@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/target/
+Cargo.lock.bak
+
+# Build artifacts (kernels/cuda/build.sh outputs)
+*.so
+*.o
+*.a
+*.cubin
+*.ptx
+
+# Python tooling (bench scripts etc.)
+__pycache__/
+*.pyc
+.venv/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Logs & scratch
+*.log
+/tmp/

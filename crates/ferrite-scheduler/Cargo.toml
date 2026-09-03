@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ferrite-types = { path = "../ferrite-types" }
+ferrite-model = { path = "../ferrite-model" }
+ferrite-batch = { path = "../ferrite-batch" }
+ferrite-kv = { path = "../ferrite-kv" }

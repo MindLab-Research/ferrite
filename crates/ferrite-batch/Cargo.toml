@@ -1,0 +1,10 @@
+[package]
+name = "ferrite-batch"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+ferrite-types = { path = "../ferrite-types" }
+ferrite-model = { path = "../ferrite-model" }
