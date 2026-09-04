@@ -1445,3 +1445,95 @@ impl CudaBackend {
         Ok(out)
     }
 }
+
+// ============================================================
+// MHC hyper-connections + rmsnorm at the DevBuf level — the layer-chain
+// components for the full decode-step device op chain (graph capture):
+// hc_pre_dev → rmsnorm_dev → gdn_layer_dev / moe_layer_dev →
+// tp_all_reduce_dev → hc_post_dev, ALL DevBuf (zero host round-trips).
+// The kernels are the same ferrite_hc_pre/hc_post/rmsnorm the Tensor-level
+// path uses — these wrappers just keep activations on device.
+// ============================================================
+impl CudaBackend {
+    /// MHC pre-step on device: residual_flat [s, n*h] → (li [s,h],
+    /// post [s,n], comb [s,n,n]). Weights (fn_w/scale/base) hit the
+    /// dev_weight cache (f32, resident after preload). DevBuf in/out —
+    /// the CPU sinkhorn/dot loops this replaces took ~0.9ms/layer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_pre_dev(
+        &self,
+        res: &DevBuf,
+        fn_w: &Tensor,
+        scale: &Tensor,
+        base: &Tensor,
+        s: usize,
+        nh: usize,
+        rms_eps: f32,
+        hc_eps: f32,
+        sinkhorn_iters: usize,
+    ) -> Result<(DevBuf, DevBuf, DevBuf)> {
+        self.enter();
+        let mix = fn_w.shape.0[0];
+        let n = ((-2.0 + (4.0 + 4.0 * mix as f64).sqrt()) / 2.0) as usize;
+        let h = nh / n;
+        let dfw = self.dev_weight(fn_w)?;
+        let dsc = self.dev_weight(scale)?;
+        let dba = self.dev_weight(base)?;
+        let li = DevBuf::alloc(self.dev, self.stream, s * h)?;
+        let post = DevBuf::alloc(self.dev, self.stream, s * n)?;
+        let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
+        ck(
+            unsafe {
+                ferrite_hc_pre(
+                    res.as_const_f32(), dfw.as_const_f32(), dsc.as_const_f32(), dba.as_const_f32(),
+                    li.as_f32(), post.as_f32(), comb.as_f32(),
+                    s as i32, n as i32, h as i32, mix as i32,
+                    rms_eps, hc_eps, sinkhorn_iters as i32, self.stream,
+                )
+            },
+            "hc_pre_dev",
+        )?;
+        Ok((li, post, comb))
+    }
+
+    /// MHC post-step on device: x [s, h_out] + residual [s, n, h] →
+    /// out [s, n, h] (per DevBuf — the all-reduce partial feeds straight
+    /// in, the next hc_pre's residual feeds straight out).
+    pub fn hc_post_dev(
+        &self,
+        x: &DevBuf,
+        res: &DevBuf,
+        post: &DevBuf,
+        comb: &DevBuf,
+        s: usize,
+        n: usize,
+        h: usize,
+    ) -> Result<DevBuf> {
+        self.enter();
+        let out = DevBuf::alloc(self.dev, self.stream, s * n * h)?;
+        ck(
+            unsafe {
+                ferrite_hc_post(
+                    x.as_const_f32(), res.as_const_f32(), post.as_const_f32(), comb.as_const_f32(),
+                    out.as_f32(), s as i32, n as i32, h as i32, self.stream,
+                )
+            },
+            "hc_post_dev",
+        )?;
+        Ok(out)
+    }
+
+    /// RMSNorm on device: x [n, dim] → out (weight resident f32).
+    /// DevBuf in/out — the layer chain's input_layernorm/post_attention
+    /// layernorm without a host round-trip.
+    pub fn rmsnorm_dev(&self, x: &DevBuf, w: &Tensor, eps: f32, n: usize, dim: usize) -> Result<DevBuf> {
+        self.enter();
+        let dw = self.dev_weight(w)?;
+        let out = DevBuf::alloc(self.dev, self.stream, x.len)?;
+        ck(
+            unsafe { ferrite_rmsnorm(x.as_const_f32(), dw.as_const_f32(), out.as_f32(), n as i32, dim as i32, eps, self.stream) },
+            "rmsnorm_dev",
+        )?;
+        Ok(out)
+    }
+}
