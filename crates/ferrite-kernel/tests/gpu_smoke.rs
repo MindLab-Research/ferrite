@@ -438,22 +438,27 @@ fn moe_fused_parity_and_speed() {
     let routed_scaling = 1.2f32;
     let limit = 7.0f32; // swiglu clamp (large enough to be active at most)
 
+    // bf16-EXACT values ({-0.5,-0.25,0,0.25,...}): the GPU's bf16 weight
+    // truncation is a no-op on these, so GPU and the f32 CPU reference see
+    // IDENTICAL numbers — any diff beyond accumulation order (~1e-6) is a
+    // real kernel bug, precisely localizable.
+    let bex = |i: usize, s: usize| ((i + s) % 4) as f32 * 0.25 - 0.5;
     let x = Tensor::from_f32(
         Shape::new([1, hidden]),
-        (0..hidden).map(|i| ((i as f32) * 0.31).sin() * 0.7).collect(),
+        (0..hidden).map(|i| bex(i, 0)).collect(),
     );
     let gate_w = Tensor::from_f32(
         Shape::new([e_total, hidden]),
-        (0..e_total * hidden).map(|i| (((i * 13 + 5) % 101) as f32) * 0.02 - 1.0).collect(),
+        (0..e_total * hidden).map(|i| bex(i, 5)).collect(),
     );
     let bias = Tensor::from_f32(
         Shape::new([e_total]),
-        (0..e_total).map(|i| ((i % 3) as f32) * 0.1).collect(),
+        (0..e_total).map(|i| bex(i, 2)).collect(),
     );
     let mk = |r: usize, c: usize, s: usize| {
         Tensor::from_f32(
             Shape::new([r, c]),
-            (0..r * c).map(|i| (((i * 7 + s) % 97) as f32) * 0.05 - 2.3).collect(),
+            (0..r * c).map(|i| bex(i * 7 + s, 0)).collect(),
         )
     };
     let eg: Vec<Tensor> = (0..e_local).map(|s| mk(inter, hidden, s * 11)).collect();
@@ -558,7 +563,7 @@ fn moe_fused_parity_and_speed() {
     // over hidden/inter dots) — an absolute cap fails on large activations.
     for i in 0..hidden {
         let d = (hv[i] - ref_out[i]).abs();
-        let tol = 5e-2 + 0.03 * ref_out[i].abs();
+        let tol = 1e-4; // bf16-exact inputs: only accumulation order differs
         assert!(
             d < tol,
             "moe_fused mismatch at {i}: gpu {} vs ref {} (diff {d}, tol {tol}; probs {:?} ids {:?})",
