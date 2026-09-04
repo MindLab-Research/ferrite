@@ -560,8 +560,12 @@ where
             });
             let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
             if probe {
+                // tagged by GDN path (FERRITE_GDN_DEV=1 → "dev" else "cpu") —
+                // the CPU-vs-device divergence pinpoints WHERE garbage starts.
+                let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+                let tag = if std::env::var_os("FERRITE_GDN_DEV").is_some() { "dev" } else { "cpu" };
                 let bytes: Vec<u8> = attn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-                std::fs::write("/tmp/l0_attn.f32", bytes).ok();
+                std::fs::write(format!("{dir}/l0_attn_tp_{tag}.f32"), bytes).ok();
             }
             let res3 =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), residual.as_slice().to_vec());
