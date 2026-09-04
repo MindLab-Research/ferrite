@@ -37,6 +37,8 @@ extern "C" {
     fn ferrite_matmul_bf16(x: *const f32, w: *const std::ffi::c_void,
                             bias: *const f32, out: *mut f32,
                             n: i32, in_f: i32, out_f: i32, s: CuStream) -> i32;
+    fn ferrite_f32_to_bf16(in_: *const f32, out: *mut std::ffi::c_void,
+                            n: i64, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
                        n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
     fn ferrite_gated_rmsnorm(x: *const f32, gate: *const f32, w: *const f32, out: *mut f32,
@@ -301,7 +303,13 @@ impl CudaBackend {
     /// layout for large matmul weights. A 285GB/TP4-rank f32 shard does not
     /// fit a 275GB B300; bf16 halves it to 142GB (TileRT's resident-weights
     /// model). The kernel converts bf16→f32 in registers; x/out stay f32.
-    /// Packed from the f32 tensor on first upload (bf16 = high 16 bits).
+    ///
+    /// Large weights (≥8M elements = 32MB f32) convert ON THE GPU: the f32
+    /// source is streamed to a scratch buffer in chunks and a kernel packs
+    /// bf16 in place — CPU-side packing of 292GB/rank was the warmup
+    /// bottleneck (~150s/thread). Small weights pack on the CPU (the
+    /// bit-shift loop is vector-friendly). Both paths use identical
+    /// truncation semantics (f32 high bits), so parity holds.
     fn dev_weight_bf16(&self, t: &Tensor) -> Result<DevRef> {
         let key = (t.as_slice().as_ptr() as usize, t.numel() << 1 | 1);
         let mut cache = self.weights.lock().unwrap();
@@ -310,20 +318,54 @@ impl CudaBackend {
                 return Ok(DevRef { ptr: cb.dev, len: cb.len });
             }
         }
-        // pack f32 → bf16 (truncate to high bits; PyTorch bf16 semantics)
+        let n = t.numel();
         let src = t.as_slice();
-        let mut packed: Vec<u16> = Vec::with_capacity(src.len());
-        for v in src {
-            packed.push((v.to_bits() >> 16) as u16);
-        }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut ptr, t.numel() * 2) }, "weight bf16 malloc")?;
-        ck(
-            unsafe { cudaMemcpy(ptr, packed.as_ptr() as *const _, packed.len() * 2, CUDA_MEMCPY_H2D) },
-            "weight bf16 H2D",
-        )?;
-        cache.insert(key, CachedBuf { keep: t.data.clone(), dev: ptr, len: t.numel() });
-        Ok(DevRef { ptr, len: t.numel() })
+        ck(unsafe { cudaMalloc(&mut ptr, n * 2) }, "weight bf16 malloc")?;
+        if n >= 8 << 20 {
+            // GPU-side conversion: stream f32 chunks to a scratch buffer and
+            // pack bf16 in place into the resident allocation. Blocking
+            // memcpy between kernels serialises per chunk (fine — the H2D
+            // dominates); a final stream sync covers the last kernel.
+            const CHUNK: usize = 32 << 20; // 32M f32 = 128MB per step
+            let mut scratch: *mut std::ffi::c_void = std::ptr::null_mut();
+            ck(unsafe { cudaMalloc(&mut scratch, CHUNK * 4) }, "bf16 scratch malloc")?;
+            let conv = (|| -> Result<()> {
+                for (i, chunk) in src.chunks(CHUNK).enumerate() {
+                    ck(
+                        unsafe { cudaMemcpy(scratch, chunk.as_ptr() as *const _, chunk.len() * 4, CUDA_MEMCPY_H2D) },
+                        "bf16 chunk H2D",
+                    )?;
+                    ck(
+                        unsafe {
+                            ferrite_f32_to_bf16(
+                                scratch as *const f32,
+                                (ptr as *mut u8).add(i * CHUNK * 2) as *mut _,
+                                chunk.len() as i64,
+                                self.stream,
+                            )
+                        },
+                        "bf16 GPU convert",
+                    )?;
+                }
+                self.sync()
+            })();
+            unsafe { cudaFree(scratch) };
+            conv?;
+        } else {
+            // pack f32 → bf16 on the CPU (truncate to high bits; PyTorch
+            // bf16 semantics — matches ferrite_f32_to_bf16 exactly)
+            let mut packed: Vec<u16> = vec![0u16; src.len()];
+            for (dst, v) in packed.iter_mut().zip(src.iter()) {
+                *dst = (v.to_bits() >> 16) as u16;
+            }
+            ck(
+                unsafe { cudaMemcpy(ptr, packed.as_ptr() as *const _, packed.len() * 2, CUDA_MEMCPY_H2D) },
+                "weight bf16 H2D",
+            )?;
+        }
+        cache.insert(key, CachedBuf { keep: t.data.clone(), dev: ptr, len: n });
+        Ok(DevRef { ptr, len: n })
     }
 
     /// Preload a weight into device-resident storage (bf16 for 2-D matmul

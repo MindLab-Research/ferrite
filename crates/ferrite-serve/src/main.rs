@@ -147,28 +147,41 @@ fn run_cuda(
     // (~142GB/rank at TP4 vs 285GB f32 which does not fit a 275GB B300),
     // f32 for 1-D (norms/logdecay/biases). After this, per-op traffic is
     // activations only.
+    //
+    // All ranks preload CONCURRENTLY — cudaSetDevice is thread-local, so
+    // each rank thread binds its own device and streams its shard over
+    // PCIe in parallel (serial was 606.8s; PCIe is per-device so the 4
+    // uploads overlap almost perfectly).
     {
         let t0 = std::time::Instant::now();
-        for (rank, shard) in cluster.shards.iter().enumerate() {
-            let mut n_2d = 0usize;
-            let mut n_1d = 0usize;
-            for (_name, t) in shard.weights.iter() {
-                shard
-                    .backend
-                    .preload_weight(t)
-                    .unwrap_or_else(|e| panic!("preload rank {rank} weight {_name}: {e}"));
-                if t.shape.0.len() >= 2 {
-                    n_2d += 1;
-                } else {
-                    n_1d += 1;
-                }
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (rank, shard) in cluster.shards.iter().enumerate() {
+                handles.push(scope.spawn(move || {
+                    let mut n_2d = 0usize;
+                    let mut n_1d = 0usize;
+                    for (_name, t) in shard.weights.iter() {
+                        shard
+                            .backend
+                            .preload_weight(t)
+                            .unwrap_or_else(|e| panic!("preload rank {rank} weight {_name}: {e}"));
+                        if t.shape.0.len() >= 2 {
+                            n_2d += 1;
+                        } else {
+                            n_1d += 1;
+                        }
+                    }
+                    println!(
+                        "[serve] rank {rank}: {n_2d} x2d (bf16-resident) + {n_1d} x1d (f32) weights on device"
+                    );
+                }));
             }
-            println!(
-                "[serve] rank {rank}: {n_2d} x2d (bf16-resident) + {n_1d} x1d (f32) weights on device"
-            );
-        }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
         println!(
-            "[serve] weights resident in {:.1}s",
+            "[serve] weights resident in {:.1}s (parallel across ranks)",
             t0.elapsed().as_secs_f32()
         );
     }

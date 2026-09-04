@@ -158,6 +158,31 @@ extern "C" cudaError_t ferrite_matmul_bf16(const float* x, const void* w,
 }
 
 // ============================================================
+// GPU-side f32 → bf16 conversion (truncation — exactly the CPU pack
+// `bits >> 16`, so parity holds). Warmup streams f32 chunks over PCIe
+// and converts in place into the resident bf16 allocation: packing
+// 292GB/rank on the CPU is the warmup bottleneck (~150s/thread), the
+// GPU converts at HBM speed.
+// ============================================================
+__global__ void f32_to_bf16_kernel(const float* __restrict__ in,
+                                   unsigned short* __restrict__ out, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        unsigned int b = __float_as_uint(in[i]);
+        out[i] = (unsigned short)(b >> 16);
+    }
+}
+
+extern "C" cudaError_t ferrite_f32_to_bf16(const float* in, void* out,
+                                           long n, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    int threads = 256;
+    long blocks = (n + threads - 1) / threads;
+    f32_to_bf16_kernel<<<(unsigned)blocks, threads, 0, s>>>(in, (unsigned short*)out, n);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // rmsnorm over the last dim: y = x / rms(x) * w
 // ============================================================
 __global__ void rmsnorm_kernel(const float* __restrict__ x,
