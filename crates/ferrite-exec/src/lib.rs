@@ -26,6 +26,12 @@ pub mod tp;
 pub use graph::GraphRunner;
 
 /// Per-sequence runtime state (CPU golden path).
+/// Probe dump path. FERRITE_PROBE_DIR isolates concurrent runs (shared
+/// /tmp collisions cross-contaminate dumps between people — default /tmp).
+fn ppath(name: &str) -> String {
+    std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp".to_string()) + "/" + name
+}
+
 #[derive(Debug, Clone)]
 pub struct DsaLayerCache {
     pub k_nope: Vec<f32>, // [t, heads, dk]
@@ -417,7 +423,7 @@ impl<B: KernelBackend> Engine<B> {
         }
         if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
             let b: Vec<u8> = attn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_attn_out.f32", b).ok();
+            std::fs::write(&ppath("l3_attn_out.f32"), b).ok();
         }
         let res3 = Tensor::from_f32(
             Shape::new([n, hc_mult, hidden]),
@@ -514,8 +520,8 @@ impl<B: KernelBackend> Engine<B> {
                 let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write(path, b).ok();
             };
-            wr("/tmp/l0_gdn_fa.f32", &fa);
-            wr("/tmp/l0_gdn_fb.f32", &fb);
+            wr(&ppath("l0_gdn_fa.f32"), &fa);
+            wr(&ppath("l0_gdn_fb.f32"), &fb);
         }
         let ga = self.project(x, &format!("{pfx}.self_attn.g_a_proj.weight"))?;
         let gb = self.project(&ga, &format!("{pfx}.self_attn.g_b_proj.weight"))?;
@@ -620,11 +626,11 @@ impl<B: KernelBackend> Engine<B> {
                 let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write(p, b).ok();
             };
-            wr("/tmp/l0_gdn_q.f32", &q);
-            wr("/tmp/l0_gdn_k.f32", &k);
-            wr("/tmp/l0_gdn_gate.f32", &gate);
-            wr("/tmp/l0_gdn_core.f32", &core);
-            wr("/tmp/l0_gdn_beta.f32", &beta);
+            wr(&ppath("l0_gdn_q.f32"), &q);
+            wr(&ppath("l0_gdn_k.f32"), &k);
+            wr(&ppath("l0_gdn_gate.f32"), &gate);
+            wr(&ppath("l0_gdn_core.f32"), &core);
+            wr(&ppath("l0_gdn_beta.f32"), &beta);
         }
         // gated output norm: per-head RMSNorm over head_dim (the real
         // checkpoint's o_norm weight is [head_dim] = [128], applied
@@ -675,11 +681,11 @@ impl<B: KernelBackend> Engine<B> {
                 let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write(path, b).ok();
             };
-            wr("/tmp/l3_dsa_qa.f32", &qa);
-            wr("/tmp/l3_dsa_qi.f32", &qi);
-            wr("/tmp/l3_dsa_q.f32", &q);
-            wr("/tmp/l3_dsa_kvb.f32", &kvb);
-            wr("/tmp/l3_dsa_hn.f32", x);
+            wr(&ppath("l3_dsa_qa.f32"), &qa);
+            wr(&ppath("l3_dsa_qi.f32"), &qi);
+            wr(&ppath("l3_dsa_q.f32"), &q);
+            wr(&ppath("l3_dsa_kvb.f32"), &kvb);
+            wr(&ppath("l3_dsa_hn.f32"), x);
         }
         let ki_raw = self.project(x, &format!("{pfx}.self_attn.indexer.wk.weight"))?;
         let kn_w = self.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?;
@@ -854,16 +860,16 @@ impl<B: KernelBackend> Engine<B> {
         let mut out = Tensor::zeros(Shape::new([n, h, dv]), DType::F32);
         if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
             let b: Vec<u8> = idx.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_dsa_idx.f32", b).ok();
+            std::fs::write(&ppath("l3_dsa_idx.f32"), b).ok();
             let b2: Vec<u8> = q.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_dsa_q_sel.f32", b2).ok();
+            std::fs::write(&ppath("l3_dsa_q_sel.f32"), b2).ok();
         }
         self.backend.sparse_mla_attn(&q, &k_nope, &v, &idx, &mut out)?;
         if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
             let b: Vec<u8> = out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_attn_raw.f32", b).ok();
+            std::fs::write(&ppath("l3_attn_raw.f32"), b).ok();
             let b2: Vec<u8> = v.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_attn_v.f32", b2).ok();
+            std::fs::write(&ppath("l3_attn_v.f32"), b2).ok();
         }
         let flat = Tensor::from_f32(Shape::new([n, h * dv]), out.as_slice().to_vec());
         self.project(&flat, &format!("{pfx}.self_attn.o_proj.weight"))
