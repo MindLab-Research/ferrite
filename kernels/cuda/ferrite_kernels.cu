@@ -1808,3 +1808,144 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
     if (e == cudaErrorPeerAccessAlreadyEnabled) return cudaSuccess;
     return e;
 }
+
+// ============================================================
+// hc_pre SPLIT for decode bandwidth: the single-block hc_pre was 0.18ms
+// because grid=(1) runs on ONE SM (24 warps limited to ~6GB/s vs 8TB/s
+// HBM). This version uses grid=(s, mix) — each block computes ONE mix's
+// dot product with 256 threads across a separate SM. rsq is computed
+// redundantly per block (x is L2-cached after the first read).
+// Expected: 0.18ms → ~0.01ms (16x).
+// ============================================================
+__global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
+                                        const float* __restrict__ fw,
+                                        float* __restrict__ mx_out,
+                                        int s, int n, int h, int mix,
+                                        float rms_eps) {
+    int t = blockIdx.x;
+    int m = blockIdx.y;
+    if (t >= s || m >= mix) return;
+    const float* x = res + (size_t)t * n * h;
+    const int nh = n * h;
+    const float* row = fw + (size_t)m * nh;
+
+    // rsq (redundant per block — x is L2-cached, 64KB)
+    float part = 0.f;
+    for (int i = threadIdx.x; i < nh; i += blockDim.x) part += x[i] * x[i];
+    __shared__ float red[8];
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffff, part, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
+    __syncthreads();
+    float msq = 0.f;
+    if (threadIdx.x == 0) {
+        for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
+    }
+    __shared__ float rsq_s;
+    if (threadIdx.x == 0) rsq_s = rsqrtf(msq / (float)nh + rms_eps);
+    __syncthreads();
+    float rsq = rsq_s;
+
+    // mix m's dot product (256 threads, coalesced)
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < nh; i += blockDim.x) acc += row[i] * x[i];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tot = 0.f;
+        for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
+        mx_out[(size_t)t * mix + m] = tot * rsq;
+    }
+}
+
+// The REST of hc_pre: reads pre-computed mx from global memory, does
+// sinkhorn + li + post + comb. Single block per token (tiny work).
+__global__ void hc_pre_rest_kernel(const float* __restrict__ res,
+                                   const float* __restrict__ mx_in,
+                                   const float* __restrict__ scale,
+                                   const float* __restrict__ base,
+                                   float* __restrict__ li,
+                                   float* __restrict__ post,
+                                   float* __restrict__ comb,
+                                   int s, int n, int h, int mix,
+                                   float rms_eps, float hc_eps, int iters) {
+    int t = blockIdx.x;
+    if (t >= s) return;
+    const float* x = res + (size_t)t * n * h;
+    const int nh = n * h;
+    extern __shared__ float sm[];
+    float* cb = sm;          // [n*n]
+    float* pre_s = sm + n * n; // [n]
+
+    const float* mx = mx_in + (size_t)t * mix;
+
+    // pre / layer_input, post, comb (parallel across n for sigmoid)
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        pre_s[i] = 1.0f / (1.0f + __expf(-(mx[i] * scale[0] + base[i]))) + hc_eps;
+        post[t * n + i] = 2.0f * (1.0f / (1.0f + __expf(-(mx[n + i] * scale[1] + base[n + i]))));
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < n; k++)
+                cb[i * n + k] = mx[2 * n + i * n + k] * scale[2] + base[2 * n + i * n + k];
+        // sinkhorn
+        for (int i = 0; i < n; i++) {
+            float rmax = -INFINITY;
+            for (int k = 0; k < n; k++) rmax = fmaxf(rmax, cb[i * n + k]);
+            float denom = 0.f;
+            for (int k = 0; k < n; k++) { cb[i * n + k] = __expf(cb[i * n + k] - rmax); denom += cb[i * n + k]; }
+            for (int k = 0; k < n; k++) cb[i * n + k] = cb[i * n + k] / denom + hc_eps;
+        }
+        for (int k = 0; k < n; k++) {
+            float colsum = 0.f;
+            for (int i = 0; i < n; i++) colsum += cb[i * n + k];
+            float d = colsum + hc_eps;
+            for (int i = 0; i < n; i++) cb[i * n + k] /= d;
+        }
+        for (int it = 1; it < iters; it++) {
+            for (int i = 0; i < n; i++) {
+                float rowsum = 0.f;
+                for (int k2 = 0; k2 < n; k2++) rowsum += cb[i * n + k2];
+                float d = rowsum + hc_eps;
+                for (int k2 = 0; k2 < n; k2++) cb[i * n + k2] /= d;
+            }
+            for (int k2 = 0; k2 < n; k2++) {
+                float colsum = 0.f;
+                for (int i = 0; i < n; i++) colsum += cb[i * n + k2];
+                float d = colsum + hc_eps;
+                for (int i = 0; i < n; i++) cb[i * n + k2] /= d;
+            }
+        }
+        for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
+    }
+    __syncthreads();
+    // li = Σ_i pre_i · x[i*h + j] (parallel over h)
+    for (int j = threadIdx.x; j < h; j += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < n; i++) acc += pre_s[i] * x[(size_t)i * h + j];
+        li[(size_t)t * h + j] = acc;
+    }
+}
+
+extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
+                                            const float* scale, const float* base,
+                                            float* li, float* post, float* comb,
+                                            float* mx_scratch,
+                                            int s, int n, int h, int mix,
+                                            float rms_eps, float hc_eps, int iters,
+                                            cudaStream_t stream) {
+    // Phase 1: multi-block mix computation (grid(s, mix) — one block per mix)
+    dim3 mix_grid(s, mix);
+    hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+        res, fw, mx_scratch, s, n, h, mix, rms_eps);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+
+    // Phase 2: rest (single block per token — sinkhorn + li + post + comb)
+    size_t smem2 = (size_t)(n * n + n) * sizeof(float);
+    hc_pre_rest_kernel<<<s, 256, smem2, stream>>>(
+        res, mx_scratch, scale, base, li, post, comb,
+        s, n, h, mix, rms_eps, hc_eps, iters);
+    return cudaGetLastError();
+}
