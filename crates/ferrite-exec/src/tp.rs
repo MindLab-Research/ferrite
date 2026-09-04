@@ -422,40 +422,7 @@ impl<B: KernelBackend> TpCluster<B> {
         if std::env::var_os("FERRITE_GRAPH").is_some() {
             return self.decode_step_graphed(seq);
         }
-        let last = {
-            let s = self.shards[0]
-                .seq_runtime(seq)
-                .ok_or_else(|| FerriteError::Config("missing seq".into()))?;
-            *s.tokens.last().ok_or_else(|| FerriteError::Config("empty context".into()))?
-        };
-        let h0 = self.shards[0].embed(&[last]);
-        let mut h = if self.full_cfg.mhc {
-            crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult)
-        } else {
-            h0
-        };
-        let plans = build_layer_plans(&self.full_cfg);
-        for plan in &plans {
-            h = self.layer_forward_tp(seq, plan.layer_idx, h, 1)?;
-        }
-        let h_final = if self.full_cfg.mhc {
-            crate::mhc::hc_contract(&h, self.full_cfg.hc_mult)
-        } else {
-            h
-        };
-        // final norm + lm head: replicated weights — any shard computes them.
-        let s0 = &self.shards[0];
-        let hn = s0.rmsnorm(&h_final, "model.norm.weight")?;
-        let logits = s0.project(&hn, "lm_head.weight")?;
-        let mut out = Tensor::zeros(Shape::new([1]), DType::F32);
-        s0.backend.argmax_lastdim(&logits, &mut out)?;
-        let tok = out.as_slice()[0] as u32;
-        for s in &mut self.shards {
-            if let Some(rt) = s.seq_runtime_mut(seq) {
-                rt.tokens.push(tok);
-            }
-        }
-        Ok(tok)
+        self.decode_step_normal(seq)
     }
 
 /// GDN (linear-attention) layer per shard: the CUDA path runs the WHOLE
