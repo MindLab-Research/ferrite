@@ -1249,18 +1249,94 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
 
         // ---- segment 4: fan_out ffn (existing device chains) ----
         let t_pre2 = std::time::Instant::now();
-        let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
-            MlpKind::Dense => s.dense_ffn(&pfx, &hfn_t, n),
-            MlpKind::Moe => s.moe_ffn(&pfx, &hfn_t, n),
-        });
-        let t_ffn = std::time::Instant::now();
-        let ffn_out = if self.shards[0].nccl.is_some() {
-            // NCCL: the MoE/dense device chain all-reduced on-stream; rank 0's
-            // partial IS the sum.
-            ffn_partials.into_iter().next().unwrap()?
+        // P2P path: fan_out returns device pointers, rank 0 P2P all_reduces
+        #[cfg(feature = "cuda")]
+        let (ffn_out_dev, ffn_out_t) = if std::env::var_os("FERRITE_P2P").is_some() {
+            let ptrs: Vec<Result<usize>> = Self::fan_out(&mut self.shards, |s| {
+                use ferrite_kernel::cuda::DevBuf;
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("P2P needs cuda".into()))?;
+                cuda.enter();
+                let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hfn_t.numel())?;
+                x_dev.upload(hfn_t.as_slice())?;
+                match plan.mlp {
+                    MlpKind::Dense => {
+                        // dense: 3 GEMV + swiglu — direct device chain
+                        let w_gate = s.w(&format!("{pfx}.mlp.gate_proj.weight"))?;
+                        let w_up = s.w(&format!("{pfx}.mlp.up_proj.weight"))?;
+                        let w_down = s.w(&format!("{pfx}.mlp.down_proj.weight"))?;
+                        let hi = hidden as i32;
+                        let inter = w_gate.shape.0[0] as i32;
+                        let g = cuda.matmul_dev(&x_dev, w_gate, n as i32, hi, inter)?;
+                        let u = cuda.matmul_dev(&x_dev, w_up, n as i32, hi, inter)?;
+                        let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, s.cfg.swiglu_limit)?;
+                        let d = cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?;
+                        Ok(d.as_f32() as usize)
+                    }
+                    MlpKind::Moe => {
+                        // MoE: graph fast path or direct fused chain
+                        use ferrite_kernel::cuda::ExpertWeights;
+                        if std::env::var_os("FERRITE_GRAPH_MOE").is_some() && n == 1 {
+                            let layer_no: String =
+                                pfx.rsplit('.').next().unwrap_or("?").to_string();
+                            let gname = format!("moe{layer_no}");
+                            if let Some(ptr) = cuda.graph_run_dev(&gname, hfn_t.as_slice())? {
+                                return Ok(ptr);
+                            }
+                        }
+                        let cfg = &s.cfg;
+                        let hidden2 = cfg.hidden_size;
+                        let topk = cfg.num_experts_per_tok;
+                        let e = cfg.n_routed_experts;
+                        let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
+                            Some(b) => b.clone(),
+                            None => Tensor::zeros(Shape::new([e]), DType::F32),
+                        };
+                        let gate_w = s.w(&format!("{pfx}.mlp.gate.weight"))?;
+                        let shared = ExpertWeights {
+                            gate: s.w(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))?,
+                            up: s.w(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))?,
+                            down: s.w(&format!("{pfx}.mlp.shared_expert.down_proj.weight"))?,
+                        };
+                        let (es, ee) = s.tp_expert_range.unwrap_or((0, e));
+                        let experts: Vec<ExpertWeights> = (es..ee)
+                            .map(|eid| {
+                                Ok(ExpertWeights {
+                                    gate: s.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
+                                    up: s.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
+                                    down: s.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let mut probs_scratch = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
+                        let out_dev = cuda.moe_layer_dev(
+                            &x_dev, gate_w, &bias, &shared, &experts, es,
+                            &mut probs_scratch, n, hidden2, topk, e,
+                            cfg.routed_scaling_factor, cfg.swiglu_limit,
+                        )?;
+                        Ok(out_dev.as_f32() as usize)
+                    }
+                }
+            });
+            let ptrs: Vec<usize> = ptrs.into_iter().collect::<Result<Vec<_>>>()?;
+            let cuda0 = self.shards[0].backend.as_cuda().unwrap();
+            let ffn_out_dev = cuda0.p2p_all_reduce(&ptrs, n * hidden)?;
+            (Some(ffn_out_dev), None)
         } else {
-            all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?)
+            let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
+                MlpKind::Dense => s.dense_ffn(&pfx, &hfn_t, n),
+                MlpKind::Moe => s.moe_ffn(&pfx, &hfn_t, n),
+            });
+            let ffn_out = if self.shards[0].nccl.is_some() {
+                ffn_partials.into_iter().next().unwrap()?
+            } else {
+                all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?)
+            };
+            (None, Some(ffn_out))
         };
+        let t_ffn = std::time::Instant::now();
         let t_far = std::time::Instant::now();
 
         // ---- segment 5: hc_post2 (GPU) → residual out ----
@@ -1271,11 +1347,15 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 .as_cuda()
                 .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
             cuda0.enter();
-            let mut ffn_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
-            ffn_dev.upload(ffn_out.as_slice())?;
-            let res_out_dev = cuda0.hc_post_dev(
-                &ffn_dev, &res2_dev, &post_f_dev, &comb_f_dev, n, hc_mult, hidden,
-            )?;
+            // P2P: ffn_out_dev is already on GPU — no upload
+            #[cfg(feature = "cuda")]
+            let res_out_dev = if let Some(ref dev) = ffn_out_dev {
+                cuda0.hc_post_dev(dev, &res2_dev, &post_f_dev, &comb_f_dev, n, hc_mult, hidden)?
+            } else {
+                let mut d = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
+                d.upload(ffn_out_t.as_ref().unwrap().as_slice())?;
+                cuda0.hc_post_dev(&d, &res2_dev, &post_f_dev, &comb_f_dev, n, hc_mult, hidden)?
+            };
             let mut out = vec![0f32; n * nh];
             res_out_dev.download(&mut out)?;
             Tensor::from_f32(Shape::new([n, nh]), out)
