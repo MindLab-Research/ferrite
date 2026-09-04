@@ -26,8 +26,11 @@ fn close(a: &Tensor, b: &Tensor, tol: f32, what: &str) {
 
 #[test]
 fn gdn_device_chain_matches_cpu() {
-    let so = std::env::var("FERRITE_KERNEL_SO")
-        .unwrap_or_else(|_| "kernels/cuda/libferrite_kernels.so".into());
+    let so = std::env::var("FERRITE_KERNEL_SO").unwrap_or_else(|_| {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("../../kernels/cuda/libferrite_kernels.so");
+        p.to_string_lossy().into_owned()
+    });
     let dev = CudaBackend::with_device(&so, 0).expect("open cuda device 0 (run on the GPU box)");
 
     let cfg = Glm53FlashConfig::test_config();
