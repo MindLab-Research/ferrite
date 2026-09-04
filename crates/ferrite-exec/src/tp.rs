@@ -620,6 +620,15 @@ where
     if shards.len() == 1 {
         return vec![f(&mut shards[0])];
     }
+    // Persistent workers (FERRITE_WORKER_POOL=1): removes the 360 spawns
+    // per token (4 ranks × 2 segments × 45 layers × ~30μs each).
+    // SAFETY (transmute): the main thread blocks on recv() until all
+    // workers finish — f's lifetime covers the execution window.
+    if let Some(pool) = fan_pool(shards.len()) {
+        let ptr = shards.as_mut_ptr();
+        let f_static: &F = unsafe { std::mem::transmute(&f) };
+        return fan_out_pooled(pool, ptr, f_static, shards.len());
+    }
     std::thread::scope(|scope| {
         let handles: Vec<_> = shards
             .iter_mut()
@@ -1241,4 +1250,90 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         }
         Ok(tok)
     }
+}
+
+// ============================================================
+// Persistent fan_out workers (FERRITE_WORKER_POOL=1): std::thread::scope
+// spawns 4 threads per segment × 2 segments × 45 layers = 360 spawns per
+// token (~20-50μs each = 7-18ms/token). Persistent workers remove the
+// spawn cost entirely; the raw Engine pointers are safe because the
+// main thread blocks on recv() until every worker finishes (the
+// lifetimes are stack-scoped, same as the scoped-thread version).
+// ============================================================
+type PoolJob = Box<dyn FnOnce() + Send + 'static>;
+
+struct FanWorkers {
+    txs: Vec<std::sync::mpsc::Sender<PoolJob>>,
+    _handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+static FAN_POOL: std::sync::OnceLock<FanWorkers> = std::sync::OnceLock::new();
+
+fn fan_pool(n: usize) -> Option<&'static FanWorkers> {
+    if std::env::var_os("FERRITE_WORKER_POOL").is_none() {
+        return None;
+    }
+    Some(
+        FAN_POOL.get_or_init(|| {
+            let (txs, handles) = (0..n)
+                .map(|i| {
+                    let (tx, rx) = std::sync::mpsc::channel::<PoolJob>();
+                    let h = std::thread::Builder::new()
+                        .name(format!("fan{}", i))
+                        .spawn(move || {
+                            ferrite_kernel::set_shard_idx(i);
+                            while let Ok(job) = rx.recv() {
+                                job();
+                            }
+                        })
+                        .expect("spawn fan worker");
+                    (tx, h)
+                })
+                .unzip();
+            FanWorkers { txs, _handles: handles }
+        }),
+    )
+}
+
+struct SendPtr<T>(T);
+unsafe impl<T> Send for SendPtr<T> {}
+
+#[allow(clippy::too_many_arguments)]
+fn fan_out_pooled<T, F, B: KernelBackend>(
+    pool: &FanWorkers,
+    shards_ptr: *mut Engine<B>,
+    f: &F,
+    n: usize,
+) -> Vec<T>
+where
+    F: Fn(&mut Engine<B>) -> T + Sync,
+    T: Send,
+{
+    // SAFETY (lifetime transmute): the main thread blocks on recv() until
+    // every worker finishes — f's and the shards' lifetimes cover the whole
+    // execution window (the same stack-scoped guarantee std::thread::scope
+    // provides). Pointers are passed as usize (always Send); correctness is
+    // guaranteed by the recv() barrier below.
+    let (tx, rx) = std::sync::mpsc::channel();
+    for i in 0..n {
+        let ptr_val = unsafe { shards_ptr.add(i) } as usize;
+        let f_val = f as *const F as usize;
+        let tx = tx.clone();
+        let job: Box<dyn FnOnce() + Send + 'static> = unsafe {
+            std::mem::transmute(Box::new(move || {
+                let engine = unsafe { &mut *(ptr_val as *mut Engine<B>) };
+                let f = unsafe { &*(f_val as *const F) };
+                let r = f(engine);
+                let _ = tx.send((i, r));
+            }) as Box<dyn FnOnce() + Send + '_>)
+        };
+        pool.txs[i].send(job).expect("fan worker alive");
+    }
+    drop(tx);
+    let mut results: Vec<Option<T>> = (0..n).map(|_| None).collect();
+    for _ in 0..n {
+        let (i, r) = rx.recv().expect("fan worker result");
+        results[i] = Some(r);
+    }
+    results.into_iter().map(|r| r.expect("fan result")).collect()
 }
