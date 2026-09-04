@@ -352,6 +352,25 @@ impl<B: KernelBackend> TpCluster<B> {
             engine.tp_expert_range = Some((rank * per, (rank + 1) * per));
             shards.push(engine);
         }
+        // P2P enable (FERRITE_P2P=1): rank 0 collects partials via NVLink
+        // cudaMemcpyPeerAsync instead of the host round-trip.
+        if std::env::var_os("FERRITE_P2P").is_some() {
+            #[cfg(feature = "cuda")]
+            {
+                for (i, shard) in shards.iter().enumerate() {
+                    if let Some(cuda) = shard.backend.as_cuda() {
+                        for peer in 0..world as i32 {
+                            if peer != i as i32 {
+                                if let Err(e) = cuda.p2p_enable(peer) {
+                                    eprintln!("[serve] P2P enable {}→{} failed: {:?}", i, peer, e);
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!("[serve] P2P access enabled ({} ranks, NVLink)", world);
+            }
+        }
         let nccl = if std::env::var_os("FERRITE_NCCL").is_some() {
             #[cfg(feature = "cuda")]
             {
