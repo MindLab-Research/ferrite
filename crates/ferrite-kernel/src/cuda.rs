@@ -2061,3 +2061,17 @@ pub fn capture_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
+
+impl CudaBackend {
+    /// Argmax over the last dim of a device buffer [n, dim] → out [n].
+    /// Device-to-device (the Tensor-level path downloaded the full logits
+    /// row — 620KB for GLM's 154880 vocab).
+    pub fn argmax_dev(&self, logits: &DevBuf, out: &mut DevBuf, n: usize, dim: usize) -> Result<()> {
+        self.enter();
+        ck(
+            unsafe { ferrite_argmax(logits.as_const_f32(), out.as_f32(), n as i32, dim as i32, self.stream) },
+            "argmax_dev",
+        )?;
+        Ok(())
+    }
+}

@@ -1209,12 +1209,44 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         } else {
             h
         };
-        let s0 = &self.shards[0];
-        let hn = s0.rmsnorm(&h_final, "model.norm.weight")?;
-        let logits = s0.project(&hn, "lm_head.weight")?;
-        let mut out = Tensor::zeros(Shape::new([1]), DType::F32);
-        s0.backend.argmax_lastdim(&logits, &mut out)?;
-        let tok = out.as_slice()[0] as u32;
+        let tok = {
+            // GPU head chain (FERRITE_HEAD_DEV): rmsnorm_dev → lm_head GEMV →
+            // argmax, all device — only ONE f32 downloads (the old Tensor-level
+            // path downloaded [1, 154880] logits = 620KB + syncs per op).
+            #[cfg(feature = "cuda")]
+            let tok = if std::env::var_os("FERRITE_HEAD_DEV").is_some() {
+                use ferrite_kernel::cuda::DevBuf;
+                let s0 = &self.shards[0];
+                let cuda0 = s0
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("FERRITE_HEAD_DEV needs cuda".into()))?;
+                cuda0.enter();
+                let hidden = self.full_cfg.hidden_size;
+                let vocab = self.full_cfg.vocab_size;
+                let mut h_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), h_final.numel())?;
+                h_dev.upload(h_final.as_slice())?;
+                let norm_w = s0.w("model.norm.weight")?;
+                let hn_dev = cuda0.rmsnorm_dev(
+                    &h_dev, norm_w, self.full_cfg.rms_norm_eps, 1, hidden,
+                )?;
+                let lm_w = s0.w("lm_head.weight")?;
+                let logits_dev = cuda0.matmul_dev(&hn_dev, lm_w, 1, hidden as i32, vocab as i32)?;
+                let mut arg_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), 1)?;
+                cuda0.argmax_dev(&logits_dev, &mut arg_dev, 1, vocab)?;
+                let mut tv = vec![0f32; 1];
+                arg_dev.download(&mut tv)?;
+                tv[0] as u32
+            } else {
+                let s0 = &self.shards[0];
+                let hn = s0.rmsnorm(&h_final, "model.norm.weight")?;
+                let logits = s0.project(&hn, "lm_head.weight")?;
+                let mut out = Tensor::zeros(Shape::new([1]), DType::F32);
+                s0.backend.argmax_lastdim(&logits, &mut out)?;
+                out.as_slice()[0] as u32
+            };
+            tok
+        };
         let t_end = std::time::Instant::now();
         if tm {
             eprintln!(
