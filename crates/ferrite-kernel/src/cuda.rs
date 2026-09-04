@@ -1121,6 +1121,28 @@ impl CudaBackend {
             },
             "gdn_prep",
         )?;
+        // NaN diagnostic: dump q/beta/gate heads when probed (FERRITE_GDN_PROBE)
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
+            let mut qb = vec![0f32; n * h];
+            beta.download(&mut qb)?;
+            let nan_b = qb.iter().filter(|x| x.is_nan()).count();
+            let mut qbuf = vec![0f32; n * h * dk];
+            q.download(&mut qbuf)?;
+            let nan_q = qbuf.iter().filter(|x| x.is_nan()).count();
+            let mut gbuf = vec![0f32; n * h * dk];
+            gate.download(&mut gbuf)?;
+            let nan_g = gbuf.iter().filter(|x| x.is_nan()).count();
+            let gmax = gbuf.iter().fold(0f32, |a, v| if v.is_finite() { a.max(v.abs()) } else { a });
+            eprintln!(
+                "[gdn_dev] L{layer} n={n} h={h} dk={dk}: beta NaN {nan_b}/{} q NaN {nan_q}/{} gate NaN {nan_g}/{} gate_max {gmax:.3e}",
+                n * h, n * h * dk, n * h * dk
+            );
+            let mut cb = vec![0f32; n * ch];
+            conv_out.download(&mut cb)?;
+            let nan_c = cb.iter().filter(|x| x.is_nan()).count();
+            let cmax = cb.iter().fold(0f32, |a, v| if v.is_finite() { a.max(v.abs()) } else { a });
+            eprintln!("[gdn_dev] conv NaN {nan_c}/{} conv_max {cmax:.3e}", n * ch);
+        }
         // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
         // blocks read-modify-write their own slice; single buffer is safe)
         let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;
