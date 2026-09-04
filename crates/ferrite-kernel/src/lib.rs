@@ -231,4 +231,13 @@ pub trait KernelBackend: Send + Sync {
     /// (note the comb transpose — transformers matmuls combᵀ·residual).
     /// `x [s,h]`, `residual [s,n,h]`, `post [s,n]`, `comb [s,n,n]` → `[s,n,h]`.
     fn hc_post(&self, x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Result<Tensor>;
+
+    /// Downcast for the device-chain path (GDN/DSA device pipelines that
+    /// compose ops at the DevBuf level — zero host round-trips in-layer).
+    /// Returns the CudaBackend when this is one; None for every other
+    /// backend (callers fall back to the Tensor-level ops).
+    #[cfg(feature = "cuda")]
+    fn as_cuda(&self) -> Option<&crate::cuda::CudaBackend> {
+        None
+    }
 }

@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [features]
 default = ["cuda"]
-cuda = ["ferrite-kernel/cuda"]
+cuda = ["ferrite-kernel/cuda", "ferrite-exec/cuda"]
 
 [dependencies]
 thiserror.workspace = true

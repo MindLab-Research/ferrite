@@ -12,3 +12,6 @@ ferrite-kernel = { path = "../ferrite-kernel" }
 ferrite-kv = { path = "../ferrite-kv" }
 ferrite-batch = { path = "../ferrite-batch" }
 ferrite-scheduler = { path = "../ferrite-scheduler" }
+
+[features]
+cuda = ["ferrite-kernel/cuda"]

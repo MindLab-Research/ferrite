@@ -509,6 +509,18 @@ impl CudaBackend {
         ck(unsafe { cudaStreamSynchronize(self.stream) }, "sync")
     }
 
+    /// Device ordinal this backend is bound to (for DevBuf::alloc at the
+    /// device-chain call sites).
+    pub fn dev(&self) -> i32 {
+        self.dev
+    }
+
+    /// This backend's stream (device-chain ops submit here; the graph
+    /// capture/replay uses it too).
+    pub fn stream(&self) -> CuStream {
+        self.stream
+    }
+
     /// Device-resident matmul: x already on device, w uploaded here (the
     /// BufferCache will dedupe repeated weight uploads), result stays on
     /// device. Building block for fused op chains (expert FFN).
@@ -695,6 +707,11 @@ impl crate::graph::GraphCapable for CudaBackend {
 }
 
 impl crate::KernelBackend for CudaBackend {
+    #[cfg(feature = "cuda")]
+    fn as_cuda(&self) -> Option<&CudaBackend> {
+        Some(self)
+    }
+
     fn matmul(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>, out: &mut Tensor) -> Result<()> {
         self.enter();
         self.run_matmul(x, w, bias, out)

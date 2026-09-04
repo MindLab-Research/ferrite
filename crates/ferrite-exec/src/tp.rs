@@ -408,6 +408,67 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(tok)
     }
 
+/// GDN (linear-attention) layer per shard: the CUDA path runs the WHOLE
+/// layer as one DevBuf pipeline (gdn_layer_dev — zero host round-trips
+/// in-layer: upload hn once, download the o_proj partial once); every
+/// other backend falls back to the Tensor-level ops.
+#[cfg(feature = "cuda")]
+fn attn_shard(
+    s: &mut Engine<B>,
+    seq: u64,
+    layer_idx: usize,
+    pfx: &str,
+    hn: &Tensor,
+    n: usize,
+    hidden: usize,
+) -> Result<Tensor> {
+    if let Some(cuda) = s.backend.as_cuda() {
+        use ferrite_kernel::cuda::{DevBuf, GdnLayerWeights};
+        let la = &s.cfg.linear_attn;
+        let gw = GdnLayerWeights {
+            qkv_proj: s.w(&format!("{pfx}.self_attn.qkv_proj.weight"))?,
+            b_proj: s.w(&format!("{pfx}.self_attn.b_proj.weight"))?,
+            f_a: s.w(&format!("{pfx}.self_attn.f_a_proj.weight"))?,
+            f_b: s.w(&format!("{pfx}.self_attn.f_b_proj.weight"))?,
+            g_a: s.w(&format!("{pfx}.self_attn.g_a_proj.weight"))?,
+            g_b: s.w(&format!("{pfx}.self_attn.g_b_proj.weight"))?,
+            conv_w: s.w(&format!("{pfx}.self_attn.qkv_conv1d.weight"))?,
+            dt_bias: s.w(&format!("{pfx}.self_attn.dt_bias"))?,
+            a_log: s.w(&format!("{pfx}.self_attn.A_log"))?,
+            o_norm: s.w(&format!("{pfx}.self_attn.o_norm.weight"))?,
+            o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+        };
+        let x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
+        x_dev.upload(hn.as_slice())?;
+        let partial = cuda.gdn_layer_dev(
+            &x_dev, &gw, seq, layer_idx, n, hidden,
+            la.num_heads, la.head_dim, la.gate_lower_bound,
+            s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+        )?;
+        let mut out = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
+        {
+            let v = std::sync::Arc::get_mut(&mut out.data).expect("unique out");
+            partial.download(v)?;
+        }
+        Ok(out)
+    } else {
+        s.linear_attn_forward(seq, layer_idx, pfx, hn, n)
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
+fn attn_shard(
+    s: &mut Engine<B>,
+    seq: u64,
+    layer_idx: usize,
+    pfx: &str,
+    hn: &Tensor,
+    n: usize,
+    _hidden: usize,
+) -> Result<Tensor> {
+    s.linear_attn_forward(seq, layer_idx, pfx, hn, n)
+}
+
 /// Run one op-group across all shards CONCURRENTLY (one thread per rank).
 /// TP ranks are independent until the all-reduce; the serial iter_mut loop
 /// left 3 of the 4 GPUs idle. cudaSetDevice is thread-local so each shard's
@@ -484,7 +545,7 @@ where
                 hn
             };
             let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
-                AttnKind::Linear => s.linear_attn_forward(seq, layer_idx, &pfx, &hn, n),
+                AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn, n, hidden),
                 AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
             });
             let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
@@ -571,7 +632,7 @@ where
                 s0.rmsnorm(&residual, &format!("{pfx}.input_layernorm.weight"))?
             };
             let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
-                AttnKind::Linear => s.linear_attn_forward(seq, layer_idx, &pfx, &hn, n),
+                AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn, n, hidden),
                 AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
             });
             let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
