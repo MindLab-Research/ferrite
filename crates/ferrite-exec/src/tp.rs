@@ -554,6 +554,8 @@ where
 
         if self.full_cfg.mhc {
             // ---- attention half: hc_pre → norm → attn (per shard) → AR → hc_post ----
+            let timing = std::env::var_os("FERRITE_TIMING").is_some() && n == 1;
+            let t0 = std::time::Instant::now();
             let (hc_fn, hc_scale, hc_base) = {
                 let s0 = &self.shards[0];
                 (
@@ -582,11 +584,14 @@ where
                 }
                 hn
             };
+            let t1 = std::time::Instant::now(); // hc_pre+rmsnorm done
             let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
                 AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn, n, hidden),
                 AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
             });
+            let t_attn = std::time::Instant::now();
             let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+            let t_ar = std::time::Instant::now();
             if probe {
                 // tagged by GDN path (FERRITE_GDN_DEV=1 → "dev" else "cpu") —
                 // the CPU-vs-device divergence pinpoints WHERE garbage starts.
@@ -598,6 +603,7 @@ where
             let res3 =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), residual.as_slice().to_vec());
             let res2 = crate::mhc::hc_post(&attn_out, &res3, &post_a, &comb_a);
+            let t_hc2 = std::time::Instant::now(); // attn hc_post done
             if probe {
                 let bytes: Vec<u8> = res2.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write("/tmp/l0_res2.f32", bytes).ok();
@@ -627,11 +633,14 @@ where
                 let s0 = &self.shards[0];
                 s0.rmsnorm(&li2, &format!("{pfx}.post_attention_layernorm.weight"))?
             };
+            let t_fpre = std::time::Instant::now(); // ffn hc_pre+rmsnorm done
             let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
                 MlpKind::Dense => s.dense_ffn(&pfx, &hfn, n),
                 MlpKind::Moe => s.moe_ffn(&pfx, &hfn, n),
             });
+            let t_ffn = std::time::Instant::now();
             let ffn_out = all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+            let t_far = std::time::Instant::now();
             if probe {
                 let bytes: Vec<u8> = ffn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write("/tmp/l0_ffn.f32", bytes).ok();
@@ -639,6 +648,19 @@ where
             let res3b =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), res2_flat.as_slice().to_vec());
             let res_out = crate::mhc::hc_post(&ffn_out, &res3b, &post_f, &comb_f);
+            if timing {
+                let t_end = std::time::Instant::now();
+                let ak = match plan.attn { AttnKind::Linear => "gdn", AttnKind::Dsa => "dsa" };
+                let mk = match plan.mlp { MlpKind::Dense => "dense", MlpKind::Moe => "moe" };
+                eprintln!(
+                    "[timing] L{layer_idx:2} {ak}/{mk} hcp={:4.1} at={:6.1} ar={:4.1} hcp2={:4.1} fp={:4.1} ffn={:6.1} far={:4.1} hc3={:4.1} tot={:6.1}ms",
+                    (t1 - t0).as_secs_f32() * 1e3, (t_attn - t1).as_secs_f32() * 1e3,
+                    (t_ar - t_attn).as_secs_f32() * 1e3, (t_hc2 - t_ar).as_secs_f32() * 1e3,
+                    (t_fpre - t_hc2).as_secs_f32() * 1e3, (t_ffn - t_fpre).as_secs_f32() * 1e3,
+                    (t_far - t_ffn).as_secs_f32() * 1e3, (t_end - t_far).as_secs_f32() * 1e3,
+                    (t_end - t0).as_secs_f32() * 1e3,
+                );
+            }
             if std::env::var_os("FERRITE_TRACE_NAN").is_some() {
                 let (mut mx, mut sum) = (0.0f32, 0.0f32);
                 for v in res_out.as_slice() {
