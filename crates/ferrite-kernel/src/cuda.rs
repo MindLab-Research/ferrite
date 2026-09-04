@@ -67,6 +67,10 @@ extern "C" {
 
 const CUDA_MEMCPY_H2D: i32 = 1;
 const CUDA_MEMCPY_D2H: i32 = 2;
+extern "C" {
+    fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
+                        count: usize, kind: i32, stream: CuStream) -> i32;
+}
 
 fn ck(err: i32, what: &str) -> Result<()> {
     if err == 0 {
@@ -84,29 +88,82 @@ fn ck(err: i32, what: &str) -> Result<()> {
     }
 }
 
-/// A device buffer (owned).
+// ============================================================
+// Activation buffer pool — per-device, size-class bucketed.
+// Per-op cudaMalloc/cudaFree are device-synchronising calls that dominate the
+// op-latency budget (tens of thousands of ops per token across a TP cluster);
+// pooled reuse removes them entirely after warmup.
+// ============================================================
+thread_local! {
+    static BUF_POOL: std::cell::RefCell<
+        std::collections::HashMap<(i32, u32), Vec<*mut std::ffi::c_void>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void) {
+    BUF_POOL.with_borrow_mut(|p| p.entry((dev, class)).or_default().push(ptr));
+}
+
+fn buf_pool_take(dev: i32, class: u32) -> Option<*mut std::ffi::c_void> {
+    BUF_POOL.with_borrow_mut(|p| p.get_mut(&(dev, class)).and_then(|v| v.pop()))
+}
+
+/// Drop all pooled activation buffers (weights are owned by the weight cache).
+/// Called from CudaBackend::Drop; leaks of freed devices are reclaimed by CUDA
+/// context teardown at exit.
+pub fn clear_activation_pool() {
+    BUF_POOL.with_borrow_mut(|p| {
+        for ((dev, _), ptrs) in p.drain() {
+            unsafe { cudaSetDevice(dev) };
+            for ptr in ptrs {
+                unsafe { cudaFree(ptr) };
+            }
+        }
+    });
+}
+
+/// A device buffer (pooled). `len` is the requested length; `class` the
+/// size class (next power of two ≥ len) used for pooling.
 struct DevBuf {
     ptr: *mut std::ffi::c_void,
     len: usize,
+    class: u32,
+    dev: i32,
+    stream: CuStream,
 }
 
 impl DevBuf {
-    fn alloc(len: usize) -> Result<Self> {
+    /// Pooled alloc: reuse a released buffer of the same size class when
+    /// available, else cudaMalloc. The caller must have `enter()`ed the
+    /// backend's device (alloc binds to the current device).
+    fn alloc(dev: i32, stream: CuStream, len: usize) -> Result<Self> {
+        let class = (len.max(1) as u32).next_power_of_two();
+        if let Some(ptr) = buf_pool_take(dev, class) {
+            return Ok(DevBuf { ptr, len, class, dev, stream });
+        }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut ptr, len * std::mem::size_of::<f32>()) }, "malloc")?;
-        Ok(DevBuf { ptr, len })
+        ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
+        Ok(DevBuf { ptr, len, class, dev, stream })
     }
+    /// Async H2D on this buffer's stream — ordering is guaranteed by
+    /// stream submission order; the op tail sync (before the CPU reads the
+    /// output tensor) is the only synchronisation point left.
     fn upload(&self, host: &[f32]) -> Result<()> {
         assert!(host.len() <= self.len);
         ck(unsafe {
-            cudaMemcpy(self.ptr, host.as_ptr() as *const _, host.len() * 4, CUDA_MEMCPY_H2D)
+            cudaMemcpyAsync(self.ptr, host.as_ptr() as *const _, host.len() * 4, CUDA_MEMCPY_H2D, self.stream)
         }, "memcpy H2D")
     }
+    /// Async D2H followed by a stream sync — the ONLY synchronisation point
+    /// of an op (the CPU must read the tensor right after; keeping it inside
+    /// lets every run_* drop its mid-op sync, so a pipeline of upload→kernel→
+    /// download submits fully asynchronously and synchronises once).
     fn download(&self, host: &mut [f32]) -> Result<()> {
         assert!(host.len() <= self.len);
         ck(unsafe {
-            cudaMemcpy(host.as_mut_ptr() as *mut _, self.ptr, host.len() * 4, CUDA_MEMCPY_D2H)
-        }, "memcpy D2H")
+            cudaMemcpyAsync(host.as_mut_ptr() as *mut _, self.ptr, host.len() * 4, CUDA_MEMCPY_D2H, self.stream)
+        }, "memcpy D2H")?;
+        ck(unsafe { cudaStreamSynchronize(self.stream) }, "sync after D2H")
     }
     fn as_f32(&self) -> *mut f32 {
         self.ptr as *mut f32
@@ -117,9 +174,10 @@ impl DevBuf {
 }
 
 impl Drop for DevBuf {
+    /// Return the buffer to the per-device pool instead of cudaFree.
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { cudaFree(self.ptr) };
+            buf_pool_release(self.dev, self.class, self.ptr);
         }
     }
 }
@@ -292,7 +350,7 @@ impl CudaBackend {
     /// device. Building block for fused op chains (expert FFN).
     fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
         let dw = self.dev_weight(w)?;
-        let do_ = DevBuf::alloc(n as usize * out_f as usize)?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
         ck(unsafe {
             ferrite_matmul(x_dev.as_const_f32(), dw.as_const_f32(), dbias, do_.as_f32(), n, in_f, out_f, self.stream)
@@ -302,7 +360,7 @@ impl CudaBackend {
 
     /// Fused SwiGLU on device: reads two independent matmul outputs.
     fn swiglu2_dev(&self, gate: &DevBuf, up: &DevBuf, n: i32, inter: i32, limit: f32) -> Result<DevBuf> {
-        let out = DevBuf::alloc(n as usize * inter as usize)?;
+        let out = DevBuf::alloc(self.dev, self.stream, n as usize * inter as usize)?;
         ck(unsafe {
             ferrite_swiglu2(gate.as_const_f32(), up.as_const_f32(), out.as_f32(), n, inter, limit, self.stream)
         }, "swiglu2")?;
@@ -313,19 +371,18 @@ impl CudaBackend {
         let n = x.shape.0[0] as i32;
         let in_f = x.shape.0[1] as i32;
         let out_f = w.shape.0[0] as i32;
-        let dx = DevBuf::alloc(x.numel())?; dx.upload(x.as_slice())?;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
         let dw = self.dev_weight(w)?;
         let db = match bias {
             Some(b) => Some(self.dev_weight(b)?),
             None => None,
         };
-        let do_ = DevBuf::alloc(out.numel())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe {
             ferrite_matmul(dx.as_const_f32(), dw.as_const_f32(),
                            db.as_ref().map_or(std::ptr::null(), |b| b.as_const_f32()),
                            do_.as_f32(), n, in_f, out_f, self.stream)
         }, "matmul")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -477,11 +534,10 @@ impl crate::KernelBackend for CudaBackend {
         self.enter();
         let n = (x.numel() / w.numel()) as i32;
         let dim = w.numel() as i32;
-        let dx = DevBuf::alloc(x.numel())?; dx.upload(x.as_slice())?;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
         let dw = self.dev_weight(w)?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_rmsnorm(dx.as_const_f32(), dw.as_const_f32(), do_.as_f32(), n, dim, eps, self.stream) }, "rmsnorm")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -491,12 +547,11 @@ impl crate::KernelBackend for CudaBackend {
         self.enter();
         let n = (x.numel() / w.numel()) as i32;
         let dim = w.numel() as i32;
-        let dx = DevBuf::alloc(x.numel())?; dx.upload(x.as_slice())?;
-        let dg = DevBuf::alloc(gate.numel())?; dg.upload(gate.as_slice())?;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
+        let dg = DevBuf::alloc(self.dev, self.stream, gate.numel())?; dg.upload(gate.as_slice())?;
         let dw = self.dev_weight(w)?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_gated_rmsnorm(dx.as_const_f32(), dg.as_const_f32(), dw.as_const_f32(), do_.as_f32(), n, dim, eps, self.stream) }, "gated_rmsnorm")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -506,10 +561,9 @@ impl crate::KernelBackend for CudaBackend {
         self.enter();
         let n = out.shape.0[0] as i32;
         let inter = out.shape.0[1] as i32;
-        let dgu = DevBuf::alloc(gate_up.numel())?; dgu.upload(gate_up.as_slice())?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let dgu = DevBuf::alloc(self.dev, self.stream, gate_up.numel())?; dgu.upload(gate_up.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_swiglu(dgu.as_const_f32(), do_.as_f32(), n, inter, limit, self.stream) }, "swiglu")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -520,13 +574,12 @@ impl crate::KernelBackend for CudaBackend {
         let n = x.shape.0[0] as i32;
         let ch = x.shape.0[1] as i32;
         let conv = w.shape.0[1] as i32;
-        let dx = DevBuf::alloc(x.numel())?; dx.upload(x.as_slice())?;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
         let dw = self.dev_weight(w)?;
-        let dsi = DevBuf::alloc(state_in.numel())?; dsi.upload(state_in.as_slice())?;
-        let do_ = DevBuf::alloc(out.numel())?;
-        let dso = DevBuf::alloc(state_out.numel())?;
+        let dsi = DevBuf::alloc(self.dev, self.stream, state_in.numel())?; dsi.upload(state_in.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
+        let dso = DevBuf::alloc(self.dev, self.stream, state_out.numel())?;
         ck(unsafe { ferrite_causal_conv1d(dx.as_const_f32(), dw.as_const_f32(), dsi.as_const_f32(), do_.as_f32(), dso.as_f32(), n, ch, conv, self.stream) }, "conv1d")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         let sv = Arc::get_mut(&mut state_out.data).expect("unique state");
@@ -545,18 +598,17 @@ impl crate::KernelBackend for CudaBackend {
         let h = a_log.numel() as i32;
         let dk = *q.shape.0.last().unwrap() as i32;
         let dv = *v.shape.0.last().unwrap() as i32;
-        let dq = DevBuf::alloc(q.numel())?; dq.upload(q.as_slice())?;
-        let dk_ = DevBuf::alloc(k.numel())?; dk_.upload(k.as_slice())?;
-        let dv_ = DevBuf::alloc(v.numel())?; dv_.upload(v.as_slice())?;
-        let db = DevBuf::alloc(beta.numel())?; db.upload(beta.as_slice())?;
-        let dg = DevBuf::alloc(gate.numel())?; dg.upload(gate.as_slice())?;
+        let dq = DevBuf::alloc(self.dev, self.stream, q.numel())?; dq.upload(q.as_slice())?;
+        let dk_ = DevBuf::alloc(self.dev, self.stream, k.numel())?; dk_.upload(k.as_slice())?;
+        let dv_ = DevBuf::alloc(self.dev, self.stream, v.numel())?; dv_.upload(v.as_slice())?;
+        let db = DevBuf::alloc(self.dev, self.stream, beta.numel())?; db.upload(beta.as_slice())?;
+        let dg = DevBuf::alloc(self.dev, self.stream, gate.numel())?; dg.upload(gate.as_slice())?;
         let dal = self.dev_weight(a_log)?;
         // WYF chunkwise: state ping-pong buffers (chunk chain), tail chunk
         // falls back to the exact per-token kernel inside the launcher.
-        let dst_a = DevBuf::alloc(state_in.numel())?; dst_a.upload(state_in.as_slice())?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let dst_a = DevBuf::alloc(self.dev, self.stream, state_in.numel())?; dst_a.upload(state_in.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_gdn_chunk(dq.as_const_f32(), dk_.as_const_f32(), dv_.as_const_f32(), db.as_const_f32(), dg.as_const_f32(), dal.as_const_f32(), dst_a.as_f32(), do_.as_f32(), n, h, dk, dv, self.stream) }, "gdn_chunk")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         let sv = Arc::get_mut(&mut state_out.data).expect("unique state");
@@ -584,12 +636,11 @@ impl crate::KernelBackend for CudaBackend {
                 "indexer_topk: q_idx [n,H*D] vs w [n,H] head mismatch".into(),
             ));
         }
-        let dq = DevBuf::alloc(q_idx.numel())?; dq.upload(q_idx.as_slice())?;
-        let dk = DevBuf::alloc(k_idx.numel())?; dk.upload(k_idx.as_slice())?;
-        let dw = DevBuf::alloc(w.numel())?; dw.upload(w.as_slice())?;
-        let di = DevBuf::alloc(idx.numel())?;
+        let dq = DevBuf::alloc(self.dev, self.stream, q_idx.numel())?; dq.upload(q_idx.as_slice())?;
+        let dk = DevBuf::alloc(self.dev, self.stream, k_idx.numel())?; dk.upload(k_idx.as_slice())?;
+        let dw = DevBuf::alloc(self.dev, self.stream, w.numel())?; dw.upload(w.as_slice())?;
+        let di = DevBuf::alloc(self.dev, self.stream, idx.numel())?;
         ck(unsafe { ferrite_indexer_topk(dq.as_const_f32(), dk.as_const_f32(), dw.as_const_f32(), di.as_f32(), n, t, h, d, topk as i32, ctx0 as i32, self.stream) }, "indexer_topk")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut idx.data).expect("unique idx");
         di.download(ov)?;
         Ok(())
@@ -603,13 +654,12 @@ impl crate::KernelBackend for CudaBackend {
         let d = *q.shape.0.last().unwrap() as i32;
         let dv = *v.shape.0.last().unwrap() as i32;
         let topk = *idx.shape.0.last().unwrap() as i32;
-        let dq = DevBuf::alloc(q.numel())?; dq.upload(q.as_slice())?;
-        let dk = DevBuf::alloc(k_nope.numel())?; dk.upload(k_nope.as_slice())?;
-        let dv_ = DevBuf::alloc(v.numel())?; dv_.upload(v.as_slice())?;
-        let di = DevBuf::alloc(idx.numel())?; di.upload(idx.as_slice())?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let dq = DevBuf::alloc(self.dev, self.stream, q.numel())?; dq.upload(q.as_slice())?;
+        let dk = DevBuf::alloc(self.dev, self.stream, k_nope.numel())?; dk.upload(k_nope.as_slice())?;
+        let dv_ = DevBuf::alloc(self.dev, self.stream, v.numel())?; dv_.upload(v.as_slice())?;
+        let di = DevBuf::alloc(self.dev, self.stream, idx.numel())?; di.upload(idx.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_sparse_attn(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), n, t, h, d, dv, topk, self.stream) }, "sparse_attn")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -619,13 +669,12 @@ impl crate::KernelBackend for CudaBackend {
         self.enter();
         let n = logits.shape.0[0] as i32;
         let e = logits.shape.0[1] as i32;
-        let dl = DevBuf::alloc(logits.numel())?; dl.upload(logits.as_slice())?;
+        let dl = DevBuf::alloc(self.dev, self.stream, logits.numel())?; dl.upload(logits.as_slice())?;
         let db = self.dev_weight(bias)?;
-        let dp = DevBuf::alloc(probs.numel())?;
+        let dp = DevBuf::alloc(self.dev, self.stream, probs.numel())?;
         // ids on the CPU backend are f32-valued; the kernel writes i32.
-        let di = DevBuf::alloc(n as usize * topk)?;
+        let di = DevBuf::alloc(self.dev, self.stream, n as usize * topk)?;
         ck(unsafe { ferrite_moe_route(dl.as_const_f32(), db.as_const_f32(), dp.as_f32(), di.as_f32(), n, e, topk as i32, routed_scaling, self.stream) }, "moe_route")?;
-        self.sync()?;
         let pv = Arc::get_mut(&mut probs.data).expect("unique probs");
         dp.download(pv)?;
         let iv = Arc::get_mut(&mut ids.data).expect("unique ids");
@@ -641,13 +690,12 @@ impl crate::KernelBackend for CudaBackend {
         let n = x.shape.0[0] as i32;
         let in_f = x.shape.0[1] as i32;
         let inter = gate_w.shape.0[0] as i32;
-        let dx = DevBuf::alloc(x.numel())?;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?;
         dx.upload(x.as_slice())?;
         let gate = self.matmul_dev(&dx, gate_w, n, in_f, inter)?;
         let up = self.matmul_dev(&dx, up_w, n, in_f, inter)?;
         let act = self.swiglu2_dev(&gate, &up, n, inter, swiglu_limit)?;
         let dout = self.matmul_dev(&act, down_w, n, inter, in_f)?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         dout.download(ov)?;
         Ok(())
@@ -657,10 +705,9 @@ impl crate::KernelBackend for CudaBackend {
         self.enter();
         let dim = *logits.shape.0.last().unwrap() as i32;
         let n = (logits.numel() / dim as usize) as i32;
-        let dl = DevBuf::alloc(logits.numel())?; dl.upload(logits.as_slice())?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let dl = DevBuf::alloc(self.dev, self.stream, logits.numel())?; dl.upload(logits.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_argmax(dl.as_const_f32(), do_.as_f32(), n, dim, self.stream) }, "argmax")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -670,10 +717,9 @@ impl crate::KernelBackend for CudaBackend {
         self.enter();
         let dim = *logits.shape.0.last().unwrap() as i32;
         let n = (logits.numel() / dim as usize) as i32;
-        let dl = DevBuf::alloc(logits.numel())?; dl.upload(logits.as_slice())?;
-        let do_ = DevBuf::alloc(out.numel())?;
+        let dl = DevBuf::alloc(self.dev, self.stream, logits.numel())?; dl.upload(logits.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe { ferrite_softmax(dl.as_const_f32(), do_.as_f32(), n, dim, self.stream) }, "softmax")?;
-        self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
