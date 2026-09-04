@@ -584,6 +584,11 @@ impl CudaBackend {
         self.dev
     }
 
+    /// This backend's CUDA stream (for NCCL comm init / external enqueue).
+    pub fn stream_handle(&self) -> CuStream {
+        self.stream
+    }
+
     /// This backend's stream (device-chain ops submit here; the graph
     /// capture/replay uses it too).
     pub fn stream(&self) -> CuStream {

@@ -326,3 +326,10 @@ mod tests {
         }
     }
 }
+
+// Cross-thread use: NCCL communicators are thread-safe for collective calls
+// (each channel is bound to one stream; the TP fan_out workers each drive
+// their own rank's channel). The raw comm pointer is not inherently Send,
+// but single-process init_all comms are valid process-wide.
+unsafe impl Send for NcclChannel {}
+unsafe impl Sync for NcclChannel {}

@@ -322,6 +322,10 @@ pub struct TpCluster<B: KernelBackend> {
     graph_captured: bool,
     /// CUDA graph: warmup/capture/replay step counter (FERRITE_GRAPH=1 path).
     graph_step: u32,
+    /// NCCL all-reduce channels (one per rank, single-process init_all).
+    /// FERRITE_NCCL=1: replaces the host-side partial download → CPU sum →
+    /// re-upload round-trip per attention/ffn segment (~0.6ms/layer).
+    nccl: Option<std::sync::Arc<Vec<ferrite_kernel::nccl::NcclChannel>>>,
 }
 
 impl<B: KernelBackend> TpCluster<B> {
@@ -348,7 +352,42 @@ impl<B: KernelBackend> TpCluster<B> {
             engine.tp_expert_range = Some((rank * per, (rank + 1) * per));
             shards.push(engine);
         }
-        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0 }
+        let nccl = if std::env::var_os("FERRITE_NCCL").is_some() {
+            #[cfg(feature = "cuda")]
+            {
+                let devices: Vec<i32> = (0..world as i32).collect();
+                let streams: Vec<ferrite_kernel::cuda::CuStream> = shards
+                    .iter()
+                    .filter_map(|s| s.backend.as_cuda().map(|c| c.stream_handle()))
+                    .collect();
+                match ferrite_kernel::nccl::NcclGroup::init_all(&devices, &streams) {
+                    Ok(ch) => {
+                        eprintln!("[serve] NCCL all-reduce up ({} ranks)", world);
+                        // Hand each shard its own channel — the device chains
+                        // (attn/ffn) all-reduce on-stream before their
+                        // download; rank 0's partial is already the sum.
+                        let arcs: Vec<std::sync::Arc<ferrite_kernel::nccl::NcclChannel>> =
+                            ch.into_iter().map(std::sync::Arc::new).collect();
+                        for (rank, shard) in shards.iter_mut().enumerate() {
+                            shard.nccl = Some(arcs[rank].clone());
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("[serve] NCCL init failed ({e:?}) — falling back to host all-reduce");
+                        false
+                    }
+                }
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                false
+            }
+        } else {
+            false
+        };
+        let _ = nccl;
+        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0, nccl: None }
     }
 
     fn ensure_seq_all(&mut self, seq: u64, tokens: &[u32]) {
@@ -466,6 +505,12 @@ fn attn_shard(
             la.num_heads, la.head_dim, la.gate_lower_bound,
             s.cfg.rms_norm_eps, la.short_conv_kernel_size,
         )?;
+        if let Some(ch) = &s.nccl {
+            // TP all-reduce on-device (replaces the host download→sum→upload
+            // round-trip; async on this rank's stream — the download below
+            // syncs it, which waits for the whole collective).
+            ch.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        }
         let mut out = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
         {
             let v = std::sync::Arc::get_mut(&mut out.data).expect("unique out");
@@ -982,12 +1027,24 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
 
         // ---- segment 2: fan_out attention (existing device chains) ----
         let t0 = std::time::Instant::now();
+        // NCCL path: the collective runs INSIDE each shard's closure (after
+        // its device chain, before the download) — the rank's download syncs
+        // its stream, which waits for the whole collective. Every rank's
+        // partial then holds the SUM, so rank 0's copy is the all-reduced
+        // attn_out (the host download→sum→upload round-trip is gone).
         let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
             AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn_t, n, hidden),
             AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn_t, n),
         });
         let t_attn = std::time::Instant::now();
-        let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+        let attn_out = if self.shards[0].nccl.is_some() {
+            // NCCL: every rank's partial IS the all-reduced sum (the device
+            // chains all-reduced on-stream before their download) — rank 0's
+            // copy is the answer, no host sum needed.
+            attn_partials.into_iter().next().unwrap()?
+        } else {
+            all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?)
+        };
         let t_ar = std::time::Instant::now();
 
         // ---- segment 3: hc_post → hc_pre2 → rmsnorm2 (GPU chain, no host) ----
@@ -1043,7 +1100,13 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             MlpKind::Moe => s.moe_ffn(&pfx, &hfn_t, n),
         });
         let t_ffn = std::time::Instant::now();
-        let ffn_out = all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+        let ffn_out = if self.shards[0].nccl.is_some() {
+            // NCCL: the MoE/dense device chain all-reduced on-stream; rank 0's
+            // partial IS the sum.
+            ffn_partials.into_iter().next().unwrap()?
+        } else {
+            all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?)
+        };
         let t_far = std::time::Instant::now();
 
         // ---- segment 5: hc_post2 (GPU) → residual out ----

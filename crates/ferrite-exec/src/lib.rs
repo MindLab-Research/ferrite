@@ -61,6 +61,11 @@ pub struct Engine<B: KernelBackend> {
     pub cfg: Glm53FlashConfig,
     pub weights: Weights,
     pub backend: B,
+    /// This shard's NCCL all-reduce channel (single-process TP; set by
+    /// TpCluster when FERRITE_NCCL=1). Device chains all-reduce on-stream
+    /// before their download — rank 0's partial is already the sum, and the
+    /// host download→sum→upload round-trip is gone (~0.6ms/layer).
+    pub nccl: Option<std::sync::Arc<ferrite_kernel::nccl::NcclChannel>>,
     pub scheduler: BatchScheduler,
     pub router: PdafRouter,
     pub plan: StaticPlan,
@@ -94,6 +99,7 @@ impl<B: KernelBackend> Engine<B> {
             cfg,
             weights,
             backend,
+            nccl: None,
             scheduler,
             router,
             plan,
@@ -732,6 +738,11 @@ impl<B: KernelBackend> Engine<B> {
                 x_dev.upload(x.as_slice())?;
                 let family = self.dsa_family_index(layer_idx);
                 let partial = cuda.dsa_layer_dev(&x_dev, &w, seq, family, n, self.cfg.hidden_size)?;
+                if let Some(ch) = &self.nccl {
+                    // TP all-reduce on-device before the download (see
+                    // attn_shard's GDN branch for the reasoning).
+                    ch.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * self.cfg.hidden_size)?;
+                }
                 let mut out = Tensor::zeros(Shape::new([n, self.cfg.hidden_size]), x.dtype);
                 let ov = std::sync::Arc::get_mut(&mut out.data).unwrap();
                 partial.download(ov)?;
@@ -993,8 +1004,15 @@ impl<B: KernelBackend> Engine<B> {
         // which is why fused MoE showed no ffn speedup until now.)
         #[cfg(feature = "cuda")]
         if let Some(cuda) = self.backend.as_cuda() {
+            // FERRITE_NCCL: all-reduce INSIDE the device chain's tail (before
+            // the download) — rank 0's partial is already the sum.
             if std::env::var_os("FERRITE_MOE_DEV").is_some() {
-                return self.moe_ffn_dev(cuda, pfx, x, n);
+                let nccl = if std::env::var_os("FERRITE_NCCL").is_some() {
+                    self.nccl.clone()
+                } else {
+                    None
+                };
+                return self.moe_ffn_dev(cuda, pfx, x, n, nccl.as_deref());
             }
         }
         let cfg = &self.cfg;
@@ -1073,8 +1091,10 @@ impl<B: KernelBackend> Engine<B> {
         pfx: &str,
         x: &Tensor,
         n: usize,
+        nccl: Option<&ferrite_kernel::nccl::NcclChannel>,
     ) -> Result<Tensor> {
         use ferrite_kernel::cuda::{DevBuf, ExpertWeights};
+        let _ = &self.nccl;
         cuda.enter();
         let tm = std::env::var_os("FERRITE_TIMING").is_some();
         let t0 = std::time::Instant::now();
@@ -1113,6 +1133,12 @@ impl<B: KernelBackend> Engine<B> {
         )?;
         let mut out = Tensor::zeros(Shape::new([n, hidden]), x.dtype);
         let ov = std::sync::Arc::get_mut(&mut out.data).unwrap();
+        if let Some(ch) = nccl {
+            // TP all-reduce on-device: every rank's partial becomes the sum;
+            // the download below syncs this rank's stream (waits for the
+            // whole collective).
+            ch.all_reduce_f32(out_dev.as_const_f32(), out_dev.as_f32(), n * hidden)?;
+        }
         out_dev.download(ov)?;
         if tm && n == 1 {
             let t2 = std::time::Instant::now();
