@@ -547,7 +547,9 @@ impl CudaBackend {
         Ok(Self::new())
     }
 
-    fn sync(&self) -> Result<()> {
+    /// Synchronise this backend's stream (public: tests and callers of the
+    /// device-chain APIs need a barrier before wall-clock timings).
+    pub fn sync(&self) -> Result<()> {
         ck(unsafe { cudaStreamSynchronize(self.stream) }, "sync")
     }
 
