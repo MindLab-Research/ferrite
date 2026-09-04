@@ -764,7 +764,12 @@ impl<B: KernelBackend> Engine<B> {
         // the FFN half of the CUDA-graph path). Opt-in during rollout.
         #[cfg(feature = "cuda")]
         if let Some(cuda) = self.backend.as_cuda() {
-            if std::env::var_os("FERRITE_MOE_DEV").is_some() {
+            // n==1 (decode) only — moe_layer_dev dispatches per (token, expert)
+            // pair without dedup: n=8 prefill runs 64 expert chains (8× waste
+            // vs the CPU path's sel-batched dedup); the timing breakdown showed
+            // prefill at 82s (95% of the 86.8s bench) from this. Decode (n=1)
+            // is exactly the 8 expert calls the device chain targets.
+            if std::env::var_os("FERRITE_MOE_DEV").is_some() && n == 1 {
                 return self.moe_ffn_dev(cuda, pfx, x, n);
             }
         }
