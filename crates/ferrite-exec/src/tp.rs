@@ -1216,22 +1216,27 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
     }
 
     fn decode_step_normal(&mut self, seq: u64) -> Result<u32> {
+        let tm = std::env::var_os("FERRITE_TIMING").is_some();
+        let t_start = std::time::Instant::now();
         let last = {
             let s = self.shards[0]
                 .seq_runtime(seq)
                 .ok_or_else(|| FerriteError::Config("missing seq".into()))?;
             *s.tokens.last().ok_or_else(|| FerriteError::Config("empty context".into()))?
         };
+        let t_embed = std::time::Instant::now();
         let h0 = self.shards[0].embed(&[last]);
         let mut h = if self.full_cfg.mhc {
             crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult)
         } else {
             h0
         };
+        let t_layers = std::time::Instant::now();
         let plans = build_layer_plans(&self.full_cfg);
         for plan in &plans {
             h = self.layer_forward_tp(seq, plan.layer_idx, h, 1)?;
         }
+        let t_head = std::time::Instant::now();
         let h_final = if self.full_cfg.mhc {
             crate::mhc::hc_contract(&h, self.full_cfg.hc_mult)
         } else {
@@ -1243,6 +1248,16 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         let mut out = Tensor::zeros(Shape::new([1]), DType::F32);
         s0.backend.argmax_lastdim(&logits, &mut out)?;
         let tok = out.as_slice()[0] as u32;
+        let t_end = std::time::Instant::now();
+        if tm {
+            eprintln!(
+                "[decode] embed={:.2}ms layers={:.2}ms head={:.2}ms total={:.2}ms",
+                (t_embed - t_start).as_secs_f32() * 1e3,
+                (t_head - t_layers).as_secs_f32() * 1e3,
+                (t_end - t_head).as_secs_f32() * 1e3,
+                (t_end - t_start).as_secs_f32() * 1e3,
+            );
+        }
         for s in &mut self.shards {
             if let Some(rt) = s.seq_runtime_mut(seq) {
                 rt.tokens.push(tok);
