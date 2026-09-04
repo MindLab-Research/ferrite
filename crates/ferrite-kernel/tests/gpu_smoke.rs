@@ -266,9 +266,7 @@ fn cuda_smoke_all_ops() {
 /// keeps device addresses stable across capture and replay.
 #[test]
 fn cuda_graph_capture_smoke() {
-    let so = std::env::var("FERRITE_KERNEL_SO")
-        .unwrap_or_else(|_| "kernels/cuda/libferrite_kernels.so".into());
-    let dev = CudaBackend::with_device(&so, 0).unwrap();
+    let dev = CudaBackend::with_device(&so_path(), 0).unwrap();
     use ferrite_kernel::graph::GraphCapable;
     let cpu = CpuBackend::new();
 
