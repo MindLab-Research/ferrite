@@ -719,14 +719,18 @@ impl<B: KernelBackend> Engine<B> {
             for t in 0..n {
                 let off = (t0 + t) * h * dk;
                 c.k_nope.resize(off + h * dk, 0.0);
-                c.k_nope[off..off + h * dk].copy_from_slice(
-                    &kvb.as_slice()[t * h * (dk + dv)..t * h * (dk + dv) + h * dk],
-                );
                 let voff = (t0 + t) * h * dv;
                 c.v.resize(voff + h * dv, 0.0);
-                c.v[voff..voff + h * dv].copy_from_slice(
-                    &kvb.as_slice()[t * h * (dk + dv) + h * dk..t * h * (dk + dv) + h * (dk + dv)],
-                );
+                // kvb is [t, h, dk+dv]: per-head layout — K = [hd, 0:dk], V = [hd, dk:dk+dv].
+                // Extract per-head (strided), NOT contiguous blocks.
+                for hd in 0..h {
+                    // kvb is [n, h*(dk+dv)]: per-head layout row = hd*(dk+dv)
+                    let src = t * h * (dk + dv) + hd * (dk + dv);
+                    c.k_nope[off + hd * dk..off + (hd + 1) * dk]
+                        .copy_from_slice(&kvb.as_slice()[src..src + dk]);
+                    c.v[voff + hd * dv..voff + (hd + 1) * dv]
+                        .copy_from_slice(&kvb.as_slice()[src + dk..src + dk + dv]);
+                }
                 let ioff = (t0 + t) * idm;
                 c.k_idx.resize(ioff + idm, 0.0);
                 c.k_idx[ioff..ioff + idm].copy_from_slice(&ki.as_slice()[t * idm..(t + 1) * idm]);
@@ -855,6 +859,12 @@ impl<B: KernelBackend> Engine<B> {
             std::fs::write("/tmp/l3_dsa_q_sel.f32", b2).ok();
         }
         self.backend.sparse_mla_attn(&q, &k_nope, &v, &idx, &mut out)?;
+        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
+            let b: Vec<u8> = out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write("/tmp/l3_attn_raw.f32", b).ok();
+            let b2: Vec<u8> = v.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write("/tmp/l3_attn_v.f32", b2).ok();
+        }
         let flat = Tensor::from_f32(Shape::new([n, h * dv]), out.as_slice().to_vec());
         self.project(&flat, &format!("{pfx}.self_attn.o_proj.weight"))
     }
