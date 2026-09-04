@@ -463,7 +463,7 @@ where
                     s0.w(&format!("{pfx}.hc_attn_base"))?.clone(),
                 )
             };
-            let (li, post_a, comb_a) = self.shards[0].backend.hc_pre(
+            let (li, post_a, comb_a) = crate::mhc::hc_pre(
                 &residual,
                 &hc_fn,
                 &hc_scale,
@@ -471,7 +471,7 @@ where
                 self.full_cfg.rms_norm_eps,
                 self.full_cfg.hc_eps,
                 self.full_cfg.hc_sinkhorn_iters,
-            )?;
+            );
             let hn = {
                 let s0 = &self.shards[0];
                 let hn = s0.rmsnorm(&li, &format!("{pfx}.input_layernorm.weight"))?;
@@ -494,7 +494,7 @@ where
             }
             let res3 =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), residual.as_slice().to_vec());
-            let res2 = self.shards[0].backend.hc_post(&attn_out, &res3, &post_a, &comb_a)?;
+            let res2 = crate::mhc::hc_post(&attn_out, &res3, &post_a, &comb_a);
             if probe {
                 let bytes: Vec<u8> = res2.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write("/tmp/l0_res2.f32", bytes).ok();
@@ -511,7 +511,7 @@ where
             };
             let res2_flat =
                 Tensor::from_f32(Shape::new([n, hc_mult * hidden]), res2.as_slice().to_vec());
-            let (li2, post_f, comb_f) = self.shards[0].backend.hc_pre(
+            let (li2, post_f, comb_f) = crate::mhc::hc_pre(
                 &res2_flat,
                 &hc_fn2,
                 &hc_scale2,
@@ -519,7 +519,7 @@ where
                 self.full_cfg.rms_norm_eps,
                 self.full_cfg.hc_eps,
                 self.full_cfg.hc_sinkhorn_iters,
-            )?;
+            );
             let hfn = {
                 let s0 = &self.shards[0];
                 s0.rmsnorm(&li2, &format!("{pfx}.post_attention_layernorm.weight"))?
@@ -535,7 +535,7 @@ where
             }
             let res3b =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), res2_flat.as_slice().to_vec());
-            let res_out = self.shards[0].backend.hc_post(&ffn_out, &res3b, &post_f, &comb_f)?;
+            let res_out = crate::mhc::hc_post(&ffn_out, &res3b, &post_f, &comb_f);
             if std::env::var_os("FERRITE_TRACE_NAN").is_some() {
                 let (mut mx, mut sum) = (0.0f32, 0.0f32);
                 for v in res_out.as_slice() {
