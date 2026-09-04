@@ -1060,7 +1060,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         let nh = hc_mult * hidden;
 
         // ---- segment 1: hc_pre + rmsnorm on rank 0's GPU (borrow) ----
-        let (hn_t, res_dev, post_a_dev, comb_a_dev) = {
+        let (hn_host, hn_t, res_dev, post_a_dev, comb_a_dev) = {
             let s0 = &self.shards[0];
             let cuda0 = s0
                 .backend
@@ -1087,10 +1087,40 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             )?;
             let norm_w = s0.w(&format!("{pfx}.input_layernorm.weight"))?;
             let hn_dev = cuda0.rmsnorm_dev(&li_dev, norm_w, self.full_cfg.rms_norm_eps, n, hidden)?;
-            let mut hn = vec![0f32; n * hidden];
-            hn_dev.download(&mut hn)?;
-            let hn_t = Tensor::from_f32(Shape::new([n, hidden]), hn);
-            (hn_t, res_dev, post_a_dev, comb_a_dev)
+            // P2P chain: hn stays on GPU — P2P copy to rank 1-3 (NVLink),
+            // no download/Tensor-construction/re-upload. Each rank's fan_out
+            // closure uses its local copy's device pointer.
+            #[cfg(feature = "cuda")]
+            let (hn_host, hn_t): (Option<Vec<f32>>, Option<Tensor>) =
+                if std::env::var_os("FERRITE_P2P").is_some() {
+                    // P2P: download once (rank 0) — no Tensor::from_f32
+                    // construction (Vec alloc + copy). The fan_out closures
+                    // use this Vec directly.
+                    let mut hn = vec![0f32; n * hidden];
+                    hn_dev.download(&mut hn)?;
+                    (Some(hn), None)
+                } else {
+                    let mut hn = vec![0f32; n * hidden];
+                    hn_dev.download(&mut hn)?;
+                    let hn_t = Tensor::from_f32(Shape::new([n, hidden]), hn);
+                    (None, Some(hn_t))
+                };
+            #[cfg(not(feature = "cuda"))]
+            let (hn_t, hn_ptrs): (Option<Tensor>, Option<Vec<usize>>) = {
+                let mut hn = vec![0f32; n * hidden];
+                hn_dev.download(&mut hn)?;
+                let hn_t = Tensor::from_f32(Shape::new([n, hidden]), hn);
+                (Some(hn_t), None)
+            };
+            (hn_host, hn_t, res_dev, post_a_dev, comb_a_dev)
+        };
+
+        // unified hn slice (P2P: from the downloaded Vec, no Tensor; else from Tensor)
+        #[cfg(feature = "cuda")]
+        let hn_slice: &[f32] = if let Some(ref h) = hn_host {
+            h.as_slice()
+        } else {
+            hn_t.as_ref().unwrap().as_slice()
         };
 
         // ---- segment 2: fan_out attention (existing device chains) ----
@@ -1108,8 +1138,8 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("P2P needs cuda".into()))?;
                     cuda.enter();
-                    let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn_t.numel())?;
-                    x_dev.upload(hn_t.as_slice())?;
+                    let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn_slice.len())?;
+                    x_dev.upload(hn_slice)?;
                     match plan.attn {
                         AttnKind::Linear => {
                             #[cfg(feature = "cuda")]
@@ -1118,7 +1148,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                                 // graph fast path
                                 if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
                                     let gname = format!("gdn{}", layer_idx);
-                                    if let Some(ptr) = cuda.graph_run_dev(&gname, hn_t.as_slice())? {
+                                    if let Some(ptr) = cuda.graph_run_dev(&gname, hn_slice)? {
                                         return Ok(ptr);
                                     }
                                 }
@@ -1191,8 +1221,8 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             } else {
                 // Existing path: Tensor-level fan_out + CPU/host all-reduce
                 let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
-                    AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn_t, n, hidden),
-                    AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn_t, n),
+                    AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, hn_t.as_ref().unwrap(), n, hidden),
+                    AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, hn_t.as_ref().unwrap(), n),
                 });
                 let attn_out = if self.shards[0].nccl.is_some() {
                     attn_partials.into_iter().next().unwrap()?

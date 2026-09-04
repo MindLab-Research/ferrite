@@ -2164,3 +2164,14 @@ impl CudaBackend {
         Ok(Some(io.out_dev as usize))
     }
 }
+
+impl CudaBackend {
+    /// Raw P2P copy (NVLink): copy `count` floats from `src` (on `src_dev`)
+    /// to `dst` (on this device). Public for the hn broadcast in the P2P
+    /// decode chain.
+    pub fn p2p_copy_raw(&self, dst: *mut f32, src: *const f32, src_dev: i32, count: usize) -> Result<()> {
+        self.enter();
+        ck(unsafe { ferrite_p2p_copy(dst, self.dev, src, src_dev, count, self.stream) }, "p2p_copy_raw")?;
+        Ok(())
+    }
+}
