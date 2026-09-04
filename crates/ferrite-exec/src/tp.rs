@@ -991,18 +991,22 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         let t_ar = std::time::Instant::now();
 
         // ---- segment 3: hc_post → hc_pre2 → rmsnorm2 (GPU chain, no host) ----
-        let (hfn_t, res2_dev, post_f_dev, comb_f_dev) = {
+        let timing_mid = std::env::var_os("FERRITE_TIMING").is_some();
+        let (tm_a, tm_b, tm_c, tm_d) = {
             let s0 = &self.shards[0];
             let cuda0 = s0
                 .backend
                 .as_cuda()
                 .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
             cuda0.enter();
+            let ta = std::time::Instant::now();
             let mut attn_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
             attn_dev.upload(attn_out.as_slice())?;
             let res2_dev = cuda0.hc_post_dev(
                 &attn_dev, &res_dev, &post_a_dev, &comb_a_dev, n, hc_mult, hidden,
             )?;
+            cuda0.sync().ok();
+            let tb = std::time::Instant::now();
             let (hc_fn2, hc_scale2, hc_base2) = (
                 s0.w(&format!("{pfx}.hc_ffn_fn"))?,
                 s0.w(&format!("{pfx}.hc_ffn_scale"))?,
@@ -1013,10 +1017,21 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 self.full_cfg.rms_norm_eps, self.full_cfg.hc_eps,
                 self.full_cfg.hc_sinkhorn_iters,
             )?;
+            cuda0.sync().ok();
+            let tc = std::time::Instant::now();
             let norm_w2 = s0.w(&format!("{pfx}.post_attention_layernorm.weight"))?;
             let hfn_dev = cuda0.rmsnorm_dev(&li2_dev, norm_w2, self.full_cfg.rms_norm_eps, n, hidden)?;
             let mut hfn = vec![0f32; n * hidden];
             hfn_dev.download(&mut hfn)?;
+            let td = std::time::Instant::now();
+            if timing_mid && n == 1 {
+                eprintln!(
+                    "[mid] up+hc_post={:4.2}ms hc_pre={:4.2}ms rmsnorm+dl={:4.2}ms",
+                    (tb - ta).as_secs_f32() * 1e3,
+                    (tc - tb).as_secs_f32() * 1e3,
+                    (td - tc).as_secs_f32() * 1e3,
+                );
+            }
             let hfn_t = Tensor::from_f32(Shape::new([n, hidden]), hfn);
             (hfn_t, res2_dev, post_f_dev, comb_f_dev)
         };
