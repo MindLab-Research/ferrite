@@ -2047,3 +2047,13 @@ pub fn memcpy_d2h_sync(src: *mut std::ffi::c_void, dst: *mut f32, floats: usize,
     unsafe { cudaMemcpyAsync(dst as *mut _, src, floats * 4, CUDA_MEMCPY_D2H, s) };
     unsafe { cudaStreamSynchronize(s) }
 }
+
+/// Global serialization for graph capture (experiment): fan_out's 4 rank
+/// workers capture CONCURRENTLY and cuGraphInstantiate crashed inside
+/// libcuda (gdb: SIGSEGV in cuGraphInstantiate from worker #2+). Capture
+/// is a one-time cost per segment — serializing the capture passes (not
+/// the replays) costs nothing steady-state.
+pub fn capture_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}

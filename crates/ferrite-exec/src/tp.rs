@@ -510,10 +510,15 @@ fn attn_shard(
             if cuda.graph_run(&gname, hn.as_slice(), &mut v)? {
                 return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
             }
-            // WARM the n==1 pool classes first: capture forbids cudaMalloc,
-            // and prefill (n==prompt_len) leaves DIFFERENT size classes in
-            // the pool — a cold n==1 class inside capture segfaults.
+            // WARM + CAPTURE under the global capture lock: fan_out's 4
+            // workers capture concurrently and cuGraphInstantiate crashed
+            // inside libcuda (gdb: SIGSEGV). Capture is one-time per
+            // segment — serializing it costs nothing steady-state.
+            let _cap = ferrite_kernel::cuda::capture_lock().lock().unwrap();
             {
+                // WARM the n==1 pool classes first: capture forbids cudaMalloc,
+                // and prefill (n==prompt_len) leaves DIFFERENT size classes in
+                // the pool — a cold n==1 class inside capture segfaults.
                 let wx = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
                 wx.upload(hn.as_slice())?;
                 let _wp = cuda.gdn_layer_dev(
