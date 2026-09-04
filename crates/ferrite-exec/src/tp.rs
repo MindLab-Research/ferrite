@@ -1433,7 +1433,9 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 cuda0.hc_post_dev(&d, &res2_dev, &post_f_dev, &comb_f_dev, n, hc_mult, hidden)?
             };
             // P2P chain: return the DevBuf (no download) — the next layer's
-            // segment 1 uses it directly. Only the last layer downloads.
+            // segment 1 uses it directly. The Tensor is a PLACEHOLDER (the
+            // input residual clone) — only residual_dev matters for the next
+            // layer. The LAST layer's caller must download residual_dev.
             if std::env::var_os("FERRITE_P2P").is_some() {
                 (residual.clone(), Some(res_out_dev))
             } else {
@@ -1475,6 +1477,9 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         };
         let t_layers = std::time::Instant::now();
         let plans = build_layer_plans(&self.full_cfg);
+        let hc_mult2 = self.full_cfg.hc_mult;
+        let hidden2 = self.full_cfg.hidden_size;
+        let nh2 = hc_mult2 * hidden2;
         // P2P chain (FERRITE_P2P + FERRITE_LAYER_DEV): residual stays on GPU
         // across layers — no Tensor download/upload per layer (~0.3ms × 45).
         #[cfg(feature = "cuda")]
@@ -1483,11 +1488,38 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             && self.full_cfg.mhc
         {
             let mut residual_dev: Option<ferrite_kernel::cuda::DevBuf> = None;
+            let mut h_tmp = h.clone();
             for plan in &plans {
-                let (h_new, dev_new) =
-                    self.layer_forward_dev(seq, plan.layer_idx, h, residual_dev, 1)?;
-                h = h_new;
+                let (_h_new, dev_new) =
+                    self.layer_forward_dev(seq, plan.layer_idx, h_tmp, residual_dev, 1)?;
+                // NOTE: h_new is a STALE clone of the input residual (P2P path
+                // returns it as a placeholder). residual_dev holds the ACTUAL
+                // output. After the loop we download the FINAL residual_dev.
+                h_tmp = _h_new;
                 residual_dev = dev_new;
+            }
+            // Download the FINAL residual (the last layer's OUTPUT) — h from
+            // the loop is the last layer's INPUT placeholder, NOT the result.
+            if let Some(ref rd) = residual_dev {
+                let s0 = &self.shards[0];
+                if let Some(cuda0) = s0.backend.as_cuda() {
+                    cuda0.enter();
+                    let mut out = vec![0f32; nh2];
+                    let r = unsafe {
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            rd.as_f32() as *mut std::ffi::c_void,
+                            out.as_mut_ptr(),
+                            nh2,
+                            cuda0.stream_handle(),
+                        )
+                    };
+                    if r != 0 {
+                        return Err(FerriteError::InvalidArg(format!(
+                            "final residual download failed: {r}"
+                        )));
+                    }
+                    h = Tensor::from_f32(Shape::new([1, nh2]), out);
+                }
             }
         } else {
             for plan in &plans {
