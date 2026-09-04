@@ -1102,47 +1102,79 @@ impl CudaBackend {
             },
             "conv1d_dev",
         )?;
-        // 3. fused prep: silu + split + per-head L2 (q/k) + beta + KDA gate
-        let dt_bias_w = self.dev_weight(w.dt_bias)?;
-        let a_log_w = self.dev_weight(w.a_log)?;
-        let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        let beta = DevBuf::alloc(self.dev, self.stream, n * h)?;
-        let gate = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        ck(
-            unsafe {
-                ferrite_gdn_prep(
-                    conv_out.as_const_f32(), b_raw.as_const_f32(), fb.as_const_f32(),
-                    dt_bias_w.as_const_f32(), a_log_w.as_const_f32(),
-                    q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
-                    ni, h as i32, dk as i32, lb, self.stream,
-                )
-            },
-            "gdn_prep",
-        )?;
-        // NaN diagnostic: dump q/beta/gate heads when probed (FERRITE_GDN_PROBE)
-        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
-            let mut qb = vec![0f32; n * h];
-            beta.download(&mut qb)?;
-            let nan_b = qb.iter().filter(|x| x.is_nan()).count();
-            let mut qbuf = vec![0f32; n * h * dk];
-            q.download(&mut qbuf)?;
-            let nan_q = qbuf.iter().filter(|x| x.is_nan()).count();
-            let mut gbuf = vec![0f32; n * h * dk];
-            gate.download(&mut gbuf)?;
-            let nan_g = gbuf.iter().filter(|x| x.is_nan()).count();
-            let gmax = gbuf.iter().fold(0f32, |a, v| if v.is_finite() { a.max(v.abs()) } else { a });
-            eprintln!(
-                "[gdn_dev] L{layer} n={n} h={h} dk={dk}: beta NaN {nan_b}/{} q NaN {nan_q}/{} gate NaN {nan_g}/{} gate_max {gmax:.3e}",
-                n * h, n * h * dk, n * h * dk
-            );
-            let mut cb = vec![0f32; n * ch];
-            conv_out.download(&mut cb)?;
-            let nan_c = cb.iter().filter(|x| x.is_nan()).count();
-            let cmax = cb.iter().fold(0f32, |a, v| if v.is_finite() { a.max(v.abs()) } else { a });
-            eprintln!("[gdn_dev] conv NaN {nan_c}/{} conv_max {cmax:.3e}", n * ch);
+        // 3. HYBRID pre-processing: SiLU/split/L2/beta/gate on CPU (bit-for-bit
+        // parity with the CPU path's Rust code — CUDA expf differs from host
+        // f32::exp by 1 ulp for some inputs, and the GDN recurrence amplifies
+        // this to O(1) divergence with real checkpoint weights). The
+        // pre-processing tensors are small (~74KB/layer for n=1) vs the
+        // matmul weights (GBs) — the H2D/D2H overhead is negligible.
+        let conv_host = {
+            let mut v = vec![0f32; n * ch];
+            conv_out.download(&mut v)?;
+            v
+        };
+        let b_raw_host = {
+            let mut v = vec![0f32; n * h];
+            b_raw.download(&mut v)?;
+            v
+        };
+        let fb_host = {
+            let mut v = vec![0f32; n * proj];
+            fb.download(&mut v)?;
+            v
+        };
+        // gb stays on device (needed for gated_rmsnorm later); also download
+        // for the CPU pre-processing? No — gb is only needed as the rmsnorm
+        // gate (device-side), not for the pre-processing below.
+
+        // ---- CPU pre-processing: IDENTICAL to Engine::linear_attn_forward ----
+        // SiLU conv output (all three q/k/v sections)
+        let mut silu = conv_host;
+        for v in silu.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp());
         }
+        // split q/k/v + L2 norm q,k per head
+        let l2norm_heads = |t: &[f32]| -> Vec<f32> {
+            let mut d = t.to_vec();
+            for i in 0..n * h {
+                let s = &d[i * dk..(i + 1) * dk];
+                let norm: f32 = s.iter().map(|v| v * v).sum::<f32>().sqrt();
+                let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
+                for j in 0..dk {
+                    d[i * dk + j] *= inv;
+                }
+            }
+            d
+        };
+        let q_v = l2norm_heads(&silu[..n * proj]);
+        let k_v = l2norm_heads(&silu[n * proj..2 * n * proj]);
+        let v_v = silu[2 * n * proj..].to_vec();
+        // beta = sigmoid(b_raw)
+        let beta_v: Vec<f32> = b_raw_host.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
+        // gate = lb * sigmoid(exp(A_log) * (fb + dt_bias))
+        let al = w.a_log.as_slice();
+        let db = w.dt_bias.as_slice();
+        let mut gate_v = vec![0.0f32; n * proj];
+        for t in 0..n {
+            for hd in 0..h {
+                let a = al[hd].exp();
+                for j in 0..dk {
+                    let g = fb_host[t * proj + hd * dk + j] + db[hd * dk + j];
+                    gate_v[t * proj + hd * dk + j] = lb * (1.0 / (1.0 + (-(a * g)).exp()));
+                }
+            }
+        }
+        // ---- upload pre-processing results to device ----
+        let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        q.upload(&q_v)?;
+        let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        k.upload(&k_v)?;
+        let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        v.upload(&v_v)?;
+        let beta = DevBuf::alloc(self.dev, self.stream, n * h)?;
+        beta.upload(&beta_v)?;
+        let gate = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        gate.upload(&gate_v)?;
         // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
         // blocks read-modify-write their own slice; single buffer is safe)
         let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;
@@ -1151,7 +1183,7 @@ impl CudaBackend {
             unsafe {
                 ferrite_gdn_chunk(
                     q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
-                    beta.as_const_f32(), gate.as_const_f32(), a_log_w.as_const_f32(),
+                    beta.as_const_f32(), gate.as_const_f32(), self.dev_weight(w.a_log)?.as_const_f32(),
                     gdn_state, core.as_f32(), ni, h as i32, dk as i32, dk as i32, self.stream,
                 )
             },
