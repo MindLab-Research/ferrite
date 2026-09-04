@@ -1087,24 +1087,113 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
 
         // ---- segment 2: fan_out attention (existing device chains) ----
         let t0 = std::time::Instant::now();
-        // NCCL path: the collective runs INSIDE each shard's closure (after
-        // its device chain, before the download) — the rank's download syncs
-        // its stream, which waits for the whole collective. Every rank's
-        // partial then holds the SUM, so rank 0's copy is the all-reduced
-        // attn_out (the host download→sum→upload round-trip is gone).
-        let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
-            AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn_t, n, hidden),
-            AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn_t, n),
-        });
+        // P2P path (FERRITE_P2P=1): fan_out returns DEVICE POINTERS (no
+        // download), rank 0 P2P-copies the partials via NVLink and sums
+        // on-device — the attn_out NEVER crosses to the host.
+        #[cfg(feature = "cuda")]
+        let (attn_out_dev, attn_out_t) =
+            if std::env::var_os("FERRITE_P2P").is_some() {
+                let ptrs: Vec<Result<usize>> = Self::fan_out(&mut self.shards, |s| {
+                    use ferrite_kernel::cuda::DevBuf;
+                    let cuda = s
+                        .backend
+                        .as_cuda()
+                        .ok_or_else(|| FerriteError::Config("P2P needs cuda".into()))?;
+                    cuda.enter();
+                    let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn_t.numel())?;
+                    x_dev.upload(hn_t.as_slice())?;
+                    match plan.attn {
+                        AttnKind::Linear => {
+                            #[cfg(feature = "cuda")]
+                            {
+                                use ferrite_kernel::cuda::GdnLayerWeights;
+                                // graph fast path
+                                if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+                                    let gname = format!("gdn{}", layer_idx);
+                                    if let Some(ptr) = cuda.graph_run_dev(&gname, hn_t.as_slice())? {
+                                        return Ok(ptr);
+                                    }
+                                }
+                                let la = &s.cfg.linear_attn;
+                                let gw = GdnLayerWeights {
+                                    qkv_proj: s.w(&format!("{pfx}.self_attn.qkv_proj.weight"))?,
+                                    b_proj: s.w(&format!("{pfx}.self_attn.b_proj.weight"))?,
+                                    f_a: s.w(&format!("{pfx}.self_attn.f_a_proj.weight"))?,
+                                    f_b: s.w(&format!("{pfx}.self_attn.f_b_proj.weight"))?,
+                                    g_a: s.w(&format!("{pfx}.self_attn.g_a_proj.weight"))?,
+                                    g_b: s.w(&format!("{pfx}.self_attn.g_b_proj.weight"))?,
+                                    conv_w: s.w(&format!("{pfx}.self_attn.qkv_conv1d.weight"))?,
+                                    dt_bias: s.w(&format!("{pfx}.self_attn.dt_bias"))?,
+                                    a_log: s.w(&format!("{pfx}.self_attn.A_log"))?,
+                                    o_norm: s.w(&format!("{pfx}.self_attn.o_norm.weight"))?,
+                                    o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                                };
+                                let partial = cuda.gdn_layer_dev(
+                                    &x_dev, &gw, seq, layer_idx, n, hidden,
+                                    la.num_heads, la.head_dim, la.gate_lower_bound,
+                                    s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+                                )?;
+                                Ok(partial.as_f32() as usize)
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            { unreachable!() }
+                        }
+                        AttnKind::Dsa => {
+                            #[cfg(feature = "cuda")]
+                            {
+                                use ferrite_kernel::cuda::DsaLayerWeights;
+                                let d = &s.cfg.dsa;
+                                let (h, dk, dv, _ip) = s.dsa_dims();
+                                let w = DsaLayerWeights {
+                                    q_a: s.w(&format!("{pfx}.self_attn.q_a_proj.weight"))?,
+                                    q_a_ln: s.w(&format!("{pfx}.self_attn.q_a_layernorm.weight"))?,
+                                    q_b: s.w(&format!("{pfx}.self_attn.q_b_proj.weight"))?,
+                                    kv_a: s.w(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))?,
+                                    kv_a_ln: s.w(&format!("{pfx}.self_attn.kv_a_layernorm.weight"))?,
+                                    kv_b: s.w(&format!("{pfx}.self_attn.kv_b_proj.weight"))?,
+                                    wq_b: s.w(&format!("{pfx}.self_attn.indexer.wq_b.weight"))?,
+                                    wk: s.w(&format!("{pfx}.self_attn.indexer.wk.weight"))?,
+                                    k_norm_w: s.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?,
+                                    k_norm_b: s.w(&format!("{pfx}.self_attn.indexer.k_norm.bias"))?,
+                                    weights_proj: s.w(&format!("{pfx}.self_attn.indexer.weights_proj.weight"))?,
+                                    gate: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?,
+                                    ape: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?,
+                                    o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                                    h, dk, dv,
+                                    ih: d.index_n_heads,
+                                    idm: d.index_head_dim,
+                                    kpool: 4,
+                                    topk: d.index_topk,
+                                    rms_eps: s.cfg.rms_norm_eps,
+                                };
+                                let family = s.dsa_family_index(layer_idx);
+                                let partial = cuda.dsa_layer_dev(&x_dev, &w, seq, family, n, hidden)?;
+                                Ok(partial.as_f32() as usize)
+                            }
+                            #[cfg(not(feature = "cuda"))]
+                            { unreachable!() }
+                        }
+                    }
+                });
+                let ptrs: Vec<usize> =
+                    ptrs.into_iter().collect::<Result<Vec<_>>>()?;
+                let cuda0 = self.shards[0].backend.as_cuda().unwrap();
+                let attn_out_dev = cuda0.p2p_all_reduce(&ptrs, n * hidden)?;
+                (Some(attn_out_dev), None)
+            } else {
+                // Existing path: Tensor-level fan_out + CPU/host all-reduce
+                let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
+                    AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn_t, n, hidden),
+                    AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn_t, n),
+                });
+                let attn_out = if self.shards[0].nccl.is_some() {
+                    attn_partials.into_iter().next().unwrap()?
+                } else {
+                    all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?)
+                };
+                (None, Some(attn_out))
+            };
         let t_attn = std::time::Instant::now();
-        let attn_out = if self.shards[0].nccl.is_some() {
-            // NCCL: every rank's partial IS the all-reduced sum (the device
-            // chains all-reduced on-stream before their download) — rank 0's
-            // copy is the answer, no host sum needed.
-            attn_partials.into_iter().next().unwrap()?
-        } else {
-            all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?)
-        };
         let t_ar = std::time::Instant::now();
 
         // ---- segment 3: hc_post → hc_pre2 → rmsnorm2 (GPU chain, no host) ----
@@ -1117,11 +1206,16 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
             cuda0.enter();
             let ta = std::time::Instant::now();
-            let mut attn_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
-            attn_dev.upload(attn_out.as_slice())?;
-            let res2_dev = cuda0.hc_post_dev(
-                &attn_dev, &res_dev, &post_a_dev, &comb_a_dev, n, hc_mult, hidden,
-            )?;
+            // P2P: attn_out_dev is already on GPU (p2p_all_reduce result) —
+            // no upload. Non-P2P: upload the host Tensor.
+            #[cfg(feature = "cuda")]
+            let res2_dev = if let Some(ref dev) = attn_out_dev {
+                cuda0.hc_post_dev(dev, &res_dev, &post_a_dev, &comb_a_dev, n, hc_mult, hidden)?
+            } else {
+                let mut d = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
+                d.upload(attn_out_t.as_ref().unwrap().as_slice())?;
+                cuda0.hc_post_dev(&d, &res_dev, &post_a_dev, &comb_a_dev, n, hc_mult, hidden)?
+            };
             cuda0.sync().ok();
             let tb = std::time::Instant::now();
             let (hc_fn2, hc_scale2, hc_base2) = (
