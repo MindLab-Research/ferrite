@@ -21,3 +21,4 @@ ferrite-model = { path = "../ferrite-model" }
 ferrite-kernel = { path = "../ferrite-kernel" }
 ferrite-exec = { path = "../ferrite-exec" }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+pprof = { version = "0.13", features = ["flamegraph"] }

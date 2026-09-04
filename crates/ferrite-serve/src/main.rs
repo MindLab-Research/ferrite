@@ -38,6 +38,20 @@ fn main() {
     let lib = get_arg("--lib", "kernels/cuda/libferrite_kernels.so");
     let prompt = get_arg("--prompt", "你好，介绍一下你自己。");
 
+    // ---- built-in CPU profiler (Go-pprof style): FERRITE_PPROF=1 starts a
+    // 1000 Hz SIGPROF sampler; on exit the flamegraph lands in
+    // FERRITE_PPROF_OUT (default serve.flamegraph.svg). Replaces external
+    // gdb-attach sampling — continuous, zero-perturbation, standard tooling.
+    let profiler = std::env::var_os("FERRITE_PPROF").map(|_| {
+        let g = pprof::ProfilerGuardBuilder::default()
+            .frequency(1000)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .expect("pprof guard (FERRITE_PPROF=1)");
+        println!("[serve] pprof sampling active (1000 Hz; flamegraph on exit)");
+        g
+    });
+
     // ---- config ----
     let cfg_path = model_dir.join("config.json");
     let cfg_str = std::fs::read_to_string(&cfg_path)
@@ -93,6 +107,24 @@ fn main() {
     );
     println!("---- output ----");
     println!("{text}");
+
+    // ---- pprof dump (after everything; the profile spans load + warmup +
+    // generate — the flamegraph's self time tells the story per phase) ----
+    if let Some(g) = &profiler {
+        match g.report().build() {
+            Ok(report) => {
+                let path = std::env::var("FERRITE_PPROF_OUT")
+                    .unwrap_or_else(|_| "serve.flamegraph.svg".to_string());
+                match std::fs::File::create(&path).map_err(|e| e.to_string()).and_then(|f| {
+                    report.flamegraph(f).map_err(|e| e.to_string())
+                }) {
+                    Ok(()) => println!("[serve] pprof flamegraph → {path}"),
+                    Err(e) => eprintln!("[serve] pprof flamegraph write failed: {e}"),
+                }
+            }
+            Err(e) => eprintln!("[serve] pprof report build failed: {e}"),
+        }
+    }
 }
 
 /// Single-process CPU inference (CpuBackend, f32).
