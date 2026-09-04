@@ -1148,117 +1148,64 @@ impl CudaBackend {
             },
             "conv1d_dev",
         )?;
-        // 3. HYBRID pre-processing: SiLU/split/L2/beta/gate on CPU (bit-for-bit
-        // parity with the CPU path's Rust code — CUDA expf differs from host
-        // f32::exp by 1 ulp for some inputs, and the GDN recurrence amplifies
-        // this to O(1) divergence with real checkpoint weights). The
-        // pre-processing tensors are small (~74KB/layer for n=1) vs the
-        // matmul weights (GBs) — the H2D/D2H overhead is negligible.
-        let conv_host = {
-            let mut v = vec![0f32; n * ch];
-            conv_out.download(&mut v)?;
-            v
-        };
-        let b_raw_host = {
-            let mut v = vec![0f32; n * h];
-            b_raw.download(&mut v)?;
-            v
-        };
-        let fb_host = {
-            let mut v = vec![0f32; n * proj];
-            fb.download(&mut v)?;
-            v
-        };
-        // PROBE: dump layer-0 intermediates for CPU-vs-dev divergence diff
-        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
-            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
-            let d = |name: &str, v: &[f32]| {
-                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
-            };
-            d("conv", &conv_host); d("braw", &b_raw_host); d("fb", &fb_host);
-            eprintln!("[gdn_probe] dev L0 dumped: conv {} braw {} fb {}", conv_host.len(), b_raw_host.len(), fb_host.len());
-        }
-        // gb stays on device (needed for gated_rmsnorm later); also download
-        // for the CPU pre-processing? No — gb is only needed as the rmsnorm
-        // gate (device-side), not for the pre-processing below.
-
-        // ---- CPU pre-processing: IDENTICAL to Engine::linear_attn_forward ----
-        // SiLU conv output (all three q/k/v sections)
-        let silu = conv_host;
-        // per v in silu: silu
-        let mut silu_v = silu;
-        for v in silu_v.iter_mut() {
-            *v = *v / (1.0 + (-*v).exp());
-        }
-        // split q/k/v: conv output is [n, 3*proj] PER-TOKEN INTERLEAVED
-        // (each token's row is [q_proj | k_proj | v_proj]) — NOT block layout
-        let mut q_raw = vec![0f32; n * proj];
-        let mut k_raw = vec![0f32; n * proj];
-        let mut v_v = vec![0f32; n * proj];
-        for t in 0..n {
-            for j in 0..proj {
-                q_raw[t * proj + j] = silu_v[t * 3 * proj + j];
-                k_raw[t * proj + j] = silu_v[t * 3 * proj + proj + j];
-                v_v[t * proj + j] = silu_v[t * 3 * proj + 2 * proj + j];
-            }
-        }
-        // L2 norm q and k per head (sequential accumulation matching CPU)
-        let l2norm_heads = |t: &[f32]| -> Vec<f32> {
-            let mut d = t.to_vec();
-            for i in 0..n * h {
-                let s = &d[i * dk..(i + 1) * dk];
-                let norm: f32 = s.iter().map(|v| v * v).sum::<f32>().sqrt();
-                let inv = if norm > 0.0 { 1.0 / norm } else { 0.0 };
-                for j in 0..dk {
-                    d[i * dk + j] *= inv;
-                }
-            }
-            d
-        };
-        let q_v = l2norm_heads(&q_raw);
-        // fla KDA: q = l2norm(q) * K^-0.5 (k is NOT scaled) — this exact
-        // scale was missing from the device chain (root cause of the GDN
-        // garbage: cpu_q norms 0.0884=1/√128 vs dev_q norms 1.0; dev_q =
-        // cpu_q × √dk element-wise). Matches CPU path lib.rs:593.
-        let q_scale = (dk as f32).recip().sqrt();
-        let q_v: Vec<f32> = q_v.iter().map(|v| v * q_scale).collect();
-        let k_v = l2norm_heads(&k_raw);
-        // beta = sigmoid(b_raw)
-        let beta_v: Vec<f32> = b_raw_host.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
-        // gate = lb * sigmoid(exp(A_log) * (fb + dt_bias))
-        let al = w.a_log.as_slice();
-        let db = w.dt_bias.as_slice();
-        let mut gate_v = vec![0.0f32; n * proj];
-        for t in 0..n {
-            for hd in 0..h {
-                let a = al[hd].exp();
-                for j in 0..dk {
-                    let g = fb_host[t * proj + hd * dk + j] + db[hd * dk + j];
-                    gate_v[t * proj + hd * dk + j] = lb * (1.0 / (1.0 + (-(a * g)).exp()));
-                }
-            }
-        }
-        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
-            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
-            let d = |name: &str, v: &[f32]| {
-                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
-            };
-            d("q", &q_v); d("k", &k_v); d("beta", &beta_v); d("gate", &gate_v);
-            eprintln!("[gdn_probe] dev L0 preproc dumped: q {} k {} beta {} gate {} (proj={})", q_v.len(), k_v.len(), beta_v.len(), gate_v.len(), proj);
-        }
-        // ---- upload pre-processing results to device ----
+        // 3. GPU pre-processing (ferrite_gdn_prep): silu + split + per-head L2
+        // norm + KDA q-scale (rsqrt(dk), k NOT scaled — its absence here was the
+        // root cause of the garbage-output bug: dev_q norms 1.0 vs CPU 0.0884
+        // = 1/sqrt(128)) + beta + gate — ONE kernel, zero host round-trips.
+        // (The old hybrid path downloaded conv/b_raw/fb, computed silu/split/
+        // L2/beta/gate on CPU, re-uploaded q/k/v/beta/gate: 9 host crossings.)
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        q.upload(&q_v)?;
         let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        k.upload(&k_v)?;
         let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        v.upload(&v_v)?;
         let beta = DevBuf::alloc(self.dev, self.stream, n * h)?;
-        beta.upload(&beta_v)?;
         let gate = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        gate.upload(&gate_v)?;
+        let dw_dt = self.dev_weight(w.dt_bias)?;
+        let dw_al = self.dev_weight(w.a_log)?;
+        ck(
+            unsafe {
+                ferrite_gdn_prep(
+                    conv_out.as_const_f32(), b_raw.as_const_f32(), fb.as_const_f32(),
+                    dw_dt.as_const_f32(), dw_al.as_const_f32(),
+                    q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
+                    ni, h as i32, dk as i32, lb, self.stream,
+                )
+            },
+            "gdn_prep",
+        )?;
+        // PROBE (rank-isolated, prefill-only): download intermediates for
+        // CPU-vs-dev divergence diff; normal path stays zero-crossing.
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
+            };
+            let mut ch = vec![0f32; n * ch];
+            let _ = conv_out.download(&mut ch);
+            d("conv", &ch);
+            let mut bh0 = vec![0f32; n * h];
+            let _ = b_raw.download(&mut bh0);
+            d("braw", &bh0);
+            let mut fh = vec![0f32; n * proj];
+            let _ = fb.download(&mut fh);
+            d("fb", &fh);
+            let mut qh = vec![0f32; n * proj];
+            let _ = q.download(&mut qh);
+            d("q", &qh);
+            let mut kh = vec![0f32; n * proj];
+            let _ = k.download(&mut kh);
+            d("k", &kh);
+            let mut bth = vec![0f32; n * h];
+            let _ = beta.download(&mut bth);
+            d("beta", &bth);
+            let mut gth = vec![0f32; n * proj];
+            let _ = gate.download(&mut gth);
+            d("gate", &gth);
+            eprintln!(
+                "[gdn_probe] dev L0 gpu-prep dumped r{} (conv {} q {} — ferrite_gdn_prep path)",
+                crate::shard_idx(), ch.len(), qh.len()
+            );
+        }
         // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
         // blocks read-modify-write their own slice; single buffer is safe)
         let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;

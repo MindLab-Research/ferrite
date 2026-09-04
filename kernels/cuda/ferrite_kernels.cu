@@ -1200,9 +1200,13 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
     }
     __syncthreads();
     float nq = red[60]; float nk = red[61];
+    // fla KDA: q = l2norm(q) * K^-0.5 (k is NOT scaled) — matches the CPU
+    // path (lib.rs:593). This scale was missing here too (same root cause as
+    // the gdn_layer_dev hybrid bug: q norms 1.0 vs CPU 0.0884=1/sqrt(128)).
+    const float q_scl = rsqrtf((float)dk);
     for (int j = threadIdx.x; j < dk; j += blockDim.x) {
         int off = hd * dk + j;
-        q[((size_t)t * h + hd) * dk + j] = sq[j] * nq;
+        q[((size_t)t * h + hd) * dk + j] = sq[j] * nq * q_scl;
         k[((size_t)t * h + hd) * dk + j] = sk[j] * nk;
     }
     // beta = sigmoid(b_raw[t, head])
