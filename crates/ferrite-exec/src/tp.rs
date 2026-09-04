@@ -422,6 +422,11 @@ fn attn_shard(
     n: usize,
     hidden: usize,
 ) -> Result<Tensor> {
+    // FERRITE_GDN_DEV=1 opt-in: the device chain has a numeric bug (garbage
+    // output — see the equivalence test TODO); the CPU path is the default.
+    if std::env::var_os("FERRITE_GDN_DEV").is_none() {
+        return s.linear_attn_forward(seq, layer_idx, pfx, hn, n);
+    }
     if let Some(cuda) = s.backend.as_cuda() {
         use ferrite_kernel::cuda::{DevBuf, GdnLayerWeights};
         // cudaSetDevice is THREAD-LOCAL: in fan_out, this thread's current
