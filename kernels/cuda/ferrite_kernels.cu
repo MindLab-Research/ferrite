@@ -1004,21 +1004,23 @@ __global__ void hc_pre_kernel(const float* __restrict__ res,
     __syncthreads();
     float rsq = red[30];
 
-    // 2. mixes: mix rows of fw against x (block-reduced dot each)
-    for (int m = 0; m < mix; m++) {
-        const float* row = fw + (size_t)m * nh;
-        float acc = 0.f;
-        for (int i = threadIdx.x; i < nh; i += blockDim.x) acc += row[i] * x[i];
-        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float tot = 0.f;
-            for (int w = 0; w < 32; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
-            mx[m] = tot * rsq;
+    // 2. mixes: WARP-PER-MIX (was: serial loop over mix — 24 dots, each with
+    //    two block-wide __syncthreads reductions = the 0.78ms/layer cost).
+    //    Each warp reduces one mix's dot independently via shuffle — zero
+    //    block syncs in the loop.
+    {
+        int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        int nwarps = blockDim.x >> 5;
+        for (int m = warp; m < mix; m += nwarps) {
+            const float* row = fw + (size_t)m * nh;
+            float acc = 0.f;
+            for (int i = lane; i < nh; i += 32) acc += row[i] * x[i];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+            if (lane == 0) mx[m] = acc * rsq;
         }
-        __syncthreads();
     }
+    __syncthreads();
 
     // 3. pre / layer_input, post, comb (single thread; n and mix are tiny)
     if (threadIdx.x == 0) {
@@ -1082,8 +1084,10 @@ extern "C" cudaError_t ferrite_hc_pre(const float* res, const float* fw,
                                        float rms_eps, float hc_eps, int iters,
                                        cudaStream_t stream) {
     size_t smem = ((size_t)mix + n * n + 32) * sizeof(float);
-    hc_pre_kernel<<<s, 256, smem, stream>>>(res, fw, scale, base, li, post, comb,
-                                             s, n, h, mix, rms_eps, hc_eps, iters);
+    // one warp per mix row (mix = n + n + n² = 24 for hc_mult 4): 768 threads
+    int threads = (mix * 32) > 1024 ? 1024 : ((mix * 32) < 256 ? 256 : mix * 32);
+    hc_pre_kernel<<<s, threads, smem, stream>>>(res, fw, scale, base, li, post, comb,
+                                                 s, n, h, mix, rms_eps, hc_eps, iters);
     return cudaGetLastError();
 }
 
