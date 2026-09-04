@@ -1171,7 +1171,17 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
         ssq += qv * qv; ssk += kv * kv;
         // gate (per channel): lb * sigmoid(exp(a_log_h) * (fb + dt_bias))
         float g = fb[(size_t)t * proj + off] + dt_bias[off];
-        gate[((size_t)t * h + hd) * dk + j] = lb / (1.0f + expf(-expf(a_log[hd]) * g));
+        // gate: KDA forget gate — MUST match the CPU path's exact computation
+        // order (lb * (1/(1+exp(-x))), NOT lb/(1+exp(-x)) — the 1-ulp
+        // division-vs-reciprocal rounding difference is amplified ~10x/token
+        // by the GDN recurrence over 8 prefill tokens (observed O(1) output
+        // divergence with real checkpoint weights).
+        // CPU (exec_lib.rs): a = al[hd].exp(); x = a*g; sig = 1/(1+(-x).exp());
+        //                   gv = lb * sig(a*g)
+        float a_ex = expf(a_log[hd]);
+        float x = a_ex * g;
+        float sig = 1.0f / (1.0f + expf(-x));
+        gate[((size_t)t * h + hd) * dk + j] = lb * sig;
         // v passes through (silu'd)
         v[((size_t)t * h + hd) * dk + j] = vv;
     }
