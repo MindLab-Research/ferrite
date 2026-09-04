@@ -1110,6 +1110,22 @@ impl CudaBackend {
         let ni = n as i32;
         // 1. six projections (bf16-resident weights)
         let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
+        // PROBE: dump x (input) + qkv (first matmul output) — pinpoints
+        // divergence to upload (x wrong) vs matmul/weights (qkv wrong)
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_dev_{name}.f32"), b).ok();
+            };
+            let mut xh = vec![0f32; x.len];
+            let _ = x.download(&mut xh);
+            d("x", &xh);
+            let mut qh = vec![0f32; n * 3 * proj];
+            let _ = qkv.download(&mut qh);
+            d("qkv", &qh);
+            eprintln!("[gdn_probe] dev L0 x/qkv dumped: x {} qkv {} (n={} proj={})", xh.len(), qh.len(), n, proj);
+        }
         let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
         let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;

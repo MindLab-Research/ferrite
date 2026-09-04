@@ -550,10 +550,12 @@ impl<B: KernelBackend> Engine<B> {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
                 std::fs::write(format!("{dir}/gdn_cpu_{name}.f32"), b).ok();
             };
+            d("x", x.as_slice());
+            d("qkv", qkv.as_slice());
             d("conv", conv_out.as_slice());
             d("braw", b_raw.as_slice());
             d("fb", fb.as_slice());
-            eprintln!("[gdn_probe] cpu L0 dumped conv/braw/fb (lib.rs live path)");
+            eprintln!("[gdn_probe] cpu L0 dumped x/qkv/conv/braw/fb (lib.rs live path)");
         }
         {
             let cv = std::sync::Arc::get_mut(&mut conv_out.data).expect("unique conv");
