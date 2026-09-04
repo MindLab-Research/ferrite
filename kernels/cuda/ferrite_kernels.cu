@@ -1500,7 +1500,9 @@ extern "C" cudaError_t ferrite_moe_fused_act(
     const void* shared_gate, const void* shared_up,
     float* act, int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, float limit, cudaStream_t s) {
-    int rows = 128;
+    // rows = warps per block (256 threads / 32 = 8): each block covers 8
+    // rows via the stride loop (r += warps).
+    int rows = 8;
     int max_rows = inter > inter_shared ? inter : inter_shared;
     dim3 grid((max_rows + rows - 1) / rows, topk + 1);
     moe_fused_act_kernel<<<grid, 256, 0, s>>>(
@@ -1520,7 +1522,11 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum(
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk,
     cudaStream_t s) {
-    int rows = 128; // warps per block (8 rows of hidden per block)
+    // CRITICAL: rows must equal warps per block (256/32 = 8). The kernel
+    // assigns ONE hidden-row per warp with no stride loop — rows=128 made
+    // grid.x = hidden/128 while each block only computed 8 rows (4096-row
+    // hidden: 32 blocks × 8 = 256 rows computed, 94% of out was garbage).
+    int rows = 8;
     dim3 grid((hidden + rows - 1) / rows);
     moe_fused_down_sum_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
