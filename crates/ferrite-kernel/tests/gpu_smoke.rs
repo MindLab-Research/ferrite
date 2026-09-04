@@ -486,7 +486,17 @@ fn moe_fused_parity_and_speed() {
 
     // ---- CPU reference (f32; GPU weights are bf16-truncated → ~2e-2 tol) ----
     let (xs, gws, bs) = (x.as_slice(), gate_w.as_slice(), bias.as_slice());
-    let scores: Vec<f32> = (0..e_total).map(|j| 1.0 / (1.0 + (-gws[j]).exp())).collect();
+    // logits[j] = x · gate_w[j, :] (the routing GEMV the GPU path runs first)
+    let logits: Vec<f32> = (0..e_total)
+        .map(|j| {
+            let mut s = 0f32;
+            for k in 0..hidden {
+                s += xs[k] * gws[j * hidden + k];
+            }
+            s
+        })
+        .collect();
+    let scores: Vec<f32> = (0..e_total).map(|j| 1.0 / (1.0 + (-logits[j]).exp())).collect();
     let choice: Vec<f32> = (0..e_total).map(|j| scores[j] + bs[j]).collect();
     let mut order: Vec<usize> = (0..e_total).collect();
     order.sort_by(|&a, &b| choice[b].partial_cmp(&choice[a]).unwrap());
