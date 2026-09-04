@@ -1157,6 +1157,24 @@ impl CudaBackend {
             },
             "gdn_chunk_dev",
         )?;
+        // probe: core output NaN check
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
+            let mut cb = vec![0f32; n * proj];
+            core.download(&mut cb)?;
+            let nan_c = cb.iter().filter(|x| x.is_nan()).count();
+            let cmax = cb.iter().fold(0f32, |a, v| if v.is_finite() { a.max(v.abs()) } else { a });
+            // also check gdn state
+            let mut sb = vec![0f32; h * dk * dk];
+            unsafe {
+                ck(cudaMemcpy(sb.as_mut_ptr() as *mut std::ffi::c_void, gdn_state as *const std::ffi::c_void, h * dk * dk * 4, CUDA_MEMCPY_D2H), "state probe")?;
+            }
+            let nan_s = sb.iter().filter(|x| x.is_nan()).count();
+            let smax = sb.iter().fold(0f32, |a, v| if v.is_finite() { a.max(v.abs()) } else { a });
+            eprintln!(
+                "[gdn_dev] L{layer} core NaN {nan_c}/{} core_max {cmax:.3e} state NaN {nan_s}/{} state_max {smax:.3e}",
+                n * proj, h * dk * dk
+            );
+        }
         // 5. gated rmsnorm (core [n,h,dk] flat = [n*h, dk]; gb the gate)
         let o_norm_w = self.dev_weight(w.o_norm)?;
         let normed = DevBuf::alloc(self.dev, self.stream, n * proj)?;
