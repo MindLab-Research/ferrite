@@ -424,6 +424,11 @@ fn attn_shard(
 ) -> Result<Tensor> {
     if let Some(cuda) = s.backend.as_cuda() {
         use ferrite_kernel::cuda::{DevBuf, GdnLayerWeights};
+        // cudaSetDevice is THREAD-LOCAL: in fan_out, this thread's current
+        // device is whatever the last rank's ops left set. Bind BEFORE any
+        // DevBuf alloc/upload (cudaMalloc binds to the current device —
+        // allocating on the wrong rank's device was the err-700 crash).
+        cuda.enter();
         let la = &s.cfg.linear_attn;
         let gw = GdnLayerWeights {
             qkv_proj: s.w(&format!("{pfx}.self_attn.qkv_proj.weight"))?,

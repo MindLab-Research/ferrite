@@ -337,8 +337,11 @@ impl CudaBackend {
     /// Bind this backend's device as the calling thread's current device.
     /// cudaSetDevice is thread-local state; TP ranks all call ops from the
     /// main thread, so each op entry re-binds before cudaMalloc/launch.
+    /// PUBLIC: device-chain call sites (attn_shard) allocate DevBufs
+    /// BEFORE the first op — cudaMalloc binds to the CALLING thread's
+    /// current device, which in a fan_out thread is another rank's.
     #[inline]
-    fn enter(&self) {
+    pub fn enter(&self) {
         unsafe {
             cudaSetDevice(self.dev);
         }
