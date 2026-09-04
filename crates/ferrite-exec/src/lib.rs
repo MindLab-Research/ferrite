@@ -674,7 +674,12 @@ impl<B: KernelBackend> Engine<B> {
             };
             d("core", core.as_slice());
             d("partial", partial.as_slice());
-            eprintln!("[gdn_probe] cpu L0 core/partial dumped r{}", ferrite_kernel::shard_idx());
+            d("q", q.as_slice());
+            d("k", k.as_slice());
+            d("beta", beta.as_slice());
+            d("gate", gate.as_slice());
+            d("v", v.as_slice());
+            eprintln!("[gdn_probe] cpu L0 core/partial/q/k/beta/gate/v dumped r{}", ferrite_kernel::shard_idx());
         }
         Ok(partial)
     }
