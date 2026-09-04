@@ -743,6 +743,13 @@ impl<B: KernelBackend> Engine<B> {
                     if cuda.graph_run(&gname, x.as_slice(), &mut v)? {
                         return Ok(Tensor::from_f32(Shape::new([n, self.cfg.hidden_size]), v));
                     }
+                    // WARM the n==1 pool classes (capture forbids cudaMalloc).
+                    {
+                        let wx = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
+                        wx.upload(x.as_slice())?;
+                        let wfamily = self.dsa_family_index(layer_idx);
+                        let _wp = cuda.dsa_layer_dev(&wx, &w, seq, wfamily, n, self.cfg.hidden_size)?;
+                    }
                     cuda.graph_capture_begin();
                     let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
                     x_dev.upload(x.as_slice())?;
@@ -1171,6 +1178,18 @@ impl<B: KernelBackend> Engine<B> {
             let mut v = vec![0f32; n * hidden];
             if cuda.graph_run(&gname, x.as_slice(), &mut v)? {
                 return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
+            }
+            // WARM the n==1 pool classes (capture forbids cudaMalloc; the
+            // prefill pass left n==prompt_len classes instead).
+            {
+                let wx = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
+                wx.upload(x.as_slice())?;
+                let mut wp = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
+                let _wo = cuda.moe_layer_dev(
+                    &wx, gate_w, &bias, &shared, &experts, es,
+                    &mut wp, n, hidden, topk, e,
+                    cfg.routed_scaling_factor, cfg.swiglu_limit,
+                )?;
             }
             cuda.graph_capture_begin();
             let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;

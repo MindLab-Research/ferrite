@@ -510,6 +510,18 @@ fn attn_shard(
             if cuda.graph_run(&gname, hn.as_slice(), &mut v)? {
                 return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
             }
+            // WARM the n==1 pool classes first: capture forbids cudaMalloc,
+            // and prefill (n==prompt_len) leaves DIFFERENT size classes in
+            // the pool — a cold n==1 class inside capture segfaults.
+            {
+                let wx = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
+                wx.upload(hn.as_slice())?;
+                let _wp = cuda.gdn_layer_dev(
+                    &wx, &gw, seq, layer_idx, n, hidden,
+                    la.num_heads, la.head_dim, la.gate_lower_bound,
+                    s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+                )?;
+            } // drops return everything to the pool
             cuda.graph_capture_begin();
             let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
             x_dev.upload(hn.as_slice())?;
