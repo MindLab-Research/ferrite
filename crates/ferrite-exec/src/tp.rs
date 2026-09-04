@@ -652,7 +652,8 @@ where
         // attn/ffn segments (FERRITE_GDN_DEV/FERRITE_MOE_DEV).
         #[cfg(feature = "cuda")]
         if std::env::var_os("FERRITE_LAYER_DEV").is_some() && self.full_cfg.mhc {
-            return self.layer_forward_dev(seq, layer_idx, residual, n);
+            let (out, _dev) = self.layer_forward_dev(seq, layer_idx, residual, None, n)?;
+            return Ok(out);
         }
         let probe = std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1; // prefill, first DSA+MoE layer
         if probe {
@@ -1048,8 +1049,9 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         seq: u64,
         layer_idx: usize,
         residual: Tensor,
+        residual_dev: Option<ferrite_kernel::cuda::DevBuf>,
         n: usize,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Option<ferrite_kernel::cuda::DevBuf>)> {
         use ferrite_kernel::cuda::DevBuf;
         let plans = build_layer_plans(&self.full_cfg);
         let plan = &plans[layer_idx];
@@ -1065,8 +1067,14 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 .as_cuda()
                 .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
             cuda0.enter();
-            let mut res_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * nh)?;
-            res_dev.upload(residual.as_slice())?;
+            // GPU-resident residual (P2P chain): use it directly — no upload.
+            let res_dev = if let Some(rd) = residual_dev {
+                rd
+            } else {
+                let mut rd = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * nh)?;
+                rd.upload(residual.as_slice())?;
+                rd
+            };
             let (hc_fn, hc_scale, hc_base) = (
                 s0.w(&format!("{pfx}.hc_attn_fn"))?,
                 s0.w(&format!("{pfx}.hc_attn_scale"))?,
@@ -1340,7 +1348,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         let t_far = std::time::Instant::now();
 
         // ---- segment 5: hc_post2 (GPU) → residual out ----
-        let out_t = {
+        let (out_t, out_dev) = {
             let s0 = &self.shards[0];
             let cuda0 = s0
                 .backend
@@ -1356,9 +1364,15 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 d.upload(ffn_out_t.as_ref().unwrap().as_slice())?;
                 cuda0.hc_post_dev(&d, &res2_dev, &post_f_dev, &comb_f_dev, n, hc_mult, hidden)?
             };
-            let mut out = vec![0f32; n * nh];
-            res_out_dev.download(&mut out)?;
-            Tensor::from_f32(Shape::new([n, nh]), out)
+            // P2P chain: return the DevBuf (no download) — the next layer's
+            // segment 1 uses it directly. Only the last layer downloads.
+            if std::env::var_os("FERRITE_P2P").is_some() {
+                (residual.clone(), Some(res_out_dev))
+            } else {
+                let mut out = vec![0f32; n * nh];
+                res_out_dev.download(&mut out)?;
+                (Tensor::from_f32(Shape::new([n, nh]), out), None)
+            }
         };
         if std::env::var_os("FERRITE_TIMING").is_some() {
             let t_end = std::time::Instant::now();
@@ -1372,7 +1386,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 (t_end - t0).as_secs_f32() * 1e3,
             );
         }
-        Ok(out_t)
+        Ok((out_t, out_dev))
     }
 
     fn decode_step_normal(&mut self, seq: u64) -> Result<u32> {
@@ -1393,8 +1407,24 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         };
         let t_layers = std::time::Instant::now();
         let plans = build_layer_plans(&self.full_cfg);
-        for plan in &plans {
-            h = self.layer_forward_tp(seq, plan.layer_idx, h, 1)?;
+        // P2P chain (FERRITE_P2P + FERRITE_LAYER_DEV): residual stays on GPU
+        // across layers — no Tensor download/upload per layer (~0.3ms × 45).
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("FERRITE_P2P").is_some()
+            && std::env::var_os("FERRITE_LAYER_DEV").is_some()
+            && self.full_cfg.mhc
+        {
+            let mut residual_dev: Option<ferrite_kernel::cuda::DevBuf> = None;
+            for plan in &plans {
+                let (h_new, dev_new) =
+                    self.layer_forward_dev(seq, plan.layer_idx, h, residual_dev, 1)?;
+                h = h_new;
+                residual_dev = dev_new;
+            }
+        } else {
+            for plan in &plans {
+                h = self.layer_forward_tp(seq, plan.layer_idx, h, 1)?;
+            }
         }
         let t_head = std::time::Instant::now();
         let h_final = if self.full_cfg.mhc {
