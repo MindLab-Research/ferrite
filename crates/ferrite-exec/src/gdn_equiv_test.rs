@@ -184,7 +184,27 @@ fn gdn_device_chain_real_shapes() {
     let mut cfg = Glm53FlashConfig::test_config();
     cfg.linear_attn.head_dim = 128;
     cfg.linear_attn.num_heads = 16;
-    let w = random_weights(&cfg, 99);
+    let mut w = random_weights(&cfg, 99);
+    // REALISTIC weight scales: serve hits NaN with real checkpoint weights
+    // (dev all-NaN, CPU fine) — random_weights' small range hides it. Scale
+    // the GDN non-linear path inputs to real-magnitude (A_log ±5-10 →
+    // exp ±e5, dt_bias ±8, fb raw ±30) and see if the device chain NaNs.
+    for (name, scale) in [("A_log", 9.0), ("dt_bias", 8.0)] {
+        if let Some(t) = w.get_mut(&format!("model.layers.0.self_attn.{name}")) {
+            let v = std::sync::Arc::get_mut(&mut t.data).unwrap();
+            for x in v.iter_mut() {
+                *x = x.abs() * scale + 0.5;
+            }
+        }
+    }
+    for suffix in ["f_b_proj.weight", "b_proj.weight"] {
+        if let Some(t) = w.get_mut(&format!("model.layers.0.self_attn.{suffix}")) {
+            let v = std::sync::Arc::get_mut(&mut t.data).unwrap();
+            for x in v.iter_mut() {
+                *x *= 40.0;
+            }
+        }
+    }
     let la = &cfg.linear_attn;
     let (h, dk) = (la.num_heads, la.head_dim);
     let hidden = cfg.hidden_size;
