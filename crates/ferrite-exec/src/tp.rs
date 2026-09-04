@@ -408,9 +408,32 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(tok)
     }
 
-    /// TP layer forward: attn partial → all-reduce → MHC/residual →
-    /// ffn partial → all-reduce. Collectives land exactly where an NCCL
-    /// deployment would place them.
+/// Run one op-group across all shards CONCURRENTLY (one thread per rank).
+/// TP ranks are independent until the all-reduce; the serial iter_mut loop
+/// left 3 of the 4 GPUs idle. cudaSetDevice is thread-local so each shard's
+/// ops bind its own GPU; DevBuf pools are thread-local too (per-thread
+/// arenas, no cross-thread buffer sharing). Result order = shard order
+/// (fan_out preserves indices; the all-reduce sum is order-independent).
+fn fan_out<T, F>(shards: &mut [Engine<B>], f: F) -> Vec<T>
+where
+    F: Fn(&mut Engine<B>) -> T + Sync,
+    T: Send,
+{
+    if shards.len() == 1 {
+        return vec![f(&mut shards[0])];
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = shards.iter_mut().map(|s| scope.spawn(|| f(s))).collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("shard thread panicked"))
+            .collect()
+    })
+}
+
+/// TP layer forward: attn partial → all-reduce → MHC/residual →
+/// ffn partial → all-reduce. Collectives land exactly where an NCCL
+/// deployment would place them.
     fn layer_forward_tp(
         &mut self,
         seq: u64,
@@ -460,15 +483,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 }
                 hn
             };
-            let attn_partials: Result<Vec<Tensor>> = self
-                .shards
-                .iter_mut()
-                .map(|s| match plan.attn {
-                    AttnKind::Linear => s.linear_attn_forward(seq, layer_idx, &pfx, &hn, n),
-                    AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
-                })
-                .collect();
-            let attn_out = all_reduce_sum(&attn_partials?);
+            let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
+                AttnKind::Linear => s.linear_attn_forward(seq, layer_idx, &pfx, &hn, n),
+                AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
+            });
+            let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
             if probe {
                 let bytes: Vec<u8> = attn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write("/tmp/l0_attn.f32", bytes).ok();
@@ -505,15 +524,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 let s0 = &self.shards[0];
                 s0.rmsnorm(&li2, &format!("{pfx}.post_attention_layernorm.weight"))?
             };
-            let ffn_partials: Result<Vec<Tensor>> = self
-                .shards
-                .iter_mut()
-                .map(|s| match plan.mlp {
-                    MlpKind::Dense => s.dense_ffn(&pfx, &hfn, n),
-                    MlpKind::Moe => s.moe_ffn(&pfx, &hfn, n),
-                })
-                .collect();
-            let ffn_out = all_reduce_sum(&ffn_partials?);
+            let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
+                MlpKind::Dense => s.dense_ffn(&pfx, &hfn, n),
+                MlpKind::Moe => s.moe_ffn(&pfx, &hfn, n),
+            });
+            let ffn_out = all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?);
             if probe {
                 let bytes: Vec<u8> = ffn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write("/tmp/l0_ffn.f32", bytes).ok();
@@ -555,15 +570,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 let s0 = &self.shards[0];
                 s0.rmsnorm(&residual, &format!("{pfx}.input_layernorm.weight"))?
             };
-            let attn_partials: Result<Vec<Tensor>> = self
-                .shards
-                .iter_mut()
-                .map(|s| match plan.attn {
-                    AttnKind::Linear => s.linear_attn_forward(seq, layer_idx, &pfx, &hn, n),
-                    AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
-                })
-                .collect();
-            let attn_out = all_reduce_sum(&attn_partials?);
+            let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
+                AttnKind::Linear => s.linear_attn_forward(seq, layer_idx, &pfx, &hn, n),
+                AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn, n),
+            });
+            let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
             let h2 = Tensor::from_f32(
                 Shape::new([n, hidden]),
                 (0..n * hidden)
@@ -574,15 +585,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 let s0 = &self.shards[0];
                 s0.rmsnorm(&h2, &format!("{pfx}.input_layernorm.weight"))?
             };
-            let ffn_partials: Result<Vec<Tensor>> = self
-                .shards
-                .iter_mut()
-                .map(|s| match plan.mlp {
-                    MlpKind::Dense => s.dense_ffn(&pfx, &hfn, n),
-                    MlpKind::Moe => s.moe_ffn(&pfx, &hfn, n),
-                })
-                .collect();
-            let ffn_out = all_reduce_sum(&ffn_partials?);
+            let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
+                MlpKind::Dense => s.dense_ffn(&pfx, &hfn, n),
+                MlpKind::Moe => s.moe_ffn(&pfx, &hfn, n),
+            });
+            let ffn_out = all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?);
             Ok(Tensor::from_f32(
                 Shape::new([n, hidden]),
                 (0..n * hidden)
