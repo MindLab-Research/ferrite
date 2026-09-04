@@ -1525,6 +1525,6 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum(
     moe_fused_down_sum_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
         (const __nv_bfloat16* const*)down_ptrs, (const __nv_bfloat16*)shared_down,
-        act, out, expert_start, e_local, hidden, inter, topk, rows);
+        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, rows);
     return cudaGetLastError();
 }
