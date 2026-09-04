@@ -883,7 +883,8 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
                                    const float* __restrict__ v,
                                    const float* __restrict__ idx,
                                    float* __restrict__ out,
-                                   int n, int t, int h, int d, int dv, int topk) {
+                                   int n, const int* __restrict__ t_ptr, int h, int d, int dv, int topk) {
+    int t = *t_ptr; // zero-copy read from pinned host memory (graph-safe)
     int row = blockIdx.x;
     int hd = blockIdx.y;
     if (row >= n) return;
@@ -946,14 +947,14 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
 
 extern "C" cudaError_t ferrite_sparse_attn(const float* q, const float* k,
                                            const float* v, const float* idx,
-                                           float* out, int n, int t, int h, int d,
+                                           float* out, int n, const int* t_ptr, int h, int d,
                                            int dv, int topk, cudaStream_t s) {
     // NOTE: block width must stay <= 32 — the shared reduction arrays
     // (red/reds) are [32]; 128 threads would write out of bounds.
     dim3 block(32);
     dim3 grid(n, h);
     size_t smem = (size_t)topk * sizeof(float); // dynamic smem for the topk scores
-    sparse_attn_kernel<<<grid, block, smem, s>>>(q, k, v, idx, out, n, t, h, d, dv, topk);
+    sparse_attn_kernel<<<grid, block, smem, s>>>(q, k, v, idx, out, n, t_ptr, h, d, dv, topk);
     return cudaGetLastError();
 }
 
@@ -1679,7 +1680,10 @@ extern "C" cudaError_t ferrite_kpool_compress(
 __global__ void pool_expand_kernel(
     const float* __restrict__ idx_pools,  // [n, select_k]
     float* __restrict__ idx,              // [n, out_width]
-    int n, int select_k, int kpool, int npools, int total, int ctx0) {
+    int n, int select_k, int kpool, int npools,
+    const int* __restrict__ total_ptr,    // pinned (graph-safe)
+    int ctx0) {
+    int total = *total_ptr;
     int i = blockIdx.x;
     if (i >= n) return;
     int out_width = select_k * kpool + (kpool - 1);
@@ -1708,9 +1712,9 @@ __global__ void pool_expand_kernel(
 
 extern "C" cudaError_t ferrite_pool_expand(
     const float* idx_pools, float* idx,
-    int n, int select_k, int kpool, int npools, int total, int ctx0,
+    int n, int select_k, int kpool, int npools, const int* total_ptr, int ctx0,
     cudaStream_t s) {
-    pool_expand_kernel<<<n, 1, 0, s>>>(idx_pools, idx, n, select_k, kpool, npools, total, ctx0);
+    pool_expand_kernel<<<n, 1, 0, s>>>(idx_pools, idx, n, select_k, kpool, npools, total_ptr, ctx0);
     return cudaGetLastError();
 }
 

@@ -50,8 +50,9 @@ extern "C" {
                                pool_keys: *mut f32, total_ptr: *const i32, npools: i32, kpool: i32,
                                idm: i32, s: CuStream) -> i32;
     fn ferrite_pool_expand(idx_pools: *const f32, idx: *mut f32,
-                            n: i32, select_k: i32, kpool: i32, npools: i32, total: i32,
-                            ctx0: i32, s: CuStream) -> i32;
+                            n: i32, select_k: i32, kpool: i32, npools: i32,
+                            total_ptr: *const i32, ctx0: i32,
+                            s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
@@ -84,7 +85,7 @@ extern "C" {
     fn ferrite_indexer_topk(qi: *const f32, ki: *const f32, w: *const f32, idx: *mut f32,
                             n: i32, t: i32, h: i32, d: i32, topk: i32, ctx0: i32, s: CuStream) -> i32;
     fn ferrite_sparse_attn(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
-                           out: *mut f32, n: i32, t: i32, h: i32, d: i32, dv: i32,
+                           out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                            topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
@@ -995,7 +996,8 @@ impl crate::KernelBackend for CudaBackend {
         let dv_ = DevBuf::alloc(self.dev, self.stream, v.numel())?; dv_.upload(v.as_slice())?;
         let di = DevBuf::alloc(self.dev, self.stream, idx.numel())?; di.upload(idx.as_slice())?;
         let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
-        ck(unsafe { ferrite_sparse_attn(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), n, t, h, d, dv, topk, self.stream) }, "sparse_attn")?;
+        let t_ptr = &t as *const i32;
+        ck(unsafe { ferrite_sparse_attn(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), n, t_ptr, h, d, dv, topk, self.stream) }, "sparse_attn")?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -1587,7 +1589,7 @@ impl CudaBackend {
             unsafe {
                 ferrite_pool_expand(
                     idx_pools.as_const_f32(), idx.as_f32(),
-                    ni, select_k as i32, kpool as i32, npools as i32, total as i32,
+                    ni, select_k as i32, kpool as i32, npools as i32, pinned_total,
                     ctx0 as i32, self.stream,
                 )
             },
@@ -1600,7 +1602,7 @@ impl CudaBackend {
             unsafe {
                 ferrite_sparse_attn(
                     qb.as_const_f32(), k_nope_dev as *const f32, v_dev as *const f32, idx.as_const_f32(),
-                    attn_out.as_f32(), ni, total as i32, h as i32, dk as i32, dv as i32,
+                    attn_out.as_f32(), ni, pinned_total, h as i32, dk as i32, dv as i32,
                     out_width as i32, self.stream,
                 )
             },
