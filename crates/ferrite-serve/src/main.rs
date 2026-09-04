@@ -203,6 +203,13 @@ fn run_cuda(
             println!("[serve] tok {i}: {tok}");
         }
     }
+    // Skip the exit-time teardown: dropping 1.17TB of f32 weights walks
+    // ~37k large glibc chunks through munmap (~70s, observed 6/6 in gdb
+    // stack samples INSIDE the generation timer), and dropping the cluster
+    // cudaFrees 568GB of resident bf16 weight across 4 ranks. The OS and
+    // CUDA context reclaim everything at process exit; serve is one-shot.
+    std::mem::forget(cluster);
+    std::mem::forget(weights);
     out
 }
 
