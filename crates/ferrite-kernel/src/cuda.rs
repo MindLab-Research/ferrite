@@ -395,14 +395,20 @@ impl CudaBackend {
         ck(unsafe { cudaMalloc(&mut ptr, n * 2) }, "weight bf16 malloc")?;
         if n >= 8 << 20 {
             // GPU-side conversion: stream f32 chunks to a scratch buffer and
-            // pack bf16 in place into the resident allocation. Blocking
-            // memcpy between kernels serialises per chunk (fine — the H2D
-            // dominates); a final stream sync covers the last kernel.
+            // pack bf16 in place into the resident allocation. **Each chunk's
+            // H2D must wait for the previous kernel** — blocking cudaMemcpy
+            // does NOT order against stream-queued kernels (the next chunk's
+            // H2D overwrites the scratch while the previous kernel is still
+            // reading it — corrupted weights → NaN downstream; this exact
+            // race is why the equivalence tests (small weights, CPU pack
+            // path) all passed while serve (25M-element qkv_proj, 4 chunks)
+            // produced all-NaN attention outputs).
             const CHUNK: usize = 32 << 20; // 32M f32 = 128MB per step
             let mut scratch: *mut std::ffi::c_void = std::ptr::null_mut();
             ck(unsafe { cudaMalloc(&mut scratch, CHUNK * 4) }, "bf16 scratch malloc")?;
             let conv = (|| -> Result<()> {
                 for (i, chunk) in src.chunks(CHUNK).enumerate() {
+                    self.sync()?; // previous kernel finished reading scratch
                     ck(
                         unsafe { cudaMemcpy(scratch, chunk.as_ptr() as *const _, chunk.len() * 4, CUDA_MEMCPY_H2D) },
                         "bf16 chunk H2D",
