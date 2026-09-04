@@ -83,9 +83,11 @@ extern "C" {
 
 const CUDA_MEMCPY_H2D: i32 = 1;
 const CUDA_MEMCPY_D2H: i32 = 2;
+const CUDA_MEMCPY_D2D: i32 = 3;
 extern "C" {
     fn cudaMemcpyAsync(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void,
                         count: usize, kind: i32, stream: CuStream) -> i32;
+    fn cudaMemsetAsync(ptr: *mut std::ffi::c_void, val: i32, count: usize, stream: CuStream) -> i32;
 }
 
 fn ck(err: i32, what: &str) -> Result<()> {
@@ -1359,7 +1361,94 @@ impl CudaBackend {
         let shared_act = self.swiglu2_dev(&shared_gate, &shared_up, ni, shared_inter, swiglu_limit)?;
         let shared_out = self.matmul_dev(&shared_act, shared.down, ni, shared_inter, hi)?;
 
-        // For now: return shared expert output as the base (routed experts TODO below)
-        Ok(shared_out)
+        // 4. routed experts — the ONLY CPU↔GPU boundary in the layer:
+        //    download ids+probs (small: n×topk), CPU dispatches expert FFN
+        //    chains (device-resident, no syncs inside), D2D-copies each
+        //    output into the gather buffer. For CUDA graph capture this
+        //    becomes a static all-experts run + GPU-side gather instead.
+        let mut ids_host = vec![0f32; n * topk];
+        dids.download(&mut ids_host)?;
+        let mut probs_host = vec![0f32; n * topk];
+        dprobs.download(&mut probs_host)?;
+        if probs_out.len >= n * topk {
+            let (dst, src) = (probs_out.as_f32(), dprobs.as_const_f32());
+            ck(unsafe {
+                cudaMemcpyAsync(dst as *mut _, src as *const _, n * topk * 4, CUDA_MEMCPY_D2D, self.stream)
+            }, "probs D2D")?;
+        }
+
+        // 5. gather buffer [n, (topk+1) * hidden]: slots 0..topk-1 = routed
+        //    expert outputs, slot topk = shared output. probs_ext = [probs, 1.0]
+        //    so ONE weighted_sum call folds the shared expert in.
+        let slots = topk + 1;
+        let mut eouts = DevBuf::alloc(self.dev, self.stream, n * slots * hidden)?;
+        let mut probs_ext = vec![0f32; n * slots];
+        probs_ext[..n * topk].copy_from_slice(&probs_host);
+        for t in 0..n {
+            probs_ext[t * slots + topk] = 1.0; // shared weight
+        }
+        let dprobs_ext = DevBuf::alloc(self.dev, self.stream, n * slots)?;
+        dprobs_ext.upload(&probs_ext)?;
+
+        // 6. per-token expert dispatch: for decode (n=1) exactly `topk`
+        //    expert chains; each = 3 matmuls + swiglu2 (no H2D/D2H inside).
+        //    Experts not owned by this rank (TP shard) contribute zero —
+        //    the all-reduce sums partials across ranks.
+        let e_count = experts.len();
+        let mut written = vec![false; n * topk]; // slot filled?
+        for t in 0..n {
+            for j in 0..topk {
+                let slot = t * slots + j;
+                let eid = ids_host[t * topk + j] as usize;
+                let local = eid.saturating_sub(expert_start);
+                if local >= e_count {
+                    continue; // another rank owns this expert → zero slot (all-reduce sums)
+                }
+                let w = &experts[local];
+                let inter = w.gate.shape.0[0] as i32;
+                let g = self.matmul_dev(x_dev, w.gate, ni, hi, inter)?;
+                let u = self.matmul_dev(x_dev, w.up, ni, hi, inter)?;
+                let a = self.swiglu2_dev(&g, &u, ni, inter, swiglu_limit)?;
+                let d = self.matmul_dev(&a, w.down, ni, inter, hi)?;
+                // D2D gather into slot (graph-capturable, no host round-trip)
+                ck(unsafe {
+                    cudaMemcpyAsync(
+                        (eouts.as_f32() as *mut std::ffi::c_void).add(slot * hidden * 4),
+                        d.as_const_f32() as *const std::ffi::c_void,
+                        n * hidden * 4, // n==1 rows contiguous for this token
+                        CUDA_MEMCPY_D2D, self.stream,
+                    )
+                }, "expert out gather")?;
+                written[t * topk + j] = true;
+            }
+            if !written.iter().all(|&w| w) && t == 0 {
+                // zero-fill unwritten slots for THIS token's other slots
+                // (experts on other ranks): copy 0s — for n=1 the whole row
+                // layout is [topk+1, hidden] so zero the missing slots only.
+                for j in 0..topk {
+                    if !written[t * topk + j] {
+                        let slot = t * slots + j;
+                        ck(unsafe { cudaMemsetAsync(eouts.as_f32().add(slot * hidden) as *mut _, 0, hidden * 4, self.stream) }, "zero slot")?;
+                    }
+                }
+            }
+        }
+        // shared expert output → slot topk (same layout)
+        for t in 0..n {
+            let slot = t * slots + topk;
+            ck(unsafe {
+                cudaMemcpyAsync(
+                    (eouts.as_f32() as *mut std::ffi::c_void).add(slot * hidden * 4),
+                    (shared_out.as_const_f32() as *const std::ffi::c_void).add(t * hidden * 4),
+                    hidden * 4, CUDA_MEMCPY_D2D, self.stream,
+                )
+            }, "shared out gather")?;
+        }
+
+        // 7. ONE weighted-sum kernel: out[t] = Σ_j probs_ext[t,j]·eouts[t,j] + shared
+        let mut out = DevBuf::alloc(self.dev, self.stream, n * hidden)?;
+        self.moe_weighted_sum_dev(&dprobs_ext, &eouts, &mut out, n, slots, hidden)?;
+        let _ = dprobs;
+        Ok(out)
     }
 }
