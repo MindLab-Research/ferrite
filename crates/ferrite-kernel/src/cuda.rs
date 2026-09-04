@@ -1129,11 +1129,25 @@ impl CudaBackend {
 
         // ---- CPU pre-processing: IDENTICAL to Engine::linear_attn_forward ----
         // SiLU conv output (all three q/k/v sections)
-        let mut silu = conv_host;
-        for v in silu.iter_mut() {
+        let silu = conv_host;
+        // per v in silu: silu
+        let mut silu_v = silu;
+        for v in silu_v.iter_mut() {
             *v = *v / (1.0 + (-*v).exp());
         }
-        // split q/k/v + L2 norm q,k per head
+        // split q/k/v: conv output is [n, 3*proj] PER-TOKEN INTERLEAVED
+        // (each token's row is [q_proj | k_proj | v_proj]) — NOT block layout
+        let mut q_raw = vec![0f32; n * proj];
+        let mut k_raw = vec![0f32; n * proj];
+        let mut v_v = vec![0f32; n * proj];
+        for t in 0..n {
+            for j in 0..proj {
+                q_raw[t * proj + j] = silu_v[t * 3 * proj + j];
+                k_raw[t * proj + j] = silu_v[t * 3 * proj + proj + j];
+                v_v[t * proj + j] = silu_v[t * 3 * proj + 2 * proj + j];
+            }
+        }
+        // L2 norm q and k per head (sequential accumulation matching CPU)
         let l2norm_heads = |t: &[f32]| -> Vec<f32> {
             let mut d = t.to_vec();
             for i in 0..n * h {
@@ -1146,9 +1160,8 @@ impl CudaBackend {
             }
             d
         };
-        let q_v = l2norm_heads(&silu[..n * proj]);
-        let k_v = l2norm_heads(&silu[n * proj..2 * n * proj]);
-        let v_v = silu[2 * n * proj..].to_vec();
+        let q_v = l2norm_heads(&q_raw);
+        let k_v = l2norm_heads(&k_raw);
         // beta = sigmoid(b_raw)
         let beta_v: Vec<f32> = b_raw_host.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
         // gate = lb * sigmoid(exp(A_log) * (fb + dt_bias))
