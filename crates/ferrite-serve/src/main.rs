@@ -89,12 +89,23 @@ fn main() {
     println!("[serve] prompt: {n} tokens", n = ids.len());
 
     // ---- inference ----
-    let eos = 154820u32; // primary <|end|> from generation_config.json
+    // Stop set: primary <|end|> from generation_config.json PLUS turn
+    // boundary specials — the model emits <|user|> after its answer and
+    // generation must respect it (user-visible contract).
+    let mut stop: Vec<u32> = vec![154820u32]; // <|end|>
+    for special in ["<|user|>", "<|endoftext|>", "<|observation|>", "<|endoftext|>"] {
+        if let Some(id) = tok.token_to_id(special) {
+            if !stop.contains(&id) {
+                stop.push(id);
+            }
+        }
+    }
+    eprintln!("[serve] stop tokens: {stop:?}");
     let t1 = std::time::Instant::now();
     let world_tp = if backend == "cuda" { tp } else { 1 };
     let new_tokens: Vec<u32> = match backend.as_str() {
-        "cuda" => run_cuda(cfg, weights, &ids, max_tokens, eos, &lib, world_tp),
-        _ => run_cpu(cfg, weights, &ids, max_tokens, eos),
+        "cuda" => run_cuda(cfg, weights, &ids, max_tokens, &stop, &lib, world_tp),
+        _ => run_cpu(cfg, weights, &ids, max_tokens, &stop),
     };
     let dt = t1.elapsed().as_secs_f64();
     let text = tok
@@ -133,12 +144,12 @@ fn run_cpu(
     weights: ferrite_model::Weights,
     ids: &[u32],
     max_tokens: usize,
-    eos: u32,
+    stop: &[u32],
 ) -> Vec<u32> {
     use ferrite_exec::Engine;
     use ferrite_kernel::CpuBackend;
     let mut engine = Engine::new(cfg, weights, CpuBackend::new());
-    engine.eos_token = Some(eos);
+    engine.eos_token = stop.first().copied();
     let seq = engine
         .submit(ids.to_vec(), max_tokens)
         .unwrap_or_else(|e| panic!("submit: {e}"));
@@ -160,7 +171,7 @@ fn run_cuda(
     weights: ferrite_model::Weights,
     ids: &[u32],
     max_tokens: usize,
-    eos: u32,
+    stop: &[u32],
     lib: &str,
     tp: usize,
 ) -> Vec<u32> {
@@ -227,7 +238,7 @@ fn run_cuda(
         let tok = cluster
             .decode_step(seq)
             .unwrap_or_else(|e| panic!("decode step {i}: {e}"));
-        if tok == eos {
+        if stop.contains(&tok) {
             break;
         }
         out.push(tok);
