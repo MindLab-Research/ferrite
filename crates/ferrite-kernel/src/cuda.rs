@@ -50,8 +50,8 @@ extern "C" {
                                pool_keys: *mut f32, total_ptr: *const i32, npools: i32, kpool: i32,
                                idm: i32, s: CuStream) -> i32;
     fn ferrite_pool_expand(idx_pools: *const f32, idx: *mut f32,
-                            n: i32, select_k: i32, kpool: i32, npools: i32,
-                            total_ptr: *const i32, ctx0: i32,
+                            n: i32, select_k: i32, kpool: i32, max_npools: i32,
+                            total_ptr: *const i32, n_fixed: i32,
                             s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
@@ -1554,14 +1554,19 @@ impl CudaBackend {
         let total = t0 + n;
 
         // 8. kpool compression: pool_keys [npools, idm]
+        // max_npools for graph safety: the grid is sized for the MAX
+        // possible pools; the kernel derives the ACTUAL npools from the
+        // pinned total (a frozen grid with actual npools would miss pools
+        // as the context grows).
+        let max_npools = (8192 + kpool - 1) / kpool; // max_tokens / kpool
         let npools = (total + kpool - 1) / kpool;
-        let pool_keys = DevBuf::alloc(self.dev, self.stream, npools * idm)?;
+        let pool_keys = DevBuf::alloc(self.dev, self.stream, max_npools * idm)?;
         let dape = self.dev_weight(w.ape)?;
         ck(
             unsafe {
                 ferrite_kpool_compress(
                     k_idx_dev as *const f32, k_gate_dev as *const f32, dape.as_const_f32(), pool_keys.as_f32(),
-                    pinned_total, npools as i32, kpool as i32, idm as i32, self.stream,
+                    pinned_total, max_npools as i32, kpool as i32, idm as i32, self.stream,
                 )
             },
             "dsa_kpool",
@@ -1589,8 +1594,8 @@ impl CudaBackend {
             unsafe {
                 ferrite_pool_expand(
                     idx_pools.as_const_f32(), idx.as_f32(),
-                    ni, select_k as i32, kpool as i32, npools as i32, pinned_total,
-                    ctx0 as i32, self.stream,
+                    ni, select_k as i32, kpool as i32, max_npools as i32, pinned_total,
+                    ni, self.stream,
                 )
             },
             "dsa_pool_expand",

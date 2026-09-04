@@ -1639,8 +1639,9 @@ __global__ void kpool_compress_kernel(
     const float* __restrict__ ape,     // [kpool, idm]
     float* __restrict__ pool_keys,     // [npools, idm]
     const int* __restrict__ total_ptr, // pinned (graph-safe)
-    int npools, int kpool, int idm) {
+    int max_npools, int kpool, int idm) {
     int total = *total_ptr;
+    int npools = (total + kpool - 1) / kpool; // derive from pinned total
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= (int)((size_t)npools * idm)) return;
     int p = tid / idm, d = tid % idm;
@@ -1680,10 +1681,12 @@ extern "C" cudaError_t ferrite_kpool_compress(
 __global__ void pool_expand_kernel(
     const float* __restrict__ idx_pools,  // [n, select_k]
     float* __restrict__ idx,              // [n, out_width]
-    int n, int select_k, int kpool, int npools,
+    int n, int select_k, int kpool, int max_npools,
     const int* __restrict__ total_ptr,    // pinned (graph-safe)
-    int ctx0) {
+    int n_fixed) {                        // n as a CONSTANT for ctx0 derivation
     int total = *total_ptr;
+    int ctx0 = total - n_fixed;           // derive from pinned total
+    int npools = (total + kpool - 1) / kpool; // derive from pinned total
     int i = blockIdx.x;
     if (i >= n) return;
     int out_width = select_k * kpool + (kpool - 1);
@@ -1712,9 +1715,10 @@ __global__ void pool_expand_kernel(
 
 extern "C" cudaError_t ferrite_pool_expand(
     const float* idx_pools, float* idx,
-    int n, int select_k, int kpool, int npools, const int* total_ptr, int ctx0,
+    int n, int select_k, int kpool, int max_npools, const int* total_ptr,
+    int n_fixed,
     cudaStream_t s) {
-    pool_expand_kernel<<<n, 1, 0, s>>>(idx_pools, idx, n, select_k, kpool, npools, total_ptr, ctx0);
+    pool_expand_kernel<<<n, 1, 0, s>>>(idx_pools, idx, n, select_k, kpool, max_npools, total_ptr, n_fixed);
     return cudaGetLastError();
 }
 
