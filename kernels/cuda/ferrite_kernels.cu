@@ -1365,33 +1365,32 @@ extern "C" cudaError_t ferrite_gemv_bf16(const float* x, const void* w,
 //     + shared·act_shared. down_ptrs indirect per selected expert.
 // ============================================================
 __global__ void moe_fused_act_kernel(
-    const float* __restrict__ x,
-    const float* __restrict__ ids_f,       // [topk] f32-encoded (moe_route writes f32)
+    const float* __restrict__ x,          // [n, hidden]
+    const float* __restrict__ ids_f,      // [n, topk] f32-encoded
     const __nv_bfloat16* const* __restrict__ gate_ptrs,  // [e_local]
     const __nv_bfloat16* const* __restrict__ up_ptrs,    // [e_local]
     const __nv_bfloat16* __restrict__ shared_gate,       // [inter_shared, hidden]
     const __nv_bfloat16* __restrict__ shared_up,
-    float* __restrict__ act,               // [topk*inter + inter_shared]
+    float* __restrict__ act,              // [n, topk*inter + inter_shared]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int rows, float limit) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int slot = blockIdx.y;
+    int tok = blockIdx.z;
     int row0 = blockIdx.x * rows;
-    // Layout: routed slots [0, topk) use inter rows each (full expert width);
-    // the shared slot (== topk) uses inter_shared rows (TP-sharded width).
+    int stride = topk * inter + inter_shared;
+    const float* xt = x + (size_t)tok * hidden;
     int slot_rows, slot_base;
     const __nv_bfloat16 *gw, *uw;
     if (slot < topk) {
         slot_rows = inter;
         slot_base = slot * inter;
-        int eid = (int)ids_f[slot];
+        int eid = (int)ids_f[(size_t)tok * topk + slot];
         int local = eid - expert_start;
         if (local < 0 || local >= e_local) {
-            // Another rank owns this expert → zero slot; the TP all-reduce
-            // across ranks fills the total contribution.
             if (warp == 0) {
                 for (int r = row0 + lane; r < row0 + rows && r < slot_rows; r += 32) {
-                    act[(size_t)slot_base + r] = 0.f;
+                    act[(size_t)tok * stride + slot_base + r] = 0.f;
                 }
             }
             return;
@@ -1410,10 +1409,10 @@ __global__ void moe_fused_act_kernel(
         const __nv_bfloat16* uwr = uw + (size_t)r * hidden;
         float g = 0.f, u = 0.f;
         for (int k = lane * 4; k < hidden; k += 32 * 4) {
-            float x0 = x[k];
-            float x1 = (k + 1 < hidden) ? x[k + 1] : 0.f;
-            float x2 = (k + 2 < hidden) ? x[k + 2] : 0.f;
-            float x3 = (k + 3 < hidden) ? x[k + 3] : 0.f;
+            float x0 = xt[k];
+            float x1 = (k + 1 < hidden) ? xt[k + 1] : 0.f;
+            float x2 = (k + 2 < hidden) ? xt[k + 2] : 0.f;
+            float x3 = (k + 3 < hidden) ? xt[k + 3] : 0.f;
             g += x0 * __bfloat162float(gwr[k]);
             u += x0 * __bfloat162float(uwr[k]);
             if (k + 1 < hidden) { g += x1 * __bfloat162float(gwr[k + 1]); u += x1 * __bfloat162float(uwr[k + 1]); }
@@ -1426,35 +1425,39 @@ __global__ void moe_fused_act_kernel(
             u += __shfl_down_sync(0xffffffff, u, off);
         }
         if (lane == 0) {
-            // swiglu2 semantics (gate clamp, up clamp, silu(g)*u)
             g = fminf(g, limit);
             u = fminf(fmaxf(u, -limit), limit);
-            act[(size_t)slot_base + r] = (g / (1.0f + expf(-g))) * u;
+            act[(size_t)tok * stride + slot_base + r] = (g / (1.0f + expf(-g))) * u;
         }
     }
 }
 
 __global__ void moe_fused_down_sum_kernel(
-    const float* __restrict__ ids_f,       // [topk]
-    const float* __restrict__ probs,       // [topk]
+    const float* __restrict__ ids_f,       // [n, topk]
+    const float* __restrict__ probs,       // [n, topk]
     const __nv_bfloat16* const* __restrict__ down_ptrs,  // [e_local], [hidden, inter] each
     const __nv_bfloat16* __restrict__ shared_down,      // [hidden, inter_shared]
-    const float* __restrict__ act,         // [topk*inter + inter_shared]
-    float* __restrict__ out,               // [hidden]
+    const float* __restrict__ act,         // [n, topk*inter + inter_shared]
+    float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int rows) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int tok = blockIdx.y;
     int h = blockIdx.x * rows + warp;
     if (h >= hidden) return;
+    int stride = topk * inter + inter_shared;
+    const float* act_t = act + (size_t)tok * stride;
+    const float* ids_t = ids_f + (size_t)tok * topk;
+    const float* probs_t = probs + (size_t)tok * topk;
     float acc = 0.f;
     for (int j = 0; j < topk; j++) {
-        int eid = (int)ids_f[j];
+        int eid = (int)ids_t[j];
         int local = eid - expert_start;
         if (local < 0 || local >= e_local) continue; // another rank's slot (zero act)
-        float p = probs[j];
+        float p = probs_t[j];
         if (p == 0.f) continue;
         const __nv_bfloat16* dwr = down_ptrs[local] + (size_t)h * inter;
-        const float* aj = act + (size_t)j * inter;
+        const float* aj = act_t + (size_t)j * inter;
         float y = 0.f;
         for (int i = lane * 4; i < inter; i += 32 * 4) {
             float a0 = aj[i];
@@ -1475,7 +1478,7 @@ __global__ void moe_fused_down_sum_kernel(
     // shared expert (slot topk, weight 1; K length = inter_shared, TP-sharded)
     {
         const __nv_bfloat16* dwr = shared_down + (size_t)h * inter_shared;
-        const float* as = act + (size_t)topk * inter;
+        const float* as = act_t + (size_t)topk * inter;
         float y = 0.f;
         for (int i = lane * 4; i < inter_shared; i += 32 * 4) {
             float a0 = as[i];
@@ -1493,7 +1496,7 @@ __global__ void moe_fused_down_sum_kernel(
         }
         acc += y;
     }
-    if (lane == 0) out[h] = acc;
+    if (lane == 0) out[(size_t)tok * hidden + h] = acc;
 }
 
 // Launcher A: act stage — caller provides the act buffer
@@ -1503,12 +1506,12 @@ extern "C" cudaError_t ferrite_moe_fused_act(
     const void* const* gate_ptrs, const void* const* up_ptrs,
     const void* shared_gate, const void* shared_up,
     float* act, int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, float limit, cudaStream_t s) {
-    // rows = warps per block (256 threads / 32 = 8): each block covers 8
-    // rows via the stride loop (r += warps).
+    int inter_shared, int topk, int n, float limit, cudaStream_t s) {
+    // rows = warps per block (256 threads / 32 = 8); grid.z = token (prefill
+    // batch dimension — decode n==1, chunked prefill n up to chunk size).
     int rows = 8;
     int max_rows = inter > inter_shared ? inter : inter_shared;
-    dim3 grid((max_rows + rows - 1) / rows, topk + 1);
+    dim3 grid((max_rows + rows - 1) / rows, topk + 1, n);
     moe_fused_act_kernel<<<grid, 256, 0, s>>>(
         x, ids_f,
         (const __nv_bfloat16* const*)gate_ptrs, (const __nv_bfloat16* const*)up_ptrs,
@@ -1518,20 +1521,20 @@ extern "C" cudaError_t ferrite_moe_fused_act(
 }
 
 // Launcher B: down + weighted-sum + shared stage — caller provides act
-// ([topk*inter + inter_shared]) and out ([hidden]).
+// ([n, topk*inter + inter_shared]) and out ([n, hidden]).
 extern "C" cudaError_t ferrite_moe_fused_down_sum(
     const float* ids_f, const float* probs,
     const void* const* down_ptrs, const void* shared_down,
     const float* act, float* out,
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk,
+    int inter_shared, int topk, int n,
     cudaStream_t s) {
     // CRITICAL: rows must equal warps per block (256/32 = 8). The kernel
     // assigns ONE hidden-row per warp with no stride loop — rows=128 made
     // grid.x = hidden/128 while each block only computed 8 rows (4096-row
     // hidden: 32 blocks × 8 = 256 rows computed, 94% of out was garbage).
     int rows = 8;
-    dim3 grid((hidden + rows - 1) / rows);
+    dim3 grid((hidden + rows - 1) / rows, n);
     moe_fused_down_sum_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
         (const __nv_bfloat16* const*)down_ptrs, (const __nv_bfloat16*)shared_down,

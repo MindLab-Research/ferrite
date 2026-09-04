@@ -546,7 +546,7 @@ where
         // per-rank CUDA graph. GDN/MoE device chains already handle the
         // attn/ffn segments (FERRITE_GDN_DEV/FERRITE_MOE_DEV).
         #[cfg(feature = "cuda")]
-        if std::env::var_os("FERRITE_LAYER_DEV").is_some() && n == 1 && self.full_cfg.mhc {
+        if std::env::var_os("FERRITE_LAYER_DEV").is_some() && self.full_cfg.mhc {
             return self.layer_forward_dev(seq, layer_idx, residual, n);
         }
         let probe = std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1; // prefill, first DSA+MoE layer

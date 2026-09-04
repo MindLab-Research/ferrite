@@ -1546,7 +1546,7 @@ extern "C" {
                               shared_up: *const std::ffi::c_void,
                               act: *mut f32, expert_start: i32, e_local: i32,
                               hidden: i32, inter: i32, inter_shared: i32,
-                              topk: i32, limit: f32,
+                              topk: i32, n: i32, limit: f32,
                               s: CuStream) -> i32;
     fn ferrite_moe_fused_down_sum(ids_f: *const f32, probs: *const f32,
                                    down_ptrs: *const *const std::ffi::c_void,
@@ -1554,7 +1554,7 @@ extern "C" {
                                    act: *const f32, out: *mut f32,
                                    expert_start: i32, e_local: i32,
                                    hidden: i32, inter: i32, inter_shared: i32,
-                                   topk: i32,
+                                   topk: i32, n: i32,
                                    s: CuStream) -> i32;
 }
 
@@ -1665,28 +1665,28 @@ impl CudaBackend {
         let dprobs = DevBuf::alloc(self.dev, self.stream, n * topk)?;
         let dids = DevBuf::alloc(self.dev, self.stream, n * topk)?;
 
-        // ---- FUSED DECODE PATH (n==1, TileRT ExpertSelect idea): GPU-side
-        // expert dispatch via the pointer table — ids/probs NEVER cross to
-        // the host; two kernels (act + down_sum) replace the per-expert
-        // kernel chains, the D2D gather and the probs_ext upload (3 host
-        // crossings + a dispatch sync per MoE layer).
-        if n == 1 {
+        // ---- FUSED PATH (TileRT ExpertSelect idea): GPU-side expert dispatch
+        // via the pointer table — ids/probs NEVER cross to the host; two
+        // kernels (act + down_sum) replace the per-expert kernel chains, the
+        // D2D gather and the probs_ext upload. Now batch-capable: grid carries
+        // the token dim (n==1 decode, n>1 chunked prefill).
+        {
             let dbias = self.dev_weight(bias_w)?;
             ck(unsafe {
                 ferrite_moe_route(logits.as_const_f32(), dbias.as_const_f32(),
                                   dprobs.as_f32(), dids.as_f32(),
                                   ni, e_total as i32, topk as i32, routed_scaling, self.stream)
             }, "moe_route_fused")?;
-            if probs_out.len >= topk {
+            if probs_out.len >= n * topk {
                 let (dst, src) = (probs_out.as_f32(), dprobs.as_const_f32());
                 ck(unsafe {
-                    cudaMemcpyAsync(dst as *mut _, src as *const _, topk * 4, CUDA_MEMCPY_D2D, self.stream)
+                    cudaMemcpyAsync(dst as *mut _, src as *const _, n * topk * 4, CUDA_MEMCPY_D2D, self.stream)
                 }, "probs D2D (fused)")?;
             }
             let (e_local, g_ptrs, u_ptrs, d_ptrs) = self.moe_expert_ptrs(experts)?;
             // Routed experts keep the FULL inter; the shared expert's inter is
             // TP-sharded (moe_intermediate_size / world). The act buffer is
-            // [topk*inter + inter_shared] (see the kernels' slot layout).
+            // [n, topk*inter + inter_shared] (see the kernels' slot layout).
             let inter = experts.first()
                 .map(|e| e.gate.shape.0[0])
                 .unwrap_or(shared.gate.shape.0[0]) as i32;
@@ -1694,24 +1694,24 @@ impl CudaBackend {
             let dsg = self.dev_weight_bf16(shared.gate)?;
             let dsu = self.dev_weight_bf16(shared.up)?;
             let dsd = self.dev_weight_bf16(shared.down)?;
-            let act = DevBuf::alloc(self.dev, self.stream, topk * inter as usize + inter_shared as usize)?;
+            let act = DevBuf::alloc(self.dev, self.stream, n * (topk * inter as usize + inter_shared as usize))?;
             ck(unsafe {
                 ferrite_moe_fused_act(
                     x_dev.as_const_f32(), dids.as_const_f32(),
                     g_ptrs as *const *const _, u_ptrs as *const *const _,
                     dsg.ptr, dsu.ptr, act.as_f32(),
                     expert_start as i32, e_local as i32, hi, inter, inter_shared,
-                    topk as i32, swiglu_limit, self.stream,
+                    topk as i32, ni, swiglu_limit, self.stream,
                 )
             }, "moe_fused_act")?;
-            let out = DevBuf::alloc(self.dev, self.stream, hidden)?;
+            let out = DevBuf::alloc(self.dev, self.stream, n * hidden)?;
             ck(unsafe {
                 ferrite_moe_fused_down_sum(
                     dids.as_const_f32(), dprobs.as_const_f32(),
                     d_ptrs as *const *const _, dsd.ptr,
                     act.as_const_f32(), out.as_f32(),
                     expert_start as i32, e_local as i32, hi, inter, inter_shared,
-                    topk as i32, self.stream,
+                    topk as i32, ni, self.stream,
                 )
             }, "moe_fused_down_sum")?;
             return Ok(out);

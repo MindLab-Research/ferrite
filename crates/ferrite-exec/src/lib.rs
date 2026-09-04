@@ -993,7 +993,7 @@ impl<B: KernelBackend> Engine<B> {
         // which is why fused MoE showed no ffn speedup until now.)
         #[cfg(feature = "cuda")]
         if let Some(cuda) = self.backend.as_cuda() {
-            if std::env::var_os("FERRITE_MOE_DEV").is_some() && n == 1 {
+            if std::env::var_os("FERRITE_MOE_DEV").is_some() {
                 return self.moe_ffn_dev(cuda, pfx, x, n);
             }
         }
