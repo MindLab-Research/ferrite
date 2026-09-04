@@ -230,9 +230,16 @@ fn run_cuda(
     }
 
     let seq = 1u64;
+    let tp0 = std::time::Instant::now();
     cluster
         .prefill_chunk(seq, ids)
         .unwrap_or_else(|e| panic!("prefill: {e}"));
+    let tp1 = std::time::Instant::now();
+    println!(
+        "[serve] prefill {} tokens in {:.3}s",
+        ids.len(),
+        tp1.duration_since(tp0).as_secs_f32()
+    );
     let mut out = Vec::new();
     for i in 0..max_tokens {
         let tok = cluster
@@ -245,6 +252,15 @@ fn run_cuda(
         if std::env::var_os("FERRITE_TRACE_TOK").is_some() {
             println!("[serve] tok {i}: {tok}");
         }
+    }
+    let td1 = std::time::Instant::now();
+    let decode_s = td1.duration_since(tp1).as_secs_f32();
+    let gen = out.len();
+    if gen > 0 {
+        println!(
+            "[serve] decode: {gen} tokens in {decode_s:.3}s = {:.1} tok/s (steady state; weights-preload + prefill excluded)",
+            gen as f32 / decode_s
+        );
     }
     // Skip the exit-time teardown: dropping 1.17TB of f32 weights walks
     // ~37k large glibc chunks through munmap (~70s, observed 6/6 in gdb
