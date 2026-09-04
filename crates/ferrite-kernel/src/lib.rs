@@ -204,4 +204,31 @@ pub trait KernelBackend: Send + Sync {
 
     /// Softmax over the last dim (numerically stabilised).
     fn softmax_lastdim(&self, logits: &Tensor, out: &mut Tensor) -> Result<()>;
+
+    // ------------------------------------------------------------------
+    // MHC hyper-connections (sglang _mhc_pre/_mhc_post exact port; the
+    // golden CPU math lives in ferrite-exec/src/mhc.rs — this is the
+    // backend surface so the GPU path can run it in one kernel instead of
+    // the per-token host loops)
+    // ------------------------------------------------------------------
+
+    /// MHC pre-step: `residual_flat [s, n*h]` + `fn_w [mix, n*h]` +
+    /// `scale [3]` + `base [mix]` → `(li [s,h], post [s,n], comb [s,n,n])`.
+    /// pre_i = sigmoid(mixes_i*s0 + base_i) + hc_eps; li = Σ pre_i·x_i;
+    /// post = 2·sigmoid; comb = sinkhorn-normalised mix block.
+    fn hc_pre(
+        &self,
+        residual_flat: &Tensor,
+        fn_w: &Tensor,
+        scale: &Tensor,
+        base: &Tensor,
+        rms_eps: f32,
+        hc_eps: f32,
+        sinkhorn_iters: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)>;
+
+    /// MHC post-step: `out[t,i,j] = post[t,i]·x[t,j] + Σ_k comb[t,k,i]·res[t,k,j]`
+    /// (note the comb transpose — transformers matmuls combᵀ·residual).
+    /// `x [s,h]`, `residual [s,n,h]`, `post [s,n]`, `comb [s,n,n]` → `[s,n,h]`.
+    fn hc_post(&self, x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Result<Tensor>;
 }

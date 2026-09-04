@@ -16,7 +16,7 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use ferrite_types::{FerriteError, Result, Tensor};
+use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 
 /// Opaque stream handle (cudaStream_t == void* at the ABI level).
 pub type CuStream = *mut std::ffi::c_void;
@@ -68,6 +68,12 @@ extern "C" {
                            topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
+    fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
+                      li: *mut f32, post: *mut f32, comb: *mut f32,
+                      s: i32, n: i32, h: i32, mix: i32,
+                      rms_eps: f32, hc_eps: f32, iters: i32, stream: CuStream) -> i32;
+    fn ferrite_hc_post(x: *const f32, res: *const f32, post: *const f32, comb: *const f32,
+                       out: *mut f32, s: i32, n: i32, h: i32, stream: CuStream) -> i32;
 }
 
 const CUDA_MEMCPY_H2D: i32 = 1;
@@ -865,5 +871,86 @@ impl crate::KernelBackend for CudaBackend {
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
+    }
+
+    // MHC hyper-connections on the GPU — replaces the per-token host loops
+    // (24×16384 mixes dot + sinkhorn + weighted combine) that dominated the
+    // layer boundary between the fan_out attention/FFN segments.
+    fn hc_pre(
+        &self,
+        residual_flat: &Tensor,
+        fn_w: &Tensor,
+        scale: &Tensor,
+        base: &Tensor,
+        rms_eps: f32,
+        hc_eps: f32,
+        sinkhorn_iters: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.enter();
+        let s = residual_flat.shape.0[0] as i32;
+        let nh = residual_flat.shape.0[1] as i32;
+        let mix = fn_w.shape.0[0] as i32;
+        let n = ((-2.0 + (4.0 + 4.0 * mix as f64).sqrt()) / 2.0) as i32;
+        let h = nh / n;
+        let dr = DevBuf::alloc(self.dev, self.stream, residual_flat.numel())?;
+        dr.upload(residual_flat.as_slice())?;
+        let dfw = self.dev_weight(fn_w)?;
+        let dsc = self.dev_weight(scale)?;
+        let dba = self.dev_weight(base)?;
+        let dli = DevBuf::alloc(self.dev, self.stream, (s * h) as usize)?;
+        let dpost = DevBuf::alloc(self.dev, self.stream, (s * n) as usize)?;
+        let dcomb = DevBuf::alloc(self.dev, self.stream, (s * n * n) as usize)?;
+        ck(
+            unsafe {
+                ferrite_hc_pre(
+                    dr.as_const_f32(), dfw.as_const_f32(), dsc.as_const_f32(), dba.as_const_f32(),
+                    dli.as_f32(), dpost.as_f32(), dcomb.as_f32(),
+                    s, n, h, mix, rms_eps, hc_eps, sinkhorn_iters as i32, self.stream,
+                )
+            },
+            "hc_pre",
+        )?;
+        let mut li = Tensor::zeros(Shape::new([s as usize, h as usize]), DType::F32);
+        {
+            let v = Arc::get_mut(&mut li.data).expect("unique");
+            dli.download(v)?;
+        }
+        let mut post = Tensor::zeros(Shape::new([s as usize, n as usize]), DType::F32);
+        {
+            let v = Arc::get_mut(&mut post.data).expect("unique");
+            dpost.download(v)?;
+        }
+        let mut comb = Tensor::zeros(Shape::new([s as usize, n as usize, n as usize]), DType::F32);
+        {
+            let v = Arc::get_mut(&mut comb.data).expect("unique");
+            dcomb.download(v)?;
+        }
+        Ok((li, post, comb))
+    }
+
+    fn hc_post(&self, x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Result<Tensor> {
+        self.enter();
+        let s = x.shape.0[0] as i32;
+        let h = x.shape.0[1] as i32;
+        let n = residual.shape.0[1] as i32;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?;
+        dx.upload(x.as_slice())?;
+        let drs = DevBuf::alloc(self.dev, self.stream, residual.numel())?;
+        drs.upload(residual.as_slice())?;
+        let dp = DevBuf::alloc(self.dev, self.stream, post.numel())?;
+        dp.upload(post.as_slice())?;
+        let dc = DevBuf::alloc(self.dev, self.stream, comb.numel())?;
+        dc.upload(comb.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, (s * n * h) as usize)?;
+        ck(
+            unsafe { ferrite_hc_post(dx.as_const_f32(), drs.as_const_f32(), dp.as_const_f32(), dc.as_const_f32(), do_.as_f32(), s, n, h, self.stream) },
+            "hc_post",
+        )?;
+        let mut out = Tensor::zeros(Shape::new([s as usize, n as usize, h as usize]), DType::F32);
+        {
+            let v = Arc::get_mut(&mut out.data).expect("unique");
+            do_.download(v)?;
+        }
+        Ok(out)
     }
 }

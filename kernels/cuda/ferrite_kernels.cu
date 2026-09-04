@@ -956,3 +956,164 @@ extern "C" cudaError_t ferrite_sparse_attn(const float* q, const float* k,
     sparse_attn_kernel<<<grid, block, smem, s>>>(q, k, v, idx, out, n, t, h, d, dv, topk);
     return cudaGetLastError();
 }
+
+// ============================================================
+// MHC hyper-connections (sglang-exact port; see ferrite-exec/src/mhc.rs
+// for the golden CPU math). hc_pre mixes the n residual flows into the
+// layer input; hc_post recombines the sublayer output back. One block
+// per token; the mix dot-products are block-reduced, the 4x4 sinkhorn
+// runs single-threaded (n is tiny).
+//
+// hc_pre: mixes[m] = (fw[m,:] · x) * rsqrt(mean(x^2)+rms_eps)
+//   pre_i  = sigmoid(mixes_i*scale0 + base_i) + hc_eps;  li = Σ pre_i x_i
+//   post_i = 2*sigmoid(mixes_{n+i}*scale1 + base_{n+i})
+//   comb   = mixes_{2n+..}*scale2 + base → sinkhorn-normalised [n,n]
+// hc_post: out[t,i,j] = post[t,i]*x[t,j] + Σ_k comb[t,k,i]*res[t,k,j]
+// ============================================================
+__global__ void hc_pre_kernel(const float* __restrict__ res,
+                               const float* __restrict__ fw,
+                               const float* __restrict__ scale,
+                               const float* __restrict__ base,
+                               float* __restrict__ li,
+                               float* __restrict__ post,
+                               float* __restrict__ comb,
+                               int s, int n, int h, int mix,
+                               float rms_eps, float hc_eps, int iters) {
+    int t = blockIdx.x;
+    if (t >= s) return;
+    const float* x = res + (size_t)t * n * h;
+    const int nh = n * h;
+    extern __shared__ float sm[]; // mixes [mix] + comb [n*n] + red [32]
+    float* mx = sm;
+    float* cb = sm + mix;
+    float* red = cb + n * n;
+
+    // 1. rsqrt(mean(x^2) + rms_eps)
+    if (threadIdx.x == 0) red[31] = rsqrtf(0.f); // placeholder init
+    float part = 0.f;
+    for (int i = threadIdx.x; i < nh; i += blockDim.x) part += x[i] * x[i];
+    // warp+block reduce via shared
+    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffff, part, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
+    __syncthreads();
+    float msq = 0.f;
+    if (threadIdx.x == 0) {
+        for (int w = 0; w < 32; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
+        red[30] = rsqrtf(msq / (float)nh + rms_eps);
+    }
+    __syncthreads();
+    float rsq = red[30];
+
+    // 2. mixes: mix rows of fw against x (block-reduced dot each)
+    for (int m = 0; m < mix; m++) {
+        const float* row = fw + (size_t)m * nh;
+        float acc = 0.f;
+        for (int i = threadIdx.x; i < nh; i += blockDim.x) acc += row[i] * x[i];
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float tot = 0.f;
+            for (int w = 0; w < 32; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
+            mx[m] = tot * rsq;
+        }
+        __syncthreads();
+    }
+
+    // 3. pre / layer_input, post, comb (single thread; n and mix are tiny)
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < n; i++) {
+            float pre_i = 1.0f / (1.0f + __expf(-(mx[i] * scale[0] + base[i]))) + hc_eps;
+            post[t * n + i] = 2.0f * (1.0f / (1.0f + __expf(-(mx[n + i] * scale[1] + base[n + i]))));
+            // stash pre in comb's tail? no — write li below with a parallel loop.
+            // keep pre in smem: reuse red[16..16+n]
+            red[16 + i] = pre_i;
+        }
+        for (int i = 0; i < n; i++)
+            for (int k = 0; k < n; k++)
+                cb[i * n + k] = mx[2 * n + i * n + k] * scale[2] + base[2 * n + i * n + k];
+        // 4. sinkhorn: row softmax (+eps), then alternating col/row normalise
+        for (int i = 0; i < n; i++) {
+            float rmax = -INFINITY;
+            for (int k = 0; k < n; k++) rmax = fmaxf(rmax, cb[i * n + k]);
+            float denom = 0.f;
+            for (int k = 0; k < n; k++) { cb[i * n + k] = __expf(cb[i * n + k] - rmax); denom += cb[i * n + k]; }
+            for (int k = 0; k < n; k++) cb[i * n + k] = cb[i * n + k] / denom + hc_eps;
+        }
+        for (int k = 0; k < n; k++) {
+            float colsum = 0.f;
+            for (int i = 0; i < n; i++) colsum += cb[i * n + k];
+            float d = colsum + hc_eps;
+            for (int i = 0; i < n; i++) cb[i * n + k] /= d;
+        }
+        for (int it = 1; it < iters; it++) {
+            for (int i = 0; i < n; i++) {
+                float rowsum = 0.f;
+                for (int k2 = 0; k2 < n; k2++) rowsum += cb[i * n + k2];
+                float d = rowsum + hc_eps;
+                for (int k2 = 0; k2 < n; k2++) cb[i * n + k2] /= d;
+            }
+            for (int k2 = 0; k2 < n; k2++) {
+                float colsum = 0.f;
+                for (int i = 0; i < n; i++) colsum += cb[i * n + k2];
+                float d = colsum + hc_eps;
+                for (int i = 0; i < n; i++) cb[i * n + k2] /= d;
+            }
+        }
+    }
+    __syncthreads();
+
+    // 5. li = Σ_i pre_i · x[i*h + j] (parallel over h)
+    for (int j = threadIdx.x; j < h; j += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < n; i++) acc += red[16 + i] * x[(size_t)i * h + j];
+        li[(size_t)t * h + j] = acc;
+    }
+    // write comb out
+    if (threadIdx.x == 0) {
+        for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
+    }
+}
+
+extern "C" cudaError_t ferrite_hc_pre(const float* res, const float* fw,
+                                       const float* scale, const float* base,
+                                       float* li, float* post, float* comb,
+                                       int s, int n, int h, int mix,
+                                       float rms_eps, float hc_eps, int iters,
+                                       cudaStream_t stream) {
+    size_t smem = ((size_t)mix + n * n + 32) * sizeof(float);
+    hc_pre_kernel<<<s, 256, smem, stream>>>(res, fw, scale, base, li, post, comb,
+                                             s, n, h, mix, rms_eps, hc_eps, iters);
+    return cudaGetLastError();
+}
+
+__global__ void hc_post_kernel(const float* __restrict__ x,
+                               const float* __restrict__ res,
+                               const float* __restrict__ post,
+                               const float* __restrict__ comb,
+                               float* __restrict__ out,
+                               int s, int n, int h) {
+    // out[t,i,j] = post[t,i]*x[t,j] + Σ_k comb[t,k,i]*res[t,k,j]
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = s * n * h;
+    if (idx >= total) return;
+    int j = idx % h;
+    int i = (idx / h) % n;
+    int t = idx / (n * h);
+    float acc = post[(size_t)t * n + i] * x[(size_t)t * h + j];
+    for (int k = 0; k < n; k++) {
+        acc += comb[(size_t)t * n * n + k * n + i] * res[(size_t)(t * n + k) * h + j];
+    }
+    out[idx] = acc;
+}
+
+extern "C" cudaError_t ferrite_hc_post(const float* x, const float* res,
+                                        const float* post, const float* comb,
+                                        float* out, int s, int n, int h,
+                                        cudaStream_t stream) {
+    int total = s * n * h;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
+    hc_post_kernel<<<grid, block, 0, stream>>>(x, res, post, comb, out, s, n, h);
+    return cudaGetLastError();
+}

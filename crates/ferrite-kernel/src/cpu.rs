@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use ferrite_types::{FerriteError, Result, Tensor};
+use ferrite_types::{FerriteError, Result, Shape, Tensor};
 
 use crate::graph::{GraphCapable, OpTrace, Recorder};
 
@@ -668,5 +668,141 @@ impl crate::KernelBackend for CpuBackend {
             }
         }
         Ok(())
+    }
+
+    // MHC hyper-connections — CPU golden math (sglang _mhc_pre/_mhc_post
+    // exact port; mirrors ferrite-exec/src/mhc.rs, which stays the reference
+    // implementation for the equivalence tests).
+    fn hc_pre(
+        &self,
+        residual_flat: &Tensor,
+        fn_w: &Tensor,
+        scale: &Tensor,
+        base: &Tensor,
+        rms_eps: f32,
+        hc_eps: f32,
+        sinkhorn_iters: usize,
+    ) -> Result<(Tensor, Tensor, Tensor)> {
+        self.rec("hc_pre");
+        let slen = residual_flat.shape.0[0];
+        let nh = residual_flat.shape.0[1];
+        let mix_hc = fn_w.shape.0[0];
+        let n = ((-2.0 + (4.0 + 4.0 * mix_hc as f64).sqrt()) / 2.0) as usize;
+        let h = nh / n;
+        let rf = residual_flat.as_slice();
+        let fw = fn_w.as_slice();
+        let sv = scale.as_slice();
+        let bv = base.as_slice();
+        let sigmoid = |x: f32| 1.0 / (1.0 + (-x).exp());
+
+        let mut mixes = vec![0.0f32; slen * mix_hc];
+        for t in 0..slen {
+            let mut msq = 0.0f32;
+            for &v in &rf[t * nh..(t + 1) * nh] {
+                msq += v * v;
+            }
+            let rsqrt = 1.0 / ((msq / nh as f32 + rms_eps).sqrt());
+            for m in 0..mix_hc {
+                let mut acc = 0.0f32;
+                let row = &fw[m * nh..(m + 1) * nh];
+                for i in 0..nh {
+                    acc += row[i] * rf[t * nh + i];
+                }
+                mixes[t * mix_hc + m] = acc * rsqrt;
+            }
+        }
+        let mut li = vec![0.0f32; slen * h];
+        let mut post = vec![0.0f32; slen * n];
+        let mut comb = vec![0.0f32; slen * n * n];
+        for t in 0..slen {
+            for i in 0..n {
+                let pre_i = sigmoid(mixes[t * mix_hc + i] * sv[0] + bv[i]) + hc_eps;
+                for j in 0..h {
+                    li[t * h + j] += pre_i * rf[t * nh + i * h + j];
+                }
+            }
+            for i in 0..n {
+                post[t * n + i] = 2.0 * sigmoid(mixes[t * mix_hc + n + i] * sv[1] + bv[n + i]);
+            }
+            for i in 0..n {
+                for k in 0..n {
+                    comb[t * n * n + i * n + k] =
+                        mixes[t * mix_hc + 2 * n + i * n + k] * sv[2] + bv[2 * n + i * n + k];
+                }
+            }
+            // sinkhorn (row softmax, then alternating col/row normalise)
+            for i in 0..n {
+                let mut rowmax = f32::MIN;
+                for k in 0..n {
+                    rowmax = rowmax.max(comb[t * n * n + i * n + k]);
+                }
+                let mut denom = 0.0f32;
+                for k in 0..n {
+                    comb[t * n * n + i * n + k] = (comb[t * n * n + i * n + k] - rowmax).exp();
+                    denom += comb[t * n * n + i * n + k];
+                }
+                for k in 0..n {
+                    comb[t * n * n + i * n + k] = comb[t * n * n + i * n + k] / denom + hc_eps;
+                }
+            }
+            for k in 0..n {
+                let mut colsum = 0.0f32;
+                for i in 0..n {
+                    colsum += comb[t * n * n + i * n + k];
+                }
+                let d = colsum + hc_eps;
+                for i in 0..n {
+                    comb[t * n * n + i * n + k] /= d;
+                }
+            }
+            for _ in 1..sinkhorn_iters {
+                for i in 0..n {
+                    let mut rowsum = 0.0f32;
+                    for k in 0..n {
+                        rowsum += comb[t * n * n + i * n + k];
+                    }
+                    let d = rowsum + hc_eps;
+                    for k in 0..n {
+                        comb[t * n * n + i * n + k] /= d;
+                    }
+                }
+                for k in 0..n {
+                    let mut colsum = 0.0f32;
+                    for i in 0..n {
+                        colsum += comb[t * n * n + i * n + k];
+                    }
+                    let d = colsum + hc_eps;
+                    for i in 0..n {
+                        comb[t * n * n + i * n + k] /= d;
+                    }
+                }
+            }
+        }
+        Ok((
+            Tensor::from_f32(Shape::new([slen, h]), li),
+            Tensor::from_f32(Shape::new([slen, n]), post),
+            Tensor::from_f32(Shape::new([slen, n, n]), comb),
+        ))
+    }
+
+    fn hc_post(&self, x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Result<Tensor> {
+        self.rec("hc_post");
+        let s = x.shape.0[0];
+        let h = x.shape.0[1];
+        let n = residual.shape.0[1];
+        let mut data = vec![0.0f32; s * n * h];
+        for t in 0..s {
+            for i in 0..n {
+                for j in 0..h {
+                    let mut acc = post.as_slice()[t * n + i] * x.as_slice()[t * h + j];
+                    for k in 0..n {
+                        acc += comb.as_slice()[(t * n + k) * n + i]
+                            * residual.as_slice()[(t * n + k) * h + j];
+                    }
+                    data[(t * n + i) * h + j] = acc;
+                }
+            }
+        }
+        Ok(Tensor::from_f32(Shape::new([s, n, h]), data))
     }
 }

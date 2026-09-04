@@ -303,3 +303,45 @@ fn cuda_graph_capture_smoke() {
     println!("cuda_graph_capture_smoke: 3-op chain captured + replayed OK");
     let _ = (&cpu, &x, &o3);
 }
+
+/// hc_pre / hc_post: GPU kernel vs CPU golden (MHC hyper-connections — the
+/// layer-boundary host loops were the biggest serial segment after fan_out).
+#[test]
+fn cuda_hc_pre_post() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda device 0");
+    let cpu = CpuBackend::new();
+    use ferrite_kernel::KernelBackend;
+
+    let (s, n, h) = (2usize, 4usize, 64usize); // mix = 2n + n^2 = 24
+    let nh = n * h;
+    let mix = 2 * n + n * n;
+    let residual = Tensor::from_f32(
+        Shape::new([s, nh]),
+        (0..s * nh).map(|i| ((i * 37 % 101) as f32) * 0.02 - 1.0).collect(),
+    );
+    let fn_w = Tensor::from_f32(
+        Shape::new([mix, nh]),
+        (0..mix * nh).map(|i| ((i * 11 % 53) as f32) * 0.01 - 0.25).collect(),
+    );
+    let scale = Tensor::from_f32(Shape::new([3]), vec![0.8, 1.2, 0.9]);
+    let base = Tensor::from_f32(Shape::new([mix]), (0..mix).map(|i| 0.01 * i as f32).collect());
+
+    let (li_g, post_g, comb_g) = dev
+        .hc_pre(&residual, &fn_w, &scale, &base, 1e-5, 1e-6, 20)
+        .expect("gpu hc_pre");
+    let (li_c, post_c, comb_c) = cpu
+        .hc_pre(&residual, &fn_w, &scale, &base, 1e-5, 1e-6, 20)
+        .expect("cpu hc_pre");
+    close(&li_g, &li_c, 2e-4, "hc_pre li");
+    close(&post_g, &post_c, 2e-4, "hc_pre post");
+    close(&comb_g, &comb_c, 2e-4, "hc_pre comb (sinkhorn)");
+
+    let x = Tensor::from_f32(Shape::new([s, h]), (0..s * h).map(|i| ((i * 7 % 31) as f32) * 0.03).collect());
+    let res3 = Tensor::from_f32(
+        Shape::new([s, n, h]),
+        (0..s * n * h).map(|i| ((i * 13 % 47) as f32) * 0.02 - 0.5).collect(),
+    );
+    let out_g = dev.hc_post(&x, &res3, &post_g, &comb_g).expect("gpu hc_post");
+    let out_c = cpu.hc_post(&x, &res3, &post_c, &comb_c).expect("cpu hc_post");
+    close(&out_g, &out_c, 2e-4, "hc_post out");
+}
