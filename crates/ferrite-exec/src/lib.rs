@@ -734,6 +734,44 @@ impl<B: KernelBackend> Engine<B> {
                     topk: d.index_topk,
                     rms_eps: self.cfg.rms_norm_eps,
                 };
+                // FERRITE_GRAPH_LAYER: per-(layer, rank) graph (same pattern
+                // as the GDN/MoE branches).
+                if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+                    use ferrite_kernel::cuda::GraphIO;
+                    let gname = format!("dsa{}", layer_idx);
+                    let mut v = vec![0f32; n * self.cfg.hidden_size];
+                    if cuda.graph_run(&gname, x.as_slice(), &mut v)? {
+                        return Ok(Tensor::from_f32(Shape::new([n, self.cfg.hidden_size]), v));
+                    }
+                    cuda.graph_capture_begin();
+                    let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
+                    x_dev.upload(x.as_slice())?;
+                    let family = self.dsa_family_index(layer_idx);
+                    let partial = cuda.dsa_layer_dev(&x_dev, &w, seq, family, n, self.cfg.hidden_size)?;
+                    cuda.graph_capture_end(&gname);
+                    cuda.graph_io_put(
+                        &gname,
+                        GraphIO {
+                            x_stage: x_dev.stage,
+                            x_len: x.numel(),
+                            out_dev: partial.as_f32() as *mut std::ffi::c_void,
+                            out_len: n * self.cfg.hidden_size,
+                        },
+                    );
+                    std::mem::forget(x_dev);
+                    std::mem::forget(partial);
+                    if !cuda.graph_replay(&gname) {
+                        return Err(FerriteError::InvalidArg(format!("graph replay {gname} failed")));
+                    }
+                    let io = cuda.graph_io_get(&gname).unwrap();
+                    let r = unsafe {
+                        ferrite_kernel::cuda::memcpy_d2h_sync(io.out_dev, v.as_mut_ptr(), n * self.cfg.hidden_size, cuda.stream_handle())
+                    };
+                    if r != 0 {
+                        return Err(FerriteError::InvalidArg(format!("dsa graph D2H failed: {r}")));
+                    }
+                    return Ok(Tensor::from_f32(Shape::new([n, self.cfg.hidden_size]), v));
+                }
                 let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
                 x_dev.upload(x.as_slice())?;
                 let family = self.dsa_family_index(layer_idx);
@@ -1123,6 +1161,51 @@ impl<B: KernelBackend> Engine<B> {
             })
             .collect::<Result<Vec<_>>>()?;
         let t1 = std::time::Instant::now();
+        // FERRITE_GRAPH_LAYER: per-(layer, rank) graph — capture the MoE
+        // segment (upload + fused kernels), replay per token (see the GDN
+        // branch in tp.rs for the pattern).
+        if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+            use ferrite_kernel::cuda::GraphIO;
+            let layer_no: String = pfx.rsplit('.').next().unwrap_or("?").to_string();
+            let gname = format!("moe{layer_no}");
+            let mut v = vec![0f32; n * hidden];
+            if cuda.graph_run(&gname, x.as_slice(), &mut v)? {
+                return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
+            }
+            cuda.graph_capture_begin();
+            let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
+            x_dev.upload(x.as_slice())?;
+            let mut probs_scratch = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
+            let out_dev = cuda.moe_layer_dev(
+                &x_dev, gate_w, &bias, &shared, &experts, es,
+                &mut probs_scratch, n, hidden, topk, e,
+                cfg.routed_scaling_factor, cfg.swiglu_limit,
+            )?;
+            cuda.graph_capture_end(&gname);
+            cuda.graph_io_put(
+                &gname,
+                GraphIO {
+                    x_stage: x_dev.stage,
+                    x_len: x.numel(),
+                    out_dev: out_dev.as_f32() as *mut std::ffi::c_void,
+                    out_len: n * hidden,
+                },
+            );
+            std::mem::forget(x_dev);
+            std::mem::forget(probs_scratch);
+            std::mem::forget(out_dev);
+            if !cuda.graph_replay(&gname) {
+                return Err(FerriteError::InvalidArg(format!("graph replay {gname} failed")));
+            }
+            let io = cuda.graph_io_get(&gname).unwrap();
+            let r = unsafe {
+                ferrite_kernel::cuda::memcpy_d2h_sync(io.out_dev, v.as_mut_ptr(), n * hidden, cuda.stream_handle())
+            };
+            if r != 0 {
+                return Err(FerriteError::InvalidArg(format!("moe graph D2H failed: {r}")));
+            }
+            return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
+        }
         let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
         x_dev.upload(x.as_slice())?;
         let mut probs_scratch = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;

@@ -498,6 +498,54 @@ fn attn_shard(
             o_norm: s.w(&format!("{pfx}.self_attn.o_norm.weight"))?,
             o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
         };
+        // FERRITE_GRAPH_LAYER: per-(layer, rank) graph — the segment's op
+        // sequence (upload memcpy + 11 kernels) is captured once, replayed
+        // per token. The pool is per-device (ranks don't share) and this
+        // rank's op sequence is deterministic → buffer addresses are stable.
+        // x_dev/partial are LEAKED (graph replays write them).
+        if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+            use ferrite_kernel::cuda::GraphIO;
+            let gname = format!("gdn{}", layer_idx);
+            let mut v = vec![0f32; n * hidden];
+            if cuda.graph_run(&gname, hn.as_slice(), &mut v)? {
+                return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
+            }
+            cuda.graph_capture_begin();
+            let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
+            x_dev.upload(hn.as_slice())?;
+            let partial = cuda.gdn_layer_dev(
+                &x_dev, &gw, seq, layer_idx, n, hidden,
+                la.num_heads, la.head_dim, la.gate_lower_bound,
+                s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+            )?;
+            cuda.graph_capture_end(&gname);
+            cuda.graph_io_put(
+                &gname,
+                GraphIO {
+                    x_stage: x_dev.stage,
+                    x_len: hn.numel(),
+                    out_dev: partial.as_f32() as *mut std::ffi::c_void,
+                    out_len: n * hidden,
+                },
+            );
+            std::mem::forget(x_dev);
+            std::mem::forget(partial);
+            // capture records but does NOT execute — replay for this token
+            if !cuda.graph_replay(&gname) {
+                return Err(FerriteError::InvalidArg(format!("graph replay {gname} failed")));
+            }
+            let mut v = vec![0f32; n * hidden];
+            // partial's device address holds the replay output
+            let io = cuda.graph_io_get(&gname).unwrap();
+            cuda.enter();
+            let r = unsafe {
+                ferrite_kernel::cuda::memcpy_d2h_sync(io.out_dev, v.as_mut_ptr(), n * hidden, cuda.stream_handle())
+            };
+            if r != 0 {
+                return Err(FerriteError::InvalidArg(format!("gdn graph D2H failed: {r}")));
+            }
+            return Ok(Tensor::from_f32(Shape::new([n, hidden]), v));
+        }
         let x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
         x_dev.upload(hn.as_slice())?;
         let partial = cuda.gdn_layer_dev(

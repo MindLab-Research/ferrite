@@ -344,6 +344,13 @@ pub struct CudaBackend {
     /// experts' rows through them with zero host round-trips. Keyed by the
     /// first expert's gate tensor pointer (stable per layer).
     moe_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoePtrTable>>,
+    /// Named CUDA graphs (per layer-segment): FERRITE_GRAPH_LAYER captures
+    /// each segment's op sequence once and replays per token — the per-op
+    /// launch gaps (~30μs × ~19 ops/layer) are the decode bottleneck after
+    /// the device chains.
+    graph_execs: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// Fixed IO pointers of captured segment graphs (per name).
+    graph_io: std::sync::Mutex<std::collections::HashMap<String, GraphIO>>,
 }
 
 // cudaStream_t is thread-safe (CUDA runtime serialises ops on a stream);
@@ -389,6 +396,8 @@ impl CudaBackend {
             conv_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -736,6 +745,58 @@ impl DriverApi {
 struct GraphState {
     capturing: bool,
     graph_exec: Option<*mut std::ffi::c_void>,
+}
+
+impl CudaBackend {
+    /// Named-graph replay: launch a previously captured graph on this
+    /// backend's stream. Returns false if the name has no captured graph
+    /// yet (caller should run+capture instead). One graph per (layer,
+    /// segment, rank) — the per-op launch gaps (~30μs × ~19 ops/layer) are
+    /// the decode bottleneck after the device chains.
+    pub fn graph_replay(&self, name: &str) -> bool {
+        let exec = self.graph_execs.lock().unwrap().get(name).copied();
+        match exec {
+            Some(exec) => {
+                let api = DriverApi::get().expect("libcuda not loadable");
+                let r = unsafe { (api.cuGraphLaunch)(exec as *mut std::ffi::c_void, self.stream) };
+                r == 0
+            }
+            None => false,
+        }
+    }
+
+    /// Begin stream capture (THREAD_LOCAL mode). Ops enqueued until
+    /// graph_capture_end are RECORDED, not executed. The pool and weight
+    /// caches must be warm (prefill does this) — cudaMalloc during capture
+    /// is illegal.
+    pub fn graph_capture_begin(&self) {
+        let api = DriverApi::get().expect("libcuda not loadable (no GPU present?)");
+        let r = unsafe { (api.cuStreamBeginCapture)(self.stream, 1) }; // 1 = THREAD_LOCAL
+        if r != 0 {
+            panic!("cuStreamBeginCapture failed: {r}");
+        }
+        set_capturing(true);
+    }
+
+    /// End capture, instantiate, store under `name`. The recorded ops did
+    /// NOT execute — replay immediately if this pass's results are needed.
+    pub fn graph_capture_end(&self, name: &str) {
+        set_capturing(false);
+        let api = DriverApi::get().expect("libcuda not loadable");
+        let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
+        let r = unsafe { (api.cuStreamEndCapture)(self.stream, &mut graph) };
+        if r != 0 {
+            panic!("cuStreamEndCapture failed: {r}");
+        }
+        let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
+        let r = unsafe { (api.cuGraphInstantiate)(&mut exec, graph, 0) };
+        if r != 0 {
+            unsafe { (api.cuGraphDestroy)(graph) };
+            panic!("cuGraphInstantiate failed: {r}");
+        }
+        unsafe { (api.cuGraphDestroy)(graph) }; // exec is independent
+        self.graph_execs.lock().unwrap().insert(name.to_string(), exec as usize);
+    }
 }
 
 impl crate::graph::GraphCapable for CudaBackend {
@@ -1908,4 +1969,80 @@ impl CudaBackend {
         )?;
         Ok(out)
     }
+}
+
+// ============================================================
+// Per-layer-segment CUDA graphs (FERRITE_GRAPH_LAYER): each segment's
+// op sequence (upload memcpy + kernels) is captured ONCE and replayed
+// per token. The pool is per-device (fan_out ranks don't share) and each
+// rank's op sequence is deterministic → buffer addresses are stable
+// across tokens. The segment's INPUT staging and OUTPUT device buffers
+// are registered as GraphIO and LEAKED (never returned to the pool —
+// replay writes them; pool reuse would corrupt).
+// ============================================================
+/// Fixed IO pointers of a captured segment graph: the CPU writes the
+/// input into `x_stage` (pinned, the recorded memcpy's source), launches
+/// the graph, then downloads `out_dev`.
+pub struct GraphIO {
+    pub x_stage: *mut std::ffi::c_void,
+    pub x_len: usize,
+    pub out_dev: *mut std::ffi::c_void,
+    pub out_len: usize,
+}
+unsafe impl Send for GraphIO {}
+unsafe impl Sync for GraphIO {}
+impl Clone for GraphIO {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for GraphIO {}
+
+impl CudaBackend {
+    pub fn graph_io_put(&self, name: &str, io: GraphIO) {
+        self.graph_io.lock().unwrap().insert(name.to_string(), io);
+    }
+    pub fn graph_io_get(&self, name: &str) -> Option<GraphIO> {
+        self.graph_io.lock().unwrap().get(name).cloned()
+    }
+    /// Replay a segment graph with fresh input: write `input` to the
+    /// captured staging, launch, download the output. (capture never
+    /// executes — this is the steady-state path)
+    pub fn graph_run(&self, name: &str, input: &[f32], out: &mut [f32]) -> Result<bool> {
+        let Some(io) = self.graph_io_get(name) else { return Ok(false); };
+        if input.len() != io.x_len || out.len() != io.out_len {
+            return Err(FerriteError::InvalidArg(format!(
+                "graph_run {name}: input {} != stage {} or out {} != {}",
+                input.len(), io.x_len, out.len(), io.out_len
+            )));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr(), io.x_stage as *mut f32, io.x_len);
+        }
+        if !self.graph_replay(name) {
+            return Ok(false);
+        }
+        self.enter();
+        ck(
+            unsafe {
+                cudaMemcpyAsync(
+                    out.as_mut_ptr() as *mut std::ffi::c_void,
+                    io.out_dev,
+                    io.out_len * 4,
+                    CUDA_MEMCPY_D2H,
+                    self.stream,
+                )
+            },
+            "graph_run D2H",
+        )?;
+        self.sync()?;
+        Ok(true)
+    }
+}
+
+/// Blocking device→host copy (raw pointers — used by the graph capture
+/// path where the DevBuf was forgotten but its address is registered).
+pub fn memcpy_d2h_sync(src: *mut std::ffi::c_void, dst: *mut f32, floats: usize, s: CuStream) -> i32 {
+    unsafe { cudaMemcpyAsync(dst as *mut _, src, floats * 4, CUDA_MEMCPY_D2H, s) };
+    unsafe { cudaStreamSynchronize(s) }
 }
