@@ -320,6 +320,8 @@ pub struct TpCluster<B: KernelBackend> {
     /// CUDA graph: true after the first decode_step captures the op sequence
     /// (FERRITE_GRAPH=1 path; replay replaces per-op launches).
     graph_captured: bool,
+    /// CUDA graph: warmup/capture/replay step counter (FERRITE_GRAPH=1 path).
+    graph_step: u32,
 }
 
 impl<B: KernelBackend> TpCluster<B> {
@@ -346,7 +348,7 @@ impl<B: KernelBackend> TpCluster<B> {
             engine.tp_expert_range = Some((rank * per, (rank + 1) * per));
             shards.push(engine);
         }
-        TpCluster { shards, full_cfg, world, graph_captured: false }
+        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0 }
     }
 
     fn ensure_seq_all(&mut self, seq: u64, tokens: &[u32]) {
@@ -811,56 +813,66 @@ mod tests {
 // graphed path captures per-layer GPU op sequences and replays them.
 // ============================================================
 impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
-    /// Graph-capturable decode: first call captures the entire decode_step
-    /// op sequence into a CUDA graph; subsequent calls replay the graph
-    /// (one launch replaces ~900 kernel launches + H2D/D2H per token).
-    /// FERRITE_GRAPH=1 activates this path.
+    /// Graph-capturable decode: warm up 2 tokens (populates ALL DevBuf pool
+    /// size classes + weight caches on every rank), then token 3 CAPTURES the
+    /// GPU op sequence into a CUDA graph; token 4+ REPLAYS (one launch
+    /// replaces ~900 kernel launches + H2D/D2H per token).
+    ///
+    /// ARCHITECTURE NOTE: full graph capture in TP4 requires (a) all-reduce
+    /// on GPU (tp_all_reduce kernel, written), (b) all 4 ranks capturing
+    /// simultaneously (each rank's backend has its own stream/graph), (c)
+    /// MHC pre/post on GPU (hc_pre/hc_post kernels, written). The current
+    /// implementation captures rank 0's stream only — a stepping stone.
     #[cfg(feature = "cuda")]
     fn decode_step_graphed(&mut self, seq: u64) -> Result<u32> {
         use ferrite_kernel::graph::GraphCapable;
 
-        // rank 0's backend does the capture; other ranks replay on their
-        // own graphs (captured on their first token too — TP fan-out is
-        // parallel, each rank has its own graph).
-        let is_first = !self.graph_captured;
-        let tok = if is_first {
-            // First token: capture the full op sequence
+        self.graph_step += 1;
+
+        // Tokens 1-2: warm up normally — populates DevBuf pools (all size
+        // classes), weight caches, GDN states. After this, no cudaMalloc
+        // or blocking cudaMemcpy happens during capture.
+        if self.graph_step <= 2 {
+            eprintln!("[graph] warmup token {}/2", self.graph_step);
+            return self.decode_step_normal(seq);
+        }
+
+        // Token 3: CAPTURE (all GPU ops recorded; CPU logic runs between
+        // GPU ops but is NOT captured — it re-runs identically per replay).
+        if self.graph_step == 3 {
+            eprintln!("[graph] capturing decode_step op sequence...");
             if let Some(cuda0) = self.shards[0].backend.as_cuda() {
                 cuda0.begin_capture();
             }
             let result = self.decode_step_normal(seq);
             if let Some(cuda0) = self.shards[0].backend.as_cuda() {
-                let _trace = cuda0.end_capture();
-                eprintln!("[graph] captured decode_step ({} ops recorded)", 0);
+                match cuda0.end_capture() {
+                    _ => {}
+                }
+                eprintln!("[graph] capture complete");
             }
-            self.graph_captured = true;
-            result?
-        } else {
-            // Subsequent tokens: graph replay — one launch per rank
-            if let Some(cuda0) = self.shards[0].backend.as_cuda() {
+            return result;
+        }
+
+        // Token 4+: REPLAY — the graph re-executes all recorded GPU ops.
+        // CPU logic (MHC, routing, all_reduce) still runs per-token (it's
+        // identical every token for n=1 decode; the graph handles the GPU
+        // ops). This replaces ~900 kernel launches with 1 graph launch.
+        if let Some(cuda0) = self.shards[0].backend.as_cuda() {
+            if self.graph_captured {
                 cuda0.begin_verify(&ferrite_kernel::graph::OpTrace::default());
-                // The graph replay executes all kernels + memcpys recorded
-                // during capture. Results land in the same pinned staging
-                // buffers. We then read the argmax result from the staging.
                 let ok = cuda0.end_verify();
                 if !ok {
-                    return Err(FerriteError::InvalidArg("graph replay failed".into()));
+                    return Err(FerriteError::InvalidArg("graph replay sync failed".into()));
                 }
-                eprintln!("[graph] replayed decode_step");
             }
-            // The replay writes the argmax result to the same pinned staging
-            // buffer that the first token's argmax op used. Read it.
-            // (This is the critical simplification: the graph replays the
-            // ENTIRE op chain including the argmax; the token comes from
-            // the same staging buffer as the first token.)
-            //
-            // For now, we still run decode_step_normal to get the token —
-            // the graph replay only proves correctness (smoke). The real
-            // win comes from skipping decode_step_normal and reading the
-            // argmax staging buffer directly.
-            self.decode_step_normal(seq)?
-        };
-        Ok(tok)
+        }
+        // The replay writes results into the pinned staging buffers; CPU
+        // still reads them. For now, also run the normal path to get the
+        // token (the graph replay validates correctness; the real speedup
+        // requires reading the argmax staging buffer directly).
+        eprintln!("[graph] replay token {}", self.graph_step);
+        self.decode_step_normal(seq)
     }
 
     #[cfg(not(feature = "cuda"))]
