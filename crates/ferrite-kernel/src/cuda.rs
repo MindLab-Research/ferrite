@@ -335,6 +335,12 @@ impl CudaBackend {
         if t.numel() == 0 {
             return Ok(()); // TP shard placeholder (empty expert slice)
         }
+        // cudaSetDevice is THREAD-LOCAL: a TP cluster drives N backends from
+        // one thread, so every entry point must re-bind before cudaMalloc —
+        // without this, ALL ranks' weights malloc onto whatever device the
+        // thread last touched (observed: 4 ranks' 142GB each piling onto
+        // GPU 7 at 247GB).
+        self.enter();
         if t.shape.0.len() >= 2 {
             self.dev_weight_bf16(t).map(|_| ())
         } else {
