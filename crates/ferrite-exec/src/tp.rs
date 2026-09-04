@@ -496,6 +496,12 @@ fn attn_shard(
 /// ops bind its own GPU; DevBuf pools are thread-local too (per-thread
 /// arenas, no cross-thread buffer sharing). Result order = shard order
 /// (fan_out preserves indices; the all-reduce sum is order-independent).
+/// Run one op-group across all shards CONCURRENTLY (one thread per rank).
+/// TP ranks are independent until the all-reduce; the serial iter_mut loop
+/// left 3 of the 4 GPUs idle. cudaSetDevice is thread-local so each shard's
+/// ops bind its own GPU; DevBuf pools are thread-local too (per-thread
+/// arenas, no cross-thread buffer sharing). Result order = shard order
+/// (fan_out preserves indices; the all-reduce sum is order-independent).
 fn fan_out<T, F>(shards: &mut [Engine<B>], f: F) -> Vec<T>
 where
     F: Fn(&mut Engine<B>) -> T + Sync,
@@ -505,7 +511,18 @@ where
         return vec![f(&mut shards[0])];
     }
     std::thread::scope(|scope| {
-        let handles: Vec<_> = shards.iter_mut().map(|s| scope.spawn(|| f(s))).collect();
+        let handles: Vec<_> = shards
+            .iter_mut()
+            .enumerate()
+            .map(|(i, s)| {
+                let f = &f;
+                scope.spawn(move || {
+                    // rank index for probe dump isolation (ferrite_kernel::shard_idx)
+                    ferrite_kernel::set_shard_idx(i);
+                    f(s)
+                })
+            })
+            .collect();
         handles
             .into_iter()
             .map(|h| h.join().expect("shard thread panicked"))

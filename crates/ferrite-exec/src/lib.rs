@@ -548,7 +548,7 @@ impl<B: KernelBackend> Engine<B> {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/gdn_cpu_{name}.f32"), b).ok();
+                std::fs::write(format!("{dir}/gdn_cpu_{name}_r{}.f32", ferrite_kernel::shard_idx()), b).ok();
             };
             d("x", x.as_slice());
             d("qkv", qkv.as_slice());
@@ -664,7 +664,19 @@ impl<B: KernelBackend> Engine<B> {
             &mut normed,
         )?;
         let normed = Tensor::from_f32(Shape::new([n, proj]), normed.as_slice().to_vec());
-        self.project(&normed, &format!("{pfx}.self_attn.o_proj.weight"))
+        let partial = self.project(&normed, &format!("{pfx}.self_attn.o_proj.weight"))?;
+        // PROBE: core (gdn chunk out) + partial (o_proj out) — rank-isolated
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer_idx == 0 && n > 1 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_cpu_{name}_r{}.f32", ferrite_kernel::shard_idx()), b).ok();
+            };
+            d("core", core.as_slice());
+            d("partial", partial.as_slice());
+            eprintln!("[gdn_probe] cpu L0 core/partial dumped r{}", ferrite_kernel::shard_idx());
+        }
+        Ok(partial)
     }
 
     // ---------------- DSA attention (expanded-cache golden path) ----------------

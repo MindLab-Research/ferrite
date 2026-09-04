@@ -31,6 +31,25 @@ pub use cuda::CudaBackend;
 pub use dcp::{lse_merge, sparse_attn_partial, split_pages_round_robin, PartialAttn};
 pub use graph::{GraphCapable, OpRecord, OpTrace};
 
+/// Shard index of the current fan_out worker thread (thread-local; 0 when
+/// not inside fan_out). Probe dumps append _r{i} to isolate rank-sharded
+/// outputs — 4 TP ranks writing the same probe file produced cross-rank
+/// diffs that looked like 100% divergence (head-sharded outputs differ BY
+/// DESIGN across ranks; the "divergence" was two different ranks' shards).
+thread_local! {
+    static SHARD_IDX: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Set the current fan_out worker's shard index (called by fan_out's spawn).
+pub fn set_shard_idx(i: usize) {
+    SHARD_IDX.with(|c| c.set(i));
+}
+
+/// Current shard index (rank-isolated probe dump paths).
+pub fn shard_idx() -> usize {
+    SHARD_IDX.with(|c| c.get())
+}
+
 use ferrite_types::{Result, Tensor};
 
 /// Device-agnostic kernel interface for GLM-5.3-Flash inference.

@@ -1116,7 +1116,7 @@ impl CudaBackend {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/gdn_dev_{name}.f32"), b).ok();
+                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
             };
             let mut xh = vec![0f32; x.len];
             let _ = x.download(&mut xh);
@@ -1174,7 +1174,7 @@ impl CudaBackend {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/gdn_dev_{name}.f32"), b).ok();
+                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
             };
             d("conv", &conv_host); d("braw", &b_raw_host); d("fb", &fb_host);
             eprintln!("[gdn_probe] dev L0 dumped: conv {} braw {} fb {}", conv_host.len(), b_raw_host.len(), fb_host.len());
@@ -1237,7 +1237,7 @@ impl CudaBackend {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/gdn_dev_{name}.f32"), b).ok();
+                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
             };
             d("q", &q_v); d("k", &k_v); d("beta", &beta_v); d("gate", &gate_v);
             eprintln!("[gdn_probe] dev L0 preproc dumped: q {} k {} beta {} gate {} (proj={})", q_v.len(), k_v.len(), beta_v.len(), gate_v.len(), proj);
@@ -1297,8 +1297,23 @@ impl CudaBackend {
             },
             "gdn_norm_dev",
         )?;
-        // 6. o_proj — TP partial out
-        self.matmul_dev(&normed, w.o_proj, ni, proj as i32, hidden as i32)
+        // 6. o_proj — TP partial out (probe: dump core + partial rank-isolated)
+        let partial = self.matmul_dev(&normed, w.o_proj, ni, proj as i32, hidden as i32)?;
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
+            };
+            let mut ch = vec![0f32; n * proj];
+            let _ = core.download(&mut ch);
+            d("core", &ch);
+            let mut ph = vec![0f32; n * hidden];
+            let _ = partial.download(&mut ph);
+            d("partial", &ph);
+            eprintln!("[gdn_probe] dev L0 core/partial dumped r{} (n={} proj={} hidden={})", crate::shard_idx(), n, proj, hidden);
+        }
+        Ok(partial)
     }
 }
 
