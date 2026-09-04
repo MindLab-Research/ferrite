@@ -1195,7 +1195,7 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
     }
     // beta = sigmoid(b_raw[t, head])
     if (threadIdx.x == 0) {
-        beta[(size_t)t * h + hd] = 1.0f / (1.0f + __expf(-b_raw[(size_t)t * proj + hd * dk]));
+        beta[(size_t)t * h + hd] = 1.0f / (1.0f + __expf(-b_raw[(size_t)t * h + hd]));
     }
 }
 

@@ -1071,11 +1071,11 @@ impl CudaBackend {
         let ni = n as i32;
         // 1. six projections (bf16-resident weights)
         let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
-        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, proj as i32)?;
-        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, proj as i32)?;
-        let fb = self.matmul_dev(&fa, w.f_b, ni, proj as i32, proj as i32)?;
-        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, proj as i32)?;
-        let gb = self.matmul_dev(&ga, w.g_b, ni, proj as i32, proj as i32)?;
+        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
+        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
+        let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
+        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?;
+        let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
         // 2. causal conv — resident tail state (RMW in place: the kernel
         // reads state_in into smem at block start, writes state_out at end,
         // one block per channel, so in==out is safe)
