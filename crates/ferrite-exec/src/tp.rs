@@ -1298,6 +1298,54 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                         let hidden2 = cfg.hidden_size;
                         let topk = cfg.num_experts_per_tok;
                         let e = cfg.n_routed_experts;
+                        let (es, ee) = s.tp_expert_range.unwrap_or((0, e));
+                        // ---- THREAD-LOCAL EXPERT POINTER CACHE ----
+                        // The 72-expert × 3-weight construction was 216
+                        // format!+HashMap lookups per rank per layer per
+                        // token = 36,000/token. Persistent fan_out workers
+                        // have stable threads → this cache hits after the
+                        // first token. Tensor addresses are stable (the
+                        // weights HashMap is never modified during inference).
+                        thread_local! {
+                            static MOE_CACHE: std::cell::RefCell<std::collections::HashMap<String, Vec<usize>>> =
+                                std::cell::RefCell::new(std::collections::HashMap::new());
+                        }
+                        let cache_key = format!("{pfx}:{}", es);
+                        let cached = MOE_CACHE.with(|c| c.borrow().get(&cache_key).cloned());
+                        let experts: Vec<ExpertWeights> = if let Some(ptrs) = cached {
+                            // SAFETY: Tensor addresses in the weights HashMap
+                            // are stable for the process lifetime (no inserts
+                            // after preload). Cached raw pointers are valid.
+                            ptrs.chunks(3)
+                                .map(|c| ExpertWeights {
+                                    gate: unsafe { &*(c[0] as *const Tensor) },
+                                    up: unsafe { &*(c[1] as *const Tensor) },
+                                    down: unsafe { &*(c[2] as *const Tensor) },
+                                })
+                                .collect()
+                        } else {
+                            let exp: Vec<ExpertWeights> = (es..ee)
+                                .map(|eid| {
+                                    Ok(ExpertWeights {
+                                        gate: s.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
+                                        up: s.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
+                                        down: s.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
+                                    })
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            let ptrs: Vec<usize> = exp
+                                .iter()
+                                .flat_map(|w| {
+                                    [
+                                        w.gate as *const Tensor as usize,
+                                        w.up as *const Tensor as usize,
+                                        w.down as *const Tensor as usize,
+                                    ]
+                                })
+                                .collect();
+                            MOE_CACHE.with(|c| c.borrow_mut().insert(cache_key, ptrs));
+                            exp
+                        };
                         let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
                             Some(b) => b.clone(),
                             None => Tensor::zeros(Shape::new([e]), DType::F32),
@@ -1308,16 +1356,6 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                             up: s.w(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))?,
                             down: s.w(&format!("{pfx}.mlp.shared_expert.down_proj.weight"))?,
                         };
-                        let (es, ee) = s.tp_expert_range.unwrap_or((0, e));
-                        let experts: Vec<ExpertWeights> = (es..ee)
-                            .map(|eid| {
-                                Ok(ExpertWeights {
-                                    gate: s.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
-                                    up: s.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
-                                    down: s.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?;
                         let mut probs_scratch = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
                         let out_dev = cuda.moe_layer_dev(
                             &x_dev, gate_w, &bias, &shared, &experts, es,
