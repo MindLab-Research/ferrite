@@ -1722,3 +1722,23 @@ extern "C" cudaError_t ferrite_scale_inplace(float* x, float s, int n, cudaStrea
     scale_inplace_kernel<<<blocks, threads, 0, st>>>(x, s, n);
     return cudaGetLastError();
 }
+
+// ============================================================
+// CUDA graph via RUNTIME API wrappers (the driver-API dlopen path
+// SIGSEGV'd inside cuGraphInstantiate on worker-thread captures).
+// ============================================================
+extern "C" cudaError_t ferrite_graph_begin(cudaStream_t s) {
+    return cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+}
+extern "C" cudaError_t ferrite_graph_end(cudaStream_t s, cudaGraph_t* g) {
+    return cudaStreamEndCapture(s, g);
+}
+extern "C" cudaError_t ferrite_graph_instantiate(cudaGraphExec_t* e, cudaGraph_t g) {
+    return cudaGraphInstantiate(e, g, 0);
+}
+extern "C" cudaError_t ferrite_graph_launch(cudaGraphExec_t e, cudaStream_t s) {
+    return cudaGraphLaunch(e, s);
+}
+extern "C" cudaError_t ferrite_graph_destroy_exec(cudaGraphExec_t e) {
+    return cudaGraphExecDestroy(e);
+}

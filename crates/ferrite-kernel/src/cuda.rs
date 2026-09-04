@@ -53,6 +53,10 @@ extern "C" {
                             n: i32, select_k: i32, kpool: i32, npools: i32, total: i32,
                             ctx0: i32, s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
+    fn ferrite_graph_begin(s: CuStream) -> i32;
+    fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
+    fn ferrite_graph_instantiate(e: *mut *mut std::ffi::c_void, g: *mut std::ffi::c_void) -> i32;
+    fn ferrite_graph_launch(e: *mut std::ffi::c_void, s: CuStream) -> i32;
     fn ferrite_f32_to_bf16(in_: *const f32, out: *mut std::ffi::c_void,
                             n: i64, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
@@ -758,8 +762,7 @@ impl CudaBackend {
         let exec = self.graph_execs.lock().unwrap().get(name).copied();
         match exec {
             Some(exec) => {
-                let api = DriverApi::get().expect("libcuda not loadable");
-                let r = unsafe { (api.cuGraphLaunch)(exec as *mut std::ffi::c_void, self.stream) };
+                let r = unsafe { ferrite_graph_launch(exec as *mut std::ffi::c_void, self.stream) };
                 r == 0
             }
             None => false,
@@ -771,10 +774,11 @@ impl CudaBackend {
     /// caches must be warm (prefill does this) — cudaMalloc during capture
     /// is illegal.
     pub fn graph_capture_begin(&self) {
-        let api = DriverApi::get().expect("libcuda not loadable (no GPU present?)");
-        let r = unsafe { (api.cuStreamBeginCapture)(self.stream, 1) }; // 1 = THREAD_LOCAL
+        // RUNTIME API wrappers (the driver-API dlopen path SIGSEGV'd inside
+        // cuGraphInstantiate on worker-thread captures)
+        let r = unsafe { ferrite_graph_begin(self.stream) };
         if r != 0 {
-            panic!("cuStreamBeginCapture failed: {r}");
+            panic!("cudaStreamBeginCapture failed: {r}");
         }
         set_capturing(true);
     }
@@ -783,19 +787,19 @@ impl CudaBackend {
     /// NOT execute — replay immediately if this pass's results are needed.
     pub fn graph_capture_end(&self, name: &str) {
         set_capturing(false);
-        let api = DriverApi::get().expect("libcuda not loadable");
         let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
-        let r = unsafe { (api.cuStreamEndCapture)(self.stream, &mut graph) };
+        let r = unsafe { ferrite_graph_end(self.stream, &mut graph) };
         if r != 0 {
-            panic!("cuStreamEndCapture failed: {r}");
+            panic!("cudaStreamEndCapture failed: {r}");
+        }
+        if graph.is_null() {
+            panic!("cudaStreamEndCapture returned a NULL graph (capture invalidated?)");
         }
         let mut exec: *mut std::ffi::c_void = std::ptr::null_mut();
-        let r = unsafe { (api.cuGraphInstantiate)(&mut exec, graph, 0) };
+        let r = unsafe { ferrite_graph_instantiate(&mut exec, graph) };
         if r != 0 {
-            unsafe { (api.cuGraphDestroy)(graph) };
-            panic!("cuGraphInstantiate failed: {r}");
+            panic!("cudaGraphInstantiate failed: {r}");
         }
-        unsafe { (api.cuGraphDestroy)(graph) }; // exec is independent
         self.graph_execs.lock().unwrap().insert(name.to_string(), exec as usize);
     }
 }
