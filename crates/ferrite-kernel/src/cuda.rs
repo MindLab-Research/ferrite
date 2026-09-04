@@ -110,6 +110,15 @@ fn ck(err: i32, what: &str) -> Result<()> {
 // op-latency budget (tens of thousands of ops per token across a TP cluster);
 // pooled reuse removes them entirely after warmup.
 //
+// GLOBAL (Mutex<HashMap>) — NOT thread-local: fan_out spawns fresh threads
+// per layer (90 spawns × 4 ranks per token); a thread-local pool was EMPTY
+// in every worker, so every DevBuf::alloc paid cudaMalloc+cudaMallocHost
+// (~70μs each, ~14k allocs/token ≈ 1s of pure allocation per token) and
+// the buffers LEAKED when the thread exited (pool dropped, never freed).
+// The global pool also makes CUDA graph capture possible (cudaMallocHost
+// during capture is illegal — with a warm global pool, capture allocates
+// nothing).
+//
 // CUDA-graph capture support: every DevBuf owns a PINNED host staging buffer
 // (cudaMallocHost, allocated with the device buffer, pooled with it).
 // upload/download go through it — cudaMemcpyAsync from pageable memory is
@@ -118,10 +127,24 @@ fn ck(err: i32, what: &str) -> Result<()> {
 // into the graph. The pinned stage is the fixed-address rendezvous: the CPU
 // writes it (outside the graph), the recorded memcpy moves stage→device.
 // ============================================================
-thread_local! {
-    static BUF_POOL: std::cell::RefCell<
-        std::collections::HashMap<(i32, u32), Vec<(*mut std::ffi::c_void, *mut std::ffi::c_void)>>,
-    > = std::cell::RefCell::new(std::collections::HashMap::new());
+static BUF_POOL: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<(i32, u32), Vec<PoolPtrs>>,
+    >,
+> = std::sync::OnceLock::new();
+
+/// Raw device/pinned-stage pointer pair — Send+Sync because the pool's
+/// Mutex serialises all take/release, and CUDA device pointers are
+/// process-global (not thread-bound).
+#[derive(Clone, Copy)]
+struct PoolPtrs(*mut std::ffi::c_void, *mut std::ffi::c_void);
+unsafe impl Send for PoolPtrs {}
+unsafe impl Sync for PoolPtrs {}
+
+fn pool() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(i32, u32), Vec<PoolPtrs>>,
+> {
+    BUF_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// True while ANY thread is inside a stream capture (THREAD_LOCAL mode).
@@ -142,28 +165,27 @@ fn is_capturing() -> bool {
 }
 
 fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void) {
-    BUF_POOL.with_borrow_mut(|p| p.entry((dev, class)).or_default().push((ptr, stage)));
+    pool().lock().unwrap().entry((dev, class)).or_default().push(PoolPtrs(ptr, stage));
 }
 
 fn buf_pool_take(dev: i32, class: u32) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
-    BUF_POOL.with_borrow_mut(|p| p.get_mut(&(dev, class)).and_then(|v| v.pop()))
+    pool().lock().unwrap().get_mut(&(dev, class)).and_then(|v| v.pop()).map(|p| (p.0, p.1))
 }
 
 /// Drop all pooled activation buffers (weights are owned by the weight cache).
 /// Called from CudaBackend::Drop; leaks of freed devices are reclaimed by CUDA
 /// context teardown at exit.
 pub fn clear_activation_pool() {
-    BUF_POOL.with_borrow_mut(|p| {
-        for ((dev, _), ptrs) in p.drain() {
-            unsafe { cudaSetDevice(dev) };
-            for (ptr, stage) in ptrs {
-                unsafe { cudaFree(ptr) };
-                if !stage.is_null() {
-                    unsafe { cudaFreeHost(stage) };
-                }
+    let mut p = pool().lock().unwrap();
+    for ((dev, _), ptrs) in p.drain() {
+        unsafe { cudaSetDevice(dev) };
+        for pp in ptrs {
+            unsafe { cudaFree(pp.0) };
+            if !pp.1.is_null() {
+                unsafe { cudaFreeHost(pp.1) };
             }
         }
-    });
+    }
 }
 
 extern "C" {
