@@ -694,6 +694,50 @@ impl<B: KernelBackend> Engine<B> {
         x: &Tensor,
         n: usize,
     ) -> Result<Tensor> {
+        // Full-device DSA chain (FERRITE_DSA_DEV=1): gemv projections →
+        // layernorm → device-resident cache append → kpool compress →
+        // indexer topk → pool expand → sparse attention → o_proj. Zero host
+        // round-trips (the CPU path did 10 Tensor-level ops each with a
+        // sync + host cache clones: 2.8ms/layer measured).
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("FERRITE_DSA_DEV").is_some() {
+            if let Some(cuda) = self.backend.as_cuda() {
+                use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights};
+                cuda.enter();
+                let d = &self.cfg.dsa;
+                let (h, dk, dv, _ip) = self.dsa_dims();
+                let w = DsaLayerWeights {
+                    q_a: self.w(&format!("{pfx}.self_attn.q_a_proj.weight"))?,
+                    q_a_ln: self.w(&format!("{pfx}.self_attn.q_a_layernorm.weight"))?,
+                    q_b: self.w(&format!("{pfx}.self_attn.q_b_proj.weight"))?,
+                    kv_a: self.w(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))?,
+                    kv_a_ln: self.w(&format!("{pfx}.self_attn.kv_a_layernorm.weight"))?,
+                    kv_b: self.w(&format!("{pfx}.self_attn.kv_b_proj.weight"))?,
+                    wq_b: self.w(&format!("{pfx}.self_attn.indexer.wq_b.weight"))?,
+                    wk: self.w(&format!("{pfx}.self_attn.indexer.wk.weight"))?,
+                    k_norm_w: self.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?,
+                    k_norm_b: self.w(&format!("{pfx}.self_attn.indexer.k_norm.bias"))?,
+                    weights_proj: self.w(&format!("{pfx}.self_attn.indexer.weights_proj.weight"))?,
+                    gate: self.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?,
+                    ape: self.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?,
+                    o_proj: self.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                    h, dk, dv,
+                    ih: d.index_n_heads,
+                    idm: d.index_head_dim,
+                    kpool: 4,
+                    topk: d.index_topk,
+                    rms_eps: self.cfg.rms_norm_eps,
+                };
+                let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
+                x_dev.upload(x.as_slice())?;
+                let family = self.dsa_family_index(layer_idx);
+                let partial = cuda.dsa_layer_dev(&x_dev, &w, seq, family, n, self.cfg.hidden_size)?;
+                let mut out = Tensor::zeros(Shape::new([n, self.cfg.hidden_size]), x.dtype);
+                let ov = std::sync::Arc::get_mut(&mut out.data).unwrap();
+                partial.download(ov)?;
+                return Ok(out);
+            }
+        }
         let d = &self.cfg.dsa;
         let (h, dk, dv, _ip) = self.dsa_dims();
         let ih = d.index_n_heads; // indexer heads (32)

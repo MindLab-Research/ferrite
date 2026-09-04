@@ -1534,3 +1534,184 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum(
         act, out, expert_start, e_local, hidden, inter, inter_shared, topk, rows);
     return cudaGetLastError();
 }
+
+// ============================================================
+// DSA (sparse attention) device chain — the four small kernels the CPU
+// path did on the host between GPU calls (each crossing was a sync):
+//   layernorm_affine: ki = LN(x·wk)(k_norm w/b)  [n, idm]
+//   dsa_cache_append: kvb per-head strided split → k_nope/v at slot T0+t,
+//                     ki/gate copies → k_idx/k_gate
+//   kpool_compress:   per-channel softmax(gate+ape) pool mixing of k_idx
+//   pool_expand:      idx_pools [n, select_k] → token idx [n, out_width]
+//                     (+ visible tail, -1 padding)
+// The big ops (indexer_topk, sparse_mla_attn, gemv projections) already
+// exist as GPU kernels — dsa_layer_dev chains them all with zero host
+// round-trips.
+// ============================================================
+__global__ void layernorm_affine_kernel(const float* __restrict__ x,
+                                        const float* __restrict__ w,
+                                        const float* __restrict__ b,
+                                        float* __restrict__ out,
+                                        int dim) {
+    int row = blockIdx.x;
+    const float* xr = x + (size_t)row * dim;
+    float* orow = out + (size_t)row * dim;
+    __shared__ float sm[512];
+    float mean = 0.f, var = 0.f;
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) sm[j] = xr[j];
+    __syncthreads();
+    for (int j = 0; j < dim; j++) mean += sm[j];
+    mean /= dim;
+    for (int j = 0; j < dim; j++) {
+        float d = sm[j] - mean;
+        var += d * d;
+    }
+    float inv = rsqrtf(var / dim + 1e-5f);
+    for (int j = threadIdx.x; j < dim; j += blockDim.x) {
+        orow[j] = (sm[j] - mean) * inv * w[j] + b[j];
+    }
+}
+
+extern "C" cudaError_t ferrite_layernorm_affine(const float* x, const float* w,
+                                                const float* b, float* out,
+                                                int n, int dim, cudaStream_t s) {
+    layernorm_affine_kernel<<<n, min(dim, 256), 0, s>>>(x, w, b, out, dim);
+    return cudaGetLastError();
+}
+
+__global__ void dsa_cache_append_kernel(
+    const float* __restrict__ kvb,   // [n, h*(dk+dv)]
+    const float* __restrict__ ki,    // [n, idm]
+    const float* __restrict__ gate,  // [n, idm]
+    float* __restrict__ k_nope,      // [T_total, h, dk]
+    float* __restrict__ v,           // [T_total, h, dv]
+    float* __restrict__ k_idx,       // [T_total, idm]
+    float* __restrict__ k_gate,      // [T_total, idm]
+    int t0, int n, int h, int dk, int dv, int idm) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_bytes = h * (dk + dv);
+    int total_elems = n * row_bytes;
+    if (tid < total_elems) {
+        int t = tid / row_bytes, r = tid % row_bytes;
+        int hd = r / (dk + dv), c = r % (dk + dv);
+        size_t dst = ((size_t)(t0 + t) * h + hd);
+        if (c < dk) {
+            k_nope[dst * dk + c] = kvb[tid];
+        } else {
+            v[dst * dv + (c - dk)] = kvb[tid];
+        }
+    } else if (tid < total_elems + n * idm) {
+        int j = tid - total_elems;
+        int t = j / idm, c = j % idm;
+        k_idx[(size_t)(t0 + t) * idm + c] = ki[j];
+    } else if (tid < total_elems + 2 * n * idm) {
+        int j = tid - total_elems - n * idm;
+        int t = j / idm, c = j % idm;
+        k_gate[(size_t)(t0 + t) * idm + c] = gate[j];
+    }
+}
+
+extern "C" cudaError_t ferrite_dsa_cache_append(
+    const float* kvb, const float* ki, const float* gate,
+    float* k_nope, float* v, float* k_idx, float* k_gate,
+    int t0, int n, int h, int dk, int dv, int idm, cudaStream_t s) {
+    int total = n * h * (dk + dv) + 2 * n * idm;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    dsa_cache_append_kernel<<<blocks, threads, 0, s>>>(
+        kvb, ki, gate, k_nope, v, k_idx, k_gate, t0, n, h, dk, dv, idm);
+    return cudaGetLastError();
+}
+
+__global__ void kpool_compress_kernel(
+    const float* __restrict__ k_idx,   // [total, idm]
+    const float* __restrict__ k_gate,  // [total, idm]
+    const float* __restrict__ ape,     // [kpool, idm]
+    float* __restrict__ pool_keys,     // [npools, idm]
+    int total, int npools, int kpool, int idm) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= (int)((size_t)npools * idm)) return;
+    int p = tid / idm, d = tid % idm;
+    float lmax = -INFINITY;
+    for (int j = 0; j < kpool; j++) {
+        int t = p * kpool + j;
+        if (t < total) {
+            float lv = k_gate[(size_t)t * idm + d] + ape[j * idm + d];
+            if (lv > lmax) lmax = lv;
+        }
+    }
+    if (lmax == -INFINITY) return;
+    float den = 0.f, num = 0.f;
+    for (int j = 0; j < kpool; j++) {
+        int t = p * kpool + j;
+        if (t < total) {
+            float wgt = expf(k_gate[(size_t)t * idm + d] + ape[j * idm + d] - lmax);
+            den += wgt;
+            num += wgt * k_idx[(size_t)t * idm + d];
+        }
+    }
+    pool_keys[(size_t)p * idm + d] = num / den;
+}
+
+extern "C" cudaError_t ferrite_kpool_compress(
+    const float* k_idx, const float* k_gate, const float* ape,
+    float* pool_keys, int total, int npools, int kpool, int idm,
+    cudaStream_t s) {
+    size_t total_t = (size_t)npools * idm;
+    int threads = 256;
+    int blocks = (int)((total_t + threads - 1) / threads);
+    kpool_compress_kernel<<<blocks, threads, 0, s>>>(
+        k_idx, k_gate, ape, pool_keys, total, npools, kpool, idm);
+    return cudaGetLastError();
+}
+
+__global__ void pool_expand_kernel(
+    const float* __restrict__ idx_pools,  // [n, select_k]
+    float* __restrict__ idx,              // [n, out_width]
+    int n, int select_k, int kpool, int npools, int total, int ctx0) {
+    int i = blockIdx.x;
+    if (i >= n) return;
+    int out_width = select_k * kpool + (kpool - 1);
+    const float* pv = idx_pools + (size_t)i * select_k;
+    float* iv = idx + (size_t)i * out_width;
+    int col = 0;
+    for (int r = 0; r < select_k; r++) {
+        float pflt = pv[r];
+        if (pflt >= 0.0f && (int)pflt < npools) {
+            int p = (int)pflt;
+            for (int j = 0; j < kpool; j++) {
+                int t = p * kpool + j;
+                iv[col++] = (t < total && t <= ctx0 + i) ? (float)t : -1.0f;
+            }
+        }
+    }
+    int visible_count = ctx0 + i + 1;
+    int tail_count = visible_count % kpool;
+    int tail_start = visible_count - tail_count;
+    for (int j = 0; j < kpool - 1 && col < out_width; j++) {
+        int t = tail_start + j;
+        iv[col++] = (j < tail_count && t <= ctx0 + i) ? (float)t : -1.0f;
+    }
+    while (col < out_width) iv[col++] = -1.0f;
+}
+
+extern "C" cudaError_t ferrite_pool_expand(
+    const float* idx_pools, float* idx,
+    int n, int select_k, int kpool, int npools, int total, int ctx0,
+    cudaStream_t s) {
+    pool_expand_kernel<<<n, 1, 0, s>>>(idx_pools, idx, n, select_k, kpool, npools, total, ctx0);
+    return cudaGetLastError();
+}
+
+// elementwise in-place scale (w_idx × n_heads^-0.5)
+__global__ void scale_inplace_kernel(float* __restrict__ x, float s, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] *= s;
+}
+extern "C" cudaError_t ferrite_scale_inplace(float* x, float s, int n, cudaStream_t st) {
+    if (n <= 0) return cudaSuccess;
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    scale_inplace_kernel<<<blocks, threads, 0, st>>>(x, s, n);
+    return cudaGetLastError();
+}

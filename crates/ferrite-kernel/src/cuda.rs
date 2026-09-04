@@ -40,6 +40,19 @@ extern "C" {
     fn ferrite_gemv_bf16(x: *const f32, w: *const std::ffi::c_void,
                           bias: *const f32, out: *mut f32,
                           in_f: i32, out_f: i32, s: CuStream) -> i32;
+    fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
+                                 out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
+    fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
+                                 k_nope: *mut f32, v: *mut f32, k_idx: *mut f32, k_gate: *mut f32,
+                                 t0: i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
+                                 s: CuStream) -> i32;
+    fn ferrite_kpool_compress(k_idx: *const f32, k_gate: *const f32, ape: *const f32,
+                               pool_keys: *mut f32, total: i32, npools: i32, kpool: i32,
+                               idm: i32, s: CuStream) -> i32;
+    fn ferrite_pool_expand(idx_pools: *const f32, idx: *mut f32,
+                            n: i32, select_k: i32, kpool: i32, npools: i32, total: i32,
+                            ctx0: i32, s: CuStream) -> i32;
+    fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_f32_to_bf16(in_: *const f32, out: *mut std::ffi::c_void,
                             n: i64, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
@@ -321,6 +334,10 @@ pub struct CudaBackend {
     /// tokens; pooled buffers would be reused by other ops).
     gdn_states: std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
     conv_states: std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
+    /// DSA caches: device-resident k_nope/v/k_idx/k_gate per (seq, family),
+    /// pre-allocated to max tokens. The CPU path grew host Vecs and cloned
+    /// them per call (~MBs memcpy per DSA layer per token).
+    dsa_caches: std::sync::Mutex<std::collections::HashMap<(u64, usize), DsaCacheState>>,
     /// MoE expert POINTER TABLES (fused GPU dispatch): per layer, three
     /// device buffers of e_local raw pointers (gate/up/down) into the
     /// dev_weight_bf16 cache — the fused kernels gather the selected
@@ -370,6 +387,7 @@ impl CudaBackend {
             graph: std::sync::Mutex::new(GraphState::default()),
             gdn_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             conv_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dsa_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -1102,6 +1120,56 @@ pub struct GdnLayerWeights<'a> {
     pub o_proj: &'a Tensor,
 }
 
+/// Device-resident DSA cache: k_nope [max_t, h, dk], v [max_t, h, dv],
+/// k_idx/k_gate [max_t, idm] — pre-allocated, appended in place by
+/// ferrite_dsa_cache_append. The CPU path grew host Vecs and cloned them
+/// per layer per token (MBs of memcpy per call).
+pub struct DsaCacheState {
+    pub k_nope: *mut std::ffi::c_void,
+    pub v: *mut std::ffi::c_void,
+    pub k_idx: *mut std::ffi::c_void,
+    pub k_gate: *mut std::ffi::c_void,
+    pub max_tokens: usize,
+    /// tokens appended so far (device-side counter; the CPU Vecs are gone)
+    pub t_count: usize,
+}
+unsafe impl Send for DsaCacheState {}
+unsafe impl Sync for DsaCacheState {}
+
+impl DsaCacheState {
+    fn clone_raw(&self) -> (*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void, usize) {
+        (self.k_nope, self.v, self.k_idx, self.k_gate, self.max_tokens)
+    }
+}
+
+/// Weight set for one DSA layer's device chain (borrowed from the shard
+/// Engine's weights — all hit the dev_weight caches after preload).
+pub struct DsaLayerWeights<'a> {
+    pub q_a: &'a Tensor,
+    pub q_a_ln: &'a Tensor,
+    pub q_b: &'a Tensor,
+    pub kv_a: &'a Tensor,
+    pub kv_a_ln: &'a Tensor,
+    pub kv_b: &'a Tensor,
+    pub wq_b: &'a Tensor,
+    pub wk: &'a Tensor,
+    pub k_norm_w: &'a Tensor,
+    pub k_norm_b: &'a Tensor,
+    pub weights_proj: &'a Tensor,
+    pub gate: &'a Tensor,
+    pub ape: &'a Tensor,
+    pub o_proj: &'a Tensor,
+    // dims
+    pub h: usize,
+    pub dk: usize,
+    pub dv: usize,
+    pub ih: usize,
+    pub idm: usize,
+    pub kpool: usize,
+    pub topk: usize,
+    pub rms_eps: f32,
+}
+
 impl CudaBackend {
     fn dev_state(
         &self,
@@ -1300,6 +1368,162 @@ impl CudaBackend {
             eprintln!("[gdn_probe] dev L0 core/partial dumped r{} (n={} proj={} hidden={})", crate::shard_idx(), n, proj, hidden);
         }
         Ok(partial)
+    }
+
+    /// Whole DSA (sparse attention) layer on device, zero host round-trips:
+    /// gemv projections → layernorm → cache append (device-resident KV +
+    /// index caches) → kpool compress → indexer topk → pool expand →
+    /// sparse attention → o_proj. The CPU path did 10 Tensor-level ops
+    /// (each a sync) + host-side cache clones per layer per token
+    /// (2.8ms/layer measured).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsa_layer_dev(
+        &self,
+        x: &DevBuf,
+        w: &DsaLayerWeights,
+        seq: u64,
+        family: usize,
+        n: usize,
+        hidden: usize,
+    ) -> Result<DevBuf> {
+        self.enter();
+        let ni = n as i32;
+        let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
+
+        // 1. query path: qa → rmsnorm → qb [n, h*dk]
+        let qa = self.matmul_dev(x, w.q_a, ni, hidden as i32, (w.q_a.shape.0[0]) as i32)?;
+        let qa_ln = self.rmsnorm_dev(&qa, w.q_a_ln, w.rms_eps, n, w.q_a.shape.0[0])?;
+        let qb = self.matmul_dev(&qa_ln, w.q_b, ni, w.q_a.shape.0[0] as i32, (h * dk) as i32)?;
+
+        // 2. kv path: latent → rmsnorm → kvb [n, h*(dk+dv)]
+        let latent = self.matmul_dev(x, w.kv_a, ni, hidden as i32, (w.kv_a.shape.0[0]) as i32)?;
+        let kv_ln = self.rmsnorm_dev(&latent, w.kv_a_ln, w.rms_eps, n, w.kv_a.shape.0[0])?;
+        let kvb = self.matmul_dev(&kv_ln, w.kv_b, ni, w.kv_a.shape.0[0] as i32, (h * (dk + dv)) as i32)?;
+
+        // 3. indexer queries: qi = qa @ wq_b [n, ih*idm]
+        let qi = self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?;
+
+        // 4. index keys: ki = LayerNorm(x @ wk)(k_norm affine) [n, idm]
+        let ki_raw = self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?;
+        let ki = DevBuf::alloc(self.dev, self.stream, n * idm)?;
+        let knw = self.dev_weight(w.k_norm_w)?;
+        let knb = self.dev_weight(w.k_norm_b)?;
+        ck(
+            unsafe { ferrite_layernorm_affine(ki_raw.as_const_f32(), knw.as_const_f32(), knb.as_const_f32(), ki.as_f32(), ni, idm as i32, self.stream) },
+            "dsa_layernorm",
+        )?;
+
+        // 5. per-head score weights: w_idx = (x @ weights_proj) × ih^-0.5 [n, ih]
+        let w_idx = self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?;
+        ck(
+            unsafe { ferrite_scale_inplace(w_idx.as_f32(), (ih as f32).sqrt().recip(), (n * ih) as i32, self.stream) },
+            "dsa_widx_scale",
+        )?;
+
+        // 6. kpool gate scores: gate = x @ compress_gate [n, idm]
+        let gate = self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?;
+
+        // 7. cache append (device-resident, in place at slot t0)
+        let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, t0) = {
+            let mut m = self.dsa_caches.lock().unwrap();
+            let (t0, ptrs) = match m.get(&(seq, family)) {
+                Some(c) => (c.t_count, (c.k_nope, c.v, c.k_idx, c.k_gate)),
+                None => (0usize, (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())),
+            };
+            if ptrs.0.is_null() {
+                let max_tokens = 8192usize;
+                let kn = self.dsa_alloc(max_tokens * h * dk)?;
+                let vv = self.dsa_alloc(max_tokens * h * dv)?;
+                let ki_ = self.dsa_alloc(max_tokens * idm)?;
+                let kg = self.dsa_alloc(max_tokens * idm)?;
+                m.insert(
+                    (seq, family),
+                    DsaCacheState { k_nope: kn, v: vv, k_idx: ki_, k_gate: kg, max_tokens, t_count: n },
+                );
+                (kn, vv, ki_, kg, 0)
+            } else {
+                m.get_mut(&(seq, family)).unwrap().t_count += n;
+                (ptrs.0, ptrs.1, ptrs.2, ptrs.3, t0)
+            }
+        };
+        ck(
+            unsafe {
+                ferrite_dsa_cache_append(
+                    kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
+                    k_nope_dev as *mut f32, v_dev as *mut f32, k_idx_dev as *mut f32, k_gate_dev as *mut f32,
+                    t0 as i32, ni, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
+                )
+            },
+            "dsa_cache_append",
+        )?;
+        let total = t0 + n;
+
+        // 8. kpool compression: pool_keys [npools, idm]
+        let npools = (total + kpool - 1) / kpool;
+        let pool_keys = DevBuf::alloc(self.dev, self.stream, npools * idm)?;
+        let dape = self.dev_weight(w.ape)?;
+        ck(
+            unsafe {
+                ferrite_kpool_compress(
+                    k_idx_dev as *const f32, k_gate_dev as *const f32, dape.as_const_f32(), pool_keys.as_f32(),
+                    total as i32, npools as i32, kpool as i32, idm as i32, self.stream,
+                )
+            },
+            "dsa_kpool",
+        )?;
+
+        // 9. indexer topk over pools
+        let select_k = (w.topk / kpool).min(npools);
+        let idx_pools = DevBuf::alloc(self.dev, self.stream, n * select_k)?;
+        let ctx0 = total - n;
+        ck(
+            unsafe {
+                ferrite_indexer_topk(
+                    qi.as_const_f32(), pool_keys.as_const_f32(), w_idx.as_const_f32(),
+                    idx_pools.as_f32(), ni, npools as i32, ih as i32, idm as i32,
+                    select_k as i32, (ctx0 / kpool) as i32, self.stream,
+                )
+            },
+            "dsa_topk",
+        )?;
+
+        // 10. expand pools to token indices [n, out_width]
+        let out_width = select_k * kpool + (kpool - 1);
+        let idx = DevBuf::alloc(self.dev, self.stream, n * out_width)?;
+        ck(
+            unsafe {
+                ferrite_pool_expand(
+                    idx_pools.as_const_f32(), idx.as_f32(),
+                    ni, select_k as i32, kpool as i32, npools as i32, total as i32,
+                    ctx0 as i32, self.stream,
+                )
+            },
+            "dsa_pool_expand",
+        )?;
+
+        // 11. sparse attention: q [n,h,dk] × k [T,h,dk] × v [T,h,dv] → out [n, h*dv]
+        let attn_out = DevBuf::alloc(self.dev, self.stream, n * h * dv)?;
+        ck(
+            unsafe {
+                ferrite_sparse_attn(
+                    qb.as_const_f32(), k_nope_dev as *const f32, v_dev as *const f32, idx.as_const_f32(),
+                    attn_out.as_f32(), ni, total as i32, h as i32, dk as i32, dv as i32,
+                    out_width as i32, self.stream,
+                )
+            },
+            "dsa_sparse_attn",
+        )?;
+
+        // 12. o_proj — TP partial [n, hidden]
+        let partial = self.matmul_dev(&attn_out, w.o_proj, ni, (h * dv) as i32, hidden as i32)?;
+        Ok(partial)
+    }
+
+    fn dsa_alloc(&self, floats: usize) -> Result<*mut std::ffi::c_void> {
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut p, floats * 4) }, "dsa cache malloc")?;
+        ck(unsafe { cudaMemset(p, 0, floats * 4) }, "dsa cache zero")?;
+        Ok(p)
     }
 }
 
