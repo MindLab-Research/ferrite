@@ -1184,8 +1184,8 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
     if (threadIdx.x == 0) {
         float a = 0.f, b = 0.f;
         for (int w = 0; w < 32; w++) { a += red[w]; b += red[32 + w]; }
-        red[60] = (a >= 0.f && a < 1e38f) ? rsqrtf(a + 1e-12f) : 0.f;
-        red[61] = (b >= 0.f && b < 1e38f) ? rsqrtf(b + 1e-12f) : 0.f;
+        red[60] = (a > 0.f) ? rsqrtf(a) : 0.f;
+        red[61] = (b > 0.f) ? rsqrtf(b) : 0.f;
     }
     __syncthreads();
     nq = red[60]; nk = red[61];
