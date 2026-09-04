@@ -807,10 +807,10 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
                                      const float* __restrict__ ki,
                                      const float* __restrict__ w,
                                      float* __restrict__ idx,
-                                     int n, const int* __restrict__ t_ptr, int h, int d, int topk,
+                                     int n, int h, int d, int topk,
                                      const int* __restrict__ total_ptr, int kpool_val, int n_fixed) {
-    int t = *t_ptr; // actual npools from pinned memory (graph-safe)
     int total = *total_ptr; // actual total tokens from pinned memory
+    int t = (total + kpool_val - 1) / kpool_val; // DERIVE npools from total
     int ctx0 = total - n_fixed; // derive from pinned total
     int ctx0_pools = ctx0 / kpool_val;
     int row = blockIdx.x;
@@ -869,7 +869,7 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
 
 extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
                                             const float* w,
-                                            float* idx, int n, const int* t_ptr, int h, int d,
+                                            float* idx, int n, int h, int d,
                                             int topk, const int* total_ptr, int kpool_val, int n_fixed,
                                             cudaStream_t s) {
     dim3 block(32);
@@ -878,7 +878,7 @@ extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
     // npools would overflow as context grows)
     int max_t = 2048; // max_npools = max_tokens / kpool
     size_t smem = (size_t)max_t * sizeof(float);
-    indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, w, idx, n, t_ptr, h, d, topk, total_ptr, kpool_val, n_fixed);
+    indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, w, idx, n, h, d, topk, total_ptr, kpool_val, n_fixed);
     return cudaGetLastError();
 }
 
