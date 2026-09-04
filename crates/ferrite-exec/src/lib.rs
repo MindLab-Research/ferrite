@@ -735,8 +735,12 @@ impl<B: KernelBackend> Engine<B> {
                     rms_eps: self.cfg.rms_norm_eps,
                 };
                 // FERRITE_GRAPH_LAYER: per-(layer, rank) graph (same pattern
-                // as the GDN/MoE branches).
-                if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+                // as the GDN/MoE branches). NOTE: DSA's KV append uses t0
+                // (token slot) — a captured graph FREEZES t0, so every
+                // replay writes the same slot (semantic break). Requires
+                // cudaGraphExecKernelNodeSetParams or DSA stays un-graphed.
+                // Gated separately (FERRITE_GRAPH_DSA) until then.
+                if std::env::var_os("FERRITE_GRAPH_DSA").is_some() && n == 1 {
                     use ferrite_kernel::cuda::GraphIO;
                     let gname = format!("dsa{}", layer_idx);
                     let mut v = vec![0f32; n * self.cfg.hidden_size];
@@ -1171,7 +1175,7 @@ impl<B: KernelBackend> Engine<B> {
         // FERRITE_GRAPH_LAYER: per-(layer, rank) graph — capture the MoE
         // segment (upload + fused kernels), replay per token (see the GDN
         // branch in tp.rs for the pattern).
-        if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+        if std::env::var_os("FERRITE_GRAPH_MOE").is_some() && n == 1 {
             use ferrite_kernel::cuda::GraphIO;
             let layer_no: String = pfx.rsplit('.').next().unwrap_or("?").to_string();
             let gname = format!("moe{layer_no}");
