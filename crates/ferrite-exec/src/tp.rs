@@ -992,7 +992,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
 
         // ---- segment 3: hc_post → hc_pre2 → rmsnorm2 (GPU chain, no host) ----
         let timing_mid = std::env::var_os("FERRITE_TIMING").is_some();
-        let (tm_a, tm_b, tm_c, tm_d) = {
+        let (hfn_t, res2_dev, post_f_dev, comb_f_dev) = {
             let s0 = &self.shards[0];
             let cuda0 = s0
                 .backend
