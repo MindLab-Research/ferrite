@@ -2143,3 +2143,24 @@ impl CudaBackend {
         Ok(out_mut)
     }
 }
+
+impl CudaBackend {
+    /// Graph replay WITHOUT the D2H download: write the input to the
+    /// captured staging, launch, return the output DEVICE pointer (for
+    /// P2P all-reduce — the result stays on GPU).
+    pub fn graph_run_dev(&self, name: &str, input: &[f32]) -> Result<Option<usize>> {
+        let Some(io) = self.graph_io_get(name) else { return Ok(None); };
+        if input.len() != io.x_len {
+            return Err(FerriteError::InvalidArg(format!(
+                "graph_run_dev {name}: input {} != stage {}", input.len(), io.x_len
+            )));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(input.as_ptr(), io.x_stage as *mut f32, io.x_len);
+        }
+        if !self.graph_replay(name) {
+            return Ok(None);
+        }
+        Ok(Some(io.out_dev as usize))
+    }
+}
