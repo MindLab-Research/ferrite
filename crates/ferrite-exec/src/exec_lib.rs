@@ -735,6 +735,16 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     pub(crate) fn moe_ffn(&self, pfx: &str, x: &Tensor, n: usize) -> Result<Tensor> {
+        // CUDA device chain: routing + expert FFNs + weighted sum ALL on device
+        // (2 syncs per MoE layer vs ~10 on the per-op path — the per-op
+        // upload/download syncs are ~97% of the decode time budget; this is
+        // the FFN half of the CUDA-graph path). Opt-in during rollout.
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = self.backend.as_cuda() {
+            if std::env::var_os("FERRITE_MOE_DEV").is_some() {
+                return self.moe_ffn_dev(cuda, pfx, x, n);
+            }
+        }
         let cfg = &self.cfg;
         let hidden = cfg.hidden_size;
         let topk = cfg.num_experts_per_tok;
@@ -784,6 +794,58 @@ impl<B: KernelBackend> Engine<B> {
         for i in 0..n * hidden {
             ov[i] += shared.as_slice()[i];
         }
+        Ok(out)
+    }
+
+    /// MoE FFN via the full device op chain (moe_layer_dev): routing on
+    /// device, per-expert fused FFN chains (zero H2D/D2H inside), D2D
+    /// gather, one weighted-sum kernel. ~2 CPU↔GPU syncs per MoE layer
+    /// vs ~10 on the per-op path. FERRITE_MOE_DEV=1 opt-in.
+    #[cfg(feature = "cuda")]
+    fn moe_ffn_dev(
+        &self,
+        cuda: &ferrite_kernel::cuda::CudaBackend,
+        pfx: &str,
+        x: &Tensor,
+        n: usize,
+    ) -> Result<Tensor> {
+        use ferrite_kernel::cuda::{DevBuf, ExpertWeights};
+        cuda.enter();
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden_size;
+        let topk = cfg.num_experts_per_tok;
+        let e = cfg.n_routed_experts;
+        let bias = match self.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
+            Some(b) => b.clone(),
+            None => Tensor::zeros(Shape::new([e]), DType::F32),
+        };
+        let gate_w = self.w(&format!("{pfx}.mlp.gate.weight"))?;
+        let shared = ExpertWeights {
+            gate: self.w(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))?,
+            up: self.w(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))?,
+            down: self.w(&format!("{pfx}.mlp.shared_expert.down_proj.weight"))?,
+        };
+        let (es, ee) = self.tp_expert_range.unwrap_or((0, e));
+        let experts: Vec<ExpertWeights> = (es..ee)
+            .map(|eid| {
+                Ok(ExpertWeights {
+                    gate: self.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
+                    up: self.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
+                    down: self.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
+        x_dev.upload(x.as_slice())?;
+        let mut probs_scratch = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
+        let out_dev = cuda.moe_layer_dev(
+            &x_dev, gate_w, &bias, &shared, &experts, es,
+            &mut probs_scratch, n, hidden, topk, e,
+            cfg.routed_scaling_factor, cfg.swiglu_limit,
+        )?;
+        let mut out = Tensor::zeros(Shape::new([n, hidden]), x.dtype);
+        let ov = std::sync::Arc::get_mut(&mut out.data).unwrap();
+        out_dev.download(ov)?;
         Ok(out)
     }
 

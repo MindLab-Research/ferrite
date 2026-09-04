@@ -1380,8 +1380,11 @@ impl CudaBackend {
         // 5. gather buffer [n, (topk+1) * hidden]: slots 0..topk-1 = routed
         //    expert outputs, slot topk = shared output. probs_ext = [probs, 1.0]
         //    so ONE weighted_sum call folds the shared expert in.
+        //    Zero-fill upfront: experts NOT owned by this rank (TP shard) leave
+        //    their slots zero — the all-reduce sums partials across ranks.
         let slots = topk + 1;
         let mut eouts = DevBuf::alloc(self.dev, self.stream, n * slots * hidden)?;
+        ck(unsafe { cudaMemsetAsync(eouts.as_f32() as *mut _, 0, n * slots * hidden * 4, self.stream) }, "eouts zero")?;
         let mut probs_ext = vec![0f32; n * slots];
         probs_ext[..n * topk].copy_from_slice(&probs_host);
         for t in 0..n {
@@ -1392,17 +1395,16 @@ impl CudaBackend {
 
         // 6. per-token expert dispatch: for decode (n=1) exactly `topk`
         //    expert chains; each = 3 matmuls + swiglu2 (no H2D/D2H inside).
-        //    Experts not owned by this rank (TP shard) contribute zero —
-        //    the all-reduce sums partials across ranks.
+        //    Experts not owned by this rank (TP shard) leave their slots ZERO
+        //    (upfront memset above) — the all-reduce sums partials across ranks.
         let e_count = experts.len();
-        let mut written = vec![false; n * topk]; // slot filled?
         for t in 0..n {
             for j in 0..topk {
                 let slot = t * slots + j;
                 let eid = ids_host[t * topk + j] as usize;
                 let local = eid.saturating_sub(expert_start);
                 if local >= e_count {
-                    continue; // another rank owns this expert → zero slot (all-reduce sums)
+                    continue; // another rank owns this expert → zero slot
                 }
                 let w = &experts[local];
                 let inter = w.gate.shape.0[0] as i32;
@@ -1415,22 +1417,10 @@ impl CudaBackend {
                     cudaMemcpyAsync(
                         (eouts.as_f32() as *mut std::ffi::c_void).add(slot * hidden * 4),
                         d.as_const_f32() as *const std::ffi::c_void,
-                        n * hidden * 4, // n==1 rows contiguous for this token
+                        hidden * 4, // one token's row (decode: n==1 contiguous)
                         CUDA_MEMCPY_D2D, self.stream,
                     )
                 }, "expert out gather")?;
-                written[t * topk + j] = true;
-            }
-            if !written.iter().all(|&w| w) && t == 0 {
-                // zero-fill unwritten slots for THIS token's other slots
-                // (experts on other ranks): copy 0s — for n=1 the whole row
-                // layout is [topk+1, hidden] so zero the missing slots only.
-                for j in 0..topk {
-                    if !written[t * topk + j] {
-                        let slot = t * slots + j;
-                        ck(unsafe { cudaMemsetAsync(eouts.as_f32().add(slot * hidden) as *mut _, 0, hidden * 4, self.stream) }, "zero slot")?;
-                    }
-                }
             }
         }
         // shared expert output → slot topk (same layout)
