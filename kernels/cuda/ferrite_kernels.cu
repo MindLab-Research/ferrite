@@ -1225,3 +1225,66 @@ extern "C" cudaError_t ferrite_gdn_prep(const float* conv_out, const float* b_ra
                                                q, k, v, beta, gate, n, h, dk, lb);
     return cudaGetLastError();
 }
+
+// ============================================================
+// TP all-reduce (sum): in-place sum of N partial outputs.
+// grid = total/nthreads, each thread sums N inputs element-wise.
+// For the decode-step device op chain: the TP fan-out produces
+// world partial [n, hidden] DevBufs; this kernel sums them in-place
+// on the FIRST partial's buffer (no H2D/D2H, graph-capturable).
+// ============================================================
+__global__ void tp_all_reduce_kernel(float* __restrict__ out,
+                                     const float* __restrict__ partials,
+                                     int total, int world) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= total) return;
+    float acc = 0.f;
+    for (int w = 0; w < world; w++) {
+        acc += partials[(size_t)w * total + i];
+    }
+    out[i] = acc;
+}
+
+extern "C" cudaError_t ferrite_tp_all_reduce(float* partials, float* out,
+                                              int total, int world,
+                                              cudaStream_t s) {
+    if (total <= 0 || world <= 1) return cudaSuccess;
+    dim3 block(256);
+    dim3 grid((total + 255) / 256);
+    tp_all_reduce_kernel<<<grid, block, 0, s>>>(out, partials, total, world);
+    return cudaGetLastError();
+}
+
+// ============================================================
+// Weighted sum for MoE: out[t, hidden] = Σ_j probs[t, j] * expert_out[t, j, hidden]
+// Each thread handles one (t, hidden_col) element, loops over topk experts.
+// ============================================================
+__global__ void moe_weighted_sum_kernel(const float* __restrict__ probs,
+                                          const float* __restrict__ eouts,
+                                          float* __restrict__ out,
+                                          int n, int topk, int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n * hidden;
+    if (idx >= total) return;
+    int t = idx / hidden;
+    int c = idx % hidden;
+    float acc = 0.f;
+    for (int j = 0; j < topk; j++) {
+        float p = probs[t * topk + j];
+        if (p != 0.f) {
+            acc += p * eouts[(size_t)t * topk * hidden + j * hidden + c];
+        }
+    }
+    out[idx] = acc;
+}
+
+extern "C" cudaError_t ferrite_moe_weighted_sum(const float* probs,
+                                                 const float* eouts,
+                                                 float* out,
+                                                 int n, int topk, int hidden,
+                                                 cudaStream_t s) {
+    dim3 block(256);
+    dim3 grid((n * hidden + 255) / 256);
+    moe_weighted_sum_kernel<<<grid, block, 0, s>>>(probs, eouts, out, n, topk, hidden);
+    return cudaGetLastError();
+}
