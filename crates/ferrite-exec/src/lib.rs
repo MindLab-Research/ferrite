@@ -544,7 +544,7 @@ impl<B: KernelBackend> Engine<B> {
         // SiLU activation on the conv output (Glm5NextTextLinearAttention:
         // causal_conv1d_fn(..., activation="silu"))
         // PROBE (lib.rs — the LIVE linear_attn_forward; exec_lib.rs's is dead code)
-        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer_idx == 0 {
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer_idx == 0 && n > 1 {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -636,7 +636,7 @@ impl<B: KernelBackend> Engine<B> {
         )?;
         self.linear_states
             .insert((seq, layer_idx), state_out.as_slice().to_vec());
-        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 0 {
+        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 0 && n > 1 {
             let wr = |p: &str, t: &Tensor| {
                 let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
                 std::fs::write(p, b).ok();

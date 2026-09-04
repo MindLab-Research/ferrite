@@ -1154,7 +1154,7 @@ impl CudaBackend {
             v
         };
         // PROBE: dump layer-0 intermediates for CPU-vs-dev divergence diff
-        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
@@ -1217,7 +1217,7 @@ impl CudaBackend {
                 }
             }
         }
-        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
             let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
             let d = |name: &str, v: &[f32]| {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
