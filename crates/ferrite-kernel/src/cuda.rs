@@ -124,15 +124,21 @@ thread_local! {
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// True while the current thread is inside a stream capture (THREAD_LOCAL
-/// mode). Download skips its synchronisation then — cudaStreamSynchronize
-/// is illegal mid-capture; the graph's end_verify syncs once at the tail.
-thread_local! {
-    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+/// True while ANY thread is inside a stream capture (THREAD_LOCAL mode).
+/// GLOBAL (AtomicBool): fan_out worker threads must also skip sync —
+/// the capture runs on the main thread but rank threads' ops land on
+/// their own streams; a cudaStreamSynchronize on the CAPTURING stream
+/// from any thread invalidates the graph (error 901).
+/// Download skips its synchronisation then — cudaStreamSynchronize is
+/// illegal mid-capture; the graph's end_verify syncs once at the tail.
+static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn set_capturing(v: bool) {
-    CAPTURING.with(|c| c.set(v));
+    CAPTURING.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn is_capturing() -> bool {
+    CAPTURING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void) {
@@ -218,7 +224,7 @@ impl DevBuf {
         ck(unsafe {
             cudaMemcpyAsync(self.stage, self.ptr, host.len() * 4, CUDA_MEMCPY_D2H, self.stream)
         }, "memcpy D2H")?;
-        if !CAPTURING.with(|c| c.get()) {
+        if !is_capturing() {
             ck(unsafe { cudaStreamSynchronize(self.stream) }, "sync after D2H")?;
         }
         unsafe {
