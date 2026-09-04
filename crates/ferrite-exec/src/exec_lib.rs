@@ -839,6 +839,8 @@ impl<B: KernelBackend> Engine<B> {
     ) -> Result<Tensor> {
         use ferrite_kernel::cuda::{DevBuf, ExpertWeights};
         cuda.enter();
+        let tm = std::env::var_os("FERRITE_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         let cfg = &self.cfg;
         let hidden = cfg.hidden_size;
         let topk = cfg.num_experts_per_tok;
@@ -863,6 +865,7 @@ impl<B: KernelBackend> Engine<B> {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let t1 = std::time::Instant::now();
         let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), x.numel())?;
         x_dev.upload(x.as_slice())?;
         let mut probs_scratch = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
@@ -874,6 +877,17 @@ impl<B: KernelBackend> Engine<B> {
         let mut out = Tensor::zeros(Shape::new([n, hidden]), x.dtype);
         let ov = std::sync::Arc::get_mut(&mut out.data).unwrap();
         out_dev.download(ov)?;
+        if tm && n == 1 {
+            let t2 = std::time::Instant::now();
+            eprintln!(
+                "[moe-ffn-dev] r{} prep={:5.2}ms ({} experts, {} w()-lookups) exec={:5.2}ms",
+                ferrite_kernel::shard_idx(),
+                (t1 - t0).as_secs_f32() * 1e3,
+                experts.len(),
+                4 + experts.len() * 3,
+                (t2 - t1).as_secs_f32() * 1e3,
+            );
+        }
         Ok(out)
     }
 
