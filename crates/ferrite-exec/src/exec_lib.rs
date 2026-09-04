@@ -515,6 +515,18 @@ impl<B: KernelBackend> Engine<B> {
             .insert((seq, layer_idx), state_out.as_slice().to_vec());
         // SiLU activation on the conv output (Glm5NextTextLinearAttention:
         // causal_conv1d_fn(..., activation="silu"))
+        // PROBE: dump raw conv (pre-silu) + b_raw + fb for dev-vs-cpu diff
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer_idx == 0 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_cpu_{name}.f32"), b).ok();
+            };
+            d("conv", conv_out.as_slice());
+            d("braw", b_raw.as_slice());
+            d("fb", fb.as_slice());
+            eprintln!("[gdn_probe] cpu L0 dumped conv/braw/fb");
+        }
         {
             let cv = std::sync::Arc::get_mut(&mut conv_out.data).expect("unique conv");
             for v in cv.iter_mut() {
@@ -574,6 +586,17 @@ impl<B: KernelBackend> Engine<B> {
                     }
                 }
             }
+        }
+        // PROBE: dump q/k/beta/gate for dev-vs-cpu diff
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer_idx == 0 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_cpu_{name}.f32"), b).ok();
+            };
+            d("q", q.as_slice()); d("k", k.as_slice());
+            d("beta", beta.as_slice()); d("gate", gate.as_slice());
+            eprintln!("[gdn_probe] cpu L0 preproc dumped: q {} k {} beta {} gate {} (proj={})", q.numel(), k.numel(), beta.numel(), gate.numel(), proj);
         }
         let a_log = self.w(&format!("{pfx}.self_attn.A_log"))?;
         // recurrent state

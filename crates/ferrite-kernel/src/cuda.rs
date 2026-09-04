@@ -1153,6 +1153,16 @@ impl CudaBackend {
             fb.download(&mut v)?;
             v
         };
+        // PROBE: dump layer-0 intermediates for CPU-vs-dev divergence diff
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_dev_{name}.f32"), b).ok();
+            };
+            d("conv", &conv_host); d("braw", &b_raw_host); d("fb", &fb_host);
+            eprintln!("[gdn_probe] dev L0 dumped: conv {} braw {} fb {}", conv_host.len(), b_raw_host.len(), fb_host.len());
+        }
         // gb stays on device (needed for gated_rmsnorm later); also download
         // for the CPU pre-processing? No — gb is only needed as the rmsnorm
         // gate (device-side), not for the pre-processing below.
@@ -1206,6 +1216,15 @@ impl CudaBackend {
                     gate_v[t * proj + hd * dk + j] = lb * (1.0 / (1.0 + (-(a * g)).exp()));
                 }
             }
+        }
+        if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
+            let dir = std::env::var("FERRITE_PROBE_DIR").unwrap_or_else(|_| "/tmp/orion".into());
+            let d = |name: &str, v: &[f32]| {
+                let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/gdn_dev_{name}.f32"), b).ok();
+            };
+            d("q", &q_v); d("k", &k_v); d("beta", &beta_v); d("gate", &gate_v);
+            eprintln!("[gdn_probe] dev L0 preproc dumped: q {} k {} beta {} gate {} (proj={})", q_v.len(), k_v.len(), beta_v.len(), gate_v.len(), proj);
         }
         // ---- upload pre-processing results to device ----
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
