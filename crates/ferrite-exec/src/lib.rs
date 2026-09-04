@@ -22,6 +22,9 @@ use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 pub mod graph;
 pub mod mhc;
 pub mod distributed;
+
+#[cfg(all(test, feature = "cuda"))]
+mod gdn_equiv_test;
 pub mod tp;
 pub use graph::GraphRunner;
 
