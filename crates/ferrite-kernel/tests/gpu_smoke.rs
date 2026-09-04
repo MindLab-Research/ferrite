@@ -258,3 +258,50 @@ fn cuda_smoke_all_ops() {
     cpu.softmax_lastdim(&lg, &mut sm_c).unwrap();
     close(&sm_g, &sm_c, 1e-5, "softmax");
 }
+
+/// CUDA-graph capture smoke: record a 3-op chain (matmul → rmsnorm →
+/// matmul) with the pinned-staging upload/download path, instantiate, and
+/// replay. Capture legality is the point — pageable memcpy is ILLEGAL
+/// during stream capture, the pinned stage is the fix; DevBuf pool reuse
+/// keeps device addresses stable across capture and replay.
+#[test]
+fn cuda_graph_capture_smoke() {
+    let so = std::env::var("FERRITE_KERNEL_SO")
+        .unwrap_or_else(|_| "kernels/cuda/libferrite_kernels.so".into());
+    let dev = CudaBackend::with_device(&so, 0).unwrap();
+    use ferrite_kernel::graph::GraphCapable;
+    let cpu = CpuBackend::new();
+
+    let x = Tensor::from_f32(Shape::new([4, 64]), (0..256).map(|i| i as f32 * 0.01).collect());
+    let w1 = Tensor::from_f32(Shape::new([48, 64]), (0..48 * 64).map(|i| (i % 13) as f32 * 0.02).collect());
+    let wn = Tensor::from_f32(Shape::new([48]), (0..48).map(|i| 1.0 + i as f32 * 0.001).collect());
+    let w2 = Tensor::from_f32(Shape::new([32, 48]), (0..32 * 48).map(|i| (i % 7) as f32 * 0.03).collect());
+    let mut o1 = Tensor::zeros(Shape::new([4, 48]), DType::F32);
+    let mut o2 = Tensor::zeros(Shape::new([4, 48]), DType::F32);
+    let mut o3 = Tensor::zeros(Shape::new([4, 32]), DType::F32);
+
+    // warmup: pools hot, weights resident — capture must find NO cudaMalloc
+    // and NO pageable memcpy in the recorded chain
+    dev.matmul(&x, &w1, None, &mut o1).unwrap();
+    dev.rmsnorm(&o1, &wn, 1e-5, &mut o2).unwrap();
+    dev.matmul(&o2, &w2, None, &mut o3).unwrap();
+
+    // capture the same 3-op chain
+    dev.begin_capture();
+    dev.matmul(&x, &w1, None, &mut o1).unwrap();
+    dev.rmsnorm(&o1, &wn, 1e-5, &mut o2).unwrap();
+    dev.matmul(&o2, &w2, None, &mut o3).unwrap();
+    let trace = dev.end_capture();
+
+    // replay: the graph re-executes stage→dev→kernel→stage for every op
+    dev.begin_verify(&trace);
+    assert!(dev.end_verify(), "graph replay sync");
+
+    // NOTE: the replay writes results into the pinned stages; the Tensor
+    // reads happen on the NEXT download call (the Rust op body does not
+    // re-run during replay). Value parity is verified end-to-end at the
+    // serve integration; here capture legality + replay success is the
+    // contract.
+    println!("cuda_graph_capture_smoke: 3-op chain captured + replayed OK");
+    let _ = (&cpu, &x, &o3);
+}

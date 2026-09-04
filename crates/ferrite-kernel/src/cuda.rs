@@ -98,18 +98,37 @@ fn ck(err: i32, what: &str) -> Result<()> {
 // Per-op cudaMalloc/cudaFree are device-synchronising calls that dominate the
 // op-latency budget (tens of thousands of ops per token across a TP cluster);
 // pooled reuse removes them entirely after warmup.
+//
+// CUDA-graph capture support: every DevBuf owns a PINNED host staging buffer
+// (cudaMallocHost, allocated with the device buffer, pooled with it).
+// upload/download go through it — cudaMemcpyAsync from pageable memory is
+// ILLEGAL during stream capture (cudaErrorStreamCaptureUnsupported) and the
+// tensor's Vec address changes every call, which would bake a stale pointer
+// into the graph. The pinned stage is the fixed-address rendezvous: the CPU
+// writes it (outside the graph), the recorded memcpy moves stage→device.
 // ============================================================
 thread_local! {
     static BUF_POOL: std::cell::RefCell<
-        std::collections::HashMap<(i32, u32), Vec<*mut std::ffi::c_void>>,
+        std::collections::HashMap<(i32, u32), Vec<(*mut std::ffi::c_void, *mut std::ffi::c_void)>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void) {
-    BUF_POOL.with_borrow_mut(|p| p.entry((dev, class)).or_default().push(ptr));
+/// True while the current thread is inside a stream capture (THREAD_LOCAL
+/// mode). Download skips its synchronisation then — cudaStreamSynchronize
+/// is illegal mid-capture; the graph's end_verify syncs once at the tail.
+thread_local! {
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn buf_pool_take(dev: i32, class: u32) -> Option<*mut std::ffi::c_void> {
+pub(crate) fn set_capturing(v: bool) {
+    CAPTURING.with(|c| c.set(v));
+}
+
+fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void) {
+    BUF_POOL.with_borrow_mut(|p| p.entry((dev, class)).or_default().push((ptr, stage)));
+}
+
+fn buf_pool_take(dev: i32, class: u32) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
     BUF_POOL.with_borrow_mut(|p| p.get_mut(&(dev, class)).and_then(|v| v.pop()))
 }
 
@@ -120,55 +139,76 @@ pub fn clear_activation_pool() {
     BUF_POOL.with_borrow_mut(|p| {
         for ((dev, _), ptrs) in p.drain() {
             unsafe { cudaSetDevice(dev) };
-            for ptr in ptrs {
+            for (ptr, stage) in ptrs {
                 unsafe { cudaFree(ptr) };
+                if !stage.is_null() {
+                    unsafe { cudaFreeHost(stage) };
+                }
             }
         }
     });
 }
 
-/// A device buffer (pooled). `len` is the requested length; `class` the
-/// size class (next power of two ≥ len) used for pooling.
+extern "C" {
+    fn cudaMallocHost(ptr: *mut *mut std::ffi::c_void, bytes: usize) -> i32;
+    fn cudaFreeHost(ptr: *mut std::ffi::c_void) -> i32;
+}
+
+/// A device buffer (pooled) with its pinned host stage. `len` is the
+/// requested length; `class` the size class (next power of two ≥ len).
 struct DevBuf {
     ptr: *mut std::ffi::c_void,
     len: usize,
     class: u32,
     dev: i32,
     stream: CuStream,
+    /// Pinned host staging (cudaMallocHost) — the fixed-address rendezvous
+    /// for graph-capturable H2D/D2H (see the module comment above).
+    stage: *mut std::ffi::c_void,
 }
 
 impl DevBuf {
-    /// Pooled alloc: reuse a released buffer of the same size class when
-    /// available, else cudaMalloc. The caller must have `enter()`ed the
-    /// backend's device (alloc binds to the current device).
+    /// Pooled alloc: reuse a released (device, stage) pair of the same size
+    /// class when available, else cudaMalloc + cudaMallocHost. The caller
+    /// must have `enter()`ed the backend's device.
     fn alloc(dev: i32, stream: CuStream, len: usize) -> Result<Self> {
         let class = (len.max(1) as u32).next_power_of_two();
-        if let Some(ptr) = buf_pool_take(dev, class) {
-            return Ok(DevBuf { ptr, len, class, dev, stream });
+        if let Some((ptr, stage)) = buf_pool_take(dev, class) {
+            return Ok(DevBuf { ptr, len, class, dev, stream, stage });
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
-        Ok(DevBuf { ptr, len, class, dev, stream })
+        let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "pinned stage malloc")?;
+        Ok(DevBuf { ptr, len, class, dev, stream, stage })
     }
-    /// Async H2D on this buffer's stream — ordering is guaranteed by
-    /// stream submission order; the op tail sync (before the CPU reads the
-    /// output tensor) is the only synchronisation point left.
+    /// H2D via the pinned stage — graph-capturable: the CPU copy into the
+    /// stage happens outside any graph; the recorded memcpy moves
+    /// stage→device at fixed addresses on both ends.
     fn upload(&self, host: &[f32]) -> Result<()> {
         assert!(host.len() <= self.len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(host.as_ptr(), self.stage as *mut f32, host.len());
+        }
         ck(unsafe {
-            cudaMemcpyAsync(self.ptr, host.as_ptr() as *const _, host.len() * 4, CUDA_MEMCPY_H2D, self.stream)
+            cudaMemcpyAsync(self.ptr, self.stage, host.len() * 4, CUDA_MEMCPY_H2D, self.stream)
         }, "memcpy H2D")
     }
-    /// Async D2H followed by a stream sync — the ONLY synchronisation point
-    /// of an op (the CPU must read the tensor right after; keeping it inside
-    /// lets every run_* drop its mid-op sync, so a pipeline of upload→kernel→
-    /// download submits fully asynchronously and synchronises once).
+    /// D2H via the pinned stage; synchronises the stream (the op tail) —
+    /// EXCEPT during capture, when sync is illegal and the graph's
+    /// end_verify does the single tail sync instead.
     fn download(&self, host: &mut [f32]) -> Result<()> {
         assert!(host.len() <= self.len);
         ck(unsafe {
-            cudaMemcpyAsync(host.as_mut_ptr() as *mut _, self.ptr, host.len() * 4, CUDA_MEMCPY_D2H, self.stream)
+            cudaMemcpyAsync(self.stage, self.ptr, host.len() * 4, CUDA_MEMCPY_D2H, self.stream)
         }, "memcpy D2H")?;
-        ck(unsafe { cudaStreamSynchronize(self.stream) }, "sync after D2H")
+        if !CAPTURING.with(|c| c.get()) {
+            ck(unsafe { cudaStreamSynchronize(self.stream) }, "sync after D2H")?;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.stage as *const f32, host.as_mut_ptr(), host.len());
+        }
+        Ok(())
     }
     fn as_f32(&self) -> *mut f32 {
         self.ptr as *mut f32
@@ -179,10 +219,10 @@ impl DevBuf {
 }
 
 impl Drop for DevBuf {
-    /// Return the buffer to the per-device pool instead of cudaFree.
+    /// Return the (device, stage) pair to the pool instead of freeing.
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            buf_pool_release(self.dev, self.class, self.ptr);
+            buf_pool_release(self.dev, self.class, self.ptr, self.stage);
         }
     }
 }
@@ -582,11 +622,13 @@ impl crate::graph::GraphCapable for CudaBackend {
         if r != 0 {
             panic!("cuStreamBeginCapture failed: {r}");
         }
+        set_capturing(true);
         let mut g = self.graph.lock().unwrap();
         g.capturing = true;
     }
 
     fn end_capture(&self) -> crate::graph::OpTrace {
+        set_capturing(false);
         let api = DriverApi::get().expect("libcuda not loadable");
         let mut graph: *mut std::ffi::c_void = std::ptr::null_mut();
         let r = unsafe { (api.cuStreamEndCapture)(self.stream, &mut graph) };
