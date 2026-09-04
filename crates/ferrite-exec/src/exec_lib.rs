@@ -801,20 +801,13 @@ impl<B: KernelBackend> Engine<B> {
     }
 
     fn expert_ffn_impl(&self, x: &Tensor, pfx: &str, inter: usize, out: &mut Tensor) -> Result<()> {
-        let n = x.shape.0[0];
-        let gate = self.project(x, &format!("{pfx}.gate_proj.weight"))?;
-        let up = self.project(x, &format!("{pfx}.up_proj.weight"))?;
-        let mut gate_up = Tensor::zeros(Shape::new([n, 2 * inter]), x.dtype);
-        let gu = std::sync::Arc::get_mut(&mut gate_up.data).unwrap();
-        for t in 0..n {
-            gu[t * 2 * inter..t * 2 * inter + inter].copy_from_slice(&gate.as_slice()[t * inter..(t + 1) * inter]);
-            gu[t * 2 * inter + inter..(t + 1) * 2 * inter].copy_from_slice(&up.as_slice()[t * inter..(t + 1) * inter]);
-        }
-        let mut act = Tensor::zeros(Shape::new([n, inter]), x.dtype);
-        self.backend.swiglu_limited(&gate_up, self.cfg.swiglu_limit, &mut act)?;
-        let down = self.project(&act, &format!("{pfx}.down_proj.weight"))?;
-        let od = std::sync::Arc::get_mut(&mut out.data).unwrap();
-        od.copy_from_slice(down.as_slice());
+        // Fused device-resident chain (KernelBackend::expert_ffn): one upload,
+        // 2 matmuls + swiglu + 1 matmul on device, one download. The old path
+        // did 3 separate project calls (6 PCIe round-trips per expert).
+        let gate_w = self.w(&format!("{pfx}.gate_proj.weight"))?;
+        let up_w = self.w(&format!("{pfx}.up_proj.weight"))?;
+        let down_w = self.w(&format!("{pfx}.down_proj.weight"))?;
+        self.backend.expert_ffn(x, gate_w, up_w, down_w, self.cfg.swiglu_limit, out)?;
         Ok(())
     }
 }
