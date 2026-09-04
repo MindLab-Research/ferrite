@@ -1742,3 +1742,27 @@ extern "C" cudaError_t ferrite_graph_launch(cudaGraphExec_t e, cudaStream_t s) {
 extern "C" cudaError_t ferrite_graph_destroy_exec(cudaGraphExec_t e) {
     return cudaGraphExecDestroy(e);
 }
+
+// DSA t0/total device counter: a captured graph FREEZES kernel arguments,
+// so t0 (the KV append slot) and total (context length) as parameters
+// would make every replay write the same slot. This mini kernel runs FIRST
+// in the graph: it reads the persistent counter and writes t0/total to a
+// fixed device location that subsequent kernels dereference.
+__global__ void dsa_t0_counter_kernel(
+    int* __restrict__ counter,   // persistent: holds next t0 (incremented by this kernel)
+    int* __restrict__ t0_out,    // written: this call's t0
+    int* __restrict__ total_out, // written: this call's total = t0 + n
+    int n) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int t0 = *counter;
+        *t0_out = t0;
+        *total_out = t0 + n;
+        *counter = t0 + n;
+    }
+}
+
+extern "C" cudaError_t ferrite_dsa_t0_counter(
+    int* counter, int* t0_out, int* total_out, int n, cudaStream_t s) {
+    dsa_t0_counter_kernel<<<1, 1, 0, s>>>(counter, t0_out, total_out, n);
+    return cudaGetLastError();
+}
