@@ -105,6 +105,59 @@ extern "C" cudaError_t ferrite_matmul_naive(const float* x, const float* w,
 }
 
 // ============================================================
+// bf16-resident weight matmul: weights live on the device in bf16
+// (half the HBM footprint of f32 — a 285GB/TP4-rank f32 shard does not
+// fit a 275GB B300; bf16 fits with 130GB to spare). x/out stay f32:
+// the activation pipeline is unchanged, only the weight layout differs.
+// w rows are __nv_bfloat16 (PyTorch-style bf16 = f32 high bits).
+// ============================================================
+#include <cuda_bf16.h>
+__global__ void matmul_tiled_bf16_kernel(const float* __restrict__ x,
+                                         const __nv_bfloat16* __restrict__ w,
+                                         const float* __restrict__ bias,
+                                         float* __restrict__ out,
+                                         int n, int in_f, int out_f) {
+    __shared__ float sx[FERRITE_TILE][FERRITE_TILE + 1];
+    __shared__ float sw[FERRITE_TILE][FERRITE_TILE + 1];
+    int row = blockIdx.y * FERRITE_TILE + threadIdx.y;
+    int col = blockIdx.x * FERRITE_TILE + threadIdx.x;
+    float acc = (bias && col < out_f) ? bias[col] : 0.0f;
+    int tiles = (in_f + FERRITE_TILE - 1) / FERRITE_TILE;
+    for (int t = 0; t < tiles; t++) {
+        int k = t * FERRITE_TILE;
+        sx[threadIdx.y][threadIdx.x] =
+            (row < n && k + threadIdx.x < in_f)
+                ? x[(size_t)row * in_f + k + threadIdx.x]
+                : 0.0f;
+        // w stored bf16 per row-major [out_f, in_f]; convert on smem load
+        sw[threadIdx.x][threadIdx.y] =
+            (col < out_f && k + threadIdx.y < in_f)
+                ? __bfloat162float(w[(size_t)col * in_f + k + threadIdx.y])
+                : 0.0f;
+        __syncthreads();
+#pragma unroll
+        for (int l = 0; l < FERRITE_TILE; l++) {
+            acc += sx[threadIdx.y][l] * sw[threadIdx.x][l];
+        }
+        __syncthreads();
+    }
+    if (row < n && col < out_f) out[(size_t)row * out_f + col] = acc;
+}
+
+extern "C" cudaError_t ferrite_matmul_bf16(const float* x, const void* w,
+                                           const float* bias, float* out,
+                                           int n, int in_f, int out_f,
+                                           cudaStream_t s) {
+    if (n <= 0 || out_f <= 0) return cudaSuccess;
+    dim3 block(FERRITE_TILE, FERRITE_TILE);
+    dim3 grid((out_f + FERRITE_TILE - 1) / FERRITE_TILE,
+              (n + FERRITE_TILE - 1) / FERRITE_TILE);
+    matmul_tiled_bf16_kernel<<<grid, block, 0, s>>>(
+        x, (const __nv_bfloat16*)w, bias, out, n, in_f, out_f);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // rmsnorm over the last dim: y = x / rms(x) * w
 // ============================================================
 __global__ void rmsnorm_kernel(const float* __restrict__ x,

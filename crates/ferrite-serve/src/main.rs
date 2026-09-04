@@ -141,6 +141,38 @@ fn run_cuda(
             .unwrap_or_else(|e| panic!("cuda backend rank {rank}: {e}"))
     });
     println!("[serve] cuda TP cluster up: {world} rank(s)");
+
+    // Weights resident on the GPU (TileRT model): upload every shard's
+    // full weight set once at startup — bf16 for 2-D matmul weights
+    // (~142GB/rank at TP4 vs 285GB f32 which does not fit a 275GB B300),
+    // f32 for 1-D (norms/logdecay/biases). After this, per-op traffic is
+    // activations only.
+    {
+        let t0 = std::time::Instant::now();
+        for (rank, shard) in cluster.shards.iter().enumerate() {
+            let mut n_2d = 0usize;
+            let mut n_1d = 0usize;
+            for (_name, t) in shard.weights.iter() {
+                shard
+                    .backend
+                    .preload_weight(t)
+                    .unwrap_or_else(|e| panic!("preload rank {rank} weight {_name}: {e}"));
+                if t.shape.0.len() >= 2 {
+                    n_2d += 1;
+                } else {
+                    n_1d += 1;
+                }
+            }
+            println!(
+                "[serve] rank {rank}: {n_2d} x2d (bf16-resident) + {n_1d} x1d (f32) weights on device"
+            );
+        }
+        println!(
+            "[serve] weights resident in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
+    }
+
     let seq = 1u64;
     cluster
         .prefill_chunk(seq, ids)

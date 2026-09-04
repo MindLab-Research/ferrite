@@ -50,7 +50,7 @@ fn cuda_smoke_all_ops() {
     let mut o_cpu = Tensor::zeros(Shape::new([4, 6]), DType::F32);
     dev.matmul(&x, &w, None, &mut o_gpu).unwrap();
     cpu.matmul(&x, &w, None, &mut o_cpu).unwrap();
-    close(&o_gpu, &o_cpu, 1e-4, "matmul");
+    close(&o_gpu, &o_cpu, 5e-3, "matmul"); // bf16-resident weights (f32 truncation ~2^-8 rel)
 
     // ---- rmsnorm [11, 4096] ----
     let (n, dim) = (11usize, 4096usize);

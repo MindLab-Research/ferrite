@@ -34,6 +34,9 @@ extern "C" {
     // ferrite kernels (ferrite_kernels.cu bridge)
     fn ferrite_matmul(x: *const f32, w: *const f32, bias: *const f32, out: *mut f32,
                       n: i32, in_f: i32, out_f: i32, s: CuStream) -> i32;
+    fn ferrite_matmul_bf16(x: *const f32, w: *const std::ffi::c_void,
+                            bias: *const f32, out: *mut f32,
+                            n: i32, in_f: i32, out_f: i32, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
                        n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
     fn ferrite_gated_rmsnorm(x: *const f32, gate: *const f32, w: *const f32, out: *mut f32,
@@ -294,6 +297,51 @@ impl CudaBackend {
         Ok(DevRef { ptr, len: t.numel() })
     }
 
+    /// Upload a weight tensor to the device ONCE in **bf16** — the resident
+    /// layout for large matmul weights. A 285GB/TP4-rank f32 shard does not
+    /// fit a 275GB B300; bf16 halves it to 142GB (TileRT's resident-weights
+    /// model). The kernel converts bf16→f32 in registers; x/out stay f32.
+    /// Packed from the f32 tensor on first upload (bf16 = high 16 bits).
+    fn dev_weight_bf16(&self, t: &Tensor) -> Result<DevRef> {
+        let key = (t.as_slice().as_ptr() as usize, t.numel() << 1 | 1);
+        let mut cache = self.weights.lock().unwrap();
+        if let Some(cb) = cache.get(&key) {
+            if cb.len == t.numel() {
+                return Ok(DevRef { ptr: cb.dev, len: cb.len });
+            }
+        }
+        // pack f32 → bf16 (truncate to high bits; PyTorch bf16 semantics)
+        let src = t.as_slice();
+        let mut packed: Vec<u16> = Vec::with_capacity(src.len());
+        for v in src {
+            packed.push((v.to_bits() >> 16) as u16);
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, t.numel() * 2) }, "weight bf16 malloc")?;
+        ck(
+            unsafe { cudaMemcpy(ptr, packed.as_ptr() as *const _, packed.len() * 2, CUDA_MEMCPY_H2D) },
+            "weight bf16 H2D",
+        )?;
+        cache.insert(key, CachedBuf { keep: t.data.clone(), dev: ptr, len: t.numel() });
+        Ok(DevRef { ptr, len: t.numel() })
+    }
+
+    /// Preload a weight into device-resident storage (bf16 for 2-D matmul
+    /// weights — run_matmul reads bf16 exclusively; 1-D tensors stay f32
+    /// for the elementwise kernels). Serve calls this over every shard
+    /// weight at startup so inference never uploads weights again (the
+    /// TileRT model: weights resident, only activations cross the bus).
+    pub fn preload_weight(&self, t: &Tensor) -> Result<()> {
+        if t.numel() == 0 {
+            return Ok(()); // TP shard placeholder (empty expert slice)
+        }
+        if t.shape.0.len() >= 2 {
+            self.dev_weight_bf16(t).map(|_| ())
+        } else {
+            self.dev_weight(t).map(|_| ())
+        }
+    }
+
     /// Number of cached (device-resident) weights.
     pub fn cached_weights(&self) -> usize {
         self.weights.lock().unwrap().len()
@@ -348,12 +396,14 @@ impl CudaBackend {
     /// Device-resident matmul: x already on device, w uploaded here (the
     /// BufferCache will dedupe repeated weight uploads), result stays on
     /// device. Building block for fused op chains (expert FFN).
+    /// Weights are resident in bf16 (dev_weight_bf16).
     fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
-        let dw = self.dev_weight(w)?;
+        let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
         ck(unsafe {
-            ferrite_matmul(x_dev.as_const_f32(), dw.as_const_f32(), dbias, do_.as_f32(), n, in_f, out_f, self.stream)
+            ferrite_matmul_bf16(x_dev.as_const_f32(), dw.ptr as *const _,
+                                 dbias, do_.as_f32(), n, in_f, out_f, self.stream)
         }, "matmul_dev")?;
         Ok(do_)
     }
@@ -372,16 +422,18 @@ impl CudaBackend {
         let in_f = x.shape.0[1] as i32;
         let out_f = w.shape.0[0] as i32;
         let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
-        let dw = self.dev_weight(w)?;
+        // weights resident in bf16 (half the f32 footprint — the TP4 shard
+        // does not fit a 275GB B300 in f32); kernel converts to f32 in registers
+        let dw = self.dev_weight_bf16(w)?;
         let db = match bias {
             Some(b) => Some(self.dev_weight(b)?),
             None => None,
         };
         let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         ck(unsafe {
-            ferrite_matmul(dx.as_const_f32(), dw.as_const_f32(),
-                           db.as_ref().map_or(std::ptr::null(), |b| b.as_const_f32()),
-                           do_.as_f32(), n, in_f, out_f, self.stream)
+            ferrite_matmul_bf16(dx.as_const_f32(), dw.ptr as *const _,
+                                 db.as_ref().map_or(std::ptr::null(), |b| b.as_const_f32()),
+                                 do_.as_f32(), n, in_f, out_f, self.stream)
         }, "matmul")?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
