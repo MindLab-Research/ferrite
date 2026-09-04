@@ -1594,7 +1594,9 @@ __global__ void dsa_cache_append_kernel(
     float* __restrict__ v,           // [T_total, h, dv]
     float* __restrict__ k_idx,       // [T_total, idm]
     float* __restrict__ k_gate,      // [T_total, idm]
-    int t0, int n, int h, int dk, int dv, int idm) {
+    const int* __restrict__ t0_ptr,  // pinned memory (graph-safe: CPU writes before each replay)
+    int n, int h, int dk, int dv, int idm) {
+    int t0 = *t0_ptr; // zero-copy read from pinned host memory
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     int row_bytes = h * (dk + dv);
     int total_elems = n * row_bytes;
@@ -1621,12 +1623,12 @@ __global__ void dsa_cache_append_kernel(
 extern "C" cudaError_t ferrite_dsa_cache_append(
     const float* kvb, const float* ki, const float* gate,
     float* k_nope, float* v, float* k_idx, float* k_gate,
-    int t0, int n, int h, int dk, int dv, int idm, cudaStream_t s) {
+    const int* t0_ptr, int n, int h, int dk, int dv, int idm, cudaStream_t s) {
     int total = n * h * (dk + dv) + 2 * n * idm;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
     dsa_cache_append_kernel<<<blocks, threads, 0, s>>>(
-        kvb, ki, gate, k_nope, v, k_idx, k_gate, t0, n, h, dk, dv, idm);
+        kvb, ki, gate, k_nope, v, k_idx, k_gate, t0_ptr, n, h, dk, dv, idm);
     return cudaGetLastError();
 }
 
@@ -1635,7 +1637,9 @@ __global__ void kpool_compress_kernel(
     const float* __restrict__ k_gate,  // [total, idm]
     const float* __restrict__ ape,     // [kpool, idm]
     float* __restrict__ pool_keys,     // [npools, idm]
-    int total, int npools, int kpool, int idm) {
+    const int* __restrict__ total_ptr, // pinned (graph-safe)
+    int npools, int kpool, int idm) {
+    int total = *total_ptr;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= (int)((size_t)npools * idm)) return;
     int p = tid / idm, d = tid % idm;
@@ -1662,13 +1666,13 @@ __global__ void kpool_compress_kernel(
 
 extern "C" cudaError_t ferrite_kpool_compress(
     const float* k_idx, const float* k_gate, const float* ape,
-    float* pool_keys, int total, int npools, int kpool, int idm,
+    float* pool_keys, const int* total_ptr, int npools, int kpool, int idm,
     cudaStream_t s) {
     size_t total_t = (size_t)npools * idm;
     int threads = 256;
     int blocks = (int)((total_t + threads - 1) / threads);
     kpool_compress_kernel<<<blocks, threads, 0, s>>>(
-        k_idx, k_gate, ape, pool_keys, total, npools, kpool, idm);
+        k_idx, k_gate, ape, pool_keys, total_ptr, npools, kpool, idm);
     return cudaGetLastError();
 }
 

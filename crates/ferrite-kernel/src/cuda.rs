@@ -44,10 +44,10 @@ extern "C" {
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
                                  k_nope: *mut f32, v: *mut f32, k_idx: *mut f32, k_gate: *mut f32,
-                                 t0: i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
+                                 t0_ptr: *const i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
                                  s: CuStream) -> i32;
     fn ferrite_kpool_compress(k_idx: *const f32, k_gate: *const f32, ape: *const f32,
-                               pool_keys: *mut f32, total: i32, npools: i32, kpool: i32,
+                               pool_keys: *mut f32, total_ptr: *const i32, npools: i32, kpool: i32,
                                idm: i32, s: CuStream) -> i32;
     fn ferrite_pool_expand(idx_pools: *const f32, idx: *mut f32,
                             n: i32, select_k: i32, kpool: i32, npools: i32, total: i32,
@@ -1203,6 +1203,11 @@ pub struct DsaCacheState {
     pub max_tokens: usize,
     /// tokens appended so far (device-side counter; the CPU Vecs are gone)
     pub t_count: usize,
+    /// PINNED t0/total (graph-safe): the CPU writes these before each
+    /// graph replay; kernels read them zero-copy from host memory.
+    /// [t0, total] — 2 ints, cudaMallocHost'd.
+    pub pinned_t0: *mut i32,
+    pub pinned_total: *mut i32,
 }
 unsafe impl Send for DsaCacheState {}
 unsafe impl Sync for DsaCacheState {}
@@ -1507,9 +1512,15 @@ impl CudaBackend {
                 let vv = self.dsa_alloc(max_tokens * h * dv)?;
                 let ki_ = self.dsa_alloc(max_tokens * idm)?;
                 let kg = self.dsa_alloc(max_tokens * idm)?;
+                // pinned t0/total (graph-safe zero-copy)
+                let mut pt0: *mut i32 = std::ptr::null_mut();
+                let mut ptot: *mut i32 = std::ptr::null_mut();
+                ck(unsafe { cudaMallocHost(&mut pt0 as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "pinned t0")?;
+                ck(unsafe { cudaMallocHost(&mut ptot as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "pinned total")?;
+                unsafe { *pt0 = 0; *ptot = 0; }
                 m.insert(
                     (seq, family),
-                    DsaCacheState { k_nope: kn, v: vv, k_idx: ki_, k_gate: kg, max_tokens, t_count: n },
+                    DsaCacheState { k_nope: kn, v: vv, k_idx: ki_, k_gate: kg, max_tokens, t_count: n, pinned_t0: pt0, pinned_total: ptot },
                 );
                 (kn, vv, ki_, kg, 0)
             } else {
@@ -1517,12 +1528,23 @@ impl CudaBackend {
                 (ptrs.0, ptrs.1, ptrs.2, ptrs.3, t0)
             }
         };
+        // Write t0/total to pinned memory (graph-safe: kernels read zero-copy,
+        // CPU writes before each replay)
+        let (pinned_t0, pinned_total) = {
+            let m = self.dsa_caches.lock().unwrap();
+            let c = m.get(&(seq, family)).unwrap();
+            unsafe {
+                *c.pinned_t0 = t0 as i32;
+                *c.pinned_total = (t0 + n) as i32;
+            }
+            (c.pinned_t0 as *const i32, c.pinned_total as *const i32)
+        };
         ck(
             unsafe {
                 ferrite_dsa_cache_append(
                     kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
                     k_nope_dev as *mut f32, v_dev as *mut f32, k_idx_dev as *mut f32, k_gate_dev as *mut f32,
-                    t0 as i32, ni, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
+                    pinned_t0, ni, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
                 )
             },
             "dsa_cache_append",
@@ -1537,7 +1559,7 @@ impl CudaBackend {
             unsafe {
                 ferrite_kpool_compress(
                     k_idx_dev as *const f32, k_gate_dev as *const f32, dape.as_const_f32(), pool_keys.as_f32(),
-                    total as i32, npools as i32, kpool as i32, idm as i32, self.stream,
+                    pinned_total, npools as i32, kpool as i32, idm as i32, self.stream,
                 )
             },
             "dsa_kpool",
