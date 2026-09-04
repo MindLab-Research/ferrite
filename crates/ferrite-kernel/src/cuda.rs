@@ -165,21 +165,22 @@ fn pool() -> &'static std::sync::Mutex<
     BUF_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// True while ANY thread is inside a stream capture (THREAD_LOCAL mode).
-/// GLOBAL (AtomicBool): fan_out worker threads must also skip sync —
-/// the capture runs on the main thread but rank threads' ops land on
-/// their own streams; a cudaStreamSynchronize on the CAPTURING stream
-/// from any thread invalidates the graph (error 901).
-/// Download skips its synchronisation then — cudaStreamSynchronize is
-/// illegal mid-capture; the graph's end_verify syncs once at the tail.
-static CAPTURING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// True while THIS thread is inside a stream capture. THREAD-LOCAL: the
+/// per-layer graphs capture inside fan_out workers — 4 ranks capture
+/// concurrently and each ends independently; a GLOBAL flag would let the
+/// first finisher re-enable sync for the others mid-capture (segfault).
+/// Download skips its synchronisation while capturing — the graph's
+/// end/replay syncs once at the tail.
+thread_local! {
+    static CAPTURING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 pub(crate) fn set_capturing(v: bool) {
-    CAPTURING.store(v, std::sync::atomic::Ordering::Relaxed);
+    CAPTURING.with(|c| c.set(v));
 }
 
 fn is_capturing() -> bool {
-    CAPTURING.load(std::sync::atomic::Ordering::Relaxed)
+    CAPTURING.with(|c| c.get())
 }
 
 fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void) {
