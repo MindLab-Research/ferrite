@@ -162,22 +162,27 @@ extern "C" {
 
 /// A device buffer (pooled) with its pinned host stage. `len` is the
 /// requested length; `class` the size class (next power of two ≥ len).
-struct DevBuf {
-    ptr: *mut std::ffi::c_void,
-    len: usize,
-    class: u32,
-    dev: i32,
-    stream: CuStream,
+///
+/// PUBLIC: the device-resident op-chain phase (whole-layer DevBuf pipelines
+/// feeding a single CUDA graph) composes ops at this level — matmul_dev and
+/// friends take/return DevBuf so activations never cross the bus inside a
+/// layer.
+pub struct DevBuf {
+    pub ptr: *mut std::ffi::c_void,
+    pub len: usize,
+    pub class: u32,
+    pub dev: i32,
+    pub stream: CuStream,
     /// Pinned host staging (cudaMallocHost) — the fixed-address rendezvous
     /// for graph-capturable H2D/D2H (see the module comment above).
-    stage: *mut std::ffi::c_void,
+    pub stage: *mut std::ffi::c_void,
 }
 
 impl DevBuf {
     /// Pooled alloc: reuse a released (device, stage) pair of the same size
     /// class when available, else cudaMalloc + cudaMallocHost. The caller
     /// must have `enter()`ed the backend's device.
-    fn alloc(dev: i32, stream: CuStream, len: usize) -> Result<Self> {
+    pub fn alloc(dev: i32, stream: CuStream, len: usize) -> Result<Self> {
         let class = (len.max(1) as u32).next_power_of_two();
         if let Some((ptr, stage)) = buf_pool_take(dev, class) {
             return Ok(DevBuf { ptr, len, class, dev, stream, stage });
@@ -191,7 +196,7 @@ impl DevBuf {
     /// H2D via the pinned stage — graph-capturable: the CPU copy into the
     /// stage happens outside any graph; the recorded memcpy moves
     /// stage→device at fixed addresses on both ends.
-    fn upload(&self, host: &[f32]) -> Result<()> {
+    pub fn upload(&self, host: &[f32]) -> Result<()> {
         assert!(host.len() <= self.len);
         unsafe {
             std::ptr::copy_nonoverlapping(host.as_ptr(), self.stage as *mut f32, host.len());
@@ -203,7 +208,7 @@ impl DevBuf {
     /// D2H via the pinned stage; synchronises the stream (the op tail) —
     /// EXCEPT during capture, when sync is illegal and the graph's
     /// end_verify does the single tail sync instead.
-    fn download(&self, host: &mut [f32]) -> Result<()> {
+    pub fn download(&self, host: &mut [f32]) -> Result<()> {
         assert!(host.len() <= self.len);
         ck(unsafe {
             cudaMemcpyAsync(self.stage, self.ptr, host.len() * 4, CUDA_MEMCPY_D2H, self.stream)
@@ -216,10 +221,10 @@ impl DevBuf {
         }
         Ok(())
     }
-    fn as_f32(&self) -> *mut f32 {
+    pub fn as_f32(&self) -> *mut f32 {
         self.ptr as *mut f32
     }
-    fn as_const_f32(&self) -> *const f32 {
+    pub fn as_const_f32(&self) -> *const f32 {
         self.ptr as *const f32
     }
 }
@@ -253,7 +258,7 @@ struct DevRef {
 }
 
 impl DevRef {
-    fn as_const_f32(&self) -> *const f32 {
+    pub fn as_const_f32(&self) -> *const f32 {
         self.ptr as *const f32
     }
 }
@@ -491,7 +496,7 @@ impl CudaBackend {
     /// BufferCache will dedupe repeated weight uploads), result stays on
     /// device. Building block for fused op chains (expert FFN).
     /// Weights are resident in bf16 (dev_weight_bf16).
-    fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
+    pub fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
@@ -503,7 +508,7 @@ impl CudaBackend {
     }
 
     /// Fused SwiGLU on device: reads two independent matmul outputs.
-    fn swiglu2_dev(&self, gate: &DevBuf, up: &DevBuf, n: i32, inter: i32, limit: f32) -> Result<DevBuf> {
+    pub fn swiglu2_dev(&self, gate: &DevBuf, up: &DevBuf, n: i32, inter: i32, limit: f32) -> Result<DevBuf> {
         let out = DevBuf::alloc(self.dev, self.stream, n as usize * inter as usize)?;
         ck(unsafe {
             ferrite_swiglu2(gate.as_const_f32(), up.as_const_f32(), out.as_f32(), n, inter, limit, self.stream)
