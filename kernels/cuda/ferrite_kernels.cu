@@ -1162,16 +1162,16 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
     for (int j = threadIdx.x; j < dk; j += blockDim.x) {
         int off = hd * dk + j;
         float qv = conv_row[off];
-        qv = qv / (1.0f + __expf(-qv)); // silu
+        qv = qv / (1.0f + expf(-qv)); // silu
         float kv = conv_row[proj + off];
-        kv = kv / (1.0f + __expf(-kv));
+        kv = kv / (1.0f + expf(-kv));
         float vv = conv_row[2 * proj + off];
-        vv = vv / (1.0f + __expf(-vv));
+        vv = vv / (1.0f + expf(-vv));
         sq[j] = qv; sk[j] = kv;
         ssq += qv * qv; ssk += kv * kv;
         // gate (per channel): lb * sigmoid(exp(a_log_h) * (fb + dt_bias))
         float g = fb[(size_t)t * proj + off] + dt_bias[off];
-        gate[((size_t)t * h + hd) * dk + j] = lb / (1.0f + __expf(-__expf(a_log[hd]) * g));
+        gate[((size_t)t * h + hd) * dk + j] = lb / (1.0f + expf(-expf(a_log[hd]) * g));
         // v passes through (silu'd)
         v[((size_t)t * h + hd) * dk + j] = vv;
     }
@@ -1184,7 +1184,8 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
     if (threadIdx.x == 0) {
         float a = 0.f, b = 0.f;
         for (int w = 0; w < 32; w++) { a += red[w]; b += red[32 + w]; }
-        red[60] = rsqrtf(a + 1e-12f); red[61] = rsqrtf(b + 1e-12f);
+        red[60] = (a >= 0.f && a < 1e38f) ? rsqrtf(a + 1e-12f) : 0.f;
+        red[61] = (b >= 0.f && b < 1e38f) ? rsqrtf(b + 1e-12f) : 0.f;
     }
     __syncthreads();
     nq = red[60]; nk = red[61];
@@ -1195,7 +1196,7 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
     }
     // beta = sigmoid(b_raw[t, head])
     if (threadIdx.x == 0) {
-        beta[(size_t)t * h + hd] = 1.0f / (1.0f + __expf(-b_raw[(size_t)t * h + hd]));
+        beta[(size_t)t * h + hd] = 1.0f / (1.0f + expf(-b_raw[(size_t)t * h + hd]));
     }
 }
 
