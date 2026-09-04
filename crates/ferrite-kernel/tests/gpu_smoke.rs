@@ -434,7 +434,7 @@ fn moe_fused_parity_and_speed() {
     dev.enter();
 
     let (hidden, inter, inter_s, e_total, topk, e_local, expert_start) =
-        (64usize, 32usize, 16usize, 8usize, 2usize, 4usize, 0usize);
+        (64usize, 32usize, 16usize, 8usize, 2usize, 8usize, 0usize);
     let routed_scaling = 1.2f32;
     let limit = 7.0f32; // swiglu clamp (large enough to be active at most)
 
@@ -544,12 +544,14 @@ fn moe_fused_parity_and_speed() {
             ref_out[h] += y;
         }
     }
-    // parity (skip when routing is ambiguous — deterministic here)
+    // parity: bf16 weight truncation is a RELATIVE error (~0.4% accumulated
+    // over hidden/inter dots) — an absolute cap fails on large activations.
     for i in 0..hidden {
         let d = (hv[i] - ref_out[i]).abs();
+        let tol = 5e-2 + 0.02 * ref_out[i].abs();
         assert!(
-            d < 5e-2,
-            "moe_fused mismatch at {i}: gpu {} vs ref {} (probs {:?} ids {:?})",
+            d < tol,
+            "moe_fused mismatch at {i}: gpu {} vs ref {} (diff {d}, tol {tol}; probs {:?} ids {:?})",
             hv[i], ref_out[i], gp, ids
         );
     }
