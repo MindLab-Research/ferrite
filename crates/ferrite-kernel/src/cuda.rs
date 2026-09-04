@@ -1327,52 +1327,11 @@ impl CudaBackend {
         // 3. shared expert: x → gate/up/swiglu/down → shared_out [n, hidden]
         let shared_gate = self.matmul_dev(x_dev, shared.gate, ni, hi, shared.gate.shape.0[0] as i32)?;
         let shared_up = self.matmul_dev(x_dev, shared.up, ni, hi, shared.up.shape.0[0] as i32)?;
-        let shared_inter = shared_gate.shape.0[0] as i32 / 1; // gate and up have same inter
+        let shared_inter = shared.gate.shape.0[0] as i32; // gate/up have same inter
         let shared_act = self.swiglu2_dev(&shared_gate, &shared_up, ni, shared_inter, swiglu_limit)?;
         let shared_out = self.matmul_dev(&shared_act, shared.down, ni, shared_inter, hi)?;
 
-        // 4. routed experts: for each expert in this rank's slice,
-        //    compute expert(x) and accumulate weighted sum.
-        //    For n=1 (decode): 1 token, topk=8 experts → at most 8 expert calls.
-        //    For graph capture: we run ALL experts in the rank's slice (not just
-        //    the selected ones) and zero out non-selected contributions via
-        //    the weighted sum kernel. This makes the graph shape-static.
-        //
-        //    expert_outs: [n, topk, hidden] — each slot is the output of one
-        //    selected expert (or zeros if not selected).
-        let e_count = experts.len();
-        let mut expert_outs = DevBuf::alloc(self.dev, self.stream, n * topk * hidden)?;
-
-        // Download ids to CPU for expert selection (small: n × topk × 4 bytes)
-        // For CUDA graph: this must be replaced with a GPU-side gather.
-        // For now: CPU-side expert dispatch (still saves the per-expert H2D).
-        let mut ids_host = vec![0f32; n * topk];
-        dprobs.download(&mut probs_host_placeholder)?; // probs to caller
-        dids.download(&mut ids_host)?;
-
-        for t in 0..n {
-            for j in 0..topk {
-                let eid = ids_host[t * topk + j] as usize;
-                let local = eid.saturating_sub(expert_start);
-                if local < e_count {
-                    let w = &experts[local];
-                    let gate = self.matmul_dev(x_dev, w.gate, ni, hi, w.gate.shape.0[0] as i32)?;
-                    let up = self.matmul_dev(x_dev, w.up, ni, hi, w.up.shape.0[0] as i32)?;
-                    let inter = w.gate.shape.0[0] as i32;
-                    let act = self.swiglu2_dev(&gate, &up, ni, inter, swiglu_limit)?;
-                    let dout = self.matmul_dev(&act, w.down, ni, inter, hi)?;
-                    // copy dout → expert_outs[t, j, :]
-                    // (for CUDA graph: use a device-side copy kernel)
-                    // For now: accumulate weighted sum directly
-                    // TODO: copy to expert_outs slot for the weighted sum kernel
-                }
-            }
-        }
-
-        // 5. weighted sum: out[t, h] = Σ_j probs[t, j] * expert_outs[t, j, h] + shared
-        let out = DevBuf::alloc(self.dev, self.stream, n * hidden)?;
-        // TODO: use ferrite_moe_weighted_sum kernel
-        // For now: return shared_out as placeholder
+        // For now: return shared expert output as the base (routed experts TODO below)
         Ok(shared_out)
     }
 }
