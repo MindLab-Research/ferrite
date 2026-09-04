@@ -1,0 +1,189 @@
+//! ferrite-serve: load the real GLM-5.3-Flash checkpoint and run inference.
+//!
+//! Usage:
+//!   ferrite-serve --model-dir /path/to/GLM-5.3-Flash [--max-tokens N]
+//!                 [--backend cpu|cuda] [--tp N] [--lib /path/libferrite_kernels.so]
+//!                 [--prompt "..."]
+//!
+//! CPU: single-process Engine (f32, needs ~700 GB RAM).
+//! CUDA: TP=N cluster — one CudaBackend per GPU (device = rank), weights
+//! sharded by shard_weights_tp, per-layer all-reduce via the TpCluster.
+
+use std::path::PathBuf;
+
+use ferrite_model::{load_hf_checkpoint, Glm53FlashConfig};
+
+/// GLM chat format: <|prompt|>\n...<|im_end|>\n<|answer|>\n
+/// (token ids resolved from the tokenizer; falls back to raw text).
+fn wrap_prompt(text: &str) -> String {
+    format!("<|user|>\n{text}</s>\n<|assistant|>\n")
+}
+
+fn main() {
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut get_arg = |name: &str, default: &str| -> String {
+        if let Some(p) = args.iter().position(|a| a == name) {
+            if p + 1 < args.len() {
+                let v = args[p + 1].clone();
+                args.drain(p..=p + 1);
+                return v;
+            }
+        }
+        default.to_string()
+    };
+    let model_dir = PathBuf::from(get_arg("--model-dir", "."));
+    let max_tokens: usize = get_arg("--max-tokens", "32").parse().unwrap_or(32);
+    let backend = get_arg("--backend", "cpu");
+    let tp: usize = get_arg("--tp", "8").parse().unwrap_or(8);
+    let lib = get_arg("--lib", "kernels/cuda/libferrite_kernels.so");
+    let prompt = get_arg("--prompt", "你好，介绍一下你自己。");
+
+    // ---- config ----
+    let cfg_path = model_dir.join("config.json");
+    let cfg_str = std::fs::read_to_string(&cfg_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", cfg_path.display()));
+    let cfg = Glm53FlashConfig::from_json_str(&cfg_str)
+        .unwrap_or_else(|e| panic!("parse config.json: {e}"));
+    println!(
+        "[serve] config ok: {} layers, vocab {}",
+        cfg.num_hidden_layers, cfg.vocab_size,
+    );
+
+    // ---- weights (FP8 dequant + name mapping; large, ~660 GB f32 in RAM) ----
+    println!("[serve] loading checkpoint from {} ...", model_dir.display());
+    let t0 = std::time::Instant::now();
+    let (weights, rep) = load_hf_checkpoint(&model_dir, &cfg)
+        .unwrap_or_else(|e| panic!("load checkpoint: {e}"));
+    println!(
+        "[serve] loaded {} tensors in {:.1}s (fp8-dequant: {}, fused: {}, skipped: {})",
+        rep.tensors_loaded,
+        t0.elapsed().as_secs_f32(),
+        rep.fp8_dequantized,
+        rep.fused_concat,
+        rep.skipped_unsupported.len(),
+    );
+    println!("[serve] mem RSS after load: {:.1} GB", rss_gb());
+
+    // ---- tokenizer ----
+    let tok_path = model_dir.join("tokenizer.json");
+    let tok = tokenizers::Tokenizer::from_file(tok_path)
+        .unwrap_or_else(|e| panic!("load tokenizer: {e}"));
+    let enc = tok
+        .encode(wrap_prompt(&prompt), false)
+        .unwrap_or_else(|e| panic!("encode: {e}"));
+    let ids: Vec<u32> = enc.get_ids().to_vec();
+    println!("[serve] prompt: {n} tokens", n = ids.len());
+
+    // ---- inference ----
+    let eos = 154820u32; // primary <|end|> from generation_config.json
+    let t1 = std::time::Instant::now();
+    let world_tp = if backend == "cuda" { tp } else { 1 };
+    let new_tokens: Vec<u32> = match backend.as_str() {
+        "cuda" => run_cuda(cfg, weights, &ids, max_tokens, eos, &lib, world_tp),
+        _ => run_cpu(cfg, weights, &ids, max_tokens, eos),
+    };
+    let dt = t1.elapsed().as_secs_f64();
+    let text = tok
+        .decode(&new_tokens, false)
+        .unwrap_or_else(|e| panic!("decode: {e}"));
+    println!(
+        "[serve] generated {} tokens in {dt:.1}s ({:.2} tok/s)",
+        new_tokens.len(),
+        new_tokens.len() as f64 / dt.max(1e-9)
+    );
+    println!("---- output ----");
+    println!("{text}");
+}
+
+/// Single-process CPU inference (CpuBackend, f32).
+fn run_cpu(
+    cfg: Glm53FlashConfig,
+    weights: ferrite_model::Weights,
+    ids: &[u32],
+    max_tokens: usize,
+    eos: u32,
+) -> Vec<u32> {
+    use ferrite_exec::Engine;
+    use ferrite_kernel::CpuBackend;
+    let mut engine = Engine::new(cfg, weights, CpuBackend::new());
+    engine.eos_token = Some(eos);
+    let seq = engine
+        .submit(ids.to_vec(), max_tokens)
+        .unwrap_or_else(|e| panic!("submit: {e}"));
+    let out = engine
+        .run_until_done(seq)
+        .unwrap_or_else(|e| panic!("run: {e}"));
+    if out.len() > ids.len() {
+        out[ids.len()..].to_vec()
+    } else {
+        out
+    }
+}
+
+/// TP=N on-device inference: one CudaBackend per GPU, weights sharded via
+/// shard_weights_tp, per-layer CPU-side all-reduce (TpCluster).
+#[cfg(feature = "cuda")]
+fn run_cuda(
+    cfg: Glm53FlashConfig,
+    weights: ferrite_model::Weights,
+    ids: &[u32],
+    max_tokens: usize,
+    eos: u32,
+    lib: &str,
+    tp: usize,
+) -> Vec<u32> {
+    use ferrite_exec::tp::TpCluster;
+    use ferrite_kernel::CudaBackend;
+
+    let world = tp.max(1);
+    let mut cluster = TpCluster::new(cfg, &weights, world, |rank| {
+        CudaBackend::with_device(lib, rank as i32)
+            .unwrap_or_else(|e| panic!("cuda backend rank {rank}: {e}"))
+    });
+    println!("[serve] cuda TP cluster up: {world} rank(s)");
+    let seq = 1u64;
+    cluster
+        .prefill_chunk(seq, ids)
+        .unwrap_or_else(|e| panic!("prefill: {e}"));
+    let mut out = Vec::new();
+    for i in 0..max_tokens {
+        let tok = cluster
+            .decode_step(seq)
+            .unwrap_or_else(|e| panic!("decode step {i}: {e}"));
+        if tok == eos {
+            break;
+        }
+        out.push(tok);
+        if std::env::var_os("FERRITE_TRACE_TOK").is_some() {
+            println!("[serve] tok {i}: {tok}");
+        }
+    }
+    out
+}
+
+#[cfg(not(feature = "cuda"))]
+fn run_cuda(
+    _cfg: Glm53FlashConfig,
+    _weights: ferrite_model::Weights,
+    _ids: &[u32],
+    _max_tokens: usize,
+    _eos: u32,
+    _lib: &str,
+) -> Vec<u32> {
+    panic!("ferrite-serve was built without the cuda feature (rebuild with --features ferrite-serve? no — build ferrite-kernel --features cuda first)");
+}
+
+fn rss_gb() -> f64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("VmRSS:") {
+            let kb: f64 = v
+                .trim()
+                .trim_end_matches(" kB")
+                .parse()
+                .unwrap_or(0.0);
+            return kb / 1024.0 / 1024.0;
+        }
+    }
+    0.0
+}

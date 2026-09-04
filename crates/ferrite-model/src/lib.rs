@@ -7,11 +7,13 @@
 //! specialisation, memory planning, PDAF scheduling) is derived from
 //! these static structures at *compile-of-engine* time, not per forward.
 
+mod checkpoint;
 mod config;
 mod layer;
 mod safetensors;
 mod weights;
 
+pub use checkpoint::{load_hf_checkpoint, CheckpointReport};
 pub use config::{DsaConfig, Glm53FlashConfig, LayerType, LinearAttnConfig, MlpType};
 pub use layer::{build_layer_plans, AttnKind, LayerPlan, MlpKind};
 pub use safetensors::{load_safetensors_dir, load_safetensors_file};

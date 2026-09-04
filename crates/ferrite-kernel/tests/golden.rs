@@ -91,24 +91,27 @@ fn gated_deltanet_step_manual() {
     b.gated_deltanet_step(&q, &k, &v, &beta, &gate, &a_log, &state, &mut out, &mut state_out)
         .unwrap();
 
-    // token 0: decay = exp(0 * -1) = 1, S was 0
-    //   k=[0,1], v=[1,2], beta=1: S = k v^T = [[0,0],[1,2]]
-    //   o_0 = q^T S = [1,0] S = [S00, S01] = [0, 0]
+    // KDA semantics: the `gate` input IS the LOG-SPACE per-channel decay
+    // (engine computes lb*sigmoid(exp(A_log)*(f_b(f_a(x))+dt_bias)));
+    // the recurrence is S *= exp(gate) (fla naive_recurrent_kda).
+    // token 0: gate = 0 -> decay = e^0 = 1 -> S stays 0; S += beta*k v^T
+    //   k=[0,1], v=[1,2], beta=1: kS = S^T k = [S10, S11] = [0,1]
+    //   S -= beta*k (kS)^T = [[0,0],[1,2]] -> S = 0; S += beta*k v^T -> [[0,0],[1,2]]
+    //   o_0 = [1,0] S = [S00, S01] = [0, 0]
     assert!((out.as_slice()[0] - 0.0).abs() < 1e-6);
     assert!((out.as_slice()[1] - 0.0).abs() < 1e-6);
 
-    // token 1: decay = exp(1 * -1) = e^-1
-    //   S *= e^-1 -> [[0,0],[e^-1, 2e^-1]]
-    //   k=[1,0]: kS = S[0,:] = [0,0]; delta erase is 0
-    //   S += 0.5 * k v^T = 0.5*[[3,4],[0,0]] -> [[1.5,2],[e^-1,2e^-1]]
-    //   o_1 = [0,1] S = [e^-1, 2e^-1]
-    let e1 = (-1.0f32).exp();
-    assert!((out.as_slice()[2] - e1).abs() < 1e-5, "o1[0]={} vs {}", out.as_slice()[2], e1);
+    // token 1: gate = 1 -> decay = e^1; S = e*[[0,0],[1,2]] = [[0,0],[e,2e]]
+    //   k=[1,0]: kS = [S00, S01] = [0,0]; erase is 0
+    //   S += 0.5 * k v^T = 0.5*[[3,4],[0,0]] -> [[1.5,2],[e,2e]]
+    //   o_1 = [0,1] S = [e, 2e]
+    let e1 = (1.0f32).exp();
+    assert!((out.as_slice()[2] - e1).abs() < 1e-5, "o1[0]={} vs e", out.as_slice()[2]);
     assert!((out.as_slice()[3] - 2. * e1).abs() < 1e-5);
     assert!((state_out.as_slice()[0] - 1.5).abs() < 1e-5, "S[0,0]=1.5");
     assert!((state_out.as_slice()[1] - 2.0).abs() < 1e-5, "S[0,1]=2.0");
-    assert!((state_out.as_slice()[2] - e1).abs() < 1e-5, "S[1,0]=e^-1");
-    assert!((state_out.as_slice()[3] - 2. * e1).abs() < 1e-5, "S[1,1]=2e^-1");
+    assert!((state_out.as_slice()[2] - e1).abs() < 1e-5, "S[1,0]=e");
+    assert!((state_out.as_slice()[3] - 2. * e1).abs() < 1e-5, "S[1,1]=2e");
 }
 
 /// Chunkwise == step-wise (the definitional invariant the CUDA WYF-parallel
@@ -191,22 +194,25 @@ fn moe_route_noaux_tc() {
     let mut probs = Tensor::zeros(Shape::new([1, 2]), DType::F32);
     let mut ids = Tensor::zeros(Shape::new([1, 2]), DType::F32);
     b.moe_route(&logits, &bias, 2, 1.0, &mut probs, &mut ids).unwrap();
+    // transformers: scores = sigmoid(logits); choice = scores + bias (top-k on
+    // choice); weights = raw sigmoid scores (no bias), renormalised.
     let s0 = 1.0f32 / (1.0 + (-(1.0f32)).exp()); // sigmoid(1)
     let s1 = 1.0f32 / (1.0 + (-(2.0f32)).exp()); // sigmoid(2)
-    let s2 = 1.0f32 / (1.0 + (-(1.0f32)).exp()); // sigmoid(0.5+0.5)
-    assert_eq!(ids.as_slice()[0], 1.0, "expert 1 has top score");
-    // tie between expert 0 and 2 (both sigmoid(1)) -> lower index wins second slot
-    assert_eq!(ids.as_slice()[1], 0.0);
-    let sum = s1 + s0;
-    assert!((probs.as_slice()[0] - s1 / sum).abs() < 1e-5);
-    assert!((probs.as_slice()[1] - s0 / sum).abs() < 1e-5);
-    let _ = s2;
+    let s2 = 1.0f32 / (1.0 + (-(0.5f32)).exp()); // sigmoid(0.5)
+    // choice scores: s0+0=0.731, s1+0=0.881, s2+0.5=1.122 -> top-2: e2, e1
+    assert_eq!(ids.as_slice()[0], 2.0, "expert 2 has top choice score (sigmoid+bias)");
+    assert_eq!(ids.as_slice()[1], 1.0, "expert 1 second");
+    // weights: raw sigmoid of the selected experts, renormalised
+    let sum = s2 + s1;
+    assert!((probs.as_slice()[0] - s2 / sum).abs() < 1e-5);
+    assert!((probs.as_slice()[1] - s1 / sum).abs() < 1e-5);
+    let _ = s0;
 }
 
 #[test]
 fn indexer_topk_and_sparse_attn() {
     let b = CpuBackend::new();
-    // q: [1,4], k: [5,4] — q equals k[2] so top pick should be index 2
+    // q: [1, 1*4] (one indexer head), k: [5, 4] — q equals k[2] so top pick is index 2
     let q = t2(1, 4, vec![1., 0., 0., 0.]);
     let k = t2(5, 4, vec![
         0., 1., 0., 0.,  // k0
@@ -215,10 +221,19 @@ fn indexer_topk_and_sparse_attn() {
         0., 0., 0., 1.,  // k3
         0.9, 0.1, 0., 0., // k4 near
     ]);
+    let w = t2(1, 1, vec![1.0]); // single head, weight 1.0
     let mut idx = Tensor::zeros(Shape::new([1, 2]), DType::F32);
-    b.indexer_topk(&q, &k, 2, &mut idx).unwrap();
+    // ctx0 = 5 (all 5 keys visible to the query: q row 0 sees j <= ctx0+0)
+    b.indexer_topk(&q, &k, &w, 2, 4, &mut idx).unwrap();
     assert_eq!(idx.as_slice()[0], 2.0, "exact match first");
     assert_eq!(idx.as_slice()[1], 4.0, "near match second");
+    // causal guard: ctx0 = 2 → row 0 only sees keys 0..=2; the best
+    // in-bounds key is k2 (exact match); the second pick falls back among
+    // k0/k1 (both score 0 — stable sort prefers the lower index).
+    let mut idx2 = Tensor::zeros(Shape::new([1, 2]), DType::F32);
+    b.indexer_topk(&q, &k, &w, 2, 2, &mut idx2).unwrap();
+    assert_eq!(idx2.as_slice()[0], 2.0, "exact match still first");
+    assert_eq!(idx2.as_slice()[1], 0.0, "ties resolved to the lower index");
     // sparse attn over selected: v = k for simplicity
     let h = 1usize;
     let dq = 4usize;

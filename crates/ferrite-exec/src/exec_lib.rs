@@ -31,7 +31,6 @@ pub struct DsaLayerCache {
     pub k_nope: Vec<f32>, // [t, heads, dk]
     pub v: Vec<f32>,      // [t, heads, dv]
     pub k_idx: Vec<f32>,  // [t, iproj]
-    pub k_gate: Vec<f32>, // [t, idm] kpool gate scores (indexer compression)
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +110,7 @@ impl<B: KernelBackend> Engine<B> {
             id,
             SeqRuntime {
                 tokens: prompt,
-                dsa_caches: (0..n_dsa).map(|_| DsaLayerCache { k_nope: Vec::new(), v: Vec::new(), k_idx: Vec::new(), k_gate: Vec::new() }).collect(),
+                dsa_caches: (0..n_dsa).map(|_| DsaLayerCache { k_nope: Vec::new(), v: Vec::new(), k_idx: Vec::new() }).collect(),
             },
         );
         Ok(id)
@@ -156,7 +155,7 @@ impl<B: KernelBackend> Engine<B> {
             SeqRuntime {
                 tokens: initial_tokens.to_vec(),
                 dsa_caches: (0..n_dsa)
-                    .map(|_| DsaLayerCache { k_nope: Vec::new(), v: Vec::new(), k_idx: Vec::new(), k_gate: Vec::new() })
+                    .map(|_| DsaLayerCache { k_nope: Vec::new(), v: Vec::new(), k_idx: Vec::new() })
                     .collect(),
             },
         );
@@ -443,7 +442,7 @@ impl<B: KernelBackend> Engine<B> {
             self.cfg.hc_eps,
             self.cfg.hc_sinkhorn_iters,
         );
-        let hfn = self.rmsnorm(&li2, &format!("{pfx}.post_attention_layernorm.weight"))?;
+        let hfn = self.rmsnorm(&li2, &format!("{pfx}.input_layernorm.weight"))?;
         let ffn_out = match plan.mlp {
             MlpKind::Dense => self.dense_ffn(&pfx, &hfn, n)?,
             MlpKind::Moe => self.moe_ffn(&pfx, &hfn, n)?,
@@ -453,16 +452,10 @@ impl<B: KernelBackend> Engine<B> {
             res2_flat.as_slice().to_vec(),
         );
         let res_out = crate::mhc::hc_post(&ffn_out, &res3b, &post_f, &comb_f);
-        if std::env::var_os("FERRITE_TRACE_NAN").is_some() {
-            let (mut mx, mut sum) = (0.0f32, 0.0f32);
-            for v in res_out.as_slice() {
-                if v.is_finite() { mx = mx.max(v.abs()); sum += v * v; }
-            }
-            eprintln!(
-                "[trace] layer {layer_idx:2} after: max|v|={mx:.4} l2={:.4} attn_max={:.4}",
-                sum.sqrt(),
-                attn_out.as_slice().iter().fold(0.0f32, |a, v| a.max(v.abs()))
-            );
+        if std::env::var_os("FERRITE_TRACE_NAN").is_some()
+            && res_out.as_slice().iter().any(|v| !v.is_finite())
+        {
+            eprintln!("[trace] NaN after ffn hc_post at layer {layer_idx}");
         }
         Ok(Tensor::from_f32(
             Shape::new([n, hc_mult * hidden]),
@@ -505,14 +498,6 @@ impl<B: KernelBackend> Engine<B> {
         let b_raw = self.project(x, &format!("{pfx}.self_attn.b_proj.weight"))?;
         let fa = self.project(x, &format!("{pfx}.self_attn.f_a_proj.weight"))?;
         let fb = self.project(&fa, &format!("{pfx}.self_attn.f_b_proj.weight"))?;
-        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 0 && n > 1 {
-            let wr = |path: &str, t: &Tensor| {
-                let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-                std::fs::write(path, b).ok();
-            };
-            wr("/tmp/l0_gdn_fa.f32", &fa);
-            wr("/tmp/l0_gdn_fb.f32", &fb);
-        }
         let ga = self.project(x, &format!("{pfx}.self_attn.g_a_proj.weight"))?;
         let gb = self.project(&ga, &format!("{pfx}.self_attn.g_b_proj.weight"))?;
         // causal short conv with carried tail (CPU golden: exact window)
@@ -563,12 +548,6 @@ impl<B: KernelBackend> Engine<B> {
         };
         let q = l2norm_heads(&q);
         let k = l2norm_heads(&k);
-        // fla KDA: q = l2norm(q) * K^-0.5 (k is NOT scaled)
-        let q = {
-            let scale = (dk as f32).recip().sqrt();
-            let d = q.as_slice().iter().map(|v| v * scale).collect::<Vec<f32>>();
-            Tensor::from_f32(Shape::new([n, h, dk]), d)
-        };
         let beta = Tensor::from_f32(
             Shape::new([n, h]),
             b_raw.as_slice().iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect(),
@@ -611,17 +590,6 @@ impl<B: KernelBackend> Engine<B> {
         )?;
         self.linear_states
             .insert((seq, layer_idx), state_out.as_slice().to_vec());
-        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 0 {
-            let wr = |p: &str, t: &Tensor| {
-                let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-                std::fs::write(p, b).ok();
-            };
-            wr("/tmp/l0_gdn_q.f32", &q);
-            wr("/tmp/l0_gdn_k.f32", &k);
-            wr("/tmp/l0_gdn_gate.f32", &gate);
-            wr("/tmp/l0_gdn_core.f32", &core);
-            wr("/tmp/l0_gdn_beta.f32", &beta);
-        }
         // gated output norm: per-head RMSNorm over head_dim (the real
         // checkpoint's o_norm weight is [head_dim] = [128], applied
         // head-wise with the channel gate) — reshape [n,h,dk] → [n*h, dk].
@@ -666,17 +634,6 @@ impl<B: KernelBackend> Engine<B> {
         // hidden; k_norm is an affine norm over the 128-dim index key;
         // weights_proj gives per-head score weights.
         let qi = self.project(&qa, &format!("{pfx}.self_attn.indexer.wq_b.weight"))?;
-        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
-            let wr = |path: &str, t: &Tensor| {
-                let b: Vec<u8> = t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-                std::fs::write(path, b).ok();
-            };
-            wr("/tmp/l3_dsa_qa.f32", &qa);
-            wr("/tmp/l3_dsa_qi.f32", &qi);
-            wr("/tmp/l3_dsa_q.f32", &q);
-            wr("/tmp/l3_dsa_kvb.f32", &kvb);
-            wr("/tmp/l3_dsa_hn.f32", x);
-        }
         let ki_raw = self.project(x, &format!("{pfx}.self_attn.indexer.wk.weight"))?;
         let kn_w = self.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?;
         let kn_b = self.w(&format!("{pfx}.self_attn.indexer.k_norm.bias"))?;
@@ -705,8 +662,6 @@ impl<B: KernelBackend> Engine<B> {
             let v = raw.as_slice().iter().map(|v| v * scale).collect::<Vec<f32>>();
             Tensor::from_f32(Shape::new([n, ih]), v)
         };
-        // kpool gate scores per NEW token: [n, idm] (cached alongside k_idx)
-        let gate_for_cache = self.project(x, &format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?;
         let family_idx = self.dsa_family_index(layer_idx);
         {
             let s = self.seqs.get_mut(&seq).unwrap();
@@ -726,124 +681,23 @@ impl<B: KernelBackend> Engine<B> {
                 let ioff = (t0 + t) * idm;
                 c.k_idx.resize(ioff + idm, 0.0);
                 c.k_idx[ioff..ioff + idm].copy_from_slice(&ki.as_slice()[t * idm..(t + 1) * idm]);
-                let goff = (t0 + t) * idm;
-                c.k_gate.resize(goff + idm, 0.0);
-                c.k_gate[goff..goff + idm]
-                    .copy_from_slice(&gate_for_cache.as_slice()[t * idm..(t + 1) * idm]);
             }
         }
-        let (k_all, v_all, kidx_all, kgate_all, total) = {
+        let (k_all, v_all, kidx_all, total) = {
             let s = self.seqs.get(&seq).unwrap();
             let c = &s.dsa_caches[family_idx];
-            (
-                c.k_nope.clone(),
-                c.v.clone(),
-                c.k_idx.clone(),
-                c.k_gate.clone(),
-                c.k_nope.len() / (h * dk),
-            )
+            (c.k_nope.clone(), c.v.clone(), c.k_idx.clone(), c.k_nope.len() / (h * dk))
         };
         let k_nope = Tensor::from_f32(Shape::new([total, h, dk]), k_all);
         let v = Tensor::from_f32(Shape::new([total, h, dv]), v_all);
-        let k_idx_all = Tensor::from_f32(Shape::new([total, idm]), kidx_all.clone());
-        // ---- k-pool compression (Glm5NextTextIndexer): group index keys into
-        // pools of `index_kpool` (=4) tokens; per-CHANNEL softmax over
-        // (gate + ape) mixes each pool's keys; top-k selects POOLS
-        // (select_k = topk/kpool), selected pools expand back to token
-        // indices; the visible tail (kpool-1) is appended; -1 = padding.
-        let kpool = 4usize; // config index_kpool
-        let npools = (total + kpool - 1) / kpool;
-        let mut pool_keys = vec![0.0f32; npools * idm];
-        {
-            let ks = kidx_all.as_slice();
-            let gv = kgate_all.as_slice(); // [total, idm] (cached gate scores)
-            let ape = self
-                .w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?
-                .as_slice()
-                .to_vec();
-            for p in 0..npools {
-                for d in 0..idm {
-                    let mut lmax = f32::NEG_INFINITY;
-                    for j in 0..kpool {
-                        let t = p * kpool + j;
-                        if t < total {
-                            lmax = lmax.max(gv[t * idm + d] + ape[j * idm + d]);
-                        }
-                    }
-                    if lmax == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    let mut den = 0.0f32;
-                    let mut num = 0.0f32;
-                    for j in 0..kpool {
-                        let t = p * kpool + j;
-                        if t < total {
-                            let wgt = (gv[t * idm + d] + ape[j * idm + d] - lmax).exp();
-                            den += wgt;
-                            num += wgt * ks[t * idm + d];
-                        }
-                    }
-                    pool_keys[p * idm + d] = num / den;
-                }
-            }
-        }
-        // pool visibility (causal): pool p is visible to query row i iff its LAST
-        // token (min((p+1)*kpool, total) - 1) is <= ctx0 + i
+        let k_idx_all = Tensor::from_f32(Shape::new([total, idm]), kidx_all);
+        let topk = d.index_topk.min(total);
+        // causal guard: the n new query rows are the LAST n of the t total
+        // keys — row i may only select keys j < (total - n) + i + 1.
         let ctx0 = total - n;
-        let select_k = (d.index_topk / kpool).min(npools);
-        let pool_idx_all = Tensor::from_f32(Shape::new([npools, idm]), pool_keys);
-        let mut idx_pools = Tensor::zeros(Shape::new([n, select_k]), DType::F32);
-        self.backend.indexer_topk(&qi, &pool_idx_all, &w_idx, select_k, ctx0 / kpool, &mut idx_pools)?;
-        // expand selected pools to token indices + append the visible tail
-        let out_width = select_k * kpool + (kpool - 1);
-        let mut idx = Tensor::zeros(Shape::new([n, out_width]), DType::F32);
-        {
-            let iv = std::sync::Arc::get_mut(&mut idx.data).expect("unique idx");
-            let pv = idx_pools.as_slice();
-            for i in 0..n {
-                let mut col = 0usize;
-                let mut written = 0usize;
-                for r in 0..select_k {
-                    let pflt = pv[i * select_k + r];
-                    if pflt < 0.0 {
-                        continue; // -1 sentinel (invisible pool)
-                    }
-                    let p = pflt as usize;
-                    if p >= npools {
-                        continue;
-                    }
-                    for j in 0..kpool {
-                        let t = p * kpool + j;
-                        if t < total && t <= ctx0 + i {
-                            iv[i * out_width + col] = t as f32;
-                            col += 1;
-                        }
-                    }
-                }
-                // tail: last (kpool-1) visible tokens
-                let vis_end = ctx0 + i; // last visible key for this row
-                let mut tail_cnt = (vis_end + 1) % kpool;
-                if tail_cnt == 0 { tail_cnt = kpool; }
-                let tail_start = vis_end + 1 - tail_cnt;
-                for t in tail_start..=vis_end {
-                    if col < out_width {
-                        iv[i * out_width + col] = t as f32;
-                        col += 1;
-                    }
-                }
-                while col < out_width {
-                    iv[i * out_width + col] = -1.0; // padding
-                    col += 1;
-                }
-            }
-        }
+        let mut idx = Tensor::zeros(Shape::new([n, topk]), DType::F32);
+        self.backend.indexer_topk(&qi, &k_idx_all, &w_idx, topk, ctx0, &mut idx)?;
         let mut out = Tensor::zeros(Shape::new([n, h, dv]), DType::F32);
-        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
-            let b: Vec<u8> = idx.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_dsa_idx.f32", b).ok();
-            let b2: Vec<u8> = q.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
-            std::fs::write("/tmp/l3_dsa_q_sel.f32", b2).ok();
-        }
         self.backend.sparse_mla_attn(&q, &k_nope, &v, &idx, &mut out)?;
         let flat = Tensor::from_f32(Shape::new([n, h * dv]), out.as_slice().to_vec());
         self.project(&flat, &format!("{pfx}.self_attn.o_proj.weight"))
@@ -895,19 +749,6 @@ impl<B: KernelBackend> Engine<B> {
         let mut ids = Tensor::zeros(Shape::new([n, topk]), DType::F32);
         self.backend
             .moe_route(&logits, &bias, topk, cfg.routed_scaling_factor, &mut probs, &mut ids)?;
-        if std::env::var_os("FERRITE_TRACE_MOE").is_some()
-            && (pfx.ends_with("layers.3") || pfx.ends_with("layers.44"))
-        {
-            let ids_v = ids.as_slice();
-            let pr = probs.as_slice();
-            eprintln!(
-                "[moe] L3 ids={:?} probs={:?} logits0={:.3} bias0={:.3}",
-                &ids_v[..topk.min(8)],
-                &pr[..topk.min(8)],
-                logits.as_slice().iter().take(4).fold(f32::MIN, |a, b| a.max(*b)),
-                bias.as_slice()[0]
-            );
-        }
         // shared expert: row/col-sharded across TP ranks (intermediate/world),
         // so its output is a partial sum — the caller all-reduces.
         let shared_inter = cfg.moe_intermediate_size / self.tp_world.max(1);

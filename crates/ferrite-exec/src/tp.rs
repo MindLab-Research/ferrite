@@ -183,32 +183,26 @@ fn shard_linear_attn_weight(
         // [heads, h] or [heads] — head split rows
         Some(row_split(t, hs, he))
     } else if name.ends_with(".dt_bias") {
-        // [3*proj] — split each third by head
-        let mut data = Vec::new();
-        let third = rows / 3;
-        let (qs, qe) = (hs * dk, he * dk);
-        for seg in 0..3 {
-            let base = seg * third;
-            data.extend_from_slice(&t.as_slice()[base + qs..base + qe]);
-        }
-        Some(Tensor::new(Shape::new([3 * (qe - qs)]), t.dtype, data))
+        // [h*dk] per-channel KDA forget-gate bias (on the f_b_proj output
+        // channels = heads*head_dim) — head split
+        Some(row_split(t, hs * dk, he * dk))
     } else if name.ends_with(".f_b_proj.weight") || name.ends_with(".g_b_proj.weight") {
         // [proj, head_dim] rows = heads*dk — head split
-        Some(row_split(t, hs * dk, he * dk))
-    } else if name.ends_with(".o_norm.weight") {
-        // [proj] heads*dk split
         Some(row_split(t, hs * dk, he * dk))
     } else if name.ends_with(".o_proj.weight") {
         // [h, proj] column split (input = head subset)
         Some(col_split(t, hs * dk, he * dk))
     } else {
-        // f_a_proj/g_a_proj [head_dim, h]: replicated
+        // f_a_proj/g_a_proj [head_dim, h] and o_norm [head_dim] (per-head
+        // shared): replicated
         None
     }
 }
 
 /// DSA weight sharding (head split for q_b/kv_b, column for o_proj,
-/// shared latent/indexer).
+/// shared latent/indexer — the indexer (wq_b/wk/k_norm/weights_proj) is
+/// replicated: per-head indexer scores are computed in full on every rank and
+/// the top-k selection is global).
 fn shard_dsa_weight(
     name: &str,
     t: &Tensor,
@@ -231,10 +225,8 @@ fn shard_dsa_weight(
     } else if name.ends_with(".o_proj.weight") {
         // [h, heads*v] — column split
         Some(col_split(t, dhs * v, dhe * v))
-    } else if name.ends_with(".indexer_q_proj.weight") || name.ends_with(".indexer_k_proj.weight") {
-        // indexer heads shared (global top-k needs full view)
-        None
     } else {
+        // q_a/kv_a/layernorms/indexer.* replicated
         None
     }
 }
@@ -426,6 +418,13 @@ impl<B: KernelBackend> TpCluster<B> {
         residual: Tensor,
         n: usize,
     ) -> Result<Tensor> {
+        let probe = std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1; // prefill, first DSA+MoE layer
+        if probe {
+            let n_el = residual.numel();
+            let bytes: Vec<u8> = residual.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write("/tmp/l0_in.f32", bytes).ok();
+            eprintln!("[probe] L0 in: {} elems", n_el);
+        }
         let plans = build_layer_plans(&self.full_cfg);
         let plan = &plans[layer_idx];
         let pfx = format!("model.layers.{layer_idx}");
@@ -452,7 +451,14 @@ impl<B: KernelBackend> TpCluster<B> {
             );
             let hn = {
                 let s0 = &self.shards[0];
-                s0.rmsnorm(&li, &format!("{pfx}.input_layernorm.weight"))?
+                let hn = s0.rmsnorm(&li, &format!("{pfx}.input_layernorm.weight"))?;
+                if probe {
+                    let bytes: Vec<u8> = li.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write("/tmp/l0_collapsed.f32", bytes).ok();
+                    let bytes2: Vec<u8> = hn.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write("/tmp/l0_hn.f32", bytes2).ok();
+                }
+                hn
             };
             let attn_partials: Result<Vec<Tensor>> = self
                 .shards
@@ -463,9 +469,17 @@ impl<B: KernelBackend> TpCluster<B> {
                 })
                 .collect();
             let attn_out = all_reduce_sum(&attn_partials?);
+            if probe {
+                let bytes: Vec<u8> = attn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write("/tmp/l0_attn.f32", bytes).ok();
+            }
             let res3 =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), residual.as_slice().to_vec());
             let res2 = crate::mhc::hc_post(&attn_out, &res3, &post_a, &comb_a);
+            if probe {
+                let bytes: Vec<u8> = res2.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write("/tmp/l0_res2.f32", bytes).ok();
+            }
 
             // ---- ffn half ----
             let (hc_fn2, hc_scale2, hc_base2) = {
@@ -489,7 +503,7 @@ impl<B: KernelBackend> TpCluster<B> {
             );
             let hfn = {
                 let s0 = &self.shards[0];
-                s0.rmsnorm(&li2, &format!("{pfx}.input_layernorm.weight"))?
+                s0.rmsnorm(&li2, &format!("{pfx}.post_attention_layernorm.weight"))?
             };
             let ffn_partials: Result<Vec<Tensor>> = self
                 .shards
@@ -500,13 +514,41 @@ impl<B: KernelBackend> TpCluster<B> {
                 })
                 .collect();
             let ffn_out = all_reduce_sum(&ffn_partials?);
+            if probe {
+                let bytes: Vec<u8> = ffn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write("/tmp/l0_ffn.f32", bytes).ok();
+            }
             let res3b =
                 Tensor::from_f32(Shape::new([n, hc_mult, hidden]), res2_flat.as_slice().to_vec());
             let res_out = crate::mhc::hc_post(&ffn_out, &res3b, &post_f, &comb_f);
-            Ok(Tensor::from_f32(
+            if std::env::var_os("FERRITE_TRACE_NAN").is_some() {
+                let (mut mx, mut sum) = (0.0f32, 0.0f32);
+                for v in res_out.as_slice() {
+                    if v.is_finite() {
+                        mx = mx.max(v.abs());
+                        sum += v * v;
+                    }
+                }
+                eprintln!(
+                    "[tp-trace] layer {:2} attn_max={:.4} ffn_max={:.4} h_l2={:.4} n_nan={}",
+                    layer_idx,
+                    attn_out.as_slice().iter().fold(0.0f32, |a, v| a.max(v.abs())),
+                    ffn_out.as_slice().iter().fold(0.0f32, |a, v| a.max(v.abs())),
+                    sum.sqrt(),
+                    res_out.as_slice().iter().filter(|v| !v.is_finite()).count()
+                );
+            }
+
+            let out_t = Tensor::from_f32(
                 Shape::new([n, hc_mult * hidden]),
                 res_out.as_slice().to_vec(),
-            ))
+            );
+            if probe {
+                let bytes: Vec<u8> = out_t.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+                std::fs::write("/tmp/l0_out.f32", bytes).ok();
+                eprintln!("[probe] L0 out: {} elems", out_t.numel());
+            }
+            Ok(out_t)
         } else {
             // standard residual stream
             let hn = {

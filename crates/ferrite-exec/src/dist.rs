@@ -74,7 +74,6 @@ pub struct DsaShard {
     pub v: Vec<f32>,
     /// indexer k rows (replicated access): [t_d, iproj]
     pub k_idx: Vec<f32>,
-    pub k_gate: Vec<f32>,
     /// token indices (global) owned by this shard.
     pub token_ids: Vec<usize>,
 }
@@ -190,7 +189,6 @@ impl<B: KernelBackend> PdafCluster<B> {
                             );
                             shard.v.extend_from_slice(&cache.v[t * h * dv..(t + 1) * h * dv]);
                             shard.k_idx.extend_from_slice(&cache.k_idx[t * idm..(t + 1) * idm]);
-                            shard.k_gate.extend_from_slice(&cache.k_gate[t * idm..(t + 1) * idm]);
                         }
                         let entry = self.dcp_states[d]
                             .dsa_shards
@@ -510,8 +508,6 @@ impl<B: KernelBackend> PdafCluster<B> {
             }
         }
         let w_idx = self.project(x, &format!("{pfx}.self_attn.indexer.weights_proj.weight"))?;
-        let gate_dec = self
-            .project(x, &format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?;
         // per-rank: append new token's KV to this rank's shard (page owner)
         let t_global = self.dcp_states[0].tokens.get(&seq).map(|t| t.len()).unwrap_or(0);
         let new_page = t_global.saturating_sub(1) / self.page_size;
@@ -525,12 +521,10 @@ impl<B: KernelBackend> PdafCluster<B> {
             shard.k_nope.extend_from_slice(&kvb.as_slice()[0..h * dk]);
             shard.v.extend_from_slice(&kvb.as_slice()[h * dk..h * (dk + dv)]);
             shard.k_idx.extend_from_slice(&ki.as_slice()[0..idm]);
-            shard.k_gate.extend_from_slice(&gate_dec.as_slice()[0..idm]);
             shard.token_ids.push(t_global.saturating_sub(1));
         }
         // k_idx replicated: gather from all shards (global top-k needs it)
         let mut full_k_idx: Vec<f32> = Vec::new();
-        let mut full_k_gate: Vec<f32> = Vec::new();
         let mut all_tokens: Vec<(usize, usize, usize)> = Vec::new(); // (global t, rank, local idx)
         for (rank, st) in self.dcp_states.iter().enumerate() {
             if let Some(shards) = st.dsa_shards.get(&seq) {
@@ -539,7 +533,6 @@ impl<B: KernelBackend> PdafCluster<B> {
                         all_tokens.push((gt, rank, li));
                     }
                     full_k_idx.extend_from_slice(&shard.k_idx);
-                    full_k_gate.extend_from_slice(&shard.k_gate);
                 }
             }
         }
@@ -548,93 +541,13 @@ impl<B: KernelBackend> PdafCluster<B> {
             // no KV yet: return zeros
             return Ok(Tensor::zeros(Shape::new([n, h * dv]), DType::F32));
         }
-        // ---- k-pool compression (Glm5NextTextIndexer): see exec dsa_attn_forward ----
-        let kpool = 4usize;
-        let total = t_have;
-        let npools = (total + kpool - 1) / kpool;
-        let mut pool_keys = vec![0.0f32; npools * idm];
-        {
-            let ks = full_k_idx.as_slice();
-            let ape = self
-                .engine
-                .w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?
-                .as_slice()
-                .to_vec();
-            let gv = full_k_gate.as_slice();
-            for p in 0..npools {
-                for d in 0..idm {
-                    let mut lmax = f32::NEG_INFINITY;
-                    for j in 0..kpool {
-                        let t = p * kpool + j;
-                        if t < total {
-                            lmax = lmax.max(gv[t * idm + d] + ape[j * idm + d]);
-                        }
-                    }
-                    if lmax == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    let mut den = 0.0f32;
-                    let mut num = 0.0f32;
-                    for j in 0..kpool {
-                        let t = p * kpool + j;
-                        if t < total {
-                            let wgt = (gv[t * idm + d] + ape[j * idm + d] - lmax).exp();
-                            den += wgt;
-                            num += wgt * ks[t * idm + d];
-                        }
-                    }
-                    pool_keys[p * idm + d] = num / den;
-                }
-            }
-        }
+        let k_idx_all = Tensor::from_f32(Shape::new([t_have, idm]), full_k_idx);
+        // global top-k over the replicated k_idx; the single new query row may
+        // only select keys j < t_have (causal guard, ctx0 = t_have - 1).
+        let topk = d.index_topk.min(t_have);
         let ctx0 = t_have.saturating_sub(1);
-        let select_k = (d.index_topk / kpool).min(npools);
-        let pool_idx_all = Tensor::from_f32(Shape::new([npools, idm]), pool_keys);
-        let mut idx_pools = Tensor::zeros(Shape::new([n, select_k]), DType::F32);
-        self.engine.backend.indexer_topk(&qi, &pool_idx_all, &w_idx, select_k, ctx0 / kpool, &mut idx_pools)?;
-        // expand selected pools to token indices + append visible tail
-        let out_width = select_k * kpool + (kpool - 1);
-        let mut idx = Tensor::zeros(Shape::new([n, out_width]), DType::F32);
-        {
-            let pv = idx_pools.as_slice();
-            let iv = std::sync::Arc::get_mut(&mut idx.data).expect("unique idx");
-            for i in 0..n {
-                let mut col = 0usize;
-                let vis_end = ctx0 + i;
-                for r in 0..select_k {
-                    let pflt = pv[i * select_k + r];
-                    if pflt < 0.0 {
-                        continue; // -1 sentinel
-                    }
-                    let pp = pflt as usize;
-                    if pp >= npools {
-                        continue;
-                    }
-                    for j in 0..kpool {
-                        let t = pp * kpool + j;
-                        if t < total && t <= vis_end {
-                            iv[i * out_width + col] = t as f32;
-                            col += 1;
-                        }
-                    }
-                }
-                let mut tail_cnt = (vis_end + 1) % kpool;
-                if tail_cnt == 0 {
-                    tail_cnt = kpool;
-                }
-                let tail_start = vis_end + 1 - tail_cnt;
-                for t in tail_start..=vis_end {
-                    if col < out_width {
-                        iv[i * out_width + col] = t as f32;
-                        col += 1;
-                    }
-                }
-                while col < out_width {
-                    iv[i * out_width + col] = -1.0;
-                    col += 1;
-                }
-            }
-        }
+        let mut idx = Tensor::zeros(Shape::new([n, topk]), DType::F32);
+        self.engine.backend.indexer_topk(&qi, &k_idx_all, &w_idx, topk, ctx0, &mut idx)?;
         // per-rank partial: each rank attends over its shard's tokens that
         // are in the selected set
         let mut partials: Vec<PartialAttn> = Vec::new();

@@ -23,6 +23,7 @@ pub type CuStream = *mut std::ffi::c_void;
 
 extern "C" {
     // cudart (linked into libferrite_kernels.so's dependency closure)
+    fn cudaSetDevice(dev: i32) -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
@@ -52,13 +53,13 @@ extern "C" {
                              beta: *const f32, gate: *const f32, a_log: *const f32,
                              state_in: *mut f32, out: *mut f32, state_out: *mut f32,
                              n: i32, h: i32, dk: i32, dv: i32, s: CuStream) -> i32;
-    fn ferrite_moe_route(logits: *const f32, bias: *const f32, probs: *mut f32,
-                         ids: *mut i32, n: i32, e: i32, topk: i32,
+    fn ferrite_moe_route(logits: *const f32, bias: *const f32, probs: *mut f32, ids: *mut f32,
+                         n: i32, e: i32, topk: i32,
                          scale: f32, s: CuStream) -> i32;
-    fn ferrite_indexer_topk(qi: *const f32, ki: *const f32, idx: *mut f32,
-                            n: i32, t: i32, d: i32, topk: i32, s: CuStream) -> i32;
+    fn ferrite_indexer_topk(qi: *const f32, ki: *const f32, w: *const f32, idx: *mut f32,
+                            n: i32, t: i32, h: i32, d: i32, topk: i32, ctx0: i32, s: CuStream) -> i32;
     fn ferrite_sparse_attn(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
-                           out: *mut f32, n: i32, h: i32, d: i32, dv: i32,
+                           out: *mut f32, n: i32, t: i32, h: i32, d: i32, dv: i32,
                            topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
@@ -154,6 +155,11 @@ impl DevRef {
 /// for CUDA-graph capture (stable device pointers across replays)).
 pub struct CudaBackend {
     stream: CuStream,
+    /// Device index this backend is bound to. cudaSetDevice is THREAD-LOCAL:
+    /// a TP cluster drives N backends from one thread, so every op must
+    /// re-bind before allocating/launching (buffers must live on the same
+    /// device as the stream).
+    dev: i32,
     weights: std::sync::Mutex<std::collections::HashMap<(usize, usize), CachedBuf>>,
     /// CUDA graph capture state (driver-API handle for the instantiated
     /// graph exec; see the GraphCapable impl below).
@@ -191,8 +197,19 @@ impl CudaBackend {
         }
         CudaBackend {
             stream,
+            dev: 0,
             weights: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph: std::sync::Mutex::new(GraphState::default()),
+        }
+    }
+
+    /// Bind this backend's device as the calling thread's current device.
+    /// cudaSetDevice is thread-local state; TP ranks all call ops from the
+    /// main thread, so each op entry re-binds before cudaMalloc/launch.
+    #[inline]
+    fn enter(&self) {
+        unsafe {
+            cudaSetDevice(self.dev);
         }
     }
 
@@ -232,10 +249,32 @@ impl CudaBackend {
         }
     }
 
+    /// Load `libferrite_kernels.so` (and its cudart dependency) explicitly,
+    /// binding the backend to CUDA device `device` (cudaSetDevice). Each rank
+    /// of a TP deployment constructs one backend per GPU.
+    pub fn with_device(so_path: &str, device: i32) -> Result<Self> {
+        let c = CString::new(so_path).map_err(|_| FerriteError::InvalidArg("bad path".into()))?;
+        let handle = unsafe { libc_dlopen(c.as_ptr(), 2) };
+        if handle.is_null() {
+            return Err(FerriteError::InvalidArg(format!(
+                "dlopen({so_path}) failed — run kernels/cuda/build.sh first"
+            )));
+        }
+        let err = unsafe { cudaSetDevice(device) };
+        if err != 0 {
+            return Err(FerriteError::InvalidArg(format!(
+                "cudaSetDevice({device}) failed: {err}"
+            )));
+        }
+        let mut b = Self::new();
+        b.dev = device;
+        Ok(b)
+    }
+
     /// Load `libferrite_kernels.so` (and its cudart dependency) explicitly.
     pub fn with_library(so_path: &str) -> Result<Self> {
         let c = CString::new(so_path).map_err(|_| FerriteError::InvalidArg("bad path".into()))?;
-        let handle = unsafe { libc_dlopen(c.as_ptr()) };
+        let handle = unsafe { libc_dlopen(c.as_ptr(), 2) };
         if handle.is_null() {
             return Err(FerriteError::InvalidArg(format!(
                 "dlopen({so_path}) failed — run kernels/cuda/build.sh first"
@@ -295,7 +334,7 @@ impl CudaBackend {
 
 extern "C" {
     #[link_name = "dlopen"]
-    fn libc_dlopen(filename: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
+    fn libc_dlopen(filename: *const std::os::raw::c_char, flags: i32) -> *mut std::ffi::c_void;
     #[link_name = "dlsym"]
     fn libc_dlsym(handle: *mut std::ffi::c_void, symbol: *const std::os::raw::c_char) -> *mut std::ffi::c_void;
 }
@@ -332,11 +371,11 @@ impl DriverApi {
         static API: std::sync::OnceLock<Option<DriverApi>> = std::sync::OnceLock::new();
         API.get_or_init(|| {
             let name = c"libcuda.so.1";
-            let h = unsafe { libc_dlopen(name.as_ptr()) };
+            let h = unsafe { libc_dlopen(name.as_ptr(), 2) };
             if h.is_null() {
                 // try without the .1
                 let name2 = c"libcuda.so";
-                let h2 = unsafe { libc_dlopen(name2.as_ptr()) };
+                let h2 = unsafe { libc_dlopen(name2.as_ptr(), 2) };
                 if h2.is_null() {
                     return None;
                 }
@@ -430,10 +469,12 @@ impl crate::graph::GraphCapable for CudaBackend {
 
 impl crate::KernelBackend for CudaBackend {
     fn matmul(&self, x: &Tensor, w: &Tensor, bias: Option<&Tensor>, out: &mut Tensor) -> Result<()> {
+        self.enter();
         self.run_matmul(x, w, bias, out)
     }
 
     fn rmsnorm(&self, x: &Tensor, w: &Tensor, eps: f32, out: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = (x.numel() / w.numel()) as i32;
         let dim = w.numel() as i32;
         let dx = DevBuf::alloc(x.numel())?; dx.upload(x.as_slice())?;
@@ -447,6 +488,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn gated_rmsnorm(&self, x: &Tensor, gate: &Tensor, w: &Tensor, eps: f32, out: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = (x.numel() / w.numel()) as i32;
         let dim = w.numel() as i32;
         let dx = DevBuf::alloc(x.numel())?; dx.upload(x.as_slice())?;
@@ -461,6 +503,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn swiglu_limited(&self, gate_up: &Tensor, limit: f32, out: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = out.shape.0[0] as i32;
         let inter = out.shape.0[1] as i32;
         let dgu = DevBuf::alloc(gate_up.numel())?; dgu.upload(gate_up.as_slice())?;
@@ -473,6 +516,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn causal_conv1d(&self, x: &Tensor, w: &Tensor, state_in: &Tensor, out: &mut Tensor, state_out: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = x.shape.0[0] as i32;
         let ch = x.shape.0[1] as i32;
         let conv = w.shape.0[1] as i32;
@@ -491,10 +535,12 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn gated_deltanet_step(&self, q: &Tensor, k: &Tensor, v: &Tensor, beta: &Tensor, gate: &Tensor, a_log: &Tensor, state_in: &Tensor, out: &mut Tensor, state_out: &mut Tensor) -> Result<()> {
+        self.enter();
         self.gated_deltanet_chunk(q, k, v, beta, gate, a_log, state_in, out, state_out)
     }
 
     fn gated_deltanet_chunk(&self, q: &Tensor, k: &Tensor, v: &Tensor, beta: &Tensor, gate: &Tensor, a_log: &Tensor, state_in: &Tensor, out: &mut Tensor, state_out: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = q.shape.0[0] as i32;
         let h = a_log.numel() as i32;
         let dk = *q.shape.0.last().unwrap() as i32;
@@ -508,25 +554,41 @@ impl crate::KernelBackend for CudaBackend {
         // WYF chunkwise: state ping-pong buffers (chunk chain), tail chunk
         // falls back to the exact per-token kernel inside the launcher.
         let dst_a = DevBuf::alloc(state_in.numel())?; dst_a.upload(state_in.as_slice())?;
-        let dst_b = DevBuf::alloc(state_out.numel())?;
         let do_ = DevBuf::alloc(out.numel())?;
-        ck(unsafe { ferrite_gdn_chunk_wyf(dq.as_const_f32(), dk_.as_const_f32(), dv_.as_const_f32(), db.as_const_f32(), dg.as_const_f32(), dal.as_const_f32(), dst_a.as_f32(), do_.as_f32(), dst_b.as_f32(), n, h, dk, dv, self.stream) }, "gdn_chunk_wyf")?;
+        ck(unsafe { ferrite_gdn_chunk(dq.as_const_f32(), dk_.as_const_f32(), dv_.as_const_f32(), db.as_const_f32(), dg.as_const_f32(), dal.as_const_f32(), dst_a.as_f32(), do_.as_f32(), n, h, dk, dv, self.stream) }, "gdn_chunk")?;
         self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         let sv = Arc::get_mut(&mut state_out.data).expect("unique state");
-        dst_b.download(sv)?;
+        dst_a.download(sv)?;
         Ok(())
     }
 
-    fn indexer_topk(&self, q_idx: &Tensor, k_idx: &Tensor, topk: usize, idx: &mut Tensor) -> Result<()> {
+    fn indexer_topk(
+        &self,
+        q_idx: &Tensor,
+        k_idx: &Tensor,
+        w: &Tensor,
+        topk: usize,
+        ctx0: usize,
+        idx: &mut Tensor,
+    ) -> Result<()> {
+        self.enter();
         let n = q_idx.shape.0[0] as i32;
+        let hd = q_idx.shape.0[1] as i32;
+        let d = k_idx.shape.0[1] as i32;
         let t = k_idx.shape.0[0] as i32;
-        let d = q_idx.shape.0[1] as i32;
+        let h = w.shape.0[1] as i32;
+        if hd != h * d {
+            return Err(FerriteError::InvalidArg(
+                "indexer_topk: q_idx [n,H*D] vs w [n,H] head mismatch".into(),
+            ));
+        }
         let dq = DevBuf::alloc(q_idx.numel())?; dq.upload(q_idx.as_slice())?;
         let dk = DevBuf::alloc(k_idx.numel())?; dk.upload(k_idx.as_slice())?;
+        let dw = DevBuf::alloc(w.numel())?; dw.upload(w.as_slice())?;
         let di = DevBuf::alloc(idx.numel())?;
-        ck(unsafe { ferrite_indexer_topk(dq.as_const_f32(), dk.as_const_f32(), di.as_f32(), n, t, d, topk as i32, self.stream) }, "indexer_topk")?;
+        ck(unsafe { ferrite_indexer_topk(dq.as_const_f32(), dk.as_const_f32(), dw.as_const_f32(), di.as_f32(), n, t, h, d, topk as i32, ctx0 as i32, self.stream) }, "indexer_topk")?;
         self.sync()?;
         let ov = Arc::get_mut(&mut idx.data).expect("unique idx");
         di.download(ov)?;
@@ -534,7 +596,9 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn sparse_mla_attn(&self, q: &Tensor, k_nope: &Tensor, v: &Tensor, idx: &Tensor, out: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = q.shape.0[0] as i32;
+        let t = k_nope.shape.0[0] as i32;
         let h = q.shape.0[1] as i32;
         let d = *q.shape.0.last().unwrap() as i32;
         let dv = *v.shape.0.last().unwrap() as i32;
@@ -544,7 +608,7 @@ impl crate::KernelBackend for CudaBackend {
         let dv_ = DevBuf::alloc(v.numel())?; dv_.upload(v.as_slice())?;
         let di = DevBuf::alloc(idx.numel())?; di.upload(idx.as_slice())?;
         let do_ = DevBuf::alloc(out.numel())?;
-        ck(unsafe { ferrite_sparse_attn(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), n, h, d, dv, topk, self.stream) }, "sparse_attn")?;
+        ck(unsafe { ferrite_sparse_attn(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), n, t, h, d, dv, topk, self.stream) }, "sparse_attn")?;
         self.sync()?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
@@ -552,6 +616,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn moe_route(&self, logits: &Tensor, bias: &Tensor, topk: usize, routed_scaling: f32, probs: &mut Tensor, ids: &mut Tensor) -> Result<()> {
+        self.enter();
         let n = logits.shape.0[0] as i32;
         let e = logits.shape.0[1] as i32;
         let dl = DevBuf::alloc(logits.numel())?; dl.upload(logits.as_slice())?;
@@ -559,7 +624,7 @@ impl crate::KernelBackend for CudaBackend {
         let dp = DevBuf::alloc(probs.numel())?;
         // ids on the CPU backend are f32-valued; the kernel writes i32.
         let di = DevBuf::alloc(n as usize * topk)?;
-        ck(unsafe { ferrite_moe_route(dl.as_const_f32(), db.as_const_f32(), dp.as_f32(), di.as_f32() as *mut i32, n, e, topk as i32, routed_scaling, self.stream) }, "moe_route")?;
+        ck(unsafe { ferrite_moe_route(dl.as_const_f32(), db.as_const_f32(), dp.as_f32(), di.as_f32(), n, e, topk as i32, routed_scaling, self.stream) }, "moe_route")?;
         self.sync()?;
         let pv = Arc::get_mut(&mut probs.data).expect("unique probs");
         dp.download(pv)?;
@@ -569,6 +634,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn expert_ffn(&self, x: &Tensor, gate_w: &Tensor, up_w: &Tensor, down_w: &Tensor, swiglu_limit: f32, out: &mut Tensor) -> Result<()> {
+        self.enter();
         // Fused device-resident chain: upload x once, two matmuls + swiglu2
         // + down matmul all on device, single D2H at the end. (The old path
         // did two host round-trips plus a host-side gate/up gather.)
@@ -588,6 +654,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn argmax_lastdim(&self, logits: &Tensor, out: &mut Tensor) -> Result<()> {
+        self.enter();
         let dim = *logits.shape.0.last().unwrap() as i32;
         let n = (logits.numel() / dim as usize) as i32;
         let dl = DevBuf::alloc(logits.numel())?; dl.upload(logits.as_slice())?;
@@ -600,6 +667,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn softmax_lastdim(&self, logits: &Tensor, out: &mut Tensor) -> Result<()> {
+        self.enter();
         let dim = *logits.shape.0.last().unwrap() as i32;
         let n = (logits.numel() / dim as usize) as i32;
         let dl = DevBuf::alloc(logits.numel())?; dl.upload(logits.as_slice())?;

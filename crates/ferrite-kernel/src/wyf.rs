@@ -168,6 +168,7 @@ mod tests {
     /// WYF parallel form must match the sequential golden recurrence
     /// bit-for-bit-ish (f32 tolerance) on random inputs.
     #[test]
+    #[ignore = "WYF assumes the exp-form decay e^{a*g}; GLM-5.3-Flash KDA decay is lb*sigmoid(...) (negative), so WYF is retired from the active paths — see cuda.rs gated_deltanet_chunk"]
     fn wyf_matches_sequential_golden() {
         let (n, h, dk, dv) = (16usize, 3usize, 8usize, 6usize);
         let mk3 = |d: Vec<f32>| Tensor::new(Shape::new([n, h, d.len() / (n * h)]), DType::F32, d);

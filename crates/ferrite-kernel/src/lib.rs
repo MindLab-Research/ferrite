@@ -130,11 +130,23 @@ pub trait KernelBackend: Send + Sync {
     // DSA sparse attention (11/45 layers, nope-only MLA + indexer)
     // ------------------------------------------------------------------
 
-    /// Indexer top-k: per query token, select `topk` KV tokens by
-    /// `q_idx · k_idx` score (paged in the real impl; the CPU reference
-    /// takes the full `[t, i_proj]` k cache and returns topk indices).
-    /// `q_idx: [n, i_proj]`, `k_idx: [t, i_proj]` → `idx: [n, topk]`.
-    fn indexer_topk(&self, q_idx: &Tensor, k_idx: &Tensor, topk: usize, idx: &mut Tensor) -> Result<()>;
+    /// Indexer top-k (real GLM-5.3-Flash checkpoint semantics):
+    /// `q_idx: [n, H*D]` per-head indexer queries (wq_b @ q_lora, H=index_n_heads),
+    /// `k_idx: [t, D]` shared index keys (k_norm(wk @ x), D=index_head_dim),
+    /// `w: [n, H]` per-head score weights (weights_proj @ x).
+    /// score[i, j] = Σ_h w[i,h] · relu(q_idx[i,h,:] · k_idx[j,:]) / √D → topk over j.
+    /// `ctx0`: causal guard — query row i may only select keys j <= ctx0 + i
+    /// (prefill rows attend causally; decode rows n=1 see all t keys).
+    /// `idx: [n, topk]` selected token indices (shared across heads).
+    fn indexer_topk(
+        &self,
+        q_idx: &Tensor,
+        k_idx: &Tensor,
+        w: &Tensor,
+        topk: usize,
+        ctx0: usize,
+        idx: &mut Tensor,
+    ) -> Result<()>;
 
     /// Sparse MLA attention over selected tokens.
     /// `q: [n, heads, d_q]` (nope only for 5.3-Flash),

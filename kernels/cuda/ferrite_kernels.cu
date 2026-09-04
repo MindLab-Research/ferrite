@@ -49,9 +49,10 @@ __global__ void matmul_tiled_kernel(const float* __restrict__ x,
             (row < n && k + threadIdx.x < in_f)
                 ? x[(size_t)row * in_f + k + threadIdx.x]
                 : 0.0f;
-        // w tile: w[col, k+ty] — broadcast within warp (correct, later
-        // replaced by pre-transposed weight layout for full coalescing)
-        sw[threadIdx.y][threadIdx.x] =
+        // w tile: sw[i][j] = w[c0+i][k0+j] — col (out dim) rows the tile,
+        // k dim columns. Store as [tx][ty] so the dot loop reads
+        // sw[tx][l] = w[c0+tx][k0+l].
+        sw[threadIdx.x][threadIdx.y] =
             (col < out_f && k + threadIdx.y < in_f)
                 ? w[(size_t)col * in_f + k + threadIdx.y]
                 : 0.0f;
@@ -119,14 +120,13 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x,
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         ss += xr[i] * xr[i];
     }
-    // block reduce (shared)
+    // warp reduce; each warp (threadIdx.y) writes its own shared slot
     __shared__ float warp_s[32];
     float lane = ss;
-    // simple shuffle reduce within warp-sized block.x
     for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffff, lane, off);
-    if (threadIdx.x == 0) warp_s[0] = lane / dim;
+    if (threadIdx.x == 0) warp_s[threadIdx.y] = lane / dim;
     __syncthreads();
-    float inv = rsqrtf(warp_s[0] + eps);
+    float inv = rsqrtf(warp_s[threadIdx.y] + eps);
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         or_[i] = xr[i] * inv * w[i];
     }
@@ -160,11 +160,12 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ x,
     float lane = ss;
     for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffff, lane, off);
     __shared__ float warp_s[32];
-    if (threadIdx.x == 0) warp_s[0] = lane / dim;
+    if (threadIdx.x == 0) warp_s[threadIdx.y] = lane / dim;
     __syncthreads();
-    float inv = rsqrtf(warp_s[0] + eps);
+    float inv = rsqrtf(warp_s[threadIdx.y] + eps);
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
-        or_[i] = xr[i] * inv * w[i] * (gr[i] + 1.0f);
+        // Glm5NextTextRMSNormGated: y = rmsnorm(x) * w * sigmoid(gate)
+        or_[i] = xr[i] * inv * w[i] / (1.0f + __expf(-gr[i]));
     }
 }
 
@@ -191,7 +192,7 @@ __global__ void swiglu_kernel(const float* __restrict__ gu,
     int row = idx / inter, col = idx % inter;
     float g = gu[(size_t)row * 2 * inter + col];
     float u = gu[(size_t)row * 2 * inter + inter + col];
-    g = fminf(fmaxf(g, -limit), limit);
+    g = fminf(g, limit); // gate: clamp max only (transformers)
     u = fminf(fmaxf(u, -limit), limit);
     out[idx] = (g / (1.0f + expf(-g))) * u;
 }
@@ -219,7 +220,7 @@ __global__ void swiglu2_kernel(const float* __restrict__ gate,
     if (idx >= total) return;
     float g = gate[idx];
     float u = up[idx];
-    g = fminf(fmaxf(g, -limit), limit);
+    g = fminf(g, limit); // gate: clamp max only (transformers)
     u = fminf(fmaxf(u, -limit), limit);
     out[idx] = (g / (1.0f + expf(-g))) * u;
 }
@@ -245,19 +246,24 @@ __global__ void conv1d_kernel(const float* __restrict__ x,
                               float* __restrict__ out,
                               float* __restrict__ state_out,
                               int n, int ch, int conv) {
-    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    // One block per channel (stream[] is per-channel state — the old (64,4)
+    // block shared one stream across 64 channels, a data race).
+    int c = blockIdx.x;
     if (c >= ch) return;
     int hist = conv - 1;
     extern __shared__ float stream[]; // hist + n floats (dynamic)
-    for (int h = threadIdx.y; h < hist; h += blockDim.y) stream[h] = state_in[c * hist + h];
-    for (int t = threadIdx.y; t < n; t += blockDim.y) stream[hist + t] = x[(size_t)t * ch + c];
+    for (int h = threadIdx.x; h < hist; h += blockDim.x)
+        stream[h] = state_in[c * hist + h];
+    for (int t = threadIdx.x; t < n; t += blockDim.x)
+        stream[hist + t] = x[(size_t)t * ch + c];
     __syncthreads();
-    for (int t = threadIdx.y; t < n; t += blockDim.y) {
+    for (int t = threadIdx.x; t < n; t += blockDim.x) {
         float acc = 0.f;
-        for (int i = 0; i < conv; i++) acc += w[c * conv + i] * stream[hist + t - (conv - 1) + i];
+        for (int i = 0; i < conv; i++)
+            acc += w[c * conv + i] * stream[hist + t - (conv - 1) + i];
         out[(size_t)t * ch + c] = acc;
     }
-    for (int h = threadIdx.y; h < hist; h += blockDim.y)
+    for (int h = threadIdx.x; h < hist; h += blockDim.x)
         state_out[c * hist + h] = stream[n + h];
 }
 
@@ -266,8 +272,8 @@ extern "C" cudaError_t ferrite_causal_conv1d(const float* x, const float* w,
                                              float* state_out, int n, int ch,
                                              int conv, cudaStream_t s) {
     int hist = conv - 1;
-    dim3 block(64, 4);
-    dim3 grid((ch + 63) / 64);
+    dim3 block(128);
+    dim3 grid(ch);
     size_t smem = (size_t)(hist + n) * sizeof(float);
     conv1d_kernel<<<grid, block, smem, s>>>(x, w, state_in, out, state_out, n, ch, conv);
     return cudaGetLastError();
@@ -293,16 +299,17 @@ __global__ void gdn_step_kernel(const float* __restrict__ q,
     int t = blockIdx.z;
     int hd = blockIdx.y;
     if (t >= n || hd >= h) return;
-    float a = -expf(a_log[hd]);
+    // KDA form: `gate` carries the LOG-SPACE decay (lb * sigmoid(exp(A_log)*(fb+dt_bias)));
+    // the recurrence is S *= exp(gate) (fla naive_recurrent_kda).
     float bt = beta[t * h + hd];
     float* S = state + (size_t)hd * dk * dv;
     const float* qh = q + ((size_t)t * h + hd) * dk;
     const float* kh = k + ((size_t)t * h + hd) * dk;
     const float* vh = v + ((size_t)t * h + hd) * dv;
     const float* gh = gate + ((size_t)t * h + hd) * dk;
-    // 1. per-channel decay: S[i, :] *= exp(g[i] * a)
+    // 1. per-channel decay: S[i, :] *= expf(gate[h, i]) — KDA log-space gate
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-        float decay = expf(gh[i] * a);
+        float decay = expf(gh[i]);
         if (decay != 1.0f) {
             for (int j = 0; j < dv; j++) S[(size_t)i * dv + j] *= decay;
         }
@@ -565,20 +572,27 @@ extern "C" cudaError_t ferrite_gdn_chunk_wyf(const float* q, const float* k,
 __global__ void moe_route_kernel(const float* __restrict__ logits,
                                  const float* __restrict__ bias,
                                  float* __restrict__ probs,
-                                 int* __restrict__ ids,
+                                 float* __restrict__ ids,
                                  int n, int e, int topk, float scale) {
     int row = blockIdx.x;
     if (row >= n) return;
-    extern __shared__ float sm[]; // e floats: sigmoid scores
+    // transformers Glm5NextTextTopkRouter:
+    //   scores = sigmoid(logits);  choice = scores + e_score_correction_bias
+    //   top-k on `choice`; weights = raw sigmoid scores (no bias), renormed.
+    extern __shared__ float sm[]; // 2e floats: [0..e) sigmoid, [e..2e) choice
+    float* ch = sm + e;
     for (int j = threadIdx.x; j < e; j += blockDim.x)
-        sm[j] = 1.0f / (1.0f + expf(-(logits[(size_t)row * e + j] + bias[j])));
+        sm[j] = 1.0f / (1.0f + expf(-logits[(size_t)row * e + j]));
     __syncthreads();
-    // selection sort topk (small e in v1; bitonic later)
+    for (int j = threadIdx.x; j < e; j += blockDim.x)
+        ch[j] = sm[j] + bias[j];
+    __syncthreads();
+    // selection sort topk on the choice scores (small e in v1; bitonic later)
     for (int r = 0; r < topk; r++) {
         int best = -1;
         float bv = -1e30f;
         for (int j = threadIdx.x; j < e; j += blockDim.x) {
-            if (sm[j] > bv) { bv = sm[j]; best = j; }
+            if (ch[j] > bv) { bv = ch[j]; best = j; }
         }
         // warp-ish reduce: use shared
         __shared__ int bidx[32];
@@ -597,18 +611,17 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
         }
         if (threadIdx.x == 0) {
             int sel = bidx[0];
-            ids[(size_t)row * topk + r] = sel;
-            sm[sel] = -1e30f; // remove
-            probs[(size_t)row * topk + r] = 0; // filled after renorm below
+            ids[(size_t)row * topk + r] = (float)sel;
+            ch[sel] = -1e30f; // remove
         }
         __syncthreads();
     }
-    // renorm pass (single thread, small topk)
+    // renorm pass (single thread, small topk) — raw sigmoid scores, no bias
     if (threadIdx.x == 0) {
         float sum = 0.f;
         for (int r = 0; r < topk; r++) {
-            int j = ids[(size_t)row * topk + r];
-            float val = 1.0f / (1.0f + expf(-(logits[(size_t)row * e + j] + bias[j])));
+            int j = (int)ids[(size_t)row * topk + r];
+            float val = sm[j];
             probs[(size_t)row * topk + r] = val;
             sum += val;
         }
@@ -618,11 +631,11 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
 }
 
 extern "C" cudaError_t ferrite_moe_route(const float* logits, const float* bias,
-                                        float* probs, int* ids, int n, int e,
+                                        float* probs, float* ids, int n, int e,
                                         int topk, float scale, cudaStream_t s) {
     dim3 block(32);
     dim3 grid(n);
-    size_t smem = (size_t)e * sizeof(float);
+    size_t smem = 2 * (size_t)e * sizeof(float);
     moe_route_kernel<<<grid, block, smem, s>>>(logits, bias, probs, ids, n, e, topk, scale);
     return cudaGetLastError();
 }
@@ -706,23 +719,37 @@ extern "C" cudaError_t ferrite_softmax(const float* logits, float* out, int n,
 }
 
 // ============================================================
-// indexer_topk: per query row, top-k indices by dot(q, k) / sqrt(dim).
+// indexer_topk (real GLM-5.3-Flash semantics):
+//   qi: [n, H*D] per-head indexer queries, ki: [t, D] shared keys,
+//   w:  [n, H] per-head score weights.
+//   score[i,j] = Σ_h w[i,h] · (q[i,h,:]·k[j,:]) / √D → topk over j.
 // v1: full scan per row (t <= 1M tokens OK for correctness harness).
 // ============================================================
 __global__ void indexer_topk_kernel(const float* __restrict__ qi,
                                      const float* __restrict__ ki,
+                                     const float* __restrict__ w,
                                      float* __restrict__ idx,
-                                     int n, int t, int d, int topk) {
+                                     int n, int t, int h, int d, int topk, int ctx0) {
     int row = blockIdx.x;
     if (row >= n) return;
     extern __shared__ float sm[]; // t scores (dynamic smem; t*4 bytes)
     float inv_sqrt_d = rsqrtf((float)d);
+    // causal guard: query row i may only select keys j < ctx0 + i + 1
+    int jmax = min(ctx0 + row + 1, t);
     for (int j = threadIdx.x; j < t; j += blockDim.x) {
-        const float* q = qi + (size_t)row * d;
         const float* k = ki + (size_t)j * d;
-        float acc = 0.f;
-        for (int l = 0; l < d; l++) acc += q[l] * k[l];
-        sm[j] = acc * inv_sqrt_d;
+        float s = 0.f;
+        if (j < jmax) {
+            for (int hi = 0; hi < h; hi++) {
+                const float* q = qi + (size_t)row * (h * d) + hi * d;
+                float dot = 0.f;
+                for (int l = 0; l < d; l++) dot += q[l] * k[l];
+                s += w[(size_t)row * h + hi] * fmaxf(dot, 0.f); // relu
+            }
+            sm[j] = s * inv_sqrt_d;
+        } else {
+            sm[j] = -INFINITY;
+        }
     }
     __syncthreads();
     // selection topk
@@ -746,20 +773,25 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
         }
         if (threadIdx.x == 0) {
             int sel = bidx[0];
-            idx[(size_t)row * topk + r] = (float)sel;
-            sm[sel] = -INFINITY;
+            if (sel >= 0) {
+                idx[(size_t)row * topk + r] = (float)sel;
+                sm[sel] = -INFINITY;
+            } else {
+                idx[(size_t)row * topk + r] = -1.0f; // invisible: skip at expansion
+            }
         }
         __syncthreads();
     }
 }
 
 extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
-                                            float* idx, int n, int t, int d,
-                                            int topk, cudaStream_t s) {
+                                            const float* w,
+                                            float* idx, int n, int t, int h, int d,
+                                            int topk, int ctx0, cudaStream_t s) {
     dim3 block(32);
     dim3 grid(n);
     size_t smem = (size_t)t * sizeof(float);
-    indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, idx, n, t, d, topk);
+    indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, w, idx, n, t, h, d, topk, ctx0);
     return cudaGetLastError();
 }
 
@@ -773,7 +805,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
                                    const float* __restrict__ v,
                                    const float* __restrict__ idx,
                                    float* __restrict__ out,
-                                   int n, int h, int d, int dv, int topk) {
+                                   int n, int t, int h, int d, int dv, int topk) {
     int row = blockIdx.x;
     int hd = blockIdx.y;
     if (row >= n) return;
@@ -781,6 +813,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
     extern __shared__ float sm[]; // topk scores + topk exp
     for (int s = threadIdx.x; s < topk; s += blockDim.x) {
         int j = (int)idx[(size_t)row * topk + s];
+        if (j < 0 || j >= t) { sm[s] = -INFINITY; continue; } // kpool padding (-1) / OOB guard
         const float* qh = q + ((size_t)row * h + hd) * d;
         const float* kj = k + ((size_t)j * h + hd) * d;
         float acc = 0.f;
@@ -815,6 +848,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
         float acc = 0.f;
         for (int s = 0; s < topk; s++) {
             int j = (int)idx[(size_t)row * topk + s];
+            if (j < 0 || j >= t) continue; // kpool padding (-1) / OOB guard
             float w = sm[s] / denom;
             acc += w * v[((size_t)j * h + hd) * dv + j2];
         }
@@ -824,10 +858,13 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
 
 extern "C" cudaError_t ferrite_sparse_attn(const float* q, const float* k,
                                            const float* v, const float* idx,
-                                           float* out, int n, int h, int d,
+                                           float* out, int n, int t, int h, int d,
                                            int dv, int topk, cudaStream_t s) {
-    dim3 block(128);
+    // NOTE: block width must stay <= 32 — the shared reduction arrays
+    // (red/reds) are [32]; 128 threads would write out of bounds.
+    dim3 block(32);
     dim3 grid(n, h);
-    sparse_attn_kernel<<<grid, block, 0, s>>>(q, k, v, idx, out, n, h, d, dv, topk);
+    size_t smem = (size_t)topk * sizeof(float); // dynamic smem for the topk scores
+    sparse_attn_kernel<<<grid, block, smem, s>>>(q, k, v, idx, out, n, t, h, d, dv, topk);
     return cudaGetLastError();
 }

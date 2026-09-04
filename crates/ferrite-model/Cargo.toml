@@ -8,4 +8,5 @@ license.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rayon.workspace = true
 ferrite-types = { path = "../ferrite-types" }

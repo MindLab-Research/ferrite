@@ -187,8 +187,9 @@ pub fn hc_pre(
     )
 }
 
-/// One hc_post step (sglang `_mhc_post_torch` exact port):
-/// residual′[t,i,j] = post[t,i] · x[t,j] + Σₖ comb[t,i,k] · residual[t,k,j]
+/// One hc_post step (transformers `_mhc_post_torch` port):
+/// residual′[t,i,j] = post[t,i] · x[t,j] + Σₖ comb[t,**k,i] · residual[t,k,j]
+/// (note the comb transpose: transformers does matmul(combᵀ, residual))
 ///
 /// `x: [s,h]`, `residual: [s,n,h]`, `post: [s,n]`, `comb: [s,n,n]`.
 pub fn hc_post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> Tensor {
@@ -201,7 +202,7 @@ pub fn hc_post(x: &Tensor, residual: &Tensor, post: &Tensor, comb: &Tensor) -> T
             for j in 0..h {
                 let mut acc = post.as_slice()[t * n + i] * x.as_slice()[t * h + j];
                 for k in 0..n {
-                    acc += comb.as_slice()[(t * n + i) * n + k]
+                    acc += comb.as_slice()[(t * n + k) * n + i]
                         * residual.as_slice()[(t * n + k) * h + j];
                 }
                 data[(t * n + i) * h + j] = acc;

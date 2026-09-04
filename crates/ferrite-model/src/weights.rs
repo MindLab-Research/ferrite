@@ -44,6 +44,7 @@ fn spec(name: &str, dims: impl IntoIterator<Item = usize>) -> WeightSpec {
 fn push_layer_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53FlashConfig) {
     let h = cfg.hidden_size;
     dst.push(spec(&format!("{pfx}.input_layernorm.weight"), [h]));
+    dst.push(spec(&format!("{pfx}.post_attention_layernorm.weight"), [h]));
     if cfg.mhc {
         // Hyper-connection params (float32 in the checkpoint).
         // Shapes per sglang Glm5NextDecoderLayer:
@@ -68,7 +69,8 @@ fn push_linear_attn_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53Flash
     let h = cfg.hidden_size;
     let proj = la.num_heads * la.head_dim;
     let c = la.short_conv_kernel_size;
-    // projections (unfused names)
+    // projections (real checkpoint stores q/k/v separately; the checkpoint
+    // adapter concatenates them into the fused qkv_proj at load time)
     dst.push(spec(&format!("{pfx}.qkv_proj.weight"), [3 * proj, h]));
     dst.push(spec(&format!("{pfx}.f_a_proj.weight"), [la.head_dim, h]));
     dst.push(spec(&format!("{pfx}.f_b_proj.weight"), [proj, la.head_dim]));
@@ -77,11 +79,15 @@ fn push_linear_attn_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53Flash
     dst.push(spec(&format!("{pfx}.g_b_proj.weight"), [proj, la.head_dim]));
     // recurrent-state params
     dst.push(spec(&format!("{pfx}.A_log"), [la.num_heads]));
-    dst.push(spec(&format!("{pfx}.dt_bias"), [3 * proj]));
-    // short causal conv on q/k/v (conv1d, in-channels = 3*proj, kernel c)
+    // KDA dt bias: [num_heads*head_dim] — enters the forget gate
+    // (decay = lb * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias)))
+    dst.push(spec(&format!("{pfx}.dt_bias"), [proj]));
+    // short causal conv on q/k/v (conv1d, in-channels = 3*proj, kernel c;
+    // checkpoint adapter concatenates the per-branch q/k/v convs)
     dst.push(spec(&format!("{pfx}.qkv_conv1d.weight"), [3 * proj, c]));
-    // output norm (RMSNorm with gate over heads*head_dim)
-    dst.push(spec(&format!("{pfx}.o_norm.weight"), [proj]));
+    // per-head gated output norm (real checkpoint: [head_dim], applied
+    // head-wise — see Engine's reshape [n*h, head_dim])
+    dst.push(spec(&format!("{pfx}.o_norm.weight"), [la.head_dim]));
     dst.push(spec(&format!("{pfx}.o_proj.weight"), [h, proj]));
 }
 
@@ -100,11 +106,19 @@ fn push_dsa_attn_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53FlashCon
         &format!("{pfx}.kv_b_proj.weight"),
         [nh * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
     ));
-    // indexer (lightweight q/k for top-k page selection)
-    let iproj = d.index_n_heads * d.index_head_dim;
-    dst.push(spec(&format!("{pfx}.indexer_q_proj.weight"), [iproj, h]));
-    dst.push(spec(&format!("{pfx}.indexer_k_proj.weight"), [iproj, h]));
-    dst.push(spec(&format!("{pfx}.indexer_norm.weight"), [iproj]));
+    // indexer (real-checkpoint layout: per-head queries from the q_lora
+    // latent, shared index keys from hidden, affine k_norm, per-head score
+    // weights)
+    let ih = d.index_n_heads;
+    let idm = d.index_head_dim;
+    dst.push(spec(&format!("{pfx}.indexer.wq_b.weight"), [ih * idm, d.q_lora_rank]));
+    dst.push(spec(&format!("{pfx}.indexer.wk.weight"), [idm, h]));
+    dst.push(spec(&format!("{pfx}.indexer.k_norm.weight"), [idm]));
+    dst.push(spec(&format!("{pfx}.indexer.k_norm.bias"), [idm]));
+    dst.push(spec(&format!("{pfx}.indexer.weights_proj.weight"), [ih, h]));
+    // k-pool compression (indexer.kpool_compress_*): gate [head_dim, hidden], ape [kpool, head_dim]
+    dst.push(spec(&format!("{pfx}.indexer.index_kpool_compress_gate"), [idm, h]));
+    dst.push(spec(&format!("{pfx}.indexer.index_kpool_compress_ape"), [4, idm]));
     dst.push(spec(&format!("{pfx}.o_proj.weight"), [h, nh * d.v_head_dim]));
 }
 
@@ -120,6 +134,8 @@ fn push_moe_mlp_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53FlashConf
     let h = cfg.hidden_size;
     let i = cfg.moe_intermediate_size;
     dst.push(spec(&format!("{pfx}.gate.weight"), [cfg.n_routed_experts, h]));
+    // noaux-tc routing bias (real checkpoint: gate.e_score_correction_bias)
+    dst.push(spec(&format!("{pfx}.gate.e_score_correction_bias"), [cfg.n_routed_experts]));
     if cfg.n_shared_experts > 0 {
         dst.push(spec(&format!("{pfx}.shared_expert.gate_proj.weight"), [i, h]));
         dst.push(spec(&format!("{pfx}.shared_expert.up_proj.weight"), [i, h]));
@@ -199,7 +215,9 @@ pub fn random_weights(cfg: &Glm53FlashConfig, seed: u64) -> Weights {
             || spec.name.ends_with("dt_bias")
             || spec.name.ends_with("layernorm.weight")
             || spec.name.ends_with("o_norm.weight")
-            || spec.name.ends_with("indexer_norm.weight")
+            || spec.name.ends_with("k_norm.weight")
+            || spec.name.ends_with("k_norm.bias")
+            || spec.name.ends_with("e_score_correction_bias")
             || spec.name.ends_with("hc_attn_base")
             || spec.name.ends_with("hc_ffn_base");
         let data: Vec<f32> = if is_bias_like {
@@ -229,9 +247,16 @@ mod tests {
         assert!(names.contains(&"model.layers.2.mlp.gate.weight"));
         assert!(names.contains(&"model.layers.2.mlp.experts.7.down_proj.weight"));
         assert!(names.contains(&"lm_head.weight"));
-        // linear layer has conv + A_log + dt_bias
+        // linear layer has conv + A_log; DSA layer has real-checkpoint indexer names
         assert!(names.contains(&"model.layers.0.self_attn.qkv_conv1d.weight"));
         assert!(names.contains(&"model.layers.0.self_attn.A_log"));
+        assert!(names.contains(&"model.layers.0.self_attn.o_norm.weight"));
+        assert!(names.contains(&"model.layers.1.self_attn.indexer.wq_b.weight"));
+        assert!(names.contains(&"model.layers.1.self_attn.indexer.wk.weight"));
+        assert!(names.contains(&"model.layers.1.self_attn.indexer.k_norm.weight"));
+        assert!(names.contains(&"model.layers.1.self_attn.indexer.k_norm.bias"));
+        assert!(names.contains(&"model.layers.1.self_attn.indexer.weights_proj.weight"));
+        assert!(names.contains(&"model.layers.2.mlp.gate.e_score_correction_bias"));
         // mhc params present
         assert!(names.contains(&"model.layers.0.hc_attn_base"));
     }
@@ -242,11 +267,12 @@ mod tests {
         let l = weight_layout(&cfg);
         let n = l.names().count();
         // 3 top-level (embed/norm/lm_head)
-        // + linear layer (34x): norm+mhc 7 + attn 11
-        // + dsa layer (11x): norm+mhc 7 + attn 10
+        // + per layer: input_layernorm + post_attention_layernorm (2)
+        // + linear layer (34x): mhc 6 + attn 11 (qkv/f_a/f_b/b/g_a/g_b/A_log/dt_bias/conv/o_norm/o_proj)
+        // + dsa layer (11x): mhc 6 + attn 12 (q_a/q_a_ln/q_b/kv_a/kv_a_ln/kv_b/indexer.wq_b/indexer.wk/indexer.k_norm.w/b/indexer.weights_proj/o_proj)
         // + dense mlp (3x): 3
-        // + moe layer (42x): gate + 3 shared + 288*3 experts = 868
-        let expect = 3 + 34 * (7 + 11) + 11 * (7 + 10) + 3 * 3 + 42 * (1 + 3 + cfg.n_routed_experts * 3);
+        // + moe layer (42x): gate + gate bias + 3 shared + 288*3 experts = 869
+        let expect = 3 + (34 + 11) * (2 + 6) + 34 * 11 + 11 * 14 + 3 * 3 + 42 * (2 + 3 + cfg.n_routed_experts * 3);
         assert_eq!(n, expect, "weight name count");
     }
 

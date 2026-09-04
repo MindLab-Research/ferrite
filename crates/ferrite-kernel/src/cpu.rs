@@ -152,7 +152,8 @@ impl crate::KernelBackend for CpuBackend {
     ) -> Result<()> {
         self.rec("gated_rmsnorm");
         self.rec("gated_rmsnorm");
-        // GLM linear-attn o_norm: y = rmsnorm(x) * (gate + 1)  (gate from g proj, silu'd upstream)
+        // GLM linear-attn o_norm: y = rmsnorm(x) * w * sigmoid(gate)
+        // (Glm5NextTextRMSNormGated applies sigmoid to the gate, not +1)
         let dim = *x.shape.0.last().ok_or_else(|| FerriteError::InvalidArg("gated rank 0".into()))?;
         let n = x.numel() / dim;
         if gate.numel() != x.numel() || w.numel() != dim || out.shape != x.shape {
@@ -162,12 +163,13 @@ impl crate::KernelBackend for CpuBackend {
         let gs = gate.as_slice();
         let ws = w.as_slice();
         let ovec = Arc::get_mut(&mut out.data).expect("unique out");
+        let sig = |v: f32| 1.0 / (1.0 + (-v).exp());
         for i in 0..n {
             let row = &xs[i * dim..(i + 1) * dim];
             let ss: f32 = row.iter().map(|v| v * v).sum::<f32>() / dim as f32;
             let inv = 1.0 / (ss + eps).sqrt();
             for j in 0..dim {
-                ovec[i * dim + j] = row[j] * inv * ws[j] * (gs[i * dim + j] + 1.0);
+                ovec[i * dim + j] = row[j] * inv * ws[j] * sig(gs[i * dim + j]);
             }
         }
         Ok(())
@@ -186,11 +188,13 @@ impl crate::KernelBackend for CpuBackend {
         }
         let g = gate_up.as_slice();
         let ovec = Arc::get_mut(&mut out.data).expect("unique out");
-        let cl = |v: f32| v.clamp(-limit, limit);
+        // transformers: gate.clamp(max=limit) (single-sided), up.clamp(±limit)
+        let cl_gate = |v: f32| if v > limit { limit } else { v };
+        let cl_up = |v: f32| v.clamp(-limit, limit);
         for i in 0..n {
             for j in 0..inter {
-                let gi = cl(g[i * two_i + j]);
-                let ui = cl(g[i * two_i + inter + j]);
+                let gi = cl_gate(g[i * two_i + j]);
+                let ui = cl_up(g[i * two_i + inter + j]);
                 let silu = gi / (1.0 + (-gi).exp());
                 ovec[i * inter + j] = silu * ui;
             }
@@ -291,24 +295,27 @@ impl crate::KernelBackend for CpuBackend {
         let ks = k.as_slice();
         let vs = v.as_slice();
         let bs = beta.as_slice();
-        let gs = gate.as_slice(); // [n, h, dk] channel-wise
+        let gs = gate.as_slice(); // [n, h, dk]: log-space decay (negative),
+                                  // = lb * sigmoid(exp(A_log) * (f_b(f_a(x)) + dt_bias))
+                                  // KDA: S *= exp(gate)  (fla naive_recurrent_kda)
         let als = a_log.as_slice();
+        let _ = als; // folded into `gate` by the engine
         // work on a local copy of the state (state may alias state_in)
         let mut s = state_in.as_slice().to_vec();
         let ovec = Arc::get_mut(&mut out.data).expect("unique out");
         let head_elems = dk * dv;
         for t in 0..n {
             for hd in 0..h {
-                let a = -als[hd].exp(); // per-head decay rate (< 0)
                 let bt = bs[t * h + hd];
                 let qh = &qs[t * h * dk + hd * dk..t * h * dk + (hd + 1) * dk];
                 let kh = &ks[t * h * dk + hd * dk..t * h * dk + (hd + 1) * dk];
                 let vh = &vs[t * h * dv + hd * dv..t * h * dv + (hd + 1) * dv];
                 let gh = &gs[t * h * dk + hd * dk..t * h * dk + (hd + 1) * dk];
                 let sh = &mut s[hd * head_elems..(hd + 1) * head_elems];
-                // S[i, :] *= exp(gate[h, i] * a) — per-channel row scaling
+                // S[i, :] *= exp(gate[h, i]) — KDA decay is log-space (fla:
+                // S = S * g.exp(); gate = lb*sigmoid(exp(A_log)*(fb+dt_bias)))
                 for i in 0..dk {
-                    let decay = (gh[i] * a).exp();
+                    let decay = gh[i].exp();
                     if decay != 1.0 {
                         for j in 0..dv {
                             sh[i * dv + j] *= decay;
@@ -365,32 +372,68 @@ impl crate::KernelBackend for CpuBackend {
 
     // ================= DSA sparse attention =================
 
-    fn indexer_topk(&self, q_idx: &Tensor, k_idx: &Tensor, topk: usize, idx: &mut Tensor) -> Result<()> {
+    fn indexer_topk(
+        &self,
+        q_idx: &Tensor,
+        k_idx: &Tensor,
+        w: &Tensor,
+        topk: usize,
+        ctx0: usize,
+        idx: &mut Tensor,
+    ) -> Result<()> {
         self.rec("indexer_topk");
-        let (n, d) = Self::check_2d(q_idx, "q_idx")?;
-        let (t, d2) = Self::check_2d(k_idx, "k_idx")?;
-        if d != d2 {
-            return Err(FerriteError::InvalidArg("indexer dim mismatch".into()));
+        // q_idx: [n, H*D] (per-head queries), k_idx: [t, D] (shared keys),
+        // w: [n, H] per-head score weights. Causal: row i selects j <= ctx0+i.
+        let (n, hd) = Self::check_2d(q_idx, "q_idx")?;
+        let (t, d) = Self::check_2d(k_idx, "k_idx")?;
+        if hd % d != 0 {
+            return Err(FerriteError::InvalidArg("indexer q rows must be H*D".into()));
+        }
+        let h = hd / d;
+        if w.shape.0 != [n, h] {
+            return Err(FerriteError::InvalidArg(format!(
+                "indexer w shape {:?} != [{n},{h}]",
+                w.shape.0
+            )));
         }
         if idx.shape.0 != [n, topk] || topk > t {
             return Err(FerriteError::InvalidArg("indexer topk shape".into()));
         }
         let qs = q_idx.as_slice();
         let ks = k_idx.as_slice();
+        let ws = w.as_slice();
+        let inv_sqrt_d = 1.0 / (d as f32).sqrt();
         let ovec = Arc::get_mut(&mut idx.data).expect("unique idx");
         for i in 0..n {
-            // full scan (reference); paged/quantised on GPU
+            // causal guard: only keys j < ctx0 + i + 1 are candidates
+            let jmax = (ctx0 + i + 1).min(t);
             let mut scored: Vec<(f32, usize)> = (0..t)
                 .map(|j| {
-                    let s: f32 = (0..d).map(|l| qs[i * d + l] * ks[j * d + l]).sum::<f32>() / (d as f32).sqrt();
-                    (s, j)
+                    if j >= jmax {
+                        return (f32::NEG_INFINITY, j);
+                    }
+                    let mut s = 0.0f32;
+                    for hi in 0..h {
+                        let mut dot = 0.0f32;
+                        let qo = i * hd + hi * d;
+                        for l in 0..d {
+                            dot += qs[qo + l] * ks[j * d + l];
+                        }
+                        s += ws[i * h + hi] * dot.max(0.0);
+                    }
+                    (s * inv_sqrt_d, j)
                 })
                 .collect();
             // partial sort: top-k by score, ties keep lower index (stable)
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
-            for (rk, (s, j)) in scored.iter().take(topk).enumerate() {
-                let _ = s;
-                ovec[i * topk + rk] = *j as f32;
+            for (rk, (sc, j)) in scored.iter().take(topk).enumerate() {
+                let sel = if *sc == f32::NEG_INFINITY {
+                    // invisible pool: emit -1 (skipped at expansion time)
+                    -1.0f32
+                } else {
+                    *j as f32
+                };
+                ovec[i * topk + rk] = sel;
             }
         }
         Ok(())
@@ -439,7 +482,11 @@ impl crate::KernelBackend for CpuBackend {
                 // scores over selected tokens
                 let mut sc = Vec::with_capacity(topk);
                 for s in 0..topk {
-                    let j = is_[i * topk + s] as usize;
+                    let jf = is_[i * topk + s];
+                    if jf < 0.0 {
+                        continue; // kpool padding slot (-1)
+                    }
+                    let j = jf as usize;
                     if j >= t {
                         return Err(FerriteError::IndexOutOfBounds { index: j, len: t });
                     }
@@ -487,19 +534,24 @@ impl crate::KernelBackend for CpuBackend {
         let pvec = Arc::get_mut(&mut probs.data).expect("unique probs");
         let ivec = Arc::get_mut(&mut ids.data).expect("unique ids");
         for i in 0..n {
-            // sigmoid score + noaux-tc bias, select top-k
+            // transformers Glm5NextTextTopkRouter:
+            //   scores = sigmoid(logits)
+            //   scores_for_choice = scores + e_score_correction_bias  (top-k on this)
+            //   topk_weights = scores.gather(idx)  (raw sigmoid, no bias)
+            //   renorm + routed_scaling_factor
+            let sig: Vec<f32> = (0..e).map(|j| 1.0 / (1.0 + (-ls[i * e + j]).exp())).collect();
             let mut scored: Vec<(f32, usize)> = (0..e)
-                .map(|j| {
-                    let s = 1.0 / (1.0 + (-(ls[i * e + j] + bs[j])).exp());
-                    (s, j)
-                })
+                .map(|j| (sig[j] + bs[j], j))
                 .collect();
             scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap().then(a.1.cmp(&b.1)));
             let sel: Vec<(f32, usize)> = scored.iter().take(topk).copied().collect();
-            let sum: f32 = sel.iter().map(|(s, _)| *s).sum::<f32>();
-            for (rk, (s, j)) in sel.iter().enumerate() {
+            let mut sum = 0.0f32;
+            for (s, j) in &sel {
+                sum += sig[*j];
+            }
+            for (rk, (_, j)) in sel.iter().enumerate() {
                 ivec[i * topk + rk] = *j as f32;
-                pvec[i * topk + rk] = s / (sum + f32::EPSILON) * routed_scaling;
+                pvec[i * topk + rk] = sig[*j] / (sum + f32::EPSILON) * routed_scaling;
             }
         }
         Ok(())

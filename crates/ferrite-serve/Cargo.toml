@@ -1,0 +1,23 @@
+[package]
+name = "ferrite-serve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ferrite-serve"
+path = "src/main.rs"
+
+[features]
+default = ["cuda"]
+cuda = ["ferrite-kernel/cuda"]
+
+[dependencies]
+thiserror.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+ferrite-types = { path = "../ferrite-types" }
+ferrite-model = { path = "../ferrite-model" }
+ferrite-kernel = { path = "../ferrite-kernel" }
+ferrite-exec = { path = "../ferrite-exec" }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
