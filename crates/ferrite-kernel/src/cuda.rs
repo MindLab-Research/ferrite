@@ -74,6 +74,11 @@ extern "C" {
                       rms_eps: f32, hc_eps: f32, iters: i32, stream: CuStream) -> i32;
     fn ferrite_hc_post(x: *const f32, res: *const f32, post: *const f32, comb: *const f32,
                        out: *mut f32, s: i32, n: i32, h: i32, stream: CuStream) -> i32;
+    fn ferrite_gdn_prep(conv_out: *const f32, b_raw: *const f32, fb: *const f32,
+                        dt_bias: *const f32, a_log: *const f32,
+                        q: *mut f32, k: *mut f32, v: *mut f32, beta: *mut f32, gate: *mut f32,
+                        n: i32, h: i32, dk: i32, lb: f32, stream: CuStream) -> i32;
+    fn cudaMemset(ptr: *mut std::ffi::c_void, val: i32, bytes: usize) -> i32;
 }
 
 const CUDA_MEMCPY_H2D: i32 = 1;
@@ -278,6 +283,11 @@ pub struct CudaBackend {
     /// CUDA graph capture state (driver-API handle for the instantiated
     /// graph exec; see the GraphCapable impl below).
     graph: std::sync::Mutex<GraphState>,
+    /// Device-resident recurrent states, keyed (seq, layer) — GDN
+    /// [h,dk,dk] state and conv tails. NOT pooled (must persist across
+    /// tokens; pooled buffers would be reused by other ops).
+    gdn_states: std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
+    conv_states: std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
 }
 
 // cudaStream_t is thread-safe (CUDA runtime serialises ops on a stream);
@@ -288,6 +298,11 @@ unsafe impl Sync for CudaBackend {}
 impl Drop for CudaBackend {
     fn drop(&mut self) {
         self.clear_weight_cache();
+        for store in [self.gdn_states.get_mut().unwrap(), self.conv_states.get_mut().unwrap()] {
+            for (_, st) in store.drain() {
+                unsafe { cudaFree(st.ptr) };
+            }
+        }
     }
 }
 
@@ -314,6 +329,8 @@ impl CudaBackend {
             dev: 0,
             weights: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph: std::sync::Mutex::new(GraphState::default()),
+            gdn_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+            conv_states: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -957,5 +974,154 @@ impl crate::KernelBackend for CudaBackend {
             do_.download(v)?;
         }
         Ok(out)
+    }
+}
+
+// ============================================================
+// GDN layer device chain — the whole linear-attention forward as one
+// DevBuf pipeline (zero host round-trips inside the layer): six
+// projections → causal conv (resident state) → fused prep (silu+split+
+// l2norm+beta+gate, one kernel) → gated-deltanet core (resident state)
+// → gated rmsnorm → o_proj. The caller (TpCluster's device path / the
+// future single CUDA graph) feeds [n, hidden] and gets the TP partial
+// [n, hidden] back, both as DevBuf.
+// ============================================================
+
+/// Device-resident recurrent state (GDN [h,dk,dk] / conv tails) — NOT
+/// pooled: it must persist across tokens, and pooled buffers get reused
+/// by other ops between tokens.
+pub struct DeviceState {
+    pub ptr: *mut std::ffi::c_void,
+    pub len: usize, // floats
+}
+unsafe impl Send for DeviceState {}
+unsafe impl Sync for DeviceState {}
+
+/// Weight set for one GDN layer's device chain (borrowed from the shard's
+/// Engine weights — all hit the dev_weight caches after warmup preload).
+pub struct GdnLayerWeights<'a> {
+    pub qkv_proj: &'a Tensor,
+    pub b_proj: &'a Tensor,
+    pub f_a: &'a Tensor,
+    pub f_b: &'a Tensor,
+    pub g_a: &'a Tensor,
+    pub g_b: &'a Tensor,
+    pub conv_w: &'a Tensor,
+    pub dt_bias: &'a Tensor,
+    pub a_log: &'a Tensor,
+    pub o_norm: &'a Tensor,
+    pub o_proj: &'a Tensor,
+}
+
+impl CudaBackend {
+    fn dev_state(
+        &self,
+        store: &std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
+        key: (u64, usize),
+        len: usize,
+    ) -> Result<*mut f32> {
+        let mut m = store.lock().unwrap();
+        if let Some(st) = m.get(&key) {
+            return Ok(st.ptr as *mut f32);
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, len * 4) }, "state malloc")?;
+        ck(unsafe { cudaMemset(ptr, 0, len * 4) }, "state zero")?;
+        m.insert(key, DeviceState { ptr, len });
+        Ok(ptr as *mut f32)
+    }
+
+    /// Whole GDN (linear-attention) layer on device. `x` is the layer's
+    /// normed input [n, hidden]; returns the o_proj partial [n, hidden]
+    /// (TP all-reduce happens at the caller).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_layer_dev(
+        &self,
+        x: &DevBuf,
+        w: &GdnLayerWeights,
+        seq: u64,
+        layer: usize,
+        n: usize,
+        hidden: usize,
+        h: usize,
+        dk: usize,
+        lb: f32,
+        rms_eps: f32,
+        conv_size: usize,
+    ) -> Result<DevBuf> {
+        self.enter();
+        let proj = h * dk;
+        let ni = n as i32;
+        // 1. six projections (bf16-resident weights)
+        let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
+        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, proj as i32)?;
+        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, proj as i32)?;
+        let fb = self.matmul_dev(&fa, w.f_b, ni, proj as i32, proj as i32)?;
+        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, proj as i32)?;
+        let gb = self.matmul_dev(&ga, w.g_b, ni, proj as i32, proj as i32)?;
+        // 2. causal conv — resident tail state (RMW in place: the kernel
+        // reads state_in into smem at block start, writes state_out at end,
+        // one block per channel, so in==out is safe)
+        let ch = 3 * proj;
+        let hist = conv_size.saturating_sub(1).max(1);
+        let dw_conv = self.dev_weight(w.conv_w)?;
+        let conv_state = self.dev_state(&self.conv_states, (seq, layer), ch * hist)?;
+        let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
+        ck(
+            unsafe {
+                ferrite_causal_conv1d(
+                    qkv.as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                    conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
+                )
+            },
+            "conv1d_dev",
+        )?;
+        // 3. fused prep: silu + split + per-head L2 (q/k) + beta + KDA gate
+        let dt_bias_w = self.dev_weight(w.dt_bias)?;
+        let a_log_w = self.dev_weight(w.a_log)?;
+        let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let beta = DevBuf::alloc(self.dev, self.stream, n * h)?;
+        let gate = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        ck(
+            unsafe {
+                ferrite_gdn_prep(
+                    conv_out.as_const_f32(), b_raw.as_const_f32(), fb.as_const_f32(),
+                    dt_bias_w.as_const_f32(), a_log_w.as_const_f32(),
+                    q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
+                    ni, h as i32, dk as i32, lb, self.stream,
+                )
+            },
+            "gdn_prep",
+        )?;
+        // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
+        // blocks read-modify-write their own slice; single buffer is safe)
+        let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;
+        let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        ck(
+            unsafe {
+                ferrite_gdn_chunk(
+                    q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
+                    beta.as_const_f32(), gate.as_const_f32(), a_log_w.as_const_f32(),
+                    gdn_state, core.as_f32(), ni, h as i32, dk as i32, dk as i32, self.stream,
+                )
+            },
+            "gdn_chunk_dev",
+        )?;
+        // 5. gated rmsnorm (core [n,h,dk] flat = [n*h, dk]; gb the gate)
+        let o_norm_w = self.dev_weight(w.o_norm)?;
+        let normed = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        ck(
+            unsafe {
+                ferrite_gated_rmsnorm(
+                    core.as_const_f32(), gb.as_const_f32(), o_norm_w.as_const_f32(),
+                    normed.as_f32(), (n * h) as i32, dk as i32, rms_eps, self.stream,
+                )
+            },
+            "gdn_norm_dev",
+        )?;
+        // 6. o_proj — TP partial out
+        self.matmul_dev(&normed, w.o_proj, ni, proj as i32, hidden as i32)
     }
 }

@@ -1117,3 +1117,99 @@ extern "C" cudaError_t ferrite_hc_post(const float* x, const float* res,
     hc_post_kernel<<<grid, block, 0, stream>>>(x, res, post, comb, out, s, n, h);
     return cudaGetLastError();
 }
+
+// ============================================================
+// fused GDN prep: everything between the conv1d/matmul projections and
+// the gated-deltanet core, in ONE kernel (the CPU path did SiLU, split,
+// per-head L2 on q/k, beta sigmoid, and the KDA forget gate as separate
+// host loops — six host round-trips per layer per token).
+//
+// Inputs (all device, from matmul_dev outputs):
+//   conv_out [n, 3*proj]  — raw causal-conv output (SiLU applied HERE)
+//   b_raw    [n, proj]    — b_proj output (beta = sigmoid)
+//   fb       [n, proj]    — f_b(f_a(x)) output (gate input)
+//   dt_bias  [proj]       — weight (f32-resident)
+//   a_log    [h]          — weight
+// Outputs:
+//   q [n,h,dk], k [n,h,dk] (L2-normalised), v [n,h,dk] (raw split)
+//   beta [n,h], gate [n,h,dk] = lb * sigmoid(exp(A_log_h) * (fb + dt_bias))
+// grid: (n * h) blocks, 256 threads — one block per (token, head).
+// ============================================================
+__global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
+                                const float* __restrict__ b_raw,
+                                const float* __restrict__ fb,
+                                const float* __restrict__ dt_bias,
+                                const float* __restrict__ a_log,
+                                float* __restrict__ q,
+                                float* __restrict__ k,
+                                float* __restrict__ v,
+                                float* __restrict__ beta,
+                                float* __restrict__ gate,
+                                int n, int h, int dk, float lb) {
+    int th = blockIdx.x;
+    if (th >= n * h) return;
+    int t = th / h;
+    int hd = th % h;
+    int proj = h * dk;
+    const float* conv_row = conv_out + (size_t)t * 3 * proj;
+    // one block handles this head's dk lanes of q/k/v/beta/gate
+    extern __shared__ float sm_ss[]; // dk floats for q & k L2 sums
+    float* sq = sm_ss;
+    float* sk = sm_ss + dk;
+    // SiLU + split (conv layout: [q_h0.., q_h1.., k_..., v_...] per token row
+    // = [3*proj] with q in [0,proj), k in [proj,2*proj), v in [2*proj,3*proj))
+    float ssq = 0.f, ssk = 0.f;
+    for (int j = threadIdx.x; j < dk; j += blockDim.x) {
+        int off = hd * dk + j;
+        float qv = conv_row[off];
+        qv = qv / (1.0f + __expf(-qv)); // silu
+        float kv = conv_row[proj + off];
+        kv = kv / (1.0f + __expf(-kv));
+        float vv = conv_row[2 * proj + off];
+        vv = vv / (1.0f + __expf(-vv));
+        sq[j] = qv; sk[j] = kv;
+        ssq += qv * qv; ssk += kv * kv;
+        // gate (per channel): lb * sigmoid(exp(a_log_h) * (fb + dt_bias))
+        float g = fb[(size_t)t * proj + off] + dt_bias[off];
+        gate[((size_t)t * h + hd) * dk + j] = lb / (1.0f + __expf(-__expf(a_log[hd]) * g));
+        // v passes through (silu'd)
+        v[((size_t)t * h + hd) * dk + j] = vv;
+    }
+    // block reduce ssq/ssk
+    __shared__ float red[64];
+    for (int off = 16; off > 0; off >>= 1) { ssq += __shfl_down_sync(0xffffffff, ssq, off); ssk += __shfl_down_sync(0xffffffff, ssk, off); }
+    if ((threadIdx.x & 31) == 0) { red[threadIdx.x >> 5] = ssq; red[32 + (threadIdx.x >> 5)] = ssk; }
+    __syncthreads();
+    float nq = 0.f, nk = 0.f;
+    if (threadIdx.x == 0) {
+        float a = 0.f, b = 0.f;
+        for (int w = 0; w < 32; w++) { a += red[w]; b += red[32 + w]; }
+        red[60] = rsqrtf(a + 1e-12f); red[61] = rsqrtf(b + 1e-12f);
+    }
+    __syncthreads();
+    nq = red[60]; nk = red[61];
+    for (int j = threadIdx.x; j < dk; j += blockDim.x) {
+        int off = hd * dk + j;
+        q[((size_t)t * h + hd) * dk + j] = sq[j] * nq;
+        k[((size_t)t * h + hd) * dk + j] = sk[j] * nk;
+    }
+    // beta = sigmoid(b_raw[t, head])
+    if (threadIdx.x == 0) {
+        beta[(size_t)t * h + hd] = 1.0f / (1.0f + __expf(-b_raw[(size_t)t * proj + hd * dk]));
+    }
+}
+
+extern "C" cudaError_t ferrite_gdn_prep(const float* conv_out, const float* b_raw,
+                                        const float* fb, const float* dt_bias,
+                                        const float* a_log,
+                                        float* q, float* k, float* v, float* beta, float* gate,
+                                        int n, int h, int dk, float lb,
+                                        cudaStream_t s) {
+    dim3 block(256);
+    dim3 grid((unsigned)((n * h + 0) / 1)); // one block per (t, head)
+    grid.x = (unsigned)(n * h);
+    size_t smem = 2 * dk * sizeof(float) + 64 * sizeof(float);
+    gdn_prep_kernel<<<grid, block, smem, s>>>(conv_out, b_raw, fb, dt_bias, a_log,
+                                               q, k, v, beta, gate, n, h, dk, lb);
+    return cudaGetLastError();
+}
