@@ -2075,3 +2075,71 @@ impl CudaBackend {
         Ok(())
     }
 }
+
+// ============================================================
+// P2P all-reduce via NVLink (B300 GPU4-7 = NV18): rank 0 collects
+// the other ranks' partials with cudaMemcpyPeerAsync, then the
+// existing tp_all_reduce kernel sums on-device. Replaces the host
+// download→CPU-sum→re-upload round-trip per attention/ffn segment.
+// ============================================================
+extern "C" {
+    fn ferrite_p2p_copy(dst: *mut f32, dst_dev: i32, src: *const f32, src_dev: i32,
+                         count: usize, s: CuStream) -> i32;
+    fn ferrite_p2p_enable(dev: i32, peer: i32) -> i32;
+}
+
+impl CudaBackend {
+    /// Enable P2P access between this device and `peer` (NVLink).
+    pub fn p2p_enable(&self, peer: i32) -> Result<()> {
+        self.enter();
+        ck(unsafe { ferrite_p2p_enable(self.dev, peer) }, "p2p_enable")?;
+        Ok(())
+    }
+
+    /// P2P all-reduce: collect `partials` (device pointers from each rank)
+    /// into a contiguous buffer on THIS device, then sum with the
+    /// tp_all_reduce kernel. All pointers must be [n] floats.
+    pub fn p2p_all_reduce(
+        &self,
+        partial_ptrs: &[usize],  // device pointers, index = rank
+        n: usize,
+    ) -> Result<DevBuf> {
+        self.enter();
+        let world = partial_ptrs.len();
+        if world <= 1 {
+            let out = DevBuf::alloc(self.dev, self.stream, n)?;
+            ck(unsafe {
+                cudaMemcpyAsync(out.as_f32() as *mut _, partial_ptrs[0] as *const _,
+                                 n * 4, CUDA_MEMCPY_D2D, self.stream)
+            }, "p2p single copy")?;
+            return Ok(out);
+        }
+        // staging: [world, n] contiguous on this device
+        let mut staging = DevBuf::alloc(self.dev, self.stream, world * n)?;
+        for (rank, &ptr) in partial_ptrs.iter().enumerate() {
+            if rank as i32 == self.dev {
+                // same device: plain D2D copy
+                ck(unsafe {
+                    cudaMemcpyAsync(
+                        (staging.as_f32() as *mut std::ffi::c_void).add(rank * n * 4),
+                        ptr as *const std::ffi::c_void,
+                        n * 4, CUDA_MEMCPY_D2D, self.stream)
+                }, "p2p local copy")?;
+            } else {
+                ck(unsafe {
+                    ferrite_p2p_copy(
+                        staging.as_f32().add(rank * n),
+                        self.dev,
+                        ptr as *const f32,
+                        rank as i32,
+                        n, self.stream)
+                }, "p2p peer copy")?;
+            }
+        }
+        // sum on this device
+        let out = DevBuf::alloc(self.dev, self.stream, n)?;
+        let mut out_mut = out;
+        self.tp_all_reduce_dev(&staging, &mut out_mut, n, world)?;
+        Ok(out_mut)
+    }
+}

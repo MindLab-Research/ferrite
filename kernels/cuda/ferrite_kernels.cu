@@ -1766,3 +1766,24 @@ extern "C" cudaError_t ferrite_dsa_t0_counter(
     dsa_t0_counter_kernel<<<1, 1, 0, s>>>(counter, t0_out, total_out, n);
     return cudaGetLastError();
 }
+
+// ============================================================
+// P2P all-reduce: rank 0 collects the other ranks' partials via
+// cudaMemcpyPeerAsync (NVLink, B300 GPU4-7 = NV18), then the existing
+// tp_all_reduce kernel sums them on-device. Replaces the host
+// download→CPU-sum→re-upload round-trip.
+// ============================================================
+extern "C" cudaError_t ferrite_p2p_copy(float* dst, int dst_dev,
+                                         const float* src, int src_dev,
+                                         size_t count, cudaStream_t s) {
+    return cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev, count * 4, s);
+}
+
+extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
+    cudaError_t e = cudaSetDevice(dev);
+    if (e != cudaSuccess) return e;
+    // Ignore cudaErrorPeerAccessAlreadyEnabled
+    e = cudaDeviceEnablePeerAccess(peer, 0);
+    if (e == cudaErrorPeerAccessAlreadyEnabled) return cudaSuccess;
+    return e;
+}
