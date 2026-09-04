@@ -67,27 +67,42 @@ fn gdn_device_chain_matches_cpu() {
         o_norm: &q("o_norm.weight"),
         o_proj: &q("o_proj.weight"),
     };
-    let x_dev = DevBuf::alloc(dev.dev(), dev.stream(), x.numel()).expect("alloc");
-    x_dev.upload(x.as_slice()).expect("upload");
-    let partial = dev
-        .gdn_layer_dev(
-            &x_dev,
-            &gw,
-            0, // seq
-            0, // layer
-            n,
-            hidden,
-            h,
-            dk,
-            la.gate_lower_bound,
-            cfg.rms_norm_eps,
-            la.short_conv_kernel_size,
-        )
-        .expect("gdn_layer_dev");
-    let mut out_gpu = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
-    {
-        let v = Arc::get_mut(&mut out_gpu.data).expect("unique");
-        partial.download(v).expect("download");
+    // THREE consecutive calls with different inputs — the device chain's
+    // resident states (conv tails, gdn state) must accumulate across calls
+    // exactly like the CPU path's HashMaps. (The single-call test passed
+    // with diff 0; the serve garbage points at cross-call state carry.)
+    for round in 0..3 {
+        let x = Tensor::from_f32(
+            Shape::new([n, hidden]),
+            (0..n * hidden)
+                .map(|i| ((i * 37 + round * 101 % 251) as f32) * 0.01 - 1.2)
+                .collect(),
+        );
+        let out_cpu = eng
+            .linear_attn_forward(0, 0, pfx, &x, n)
+            .unwrap_or_else(|e| panic!("cpu round {round}: {e}"));
+        let x_dev = DevBuf::alloc(dev.dev(), dev.stream(), x.numel()).expect("alloc");
+        x_dev.upload(x.as_slice()).expect("upload");
+        let partial = dev
+            .gdn_layer_dev(
+                &x_dev,
+                &gw,
+                0, // seq
+                0, // layer
+                n,
+                hidden,
+                h,
+                dk,
+                la.gate_lower_bound,
+                cfg.rms_norm_eps,
+                la.short_conv_kernel_size,
+            )
+            .expect("gdn_layer_dev");
+        let mut out_gpu = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
+        {
+            let v = Arc::get_mut(&mut out_gpu.data).expect("unique");
+            partial.download(v).expect("download");
+        }
+        close(&out_cpu, &out_gpu, 2e-3, &format!("gdn_layer_dev round {round}"));
     }
-    close(&out_cpu, &out_gpu, 2e-3, "gdn_layer_dev vs cpu");
 }
