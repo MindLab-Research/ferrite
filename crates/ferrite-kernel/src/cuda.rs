@@ -37,6 +37,9 @@ extern "C" {
     fn ferrite_matmul_bf16(x: *const f32, w: *const std::ffi::c_void,
                             bias: *const f32, out: *mut f32,
                             n: i32, in_f: i32, out_f: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_bf16(x: *const f32, w: *const std::ffi::c_void,
+                          bias: *const f32, out: *mut f32,
+                          in_f: i32, out_f: i32, s: CuStream) -> i32;
     fn ferrite_f32_to_bf16(in_: *const f32, out: *mut std::ffi::c_void,
                             n: i64, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
@@ -568,10 +571,19 @@ impl CudaBackend {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
-        ck(unsafe {
-            ferrite_matmul_bf16(x_dev.as_const_f32(), dw.ptr as *const _,
-                                 dbias, do_.as_f32(), n, in_f, out_f, self.stream)
-        }, "matmul_dev")?;
+        if n == 1 {
+            // Decode GEMV: the 32x32 tiled kernel wastes 31/32 warps at n==1;
+            // warp-per-row GEMV streams W's bf16 row with 32-lane strip-mining.
+            ck(unsafe {
+                ferrite_gemv_bf16(x_dev.as_const_f32(), dw.ptr as *const _,
+                                  dbias, do_.as_f32(), in_f, out_f, self.stream)
+            }, "gemv_dev")?;
+        } else {
+            ck(unsafe {
+                ferrite_matmul_bf16(x_dev.as_const_f32(), dw.ptr as *const _,
+                                     dbias, do_.as_f32(), n, in_f, out_f, self.stream)
+            }, "matmul_dev")?;
+        }
         Ok(do_)
     }
 

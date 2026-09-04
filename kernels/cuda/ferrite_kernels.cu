@@ -1292,3 +1292,55 @@ extern "C" cudaError_t ferrite_moe_weighted_sum(const float* probs,
     moe_weighted_sum_kernel<<<grid, block, 0, s>>>(probs, eouts, out, n, topk, hidden);
     return cudaGetLastError();
 }
+
+// ============================================================
+// Dedicated GEMV for decode (n==1): y[1,out_f] = x[1,in_f] @ W^T + bias.
+// W row-major [out_f, in_f] bf16, x f32. The tiled 32x32 kernel wastes
+// 31/32 warps at n=1 (only one row of the tile is live); this warp-level
+// GEMV gives every warp one output row and streams W's bf16 row with
+// 32-lane strip-mining — 8 rows per 256-thread block, K folded by warp
+// shuffle reduction. This is the decode matmul (every matmul at n==1:
+// GDN projections, MoE experts, DSA, lm_head).
+// ============================================================
+__global__ void gemv_bf16_kernel(const float* __restrict__ x,
+                                 const __nv_bfloat16* __restrict__ w,
+                                 const float* __restrict__ bias,
+                                 float* __restrict__ y,
+                                 int in_f, int out_f) {
+    int warps_per_block = blockDim.x >> 5;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    int row = blockIdx.x * warps_per_block + warp;
+    if (row >= out_f) return;
+    const __nv_bfloat16* wr = w + (size_t)row * in_f;
+    float acc = 0.f;
+    // strip-mine: 32 lanes x 4 elements = 128 bf16 per iteration
+    for (int k = lane * 4; k < in_f; k += 32 * 4) {
+        float xv[4];
+        xv[0] = x[k];
+        xv[1] = (k + 1 < in_f) ? x[k + 1] : 0.f;
+        xv[2] = (k + 2 < in_f) ? x[k + 2] : 0.f;
+        xv[3] = (k + 3 < in_f) ? x[k + 3] : 0.f;
+        acc += xv[0] * __bfloat162float(wr[k]);
+        if (k + 1 < in_f) acc += xv[1] * __bfloat162float(wr[k + 1]);
+        if (k + 2 < in_f) acc += xv[2] * __bfloat162float(wr[k + 2]);
+        if (k + 3 < in_f) acc += xv[3] * __bfloat162float(wr[k + 3]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (lane == 0) y[row] = (bias ? bias[row] : 0.f) + acc;
+}
+
+extern "C" cudaError_t ferrite_gemv_bf16(const float* x, const void* w,
+                                         const float* bias, float* out,
+                                         int in_f, int out_f,
+                                         cudaStream_t s) {
+    if (out_f <= 0) return cudaSuccess;
+    int threads = 256;
+    int warps = threads >> 5; // 8 rows per block
+    dim3 grid((out_f + warps - 1) / warps);
+    gemv_bf16_kernel<<<grid, threads, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f);
+    return cudaGetLastError();
+}
