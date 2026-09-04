@@ -1175,20 +1175,21 @@ __global__ void gdn_prep_kernel(const float* __restrict__ conv_out,
         // v passes through (silu'd)
         v[((size_t)t * h + hd) * dk + j] = vv;
     }
-    // block reduce ssq/ssk
+    // L2 norm: SINGLE-THREAD sequential accumulation — EXACTLY matches the
+    // CPU's iter().sum() order (left-to-right). The warp-shuffle tree
+    // reduction differed by 1-2 ulp; the GDN recurrence (real-weight decay
+    // ~10x/token) amplifies this to O(1) divergence over 8 prefill tokens
+    // (observed max_diff 2.15 at l0 attn all-reduce).
     __shared__ float red[64];
-    for (int off = 16; off > 0; off >>= 1) { ssq += __shfl_down_sync(0xffffffff, ssq, off); ssk += __shfl_down_sync(0xffffffff, ssk, off); }
-    if ((threadIdx.x & 31) == 0) { red[threadIdx.x >> 5] = ssq; red[32 + (threadIdx.x >> 5)] = ssk; }
-    __syncthreads();
-    float nq = 0.f, nk = 0.f;
+    __syncthreads(); // sq[]/sk[] writes from all threads visible before sum
     if (threadIdx.x == 0) {
         float a = 0.f, b = 0.f;
-        for (int w = 0; w < 32; w++) { a += red[w]; b += red[32 + w]; }
-        red[60] = (a > 0.f) ? rsqrtf(a) : 0.f;
-        red[61] = (b > 0.f) ? rsqrtf(b) : 0.f;
+        for (int j = 0; j < dk; j++) { a += sq[j] * sq[j]; b += sk[j] * sk[j]; }
+        red[60] = (a > 0.f) ? 1.0f / sqrtf(a) : 0.f;
+        red[61] = (b > 0.f) ? 1.0f / sqrtf(b) : 0.f;
     }
     __syncthreads();
-    nq = red[60]; nk = red[61];
+    float nq = red[60]; float nk = red[61];
     for (int j = threadIdx.x; j < dk; j += blockDim.x) {
         int off = hd * dk + j;
         q[((size_t)t * h + hd) * dk + j] = sq[j] * nq;
