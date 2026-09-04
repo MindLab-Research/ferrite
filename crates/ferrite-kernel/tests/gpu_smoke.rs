@@ -417,3 +417,167 @@ fn gemv_bf16_parity_and_speed() {
         );
     }
 }
+
+// ============================================================
+// Fused MoE decode (n==1, GPU-dispatch path) parity + speed.
+// The fused path (moe_layer_dev n==1) routes → act → down_sum with ids/
+// probs NEVER crossing to the host (device pointer table). Reference:
+// hand-rolled f32 routing (sigmoid+bias topk, renorm × scale) + expert
+// FFN (swiglu2 semantics) + shared expert, on the same tensors.
+// ============================================================
+#[test]
+fn moe_fused_parity_and_speed() {
+    use ferrite_kernel::cuda::{DevBuf, ExpertWeights};
+    use std::time::Instant;
+
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda device 0");
+    dev.enter();
+
+    let (hidden, inter, inter_s, e_total, topk, e_local, expert_start) =
+        (64usize, 32usize, 16usize, 8usize, 2usize, 4usize, 0usize);
+    let routed_scaling = 1.2f32;
+    let limit = 7.0f32; // swiglu clamp (large enough to be active at most)
+
+    let x = Tensor::from_f32(
+        Shape::new([1, hidden]),
+        (0..hidden).map(|i| ((i as f32) * 0.31).sin() * 0.7).collect(),
+    );
+    let gate_w = Tensor::from_f32(
+        Shape::new([e_total, hidden]),
+        (0..e_total * hidden).map(|i| (((i * 13 + 5) % 101) as f32) * 0.02 - 1.0).collect(),
+    );
+    let bias = Tensor::from_f32(
+        Shape::new([e_total]),
+        (0..e_total).map(|i| ((i % 3) as f32) * 0.1).collect(),
+    );
+    let mk = |r: usize, c: usize, s: usize| {
+        Tensor::from_f32(
+            Shape::new([r, c]),
+            (0..r * c).map(|i| (((i * 7 + s) % 97) as f32) * 0.05 - 2.3).collect(),
+        )
+    };
+    let eg: Vec<Tensor> = (0..e_local).map(|s| mk(inter, hidden, s * 11)).collect();
+    let eu: Vec<Tensor> = (0..e_local).map(|s| mk(inter, hidden, s * 13 + 3)).collect();
+    let ed: Vec<Tensor> = (0..e_local).map(|s| mk(hidden, inter, s * 17 + 7)).collect();
+    let sg = mk(inter_s, hidden, 29);
+    let su = mk(inter_s, hidden, 31);
+    let sd = mk(hidden, inter_s, 37);
+    let experts: Vec<ExpertWeights> = (0..e_local)
+        .map(|i| ExpertWeights { gate: &eg[i], up: &eu[i], down: &ed[i] })
+        .collect();
+    let shared = ExpertWeights { gate: &sg, up: &su, down: &sd };
+
+    // ---- GPU fused ----
+    let mut probs_scratch = DevBuf::alloc(dev.dev(), dev.stream(), topk).unwrap();
+    let out = {
+        let dx = DevBuf::alloc(dev.dev(), dev.stream(), hidden).unwrap();
+        dx.upload(x.as_slice()).unwrap();
+        dev.moe_layer_dev(
+            &dx, &gate_w, &bias, &shared, &experts, expert_start,
+            &mut probs_scratch, 1, hidden, topk, e_total,
+            routed_scaling, limit,
+        )
+        .unwrap()
+    };
+    let mut hv = vec![0f32; hidden];
+    out.download(&mut hv).unwrap();
+    let mut gp = vec![0f32; topk];
+    probs_scratch.download(&mut gp).unwrap();
+
+    // ---- CPU reference (f32; GPU weights are bf16-truncated → ~2e-2 tol) ----
+    let (xs, gws, bs) = (x.as_slice(), gate_w.as_slice(), bias.as_slice());
+    let scores: Vec<f32> = (0..e_total).map(|j| 1.0 / (1.0 + (-gws[j]).exp())).collect();
+    let choice: Vec<f32> = (0..e_total).map(|j| scores[j] + bs[j]).collect();
+    let mut order: Vec<usize> = (0..e_total).collect();
+    order.sort_by(|&a, &b| choice[b].partial_cmp(&choice[a]).unwrap());
+    let ids: Vec<usize> = order[..topk].to_vec();
+    let raw: Vec<f32> = ids.iter().map(|&j| scores[j]).collect();
+    let rsum: f32 = raw.iter().sum();
+    let probs: Vec<f32> = raw.iter().map(|v| v / rsum * routed_scaling).collect();
+
+    let silu = |g: f32| g / (1.0 + (-g).exp());
+    let mut ref_out = vec![0f32; hidden];
+    for (jj, &eid) in ids.iter().enumerate() {
+        if eid < expert_start || eid >= expert_start + e_local {
+            continue; // another rank's slot → zero contribution here
+        }
+        let e = eid - expert_start;
+        let mut act = vec![0f32; inter];
+        for i in 0..inter {
+            let mut g = 0f32;
+            let mut u = 0f32;
+            for k in 0..hidden {
+                g += xs[k] * eg[e].as_slice()[i * hidden + k];
+                u += xs[k] * eu[e].as_slice()[i * hidden + k];
+            }
+            g = g.min(limit);
+            u = u.max(-limit).min(limit);
+            act[i] = silu(g) * u;
+        }
+        for h in 0..hidden {
+            let mut y = 0f32;
+            for i in 0..inter {
+                y += act[i] * ed[e].as_slice()[h * inter + i];
+            }
+            ref_out[h] += probs[jj] * y;
+        }
+    }
+    // shared expert (inter_s width)
+    {
+        let mut act = vec![0f32; inter_s];
+        for i in 0..inter_s {
+            let mut g = 0f32;
+            let mut u = 0f32;
+            for k in 0..hidden {
+                g += xs[k] * sg.as_slice()[i * hidden + k];
+                u += xs[k] * su.as_slice()[i * hidden + k];
+            }
+            g = g.min(limit);
+            u = u.max(-limit).min(limit);
+            act[i] = silu(g) * u;
+        }
+        for h in 0..hidden {
+            let mut y = 0f32;
+            for i in 0..inter_s {
+                y += act[i] * sd.as_slice()[h * inter_s + i];
+            }
+            ref_out[h] += y;
+        }
+    }
+    // parity (skip when routing is ambiguous — deterministic here)
+    for i in 0..hidden {
+        let d = (hv[i] - ref_out[i]).abs();
+        assert!(
+            d < 5e-2,
+            "moe_fused mismatch at {i}: gpu {} vs ref {} (probs {:?} ids {:?})",
+            hv[i], ref_out[i], gp, ids
+        );
+    }
+    eprintln!(
+        "[moe-fused] parity ok (ids {:?}, probs {:?}); max_diff {}",
+        ids,
+        gp,
+        (0..hidden).map(|i| (hv[i] - ref_out[i]).abs()).fold(0f32, f32::max)
+    );
+
+    // ---- speed: the full fused MoE (route+act+down_sum) per call ----
+    let dx = DevBuf::alloc(dev.dev(), dev.stream(), hidden).unwrap();
+    dx.upload(x.as_slice()).unwrap();
+    for _ in 0..20 {
+        let _ = dev.moe_layer_dev(&dx, &gate_w, &bias, &shared, &experts, expert_start,
+                                   &mut probs_scratch, 1, hidden, topk, e_total,
+                                   routed_scaling, limit).unwrap();
+    }
+    dev.sync().unwrap();
+    let iters = 500;
+    let t0 = Instant::now();
+    for _ in 0..iters {
+        let _ = dev.moe_layer_dev(&dx, &gate_w, &bias, &shared, &experts, expert_start,
+                                   &mut probs_scratch, 1, hidden, topk, e_total,
+                                   routed_scaling, limit).unwrap();
+    }
+    dev.sync().unwrap();
+    let us = t0.elapsed().as_secs_f32() * 1e6 / iters as f32;
+    eprintln!("[moe-fused] {us:.1} μs/call (route+act+down_sum, e_local={e_local} topk={topk})");
+    assert!(us < 300.0, "moe_fused too slow: {us:.1} μs/call");
+}

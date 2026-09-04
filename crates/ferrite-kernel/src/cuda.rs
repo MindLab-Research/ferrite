@@ -321,6 +321,12 @@ pub struct CudaBackend {
     /// tokens; pooled buffers would be reused by other ops).
     gdn_states: std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
     conv_states: std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
+    /// MoE expert POINTER TABLES (fused GPU dispatch): per layer, three
+    /// device buffers of e_local raw pointers (gate/up/down) into the
+    /// dev_weight_bf16 cache — the fused kernels gather the selected
+    /// experts' rows through them with zero host round-trips. Keyed by the
+    /// first expert's gate tensor pointer (stable per layer).
+    moe_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoePtrTable>>,
 }
 
 // cudaStream_t is thread-safe (CUDA runtime serialises ops on a stream);
@@ -364,6 +370,7 @@ impl CudaBackend {
             graph: std::sync::Mutex::new(GraphState::default()),
             gdn_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             conv_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+            moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -1067,6 +1074,18 @@ pub struct DeviceState {
 unsafe impl Send for DeviceState {}
 unsafe impl Sync for DeviceState {}
 
+/// Per-layer MoE expert pointer table (device buffers of e_local raw
+/// pointers into the bf16 weight cache) — the fused kernels' indirect
+/// addressing for GPU-side expert dispatch.
+pub struct MoePtrTable {
+    pub gate_dev: *mut std::ffi::c_void,
+    pub up_dev: *mut std::ffi::c_void,
+    pub down_dev: *mut std::ffi::c_void,
+    pub e_local: usize,
+}
+unsafe impl Send for MoePtrTable {}
+unsafe impl Sync for MoePtrTable {}
+
 /// Weight set for one GDN layer's device chain (borrowed from the shard's
 /// Engine weights — all hit the dev_weight caches after warmup preload).
 pub struct GdnLayerWeights<'a> {
@@ -1296,6 +1315,23 @@ extern "C" {
     fn ferrite_moe_weighted_sum(probs: *const f32, eouts: *const f32,
                                   out: *mut f32, n: i32, topk: i32, hidden: i32,
                                   s: CuStream) -> i32;
+    fn ferrite_moe_fused_act(x: *const f32, ids_f: *const f32,
+                              gate_ptrs: *const *const std::ffi::c_void,
+                              up_ptrs: *const *const std::ffi::c_void,
+                              shared_gate: *const std::ffi::c_void,
+                              shared_up: *const std::ffi::c_void,
+                              act: *mut f32, expert_start: i32, e_local: i32,
+                              hidden: i32, inter: i32, inter_shared: i32,
+                              topk: i32, limit: f32,
+                              s: CuStream) -> i32;
+    fn ferrite_moe_fused_down_sum(ids_f: *const f32, probs: *const f32,
+                                   down_ptrs: *const *const std::ffi::c_void,
+                                   shared_down: *const std::ffi::c_void,
+                                   act: *const f32, out: *mut f32,
+                                   expert_start: i32, e_local: i32,
+                                   hidden: i32, inter: i32, inter_shared: i32,
+                                   topk: i32,
+                                   s: CuStream) -> i32;
 }
 
 impl CudaBackend {
@@ -1338,6 +1374,46 @@ impl CudaBackend {
     /// Full MoE layer on device: x_dev [n, hidden] → partial [n, hidden].
     /// routing (moe_route) → top-k expert FFNs (matmul_dev + swiglu2_dev)
     /// → weighted sum → + shared expert. All DevBuf, graph-capturable.
+    /// Lazily build (and cache) this layer's expert POINTER TABLE: three
+    /// device buffers of e_local raw pointers into the dev_weight_bf16
+    /// cache. The fused MoE kernels gather the selected experts' rows
+    /// through these with GPU-side dispatch — zero host round-trips, zero
+    /// duplicated weight memory. Keyed by the first expert's gate tensor
+    /// pointer (stable per layer).
+    pub fn moe_expert_ptrs(
+        &self,
+        experts: &[ExpertWeights],
+    ) -> Result<(usize, *mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void)> {
+        self.enter();
+        let key = experts.first().map(|e| e.gate.as_slice().as_ptr() as usize).unwrap_or(0);
+        let e_local = experts.len();
+        {
+            let m = self.moe_ptrs.lock().unwrap();
+            if let Some(t) = m.get(&key) {
+                return Ok((t.e_local, t.gate_dev, t.up_dev, t.down_dev));
+            }
+        }
+        let mut gates: Vec<*mut std::ffi::c_void> = Vec::with_capacity(e_local);
+        let mut ups: Vec<*mut std::ffi::c_void> = Vec::with_capacity(e_local);
+        let mut downs: Vec<*mut std::ffi::c_void> = Vec::with_capacity(e_local);
+        for e in experts {
+            gates.push(self.dev_weight_bf16(e.gate)?.ptr);
+            ups.push(self.dev_weight_bf16(e.up)?.ptr);
+            downs.push(self.dev_weight_bf16(e.down)?.ptr);
+        }
+        let mk = |v: &[*mut std::ffi::c_void]| -> Result<*mut std::ffi::c_void> {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            ck(unsafe { cudaMalloc(&mut p, v.len() * std::mem::size_of::<*mut std::ffi::c_void>()) }, "moe ptr table malloc")?;
+            ck(unsafe {
+                cudaMemcpy(p, v.as_ptr() as *const _, v.len() * std::mem::size_of::<*mut std::ffi::c_void>(), CUDA_MEMCPY_H2D)
+            }, "moe ptr table H2D")?;
+            Ok(p)
+        };
+        let (g, u, d) = (mk(&gates)?, mk(&ups)?, mk(&downs)?);
+        self.moe_ptrs.lock().unwrap().insert(key, MoePtrTable { gate_dev: g, up_dev: u, down_dev: d, e_local });
+        Ok((e_local, g, u, d))
+    }
+
     pub fn moe_layer_dev(
         &self,
         x_dev: &DevBuf,
@@ -1364,8 +1440,61 @@ impl CudaBackend {
         // 2. moe_route on device: logits → probs [n, topk], ids [n, topk]
         let dprobs = DevBuf::alloc(self.dev, self.stream, n * topk)?;
         let dids = DevBuf::alloc(self.dev, self.stream, n * topk)?;
-        let dbias = self.dev_weight(bias_w)?;
+
+        // ---- FUSED DECODE PATH (n==1, TileRT ExpertSelect idea): GPU-side
+        // expert dispatch via the pointer table — ids/probs NEVER cross to
+        // the host; two kernels (act + down_sum) replace the per-expert
+        // kernel chains, the D2D gather and the probs_ext upload (3 host
+        // crossings + a dispatch sync per MoE layer).
+        if n == 1 {
+            let dbias = self.dev_weight(bias_w)?;
+            ck(unsafe {
+                ferrite_moe_route(logits.as_const_f32(), dbias.as_const_f32(),
+                                  dprobs.as_f32(), dids.as_f32(),
+                                  ni, e_total as i32, topk as i32, routed_scaling, self.stream)
+            }, "moe_route_fused")?;
+            if probs_out.len >= topk {
+                let (dst, src) = (probs_out.as_f32(), dprobs.as_const_f32());
+                ck(unsafe {
+                    cudaMemcpyAsync(dst as *mut _, src as *const _, topk * 4, CUDA_MEMCPY_D2D, self.stream)
+                }, "probs D2D (fused)")?;
+            }
+            let (e_local, g_ptrs, u_ptrs, d_ptrs) = self.moe_expert_ptrs(experts)?;
+            // Routed experts keep the FULL inter; the shared expert's inter is
+            // TP-sharded (moe_intermediate_size / world). The act buffer is
+            // [topk*inter + inter_shared] (see the kernels' slot layout).
+            let inter = experts.first()
+                .map(|e| e.gate.shape.0[0])
+                .unwrap_or(shared.gate.shape.0[0]) as i32;
+            let inter_shared = shared.gate.shape.0[0] as i32;
+            let dsg = self.dev_weight_bf16(shared.gate)?;
+            let dsu = self.dev_weight_bf16(shared.up)?;
+            let dsd = self.dev_weight_bf16(shared.down)?;
+            let act = DevBuf::alloc(self.dev, self.stream, topk * inter as usize + inter_shared as usize)?;
+            ck(unsafe {
+                ferrite_moe_fused_act(
+                    x_dev.as_const_f32(), dids.as_const_f32(),
+                    g_ptrs as *const *const _, u_ptrs as *const *const _,
+                    dsg.ptr, dsu.ptr, act.as_f32(),
+                    expert_start as i32, e_local as i32, hi, inter, inter_shared,
+                    topk as i32, swiglu_limit, self.stream,
+                )
+            }, "moe_fused_act")?;
+            let out = DevBuf::alloc(self.dev, self.stream, hidden)?;
+            ck(unsafe {
+                ferrite_moe_fused_down_sum(
+                    dids.as_const_f32(), dprobs.as_const_f32(),
+                    d_ptrs as *const *const _, dsd.ptr,
+                    act.as_const_f32(), out.as_f32(),
+                    expert_start as i32, e_local as i32, hi, inter, inter_shared,
+                    topk as i32, self.stream,
+                )
+            }, "moe_fused_down_sum")?;
+            return Ok(out);
+        }
+
         ck(unsafe {
+            let dbias = self.dev_weight(bias_w)?;
             ferrite_moe_route(logits.as_const_f32(), dbias.as_const_f32(),
                               dprobs.as_f32(), dids.as_f32(),
                               ni, e_total as i32, topk as i32, routed_scaling, self.stream)
