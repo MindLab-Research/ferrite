@@ -540,6 +540,15 @@ where
         residual: Tensor,
         n: usize,
     ) -> Result<Tensor> {
+        // Full device op chain (FERRITE_LAYER_DEV=1, decode n==1): MHC
+        // hc_pre/hc_post + rmsnorm on GPU (DevBuf level, zero host compute
+        // between the layer's GPU ops) — the layer-chain phase toward the
+        // per-rank CUDA graph. GDN/MoE device chains already handle the
+        // attn/ffn segments (FERRITE_GDN_DEV/FERRITE_MOE_DEV).
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("FERRITE_LAYER_DEV").is_some() && n == 1 && self.full_cfg.mhc {
+            return self.layer_forward_dev(seq, layer_idx, residual, n);
+        }
         let probe = std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1; // prefill, first DSA+MoE layer
         if probe {
             let n_el = residual.numel();
@@ -917,6 +926,123 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
     #[cfg(not(feature = "cuda"))]
     fn decode_step_graphed(&mut self, seq: u64) -> Result<u32> {
         self.decode_step_normal(seq)
+    }
+
+    /// Full-device-layer forward (FERRITE_LAYER_DEV=1, decode n==1, mhc):
+    /// hc_pre → rmsnorm → [fan_out attn] → all_reduce → hc_post →
+    /// hc_pre → rmsnorm → [fan_out ffn] → all_reduce → hc_post, with the
+    /// MHC/norm segments on GPU (hc_pre_dev/rmsnorm_dev/hc_post_dev —
+    /// DevBuf level, zero host compute between the layer's GPU ops).
+    /// attn/ffn go through the existing device chains (FERRITE_GDN_DEV /
+    /// FERRITE_MOE_DEV); the all-reduce stays host (fan_out partials on 4
+    /// GPUs — NCCL comes later). Per-layer host crossings: ~6 vs ~12 on the
+    /// CPU-MHC path.
+    #[cfg(feature = "cuda")]
+    fn layer_forward_dev(
+        &mut self,
+        seq: u64,
+        layer_idx: usize,
+        residual: Tensor,
+        n: usize,
+    ) -> Result<Tensor> {
+        use ferrite_kernel::cuda::DevBuf;
+        let plans = build_layer_plans(&self.full_cfg);
+        let plan = &plans[layer_idx];
+        let pfx = format!("model.layers.{layer_idx}");
+        let (hidden, hc_mult) = (self.full_cfg.hidden_size, self.full_cfg.hc_mult);
+        let nh = hc_mult * hidden;
+
+        // ---- segment 1: hc_pre + rmsnorm on rank 0's GPU (borrow) ----
+        let (hn_t, res_dev, post_a_dev, comb_a_dev) = {
+            let s0 = &self.shards[0];
+            let cuda0 = s0
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
+            cuda0.enter();
+            let mut res_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * nh)?;
+            res_dev.upload(residual.as_slice())?;
+            let (hc_fn, hc_scale, hc_base) = (
+                s0.w(&format!("{pfx}.hc_attn_fn"))?,
+                s0.w(&format!("{pfx}.hc_attn_scale"))?,
+                s0.w(&format!("{pfx}.hc_attn_base"))?,
+            );
+            let (li_dev, post_a_dev, comb_a_dev) = cuda0.hc_pre_dev(
+                &res_dev, hc_fn, hc_scale, hc_base, n, nh,
+                self.full_cfg.rms_norm_eps, self.full_cfg.hc_eps,
+                self.full_cfg.hc_sinkhorn_iters,
+            )?;
+            let norm_w = s0.w(&format!("{pfx}.input_layernorm.weight"))?;
+            let hn_dev = cuda0.rmsnorm_dev(&li_dev, norm_w, self.full_cfg.rms_norm_eps, n, hidden)?;
+            let mut hn = vec![0f32; n * hidden];
+            hn_dev.download(&mut hn)?;
+            let hn_t = Tensor::from_f32(Shape::new([n, hidden]), hn);
+            (hn_t, res_dev, post_a_dev, comb_a_dev)
+        };
+
+        // ---- segment 2: fan_out attention (existing device chains) ----
+        let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
+            AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn_t, n, hidden),
+            AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn_t, n),
+        });
+        let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+
+        // ---- segment 3: hc_post → hc_pre2 → rmsnorm2 (GPU chain, no host) ----
+        let (hfn_t, res2_dev, post_f_dev, comb_f_dev) = {
+            let s0 = &self.shards[0];
+            let cuda0 = s0
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
+            cuda0.enter();
+            let mut attn_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
+            attn_dev.upload(attn_out.as_slice())?;
+            let res2_dev = cuda0.hc_post_dev(
+                &attn_dev, &res_dev, &post_a_dev, &comb_a_dev, n, hc_mult, hidden,
+            )?;
+            let (hc_fn2, hc_scale2, hc_base2) = (
+                s0.w(&format!("{pfx}.hc_ffn_fn"))?,
+                s0.w(&format!("{pfx}.hc_ffn_scale"))?,
+                s0.w(&format!("{pfx}.hc_ffn_base"))?,
+            );
+            let (li2_dev, post_f_dev, comb_f_dev) = cuda0.hc_pre_dev(
+                &res2_dev, hc_fn2, hc_scale2, hc_base2, n, nh,
+                self.full_cfg.rms_norm_eps, self.full_cfg.hc_eps,
+                self.full_cfg.hc_sinkhorn_iters,
+            )?;
+            let norm_w2 = s0.w(&format!("{pfx}.post_attention_layernorm.weight"))?;
+            let hfn_dev = cuda0.rmsnorm_dev(&li2_dev, norm_w2, self.full_cfg.rms_norm_eps, n, hidden)?;
+            let mut hfn = vec![0f32; n * hidden];
+            hfn_dev.download(&mut hfn)?;
+            let hfn_t = Tensor::from_f32(Shape::new([n, hidden]), hfn);
+            (hfn_t, res2_dev, post_f_dev, comb_f_dev)
+        };
+
+        // ---- segment 4: fan_out ffn (existing device chains) ----
+        let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
+            MlpKind::Dense => s.dense_ffn(&pfx, &hfn_t, n),
+            MlpKind::Moe => s.moe_ffn(&pfx, &hfn_t, n),
+        });
+        let ffn_out = all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+
+        // ---- segment 5: hc_post2 (GPU) → residual out ----
+        let out_t = {
+            let s0 = &self.shards[0];
+            let cuda0 = s0
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("FERRITE_LAYER_DEV needs cuda backend".into()))?;
+            cuda0.enter();
+            let mut ffn_dev = DevBuf::alloc(cuda0.dev(), cuda0.stream(), n * hidden)?;
+            ffn_dev.upload(ffn_out.as_slice())?;
+            let res_out_dev = cuda0.hc_post_dev(
+                &ffn_dev, &res2_dev, &post_f_dev, &comb_f_dev, n, hc_mult, hidden,
+            )?;
+            let mut out = vec![0f32; n * nh];
+            res_out_dev.download(&mut out)?;
+            Tensor::from_f32(Shape::new([n, nh]), out)
+        };
+        Ok(out_t)
     }
 
     fn decode_step_normal(&mut self, seq: u64) -> Result<u32> {
