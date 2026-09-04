@@ -814,6 +814,15 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
     for (int s = threadIdx.x; s < topk; s += blockDim.x) {
         int j = (int)idx[(size_t)row * topk + s];
         if (j < 0 || j >= t) { sm[s] = -INFINITY; continue; } // kpool padding (-1) / OOB guard
+        // transformers scatter-add mask: duplicate indices collapse to ONE
+        // visible key. Skip repeats (first occurrence wins) so the softmax
+        // stays normalised.
+        bool dup = false;
+        for (int s0 = 0; s0 < topk; s0++) {
+            int j0 = (int)idx[(size_t)row * topk + s0];
+            if (s0 < s && j0 == j) { dup = true; break; }
+        }
+        if (dup) { sm[s] = -INFINITY; continue; }
         const float* qh = q + ((size_t)row * h + hd) * d;
         const float* kj = k + ((size_t)j * h + hd) * d;
         float acc = 0.f;
@@ -849,6 +858,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q,
         for (int s = 0; s < topk; s++) {
             int j = (int)idx[(size_t)row * topk + s];
             if (j < 0 || j >= t) continue; // kpool padding (-1) / OOB guard
+            if (sm[s] == -INFINITY) continue; // deduplicated slot (repeat index)
             float w = sm[s] / denom;
             acc += w * v[((size_t)j * h + hd) * dv + j2];
         }

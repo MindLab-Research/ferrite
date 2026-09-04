@@ -484,11 +484,25 @@ impl crate::KernelBackend for CpuBackend {
                 for s in 0..topk {
                     let jf = is_[i * topk + s];
                     if jf < 0.0 {
-                        continue; // kpool padding slot (-1)
+                       continue; // kpool padding slot (-1)
                     }
                     let j = jf as usize;
                     if j >= t {
-                        return Err(FerriteError::IndexOutOfBounds { index: j, len: t });
+                       return Err(FerriteError::IndexOutOfBounds { index: j, len: t });
+                    }
+                    // transformers builds a scatter-add mask: duplicate indices
+                    // collapse to a single visible key. Skip repeats (keep
+                    // first occurrence) so softmax stays normalised.
+                    let mut dup = false;
+                    for s0 in 0..s {
+                       let j0 = is_[i * topk + s0];
+                       if j0 >= 0.0 && j0 as usize == j {
+                         dup = true;
+                         break;
+                       }
+                    }
+                    if dup {
+                       continue;
                     }
                     let kj = &ks[j * h * dk + hd * dk..j * h * dk + (hd + 1) * dk];
                     let sc_j: f32 = (0..dq).map(|l| qh[l] * kj[l]).sum::<f32>() * scale;

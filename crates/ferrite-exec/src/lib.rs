@@ -415,6 +415,10 @@ impl<B: KernelBackend> Engine<B> {
         {
             eprintln!("[trace] NaN after attn (kind={:?}) at layer {layer_idx}", plan.attn);
         }
+        if std::env::var_os("FERRITE_PROBE").is_some() && layer_idx == 3 && n > 1 {
+            let b: Vec<u8> = attn_out.as_slice().iter().flat_map(|v| v.to_le_bytes()).collect();
+            std::fs::write("/tmp/l3_attn_out.f32", b).ok();
+        }
         let res3 = Tensor::from_f32(
             Shape::new([n, hc_mult, hidden]),
             residual_flat.as_slice().to_vec(),
@@ -802,34 +806,40 @@ impl<B: KernelBackend> Engine<B> {
             let pv = idx_pools.as_slice();
             for i in 0..n {
                 let mut col = 0usize;
-                let mut written = 0usize;
                 for r in 0..select_k {
                     let pflt = pv[i * select_k + r];
-                    if pflt < 0.0 {
-                        continue; // -1 sentinel (invisible pool)
-                    }
-                    let p = pflt as usize;
-                    if p >= npools {
-                        continue;
-                    }
-                    for j in 0..kpool {
-                        let t = p * kpool + j;
-                        if t < total && t <= ctx0 + i {
-                            iv[i * out_width + col] = t as f32;
+                    if pflt >= 0.0 && (pflt as usize) < npools {
+                        let p = pflt as usize;
+                        for j in 0..kpool {
+                            let t = p * kpool + j;
+                            // transformers: expand ALL kpool slots; invalid
+                            // (t >= total or beyond causal) become -1
+                            iv[i * out_width + col] = if t < total && t <= ctx0 + i {
+                                t as f32
+                            } else {
+                                -1.0
+                            };
                             col += 1;
                         }
                     }
                 }
-                // tail: last (kpool-1) visible tokens
-                let vis_end = ctx0 + i; // last visible key for this row
-                let mut tail_cnt = (vis_end + 1) % kpool;
-                if tail_cnt == 0 { tail_cnt = kpool; }
-                let tail_start = vis_end + 1 - tail_cnt;
-                for t in tail_start..=vis_end {
-                    if col < out_width {
-                        iv[i * out_width + col] = t as f32;
-                        col += 1;
+                // tail: transformers append_visible_tail — tail_count =
+                // visible_count % kpool entries starting at tail_start, padded
+                // to kpool-1 slots with -1. tail_count == 0 → all -1.
+                let visible_count = ctx0 + i + 1;
+                let tail_count = visible_count % kpool;
+                let tail_start = visible_count - tail_count;
+                for j in 0..(kpool - 1) {
+                    if col >= out_width {
+                        break;
                     }
+                    let t = tail_start + j;
+                    iv[i * out_width + col] = if j < tail_count && t <= ctx0 + i {
+                        t as f32
+                    } else {
+                        -1.0
+                    };
+                    col += 1;
                 }
                 while col < out_width {
                     iv[i * out_width + col] = -1.0; // padding
