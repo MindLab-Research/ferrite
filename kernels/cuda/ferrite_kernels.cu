@@ -807,13 +807,18 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
                                      const float* __restrict__ ki,
                                      const float* __restrict__ w,
                                      float* __restrict__ idx,
-                                     int n, int t, int h, int d, int topk, int ctx0) {
+                                     int n, const int* __restrict__ t_ptr, int h, int d, int topk,
+                                     const int* __restrict__ total_ptr, int kpool_val, int n_fixed) {
+    int t = *t_ptr; // actual npools from pinned memory (graph-safe)
+    int total = *total_ptr; // actual total tokens from pinned memory
+    int ctx0 = total - n_fixed; // derive from pinned total
+    int ctx0_pools = ctx0 / kpool_val;
     int row = blockIdx.x;
     if (row >= n) return;
-    extern __shared__ float sm[]; // t scores (dynamic smem; t*4 bytes)
+    extern __shared__ float sm[]; // t scores (sized for MAX at launch; graph-safe)
     float inv_sqrt_d = rsqrtf((float)d);
-    // causal guard: query row i may only select keys j < ctx0 + i + 1
-    int jmax = min(ctx0 + row + 1, t);
+    // causal guard: query row i may only select keys j < ctx0_pools + i + 1
+    int jmax = min(ctx0_pools + row + 1, t);
     for (int j = threadIdx.x; j < t; j += blockDim.x) {
         const float* k = ki + (size_t)j * d;
         float s = 0.f;
@@ -864,12 +869,16 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
 
 extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
                                             const float* w,
-                                            float* idx, int n, int t, int h, int d,
-                                            int topk, int ctx0, cudaStream_t s) {
+                                            float* idx, int n, const int* t_ptr, int h, int d,
+                                            int topk, const int* total_ptr, int kpool_val, int n_fixed,
+                                            cudaStream_t s) {
     dim3 block(32);
     dim3 grid(n);
-    size_t smem = (size_t)t * sizeof(float);
-    indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, w, idx, n, t, h, d, topk, ctx0);
+    // smem sized for MAX possible pools (graph-safe: frozen smem with actual
+    // npools would overflow as context grows)
+    int max_t = 2048; // max_npools = max_tokens / kpool
+    size_t smem = (size_t)max_t * sizeof(float);
+    indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, w, idx, n, t_ptr, h, d, topk, total_ptr, kpool_val, n_fixed);
     return cudaGetLastError();
 }
 

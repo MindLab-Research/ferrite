@@ -83,7 +83,8 @@ extern "C" {
                          n: i32, e: i32, topk: i32,
                          scale: f32, s: CuStream) -> i32;
     fn ferrite_indexer_topk(qi: *const f32, ki: *const f32, w: *const f32, idx: *mut f32,
-                            n: i32, t: i32, h: i32, d: i32, topk: i32, ctx0: i32, s: CuStream) -> i32;
+                            n: i32, t_ptr: *const i32, h: i32, d: i32, topk: i32,
+                            total_ptr: *const i32, kpool_val: i32, n_fixed: i32, s: CuStream) -> i32;
     fn ferrite_sparse_attn(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
                            out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                            topk: i32, s: CuStream) -> i32;
@@ -977,7 +978,12 @@ impl crate::KernelBackend for CudaBackend {
         let dk = DevBuf::alloc(self.dev, self.stream, k_idx.numel())?; dk.upload(k_idx.as_slice())?;
         let dw = DevBuf::alloc(self.dev, self.stream, w.numel())?; dw.upload(w.as_slice())?;
         let di = DevBuf::alloc(self.dev, self.stream, idx.numel())?;
-        ck(unsafe { ferrite_indexer_topk(dq.as_const_f32(), dk.as_const_f32(), dw.as_const_f32(), di.as_f32(), n, t, h, d, topk as i32, ctx0 as i32, self.stream) }, "indexer_topk")?;
+        let t_i32 = t as i32;
+        let t_ptr = &t_i32 as *const i32;
+        let ctx0_i32 = ctx0 as i32;
+        let ctx0_ptr = &ctx0_i32 as *const i32;
+        let kpool_const = 4i32;
+        ck(unsafe { ferrite_indexer_topk(dq.as_const_f32(), dk.as_const_f32(), dw.as_const_f32(), di.as_f32(), n, t_ptr, h, d, topk as i32, ctx0_ptr, kpool_const, n, self.stream) }, "indexer_topk")?;
         let ov = Arc::get_mut(&mut idx.data).expect("unique idx");
         di.download(ov)?;
         Ok(())
@@ -1576,12 +1582,13 @@ impl CudaBackend {
         let select_k = (w.topk / kpool).min(npools);
         let idx_pools = DevBuf::alloc(self.dev, self.stream, n * select_k)?;
         let ctx0 = total - n;
+        // graph-safe: pass pinned total_ptr instead of frozen npools/ctx0 values
         ck(
             unsafe {
                 ferrite_indexer_topk(
                     qi.as_const_f32(), pool_keys.as_const_f32(), w_idx.as_const_f32(),
-                    idx_pools.as_f32(), ni, npools as i32, ih as i32, idm as i32,
-                    select_k as i32, (ctx0 / kpool) as i32, self.stream,
+                    idx_pools.as_f32(), ni, pinned_total, ih as i32, idm as i32,
+                    select_k as i32, pinned_total, kpool as i32, ni, self.stream,
                 )
             },
             "dsa_topk",
