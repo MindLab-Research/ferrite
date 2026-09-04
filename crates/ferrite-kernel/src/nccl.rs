@@ -87,6 +87,22 @@ impl NcclApi {
                 h = unsafe { libc_dlopen(name2.as_ptr()) };
             }
             if h.is_null() {
+                // Absolute-path fallbacks: the toolkit lib dirs are not on
+                // the default loader path and serve's env may not have them
+                // (observed: python ctypes loads fine but serve's dlopen
+                // misses — the CUDA toolkit ships nccl in versioned dirs).
+                for p in [
+                    c"/usr/local/cuda-13.2/lib/libnccl.so.2",
+                    c"/usr/local/cuda-12.9/lib/libnccl.so.2",
+                    c"/usr/lib/x86_64-linux-gnu/libnccl.so.2",
+                ] {
+                    h = unsafe { libc_dlopen(p.as_ptr()) };
+                    if !h.is_null() {
+                        break;
+                    }
+                }
+            }
+            if h.is_null() {
                 return None;
             }
             let sym = |c: &std::ffi::CStr| unsafe {
