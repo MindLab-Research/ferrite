@@ -981,11 +981,14 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         };
 
         // ---- segment 2: fan_out attention (existing device chains) ----
+        let t0 = std::time::Instant::now();
         let attn_partials = Self::fan_out(&mut self.shards, |s| match plan.attn {
             AttnKind::Linear => Self::attn_shard(s, seq, layer_idx, &pfx, &hn_t, n, hidden),
             AttnKind::Dsa => s.dsa_attn_forward(seq, layer_idx, &pfx, &hn_t, n),
         });
+        let t_attn = std::time::Instant::now();
         let attn_out = all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+        let t_ar = std::time::Instant::now();
 
         // ---- segment 3: hc_post → hc_pre2 → rmsnorm2 (GPU chain, no host) ----
         let (hfn_t, res2_dev, post_f_dev, comb_f_dev) = {
@@ -1019,11 +1022,14 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         };
 
         // ---- segment 4: fan_out ffn (existing device chains) ----
+        let t_pre2 = std::time::Instant::now();
         let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
             MlpKind::Dense => s.dense_ffn(&pfx, &hfn_t, n),
             MlpKind::Moe => s.moe_ffn(&pfx, &hfn_t, n),
         });
+        let t_ffn = std::time::Instant::now();
         let ffn_out = all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?);
+        let t_far = std::time::Instant::now();
 
         // ---- segment 5: hc_post2 (GPU) → residual out ----
         let out_t = {
@@ -1042,6 +1048,18 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             res_out_dev.download(&mut out)?;
             Tensor::from_f32(Shape::new([n, nh]), out)
         };
+        if std::env::var_os("FERRITE_TIMING").is_some() {
+            let t_end = std::time::Instant::now();
+            let ak = match plan.attn { AttnKind::Linear => "gdn", AttnKind::Dsa => "dsa" };
+            let mk = match plan.mlp { MlpKind::Dense => "dense", MlpKind::Moe => "moe" };
+            eprintln!(
+                "[timing] L{layer_idx:2} {ak}/{mk} at={:6.1} ar={:4.1} mid={:5.1} ffn={:6.1} far={:4.1} tail={:4.1} tot={:6.1}ms",
+                (t_attn - t0).as_secs_f32() * 1e3, (t_ar - t_attn).as_secs_f32() * 1e3,
+                (t_pre2 - t_ar).as_secs_f32() * 1e3, (t_ffn - t_pre2).as_secs_f32() * 1e3,
+                (t_far - t_ffn).as_secs_f32() * 1e3, (t_end - t_far).as_secs_f32() * 1e3,
+                (t_end - t0).as_secs_f32() * 1e3,
+            );
+        }
         Ok(out_t)
     }
 
