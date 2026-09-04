@@ -1217,6 +1217,12 @@ impl CudaBackend {
             d
         };
         let q_v = l2norm_heads(&q_raw);
+        // fla KDA: q = l2norm(q) * K^-0.5 (k is NOT scaled) — this exact
+        // scale was missing from the device chain (root cause of the GDN
+        // garbage: cpu_q norms 0.0884=1/√128 vs dev_q norms 1.0; dev_q =
+        // cpu_q × √dk element-wise). Matches CPU path lib.rs:593.
+        let q_scale = (dk as f32).recip().sqrt();
+        let q_v: Vec<f32> = q_v.iter().map(|v| v * q_scale).collect();
         let k_v = l2norm_heads(&k_raw);
         // beta = sigmoid(b_raw)
         let beta_v: Vec<f32> = b_raw_host.iter().map(|v| 1.0 / (1.0 + (-v).exp())).collect();
