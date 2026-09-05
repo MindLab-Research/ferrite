@@ -381,6 +381,18 @@ impl DevRef {
 /// device-resident via the pointer-keyed cache — repeated uploads of the
 /// same Arc'd weight tensor hit the cache, which is also the precondition
 /// for CUDA-graph capture (stable device pointers across replays)).
+/// MTP speculative-decoding buffers (fixed graph-capture addresses):
+/// hf_dev = decode graph's h_final [hidden] (n=1), hf_v = verify graph's
+/// h_final [2*hidden] (n=2: rows t_last/d1), hprev = draft's h input, and
+/// per-GDN-layer (conv, gdn) ping-pong B scratch (verify writes B, accept
+/// commits B→A, reject leaves A untouched).
+pub struct MtpState {
+    pub hf_dev: DevBuf,
+    pub hf_v: DevBuf,
+    pub hprev: DevBuf,
+    pub scratch: Vec<(DevBuf, DevBuf)>,
+}
+
 pub struct CudaBackend {
     stream: CuStream,
     /// Device index this backend is bound to. cudaSetDevice is THREAD-LOCAL:
@@ -414,6 +426,8 @@ pub struct CudaBackend {
     graph_execs: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     /// Fixed IO pointers of captured segment graphs (per name).
     graph_io: std::sync::Mutex<std::collections::HashMap<String, GraphIO>>,
+    /// MTP speculative-decoding fixed buffers (see MtpState).
+    pub mtp: std::sync::Mutex<Option<MtpState>>,
 }
 
 // cudaStream_t is thread-safe (CUDA runtime serialises ops on a stream);
@@ -461,6 +475,7 @@ impl CudaBackend {
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
+            mtp: std::sync::Mutex::new(None),
         }
     }
 
@@ -1482,7 +1497,17 @@ pub struct DsaLayerWeights<'a> {
 }
 
 impl CudaBackend {
-    fn dev_state(
+    /// Main GDN state ptr (the A side of the verify ping-pong).
+    pub fn gdn_state_ptr(&self, seq: u64, layer: usize, len: usize) -> Result<*mut f32> {
+        self.dev_state(&self.gdn_states, (seq, layer), len)
+    }
+
+    /// Main conv-tail state ptr (the A side of the verify ping-pong).
+    pub fn conv_state_ptr(&self, seq: u64, layer: usize, len: usize) -> Result<*mut f32> {
+        self.dev_state(&self.conv_states, (seq, layer), len)
+    }
+
+    pub fn dev_state(
         &self,
         store: &std::sync::Mutex<std::collections::HashMap<(u64, usize), DeviceState>>,
         key: (u64, usize),
@@ -2663,6 +2688,22 @@ impl CudaBackend {
                 self.stream,
             )
         }, "copy_dev")?;
+        Ok(())
+    }
+
+    /// Raw-ptr D2D copy (MTP ping-pong commit: verify scratch B -> main
+    /// state A, or A -> B copy-in). Both sides are raw device pointers.
+    pub fn copy_raw_dev(&self, src: *const f32, dst: *mut f32, n: usize) -> Result<()> {
+        self.enter();
+        ck(unsafe {
+            cudaMemcpyAsync(
+                dst as *mut std::ffi::c_void,
+                src as *const std::ffi::c_void,
+                n * 4,
+                CUDA_MEMCPY_D2D,
+                self.stream,
+            )
+        }, "copy_raw_dev")?;
         Ok(())
     }
 }

@@ -525,6 +525,7 @@ impl<B: KernelBackend> TpCluster<B> {
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         let gname = format!("mega{seq}");
+        let mtp = std::env::var_os("FERRITE_MTP").is_some();
 
         if self.mega_seq != Some(seq) {
             // (Re)capture for this seq. Dry-run: all 4 ranks run the full
@@ -533,7 +534,11 @@ impl<B: KernelBackend> TpCluster<B> {
             // exact worker that captures next.
             let t0 = std::time::Instant::now();
             let toks = Self::fan_out(&mut self.shards, |s| {
-                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname, 1, None)
+                if mtp {
+                    Self::mtp_setup_bufs(s, &plans)?;
+                }
+                let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
+                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname, 1, vio.as_ref())
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
@@ -564,11 +569,32 @@ impl<B: KernelBackend> TpCluster<B> {
             // is deadlock-free (the nccl test proved it).
             let tc = std::time::Instant::now();
             Self::fan_out(&mut self.shards, |s| {
-                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname, 1, None)
+                let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
+                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname, 1, vio.as_ref())
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
             self.mega_seq = Some(seq);
+            if mtp {
+                // MTP verify graph (n=2: [t_last, d1]): GDN state → scratch B
+                // (ping-pong), h_final export (hf_v [2,hidden]), argmax 2.
+                let gv = format!("mega_v{seq}");
+                let h2 = self.shards[0].embed(&[last, last]);
+                let in_vals2 = crate::mhc::hc_expand(&h2, self.full_cfg.hc_mult);
+                let _ = Self::fan_out(&mut self.shards, |s| {
+                    let vio = Self::mtp_vio(s, true);
+                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, false, &gv, 2, Some(&vio))
+                })
+                .into_iter()
+                .collect::<Result<Vec<Vec<f32>>>>()?;
+                Self::fan_out(&mut self.shards, |s| {
+                    let vio = Self::mtp_vio(s, true);
+                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, true, &gv, 2, Some(&vio))
+                })
+                .into_iter()
+                .collect::<Result<Vec<Vec<f32>>>>()?;
+                eprintln!("[mega] MTP: verify graph {gv} captured (n=2, GDN ping-pong scratch)");
+            }
             eprintln!(
                 "[mega] captured {gname}: {} layers, {} NCCL ARs/rank; dry-run {:.1}ms + capture {:.1}ms",
                 plans.len(), plans.len() * 2,
@@ -588,6 +614,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 }
             }
             return Ok(tok);
+        }
+        if mtp {
+            // MTP steady step: draft (mtp_forward) + verify (mega_v n=2) +
+            // greedy accept + ping-pong commit.
+            return self.mtp_step(seq, &plans, num_dsa);
         }
         // Steady state: advance DSA pinned t0/total (the graph's kernels
         // read them zero-copy), write the 4 stagings, one launch per rank,
@@ -667,6 +698,222 @@ impl<B: KernelBackend> TpCluster<B> {
             }
         }
         Ok(tok)
+    }
+
+    /// MTP (FERRITE_MTP=1) steady step: draft (mtp_forward on the layers.45
+    /// nextn layer) → verify (mega_v n=2 graph replay) → greedy accept →
+    /// ping-pong state commit. Returns the LAST accepted token (2 on full
+    /// accept: d1 + bonus; 1 on rejection: the verify bonus).
+    #[cfg(feature = "cuda")]
+    fn mtp_step(&mut self, seq: u64, plans: &[ferrite_model::LayerPlan], num_dsa: usize) -> Result<u32> {
+        use ferrite_kernel::cuda::DevBuf;
+        let hidden = self.full_cfg.hidden_size;
+        let hc_mult = self.full_cfg.hc_mult;
+        let gname = format!("mega{seq}");
+        let gvname = format!("mega_v{seq}");
+        let mtp_family = self
+            .full_cfg
+            .layer_types
+            .iter()
+            .filter(|t| matches!(t, ferrite_model::LayerType::DeepseekSparseAttention))
+            .count();
+        let last = {
+            let s = self.shards[0]
+                .seq_runtime(seq)
+                .ok_or_else(|| FerriteError::Config("missing seq".into()))?;
+            *s.tokens.last().ok_or_else(|| FerriteError::Config("empty context".into()))?
+        };
+        // 1. draft: h_prev staging (accept row of last step's h_final) +
+        //    embed(last) → mtp_forward → d1 (identical across ranks).
+        let d1 = Self::fan_out(&mut self.shards, |s| {
+            let cuda = s
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+            cuda.enter();
+            let h2 = s.embed(&[last]);
+            let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+            emb.upload(h2.as_slice())?;
+            // hprev: fixed MtpState buffer (borrow outliving the lock via raw ptr)
+            let hptr = {
+                let m = cuda.mtp.lock().unwrap();
+                let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                &m.hprev as *const DevBuf as usize
+            };
+            let hprev: &DevBuf = unsafe { &*(hptr as *const DevBuf) };
+            mtp_forward(s, seq, &emb, hprev)
+        })
+        .into_iter()
+        .collect::<Result<Vec<f32>>>()?[0];
+        // 2. verify: scratch A→B copy-in + dsa advance(2) + mega_v replay → argmax[2]
+        let h2v = self.shards[0].embed(&[last, d1 as u32]);
+        let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
+        let toks_v = Self::fan_out(&mut self.shards, |s| {
+            let cuda = s
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+            cuda.enter();
+            let la = &s.cfg.linear_attn;
+            let proj = la.num_heads * la.head_dim;
+            let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
+            let gdn_len = la.num_heads * la.head_dim * la.head_dim;
+            {
+                let m = cuda.mtp.lock().unwrap();
+                let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                let mut gi = 0usize;
+                for plan in plans {
+                    if matches!(plan.attn, AttnKind::Linear) {
+                        let (cb, gb) = &m.scratch[gi];
+                        let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
+                        cuda.copy_raw_dev(aptr as *const f32, cb.as_f32(), conv_len)?;
+                        let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
+                        cuda.copy_raw_dev(gptr as *const f32, gb.as_f32(), gdn_len)?;
+                        gi += 1;
+                    }
+                }
+            }
+            for f in 0..num_dsa {
+                cuda.dsa_host_advance(seq, f, 2);
+            }
+            let mut out = [0f32; 2];
+            if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
+                return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
+            }
+            Ok((out[0], out[1]))
+        })
+        .into_iter()
+        .collect::<Result<Vec<(f32, f32)>>>()?;
+        let (a0, a1) = toks_v[0];
+        // 3. accept: d1 == argmax[0] → 2 tokens (d1 + bonus a1); else 1 (a0).
+        if d1 as u32 == a0 as u32 {
+            // accept 2: ping-pong commit B→A + hprev ← hf_v row 1 (d1's h)
+            Self::fan_out(&mut self.shards, |s| {
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                cuda.enter();
+                let la = &s.cfg.linear_attn;
+                let proj = la.num_heads * la.head_dim;
+                let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
+                let gdn_len = la.num_heads * la.head_dim * la.head_dim;
+                {
+                    let m = cuda.mtp.lock().unwrap();
+                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    let mut gi = 0usize;
+                    for plan in plans {
+                        if matches!(plan.attn, AttnKind::Linear) {
+                            let (cb, gb) = &m.scratch[gi];
+                            let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
+                            cuda.copy_raw_dev(cb.as_const_f32(), aptr, conv_len)?;
+                            let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
+                            cuda.copy_raw_dev(gb.as_const_f32(), gptr, gdn_len)?;
+                            gi += 1;
+                        }
+                    }
+                    // hprev ← hf_v row 1 (the accepted d1-position h)
+                    cuda.copy_dev(&m.hf_v, hidden, m.hprev.as_f32(), hidden)?;
+                }
+                Ok::<(), FerriteError>(())
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+            for s in &mut self.shards {
+                if let Some(rt) = s.seq_runtime_mut(seq) {
+                    rt.tokens.push(d1 as u32);
+                    rt.tokens.push(a1 as u32);
+                }
+            }
+            Ok(a1 as u32)
+        } else {
+            // accept 1: bonus a0 — fallback to the normal decode graph (n=1)
+            // for a0's state step; DSA rollback(1) + advance(1) + MTP cache
+            // rollback (draft d1 rejected); hprev ← hf_dev row 0 (a0's h).
+            let h2f = self.shards[0].embed(&[a0 as u32]);
+            let in_vals1 = crate::mhc::hc_expand(&h2f, hc_mult);
+            Self::fan_out(&mut self.shards, |s| {
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                cuda.enter();
+                for f in 0..num_dsa {
+                    cuda.dsa_host_rollback(seq, f, 1);
+                    cuda.dsa_host_advance(seq, f, 1);
+                }
+                cuda.dsa_host_rollback(seq, mtp_family, 1); // draft d1 rejected
+                let mut out = [0f32; 1];
+                if !cuda.graph_run(&gname, in_vals1.as_slice(), &mut out)? {
+                    return Err(FerriteError::InvalidArg(format!("mega graph {gname} missing")));
+                }
+                {
+                    let m = cuda.mtp.lock().unwrap();
+                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    cuda.copy_dev(&m.hf_dev, 0, m.hprev.as_f32(), hidden)?;
+                }
+                Ok::<(), FerriteError>(())
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+            for s in &mut self.shards {
+                if let Some(rt) = s.seq_runtime_mut(seq) {
+                    rt.tokens.push(a0 as u32);
+                }
+            }
+            Ok(a0 as u32)
+        }
+    }
+
+    /// Allocate the per-rank MTP fixed buffers (MtpState): decode-graph h_final
+    /// [hidden], verify-graph h_final [2*hidden], draft h_prev [hidden], and
+    /// per-GDN-layer (conv, gdn) ping-pong B scratch. Called once before the
+    /// mega graph captures (fixed addresses for graph lifetime).
+    #[cfg(feature = "cuda")]
+    fn mtp_setup_bufs(s: &mut Engine<B>, plans: &[ferrite_model::LayerPlan]) -> Result<()> {
+        use ferrite_kernel::cuda::{DevBuf, MtpState};
+        let cuda = s
+            .backend
+            .as_cuda()
+            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+        cuda.enter();
+        let cfg = &s.cfg;
+        let hidden = cfg.hidden_size;
+        let la = &cfg.linear_attn;
+        let proj = la.num_heads * la.head_dim;
+        let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
+        let gdn_len = la.num_heads * la.head_dim * la.head_dim;
+        let mut scratch = Vec::new();
+        for plan in plans {
+            if matches!(plan.attn, AttnKind::Linear) {
+                let conv = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), conv_len)?;
+                let gdn = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), gdn_len)?;
+                scratch.push((conv, gdn));
+            }
+        }
+        let hf_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let hf_v = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 2 * hidden)?;
+        let hprev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch });
+        Ok(())
+    }
+
+    /// VerifyIO for the given graph: verify=false → decode graph (n=1, empty
+    /// scratch, h_final → hf_dev); verify=true → verify graph (n=2, GDN
+    /// ping-pong scratch ptrs, h_final → hf_v).
+    #[cfg(feature = "cuda")]
+    fn mtp_vio(s: &Engine<B>, verify: bool) -> VerifyIO {
+        let cuda = s.backend.as_cuda().unwrap();
+        let m = cuda.mtp.lock().unwrap();
+        let m = m.as_ref().unwrap();
+        if verify {
+            VerifyIO {
+                gdn_scratch: m.scratch.iter().map(|(c, g)| (c.as_f32(), g.as_f32())).collect(),
+                h_final: m.hf_v.as_f32(),
+            }
+        } else {
+            VerifyIO { gdn_scratch: vec![], h_final: m.hf_dev.as_f32() }
+        }
     }
 
 // ============================================================
@@ -760,7 +1007,7 @@ fn mega_chain_dev(
         // lands back at the real cache count (no post-capture rollback);
         // replay-side dsa_host_advance then keeps it in lockstep.
         for f in 0..num_dsa {
-            cuda.dsa_host_rollback(seq, f, 1);
+            cuda.dsa_host_rollback(seq, f, n);
         }
         // Serialize per-rank captures (concurrent cuGraphInstantiate
         // SIGSEGV'd historically); record-mode NCCL enqueue never
@@ -1031,10 +1278,11 @@ fn mega_chain_dev(
     // identical data after the ARs, replicated weights)
     let t_hs = std::time::Instant::now();
     let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
-    // verify mode: export the LAST row of h_final (the verify chain's
-    // final token residual) into the MTP draft's fixed h_prev buffer.
+    // verify mode: export ALL n rows of h_final (hc_contract residual) into
+    // the fixed staging buffer — the host picks the accept-position row as
+    // the MTP draft's h_prev after the argmax accept decision.
     if let Some(v) = verify {
-        cuda.copy_dev(&h_final, (n - 1) * hidden, v.h_final, hidden)?;
+        cuda.copy_dev(&h_final, 0, v.h_final, n * hidden)?;
     }
     mprobe!("hfinal", &h_final, hidden);
     let hn_head = cuda.rmsnorm_dev(
