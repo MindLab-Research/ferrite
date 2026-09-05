@@ -298,26 +298,16 @@ impl NcclChannel {
     }
 
     /// Reduce-scatter (sum) f32: `send` holds world × count, `recv` gets
-    /// this rank's count-sized slice of the sum. The RS-then-AG pair is the
-    /// bandwidth-optimal TP residual update.
-    pub fn reduce_scatter_f32(
-        &self,
-        send: *const f32,
-        recv: *mut f32,
-        count: usize,
-    ) -> Result<()> {
-        let r = unsafe {
-            (self.api.ncclReduceScatter)(
-                send as *const c_void,
-                recv as *mut c_void,
-                count,
-                NCCL_FLOAT32,
-                NCCL_SUM,
-                self.comm,
-                self.stream,
-            )
-        };
+    /// this rank's count-sized slice of the sum.
+    pub fn reduce_scatter_f32(&self, send: *const f32, recv: *mut f32, count: usize) -> Result<()> {
+        let r = unsafe { (self.api.ncclReduceScatter)(send as *const c_void, recv as *mut c_void, count, NCCL_FLOAT32, NCCL_SUM, self.comm, self.stream) };
         self.api.ck(r, "ncclReduceScatter")
+    }
+
+    /// All-reduce f32 on the channel's CUDA stream. No host gather/sum.
+    pub fn all_reduce_f32_device(&self, send: *const f32, recv: *mut f32, count: usize) -> Result<()> {
+        let r = unsafe { (self.api.ncclAllReduce)(send as *const c_void, recv as *mut c_void, count, NCCL_FLOAT32, NCCL_SUM, self.comm, self.stream) };
+        self.api.ck(r, "ncclAllReduce")
     }
 }
 
