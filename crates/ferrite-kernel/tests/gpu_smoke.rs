@@ -1032,7 +1032,11 @@ fn event_timing_graph() {
     eprintln!("[evt] plain stream: {:.3}ms (out={:.4})", ms_a, va[0]);
     assert!(ms_a > 0.0, "plain elapsed must be > 0, got {ms_a}");
 
-    // (b) events recorded during capture -> event record nodes
+    // (b) events recorded during capture -> event record nodes.
+    // NOTE: drop (a)'s buffers first so the pool has the 16KB size class
+    // free — in-capture alloc of a cold class is err 900 (the mega chain
+    // warms every class in its dry-run pass for exactly this reason).
+    drop(out_a);
     let g0 = dev.event_create().unwrap();
     let g1 = dev.event_create().unwrap();
     dev.graph_capture_begin();
