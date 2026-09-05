@@ -123,7 +123,7 @@ extern "C" {
                               out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                               topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
-    fn ferrite_mtp_commit(k_pin: *const i32, plan: *const *const f32,
+    fn ferrite_mtp_commit(k_pin: *const i32, plan: *const *mut f32,
                           n_plans: i32, conv_len: i32, gdn_len: i32,
                           hf_v: *const f32, hprev: *mut f32,
                           hidden: i32, s: CuStream) -> i32;
@@ -2826,7 +2826,7 @@ impl CudaBackend {
             unsafe {
                 ferrite_mtp_commit(
                     cp.k_pin as *const i32,
-                    cp.plan.as_f32() as *const *const f32,
+                    cp.plan.as_f32() as *const *mut f32,
                     cp.n as i32,
                     cp.conv_len as i32,
                     cp.gdn_len as i32,

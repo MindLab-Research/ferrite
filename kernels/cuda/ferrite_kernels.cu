@@ -3226,7 +3226,7 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
 // (A+t_last). Tail segment: hprev <- hf_v row (k-1).
 // ============================================================
 __global__ void mtp_commit_kernel(const int* __restrict__ k_pin,
-                                   const float* const* __restrict__ plan,
+                                   float* const* __restrict__ plan,
                                    int n_plans, int conv_len, int gdn_len,
                                    const float* __restrict__ hf_v,
                                    float* __restrict__ hprev, int hidden) {
@@ -3259,7 +3259,7 @@ __global__ void mtp_commit_kernel(const int* __restrict__ k_pin,
 }
 
 extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
-                                          const float* const* plan,
+                                          float* const* plan,
                                           int n_plans, int conv_len, int gdn_len,
                                           const float* hf_v, float* hprev,
                                           int hidden, cudaStream_t s) {
