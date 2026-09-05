@@ -504,6 +504,16 @@ impl<B: KernelBackend> TpCluster<B> {
             .into_iter()
             .collect::<Result<Vec<f32>>>()?;
             let t_dry = t0.elapsed();
+            if std::env::var_os("FERRITE_MEGA_DRY").is_some() {
+                // DRY mode: skip capture/replay — every step runs the real
+                // chain. Bisection: dry output correct → graph-mechanism bug;
+                // dry output garbage → chain-semantics bug.
+                eprintln!(
+                    "[mega] DRY mode step (tok={}): dry-run {:.1}ms — no capture",
+                    toks[0], t_dry.as_secs_f32() * 1e3
+                );
+                return Ok(toks[0] as u32);
+            }
             // Capture: record-only. capture_lock serializes the per-rank
             // captures (concurrent cuGraphInstantiate SIGSEGV'd historically);
             // record-mode NCCL enqueue never rendezvous, so serialized capture
@@ -611,6 +621,27 @@ fn mega_chain_dev(
     let topk = cfg.num_experts_per_tok;
     let e = cfg.n_routed_experts;
 
+    // FERRITE_MEGA_PROBE: dump intermediates to /tmp/orion (dry-run only —
+    // download syncs, so never inside a capture). Cross-rank ar0/resmid
+    // equality also validates the NCCL all-reduce.
+    let dev_id = cuda.dev();
+    let probe = !capture && std::env::var_os("FERRITE_MEGA_PROBE").is_some();
+    macro_rules! mprobe {
+        ($name:expr, $buf:expr, $len:expr) => {
+            if probe {
+                let mut pv = vec![0f32; $len];
+                if $buf.download(&mut pv).is_ok() {
+                    let bytes: Vec<u8> = pv.iter().flat_map(|x| x.to_le_bytes()).collect();
+                    std::fs::write(
+                        format!("/tmp/orion/mega_probe_{}_dev{}.f32", $name, dev_id),
+                        bytes,
+                    )
+                    .ok();
+                }
+            }
+        };
+    }
+
     let _guard = if capture {
         // DSA host bookkeeping: the capture pass re-runs dsa_layer_dev's
         // host logic (t_count += 1 WITHOUT executing cache_append). Roll it
@@ -637,6 +668,7 @@ fn mega_chain_dev(
     let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), nh)?;
     res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
+    mprobe!("res0", &res, nh);
 
     for (layer_idx, plan) in plans.iter().enumerate() {
         let pfx = format!("model.layers.{layer_idx}");
@@ -659,6 +691,9 @@ fn mega_chain_dev(
             n,
             hidden,
         )?;
+        if layer_idx == 0 {
+            mprobe!("hn0", &hn, hidden);
+        }
         // B: attention → NCCL all-reduce (in-place; every rank holds the sum)
         let partial = match plan.attn {
             AttnKind::Linear => {
@@ -714,8 +749,14 @@ fn mega_chain_dev(
             }
         };
         nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        if layer_idx == 0 {
+            mprobe!("ar0", &partial, hidden); // NCCL AR result — must be identical across the 4 rank files
+        }
         // C: hc_post → hc_pre2 → post_attention_layernorm
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
+        if layer_idx == 0 {
+            mprobe!("resmid0", &res_mid, nh);
+        }
         let (li2, post_f, comb_f) = cuda.hc_pre_dev(
             &res_mid,
             s.w(&format!("{pfx}.hc_ffn_fn"))?,
@@ -780,9 +821,11 @@ fn mega_chain_dev(
         res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
     }
 
+    mprobe!("resL", &res, nh);
     // head: contract → model.norm → lm_head → argmax (redundant per rank —
     // identical data after the ARs, replicated weights)
     let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
+    mprobe!("hfinal", &h_final, hidden);
     let hn_head = cuda.rmsnorm_dev(
         &h_final,
         s.w("model.norm.weight")?,
@@ -792,6 +835,7 @@ fn mega_chain_dev(
     )?;
     let lm_w = s.w("lm_head.weight")?;
     let logits = cuda.matmul_dev(&hn_head, lm_w, n as i32, hidden as i32, cfg.vocab_size as i32)?;
+    mprobe!("logits16", &logits, 16);
     let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), n)?;
     cuda.argmax_dev(&logits, &mut arg, n, cfg.vocab_size)?;
 
