@@ -1931,7 +1931,37 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             (Some(ffn_out_dev), None)
         } else {
             let ffn_partials = Self::fan_out(&mut self.shards, |s| match plan.mlp {
-                MlpKind::Dense => s.dense_ffn(&pfx, &hfn_t, n),
+                MlpKind::Dense => {
+                    #[cfg(feature = "cuda")]
+                    if let Some(cuda) = s.backend.as_cuda() {
+                        if let Some(ch) = &s.nccl {
+                            // Device dense chain + NCCL AR (parity-tested vs
+                            // dense_ffn's run_matmul/swiglu_limited — see
+                            // dense_chain_parity). The Tensor dense_ffn has
+                            // NO all-reduce: with NCCL the fan_out result
+                            // took rank 0's 1/4 partial (correctness bug).
+                            use ferrite_kernel::cuda::DevBuf;
+                            cuda.enter();
+                            let x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hfn_t.numel())?;
+                            x_dev.upload(hfn_t.as_slice())?;
+                            let w_gate = s.w(&format!("{pfx}.mlp.gate_proj.weight"))?;
+                            let w_up = s.w(&format!("{pfx}.mlp.up_proj.weight"))?;
+                            let w_down = s.w(&format!("{pfx}.mlp.down_proj.weight"))?;
+                            let hi = hidden as i32;
+                            let inter = w_gate.shape.0[0] as i32;
+                            let g = cuda.matmul_dev(&x_dev, w_gate, n as i32, hi, inter)?;
+                            let u = cuda.matmul_dev(&x_dev, w_up, n as i32, hi, inter)?;
+                            let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, s.cfg.swiglu_limit)?;
+                            let d = cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?;
+                            ch.all_reduce_f32(d.as_const_f32(), d.as_f32(), n * hidden)?;
+                            let mut out = Tensor::zeros(Shape::new([n, hidden]), hfn_t.dtype);
+                            let ov = std::sync::Arc::get_mut(&mut out.data).expect("unique out");
+                            d.download(ov)?;
+                            return Ok(out);
+                        }
+                    }
+                    s.dense_ffn(&pfx, &hfn_t, n)
+                }
                 MlpKind::Moe => s.moe_ffn(&pfx, &hfn_t, n),
             });
             let ffn_out = if self.shards[0].nccl.is_some() {
