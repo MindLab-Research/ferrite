@@ -1707,8 +1707,22 @@ impl CudaBackend {
         // 3. indexer queries: qi = qa @ wq_b [n, ih*idm]
         let qi = self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?;
 
-        // 4. index keys: ki = LayerNorm(x @ wk)(k_norm affine) [n, idm]
-        let ki_raw = self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?;
+        // 4-6. index keys / per-head weights / kpool gate: three SAME-INPUT(x)
+        // GEMVs fused into ONE tri kernel at decode (n==1) — ki = LN(x@wk),
+        // w_idx = (x@weights_proj)·ih^-0.5, gate = x@compress_gate.
+        let (ki_raw, w_idx, gate) = if n == 1 {
+            let (a, b, c) = self.gemv_tri_dev(
+                x, w.wk, w.weights_proj, w.gate,
+                hidden as i32, idm as i32, ih as i32, idm as i32,
+            )?;
+            (a, b, c)
+        } else {
+            (
+                self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?,
+                self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?,
+                self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?,
+            )
+        };
         let ki = DevBuf::alloc(self.dev, self.stream, n * idm)?;
         let knw = self.dev_weight(w.k_norm_w)?;
         let knb = self.dev_weight(w.k_norm_b)?;
@@ -1716,16 +1730,10 @@ impl CudaBackend {
             unsafe { ferrite_layernorm_affine(ki_raw.as_const_f32(), knw.as_const_f32(), knb.as_const_f32(), ki.as_f32(), ni, idm as i32, self.stream) },
             "dsa_layernorm",
         )?;
-
-        // 5. per-head score weights: w_idx = (x @ weights_proj) × ih^-0.5 [n, ih]
-        let w_idx = self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?;
         ck(
             unsafe { ferrite_scale_inplace(w_idx.as_f32(), (ih as f32).sqrt().recip(), (n * ih) as i32, self.stream) },
             "dsa_widx_scale",
         )?;
-
-        // 6. kpool gate scores: gate = x @ compress_gate [n, idm]
-        let gate = self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?;
 
         // 7. cache append (device-resident, in place at slot t0)
         let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, t0) = {

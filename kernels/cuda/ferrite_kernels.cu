@@ -2218,25 +2218,49 @@ __global__ void pool_expand_kernel(
     int out_width = select_k * kpool + (kpool - 1);
     const float* pv = idx_pools + (size_t)i * select_k;
     float* iv = idx + (size_t)i * out_width;
-    int col = 0;
-    for (int r = 0; r < select_k; r++) {
+
+    // MULTI-THREAD (was 1 thread serially writing ~8K slots — a dsa-layer
+    // straggler): phase A flags valid r (pflt in range) + block prefix in
+    // smem; phase B writes valid r's kpool slots in parallel. Invalid r slots
+    // are SKIPPED (compact — col only advances for valid r, matching the
+    // serial semantics): valid r's base col = valid_prefix(r) * kpool.
+    extern __shared__ int sp[];           // [select_k+1] prefix
+    int tid = threadIdx.x;
+    for (int r = tid; r < select_k; r += blockDim.x) {
         float pflt = pv[r];
-        if (pflt >= 0.0f && (int)pflt < npools) {
-            int p = (int)pflt;
-            for (int j = 0; j < kpool; j++) {
-                int t = p * kpool + j;
-                iv[col++] = (t < total && t <= ctx0 + i) ? (float)t : -1.0f;
-            }
+        sp[r + 1] = (pflt >= 0.0f && (int)pflt < npools) ? 1 : 0;
+    }
+    if (tid == 0) sp[0] = 0;
+    __syncthreads();
+    if (tid == 0) { // serial scan (select_k ~2k adds from smem — fine)
+        for (int r = 0; r < select_k; r++) sp[r + 1] += sp[r];
+    }
+    __syncthreads();
+    int nvalid = sp[select_k];
+    // phase B: slot s = c/kpool → rank r via prefix probe (monotonic sp —
+    // start from a proportional guess, walk to the bracketing interval)
+    for (int c = tid; c < nvalid * kpool; c += blockDim.x) {
+        int s = c / kpool, j = c % kpool;
+        int r = (int)(((long long)s * select_k) / (nvalid > 0 ? nvalid : 1));
+        if (r >= select_k) r = select_k - 1;
+        while (r > 0 && sp[r] > s) r--;
+        while (r + 1 < select_k && sp[r + 1] <= s) r++;
+        int p = (int)pv[r];
+        int t = p * kpool + j;
+        iv[s * kpool + j] = (t < total && t <= ctx0 + i) ? (float)t : -1.0f;
+    }
+    // tail + padding (kpool-1 slots — tiny, single thread as before)
+    if (tid == 0) {
+        int visible_count = ctx0 + i + 1;
+        int tail_count = visible_count % kpool;
+        int tail_start = visible_count - tail_count;
+        int col = nvalid * kpool;
+        for (int j = 0; j < kpool - 1 && col < out_width; j++) {
+            int t = tail_start + j;
+            iv[col++] = (j < tail_count && t <= ctx0 + i) ? (float)t : -1.0f;
         }
+        while (col < out_width) iv[col++] = -1.0f;
     }
-    int visible_count = ctx0 + i + 1;
-    int tail_count = visible_count % kpool;
-    int tail_start = visible_count - tail_count;
-    for (int j = 0; j < kpool - 1 && col < out_width; j++) {
-        int t = tail_start + j;
-        iv[col++] = (j < tail_count && t <= ctx0 + i) ? (float)t : -1.0f;
-    }
-    while (col < out_width) iv[col++] = -1.0f;
 }
 
 extern "C" cudaError_t ferrite_pool_expand(
@@ -2244,7 +2268,8 @@ extern "C" cudaError_t ferrite_pool_expand(
     int n, int select_k, int kpool, int max_npools, const int* total_ptr,
     int n_fixed,
     cudaStream_t s) {
-    pool_expand_kernel<<<n, 1, 0, s>>>(idx_pools, idx, n, select_k, kpool, max_npools, total_ptr, n_fixed);
+    size_t smem = ((size_t)select_k + 1) * sizeof(int);
+    pool_expand_kernel<<<n, 256, smem, s>>>(idx_pools, idx, n, select_k, kpool, max_npools, total_ptr, n_fixed);
     return cudaGetLastError();
 }
 
