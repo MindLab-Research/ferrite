@@ -656,6 +656,10 @@ fn mega_chain_dev(
     // equality also validates the NCCL all-reduce.
     let dev_id = cuda.dev();
     let probe = !capture && std::env::var_os("FERRITE_MEGA_PROBE").is_some();
+    // per-layer breakdown timing (dry only): attn A+B+AR / ffn C+D+E+AR /
+    // head — sync at segment boundaries (diagnostic runs only)
+    let tm = !capture && dev_id == 0 && std::env::var_os("FERRITE_TIMING").is_some();
+    let (mut t_attn, mut t_ffn, mut t_head) = (0f64, 0f64, 0f64);
     macro_rules! mprobe {
         ($name:expr, $buf:expr, $len:expr) => {
             if probe {
@@ -701,6 +705,7 @@ fn mega_chain_dev(
     mprobe!("res0", &res, nh);
 
     for (layer_idx, plan) in plans.iter().enumerate() {
+        let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
         // A: hc_pre + input_layernorm (redundant per rank)
         let (li, post_a, comb_a) = cuda.hc_pre_dev(
@@ -779,6 +784,11 @@ fn mega_chain_dev(
             }
         };
         nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        if tm {
+            let _ = cuda.sync();
+            t_attn += t_l.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_mid = std::time::Instant::now();
         if layer_idx == 0 {
             mprobe!("ar0", &partial, hidden); // NCCL AR result — must be identical across the 4 rank files
         }
@@ -886,6 +896,10 @@ fn mega_chain_dev(
                 eprintln!("[mega] L{layer_idx:02} {kind} ar maxabs={mx:.4}");
             }
         }
+        if tm {
+            let _ = cuda.sync();
+            t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
+        }
         // E: hc_post2 → next layer's residual
         res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
     }
@@ -893,6 +907,7 @@ fn mega_chain_dev(
     mprobe!("resL", &res, nh);
     // head: contract → model.norm → lm_head → argmax (redundant per rank —
     // identical data after the ARs, replicated weights)
+    let t_hs = std::time::Instant::now();
     let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
     mprobe!("hfinal", &h_final, hidden);
     let hn_head = cuda.rmsnorm_dev(
@@ -929,6 +944,17 @@ fn mega_chain_dev(
     } else {
         let mut tv = vec![0f32; 1];
         arg.download(&mut tv)?;
+        if tm {
+            let _ = cuda.sync();
+            t_head = t_hs.elapsed().as_secs_f64() * 1e3;
+            eprintln!(
+                "[mega-timing] {} layers: attn(A+AR)={:.1}ms ffn(C+D+E+AR)={:.1}ms head={:.2}ms",
+                plans.len(),
+                t_attn,
+                t_ffn,
+                t_head
+            );
+        }
         Ok(tv[0])
     }
 }
