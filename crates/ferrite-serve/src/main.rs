@@ -256,10 +256,18 @@ fn run_cuda(
     let td1 = std::time::Instant::now();
     let decode_s = td1.duration_since(tp1).as_secs_f32();
     let gen = out.len();
+    // MTP: out.len() counts decode STEPS; the real generated token count is
+    // rt.tokens.len() - prompt (accept-2/3 push 2/3 tokens per step).
+    let real: Option<usize> = cluster
+        .shards
+        .first()
+        .and_then(|s| s.seq_runtime(seq).map(|rt| rt.tokens.len().saturating_sub(ids.len())));
     if gen > 0 {
         println!(
-            "[serve] decode: {gen} tokens in {decode_s:.3}s = {:.1} tok/s (steady state; weights-preload + prefill excluded)",
-            gen as f32 / decode_s
+            "[serve] decode: {gen} steps in {decode_s:.3}s = {:.1} steps/s | real {} tokens = {:.1} tok/s (steady state; weights-preload + prefill excluded)",
+            gen as f32 / decode_s,
+            real.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
+            real.map(|r| r as f32 / decode_s).unwrap_or(0.0),
         );
     }
     // Skip the exit-time teardown: dropping 1.17TB of f32 weights walks

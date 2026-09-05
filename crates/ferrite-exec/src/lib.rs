@@ -177,7 +177,7 @@ impl<B: KernelBackend> Engine<B> {
         );
     }
 
-    pub(crate) fn seq_runtime(&self, seq: u64) -> Option<&SeqRuntime> {
+    pub fn seq_runtime(&self, seq: u64) -> Option<&SeqRuntime> {
         self.seqs.get(&seq)
     }
 
