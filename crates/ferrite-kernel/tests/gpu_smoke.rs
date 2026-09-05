@@ -997,3 +997,59 @@ fn gemv_v2_bench() {
     }
     eprintln!("[gemv-v2] TOTAL: v1={:.1}us v2={:.1}us ({:.2}x)", total_v1, total_v2, total_v1 / total_v2.max(1e-9));
 }
+
+/// Event-in-graph timing mechanism isolation: the mega EVTS run panicked
+/// cudaEventElapsedTime=InvalidValue(1) on the first post-replay read.
+/// (a) plain stream events (record→kernel→record→sync→elapsed) vs
+/// (b) events recorded DURING capture (→ event record nodes) →
+/// instantiate → replay → elapsed. Isolates which path breaks.
+#[test]
+fn event_timing_graph() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let n = 4096usize;
+    let mut rnd = 0x1234_5566_7788_99u64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    let xv: Vec<f32> = (0..n).map(|_| r()).collect();
+    let wv: Vec<f32> = (0..n * n).map(|_| r() * 0.02).collect();
+    let x_t = Tensor::from_f32(Shape::new([1, n]), xv.clone());
+    let w_t = Tensor::from_f32(Shape::new([n, n]), wv);
+    let x_dev = ferrite_kernel::cuda::DevBuf::alloc(dev.dev(), dev.stream_handle(), n).unwrap();
+    x_dev.upload(&xv).unwrap();
+    let _ = dev.matmul_dev(&x_dev, &w_t, 1, n as i32, n as i32); // warm weight cache
+    let _ = dev.sync();
+
+    // (a) plain stream events
+    let e0 = dev.event_create().unwrap();
+    let e1 = dev.event_create().unwrap();
+    dev.event_record(e0);
+    let out_a = dev.matmul_dev(&x_dev, &w_t, 1, n as i32, n as i32).unwrap();
+    dev.event_record(e1);
+    let _ = dev.sync();
+    let ms_a = dev.event_elapsed_ms(e0, e1);
+    let mut va = vec![0f32; 1];
+    out_a.download(&mut va).unwrap();
+    eprintln!("[evt] plain stream: {:.3}ms (out={:.4})", ms_a, va[0]);
+    assert!(ms_a > 0.0, "plain elapsed must be > 0, got {ms_a}");
+
+    // (b) events recorded during capture -> event record nodes
+    let g0 = dev.event_create().unwrap();
+    let g1 = dev.event_create().unwrap();
+    dev.graph_capture_begin();
+    dev.event_record(g0);
+    let out_b = dev.matmul_dev(&x_dev, &w_t, 1, n as i32, n as i32).unwrap();
+    dev.event_record(g1);
+    dev.graph_capture_end("evttest");
+    dev.graph_io_put("evttest", ferrite_kernel::cuda::GraphIO {
+        x_stage: x_dev.stage,
+        x_len: n,
+        out_dev: out_b.as_f32() as *mut std::ffi::c_void,
+        out_len: n,
+    });
+    std::mem::forget(out_b); // graph output must outlive replays (mega pattern)
+    let mut ob = vec![0f32; n];
+    assert!(dev.graph_run("evttest", &xv, &mut ob).unwrap(), "graph_run evttest");
+    let ms_b = dev.event_elapsed_ms(g0, g1);
+    eprintln!("[evt] in-graph: {:.3}ms (out={:.4})", ms_b, ob[0]);
+    assert!(ms_b > 0.0, "in-graph elapsed must be > 0, got {ms_b}");
+}
