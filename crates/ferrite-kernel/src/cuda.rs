@@ -58,6 +58,10 @@ extern "C" {
                             s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
+    fn ferrite_event_create(ev: *mut *mut std::ffi::c_void) -> i32;
+    fn ferrite_event_record(ev: *mut std::ffi::c_void, s: CuStream) -> i32;
+    fn ferrite_event_elapsed(a: *mut std::ffi::c_void, b: *mut std::ffi::c_void, ms: *mut f32) -> i32;
+    fn ferrite_event_destroy(ev: *mut std::ffi::c_void) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
     fn ferrite_graph_instantiate(e: *mut *mut std::ffi::c_void, g: *mut std::ffi::c_void) -> i32;
     fn ferrite_graph_launch(e: *mut std::ffi::c_void, s: CuStream) -> i32;
@@ -833,7 +837,45 @@ impl CudaBackend {
         }
         self.graph_execs.lock().unwrap().insert(name.to_string(), exec as usize);
     }
+
+    // ---- event-in-graph timing (FERRITE_MEGA_EVTS) ----
+    // Events recorded during capture become graph nodes; replay updates
+    // them, and post-replay elapsed gives TRUE in-graph segment times
+    // (the DRY sync-timing drains the queue → contaminated numbers).
+
+    /// Create a timing-enabled event (opaque handle; destroy with
+    /// event_destroy). Capture-safe: recording it inside graph_capture
+    /// inserts an event-record node.
+    pub fn event_create(&self) -> Result<*mut std::ffi::c_void> {
+        let mut ev: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { ferrite_event_create(&mut ev) }, "event_create")?;
+        Ok(ev)
+    }
+    pub fn event_destroy(&self, ev: *mut std::ffi::c_void) {
+        let _ = unsafe { ferrite_event_destroy(ev) };
+    }
+    /// Record on this backend's stream. Inside a capture pass this
+    /// becomes an event-record node in the graph.
+    pub fn event_record(&self, ev: *mut std::ffi::c_void) {
+        let r = unsafe { ferrite_event_record(ev, self.stream) };
+        if r != 0 { panic!("cudaEventRecord failed: {r}"); }
+    }
+    /// elapsed ms from event a → b (both updated by the same replay).
+    pub fn event_elapsed_ms(&self, a: *mut std::ffi::c_void, b: *mut std::ffi::c_void) -> f32 {
+        let mut ms = 0f32;
+        let r = unsafe { ferrite_event_elapsed(a, b, &mut ms) };
+        if r != 0 { panic!("cudaEventElapsedTime failed: {r}"); }
+        ms
+    }
 }
+
+/// Mega-graph segment events (rank-0): created during the capture pass
+/// (mega_chain_dev, FERRITE_MEGA_EVTS), read after each replay
+/// (decode_step_mega) — [e_layer_start, e_attn_end, e_mid_end, e_ffn_end]
+/// per layer × 45 + head pair. Handles stored as usize (raw pointers
+/// are not Send; a static Mutex needs Send contents).
+pub static MEGA_EVTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
 
 impl crate::graph::GraphCapable for CudaBackend {
     fn begin_capture(&self) {

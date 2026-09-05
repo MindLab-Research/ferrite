@@ -584,6 +584,44 @@ impl<B: KernelBackend> TpCluster<B> {
                 1e3 / dt.as_secs_f32().max(1e-9)
             );
         }
+        // Event-in-graph segment times (FERRITE_MEGA_EVTS): read the
+        // rank-0 graph's event nodes after the replay — TRUE in-graph
+        // per-segment times (no sync-drain contamination like DRY mode).
+        if std::env::var_os("FERRITE_MEGA_EVTS").is_some() {
+            let es = ferrite_kernel::cuda::MEGA_EVTS.lock().unwrap();
+            let nl = plans.len();
+            if es.len() >= nl * 4 + 2 {
+                let cuda0 = self.shards[0]
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("FERRITE_MEGA_EVTS needs cuda".into()))?;
+                cuda0.enter();
+                let el = |a: usize, b: usize| {
+                    cuda0.event_elapsed_ms(a as *mut std::ffi::c_void, b as *mut std::ffi::c_void) as f64
+                };
+                let (mut a_hc, mut b_gdn, mut b_dsa, mut c_hc, mut de_ffn) =
+                    (0f64, 0f64, 0f64, 0f64, 0f64);
+                for (i, p) in plans.iter().enumerate() {
+                    let prev = if i == 0 { es[0] } else { es[4 + (i - 1) * 4] };
+                    let (e_a, e_b, e_c, e_e) =
+                        (es[1 + i * 4], es[2 + i * 4], es[3 + i * 4], es[4 + i * 4]);
+                    a_hc += el(prev, e_a);
+                    if matches!(p.attn, AttnKind::Dsa) {
+                        b_dsa += el(e_a, e_b);
+                    } else {
+                        b_gdn += el(e_a, e_b);
+                    }
+                    c_hc += el(e_b, e_c);
+                    de_ffn += el(e_c, e_e);
+                }
+                let head = el(es[4 + (nl - 1) * 4], es[4 * nl + 1]);
+                eprintln!(
+                    "[evts] A_hc={:.2} B_gdn={:.2} B_dsa={:.2} C_hc={:.2} DE_ffn={:.2} head={:.3} tot={:.2}ms",
+                    a_hc, b_gdn, b_dsa, c_hc, de_ffn, head,
+                    a_hc + b_gdn + b_dsa + c_hc + de_ffn + head
+                );
+            }
+        }
         // every shard's seq_runtime must track the sampled token —
         // decode_step_normal pushes at its tail; mega omitted it → the
         // next step's input token froze at the prompt's last token →
@@ -703,6 +741,27 @@ fn mega_chain_dev(
     let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), nh)?;
     res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
+    // Event-in-graph timing (FERRITE_MEGA_EVTS): rank-0 records timing
+    // events at segment boundaries DURING capture — they become graph
+    // nodes, replay updates them, post-replay elapsed = TRUE in-graph
+    // segment times (the DRY sync-timing drains the async queue between
+    // layers → contaminated). Layout: es[0] graph input; per layer i:
+    // es[1+4i]=after A(hc_pre+norm), es[2+4i]=after B(attn+AR),
+    // es[3+4i]=after C(hc_post+hc_pre2+norm), es[4+4i]=after
+    // E(ffn+AR+hc_post2); es[4*nl+1]=after head(argmax).
+    let evt_on = capture && dev_id == 0 && std::env::var_os("FERRITE_MEGA_EVTS").is_some();
+    if evt_on {
+        let nl = plans.len();
+        let mut es = Vec::with_capacity(nl * 4 + 2);
+        for _ in 0..nl * 4 + 2 {
+            es.push(cuda.event_create()? as usize);
+        }
+        cuda.event_record(es[0] as *mut std::ffi::c_void); // graph input
+        *ferrite_kernel::cuda::MEGA_EVTS.lock().unwrap() = es;
+    }
+    let ev = |i: usize| {
+        ferrite_kernel::cuda::MEGA_EVTS.lock().unwrap()[i] as *mut std::ffi::c_void
+    };
     mprobe!("res0", &res, nh);
 
     for (layer_idx, plan) in plans.iter().enumerate() {
@@ -730,6 +789,9 @@ fn mega_chain_dev(
         if tm {
             let _ = cuda.sync();
             t_a += t_l.elapsed().as_secs_f64() * 1e3;
+        }
+        if evt_on {
+            cuda.event_record(ev(1 + layer_idx * 4)); // after A (hc_pre+norm)
         }
         let t_b = std::time::Instant::now();
         if layer_idx == 0 {
@@ -811,6 +873,9 @@ fn mega_chain_dev(
                 eprintln!("[mega] L{layer_idx:02} {kind} ar  maxabs={mx:.4}");
             }
         }
+        if evt_on {
+            cuda.event_record(ev(2 + layer_idx * 4)); // after B (attn+AR)
+        }
         // C: hc_post → hc_pre2 → post_attention_layernorm
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
         if layer_idx == 0 {
@@ -837,6 +902,9 @@ fn mega_chain_dev(
         if tm {
             let _ = cuda.sync();
             t_c += t_mid.elapsed().as_secs_f64() * 1e3;
+        }
+        if evt_on {
+            cuda.event_record(ev(3 + layer_idx * 4)); // after C (hc_post+hc_pre2+norm)
         }
         let t_d = std::time::Instant::now();
         if probe && layer_idx < 3 && matches!(plan.mlp, MlpKind::Dense) {
@@ -922,6 +990,9 @@ fn mega_chain_dev(
             let _ = cuda.sync();
             t_e += t_d.elapsed().as_secs_f64() * 1e3;
         }
+        if evt_on {
+            cuda.event_record(ev(4 + layer_idx * 4)); // after E (ffn+AR+hc_post2)
+        }
     }
 
     mprobe!("resL", &res, nh);
@@ -942,6 +1013,9 @@ fn mega_chain_dev(
     mprobe!("logits16", &logits, 16);
     let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), n)?;
     cuda.argmax_dev(&logits, &mut arg, n, cfg.vocab_size)?;
+    if evt_on {
+        cuda.event_record(ev(4 * plans.len() + 1)); // head end (argmax)
+    }
 
     if capture {
         cuda.graph_capture_end(gname);

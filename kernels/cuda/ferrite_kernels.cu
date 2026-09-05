@@ -1860,6 +1860,30 @@ extern "C" cudaError_t ferrite_scale_inplace(float* x, float s, int n, cudaStrea
 // CUDA graph via RUNTIME API wrappers (the driver-API dlopen path
 // SIGSEGV'd inside cuGraphInstantiate on worker-thread captures).
 // ============================================================
+// Event-in-graph timing (FERRITE_MEGA_EVTS): events recorded during
+// stream capture become event-record nodes — replay updates them, and
+// post-replay cudaEventElapsedTime gives the TRUE in-graph segment
+// times (the DRY sync-timing drains the async queue between layers,
+// so its per-segment numbers are contaminated by downstream work).
+extern "C" cudaError_t ferrite_event_create(void** ev) {
+    cudaEvent_t* e = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
+    if (!e) return cudaErrorMemoryAllocation;
+    cudaError_t err = cudaEventCreate(e); // default flags: timing enabled
+    if (err != cudaSuccess) { free(e); return err; }
+    *ev = e;
+    return err;
+}
+extern "C" cudaError_t ferrite_event_record(void* ev, cudaStream_t s) {
+    return cudaEventRecord(*(cudaEvent_t*)ev, s); // in capture: graph node
+}
+extern "C" cudaError_t ferrite_event_elapsed(void* a, void* b, float* ms) {
+    return cudaEventElapsedTime(ms, *(cudaEvent_t*)b, *(cudaEvent_t*)a);
+}
+extern "C" cudaError_t ferrite_event_destroy(void* ev) {
+    cudaError_t err = cudaEventDestroy(*(cudaEvent_t*)ev);
+    free(ev);
+    return err;
+}
 extern "C" cudaError_t ferrite_graph_begin(cudaStream_t s) {
     return cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
 }
