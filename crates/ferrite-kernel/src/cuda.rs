@@ -2154,7 +2154,11 @@ impl CudaBackend {
             }, "p2p single copy")?;
             return Ok(out);
         }
-        // staging: [world, n] contiguous on this device
+        // staging: [world, n] contiguous on this device — LEAKED (not returned
+        // to the pool): the pool would reuse this memory for the NEXT op's
+        // allocation while the GPU is still executing the tp_all_reduce
+        // kernel that reads from it (async race). Per-token leak is
+        // world * n * 4 bytes = 4 × 4096 × 4 = 64KB → acceptable.
         let mut staging = DevBuf::alloc(self.dev, self.stream, world * n)?;
         for (rank, &ptr) in partial_ptrs.iter().enumerate() {
             if rank as i32 == self.dev {
@@ -2180,6 +2184,10 @@ impl CudaBackend {
         let out = DevBuf::alloc(self.dev, self.stream, n)?;
         let mut out_mut = out;
         self.tp_all_reduce_dev(&staging, &mut out_mut, n, world)?;
+        // CRITICAL: sync before returning — staging goes back to the pool on
+        // drop, and the NEXT allocation would reuse its memory while the
+        // GPU is still reading it (tp_all_reduce kernel is async).
+        self.sync()?;
         Ok(out_mut)
     }
 }
