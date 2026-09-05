@@ -612,6 +612,17 @@ fn mega_chain_dev(
     let e = cfg.n_routed_experts;
 
     let _guard = if capture {
+        // DSA host bookkeeping: the capture pass re-runs dsa_layer_dev's
+        // host logic (t_count += 1 WITHOUT executing cache_append). Roll it
+        // back BEFORE the pass so the recorded buffer sizes match the
+        // dry-run's — npools/select_k derive from t_count/total, and the
+        // +1 shift changes the idx_pools/idx size classes → pool miss →
+        // cudaMalloc during capture = err 900. After the pass t_count
+        // lands back at the real cache count (no post-capture rollback);
+        // replay-side dsa_host_advance then keeps it in lockstep.
+        for f in 0..num_dsa {
+            cuda.dsa_host_rollback(seq, f, 1);
+        }
         // Serialize per-rank captures (concurrent cuGraphInstantiate
         // SIGSEGV'd historically); record-mode NCCL enqueue never
         // rendezvous, so serialized capture is deadlock-free.
@@ -797,11 +808,10 @@ fn mega_chain_dev(
             },
         );
         std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
-        // DSA host bookkeeping advanced t_count during the record pass
-        // without executing the kernels — undo it (replay advances for real).
-        for f in 0..num_dsa {
-            cuda.dsa_host_rollback(seq, f, 1);
-        }
+        // NOTE: no DSA rollback here — the PRE-capture rollback above makes
+        // the pass's virtual t_count advance land exactly on the real cache
+        // count (dry-run's tokens). replay-side dsa_host_advance keeps it
+        // in lockstep from here on.
         Ok(0.0)
     } else {
         let mut tv = vec![0f32; 1];
