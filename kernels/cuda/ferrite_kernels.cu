@@ -1877,7 +1877,9 @@ extern "C" cudaError_t ferrite_event_record(void* ev, cudaStream_t s) {
     return cudaEventRecord(*(cudaEvent_t*)ev, s); // in capture: graph node
 }
 extern "C" cudaError_t ferrite_event_elapsed(void* a, void* b, float* ms) {
-    return cudaEventElapsedTime(ms, *(cudaEvent_t*)b, *(cudaEvent_t*)a);
+    // (a, b) = (start, stop): elapsed ms from event a to event b (a must
+    // have been recorded BEFORE b — the graph replays them in node order).
+    return cudaEventElapsedTime(ms, *(cudaEvent_t*)a, *(cudaEvent_t*)b);
 }
 extern "C" cudaError_t ferrite_event_destroy(void* ev) {
     cudaError_t err = cudaEventDestroy(*(cudaEvent_t*)ev);
