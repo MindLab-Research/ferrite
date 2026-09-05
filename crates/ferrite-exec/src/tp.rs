@@ -579,6 +579,49 @@ impl<B: KernelBackend> TpCluster<B> {
             .collect::<Result<Vec<Vec<f32>>>>()?;
             self.mega_seq = Some(seq);
             if mtp {
+                // MTP draft-cache catch-up: run the draft layer (layers.45)
+                // over every prompt token so its DSA cache (family num_dsa)
+                // holds the prompt context — without this the draft's
+                // attention has no history and d1 is a blind guess (accept
+                // rate 40%). h_prev approximated by hf_dev (prompt-tail h).
+                let prompt_tokens: Vec<u32> = {
+                    let s = self.shards[0]
+                        .seq_runtime(seq)
+                        .ok_or_else(|| FerriteError::Config("missing seq".into()))?;
+                    s.tokens.clone()
+                };
+                let hidden = self.full_cfg.hidden_size;
+                let _ = Self::fan_out(&mut self.shards, |s| {
+                    for t in &prompt_tokens {
+                        let hptr = {
+                            let cuda = s
+                                .backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                            cuda.enter();
+                            let h2 = s.embed(&[*t]);
+                            let emb = ferrite_kernel::cuda::DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                            emb.upload(h2.as_slice())?;
+                            let m = cuda.mtp.lock().unwrap();
+                            let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                            (
+                                emb,
+                                &m.hf_dev as *const ferrite_kernel::cuda::DevBuf as usize,
+                            )
+                        };
+                        let (emb, hptr) = hptr;
+                        let hprev: &ferrite_kernel::cuda::DevBuf =
+                            unsafe { &*(hptr as *const ferrite_kernel::cuda::DevBuf) };
+                        mtp_forward(s, seq, &emb, hprev)?;
+                    }
+                    Ok::<(), FerriteError>(())
+                })
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+                eprintln!(
+                    "[mega] MTP: draft cache catch-up done ({} prompt tokens)",
+                    prompt_tokens.len()
+                );
                 // MTP verify graph (n=2: [t_last, d1]): GDN state → scratch B
                 // (ping-pong), h_final export (hf_v [2,hidden]), argmax 2.
                 let gv = format!("mega_v{seq}");
