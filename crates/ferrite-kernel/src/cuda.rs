@@ -1962,6 +1962,20 @@ impl CudaBackend {
         // Use the SPLIT kernel (grid(s, mix) spreads each mix's dot product
         // across a separate SM — the single-block version ran on ONE SM with
         // 24 warps, limited to ~6GB/s vs 8TB/s HBM = 0.18ms; split = ~0.02ms)
+        // WARM-UP: run once with the original kernel first (fills the pool
+        // with mx_scratch's size class — graph capture would cudaMalloc on
+        // pool miss which is illegal during stream capture).
+        ck(
+            unsafe {
+                ferrite_hc_pre(
+                    res.as_const_f32(), dfw.as_const_f32(), dsc.as_const_f32(), dba.as_const_f32(),
+                    li.as_f32(), post.as_f32(), comb.as_f32(),
+                    s as i32, n as i32, h as i32, mix as i32,
+                    rms_eps, hc_eps, sinkhorn_iters as i32, self.stream,
+                )
+            },
+            "hc_pre_warmup",
+        )?;
         ck(
             unsafe {
                 ferrite_hc_pre_split(
