@@ -2889,3 +2889,200 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot(
         staging_local, ready_local, out, world, n);
     return cudaGetLastError();
 }
+
+// ============================================================
+// Knife 1b: qkv GEMV + conv FIR/silu/window-slide epilogue (decode n==1).
+// Replaces matmul_dev(qkv_proj) + the FIR/silu/slide half of
+// conv_prep_fused — one kernel per gdn layer. The row's dot lands,
+// lane 0 runs the 3-tap FIR against the sliding-window state, slides
+// it, applies silu, and writes q/k/v directly. The L2 norm + gate +
+// beta halves move to gdn_step_v2p's prologue (they need cross-row
+// reductions / other tensors).
+// ============================================================
+__global__ void gemv_qkv_conv_kernel(const float* __restrict__ x,
+                                     const __nv_bfloat16* __restrict__ w,
+                                     const __nv_bfloat16* __restrict__ cw,
+                                     float* __restrict__ cs,
+                                     float* __restrict__ q,
+                                     float* __restrict__ k,
+                                     float* __restrict__ v,
+                                     int in_f, int proj) {
+    // WPR==1 specialization of gemv_bf16_v2 (out=3*proj >= 16k rows):
+    // one warp per row, uint4 body, lane 0 epilogue = FIR + slide + silu.
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 8 + warp;   // 256 threads = 8 warps/block
+    if (row >= 3 * proj) return;
+    const __nv_bfloat16* wr = w + (size_t)row * in_f;
+    float acc = 0.f;
+    #pragma unroll 2
+    for (int k0 = lane * 8; k0 + 7 < in_f; k0 += 32 * 8) {
+        uint4 wv = *reinterpret_cast<const uint4*>(wr + k0);
+        float4 xa = *reinterpret_cast<const float4*>(x + k0);
+        float4 xb = *reinterpret_cast<const float4*>(x + k0 + 4);
+        const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
+        float2 f0 = __bfloat1622float2(w2[0]);
+        float2 f1 = __bfloat1622float2(w2[1]);
+        float2 f2 = __bfloat1622float2(w2[2]);
+        float2 f3 = __bfloat1622float2(w2[3]);
+        acc += xa.x * f0.x + xa.y * f0.y + xa.z * f1.x + xa.w * f1.y;
+        acc += xb.x * f2.x + xb.y * f2.y + xb.z * f3.x + xb.w * f3.y;
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    if (lane != 0) return;
+    // ---- epilogue: conv FIR (3 window taps + new token) + slide + silu ----
+    const float xv = acc;                       // new conv input token
+    float fir = __bfloat162float(cw[(size_t)row * 4 + 0]) * cs[(size_t)row * 3 + 0]
+              + __bfloat162float(cw[(size_t)row * 4 + 1]) * cs[(size_t)row * 3 + 1]
+              + __bfloat162float(cw[(size_t)row * 4 + 2]) * cs[(size_t)row * 3 + 2]
+              + __bfloat162float(cw[(size_t)row * 4 + 3]) * xv;
+    cs[(size_t)row * 3 + 0] = cs[(size_t)row * 3 + 1];
+    cs[(size_t)row * 3 + 1] = cs[(size_t)row * 3 + 2];
+    cs[(size_t)row * 3 + 2] = xv;
+    fir = fir / (1.0f + expf(-fir));            // silu (q, k and v all gated)
+    if (row < proj)       q[row] = fir;
+    else if (row < 2 * proj) k[row - proj] = fir;
+    else                  v[row - 2 * proj] = fir;
+}
+extern "C" cudaError_t ferrite_gemv_qkv_conv(
+    const float* x, const void* w, const void* cw, float* cs,
+    float* q, float* k, float* v, int in_f, int proj, cudaStream_t s) {
+    int out_f = 3 * proj;
+    dim3 grid((out_f + 7) / 8);
+    gemv_qkv_conv_kernel<<<grid, 256, 0, s>>>(
+        x, (const __nv_bfloat16*)w, (const __nv_bfloat16*)cw, cs,
+        q, k, v, in_f, proj);
+    return cudaGetLastError();
+}
+
+// ============================================================
+// Knife 1b part 2: gdn_step_v2p — gdn_step_v2 with an extended prologue
+// that computes the L2 norm (q, k), gate (KDA log-space sigmoid) and beta
+// inline, replacing the conv_prep_fused node. q/k arrive as raw FIR+silu
+// output (from gemv_qkv_conv's epilogue); the block reduces sum(qh^2)/
+// sum(kh^2) via smem tree, then applies q = qh*L2*rsqrt(dk), k = kh*L2
+// (matching conv_prep_fused's normalization semantics).
+// ============================================================
+__global__ void gdn_step_v2p_kernel(const float* __restrict__ q,
+                                   const float* __restrict__ k,
+                                   const float* __restrict__ v,
+                                   const float* __restrict__ b_raw,
+                                   const float* __restrict__ fb,
+                                   const float* __restrict__ dt_bias,
+                                   const float* __restrict__ a_log,
+                                   float lb,
+                                   float* __restrict__ state,
+                                   float* __restrict__ out,
+                                   int n, int h, int dk, int dv) {
+    int t = blockIdx.x;
+    int hd = blockIdx.y;
+    if (t >= n || hd >= h) return;
+    const float a_ex = expf(a_log[hd]);
+    const float bt = 1.0f / (1.0f + expf(-b_raw[hd]));
+    const size_t spitch = (size_t)dv + 1;
+    extern __shared__ float sm[];
+    float* S = sm;
+    float* ks = S + (size_t)dk * spitch;
+    float* kh = ks + dv;
+    float* vh = kh + dk;
+    float* qh = vh + dv;
+    float* gh = qh + dk;
+    float* red = gh + dk; // [2]: L2 sums (q, k)
+    __shared__ float wq[16], wk[16]; // warp sums for the L2 block-tree
+    // 0. load q/k (raw FIR+silu) + gate math + v + state; L2 via smem tree
+    const int base = (int)((size_t)t * h + hd) * dk;
+    float q_sq = 0.f, k_sq = 0.f;
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        float qv = q[base + i];
+        float kv = k[base + i];
+        qh[i] = qv; kh[i] = kv;
+        q_sq += qv * qv; k_sq += kv * kv;
+        // KDA log-space gate: lb * sig(a_log[hd] * (fb[c]+dt_bias[c])) —
+        // exact conv_prep computation order (1-ulp sensitive recurrence).
+        float g = fb[base + i] + dt_bias[base + i];
+        gh[i] = lb / (1.0f + expf(-(a_ex * g)));
+    }
+    for (int j = threadIdx.x; j < dv; j += blockDim.x)
+        vh[j] = v[(size_t)((size_t)t * h + hd) * dv + j];
+    // block-tree reduce q_sq/k_sq -> red[2]
+    // (warp shuffle: every warp's lane 0 holds the warp sum; 512 threads
+    // = 16 warps; warps past dk are all-zero lanes, contributing 0)
+    unsigned mask = 0xffffffffu;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        q_sq += __shfl_down_sync(mask, q_sq, off);
+        k_sq += __shfl_down_sync(mask, k_sq, off);
+    }
+    if ((threadIdx.x & 31) == 0) {
+        int w = threadIdx.x >> 5;
+        wq[w] = q_sq; wk[w] = k_sq;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = 0.f, b = 0.f;
+        for (int w = 0; w < 16; w++) { a += wq[w]; b += wk[w]; }
+        red[0] = (a > 0.f) ? rsqrtf(a) : 0.f;
+        red[1] = (b > 0.f) ? rsqrtf(b) : 0.f;
+    }
+    __syncthreads();
+    const float q_scl = rsqrtf((float)dk);
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        qh[i] = qh[i] * red[0] * q_scl;
+        kh[i] = kh[i] * red[1];
+    }
+    float* Sg = state + (size_t)hd * dk * dv;
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
+    __syncthreads();
+    // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        float decay = expf(gh[i]);
+        if (decay != 1.0f) {
+            float* Si = S + (size_t)i * spitch;
+            for (int j = 0; j < dv; j++) Si[j] *= decay;
+        }
+    }
+    __syncthreads();
+    // 2. kS = S^T k
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
+        ks[j] = acc;
+    }
+    __syncthreads();
+    // 3. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
+            bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
+    __syncthreads();
+    // 4. o = q^T S
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
+        out[((size_t)t * h + hd) * dv + j] = acc;
+    }
+    __syncthreads();
+    // 5. store state back
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+}
+extern "C" cudaError_t ferrite_gdn_step_v2p(
+    const float* q, const float* k, const float* v,
+    const float* b_raw, const float* fb, const float* dt_bias,
+    const float* a_log, float lb,
+    float* state, float* out, int h, int dk, int dv,
+    cudaStream_t s) {
+    size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
+                  + (size_t)(dv + dk + dv + dk + dk + 2) * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gdn_step_v2p_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+    }
+    dim3 block(512);
+    dim3 grid(1, h, 1);
+    gdn_step_v2p_kernel<<<grid, block, smem, s>>>(
+        q, k, v, b_raw, fb, dt_bias, a_log, lb, state, out, 1, h, dk, dv);
+    return cudaGetLastError();
+}
