@@ -851,3 +851,76 @@ fn head_chain_bench() {
         t_gemv, (vocab * h * 2) as f64 / t_gemv / 1e3, t_arg, t_rms
     );
 }
+
+/// gemv5_bf16 parity: the fused 5-matrix same-input GEMV vs 5 separate
+/// matmul_dev calls (gdn: qkv/b/fa/ga share x; dsa: qa/latent/ki/w_idx/gate
+/// share x). bf16 accumulation-order differences only (~1e-6).
+#[test]
+fn gemv5_parity() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let stream = dev.stream_handle();
+    let in_f = 4096usize;
+    // gdn shapes (TP4 shard): qkv [3*proj, 4096], b [h, 4096], fa [dk, 4096], ga [dk, 4096]
+    let (proj, hh, dk) = (1536usize, 512usize, 512usize);
+    let shapes: Vec<(usize, &str)> = vec![
+        (3 * proj, "qkv"), (hh, "b"), (dk, "fa"), (dk, "ga"), (dk * 2 + 64, "kvA"),
+    ];
+    let mut rnd = 0x1234_5678_9abc_defu64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    let xv: Vec<f32> = (0..in_f).map(|_| r()).collect();
+    let x_t = Tensor::from_f32(Shape::new([1, in_f]), xv.clone());
+    let x_dev = DevBuf::alloc(dev.dev(), stream, in_f).unwrap();
+    x_dev.upload(&xv).unwrap();
+
+    let mut ws: Vec<Tensor> = Vec::new();
+    let mut exps: Vec<Vec<f32>> = Vec::new();
+    for (of, _n) in &shapes {
+        let wv: Vec<f32> = (0..of * in_f).map(|_| r() * 0.02).collect();
+        let w = Tensor::from_f32(Shape::new([*of, in_f]), wv);
+        // reference: individual matmul_dev
+        let o = dev.matmul_dev(&x_dev, &w, 1, in_f as i32, *of as i32).unwrap();
+        let mut ev = vec![0f32; *of];
+        o.download(&mut ev).unwrap();
+        exps.push(ev);
+        ws.push(w);
+    }
+
+    // fused gemv5
+    let (o1, o2, o3, o4, o5) = dev
+        .gemv5_dev(&x_dev, &ws[0], &ws[1], &ws[2], &ws[3], Some(&ws[4]),
+                   in_f as i32, 3 * proj as i32, hh as i32, dk as i32, dk as i32)
+        .unwrap();
+    let outs = [o1, o2, o3, o4, o5.unwrap()];
+    for (i, (o, exp)) in outs.iter().zip(exps.iter()).enumerate() {
+        let mut got = vec![0f32; shapes[i].0];
+        o.download(&mut got).unwrap();
+        let mut maxd = 0f32;
+        for (g, e) in got.iter().zip(exp.iter()) {
+            maxd = maxd.max((g - e).abs());
+        }
+        eprintln!("[gemv5] {} [1,{}]: max_diff={:.2e}", shapes[i].1, shapes[i].0, maxd);
+        assert!(maxd < 2e-4, "gemv5 {} max_diff {:.2e} too large", shapes[i].1, maxd);
+    }
+    // timing: fused vs 5 separate (steady-state)
+    let it = 500;
+    let t0 = std::time::Instant::now();
+    for _ in 0..it {
+        let _ = dev.matmul_dev(&x_dev, &ws[0], 1, in_f as i32, 3 * proj as i32);
+        let _ = dev.matmul_dev(&x_dev, &ws[1], 1, in_f as i32, hh as i32);
+        let _ = dev.matmul_dev(&x_dev, &ws[2], 1, in_f as i32, dk as i32);
+        let _ = dev.matmul_dev(&x_dev, &ws[3], 1, in_f as i32, dk as i32);
+        let _ = dev.matmul_dev(&x_dev, &ws[4], 1, in_f as i32, (dk * 2 + 64) as i32);
+    }
+    let _ = dev.sync();
+    let t_sep = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+    let t1 = std::time::Instant::now();
+    for _ in 0..it {
+        let _ = dev.gemv5_dev(&x_dev, &ws[0], &ws[1], &ws[2], &ws[3], Some(&ws[4]),
+                              in_f as i32, 3 * proj as i32, hh as i32, dk as i32, dk as i32);
+    }
+    let _ = dev.sync();
+    let t_fus = t1.elapsed().as_secs_f64() * 1e6 / it as f64;
+    eprintln!("[gemv5] 5-matrix chain: separate={:.1}us fused={:.1}us ({:.1}x)", t_sep, t_fus, t_sep / t_fus.max(1e-9));
+}

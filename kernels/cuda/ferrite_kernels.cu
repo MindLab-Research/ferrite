@@ -1999,3 +1999,53 @@ extern "C" cudaError_t ferrite_hc_contract(const float* in, float* out,
     hc_contract_kernel<<<grid, block, 0, stream>>>(in, out, s, n, h);
     return cudaGetLastError();
 }
+
+// ============================================================
+// gemv5_bf16: ONE launch for up to 5 same-input GEMVs (decode n=1).
+// gdn_layer_dev issues x*Wqkv, x*Wb, x*Wfa, x*Wga as 4 separate GEMV
+// launches (4 kernel tails ~10-15us each); dsa issues 5. Same-input rows
+// concatenate: thread t owns ONE output row of the virtual [of1+..+of5,
+// in_f] matrix — full HBM bandwidth, one launch.
+// Pass of5=0 (w5/o5 = nullptr) for the 4-matrix case.
+// ============================================================
+__global__ void gemv5_bf16_kernel(const float* __restrict__ x,
+                                  const __nv_bfloat16* __restrict__ w1, const __nv_bfloat16* __restrict__ w2,
+                                  const __nv_bfloat16* __restrict__ w3, const __nv_bfloat16* __restrict__ w4,
+                                  const __nv_bfloat16* __restrict__ w5,
+                                  float* __restrict__ o1, float* __restrict__ o2,
+                                  float* __restrict__ o3, float* __restrict__ o4,
+                                  float* __restrict__ o5,
+                                  int in_f, int of1, int of2, int of3, int of4, int of5) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int tot = of1 + of2 + of3 + of4 + of5;
+    if (row >= tot) return;
+    const __nv_bfloat16* wrow;
+    float* orow;
+    if (row < of1) { wrow = w1 + (size_t)row * in_f; orow = o1 + row; }
+    else if (row < of1 + of2) { wrow = w2 + (size_t)(row - of1) * in_f; orow = o2 + (row - of1); }
+    else if (row < of1 + of2 + of3) { wrow = w3 + (size_t)(row - of1 - of2) * in_f; orow = o3 + (row - of1 - of2); }
+    else if (row < of1 + of2 + of3 + of4) { wrow = w4 + (size_t)(row - of1 - of2 - of3) * in_f; orow = o4 + (row - of1 - of2 - of3); }
+    else { wrow = w5 + (size_t)(row - of1 - of2 - of3 - of4) * in_f; orow = o5 + (row - of1 - of2 - of3 - of4); }
+    float acc = 0.f;
+    for (int k = 0; k < in_f; k++) acc += x[k] * __bfloat162float(wrow[k]);
+    *orow = acc;
+}
+
+extern "C" cudaError_t ferrite_gemv5_bf16(const float* x,
+                                          const void* w1, const void* w2, const void* w3,
+                                          const void* w4, const void* w5,
+                                          float* o1, float* o2, float* o3, float* o4, float* o5,
+                                          int in_f, int of1, int of2, int of3, int of4, int of5,
+                                          cudaStream_t s) {
+    int tot = of1 + of2 + of3 + of4 + of5;
+    if (tot <= 0) return cudaSuccess;
+    dim3 block(256);
+    dim3 grid((tot + 255) / 256);
+    gemv5_bf16_kernel<<<grid, block, 0, s>>>(
+        x,
+        (const __nv_bfloat16*)w1, (const __nv_bfloat16*)w2, (const __nv_bfloat16*)w3,
+        (const __nv_bfloat16*)w4, (const __nv_bfloat16*)w5,
+        o1, o2, o3, o4, o5,
+        in_f, of1, of2, of3, of4, of5);
+    return cudaGetLastError();
+}

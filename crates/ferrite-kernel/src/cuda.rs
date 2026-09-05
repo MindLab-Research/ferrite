@@ -64,6 +64,11 @@ extern "C" {
                        n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
     fn ferrite_hc_contract(x: *const f32, out: *mut f32,
                            s: i32, n: i32, h: i32, stream: CuStream) -> i32;
+    fn ferrite_gemv5_bf16(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
+                          w3: *const std::ffi::c_void, w4: *const std::ffi::c_void, w5: *const std::ffi::c_void,
+                          o1: *mut f32, o2: *mut f32, o3: *mut f32, o4: *mut f32, o5: *mut f32,
+                          in_f: i32, of1: i32, of2: i32, of3: i32, of4: i32, of5: i32,
+                          stream: CuStream) -> i32;
     fn ferrite_gated_rmsnorm(x: *const f32, gate: *const f32, w: *const f32, out: *mut f32,
                              n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
     fn ferrite_swiglu(gu: *const f32, out: *mut f32, n: i32, inter: i32,
@@ -1297,8 +1302,23 @@ impl CudaBackend {
         self.enter();
         let proj = h * dk;
         let ni = n as i32;
-        // 1. six projections (bf16-resident weights)
-        let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
+        // 1. six projections (bf16-resident weights) — FUSED first four
+        // (qkv/b/fa/ga share the input x): ONE gemv5 launch replaces 4
+        // separate GEMV launches (3 fewer kernel tails on B300); fb/gb
+        // depend on fa/ga outputs (serial, stay separate).
+        let (qkv, b_raw, fa, ga, _) = self.gemv5_dev(
+            x,
+            w.qkv_proj,
+            w.b_proj,
+            w.f_a,
+            w.g_a,
+            None,
+            hidden as i32,
+            (3 * proj) as i32,
+            h as i32,
+            dk as i32,
+            dk as i32,
+        )?;
         // PROBE: dump x (input) + qkv (first matmul output) — pinpoints
         // divergence to upload (x wrong) vs matmul/weights (qkv wrong)
         if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
@@ -1315,10 +1335,7 @@ impl CudaBackend {
             d("qkv", &qh);
             eprintln!("[gdn_probe] dev L0 x/qkv dumped: x {} qkv {} (n={} proj={})", xh.len(), qh.len(), n, proj);
         }
-        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
-        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
-        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?;
         let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
         // 2. causal conv — resident tail state (RMW in place: the kernel
         // reads state_in into smem at block start, writes state_out at end,
@@ -1478,21 +1495,34 @@ impl CudaBackend {
         let ni = n as i32;
         let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
 
-        // 1. query path: qa → rmsnorm → qb [n, h*dk]
-        let qa = self.matmul_dev(x, w.q_a, ni, hidden as i32, (w.q_a.shape.0[0]) as i32)?;
+        // 1-6. FUSED first-five same-input GEMVs — qa/latent/ki_raw/w_idx/gate
+        // all project the same x: ONE gemv5 launch replaces 5 separate GEMV
+        // launches (4 fewer kernel tails on B300, ~10-15us each).
+        let (qa, latent, ki_raw, w_idx, gate5) = self.gemv5_dev(
+            x,
+            w.q_a,
+            w.kv_a,
+            w.wk,
+            w.weights_proj,
+            Some(w.gate),
+            hidden as i32,
+            (w.q_a.shape.0[0]) as i32,
+            (w.kv_a.shape.0[0]) as i32,
+            idm as i32,
+            ih as i32,
+        )?;
+        let gate = gate5.expect("gemv5 with w5 returns o5");
         let qa_ln = self.rmsnorm_dev(&qa, w.q_a_ln, w.rms_eps, n, w.q_a.shape.0[0])?;
         let qb = self.matmul_dev(&qa_ln, w.q_b, ni, w.q_a.shape.0[0] as i32, (h * dk) as i32)?;
 
-        // 2. kv path: latent → rmsnorm → kvb [n, h*(dk+dv)]
-        let latent = self.matmul_dev(x, w.kv_a, ni, hidden as i32, (w.kv_a.shape.0[0]) as i32)?;
+        // 2b. kv path: latent → rmsnorm → kvb [n, h*(dk+dv)]
         let kv_ln = self.rmsnorm_dev(&latent, w.kv_a_ln, w.rms_eps, n, w.kv_a.shape.0[0])?;
         let kvb = self.matmul_dev(&kv_ln, w.kv_b, ni, w.kv_a.shape.0[0] as i32, (h * (dk + dv)) as i32)?;
 
-        // 3. indexer queries: qi = qa @ wq_b [n, ih*idm]
+        // 3b. indexer queries: qi = qa_ln @ wq_b [n, ih*idm]
         let qi = self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?;
 
-        // 4. index keys: ki = LayerNorm(x @ wk)(k_norm affine) [n, idm]
-        let ki_raw = self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?;
+        // 4b. index keys: ki = LayerNorm(ki_raw)(k_norm affine) [n, idm]
         let ki = DevBuf::alloc(self.dev, self.stream, n * idm)?;
         let knw = self.dev_weight(w.k_norm_w)?;
         let knb = self.dev_weight(w.k_norm_b)?;
@@ -1501,15 +1531,11 @@ impl CudaBackend {
             "dsa_layernorm",
         )?;
 
-        // 5. per-head score weights: w_idx = (x @ weights_proj) × ih^-0.5 [n, ih]
-        let w_idx = self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?;
+        // 5b. per-head score weights: w_idx × ih^-0.5
         ck(
             unsafe { ferrite_scale_inplace(w_idx.as_f32(), (ih as f32).sqrt().recip(), (n * ih) as i32, self.stream) },
             "dsa_widx_scale",
         )?;
-
-        // 6. kpool gate scores: gate = x @ compress_gate [n, idm]
-        let gate = self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?;
 
         // 7. cache append (device-resident, in place at slot t0)
         let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, t0) = {
@@ -2064,6 +2090,54 @@ impl CudaBackend {
             "hc_contract_dev",
         )?;
         Ok(out)
+    }
+
+    /// Fused multi-GEMV (same input x, up to 5 weight matrices) — ONE launch
+    /// for decode chains that project x through several matrices (gdn: qkv/b/
+    /// fa/ga share x; dsa: qa/latent/ki/w_idx/gate share x). Kills N-1 kernel
+    /// launches + their tail latencies (~10-15us each on B300). w5=None →
+    /// of5=0 (4-matrix case). Returns the output DevBufs in order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv5_dev(
+        &self,
+        x: &DevBuf,
+        w1: &Tensor, w2: &Tensor, w3: &Tensor, w4: &Tensor,
+        w5: Option<&Tensor>,
+        in_f: i32,
+        of1: i32, of2: i32, of3: i32, of4: i32,
+    ) -> Result<(DevBuf, DevBuf, DevBuf, DevBuf, Option<DevBuf>)> {
+        self.enter();
+        let d1 = self.dev_weight_bf16(w1)?;
+        let d2 = self.dev_weight_bf16(w2)?;
+        let d3 = self.dev_weight_bf16(w3)?;
+        let d4 = self.dev_weight_bf16(w4)?;
+        let o1 = DevBuf::alloc(self.dev, self.stream, of1 as usize)?;
+        let o2 = DevBuf::alloc(self.dev, self.stream, of2 as usize)?;
+        let o3 = DevBuf::alloc(self.dev, self.stream, of3 as usize)?;
+        let o4 = DevBuf::alloc(self.dev, self.stream, of4 as usize)?;
+        let of5 = w5.map(|t| t.shape.0[0] as i32).unwrap_or(0);
+        let d5: *const std::ffi::c_void = match w5 {
+            Some(w5t) => self.dev_weight_bf16(w5t)?.ptr,
+            None => std::ptr::null(),
+        };
+        let o5 = match w5 {
+            Some(w5t) => DevBuf::alloc(self.dev, self.stream, w5t.numel())?,
+            None => DevBuf::alloc(self.dev, self.stream, 1)?, // unused 4B slot
+        };
+        ck(
+            unsafe {
+                ferrite_gemv5_bf16(
+                    x.as_const_f32(),
+                    d1.ptr, d2.ptr, d3.ptr, d4.ptr, d5,
+                    o1.as_f32(), o2.as_f32(), o3.as_f32(), o4.as_f32(),
+                    if w5.is_some() { o5.as_f32() } else { std::ptr::null_mut() },
+                    in_f, of1, of2, of3, of4, of5,
+                    self.stream,
+                )
+            },
+            "gemv5_dev",
+        )?;
+        Ok((o1, o2, o3, o4, if w5.is_some() { Some(o5) } else { None }))
     }
 }
 
