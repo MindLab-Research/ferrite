@@ -322,6 +322,9 @@ pub struct TpCluster<B: KernelBackend> {
     graph_captured: bool,
     /// CUDA graph: warmup/capture/replay step counter (FERRITE_GRAPH=1 path).
     graph_step: u32,
+    /// Mega-graph (FERRITE_MEGA): seq whose whole-decode-step per-rank graphs
+    /// are captured. Some(seq) → replay path; None/other seq → re-capture.
+    mega_seq: Option<u64>,
     /// NCCL all-reduce channels (one per rank, single-process init_all).
     /// FERRITE_NCCL=1: replaces the host-side partial download → CPU sum →
     /// re-upload round-trip per attention/ffn segment (~0.6ms/layer).
@@ -415,7 +418,7 @@ impl<B: KernelBackend> TpCluster<B> {
             false
         };
         let _ = nccl;
-        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0, nccl: None }
+        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0, mega_seq: None, nccl: None }
     }
 
     fn ensure_seq_all(&mut self, seq: u64, tokens: &[u32]) {
@@ -450,8 +453,362 @@ impl<B: KernelBackend> TpCluster<B> {
         if std::env::var_os("FERRITE_GRAPH").is_some() {
             return self.decode_step_graphed(seq);
         }
+        // FERRITE_MEGA=1: the ENTIRE decode step as one per-rank CUDA graph
+        // (NCCL all-reduce INSIDE the graph — the 100 tok/s path). Needs
+        // FERRITE_NCCL (per-shard channels; the collectives are recorded as
+        // graph nodes).
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("FERRITE_MEGA").is_some() && self.shards[0].nccl.is_some() {
+            return self.decode_step_mega(seq);
+        }
         self.decode_step_normal(seq)
     }
+
+    /// FERRITE_MEGA: whole-decode-step per-rank CUDA graphs (NCCL in-graph).
+    ///
+    /// Phases per seq: (1) dry-run the full chain per rank (real execution —
+    /// warms every DevBuf pool class + per-rank weight caches + the NCCL
+    /// 4096-float all-reduce plan; produces this step's token), (2) capture
+    /// the same chain into graph `mega{seq}` (record-only; NCCL ARs become
+    /// graph nodes — warm comm + ThreadLocal capture, proven in
+    /// gpu_smoke_nccl_graph: 90 ARs/replay @ 15µs), (3) every later step =
+    /// one graph replay per rank (staging write + DSA pinned advance +
+    /// graph launch + argmax D2H — zero host round-trips per layer).
+    ///
+    /// Env: FERRITE_MEGA=1 FERRITE_NCCL=1 FERRITE_WORKER_POOL=1 (+ the
+    /// device-chain flags for the prefill: FERRITE_GDN_DEV/MOE_DEV/DSA_DEV/
+    /// LAYER_DEV/HEAD_DEV=1) and NCCL_NVLS_ENABLE=0 on b300-4.
+    #[cfg(feature = "cuda")]
+    fn decode_step_mega(&mut self, seq: u64) -> Result<u32> {
+        let last = {
+            let s = self.shards[0]
+                .seq_runtime(seq)
+                .ok_or_else(|| FerriteError::Config("missing seq".into()))?;
+            *s.tokens.last().ok_or_else(|| FerriteError::Config("empty context".into()))?
+        };
+        let h0 = self.shards[0].embed(&[last]);
+        let in_vals = crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult);
+        let plans = build_layer_plans(&self.full_cfg);
+        let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
+        let gname = format!("mega{seq}");
+
+        if self.mega_seq != Some(seq) {
+            // (Re)capture for this seq. Dry-run: all 4 ranks run the full
+            // chain in parallel (fan_out) — the NCCL ARs rendezvous for
+            // real; every pool class / weight cache / NCCL plan warms on the
+            // exact worker that captures next.
+            let t0 = std::time::Instant::now();
+            let toks = Self::fan_out(&mut self.shards, |s| {
+                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname)
+            })
+            .into_iter()
+            .collect::<Result<Vec<f32>>>()?;
+            let t_dry = t0.elapsed();
+            // Capture: record-only. capture_lock serializes the per-rank
+            // captures (concurrent cuGraphInstantiate SIGSEGV'd historically);
+            // record-mode NCCL enqueue never rendezvous, so serialized capture
+            // is deadlock-free (the nccl test proved it).
+            let tc = std::time::Instant::now();
+            Self::fan_out(&mut self.shards, |s| {
+                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname)
+            })
+            .into_iter()
+            .collect::<Result<Vec<f32>>>()?;
+            self.mega_seq = Some(seq);
+            eprintln!(
+                "[mega] captured {gname}: {} layers, {} NCCL ARs/rank; dry-run {:.1}ms + capture {:.1}ms",
+                plans.len(), plans.len() * 2,
+                t_dry.as_secs_f32() * 1e3,
+                tc.elapsed().as_secs_f32() * 1e3
+            );
+            // all four ranks computed the same token (bit-identical after
+            // the ARs — symmetric redundant head)
+            return Ok(toks[0] as u32);
+        }
+        // Steady state: advance DSA pinned t0/total (the graph's kernels
+        // read them zero-copy), write the 4 stagings, one launch per rank,
+        // argmax D2H — the entire step is graph-resident.
+        let t0 = std::time::Instant::now();
+        let toks = Self::fan_out(&mut self.shards, |s| {
+            let cuda = s
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("FERRITE_MEGA needs cuda".into()))?;
+            cuda.enter();
+            for f in 0..num_dsa {
+                cuda.dsa_host_advance(seq, f, 1);
+            }
+            let mut out = [0f32; 1];
+            if !cuda.graph_run(&gname, in_vals.as_slice(), &mut out)? {
+                return Err(FerriteError::InvalidArg(format!("mega graph {gname} missing")));
+            }
+            Ok(out[0])
+        })
+        .into_iter()
+        .collect::<Result<Vec<f32>>>()?;
+        let dt = t0.elapsed();
+        if std::env::var_os("FERRITE_TIMING").is_some() {
+            eprintln!(
+                "[mega] replay {:.2}ms ({:.1} tok/s)",
+                dt.as_secs_f32() * 1e3,
+                1e3 / dt.as_secs_f32().max(1e-9)
+            );
+        }
+        Ok(toks[0] as u32)
+    }
+
+// ============================================================
+// Mega-graph chain (FERRITE_MEGA): ONE rank's whole-decode-step device
+// chain — staging upload → [per layer: hc_pre → norm → attn(GDN/DSA) →
+// NCCL AR → hc_post → hc_pre2 → norm → ffn(MoE/Dense) → NCCL AR →
+// hc_post] × 45 → contract → norm → lm_head → argmax.
+//
+// Every intermediate stays on-device (the old chain crossed PCIe ~6× per
+// layer via host all-reduce staging); NCCL all-reduce runs INSIDE the
+// captured graph (warm comm + ThreadLocal capture — proven in
+// gpu_smoke_nccl_graph: 90 ARs/replay @ 15µs). The hc chain + head run
+// REDUNDANTLY on every rank (the in-place AR leaves bit-identical data
+// everywhere; hc/lm_head weights are replicated) — no broadcast needed.
+//
+// capture=false → dry-run (real execution: warms every pool class +
+// per-rank weight caches + the NCCL 4096-float AR plan; returns the
+// sampled token). capture=true → records the whole sequence into graph
+// `gname` (NCCL enqueues become graph nodes; record never executes).
+//
+// Capture-mode memory: intermediates return to the pool BUT replay
+// allocates nothing (graph_run = staging write + launch + raw D2H), so
+// their recorded addresses are never re-dispensed while the graph lives.
+// Only the IO boundaries are pinned via GraphIO (forgotten arg DevBuf +
+// res0's stage). The DSA host bookkeeping (t_count) advances during the
+// record pass without executing the kernels — rolled back after capture;
+// replay advances it for real before each graph_run.
+// ============================================================
+
+#[cfg(feature = "cuda")]
+fn mega_chain_dev(
+    s: &mut Engine<B>,
+    seq: u64,
+    in_vals: &[f32],
+    plans: &[ferrite_model::LayerPlan],
+    num_dsa: usize,
+    capture: bool,
+    gname: &str,
+) -> Result<f32> {
+    use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights, GdnLayerWeights, GraphIO};
+    let cuda = s
+        .backend
+        .as_cuda()
+        .ok_or_else(|| FerriteError::Config("FERRITE_MEGA needs cuda backend".into()))?;
+    let nccl = s
+        .nccl
+        .clone()
+        .ok_or_else(|| FerriteError::Config("FERRITE_MEGA needs FERRITE_NCCL=1".into()))?;
+    cuda.enter();
+    let cfg = &s.cfg;
+    let (hidden, hc_mult) = (cfg.hidden_size, cfg.hc_mult);
+    let nh = hc_mult * hidden;
+    let n = 1usize;
+    let topk = cfg.num_experts_per_tok;
+    let e = cfg.n_routed_experts;
+
+    let _guard = if capture {
+        // Serialize per-rank captures (concurrent cuGraphInstantiate
+        // SIGSEGV'd historically); record-mode NCCL enqueue never
+        // rendezvous, so serialized capture is deadlock-free.
+        Some(ferrite_kernel::cuda::capture_lock().lock().unwrap())
+    } else {
+        None
+    };
+    if capture {
+        cuda.graph_capture_begin();
+    }
+
+    let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), nh)?;
+    res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
+    let x_stage = res.stage; // GraphIO: replay writes fresh input here
+
+    for (layer_idx, plan) in plans.iter().enumerate() {
+        let pfx = format!("model.layers.{layer_idx}");
+        // A: hc_pre + input_layernorm (redundant per rank)
+        let (li, post_a, comb_a) = cuda.hc_pre_dev(
+            &res,
+            s.w(&format!("{pfx}.hc_attn_fn"))?,
+            s.w(&format!("{pfx}.hc_attn_scale"))?,
+            s.w(&format!("{pfx}.hc_attn_base"))?,
+            n,
+            nh,
+            cfg.rms_norm_eps,
+            cfg.hc_eps,
+            cfg.hc_sinkhorn_iters,
+        )?;
+        let hn = cuda.rmsnorm_dev(
+            &li,
+            s.w(&format!("{pfx}.input_layernorm.weight"))?,
+            cfg.rms_norm_eps,
+            n,
+            hidden,
+        )?;
+        // B: attention → NCCL all-reduce (in-place; every rank holds the sum)
+        let partial = match plan.attn {
+            AttnKind::Linear => {
+                let la = &cfg.linear_attn;
+                let gw = GdnLayerWeights {
+                    qkv_proj: s.w(&format!("{pfx}.self_attn.qkv_proj.weight"))?,
+                    b_proj: s.w(&format!("{pfx}.self_attn.b_proj.weight"))?,
+                    f_a: s.w(&format!("{pfx}.self_attn.f_a_proj.weight"))?,
+                    f_b: s.w(&format!("{pfx}.self_attn.f_b_proj.weight"))?,
+                    g_a: s.w(&format!("{pfx}.self_attn.g_a_proj.weight"))?,
+                    g_b: s.w(&format!("{pfx}.self_attn.g_b_proj.weight"))?,
+                    conv_w: s.w(&format!("{pfx}.self_attn.qkv_conv1d.weight"))?,
+                    dt_bias: s.w(&format!("{pfx}.self_attn.dt_bias"))?,
+                    a_log: s.w(&format!("{pfx}.self_attn.A_log"))?,
+                    o_norm: s.w(&format!("{pfx}.self_attn.o_norm.weight"))?,
+                    o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                };
+                cuda.gdn_layer_dev(
+                    &hn, &gw, seq, layer_idx, n, hidden,
+                    la.num_heads, la.head_dim, la.gate_lower_bound,
+                    cfg.rms_norm_eps, la.short_conv_kernel_size,
+                )?
+            }
+            AttnKind::Dsa => {
+                let d = &cfg.dsa;
+                let (dsa_h, dsa_dk, dsa_dv, _ip) = s.dsa_dims();
+                let w = DsaLayerWeights {
+                    q_a: s.w(&format!("{pfx}.self_attn.q_a_proj.weight"))?,
+                    q_a_ln: s.w(&format!("{pfx}.self_attn.q_a_layernorm.weight"))?,
+                    q_b: s.w(&format!("{pfx}.self_attn.q_b_proj.weight"))?,
+                    kv_a: s.w(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))?,
+                    kv_a_ln: s.w(&format!("{pfx}.self_attn.kv_a_layernorm.weight"))?,
+                    kv_b: s.w(&format!("{pfx}.self_attn.kv_b_proj.weight"))?,
+                    wq_b: s.w(&format!("{pfx}.self_attn.indexer.wq_b.weight"))?,
+                    wk: s.w(&format!("{pfx}.self_attn.indexer.wk.weight"))?,
+                    k_norm_w: s.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?,
+                    k_norm_b: s.w(&format!("{pfx}.self_attn.indexer.k_norm.bias"))?,
+                    weights_proj: s.w(&format!("{pfx}.self_attn.indexer.weights_proj.weight"))?,
+                    gate: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?,
+                    ape: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?,
+                    o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                    h: dsa_h,
+                    dk: dsa_dk,
+                    dv: dsa_dv,
+                    ih: d.index_n_heads,
+                    idm: d.index_head_dim,
+                    kpool: 4,
+                    topk: d.index_topk,
+                    rms_eps: cfg.rms_norm_eps,
+                };
+                let family = s.dsa_family_index(layer_idx);
+                cuda.dsa_layer_dev(&hn, &w, seq, family, n, hidden)?
+            }
+        };
+        nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        // C: hc_post → hc_pre2 → post_attention_layernorm
+        let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
+        let (li2, post_f, comb_f) = cuda.hc_pre_dev(
+            &res_mid,
+            s.w(&format!("{pfx}.hc_ffn_fn"))?,
+            s.w(&format!("{pfx}.hc_ffn_scale"))?,
+            s.w(&format!("{pfx}.hc_ffn_base"))?,
+            n,
+            nh,
+            cfg.rms_norm_eps,
+            cfg.hc_eps,
+            cfg.hc_sinkhorn_iters,
+        )?;
+        let hfn = cuda.rmsnorm_dev(
+            &li2,
+            s.w(&format!("{pfx}.post_attention_layernorm.weight"))?,
+            cfg.rms_norm_eps,
+            n,
+            hidden,
+        )?;
+        // D: FFN (MoE or Dense) → NCCL all-reduce
+        let partial2 = match plan.mlp {
+            MlpKind::Moe => {
+                let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
+                    Some(b) => b.clone(),
+                    None => Tensor::zeros(Shape::new([e]), DType::F32),
+                };
+                let gate_w = s.w(&format!("{pfx}.mlp.gate.weight"))?;
+                let shared = ExpertWeights {
+                    gate: s.w(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))?,
+                    up: s.w(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))?,
+                    down: s.w(&format!("{pfx}.mlp.shared_expert.down_proj.weight"))?,
+                };
+                let (es, ee) = s.tp_expert_range.unwrap_or((0, e));
+                let experts: Vec<ExpertWeights> = (es..ee)
+                    .map(|eid| {
+                        Ok(ExpertWeights {
+                            gate: s.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
+                            up: s.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
+                            down: s.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut probs = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
+                cuda.moe_layer_dev(
+                    &hfn, gate_w, &bias, &shared, &experts, es, &mut probs,
+                    n, hidden, topk, e, cfg.routed_scaling_factor, cfg.swiglu_limit,
+                )?
+            }
+            MlpKind::Dense => {
+                let w_gate = s.w(&format!("{pfx}.mlp.gate_proj.weight"))?;
+                let w_up = s.w(&format!("{pfx}.mlp.up_proj.weight"))?;
+                let w_down = s.w(&format!("{pfx}.mlp.down_proj.weight"))?;
+                let hi = hidden as i32;
+                let inter = w_gate.shape.0[0] as i32;
+                let g = cuda.matmul_dev(&hfn, w_gate, n as i32, hi, inter)?;
+                let u = cuda.matmul_dev(&hfn, w_up, n as i32, hi, inter)?;
+                let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, cfg.swiglu_limit)?;
+                cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
+            }
+        };
+        nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        // E: hc_post2 → next layer's residual
+        res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+    }
+
+    // head: contract → model.norm → lm_head → argmax (redundant per rank —
+    // identical data after the ARs, replicated weights)
+    let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
+    let hn_head = cuda.rmsnorm_dev(
+        &h_final,
+        s.w("model.norm.weight")?,
+        cfg.rms_norm_eps,
+        n,
+        hidden,
+    )?;
+    let lm_w = s.w("lm_head.weight")?;
+    let logits = cuda.matmul_dev(&hn_head, lm_w, n as i32, hidden as i32, cfg.vocab_size as i32)?;
+    let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), n)?;
+    cuda.argmax_dev(&logits, &mut arg, n, cfg.vocab_size)?;
+
+    if capture {
+        cuda.graph_capture_end(gname);
+        drop(_guard);
+        cuda.graph_io_put(
+            gname,
+            GraphIO {
+                x_stage,
+                x_len: nh,
+                out_dev: arg.as_f32() as *mut std::ffi::c_void,
+                out_len: n,
+            },
+        );
+        std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
+        // DSA host bookkeeping advanced t_count during the record pass
+        // without executing the kernels — undo it (replay advances for real).
+        for f in 0..num_dsa {
+            cuda.dsa_host_rollback(seq, f, 1);
+        }
+        Ok(0.0)
+    } else {
+        let mut tv = vec![0f32; 1];
+        arg.download(&mut tv)?;
+        Ok(tv[0])
+    }
+}
 
 /// GDN (linear-attention) layer per shard: the CUDA path runs the WHOLE
 /// layer as one DevBuf pipeline (gdn_layer_dev — zero host round-trips

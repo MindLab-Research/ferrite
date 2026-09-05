@@ -1630,6 +1630,35 @@ impl CudaBackend {
         Ok(partial)
     }
 
+    /// Mega-graph host-side DSA advance: write the pinned t0/total that the
+    /// captured graph's kernels read zero-copy, and advance t_count — the
+    /// same bookkeeping dsa_layer_dev's host logic does per call, minus the
+    /// kernels (the graph executes those at replay). Call BEFORE every
+    /// graph replay.
+    pub fn dsa_host_advance(&self, seq: u64, family: usize, n: usize) {
+        let mut m = self.dsa_caches.lock().unwrap();
+        if let Some(c) = m.get_mut(&(seq, family)) {
+            let t0 = c.t_count;
+            unsafe {
+                *c.pinned_t0 = t0 as i32;
+                *c.pinned_total = (t0 + n) as i32;
+            }
+            c.t_count += n;
+        }
+    }
+
+    /// Mega-graph capture rollback: the capture pass ran dsa_layer_dev's
+    /// host bookkeeping (t_count += n, pinned write) but its kernels were
+    /// only RECORDED, not executed — undo the virtual advance so t_count
+    /// equals the tokens actually in the cache, then advance before every
+    /// replay keeps the invariant.
+    pub fn dsa_host_rollback(&self, seq: u64, family: usize, n: usize) {
+        let mut m = self.dsa_caches.lock().unwrap();
+        if let Some(c) = m.get_mut(&(seq, family)) {
+            c.t_count -= n;
+        }
+    }
+
     fn dsa_alloc(&self, floats: usize) -> Result<*mut std::ffi::c_void> {
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut p, floats * 4) }, "dsa cache malloc")?;
