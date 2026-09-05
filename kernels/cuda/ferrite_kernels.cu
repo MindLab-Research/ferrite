@@ -1510,7 +1510,7 @@ extern "C" cudaError_t ferrite_gdn_prep(const float* conv_out, const float* b_ra
 __global__ void conv_prep_fused_kernel(
     const float* __restrict__ x,        // [ch] qkv proj output (n==1)
     const float* __restrict__ cw,       // [ch, conv=4] FIR weights
-    const float* __restrict__ cs,       // [ch, hist=3] sliding-window state (in==out)
+    float* __restrict__ cs,             // [ch, hist=3] sliding-window state (in==out)
     const float* __restrict__ b_raw,   // [h]
     const float* __restrict__ fb,      // [proj]
     const float* __restrict__ dt_bias, // [proj]
