@@ -1047,8 +1047,7 @@ impl CudaBackend {
         }
         self.graph_execs.lock().unwrap().insert(name.to_string(), exec as usize);
     }
-
-
+}
 
 impl crate::graph::GraphCapable for CudaBackend {
     fn begin_capture(&self) {
