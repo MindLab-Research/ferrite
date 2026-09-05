@@ -685,3 +685,46 @@ fn dense_chain_parity() {
     );
     eprintln!("dense_chain_parity: matmul/swiglu/down all bit-exact — operator level OK");
 }
+
+/// hc_contract_dev parity (host golden): [s, n*h] -> [s, h] mean over the
+/// n MHC flows — the NEW kernel the mega-graph's head bridge uses. mhc.rs
+/// layout: flow i of token t at in[(t*n + i)*h .. +h]; out[t*h + j] =
+/// mean_i in[(t*n+i)*h + j]. Never unit-tested before (added for the
+/// mega-graph); the mega dry-run outputs tok=522 with flat logits while
+/// every layer's AR matches — the head bridge is the prime suspect.
+#[test]
+fn hc_contract_parity() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda device 0");
+    let (s, n, h) = (2usize, 4usize, 4096usize); // rows, hc_mult flows, hidden
+    let mut seed = 0x9e3779b97f4a7c15u64;
+    let mut r = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / 2147483648.0) - 0.5
+    };
+    let x: Vec<f32> = (0..s * n * h).map(|_| r() * 3.0).collect();
+
+    // host golden (mhc::hc_contract semantics)
+    let mut host = vec![0f32; s * h];
+    for t in 0..s {
+        for j in 0..h {
+            let mut acc = 0f32;
+            for i in 0..n {
+                acc += x[(t * n + i) * h + j];
+            }
+            host[t * h + j] = acc / n as f32;
+        }
+    }
+
+    // device
+    let x_dev = DevBuf::alloc(dev.dev(), dev.stream_handle(), s * n * h).unwrap();
+    x_dev.upload(&x).unwrap();
+    let out_dev = dev.hc_contract_dev(&x_dev, s, n, h).expect("hc_contract_dev");
+    let mut got = vec![0f32; s * h];
+    out_dev.download(&mut got).unwrap();
+
+    let host_t = Tensor::from_f32(Shape::new([s, h]), host);
+    let got_t = Tensor::from_f32(Shape::new([s, h]), got);
+    close(&host_t, &got_t, 1e-5, "hc_contract_dev vs host golden");
+    eprintln!("hc_contract_parity: OK (kernel layout (t*n+i)*h+j confirmed)");
+}
