@@ -3242,7 +3242,7 @@ __global__ void mtp_commit_kernel(const int* __restrict__ k_pin,
         if (idx < lay) {
             int l = (int)(idx / row);
             int r = (int)(idx - (long)l * row);
-            const float* const* p = plan + (size_t)l * 8;
+            float* const* p = plan + (size_t)l * 8;
             if (r < conv_len) {
                 const float* src = (k == 3) ? p[2] : (k == 2) ? p[6] : p[4];
                 p[0][r] = src[r];
