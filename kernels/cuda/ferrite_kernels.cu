@@ -499,6 +499,12 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     int t = blockIdx.x;
     int hd = blockIdx.y;
     if (t >= n || hd >= h) return;
+#if __CUDA_ARCH__ >= 900
+    // PDL: prologue (blockIdx math, smem layout above) ran while the
+    // upstream kernel (conv_prep_fused) was still draining its tail;
+    // now block until its q/k/v/beta/gate stores are visible.
+    cudaGridDependencySynchronize();
+#endif
     float bt = beta[(size_t)t * h + hd];
     const size_t spitch = (size_t)dv + 1; // padded row stride (bank conflicts)
     extern __shared__ float sm[];
@@ -569,10 +575,30 @@ extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
     for (int t = 0; t < n; t++) {
         dim3 block(512);
         dim3 grid(1, h, 1);
-        gdn_step_v2_kernel<<<grid, block, smem, s>>>(
-            q + (size_t)t * h * dk, k + (size_t)t * h * dk, v + (size_t)t * h * dv,
-            beta + (size_t)t * h, gate + (size_t)t * h * dk, a_log,
-            state, out + (size_t)t * h * dv, 1, h, dk, dv);
+        const float* qt = q + (size_t)t * h * dk;
+        const float* kt = k + (size_t)t * h * dk;
+        const float* vt = v + (size_t)t * h * dv;
+        const float* betat = beta + (size_t)t * h;
+        const float* gatet = gate + (size_t)t * h * dk;
+        float* ot = out + (size_t)t * h * dv;
+        if (ferrite_pdl_enabled()) {
+            // PDL: launch with programmatic stream serialization — this kernel's
+            // prologue overlaps the upstream (conv_prep_fused) tail; its
+            // cudaGridDependencySynchronize() gates the actual data reads.
+            cudaLaunchConfig_t cfg = {};
+            cfg.gridDim = grid; cfg.blockDim = block;
+            cfg.dynamicSmemBytes = smem; cfg.stream = s;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = 1;
+            cfg.attrs = attrs; cfg.numAttrs = 1;
+            cudaLaunchKernelEx(&cfg, gdn_step_v2_kernel,
+                               qt, kt, vt, betat, gatet, a_log, state, ot,
+                               1, h, dk, dv);
+        } else {
+            gdn_step_v2_kernel<<<grid, block, smem, s>>>(qt, kt, vt, betat, gatet,
+                                                          a_log, state, ot, 1, h, dk, dv);
+        }
         cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) return e;
     }
@@ -1581,6 +1607,22 @@ __global__ void conv_prep_fused_kernel(
     q[c_q] = sq[j] * red[60] * q_scl;
     k[c_q] = sk[j] * red[61];
     if (threadIdx.x == 0) beta[hd] = 1.0f / (1.0f + expf(-b_raw[hd]));
+#if __CUDA_ARCH__ >= 900
+    // PDL: release the downstream launch (gdn_step_v2 prologue) early —
+    // all global stores (q/k/v/beta/gate) are complete here.
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+}
+
+// PDL (programmatic dependent launch) enable flag: FERRITE_PDL=1 opt-in.
+// Cache the getenv once — checked on every gdn launcher call.
+static int ferrite_pdl_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("FERRITE_PDL");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
 }
 
 extern "C" cudaError_t ferrite_conv_prep_fused(
