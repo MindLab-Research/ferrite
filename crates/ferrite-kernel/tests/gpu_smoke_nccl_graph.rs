@@ -384,4 +384,66 @@ fn p2p_oneshot_vs_nccl() {
     let us_nccl = t1.elapsed().as_secs_f64() * 1e6 / N as f64;
     eprintln!("[p2p_oneshot] one-shot {:.2}us vs NCCL {:.2}us per AR ({} iters, {} f32)",
               us_oneshot, us_nccl, N, COUNT);
+
+    // ---- GRAPH-MODE: capture the down+sum pair per rank, measure replay
+    // latency (the production path — NCCL-in-graph measures ~15us/AR).
+    for b in backends.iter() { b.enter(); }
+    std::thread::scope(|s| {
+        for r in 0..WORLD {
+            let b = SendPtr(&backends[r]);
+            let stg = SendPtr(&staging[r]);
+            let rdy = SendPtr(&ready[r]);
+            let ctr = SendPtr(&ctrs[r]);
+            let par = SendPtr(&partials[r]);
+            let slot = unsafe { outs.as_mut_ptr().add(r) } as usize;
+            let st = SendPtr(&stg_tbls[r]);
+            let rt = SendPtr(&rdy_tbls[r]);
+            s.spawn(move || {
+                let SendPtr(b) = b;
+                let (SendPtr(stg), SendPtr(rdy), SendPtr(ctr), SendPtr(par)) = (stg, rdy, ctr, par);
+                let (SendPtr(st), SendPtr(rt)) = (st, rt);
+                let out = unsafe { &mut *(slot as *mut DevBuf) };
+                b.enter();
+                let _cap = capture_lock().lock().unwrap();
+                b.graph_capture_begin();
+                b.p2p_ar_oneshot_dev(par, st, rt, ctr, stg, rdy, out,
+                                     COUNT, WORLD, r).unwrap();
+                b.graph_capture_end("p2p_g");
+            });
+        }
+    });
+    // replay loop: same barrier cadence, host flag reset between replays
+    let t2 = std::time::Instant::now();
+    let barrier3 = std::sync::Barrier::new(WORLD);
+    std::thread::scope(|s| {
+        let bar = &barrier3;
+        for r in 0..WORLD {
+            let b = SendPtr(&backends[r]);
+            let rdy_slot = unsafe { ready.as_mut_ptr().add(r) } as usize;
+            s.spawn(move || {
+                let SendPtr(b) = b;
+                let rdy = unsafe { &*(rdy_slot as *const DevBuf) };
+                b.enter();
+                let zeros = vec![0f32; WORLD];
+                for _ in 0..N {
+                    assert!(b.graph_replay("p2p_g"), "replay");
+                    let _ = b.sync();
+                    bar.wait();
+                    rdy.upload(&zeros).unwrap();
+                    let _ = b.sync();
+                    bar.wait();
+                }
+            });
+        }
+    });
+    let us_graph = t2.elapsed().as_secs_f64() * 1e6 / N as f64;
+    // verify replay output too
+    {
+        backends[0].enter();
+        let mut v = vec![0f32; COUNT];
+        outs[0].download(&mut v).unwrap();
+        assert!(v.iter().all(|x| (x - 10.0).abs() < 1e-4), "graph one-shot wrong");
+    }
+    eprintln!("[p2p_oneshot] GRAPH replay: one-shot {:.2}us/AR (vs NCCL-in-graph ~15us; host-launch {:.2} vs {:.2})",
+              us_graph, us_oneshot, us_nccl);
 }
