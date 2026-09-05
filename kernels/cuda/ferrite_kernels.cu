@@ -1803,6 +1803,80 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
 }
 
 // ============================================================
+// TRI GEMV (decode n==1): three SAME-INPUT projections in ONE kernel —
+// the gdn layer's b_raw [h,in] + f_a [dk,in] + g_a [dk,in] all read the
+// same hidden x. v1 ran three separate gemv v2 launches (3 kernel
+// boundaries per gdn layer × 34 layers); tri maps the three weight
+// matrices onto one row space [0, o1+o2+o3) — WPR=4 K-split per row,
+// uint4 vector body identical to gemv_bf16_v2. -2 nodes/layer.
+// ============================================================
+__global__ void gemv_tri_kernel(const float* __restrict__ x,
+                                const __nv_bfloat16* __restrict__ w1,
+                                const __nv_bfloat16* __restrict__ w2,
+                                const __nv_bfloat16* __restrict__ w3,
+                                float* __restrict__ y1,
+                                float* __restrict__ y2,
+                                float* __restrict__ y3,
+                                int in_f, int o1, int o2, int o3) {
+    const int T = o1 + o2 + o3;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rpb = (blockDim.x >> 5) / 4;    // WPR=4, 256 threads → 2 rows/block
+    const int row = blockIdx.x * rpb + warp / 4;
+    const int kw = warp % 4;                   // K-slice id (WPR=4)
+    float acc = 0.f;
+    if (row < T) {
+        const __nv_bfloat16* wr;
+        if (row < o1)               wr = w1 + (size_t)row * in_f;
+        else if (row < o1 + o2)     wr = w2 + (size_t)(row - o1) * in_f;
+        else                        wr = w3 + (size_t)(row - o1 - o2) * in_f;
+        int kper = ((in_f + 3) / 4 + 7) & ~7;  // WPR=4 slice, 8-aligned
+        int k0 = kw * kper;
+        int k1 = min(k0 + kper, in_f);
+        #pragma unroll 2
+        for (int k = k0 + lane * 8; k + 7 < k1; k += 32 * 8) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            float4 xa = *reinterpret_cast<const float4*>(x + k);
+            float4 xb = *reinterpret_cast<const float4*>(x + k + 4);
+            const __nv_bfloat162* w2p = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 f0 = __bfloat1622float2(w2p[0]);
+            float2 f1 = __bfloat1622float2(w2p[1]);
+            float2 f2 = __bfloat1622float2(w2p[2]);
+            float2 f3 = __bfloat1622float2(w2p[3]);
+            acc += xa.x * f0.x + xa.y * f0.y + xa.z * f1.x + xa.w * f1.y;
+            acc += xb.x * f2.x + xb.y * f2.y + xb.z * f3.x + xb.w * f3.y;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
+    __shared__ float part[8];
+    if (lane == 0) part[warp] = acc;
+    __syncthreads();
+    if (warp % 4 == 0 && lane == 0 && row < T) {
+        float sum = 0.f;
+        #pragma unroll
+        for (int j = 0; j < 4; j++) sum += part[(warp / 4) * 4 + j];
+        if (row < o1)               y1[row] = sum;
+        else if (row < o1 + o2)     y2[row - o1] = sum;
+        else                        y3[row - o1 - o2] = sum;
+    }
+}
+
+extern "C" cudaError_t ferrite_gemv_tri(const float* x, const void* w1, const void* w2,
+                                        const void* w3, float* y1, float* y2, float* y3,
+                                        int in_f, int o1, int o2, int o3,
+                                        cudaStream_t s) {
+    int T = o1 + o2 + o3;
+    if (T <= 0 || in_f <= 0) return cudaSuccess;
+    if (in_f & 7) return cudaErrorNotSupported; // host falls back to 3x gemv
+    dim3 grid((T + 1) / 2);                     // rpb=2 rows/block (WPR=4)
+    gemv_tri_kernel<<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w1,
+                                         (const __nv_bfloat16*)w2,
+                                         (const __nv_bfloat16*)w3,
+                                         y1, y2, y3, in_f, o1, o2, o3);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // Fused MoE decode (n==1) with GPU-side expert dispatch — the TileRT
 // ExpertSelectUpGateSiLU idea, ferrite-style: expert weights stay wherever
 // the dev_weight_bf16 cache put them; a device POINTER TABLE

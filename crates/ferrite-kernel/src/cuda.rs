@@ -43,6 +43,9 @@ extern "C" {
     fn ferrite_gemv_bf16_v2(x: *const f32, w: *const std::ffi::c_void,
                              bias: *const f32, out: *mut f32,
                              in_f: i32, out_f: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
+                        w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
+                        in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
@@ -680,6 +683,27 @@ impl CudaBackend {
                                  std::ptr::null(), do_.as_f32(), in_f, out_f, self.stream)
         }, "gemv_v2_dev")?;
         Ok(do_)
+    }
+
+    /// 3-in-1 GEMV (decode n==1): the gdn layer's b_raw [h,in] + f_a [dk,in]
+    /// + g_a [dk,in] all read the SAME hidden x — one kernel maps the three
+    /// weight matrices onto one row space (WPR=4 K-split, uint4 body) instead
+    /// of three separate gemv v2 launches. -2 kernel boundaries per gdn
+    /// layer × 34 layers.
+    pub fn gemv_tri_dev(&self, x_dev: &DevBuf, w1: &Tensor, w2: &Tensor, w3: &Tensor,
+                        in_f: i32, o1: i32, o2: i32, o3: i32) -> Result<(DevBuf, DevBuf, DevBuf)> {
+        let dw1 = self.dev_weight_bf16(w1)?;
+        let dw2 = self.dev_weight_bf16(w2)?;
+        let dw3 = self.dev_weight_bf16(w3)?;
+        let y1 = DevBuf::alloc(self.dev, self.stream, o1 as usize)?;
+        let y2 = DevBuf::alloc(self.dev, self.stream, o2 as usize)?;
+        let y3 = DevBuf::alloc(self.dev, self.stream, o3 as usize)?;
+        ck(unsafe {
+            ferrite_gemv_tri(x_dev.as_const_f32(), dw1.ptr as *const _, dw2.ptr as *const _,
+                             dw3.ptr as *const _, y1.as_f32(), y2.as_f32(), y3.as_f32(),
+                             in_f, o1, o2, o3, self.stream)
+        }, "gemv_tri")?;
+        Ok((y1, y2, y3))
     }
 
     /// sparse_attn v2 (256-thread block, float4 dots, smem idx/bitmap dedup):
@@ -1485,10 +1509,18 @@ impl CudaBackend {
             d("qkv", &qh);
             eprintln!("[gdn_probe] dev L0 x/qkv dumped: x {} qkv {} (n={} proj={})", xh.len(), qh.len(), n, proj);
         }
-        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
-        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
+        let (b_raw, fa, ga) = if n == 1 {
+            // 3-in-1 GEMV (b_raw || f_a || g_a — same input x): one kernel maps
+            // the three weight matrices onto one row space (WPR=4 K-split) —
+            // 3 kernel launches → 1 per gdn layer × 34 layers.
+            self.gemv_tri_dev(x, w.b_proj, w.f_a, w.g_a, hidden as i32,
+                              h as i32, dk as i32, dk as i32)?
+        } else {
+            (self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?,
+             self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?,
+             self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?)
+        };
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
-        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?;
         let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
         // 2. causal conv — resident tail state (RMW in place: the kernel
         // reads state_in into smem at block start, writes state_out at end,

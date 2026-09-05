@@ -1275,3 +1275,39 @@ fn conv_prep_fused_parity() {
         assert!(mx < 1e-5 && ms < 1e-6, "conv_prep_fused h={h} dk={dk} qkv {mx:.2e} state {ms:.2e}");
     }
 }
+
+/// gemv_tri parity (3-in-1 GEMV: b_raw||f_a||g_a same-input row mapping):
+/// CPU golden dot per segment; covers the o1/o1+o2 segment boundaries and
+/// the WPR=4 K-split slice alignment (in_f multiple of 8).
+#[test]
+fn gemv_tri_parity() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let (in_f, o1, o2, o3) = (64usize, 4usize, 8usize, 8usize);
+    let mut rnd = 0x1234_5678_9abc_def1u64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 - 0.5 };
+    let x: Vec<f32> = (0..in_f).map(|_| r()).collect();
+    let w1: Vec<f32> = (0..o1 * in_f).map(|_| r()).collect();
+    let w2: Vec<f32> = (0..o2 * in_f).map(|_| r()).collect();
+    let w3: Vec<f32> = (0..o3 * in_f).map(|_| r()).collect();
+    let t = |v: Vec<f32>, sh: &[usize]| Tensor::from_f32(Shape::new(sh.to_vec()), v);
+    let x_t = t(x.clone(), &[in_f]);
+    let w1_t = t(w1.clone(), &[o1, in_f]); let w2_t = t(w2.clone(), &[o2, in_f]); let w3_t = t(w3.clone(), &[o3, in_f]);
+    // upload x to DevBuf (gemv_tri_dev takes &DevBuf)
+    let mut xv = vec![0f32; in_f];
+    xv.copy_from_slice(x_t.as_slice());
+    let xd = DevBuf::alloc(dev.dev(), dev.stream(), in_f).expect("buf");
+    xd.upload(&xv).expect("upload x");
+    let (y1, y2, y3) = dev.gemv_tri_dev(&xd, &w1_t, &w2_t, &w3_t, in_f as i32, o1 as i32, o2 as i32, o3 as i32).expect("tri");
+    let mut g1 = vec![0f32; o1]; let mut g2 = vec![0f32; o2]; let mut g3 = vec![0f32; o3];
+    y1.download(&mut g1).expect("d1"); y2.download(&mut g2).expect("d2"); y3.download(&mut g3).expect("d3");
+    let dot = |w: &[f32], o: usize| -> Vec<f32> {
+        (0..o).map(|r_| (0..in_f).map(|c| w[r_ * in_f + c] * x[c]).sum()).collect()
+    };
+    let (e1, e2, e3) = (dot(&w1, o1), dot(&w2, o2), dot(&w3, o3));
+    let m = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+    let mx = m(&g1, &e1).max(m(&g2, &e2)).max(m(&g3, &e3));
+    eprintln!("[gemv-tri] seg maxd y1={:.2e} y2={:.2e} y3={:.2e}", m(&g1, &e1), m(&g2, &e2), m(&g3, &e3));
+    assert!(mx < 1e-4, "gemv_tri parity maxd {mx:.2e}");
+}
