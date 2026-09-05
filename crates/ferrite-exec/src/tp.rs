@@ -1020,7 +1020,7 @@ fn mega_chain_dev(
         cuda.graph_capture_begin();
     }
 
-    let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), nh)?;
+    let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
     res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
     // Event-in-graph timing (FERRITE_MEGA_EVTS): rank-0 records timing
@@ -1308,7 +1308,7 @@ fn mega_chain_dev(
             gname,
             GraphIO {
                 x_stage,
-                x_len: nh,
+                x_len: n * nh,
                 out_dev: arg.as_f32() as *mut std::ffi::c_void,
                 out_len: n,
             },
