@@ -69,6 +69,9 @@ fn nccl_in_graph_all_reduce() {
                 let mut wx = DevBuf::alloc(b.dev(), b.stream_handle(), COUNT).unwrap();
                 wx.upload(&v).unwrap();
                 ch.all_reduce_f32(wx.as_const_f32(), wx.as_f32(), COUNT).unwrap();
+                // in-place AR accumulates — re-upload the initial values so
+                // the second (steady-state path) round starts from v again
+                wx.upload(&v).unwrap();
                 ch.all_reduce_f32(wx.as_const_f32(), wx.as_f32(), COUNT).unwrap();
                 b.sync().unwrap();
                 let mut got = vec![0f32; COUNT];
