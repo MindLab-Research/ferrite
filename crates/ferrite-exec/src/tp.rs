@@ -509,10 +509,20 @@ impl<B: KernelBackend> TpCluster<B> {
                 // chain. Bisection: dry output correct → graph-mechanism bug;
                 // dry output garbage → chain-semantics bug.
                 eprintln!(
-                    "[mega] DRY mode step (in={last} tok={}): dry-run {:.1}ms — no capture",
-                    toks[0], t_dry.as_secs_f32() * 1e3
-                );
-                return Ok(toks[0] as u32);
+                            "[mega] DRY mode step (in={last} tok={}): dry-run {:.1}ms — no capture",
+                            toks[0], t_dry.as_secs_f32() * 1e3
+                        );
+                                        // every shard's seq_runtime must track the sampled token — the NEXT
+                // step's input embeds tokens.last() (decode_step_normal pushes at its
+                // tail; mega omitted it → input token froze at the prompt's last
+                // token → output self-locked to one token)
+                let tok = toks[0] as u32;
+                for s in &mut self.shards {
+                    if let Some(rt) = s.seq_runtime_mut(seq) {
+                        rt.tokens.push(tok);
+                    }
+                }
+                return Ok(tok);
             }
             // Capture: record-only. capture_lock serializes the per-rank
             // captures (concurrent cuGraphInstantiate SIGSEGV'd historically);
@@ -533,7 +543,17 @@ impl<B: KernelBackend> TpCluster<B> {
             );
             // all four ranks computed the same token (bit-identical after
             // the ARs — symmetric redundant head)
-            return Ok(toks[0] as u32);
+            // every shard's seq_runtime must track the sampled token —
+            // decode_step_normal pushes at its tail; mega omitted it → the
+            // next step's input token froze at the prompt's last token →
+            // output self-locked to one token.
+            let tok = toks[0] as u32;
+            for s in &mut self.shards {
+                if let Some(rt) = s.seq_runtime_mut(seq) {
+                    rt.tokens.push(tok);
+                }
+            }
+            return Ok(tok);
         }
         // Steady state: advance DSA pinned t0/total (the graph's kernels
         // read them zero-copy), write the 4 stagings, one launch per rank,
@@ -564,7 +584,17 @@ impl<B: KernelBackend> TpCluster<B> {
                 1e3 / dt.as_secs_f32().max(1e-9)
             );
         }
-        Ok(toks[0] as u32)
+        // every shard's seq_runtime must track the sampled token —
+        // decode_step_normal pushes at its tail; mega omitted it → the
+        // next step's input token froze at the prompt's last token →
+        // output self-locked to one token.
+        let tok = toks[0] as u32;
+        for s in &mut self.shards {
+            if let Some(rt) = s.seq_runtime_mut(seq) {
+                rt.tokens.push(tok);
+            }
+        }
+        Ok(tok)
     }
 
 // ============================================================
