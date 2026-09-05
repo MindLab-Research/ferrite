@@ -44,18 +44,38 @@ fn nccl_in_graph_all_reduce() {
     // ---- warm-up: 2 in-place collectives per rank OUTSIDE capture ----
     // (allocates NCCL's internal buffers + warms the COUNT-size DevBuf pool
     // class on every device — capture forbids cudaMalloc)
+    // NCCL collective = ENQUEUE per rank; it completes only when EVERY rank
+    // has joined — enqueue ALL ranks first, THEN sync (a per-rank
+    // enqueue+sync loop deadlocks: rank 0's sync waits for ranks that have
+    // not enqueued yet).
+    let warm_vals: Vec<Vec<f32>> = (0..WORLD)
+        .map(|r| (0..COUNT).map(|i| (r + i % 7) as f32).collect())
+        .collect();
+    let mut wbufs: Vec<DevBuf> = Vec::with_capacity(WORLD);
     for r in 0..WORLD {
         let b = &backends[r];
         b.enter();
         let mut wx = DevBuf::alloc(b.dev(), b.stream_handle(), COUNT).unwrap();
-        let v: Vec<f32> = (0..COUNT).map(|i| (r + i % 7) as f32).collect();
-        wx.upload(&v).unwrap();
+        wx.upload(&warm_vals[r]).unwrap();
         chans[r].all_reduce_f32(wx.as_const_f32(), wx.as_f32(), COUNT).unwrap();
-        b.sync().unwrap();
-        chans[r].all_reduce_f32(wx.as_const_f32(), wx.as_f32(), COUNT).unwrap();
+        wbufs.push(wx);
+    }
+    for r in 0..WORLD {
+        backends[r].enter();
+        backends[r].sync().unwrap();
+    }
+    // second round on the same buffers (proves the steady-state enqueue
+    // path; the first round did the plan/buffer allocation)
+    for r in 0..WORLD {
+        backends[r].enter();
+        chans[r].all_reduce_f32(wbufs[r].as_const_f32(), wbufs[r].as_f32(), COUNT).unwrap();
+    }
+    for r in 0..WORLD {
+        let b = &backends[r];
+        b.enter();
         b.sync().unwrap();
         let mut got = vec![0f32; COUNT];
-        wx.download(&mut got).unwrap();
+        wbufs[r].download(&mut got).unwrap();
         // sum over ranks of (r + i%7) = 6 + i%7
         for (i, g) in got.iter().enumerate() {
             assert!(
@@ -63,7 +83,7 @@ fn nccl_in_graph_all_reduce() {
                 "warmup allreduce wrong r{r} i{i}: {g}"
             );
         }
-    } // wx dropped → COUNT class warm in every device's pool
+    } // wbufs dropped → COUNT class warm in every device's pool
 
     // ---- capture: per-rank graph, K=1 collective (correctness) ----
     let mut inputs: Vec<Vec<f32>> = Vec::with_capacity(WORLD);
