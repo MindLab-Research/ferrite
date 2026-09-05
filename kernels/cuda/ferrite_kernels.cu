@@ -2951,7 +2951,7 @@ extern "C" cudaError_t ferrite_gemv_qkv_conv(
     int out_f = 3 * proj;
     dim3 grid((out_f + 7) / 8);
     gemv_qkv_conv_kernel<<<grid, 256, 0, s>>>(
-        x, (const __nv_bfloat16*)w, (const __nv_bfloat16*)cw, cs,
+        x, (const __nv_bfloat16*)w, cw, cs,
         q, k, v, in_f, proj);
     return cudaGetLastError();
 }
