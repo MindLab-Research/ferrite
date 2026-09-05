@@ -334,8 +334,11 @@ use ferrite_kernel::KernelBackend;
 ///   MTP draft's eh_proj) exported via a capture-safe D2D graph node.
 #[cfg(feature = "cuda")]
 pub(crate) struct VerifyIO {
-    pub gdn_scratch: Vec<(*mut f32, *mut f32)>, // [n_gdn_layers] (conv, gdn)
-    pub h_final: *mut f32,                        // [hidden] staging
+    /// [n_gdn_layers] (conv, gdn, conv0, gdn0): B = full n-token verify
+    /// state, B0 = t=0-only snapshot (A+t_last) — accept-1 commits B0,
+    /// accept-2 commits B.
+    pub gdn_scratch: Vec<(*mut f32, *mut f32, *mut f32, *mut f32)>,
+    pub h_final: *mut f32, // [n*hidden] staging
 }
 
 /// A tensor-parallel cluster: `world` engines, each holding its TP shard of
@@ -764,7 +767,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 let mut gi = 0usize;
                 for plan in plans {
                     if matches!(plan.attn, AttnKind::Linear) {
-                        let (cb, gb) = &m.scratch[gi];
+                        let (cb, gb, _, _) = &m.scratch[gi];
                         let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
                         cuda.copy_raw_dev(aptr as *const f32, cb.as_f32(), conv_len)?;
                         let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
@@ -814,7 +817,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     let mut gi = 0usize;
                     for plan in plans {
                         if matches!(plan.attn, AttnKind::Linear) {
-                            let (cb, gb) = &m.scratch[gi];
+                            let (cb, gb, _, _) = &m.scratch[gi];
                             let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
                             cuda.copy_raw_dev(cb.as_const_f32(), aptr, conv_len)?;
                             let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
@@ -855,9 +858,27 @@ impl<B: KernelBackend> TpCluster<B> {
                     cuda.dsa_host_rollback(seq, f, 1);
                 }
                 cuda.dsa_host_rollback(seq, mtp_family, 1); // draft d1 rejected
+                let la = &s.cfg.linear_attn;
+                let proj = la.num_heads * la.head_dim;
+                let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
+                let gdn_len = la.num_heads * la.head_dim * la.head_dim;
                 {
                     let m = cuda.mtp.lock().unwrap();
                     let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    // B0→A: commit the t=0 snapshots (A + t_last) so A holds
+                    // every accepted token exactly once; the next step's t=0
+                    // advances t_last'=a0 on top of it.
+                    let mut gi = 0usize;
+                    for plan in plans {
+                        if matches!(plan.attn, AttnKind::Linear) {
+                            let (_, _, cb0, gb0) = &m.scratch[gi];
+                            let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
+                            cuda.copy_raw_dev(cb0.as_const_f32(), aptr, conv_len)?;
+                            let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
+                            cuda.copy_raw_dev(gb0.as_const_f32(), gptr, gdn_len)?;
+                            gi += 1;
+                        }
+                    }
                     cuda.copy_dev(&m.hf_v, 0, m.hprev.as_f32(), hidden)?;
                 }
                 Ok::<(), FerriteError>(())
@@ -896,7 +917,9 @@ impl<B: KernelBackend> TpCluster<B> {
             if matches!(plan.attn, AttnKind::Linear) {
                 let conv = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), conv_len)?;
                 let gdn = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), gdn_len)?;
-                scratch.push((conv, gdn));
+                let conv0 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), conv_len)?;
+                let gdn0 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), gdn_len)?;
+                scratch.push((conv, gdn, conv0, gdn0));
             }
         }
         let hf_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
@@ -916,7 +939,11 @@ impl<B: KernelBackend> TpCluster<B> {
         let m = m.as_ref().unwrap();
         if verify {
             VerifyIO {
-                gdn_scratch: m.scratch.iter().map(|(c, g)| (c.as_f32(), g.as_f32())).collect(),
+                gdn_scratch: m
+                    .scratch
+                    .iter()
+                    .map(|(c, g, c0, g0)| (c.as_f32(), g.as_f32(), c0.as_f32(), g0.as_f32()))
+                    .collect(),
                 h_final: m.hf_v.as_f32(),
             }
         } else {

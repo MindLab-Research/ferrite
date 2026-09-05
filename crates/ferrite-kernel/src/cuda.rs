@@ -390,7 +390,9 @@ pub struct MtpState {
     pub hf_dev: DevBuf,
     pub hf_v: DevBuf,
     pub hprev: DevBuf,
-    pub scratch: Vec<(DevBuf, DevBuf)>,
+    /// per-GDN-layer (conv, gdn, conv0, gdn0): B = full verify state,
+    /// B0 = t=0 snapshot (accept-1 commit source).
+    pub scratch: Vec<(DevBuf, DevBuf, DevBuf, DevBuf)>,
 }
 
 pub struct CudaBackend {
@@ -1541,7 +1543,7 @@ impl CudaBackend {
         lb: f32,
         rms_eps: f32,
         conv_size: usize,
-        state_override: Option<(*mut f32, *mut f32)>, // (conv, gdn) verify scratch
+        state_override: Option<(*mut f32, *mut f32, *mut f32, *mut f32)>, // (conv, gdn, conv0, gdn0) verify scratch: B = full n-token state, B0 = t=0-only snapshot for accept-1 commit
     ) -> Result<DevBuf> {
         self.enter();
         let proj = h * dk;
@@ -1595,7 +1597,7 @@ impl CudaBackend {
         let hist = conv_size.saturating_sub(1).max(1);
         let dw_conv = self.dev_weight(w.conv_w)?;
         let conv_state = match state_override {
-            Some((cs, _)) => cs,
+            Some((cs, _, _, _)) => cs,
             None => self.dev_state(&self.conv_states, (seq, layer), ch * hist)?,
         };
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -1622,15 +1624,41 @@ impl CudaBackend {
             )?;
         } else {
             let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
-            ck(
-                unsafe {
-                    ferrite_causal_conv1d(
-                        qkv.as_ref().unwrap().as_const_f32(), dw_conv.as_const_f32(), conv_state,
-                        conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
-                    )
-                },
-                "conv1d_dev",
-            )?;
+            if let Some((_, _, c0, _)) = state_override.filter(|_| n == 2) {
+                // verify n=2 B0 scheme: split so t=0's window (A+t_last) is
+                // snapshotted to conv0 — accept-1 commits conv0 (rejects d1's
+                // window advance); conv_state (B) holds the full 2-token state.
+                let qkv_p = qkv.as_ref().unwrap();
+                ck(
+                    unsafe {
+                        ferrite_causal_conv1d(
+                            qkv_p.as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                            conv_out.as_f32(), conv_state, 1, ch as i32, conv_size as i32, self.stream,
+                        )
+                    },
+                    "conv1d_v_t0",
+                )?;
+                self.copy_raw_dev(conv_state as *const f32, c0, ch * hist)?;
+                ck(
+                    unsafe {
+                        ferrite_causal_conv1d(
+                            qkv_p.as_const_f32().add(ch), dw_conv.as_const_f32(), conv_state,
+                            conv_out.as_f32().add(ch), conv_state, 1, ch as i32, conv_size as i32, self.stream,
+                        )
+                    },
+                    "conv1d_v_t1",
+                )?;
+            } else {
+                ck(
+                    unsafe {
+                        ferrite_causal_conv1d(
+                            qkv.as_ref().unwrap().as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                            conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
+                        )
+                    },
+                    "conv1d_dev",
+                )?;
+            }
             // 3. GPU pre-processing (ferrite_gdn_prep): silu + split + per-head L2
             // norm + KDA q-scale + beta + gate — ONE kernel, zero host round-trips.
             ck(
@@ -1680,7 +1708,7 @@ impl CudaBackend {
         // blocks read-modify-write their own slice; single buffer is safe).
         // v2: state staged in smem (padded stride dk+1) — HBM 7 passes → 2.
         let gdn_state = match state_override {
-            Some((_, gs)) => gs,
+            Some((_, gs, _, _)) => gs,
             None => self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?,
         };
         let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -1698,6 +1726,33 @@ impl CudaBackend {
                     )
                 },
                 "gdn_step_v2p",
+            )?;
+        } else if let Some((_, _, _, g0)) = state_override.filter(|_| n == 2) {
+            // verify n=2 B0 scheme: t=0 advances the state by t_last only
+            // (B = A+t_last), snapshots to gdn0 (accept-1's commit source),
+            // then t=1 advances by d1 (B = full 2-token state, accept-2).
+            let dal = self.dev_weight(w.a_log)?;
+            ck(
+                unsafe {
+                    ferrite_gdn_chunk_v2(
+                        q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
+                        beta.as_const_f32(), gate.as_const_f32(), dal.as_const_f32(),
+                        gdn_state, core.as_f32(), 1, h as i32, dk as i32, dk as i32, self.stream,
+                    )
+                },
+                "gdn_chunk_v_t0",
+            )?;
+            self.copy_raw_dev(gdn_state as *const f32, g0, h * dk * dk)?;
+            ck(
+                unsafe {
+                    ferrite_gdn_chunk_v2(
+                        q.as_const_f32().add(h * dk), k.as_const_f32().add(h * dk),
+                        v.as_const_f32().add(h * dk), beta.as_const_f32().add(h),
+                        gate.as_const_f32().add(h * dk), dal.as_const_f32(),
+                        gdn_state, core.as_f32().add(h * dk), 1, h as i32, dk as i32, dk as i32, self.stream,
+                    )
+                },
+                "gdn_chunk_v_t1",
             )?;
         } else {
             ck(
