@@ -334,10 +334,10 @@ use ferrite_kernel::KernelBackend;
 ///   MTP draft's eh_proj) exported via a capture-safe D2D graph node.
 #[cfg(feature = "cuda")]
 pub(crate) struct VerifyIO {
-    /// [n_gdn_layers] (conv, gdn, conv0, gdn0): B = full n-token verify
-    /// state, B0 = t=0-only snapshot (A+t_last) — accept-1 commits B0,
-    /// accept-2 commits B.
-    pub gdn_scratch: Vec<(*mut f32, *mut f32, *mut f32, *mut f32)>,
+    /// [n_gdn_layers] (conv, gdn, conv0, gdn0, gdn1): B = full n-token verify
+    /// state, B0 = t=0 snapshot (A+t_last, accept-1), B1 = t=1 snapshot
+    /// (A+t_last+d1, accept-2, n=3 only).
+    pub gdn_scratch: Vec<(*mut f32, *mut f32, *mut f32, *mut f32, *mut f32, *mut f32)>,
     pub h_final: *mut f32, // [n*hidden] staging
 }
 
@@ -633,17 +633,17 @@ impl<B: KernelBackend> TpCluster<B> {
                 // MTP verify graph (n=2: [t_last, d1]): GDN state → scratch B
                 // (ping-pong), h_final export (hf_v [2,hidden]), argmax 2.
                 let gv = format!("mega_v{seq}");
-                let h2 = self.shards[0].embed(&[last, last]);
+                let h2 = self.shards[0].embed(&[last, last, last]);
                 let in_vals2 = crate::mhc::hc_expand(&h2, self.full_cfg.hc_mult);
                 let _ = Self::fan_out(&mut self.shards, |s| {
                     let vio = Self::mtp_vio(s, true);
-                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, false, &gv, 2, Some(&vio))
+                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, false, &gv, 3, Some(&vio))
                 })
                 .into_iter()
                 .collect::<Result<Vec<Vec<f32>>>>()?;
                 Self::fan_out(&mut self.shards, |s| {
                     let vio = Self::mtp_vio(s, true);
-                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, true, &gv, 2, Some(&vio))
+                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, true, &gv, 3, Some(&vio))
                 })
                 .into_iter()
                 .collect::<Result<Vec<Vec<f32>>>>()?;
@@ -781,26 +781,48 @@ impl<B: KernelBackend> TpCluster<B> {
         let t_d = std::time::Instant::now();
         // 1. draft: h_prev staging (accept row of last step's h_final) +
         //    embed(last) → mtp_forward → d1 (identical across ranks).
-        let d1 = Self::fan_out(&mut self.shards, |s| {
-            let cuda = s
-                .backend
-                .as_cuda()
-                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-            cuda.enter();
-            let h2 = s.embed(&[last]);
-            let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-            emb.upload(h2.as_slice())?;
-            // hprev: fixed MtpState buffer (borrow outliving the lock via raw ptr)
-            let hptr = {
-                let m = cuda.mtp.lock().unwrap();
-                let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                &m.hprev as *const DevBuf as usize
-            };
-            let hprev: &DevBuf = unsafe { &*(hptr as *const DevBuf) };
-            mtp_forward(s, seq, &emb, hprev, None)
-        })
-        .into_iter()
-        .collect::<Result<Vec<f32>>>()?[0];
+        let (d1, d2) = {
+            let toks = Self::fan_out(&mut self.shards, |s| {
+                let (emb, hptr) = {
+                    let cuda = s
+                        .backend
+                        .as_cuda()
+                        .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                    cuda.enter();
+                    let h2 = s.embed(&[last]);
+                    let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                    emb.upload(h2.as_slice())?;
+                    let m = cuda.mtp.lock().unwrap();
+                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    (emb, &m.hprev as *const DevBuf as usize)
+                };
+                let hprev: &DevBuf = unsafe { &*(hptr as *const DevBuf) };
+                // draft chain: d1 from hprev; d2 from d1's MTP residual h
+                // (the draft model's own hidden — EAGLE-style recursion).
+                let (d1, h_d1) = {
+                    let cuda = s
+                        .backend
+                        .as_cuda()
+                        .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                    let h_d1 = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
+                    (mtp_forward(s, seq, &emb, hprev, Some(&h_d1))?, h_d1)
+                };
+                let d2 = {
+                    let cuda = s
+                        .backend
+                        .as_cuda()
+                        .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                    let h3 = s.embed(&[d1 as u32]);
+                    let emb2 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                    emb2.upload(h3.as_slice())?;
+                    mtp_forward(s, seq, &emb2, &h_d1, None)?
+                };
+                Ok((d1, d2))
+            })
+            .into_iter()
+            .collect::<Result<Vec<(f32, f32)>>>()?;
+            toks[0]
+        };
         let t_draft = t_d.elapsed();
         let t_v = std::time::Instant::now();
         // 2. verify: scratch A→B copy-in + dsa advance(2) + mega_v replay → argmax[2]
@@ -822,7 +844,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 let mut gi = 0usize;
                 for plan in plans {
                     if matches!(plan.attn, AttnKind::Linear) {
-                        let (cb, gb, _, _) = &m.scratch[gi];
+                        let (cb, gb, _, _, _, _) = &m.scratch[gi];
                         let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
                         cuda.copy_raw_dev(aptr as *const f32, cb.as_f32(), conv_len)?;
                         let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
@@ -843,120 +865,109 @@ impl<B: KernelBackend> TpCluster<B> {
             if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
                 return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
             }
-            Ok((out[0], out[1]))
+            Ok((out[0], out[1], out[2]))
         })
         .into_iter()
-        .collect::<Result<Vec<(f32, f32)>>>()?;
-        let (a0, a1) = toks_v[0];
+        .collect::<Result<Vec<(f32, f32, f32)>>>()?;
+        let (a0, a1, a2) = toks_v[0];
         let t_verify = t_v.elapsed();
         let t_c = std::time::Instant::now();
-        // 3. accept: d1 == argmax[0] → 2 tokens (d1 + bonus a1); else 1 (a0).
+        // 3. accept: longest prefix of (d1, d2) vs (a0, a1); k = 1/2/3.
+        // k=3: d1==a0 && d2==a1 (3 tokens: d1, d2, bonus a2; commit B full)
+        // k=2: d1==a0, d2!=a1 (2 tokens: d1, bonus a1; commit B1 = A+t_last+d1)
+        // k=1: d1!=a0 (1 token: a0; commit B0 = A+t_last)
+        let k = if d1 as u32 == a0 as u32 {
+            if d2 as u32 == a1 as u32 { 3 } else { 2 }
+        } else { 1 };
         let dbg = std::env::var_os("FERRITE_MTP_DEBUG").is_some();
         if dbg {
-            eprintln!("[mtp] d1={:?} a0={:?} a1={:?} -> {}", d1 as u32, a0 as u32, a1 as u32,
-                     if d1 as u32 == a0 as u32 { "accept2" } else { "fallback" });
+            eprintln!("[mtp] d1={:?} d2={:?} a0={:?} a1={:?} a2={:?} -> accept{}", d1 as u32, d2 as u32, a0 as u32, a1 as u32, a2 as u32, k);
         }
-        if d1 as u32 == a0 as u32 {
-            // accept 2: ping-pong commit B→A + hprev ← hf_v row 1 (d1's h)
-            Self::fan_out(&mut self.shards, |s| {
-                let cuda = s
-                    .backend
-                    .as_cuda()
-                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                cuda.enter();
-                let la = &s.cfg.linear_attn;
-                let proj = la.num_heads * la.head_dim;
-                let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
-                let gdn_len = la.num_heads * la.head_dim * la.head_dim;
-                {
-                    let m = cuda.mtp.lock().unwrap();
-                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    let mut gi = 0usize;
-                    for plan in plans {
-                        if matches!(plan.attn, AttnKind::Linear) {
-                            let (cb, gb, _, _) = &m.scratch[gi];
-                            let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
-                            cuda.copy_raw_dev(cb.as_const_f32(), aptr, conv_len)?;
-                            let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
-                            cuda.copy_raw_dev(gb.as_const_f32(), gptr, gdn_len)?;
-                            gi += 1;
-                        }
+        // B_k commit source indices into the 6-tuple scratch (conv, gdn, conv0, gdn0, conv1, gdn1):
+        // k=3 -> B (.0/.1), k=2 -> B1 (.4/.5), k=1 -> B0 (.2/.3)
+        let (ci, gi) = match k { 3 => (0usize, 1usize), 2 => (4usize, 5usize), _ => (2usize, 3usize) };
+        Self::fan_out(&mut self.shards, |s| {
+            let cuda = s
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+            cuda.enter();
+            // rollback the REJECTED tail of the verify append (3 tokens appended,
+            // keep k) and the rejected draft appends (2 draft tokens, keep k-1).
+            for f in 0..num_dsa {
+                cuda.dsa_host_rollback(seq, f, (3 - k) as usize);
+            }
+            cuda.dsa_host_rollback(seq, mtp_family, (3 - k) as usize);
+            let la = &s.cfg.linear_attn;
+            let proj = la.num_heads * la.head_dim;
+            let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
+            let gdn_len = la.num_heads * la.head_dim * la.head_dim;
+            {
+                let m = cuda.mtp.lock().unwrap();
+                let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                let mut idx = 0usize;
+                for plan in plans {
+                    if matches!(plan.attn, AttnKind::Linear) {
+                        let sc = &m.scratch[idx];
+                        let (cb, gb) = (&sc.0, &sc.1); // B (full)
+                        let (cb0, gb0) = (&sc.2, &sc.3); // B0 = A+t_last
+                        let (cb1, gb1) = (&sc.4, &sc.5); // B1 = A+t_last+d1
+                        let (cc, gc) = match k {
+                            3 => (cb, gb),
+                            2 => (cb1, gb1),
+                            _ => (cb0, gb0),
+                        };
+                        let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
+                        cuda.copy_raw_dev(cc.as_const_f32(), aptr, conv_len)?;
+                        let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
+                        cuda.copy_raw_dev(gc.as_const_f32(), gptr, gdn_len)?;
+                        idx += 1;
                     }
-                    // hprev ← hf_v row 0 (t_last-position h — the NEXT step's
-                    // draft predicts t_last'=a1's next from h(a1)=this step's
-                    // verify t=0 output; NOT row 1 (d1's h — that's for a
-                    // draft-2 token, Phase 2)
-                    cuda.copy_dev(&m.hf_v, 0, m.hprev.as_f32(), hidden)?;
                 }
-                Ok::<(), FerriteError>(())
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-            for s in &mut self.shards {
-                if let Some(rt) = s.seq_runtime_mut(seq) {
-                    rt.tokens.push(d1 as u32);
-                    rt.tokens.push(a1 as u32);
-                }
+                // hprev <- hf_v row k-1 (the last accepted position's h)
+                cuda.copy_dev(&m.hf_v, (k - 1) * hidden, m.hprev.as_f32(), hidden)?;
             }
-            if mtp_tm {
-                eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit2={:.2}ms (accept2 d1={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, d1 as u32);
-            }
-            Ok(a1 as u32)
-        } else {
-            // accept 1: bonus a0 only. NO fallback mega replay — the GDN state
-            // must stay at "before t_last" so the NEXT verify's t=0 slot does
-            // the one true advance of t_last (=a0). Running the fallback
-            // graph double-advances (fallback t_last + verify t=0 t_last)
-            // and the state corruption self-locks the token stream.
-            // Cache: verify appended [t_last, d1]; d1 was rejected → rollback 1.
-            // MTP draft cache: rollback the rejected d1 append.
-            // hprev ← hf_v row 0 (verify t=0's h = the accepted position).
-            Self::fan_out(&mut self.shards, |s| {
-                let cuda = s
-                    .backend
-                    .as_cuda()
-                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                cuda.enter();
-                for f in 0..num_dsa {
-                    cuda.dsa_host_rollback(seq, f, 1);
-                }
-                cuda.dsa_host_rollback(seq, mtp_family, 1); // draft d1 rejected
-                let la = &s.cfg.linear_attn;
-                let proj = la.num_heads * la.head_dim;
-                let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
-                let gdn_len = la.num_heads * la.head_dim * la.head_dim;
-                {
-                    let m = cuda.mtp.lock().unwrap();
-                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    // B0→A: commit the t=0 snapshots (A + t_last) so A holds
-                    // every accepted token exactly once; the next step's t=0
-                    // advances t_last'=a0 on top of it.
-                    let mut gi = 0usize;
-                    for plan in plans {
-                        if matches!(plan.attn, AttnKind::Linear) {
-                            let (_, _, cb0, gb0) = &m.scratch[gi];
-                            let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
-                            cuda.copy_raw_dev(cb0.as_const_f32(), aptr, conv_len)?;
-                            let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
-                            cuda.copy_raw_dev(gb0.as_const_f32(), gptr, gdn_len)?;
-                            gi += 1;
-                        }
+            Ok::<(), FerriteError>(())
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+        match k {
+            3 => {
+                for s in &mut self.shards {
+                    if let Some(rt) = s.seq_runtime_mut(seq) {
+                        rt.tokens.push(d1 as u32);
+                        rt.tokens.push(d2 as u32);
+                        rt.tokens.push(a2 as u32);
                     }
-                    cuda.copy_dev(&m.hf_v, 0, m.hprev.as_f32(), hidden)?;
                 }
-                Ok::<(), FerriteError>(())
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-            for s in &mut self.shards {
-                if let Some(rt) = s.seq_runtime_mut(seq) {
-                    rt.tokens.push(a0 as u32);
+                if mtp_tm {
+                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit3={:.2}ms (accept3 d1={:?} d2={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, d1 as u32, d2 as u32);
                 }
+                Ok(a2 as u32)
             }
-            if mtp_tm {
-                eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit1={:.2}ms (accept1 a0={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, a0 as u32);
+            2 => {
+                for s in &mut self.shards {
+                    if let Some(rt) = s.seq_runtime_mut(seq) {
+                        rt.tokens.push(d1 as u32);
+                        rt.tokens.push(a1 as u32);
+                    }
+                }
+                if mtp_tm {
+                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit2={:.2}ms (accept2 d1={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, d1 as u32);
+                }
+                Ok(a1 as u32)
             }
-            Ok(a0 as u32)
+            _ => {
+                for s in &mut self.shards {
+                    if let Some(rt) = s.seq_runtime_mut(seq) {
+                        rt.tokens.push(a0 as u32);
+                    }
+                }
+                if mtp_tm {
+                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit1={:.2}ms (accept1 a0={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, a0 as u32);
+                }
+                Ok(a0 as u32)
+            }
         }
     }
 
@@ -985,11 +996,13 @@ impl<B: KernelBackend> TpCluster<B> {
                 let gdn = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), gdn_len)?;
                 let conv0 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), conv_len)?;
                 let gdn0 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), gdn_len)?;
-                scratch.push((conv, gdn, conv0, gdn0));
+                let conv1 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), conv_len)?;
+                let gdn1 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), gdn_len)?;
+                scratch.push((conv, gdn, conv0, gdn0, conv1, gdn1));
             }
         }
         let hf_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-        let hf_v = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 2 * hidden)?;
+        let hf_v = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 3 * hidden)?;
         let hprev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
         *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch });
         Ok(())
@@ -1008,7 +1021,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 gdn_scratch: m
                     .scratch
                     .iter()
-                    .map(|(c, g, c0, g0)| (c.as_f32(), g.as_f32(), c0.as_f32(), g0.as_f32()))
+                    .map(|(c, g, c0, g0, c1, g1)| (c.as_f32(), g.as_f32(), c0.as_f32(), g0.as_f32(), c1.as_f32(), g1.as_f32()))
                     .collect(),
                 h_final: m.hf_v.as_f32(),
             }

@@ -3116,6 +3116,7 @@ __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
                                        const float* __restrict__ a_log,
                                        float* __restrict__ state,
                                        float* __restrict__ gdn0,
+                                       float* __restrict__ gdn1,
                                        float* __restrict__ out,
                                        int n, int h, int dk, int dv) {
     int hd = blockIdx.y;
@@ -3171,11 +3172,13 @@ __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
             out[((size_t)t * h + hd) * dv + j] = acc;
         }
         __syncthreads();
-        // 5. t=0 B0 snapshot (accept-1's commit source) straight from smem
-        if (t == 0 && gdn0 != nullptr) {
-            float* S0 = gdn0 + (size_t)hd * dk * dv;
+        // 5. t=0/t=1 snapshots (B_k = A + t_0..t_k: accept-k's commit source)
+        // straight from smem — B0 = A+t_last (accept-1), B1 = A+t_last+d1
+        // (accept-2, n=3 only)
+        if ((t == 0 && gdn0 != nullptr) || (t == 1 && gdn1 != nullptr)) {
+            float* Sk = (t == 0 ? gdn0 : gdn1) + (size_t)hd * dk * dv;
             for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-                S0[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+                Sk[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
             __syncthreads();
         }
     }
@@ -3186,7 +3189,7 @@ __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
 extern "C" cudaError_t ferrite_gdn_chunk_fused(
     const float* q, const float* k, const float* v,
     const float* beta, const float* gate, const float* a_log,
-    float* state, float* gdn0, float* out,
+    float* state, float* gdn0, float* gdn1, float* out,
     int n, int h, int dk, int dv, cudaStream_t s) {
     size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
                   + (size_t)(dv + dk + dv + dk + dk) * sizeof(float);
@@ -3198,6 +3201,6 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
     dim3 block(512);
     dim3 grid(1, h, 1);
     gdn_chunk_fused_kernel<<<grid, block, smem, s>>>(
-        q, k, v, beta, gate, a_log, state, gdn0, out, n, h, dk, dv);
+        q, k, v, beta, gate, a_log, state, gdn0, gdn1, out, n, h, dk, dv);
     return cudaGetLastError();
 }
