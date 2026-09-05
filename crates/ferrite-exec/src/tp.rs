@@ -752,6 +752,14 @@ fn mega_chain_dev(
         if layer_idx == 0 {
             mprobe!("ar0", &partial, hidden); // NCCL AR result — must be identical across the 4 rank files
         }
+        if probe && dev_id == 0 {
+            let mut pv = vec![0f32; hidden];
+            if partial.download(&mut pv).is_ok() {
+                let mx = pv.iter().fold(0f32, |a, x| a.max(x.abs()));
+                let kind = if matches!(plan.attn, AttnKind::Dsa) { "dsa" } else { "gdn" };
+                eprintln!("[mega] L{layer_idx:02} {kind} ar  maxabs={mx:.4}");
+            }
+        }
         // C: hc_post → hc_pre2 → post_attention_layernorm
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
         if layer_idx == 0 {
@@ -817,6 +825,14 @@ fn mega_chain_dev(
             }
         };
         nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        if probe && dev_id == 0 {
+            let mut pv = vec![0f32; hidden];
+            if partial2.download(&mut pv).is_ok() {
+                let mx = pv.iter().fold(0f32, |a, x| a.max(x.abs()));
+                let kind = if matches!(plan.mlp, MlpKind::Moe) { "moe" } else { "dense" };
+                eprintln!("[mega] L{layer_idx:02} {kind} ar maxabs={mx:.4}");
+            }
+        }
         // E: hc_post2 → next layer's residual
         res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
     }
