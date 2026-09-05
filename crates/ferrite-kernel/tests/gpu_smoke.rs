@@ -598,3 +598,90 @@ fn moe_fused_parity_and_speed() {
     eprintln!("[moe-fused] {us:.1} μs/call (route+act+down_sum, e_local={e_local} topk={topk})");
     assert!(us < 300.0, "moe_fused too slow: {us:.1} μs/call");
 }
+
+/// Dense-MLP operator parity (43s unit test vs the 4-min integration run):
+/// the mega-graph chain (matmul_dev + swiglu2_dev, separated g/u) vs the
+/// normal path (Tensor matmul via KernelBackend::matmul + swiglu_limited,
+/// packed gate_up). The mega dry-run's L00-02 dense AR diverges 2-3x from
+/// the known-good normal path while its dev0 g/u/a match — bisect at the
+/// OPERATOR level. Both paths share the bf16 weight cache + kernels, so
+/// parity must be bit-exact; any diff pinpoints the bug.
+#[test]
+fn dense_chain_parity() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda device 0");
+    let n = 1usize;
+    let hidden = 4096usize;
+    let inter = 3072usize; // per-rank shard of inter=12288 (GLM-5.3-Flash TP4)
+    let limit = 7.0f32;
+
+    let mut seed = 0x12345678u64;
+    let mut r = || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((seed >> 33) as f32 / 2147483648.0) - 0.5 // [-0.5, 0.5)
+    };
+
+    // ---- 1. matmul parity: Tensor path (the normal path's project) vs
+    // matmul_dev (the mega chain) — same bf16 kernel + weight cache
+    let x: Vec<f32> = (0..n * hidden).map(|_| r()).collect();
+    let w: Vec<f32> = (0..inter * hidden).map(|_| r() * 0.05).collect();
+    let x_t = Tensor::from_f32(Shape::new([n, hidden]), x.clone());
+    let w_t = Tensor::from_f32(Shape::new([inter, hidden]), w);
+    let mut out_t = Tensor::zeros(Shape::new([n, inter]), DType::F32);
+    dev.matmul(&x_t, &w_t, None, &mut out_t).expect("tensor matmul");
+
+    let x_dev = DevBuf::alloc(dev.dev(), dev.stream_handle(), n * hidden).unwrap();
+    x_dev.upload(&x).unwrap();
+    let out_dev = dev.matmul_dev(&x_dev, &w_t, n as i32, hidden as i32, inter as i32).unwrap();
+    let mut out_d = vec![0f32; n * inter];
+    out_dev.download(&mut out_d).unwrap();
+    close(
+        &out_t,
+        &Tensor::from_f32(Shape::new([n, inter]), out_d),
+        0.0,
+        "matmul_dev vs run_matmul (bit-exact expected)",
+    );
+
+    // ---- 2. swiglu parity: packed (swiglu_limited, normal path) vs
+    // separated (swiglu2_dev, mega chain) — same clamp+silu formula
+    let g: Vec<f32> = (0..n * inter).map(|_| r() * 12.0).collect(); // span the clamp
+    let u: Vec<f32> = (0..n * inter).map(|_| r() * 12.0).collect();
+    let mut gu = vec![0f32; n * 2 * inter];
+    for t in 0..n {
+        gu[t * 2 * inter..t * 2 * inter + inter].copy_from_slice(&g[t * inter..(t + 1) * inter]);
+        gu[t * 2 * inter + inter..(t + 1) * 2 * inter].copy_from_slice(&u[t * inter..(t + 1) * inter]);
+    }
+    let gu_t = Tensor::from_f32(Shape::new([n, 2 * inter]), gu);
+    let mut act_t = Tensor::zeros(Shape::new([n, inter]), DType::F32);
+    dev.swiglu_limited(&gu_t, limit, &mut act_t).expect("swiglu_limited");
+
+    let g_dev = DevBuf::alloc(dev.dev(), dev.stream_handle(), n * inter).unwrap();
+    g_dev.upload(&g).unwrap();
+    let u_dev = DevBuf::alloc(dev.dev(), dev.stream_handle(), n * inter).unwrap();
+    u_dev.upload(&u).unwrap();
+    let act_dev = dev.swiglu2_dev(&g_dev, &u_dev, n as i32, inter as i32, limit).unwrap();
+    let mut act_d = vec![0f32; n * inter];
+    act_dev.download(&mut act_d).unwrap();
+    close(
+        &act_t,
+        &Tensor::from_f32(Shape::new([n, inter]), act_d),
+        0.0,
+        "swiglu2_dev vs swiglu_limited (bit-exact expected)",
+    );
+
+    // ---- 3. down-proj parity: act @ wd.T — Tensor vs matmul_dev
+    let wd: Vec<f32> = (0..hidden * inter).map(|_| r() * 0.05).collect();
+    let wd_t = Tensor::from_f32(Shape::new([hidden, inter]), wd);
+    let mut dn_t = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
+    dev.matmul(&act_t, &wd_t, None, &mut dn_t).expect("down tensor matmul");
+    let dn_dev = dev.matmul_dev(&act_dev, &wd_t, n as i32, inter as i32, hidden as i32).unwrap();
+    let mut dn_d = vec![0f32; n * hidden];
+    dn_dev.download(&mut dn_d).unwrap();
+    close(
+        &dn_t,
+        &Tensor::from_f32(Shape::new([n, hidden]), dn_d),
+        0.0,
+        "dense down matmul parity",
+    );
+    eprintln!("dense_chain_parity: matmul/swiglu/down all bit-exact — operator level OK");
+}

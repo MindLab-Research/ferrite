@@ -783,6 +783,13 @@ fn mega_chain_dev(
             n,
             hidden,
         )?;
+        if probe && layer_idx < 3 && matches!(plan.mlp, MlpKind::Dense) {
+            let mut pv = vec![0f32; hidden];
+            if hfn.download(&mut pv).is_ok() {
+                let mx = pv.iter().fold(0f32, |acc, x| acc.max(x.abs()));
+                eprintln!("[mega] L{layer_idx:02} hfn in={mx:.4}");
+            }
+        }
         // D: FFN (MoE or Dense) → NCCL all-reduce
         let partial2 = match plan.mlp {
             MlpKind::Moe => {
@@ -821,7 +828,7 @@ fn mega_chain_dev(
                 let g = cuda.matmul_dev(&hfn, w_gate, n as i32, hi, inter)?;
                 let u = cuda.matmul_dev(&hfn, w_up, n as i32, hi, inter)?;
                 let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, cfg.swiglu_limit)?;
-                if probe && dev_id == 0 && layer_idx < 3 {
+                if probe && layer_idx < 3 {
                     let mm = |b: &ferrite_kernel::cuda::DevBuf| -> f32 {
                         let mut pv = vec![0f32; b.len];
                         if b.download(&mut pv).is_ok() {
