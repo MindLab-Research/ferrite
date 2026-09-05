@@ -123,6 +123,10 @@ extern "C" {
                               out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                               topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
+    fn ferrite_mtp_commit(k_pin: *const i32, plan: *const *const f32,
+                          n_plans: i32, conv_len: i32, gdn_len: i32,
+                          hf_v: *const f32, hprev: *mut f32,
+                          hidden: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
                       li: *mut f32, post: *mut f32, comb: *mut f32,
@@ -397,6 +401,25 @@ pub struct MtpState {
     /// per-GDN-layer (conv, gdn, conv0, gdn0, conv1, gdn1): B = full verify
     /// state, B0 = t=0 snapshot (accept-1), B1 = t=1 snapshot (accept-2, n=3).
     pub scratch: Vec<(DevBuf, DevBuf, DevBuf, DevBuf, DevBuf, DevBuf)>,
+    /// Single-kernel accept-commit plan: device-resident [n_gdn][8] pointer
+    /// table (conv_a, gdn_a, conv_b, gdn_b, conv_b0, gdn_b0, conv_b1,
+    /// gdn_b1) + a pinned k slot. One ferrite_mtp_commit launch replaces
+    /// 2*n_gdn cudaMemcpyAsync D2Ds + the hprev row select.
+    pub commit: Option<MtpCommitPlan>,
+}
+
+/// Device-resident commit pointer table for ferrite_mtp_commit. `plan`
+/// packs 8 device pointers per GDN layer as f32 bit patterns (DevBuf is
+/// f32-typed; 2 f32 per pointer). `k_pin` is a 4-byte cudaMallocHost slot —
+/// the kernel reads it zero-copy at run time (k is only known AFTER the
+/// verify graph replay returns argmax, so it cannot be baked into a graph).
+pub struct MtpCommitPlan {
+    pub plan: DevBuf,
+    pub k_pin: *mut i32,
+    pub n: usize,
+    pub conv_len: usize,
+    pub gdn_len: usize,
+    pub hidden: usize,
 }
 
 pub struct CudaBackend {
@@ -2581,6 +2604,19 @@ pub fn capture_lock() -> &'static std::sync::Mutex<()> {
 }
 
 impl CudaBackend {
+    /// Pin 4 bytes of host memory (zero-copy kernel read slot — the MTP
+    /// commit kernel's k). cudaMallocHost'd; freed with cudaFreeHost when
+    /// the backend drops (pool-free by design: one slot per seq lifetime).
+    pub fn pinned_i32(&self) -> Result<*mut i32> {
+        let mut p: *mut i32 = std::ptr::null_mut();
+        ck(
+            unsafe { cudaMallocHost(&mut p as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) },
+            "pinned_i32",
+        )?;
+        unsafe { *p = 0 };
+        Ok(p)
+    }
+
     /// Argmax over the last dim of a device buffer [n, dim] → out [n].
     /// Device-to-device (the Tensor-level path downloaded the full logits
     /// row — 620KB for GLM's 154880 vocab).
@@ -2763,6 +2799,45 @@ impl CudaBackend {
                 self.stream,
             )
         }, "copy_raw_dev")?;
+        Ok(())
+    }
+
+    /// MTP accept commit (single launch): writes k to the pinned slot
+    /// (zero-copy kernel read) and fires ferrite_mtp_commit — the kernel
+    /// selects B_k per GDN layer (k=3 -> B, 2 -> B1, 1 -> B0), copies it
+    /// back to the main state A, and sets hprev <- hf_v row (k-1) for the
+    /// next draft step. Replaces 2*n_gdn cudaMemcpyAsync launches + the
+    /// hprev select. Graph-unsafe (pinned k write) — always called OUTSIDE
+    /// captures, right after the verify replay's D2H sync.
+    pub fn mtp_commit(&self, k: i32) -> Result<()> {
+        let m = self.mtp.lock().unwrap();
+        let m = m
+            .as_ref()
+            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+        let cp = m
+            .commit
+            .as_ref()
+            .ok_or_else(|| FerriteError::Config("mtp commit plan missing".into()))?;
+        unsafe {
+            *cp.k_pin = k;
+        }
+        self.enter();
+        ck(
+            unsafe {
+                ferrite_mtp_commit(
+                    cp.k_pin as *const i32,
+                    cp.plan.as_f32() as *const *const f32,
+                    cp.n as i32,
+                    cp.conv_len as i32,
+                    cp.gdn_len as i32,
+                    m.hf_v.as_const_f32(),
+                    m.hprev.as_f32(),
+                    cp.hidden as i32,
+                    self.stream,
+                )
+            },
+            "mtp_commit",
+        )?;
         Ok(())
     }
 }

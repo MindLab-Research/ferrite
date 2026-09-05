@@ -3211,3 +3211,63 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
     }
     return le;
 }
+
+// ============================================================
+// MTP accept commit (single launch): replaces the per-layer
+// cudaMemcpyAsync ping-pong chain (2 memcpys x n_gdn_layers + hprev
+// select = ~70 launches/step of pure launch overhead) with ONE kernel.
+// k (1..3, the accept length) is read from a PINNED host int at run
+// time (zero-copy): the verify graph replay returns argmax to the
+// host, the host computes k, then launches this kernel.
+// plan: [n_plans][8] device-resident pointer table per GDN layer:
+//   [0]=conv_a(dst) [1]=gdn_a(dst) [2]=conv_b [3]=gdn_b
+//   [4]=conv_b0 [5]=gdn_b0 [6]=conv_b1 [7]=gdn_b1
+// k=3 commits B (full verify state), k=2 B1 (A+t_last+d1), k=1 B0
+// (A+t_last). Tail segment: hprev <- hf_v row (k-1).
+// ============================================================
+__global__ void mtp_commit_kernel(const int* __restrict__ k_pin,
+                                   const float* const* __restrict__ plan,
+                                   int n_plans, int conv_len, int gdn_len,
+                                   const float* __restrict__ hf_v,
+                                   float* __restrict__ hprev, int hidden) {
+    __shared__ int ks;
+    if (threadIdx.x == 0) ks = *k_pin;
+    __syncthreads();
+    const int k = ks; // 1..3
+    const int row = conv_len + gdn_len;
+    const long lay = (long)n_plans * row;
+    const long total = lay + hidden;
+    for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+         idx += (long)gridDim.x * blockDim.x) {
+        if (idx < lay) {
+            int l = (int)(idx / row);
+            int r = (int)(idx - (long)l * row);
+            const float* const* p = plan + (size_t)l * 8;
+            if (r < conv_len) {
+                const float* src = (k == 3) ? p[2] : (k == 2) ? p[6] : p[4];
+                p[0][r] = src[r];
+            } else {
+                int rr = r - conv_len;
+                const float* src = (k == 3) ? p[3] : (k == 2) ? p[7] : p[5];
+                p[1][rr] = src[rr];
+            }
+        } else {
+            int r = (int)(idx - lay);
+            hprev[r] = hf_v[(size_t)(k - 1) * hidden + r];
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
+                                          const float* const* plan,
+                                          int n_plans, int conv_len, int gdn_len,
+                                          const float* hf_v, float* hprev,
+                                          int hidden, cudaStream_t s) {
+    long total = (long)n_plans * (conv_len + gdn_len) + hidden;
+    int blocks = (int)((total + 1023) / 1024);
+    if (blocks > 4096) blocks = 4096;
+    if (blocks < 1) blocks = 1;
+    mtp_commit_kernel<<<blocks, 1024, 0, s>>>(k_pin, plan, n_plans, conv_len,
+                                             gdn_len, hf_v, hprev, hidden);
+    return cudaGetLastError();
+}

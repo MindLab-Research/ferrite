@@ -538,7 +538,7 @@ impl<B: KernelBackend> TpCluster<B> {
             let t0 = std::time::Instant::now();
             let toks = Self::fan_out(&mut self.shards, |s| {
                 if mtp {
-                    Self::mtp_setup_bufs(s, &plans)?;
+                    Self::mtp_setup_bufs(s, &plans, seq)?;
                 }
                 let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
                 Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname, 1, vio.as_ref())
@@ -825,7 +825,9 @@ impl<B: KernelBackend> TpCluster<B> {
         };
         let t_draft = t_d.elapsed();
         let t_v = std::time::Instant::now();
-        // 2. verify: scratch A→B copy-in + dsa advance(2) + mega_v replay → argmax[2]
+        // 2. verify: dsa advance(3) + mega_v replay (the A→B ping-pong
+        //    copy-in is graph-recorded — capture-time nodes, not a host
+        //    memcpy loop) → argmax[3] → fused accept/commit.
         let h2v = self.shards[0].embed(&[last, d1 as u32, d2 as u32]);
         let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
         let toks_v = Self::fan_out(&mut self.shards, |s| {
@@ -834,25 +836,6 @@ impl<B: KernelBackend> TpCluster<B> {
                 .as_cuda()
                 .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
             cuda.enter();
-            let la = &s.cfg.linear_attn;
-            let proj = la.num_heads * la.head_dim;
-            let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
-            let gdn_len = la.num_heads * la.head_dim * la.head_dim;
-            {
-                let m = cuda.mtp.lock().unwrap();
-                let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                let mut gi = 0usize;
-                for plan in plans {
-                    if matches!(plan.attn, AttnKind::Linear) {
-                        let (cb, gb, _, _, _, _) = &m.scratch[gi];
-                        let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
-                        cuda.copy_raw_dev(aptr as *const f32, cb.as_f32(), conv_len)?;
-                        let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
-                        cuda.copy_raw_dev(gptr as *const f32, gb.as_f32(), gdn_len)?;
-                        gi += 1;
-                    }
-                }
-            }
             for f in 0..num_dsa {
                 // advance(3): append this step's verify input [t_last, d1, d2].
                 cuda.dsa_host_advance(seq, f, 3);
@@ -861,72 +844,36 @@ impl<B: KernelBackend> TpCluster<B> {
             if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
                 return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
             }
-            Ok((out[0], out[1], out[2]))
-        })
-        .into_iter()
-        .collect::<Result<Vec<(f32, f32, f32)>>>()?;
-        let (a0, a1, a2) = toks_v[0];
-        let t_verify = t_v.elapsed();
-        let t_c = std::time::Instant::now();
-        // 3. accept: longest prefix of (d1, d2) vs (a0, a1); k = 1/2/3.
-        // k=3: d1==a0 && d2==a1 (3 tokens: d1, d2, bonus a2; commit B full)
-        // k=2: d1==a0, d2!=a1 (2 tokens: d1, bonus a1; commit B1 = A+t_last+d1)
-        // k=1: d1!=a0 (1 token: a0; commit B0 = A+t_last)
-        let k = if d1 as u32 == a0 as u32 {
-            if d2 as u32 == a1 as u32 { 3 } else { 2 }
-        } else { 1 };
-        let dbg = std::env::var_os("FERRITE_MTP_DEBUG").is_some();
-        if dbg {
-            eprintln!("[mtp] d1={:?} d2={:?} a0={:?} a1={:?} a2={:?} -> accept{}", d1 as u32, d2 as u32, a0 as u32, a1 as u32, a2 as u32, k);
-        }
-        // B_k commit source indices into the 6-tuple scratch (conv, gdn, conv0, gdn0, conv1, gdn1):
-        // k=3 -> B (.0/.1), k=2 -> B1 (.4/.5), k=1 -> B0 (.2/.3)
-        let (ci, gi) = match k { 3 => (0usize, 1usize), 2 => (4usize, 5usize), _ => (2usize, 3usize) };
-        Self::fan_out(&mut self.shards, |s| {
-            let cuda = s
-                .backend
-                .as_cuda()
-                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-            cuda.enter();
-            // rollback the REJECTED tail of the verify append (3 tokens appended,
-            // keep k) and the rejected draft appends (2 draft tokens, keep k-1).
+            // Accept + commit fused into the verify worker (was a THIRD
+            // fan_out round-trip): d1/d2/argmax are bit-identical across
+            // ranks, so every worker derives the same k. DSA rollback is
+            // host pinned bookkeeping (ns); the B_k -> A ping-pong commit +
+            // hprev <- hf_v[k-1] is ONE ferrite_mtp_commit launch (was
+            // 2*n_gdn cudaMemcpyAsync D2Ds launched from the host loop).
+            let k = if d1 as u32 == out[0] as u32 {
+                if d2 as u32 == out[1] as u32 { 3 } else { 2 }
+            } else { 1 };
             for f in 0..num_dsa {
                 cuda.dsa_host_rollback(seq, f, (3 - k) as usize);
             }
             cuda.dsa_host_rollback(seq, mtp_family, (3 - k) as usize);
-            let la = &s.cfg.linear_attn;
-            let proj = la.num_heads * la.head_dim;
-            let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
-            let gdn_len = la.num_heads * la.head_dim * la.head_dim;
-            {
-                let m = cuda.mtp.lock().unwrap();
-                let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                let mut idx = 0usize;
-                for plan in plans {
-                    if matches!(plan.attn, AttnKind::Linear) {
-                        let sc = &m.scratch[idx];
-                        let (cb, gb) = (&sc.0, &sc.1); // B (full)
-                        let (cb0, gb0) = (&sc.2, &sc.3); // B0 = A+t_last
-                        let (cb1, gb1) = (&sc.4, &sc.5); // B1 = A+t_last+d1
-                        let (cc, gc) = match k {
-                            3 => (cb, gb),
-                            2 => (cb1, gb1),
-                            _ => (cb0, gb0),
-                        };
-                        let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
-                        cuda.copy_raw_dev(cc.as_const_f32(), aptr, conv_len)?;
-                        let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
-                        cuda.copy_raw_dev(gc.as_const_f32(), gptr, gdn_len)?;
-                        idx += 1;
-                    }
-                }
-                // hprev <- hf_v row k-1 (the last accepted position's h)
-                cuda.copy_dev(&m.hf_v, (k - 1) * hidden, m.hprev.as_f32(), hidden)?;
-            }
-            Ok::<(), FerriteError>(())
+            cuda.mtp_commit(k)?;
+            Ok((out[0], out[1], out[2], k))
         })
         .into_iter()
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Result<Vec<(f32, f32, f32, i32)>>>()?;
+        let (a0, a1, a2, k) = toks_v[0];
+        let t_verify = t_v.elapsed();
+        let t_c = std::time::Instant::now();
+        // 3. accept: longest prefix of (d1, d2) vs (a0, a1); k = 1/2/3
+        // (computed per-rank inside the verify worker — bit-identical inputs).
+        // k=3: d1==a0 && d2==a1 (3 tokens: d1, d2, bonus a2; commit B full)
+        // k=2: d1==a0, d2!=a1 (2 tokens: d1, bonus a1; commit B1 = A+t_last+d1)
+        // k=1: d1!=a0 (1 token: a0; commit B0 = A+t_last)
+        let dbg = std::env::var_os("FERRITE_MTP_DEBUG").is_some();
+        if dbg {
+            eprintln!("[mtp] d1={:?} d2={:?} a0={:?} a1={:?} a2={:?} -> accept{}", d1 as u32, d2 as u32, a0 as u32, a1 as u32, a2 as u32, k);
+        }
         match k {
             3 => {
                 for s in &mut self.shards {
@@ -972,8 +919,8 @@ impl<B: KernelBackend> TpCluster<B> {
     /// per-GDN-layer (conv, gdn) ping-pong B scratch. Called once before the
     /// mega graph captures (fixed addresses for graph lifetime).
     #[cfg(feature = "cuda")]
-    fn mtp_setup_bufs(s: &mut Engine<B>, plans: &[ferrite_model::LayerPlan]) -> Result<()> {
-        use ferrite_kernel::cuda::{DevBuf, MtpState};
+    fn mtp_setup_bufs(s: &mut Engine<B>, plans: &[ferrite_model::LayerPlan], seq: u64) -> Result<()> {
+        use ferrite_kernel::cuda::{DevBuf, MtpCommitPlan, MtpState};
         let cuda = s
             .backend
             .as_cuda()
@@ -1000,7 +947,43 @@ impl<B: KernelBackend> TpCluster<B> {
         let hf_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
         let hf_v = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 3 * hidden)?;
         let hprev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-        *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch });
+        // Single-kernel accept-commit plan: per GDN layer the 8-pointer table
+        // (conv_a, gdn_a, conv_b, gdn_b, conv_b0, gdn_b0, conv_b1, gdn_b1)
+        // packed as f32 bit patterns (DevBuf is f32-typed; 2 f32 per
+        // pointer) + a pinned k slot. The A-side pointers come from the
+        // seq's recurrent-state stores (fixed for the seq's lifetime —
+        // also what the verify graph's recorded A→B copy-in nodes use).
+        // This allocates the A states now if not yet warm (idempotent
+        // dev_state lookup).
+        let mut flat: Vec<f32> = Vec::with_capacity(scratch.len() * 16);
+        let mut n_plans = 0usize;
+        for plan in plans {
+            if matches!(plan.attn, AttnKind::Linear) {
+                let a_conv = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
+                let a_gdn = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
+                let (cb, gb, cb0, gb0, cb1, gb1) = &scratch[n_plans];
+                for p in [
+                    a_conv,
+                    a_gdn,
+                    cb.as_f32(),
+                    gb.as_f32(),
+                    cb0.as_f32(),
+                    gb0.as_f32(),
+                    cb1.as_f32(),
+                    gb1.as_f32(),
+                ] {
+                    let bits = p as usize as u64;
+                    flat.push(f32::from_bits((bits & 0xffff_ffff) as u32));
+                    flat.push(f32::from_bits((bits >> 32) as u32));
+                }
+                n_plans += 1;
+            }
+        }
+        let plan_buf = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), flat.len())?;
+        plan_buf.upload(flat.as_slice())?;
+        let k_pin = cuda.pinned_i32()?;
+        let commit = MtpCommitPlan { plan: plan_buf, k_pin, n: n_plans, conv_len, gdn_len, hidden };
+        *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch, commit: Some(commit) });
         Ok(())
     }
 
@@ -1133,6 +1116,34 @@ fn mega_chain_dev(
     };
     if capture {
         cuda.graph_capture_begin();
+    }
+
+    // MTP verify chain: record the A→B ping-pong copy-in as the FIRST graph
+    // nodes — every replay refreshes B from the committed A state before the
+    // layer chain writes it. A (per-seq recurrent states) and B (MtpState
+    // scratch) are fixed addresses for the graph's lifetime, so the D2D
+    // memcpys are capture-stable. This removes the host loop of
+    // 2*n_gdn cudaMemcpyAsync launches from every step (was ~1ms + fan_out
+    // round-trips). Only captured (replayed); the dry-run skips it — B
+    // holding stale data there is fine (dry output is discarded).
+    if let Some(v) = verify {
+        if capture {
+            let la = &cfg.linear_attn;
+            let proj = la.num_heads * la.head_dim;
+            let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
+            let gdn_len = la.num_heads * la.head_dim * la.head_dim;
+            let mut gi = 0usize;
+            for plan in plans {
+                if matches!(plan.attn, AttnKind::Linear) {
+                    let (cb, gb, _, _, _, _) = v.gdn_scratch[gi];
+                    let aptr = cuda.conv_state_ptr(seq, plan.layer_idx, conv_len)?;
+                    let gptr = cuda.gdn_state_ptr(seq, plan.layer_idx, gdn_len)?;
+                    cuda.copy_raw_dev(aptr as *const f32, cb, conv_len)?;
+                    cuda.copy_raw_dev(gptr as *const f32, gb, gdn_len)?;
+                    gi += 1;
+                }
+            }
+        }
     }
 
     let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
