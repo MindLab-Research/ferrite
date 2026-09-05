@@ -1176,7 +1176,13 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                                 // copies from this buffer, but GPU ops are ASYNC.
                                 // Without the sync, rank 0 reads stale/uninitialized data.
                                 cuda.sync()?;
-                                Ok(partial.as_f32() as usize)
+                                // CRITICAL: forget the partial DevBuf — it goes
+                                // back to the pool on drop, and P2P all-reduce's
+                                // staging allocation might reuse the SAME memory
+                                // (read+write same address = data corruption).
+                                let ptr = partial.as_f32() as usize;
+                                std::mem::forget(partial);
+                                Ok(ptr)
                             }
                             #[cfg(not(feature = "cuda"))]
                             { unreachable!() }
@@ -1213,7 +1219,10 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                                 let partial = cuda.dsa_layer_dev(&x_dev, &w, seq, family, n, hidden)?;
                                 // Sync before P2P copy (GPU ops are async)
                                 cuda.sync()?;
-                                Ok(partial.as_f32() as usize)
+                                // CRITICAL: forget the DevBuf — pool reuse race with P2P staging
+                                let ptr = partial.as_f32() as usize;
+                                std::mem::forget(partial);
+                                Ok(ptr)
                             }
                             #[cfg(not(feature = "cuda"))]
                             { unreachable!() }
@@ -1358,7 +1367,10 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                         let d = cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?;
                         // Sync before P2P copy (GPU ops are async)
                         cuda.sync()?;
-                        Ok(d.as_f32() as usize)
+                        // CRITICAL: forget the DevBuf — pool reuse race with P2P staging
+                        let ptr = d.as_f32() as usize;
+                        std::mem::forget(d);
+                        Ok(ptr)
                     }
                     MlpKind::Moe => {
                         // MoE: graph fast path or direct fused chain
@@ -1441,7 +1453,10 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                         )?;
                         // Sync before P2P copy (GPU ops are async)
                         cuda.sync()?;
-                        Ok(out_dev.as_f32() as usize)
+                        // CRITICAL: forget the DevBuf — pool reuse race with P2P staging
+                        let ptr = out_dev.as_f32() as usize;
+                        std::mem::forget(out_dev);
+                        Ok(ptr)
                     }
                 }
             });
