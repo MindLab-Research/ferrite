@@ -145,6 +145,15 @@ extern "C" {
                                q: *mut f32, k: *mut f32, v: *mut f32,
                                beta: *mut f32, gate: *mut f32,
                                h: i32, dk: i32, lb: f32, stream: CuStream) -> i32;
+    fn ferrite_gemv_qkv_conv(x: *const f32, w: *const std::ffi::c_void,
+                             cw: *const f32, cs: *mut f32,
+                             q: *mut f32, k: *mut f32, v: *mut f32,
+                             in_f: i32, proj: i32, stream: CuStream) -> i32;
+    fn ferrite_gdn_step_v2p(q: *const f32, k: *const f32, v: *const f32,
+                            b_raw: *const f32, fb: *const f32, dt_bias: *const f32,
+                            a_log: *const f32, lb: f32,
+                            state: *mut f32, out: *mut f32,
+                            h: i32, dk: i32, dv: i32, stream: CuStream) -> i32;
     fn cudaMemset(ptr: *mut std::ffi::c_void, val: i32, bytes: usize) -> i32;
 }
 
@@ -1515,7 +1524,13 @@ impl CudaBackend {
         // smem kernel's throughput; graph-replay has no launch tail to
         // save) — kept separate. gemv5_dev stays for a future tiled fused
         // version (weight concat at load time).
-        let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
+        // knife 1b (n==1): the qkv GEMV's epilogue does conv FIR + silu +
+        // window slide inline (gemv_qkv_conv) — no qkv buffer materialized.
+        let qkv = if n > 1 {
+            Some(self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?)
+        } else {
+            None
+        };
         // PROBE: dump x (input) + qkv (first matmul output) — pinpoints
         // divergence to upload (x wrong) vs matmul/weights (qkv wrong)
         if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
@@ -1528,7 +1543,7 @@ impl CudaBackend {
             let _ = x.download(&mut xh);
             d("x", &xh);
             let mut qh = vec![0f32; n * 3 * proj];
-            let _ = qkv.download(&mut qh);
+            let _ = qkv.as_ref().unwrap().download(&mut qh);
             d("qkv", &qh);
             eprintln!("[gdn_probe] dev L0 x/qkv dumped: x {} qkv {} (n={} proj={})", xh.len(), qh.len(), n, proj);
         }
@@ -1560,28 +1575,26 @@ impl CudaBackend {
         let dw_dt = self.dev_weight(w.dt_bias)?;
         let dw_al = self.dev_weight(w.a_log)?;
         if n == 1 {
-            // FUSED decode path (34 gdn layers × 2 kernels → 1): conv FIR +
-            // sliding-window state update + silu/split/L2/beta/gate prep in a
-            // single kernel — kills the conv_out HBM round-trip and one
-            // kernel-boundary cost per layer.
+            // knife 1b: qkv GEMV epilogue does conv FIR + silu + window slide
+            // inline — q/k/v come out raw (un-L2'd); gdn_step_v2p's prologue
+            // computes L2/gate/beta. Kills the standalone conv_prep node.
+            let dw_qkv = self.dev_weight_bf16(w.qkv_proj)?;
             ck(
                 unsafe {
-                    ferrite_conv_prep_fused(
-                        qkv.as_const_f32(), dw_conv.as_const_f32(), conv_state,
-                        b_raw.as_const_f32(), fb.as_const_f32(),
-                        dw_dt.as_const_f32(), dw_al.as_const_f32(),
-                        q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
-                        h as i32, dk as i32, lb, self.stream,
+                    ferrite_gemv_qkv_conv(
+                        x.as_const_f32(), dw_qkv.ptr, dw_conv.as_const_f32(), conv_state,
+                        q.as_f32(), k.as_f32(), v.as_f32(),
+                        hidden as i32, proj as i32, self.stream,
                     )
                 },
-                "conv_prep_fused",
+                "gemv_qkv_conv",
             )?;
         } else {
             let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
             ck(
                 unsafe {
                     ferrite_causal_conv1d(
-                        qkv.as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                        qkv.as_ref().unwrap().as_const_f32(), dw_conv.as_const_f32(), conv_state,
                         conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
                     )
                 },
@@ -1637,16 +1650,33 @@ impl CudaBackend {
         // v2: state staged in smem (padded stride dk+1) — HBM 7 passes → 2.
         let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;
         let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        ck(
-            unsafe {
-                ferrite_gdn_chunk_v2(
-                    q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
-                    beta.as_const_f32(), gate.as_const_f32(), self.dev_weight(w.a_log)?.as_const_f32(),
-                    gdn_state, core.as_f32(), ni, h as i32, dk as i32, dk as i32, self.stream,
-                )
-            },
-            "gdn_chunk_dev",
-        )?;
+        if n == 1 {
+            // knife 1b: v2p — prologue computes L2 norm, KDA gate and beta
+            // inline (from fb/dt_bias/a_log/b_raw), replacing conv_prep's
+            // second half. q/k arrive raw FIR+silu (un-L2'd).
+            ck(
+                unsafe {
+                    ferrite_gdn_step_v2p(
+                        q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
+                        b_raw.as_const_f32(), fb.as_const_f32(),
+                        dw_dt.as_const_f32(), dw_al.as_const_f32(), lb,
+                        gdn_state, core.as_f32(), h as i32, dk as i32, dk as i32, self.stream,
+                    )
+                },
+                "gdn_step_v2p",
+            )?;
+        } else {
+            ck(
+                unsafe {
+                    ferrite_gdn_chunk_v2(
+                        q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
+                        beta.as_const_f32(), gate.as_const_f32(), self.dev_weight(w.a_log)?.as_const_f32(),
+                        gdn_state, core.as_f32(), ni, h as i32, dk as i32, dk as i32, self.stream,
+                    )
+                },
+                "gdn_chunk_dev",
+            )?;
+        }
         // probe: core output NaN check
         if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 {
             let mut cb = vec![0f32; n * proj];
