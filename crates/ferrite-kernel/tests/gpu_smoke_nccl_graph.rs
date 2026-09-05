@@ -78,7 +78,8 @@ fn nccl_in_graph_all_reduce() {
                 wx.download(&mut got).unwrap();
                 for (i, g) in got.iter().enumerate() {
                     assert!(
-                        (g - (6.0 + (i % 7) as f32)).abs() < 1e-2,
+                        // sum over r of (r + i%7) = 6 + 4*(i%7)
+                        (g - (6.0 + 4.0 * (i % 7) as f32)).abs() < 1e-2,
                         "warmup allreduce wrong r{r} i{i}: {g}"
                     );
                 }
