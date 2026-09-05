@@ -989,6 +989,129 @@ extern "C" cudaError_t ferrite_sparse_attn(const float* q, const float* k,
 }
 
 // ============================================================
+// sparse_attn v2: v1 ran block=32 (ONE warp per (row, head)) over
+// topk = select_k*kpool+3 (~8K) slots — each lane did hundreds of
+// SERIAL SCALAR dots (d=128 each) and the dedup rescanned idx from
+// GLOBAL memory O(topk^2); the v-gather re-read idx dv/32 times.
+// v2 (256 threads/block): idx + scores + q in smem, float4 dots,
+// bitmap dedup (atomicOr test-and-set — same "first wins" semantics,
+// any duplicate slot yields the same key so the winner is arbitrary),
+// block-parallel softmax (warp shuffle + 8-warp smem), coalesced
+// weight × v gather. smem ≈ topk*8B + d*4 + 16KB bitmap — opt-in
+// dynamic smem for >48KB. Bitmap covers t ≤ 131072 (4096 words);
+// longer caches skip dedup for j beyond range (dup keys double-count
+// — acceptable for now, bench caches are ≤ 16K).
+// ============================================================
+__global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
+                                      const float* __restrict__ k,
+                                      const float* __restrict__ v,
+                                      const float* __restrict__ idx,
+                                      float* __restrict__ out,
+                                      int n, const int* __restrict__ t_ptr, int h, int d, int dv, int topk) {
+    int t = *t_ptr; // zero-copy pinned read (graph-safe)
+    int row = blockIdx.x;
+    int hd = blockIdx.y;
+    if (row >= n || hd >= h) return;
+    float scale = rsqrtf((float)d);
+    extern __shared__ float sm[];
+    int* idx_s = (int*)sm;                            // [topk]
+    float* sc = (float*)(idx_s + topk);               // [topk] scores → weights
+    float* qs = sc + topk;                             // [d]
+    float* red = qs + d;                              // [8] warp-partials (max/sum)
+    unsigned int* bm = (unsigned int*)(red + 8);       // [4096] dedup bitmap
+    const int bm_words_max = 4096;
+    int bm_words = (t + 31) >> 5; if (bm_words > bm_words_max) bm_words = bm_words_max;
+    // 0. preload: idx → smem, q head-slice → smem, clear bitmap
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) idx_s[s] = (int)idx[(size_t)row * topk + s];
+    for (int l = threadIdx.x; l < d; l += blockDim.x) qs[l] = q[((size_t)row * h + hd) * d + l];
+    for (int w0 = threadIdx.x; w0 < bm_words_max; w0 += blockDim.x) bm[w0] = 0u;
+    __syncthreads();
+    // 1. scores: float4 dot per slot; bitmap dedup (first wins — duplicate
+    // slots carry the same key, so which one survives is value-identical)
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+        int j = idx_s[s];
+        if (j < 0 || j >= t) { sc[s] = -INFINITY; continue; }
+        bool dup = false;
+        if ((j >> 5) < bm_words) {
+            unsigned int prev = atomicOr(&bm[j >> 5], 1u << (j & 31));
+            dup = (prev & (1u << (j & 31))) != 0;
+        }
+        if (dup) { sc[s] = -INFINITY; continue; }
+        const float4* k4 = reinterpret_cast<const float4*>(k + ((size_t)j * h + hd) * d);
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int l = 0; l + 3 < d; l += 4) {
+            float4 kk = k4[l >> 2];
+            float4 qq = *reinterpret_cast<const float4*>(qs + l);
+            acc.x += qq.x * kk.x; acc.y += qq.y * kk.y;
+            acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
+        }
+        float a = acc.x + acc.y + acc.z + acc.w;
+        for (int l = d & ~3; l < d; l++) a += qs[l] * k[((size_t)j * h + hd) * d + l];
+        sc[s] = a * scale;
+    }
+    __syncthreads();
+    // 2. softmax (block-wide max → exp → sum via warp shuffles + smem)
+    float m = -INFINITY;
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) m = fmaxf(m, sc[s]);
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 8) m = red[threadIdx.x];
+    for (int off = 4; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    __shared__ float ms_;
+    if (threadIdx.x == 0) ms_ = m;
+    __syncthreads();
+    m = ms_;
+    bool all_inf = (m == -INFINITY);
+    float sum = 0.f;
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+        sc[s] = all_inf ? 0.f : __expf(sc[s] - m);
+        sum += sc[s];
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 8) sum = red[threadIdx.x];
+    for (int off = 4; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    __shared__ float sum_;
+    if (threadIdx.x == 0) sum_ = sum;
+    __syncthreads();
+    float denom = sum_ + 1e-9f;
+    __syncthreads();
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) sc[s] /= denom;
+    __syncthreads();
+    // 3. weighted v-gather: coalesced over j2 (consecutive lanes → dv)
+    for (int j2 = threadIdx.x; j2 < dv; j2 += blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < topk; s++) {
+            float w = sc[s];
+            if (w == 0.f) continue; // padding / deduped slot (exp→0)
+            int j = idx_s[s];
+            if (j < 0 || j >= t) continue;
+            a += w * v[((size_t)j * h + hd) * dv + j2];
+        }
+        out[((size_t)row * h + hd) * dv + j2] = a;
+    }
+}
+
+extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q, const float* k,
+                                              const float* v, const float* idx,
+                                              float* out, int n, const int* t_ptr, int h, int d,
+                                              int dv, int topk, cudaStream_t s) {
+    dim3 block(256);
+    dim3 grid(n, h);
+    size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
+                  + 8 * sizeof(float) + 4096 * sizeof(unsigned int);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+    }
+    sparse_attn_v2_kernel<<<grid, block, smem, s>>>(q, k, v, idx, out, n, t_ptr, h, d, dv, topk);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // MHC hyper-connections (sglang-exact port; see ferrite-exec/src/mhc.rs
 // for the golden CPU math). hc_pre mixes the n residual flows into the
 // layer input; hc_post recombines the sublayer output back. One block
@@ -1865,6 +1988,24 @@ extern "C" cudaError_t ferrite_scale_inplace(float* x, float s, int n, cudaStrea
 // post-replay cudaEventElapsedTime gives the TRUE in-graph segment
 // times (the DRY sync-timing drains the async queue between layers,
 // so its per-segment numbers are contaminated by downstream work).
+// ============================================================
+// In-graph timing marker (FERRITE_MEGA_EVTS v2): CUDA events recorded
+// inside a graph cannot be used with cudaEventElapsedTime (verified:
+// single-test event_timing_graph path (b) → InvalidValue(1); events in
+// graphs are synchronization-only). Instead a 1-thread kernel reads
+// %globaltimer (chip-wide ns clock) into a u64 slot — replay updates
+// the buffer, host computes segment deltas post-replay.
+// ============================================================
+__global__ void mark_ts_kernel(unsigned long long* __restrict__ buf, int slot) {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    buf[slot] = t;
+}
+extern "C" cudaError_t ferrite_mark_ts(unsigned long long* buf, int slot, cudaStream_t s) {
+    mark_ts_kernel<<<1, 1, 0, s>>>(buf, slot);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_event_create(void** ev) {
     cudaEvent_t* e = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
     if (!e) return cudaErrorMemoryAllocation;

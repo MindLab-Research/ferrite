@@ -102,6 +102,9 @@ extern "C" {
     fn ferrite_sparse_attn(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
                            out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                            topk: i32, s: CuStream) -> i32;
+    fn ferrite_sparse_attn_v2(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
+                              out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
+                              topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
@@ -666,6 +669,31 @@ impl CudaBackend {
                                  std::ptr::null(), do_.as_f32(), in_f, out_f, self.stream)
         }, "gemv_v2_dev")?;
         Ok(do_)
+    }
+
+    /// sparse_attn v2 (256-thread block, float4 dots, smem idx/bitmap dedup):
+    /// the dsa attention core — v1 ran block=32 (ONE warp) over topk≈8K
+    /// slots with serial scalar dots + O(topk²) global idx rereads. Parity
+    /// tested against the CPU reference (dedup first-wins, padding, softmax)
+    /// in gpu_smoke::sparse_attn_v2_parity.
+    pub fn sparse_mla_attn_v2(&self, q: &Tensor, k_nope: &Tensor, v: &Tensor, idx: &Tensor, out: &mut Tensor) -> Result<()> {
+        self.enter();
+        let n = q.shape.0[0] as i32;
+        let t = k_nope.shape.0[0] as i32;
+        let h = q.shape.0[1] as i32;
+        let d = *q.shape.0.last().unwrap() as i32;
+        let dv = *v.shape.0.last().unwrap() as i32;
+        let topk = *idx.shape.0.last().unwrap() as i32;
+        let dq = DevBuf::alloc(self.dev, self.stream, q.numel())?; dq.upload(q.as_slice())?;
+        let dk = DevBuf::alloc(self.dev, self.stream, k_nope.numel())?; dk.upload(k_nope.as_slice())?;
+        let dv_ = DevBuf::alloc(self.dev, self.stream, v.numel())?; dv_.upload(v.as_slice())?;
+        let di = DevBuf::alloc(self.dev, self.stream, idx.numel())?; di.upload(idx.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
+        let t_ptr = &t as *const i32;
+        ck(unsafe { ferrite_sparse_attn_v2(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), n, t_ptr, h, d, dv, topk, self.stream) }, "sparse_attn_v2")?;
+        let ov = Arc::get_mut(&mut out.data).expect("unique out");
+        do_.download(ov)?;
+        Ok(())
     }
 
     /// Fused SwiGLU on device: reads two independent matmul outputs.
@@ -1684,10 +1712,12 @@ impl CudaBackend {
         )?;
 
         // 11. sparse attention: q [n,h,dk] × k [T,h,dk] × v [T,h,dv] → out [n, h*dv]
+        // v2: 256-thread block (v1 was 32 — one warp over topk≈8K slots with
+        // serial scalar dots + O(topk²) global idx rereads for dedup).
         let attn_out = DevBuf::alloc(self.dev, self.stream, n * h * dv)?;
         ck(
             unsafe {
-                ferrite_sparse_attn(
+                ferrite_sparse_attn_v2(
                     qb.as_const_f32(), k_nope_dev as *const f32, v_dev as *const f32, idx.as_const_f32(),
                     attn_out.as_f32(), ni, pinned_total, h as i32, dk as i32, dv as i32,
                     out_width as i32, self.stream,

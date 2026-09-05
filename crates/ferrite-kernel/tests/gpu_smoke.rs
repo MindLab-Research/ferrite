@@ -1057,3 +1057,64 @@ fn event_timing_graph() {
     eprintln!("[evt] in-graph: {:.3}ms (out={:.4})", ms_b, ob[0]);
     assert!(ms_b > 0.0, "in-graph elapsed must be > 0, got {ms_b}");
 }
+
+/// sparse_attn v2 parity: 256-thread block (v1 was 32 — one warp over
+/// topk≈8K slots with serial scalar dots + O(topk²) global idx rereads).
+/// CPU reference implements the exact semantics: padding (-1)/OOB → skip,
+/// duplicate idx → FIRST occurrence wins (scatter-add collapse), softmax,
+/// weighted v-gather. Covers d=16 (float4 path + tail), dup keys, -1 pads.
+#[test]
+fn sparse_attn_v2_parity() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let (n, h, d, dv, topk, t) = (1usize, 2usize, 16usize, 8usize, 8usize, 12usize);
+    let mut rnd = 0xbeef_cafe_1234_5678u64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    let q: Vec<f32> = (0..n * h * d).map(|_| r()).collect();
+    let k: Vec<f32> = (0..t * h * d).map(|_| r()).collect();
+    let v: Vec<f32> = (0..t * h * dv).map(|_| r()).collect();
+    // dups (3 twice, 7 twice) + padding (-1) + valid
+    let idx: Vec<f32> = vec![3.0, 3.0, -1.0, 7.0, 0.0, 11.0, 7.0, 2.0];
+    let q_t = Tensor::from_f32(Shape::new([n, h, d]), q.clone());
+    let k_t = Tensor::from_f32(Shape::new([t, h, d]), k.clone());
+    let v_t = Tensor::from_f32(Shape::new([t, h, dv]), v.clone());
+    let i_t = Tensor::from_f32(Shape::new([n, topk]), idx.clone());
+    let mut out = Tensor::from_f32(Shape::new([n, h * dv]), vec![0f32; n * h * dv]);
+    dev.sparse_mla_attn_v2(&q_t, &k_t, &v_t, &i_t, &mut out).unwrap();
+    let got = out.as_slice().to_vec();
+
+    // CPU reference
+    let scale = 1.0f32 / (d as f32).sqrt();
+    let mut refd = vec![0f32; n * h * dv];
+    for row in 0..n {
+        for hd in 0..h {
+            let mut sc = vec![-f32::INFINITY; topk];
+            let mut seen: Vec<i32> = Vec::new();
+            for s in 0..topk {
+                let j = idx[row * topk + s] as i32;
+                if j < 0 || j >= t as i32 { continue; }
+                if seen.contains(&j) { continue; } // first occurrence wins
+                seen.push(j);
+                let mut acc = 0f32;
+                for l in 0..d {
+                    acc += q[(row * h + hd) * d + l] * k[((j as usize) * h + hd) * d + l];
+                }
+                sc[s] = acc * scale;
+            }
+            let m = sc.iter().copied().fold(-f32::INFINITY, f32::max);
+            let den: f32 = sc.iter().map(|&x| if x == -f32::INFINITY { 0.0 } else { (x - m).exp() }).sum::<f32>() + 1e-9;
+            for s in 0..topk {
+                let j = idx[row * topk + s] as i32;
+                if j < 0 || j >= t as i32 || sc[s] == -f32::INFINITY { continue; }
+                let w = (sc[s] - m).exp() / den;
+                for j2 in 0..dv {
+                    refd[(row * h + hd) * dv + j2] += w * v[((j as usize) * h + hd) * dv + j2];
+                }
+            }
+        }
+    }
+    let mut maxd = 0f32;
+    for (a, b) in got.iter().zip(refd.iter()) { maxd = maxd.max((a - b).abs()); }
+    eprintln!("[sparse-v2] parity max_diff={maxd:.2e}");
+    assert!(maxd < 1e-4, "sparse_attn_v2 max_diff {maxd:.2e} too large");
+}
