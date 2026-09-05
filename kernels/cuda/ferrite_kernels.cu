@@ -2901,7 +2901,7 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot(
 // ============================================================
 __global__ void gemv_qkv_conv_kernel(const float* __restrict__ x,
                                      const __nv_bfloat16* __restrict__ w,
-                                     const __nv_bfloat16* __restrict__ cw,
+                                     const float* __restrict__ cw,
                                      float* __restrict__ cs,
                                      float* __restrict__ q,
                                      float* __restrict__ k,
@@ -2933,10 +2933,10 @@ __global__ void gemv_qkv_conv_kernel(const float* __restrict__ x,
     if (lane != 0) return;
     // ---- epilogue: conv FIR (3 window taps + new token) + slide + silu ----
     const float xv = acc;                       // new conv input token
-    float fir = __bfloat162float(cw[(size_t)row * 4 + 0]) * cs[(size_t)row * 3 + 0]
-              + __bfloat162float(cw[(size_t)row * 4 + 1]) * cs[(size_t)row * 3 + 1]
-              + __bfloat162float(cw[(size_t)row * 4 + 2]) * cs[(size_t)row * 3 + 2]
-              + __bfloat162float(cw[(size_t)row * 4 + 3]) * xv;
+    float fir = cw[(size_t)row * 4 + 0] * cs[(size_t)row * 3 + 0]
+              + cw[(size_t)row * 4 + 1] * cs[(size_t)row * 3 + 1]
+              + cw[(size_t)row * 4 + 2] * cs[(size_t)row * 3 + 2]
+              + cw[(size_t)row * 4 + 3] * xv;
     cs[(size_t)row * 3 + 0] = cs[(size_t)row * 3 + 1];
     cs[(size_t)row * 3 + 1] = cs[(size_t)row * 3 + 2];
     cs[(size_t)row * 3 + 2] = xv;
