@@ -874,8 +874,11 @@ impl<B: KernelBackend> TpCluster<B> {
                             gi += 1;
                         }
                     }
-                    // hprev ← hf_v row 1 (the accepted d1-position h)
-                    cuda.copy_dev(&m.hf_v, hidden, m.hprev.as_f32(), hidden)?;
+                    // hprev ← hf_v row 0 (t_last-position h — the NEXT step's
+                    // draft predicts t_last'=a1's next from h(a1)=this step's
+                    // verify t=0 output; NOT row 1 (d1's h — that's for a
+                    // draft-2 token, Phase 2)
+                    cuda.copy_dev(&m.hf_v, 0, m.hprev.as_f32(), hidden)?;
                 }
                 Ok::<(), FerriteError>(())
             })
