@@ -430,6 +430,11 @@ pub struct CudaBackend {
     graph_io: std::sync::Mutex<std::collections::HashMap<String, GraphIO>>,
     /// MTP speculative-decoding fixed buffers (see MtpState).
     pub mtp: std::sync::Mutex<Option<MtpState>>,
+    /// Per-row GEMV for small-n matmul (n==2) — ONLY the MTP verify chain
+    /// sets this: the n=2 tiled GEMM wastes a whole tile (verify 108ms vs
+    /// 23ms). Prefill MUST keep the GEMM (its row-batched accumulation
+    /// order sets the first greedy token; per-row flips it 背出师表→English).
+    pub small_n_rows: std::sync::atomic::AtomicBool,
 }
 
 // cudaStream_t is thread-safe (CUDA runtime serialises ops on a stream);
@@ -478,6 +483,7 @@ impl CudaBackend {
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
+            small_n_rows: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -705,16 +711,14 @@ impl CudaBackend {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
-        if n <= 2 {
+        if n == 1 || (n <= 2 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
             // Decode GEMV v2: uint4 vectorized + K-split WPR — 2.09x over v1
             // (bench gemv_v2_bench: 3.11→6.80TB/s lm_head, 2.20→3.91 o_proj,
             // all shapes 1.45-2.18x, maxd 3.8e-6). v1 kept for A/B.
-            // n<=2 (MTP verify n=2): per-row GEMV — the tiled GEMM wastes a
-            // whole tile on a 2-row batch (verify was 108ms vs 20ms n=1).
-            // NOTE: n>=3 keeps the GEMM — small prefill chunks (n=3/4) must
-            // keep the GEMM's accumulation order (row-batched) or the
-            // bf16 sum-order micro-delta flips the first greedy token
-            // (背出师表 flipped 先→The, output became an English gloss).
+            // n==2 per-row GEMV: ONLY under small_n_rows (the MTP verify chain
+            // — the tiled GEMM wastes a whole tile on 2 rows: 108ms vs 23ms).
+            // Prefill n>=2 keeps the GEMM unconditionally: its accumulation
+            // order sets the first greedy token (per-row flipped it).
             for r in 0..n {
                 ck(unsafe {
                     ferrite_gemv_bf16_v2(x_dev.as_const_f32().add(r as usize * in_f as usize), dw.ptr as *const _,

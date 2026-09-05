@@ -1058,6 +1058,11 @@ fn mega_chain_dev(
         .clone()
         .ok_or_else(|| FerriteError::Config("FERRITE_MEGA needs FERRITE_NCCL=1".into()))?;
     cuda.enter();
+    // MTP verify chain (n==2): per-row GEMV for the small-n matmuls (the
+    // tiled GEMM wastes a tile on 2 rows: 108ms vs 23ms). Prefill keeps the
+    // GEMM — its accumulation order sets the first greedy token (per-row
+    // GEMV flips 背出师表 recitation into an English gloss).
+    cuda.small_n_rows.store(verify.is_some(), std::sync::atomic::Ordering::Relaxed);
     let cfg = &s.cfg;
     let (hidden, hc_mult) = (cfg.hidden_size, cfg.hc_mult);
     let nh = hc_mult * hidden;
@@ -1411,6 +1416,7 @@ fn mega_chain_dev(
         // the pass's virtual t_count advance land exactly on the real cache
         // count (dry-run's tokens). replay-side dsa_host_advance keeps it
         // in lockstep from here on.
+        cuda.small_n_rows.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(Vec::new())
     } else {
         let mut tv = vec![0f32; n];
@@ -1438,6 +1444,7 @@ fn mega_chain_dev(
                 t_head
             );
         }
+        cuda.small_n_rows.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(tv)
     }
 }
