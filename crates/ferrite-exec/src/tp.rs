@@ -85,6 +85,14 @@ pub fn shard_weights_tp(
     let dsa_h = cfg.dsa.num_attention_heads;
     let (hs, he) = head_range(heads, rank, world);
     let (dhs, dhe) = head_range(dsa_h, rank, world);
+    // MTP (nextn) layer plan: DSA attention + MoE mlp — same shard rules
+    // as decoder DSA/MoE layers (eh_proj/enorm/hnorm/shared_head.norm
+    // handled by the replicated / column-split branches above).
+    let mtp_plan = ferrite_model::LayerPlan {
+        layer_idx: cfg.num_hidden_layers,
+        attn: AttnKind::Dsa,
+        mlp: MlpKind::Moe,
+    };
     let mut out = HashMap::new();
 
     for name in w.keys() {
@@ -95,6 +103,9 @@ pub fn shard_weights_tp(
             // the forward (simpler); the GPU path splits.
             t.clone()
         } else if name.starts_with("model.norm.weight")
+            || name.ends_with(".enorm.weight")
+            || name.ends_with(".hnorm.weight")
+            || name.ends_with(".shared_head.norm.weight")
             || name.ends_with("input_layernorm.weight")
             || name.ends_with("q_a_layernorm.weight")
             || name.ends_with("kv_a_layernorm.weight")
@@ -109,10 +120,21 @@ pub fn shard_weights_tp(
         {
             // replicated: norms over full hidden, MHC, router
             t.clone()
+        } else if name.ends_with(".eh_proj.weight") {
+            // MTP eh_proj [h, 2h]: column split — input is
+            // cat(enorm(embed), hnorm(h_prev)), each rank takes 2h/world cols
+            // (partial sums all-reduced in mtp_layer_dev).
+            let cols = t.shape.0[1];
+            col_split(t, cols * rank / world, cols * (rank + 1) / world)
         } else if let Some(layer_str) = layer_of(name) {
             let layer: usize = layer_str.parse().unwrap_or(0);
             let plan = build_layer_plans(cfg);
-            let lp = plan[layer];
+            let lp = if layer >= plan.len() {
+                // MTP (nextn) layer: DSA attention + MoE mlp (eh_proj handled above)
+                &mtp_plan
+            } else {
+                &plan[layer]
+            };
             shard_one_layer(name, t, cfg, &lp, rank, world, hs, he, dhs, dhe, h, proj, dk)
         } else {
             t.clone()

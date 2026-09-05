@@ -330,11 +330,13 @@ pub fn load_hf_checkpoint(
                 }
             };
             let lidx: usize = l.parse().unwrap_or(usize::MAX);
-            if lidx >= cfg.num_hidden_layers {
-                // MTP / nextn layer (ferrite runs the 45 decoder layers only)
+            if lidx > cfg.num_hidden_layers {
                 rep.skipped_unsupported.push(name.clone());
                 continue;
             }
+            // lidx == num_hidden_layers: the MTP (nextn) layer — eh_proj /
+            // enorm / hnorm / DSA attn / MoE mlp / shared_head.norm flow
+            // through the same name mapping as decoder layers.
             // shared_expert (ferrite) → shared_experts (checkpoint, plural)
             let r = r.replacen("shared_expert.", "shared_experts.", 1);
             format!("{lm}.layers.{l}.{r}")

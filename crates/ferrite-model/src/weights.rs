@@ -148,7 +148,25 @@ fn push_moe_mlp_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53FlashConf
     }
 }
 
-/// Build the full layout (embed, per-layer, final norm, lm_head).
+/// MTP (nextn) layer: eh_proj(cat(enorm(embed), hnorm(h_prev))) then a
+/// standard DSA-attn + MoE decoder layer; shared_head.norm before the tied
+/// lm_head. No MHC, no RoPE (nope-only DSA) — significantly simpler than
+/// the GDN decoder layers.
+fn push_mtp_layer_spans(dst: &mut Vec<WeightSpec>, pfx: &str, cfg: &Glm53FlashConfig) {
+    let h = cfg.hidden_size;
+    dst.push(spec(&format!("{pfx}.enorm.weight"), [h]));
+    dst.push(spec(&format!("{pfx}.hnorm.weight"), [h]));
+    dst.push(spec(&format!("{pfx}.eh_proj.weight"), [h, 2 * h]));
+    dst.push(spec(&format!("{pfx}.input_layernorm.weight"), [h]));
+    dst.push(spec(&format!("{pfx}.post_attention_layernorm.weight"), [h]));
+    let attn_pfx = format!("{pfx}.self_attn");
+    push_dsa_attn_spans(dst, &attn_pfx, cfg);
+    let mlp_pfx = format!("{pfx}.mlp");
+    push_moe_mlp_spans(dst, &mlp_pfx, cfg);
+    dst.push(spec(&format!("{pfx}.shared_head.norm.weight"), [h]));
+}
+
+/// Build the full layout (embed, per-layer, final norm, lm_head, MTP).
 pub fn weight_layout(cfg: &Glm53FlashConfig) -> WeightLayout {
     let h = cfg.hidden_size;
     let mut specs = Vec::new();
@@ -166,6 +184,10 @@ pub fn weight_layout(cfg: &Glm53FlashConfig) -> WeightLayout {
             MlpKind::Dense => push_dense_mlp_spans(&mut specs, &mlp_pfx, cfg),
             MlpKind::Moe => push_moe_mlp_spans(&mut specs, &mlp_pfx, cfg),
         }
+    }
+    if cfg.num_nextn_predict_layers > 0 {
+        let mtp_pfx = format!("model.layers.{}", cfg.num_hidden_layers);
+        push_mtp_layer_spans(&mut specs, &mtp_pfx, cfg);
     }
     specs.push(spec("model.norm.weight", [h]));
     specs.push(spec("lm_head.weight", [cfg.vocab_size, h]));
