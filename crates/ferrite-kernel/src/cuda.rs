@@ -89,6 +89,10 @@ extern "C" {
                          beta: *const f32, gate: *const f32, a_log: *const f32,
                          state: *mut f32, out: *mut f32,
                          n: i32, h: i32, dk: i32, dv: i32, s: CuStream) -> i32;
+    fn ferrite_gdn_chunk_v2(q: *const f32, k: *const f32, v: *const f32,
+                            beta: *const f32, gate: *const f32, a_log: *const f32,
+                            state: *mut f32, out: *mut f32,
+                            n: i32, h: i32, dk: i32, dv: i32, s: CuStream) -> i32;
     fn ferrite_gdn_chunk_wyf(q: *const f32, k: *const f32, v: *const f32,
                              beta: *const f32, gate: *const f32, a_log: *const f32,
                              state_in: *mut f32, out: *mut f32, state_out: *mut f32,
@@ -696,6 +700,34 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// gdn_step v2 parity hook (kernel-level): runs the v2 recurrent core
+    /// (state staged in smem, padded stride) and returns out + new state.
+    /// Golden is the sequential CPU recurrence in the gpu_smoke test.
+    pub fn gdn_step_v2_dev(&self, q: &Tensor, k: &Tensor, v: &Tensor, beta: &Tensor,
+                           gate: &Tensor, a_log: &Tensor, state_in: &Tensor, n: usize,
+                           h: usize, dk: usize, dv: usize,
+                           out: &mut Tensor, state_out: &mut Tensor) -> Result<()> {
+        self.enter();
+        let nn = n as i32;
+        let dq = DevBuf::alloc(self.dev, self.stream, q.numel())?; dq.upload(q.as_slice())?;
+        let dk_ = DevBuf::alloc(self.dev, self.stream, k.numel())?; dk_.upload(k.as_slice())?;
+        let dv_ = DevBuf::alloc(self.dev, self.stream, v.numel())?; dv_.upload(v.as_slice())?;
+        let db = DevBuf::alloc(self.dev, self.stream, beta.numel())?; db.upload(beta.as_slice())?;
+        let dg = DevBuf::alloc(self.dev, self.stream, gate.numel())?; dg.upload(gate.as_slice())?;
+        let dal = DevBuf::alloc(self.dev, self.stream, a_log.numel())?; dal.upload(a_log.as_slice())?;
+        let dst = DevBuf::alloc(self.dev, self.stream, state_in.numel())?; dst.upload(state_in.as_slice())?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
+        ck(unsafe { ferrite_gdn_chunk_v2(dq.as_const_f32(), dk_.as_const_f32(), dv_.as_const_f32(),
+                                         db.as_const_f32(), dg.as_const_f32(), dal.as_const_f32(),
+                                         dst.as_f32(), do_.as_f32(), nn, h as i32, dk as i32, dv as i32,
+                                         self.stream) }, "gdn_chunk_v2")?;
+        let ov = Arc::get_mut(&mut out.data).expect("unique out");
+        do_.download(ov)?;
+        let sv = Arc::get_mut(&mut state_out.data).expect("unique state_out");
+        dst.download(sv)?;
+        Ok(())
+    }
+
     /// Fused SwiGLU on device: reads two independent matmul outputs.
     pub fn swiglu2_dev(&self, gate: &DevBuf, up: &DevBuf, n: i32, inter: i32, limit: f32) -> Result<DevBuf> {
         let out = DevBuf::alloc(self.dev, self.stream, n as usize * inter as usize)?;
@@ -1045,7 +1077,7 @@ impl crate::KernelBackend for CudaBackend {
         // falls back to the exact per-token kernel inside the launcher.
         let dst_a = DevBuf::alloc(self.dev, self.stream, state_in.numel())?; dst_a.upload(state_in.as_slice())?;
         let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
-        ck(unsafe { ferrite_gdn_chunk(dq.as_const_f32(), dk_.as_const_f32(), dv_.as_const_f32(), db.as_const_f32(), dg.as_const_f32(), dal.as_const_f32(), dst_a.as_f32(), do_.as_f32(), n, h, dk, dv, self.stream) }, "gdn_chunk")?;
+        ck(unsafe { ferrite_gdn_chunk_v2(dq.as_const_f32(), dk_.as_const_f32(), dv_.as_const_f32(), db.as_const_f32(), dg.as_const_f32(), dal.as_const_f32(), dst_a.as_f32(), do_.as_f32(), n, h, dk, dv, self.stream) }, "gdn_chunk_v2")?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         let sv = Arc::get_mut(&mut state_out.data).expect("unique state");
@@ -1494,12 +1526,13 @@ impl CudaBackend {
             );
         }
         // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
-        // blocks read-modify-write their own slice; single buffer is safe)
+        // blocks read-modify-write their own slice; single buffer is safe).
+        // v2: state staged in smem (padded stride dk+1) — HBM 7 passes → 2.
         let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;
         let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         ck(
             unsafe {
-                ferrite_gdn_chunk(
+                ferrite_gdn_chunk_v2(
                     q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
                     beta.as_const_f32(), gate.as_const_f32(), self.dev_weight(w.a_log)?.as_const_f32(),
                     gdn_state, core.as_f32(), ni, h as i32, dk as i32, dk as i32, self.stream,

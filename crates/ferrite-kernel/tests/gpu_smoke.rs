@@ -1118,3 +1118,72 @@ fn sparse_attn_v2_parity() {
     eprintln!("[sparse-v2] parity max_diff={maxd:.2e}");
     assert!(maxd < 1e-4, "sparse_attn_v2 max_diff {maxd:.2e} too large");
 }
+
+/// gdn_step v2 parity: state staged in smem (padded stride dk+1) with
+/// block 512 — v1 swept the HBM state 7 times per token with block 128.
+/// Golden = the sequential CPU recurrence (decay → kS → delta → o).
+/// Covers dk=dv=128 (model shape, h=2/rank slice) AND odd dk=17/dv=13
+/// (padding/stripe math) with a 3-token chain (state dependency).
+#[test]
+fn gdn_step_v2_parity() {
+    for &(n, h, dk, dv) in &[(1usize, 2, 128, 128), (3usize, 2, 17, 13)] {
+        let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+        dev.enter();
+        let mut rnd = 0x5dee_ce6d_1234_0001u64;
+        let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+        let q: Vec<f32> = (0..n * h * dk).map(|_| r()).collect();
+        let k: Vec<f32> = (0..n * h * dk).map(|_| r()).collect();
+        let v: Vec<f32> = (0..n * h * dv).map(|_| r()).collect();
+        let beta: Vec<f32> = (0..n * h).map(|_| r() * 0.5 + 0.25).collect();
+        let gate: Vec<f32> = (0..n * h * dk).map(|_| r() * 0.2 - 0.3).collect();
+        let a_log: Vec<f32> = (0..h).map(|_| r() - 0.5).collect();
+        let mut state: Vec<f32> = (0..h * dk * dv).map(|_| r() * 0.2 - 0.1).collect();
+        let golden_state = state.clone();
+        let q_t = Tensor::from_f32(Shape::new([n, h, dk]), q.clone());
+        let k_t = Tensor::from_f32(Shape::new([n, h, dk]), k.clone());
+        let v_t = Tensor::from_f32(Shape::new([n, h, dv]), v.clone());
+        let b_t = Tensor::from_f32(Shape::new([n, h]), beta.clone());
+        let g_t = Tensor::from_f32(Shape::new([n, h, dk]), gate.clone());
+        let a_t = Tensor::from_f32(Shape::new([h]), a_log.clone());
+        let s_t = Tensor::from_f32(Shape::new([h, dk, dv]), state.clone());
+        let mut out = Tensor::from_f32(Shape::new([n, h * dv]), vec![0f32; n * h * dv]);
+        let mut s_out = Tensor::from_f32(Shape::new([h, dk, dv]), vec![0f32; h * dk * dv]);
+        dev.gdn_step_v2_dev(&q_t, &k_t, &v_t, &b_t, &g_t, &a_t, &s_t, n, h, dk, dv, &mut out, &mut s_out).unwrap();
+        let got_out = out.as_slice().to_vec();
+        let got_state = s_out.as_slice().to_vec();
+
+        // CPU golden: exact per-token recurrence (matches gdn_step_kernel math)
+        let mut gs = golden_state;
+        let mut gout = vec![0f32; n * h * dv];
+        for t in 0..n {
+            for hd in 0..h {
+                let S = &mut gs[hd * dk * dv..(hd + 1) * dk * dv];
+                let bt = beta[t * h + hd];
+                for i in 0..dk {
+                    let decay = (gate[(t * h + hd) * dk + i]).exp();
+                    if decay != 1.0 { for j in 0..dv { S[i * dv + j] *= decay; } }
+                }
+                let mut ks = vec![0f32; dv];
+                for j in 0..dv {
+                    let mut acc = 0f32;
+                    for i in 0..dk { acc += k[(t * h + hd) * dk + i] * S[i * dv + j]; }
+                    ks[j] = acc;
+                }
+                for i in 0..dk {
+                    let ki = k[(t * h + hd) * dk + i];
+                    for j in 0..dv { S[i * dv + j] += bt * ki * (v[(t * h + hd) * dv + j] - ks[j]); }
+                }
+                for j in 0..dv {
+                    let mut acc = 0f32;
+                    for i in 0..dk { acc += q[(t * h + hd) * dk + i] * S[i * dv + j]; }
+                    gout[(t * h + hd) * dv + j] = acc;
+                }
+            }
+        }
+        let mut mo = 0f32; let mut ms = 0f32;
+        for (a, b) in got_out.iter().zip(gout.iter()) { mo = mo.max((a - b).abs()); }
+        for (a, b) in got_state.iter().zip(gs.iter()) { ms = ms.max((a - b).abs()); }
+        eprintln!("[gdn-v2 n={n} h={h} dk={dk} dv={dv}] out maxd={mo:.2e} state maxd={ms:.2e}");
+        assert!(mo < 1e-4 && ms < 1e-4, "gdn_step_v2 n={n} dk={dk} out {mo:.2e} state {ms:.2e}");
+    }
+}

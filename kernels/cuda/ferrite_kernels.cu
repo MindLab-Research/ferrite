@@ -477,6 +477,109 @@ extern "C" cudaError_t ferrite_gdn_chunk(const float* q, const float* k,
 }
 
 // ============================================================
+// gdn_step v2: v1 kept the dk*dv state in HBM and swept it FOUR times
+// per token (decay R/W, kS read, delta R/W, o read — ~7 HBM passes over
+// 1MB/layer with h=16 TP4 ranks), one block per head with 128 threads.
+// v2 stages the state in SHARED memory (padded stride dv+1 = 129 —
+// bank-conflict-free for both row sweeps and column reductions), so HBM
+// traffic drops to load+store (2 passes) and every intermediate step
+// reads smem. Block 512 (4x intra-block parallelism). Same per-token
+// launch loop (decode n=1 → single launch; the state chain forbids
+// parallel tokens).
+// ============================================================
+__global__ void gdn_step_v2_kernel(const float* __restrict__ q,
+                                   const float* __restrict__ k,
+                                   const float* __restrict__ v,
+                                   const float* __restrict__ beta,
+                                   const float* __restrict__ gate,
+                                   const float* __restrict__ a_log,
+                                   float* __restrict__ state,
+                                   float* __restrict__ out,
+                                   int n, int h, int dk, int dv) {
+    int t = blockIdx.x;
+    int hd = blockIdx.y;
+    if (t >= n || hd >= h) return;
+    float bt = beta[(size_t)t * h + hd];
+    const size_t spitch = (size_t)dv + 1; // padded row stride (bank conflicts)
+    extern __shared__ float sm[];
+    float* S = sm;                          // [dk * (dv+1)]
+    float* ks = S + (size_t)dk * spitch;    // [dv]
+    float* kh = ks + dv;                    // [dk]
+    float* vh = kh + dk;                    // [dv]
+    float* qh = vh + dv;                    // [dk]
+    float* gh = qh + dk;                    // [dk]
+    // 0. load: state → smem (single HBM read), q/k/v/gate caches
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        gh[i] = gate[((size_t)t * h + hd) * dk + i];
+        qh[i] = q[((size_t)t * h + hd) * dk + i];
+        kh[i] = k[((size_t)t * h + hd) * dk + i];
+    }
+    for (int j = threadIdx.x; j < dv; j += blockDim.x)
+        vh[j] = v[((size_t)t * h + hd) * dv + j];
+    float* Sg = state + (size_t)hd * dk * dv;
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
+    __syncthreads();
+    // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+        float decay = expf(gh[i]);
+        if (decay != 1.0f) {
+            float* Si = S + (size_t)i * spitch;
+            for (int j = 0; j < dv; j++) Si[j] *= decay;
+        }
+    }
+    __syncthreads();
+    // 2. kS = S^T k
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
+        ks[j] = acc;
+    }
+    __syncthreads();
+    // 3. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
+            bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
+    __syncthreads();
+    // 4. o = q^T S
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
+        out[((size_t)t * h + hd) * dv + j] = acc;
+    }
+    __syncthreads();
+    // 5. store state back (single HBM write)
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+}
+
+extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
+                                            const float* v, const float* beta,
+                                            const float* gate, const float* a_log,
+                                            float* state, float* out,
+                                            int n, int h, int dk, int dv,
+                                            cudaStream_t s) {
+    size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
+                  + (size_t)(dv + dk + dv + dk + dk) * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gdn_step_v2_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+    }
+    for (int t = 0; t < n; t++) {
+        dim3 block(512);
+        dim3 grid(1, h, 1);
+        gdn_step_v2_kernel<<<grid, block, smem, s>>>(
+            q + (size_t)t * h * dk, k + (size_t)t * h * dk, v + (size_t)t * h * dv,
+            beta + (size_t)t * h, gate + (size_t)t * h * dk, a_log,
+            state, out + (size_t)t * h * dv, 1, h, dk, dv);
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) return e;
+    }
+    return cudaSuccess;
+}
+
+// ============================================================
 // WYF-parallel chunkwise Gated DeltaNet (ferrite-kernel/src/wyf.rs math):
 //   L[t,i] = Σ_{r≤t} gate[r,i]·a  (inclusive prefix, log-space)
 //   b_t = S₀ᵀ(k_t ⊙ e^{L_t})                       — state interaction
