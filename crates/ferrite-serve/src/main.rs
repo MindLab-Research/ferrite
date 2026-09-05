@@ -241,6 +241,11 @@ fn run_cuda(
         tp1.duration_since(tp0).as_secs_f32()
     );
     let mut out = Vec::new();
+    let mut prev_rt_len = cluster
+        .shards
+        .first()
+        .and_then(|s| s.seq_runtime(seq).map(|rt| rt.tokens.len()))
+        .unwrap_or(0);
     for i in 0..max_tokens {
         let tok = cluster
             .decode_step(seq)
@@ -248,7 +253,25 @@ fn run_cuda(
         if stop.contains(&tok) {
             break;
         }
-        out.push(tok);
+        // MTP: one decode step emits k=1..3 tokens (rt.tokens) — collect the
+        // FULL incremental stream, not just the step's last token (dropping
+        // accept-2/3's earlier tokens garbles the text mid-character).
+        if let Some(rt) = cluster.shards.first().and_then(|s| s.seq_runtime(seq)) {
+            let new_tokens: Vec<u32> = rt.tokens[prev_rt_len..].to_vec();
+            if !new_tokens.is_empty() {
+                if let Some(&last_new) = new_tokens.last() {
+                    if stop.contains(&last_new) {
+                        out.extend_from_slice(&new_tokens[..new_tokens.len() - 1]);
+                        prev_rt_len = rt.tokens.len();
+                        break;
+                    }
+                }
+                out.extend_from_slice(&new_tokens);
+                prev_rt_len = rt.tokens.len();
+            }
+        } else {
+            out.push(tok);
+        }
         if std::env::var_os("FERRITE_TRACE_TOK").is_some() {
             println!("[serve] tok {i}: {tok}");
         }
