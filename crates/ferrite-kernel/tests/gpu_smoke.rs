@@ -1302,10 +1302,15 @@ fn gemv_tri_parity() {
     let (y1, y2, y3) = dev.gemv_tri_dev(&xd, &w1_t, &w2_t, &w3_t, in_f as i32, o1 as i32, o2 as i32, o3 as i32).expect("tri");
     let mut g1 = vec![0f32; o1]; let mut g2 = vec![0f32; o2]; let mut g3 = vec![0f32; o3];
     y1.download(&mut g1).expect("d1"); y2.download(&mut g2).expect("d2"); y3.download(&mut g3).expect("d3");
-    let dot = |w: &[f32], o: usize| -> Vec<f32> {
-        (0..o).map(|r_| (0..in_f).map(|c| w[r_ * in_f + c] * x[c]).sum()).collect()
-    };
-    let (e1, e2, e3) = (dot(&w1, o1), dot(&w2, o2), dot(&w3, o3));
+    // golden: 3x gemv_v2 (same bf16 weights — isolates tri's segment mapping
+    // & K-split from the bf16 quantization itself, which matmul parity covers)
+    let mut xv0 = vec![0f32; in_f];
+    xv0.copy_from_slice(x_t.as_slice());
+    let g1_ = dev.gemv_v2_dev(&xd, &w1_t, 1, in_f as i32, o1 as i32).expect("v2a");
+    let g2_ = dev.gemv_v2_dev(&xd, &w2_t, 1, in_f as i32, o2 as i32).expect("v2b");
+    let g3_ = dev.gemv_v2_dev(&xd, &w3_t, 1, in_f as i32, o3 as i32).expect("v2c");
+    let mut e1 = vec![0f32; o1]; let mut e2 = vec![0f32; o2]; let mut e3 = vec![0f32; o3];
+    g1_.download(&mut e1).expect("d"); g2_.download(&mut e2).expect("d"); g3_.download(&mut e3).expect("d");
     let m = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
     let mx = m(&g1, &e1).max(m(&g2, &e2)).max(m(&g3, &e3));
     eprintln!("[gemv-tri] seg maxd y1={:.2e} y2={:.2e} y3={:.2e}", m(&g1, &e1), m(&g2, &e2), m(&g3, &e3));
