@@ -837,11 +837,14 @@ impl<B: KernelBackend> TpCluster<B> {
             }
             Ok(a1 as u32)
         } else {
-            // accept 1: bonus a0 — fallback to the normal decode graph (n=1)
-            // for a0's state step; DSA rollback(1) + advance(1) + MTP cache
-            // rollback (draft d1 rejected); hprev ← hf_dev row 0 (a0's h).
-            let h2f = self.shards[0].embed(&[a0 as u32]);
-            let in_vals1 = crate::mhc::hc_expand(&h2f, hc_mult);
+            // accept 1: bonus a0 only. NO fallback mega replay — the GDN state
+            // must stay at "before t_last" so the NEXT verify's t=0 slot does
+            // the one true advance of t_last (=a0). Running the fallback
+            // graph double-advances (fallback t_last + verify t=0 t_last)
+            // and the state corruption self-locks the token stream.
+            // Cache: verify appended [t_last, d1]; d1 was rejected → rollback 1.
+            // MTP draft cache: rollback the rejected d1 append.
+            // hprev ← hf_v row 0 (verify t=0's h = the accepted position).
             Self::fan_out(&mut self.shards, |s| {
                 let cuda = s
                     .backend
@@ -850,17 +853,12 @@ impl<B: KernelBackend> TpCluster<B> {
                 cuda.enter();
                 for f in 0..num_dsa {
                     cuda.dsa_host_rollback(seq, f, 1);
-                    cuda.dsa_host_advance(seq, f, 1);
                 }
                 cuda.dsa_host_rollback(seq, mtp_family, 1); // draft d1 rejected
-                let mut out = [0f32; 1];
-                if !cuda.graph_run(&gname, in_vals1.as_slice(), &mut out)? {
-                    return Err(FerriteError::InvalidArg(format!("mega graph {gname} missing")));
-                }
                 {
                     let m = cuda.mtp.lock().unwrap();
                     let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    cuda.copy_dev(&m.hf_dev, 0, m.hprev.as_f32(), hidden)?;
+                    cuda.copy_dev(&m.hf_v, 0, m.hprev.as_f32(), hidden)?;
                 }
                 Ok::<(), FerriteError>(())
             })
