@@ -1685,6 +1685,11 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 } else {
                     all_reduce_sum(&attn_partials.into_iter().collect::<Result<Vec<_>>>()?)
                 };
+                if std::env::var_os("FERRITE_AR_PROBE").is_some() && n == 1 {
+                    let mx = attn_out.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
+                    let kind = if matches!(plan.attn, AttnKind::Dsa) { "dsa" } else { "gdn" };
+                    eprintln!("[norm] L{layer_idx:02} {kind} ar  maxabs={mx:.4}");
+                }
                 (None, Some(attn_out))
             };
         let t_attn = std::time::Instant::now();
@@ -1914,6 +1919,11 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             } else {
                 all_reduce_sum(&ffn_partials.into_iter().collect::<Result<Vec<_>>>()?)
             };
+            if std::env::var_os("FERRITE_AR_PROBE").is_some() && n == 1 {
+                let mx = ffn_out.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
+                let kind = if matches!(plan.mlp, MlpKind::Moe) { "moe" } else { "dense" };
+                eprintln!("[norm] L{layer_idx:02} {kind} ar maxabs={mx:.4}");
+            }
             (None, Some(ffn_out))
         };
         let t_ffn = std::time::Instant::now();
