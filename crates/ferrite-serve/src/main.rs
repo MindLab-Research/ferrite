@@ -136,6 +136,12 @@ fn main() {
             Err(e) => eprintln!("[serve] pprof report build failed: {e}"),
         }
     }
+
+    // One-shot process: skip the exit-time teardown. Dropping the cluster
+    // (1.17TB of weights + 4 CUDA contexts) SEGFAULTS at exit (EXIT 139) —
+    // which also LOSES nsys's CUPTI activity buffers (no kernel data in
+    // the report). The OS reclaims everything anyway.
+    std::process::exit(0);
 }
 
 /// Single-process CPU inference (CpuBackend, f32).
