@@ -2676,3 +2676,66 @@ extern "C" cudaError_t ferrite_gemv5_bf16(const float* x,
         in_f, of1, of2, of3, of4, of5);
     return cudaGetLastError();
 }
+
+// ============================================================
+// PDL (Programmatic Dependent Launch) experiment: A→B dependency chain.
+// Normal launch: B waits for A's FULL completion (tail + memory flush)
+// before B's prologue starts. PDL (sm_90+): B launches early (A's
+// cudaTriggerProgrammaticLaunchCompletion), B's prologue (address calc,
+// smem init, independent loads) overlaps A's tail; B's
+// cudaGridDependencySynchronize() blocks until A's writes are visible.
+// ferrite_pdl_exp times iters× (A,B) chains both ways.
+// ============================================================
+__global__ void pdl_a_kernel(float* buf, int work_iters) {
+    cudaTriggerProgrammaticLaunchCompletion();  // release B's launch NOW
+    // main body (overlappable with B's prologue)
+    for (int i = threadIdx.x; i < 4096; i += blockDim.x) buf[i] = (float)(i + threadIdx.x);
+    for (int it = 0; it < work_iters; it++)
+        for (int i = threadIdx.x; i < 4096; i += blockDim.x) buf[i] = buf[i] * 1.0001f + 0.1f;
+}
+__global__ void pdl_b_kernel(const float* buf, float* out) {
+    // prologue: independent work (would otherwise sit idle behind A's tail)
+    float dummy = 0.f;
+    #pragma unroll 20
+    for (int it = 0; it < 2000; it++) dummy += it * 0.001f;
+    cudaGridDependencySynchronize();  // A's writes now visible
+    float acc = 0.f;
+    for (int i = threadIdx.x; i < 4096; i += blockDim.x) acc += buf[i];
+    if (dummy == 12345.678f) acc = -acc;  // keep prologue alive
+    atomicAdd(out, acc * 1e-9f);
+}
+extern "C" cudaError_t ferrite_pdl_exp(int mode, int iters, float* out_time_ms,
+                                       float* out_checksum, cudaStream_t s) {
+    float *d_a, *d_b;
+    cudaError_t e;
+    if ((e = cudaMalloc(&d_a, 4096 * sizeof(float))) != cudaSuccess) return e;
+    if ((e = cudaMalloc(&d_b, sizeof(float))) != cudaSuccess) { cudaFree(d_a); return e; }
+    cudaMemset(d_b, 0, sizeof(float));
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0, s);
+    for (int it = 0; it < iters; it++) {
+        if (mode == 1) {
+            cudaLaunchConfig_t cfg = {};
+            cfg.gridDim = dim3(1); cfg.blockDim = dim3(256); cfg.stream = s;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = 1;
+            cfg.attrs = attrs; cfg.numAttrs = 1;
+            cudaLaunchKernelEx(&cfg, pdl_a_kernel, d_a, 200);
+            cudaLaunchKernelEx(&cfg, pdl_b_kernel, (const float*)d_a, d_b);
+        } else {
+            pdl_a_kernel<<<1, 256, 0, s>>>(d_a, 200);
+            pdl_b_kernel<<<1, 256, 0, s>>>((const float*)d_a, d_b);
+        }
+    }
+    cudaEventRecord(e1, s);
+    cudaEventSynchronize(e1);
+    float ms;
+    cudaEventElapsedTime(&ms, e0, e1);
+    *out_time_ms = ms;
+    e = cudaMemcpy(out_checksum, d_b, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    cudaFree(d_a); cudaFree(d_b);
+    return e;
+}

@@ -60,6 +60,8 @@ extern "C" {
                             total_ptr: *const i32, n_fixed: i32,
                             s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
+    fn ferrite_pdl_exp(mode: i32, iters: i32, out_time_ms: *mut f32,
+                       out_checksum: *mut f32, s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_event_create(ev: *mut *mut std::ffi::c_void) -> i32;
     fn ferrite_event_record(ev: *mut std::ffi::c_void, s: CuStream) -> i32;
@@ -638,6 +640,19 @@ impl CudaBackend {
     /// This backend's CUDA stream (for NCCL comm init / external enqueue).
     pub fn stream_handle(&self) -> CuStream {
         self.stream
+    }
+
+    /// PDL (programmatic dependent launch) experiment: times iters× (A→B)
+    /// dependency chains, normal launch (mode 0) vs PDL launch
+    /// (mode 1: cudaLaunchKernelEx + ProgrammaticStreamSerialization — B's
+    /// prologue overlaps A's tail via cudaGridDependencySynchronize).
+    /// Returns (time_ms, checksum).
+    pub fn pdl_exp_dev(&self, mode: i32, iters: i32) -> Result<(f32, f32)> {
+        self.enter();
+        let mut t = 0f32;
+        let mut c = 0f32;
+        ck(unsafe { ferrite_pdl_exp(mode, iters, &mut t, &mut c, self.stream) }, "pdl_exp")?;
+        Ok((t, c))
     }
 
     /// This backend's stream (device-chain ops submit here; the graph

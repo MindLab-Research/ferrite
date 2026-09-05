@@ -1316,3 +1316,20 @@ fn gemv_tri_parity() {
     eprintln!("[gemv-tri] seg maxd y1={:.2e} y2={:.2e} y3={:.2e}", m(&g1, &e1), m(&g2, &e2), m(&g3, &e3));
     assert!(mx < 1e-4, "gemv_tri parity maxd {mx:.2e}");
 }
+
+/// PDL (programmatic dependent launch) microbench: A→B chain, normal launch
+/// vs PDL (cudaLaunchKernelEx + ProgrammaticStreamSerialization). Reports
+/// both timings + identical checksums (correctness of the early-launch
+/// overlap: B's prologue overlaps A's tail, B's gridDepSync waits for A).
+#[test]
+fn pdl_exp() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let _ = dev.pdl_exp_dev(0, 200).expect("warm normal"); // warm
+    let (t_norm, c_norm) = dev.pdl_exp_dev(0, 200).expect("normal");
+    let _ = dev.pdl_exp_dev(1, 200).expect("warm pdl");
+    let (t_pdl, c_pdl) = dev.pdl_exp_dev(1, 200).expect("pdl");
+    eprintln!("[pdl] normal {:.3}ms vs pdl {:.3}ms per 200 chains ({:.1}x), checksums {:.4} / {:.4}",
+              t_norm, t_pdl, t_norm / t_pdl.max(1e-9), c_norm, c_pdl);
+    assert!((c_norm - c_pdl).abs() < 1e-3 * c_norm.abs().max(1.0), "PDL checksum mismatch");
+}
