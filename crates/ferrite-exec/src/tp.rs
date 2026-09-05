@@ -784,10 +784,13 @@ fn mega_chain_dev(
             hidden,
         )?;
         if probe && layer_idx < 3 && matches!(plan.mlp, MlpKind::Dense) {
-            let mut pv = vec![0f32; hidden];
-            if hfn.download(&mut pv).is_ok() {
-                let mx = pv.iter().fold(0f32, |acc, x| acc.max(x.abs()));
-                eprintln!("[mega] L{layer_idx:02} hfn in={mx:.4}");
+            mprobe!("hfn0", &hfn, hidden);
+            if dev_id == 0 {
+                let mut pv = vec![0f32; hidden];
+                if hfn.download(&mut pv).is_ok() {
+                    let mx = pv.iter().fold(0f32, |acc, x| acc.max(x.abs()));
+                    eprintln!("[mega] L{layer_idx:02} hfn in={mx:.4}", mx);
+                }
             }
         }
         // D: FFN (MoE or Dense) → NCCL all-reduce
@@ -1791,6 +1794,22 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             let hfn_dev = cuda0.rmsnorm_dev(&li2_dev, norm_w2, self.full_cfg.rms_norm_eps, n, hidden)?;
             let mut hfn = vec![0f32; n * hidden];
             hfn_dev.download(&mut hfn)?;
+            // element-wise bisection probe: L00's res_mid + hfn vs mega's
+            // (mga diverges from L01's gdn ar +1.8% although L00's ARs match)
+            if layer_idx == 0 && n == 1 && std::env::var_os("FERRITE_AR_PROBE").is_some() {
+                let mut rm = vec![0f32; n * nh];
+                let _ = res2_dev.download(&mut rm);
+                let b: Vec<u8> = rm.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write("/tmp/orion/norm_resmid0.f32", b).ok();
+                let b: Vec<u8> = hfn.iter().flat_map(|x| x.to_le_bytes()).collect();
+                std::fs::write("/tmp/orion/norm_hfn0.f32", b).ok();
+                let mx = |v: &[f32]| v.iter().fold(0f32, |a, x| a.max(x.abs()));
+                eprintln!(
+                    "[norm] L00 resmid0 maxabs={:.4} hfn0 maxabs={:.4}",
+                    mx(&rm),
+                    mx(&hfn)
+                );
+            }
             let td = std::time::Instant::now();
             if timing_mid && n == 1 {
                 eprintln!(
