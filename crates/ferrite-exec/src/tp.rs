@@ -1127,7 +1127,7 @@ fn mega_chain_dev(
     // round-trips). Only captured (replayed); the dry-run skips it — B
     // holding stale data there is fine (dry output is discarded).
     if let Some(v) = verify {
-        if capture {
+        if capture && !v.gdn_scratch.is_empty() {
             let la = &cfg.linear_attn;
             let proj = la.num_heads * la.head_dim;
             let conv_len = 3 * proj * (la.short_conv_kernel_size.saturating_sub(1).max(1));
