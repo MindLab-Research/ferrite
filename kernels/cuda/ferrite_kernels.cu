@@ -559,6 +559,17 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
         Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
 }
 
+// PDL (programmatic dependent launch) enable flag: FERRITE_PDL=1 opt-in.
+// Cache the getenv once — checked on every PDL-capable launcher call.
+static int ferrite_pdl_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("FERRITE_PDL");
+        cached = (e && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
 extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
                                             const float* v, const float* beta,
                                             const float* gate, const float* a_log,
@@ -1612,17 +1623,6 @@ __global__ void conv_prep_fused_kernel(
     // all global stores (q/k/v/beta/gate) are complete here.
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
-}
-
-// PDL (programmatic dependent launch) enable flag: FERRITE_PDL=1 opt-in.
-// Cache the getenv once — checked on every gdn launcher call.
-static int ferrite_pdl_enabled(void) {
-    static int cached = -1;
-    if (cached < 0) {
-        const char* e = getenv("FERRITE_PDL");
-        cached = (e && e[0] == '1') ? 1 : 0;
-    }
-    return cached;
 }
 
 extern "C" cudaError_t ferrite_conv_prep_fused(
