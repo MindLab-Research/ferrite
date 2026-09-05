@@ -826,7 +826,7 @@ impl<B: KernelBackend> TpCluster<B> {
         let t_draft = t_d.elapsed();
         let t_v = std::time::Instant::now();
         // 2. verify: scratch A→B copy-in + dsa advance(2) + mega_v replay → argmax[2]
-        let h2v = self.shards[0].embed(&[last, d1 as u32]);
+        let h2v = self.shards[0].embed(&[last, d1 as u32, d2 as u32]);
         let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
         let toks_v = Self::fan_out(&mut self.shards, |s| {
             let cuda = s
@@ -854,14 +854,10 @@ impl<B: KernelBackend> TpCluster<B> {
                 }
             }
             for f in 0..num_dsa {
-                // advance(2): append this step's verify input [t_last, d1].
-                // NO rollback here — the previous step's cache tail
-                // (d1_prev, accepted) is VALID and must stay; the 1196
-                // self-lock's real cause was the accept-1 double state
-                // advance (fixed by the B0 scheme), not cache duplication.
-                cuda.dsa_host_advance(seq, f, 2);
+                // advance(3): append this step's verify input [t_last, d1, d2].
+                cuda.dsa_host_advance(seq, f, 3);
             }
-            let mut out = [0f32; 2];
+            let mut out = [0f32; 3];
             if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
                 return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
             }
