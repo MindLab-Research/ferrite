@@ -1959,17 +1959,19 @@ impl CudaBackend {
         let post = DevBuf::alloc(self.dev, self.stream, s * n)?;
         let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
         let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * mix)?;
-        let _ = mx_scratch; // kept for the split version (currently disabled)
+        // Use the SPLIT kernel (grid(s, mix) spreads each mix's dot product
+        // across a separate SM — the single-block version ran on ONE SM with
+        // 24 warps, limited to ~6GB/s vs 8TB/s HBM = 0.18ms; split = ~0.02ms)
         ck(
             unsafe {
-                ferrite_hc_pre(
+                ferrite_hc_pre_split(
                     res.as_const_f32(), dfw.as_const_f32(), dsc.as_const_f32(), dba.as_const_f32(),
-                    li.as_f32(), post.as_f32(), comb.as_f32(),
+                    li.as_f32(), post.as_f32(), comb.as_f32(), mx_scratch.as_f32(),
                     s as i32, n as i32, h as i32, mix as i32,
                     rms_eps, hc_eps, sinkhorn_iters as i32, self.stream,
                 )
             },
-            "hc_pre_dev",
+            "hc_pre_dev_split",
         )?;
         Ok((li, post, comb))
     }
