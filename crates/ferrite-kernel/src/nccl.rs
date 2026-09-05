@@ -177,27 +177,83 @@ pub struct NcclGroup;
 impl NcclGroup {
     /// Single-process multi-GPU: one communicator per listed CUDA device
     /// ordinal. Caller keeps every returned channel alive together.
+    /// Uses ncclCommInitRank from per-rank threads (PyTorch-style) —
+    /// ncclCommInitAll fails with "unhandled cuda error" when the calling
+    /// thread already has CUDA contexts from CudaBackend creation.
     pub fn init_all(devices: &[i32], streams: &[CuStream]) -> Result<Vec<NcclChannel>> {
         let api = NcclApi::get()
             .ok_or_else(|| FerriteError::InvalidArg("libnccl not loadable (no NCCL installed?)".into()))?;
         if devices.len() != streams.len() {
             return Err(FerriteError::InvalidArg("devices/streams length mismatch".into()));
         }
-        let n = devices.len() as i32;
-        let mut comms: Vec<NcclComm> = vec![std::ptr::null_mut(); devices.len()];
-        // SAFETY: comms out-param is sized to ndev; devices valid for the call.
-        let r = unsafe { (api.ncclCommInitAll)(comms.as_mut_ptr(), n, devices.as_ptr()) };
-        api.ck(r, "ncclCommInitAll")?;
+        let world = devices.len();
+
+        // Generate unique ID (rank 0 style — all ranks share it)
+        let mut id = NcclUniqueId { bytes: [0u8; 128] };
+        let r = unsafe { (api.ncclGetUniqueId)(&mut id) };
+        api.ck(r, "ncclGetUniqueId")?;
+
+        // Spawn a thread per rank, each calls ncclCommInitRank concurrently
+        // (this is how PyTorch initializes NCCL — it works on machines where
+        // ncclCommInitAll fails due to pre-existing CUDA contexts).
+        let mut handles = vec![];
+        for rank in 0..world {
+            let id_bytes = id.bytes; // Copy ([u8;128] is Send)
+            let world_i = world as i32;
+            let rank_i = rank as i32;
+            let device = devices[rank];
+
+            handles.push(std::thread::spawn(move || {
+                // Set CUDA device for this thread (fresh context)
+                unsafe {
+                    crate::cuda::cuda_set_device(device);
+                }
+                let api = match NcclApi::get() {
+                    Some(a) => a,
+                    None => return (rank, 0usize, -1i32), // api lost
+                };
+                let mut comm: NcclComm = std::ptr::null_mut();
+                let local_id = NcclUniqueId { bytes: id_bytes };
+                let r = unsafe {
+                    (api.ncclCommInitRank)(&mut comm, rank_i, world_i, local_id)
+                };
+                (rank, comm as usize, r)
+            }));
+        }
+
+        // Collect results (usize comm pointers are Send)
+        let mut comms: Vec<usize> = vec![0; world];
+        let mut first_err: Option<String> = None;
+        for h in handles {
+            let (rank, comm, r) = h
+                .join()
+                .map_err(|_| FerriteError::InvalidArg("nccl init thread panicked".into()))?;
+            if r != 0 {
+                let err_str = api.err_str(r);
+                if first_err.is_none() {
+                    first_err = Some(format!("ncclCommInitRank rank {rank}: {err_str}"));
+                }
+            } else {
+                comms[rank] = comm;
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(FerriteError::InvalidArg(e));
+        }
+        if comms.iter().any(|c| *c == 0) {
+            return Err(FerriteError::InvalidArg("ncclCommInitRank returned null comm".into()));
+        }
+
         Ok(comms
             .into_iter()
             .zip(streams.iter())
             .enumerate()
             .map(|(rank, (comm, &stream))| NcclChannel {
                 api,
-                comm,
+                comm: comm as NcclComm,
                 stream,
                 rank,
-                world: devices.len(),
+                world,
             })
             .collect())
     }
