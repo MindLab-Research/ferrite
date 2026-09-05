@@ -3086,3 +3086,16 @@ extern "C" cudaError_t ferrite_gdn_step_v2p(
         q, k, v, b_raw, fb, dt_bias, a_log, lb, state, out, 1, h, dk, dv);
     return cudaGetLastError();
 }
+
+// elementwise add (residual): z = x + y — MTP layer's standard (non-MHC)
+// residual connections.
+__global__ void add_kernel(const float* __restrict__ x, const float* __restrict__ y,
+                           float* __restrict__ z, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) z[i] = x[i] + y[i];
+}
+extern "C" cudaError_t ferrite_add(const float* x, const float* y, float* z,
+                                   int n, cudaStream_t s) {
+    add_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, y, z, n);
+    return cudaGetLastError();
+}

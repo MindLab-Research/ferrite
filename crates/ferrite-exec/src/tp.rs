@@ -2449,3 +2449,114 @@ where
     }
     results.into_iter().map(|r| r.expect("fan result")).collect()
 }
+
+/// MTP (nextn) layer-45 forward, single token (draft): eh_proj preprocessing
+/// → input_layernorm → DSA attn (cache family = num_dsa, independent of the
+/// decoder's 0..num_dsa-1) → residual → post_attention_layernorm → MoE →
+/// residual → shared_head.norm → lm_head → argmax. Standard residual stream
+/// (no MHC). Per-rank TP: eh_proj column-split partial + AR, DSA head-split
+/// partial + AR, MoE expert-split partial + AR. Returns the draft token.
+#[cfg(feature = "cuda")]
+pub(crate) fn mtp_forward<B: KernelBackend>(
+    s: &mut Engine<B>,
+    seq: u64,
+    embed_row: &ferrite_kernel::cuda::DevBuf,
+    h_prev: &ferrite_kernel::cuda::DevBuf,
+) -> Result<f32> {
+    use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights};
+    let cuda = s
+        .backend
+        .as_cuda()
+        .ok_or_else(|| FerriteError::Config("mtp needs cuda backend".into()))?;
+    let nccl = s
+        .nccl
+        .clone()
+        .ok_or_else(|| FerriteError::Config("mtp needs FERRITE_NCCL=1".into()))?;
+    cuda.enter();
+    let cfg = &s.cfg;
+    let h = cfg.hidden_size;
+    let world = s.tp_world;
+    let rank = cuda.dev() as usize;
+    let pfx = format!("model.layers.{}", cfg.num_hidden_layers);
+    let d = &cfg.dsa;
+    let (dsa_h, dsa_dk, dsa_dv, _ip) = s.dsa_dims();
+    // MTP DSA cache family: independent of the decoder's 0..num_dsa-1.
+    let mtp_family = cfg
+        .layer_types
+        .iter()
+        .filter(|t| matches!(t, ferrite_model::LayerType::DeepseekSparseAttention))
+        .count();
+
+    // 1. enorm(embed) ‖ hnorm(h_prev) → this rank's eh_proj input segment
+    let enorm = cuda.rmsnorm_dev(embed_row, s.w(&format!("{pfx}.enorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
+    let hnorm = cuda.rmsnorm_dev(h_prev, s.w(&format!("{pfx}.hnorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
+    let x_seg = cuda.mtp_eh_seg_dev(&enorm, &hnorm, rank, world, h)?;
+    let eh_partial = cuda.matmul_dev(&x_seg, s.w(&format!("{pfx}.eh_proj.weight"))?, 1, (2 * h / world) as i32, h as i32)?;
+    nccl.all_reduce_f32(eh_partial.as_const_f32(), eh_partial.as_f32(), h)?;
+    // 2. input_layernorm → DSA attn (independent cache family)
+    let hn = cuda.rmsnorm_dev(&eh_partial, s.w(&format!("{pfx}.input_layernorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
+    let w = DsaLayerWeights {
+        q_a: s.w(&format!("{pfx}.self_attn.q_a_proj.weight"))?,
+        q_a_ln: s.w(&format!("{pfx}.self_attn.q_a_layernorm.weight"))?,
+        q_b: s.w(&format!("{pfx}.self_attn.q_b_proj.weight"))?,
+        kv_a: s.w(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))?,
+        kv_a_ln: s.w(&format!("{pfx}.self_attn.kv_a_layernorm.weight"))?,
+        kv_b: s.w(&format!("{pfx}.self_attn.kv_b_proj.weight"))?,
+        wq_b: s.w(&format!("{pfx}.self_attn.indexer.wq_b.weight"))?,
+        wk: s.w(&format!("{pfx}.self_attn.indexer.wk.weight"))?,
+        k_norm_w: s.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?,
+        k_norm_b: s.w(&format!("{pfx}.self_attn.indexer.k_norm.bias"))?,
+        weights_proj: s.w(&format!("{pfx}.self_attn.indexer.weights_proj.weight"))?,
+        gate: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?,
+        ape: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?,
+        o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+        h: dsa_h,
+        dk: dsa_dk,
+        dv: dsa_dv,
+        ih: d.index_n_heads,
+        idm: d.index_head_dim,
+        kpool: 4,
+        topk: d.index_topk,
+        rms_eps: cfg.rms_norm_eps,
+    };
+    let attn_partial = cuda.dsa_layer_dev(&hn, &w, seq, mtp_family, 1, h)?;
+    nccl.all_reduce_f32(attn_partial.as_const_f32(), attn_partial.as_f32(), h)?;
+    // 3. residual + post_attention_layernorm
+    let x1 = cuda.add_dev(&eh_partial, &attn_partial, h)?;
+    let hn2 = cuda.rmsnorm_dev(&x1, s.w(&format!("{pfx}.post_attention_layernorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
+    // 4. MoE (same call shape as the decoder moe layers)
+    let e = cfg.n_routed_experts;
+    let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
+        Some(b) => b.clone(),
+        None => Tensor::zeros(Shape::new([e]), DType::F32),
+    };
+    let gate_w = s.w(&format!("{pfx}.mlp.gate.weight"))?;
+    let shared = ExpertWeights {
+        gate: s.w(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))?,
+        up: s.w(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))?,
+        down: s.w(&format!("{pfx}.mlp.shared_expert.down_proj.weight"))?,
+    };
+    let (es, ee) = s.tp_expert_range.unwrap_or((0, e));
+    let experts: Vec<ExpertWeights> = (es..ee)
+        .map(|eid| {
+            Ok(ExpertWeights {
+                gate: s.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
+                up: s.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
+                down: s.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut probs = DevBuf::alloc(cuda.dev(), cuda.stream(), cfg.num_experts_per_tok)?;
+    let moe_partial = cuda.moe_layer_dev(&hn2, gate_w, &bias, &shared, &experts, es, &mut probs, 1, h, cfg.num_experts_per_tok, e, cfg.routed_scaling_factor, cfg.swiglu_limit)?;
+    nccl.all_reduce_f32(moe_partial.as_const_f32(), moe_partial.as_f32(), h)?;
+    // 5. residual + shared_head.norm + lm_head + argmax
+    let x2 = cuda.add_dev(&x1, &moe_partial, h)?;
+    let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
+    let lm_w = s.w("lm_head.weight")?;
+    let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
+    let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
+    cuda.argmax_dev(&logits, &mut arg, 1, cfg.vocab_size)?;
+    let mut tok = vec![0f32; 1];
+    arg.download(&mut tok)?;
+    Ok(tok[0])
+}

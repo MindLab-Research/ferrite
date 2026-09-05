@@ -154,6 +154,8 @@ extern "C" {
                             a_log: *const f32, lb: f32,
                             state: *mut f32, out: *mut f32,
                             h: i32, dk: i32, dv: i32, stream: CuStream) -> i32;
+    fn ferrite_add(x: *const f32, y: *const f32, z: *mut f32,
+                   n: i32, stream: CuStream) -> i32;
     fn cudaMemset(ptr: *mut std::ffi::c_void, val: i32, bytes: usize) -> i32;
 }
 
@@ -2601,6 +2603,43 @@ impl CudaBackend {
                 self.stream)
         }, "p2p_ar_oneshot")?;
         Ok(())
+    }
+
+    /// Elementwise add (residual): z = x + y [n]. MTP layer's standard
+    /// (non-MHC) residual connections.
+    pub fn add_dev(&self, x: &DevBuf, y: &DevBuf, n: usize) -> Result<DevBuf> {
+        self.enter();
+        let z = DevBuf::alloc(self.dev, self.stream, n)?;
+        ck(unsafe {
+            ferrite_add(x.as_const_f32(), y.as_const_f32(), z.as_f32(), n as i32, self.stream)
+        }, "add_dev")?;
+        Ok(z)
+    }
+
+    /// MTP eh_proj input segment for this rank: eh_proj is column-split
+    /// (2h/world cols); rank r's slice of cat(enorm, hnorm) is
+    /// [r*half, (r+1)*half) where half = 2h/world — ranks < world/2 read
+    /// enorm, the rest read hnorm. One D2D copy.
+    pub fn mtp_eh_seg_dev(&self, enorm: &DevBuf, hnorm: &DevBuf, rank: usize,
+                          world: usize, h: usize) -> Result<DevBuf> {
+        self.enter();
+        let seg_len = 2 * h / world;
+        let seg = DevBuf::alloc(self.dev, self.stream, seg_len)?;
+        let (src, off) = if rank < world / 2 {
+            (enorm, rank * seg_len)
+        } else {
+            (hnorm, (rank - world / 2) * seg_len)
+        };
+        ck(unsafe {
+            cudaMemcpyAsync(
+                seg.as_f32() as *mut std::ffi::c_void,
+                (src.as_const_f32() as *const u8).add(off * 4) as *const std::ffi::c_void,
+                seg_len * 4,
+                CUDA_MEMCPY_D2D,
+                self.stream,
+            )
+        }, "mtp_eh_seg")?;
+        Ok(seg)
     }
 }
 
