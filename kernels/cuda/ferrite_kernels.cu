@@ -1949,3 +1949,32 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
         s, n, h, mix, rms_eps, hc_eps, iters);
     return cudaGetLastError();
 }
+
+// ============================================================
+// hc_contract: [s, n*h] -> [s, h] — mean over the n MHC flows (the mirror
+// of mhc::hc_expand; the head chain's input after the last layer). Token-
+// major layout: flow i of token t lives at in[(t*n + i)*h .. +h].
+// mega-graph: this closes the device-resident decode loop (residual ->
+// contract -> rmsnorm -> lm_head -> argmax, zero host crossings).
+// ============================================================
+__global__ void hc_contract_kernel(const float* __restrict__ in,
+                                   float* __restrict__ out,
+                                   int s, int n, int h) {
+    int j = blockIdx.x * blockDim.x + threadIdx.x;  // one thread per output elem
+    int t = blockIdx.y;
+    if (j >= h || t >= s) return;
+    float acc = 0.f;
+    for (int i = 0; i < n; i++) {
+        acc += in[(size_t)(t * n + i) * h + j];
+    }
+    out[(size_t)t * h + j] = acc / n;
+}
+
+extern "C" cudaError_t ferrite_hc_contract(const float* in, float* out,
+                                          int s, int n, int h,
+                                          cudaStream_t stream) {
+    dim3 block(256);
+    dim3 grid((h + 255) / 256, s);
+    hc_contract_kernel<<<grid, block, 0, stream>>>(in, out, s, n, h);
+    return cudaGetLastError();
+}

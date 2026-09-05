@@ -62,6 +62,8 @@ extern "C" {
                             n: i64, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
                        n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
+    fn ferrite_hc_contract(x: *const f32, out: *mut f32,
+                           s: i32, n: i32, h: i32, stream: CuStream) -> i32;
     fn ferrite_gated_rmsnorm(x: *const f32, gate: *const f32, w: *const f32, out: *mut f32,
                              n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
     fn ferrite_swiglu(gu: *const f32, out: *mut f32, n: i32, inter: i32,
@@ -2014,6 +2016,20 @@ impl CudaBackend {
         ck(
             unsafe { ferrite_rmsnorm(x.as_const_f32(), dw.as_const_f32(), out.as_f32(), n as i32, dim as i32, eps, self.stream) },
             "rmsnorm_dev",
+        )?;
+        Ok(out)
+    }
+
+    /// hc_contract on device: x [s, n*h] → out [s, h] — mean over the n MHC
+    /// flows (mirror of mhc::hc_expand). The mega-graph's head-chain bridge:
+    /// last layer's residual → contract → rmsnorm → lm_head, zero host
+    /// crossings.
+    pub fn hc_contract_dev(&self, x: &DevBuf, s: usize, n: usize, h: usize) -> Result<DevBuf> {
+        self.enter();
+        let out = DevBuf::alloc(self.dev, self.stream, s * h)?;
+        ck(
+            unsafe { ferrite_hc_contract(x.as_const_f32(), out.as_f32(), s as i32, n as i32, h as i32, self.stream) },
+            "hc_contract_dev",
         )?;
         Ok(out)
     }
