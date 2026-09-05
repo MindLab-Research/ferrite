@@ -924,3 +924,76 @@ fn gemv5_parity() {
     let t_fus = t1.elapsed().as_secs_f64() * 1e6 / it as f64;
     eprintln!("[gemv5] 5-matrix chain: separate={:.1}us fused={:.1}us ({:.1}x)", t_sep, t_fus, t_sep / t_fus.max(1e-9));
 }
+
+/// GEMV v2 (vectorized uint4 + K-split WPR) vs v1 (scalar warp-per-row):
+/// parity + A/B perf on the real decode shapes (TP4 shards). v1 measured
+/// 2.2-3.1 TB/s (27-39% of B300 HBM) — v2 targets 6+ TB/s. Decides the
+/// matmul_dev n==1 swap.
+#[test]
+fn gemv_v2_bench() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let stream = dev.stream_handle();
+    // (in_f, out_f, name) — real decode shapes per rank (TP4):
+    // lm_head full/shard, gdn qkv/b/o, moe gate/down, dsa kv_a.
+    let shapes: Vec<(usize, usize, &str)> = vec![
+        (4096, 154880, "lm_head_full"),
+        (4096, 38720, "lm_head_shard"),
+        (4096, 16384, "qkv_big"),
+        (4096, 4096, "proj_4k"),
+        (4096, 3072, "o_proj_med"),
+        (4096, 1536, "moe_gate"),
+        (1536, 4096, "moe_down"),
+        (4096, 1088, "dsa_kvA"),
+        (4096, 512, "gdn_small"),
+    ];
+    let mut rnd = 0xfeed_beef_cafe_f00du64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    let mut total_v1 = 0f64;
+    let mut total_v2 = 0f64;
+    for (in_f, out_f, name) in &shapes {
+        let (in_f, out_f) = (*in_f, *out_f);
+        let xv: Vec<f32> = (0..in_f).map(|_| r()).collect();
+        let wv: Vec<f32> = (0..out_f * in_f).map(|_| r() * 0.02).collect();
+        let x_t = Tensor::from_f32(Shape::new([1, in_f]), xv);
+        let w_t = Tensor::from_f32(Shape::new([out_f, in_f]), wv);
+        let x_dev = DevBuf::alloc(dev.dev(), stream, in_f).unwrap();
+        x_dev.upload(x_t.as_slice()).unwrap();
+        // warm both (weight upload to bf16 cache) + parity reference
+        let o1 = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).unwrap();
+        let o2 = dev.gemv_v2_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).unwrap();
+        let _ = dev.sync();
+        let mut e1 = vec![0f32; out_f];
+        let mut e2 = vec![0f32; out_f];
+        o1.download(&mut e1).unwrap();
+        o2.download(&mut e2).unwrap();
+        let mut maxd = 0f32;
+        for (a, b) in e1.iter().zip(e2.iter()) { maxd = maxd.max((a - b).abs()); }
+        // A/B: async loop + sync (kernel >> launch for these sizes)
+        let bytes = (out_f * in_f * 2) as f64;
+        let it = if bytes > 64e6 { 100 } else { 1000 };
+        let t0 = std::time::Instant::now();
+        for _ in 0..it {
+            let _ = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32);
+        }
+        let _ = dev.sync();
+        let t_v1 = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+        let t1 = std::time::Instant::now();
+        for _ in 0..it {
+            let _ = dev.gemv_v2_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32);
+        }
+        let _ = dev.sync();
+        let t_v2 = t1.elapsed().as_secs_f64() * 1e6 / it as f64;
+        total_v1 += t_v1;
+        total_v2 += t_v2;
+        eprintln!(
+            "[gemv-v2] {:>13} [{:>6},{:>5}]: v1={:8.1}us ({:5.2}TB/s) v2={:8.1}us ({:5.2}TB/s) {:5.2}x  maxd={:.1e}",
+            name, out_f, in_f,
+            t_v1, bytes / t_v1 / 1e6, t_v2, bytes / t_v2 / 1e6,
+            t_v1 / t_v2.max(1e-9), maxd
+        );
+        assert!(maxd < 2e-4, "gemv_v2 {} max_diff {:.2e} too large", name, maxd);
+    }
+    eprintln!("[gemv-v2] TOTAL: v1={:.1}us v2={:.1}us ({:.2}x)", total_v1, total_v2, total_v1 / total_v2.max(1e-9));
+}

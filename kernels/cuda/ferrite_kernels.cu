@@ -1381,6 +1381,97 @@ extern "C" cudaError_t ferrite_gemv_bf16(const float* x, const void* w,
 }
 
 // ============================================================
+// GEMV v2 (vectorized + K-split): v1 runs the decode weight-streaming
+// chains (gdn/dsa/moe/lm_head ≈ 17ms of the 28.2ms decode step) at only
+// 2.2-3.1 TB/s (27-39% of B300's 8 TB/s HBM). Two diagnosed bottlenecks:
+//   (a) scalar bf16 loads — v2 issues uint4 (8 bf16 = 16B) per lane-step
+//       plus 2x float4 x loads;
+//   (b) latency-bound medium matrices — [3072,4096] gives only 384
+//       blocks = 21 warps/SM ≈ 5KB in flight per SM vs the ~43KB HBM
+//       latency-BW product needs. v2 splits K across WPR warps per row
+//       (same-block smem reduce — no extra kernel, no atomics):
+//       [3072,4096] WPR=4 → 12288 warps → 83/SM.
+// Correctness note: v1/v2 summation orders differ (K-slice partials +
+// smem fold vs single-warp shuffle tree) → f32 rounding diffs ~1e-6.
+// ============================================================
+template <int WPR>
+__global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
+                                   const __nv_bfloat16* __restrict__ w,
+                                   const float* __restrict__ bias,
+                                   float* __restrict__ y,
+                                   int in_f, int out_f) {
+    const int warps = blockDim.x >> 5;
+    const int rpb = warps / WPR;               // rows per block
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * rpb + warp / WPR;
+    const int kw = warp % WPR;                 // K-slice id
+    float acc = 0.f;
+    if (row < out_f) {
+        const __nv_bfloat16* wr = w + (size_t)row * in_f;
+        // slice size rounded to a multiple of 8 (uint4 16B alignment;
+        // in_f % 8 == 0 is guaranteed by the host fallback to v1)
+        int kper = ((in_f + WPR - 1) / WPR + 7) & ~7;
+        int k0 = kw * kper;
+        int k1 = min(k0 + kper, in_f);
+        // vector body: uint4 W (8 bf16) + 2x float4 x per lane-step
+        #pragma unroll 2
+        for (int k = k0 + lane * 8; k + 7 < k1; k += 32 * 8) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            float4 xa = *reinterpret_cast<const float4*>(x + k);
+            float4 xb = *reinterpret_cast<const float4*>(x + k + 4);
+            const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 f0 = __bfloat1622float2(w2[0]);
+            float2 f1 = __bfloat1622float2(w2[1]);
+            float2 f2 = __bfloat1622float2(w2[2]);
+            float2 f3 = __bfloat1622float2(w2[3]);
+            acc += xa.x * f0.x + xa.y * f0.y + xa.z * f1.x + xa.w * f1.y;
+            acc += xb.x * f2.x + xb.y * f2.y + xb.z * f3.x + xb.w * f3.y;
+        }
+        // No tail: host falls back to v1 when in_f % 8 != 0, so in_f is a
+        // multiple of 8; kper is rounded to 8 → k0/k1 8-aligned → the
+        // vector loop's k+7 < k1 guard covers every element of [k0, k1).
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (WPR == 1) {
+        if (lane == 0 && row < out_f) y[row] = (bias ? bias[row] : 0.f) + acc;
+    } else {
+        __shared__ float part[16];
+        if (lane == 0) part[warp] = acc;
+        __syncthreads();
+        if (warp % WPR == 0 && lane == 0) {
+            float sum = 0.f;
+            #pragma unroll
+            for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
+            if (row < out_f) y[row] = (bias ? bias[row] : 0.f) + sum;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
+                                            const float* bias, float* out,
+                                            int in_f, int out_f,
+                                            cudaStream_t s) {
+    if (out_f <= 0) return cudaSuccess;
+    if (in_f <= 0) return cudaSuccess;
+    if (in_f & 7) return ferrite_gemv_bf16(x, w, bias, out, in_f, out_f, s);
+    // WPR heuristic by row count: enough warps to cover HBM latency
+    // (out_f*WPR/8 warps total; target >= 64 warps/SM on 148 SMs).
+    int wpr = out_f >= 16384 ? 1 : (out_f >= 4096 ? 2 : (out_f >= 1024 ? 4 : 8));
+    int rpb = 8 / wpr;                        // 256 threads = 8 warps
+    dim3 grid((out_f + rpb - 1) / rpb);
+    switch (wpr) {
+        case 1: gemv_bf16_v2_kernel<1><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
+        case 2: gemv_bf16_v2_kernel<2><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
+        case 4: gemv_bf16_v2_kernel<4><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
+        default: gemv_bf16_v2_kernel<8><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
+    }
+    return cudaGetLastError();
+}
+
+// ============================================================
 // Fused MoE decode (n==1) with GPU-side expert dispatch — the TileRT
 // ExpertSelectUpGateSiLU idea, ferrite-style: expert weights stay wherever
 // the dev_weight_bf16 cache put them; a device POINTER TABLE

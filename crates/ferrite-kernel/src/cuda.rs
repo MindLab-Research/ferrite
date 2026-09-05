@@ -40,6 +40,9 @@ extern "C" {
     fn ferrite_gemv_bf16(x: *const f32, w: *const std::ffi::c_void,
                           bias: *const f32, out: *mut f32,
                           in_f: i32, out_f: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_bf16_v2(x: *const f32, w: *const std::ffi::c_void,
+                             bias: *const f32, out: *mut f32,
+                             in_f: i32, out_f: i32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
@@ -643,6 +646,20 @@ impl CudaBackend {
                                      dbias, do_.as_f32(), n, in_f, out_f, self.stream)
             }, "matmul_dev")?;
         }
+        Ok(do_)
+    }
+
+    /// GEMV v2 (vectorized uint4 + K-split): the decode weight-streaming
+    /// upgrade of matmul_dev's n==1 path — uint4 (8 bf16) loads + WPR
+    /// warps/row K-split to cover HBM latency on medium matrices.
+    /// Benchmarked 2.2-3.1 TB/s (v1) → target 6+ TB/s. A/B via gemv_v2_bench.
+    pub fn gemv_v2_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
+        let dw = self.dev_weight_bf16(w)?;
+        let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
+        ck(unsafe {
+            ferrite_gemv_bf16_v2(x_dev.as_const_f32(), dw.ptr as *const _,
+                                 std::ptr::null(), do_.as_f32(), in_f, out_f, self.stream)
+        }, "gemv_v2_dev")?;
         Ok(do_)
     }
 
