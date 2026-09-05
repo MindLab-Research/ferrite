@@ -660,6 +660,7 @@ fn mega_chain_dev(
     // head — sync at segment boundaries (diagnostic runs only)
     let tm = !capture && dev_id == 0 && std::env::var_os("FERRITE_TIMING").is_some();
     let (mut t_attn, mut t_ffn, mut t_head) = (0f64, 0f64, 0f64);
+    let (mut t_a, mut t_b_gdn, mut t_b_dsa, mut t_c, mut t_e) = (0f64, 0f64, 0f64, 0f64, 0f64);
     macro_rules! mprobe {
         ($name:expr, $buf:expr, $len:expr) => {
             if probe {
@@ -726,6 +727,11 @@ fn mega_chain_dev(
             n,
             hidden,
         )?;
+        if tm {
+            let _ = cuda.sync();
+            t_a += t_l.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_b = std::time::Instant::now();
         if layer_idx == 0 {
             mprobe!("hn0", &hn, hidden);
         }
@@ -787,6 +793,11 @@ fn mega_chain_dev(
         if tm {
             let _ = cuda.sync();
             t_attn += t_l.elapsed().as_secs_f64() * 1e3;
+            if matches!(plan.attn, AttnKind::Dsa) {
+                t_b_dsa += t_b.elapsed().as_secs_f64() * 1e3;
+            } else {
+                t_b_gdn += t_b.elapsed().as_secs_f64() * 1e3;
+            }
         }
         let t_mid = std::time::Instant::now();
         if layer_idx == 0 {
@@ -823,6 +834,11 @@ fn mega_chain_dev(
             n,
             hidden,
         )?;
+        if tm {
+            let _ = cuda.sync();
+            t_c += t_mid.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_d = std::time::Instant::now();
         if probe && layer_idx < 3 && matches!(plan.mlp, MlpKind::Dense) {
             mprobe!("hfn0", &hfn, hidden);
             if dev_id == 0 {
@@ -902,6 +918,10 @@ fn mega_chain_dev(
         }
         // E: hc_post2 → next layer's residual
         res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+        if tm {
+            let _ = cuda.sync();
+            t_e += t_d.elapsed().as_secs_f64() * 1e3;
+        }
     }
 
     mprobe!("resL", &res, nh);
@@ -947,11 +967,23 @@ fn mega_chain_dev(
         if tm {
             let _ = cuda.sync();
             t_head = t_hs.elapsed().as_secs_f64() * 1e3;
+            let (n_dsa, n_gdn) = plans
+                .iter()
+                .fold((0usize, 0usize), |(d, g), pl| {
+                    if matches!(pl.attn, AttnKind::Dsa) { (d + 1, g) } else { (d, g + 1) }
+                });
             eprintln!(
-                "[mega-timing] {} layers: attn(A+AR)={:.1}ms ffn(C+D+E+AR)={:.1}ms head={:.2}ms",
+                "[mega-timing] {}L: attn={:.1} (A_hc={:.1} B: gdn{}={:.1} dsa{}={:.1}) ffn={:.1} (C_hc={:.1} D+E={:.1}) head={:.2}",
                 plans.len(),
                 t_attn,
+                t_a,
+                n_gdn,
+                t_b_gdn,
+                n_dsa,
+                t_b_dsa,
                 t_ffn,
+                t_c,
+                t_ffn - t_c - t_e,
                 t_head
             );
         }
