@@ -592,8 +592,12 @@ impl<B: KernelBackend> TpCluster<B> {
                 };
                 let hidden = self.full_cfg.hidden_size;
                 let _ = Self::fan_out(&mut self.shards, |s| {
+                    // h chain: token 0 uses hf_dev (prompt-tail target h), then
+                    // each step's MTP-layer residual h (x2) recurses — a
+                    // per-token h sequence beats the fixed approximation.
+                    let mut h_cur: Option<ferrite_kernel::cuda::DevBuf> = None;
                     for t in &prompt_tokens {
-                        let hptr = {
+                        let (emb, hptr) = {
                             let cuda = s
                                 .backend
                                 .as_cuda()
@@ -604,15 +608,19 @@ impl<B: KernelBackend> TpCluster<B> {
                             emb.upload(h2.as_slice())?;
                             let m = cuda.mtp.lock().unwrap();
                             let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                            (
-                                emb,
-                                &m.hf_dev as *const ferrite_kernel::cuda::DevBuf as usize,
-                            )
+                            (emb, &m.hf_dev as *const ferrite_kernel::cuda::DevBuf as usize)
                         };
-                        let (emb, hptr) = hptr;
-                        let hprev: &ferrite_kernel::cuda::DevBuf =
-                            unsafe { &*(hptr as *const ferrite_kernel::cuda::DevBuf) };
-                        mtp_forward(s, seq, &emb, hprev)?;
+                        let hout = ferrite_kernel::cuda::DevBuf::alloc(
+                            s.backend.as_cuda().unwrap().dev(),
+                            s.backend.as_cuda().unwrap().stream(),
+                            hidden,
+                        )?;
+                        let hprev: &ferrite_kernel::cuda::DevBuf = match h_cur.as_ref() {
+                            Some(h) => h,
+                            None => unsafe { &*(hptr as *const ferrite_kernel::cuda::DevBuf) },
+                        };
+                        mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
+                        h_cur = Some(hout);
                     }
                     Ok::<(), FerriteError>(())
                 })
@@ -789,7 +797,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 &m.hprev as *const DevBuf as usize
             };
             let hprev: &DevBuf = unsafe { &*(hptr as *const DevBuf) };
-            mtp_forward(s, seq, &emb, hprev)
+            mtp_forward(s, seq, &emb, hprev, None)
         })
         .into_iter()
         .collect::<Result<Vec<f32>>>()?[0];
@@ -2831,6 +2839,7 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     seq: u64,
     embed_row: &ferrite_kernel::cuda::DevBuf,
     h_prev: &ferrite_kernel::cuda::DevBuf,
+    h_out: Option<&ferrite_kernel::cuda::DevBuf>,
 ) -> Result<f32> {
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights};
     let cuda = s
@@ -2920,6 +2929,12 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     nccl.all_reduce_f32(moe_partial.as_const_f32(), moe_partial.as_f32(), h)?;
     // 5. residual + shared_head.norm + lm_head + argmax
     let x2 = cuda.add_dev(&x1, &moe_partial, h)?;
+    if let Some(ho) = h_out {
+        // catch-up recursion: export the MTP layer's own residual h (x2) —
+        // the next catch-up step's h_prev (per-token h chain beats the fixed
+        // prompt-tail approximation for draft quality).
+        cuda.copy_dev(&x2, 0, ho.as_f32(), h)?;
+    }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
     let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
