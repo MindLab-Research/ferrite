@@ -1187,3 +1187,89 @@ fn gdn_step_v2_parity() {
         assert!(mo < 1e-4 && ms < 1e-4, "gdn_step_v2 n={n} dk={dk} out {mo:.2e} state {ms:.2e}");
     }
 }
+
+/// conv1d+gdn_prep FUSED parity (decode n==1 path): golden = CPU conv FIR
+/// (4-tap sliding window) → silu → KDA gate (lb*sig(a*(fb+dt)) exact order)
+/// → L2 norm (q *= rsqrt(dk)) → beta sigmoid. Covers the in-place window
+/// slide and both the real (h=16,dk=128) and odd (h=2,dk=17) shapes.
+#[test]
+fn conv_prep_fused_parity() {
+    for &(h, dk) in &[(2usize, 17usize), (16usize, 128usize)] {
+        let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+        dev.enter();
+        let proj = h * dk;
+        let ch = 3 * proj;
+        let conv = 4usize;
+        let hist = conv - 1;
+        let lb = 0.85f32;
+        let mut rnd = 0x9e37_79b9_7f4a_7c15u64;
+        let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+        let x: Vec<f32> = (0..ch).map(|_| r() * 2.0 - 1.0).collect();
+        let cw: Vec<f32> = (0..ch * conv).map(|_| r() * 0.4 - 0.2).collect();
+        let cs: Vec<f32> = (0..ch * hist).map(|_| r() * 2.0 - 1.0).collect();
+        let b_raw: Vec<f32> = (0..h).map(|_| r()).collect();
+        let fb: Vec<f32> = (0..proj).map(|_| r() * 0.5).collect();
+        let dt: Vec<f32> = (0..proj).map(|_| r() * 0.2 - 0.1).collect();
+        let al: Vec<f32> = (0..h).map(|_| r() - 0.5).collect();
+        let t = |v: Vec<f32>, sh: &[usize]| Tensor::from_f32(Shape::new(sh.to_vec()), v);
+        let x_t = t(x.clone(), &[ch]); let cw_t = t(cw.clone(), &[ch, conv]);
+        let mut cs_t = t(cs.clone(), &[ch, hist]);
+        let b_t = t(b_raw.clone(), &[h]); let fb_t = t(fb.clone(), &[proj]);
+        let dt_t = t(dt.clone(), &[proj]); let al_t = t(al.clone(), &[h]);
+        let mut q_t = Tensor::from_f32(Shape::new(vec![proj]), vec![0f32; proj]);
+        let mut k_t = Tensor::from_f32(Shape::new(vec![proj]), vec![0f32; proj]);
+        let mut v_t = Tensor::from_f32(Shape::new(vec![proj]), vec![0f32; proj]);
+        let mut bt_t = Tensor::from_f32(Shape::new(vec![h]), vec![0f32; h]);
+        let mut g_t = Tensor::from_f32(Shape::new(vec![proj]), vec![0f32; proj]);
+        dev.conv_prep_fused_dev(&x_t, &cw_t, &mut cs_t, &b_t, &fb_t, &dt_t, &al_t, h, dk, lb,
+                                &mut q_t, &mut k_t, &mut v_t, &mut bt_t, &mut g_t).unwrap();
+        let gq = q_t.as_slice().to_vec(); let gk = k_t.as_slice().to_vec();
+        let gv = v_t.as_slice().to_vec(); let gb = bt_t.as_slice().to_vec();
+        let gg = g_t.as_slice().to_vec(); let gcs = cs_t.as_slice().to_vec();
+
+        // CPU golden
+        let conv_c = |c: usize| -> f32 {
+            let mut acc = 0f32;
+            for i in 0..hist { acc += cw[c * conv + i] * cs[c * hist + i]; }
+            acc + cw[c * conv + 3] * x[c]
+        };
+        let silu = |z: f32| z / (1.0 + (-z).exp());
+        let mut rq = vec![0f32; proj]; let mut rk = vec![0f32; proj]; let mut rv = vec![0f32; proj];
+        for hd in 0..h {
+            let mut qv = vec![0f32; dk]; let mut kv = vec![0f32; dk];
+            for j in 0..dk {
+                let cq = hd * dk + j;
+                qv[j] = silu(conv_c(cq)); kv[j] = silu(conv_c(proj + cq)); rv[cq] = silu(conv_c(2 * proj + cq));
+                let a_ex = al[hd].exp();
+                let xg = a_ex * (fb[cq] + dt[cq]);
+                // exact order: lb * (1/(1+exp(-x)))
+                let gg_ = lb * (1.0 / (1.0 + (-xg).exp()));
+                assert!((gg[cq] - gg_).abs() < 1e-5, "gate mismatch at {cq}: {} vs {gg_}", gg[cq]);
+            }
+            let nq = { let s: f32 = qv.iter().map(|z| z * z).sum(); if s > 0.0 { 1.0 / s.sqrt() } else { 0.0 } };
+            let nk = { let s: f32 = kv.iter().map(|z| z * z).sum(); if s > 0.0 { 1.0 / s.sqrt() } else { 0.0 } };
+            let qs = 1.0f32 / (dk as f32).sqrt();
+            for j in 0..dk {
+                let cq = hd * dk + j;
+                rq[cq] = qv[j] * nq * qs;
+                rk[cq] = kv[j] * nk;
+            }
+            let bexp = 1.0 / (1.0 + (-b_raw[hd]).exp());
+            assert!((gb[hd] - bexp).abs() < 1e-5, "beta mismatch");
+        }
+        let mut mx = 0f32;
+        for a in gq.iter().zip(rq.iter()).chain(gk.iter().zip(rk.iter())).chain(gv.iter().zip(rv.iter())) {
+            mx = mx.max((a.0 - a.1).abs());
+        }
+        // state slid: [s1,s2,x] per channel
+        let mut ms = 0f32;
+        for c in 0..ch {
+            for hh in 0..hist {
+                let want = if hh < hist - 1 { cs[c * hist + hh + 1] } else { x[c] };
+                ms = ms.max((gcs[c * hist + hh] - want).abs());
+            }
+        }
+        eprintln!("[convprep-fused h={h} dk={dk}] qkv maxd={mx:.2e} state maxd={ms:.2e}");
+        assert!(mx < 1e-5 && ms < 1e-6, "conv_prep_fused h={h} dk={dk} qkv {mx:.2e} state {ms:.2e}");
+    }
+}

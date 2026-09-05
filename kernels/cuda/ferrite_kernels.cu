@@ -1496,6 +1496,107 @@ extern "C" cudaError_t ferrite_gdn_prep(const float* conv_out, const float* b_ra
 }
 
 // ============================================================
+// conv1d + gdn_prep FUSED (decode n==1 hot path): v1 ran two kernels
+// (conv1d: grid(ch) one-block-per-channel FIR; gdn_prep: grid(n*h)
+// per-head silu/split/L2/beta/gate) with the conv_out round-trip
+// through HBM between them — ~2 kernel-boundary costs per gdn layer
+// × 34 layers. v2: grid(h) one block per head, dk threads; each thread
+// owns lane j of the head's q/k/v triple, computes the 4-tap FIR from
+// the resident sliding-window state, updates the window in place
+// (per-channel ownership — same in==out safety as conv1d), then runs
+// the prep math (silu, gate, L2 — thread-0 serial sum for the exact
+// CPU accumulation order, beta). Prefill (n>1) keeps the v1 pair.
+// ============================================================
+__global__ void conv_prep_fused_kernel(
+    const float* __restrict__ x,        // [ch] qkv proj output (n==1)
+    const float* __restrict__ cw,       // [ch, conv=4] FIR weights
+    const float* __restrict__ cs,       // [ch, hist=3] sliding-window state (in==out)
+    const float* __restrict__ b_raw,   // [h]
+    const float* __restrict__ fb,      // [proj]
+    const float* __restrict__ dt_bias, // [proj]
+    const float* __restrict__ a_log,   // [h]
+    float* __restrict__ q, float* __restrict__ k, float* __restrict__ v,
+    float* __restrict__ beta, float* __restrict__ gate,
+    int h, int dk, float lb) {
+    int hd = blockIdx.x;
+    int j = threadIdx.x;
+    if (j >= dk) return;
+    extern __shared__ float sm[]; // sq[dk], sk[dk] (L2 sums — exact serial order)
+    float* sq = sm;
+    float* sk = sm + dk;
+    const int proj = h * dk;
+    const int c_q = hd * dk + j;
+    const int c_k = proj + c_q;
+    const int c_v = 2 * proj + c_q;
+    // 1. conv FIR (4 taps: 3 window + new token) — matches conv1d_kernel
+    //    out = Σ_i w[i]·stream[hist + 0 - 3 + i], stream = [s0,s1,s2,x]
+    float qv = cw[c_q * 4 + 0] * cs[c_q * 3 + 0]
+              + cw[c_q * 4 + 1] * cs[c_q * 3 + 1]
+              + cw[c_q * 4 + 2] * cs[c_q * 3 + 2]
+              + cw[c_q * 4 + 3] * x[c_q];
+    float kv = cw[c_k * 4 + 0] * cs[c_k * 3 + 0]
+              + cw[c_k * 4 + 1] * cs[c_k * 3 + 1]
+              + cw[c_k * 4 + 2] * cs[c_k * 3 + 2]
+              + cw[c_k * 4 + 3] * x[c_k];
+    float vv = cw[c_v * 4 + 0] * cs[c_v * 3 + 0]
+              + cw[c_v * 4 + 1] * cs[c_v * 3 + 1]
+              + cw[c_v * 4 + 2] * cs[c_v * 3 + 2]
+              + cw[c_v * 4 + 3] * x[c_v];
+    // 2. slide the window in place: [s0,s1,s2] → [s1,s2,x] (same channel →
+    //    per-thread ownership, no race; conv1d_kernel did the same per block)
+    cs[c_q * 3 + 0] = cs[c_q * 3 + 1];
+    cs[c_q * 3 + 1] = cs[c_q * 3 + 2];
+    cs[c_q * 3 + 2] = x[c_q];
+    cs[c_k * 3 + 0] = cs[c_k * 3 + 1];
+    cs[c_k * 3 + 1] = cs[c_k * 3 + 2];
+    cs[c_k * 3 + 2] = x[c_k];
+    cs[c_v * 3 + 0] = cs[c_v * 3 + 1];
+    cs[c_v * 3 + 1] = cs[c_v * 3 + 2];
+    cs[c_v * 3 + 2] = x[c_v];
+    // 3. prep math (gdn_prep exact semantics): silu, gate, L2, beta
+    qv = qv / (1.0f + expf(-qv));
+    kv = kv / (1.0f + expf(-kv));
+    vv = vv / (1.0f + expf(-vv));
+    sq[j] = qv; sk[j] = kv;
+    // gate: KDA log-space — MUST be lb * sig(a*(fb+dt)) in that exact
+    // computation order (1-ulp division rounding amplifies in the recurrence)
+    float g = fb[c_q] + dt_bias[c_q];
+    float a_ex = expf(a_log[hd]);
+    float xg = a_ex * g;
+    float sig = 1.0f / (1.0f + expf(-xg));
+    gate[c_q] = lb * sig;
+    v[c_q] = vv;
+    // L2 norm: thread-0 serial accumulation — EXACT CPU iter().sum() order
+    // (warp-shuffle trees diverge 1-2 ulp → O(1) divergence over prefill)
+    __shared__ float red[64];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float a = 0.f, b = 0.f;
+        for (int i = 0; i < dk; i++) { a += sq[i] * sq[i]; b += sk[i] * sk[i]; }
+        red[60] = (a > 0.f) ? 1.0f / sqrtf(a) : 0.f;
+        red[61] = (b > 0.f) ? 1.0f / sqrtf(b) : 0.f;
+    }
+    __syncthreads();
+    const float q_scl = rsqrtf((float)dk);
+    q[c_q] = sq[j] * red[60] * q_scl;
+    k[c_q] = sk[j] * red[61];
+    if (threadIdx.x == 0) beta[hd] = 1.0f / (1.0f + expf(-b_raw[hd]));
+}
+
+extern "C" cudaError_t ferrite_conv_prep_fused(
+    const float* x, const float* cw, const float* cs,
+    const float* b_raw, const float* fb, const float* dt_bias,
+    const float* a_log, float* q, float* k, float* v,
+    float* beta, float* gate, int h, int dk, float lb, cudaStream_t s) {
+    dim3 block((dk > 1024) ? 1024 : dk);
+    dim3 grid(h);
+    size_t smem = 2 * (size_t)dk * sizeof(float) + 64 * sizeof(float);
+    conv_prep_fused_kernel<<<grid, block, smem, s>>>(x, cw, cs, b_raw, fb, dt_bias,
+                                                     a_log, q, k, v, beta, gate, h, dk, lb);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // TP all-reduce (sum): in-place sum of N partial outputs.
 // grid = total/nthreads, each thread sums N inputs element-wise.
 // For the decode-step device op chain: the TP fan-out produces

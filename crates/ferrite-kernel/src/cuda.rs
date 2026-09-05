@@ -125,6 +125,12 @@ extern "C" {
                         dt_bias: *const f32, a_log: *const f32,
                         q: *mut f32, k: *mut f32, v: *mut f32, beta: *mut f32, gate: *mut f32,
                         n: i32, h: i32, dk: i32, lb: f32, stream: CuStream) -> i32;
+    fn ferrite_conv_prep_fused(x: *const f32, cw: *const f32, cs: *const f32,
+                               b_raw: *const f32, fb: *const f32, dt_bias: *const f32,
+                               a_log: *const f32,
+                               q: *mut f32, k: *mut f32, v: *mut f32,
+                               beta: *mut f32, gate: *mut f32,
+                               h: i32, dk: i32, lb: f32, stream: CuStream) -> i32;
     fn cudaMemset(ptr: *mut std::ffi::c_void, val: i32, bytes: usize) -> i32;
 }
 
@@ -725,6 +731,39 @@ impl CudaBackend {
         do_.download(ov)?;
         let sv = Arc::get_mut(&mut state_out.data).expect("unique state_out");
         dst.download(sv)?;
+        Ok(())
+    }
+
+    /// conv1d+gdn_prep FUSED parity hook (decode n==1 hot path). `cs` is the
+    /// sliding-window conv state — updated IN PLACE (downloaded back mutated).
+    pub fn conv_prep_fused_dev(&self, x: &Tensor, cw: &Tensor, cs: &mut Tensor,
+                               b_raw: &Tensor, fb: &Tensor, dt_bias: &Tensor, a_log: &Tensor,
+                               h: usize, dk: usize, lb: f32,
+                               q: &mut Tensor, k: &mut Tensor, v: &mut Tensor,
+                               beta: &mut Tensor, gate: &mut Tensor) -> Result<()> {
+        self.enter();
+        let proj = h * dk;
+        let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
+        let dwc = DevBuf::alloc(self.dev, self.stream, cw.numel())?; dwc.upload(cw.as_slice())?;
+        let dcs = DevBuf::alloc(self.dev, self.stream, cs.numel())?; dcs.upload(cs.as_slice())?;
+        let db = DevBuf::alloc(self.dev, self.stream, b_raw.numel())?; db.upload(b_raw.as_slice())?;
+        let dfb = DevBuf::alloc(self.dev, self.stream, fb.numel())?; dfb.upload(fb.as_slice())?;
+        let ddt = DevBuf::alloc(self.dev, self.stream, dt_bias.numel())?; ddt.upload(dt_bias.as_slice())?;
+        let dal = DevBuf::alloc(self.dev, self.stream, a_log.numel())?; dal.upload(a_log.as_slice())?;
+        let dq = DevBuf::alloc(self.dev, self.stream, q.numel())?;
+        let dk_ = DevBuf::alloc(self.dev, self.stream, k.numel())?;
+        let dv_ = DevBuf::alloc(self.dev, self.stream, v.numel())?;
+        let dbt = DevBuf::alloc(self.dev, self.stream, beta.numel())?;
+        let dg = DevBuf::alloc(self.dev, self.stream, gate.numel())?;
+        ck(unsafe { ferrite_conv_prep_fused(dx.as_const_f32(), dwc.as_const_f32(), dcs.as_f32(),
+                                             db.as_const_f32(), dfb.as_const_f32(), ddt.as_const_f32(),
+                                             dal.as_const_f32(), dq.as_f32(), dk_.as_f32(), dv_.as_f32(),
+                                             dbt.as_f32(), dg.as_f32(),
+                                             h as i32, dk as i32, lb, self.stream) }, "conv_prep_fused")?;
+        for (o, d) in [(q, dq), (k, dk_), (v, dv_), (beta, dbt), (gate, dg), (cs, dcs)] {
+            let ov = Arc::get_mut(&mut o.data).expect("unique out");
+            d.download(ov)?;
+        }
         Ok(())
     }
 
@@ -1457,22 +1496,6 @@ impl CudaBackend {
         let hist = conv_size.saturating_sub(1).max(1);
         let dw_conv = self.dev_weight(w.conv_w)?;
         let conv_state = self.dev_state(&self.conv_states, (seq, layer), ch * hist)?;
-        let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
-        ck(
-            unsafe {
-                ferrite_causal_conv1d(
-                    qkv.as_const_f32(), dw_conv.as_const_f32(), conv_state,
-                    conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
-                )
-            },
-            "conv1d_dev",
-        )?;
-        // 3. GPU pre-processing (ferrite_gdn_prep): silu + split + per-head L2
-        // norm + KDA q-scale (rsqrt(dk), k NOT scaled — its absence here was the
-        // root cause of the garbage-output bug: dev_q norms 1.0 vs CPU 0.0884
-        // = 1/sqrt(128)) + beta + gate — ONE kernel, zero host round-trips.
-        // (The old hybrid path downloaded conv/b_raw/fb, computed silu/split/
-        // L2/beta/gate on CPU, re-uploaded q/k/v/beta/gate: 9 host crossings.)
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -1480,17 +1503,48 @@ impl CudaBackend {
         let gate = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         let dw_dt = self.dev_weight(w.dt_bias)?;
         let dw_al = self.dev_weight(w.a_log)?;
-        ck(
-            unsafe {
-                ferrite_gdn_prep(
-                    conv_out.as_const_f32(), b_raw.as_const_f32(), fb.as_const_f32(),
-                    dw_dt.as_const_f32(), dw_al.as_const_f32(),
-                    q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
-                    ni, h as i32, dk as i32, lb, self.stream,
-                )
-            },
-            "gdn_prep",
-        )?;
+        if n == 1 {
+            // FUSED decode path (34 gdn layers × 2 kernels → 1): conv FIR +
+            // sliding-window state update + silu/split/L2/beta/gate prep in a
+            // single kernel — kills the conv_out HBM round-trip and one
+            // kernel-boundary cost per layer.
+            ck(
+                unsafe {
+                    ferrite_conv_prep_fused(
+                        qkv.as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                        b_raw.as_const_f32(), fb.as_const_f32(),
+                        dw_dt.as_const_f32(), dw_al.as_const_f32(),
+                        q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
+                        h as i32, dk as i32, lb, self.stream,
+                    )
+                },
+                "conv_prep_fused",
+            )?;
+        } else {
+            let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
+            ck(
+                unsafe {
+                    ferrite_causal_conv1d(
+                        qkv.as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                        conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
+                    )
+                },
+                "conv1d_dev",
+            )?;
+            // 3. GPU pre-processing (ferrite_gdn_prep): silu + split + per-head L2
+            // norm + KDA q-scale + beta + gate — ONE kernel, zero host round-trips.
+            ck(
+                unsafe {
+                    ferrite_gdn_prep(
+                        conv_out.as_const_f32(), b_raw.as_const_f32(), fb.as_const_f32(),
+                        dw_dt.as_const_f32(), dw_al.as_const_f32(),
+                        q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
+                        ni, h as i32, dk as i32, lb, self.stream,
+                    )
+                },
+                "gdn_prep",
+            )?;
+        }
         // PROBE (rank-isolated, prefill-only): download intermediates for
         // CPU-vs-dev divergence diff; normal path stays zero-crossing.
         if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
@@ -1499,9 +1553,6 @@ impl CudaBackend {
                 let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
                 std::fs::write(format!("{dir}/gdn_dev_{name}_r{}.f32", crate::shard_idx()), b).ok();
             };
-            let mut ch = vec![0f32; n * ch];
-            let _ = conv_out.download(&mut ch);
-            d("conv", &ch);
             let mut bh0 = vec![0f32; n * h];
             let _ = b_raw.download(&mut bh0);
             d("braw", &bh0);
@@ -1521,8 +1572,8 @@ impl CudaBackend {
             let _ = gate.download(&mut gth);
             d("gate", &gth);
             eprintln!(
-                "[gdn_probe] dev L0 gpu-prep dumped r{} (conv {} q {} — ferrite_gdn_prep path)",
-                crate::shard_idx(), ch.len(), qh.len()
+                "[gdn_probe] dev L0 gpu-prep dumped r{} (q {} — conv_prep_fused path)",
+                crate::shard_idx(), qh.len()
             );
         }
         // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
