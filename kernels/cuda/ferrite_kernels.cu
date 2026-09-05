@@ -2875,8 +2875,8 @@ __global__ void p2p_ar_sum_kernel(const float* __restrict__ staging, // local [w
 // peer bases); ctr is this rank's local block counter; staging_local /
 // ready_local are this rank's staging row block and flag row.
 extern "C" cudaError_t ferrite_p2p_ar_oneshot(
-    const float* partial, const float* const* staging_tbl,
-    const unsigned* const* ready_tbl, unsigned* ctr,
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* ctr,
     const float* staging_local, const unsigned* ready_local,
     float* out, int n, int world, int my_rank, cudaStream_t s) {
     p2p_ar_down_kernel<<<(n + 255) / 256, 256, 0, s>>>(

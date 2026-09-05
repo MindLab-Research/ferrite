@@ -63,8 +63,8 @@ extern "C" {
     fn ferrite_pdl_exp(mode: i32, iters: i32, out_time_ms: *mut f32,
                        out_checksum: *mut f32, s: CuStream) -> i32;
     fn ferrite_p2p_ar_oneshot(partial: *const f32,
-                               staging_tbl: *const *const f32,
-                               ready_tbl: *const *const u32,
+                               staging_tbl: *const *mut f32,
+                               ready_tbl: *const *mut u32,
                                ctr: *mut u32,
                                staging_local: *const f32,
                                ready_local: *const u32,
@@ -2562,8 +2562,8 @@ impl CudaBackend {
         ck(unsafe {
             ferrite_p2p_ar_oneshot(
                 partial.as_const_f32(),
-                staging_tbl.as_const_f32() as *const *const f32,
-                ready_tbl.as_const_f32() as *const *const u32,
+                staging_tbl.as_f32() as *const *mut f32,
+                ready_tbl.as_f32() as *const *mut u32,
                 ctr.as_f32() as *mut u32,
                 staging_local.as_const_f32(),
                 ready_local.as_const_f32() as *const u32,
