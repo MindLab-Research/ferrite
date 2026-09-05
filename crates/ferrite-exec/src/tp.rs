@@ -786,6 +786,11 @@ impl<B: KernelBackend> TpCluster<B> {
         .collect::<Result<Vec<(f32, f32)>>>()?;
         let (a0, a1) = toks_v[0];
         // 3. accept: d1 == argmax[0] → 2 tokens (d1 + bonus a1); else 1 (a0).
+        let dbg = std::env::var_os("FERRITE_MTP_DEBUG").is_some();
+        if dbg {
+            eprintln!("[mtp] d1={:?} a0={:?} a1={:?} -> {}", d1 as u32, a0 as u32, a1 as u32,
+                     if d1 as u32 == a0 as u32 { "accept2" } else { "fallback" });
+        }
         if d1 as u32 == a0 as u32 {
             // accept 2: ping-pong commit B→A + hprev ← hf_v row 1 (d1's h)
             Self::fan_out(&mut self.shards, |s| {
