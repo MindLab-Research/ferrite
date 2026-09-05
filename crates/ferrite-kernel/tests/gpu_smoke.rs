@@ -728,3 +728,65 @@ fn hc_contract_parity() {
     close(&host_t, &got_t, 1e-5, "hc_contract_dev vs host golden");
     eprintln!("hc_contract_parity: OK (kernel layout (t*n+i)*h+j confirmed)");
 }
+
+/// hc 段微基准：mega-graph 42ms→37.5ms 后 A_hc+C_hc 仍占 17.8ms。分解
+/// hc_pre_split(mix 多块) / rmsnorm / hc_post 的单次耗时（n=1 decode 形态），
+/// 定位剩余 kernel 效率黑洞（hc_pre_rest sinkhorn 单块在 .so 内无法单独测）。
+#[test]
+fn hc_micro_bench() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let stream = dev.stream_handle();
+    let (n, h) = (4usize, 4096usize); // hc_mult, hidden
+    let nh = n * h;
+    let s = 1usize;
+    let iters = 2000;
+    let mut rnd = 0x853c49e6748fea9bu64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    let mut mk = |len: usize| -> Vec<f32> { (0..len).map(|_| r()).collect() };
+    let t = |v: &Vec<f32>| -> Tensor { Tensor::from_f32(Shape::new(vec![v.len()]), v.clone()) };
+
+    let res_v = mk(s * nh);
+    let fn_v = mk(24 * nh); // mix x nh (row-major)
+    let scale_v = mk(s * n);
+    let base_v = mk(24);
+    let x_v = mk(s * h);
+    let post_v = mk(s * n);
+    let comb_v = mk(s * n * n);
+    let w_v = mk(h);
+
+    let res_t = t(&res_v); let fn_t = t(&fn_v); let scale_t = t(&scale_v);
+    let base_t = t(&base_v); let x_t = t(&x_v); let post_t = t(&post_v);
+    let comb_t = t(&comb_v); let w_t = t(&w_v);
+
+    let up = |v: &Vec<f32>| -> DevBuf { let mut b = DevBuf::alloc(dev.dev(), stream, v.len()).unwrap(); b.upload(v).unwrap(); b };
+    let res = up(&res_v); let x = up(&x_v); let post = up(&post_v); let comb = up(&comb_v); let wbuf = up(&w_v);
+
+    // warm + bench hc_pre (split mix + rest)
+    for _ in 0..50 { let _ = dev.hc_pre_dev(&res, &fn_t, &scale_t, &base_t, s, nh, 1e-5, 1e-4, 20); }
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters { let _ = dev.hc_pre_dev(&res, &fn_t, &scale_t, &base_t, s, nh, 1e-5, 1e-4, 20); }
+    let _ = dev.sync();
+    let t_pre = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    // rmsnorm [1, 4096]
+    let _ = dev.rmsnorm_dev(&x, &w_t, 1e-5, s, h);
+    let t1 = std::time::Instant::now();
+    for _ in 0..iters { let _ = dev.rmsnorm_dev(&x, &w_t, 1e-5, s, h); }
+    let _ = dev.sync();
+    let t_rms = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    // hc_post x[s,h]+res[s,n,h] -> [s,n,h]
+    let _ = dev.hc_post_dev(&x, &res, &post, &comb, s, n, h);
+    let t2 = std::time::Instant::now();
+    for _ in 0..iters { let _ = dev.hc_post_dev(&x, &res, &post, &comb, s, n, h); }
+    let _ = dev.sync();
+    let t_post = t2.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    eprintln!(
+        "[hc-bench] hc_pre(split+rest)={:.1}us rmsnorm={:.2}us hc_post={:.1}us | per-layer A(pre+rms)={:.1}us C(post+pre+rms2)={:.1}us x45L={:.1}ms",
+        t_pre, t_rms, t_post, t_pre + t_rms, t_post + t_pre + 2.0 * t_rms,
+        (t_post + t_pre + 2.0 * t_rms) * 45.0 / 1000.0
+    );
+}
