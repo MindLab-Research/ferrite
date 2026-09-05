@@ -2016,7 +2016,7 @@ __global__ void gemv5_bf16_kernel(const float* __restrict__ x,
                                   float* __restrict__ o3, float* __restrict__ o4,
                                   float* __restrict__ o5,
                                   int in_f, int of1, int of2, int of3, int of4, int of5) {
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.x; // one block per row
     int tot = of1 + of2 + of3 + of4 + of5;
     if (row >= tot) return;
     const __nv_bfloat16* wrow;
@@ -2027,8 +2027,18 @@ __global__ void gemv5_bf16_kernel(const float* __restrict__ x,
     else if (row < of1 + of2 + of3 + of4) { wrow = w4 + (size_t)(row - of1 - of2 - of3) * in_f; orow = o4 + (row - of1 - of2 - of3); }
     else { wrow = w5 + (size_t)(row - of1 - of2 - of3 - of4) * in_f; orow = o5 + (row - of1 - of2 - of3 - of4); }
     float acc = 0.f;
-    for (int k = 0; k < in_f; k++) acc += x[k] * __bfloat162float(wrow[k]);
-    *orow = acc;
+    for (int k = threadIdx.x; k < in_f; k += blockDim.x)
+        acc += x[k] * __bfloat162float(wrow[k]);
+    for (int off = 16; off > 0; off >>= 1)
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    __shared__ float red[8];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += red[i];
+        *orow = t;
+    }
 }
 
 extern "C" cudaError_t ferrite_gemv5_bf16(const float* x,
@@ -2040,7 +2050,7 @@ extern "C" cudaError_t ferrite_gemv5_bf16(const float* x,
     int tot = of1 + of2 + of3 + of4 + of5;
     if (tot <= 0) return cudaSuccess;
     dim3 block(256);
-    dim3 grid((tot + 255) / 256);
+    dim3 grid(tot); // one block per output row
     gemv5_bf16_kernel<<<grid, block, 0, s>>>(
         x,
         (const __nv_bfloat16*)w1, (const __nv_bfloat16*)w2, (const __nv_bfloat16*)w3,
