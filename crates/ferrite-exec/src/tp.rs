@@ -824,11 +824,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 }
             }
             for f in 0..num_dsa {
-                // rollback last step's tail append first: the verify input
-                // re-appends t_last, so without this the cache accumulates a
-                // DUPLICATE t_last kv per step (topk fills with repeats →
-                // attention collapses → token self-locks, e.g. d1=a0=a1=1196).
-                cuda.dsa_host_rollback(seq, f, 1);
+                // advance(2): append this step's verify input [t_last, d1].
+                // NO rollback here — the previous step's cache tail
+                // (d1_prev, accepted) is VALID and must stay; the 1196
+                // self-lock's real cause was the accept-1 double state
+                // advance (fixed by the B0 scheme), not cache duplication.
                 cuda.dsa_host_advance(seq, f, 2);
             }
             let mut out = [0f32; 2];
