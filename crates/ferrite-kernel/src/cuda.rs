@@ -705,14 +705,18 @@ impl CudaBackend {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
-        if n == 1 {
+        if n <= 4 {
             // Decode GEMV v2: uint4 vectorized + K-split WPR — 2.09x over v1
             // (bench gemv_v2_bench: 3.11→6.80TB/s lm_head, 2.20→3.91 o_proj,
             // all shapes 1.45-2.18x, maxd 3.8e-6). v1 kept for A/B.
-            ck(unsafe {
-                ferrite_gemv_bf16_v2(x_dev.as_const_f32(), dw.ptr as *const _,
-                                      dbias, do_.as_f32(), in_f, out_f, self.stream)
-            }, "gemv_dev")?;
+            // n<=4 (MTP verify n=2): per-row GEMV — the tiled GEMM wastes a
+            // whole tile on a 2-row batch (verify was 108ms vs 20ms n=1).
+            for r in 0..n {
+                ck(unsafe {
+                    ferrite_gemv_bf16_v2(x_dev.as_const_f32().add(r as usize * in_f as usize), dw.ptr as *const _,
+                                          dbias, do_.as_f32().add(r as usize * out_f as usize), in_f, out_f, self.stream)
+                }, "gemv_dev")?;
+            }
         } else {
             ck(unsafe {
                 ferrite_matmul_bf16(x_dev.as_const_f32(), dw.ptr as *const _,
