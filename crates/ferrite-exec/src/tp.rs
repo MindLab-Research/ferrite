@@ -498,7 +498,9 @@ fn attn_shard(
         // per token. The pool is per-device (ranks don't share) and this
         // rank's op sequence is deterministic → buffer addresses are stable.
         // x_dev/partial are LEAKED (graph replays write them).
-        if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+        if std::env::var_os("FERRITE_GRAPH_LAYER").is_some()
+            && std::env::var_os("FERRITE_NCCL").is_none()
+            && n == 1 {
             use ferrite_kernel::cuda::GraphIO;
             let gname = format!("gdn{}", layer_idx);
             let mut v = vec![0f32; n * hidden];
@@ -1155,7 +1157,9 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                             {
                                 use ferrite_kernel::cuda::GdnLayerWeights;
                                 // graph fast path
-                                if std::env::var_os("FERRITE_GRAPH_LAYER").is_some() && n == 1 {
+                                if std::env::var_os("FERRITE_GRAPH_LAYER").is_some()
+                                    && std::env::var_os("FERRITE_NCCL").is_none()
+                                    && n == 1 {
                                     let gname = format!("gdn{}", layer_idx);
                                     if let Some(ptr) = cuda.graph_run_dev(&gname, hn_slice)? {
                                         return Ok(ptr);
