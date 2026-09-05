@@ -62,6 +62,14 @@ extern "C" {
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_pdl_exp(mode: i32, iters: i32, out_time_ms: *mut f32,
                        out_checksum: *mut f32, s: CuStream) -> i32;
+    fn ferrite_p2p_ar_oneshot(partial: *const f32,
+                               staging_tbl: *const *const f32,
+                               ready_tbl: *const *const u32,
+                               ctr: *mut u32,
+                               staging_local: *const f32,
+                               ready_local: *const u32,
+                               out: *mut f32, n: i32, world: i32, my_rank: i32,
+                               s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_event_create(ev: *mut *mut std::ffi::c_void) -> i32;
     fn ferrite_event_record(ev: *mut std::ffi::c_void, s: CuStream) -> i32;
@@ -2536,6 +2544,33 @@ impl CudaBackend {
         // GPU is still reading it (tp_all_reduce kernel is async).
         self.sync()?;
         Ok(out_mut)
+    }
+
+    /// P2P one-shot all-reduce micro-bench path (TileRT
+    /// ExpertDownAllReduce mode): down kernel writes this rank's partial
+    /// into EVERY rank's staging row via UVA peer writes (NVLink) and
+    /// raises its ready flag; sum kernel spins all world flags then sums
+    /// the local staging rows. staging_tbl/ready_tbl are device arrays of
+    /// world device pointers (peer bases), ctr is this rank's block
+    /// counter, staging_local is [world][n] rows, ready_local is [world].
+    pub fn p2p_ar_oneshot_dev(&self, partial: &DevBuf, staging_tbl: &DevBuf,
+                              ready_tbl: &DevBuf, ctr: &DevBuf,
+                              staging_local: &DevBuf, ready_local: &DevBuf,
+                              out: &mut DevBuf, n: usize, world: usize,
+                              my_rank: usize) -> Result<()> {
+        self.enter();
+        ck(unsafe {
+            ferrite_p2p_ar_oneshot(
+                partial.as_const_f32(),
+                staging_tbl.as_const_f32() as *const *const f32,
+                ready_tbl.as_const_f32() as *const *const u32,
+                ctr.as_f32() as *mut u32,
+                staging_local.as_const_f32(),
+                ready_local.as_const_f32() as *const u32,
+                out.as_f32(), n as i32, world as i32, my_rank as i32,
+                self.stream)
+        }, "p2p_ar_oneshot")?;
+        Ok(())
     }
 }
 

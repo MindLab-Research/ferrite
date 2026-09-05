@@ -2822,3 +2822,68 @@ extern "C" cudaError_t ferrite_pdl_exp(int mode, int iters, float* out_time_ms,
     cudaFree(d_a); cudaFree(d_b);
     return e;
 }
+
+// ============================================================
+// P2P one-shot all-reduce micro-bench (TileRT ExpertDownAllReduce
+// mode): replaces NCCL allreduce for small decode collectives
+// (n*hidden f32). down: each rank writes its partial into ALL ranks'
+// staging slots (UVA peer writes over NVLink) + last block raises MY
+// flag on ALL ranks; sum: spins all local flags, sums local staging
+// [world][n] rows. Flags are reset by the host between iterations
+// (micro-bench protocol; the production version inlines the flag
+// reset into the next round's producer per ready/done handshake).
+// ============================================================
+__global__ void p2p_ar_down_kernel(const float* __restrict__ partial,
+                                   float* const* __restrict__ staging_tbl,
+                                   unsigned* const* __restrict__ ready_tbl,
+                                   unsigned* ctr, int world, int my_rank, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = partial[i];
+        #pragma unroll 4
+        for (int r = 0; r < world; r++) staging_tbl[r][i] = v;
+    }
+    __threadfence_system(); // peer-visible stores before flag
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned prev = atomicAdd(ctr, 1u);
+        if (prev == gridDim.x - 1u) { // last block to finish: all stores visible
+            for (int r = 0; r < world; r++)
+                *(volatile unsigned*)&ready_tbl[r][my_rank] = 1u;
+            *ctr = 0u; // reset for the next launch (stream-ordered)
+        }
+    }
+}
+
+__global__ void p2p_ar_sum_kernel(const float* __restrict__ staging, // local [world][n]
+                                  const unsigned* __restrict__ ready,  // local [world]
+                                  float* __restrict__ out, int world, int n) {
+    if (threadIdx.x == 0) { // every block spins until all ranks' flags are up
+        for (int r = 0; r < world; r++)
+            while (*(volatile unsigned*)&ready[r] == 0u) __nanosleep(100);
+    }
+    __syncthreads();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float acc = 0.f;
+        for (int r = 0; r < world; r++) acc += staging[(size_t)r * n + i];
+        out[i] = acc;
+    }
+}
+
+// staging_tbl/ready_tbl are DEVICE arrays of world device pointers (the
+// peer bases); ctr is this rank's local block counter; staging_local /
+// ready_local are this rank's staging row block and flag row.
+extern "C" cudaError_t ferrite_p2p_ar_oneshot(
+    const float* partial, const float* const* staging_tbl,
+    const unsigned* const* ready_tbl, unsigned* ctr,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, cudaStream_t s) {
+    p2p_ar_down_kernel<<<(n + 255) / 256, 256, 0, s>>>(
+        partial, staging_tbl, ready_tbl, ctr, world, my_rank, n);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    p2p_ar_sum_kernel<<<(n + 255) / 256, 256, 0, s>>>(
+        staging_local, ready_local, out, world, n);
+    return cudaGetLastError();
+}
