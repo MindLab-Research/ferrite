@@ -2840,8 +2840,10 @@ __global__ void p2p_ar_down_kernel(const float* __restrict__ partial,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float v = partial[i];
+        // each rank writes ITS slot row (my_rank) in every peer's staging
+        const size_t off = (size_t)my_rank * n + i;
         #pragma unroll 4
-        for (int r = 0; r < world; r++) staging_tbl[r][i] = v;
+        for (int r = 0; r < world; r++) staging_tbl[r][off] = v;
     }
     __threadfence_system(); // peer-visible stores before flag
     __syncthreads();
