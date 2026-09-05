@@ -2091,23 +2091,23 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             }
         }
         let t_head = std::time::Instant::now();
+        if std::env::var_os("FERRITE_AR_PROBE").is_some() {
+            // dump for cross-path diffing vs the mega-graph's resL/hfinal probes
+            let b: Vec<u8> = h.as_slice().iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write("/tmp/orion/norm_resL.f32", b).ok();
+            let mx0 = h.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
+            eprintln!("[norm] resL maxabs={mx0:.4}");
+        }
         let h_final = if self.full_cfg.mhc {
             crate::mhc::hc_contract(&h, self.full_cfg.hc_mult)
         } else {
             h
         };
         if std::env::var_os("FERRITE_AR_PROBE").is_some() {
-            // dump for cross-path diffing vs the mega-graph's resL/hfinal probes
-            let b: Vec<u8> = h.as_slice().iter().flat_map(|x| x.to_le_bytes()).collect();
-            std::fs::write("/tmp/orion/norm_resL.f32", b).ok();
             let b: Vec<u8> = h_final.as_slice().iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write("/tmp/orion/norm_hfinal.f32", b).ok();
-            let mx = |t: &Tensor| t.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
-            eprintln!(
-                "[norm] resL maxabs={:.4} hfinal maxabs={:.4}",
-                mx(&h),
-                mx(&h_final)
-            );
+            let mx = h_final.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
+            eprintln!("[norm] hfinal maxabs={mx:.4}");
         }
         let tok = {
             // GPU head chain (FERRITE_HEAD_DEV): rmsnorm_dev → lm_head GEMV →
