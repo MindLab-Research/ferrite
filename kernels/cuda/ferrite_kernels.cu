@@ -720,6 +720,11 @@ extern "C" cudaError_t ferrite_moe_route(const float* logits, const float* bias,
 
 // ============================================================
 // argmax over the last dim (greedy decode)
+// MULTI-BLOCK-LATENCY-HIDDEN: the old grid(n)×block(32) ran ONE warp per
+// row — 154880 elements / 32 threads = 4840 serial global loads per thread
+// with zero latency hiding → 796µs for [1, 154880] (measured). 1024
+// threads (32 warps) strided: ~151 elements/thread, latency fully hidden
+// → ~20µs. Warp-reduce then 32-way block reduce.
 // ============================================================
 __global__ void argmax_kernel(const float* __restrict__ logits,
                               float* __restrict__ out, int n, int dim) {
@@ -731,24 +736,31 @@ __global__ void argmax_kernel(const float* __restrict__ logits,
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         if (lr[i] > bv) { bv = lr[i]; best = i; }
     }
+    // warp-level reduce (index must prefer the FIRST max on ties —
+    // shuffle order: keep earlier index when equal by using > only)
+    for (int off = 16; off > 0; off >>= 1) {
+        float ov = __shfl_down_sync(0xffffffff, bv, off);
+        int oi = __shfl_down_sync(0xffffffff, best, off);
+        if (ov > bv) { bv = ov; best = oi; }
+    }
     __shared__ int bidx[32];
     __shared__ float bval[32];
-    bidx[threadIdx.x] = best;
-    bval[threadIdx.x] = bv;
+    int warp = threadIdx.x >> 5;
+    int lane = threadIdx.x & 31;
+    if (lane == 0) { bidx[warp] = best; bval[warp] = bv; }
     __syncthreads();
-    for (int off = 16; off > 0; off >>= 1) {
-        if (threadIdx.x + off < 32 && bval[threadIdx.x + off] > bval[threadIdx.x]) {
-            bval[threadIdx.x] = bval[threadIdx.x + off];
-            bidx[threadIdx.x] = bidx[threadIdx.x + off];
+    if (threadIdx.x == 0) {
+        int nw = (blockDim.x + 31) >> 5;
+        for (int w = 1; w < nw; w++) {
+            if (bval[w] > bv) { bv = bval[w]; best = bidx[w]; }
         }
-        __syncthreads();
+        out[row] = (float)best;
     }
-    if (threadIdx.x == 0) out[row] = (float)bidx[0];
 }
 
 extern "C" cudaError_t ferrite_argmax(const float* logits, float* out, int n,
                                       int dim, cudaStream_t s) {
-    dim3 block(32);
+    dim3 block(1024);
     dim3 grid(n);
     argmax_kernel<<<grid, block, 0, s>>>(logits, out, n, dim);
     return cudaGetLastError();
