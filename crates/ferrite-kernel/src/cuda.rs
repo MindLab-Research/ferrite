@@ -1302,23 +1302,13 @@ impl CudaBackend {
         self.enter();
         let proj = h * dk;
         let ni = n as i32;
-        // 1. six projections (bf16-resident weights) — FUSED first four
-        // (qkv/b/fa/ga share the input x): ONE gemv5 launch replaces 4
-        // separate GEMV launches (3 fewer kernel tails on B300); fb/gb
-        // depend on fa/ga outputs (serial, stay separate).
-        let (qkv, b_raw, fa, ga, _) = self.gemv5_dev(
-            x,
-            w.qkv_proj,
-            w.b_proj,
-            w.f_a,
-            w.g_a,
-            None,
-            hidden as i32,
-            (3 * proj) as i32,
-            h as i32,
-            dk as i32,
-            dk as i32,
-        )?;
+        // 1. six projections (bf16-resident weights). NOTE: the gemv5 fused
+        // same-input kernel measured SLOWER than separate tiled GEMVs
+        // (48.7us vs 40.5us — block-per-row co-op dot loses to the tiled
+        // smem kernel's throughput; graph-replay has no launch tail to
+        // save) — kept separate. gemv5_dev stays for a future tiled fused
+        // version (weight concat at load time).
+        let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
         // PROBE: dump x (input) + qkv (first matmul output) — pinpoints
         // divergence to upload (x wrong) vs matmul/weights (qkv wrong)
         if std::env::var_os("FERRITE_GDN_PROBE").is_some() && layer == 0 && n > 1 {
@@ -1335,7 +1325,10 @@ impl CudaBackend {
             d("qkv", &qh);
             eprintln!("[gdn_probe] dev L0 x/qkv dumped: x {} qkv {} (n={} proj={})", xh.len(), qh.len(), n, proj);
         }
+        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
+        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
+        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?;
         let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
         // 2. causal conv — resident tail state (RMW in place: the kernel
         // reads state_in into smem at block start, writes state_out at end,
@@ -1495,34 +1488,22 @@ impl CudaBackend {
         let ni = n as i32;
         let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
 
-        // 1-6. FUSED first-five same-input GEMVs — qa/latent/ki_raw/w_idx/gate
-        // all project the same x: ONE gemv5 launch replaces 5 separate GEMV
-        // launches (4 fewer kernel tails on B300, ~10-15us each).
-        let (qa, latent, ki_raw, w_idx, gate5) = self.gemv5_dev(
-            x,
-            w.q_a,
-            w.kv_a,
-            w.wk,
-            w.weights_proj,
-            Some(w.gate),
-            hidden as i32,
-            (w.q_a.shape.0[0]) as i32,
-            (w.kv_a.shape.0[0]) as i32,
-            idm as i32,
-            ih as i32,
-        )?;
-        let gate = gate5.expect("gemv5 with w5 returns o5");
+        // 1. query path: qa → rmsnorm → qb [n, h*dk]. (gemv5 fused same-input
+        // GEMV measured SLOWER than separate tiled — see gdn note.)
+        let qa = self.matmul_dev(x, w.q_a, ni, hidden as i32, (w.q_a.shape.0[0]) as i32)?;
         let qa_ln = self.rmsnorm_dev(&qa, w.q_a_ln, w.rms_eps, n, w.q_a.shape.0[0])?;
         let qb = self.matmul_dev(&qa_ln, w.q_b, ni, w.q_a.shape.0[0] as i32, (h * dk) as i32)?;
 
-        // 2b. kv path: latent → rmsnorm → kvb [n, h*(dk+dv)]
+        // 2. kv path: latent → rmsnorm → kvb [n, h*(dk+dv)]
+        let latent = self.matmul_dev(x, w.kv_a, ni, hidden as i32, (w.kv_a.shape.0[0]) as i32)?;
         let kv_ln = self.rmsnorm_dev(&latent, w.kv_a_ln, w.rms_eps, n, w.kv_a.shape.0[0])?;
         let kvb = self.matmul_dev(&kv_ln, w.kv_b, ni, w.kv_a.shape.0[0] as i32, (h * (dk + dv)) as i32)?;
 
-        // 3b. indexer queries: qi = qa_ln @ wq_b [n, ih*idm]
+        // 3. indexer queries: qi = qa @ wq_b [n, ih*idm]
         let qi = self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?;
 
-        // 4b. index keys: ki = LayerNorm(ki_raw)(k_norm affine) [n, idm]
+        // 4. index keys: ki = LayerNorm(x @ wk)(k_norm affine) [n, idm]
+        let ki_raw = self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?;
         let ki = DevBuf::alloc(self.dev, self.stream, n * idm)?;
         let knw = self.dev_weight(w.k_norm_w)?;
         let knb = self.dev_weight(w.k_norm_b)?;
@@ -1531,11 +1512,15 @@ impl CudaBackend {
             "dsa_layernorm",
         )?;
 
-        // 5b. per-head score weights: w_idx × ih^-0.5
+        // 5. per-head score weights: w_idx = (x @ weights_proj) × ih^-0.5 [n, ih]
+        let w_idx = self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?;
         ck(
             unsafe { ferrite_scale_inplace(w_idx.as_f32(), (ih as f32).sqrt().recip(), (n * ih) as i32, self.stream) },
             "dsa_widx_scale",
         )?;
+
+        // 6. kpool gate scores: gate = x @ compress_gate [n, idm]
+        let gate = self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?;
 
         // 7. cache append (device-resident, in place at slot t0)
         let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, t0) = {
