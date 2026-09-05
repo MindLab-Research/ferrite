@@ -715,7 +715,7 @@ impl CudaBackend {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
-        if n == 1 || (n <= 2 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
+        if n == 1 || (n <= 3 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
             // Decode GEMV v2: uint4 vectorized + K-split WPR — 2.09x over v1
             // (bench gemv_v2_bench: 3.11→6.80TB/s lm_head, 2.20→3.91 o_proj,
             // all shapes 1.45-2.18x, maxd 3.8e-6). v1 kept for A/B.
