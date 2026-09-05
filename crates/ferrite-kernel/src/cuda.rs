@@ -2177,7 +2177,8 @@ impl CudaBackend {
         let li = DevBuf::alloc(self.dev, self.stream, s * h)?;
         let post = DevBuf::alloc(self.dev, self.stream, s * n)?;
         let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
-        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * mix)?;
+        // K-split partials: s * mix * HC_MIX_KS(8) lanes
+        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * mix * 8)?;
         // SPLIT version (grid(s, mix) — one block per mix row): the
         // single-block kernel ran on ONE SM (~6GB/s of 8TB/s HBM); the mix
         // GEMV (16384×18432) was 57% of the decode step (A_hc+C_hc 24ms of

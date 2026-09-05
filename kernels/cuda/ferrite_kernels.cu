@@ -2304,45 +2304,44 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // redundantly per block (x is L2-cached after the first read).
 // Expected: 0.18ms → ~0.01ms (16x).
 // ============================================================
+// K-SPLIT lanes per mix row in hc_pre phase 1 (gridDim.z): 24 mix rows × 8
+// = 192 blocks = 130% SM occupancy on B300 (148 SMs) vs 24 blocks (16%).
+#define HC_MIX_KS 8
+
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
-                                        float* __restrict__ mx_out,
+                                        float* __restrict__ mx_partial,
                                         int s, int n, int h, int mix,
                                         float rms_eps) {
+    // K-SPLIT: gridDim.z = KS lanes per mix row — 24 mix rows × 8 lanes =
+    // 192 blocks (130% SM) vs the old 24-block single-lane version (16% SM,
+    // each block serially dotting the full 18432-dim row). Each lane dots
+    // its 1/KS segment; the rest kernel's prologue sums the KS partials and
+    // applies rsq (rsq itself moved there too — phase 1 is a pure dot now).
+    const int KS = gridDim.z;
     int t = blockIdx.x;
     int m = blockIdx.y;
+    int z = blockIdx.z;
     if (t >= s || m >= mix) return;
     const float* x = res + (size_t)t * n * h;
     const int nh = n * h;
     const float* row = fw + (size_t)m * nh;
+    int seg = (nh + KS - 1) / KS;
+    int lo = z * seg;
+    int hi = min(lo + seg, nh);
 
-    // rsq (redundant per block — x is L2-cached, 64KB)
-    float part = 0.f;
-    for (int i = threadIdx.x; i < nh; i += blockDim.x) part += x[i] * x[i];
-    __shared__ float red[8];
-    for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffff, part, off);
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
-    __syncthreads();
-    float msq = 0.f;
-    if (threadIdx.x == 0) {
-        for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
-    }
-    __shared__ float rsq_s;
-    if (threadIdx.x == 0) rsq_s = rsqrtf(msq / (float)nh + rms_eps);
-    __syncthreads();
-    float rsq = rsq_s;
-
-    // mix m's dot product (256 threads, coalesced)
     float acc = 0.f;
-    for (int i = threadIdx.x; i < nh; i += blockDim.x) acc += row[i] * x[i];
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) acc += row[i] * x[i];
+    __shared__ float red[8];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
     __syncthreads();
     if (threadIdx.x == 0) {
         float tot = 0.f;
         for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
-        mx_out[(size_t)t * mix + m] = tot * rsq;
+        mx_partial[((size_t)t * mix + m) * KS + z] = tot;
     }
+    (void)rms_eps;
 }
 
 // The REST of hc_pre: reads pre-computed mx from global memory, does
@@ -2355,19 +2354,42 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
                                    float* __restrict__ li,
                                    float* __restrict__ post,
                                    float* __restrict__ comb,
-                                   int s, int n, int h, int mix,
+                                   int s, int n, int h, int mix, int mix_ks,
                                    float rms_eps, float hc_eps, int iters) {
     int t = blockIdx.x;
     if (t >= s) return;
     const float* x = res + (size_t)t * n * h;
     const int nh = n * h;
     extern __shared__ float sm[];
-    float* cb = sm;          // [n*n]
-    float* pre_s = sm + n * n; // [n]
-    float* li_s = sm + n * n + n; // [h] fused-norm staging (rmsnorm parity)
-    float* red = li_s + h;   // [8] warp partials
+    float* mx_s = sm;               // [mix] K-split partials reduced here
+    float* cb = sm + mix;           // [n*n]
+    float* pre_s = sm + mix + n * n; // [n]
+    float* li_s = sm + mix + n * n + n; // [h] fused-norm staging (rmsnorm parity)
+    float* red = li_s + h;   // [8+8] warp partials (mx prologue + norm tail)
 
-    const float* mx = mx_in + (size_t)t * mix;
+    // PROLOGUE (K-split phase-2): reduce the KS partial dots per mix row
+    // and apply rsq (Σx² block reduce — was phase-1 per-block redundant).
+    // mx_in layout: [t][mix][ks] partials from hc_pre_mix_split_kernel.
+    {
+        float part = 0.f;
+        for (int i = threadIdx.x; i < nh; i += blockDim.x) part += x[i] * x[i];
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffff, part, off);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
+        __syncthreads();
+        float msq = 0.f;
+        if (threadIdx.x == 0) {
+            for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
+            red[15] = rsqrtf(msq / (float)nh + rms_eps);
+        }
+        // reduce partials: thread m sums its mix row's ks lanes
+        for (int m = threadIdx.x; m < mix; m += blockDim.x) {
+            float acc = 0.f;
+            for (int z = 0; z < mix_ks; z++) acc += mx_in[((size_t)t * mix + m) * mix_ks + z];
+            mx_s[m] = acc * red[15];
+        }
+        __syncthreads();
+    }
+    const float* mx = mx_s;
 
     // pre / layer_input, post, comb (parallel across n for sigmoid)
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -2445,8 +2467,11 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
                                             int s, int n, int h, int mix,
                                             float rms_eps, float hc_eps, int iters,
                                             cudaStream_t stream) {
-    // Phase 1: multi-block mix computation (grid(s, mix) — one block per mix)
-    dim3 mix_grid(s, mix);
+    // Phase 1: K-SPLIT mix computation — grid(s, mix, KS=8) = 192 blocks
+    // (130% SM) vs the old (s, mix) = 24 blocks (16% SM, each block serially
+    // dotting the full 18432-dim row). Each lane dots its 1/8 segment into
+    // mx_partial; the rest kernel's prologue sums the 8 lanes and applies rsq.
+    dim3 mix_grid(s, mix, HC_MIX_KS);
     hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
         res, fw, mx_scratch, s, n, h, mix, rms_eps);
     cudaError_t e = cudaGetLastError();
@@ -2455,11 +2480,12 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     // Phase 2: rest (single block per token — sinkhorn + li + post + comb)
     // + FUSED rmsnorm tail (nw = input_layernorm weight): li comes out
     // normalized — saves the standalone rmsnorm launch per layer segment.
-    // smem: cb[n*n] + pre_s[n] + li_s[h] + red[8]  (h=4096 → ~16.5KB)
-    size_t smem2 = ((size_t)(n * n + n) + h + 8) * sizeof(float);
+    // PROLOGUE: reduce the KS mix partials + rsq (Σx²).
+    // smem: mx_s[mix] + cb[n*n] + pre_s[n] + li_s[h] + red[8]  (~16.6KB)
+    size_t smem2 = ((size_t)(mix + n * n + n) + h + 16) * sizeof(float);
     hc_pre_rest_kernel<<<s, 256, smem2, stream>>>(
         res, mx_scratch, scale, base, nw, li, post, comb,
-        s, n, h, mix, rms_eps, hc_eps, iters);
+        s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
     return cudaGetLastError();
 }
 
