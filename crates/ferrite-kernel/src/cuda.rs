@@ -1081,6 +1081,15 @@ impl CudaBackend {
         if r != 0 { panic!("cudaEventElapsedTime failed: {r}"); }
         ms
     }
+
+    /// Non-panicking event_elapsed (diagnostics must never kill serve):
+    /// Ok(ms) or Err(cuda code). MTP verify-graph reads hit cudaErrorInvalidValue
+    /// when an event pair was never recorded (capture-time created, replay-order).
+    pub fn event_elapsed_try(&self, a: *mut std::ffi::c_void, b: *mut std::ffi::c_void) -> Result<f32, i32> {
+        let mut ms = 0f32;
+        let r = unsafe { ferrite_event_elapsed(a, b, &mut ms) };
+        if r != 0 { Err(r) } else { Ok(ms) }
+    }
 }
 
 /// Mega-graph segment events (rank-0): created during the capture pass

@@ -866,7 +866,9 @@ impl<B: KernelBackend> TpCluster<B> {
         let t_verify = t_v.elapsed();
         // Event-in-graph segment times for the VERIFY graph (same layout as
         // the decode-path reader: es[0] input, per layer 4 events, head) —
-        // diagnostic for the n=3 vs n=1 per-segment cost split.
+        // diagnostic for the n=3 vs n=1 per-segment cost split. Fault-tolerant
+        // reads (event pairs never recorded -> cudaErrorInvalidValue): skip
+        // the segment, print the offending pair once per step.
         if std::env::var_os("FERRITE_MEGA_EVTS").is_some() {
             let es = ferrite_kernel::cuda::MEGA_EVTS.lock().unwrap();
             let nl = plans.len();
@@ -876,8 +878,17 @@ impl<B: KernelBackend> TpCluster<B> {
                     .as_cuda()
                     .ok_or_else(|| FerriteError::Config("FERRITE_MEGA_EVTS needs cuda".into()))?;
                 cuda0.enter();
-                let el = |a: usize, b: usize| {
-                    cuda0.event_elapsed_ms(a as *mut std::ffi::c_void, b as *mut std::ffi::c_void) as f64
+                let el = |a: usize, b: usize| -> f64 {
+                    match cuda0.event_elapsed_try(
+                        a as *mut std::ffi::c_void,
+                        b as *mut std::ffi::c_void,
+                    ) {
+                        Ok(ms) => ms as f64,
+                        Err(code) => {
+                            eprintln!("[evts-v] elapsed err {code} on pair ({a},{b}) — skipped");
+                            0.0
+                        }
+                    }
                 };
                 let (mut a_hc, mut b_gdn, mut b_dsa, mut c_hc, mut de_ffn) =
                     (0f64, 0f64, 0f64, 0f64, 0f64);
