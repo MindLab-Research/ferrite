@@ -1171,6 +1171,11 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                                     la.num_heads, la.head_dim, la.gate_lower_bound,
                                     s.cfg.rms_norm_eps, la.short_conv_kernel_size,
                                 )?;
+                                // CRITICAL: sync this rank's stream before returning
+                                // the device pointer — the P2P all-reduce on rank 0
+                                // copies from this buffer, but GPU ops are ASYNC.
+                                // Without the sync, rank 0 reads stale/uninitialized data.
+                                cuda.sync()?;
                                 Ok(partial.as_f32() as usize)
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1206,6 +1211,8 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                                 };
                                 let family = s.dsa_family_index(layer_idx);
                                 let partial = cuda.dsa_layer_dev(&x_dev, &w, seq, family, n, hidden)?;
+                                // Sync before P2P copy (GPU ops are async)
+                                cuda.sync()?;
                                 Ok(partial.as_f32() as usize)
                             }
                             #[cfg(not(feature = "cuda"))]
@@ -1311,6 +1318,8 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                         let u = cuda.matmul_dev(&x_dev, w_up, n as i32, hi, inter)?;
                         let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, s.cfg.swiglu_limit)?;
                         let d = cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?;
+                        // Sync before P2P copy (GPU ops are async)
+                        cuda.sync()?;
                         Ok(d.as_f32() as usize)
                     }
                     MlpKind::Moe => {
@@ -1392,6 +1401,8 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                             &mut probs_scratch, n, hidden2, topk, e,
                             cfg.routed_scaling_factor, cfg.swiglu_limit,
                         )?;
+                        // Sync before P2P copy (GPU ops are async)
+                        cuda.sync()?;
                         Ok(out_dev.as_f32() as usize)
                     }
                 }
