@@ -789,7 +789,7 @@ fn mega_chain_dev(
                 let mut pv = vec![0f32; hidden];
                 if hfn.download(&mut pv).is_ok() {
                     let mx = pv.iter().fold(0f32, |acc, x| acc.max(x.abs()));
-                    eprintln!("[mega] L{layer_idx:02} hfn in={mx:.4}", mx);
+                    eprintln!("[mega] L{layer_idx:02} hfn in={mx:.4}");
                 }
             }
         }
