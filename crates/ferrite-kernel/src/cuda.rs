@@ -1516,6 +1516,7 @@ impl CudaBackend {
         lb: f32,
         rms_eps: f32,
         conv_size: usize,
+        state_override: Option<(*mut f32, *mut f32)>, // (conv, gdn) verify scratch
     ) -> Result<DevBuf> {
         self.enter();
         let proj = h * dk;
@@ -1568,7 +1569,10 @@ impl CudaBackend {
         let ch = 3 * proj;
         let hist = conv_size.saturating_sub(1).max(1);
         let dw_conv = self.dev_weight(w.conv_w)?;
-        let conv_state = self.dev_state(&self.conv_states, (seq, layer), ch * hist)?;
+        let conv_state = match state_override {
+            Some((cs, _)) => cs,
+            None => self.dev_state(&self.conv_states, (seq, layer), ch * hist)?,
+        };
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -1650,7 +1654,10 @@ impl CudaBackend {
         // 4. gated-deltanet core — resident [h, dk, dk] state (per-head
         // blocks read-modify-write their own slice; single buffer is safe).
         // v2: state staged in smem (padded stride dk+1) — HBM 7 passes → 2.
-        let gdn_state = self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?;
+        let gdn_state = match state_override {
+            Some((_, gs)) => gs,
+            None => self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?,
+        };
         let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         if n == 1 {
             // knife 1b: v2p — prologue computes L2 norm, KDA gate and beta
@@ -2640,6 +2647,23 @@ impl CudaBackend {
             )
         }, "mtp_eh_seg")?;
         Ok(seg)
+    }
+
+    /// D2D copy with source offset (elements): dst[0..n] = src[src_off..src_off+n].
+    /// Used by the MTP verify chain to export h_final's last row into the
+    /// draft's fixed h_prev staging buffer (capture-safe graph node).
+    pub fn copy_dev(&self, src: &DevBuf, src_off: usize, dst: *mut f32, n: usize) -> Result<()> {
+        self.enter();
+        ck(unsafe {
+            cudaMemcpyAsync(
+                dst as *mut std::ffi::c_void,
+                (src.as_const_f32() as *const u8).add(src_off * 4) as *const std::ffi::c_void,
+                n * 4,
+                CUDA_MEMCPY_D2D,
+                self.stream,
+            )
+        }, "copy_dev")?;
+        Ok(())
     }
 }
 

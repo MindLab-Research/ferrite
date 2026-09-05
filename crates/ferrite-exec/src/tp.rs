@@ -326,6 +326,18 @@ pub fn all_gather_rows(parts: &[Tensor]) -> Tensor {
 
 use ferrite_kernel::KernelBackend;
 
+/// Verify-chain IO for MTP speculative decoding (n=2/3 graphs):
+/// - gdn_scratch: per-GDN-layer (conv_state, gdn_state) scratch ptrs — the
+///   ping-pong B buffers so verify's t-recurrence never touches the main
+///   state until accept commits;
+/// - h_final: the verify chain's last hc_post residual row (h_prev for the
+///   MTP draft's eh_proj) exported via a capture-safe D2D graph node.
+#[cfg(feature = "cuda")]
+pub(crate) struct VerifyIO {
+    pub gdn_scratch: Vec<(*mut f32, *mut f32)>, // [n_gdn_layers] (conv, gdn)
+    pub h_final: *mut f32,                        // [hidden] staging
+}
+
 /// A tensor-parallel cluster: `world` engines, each holding its TP shard of
 /// the weights (head-split attention, row/col-split MLP, expert-slice MoE).
 /// Attention and FFN outputs are partial sums; the cluster all-reduces them
@@ -521,10 +533,10 @@ impl<B: KernelBackend> TpCluster<B> {
             // exact worker that captures next.
             let t0 = std::time::Instant::now();
             let toks = Self::fan_out(&mut self.shards, |s| {
-                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname)
+                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname, 1, None)
             })
             .into_iter()
-            .collect::<Result<Vec<f32>>>()?;
+            .collect::<Result<Vec<Vec<f32>>>>()?;
             let t_dry = t0.elapsed();
             if std::env::var_os("FERRITE_MEGA_DRY").is_some() {
                 // DRY mode: skip capture/replay — every step runs the real
@@ -532,13 +544,13 @@ impl<B: KernelBackend> TpCluster<B> {
                 // dry output garbage → chain-semantics bug.
                 eprintln!(
                             "[mega] DRY mode step (in={last} tok={}): dry-run {:.1}ms — no capture",
-                            toks[0], t_dry.as_secs_f32() * 1e3
+                            toks[0][0], t_dry.as_secs_f32() * 1e3
                         );
                                         // every shard's seq_runtime must track the sampled token — the NEXT
                 // step's input embeds tokens.last() (decode_step_normal pushes at its
                 // tail; mega omitted it → input token froze at the prompt's last
                 // token → output self-locked to one token)
-                let tok = toks[0] as u32;
+                let tok = toks[0][0] as u32;
                 for s in &mut self.shards {
                     if let Some(rt) = s.seq_runtime_mut(seq) {
                         rt.tokens.push(tok);
@@ -552,10 +564,10 @@ impl<B: KernelBackend> TpCluster<B> {
             // is deadlock-free (the nccl test proved it).
             let tc = std::time::Instant::now();
             Self::fan_out(&mut self.shards, |s| {
-                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname)
+                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname, 1, None)
             })
             .into_iter()
-            .collect::<Result<Vec<f32>>>()?;
+            .collect::<Result<Vec<Vec<f32>>>>()?;
             self.mega_seq = Some(seq);
             eprintln!(
                 "[mega] captured {gname}: {} layers, {} NCCL ARs/rank; dry-run {:.1}ms + capture {:.1}ms",
@@ -569,7 +581,7 @@ impl<B: KernelBackend> TpCluster<B> {
             // decode_step_normal pushes at its tail; mega omitted it → the
             // next step's input token froze at the prompt's last token →
             // output self-locked to one token.
-            let tok = toks[0] as u32;
+            let tok = toks[0][0] as u32;
             for s in &mut self.shards {
                 if let Some(rt) = s.seq_runtime_mut(seq) {
                     rt.tokens.push(tok);
@@ -693,7 +705,9 @@ fn mega_chain_dev(
     num_dsa: usize,
     capture: bool,
     gname: &str,
-) -> Result<f32> {
+    n: usize,
+    verify: Option<&VerifyIO>,
+) -> Result<Vec<f32>> {
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights, GdnLayerWeights, GraphIO};
     let cuda = s
         .backend
@@ -707,7 +721,6 @@ fn mega_chain_dev(
     let cfg = &s.cfg;
     let (hidden, hc_mult) = (cfg.hidden_size, cfg.hc_mult);
     let nh = hc_mult * hidden;
-    let n = 1usize;
     let topk = cfg.num_experts_per_tok;
     let e = cfg.n_routed_experts;
 
@@ -786,6 +799,7 @@ fn mega_chain_dev(
     };
     mprobe!("res0", &res, nh);
 
+    let mut gdn_idx = 0usize; // verify scratch index (GDN layers only)
     for (layer_idx, plan) in plans.iter().enumerate() {
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
@@ -833,10 +847,12 @@ fn mega_chain_dev(
                     o_norm: s.w(&format!("{pfx}.self_attn.o_norm.weight"))?,
                     o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
                 };
+                let state_override = verify.and_then(|v| v.gdn_scratch.get(gdn_idx)).copied();
+                gdn_idx += 1;
                 cuda.gdn_layer_dev(
                     &hn, &gw, seq, layer_idx, n, hidden,
                     la.num_heads, la.head_dim, la.gate_lower_bound,
-                    cfg.rms_norm_eps, la.short_conv_kernel_size,
+                    cfg.rms_norm_eps, la.short_conv_kernel_size, state_override,
                 )?
             }
             AttnKind::Dsa => {
@@ -1015,6 +1031,11 @@ fn mega_chain_dev(
     // identical data after the ARs, replicated weights)
     let t_hs = std::time::Instant::now();
     let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
+    // verify mode: export the LAST row of h_final (the verify chain's
+    // final token residual) into the MTP draft's fixed h_prev buffer.
+    if let Some(v) = verify {
+        cuda.copy_dev(&h_final, (n - 1) * hidden, v.h_final, hidden)?;
+    }
     mprobe!("hfinal", &h_final, hidden);
     let hn_head = cuda.rmsnorm_dev(
         &h_final,
@@ -1049,9 +1070,9 @@ fn mega_chain_dev(
         // the pass's virtual t_count advance land exactly on the real cache
         // count (dry-run's tokens). replay-side dsa_host_advance keeps it
         // in lockstep from here on.
-        Ok(0.0)
+        Ok(Vec::new())
     } else {
-        let mut tv = vec![0f32; 1];
+        let mut tv = vec![0f32; n];
         arg.download(&mut tv)?;
         if tm {
             let _ = cuda.sync();
@@ -1076,7 +1097,7 @@ fn mega_chain_dev(
                 t_head
             );
         }
-        Ok(tv[0])
+        Ok(tv)
     }
 }
 
@@ -1148,7 +1169,7 @@ fn attn_shard(
                 let _wp = cuda.gdn_layer_dev(
                     &wx, &gw, seq, layer_idx, n, hidden,
                     la.num_heads, la.head_dim, la.gate_lower_bound,
-                    s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+                    s.cfg.rms_norm_eps, la.short_conv_kernel_size, None,
                 )?;
             } // drops return everything to the pool
             cuda.graph_capture_begin();
@@ -1157,7 +1178,7 @@ fn attn_shard(
             let partial = cuda.gdn_layer_dev(
                 &x_dev, &gw, seq, layer_idx, n, hidden,
                 la.num_heads, la.head_dim, la.gate_lower_bound,
-                s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+                s.cfg.rms_norm_eps, la.short_conv_kernel_size, None,
             )?;
             cuda.graph_capture_end(&gname);
             cuda.graph_io_put(
@@ -1192,7 +1213,7 @@ fn attn_shard(
         let partial = cuda.gdn_layer_dev(
             &x_dev, &gw, seq, layer_idx, n, hidden,
             la.num_heads, la.head_dim, la.gate_lower_bound,
-            s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+            s.cfg.rms_norm_eps, la.short_conv_kernel_size, None,
         )?;
         if let Some(ch) = &s.nccl {
             // TP all-reduce on-device (replaces the host download→sum→upload
@@ -1810,7 +1831,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                                 let partial = cuda.gdn_layer_dev(
                                     &x_dev, &gw, seq, layer_idx, n, hidden,
                                     la.num_heads, la.head_dim, la.gate_lower_bound,
-                                    s.cfg.rms_norm_eps, la.short_conv_kernel_size,
+                                    s.cfg.rms_norm_eps, la.short_conv_kernel_size, None,
                                 )?;
                                 // CRITICAL: sync this rank's stream before returning
                                 // the device pointer — the P2P all-reduce on rank 0

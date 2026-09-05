@@ -95,7 +95,7 @@ fn gdn_device_chain_matches_cpu() {
                 dk,
                 la.gate_lower_bound,
                 cfg.rms_norm_eps,
-                la.short_conv_kernel_size,
+                la.short_conv_kernel_size, None,
             )
             .expect("gdn_layer_dev");
         let mut out_gpu = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
@@ -158,7 +158,7 @@ fn gdn_device_chain_tp4_shard() {
         let partial = dev
             .gdn_layer_dev(
                 &x_dev, &gw, 0, 0, n, hidden, h, dk,
-                la.gate_lower_bound, cfg.rms_norm_eps, la.short_conv_kernel_size,
+                la.gate_lower_bound, cfg.rms_norm_eps, la.short_conv_kernel_size, None,
             )
             .expect("gdn_layer_dev");
         let mut out_gpu = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
@@ -238,7 +238,7 @@ fn gdn_device_chain_real_shapes() {
         let partial = dev
             .gdn_layer_dev(
                 &x_dev, &gw, 0, 0, n, hidden, h, dk,
-                la.gate_lower_bound, cfg.rms_norm_eps, la.short_conv_kernel_size,
+                la.gate_lower_bound, cfg.rms_norm_eps, la.short_conv_kernel_size, None,
             )
             .expect("gdn_layer_dev");
         let mut out_gpu = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
