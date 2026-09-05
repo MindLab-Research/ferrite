@@ -2713,6 +2713,47 @@ extern "C" cudaError_t ferrite_pdl_exp(int mode, int iters, float* out_time_ms,
     cudaMemset(d_b, 0, sizeof(float));
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
+    if (mode >= 2) {
+        // GRAPH-CAPTURED chains: does the PDL attribute survive stream capture?
+        // mode 2 = normal launches captured; mode 3 = cudaLaunchKernelEx + PDL
+        // attr captured. Same A→B dependency chain ×16 per graph, replay iters.
+        cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
+        for (int it = 0; it < 16; it++) {
+            if (mode == 3) {
+                cudaLaunchConfig_t cfg = {};
+                cfg.gridDim = dim3(1); cfg.blockDim = dim3(256); cfg.stream = s;
+                cudaLaunchAttribute attrs[1];
+                attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+                attrs[0].val.programmaticStreamSerializationAllowed = 1;
+                cfg.attrs = attrs; cfg.numAttrs = 1;
+                cudaLaunchKernelEx(&cfg, pdl_a_kernel, d_a, 200);
+                cudaLaunchKernelEx(&cfg, pdl_b_kernel, (const float*)d_a, d_b);
+            } else {
+                pdl_a_kernel<<<1, 256, 0, s>>>(d_a, 200);
+                pdl_b_kernel<<<1, 256, 0, s>>>((const float*)d_a, d_b);
+            }
+        }
+        cudaGraph_t g;
+        if ((e = cudaStreamEndCapture(s, &g)) != cudaSuccess) { cudaFree(d_a); cudaFree(d_b); return e; }
+        cudaGraphExec_t ge;
+        if ((e = cudaGraphInstantiate(&ge, g, NULL, NULL, 0)) != cudaSuccess) { cudaGraphDestroy(g); cudaFree(d_a); cudaFree(d_b); return e; }
+        cudaGraphDestroy(g);
+        cudaGraphLaunch(ge, s); // warm
+        cudaStreamSynchronize(s);
+        cudaMemset(d_b, 0, sizeof(float));
+        cudaEventRecord(e0, s);
+        for (int it = 0; it < iters; it++) cudaGraphLaunch(ge, s);
+        cudaEventRecord(e1, s);
+        cudaEventSynchronize(e1);
+        float ms;
+        cudaEventElapsedTime(&ms, e0, e1);
+        *out_time_ms = ms;
+        e = cudaMemcpy(out_checksum, d_b, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaGraphExecDestroy(ge);
+        cudaEventDestroy(e0); cudaEventDestroy(e1);
+        cudaFree(d_a); cudaFree(d_b);
+        return e;
+    }
     cudaEventRecord(e0, s);
     for (int it = 0; it < iters; it++) {
         if (mode == 1) {

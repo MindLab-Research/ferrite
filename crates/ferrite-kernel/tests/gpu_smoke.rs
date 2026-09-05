@@ -1329,7 +1329,16 @@ fn pdl_exp() {
     let (t_norm, c_norm) = dev.pdl_exp_dev(0, 200).expect("normal");
     let _ = dev.pdl_exp_dev(1, 200).expect("warm pdl");
     let (t_pdl, c_pdl) = dev.pdl_exp_dev(1, 200).expect("pdl");
-    eprintln!("[pdl] normal {:.3}ms vs pdl {:.3}ms per 200 chains ({:.1}x), checksums {:.4} / {:.4}",
-              t_norm, t_pdl, t_norm / t_pdl.max(1e-9), c_norm, c_pdl);
+    // GRAPH-CAPTURED: does the PDL attribute survive stream capture?
+    // (mode 2 = normal captured, mode 3 = PDL captured; 16 chains/graph × 200 replays)
+    let _ = dev.pdl_exp_dev(2, 50).expect("warm g2");
+    let (t_g_norm, c_gn) = dev.pdl_exp_dev(2, 200).expect("graph normal");
+    let _ = dev.pdl_exp_dev(3, 50).expect("warm g3");
+    let (t_g_pdl, c_gp) = dev.pdl_exp_dev(3, 200).expect("graph pdl");
+    eprintln!("[pdl] stream: normal {:.3}ms vs pdl {:.3}ms ({:.1}x) | graph: normal {:.3}ms vs pdl {:.3}ms ({:.1}x) per 200, checksums {:.4}/{:.4}/{:.4}/{:.4}",
+              t_norm, t_pdl, t_norm / t_pdl.max(1e-9),
+              t_g_norm, t_g_pdl, t_g_norm / t_g_pdl.max(1e-9),
+              c_norm, c_pdl, c_gn, c_gp);
     assert!((c_norm - c_pdl).abs() < 1e-3 * c_norm.abs().max(1.0), "PDL checksum mismatch");
+    assert!((c_gn - c_gp).abs() < 1e-3 * c_gn.abs().max(1.0), "graph PDL checksum mismatch");
 }
