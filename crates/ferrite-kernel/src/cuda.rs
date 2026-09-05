@@ -1990,15 +1990,18 @@ impl CudaBackend {
         let post = DevBuf::alloc(self.dev, self.stream, s * n)?;
         let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
         let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * mix)?;
-        // Use the ORIGINAL single-block kernel — the SPLIT version (grid(s,mix))
-        // triggers err 900 during graph capture (mx_scratch pool size class not
-        // warm in capture-mode thread). The split approach works but needs
-        // pool warm-up inside the capture path — deferred to mega-graph.
+        // SPLIT version (grid(s, mix) — one block per mix row): the
+        // single-block kernel ran on ONE SM (~6GB/s of 8TB/s HBM); the mix
+        // GEMV (16384×18432) was 57% of the decode step (A_hc+C_hc 24ms of
+        // 42ms). The original err-900 capture concern (mx_scratch pool
+        // class not warm in capture thread) is gone under the mega-graph:
+        // the dry-run warms the pool on the SAME worker that captures.
         ck(
             unsafe {
-                ferrite_hc_pre(
+                ferrite_hc_pre_split(
                     res.as_const_f32(), dfw.as_const_f32(), dsc.as_const_f32(), dba.as_const_f32(),
                     li.as_f32(), post.as_f32(), comb.as_f32(),
+                    mx_scratch.as_f32(),
                     s as i32, n as i32, h as i32, mix as i32,
                     rms_eps, hc_eps, sinkhorn_iters as i32, self.stream,
                 )
