@@ -374,6 +374,7 @@ impl<B: KernelBackend> TpCluster<B> {
         let nccl = if std::env::var_os("FERRITE_NCCL").is_some() {
             #[cfg(feature = "cuda")]
             {
+                eprintln!("[serve] FERRITE_NCCL detected, initializing...");
                 // Initialize CUDA context on device 0 before NCCL —
                 // ncclCommInitAll needs an active CUDA context on the
                 // calling thread (the last cudaSetDevice was device world-1
