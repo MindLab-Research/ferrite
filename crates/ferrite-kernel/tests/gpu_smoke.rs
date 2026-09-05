@@ -763,10 +763,12 @@ fn hc_micro_bench() {
     let up = |v: &Vec<f32>| -> DevBuf { let mut b = DevBuf::alloc(dev.dev(), stream, v.len()).unwrap(); b.upload(v).unwrap(); b };
     let res = up(&res_v); let x = up(&x_v); let post = up(&post_v); let comb = up(&comb_v); let wbuf = up(&w_v);
 
-    // warm + bench hc_pre (split mix + rest)
-    for _ in 0..50 { let _ = dev.hc_pre_dev(&res, &fn_t, &scale_t, &base_t, s, nh, 1e-5, 1e-4, 20); }
+    // warm + bench hc_pre (split mix + rest + fused rmsnorm tail — nw ones)
+    let nw_v = vec![1.0f32; h];
+    let nw_t = t(&nw_v);
+    for _ in 0..50 { let _ = dev.hc_pre_dev(&res, &fn_t, &scale_t, &base_t, &nw_t, s, nh, 1e-5, 1e-4, 20); }
     let t0 = std::time::Instant::now();
-    for _ in 0..iters { let _ = dev.hc_pre_dev(&res, &fn_t, &scale_t, &base_t, s, nh, 1e-5, 1e-4, 20); }
+    for _ in 0..iters { let _ = dev.hc_pre_dev(&res, &fn_t, &scale_t, &base_t, &nw_t, s, nh, 1e-5, 1e-4, 20); }
     let _ = dev.sync();
     let t_pre = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
 

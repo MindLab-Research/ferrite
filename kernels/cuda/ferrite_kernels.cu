@@ -2351,6 +2351,7 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
                                    const float* __restrict__ mx_in,
                                    const float* __restrict__ scale,
                                    const float* __restrict__ base,
+                                   const float* __restrict__ nw,
                                    float* __restrict__ li,
                                    float* __restrict__ post,
                                    float* __restrict__ comb,
@@ -2363,6 +2364,8 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     extern __shared__ float sm[];
     float* cb = sm;          // [n*n]
     float* pre_s = sm + n * n; // [n]
+    float* li_s = sm + n * n + n; // [h] fused-norm staging (rmsnorm parity)
+    float* red = li_s + h;   // [8] warp partials
 
     const float* mx = mx_in + (size_t)t * mix;
 
@@ -2407,16 +2410,36 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
         for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
     }
     __syncthreads();
-    // li = Σ_i pre_i · x[i*h + j] (parallel over h)
+    // li = Σ_i pre_i · x[i*h + j] (parallel over h) — staged in smem, then
+    // FUSED rmsnorm tail (saves the standalone rmsnorm kernel launch per
+    // layer segment): identical reduce order to rmsnorm_kernel (stride ss →
+    // warp shfl → serial red[8] → rsqrt(ss/h + eps)) for parity.
     for (int j = threadIdx.x; j < h; j += blockDim.x) {
         float acc = 0.f;
         for (int i = 0; i < n; i++) acc += pre_s[i] * x[(size_t)i * h + j];
-        li[(size_t)t * h + j] = acc;
+        li_s[j] = acc;
+    }
+    __syncthreads();
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < h; j += blockDim.x) ss += li_s[j] * li_s[j];
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float tt = 0.f;
+        for (int i = 0; i < 8; i++) tt += red[i];
+        red[0] = rsqrtf(tt / h + rms_eps);
+    }
+    __syncthreads();
+    float inv = red[0];
+    for (int j = threadIdx.x; j < h; j += blockDim.x) {
+        li[(size_t)t * h + j] = li_s[j] * inv * nw[j];
     }
 }
 
 extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
                                             const float* scale, const float* base,
+                                            const float* nw,
                                             float* li, float* post, float* comb,
                                             float* mx_scratch,
                                             int s, int n, int h, int mix,
@@ -2430,9 +2453,12 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     if (e != cudaSuccess) return e;
 
     // Phase 2: rest (single block per token — sinkhorn + li + post + comb)
-    size_t smem2 = (size_t)(n * n + n) * sizeof(float);
+    // + FUSED rmsnorm tail (nw = input_layernorm weight): li comes out
+    // normalized — saves the standalone rmsnorm launch per layer segment.
+    // smem: cb[n*n] + pre_s[n] + li_s[h] + red[8]  (h=4096 → ~16.5KB)
+    size_t smem2 = ((size_t)(n * n + n) + h + 8) * sizeof(float);
     hc_pre_rest_kernel<<<s, 256, smem2, stream>>>(
-        res, mx_scratch, scale, base, li, post, comb,
+        res, mx_scratch, scale, base, nw, li, post, comb,
         s, n, h, mix, rms_eps, hc_eps, iters);
     return cudaGetLastError();
 }

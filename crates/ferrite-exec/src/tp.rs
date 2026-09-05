@@ -773,19 +773,16 @@ fn mega_chain_dev(
             s.w(&format!("{pfx}.hc_attn_fn"))?,
             s.w(&format!("{pfx}.hc_attn_scale"))?,
             s.w(&format!("{pfx}.hc_attn_base"))?,
+            s.w(&format!("{pfx}.input_layernorm.weight"))?,
             n,
             nh,
             cfg.rms_norm_eps,
             cfg.hc_eps,
             cfg.hc_sinkhorn_iters,
         )?;
-        let hn = cuda.rmsnorm_dev(
-            &li,
-            s.w(&format!("{pfx}.input_layernorm.weight"))?,
-            cfg.rms_norm_eps,
-            n,
-            hidden,
-        )?;
+        // li comes out already RMS-normalized (fused tail in hc_pre_rest) —
+        // the standalone rmsnorm_dev launch is gone.
+        let hn = li;
         if tm {
             let _ = cuda.sync();
             t_a += t_l.elapsed().as_secs_f64() * 1e3;
@@ -886,19 +883,15 @@ fn mega_chain_dev(
             s.w(&format!("{pfx}.hc_ffn_fn"))?,
             s.w(&format!("{pfx}.hc_ffn_scale"))?,
             s.w(&format!("{pfx}.hc_ffn_base"))?,
+            s.w(&format!("{pfx}.post_attention_layernorm.weight"))?,
             n,
             nh,
             cfg.rms_norm_eps,
             cfg.hc_eps,
             cfg.hc_sinkhorn_iters,
         )?;
-        let hfn = cuda.rmsnorm_dev(
-            &li2,
-            s.w(&format!("{pfx}.post_attention_layernorm.weight"))?,
-            cfg.rms_norm_eps,
-            n,
-            hidden,
-        )?;
+        // li2 already RMS-normalized by the fused hc_pre_rest tail.
+        let hfn = li2;
         if tm {
             let _ = cuda.sync();
             t_c += t_mid.elapsed().as_secs_f64() * 1e3;
@@ -1703,13 +1696,14 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 s0.w(&format!("{pfx}.hc_attn_scale"))?,
                 s0.w(&format!("{pfx}.hc_attn_base"))?,
             );
+            let norm_w = s0.w(&format!("{pfx}.input_layernorm.weight"))?;
             let (li_dev, post_a_dev, comb_a_dev) = cuda0.hc_pre_dev(
-                &res_dev, hc_fn, hc_scale, hc_base, n, nh,
+                &res_dev, hc_fn, hc_scale, hc_base, norm_w, n, nh,
                 self.full_cfg.rms_norm_eps, self.full_cfg.hc_eps,
                 self.full_cfg.hc_sinkhorn_iters,
             )?;
-            let norm_w = s0.w(&format!("{pfx}.input_layernorm.weight"))?;
-            let hn_dev = cuda0.rmsnorm_dev(&li_dev, norm_w, self.full_cfg.rms_norm_eps, n, hidden)?;
+            // li_dev already RMS-normalized (fused hc_pre_rest tail).
+            let hn_dev = li_dev;
             // P2P chain: hn stays on GPU — P2P copy to rank 1-3 (NVLink),
             // no download/Tensor-construction/re-upload. Each rank's fan_out
             // closure uses its local copy's device pointer.
@@ -1945,15 +1939,16 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                 s0.w(&format!("{pfx}.hc_ffn_scale"))?,
                 s0.w(&format!("{pfx}.hc_ffn_base"))?,
             );
+            let norm_w2 = s0.w(&format!("{pfx}.post_attention_layernorm.weight"))?;
             let (li2_dev, post_f_dev, comb_f_dev) = cuda0.hc_pre_dev(
-                &res2_dev, hc_fn2, hc_scale2, hc_base2, n, nh,
+                &res2_dev, hc_fn2, hc_scale2, hc_base2, norm_w2, n, nh,
                 self.full_cfg.rms_norm_eps, self.full_cfg.hc_eps,
                 self.full_cfg.hc_sinkhorn_iters,
             )?;
             cuda0.sync().ok();
             let tc = std::time::Instant::now();
-            let norm_w2 = s0.w(&format!("{pfx}.post_attention_layernorm.weight"))?;
-            let hfn_dev = cuda0.rmsnorm_dev(&li2_dev, norm_w2, self.full_cfg.rms_norm_eps, n, hidden)?;
+            // li2_dev already RMS-normalized (fused hc_pre_rest tail).
+            let hfn_dev = li2_dev;
             let mut hfn = vec![0f32; n * hidden];
             hfn_dev.download(&mut hfn)?;
             // element-wise bisection probe: L00's res_mid + hfn vs mega's

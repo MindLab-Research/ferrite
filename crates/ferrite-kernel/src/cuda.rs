@@ -116,6 +116,7 @@ extern "C" {
                       s: i32, n: i32, h: i32, mix: i32,
                       rms_eps: f32, hc_eps: f32, iters: i32, stream: CuStream) -> i32;
     fn ferrite_hc_pre_split(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
+                             nw: *const f32,
                              li: *mut f32, post: *mut f32, comb: *mut f32, mx_scratch: *mut f32,
                              s: i32, n: i32, h: i32, mix: i32,
                              rms_eps: f32, hc_eps: f32, iters: i32, stream: CuStream) -> i32;
@@ -2158,6 +2159,7 @@ impl CudaBackend {
         fn_w: &Tensor,
         scale: &Tensor,
         base: &Tensor,
+        norm_w: &Tensor,
         s: usize,
         nh: usize,
         rms_eps: f32,
@@ -2171,6 +2173,7 @@ impl CudaBackend {
         let dfw = self.dev_weight(fn_w)?;
         let dsc = self.dev_weight(scale)?;
         let dba = self.dev_weight(base)?;
+        let dnw = self.dev_weight(norm_w)?;
         let li = DevBuf::alloc(self.dev, self.stream, s * h)?;
         let post = DevBuf::alloc(self.dev, self.stream, s * n)?;
         let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
@@ -2181,10 +2184,14 @@ impl CudaBackend {
         // 42ms). The original err-900 capture concern (mx_scratch pool
         // class not warm in capture thread) is gone under the mega-graph:
         // the dry-run warms the pool on the SAME worker that captures.
+        // FUSED rmsnorm tail in phase-2 rest kernel (nw): li comes out
+        // normalized (input_layernorm) — callers no longer launch a
+        // standalone rmsnorm after this.
         ck(
             unsafe {
                 ferrite_hc_pre_split(
                     res.as_const_f32(), dfw.as_const_f32(), dsc.as_const_f32(), dba.as_const_f32(),
+                    dnw.as_const_f32(),
                     li.as_f32(), post.as_f32(), comb.as_f32(),
                     mx_scratch.as_f32(),
                     s as i32, n as i32, h as i32, mix as i32,
