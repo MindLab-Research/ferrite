@@ -864,6 +864,44 @@ impl<B: KernelBackend> TpCluster<B> {
         .collect::<Result<Vec<(f32, f32, f32, i32)>>>()?;
         let (a0, a1, a2, k) = toks_v[0];
         let t_verify = t_v.elapsed();
+        // Event-in-graph segment times for the VERIFY graph (same layout as
+        // the decode-path reader: es[0] input, per layer 4 events, head) —
+        // diagnostic for the n=3 vs n=1 per-segment cost split.
+        if std::env::var_os("FERRITE_MEGA_EVTS").is_some() {
+            let es = ferrite_kernel::cuda::MEGA_EVTS.lock().unwrap();
+            let nl = plans.len();
+            if es.len() >= nl * 4 + 2 {
+                let cuda0 = self.shards[0]
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("FERRITE_MEGA_EVTS needs cuda".into()))?;
+                cuda0.enter();
+                let el = |a: usize, b: usize| {
+                    cuda0.event_elapsed_ms(a as *mut std::ffi::c_void, b as *mut std::ffi::c_void) as f64
+                };
+                let (mut a_hc, mut b_gdn, mut b_dsa, mut c_hc, mut de_ffn) =
+                    (0f64, 0f64, 0f64, 0f64, 0f64);
+                for (i, p) in plans.iter().enumerate() {
+                    let prev = if i == 0 { es[0] } else { es[4 + (i - 1) * 4] };
+                    let (e_a, e_b, e_c, e_e) =
+                        (es[1 + i * 4], es[2 + i * 4], es[3 + i * 4], es[4 + i * 4]);
+                    a_hc += el(prev, e_a);
+                    if matches!(p.attn, AttnKind::Dsa) {
+                        b_dsa += el(e_a, e_b);
+                    } else {
+                        b_gdn += el(e_a, e_b);
+                    }
+                    c_hc += el(e_b, e_c);
+                    de_ffn += el(e_c, e_e);
+                }
+                let head = el(es[4 + (nl - 1) * 4], es[4 * nl + 1]);
+                eprintln!(
+                    "[evts-v] A_hc={:.2} B_gdn={:.2} B_dsa={:.2} C_hc={:.2} DE_ffn={:.2} head={:.3} tot={:.2}ms",
+                    a_hc, b_gdn, b_dsa, c_hc, de_ffn, head,
+                    a_hc + b_gdn + b_dsa + c_hc + de_ffn + head
+                );
+            }
+        }
         let t_c = std::time::Instant::now();
         // 3. accept: longest prefix of (d1, d2) vs (a0, a1); k = 1/2/3
         // (computed per-rank inside the verify worker — bit-identical inputs).
