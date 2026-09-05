@@ -184,27 +184,36 @@ extern "C" cudaError_t ferrite_f32_to_bf16(const float* in, void* out,
 
 // ============================================================
 // rmsnorm over the last dim: y = x / rms(x) * w
+// 256 threads per ROW (the old block(32,4) ran ONE warp per row — for
+// n=1 decode that was 32 threads serially scanning 4096 elements =
+// 128 dependent loads/thread, no latency hiding, 41µs measured; the mega
+// graph calls this 2×45+1 times per token = 3.7ms/token).
 // ============================================================
 __global__ void rmsnorm_kernel(const float* __restrict__ x,
                                const float* __restrict__ w,
                                float* __restrict__ out,
                                int n, int dim, float eps) {
-    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    int row = blockIdx.x;
     if (row >= n) return;
     const float* xr = x + (size_t)row * dim;
     float* or_ = out + (size_t)row * dim;
-    // one warp handles the row reduction (dim <= 16k covers 4096 hidden)
     float ss = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         ss += xr[i] * xr[i];
     }
-    // warp reduce; each warp (threadIdx.y) writes its own shared slot
-    __shared__ float warp_s[32];
+    // warp reduce
     float lane = ss;
     for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffff, lane, off);
-    if (threadIdx.x == 0) warp_s[threadIdx.y] = lane / dim;
+    __shared__ float red[8]; // 256 threads = 8 warps
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = lane;
     __syncthreads();
-    float inv = rsqrtf(warp_s[threadIdx.y] + eps);
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += red[i];
+        red[0] = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    float inv = red[0];
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         or_[i] = xr[i] * inv * w[i];
     }
@@ -213,8 +222,8 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x,
 extern "C" cudaError_t ferrite_rmsnorm(const float* x, const float* w,
                                        float* out, int n, int dim, float eps,
                                        cudaStream_t s) {
-    dim3 block(32, 4);
-    dim3 grid((n + 3) / 4);
+    dim3 block(256);
+    dim3 grid(n);
     rmsnorm_kernel<<<grid, block, 0, s>>>(x, w, out, n, dim, eps);
     return cudaGetLastError();
 }
