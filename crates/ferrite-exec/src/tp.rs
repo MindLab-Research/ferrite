@@ -509,7 +509,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 // chain. Bisection: dry output correct → graph-mechanism bug;
                 // dry output garbage → chain-semantics bug.
                 eprintln!(
-                    "[mega] DRY mode step (tok={}): dry-run {:.1}ms — no capture",
+                    "[mega] DRY mode step (in={last} tok={}): dry-run {:.1}ms — no capture",
                     toks[0], t_dry.as_secs_f32() * 1e3
                 );
                 return Ok(toks[0] as u32);
