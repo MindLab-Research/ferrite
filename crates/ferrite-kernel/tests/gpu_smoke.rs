@@ -790,3 +790,64 @@ fn hc_micro_bench() {
         (t_post + t_pre + 2.0 * t_rms) * 45.0 / 1000.0
     );
 }
+
+/// head 链微基准：mega 实测 head=2.55ms/token（contract+norm+lm_head GEMV+argmax），
+/// 理论 640µs（1.2GB bf16 @2.2TB/s）。分解 lm_head GEMV 大矩阵 vs rmsnorm kernel-only。
+#[test]
+fn head_chain_bench() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let h = 4096usize;
+    let vocab = 154880usize;
+    let n = 1usize;
+    let iters = 200;
+    let mut rnd = 0x9e3779b97f4a7c15u64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+
+    // lm_head GEMV: x[1,4096] × W[154880,4096] bf16 → [1,154880]
+    let xv: Vec<f32> = (0..h).map(|_| r()).collect();
+    let wv: Vec<f32> = (0..vocab * h).map(|_| r() * 0.02).collect();
+    let x_t = Tensor::from_f32(Shape::new([n, h]), xv);
+    let w_t = Tensor::from_f32(Shape::new([vocab, h]), wv);
+    // warm (weight upload to bf16 cache)
+    let x_dev = ferrite_kernel::cuda::DevBuf::alloc(dev.dev(), dev.stream_handle(), n * h).unwrap();
+    x_dev.upload(x_t.as_slice()).unwrap();
+    let _ = dev.matmul_dev(&x_dev, &w_t, n as i32, h as i32, vocab as i32);
+    let _ = dev.sync();
+
+    // bench lm_head GEMV
+    let t0 = std::time::Instant::now();
+    for _ in 0..iters {
+        let _ = dev.matmul_dev(&x_dev, &w_t, n as i32, h as i32, vocab as i32);
+    }
+    let _ = dev.sync();
+    let t_gemv = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    // argmax [1, 154880]
+    let logits = dev.matmul_dev(&x_dev, &w_t, n as i32, h as i32, vocab as i32).unwrap();
+    let mut arg = ferrite_kernel::cuda::DevBuf::alloc(dev.dev(), dev.stream_handle(), n).unwrap();
+    let _ = dev.argmax_dev(&logits, &mut arg, n, vocab);
+    let _ = dev.sync();
+    let t1 = std::time::Instant::now();
+    for _ in 0..iters {
+        let _ = dev.argmax_dev(&logits, &mut arg, n, vocab);
+    }
+    let _ = dev.sync();
+    let t_arg = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    // rmsnorm kernel-only (dev_weight cached): x[1,4096] w[4096]
+    let w2 = Tensor::from_f32(Shape::new([h]), (0..h).map(|_| r()).collect::<Vec<f32>>());
+    let _ = dev.rmsnorm_dev(&x_dev, &w2, 1e-5, n, h);
+    let _ = dev.sync();
+    let t2 = std::time::Instant::now();
+    for _ in 0..iters {
+        let _ = dev.rmsnorm_dev(&x_dev, &w2, 1e-5, n, h);
+    }
+    let _ = dev.sync();
+    let t_rms = t2.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+    eprintln!(
+        "[head-bench] lm_head GEMV [1,{h}]x[{vocab},{h}] bf16 = {:.1}us ({}GB/s eff) | argmax[{vocab}] = {:.2}us | rmsnorm[1,{h}] = {:.2}us",
+        t_gemv, (vocab * h * 2) as f64 / t_gemv / 1e3, t_arg, t_rms
+    );
+}
