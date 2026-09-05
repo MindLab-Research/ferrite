@@ -821,6 +821,19 @@ fn mega_chain_dev(
                 let g = cuda.matmul_dev(&hfn, w_gate, n as i32, hi, inter)?;
                 let u = cuda.matmul_dev(&hfn, w_up, n as i32, hi, inter)?;
                 let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, cfg.swiglu_limit)?;
+                if probe && dev_id == 0 && layer_idx < 3 {
+                    let mm = |b: &ferrite_kernel::cuda::DevBuf| -> f32 {
+                        let mut pv = vec![0f32; b.len];
+                        if b.download(&mut pv).is_ok() {
+                            return pv.iter().fold(0f32, |acc, x| acc.max(x.abs()));
+                        }
+                        0.0
+                    };
+                    eprintln!(
+                        "[mega] L{layer_idx:02} dense g={:.4} u={:.4} a={:.4} (inter={inter})",
+                        mm(&g), mm(&u), mm(&a)
+                    );
+                }
                 cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
             }
         };

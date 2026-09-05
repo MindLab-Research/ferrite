@@ -1041,6 +1041,16 @@ impl<B: KernelBackend> Engine<B> {
         }
         let mut act = Tensor::zeros(Shape::new([n, inter]), x.dtype);
         self.backend.swiglu_limited(&gate_up, self.cfg.swiglu_limit, &mut act)?;
+        if std::env::var_os("FERRITE_AR_PROBE").is_some() && n == 1 {
+            // dense-ffn bisection probe (vs mega's matmul_dev chain): the
+            // mega path's L00-02 dense AR diverges 2-3x from this one.
+            let mx = |t: &Tensor| t.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
+            let xmx = x.as_slice().iter().fold(0f32, |a, x| a.max(x.abs()));
+            eprintln!(
+                "[norm] {pfx} dense g={:.4} u={:.4} a={:.4} (in={:.4}, inter={inter})",
+                mx(&gate), mx(&up), mx(&act), xmx
+            );
+        }
         self.project(&act, &format!("{pfx}.mlp.down_proj.weight"))
     }
 
