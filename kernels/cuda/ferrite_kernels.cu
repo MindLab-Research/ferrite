@@ -1584,7 +1584,7 @@ __global__ void conv_prep_fused_kernel(
 }
 
 extern "C" cudaError_t ferrite_conv_prep_fused(
-    const float* x, const float* cw, const float* cs,
+    const float* x, const float* cw, float* cs,
     const float* b_raw, const float* fb, const float* dt_bias,
     const float* a_log, float* q, float* k, float* v,
     float* beta, float* gate, int h, int dk, float lb, cudaStream_t s) {
