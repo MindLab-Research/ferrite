@@ -3197,7 +3197,7 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
         cudaError_t e = cudaFuncSetAttribute(gdn_chunk_fused_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         if (e != cudaSuccess) {
-            fprintf(stderr, "[gdn_fused] setattr failed smem=%zu: %s\n", smem, cudaGetErrorString(e));
+            printf("[gdn_fused] setattr failed smem=%zu: %s\n", smem, cudaGetErrorString(e));
             return e;
         }
     }
@@ -3207,7 +3207,7 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
         q, k, v, beta, gate, a_log, state, gdn0, gdn1, out, n, h, dk, dv);
     cudaError_t le = cudaGetLastError();
     if (le != cudaSuccess) {
-        fprintf(stderr, "[gdn_fused] launch failed n=%d h=%d dk=%d dv=%d smem=%zu: %s\n",
+        printf("[gdn_fused] launch failed n=%d h=%d dk=%d dv=%d smem=%zu: %s\n",
                 n, h, dk, dv, smem, cudaGetErrorString(le));
     }
     return le;
