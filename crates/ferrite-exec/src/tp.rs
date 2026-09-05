@@ -374,6 +374,14 @@ impl<B: KernelBackend> TpCluster<B> {
         let nccl = if std::env::var_os("FERRITE_NCCL").is_some() {
             #[cfg(feature = "cuda")]
             {
+                // Initialize CUDA context on device 0 before NCCL —
+                // ncclCommInitAll needs an active CUDA context on the
+                // calling thread (the last cudaSetDevice was device world-1
+                // from the shard creation, which can cause "unhandled cuda
+                // error" from NCCL's internal device queries).
+                unsafe {
+                    ferrite_kernel::cuda::cuda_set_device(0);
+                }
                 let devices: Vec<i32> = (0..world as i32).collect();
                 let streams: Vec<ferrite_kernel::cuda::CuStream> = shards
                     .iter()

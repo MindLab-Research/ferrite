@@ -2223,3 +2223,8 @@ impl CudaBackend {
         Ok(())
     }
 }
+
+/// Set the current CUDA device (for NCCL init — needs device 0 context).
+pub fn cuda_set_device(dev: i32) {
+    unsafe { cudaSetDevice(dev) };
+}
