@@ -149,6 +149,10 @@ extern "C" {
                              cw: *const f32, cs: *mut f32,
                              q: *mut f32, k: *mut f32, v: *mut f32,
                              in_f: i32, proj: i32, stream: CuStream) -> i32;
+    fn ferrite_gdn_chunk_fused(q: *const f32, k: *const f32, v: *const f32,
+                               beta: *const f32, gate: *const f32, a_log: *const f32,
+                               state: *mut f32, gdn0: *mut f32, out: *mut f32,
+                               n: i32, h: i32, dk: i32, dv: i32, stream: CuStream) -> i32;
     fn ferrite_gdn_step_v2p(q: *const f32, k: *const f32, v: *const f32,
                             b_raw: *const f32, fb: *const f32, dt_bias: *const f32,
                             a_log: *const f32, lb: f32,
@@ -1740,31 +1744,22 @@ impl CudaBackend {
                 "gdn_step_v2p",
             )?;
         } else if let Some((_, _, _, g0)) = state_override.filter(|_| n == 2) {
-            // verify n=2 B0 scheme: t=0 advances the state by t_last only
-            // (B = A+t_last), snapshots to gdn0 (accept-1's commit source),
-            // then t=1 advances by d1 (B = full 2-token state, accept-2).
+            // MTP Phase2: fused single-launch n-token chunk — the state stays
+            // resident in smem across the t loop (HBM round-trip eliminated),
+            // the t=0 B0 snapshot (A+t_last, accept-1's commit source) is
+            // written straight from smem. Replaces the 2-launch t-split + the
+            // in-between D2D copy.
             let dal = self.dev_weight(w.a_log)?;
             ck(
                 unsafe {
-                    ferrite_gdn_chunk_v2(
+                    ferrite_gdn_chunk_fused(
                         q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
                         beta.as_const_f32(), gate.as_const_f32(), dal.as_const_f32(),
-                        gdn_state, core.as_f32(), 1, h as i32, dk as i32, dk as i32, self.stream,
+                        gdn_state, g0, core.as_f32(),
+                        ni, h as i32, dk as i32, dk as i32, self.stream,
                     )
                 },
-                "gdn_chunk_v_t0",
-            )?;
-            self.copy_raw_dev(gdn_state as *const f32, g0, h * dk * dk)?;
-            ck(
-                unsafe {
-                    ferrite_gdn_chunk_v2(
-                        q.as_const_f32().add(h * dk), k.as_const_f32().add(h * dk),
-                        v.as_const_f32().add(h * dk), beta.as_const_f32().add(h),
-                        gate.as_const_f32().add(h * dk), dal.as_const_f32(),
-                        gdn_state, core.as_f32().add(h * dk), 1, h as i32, dk as i32, dk as i32, self.stream,
-                    )
-                },
-                "gdn_chunk_v_t1",
+                "gdn_chunk_fused",
             )?;
         } else {
             ck(

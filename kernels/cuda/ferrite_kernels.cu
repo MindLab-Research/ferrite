@@ -3099,3 +3099,105 @@ extern "C" cudaError_t ferrite_add(const float* x, const float* y, float* z,
     add_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, y, z, n);
     return cudaGetLastError();
 }
+
+// ============================================================
+// MTP Phase2: fused n-token GDN chunk (verify n=2) — ONE launch per layer
+// instead of the t-split's 2 chunk_v2 launches + a B0 copy in between.
+// The state stays resident in smem across the t loop (HBM state round-trip
+// eliminated); the t=0 snapshot (B0 = A+t_last for accept-1's commit) is
+// written straight from smem. Saves ~2 launches + 16MB HBM traffic/layer
+// on the 34 GDN layers (verify 23.4ms → ~19ms expected).
+// ============================================================
+__global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
+                                       const float* __restrict__ k,
+                                       const float* __restrict__ v,
+                                       const float* __restrict__ beta,
+                                       const float* __restrict__ gate,
+                                       const float* __restrict__ a_log,
+                                       float* __restrict__ state,
+                                       float* __restrict__ gdn0,
+                                       float* __restrict__ out,
+                                       int n, int h, int dk, int dv) {
+    int hd = blockIdx.y;
+    if (hd >= h) return;
+    const size_t spitch = (size_t)dv + 1;
+    extern __shared__ float sm[];
+    float* S = sm;                          // [dk * (dv+1)] — resident across t
+    float* ks = S + (size_t)dk * spitch;   // [dv]
+    float* kh = ks + dv;                   // [dk]
+    float* vh = kh + dk;                   // [dv]
+    float* qh = vh + dv;                   // [dk]
+    float* gh = qh + dk;                   // [dk]
+    float* Sg = state + (size_t)hd * dk * dv;
+    // state load ONCE (smem resident across the whole t loop)
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
+    __syncthreads();
+    for (int t = 0; t < n; t++) {
+        float bt = beta[(size_t)t * h + hd];
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            gh[i] = gate[((size_t)t * h + hd) * dk + i];
+            qh[i] = q[((size_t)t * h + hd) * dk + i];
+            kh[i] = k[((size_t)t * h + hd) * dk + i];
+        }
+        for (int j = threadIdx.x; j < dv; j += blockDim.x)
+            vh[j] = v[((size_t)t * h + hd) * dv + j];
+        __syncthreads();
+        // 1. per-channel decay
+        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
+            float decay = expf(gh[i]);
+            if (decay != 1.0f) {
+                float* Si = S + (size_t)i * spitch;
+                for (int j = 0; j < dv; j++) Si[j] *= decay;
+            }
+        }
+        __syncthreads();
+        // 2. kS = S^T k
+        for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
+            ks[j] = acc;
+        }
+        __syncthreads();
+        // 3. delta rule
+        for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+            S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
+                bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
+        __syncthreads();
+        // 4. o = q^T S
+        for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
+            out[((size_t)t * h + hd) * dv + j] = acc;
+        }
+        __syncthreads();
+        // 5. t=0 B0 snapshot (accept-1's commit source) straight from smem
+        if (t == 0 && gdn0 != nullptr) {
+            float* S0 = gdn0 + (size_t)hd * dk * dv;
+            for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+                S0[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+            __syncthreads();
+        }
+    }
+    // state store ONCE after the loop (B = A + all n tokens)
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+}
+extern "C" cudaError_t ferrite_gdn_chunk_fused(
+    const float* q, const float* k, const float* v,
+    const float* beta, const float* gate, const float* a_log,
+    float* state, float* gdn0, float* out,
+    int n, int h, int dk, int dv, cudaStream_t s) {
+    size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
+                  + (size_t)(dv + dk + dv + dk + dk) * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gdn_chunk_fused_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+    }
+    dim3 block(512);
+    dim3 grid(1, h, 1);
+    gdn_chunk_fused_kernel<<<grid, block, smem, s>>>(
+        q, k, v, beta, gate, a_log, state, gdn0, out, n, h, dk, dv);
+    return cudaGetLastError();
+}
