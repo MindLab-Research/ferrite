@@ -1013,17 +1013,21 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     int hd = blockIdx.y;
     if (row >= n || hd >= h) return;
     float scale = rsqrtf((float)d);
+    // Layout: qs FIRST (float4 reads need the 16B-aligned smem base;
+    // topk=8195 is NOT a multiple of 4 — an int[topk] prefix misaligned
+    // qs by 12B and crashed prefill with err 716). All later arrays are
+    // scalar-access, 4B alignment suffices.
     extern __shared__ float sm[];
-    int* idx_s = (int*)sm;                            // [topk]
-    float* sc = (float*)(idx_s + topk);               // [topk] scores → weights
-    float* qs = sc + topk;                             // [d]
-    float* red = qs + d;                              // [8] warp-partials (max/sum)
+    float* qs = sm;                                   // [d] float4 reads
+    float* sc = sm + d;                                // [topk] scores → weights
+    int* idx_s = (int*)(sc + topk);                   // [topk]
+    float* red = (float*)(idx_s + topk);               // [8] warp partials
     unsigned int* bm = (unsigned int*)(red + 8);       // [4096] dedup bitmap
     const int bm_words_max = 4096;
     int bm_words = (t + 31) >> 5; if (bm_words > bm_words_max) bm_words = bm_words_max;
-    // 0. preload: idx → smem, q head-slice → smem, clear bitmap
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) idx_s[s] = (int)idx[(size_t)row * topk + s];
+    // 0. preload: q head-slice → smem, idx → smem, clear bitmap
     for (int l = threadIdx.x; l < d; l += blockDim.x) qs[l] = q[((size_t)row * h + hd) * d + l];
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) idx_s[s] = (int)idx[(size_t)row * topk + s];
     for (int w0 = threadIdx.x; w0 < bm_words_max; w0 += blockDim.x) bm[w0] = 0u;
     __syncthreads();
     // 1. scores: float4 dot per slot; bitmap dedup (first wins — duplicate
