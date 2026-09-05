@@ -2332,50 +2332,6 @@ extern "C" cudaError_t ferrite_scale_inplace(float* x, float s, int n, cudaStrea
 // CUDA graph via RUNTIME API wrappers (the driver-API dlopen path
 // SIGSEGV'd inside cuGraphInstantiate on worker-thread captures).
 // ============================================================
-// Event-in-graph timing (FERRITE_MEGA_EVTS): events recorded during
-// stream capture become event-record nodes — replay updates them, and
-// post-replay cudaEventElapsedTime gives the TRUE in-graph segment
-// times (the DRY sync-timing drains the async queue between layers,
-// so its per-segment numbers are contaminated by downstream work).
-// ============================================================
-// In-graph timing marker (FERRITE_MEGA_EVTS v2): CUDA events recorded
-// inside a graph cannot be used with cudaEventElapsedTime (verified:
-// single-test event_timing_graph path (b) → InvalidValue(1); events in
-// graphs are synchronization-only). Instead a 1-thread kernel reads
-// %globaltimer (chip-wide ns clock) into a u64 slot — replay updates
-// the buffer, host computes segment deltas post-replay.
-// ============================================================
-__global__ void mark_ts_kernel(unsigned long long* __restrict__ buf, int slot) {
-    unsigned long long t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    buf[slot] = t;
-}
-extern "C" cudaError_t ferrite_mark_ts(unsigned long long* buf, int slot, cudaStream_t s) {
-    mark_ts_kernel<<<1, 1, 0, s>>>(buf, slot);
-    return cudaGetLastError();
-}
-
-extern "C" cudaError_t ferrite_event_create(void** ev) {
-    cudaEvent_t* e = (cudaEvent_t*)malloc(sizeof(cudaEvent_t));
-    if (!e) return cudaErrorMemoryAllocation;
-    cudaError_t err = cudaEventCreate(e); // default flags: timing enabled
-    if (err != cudaSuccess) { free(e); return err; }
-    *ev = e;
-    return err;
-}
-extern "C" cudaError_t ferrite_event_record(void* ev, cudaStream_t s) {
-    return cudaEventRecord(*(cudaEvent_t*)ev, s); // in capture: graph node
-}
-extern "C" cudaError_t ferrite_event_elapsed(void* a, void* b, float* ms) {
-    // (a, b) = (start, stop): elapsed ms from event a to event b (a must
-    // have been recorded BEFORE b — the graph replays them in node order).
-    return cudaEventElapsedTime(ms, *(cudaEvent_t*)a, *(cudaEvent_t*)b);
-}
-extern "C" cudaError_t ferrite_event_destroy(void* ev) {
-    cudaError_t err = cudaEventDestroy(*(cudaEvent_t*)ev);
-    free(ev);
-    return err;
-}
 extern "C" cudaError_t ferrite_graph_begin(cudaStream_t s) {
     return cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
 }
