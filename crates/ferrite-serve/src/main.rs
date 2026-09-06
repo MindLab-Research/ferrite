@@ -253,15 +253,18 @@ fn run_cuda(
         .and_then(|s| s.seq_runtime(seq).map(|rt| rt.tokens.len()))
         .unwrap_or(0);
     // ncu capture window (ncu --profile-from-start off + FERRITE_NCU=1):
-    // the 80s weight load (38k H2D uploads ncu intercepts at ms-level
-    // cost each — stalls the run 10+ min) and prefill run at full speed;
-    // only the decode loop is profiled. cuProfilerStop flushes the window.
+    // skip step 0 (the mega/verify graph CAPTURE — ncu's per-kernel replay
+    // conflicts with stream capture and hangs the run) and the 80s weight
+    // load (ncu intercepts each H2D at ms cost); the window opens at the
+    // SECOND decode step (pure graph replays) and closes after the loop.
     let ncu_win = std::env::var_os("FERRITE_NCU").is_some();
-    if ncu_win {
-        #[cfg(feature = "cuda")]
-        ferrite_kernel::cuda::profiler_start();
-    }
+    let mut ncu_started = false;
     for i in 0..max_tokens {
+        if ncu_win && i == 1 {
+            #[cfg(feature = "cuda")]
+            ferrite_kernel::cuda::profiler_start();
+            ncu_started = true;
+        }
         let tok = cluster
             .decode_step(seq)
             .unwrap_or_else(|e| panic!("decode step {i}: {e}"));
@@ -291,7 +294,7 @@ fn run_cuda(
             println!("[serve] tok {i}: {tok}");
         }
     }
-    if ncu_win {
+    if ncu_started {
         #[cfg(feature = "cuda")]
         ferrite_kernel::cuda::profiler_stop();
     }
