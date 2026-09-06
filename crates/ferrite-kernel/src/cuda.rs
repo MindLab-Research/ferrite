@@ -86,6 +86,7 @@ extern "C" {
     fn ferrite_embed_one(table: *const std::ffi::c_void, token_slot: *const i32,
                         out: *mut f32, hidden: i32, mult: i32,
                         vocab: i32, s: CuStream) -> i32;
+    fn ferrite_cast_store_i32(src: *const std::ffi::c_void, dst: *mut std::ffi::c_void, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
                                  k_nope: *mut f32, v: *mut f32, k_idx: *mut f32, k_gate: *mut f32,
                                  t0_ptr: *const i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
@@ -3283,6 +3284,22 @@ impl CudaBackend {
     /// never crosses to host) into the hc_expand'd graph input [mult, hidden].
     /// Replaces: host embed lookup + hc_expand 64KB Vec + DevBuf upload 4KB
     /// H2D → ONE kernel reading 4B from device.
+    /// Device-side f32 argmax result -> i32 token slot (replaces the
+    /// D2H->cast->H2D roundtrip between draft1/draft2 whose
+    /// cudaStreamSynchronize broke NCCL AR channel continuity, causing
+    /// 1-ulp float drift -> argmax flips on near-ties (d1 98347->702 with
+    /// bit-identical x2). Keeps the entire draft chain on-device (true
+    /// zero-H2D) AND preserves NCCL AR ordering (no sync between drafts).
+    pub fn cast_store_i32(
+        &self,
+        src: *const std::ffi::c_void,
+        dst: *mut std::ffi::c_void,
+    ) -> Result<()> {
+        self.enter();
+        ck(unsafe { ferrite_cast_store_i32(src, dst, self.stream) }, "cast_store_i32")?;
+        Ok(())
+    }
+
     pub fn embed_one_dev(
         &self,
         table: &Tensor,

@@ -4267,3 +4267,18 @@ extern "C" cudaError_t ferrite_embed_one(
         (const float*)table, token_slot, out, hidden, mult, vocab);
     return cudaGetLastError();
 }
+
+// f32 -> i32 cast + store (device-side argmax-to-token-chain link).
+// Replaces the D2H(d1)→host cast→H2D(tokens_dev[1]) roundtrip whose
+// cudaStreamSynchronize between draft1 and draft2 breaks NCCL AR
+// channel state (float reduction order 1-ulp → argmax flips on
+// near-ties — d1 diverged from 98347 to 702 with bit-identical x2).
+__global__ void cast_store_i32_kernel(const float* src, int* dst) {
+    dst[0] = (int)__ldg(src);
+}
+
+extern "C" cudaError_t ferrite_cast_store_i32(
+    const void* src, void* dst, cudaStream_t s) {
+    cast_store_i32_kernel<<<1, 1, 0, s>>>((const float*)src, (int*)dst);
+    return cudaGetLastError();
+}

@@ -1378,27 +1378,25 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                 }
                 // Draft 2: embed_one(d1) → emb2_dev → mtp_forward → d2_argmax_dev
-                // d1 is f32 (argmax output); embed_one reads i32 — 4B D2H
-                // (within SSE budget; TODO: f32→i32 cast kernel on device)
+                // Device cast: d1_argmax_dev (f32) → tokens_dev[1] (i32) —
+                // replaces the D2H→host-cast→H2D roundtrip. That roundtrip's
+                // cudaStreamSynchronize between draft1 and draft2 broke NCCL
+                // AR channel continuity: draft2's ARs got 1-ulp float drift →
+                // x2 checksums matched to 6 decimals but argmax flipped on
+                // near-ties (d1 98347→702, d2 315→8606) → token stream
+                // diverged → accept=1.0. The cast kernel runs on the same
+                // stream immediately after draft1's argmax: no sync, no H2D,
+                // full device chain (true zero-H2D), NCCL AR ordering
+                // preserved exactly like the original fan_out.
                 {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("cuda".into()))?;
-                    let mut d1_f32 = [0f32; 1];
-                    let r = ferrite_kernel::cuda::memcpy_d2h_sync(
-                        d1_ptr as *mut std::ffi::c_void,
-                        &mut d1_f32[0] as *mut f32,
-                        1, cuda.stream_handle(),
-                    );
-                    if r != 0 { return Err(FerriteError::InvalidArg(format!("d1 D2H: {r}"))); }
-                    // tokens_dev[1] = d1 (4B H2D — d1 from D2H read)
-                    {
-                        let d1_i32 = d1_f32[0] as i32;
-                        let r = ferrite_kernel::cuda::memcpy_htod_i32(
-                            unsafe { tokens_ptr.add(1) }, &d1_i32, 1, cuda.stream_handle());
-                        if r != 0 { return Err(FerriteError::InvalidArg(format!("tokens_dev[1] H2D: {r}"))); }
-                    }
+                    cuda.cast_store_i32(
+                        d1_ptr as *const std::ffi::c_void,
+                        unsafe { tokens_ptr.add(1) } as *mut std::ffi::c_void,
+                    )?;
                     cuda.embed_one_dev(&embed_table, unsafe { tokens_ptr.add(1) }, emb2_ptr, hidden, 1)?;
                 } // cuda dropped
 
