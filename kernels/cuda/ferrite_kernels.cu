@@ -3825,26 +3825,19 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
     unsigned int* scratch, cudaStream_t s)
 {
     (void)srows;
+    (void)scratch;
     if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
-    // co_res: max co-resident blocks (occupancy x SMs) — the quant barrier's
-    // participants. mma runs FULLY PARALLEL (grid = out_f/16, no row loop);
-    // blocks beyond co_res spin-pass the ready flag once (they launch in
-    // later waves after the quant wave retires).
-    static int co_res = 0;
-    if (co_res == 0) {
-        int per_sm = 0;
-        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gemv_fp8_mma_v3_kernel, 256, 0);
-        int nsm = 0;
-        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
-        co_res = per_sm * nsm;
-        if (co_res <= 0) co_res = 128;
-    }
+    // v1 dispatch (default): fully-independent per-block quant — v3's
+    // cooperative barrier lost on ALL shapes (the ~8.5k non-participant
+    // blocks' spin-pass atomics serialize on one L2 address ~250us; the
+    // two-round votes among 1184 blocks cost ~70us more). v1's redundant
+    // quant is fully parallel and beats the barrier everywhere; it wins the
+    // HBM-bound large shapes 1.23x over bf16 (185us vs 227us on lm_head).
+    // v3.1 kernel kept above for the record (grid-fix data in the log).
+    const int smem = in_f + 256 * 4 + 4 + 8 * 16 * 4;
+    cudaFuncSetAttribute(gemv_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     dim3 grid((unsigned)(out_f / 16));
-    // participants = min(grid, co_res): small matrices have fewer blocks than
-    // the co-residency cap — the spin barriers wait for ALL participants, so
-    // co_res > grid would deadlock (16x128: grid=1 spin-waits for 1184 votes).
-    int participants = co_res < (int)grid.x ? co_res : (int)grid.x;
-    gemv_fp8_mma_v3_kernel<<<grid, 256, 0, s>>>(
-        x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols, participants);
+    gemv_fp8_mma_kernel<<<grid, 256, smem, s>>>(
+        x, (const unsigned char*)w, w_scale, out, in_f, out_f, srows, scols);
     return cudaGetLastError();
 }
