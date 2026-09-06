@@ -619,7 +619,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             Some(h) => h,
                             None => unsafe { &*(hptr as *const ferrite_kernel::cuda::DevBuf) },
                         };
-                        mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
+                        mtp_forward(s, seq, &emb, hprev, Some(&hout), None)?;
                         h_cur = Some(hout);
                     }
                     Ok::<(), FerriteError>(())
@@ -743,43 +743,120 @@ impl<B: KernelBackend> TpCluster<B> {
         let t_d = std::time::Instant::now();
         // 1. draft: h_prev staging (accept row of last step's h_final) +
         //    embed(last) → mtp_forward → d1 (identical across ranks).
+        // mega_d DRAFT GRAPH (v2): the WHOLE draft chain — gather(last) →
+        // forward#1 → argmax(d1, device) → gather(d1) → forward#2 →
+        // argmax(d2, device) — captured as ONE graph. Steady step: write the
+        // pinned zero-copy last_id, DSA family advance, ONE graph replay,
+        // single D2H for (d1, d2). Target: draft < 5% of step.
         let (d1, d2) = {
             let toks = Self::fan_out(&mut self.shards, |s| {
-                let (emb, hptr) = {
+                let gd = format!("mega_d{seq}");
+                // NLL: short borrows only — every cuda use is scoped, the
+                // mtp_forward(&mut Engine) calls sit between them.
+                let (emb_last, emb_d1, h_d1, d1_id, d2_id, hprev, last_pin, table, need_capture) = {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
                     cuda.enter();
-                    let h2 = s.embed(&[last]);
-                    let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-                    emb.upload(h2.as_slice())?;
-                    let m = cuda.mtp.lock().unwrap();
-                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    (emb, &m.hprev as *const DevBuf as usize)
+                    let mg = cuda.mtp.lock().unwrap();
+                    let m = mg
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    let table = m
+                        .embed_table
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp embed table missing".into()))?;
+                    (
+                        &m.emb_last as *const DevBuf as usize,
+                        &m.emb_d1 as *const DevBuf as usize,
+                        &m.h_d1 as *const DevBuf as usize,
+                        &m.d1_id as *const DevBuf as usize,
+                        &m.d2_id as *const DevBuf as usize,
+                        &m.hprev as *const DevBuf as usize,
+                        m.last_id_pin as usize,
+                        table.as_const_f32() as usize,
+                        !cuda.graph_exists(&gd),
+                    )
                 };
-                let hprev: &DevBuf = unsafe { &*(hptr as *const DevBuf) };
-                // draft chain: d1 from hprev; d2 from d1's MTP residual h
-                // (the draft model's own hidden — EAGLE-style recursion).
-                let (d1, h_d1) = {
+                let (emb_last, emb_d1, h_d1, d1_id, d2_id, hprev): (&DevBuf, &DevBuf, &DevBuf, &DevBuf, &DevBuf, &DevBuf) = unsafe {
+                    (
+                        &*(emb_last as *const DevBuf),
+                        &*(emb_d1 as *const DevBuf),
+                        &*(h_d1 as *const DevBuf),
+                        &*(d1_id as *const DevBuf),
+                        &*(d2_id as *const DevBuf),
+                        &*(hprev as *const DevBuf),
+                    )
+                };
+                let last_pin = last_pin as *mut f32;
+                let table = table as *const f32;
+                if need_capture {
+                    // CAPTURE (first draft step): record the whole chain.
+                    // capture_lock serializes the 4 ranks' record-mode NCCL
+                    // enqueues (the mega-graph pattern); the post-pass DSA
+                    // family rollback undoes the record pass's +2 host
+                    // bookkeeping so t_count matches the real cache.
+                    let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        cuda.enter();
+                        cuda.dsa_host_rollback(seq, mtp_family, 2);
+                        unsafe { *last_pin = last as f32; }
+                        cuda.graph_capture_begin();
+                        cuda.embed_gather_dev(table, last_pin, emb_last.as_f32(), hidden)?;
+                    }
+                    mtp_forward(s, seq, emb_last, hprev, Some(h_d1), Some(d1_id))?;
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        cuda.embed_gather_dev(table, d1_id.as_const_f32(), emb_d1.as_f32(), hidden)?;
+                    }
+                    mtp_forward(s, seq, emb_d1, h_d1, None, Some(d2_id))?;
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        cuda.graph_capture_end(&gd);
+                        cuda.dsa_host_rollback(seq, mtp_family, 2);
+                    }
+                }
+                // STEADY: pinned zero-copy last_id write, DSA family advance
+                // (+2: d1/d2 appends — the graph's kernels read pinned t0),
+                // ONE graph replay, single D2H for (d1, d2).
+                unsafe { *last_pin = last as f32; }
+                {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                    let h_d1 = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
-                    (mtp_forward(s, seq, &emb, hprev, Some(&h_d1))?, h_d1)
-                };
-                let d2 = {
+                    cuda.dsa_host_advance(seq, mtp_family, 2);
+                    if !cuda.graph_replay(&gd) {
+                        return Err(FerriteError::InvalidArg(format!("mega_d graph {gd} missing")));
+                    }
+                }
+                let (dv1, dv2) = {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                    let h3 = s.embed(&[d1 as u32]);
-                    let emb2 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-                    emb2.upload(h3.as_slice())?;
-                    mtp_forward(s, seq, &emb2, &h_d1, None)?
+                    let mg = cuda.mtp.lock().unwrap();
+                    let m = mg
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    let mut d1v = [0f32; 1];
+                    let mut d2v = [0f32; 1];
+                    m.d1_id.download(&mut d1v)?;
+                    m.d2_id.download(&mut d2v)?;
+                    (d1v[0], d2v[0])
                 };
-                Ok((d1, d2))
+                Ok((dv1, dv2))
             })
             .into_iter()
             .collect::<Result<Vec<(f32, f32)>>>()?;
@@ -945,7 +1022,23 @@ impl<B: KernelBackend> TpCluster<B> {
         plan_buf.upload(flat.as_slice())?;
         let k_pin = cuda.pinned_i32()?;
         let commit = MtpCommitPlan { plan: plan_buf, k_pin, n: n_plans, conv_len, gdn_len, hidden };
-        *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch, commit: Some(commit) });
+        // mega_d draft-graph buffers: replicated f32 embedding table
+        // (every shard holds the full table), pinned zero-copy last-token id,
+        // gather staging, the recursion h slot, and the d1/d2 argmax slots.
+        let embed_w = s.w("model.embed_tokens.weight")?;
+        let mut embed_table = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), embed_w.shape.0[0] * embed_w.shape.0[1])?;
+        embed_table.upload(embed_w.as_slice())?;
+        let last_id_pin = cuda.pinned_i32()? as *mut f32;
+        let emb_last = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let emb_d1 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let h_d1 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let d1_id = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let d2_id = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        *cuda.mtp.lock().unwrap() = Some(MtpState {
+            hf_dev, hf_v, hprev, scratch, commit: Some(commit),
+            embed_table: Some(embed_table), last_id_pin,
+            emb_last, emb_d1, h_d1, d1_id, d2_id,
+        });
         Ok(())
     }
 
@@ -2786,6 +2879,7 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     embed_row: &ferrite_kernel::cuda::DevBuf,
     h_prev: &ferrite_kernel::cuda::DevBuf,
     h_out: Option<&ferrite_kernel::cuda::DevBuf>,
+    arg_out: Option<&ferrite_kernel::cuda::DevBuf>,
 ) -> Result<f32> {
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights};
     let cuda = s
@@ -2886,7 +2980,17 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
     let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
     cuda.argmax_dev(&logits, &mut arg, 1, cfg.vocab_size)?;
-    let mut tok = vec![0f32; 1];
-    arg.download(&mut tok)?;
-    Ok(tok[0])
+    match arg_out {
+        Some(dst) => {
+            // device chain: the draft id stays on the GPU (feeds the next
+            // gather directly; host sees it only at the accept decision)
+            cuda.copy_dev(&arg, 0, dst.as_f32(), 1)?;
+            Ok(0.0)
+        }
+        None => {
+            let mut tok = vec![0f32; 1];
+            arg.download(&mut tok)?;
+            Ok(tok[0])
+        }
+    }
 }

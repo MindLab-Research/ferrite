@@ -125,6 +125,8 @@ extern "C" {
                           n_plans: i32, conv_len: i32, gdn_len: i32,
                           hf_v: *const f32, hprev: *mut f32,
                           hidden: i32, s: CuStream) -> i32;
+    fn ferrite_embed_gather(table: *const f32, id: *const f32, out: *mut f32,
+                            hidden: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
                       li: *mut f32, post: *mut f32, comb: *mut f32,
@@ -404,6 +406,18 @@ pub struct MtpState {
     /// gdn_b1) + a pinned k slot. One ferrite_mtp_commit launch replaces
     /// 2*n_gdn cudaMemcpyAsync D2Ds + the hprev row select.
     pub commit: Option<MtpCommitPlan>,
+    /// mega_d draft graph (v2): the whole draft chain (gather -> forward ->
+    /// argmax -> gather -> forward -> argmax) captured as ONE graph. Inputs:
+    /// last_id (PINNED f32 — zero-copy read at replay), hprev (fixed).
+    /// Outputs: d1_id/d2_id (device slots, one D2H after replay), h_d1 (the
+    /// recursion h, fixed slot). embed_table: replicated f32 [vocab,hidden].
+    pub embed_table: Option<DevBuf>,
+    pub last_id_pin: *mut f32,
+    pub emb_last: DevBuf,
+    pub emb_d1: DevBuf,
+    pub h_d1: DevBuf,
+    pub d1_id: DevBuf,
+    pub d2_id: DevBuf,
 }
 
 /// Device-resident commit pointer table for ferrite_mtp_commit. `plan`
@@ -1016,6 +1030,11 @@ impl CudaBackend {
             }
             None => false,
         }
+    }
+
+    /// Whether a captured graph exists under `name` (probe without replay).
+    pub fn graph_exists(&self, name: &str) -> bool {
+        self.graph_execs.lock().unwrap().contains_key(name)
     }
 
     /// Begin stream capture (THREAD_LOCAL mode). Ops enqueued until
@@ -2799,6 +2818,18 @@ impl CudaBackend {
                 )
             },
             "mtp_commit",
+        )?;
+        Ok(())
+    }
+
+    /// Embedding row gather for the draft chain: token id (device slot OR
+    /// pinned-host f32 — zero-copy UVA read at replay time) -> one f32 row
+    /// of the replicated [vocab, hidden] table. Graph-capturable.
+    pub fn embed_gather_dev(&self, table: *const f32, id: *const f32, out: *mut f32, hidden: usize) -> Result<()> {
+        self.enter();
+        ck(
+            unsafe { ferrite_embed_gather(table, id, out, hidden as i32, self.stream) },
+            "embed_gather",
         )?;
         Ok(())
     }
