@@ -3705,6 +3705,96 @@ extern "C" cudaError_t ferrite_fp8_mma_probe(const unsigned char* A, const unsig
 // fallbacks (fp8-registered weights with misaligned shapes serve bf16).
 // Requires: in_f % 128 == 0 and out_f % 16 == 0 (GLM weights all comply).
 // ============================================================
+// ============================================================
+// gemv_fp8_mma v1 (W8A8, launcher DEFAULT): per-block independent quant —
+// every block quantizes x into ITS OWN shared memory (fully parallel, no
+// barrier), then mma reads the smem xq. Redundant work (grid x quant) but
+// NO synchronization: beats the v3 cooperative barrier on EVERY shape
+// (v3.1: small 0.28x / large 0.52x vs v1 0.60x / 1.23x — the spin-pass
+// atomics of ~8.5k non-participant blocks serialize on one L2 address
+// ~250us, and the two-round votes among 1.2k blocks cost ~70us more).
+// v1 wins the HBM-bound large shapes 1.23x over bf16 (185us vs 227us on
+// lm_head 154880x4096). smem: [xq e4m3 |in_f|][reduce 256][xs 1][sacc 8x16].
+// ============================================================
+__global__ void gemv_fp8_mma_kernel(
+    const float* __restrict__ x,          // [in_f] f32 (n=1 decode row)
+    const unsigned char* __restrict__ w,  // [out_f, in_f] e4m3 row-major
+    const float* __restrict__ w_scale,    // [srows][scols] = [out/128][in/128]
+    float* __restrict__ y,                // [out_f]
+    int in_f, int out_f, int srows, int scols)
+{
+    (void)srows;
+    const int m0 = blockIdx.x * 16;        // 16 output rows per block
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = lane >> 2, c0 = (lane & 3) * 4; // probe-verified fragments
+    extern __shared__ unsigned char smem[];
+    unsigned char* sx = smem;                       // [in_f] quantized x (e4m3)
+    float* sred = (float*)(smem + in_f);            // [256] absmax reduce
+    float* sxs = (float*)(smem + in_f + 256 * 4);   // [1] x_scale
+    float* sacc = sxs + 1;                          // [8][16] warp partials
+    // ---- 1. per-block quantize (NO cross-block barrier — this is v1's win) ----
+    {
+        float amax = 1e-9f;
+        for (int k = threadIdx.x; k < in_f; k += 256)
+            amax = fmaxf(amax, fabsf(x[k]));
+        sred[threadIdx.x] = amax;
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (threadIdx.x < off)
+                sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) sxs[0] = sred[0] / 448.0f;
+        __syncthreads();
+        const float inv = 1.0f / sxs[0];
+        for (int k = threadIdx.x; k < in_f; k += 256) {
+            const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
+            sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+        }
+        __syncthreads();
+    }
+    // ---- 2. mma body (reads smem xq; fragments per fp8_mma_layout_probe) ----
+    const int nblk = (in_f + 127) >> 7;
+    const int bseg = (nblk + 7) / 8;
+    const int kW = warp;
+    const int k0 = kW * bseg * 128;
+    const int k1 = min(k0 + bseg * 128, in_f);
+    const int ws_row = (m0 / 128) * scols;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int kb = k0; kb < k1; kb += 128) {
+        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+        for (int kk = kb; kk < kb + 128; kk += 32) {
+            if (kk + 32 > k1) break;
+            unsigned a[4];
+            a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
+            a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
+            a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
+            a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
+            unsigned b[2];
+            b[0] = *(const unsigned*)(sx + kk + c0);
+            b[1] = *(const unsigned*)(sx + kk + c0 + 16);
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                  "r"(b[0]), "r"(b[1]));
+        }
+        const float wsc = w_scale[ws_row + (kb >> 7)];
+        if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; }
+    }
+    if ((lane & 3) == 0) {
+        sacc[warp * 16 + r0] = acc0;
+        sacc[warp * 16 + r0 + 8] = acc1;
+    }
+    __syncthreads();
+    if (warp == 0 && lane < 16) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
+        y[m0 + lane] = t * sxs[0];
+    }
+}
+
 // v3.1 (user-directed grid fix): cooperative quant on the first co_res
 // blocks ONLY (spin barrier among co-resident participants — deadlock-free),
 // the mma stage runs FULLY PARALLEL (grid = out_f/16, no row loop — the
