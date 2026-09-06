@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 use rayon::prelude::*;
 
-use crate::config::Glm53FlashConfig;
+use crate::config::{Glm53FlashConfig, LayerType, MlpType};
 use crate::weights::{weight_layout, Weights};
 
 const FP8_BLOCK: usize = 128;
@@ -242,12 +242,60 @@ fn dequant_block(w: &[f32], s: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// `src` is the checkpoint-side name; scale is looked up as `{src}.weight_scale_inv`-style
 /// (`{src}` ends with `.weight` for proj matrices; non-.weight params are
 /// never FP8 in this checkpoint).
+/// sglang `modules_to_not_convert`-aligned fp8 eligibility (GLM-5.3-Flash,
+/// activation_scheme=dynamic fmt=e4m3): fp8 ONLY for the MoE/Dense expert
+/// GEMMs + the MLA full-attention main projections. Everything else — GDN
+/// linear attention (all submodules), MLA indexer components, the MoE router
+/// (mlp.gate / e_score_correction_bias), the shared expert (checkpoint-native
+/// bf16 — no `*_scale_inv` sibling), lm_head, embed and every norm — stays
+/// bf16. This decides whether a `*_scale_inv` tensor's weight is served from
+/// the fp8 bypass (eligible ⇒ placeholder + Fp8Weight) or bf16-recovered
+/// (dequant_block → f32, which the preload bf16-encodes).
+pub fn is_fp8_eligible(src: &str, layer_idx: Option<usize>, cfg: &Glm53FlashConfig) -> bool {
+    // non-layer globals: never fp8
+    if src == "lm_head.weight" || src == "model.embed_tokens.weight" { return false; }
+    if src.ends_with("_layernorm.weight") || src.ends_with(".norm.weight")
+        || src.ends_with(".enorm.weight") || src.ends_with(".hnorm.weight")
+        || src.ends_with(".shared_head.norm.weight") { return false; }
+    // MoE router: bf16 (+ fp32 activations per moe_router_dtype)
+    if src.contains(".mlp.gate") || src.contains(".mlp.e_score_correction_bias") { return false; }
+    // MoE routed experts: fp8
+    if src.contains(".experts.") { return true; }
+    // shared expert: checkpoint-native bf16
+    if src.contains(".shared_expert.") { return false; }
+    let Some(li) = layer_idx else { return false; };
+    // dense-MLP expert GEMMs (first_k_dense_replace)
+    if matches!(cfg.mlp_types.get(li), Some(MlpType::Dense))
+        && (src.ends_with(".gate_proj.weight") || src.ends_with(".up_proj.weight")
+            || src.ends_with(".down_proj.weight"))
+    {
+        return true;
+    }
+    // MLA (deepseek_sparse_attention, or the MTP/nextn layer 45 — treated as
+    // DSA): main projections fp8; indexer components bf16; GDN bf16.
+    let is_dsa = matches!(cfg.layer_types.get(li), Some(LayerType::DeepseekSparseAttention))
+        || li >= cfg.layer_types.len();
+    if is_dsa {
+        if src.contains("self_attn.indexer.") { return false; }
+        return src.ends_with(".q_a_proj.weight") || src.contains("kv_a_proj_with_mqa.weight")
+            || src.ends_with(".q_b_proj.weight") || src.ends_with(".o_proj.weight");
+    }
+    false
+}
+
+fn layer_idx_of(src: &str) -> Option<usize> {
+    let m = src.find("layers.")?;
+    let after = &src[m + 7..];
+    let end = after.find('.')?;
+    after[..end].parse().ok()
+}
+
 fn load_named(
     files: &[PathBuf],
     index: &HashMap<String, Entry>,
     src: &str,
     rep: &mut CheckpointReport,
-    keep_f32: bool,
+    cfg: &Glm53FlashConfig,
 ) -> Result<(Tensor, Option<crate::weights::Fp8Weight>)> {
     let e = index
         .get(src)
@@ -285,23 +333,30 @@ fn load_named(
             data: raw, // the F8 bytes (pre-f32-conversion)
             scale: s,
         };
-        if keep_f32 {
-            rep.fp8_dequantized += 1;
-            let w = to_f32(&fp8.data, RawDType::Fp8E4m3);
-            let sraw = read_entry(files, sc)?;
-            let s = to_f32(&sraw, RawDType::F32);
-            let data = dequant_block(&w, &s, rows, cols);
-            Ok((Tensor::new(Shape::new(shape), DType::F32, data), Some(fp8)))
-        } else {
+        if is_fp8_eligible(src, layer_idx_of(src), cfg) {
+            // sglang-aligned fp8 single-store: eligible weights (MoE/Dense
+            // experts, MLA main projections) never materialize the dequantized
+            // f32 — the checkpoint-native fp8+scales IS the precision (the
+            // bf16 path re-quantized it anyway). The placeholder keeps a unique
+            // heap ptr (fp8_map keys on (ptr, numel)) + the real shape (dims
+            // are read by shard/device-chain code); data is untouched on the
+            // cuda path (fp8 hit ⇒ bf16 upload skipped, matmul serves fp8).
             rep.fp8_placeholder += 1;
-            // Direct field construction: Tensor::new asserts data.len() ==
-            // numel (the placeholder's 4-elem stub intentionally violates it).
             let placeholder = Tensor {
                 shape: Shape::new(shape),
                 dtype: DType::F32,
                 data: std::sync::Arc::new(vec![0f32; 4]),
             };
             Ok((placeholder, Some(fp8)))
+        } else {
+            // ineligible-but-`_scale_inv` present (MoE router, shared expert if
+            // any): bf16-recover — dequant_block → f32 (preload bf16-encodes).
+            rep.fp8_dequantized += 1;
+            let w = to_f32(&fp8.data, RawDType::Fp8E4m3);
+            let sraw = read_entry(files, sc)?;
+            let s = to_f32(&sraw, RawDType::F32);
+            let data = dequant_block(&w, &s, rows, cols);
+            Ok((Tensor::new(Shape::new(shape), DType::F32, data), Some(fp8)))
         }
     } else {
         let raw = read_entry(files, e)?;
@@ -385,9 +440,9 @@ pub fn load_hf_checkpoint(
         .map(|(name, src)| {
             if let Some(base) = src.strip_suffix("__FUSED_QKV__") {
                 let mut r = CheckpointReport::default();
-                let (q, _) = load_named(&files, &index, &format!("{base}q_proj.weight"), &mut r, true)?;
-                let (k, _) = load_named(&files, &index, &format!("{base}k_proj.weight"), &mut r, true)?;
-                let (v, _) = load_named(&files, &index, &format!("{base}v_proj.weight"), &mut r, true)?;
+                let (q, _) = load_named(&files, &index, &format!("{base}q_proj.weight"), &mut r, cfg)?;
+                let (k, _) = load_named(&files, &index, &format!("{base}k_proj.weight"), &mut r, cfg)?;
+                let (v, _) = load_named(&files, &index, &format!("{base}v_proj.weight"), &mut r, cfg)?;
                 let rows = q.shape.0[0] + k.shape.0[0] + v.shape.0[0];
                 let c = q.shape.0[1];
                 let data = concat_rows(
@@ -405,7 +460,7 @@ pub fn load_hf_checkpoint(
                 let mut r = CheckpointReport::default();
                 let mut parts: Vec<Tensor> = Vec::new();
                 for b in ["q", "k", "v"] {
-                    let (t, _) = load_named(&files, &index, &format!("{base}{b}_conv1d.weight"), &mut r, true)?;
+                    let (t, _) = load_named(&files, &index, &format!("{base}{b}_conv1d.weight"), &mut r, cfg)?;
                     let (c1, c2, c3) = (
                         t.shape.0[0],
                         *t.shape.0.get(1).unwrap_or(&1),
@@ -427,21 +482,12 @@ pub fn load_hf_checkpoint(
                 return Ok((name, Tensor::new(Shape::new(vec![rows, c]), DType::F32, data), None));
             }
             let mut r = CheckpointReport::default();
-            // Single-store policy: only weights whose f32 is read DIRECTLY
-            // (bf16 pointer tables for fused MoE, hc dev_weight f32, embed
-            // host lookup, fused-qkv concat) keep the dequantized f32; the
-            // rest serve from the fp8 bypass and get a 4-element placeholder
-            // (unique ptr for the fp8_map key, real shape for dim readers).
-            let keep_f32 = name.contains(".experts.")
-                || name.contains(".shared_expert")
-                || name == "model.embed_tokens.weight"
-                || name.ends_with("hc_attn_base")
-                || name.ends_with("hc_attn_scale")
-                || name.ends_with("hc_attn_fn")
-                || name.ends_with("hc_ffn_base")
-                || name.ends_with("hc_ffn_scale")
-                || name.ends_with("hc_ffn_fn");
-            let (t, fp8) = load_named(&files, &index, &src, &mut r, keep_f32)?;
+            // fp8 eligibility is decided inside load_named via is_fp8_eligible
+            // (sglang modules_to_not_convert aligned): MoE/Dense experts + MLA
+            // main projections → fp8 single-store (placeholder); everything
+            // else (GDN, MLA indexer, MoE router, lm_head, embed, norms, hc)
+            // → bf16. Pass cfg so the layer-type classification is available.
+            let (t, fp8) = load_named(&files, &index, &src, &mut r, cfg)?;
             Ok((name, t, fp8))
         })
         .collect();
@@ -512,14 +558,19 @@ mod tests {
         }
         let (files, index) = scan_headers(dir).unwrap();
         let mut rep = CheckpointReport::default();
-        let (t, _fp8) = load_named(
-            &files,
-            &index,
-            "model.language_model.layers.5.mlp.experts.51.down_proj.weight",
-            &mut rep,
-            true,
-        )
-        .unwrap();
+        // down_proj is fp8-ELIGIBLE → load_named serves the placeholder (no
+        // dequantized f32). Directly dequant here to validate the block-scale
+        // math against the reference f32 values.
+        let de = &index["model.language_model.layers.5.mlp.experts.51.down_proj.weight"];
+        let raw = read_entry(&files, de).unwrap();
+        let w = to_f32(&raw, RawDType::Fp8E4m3);
+        let se = &index["model.language_model.layers.5.mlp.experts.51.down_proj.weight_scale_inv"];
+        let sraw = read_entry(&files, se).unwrap();
+        let s = to_f32(&sraw, RawDType::F32);
+        let rows = de.shape[0];
+        let cols = if de.shape.len() > 1 { de.shape[1] } else { 1 };
+        let data = dequant_block(&w, &s, rows, cols);
+        let t = Tensor::new(Shape::new(vec![rows, cols]), DType::F32, data);
         let sl = t.as_slice();
         let nbad = sl.iter().filter(|v| !v.is_finite()).count();
         let first: Vec<usize> = sl
@@ -537,14 +588,7 @@ mod tests {
             first,
             &sl[..4]
         );
-        let s = load_named(
-            &files,
-            &index,
-            "model.language_model.layers.5.mlp.experts.51.down_proj.weight_scale_inv",
-            &mut rep,
-            true,
-        )
-        .unwrap();
+        let s = s.clone();
         // dump the raw entry the Rust scanner resolved, to compare with python
         let probe_e = index
             .get("model.language_model.layers.5.mlp.experts.51.down_proj.weight_scale_inv")
@@ -570,5 +614,51 @@ mod tests {
             s.as_slice().iter().filter(|v| !v.is_finite()).count()
         );
         assert!(nbad == 0, "expert weight has non-finite values after dequant");
+    }
+}
+#[cfg(test)]
+mod fp8_eligibility_tests {
+    use super::*;
+    use crate::config::{Glm53FlashConfig, LayerType, MlpType};
+
+    #[test]
+    fn fp8_eligibility_sglang_aligned() {
+        let cfg = Glm53FlashConfig::test_config();
+        let n = cfg.num_hidden_layers;
+        // globals -> never fp8
+        assert!(!is_fp8_eligible("lm_head.weight", None, &cfg));
+        assert!(!is_fp8_eligible("model.embed_tokens.weight", None, &cfg));
+        assert!(!is_fp8_eligible("model.norm.weight", None, &cfg));
+        assert!(!is_fp8_eligible("model.language_model.layers.5.mlp.gate.weight", None, &cfg));
+        // GDN linear-attention layer (idx 0 = LinearAttention): all bf16
+        let gdn = cfg.layer_types.iter().position(|t| *t == LayerType::LinearAttention).unwrap();
+        assert!(!is_fp8_eligible(&format!("model.layers.{gdn}.self_attn.qkv_proj.weight"), Some(gdn), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{gdn}.self_attn.o_proj.weight"), Some(gdn), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{gdn}.self_attn.f_a_proj.weight"), Some(gdn), &cfg));
+        // MLA full-attn layer (idx 1 = DeepseekSparseAttention): main proj fp8
+        let dsa = cfg.layer_types.iter().position(|t| *t == LayerType::DeepseekSparseAttention).unwrap();
+        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.q_a_proj.weight"), Some(dsa), &cfg));
+        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.kv_a_proj_with_mqa.weight"), Some(dsa), &cfg));
+        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.q_b_proj.weight"), Some(dsa), &cfg));
+        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.o_proj.weight"), Some(dsa), &cfg));
+        // MLA indexer components -> bf16
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.indexer.wq_b.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.indexer.weights_proj.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.indexer.k_norm.weight"), Some(dsa), &cfg));
+        // MoE router (mlp.gate / e_score_correction_bias) -> bf16
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.mlp.gate.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.mlp.e_score_correction_bias"), Some(dsa), &cfg));
+        // MoE experts -> fp8
+        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.mlp.experts.0.gate_proj.weight"), Some(dsa), &cfg));
+        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.mlp.experts.0.down_proj.weight"), Some(dsa), &cfg));
+        // shared expert -> bf16 (checkpoint-native)
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.mlp.shared_expert.gate_proj.weight"), Some(dsa), &cfg));
+        // dense-MLP layer (idx 0 = Dense mlp): gate/up/down fp8
+        let dense = cfg.mlp_types.iter().position(|m| *m == MlpType::Dense).unwrap();
+        assert!(is_fp8_eligible(&format!("model.layers.{dense}.mlp.gate_proj.weight"), Some(dense), &cfg));
+        assert!(is_fp8_eligible(&format!("model.layers.{dense}.mlp.down_proj.weight"), Some(dense), &cfg));
+        // MTP/nextn layer (li == num_hidden_layers): treated as DSA — main proj fp8, indexer bf16
+        assert!(is_fp8_eligible(&format!("model.layers.{n}.self_attn.q_a_proj.weight"), Some(n), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{n}.self_attn.indexer.wq_b.weight"), Some(n), &cfg));
     }
 }

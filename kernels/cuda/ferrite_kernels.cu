@@ -2155,6 +2155,237 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum(
 }
 
 // ============================================================
+// MoE fp8 variants: the experts' weights serve from the checkpoint-native
+// F8_E4M3 bytes + 128x128 block scales (the fp8_map's Fp8Dev pairs) —
+// HALF the HBM traffic of the bf16 pointer tables (moe was 4.5ms of the
+// 21.7ms verify step, HBM-bound). Same grid/tile structure as the bf16
+// kernels; the dot bodies swap bf16-uint4 loads for 16x-fp8-uint4 with the
+// inline block-scale dequant (w_f32 = e4m3(b) * s[r>>7][k>>7], the
+// checkpoint's own dequant_block semantics — NOT a re-quantization).
+// scale layouts: act weights [inter, hidden] -> srow = s + (r>>7)*hscols
+// (hscols = hidden/128); down weights [hidden, inter] -> srow = s + (h>>7)*dscols
+// (dscols = inter/128).
+// ============================================================
+__global__ void moe_fused_act_fp8_kernel(
+    const float* __restrict__ x,          // [n, hidden]
+    const float* __restrict__ ids_f,      // [n, topk] f32-encoded
+    const unsigned char* const* __restrict__ gate_w8_ptrs,   // [e_local] fp8 [inter, hidden]
+    const float* const* __restrict__ gate_scale_ptrs,       // [e_local] [inter/128, hidden/128]
+    const unsigned char* const* __restrict__ up_w8_ptrs,    // [e_local] fp8 [inter, hidden]
+    const float* const* __restrict__ up_scale_ptrs,
+    const unsigned char* __restrict__ shared_gate_w8,      // [inter_shared, hidden]
+    const float* __restrict__ shared_gate_scale,
+    const unsigned char* __restrict__ shared_up_w8,
+    const float* __restrict__ shared_up_scale,
+    float* __restrict__ act,              // [n, topk*inter + inter_shared]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int rows, float limit, int hscols) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int slot = blockIdx.y;
+    int tok = blockIdx.z;
+    int row0 = blockIdx.x * rows;
+    int stride = topk * inter + inter_shared;
+    const float* xt = x + (size_t)tok * hidden;
+    int slot_rows, slot_base;
+    const unsigned char *gw8, *uw8;
+    const float *gs, *us; // block scales
+    if (slot < topk) {
+        slot_rows = inter;
+        slot_base = slot * inter;
+        int eid = (int)ids_f[(size_t)tok * topk + slot];
+        int local = eid - expert_start;
+        if (local < 0 || local >= e_local) {
+            if (warp == 0) {
+                for (int r = row0 + lane; r < row0 + rows && r < slot_rows; r += 32) {
+                    act[(size_t)tok * stride + slot_base + r] = 0.f;
+                }
+            }
+            return;
+        }
+        gw8 = gate_w8_ptrs[local]; gs = gate_scale_ptrs[local];
+        uw8 = up_w8_ptrs[local];  us = up_scale_ptrs[local];
+    } else {
+        slot_rows = inter_shared;
+        slot_base = topk * inter;
+        gw8 = shared_gate_w8; gs = shared_gate_scale;
+        uw8 = shared_up_w8;   us = shared_up_scale;
+    }
+    int warps = blockDim.x >> 5;
+    for (int r = row0 + warp; r < row0 + rows && r < slot_rows; r += warps) {
+        const unsigned char* gwr = gw8 + (size_t)r * hidden;
+        const unsigned char* uwr = uw8 + (size_t)r * hidden;
+        const float* gsr = gs + (size_t)(r >> 7) * hscols; // block-scale row
+        const float* usr = us + (size_t)(r >> 7) * hscols;
+        float g = 0.f, u = 0.f;
+        // uint4 = 16 fp8 weights per lane-step; the 16-col group never
+        // crosses a 128-col scale block (16 | 128), one s fetch per group.
+        for (int k = lane * 16; k + 15 < hidden; k += 32 * 16) {
+            const float4 xa = *reinterpret_cast<const float4*>(xt + k);
+            const float4 xb = *reinterpret_cast<const float4*>(xt + k + 4);
+            const float4 xc = *reinterpret_cast<const float4*>(xt + k + 8);
+            const float4 xd = *reinterpret_cast<const float4*>(xt + k + 12);
+            uint4 gv = *reinterpret_cast<const uint4*>(gwr + k);
+            uint4 uv = *reinterpret_cast<const uint4*>(uwr + k);
+            const unsigned char* g8 = reinterpret_cast<const unsigned char*>(&gv);
+            const unsigned char* u8 = reinterpret_cast<const unsigned char*>(&uv);
+            const float gs_c = gsr[k >> 7];
+            const float us_c = usr[k >> 7];
+            #pragma unroll
+            for (int e = 0; e < 16; e++) {
+                const float xv[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
+                                      xc.x, xc.y, xc.z, xc.w, xd.x, xd.y, xd.z, xd.w};
+                g += (__half2float(__nv_cvt_fp8_to_halfraw(g8[e], __NV_E4M3)) * gs_c) * xv[e];
+                u += (__half2float(__nv_cvt_fp8_to_halfraw(u8[e], __NV_E4M3)) * us_c) * xv[e];
+            }
+        }
+        for (int k = ((hidden >> 4) << 4) + lane; k < hidden; k += 32) {
+            // tail (hidden % 16 != 0 — never on GLM but kept safe)
+            const float gs_c = gsr[k >> 7];
+            const float us_c = usr[k >> 7];
+            g += (__half2float(__nv_cvt_fp8_to_halfraw(gwr[k], __NV_E4M3)) * gs_c) * xt[k];
+            u += (__half2float(__nv_cvt_fp8_to_halfraw(uwr[k], __NV_E4M3)) * us_c) * xt[k];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            g += __shfl_down_sync(0xffffffff, g, off);
+            u += __shfl_down_sync(0xffffffff, u, off);
+        }
+        if (lane == 0) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+            act[(size_t)tok * stride + slot_base + r] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_moe_fused_act_fp8(
+    const float* x, const float* ids_f,
+    const void* const* gate_w8_ptrs, const void* const* gate_scale_ptrs,
+    const void* const* up_w8_ptrs, const void* const* up_scale_ptrs,
+    const void* shared_gate_w8, const void* shared_gate_scale,
+    const void* shared_up_w8, const void* shared_up_scale,
+    float* act, int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, float limit, int hscols,
+    cudaStream_t s) {
+    int rows = 8;
+    int max_rows = inter > inter_shared ? inter : inter_shared;
+    dim3 grid((max_rows + rows - 1) / rows, topk + 1, n);
+    moe_fused_act_fp8_kernel<<<grid, 256, 0, s>>>(
+        x, ids_f,
+        (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
+        (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
+        (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
+        (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
+        act, expert_start, e_local, hidden, inter, inter_shared, topk, rows, limit, hscols);
+    return cudaGetLastError();
+}
+
+__global__ void moe_fused_down_sum_fp8_kernel(
+    const float* __restrict__ ids_f,       // [n, topk]
+    const float* __restrict__ probs,       // [n, topk]
+    const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] fp8 [hidden, inter]
+    const float* const* __restrict__ down_scale_ptrs,       // [e_local] [hidden/128, inter/128]
+    const unsigned char* __restrict__ shared_down_w8,      // [hidden, inter_shared]
+    const float* __restrict__ shared_down_scale,
+    const float* __restrict__ act,         // [n, topk*inter + inter_shared]
+    float* __restrict__ out,               // [n, hidden]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int tok = blockIdx.y;
+    int h = blockIdx.x * 8 + warp;
+    if (h >= hidden) return;
+    int stride = topk * inter + inter_shared;
+    const float* act_t = act + (size_t)tok * stride;
+    const float* ids_t = ids_f + (size_t)tok * topk;
+    const float* probs_t = probs + (size_t)tok * topk;
+    float acc = 0.f;
+    for (int j = 0; j < topk; j++) {
+        int eid = (int)ids_t[j];
+        int local = eid - expert_start;
+        if (local < 0 || local >= e_local) continue; // another rank's slot (zero act)
+        float p = probs_t[j];
+        if (p == 0.f) continue;
+        const unsigned char* dwr = down_w8_ptrs[local] + (size_t)h * inter;
+        const float* dsr = down_scale_ptrs[local] + (size_t)(h >> 7) * dscols;
+        const float* aj = act_t + (size_t)j * inter;
+        float y = 0.f;
+        int i = lane * 16;
+        for (; i + 15 < inter; i += 32 * 16) {
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const float4 aa = *reinterpret_cast<const float4*>(aj + i);
+            const float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
+            const float4 ac = *reinterpret_cast<const float4*>(aj + i + 8);
+            const float4 ad = *reinterpret_cast<const float4*>(aj + i + 12);
+            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+            const float ds_c = dsr[i >> 7];
+            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
+                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+#pragma unroll
+            for (int e = 0; e < 16; e++) {
+                y += (__half2float(__nv_cvt_fp8_to_halfraw(d8[e], __NV_E4M3)) * ds_c) * xv[e];
+            }
+        }
+        for (; i < inter; i++) {
+            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_down_sync(0xffffffff, y, off);
+        }
+        acc += p * y;
+    }
+    // shared expert (slot topk, weight 1; K length = inter_shared, TP-sharded)
+    {
+        const unsigned char* dwr = shared_down_w8 + (size_t)h * inter_shared;
+        const float* dsr = shared_down_scale + (size_t)(h >> 7) * dscols;
+        const float* as_ = act_t + (size_t)topk * inter;
+        float y = 0.f;
+        int i = lane * 16;
+        for (; i + 15 < inter_shared; i += 32 * 16) {
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const float4 aa = *reinterpret_cast<const float4*>(as_ + i);
+            const float4 ab = *reinterpret_cast<const float4*>(as_ + i + 4);
+            const float4 ac = *reinterpret_cast<const float4*>(as_ + i + 8);
+            const float4 ad = *reinterpret_cast<const float4*>(as_ + i + 12);
+            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+            const float ds_c = dsr[i >> 7];
+            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
+                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+#pragma unroll
+            for (int e = 0; e < 16; e++) {
+                y += (__half2float(__nv_cvt_fp8_to_halfraw(d8[e], __NV_E4M3)) * ds_c) * xv[e];
+            }
+        }
+        for (; i < inter_shared; i++) {
+            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * as_[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_down_sync(0xffffffff, y, off);
+        }
+        acc += y;
+    }
+    if (lane == 0) out[(size_t)tok * hidden + h] = acc;
+}
+
+extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
+    const float* ids_f, const float* probs,
+    const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
+    const void* shared_down_w8, const void* shared_down_scale,
+    const float* act, float* out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
+    dim3 grid((hidden + 7) / 8, n, 1);
+    moe_fused_down_sum_fp8_kernel<<<grid, 256, 0, s>>>(
+        ids_f, probs,
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
+        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // DSA (sparse attention) device chain — the four small kernels the CPU
 // path did on the host between GPU calls (each crossing was a sync):
 //   layernorm_affine: ki = LN(x·wk)(k_norm w/b)  [n, idm]

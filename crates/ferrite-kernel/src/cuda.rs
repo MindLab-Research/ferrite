@@ -469,6 +469,9 @@ pub struct CudaBackend {
     /// registration (same-name golden/fp8 shard pairing), zero call-site
     /// churn in the exec layer.
     fp8_map: std::sync::Mutex<std::collections::HashMap<(usize, usize), Fp8Dev>>,
+    /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
+    /// scale) device tables for the fused MoE kernels.
+    moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
     /// Named CUDA graphs (per layer-segment): FERRITE_GRAPH_LAYER captures
     /// each segment's op sequence once and replays per token — the per-op
     /// launch gaps (~30μs × ~19 ops/layer) are the decode bottleneck after
@@ -529,6 +532,7 @@ impl CudaBackend {
             dsa_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
@@ -1558,6 +1562,22 @@ pub struct MoePtrTable {
     pub down_dev: *mut std::ffi::c_void,
     pub e_local: usize,
 }
+
+/// fp8 variant of the expert pointer table: per expert (w8_bytes, scale)
+/// pairs for gate/up/down — the fused MoE kernels gather e4m3 rows + block
+/// scales through these (HALF the bf16 tables' HBM traffic; the inline
+/// dequant is the checkpoint's own semantics, not a re-quantization).
+pub struct MoeFp8PtrTable {
+    pub gate_w8: *mut std::ffi::c_void,
+    pub gate_scale: *mut std::ffi::c_void,
+    pub up_w8: *mut std::ffi::c_void,
+    pub up_scale: *mut std::ffi::c_void,
+    pub down_w8: *mut std::ffi::c_void,
+    pub down_scale: *mut std::ffi::c_void,
+    pub e_local: usize,
+}
+unsafe impl Send for MoeFp8PtrTable {}
+unsafe impl Sync for MoeFp8PtrTable {}
 unsafe impl Send for MoePtrTable {}
 unsafe impl Sync for MoePtrTable {}
 
@@ -2186,6 +2206,29 @@ extern "C" {
                                    hidden: i32, inter: i32, inter_shared: i32,
                                    topk: i32, n: i32,
                                    s: CuStream) -> i32;
+    fn ferrite_moe_fused_act_fp8(x: *const f32, ids_f: *const f32,
+                                  gate_w8_ptrs: *const *const std::ffi::c_void,
+                                  gate_scale_ptrs: *const *const std::ffi::c_void,
+                                  up_w8_ptrs: *const *const std::ffi::c_void,
+                                  up_scale_ptrs: *const *const std::ffi::c_void,
+                                  shared_gate_w8: *const std::ffi::c_void,
+                                  shared_gate_scale: *const std::ffi::c_void,
+                                  shared_up_w8: *const std::ffi::c_void,
+                                  shared_up_scale: *const std::ffi::c_void,
+                                  act: *mut f32, expert_start: i32, e_local: i32,
+                                  hidden: i32, inter: i32, inter_shared: i32,
+                                  topk: i32, n: i32, limit: f32, hscols: i32,
+                                  s: CuStream) -> i32;
+    fn ferrite_moe_fused_down_sum_fp8(ids_f: *const f32, probs: *const f32,
+                                      down_w8_ptrs: *const *const std::ffi::c_void,
+                                      down_scale_ptrs: *const *const std::ffi::c_void,
+                                      shared_down_w8: *const std::ffi::c_void,
+                                      shared_down_scale: *const std::ffi::c_void,
+                                      act: *const f32, out: *mut f32,
+                                      expert_start: i32, e_local: i32,
+                                      hidden: i32, inter: i32, inter_shared: i32,
+                                      topk: i32, n: i32, dscols: i32,
+                                      s: CuStream) -> i32;
 }
 
 impl CudaBackend {
@@ -2268,6 +2311,73 @@ impl CudaBackend {
         Ok((e_local, g, u, d))
     }
 
+    /// fp8 variant of the expert pointer table: (w8 bytes, block scales)
+    /// device tables per expert for gate/up/down — the fused MoE kernels'
+    /// e4m3 indirect addressing. Returns None when ANY expert weight misses
+    /// the fp8 registration (caller falls back to the bf16 tables — domain
+    /// uniformity is per-LAYER, never mixed).
+    pub fn moe_expert_ptrs_fp8(
+        &self,
+        experts: &[ExpertWeights],
+    ) -> Result<Option<MoeFp8PtrTable>> {
+        self.enter();
+        let key = experts.first().map(|e| e.gate.as_slice().as_ptr() as usize).unwrap_or(0);
+        let e_local = experts.len();
+        {
+            let m = self.moe_fp8_ptrs.lock().unwrap();
+            if let Some(t) = m.get(&key) {
+                return Ok(Some(MoeFp8PtrTable {
+                    gate_w8: t.gate_w8, gate_scale: t.gate_scale,
+                    up_w8: t.up_w8, up_scale: t.up_scale,
+                    down_w8: t.down_w8, down_scale: t.down_scale,
+                    e_local: t.e_local,
+                }));
+            }
+        }
+        // every expert weight must be fp8-registered (all-or-nothing)
+        let mut gate_w8 = Vec::with_capacity(e_local);
+        let mut gate_sc = Vec::with_capacity(e_local);
+        let mut up_w8 = Vec::with_capacity(e_local);
+        let mut up_sc = Vec::with_capacity(e_local);
+        let mut down_w8 = Vec::with_capacity(e_local);
+        let mut down_sc = Vec::with_capacity(e_local);
+        for e in experts {
+            let (g, u, d) = match (self.fp8_lookup(e.gate), self.fp8_lookup(e.up), self.fp8_lookup(e.down)) {
+                (Some(g), Some(u), Some(d)) => (g, u, d),
+                _ => return Ok(None), // not fully fp8 → bf16 tables (this layer)
+            };
+            gate_w8.push(g.w); gate_sc.push(g.scale);
+            up_w8.push(u.w); up_sc.push(u.scale);
+            down_w8.push(d.w); down_sc.push(d.scale);
+        }
+        // table upload macro (six tables, same pattern — the bf16 builder's
+        // closure, macro'd for the fp8 pair tables)
+        macro_rules! upload_table {
+            ($vals:expr) => {{
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                ck(unsafe { cudaMalloc(&mut p, $vals.len() * std::mem::size_of::<*mut std::ffi::c_void>()) }, "moe fp8 table malloc")?;
+                ck(unsafe {
+                    cudaMemcpy(p, $vals.as_ptr() as *const _, $vals.len() * std::mem::size_of::<*mut std::ffi::c_void>(), CUDA_MEMCPY_H2D)
+                }, "moe fp8 table H2D")?;
+                p
+            }};
+        }
+        let t = MoeFp8PtrTable {
+            gate_w8: upload_table!(gate_w8), gate_scale: upload_table!(gate_sc),
+            up_w8: upload_table!(up_w8), up_scale: upload_table!(up_sc),
+            down_w8: upload_table!(down_w8), down_scale: upload_table!(down_sc),
+            e_local,
+        };
+        let out = MoeFp8PtrTable {
+            gate_w8: t.gate_w8, gate_scale: t.gate_scale,
+            up_w8: t.up_w8, up_scale: t.up_scale,
+            down_w8: t.down_w8, down_scale: t.down_scale,
+            e_local: t.e_local,
+        };
+        self.moe_fp8_ptrs.lock().unwrap().insert(key, t);
+        Ok(Some(out))
+    }
+
     pub fn moe_layer_dev(
         &self,
         x_dev: &DevBuf,
@@ -2313,7 +2423,6 @@ impl CudaBackend {
                     cudaMemcpyAsync(dst as *mut _, src as *const _, n * topk * 4, CUDA_MEMCPY_D2D, self.stream)
                 }, "probs D2D (fused)")?;
             }
-            let (e_local, g_ptrs, u_ptrs, d_ptrs) = self.moe_expert_ptrs(experts)?;
             // Routed experts keep the FULL inter; the shared expert's inter is
             // TP-sharded (moe_intermediate_size / world). The act buffer is
             // [n, topk*inter + inter_shared] (see the kernels' slot layout).
@@ -2321,10 +2430,50 @@ impl CudaBackend {
                 .map(|e| e.gate.shape.0[0])
                 .unwrap_or(shared.gate.shape.0[0]) as i32;
             let inter_shared = shared.gate.shape.0[0] as i32;
+            let act = DevBuf::alloc(self.dev, self.stream, n * (topk * inter as usize + inter_shared as usize))?;
+            let out = DevBuf::alloc(self.dev, self.stream, n * hidden)?;
+            // fp8 fused path: experts + shared ALL fp8-registered → e4m3
+            // tables (HALF the bf16 tables' HBM bytes — the moe segment was
+            // 4.5ms of the 21.7ms verify step, HBM-bound). All-or-nothing per
+            // layer (domain uniformity: never mix fp8/bf16 experts); a miss on
+            // any weight falls back to the bf16 tables below.
+            let shared_fp8 = match (self.fp8_lookup(shared.gate), self.fp8_lookup(shared.up), self.fp8_lookup(shared.down)) {
+                (Some(g), Some(u), Some(d)) if self.fp8_lookup(gate_w).is_none() => Some((g, u, d)),
+                _ => None,
+            };
+            if let (Some(tbl), Some((sg, su, sd))) = (self.moe_expert_ptrs_fp8(experts)?, shared_fp8) {
+                let hscols = self.fp8_lookup(shared.gate).map(|f| f.scols).unwrap_or((hidden as usize).div_ceil(128) as i32);
+                ck(unsafe {
+                    ferrite_moe_fused_act_fp8(
+                        x_dev.as_const_f32(), dids.as_const_f32(),
+                        tbl.gate_w8 as *const *const _, tbl.gate_scale as *const *const _,
+                        tbl.up_w8 as *const *const _, tbl.up_scale as *const *const _,
+                        sg.w, sg.scale, su.w, su.scale,
+                        act.as_f32(),
+                        expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                        topk as i32, ni, swiglu_limit, hscols,
+                        self.stream,
+                    )
+                }, "moe_fused_act_fp8")?;
+                // down's scale cols = inter/128 (down weights are [hidden, inter])
+                let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
+                ck(unsafe {
+                    ferrite_moe_fused_down_sum_fp8(
+                        dids.as_const_f32(), dprobs.as_const_f32(),
+                        tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
+                        sd.w, sd.scale,
+                        act.as_const_f32(), out.as_f32(),
+                        expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                        topk as i32, ni, dscols, self.stream,
+                    )
+                }, "moe_fused_down_sum_fp8")?;
+                return Ok(out);
+            }
+            // bf16 fused path (experts' ptr tables into the dev_weight_bf16 cache)
+            let (e_local, g_ptrs, u_ptrs, d_ptrs) = self.moe_expert_ptrs(experts)?;
             let dsg = self.dev_weight_bf16(shared.gate)?;
             let dsu = self.dev_weight_bf16(shared.up)?;
             let dsd = self.dev_weight_bf16(shared.down)?;
-            let act = DevBuf::alloc(self.dev, self.stream, n * (topk * inter as usize + inter_shared as usize))?;
             ck(unsafe {
                 ferrite_moe_fused_act(
                     x_dev.as_const_f32(), dids.as_const_f32(),
@@ -2334,7 +2483,6 @@ impl CudaBackend {
                     topk as i32, ni, swiglu_limit, self.stream,
                 )
             }, "moe_fused_act")?;
-            let out = DevBuf::alloc(self.dev, self.stream, n * hidden)?;
             ck(unsafe {
                 ferrite_moe_fused_down_sum(
                     dids.as_const_f32(), dprobs.as_const_f32(),

@@ -1377,3 +1377,196 @@ fn gemv_fp8_parity() {
         }
     }
 }
+
+/// moe fp8 parity + A/B speed vs bf16: register e4m3 bytes + 128-block scales
+/// for every expert AND the shared expert, drive moe_layer_dev's fp8 path, and
+/// match a CPU golden (e4m3-decode × scale dot, swiglu, prob-weighted down —
+/// the fp8 kernel's OWN semantics, so diff must be ~0). Then benchmark the
+/// SAME moe_layer_dev twice: fp8-registered (HALF the weight bytes) vs bf16
+/// fallback (unregistered) — proves the fp8 path is actually faster, not just
+/// correct (the e4m3 scalar-convert overhead can offset the HBM savings if the
+/// kernel isn't bf16-parity-vectorized).
+#[test]
+fn moe_fused_fp8_parity_and_speed() {
+    use ferrite_kernel::cuda::{DevBuf, ExpertWeights};
+    use std::time::Instant;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+
+    let (hidden, inter, inter_s, e_total, topk, e_local, expert_start) =
+        (4096usize, 512usize, 128usize, 8usize, 4usize, 8usize, 0usize);
+    let routed_scaling = 1.2f32;
+    let limit = 7.0f32;
+    let mut seed = 0xfeed_face_cafe_1234u64;
+    let mut r = || { seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((seed >> 33) as f32 / 2147483648.0 - 0.5) };
+
+    let mut mkf = |rr: usize, cc: usize, s: f32| -> Vec<f32> { (0..rr * cc).map(|_| r() * s).collect() };
+    let mkbytes = |w: &[f32], rows: usize, cols: usize| -> (Vec<u8>, Vec<f32>) {
+        let srows = rows.div_ceil(128);
+        let scols = cols.div_ceil(128);
+        let mut scale = vec![0f32; srows * scols];
+        for br in 0..srows {
+            for bc in 0..scols {
+                let mut m = 0f32;
+                for i in 0..128 {
+                    for jj in 0..128 {
+                        let rr = (br * 128 + i).min(rows - 1);
+                        let cc = (bc * 128 + jj).min(cols - 1);
+                        let v = w[rr * cols + cc].abs();
+                        if v > m { m = v; }
+                    }
+                }
+                scale[br * scols + bc] = m / 448.0;
+            }
+        }
+        let mut bytes = vec![0u8; w.len()];
+        for i in 0..w.len() {
+            let br = i / cols / 128;
+            let bc = (i % cols) / 128;
+            let sc = scale[br * scols + bc];
+            let q = (w[i] / sc).clamp(-448.0, 448.0);
+            bytes[i] = fp8_encode(q);
+        }
+        (bytes, scale)
+    };
+
+    let x = mkf(1, hidden, 1.0);
+    let gate_w = mkf(e_total, hidden, 0.3);
+    let bias = mkf(e_total, 1, 1.0);
+    let eg: Vec<Vec<f32>> = (0..e_local).map(|_| mkf(inter, hidden, 0.05)).collect();
+    let eu: Vec<Vec<f32>> = (0..e_local).map(|_| mkf(inter, hidden, 0.05)).collect();
+    let ed: Vec<Vec<f32>> = (0..e_local).map(|_| mkf(hidden, inter, 0.05)).collect();
+    let sg = mkf(inter_s, hidden, 0.05);
+    let su = mkf(inter_s, hidden, 0.05);
+    let sd = mkf(hidden, inter_s, 0.05);
+    let eg_t: Vec<Tensor> = eg.iter().map(|v| Tensor::from_f32(Shape::new([inter, hidden]), v.clone())).collect();
+    let eu_t: Vec<Tensor> = eu.iter().map(|v| Tensor::from_f32(Shape::new([inter, hidden]), v.clone())).collect();
+    let ed_t: Vec<Tensor> = ed.iter().map(|v| Tensor::from_f32(Shape::new([hidden, inter]), v.clone())).collect();
+    let mut eg_b = vec![]; let mut eu_b = vec![]; let mut ed_b = vec![];
+    for i in 0..e_local {
+        let (gb, gs) = mkbytes(&eg[i], inter, hidden);
+        dev.register_fp8(&eg_t[i], inter, hidden, &gb, &gs).unwrap();
+        eg_b.push((gb, gs));
+        let (ub, us) = mkbytes(&eu[i], inter, hidden);
+        dev.register_fp8(&eu_t[i], inter, hidden, &ub, &us).unwrap();
+        eu_b.push((ub, us));
+        let (db, ds) = mkbytes(&ed[i], hidden, inter);
+        dev.register_fp8(&ed_t[i], hidden, inter, &db, &ds).unwrap();
+        ed_b.push((db, ds));
+    }
+    let sg_t = Tensor::from_f32(Shape::new([inter_s, hidden]), sg.clone());
+    let su_t = Tensor::from_f32(Shape::new([inter_s, hidden]), su.clone());
+    let sd_t = Tensor::from_f32(Shape::new([hidden, inter_s]), sd.clone());
+    let (sgb, sgs) = mkbytes(&sg, inter_s, hidden);
+    dev.register_fp8(&sg_t, inter_s, hidden, &sgb, &sgs).unwrap();
+    let (sub, sus) = mkbytes(&su, inter_s, hidden);
+    dev.register_fp8(&su_t, inter_s, hidden, &sub, &sus).unwrap();
+    let (sdb, sds) = mkbytes(&sd, hidden, inter_s);
+    dev.register_fp8(&sd_t, hidden, inter_s, &sdb, &sds).unwrap();
+
+    let experts: Vec<ExpertWeights> = (0..e_local).map(|i| ExpertWeights { gate: &eg_t[i], up: &eu_t[i], down: &ed_t[i] }).collect();
+    let shared = ExpertWeights { gate: &sg_t, up: &su_t, down: &sd_t };
+    let x_t = Tensor::from_f32(Shape::new([1, hidden]), x.clone());
+    let gate_t = Tensor::from_f32(Shape::new([e_total, hidden]), gate_w.clone());
+    let bias_t = Tensor::from_f32(Shape::new([e_total]), bias.clone());
+
+    let dx = DevBuf::alloc(dev.dev(), dev.stream(), hidden).unwrap();
+    dx.upload(x_t.as_slice()).unwrap();
+    let mut probs_scratch = DevBuf::alloc(dev.dev(), dev.stream(), topk).unwrap();
+    let out = dev.moe_layer_dev(&dx, &gate_t, &bias_t, &shared, &experts, expert_start,
+                                &mut probs_scratch, 1, hidden, topk, e_total,
+                                routed_scaling, limit).unwrap();
+    let mut hv = vec![0f32; hidden];
+    out.download(&mut hv).unwrap();
+    let mut gp = vec![0f32; topk];
+    probs_scratch.download(&mut gp).unwrap();
+
+    // CPU golden (fp8 semantics: e4m3(bytes) * block-scale dot)
+    let f8dot = |wbytes: &[u8], wscale: &[f32], wcols: usize, xr: &[f32], row: usize| -> f32 {
+        let scols = wcols.div_ceil(128);
+        let mut acc = 0f64;
+        for k in 0..xr.len() {
+            acc += (e4m3_decode(wbytes[row * wcols + k]) as f64) * (wscale[(row / 128) * scols + k / 128] as f64) * (xr[k] as f64);
+        }
+        acc as f32
+    };
+    let xs = x_t.as_slice();
+    let silu = |g: f32| g / (1.0 + (-g).exp());
+    let logits: Vec<f32> = (0..e_total).map(|j| xs.iter().zip(gate_w[j * hidden..].iter()).map(|(a, b)| a * b).sum()).collect();
+    let scores: Vec<f32> = logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
+    let choice: Vec<f32> = scores.iter().zip(bias.iter()).map(|(s, b)| s + b).collect();
+    let mut order: Vec<usize> = (0..e_total).collect();
+    order.sort_by(|&a, &b| choice[b].partial_cmp(&choice[a]).unwrap());
+    let ids: Vec<usize> = order[..topk].to_vec();
+    let raw: Vec<f32> = ids.iter().map(|&j| scores[j]).collect();
+    let rsum: f32 = raw.iter().sum();
+    let probs: Vec<f32> = raw.iter().map(|v| v / rsum * routed_scaling).collect();
+    let mut ref_out = vec![0f32; hidden];
+    for (jj, &eid) in ids.iter().enumerate() {
+        if eid < expert_start || eid >= expert_start + e_local { continue; }
+        let e = eid - expert_start;
+        let mut act = vec![0f32; inter];
+        for i in 0..inter {
+            let g = f8dot(&eg_b[e].0, &eg_b[e].1, hidden, xs, i).min(limit);
+            let uu = f8dot(&eu_b[e].0, &eu_b[e].1, hidden, xs, i).max(-limit).min(limit);
+            act[i] = silu(g) * uu;
+        }
+        for h in 0..hidden {
+            ref_out[h] += probs[jj] * f8dot(&ed_b[e].0, &ed_b[e].1, inter, &act, h);
+        }
+    }
+    {
+        let mut act = vec![0f32; inter_s];
+        for i in 0..inter_s {
+            let g = f8dot(&sgb, &sgs, hidden, xs, i).min(limit);
+            let uu = f8dot(&sub, &sus, hidden, xs, i).max(-limit).min(limit);
+            act[i] = silu(g) * uu;
+        }
+        for h in 0..hidden {
+            ref_out[h] += f8dot(&sdb, &sds, inter_s, &act, h);
+        }
+    }
+    let maxd = (0..hidden).map(|i| (hv[i] - ref_out[i]).abs()).fold(0f32, f32::max);
+    let rel = maxd / ref_out.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
+    eprintln!("[moe-fp8] parity max_diff={maxd:.2e} rel={rel:.3e} (ids={:?} probs={:?})", gp, ids);
+    assert!(rel < 1e-4, "moe fp8 parity rel {rel:.2e} too large");
+
+    // A/B speed: fp8 (registered, this dev) vs bf16 (unregistered dev2)
+    let dev2 = CudaBackend::with_device(&so_path(), 1).expect("open cuda dev 1");
+    dev2.enter();
+    let dx2 = DevBuf::alloc(dev2.dev(), dev2.stream(), hidden).unwrap();
+    dx2.upload(x_t.as_slice()).unwrap();
+    let mut ps2 = DevBuf::alloc(dev2.dev(), dev2.stream(), topk).unwrap();
+    for _ in 0..20 { let _ = dev2.moe_layer_dev(&dx2, &gate_t, &bias_t, &shared, &experts, expert_start, &mut ps2, 1, hidden, topk, e_total, routed_scaling, limit).unwrap(); }
+    dev2.sync().unwrap();
+    let it = 500;
+    let t0 = Instant::now();
+    for _ in 0..it { let _ = dev2.moe_layer_dev(&dx2, &gate_t, &bias_t, &shared, &experts, expert_start, &mut ps2, 1, hidden, topk, e_total, routed_scaling, limit).unwrap(); }
+    dev2.sync().unwrap();
+    let bf16_us = t0.elapsed().as_secs_f64() * 1e6 / it as f64;
+    for _ in 0..20 { let _ = dev.moe_layer_dev(&dx, &gate_t, &bias_t, &shared, &experts, expert_start, &mut probs_scratch, 1, hidden, topk, e_total, routed_scaling, limit).unwrap(); }
+    dev.sync().unwrap();
+    let t1 = Instant::now();
+    for _ in 0..it { let _ = dev.moe_layer_dev(&dx, &gate_t, &bias_t, &shared, &experts, expert_start, &mut probs_scratch, 1, hidden, topk, e_total, routed_scaling, limit).unwrap(); }
+    dev.sync().unwrap();
+    let fp8_us = t1.elapsed().as_secs_f64() * 1e6 / it as f64;
+    eprintln!("[moe-fp8] speed: bf16={bf16_us:.1}us fp8={fp8_us:.1}us ({:.2}x) [e_local={e_local} topk={topk} hidden={hidden} inter={inter}]",
+        bf16_us / fp8_us.max(1e-9));
+}
+
+/// e4m3 encode (f32 → F8_E4M3 bytes, bias-7, 3-bit mantissa, ±448 clamp)
+/// — inverse of e4m3_decode (verified 0-error against __nv_cvt_fp8_to_halfraw).
+fn fp8_encode(x: f32) -> u8 {
+    let sign = if x < 0.0 { 0x80u8 } else { 0 };
+    let a = x.abs();
+    if a == 0.0 { return sign; }
+    let e_b = (a.log2().floor() as i32 + 7).min(15);
+    let mut m = (a / 2f32.powi(e_b - 7) * 8.0).round() as i32;
+    if m > 8 { m = 8; } // rounding can hit 8 → carries to next exp
+    if m == 8 {
+        let e2 = (e_b + 1).min(15);
+        return sign | ((e2 as u8) << 3);
+    }
+    sign | (((e_b as u8) & 0xF) << 3) | ((m as u8) & 7)
+}
+
