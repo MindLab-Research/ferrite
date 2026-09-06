@@ -3636,6 +3636,15 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     // 1. enorm(embed) ‖ hnorm(h_prev) → this rank's eh_proj input segment
     let enorm = cuda.rmsnorm_dev(embed_row, s.w(&format!("{pfx}.enorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let hnorm = cuda.rmsnorm_dev(h_prev, s.w(&format!("{pfx}.hnorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+        let mut e4 = [0f32; 2];
+        let mut n4 = [0f32; 2];
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            enorm.as_f32() as *mut std::ffi::c_void, e4.as_mut_ptr(), 2, cuda.stream_handle());
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            hnorm.as_f32() as *mut std::ffi::c_void, n4.as_mut_ptr(), 2, cuda.stream_handle());
+        eprintln!("[zh2d-en] enorm={:?} hnorm={:?}", e4, n4);
+    }
     let x_seg = cuda.mtp_eh_seg_dev(&enorm, &hnorm, rank, world, h)?;
     let eh_partial = cuda.matmul_dev(&x_seg, s.w(&format!("{pfx}.eh_proj.weight"))?, 1, (2 * h / world) as i32, h as i32)?;
     nccl.all_reduce_f32(eh_partial.as_const_f32(), eh_partial.as_f32(), h)?;
@@ -3699,6 +3708,12 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     let x2 = cuda.add_dev(&x1, &moe_partial, h)?;
     if let Some(ho) = h_out {
         cuda.copy_dev(&x2, 0, ho.as_f32(), h)?;
+    }
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+        let mut x4 = [0f32; 2];
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            x2.as_f32() as *mut std::ffi::c_void, x4.as_mut_ptr(), 2, cuda.stream_handle());
+        eprintln!("[zh2d-x2] x2={:?}", x4);
     }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
