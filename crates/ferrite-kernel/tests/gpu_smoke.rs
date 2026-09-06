@@ -1528,7 +1528,19 @@ fn moe_fused_fp8_parity_and_speed() {
     }
     let maxd = (0..hidden).map(|i| (hv[i] - ref_out[i]).abs()).fold(0f32, f32::max);
     let rel = maxd / ref_out.iter().fold(0f32, |a, v| a.max(v.abs())).max(1e-6);
-    eprintln!("[moe-fp8] parity max_diff={maxd:.2e} rel={rel:.3e} (ids={:?} probs={:?})", gp, ids);
+    // diagnosis: max_diff magnitude + the first few (gpu, golden) pairs to
+    // distinguish a uniform fp-order/quantization diff from a localized
+    // index/layout bug (uniform → ~1e-3 rel; localized → huge on one element).
+    let mut worst = (0f32, 0usize);;
+    for i in 0..hidden {
+        let d = (hv[i] - ref_out[i]).abs();
+        if d > worst.0 { worst = (d, i); }
+    }
+    eprintln!(
+        "[moe-fp8] max_diff={maxd:.3e} rel={rel:.3e} ref_max={:.3e} worst(i={}) gpu={:.5} gold={:.5} | first2: gpu={:.4} vs {:.4}, {:.4} vs {:.4} | ids={:?} gp={:?}",
+        ref_out.iter().fold(0f32, |a, v| a.max(v.abs())),
+        worst.1, hv[worst.1], ref_out[worst.1], hv[0], ref_out[0], hv[1], ref_out[1], ids, gp
+    );
     assert!(rel < 1e-4, "moe fp8 parity rel {rel:.2e} too large");
 
     // A/B speed: fp8 (registered, this dev) vs bf16 (unregistered dev2)
