@@ -984,10 +984,18 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
         const float* k = ki + (size_t)j * d;
         float s = 0.f;
         if (j < jmax) {
+            // float4 dot (d multiple of 4, 16B-aligned DevBuf): 4x load width
+            // over the scalar loop; per-head accumulation stays ascending-l.
             for (int hi = 0; hi < h; hi++) {
                 const float* q = qi + (size_t)row * (h * d) + hi * d;
                 float dot = 0.f;
-                for (int l = 0; l < d; l++) dot += q[l] * k[l];
+                float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                for (int l = 0; l + 3 < d; l += 4) {
+                    float4 qv = *reinterpret_cast<const float4*>(q + l);
+                    float4 kv = *reinterpret_cast<const float4*>(k + l);
+                    d0 += qv.x * kv.x; d1 += qv.y * kv.y; d2 += qv.z * kv.z; d3 += qv.w * kv.w;
+                }
+                dot = (d0 + d1) + (d2 + d3);
                 s += w[(size_t)row * h + hi] * fmaxf(dot, 0.f); // relu
             }
             sm[j] = s * inv_sqrt_d;
