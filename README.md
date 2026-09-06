@@ -11,6 +11,10 @@ Rust-native inference engine for **GLM-5.3-Flash** (hybrid GatedDeltaNet linear 
 | PD/CP/EAGLE as patches on monolithic serving | PDAF phases (prefill/decode/attention/FFN) are first-class: `StaticPlan` op graph + `PdafRouter` phase routing + transfer events |
 | CUDA graph as an afterthought | `GraphCapable` contract in the backend trait from day one; decode op-sequence stability is *tested* (graph bucketing preconditions) |
 
+## Current state (perf-b1)
+
+Decode (TP=4, B300 GPUs 4–7, GLM-5.3-Flash): non-MTP 49 tok/s → MTP speculative (draft=2/verify n=3) **64.8 tok/s** @200-step window (accept ≈2.4 tokens/step). One CUDA graph per step; A→B ping-pong recorded in-graph; single-kernel accept commit. See `AGENTS.md` for the full flag table, demo configs, profiling workflow (ncu; nsys 2024.2.3 does not work on CUDA 13.2/B300), and GPU test discipline.
+
 ## Layout
 
 ```
@@ -27,7 +31,7 @@ crates/
   ferrite-scheduler PDAF: static op plan + phase router + transfer events
   ferrite-exec      Engine<B> — full forward (34 lin + 11 DSA + 3 dense +
                     42 MoE layers), MHC-residual approx, greedy decode
-kernels/cuda/       ferrite_kernels.cu (sm_100a) + build.sh
+kernels/cuda/       ferrite_kernels.cu (sm_103a, B300) + build.sh
 ```
 
 ## Numerical contract
@@ -46,7 +50,7 @@ CPU tests: `cargo test` (74 workspace tests, all green).
 
 ```bash
 # 1. kernels (nvcc only — compile does not touch the GPU):
-cd kernels/cuda && ./build.sh 100a          # → libferrite_kernels.so (sm_100a)
+cd kernels/cuda && ./build.sh 103a          # → libferrite_kernels.so (sm_103a, B300)
 # verified on 1102 (CUDA 13.0, B300): builds clean, 1.1 MB
 
 # 2. rust workspace (CPU path — runs anywhere):
@@ -59,7 +63,7 @@ cargo check -p ferrite-kernel --features cuda   # FFI layer compiles
 
 ## Runbook (B300 bring-up, when the card arrives)
 
-1. `./build.sh 100a` on the B300 node (nvcc 13.0 verified on 1102).
+1. `./build.sh 103a` on the B300 node (nvcc 13.2).
 2. `CudaBackend::with_library("libferrite_kernels.so")`.
 3. Golden-diff: run the same random-weight model through `CpuBackend` and
    `CudaBackend`, assert f32 tolerance 1e-5 op-by-op (the CPU tests are the
@@ -75,7 +79,7 @@ cargo check -p ferrite-kernel --features cuda   # FFI layer compiles
 - [x] CPU engine end-to-end (random weights, 4-layer test config): chunked
       prefill, decode, MoE routing, DSA top-k, linear attention, CUDA-graph
       op-sequence stability — 16 test targets green
-- [x] CUDA kernels compiled for sm_100a (B300-verified, nvcc 13.0)
+- [x] CUDA kernels compiled for sm_103a (B300-verified, nvcc 13.2)
 - [x] CudaBackend FFI skeleton (host↔device v1; golden-diff harness next)
 - [x] MHC exact hyper-connections (mhc.rs — sglang-aligned hc_pre/hc_post
       with sinkhorn, 4-flow residual, hc_expand/contract lifecycle; 10/10)
