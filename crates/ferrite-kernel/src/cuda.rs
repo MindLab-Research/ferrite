@@ -733,16 +733,16 @@ impl CudaBackend {
         self.fp8_lookup(t).is_some()
     }
 
-    /// W8A8 v3 mega-quant scratch for this width (lazy, one cudaMalloc +
-    /// zero per in_f; the kernel tail resets the barrier counters so the
-    /// buffer is reusable). Layout: [amax_bits, cnt, cnt2, xs] u32 header +
-    /// xq[in_f] e4m3 bytes.
+    /// W8A8 v3.1 scratch for this width (lazy, one cudaMalloc + zero per
+    /// in_f; layout [amax(int bits), cnt, cnt2, cnt3, pad, xs(f32), xq[in_f]]
+    /// — 32B header + xq bytes; the kernel tail resets the barrier counters
+    /// via the cnt3 full-grid vote (stream order serializes callers).
     fn w8a8_scratch_ptr(&self, in_f: usize) -> Result<*mut u32> {
         let key = in_f;
         if let Some(&(p, _)) = self.w8a8_scratch.lock().unwrap().get(&key) {
             return Ok(p as *mut u32);
         }
-        let bytes = 16 + in_f;
+        let bytes = 32 + in_f;
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut p, bytes) }, "w8a8 scratch malloc")?;
         ck(unsafe { cudaMemset(p, 0, bytes) }, "w8a8 scratch zero")?;

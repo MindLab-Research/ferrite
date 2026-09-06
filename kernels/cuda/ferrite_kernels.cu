@@ -3705,63 +3705,65 @@ extern "C" cudaError_t ferrite_fp8_mma_probe(const unsigned char* A, const unsig
 // fallbacks (fp8-registered weights with misaligned shapes serve bf16).
 // Requires: in_f % 128 == 0 and out_f % 16 == 0 (GLM weights all comply).
 // ============================================================
-// v3 (mega-kernel quant): the whole gemv in ONE launch — the quant runs
-// COOPERATIVELY at the kernel head (every block slices k, atomicMax the
-// partial absmax, votes, encodes its slice into the GLOBAL xq scratch),
-// then every block's mma reads the shared xq. v1 re-quantized per block
-// (32x redundant work), v2's separate quant kernel paid a full launch
-// (~1.5us — 0.49x vs bf16 on small matrices); this pays neither.
-// Scratch layout (persistent, Rust-side): [0..4)=amax(int bits) [4..8)=cnt
-// [8..12)=cnt2 [12..16)=xs(f32) [16..16+in_f)=xq(e4m3). The kernel TAIL
-// (block 0) resets amax/cnt/cnt2 for the next call — stream order makes
-// that safe. All blocks are co-resident (grid <= 96 << 148 SMs), so the
-// spin barriers cannot deadlock.
+// v3.1 (user-directed grid fix): cooperative quant on the first co_res
+// blocks ONLY (spin barrier among co-resident participants — deadlock-free),
+// the mma stage runs FULLY PARALLEL (grid = out_f/16, no row loop — the
+// earlier row-loop cap left 86% of the GPU idle on lm_head, 0.54x). Blocks
+// >= co_res start after earlier ones retire (SM occupancy order), spin-pass
+// the ready flag once, and join the mma directly. Tail: block 0 waits on a
+// full-grid completion vote (cnt3 — non-resident blocks only ADD, never
+// spin, so no deadlock) then resets the barrier state for the next call
+// (stream order serializes callers).
 __global__ void gemv_fp8_mma_v3_kernel(
     const float* __restrict__ x,          // [in_f] f32 activations
     const unsigned char* __restrict__ w,   // [out_f, in_f] e4m3 row-major
     const float* __restrict__ w_scale,    // [srows][scols]
     float* __restrict__ y,                 // [out_f]
-    unsigned int* __restrict__ scratch,    // amax/cnt/cnt2/xs/xq (see above)
-    int in_f, int out_f, int scols)
+    unsigned int* __restrict__ scratch,    // [amax(int bits), cnt, cnt2, cnt3, xs, xq]
+    int in_f, int out_f, int scols, int co_res)
 {
-    const int nb = gridDim.x;
+    const int nb = gridDim.x;              // = out_f/16 (FULL parallel)
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int* g_amax = (int*)scratch;            // float-as-int atomicMax (abs >= 0)
     unsigned int* g_cnt = scratch + 1;
     unsigned int* g_cnt2 = scratch + 2;
-    float* g_xs = (float*)(scratch + 3);
-    unsigned char* xq = (unsigned char*)(scratch + 4);
+    unsigned int* g_cnt3 = scratch + 3;
+    float* g_xs = (float*)(scratch + 4);
+    unsigned char* xq = (unsigned char*)(scratch + 6);
 
-    // ---- phase A: per-block sliced absmax -> atomicMax; vote; xs ----
-    float pmax = 1e-9f;
-    for (int k = (blockIdx.x * 256) + threadIdx.x; k < in_f; k += nb * 256)
-        pmax = fmaxf(pmax, fabsf(x[k]));
-    // warp reduce
-    for (int off = 16; off > 0; off >>= 1)
-        pmax = fmaxf(pmax, __shfl_down_sync(0xffffffff, pmax, off));
-    if (lane == 0) atomicMax(g_amax, __float_as_int(pmax));
-    if (threadIdx.x == 0) atomicAdd(g_cnt, 1u);
-    if (threadIdx.x == 0) { while (atomicAdd(g_cnt, 0u) < nb) __nanosleep(64); }
-    __syncthreads();
-    const float xs_ = __int_as_float(atomicAdd(g_amax, 0)) / 448.0f;
-    if (threadIdx.x == 0 && blockIdx.x == 0) *g_xs = xs_;
-    // ---- phase B: sliced encode into global xq; vote ----
-    const float inv = 1.0f / xs_;
-    for (int k = (blockIdx.x * 256) + threadIdx.x; k < in_f; k += nb * 256) {
-        const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
-        xq[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    // ---- phase A+B: first co_res blocks cooperatively quantize ----
+    if (blockIdx.x < (unsigned)co_res) {
+        float pmax = 1e-9f;
+        for (int k = (blockIdx.x * 256) + threadIdx.x; k < in_f; k += co_res * 256)
+            pmax = fmaxf(pmax, fabsf(x[k]));
+        for (int off = 16; off > 0; off >>= 1)
+            pmax = fmaxf(pmax, __shfl_down_sync(0xffffffff, pmax, off));
+        if (lane == 0) atomicMax(g_amax, __float_as_int(pmax));
+        if (threadIdx.x == 0) atomicAdd(g_cnt, 1u);
+        if (threadIdx.x == 0) { while (atomicAdd(g_cnt, 0u) < (unsigned)co_res) __nanosleep(32); }
+        __syncthreads();
+        const float xs_ = __int_as_float(atomicAdd(g_amax, 0)) / 448.0f;
+        if (threadIdx.x == 0 && blockIdx.x == 0) *g_xs = xs_;
+        const float inv = 1.0f / xs_;
+        for (int k = (blockIdx.x * 256) + threadIdx.x; k < in_f; k += co_res * 256) {
+            const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
+            xq[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+        }
+        __threadfence();
+        if (threadIdx.x == 0) atomicAdd(g_cnt2, 1u);
+        if (threadIdx.x == 0) { while (atomicAdd(g_cnt2, 0u) < (unsigned)co_res) __nanosleep(32); }
+        __threadfence();
+        __syncthreads();
+    } else {
+        // later waves: launched after earlier blocks retire; the quant is
+        // long done — one volatile check passes immediately.
+        if (threadIdx.x == 0) { while (atomicAdd(g_cnt2, 0u) < (unsigned)co_res) __nanosleep(32); }
+        __syncthreads();
     }
-    __threadfence();                        // xq visible before the vote
-    if (threadIdx.x == 0) atomicAdd(g_cnt2, 1u);
-    if (threadIdx.x == 0) { while (atomicAdd(g_cnt2, 0u) < nb) __nanosleep(64); }
-    __threadfence();                        // acquire: xq of other blocks
-    __syncthreads();
+    const float xs_ = *g_xs;
 
-    // ---- mma body (reads the shared xq; fragments per fp8_mma_layout_probe).
-    // Row LOOP: the grid is capped at CO_RESIDENT blocks (the spin barriers
-    // require every participating block to be simultaneously resident —
-    // lm_head's 9680 blocks deadlocked the first cut); each block walks
-    // rows m0 += gridDim.x * 16.
+    // ---- mma stage: FULLY parallel, one 16-row block per block (no loop) ----
+    const int m0 = blockIdx.x * 16;
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
     __shared__ float sacc[8 * 16];
     const int nblk = (in_f + 127) >> 7;
@@ -3769,49 +3771,51 @@ __global__ void gemv_fp8_mma_v3_kernel(
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, in_f);
-    for (int m0 = blockIdx.x * 16; m0 < out_f; m0 += (int)gridDim.x * 16) {
-        const int ws_row = (m0 / 128) * scols;
-        float acc0 = 0.f, acc1 = 0.f;
-        for (int kb = k0; kb < k1; kb += 128) {
-            float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-            for (int kk = kb; kk < kb + 128; kk += 32) {
-                if (kk + 32 > k1) break;
-                unsigned a[4];
-                a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
-                a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
-                a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
-                a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
-                unsigned b[2];
-                b[0] = *(const unsigned*)(xq + kk + c0);
-                b[1] = *(const unsigned*)(xq + kk + c0 + 16);
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                      "r"(b[0]), "r"(b[1]));
-            }
-            const float wsc = w_scale[ws_row + (kb >> 7)];
-            if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; }
+    const int ws_row = (m0 / 128) * scols;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int kb = k0; kb < k1; kb += 128) {
+        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+        for (int kk = kb; kk < kb + 128; kk += 32) {
+            if (kk + 32 > k1) break;
+            unsigned a[4];
+            a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
+            a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
+            a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
+            a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
+            unsigned b[2];
+            b[0] = *(const unsigned*)(xq + kk + c0);
+            b[1] = *(const unsigned*)(xq + kk + c0 + 16);
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                  "r"(b[0]), "r"(b[1]));
         }
-        if ((lane & 3) == 0) {
-            sacc[warp * 16 + r0] = acc0;
-            sacc[warp * 16 + r0 + 8] = acc1;
-        }
-        __syncthreads();
-        if (warp == 0 && lane < 16) {
-            float t = 0.f;
-            for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
-            y[m0 + lane] = t * xs_;
-        }
-        __syncthreads(); // sacc reuse next row iteration
+        const float wsc = w_scale[ws_row + (kb >> 7)];
+        if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; }
     }
-    // ---- tail: block 0 resets the barrier state (stream order makes the
-    // next launch see zeros; amax reset via int 0) ----
+    if ((lane & 3) == 0) {
+        sacc[warp * 16 + r0] = acc0;
+        sacc[warp * 16 + r0 + 8] = acc1;
+    }
+    __syncthreads();
+    if (warp == 0 && lane < 16) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
+        y[m0 + lane] = t * xs_;
+    }
+    // ---- tail: block 0 resets the barrier state AFTER all blocks voted done
+    // (non-resident blocks only ADD, never spin — no deadlock; stream order
+    // serializes the next launch against this reset). ----
+    __threadfence();
+    if (threadIdx.x == 0) atomicAdd(g_cnt3, 1u);
     if (blockIdx.x == 0 && threadIdx.x == 0) {
+        while (atomicAdd(g_cnt3, 0u) < (unsigned)nb) __nanosleep(32);
         *g_amax = 0;
         *g_cnt = 0;
         *g_cnt2 = 0;
+        *g_cnt3 = 0;
     }
 }
 
@@ -3822,23 +3826,21 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
 {
     (void)srows;
     if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
-    // CO-RESIDENT cap via the occupancy API: the spin barriers require every
-    // participating block simultaneously resident. v3's hardcoded 128 (1/SM)
-    // left the GPU 86% idle on lm_head (0.42x vs bf16); this kernel is tiny
-    // (256 thr, 512B smem) so 4-8 blocks/SM co-reside — row-loop iterations
-    // drop accordingly (9680/1184 = 8 instead of 9680/128 = 76).
-    static int max_active = 0; // cached: occupancy × SM count (host-side, per-process)
-    if (max_active == 0) {
+    // co_res: max co-resident blocks (occupancy x SMs) — the quant barrier's
+    // participants. mma runs FULLY PARALLEL (grid = out_f/16, no row loop);
+    // blocks beyond co_res spin-pass the ready flag once (they launch in
+    // later waves after the quant wave retires).
+    static int co_res = 0;
+    if (co_res == 0) {
         int per_sm = 0;
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gemv_fp8_mma_v3_kernel, 256, 0);
         int nsm = 0;
         cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
-        max_active = per_sm * nsm;
-        if (max_active <= 0) max_active = 128; // conservative fallback
+        co_res = per_sm * nsm;
+        if (co_res <= 0) co_res = 128;
     }
-    const unsigned want = (unsigned)(out_f / 16);
-    const unsigned grid = want < (unsigned)max_active ? want : (unsigned)max_active;
+    dim3 grid((unsigned)(out_f / 16));
     gemv_fp8_mma_v3_kernel<<<grid, 256, 0, s>>>(
-        x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols);
+        x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols, co_res);
     return cudaGetLastError();
 }
