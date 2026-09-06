@@ -3757,8 +3757,11 @@ __global__ void gemv_fp8_mma_v3_kernel(
     __threadfence();                        // acquire: xq of other blocks
     __syncthreads();
 
-    // ---- mma body (reads the shared xq; fragments per fp8_mma_layout_probe) ----
-    const int m0 = blockIdx.x * 16;
+    // ---- mma body (reads the shared xq; fragments per fp8_mma_layout_probe).
+    // Row LOOP: the grid is capped at CO_RESIDENT blocks (the spin barriers
+    // require every participating block to be simultaneously resident —
+    // lm_head's 9680 blocks deadlocked the first cut); each block walks
+    // rows m0 += gridDim.x * 16.
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
     __shared__ float sacc[8 * 16];
     const int nblk = (in_f + 127) >> 7;
@@ -3766,39 +3769,42 @@ __global__ void gemv_fp8_mma_v3_kernel(
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, in_f);
-    const int ws_row = (m0 / 128) * scols;
-    float acc0 = 0.f, acc1 = 0.f;
-    for (int kb = k0; kb < k1; kb += 128) {
-        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-        for (int kk = kb; kk < kb + 128; kk += 32) {
-            if (kk + 32 > k1) break;
-            unsigned a[4];
-            a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
-            a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
-            a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
-            a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
-            unsigned b[2];
-            b[0] = *(const unsigned*)(xq + kk + c0);
-            b[1] = *(const unsigned*)(xq + kk + c0 + 16);
-            asm volatile(
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                  "r"(b[0]), "r"(b[1]));
+    for (int m0 = blockIdx.x * 16; m0 < out_f; m0 += (int)gridDim.x * 16) {
+        const int ws_row = (m0 / 128) * scols;
+        float acc0 = 0.f, acc1 = 0.f;
+        for (int kb = k0; kb < k1; kb += 128) {
+            float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+            for (int kk = kb; kk < kb + 128; kk += 32) {
+                if (kk + 32 > k1) break;
+                unsigned a[4];
+                a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
+                a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
+                a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
+                a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
+                unsigned b[2];
+                b[0] = *(const unsigned*)(xq + kk + c0);
+                b[1] = *(const unsigned*)(xq + kk + c0 + 16);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                      "r"(b[0]), "r"(b[1]));
+            }
+            const float wsc = w_scale[ws_row + (kb >> 7)];
+            if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; }
         }
-        const float wsc = w_scale[ws_row + (kb >> 7)];
-        if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; }
-    }
-    if ((lane & 3) == 0) {
-        sacc[warp * 16 + r0] = acc0;
-        sacc[warp * 16 + r0 + 8] = acc1;
-    }
-    __syncthreads();
-    if (warp == 0 && lane < 16) {
-        float t = 0.f;
-        for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
-        y[m0 + lane] = t * xs_;
+        if ((lane & 3) == 0) {
+            sacc[warp * 16 + r0] = acc0;
+            sacc[warp * 16 + r0 + 8] = acc1;
+        }
+        __syncthreads();
+        if (warp == 0 && lane < 16) {
+            float t = 0.f;
+            for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
+            y[m0 + lane] = t * xs_;
+        }
+        __syncthreads(); // sacc reuse next row iteration
     }
     // ---- tail: block 0 resets the barrier state (stream order makes the
     // next launch see zeros; amax reset via int 0) ----
@@ -3816,7 +3822,9 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
 {
     (void)srows;
     if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
-    dim3 grid(out_f / 16);
+    // CO-RESIDENT cap: the spin barriers require every block resident
+    // (9680-block lm_head deadlocked the first cut); blocks row-loop above.
+    const unsigned grid = (unsigned)(out_f / 16) < 128u ? (unsigned)(out_f / 16) : 128u;
     gemv_fp8_mma_v3_kernel<<<grid, 256, 0, s>>>(
         x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols);
     return cudaGetLastError();
