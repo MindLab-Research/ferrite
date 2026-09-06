@@ -559,11 +559,19 @@ impl<B: KernelBackend> TpCluster<B> {
                     eprintln!("[tp] fp8 register {} failed: {e} (stays bf16)", name);
                 } else {
                     registered += 1;
-                    if dbg && !cuda.fp8_hit(golden) {
-                        eprintln!(
-                            "[fp8dbg] REGISTER-VERIFY MISS {name} ptr={:x} numel={} map={}",
-                            golden.as_slice().as_ptr() as usize, golden.numel(), cuda.fp8_registered()
-                        );
+                    if dbg {
+                        if !cuda.fp8_hit(golden) {
+                            eprintln!(
+                                "[fp8dbg] REGISTER-VERIFY MISS {name} ptr={:x} numel={} map={}",
+                                golden.as_slice().as_ptr() as usize, golden.numel(), cuda.fp8_registered()
+                            );
+                        }
+                        if registered <= 3 || registered % 2000 == 0 {
+                            eprintln!(
+                                "[fp8dbg] reg#{registered} {name} ptr={:x} numel={}",
+                                golden.as_slice().as_ptr() as usize, golden.numel()
+                            );
+                        }
                     }
                 }
             }
