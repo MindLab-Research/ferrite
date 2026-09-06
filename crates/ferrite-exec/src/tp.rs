@@ -1376,7 +1376,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         let exp = crate::mhc::hc_expand(&h2v, hc_mult);
                         let exp_s = exp.as_slice();
                         let match_ct = vin_chk.iter().zip(exp_s.iter()).take(4)
-                            .filter(|(a, b)| (a - b).abs() < 1e-3).count();
+                            .filter(|(a, b)| (**a - **b).abs() < 1e-3).count();
                         eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} k={} vin_raw={:?} exp_host={:?} match={}/4 r={}",
                             d1_val[0], d2_val[0], a[0],
                             if d1_val[0] as u32 == a[0] as u32 { "==" } else { "!=" },
