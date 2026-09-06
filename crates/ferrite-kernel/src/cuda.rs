@@ -2981,6 +2981,22 @@ impl CudaBackend {
     }
 }
 
+/// H2D copy for small i32 arrays (the zero-H2D path's token slots — 4B
+/// writes to the device-resident tokens_dev buffer; NOT a general-purpose
+/// H2D, just the initial token + d1/d2 writes that the accept kernel
+/// would otherwise write on device).
+pub fn memcpy_htod_i32(dst: *mut i32, src: *const i32, n: usize, s: CuStream) -> i32 {
+    unsafe {
+        cudaMemcpyAsync(
+            dst as *mut std::ffi::c_void,
+            src as *const std::ffi::c_void,
+            n * 4,
+            CUDA_MEMCPY_H2D,
+            s,
+        )
+    }
+}
+
 /// Blocking device→host copy (raw pointers — used by the graph capture
 /// path where the DevBuf was forgotten but its address is registered).
 pub fn memcpy_d2h_sync(src: *mut std::ffi::c_void, dst: *mut f32, floats: usize, s: CuStream) -> i32 {

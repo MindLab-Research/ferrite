@@ -1180,8 +1180,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 // mtp_forward_raw_argmax (which takes &mut s — re-acquires
                 // cuda internally). This is the SAME raw-pointer pattern as
                 // the existing mtp_step (hptr as usize — proven to work).
-                let (cuda, tokens_ptr, emb1_ptr, emb2_ptr, d1_ptr, d2_ptr,
-                     hprev_ptr, k_ptr, nt_ptr, na_ptr, verify_in_ptr) = {
+                let (tokens_ptr, emb1_ptr, emb2_ptr, d2_ptr, hprev_ptr, d1_ptr) = {
                     let cuda = s
                         .backend
                         .as_cuda()
@@ -1192,24 +1191,28 @@ impl<B: KernelBackend> TpCluster<B> {
                         .as_ref()
                         .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
                     (
-                        cuda as *const ferrite_kernel::cuda::CudaBackend,
-                        m.tokens_dev.as_f32() as *mut i32,
-                        m.emb1_dev.as_f32(),
-                        m.emb2_dev.as_f32(),
-                        m.d1_argmax_dev.as_f32(),
-                        m.d2_argmax_dev.as_f32(),
-                        m.hprev.as_f32(),
-                        m.k_dev.as_f32() as *mut i32,
-                        m.next_token_dev.as_f32() as *mut i32,
-                        m.n_accepted_dev.as_f32() as *mut i32,
-                        m.emb1_dev.as_f32(), // reuse emb1 slot for verify input placeholder
+                        m.tokens_dev.as_f32() as *mut i32, // [last, d1, d2] device int slots
+                        m.emb1_dev.as_f32(),                  // draft 1 embed [hidden]
+                        m.emb2_dev.as_f32(),                  // draft 2 embed [hidden]
+                        m.d2_argmax_dev.as_f32(),             // draft 2 argmax [1]
+                        m.hprev.as_f32(),                      // draft h_prev [hidden]
+                        m.d1_argmax_dev.as_f32(),              // draft 1 argmax [1]
                     )
-                }; // ALL borrows dropped here (cuda, mutex, MtpState)
+                }; // ALL borrows dropped (cuda, mutex, MtpState)
 
-                let _ = (emb2_ptr, verify_in_ptr); // used below
-
-                // Write tokens_dev[0] = last (the ONLY H2D: 4B initial token)
-                unsafe { *tokens_ptr.add(0) = last as i32; }
+                // Write tokens_dev[0] = last — 4B H2D (the ONLY host-initiated
+                // data write in the zero-H2D path; d1/d2 are written via D2D
+                // from argmax outputs, next_token by the accept kernel)
+                {
+                    let cuda = s
+                        .backend
+                        .as_cuda()
+                        .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                    let last_i32 = last as i32;
+                    let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                        tokens_ptr, &last_i32, 1, cuda.stream_handle());
+                    if r != 0 { return Err(FerriteError::InvalidArg(format!("tokens_dev[0] H2D: {r}"))); }
+                }
 
                 // === Phase 1: DRAFT (all device, zero H2D) ===
                 // Draft 1: embed_one(last) → emb1_dev → mtp_forward → d1_argmax_dev
@@ -1255,7 +1258,13 @@ impl<B: KernelBackend> TpCluster<B> {
                         1, cuda.stream_handle(),
                     );
                     if r != 0 { return Err(FerriteError::InvalidArg(format!("d1 D2H: {r}"))); }
-                    unsafe { *(tokens_ptr.add(1)) = d1_f32[0] as i32; }
+                    // tokens_dev[1] = d1 (4B H2D — d1 from D2H read)
+                    {
+                        let d1_i32 = d1_f32[0] as i32;
+                        let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                            unsafe { tokens_ptr.add(1) }, &d1_i32, 1, cuda.stream_handle());
+                        if r != 0 { return Err(FerriteError::InvalidArg(format!("tokens_dev[1] H2D: {r}"))); }
+                    }
                     cuda.embed_one_dev(&embed_table, unsafe { tokens_ptr.add(1) }, emb2_ptr, hidden, 1)?;
                 } // cuda dropped
 
@@ -1288,7 +1297,13 @@ impl<B: KernelBackend> TpCluster<B> {
                             1, cuda.stream_handle(),
                         );
                         if r != 0 { return Err(FerriteError::InvalidArg(format!("d2 D2H: {r}"))); }
-                        unsafe { *(tokens_ptr.add(2)) = d2_f32[0] as i32; }
+                        // tokens_dev[2] = d2 (4B H2D — d2 from D2H read)
+                        {
+                            let d2_i32 = d2_f32[0] as i32;
+                            let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                                unsafe { tokens_ptr.add(2) }, &d2_i32, 1, cuda.stream_handle());
+                            if r != 0 { return Err(FerriteError::InvalidArg(format!("tokens_dev[2] H2D: {r}"))); }
+                        }
                     }
 
                     // embed_expand_dev: [last, d1, d2] → graph input [3, hc_mult, hidden]
