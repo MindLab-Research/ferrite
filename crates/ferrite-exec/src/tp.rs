@@ -3697,10 +3697,17 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         cuda.copy_dev(&x2, 0, ho.as_f32(), h)?;
     }
     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-        let mut x4 = [0f32; 2];
+        // full-4096 checksum: bit-level compare orig vs zero-H2D x2 (front-2
+        // matched but d1 diverged — either x2's tail differs (attn/moe cache
+        // diff) or the argmax output buffer is corrupted)
+        let mut xfull = vec![0f32; h];
         ferrite_kernel::cuda::memcpy_d2h_sync(
-            x2.as_f32() as *mut std::ffi::c_void, x4.as_mut_ptr(), 2, cuda.stream_handle());
-        eprintln!("[zh2d-x2] x2={:?}", x4);
+            x2.as_f32() as *mut std::ffi::c_void, xfull.as_mut_ptr(), h, cuda.stream_handle());
+        let mut hsum: f64 = 0.0;
+        let mut nzc = 0usize;
+        for v in &xfull { hsum += *v as f64; if *v != 0.0 { nzc += 1; } }
+        eprintln!("[zh2d-x2] x2[0..2]={:?} sum={:.6} nz={} last4={:?}",
+            &xfull[..2], hsum, nzc, &xfull[h-4..]);
     }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
