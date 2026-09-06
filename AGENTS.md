@@ -86,14 +86,16 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 
 **nsys 2024.2.3 (apt) DOES NOT WORK with CUDA 13.2 / driver 595 / B300**: zero CUDA rows in the report (CUPTI injection fails silently; even a 3-kernel mini program records nothing). Do not waste time on it. GPU-side timing events inside a captured CUDA graph also do NOT work (`cudaEventElapsedTime` on graph-recorded events returns InvalidValue — sync-only; the dead `FERRITE_MEGA_EVTS` code has been removed for this reason).
 
-**Use ncu (CUDA 13.2 bundled)** — verified working incl. CUDA-graph replays:
+**Use ncu (CUDA 13.2 bundled)** — verified working incl. CUDA-graph replays. TWO mandatory pieces:
+
+1. `FERRITE_NCU=1` on the serve — opens a `cudaProfilerStart/Stop` window around the decode loop, **starting at step i==1** (step 0 is the mega/verify graph CAPTURE; ncu's per-kernel replay conflicts with stream capture and hangs the run mid-prefill).
+2. `ncu --profile-from-start off` — without it ncu intercepts every launch from process start (the 80s weight load = 38k H2D/kernel interceptions at ms each → 10+ min stall).
 
 ```bash
-sudo /usr/local/cuda-13.2/bin/ncu --graph-profiling node \
+sudo /usr/local/cuda-13.2/bin/ncu --profile-from-start off --graph-profiling node \
   --metrics gpu__time_duration.sum --launch-count 500000 \
   --csv --log-file /tmp/ncu_mtp.csv \
-  env NCCL_NVLS_ENABLE=0 FERRITE_MEGA=1 ... CUDA_VISIBLE_DEVICES=4,5,6,7 \
-  LD_LIBRARY_PATH=/home/ubuntu/ferrite/kernels/cuda \
+  env NCCL_NVLS_ENABLE=0 FERRITE_MEGA=1 FERRITE_MTP=1 FERRITE_NCU=1 ... \
   ./target/release/ferrite-serve --backend cuda --tp 4 --model-dir ... --max-tokens 15 ...
 ```
 
