@@ -868,6 +868,20 @@ impl<B: KernelBackend> TpCluster<B> {
         //    copy-in is graph-recorded — capture-time nodes, not a host
         //    memcpy loop) → argmax[3] → fused accept/commit.
         let h2v = self.shards[0].embed(&[last, d1 as u32, d2 as u32]);
+        // bf16 round-trip the verify inputs: the draft graph gathers
+        // embeddings from the bf16 resident table (dev_weight_bf16
+        // truncation), so d1/d2 are argmaxes of bf16-embed logits. Verify
+        // must run its argmax in the SAME precision domain or d1==a0
+        // compares across domains (observed accept 2.38 -> 2.02). Truncate
+        // to the bf16 high half — identical to the device table's bits.
+        let h2v = {
+            let mut d = (*h2v.data).clone();
+            for v in d.iter_mut() {
+                let b = v.to_bits();
+                *v = f32::from_bits((b >> 16) << 16);
+            }
+            ferrite_types::Tensor::from_f32(h2v.shape, d)
+        };
         let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
         let toks_v = Self::fan_out(&mut self.shards, |s| {
             let cuda = s
