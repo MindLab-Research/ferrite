@@ -229,6 +229,18 @@ fn run_cuda(
                             n_fp8 += 1;
                             continue;
                         }
+                        if std::env::var_os("FERRITE_FP8_DEBUG").is_some()
+                            && !moe_bf16
+                            && t.shape.0.len() >= 2
+                            && shard.weights8.contains_key(name)
+                        {
+                            // registered fp8 but preload lookup missed: the
+                            // (ptr, numel) key diverged between register and here.
+                            eprintln!(
+                                "[fp8dbg] PRELOAD-MISS {name} ptr={:x} numel={} map={}",
+                                t.as_slice().as_ptr() as usize, t.numel(), shard.backend.fp8_registered()
+                            );
+                        }
                         shard
                             .backend
                             .preload_weight(t)

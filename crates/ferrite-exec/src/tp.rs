@@ -539,6 +539,11 @@ impl<B: KernelBackend> TpCluster<B> {
     /// the f32 sharding; block-128-misaligned seams simply drop out of the
     /// set — those weights stay on the bf16 path on ALL ranks).
     pub fn set_fp8(&mut self, w8: &Weights8) {
+        if std::env::var_os("FERRITE_NO_FP8").is_some() {
+            println!("[tp] fp8 bypass DISABLED (FERRITE_NO_FP8) — all bf16");
+            return;
+        }
+        let dbg = std::env::var_os("FERRITE_FP8_DEBUG").is_some();
         let n = self.shards.len();
         let mut registered = 0usize;
         for rank in 0..n {
@@ -554,6 +559,12 @@ impl<B: KernelBackend> TpCluster<B> {
                     eprintln!("[tp] fp8 register {} failed: {e} (stays bf16)", name);
                 } else {
                     registered += 1;
+                    if dbg && !cuda.fp8_hit(golden) {
+                        eprintln!(
+                            "[fp8dbg] REGISTER-VERIFY MISS {name} ptr={:x} numel={} map={}",
+                            golden.as_slice().as_ptr() as usize, golden.numel(), cuda.fp8_registered()
+                        );
+                    }
                 }
             }
             self.shards[rank].weights8 = shard;
