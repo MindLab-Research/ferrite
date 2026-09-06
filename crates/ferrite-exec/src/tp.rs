@@ -1189,7 +1189,29 @@ impl<B: KernelBackend> TpCluster<B> {
         plan_buf.upload(flat.as_slice())?;
         let k_pin = cuda.pinned_i32()?;
         let commit = MtpCommitPlan { plan: plan_buf, k_pin, n: n_plans, conv_len, gdn_len, hidden };
-        *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch, commit: Some(commit) });
+        // ZERO-H2D device token chain (fixed bufs — never pooled, stable
+        // addresses for the accept kernel's device-resident loop):
+        // tokens_dev [3] i32 = [last, d1, d2] (embed kernel reads these)
+        // k_dev [1] i32, next_token_dev [1] i32, n_accepted_dev [1] i32
+        // (accept kernel outputs; host reads 8-12B D2H for SSE)
+        // verify_argmax_dev [3] f32 (graph argmax output — the verify graph
+        // writes a0/a1/a2 here; accept kernel compares against d1/d2)
+        // emb1_dev/emb2_dev [hidden] f32 (draft chain embeds from embed_one)
+        // d1_argmax_dev/d2_argmax_dev [1] f32 (draft argmax outputs)
+        let tokens_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 3)?;
+        let verify_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 3)?;
+        let k_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let next_token_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let n_accepted_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let emb1_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let emb2_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let d1_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let d2_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        *cuda.mtp.lock().unwrap() = Some(MtpState {
+            hf_dev, hf_v, hprev, scratch, commit: Some(commit),
+            tokens_dev, verify_argmax_dev, k_dev, next_token_dev, n_accepted_dev,
+            emb1_dev, emb2_dev, d1_argmax_dev, d2_argmax_dev,
+        });
         Ok(())
     }
 
@@ -3031,6 +3053,31 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     h_prev: &ferrite_kernel::cuda::DevBuf,
     h_out: Option<&ferrite_kernel::cuda::DevBuf>,
 ) -> Result<f32> {
+    let mut arg_slot = ferrite_kernel::cuda::DevBuf::alloc(
+        s.backend.as_cuda().unwrap().dev(),
+        s.backend.as_cuda().unwrap().stream(),
+        1,
+    )?;
+    mtp_forward_dev_argmax(s, seq, embed_row, h_prev, h_out, &mut arg_slot)?;
+    let cuda = s.backend.as_cuda().unwrap();
+    let mut tok = vec![0f32; 1];
+    arg_slot.download(&mut tok)?;
+    cuda.enter();
+    Ok(tok[0])
+}
+
+/// Zero-H2D mtp_forward: same layer chain, but the argmax lands in a CALLER-
+/// PROVIDED device slot (no D2H round-trip — the token stays on device for
+/// the accept kernel). Combined with embed_one_dev (device-resident embed),
+/// the draft chain has ZERO host↔device transfers.
+pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
+    s: &mut Engine<B>,
+    seq: u64,
+    embed_row: &ferrite_kernel::cuda::DevBuf,
+    h_prev: &ferrite_kernel::cuda::DevBuf,
+    h_out: Option<&ferrite_kernel::cuda::DevBuf>,
+    arg_out: &mut ferrite_kernel::cuda::DevBuf,
+) -> Result<()> {
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights};
     let cuda = s
         .backend
@@ -3048,7 +3095,6 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     let pfx = format!("model.layers.{}", cfg.num_hidden_layers);
     let d = &cfg.dsa;
     let (dsa_h, dsa_dk, dsa_dv, _ip) = s.dsa_dims();
-    // MTP DSA cache family: independent of the decoder's 0..num_dsa-1.
     let mtp_family = cfg
         .layer_types
         .iter()
@@ -3092,7 +3138,7 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     // 3. residual + post_attention_layernorm
     let x1 = cuda.add_dev(&eh_partial, &attn_partial, h)?;
     let hn2 = cuda.rmsnorm_dev(&x1, s.w(&format!("{pfx}.post_attention_layernorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
-    // 4. MoE (same call shape as the decoder moe layers)
+    // 4. MoE
     let e = cfg.n_routed_experts;
     let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
         Some(b) => b.clone(),
@@ -3117,20 +3163,17 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     let mut probs = DevBuf::alloc(cuda.dev(), cuda.stream(), cfg.num_experts_per_tok)?;
     let moe_partial = cuda.moe_layer_dev(&hn2, gate_w, &bias, &shared, &experts, es, &mut probs, 1, h, cfg.num_experts_per_tok, e, cfg.routed_scaling_factor, cfg.swiglu_limit)?;
     nccl.all_reduce_f32(moe_partial.as_const_f32(), moe_partial.as_f32(), h)?;
-    // 5. residual + shared_head.norm + lm_head + argmax
+    // 5. residual + shared_head.norm + lm_head + argmax → DEVICE SLOT (no D2H)
     let x2 = cuda.add_dev(&x1, &moe_partial, h)?;
     if let Some(ho) = h_out {
-        // catch-up recursion: export the MTP layer's own residual h (x2) —
-        // the next catch-up step's h_prev (per-token h chain beats the fixed
-        // prompt-tail approximation for draft quality).
         cuda.copy_dev(&x2, 0, ho.as_f32(), h)?;
     }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
     let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
-    let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
-    cuda.argmax_dev(&logits, &mut arg, 1, cfg.vocab_size)?;
-    let mut tok = vec![0f32; 1];
-    arg.download(&mut tok)?;
-    Ok(tok[0])
+    // argmax writes DIRECTLY to the caller's device slot — zero D2H
+    cuda.argmax_dev(&logits, arg_out, 1, cfg.vocab_size)?;
+    Ok(())
 }
+
+
