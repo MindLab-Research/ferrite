@@ -866,23 +866,24 @@ impl<B: KernelBackend> TpCluster<B> {
                         mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
                         h_cur = Some(hout);
                     }
-                    // FIX (accept=1.0 root): persist the catch-up h chain's
-                    // LAST value into MtpState.hprev. Without this, the first
-                    // mtp_step's draft reads UNINITIALIZED pool memory as
-                    // h_prev (zeros in the zero-H2D path / stale garbage in
-                    // the original path) → x2's hnorm segment wrong → d1's
-                    // sibling d2 garbage → d2's KV (slot 15 + decoder slot 17)
-                    // pollutes every later step's draft attention → argmax
-                    // flips → accept collapse. h_prev semantics: the draft's
-                    // previous-token hidden = the LAST catch-up hout.
-                    if let Some(h_last) = h_cur.as_ref() {
+                    // FIX v2 (accept=1.0 root): seed MtpState.hprev from
+                    // hf_dev — the DECODER's h_final for the prompt tail (the
+                    // same h the catch-up's token-0 uses as h_prev, and the
+                    // semantic the steady-state commit provides via
+                    // hf_v[k-1] = decoder h_final). The previous hout-chain
+                    // seeding (MTP-layer x2) mismatched the steady-state
+                    // h_prev semantics (decoder h_final), sending the draft's
+                    // d2 chain sideways from step 1 (d2 garbage → slot-15 KV
+                    // pollution → next-step pool-3 aggregation → d1 argmax
+                    // flips → accept=1.0 forever).
+                    {
                         let cuda = s
                             .backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
                         let m = cuda.mtp.lock().unwrap();
                         if let Some(m) = m.as_ref() {
-                            cuda.copy_dev(h_last, 0, m.hprev.as_f32(), hidden)?;
+                            cuda.copy_dev(&m.hf_dev, 0, m.hprev.as_f32(), hidden)?;
                         }
                     }
                     Ok::<(), FerriteError>(())
