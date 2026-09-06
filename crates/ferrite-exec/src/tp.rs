@@ -3726,6 +3726,14 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         for (i, v) in xfull[..xn].iter().enumerate() { segs[i / 512] += *v as f64; }
         eprintln!("[zh2d-x2] x2[0..2]={:?} sum={:.6} segs={:?} last4={:?}",
             &xfull[..2], hsum, segs, &xfull[xn-4..]);
+        // BIT-level first 32 u32 — 8-seg f64 sums cannot see 1-ulp diffs
+        // (1.5e-8 < 1e-6 print precision) but argmax flips on near-ties
+        // (orig d2=315 vs zh 8606, orig S2 d1=98347 vs zh 702). Bits localize it.
+        let mut xbf = [0f32; 32];
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            x2.as_f32() as *mut std::ffi::c_void, xbf.as_mut_ptr(), 32, cuda.stream_handle());
+        let xbits: Vec<u32> = xbf.iter().map(|v| v.to_bits()).collect();
+        eprintln!("[zh2d-x2b] {:?}", xbits);
     }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
