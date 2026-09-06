@@ -1596,11 +1596,12 @@ fn fp8_encode(x: f32) -> u8 {
 fn fp8_mma_layout_probe() {
     let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
     dev.enter();
-    // A [16,32] e4m3 bytes (row-major), B [32,8] e4m3 bytes (k-major / n=8)
+    // A [16,32] e4m3 bytes (row-major), B [32,8] e4m3 bytes (COL-major: B(k,n)
+    // at bytes[n*32+k] — the PTX .col operand reads k contiguous per n column)
     let mut A = vec![0u8; 16 * 32];
     let mut B = vec![0u8; 32 * 8];
     for i in 0..16 { for k in 0..32 { A[i * 32 + k] = fp8_encode((i * 32 + k) as f32 / 448.0); } }
-    for k in 0..32 { for n in 0..8 { B[k * 8 + n] = fp8_encode((k * 8 + n + 1) as f32 / 448.0); } }
+    for k in 0..32 { for n in 0..8 { B[n * 32 + k] = fp8_encode((k * 8 + n + 1) as f32 / 448.0); } }
     let mut C = vec![0f32; 16 * 8];
     // Pack the u8 byte arrays into f32 words (4 bytes LE per f32) so they ride
     // through DevBuf; the probe kernel reads them as raw bytes back.
@@ -1623,7 +1624,7 @@ fn fp8_mma_layout_probe() {
     let mut gold = vec![0f32; 16 * 8];
     for i in 0..16 { for n in 0..8 {
         let mut acc = 0f64;
-        for k in 0..32 { acc += (e4m3_decode(A[i * 32 + k]) as f64) * (e4m3_decode(B[k * 8 + n]) as f64); }
+        for k in 0..32 { acc += (e4m3_decode(A[i * 32 + k]) as f64) * (e4m3_decode(B[n * 32 + k]) as f64); }
         gold[i * 8 + n] = acc as f32;
     }}
     let mut maxd = 0f32; let mut worst = (0usize, 0usize);

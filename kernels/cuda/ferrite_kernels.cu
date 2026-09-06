@@ -3654,16 +3654,17 @@ __global__ void fp8_mma_probe_kernel(const unsigned char* __restrict__ A,
     const int r0 = t >> 2, c0 = (t & 3) * 4;
     // m16n8k32 e4m3 fragments (PTX spec): A = 4 .b32/thread (16 fp8),
     // B = 2 .b32/thread (8 fp8), C = 4 f32/thread.
-    // A layout (row-major): a0=(r0, k=c0..+3), a1=(r0+8, c0), a2=(r0, c0+16), a3=(r0+8, c0+16)
-    // B layout (col-major k,n): b0=(k=c0..+3, n=r0), b1=(k=c0+16..+3, n=r0)
+    // A row-major [m,k]: a0=(r0, k=c0..+3), a1=(r0+8, c0), a2=(r0, c0+16), a3=(r0+8, c0+16)
+    // B col-major [k,n] (n-major stride 32, k contiguous): b0=(k=c0..+3, n=r0), b1=(k=c0+16, n=r0)
+    // C m16n8 classic: c0/c1=(r0, cc*2/+1), c2/c3=(r0+8, cc*2/+1)
     unsigned a[4];
     a[0] = *(const unsigned*)(A + r0 * 32 + c0);
     a[1] = *(const unsigned*)(A + (r0 + 8) * 32 + c0);
     a[2] = *(const unsigned*)(A + r0 * 32 + c0 + 16);
     a[3] = *(const unsigned*)(A + (r0 + 8) * 32 + c0 + 16);
     unsigned b[2];
-    b[0] = *(const unsigned*)(B + c0 * 8 + (t >> 2));
-    b[1] = *(const unsigned*)(B + (c0 + 16) * 8 + (t >> 2));
+    b[0] = *(const unsigned*)(B + r0 * 32 + c0);
+    b[1] = *(const unsigned*)(B + r0 * 32 + c0 + 16);
     float c0f = 0.f, c1f = 0.f, c2f = 0.f, c3f = 0.f;
     asm volatile(
         "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
@@ -3671,11 +3672,11 @@ __global__ void fp8_mma_probe_kernel(const unsigned char* __restrict__ A,
         : "+f"(c0f), "+f"(c1f), "+f"(c2f), "+f"(c3f)
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
           "r"(b[0]), "r"(b[1]));
-    const int cr = (t >> 2), cc = (t & 3);
+    const int cr = (t >> 2), cc = (t & 3) * 2;
     C[(cr) * 8 + cc] = c0f;
-    C[(cr) * 8 + cc + 4] = c1f;
+    C[(cr) * 8 + cc + 1] = c1f;
     C[(cr + 8) * 8 + cc] = c2f;
-    C[(cr + 8) * 8 + cc + 4] = c3f;
+    C[(cr + 8) * 8 + cc + 1] = c3f;
 }
 
 extern "C" cudaError_t ferrite_fp8_mma_probe(const unsigned char* A, const unsigned char* B,
