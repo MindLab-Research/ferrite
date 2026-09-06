@@ -3705,147 +3705,62 @@ extern "C" cudaError_t ferrite_fp8_mma_probe(const unsigned char* A, const unsig
 // fallbacks (fp8-registered weights with misaligned shapes serve bf16).
 // Requires: in_f % 128 == 0 and out_f % 16 == 0 (GLM weights all comply).
 // ============================================================
-__global__ void gemv_fp8_mma_kernel(
-    const float* __restrict__ x,          // [in_f] f32 (n=1 decode row)
-    const unsigned char* __restrict__ w,  // [out_f, in_f] e4m3 row-major
-    const float* __restrict__ w_scale,    // [srows][scols] = [out/128][in/128]
-    float* __restrict__ y,                // [out_f]
-    int in_f, int out_f, int srows, int scols)
+// v3 (mega-kernel quant): the whole gemv in ONE launch — the quant runs
+// COOPERATIVELY at the kernel head (every block slices k, atomicMax the
+// partial absmax, votes, encodes its slice into the GLOBAL xq scratch),
+// then every block's mma reads the shared xq. v1 re-quantized per block
+// (32x redundant work), v2's separate quant kernel paid a full launch
+// (~1.5us — 0.49x vs bf16 on small matrices); this pays neither.
+// Scratch layout (persistent, Rust-side): [0..4)=amax(int bits) [4..8)=cnt
+// [8..12)=cnt2 [12..16)=xs(f32) [16..16+in_f)=xq(e4m3). The kernel TAIL
+// (block 0) resets amax/cnt/cnt2 for the next call — stream order makes
+// that safe. All blocks are co-resident (grid <= 96 << 148 SMs), so the
+// spin barriers cannot deadlock.
+__global__ void gemv_fp8_mma_v3_kernel(
+    const float* __restrict__ x,          // [in_f] f32 activations
+    const unsigned char* __restrict__ w,   // [out_f, in_f] e4m3 row-major
+    const float* __restrict__ w_scale,    // [srows][scols]
+    float* __restrict__ y,                 // [out_f]
+    unsigned int* __restrict__ scratch,    // amax/cnt/cnt2/xs/xq (see above)
+    int in_f, int out_f, int scols)
 {
-    (void)srows;
-    const int m0 = blockIdx.x * 16;        // 16 output rows per block
+    const int nb = gridDim.x;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int r0 = lane >> 2, c0 = (lane & 3) * 4; // probe-verified fragments
-    // smem: quantized x (e4m3), absmax reduce buf, x_scale, per-warp accs [8][16]
-    extern __shared__ unsigned char smem[];
-    unsigned char* sx = smem;                       // [in_f]
-    float* sred = (float*)(smem + in_f);            // [256]
-    float* sxs = (float*)(smem + in_f + 256 * 4);   // [1]
-    float* sacc = sxs + 1;                          // [8][16]
-    // ---- 1. quantize x: per-token absmax / 448 -> e4m3 (dynamic, sglang) ----
-    {
-        float amax = 1e-9f;
-        for (int k = threadIdx.x; k < in_f; k += 256)
-            amax = fmaxf(amax, fabsf(x[k]));
-        sred[threadIdx.x] = amax;
-        __syncthreads();
-        for (int off = 128; off > 0; off >>= 1) {
-            if (threadIdx.x < off)
-                sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
-            __syncthreads();
-        }
-        if (threadIdx.x == 0) sxs[0] = sred[0] / 448.0f;
-        __syncthreads();
-        const float inv = 1.0f / sxs[0];
-        for (int k = threadIdx.x; k < in_f; k += 256) {
-            // f32 -> e4m3 direct (RN): matches the reference encoder — the
-            // f32->half->e4m3 double-round drifted 1ulp on ~6% of lanes and
-            // the 128-term dot amplified it to ~20% (measured 128x16 case).
-            const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
-            sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
-        }
-        __syncthreads();
-    }
-    // ---- 2. K-split mma: 8 warps over K, 16 rows x N=8 (x replicated) ----
-    // kseg rounded UP to 128-block multiples: each warp owns whole k128
-    // blocks (a partial block would straddle two w_scale blocks and mix them
-    // into one mma accumulation — the block-scale indexing requires it).
-    const int nblk = (in_f + 127) >> 7;        // total k128 blocks
-    const int bseg = (nblk + 7) / 8;          // blocks per warp (>=1)
-    const int kW = warp;
-    const int k0 = kW * bseg * 128;
-    const int k1 = min(k0 + bseg * 128, in_f);
-    const int ws_row = (m0 / 128) * scols;  // 16 rows share the m/128 scale row
-    float acc0 = 0.f, acc1 = 0.f;          // (r0, col0) and (r0+8, col0) partials
-    for (int kb = k0; kb < k1; kb += 128) {
-        // 4 mmas per k128 block; D accumulates raw e4m3 x e4m3 dots
-        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-        for (int kk = kb; kk < kb + 128; kk += 32) {
-            if (kk + 32 > k1) break;        // K-tail (in_f%128!=0 not hit in v1)
-            unsigned a[4];
-            a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
-            a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
-            a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
-            a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
-            unsigned b[2];
-            b[0] = *(const unsigned*)(sx + kk + c0);        // B(k,n)=x_q[k] all n
-            b[1] = *(const unsigned*)(sx + kk + c0 + 16);
-            asm volatile(
-                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
-                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
-                  "r"(b[0]), "r"(b[1]));
-        }
-        const float wsc = w_scale[ws_row + (kb >> 7)];
-        if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; } // col0 threads own the value
-    }
-    // ---- 3. block reduce: smem [8][16], warp0 writes y ----
-    if ((lane & 3) == 0) {
-        sacc[warp * 16 + r0] = acc0;
-        sacc[warp * 16 + r0 + 8] = acc1;
-    }
-    __syncthreads();
-    if (warp == 0 && lane < 16) {
-        float t = 0.f;
-        for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
-        y[m0 + lane] = t * sxs[0];
-    }
-}
+    int* g_amax = (int*)scratch;            // float-as-int atomicMax (abs >= 0)
+    unsigned int* g_cnt = scratch + 1;
+    unsigned int* g_cnt2 = scratch + 2;
+    float* g_xs = (float*)(scratch + 3);
+    unsigned char* xq = (unsigned char*)(scratch + 4);
 
-// v2 (split, sglang per_token_group_quant pattern): quantize ONCE per call in
-// a standalone kernel, then the mma kernel reads the e4m3 xq from GLOBAL
-// memory (L2) — v1 re-quantized inside EVERY block (32x for 512x4096, the
-// dominant waste behind small-matrix 0.60x vs bf16). The layer-level v3
-// hoists this further: quantize x ONCE per layer (it feeds 6 same-x gemvs).
-__global__ void fp8_quant_kernel(
-    const float* __restrict__ x,   // [in_f] f32 activations
-    unsigned char* __restrict__ xq, // [in_f] e4m3 out
-    float* __restrict__ xs,        // [1] per-token scale out
-    int in_f)
-{
-    __shared__ float sred[256];
-    float amax = 1e-9f;
-    for (int k = threadIdx.x; k < in_f; k += 256)
-        amax = fmaxf(amax, fabsf(x[k]));
-    sred[threadIdx.x] = amax;
+    // ---- phase A: per-block sliced absmax -> atomicMax; vote; xs ----
+    float pmax = 1e-9f;
+    for (int k = (blockIdx.x * 256) + threadIdx.x; k < in_f; k += nb * 256)
+        pmax = fmaxf(pmax, fabsf(x[k]));
+    // warp reduce
+    for (int off = 16; off > 0; off >>= 1)
+        pmax = fmaxf(pmax, __shfl_down_sync(0xffffffff, pmax, off));
+    if (lane == 0) atomicMax(g_amax, __float_as_int(pmax));
+    if (threadIdx.x == 0) atomicAdd(g_cnt, 1u);
+    if (threadIdx.x == 0) { while (atomicAdd(g_cnt, 0u) < nb) __nanosleep(64); }
     __syncthreads();
-    for (int off = 128; off > 0; off >>= 1) {
-        if (threadIdx.x < off)
-            sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
-        __syncthreads();
-    }
-    if (threadIdx.x == 0) xs[0] = sred[0] / 448.0f;
-    __syncthreads();
-    const float inv = 1.0f / xs[0];
-    for (int k = threadIdx.x; k < in_f; k += 256) {
+    const float xs_ = __int_as_float(atomicAdd(g_amax, 0)) / 448.0f;
+    if (threadIdx.x == 0 && blockIdx.x == 0) *g_xs = xs_;
+    // ---- phase B: sliced encode into global xq; vote ----
+    const float inv = 1.0f / xs_;
+    for (int k = (blockIdx.x * 256) + threadIdx.x; k < in_f; k += nb * 256) {
         const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
         xq[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
     }
-}
+    __threadfence();                        // xq visible before the vote
+    if (threadIdx.x == 0) atomicAdd(g_cnt2, 1u);
+    if (threadIdx.x == 0) { while (atomicAdd(g_cnt2, 0u) < nb) __nanosleep(64); }
+    __threadfence();                        // acquire: xq of other blocks
+    __syncthreads();
 
-extern "C" cudaError_t ferrite_fp8_quant(
-    const float* x, unsigned char* xq, float* xs, int in_f, cudaStream_t s)
-{
-    fp8_quant_kernel<<<1, 256, 0, s>>>(x, xq, xs, in_f);
-    return cudaGetLastError();
-}
-
-// v2 mma body: pre-quantized xq from GLOBAL (L2), no smem staging, no
-// per-block quant prologue — smem holds only the [8][16] warp partials.
-__global__ void gemv_fp8_mma_v2_kernel(
-    const unsigned char* __restrict__ xq, // [in_f] e4m3 (pre-quantized)
-    const float* __restrict__ xs,         // [1] per-token scale
-    const unsigned char* __restrict__ w,  // [out_f, in_f] e4m3 row-major
-    const float* __restrict__ w_scale,    // [srows][scols]
-    float* __restrict__ y,                // [out_f]
-    int in_f, int out_f, int scols)
-{
+    // ---- mma body (reads the shared xq; fragments per fp8_mma_layout_probe) ----
     const int m0 = blockIdx.x * 16;
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
-    __shared__ float sacc[8 * 16]; // 1D: [warp*16 + row] (the probe-verified 2D form tripped
-                                   // "modifiable lvalue" with flat indexing)
+    __shared__ float sacc[8 * 16];
     const int nblk = (in_f + 127) >> 7;
     const int bseg = (nblk + 7) / 8;
     const int kW = warp;
@@ -3863,7 +3778,7 @@ __global__ void gemv_fp8_mma_v2_kernel(
             a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
             a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
             unsigned b[2];
-            b[0] = *(const unsigned*)(xq + kk + c0);       // global (L2) read
+            b[0] = *(const unsigned*)(xq + kk + c0);
             b[1] = *(const unsigned*)(xq + kk + c0 + 16);
             asm volatile(
                 "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
@@ -3883,31 +3798,26 @@ __global__ void gemv_fp8_mma_v2_kernel(
     if (warp == 0 && lane < 16) {
         float t = 0.f;
         for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
-        y[m0 + lane] = t * xs[0];
+        y[m0 + lane] = t * xs_;
     }
-}
-
-extern "C" cudaError_t ferrite_gemv_fp8_mma_v2(
-    const unsigned char* xq, const float* xs,
-    const void* w, const float* w_scale,
-    float* out, int in_f, int out_f, int scols, cudaStream_t s)
-{
-    if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
-    dim3 grid(out_f / 16);
-    gemv_fp8_mma_v2_kernel<<<grid, 256, 0, s>>>(
-        xq, xs, (const unsigned char*)w, w_scale, out, in_f, out_f, scols);
-    return cudaGetLastError();
+    // ---- tail: block 0 resets the barrier state (stream order makes the
+    // next launch see zeros; amax reset via int 0) ----
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *g_amax = 0;
+        *g_cnt = 0;
+        *g_cnt2 = 0;
+    }
 }
 
 extern "C" cudaError_t ferrite_gemv_fp8_mma(
     const float* x, const void* w, const float* w_scale,
-    float* out, int in_f, int out_f, int srows, int scols, cudaStream_t s)
+    float* out, int in_f, int out_f, int srows, int scols,
+    unsigned int* scratch, cudaStream_t s)
 {
-    if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported; // v1: GLM-aligned shapes only
-    const int smem = in_f + 256 * 4 + 4 + 8 * 16 * 4;
-    cudaFuncSetAttribute(gemv_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    (void)srows;
+    if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
     dim3 grid(out_f / 16);
-    gemv_fp8_mma_kernel<<<grid, 256, smem, s>>>(
-        x, (const unsigned char*)w, w_scale, out, in_f, out_f, srows, scols);
+    gemv_fp8_mma_v3_kernel<<<grid, 256, 0, s>>>(
+        x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols);
     return cudaGetLastError();
 }

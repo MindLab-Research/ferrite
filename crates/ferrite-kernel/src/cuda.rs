@@ -59,7 +59,7 @@ extern "C" {
                                 scols: i32, s: CuStream) -> i32;
     fn ferrite_gemv_fp8_mma(x: *const f32, w: *const std::ffi::c_void, w_scale: *const f32,
                             out: *mut f32, in_f: i32, out_f: i32,
-                            srows: i32, scols: i32, s: CuStream) -> i32;
+                            srows: i32, scols: i32, scratch: *mut u32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
@@ -480,6 +480,11 @@ pub struct CudaBackend {
     /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
     /// scale) device tables for the fused MoE kernels.
     moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
+    /// W8A8 mega-quant scratch per in_f (v3 gemv): [amax_bits, cnt, cnt2, xs,
+    /// xq[in_f]] — the cooperative in-kernel quant's barrier state + shared
+    /// xq. Allocated once (lazy) per width; the kernel TAIL resets the
+    /// barrier counters, so the buffer is reusable across calls (stream order).
+    w8a8_scratch: std::sync::Mutex<std::collections::HashMap<usize, (*mut std::ffi::c_void, usize)>>,
     /// Named CUDA graphs (per layer-segment): FERRITE_GRAPH_LAYER captures
     /// each segment's op sequence once and replays per token — the per-op
     /// launch gaps (~30μs × ~19 ops/layer) are the decode bottleneck after
@@ -541,6 +546,7 @@ impl CudaBackend {
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            w8a8_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
@@ -727,6 +733,23 @@ impl CudaBackend {
         self.fp8_lookup(t).is_some()
     }
 
+    /// W8A8 v3 mega-quant scratch for this width (lazy, one cudaMalloc +
+    /// zero per in_f; the kernel tail resets the barrier counters so the
+    /// buffer is reusable). Layout: [amax_bits, cnt, cnt2, xs] u32 header +
+    /// xq[in_f] e4m3 bytes.
+    fn w8a8_scratch_ptr(&self, in_f: usize) -> Result<*mut u32> {
+        let key = in_f;
+        if let Some(&(p, _)) = self.w8a8_scratch.lock().unwrap().get(&key) {
+            return Ok(p as *mut u32);
+        }
+        let bytes = 16 + in_f;
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut p, bytes) }, "w8a8 scratch malloc")?;
+        ck(unsafe { cudaMemset(p, 0, bytes) }, "w8a8 scratch zero")?;
+        self.w8a8_scratch.lock().unwrap().insert(key, (p, bytes));
+        Ok(p as *mut u32)
+    }
+
     /// Preload a weight into device-resident storage (bf16 for 2-D matmul
     /// weights — run_matmul reads bf16 exclusively; 1-D tensors stay f32
     /// for the elementwise kernels). Serve calls this over every shard
@@ -870,26 +893,27 @@ impl CudaBackend {
         // prefill speed here).
         if let Some(f8) = self.fp8_lookup(w) {
             // W8A8 tensor-core path (n=1 decode, GLM-aligned shapes): the
-            // mma.sync m16n8k32 e4m3 gemv. v2 SPLIT (sglang per_token_group_quant
-            // pattern): quantize x ONCE in a standalone kernel (v1 re-quantized
-            // inside EVERY block — 32x for 512x4096, the small-matrix 0.60x
-            // waste), then the mma kernel reads the e4m3 xq from global (L2).
-            // Misaligned shapes / n>1 fall back to the W8A16 gemv below (kept).
+            // mma.sync m16n8k32 e4m3 gemv — activations quantized in-kernel
+            // (per-token absmax/448), e4m3 x e4m3 multiplied directly on the
+            // tensor core (NO per-element dequant — the W8A16 attempt's cvt
+            // overhead offset the HBM savings: 0.96x vs bf16). Misaligned
+            // shapes / n>1 fall back to the W8A16 gemv below (kept).
+            // v2 split (standalone quant kernel + global-xq mma) measured
+            // SLOWER on every shape (0.49x vs v1's 0.60x — the extra launch
+            // costs more than the 32x de-duplicated per-block quant work);
+            // the real fix is layer-level x quant sharing (quant once in the
+            // upstream epilogue, all same-x gemvs consume), not more kernels.
             if n == 1 && in_f % 128 == 0 && out_f % 16 == 0 && f8.scols == (in_f as i32 + 127) / 128 {
-                // xq/xs pooled buffers: (in_f+3)/4 f32 words = in_f bytes
-                let xq = DevBuf::alloc(self.dev, self.stream, (in_f as usize + 3) / 4)?;
-                let xs = DevBuf::alloc(self.dev, self.stream, 1)?;
                 let do_ = DevBuf::alloc(self.dev, self.stream, out_f as usize)?;
-                let rq = unsafe { ferrite_fp8_quant(x_dev.as_const_f32(), xq.as_f32() as *mut u8, xs.as_f32(), in_f, self.stream) };
-                if rq == 0 {
-                    let r2 = unsafe { ferrite_gemv_fp8_mma_v2(xq.as_f32() as *const u8, xs.as_const_f32(),
-                                                              f8.w, f8.scale as *const f32,
-                                                              do_.as_f32(), in_f, out_f, f8.scols, self.stream) };
-                    if r2 == 0 {
-                        return Ok(do_);
-                    }
+                let scratch = self.w8a8_scratch_ptr(in_f as usize)?;
+                let r = unsafe {
+                    ferrite_gemv_fp8_mma(x_dev.as_const_f32(), f8.w, f8.scale as *const f32,
+                                         do_.as_f32(), in_f, out_f, f8.srows, f8.scols, scratch, self.stream)
+                };
+                if r == 0 {
+                    return Ok(do_);
                 }
-                // fall through to W8A16 on failure
+                // cudaErrorNotSupported (unaligned): fall through to W8A16
             }
             let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
             ck(unsafe {
