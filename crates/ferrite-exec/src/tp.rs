@@ -1563,11 +1563,19 @@ impl<B: KernelBackend> TpCluster<B> {
                     let k_host = if d1_val[0] as u32 == a[0] as u32 {
                         if d2_val[0] as u32 == a[1] as u32 { 3 } else { 2 }
                     } else { 1 };
-                    // DSA rollback
+                    // DSA rollback — draft family keeps k accepted KVs:
+                    // draft1+draft2 appended 2 (last + d1), the accept keeps
+                    // k tokens (a0..a_{k-1}) — the window must retain d1's KV
+                    // (slot t0, d1==a0 when k>=2) for the next step's
+                    // attention. rollback(2-k): k=1→+1 (last), k=2→+2 (last
+                    // + d1==a0), k=3→+2 (max, draft only appended 2). The old
+                    // (3-k) dropped d1's KV at k=2 → draft's context missing
+                    // the accepted token → argmax flipped to input-repeat
+                    // (d1=last observed at S4) → accept collapse after S3.
                     for f in 0..num_dsa {
                         cuda.dsa_host_rollback(seq, f, (3 - k_host) as usize);
                     }
-                    cuda.dsa_host_rollback(seq, mtp_family, (3 - k_host) as usize);
+                    cuda.dsa_host_rollback(seq, mtp_family, (2 - k_host).max(0) as usize);
                     // mtp_commit with k from host (pinned — TODO: k_dev from device)
                     cuda.mtp_commit(k_host)?;
                     let t_commit = t_c.elapsed();
