@@ -1651,7 +1651,7 @@ fn gemv_fp8_mma_parity_and_speed() {
     for &(in_f, out_f) in &[(128usize, 16usize), (4096usize, 512usize), (4096usize, 1536usize)] {
         // W: random e4m3 + 128-block scales (real quantizer: max/448)
         let wv: Vec<f32> = (0..out_f * in_f).map(|_| r() * 0.05).collect();
-        let srows = out_f / 128;
+        let srows = out_f.div_ceil(128);
         let scols = in_f / 128;
         let mut scale = vec![0f32; srows * scols];
         for br in 0..srows { for bc in 0..scols {
