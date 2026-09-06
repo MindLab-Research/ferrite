@@ -1323,10 +1323,16 @@ impl<B: KernelBackend> TpCluster<B> {
                     if r != 0 { return Err(FerriteError::InvalidArg(format!("verify input D2H: {r}"))); }
 
                     // DSA advance (pinned t0/total bookkeeping, no data H2D)
+                    // NOTE: mtp_family is NOT advanced here — the verify graph
+                    // covers only the 45 decoder layers (families 0..num_dsa-1).
+                    // The MTP layer's cache advances inside the draft's
+                    // dsa_layer_dev (+1 per mtp_forward) and rolls back with
+                    // (3-k) — advancing it here too would desync t_count (each
+                    // step +k too far → draft appends at the wrong cache slot
+                    // → garbage d1, accept=1.0. This was the zero-H2D bug.)
                     for f in 0..num_dsa {
                         cuda.dsa_host_advance(seq, f, 3);
                     }
-                    cuda.dsa_host_advance(seq, mtp_family, 3);
 
                     // Graph replay (reads from pinned staging — the graph's
                     // internal memcpy, not a host H2D)
