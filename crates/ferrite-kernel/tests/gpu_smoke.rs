@@ -1721,7 +1721,8 @@ fn gemv_fp8_mma_parity_and_speed() {
         eprintln!("[w8a8-gemv {out_f}x{in_f}] parity maxd={maxd:.3e} rel={rel:.3e}");
         assert!(rel < 1e-2, "W8A8 gemv parity {out_f}x{in_f}: rel {rel:.3e} (maxd {maxd:.3e}) — kernel quantization mismatch (in-kernel half-round vs test f32-round is ≤1ulp e4m3, not this large)");
 
-        // bench: W8A8 (this dev) vs bf16 (dev1, unregistered tensor)
+        // bench: W8A8 (this dev) vs bf16 (fresh backend on the SAME visible
+        // device — CI harnesses often expose a single GPU)
         let iters = 500;
         for _ in 0..20 { let _ = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).unwrap(); }
         dev.sync().unwrap();
@@ -1729,7 +1730,7 @@ fn gemv_fp8_mma_parity_and_speed() {
         for _ in 0..iters { let _ = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).unwrap(); }
         dev.sync().unwrap();
         let w8a8_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        let dev2 = CudaBackend::with_device(&so_path(), 1).expect("cuda 1");
+        let dev2 = CudaBackend::with_device(&so_path(), 0).expect("cuda bench");
         dev2.enter();
         let w_bf = Tensor::from_f32(Shape::new([out_f, in_f]), wv.clone()); // f32 → bf16 path
         let x2 = DevBuf::alloc(dev2.dev(), dev2.stream(), in_f).unwrap();
