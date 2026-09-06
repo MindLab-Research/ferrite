@@ -1772,15 +1772,18 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
                                    const __nv_bfloat16* __restrict__ w,
                                    const float* __restrict__ bias,
                                    float* __restrict__ y,
-                                   int in_f, int out_f) {
+                                   int in_f, int out_f, int nrows) {
     const int warps = blockDim.x >> 5;
     const int rpb = warps / WPR;               // rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row = blockIdx.x * rpb + warp / WPR;
+    const int rowg = blockIdx.x * rpb + warp / WPR;   // global row in [0, nrows*out_f)
+    const int token = rowg / out_f;
+    const int row = rowg - token * out_f;
     const int kw = warp % WPR;                 // K-slice id
     float acc = 0.f;
-    if (row < out_f) {
+    if (rowg < nrows * out_f) {
         const __nv_bfloat16* wr = w + (size_t)row * in_f;
+        const float* xr = x + (size_t)token * in_f;
         // slice size rounded to a multiple of 8 (uint4 16B alignment;
         // in_f % 8 == 0 is guaranteed by the host fallback to v1)
         int kper = ((in_f + WPR - 1) / WPR + 7) & ~7;
@@ -1790,8 +1793,8 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
         #pragma unroll 2
         for (int k = k0 + lane * 8; k + 7 < k1; k += 32 * 8) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
-            float4 xa = *reinterpret_cast<const float4*>(x + k);
-            float4 xb = *reinterpret_cast<const float4*>(x + k + 4);
+            float4 xa = *reinterpret_cast<const float4*>(xr + k);
+            float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
             const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
             float2 f0 = __bfloat1622float2(w2[0]);
             float2 f1 = __bfloat1622float2(w2[1]);
@@ -1809,7 +1812,7 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (WPR == 1) {
-        if (lane == 0 && row < out_f) y[row] = (bias ? bias[row] : 0.f) + acc;
+        if (lane == 0 && rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + acc;
     } else {
         __shared__ float part[16];
         if (lane == 0) part[warp] = acc;
@@ -1818,28 +1821,29 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
             float sum = 0.f;
             #pragma unroll
             for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
-            if (row < out_f) y[row] = (bias ? bias[row] : 0.f) + sum;
+            if (rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + sum;
         }
     }
 }
 
 extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
                                             const float* bias, float* out,
-                                            int in_f, int out_f,
+                                            int in_f, int out_f, int nrows,
                                             cudaStream_t s) {
-    if (out_f <= 0) return cudaSuccess;
+    if (out_f <= 0 || nrows <= 0) return cudaSuccess;
     if (in_f <= 0) return cudaSuccess;
     if (in_f & 7) return ferrite_gemv_bf16(x, w, bias, out, in_f, out_f, s);
     // WPR heuristic by row count: enough warps to cover HBM latency
     // (out_f*WPR/8 warps total; target >= 64 warps/SM on 148 SMs).
     int wpr = out_f >= 16384 ? 1 : (out_f >= 4096 ? 2 : (out_f >= 1024 ? 4 : 8));
     int rpb = 8 / wpr;                        // 256 threads = 8 warps
-    dim3 grid((out_f + rpb - 1) / rpb);
+    long total = (long)nrows * out_f;
+    dim3 grid((total + rpb - 1) / rpb);
     switch (wpr) {
-        case 1: gemv_bf16_v2_kernel<1><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
-        case 2: gemv_bf16_v2_kernel<2><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
-        case 4: gemv_bf16_v2_kernel<4><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
-        default: gemv_bf16_v2_kernel<8><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f); break;
+        case 1: gemv_bf16_v2_kernel<1><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
+        case 2: gemv_bf16_v2_kernel<2><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
+        case 4: gemv_bf16_v2_kernel<4><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
+        default: gemv_bf16_v2_kernel<8><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
     }
     return cudaGetLastError();
 }

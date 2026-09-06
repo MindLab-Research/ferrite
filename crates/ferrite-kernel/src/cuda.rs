@@ -44,7 +44,7 @@ extern "C" {
                           in_f: i32, out_f: i32, s: CuStream) -> i32;
     fn ferrite_gemv_bf16_v2(x: *const f32, w: *const std::ffi::c_void,
                              bias: *const f32, out: *mut f32,
-                             in_f: i32, out_f: i32, s: CuStream) -> i32;
+                             in_f: i32, out_f: i32, nrows: i32, s: CuStream) -> i32;
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
@@ -739,17 +739,19 @@ impl CudaBackend {
         if n == 1 || (n <= 3 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
             // Decode GEMV v2: uint4 vectorized + K-split WPR — 2.09x over v1
             // (bench gemv_v2_bench: 3.11→6.80TB/s lm_head, 2.20→3.91 o_proj,
-            // all shapes 1.45-2.18x, maxd 3.8e-6). v1 kept for A/B.
+            // all shapes 1.45-2.18x). BATCHED: ONE launch covers n rows
+            // (grid = n*out_f) — was n single-row launches, the MTP verify
+            // chain's 19880 small-graph-node cause. Per-row accumulation order
+            // (warp shuffle + WPR root) is unchanged, so the greedy argmax is
+            // bit-identical; only the launch/graph-node count drops n×.
             // n==2 per-row GEMV: ONLY under small_n_rows (the MTP verify chain
             // — the tiled GEMM wastes a whole tile on 2 rows: 108ms vs 23ms).
             // Prefill n>=2 keeps the GEMM unconditionally: its accumulation
             // order sets the first greedy token (per-row flipped it).
-            for r in 0..n {
-                ck(unsafe {
-                    ferrite_gemv_bf16_v2(x_dev.as_const_f32().add(r as usize * in_f as usize), dw.ptr as *const _,
-                                          dbias, do_.as_f32().add(r as usize * out_f as usize), in_f, out_f, self.stream)
-                }, "gemv_dev")?;
-            }
+            ck(unsafe {
+                ferrite_gemv_bf16_v2(x_dev.as_const_f32(), dw.ptr as *const _,
+                                      dbias, do_.as_f32(), in_f, out_f, n, self.stream)
+            }, "gemv_batch")?;
         } else {
             ck(unsafe {
                 ferrite_matmul_bf16(x_dev.as_const_f32(), dw.ptr as *const _,
@@ -768,7 +770,7 @@ impl CudaBackend {
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         ck(unsafe {
             ferrite_gemv_bf16_v2(x_dev.as_const_f32(), dw.ptr as *const _,
-                                 std::ptr::null(), do_.as_f32(), in_f, out_f, self.stream)
+                                 std::ptr::null(), do_.as_f32(), in_f, out_f, n, self.stream)
         }, "gemv_v2_dev")?;
         Ok(do_)
     }
