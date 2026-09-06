@@ -258,7 +258,7 @@ pub fn is_fp8_eligible(src: &str, layer_idx: Option<usize>, cfg: &Glm53FlashConf
         || src.ends_with(".enorm.weight") || src.ends_with(".hnorm.weight")
         || src.ends_with(".shared_head.norm.weight") { return false; }
     // MoE router: bf16 (+ fp32 activations per moe_router_dtype)
-    if src.contains(".mlp.gate") || src.contains(".mlp.e_score_correction_bias") { return false; }
+    if src.ends_with(".mlp.gate.weight") || src.ends_with(".mlp.e_score_correction_bias") { return false; }
     // MoE routed experts: fp8
     if src.contains(".experts.") { return true; }
     // shared expert: checkpoint-native bf16
@@ -608,10 +608,9 @@ mod tests {
             .iter()
             .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), v| (a.min(*v), b.max(*v)));
         println!(
-            "scale: dtype={:?} shape={:?} min={mn} max={mx} n_bad={}",
-            s.dtype,
-            s.shape.0,
-            s.as_slice().iter().filter(|v| !v.is_finite()).count()
+            "scale: dtype=F32 len={} min={mn} max={mx} n_bad={}",
+            s.len(),
+            s.iter().filter(|v| !v.is_finite()).count()
         );
         assert!(nbad == 0, "expert weight has non-finite values after dequant");
     }
