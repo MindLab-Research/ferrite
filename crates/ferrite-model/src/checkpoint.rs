@@ -127,6 +127,7 @@ fn e4m3_to_f32(b: u8) -> f32 {
 pub struct CheckpointReport {
     pub tensors_loaded: usize,
     pub fp8_dequantized: usize,
+    pub fp8_bypass: usize,
     pub fused_concat: usize,
     pub skipped_unsupported: Vec<String>,
     pub missing: Vec<String>,
@@ -245,7 +246,7 @@ fn load_named(
     index: &HashMap<String, Entry>,
     src: &str,
     rep: &mut CheckpointReport,
-) -> Result<Tensor> {
+) -> Result<(Tensor, Option<crate::weights::Fp8Weight>)> {
     let e = index
         .get(src)
         .ok_or_else(|| FerriteError::Config(format!("ckpt: missing tensor {src}")))?;
@@ -271,11 +272,21 @@ fn load_named(
         }
         rep.fp8_dequantized += 1;
         let data = dequant_block(&w, &s, rows, cols);
-        Ok(Tensor::new(Shape::new(shape), DType::F32, data))
+        // fp8 bypass (device path): raw F8_E4M3 bytes + block scale — the
+        // f32 above stays the golden/host reference, the bypass carries the
+        // NATIVE precision (w = e4m3(raw) * s[r/128][c/128], inline dequant
+        // on device, HALF the bf16-resident HBM traffic).
+        let fp8 = crate::weights::Fp8Weight {
+            rows,
+            cols,
+            data: raw, // the F8 bytes (pre-f32-conversion)
+            scale: s,
+        };
+        Ok((Tensor::new(Shape::new(shape), DType::F32, data), Some(fp8)))
     } else {
         let raw = read_entry(files, e)?;
         let data = to_f32(&raw, e.dtype);
-        Ok(Tensor::new(Shape::new(shape), DType::F32, data))
+        Ok((Tensor::new(Shape::new(shape), DType::F32, data), None))
     }
 }
 
@@ -296,7 +307,7 @@ fn concat_rows(a: &[f32], ra: usize, b: &[f32], rb: usize, cols: usize) -> Vec<f
 pub fn load_hf_checkpoint(
     dir: &Path,
     cfg: &Glm53FlashConfig,
-) -> Result<(Weights, CheckpointReport)> {
+) -> Result<(Weights, crate::weights::Weights8, CheckpointReport)> {
     let (files, index) = scan_headers(dir)?;
     let mut rep = CheckpointReport::default();
     let lm = "model.language_model";
@@ -349,14 +360,14 @@ pub fn load_hf_checkpoint(
 
     // ---- run jobs in parallel (rayon): each job reads + converts its own
     // tensors; FP8 dequant happens per-tensor inside load_named ----
-    let results: Vec<Result<(String, Tensor)>> = jobs
+    let results: Vec<Result<(String, Tensor, Option<crate::weights::Fp8Weight>)>> = jobs
         .into_par_iter()
         .map(|(name, src)| {
             if let Some(base) = src.strip_suffix("__FUSED_QKV__") {
                 let mut r = CheckpointReport::default();
-                let q = load_named(&files, &index, &format!("{base}q_proj.weight"), &mut r)?;
-                let k = load_named(&files, &index, &format!("{base}k_proj.weight"), &mut r)?;
-                let v = load_named(&files, &index, &format!("{base}v_proj.weight"), &mut r)?;
+                let (q, _) = load_named(&files, &index, &format!("{base}q_proj.weight"), &mut r)?;
+                let (k, _) = load_named(&files, &index, &format!("{base}k_proj.weight"), &mut r)?;
+                let (v, _) = load_named(&files, &index, &format!("{base}v_proj.weight"), &mut r)?;
                 let rows = q.shape.0[0] + k.shape.0[0] + v.shape.0[0];
                 let c = q.shape.0[1];
                 let data = concat_rows(
@@ -366,13 +377,15 @@ pub fn load_hf_checkpoint(
                     v.shape.0[0],
                     c,
                 );
-                return Ok((name, Tensor::new(Shape::new(vec![rows, c]), DType::F32, data)));
+                // fp8 bypass for fused-qkv is NOT concatenable per-block (the
+                // per-part 128-block grid breaks at row seams) → bf16 path.
+                return Ok((name, Tensor::new(Shape::new(vec![rows, c]), DType::F32, data), None));
             }
             if let Some(base) = src.strip_suffix("__FUSED_CONV__") {
                 let mut r = CheckpointReport::default();
                 let mut parts: Vec<Tensor> = Vec::new();
                 for b in ["q", "k", "v"] {
-                    let t = load_named(&files, &index, &format!("{base}{b}_conv1d.weight"), &mut r)?;
+                    let (t, _) = load_named(&files, &index, &format!("{base}{b}_conv1d.weight"), &mut r)?;
                     let (c1, c2, c3) = (
                         t.shape.0[0],
                         *t.shape.0.get(1).unwrap_or(&1),
@@ -391,11 +404,11 @@ pub fn load_hf_checkpoint(
                 for p in &parts {
                     data.extend_from_slice(p.as_slice());
                 }
-                return Ok((name, Tensor::new(Shape::new(vec![rows, c]), DType::F32, data)));
+                return Ok((name, Tensor::new(Shape::new(vec![rows, c]), DType::F32, data), None));
             }
             let mut r = CheckpointReport::default();
-            let t = load_named(&files, &index, &src, &mut r)?;
-            Ok((name, t))
+            let (t, fp8) = load_named(&files, &index, &src, &mut r)?;
+            Ok((name, t, fp8))
         })
         .collect();
 
@@ -406,8 +419,9 @@ pub fn load_hf_checkpoint(
         .map(|s| (s.name.clone(), s.shape.0.clone()))
         .collect();
     let mut w: Weights = HashMap::new();
+    let mut w8: crate::weights::Weights8 = HashMap::new();
     for res in results {
-        let (name, t) = res?;
+        let (name, t, fp8) = res?;
         if let Some(expect) = layout.get(&name) {
             if t.shape.0 != *expect {
                 return Err(FerriteError::Config(format!(
@@ -421,9 +435,13 @@ pub fn load_hf_checkpoint(
         } else {
             rep.tensors_loaded += 1;
         }
+        if let Some(f8) = fp8 {
+            rep.fp8_bypass += 1;
+            w8.insert(name.clone(), f8);
+        }
         w.insert(name, t);
     }
-    Ok((w, rep))
+    Ok((w, w8, rep))
 }
 
 #[cfg(test)]
@@ -460,7 +478,7 @@ mod tests {
         }
         let (files, index) = scan_headers(dir).unwrap();
         let mut rep = CheckpointReport::default();
-        let t = load_named(
+        let (t, _fp8) = load_named(
             &files,
             &index,
             "model.language_model.layers.5.mlp.experts.51.down_proj.weight",

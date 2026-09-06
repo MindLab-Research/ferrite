@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 
-use ferrite_model::{AttnKind, Glm53FlashConfig, MlpKind, Weights, build_layer_plans};
+use ferrite_model::{AttnKind, Glm53FlashConfig, MlpKind, Weights, build_layer_plans, Fp8Weight, Weights8};
 use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 
 use crate::Engine;
@@ -37,6 +37,172 @@ use crate::Engine;
 
 /// Slice a weight along dim0 (row split) → rows [start, end).
 /// Handles 1D (A_log/o_norm/dt_bias) and 2D tensors.
+// ---------------------------------------------------------------------------
+// FP8 TP sharding — mirrors shard_weights_tp's classification, but slices the
+// native F8 bytes + 128-block scale instead of dequantized f32. Mirrors must
+// stay bit-consistent with the Tensor sharding above (cross-checked by
+// `shard_weights8_tp`'s shape assertion vs the f32 shard) or draft/verify
+// numerics diverge across ranks.
+// ---------------------------------------------------------------------------
+
+/// Row-split an Fp8Weight [r0, r1). Returns None unless both edges are
+/// 128-aligned (the block-scale grid rows r/128 must not straddle the seam);
+/// caller falls back to the bf16 path on None.
+fn fp8_row(f: &Fp8Weight, r0: usize, r1: usize) -> Option<Fp8Weight> {
+    if r0 % 128 != 0 || r1 % 128 != 0 || r1 < r0 || r1 > f.rows {
+        return None;
+    }
+    let scols = f.cols.div_ceil(128);
+    let s0 = r0 / 128;
+    let s1 = r1 / 128;
+    let mut scale = Vec::with_capacity((s1 - s0) * scols);
+    for sr in s0..s1 {
+        let base = sr * scols;
+        scale.extend_from_slice(&f.scale[base..base + scols]);
+    }
+    Some(Fp8Weight {
+        rows: r1 - r0,
+        cols: f.cols,
+        data: f.data[r0 * f.cols..r1 * f.cols].to_vec(),
+        scale,
+    })
+}
+
+/// Col-split an Fp8Weight [c0, c1) — same 128-alignment contract on cols.
+fn fp8_col(f: &Fp8Weight, c0: usize, c1: usize) -> Option<Fp8Weight> {
+    if c0 % 128 != 0 || c1 % 128 != 0 || c1 < c0 || c1 > f.cols {
+        return None;
+    }
+    let scols = f.cols.div_ceil(128);
+    let t0 = c0 / 128;
+    let t1 = c1 / 128;
+    let nsc = t1 - t0;
+    let mut scale = Vec::with_capacity(f.rows.div_ceil(128) * nsc);
+    for sr in 0..f.rows.div_ceil(128) {
+        let base = sr * scols;
+        scale.extend_from_slice(&f.scale[base + t0..base + t1]);
+    }
+    let mut data = Vec::with_capacity(f.rows * (c1 - c0));
+    for r in 0..f.rows {
+        let base = r * f.cols;
+        data.extend_from_slice(&f.data[base + c0..base + c1]);
+    }
+    Some(Fp8Weight {
+        rows: f.rows,
+        cols: c1 - c0,
+        data,
+        scale,
+    })
+}
+
+/// TP-shard the fp8 bypass set. Classification mirrors shard_weights_tp:
+/// replicated / EP-whole experts / row-split (gate/up, q_b/kv_b, b/g/f_b) /
+/// col-split (down, o_proj, eh_proj). Misaligned seams or non-fp8 names are
+/// simply absent from the result — the engine's w8() lookup misses and the
+/// bf16 path serves that weight (safe fallback, keeps every rank consistent
+/// because the seam alignment is rank-independent for power-of-2 worlds).
+#[allow(clippy::too_many_arguments)]
+pub fn shard_weights8_tp(
+    w8: &Weights8,
+    cfg: &Glm53FlashConfig,
+    rank: usize,
+    world: usize,
+) -> Weights8 {
+    assert!(world >= 1 && rank < world);
+    if world == 1 {
+        return w8.clone();
+    }
+    let h = cfg.hidden_size;
+    let heads = cfg.linear_attn.num_heads;
+    let dk = cfg.linear_attn.head_dim;
+    let proj = heads * dk;
+    let dsa_h = cfg.dsa.num_attention_heads;
+    let nope = cfg.dsa.qk_nope_head_dim;
+    let vd = cfg.dsa.v_head_dim;
+    let (hs, he) = head_range(heads, rank, world);
+    let (dhs, dhe) = head_range(dsa_h, rank, world);
+    let n_exp = cfg.n_routed_experts;
+    let (es, ee) = head_range(n_exp, rank, world);
+    let mut out: Weights8 = HashMap::new();
+    for (name, f) in w8 {
+        // fused qkv/conv1d bypasses were never stored (block seams at the
+        // q|k|v row boundaries) — only plain fp8 tensors reach here.
+        let local: Option<Fp8Weight> = if name == "lm_head.weight" {
+            // vocab-split happens device-side (full + mask) — replicate.
+            Some(f.clone())
+        } else if name == "model.embed_tokens.weight" {
+            Some(f.clone())
+        } else if name.ends_with(".eh_proj.weight") {
+            let cols = f.cols; // 2h
+            fp8_col(f, cols * rank / world, cols * (rank + 1) / world)
+        } else if let Some(layer_str) = layer_of(name) {
+            let layer: usize = layer_str.parse().unwrap_or(0);
+            let plan = build_layer_plans(cfg);
+            let lp = if layer >= plan.len() {
+                &ferrite_model::LayerPlan {
+                    layer_idx: layer,
+                    attn: AttnKind::Dsa,
+                    mlp: MlpKind::Moe,
+                }
+            } else {
+                &plan[layer]
+            };
+            // expert weights: EP-style whole experts per rank
+            if let Some(expert) = name.split(".experts.").nth(1) {
+                let e: usize = expert.split('.').next().unwrap_or("0").parse().unwrap_or(0);
+                if e >= es && e < ee {
+                    Some(f.clone())
+                } else {
+                    None
+                }
+            } else if name.ends_with(".shared_expert.gate_proj.weight")
+                || name.ends_with(".shared_expert.up_proj.weight")
+                || name.ends_with(".gate_proj.weight")
+                || name.ends_with(".up_proj.weight")
+            {
+                fp8_row(f, f.rows * rank / world, f.rows * (rank + 1) / world)
+            } else if name.ends_with(".shared_expert.down_proj.weight")
+                || name.ends_with(".down_proj.weight")
+            {
+                fp8_col(f, f.cols * rank / world, f.cols * (rank + 1) / world)
+            } else {
+                match lp.attn {
+                    AttnKind::Linear => {
+                        if name.ends_with(".b_proj.weight") {
+                            fp8_row(f, hs * dk, he * dk)
+                        } else if name.ends_with(".dt_bias") {
+                            fp8_row(f, hs * dk, he * dk) // 1D — no fp8 in practice
+                        } else if name.ends_with(".f_b_proj.weight") || name.ends_with(".g_b_proj.weight") {
+                            fp8_row(f, hs * dk, he * dk)
+                        } else if name.ends_with(".o_proj.weight") {
+                            fp8_col(f, hs * dk, he * dk)
+                        } else {
+                            Some(f.clone()) // f_a/g_a proj, o_norm, indexer
+                        }
+                    }
+                    AttnKind::Dsa => {
+                        if name.ends_with(".q_b_proj.weight") {
+                            fp8_row(f, dhs * nope, dhe * nope)
+                        } else if name.ends_with(".kv_b_proj.weight") {
+                            fp8_row(f, dhs * (nope + vd), dhe * (nope + vd))
+                        } else if name.ends_with(".o_proj.weight") {
+                            fp8_col(f, dhs * vd, dhe * vd)
+                        } else {
+                            Some(f.clone()) // q_a/kv_a/indexer replicated
+                        }
+                    }
+                }
+            }
+        } else {
+            Some(f.clone()) // model.norm, hc_*, router (mlp.gate) replicated
+        };
+        if let Some(l) = local {
+            out.insert(name.clone(), l);
+        }
+    }
+    out
+}
+
 fn row_split(w: &Tensor, start: usize, end: usize) -> Tensor {
     let dims = &w.shape.0;
     if dims.len() == 1 {
@@ -369,6 +535,17 @@ pub struct TpCluster<B: KernelBackend> {
 }
 
 impl<B: KernelBackend> TpCluster<B> {
+    /// Distribute the fp8 bypass set to every rank (same classification as
+    /// the f32 sharding; block-128-misaligned seams simply drop out of the
+    /// set — those weights stay on the bf16 path on ALL ranks).
+    pub fn set_fp8(&mut self, w8: &Weights8) {
+        let n = self.shards.len();
+        for rank in 0..n {
+            let shard = shard_weights8_tp(w8, &self.full_cfg, rank, n);
+            self.shards[rank].weights8 = shard;
+        }
+    }
+
     /// Build a TP=world cluster from full weights. `mk_backend` constructs
     /// each rank's backend (rank index passed for device selection).
     pub fn new(

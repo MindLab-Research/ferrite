@@ -523,6 +523,7 @@ mod fused_alias_tests {
 /// (w_f32 = e4m3(raw) * s[row/128][col/128] — the checkpoint's own
 /// dequant_block semantics, f32 accumulate). HALF the HBM traffic of the
 /// bf16-resident path (gemv/moe are bandwidth-bound).
+#[derive(Clone, Debug)]
 pub struct Fp8Weight {
     pub rows: usize,
     pub cols: usize,

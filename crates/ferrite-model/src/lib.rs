@@ -17,7 +17,7 @@ pub use checkpoint::{load_hf_checkpoint, CheckpointReport};
 pub use config::{DsaConfig, Glm53FlashConfig, LayerType, LinearAttnConfig, MlpType};
 pub use layer::{build_layer_plans, AttnKind, LayerPlan, MlpKind};
 pub use safetensors::{load_safetensors_dir, load_safetensors_file};
-pub use weights::{apply_fused_aliases, random_weights, weight_layout, WeightLayout, Weights};
+pub use weights::{apply_fused_aliases, random_weights, weight_layout, Fp8Weight, WeightLayout, Weights, Weights8};
 
 /// Model identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

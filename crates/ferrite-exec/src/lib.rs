@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use ferrite_batch::BatchScheduler;
 use ferrite_kernel::KernelBackend;
-use ferrite_model::{build_layer_plans, AttnKind, Glm53FlashConfig, LayerType, MlpKind, Weights};
+use ferrite_model::{build_layer_plans, AttnKind, Glm53FlashConfig, Fp8Weight, LayerType, MlpKind, Weights, Weights8};
 use ferrite_scheduler::{PdafRouter, StaticPlan};
 use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 
@@ -60,6 +60,9 @@ pub struct StepOutcome {
 pub struct Engine<B: KernelBackend> {
     pub cfg: Glm53FlashConfig,
     pub weights: Weights,
+    /// fp8 bypass set (native F8 + 128-block scale) — names matching `weights`;
+    /// a lookup miss here means that weight serves from the bf16 path.
+    pub weights8: Weights8,
     pub backend: B,
     /// This shard's NCCL all-reduce channel (single-process TP; set by
     /// TpCluster when FERRITE_NCCL=1). Device chains all-reduce on-stream
@@ -98,6 +101,7 @@ impl<B: KernelBackend> Engine<B> {
         Engine {
             cfg,
             weights,
+            weights8: HashMap::new(),
             backend,
             nccl: None,
             scheduler,
@@ -135,6 +139,11 @@ impl<B: KernelBackend> Engine<B> {
     pub(crate) fn dsa_dims(&self) -> (usize, usize, usize, usize) {
         let d = &self.cfg.dsa;
         (d.num_attention_heads, d.qk_nope_head_dim, d.v_head_dim, d.index_n_heads * d.index_head_dim)
+    }
+
+    /// fp8 bypass lookup: None → caller falls back to the bf16/f32 path.
+    pub fn w8(&self, name: &str) -> Option<&Fp8Weight> {
+        self.weights8.get(name)
     }
 
     pub(crate) fn w(&self, name: &str) -> Result<&Tensor> {

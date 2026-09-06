@@ -66,7 +66,7 @@ fn main() {
     // ---- weights (FP8 dequant + name mapping; large, ~660 GB f32 in RAM) ----
     println!("[serve] loading checkpoint from {} ...", model_dir.display());
     let t0 = std::time::Instant::now();
-    let (weights, rep) = load_hf_checkpoint(&model_dir, &cfg)
+    let (weights, weights8, rep) = load_hf_checkpoint(&model_dir, &cfg)
         .unwrap_or_else(|e| panic!("load checkpoint: {e}"));
     println!(
         "[serve] loaded {} tensors in {:.1}s (fp8-dequant: {}, fused: {}, skipped: {})",
@@ -104,7 +104,7 @@ fn main() {
     let t1 = std::time::Instant::now();
     let world_tp = if backend == "cuda" { tp } else { 1 };
     let new_tokens: Vec<u32> = match backend.as_str() {
-        "cuda" => run_cuda(cfg, weights, &ids, max_tokens, &stop, &lib, world_tp),
+        "cuda" => run_cuda(cfg, weights, weights8, &ids, max_tokens, &stop, &lib, world_tp),
         _ => run_cpu(cfg, weights, &ids, max_tokens, &stop),
     };
     let dt = t1.elapsed().as_secs_f64();
@@ -175,6 +175,7 @@ fn run_cpu(
 fn run_cuda(
     cfg: Glm53FlashConfig,
     weights: ferrite_model::Weights,
+    weights8: ferrite_model::Weights8,
     ids: &[u32],
     max_tokens: usize,
     stop: &[u32],
@@ -190,6 +191,12 @@ fn run_cuda(
             .unwrap_or_else(|e| panic!("cuda backend rank {rank}: {e}"))
     });
     println!("[serve] cuda TP cluster up: {world} rank(s)");
+
+    // fp8 bypass shards (native F8 bytes + 128-block scale): same TP
+    // classification as the f32 shards; engine w8() lookup misses → bf16 path
+    // (safe per-weight fallback, draft/verify stay in one domain per weight).
+    cluster.set_fp8(&weights8);
+    println!("[serve] fp8 bypass: {} full / {} rank-0 shards", weights8.len(), cluster.shards[0].weights8.len());
 
     // Weights resident on the GPU (TileRT model): upload every shard's
     // full weight set once at startup — bf16 for 2-D matmul weights
