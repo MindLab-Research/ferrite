@@ -996,27 +996,32 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
         }
     }
     __syncthreads();
-    // selection topk
+    // selection topk (warp-shuffle reduce, blockDim-agnostic): scoring was
+    // 32 threads (96 total on the verify chain — 96/4736 cores busy, 144us/
+    // inst O(len)); 256 threads = 8x lanes. Strict > keeps the LOWEST lane /
+    // warp index on ties — same selection as the old 32-thread tree.
     for (int r = 0; r < topk; r++) {
-        __shared__ int bidx[32];
-        __shared__ float bval[32];
+        __shared__ int bidx[8];
+        __shared__ float bval[8];
         int best = -1;
         float bv = -INFINITY;
         for (int j = threadIdx.x; j < t; j += blockDim.x) {
             if (sm[j] > bv) { bv = sm[j]; best = j; }
         }
-        bidx[threadIdx.x] = best;
-        bval[threadIdx.x] = bv;
-        __syncthreads();
         for (int off = 16; off > 0; off >>= 1) {
-            if (threadIdx.x + off < 32 && bval[threadIdx.x + off] > bval[threadIdx.x]) {
-                bval[threadIdx.x] = bval[threadIdx.x + off];
-                bidx[threadIdx.x] = bidx[threadIdx.x + off];
-            }
-            __syncthreads();
+            float ov = __shfl_down_sync(0xffffffff, bv, off);
+            int oi = __shfl_down_sync(0xffffffff, best, off);
+            if (ov > bv) { bv = ov; best = oi; }
         }
+        int warp = threadIdx.x >> 5;
+        if ((threadIdx.x & 31) == 0) { bidx[warp] = best; bval[warp] = bv; }
+        __syncthreads();
         if (threadIdx.x == 0) {
-            int sel = bidx[0];
+            int sel = -1;
+            float sv = -INFINITY;
+            for (int w = 0; w < (blockDim.x >> 5); w++) {
+                if (bval[w] > sv) { sv = bval[w]; sel = bidx[w]; }
+            }
             if (sel >= 0) {
                 idx[(size_t)row * topk + r] = (float)sel;
                 sm[sel] = -INFINITY;
@@ -1033,7 +1038,7 @@ extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
                                             float* idx, int n, int h, int d,
                                             int topk, const int* total_ptr, int kpool_val, int n_fixed,
                                             cudaStream_t s) {
-    dim3 block(32);
+    dim3 block(256);
     dim3 grid(n);
     // smem sized for MAX possible pools (graph-safe: frozen smem with actual
     // npools would overflow as context grows)
