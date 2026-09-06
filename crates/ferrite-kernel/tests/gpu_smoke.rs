@@ -1655,22 +1655,38 @@ fn gemv_fp8_mma_parity_and_speed() {
     dev.enter();
     let mut rnd = 0xfeed_beef_cafe_f00du64;
     let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
-    for &(in_f, out_f) in &[(128usize, 16usize), (4096usize, 512usize), (4096usize, 1536usize)] {
-        // W: random e4m3 + 128-block scales (real quantizer: max/448)
-        let wv: Vec<f32> = (0..out_f * in_f).map(|_| r() * 0.05).collect();
+    for &(in_f, out_f) in &[(128usize, 16usize), (4096usize, 512usize), (4096usize, 1536usize), (4096usize, 154880usize)] {
+        // W: random e4m3 + 128-block scales. Large shapes (lm_head) use random
+        // legal e4m3 bytes + constant scale (constructing 634M fp8_encode
+        // values would take minutes — parity spot-checks the first 8 rows).
+        let big = out_f * in_f > 10_000_000;
         let srows = out_f.div_ceil(128);
         let scols = in_f / 128;
-        let mut scale = vec![0f32; srows * scols];
-        for br in 0..srows { for bc in 0..scols {
-            let mut m = 0f32;
-            let rows_here = 128.min(out_f - br * 128);
-            let cols_here = 128.min(in_f - bc * 128);
-            for i in 0..rows_here { for jj in 0..cols_here { m = m.max(wv[(br * 128 + i) * in_f + bc * 128 + jj].abs()); } }
-            scale[br * scols + bc] = m / 448.0;
-        }}
-        let wbytes: Vec<u8> = (0..out_f * in_f)
-            .map(|i| fp8_encode((wv[i] / scale[(i / in_f) / 128 * scols + (i % in_f) / 128]).clamp(-448.0, 448.0)))
-            .collect();
+        // wv: always built (bench's bf16 baseline needs the f32 source; the
+        // big case skips the e4m3 encode loop but keeps a random f32 W).
+        let wv: Vec<f32> = (0..out_f * in_f).map(|_| r() * 0.05).collect();
+        let wbytes: Vec<u8>;
+        let scale: Vec<f32>;
+        if big {
+            // lm_head-sized (317MB fp8): random legal e4m3 bytes + constant
+            // scale (634M fp8_encode calls would take minutes; parity
+            // spot-checks the first 8 rows only, bench measures raw HBM)
+            wbytes = (0..out_f * in_f).map(|i| 0x10 | ((i as u32).wrapping_mul(2654435761) >> 25) as u8 & 0x6f).collect();
+            scale = vec![0.003f32; srows * scols];
+        } else {
+            let mut sc = vec![0f32; srows * scols];
+            for br in 0..srows { for bc in 0..scols {
+                let mut m = 0f32;
+                let rows_here = 128.min(out_f - br * 128);
+                let cols_here = 128.min(in_f - bc * 128);
+                for i in 0..rows_here { for jj in 0..cols_here { m = m.max(wv[(br * 128 + i) * in_f + bc * 128 + jj].abs()); } }
+                sc[br * scols + bc] = m / 448.0;
+            }}
+            scale = sc;
+            wbytes = (0..out_f * in_f)
+                .map(|i| fp8_encode((wv[i] / scale[(i / in_f) / 128 * scols + (i % in_f) / 128]).clamp(-448.0, 448.0)))
+                .collect();
+        }
         // x: f32 (the kernel quantizes in-kernel — golden must replicate).
         // e4m3-gridpoint construction: x[k] = e4m3_val * 2^e (exact in f32 —
         // x*inv returns the e4m3 value bit-exactly) — quantization is lossless,
@@ -1698,7 +1714,9 @@ fn gemv_fp8_mma_parity_and_speed() {
         let x_inv = 1.0f32 / x_scale;
         let xq: Vec<u8> = x.iter().map(|&v| fp8_encode((v * x_inv).clamp(-448.0, 448.0))).collect();
         let mut golden = vec![0f32; out_f];
-        for m in 0..out_f {
+        // big case: full 634M-dot golden would take minutes — spot-check 8 rows
+        let m_check = if big { 8.min(out_f) } else { out_f };
+        for m in 0..m_check {
             let ws_row = (m / 128) * scols;
             let mut acc = 0f64;
             for k in 0..in_f {
@@ -1710,7 +1728,7 @@ fn gemv_fp8_mma_parity_and_speed() {
         // parity: W8A8 = double quantization (W + x) — relative tolerance
         let mut maxd = 0f32;
         let mut rel = 0f32;
-        for m in 0..out_f {
+        for m in 0..m_check {
             let d = (got[m] - golden[m]).abs();
             maxd = maxd.max(d);
             rel = rel.max(d / golden[m].abs().max(1e-6));
