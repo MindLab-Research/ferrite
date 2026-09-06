@@ -788,16 +788,20 @@ impl<B: KernelBackend> TpCluster<B> {
                 };
                 let last_pin = last_pin as *mut f32;
                 let table = table as *const f32;
+                let gd2 = format!("mega_d2_{seq}");
                 if need_capture {
-                    // CAPTURE (first draft step): record the whole chain.
-                    // capture_lock serializes the 4 ranks' record-mode NCCL
-                    // enqueues (the mega-graph pattern). The record pass
-                    // host-advances the DSA family +2 (one per forward) —
-                    // the POST-pass rollback undoes it so t_count matches
-                    // the real cache (NO pre-pass rollback: there is no
-                    // dry-run drift here; rolling back first would shift the
-                    // family cache by -2 and corrupt d1/d2 quality — the
-                    // observed accept 2.37→1.99 regression).
+                    // CAPTURE (first draft step): TWO graphs (mega_d1 /
+                    // mega_d2) — the DSA pinned t0 must INCREMENT between the
+                    // forward passes (host chain: fwd#1 appends at X, advance
+                    // (1), fwd#2 appends at X+1). A single replayed graph
+                    // reads the SAME pinned t0 twice (d2's KV append
+                    // overwrote d1's slot; total over-read the cache) — the
+                    // accept 2.38→2.02 root cause. Replaying the halves
+                    // separately with an advance(1) between them restores
+                    // the host-chain semantics; each half is still one
+                    // launch (gather→forward→argmax).
+                    // Record passes host-advance the DSA family +1 each —
+                    // post-pass rollbacks undo them.
                     let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
                     {
                         let cuda = s
@@ -815,6 +819,15 @@ impl<B: KernelBackend> TpCluster<B> {
                             .backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        cuda.graph_capture_end(&gd);
+                        cuda.dsa_host_rollback(seq, mtp_family, 1);
+                    }
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        cuda.graph_capture_begin();
                         cuda.embed_gather_dev(table, d1_id.as_const_f32(), emb_d1.as_f32(), hidden)?;
                     }
                     mtp_forward(s, seq, emb_d1, h_d1, None, Some(d2_id))?;
@@ -823,22 +836,25 @@ impl<B: KernelBackend> TpCluster<B> {
                             .backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                        cuda.graph_capture_end(&gd);
-                        cuda.dsa_host_rollback(seq, mtp_family, 2);
+                        cuda.graph_capture_end(&gd2);
+                        cuda.dsa_host_rollback(seq, mtp_family, 1);
                     }
                 }
-                // STEADY: pinned zero-copy last_id write, DSA family advance
-                // (+2: d1/d2 appends — the graph's kernels read pinned t0),
-                // ONE graph replay, single D2H for (d1, d2).
+                // STEADY: pinned zero-copy last_id write; advance(1) →
+                // replay(mega_d1) → advance(1) → replay(mega_d2) → single D2H.
                 unsafe { *last_pin = last as f32; }
                 {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                    cuda.dsa_host_advance(seq, mtp_family, 2);
+                    cuda.dsa_host_advance(seq, mtp_family, 1);
                     if !cuda.graph_replay(&gd) {
-                        return Err(FerriteError::InvalidArg(format!("mega_d graph {gd} missing")));
+                        return Err(FerriteError::InvalidArg(format!("mega_d1 graph {gd} missing")));
+                    }
+                    cuda.dsa_host_advance(seq, mtp_family, 1);
+                    if !cuda.graph_replay(&gd2) {
+                        return Err(FerriteError::InvalidArg(format!("mega_d2 graph {gd2} missing")));
                     }
                 }
                 let (dv1, dv2) = {
