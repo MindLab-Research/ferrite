@@ -3329,12 +3329,12 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         int k = lane * 16;
         for (; k + 15 < in_f; k += 32 * 16) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
-            const __nv_fp8_e4m3* w8 = reinterpret_cast<const __nv_fp8_e4m3*>(&wv);
+            const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
             float sc = srow[k >> 7];
             const float* xk = xr + k;
             #pragma unroll
             for (int e = 0; e < 16; e++) {
-                acc += (__half2float(__nv_cvt_fp8_to_halfraw(w8[e].x, __NV_E4M3)) * sc) * xk[e];
+                acc += (__half2float(__nv_cvt_fp8_to_halfraw(w8[e], __NV_E4M3)) * sc) * xk[e];
             }
         }
         for (; k < in_f; k++) {
