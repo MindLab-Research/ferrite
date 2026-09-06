@@ -1493,6 +1493,16 @@ fn moe_fused_fp8_parity_and_speed() {
     };
     let xs = x_t.as_slice();
     let silu = |g: f32| g / (1.0 + (-g).exp());
+    // W8A8 act semantics: the mma kernel e4m3-quantizes x per-token
+    // (absmax/448, in-kernel) — the golden's gate/up dots consume
+    // e4m3(x·inv)·x_scale (fp8 round-trip), NOT the raw f32 x. Down stays
+    // f32 act (the kernel outputs f32 act for the dequant down path).
+    let x_amax = xs.iter().fold(0f32, |a, v| a.max(v.abs()));
+    let x_scale = x_amax / 448.0;
+    let x_inv = 1.0f32 / x_scale;
+    let xq: Vec<f32> = xs.iter()
+        .map(|&v| e4m3_decode(fp8_encode((v * x_inv).clamp(-448.0, 448.0))) * x_scale)
+        .collect();
     let logits: Vec<f32> = (0..e_total).map(|j| xs.iter().zip(gate_w[j * hidden..].iter()).map(|(a, b)| a * b).sum()).collect();
     let scores: Vec<f32> = logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
     let choice: Vec<f32> = scores.iter().zip(bias.iter()).map(|(s, b)| s + b).collect();
@@ -1508,8 +1518,8 @@ fn moe_fused_fp8_parity_and_speed() {
         let e = eid - expert_start;
         let mut act = vec![0f32; inter];
         for i in 0..inter {
-            let g = f8dot(&eg_b[e].0, &eg_b[e].1, hidden, xs, i).min(limit);
-            let uu = f8dot(&eu_b[e].0, &eu_b[e].1, hidden, xs, i).max(-limit).min(limit);
+            let g = f8dot(&eg_b[e].0, &eg_b[e].1, hidden, &xq, i).min(limit);
+            let uu = f8dot(&eu_b[e].0, &eu_b[e].1, hidden, &xq, i).max(-limit).min(limit);
             act[i] = silu(g) * uu;
         }
         for h in 0..hidden {
@@ -1519,8 +1529,8 @@ fn moe_fused_fp8_parity_and_speed() {
     {
         let mut act = vec![0f32; inter_s];
         for i in 0..inter_s {
-            let g = f8dot(&sgb, &sgs, hidden, xs, i).min(limit);
-            let uu = f8dot(&sub, &sus, hidden, xs, i).max(-limit).min(limit);
+            let g = f8dot(&sgb, &sgs, hidden, &xq, i).min(limit);
+            let uu = f8dot(&sub, &sus, hidden, &xq, i).max(-limit).min(limit);
             act[i] = silu(g) * uu;
         }
         for h in 0..hidden {
