@@ -52,6 +52,7 @@ extern "C" {
                            scale: *const f32, bias: *const f32, out: *mut f32,
                            in_f: i32, out_f: i32, nrows: i32,
                            srows: i32, scols: i32, s: CuStream) -> i32;
+    fn ferrite_fp8_mma_probe(A: *const u8, B: *const u8, C: *mut f32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
@@ -827,6 +828,17 @@ impl CudaBackend {
     /// capture/replay uses it too).
     pub fn stream(&self) -> CuStream {
         self.stream
+    }
+
+    /// fp8 mma layout probe (W8A8 tensor-core feasibility): drives the raw
+    /// mma.sync...e4m3 fragment layout experiment. `a`/`b` hold packed fp8
+    /// bytes (as f32 words), `c` receives the f32 mma result.
+    pub fn fp8_mma_probe_dev(&self, a: &DevBuf, b: &DevBuf, c: &mut DevBuf) -> Result<()> {
+        self.enter();
+        ck(unsafe {
+            ferrite_fp8_mma_probe(a.as_f32() as *const u8, b.as_f32() as *const u8,
+                                  c.as_f32(), self.stream)
+        }, "fp8_mma_probe")
     }
 
     /// Device-resident matmul: x already on device, w uploaded here (the

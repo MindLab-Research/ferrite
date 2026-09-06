@@ -5,6 +5,7 @@
 
 use ferrite_kernel::{CpuBackend, CudaBackend, KernelBackend};
 use ferrite_types::{DType, Shape, Tensor};
+use ferrite_kernel::cuda::DevBuf;
 
 fn so_path() -> String {
     std::env::var("FERRITE_KERNEL_SO").unwrap_or_else(|_| {
@@ -1586,3 +1587,51 @@ fn fp8_encode(x: f32) -> u8 {
     sign | (((e_b as u8) & 0xF) << 3) | ((m as u8) & 7)
 }
 
+
+/// fp8 mma layout probe: drive sm_103a's mma.sync...e4m3 (m16n8k16) through
+/// ferrite_fp8_mma_probe and verify the (guessed) A/B fragment layout against a
+/// CPU golden. A[i][k]=e4m3(i*16+k), B[k][n]=e4m3(k*8+n+1) — mismatch signatures
+/// reveal the correct (row,k)→thread mapping for the W8A8 rewrite.
+#[test]
+fn fp8_mma_layout_probe() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    // A [16,16] e4m3 bytes (row-major), B [16,8] e4m3 bytes (k-major / n=8)
+    let mut A = vec![0u8; 16 * 16];
+    let mut B = vec![0u8; 16 * 8];
+    for i in 0..16 { for k in 0..16 { A[i * 16 + k] = fp8_encode((i * 16 + k) as f32 / 448.0); } }
+    for k in 0..16 { for n in 0..8 { B[k * 8 + n] = fp8_encode((k * 8 + n + 1) as f32 / 448.0); } }
+    let mut C = vec![0f32; 16 * 8];
+    // Pack the u8 byte arrays into f32 words (4 bytes LE per f32) so they ride
+    // through DevBuf; the probe kernel reads them as raw bytes back.
+    let pack = |bytes: &[u8]| -> Vec<f32> {
+        (0..bytes.len() / 4).map(|i| {
+            let b0 = bytes[i * 4] as u32; let b1 = (bytes[i * 4 + 1] as u32) << 8;
+            let b2 = (bytes[i * 4 + 2] as u32) << 16; let b3 = (bytes[i * 4 + 3] as u32) << 24;
+            f32::from_bits(b0 | b1 | b2 | b3)
+        }).collect()
+    };
+    let ab = DevBuf::alloc(dev.dev(), dev.stream(), (16 * 16 + 3) / 4).unwrap();
+    ab.upload(&pack(&A)).unwrap();
+    let bb = DevBuf::alloc(dev.dev(), dev.stream(), (16 * 8 + 3) / 4).unwrap();
+    bb.upload(&pack(&B)).unwrap();
+    let mut cb = DevBuf::alloc(dev.dev(), dev.stream(), 16 * 8).unwrap();
+    dev.fp8_mma_probe_dev(&ab, &bb, &mut cb).expect("fp8 mma probe");
+    dev.sync().unwrap();
+    cb.download(&mut C).unwrap();
+    // CPU golden: C[i][n] = Σ_k e4m3(A[i][k]) * e4m3(B[k][n])
+    let mut gold = vec![0f32; 16 * 8];
+    for i in 0..16 { for n in 0..8 {
+        let mut acc = 0f64;
+        for k in 0..16 { acc += (e4m3_decode(A[i * 16 + k]) as f64) * (e4m3_decode(B[k * 8 + n]) as f64); }
+        gold[i * 8 + n] = acc as f32;
+    }}
+    let mut maxd = 0f32; let mut worst = (0usize, 0usize);
+    for i in 0..16 { for n in 0..8 {
+        let d = (C[i * 8 + n] - gold[i * 8 + n]).abs();
+        if d > maxd { maxd = d; worst = (i, n); }
+    }}
+    eprintln!("[fp8-mma] max_diff={maxd:.4e} worst=({},{}) gpu={:.4} gold={:.4}", worst.0, worst.1, C[worst.0 * 8 + worst.1], gold[worst.0 * 8 + worst.1]);
+    eprintln!("[fp8-mma] C[0]={:.4} C[1]={:.4} C[2]={:.4} (layout check)", C[0], C[1], C[2]);
+    assert!(maxd < 1e-4, "fp8 mma fragment layout wrong: max_diff {maxd:.3e} at ({},{})", worst.0, worst.1);
+}
