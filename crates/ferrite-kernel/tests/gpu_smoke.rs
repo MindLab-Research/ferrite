@@ -1558,8 +1558,9 @@ fn moe_fused_fp8_parity_and_speed() {
     // ABSOLUTE difference.
     assert!(maxd < 3e-4, "moe fp8 parity abs {maxd:.2e} too large (rel {rel:.2e})");
 
-    // A/B speed: fp8 (registered, this dev) vs bf16 (unregistered dev2)
-    let dev2 = CudaBackend::with_device(&so_path(), 1).expect("open cuda dev 1");
+    // A/B speed: fp8 (registered, this dev) vs bf16 (unregistered dev — SAME
+    // visible device: CI harnesses expose a single GPU)
+    let dev2 = CudaBackend::with_device(&so_path(), 0).expect("cuda bench");
     dev2.enter();
     let dx2 = DevBuf::alloc(dev2.dev(), dev2.stream(), hidden).unwrap();
     dx2.upload(x_t.as_slice()).unwrap();
