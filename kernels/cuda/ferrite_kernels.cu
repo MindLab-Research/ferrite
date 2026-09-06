@@ -2533,12 +2533,16 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     }
     __syncthreads();
     // ---- 3. swiglu epilogue: act[r] = silu(min(g, limit)) * clamp(u, ±limit) ----
+    // g/u are e4m3(W)·w_scale·e4m3(x/x_s) dots — scale by x_s (the per-token
+    // quant scale) before the nonlinearity (v1 gemv epilogue semantics).
     if (warp == 0 && lane < 16) {
         float g = 0.f, u = 0.f;
         for (int i = 0; i < 8; i++) {
             g += sgacc[i * 16 + lane];
             u += suacc[i * 16 + lane];
         }
+        g *= sxs[0];
+        u *= sxs[0];
         g = fminf(g, limit);
         u = fminf(fmaxf(u, -limit), limit);
         const int r = m0 + lane;
