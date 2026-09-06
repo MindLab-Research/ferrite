@@ -1572,13 +1572,13 @@ fn moe_fused_fp8_parity_and_speed() {
 }
 
 /// e4m3 encode (f32 → F8_E4M3 bytes, bias-7, 3-bit mantissa, ±448 clamp)
-/// — inverse of e4m3_decode (verified 0-error against __nv_cvt_fp8_to_halfraw).
+/// — inverse of e4m3_decode; round-to-nearest-EVEN (matches __nv_cvt_float_to_fp8).
 fn fp8_encode(x: f32) -> u8 {
     let sign = if x < 0.0 { 0x80u8 } else { 0 };
     let a = x.abs();
     if a == 0.0 { return sign; }
     let e_b = (a.log2().floor() as i32 + 7).min(15);
-    let mut m = (a / 2f32.powi(e_b - 7) * 8.0).round() as i32;
+    let mut m = (a / 2f32.powi(e_b - 7) * 8.0).round_ties_even() as i32;
     if m > 8 { m = 8; } // rounding can hit 8 → carries to next exp
     if m == 8 {
         let e2 = (e_b + 1).min(15);
