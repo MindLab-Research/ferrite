@@ -53,6 +53,10 @@ extern "C" {
                            in_f: i32, out_f: i32, nrows: i32,
                            srows: i32, scols: i32, s: CuStream) -> i32;
     fn ferrite_fp8_mma_probe(A: *const u8, B: *const u8, C: *mut f32, s: CuStream) -> i32;
+    fn ferrite_fp8_quant(x: *const f32, xq: *mut u8, xs: *mut f32, in_f: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_fp8_mma_v2(xq: *const u8, xs: *const f32, w: *const std::ffi::c_void,
+                                w_scale: *const f32, out: *mut f32, in_f: i32, out_f: i32,
+                                scols: i32, s: CuStream) -> i32;
     fn ferrite_gemv_fp8_mma(x: *const f32, w: *const std::ffi::c_void, w_scale: *const f32,
                             out: *mut f32, in_f: i32, out_f: i32,
                             srows: i32, scols: i32, s: CuStream) -> i32;
@@ -866,21 +870,26 @@ impl CudaBackend {
         // prefill speed here).
         if let Some(f8) = self.fp8_lookup(w) {
             // W8A8 tensor-core path (n=1 decode, GLM-aligned shapes): the
-            // mma.sync m16n8k32 e4m3 gemv — activations quantized in-kernel
-            // (per-token absmax/448), e4m3 x e4m3 multiplied directly on the
-            // tensor core (NO per-element dequant — the W8A16 attempt's cvt
-            // overhead offset the HBM savings: 0.96x vs bf16). Misaligned
-            // shapes / n>1 fall back to the W8A16 gemv below (kept).
+            // mma.sync m16n8k32 e4m3 gemv. v2 SPLIT (sglang per_token_group_quant
+            // pattern): quantize x ONCE in a standalone kernel (v1 re-quantized
+            // inside EVERY block — 32x for 512x4096, the small-matrix 0.60x
+            // waste), then the mma kernel reads the e4m3 xq from global (L2).
+            // Misaligned shapes / n>1 fall back to the W8A16 gemv below (kept).
             if n == 1 && in_f % 128 == 0 && out_f % 16 == 0 && f8.scols == (in_f as i32 + 127) / 128 {
+                // xq/xs pooled buffers: (in_f+3)/4 f32 words = in_f bytes
+                let xq = DevBuf::alloc(self.dev, self.stream, (in_f as usize + 3) / 4)?;
+                let xs = DevBuf::alloc(self.dev, self.stream, 1)?;
                 let do_ = DevBuf::alloc(self.dev, self.stream, out_f as usize)?;
-                let r = unsafe {
-                    ferrite_gemv_fp8_mma(x_dev.as_const_f32(), f8.w, f8.scale as *const f32,
-                                         do_.as_f32(), in_f, out_f, f8.srows, f8.scols, self.stream)
-                };
-                if r == 0 {
-                    return Ok(do_);
+                let rq = unsafe { ferrite_fp8_quant(x_dev.as_const_f32(), xq.as_f32() as *mut u8, xs.as_f32(), in_f, self.stream) };
+                if rq == 0 {
+                    let r2 = unsafe { ferrite_gemv_fp8_mma_v2(xq.as_f32() as *const u8, xs.as_const_f32(),
+                                                              f8.w, f8.scale as *const f32,
+                                                              do_.as_f32(), in_f, out_f, f8.scols, self.stream) };
+                    if r2 == 0 {
+                        return Ok(do_);
+                    }
                 }
-                // cudaErrorNotSupported (unaligned): fall through to W8A16
+                // fall through to W8A16 on failure
             }
             let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
             ck(unsafe {

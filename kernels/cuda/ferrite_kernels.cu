@@ -3793,6 +3793,111 @@ __global__ void gemv_fp8_mma_kernel(
     }
 }
 
+// v2 (split, sglang per_token_group_quant pattern): quantize ONCE per call in
+// a standalone kernel, then the mma kernel reads the e4m3 xq from GLOBAL
+// memory (L2) — v1 re-quantized inside EVERY block (32x for 512x4096, the
+// dominant waste behind small-matrix 0.60x vs bf16). The layer-level v3
+// hoists this further: quantize x ONCE per layer (it feeds 6 same-x gemvs).
+__global__ void fp8_quant_kernel(
+    const float* __restrict__ x,   // [in_f] f32 activations
+    unsigned char* __restrict__ xq, // [in_f] e4m3 out
+    float* __restrict__ xs,        // [1] per-token scale out
+    int in_f)
+{
+    __shared__ float sred[256];
+    float amax = 1e-9f;
+    for (int k = threadIdx.x; k < in_f; k += 256)
+        amax = fmaxf(amax, fabsf(x[k]));
+    sred[threadIdx.x] = amax;
+    __syncthreads();
+    for (int off = 128; off > 0; off >>= 1) {
+        if (threadIdx.x < off)
+            sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) xs[0] = sred[0] / 448.0f;
+    __syncthreads();
+    const float inv = 1.0f / xs[0];
+    for (int k = threadIdx.x; k < in_f; k += 256) {
+        const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
+        xq[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+extern "C" cudaError_t ferrite_fp8_quant(
+    const float* x, unsigned char* xq, float* xs, int in_f, cudaStream_t s)
+{
+    fp8_quant_kernel<<<1, 256, 0, s>>>(x, xq, xs, in_f);
+    return cudaGetLastError();
+}
+
+// v2 mma body: pre-quantized xq from GLOBAL (L2), no smem staging, no
+// per-block quant prologue — smem holds only the [8][16] warp partials.
+__global__ void gemv_fp8_mma_v2_kernel(
+    const unsigned char* __restrict__ xq, // [in_f] e4m3 (pre-quantized)
+    const float* __restrict__ xs,         // [1] per-token scale
+    const unsigned char* __restrict__ w,  // [out_f, in_f] e4m3 row-major
+    const float* __restrict__ w_scale,    // [srows][scols]
+    float* __restrict__ y,                // [out_f]
+    int in_f, int out_f, int scols)
+{
+    const int m0 = blockIdx.x * 16;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = lane >> 2, c0 = (lane & 3) * 4;
+    __shared__ float sacc[8][16];
+    const int nblk = (in_f + 127) >> 7;
+    const int bseg = (nblk + 7) / 8;
+    const int kW = warp;
+    const int k0 = kW * bseg * 128;
+    const int k1 = min(k0 + bseg * 128, in_f);
+    const int ws_row = (m0 / 128) * scols;
+    float acc0 = 0.f, acc1 = 0.f;
+    for (int kb = k0; kb < k1; kb += 128) {
+        float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+        for (int kk = kb; kk < kb + 128; kk += 32) {
+            if (kk + 32 > k1) break;
+            unsigned a[4];
+            a[0] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0);
+            a[1] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0);
+            a[2] = *(const unsigned*)(w + (size_t)(m0 + r0) * in_f + kk + c0 + 16);
+            a[3] = *(const unsigned*)(w + (size_t)(m0 + r0 + 8) * in_f + kk + c0 + 16);
+            unsigned b[2];
+            b[0] = *(const unsigned*)(xq + kk + c0);       // global (L2) read
+            b[1] = *(const unsigned*)(xq + kk + c0 + 16);
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+                  "r"(b[0]), "r"(b[1]));
+        }
+        const float wsc = w_scale[ws_row + (kb >> 7)];
+        if ((lane & 3) == 0) { acc0 += d0 * wsc; acc1 += d2 * wsc; }
+    }
+    if ((lane & 3) == 0) {
+        sacc[warp * 16 + r0] = acc0;
+        sacc[warp * 16 + r0 + 8] = acc1;
+    }
+    __syncthreads();
+    if (warp == 0 && lane < 16) {
+        float t = 0.f;
+        for (int i = 0; i < 8; i++) t += sacc[i * 16 + lane];
+        y[m0 + lane] = t * xs[0];
+    }
+}
+
+extern "C" cudaError_t ferrite_gemv_fp8_mma_v2(
+    const unsigned char* xq, const float* xs,
+    const void* w, const float* w_scale,
+    float* out, int in_f, int out_f, int scols, cudaStream_t s)
+{
+    if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
+    dim3 grid(out_f / 16);
+    gemv_fp8_mma_v2_kernel<<<grid, 256, 0, s>>>(
+        xq, xs, (const unsigned char*)w, w_scale, out, in_f, out_f, scols);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_gemv_fp8_mma(
     const float* x, const void* w, const float* w_scale,
     float* out, int in_f, int out_f, int srows, int scols, cudaStream_t s)
