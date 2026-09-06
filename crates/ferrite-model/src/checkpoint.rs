@@ -128,6 +128,7 @@ pub struct CheckpointReport {
     pub tensors_loaded: usize,
     pub fp8_dequantized: usize,
     pub fp8_bypass: usize,
+    pub fp8_placeholder: usize,
     pub fused_concat: usize,
     pub skipped_unsupported: Vec<String>,
     pub missing: Vec<String>,
@@ -246,6 +247,7 @@ fn load_named(
     index: &HashMap<String, Entry>,
     src: &str,
     rep: &mut CheckpointReport,
+    keep_f32: bool,
 ) -> Result<(Tensor, Option<crate::weights::Fp8Weight>)> {
     let e = index
         .get(src)
@@ -254,7 +256,6 @@ fn load_named(
     if let Some(sc) = index.get(&format!("{src}_scale_inv")) {
         // FP8 block dequant (weight → {src}.weight_scale_inv; src ends with ".weight")
         let raw = read_entry(files, e)?;
-        let w = to_f32(&raw, RawDType::Fp8E4m3);
         let sraw = read_entry(files, sc)?;
         if sc.dtype != RawDType::F32 {
             return Err(FerriteError::Config(format!("ckpt: {src}_scale_inv not F32")));
@@ -270,19 +271,32 @@ fn load_named(
                 expect
             )));
         }
-        rep.fp8_dequantized += 1;
-        let data = dequant_block(&w, &s, rows, cols);
-        // fp8 bypass (device path): raw F8_E4M3 bytes + block scale — the
-        // f32 above stays the golden/host reference, the bypass carries the
-        // NATIVE precision (w = e4m3(raw) * s[r/128][c/128], inline dequant
-        // on device, HALF the bf16-resident HBM traffic).
+        // Single-store: fp8-served weights never materialize the dequantized
+        // f32 (the checkpoint's native precision IS the fp8+scales — the bf16
+        // path re-quantized it anyway). The placeholder keeps a unique heap
+        // pointer (fp8_map keys on (ptr, numel)) and the real shape (dims are
+        // read by shard/device-chain code); its data is NEVER touched on the
+        // cuda path (fp8 hit ⇒ bf16 upload skipped, matmul serves fp8).
+        // keep_f32 = consumers that read the f32 directly (fused-MoE bf16
+        // pointer tables, hc dev_weight f32, embed lookup, fused-qkv concat).
         let fp8 = crate::weights::Fp8Weight {
             rows,
             cols,
             data: raw, // the F8 bytes (pre-f32-conversion)
             scale: s,
         };
-        Ok((Tensor::new(Shape::new(shape), DType::F32, data), Some(fp8)))
+        if keep_f32 {
+            rep.fp8_dequantized += 1;
+            let w = to_f32(&fp8.data, RawDType::Fp8E4m3);
+            let sraw = read_entry(files, sc)?;
+            let s = to_f32(&sraw, RawDType::F32);
+            let data = dequant_block(&w, &s, rows, cols);
+            Ok((Tensor::new(Shape::new(shape), DType::F32, data), Some(fp8)))
+        } else {
+            rep.fp8_placeholder += 1;
+            let placeholder = Tensor::new(Shape::new(shape), DType::F32, vec![0f32; 4]);
+            Ok((placeholder, Some(fp8)))
+        }
     } else {
         let raw = read_entry(files, e)?;
         let data = to_f32(&raw, e.dtype);
@@ -365,9 +379,9 @@ pub fn load_hf_checkpoint(
         .map(|(name, src)| {
             if let Some(base) = src.strip_suffix("__FUSED_QKV__") {
                 let mut r = CheckpointReport::default();
-                let (q, _) = load_named(&files, &index, &format!("{base}q_proj.weight"), &mut r)?;
-                let (k, _) = load_named(&files, &index, &format!("{base}k_proj.weight"), &mut r)?;
-                let (v, _) = load_named(&files, &index, &format!("{base}v_proj.weight"), &mut r)?;
+                let (q, _) = load_named(&files, &index, &format!("{base}q_proj.weight"), &mut r, true)?;
+                let (k, _) = load_named(&files, &index, &format!("{base}k_proj.weight"), &mut r, true)?;
+                let (v, _) = load_named(&files, &index, &format!("{base}v_proj.weight"), &mut r, true)?;
                 let rows = q.shape.0[0] + k.shape.0[0] + v.shape.0[0];
                 let c = q.shape.0[1];
                 let data = concat_rows(
@@ -385,7 +399,7 @@ pub fn load_hf_checkpoint(
                 let mut r = CheckpointReport::default();
                 let mut parts: Vec<Tensor> = Vec::new();
                 for b in ["q", "k", "v"] {
-                    let (t, _) = load_named(&files, &index, &format!("{base}{b}_conv1d.weight"), &mut r)?;
+                    let (t, _) = load_named(&files, &index, &format!("{base}{b}_conv1d.weight"), &mut r, true)?;
                     let (c1, c2, c3) = (
                         t.shape.0[0],
                         *t.shape.0.get(1).unwrap_or(&1),
@@ -407,7 +421,21 @@ pub fn load_hf_checkpoint(
                 return Ok((name, Tensor::new(Shape::new(vec![rows, c]), DType::F32, data), None));
             }
             let mut r = CheckpointReport::default();
-            let (t, fp8) = load_named(&files, &index, &src, &mut r)?;
+            // Single-store policy: only weights whose f32 is read DIRECTLY
+            // (bf16 pointer tables for fused MoE, hc dev_weight f32, embed
+            // host lookup, fused-qkv concat) keep the dequantized f32; the
+            // rest serve from the fp8 bypass and get a 4-element placeholder
+            // (unique ptr for the fp8_map key, real shape for dim readers).
+            let keep_f32 = name.contains(".experts.")
+                || name.contains(".shared_expert")
+                || name == "model.embed_tokens.weight"
+                || name.ends_with("hc_attn_base")
+                || name.ends_with("hc_attn_scale")
+                || name.ends_with("hc_attn_fn")
+                || name.ends_with("hc_ffn_base")
+                || name.ends_with("hc_ffn_scale")
+                || name.ends_with("hc_ffn_fn");
+            let (t, fp8) = load_named(&files, &index, &src, &mut r, keep_f32)?;
             Ok((name, t, fp8))
         })
         .collect();
@@ -483,6 +511,7 @@ mod tests {
             &index,
             "model.language_model.layers.5.mlp.experts.51.down_proj.weight",
             &mut rep,
+            true,
         )
         .unwrap();
         let sl = t.as_slice();
@@ -507,6 +536,7 @@ mod tests {
             &index,
             "model.language_model.layers.5.mlp.experts.51.down_proj.weight_scale_inv",
             &mut rep,
+            true,
         )
         .unwrap();
         // dump the raw entry the Rust scanner resolved, to compare with python

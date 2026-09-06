@@ -724,6 +724,11 @@ impl CudaBackend {
         if t.numel() == 0 {
             return Ok(()); // TP shard placeholder (empty expert slice)
         }
+        if t.as_slice().len() < t.numel() {
+            // fp8 single-store placeholder: no bf16 to upload — the fp8 map
+            // serves it (register_fp8 uploaded the F8 bytes at set_fp8).
+            return Ok(());
+        }
         // cudaSetDevice is THREAD-LOCAL: a TP cluster drives N backends from
         // one thread, so every entry point must re-bind before cudaMalloc —
         // without this, ALL ranks' weights malloc onto whatever device the
@@ -825,6 +830,16 @@ impl CudaBackend {
     /// device. Building block for fused op chains (expert FFN).
     /// Weights are resident in bf16 (dev_weight_bf16).
     pub fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
+        // fp8 single-store guard: a placeholder Tensor (data.len() < numel)
+        // with NO fp8 registration must fail loudly — its bf16 upload would
+        // read 4 elements as the full weight (garbage), and the fp8 map is
+        // the only real store (register failed or shard seam dropped it).
+        if w.as_slice().len() < w.numel() && self.fp8_lookup(w).is_none() {
+            return Err(FerriteError::InvalidArg(format!(
+                "matmul_dev: fp8 placeholder weight ({} elems data vs {} numel) has no fp8 registration",
+                w.as_slice().len(), w.numel()
+            )));
+        }
         // fp8 bypass: registered (ptr,numel) → native-precision F8 GEMV
         // (half the bf16 HBM bytes). Serves ANY n (prefill n>3 included — the
         // gemv loop covers it; slower than a tiled fp8 GEMM but the numeric
