@@ -3568,7 +3568,17 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         ptr: argmax_ptr, len: 1,
         class: 1u32, dev, stream, stage: std::ptr::null_mut(),
     };
-    mtp_forward_dev_argmax(s, seq, &emb, &hprev, h_out.as_ref(), &mut arg)
+    let result = mtp_forward_dev_argmax(s, seq, &emb, &hprev, h_out.as_ref(), &mut arg);
+    // CRITICAL: these DevBuf views are raw-pointer ALIASES into MtpState's
+    // fixed buffers — they do NOT own the memory. The Drop impl returns
+    // (ptr, stage) to the buf_pool — with stage=null, the pool's free()
+    // calls cudaFreeHost(null) → SEGV. forget() them (the originals are
+    // owned by MtpState and live for the seq's lifetime).
+    std::mem::forget(emb);
+    std::mem::forget(hprev);
+    if let Some(h) = h_out.as_ref() { std::mem::forget(h); }
+    std::mem::forget(arg);
+    result
 }
 
 
