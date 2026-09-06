@@ -3183,7 +3183,11 @@ impl CudaBackend {
         mult: usize,
     ) -> Result<()> {
         self.enter();
-        let dw = self.dev_weight_bf16(table)?;
+        // F32 table (NOT bf16): the embed row feeds the residual stream —
+        // bf16 truncation changed the numeric domain (accept 2.38→2.18,
+        // argmax ties flip; the W8A8 lesson). f32 = bit-identical to the
+        // host lookup. +1.2GB VRAM for 154880x4096.
+        let dw = self.dev_weight(table)?;
         let vocab = table.shape.0[0];
         ck(
             unsafe {

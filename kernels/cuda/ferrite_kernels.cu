@@ -4120,8 +4120,12 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
 // mega-graph's first node becomes this kernel instead of the staging memcpy).
 // Table is the resident bf16 embed (dev_weight_bf16 cache).
 // ============================================================
+// NOTE: the table is F32 (dev_weight f32 cache — the embed output feeds the
+// residual stream; a bf16 table changed the numeric domain and cost accept
+// 2.38→2.18 (argmax ties flip — the same class as the W8A8 lesson). f32 =
+// bit-identical to the host lookup. VRAM +1.2GB for 154880x4096.
 __global__ void embed_expand_kernel(
-    const __nv_bfloat16* __restrict__ table,  // [vocab, hidden] resident bf16
+    const float* __restrict__ table,         // [vocab, hidden] resident F32
     const int* __restrict__ ids,              // [n] token ids (pinned or device)
     float* __restrict__ out,                  // [n, mult, hidden] (graph res buf)
     int n, int hidden, int mult, int vocab)
@@ -4130,10 +4134,10 @@ __global__ void embed_expand_kernel(
     if (t >= n) return;
     int id = ids[t];
     if (id < 0 || id >= vocab) id = 0;
-    const __nv_bfloat16* row = table + (size_t)id * hidden;
+    const float* row = table + (size_t)id * hidden;
     float* dst = out + (size_t)t * mult * hidden;
     for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
-        float v = __bfloat162float(row[j]);
+        float v = row[j];
         for (int m = 0; m < mult; m++) {
             dst[(size_t)m * hidden + j] = v;
         }
@@ -4146,6 +4150,6 @@ extern "C" cudaError_t ferrite_embed_expand(
 {
     if (n <= 0) return cudaSuccess;
     embed_expand_kernel<<<n, 256, 0, s>>>(
-        (const __nv_bfloat16*)table, ids, out, n, hidden, mult, vocab);
+        (const float*)table, ids, out, n, hidden, mult, vocab);
     return cudaGetLastError();
 }
