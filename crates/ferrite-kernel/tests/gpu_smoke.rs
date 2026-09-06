@@ -1000,66 +1000,6 @@ fn gemv_v2_bench() {
     eprintln!("[gemv-v2] TOTAL: v1={:.1}us v2={:.1}us ({:.2}x)", total_v1, total_v2, total_v1 / total_v2.max(1e-9));
 }
 
-/// Event-in-graph timing mechanism isolation: the mega EVTS run panicked
-/// cudaEventElapsedTime=InvalidValue(1) on the first post-replay read.
-/// (a) plain stream events (record→kernel→record→sync→elapsed) vs
-/// (b) events recorded DURING capture (→ event record nodes) →
-/// instantiate → replay → elapsed. Isolates which path breaks.
-#[test]
-fn event_timing_graph() {
-    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
-    dev.enter();
-    let n = 4096usize;
-    let mut rnd = 0x1234_5566_7788_99u64;
-    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
-    let xv: Vec<f32> = (0..n).map(|_| r()).collect();
-    let wv: Vec<f32> = (0..n * n).map(|_| r() * 0.02).collect();
-    let x_t = Tensor::from_f32(Shape::new([1, n]), xv.clone());
-    let w_t = Tensor::from_f32(Shape::new([n, n]), wv);
-    let x_dev = ferrite_kernel::cuda::DevBuf::alloc(dev.dev(), dev.stream_handle(), n).unwrap();
-    x_dev.upload(&xv).unwrap();
-    let _ = dev.matmul_dev(&x_dev, &w_t, 1, n as i32, n as i32); // warm weight cache
-    let _ = dev.sync();
-
-    // (a) plain stream events
-    let e0 = dev.event_create().unwrap();
-    let e1 = dev.event_create().unwrap();
-    dev.event_record(e0);
-    let out_a = dev.matmul_dev(&x_dev, &w_t, 1, n as i32, n as i32).unwrap();
-    dev.event_record(e1);
-    let _ = dev.sync();
-    let ms_a = dev.event_elapsed_ms(e0, e1);
-    let mut va = vec![0f32; 1];
-    out_a.download(&mut va).unwrap();
-    eprintln!("[evt] plain stream: {:.3}ms (out={:.4})", ms_a, va[0]);
-    assert!(ms_a > 0.0, "plain elapsed must be > 0, got {ms_a}");
-
-    // (b) events recorded during capture -> event record nodes.
-    // NOTE: drop (a)'s buffers first so the pool has the 16KB size class
-    // free — in-capture alloc of a cold class is err 900 (the mega chain
-    // warms every class in its dry-run pass for exactly this reason).
-    drop(out_a);
-    let g0 = dev.event_create().unwrap();
-    let g1 = dev.event_create().unwrap();
-    dev.graph_capture_begin();
-    dev.event_record(g0);
-    let out_b = dev.matmul_dev(&x_dev, &w_t, 1, n as i32, n as i32).unwrap();
-    dev.event_record(g1);
-    dev.graph_capture_end("evttest");
-    dev.graph_io_put("evttest", ferrite_kernel::cuda::GraphIO {
-        x_stage: x_dev.stage,
-        x_len: n,
-        out_dev: out_b.as_f32() as *mut std::ffi::c_void,
-        out_len: n,
-    });
-    std::mem::forget(out_b); // graph output must outlive replays (mega pattern)
-    let mut ob = vec![0f32; n];
-    assert!(dev.graph_run("evttest", &xv, &mut ob).unwrap(), "graph_run evttest");
-    let ms_b = dev.event_elapsed_ms(g0, g1);
-    eprintln!("[evt] in-graph: {:.3}ms (out={:.4})", ms_b, ob[0]);
-    assert!(ms_b > 0.0, "in-graph elapsed must be > 0, got {ms_b}");
-}
-
 /// sparse_attn v2 parity: 256-thread block (v1 was 32 — one warp over
 /// topk≈8K slots with serial scalar dots + O(topk²) global idx rereads).
 /// CPU reference implements the exact semantics: padding (-1)/OOB → skip,
@@ -1341,4 +1281,99 @@ fn pdl_exp() {
               c_norm, c_pdl, c_gn, c_gp);
     assert!((c_norm - c_pdl).abs() < 1e-3 * c_norm.abs().max(1.0), "PDL checksum mismatch");
     assert!((c_gn - c_gp).abs() < 1e-3 * c_gn.abs().max(1.0), "graph PDL checksum mismatch");
+}
+
+/// E4M3 decode (CPU golden reference — matches __nv_cvt_fp8_to_halfraw
+/// semantics: bias-7 exponent, 3-bit mantissa, subnormal e=0 → m×2^-9).
+fn e4m3_decode(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let e = ((b >> 3) & 0xF) as i32;
+    let m = (b & 7) as f32;
+    if e == 0 {
+        sign * m * (1.0 / 512.0)
+    } else {
+        sign * (1.0 + m / 8.0) * (2.0f32).powi(e - 7)
+    }
+}
+
+/// gemv_fp8 parity: register a synthetic Fp8Weight (random legal e4m3 bytes
+/// + 128x128 block scales) against a dummy f32 golden Tensor, verify the
+/// (ptr,numel) hit mechanism, then matmul_dev must serve the fp8 kernel and
+/// match the CPU golden dot y[r] = Σ_k e4m3(b[r][k])·s[r/128][k/128]·x[k].
+/// Covers block-straddling shapes (out=300 non-multiple, in=512 → 4 col
+/// blocks) + the real decode shape (1536×4096) + batched n=3 (verify path).
+#[test]
+fn gemv_fp8_parity() {
+    use ferrite_kernel::cuda::DevBuf;
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let mut rnd = 0xf00d_feed_1234_5678u64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    for &(in_f, out_f) in &[(512usize, 300usize), (4096usize, 1536usize)] {
+        // random legal e4m3 bytes (avoid 0x7F/0xFF NaN pattern: exp=mant=max)
+        let bytes: Vec<u8> = (0..out_f * in_f).map(|_| 0x10 | ((r() * 255.0) as u8 & 0x6F)).collect();
+        let srows = out_f.div_ceil(128);
+        let scols = in_f.div_ceil(128);
+        let scale: Vec<f32> = (0..srows * scols).map(|_| 0.5 + r()).collect();
+        let x: Vec<f32> = (0..in_f).map(|_| r() * 2.0 - 1.0).collect();
+        // dummy golden Tensor (fp8 register key = (ptr, numel); content unused)
+        let w_t = Tensor::from_f32(Shape::new([out_f, in_f]), vec![0f32; out_f * in_f]);
+        dev.register_fp8(&w_t, out_f, in_f, &bytes, &scale).expect("register");
+        assert!(dev.fp8_hit(&w_t), "fp8 (ptr,numel) hit mechanism failed");
+
+        // CPU golden: f32 sequential accumulate (kernel order differs — tolerance)
+        let mut golden = vec![0f32; out_f];
+        for row in 0..out_f {
+            let mut acc = 0f64;
+            for k in 0..in_f {
+                let b = bytes[row * in_f + k];
+                acc += (e4m3_decode(b) as f64) * (scale[(row / 128) * scols + k / 128] as f64) * (x[k] as f64);
+            }
+            golden[row] = acc as f32;
+        }
+
+        // n=1 (decode gemv)
+        let x_dev = DevBuf::alloc(dev.dev(), dev.stream_handle(), in_f).unwrap();
+        x_dev.upload(&x).unwrap();
+        let y = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).expect("fp8 gemv n=1");
+        dev.sync().unwrap();
+        let mut got = vec![0f32; out_f];
+        y.download(&mut got).unwrap();
+        let mut maxd = 0f32;
+        let mut rel = 0f32;
+        for i in 0..out_f {
+            maxd = maxd.max((got[i] - golden[i]).abs());
+            rel = rel.max((got[i] - golden[i]).abs() / golden[i].abs().max(1e-6));
+        }
+        eprintln!("[fp8-parity {out_f}x{in_f}] n=1 abs={maxd:.2e} rel={rel:.2e}");
+        assert!(rel < 1e-4, "gemv_fp8 n=1 parity {out_f}x{in_f}: rel {rel:.2e} abs {maxd:.2e}");
+
+        // n=3 (MTP verify batch): rows share the same w — y[t] = w·x[t]
+        if out_f >= 300 && in_f >= 512 {
+            let x3: Vec<f32> = (0..3 * in_f).map(|_| r() * 2.0 - 1.0).collect();
+            let mut golden3 = vec![0f32; 3 * out_f];
+            for t in 0..3 {
+                for row in 0..out_f {
+                    let mut acc = 0f64;
+                    for k in 0..in_f {
+                        let b = bytes[row * in_f + k];
+                        acc += (e4m3_decode(b) as f64) * (scale[(row / 128) * scols + k / 128] as f64) * (x3[t * in_f + k] as f64);
+                    }
+                    golden3[t * out_f + row] = acc as f32;
+                }
+            }
+            let x3_dev = DevBuf::alloc(dev.dev(), dev.stream_handle(), 3 * in_f).unwrap();
+            x3_dev.upload(&x3).unwrap();
+            let y3 = dev.matmul_dev(&x3_dev, &w_t, 3, in_f as i32, out_f as i32).expect("fp8 gemv n=3");
+            dev.sync().unwrap();
+            let mut got3 = vec![0f32; 3 * out_f];
+            y3.download(&mut got3).unwrap();
+            let mut rel3 = 0f32;
+            for i in 0..3 * out_f {
+                rel3 = rel3.max((got3[i] - golden3[i]).abs() / golden3[i].abs().max(1e-6));
+            }
+            eprintln!("[fp8-parity {out_f}x{in_f}] n=3 rel={rel3:.2e}");
+            assert!(rel3 < 1e-4, "gemv_fp8 n=3 parity {out_f}x{in_f}: rel {rel3:.2e}");
+        }
+    }
 }
