@@ -740,6 +740,7 @@ impl<B: KernelBackend> TpCluster<B> {
             *s.tokens.last().ok_or_else(|| FerriteError::Config("empty context".into()))?
         };
         let mtp_tm = std::env::var_os("FERRITE_MTP_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         let t_d = std::time::Instant::now();
         // 1. draft: h_prev staging (accept row of last step's h_final) +
         //    embed(last) → mtp_forward → d1 (identical across ranks).
@@ -926,7 +927,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                 }
                 if mtp_tm {
-                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit3={:.2}ms (accept3 d1={:?} d2={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, d1 as u32, d2 as u32);
+                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit3={:.2}ms total={:.2}ms (accept3 d1={:?} d2={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, t0.elapsed().as_secs_f64()*1e3, d1 as u32, d2 as u32);
                 }
                 Ok(a2 as u32)
             }
@@ -938,7 +939,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                 }
                 if mtp_tm {
-                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit2={:.2}ms (accept2 d1={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, d1 as u32);
+                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit2={:.2}ms total={:.2}ms (accept2 d1={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, t0.elapsed().as_secs_f64()*1e3, d1 as u32);
                 }
                 Ok(a1 as u32)
             }
@@ -949,7 +950,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                 }
                 if mtp_tm {
-                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit1={:.2}ms (accept1 a0={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, a0 as u32);
+                    eprintln!("[mtp-tm] draft={:.2}ms verify={:.2}ms commit1={:.2}ms total={:.2}ms (accept1 a0={:?})", t_draft.as_secs_f64()*1e3, t_verify.as_secs_f64()*1e3, t_c.elapsed().as_secs_f64()*1e3, t0.elapsed().as_secs_f64()*1e3, a0 as u32);
                 }
                 Ok(a0 as u32)
             }
