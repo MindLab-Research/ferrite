@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cuda_fp8.h>
 
 #define FERRITE_CHECK(call)                                                  \
     do {                                                                     \
