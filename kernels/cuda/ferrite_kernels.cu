@@ -2466,7 +2466,7 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     float* cb = sm + mix;           // [n*n]
     float* pre_s = sm + mix + n * n; // [n]
     float* li_s = sm + mix + n * n + n; // [h] fused-norm staging (rmsnorm parity)
-    float* red = li_s + h;   // [8+8] warp partials (mx prologue + norm tail)
+    float* red = li_s + h;   // [WMAX+8] warp partials (mx prologue + norm tail); WMAX = 32 (1024 threads)
 
     // PROLOGUE (K-split phase-2): reduce the KS partial dots per mix row
     // and apply rsq (Σx² block reduce — was phase-1 per-block redundant).
@@ -2479,14 +2479,14 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
         __syncthreads();
         float msq = 0.f;
         if (threadIdx.x == 0) {
-            for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
-            red[15] = rsqrtf(msq / (float)nh + rms_eps);
+            for (int w = 0; w < 32; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
+            red[39] = rsqrtf(msq / (float)nh + rms_eps);
         }
         // reduce partials: thread m sums its mix row's ks lanes
         for (int m = threadIdx.x; m < mix; m += blockDim.x) {
             float acc = 0.f;
             for (int z = 0; z < mix_ks; z++) acc += mx_in[((size_t)t * mix + m) * mix_ks + z];
-            mx_s[m] = acc * red[15];
+            mx_s[m] = acc * red[39];
         }
         __syncthreads();
     }
@@ -2570,7 +2570,7 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     __syncthreads();
     if (threadIdx.x == 0) {
         float tt = 0.f;
-        for (int i = 0; i < 8; i++) tt += red[i];
+        for (int i = 0; i < 32; i++) if (i < (blockDim.x + 31) >> 5) tt += red[i];
         red[0] = rsqrtf(tt / h + rms_eps);
     }
     __syncthreads();
@@ -2602,9 +2602,16 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     // + FUSED rmsnorm tail (nw = input_layernorm weight): li comes out
     // normalized — saves the standalone rmsnorm launch per layer segment.
     // PROLOGUE: reduce the KS mix partials + rsq (Σx²).
-    // smem: mx_s[mix] + cb[n*n] + pre_s[n] + li_s[h] + red[8]  (~16.6KB)
-    size_t smem2 = ((size_t)(mix + n * n + n) + h + 16) * sizeof(float);
-    hc_pre_rest_kernel<<<s, 256, smem2, stream>>>(
+    // TILE FIX (verify chain was 26.7% of step): grid=s (n=3 verify -> 3
+    // blocks on 148 SMs) at 256 thr = 12.5% SM warp occupancy — the global
+    // reads (nh + h + li writes) stall on latency. 1024 threads = 32 warps
+    // (50% occupancy) cuts the li/prologue rounds 4x. red[] now sized for
+    // 32 warp partials; msq slot moved to red[39]. NOTE: the rmsnorm warp
+    // partial ORDER changed (8 -> up-to-32 ascending) — validated by
+    // 出师表 recitation (garbling = revert this).
+    // smem: mx_s[mix] + cb[n*n] + pre_s[n] + li_s[h] + red[40]  (~16.7KB)
+    size_t smem2 = ((size_t)(mix + n * n + n) + h + 48) * sizeof(float);
+    hc_pre_rest_kernel<<<s, 1024, smem2, stream>>>(
         res, mx_scratch, scale, base, nw, li, post, comb,
         s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
     return cudaGetLastError();
