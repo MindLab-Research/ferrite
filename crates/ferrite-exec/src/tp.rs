@@ -1236,7 +1236,11 @@ impl<B: KernelBackend> TpCluster<B> {
                         let rh2 = ferrite_kernel::cuda::memcpy_d2h_sync(
                             m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv.as_mut_ptr(), 4, cuda.stream_handle());
                         let h_match = hp.iter().zip(hfv.iter()).all(|(a, b)| a == b);
-                        eprintln!("[zh2d-hp] hprev[0..4]={:?} hf_v[0..4]={:?} match={} r={}/{}", hp, hfv, h_match, rh, rh2);
+                        // mtp_family cache slot bookkeeping BEFORE draft1 (the
+                        // draft's DSA attention reads [0..t0+1); off-by-one here
+                        // = stale/shifted attention window = delayed-looking d1)
+                        let tc = cuda.dsa_t_count(seq, mtp_family);
+                        eprintln!("[zh2d-hp] hprev[0..4]={:?} hf_v[0..4]={:?} match={} tc={:?} r={}/{}", hp, hfv, h_match, tc, rh, rh2);
                     }
                     cuda.embed_one_dev(&embed_table, tokens_ptr, emb1_ptr, hidden, 1)?;
                     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {

@@ -2257,6 +2257,12 @@ impl CudaBackend {
         Ok(partial)
     }
 
+    /// Debug getter: the family's current t_count (host bookkeeping).
+    pub fn dsa_t_count(&self, seq: u64, family: usize) -> Option<usize> {
+        let m = self.dsa_caches.lock().unwrap();
+        m.get(&(seq, family)).map(|c| c.t_count)
+    }
+
     /// Mega-graph host-side DSA advance: write the pinned t0/total that the
     /// captured graph's kernels read zero-copy, and advance t_count — the
     /// same bookkeeping dsa_layer_dev's host logic does per call, minus the
