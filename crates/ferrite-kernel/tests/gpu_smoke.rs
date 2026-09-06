@@ -1656,7 +1656,9 @@ fn gemv_fp8_mma_parity_and_speed() {
         let mut scale = vec![0f32; srows * scols];
         for br in 0..srows { for bc in 0..scols {
             let mut m = 0f32;
-            for i in 0..128 { for jj in 0..128 { m = m.max(wv[(br * 128 + i) * in_f + bc * 128 + jj].abs()); } }
+            let rows_here = 128.min(out_f - br * 128);
+            let cols_here = 128.min(in_f - bc * 128);
+            for i in 0..rows_here { for jj in 0..cols_here { m = m.max(wv[(br * 128 + i) * in_f + bc * 128 + jj].abs()); } }
             scale[br * scols + bc] = m / 448.0;
         }}
         let wbytes: Vec<u8> = (0..out_f * in_f)
