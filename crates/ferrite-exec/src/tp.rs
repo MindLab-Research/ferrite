@@ -1369,7 +1369,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         let mut vin_chk = [0f32; 8];
                         let rc = ferrite_kernel::cuda::memcpy_d2h_sync(
                             io.x_stage, vin_chk.as_mut_ptr(), 8, cuda.stream_handle());
-                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} a1={:.0} a2={:.0} k={} vin[0..4]={:?.3} r={}",
+                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} a1={:.0} a2={:.0} k={} vin[0..4]={:?} r={}",
                             d1_val[0], d2_val[0], a[0], a[1], a[2],
                             if d1_val[0] as u32 == a[0] as u32 { "==" } else { "!=" },
                             vin_chk.iter().map(|v| v.trunc()).collect::<Vec<_>>(), rc);
