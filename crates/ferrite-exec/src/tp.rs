@@ -1269,6 +1269,27 @@ impl<B: KernelBackend> TpCluster<B> {
                     d1_ptr as *mut std::ffi::c_void,
                     hidden,
                 )?;
+                // KV-slot dump: cache[t0]'s first k_nope floats after draft1's
+                // append — S3==S2 would mean the append wrote STALE KV (the
+                // delayed-d1 root); differs = cache fresh (look deeper).
+                if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                        let (knp, t0c) = {
+                            let m2 = cuda.mtp_family_cache(seq, mtp_family)?;
+                            (m2.0, m2.1)
+                        };
+                        let _ = t0c;
+                        let mut kv = [0f32; 4];
+                        let rk = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            unsafe { knp.add(14 * 16 * 128) } as *mut std::ffi::c_void,
+                            kv.as_mut_ptr(), 4, cuda.stream_handle());
+                        eprintln!("[zh2d-kv] cache14_knope={:?} r={}", kv, rk);
+                    }
+                }
 
                 // FERRITE_ZH2D_AB: same-process A/B of the draft chain — re-run
                 // draft 1 the ORIGINAL way (host embed + upload + mtp_forward

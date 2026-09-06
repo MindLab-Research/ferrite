@@ -2263,6 +2263,14 @@ impl CudaBackend {
         m.get(&(seq, family)).map(|c| c.t_count)
     }
 
+    /// Debug getter: (k_nope device ptr, t_count) for a family's cache.
+    pub fn mtp_family_cache(&self, seq: u64, family: usize) -> Result<(*mut std::ffi::c_void, usize)> {
+        let m = self.dsa_caches.lock().unwrap();
+        let c = m.get(&(seq, family))
+            .ok_or_else(|| FerriteError::InvalidArg(format!("no dsa cache ({seq},{family})")))?;
+        Ok((c.k_nope, c.t_count))
+    }
+
     /// Mega-graph host-side DSA advance: write the pinned t0/total that the
     /// captured graph's kernels read zero-copy, and advance t_count — the
     /// same bookkeeping dsa_layer_dev's host logic does per call, minus the
