@@ -2230,12 +2230,20 @@ __global__ void moe_fused_act_fp8_kernel(
             const unsigned char* u8 = reinterpret_cast<const unsigned char*>(&uv);
             const float gs_c = gsr[k >> 7];
             const float us_c = usr[k >> 7];
+            // fp8x2 batch convert (__nv_cvt_fp8x2_to_halfraw2): 2 e4m3 -> 1
+            // half2 per op — HALVES the convert instruction count vs the
+            // scalar __nv_cvt_fp8_to_halfraw (the single-warp gemv was
+            // convert-bound, offsetting the fp8 HBM savings: 0.94x vs bf16).
+            const float xv[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
+                                  xc.x, xc.y, xc.z, xc.w, xd.x, xd.y, xd.z, xd.w};
             #pragma unroll
-            for (int e = 0; e < 16; e++) {
-                const float xv[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
-                                      xc.x, xc.y, xc.z, xc.w, xd.x, xd.y, xd.z, xd.w};
-                g += (__half2float(__nv_cvt_fp8_to_halfraw(g8[e], __NV_E4M3)) * gs_c) * xv[e];
-                u += (__half2float(__nv_cvt_fp8_to_halfraw(u8[e], __NV_E4M3)) * us_c) * xv[e];
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t gx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&g8[p * 2]);
+                const __nv_fp8x2_storage_t ux2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&u8[p * 2]);
+                const float2 gf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(gx2, __NV_E4M3)));
+                const float2 uf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(ux2, __NV_E4M3)));
+                g += (gf.x * gs_c) * xv[p * 2] + (gf.y * gs_c) * xv[p * 2 + 1];
+                u += (uf.x * us_c) * xv[p * 2] + (uf.y * us_c) * xv[p * 2 + 1];
             }
         }
         for (int k = ((hidden >> 4) << 4) + lane; k < hidden; k += 32) {
@@ -2322,8 +2330,10 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
                                   ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
 #pragma unroll
-            for (int e = 0; e < 16; e++) {
-                y += (__half2float(__nv_cvt_fp8_to_halfraw(d8[e], __NV_E4M3)) * ds_c) * xv[e];
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
             }
         }
         for (; i < inter; i++) {
@@ -2353,8 +2363,10 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
                                   ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
 #pragma unroll
-            for (int e = 0; e < 16; e++) {
-                y += (__half2float(__nv_cvt_fp8_to_halfraw(d8[e], __NV_E4M3)) * ds_c) * xv[e];
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
             }
         }
         for (; i < inter_shared; i++) {
@@ -3580,28 +3592,14 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             const float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
             const float4 xc = *reinterpret_cast<const float4*>(xr + k + 8);
             const float4 xd = *reinterpret_cast<const float4*>(xr + k + 12);
-            const float wq[16] = {
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[0], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[1], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[2], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[3], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[4], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[5], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[6], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[7], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[8], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[9], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[10], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[11], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[12], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[13], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[14], __NV_E4M3)) * sc,
-                __half2float(__nv_cvt_fp8_to_halfraw(w8[15], __NV_E4M3)) * sc,
-            };
-            acc += xa.x * wq[0] + xa.y * wq[1] + xa.z * wq[2] + xa.w * wq[3];
-            acc += xb.x * wq[4] + xb.y * wq[5] + xb.z * wq[6] + xb.w * wq[7];
-            acc += xc.x * wq[8] + xc.y * wq[9] + xc.z * wq[10] + xc.w * wq[11];
-            acc += xd.x * wq[12] + xd.y * wq[13] + xd.z * wq[14] + xd.w * wq[15];
+            const float xv[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
+                                  xc.x, xc.y, xc.z, xc.w, xd.x, xd.y, xd.z, xd.w};
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3)));
+                acc += (wf.x * sc) * xv[p * 2] + (wf.y * sc) * xv[p * 2 + 1];
+            }
         }
         // scalar tail: elements past the last full uint4 step (in_f % 16
         // != 0 slice ends, misaligned k1) — one fp8 per lane iteration.
