@@ -3739,7 +3739,7 @@ __global__ void gemv_fp8_mma_kernel(
         const float inv = 1.0f / sxs[0];
         for (int k = threadIdx.x; k < in_f; k += 256) {
             const __half h = __float2half(fminf(fmaxf(x[k] * inv, -448.0f), 448.0f));
-            sx[k] = (unsigned char)__nv_cvt_halfraw_to_fp8(h, __NV_E4M3, __NV_SATFINITE, __NV_SATFINITE);
+            sx[k] = (unsigned char)__nv_cvt_halfraw_to_fp8(h, __NV_E4M3, __NV_SATFINITE);
         }
         __syncthreads();
     }
