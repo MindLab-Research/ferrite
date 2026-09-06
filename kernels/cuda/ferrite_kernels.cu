@@ -3296,21 +3296,3 @@ extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
                                              gdn_len, hf_v, hprev, hidden);
     return cudaGetLastError();
 }
-
-// ============================================================
-// Embedding row gather (MTP draft device chain): token id (device f32,
-// argmax output) -> one f32 row of the replicated [vocab, hidden] table.
-// Replaces the host embed lookup + H2D upload on every draft step; the id
-// never crosses to the host until the accept decision (one D2H for d1+d2).
-// ============================================================
-__global__ void embed_gather_kernel(const float* __restrict__ table,
-                                    const float* __restrict__ id,
-                                    float* __restrict__ out, int hidden) {
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < hidden) out[i] = table[(size_t)(*id) * hidden + i];
-}
-extern "C" cudaError_t ferrite_embed_gather(const float* table, const float* id,
-                                            float* out, int hidden, cudaStream_t s) {
-    embed_gather_kernel<<<(hidden + 255) / 256, 256, 0, s>>>(table, id, out, hidden);
-    return cudaGetLastError();
-}
