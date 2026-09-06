@@ -125,6 +125,8 @@ extern "C" {
                           n_plans: i32, conv_len: i32, gdn_len: i32,
                           hf_v: *const f32, hprev: *mut f32,
                           hidden: i32, s: CuStream) -> i32;
+    fn ferrite_embed_gather(table: *const f32, id: *const f32, out: *mut f32,
+                            hidden: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
                       li: *mut f32, post: *mut f32, comb: *mut f32,
@@ -404,6 +406,17 @@ pub struct MtpState {
     /// gdn_b1) + a pinned k slot. One ferrite_mtp_commit launch replaces
     /// 2*n_gdn cudaMemcpyAsync D2Ds + the hprev row select.
     pub commit: Option<MtpCommitPlan>,
+    /// Device-side draft chain (graph-capturable): the replicated f32
+    /// embedding table [vocab, hidden] (every shard holds the full table;
+    /// the draft gather replaces the host lookup + H2D per step), gather
+    /// outputs (emb_last/emb_d1), and the argmax id slots (d1/d2 — the id
+    /// never crosses to the host until the accept decision).
+    pub embed_table: Option<DevBuf>,
+    pub emb_last: DevBuf,
+    pub emb_d1: DevBuf,
+    pub d1_id: DevBuf,
+    pub d2_id: DevBuf,
+    pub last_id: DevBuf,
 }
 
 /// Device-resident commit pointer table for ferrite_mtp_commit. `plan`
@@ -2799,6 +2812,19 @@ impl CudaBackend {
                 )
             },
             "mtp_commit",
+        )?;
+        Ok(())
+    }
+
+    /// Embedding row gather (MTP draft device chain): token id (device f32,
+    /// argmax output — never crosses to the host) reads one row of the
+    /// replicated f32 [vocab, hidden] table. Replaces the host embed lookup +
+    /// H2D upload per draft step; graph-capturable (fixed addresses).
+    pub fn embed_gather_dev(&self, table: &DevBuf, id: &DevBuf, out: &DevBuf, hidden: usize) -> Result<()> {
+        self.enter();
+        ck(
+            unsafe { ferrite_embed_gather(table.as_const_f32(), id.as_const_f32(), out.as_f32(), hidden as i32, self.stream) },
+            "embed_gather",
         )?;
         Ok(())
     }

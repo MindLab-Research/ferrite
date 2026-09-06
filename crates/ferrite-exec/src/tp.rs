@@ -619,7 +619,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             Some(h) => h,
                             None => unsafe { &*(hptr as *const ferrite_kernel::cuda::DevBuf) },
                         };
-                        mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
+                        mtp_forward(s, seq, &emb, hprev, Some(&hout), None)?;
                         h_cur = Some(hout);
                     }
                     Ok::<(), FerriteError>(())
@@ -745,41 +745,91 @@ impl<B: KernelBackend> TpCluster<B> {
         //    embed(last) → mtp_forward → d1 (identical across ranks).
         let (d1, d2) = {
             let toks = Self::fan_out(&mut self.shards, |s| {
-                let (emb, hptr) = {
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                cuda.enter();
+                // Draft chain, fully on device (the ids never cross to the
+                // host until the single D2H below): last -> gather -> forward
+                // -> d1 (device argmax) -> gather(d1) -> forward -> d2.
+                // Replaces 2x host embed lookup + H2D + 2x argmax D2H syncs.
+                // Borrow discipline: MtpState bufs are fixed-address DevBufs —
+                // take raw pointers (the hptr pattern), drop the guard before
+                // mtp_forward takes &mut Engine.
+                let (emb_last, hprev, table, d1_id, d2_id, emb_d1, d1_slot, d2_slot) = {
+                    let mg = cuda.mtp.lock().unwrap();
+                    let m = mg
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    let table = m
+                        .embed_table
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp embed table missing".into()))?;
+                    (
+                        &m.emb_last as *const DevBuf as usize,
+                        &m.hprev as *const DevBuf as usize,
+                        table as *const DevBuf as usize,
+                        &m.d1_id as *const DevBuf as usize,
+                        &m.d2_id as *const DevBuf as usize,
+                        &m.emb_d1 as *const DevBuf as usize,
+                        &m.d1_id as *const DevBuf as usize,
+                        &m.d2_id as *const DevBuf as usize,
+                    )
+                };
+                let (emb_last, hprev, table, d1_id, d2_id, emb_d1) = unsafe {
+                    (
+                        &*(emb_last as *const DevBuf),
+                        &*(hprev as *const DevBuf),
+                        &*(table as *const DevBuf),
+                        &*(d1_id as *const DevBuf),
+                        &*(d2_id as *const DevBuf),
+                        &*(emb_d1 as *const DevBuf),
+                    )
+                };
+                {
+                    let mg = cuda.mtp.lock().unwrap();
+                    let m = mg
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    m.last_id.upload(&[last as f32])?;
+                    cuda.embed_gather_dev(table, &m.last_id, emb_last, hidden)?;
+                }
+                let h_d1 = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
+                // NLL: the `cuda` borrow ends here (last use); mtp_forward
+                // takes &mut Engine. Re-borrow per segment below.
+                drop(cuda);
+                mtp_forward(s, seq, emb_last, hprev, Some(&h_d1), Some(d1_id))?;
+                {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
                     cuda.enter();
-                    let h2 = s.embed(&[last]);
-                    let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-                    emb.upload(h2.as_slice())?;
-                    let m = cuda.mtp.lock().unwrap();
-                    let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    (emb, &m.hprev as *const DevBuf as usize)
-                };
-                let hprev: &DevBuf = unsafe { &*(hptr as *const DevBuf) };
-                // draft chain: d1 from hprev; d2 from d1's MTP residual h
-                // (the draft model's own hidden — EAGLE-style recursion).
-                let (d1, h_d1) = {
+                    let mg = cuda.mtp.lock().unwrap();
+                    let m = mg
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    cuda.embed_gather_dev(table, &m.d1_id, emb_d1, hidden)?;
+                }
+                mtp_forward(s, seq, emb_d1, &h_d1, None, Some(d2_id))?;
+                let (dv1, dv2) = {
                     let cuda = s
                         .backend
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                    let h_d1 = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
-                    (mtp_forward(s, seq, &emb, hprev, Some(&h_d1))?, h_d1)
+                    cuda.enter();
+                    let mg = cuda.mtp.lock().unwrap();
+                    let m = mg
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    let mut d1v = [0f32; 1];
+                    let mut d2v = [0f32; 1];
+                    m.d1_id.download(&mut d1v)?;
+                    m.d2_id.download(&mut d2v)?;
+                    (d1v[0], d2v[0])
                 };
-                let d2 = {
-                    let cuda = s
-                        .backend
-                        .as_cuda()
-                        .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                    let h3 = s.embed(&[d1 as u32]);
-                    let emb2 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-                    emb2.upload(h3.as_slice())?;
-                    mtp_forward(s, seq, &emb2, &h_d1, None)?
-                };
-                Ok((d1, d2))
+                Ok((dv1, dv2))
             })
             .into_iter()
             .collect::<Result<Vec<(f32, f32)>>>()?;
@@ -945,7 +995,22 @@ impl<B: KernelBackend> TpCluster<B> {
         plan_buf.upload(flat.as_slice())?;
         let k_pin = cuda.pinned_i32()?;
         let commit = MtpCommitPlan { plan: plan_buf, k_pin, n: n_plans, conv_len, gdn_len, hidden };
-        *cuda.mtp.lock().unwrap() = Some(MtpState { hf_dev, hf_v, hprev, scratch, commit: Some(commit) });
+        // Device-side draft chain: the replicated f32 embedding table
+        // [vocab, hidden] (every shard holds the full table; upload once at
+        // setup) + gather staging + argmax id slots. The draft ids stay on
+        // the GPU until the accept decision (one D2H for d1+d2).
+        let embed_w = s.w("model.embed_tokens.weight")?;
+        let mut embed_table = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), embed_w.shape.0[0] * embed_w.shape.0[1])?;
+        embed_table.upload(embed_w.as_slice())?;
+        let emb_last = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let emb_d1 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+        let d1_id = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let d2_id = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        let last_id = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
+        *cuda.mtp.lock().unwrap() = Some(MtpState {
+            hf_dev, hf_v, hprev, scratch, commit: Some(commit),
+            embed_table: Some(embed_table), emb_last, emb_d1, d1_id, d2_id, last_id,
+        });
         Ok(())
     }
 
@@ -2786,6 +2851,7 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     embed_row: &ferrite_kernel::cuda::DevBuf,
     h_prev: &ferrite_kernel::cuda::DevBuf,
     h_out: Option<&ferrite_kernel::cuda::DevBuf>,
+    arg_out: Option<&ferrite_kernel::cuda::DevBuf>,
 ) -> Result<f32> {
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights};
     let cuda = s
@@ -2886,7 +2952,17 @@ pub(crate) fn mtp_forward<B: KernelBackend>(
     let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
     let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
     cuda.argmax_dev(&logits, &mut arg, 1, cfg.vocab_size)?;
-    let mut tok = vec![0f32; 1];
-    arg.download(&mut tok)?;
-    Ok(tok[0])
+    match arg_out {
+        Some(dst) => {
+            // device chain: the draft id stays on the GPU (d1 feeds the next
+            // gather directly; the host only sees it at the accept decision)
+            cuda.copy_dev(&arg, 0, dst.as_f32(), 1)?;
+            Ok(0.0)
+        }
+        None => {
+            let mut tok = vec![0f32; 1];
+            arg.download(&mut tok)?;
+            Ok(tok[0])
+        }
+    }
 }
