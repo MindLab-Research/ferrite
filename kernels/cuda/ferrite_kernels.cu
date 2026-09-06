@@ -3739,10 +3739,10 @@ __global__ void gemv_fp8_mma_kernel(
         const float inv = 1.0f / sxs[0];
         for (int k = threadIdx.x; k < in_f; k += 256) {
             // f32 -> e4m3 direct (RN): matches the reference encoder — the
-            // f32->half->e4m3 double-round drifts 1 ulp on ~6% of lanes and
-            // the 128-term dot amplifies it to ~20% (measured 128x16 case).
+            // f32->half->e4m3 double-round drifted 1ulp on ~6% of lanes and
+            // the 128-term dot amplified it to ~20% (measured 128x16 case).
             const float q = fminf(fmaxf(x[k] * inv, -448.0f), 448.0f);
-            sx[k] = (unsigned char)__nv_fp8_e4m3(q).x;
+            sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
         }
         __syncthreads();
     }
