@@ -1235,12 +1235,19 @@ impl<B: KernelBackend> TpCluster<B> {
                         let mut hfv = [0f32; 4];
                         let rh2 = ferrite_kernel::cuda::memcpy_d2h_sync(
                             m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv.as_mut_ptr(), 4, cuda.stream_handle());
-                        let h_match = hp.iter().zip(hfv.iter()).all(|(a, b)| a == b);
-                        // mtp_family cache slot bookkeeping BEFORE draft1 (the
-                        // draft's DSA attention reads [0..t0+1); off-by-one here
-                        // = stale/shifted attention window = delayed-looking d1)
+                        // FULL hptr vs hf_v[0] comparison (4096 floats) — first 8
+                        // mismatch indices (k=1 commit writes hprev<-hf_v[0]).
+                        let mut hp_full = vec![0f32; 4096];
+                        let mut hfv_full = vec![0f32; 4096];
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            hprev_ptr as *mut std::ffi::c_void, hp_full.as_mut_ptr(), 4096, cuda.stream_handle());
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv_full.as_mut_ptr(), 4096, cuda.stream_handle());
+                        let mism: Vec<usize> = hp_full.iter().zip(hfv_full.iter()).enumerate()
+                            .filter(|(_, (a, b))| a != b).map(|(i, _)| i).take(8).collect();
                         let tc = cuda.dsa_t_count(seq, mtp_family);
-                        eprintln!("[zh2d-hp] hprev[0..4]={:?} hf_v[0..4]={:?} match={} tc={:?} r={}/{}", hp, hfv, h_match, tc, rh, rh2);
+                        eprintln!("[zh2d-hp] hp[0..4]={:?} mism_idx={:?} n_mism={} tc={:?} r={}/{}",
+                            hp, mism, mism.len(), tc, rh, rh2);
                     }
                     cuda.embed_one_dev(&embed_table, tokens_ptr, emb1_ptr, hidden, 1)?;
                     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
@@ -1298,6 +1305,9 @@ impl<B: KernelBackend> TpCluster<B> {
                 // sees the same cache slot. Float-compare d1/d1_ref and the
                 // x2 residual (h_d1) — locates WHERE the zero-H2D draft diverges.
                 if std::env::var_os("FERRITE_ZH2D_AB").is_some() {
+                    // AB v2 (raw_argmax — same fn as zh path, emb from host
+                    // upload): d1_ref vs d1_zh + h_d1 float compare. If equal →
+                    // emb buffer path is NOT the divergence; if differ → it is.
                     {
                         let cuda = s
                             .backend
@@ -1309,24 +1319,32 @@ impl<B: KernelBackend> TpCluster<B> {
                             d1_ptr as *mut std::ffi::c_void, &mut d1_zh[0], 1, cuda.stream_handle());
                         ferrite_kernel::cuda::memcpy_d2h_sync(
                             h_d1.as_f32() as *mut std::ffi::c_void, hd1_zh.as_mut_ptr(), 8, cuda.stream_handle());
-                        // original path: host embed + upload + mtp_forward
                         let h2 = s.embed(&[last]);
                         let emb_ref = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
                         emb_ref.upload(h2.as_slice())?;
                         let h_d1_ref = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
-                        let hptr_ref = {
-                            let m = cuda.mtp.lock().unwrap();
-                            &m.as_ref().unwrap().hprev as *const DevBuf as usize
-                        }; // cuda borrow ends here (NLL)
-                        let hprev_ref: &DevBuf = unsafe { &*(hptr_ref as *const DevBuf) };
-                        let d1_ref = mtp_forward(s, seq, &emb_ref, hprev_ref, Some(&h_d1_ref))?;
-                        // ab's mtp_forward advanced mtp_family t_count by 1 — roll back
+                        let d1_ref_buf = DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
+                        let d1_ref_ptr = d1_ref_buf.as_f32();
+                        // raw-argmax variant (no mtp_forward — avoids the
+                        // segfault): same hprev_ptr, h_d1_ref out, d1_ref buf
+                        drop(cuda);
+                        mtp_forward_raw_argmax(
+                            s, seq,
+                            emb_ref.as_f32() as *mut std::ffi::c_void,
+                            hprev_ptr as *mut std::ffi::c_void,
+                            h_d1_ref.as_f32() as *mut std::ffi::c_void,
+                            d1_ref_ptr as *mut std::ffi::c_void,
+                            hidden,
+                        )?;
                         {
                             let cuda = s
                                 .backend
                                 .as_cuda()
                                 .ok_or_else(|| FerriteError::Config("cuda".into()))?;
                             cuda.dsa_host_rollback(seq, mtp_family, 1);
+                            let mut d1_ref = [0f32; 1];
+                            ferrite_kernel::cuda::memcpy_d2h_sync(
+                                d1_ref_ptr as *mut std::ffi::c_void, &mut d1_ref[0], 1, cuda.stream_handle());
                             let mut hd1_ref = [0f32; 8];
                             ferrite_kernel::cuda::memcpy_d2h_sync(
                                 h_d1_ref.as_f32() as *mut std::ffi::c_void, hd1_ref.as_mut_ptr(), 8, cuda.stream_handle());
@@ -1334,7 +1352,7 @@ impl<B: KernelBackend> TpCluster<B> {
                             let hd: Vec<String> = hd1_zh.iter().map(|v| format!("{v:.6}")).collect();
                             let hr: Vec<String> = hd1_ref.iter().map(|v| format!("{v:.6}")).collect();
                             eprintln!("[zh2d-ab1] d1_zh={:.0} d1_ref={:.0} match={} h_d1_zh={:?} h_d1_ref={:?} h_match={}",
-                                d1_zh[0], d1_ref, d1_zh[0] as u32 == d1_ref as u32, hd, hr, h_match);
+                                d1_zh[0], d1_ref[0], d1_zh[0] as u32 == d1_ref[0] as u32, hd, hr, h_match);
                         }
                     }
                 }
