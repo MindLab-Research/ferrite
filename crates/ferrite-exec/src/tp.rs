@@ -1222,7 +1222,22 @@ impl<B: KernelBackend> TpCluster<B> {
                         .as_cuda()
                         .ok_or_else(|| FerriteError::Config("cuda".into()))?;
                     cuda.enter();
+                    // DEBUG: dump hprev[0..4] (the draft's state input — if
+                    // garbage, commit/hf_v is the bug; if sane, draft chain is)
+                    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                        let mut hp = [0f32; 4];
+                        let rh = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            hprev_ptr as *mut std::ffi::c_void, hp.as_mut_ptr(), 4, cuda.stream_handle());
+                        eprintln!("[zh2d-hp] hprev[0..4]={:?} r={}", hp, rh);
+                    }
                     cuda.embed_one_dev(&embed_table, tokens_ptr, emb1_ptr, hidden, 1)?;
+                    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                        let mut eb = [0f32; 4];
+                        let re = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            emb1_ptr as *mut std::ffi::c_void, eb.as_mut_ptr(), 4, cuda.stream_handle());
+                        let last_emb: Vec<f32> = s.embed(&[last]).as_slice()[..4].to_vec();
+                        eprintln!("[zh2d-eb] emb1[0..4]={:?} host_embed={:?} r={}", eb, last_emb, re);
+                    }
                 } // cuda dropped
 
                 // mtp_forward #1: takes &mut s (no cuda alive) — re-acquires internally
