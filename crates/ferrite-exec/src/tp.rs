@@ -3626,13 +3626,21 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     let enorm = cuda.rmsnorm_dev(embed_row, s.w(&format!("{pfx}.enorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let hnorm = cuda.rmsnorm_dev(h_prev, s.w(&format!("{pfx}.hnorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-        let mut e4 = [0f32; 2];
-        let mut n4 = [0f32; 2];
+        // full hnorm checksum (8 segments of 512) — hprev's 4096-float
+        // bit-level: front-2 matched orig but S1 d2 diverged 8606 vs 315
+        // with x2 8-seg checksums equal => 1-ulp somewhere upstream.
+        // hnorm is rmsnorm(hprev) — its 8-seg sums localize hprev's drift.
+        let mut nfull = [0f32; 4096];
         ferrite_kernel::cuda::memcpy_d2h_sync(
-            enorm.as_f32() as *mut std::ffi::c_void, e4.as_mut_ptr(), 2, cuda.stream_handle());
+            hnorm.as_f32() as *mut std::ffi::c_void, nfull.as_mut_ptr(), h.min(4096), cuda.stream_handle());
+        let mut nsegs = [0f64; 8];
+        for (i, v) in nfull[..h.min(4096)].iter().enumerate() { nsegs[i / 512] += *v as f64; }
+        let mut efull = [0f32; 4096];
         ferrite_kernel::cuda::memcpy_d2h_sync(
-            hnorm.as_f32() as *mut std::ffi::c_void, n4.as_mut_ptr(), 2, cuda.stream_handle());
-        eprintln!("[zh2d-en] enorm={:?} hnorm={:?}", e4, n4);
+            enorm.as_f32() as *mut std::ffi::c_void, efull.as_mut_ptr(), h.min(4096), cuda.stream_handle());
+        let mut esegs = [0f64; 8];
+        for (i, v) in efull[..h.min(4096)].iter().enumerate() { esegs[i / 512] += *v as f64; }
+        eprintln!("[zh2d-en] esegs={:?} nsegs={:?}", esegs, nsegs);
     }
     let x_seg = cuda.mtp_eh_seg_dev(&enorm, &hnorm, rank, world, h)?;
     let eh_partial = cuda.matmul_dev(&x_seg, s.w(&format!("{pfx}.eh_proj.weight"))?, 1, (2 * h / world) as i32, h as i32)?;
@@ -3722,6 +3730,19 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
     // argmax writes DIRECTLY to the caller's device slot — zero D2H
     cuda.argmax_dev(&logits, arg_out, 1, cfg.vocab_size)?;
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+        // Read back what argmax ACTUALLY wrote vs what it was given: the
+        // d1=702-vs-98347 divergence has bit-identical x2 — either argmax
+        // read different logits (pool-buffer aliasing) or wrote elsewhere.
+        let mut av = [0f32; 1];
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            arg_out.as_f32() as *mut std::ffi::c_void, av.as_mut_ptr(), 1, cuda.stream_handle());
+        // top-2 of logits for argmax sanity (154880 wide, read cols of interest)
+        let mut l2 = [0f32; 2];
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            logits.as_f32() as *mut std::ffi::c_void, l2.as_mut_ptr(), 2, cuda.stream_handle());
+        eprintln!("[zh2d-am] argmax_out={:.0} logits[0..2]={:?.4}", av[0], l2);
+    }
     Ok(())
 }
 
