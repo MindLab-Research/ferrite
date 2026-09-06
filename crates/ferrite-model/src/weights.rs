@@ -517,3 +517,20 @@ mod fused_alias_tests {
         assert_eq!(up.as_slice()[0], (inter * hidden) as f32);
     }
 }
+
+/// Native fp8 weight (checkpoint F8_E4M3 + 128x128 block scale): raw bytes
+/// stay fp8 (row-major [rows, cols]); the device path dequants INLINE
+/// (w_f32 = e4m3(raw) * s[row/128][col/128] — the checkpoint's own
+/// dequant_block semantics, f32 accumulate). HALF the HBM traffic of the
+/// bf16-resident path (gemv/moe are bandwidth-bound).
+pub struct Fp8Weight {
+    pub rows: usize,
+    pub cols: usize,
+    pub data: Vec<u8>,   // F8_E4M3 row-major
+    pub scale: Vec<f32>,  // [rows/128][cols/128]
+}
+
+/// fp8 bypass store: name -> native fp8 (checkpoints with a
+/// `{src}_scale_inv` sibling tensor). Loaded alongside the f32 Weights (the
+/// f32 stays the golden/host reference; the fp8 serves the device path).
+pub type Weights8 = std::collections::HashMap<String, Fp8Weight>;
