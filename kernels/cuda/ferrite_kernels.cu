@@ -3306,6 +3306,13 @@ extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
 // dequantized f32 — this reads HALF the bytes; gemv/moe are HBM-bound).
 // A 16-element uint4 lane never crosses a 128-col scale block (128%16==0).
 // ============================================================
+// WPR: warps per row (K-split). 4 warps cooperate on one output row — the
+// single-warp/row v0 read HBM at ~1/3 the bf16_v2 rate (no latency hiding);
+// the K-split matches bf16_v2's structure (tile per WPR-warps, smem partial
+// reduce). kper is 16-aligned: a uint4 lane-step (16 fp8) never crosses a
+// 128-col scale block boundary (128 % 16 == 0), and slice starts land on
+// scale-block boundaries whenever in_f is 128-aligned (all real shapes).
+template <int WPR>
 __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
                                    const unsigned char* __restrict__ w,
                                    const float* __restrict__ scale,
@@ -3313,32 +3320,62 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
                                    float* __restrict__ y,
                                    int in_f, int out_f, int nrows,
                                    int srows, int scols) {
+    (void)srows;
+    const int warps = blockDim.x >> 5;
+    const int rpb = warps / WPR;               // rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int rowg = blockIdx.x + 0 * warp; // placeholder-neutral
-    (void)rowg;
-    const int rg = blockIdx.x * (blockDim.x >> 5) + warp;
-    const int token = rg / out_f;
-    const int row = rg - token * out_f;
+    const int rowg = blockIdx.x * rpb + warp / WPR;   // global row
+    const int token = rowg / out_f;
+    const int row = rowg - token * out_f;
+    const int kw = warp % WPR;                 // K-slice id
     float acc = 0.f;
-    if (rg < nrows * out_f) {
+    if (rowg < nrows * out_f) {
         const unsigned char* wr = w + (size_t)row * in_f;
         const float* xr = x + (size_t)token * in_f;
         const float* srow = scale + (size_t)(row >> 7) * scols;
-        // lane-strided uint4 walk: 16 fp8 per iter; one block-scale fetch
-        // per 128-col segment (scale constant inside the segment).
-        int k = lane * 16;
-        for (; k + 15 < in_f; k += 32 * 16) {
+        int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
+        int k0 = kw * kper;
+        int k1 = min(k0 + kper, in_f);
+        // vector body: uint4 = 16 fp8; scale fetched per 128-col block
+        // (constant within the 16-lane step; k%16==0 keeps the step inside
+        // one block).
+        int k = k0 + lane * 16;
+        #pragma unroll 2
+        for (; k + 15 < k1; k += 32 * 16) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
-            float sc = srow[k >> 7];
-            const float* xk = xr + k;
-            #pragma unroll
-            for (int e = 0; e < 16; e++) {
-                acc += (__half2float(__nv_cvt_fp8_to_halfraw(w8[e], __NV_E4M3)) * sc) * xk[e];
-            }
+            const float sc = srow[k >> 7];
+            const float4 xa = *reinterpret_cast<const float4*>(xr + k);
+            const float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
+            const float4 xc = *reinterpret_cast<const float4*>(xr + k + 8);
+            const float4 xd = *reinterpret_cast<const float4*>(xr + k + 12);
+            const float wq[16] = {
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[0], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[1], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[2], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[3], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[4], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[5], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[6], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[7], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[8], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[9], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[10], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[11], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[12], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[13], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[14], __NV_E4M3)) * sc,
+                __half2float(__nv_cvt_fp8_to_halfraw(w8[15], __NV_E4M3)) * sc,
+            };
+            acc += xa.x * wq[0] + xa.y * wq[1] + xa.z * wq[2] + xa.w * wq[3];
+            acc += xb.x * wq[4] + xb.y * wq[5] + xb.z * wq[6] + xb.w * wq[7];
+            acc += xc.x * wq[8] + xc.y * wq[9] + xc.z * wq[10] + xc.w * wq[11];
+            acc += xd.x * wq[12] + xd.y * wq[13] + xd.z * wq[14] + xd.w * wq[15];
         }
-        for (; k < in_f; k++) {
-            float sc = srow[k >> 7];
+        // scalar tail: elements past the last full uint4 step (in_f % 16
+        // != 0 slice ends, misaligned k1) — one fp8 per lane iteration.
+        for (; k < k1; k++) {
+            const float sc = srow[k >> 7];
             acc += (__half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc) * xr[k];
         }
     }
@@ -3346,8 +3383,18 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     for (int off = 16; off > 0; off >>= 1) {
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
-    if (lane == 0 && rg < nrows * out_f) {
-        y[rg] = (bias ? bias[row] : 0.f) + acc;
+    if (WPR == 1) {
+        if (lane == 0 && rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + acc;
+    } else {
+        __shared__ float part[16];
+        if (lane == 0) part[warp] = acc;
+        __syncthreads();
+        if (warp % WPR == 0 && lane == 0) {
+            float sum = 0.f;
+            #pragma unroll
+            for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
+            if (rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + sum;
+        }
     }
 }
 
@@ -3358,9 +3405,11 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           cudaStream_t s) {
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
     long total = (long)nrows * out_f;
-    dim3 grid((unsigned)((total + 7) / 8));  // 8 warps/block, 1 row/warp
+    constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
+    const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
+    dim3 grid((unsigned)((total + rpb - 1) / rpb));
     dim3 block(256);
-    gemv_fp8_v2_kernel<<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
-                                              in_f, out_f, nrows, srows, scols);
+    gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
+                                                   in_f, out_f, nrows, srows, scols);
     return cudaGetLastError();
 }
