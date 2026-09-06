@@ -866,26 +866,13 @@ impl<B: KernelBackend> TpCluster<B> {
                         mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
                         h_cur = Some(hout);
                     }
-                    // FIX v2 (accept=1.0 root): seed MtpState.hprev from
-                    // hf_dev — the DECODER's h_final for the prompt tail (the
-                    // same h the catch-up's token-0 uses as h_prev, and the
-                    // semantic the steady-state commit provides via
-                    // hf_v[k-1] = decoder h_final). The previous hout-chain
-                    // seeding (MTP-layer x2) mismatched the steady-state
-                    // h_prev semantics (decoder h_final), sending the draft's
-                    // d2 chain sideways from step 1 (d2 garbage → slot-15 KV
-                    // pollution → next-step pool-3 aggregation → d1 argmax
-                    // flips → accept=1.0 forever).
-                    {
-                        let cuda = s
-                            .backend
-                            .as_cuda()
-                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                        let m = cuda.mtp.lock().unwrap();
-                        if let Some(m) = m.as_ref() {
-                            cuda.copy_dev(&m.hf_dev, 0, m.hprev.as_f32(), hidden)?;
-                        }
-                    }
+                    // NOTE: NO hprev seeding — the ORIGINAL mtp_step leaves
+                    // hprev as pool residue for step 1 (garbage → S1 k=1 →
+                    // S2 hprev=hf_v[0] → the original token stream enters the
+                    // high-predictability regime where accept reaches 2.38).
+                    // Seeding (hf_dev) made S1 k=2 → stream diverged into
+                    // low-predictability tokens (a0=1/320 long-tail) →
+                    // accept stayed 1.0. Restoring the original behavior.
                     Ok::<(), FerriteError>(())
                 })
                 .into_iter()
