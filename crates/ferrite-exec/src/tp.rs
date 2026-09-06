@@ -1261,8 +1261,12 @@ impl<B: KernelBackend> TpCluster<B> {
                         let mut eb = [0f32; 4];
                         let re = ferrite_kernel::cuda::memcpy_d2h_sync(
                             emb1_ptr as *mut std::ffi::c_void, eb.as_mut_ptr(), 4, cuda.stream_handle());
-                        let last_emb: Vec<f32> = s.embed(&[last]).as_slice()[..4].to_vec();
-                        eprintln!("[zh2d-eb] emb1[0..4]={:?} host_embed={:?} r={}", eb, last_emb, re);
+                        let last_emb_full = s.embed(&[last]).as_slice().to_vec();
+                        let mut eb_full = vec![0f32; hidden];
+                        let re2 = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            emb1_ptr as *mut std::ffi::c_void, eb_full.as_mut_ptr(), hidden, cuda.stream_handle());
+                        let mism = eb_full.iter().zip(last_emb_full.iter()).filter(|(a, b)| a != b).count();
+                        eprintln!("[zh2d-eb] emb1[0..4]={:?} full4096_mismatch={} r={}/{}", &eb_full[..4], mism, re, re2);
                     }
                 } // cuda dropped
 
