@@ -293,6 +293,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-dispatch"
+version = "0.1.0"
+dependencies = [
+ "ferrite-kv",
+ "ferrite-model",
+ "ferrite-types",
+]
+
+[[package]]
 name = "ferrite-exec"
 version = "0.1.0"
 dependencies = [
