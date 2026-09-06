@@ -1636,3 +1636,91 @@ fn fp8_mma_layout_probe() {
     eprintln!("[fp8-mma] C[0]={:.4} C[1]={:.4} C[2]={:.4} (layout check)", C[0], C[1], C[2]);
     assert!(maxd < 1e-4, "fp8 mma fragment layout wrong: max_diff {maxd:.3e} at ({},{})", worst.0, worst.1);
 }
+
+/// W8A8 gemv parity + speed: the tensor-core fp8 gemv (mma.sync m16n8k32,
+/// activations quantized in-kernel per-token absmax/448, e4m3 x e4m3 direct)
+/// vs the CPU golden (e4m3(W)·w_scale·e4m3(x/x_s)·x_s block-quantized dot)
+/// and the bf16 gemv (the n=1 baseline). Aligned shapes only (in%128==0,
+/// out%16==0 — GLM weights all comply; misaligned serve the W8A16 fallback).
+#[test]
+fn gemv_fp8_mma_parity_and_speed() {
+    let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
+    dev.enter();
+    let mut rnd = 0xfeed_beef_cafe_f00du64;
+    let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
+    for &(in_f, out_f) in &[(4096usize, 512usize), (4096usize, 1536usize)] {
+        // W: random e4m3 + 128-block scales (real quantizer: max/448)
+        let wv: Vec<f32> = (0..out_f * in_f).map(|_| r() * 0.05).collect();
+        let srows = out_f / 128;
+        let scols = in_f / 128;
+        let mut scale = vec![0f32; srows * scols];
+        for br in 0..srows { for bc in 0..scols {
+            let mut m = 0f32;
+            for i in 0..128 { for jj in 0..128 { m = m.max(wv[(br * 128 + i) * in_f + bc * 128 + jj].abs()); } }
+            scale[br * scols + bc] = m / 448.0;
+        }}
+        let wbytes: Vec<u8> = (0..out_f * in_f)
+            .map(|i| fp8_encode((wv[i] / scale[(i / in_f) / 128 * scols + (i % in_f) / 128]).clamp(-448.0, 448.0)))
+            .collect();
+        // x: f32 (the kernel quantizes in-kernel — golden must replicate)
+        let x: Vec<f32> = (0..in_f).map(|_| r() * 2.0 - 1.0).collect();
+        // register fp8 (golden Tensor + bytes + scale) → matmul_dev n=1 → W8A8
+        let w_t = Tensor::from_f32(Shape::new([out_f, in_f]), vec![0f32; out_f * in_f]);
+        dev.register_fp8(&w_t, out_f, in_f, &wbytes, &scale).expect("register");
+        let x_dev = DevBuf::alloc(dev.dev(), dev.stream(), in_f).unwrap();
+        x_dev.upload(&x).unwrap();
+        let y = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).expect("W8A8 gemv");
+        dev.sync().unwrap();
+        let mut got = vec![0f32; out_f];
+        y.download(&mut got).unwrap();
+
+        // CPU golden: x_scale = absmax/448 (kernel's per-token quant); x_q =
+        // e4m3(x/x_scale); y[m] = Σ_k e4m3(W)·w_s[m/128][k/128]·e4m3(x_q)·x_scale
+        let x_amax = x.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let x_scale = x_amax / 448.0;
+        let xq: Vec<u8> = x.iter().map(|&v| fp8_encode((v / x_scale).clamp(-448.0, 448.0))).collect();
+        let mut golden = vec![0f32; out_f];
+        for m in 0..out_f {
+            let ws_row = (m / 128) * scols;
+            let mut acc = 0f64;
+            for k in 0..in_f {
+                let wk = e4m3_decode(wbytes[m * in_f + k]) as f64 * scale[ws_row + k / 128] as f64;
+                acc += wk * e4m3_decode(xq[k]) as f64 * x_scale as f64;
+            }
+            golden[m] = acc as f32;
+        }
+        // parity: W8A8 = double quantization (W + x) — relative tolerance
+        let mut maxd = 0f32;
+        let mut rel = 0f32;
+        for m in 0..out_f {
+            let d = (got[m] - golden[m]).abs();
+            maxd = maxd.max(d);
+            rel = rel.max(d / golden[m].abs().max(1e-6));
+        }
+        eprintln!("[w8a8-gemv {out_f}x{in_f}] parity maxd={maxd:.3e} rel={rel:.3e}");
+        assert!(rel < 1e-2, "W8A8 gemv parity {out_f}x{in_f}: rel {rel:.3e} (maxd {maxd:.3e}) — kernel quantization mismatch (in-kernel half-round vs test f32-round is ≤1ulp e4m3, not this large)");
+
+        // bench: W8A8 (this dev) vs bf16 (dev1, unregistered tensor)
+        let iters = 500;
+        for _ in 0..20 { let _ = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).unwrap(); }
+        dev.sync().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters { let _ = dev.matmul_dev(&x_dev, &w_t, 1, in_f as i32, out_f as i32).unwrap(); }
+        dev.sync().unwrap();
+        let w8a8_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let dev2 = CudaBackend::with_device(&so_path(), 1).expect("cuda 1");
+        dev2.enter();
+        let w_bf = Tensor::from_f32(Shape::new([out_f, in_f]), wv.clone()); // f32 → bf16 path
+        let x2 = DevBuf::alloc(dev2.dev(), dev2.stream(), in_f).unwrap();
+        x2.upload(&x).unwrap();
+        for _ in 0..20 { let _ = dev2.matmul_dev(&x2, &w_bf, 1, in_f as i32, out_f as i32).unwrap(); }
+        dev2.sync().unwrap();
+        let t1 = std::time::Instant::now();
+        for _ in 0..iters { let _ = dev2.matmul_dev(&x2, &w_bf, 1, in_f as i32, out_f as i32).unwrap(); }
+        dev2.sync().unwrap();
+        let bf16_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
+        let bytes = (out_f * in_f) as f64;
+        eprintln!("[w8a8-gemv {out_f}x{in_f}] W8A8={w8a8_us:.1}us ({:.2}GB/s eff) bf16={bf16_us:.1}us ({:.2}GB/s) ratio={:.2}x",
+            bytes / 1.0 / w8a8_us, bytes * 2.0 / 1.0 / bf16_us, bf16_us / w8a8_us);
+    }
+}

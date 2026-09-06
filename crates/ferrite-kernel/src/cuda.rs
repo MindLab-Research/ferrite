@@ -53,6 +53,9 @@ extern "C" {
                            in_f: i32, out_f: i32, nrows: i32,
                            srows: i32, scols: i32, s: CuStream) -> i32;
     fn ferrite_fp8_mma_probe(A: *const u8, B: *const u8, C: *mut f32, s: CuStream) -> i32;
+    fn ferrite_gemv_fp8_mma(x: *const f32, w: *const std::ffi::c_void, w_scale: *const f32,
+                            out: *mut f32, in_f: i32, out_f: i32,
+                            srows: i32, scols: i32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
@@ -862,6 +865,23 @@ impl CudaBackend {
         // domain stays uniform across prefill/decode, which matters more than
         // prefill speed here).
         if let Some(f8) = self.fp8_lookup(w) {
+            // W8A8 tensor-core path (n=1 decode, GLM-aligned shapes): the
+            // mma.sync m16n8k32 e4m3 gemv — activations quantized in-kernel
+            // (per-token absmax/448), e4m3 x e4m3 multiplied directly on the
+            // tensor core (NO per-element dequant — the W8A16 attempt's cvt
+            // overhead offset the HBM savings: 0.96x vs bf16). Misaligned
+            // shapes / n>1 fall back to the W8A16 gemv below (kept).
+            if n == 1 && in_f % 128 == 0 && out_f % 16 == 0 && f8.scols == (in_f as i32 + 127) / 128 {
+                let do_ = DevBuf::alloc(self.dev, self.stream, out_f as usize)?;
+                let r = unsafe {
+                    ferrite_gemv_fp8_mma(x_dev.as_const_f32(), f8.w, f8.scale as *const f32,
+                                         do_.as_f32(), in_f, out_f, f8.srows, f8.scols, self.stream)
+                };
+                if r == 0 {
+                    return Ok(do_);
+                }
+                // cudaErrorNotSupported (unaligned): fall through to W8A16
+            }
             let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
             ck(unsafe {
                 ferrite_gemv_fp8_v2(x_dev.as_const_f32(), f8.w as *const _, f8.scale as *const f32, std::ptr::null(),
