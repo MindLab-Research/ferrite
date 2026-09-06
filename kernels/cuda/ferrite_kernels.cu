@@ -3296,3 +3296,70 @@ extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
                                              gdn_len, hf_v, hprev, hidden);
     return cudaGetLastError();
 }
+
+// ============================================================
+// gemv_fp8_v2: uint4 16x fp8 weights + 128x128-block scale inline dequant
+// (w_f32 = fp8_e4m3(raw) * s[row/128][col/128] — EXACTLY the checkpoint's
+// dequant_block semantics, f32 x, f32 accumulate). Native-precision path:
+// the weights stay in their checkpoint fp8 (the bf16 path re-quantized the
+// dequantized f32 — this reads HALF the bytes; gemv/moe are HBM-bound).
+// A 16-element uint4 lane never crosses a 128-col scale block (128%16==0).
+// ============================================================
+__global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
+                                   const unsigned char* __restrict__ w,
+                                   const float* __restrict__ scale,
+                                   const float* __restrict__ bias,
+                                   float* __restrict__ y,
+                                   int in_f, int out_f, int nrows,
+                                   int srows, int scols) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int rowg = blockIdx.x + 0 * warp; // placeholder-neutral
+    (void)rowg;
+    const int rg = blockIdx.x * (blockDim.x >> 5) + warp;
+    const int token = rg / out_f;
+    const int row = rg - token * out_f;
+    float acc = 0.f;
+    if (rg < nrows * out_f) {
+        const unsigned char* wr = w + (size_t)row * in_f;
+        const float* xr = x + (size_t)token * in_f;
+        const float* srow = scale + (size_t)(row >> 7) * scols;
+        // lane-strided uint4 walk: 16 fp8 per iter; one block-scale fetch
+        // per 128-col segment (scale constant inside the segment).
+        int k = lane * 16;
+        for (; k + 15 < in_f; k += 32 * 16) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            const __nv_fp8_e4m3* w8 = reinterpret_cast<const __nv_fp8_e4m3*>(&wv);
+            float sc = srow[k >> 7];
+            const float* xk = xr + k;
+            #pragma unroll
+            for (int e = 0; e < 16; e++) {
+                acc += (__half2float(__nv_cvt_fp8_to_halfraw(w8[e], __NV_E4M3)) * sc) * xk[e];
+            }
+        }
+        for (; k < in_f; k++) {
+            float sc = srow[k >> 7];
+            acc += (__half2float(__nv_cvt_fp8_to_halfraw((const __nv_fp8_e4m3&)wr[k], __NV_E4M3)) * sc) * xr[k];
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (lane == 0 && rg < nrows * out_f) {
+        y[rg] = (bias ? bias[row] : 0.f) + acc;
+    }
+}
+
+extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
+                                          const float* scale, const float* bias,
+                                          float* out, int in_f, int out_f,
+                                          int nrows, int srows, int scols,
+                                          cudaStream_t s) {
+    if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
+    long total = (long)nrows * out_f;
+    dim3 grid((unsigned)((total + 7) / 8));  // 8 warps/block, 1 row/warp
+    dim3 block(256);
+    gemv_fp8_v2_kernel<<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
+                                              in_f, out_f, nrows, srows, scols);
+    return cudaGetLastError();
+}
