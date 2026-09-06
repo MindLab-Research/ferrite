@@ -77,6 +77,15 @@ extern "C" {
     fn ferrite_embed_expand(table: *const std::ffi::c_void, ids: *const i32,
                             out: *mut f32, n: i32, hidden: i32, mult: i32,
                             vocab: i32, s: CuStream) -> i32;
+    fn ferrite_mtp_accept(d1: *const f32, d2: *const f32, a: *const f32,
+                          k_out: *mut i32, next_token: *mut i32, n_accepted: *mut i32,
+                          s: CuStream) -> i32;
+    fn ferrite_embed_expand_dev(table: *const std::ffi::c_void, ids_dev: *const i32,
+                               out: *mut f32, n: i32, hidden: i32, mult: i32,
+                               vocab: i32, s: CuStream) -> i32;
+    fn ferrite_embed_one(table: *const std::ffi::c_void, token_slot: *const i32,
+                        out: *mut f32, hidden: i32, mult: i32,
+                        vocab: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
                                  k_nope: *mut f32, v: *mut f32, k_idx: *mut f32, k_gate: *mut f32,
                                  t0_ptr: *const i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
@@ -431,6 +440,30 @@ pub struct MtpState {
     /// gdn_b1) + a pinned k slot. One ferrite_mtp_commit launch replaces
     /// 2*n_gdn cudaMemcpyAsync D2Ds + the hprev row select.
     pub commit: Option<MtpCommitPlan>,
+    /// ZERO-H2D device token chain (user mandate: the entire decode loop
+    /// must have no host-to-device transfers — D2H between steps is allowed
+    /// for SSE). The token IDs never leave the device: argmax (device) →
+    /// accept kernel (device) → embed kernel (device) → graph input
+    /// (device) → next step. Host reads 8 bytes D2H per step (k +
+    /// next_token for seq tracking + API response).
+    ///
+    /// [0] = last accepted token (written by accept kernel or initial prompt)
+    /// [1] = draft d1 (written by draft chain argmax)
+    /// [2] = draft d2 (written by draft chain argmax)
+    pub tokens_dev: DevBuf,      // [3] i32 — the token chain (device)
+    /// verify graph's argmax output [3] (a0, a1, a2 — the graph writes here
+    /// at replay; the accept kernel reads it to compare against d1/d2)
+    pub verify_argmax_dev: DevBuf, // [3] f32 — argmax of the verify graph
+    /// accept kernel outputs (device, read D2H by host for seq + SSE)
+    pub k_dev: DevBuf,            // [1] i32 — accept count 1/2/3
+    pub next_token_dev: DevBuf,   // [1] i32 — next step's "last" token
+    pub n_accepted_dev: DevBuf,   // [1] i32 — tokens accepted this step
+    /// draft chain embeds (fixed bufs, embed_one kernel output)
+    pub emb1_dev: DevBuf,         // [hidden] f32 — draft 1's embed
+    pub emb2_dev: DevBuf,         // [hidden] f32 — draft 2's embed
+    /// draft argmax outputs (device, from mtp_forward's argmax)
+    pub d1_argmax_dev: DevBuf,    // [1] f32 — draft 1 token (argmax output)
+    pub d2_argmax_dev: DevBuf,    // [1] f32 — draft 2 token (argmax output)
 }
 
 /// Device-resident commit pointer table for ferrite_mtp_commit. `plan`
@@ -3207,6 +3240,84 @@ impl CudaBackend {
         Ok(())
     }
 
+    // ================================================================
+    // Zero-H2D device-resident MTP chain (user mandate: the ENTIRE decode
+    // loop must have no host-to-device transfers). The token never leaves
+    // the device: argmax output (device) → embed kernel reads it → graph
+    // input (device) → graph replay → argmax (device) → accept kernel
+    // (device) → commit kernel reads k from device → next step.
+    // Host reads 8 bytes D2H per step (k + next_token for API response).
+    // ================================================================
+
+    /// Embed ONE token from a device int slot (the argmax/accept output —
+    /// never crosses to host) into the hc_expand'd graph input [mult, hidden].
+    /// Replaces: host embed lookup + hc_expand 64KB Vec + DevBuf upload 4KB
+    /// H2D → ONE kernel reading 4B from device.
+    pub fn embed_one_dev(
+        &self,
+        table: &Tensor,
+        token_slot: *const i32,
+        out: *mut f32,
+        hidden: usize,
+        mult: usize,
+    ) -> Result<()> {
+        self.enter();
+        let dw = self.dev_weight(table)?; // F32 (bit-identical numeric domain)
+        let vocab = table.shape.0[0];
+        ck(
+            unsafe {
+                ferrite_embed_one(dw.ptr, token_slot, out, hidden as i32, mult as i32, vocab as i32, self.stream)
+            },
+            "embed_one_dev",
+        )?;
+        Ok(())
+    }
+
+    /// Embed n tokens from a device int buf (the token chain: [last, d1, d2])
+    /// into the graph input [n, mult, hidden] — the verify graph's input
+    /// written entirely on device.
+    pub fn embed_expand_dev_buf(
+        &self,
+        table: &Tensor,
+        ids_dev: *const i32,
+        out: *mut f32,
+        n: usize,
+        hidden: usize,
+        mult: usize,
+    ) -> Result<()> {
+        self.enter();
+        let dw = self.dev_weight(table)?;
+        let vocab = table.shape.0[0];
+        ck(
+            unsafe {
+                ferrite_embed_expand_dev(dw.ptr, ids_dev, out, n as i32, hidden as i32, mult as i32, vocab as i32, self.stream)
+            },
+            "embed_expand_dev",
+        )?;
+        Ok(())
+    }
+
+    /// MTP accept on device: compares draft d1/d2 vs verify a[0..2] (ALL
+    /// device bufs — the argmax outputs never cross to host), writes k +
+    /// next_token + n_accepted to device int slots. The host reads these
+    /// 8-12 bytes D2H per step for API response / seq tracking.
+    pub fn mtp_accept_dev(
+        &self,
+        d1: *const f32,
+        d2: *const f32,
+        a: *const f32,
+        k_out: *mut i32,
+        next_token: *mut i32,
+        n_accepted: *mut i32,
+    ) -> Result<()> {
+        self.enter();
+        ck(
+            unsafe { ferrite_mtp_accept(d1, d2, a, k_out, next_token, n_accepted, self.stream) },
+            "mtp_accept",
+        )?;
+        Ok(())
+    }
+
     /// D2D copy with source offset (elements): dst[0..n] = src[src_off..src_off+n].
     /// Used by the MTP verify chain to export h_final's last row into the
     /// draft's fixed h_prev staging buffer (capture-safe graph node).
@@ -3237,6 +3348,43 @@ impl CudaBackend {
                 self.stream,
             )
         }, "copy_raw_dev")?;
+        Ok(())
+    }
+
+    /// MTP accept commit with k from a DEVICE buffer (zero-H2D chain: the
+    /// accept kernel wrote k to k_dev on device — no host round-trip).
+    /// Same commit kernel as the pinned variant, but reads k from device.
+    pub fn mtp_commit_dev(&self, k_dev: *const i32) -> Result<()> {
+        let m = self.mtp.lock().unwrap();
+        let m = m
+            .as_ref()
+            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+        let cp = m
+            .commit
+            .as_ref()
+            .ok_or_else(|| FerriteError::Config("mtp commit plan missing".into()))?;
+        self.enter();
+        // the commit kernel reads k from a device pointer — the pinned k_pin
+        // slot is still written for the legacy path, but the kernel parameter
+        // points at the device slot for the zero-H2D chain.
+        // For now we pass the device k pointer as the "pinned" pointer (the
+        // kernel dereferences it the same way — zero-copy device read).
+        ck(
+            unsafe {
+                ferrite_mtp_commit(
+                    k_dev,
+                    cp.plan.as_f32() as *const *mut f32,
+                    cp.n as i32,
+                    cp.conv_len as i32,
+                    cp.gdn_len as i32,
+                    m.hf_v.as_const_f32(),
+                    m.hprev.as_f32(),
+                    cp.hidden as i32,
+                    self.stream,
+                )
+            },
+            "mtp_commit_dev",
+        )?;
         Ok(())
     }
 

@@ -4153,3 +4153,117 @@ extern "C" cudaError_t ferrite_embed_expand(
         (const float*)table, ids, out, n, hidden, mult, vocab);
     return cudaGetLastError();
 }
+
+// ============================================================
+// Device-resident MTP accept kernel: compares draft d1/d2 vs verify a0/a1/a2
+// (ALL device buffers — the argmax outputs never cross to host), writes k
+// and next_token to device slots. The host reads 8 bytes D2H per step
+// (k + next_token for API response + seq tracking) — the ENTIRE decode
+// loop is zero-H2D after the initial prompt upload.
+// ============================================================
+__global__ void mtp_accept_kernel(
+    const float* __restrict__ d1,        // [1] draft argmax (device)
+    const float* __restrict__ d2,        // [1] draft argmax (device)
+    const float* __restrict__ a,         // [3] verify argmax (device: a0,a1,a2)
+    int* __restrict__ k_out,             // [1] accept count 1/2/3
+    int* __restrict__ next_token,        // [1] next "last" token for the loop
+    int* __restrict__ n_accepted         // [1] tokens accepted this step (for host read)
+) {
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int d1_i = (int)d1[0];
+        int d2_i = (int)d2[0];
+        int a0_i = (int)a[0];
+        int a1_i = (int)a[1];
+        int a2_i = (int)a[2];
+        int k, nt;
+        if (d1_i == a0_i) {
+            if (d2_i == a1_i) {
+                k = 3; nt = a2_i; n_accepted[0] = 3;
+            } else {
+                k = 2; nt = a1_i; n_accepted[0] = 2;
+            }
+        } else {
+            k = 1; nt = a0_i; n_accepted[0] = 1;
+        }
+        *k_out = k;
+        *next_token = nt;
+    }
+}
+
+extern "C" cudaError_t ferrite_mtp_accept(
+    const float* d1, const float* d2, const float* a,
+    int* k_out, int* next_token, int* n_accepted,
+    cudaStream_t s)
+{
+    mtp_accept_kernel<<<1, 1, 0, s>>>(d1, d2, a, k_out, next_token, n_accepted);
+    return cudaGetLastError();
+}
+
+// ============================================================
+// Device token-chain embed: reads token IDs from a DEVICE int buffer
+// (the previous step's accept kernel output or the initial prompt H2D)
+// and writes the expanded graph input [n, mult, hidden]. This is the
+// ZERO-H2D replacement for the host embed lookup + hc_expand + staging
+// upload: the token never leaves the device.
+// ============================================================
+__global__ void embed_expand_dev_kernel(
+    const float* __restrict__ table,         // [vocab, hidden] resident F32
+    const int* __restrict__ ids_dev,         // [n] token ids (DEVICE buf)
+    float* __restrict__ out,                  // [n, mult, hidden] graph input
+    int n, int hidden, int mult, int vocab)
+{
+    int t = blockIdx.x;
+    if (t >= n) return;
+    int id = ids_dev[t];
+    if (id < 0 || id >= vocab) id = 0;
+    const float* row = table + (size_t)id * hidden;
+    float* dst = out + (size_t)t * mult * hidden;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
+        float v = row[j];
+        for (int m = 0; m < mult; m++) {
+            dst[(size_t)m * hidden + j] = v;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_embed_expand_dev(
+    const void* table, const int* ids_dev, float* out,
+    int n, int hidden, int mult, int vocab, cudaStream_t s)
+{
+    if (n <= 0) return cudaSuccess;
+    embed_expand_dev_kernel<<<n, 256, 0, s>>>(
+        (const float*)table, ids_dev, out, n, hidden, mult, vocab);
+    return cudaGetLastError();
+}
+
+// ============================================================
+// Draft embed: reads ONE token from a device int slot (the previous argmax
+// or accept output), embeds it (table lookup + MHC expand) into a device
+// buffer — replaces the host embed lookup + hc_expand + DevBuf::upload
+// (4KB H2D) with a single kernel reading 4B from device.
+// ============================================================
+__global__ void embed_one_kernel(
+    const float* __restrict__ table,         // [vocab, hidden] resident F32
+    const int* __restrict__ token_slot,      // [1] device int (the token)
+    float* __restrict__ out,                  // [mult * hidden] (hc_expand'd)
+    int hidden, int mult, int vocab)
+{
+    int id = token_slot[0];
+    if (id < 0 || id >= vocab) id = 0;
+    const float* row = table + (size_t)id * hidden;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
+        float v = row[j];
+        for (int m = 0; m < mult; m++) {
+            out[(size_t)m * hidden + j] = v;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_embed_one(
+    const void* table, const int* token_slot, float* out,
+    int hidden, int mult, int vocab, cudaStream_t s)
+{
+    embed_one_kernel<<<1, 256, 0, s>>>(
+        (const float*)table, token_slot, out, hidden, mult, vocab);
+    return cudaGetLastError();
+}
