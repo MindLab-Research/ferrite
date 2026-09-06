@@ -1365,14 +1365,22 @@ impl<B: KernelBackend> TpCluster<B> {
                     // (d1 vs a0 mismatch = verify input path bug; checksum vs
                     // the original hc_expand identifies embed_expand_dev issues)
                     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                        // verify input checksum (first 8 values from staging)
-                        let mut vin_chk = [0f32; 8];
+                        // RAW values (no trunc — embedding magnitudes are ~0.01,
+                        // trunc() displayed them as 0.0 which looked like a bug
+                        // but is NORMAL). Plus the host expected hc_expand for
+                        // direct device-vs-host comparison.
+                        let mut vin_chk = [0f32; 4];
                         let rc = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            io.x_stage, vin_chk.as_mut_ptr(), 8, cuda.stream_handle());
-                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} a1={:.0} a2={:.0} k={} vin[0..4]={:?} r={}",
-                            d1_val[0], d2_val[0], a[0], a[1], a[2],
+                            io.x_stage, vin_chk.as_mut_ptr(), 4, cuda.stream_handle());
+                        let h2v = s.embed(&[last, d1_val[0] as u32, d2_val[0] as u32]);
+                        let exp = crate::mhc::hc_expand(&h2v, hc_mult);
+                        let exp_s = exp.as_slice();
+                        let match_ct = vin_chk.iter().zip(exp_s.iter()).take(4)
+                            .filter(|(a, b)| (a - b).abs() < 1e-3).count();
+                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} k={} vin_raw={:?} exp_host={:?} match={}/4 r={}",
+                            d1_val[0], d2_val[0], a[0],
                             if d1_val[0] as u32 == a[0] as u32 { "==" } else { "!=" },
-                            vin_chk.iter().map(|v| v.trunc()).collect::<Vec<_>>(), rc);
+                            vin_chk, &exp_s[..4], match_ct, rc);
                     }
                     let k_host = if d1_val[0] as u32 == a[0] as u32 {
                         if d2_val[0] as u32 == a[1] as u32 { 3 } else { 2 }
