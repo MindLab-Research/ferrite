@@ -48,6 +48,10 @@ extern "C" {
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_fp8_v2(x: *const f32, w: *const std::ffi::c_void,
+                           scale: *const f32, bias: *const f32, out: *mut f32,
+                           in_f: i32, out_f: i32, nrows: i32,
+                           srows: i32, scols: i32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
@@ -420,6 +424,18 @@ pub struct MtpCommitPlan {
     pub hidden: usize,
 }
 
+/// Device-resident fp8 weight (raw F8_E4M3 bytes + block scales). Send+Sync
+/// raw pointers — owned by the fp8_map, freed on clear_weight_cache.
+#[derive(Clone, Copy)]
+pub struct Fp8Dev {
+    pub w: *mut std::ffi::c_void,
+    pub scale: *mut std::ffi::c_void,
+    pub srows: i32,
+    pub scols: i32,
+}
+unsafe impl Send for Fp8Dev {}
+unsafe impl Sync for Fp8Dev {}
+
 pub struct CudaBackend {
     stream: CuStream,
     /// Device index this backend is bound to. cudaSetDevice is THREAD-LOCAL:
@@ -446,6 +462,13 @@ pub struct CudaBackend {
     /// experts' rows through them with zero host round-trips. Keyed by the
     /// first expert's gate tensor pointer (stable per layer).
     moe_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoePtrTable>>,
+    /// FP8 bypass registry: f32 golden's (ptr, numel) → device (raw F8 bytes
+    /// + 128x128 block scale). matmul_dev looks up EVERY weight by the
+    /// caller-passed &Tensor — a hit serves the native-precision fp8 GEMV
+    /// (half the bf16 HBM traffic), a miss keeps bf16. Keyed at set_fp8
+    /// registration (same-name golden/fp8 shard pairing), zero call-site
+    /// churn in the exec layer.
+    fp8_map: std::sync::Mutex<std::collections::HashMap<(usize, usize), Fp8Dev>>,
     /// Named CUDA graphs (per layer-segment): FERRITE_GRAPH_LAYER captures
     /// each segment's op sequence once and replays per token — the per-op
     /// launch gaps (~30μs × ~19 ops/layer) are the decode bottleneck after
@@ -505,6 +528,7 @@ impl CudaBackend {
             conv_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
@@ -623,6 +647,66 @@ impl CudaBackend {
         Ok(DevRef { ptr, len: n })
     }
 
+    /// Register an fp8 bypass for `golden` (the f32 weight Tensor callers
+    /// keep passing around): uploads the raw F8 bytes + block scales, keyed
+    /// by the golden's (ptr, numel). Every matmul_dev on that Tensor from
+    /// then on serves from the fp8 kernel — zero call-site changes; a
+    /// weight never registered (or a shard seam misaligned for fp8) just
+    /// keeps the bf16 path. Registration is idempotent (re-register hits
+    /// the cache and returns).
+    pub fn register_fp8(
+        &self,
+        golden: &Tensor,
+        rows: usize,
+        cols: usize,
+        data: &[u8],
+        scale: &[f32],
+    ) -> Result<()> {
+        self.enter();
+        let key = (golden.as_slice().as_ptr() as usize, golden.numel());
+        {
+            let m = self.fp8_map.lock().unwrap();
+            if m.contains_key(&key) {
+                return Ok(());
+            }
+        }
+        if data.len() != rows * cols {
+            return Err(FerriteError::InvalidArg(format!(
+                "register_fp8: data {} != rows*cols {}*{}",
+                data.len(), rows, cols
+            )));
+        }
+        let srows = rows.div_ceil(128);
+        let scols = cols.div_ceil(128);
+        if scale.len() != srows * scols {
+            return Err(FerriteError::InvalidArg(format!(
+                "register_fp8: scale {} != {}*{} (block 128)",
+                scale.len(), srows, scols
+            )));
+        }
+        let mut w: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut sc: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut w, data.len()) }, "fp8 w malloc")?;
+        ck(unsafe { cudaMalloc(&mut sc, scale.len() * 4) }, "fp8 scale malloc")?;
+        ck(unsafe { cudaMemcpy(w, data.as_ptr() as *const _, data.len(), CUDA_MEMCPY_H2D) }, "fp8 w H2D")?;
+        ck(unsafe { cudaMemcpy(sc, scale.as_ptr() as *const _, scale.len() * 4, CUDA_MEMCPY_H2D) }, "fp8 scale H2D")?;
+        self.fp8_map.lock().unwrap().insert(
+            key,
+            Fp8Dev { w, scale: sc, srows: srows as i32, scols: scols as i32 },
+        );
+        Ok(())
+    }
+
+    fn fp8_lookup(&self, t: &Tensor) -> Option<Fp8Dev> {
+        let key = (t.as_slice().as_ptr() as usize, t.numel());
+        self.fp8_map.lock().unwrap().get(&key).copied()
+    }
+
+    /// Number of registered fp8 bypass weights (diagnostics).
+    pub fn fp8_registered(&self) -> usize {
+        self.fp8_map.lock().unwrap().len()
+    }
+
     /// Preload a weight into device-resident storage (bf16 for 2-D matmul
     /// weights — run_matmul reads bf16 exclusively; 1-D tensors stay f32
     /// for the elementwise kernels). Serve calls this over every shard
@@ -733,6 +817,19 @@ impl CudaBackend {
     /// device. Building block for fused op chains (expert FFN).
     /// Weights are resident in bf16 (dev_weight_bf16).
     pub fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
+        // fp8 bypass: registered (ptr,numel) → native-precision F8 GEMV
+        // (half the bf16 HBM bytes). Serves ANY n (prefill n>3 included — the
+        // gemv loop covers it; slower than a tiled fp8 GEMM but the numeric
+        // domain stays uniform across prefill/decode, which matters more than
+        // prefill speed here).
+        if let Some(f8) = self.fp8_lookup(w) {
+            let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
+            ck(unsafe {
+                ferrite_gemv_fp8_v2(x_dev.as_const_f32(), f8.w as *const _, f8.scale as *const f32, std::ptr::null(),
+                                    do_.as_f32(), in_f, out_f, n, f8.srows, f8.scols, self.stream)
+            }, "gemv_fp8")?;
+            return Ok(do_);
+        }
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
@@ -782,6 +879,19 @@ impl CudaBackend {
     /// layer × 34 layers.
     pub fn gemv_tri_dev(&self, x_dev: &DevBuf, w1: &Tensor, w2: &Tensor, w3: &Tensor,
                         in_f: i32, o1: i32, o2: i32, o3: i32) -> Result<(DevBuf, DevBuf, DevBuf)> {
+        // fp8 domain-uniformity guard: if ANY of the three is registered fp8,
+        // serve all three through matmul_dev (fp8 GEMV) — the bf16 tri-kernel
+        // and the fp8 single GEMV produce different numerics, and the MTP
+        // draft (n==1, tri) vs verify (n==3, matmul) chains MUST stay in one
+        // domain or the accept decision flips (same failure class as the
+        // NCCL graph-order d2 flips). Cost: 2 extra launches × 34 layers on
+        // the draft chain (~0.3ms/step) until the fp8 tri kernel lands.
+        if self.fp8_lookup(w1).is_some() {
+            let y1 = self.matmul_dev(x_dev, w1, 1, in_f, o1)?;
+            let y2 = self.matmul_dev(x_dev, w2, 1, in_f, o2)?;
+            let y3 = self.matmul_dev(x_dev, w3, 1, in_f, o3)?;
+            return Ok((y1, y2, y3));
+        }
         let dw1 = self.dev_weight_bf16(w1)?;
         let dw2 = self.dev_weight_bf16(w2)?;
         let dw3 = self.dev_weight_bf16(w3)?;

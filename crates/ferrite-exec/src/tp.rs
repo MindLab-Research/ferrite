@@ -540,10 +540,25 @@ impl<B: KernelBackend> TpCluster<B> {
     /// set — those weights stay on the bf16 path on ALL ranks).
     pub fn set_fp8(&mut self, w8: &Weights8) {
         let n = self.shards.len();
+        let mut registered = 0usize;
         for rank in 0..n {
             let shard = shard_weights8_tp(w8, &self.full_cfg, rank, n);
+            // Register each fp8 weight against its f32 golden (same-name
+            // shard pairing) on the CUDA backend: matmul_dev hits by
+            // (ptr, numel) from then on. Non-CUDA backends skip (CPU path
+            // stays on the f32 golden — correctness reference).
+            for (name, f8) in shard.iter() {
+                let Some(golden) = self.shards[rank].weights.get(name) else { continue };
+                let Some(cuda) = self.shards[rank].backend.as_cuda() else { continue };
+                if let Err(e) = cuda.register_fp8(golden, f8.rows, f8.cols, &f8.data, &f8.scale) {
+                    eprintln!("[tp] fp8 register {} failed: {e} (stays bf16)", name);
+                } else {
+                    registered += 1;
+                }
+            }
             self.shards[rank].weights8 = shard;
         }
+        println!("[tp] fp8 bypass registered: {} weights (rank-avg {})", registered / n.max(1), registered);
     }
 
     /// Build a TP=world cluster from full weights. `mk_backend` constructs
