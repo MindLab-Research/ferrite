@@ -663,8 +663,9 @@ mod fp8_eligibility_tests {
         let dense = cfg.mlp_types.iter().position(|m| *m == MlpType::Dense).unwrap();
         assert!(is_fp8_eligible(&format!("model.layers.{dense}.mlp.gate_proj.weight"), Some(dense), &cfg));
         assert!(is_fp8_eligible(&format!("model.layers.{dense}.mlp.down_proj.weight"), Some(dense), &cfg));
-        // MTP/nextn layer (li == num_hidden_layers): treated as DSA — main proj fp8, indexer bf16
-        assert!(is_fp8_eligible(&format!("model.layers.{n}.self_attn.q_a_proj.weight"), Some(n), &cfg));
+        // MTP/nextn layer (li == num_hidden_layers): treated as DSA — main proj
+        // bf16 (same e2e rollback as the decoder MLA projections)
+        assert!(!is_fp8_eligible(&format!("model.layers.{n}.self_attn.q_a_proj.weight"), Some(n), &cfg));
         assert!(!is_fp8_eligible(&format!("model.layers.{n}.self_attn.indexer.wq_b.weight"), Some(n), &cfg));
     }
 }
