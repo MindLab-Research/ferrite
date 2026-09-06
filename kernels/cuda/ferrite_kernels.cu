@@ -2397,6 +2397,182 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     return cudaGetLastError();
 }
 
+
+// ============================================================
+// moe_fused_act_fp8_mma (W8A8): the act stage of the fused MoE on the
+// tensor core — per (16-row block, slot, token): v1-mode per-block quant
+// (x -> e4m3 smem, absmax/448), GATE mma + UP mma (both [16, K] against
+// the SAME smem xq — the N=8 replica of B), then the swiglu epilogue on
+// the two 16-row results. The W8A16 dequant loop (moe_fused_act_fp8)
+// measured 0.94x bf16 — the mma path halves the expert weight HBM bytes
+// (fp8) AND computes e4m3 x e4m3 directly (no per-element cvt).
+// smem: xq[hidden] + reduce[256] + xs[1] + gate sacc[8][16] + up sacc[8][16].
+// ============================================================
+__global__ void moe_fused_act_fp8_mma_kernel(
+    const float* __restrict__ x,          // [n, hidden]
+    const float* __restrict__ ids_f,      // [n, topk]
+    const unsigned char* const* __restrict__ gate_w8_ptrs,   // [e_local] [inter, hidden] e4m3
+    const float* const* __restrict__ gate_scale_ptrs,       // [e_local] [inter/128, hidden/128]
+    const unsigned char* const* __restrict__ up_w8_ptrs,    // [e_local] [inter, hidden]
+    const float* const* __restrict__ up_scale_ptrs,
+    const unsigned char* __restrict__ shared_gate_w8,      // [inter_shared, hidden]
+    const float* __restrict__ shared_gate_scale,
+    const unsigned char* __restrict__ shared_up_w8,
+    const float* __restrict__ shared_up_scale,
+    float* __restrict__ act,              // [n, topk*inter + inter_shared]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, float limit) {
+    const int slot = blockIdx.y;
+    const int tok = blockIdx.z;
+    const int m0 = blockIdx.x * 16;        // 16 inter rows per block
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = lane >> 2, c0 = (lane & 3) * 4;
+    const int stride = topk * inter + inter_shared;
+    const float* xt = x + (size_t)tok * hidden;
+    int slot_rows, slot_base;
+    const unsigned char *gw8, *uw8;
+    const float *gs, *us;
+    if (slot < topk) {
+        slot_rows = inter;
+        slot_base = slot * inter;
+        int eid = (int)ids_f[(size_t)tok * topk + slot];
+        int local = eid - expert_start;
+        if (local < 0 || local >= e_local || m0 >= slot_rows) {
+            // another rank's slot or tail rows: zero (act buffer pre-zeroed by
+            // the caller for cross-rank slots; tail rows just skip writes)
+            return;
+        }
+        gw8 = gate_w8_ptrs[local]; gs = gate_scale_ptrs[local];
+        uw8 = up_w8_ptrs[local];  us = up_scale_ptrs[local];
+    } else {
+        slot_rows = inter_shared;
+        slot_base = topk * inter;
+        if (m0 >= slot_rows) return;
+        gw8 = shared_gate_w8; gs = shared_gate_scale;
+        uw8 = shared_up_w8;   us = shared_up_scale;
+    }
+    // ---- 1. per-block quantize (v1 mode — NO cross-block barrier) ----
+    extern __shared__ unsigned char smem[];
+    unsigned char* sx = smem;                       // [hidden] e4m3 xq
+    float* sred = (float*)(smem + hidden);         // [256] absmax reduce
+    float* sxs = (float*)(smem + hidden + 256 * 4); // [1] x_scale
+    float* sgacc = sxs + 1;                        // [8][16] gate partials
+    float* suacc = sgacc + 8 * 16;                 // [8][16] up partials
+    {
+        float amax = 1e-9f;
+        for (int k = threadIdx.x; k < hidden; k += 256)
+            amax = fmaxf(amax, fabsf(xt[k]));
+        sred[threadIdx.x] = amax;
+        __syncthreads();
+        for (int off = 128; off > 0; off >>= 1) {
+            if (threadIdx.x < off)
+                sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) sxs[0] = sred[0] / 448.0f;
+        __syncthreads();
+        const float inv = 1.0f / sxs[0];
+        for (int k = threadIdx.x; k < hidden; k += 256) {
+            const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
+            sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+        }
+        __syncthreads();
+    }
+    // ---- 2. gate mma + up mma (same smem xq; 8-warp K-split each) ----
+    const int nblk = (hidden + 127) >> 7;
+    const int bseg = (nblk + 7) / 8;
+    const int kW = warp;
+    const int k0 = kW * bseg * 128;
+    const int k1 = min(k0 + bseg * 128, hidden);
+    const int gs_ws = (m0 / 128) * ((hidden + 127) >> 7);   // scale row (16 rows share m/128)
+    float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
+    for (int kb = k0; kb < k1; kb += 128) {
+        float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
+        float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
+        for (int kk = kb; kk < kb + 128; kk += 32) {
+            if (kk + 32 > k1) break;
+            unsigned ba[4];  // A fragments: rows m0+r0 / m0+r0+8 (shared by gate+up)
+            ba[0] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0);
+            ba[1] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
+            ba[2] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
+            ba[3] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
+            unsigned b1_[4]; // up A fragments (same rows, up weights)
+            b1_[0] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0);
+            b1_[1] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
+            b1_[2] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
+            b1_[3] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
+            unsigned b[2];   // B: smem xq (n=8 replica)
+            b[0] = *(const unsigned*)(sx + kk + c0);
+            b[1] = *(const unsigned*)(sx + kk + c0 + 16);
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(gd0), "+f"(gd1), "+f"(gd2), "+f"(gd3)
+                : "r"(ba[0]), "r"(ba[1]), "r"(ba[2]), "r"(ba[3]),
+                  "r"(b[0]), "r"(b[1]));
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(ud0), "+f"(ud1), "+f"(ud2), "+f"(ud3)
+                : "r"(b1_[0]), "r"(b1_[1]), "r"(b1_[2]), "r"(b1_[3]),
+                  "r"(b[0]), "r"(b[1]));
+        }
+        const int kblk = kb >> 7;
+        const float gw_sc = gs[gs_ws + kblk];
+        const float uw_sc = us[gs_ws + kblk];
+        if ((lane & 3) == 0) {
+            g0 += gd0 * gw_sc; g1 += gd2 * gw_sc;   // (r0, col0), (r0+8, col0)
+            u0 += ud0 * uw_sc; u1 += ud2 * uw_sc;
+        }
+    }
+    if ((lane & 3) == 0) {
+        sgacc[warp * 16 + r0] = g0;
+        sgacc[warp * 16 + r0 + 8] = g1;
+        suacc[warp * 16 + r0] = u0;
+        suacc[warp * 16 + r0 + 8] = u1;
+    }
+    __syncthreads();
+    // ---- 3. swiglu epilogue: act[r] = silu(min(g, limit)) * clamp(u, ±limit) ----
+    if (warp == 0 && lane < 16) {
+        float g = 0.f, u = 0.f;
+        for (int i = 0; i < 8; i++) {
+            g += sgacc[i * 16 + lane];
+            u += suacc[i * 16 + lane];
+        }
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        const int r = m0 + lane;
+        if (r < slot_rows) {
+            act[(size_t)tok * stride + slot_base + r] = (g / (1.0f + expf(-g))) * u;
+        }
+    }
+    (void)e_local;
+}
+
+extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
+    const float* x, const float* ids_f,
+    const void* const* gate_w8_ptrs, const void* const* gate_scale_ptrs,
+    const void* const* up_w8_ptrs, const void* const* up_scale_ptrs,
+    const void* shared_gate_w8, const void* shared_gate_scale,
+    const void* shared_up_w8, const void* shared_up_scale,
+    float* act, int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, float limit, cudaStream_t s)
+{
+    int max_rows = inter > inter_shared ? inter : inter_shared;
+    if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported; // v1 alignment
+    dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
+    const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
+    cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
+        x, ids_f,
+        (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
+        (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
+        (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
+        (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
+        act, expert_start, e_local, hidden, inter, inter_shared, topk, limit);
+    return cudaGetLastError();
+}
+
 // ============================================================
 // DSA (sparse attention) device chain — the four small kernels the CPU
 // path did on the host between GPU calls (each crossing was a sync):

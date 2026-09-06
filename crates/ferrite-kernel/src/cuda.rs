@@ -54,6 +54,18 @@ extern "C" {
                            srows: i32, scols: i32, s: CuStream) -> i32;
     fn ferrite_fp8_mma_probe(A: *const u8, B: *const u8, C: *mut f32, s: CuStream) -> i32;
     fn ferrite_fp8_quant(x: *const f32, xq: *mut u8, xs: *mut f32, in_f: i32, s: CuStream) -> i32;
+    fn ferrite_moe_fused_act_fp8_mma(x: *const f32, ids_f: *const f32,
+                                      gate_w8_ptrs: *const *const std::ffi::c_void,
+                                      gate_scale_ptrs: *const *const std::ffi::c_void,
+                                      up_w8_ptrs: *const *const std::ffi::c_void,
+                                      up_scale_ptrs: *const *const std::ffi::c_void,
+                                      shared_gate_w8: *const std::ffi::c_void,
+                                      shared_gate_scale: *const std::ffi::c_void,
+                                      shared_up_w8: *const std::ffi::c_void,
+                                      shared_up_scale: *const std::ffi::c_void,
+                                      act: *mut f32, expert_start: i32, e_local: i32,
+                                      hidden: i32, inter: i32, inter_shared: i32,
+                                      topk: i32, n: i32, limit: f32, s: CuStream) -> i32;
     fn ferrite_gemv_fp8_mma_v2(xq: *const u8, xs: *const f32, w: *const std::ffi::c_void,
                                 w_scale: *const f32, out: *mut f32, in_f: i32, out_f: i32,
                                 scols: i32, s: CuStream) -> i32;
@@ -2507,6 +2519,41 @@ impl CudaBackend {
                 _ => None,
             };
             if let (Some(tbl), Some((sg, su, sd))) = (self.moe_expert_ptrs_fp8(experts)?, shared_fp8) {
+                // W8A8 tensor-core act (v1-mode per-block quant + gate/up dual
+                // mma on the SAME smem xq + swiglu epilogue): the W8A16 dequant
+                // loop measured 0.94x bf16 (cvt overhead offset the fp8 HBM
+                // savings). Misaligned shapes (inter%16, hidden%128) fall back
+                // to the dequant act below (kept).
+                let inter_max = inter.max(inter_shared);
+                let act_mma = inter_max % 16 == 0 && hidden % 128 == 0;
+                if act_mma {
+                    let r = unsafe {
+                        ferrite_moe_fused_act_fp8_mma(
+                            x_dev.as_const_f32(), dids.as_const_f32(),
+                            tbl.gate_w8 as *const *const _, tbl.gate_scale as *const *const _,
+                            tbl.up_w8 as *const *const _, tbl.up_scale as *const *const _,
+                            sg.w, sg.scale, su.w, su.scale,
+                            act.as_f32(),
+                            expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                            topk as i32, ni, swiglu_limit, self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
+                        ck(unsafe {
+                            ferrite_moe_fused_down_sum_fp8(
+                                dids.as_const_f32(), dprobs.as_const_f32(),
+                                tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
+                                sd.w, sd.scale,
+                                act.as_const_f32(), out.as_f32(),
+                                expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                                topk as i32, ni, dscols, self.stream,
+                            )
+                        }, "moe_fused_down_sum_fp8")?;
+                        return Ok(out);
+                    }
+                    // act_mma not supported (unaligned) — fall through to dequant
+                }
                 let hscols = self.fp8_lookup(shared.gate).map(|f| f.scols).unwrap_or((hidden as usize).div_ceil(128) as i32);
                 ck(unsafe {
                     ferrite_moe_fused_act_fp8(
