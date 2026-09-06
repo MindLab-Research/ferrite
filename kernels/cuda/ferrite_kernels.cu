@@ -1981,16 +1981,31 @@ __global__ void moe_fused_act_kernel(
         const __nv_bfloat16* gwr = gw + (size_t)r * hidden;
         const __nv_bfloat16* uwr = uw + (size_t)r * hidden;
         float g = 0.f, u = 0.f;
-        for (int k = lane * 4; k < hidden; k += 32 * 4) {
-            float x0 = xt[k];
-            float x1 = (k + 1 < hidden) ? xt[k + 1] : 0.f;
-            float x2 = (k + 2 < hidden) ? xt[k + 2] : 0.f;
-            float x3 = (k + 3 < hidden) ? xt[k + 3] : 0.f;
-            g += x0 * __bfloat162float(gwr[k]);
-            u += x0 * __bfloat162float(uwr[k]);
-            if (k + 1 < hidden) { g += x1 * __bfloat162float(gwr[k + 1]); u += x1 * __bfloat162float(uwr[k + 1]); }
-            if (k + 2 < hidden) { g += x2 * __bfloat162float(gwr[k + 2]); u += x2 * __bfloat162float(uwr[k + 2]); }
-            if (k + 3 < hidden) { g += x3 * __bfloat162float(gwr[k + 3]); u += x3 * __bfloat162float(uwr[k + 3]); }
+        // uint4-vectorized (8 bf16 weights + 2x float4 x per lane-step): the
+        // per-lane k-summation order is ascending (same accumulation chain as
+        // the scalar loop, 8-wide steps); lane boundary shift only changes the
+        // cross-lane partial grouping, folded by the warp shuffle — validated
+        // by 出师表 recitation (garbling = revert). hidden%8==0 (4096).
+        for (int k = lane * 8; k + 7 < hidden; k += 32 * 8) {
+            float4 xa = *reinterpret_cast<const float4*>(xt + k);
+            float4 xb = *reinterpret_cast<const float4*>(xt + k + 4);
+            uint4 gv = *reinterpret_cast<const uint4*>(gwr + k);
+            uint4 uv = *reinterpret_cast<const uint4*>(uwr + k);
+            const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gv);
+            const __nv_bfloat162* u2 = reinterpret_cast<const __nv_bfloat162*>(&uv);
+            float2 gf0 = __bfloat1622float2(g2[0]), gf1 = __bfloat1622float2(g2[1]);
+            float2 gf2 = __bfloat1622float2(g2[2]), gf3 = __bfloat1622float2(g2[3]);
+            float2 uf0 = __bfloat1622float2(u2[0]), uf1 = __bfloat1622float2(u2[1]);
+            float2 uf2 = __bfloat1622float2(u2[2]), uf3 = __bfloat1622float2(u2[3]);
+            g += xa.x * gf0.x + xa.y * gf0.y + xa.z * gf1.x + xa.w * gf1.y
+               + xb.x * gf2.x + xb.y * gf2.y + xb.z * gf3.x + xb.w * gf3.y;
+            u += xa.x * uf0.x + xa.y * uf0.y + xa.z * uf1.x + xa.w * uf1.y
+               + xb.x * uf2.x + xb.y * uf2.y + xb.z * uf3.x + xb.w * uf3.y;
+        }
+        for (int k = lane * 8 + ((hidden >> 3) << 3); k < hidden; k += 32) {
+            // tail (hidden % 8 != 0 — never on GLM but kept safe)
+            g += xt[k] * __bfloat162float(gwr[k]);
+            u += xt[k] * __bfloat162float(uwr[k]);
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
@@ -2032,15 +2047,21 @@ __global__ void moe_fused_down_sum_kernel(
         const __nv_bfloat16* dwr = down_ptrs[local] + (size_t)h * inter;
         const float* aj = act_t + (size_t)j * inter;
         float y = 0.f;
-        for (int i = lane * 4; i < inter; i += 32 * 4) {
-            float a0 = aj[i];
-            float a1 = (i + 1 < inter) ? aj[i + 1] : 0.f;
-            float a2 = (i + 2 < inter) ? aj[i + 2] : 0.f;
-            float a3 = (i + 3 < inter) ? aj[i + 3] : 0.f;
-            y += a0 * __bfloat162float(dwr[i]);
-            if (i + 1 < inter) y += a1 * __bfloat162float(dwr[i + 1]);
-            if (i + 2 < inter) y += a2 * __bfloat162float(dwr[i + 2]);
-            if (i + 3 < inter) y += a3 * __bfloat162float(dwr[i + 3]);
+        // uint4-vectorized: 8 bf16 weights + 2x float4 act per lane-step.
+        // inter%8 may be nonzero — tail handled scalar below.
+        int i = lane * 8;
+        for (; i + 7 < inter; i += 32 * 8) {
+            float4 aa = *reinterpret_cast<const float4*>(aj + i);
+            float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const __nv_bfloat162* d2 = reinterpret_cast<const __nv_bfloat162*>(&dv);
+            float2 df0 = __bfloat1622float2(d2[0]), df1 = __bfloat1622float2(d2[1]);
+            float2 df2 = __bfloat1622float2(d2[2]), df3 = __bfloat1622float2(d2[3]);
+            y += aa.x * df0.x + aa.y * df0.y + aa.z * df1.x + aa.w * df1.y
+               + ab.x * df2.x + ab.y * df2.y + ab.z * df3.x + ab.w * df3.y;
+        }
+        for (; i < inter; i++) {
+            y += aj[i] * __bfloat162float(dwr[i]);
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
@@ -2053,15 +2074,19 @@ __global__ void moe_fused_down_sum_kernel(
         const __nv_bfloat16* dwr = shared_down + (size_t)h * inter_shared;
         const float* as = act_t + (size_t)topk * inter;
         float y = 0.f;
-        for (int i = lane * 4; i < inter_shared; i += 32 * 4) {
-            float a0 = as[i];
-            float a1 = (i + 1 < inter_shared) ? as[i + 1] : 0.f;
-            float a2 = (i + 2 < inter_shared) ? as[i + 2] : 0.f;
-            float a3 = (i + 3 < inter_shared) ? as[i + 3] : 0.f;
-            y += a0 * __bfloat162float(dwr[i]);
-            if (i + 1 < inter_shared) y += a1 * __bfloat162float(dwr[i + 1]);
-            if (i + 2 < inter_shared) y += a2 * __bfloat162float(dwr[i + 2]);
-            if (i + 3 < inter_shared) y += a3 * __bfloat162float(dwr[i + 3]);
+        int i = lane * 8;
+        for (; i + 7 < inter_shared; i += 32 * 8) {
+            float4 aa = *reinterpret_cast<const float4*>(as + i);
+            float4 ab = *reinterpret_cast<const float4*>(as + i + 4);
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const __nv_bfloat162* d2 = reinterpret_cast<const __nv_bfloat162*>(&dv);
+            float2 df0 = __bfloat1622float2(d2[0]), df1 = __bfloat1622float2(d2[1]);
+            float2 df2 = __bfloat1622float2(d2[2]), df3 = __bfloat1622float2(d2[3]);
+            y += aa.x * df0.x + aa.y * df0.y + aa.z * df1.x + aa.w * df1.y
+               + ab.x * df2.x + ab.y * df2.y + ab.z * df3.x + ab.w * df3.y;
+        }
+        for (; i < inter_shared; i++) {
+            y += as[i] * __bfloat162float(dwr[i]);
         }
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
