@@ -767,8 +767,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 .ok_or_else(|| FerriteError::Config("missing seq".into()))?;
             *s.tokens.last().ok_or_else(|| FerriteError::Config("empty context".into()))?
         };
-        let h0 = self.shards[0].embed(&[last]);
-        let in_vals = crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult);
+        let token_ids = &[last];
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         let gname = format!("mega{seq}");
@@ -785,7 +784,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     Self::mtp_setup_bufs(s, &plans, seq)?;
                 }
                 let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
-                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, false, &gname, 1, vio.as_ref())
+                Self::mega_chain_dev(s, seq, token_ids, &plans, num_dsa, false, &gname, 1, vio.as_ref())
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
@@ -817,7 +816,7 @@ impl<B: KernelBackend> TpCluster<B> {
             let tc = std::time::Instant::now();
             Self::fan_out(&mut self.shards, |s| {
                 let vio = if mtp { Some(Self::mtp_vio(s, false)) } else { None };
-                Self::mega_chain_dev(s, seq, in_vals.as_slice(), &plans, num_dsa, true, &gname, 1, vio.as_ref())
+                Self::mega_chain_dev(s, seq, token_ids, &plans, num_dsa, true, &gname, 1, vio.as_ref())
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
@@ -877,17 +876,19 @@ impl<B: KernelBackend> TpCluster<B> {
                 // MTP verify graph (n=2: [t_last, d1]): GDN state → scratch B
                 // (ping-pong), h_final export (hf_v [2,hidden]), argmax 2.
                 let gv = format!("mega_v{seq}");
-                let h2 = self.shards[0].embed(&[last, last, last]);
-                let in_vals2 = crate::mhc::hc_expand(&h2, self.full_cfg.hc_mult);
+                // capture with placeholder ids ([last,last,last]); the REAL
+                // [last,d1,d2] land via pinned_ids_write at replay — embed+
+                // expand are the graph's FIRST node (embed_expand kernel).
+                let token_ids2 = &[last, last, last];
                 let _ = Self::fan_out(&mut self.shards, |s| {
                     let vio = Self::mtp_vio(s, true);
-                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, false, &gv, 3, Some(&vio))
+                    Self::mega_chain_dev(s, seq, token_ids2, &plans, num_dsa, false, &gv, 3, Some(&vio))
                 })
                 .into_iter()
                 .collect::<Result<Vec<Vec<f32>>>>()?;
                 Self::fan_out(&mut self.shards, |s| {
                     let vio = Self::mtp_vio(s, true);
-                    Self::mega_chain_dev(s, seq, in_vals2.as_slice(), &plans, num_dsa, true, &gv, 3, Some(&vio))
+                    Self::mega_chain_dev(s, seq, token_ids2, &plans, num_dsa, true, &gv, 3, Some(&vio))
                 })
                 .into_iter()
                 .collect::<Result<Vec<Vec<f32>>>>()?;
@@ -932,8 +933,18 @@ impl<B: KernelBackend> TpCluster<B> {
                 cuda.dsa_host_advance(seq, f, 1);
             }
             let mut out = [0f32; 1];
-            if !cuda.graph_run(&gname, in_vals.as_slice(), &mut out)? {
+            // host-4ms knife 1: embed+hc_expand+staging collapsed into the
+            // graph's embed_expand kernel — replay writes 4B pinned id + launches.
+            cuda.pinned_ids_write(1, &[last])?;
+            if !cuda.graph_replay(&gname) {
                 return Err(FerriteError::InvalidArg(format!("mega graph {gname} missing")));
+            }
+            let io = cuda.graph_io_get(&gname)
+                .ok_or_else(|| FerriteError::InvalidArg(format!("mega graph {gname} io missing")))?;
+            use ferrite_kernel::cuda::memcpy_d2h_sync;
+            let r = unsafe { memcpy_d2h_sync(io.out_dev, out.as_mut_ptr(), 1, cuda.stream_handle()) };
+            if r != 0 {
+                return Err(FerriteError::InvalidArg(format!("mega argmax D2H: {r}")));
             }
             Ok(out[0])
         })
@@ -1034,8 +1045,9 @@ impl<B: KernelBackend> TpCluster<B> {
         // 2. verify: dsa advance(3) + mega_v replay (the A→B ping-pong
         //    copy-in is graph-recorded — capture-time nodes, not a host
         //    memcpy loop) → argmax[3] → fused accept/commit.
-        let h2v = self.shards[0].embed(&[last, d1 as u32, d2 as u32]);
-        let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
+        // host-4ms knife 1: [last, d1, d2] go through the pinned id slot —
+        // embed+hc_expand+staging are the graph's embed_expand kernel.
+        let verify_ids = [last, d1 as u32, d2 as u32];
         let toks_v = Self::fan_out(&mut self.shards, |s| {
             let cuda = s
                 .backend
@@ -1047,8 +1059,18 @@ impl<B: KernelBackend> TpCluster<B> {
                 cuda.dsa_host_advance(seq, f, 3);
             }
             let mut out = [0f32; 3];
-            if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
+            cuda.pinned_ids_write(3, &verify_ids)?;
+            if !cuda.graph_replay(&gvname) {
                 return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
+            }
+            let io = cuda.graph_io_get(&gvname)
+                .ok_or_else(|| FerriteError::InvalidArg(format!("mega_v graph {gvname} io missing")))?;
+            {
+                use ferrite_kernel::cuda::memcpy_d2h_sync;
+                let r = unsafe { memcpy_d2h_sync(io.out_dev, out.as_mut_ptr(), 3, cuda.stream_handle()) };
+                if r != 0 {
+                    return Err(FerriteError::InvalidArg(format!("mega_v argmax D2H: {r}")));
+                }
             }
             // Accept + commit fused into the verify worker (was a THIRD
             // fan_out round-trip): d1/d2/argmax are bit-identical across
@@ -1246,7 +1268,7 @@ impl<B: KernelBackend> TpCluster<B> {
 fn mega_chain_dev(
     s: &mut Engine<B>,
     seq: u64,
-    in_vals: &[f32],
+    token_ids: &[u32],
     plans: &[ferrite_model::LayerPlan],
     num_dsa: usize,
     capture: bool,
@@ -1353,8 +1375,22 @@ fn mega_chain_dev(
     }
 
     let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
-    res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
-    let x_stage = res.stage; // GraphIO: replay writes fresh input here
+    // embed_expand (host-4ms knife 1): kernel writes res [n, hc_mult, hidden]
+    // from the pinned token ids — the host embed lookup (16KB/token row
+    // memcpy) + hc_expand (64-192KB Vec concat) + 48KB staging H2D collapse
+    // to a 12B pinned write. Recorded as the graph's FIRST node: replay
+    // writes ids through pinned_ids_write, the kernel reads them zero-copy.
+    let embed_w = s.w("model.embed_tokens.weight")?;
+    cuda.pinned_ids_write(n, token_ids)?;
+    cuda.embed_expand_dev(
+        embed_w,
+        cuda.pinned_ids_ptr(n)?,
+        res.as_f32(),
+        n,
+        hidden,
+        hc_mult,
+    )?;
+    let x_stage = res.stage; // GraphIO (legacy f32 path; the ids path writes pinned)
     mprobe!("res0", &res, nh);
 
     let mut gdn_idx = 0usize; // verify scratch index (GDN layers only)

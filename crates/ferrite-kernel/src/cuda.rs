@@ -74,6 +74,9 @@ extern "C" {
                             srows: i32, scols: i32, scratch: *mut u32, s: CuStream) -> i32;
     fn ferrite_layernorm_affine(x: *const f32, w: *const f32, b: *const f32,
                                  out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
+    fn ferrite_embed_expand(table: *const std::ffi::c_void, ids: *const i32,
+                            out: *mut f32, n: i32, hidden: i32, mult: i32,
+                            vocab: i32, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
                                  k_nope: *mut f32, v: *mut f32, k_idx: *mut f32, k_gate: *mut f32,
                                  t0_ptr: *const i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
@@ -511,6 +514,9 @@ pub struct CudaBackend {
     /// 23ms). Prefill MUST keep the GEMM (its row-batched accumulation
     /// order sets the first greedy token; per-row flips it 背出师表→English).
     pub small_n_rows: std::sync::atomic::AtomicBool,
+    /// pinned token-id slots (embed_expand's zero-copy kernel input; cached
+    /// per n — decode graph n=1, verify graph n=3).
+    pinned_ids_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut i32>>,
 }
 
 // cudaStream_t is thread-safe (CUDA runtime serialises ops on a stream);
@@ -563,6 +569,7 @@ impl CudaBackend {
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
             small_n_rows: std::sync::atomic::AtomicBool::new(false),
+            pinned_ids_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2972,6 +2979,42 @@ impl CudaBackend {
         Ok(p)
     }
 
+    /// Pin n i32 slots (zero-copy kernel read — the embed_expand token ids:
+    /// the mega-graph's first node is the embed_expand kernel reading these;
+    /// replay writes 1-3 i32 (12B) instead of the 48KB f32 staging upload).
+    fn pinned_ids(&self, n: usize) -> Result<*mut i32> {
+        if let Some(&p) = self.pinned_ids_cache.lock().unwrap().get(&n) {
+            return Ok(p);
+        }
+        let mut p: *mut i32 = std::ptr::null_mut();
+        ck(
+            unsafe { cudaMallocHost(&mut p as *mut *mut i32 as *mut *mut std::ffi::c_void, n * 4) },
+            "pinned_ids",
+        )?;
+        for i in 0..n {
+            unsafe { *p.add(i) = 0 };
+        }
+        self.pinned_ids_cache.lock().unwrap().insert(n, p);
+        Ok(p)
+    }
+
+    /// Write token ids into the graph's pinned id slot (host, 4B/token —
+    /// the 12B replay input that replaces the 48KB f32 staging write).
+    pub fn pinned_ids_write(&self, n: usize, ids: &[u32]) -> Result<()> {
+        let p = self.pinned_ids(n)?;
+        for (i, &t) in ids.iter().enumerate() {
+            unsafe { *p.add(i) = t as i32 };
+        }
+        Ok(())
+    }
+
+    /// Pinned id slot pointer (for the embed_expand kernel's capture-time
+    /// parameter — the graph records this address; replay writes through
+    /// pinned_ids_write).
+    pub fn pinned_ids_ptr(&self, n: usize) -> Result<*mut i32> {
+        self.pinned_ids(n)
+    }
+
     /// Argmax over the last dim of a device buffer [n, dim] → out [n].
     /// Device-to-device (the Tensor-level path downloaded the full logits
     /// row — 620KB for GLM's 154880 vocab).
@@ -3122,6 +3165,42 @@ impl CudaBackend {
             )
         }, "mtp_eh_seg")?;
         Ok(seg)
+    }
+
+    /// embed_expand (host-4ms knife 1): token ids → embed row lookup (bf16
+    /// resident table) → MHC expand (row × mult) → writes `out` [n, mult,
+    /// hidden] in ONE kernel. Replaces the host embed lookup (n×16KB row
+    /// memcpy) + hc_expand (64-192KB Vec concat) + H2D upload with a 12B id
+    /// write + one kernel. ids is a device i32 buf (n entries; host writes
+    /// go through a small pinned staging or D2D from the argmax output).
+    pub fn embed_expand_dev(
+        &self,
+        table: &Tensor,
+        ids: *const i32,
+        out: *mut f32,
+        n: usize,
+        hidden: usize,
+        mult: usize,
+    ) -> Result<()> {
+        self.enter();
+        let dw = self.dev_weight_bf16(table)?;
+        let vocab = table.shape.0[0];
+        ck(
+            unsafe {
+                ferrite_embed_expand(
+                    dw.ptr,
+                    ids,
+                    out,
+                    n as i32,
+                    hidden as i32,
+                    mult as i32,
+                    vocab as i32,
+                    self.stream,
+                )
+            },
+            "embed_expand",
+        )?;
+        Ok(())
     }
 
     /// D2D copy with source offset (elements): dst[0..n] = src[src_off..src_off+n].

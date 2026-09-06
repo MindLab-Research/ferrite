@@ -4111,3 +4111,41 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
         x, (const unsigned char*)w, w_scale, out, in_f, out_f, srows, scols);
     return cudaGetLastError();
 }
+
+// ============================================================
+// embed_expand (host-4ms root-out knife 1): host embed lookup (16KB row
+// memcpy) + hc_expand (64-192KB Vec concat) + staging H2D — all folded into
+// ONE kernel that reads token ids from a pinned slot (host writes 1-3 u32/f32
+// ids — 12B vs 192KB) and writes the graph input res directly (the
+// mega-graph's first node becomes this kernel instead of the staging memcpy).
+// Table is the resident bf16 embed (dev_weight_bf16 cache).
+// ============================================================
+__global__ void embed_expand_kernel(
+    const __nv_bfloat16* __restrict__ table,  // [vocab, hidden] resident bf16
+    const int* __restrict__ ids,              // [n] token ids (pinned or device)
+    float* __restrict__ out,                  // [n, mult, hidden] (graph res buf)
+    int n, int hidden, int mult, int vocab)
+{
+    int t = blockIdx.x;                       // one block per token
+    if (t >= n) return;
+    int id = ids[t];
+    if (id < 0 || id >= vocab) id = 0;
+    const __nv_bfloat16* row = table + (size_t)id * hidden;
+    float* dst = out + (size_t)t * mult * hidden;
+    for (int j = threadIdx.x; j < hidden; j += blockDim.x) {
+        float v = __bfloat162float(row[j]);
+        for (int m = 0; m < mult; m++) {
+            dst[(size_t)m * hidden + j] = v;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_embed_expand(
+    const void* table, const int* ids, float* out,
+    int n, int hidden, int mult, int vocab, cudaStream_t s)
+{
+    if (n <= 0) return cudaSuccess;
+    embed_expand_kernel<<<n, 256, 0, s>>>(
+        (const __nv_bfloat16*)table, ids, out, n, hidden, mult, vocab);
+    return cudaGetLastError();
+}
