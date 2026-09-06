@@ -125,7 +125,7 @@ extern "C" {
                           n_plans: i32, conv_len: i32, gdn_len: i32,
                           hf_v: *const f32, hprev: *mut f32,
                           hidden: i32, s: CuStream) -> i32;
-    fn ferrite_embed_gather(table: *const f32, id: *const f32, out: *mut f32,
+    fn ferrite_embed_gather(table: *const std::ffi::c_void, id: *const f32, out: *mut f32,
                             hidden: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
@@ -411,7 +411,10 @@ pub struct MtpState {
     /// last_id (PINNED f32 — zero-copy read at replay), hprev (fixed).
     /// Outputs: d1_id/d2_id (device slots, one D2H after replay), h_d1 (the
     /// recursion h, fixed slot). embed_table: replicated f32 [vocab,hidden].
-    pub embed_table: Option<DevBuf>,
+    /// bf16 embedding-table device pointer (reuses the resident
+    /// dev_weight_bf16 cache — NO 2.5GB/rank f32 upload, which cost ~7s of
+    /// one-time setup and wrecked the short-run step average).
+    pub embed_bf16: usize,
     pub last_id_pin: *mut f32,
     pub emb_last: DevBuf,
     pub emb_d1: DevBuf,
@@ -573,7 +576,11 @@ impl CudaBackend {
     /// bottleneck (~150s/thread). Small weights pack on the CPU (the
     /// bit-shift loop is vector-friendly). Both paths use identical
     /// truncation semantics (f32 high bits), so parity holds.
-    fn dev_weight_bf16(&self, t: &Tensor) -> Result<DevRef> {
+    pub fn dev_bf16_ptr(&self, t: &Tensor) -> Result<usize> {
+        Ok(self.dev_weight_bf16(t)?.ptr as usize)
+    }
+
+    pub fn dev_weight_bf16(&self, t: &Tensor) -> Result<DevRef> {
         let key = (t.as_slice().as_ptr() as usize, t.numel() << 1 | 1);
         let mut cache = self.weights.lock().unwrap();
         if let Some(cb) = cache.get(&key) {
@@ -2825,7 +2832,7 @@ impl CudaBackend {
     /// Embedding row gather for the draft chain: token id (device slot OR
     /// pinned-host f32 — zero-copy UVA read at replay time) -> one f32 row
     /// of the replicated [vocab, hidden] table. Graph-capturable.
-    pub fn embed_gather_dev(&self, table: *const f32, id: *const f32, out: *mut f32, hidden: usize) -> Result<()> {
+    pub fn embed_gather_dev(&self, table: *const std::ffi::c_void, id: *const f32, out: *mut f32, hidden: usize) -> Result<()> {
         self.enter();
         ck(
             unsafe { ferrite_embed_gather(table, id, out, hidden as i32, self.stream) },

@@ -764,10 +764,6 @@ impl<B: KernelBackend> TpCluster<B> {
                     let m = mg
                         .as_ref()
                         .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    let table = m
-                        .embed_table
-                        .as_ref()
-                        .ok_or_else(|| FerriteError::Config("mtp embed table missing".into()))?;
                     (
                         &m.emb_last as *const DevBuf as usize,
                         &m.emb_d1 as *const DevBuf as usize,
@@ -776,7 +772,7 @@ impl<B: KernelBackend> TpCluster<B> {
                         &m.d2_id as *const DevBuf as usize,
                         &m.hprev as *const DevBuf as usize,
                         m.last_id_pin as usize,
-                        table.as_const_f32() as usize,
+                        m.embed_bf16,
                         !cuda.graph_exists(&gd),
                     )
                 };
@@ -791,7 +787,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     )
                 };
                 let last_pin = last_pin as *mut f32;
-                let table = table as *const f32;
+                let table = table as *const std::ffi::c_void;
                 if need_capture {
                     // CAPTURE (first draft step): record the whole chain.
                     // capture_lock serializes the 4 ranks' record-mode NCCL
@@ -1026,12 +1022,13 @@ impl<B: KernelBackend> TpCluster<B> {
         plan_buf.upload(flat.as_slice())?;
         let k_pin = cuda.pinned_i32()?;
         let commit = MtpCommitPlan { plan: plan_buf, k_pin, n: n_plans, conv_len, gdn_len, hidden };
-        // mega_d draft-graph buffers: replicated f32 embedding table
-        // (every shard holds the full table), pinned zero-copy last-token id,
-        // gather staging, the recursion h slot, and the d1/d2 argmax slots.
-        let embed_w = s.w("model.embed_tokens.weight")?;
-        let mut embed_table = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), embed_w.shape.0[0] * embed_w.shape.0[1])?;
-        embed_table.upload(embed_w.as_slice())?;
+        // mega_d draft-graph buffers: the embedding table reuses the
+        // RESIDENT bf16 weight cache (dev_weight_bf16 — the rank already
+        // uploaded it for lm_head; NO second 2.5GB/rank f32 copy: that H2D +
+        // cudaMallocHost cost ~7s of setup and wrecked short-run step
+        // averages). Pinned zero-copy last-token id, gather staging, the
+        // recursion h slot, and the d1/d2 argmax slots.
+        let embed_bf16 = cuda.dev_bf16_ptr(s.w("model.embed_tokens.weight")?)?;
         let last_id_pin = cuda.pinned_i32()? as *mut f32;
         let emb_last = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
         let emb_d1 = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
@@ -1040,7 +1037,7 @@ impl<B: KernelBackend> TpCluster<B> {
         let d2_id = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), 1)?;
         *cuda.mtp.lock().unwrap() = Some(MtpState {
             hf_dev, hf_v, hprev, scratch, commit: Some(commit),
-            embed_table: Some(embed_table), last_id_pin,
+            embed_bf16, last_id_pin,
             emb_last, emb_d1, h_d1, d1_id, d2_id,
         });
         Ok(())
