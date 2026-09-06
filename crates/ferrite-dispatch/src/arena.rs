@@ -171,21 +171,21 @@ impl<F: ArenaFamily, T> TypedArena<F, T> {
 // -- family tags -----------------------------------------------------------
 
 /// Arena family: scheduler sequences (requests).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SeqTag;
 impl ArenaFamily for SeqTag {
     const NAME: &'static str = "seq";
 }
 
 /// Arena family: radix-tree cache nodes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeTag;
 impl ArenaFamily for NodeTag {
     const NAME: &'static str = "radix-node";
 }
 
 /// Arena family: physical state slots (decode rows / radix snapshots).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SlotTag;
 impl ArenaFamily for SlotTag {
     const NAME: &'static str = "state-slot";

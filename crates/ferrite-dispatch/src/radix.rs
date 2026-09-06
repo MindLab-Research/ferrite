@@ -82,9 +82,15 @@ pub struct RadixNode {
     pub start: usize,
     /// Parent handle (root's parent = itself — the sentinel convention).
     pub parent: NodeId,
-    /// First-token → child. Block granularity keeps this tiny (fan-in per
-    /// node is bounded by real sharing, not vocabulary size).
-    children: HashMap<u32, NodeId>,
+    /// First-token → sibling bucket. Blocks are ATOMIC sharing units
+    /// (page-aligned): two blocks with the same first token are *different*
+    /// children (a shared chat-template header followed by diverging
+    /// content is the common case — SGLang keys children by the whole
+    /// block, and so do we: the bucket is a linear scan of full-block
+    /// equality, not a single-token discriminator). A bucket holds the
+    /// rare same-first-token forks; `match` and `insert` compare whole
+    /// blocks, never the key alone.
+    children: HashMap<u32, Vec<NodeId>>,
     /// Live decode rows whose committed path includes this node
     /// (SGLang `lock_ref`).
     lock_ref: u32,
@@ -239,7 +245,9 @@ impl RadixCache {
 
     /// Longest-prefix match over page-aligned blocks.
     ///
-    /// O(depth × page memcmp). The match is *committed blocks only*: a
+    /// O(depth × bucket scan × page memcmp) — buckets are tiny (the
+    /// same-first-token fork is rare; the common case is a single child
+    /// per first token). The match is *committed blocks only*: a
     /// partially-filled live tail never shares (its pages are not frozen).
     pub fn match_prefix(&mut self, tokens: &[u32]) -> Option<PrefixMatch> {
         let clock = self.clock.next();
@@ -250,19 +258,20 @@ impl RadixCache {
         while matched + self.page_size <= tokens.len() {
             let first = tokens[matched];
             let child = match self.nodes.get(cur) {
-                Some(n) => n.children.get(&first).copied(),
+                Some(n) => n.children.get(&first).and_then(|bucket| {
+                    bucket
+                        .iter()
+                        .find(|&&c| {
+                            let cn = self.nodes.get(c).expect("child id from live parent");
+                            cn.tokens.len() == self.page_size
+                                && cn.tokens[..] == tokens[matched..matched + self.page_size]
+                                && cn.state.is_some()
+                        })
+                        .copied()
+                }),
                 None => break,
             };
             let Some(child) = child else { break };
-            let block_matches = {
-                let n = self.nodes.get(child).expect("child id from live parent");
-                n.tokens.len() == self.page_size
-                    && n.tokens[..] == tokens[matched..matched + self.page_size]
-                    && n.state.is_some()
-            };
-            if !block_matches {
-                break;
-            }
             cur = child;
             matched += self.page_size;
             if let Some(n) = self.nodes.get_mut(cur) {
@@ -286,15 +295,24 @@ impl RadixCache {
     /// backed by `state` (the registry snapshot). The scheduler freezes
     /// one block at a time as a row's commit crosses page boundaries.
     ///
-    /// Sibling collision is an invariant violation (matched tokens are
-    /// unique per parent+key — a match would have descended the existing
-    /// child), so collision is an error, not a split.
+    /// **Identical block → reuse** (the radix-sharing payoff): if the
+    /// parent already holds this exact block (two requests shared a
+    /// prefix — e.g. the same chat-template header), the existing node
+    /// is returned and the caller releases its fresh snapshot (one
+    /// state per block is the invariant; block-equal prefixes imply
+    /// equal GDN state). Divergent blocks with the same first token are
+    /// *separate children* (the bucket) — no split is ever needed at
+    /// page granularity (a mid-block fork just yields two sibling
+    /// blocks sharing the parent).
+    ///
+    /// Returns `(node, inserted_new)`; `inserted_new == false` means the
+    /// caller must release the state it minted for this block.
     pub fn insert_branch(
         &mut self,
         parent: NodeId,
         tokens: Vec<u32>,
         state: StateId,
-    ) -> Result<NodeId> {
+    ) -> Result<(NodeId, bool)> {
         if tokens.is_empty() || tokens.len() > self.page_size {
             return Err(FerriteError::Scheduler(format!(
                 "radix insert: block len {} not in 1..={}",
@@ -303,16 +321,29 @@ impl RadixCache {
             )));
         }
         let key = tokens[0];
-        let parent_ref = self
+        // exact-block reuse (shared prefix: same block already cached)
+        if let Some(bucket) = self
             .nodes
-            .get_mut(parent)
-            .ok_or_else(|| FerriteError::Scheduler("radix insert: stale parent".into()))?;
-        if parent_ref.children.contains_key(&key) {
-            return Err(FerriteError::Scheduler(format!(
-                "radix insert: fork collision at token {key} (must split first)"
-            )));
+            .get(parent)
+            .ok_or_else(|| FerriteError::Scheduler("radix insert: stale parent".into()))?
+            .children
+            .get(&key)
+        {
+            for &c in bucket {
+                if let Some(cn) = self.nodes.get(c) {
+                    if cn.tokens == tokens {
+                        return Ok((c, false));
+                    }
+                }
+            }
         }
-        let start = parent_ref.start + parent_ref.tokens.len();
+        let start = {
+            let p = self
+                .nodes
+                .get(parent)
+                .ok_or_else(|| FerriteError::Scheduler("radix insert: stale parent".into()))?;
+            p.start + p.tokens.len()
+        };
         let child = self.nodes.insert(RadixNode {
             tokens,
             state: Some(state),
@@ -327,11 +358,13 @@ impl RadixCache {
             .get_mut(parent)
             .expect("parent re-borrowed")
             .children
-            .insert(key, child);
+            .entry(key)
+            .or_default()
+            .push(child);
         self.bubble_blocks(parent);
         self.total_blocks += 1;
         self.evictable_tokens += self.page_size;
-        Ok(child)
+        Ok((child, true))
     }
 
     fn bubble_blocks(&mut self, mut node: NodeId) {
@@ -435,9 +468,15 @@ impl RadixCache {
             (n.tokens.clone(), n.state, n.parent)
         };
         let state = state.ok_or_else(|| FerriteError::Scheduler("detach: node without state".into()))?;
-        if let Some(p) = self.nodes.get_mut(parent) {
-            if let Some(first) = tokens.first() {
-                p.children.remove(first);
+        // unlink from the parent's sibling bucket (first-token key)
+        if let Some(first) = tokens.first() {
+            if let Some(p) = self.nodes.get_mut(parent) {
+                if let Some(bucket) = p.children.get_mut(first) {
+                    bucket.retain(|&c| c != node);
+                    if bucket.is_empty() {
+                        p.children.remove(first);
+                    }
+                }
             }
         }
         let mut cur = parent;
@@ -500,10 +539,15 @@ impl RadixCache {
             let Some(state) = state else { break };
             let pages = tokens.len().div_ceil(self.page_size).max(1);
             reclaimed += pages;
-            // unlink from parent, drop subtree weight
-            if let Some(p) = self.nodes.get_mut(parent) {
-                if let Some(first) = tokens.first() {
-                    p.children.remove(first);
+            // unlink from the parent's sibling bucket, drop subtree weight
+            if let Some(first) = tokens.first() {
+                if let Some(p) = self.nodes.get_mut(parent) {
+                    if let Some(bucket) = p.children.get_mut(first) {
+                        bucket.retain(|&c| c != victim);
+                        if bucket.is_empty() {
+                            p.children.remove(first);
+                        }
+                    }
                 }
             }
             let mut cur = parent;

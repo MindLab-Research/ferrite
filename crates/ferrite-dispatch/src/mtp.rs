@@ -168,11 +168,18 @@ pub fn commit_row(
         row_tokens.push(accept.accepted[i]);
     }
     row_tokens.push(accept.bonus);
-    let new_len = committed_len + append;
+    // OpenAI `max_tokens` semantics: the MTP accept window (k+1 tokens)
+    // can overshoot the cap mid-step — truncate to the cap (the window is
+    // atomic on device, the commit surface is the cap). SGLang/vLLM
+    // speculative paths do the same clip at the completion boundary.
+    if row_tokens.len() > max_new_tokens {
+        row_tokens.truncate(max_new_tokens);
+    }
+    let new_len = row_tokens.len();
     // page-boundary promotion: whole pages only (radix granularity).
     // `committed_len` may already be mid-page (prefill wrote it);
     // promotion counts new full pages completed by this commit.
-    let page = new_len - (new_len % page_size);
+    let page = new_len.saturating_add(page_size.saturating_sub(1)) & !(page_size - 1);
     let was = committed_len - (committed_len % page_size);
     let promoted_pages = page.saturating_sub(was);
     let finished = accept.bonus == eos || row_tokens.len() >= max_new_tokens;

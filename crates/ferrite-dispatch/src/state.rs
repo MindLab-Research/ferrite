@@ -349,7 +349,7 @@ pub struct PageLease {
 // ---------------------------------------------------------------------------
 
 /// Family tag for registry-owned snapshot records.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StateTag;
 impl ArenaFamily for StateTag {
     const NAME: &'static str = "state";
@@ -995,6 +995,34 @@ impl<S: PhysStateStore> StateRegistry<S> {
             .and_then(|r| r.as_ref())
             .map(|r| r.committed_tokens)
             .ok_or_else(|| FerriteError::Pool(format!("row_tokens: row {row} not acquired")))
+    }
+
+    /// DSA pages currently leased by a row (the exec backend's growth
+    /// check: `needed = ceil(tokens / page_size)` vs this).
+    pub fn row_pages(&self, row: u32) -> Result<usize> {
+        self.rows
+            .get(row as usize)
+            .and_then(|r| r.as_ref())
+            .map(|r| r.dsa_pages.len())
+            .ok_or_else(|| FerriteError::Pool(format!("row_pages: row {row} not acquired")))
+    }
+
+    /// Grow a row's DSA pages to cover `total_tokens` (idempotent — the
+    /// prefill/decode drivers' ensure primitive; the mock backend has no
+    /// device pool, so this only keeps the registry's page bookkeeping
+    /// in step with the row's committed stream).
+    pub fn ensure_row_pages(&mut self, row: u32, total_tokens: usize) -> Result<()> {
+        let page_size = self.page_size;
+        let need = total_tokens.div_ceil(page_size);
+        let have = self.row_pages(row)?;
+        let committed = self.row_tokens(row)?;
+        if need > have {
+            // `new_tokens` is the *increment* to the committed count (the
+            // stream grew by the delta, not by the total).
+            let delta = total_tokens.saturating_sub(committed);
+            self.extend_row(row, need - have, delta)?;
+        }
+        Ok(())
     }
 
     /// Tier census (diagnostics: hicache occupancy).

@@ -318,7 +318,8 @@ impl<S: PhysStateStore> BatchScheduler<S> {
         self.rows.iter().position(|r| r.is_none()).map(|i| i as u32)
     }
 
-    fn live_rows(&self) -> u32 {
+    /// Live rows (decode-batch occupancy — the bucket scheduler's input).
+    pub fn live_rows(&self) -> u32 {
         self.rows.iter().filter(|r| r.is_some()).count() as u32
     }
 
@@ -614,35 +615,40 @@ impl<S: PhysStateStore> BatchScheduler<S> {
         row: u32,
         accept: &crate::mtp::AcceptRow,
     ) -> Result<(bool, usize)> {
-        let (eos, max_new, page_size, stream_len, committed_len) = {
+        // Output-level commit (max_new_tokens caps the COMPLETION, OpenAI
+        // `max_tokens` semantics — not the prompt+output stream length)
+        // followed by stream-level radix promotion (pages cover the whole
+        // committed stream: prompt + output).
+        let (eos, max_new, page_size, prompt_len) = {
             let s = self
                 .seqs
                 .get(seq)
                 .ok_or_else(|| FerriteError::Scheduler("commit: stale seq".into()))?;
-            (s.eos, s.max_new_tokens, self.cfg.page_size, s.stream_len(), s.stream_len())
+            (s.eos, s.max_new_tokens, self.cfg.page_size, s.prompt.len())
         };
-        let mut stream = {
-            let s = self.seqs.get(seq).expect("arena-consistent");
-            let mut full = s.prompt.clone();
-            full.extend_from_slice(&s.output);
-            full
-        };
-        let commit = crate::mtp::commit_row(&mut stream, committed_len, accept, eos, max_new, page_size)?;
-        {
+        let commit = {
             let s = self.seqs.get_mut(seq).expect("arena-consistent");
-            // stream = prompt ++ output; append the accepted window to output
-            let new_tokens = &stream[s.prompt.len() + s.output.len()..];
-            s.output.extend_from_slice(new_tokens);
-        }
-        let _ = stream_len;
-        // radix promotion: whole pages completed by this commit
-        let promoted = self.promote_row_prefix(seq, row, commit.new_len)?;
+            // `s.output` is the completion stream alone — the max-tokens
+            // cap and the accepted-window append both apply to it.
+            let out_len = s.output.len();
+            crate::mtp::commit_row(&mut s.output, out_len, accept, eos, max_new, page_size)?
+        };
+        // radix promotion: whole pages of the committed stream completed
+        // by this commit (prompt ++ output watermark).
+        let stream_len = prompt_len + self.seqs.get(seq).expect("arena-consistent").output.len();
+        let promoted = self.promote_row_prefix(seq, row, stream_len)?;
         Ok((commit.finished, promoted))
     }
 
     /// Promote the row's page-aligned prefix watermark to the radix tree
     /// (admission-agnostic: prefill chunks and MTP commits share the
     /// watermark logic — new full pages become shareable children).
+    ///
+    /// One node per page (the block granularity — a node's tokens are one
+    /// DSA page, its snapshot the state at the block's end): promotion
+    /// walks [`from`, watermark) one page at a time, chaining children
+    /// down from the anchor — the sharing unit is exactly the page, and a
+    /// mid-prefix reader matches at page boundaries only.
     fn promote_row_prefix(
         &mut self,
         seq: crate::arena::SeqId,
@@ -650,42 +656,51 @@ impl<S: PhysStateStore> BatchScheduler<S> {
         stream_len_now: usize,
     ) -> Result<usize> {
         let page = self.cfg.page_size;
-        let (from, anchor) = {
+        let (mut watermark, mut anchor) = {
             let s = self.seqs.get(seq).expect("arena-consistent");
             (s.promoted_to, s.anchor)
         };
-        let new_pages = stream_len_now / page - from / page;
-        if new_pages == 0 {
-            return Ok(0);
-        }
-        let snap_tokens = (stream_len_now / page) * page;
-        // Row state must cover the watermark (prefill wrote it / MTP
-        // commit did); pages leased at admission cover the matched prefix.
-        let state = self.registry.snapshot_from_row(row, snap_tokens)?;
-        let tokens = {
-            let s = self.seqs.get(seq).expect("arena-consistent");
-            // stream window [from, snap_tokens) — prompt then output
-            let mut window = Vec::with_capacity(snap_tokens - from);
-            let (p_out, o_start) = if from < s.prompt.len() {
-                (s.prompt[from.min(s.prompt.len())..].to_vec(), 0usize)
-            } else {
-                (Vec::new(), from - s.prompt.len())
+        let mut promoted = 0usize;
+        while watermark + page <= stream_len_now {
+            let block_end = watermark + page;
+            // Snapshot at the block boundary (the page's last-token state).
+            let state = self.registry.snapshot_from_row(row, block_end)?;
+            // Stream window [watermark, block_end) — prompt then output.
+            let tokens = {
+                let s = self.seqs.get(seq).expect("arena-consistent");
+                let mut window = Vec::with_capacity(page);
+                if watermark < s.prompt.len() {
+                    let end = block_end.min(s.prompt.len());
+                    window.extend_from_slice(&s.prompt[watermark..end]);
+                }
+                if block_end > s.prompt.len() {
+                    let o_start = watermark.saturating_sub(s.prompt.len());
+                    let o_end = (block_end - s.prompt.len()).min(s.output.len());
+                    if o_start < o_end {
+                        window.extend_from_slice(&s.output[o_start..o_end]);
+                    }
+                }
+                window
             };
-            window.extend_from_slice(&p_out);
-            if snap_tokens > s.prompt.len() {
-                let o_end = (snap_tokens - s.prompt.len()).min(s.output.len());
-                window.extend_from_slice(&s.output[o_start.min(s.output.len())..o_end]);
+            let parent = anchor.unwrap_or_else(|| self.radix.root());
+            let (child, inserted_new) = self.radix.insert_branch(parent, tokens, state)?;
+            if !inserted_new {
+                // Identical block already shared (another request promoted
+                // this exact page-prefix): the existing node's state IS
+                // this block's state (block-equal prefixes ⇒ equal GDN
+                // snapshots); release our fresh snapshot and share the node.
+                self.registry.release_snapshot(state)?;
             }
-            window
-        };
-        let anchor = anchor.unwrap_or_else(|| self.radix.root());
-        let child = self.radix.insert_branch(anchor, tokens, state)?;
-        {
-            let s = self.seqs.get_mut(seq).expect("arena-consistent");
-            s.promoted_to = snap_tokens;
-            s.anchor = Some(child);
+            anchor = Some(child);
+            watermark = block_end;
+            promoted += 1;
         }
-        Ok(new_pages)
+        if promoted > 0 {
+            let s = self.seqs.get_mut(seq).expect("arena-consistent");
+            s.promoted_to = watermark;
+            s.anchor = anchor;
+        }
+        Ok(promoted)
     }
 
     /// Retirement: unpin the radix path, release the row, terminal phase.
@@ -729,6 +744,42 @@ impl<S: PhysStateStore> BatchScheduler<S> {
     }
 
     // -- queries ------------------------------------------------------------
+
+    /// Abort an active sequence (client disconnect / API cancel): retire
+    /// it mid-flight — release the decode row, unpin the radix path,
+    /// return its pages. The partial output stays queryable (`output`).
+    ///
+    /// Idempotent: cancelling a retired/unknown seq is a no-op (returns
+    /// false). This is the SSE-disconnect path of the HTTP server — the
+    /// row freed here is admitted to the next queued request at the
+    /// coming tick (no partial-tick churn; the tick is the only writer).
+    pub fn cancel(&mut self, seq: crate::arena::SeqId) -> Result<bool> {
+        let (phase, row) = self
+            .seqs
+            .get(seq)
+            .map(|s| (s.phase, s.row))
+            .ok_or_else(|| FerriteError::Scheduler("cancel: stale seq".into()))?;
+        match phase {
+            Phase::Retired => Ok(false), // already terminal (idempotent)
+            Phase::Queued => {
+                self.queue.retain(|&q| q != seq);
+                if let Some(s) = self.seqs.get_mut(seq) {
+                    s.phase = Phase::Retired;
+                }
+                Ok(true)
+            }
+            Phase::Prefilling { .. } | Phase::Decoding => {
+                let row = row.ok_or_else(|| {
+                    FerriteError::Scheduler("cancel: active seq without row (corrupt state)".into())
+                })?;
+                // committed prefix promotion happens naturally at the next
+                // page boundary; a cancelled seq's partial pages unpin on
+                // retire (the tree keeps only what it already promoted).
+                self.compact_after_retire(row)?;
+                Ok(true)
+            }
+        }
+    }
 
     pub fn status(&self, seq: crate::arena::SeqId) -> Result<&'static str> {
         let phase = self
