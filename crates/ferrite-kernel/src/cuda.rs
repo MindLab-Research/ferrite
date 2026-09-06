@@ -24,6 +24,8 @@ pub type CuStream = *mut std::ffi::c_void;
 extern "C" {
     // cudart (linked into libferrite_kernels.so's dependency closure)
     fn cudaSetDevice(dev: i32) -> i32;
+    fn cudaProfilerStart() -> i32;
+    fn cudaProfilerStop() -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
@@ -2835,4 +2837,17 @@ impl CudaBackend {
 /// Set the current CUDA device (for NCCL init — needs device 0 context).
 pub fn cuda_set_device(dev: i32) {
     unsafe { cudaSetDevice(dev) };
+}
+
+/// ncu capture-window control (`ncu --profile-from-start off`): FERRITE_NCU=1
+/// opens the window right before the decode loop — the 80s weight load
+/// (38k H2D uploads ncu intercepts at ms-level cost each, stalling the run
+/// 10+ minutes) and prefill run at full speed, only the decode steps are
+/// profiled. cuProfilerStart/Stop work for both ncu and nsys.
+pub fn profiler_start() {
+    unsafe { cudaProfilerStart() };
+}
+
+pub fn profiler_stop() {
+    unsafe { cudaProfilerStop() };
 }

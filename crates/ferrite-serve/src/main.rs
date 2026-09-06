@@ -252,6 +252,15 @@ fn run_cuda(
         .first()
         .and_then(|s| s.seq_runtime(seq).map(|rt| rt.tokens.len()))
         .unwrap_or(0);
+    // ncu capture window (ncu --profile-from-start off + FERRITE_NCU=1):
+    // the 80s weight load (38k H2D uploads ncu intercepts at ms-level
+    // cost each — stalls the run 10+ min) and prefill run at full speed;
+    // only the decode loop is profiled. cuProfilerStop flushes the window.
+    let ncu_win = std::env::var_os("FERRITE_NCU").is_some();
+    if ncu_win {
+        #[cfg(feature = "cuda")]
+        ferrite_kernel::cuda::profiler_start();
+    }
     for i in 0..max_tokens {
         let tok = cluster
             .decode_step(seq)
@@ -281,6 +290,10 @@ fn run_cuda(
         if std::env::var_os("FERRITE_TRACE_TOK").is_some() {
             println!("[serve] tok {i}: {tok}");
         }
+    }
+    if ncu_win {
+        #[cfg(feature = "cuda")]
+        ferrite_kernel::cuda::profiler_stop();
     }
     let td1 = std::time::Instant::now();
     let decode_s = td1.duration_since(tp1).as_secs_f32();
