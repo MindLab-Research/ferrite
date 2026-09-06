@@ -1361,6 +1361,19 @@ impl<B: KernelBackend> TpCluster<B> {
                     let r2 = ferrite_kernel::cuda::memcpy_d2h_sync(
                         d2_ptr as *mut std::ffi::c_void, d2_val.as_mut_ptr(), 1, cuda.stream_handle());
                     if r1 != 0 || r2 != 0 { return Err(FerriteError::InvalidArg(format!("d1/d2 D2H: {r1}/{r2}"))); }
+                    // ZERO-H2D debug: d1/d2/a comparison + verify input checksum
+                    // (d1 vs a0 mismatch = verify input path bug; checksum vs
+                    // the original hc_expand identifies embed_expand_dev issues)
+                    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                        // verify input checksum (first 8 values from staging)
+                        let mut vin_chk = [0f32; 8];
+                        let rc = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            io.x_stage, vin_chk.as_mut_ptr(), 8, cuda.stream_handle());
+                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} a1={:.0} a2={:.0} k={} vin[0..4]={:?.3} r={}",
+                            d1_val[0], d2_val[0], a[0], a[1], a[2],
+                            if d1_val[0] as u32 == a[0] as u32 { "==" } else { "!=" },
+                            vin_chk.iter().map(|v| v.trunc()).collect::<Vec<_>>(), rc);
+                    }
                     let k_host = if d1_val[0] as u32 == a[0] as u32 {
                         if d2_val[0] as u32 == a[1] as u32 { 3 } else { 2 }
                     } else { 1 };
