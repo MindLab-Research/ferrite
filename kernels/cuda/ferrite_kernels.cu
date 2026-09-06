@@ -3822,9 +3822,22 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
 {
     (void)srows;
     if (out_f % 16 != 0 || in_f % 128 != 0) return cudaErrorNotSupported;
-    // CO-RESIDENT cap: the spin barriers require every block resident
-    // (9680-block lm_head deadlocked the first cut); blocks row-loop above.
-    const unsigned grid = (unsigned)(out_f / 16) < 128u ? (unsigned)(out_f / 16) : 128u;
+    // CO-RESIDENT cap via the occupancy API: the spin barriers require every
+    // participating block simultaneously resident. v3's hardcoded 128 (1/SM)
+    // left the GPU 86% idle on lm_head (0.42x vs bf16); this kernel is tiny
+    // (256 thr, 512B smem) so 4-8 blocks/SM co-reside — row-loop iterations
+    // drop accordingly (9680/1184 = 8 instead of 9680/128 = 76).
+    static int max_active = 0; // cached: occupancy × SM count (host-side, per-process)
+    if (max_active == 0) {
+        int per_sm = 0;
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, gemv_fp8_mma_v3_kernel, 256, 0);
+        int nsm = 0;
+        cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+        max_active = per_sm * nsm;
+        if (max_active <= 0) max_active = 128; // conservative fallback
+    }
+    const unsigned want = (unsigned)(out_f / 16);
+    const unsigned grid = want < (unsigned)max_active ? want : (unsigned)max_active;
     gemv_fp8_mma_v3_kernel<<<grid, 256, 0, s>>>(
         x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols);
     return cudaGetLastError();
