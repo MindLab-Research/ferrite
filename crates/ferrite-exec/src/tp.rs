@@ -1290,11 +1290,21 @@ impl<B: KernelBackend> TpCluster<B> {
                             (m2.0, m2.1)
                         };
                         let _ = t0c;
+                        // k_nope layout [max_tokens, h=64, dk=256] → slot stride
+                        // h*dk=16384 floats. Slot 14 = the draft's own append
+                        // target — MUST change every step (fresh KV). If it
+                        // stays constant across steps → append is not landing
+                        // at slot 14 (stale KV read by attention = delayed d1).
                         let mut kv = [0f32; 4];
                         let rk = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            unsafe { knp.add(14 * 16 * 128) } as *mut std::ffi::c_void,
+                            unsafe { knp.add(14 * 64 * 256) } as *mut std::ffi::c_void,
                             kv.as_mut_ptr(), 4, cuda.stream_handle());
-                        eprintln!("[zh2d-kv] cache14_knope={:?} r={}", kv, rk);
+                        // also slot 15 (draft2's append target)
+                        let mut kv15 = [0f32; 4];
+                        let rk15 = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            unsafe { knp.add(15 * 64 * 256) } as *mut std::ffi::c_void,
+                            kv15.as_mut_ptr(), 4, cuda.stream_handle());
+                        eprintln!("[zh2d-kv] s14={:?} s15={:?} r={}/{}", kv, kv15, rk, rk15);
                     }
                 }
 
