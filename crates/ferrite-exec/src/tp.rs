@@ -3712,8 +3712,12 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
             x2.as_f32() as *mut std::ffi::c_void, xfull.as_mut_ptr(), xn, cuda.stream_handle());
         let mut hsum: f64 = 0.0;
         for v in &xfull[..xn] { hsum += *v as f64; }
-        eprintln!("[zh2d-x2] x2[0..2]={:?} sum={:.6} last4={:?}",
-            &xfull[..2], hsum, &xfull[xn-4..]);
+        // 8-segment checksums (512 floats each) — pinpoints WHICH 512-block
+        // of x2 differs between orig and zero-H2D (sum can cancel across blocks)
+        let mut segs = [0f64; 8];
+        for (i, v) in xfull[..xn].iter().enumerate() { segs[i / 512] += *v as f64; }
+        eprintln!("[zh2d-x2] x2[0..2]={:?} sum={:.6} segs={:?} last4={:?}",
+            &xfull[..2], hsum, segs, &xfull[xn-4..]);
     }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
