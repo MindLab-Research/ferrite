@@ -1258,6 +1258,53 @@ impl<B: KernelBackend> TpCluster<B> {
                     hidden,
                 )?;
 
+                // FERRITE_ZH2D_AB: same-process A/B of the draft chain — re-run
+                // draft 1 the ORIGINAL way (host embed + upload + mtp_forward
+                // wrapper). NCCL stays matched (all 4 ranks execute the same
+                // extra 3 ARs); mtp_family t_count rolled back (-1) so draft 2
+                // sees the same cache slot. Float-compare d1/d1_ref and the
+                // x2 residual (h_d1) — locates WHERE the zero-H2D draft diverges.
+                if std::env::var_os("FERRITE_ZH2D_AB").is_some() {
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                        let mut d1_zh = [0f32; 1];
+                        let mut hd1_zh = [0f32; 8];
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            d1_ptr as *mut std::ffi::c_void, &mut d1_zh[0], 1, cuda.stream_handle());
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            h_d1.as_f32() as *mut std::ffi::c_void, hd1_zh.as_mut_ptr(), 8, cuda.stream_handle());
+                        // original path: host embed + upload + mtp_forward
+                        let h2 = s.embed(&[last]);
+                        let emb_ref = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                        emb_ref.upload(h2.as_slice())?;
+                        let h_d1_ref = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
+                        let hptr_ref = {
+                            let m = cuda.mtp.lock().unwrap();
+                            &m.as_ref().unwrap().hprev as *const DevBuf as usize
+                        }; // cuda borrow ends here (NLL)
+                        let hprev_ref: &DevBuf = unsafe { &*(hptr_ref as *const DevBuf) };
+                        let d1_ref = mtp_forward(s, seq, &emb_ref, hprev_ref, Some(&h_d1_ref))?;
+                        // ab's mtp_forward advanced mtp_family t_count by 1 — roll back
+                        {
+                            let cuda = s
+                                .backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                            cuda.dsa_host_rollback(seq, mtp_family, 1);
+                            let mut hd1_ref = [0f32; 8];
+                            ferrite_kernel::cuda::memcpy_d2h_sync(
+                                h_d1_ref.as_f32() as *mut std::ffi::c_void, hd1_ref.as_mut_ptr(), 8, cuda.stream_handle());
+                            let h_match = hd1_zh.iter().zip(hd1_ref.iter()).all(|(a, b)| a == b);
+                            let hd: Vec<String> = hd1_zh.iter().map(|v| format!("{v:.6}")).collect();
+                            let hr: Vec<String> = hd1_ref.iter().map(|v| format!("{v:.6}")).collect();
+                            eprintln!("[zh2d-ab1] d1_zh={:.0} d1_ref={:.0} match={} h_d1_zh={:?} h_d1_ref={:?} h_match={}",
+                                d1_zh[0], d1_ref, d1_zh[0] as u32 == d1_ref as u32, hd, hr, h_match);
+                        }
+                    }
+                }
                 // Draft 2: embed_one(d1) → emb2_dev → mtp_forward → d2_argmax_dev
                 // d1 is f32 (argmax output); embed_one reads i32 — 4B D2H
                 // (within SSE budget; TODO: f32→i32 cast kernel on device)
@@ -1292,6 +1339,35 @@ impl<B: KernelBackend> TpCluster<B> {
                     d2_ptr as *mut std::ffi::c_void,
                     hidden,
                 )?;
+                // FERRITE_ZH2D_AB: draft 2 A/B — original path with the SAME
+                // h_d1 (x2 from zero-H2D draft 1) + host embed of d1.
+                if std::env::var_os("FERRITE_ZH2D_AB").is_some() {
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                        let mut d1_zh2 = [0f32; 1];
+                        let mut d2_zh = [0f32; 1];
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            d1_ptr as *mut std::ffi::c_void, &mut d1_zh2[0], 1, cuda.stream_handle());
+                        ferrite_kernel::cuda::memcpy_d2h_sync(
+                            d2_ptr as *mut std::ffi::c_void, &mut d2_zh[0], 1, cuda.stream_handle());
+                        let h3 = s.embed(&[d1_zh2[0] as u32]);
+                        let emb2_ref = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                        emb2_ref.upload(h3.as_slice())?;
+                        let d2_ref = mtp_forward(s, seq, &emb2_ref, &h_d1, None)?;
+                        {
+                            let cuda = s
+                                .backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                            cuda.dsa_host_rollback(seq, mtp_family, 1);
+                        }
+                        eprintln!("[zh2d-ab2] d2_zh={:.0} d2_ref={:.0} match={}",
+                            d2_zh[0], d2_ref, d2_zh[0] as u32 == d2_ref as u32);
+                    }
+                }
                 let t_draft = t_d.elapsed();
 
                 // === Phase 2: VERIFY (graph replay, input from device) ===
