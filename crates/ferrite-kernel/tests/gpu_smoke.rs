@@ -1671,7 +1671,7 @@ fn gemv_fp8_mma_parity_and_speed() {
             // lm_head-sized (317MB fp8): random legal e4m3 bytes + constant
             // scale (634M fp8_encode calls would take minutes; parity
             // spot-checks the first 8 rows only, bench measures raw HBM)
-            wbytes = (0..out_f * in_f).map(|i| 0x10 | ((i as u32).wrapping_mul(2654435761) >> 25) as u8 & 0x6f).collect();
+            wbytes = (0..out_f * in_f).map(|i| 0x10 | ((i as u32).wrapping_mul(2654435761) >> 25) as u8 & 0x6e).collect();
             scale = vec![0.003f32; srows * scols];
         } else {
             let mut sc = vec![0f32; srows * scols];
