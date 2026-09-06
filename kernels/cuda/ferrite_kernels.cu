@@ -2537,10 +2537,30 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     // FUSED rmsnorm tail (saves the standalone rmsnorm kernel launch per
     // layer segment): identical reduce order to rmsnorm_kernel (stride ss →
     // warp shfl → serial red[8] → rsqrt(ss/h + eps)) for parity.
-    for (int j = threadIdx.x; j < h; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < n; i++) acc += pre_s[i] * x[(size_t)i * h + j];
-        li_s[j] = acc;
+    // float4-vectorized read of x (j is a multiple of 4; i*h is a multiple of
+    // hidden, both 16B-aligned): each j's acc accumulates over i in the SAME
+    // order as the scalar loop — bit-identical, only the global-load width
+    // changes (memory-bound li: ~2-4x faster). h%4==0 guaranteed (hidden ints).
+    for (int j = threadIdx.x << 2; j < h; j += blockDim.x << 2) {
+        if (j + 3 < h) {
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            #pragma unroll
+            for (int i = 0; i < n; i++) {
+                const float* xr = x + (size_t)i * h + j;
+                float4 xv = *reinterpret_cast<const float4*>(xr);
+                a0 += pre_s[i] * xv.x;
+                a1 += pre_s[i] * xv.y;
+                a2 += pre_s[i] * xv.z;
+                a3 += pre_s[i] * xv.w;
+            }
+            li_s[j] = a0; li_s[j + 1] = a1; li_s[j + 2] = a2; li_s[j + 3] = a3;
+        } else {
+            for (int jj = j; jj < h; jj++) {
+                float acc = 0.f;
+                for (int i = 0; i < n; i++) acc += pre_s[i] * x[(size_t)i * h + jj];
+                li_s[jj] = acc;
+            }
+        }
     }
     __syncthreads();
     float ss = 0.f;
