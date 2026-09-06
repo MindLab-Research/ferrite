@@ -212,7 +212,11 @@ fn row_split(w: &Tensor, start: usize, end: usize) -> Tensor {
     if w.as_slice().len() < w.numel() {
         let mut shape = vec![end - start];
         shape.extend_from_slice(&dims[1..]);
-        return Tensor::new(Shape::new(shape), w.dtype, vec![0f32; 4]);
+        return Tensor {
+            shape: Shape::new(shape),
+            dtype: w.dtype,
+            data: std::sync::Arc::new(vec![0f32; 4]),
+        };
     }
     if dims.len() == 1 {
         let data = w.as_slice()[start..end].to_vec();
@@ -231,7 +235,11 @@ fn col_split(w: &Tensor, start: usize, end: usize) -> Tensor {
     let cols = w.shape.0[1];
     if w.as_slice().len() < w.numel() {
         // fp8 placeholder: shape-only split (see row_split)
-        return Tensor::new(Shape::new([rows, end - start]), w.dtype, vec![0f32; 4]);
+        return Tensor {
+            shape: Shape::new([rows, end - start]),
+            dtype: w.dtype,
+            data: std::sync::Arc::new(vec![0f32; 4]),
+        };
     }
     let mut data = Vec::with_capacity(rows * (end - start));
     for r in 0..rows {

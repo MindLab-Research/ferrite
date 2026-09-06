@@ -294,7 +294,13 @@ fn load_named(
             Ok((Tensor::new(Shape::new(shape), DType::F32, data), Some(fp8)))
         } else {
             rep.fp8_placeholder += 1;
-            let placeholder = Tensor::new(Shape::new(shape), DType::F32, vec![0f32; 4]);
+            // Direct field construction: Tensor::new asserts data.len() ==
+            // numel (the placeholder's 4-elem stub intentionally violates it).
+            let placeholder = Tensor {
+                shape: Shape::new(shape),
+                dtype: DType::F32,
+                data: std::sync::Arc::new(vec![0f32; 4]),
+            };
             Ok((placeholder, Some(fp8)))
         }
     } else {
