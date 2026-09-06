@@ -216,11 +216,23 @@ fn run_cuda(
                 handles.push(scope.spawn(move || {
                     let mut n_2d = 0usize;
                     let mut n_1d = 0usize;
-                    for (_name, t) in shard.weights.iter() {
+                    let mut n_fp8 = 0usize;
+                    for (name, t) in shard.weights.iter() {
+                        // fp8 bypass: skip the bf16 upload for registered hits —
+                        // matmul_dev serves these from the native-F8 resident copy
+                        // (registered at set_fp8). The fused-MoE kernels still read
+                        // the bf16 pointer tables (routed experts + shared expert),
+                        // so those weights keep their bf16 residency.
+                        let moe_bf16 =
+                            name.contains(".experts.") || name.contains(".shared_expert.");
+                        if !moe_bf16 && shard.backend.fp8_hit(t) {
+                            n_fp8 += 1;
+                            continue;
+                        }
                         shard
                             .backend
                             .preload_weight(t)
-                            .unwrap_or_else(|e| panic!("preload rank {rank} weight {_name}: {e}"));
+                            .unwrap_or_else(|e| panic!("preload rank {rank} weight {name}: {e}"));
                         if t.shape.0.len() >= 2 {
                             n_2d += 1;
                         } else {
@@ -228,7 +240,7 @@ fn run_cuda(
                         }
                     }
                     println!(
-                        "[serve] rank {rank}: {n_2d} x2d (bf16-resident) + {n_1d} x1d (f32) weights on device"
+                        "[serve] rank {rank}: {n_2d} x2d (bf16-resident) + {n_1d} x1d (f32) + {n_fp8} fp8-resident weights on device"
                     );
                 }));
             }

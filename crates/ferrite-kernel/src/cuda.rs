@@ -707,6 +707,14 @@ impl CudaBackend {
         self.fp8_map.lock().unwrap().len()
     }
 
+    /// Is this f32 golden served from the registered fp8 bypass? Preload
+    /// skips the bf16 upload for hits (matmul_dev serves fp8; only
+    /// non-fp8-able weights and the fused-MoE bf16 ptr tables stay bf16) —
+    /// the fp8 + bf16 double residency OOM'd rank 3 at ~213GB/275GB.
+    pub fn fp8_hit(&self, t: &Tensor) -> bool {
+        self.fp8_lookup(t).is_some()
+    }
+
     /// Preload a weight into device-resident storage (bf16 for 2-D matmul
     /// weights — run_matmul reads bf16 exclusively; 1-D tensors stay f32
     /// for the elementwise kernels). Serve calls this over every shard
