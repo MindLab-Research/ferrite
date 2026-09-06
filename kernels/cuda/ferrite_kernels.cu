@@ -3844,7 +3844,8 @@ __global__ void gemv_fp8_mma_v2_kernel(
     const int m0 = blockIdx.x * 16;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
-    __shared__ float sacc[8][16];
+    __shared__ float sacc[8 * 16]; // 1D: [warp*16 + row] (the probe-verified 2D form tripped
+                                   // "modifiable lvalue" with flat indexing)
     const int nblk = (in_f + 127) >> 7;
     const int bseg = (nblk + 7) / 8;
     const int kW = warp;
