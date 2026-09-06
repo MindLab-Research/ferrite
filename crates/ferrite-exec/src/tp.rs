@@ -1552,17 +1552,19 @@ impl<B: KernelBackend> TpCluster<B> {
                     let k_host = if d1_val[0] as u32 == a[0] as u32 {
                         if d2_val[0] as u32 == a[1] as u32 { 3 } else { 2 }
                     } else { 1 };
-                    // DSA rollback — mtp_family reverts to (3-k), matching the
-                    // original mtp_step: draft appended 2 (last, d1); k=1
-                    // rejects d1 → rollback BOTH (t back to t0, next step's
-                    // draft1 overwrites t0 with the new last). k=2 accepts
-                    // d1==a0 → keep last+d1. k=3 keeps all. The (2-k) variant
-                    // kept the REJECTED d1's KV at k=1 — draft's attention
-                    // consumed verify-failed KV — accept collapsed.
+                    // DSA rollback — decoder families: verify graph appends 3
+                    // (last,d1,d2) → keep k accepted → rollback(3-k) ✓ (vLLM
+                    // semantics). mtp_family: draft appends only 2 (last@t0,
+                    // d1@t0+1) → keep k means rollback(2-k): k=1 keeps t0's
+                    // last (the PREVIOUSLY-VERIFIED main KV), next draft1's
+                    // a0 overwrites t0+1 (the REJECTED d1 slot); k=2/3 keep
+                    // last+d1. The old (3-k) was vLLM's 3-append formula
+                    // applied to a 2-append draft — it reverted ONE too many,
+                    // so the next draft1 overwrote the verified main KV at t0.
                     for f in 0..num_dsa {
                         cuda.dsa_host_rollback(seq, f, (3 - k_host) as usize);
                     }
-                    cuda.dsa_host_rollback(seq, mtp_family, (3 - k_host) as usize);
+                    cuda.dsa_host_rollback(seq, mtp_family, (2 - k_host).max(0) as usize);
                     // mtp_commit with k from host (pinned — TODO: k_dev from device)
                     cuda.mtp_commit(k_host)?;
                     let t_commit = t_c.elapsed();
@@ -3741,7 +3743,7 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         let mut l2 = [0f32; 2];
         ferrite_kernel::cuda::memcpy_d2h_sync(
             logits.as_f32() as *mut std::ffi::c_void, l2.as_mut_ptr(), 2, cuda.stream_handle());
-        eprintln!("[zh2d-am] argmax_out={:.0} logits[0..2]={:?.4}", av[0], l2);
+        eprintln!("[zh2d-am] argmax_out={:.0} logits[0..2]={:?}", av[0], l2);
     }
     Ok(())
 }
