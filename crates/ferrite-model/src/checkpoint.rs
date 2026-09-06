@@ -277,8 +277,12 @@ pub fn is_fp8_eligible(src: &str, layer_idx: Option<usize>, cfg: &Glm53FlashConf
         || li >= cfg.layer_types.len();
     if is_dsa {
         if src.contains("self_attn.indexer.") { return false; }
-        return src.ends_with(".q_a_proj.weight") || src.contains("kv_a_proj_with_mqa.weight")
-            || src.ends_with(".q_b_proj.weight") || src.ends_with(".o_proj.weight");
+        // e2e 2026-09-06: MLA main projections measured NEGATIVE (dsa at=6.0ms
+        // /layer vs ~4 bf16 — 44 small-matrix W8A8 gemvs at 0.6x; accept
+        // 2.38->2.17 from x-e4m3 argmax flips). lm_head (154880 rows) and MoE
+        // experts stay fp8 (HBM-bound wins). Re-enable with the 6-matrix mega
+        // gemv (shared xq quant, N=8 real columns) that fixes the 0.6x.
+        return false;
     }
     false
 }
@@ -634,12 +638,15 @@ mod fp8_eligibility_tests {
         assert!(!is_fp8_eligible(&format!("model.layers.{gdn}.self_attn.qkv_proj.weight"), Some(gdn), &cfg));
         assert!(!is_fp8_eligible(&format!("model.layers.{gdn}.self_attn.o_proj.weight"), Some(gdn), &cfg));
         assert!(!is_fp8_eligible(&format!("model.layers.{gdn}.self_attn.f_a_proj.weight"), Some(gdn), &cfg));
-        // MLA full-attn layer (idx 1 = DeepseekSparseAttention): main proj fp8
+        // MLA full-attn layer (idx 1 = DeepseekSparseAttention): main proj bf16
+        // (e2e 2026-09-06 rollback: 44 small-matrix W8A8 gemvs at 0.6x + accept
+        // 2.38->2.17 argmax flips were net-negative; revisit with the 6-matrix
+        // mega gemv)
         let dsa = cfg.layer_types.iter().position(|t| *t == LayerType::DeepseekSparseAttention).unwrap();
-        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.q_a_proj.weight"), Some(dsa), &cfg));
-        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.kv_a_proj_with_mqa.weight"), Some(dsa), &cfg));
-        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.q_b_proj.weight"), Some(dsa), &cfg));
-        assert!(is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.o_proj.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.q_a_proj.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.kv_a_proj_with_mqa.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.q_b_proj.weight"), Some(dsa), &cfg));
+        assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.o_proj.weight"), Some(dsa), &cfg));
         // MLA indexer components -> bf16
         assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.indexer.wq_b.weight"), Some(dsa), &cfg));
         assert!(!is_fp8_eligible(&format!("model.layers.{dsa}.self_attn.indexer.weights_proj.weight"), Some(dsa), &cfg));
