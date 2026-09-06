@@ -302,6 +302,7 @@ dependencies = [
  "ferrite-model",
  "ferrite-scheduler",
  "ferrite-types",
+ "rayon",
  "thiserror 2.0.20",
 ]
 

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+rayon.workspace = true
 thiserror.workspace = true
 ferrite-types = { path = "../ferrite-types" }
 ferrite-model = { path = "../ferrite-model" }

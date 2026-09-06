@@ -566,38 +566,50 @@ impl<B: KernelBackend> TpCluster<B> {
         }
         let dbg = std::env::var_os("FERRITE_FP8_DEBUG").is_some();
         let n = self.shards.len();
-        let mut registered = 0usize;
-        for rank in 0..n {
-            let shard = shard_weights8_tp(w8, &self.full_cfg, rank, n);
-            // Register each fp8 weight against its f32 golden (same-name
-            // shard pairing) on the CUDA backend: matmul_dev hits by
-            // (ptr, numel) from then on. Non-CUDA backends skip (CPU path
-            // stays on the f32 golden — correctness reference).
-            for (name, f8) in shard.iter() {
-                let Some(golden) = self.shards[rank].weights.get(name) else { continue };
-                let Some(cuda) = self.shards[rank].backend.as_cuda() else { continue };
-                if let Err(e) = cuda.register_fp8(golden, f8.rows, f8.cols, &f8.data, &f8.scale) {
-                    eprintln!("[tp] fp8 register {} failed: {e} (stays bf16)", name);
-                } else {
-                    registered += 1;
-                    if dbg {
-                        if !cuda.fp8_hit(golden) {
-                            eprintln!(
-                                "[fp8dbg] REGISTER-VERIFY MISS {name} ptr={:x} numel={} map={}",
-                                golden.as_slice().as_ptr() as usize, golden.numel(), cuda.fp8_registered()
-                            );
-                        }
-                        if registered <= 3 || registered % 2000 == 0 {
-                            eprintln!(
-                                "[fp8dbg] reg#{registered} {name} ptr={:x} numel={}",
-                                golden.as_slice().as_ptr() as usize, golden.numel()
-                            );
+        // CONCURRENT per-rank registration (was a serial `for rank in 0..n` —
+        // 9474 cudaMalloc+H2D × 4 ranks on the main thread: GPU k got its fp8
+        // upload only after rank k-1 finished, so GPUs 2/3 sat at 1GB while
+        // 0/1 were at 76GB — the visible "not concurrent loading"). rayon's
+        // par_iter_mut gives each rank its own thread; register_fp8's enter()
+        // is thread-local cudaSetDevice, so each thread binds ITS rank's
+        // device — the H2Ds all fly concurrently.
+        use rayon::prelude::*;
+        let full_cfg = self.full_cfg.clone();
+        let registered: Vec<usize> = self
+            .shards
+            .par_iter_mut()
+            .enumerate()
+            .map(|(rank, shard)| {
+                let shard8 = shard_weights8_tp(w8, &full_cfg, rank, n);
+                let mut cnt = 0usize;
+                for (name, f8) in shard8.iter() {
+                    let Some(golden) = shard.weights.get(name) else { continue };
+                    let Some(cuda) = shard.backend.as_cuda() else { continue };
+                    if let Err(e) = cuda.register_fp8(golden, f8.rows, f8.cols, &f8.data, &f8.scale) {
+                        eprintln!("[tp] fp8 register {} failed: {e} (stays bf16)", name);
+                    } else {
+                        cnt += 1;
+                        if dbg {
+                            if !cuda.fp8_hit(golden) {
+                                eprintln!(
+                                    "[fp8dbg] REGISTER-VERIFY MISS {name} ptr={:x} numel={} map={}",
+                                    golden.as_slice().as_ptr() as usize, golden.numel(), cuda.fp8_registered()
+                                );
+                            }
+                            if cnt <= 3 || cnt % 2000 == 0 {
+                                eprintln!(
+                                    "[fp8dbg] r{rank} reg#{cnt} {name} ptr={:x} numel={}",
+                                    golden.as_slice().as_ptr() as usize, golden.numel()
+                                );
+                            }
                         }
                     }
                 }
-            }
-            self.shards[rank].weights8 = shard;
-        }
+                shard.weights8 = shard8;
+                cnt
+            })
+            .collect();
+        let registered: usize = registered.into_iter().sum();
         println!("[tp] fp8 bypass registered: {} weights (rank-avg {})", registered / n.max(1), registered);
     }
 
