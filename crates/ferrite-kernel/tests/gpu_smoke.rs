@@ -1573,18 +1573,25 @@ fn moe_fused_fp8_parity_and_speed() {
 
 /// e4m3 encode (f32 → F8_E4M3 bytes, bias-7, 3-bit mantissa, ±448 clamp)
 /// — inverse of e4m3_decode; round-to-nearest-EVEN (matches __nv_cvt_float_to_fp8).
+/// value = (1 + m/8)·2^(e-7): the mantissa field m is the FRACTION bits
+/// (frac-1)·8 ∈ [0,8), NOT (a/2^e)·8 — an off-by-8 there codes 448 as 0x78
+/// (=256) instead of 0x7E and skewed every W8A8 golden vs the kernel's
+/// __nv_cvt (constant ~1.29x dot ratio, the 128x16 probe caught it).
 fn fp8_encode(x: f32) -> u8 {
     let sign = if x < 0.0 { 0x80u8 } else { 0 };
     let a = x.abs();
     if a == 0.0 { return sign; }
-    let e_b = (a.log2().floor() as i32 + 7).min(15);
-    let mut m = (a / 2f32.powi(e_b - 7) * 8.0).round_ties_even() as i32;
-    if m > 8 { m = 8; } // rounding can hit 8 → carries to next exp
-    if m == 8 {
-        let e2 = (e_b + 1).min(15);
-        return sign | ((e2 as u8) << 3);
+    if a >= 448.0 { return sign | 0x7e; } // e4m3 max finite (SATFINITE clamp)
+    let e_b = (a.log2().floor() as i32 + 7).max(1); // normal range (bias 7)
+    let frac = a / 2f32.powi(e_b - 7); // [1, 2)
+    let mut e = e_b;
+    let mut m = ((frac - 1.0) * 8.0).round_ties_even() as i32; // [0, 8]
+    if m >= 8 { // carry: fraction rounded to 2.0
+        e = e_b + 1;
+        m = 0;
     }
-    sign | (((e_b as u8) & 0xF) << 3) | ((m as u8) & 7)
+    if e > 15 { return sign | 0x7e; } // overflow clamps to max finite
+    sign | (((e as u8) & 0xF) << 3) | ((m as u8) & 7)
 }
 
 
