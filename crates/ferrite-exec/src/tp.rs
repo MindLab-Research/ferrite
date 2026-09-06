@@ -1536,18 +1536,29 @@ impl<B: KernelBackend> TpCluster<B> {
                         // trunc() displayed them as 0.0 which looked like a bug
                         // but is NORMAL). Plus the host expected hc_expand for
                         // direct device-vs-host comparison.
-                        let mut vin_chk = [0f32; 4];
+                        // FULL 12288-float bit-level memcmp of verify input
+                        // (device embed_expand_dev vs host hc_expand). The old
+                        // front-4/1e-3 check missed 1-ulp drift that flips a0's
+                        // argmax (S2 a0=374 vs orig 98347) — the root cause.
+                        let nv = 3 * hc_mult * 4096;
+                        let mut vin_full = vec![0f32; nv];
                         let rc = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            io.x_stage, vin_chk.as_mut_ptr(), 4, cuda.stream_handle());
+                            io.x_stage, vin_full.as_mut_ptr(), nv, cuda.stream_handle());
                         let h2v = s.embed(&[last, d1_val[0] as u32, d2_val[0] as u32]);
                         let exp = crate::mhc::hc_expand(&h2v, hc_mult);
                         let exp_s = exp.as_slice();
-                        let match_ct = vin_chk.iter().zip(exp_s.iter()).take(4)
-                            .filter(|(a, b)| (**a - **b).abs() < 1e-3).count();
-                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} k={} vin_raw={:?} exp_host={:?} match={}/4 r={}",
+                        let mut mm_ct = 0usize; let mut mm_first: i64 = -1;
+                        let mut mm_maxdiff: f32 = 0.0;
+                        for (i, (a, b)) in vin_full.iter().zip(exp_s.iter()).enumerate() {
+                            if a.to_bits() != b.to_bits() {
+                                mm_ct += 1; if mm_first < 0 { mm_first = i as i64; }
+                                let d = (*a - *b).abs(); if d > mm_maxdiff { mm_maxdiff = d; }
+                            }
+                        }
+                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} k={} vin_full: mm={}/{} first={} maxdiff={:.2e} r={}",
                             d1_val[0], d2_val[0], a[0],
                             if d1_val[0] as u32 == a[0] as u32 { "==" } else { "!=" },
-                            vin_chk, &exp_s[..4], match_ct, rc);
+                            mm_ct, nv, mm_first, mm_maxdiff, rc);
                     }
                     let k_host = if d1_val[0] as u32 == a[0] as u32 {
                         if d2_val[0] as u32 == a[1] as u32 { 3 } else { 2 }
