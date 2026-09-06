@@ -1648,7 +1648,7 @@ fn gemv_fp8_mma_parity_and_speed() {
     dev.enter();
     let mut rnd = 0xfeed_beef_cafe_f00du64;
     let mut r = || { rnd = rnd.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); ((rnd >> 33) as f32) / 2147483648.0 };
-    for &(in_f, out_f) in &[(4096usize, 512usize), (4096usize, 1536usize)] {
+    for &(in_f, out_f) in &[(128usize, 16usize), (4096usize, 512usize), (4096usize, 1536usize)] {
         // W: random e4m3 + 128-block scales (real quantizer: max/448)
         let wv: Vec<f32> = (0..out_f * in_f).map(|_| r() * 0.05).collect();
         let srows = out_f / 128;
@@ -1697,6 +1697,9 @@ fn gemv_fp8_mma_parity_and_speed() {
             maxd = maxd.max(d);
             rel = rel.max(d / golden[m].abs().max(1e-6));
         }
+        // ratio diagnosis: constant got/golden ratio → scale bug; random → layout bug
+        let ratios: Vec<f32> = (0..8).map(|m| got[m] / golden[m]).collect();
+        eprintln!("[w8a8-gemv {out_f}x{in_f}] parity maxd={maxd:.3e} rel={rel:.3e} got[0..8]={:?} gold[0..8]={:?} ratios={:?}", &got[..8.min(out_f)], &golden[..8.min(out_f)], ratios);
         eprintln!("[w8a8-gemv {out_f}x{in_f}] parity maxd={maxd:.3e} rel={rel:.3e}");
         assert!(rel < 1e-2, "W8A8 gemv parity {out_f}x{in_f}: rel {rel:.3e} (maxd {maxd:.3e}) — kernel quantization mismatch (in-kernel half-round vs test f32-round is ≤1ulp e4m3, not this large)");
 
