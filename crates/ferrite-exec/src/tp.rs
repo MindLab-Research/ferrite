@@ -1173,7 +1173,7 @@ impl<B: KernelBackend> TpCluster<B> {
         let embed_table = self.shards[0]
             .w("model.embed_tokens.weight")?
             .clone();
-        let (k, next_token) = {
+        let (k, next_token, a0f, a1f, a2f, d1f, d2f) = {
             let toks = Self::fan_out(&mut self.shards, |s| {
                 // Extract ALL device pointers from MtpState (scoped mutex)
                 // + raw dev/stream handles. Drop ALL borrows before calling
@@ -1424,20 +1424,20 @@ impl<B: KernelBackend> TpCluster<B> {
                         );
                     }
 
-                    // === Phase 4: D2H read (8 bytes for SSE/seq) ===
-                    // FERRITE_SSE=1 (default): read k + next_token every step
-                    // FERRITE_SSE=0: batch mode — read every N steps (TODO)
-                    let mut k_out = [0i32; 1];
-                    let mut nt_out = [0i32; 1];
-                    // next_token = a[k-1] (the k-th accepted verify token)
+                    // === Phase 4: return the D2H'd values (no re-read) ===
+                    // BUG FIX: Phase 5 previously re-read m.verify_argmax_dev
+                    // (a MtpState buffer the graph NEVER writes — the graph's
+                    // argmax goes to io.out_dev). That re-read returned garbage,
+                    // the seq push wrote a garbage a0, and `last` froze on
+                    // the same garbage token every step (embed(last) identical
+                    // across steps — the debug smoking gun). The correct values
+                    // are ALREADY D2H'd here: a (io.out_dev) + d1_val/d2_val.
                     let nt = match k_host { 3 => a[2] as i32, 2 => a[1] as i32, _ => a[0] as i32 };
-                    k_out[0] = k_host;
-                    nt_out[0] = nt;
-                    Ok((k_out[0], nt_out[0]))
+                    Ok((k_host, nt, a[0], a[1], a[2], d1_val[0], d2_val[0]))
                 }
             })
             .into_iter()
-            .collect::<Result<Vec<(i32, i32)>>>()?;
+            .collect::<Result<Vec<(i32, i32, f32, f32, f32, f32, f32)>>>()?;
             toks[0]
         };
 
@@ -1454,45 +1454,10 @@ impl<B: KernelBackend> TpCluster<B> {
         // NOTE: for full zero-H2D, the token push would be accumulated on
         // device and read in batch mode. For SSE mode, we read the verify
         // argmax (3 f32 = 12 bytes D2H, already done above as `a`).
-        let (a0, a1, a2) = {
-            // The verify argmax was read D2H inside the fan_out — but we need
-            // it here for the seq push. For now, re-read from the shard's
-            // MtpState (verify_argmax_dev). This is 12 bytes D2H (a0-a2).
-            // TODO: accumulate tokens on device, read in batch
-            let cuda = self.shards[0].backend.as_cuda().unwrap();
-            let m = cuda.mtp.lock().unwrap();
-            let m = m.as_ref().unwrap();
-            let mut a = [0f32; 3];
-            let r = ferrite_kernel::cuda::memcpy_d2h_sync(
-                m.verify_argmax_dev.as_f32() as *mut std::ffi::c_void,
-                a.as_mut_ptr(),
-                3,
-                cuda.stream_handle(),
-            );
-            if r != 0 {
-                return Err(FerriteError::InvalidArg(format!("verify argmax re-read D2H: {r}")));
-            }
-            (a[0] as u32, a[1] as u32, a[2] as u32)
-        };
-        // Also need d1, d2 for the k=2/k=3 cases
-        let (d1_u32, d2_u32) = {
-            let cuda = self.shards[0].backend.as_cuda().unwrap();
-            let m = cuda.mtp.lock().unwrap();
-            let m = m.as_ref().unwrap();
-            let mut d = [0f32; 2];
-            let r1 = ferrite_kernel::cuda::memcpy_d2h_sync(
-                m.d1_argmax_dev.as_f32() as *mut std::ffi::c_void,
-                &mut d[0] as *mut f32, 1, cuda.stream_handle(),
-            );
-            let r2 = ferrite_kernel::cuda::memcpy_d2h_sync(
-                m.d2_argmax_dev.as_f32() as *mut std::ffi::c_void,
-                &mut d[1] as *mut f32, 1, cuda.stream_handle(),
-            );
-            if r1 != 0 || r2 != 0 {
-                return Err(FerriteError::InvalidArg(format!("d1/d2 re-read D2H: {r1}/{r2}")));
-            }
-            (d[0] as u32, d[1] as u32)
-        };
+        // a0/a1/a2 (verify graph argmax — io.out_dev D2H'd inside the
+        // fan_out) + d1/d2 (draft argmax) came back with the fan_out result.
+        let (a0, a1, a2) = (a0f as u32, a1f as u32, a2f as u32);
+        let (d1_u32, d2_u32) = (d1f as u32, d2f as u32);
         match k {
             3 => {
                 for s in &mut self.shards {
