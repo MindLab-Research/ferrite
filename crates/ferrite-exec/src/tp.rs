@@ -1228,7 +1228,15 @@ impl<B: KernelBackend> TpCluster<B> {
                         let mut hp = [0f32; 4];
                         let rh = ferrite_kernel::cuda::memcpy_d2h_sync(
                             hprev_ptr as *mut std::ffi::c_void, hp.as_mut_ptr(), 4, cuda.stream_handle());
-                        eprintln!("[zh2d-hp] hprev[0..4]={:?} r={}", hp, rh);
+                        // commit validation: hprev SHOULD equal hf_v[0] (k=1 →
+                        // row 0 of last step's verify h_final export). D2H both.
+                        let m2 = cuda.mtp.lock().unwrap();
+                        let m2 = m2.as_ref().unwrap();
+                        let mut hfv = [0f32; 4];
+                        let rh2 = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv.as_mut_ptr(), 4, cuda.stream_handle());
+                        let h_match = hp.iter().zip(hfv.iter()).all(|(a, b)| a == b);
+                        eprintln!("[zh2d-hp] hprev[0..4]={:?} hf_v[0..4]={:?} match={} r={}/{}", hp, hfv, h_match, rh, rh2);
                     }
                     cuda.embed_one_dev(&embed_table, tokens_ptr, emb1_ptr, hidden, 1)?;
                     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
