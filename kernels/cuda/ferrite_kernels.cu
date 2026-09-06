@@ -3840,7 +3840,11 @@ extern "C" cudaError_t ferrite_gemv_fp8_mma(
         if (co_res <= 0) co_res = 128;
     }
     dim3 grid((unsigned)(out_f / 16));
+    // participants = min(grid, co_res): small matrices have fewer blocks than
+    // the co-residency cap — the spin barriers wait for ALL participants, so
+    // co_res > grid would deadlock (16x128: grid=1 spin-waits for 1184 votes).
+    int participants = co_res < (int)grid.x ? co_res : (int)grid.x;
     gemv_fp8_mma_v3_kernel<<<grid, 256, 0, s>>>(
-        x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols, co_res);
+        x, (const unsigned char*)w, w_scale, out, scratch, in_f, out_f, scols, participants);
     return cudaGetLastError();
 }
