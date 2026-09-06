@@ -794,9 +794,13 @@ impl<B: KernelBackend> TpCluster<B> {
                 if need_capture {
                     // CAPTURE (first draft step): record the whole chain.
                     // capture_lock serializes the 4 ranks' record-mode NCCL
-                    // enqueues (the mega-graph pattern); the post-pass DSA
-                    // family rollback undoes the record pass's +2 host
-                    // bookkeeping so t_count matches the real cache.
+                    // enqueues (the mega-graph pattern). The record pass
+                    // host-advances the DSA family +2 (one per forward) —
+                    // the POST-pass rollback undoes it so t_count matches
+                    // the real cache (NO pre-pass rollback: there is no
+                    // dry-run drift here; rolling back first would shift the
+                    // family cache by -2 and corrupt d1/d2 quality — the
+                    // observed accept 2.37→1.99 regression).
                     let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
                     {
                         let cuda = s
@@ -804,7 +808,6 @@ impl<B: KernelBackend> TpCluster<B> {
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
                         cuda.enter();
-                        cuda.dsa_host_rollback(seq, mtp_family, 2);
                         unsafe { *last_pin = last as f32; }
                         cuda.graph_capture_begin();
                         cuda.embed_gather_dev(table, last_pin, emb_last.as_f32(), hidden)?;
