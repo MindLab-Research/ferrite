@@ -866,12 +866,31 @@ impl<B: KernelBackend> TpCluster<B> {
                         mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
                         h_cur = Some(hout);
                     }
+                    // FIX (accept=1.0 root): persist the catch-up h chain's
+                    // LAST value into MtpState.hprev. Without this, the first
+                    // mtp_step's draft reads UNINITIALIZED pool memory as
+                    // h_prev (zeros in the zero-H2D path / stale garbage in
+                    // the original path) → x2's hnorm segment wrong → d1's
+                    // sibling d2 garbage → d2's KV (slot 15 + decoder slot 17)
+                    // pollutes every later step's draft attention → argmax
+                    // flips → accept collapse. h_prev semantics: the draft's
+                    // previous-token hidden = the LAST catch-up hout.
+                    if let Some(h_last) = h_cur.as_ref() {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        let m = cuda.mtp.lock().unwrap();
+                        if let Some(m) = m.as_ref() {
+                            cuda.copy_dev(h_last, 0, m.hprev.as_f32(), hidden)?;
+                        }
+                    }
                     Ok::<(), FerriteError>(())
                 })
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
                 eprintln!(
-                    "[mega] MTP: draft cache catch-up done ({} prompt tokens)",
+                    "[mega] MTP: draft cache catch-up done ({} prompt tokens, h_prev seeded)",
                     prompt_tokens.len()
                 );
                 // MTP verify graph (n=2: [t_last, d1]): GDN state → scratch B
