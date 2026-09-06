@@ -916,6 +916,13 @@ impl<B: KernelBackend> TpCluster<B> {
         if mtp {
             // MTP steady step: draft (mtp_forward) + verify (mega_v n=2) +
             // greedy accept + ping-pong commit.
+            // Zero-H2D device-resident MTP (FERRITE_ZERO_H2D=1): the entire
+            // draft→verify→accept→commit chain runs on device — tokens never
+            // cross to host for computation. Only D2H: 8-12B per step for SSE
+            // (k + next_token + verify argmax). Default OFF until verified.
+            if std::env::var_os("FERRITE_ZERO_H2D").is_some() {
+                return self.mtp_step_zero_h2d(seq, &plans, num_dsa);
+            }
             return self.mtp_step(seq, &plans, num_dsa);
         }
         // Steady state: advance DSA pinned t0/total (the graph's kernels
