@@ -252,6 +252,11 @@ fn dequant_block(w: &[f32], s: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// the fp8 bypass (eligible ⇒ placeholder + Fp8Weight) or bf16-recovered
 /// (dequant_block → f32, which the preload bf16-encodes).
 pub fn is_fp8_eligible(src: &str, layer_idx: Option<usize>, cfg: &Glm53FlashConfig) -> bool {
+    // global kill switch: full-bf16 A/B baseline (no placeholders at all —
+    // a placeholder without registration fails loudly in matmul_dev)
+    if std::env::var_os("FERRITE_NO_FP8").is_some() {
+        return false;
+    }
     // non-layer globals: never fp8
     if src == "lm_head.weight" || src == "model.embed_tokens.weight" { return false; }
     if src.ends_with("_layernorm.weight") || src.ends_with(".norm.weight")
