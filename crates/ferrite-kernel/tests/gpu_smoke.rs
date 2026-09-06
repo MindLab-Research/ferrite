@@ -1664,8 +1664,14 @@ fn gemv_fp8_mma_parity_and_speed() {
         let wbytes: Vec<u8> = (0..out_f * in_f)
             .map(|i| fp8_encode((wv[i] / scale[(i / in_f) / 128 * scols + (i % in_f) / 128]).clamp(-448.0, 448.0)))
             .collect();
-        // x: f32 (the kernel quantizes in-kernel — golden must replicate)
-        let x: Vec<f32> = (0..in_f).map(|_| r() * 2.0 - 1.0).collect();
+        // x: f32 (the kernel quantizes in-kernel — golden must replicate).
+        // e4m3-gridpoint construction: x[k] = e4m3_val * 2^e (exact in f32 —
+        // x*inv returns the e4m3 value bit-exactly) — quantization is lossless,
+        // isolating the mma/scale path from xq round differences.
+        let x: Vec<f32> = (0..in_f).map(|k| {
+            let b = ((k % 13) * 17 + 3) as u8 & 0x7e; // varied legal e4m3 bytes
+            e4m3_decode(b) * 0.03125f32 // exact power-of-two scale in f32
+        }).collect();
         // register fp8 (golden Tensor + bytes + scale) → matmul_dev n=1 → W8A8
         let w_t = Tensor::from_f32(Shape::new([out_f, in_f]), vec![0f32; out_f * in_f]);
         dev.register_fp8(&w_t, out_f, in_f, &wbytes, &scale).expect("register");
@@ -1677,10 +1683,13 @@ fn gemv_fp8_mma_parity_and_speed() {
         y.download(&mut got).unwrap();
 
         // CPU golden: x_scale = absmax/448 (kernel's per-token quant); x_q =
-        // e4m3(x/x_scale); y[m] = Σ_k e4m3(W)·w_s[m/128][k/128]·e4m3(x_q)·x_scale
+        // e4m3(x/x_s); y[m] = Σ_k e4m3(W)·w_s[m/128][k/128]·e4m3(x_q)·x_scale
+        // (mul-by-reciprocal — the kernel computes x*(1/scale) in f32; the
+        // division's 1-ulp difference flips e4m3 gridpoints on some lanes)
         let x_amax = x.iter().fold(0f32, |a, v| a.max(v.abs()));
         let x_scale = x_amax / 448.0;
-        let xq: Vec<u8> = x.iter().map(|&v| fp8_encode((v / x_scale).clamp(-448.0, 448.0))).collect();
+        let x_inv = 1.0f32 / x_scale;
+        let xq: Vec<u8> = x.iter().map(|&v| fp8_encode((v * x_inv).clamp(-448.0, 448.0))).collect();
         let mut golden = vec![0f32; out_f];
         for m in 0..out_f {
             let ws_row = (m / 128) * scols;
