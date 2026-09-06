@@ -3643,37 +3643,31 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     return cudaGetLastError();
 }
 
-// ==== fp8 mma layout probe (W8A8 feasibility): m16n8k16 e4m3 =====
-// A[16,16] fp8 row-major, B[16,8] fp8 col-major(k,n), C[16,8] f32.
-// Encodes A[i][k] = fp8((i*16+k)/448.0) and B[k][n]=fp8(1/448) so C[i][n] =
-// Σ_k (i*16+k)/448 * 1/448 — reading C recovers which (row,k) each thread's
-// fragment covered, pinning the PTX fragment layout for sm_103a.
+// ==== fp8 mma layout probe (W8A8 feasibility): m16n8k32 e4m3 (sm_90+) =====
+// A[16,32] fp8 row-major, B[32,8] fp8 col-major(k,n), C[16,8] f32.
+// Encodes A[i][k]=fp8((i*32+k)/448), B[k][n]=fp8((k*8+n+1)/448) so C[i][n]=
+// Σ_k (i*32+k)/448*(k*8+n+1)/448 — reading C pins the PTX fragment layout.
 __global__ void fp8_mma_probe_kernel(const unsigned char* __restrict__ A,
                                      const unsigned char* __restrict__ B,
                                      float* __restrict__ C) {
     const int t = threadIdx.x & 31;
-    // PTX m16n8k16 e4m3 fragments (row-major A, col-major B):
-    // A: 4 .b32/thread = 16 fp8; B: 2 .b32/thread = 8 fp8; C: 4 f32/thread.
-    // Load A:                 row              k-pos
-    //   a0: r=t/4,       k=(t%4)*4
-    //   a1: r=t/4,       k=(t%4)*4+8
-    //   a2: r=t/4+8,     k=(t%4)*4
-    //   a3: r=t/4+8,     k=(t%4)*4+8
     const int r0 = t >> 2, c0 = (t & 3) * 4;
-    unsigned a0 = *(const unsigned*)(A + r0 * 16 + c0);
-    unsigned a1 = *(const unsigned*)(A + r0 * 16 + c0 + 8);
-    unsigned a2 = *(const unsigned*)(A + (r0 + 8) * 16 + c0);
-    unsigned a3 = *(const unsigned*)(A + (r0 + 8) * 16 + c0 + 8);
-    // Load B: col-major [k, n]: k=(t%4)*4, n=? B fragment k16n8: 2 .b32
-    unsigned b0 = *(const unsigned*)(B + c0 * 8 + (t >> 2));  // k, n=t/4
-    unsigned b1 = *(const unsigned*)(B + (c0 + 8) * 8 + (t >> 2));
+    // m16n8k32 e4m3 fragments: A = 8 .b32/thread (32 fp8), B = 4 .b32/thread
+    // (16 fp8), C = 4 f32/thread. A: row r0/r0+8, k = c0 + {0,8,16,24}.
+    unsigned a[8];
+    for (int g = 0; g < 4; g++) a[g] = *(const unsigned*)(A + r0 * 32 + c0 + g * 8);
+    for (int g = 0; g < 4; g++) a[g + 4] = *(const unsigned*)(A + (r0 + 8) * 32 + c0 + g * 8);
+    // B (col-major [k,n]): k = c0 + {0,8,16,24}, n = t/4.
+    unsigned b[4];
+    for (int g = 0; g < 4; g++) b[g] = *(const unsigned*)(B + (c0 + g * 8) * 8 + (t >> 2));
     float c0f = 0.f, c1f = 0.f, c2f = 0.f, c3f = 0.f;
     asm volatile(
-        "mma.sync.aligned.m16n8k16.row.col.f32.e4m3.e4m3.f32 "
-        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7,%8,%9,%10,%11}, {%12,%13,%14,%15}, {%0,%1,%2,%3};\n"
         : "+f"(c0f), "+f"(c1f), "+f"(c2f), "+f"(c3f)
-        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-    // C fragment: c_x/dx = (col + 4*(t%4), row + 8*(t/4))
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(a[4]), "r"(a[5]), "r"(a[6]), "r"(a[7]),
+          "r"(b[0]), "r"(b[1]), "r"(b[2]), "r"(b[3]));
     const int cr = (t >> 2), cc = (t & 3);
     C[(cr) * 8 + cc] = c0f;
     C[(cr) * 8 + cc + 4] = c1f;

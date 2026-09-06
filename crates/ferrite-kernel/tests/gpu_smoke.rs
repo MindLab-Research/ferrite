@@ -1596,11 +1596,11 @@ fn fp8_encode(x: f32) -> u8 {
 fn fp8_mma_layout_probe() {
     let dev = CudaBackend::with_device(&so_path(), 0).expect("open cuda");
     dev.enter();
-    // A [16,16] e4m3 bytes (row-major), B [16,8] e4m3 bytes (k-major / n=8)
-    let mut A = vec![0u8; 16 * 16];
-    let mut B = vec![0u8; 16 * 8];
-    for i in 0..16 { for k in 0..16 { A[i * 16 + k] = fp8_encode((i * 16 + k) as f32 / 448.0); } }
-    for k in 0..16 { for n in 0..8 { B[k * 8 + n] = fp8_encode((k * 8 + n + 1) as f32 / 448.0); } }
+    // A [16,32] e4m3 bytes (row-major), B [32,8] e4m3 bytes (k-major / n=8)
+    let mut A = vec![0u8; 16 * 32];
+    let mut B = vec![0u8; 32 * 8];
+    for i in 0..16 { for k in 0..32 { A[i * 32 + k] = fp8_encode((i * 32 + k) as f32 / 448.0); } }
+    for k in 0..32 { for n in 0..8 { B[k * 8 + n] = fp8_encode((k * 8 + n + 1) as f32 / 448.0); } }
     let mut C = vec![0f32; 16 * 8];
     // Pack the u8 byte arrays into f32 words (4 bytes LE per f32) so they ride
     // through DevBuf; the probe kernel reads them as raw bytes back.
@@ -1611,9 +1611,9 @@ fn fp8_mma_layout_probe() {
             f32::from_bits(b0 | b1 | b2 | b3)
         }).collect()
     };
-    let ab = DevBuf::alloc(dev.dev(), dev.stream(), (16 * 16 + 3) / 4).unwrap();
+    let ab = DevBuf::alloc(dev.dev(), dev.stream(), (16 * 32 + 3) / 4).unwrap();
     ab.upload(&pack(&A)).unwrap();
-    let bb = DevBuf::alloc(dev.dev(), dev.stream(), (16 * 8 + 3) / 4).unwrap();
+    let bb = DevBuf::alloc(dev.dev(), dev.stream(), (32 * 8 + 3) / 4).unwrap();
     bb.upload(&pack(&B)).unwrap();
     let mut cb = DevBuf::alloc(dev.dev(), dev.stream(), 16 * 8).unwrap();
     dev.fp8_mma_probe_dev(&ab, &bb, &mut cb).expect("fp8 mma probe");
@@ -1623,7 +1623,7 @@ fn fp8_mma_layout_probe() {
     let mut gold = vec![0f32; 16 * 8];
     for i in 0..16 { for n in 0..8 {
         let mut acc = 0f64;
-        for k in 0..16 { acc += (e4m3_decode(A[i * 16 + k]) as f64) * (e4m3_decode(B[k * 8 + n]) as f64); }
+        for k in 0..32 { acc += (e4m3_decode(A[i * 32 + k]) as f64) * (e4m3_decode(B[k * 8 + n]) as f64); }
         gold[i * 8 + n] = acc as f32;
     }}
     let mut maxd = 0f32; let mut worst = (0usize, 0usize);
