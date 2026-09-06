@@ -3334,12 +3334,12 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             const float* xk = xr + k;
             #pragma unroll
             for (int e = 0; e < 16; e++) {
-                acc += (__half2float(__nv_cvt_fp8_to_halfraw(w8[e], __NV_E4M3)) * sc) * xk[e];
+                acc += (__half2float(__nv_cvt_fp8_to_halfraw(w8[e].x, __NV_E4M3)) * sc) * xk[e];
             }
         }
         for (; k < in_f; k++) {
             float sc = srow[k >> 7];
-            acc += (__half2float(__nv_cvt_fp8_to_halfraw((const __nv_fp8_e4m3&)wr[k], __NV_E4M3)) * sc) * xr[k];
+            acc += (__half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc) * xr[k];
         }
     }
     #pragma unroll
