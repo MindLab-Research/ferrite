@@ -322,15 +322,18 @@ pub fn load_direct(dir: &Path, cfg: &crate::config::Glm53FlashConfig) -> Result<
         // device-side H2D writes each segment at its row offset; bytes
         // are bf16 in the checkpoint and resident (no conversion).
         if let Some(base) = src.strip_suffix("__FUSED_QKV__") {
-            let base = base.strip_prefix("model.").unwrap_or(base);
+            // base is already the full checkpoint prefix (e.g.
+            // "model.language_model.layers.0.self_attn.") — do NOT strip
+            // "model." or re-prepend {lm}. (the legacy loader at
+            // checkpoint.rs:464 searches "{base}q_proj.weight" directly).
             let mut segs = Vec::with_capacity(3);
             let mut rows = 0usize;
             let mut cols = 0usize;
             for part in ["q_proj", "k_proj", "v_proj"] {
                 let e = direct
-                    .entry(&format!("{lm}.{base}{part}.weight"))
+                    .entry(&format!("{base}{part}.weight"))
                     .ok_or_else(|| {
-                        FerriteError::Config(format!("direct: fused qkv missing {base}{part}"))
+                        FerriteError::Config(format!("direct: fused qkv missing {base}{part}.weight"))
                     })?;
                 if e.dtype != RawDType2::Bf16 {
                     return Err(FerriteError::Config(format!(
@@ -349,15 +352,17 @@ pub fn load_direct(dir: &Path, cfg: &crate::config::Glm53FlashConfig) -> Result<
         // fused conv (GDN short conv): [c,1,k] squeezed — same byte
         // layout as [c,k]; q/k/v segments concatenated.
         if let Some(base) = src.strip_suffix("__FUSED_CONV__") {
-            let base = base.strip_prefix("model.").unwrap_or(base);
+            // base is already the full checkpoint prefix (e.g.
+            // "model.language_model.layers.0.self_attn.") — same fix as
+            // FUSED_QKV: no strip, no {lm}. prefix.
             let mut segs = Vec::with_capacity(3);
             let mut rows = 0usize;
             let mut cols = 0usize;
             for part in ["q", "k", "v"] {
                 let e = direct
-                    .entry(&format!("{lm}.{base}{part}_conv1d.weight"))
+                    .entry(&format!("{base}{part}_conv1d.weight"))
                     .ok_or_else(|| {
-                        FerriteError::Config(format!("direct: fused conv missing {base}{part}_conv1d"))
+                        FerriteError::Config(format!("direct: fused conv missing {base}{part}_conv1d.weight"))
                     })?;
                 let (c, k) = (e.shape[0], *e.shape.get(2).unwrap_or(&1));
                 segs.push(e.seg);
