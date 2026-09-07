@@ -1216,6 +1216,20 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
         }
     }
     __syncthreads();
+    // FAST PATH (select_k >= jmax): ALL causally-valid pools are selected —
+    // the O(k×t) serial argmax loop (select_k iterations × full t scan + sync,
+    // ~65µs at k=t=129 × 11 DSA layers = 0.7ms/step) reduces to a direct
+    // enumeration O(t). The downstream (sparse_attn_v2) computes scores from
+    // qi·ki — idx order is irrelevant (weighted sum, commutative).
+    if (select_k >= jmax) {
+        for (int r = threadIdx.x; r < select_k; r += blockDim.x) {
+            idx[(size_t)row * topk_max + r] = (r < jmax) ? (float)r : -1.0f;
+        }
+        for (int r = select_k + threadIdx.x; r < topk_max; r += blockDim.x) {
+            idx[(size_t)row * topk_max + r] = -1.0f;
+        }
+        return;
+    }
     // selection topk (warp-shuffle reduce, blockDim-agnostic): scoring was
     // 32 threads (96 total on the verify chain — 96/4736 cores busy, 144us/
     // inst O(len)); 256 threads = 8x lanes. Strict > keeps the LOWEST lane /
