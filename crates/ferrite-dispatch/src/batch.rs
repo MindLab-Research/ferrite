@@ -562,7 +562,7 @@ impl<S: PhysStateStore> BatchScheduler<S> {
                 work.bucket.seqs.len()
             )));
         }
-        let mut retired: Vec<u32> = Vec::new();
+        let mut retired: Vec<crate::arena::SeqId> = Vec::new();
         for (i, accept) in readback.accepts.iter().enumerate() {
             let seq = work.bucket.seqs[i];
             let row = work.bucket.rows[i];
@@ -573,10 +573,20 @@ impl<S: PhysStateStore> BatchScheduler<S> {
             digest.accept_count += 1;
             if done {
                 digest.rows_retired += 1;
-                retired.push(row);
+                retired.push(seq);
             }
         }
-        for row in retired {
+        for seq in retired {
+            // Resolve the row AT RETIRE TIME, not from the bucket layout:
+            // each compact_after_retire moves the highest live row into the
+            // freed hole (and updates that seq's `row`), so the bucket's
+            // row indices go stale the moment the first retire runs.
+            // Retiring a stale index hit "retire: row N unowned" whenever
+            // 2+ rows finished in one tick (concurrent completion — the
+            // compaction cascade vacated later indices).
+            let Some(row) = self.seqs.get(seq).and_then(|s| s.row) else {
+                continue; // already terminal (defensive: double-finish edge)
+            };
             self.compact_after_retire(row)?;
         }
         Ok(digest)

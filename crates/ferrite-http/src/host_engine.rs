@@ -381,3 +381,53 @@ impl ferrite_dispatch::exec::StateStoreCap for HostBackendCap {
         ))
     }
 }
+
+/// The deterministic mock engine IS a ServeEngine: the driver runs it the
+/// same way it runs the CUDA engine (ferrite-serve's GpuEngine) — one
+/// trait, two backends.
+impl crate::engine::ServeEngine for HostEngine {
+    fn submit(
+        &mut self,
+        prompt_ids: Vec<u32>,
+        max_new_tokens: usize,
+        eos: u32,
+    ) -> Result<SeqId> {
+        HostEngine::submit(self, prompt_ids, max_new_tokens, eos)
+    }
+
+    fn tick(&mut self, plan: &mut TickPlan) -> Result<()> {
+        HostEngine::tick(self, plan)
+    }
+
+    fn output(&self, seq: SeqId) -> Result<Vec<u32>> {
+        HostEngine::output(self, seq)
+    }
+
+    fn cancel(&mut self, seq: SeqId) -> Result<bool> {
+        HostEngine::cancel(self, seq)
+    }
+
+    fn deregister(&mut self, seq: SeqId) {
+        self.exec.deregister(seq);
+    }
+
+    fn status(&self, seq: SeqId) -> Option<&'static str> {
+        self.sched.status(seq).ok()
+    }
+
+    fn live_rows(&self) -> usize {
+        self.sched.live_rows() as usize
+    }
+
+    fn queued(&self) -> usize {
+        self.sched.queued()
+    }
+
+    fn cache_stats(&self) -> ferrite_dispatch::batch::CacheStats {
+        self.sched.cache_stats()
+    }
+
+    fn stop_id(&self) -> u32 {
+        STOP_ID
+    }
+}

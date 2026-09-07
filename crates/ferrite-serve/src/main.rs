@@ -13,6 +13,11 @@ use std::path::PathBuf;
 
 use ferrite_model::{load_hf_checkpoint, Glm53FlashConfig};
 
+/// The CUDA GpuEngine (per-seq TpCluster decode behind the ServeEngine
+/// seam) — the --serve mode's engine.
+#[cfg(feature = "cuda")]
+mod gpu_engine;
+
 /// GLM chat format: <|prompt|>\n...<|im_end|>\n<|answer|>\n
 /// (token ids resolved from the tokenizer; falls back to raw text).
 fn wrap_prompt(text: &str) -> String {
@@ -21,6 +26,8 @@ fn wrap_prompt(text: &str) -> String {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let serve = args.iter().any(|a| a == "--serve");
+    args.retain(|a| a != "--serve");
     let mut get_arg = |name: &str, default: &str| -> String {
         if let Some(p) = args.iter().position(|a| a == name) {
             if p + 1 < args.len() {
@@ -37,6 +44,10 @@ fn main() {
     let tp: usize = get_arg("--tp", "8").parse().unwrap_or(8);
     let lib = get_arg("--lib", "kernels/cuda/libferrite_kernels.so");
     let prompt = get_arg("--prompt", "你好，介绍一下你自己。");
+    // --serve mode flags (the OpenAI HTTP/SSE API — see run_serve).
+    let port: u16 = get_arg("--port", "8080").parse().unwrap_or(8080);
+    let max_seqs: usize = get_arg("--max-seqs", "4").parse().unwrap_or(4);
+    let model_name = get_arg("--model-name", "glm-5.3-flash");
 
     // ---- built-in CPU profiler (Go-pprof style): FERRITE_PPROF=1 starts a
     // 1000 Hz SIGPROF sampler; on exit the flamegraph lands in
@@ -77,6 +88,32 @@ fn main() {
         rep.skipped_unsupported.len(),
     );
     println!("[serve] mem RSS after load: {:.1} GB", rss_gb());
+
+    // ---- serve mode (--serve): the OpenAI-compatible HTTP/SSE API ----
+    // (SSE streaming + concurrent requests over the CUDA cluster; see
+    // run_serve. Runs until ctrl-c — never returns.)
+    if serve {
+        if backend != "cuda" {
+            panic!("--serve requires --backend cuda (the mock HTTP serve is the ferrite-http binary)");
+        }
+        #[cfg(feature = "cuda")]
+        run_serve(
+            cfg,
+            weights,
+            weights8,
+            &lib,
+            tp,
+            &model_dir,
+            port,
+            max_seqs,
+            model_name,
+        );
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (weights, weights8, lib, tp, model_dir, port, max_seqs, model_name);
+            panic!("ferrite-serve was built without the cuda feature");
+        }
+    }
 
     // ---- tokenizer ----
     let tok_path = model_dir.join("tokenizer.json");
@@ -366,6 +403,140 @@ fn run_cuda(
     _lib: &str,
 ) -> Vec<u32> {
     panic!("ferrite-serve was built without the cuda feature (rebuild with --features ferrite-serve? no — build ferrite-kernel --features cuda first)");
+}
+
+/// --serve mode: the OpenAI-compatible HTTP/SSE API over the CUDA cluster.
+/// Same bring-up as run_cuda (cluster + fp8 bypass + concurrent resident
+/// preload), then the GpuEngine (per-seq prefill + round-robin mega-graph
+/// decode behind the ferrite-http driver) + the axum router:
+/// POST /v1/chat/completions (stream=true → SSE chat.completion.chunk +
+/// [DONE]; false → one JSON), /v1/models, /health, /v1/stats. Concurrency:
+/// --max-seqs live requests interleaved (each ~1/N of the single-stream
+/// rate; true batched decode is the next phase — the scheduler's
+/// ExecBackend seam). Runs until ctrl-c, then process::exit(0) (no
+/// exit-time cluster drop — same reason as the one-shot path: the 1.17TB
+/// teardown segfaults).
+#[cfg(feature = "cuda")]
+fn run_serve(
+    cfg: Glm53FlashConfig,
+    weights: ferrite_model::Weights,
+    weights8: ferrite_model::Weights8,
+    lib: &str,
+    tp: usize,
+    model_dir: &std::path::Path,
+    port: u16,
+    max_seqs: usize,
+    model_name: String,
+) -> ! {
+    use ferrite_exec::tp::TpCluster;
+    use ferrite_http::api::{router, AppState};
+    use ferrite_http::driver::EngineDriver;
+    use ferrite_http::tokenizer::ChatTokenizer;
+    use ferrite_kernel::CudaBackend;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    let world = tp.max(1);
+    let mut cluster = TpCluster::new(cfg, &weights, world, |rank| {
+        CudaBackend::with_device(lib, rank as i32)
+            .unwrap_or_else(|e| panic!("cuda backend rank {rank}: {e}"))
+    });
+    println!("[serve] cuda TP cluster up: {world} rank(s)");
+    cluster.set_fp8(&weights8);
+    println!(
+        "[serve] fp8 bypass: {} full / {} rank-0 shards",
+        weights8.len(),
+        cluster.shards[0].weights8.len()
+    );
+
+    // Resident preload (concurrent per rank — same as run_cuda).
+    {
+        let t0 = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (rank, shard) in cluster.shards.iter().enumerate() {
+                handles.push(scope.spawn(move || {
+                    let mut n_2d = 0usize;
+                    let mut n_1d = 0usize;
+                    let mut n_fp8 = 0usize;
+                    for (name, t) in shard.weights.iter() {
+                        let moe_bf16 =
+                            name.contains(".experts.") || name.contains(".shared_expert.");
+                        if !moe_bf16 && shard.backend.fp8_hit(t) {
+                            n_fp8 += 1;
+                            continue;
+                        }
+                        shard
+                            .backend
+                            .preload_weight(t)
+                            .unwrap_or_else(|e| panic!("preload rank {rank} weight {name}: {e}"));
+                        if t.shape.0.len() >= 2 {
+                            n_2d += 1;
+                        } else {
+                            n_1d += 1;
+                        }
+                    }
+                    println!(
+                        "[serve] rank {rank}: {n_2d} x2d (bf16-resident) + {n_1d} x1d (f32) + {n_fp8} fp8-resident weights on device"
+                    );
+                }));
+            }
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+        println!(
+            "[serve] weights resident in {:.1}s (parallel across ranks)",
+            t0.elapsed().as_secs_f32()
+        );
+    }
+
+    // Tokenizer (chat template CLI-parity + the stop set) — the HTTP
+    // layer renders/encodes; the engine retires on the same stops.
+    let tok = ChatTokenizer::from_file(&model_dir.join("tokenizer.json"))
+        .unwrap_or_else(|e| panic!("load tokenizer: {e}"));
+    let stops = tok.stop_ids().to_vec();
+
+    // The GPU engine + the driver (one engine thread owning the cluster;
+    // HTTP on tokio — submit/cancel over mpsc, events back per request).
+    // tick_interval ZERO: the decode step is GPU-bound (~20ms/seq/step
+    // round-robin) — no pacing needed.
+    let engine = crate::gpu_engine::GpuEngine::new(cluster, stops, max_seqs);
+    let handle = EngineDriver::spawn_with(engine, std::time::Duration::ZERO);
+
+    let state = AppState {
+        handle,
+        tok: Arc::new(tok),
+        model_name: model_name.clone(),
+        req_counter: Arc::new(AtomicU64::new(1)),
+    };
+    let app = router(state);
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
+        .parse()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .unwrap_or_else(|e| panic!("bind {addr}: {e}"));
+        println!(
+            "[serve] serving {model_name} on http://{addr}/v1/chat/completions (SSE + concurrent, max_seqs={max_seqs})"
+        );
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = tokio::signal::ctrl_c().await;
+                eprintln!("[serve] ctrl-c: shutting down");
+            })
+            .await
+            .expect("serve");
+    });
+    // NO exit-time teardown: dropping the cluster (1.17TB weights + CUDA
+    // contexts) segfaults (EXIT 139 — the one-shot path's known issue);
+    // the driver thread + its engine leak with the process instead.
+    std::process::exit(0);
 }
 
 fn rss_gb() -> f64 {

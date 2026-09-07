@@ -452,7 +452,10 @@ dependencies = [
 name = "ferrite-serve"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "ferrite-dispatch",
  "ferrite-exec",
+ "ferrite-http",
  "ferrite-kernel",
  "ferrite-model",
  "ferrite-types",
@@ -461,6 +464,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "tokenizers",
+ "tokio",
 ]
 
 [[package]]

@@ -23,44 +23,36 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-/// Render messages through the GLM chat format.
+/// Render messages through the GLM chat format — BYTE-PARITY with
+/// ferrite-serve's CLI `wrap_prompt` (`<|user|>\n{text}</s>\n<|assistant|>\n`,
+/// the validated frame): the same tokens radix-match the same prefix, and
+/// the model sees the identical prompt the CLI path was tuned on.
 ///
-/// System + user turns stack inside `<|prompt|>…</s>`; the assistant
-/// turn opens `<|answer|>` and generation continues from there. This
-/// mirrors `ferrite-serve`'s `wrap_prompt` exactly (single-turn there,
-/// multi-turn here — same frame, stacked turns).
+/// Multi-turn: user/system turns open `<|user|>`, assistant turns open
+/// `<|assistant|>`; every turn closes `</s>`; the generation point is the
+/// trailing `<|assistant|>\n`. System turns fold into the leading user
+/// frame (this model has no separate system slot).
 pub fn render_chat_template(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
-    let mut last_role = "user";
+    let mut last_was_user = false;
     for msg in messages {
-        let role = if msg.role == "assistant" { "assistant" } else { "user" };
-        if role == "assistant" {
-            // an in-context assistant turn: previous turn's answer text
+        let is_asst = msg.role == "assistant";
+        if is_asst {
+            prompt.push_str("<|assistant|>\n");
             prompt.push_str(&msg.content);
-            prompt.push_str("\n<s>\n\n");
-            prompt.push_str("<|prompt|>\n");
+            prompt.push_str("</s>\n");
+            last_was_user = false;
         } else {
-            if last_role == "assistant" || !prompt.is_empty() {
-                // consecutive non-assistant turns stack with the frame
-                prompt.push_str(&msg.content);
-                prompt.push('\n');
-            } else {
-                prompt.push_str("<|prompt|>\n");
-                prompt.push_str(&msg.content);
-                prompt.push('\n');
-            }
+            prompt.push_str("<|user|>\n");
+            prompt.push_str(&msg.content);
+            prompt.push_str("</s>\n");
+            let _ = last_was_user;
+            last_was_user = true;
         }
-        last_role = role;
     }
-    // close: only if the last turn wasn't an assistant continuation
-    if !prompt.starts_with("<|prompt|>") {
-        prompt.insert_str(0, "<|prompt|>\n");
-    }
-    if !prompt.trim_end().ends_with("\n") {
-        prompt.push('\n');
-    }
-    prompt.push_str("</s>\n\n");
-    format!("{prompt}")
+    // generation opens at the final assistant frame
+    prompt.push_str("<|assistant|>\n");
+    prompt
 }
 
 /// GLM-5.3-Flash tokenizer wrapper: encode prompts, decode deltas,
@@ -74,7 +66,7 @@ pub fn render_chat_template(messages: &[ChatMessage]) -> String {
 ///   with zero model files (the full HTTP → scheduler → SSE path runs
 ///   on a laptop; the GPU backend swaps in behind the same API).
 pub enum ChatTokenizer {
-    Real(Tokenizer),
+    Real(Tokenizer, Vec<u32>),
     Byte,
 }
 
@@ -82,15 +74,21 @@ impl ChatTokenizer {
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
         let tok = Tokenizer::from_file(path)
             .map_err(|e| FerriteError::InvalidArg(format!("load tokenizer: {e}")))?;
-        let mut stop: Vec<u32> = vec![154_820]; // <|end|> (ferrite-serve parity)
-        for special in ["\u{FFFD}\u{FFFD}", "\u{FFFD}", "\u{FFFD}\u{FFFD}", "\u{FFFD}\u{FFFD}"] {
+        // Stop set — ferrite-serve CLI parity (byte-for-byte the same stop
+        // list): primary <|end|> 154820 PLUS the turn-boundary specials
+        // resolved from the tokenizer (misses skipped; dedup). The peer's
+        // original literals here were U+FFFD corruption (dead resolution —
+        // stop_ids fell back to a guessed static); resolved-at-load is truth.
+        let mut stop: Vec<u32> = vec![154_820]; // <|end|> (eos)
+        for special in ["<|user|>", "<|endoftext|>", "<|observation|>"] {
             if let Some(id) = tok.token_to_id(special) {
                 if !stop.contains(&id) {
                     stop.push(id);
                 }
             }
         }
-        Ok(ChatTokenizer::Real(tok))
+        eprintln!("[http] tokenizer stops: {stop:?}");
+        Ok(ChatTokenizer::Real(tok, stop))
     }
 
     /// The byte-level identity codec (mock mode — see the type doc).
@@ -100,7 +98,7 @@ impl ChatTokenizer {
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         match self {
-            ChatTokenizer::Real(tok) => {
+            ChatTokenizer::Real(tok, _) => {
                 let enc = tok
                     .encode(text, false)
                     .map_err(|e| FerriteError::InvalidArg(format!("encode: {e}")))?;
@@ -112,7 +110,7 @@ impl ChatTokenizer {
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         match self {
-            ChatTokenizer::Real(tok) => tok
+            ChatTokenizer::Real(tok, _) => tok
                 .decode(ids, false)
                 .map_err(|e| FerriteError::InvalidArg(format!("decode: {e}"))),
             ChatTokenizer::Byte => {
@@ -126,7 +124,7 @@ impl ChatTokenizer {
     /// from streamed content.
     pub fn stop_ids(&self) -> &[u32] {
         match self {
-            ChatTokenizer::Real(_) => STOP_IDS_REAL,
+            ChatTokenizer::Real(_, stop) => stop,
             ChatTokenizer::Byte => STOP_IDS_BYTE,
         }
     }
@@ -136,9 +134,6 @@ impl ChatTokenizer {
         self.stop_ids().contains(&id)
     }
 }
-
-/// `<|end|>` + turn-boundary specials (ferrite-serve parity).
-static STOP_IDS_REAL: &[u32] = &[154_820, 154_821, 154_822, 154_823];
 
 /// Byte codec has no specials; the mock engine emits `STOP_ID` (154820)
 /// outside byte range at stream end — outside id space cannot collide

@@ -190,6 +190,14 @@ impl<B: KernelBackend> Engine<B> {
         self.seqs.get(&seq)
     }
 
+    /// Drop a sequence's runtime (host tokens + bookkeeping). Multi-seq
+    /// serving lifecycle: the GPU-side per-seq state (DSA caches, GDN
+    /// states, mega graphs) is freed separately via TpCluster::free_seq —
+    /// this only clears the engine's host map.
+    pub fn remove_seq(&mut self, seq: u64) -> bool {
+        self.seqs.remove(&seq).is_some()
+    }
+
     pub(crate) fn seq_runtime_mut(&mut self, seq: u64) -> Option<&mut SeqRuntime> {
         self.seqs.get_mut(&seq)
     }

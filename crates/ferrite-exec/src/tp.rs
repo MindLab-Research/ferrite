@@ -726,6 +726,26 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(())
     }
 
+    /// Free a sequence's host + GPU state (multi-seq serving lifecycle —
+    /// finished/aborted requests release ~GBs of per-seq caches: DSA KV,
+    /// GDN states, mega graphs, or the serve OOMs after a handful of
+    /// requests). Engine-thread only (single writer — no replay races).
+    pub fn free_seq(&mut self, seq: u64) {
+        for s in &mut self.shards {
+            s.remove_seq(seq);
+        }
+        if self.mega_seq == Some(seq) {
+            self.mega_seq = None;
+        }
+        Self::fan_out(&mut self.shards, |s| {
+            if let Some(cuda) = s.backend.as_cuda() {
+                if let Err(e) = cuda.free_seq(seq) {
+                    eprintln!("[cluster] free_seq {seq}: {e}");
+                }
+            }
+        });
+    }
+
     /// Decode one token. Returns the sampled token id.
     pub fn decode_step(&mut self, seq: u64) -> Result<u32> {
         // CUDA graph fast path: FERRITE_GRAPH=1 → first decode_step captures
@@ -774,7 +794,20 @@ impl<B: KernelBackend> TpCluster<B> {
         let gname = format!("mega{seq}");
         let mtp = std::env::var_os("FERRITE_MTP").is_some();
 
-        if self.mega_seq != Some(seq) {
+        // Multi-seq serving: the mega graph is keyed per seq (mega{seq}), but
+        // mega_seq is a SINGLE-slot marker — a naive != check re-ran the
+        // seconds-scale dry-run+capture on every seq switch (round-robin
+        // decode would recapture per step). A seq whose graph already exists
+        // (graph_io registered at capture end) just switches the marker and
+        // replays: every binding the replay reads (DSA pinned t0/total,
+        // caches, GDN states, graphs) is keyed by seq.
+        let have_graph = self
+            .shards[0]
+            .backend
+            .as_cuda()
+            .map(|c| c.graph_io_get(&gname).is_some())
+            .unwrap_or(false);
+        if self.mega_seq != Some(seq) && !have_graph {
             // (Re)capture for this seq. Dry-run: all 4 ranks run the full
             // chain in parallel (fan_out) — the NCCL ARs rendezvous for
             // real; every pool class / weight cache / NCCL plan warms on the

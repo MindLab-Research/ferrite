@@ -47,7 +47,9 @@ use ferrite_dispatch::arena::SeqId;
 use ferrite_dispatch::batch::{SchedConfig, TickPlan};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::engine::{DriverCmd, DriverStats, FinishReason, ReqEvent, ReqId, RequestSpec, Usage};
+use crate::engine::{
+    DriverCmd, DriverStats, FinishReason, ReqEvent, ReqId, RequestSpec, ServeEngine, Usage,
+};
 use crate::host_engine::HostEngine;
 
 /// The HTTP-facing handle: submit/cancel from any async context, stats
@@ -107,9 +109,13 @@ struct ReqCtx {
     admitted: bool,
 }
 
-/// The engine thread's full state.
-pub struct EngineDriver {
-    engine: HostEngine,
+/// The engine thread's full state. Generic over the serving engine: the
+/// deterministic HostEngine (mock compute over the real BatchScheduler)
+/// and the CUDA engine (ferrite-serve's GpuEngine over the TpCluster)
+/// both implement `ServeEngine` — the driver, the HTTP layer and the
+/// event protocol are engine-agnostic.
+pub struct EngineDriver<E: ServeEngine + 'static> {
+    engine: E,
     cmd: UnboundedReceiver<DriverCmd>,
     stats: Arc<RwLock<DriverStats>>,
     reqs: HashMap<ReqId, ReqCtx>,
@@ -127,18 +133,24 @@ pub struct EngineDriver {
     last_tick: std::time::Instant,
 }
 
-impl EngineDriver {
-    /// Spawn the engine thread. Returns the async-side handle.
-    /// The thread parks on the command channel when idle (no busy tick).
-    ///
-    /// `tick_interval` paces the busy loop (see the field doc): the mock
-    /// backend passes ~5ms (decode-cadence simulation); the CUDA backend
-    /// passes ZERO (the verify replay is the pacing — sleep would only
-    /// add latency on top of the 27ms graph).
+impl EngineDriver<HostEngine> {
+    /// Spawn the mock engine thread (the standalone ferrite-http binary:
+    /// deterministic generation over the real scheduler — full stack on a
+    /// laptop, no model files).
     pub fn spawn(cfg: SchedConfig, stop_id: u32, tick_interval: std::time::Duration) -> EngineHandle {
+        let engine = HostEngine::new(cfg, stop_id).expect("host engine init");
+        Self::spawn_with(engine, tick_interval)
+    }
+}
+
+impl<E: ServeEngine + 'static> EngineDriver<E> {
+    /// Spawn an engine thread over ANY ServeEngine (the GPU backend in
+    /// ferrite-serve builds its engine and hands it here; the driver/HTTP
+    /// protocol is identical). `tick_interval` = ZERO for GPU engines (the
+    /// decode step is the pacing); a positive Duration paces mock engines.
+    pub fn spawn_with(engine: E, tick_interval: std::time::Duration) -> EngineHandle {
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
         let stats = Arc::new(RwLock::new(DriverStats::default()));
-        let engine = HostEngine::new(cfg, stop_id).expect("host engine init");
         let mut driver = EngineDriver {
             engine,
             cmd: cmd_rx,
@@ -192,7 +204,7 @@ impl EngineDriver {
     }
 
     fn engine_busy(&self) -> bool {
-        self.engine.sched.live_rows() > 0 || self.engine.sched.queued() > 0
+        self.engine.live_rows() > 0 || self.engine.queued() > 0
     }
 
     fn reqs_dirty(&self) -> bool {
@@ -251,7 +263,7 @@ impl EngineDriver {
                     let usage = self.usage_of(&ctx, None);
                     let _ = ctx.events.send(ReqEvent::Finished { reason, usage });
                     self.seq_to_req.remove(&ctx.seq);
-                    self.engine.exec.deregister(ctx.seq);
+                    self.engine.deregister(ctx.seq);
                 }
             }
         }
@@ -310,17 +322,18 @@ impl EngineDriver {
             // scheduler's commit math finished the request (eos/max).
             let retired = self
                 .engine
-                .sched
                 .status(seq)
                 .map(|s| s == "retired")
                 .unwrap_or(false);
             if retired {
                 if let Some(ctx) = self.reqs.remove(&req) {
                     self.seq_to_req.remove(&seq);
-                    self.engine.exec.deregister(seq);
                     // Finish reason: the stop marker rides the output tail
                     // (stop → `Stop`; clean cap → `Length`). The marker itself
                     // is not content: strip it from the delta the SSE sends.
+                    // Read output BEFORE deregister — engines that free state
+                    // on deregister (the CUDA engine drops the seq's cluster
+                    // runtime) lose the final output otherwise.
                     let out = self.engine.output(seq).unwrap_or_default();
                     let stopped = out.last() == Some(&self.stop_id());
                     let reason =
@@ -335,6 +348,7 @@ impl EngineDriver {
                             cached_tokens: cached,
                         },
                     });
+                    self.engine.deregister(seq);
                 }
             }
         }
@@ -347,19 +361,19 @@ impl EngineDriver {
     /// still advanced the engine's admissions/partial state; /v1/stats
     /// must never report a stale world).
     fn publish_stats(&mut self) {
-        let census = self.engine.sched.cache_stats();
+        let census = self.engine.cache_stats();
         let stats = DriverStats::from_census(
             census,
             self.ticks,
             self.tokens_committed,
-            self.engine.sched.live_rows() as usize,
-            self.engine.sched.queued(),
+            self.engine.live_rows(),
+            self.engine.queued(),
         );
         *self.stats.write().unwrap_or_else(|e| e.into_inner()) = stats;
     }
 
     fn stop_id(&self) -> u32 {
-        crate::host_engine::STOP_ID
+        self.engine.stop_id()
     }
 
     fn usage_of(&self, ctx: &ReqCtx, extra: Option<usize>) -> Usage {

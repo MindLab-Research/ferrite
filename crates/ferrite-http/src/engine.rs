@@ -147,6 +147,63 @@ impl DriverStats {
     }
 }
 
+/// The serving-engine seam: what the driver needs from ANY engine behind
+/// the HTTP layer. The deterministic `HostEngine` (mock compute over the
+/// real BatchScheduler) implements it for the standalone binary; the CUDA
+/// engine (ferrite-serve's GpuEngine over the TpCluster) implements it
+/// for production. The driver thread is the engine's ONLY writer
+/// (single-writer by design — see the module doc), so these methods never
+/// race: submit/cancel/tick/deregister all run on the engine thread.
+///
+/// Contract notes:
+/// - `submit` queues admission (the engine's own backpressure decides when
+///   the prefill actually runs — the driver reports `Admitted` from
+///   `tick`'s plan when the engine fills it);
+/// - `tick` advances the engine by one driver cadence (admissions land in
+///   `plan.admissions`, commits advance `output`);
+/// - `output` grows monotonically until retirement (the driver diffs it
+///   against a per-request watermark to mint token deltas);
+/// - `status` reports "retired" when the request is finished (the driver
+///   then reads the final output once and drops the request);
+/// - `deregister` releases engine-side state (host bookkeeping for the
+///   mock, GPU memory for the CUDA engine) — called exactly once per
+///   request, after the terminal event.
+pub trait ServeEngine: Send {
+    /// Enqueue a generation request. Returns the engine's SeqId (the
+    /// driver correlates it with its own ReqId).
+    fn submit(
+        &mut self,
+        prompt_ids: Vec<u32>,
+        max_new_tokens: usize,
+        eos: u32,
+    ) -> ferrite_types::Result<SeqId>;
+    /// One engine tick (the driver's cadence loop): run whatever the engine
+    /// decides (admissions/prefills/decode steps), filling the plan's
+    /// admissions for the driver's event publication.
+    fn tick(&mut self, plan: &mut TickPlan) -> ferrite_types::Result<()>;
+    /// Committed output tokens for a seq (grows until retirement; the
+    /// stop token rides the tail — the driver strips it from usage).
+    fn output(&self, seq: SeqId) -> ferrite_types::Result<Vec<u32>>;
+    /// Retire + release a seq (client disconnect). Returns true if it was
+    /// live (already-terminal returns false — same wire semantics).
+    fn cancel(&mut self, seq: SeqId) -> ferrite_types::Result<bool>;
+    /// Drop engine-side state after the terminal event (host bookkeeping,
+    /// GPU memory — one call per request lifetime).
+    fn deregister(&mut self, seq: SeqId);
+    /// Scheduler status of a seq: Some("retired") = finished (the driver's
+    /// retirement detection), Some("live"/other) = in flight, None = unknown.
+    fn status(&self, seq: SeqId) -> Option<&'static str>;
+    /// Telemetry (the /v1/stats source).
+    fn live_rows(&self) -> usize;
+    /// Queued (admitted but not yet decoding) request count.
+    fn queued(&self) -> usize;
+    /// Cache census (radix/hicache for the BatchScheduler engine; the CUDA
+    /// engine reports its own or defaults).
+    fn cache_stats(&self) -> CacheStats;
+    /// The primary stop token id (retirement tail detection).
+    fn stop_id(&self) -> u32;
+}
+
 // Re-exports for the driver and api modules (one-import ergonomics).
 pub use ferrite_dispatch::batch::CacheStats;
 pub use ferrite_dispatch::prelude::TickPlan;

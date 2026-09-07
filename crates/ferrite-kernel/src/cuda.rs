@@ -315,6 +315,7 @@ pub fn clear_activation_pool() {
 extern "C" {
     fn cudaMallocHost(ptr: *mut *mut std::ffi::c_void, bytes: usize) -> i32;
     fn cudaFreeHost(ptr: *mut std::ffi::c_void) -> i32;
+    fn cudaGraphExecDestroy(exec: *mut std::ffi::c_void) -> i32;
 }
 
 /// A device buffer (pooled) with its pinned host stage. `len` is the
@@ -2299,6 +2300,76 @@ impl CudaBackend {
         if let Some(c) = m.get_mut(&(seq, family)) {
             c.t_count -= n;
         }
+    }
+
+    /// Free ONE sequence's per-seq GPU state (multi-seq serving lifecycle —
+    /// finished/aborted requests release ~GBs of per-seq caches or the
+    /// serve OOMs after a handful of requests). Runs on the engine thread
+    /// (single writer — no replay can race the frees; the caller owns the
+    /// schedule). Order matters: graph execs are destroyed BEFORE the
+    /// buffers their recorded kernel params reference (DSA caches, pinned
+    /// t0). The gdn{layer}/moe{layer} per-LAYER segment graphs are
+    /// seq-independent shared assets and are NOT touched. MtpState is a
+    /// per-rank singleton (MTP serving is single-seq); not touched here.
+    pub fn free_seq(&self, seq: u64) -> Result<()> {
+        self.enter();
+        // Pending stream work may still reference the seq's buffers (the
+        // last decode's async kernels): sync before freeing.
+        self.sync()?;
+        // 1. This seq's mega graphs (exact names — mega{seq}, mega_v{seq}):
+        //    destroy the exec, drop the IO pins (pinned staging +
+        //    the leaked argmax DevBuf).
+        for name in [format!("mega{seq}"), format!("mega_v{seq}")] {
+            if let Some(exec) = self.graph_execs.lock().unwrap().remove(&name) {
+                unsafe { cudaGraphExecDestroy(exec as *mut std::ffi::c_void) };
+            }
+            if let Some(io) = self.graph_io.lock().unwrap().remove(&name) {
+                unsafe {
+                    if !io.x_stage.is_null() {
+                        cudaFreeHost(io.x_stage);
+                    }
+                    if !io.out_dev.is_null() {
+                        cudaFree(io.out_dev);
+                    }
+                }
+            }
+        }
+        // 2. DSA family caches: (seq, *) → 4 device buffers + 2 pinned ints.
+        {
+            let mut m = self.dsa_caches.lock().unwrap();
+            let keys: Vec<usize> = m
+                .keys()
+                .filter(|(s, _)| *s == seq)
+                .map(|(_, f)| *f)
+                .collect();
+            for f in keys {
+                if let Some(c) = m.remove(&(seq, f)) {
+                    unsafe {
+                        cudaFree(c.k_nope);
+                        cudaFree(c.v);
+                        cudaFree(c.k_idx);
+                        cudaFree(c.k_gate);
+                        cudaFreeHost(c.pinned_t0 as *mut std::ffi::c_void);
+                        cudaFreeHost(c.pinned_total as *mut std::ffi::c_void);
+                    }
+                }
+            }
+        }
+        // 3. GDN/conv recurrent states: (seq, layer) → DeviceState.
+        for store in [&self.gdn_states, &self.conv_states] {
+            let mut m = store.lock().unwrap();
+            let keys: Vec<usize> = m
+                .keys()
+                .filter(|(s, _)| *s == seq)
+                .map(|(_, l)| *l)
+                .collect();
+            for l in keys {
+                if let Some(st) = m.remove(&(seq, l)) {
+                    unsafe { cudaFree(st.ptr) };
+                }
+            }
+        }
+        Ok(())
     }
 
     fn dsa_alloc(&self, floats: usize) -> Result<*mut std::ffi::c_void> {
