@@ -866,13 +866,25 @@ impl<B: KernelBackend> TpCluster<B> {
                         mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
                         h_cur = Some(hout);
                     }
-                    // NOTE: NO hprev seeding — the ORIGINAL mtp_step leaves
-                    // hprev as pool residue for step 1 (garbage → S1 k=1 →
-                    // S2 hprev=hf_v[0] → the original token stream enters the
-                    // high-predictability regime where accept reaches 2.38).
-                    // Seeding (hf_dev) made S1 k=2 → stream diverged into
-                    // low-predictability tokens (a0=1/320 long-tail) →
-                    // accept stayed 1.0. Restoring the original behavior.
+                    // SEED MtpState.hprev with the catch-up chain's FINAL h
+                    // (the draft/MTP layer's residual h after processing the
+                    // last prompt token) — a DETERMINISTIC value, not pool
+                    // residue. S1's hprev MUST be this: without it, S1 reads
+                    // cudaMalloc's undefined memory (pool residue), the ONLY
+                    // non-deterministic input to draft1 → x2 carries 1-ulp
+                    // drift vs the original path → argmax flips on the
+                    // small-margin d2 (8606 vs 315) → stream diverges →
+                    // accept=1.0. Per the mandate "MTP uses the previously-
+                    // verified main KV", S1's hprev = catch-up final state.
+                    if let Some(hf) = h_cur.as_ref() {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                        let m = cuda.mtp.lock().unwrap();
+                        let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                        cuda.copy_dev(hf, 0, m.hprev.as_f32(), hidden)?;
+                    }
                     Ok::<(), FerriteError>(())
                 })
                 .into_iter()
