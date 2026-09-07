@@ -210,6 +210,10 @@ extern "C" {
     fn ferrite_moe_route(logits: *const f32, bias: *const f32, probs: *mut f32, ids: *mut f32,
                          n: i32, e: i32, topk: i32,
                          scale: f32, s: CuStream) -> i32;
+    fn ferrite_router_gemm_route_fused(
+        x: *const f32, w: *const std::ffi::c_void, bias: *const f32,
+        probs: *mut f32, ids: *mut f32, logits: *mut f32, ctr: *mut u32,
+        n_exp: i32, hidden: i32, topk: i32, scale: f32, s: CuStream) -> i32;
     fn ferrite_indexer_topk(qi: *const f32, ki: *const f32, w: *const f32, idx: *mut f32,
                             n: i32, h: i32, d: i32, topk: i32,
                             total_ptr: *const i32, kpool_val: i32, n_fixed: i32, s: CuStream) -> i32;
@@ -3844,25 +3848,44 @@ impl CudaBackend {
         let ni = n as i32;
         let hi = hidden as i32;
 
-        // 1. routing: x @ gate_w → logits [n, e_total]
-        let logits = self.matmul_dev(x_dev, gate_w, ni, hi, e_total as i32)?;
-
-        // 2. moe_route on device: logits → probs [n, topk], ids [n, topk]
+        // 1. routing + 2. moe_route: FUSED for n==1 (the router GEMV + the
+        // sigmoid+topk+renorm in ONE kernel — the "last block" pattern saves
+        // the separate moe_route's 12µs launch overhead × 44 layers = 0.53ms)
         let dprobs = DevBuf::alloc(self.dev, self.stream, n * topk)?;
         let dids = DevBuf::alloc(self.dev, self.stream, n * topk)?;
+        let dbias = self.dev_weight(bias_w)?;
+        if ni == 1 {
+            // FUSED: router GEMV + route (the "last block" pattern — the 160
+            // expert blocks compute the logits, the last block does the route)
+            let dw_gate = self.dev_weight_bf16(gate_w)?;
+            let dlogits = DevBuf::alloc(self.dev, self.stream, e_total)?;
+            let dctr = DevBuf::alloc(self.dev, self.stream, 4)?;
+            ck(unsafe { cudaMemsetAsync(dctr.as_f32() as *mut _, 0, 4, self.stream) }, "ctr zero")?;
+            ck(unsafe {
+                ferrite_router_gemm_route_fused(
+                    x_dev.as_const_f32(), dw_gate.ptr as *const _, dbias.as_const_f32(),
+                    dprobs.as_f32(), dids.as_f32(), dlogits.as_f32(), dctr.as_f32() as *mut u32,
+                    e_total as i32, hi, topk as i32, routed_scaling, self.stream)
+            }, "router_gemm_route_fused")?;
+        } else {
+            // n > 1 (prefill): the old path (matmul + moe_route)
+            let logits = self.matmul_dev(x_dev, gate_w, ni, hi, e_total as i32)?;
+            ck(unsafe {
+                ferrite_moe_route(logits.as_const_f32(), dbias.as_const_f32(),
+                                  dprobs.as_f32(), dids.as_f32(),
+                                  ni, e_total as i32, topk as i32, routed_scaling, self.stream)
+            }, "moe_route_fused")?;
+        }
 
         // ---- FUSED PATH (TileRT ExpertSelect idea): GPU-side expert dispatch
         // via the pointer table — ids/probs NEVER cross to the host; two
         // kernels (act + down_sum) replace the per-expert kernel chains, the
         // D2D gather and the probs_ext upload. Now batch-capable: grid carries
         // the token dim (n==1 decode, n>1 chunked prefill).
+        // (routing is handled by the conditional above: n==1 → fused
+        // router_gemm_route_fused; n>1 → matmul + moe_route)
         {
-            let dbias = self.dev_weight(bias_w)?;
-            ck(unsafe {
-                ferrite_moe_route(logits.as_const_f32(), dbias.as_const_f32(),
-                                  dprobs.as_f32(), dids.as_f32(),
-                                  ni, e_total as i32, topk as i32, routed_scaling, self.stream)
-            }, "moe_route_fused")?;
+            // dbias already allocated above the routing conditional
             if probs_out.len >= n * topk {
                 let (dst, src) = (probs_out.as_f32(), dprobs.as_const_f32());
                 ck(unsafe {
@@ -3978,6 +4001,10 @@ impl CudaBackend {
 
         ck(unsafe {
             let dbias = self.dev_weight(bias_w)?;
+            // NOTE: n>1 (prefill) — the fused path returned earlier; this is
+            // the fallback (non-fused MoE). The logits come from the matmul
+            // in the n>1 branch of the routing conditional above.
+            let logits = self.matmul_dev(x_dev, gate_w, ni, hi, e_total as i32)?;
             ferrite_moe_route(logits.as_const_f32(), dbias.as_const_f32(),
                               dprobs.as_f32(), dids.as_f32(),
                               ni, e_total as i32, topk as i32, routed_scaling, self.stream)
