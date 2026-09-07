@@ -3425,7 +3425,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             // closure uses its local copy's device pointer.
             #[cfg(feature = "cuda")]
             let (hn_host, hn_t): (Option<Vec<f32>>, Option<Tensor>) =
-                if std::env::var_os("FERRITE_P2P").is_some() {
+                if std::env::var_os("FERRITE_P2P_PREFILL").is_some() {
                     // P2P: download once (rank 0) — no Tensor::from_f32
                     // construction (Vec alloc + copy). The fan_out closures
                     // use this Vec directly.
@@ -3463,7 +3463,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         // on-device — the attn_out NEVER crosses to the host.
         #[cfg(feature = "cuda")]
         let (attn_out_dev, attn_out_t) =
-            if std::env::var_os("FERRITE_P2P").is_some() {
+            if std::env::var_os("FERRITE_P2P_PREFILL").is_some() {
                 let ptrs: Vec<Result<usize>> = Self::fan_out(&mut self.shards, |s| {
                     use ferrite_kernel::cuda::DevBuf;
                     let cuda = s
@@ -3700,7 +3700,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         let t_pre2 = std::time::Instant::now();
         // P2P path: fan_out returns device pointers, rank 0 P2P all_reduces
         #[cfg(feature = "cuda")]
-        let (ffn_out_dev, ffn_out_t) = if std::env::var_os("FERRITE_P2P").is_some() {
+        let (ffn_out_dev, ffn_out_t) = if std::env::var_os("FERRITE_P2P_PREFILL").is_some() {
             let ptrs: Vec<Result<usize>> = Self::fan_out(&mut self.shards, |s| {
                 use ferrite_kernel::cuda::DevBuf;
                 let cuda = s
@@ -3892,7 +3892,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
             // segment 1 uses it directly. The Tensor is a PLACEHOLDER (the
             // input residual clone) — only residual_dev matters for the next
             // layer. The LAST layer's caller must download residual_dev.
-            if std::env::var_os("FERRITE_P2P").is_some() {
+            if std::env::var_os("FERRITE_P2P_PREFILL").is_some() {
                 (residual.clone(), Some(res_out_dev))
             } else {
                 let mut out = vec![0f32; n * nh];
@@ -3939,7 +3939,7 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
         // P2P chain (FERRITE_P2P + FERRITE_LAYER_DEV): residual stays on GPU
         // across layers — no Tensor download/upload per layer (~0.3ms × 45).
         #[cfg(feature = "cuda")]
-        if std::env::var_os("FERRITE_P2P").is_some()
+        if std::env::var_os("FERRITE_P2P_PREFILL").is_some()
             && std::env::var_os("FERRITE_LAYER_DEV").is_some()
             && self.full_cfg.mhc
         {
