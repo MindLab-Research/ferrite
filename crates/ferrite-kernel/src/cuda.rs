@@ -723,15 +723,39 @@ impl CudaBackend {
                 return Ok(DevRef { ptr: cb.dev, len: cb.len });
             }
         }
-        // MMAP PLACEHOLDER GUARD: a 4-elem stub that missed the cache would
-        // cudaMemcpy numel*4 bytes from a 16-byte Vec — a silent heap OOB
-        // read → garbage f32 weights (norms/hc/A_log/dt_bias) → garbage text
-        // with ZERO errors logged. Fail fast with the numel so the skipped
-        // preload is identifiable. (The bf16 path (dev_weight_bf16) has the
-        // same guard; this closes the f32 blind spot.)
+        // MMAP PLACEHOLDER GUARD: a 4-elem stub that missed the f32 cache
+        // would cudaMemcpy numel*4 bytes from a 16-byte Vec — a silent heap
+        // OOB read → garbage f32 weights → garbage text with ZERO errors
+        // logged. THE ROOT CAUSE of the mmap "!!!" bug: legacy-loaded weights
+        // are REAL f32 tensors (dev_weight falls through and uploads them),
+        // but mmap placeholders are 4-elem stubs — the fallthrough read heap
+        // garbage (conv_w / indexer ape / every f32-consumer 2-D weight the
+        // legacy path uploaded lazily on first dev_weight call).
+        // RECOVERY: the mmap preloaded the same weight as bf16 residency
+        // (key numel<<1|1 via preload_bf16_raw). Widen it on device
+        // (bf16→f32, bit-identical to the legacy path's checkpoint
+        // bf16→f32 widen) and register the f32 key.
         if t.as_slice().len() < t.numel() {
+            let bkey = (t.as_slice().as_ptr() as usize, t.numel() << 1 | 1);
+            if let Some(bb) = cache.get(&bkey) {
+                if bb.len == t.numel() {
+                    let numel = t.numel();
+                    let mut f32p: *mut std::ffi::c_void = std::ptr::null_mut();
+                    ck(unsafe { cudaMalloc(&mut f32p, numel * 4) }, "dev_weight bf16→f32 widen malloc")?;
+                    let conv = (|| -> Result<()> {
+                        ck(
+                            unsafe { ferrite_bf16_to_f32(bb.dev as *const _, f32p as *mut f32, numel as i64, self.stream) },
+                            "dev_weight bf16→f32 widen",
+                        )
+                    })();
+                    self.sync()?;
+                    conv?;
+                    cache.insert(key, CachedBuf { keep: t.data.clone(), dev: f32p, len: numel });
+                    return Ok(DevRef { ptr: f32p, len: numel });
+                }
+            }
             return Err(FerriteError::InvalidArg(format!(
-                "dev_weight: placeholder stub ({} bytes data vs {} numel) missed the f32 cache — the weight was never preloaded",
+                "dev_weight: placeholder stub ({} bytes data vs {} numel) missed both f32 and bf16 caches — the weight was never preloaded",
                 t.as_slice().len(),
                 t.numel()
             )));
