@@ -147,13 +147,23 @@ pub fn shard_weights8_tp(
             } else {
                 &plan[layer]
             };
-            // expert weights: EP-style whole experts per rank
+            // expert weights: MoE TP (default) shards every expert's inter dim
+            // across ranks (gate/up row-split, down col-split — constant topk
+            // work per rank, no EP routing skew); FERRITE_MOE_EP=1 keeps EP
+            // (whole experts per rank).
             if let Some(expert) = name.split(".experts.").nth(1) {
                 let e: usize = expert.split('.').next().unwrap_or("0").parse().unwrap_or(0);
-                if e >= es && e < ee {
-                    Some(f.clone())
+                if std::env::var_os("FERRITE_MOE_EP").is_some() {
+                    if e >= es && e < ee {
+                        Some(f.clone())
+                    } else {
+                        None
+                    }
+                } else if name.ends_with(".down_proj.weight") {
+                    fp8_col(f, f.cols * rank / world, f.cols * (rank + 1) / world)
                 } else {
-                    None
+                    // gate/up: [inter, hidden] row-split
+                    fp8_row(f, f.rows * rank / world, f.rows * (rank + 1) / world)
                 }
             } else if name.ends_with(".shared_expert.gate_proj.weight")
                 || name.ends_with(".shared_expert.up_proj.weight")
@@ -465,14 +475,30 @@ fn shard_mlp_weight(
     if let Some(expert) = name.split(".experts.").nth(1) {
         // "e.gate_proj.weight"
         let e: usize = expert.split('.').next()?.parse().ok()?;
+        let _ = e;
         let n = cfg.n_routed_experts;
-        let (es, ee) = head_range(n, rank, world);
-        if e < es || e >= ee {
-            return Some(Tensor::new(Shape::new([0, cols]), t.dtype, vec![])); // empty: not ours
+        // MoE TP (default): every expert's intermediate dim sharded across
+        // ranks — gate/up row-split [inter/world, hidden], down col-split
+        // [hidden, inter/world] (the shared_expert pattern). Topk work is
+        // then CONSTANT per rank — no EP routing skew (nsys: p2p_ar_sum
+        // waited 44µs avg on the EP hot rank vs 2µs min = 4ms/step of pure
+        // skew). FERRITE_MOE_EP=1 keeps the EP mode (whole experts per
+        // rank, es..ee).
+        if std::env::var_os("FERRITE_MOE_EP").is_none() {
+            if name.ends_with(".down_proj.weight") {
+                Some(col_split(t, cols * rank / world, cols * (rank + 1) / world))
+            } else {
+                // gate_proj / up_proj: [inter, hidden] row-split
+                Some(row_split(t, rows * rank / world, rows * (rank + 1) / world))
+            }
+        } else {
+            let (es, ee) = head_range(n, rank, world);
+            if e < es || e >= ee {
+                return Some(Tensor::new(Shape::new([0, cols]), t.dtype, vec![])); // empty: not ours
+            }
+            return Some(t.clone()); // full expert (EP-style: whole experts per rank)
         }
-        return Some(t.clone()); // full expert (EP-style: whole experts per rank)
-    }
-    if name.ends_with(".shared_expert.gate_proj.weight") || name.ends_with(".shared_expert.up_proj.weight") {
+    } else if name.ends_with(".shared_expert.gate_proj.weight") || name.ends_with(".shared_expert.up_proj.weight") {
         Some(row_split(t, rows * rank / world, rows * (rank + 1) / world))
     } else if name.ends_with(".shared_expert.down_proj.weight") {
         Some(col_split(t, cols * rank / world, cols * (rank + 1) / world))
@@ -642,8 +668,16 @@ impl<B: KernelBackend> TpCluster<B> {
             let w = shard_weights_tp(weights, &full_cfg, rank, world);
             let mut engine = Engine::new(shard_cfg, w, mk_backend(rank));
             engine.tp_world = world;
-            let per = full_cfg.n_routed_experts / world;
-            engine.tp_expert_range = Some((rank * per, (rank + 1) * per));
+            // MoE TP (default): ALL routed experts resident per rank (each
+            // inter/world-sharded) — tp_expert_range covers the full set
+            // (0..n) so the fused kernels' id→table indexing is direct.
+            // FERRITE_MOE_EP=1 keeps EP (whole experts per rank slice).
+            if std::env::var_os("FERRITE_MOE_EP").is_some() {
+                let per = full_cfg.n_routed_experts / world;
+                engine.tp_expert_range = Some((rank * per, (rank + 1) * per));
+            } else {
+                engine.tp_expert_range = Some((0, full_cfg.n_routed_experts));
+            }
             shards.push(engine);
         }
         // P2P enable (FERRITE_P2P=1): rank 0 collects partials via NVLink

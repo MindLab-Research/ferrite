@@ -111,9 +111,20 @@ fn split_of(name: &str, full: &[usize], cfg: &Glm53FlashConfig, rank: usize, wor
         return Split::Replicated; // non-layer global
     };
     let is_dsa = cfg.layer_types.get(li).map(|t| matches!(t, ferrite_model::LayerType::DeepseekSparseAttention)).unwrap_or(li >= cfg.layer_types.len());
-    // MoE experts: EP whole (mirror)
+    // MoE experts: TP (default) — every expert's intermediate dim sharded
+    // across ranks (gate/up row-split, down col-split — the shared_expert
+    // pattern). Constant topk work per rank → no EP routing skew in the p2p
+    // AR wait (nsys: AR 44µs avg on EP's hot rank vs 2µs min = 4ms/step of
+    // pure skew). FERRITE_MOE_EP=1 keeps EP (whole experts per rank slice).
     if name.split(".experts.").nth(1).is_some() {
-        return Split::Expert { es, ee };
+        if std::env::var_os("FERRITE_MOE_EP").is_some() {
+            return Split::Expert { es, ee };
+        }
+        if name.ends_with(".down_proj.weight") {
+            return Split::Cols { c0: cols * rank / world, c1: cols * (rank + 1) / world };
+        }
+        // gate/up: [inter, hidden] row-split
+        return Split::Rows { r0: rows * rank / world, r1: rows * (rank + 1) / world };
     }
     if name.ends_with(".gate_proj.weight") || name.ends_with(".up_proj.weight") {
         return Split::Rows { r0: rows * rank / world, r1: rows * (rank + 1) / world };
@@ -306,6 +317,11 @@ pub fn direct_preload_shard(
                 // scale) and serves dev_weight_bf16 consumers.
                 let scols_full = cols.div_ceil(128);
                 let d = dv.direct.slice(data);
+                // experts under MoE-TP walk the Rows/Cols splits — the fused
+                // MoE kernels read bf16 pointer tables (moe_expert_ptrs), so
+                // experts get dequant-bf16 ONLY (no register_fp8 fp8 copy —
+                // doubling 160×3 experts' residency OOMs: 275GB cap).
+                let is_expert = name.split(".experts.").nth(1).is_some();
                 match split {
                     Split::Replicated => {
                         // fp8 GEMV (W8A16) registration — the SAME numerical path
@@ -316,7 +332,9 @@ pub fn direct_preload_shard(
                         // priority. (The bf16-dequant GEMV loses 16 mantissa
                         // bits per weight — ~0.2% relative error that flips
                         // argmax ties step-by-step → diverging garbage text.)
-                        backend.register_fp8(ph, rows, cols, d, &scale_full)?;
+                        if !is_expert {
+                            backend.register_fp8(ph, rows, cols, d, &scale_full)?;
+                        }
                         backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
                         st.fp8_rows += 1;
                     }
@@ -330,7 +348,9 @@ pub fn direct_preload_shard(
                         // grid's rows r0/128..r1/128, full cols).
                         let sw = scale_row_window(&scale_full, scols_full, r0 / 128, r1.div_ceil(128));
                         let dr = &d[r0 * cols..r1 * cols];
-                        backend.register_fp8(ph, r1 - r0, cols, dr, &sw)?;
+                        if !is_expert {
+                            backend.register_fp8(ph, r1 - r0, cols, dr, &sw)?;
+                        }
                         backend.preload_fp8_dequant(ph, dr, &sw, r1 - r0, cols)?;
                         st.fp8_rows += 1;
                     }
@@ -351,7 +371,9 @@ pub fn direct_preload_shard(
                         for r in 0..srows {
                             sg.extend_from_slice(&scale_full[r * scols_full + sc0..r * scols_full + sc1]);
                         }
-                        backend.register_fp8(ph, rows, shard_cols, &dg, &sg)?;
+                        if !is_expert {
+                            backend.register_fp8(ph, rows, shard_cols, &dg, &sg)?;
+                        }
                         backend.preload_fp8_col_dequant(ph, d, &scale_full, rows, cols, c0, c1)?;
                         st.fp8_cols += 1;
                     }

@@ -27,6 +27,7 @@ extern "C" {
     fn cudaProfilerStart() -> i32;
     fn cudaProfilerStop() -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
+    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
     fn cudaMemcpy2D(
@@ -458,6 +459,19 @@ impl Drop for DevBuf {
 }
 
 /// Cached device-resident weight: keyed by the host Arc buffer pointer
+/// Persistent fp8-dequant staging (grow-on-demand, NEVER freed per call).
+/// The mmap TP preload fires ~21600 dequants; each call's malloc(2MB w8)
+/// +malloc(sc)+malloc(4MB ptr)+free(w8)+free(sc) interleaves 2MB-page-sized
+/// frees with 4MB retained outputs — the 2MB-page allocator fragments
+/// (observed: 132GB free yet a 4MB malloc fails; EP mode's 5400 calls at
+/// 8MB staging never fragments).
+struct Fp8Stage {
+    w8: *mut std::ffi::c_void,
+    w8_cap: usize,
+    sc: *mut std::ffi::c_void,
+    sc_cap: usize,
+}
+
 /// (stable because the tensor is immutable), the host Arc is kept alive in
 /// the cache so the pointer can never dangle.
 struct CachedBuf {
@@ -618,6 +632,23 @@ pub struct CudaBackend {
     /// xq. Allocated once (lazy) per width; the kernel TAIL resets the
     /// barrier counters, so the buffer is reusable across calls (stream order).
     w8a8_scratch: std::sync::Mutex<std::collections::HashMap<usize, (*mut std::ffi::c_void, usize)>>,
+    /// Persistent fp8-dequant staging (grow-on-demand, NEVER freed per call).
+    /// Root cause this exists: the mmap TP preload fires ~21600 dequants
+    /// (160 experts × 3 proj × 45 layers × rows/cols splits); each call's
+    /// malloc(w8 2MB)+malloc(sc)+malloc(ptr 4MB)+free(w8)+free(sc) interleaves
+    /// 2MB-page-sized frees with 4MB retained outputs — the 2MB-page
+    /// allocator fragments (observed: 132GB free yet a 4MB malloc fails,
+    /// EP mode's 5400 calls at 8MB staging never fragments). Reusing one
+    /// staging buffer (sized to the largest request) removes the interleave.
+    fp8_stage: std::sync::Mutex<Fp8Stage>,
+    /// Preload output arena (bump allocator over ~1GB cudaMalloc blocks).
+    /// B300 allocator quirk: 21600 small (4MB) cudaMalloc calls for the MoE-TP
+    /// expert dequant outputs fail with cudaErrorMemoryAllocation at
+    /// ~130GB used / 129GB free (the EP mode's 5400 16MB calls at 161GB
+    /// never hit it) — the driver rejects small allocations once the count
+    /// × interleave pattern crosses a threshold. Bump-slicing one 1GB block
+    /// per ~256 outputs keeps the cudaMalloc count at ~90 total.
+    bump: std::sync::Mutex<Vec<(*mut std::ffi::c_void, usize, usize)>>,
     /// Named CUDA graphs (per layer-segment): FERRITE_GRAPH_LAYER captures
     /// each segment's op sequence once and replays per token — the per-op
     /// launch gaps (~30μs × ~19 ops/layer) are the decode bottleneck after
@@ -691,6 +722,8 @@ impl CudaBackend {
             dsa_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             p2p_ar: std::sync::Mutex::new(None),
             w8a8_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fp8_stage: std::sync::Mutex::new(Fp8Stage { w8: std::ptr::null_mut(), w8_cap: 0, sc: std::ptr::null_mut(), sc_cap: 0 }),
+            bump: std::sync::Mutex::new(Vec::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
@@ -1009,8 +1042,7 @@ impl CudaBackend {
                 }
             }
         }
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "bf16_col malloc")?;
+        let ptr = self.bump_alloc(numel * 2)?;
         ck(
             unsafe {
                 cudaMemcpy2D(
@@ -1037,6 +1069,7 @@ impl CudaBackend {
     /// cudaMemcpy2D strided H2D from the mmap slice; the scale window is
     /// gathered on the host (KBs — [srows, c0/128..c1/128) of [srows,
     /// full_cols/128], the only small CPU pass on the direct path).
+    /// Bump-allocate the output (see bump_alloc — B300 small-alloc quirk).
     pub fn preload_fp8_col_dequant(
         &self,
         placeholder: &Tensor,
@@ -1075,9 +1108,30 @@ impl CudaBackend {
                 }
             }
         }
-        // fp8 window: strided H2D from the mmap slice
-        let mut w8: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut w8, numel) }, "fp8_col w8 malloc")?;
+        // fp8 window: strided H2D from the mmap slice (PERSISTENT fp8_stage —
+        // same anti-fragmentation rationale as preload_fp8_dequant)
+        let mut stage = self.fp8_stage.lock().unwrap();
+        if stage.w8_cap < numel {
+            if !stage.w8.is_null() {
+                unsafe { cudaFree(stage.w8) };
+            }
+            ck(unsafe { cudaMalloc(&mut stage.w8, numel) }, "fp8_col w8 stage alloc")?;
+            stage.w8_cap = numel;
+        }
+        // scale window: host gather (KBs), then H2D
+        let mut scale: Vec<f32> = Vec::with_capacity(srows * scols);
+        for sr in 0..srows {
+            let base = sr * full_scols;
+            scale.extend_from_slice(&scale_full[base + sc0..base + sc1]);
+        }
+        if stage.sc_cap < scale.len() * 4 {
+            if !stage.sc.is_null() {
+                unsafe { cudaFree(stage.sc) };
+            }
+            ck(unsafe { cudaMalloc(&mut stage.sc, scale.len() * 4) }, "fp8_col sc stage alloc")?;
+            stage.sc_cap = scale.len() * 4;
+        }
+        let w8 = stage.w8;
         ck(
             unsafe {
                 cudaMemcpy2D(
@@ -1092,18 +1146,10 @@ impl CudaBackend {
             },
             "fp8_col H2D (mmap strided window)",
         )?;
-        // scale window: host gather (KBs), then H2D
-        let mut scale: Vec<f32> = Vec::with_capacity(srows * scols);
-        for sr in 0..srows {
-            let base = sr * full_scols;
-            scale.extend_from_slice(&scale_full[base + sc0..base + sc1]);
-        }
-        let mut sc: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut sc, scale.len() * 4) }, "fp8_col scale malloc")?;
+        let sc = stage.sc;
         ck(unsafe { cudaMemcpy(sc, scale.as_ptr() as *const _, scale.len() * 4, CUDA_MEMCPY_H2D) }, "fp8_col scale H2D")?;
-        // GPU dequant → resident bf16
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "fp8_col bf16 malloc")?;
+        // GPU dequant → resident bf16 (bump arena — see bump_alloc)
+        let ptr = self.bump_alloc(numel * 2)?;
         let conv = (|| -> Result<()> {
             ck(
                 unsafe {
@@ -1122,10 +1168,7 @@ impl CudaBackend {
             )
         })();
         self.sync()?;
-        unsafe {
-            cudaFree(w8);
-            cudaFree(sc);
-        }
+        drop(stage);
         conv?;
         self.weights.lock().unwrap().insert(
             key,
@@ -1206,6 +1249,32 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// Bump-allocate from ~1GB arena blocks (B300 allocator quirk: 21600
+    /// small 4MB cudaMalloc calls for MoE-TP expert dequant outputs fail
+    /// with cudaErrorMemoryAllocation at ~130GB used / 129GB free — the EP
+    /// mode's 5400 16MB calls at 161GB never hit it; the driver's small-
+    /// allocation path degrades past ~14k live allocations). Preload outputs
+    /// live for the process lifetime (weights cache) — bump blocks are
+    /// never freed. Slicing one 1GB block per ~256 outputs keeps the total
+    /// cudaMalloc count at ~90.
+    fn bump_alloc(&self, bytes: usize) -> Result<*mut std::ffi::c_void> {
+        let mut blocks = self.bump.lock().unwrap();
+        const CHUNK: usize = 1 << 30; // 1 GiB
+        let need = bytes.next_multiple_of(256);
+        if let Some((base, cap, used)) = blocks.last_mut() {
+            if *cap - *used >= need {
+                let ptr = unsafe { (*base as *mut u8).add(*used) as *mut std::ffi::c_void };
+                *used += need;
+                return Ok(ptr);
+            }
+        }
+        let sz = need.max(CHUNK);
+        let mut base: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut base, sz) }, "bump arena block")?;
+        blocks.push((base, sz, need));
+        Ok(base)
+    }
+
     /// fp8 e4m3 + 128×128 block scales → resident bf16, dequantized ON
     /// THE GPU (the legacy path's `to_f32` + `dequant_block` + CPU pack —
     /// 3 passes over the weight + a 4× f32 materialization — replaced by
@@ -1245,17 +1314,34 @@ impl CudaBackend {
                     return Ok(());
                 }
             }
+        }        // staging: PERSISTENT fp8_stage (grow-on-demand, reused across calls —
+        // the mmap TP preload fires ~21600 dequants; each call's malloc(2MB
+        // w8)+free interleaved with 4MB retained outputs fragments the
+        // 2MB-page allocator: observed 132GB free yet a 4MB malloc fails).
+        let mut stage = self.fp8_stage.lock().unwrap();
+        if stage.w8_cap < data.len() {
+            if !stage.w8.is_null() {
+                unsafe { cudaFree(stage.w8) };
+            }
+            ck(unsafe { cudaMalloc(&mut stage.w8, data.len()) }, "fp8_dequant w8 stage alloc")?;
+            stage.w8_cap = data.len();
         }
-        // staging: fp8 bytes + scales (device, freed after the kernel)
-        let mut w8: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut sc: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut w8, data.len()) }, "fp8_dequant w8 malloc")?;
-        ck(unsafe { cudaMalloc(&mut sc, scale.len() * 4) }, "fp8_dequant scale malloc")?;
+        if stage.sc_cap < scale.len() * 4 {
+            if !stage.sc.is_null() {
+                unsafe { cudaFree(stage.sc) };
+            }
+            ck(unsafe { cudaMalloc(&mut stage.sc, scale.len() * 4) }, "fp8_dequant sc stage alloc")?;
+            stage.sc_cap = scale.len() * 4;
+        }
+        let w8 = stage.w8;
+        let sc = stage.sc;
         ck(unsafe { cudaMemcpy(w8, data.as_ptr() as *const _, data.len(), CUDA_MEMCPY_H2D) }, "fp8_dequant w8 H2D")?;
         ck(unsafe { cudaMemcpy(sc, scale.as_ptr() as *const _, scale.len() * 4, CUDA_MEMCPY_H2D) }, "fp8_dequant scale H2D")?;
-        // resident bf16 output
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "fp8_dequant bf16 malloc")?;
+        // resident bf16 output — BUMP arena (B300 quirk: 21600 small cudaMalloc
+        // calls for MoE-TP expert dequant outputs fail with OOM at ~130GB
+        // used / 129GB free; bump-slicing 1GB blocks keeps the cudaMalloc
+        // count at ~90. EP mode's 5400 16MB calls at 161GB never hit it.)
+        let ptr = self.bump_alloc(numel * 2)?;
         let conv = (|| -> Result<()> {
             ck(
                 unsafe {
@@ -1273,13 +1359,11 @@ impl CudaBackend {
                 "fp8 GPU dequant",
             )
         })();
-        // staging freed after the kernel completes (sync — load path, not
-        // steady-state; freeing in-flight DMA target memory would race).
+        // staging NOT freed — persistent fp8_stage reuse (the mmap TP preload
+        // fires ~21600 dequants; per-call free+malloc interleaved with 4MB
+        // retained outputs fragments the 2MB-page allocator).
         self.sync()?;
-        unsafe {
-            cudaFree(w8);
-            cudaFree(sc);
-        }
+        drop(stage);
         conv?;
         // D2H verify: read back first 8 bf16 elements of the dequant output and
         // compare with the CPU reference (e4m3 decode × scale → f32 → bf16).
@@ -1352,8 +1436,15 @@ impl CudaBackend {
                 }
             }
         }
-        let mut staging: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut staging, numel * 2) }, "bf16f32 staging malloc")?;
+        let mut stage = self.fp8_stage.lock().unwrap();
+        if stage.w8_cap < numel * 2 {
+            if !stage.w8.is_null() {
+                unsafe { cudaFree(stage.w8) };
+            }
+            ck(unsafe { cudaMalloc(&mut stage.w8, numel * 2) }, "bf16f32 staging stage alloc")?;
+            stage.w8_cap = numel * 2;
+        }
+        let staging = stage.w8;
         ck(
             unsafe { cudaMemcpy(staging, bf16_bytes.as_ptr() as *const _, numel * 2, CUDA_MEMCPY_H2D) },
             "bf16f32 H2D (mmap → device)",
@@ -1367,7 +1458,7 @@ impl CudaBackend {
             )
         })();
         self.sync()?;
-        unsafe { cudaFree(staging) };
+        drop(stage);
         conv?;
         self.weights.lock().unwrap().insert(
             key,
