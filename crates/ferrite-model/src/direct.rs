@@ -276,6 +276,10 @@ pub enum WeightView {
     /// the GPU bf16→f32 expand kernel widens on device; no CPU round-trip
     /// for 2.5GB embed or any norm).
     Bf16ToF32 { seg: Seg, shape: Vec<usize> },
+    /// f32 bytes the runtime consumes as f32 — H2D verbatim (the checkpoint
+    /// already stores f32: rare 1-D weights like scales/biases). NO bf16→f32
+    /// conversion (the mmap bytes ARE the device layout).
+    F32Seg { seg: Seg, shape: Vec<usize> },
 }
 
 /// The direct-loading result: the runtime placeholder table (shape-real,
@@ -430,20 +434,27 @@ pub fn load_direct(dir: &Path, cfg: &crate::config::Glm53FlashConfig) -> Result<
                 }
             }
             other => {
-                // F32/F16 checkpoint entries: rare (scales live as F32) —
-                // treat 2-D as bf16-seg-pass (never hit on this release),
-                // 1-D as GPU-widened f32 (same expand path).
+                // F32/F16 checkpoint entries: the checkpoint stores these
+                // directly as f32 (rare 1-D weights like scales/biases/A_log).
+                // F32 bytes are ALREADY the device layout — H2D verbatim,
+                // NO bf16→f32 conversion (the old Bf16ToF32 classification
+                // was the 2x-byte-mismatch bug: it expected numel*2 bf16
+                // bytes but the mmap segment had numel*4 f32 bytes).
                 if shape.len() >= 2 {
+                    // 2-D f32 in the checkpoint (never hit on this release):
+                    // treat as bf16-seg-pass — will byte-mismatch if it ever
+                    // fires, loudly identifying the case.
                     placeholders.insert(name.clone(), placeholder(shape.clone()));
                     views.insert(
                         name,
                         WeightView::Bf16Segs { segs: vec![e.seg], shape: shape.clone() },
                     );
                 } else {
+                    // 1-D f32: direct H2D (the bytes are the device layout).
                     placeholders.insert(name.clone(), placeholder(shape.clone()));
                     views.insert(
                         name,
-                        WeightView::Bf16ToF32 { seg: e.seg, shape: shape.clone() },
+                        WeightView::F32Seg { seg: e.seg, shape: shape.clone() },
                     );
                 }
                 let _ = other;

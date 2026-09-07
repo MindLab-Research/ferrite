@@ -1265,6 +1265,44 @@ impl CudaBackend {
         Ok(())
     }
 
+    /// f32 raw → resident f32 (VERBATIM — the mmap bytes ARE the device
+    /// layout for f32 checkpoint weights: rare 1-D norms/biases/scales that
+    /// the checkpoint stores as F32, not bf16. No conversion kernel — just
+    /// cudaMemcpy. Cache key is the f32 dev_weight's (ptr, numel).
+    pub fn preload_f32_raw(&self, placeholder: &Tensor, f32_bytes: &[u8]) -> Result<()> {
+        let numel = placeholder.numel();
+        if numel == 0 {
+            return Ok(());
+        }
+        if f32_bytes.len() != numel * 4 {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_f32_raw: {} bytes != numel {numel} * 4",
+                f32_bytes.len()
+            )));
+        }
+        self.enter();
+        let key = (placeholder.as_slice().as_ptr() as usize, numel);
+        {
+            let cache = self.weights.lock().unwrap();
+            if let Some(cb) = cache.get(&key) {
+                if cb.len == numel {
+                    return Ok(());
+                }
+            }
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, numel * 4) }, "f32raw malloc")?;
+        ck(
+            unsafe { cudaMemcpy(ptr, f32_bytes.as_ptr() as *const _, numel * 4, CUDA_MEMCPY_H2D) },
+            "f32raw H2D (mmap → device)",
+        )?;
+        self.weights.lock().unwrap().insert(
+            key,
+            CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
+        );
+        Ok(())
+    }
+
     /// Free all cached device weights (explicit; the Drop impl does it too).
     pub fn clear_weight_cache(&self) {
         let mut cache = self.weights.lock().unwrap();

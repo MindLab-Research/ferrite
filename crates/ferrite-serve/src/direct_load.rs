@@ -55,6 +55,7 @@ fn view_shape(v: &WeightView) -> &[usize] {
         WeightView::Bf16Segs { shape, .. } => shape,
         WeightView::Fp8 { shape, .. } => shape,
         WeightView::Bf16ToF32 { shape, .. } => shape,
+        WeightView::F32Seg { shape, .. } => shape,
     }
 }
 
@@ -343,6 +344,30 @@ pub fn direct_preload_shard(
                     }
                 }
                 let _ = shape;
+            }
+            WeightView::F32Seg { seg, shape } => {
+                // f32 checkpoint bytes → f32 resident (VERBATIM — no bf16→f32
+                // widening; the mmap bytes ARE the device layout at 4
+                // bytes/element). The old Bf16ToF32 classification here was
+                // the 2x-byte-mismatch bug (expected numel*2 bf16 bytes,
+                // got numel*4 f32 bytes → panic).
+                let full = dv.direct.slice(seg);
+                match split {
+                    Split::Replicated => {
+                        backend.preload_f32_raw(ph, full)?;
+                        st.f32_expand += 1;
+                    }
+                    Split::Rows { r0, r1 } => {
+                        let rb = shape.get(1).copied().unwrap_or(1) * 4; // f32 row bytes
+                        backend.preload_f32_raw(ph, &full[r0 * rb..r1 * rb])?;
+                        st.f32_expand += 1;
+                    }
+                    _ => {
+                        return Err(FerriteError::Config(format!(
+                            "direct: {name} F32Seg with non-row split (checkpoint drift)"
+                        )));
+                    }
+                }
             }
         }
     }
