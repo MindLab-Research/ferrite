@@ -230,10 +230,15 @@ extern "C" cudaError_t ferrite_dequant_e4m3_block(const void* w, const void* sca
 // bf16 raw → f32 resident (the embed-table expand: checkpoint bf16 bytes
 // H2D'd straight from the mmap, expanded on device — 2.5 GB never crosses
 // a CPU conversion pass).
+// NOTE: bit-convert explicitly (u16 << 16 into f32 bits) instead of
+// __bfloat162float — the intrinsic path produced garbage on sm_103a
+// (unit-test verified: got 0x473f0000(48896) for bf16 0xbf78(-0.97));
+// the bit form is the mathematically identical expansion (bf16 IS the
+// high 16 bits of f32) with zero intrinsic dependency.
 __global__ void bf16_to_f32_kernel(const unsigned short* __restrict__ in,
                                     float* __restrict__ out, long n) {
     long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] = __bfloat162float(in[i]);
+    if (i < n) out[i] = __uint_as_float(((unsigned)in[i]) << 16);
 }
 
 extern "C" cudaError_t ferrite_bf16_to_f32(const void* in, void* out,

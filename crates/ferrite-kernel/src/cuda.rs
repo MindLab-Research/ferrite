@@ -661,6 +661,8 @@ impl Default for CudaBackend {
 
 // fp8 dequant D2H verify counter (first 3 per process — mmap debug only)
 static FP8_DBG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+// hc_pre input dump counter (first call per process — mmap garbage hunt)
+static HC_DBG_ONCE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 impl CudaBackend {
     /// Loads libferrite_kernels.so's dependency closure (cudart) and
@@ -1372,6 +1374,73 @@ impl CudaBackend {
             CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
         );
         Ok(())
+    }
+
+    // ============================================================
+    // GPU kernel unit-test probes (doc(hidden) — used by
+    // tests/bf16_widen_gpu.rs to validate the mmap preload path's kernels
+    // in isolation on real hardware; NOT part of the serving path).
+    // ============================================================
+
+    /// Direct ferrite_bf16_to_f32 kernel roundtrip: bf16 bytes → GPU
+    /// staging → kernel → f32 readback. Tests the kernel itself (the mmap
+    /// path's widen + preload_bf16_to_f32_raw both feed this kernel; the
+    /// serve logs showed its output as garbage while memcpy paths verified
+    /// correct — this probe isolates exactly that kernel).
+    #[doc(hidden)]
+    pub fn dbg_kernel_bf16_to_f32(&self, bf16: &[u8]) -> Result<Vec<f32>> {
+        assert_eq!(bf16.len() % 2, 0);
+        let numel = bf16.len() / 2;
+        self.enter();
+        let mut staging: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut staging, bf16.len()) }, "dbg staging malloc")?;
+        ck(
+            unsafe { cudaMemcpy(staging, bf16.as_ptr() as *const _, bf16.len(), CUDA_MEMCPY_H2D) },
+            "dbg staging H2D",
+        )?;
+        let mut out: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut out, numel * 4) }, "dbg out malloc")?;
+        ck(
+            unsafe { ferrite_bf16_to_f32(staging, out as *mut f32, numel as i64, self.stream) },
+            "dbg kernel bf16→f32",
+        )?;
+        self.sync()?;
+        let mut v = vec![0f32; numel];
+        ck(
+            unsafe { cudaMemcpy(v.as_mut_ptr() as *mut _, out, numel * 4, 2 /* D2H */) },
+            "dbg out D2H",
+        )?;
+        unsafe { cudaFree(staging) };
+        unsafe { cudaFree(out) };
+        Ok(v)
+    }
+
+    /// Read back the f32 residency a placeholder's dev_weight resolves to
+    /// (covers both the direct preload key and the bf16-widen recovery path).
+    #[doc(hidden)]
+    pub fn dbg_dev_f32(&self, t: &Tensor) -> Result<Vec<f32>> {
+        let dw = self.dev_weight(t)?;
+        self.enter();
+        let mut v = vec![0f32; dw.len];
+        ck(
+            unsafe { cudaMemcpy(v.as_mut_ptr() as *mut _, dw.ptr, dw.len * 4, 2 /* D2H */) },
+            "dbg dev f32 D2H",
+        )?;
+        Ok(v)
+    }
+
+    /// Read back the bf16 residency a placeholder's dev_weight_bf16 resolves
+    /// to, widened to f32 host-side (bf16 u16 << 16) for comparison.
+    #[doc(hidden)]
+    pub fn dbg_dev_bf16_as_f32(&self, t: &Tensor) -> Result<Vec<f32>> {
+        let dw = self.dev_weight_bf16(t)?;
+        self.enter();
+        let mut raw = vec![0u16; dw.len];
+        ck(
+            unsafe { cudaMemcpy(raw.as_mut_ptr() as *mut _, dw.ptr, dw.len * 2, 2 /* D2H */) },
+            "dbg dev bf16 D2H",
+        )?;
+        Ok(raw.into_iter().map(|b| f32::from_bits((b as u32) << 16)).collect())
     }
 
     /// f32 raw → resident f32 (VERBATIM — the mmap bytes ARE the device
@@ -3947,6 +4016,24 @@ impl CudaBackend {
         let dsc = self.dev_weight(scale)?;
         let dba = self.dev_weight(base)?;
         let dnw = self.dev_weight(norm_w)?;
+        // hc-pre input dump (first call per process): the mmap path's hc_pre
+        // output explodes (hn0 ±41056 vs expected ~O(1)) despite all weights
+        // verifying equal — dump the ACTUAL device values of fw/scale/base/nw
+        // to find which input is wrong. Expected (checkpoint): fw ~O(1),
+        // scale [0.06-0.09], base ~-7.6, nw ~1.45, res ~0.001.
+        if HC_DBG_ONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 1 {
+            let rd = |p: *const std::ffi::c_void, cnt: usize, tag: &str| unsafe {
+                let mut buf = vec![0f32; cnt];
+                cudaMemcpy(buf.as_mut_ptr() as *mut _, p, cnt * 4, 2 /* D2H */);
+                eprintln!("[hc-dbg] {tag}: {:?} (ptr={:p})", &buf, p);
+            };
+            let _ = self.sync();
+            rd(dfw.ptr as *const _, 4, "fw[24,16384] widen");
+            rd(dsc.ptr as *const _, 3, "scale[3]");
+            rd(dba.ptr as *const _, 4, "base[24]");
+            rd(dnw.ptr as *const _, 4, "nw[4096]");
+            rd(res.as_const_f32() as *const _, 4, "res");
+        }
         let li = DevBuf::alloc(self.dev, self.stream, s * h)?;
         let post = DevBuf::alloc(self.dev, self.stream, s * n)?;
         let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
