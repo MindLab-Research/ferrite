@@ -145,6 +145,7 @@ extern "C" {
                                   staging_local: *const f32,
                                   ready_local: *const u32,
                                   out: *mut f32, n: i32, world: i32, my_rank: i32,
+                                  stride: i32,
                                   s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
@@ -3915,6 +3916,7 @@ impl CudaBackend {
                 n as i32,
                 st.world as i32,
                 self.dev as i32,
+                st.max_n as i32, // staging row stride ([2][world][max_n] layout)
                 self.stream,
             )
         }, "p2p_ar_v2")?;

@@ -4012,15 +4012,15 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot(
 // ============================================================
 __global__ void p2p_ar_down_v2_kernel(
     const float* __restrict__ partial,          // this rank's partial [n]
-    float* const* __restrict__ staging_tbl,     // [world] peers' staging bases ([2][world][n])
+    float* const* __restrict__ staging_tbl,     // [world] peers' staging bases ([2][world][stride])
     unsigned* const* __restrict__ ready_tbl,    // [world] peers' flag rows ([world] u32)
     unsigned* epoch, unsigned* ctr,             // this rank's device counters
-    int world, int my_rank, int n) {
+    int world, int my_rank, int n, int stride) {
     unsigned e = *epoch; // this call's epoch (pre-advance)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float v = partial[i];
-        const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)n + (unsigned)i);
+        const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)i);
         #pragma unroll 4
         for (int r = 0; r < world; r++) staging_tbl[r][off] = v;
     }
@@ -4038,10 +4038,10 @@ __global__ void p2p_ar_down_v2_kernel(
 }
 
 __global__ void p2p_ar_sum_v2_kernel(
-    const float* __restrict__ staging_local,   // my [2][world][n]
+    const float* __restrict__ staging_local,   // my [2][world][stride]
     const unsigned* __restrict__ ready_local,   // my [world] epoch stamps
     const unsigned* epoch,                      // (= e+1 after my down)
-    float* __restrict__ out, int world, int n) {
+    float* __restrict__ out, int world, int n, int stride) {
     unsigned e2 = *epoch; // the round this sum completes (down's e+1)
     if (threadIdx.x == 0) { // every block spins until all ranks' flags reach e2
         for (int r = 0; r < world; r++)
@@ -4053,7 +4053,7 @@ __global__ void p2p_ar_sum_v2_kernel(
         int par = (int)((e2 - 1u) & 1u);
         float acc = 0.f;
         for (int r = 0; r < world; r++)
-            acc += staging_local[(size_t)(par * world + r) * n + i];
+            acc += staging_local[(size_t)(par * world + r) * stride + i];
         out[i] = acc;
     }
 }
@@ -4062,16 +4062,16 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot_v2(
     const float* partial, float* const* staging_tbl,
     unsigned* const* ready_tbl, unsigned* epoch, unsigned* ctr,
     const float* staging_local, const unsigned* ready_local,
-    float* out, int n, int world, int my_rank, cudaStream_t s) {
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
     int threads = 256;
     int blocks = (n + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     p2p_ar_down_v2_kernel<<<blocks, threads, 0, s>>>(
-        partial, staging_tbl, ready_tbl, epoch, ctr, world, my_rank, n);
+        partial, staging_tbl, ready_tbl, epoch, ctr, world, my_rank, n, stride);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
     p2p_ar_sum_v2_kernel<<<blocks, threads, 0, s>>>(
-        staging_local, ready_local, epoch, out, world, n);
+        staging_local, ready_local, epoch, out, world, n, stride);
     return cudaGetLastError();
 }
 
