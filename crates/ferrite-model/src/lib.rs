@@ -9,12 +9,14 @@
 
 mod checkpoint;
 mod config;
+pub mod direct;
 mod layer;
 mod safetensors;
 mod weights;
 
 pub use checkpoint::{load_hf_checkpoint, CheckpointReport};
 pub use config::{DsaConfig, Glm53FlashConfig, LayerType, LinearAttnConfig, MlpType};
+pub use direct::{load_direct, DirectView, DirectWeights, Seg, WeightView};
 pub use layer::{build_layer_plans, AttnKind, LayerPlan, MlpKind};
 pub use safetensors::{load_safetensors_dir, load_safetensors_file};
 pub use weights::{apply_fused_aliases, random_weights, weight_layout, Fp8Weight, WeightLayout, Weights, Weights8};

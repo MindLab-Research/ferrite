@@ -34,7 +34,60 @@ use rayon::prelude::*;
 use crate::config::{Glm53FlashConfig, LayerType, MlpType};
 use crate::weights::{weight_layout, Weights};
 
-const FP8_BLOCK: usize = 128;
+pub(crate) const FP8_BLOCK: usize = 128;
+
+/// The ferrite-name → checkpoint-name mapping (one source of truth for
+/// the legacy f32 loader AND the mmap direct loader: fused qkv/conv
+/// conventions, the `model.language_model` prefix, MTP-layer skips).
+/// Empty src marks a skip (the legacy loader logs it as unsupported).
+pub fn checkpoint_jobs(cfg: &Glm53FlashConfig) -> Vec<(String, String)> {
+    let lm = "model.language_model";
+    let mut jobs: Vec<(String, String)> = Vec::new(); // (ferrite name, checkpoint src or "")
+    for spec in crate::weights::weight_layout(cfg).specs {
+        let name = spec.name;
+        let src = if let Some(pfx) = name.strip_suffix("qkv_proj.weight") {
+            let base = pfx.strip_prefix("model.").unwrap_or(pfx).to_string();
+            let src = format!("{lm}.{base}__FUSED_QKV__");
+            jobs.push((name, src));
+            continue;
+        } else if let Some(pfx) = name.strip_suffix("qkv_conv1d.weight") {
+            let base = pfx.strip_prefix("model.").unwrap_or(pfx).to_string();
+            let src = format!("{lm}.{base}__FUSED_CONV__");
+            jobs.push((name, src));
+            continue;
+        } else if name == "model.embed_tokens.weight" {
+            format!("{lm}.embed_tokens.weight")
+        } else if name == "model.norm.weight" {
+            format!("{lm}.norm.weight")
+        } else if name == "lm_head.weight" {
+            "lm_head.weight".to_string()
+        } else if let Some(rest) = name.strip_prefix("model.layers.") {
+            let (l, r) = match rest.split_once('.') {
+                Some(x) => x,
+                None => {
+                    jobs.push((name, String::new()));
+                    continue;
+                }
+            };
+            let lidx: usize = l.parse().unwrap_or(usize::MAX);
+            if lidx > cfg.num_hidden_layers {
+                jobs.push((name, String::new()));
+                continue;
+            }
+            // lidx == num_hidden_layers: the MTP (nextn) layer — eh_proj /
+            // enorm / hnorm / DSA attn / MoE mlp / shared_head.norm flow
+            // through the same name mapping as decoder layers.
+            // shared_expert (ferrite) → shared_experts (checkpoint, plural)
+            let r = r.replacen("shared_expert.", "shared_experts.", 1);
+            format!("{lm}.layers.{l}.{r}")
+        } else {
+            jobs.push((name, String::new()));
+            continue;
+        };
+        jobs.push((name, src));
+    }
+    jobs
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RawDType {
@@ -296,7 +349,7 @@ pub fn is_fp8_eligible(src: &str, layer_idx: Option<usize>, cfg: &Glm53FlashConf
     false
 }
 
-fn layer_idx_of(src: &str) -> Option<usize> {
+pub(crate) fn layer_idx_of(src: &str) -> Option<usize> {
     let m = src.find("layers.")?;
     let after = &src[m + 7..];
     let end = after.find('.')?;
@@ -398,53 +451,10 @@ pub fn load_hf_checkpoint(
 ) -> Result<(Weights, crate::weights::Weights8, CheckpointReport)> {
     let (files, index) = scan_headers(dir)?;
     let mut rep = CheckpointReport::default();
-    let lm = "model.language_model";
 
-    // ---- build the job list (pure name mapping, no I/O) ----
-    let mut jobs: Vec<(String, String)> = Vec::new(); // (ferrite name, checkpoint src or "")
-    for spec in weight_layout(cfg).specs {
-        let name = spec.name;
-        let src = if let Some(pfx) = name.strip_suffix("qkv_proj.weight") {
-            let base = pfx.strip_prefix("model.").unwrap_or(pfx).to_string();
-            let src = format!("{lm}.{base}__FUSED_QKV__");
-            jobs.push((name, src));
-            continue;
-        } else if let Some(pfx) = name.strip_suffix("qkv_conv1d.weight") {
-            let base = pfx.strip_prefix("model.").unwrap_or(pfx).to_string();
-            let src = format!("{lm}.{base}__FUSED_CONV__");
-            jobs.push((name, src));
-            continue;
-        } else if name == "model.embed_tokens.weight" {
-            format!("{lm}.embed_tokens.weight")
-        } else if name == "model.norm.weight" {
-            format!("{lm}.norm.weight")
-        } else if name == "lm_head.weight" {
-            "lm_head.weight".to_string()
-        } else if let Some(rest) = name.strip_prefix("model.layers.") {
-            let (l, r) = match rest.split_once('.') {
-                Some(x) => x,
-                None => {
-                    rep.skipped_unsupported.push(name.clone());
-                    continue;
-                }
-            };
-            let lidx: usize = l.parse().unwrap_or(usize::MAX);
-            if lidx > cfg.num_hidden_layers {
-                rep.skipped_unsupported.push(name.clone());
-                continue;
-            }
-            // lidx == num_hidden_layers: the MTP (nextn) layer — eh_proj /
-            // enorm / hnorm / DSA attn / MoE mlp / shared_head.norm flow
-            // through the same name mapping as decoder layers.
-            // shared_expert (ferrite) → shared_experts (checkpoint, plural)
-            let r = r.replacen("shared_expert.", "shared_experts.", 1);
-            format!("{lm}.layers.{l}.{r}")
-        } else {
-            rep.skipped_unsupported.push(name.clone());
-            continue;
-        };
-        jobs.push((name, src));
-    }
+    // ---- build the job list (pure name mapping, no I/O — shared with
+    // the mmap direct loader: `checkpoint_jobs` is the single source) ----
+    let jobs = checkpoint_jobs(cfg);
 
     // ---- run jobs in parallel (rayon): each job reads + converts its own
     // tensors; FP8 dequant happens per-tensor inside load_named ----
@@ -570,7 +580,6 @@ mod tests {
             return;
         }
         let (files, index) = scan_headers(dir).unwrap();
-        let mut rep = CheckpointReport::default();
         // down_proj is fp8-ELIGIBLE → load_named serves the placeholder (no
         // dequantized f32). Directly dequant here to validate the block-scale
         // math against the reference f32 values.

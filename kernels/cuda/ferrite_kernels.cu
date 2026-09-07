@@ -184,6 +184,69 @@ extern "C" cudaError_t ferrite_f32_to_bf16(const float* in, void* out,
 }
 
 // ============================================================
+// Direct-load kernels (mmap disk→GPU path — weights never materialize on
+// the CPU): the preload path H2Ds the checkpoint's raw bytes and converts
+// IN DEVICE MEMORY.
+//
+// dequant_e4m3_block: fp8 e4m3 [rows, cols] × 128×128 block scales →
+// bf16 resident (the CPU path's dequant_block + bf16-pack fused; the
+// e4m3→float conversion uses the fp8 intrinsic (half-raw — exact: e4m3's
+// 4-bit exponent/3-bit mantissa are representable in fp16), scale fetch
+// per element by (row/128, col/128) block index, bf16 truncate `>> 16`
+// — identical to the CPU pack's f32→bf16 rounding).
+// ============================================================
+__global__ void dequant_e4m3_block_kernel(const unsigned char* __restrict__ w,
+                                          const float* __restrict__ scale,
+                                          unsigned short* __restrict__ out,
+                                          long rows, long cols,
+                                          int srows, int scols) {
+    long total = rows * cols;
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += (long)gridDim.x * blockDim.x) {
+        long r = i / cols, c = i - r * cols;
+        int sr = (int)(r >> 7); if (sr >= srows) sr = srows - 1;
+        int sc = (int)(c >> 7); if (sc >= scols) sc = scols - 1;
+        float v = __half2float(__nv_cvt_fp8_to_halfraw(w[i], __NV_E4M3))
+                  * scale[(long)sr * scols + sc];
+        out[i] = (unsigned short)(__float_as_uint(v) >> 16);
+    }
+}
+
+extern "C" cudaError_t ferrite_dequant_e4m3_block(const void* w, const void* scale,
+                                                  void* out, long rows, long cols,
+                                                  int srows, int scols,
+                                                  cudaStream_t s) {
+    long total = rows * cols;
+    if (total <= 0) return cudaSuccess;
+    int threads = 256;
+    long blocks = (total + threads - 1) / threads;
+    if (blocks > (1L << 31) - 1) blocks = (1L << 31) - 1;
+    dequant_e4m3_block_kernel<<<(unsigned)blocks, threads, 0, s>>>(
+        (const unsigned char*)w, (const float*)scale, (unsigned short*)out,
+        rows, cols, srows, scols);
+    return cudaGetLastError();
+}
+
+// bf16 raw → f32 resident (the embed-table expand: checkpoint bf16 bytes
+// H2D'd straight from the mmap, expanded on device — 2.5 GB never crosses
+// a CPU conversion pass).
+__global__ void bf16_to_f32_kernel(const unsigned short* __restrict__ in,
+                                    float* __restrict__ out, long n) {
+    long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = __bfloat162float(in[i]);
+}
+
+extern "C" cudaError_t ferrite_bf16_to_f32(const void* in, void* out,
+                                           long n, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    int threads = 256;
+    long blocks = (n + threads - 1) / threads;
+    bf16_to_f32_kernel<<<(unsigned)blocks, threads, 0, s>>>(
+        (const unsigned short*)in, (float*)out, n);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // rmsnorm over the last dim: y = x / rms(x) * w
 // 256 threads per ROW (the old block(32,4) ran ONE warp per row — for
 // n=1 decode that was 32 threads serially scanning 4096 elements =

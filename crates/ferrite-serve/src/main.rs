@@ -18,6 +18,12 @@ use ferrite_model::{load_hf_checkpoint, Glm53FlashConfig};
 #[cfg(feature = "cuda")]
 mod gpu_engine;
 
+/// Direct mmap preload (disk→GPU without CPU materialization — the
+/// FERRITE_DIRECT_LOAD=1 path): TP windows mirrored from shard_weights_tp,
+/// mmap slices → the backend's direct-preload entry points.
+#[cfg(feature = "cuda")]
+mod direct_load;
+
 /// GLM chat format: <|prompt|>\n...<|im_end|>\n<|answer|>\n
 /// (token ids resolved from the tokenizer; falls back to raw text).
 fn wrap_prompt(text: &str) -> String {
@@ -74,20 +80,56 @@ fn main() {
         cfg.num_hidden_layers, cfg.vocab_size,
     );
 
-    // ---- weights (FP8 dequant + name mapping; large, ~660 GB f32 in RAM) ----
-    println!("[serve] loading checkpoint from {} ...", model_dir.display());
+    // ---- weights ----
+    // FERRITE_DIRECT_LOAD=1 (+ --backend cuda): the mmap direct path —
+    // placeholder tensors (shape-real, 4-elem data stubs) feed TpCluster's
+    // shape-only shard splits, and the preload phase streams the mmap
+    // slices into the device caches (bf16 verbatim / fp8 GPU dequant /
+    // bf16→f32 expand). The CPU never materializes a weight: legacy peak
+    // RSS was ~660GB of f32; the direct path maps the safetensors files
+    // and the page cache is the only host-side copy.
+    // W8A8 is incompatible with the direct path in v1 (the fp8 bypass
+    // registers CPU Vec bytes — direct dequants everything to bf16).
+    let use_direct = std::env::var_os("FERRITE_DIRECT_LOAD").is_some() && backend == "cuda";
+    if use_direct && std::env::var_os("FERRITE_W8A8").is_some() {
+        panic!("FERRITE_DIRECT_LOAD and FERRITE_W8A8 are mutually exclusive in v1 (the direct path dequants fp8 → bf16 resident)");
+    }
     let t0 = std::time::Instant::now();
-    let (weights, weights8, rep) = load_hf_checkpoint(&model_dir, &cfg)
-        .unwrap_or_else(|e| panic!("load checkpoint: {e}"));
-    println!(
-        "[serve] loaded {} tensors in {:.1}s (fp8-dequant: {}, fused: {}, skipped: {})",
-        rep.tensors_loaded,
-        t0.elapsed().as_secs_f32(),
-        rep.fp8_dequantized,
-        rep.fused_concat,
-        rep.skipped_unsupported.len(),
-    );
-    println!("[serve] mem RSS after load: {:.1} GB", rss_gb());
+    let direct: Option<std::sync::Arc<ferrite_model::direct::DirectView>> = if use_direct {
+        let dv = ferrite_model::direct::load_direct(&model_dir, &cfg)
+            .unwrap_or_else(|e| panic!("direct mmap load: {e}"));
+        println!(
+            "[serve] direct mmap view: {} weights mapped ({} views, page cache = the only host copy)",
+            dv.placeholders.len(),
+            dv.views.len(),
+        );
+        Some(std::sync::Arc::new(dv))
+    } else {
+        None
+    };
+    let (weights, weights8, _rep) = if let Some(dv) = &direct {
+        // placeholder table: shape-real stubs (the cluster's shard splits
+        // are shape-only on them — row_split/col_split's stub branch), the
+        // device caches key on their pointers; W8A8 is off (guarded above).
+        (dv.placeholders.clone(), Default::default(), ferrite_model::CheckpointReport::default())
+    } else {
+        // legacy: FP8 dequant + name mapping on the CPU (large, ~660 GB f32)
+        println!("[serve] loading checkpoint from {} ...", model_dir.display());
+        let (w, w8, r) = load_hf_checkpoint(&model_dir, &cfg)
+            .unwrap_or_else(|e| panic!("load checkpoint: {e}"));
+        println!(
+            "[serve] loaded {} tensors in {:.1}s (fp8-dequant: {}, fused: {}, skipped: {})",
+            r.tensors_loaded,
+            t0.elapsed().as_secs_f32(),
+            r.fp8_dequantized,
+            r.fused_concat,
+            r.skipped_unsupported.len(),
+        );
+        (w, w8, r)
+    };
+    if direct.is_none() {
+        println!("[serve] mem RSS after load: {:.1} GB", rss_gb());
+    }
 
     // ---- serve mode (--serve): the OpenAI-compatible HTTP/SSE API ----
     // (SSE streaming + concurrent requests over the CUDA cluster; see
@@ -107,6 +149,7 @@ fn main() {
             port,
             max_seqs,
             model_name,
+            direct,
         );
         #[cfg(not(feature = "cuda"))]
         {
@@ -141,7 +184,7 @@ fn main() {
     let t1 = std::time::Instant::now();
     let world_tp = if backend == "cuda" { tp } else { 1 };
     let new_tokens: Vec<u32> = match backend.as_str() {
-        "cuda" => run_cuda(cfg, weights, weights8, &ids, max_tokens, &stop, &lib, world_tp),
+        "cuda" => run_cuda(cfg, weights, weights8, &ids, max_tokens, &stop, &lib, world_tp, direct),
         _ => run_cpu(cfg, weights, &ids, max_tokens, &stop),
     };
     let dt = t1.elapsed().as_secs_f64();
@@ -218,12 +261,13 @@ fn run_cuda(
     stop: &[u32],
     lib: &str,
     tp: usize,
+    direct: Option<std::sync::Arc<ferrite_model::direct::DirectView>>,
 ) -> Vec<u32> {
     use ferrite_exec::tp::TpCluster;
     use ferrite_kernel::CudaBackend;
 
     let world = tp.max(1);
-    let mut cluster = TpCluster::new(cfg, &weights, world, |rank| {
+    let mut cluster = TpCluster::new(cfg.clone(), &weights, world, |rank| {
         CudaBackend::with_device(lib, rank as i32)
             .unwrap_or_else(|e| panic!("cuda backend rank {rank}: {e}"))
     });
@@ -245,12 +289,33 @@ fn run_cuda(
     // each rank thread binds its own device and streams its shard over
     // PCIe in parallel (serial was 606.8s; PCIe is per-device so the 4
     // uploads overlap almost perfectly).
+    //
+    // DIRECT path (FERRITE_DIRECT_LOAD=1): the mmap slices stream into
+    // the device caches through the direct-preload entry points (bf16
+    // verbatim / fp8 GPU dequant / bf16→f32 expand / pitched column
+    // windows) — the placeholder stubs in shard.weights carry the shapes
+    // and the runtime cache keys; the CPU f32 materialization never
+    // happens (the legacy branch below is the fallback).
     {
         let t0 = std::time::Instant::now();
+        let cfgref = &cfg; // &Config captured by ref into every rank closure
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for (rank, shard) in cluster.shards.iter().enumerate() {
+                let dv = direct.clone();
                 handles.push(scope.spawn(move || {
+                    if let Some(dv) = &dv {
+                        let st = crate::direct_load::direct_preload_shard(
+                            &shard.backend, dv, cfgref, rank, world, &shard.weights,
+                        )
+                        .unwrap_or_else(|e| panic!("direct preload rank {rank}: {e}"));
+                        println!(
+                            "[serve] rank {rank}: DIRECT mmap preload (bf16 rows {} cols {} full {} / fp8 rows {} cols {} / f32 {} / experts {})",
+                            st.bf16_rows, st.bf16_cols, st.bf16_full,
+                            st.fp8_rows, st.fp8_cols, st.f32_expand, st.experts,
+                        );
+                        return;
+                    }
                     let mut n_2d = 0usize;
                     let mut n_1d = 0usize;
                     let mut n_fp8 = 0usize;
@@ -401,6 +466,7 @@ fn run_cuda(
     _max_tokens: usize,
     _eos: u32,
     _lib: &str,
+    _direct: Option<std::sync::Arc<ferrite_model::direct::DirectView>>,
 ) -> Vec<u32> {
     panic!("ferrite-serve was built without the cuda feature (rebuild with --features ferrite-serve? no — build ferrite-kernel --features cuda first)");
 }
@@ -427,6 +493,7 @@ fn run_serve(
     port: u16,
     max_seqs: usize,
     model_name: String,
+    direct: Option<std::sync::Arc<ferrite_model::direct::DirectView>>,
 ) -> ! {
     use ferrite_exec::tp::TpCluster;
     use ferrite_http::api::{router, AppState};
@@ -437,7 +504,7 @@ fn run_serve(
     use std::sync::Arc;
 
     let world = tp.max(1);
-    let mut cluster = TpCluster::new(cfg, &weights, world, |rank| {
+    let mut cluster = TpCluster::new(cfg.clone(), &weights, world, |rank| {
         CudaBackend::with_device(lib, rank as i32)
             .unwrap_or_else(|e| panic!("cuda backend rank {rank}: {e}"))
     });
@@ -449,13 +516,29 @@ fn run_serve(
         cluster.shards[0].weights8.len()
     );
 
-    // Resident preload (concurrent per rank — same as run_cuda).
+    // Resident preload (concurrent per rank — same as run_cuda). DIRECT
+    // path: the mmap slices stream into the device caches (no CPU f32
+    // materialization); legacy: preload_weight over the f32 tensors.
     {
         let t0 = std::time::Instant::now();
+        let cfgref = &cfg; // &Config captured by ref into every rank closure
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for (rank, shard) in cluster.shards.iter().enumerate() {
+                let dv = direct.clone();
                 handles.push(scope.spawn(move || {
+                    if let Some(dv) = &dv {
+                        let st = crate::direct_load::direct_preload_shard(
+                            &shard.backend, dv, cfgref, rank, world, &shard.weights,
+                        )
+                        .unwrap_or_else(|e| panic!("direct preload rank {rank}: {e}"));
+                        println!(
+                            "[serve] rank {rank}: DIRECT mmap preload (bf16 rows {} cols {} full {} / fp8 rows {} cols {} / f32 {} / experts {})",
+                            st.bf16_rows, st.bf16_cols, st.bf16_full,
+                            st.fp8_rows, st.fp8_cols, st.f32_expand, st.experts,
+                        );
+                        return;
+                    }
                     let mut n_2d = 0usize;
                     let mut n_1d = 0usize;
                     let mut n_fp8 = 0usize;

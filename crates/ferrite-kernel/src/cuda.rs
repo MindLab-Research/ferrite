@@ -29,6 +29,15 @@ extern "C" {
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
+    fn cudaMemcpy2D(
+        dst: *mut std::ffi::c_void,
+        dpitch: usize,
+        src: *const std::ffi::c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+        kind: i32,
+    ) -> i32;
     fn cudaStreamCreate(stream: *mut CuStream) -> i32;
     fn cudaStreamSynchronize(stream: CuStream) -> i32;
     fn cudaGetErrorString(err: i32) -> *const std::os::raw::c_char;
@@ -153,6 +162,11 @@ extern "C" {
     fn ferrite_graph_launch(e: *mut std::ffi::c_void, s: CuStream) -> i32;
     fn ferrite_f32_to_bf16(in_: *const f32, out: *mut std::ffi::c_void,
                             n: i64, s: CuStream) -> i32;
+    fn ferrite_dequant_e4m3_block(w: *const u8, scale: *const f32, out: *mut std::ffi::c_void,
+                                  rows: i64, cols: i64, srows: i32, scols: i32,
+                                  s: CuStream) -> i32;
+    fn ferrite_bf16_to_f32(in_: *const std::ffi::c_void, out: *mut f32,
+                           n: i64, s: CuStream) -> i32;
     fn ferrite_rmsnorm(x: *const f32, w: *const f32, out: *mut f32,
                        n: i32, dim: i32, eps: f32, s: CuStream) -> i32;
     fn ferrite_hc_contract(x: *const f32, out: *mut f32,
@@ -903,9 +917,352 @@ impl CudaBackend {
         }
     }
 
-    /// Number of cached (device-resident) weights.
-    pub fn cached_weights(&self) -> usize {
-        self.weights.lock().unwrap().len()
+    /// bf16 raw → resident bf16 via a COLUMN window (TP col-split: down/
+    /// o_proj/eh_proj) — cudaMemcpy2D strided H2D straight from the mmap
+    /// slice (host pitch = full row, width = the shard's col window). No
+    /// CPU gather pass: the page cache streams the strided window.
+    pub fn preload_bf16_col_raw(
+        &self,
+        placeholder: &Tensor,
+        src: &[u8],       // mmap slice of the FULL [rows, full_cols] bf16 weight
+        rows: usize,
+        full_cols: usize,
+        c0: usize,
+        c1: usize,
+    ) -> Result<()> {
+        let shard_cols = c1 - c0;
+        let numel = placeholder.numel();
+        if numel != rows * shard_cols {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_bf16_col_raw: placeholder numel {numel} != {rows}x{shard_cols}"
+            )));
+        }
+        if src.len() != rows * full_cols * 2 {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_bf16_col_raw: src {} != {rows}x{full_cols} bf16",
+                src.len()
+            )));
+        }
+        self.enter();
+        let key = (placeholder.as_slice().as_ptr() as usize, numel << 1 | 1);
+        {
+            let cache = self.weights.lock().unwrap();
+            if let Some(cb) = cache.get(&key) {
+                if cb.len == numel {
+                    return Ok(());
+                }
+            }
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "bf16_col malloc")?;
+        ck(
+            unsafe {
+                cudaMemcpy2D(
+                    ptr,
+                    shard_cols * 2,                       // dst pitch: shard row bytes
+                    src.as_ptr().add(c0 * 2) as *const _,  // first window column
+                    full_cols * 2,                         // src pitch: full row bytes (mmap)
+                    shard_cols * 2,                        // width: window bytes
+                    rows,                                  // height
+                    CUDA_MEMCPY_H2D,
+                )
+            },
+            "bf16_col H2D (mmap strided window)",
+        )?;
+        self.weights.lock().unwrap().insert(
+            key,
+            CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
+        );
+        Ok(())
+    }
+
+    /// fp8 e4m3 + block scales → resident bf16, dequantized on the GPU, for
+    /// a TP COLUMN window (down_proj col-split): the fp8 window is a
+    /// cudaMemcpy2D strided H2D from the mmap slice; the scale window is
+    /// gathered on the host (KBs — [srows, c0/128..c1/128) of [srows,
+    /// full_cols/128], the only small CPU pass on the direct path).
+    pub fn preload_fp8_col_dequant(
+        &self,
+        placeholder: &Tensor,
+        src: &[u8],        // mmap slice of the FULL [rows, full_cols] fp8 weight
+        scale_full: &[f32], // full [srows, full_cols/128] scales (host-side, tiny)
+        rows: usize,
+        full_cols: usize,
+        c0: usize,
+        c1: usize,
+    ) -> Result<()> {
+        let shard_cols = c1 - c0;
+        let numel = placeholder.numel();
+        if numel != rows * shard_cols {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_fp8_col_dequant: numel {numel} != {rows}x{shard_cols}"
+            )));
+        }
+        let srows = rows.div_ceil(128);
+        let full_scols = full_cols.div_ceil(128);
+        let sc0 = c0 / 128;
+        let sc1 = c1.div_ceil(128);
+        let scols = sc1 - sc0;
+        if scale_full.len() != srows * full_scols {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_fp8_col_dequant: scale len {} != {srows}x{full_scols}",
+                scale_full.len()
+            )));
+        }
+        self.enter();
+        let key = (placeholder.as_slice().as_ptr() as usize, numel << 1 | 1);
+        {
+            let cache = self.weights.lock().unwrap();
+            if let Some(cb) = cache.get(&key) {
+                if cb.len == numel {
+                    return Ok(());
+                }
+            }
+        }
+        // fp8 window: strided H2D from the mmap slice
+        let mut w8: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut w8, numel) }, "fp8_col w8 malloc")?;
+        ck(
+            unsafe {
+                cudaMemcpy2D(
+                    w8,
+                    shard_cols,
+                    src.as_ptr().add(c0) as *const _,
+                    full_cols,
+                    shard_cols,
+                    rows,
+                    CUDA_MEMCPY_H2D,
+                )
+            },
+            "fp8_col H2D (mmap strided window)",
+        )?;
+        // scale window: host gather (KBs), then H2D
+        let mut scale: Vec<f32> = Vec::with_capacity(srows * scols);
+        for sr in 0..srows {
+            let base = sr * full_scols;
+            scale.extend_from_slice(&scale_full[base + sc0..base + sc1]);
+        }
+        let mut sc: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut sc, scale.len() * 4) }, "fp8_col scale malloc")?;
+        ck(unsafe { cudaMemcpy(sc, scale.as_ptr() as *const _, scale.len() * 4, CUDA_MEMCPY_H2D) }, "fp8_col scale H2D")?;
+        // GPU dequant → resident bf16
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "fp8_col bf16 malloc")?;
+        let conv = (|| -> Result<()> {
+            ck(
+                unsafe {
+                    ferrite_dequant_e4m3_block(
+                        w8 as *const u8,
+                        sc as *const f32,
+                        ptr,
+                        rows as i64,
+                        shard_cols as i64,
+                        srows as i32,
+                        scols as i32,
+                        self.stream,
+                    )
+                },
+                "fp8_col GPU dequant",
+            )
+        })();
+        self.sync()?;
+        unsafe {
+            cudaFree(w8);
+            cudaFree(sc);
+        }
+        conv?;
+        self.weights.lock().unwrap().insert(
+            key,
+            CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
+        );
+        Ok(())
+    }
+
+
+    // ============================================================
+    // DIRECT-LOAD preload API (mmap disk→GPU — weights never materialize
+    // on the CPU): the three entry points pair with `ferrite_model::direct`
+    // WeightViews. Cache keys are the PLACEHOLDER tensor's (ptr, numel)
+    // — the same keys dev_weight/dev_weight_bf16 compute at runtime, so
+    // the engine's zero-change lookups hit the direct-uploaded buffers.
+    // ============================================================
+
+    /// bf16 raw segments → resident bf16 (NO conversion — the checkpoint's
+    /// bf16 IS the resident layout). Segments concatenate in order (fused
+    /// qkv: q/k/v row-blocks); each cudaMemcpy's straight from the mmap
+    /// slice (page cache → PCIe DMA).
+    pub fn preload_bf16_raw(&self, placeholder: &Tensor, segments: &[&[u8]]) -> Result<()> {
+        let numel = placeholder.numel();
+        if numel == 0 {
+            return Ok(()); // TP shard placeholder (empty expert slice)
+        }
+        let total_bytes: usize = segments.iter().map(|s| s.len()).sum();
+        if total_bytes != numel * 2 {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_bf16_raw: {} bytes != numel {numel} * 2 (bf16)",
+                total_bytes
+            )));
+        }
+        self.enter();
+        let key = (placeholder.as_slice().as_ptr() as usize, numel << 1 | 1);
+        {
+            let cache = self.weights.lock().unwrap();
+            if let Some(cb) = cache.get(&key) {
+                if cb.len == numel {
+                    return Ok(()); // idempotent (re-preload of the same weight)
+                }
+            }
+        }
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "bf16_raw malloc")?;
+        let mut off = 0usize;
+        for seg in segments {
+            if seg.is_empty() {
+                continue;
+            }
+            ck(
+                unsafe {
+                    cudaMemcpy((ptr as *mut u8).add(off) as *mut _, seg.as_ptr() as *const _, seg.len(), CUDA_MEMCPY_H2D)
+                },
+                "bf16_raw segment H2D (mmap → device)",
+            )?;
+            off += seg.len();
+        }
+        self.weights.lock().unwrap().insert(
+            key,
+            CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
+        );
+        Ok(())
+    }
+
+    /// fp8 e4m3 + 128×128 block scales → resident bf16, dequantized ON
+    /// THE GPU (the legacy path's `to_f32` + `dequant_block` + CPU pack —
+    /// 3 passes over the weight + a 4× f32 materialization — replaced by
+    /// one fp8 H2D + one kernel). H2D sources are the mmap slices.
+    pub fn preload_fp8_dequant(
+        &self,
+        placeholder: &Tensor,
+        data: &[u8],
+        scale: &[f32],
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        let numel = placeholder.numel();
+        if numel == 0 {
+            return Ok(());
+        }
+        if data.len() != rows * cols {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_fp8_dequant: data {} != rows*cols {rows}*{cols}",
+                data.len()
+            )));
+        }
+        let srows = rows.div_ceil(128);
+        let scols = cols.div_ceil(128);
+        if scale.len() != srows * scols {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_fp8_dequant: scale {} != {srows}*{scols} (block 128)",
+                scale.len()
+            )));
+        }
+        self.enter();
+        let key = (placeholder.as_slice().as_ptr() as usize, numel << 1 | 1);
+        {
+            let cache = self.weights.lock().unwrap();
+            if let Some(cb) = cache.get(&key) {
+                if cb.len == numel {
+                    return Ok(());
+                }
+            }
+        }
+        // staging: fp8 bytes + scales (device, freed after the kernel)
+        let mut w8: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut sc: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut w8, data.len()) }, "fp8_dequant w8 malloc")?;
+        ck(unsafe { cudaMalloc(&mut sc, scale.len() * 4) }, "fp8_dequant scale malloc")?;
+        ck(unsafe { cudaMemcpy(w8, data.as_ptr() as *const _, data.len(), CUDA_MEMCPY_H2D) }, "fp8_dequant w8 H2D")?;
+        ck(unsafe { cudaMemcpy(sc, scale.as_ptr() as *const _, scale.len() * 4, CUDA_MEMCPY_H2D) }, "fp8_dequant scale H2D")?;
+        // resident bf16 output
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, numel * 2) }, "fp8_dequant bf16 malloc")?;
+        let conv = (|| -> Result<()> {
+            ck(
+                unsafe {
+                    ferrite_dequant_e4m3_block(
+                        w8 as *const u8,
+                        sc as *const f32,
+                        ptr,
+                        rows as i64,
+                        cols as i64,
+                        srows as i32,
+                        scols as i32,
+                        self.stream,
+                    )
+                },
+                "fp8 GPU dequant",
+            )
+        })();
+        // staging freed after the kernel completes (sync — load path, not
+        // steady-state; freeing in-flight DMA target memory would race).
+        self.sync()?;
+        unsafe {
+            cudaFree(w8);
+            cudaFree(sc);
+        }
+        conv?;
+        self.weights.lock().unwrap().insert(
+            key,
+            CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
+        );
+        Ok(())
+    }
+
+    /// bf16 raw → resident f32 (GPU expand — the embed table's f32 cache:
+    /// the bf16→f32 widening happens on device; 2.5 GB never crosses a CPU
+    /// conversion pass). Cache key is the f32 dev_weight's (ptr, numel).
+    pub fn preload_bf16_to_f32_raw(&self, placeholder: &Tensor, bf16_bytes: &[u8]) -> Result<()> {
+        let numel = placeholder.numel();
+        if numel == 0 {
+            return Ok(());
+        }
+        if bf16_bytes.len() != numel * 2 {
+            return Err(FerriteError::InvalidArg(format!(
+                "preload_bf16_to_f32_raw: {} bytes != numel {numel} * 2",
+                bf16_bytes.len()
+            )));
+        }
+        self.enter();
+        let key = (placeholder.as_slice().as_ptr() as usize, numel);
+        {
+            let cache = self.weights.lock().unwrap();
+            if let Some(cb) = cache.get(&key) {
+                if cb.len == numel {
+                    return Ok(());
+                }
+            }
+        }
+        let mut staging: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut staging, numel * 2) }, "bf16f32 staging malloc")?;
+        ck(
+            unsafe { cudaMemcpy(staging, bf16_bytes.as_ptr() as *const _, numel * 2, CUDA_MEMCPY_H2D) },
+            "bf16f32 H2D (mmap → device)",
+        )?;
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, numel * 4) }, "bf16f32 out malloc")?;
+        let conv = (|| -> Result<()> {
+            ck(
+                unsafe { ferrite_bf16_to_f32(staging, ptr as *mut f32, numel as i64, self.stream) },
+                "bf16→f32 GPU expand",
+            )
+        })();
+        self.sync()?;
+        unsafe { cudaFree(staging) };
+        conv?;
+        self.weights.lock().unwrap().insert(
+            key,
+            CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
+        );
+        Ok(())
     }
 
     /// Free all cached device weights (explicit; the Drop impl does it too).
