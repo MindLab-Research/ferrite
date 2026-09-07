@@ -1883,7 +1883,7 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
 // Grid: (out_f + rpb - 1)/rpb blocks (NO ×n — each block computes one
 // row's n outputs). Registers: NT accumulators/lane (NT<=16 — 16 floats).
 // ============================================================
-template <int NT>
+template <int NT, int WPR>
 __global__ void gemv_bf16_nt_kernel(const float* __restrict__ x,
                                     const __nv_bfloat16* __restrict__ w,
                                     const float* __restrict__ bias,
@@ -1969,16 +1969,27 @@ extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
     int rpb = 8 / wpr;
     dim3 grid((out_f + rpb - 1) / rpb);
     const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    // double dispatch (NT × WPR — the v2 heuristic's per-out_f K-split):
+    // macro-instantiated switch (9 NT values × 4 WPR lanes = 36 kernels,
+    // same code path per instantiation — no register bloat beyond NT).
+#define NT_CASE(NTV, WPRV) gemv_bf16_nt_kernel<NTV, WPRV><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f)
+#define NT_SWITCH_W(NTV) \
+    switch (wpr) { \
+        case 1:  NT_CASE(NTV, 1);  break; \
+        case 2:  NT_CASE(NTV, 2);  break; \
+        case 4:  NT_CASE(NTV, 4);  break; \
+        default: NT_CASE(NTV, 8);  break; \
+    }
     switch (nrows) {
-        case 2:  gemv_bf16_nt_kernel<2> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 3:  gemv_bf16_nt_kernel<3> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 4:  gemv_bf16_nt_kernel<4> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 5:  gemv_bf16_nt_kernel<5> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 6:  gemv_bf16_nt_kernel<6> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 7:  gemv_bf16_nt_kernel<7> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 8:  gemv_bf16_nt_kernel<8> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 12: gemv_bf16_nt_kernel<12><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
-        case 16: gemv_bf16_nt_kernel<16><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 2:  NT_SWITCH_W(2); break;
+        case 3:  NT_SWITCH_W(3); break;
+        case 4:  NT_SWITCH_W(4); break;
+        case 5:  NT_SWITCH_W(5); break;
+        case 6:  NT_SWITCH_W(6); break;
+        case 7:  NT_SWITCH_W(7); break;
+        case 8:  NT_SWITCH_W(8); break;
+        case 12: NT_SWITCH_W(12); break;
+        case 16: NT_SWITCH_W(16); break;
         default: return cudaErrorNotSupported; // host falls back to v2 batched
     }
     return cudaGetLastError();
