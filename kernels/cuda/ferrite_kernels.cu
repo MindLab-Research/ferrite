@@ -3632,6 +3632,23 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
         for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
         mx_partial[((size_t)t * mix + m) * KS + z] = tot;
     }
+    // Σx² fusion (m==0 lane only): this block ALREADY reads x[lo, hi) for
+    // the mix dot — the z-segment's Σx² rides free. The rest kernel's P1
+    // prologue re-read the full nh (16K floats, ~15µs × 90/step = 1.35ms)
+    // just for rsqrt(Σx²/nh + eps); it now reduces these KS partials
+    // (8 adds) instead. Scratch tail: mx_partial[s*mix*KS + t*KS + z].
+    if (m == 0) {
+        float sq = 0.f;
+        for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) sq += x[i] * x[i];
+        for (int off = 16; off > 0; off >>= 1) sq += __shfl_down_sync(0xffffffff, sq, off);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float tot2 = 0.f;
+            for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot2 += red[w];
+            mx_partial[(size_t)s * mix * KS + (size_t)t * KS + z] = tot2;
+        }
+    }
     (void)rms_eps;
 }
 
@@ -3662,16 +3679,16 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     // and apply rsq (Σx² block reduce — was phase-1 per-block redundant).
     // mx_in layout: [t][mix][ks] partials from hc_pre_mix_split_kernel.
     {
-        float part = 0.f;
-        for (int i = threadIdx.x; i < nh; i += blockDim.x) part += x[i] * x[i];
-        for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffff, part, off);
-        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = part;
-        __syncthreads();
+        // Σx² FUSED into the mix_split (m==0 lanes): the tail [s][mix_ks]
+        // scratch holds the z-segment partials — 8 adds replace the full nh
+        // re-read (16K floats ~15µs × 90/step = 1.35ms).
         float msq = 0.f;
         if (threadIdx.x == 0) {
-            for (int w = 0; w < 32; w++) if (w < (blockDim.x + 31) >> 5) msq += red[w];
+            const float* xsq = mx_in + (size_t)s * mix * mix_ks;
+            for (int z = 0; z < mix_ks; z++) msq += xsq[(size_t)t * mix_ks + z];
             red[39] = rsqrtf(msq / (float)nh + rms_eps);
         }
+        __syncthreads();
         // reduce partials: thread m sums its mix row's ks lanes
         for (int m = threadIdx.x; m < mix; m += blockDim.x) {
             float acc = 0.f;
