@@ -101,6 +101,31 @@ extern "C" {
                             n: i32, select_k: i32, kpool: i32, max_npools: i32,
                             total_ptr: *const i32, n_fixed: i32,
                             s: CuStream) -> i32;
+    fn ferrite_dsa_append_batched(kvb: *const f32, ki: *const f32, gate: *const f32,
+                                   kn_tbl: *const *mut f32, v_tbl: *const *mut f32,
+                                   kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
+                                   t0_tbl: *const *const i32,
+                                   b: i32, h: i32, dk: i32, dv: i32, idm: i32,
+                                   s: CuStream) -> i32;
+    fn ferrite_kpool_compress_batched(kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
+                                       ape: *const f32, pool_keys: *mut f32,
+                                       total_tbl: *const *const i32,
+                                       b: i32, max_npools: i32, kpool: i32, idm: i32,
+                                       s: CuStream) -> i32;
+    fn ferrite_indexer_topk_batched(qi: *const f32, pool_keys: *const f32, w: *const f32,
+                                     idx: *mut f32, b: i32, ih: i32, idm: i32,
+                                     select_k_max: i32, kpool: i32, max_npools: i32,
+                                     total_tbl: *const *const i32,
+                                     s: CuStream) -> i32;
+    fn ferrite_pool_expand_batched(idx_pools: *const f32, idx: *mut f32,
+                                   b: i32, select_k_max: i32, kpool: i32, max_npools: i32,
+                                   total_tbl: *const *const i32, n_fixed: i32,
+                                   s: CuStream) -> i32;
+    fn ferrite_sparse_attn_v2_batched(q: *const f32, k_tbl: *const *mut f32, v_tbl: *const *mut f32,
+                                       idx: *const f32, out: *mut f32, b: i32,
+                                       total_tbl: *const *const i32,
+                                       h: i32, d: i32, dv: i32, topk: i32,
+                                       s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_pdl_exp(mode: i32, iters: i32, out_time_ms: *mut f32,
                        out_checksum: *mut f32, s: CuStream) -> i32;
@@ -550,6 +575,12 @@ pub struct CudaBackend {
     /// composition: the (seq, layer) state addresses are stable). Purged
     /// when free_seq drops a member (the tables would dangle).
     gdn_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, Vec<u64>), (*mut std::ffi::c_void, *mut std::ffi::c_void)>>,
+    /// Batched per-seq DSA tables: (family, seq-set) → 6 device pointer
+    /// arrays ([B] k_nope / v / k_idx / k_gate cache ptrs + [B] PINNED
+    /// t0 / total int ptrs — the kernels dereference the pinned ints
+    /// zero-copy, host-written per step: graph-safe). cudaMalloc'd + memcpy'd
+    /// once per composition; purged by free_seq when a member cache dies.
+    dsa_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, Vec<u64>), DsaBatchTables>>,
     /// W8A8 mega-quant scratch per in_f (v3 gemv): [amax_bits, cnt, cnt2, xs,
     /// xq[in_f]] — the cooperative in-kernel quant's barrier state + shared
     /// xq. Allocated once (lazy) per width; the kernel TAIL resets the
@@ -620,6 +651,7 @@ impl CudaBackend {
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             gdn_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dsa_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             w8a8_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1785,6 +1817,24 @@ impl DsaCacheState {
     }
 }
 
+/// Device pointer tables for the BATCHED DSA kernels: [B] arrays of the
+/// per-seq cache pointers (kn/v/kidx/kgate — stable for the caches'
+/// lifetime) + [B] arrays of the per-seq PINNED t0/total int POINTERS
+/// (kernels deref zero-copy; the ints are host-written per step —
+/// graph-safe). One (family, seq-set) composition → one table set,
+/// cudaMalloc'd + memcpy'd once, cached, purged by free_seq.
+#[derive(Clone, Copy)]
+pub struct DsaBatchTables {
+    pub kn: *mut std::ffi::c_void,
+    pub v: *mut std::ffi::c_void,
+    pub kidx: *mut std::ffi::c_void,
+    pub kgate: *mut std::ffi::c_void,
+    pub t0p: *mut std::ffi::c_void,
+    pub totp: *mut std::ffi::c_void,
+}
+unsafe impl Send for DsaBatchTables {}
+unsafe impl Sync for DsaBatchTables {}
+
 /// Weight set for one DSA layer's device chain (borrowed from the shard
 /// Engine's weights — all hit the dev_weight caches after preload).
 pub struct DsaLayerWeights<'a> {
@@ -1880,6 +1930,62 @@ impl CudaBackend {
         let g = mk(&gdn_ptrs)?;
         self.gdn_tbl_cache.lock().unwrap().insert(key, (c, g));
         Ok((c as *const *mut f32, g as *const *mut f32))
+    }
+
+    /// Batched DSA per-seq pointer tables: (family, seq-set) → 6 device
+    /// [B] arrays — k_nope/v/k_idx/k_gate cache pointers (stable for the
+    /// caches' lifetime) + the per-seq PINNED t0/total int POINTERS (the
+    /// kernels dereference them zero-copy; the host writes the ints per
+    /// step — the same graph-safe mechanism as the per-seq kernels' single
+    /// pinned pointer). cudaMalloc'd + memcpy'd ONCE per composition, cached
+    /// (the capture pass re-uses the same pointers); purged by free_seq.
+    /// REQUIRES all (seq, family) caches to exist (the caller's bookkeeping
+    /// loop get-or-creates them first).
+    fn dsa_ptr_tables(&self, family: usize, seqs: &[u64]) -> Result<DsaBatchTables> {
+        let key = (family, seqs.to_vec());
+        {
+            let m = self.dsa_tbl_cache.lock().unwrap();
+            if let Some(&t) = m.get(&key) {
+                return Ok(t);
+            }
+        }
+        let mut kn: Vec<*mut f32> = Vec::with_capacity(seqs.len());
+        let mut vv: Vec<*mut f32> = Vec::with_capacity(seqs.len());
+        let mut ki_: Vec<*mut f32> = Vec::with_capacity(seqs.len());
+        let mut kg: Vec<*mut f32> = Vec::with_capacity(seqs.len());
+        let mut t0p: Vec<*const i32> = Vec::with_capacity(seqs.len());
+        let mut totp: Vec<*const i32> = Vec::with_capacity(seqs.len());
+        {
+            let m = self.dsa_caches.lock().unwrap();
+            for &s in seqs {
+                let c = m
+                    .get(&(s, family))
+                    .ok_or_else(|| FerriteError::InvalidArg(format!("no dsa cache ({s},{family}) for batched tables")))?;
+                kn.push(c.k_nope as *mut f32);
+                vv.push(c.v as *mut f32);
+                ki_.push(c.k_idx as *mut f32);
+                kg.push(c.k_gate as *mut f32);
+                t0p.push(c.pinned_t0 as *const i32);
+                totp.push(c.pinned_total as *const i32);
+            }
+        }
+        let mk = |src: *const u8, len: usize| -> Result<*mut std::ffi::c_void> {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            ck(unsafe { cudaMalloc(&mut p, len) }, "dsa tbl malloc")?;
+            ck(unsafe { cudaMemcpy(p, src as *const _, len, CUDA_MEMCPY_H2D) }, "dsa tbl H2D")?;
+            Ok(p)
+        };
+        let b = seqs.len() * std::mem::size_of::<*mut f32>();
+        let t = DsaBatchTables {
+            kn: mk(kn.as_ptr() as *const u8, b)?,
+            v: mk(vv.as_ptr() as *const u8, b)?,
+            kidx: mk(ki_.as_ptr() as *const u8, b)?,
+            kgate: mk(kg.as_ptr() as *const u8, b)?,
+            t0p: mk(t0p.as_ptr() as *const u8, b)?,
+            totp: mk(totp.as_ptr() as *const u8, b)?,
+        };
+        self.dsa_tbl_cache.lock().unwrap().insert(key, t);
+        Ok(t)
     }
 
     /// Whole GDN (linear-attention) layer on device. `x` is the layer's
@@ -2506,20 +2612,16 @@ impl CudaBackend {
             "dsa_widx_scale_batched",
         )?;
 
-        // Per-seq: cache append + kpool + topk + expand + attention.
-        // Scratch buffers allocated OUTSIDE the loop (attn_out [B, h*dv]
-        // accumulates all rows for the shared o_proj; per-iteration scratch
-        // reuses the same pool addresses deterministically — graph-stable).
+        // Per-seq HOST bookkeeping ONLY (get-or-create the (seq, family)
+        // caches, advance t_count, write the pinned t0/total ints the batched
+        // kernels read zero-copy via the [B] pointer tables). The returned
+        // raw pointers are unused here — the tables reach them by (family,
+        // seq-set).
         let max_npools = (8192 + kpool - 1) / kpool;
         let attn_out = DevBuf::alloc(self.dev, self.stream, n * h * dv)?;
         let dape = self.dev_weight(w.ape)?;
-        for (r, &seq_r) in seqs.iter().enumerate() {
-            // 7. cache append — (seq_r, family) get-or-create + host t0
-            // bookkeeping (identical to dsa_layer_dev's, n=1 per row).
-            // Copy the raw pointers out FIRST (Copy types — the immutable
-            // borrow ends), then mutate t_count (E0502: get's borrow must
-            // not span the get_mut).
-            let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, pinned_t0, pinned_total, total) = {
+        for &seq_r in seqs {
+            let _ = {
                 let mut m = self.dsa_caches.lock().unwrap();
                 let existing = m
                     .get(&(seq_r, family))
@@ -2553,70 +2655,79 @@ impl CudaBackend {
                     }
                 }
             };
-            // row r's kvb/ki/gate slices → the per-seq cache at its t0
-            ck(
-                unsafe {
-                    ferrite_dsa_cache_append(
-                        kvb.as_const_f32().add(r * h * (dk + dv)),
-                        ki.as_const_f32().add(r * idm),
-                        gate.as_const_f32().add(r * idm),
-                        k_nope_dev as *mut f32, v_dev as *mut f32, k_idx_dev as *mut f32, k_gate_dev as *mut f32,
-                        pinned_t0, 1, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
-                    )
-                },
-                "dsa_append_batched_row",
-            )?;
-            // 8. kpool compression — per-seq cache (pool_keys reused across
-            // rows: same pool address, sequential stream order — graph-safe)
-            let pool_keys = DevBuf::alloc(self.dev, self.stream, max_npools * idm)?;
-            ck(
-                unsafe {
-                    ferrite_kpool_compress(
-                        k_idx_dev as *const f32, k_gate_dev as *const f32, dape.as_const_f32(), pool_keys.as_f32(),
-                        pinned_total, max_npools as i32, kpool as i32, idm as i32, self.stream,
-                    )
-                },
-                "dsa_kpool_batched_row",
-            )?;
-            // 9. indexer topk (row r's qi/w_idx slices vs the per-seq pool keys)
-            let npools = (total + kpool - 1) / kpool;
-            let select_k = (w.topk / kpool).min(npools);
-            let idx_pools = DevBuf::alloc(self.dev, self.stream, 1 * select_k)?;
-            ck(
-                unsafe {
-                    ferrite_indexer_topk(
-                        qi.as_const_f32().add(r * ih * idm), pool_keys.as_const_f32(), w_idx.as_const_f32().add(r * ih),
-                        idx_pools.as_f32(), 1, ih as i32, idm as i32,
-                        select_k as i32, pinned_total, kpool as i32, 1, self.stream,
-                    )
-                },
-                "dsa_topk_batched_row",
-            )?;
-            // 10. expand pools → token indices
-            let out_width = select_k * kpool + (kpool - 1);
-            let idx = DevBuf::alloc(self.dev, self.stream, 1 * out_width)?;
-            ck(
-                unsafe {
-                    ferrite_pool_expand(
-                        idx_pools.as_const_f32(), idx.as_f32(),
-                        1, select_k as i32, kpool as i32, max_npools as i32, pinned_total,
-                        1, self.stream,
-                    )
-                },
-                "dsa_pool_expand_batched_row",
-            )?;
-            // 11. sparse attention (row r's qb vs the per-seq cache) → attn_out row
-            ck(
-                unsafe {
-                    ferrite_sparse_attn_v2(
-                        qb.as_const_f32().add(r * h * dk), k_nope_dev as *const f32, v_dev as *const f32, idx.as_const_f32(),
-                        attn_out.as_f32().add(r * h * dv), 1, pinned_total, h as i32, dk as i32, dv as i32,
-                        out_width as i32, self.stream,
-                    )
-                },
-                "dsa_sparse_attn_batched_row",
-            )?;
         }
+        // the (family, seq-set) batched pointer tables (cached per composition)
+        let tbl = self.dsa_ptr_tables(family, seqs)?;
+        // 7. cache append — ONE launch: all B rows → each seq's cache at its
+        // own t0 (the per-seq t0s via the pinned-ptr table, zero-copy).
+        ck(
+            unsafe {
+                ferrite_dsa_append_batched(
+                    kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
+                    tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
+                    tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
+                    tbl.t0p as *const *const i32,
+                    ni, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
+                )
+            },
+            "dsa_append_batched",
+        )?;
+        // 8. kpool compression — ONE launch: per-seq pools from each seq's
+        // k_idx/k_gate (npools derived live from each seq's pinned total).
+        let pool_keys = DevBuf::alloc(self.dev, self.stream, n * max_npools * idm)?;
+        ck(
+            unsafe {
+                ferrite_kpool_compress_batched(
+                    tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
+                    dape.as_const_f32(), pool_keys.as_f32(),
+                    tbl.totp as *const *const i32,
+                    ni, max_npools as i32, kpool as i32, idm as i32, self.stream,
+                )
+            },
+            "dsa_kpool_batched",
+        )?;
+        // 9. indexer topk — grid(B), one 256-thread block per seq: its qi/w_idx
+        // row vs its pool_keys row (select_k LIVE per seq from the pinned
+        // total — not frozen at capture like the single-seq graph path).
+        let select_k_max = w.topk / kpool;
+        let idx_pools = DevBuf::alloc(self.dev, self.stream, n * select_k_max)?;
+        ck(
+            unsafe {
+                ferrite_indexer_topk_batched(
+                    qi.as_const_f32(), pool_keys.as_const_f32(), w_idx.as_const_f32(),
+                    idx_pools.as_f32(), ni, ih as i32, idm as i32, select_k_max as i32,
+                    kpool as i32, max_npools as i32, tbl.totp as *const *const i32, self.stream,
+                )
+            },
+            "dsa_topk_batched",
+        )?;
+        // 10. expand pools → token indices (idx stride frozen at the cap —
+        // the -1 tail slots beyond each seq's live out_width are masked
+        // by the attention's j < 0 guard).
+        let out_width = select_k_max * kpool + (kpool - 1);
+        let idx = DevBuf::alloc(self.dev, self.stream, n * out_width)?;
+        ck(
+            unsafe {
+                ferrite_pool_expand_batched(
+                    idx_pools.as_const_f32(), idx.as_f32(),
+                    ni, select_k_max as i32, kpool as i32, max_npools as i32,
+                    tbl.totp as *const *const i32, 1, self.stream,
+                )
+            },
+            "dsa_expand_batched",
+        )?;
+        // 11. sparse attention — grid(B, h): each seq's qb row vs its own
+        // k_nope/v cache over its idx row (per-seq total via pinned table).
+        ck(
+            unsafe {
+                ferrite_sparse_attn_v2_batched(
+                    qb.as_const_f32(), tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
+                    idx.as_const_f32(), attn_out.as_f32(), ni, tbl.totp as *const *const i32,
+                    h as i32, dk as i32, dv as i32, out_width as i32, self.stream,
+                )
+            },
+            "dsa_attn_batched",
+        )?;
         // 12. o_proj GEMM n=B
         let partial = self.matmul_dev(&attn_out, w.o_proj, ni, (h * dv) as i32, hidden as i32)?;
         Ok(partial)
@@ -2747,6 +2858,30 @@ impl CudaBackend {
                     unsafe {
                         cudaFree(c);
                         cudaFree(g);
+                    }
+                }
+            }
+        }
+        // 5. Batched DSA tables: any (family, seq-set) containing this seq
+        // dangles (its cache pointers above are freed) — cudaFree the 6
+        // table arrays + purge the entries. The next batched DSA layer call
+        // for a new composition rebuilds them.
+        {
+            let mut m = self.dsa_tbl_cache.lock().unwrap();
+            let keys: Vec<(usize, Vec<u64>)> = m
+                .keys()
+                .filter(|(_, s)| s.contains(&seq))
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some(t) = m.remove(&k) {
+                    unsafe {
+                        cudaFree(t.kn);
+                        cudaFree(t.v);
+                        cudaFree(t.kidx);
+                        cudaFree(t.kgate);
+                        cudaFree(t.t0p);
+                        cudaFree(t.totp);
                     }
                 }
             }

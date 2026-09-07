@@ -3056,6 +3056,378 @@ extern "C" cudaError_t ferrite_pool_expand(
     return cudaGetLastError();
 }
 
+// ============================================================
+// DSA BATCHED (multi-seq decode, B rows = B seqs): the 5 per-seq
+// chains (append/kpool/topk/expand/attn) collapsed to ONE launch each.
+// Per-seq cache/total state via device pointer tables: [B] arrays of the
+// per-(seq,family) cache pointers (stable for the caches' lifetime — the
+// tables are cudaMalloc'd + memcpy'd once per composition by the host) and
+// [B] arrays of the per-seq PINNED t0/total int pointers (the kernel
+// dereferences zero-copy — the host writes the ints per step; graph-safe).
+// Replaces B × 5 per-seq launches (small grids at n=1 serialize) with
+// grid(B,...) launches that fill the SMs; per-seq math identical (the
+// bodies are the single-seq kernels' with row→(seq, ptr-table) indexing).
+// ============================================================
+
+// 1. cache append: kvb [B,h*(dk+dv)], ki [B,idm], gate [B,idm] → each seq's
+// cache at ITS t0 (flat grid over all 3 regions, seq derived by division).
+__global__ void dsa_append_batched_kernel(
+    const float* __restrict__ kvb,   // [B, h*(dk+dv)]
+    const float* __restrict__ ki,    // [B, idm]
+    const float* __restrict__ gate,  // [B, idm]
+    float* const* __restrict__ kn_tbl,   // [B] per-seq k_nope ptrs
+    float* const* __restrict__ v_tbl,    // [B]
+    float* const* __restrict__ kidx_tbl, // [B]
+    float* const* __restrict__ kgate_tbl,// [B]
+    const int* const* __restrict__ t0_tbl, // [B] per-seq PINNED t0 ptrs
+    int B, int h, int dk, int dv, int idm) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int row_bytes = h * (dk + dv);
+    int part = row_bytes + 2 * idm;
+    if (tid >= (size_t)B * part) return;
+    int seq = tid / part, r = tid % part;
+    int t0 = *t0_tbl[seq]; // per-seq pinned t0 (zero-copy)
+    if (r < row_bytes) {
+        int hd = r / (dk + dv), c = r % (dk + dv);
+        size_t dst = ((size_t)t0 * h + hd);
+        if (c < dk) kn_tbl[seq][dst * dk + c] = kvb[(size_t)seq * row_bytes + r];
+        else        v_tbl[seq][dst * dv + (c - dk)] = kvb[(size_t)seq * row_bytes + r];
+    } else {
+        int j = r - row_bytes; // ki region then gate region
+        if (j < idm) kidx_tbl[seq][(size_t)t0 * idm + j] = ki[(size_t)seq * idm + j];
+        else         kgate_tbl[seq][(size_t)t0 * idm + (j - idm)] = gate[(size_t)seq * idm + (j - idm)];
+    }
+}
+
+// 2. kpool compression: per-seq (k_idx, k_gate) → pool_keys [B, max_npools,
+// idm]. npools derived live per seq from its pinned total.
+__global__ void kpool_compress_batched_kernel(
+    const float* const* __restrict__ kidx_tbl,  // [B]
+    const float* const* __restrict__ kgate_tbl, // [B]
+    const float* __restrict__ ape,              // [kpool, idm] shared
+    float* __restrict__ pool_keys,               // [B, max_npools, idm]
+    const int* const* __restrict__ total_tbl,    // [B] per-seq PINNED total ptrs
+    int B, int max_npools, int kpool, int idm) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t per = (size_t)max_npools * idm;
+    if (tid >= (size_t)B * per) return;
+    int seq = (int)(tid / per);
+    size_t rem = tid % per;
+    int p = (int)(rem / idm), d = (int)(rem % idm);
+    int total = *total_tbl[seq];
+    int npools = (total + kpool - 1) / kpool;
+    if (p >= npools) return;
+    const float* k_idx = kidx_tbl[seq];
+    const float* k_gate = kgate_tbl[seq];
+    float lmax = -INFINITY;
+    for (int j = 0; j < kpool; j++) {
+        int t = p * kpool + j;
+        if (t < total) {
+            float lv = k_gate[(size_t)t * idm + d] + ape[(size_t)j * idm + d];
+            if (lv > lmax) lmax = lv;
+        }
+    }
+    if (lmax == -INFINITY) return;
+    float den = 0.f, num = 0.f;
+    for (int j = 0; j < kpool; j++) {
+        int t = p * kpool + j;
+        if (t < total) {
+            float wgt = expf(k_gate[(size_t)t * idm + d] + ape[(size_t)j * idm + d] - lmax);
+            den += wgt;
+            num += wgt * k_idx[(size_t)t * idm + d];
+        }
+    }
+    pool_keys[(size_t)seq * per + (size_t)p * idm + d] = num / den;
+}
+
+// 3. indexer topk: one 256-thread block per seq — score ALL pools of its
+// pool_keys row, warp-shuffle select_k selection (select_k live: min(cap,
+// npools) from the pinned total — unlike the single-seq graph-frozen arg).
+__global__ void indexer_topk_batched_kernel(
+    const float* __restrict__ qi,        // [B, ih*idm]
+    const float* __restrict__ pool_keys, // [B, max_npools, idm]
+    const float* __restrict__ w,          // [B, ih]
+    float* __restrict__ idx,              // [B, select_k_max]
+    int B, int ih, int idm, int select_k_max, int kpool, int max_npools,
+    const int* const* __restrict__ total_tbl) { // [B] pinned
+    int seq = blockIdx.x;
+    if (seq >= B) return;
+    int total = *total_tbl[seq];
+    int t = (total + kpool - 1) / kpool; // live npools
+    int ctx0 = total - 1;                  // n=1 per seq
+    int ctx0_pools = ctx0 / kpool;
+    int jmax = min(ctx0_pools + 1, t);
+    int select_k = min(select_k_max, t);
+    const float* q_s = qi + (size_t)seq * (size_t)(ih * idm);
+    const float* pk = pool_keys + (size_t)seq * (size_t)max_npools * idm;
+    const float* w_s = w + (size_t)seq * ih;
+    float* iv = idx + (size_t)seq * select_k_max;
+    extern __shared__ float sm[]; // max_npools scores (sized for MAX at launch)
+    float inv_sqrt_d = rsqrtf((float)idm);
+    for (int j = threadIdx.x; j < t; j += blockDim.x) {
+        const float* k = pk + (size_t)j * idm;
+        float s = 0.f;
+        if (j < jmax) {
+            for (int hi = 0; hi < ih; hi++) {
+                const float* q = q_s + (size_t)hi * idm;
+                float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                for (int l = 0; l + 3 < idm; l += 4) {
+                    float4 qv = *reinterpret_cast<const float4*>(q + l);
+                    float4 kv = *reinterpret_cast<const float4*>(k + l);
+                    d0 += qv.x * kv.x; d1 += qv.y * kv.y; d2 += qv.z * kv.z; d3 += qv.w * kv.w;
+                }
+                float dot = (d0 + d1) + (d2 + d3);
+                s += w_s[hi] * fmaxf(dot, 0.f); // relu
+            }
+            sm[j] = s * inv_sqrt_d;
+        } else {
+            sm[j] = -INFINITY;
+        }
+    }
+    __syncthreads();
+    for (int r = 0; r < select_k; r++) {
+        __shared__ int bidx[8];
+        __shared__ float bval[8];
+        int best = -1;
+        float bv = -INFINITY;
+        for (int j = threadIdx.x; j < t; j += blockDim.x) {
+            if (sm[j] > bv) { bv = sm[j]; best = j; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down_sync(0xffffffff, bv, off);
+            int oi = __shfl_down_sync(0xffffffff, best, off);
+            if (ov > bv) { bv = ov; best = oi; }
+        }
+        int warp = threadIdx.x >> 5;
+        if ((threadIdx.x & 31) == 0) { bidx[warp] = best; bval[warp] = bv; }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int sel = -1;
+            float sv = -INFINITY;
+            for (int wi = 0; wi < (blockDim.x >> 5); wi++) {
+                if (bval[wi] > sv) { sv = bval[wi]; sel = bidx[wi]; }
+            }
+            if (sel >= 0) { iv[r] = (float)sel; sm[sel] = -INFINITY; }
+            else iv[r] = -1.0f;
+        }
+        __syncthreads();
+    }
+    // pad the (select_k_max - select_k) tail: pool_expand only reads r <
+    // select_k, but keep the buffer deterministic.
+    for (int r = select_k + threadIdx.x; r < select_k_max; r += blockDim.x) iv[r] = -1.0f;
+}
+
+// 4. pool expand: one block per seq — compact the valid pools' token slots
+// + causal tail (multi-thread prefix + probe, the single-seq semantics),
+// out_width frozen at select_k_max for the graph-stable buffer stride.
+__global__ void pool_expand_batched_kernel(
+    const float* __restrict__ idx_pools,  // [B, select_k_max]
+    float* __restrict__ idx,              // [B, select_k_max*kpool + (kpool-1)]
+    int B, int select_k_max, int kpool, int max_npools,
+    const int* const* __restrict__ total_tbl, int n_fixed) {
+    int seq = blockIdx.x;
+    int total = *total_tbl[seq];
+    int ctx0 = total - n_fixed;
+    int npools = (total + kpool - 1) / kpool;
+    int select_k = min(select_k_max, npools);
+    int out_width = select_k * kpool + (kpool - 1);
+    int out_stride = select_k_max * kpool + (kpool - 1);
+    const float* pv = idx_pools + (size_t)seq * select_k_max;
+    float* iv = idx + (size_t)seq * (size_t)out_stride;
+    extern __shared__ int sp[]; // [select_k_max+1] prefix
+    int tid = threadIdx.x;
+    for (int r = tid; r < select_k; r += blockDim.x) {
+        float pflt = pv[r];
+        sp[r + 1] = (pflt >= 0.0f && (int)pflt < npools) ? 1 : 0;
+    }
+    if (tid == 0) sp[0] = 0;
+    __syncthreads();
+    if (tid == 0) { for (int r = 0; r < select_k; r++) sp[r + 1] += sp[r]; }
+    __syncthreads();
+    int nvalid = sp[select_k];
+    for (int c = tid; c < nvalid * kpool; c += blockDim.x) {
+        int s = c / kpool, j = c % kpool;
+        int r = (int)(((long long)s * select_k) / (nvalid > 0 ? nvalid : 1));
+        if (r >= select_k) r = select_k - 1;
+        while (r > 0 && sp[r] > s) r--;
+        while (r + 1 < select_k && sp[r + 1] <= s) r++;
+        int p = (int)pv[r];
+        int t = p * kpool + j;
+        iv[s * kpool + j] = (t < total && t <= ctx0) ? (float)t : -1.0f;
+    }
+    if (tid == 0) {
+        int visible_count = ctx0 + 1; // n=1: row i=0
+        int tail_count = visible_count % kpool;
+        int tail_start = visible_count - tail_count;
+        int col = nvalid * kpool;
+        for (int j = 0; j < kpool - 1 && col < out_width; j++) {
+            int t = tail_start + j;
+            iv[col++] = (j < tail_count && t <= ctx0) ? (float)t : -1.0f;
+        }
+        while (col < out_width) iv[col++] = -1.0f;
+        while (col < out_stride) iv[col++] = -1.0f; // stride tail (select_k < max)
+    }
+}
+
+// 5. sparse attention: grid (B, h) — the v2 body per (seq, head) with the
+// per-seq k/v via tables + per-seq idx row (stride = frozen out_width).
+__global__ void sparse_attn_v2_batched_kernel(
+    const float* __restrict__ q,          // [B, h*d]
+    float* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches
+    float* const* __restrict__ v_tbl,      // [B] per-seq v caches
+    const float* __restrict__ idx,         // [B, topk_slots]
+    float* __restrict__ out,              // [B, h*dv]
+    int B, const int* const* __restrict__ total_tbl, // [B] pinned
+    int h, int d, int dv, int topk) {
+    int seq = blockIdx.x;
+    int hd = blockIdx.y;
+    int t = *total_tbl[seq]; // per-seq zero-copy pinned read
+    const float* q_s = q + (size_t)seq * (size_t)(h * d);
+    const float* k_s = k_tbl[seq];
+    const float* v_s = v_tbl[seq];
+    const float* idx_s = idx + (size_t)seq * topk;
+    float* out_s = out + (size_t)seq * (size_t)(h * dv);
+    float scale = rsqrtf((float)d);
+    extern __shared__ float sm[];
+    float* qs = sm;                                   // [d] float4-aligned base
+    float* sc = sm + d;                                // [topk]
+    int* idxs = (int*)(sc + topk);                     // [topk]
+    float* red = (float*)(idxs + topk);                // [8]
+    unsigned int* bm = (unsigned int*)(red + 8);       // [4096] dedup bitmap
+    const int bm_words_max = 4096;
+    int bm_words = (t + 31) >> 5; if (bm_words > bm_words_max) bm_words = bm_words_max;
+    for (int l = threadIdx.x; l < d; l += blockDim.x) qs[l] = q_s[(size_t)hd * d + l];
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) idxs[s] = (int)idx_s[s];
+    for (int w0 = threadIdx.x; w0 < bm_words_max; w0 += blockDim.x) bm[w0] = 0u;
+    __syncthreads();
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+        int j = idxs[s];
+        if (j < 0 || j >= t) { sc[s] = -INFINITY; continue; }
+        bool dup = false;
+        if ((j >> 5) < bm_words) {
+            unsigned int prev = atomicOr(&bm[j >> 5], 1u << (j & 31));
+            dup = (prev & (1u << (j & 31))) != 0;
+        }
+        if (dup) { sc[s] = -INFINITY; continue; }
+        const float4* k4 = reinterpret_cast<const float4*>(k_s + ((size_t)j * h + hd) * d);
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int l = 0; l + 3 < d; l += 4) {
+            float4 kk = k4[l >> 2];
+            float4 qq = *reinterpret_cast<const float4*>(qs + l);
+            acc.x += qq.x * kk.x; acc.y += qq.y * kk.y; acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
+        }
+        float a = acc.x + acc.y + acc.z + acc.w;
+        for (int l = d & ~3; l < d; l++) a += qs[l] * k_s[((size_t)j * h + hd) * d + l];
+        sc[s] = a * scale;
+    }
+    __syncthreads();
+    float m = -INFINITY;
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) m = fmaxf(m, sc[s]);
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x < 8) m = red[threadIdx.x];
+    for (int off = 4; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    __shared__ float ms_;
+    if (threadIdx.x == 0) ms_ = m;
+    __syncthreads();
+    m = ms_;
+    bool all_inf = (m == -INFINITY);
+    float sum = 0.f;
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+        sc[s] = all_inf ? 0.f : __expf(sc[s] - m);
+        sum += sc[s];
+    }
+    for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
+    __syncthreads();
+    if (threadIdx.x < 8) sum = red[threadIdx.x];
+    for (int off = 4; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    __shared__ float sum_;
+    if (threadIdx.x == 0) sum_ = sum;
+    __syncthreads();
+    float denom = sum_ + 1e-9f;
+    __syncthreads();
+    for (int s = threadIdx.x; s < topk; s += blockDim.x) sc[s] /= denom;
+    __syncthreads();
+    for (int j2 = threadIdx.x; j2 < dv; j2 += blockDim.x) {
+        float a = 0.f;
+        for (int s = 0; s < topk; s++) {
+            float w = sc[s];
+            if (w == 0.f) continue;
+            int j = idxs[s];
+            if (j < 0 || j >= t) continue;
+            a += w * v_s[((size_t)j * h + hd) * dv + j2];
+        }
+        out_s[(size_t)hd * dv + j2] = a;
+    }
+}
+
+extern "C" cudaError_t ferrite_dsa_append_batched(
+    const float* kvb, const float* ki, const float* gate,
+    float* const* kn_tbl, float* const* v_tbl, float* const* kidx_tbl, float* const* kgate_tbl,
+    const int* const* t0_tbl, int B, int h, int dk, int dv, int idm, cudaStream_t s) {
+    size_t total = (size_t)B * (size_t)(h * (dk + dv) + 2 * idm);
+    int threads = 256;
+    int blocks = (int)((total + threads - 1) / threads);
+    dsa_append_batched_kernel<<<blocks, threads, 0, s>>>(
+        kvb, ki, gate, kn_tbl, v_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t ferrite_kpool_compress_batched(
+    const float* const* kidx_tbl, const float* const* kgate_tbl,
+    const float* ape, float* pool_keys, const int* const* total_tbl,
+    int B, int max_npools, int kpool, int idm, cudaStream_t s) {
+    size_t total_t = (size_t)B * (size_t)max_npools * idm;
+    int threads = 256;
+    int blocks = (int)((total_t + threads - 1) / threads);
+    kpool_compress_batched_kernel<<<blocks, threads, 0, s>>>(
+        kidx_tbl, kgate_tbl, ape, pool_keys, total_tbl, B, max_npools, kpool, idm);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t ferrite_indexer_topk_batched(
+    const float* qi, const float* pool_keys, const float* w,
+    float* idx, int B, int ih, int idm, int select_k_max, int kpool, int max_npools,
+    const int* const* total_tbl, cudaStream_t s) {
+    dim3 block(256);
+    dim3 grid(B);
+    int max_t = 2048; // max_npools (smem frozen for MAX — graph-safe)
+    size_t smem = (size_t)max_t * sizeof(float);
+    indexer_topk_batched_kernel<<<grid, block, smem, s>>>(
+        qi, pool_keys, w, idx, B, ih, idm, select_k_max, kpool, max_npools, total_tbl);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t ferrite_pool_expand_batched(
+    const float* idx_pools, float* idx,
+    int B, int select_k_max, int kpool, int max_npools,
+    const int* const* total_tbl, int n_fixed, cudaStream_t s) {
+    size_t smem = ((size_t)select_k_max + 1) * sizeof(int);
+    pool_expand_batched_kernel<<<B, 256, smem, s>>>(
+        idx_pools, idx, B, select_k_max, kpool, max_npools, total_tbl, n_fixed);
+    return cudaGetLastError();
+}
+
+extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
+    const float* q, float* const* k_tbl, float* const* v_tbl,
+    const float* idx, float* out, int B, const int* const* total_tbl,
+    int h, int d, int dv, int topk, cudaStream_t s) {
+    dim3 block(256);
+    dim3 grid(B, h);
+    size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
+                  + 8 * sizeof(float) + 4096 * sizeof(unsigned int);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        if (e != cudaSuccess) return e;
+    }
+    sparse_attn_v2_batched_kernel<<<grid, block, smem, s>>>(
+        q, k_tbl, v_tbl, idx, out, B, total_tbl, h, d, dv, topk);
+    return cudaGetLastError();
+}
+
 // elementwise in-place scale (w_idx × n_heads^-0.5)
 __global__ void scale_inplace_kernel(float* __restrict__ x, float s, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
