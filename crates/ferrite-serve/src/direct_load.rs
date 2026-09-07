@@ -308,11 +308,19 @@ pub fn direct_preload_shard(
                 let d = dv.direct.slice(data);
                 match split {
                     Split::Replicated => {
+                        // fp8 GEMV (W8A16) registration — the SAME numerical path
+                        // as the legacy loader's set_fp8 (matmul_dev's
+                        // fp8_lookup hit → ferrite_gemv_fp8_v2 inline fp8×scale
+                        // f32 accumulation). The bf16 dequant below is kept as
+                        // the dev_weight_bf16 fallback; the fp8 GEMV takes
+                        // priority. (The bf16-dequant GEMV loses 16 mantissa
+                        // bits per weight — ~0.2% relative error that flips
+                        // argmax ties step-by-step → diverging garbage text.)
+                        backend.register_fp8(ph, rows, cols, d, &scale_full)?;
                         backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
                         st.fp8_rows += 1;
                     }
                     Split::Rows { r0, r1 } => {
-                        let d = dv.direct.slice(data);
                         let srows = (r1 - r0).div_ceil(128);
                         let scols = cols.div_ceil(128);
                         let _ = (srows, scols);
@@ -321,11 +329,29 @@ pub fn direct_preload_shard(
                         // SHARD rows — the window's blocks are the full
                         // grid's rows r0/128..r1/128, full cols).
                         let sw = scale_row_window(&scale_full, scols_full, r0 / 128, r1.div_ceil(128));
-                        backend.preload_fp8_dequant(ph, &d[r0 * cols..r1 * cols], &sw, r1 - r0, cols)?;
+                        let dr = &d[r0 * cols..r1 * cols];
+                        backend.register_fp8(ph, r1 - r0, cols, dr, &sw)?;
+                        backend.preload_fp8_dequant(ph, dr, &sw, r1 - r0, cols)?;
                         st.fp8_rows += 1;
                     }
                     Split::Cols { c0, c1 } => {
                         let d = dv.direct.slice(data);
+                        // host-gather the fp8 col window [c0, c1) + the scale
+                        // col window [c0/128, c1.ceil/128) — the register_fp8
+                        // data layout is the SHARD's [rows, c1-c0] fp8 grid.
+                        let shard_cols = c1 - c0;
+                        let mut dg: Vec<u8> = Vec::with_capacity(rows * shard_cols);
+                        for r in 0..rows {
+                            dg.extend_from_slice(&d[r * cols + c0..r * cols + c1]);
+                        }
+                        let srows = rows.div_ceil(128);
+                        let sc0 = c0 / 128;
+                        let sc1 = c1.div_ceil(128);
+                        let mut sg: Vec<f32> = Vec::with_capacity(srows * (sc1 - sc0));
+                        for r in 0..srows {
+                            sg.extend_from_slice(&scale_full[r * scols_full + sc0..r * scols_full + sc1]);
+                        }
+                        backend.register_fp8(ph, rows, shard_cols, &dg, &sg)?;
                         backend.preload_fp8_col_dequant(ph, d, &scale_full, rows, cols, c0, c1)?;
                         st.fp8_cols += 1;
                     }
@@ -342,6 +368,11 @@ pub fn direct_preload_shard(
                             .and_then(|s| s.parse().ok())
                             .unwrap_or(usize::MAX);
                         if e >= es && e < ee {
+                            // experts: NO register_fp8 — the fused MoE kernel
+                            // (moe_expert_ptrs) reads the bf16 pointer table
+                            // (dev_weight_bf16), the same numerical path as
+                            // the legacy loader's expert bf16; fp8_map
+                            // registration would only double the residency.
                             let d = dv.direct.slice(data);
                             backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
                             st.experts += 1;
