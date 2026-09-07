@@ -740,6 +740,10 @@ impl CudaBackend {
             if let Some(bb) = cache.get(&bkey) {
                 if bb.len == t.numel() {
                     let numel = t.numel();
+                    eprintln!(
+                        "[widen] f32-consumer weight: numel={numel} shape={:?} — widening bf16 residency",
+                        t.shape.0
+                    );
                     let mut f32p: *mut std::ffi::c_void = std::ptr::null_mut();
                     ck(unsafe { cudaMalloc(&mut f32p, numel * 4) }, "dev_weight bf16→f32 widen malloc")?;
                     let conv = (|| -> Result<()> {
