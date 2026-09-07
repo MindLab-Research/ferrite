@@ -9,6 +9,8 @@ members = [
     "crates/ferrite-scheduler",
     "crates/ferrite-exec",
     "crates/ferrite-serve",
+    "crates/ferrite-dispatch",
+    "crates/ferrite-http",
 ]
 
 [workspace.package]

@@ -1,0 +1,29 @@
+[package]
+name = "ferrite-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# The mock generation backend (deterministic token stream) — always on:
+# the HTTP/SSE layer is the deliverable; GPU backend lands behind
+# `cuda` like ferrite-serve (ferrite-kernel/cuda feature chain).
+mock = []
+
+[[bin]]
+name = "ferrite-http"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal", "net", "time"] }
+tokio-stream = "0.1"
+axum = "0.7"
+
+ferrite-types = { path = "../ferrite-types" }
+ferrite-dispatch = { path = "../ferrite-dispatch" }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
