@@ -123,53 +123,87 @@ pub async fn chat_completions(
 
     match req.stream.unwrap_or(false) {
         true => {
-            // SSE streaming: one frame per engine event (the driver's MTP
-            // commit window — 1–3 tokens per frame, the OpenAI chunk
-            // granularity), [DONE] appended by the stream tail. The event
-            // closure owns a tokenizer clone (Arc) for delta decoding;
-            // stop ids never reach content (stripped before decode).
+            // SSE streaming with FRAME BATCHING + incremental detokenization:
+            // the driver's Tokens events (1-3 tokens per tick) are NOT one
+            // SSE frame each — content flushes when the batch reaches 8
+            // tokens or 50ms since it opened (lower frame frequency; whole
+            // words/phrases per delta). Multi-byte characters split across
+            // token boundaries (byte-BPE) are handled by decode_batch's
+            // tail-holdback: a batch whose tail decodes to a partial char
+            // (U+FFFD) holds its trailing tokens for the next batch — the
+            // per-delta decode that produced � for every split char is gone.
             let tok = state.tok.clone();
             let model = state.model_name.clone();
             let include_usage = req.include_usage.unwrap_or(false);
             let handle = state.handle.clone();
             let chat_id2 = chat_id.clone();
             let body = UnboundedReceiverStream::new(events);
-            let stream = body.map(move |ev: ReqEvent| -> Result<Event, std::convert::Infallible> {
-                Ok(match ev {
-                    ReqEvent::Admitted { prefix_hit, prompt_tokens } => Event::default()
+            // SSE batch state (moved into the stream closure — per request):
+            // pending content ids + the batch's open time.
+            let mut batch: Vec<u32> = Vec::new();
+            let mut batch_open: Option<std::time::Instant> = None;
+            let stream = body.filter_map(move |ev: ReqEvent| -> Option<Result<Event, std::convert::Infallible>> {
+                match ev {
+                    ReqEvent::Admitted { prefix_hit, prompt_tokens } => Some(Ok(Event::default()
                         .comment(format!(
                             "ferrite: admitted prefix_hit={prefix_hit} prompt_tokens={prompt_tokens}"
-                        )),
+                        )))),
                     ReqEvent::Tokens { ids } => {
-                        let clean: Vec<u32> =
-                            ids.into_iter().filter(|t| !tok.is_stop(*t)).collect();
-                        let text = if clean.is_empty() {
-                            String::new()
-                        } else {
-                            tok.decode(&clean).unwrap_or_default()
-                        };
-                        if text.is_empty() {
-                            // stop-id-only window (turn end rides Finished)
-                            Event::default().comment("ferrite: stop token")
-                        } else {
-                            let chunk = ChatChunk::content(&chat_id2, &model, &text);
-                            Event::default().data(serde_json::to_string(&chunk).expect("sse"))
+                        for t in ids {
+                            if !tok.is_stop(t) {
+                                batch.push(t);
+                            }
                         }
+                        if batch.is_empty() {
+                            return None; // stop-only window — no frame
+                        }
+                        let opened = *batch_open.get_or_insert_with(std::time::Instant::now);
+                        if batch.len() < 8 && opened.elapsed().as_millis() < 50 {
+                            return None; // keep accumulating (batching)
+                        }
+                        batch_open = None;
+                        // Tail-holdback decode: trailing tokens whose bytes
+                        // form an incomplete UTF-8 char stay in the batch.
+                        let (text, held) = tok.decode_batch(&batch);
+                        let keep = batch.len() - held;
+                        batch.drain(..keep);
+                        if held > 0 {
+                            batch_open = Some(std::time::Instant::now());
+                        }
+                        if text.is_empty() {
+                            return None;
+                        }
+                        let chunk = ChatChunk::content(&chat_id2, &model, &text);
+                        Some(Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).expect("sse"))))
                     }
                     ReqEvent::Finished { reason, usage } => {
+                        // Terminal: the held-back tail (multi-byte splits)
+                        // rides the finish frame's delta (protocol-legal:
+                        // content + finish_reason together — one filter_map
+                        // slot; clients accumulate deltas).
+                        let tail = if batch.is_empty() {
+                            None
+                        } else {
+                            let s = tok.decode(&batch).unwrap_or_default();
+                            batch.clear();
+                            if s.is_empty() { None } else { Some(s) }
+                        };
                         let chunk = ChatChunk::finish(
                             &chat_id2,
                             &model,
                             reason.as_str(),
                             include_usage.then(|| UsageDto::of(usage)),
+                            tail,
                         );
-                        Event::default().data(serde_json::to_string(&chunk).expect("sse"))
+                        Some(Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).expect("sse"))))
                     }
-                })
+                }
             });
             // [DONE] sentinel after the Finished frame (OpenAI close).
             let stream = stream.chain(tokio_stream::iter(vec![
-                Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]"))
+                Ok::<_, std::convert::Infallible>(Event::default().data("[DONE]")),
             ]));
             // Cancel-on-drop: the body ends — client disconnect or stream
             // complete — the driver hears Cancel (retire + unpins; cancel
@@ -178,23 +212,25 @@ pub async fn chat_completions(
             Sse::new(guarded).keep_alive(KeepAlive::default()).into_response()
         }
         false => {
-            // Aggregate the event stream into one completion JSON.
+            // Aggregate the event stream into one completion JSON. The
+            // content is decoded ONCE at the end (whole-stream decode —
+            // per-event decoding split multi-byte chars across event
+            // boundaries: the byte-BPE tail of a Chinese char in one event
+            // decoded to U+FFFD per event; the single full decode joins
+            // the bytes correctly).
             // (the stream must outlive the loop — `while let` re-evaluates
             // its scrutinee per iteration, so bind it first)
             let mut events = UnboundedReceiverStream::new(events);
             let mut usage = Usage::default();
-            let mut text = String::new();
+            let mut all_ids: Vec<u32> = Vec::new();
             let mut reason = FinishReason::Stop;
             while let Some(ev) = events.next().await {
                 match ev {
                     ReqEvent::Admitted { .. } => {}
                     ReqEvent::Tokens { ids } => {
-                        // stream-content decode in batches; drop stop ids
-                        let clean: Vec<u32> =
-                            ids.into_iter().filter(|t| !state.tok.is_stop(*t)).collect();
-                        if !clean.is_empty() {
-                            if let Ok(s) = state.tok.decode(&clean) {
-                                text.push_str(&s);
+                        for t in ids {
+                            if !state.tok.is_stop(t) {
+                                all_ids.push(t);
                             }
                         }
                     }
@@ -204,6 +240,7 @@ pub async fn chat_completions(
                     }
                 }
             }
+            let text = state.tok.decode(&all_ids).unwrap_or_default();
             Json(ChatCompletionResponse::of(
                 &chat_id,
                 &state.model_name,

@@ -109,9 +109,18 @@ impl ChatChunk {
         }
     }
 
-    /// Terminal frame: empty delta + finish_reason (+usage when requested).
+    /// Terminal frame: finish_reason (+usage when requested). The tail
+    /// content delta may ride this frame (protocol-legal: `delta.content`
+    /// alongside `finish_reason` — the held-back multi-byte split flushes
+    /// here instead of a separate frame; clients accumulate deltas).
     /// `reason` is `FinishReason::as_str()` — a `&'static str`.
-    pub fn finish(id: &str, model: &str, reason: &'static str, usage: Option<UsageDto>) -> Self {
+    pub fn finish(
+        id: &str,
+        model: &str,
+        reason: &'static str,
+        usage: Option<UsageDto>,
+        tail: Option<String>,
+    ) -> Self {
         ChatChunk {
             id: id.to_string(),
             object: "chat.completion.chunk",
@@ -119,7 +128,7 @@ impl ChatChunk {
             model: model.to_string(),
             choices: vec![ChunkChoice {
                 index: 0,
-                delta: Delta::default(),
+                delta: Delta { role: None, content: tail },
                 finish_reason: Some(reason),
             }],
             usage,

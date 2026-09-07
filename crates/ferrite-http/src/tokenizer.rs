@@ -129,6 +129,26 @@ impl ChatTokenizer {
         }
     }
 
+    /// Streaming batch decode with UTF-8 tail-holdback: byte-BPE splits
+    /// multi-byte characters across token boundaries — decoding a batch
+    /// whose TAIL is a partial char yields U+FFFD. This holds back the
+    /// trailing tokens while the decode ends in a replacement char (the
+    /// held tokens stay in the caller's buffer and concatenate with the
+    /// next batch; the terminal flush passes `decode` on the full buffer
+    /// which accepts the tail). Returns (safe text, tokens held back).
+    pub fn decode_batch(&self, buf: &[u32]) -> (String, usize) {
+        if buf.is_empty() {
+            return (String::new(), 0);
+        }
+        let mut n = buf.len();
+        let mut s = self.decode(&buf[..n]).unwrap_or_default();
+        while n > 1 && s.ends_with('\u{FFFD}') {
+            n -= 1;
+            s = self.decode(&buf[..n]).unwrap_or_default();
+        }
+        (s, buf.len() - n)
+    }
+
     /// Check whether an accepted token ends the turn.
     pub fn is_stop(&self, id: u32) -> bool {
         self.stop_ids().contains(&id)
