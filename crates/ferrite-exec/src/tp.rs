@@ -866,24 +866,28 @@ impl<B: KernelBackend> TpCluster<B> {
                         mtp_forward(s, seq, &emb, hprev, Some(&hout))?;
                         h_cur = Some(hout);
                     }
-                    // SEED MtpState.hprev with the catch-up chain's FINAL h
-                    // (the draft/MTP layer's residual h after processing the
-                    // last prompt token) — a DETERMINISTIC value, not pool
-                    // residue. S1's hprev MUST be this: without it, S1 reads
-                    // cudaMalloc's undefined memory (pool residue), the ONLY
-                    // non-deterministic input to draft1 → x2 carries 1-ulp
-                    // drift vs the original path → argmax flips on the
-                    // small-margin d2 (8606 vs 315) → stream diverges →
-                    // accept=1.0. Per the mandate "MTP uses the previously-
-                    // verified main KV", S1's hprev = catch-up final state.
-                    if let Some(hf) = h_cur.as_ref() {
+                    // SEED MtpState.hprev = hf_dev (the prompt-tail decoder
+                    // h_final) right at catch-up — once, before step 1. This
+                    // makes S1's hprev a DETERMINISTIC value (the previously-
+                    // verified main KV per the mandate) instead of pool
+                    // residue. mtp_step_zero_h2d allocates 8 extra device
+                    // buffers in MtpState, so its pool residue for hprev
+                    // DIFFERS from the original path's → S1's draft1 x2
+                    // carries a 1-ulp drift (hidden from 8-seg 6-decimal
+                    // checksums) → d1=990 survives (large argmax margin) but
+                    // d2 flips (8606 vs 315, near-tie) → stream diverges →
+                    // accept=1.0. FIX v2 (afdbaac) proved seeding hf_dev
+                    // restores S1-S3 to d1==a0 (k=2). hf_dev is the correct
+                    // seed (NOT the catch-up MTP-layer trailing hout, which
+                    // moved d1 to 136493). Combined with the (2-k) rollback.
+                    {
                         let cuda = s
                             .backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("cuda".into()))?;
                         let m = cuda.mtp.lock().unwrap();
                         let m = m.as_ref().ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                        cuda.copy_dev(hf, 0, m.hprev.as_f32(), hidden)?;
+                        cuda.copy_dev(&m.hf_dev, 0, m.hprev.as_f32(), hidden)?;
                     }
                     Ok::<(), FerriteError>(())
                 })
