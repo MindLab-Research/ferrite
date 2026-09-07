@@ -45,6 +45,9 @@ extern "C" {
     fn ferrite_gemv_bf16_v2(x: *const f32, w: *const std::ffi::c_void,
                              bias: *const f32, out: *mut f32,
                              in_f: i32, out_f: i32, nrows: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_bf16_nt(x: *const f32, w: *const std::ffi::c_void,
+                             bias: *const f32, out: *mut f32,
+                             in_f: i32, out_f: i32, nrows: i32, s: CuStream) -> i32;
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
@@ -994,6 +997,24 @@ impl CudaBackend {
             // the L2 for the n rows' same-weight reads (verify n=3: +35% vs
             // n=1's 16ms). Prefill keeps the GEMM (its row-batched
             // accumulation order sets the first greedy token).
+            // v4 (n>1): the TALL-SKINNY nt kernel FIRST — each warp-group
+            // reads ONE weight row slice ONCE and dots it against ALL n
+            // activation rows (the true batched-GEMM weight streaming:
+            // weights 1×, activations n× from L2, per-token accumulation
+            // IDENTICAL to v2 — no greedy flips). Measured v2-batched at
+            // n=4: 33.5ms/step (weights ~2× effective, L2 partial reuse);
+            // v4's target: the n=1 HBM floor (~16-18ms) at n=4 → ~2x.
+            // Unsupported shapes (in_f%8, n not in the template set) return
+            // NotSupported → the v2 batched below (per-row, L2 luck).
+            if n > 1 {
+                let r = unsafe {
+                    ferrite_gemv_bf16_nt(x_dev.as_const_f32(), dw.ptr as *const _,
+                                         dbias, do_.as_f32(), in_f, out_f, n, self.stream)
+                };
+                if r == 0 {
+                    return Ok(do_);
+                }
+            }
             ck(unsafe {
                 ferrite_gemv_bf16_v2(x_dev.as_const_f32(), dw.ptr as *const _,
                                       dbias, do_.as_f32(), in_f, out_f, n, self.stream)

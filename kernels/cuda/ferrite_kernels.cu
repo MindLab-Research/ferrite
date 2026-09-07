@@ -1863,6 +1863,128 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
 }
 
 // ============================================================
+// N-token tall-skinny GEMV (v4): each WPR-warp group computes ONE output
+// row for ALL n tokens — the weight row slice is read from HBM ONCE and
+// dotted against the n activation rows (activations are n*in_f*4B ≈ 64KB
+// at n=4/in=4096 — L2/L1-resident after the first blocks). This is the
+// TRUE batched-GEMM weight streaming at small n:
+//   - v2 batched (n rows in one launch): each (token,row) block reads the
+//     SAME weight bytes n times — the L2 *partially* serves the n-th read
+//     (measured n=4 batched decode: 33.5ms/step vs n=1's 16.1ms — ~2x
+//     effective weight traffic);
+//   - the tiled GEMM (ferrite_matmul_bf16): reads weights once but its
+//     128-row tile computes the full tile regardless of n (measured n=4:
+//     105ms/step — 6.5x the HBM floor);
+//   - v4 (this kernel): weights once (the HBM floor), n accumulators per
+//     warp, the per-token accumulation order IDENTICAL to v2 (the same
+//     K-slice lane order, the same FMA chain, the same WPR shuffle/root
+//     reduction) — bit-equal per-token results vs the n=1 GEMV, no greedy
+//     flips. n=4 decode: ~16-18ms/step (the n=1 HBM floor + ε compute).
+// Grid: (out_f + rpb - 1)/rpb blocks (NO ×n — each block computes one
+// row's n outputs). Registers: NT accumulators/lane (NT<=16 — 16 floats).
+// ============================================================
+template <int NT>
+__global__ void gemv_bf16_nt_kernel(const float* __restrict__ x,
+                                    const __nv_bfloat16* __restrict__ w,
+                                    const float* __restrict__ bias,
+                                    float* __restrict__ y,
+                                    int in_f, int out_f) {
+    const int warps = blockDim.x >> 5;
+    const int rpb = warps / WPR;               // rows per block (as v2)
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * rpb + warp / WPR;   // ONE row per warp-group
+    const int kw = warp % WPR;                 // K-slice id (as v2)
+    float acc[NT];
+    #pragma unroll
+    for (int t = 0; t < NT; t++) acc[t] = 0.f;
+    if (row < out_f) {
+        const __nv_bfloat16* wr = w + (size_t)row * in_f;
+        int kper = ((in_f + WPR - 1) / WPR + 7) & ~7;
+        int k0 = kw * kper;
+        int k1 = min(k0 + kper, in_f);
+        // vector body: uint4 W (8 bf16) read ONCE per k-step; the n
+        // activation rows' float4 pairs (x[t] is n*in_f ≤ 64KB — L1/L2 hits).
+        // Per-token FMA chain = v2's exactly (same k order, same fma pairs).
+        #pragma unroll 2
+        for (int k = k0 + lane * 8; k + 7 < k1; k += 32 * 8) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 f0 = __bfloat1622float2(w2[0]);
+            float2 f1 = __bfloat1622float2(w2[1]);
+            float2 f2 = __bfloat1622float2(w2[2]);
+            float2 f3 = __bfloat1622float2(w2[3]);
+            #pragma unroll
+            for (int t = 0; t < NT; t++) {
+                const float* xr = x + (size_t)t * in_f;
+                float4 xa = *reinterpret_cast<const float4*>(xr + k);
+                float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
+                acc[t] += xa.x * f0.x + xa.y * f0.y + xa.z * f1.x + xa.w * f1.y;
+                acc[t] += xb.x * f2.x + xb.y * f2.y + xb.z * f3.x + xb.w * f3.y;
+            }
+        }
+        // tail (in_f % (32*8*WPR) != 0): scalar per v2 (in_f%8==0 guaranteed
+        // by the host; the kper rounding covers the K-slice tail identically)
+    }
+    // per-token warp shuffle (the same off order as v2 per token)
+    #pragma unroll
+    for (int t = 0; t < NT; t++) {
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            acc[t] += __shfl_down_sync(0xffffffff, acc[t], off);
+        }
+    }
+    if (WPR == 1) {
+        if (lane == 0 && row < out_f) {
+            #pragma unroll
+            for (int t = 0; t < NT; t++) {
+                y[(size_t)t * out_f + row] = (bias ? bias[row] : 0.f) + acc[t];
+            }
+        }
+    } else {
+        __shared__ float part[NT][16];
+        if (lane == 0) {
+            #pragma unroll
+            for (int t = 0; t < NT; t++) part[t][warp] = acc[t];
+        }
+        __syncthreads();
+        if (warp % WPR == 0 && lane == 0) {
+            #pragma unroll
+            for (int t = 0; t < NT; t++) {
+                float sum = 0.f;
+                #pragma unroll
+                for (int j = 0; j < WPR; j++) sum += part[t][(warp / WPR) * WPR + j];
+                if (row < out_f) y[(size_t)t * out_f + row] = (bias ? bias[row] : 0.f) + sum;
+            }
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
+                                           const float* bias, float* out,
+                                           int in_f, int out_f, int nrows,
+                                           cudaStream_t s) {
+    if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
+    if (in_f & 7) return cudaErrorNotSupported; // host falls back to v2 (→v1)
+    int wpr = out_f >= 16384 ? 1 : (out_f >= 4096 ? 2 : (out_f >= 1024 ? 4 : 8));
+    int rpb = 8 / wpr;
+    dim3 grid((out_f + rpb - 1) / rpb);
+    const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    switch (nrows) {
+        case 2:  gemv_bf16_nt_kernel<2> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 3:  gemv_bf16_nt_kernel<3> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 4:  gemv_bf16_nt_kernel<4> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 5:  gemv_bf16_nt_kernel<5> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 6:  gemv_bf16_nt_kernel<6> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 7:  gemv_bf16_nt_kernel<7> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 8:  gemv_bf16_nt_kernel<8> <<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 12: gemv_bf16_nt_kernel<12><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        case 16: gemv_bf16_nt_kernel<16><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f); break;
+        default: return cudaErrorNotSupported; // host falls back to v2 batched
+    }
+    return cudaGetLastError();
+}
+
+// ============================================================
 // TRI GEMV (decode n==1): three SAME-INPUT projections in ONE kernel —
 // the gdn layer's b_raw [h,in] + f_a [dk,in] + g_a [dk,in] all read the
 // same hidden x. v1 ran three separate gemv v2 launches (3 kernel
