@@ -2429,48 +2429,62 @@ __global__ void moe_fused_down_sum_kernel(
     float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int rows) {
+    // EXPERT-PARALLEL (v11): grid (hidden, n) — 1 hidden dim per block, 8 warps
+    // = 8 experts (warp j → expert j). The old version (grid (hidden/rows, n),
+    // 1 warp per hidden dim, 8-expert serial loop) was 18.9µs/layer — the
+    // expert loop is the latency chain. Now: 8 warps compute the 8 experts'
+    // dot products in PARALLEL, warp 0 sums the partials in j=0..7 order
+    // (SAME summation order as the old serial acc += p*y — FP-SAFE).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int tok = blockIdx.y;
-    int h = blockIdx.x * rows + warp;
+    int h = blockIdx.x; // 1 hidden per block (grid (hidden, n))
     if (h >= hidden) return;
     int stride = topk * inter + inter_shared;
     const float* act_t = act + (size_t)tok * stride;
     const float* ids_t = ids_f + (size_t)tok * topk;
     const float* probs_t = probs + (size_t)tok * topk;
-    float acc = 0.f;
-    for (int j = 0; j < topk; j++) {
-        int eid = (int)ids_t[j];
-        int local = eid - expert_start;
-        if (local < 0 || local >= e_local) continue; // another rank's slot (zero act)
-        float p = probs_t[j];
-        if (p == 0.f) continue;
-        const __nv_bfloat16* dwr = down_ptrs[local] + (size_t)h * inter;
-        const float* aj = act_t + (size_t)j * inter;
-        float y = 0.f;
-        // uint4-vectorized: 8 bf16 weights + 2x float4 act per lane-step.
-        // inter%8 may be nonzero — tail handled scalar below.
-        int i = lane * 8;
-        for (; i + 7 < inter; i += 32 * 8) {
-            float4 aa = *reinterpret_cast<const float4*>(aj + i);
-            float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
-            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
-            const __nv_bfloat162* d2 = reinterpret_cast<const __nv_bfloat162*>(&dv);
-            float2 df0 = __bfloat1622float2(d2[0]), df1 = __bfloat1622float2(d2[1]);
-            float2 df2 = __bfloat1622float2(d2[2]), df3 = __bfloat1622float2(d2[3]);
-            y += aa.x * df0.x + aa.y * df0.y + aa.z * df1.x + aa.w * df1.y
-               + ab.x * df2.x + ab.y * df2.y + ab.z * df3.x + ab.w * df3.y;
-        }
-        for (; i < inter; i++) {
-            y += aj[i] * __bfloat162float(dwr[i]);
-        }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            y += __shfl_down_sync(0xffffffff, y, off);
-        }
-        acc += p * y;
-    }
-    // shared expert (slot topk, weight 1; K length = inter_shared, TP-sharded)
+    __shared__ float part[32]; // per-warp partials (topk ≤ 8, 32 max warps)
+    // Each warp j computes expert j's p*y dot product (parallel)
     {
+        int j = warp; // warp ID = expert slot
+        float py = 0.f;
+        if (j < topk) {
+            int eid = (int)ids_t[j];
+            int local = eid - expert_start;
+            if (local >= 0 && local < e_local) {
+                float p = probs_t[j];
+                if (p != 0.f) {
+                    const __nv_bfloat16* dwr = down_ptrs[local] + (size_t)h * inter;
+                    const float* aj = act_t + (size_t)j * inter;
+                    float y = 0.f;
+                    int i = lane * 8;
+                    for (; i + 7 < inter; i += 32 * 8) {
+                        float4 aa = *reinterpret_cast<const float4*>(aj + i);
+                        float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
+                        uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+                        const __nv_bfloat162* d2 = reinterpret_cast<const __nv_bfloat162*>(&dv);
+                        float2 df0 = __bfloat1622float2(d2[0]), df1 = __bfloat1622float2(d2[1]);
+                        float2 df2 = __bfloat1622float2(d2[2]), df3 = __bfloat1622float2(d2[3]);
+                        y += aa.x * df0.x + aa.y * df0.y + aa.z * df1.x + aa.w * df1.y
+                           + ab.x * df2.x + ab.y * df2.y + ab.z * df3.x + ab.w * df3.y;
+                    }
+                    for (; i < inter; i++) {
+                        y += aj[i] * __bfloat162float(dwr[i]);
+                    }
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) {
+                        y += __shfl_down_sync(0xffffffff, y, off);
+                    }
+                    if (lane == 0) py = p * y;
+                }
+            }
+        }
+        if (lane == 0) part[warp] = py;
+    }
+    // Warp 0 ALSO computes the shared expert (slot topk) — 2 dot products
+    // on the critical path (still 4.5× faster than the old 9-serial)
+    float shared_y = 0.f;
+    if (warp == 0) {
         const __nv_bfloat16* dwr = shared_down + (size_t)h * inter_shared;
         const float* as = act_t + (size_t)topk * inter;
         float y = 0.f;
@@ -2488,13 +2502,23 @@ __global__ void moe_fused_down_sum_kernel(
         for (; i < inter_shared; i++) {
             y += as[i] * __bfloat162float(dwr[i]);
         }
-#pragma unroll
+        #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             y += __shfl_down_sync(0xffffffff, y, off);
         }
-        acc += y;
+        if (lane == 0) shared_y = y;
     }
-    if (lane == 0) out[(size_t)tok * hidden + h] = acc;
+    __syncthreads();
+    // Warp 0 lane 0: sum the 8 partials in j=0..7 order (SAME as the old
+    // serial acc += p*y for j=0..7 — FP-SAFE) + the shared expert
+    if (warp == 0 && lane == 0) {
+        float acc = 0.f;
+        for (int j = 0; j < topk; j++) {
+            acc += part[j]; // j-ascending = the old serial order
+        }
+        acc += shared_y;
+        out[(size_t)tok * hidden + h] = acc;
+    }
 }
 
 // Launcher A: act stage — caller provides the act buffer
@@ -2527,16 +2551,18 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum(
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n,
     cudaStream_t s) {
-    // CRITICAL: rows must equal warps per block (256/32 = 8). The kernel
-    // assigns ONE hidden-row per warp with no stride loop — rows=128 made
-    // grid.x = hidden/128 while each block only computed 8 rows (4096-row
-    // hidden: 32 blocks × 8 = 256 rows computed, 94% of out was garbage).
-    int rows = 8;
-    dim3 grid((hidden + rows - 1) / rows, n);
+    // EXPERT-PARALLEL (v11): grid (hidden, n) — 1 hidden dim per block, 8 warps
+    // = 8 experts (warp j → expert j). The old grid (hidden/8, n) had 1 warp
+    // per hidden dim with the 8-expert serial loop (the latency chain: 9 dot
+    // products × 512 dims serial per warp = 18.9µs/layer). Now: 8 warps
+    // compute the 8 experts in PARALLEL, warp 0 also handles the shared
+    // expert + sums partials in j=0..7 order (FP-SAFE — same summation
+    // order as the old serial acc += p*y).
+    dim3 grid(hidden, n);
     moe_fused_down_sum_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
         (const __nv_bfloat16* const*)down_ptrs, (const __nv_bfloat16*)shared_down,
-        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, rows);
+        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, 8);
     return cudaGetLastError();
 }
 
