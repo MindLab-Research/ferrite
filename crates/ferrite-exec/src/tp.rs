@@ -1683,116 +1683,48 @@ impl<B: KernelBackend> TpCluster<B> {
                     cuda.enter();
 
                     // tokens_dev = [last, d1, d2] for verify input
+                    // D2H d1 and d2 (for the host embed + accept comparison).
+                    let mut d1_val = [0f32; 1];
+                    let mut d2_val = [0f32; 1];
                     {
-                        let mut d2_f32 = [0f32; 1];
-                        let r = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            d2_ptr as *mut std::ffi::c_void,
-                            &mut d2_f32[0] as *mut f32,
-                            1, cuda.stream_handle(),
-                        );
-                        if r != 0 { return Err(FerriteError::InvalidArg(format!("d2 D2H: {r}"))); }
-                        // tokens_dev[2] = d2 (4B H2D — d2 from D2H read)
-                        {
-                            let d2_i32 = d2_f32[0] as i32;
-                            let r = ferrite_kernel::cuda::memcpy_htod_i32(
-                                unsafe { tokens_ptr.add(2) }, &d2_i32, 1, cuda.stream_handle());
-                            if r != 0 { return Err(FerriteError::InvalidArg(format!("tokens_dev[2] H2D: {r}"))); }
-                        }
+                        let r1 = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            d1_ptr as *mut std::ffi::c_void, d1_val.as_mut_ptr(), 1, cuda.stream_handle());
+                        let r2 = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            d2_ptr as *mut std::ffi::c_void, d2_val.as_mut_ptr(), 1, cuda.stream_handle());
+                        if r1 != 0 || r2 != 0 { return Err(FerriteError::InvalidArg(format!("d1/d2 D2H: {r1}/{r2}"))); }
+                        // also write tokens_dev[2] = d2 (for the FERRITE_MTP_DEBUG path)
+                        let d2_i32 = d2_val[0] as i32;
+                        let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                            unsafe { tokens_ptr.add(2) }, &d2_i32, 1, cuda.stream_handle());
+                        if r != 0 { return Err(FerriteError::InvalidArg(format!("tokens_dev[2] H2D: {r}"))); }
                     }
 
-                    // embed_expand_dev: [last, d1, d2] → graph input [3, hc_mult, hidden]
-                    let nh = hc_mult * hidden;
-                    let verify_in = ferrite_kernel::cuda::DevBuf::alloc(cuda.dev(), cuda.stream(), 3 * nh)?;
-                    cuda.embed_expand_dev_buf(&embed_table, tokens_ptr, verify_in.as_f32(), 3, hidden, hc_mult)?;
+                    // Verify input: HOST embed + hc_expand (IDENTICAL to mtp_step).
+                    // The device embed_expand_dev_buf had 1-ulp drift that flipped
+                    // the verify argmax on near-ties → accept=1.0. Reverting the
+                    // verify input to the proven host path fixes the accept while
+                    // keeping the draft chain fully on device (the zero-H2D
+                    // saving: no D2H roundtrip between draft1/draft2 — the
+                    // cast_store_i32 kernel keeps the chain on device).
+                    let h2v = s.embed(&[last, d1_val[0] as u32, d2_val[0] as u32]);
+                    let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
 
-                    // D2H to the graph's pinned staging (graph reads from pinned)
-                    let io = cuda.graph_io_get(&gvname)
-                        .ok_or_else(|| FerriteError::InvalidArg(format!("mega_v graph {gvname} io missing")))?;
-                    let r = ferrite_kernel::cuda::memcpy_d2h_sync(
-                        verify_in.as_f32() as *mut std::ffi::c_void,
-                        io.x_stage as *mut f32,
-                        3 * nh,
-                        cuda.stream_handle(),
-                    );
-                    if r != 0 { return Err(FerriteError::InvalidArg(format!("verify input D2H: {r}"))); }
-
-                    // DSA advance (pinned t0/total bookkeeping, no data H2D)
-                    // NOTE: mtp_family is NOT advanced here — the verify graph
-                    // covers only the 45 decoder layers (families 0..num_dsa-1).
-                    // The MTP layer's cache advances inside the draft's
-                    // dsa_layer_dev (+1 per mtp_forward) and rolls back with
-                    // (3-k) — advancing it here too would desync t_count (each
-                    // step +k too far → draft appends at the wrong cache slot
-                    // → garbage d1, accept=1.0. This was the zero-H2D bug.)
+                    // DSA advance (pinned t0/total bookkeeping)
                     for f in 0..num_dsa {
                         cuda.dsa_host_advance(seq, f, 3);
                     }
 
-                    // Graph replay (reads from pinned staging — the graph's
-                    // internal memcpy, not a host H2D)
-                    if !cuda.graph_replay(&gvname) {
+                    // Graph replay with the host input (graph_run copies in_vals
+                    // to the pinned staging internally — same as mtp_step)
+                    let mut a = [0f32; 3];
+                    if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut a)? {
                         return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
                     }
-
-                    // Read verify argmax (3 f32 = 12 bytes D2H — for the accept
-                    // kernel's device comparison; also needed for the host seq push)
-                    let mut a = [0f32; 3];
-                    let r = ferrite_kernel::cuda::memcpy_d2h_sync(
-                        io.out_dev,
-                        a.as_mut_ptr(),
-                        3,
-                        cuda.stream_handle(),
-                    );
-                    if r != 0 { return Err(FerriteError::InvalidArg(format!("verify argmax D2H: {r}"))); }
                     let t_verify = t_v.elapsed();
                     let _ = t_verify;
 
-                    // === Phase 3: ACCEPT + COMMIT (device) ===
+                    // === Phase 3: ACCEPT + COMMIT ===
                     let t_c = std::time::Instant::now();
-                    // Host-side k (for DSA rollback bookkeeping — ns-level)
-                    let d1_i = unsafe { *(d1_ptr as *const i32) }; // read from device (f32 bit pattern → i32? no — this is wrong)
-                    let _ = d1_i; // d1 is f32, need D2H to read as int
-                    // k from host comparison (the existing logic — will be
-                    // replaced by the device accept kernel once verified)
-                    let mut d1_val = [0f32; 1];
-                    let mut d2_val = [0f32; 1];
-                    let r1 = ferrite_kernel::cuda::memcpy_d2h_sync(
-                        d1_ptr as *mut std::ffi::c_void, d1_val.as_mut_ptr(), 1, cuda.stream_handle());
-                    let r2 = ferrite_kernel::cuda::memcpy_d2h_sync(
-                        d2_ptr as *mut std::ffi::c_void, d2_val.as_mut_ptr(), 1, cuda.stream_handle());
-                    if r1 != 0 || r2 != 0 { return Err(FerriteError::InvalidArg(format!("d1/d2 D2H: {r1}/{r2}"))); }
-                    // ZERO-H2D debug: d1/d2/a comparison + verify input checksum
-                    // (d1 vs a0 mismatch = verify input path bug; checksum vs
-                    // the original hc_expand identifies embed_expand_dev issues)
-                    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                        // RAW values (no trunc — embedding magnitudes are ~0.01,
-                        // trunc() displayed them as 0.0 which looked like a bug
-                        // but is NORMAL). Plus the host expected hc_expand for
-                        // direct device-vs-host comparison.
-                        // FULL 12288-float bit-level memcmp of verify input
-                        // (device embed_expand_dev vs host hc_expand). The old
-                        // front-4/1e-3 check missed 1-ulp drift that flips a0's
-                        // argmax (S2 a0=374 vs orig 98347) — the root cause.
-                        let nv = 3 * hc_mult * 4096;
-                        let mut vin_full = vec![0f32; nv];
-                        let rc = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            io.x_stage, vin_full.as_mut_ptr(), nv, cuda.stream_handle());
-                        let h2v = s.embed(&[last, d1_val[0] as u32, d2_val[0] as u32]);
-                        let exp = crate::mhc::hc_expand(&h2v, hc_mult);
-                        let exp_s = exp.as_slice();
-                        let mut mm_ct = 0usize; let mut mm_first: i64 = -1;
-                        let mut mm_maxdiff: f32 = 0.0;
-                        for (i, (a, b)) in vin_full.iter().zip(exp_s.iter()).enumerate() {
-                            if a.to_bits() != b.to_bits() {
-                                mm_ct += 1; if mm_first < 0 { mm_first = i as i64; }
-                                let d = (*a - *b).abs(); if d > mm_maxdiff { mm_maxdiff = d; }
-                            }
-                        }
-                        eprintln!("[zh2d] d1={:.0} d2={:.0} a0={:.0} k={} vin_full: mm={}/{} first={} maxdiff={:.2e} r={}",
-                            d1_val[0], d2_val[0], a[0],
-                            if d1_val[0] as u32 == a[0] as u32 { "==" } else { "!=" },
-                            mm_ct, nv, mm_first, mm_maxdiff, rc);
-                    }
                     let k_host = if d1_val[0] as u32 == a[0] as u32 {
                         if d2_val[0] as u32 == a[1] as u32 { 3 } else { 2 }
                     } else { 1 };
