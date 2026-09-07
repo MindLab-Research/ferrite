@@ -2265,6 +2265,278 @@ impl CudaBackend {
         m.get(&(seq, family)).map(|c| c.t_count)
     }
 
+    // ============================================================
+    // BATCHED decode layers (n = B rows from B DIFFERENT seqs): the GEMM
+    // projections run at n=B (weights read ONCE per step — the user's
+    // batched-GEMM directive), while the per-seq recurrent state ops
+    // (GDN conv/state, DSA cache) run as B × n=1 kernel launches with
+    // each row's own (seq, layer/family) state pointers. Inside a CUDA
+    // graph the B launches replay at ~µs node cost — the small per-seq
+    // kernels are independent (different states) and the HBM-bound
+    // projections (95% of step time) amortize across all B rows.
+    // ============================================================
+
+    /// Batched GDN layer: x [B, hidden] → partial [B, hidden]. The
+    /// projections (qkv/b/fa/ga/fb/gb/o_proj) are n=B GEMMs; the conv FIR
+    /// + gated-deltanet core run per-seq (row r against (seqs[r], layer)'s
+    /// conv/gdn state — B × n=1 launches with row-slice pointers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_layer_dev_batched(
+        &self,
+        x: &DevBuf,
+        w: &GdnLayerWeights,
+        seqs: &[u64],
+        layer: usize,
+        n: usize,
+        hidden: usize,
+        h: usize,
+        dk: usize,
+        lb: f32,
+        rms_eps: f32,
+        conv_size: usize,
+    ) -> Result<DevBuf> {
+        self.enter();
+        let proj = h * dk;
+        let ni = n as i32;
+        let ch = 3 * proj;
+        let hist = conv_size.saturating_sub(1).max(1);
+        // 1. projections — n=B GEMMs (the batched-GEMM directive: weights
+        // stream once for all B rows; per-row accumulation is the tiled
+        // GEMM's, matching the prefill's numeric domain).
+        let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
+        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
+        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
+        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?;
+        let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
+        let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
+        let dw_conv = self.dev_weight(w.conv_w)?;
+        // 2. per-seq causal conv: row r's qkv slice → (seqs[r], layer)'s
+        // conv tail state (RMW in place). B × n=1 launches.
+        let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
+        for (r, &seq_r) in seqs.iter().enumerate() {
+            let conv_state = self.dev_state(&self.conv_states, (seq_r, layer), ch * hist)?;
+            ck(
+                unsafe {
+                    ferrite_causal_conv1d(
+                        qkv.as_const_f32().add(r * ch), dw_conv.as_const_f32(), conv_state,
+                        conv_out.as_f32().add(r * ch), conv_state, 1, ch as i32, conv_size as i32, self.stream,
+                    )
+                },
+                "conv1d_batched_row",
+            )?;
+        }
+        // 3. gdn_prep n=B (row-independent: silu + split + L2 + beta + gate)
+        let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let v = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let beta = DevBuf::alloc(self.dev, self.stream, n * h)?;
+        let gate = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        let dw_dt = self.dev_weight(w.dt_bias)?;
+        let dw_al = self.dev_weight(w.a_log)?;
+        ck(
+            unsafe {
+                ferrite_gdn_prep(
+                    conv_out.as_const_f32(), b_raw.as_const_f32(), fb.as_const_f32(),
+                    dw_dt.as_const_f32(), dw_al.as_const_f32(),
+                    q.as_f32(), k.as_f32(), v.as_f32(), beta.as_f32(), gate.as_f32(),
+                    ni, h as i32, dk as i32, lb, self.stream,
+                )
+            },
+            "gdn_prep_batched",
+        )?;
+        // 4. per-seq gated-deltanet core: row r against (seqs[r], layer)'s
+        // [h, dk, dk] state. B × n=1 gdn_chunk_v2 launches.
+        let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        for (r, &seq_r) in seqs.iter().enumerate() {
+            let gdn_state = self.dev_state(&self.gdn_states, (seq_r, layer), h * dk * dk)?;
+            ck(
+                unsafe {
+                    ferrite_gdn_chunk_v2(
+                        q.as_const_f32().add(r * proj), k.as_const_f32().add(r * proj),
+                        v.as_const_f32().add(r * proj),
+                        beta.as_const_f32().add(r * h), gate.as_const_f32().add(r * proj),
+                        dw_al.as_const_f32(),
+                        gdn_state, core.as_f32().add(r * proj), 1, h as i32, dk as i32, dk as i32, self.stream,
+                    )
+                },
+                "gdn_chunk_batched_row",
+            )?;
+        }
+        // 5. gated rmsnorm n=B (row-independent) + o_proj GEMM n=B
+        let o_norm_w = self.dev_weight(w.o_norm)?;
+        let normed = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+        ck(
+            unsafe {
+                ferrite_gated_rmsnorm(
+                    core.as_const_f32(), gb.as_const_f32(), o_norm_w.as_const_f32(),
+                    normed.as_f32(), (n * h) as i32, dk as i32, rms_eps, self.stream,
+                )
+            },
+            "gdn_norm_batched",
+        )?;
+        let partial = self.matmul_dev(&normed, w.o_proj, ni, proj as i32, hidden as i32)?;
+        Ok(partial)
+    }
+
+    /// Batched DSA layer: x [B, hidden] → partial [B, hidden]. Projections
+    /// are n=B GEMMs; the cache append + kpool + indexer topk + pool expand
+    /// + sparse attention run per-seq (row r against (seqs[r], family)'s
+    /// DSA cache at its own t0 — B × n=1 launches). The per-(seq, family)
+    /// host bookkeeping (t_count += 1, pinned t0/total write) runs here —
+    /// same as dsa_layer_dev, per row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsa_layer_dev_batched(
+        &self,
+        x: &DevBuf,
+        w: &DsaLayerWeights,
+        seqs: &[u64],
+        family: usize,
+        n: usize,
+        hidden: usize,
+    ) -> Result<DevBuf> {
+        self.enter();
+        let ni = n as i32;
+        let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
+        // 1-6. projections + layernorm + scale — n=B GEMMs (row-independent
+        // norms). The kvb/ki/gate rows feed the per-seq cache appends below.
+        let qa = self.matmul_dev(x, w.q_a, ni, hidden as i32, (w.q_a.shape.0[0]) as i32)?;
+        let qa_ln = self.rmsnorm_dev(&qa, w.q_a_ln, w.rms_eps, n, w.q_a.shape.0[0])?;
+        let qb = self.matmul_dev(&qa_ln, w.q_b, ni, w.q_a.shape.0[0] as i32, (h * dk) as i32)?;
+        let latent = self.matmul_dev(x, w.kv_a, ni, hidden as i32, (w.kv_a.shape.0[0]) as i32)?;
+        let kv_ln = self.rmsnorm_dev(&latent, w.kv_a_ln, w.rms_eps, n, w.kv_a.shape.0[0])?;
+        let kvb = self.matmul_dev(&kv_ln, w.kv_b, ni, w.kv_a.shape.0[0] as i32, (h * (dk + dv)) as i32)?;
+        let qi = self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?;
+        let ki_raw = self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?;
+        let w_idx = self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?;
+        let gate = self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?;
+        let ki = DevBuf::alloc(self.dev, self.stream, n * idm)?;
+        let knw = self.dev_weight(w.k_norm_w)?;
+        let knb = self.dev_weight(w.k_norm_b)?;
+        ck(
+            unsafe { ferrite_layernorm_affine(ki_raw.as_const_f32(), knw.as_const_f32(), knb.as_const_f32(), ki.as_f32(), ni, idm as i32, self.stream) },
+            "dsa_layernorm_batched",
+        )?;
+        ck(
+            unsafe { ferrite_scale_inplace(w_idx.as_f32(), (ih as f32).sqrt().recip(), (n * ih) as i32, self.stream) },
+            "dsa_widx_scale_batched",
+        )?;
+
+        // Per-seq: cache append + kpool + topk + expand + attention.
+        // Scratch buffers allocated OUTSIDE the loop (attn_out [B, h*dv]
+        // accumulates all rows for the shared o_proj; per-iteration scratch
+        // reuses the same pool addresses deterministically — graph-stable).
+        let max_npools = (8192 + kpool - 1) / kpool;
+        let attn_out = DevBuf::alloc(self.dev, self.stream, n * h * dv)?;
+        let dape = self.dev_weight(w.ape)?;
+        for (r, &seq_r) in seqs.iter().enumerate() {
+            // 7. cache append — (seq_r, family) get-or-create + host t0
+            // bookkeeping (identical to dsa_layer_dev's, n=1 per row).
+            // Copy the raw pointers out FIRST (Copy types — the immutable
+            // borrow ends), then mutate t_count (E0502: get's borrow must
+            // not span the get_mut).
+            let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, pinned_t0, pinned_total, total) = {
+                let mut m = self.dsa_caches.lock().unwrap();
+                let existing = m
+                    .get(&(seq_r, family))
+                    .filter(|c| !c.k_nope.is_null())
+                    .map(|c| (c.k_nope, c.v, c.k_idx, c.k_gate, c.pinned_t0, c.pinned_total, c.t_count));
+                match existing {
+                    Some((kn, vv, ki_, kg, pt0, ptot, t0)) => {
+                        m.get_mut(&(seq_r, family)).unwrap().t_count += 1;
+                        unsafe {
+                            *pt0 = t0 as i32;
+                            *ptot = (t0 + 1) as i32;
+                        }
+                        (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32, t0 + 1)
+                    }
+                    None => {
+                        let max_tokens = 8192usize;
+                        let kn = self.dsa_alloc(max_tokens * h * dk)?;
+                        let vv = self.dsa_alloc(max_tokens * h * dv)?;
+                        let ki_ = self.dsa_alloc(max_tokens * idm)?;
+                        let kg = self.dsa_alloc(max_tokens * idm)?;
+                        let mut pt0: *mut i32 = std::ptr::null_mut();
+                        let mut ptot: *mut i32 = std::ptr::null_mut();
+                        ck(unsafe { cudaMallocHost(&mut pt0 as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "pinned t0")?;
+                        ck(unsafe { cudaMallocHost(&mut ptot as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "pinned total")?;
+                        unsafe { *pt0 = 0; *ptot = 1; }
+                        m.insert(
+                            (seq_r, family),
+                            DsaCacheState { k_nope: kn, v: vv, k_idx: ki_, k_gate: kg, max_tokens, t_count: 1, pinned_t0: pt0, pinned_total: ptot },
+                        );
+                        (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32, 1)
+                    }
+                }
+            };
+            // row r's kvb/ki/gate slices → the per-seq cache at its t0
+            ck(
+                unsafe {
+                    ferrite_dsa_cache_append(
+                        kvb.as_const_f32().add(r * h * (dk + dv)),
+                        ki.as_const_f32().add(r * idm),
+                        gate.as_const_f32().add(r * idm),
+                        k_nope_dev as *mut f32, v_dev as *mut f32, k_idx_dev as *mut f32, k_gate_dev as *mut f32,
+                        pinned_t0, 1, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
+                    )
+                },
+                "dsa_append_batched_row",
+            )?;
+            // 8. kpool compression — per-seq cache (pool_keys reused across
+            // rows: same pool address, sequential stream order — graph-safe)
+            let pool_keys = DevBuf::alloc(self.dev, self.stream, max_npools * idm)?;
+            ck(
+                unsafe {
+                    ferrite_kpool_compress(
+                        k_idx_dev as *const f32, k_gate_dev as *const f32, dape.as_const_f32(), pool_keys.as_f32(),
+                        pinned_total, max_npools as i32, kpool as i32, idm as i32, self.stream,
+                    )
+                },
+                "dsa_kpool_batched_row",
+            )?;
+            // 9. indexer topk (row r's qi/w_idx slices vs the per-seq pool keys)
+            let npools = (total + kpool - 1) / kpool;
+            let select_k = (w.topk / kpool).min(npools);
+            let idx_pools = DevBuf::alloc(self.dev, self.stream, 1 * select_k)?;
+            ck(
+                unsafe {
+                    ferrite_indexer_topk(
+                        qi.as_const_f32().add(r * ih * idm), pool_keys.as_const_f32(), w_idx.as_const_f32().add(r * ih),
+                        idx_pools.as_f32(), 1, ih as i32, idm as i32,
+                        select_k as i32, pinned_total, kpool as i32, 1, self.stream,
+                    )
+                },
+                "dsa_topk_batched_row",
+            )?;
+            // 10. expand pools → token indices
+            let out_width = select_k * kpool + (kpool - 1);
+            let idx = DevBuf::alloc(self.dev, self.stream, 1 * out_width)?;
+            ck(
+                unsafe {
+                    ferrite_pool_expand(
+                        idx_pools.as_const_f32(), idx.as_f32(),
+                        1, select_k as i32, kpool as i32, max_npools as i32, pinned_total,
+                        1, self.stream,
+                    )
+                },
+                "dsa_pool_expand_batched_row",
+            )?;
+            // 11. sparse attention (row r's qb vs the per-seq cache) → attn_out row
+            ck(
+                unsafe {
+                    ferrite_sparse_attn_v2(
+                        qb.as_const_f32().add(r * h * dk), k_nope_dev as *const f32, v_dev as *const f32, idx.as_const_f32(),
+                        attn_out.as_f32().add(r * h * dv), 1, pinned_total, h as i32, dk as i32, dv as i32,
+                        out_width as i32, self.stream,
+                    )
+                },
+                "dsa_sparse_attn_batched_row",
+            )?;
+        }
+        // 12. o_proj GEMM n=B
+        let partial = self.matmul_dev(&attn_out, w.o_proj, ni, (h * dv) as i32, hidden as i32)?;
+        Ok(partial)
+    }
+
     /// Debug getter: (k_nope device ptr, t_count) for a family's cache.
     pub fn mtp_family_cache(&self, seq: u64, family: usize) -> Result<(*mut std::ffi::c_void, usize)> {
         let m = self.dsa_caches.lock().unwrap();
@@ -3035,6 +3307,17 @@ impl CudaBackend {
     }
     pub fn graph_io_get(&self, name: &str) -> Option<GraphIO> {
         self.graph_io.lock().unwrap().get(name).cloned()
+    }
+    /// Destroy a named graph (exec + IO entry) — the batched decode's
+    /// composition lifecycle: the "megab_{seqs}" graph's recorded kernel args
+    /// embed per-seq state pointers; a seq's retirement frees those states,
+    /// so the graph MUST be destroyed before the freed pointers replay.
+    /// The next decode_step_batched recaptures for the new composition.
+    pub fn graph_destroy(&self, name: &str) {
+        if let Some(exec) = self.graph_execs.lock().unwrap().remove(name) {
+            unsafe { cudaGraphExecDestroy(exec as *mut std::ffi::c_void) };
+        }
+        self.graph_io.lock().unwrap().remove(name);
     }
     /// Replay a segment graph with fresh input: write `input` to the
     /// captured staging, launch, download the output. (capture never

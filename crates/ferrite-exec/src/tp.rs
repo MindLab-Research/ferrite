@@ -746,6 +746,141 @@ impl<B: KernelBackend> TpCluster<B> {
         });
     }
 
+    /// Destroy a batched-decode graph ("megab_*") on all ranks — the
+    /// composition lifecycle: a seq's retirement frees its per-seq states
+    /// (the graph's recorded kernel args reference them) — the graph MUST
+    /// be destroyed before a replay would touch freed pointers. The next
+    /// decode_step_batched for the new composition captures fresh.
+    pub fn destroy_batch_graph(&mut self, name: &str) {
+        #[cfg(feature = "cuda")]
+        Self::fan_out(&mut self.shards, |s| {
+            if let Some(cuda) = s.backend.as_cuda() {
+                cuda.graph_destroy(name);
+            }
+        });
+    }
+
+    /// ONE decode step for B seqs (the true-batched decode, Step A — non-MTP):
+    /// a single mega graph covering ALL live seqs. The projections run at
+    /// n=B GEMM (weights stream once per step for all B rows — the batched
+    /// GEMM directive), the per-seq recurrent state ops (GDN conv/state, DSA
+    /// caches) run as B × n=1 in-graph launches with each row's own
+    /// (seq, layer/family) state pointers. The graph is keyed by the
+    /// composition ("megab_{s1}_{s2}..."): a membership change re-captures
+    /// (~1-2s, amortized over 1000-token streams). The dry-run + capture
+    /// pattern mirrors decode_step_mega (the dry-run IS the step's real
+    /// output — its state advances stick; the capture records only).
+    #[cfg(feature = "cuda")]
+    pub fn decode_step_batched(&mut self, seqs: &[u64]) -> Result<Vec<u32>> {
+        let n = seqs.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let plans = build_layer_plans(&self.full_cfg);
+        let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
+        let gname = format!(
+            "megab_{}",
+            seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("_")
+        );
+        // B rows' last tokens → embed (replicated table) → hc_expand [B, nh]
+        let last_toks: Vec<u32> = seqs
+            .iter()
+            .map(|&seq_r| -> Result<u32> {
+                let s = self
+                    .shards[0]
+                    .seq_runtime(seq_r)
+                    .ok_or_else(|| FerriteError::Config(format!("batched: missing seq {seq_r}")))?;
+                Ok(*s
+                    .tokens
+                    .last()
+                    .ok_or_else(|| FerriteError::Config("empty context".into()))?)
+            })
+            .collect::<Result<Vec<u32>>>()?;
+        let h0 = self.shards[0].embed(&last_toks);
+        let in_vals = crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult);
+
+        let have_graph = self
+            .shards[0]
+            .backend
+            .as_cuda()
+            .map(|c| c.graph_io_get(&gname).is_some())
+            .unwrap_or(false);
+        if !have_graph {
+            // Capture path: dry-run (REAL execution — warms every pool class,
+            // creates every (seq, layer/family) state, advances every seq's
+            // DSA t_count + GDN states; returns the step's B tokens) then
+            // capture (records only; the pre-capture DSA rollback keeps the
+            // recorded pinned t0/total matching the dry-run's).
+            let toks = Self::fan_out(&mut self.shards, |s| {
+                Self::mega_chain_dev_batched(
+                    s, seqs, in_vals.as_slice(), &plans, num_dsa, false, &gname, n,
+                )
+            })
+            .into_iter()
+            .collect::<Result<Vec<Vec<f32>>>>()?;
+            Self::fan_out(&mut self.shards, |s| {
+                Self::mega_chain_dev_batched(
+                    s, seqs, in_vals.as_slice(), &plans, num_dsa, true, &gname, n,
+                )
+            })
+            .into_iter()
+            .collect::<Result<Vec<Vec<f32>>>>()?;
+            eprintln!(
+                "[megab] captured {gname}: {n} seqs, {} layers (B-row GEMM + per-seq state kernels)",
+                plans.len()
+            );
+            let out: Vec<u32> = toks[0].iter().map(|t| *t as u32).collect();
+            for (i, &seq_r) in seqs.iter().enumerate() {
+                for s in &mut self.shards {
+                    if let Some(rt) = s.seq_runtime_mut(seq_r) {
+                        rt.tokens.push(out[i]);
+                    }
+                }
+            }
+            return Ok(out);
+        }
+        // Steady state: per-seq DSA pinned advance (B × num_dsa host writes)
+        // + ONE graph replay + B tokens D2H — the entire B-seq step is
+        // graph-resident (per-seq kernels included).
+        let t0 = std::time::Instant::now();
+        let toks = Self::fan_out(&mut self.shards, |s| {
+            let cuda = s
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("batched needs cuda".into()))?;
+            cuda.enter();
+            for &seq_r in seqs {
+                for f in 0..num_dsa {
+                    cuda.dsa_host_advance(seq_r, f, 1);
+                }
+            }
+            let mut out = vec![0f32; n];
+            if !cuda.graph_run(&gname, in_vals.as_slice(), &mut out)? {
+                return Err(FerriteError::InvalidArg(format!("batched graph {gname} missing")));
+            }
+            Ok(out)
+        })
+        .into_iter()
+        .collect::<Result<Vec<Vec<f32>>>>()?;
+        if std::env::var_os("FERRITE_TIMING").is_some() {
+            let dt = t0.elapsed();
+            eprintln!(
+                "[megab] replay {n} seqs: {:.2}ms ({:.1} tok/s aggregate)",
+                dt.as_secs_f32() * 1e3,
+                n as f64 / dt.as_secs_f64().max(1e-9)
+            );
+        }
+        let out: Vec<u32> = toks[0].iter().map(|t| *t as u32).collect();
+        for (i, &seq_r) in seqs.iter().enumerate() {
+            for s in &mut self.shards {
+                if let Some(rt) = s.seq_runtime_mut(seq_r) {
+                    rt.tokens.push(out[i]);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Decode one token. Returns the sampled token id.
     pub fn decode_step(&mut self, seq: u64) -> Result<u32> {
         // CUDA graph fast path: FERRITE_GRAPH=1 → first decode_step captures
@@ -2264,6 +2399,240 @@ fn mega_chain_dev(
             );
         }
         cuda.small_n_rows.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(tv)
+    }
+}
+
+// ============================================================
+// BATCHED decode chain (Step A of the true-batched decode): ONE graph step
+// for B seqs. The projections run at n=B GEMM (weights stream ONCE for all
+// B rows — the user's batched-GEMM directive), while the per-seq recurrent
+// state ops (GDN conv/state, DSA caches) run as B × n=1 kernel launches
+// with each row's own (seq, layer/family) state pointers — inside ONE CUDA
+// graph (replay node cost ~µs). The GEMM accumulation differs from the
+// n=1 GEMV path by 1-ulp-class rounding (accepted — prefill's GEMM domain).
+// Composition change (a seq joins/leaves) → re-capture (~1-2s, amortized
+// over 1000-token streams). Non-MTP path (MTP forces max_seqs=1).
+// ============================================================
+#[cfg(feature = "cuda")]
+fn mega_chain_dev_batched(
+    s: &mut Engine<B>,
+    seqs: &[u64],
+    in_vals: &[f32],
+    plans: &[ferrite_model::LayerPlan],
+    num_dsa: usize,
+    capture: bool,
+    gname: &str,
+    n: usize,
+) -> Result<Vec<f32>> {
+    use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights, GdnLayerWeights, GraphIO};
+    let cuda = s
+        .backend
+        .as_cuda()
+        .ok_or_else(|| FerriteError::Config("batched needs cuda backend".into()))?;
+    let nccl = s
+        .nccl
+        .clone()
+        .ok_or_else(|| FerriteError::Config("batched needs FERRITE_NCCL=1".into()))?;
+    cuda.enter();
+    let cfg = &s.cfg;
+    let (hidden, hc_mult) = (cfg.hidden_size, cfg.hc_mult);
+    let nh = hc_mult * hidden;
+    let topk = cfg.num_experts_per_tok;
+    let e = cfg.n_routed_experts;
+
+    let _guard = if capture {
+        // Pre-capture rollback: the dry-run advanced each seq's DSA t_count
+        // by 1 per family (real kernels executed); the capture pass re-runs
+        // the host bookkeeping (+1 per seq per family) — roll back so the
+        // recorded pinned t0/total match the dry-run's, and t_count lands
+        // back at the real cache count after the capture pass. (The per-seq
+        // GDN/conv states need no rollback — capture records without
+        // executing, and the dry-run's state advance IS the real step.)
+        for &seq_r in seqs {
+            for f in 0..num_dsa {
+                cuda.dsa_host_rollback(seq_r, f, 1);
+            }
+        }
+        // Serialize per-rank captures (concurrent cuGraphInstantiate
+        // SIGSEGV'd historically); record-mode NCCL enqueue never
+        // rendezvous, so serialized capture is deadlock-free.
+        Some(ferrite_kernel::cuda::capture_lock().lock().unwrap())
+    } else {
+        None
+    };
+    if capture {
+        cuda.graph_capture_begin();
+    }
+
+    let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
+    res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
+    let x_stage = res.stage; // GraphIO: replay writes fresh input here
+
+    for (layer_idx, plan) in plans.iter().enumerate() {
+        let pfx = format!("model.layers.{layer_idx}");
+        // A: hc_pre (n=B — row-independent)
+        let (li, post_a, comb_a) = cuda.hc_pre_dev(
+            &res,
+            s.w(&format!("{pfx}.hc_attn_fn"))?,
+            s.w(&format!("{pfx}.hc_attn_scale"))?,
+            s.w(&format!("{pfx}.hc_attn_base"))?,
+            s.w(&format!("{pfx}.input_layernorm.weight"))?,
+            n,
+            nh,
+            cfg.rms_norm_eps,
+            cfg.hc_eps,
+            cfg.hc_sinkhorn_iters,
+        )?;
+        let hn = li;
+        // B: attention — the batched per-seq dispatch (n=B GEMM projections
+        // + B × n=1 per-seq state kernels)
+        let partial = match plan.attn {
+            AttnKind::Linear => {
+                let la = &cfg.linear_attn;
+                let gw = GdnLayerWeights {
+                    qkv_proj: s.w(&format!("{pfx}.self_attn.qkv_proj.weight"))?,
+                    b_proj: s.w(&format!("{pfx}.self_attn.b_proj.weight"))?,
+                    f_a: s.w(&format!("{pfx}.self_attn.f_a_proj.weight"))?,
+                    f_b: s.w(&format!("{pfx}.self_attn.f_b_proj.weight"))?,
+                    g_a: s.w(&format!("{pfx}.self_attn.g_a_proj.weight"))?,
+                    g_b: s.w(&format!("{pfx}.self_attn.g_b_proj.weight"))?,
+                    conv_w: s.w(&format!("{pfx}.self_attn.qkv_conv1d.weight"))?,
+                    dt_bias: s.w(&format!("{pfx}.self_attn.dt_bias"))?,
+                    a_log: s.w(&format!("{pfx}.self_attn.A_log"))?,
+                    o_norm: s.w(&format!("{pfx}.self_attn.o_norm.weight"))?,
+                    o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                };
+                cuda.gdn_layer_dev_batched(
+                    &hn, &gw, seqs, layer_idx, n, hidden,
+                    la.num_heads, la.head_dim, la.gate_lower_bound,
+                    cfg.rms_norm_eps, la.short_conv_kernel_size,
+                )?
+            }
+            AttnKind::Dsa => {
+                let d = &cfg.dsa;
+                let (dsa_h, dsa_dk, dsa_dv, _ip) = s.dsa_dims();
+                let w = DsaLayerWeights {
+                    q_a: s.w(&format!("{pfx}.self_attn.q_a_proj.weight"))?,
+                    q_a_ln: s.w(&format!("{pfx}.self_attn.q_a_layernorm.weight"))?,
+                    q_b: s.w(&format!("{pfx}.self_attn.q_b_proj.weight"))?,
+                    kv_a: s.w(&format!("{pfx}.self_attn.kv_a_proj_with_mqa.weight"))?,
+                    kv_a_ln: s.w(&format!("{pfx}.self_attn.kv_a_layernorm.weight"))?,
+                    kv_b: s.w(&format!("{pfx}.self_attn.kv_b_proj.weight"))?,
+                    wq_b: s.w(&format!("{pfx}.self_attn.indexer.wq_b.weight"))?,
+                    wk: s.w(&format!("{pfx}.self_attn.indexer.wk.weight"))?,
+                    k_norm_w: s.w(&format!("{pfx}.self_attn.indexer.k_norm.weight"))?,
+                    k_norm_b: s.w(&format!("{pfx}.self_attn.indexer.k_norm.bias"))?,
+                    weights_proj: s.w(&format!("{pfx}.self_attn.indexer.weights_proj.weight"))?,
+                    gate: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_gate"))?,
+                    ape: s.w(&format!("{pfx}.self_attn.indexer.index_kpool_compress_ape"))?,
+                    o_proj: s.w(&format!("{pfx}.self_attn.o_proj.weight"))?,
+                    h: dsa_h,
+                    dk: dsa_dk,
+                    dv: dsa_dv,
+                    ih: d.index_n_heads,
+                    idm: d.index_head_dim,
+                    kpool: 4,
+                    topk: d.index_topk,
+                    rms_eps: cfg.rms_norm_eps,
+                };
+                let family = s.dsa_family_index(layer_idx);
+                cuda.dsa_layer_dev_batched(&hn, &w, seqs, family, n, hidden)?
+            }
+        };
+        nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        // C: hc_post → hc_pre2
+        let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
+        let (li2, post_f, comb_f) = cuda.hc_pre_dev(
+            &res_mid,
+            s.w(&format!("{pfx}.hc_ffn_fn"))?,
+            s.w(&format!("{pfx}.hc_ffn_scale"))?,
+            s.w(&format!("{pfx}.hc_ffn_base"))?,
+            s.w(&format!("{pfx}.post_attention_layernorm.weight"))?,
+            n,
+            nh,
+            cfg.rms_norm_eps,
+            cfg.hc_eps,
+            cfg.hc_sinkhorn_iters,
+        )?;
+        let hfn = li2;
+        // D: FFN (MoE/Dense — n=B, row-independent; the existing n>1 kernels)
+        let partial2 = match plan.mlp {
+            MlpKind::Moe => {
+                let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
+                    Some(b) => b.clone(),
+                    None => Tensor::zeros(Shape::new([e]), DType::F32),
+                };
+                let gate_w = s.w(&format!("{pfx}.mlp.gate.weight"))?;
+                let shared = ExpertWeights {
+                    gate: s.w(&format!("{pfx}.mlp.shared_expert.gate_proj.weight"))?,
+                    up: s.w(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))?,
+                    down: s.w(&format!("{pfx}.mlp.shared_expert.down_proj.weight"))?,
+                };
+                let (es, ee) = s.tp_expert_range.unwrap_or((0, e));
+                let experts: Vec<ExpertWeights> = (es..ee)
+                    .map(|eid| {
+                        Ok(ExpertWeights {
+                            gate: s.w(&format!("{pfx}.mlp.experts.{eid}.gate_proj.weight"))?,
+                            up: s.w(&format!("{pfx}.mlp.experts.{eid}.up_proj.weight"))?,
+                            down: s.w(&format!("{pfx}.mlp.experts.{eid}.down_proj.weight"))?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let mut probs = DevBuf::alloc(cuda.dev(), cuda.stream(), n * topk)?;
+                cuda.moe_layer_dev(
+                    &hfn, gate_w, &bias, &shared, &experts, es, &mut probs,
+                    n, hidden, topk, e, cfg.routed_scaling_factor, cfg.swiglu_limit,
+                )?
+            }
+            MlpKind::Dense => {
+                let w_gate = s.w(&format!("{pfx}.mlp.gate_proj.weight"))?;
+                let w_up = s.w(&format!("{pfx}.mlp.up_proj.weight"))?;
+                let w_down = s.w(&format!("{pfx}.mlp.down_proj.weight"))?;
+                let hi = hidden as i32;
+                let inter = w_gate.shape.0[0] as i32;
+                let g = cuda.matmul_dev(&hfn, w_gate, n as i32, hi, inter)?;
+                let u = cuda.matmul_dev(&hfn, w_up, n as i32, hi, inter)?;
+                let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, cfg.swiglu_limit)?;
+                cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
+            }
+        };
+        nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        // E: hc_post2 → next layer's residual
+        res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+    }
+    // head: contract → model.norm → lm_head → argmax (all n=B; redundant per
+    // rank — identical data after the ARs, replicated weights)
+    let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
+    let hn_head = cuda.rmsnorm_dev(
+        &h_final,
+        s.w("model.norm.weight")?,
+        cfg.rms_norm_eps,
+        n,
+        hidden,
+    )?;
+    let lm_w = s.w("lm_head.weight")?;
+    let logits = cuda.matmul_dev(&hn_head, lm_w, n as i32, hidden as i32, cfg.vocab_size as i32)?;
+    let mut arg = DevBuf::alloc(cuda.dev(), cuda.stream(), n)?;
+    cuda.argmax_dev(&logits, &mut arg, n, cfg.vocab_size)?;
+
+    if capture {
+        cuda.graph_capture_end(gname);
+        drop(_guard);
+        cuda.graph_io_put(
+            gname,
+            GraphIO {
+                x_stage,
+                x_len: n * nh,
+                out_dev: arg.as_f32() as *mut std::ffi::c_void,
+                out_len: n,
+            },
+        );
+        std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
+        Ok(Vec::new())
+    } else {
+        let mut tv = vec![0f32; n];
+        arg.download(&mut tv)?;
         Ok(tv)
     }
 }

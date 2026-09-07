@@ -69,6 +69,13 @@ pub struct GpuEngine {
     stops: Vec<u32>,
     max_seqs: usize,
     ticks: u64,
+    /// The current batched-decode graph's composition name
+    /// ("megab_{s1}_{s2}..."). A membership change (admission / retirement /
+    /// cancel) destroys the old graph — its captured kernel args embed the
+    /// member seqs' per-seq state pointers, which free_seq releases. The
+    /// next tick captures fresh for the new composition (~1-2s, amortized
+    /// over 1000-token streams).
+    batch_graph: Option<String>,
 }
 
 impl GpuEngine {
@@ -94,6 +101,7 @@ impl GpuEngine {
             stops,
             max_seqs,
             ticks: 0,
+            batch_graph: None,
         }
     }
 
@@ -109,6 +117,14 @@ impl GpuEngine {
 
     /// Release the seq's GPU state + drop the arena entry (idempotent).
     fn free(&mut self, seq: SeqId) {
+        // The batched graph's captured kernel args embed the member seqs'
+        // per-seq state pointers ((seq, layer) GDN states, (seq, family) DSA
+        // caches) — free_seq releases those. Destroy the graph BEFORE the
+        // states go away (a replay after free = use-after-free on the GPU).
+        // The next tick captures fresh for the new composition.
+        if let Some(name) = self.batch_graph.take() {
+            self.cluster.destroy_batch_graph(&name);
+        }
         // Read the params immutably, snapshot the output (needs &self),
         // then free the GPU state + update the arena (&mut self) —
         // sequenced to avoid the borrow conflict.
@@ -192,45 +208,114 @@ impl ServeEngine for GpuEngine {
                 plan.admissions.push(Admission { seq, row: 0, prefix_hit: 0 });
             }
         }
-        // 2. Decode round-robin: one cluster step per live seq per tick
-        //    (~20ms graph replay each; the first step per seq pays the
-        //    mega-graph capture, seconds — logged by the cluster).
+        // 2. Decode — the TRUE BATCHED path (non-MTP): ONE graph step for
+        //    ALL live seqs. The projections run at n=B GEMM (weights stream
+        //    once per step for all B rows — the batched-GEMM directive);
+        //    the per-seq recurrent state ops (GDN conv/state, DSA caches) run
+        //    as B × n=1 in-graph launches with each row's own state
+        //    pointers. Composition change (admission/retirement) re-captures
+        //    (~1-2s, amortized over 1000-token streams).
+        //    MTP: the per-seq round-robin (MtpState is a per-rank singleton —
+        //    the batched MTP is Step B; FERRITE_MTP already forces max_seqs=1
+        //    so this branch degenerates to a single live seq).
+        let mtp_mode = std::env::var_os("FERRITE_MTP").is_some();
         let mut retired: Vec<SeqId> = Vec::new();
-        for i in 0..self.live.len() {
-            let seq = self.live[i];
-            let (cluster_seq, prompt_len, max_new, prev_len) = match self.arena.get(seq) {
-                Some(g) => (g.cluster_seq, g.prompt_len, g.max_new, g.prev_len),
-                None => continue,
-            };
-            self.cluster.decode_step(cluster_seq)?;
-            let rt_len = self
-                .cluster
-                .shards
-                .first()
-                .and_then(|s| s.seq_runtime(cluster_seq))
-                .map(|rt| rt.tokens.len())
-                .unwrap_or(0);
-            let stopped = rt_len > prev_len
-                && self
-                    .cluster
-                    .shards
-                    .first()
-                    .and_then(|s| s.seq_runtime(cluster_seq))
-                    .map(|rt| rt.tokens[prev_len..].iter().any(|t| self.stops.contains(t)))
-                    .unwrap_or(false);
-            if let Some(g) = self.arena.get_mut(seq) {
-                g.prev_len = rt_len;
-            }
-            let generated = rt_len.saturating_sub(prompt_len);
-            if stopped || generated >= max_new {
-                // Snapshot before the mutable borrow (the driver reads
-                // output once after retirement, then deregisters).
-                let snapshot = self.incremental(cluster_seq, prompt_len);
-                if let Some(g) = self.arena.get_mut(seq) {
-                    g.retired = true;
-                    g.final_out = Some(snapshot);
+        if !self.live.is_empty() {
+            if mtp_mode {
+                // per-seq round-robin (the legacy single-seq path — MTP's
+                // single-seq constraint; decode_step handles mega/MTP)
+                for i in 0..self.live.len() {
+                    let seq = self.live[i];
+                    let (cluster_seq, prompt_len, max_new, prev_len) = match self.arena.get(seq) {
+                        Some(g) => (g.cluster_seq, g.prompt_len, g.max_new, g.prev_len),
+                        None => continue,
+                    };
+                    self.cluster.decode_step(cluster_seq)?;
+                    let rt_len = self
+                        .cluster
+                        .shards
+                        .first()
+                        .and_then(|s| s.seq_runtime(cluster_seq))
+                        .map(|rt| rt.tokens.len())
+                        .unwrap_or(0);
+                    let stopped = rt_len > prev_len
+                        && self
+                            .cluster
+                            .shards
+                            .first()
+                            .and_then(|s| s.seq_runtime(cluster_seq))
+                            .map(|rt| rt.tokens[prev_len..].iter().any(|t| self.stops.contains(t)))
+                            .unwrap_or(false);
+                    if let Some(g) = self.arena.get_mut(seq) {
+                        g.prev_len = rt_len;
+                    }
+                    let generated = rt_len.saturating_sub(prompt_len);
+                    if stopped || generated >= max_new {
+                        let snapshot = self.incremental(cluster_seq, prompt_len);
+                        if let Some(g) = self.arena.get_mut(seq) {
+                            g.retired = true;
+                            g.final_out = Some(snapshot);
+                        }
+                        retired.push(seq);
+                    }
                 }
-                retired.push(seq);
+            } else {
+                // BATCHED: one decode_step_batched for the whole live set —
+                // the graph composition is the ordered live cluster seqs.
+                let live_seqs: Vec<u64> = self
+                    .live
+                    .iter()
+                    .filter_map(|seq| self.arena.get(*seq).map(|g| g.cluster_seq))
+                    .collect();
+                let batch_name = format!(
+                    "megab_{}",
+                    live_seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("_")
+                );
+                if self.batch_graph.as_deref() != Some(batch_name.as_str()) {
+                    // Composition changed (admission/retirement freed the old
+                    // graph) — destroy the stale graph, capture fresh this tick.
+                    if let Some(old) = self.batch_graph.take() {
+                        self.cluster.destroy_batch_graph(&old);
+                    }
+                    self.batch_graph = Some(batch_name);
+                }
+                self.cluster.decode_step_batched(&live_seqs)?;
+                // per-seq retirement checks (the incremental reads — same
+                // logic as the per-seq loop, minus the decode_step call)
+                for i in 0..self.live.len() {
+                    let seq = self.live[i];
+                    let (cluster_seq, prompt_len, max_new, prev_len) = match self.arena.get(seq) {
+                        Some(g) => (g.cluster_seq, g.prompt_len, g.max_new, g.prev_len),
+                        None => continue,
+                    };
+                    let rt_len = self
+                        .cluster
+                        .shards
+                        .first()
+                        .and_then(|s| s.seq_runtime(cluster_seq))
+                        .map(|rt| rt.tokens.len())
+                        .unwrap_or(0);
+                    let stopped = rt_len > prev_len
+                        && self
+                            .cluster
+                            .shards
+                            .first()
+                            .and_then(|s| s.seq_runtime(cluster_seq))
+                            .map(|rt| rt.tokens[prev_len..].iter().any(|t| self.stops.contains(t)))
+                            .unwrap_or(false);
+                    if let Some(g) = self.arena.get_mut(seq) {
+                        g.prev_len = rt_len;
+                    }
+                    let generated = rt_len.saturating_sub(prompt_len);
+                    if stopped || generated >= max_new {
+                        let snapshot = self.incremental(cluster_seq, prompt_len);
+                        if let Some(g) = self.arena.get_mut(seq) {
+                            g.retired = true;
+                            g.final_out = Some(snapshot);
+                        }
+                        retired.push(seq);
+                    }
+                }
             }
         }
         for seq in retired {
