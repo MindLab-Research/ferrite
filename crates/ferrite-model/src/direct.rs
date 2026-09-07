@@ -419,7 +419,30 @@ pub fn load_direct(dir: &Path, cfg: &crate::config::Glm53FlashConfig) -> Result<
                 // expand on the GPU (bf16 H2D raw + widen kernel — the f32
                 // resident cache); bf16-consumers (2-D GDN/DSA weights) copy
                 // verbatim (the checkpoint's bf16 IS the resident layout).
-                if name.contains("embed_tokens") || shape.len() < 2 {
+                if name.contains("embed_tokens") {
+                    // HOST-MATERIALIZE the embed table: Engine::embed()
+                    // (lib.rs:160) does host table lookup per token
+                    // (as_slice()[(t*hidden)..]) — the embed table MUST be
+                    // real data, not a 4-elem placeholder. Read bf16 from
+                    // mmap, convert to f32 (~2.4GB host — vs 1.5TB saved).
+                    // The GPU preload still uses the Bf16ToF32 view (the
+                    // device gets its own copy via the widen kernel).
+                    let n: usize = shape.iter().product();
+                    let bytes = direct.slice(&e.seg);
+                    let mut f32_data = Vec::with_capacity(n);
+                    for chunk in bytes.chunks_exact(2) {
+                        let bits = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
+                        f32_data.push(f32::from_bits(bits << 16));
+                    }
+                    placeholders.insert(
+                        name.clone(),
+                        Tensor { shape: Shape::new(shape.clone()), dtype: DType::F32, data: std::sync::Arc::new(f32_data) },
+                    );
+                    views.insert(
+                        name,
+                        WeightView::Bf16ToF32 { seg: e.seg, shape: shape.clone() },
+                    );
+                } else if shape.len() < 2 {
                     placeholders.insert(name.clone(), placeholder(shape.clone()));
                     views.insert(
                         name,
