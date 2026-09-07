@@ -749,6 +749,16 @@ impl CudaBackend {
                 return Ok(DevRef { ptr: cb.dev, len: cb.len });
             }
         }
+        // MMAP DIAGNOSTIC: placeholder (4-elem stub) falling through to the
+        // upload path reads 4 zeros as the full weight → GARBAGE. This should
+        // NEVER happen in the mmap path (direct_preload_shard preloads all
+        // weights). If it fires, the preload missed this weight's cache key.
+        if t.as_slice().len() < t.numel() {
+            eprintln!(
+                "[dev_weight_bf16] CACHE MISS placeholder: numel={} data_len={} key=({},{}) — uploading 4-elem stub as full weight → GARBAGE",
+                t.numel(), t.as_slice().len(), t.as_slice().as_ptr() as usize, t.numel() << 1 | 1
+            );
+        }
         let n = t.numel();
         let src = t.as_slice();
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
