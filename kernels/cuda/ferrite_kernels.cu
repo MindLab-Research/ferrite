@@ -3667,7 +3667,12 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
 }
 
 // The REST of hc_pre: reads pre-computed mx from global memory, does
-// sinkhorn + li + post + comb. Single block per token (tiny work).
+// sinkhorn + li + post + comb. Single block per token.
+// cp.async PREFETCH: the P3's 64KB x-read at 1 SM was ~30-40µs (load-use
+// dependency chain: load i → FMA → load i+1, MLP ~2 at 1 SM's ~32
+// outstanding L2 requests). cp.async DMA-copies x to shared ASYNCHRONOUSLY
+// (overlapped with P1/P2 ~2µs), then P3 reads from shared (20TB/s) —
+// ~3µs. Total hc_pre_rest: 62µs → ~10µs expected.
 __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
                                    const float* __restrict__ mx_in,
                                    const float* __restrict__ scale,
@@ -3683,11 +3688,25 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     const float* x = res + (size_t)t * n * h;
     const int nh = n * h;
     extern __shared__ float sm[];
-    float* mx_s = sm;               // [mix] K-split partials reduced here
-    float* cb = sm + mix;           // [n*n]
-    float* pre_s = sm + mix + n * n; // [n]
-    float* li_s = sm + mix + n * n + n; // [h] fused-norm staging (rmsnorm parity)
-    float* red = li_s + h;   // [WMAX+8] warp partials (mx prologue + norm tail); WMAX = 32 (1024 threads)
+    // cp.async staging: x prefetched here (overlaps with P1/P2)
+    float* smem_x = sm;                          // [nh] = n*h floats
+    float* mx_s = sm + nh;                       // [mix]
+    float* cb = sm + nh + mix;                   // [n*n]
+    float* pre_s = sm + nh + mix + n * n;        // [n]
+    float* li_s = sm + nh + mix + n * n + n;     // [h]
+    float* red = li_s + h;   // [WMAX+8]
+
+    // ── 1. Prefetch x → smem_x (SYNCHRONOUS coalesced copy, NO FMA dependency
+    // chain — the pure load→store has 4× the MLP of P3's load-FMA-load chain;
+    // 32 warps × 16B coalesced = 512 warp-loads at 128 outstanding ≈ 2µs).
+    // The P3 then reads from SHARED (20TB/s) instead of GLOBAL (load-use
+    // dependency chain at ~8GB/s effective on 1 SM). ──
+    {
+        for (int i = threadIdx.x; i < nh; i += blockDim.x) {
+            smem_x[i] = x[i];
+        }
+        __syncthreads();
+    }
 
     // PROLOGUE (K-split phase-2): reduce the KS partial dots per mix row
     // and apply rsq (Σx² block reduce — was phase-1 per-block redundant).
@@ -3754,17 +3773,18 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
         for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
     }
     __syncthreads();
-    // li = Σ_i pre_i · x[i*h + j] (parallel over h) — staged in smem, then
-    // FUSED rmsnorm tail. NOTE: the n==4 specialized path (4 independent
-    // float4 loads) produced garbled text (32-token early stop) — reverted;
-    // the runtime-n loop's `#pragma unroll` is a no-op on runtime n but the
+    // ── 3. P3: li = Σ_i pre_i · smem_x[i*h + j] (parallel over h) — reading
+    // from SHARED (prefetched above, 20TB/s) instead of GLOBAL (load-use
+    // dependency chain at ~8GB/s effective on 1 SM). Staged in li_s smem,
+    // then FUSED rmsnorm tail. NOTE: the n==4 specialized path (4 independent
+    // float4 loads) produced garbled text — reverted; the runtime-n loop's
     // sequential load→FMA→load chain is numerically correct.
     for (int j = threadIdx.x << 2; j < h; j += blockDim.x << 2) {
         if (j + 3 < h) {
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
             #pragma unroll
             for (int i = 0; i < n; i++) {
-                const float* xr = x + (size_t)i * h + j;
+                const float* xr = smem_x + (size_t)i * h + j;
                 float4 xv = *reinterpret_cast<const float4*>(xr);
                 a0 += pre_s[i] * xv.x;
                 a1 += pre_s[i] * xv.y;
@@ -3775,7 +3795,7 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
         } else {
             for (int jj = j; jj < h; jj++) {
                 float acc = 0.f;
-                for (int i = 0; i < n; i++) acc += pre_s[i] * x[(size_t)i * h + jj];
+                for (int i = 0; i < n; i++) acc += pre_s[i] * smem_x[(size_t)i * h + jj];
                 li_s[jj] = acc;
             }
         }
@@ -3827,8 +3847,17 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     // 32 warp partials; msq slot moved to red[39]. NOTE: the rmsnorm warp
     // partial ORDER changed (8 -> up-to-32 ascending) — validated by
     // 出师表 recitation (garbling = revert this).
-    // smem: mx_s[mix] + cb[n*n] + pre_s[n] + li_s[h] + red[40]  (~16.7KB)
-    size_t smem2 = ((size_t)(mix + n * n + n) + h + 48) * sizeof(float);
+    // smem: smem_x[n*h] (cp.async prefetch staging — the P3 reads from shared
+    // at 20TB/s instead of global's load-use chain at ~8GB/s on 1 SM) +
+    // mx_s[mix] + cb[n*n] + pre_s[n] + li_s[h] + red[40]  (~82.3KB total)
+    size_t smem2 = ((size_t)(n * h + mix + n * n + n) + h + 48) * sizeof(float);
+    // opt-in >48KB dynamic smem (n*h=64KB staging + 18KB existing = 82KB;
+    // the default per-block limit is 48KB). NO static bool — the TP setup has
+    // 4 CUDA contexts (one per GPU); a process-wide static would only set the
+    // attribute on the FIRST context, leaving ranks 1-3 failing silently.
+    cudaFuncSetAttribute(hc_pre_rest_kernel,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         (int)smem2);
     hc_pre_rest_kernel<<<s, 1024, smem2, stream>>>(
         res, mx_scratch, scale, base, nw, li, post, comb,
         s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
