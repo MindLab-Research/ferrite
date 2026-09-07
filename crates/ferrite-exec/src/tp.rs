@@ -2435,6 +2435,13 @@ fn mega_chain_dev_batched(
         .clone()
         .ok_or_else(|| FerriteError::Config("batched needs FERRITE_NCCL=1".into()))?;
     cuda.enter();
+    // The batched chain's projections take the GEMV path (n≤16 rows under
+    // small_n_rows → gemv_bf16_v2, ONE launch covering n rows): the tiled
+    // GEMM at tiny n wastes its 128-row tile (measured n=4 batched: 105ms
+    // /step vs n=1's 16ms — the same tile-waste the MTP verify chain hit at
+    // n=2: 108ms vs 23ms). The GEMV batched rides the L2 for the n rows'
+    // same-weight reads (verify n=3: +35% vs n=1).
+    cuda.small_n_rows.store(true, std::sync::atomic::Ordering::Relaxed);
     let cfg = &s.cfg;
     let (hidden, hc_mult) = (cfg.hidden_size, cfg.hc_mult);
     let nh = hc_mult * hidden;
@@ -2629,10 +2636,16 @@ fn mega_chain_dev_batched(
             },
         );
         std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
+        // NOTE: no DSA rollback here — the PRE-capture rollback above makes
+        // the pass's virtual t_count advance land exactly on the real cache
+        // count (the dry-run's tokens); replay-side dsa_host_advance keeps it
+        // in lockstep from here on.
+        cuda.small_n_rows.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(Vec::new())
     } else {
         let mut tv = vec![0f32; n];
         arg.download(&mut tv)?;
+        cuda.small_n_rows.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(tv)
     }
 }

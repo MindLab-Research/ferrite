@@ -979,7 +979,7 @@ impl CudaBackend {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
-        if n == 1 || (n <= 3 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
+        if n == 1 || (n <= 16 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
             // Decode GEMV v2: uint4 vectorized + K-split WPR — 2.09x over v1
             // (bench gemv_v2_bench: 3.11→6.80TB/s lm_head, 2.20→3.91 o_proj,
             // all shapes 1.45-2.18x). BATCHED: ONE launch covers n rows
@@ -987,10 +987,13 @@ impl CudaBackend {
             // chain's 19880 small-graph-node cause. Per-row accumulation order
             // (warp shuffle + WPR root) is unchanged, so the greedy argmax is
             // bit-identical; only the launch/graph-node count drops n×.
-            // n==2 per-row GEMV: ONLY under small_n_rows (the MTP verify chain
-            // — the tiled GEMM wastes a whole tile on 2 rows: 108ms vs 23ms).
-            // Prefill n>=2 keeps the GEMM unconditionally: its accumulation
-            // order sets the first greedy token (per-row flipped it).
+            // small_n_rows (the MTP verify chain n<=3, the BATCHED decode
+            // n<=16): the tiled GEMM at tiny n wastes the tile (measured n=4
+            // batched: 105ms/step vs n=1's 16ms — the 128-row tile computes
+            // the full K per tile regardless of n). The GEMV batched rides
+            // the L2 for the n rows' same-weight reads (verify n=3: +35% vs
+            // n=1's 16ms). Prefill keeps the GEMM (its row-batched
+            // accumulation order sets the first greedy token).
             ck(unsafe {
                 ferrite_gemv_bf16_v2(x_dev.as_const_f32(), dw.ptr as *const _,
                                       dbias, do_.as_f32(), in_f, out_f, n, self.stream)
