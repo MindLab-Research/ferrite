@@ -1297,7 +1297,7 @@ impl<B: KernelBackend> TpCluster<B> {
             for f in 0..num_dsa {
                 cuda.dsa_host_rollback(seq, f, (3 - k) as usize);
             }
-            cuda.dsa_host_rollback(seq, mtp_family, (3 - k) as usize);
+            cuda.dsa_host_rollback(seq, mtp_family, (2 - k).max(0) as usize);
             cuda.mtp_commit(k)?;
             Ok((out[0], out[1], out[2], k))
         })
@@ -1744,7 +1744,20 @@ impl<B: KernelBackend> TpCluster<B> {
                     for f in 0..num_dsa {
                         cuda.dsa_host_rollback(seq, f, (3 - k_host) as usize);
                     }
-                    cuda.dsa_host_rollback(seq, mtp_family, (3 - k_host) as usize);
+                    // mtp_family rollback: (2-k).max(0) — the draft appends 2
+                    // (last@t0, d1@t0+1), rollback removes ONLY unaccepted
+                    // draft tokens. k=1: remove d1 (rejected), keep last (the
+                    // step's input — already in the decoder cache). k=2/3:
+                    // keep both (d1 accepted). Net advance = min(2,k) — the
+                    // draft cache grows in LOCKSTEP with the decoder cache
+                    // (k per step). The OLD (3-k) advanced only k-1 per step:
+                    // after 3 steps the mtp_family lagged the decoder by 3
+                    // tokens, the draft's DSA attention missed the accepted
+                    // tokens, argmax flipped to input-repeat (d1==d2, the
+                    // diagnostic's call-3 signature) and accept collapsed to
+                    // 1.0 permanently (commit 2a9c85c predicted this exact
+                    // failure mode; 2ffcc68's revert misread the tc data).
+                    cuda.dsa_host_rollback(seq, mtp_family, (2 - k_host).max(0) as usize);
                     // Diagnostic: first 10 CALLS (step%4==0 = rank 0 of each call;
                     // 4 ranks increment ZH2D_STEP per call) — shows when accept
                     // collapses and whether hprev/draft values keep changing
