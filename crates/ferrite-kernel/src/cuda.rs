@@ -136,6 +136,15 @@ extern "C" {
     fn ferrite_causal_conv1d(x: *const f32, w: *const f32, state_in: *const f32,
                              out: *mut f32, state_out: *mut f32,
                              n: i32, ch: i32, conv: i32, s: CuStream) -> i32;
+    fn ferrite_conv1d_batched(x: *const f32, w: *const f32,
+                             state_ptrs: *const *mut f32,
+                             out: *mut f32, b: i32, ch: i32, conv: i32,
+                             s: CuStream) -> i32;
+    fn ferrite_gdn_chunk_batched(q: *const f32, k: *const f32, v: *const f32,
+                                  beta: *const f32, gate: *const f32, a_log: *const f32,
+                                  state_ptrs: *const *mut f32,
+                                  out: *mut f32, b: i32, h: i32, dk: i32, dv: i32,
+                                  s: CuStream) -> i32;
     fn ferrite_gdn_chunk(q: *const f32, k: *const f32, v: *const f32,
                          beta: *const f32, gate: *const f32, a_log: *const f32,
                          state: *mut f32, out: *mut f32,
@@ -533,6 +542,14 @@ pub struct CudaBackend {
     /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
     /// scale) device tables for the fused MoE kernels.
     moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
+    /// Batched per-seq GDN state tables: (layer, seq-set) → (conv_tbl,
+    /// gdn_tbl) device pointer pairs — the batched kernels' device arrays
+    /// of B state pointers. cudaMalloc'd + memcpy'd ONCE per composition
+    /// (at the dry-run), cached (the capture re-uses the same pointers —
+    /// no malloc during capture; the table content is FROZEN per
+    /// composition: the (seq, layer) state addresses are stable). Purged
+    /// when free_seq drops a member (the tables would dangle).
+    gdn_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, Vec<u64>), (*mut std::ffi::c_void, *mut std::ffi::c_void)>>,
     /// W8A8 mega-quant scratch per in_f (v3 gemv): [amax_bits, cnt, cnt2, xs,
     /// xq[in_f]] — the cooperative in-kernel quant's barrier state + shared
     /// xq. Allocated once (lazy) per width; the kernel TAIL resets the
@@ -602,6 +619,7 @@ impl CudaBackend {
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
+            gdn_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             w8a8_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1823,6 +1841,47 @@ impl CudaBackend {
         Ok(ptr as *mut f32)
     }
 
+    /// Batched per-seq GDN state pointer tables (the batched decode): the
+    /// (conv, gdn) device arrays of B per-seq state pointers for ONE layer —
+    /// the batched kernels' (state_ptrs[seq]) indirection. Built ONCE per
+    /// (layer, seq-set) at the dry-run (cudaMalloc + memcpy — no capture
+    /// running), cached: the capture pass re-uses the SAME pointers (no
+    /// malloc during capture, the graph's kernel args stable). The table
+    /// content is frozen per composition (the (seq, layer) state addresses
+    /// are stable for the states' lifetime). Purged by free_seq (a member's
+    /// state freed → the table dangles).
+    fn gdn_state_tables(
+        &self,
+        layer: usize,
+        seqs: &[u64],
+        conv_len: usize,
+        gdn_len: usize,
+    ) -> Result<(*const *mut f32, *const *mut f32)> {
+        let key = (layer, seqs.to_vec());
+        {
+            let m = self.gdn_tbl_cache.lock().unwrap();
+            if let Some(&(c, g)) = m.get(&key) {
+                return Ok((c as *const *mut f32, g as *const *mut f32));
+            }
+        }
+        let mut conv_ptrs = Vec::with_capacity(seqs.len());
+        let mut gdn_ptrs = Vec::with_capacity(seqs.len());
+        for &seq_r in seqs {
+            conv_ptrs.push(self.dev_state(&self.conv_states, (seq_r, layer), conv_len)?);
+            gdn_ptrs.push(self.dev_state(&self.gdn_states, (seq_r, layer), gdn_len)?);
+        }
+        let mk = |v: &[*mut f32]| -> Result<*mut std::ffi::c_void> {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            ck(unsafe { cudaMalloc(&mut p, v.len() * std::mem::size_of::<*mut f32>()) }, "gdn tbl malloc")?;
+            ck(unsafe { cudaMemcpy(p, v.as_ptr() as *const _, v.len() * std::mem::size_of::<*mut f32>(), CUDA_MEMCPY_H2D) }, "gdn tbl H2D")?;
+            Ok(p)
+        };
+        let c = mk(&conv_ptrs)?;
+        let g = mk(&gdn_ptrs)?;
+        self.gdn_tbl_cache.lock().unwrap().insert(key, (c, g));
+        Ok((c as *const *mut f32, g as *const *mut f32))
+    }
+
     /// Whole GDN (linear-attention) layer on device. `x` is the layer's
     /// normed input [n, hidden]; returns the o_proj partial [n, hidden]
     /// (TP all-reduce happens at the caller).
@@ -2334,21 +2393,24 @@ impl CudaBackend {
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
         let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
         let dw_conv = self.dev_weight(w.conv_w)?;
-        // 2. per-seq causal conv: row r's qkv slice → (seqs[r], layer)'s
-        // conv tail state (RMW in place). B × n=1 launches.
+        // 2. per-seq causal conv — BATCHED: ONE launch, B×ch threads (each
+        // (seq, channel): the 3-tap FIR + slide vs state_ptrs[seq]'s slice —
+        // the ptr table cached per (layer, seq-set)). The per-seq loop's B
+        // small launches (grid(ch), 1 live thread/block at n=1) serialize
+        // per seq; the batched grid fills the SMs. FIR accumulation order =
+        // conv1d_kernel's sequential i (bit-equal per seq).
         let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
-        for (r, &seq_r) in seqs.iter().enumerate() {
-            let conv_state = self.dev_state(&self.conv_states, (seq_r, layer), ch * hist)?;
-            ck(
-                unsafe {
-                    ferrite_causal_conv1d(
-                        qkv.as_const_f32().add(r * ch), dw_conv.as_const_f32(), conv_state,
-                        conv_out.as_f32().add(r * ch), conv_state, 1, ch as i32, conv_size as i32, self.stream,
-                    )
-                },
-                "conv1d_batched_row",
-            )?;
-        }
+        let (conv_tbl, gdn_tbl) = self.gdn_state_tables(layer, seqs, ch * hist, h * dk * dk)?;
+        ck(
+            unsafe {
+                ferrite_conv1d_batched(
+                    qkv.as_const_f32(), dw_conv.as_const_f32(),
+                    conv_tbl, conv_out.as_f32(),
+                    n as i32, ch as i32, conv_size as i32, self.stream,
+                )
+            },
+            "conv1d_batched",
+        )?;
         // 3. gdn_prep n=B (row-independent: silu + split + L2 + beta + gate)
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
         let k = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -2368,24 +2430,23 @@ impl CudaBackend {
             },
             "gdn_prep_batched",
         )?;
-        // 4. per-seq gated-deltanet core: row r against (seqs[r], layer)'s
-        // [h, dk, dk] state. B × n=1 gdn_chunk_v2 launches.
+        // 4. per-seq gated-deltanet core — BATCHED: ONE launch, grid (B, h)
+        // (the gdn_step_v2 body per (seq, head) with state_ptrs[seq] — the B
+        // per-seq grid(1,h) launches (43% SM each) serialize; the batched
+        // grid(B,h) fills the SMs). The 5-phase accumulation is bit-equal
+        // per seq (the same kernel body, the same per-(seq,head) indexing).
         let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
-        for (r, &seq_r) in seqs.iter().enumerate() {
-            let gdn_state = self.dev_state(&self.gdn_states, (seq_r, layer), h * dk * dk)?;
-            ck(
-                unsafe {
-                    ferrite_gdn_chunk_v2(
-                        q.as_const_f32().add(r * proj), k.as_const_f32().add(r * proj),
-                        v.as_const_f32().add(r * proj),
-                        beta.as_const_f32().add(r * h), gate.as_const_f32().add(r * proj),
-                        dw_al.as_const_f32(),
-                        gdn_state, core.as_f32().add(r * proj), 1, h as i32, dk as i32, dk as i32, self.stream,
-                    )
-                },
-                "gdn_chunk_batched_row",
-            )?;
-        }
+        ck(
+            unsafe {
+                ferrite_gdn_chunk_batched(
+                    q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
+                    beta.as_const_f32(), gate.as_const_f32(), dw_al.as_const_f32(),
+                    gdn_tbl, core.as_f32(),
+                    n as i32, h as i32, dk as i32, dk as i32, self.stream,
+                )
+            },
+            "gdn_chunk_batched",
+        )?;
         // 5. gated rmsnorm n=B (row-independent) + o_proj GEMM n=B
         let o_norm_w = self.dev_weight(w.o_norm)?;
         let normed = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -2666,6 +2727,27 @@ impl CudaBackend {
             for l in keys {
                 if let Some(st) = m.remove(&(seq, l)) {
                     unsafe { cudaFree(st.ptr) };
+                }
+            }
+        }
+        // 4. Batched GDN state tables: any (layer, seq-set) containing this
+        // seq dangles (its conv/gdn state pointers above are freed) —
+        // cudaFree the table pairs + purge the entries. The next
+        // decode_step_batched for the new composition rebuilds (the capture
+        // re-captures: the table rebuild is part of the dry-run).
+        {
+            let mut m = self.gdn_tbl_cache.lock().unwrap();
+            let keys: Vec<(usize, Vec<u64>)> = m
+                .keys()
+                .filter(|(_, s)| s.contains(&seq))
+                .cloned()
+                .collect();
+            for k in keys {
+                if let Some((c, g)) = m.remove(&k) {
+                    unsafe {
+                        cudaFree(c);
+                        cudaFree(g);
+                    }
                 }
             }
         }

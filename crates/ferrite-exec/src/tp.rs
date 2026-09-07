@@ -2447,6 +2447,16 @@ fn mega_chain_dev_batched(
     let nh = hc_mult * hidden;
     let topk = cfg.num_experts_per_tok;
     let e = cfg.n_routed_experts;
+    // FERRITE_TIMING per-segment breakdown (dry-run only — the syncs are
+    // capture-illegal): attn (A_hc + B: gdn/dsa batched + AR) / ffn (C_hc +
+    // D+E moe) / head. The B segment splits GDN vs DSA — the per-seq state
+    // ops' share of the n-scaling cost (the n=4 step is 31.6ms vs n=1's
+    // 16.1ms: WHERE the +15.5ms lives — the MoE's per-token expert reads or
+    // the per-seq GDN/DSA kernels).
+    let dev_id = cuda.dev();
+    let tm = !capture && dev_id == 0 && std::env::var_os("FERRITE_TIMING").is_some();
+    let (mut t_attn, mut t_ffn, mut t_head) = (0f64, 0f64, 0f64);
+    let (mut t_a, mut t_b_gdn, mut t_b_dsa, mut t_c, mut t_e) = (0f64, 0f64, 0f64, 0f64, 0f64);
 
     let _guard = if capture {
         // Pre-capture rollback: the dry-run advanced each seq's DSA t_count
@@ -2477,6 +2487,7 @@ fn mega_chain_dev_batched(
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
 
     for (layer_idx, plan) in plans.iter().enumerate() {
+        let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
         // A: hc_pre (n=B — row-independent)
         let (li, post_a, comb_a) = cuda.hc_pre_dev(
@@ -2492,6 +2503,11 @@ fn mega_chain_dev_batched(
             cfg.hc_sinkhorn_iters,
         )?;
         let hn = li;
+        if tm {
+            let _ = cuda.sync();
+            t_a += t_l.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_b = std::time::Instant::now();
         // B: attention — the batched per-seq dispatch (n=B GEMM projections
         // + B × n=1 per-seq state kernels)
         let partial = match plan.attn {
@@ -2548,6 +2564,16 @@ fn mega_chain_dev_batched(
             }
         };
         nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        if tm {
+            let _ = cuda.sync();
+            t_attn += t_l.elapsed().as_secs_f64() * 1e3;
+            if matches!(plan.attn, AttnKind::Dsa) {
+                t_b_dsa += t_b.elapsed().as_secs_f64() * 1e3;
+            } else {
+                t_b_gdn += t_b.elapsed().as_secs_f64() * 1e3;
+            }
+        }
+        let t_mid = std::time::Instant::now();
         // C: hc_post → hc_pre2
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
         let (li2, post_f, comb_f) = cuda.hc_pre_dev(
@@ -2563,6 +2589,11 @@ fn mega_chain_dev_batched(
             cfg.hc_sinkhorn_iters,
         )?;
         let hfn = li2;
+        if tm {
+            let _ = cuda.sync();
+            t_c += t_mid.elapsed().as_secs_f64() * 1e3;
+        }
+        let t_d = std::time::Instant::now();
         // D: FFN (MoE/Dense — n=B, row-independent; the existing n>1 kernels)
         let partial2 = match plan.mlp {
             MlpKind::Moe => {
@@ -2605,11 +2636,20 @@ fn mega_chain_dev_batched(
             }
         };
         nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        if tm {
+            let _ = cuda.sync();
+            t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
+        }
         // E: hc_post2 → next layer's residual
         res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+        if tm {
+            let _ = cuda.sync();
+            t_e += t_d.elapsed().as_secs_f64() * 1e3;
+        }
     }
     // head: contract → model.norm → lm_head → argmax (all n=B; redundant per
     // rank — identical data after the ARs, replicated weights)
+    let t_hs = std::time::Instant::now();
     let h_final = cuda.hc_contract_dev(&res, n, hc_mult, hidden)?;
     let hn_head = cuda.rmsnorm_dev(
         &h_final,
@@ -2645,6 +2685,29 @@ fn mega_chain_dev_batched(
     } else {
         let mut tv = vec![0f32; n];
         arg.download(&mut tv)?;
+        if tm {
+            let _ = cuda.sync();
+            t_head = t_hs.elapsed().as_secs_f64() * 1e3;
+            let (n_dsa, n_gdn) = plans
+                .iter()
+                .fold((0usize, 0usize), |(d, g), pl| {
+                    if matches!(pl.attn, AttnKind::Dsa) { (d + 1, g) } else { (d, g + 1) }
+                });
+            eprintln!(
+                "[megab-timing] n={n} {}L: attn={:.1} (A_hc={:.1} B: gdn{}={:.1} dsa{}={:.1}) ffn={:.1} (C_hc={:.1} D+E={:.1}) head={:.2}",
+                plans.len(),
+                t_attn,
+                t_a,
+                n_gdn,
+                t_b_gdn,
+                n_dsa,
+                t_b_dsa,
+                t_ffn,
+                t_c,
+                t_ffn - t_c - t_e,
+                t_head
+            );
+        }
         cuda.small_n_rows.store(false, std::sync::atomic::Ordering::Relaxed);
         Ok(tv)
     }
