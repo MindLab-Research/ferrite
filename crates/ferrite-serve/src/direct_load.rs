@@ -206,6 +206,13 @@ pub fn direct_preload_shard(
             WeightView::Bf16Segs { segs, shape } => match split {
                 Split::Replicated => {
                     let slices: Vec<&[u8]> = segs.iter().map(|s| dv.direct.slice(s)).collect();
+                    // mmap sanity: first 8 bytes of replicated weights (the
+                    // lm_head is replicated — all-zero here = wrong offset →
+                    // all-zero logits → constant "!" output)
+                    if std::env::var_os("FERRITE_MMAP_DEBUG").is_some() && name.contains("lm_head") {
+                        let b = &slices[0][..8.min(slices[0].len())];
+                        eprintln!("[mmap-dbg] {name}: first 8 bytes {:02x?} (len={})", b, slices[0].len());
+                    }
                     backend.preload_bf16_raw(ph, &slices)?;
                     st.bf16_full += 1;
                 }
@@ -214,6 +221,11 @@ pub fn direct_preload_shard(
                         let (w, row_bytes) = (shape.get(1).copied().unwrap_or(1), shape[0]);
                         let rb = w * 2;
                         let full = dv.direct.slice(&segs[0]);
+                        // mmap sanity: first 8 bytes of split weights (Rows)
+                        if std::env::var_os("FERRITE_MMAP_DEBUG").is_some() && name.contains("layers.0.") {
+                            let s = &full[r0 * rb..(r0 * rb + 8).min(r1 * rb)];
+                            eprintln!("[mmap-dbg] ROWS {name}: r0={r0} r1={r1} rb={rb} first8={:02x?} len={}", s, full.len());
+                        }
                         backend.preload_bf16_raw(ph, &[&full[r0 * rb..r1 * rb]])?;
                         let _ = row_bytes;
                         st.bf16_rows += 1;
@@ -279,7 +291,29 @@ pub fn direct_preload_shard(
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect();
                 let scols_full = cols.div_ceil(128);
+                // CRITICAL FIX: register the fp8 bypass (fp8 data + scale on
+                // the device, keyed by the placeholder's ptr+numel) so
+                // matmul_dev's fp8_lookup HITS and serves the fp8 GEMV —
+                // the SAME numerical path as the legacy loader (register_fp8
+                // → ferrite_gemv_fp8_v2 W8A16). Without this, matmul_dev falls
+                // through to dev_weight_bf16 (the dequanted bf16) — the bf16
+                // GEMV's different rounding vs the fp8 GEMV produces constant
+                // "!!!!!" output (the mmap path's root cause: the legacy path
+                // registers fp8 for ALL fp8-eligible weights via set_fp8 →
+                // fp8 GEMV; the mmap path dequanted to bf16 → bf16 GEMV —
+                // a different numerical domain for the MoE experts).
+                // ALSO keep the bf16 dequant (preload_fp8_dequant) for the
+                // non-fp8 fallback path (dev_weight_bf16 consumers).
+                let d = dv.direct.slice(data);
+                backend.register_fp8(ph, rows, cols, d, &scale_full)?;
+                st.fp8_rows += 1;
+                // bf16 dequant (fallback for dev_weight_bf16 consumers —
+                // the fp8 GEMV takes priority in matmul_dev's fp8_lookup)
                 match split {
+                    Split::Replicated => {
+                        backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
+                        st.fp8_rows += 1;
+                    }
                     Split::Replicated => {
                         let d = dv.direct.slice(data);
                         backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
@@ -328,6 +362,12 @@ pub fn direct_preload_shard(
                 // 1-D head-split weights — dt_bias/a_log — are ALSO bf16→f32
                 // views with a Rows window on the 1-D segment)
                 let full = dv.direct.slice(seg);
+                // mmap sanity: first 8 bytes of 1-D norm weights (all-zero =
+                // wrong offset → rmsnorm produces zeros → constant "!" output)
+                if std::env::var_os("FERRITE_MMAP_DEBUG").is_some() && name.contains("norm") {
+                    let b = &full[..8.min(full.len())];
+                    eprintln!("[mmap-dbg] NORM {name}: first 8 bytes {:02x?} (len={})", b, full.len());
+                }
                 match split {
                     Split::Replicated => {
                         backend.preload_bf16_to_f32_raw(ph, full)?;
