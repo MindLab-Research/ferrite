@@ -380,6 +380,7 @@ fn run_cuda(
         tp1.duration_since(tp0).as_secs_f32()
     );
     let mut out = Vec::new();
+    let mut steps_done: usize = 0;
     let mut prev_rt_len = cluster
         .shards
         .first()
@@ -393,6 +394,7 @@ fn run_cuda(
     let ncu_win = std::env::var_os("FERRITE_NCU").is_some();
     let mut ncu_started = false;
     for i in 0..max_tokens {
+        steps_done += 1;
         if ncu_win && i == 1 {
             #[cfg(feature = "cuda")]
             ferrite_kernel::cuda::profiler_start();
@@ -441,11 +443,13 @@ fn run_cuda(
         .first()
         .and_then(|s| s.seq_runtime(seq).map(|rt| rt.tokens.len().saturating_sub(ids.len())));
     if gen > 0 {
+        let acc = if steps_done > 0 { real.unwrap_or(gen) as f32 / steps_done as f32 } else { 1.0 };
         println!(
-            "[serve] decode: {gen} steps in {decode_s:.3}s = {:.1} steps/s | real {} tokens = {:.1} tok/s (steady state; weights-preload + prefill excluded)",
-            gen as f32 / decode_s,
+            "[serve] decode: {steps_done} steps in {decode_s:.3}s = {:.1} steps/s | real {} tokens = {:.1} tok/s | accept {:.2} (steady state; weights-preload + prefill excluded)",
+            steps_done as f32 / decode_s,
             real.map(|r| r.to_string()).unwrap_or_else(|| "?".into()),
             real.map(|r| r as f32 / decode_s).unwrap_or(0.0),
+            acc,
         );
     }
     // Skip the exit-time teardown: dropping 1.17TB of f32 weights walks
