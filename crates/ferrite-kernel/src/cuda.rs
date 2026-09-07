@@ -137,6 +137,15 @@ extern "C" {
                                ready_local: *const u32,
                                out: *mut f32, n: i32, world: i32, my_rank: i32,
                                s: CuStream) -> i32;
+    fn ferrite_p2p_ar_oneshot_v2(partial: *const f32,
+                                  staging_tbl: *const *mut f32,
+                                  ready_tbl: *const *mut u32,
+                                  epoch: *mut u32,
+                                  ctr: *mut u32,
+                                  staging_local: *const f32,
+                                  ready_local: *const u32,
+                                  out: *mut f32, n: i32, world: i32, my_rank: i32,
+                                  s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
     fn ferrite_graph_instantiate(e: *mut *mut std::ffi::c_void, g: *mut std::ffi::c_void) -> i32;
@@ -581,6 +590,14 @@ pub struct CudaBackend {
     /// zero-copy, host-written per step: graph-safe). cudaMalloc'd + memcpy'd
     /// once per composition; purged by free_seq when a member cache dies.
     dsa_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, Vec<u64>), DsaBatchTables>>,
+    /// P2P one-shot AR state (v2 epoch+ping-pong; FERRITE_P2P): the per-rank
+    /// persistent device buffers for the in-graph decode-chain all-reduce —
+    /// see P2pArState. Set once at cluster setup (after the peers' UVA
+    /// addresses are exchanged); the AR sites call p2p_ar_v2 (fallback to
+    /// NCCL when unset). Mutex: phase 2 (tables) mutates after phase 1
+    /// (alloc) under &self (the cluster setup); the decode path copies the
+    /// small state out per call.
+    p2p_ar: std::sync::Mutex<Option<P2pArState>>,
     /// W8A8 mega-quant scratch per in_f (v3 gemv): [amax_bits, cnt, cnt2, xs,
     /// xq[in_f]] — the cooperative in-kernel quant's barrier state + shared
     /// xq. Allocated once (lazy) per width; the kernel TAIL resets the
@@ -652,6 +669,7 @@ impl CudaBackend {
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             gdn_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            p2p_ar: std::sync::Mutex::new(None),
             w8a8_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_execs: std::sync::Mutex::new(std::collections::HashMap::new()),
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1834,6 +1852,27 @@ pub struct DsaBatchTables {
 }
 unsafe impl Send for DsaBatchTables {}
 unsafe impl Sync for DsaBatchTables {}
+
+/// P2P one-shot all-reduce state (per rank, v2 epoch+ping-pong protocol —
+/// the in-graph decode-chain AR): [2][world][max_n] ping-pong staging +
+/// [world] epoch-stamp flags + epoch/ctr counters + the [world] tables of
+/// the PEERS' staging/flag bases (UVA — same process, peer access enabled).
+/// cudaMalloc'd ONCE at cluster setup (FERRITE_P2P), NEVER pool-allocated
+/// (fixed addresses across graph captures); the counters are runtime
+/// device state the captured kernels advance per replay.
+#[derive(Clone, Copy)]
+pub struct P2pArState {
+    pub staging_local: *mut std::ffi::c_void, // [2][world][max_n] f32
+    pub ready_local: *mut std::ffi::c_void,   // [world] u32 epoch stamps
+    pub epoch: *mut std::ffi::c_void,         // [1] u32 call counter
+    pub ctr: *mut std::ffi::c_void,          // [1] u32 block arrivals
+    pub staging_tbl: *mut std::ffi::c_void,   // [world] device ptrs (peers' staging bases)
+    pub ready_tbl: *mut std::ffi::c_void,     // [world] device ptrs (peers' flag rows)
+    pub world: usize,
+    pub max_n: usize,
+}
+unsafe impl Send for P2pArState {}
+unsafe impl Sync for P2pArState {}
 
 /// Weight set for one DSA layer's device chain (borrowed from the shard
 /// Engine's weights — all hit the dev_weight caches after preload).
@@ -3791,6 +3830,95 @@ impl CudaBackend {
                 self.stream)
         }, "p2p_ar_oneshot")?;
         Ok(())
+    }
+
+    /// Phase 1: allocate this rank's P2P AR v2 buffers (the [2][world][max_n]
+    /// ping-pong staging + the [world] epoch flags + the epoch/ctr counters,
+    /// all zeroed). Returns the (staging, ready) UVA addresses for the peers'
+    /// pointer tables. The OnceLock holds the state — the cluster setup is
+    /// the only caller (before any decode).
+    pub fn p2p_ar_alloc(&self, world: usize, max_n: usize) -> Result<(usize, usize)> {
+        self.enter();
+        let st_len = 2 * world * max_n; // [2][world][max_n] f32 (ping-pong)
+        let mut st: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut st, st_len * 4) }, "p2p_ar staging malloc")?;
+        ck(unsafe { cudaMemset(st, 0, st_len * 4) }, "p2p_ar staging zero")?;
+        let mut rd: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut rd, world * 4) }, "p2p_ar flags malloc")?;
+        ck(unsafe { cudaMemset(rd, 0, world * 4) }, "p2p_ar flags zero")?;
+        let mut ep: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ep, 4) }, "p2p_ar epoch malloc")?;
+        ck(unsafe { cudaMemset(ep, 0, 4) }, "p2p_ar epoch zero")?;
+        let mut ct: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ct, 4) }, "p2p_ar ctr malloc")?;
+        ck(unsafe { cudaMemset(ct, 0, 4) }, "p2p_ar ctr zero")?;
+        let _ = self.p2p_ar.lock().unwrap().replace(P2pArState {
+            staging_local: st,
+            ready_local: rd,
+            epoch: ep,
+            ctr: ct,
+            staging_tbl: std::ptr::null_mut(),
+            ready_tbl: std::ptr::null_mut(),
+            world,
+            max_n,
+        });
+        Ok((st as usize, rd as usize))
+    }
+
+    /// Phase 2: upload this rank's [world] pointer tables (the peers'
+    /// staging/ready UVA bases — same process, peer access enabled).
+    pub fn p2p_ar_tables(&self, staging_addrs: &[usize], ready_addrs: &[usize]) -> Result<()> {
+        let mut m = self.p2p_ar.lock().unwrap();
+        let Some(st) = m.as_mut() else {
+            return Err(FerriteError::InvalidArg("p2p_ar_tables before alloc".into()));
+        };
+        self.enter();
+        let mk = |addrs: &[usize]| -> Result<*mut std::ffi::c_void> {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            ck(unsafe { cudaMalloc(&mut p, addrs.len() * 8) }, "p2p_ar tbl malloc")?;
+            ck(unsafe { cudaMemcpy(p, addrs.as_ptr() as *const _, addrs.len() * 8, CUDA_MEMCPY_H2D) }, "p2p_ar tbl H2D")?;
+            Ok(p)
+        };
+        st.staging_tbl = mk(staging_addrs)?;
+        st.ready_tbl = mk(ready_addrs)?;
+        Ok(())
+    }
+
+    /// One-shot AR v2 (epoch + ping-pong — in-graph, multi-call safe). IN-PLACE
+    /// on `buf`: the down kernel stages it to every peer's ping-pong slot,
+    /// the sum kernel spins the epoch flags and writes the reduced values
+    /// back into `buf` (the sequential down→sum makes the in-place reuse
+    /// safe). Returns false when unconfigured or n > max_n (the caller
+    /// falls back to NCCL).
+    pub fn p2p_ar_v2(&self, buf: &mut DevBuf, n: usize) -> Result<bool> {
+        let st = {
+            let m = self.p2p_ar.lock().unwrap();
+            match m.as_ref() {
+                Some(st) => *st,
+                None => return Ok(false),
+            }
+        };
+        if n > st.max_n || st.staging_tbl.is_null() {
+            return Ok(false);
+        }
+        self.enter();
+        ck(unsafe {
+            ferrite_p2p_ar_oneshot_v2(
+                buf.as_const_f32(),
+                st.staging_tbl as *const *mut f32,
+                st.ready_tbl as *const *mut u32,
+                st.epoch as *mut u32,
+                st.ctr as *mut u32,
+                st.staging_local as *const f32,
+                st.ready_local as *const u32,
+                buf.as_f32(),
+                n as i32,
+                st.world as i32,
+                self.dev as i32,
+                self.stream,
+            )
+        }, "p2p_ar_v2")?;
+        Ok(true)
     }
 
     /// Elementwise add (residual): z = x + y [n]. MTP layer's standard

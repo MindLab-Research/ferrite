@@ -653,6 +653,43 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                 }
                 eprintln!("[serve] P2P access enabled ({} ranks, NVLink)", world);
+                // P2P AR v2 state (the in-graph epoch+ping-pong oneshot for the
+                // decode chains — replaces the NCCL ring ARs, ~35µs → ~10µs):
+                // phase 1 alloc per rank, phase 2 the [world] UVA pointer
+                // tables. max_n covers the batched (max_seqs×hidden) + MTP
+                // verify payloads.
+                const P2P_AR_MAX_N: usize = 16 * 4096;
+                let mut addrs = Vec::with_capacity(world);
+                for shard in &shards {
+                    match shard
+                        .backend
+                        .as_cuda()
+                        .and_then(|c| c.p2p_ar_alloc(world, P2P_AR_MAX_N).ok())
+                    {
+                        Some(a) => addrs.push(a),
+                        None => {
+                            addrs.clear();
+                            break;
+                        }
+                    }
+                }
+                if addrs.len() == world {
+                    let (ss, rs): (Vec<usize>, Vec<usize>) = addrs.iter().cloned().unzip();
+                    let mut ok = true;
+                    for shard in &shards {
+                        if let Some(c) = shard.backend.as_cuda() {
+                            if let Err(e) = c.p2p_ar_tables(&ss, &rs) {
+                                eprintln!("[serve] P2P AR tables failed: {e:?} (ARs fall back to NCCL)");
+                                ok = false;
+                            }
+                        }
+                    }
+                    if ok {
+                        eprintln!("[serve] P2P AR v2 ready (world={world}, max_n={P2P_AR_MAX_N})");
+                    }
+                } else {
+                    eprintln!("[serve] P2P AR alloc failed (ARs fall back to NCCL)");
+                }
             }
         }
         let nccl = if std::env::var_os("FERRITE_NCCL").is_some() {
@@ -2142,7 +2179,7 @@ fn mega_chain_dev(
             mprobe!("hn0", &hn, hidden);
         }
         // B: attention → NCCL all-reduce (in-place; every rank holds the sum)
-        let partial = match plan.attn {
+        let mut partial = match plan.attn {
             AttnKind::Linear => {
                 let la = &cfg.linear_attn;
                 let gw = GdnLayerWeights {
@@ -2197,7 +2234,13 @@ fn mega_chain_dev(
                 cuda.dsa_layer_dev(&hn, &w, seq, family, n, hidden)?
             }
         };
-        nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        let ar_p2p = match s.backend.as_cuda() {
+            Some(c) => c.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false),
+            None => false,
+        };
+        if !ar_p2p {
+            nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        }
         if tm {
             let _ = cuda.sync();
             t_attn += t_l.elapsed().as_secs_f64() * 1e3;
@@ -2254,7 +2297,7 @@ fn mega_chain_dev(
             }
         }
         // D: FFN (MoE or Dense) → NCCL all-reduce
-        let partial2 = match plan.mlp {
+        let mut partial2 = match plan.mlp {
             MlpKind::Moe => {
                 let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
                     Some(b) => b.clone(),
@@ -2307,7 +2350,13 @@ fn mega_chain_dev(
                 cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
             }
         };
-        nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        let ar_p2p = match s.backend.as_cuda() {
+            Some(c) => c.p2p_ar_v2(&mut partial2, n * hidden).unwrap_or(false),
+            None => false,
+        };
+        if !ar_p2p {
+            nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        }
         if probe && dev_id == 0 {
             let mut pv = vec![0f32; hidden];
             if partial2.download(&mut pv).is_ok() {
@@ -2510,7 +2559,7 @@ fn mega_chain_dev_batched(
         let t_b = std::time::Instant::now();
         // B: attention — the batched per-seq dispatch (n=B GEMM projections
         // + B × n=1 per-seq state kernels)
-        let partial = match plan.attn {
+        let mut partial = match plan.attn {
             AttnKind::Linear => {
                 let la = &cfg.linear_attn;
                 let gw = GdnLayerWeights {
@@ -2563,7 +2612,13 @@ fn mega_chain_dev_batched(
                 cuda.dsa_layer_dev_batched(&hn, &w, seqs, family, n, hidden)?
             }
         };
-        nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        let ar_p2p = match s.backend.as_cuda() {
+            Some(c) => c.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false),
+            None => false,
+        };
+        if !ar_p2p {
+            nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+        }
         if tm {
             let _ = cuda.sync();
             t_attn += t_l.elapsed().as_secs_f64() * 1e3;
@@ -2595,7 +2650,7 @@ fn mega_chain_dev_batched(
         }
         let t_d = std::time::Instant::now();
         // D: FFN (MoE/Dense — n=B, row-independent; the existing n>1 kernels)
-        let partial2 = match plan.mlp {
+        let mut partial2 = match plan.mlp {
             MlpKind::Moe => {
                 let bias = match s.weights.get(&format!("{pfx}.mlp.gate.e_score_correction_bias")) {
                     Some(b) => b.clone(),
@@ -2635,7 +2690,13 @@ fn mega_chain_dev_batched(
                 cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
             }
         };
-        nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        let ar_p2p = match s.backend.as_cuda() {
+            Some(c) => c.p2p_ar_v2(&mut partial2, n * hidden).unwrap_or(false),
+            None => false,
+        };
+        if !ar_p2p {
+            nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
+        }
         if tm {
             let _ = cuda.sync();
             t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
@@ -4166,8 +4227,11 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         eprintln!("[zh2d-en] esegs={:?} nsegs={:?}", esegs, nsegs);
     }
     let x_seg = cuda.mtp_eh_seg_dev(&enorm, &hnorm, rank, world, h)?;
-    let eh_partial = cuda.matmul_dev(&x_seg, s.w(&format!("{pfx}.eh_proj.weight"))?, 1, (2 * h / world) as i32, h as i32)?;
-    nccl.all_reduce_f32(eh_partial.as_const_f32(), eh_partial.as_f32(), h)?;
+    let mut eh_partial = cuda.matmul_dev(&x_seg, s.w(&format!("{pfx}.eh_proj.weight"))?, 1, (2 * h / world) as i32, h as i32)?;
+    let ar_p2p = cuda.p2p_ar_v2(&mut eh_partial, h).unwrap_or(false);
+    if !ar_p2p {
+        nccl.all_reduce_f32(eh_partial.as_const_f32(), eh_partial.as_f32(), h)?;
+    }
     // 2. input_layernorm → DSA attn (independent cache family)
     let hn = cuda.rmsnorm_dev(&eh_partial, s.w(&format!("{pfx}.input_layernorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let w = DsaLayerWeights {
@@ -4195,7 +4259,11 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         rms_eps: cfg.rms_norm_eps,
     };
     let attn_partial = cuda.dsa_layer_dev(&hn, &w, seq, mtp_family, 1, h)?;
-    nccl.all_reduce_f32(attn_partial.as_const_f32(), attn_partial.as_f32(), h)?;
+    let mut attn_partial = attn_partial;
+    let ar_p2p = cuda.p2p_ar_v2(&mut attn_partial, h).unwrap_or(false);
+    if !ar_p2p {
+        nccl.all_reduce_f32(attn_partial.as_const_f32(), attn_partial.as_f32(), h)?;
+    }
     // 3. residual + post_attention_layernorm
     let x1 = cuda.add_dev(&eh_partial, &attn_partial, h)?;
     let hn2 = cuda.rmsnorm_dev(&x1, s.w(&format!("{pfx}.post_attention_layernorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
@@ -4222,8 +4290,11 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut probs = DevBuf::alloc(cuda.dev(), cuda.stream(), cfg.num_experts_per_tok)?;
-    let moe_partial = cuda.moe_layer_dev(&hn2, gate_w, &bias, &shared, &experts, es, &mut probs, 1, h, cfg.num_experts_per_tok, e, cfg.routed_scaling_factor, cfg.swiglu_limit)?;
-    nccl.all_reduce_f32(moe_partial.as_const_f32(), moe_partial.as_f32(), h)?;
+    let mut moe_partial = cuda.moe_layer_dev(&hn2, gate_w, &bias, &shared, &experts, es, &mut probs, 1, h, cfg.num_experts_per_tok, e, cfg.routed_scaling_factor, cfg.swiglu_limit)?;
+    let ar_p2p = cuda.p2p_ar_v2(&mut moe_partial, h).unwrap_or(false);
+    if !ar_p2p {
+        nccl.all_reduce_f32(moe_partial.as_const_f32(), moe_partial.as_f32(), h)?;
+    }
     // 5. residual + shared_head.norm + lm_head + argmax → DEVICE SLOT (no D2H)
     let x2 = cuda.add_dev(&x1, &moe_partial, h)?;
     if let Some(ho) = h_out {

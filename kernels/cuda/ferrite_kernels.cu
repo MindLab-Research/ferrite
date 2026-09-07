@@ -3987,6 +3987,96 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot(
 }
 
 // ============================================================
+// P2P one-shot AR v2 — PRODUCTION (in-graph, multi-call safe).
+// v1 (above) is the micro-bench protocol: flags are never reset, so a
+// SECOND call spins through stale 1s and reads half-written staging
+// (race) — unusable for the decode chains (90 AR/step × thousands of
+// steps). v2 fixes it with an EPOCH + PING-PONG protocol, no resets:
+//   epoch  : per-rank device u32, advances once per call (the down's
+//            last block, AFTER the flag writes). Monotonic; the sum
+//            derives its round from it (stream order: down → sum).
+//   staging: [2][world][n] — call e uses parity e&1 (ping-pong). The
+//            rank j's down of call e+2 (same parity) is gated by the
+//            transitive chain j.sum(e+1) ⟂ j.down(e+2) ≥ i.down(e+1) ≥
+//            i.sum(e) — a 2-deep pipeline: rank i's sum(e) can never
+//            race rank j's staging overwrite of call e+2.
+//   flags  : per-rank [world] u32 EPOCH stamps (written via UVA by the
+//            peers' down; the wrap-safe spin compares (int)(flag-e) >= 0).
+//   ctr    : per-call block-arrivals (the down's last block does the
+//            flag writes + the epoch advance + the ctr reset).
+// Graph-capturable: the epoch/staging/flags/tables are persistent device
+// buffers (fixed addresses across replays); the counters are RUNTIME
+// device state the captured kernels read/write — each replay advances the
+// epoch exactly like a dry-run call. Lockstep requirement: all ranks
+// launch their graphs ~together (the fan_out worker pool guarantees).
+// ============================================================
+__global__ void p2p_ar_down_v2_kernel(
+    const float* __restrict__ partial,          // this rank's partial [n]
+    float* const* __restrict__ staging_tbl,     // [world] peers' staging bases ([2][world][n])
+    unsigned* const* __restrict__ ready_tbl,    // [world] peers' flag rows ([world] u32)
+    unsigned* epoch, unsigned* ctr,             // this rank's device counters
+    int world, int my_rank, int n) {
+    unsigned e = *epoch; // this call's epoch (pre-advance)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = partial[i];
+        const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)n + (unsigned)i);
+        #pragma unroll 4
+        for (int r = 0; r < world; r++) staging_tbl[r][off] = v;
+    }
+    __threadfence_system(); // peer-visible stores before flag
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned prev = atomicAdd(ctr, 1u);
+        if (prev == gridDim.x - 1u) { // last block: all stores fenced
+            for (int r = 0; r < world; r++)
+                *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
+            *ctr = 0u;     // reset for the next call (stream-ordered)
+            *epoch = e + 1u; // advance AFTER the flags (the next kernel sees it)
+        }
+    }
+}
+
+__global__ void p2p_ar_sum_v2_kernel(
+    const float* __restrict__ staging_local,   // my [2][world][n]
+    const unsigned* __restrict__ ready_local,   // my [world] epoch stamps
+    const unsigned* epoch,                      // (= e+1 after my down)
+    float* __restrict__ out, int world, int n) {
+    unsigned e2 = *epoch; // the round this sum completes (down's e+1)
+    if (threadIdx.x == 0) { // every block spins until all ranks' flags reach e2
+        for (int r = 0; r < world; r++)
+            while ((int)((*(volatile unsigned*)&ready_local[r]) - e2) < 0) __nanosleep(100);
+    }
+    __syncthreads();
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        int par = (int)((e2 - 1u) & 1u);
+        float acc = 0.f;
+        for (int r = 0; r < world; r++)
+            acc += staging_local[(size_t)(par * world + r) * n + i];
+        out[i] = acc;
+    }
+}
+
+extern "C" cudaError_t ferrite_p2p_ar_oneshot_v2(
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch, unsigned* ctr,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, cudaStream_t s) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    p2p_ar_down_v2_kernel<<<blocks, threads, 0, s>>>(
+        partial, staging_tbl, ready_tbl, epoch, ctr, world, my_rank, n);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    p2p_ar_sum_v2_kernel<<<blocks, threads, 0, s>>>(
+        staging_local, ready_local, epoch, out, world, n);
+    return cudaGetLastError();
+}
+
+
+// ============================================================
 // Knife 1b: qkv GEMV + conv FIR/silu/window-slide epilogue (decode n==1).
 // Replaces matmul_dev(qkv_proj) + the FIR/silu/slide half of
 // conv_prep_fused — one kernel per gdn layer. The row's dot lands,
