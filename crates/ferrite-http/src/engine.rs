@@ -202,6 +202,12 @@ pub trait ServeEngine: Send {
     fn cache_stats(&self) -> CacheStats;
     /// The primary stop token id (retirement tail detection).
     fn stop_id(&self) -> u32;
+    /// Stop-set membership for the finish-reason call: the engine's full
+    /// stop set (the model's turn-end token — e.g. GLM's `augu` id — is
+    /// NOT always the primary <|end|> id; judging by stop_id() alone
+    /// mislabels genuine stops as "length"). The driver asks the engine:
+    /// "does this token end the turn?".
+    fn is_stop(&self, t: u32) -> bool;
 }
 
 // Re-exports for the driver and api modules (one-import ergonomics).

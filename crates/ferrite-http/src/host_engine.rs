@@ -430,4 +430,9 @@ impl crate::engine::ServeEngine for HostEngine {
     fn stop_id(&self) -> u32 {
         STOP_ID
     }
+
+    /// Mock stop set: the single deterministic STOP_ID.
+    fn is_stop(&self, t: u32) -> bool {
+        t == STOP_ID
+    }
 }

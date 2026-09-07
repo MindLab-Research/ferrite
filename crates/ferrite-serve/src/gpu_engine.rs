@@ -298,4 +298,11 @@ impl ServeEngine for GpuEngine {
     fn stop_id(&self) -> u32 {
         self.stops.first().copied().unwrap_or(154_820)
     }
+
+    /// The FULL stop set decides the finish reason: the model's turn-end
+    /// token (augu id 154827 — not the primary <|end|> 154820) must label
+    /// genuine stops as "stop", not "length".
+    fn is_stop(&self, t: u32) -> bool {
+        self.stops.contains(&t)
+    }
 }

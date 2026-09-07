@@ -2311,28 +2311,32 @@ impl CudaBackend {
     /// t0). The gdn{layer}/moe{layer} per-LAYER segment graphs are
     /// seq-independent shared assets and are NOT touched. MtpState is a
     /// per-rank singleton (MTP serving is single-seq); not touched here.
+    ///
+    /// GraphIO pins (x_stage/out_dev) are REMOVED from the map but NOT
+    /// freed: x_stage is the input DevBuf's pinned staging — that DevBuf
+    /// returns to the (per-thread) DevBuf pool at the step's end, and the
+    /// pool re-dispenses the (ptr, stage) pair for the NEXT capture. A
+    /// cudaFreeHost here corrupts the pool's next allocation (observed:
+    /// the follow-up seq's mega capture failed with "memcpy H2D: invalid
+    /// argument" — the H2D src was the freed stage). The pins leak
+    /// ~64KB/seq — negligible vs the ~GBs of DSA caches freed here.
     pub fn free_seq(&self, seq: u64) -> Result<()> {
         self.enter();
         // Pending stream work may still reference the seq's buffers (the
-        // last decode's async kernels): sync before freeing.
-        self.sync()?;
+        // last decode's async kernels): sync before freeing. Best-effort —
+        // a wedged stream (a failed capture can leave capture mode ON,
+        // err 900 on every op) must not block the frees below.
+        if let Err(e) = self.sync() {
+            eprintln!("[cluster] free_seq {seq}: pre-free sync failed ({e}) — freeing anyway");
+        }
         // 1. This seq's mega graphs (exact names — mega{seq}, mega_v{seq}):
-        //    destroy the exec, drop the IO pins (pinned staging +
-        //    the leaked argmax DevBuf).
+        //    destroy the exec; drop the GraphIO MAP entries (the pins leak —
+        //    see the doc comment).
         for name in [format!("mega{seq}"), format!("mega_v{seq}")] {
             if let Some(exec) = self.graph_execs.lock().unwrap().remove(&name) {
                 unsafe { cudaGraphExecDestroy(exec as *mut std::ffi::c_void) };
             }
-            if let Some(io) = self.graph_io.lock().unwrap().remove(&name) {
-                unsafe {
-                    if !io.x_stage.is_null() {
-                        cudaFreeHost(io.x_stage);
-                    }
-                    if !io.out_dev.is_null() {
-                        cudaFree(io.out_dev);
-                    }
-                }
-            }
+            self.graph_io.lock().unwrap().remove(&name);
         }
         // 2. DSA family caches: (seq, *) → 4 device buffers + 2 pinned ints.
         {

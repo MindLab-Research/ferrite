@@ -335,7 +335,7 @@ impl<E: ServeEngine + 'static> EngineDriver<E> {
                     // on deregister (the CUDA engine drops the seq's cluster
                     // runtime) lose the final output otherwise.
                     let out = self.engine.output(seq).unwrap_or_default();
-                    let stopped = out.last() == Some(&self.stop_id());
+                    let stopped = out.last().map(|t| self.engine.is_stop(*t)).unwrap_or(false);
                     let reason =
                         if stopped { FinishReason::Stop } else { FinishReason::Length };
                     let completion =
