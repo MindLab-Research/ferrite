@@ -83,7 +83,13 @@ fn split_of(name: &str, full: &[usize], cfg: &Glm53FlashConfig, rank: usize, wor
         "input_layernorm.weight", "q_a_layernorm.weight", "kv_a_layernorm.weight",
         "indexer_norm.weight", "hc_attn_base", "hc_attn_scale", "hc_attn_fn",
         "hc_ffn_base", "hc_ffn_scale", "hc_ffn_fn", "mlp.gate.weight",
-        ".o_norm.weight", ".a_log", ".dt_bias_h", // o_norm/a_log replicated per-head shared
+        ".o_norm.weight", // o_norm is [head_dim] per-head shared — replicated.
+        // NOTE: .a_log and .dt_bias were wrongly here (they're [heads] /
+        // [heads*dk] — HEAD-SPLIT, matching tp.rs's head_split). The
+        // replicated classification passed the FULL bytes to a rank whose
+        // placeholder had the head-split shape → preload byte-count mismatch
+        // (12 bytes vs numel 3 * 2 = 6). Fixed: they fall through to the
+        // GDN head-split section below.
     ];
     if name.starts_with("model.norm.weight") || name == "model.embed_tokens.weight" {
         return Split::Replicated;
