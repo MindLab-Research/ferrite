@@ -3755,13 +3755,10 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     }
     __syncthreads();
     // li = Σ_i pre_i · x[i*h + j] (parallel over h) — staged in smem, then
-    // FUSED rmsnorm tail (saves the standalone rmsnorm kernel launch per
-    // layer segment): identical reduce order to rmsnorm_kernel (stride ss →
-    // warp shfl → serial red[8] → rsqrt(ss/h + eps)) for parity.
-    // float4-vectorized read of x (j is a multiple of 4; i*h is a multiple of
-    // hidden, both 16B-aligned): each j's acc accumulates over i in the SAME
-    // order as the scalar loop — bit-identical, only the global-load width
-    // changes (memory-bound li: ~2-4x faster). h%4==0 guaranteed (hidden ints).
+    // FUSED rmsnorm tail. NOTE: the n==4 specialized path (4 independent
+    // float4 loads) produced garbled text (32-token early stop) — reverted;
+    // the runtime-n loop's `#pragma unroll` is a no-op on runtime n but the
+    // sequential load→FMA→load chain is numerically correct.
     for (int j = threadIdx.x << 2; j < h; j += blockDim.x << 2) {
         if (j + 3 < h) {
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
