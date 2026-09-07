@@ -2438,9 +2438,16 @@ impl CudaBackend {
             "dsa_kpool",
         )?;
 
-        // 9. indexer topk over pools
-        let select_k = (w.topk / kpool).min(npools);
-        let idx_pools = DevBuf::alloc(self.dev, self.stream, n * select_k)?;
+        // 9. indexer topk over pools — GRAPH-SAFE select_k: pass the CONSTANT
+        // topk/kpool (select_k_max); the kernel derives the LIVE select_k =
+        // min(select_k_max, npools) from the pinned total at replay time. The
+        // OLD code froze min(topk/kpool, npools_at_capture) as a kernel arg —
+        // the verify graph's attention then saw only capture-time pools while
+        // the draft (live select_k) saw the growing cache → d1≠a0 → MTP
+        // accept collapse (the root cause of both the 500-step decay and the
+        // ZERO_H2D early collapse).
+        let select_k_max = w.topk / kpool;
+        let idx_pools = DevBuf::alloc(self.dev, self.stream, n * select_k_max)?;
         let ctx0 = total - n;
         // graph-safe: pass pinned total_ptr instead of frozen npools/ctx0 values
         ck(
@@ -2448,25 +2455,28 @@ impl CudaBackend {
                 ferrite_indexer_topk(
                     qi.as_const_f32(), pool_keys.as_const_f32(), w_idx.as_const_f32(),
                     idx_pools.as_f32(), ni, ih as i32, idm as i32,
-                    select_k as i32, pinned_total, kpool as i32, ni, self.stream,
+                    select_k_max as i32, pinned_total, kpool as i32, ni, self.stream,
                 )
             },
             "dsa_topk",
         )?;
 
-        // 10. expand pools to token indices [n, out_width]
-        let out_width = select_k * kpool + (kpool - 1);
+        // 10. expand pools to token indices [n, out_width_max] — the kernel
+        // derives the live select_k/out_width from the pinned total; the
+        // buffer stride is frozen at the max (graph-safe), the -1 tail slots
+        // beyond each row's live out_width are masked by the attn's j<0 check.
+        let out_width = select_k_max * kpool + (kpool - 1);
         let idx = DevBuf::alloc(self.dev, self.stream, n * out_width)?;
         ck(
             unsafe {
                 ferrite_pool_expand(
                     idx_pools.as_const_f32(), idx.as_f32(),
-                    ni, select_k as i32, kpool as i32, max_npools as i32, pinned_total,
+                    ni, select_k_max as i32, kpool as i32, max_npools as i32, pinned_total,
                     ni, self.stream,
                 )
             },
             "dsa_pool_expand",
-        )?;
+        )?;;
 
         // 11. sparse attention: q [n,h,dk] × k [T,h,dk] × v [T,h,dv] → out [n, h*dv]
         // v2: 256-thread block (v1 was 32 — one warp over topk≈8K slots with

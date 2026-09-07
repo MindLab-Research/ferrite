@@ -1111,10 +1111,11 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
                                      const float* __restrict__ ki,
                                      const float* __restrict__ w,
                                      float* __restrict__ idx,
-                                     int n, int h, int d, int topk,
+                                     int n, int h, int d, int topk_max,
                                      const int* __restrict__ total_ptr, int kpool_val, int n_fixed) {
     int total = *total_ptr; // actual total tokens from pinned memory
     int t = (total + kpool_val - 1) / kpool_val; // DERIVE npools from total
+    int select_k = min(topk_max, t); // LIVE select_k (graph-safe: grows with cache)
     int ctx0 = total - n_fixed; // derive from pinned total
     int ctx0_pools = ctx0 / kpool_val;
     int row = blockIdx.x;
@@ -1151,7 +1152,11 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
     // 32 threads (96 total on the verify chain — 96/4736 cores busy, 144us/
     // inst O(len)); 256 threads = 8x lanes. Strict > keeps the LOWEST lane /
     // warp index on ties — same selection as the old 32-thread tree.
-    for (int r = 0; r < topk; r++) {
+    // GRAPH-SAFE: select_k derived LIVE from the pinned total (not frozen at
+    // capture — the old frozen select_k made the verify graph's attention see
+    // only capture-time npools while the draft's live select_k grew with the
+    // cache → d1≠a0 → MTP accept collapse).
+    for (int r = 0; r < select_k; r++) {
         __shared__ int bidx[8];
         __shared__ float bval[8];
         int best = -1;
@@ -1174,13 +1179,18 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
                 if (bval[w] > sv) { sv = bval[w]; sel = bidx[w]; }
             }
             if (sel >= 0) {
-                idx[(size_t)row * topk + r] = (float)sel;
+                idx[(size_t)row * topk_max + r] = (float)sel;
                 sm[sel] = -INFINITY;
             } else {
-                idx[(size_t)row * topk + r] = -1.0f; // invisible: skip at expansion
+                idx[(size_t)row * topk_max + r] = -1.0f; // invisible: skip at expansion
             }
         }
         __syncthreads();
+    }
+    // pad the (select_k..topk_max) tail: expand only reads r < select_k but
+    // keep the buffer deterministic (graph-safe: fixed stride topk_max).
+    for (int r = select_k + threadIdx.x; r < topk_max; r += blockDim.x) {
+        idx[(size_t)row * topk_max + r] = -1.0f;
     }
 }
 
@@ -2988,26 +2998,28 @@ extern "C" cudaError_t ferrite_kpool_compress(
 }
 
 __global__ void pool_expand_kernel(
-    const float* __restrict__ idx_pools,  // [n, select_k]
-    float* __restrict__ idx,              // [n, out_width]
-    int n, int select_k, int kpool, int max_npools,
+    const float* __restrict__ idx_pools,  // [n, select_k_max]
+    float* __restrict__ idx,              // [n, out_width_max]
+    int n, int select_k_max, int kpool, int max_npools,
     const int* __restrict__ total_ptr,    // pinned (graph-safe)
     int n_fixed) {                        // n as a CONSTANT for ctx0 derivation
     int total = *total_ptr;
     int ctx0 = total - n_fixed;           // derive from pinned total
     int npools = (total + kpool - 1) / kpool; // derive from pinned total
+    int select_k = min(select_k_max, npools); // LIVE (graph-safe: grows with cache)
+    int out_width = select_k * kpool + (kpool - 1); // live out_width
+    int out_stride = select_k_max * kpool + (kpool - 1); // fixed buffer stride
     int i = blockIdx.x;
     if (i >= n) return;
-    int out_width = select_k * kpool + (kpool - 1);
-    const float* pv = idx_pools + (size_t)i * select_k;
-    float* iv = idx + (size_t)i * out_width;
+    const float* pv = idx_pools + (size_t)i * select_k_max;
+    float* iv = idx + (size_t)i * out_stride;
 
     // MULTI-THREAD (was 1 thread serially writing ~8K slots — a dsa-layer
     // straggler): phase A flags valid r (pflt in range) + block prefix in
     // smem; phase B writes valid r's kpool slots in parallel. Invalid r slots
     // are SKIPPED (compact — col only advances for valid r, matching the
     // serial semantics): valid r's base col = valid_prefix(r) * kpool.
-    extern __shared__ int sp[];           // [select_k+1] prefix
+    extern __shared__ int sp[];           // [select_k_max+1] prefix
     int tid = threadIdx.x;
     for (int r = tid; r < select_k; r += blockDim.x) {
         float pflt = pv[r];
@@ -3043,6 +3055,7 @@ __global__ void pool_expand_kernel(
             iv[col++] = (j < tail_count && t <= ctx0 + i) ? (float)t : -1.0f;
         }
         while (col < out_width) iv[col++] = -1.0f;
+        while (col < out_stride) iv[col++] = -1.0f; // stride tail (select_k < max)
     }
 }
 

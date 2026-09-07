@@ -1745,6 +1745,18 @@ impl<B: KernelBackend> TpCluster<B> {
                         cuda.dsa_host_rollback(seq, f, (3 - k_host) as usize);
                     }
                     cuda.dsa_host_rollback(seq, mtp_family, (3 - k_host) as usize);
+                    // Diagnostic: first 10 CALLS (step%4==0 = rank 0 of each call;
+                    // 4 ranks increment ZH2D_STEP per call) — shows when accept
+                    // collapses and whether hprev/draft values keep changing
+                    {
+                        static ZH2D_STEP: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+                        let step = ZH2D_STEP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if step < 48 && step % 4 == 0 {
+                            eprintln!("[zh2d-accept] call={} last={} d1={} d2={} a0={} a1={} a2={} k={}",
+                                step / 4, last, d1_val[0] as u32, d2_val[0] as u32,
+                                a[0] as u32, a[1] as u32, a[2] as u32, k_host);
+                        }
+                    }
                     // mtp_commit with k from host (pinned — TODO: k_dev from device)
                     cuda.mtp_commit(k_host)?;
                     let t_commit = t_c.elapsed();
