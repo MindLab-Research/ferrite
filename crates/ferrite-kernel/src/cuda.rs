@@ -659,6 +659,9 @@ impl Default for CudaBackend {
     }
 }
 
+// fp8 dequant D2H verify counter (first 3 per process — mmap debug only)
+static FP8_DBG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 impl CudaBackend {
     /// Loads libferrite_kernels.so's dependency closure (cudart) and
     /// creates a stream. Call after the .so is in the loader path.
@@ -1138,6 +1141,21 @@ impl CudaBackend {
             )?;
             off += seg.len();
         }
+        // D2H readback diagnostic: verify the device data matches the source
+        // (mmap → device memcpy is a faithful copy, but let's PROVE it)
+        if std::env::var_os("FERRITE_MMAP_DEBUG").is_some() && numel >= 8 {
+            let mut host_back: Vec<u8> = vec![0u8; 16];
+            ck(
+                unsafe { cudaMemcpy(host_back.as_mut_ptr() as *mut _, ptr, 16, CUDA_MEMCPY_D2H) },
+                "bf16_raw D2H verify",
+            )?;
+            let src_first: Vec<u8> = segments.iter().flat_map(|s| s.iter().take(16).copied()).take(16).collect();
+            let match_ = host_back == src_first[..16.min(src_first.len())];
+            eprintln!(
+                "[mmap-dbg] bf16_raw D2H verify: numel={} device={:02x?} src={:02x?} match={}",
+                numel, &host_back[..8], &src_first[..8.min(src_first.len())], match_
+            );
+        }
         self.weights.lock().unwrap().insert(
             key,
             CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },
@@ -1220,6 +1238,46 @@ impl CudaBackend {
             cudaFree(sc);
         }
         conv?;
+        // D2H verify: read back first 8 bf16 elements of the dequant output and
+        // compare with the CPU reference (e4m3 decode × scale → f32 → bf16).
+        // Catches kernel/scale-indexing/staging bugs on the 95%-of-params
+        // expert path (fp8 dequant is mmap-only — the legacy path dequants on
+        // CPU via dequant_block; a divergence here = garbage experts →
+        // constant-output bug). One run, first 3 experts per rank.
+        if std::env::var_os("FERRITE_MMAP_DEBUG").is_some()
+            && numel >= 8
+            && rows >= 1
+            && cols >= 8
+            && FP8_DBG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3
+        {
+            let mut host_back: Vec<u8> = vec![0u8; 16];
+            ck(
+                unsafe { cudaMemcpy(host_back.as_mut_ptr() as *mut _, ptr, 16, CUDA_MEMCPY_D2H) },
+                "fp8_dequant D2H verify",
+            )?;
+            let mut expect: Vec<u8> = Vec::with_capacity(16);
+            for c in 0..8usize.min(cols).min(data.len()) {
+                let b = data[c];
+                let sign = if b & 0x80 != 0 { -1.0f32 } else { 1.0f32 };
+                let e = ((b >> 3) & 0x0f) as i32;
+                let m = (b & 0x07) as i32;
+                let v: f32 = if e == 0 {
+                    sign * (m as f32 / 8.0) * 2f32.powi(-6)
+                } else {
+                    sign * (1.0 + m as f32 / 8.0) * 2f32.powi(e - 7)
+                };
+                let sc_col = (c / 128).min(scols.saturating_sub(1));
+                let f = v * scale[sc_col];
+                let bits = f.to_bits() >> 16;
+                expect.extend_from_slice(&(bits as u16).to_le_bytes());
+            }
+            let n8 = expect.len().min(8);
+            let m = &host_back[..n8] == &expect[..n8];
+            eprintln!(
+                "[fp8-verify] numel={} {}x{} device={:02x?} expect={:02x?} match={}",
+                numel, rows, cols, &host_back[..n8], &expect[..n8], m
+            );
+        }
         self.weights.lock().unwrap().insert(
             key,
             CachedBuf { keep: placeholder.data.clone(), dev: ptr, len: numel },

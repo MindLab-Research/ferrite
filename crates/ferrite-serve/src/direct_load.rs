@@ -291,31 +291,18 @@ pub fn direct_preload_shard(
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect();
                 let scols_full = cols.div_ceil(128);
-                // CRITICAL FIX: register the fp8 bypass (fp8 data + scale on
-                // the device, keyed by the placeholder's ptr+numel) so
-                // matmul_dev's fp8_lookup HITS and serves the fp8 GEMV —
-                // the SAME numerical path as the legacy loader (register_fp8
-                // → ferrite_gemv_fp8_v2 W8A16). Without this, matmul_dev falls
-                // through to dev_weight_bf16 (the dequanted bf16) — the bf16
-                // GEMV's different rounding vs the fp8 GEMV produces constant
-                // "!!!!!" output (the mmap path's root cause: the legacy path
-                // registers fp8 for ALL fp8-eligible weights via set_fp8 →
-                // fp8 GEMV; the mmap path dequanted to bf16 → bf16 GEMV —
-                // a different numerical domain for the MoE experts).
-                // ALSO keep the bf16 dequant (preload_fp8_dequant) for the
-                // non-fp8 fallback path (dev_weight_bf16 consumers).
+                // fp8 weights: register the SHARD-CORRECT fp8 bypass (same
+                // numerical path as the legacy loader: fp8 GEMV W8A16) AND
+                // dequant to bf16 (dev_weight_bf16 fallback). The legacy path
+                // registers the SPLIT fp8 (fp8_row/fp8_col produce per-rank
+                // shard fp8 + scale); registering the FULL fp8 here would make
+                // the fp8 GEMV read 4x the rows → wrong numerics. The bf16
+                // dequant below is shard-correct (row/col windows on data and
+                // scale) and serves dev_weight_bf16 consumers.
+                let scols_full = cols.div_ceil(128);
                 let d = dv.direct.slice(data);
-                backend.register_fp8(ph, rows, cols, d, &scale_full)?;
-                st.fp8_rows += 1;
-                // bf16 dequant (fallback for dev_weight_bf16 consumers —
-                // the fp8 GEMV takes priority in matmul_dev's fp8_lookup)
                 match split {
                     Split::Replicated => {
-                        backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
-                        st.fp8_rows += 1;
-                    }
-                    Split::Replicated => {
-                        let d = dv.direct.slice(data);
                         backend.preload_fp8_dequant(ph, d, &scale_full, rows, cols)?;
                         st.fp8_rows += 1;
                     }

@@ -429,10 +429,20 @@ pub fn load_direct(dir: &Path, cfg: &crate::config::Glm53FlashConfig) -> Result<
                     // device gets its own copy via the widen kernel).
                     let n: usize = shape.iter().product();
                     let bytes = direct.slice(&e.seg);
+                    // mmap sanity: first 8 bytes of the embed segment (should
+                    // be non-zero bf16 — all-zero = wrong offset → garbage
+                    // embeddings → constant "!!!" output)
+                    if std::env::var_os("FERRITE_MMAP_DEBUG").is_some() {
+                        eprintln!("[mmap-dbg] embed seg first 8 bytes: {:02x?} (len={})", &bytes[..8.min(bytes.len())], bytes.len());
+                    }
                     let mut f32_data = Vec::with_capacity(n);
                     for chunk in bytes.chunks_exact(2) {
                         let bits = u16::from_le_bytes([chunk[0], chunk[1]]) as u32;
                         f32_data.push(f32::from_bits(bits << 16));
+                    }
+                    // sanity: first 2 f32 values (token 0's embedding start)
+                    if std::env::var_os("FERRITE_MMAP_DEBUG").is_some() {
+                        eprintln!("[mmap-dbg] embed f32[0..2]: {:?} (expect non-zero)", &f32_data[..2.min(f32_data.len())]);
                     }
                     placeholders.insert(
                         name.clone(),
