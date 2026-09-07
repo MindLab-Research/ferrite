@@ -1255,9 +1255,9 @@ impl<B: KernelBackend> TpCluster<B> {
                         // row 0 of last step's verify h_final export). D2H both.
                         let m2 = cuda.mtp.lock().unwrap();
                         let m2 = m2.as_ref().unwrap();
-                        let mut hfv = [0f32; 4];
+                        let mut hfv = [0f32; 12];
                         let rh2 = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv.as_mut_ptr(), 4, cuda.stream_handle());
+                            m2.hf_v.as_f32() as *mut std::ffi::c_void, hfv.as_mut_ptr(), 12, cuda.stream_handle());
                         // FULL hptr vs hf_v[0] comparison (4096 floats) — first 8
                         // mismatch indices (k=1 commit writes hprev<-hf_v[0]).
                         let mut hp_full = vec![0f32; 4096];
@@ -1269,8 +1269,14 @@ impl<B: KernelBackend> TpCluster<B> {
                         let mism: Vec<usize> = hp_full.iter().zip(hfv_full.iter()).enumerate()
                             .filter(|(_, (a, b))| a != b).map(|(i, _)| i).take(8).collect();
                         let tc = cuda.dsa_t_count(seq, mtp_family);
-                        eprintln!("[zh2d-hp] hp[0..4]={:?} mism_idx={:?} n_mism={} tc={:?} r={}/{}",
-                            hp, mism, mism.len(), tc, rh, rh2);
+                        // k=2 commit writes hprev<-hf_v[1]: which row does hprev
+                        // actually match? (S6+ all-miss root: wrong row?)
+                        let mut m1 = vec![0f32; 4096]; let mut m2r = vec![0f32; 4096];
+                        ferrite_kernel::cuda::memcpy_d2h_sync(hprev_ptr as *mut std::ffi::c_void, m1.as_mut_ptr(), 4096, cuda.stream_handle());
+                        ferrite_kernel::cuda::memcpy_d2h_sync(unsafe { (m2.hf_v.as_f32() as *mut std::ffi::c_void).add(4096) }, m2r.as_mut_ptr(), 4096, cuda.stream_handle());
+                        let row_mism: Vec<usize> = m1.iter().zip(m2r.iter()).enumerate().filter(|(_, (a, b))| a != b).map(|(i, _)| i).take(4).collect();
+                        eprintln!("[zh2d-hp] hp={:?} hfv_rows={:?} hp_vs_row1_mism={} idx={:?} tc={:?}",
+                            hp, hfv, row_mism.len(), row_mism, tc);
                     }
                     cuda.embed_one_dev(&embed_table, tokens_ptr, emb1_ptr, hidden, 1)?;
                     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
@@ -1303,9 +1309,13 @@ impl<B: KernelBackend> TpCluster<B> {
                     d1_ptr as *mut std::ffi::c_void,
                     hidden,
                 )?;
-                // KV-slot dump: cache[t0]'s first k_nope floats after draft1's
-                // append — S3==S2 would mean the append wrote STALE KV (the
-                // delayed-d1 root); differs = cache fresh (look deeper).
+                // KV-slot dump: the draft1's just-appended slot (t_count-1 after
+                // the append) and draft2's target (t_count). MUST change every
+                // step (fresh KV per draft input). FIXED: the old dump used
+                // BYTE arithmetic on *mut c_void (14*64*256 bytes = slot 3.5's
+                // region — h=64, dk=256 → slot stride is 16384 FLOATS = 65536
+                // bytes) — it read slot 3's head-32 garbage, meaningless.
+                // Now: *mut f32 + (slot * h * dk) floats, t from the cache.
                 if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
                     {
                         let cuda = s
@@ -1316,22 +1326,24 @@ impl<B: KernelBackend> TpCluster<B> {
                             let m2 = cuda.mtp_family_cache(seq, mtp_family)?;
                             (m2.0, m2.1)
                         };
-                        let _ = t0c;
-                        // k_nope layout [max_tokens, h=64, dk=256] → slot stride
-                        // h*dk=16384 floats. Slot 14 = the draft's own append
-                        // target — MUST change every step (fresh KV). If it
-                        // stays constant across steps → append is not landing
-                        // at slot 14 (stale KV read by attention = delayed d1).
+                        // slot stride = h*dk floats (k_nope [max_t, h, dk]);
+                        // h=64 dk=256 → 16384 floats. t0c is AFTER draft1's
+                        // append (t_count incremented by dsa_layer_dev), so
+                        // draft1 wrote slot t0c-1; draft2 will write slot t0c.
+                        let knp_f = knp as *mut f32;
+                        let stride = 64 * 256;
+                        let s_prev = unsafe { knp_f.add(t0c.saturating_sub(1) * stride) };
+                        let s_next = unsafe { knp_f.add(t0c * stride) };
                         let mut kv = [0f32; 4];
                         let rk = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            unsafe { knp.add(14 * 64 * 256) } as *mut std::ffi::c_void,
+                            s_prev as *mut std::ffi::c_void,
                             kv.as_mut_ptr(), 4, cuda.stream_handle());
-                        // also slot 15 (draft2's append target)
-                        let mut kv15 = [0f32; 4];
-                        let rk15 = ferrite_kernel::cuda::memcpy_d2h_sync(
-                            unsafe { knp.add(15 * 64 * 256) } as *mut std::ffi::c_void,
-                            kv15.as_mut_ptr(), 4, cuda.stream_handle());
-                        eprintln!("[zh2d-kv] s14={:?} s15={:?} r={}/{}", kv, kv15, rk, rk15);
+                        let mut kv2 = [0f32; 4];
+                        let rk2 = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            s_next as *mut std::ffi::c_void,
+                            kv2.as_mut_ptr(), 4, cuda.stream_handle());
+                        eprintln!("[zh2d-kv] t={} slot[t-1]={:?} slot[t]={:?} r={}/{}",
+                            t0c, kv, kv2, rk, rk2);
                     }
                 }
 
@@ -1581,17 +1593,21 @@ impl<B: KernelBackend> TpCluster<B> {
                     } else { 1 };
                     // DSA rollback — decoder families: verify graph appends 3
                     // (last,d1,d2) → keep k accepted → rollback(3-k) ✓ (vLLM
-                    // semantics). mtp_family: draft appends only 2 (last@t0,
-                    // d1@t0+1) → keep k means rollback(2-k): k=1 keeps t0's
-                    // last (the PREVIOUSLY-VERIFIED main KV), next draft1's
-                    // a0 overwrites t0+1 (the REJECTED d1 slot); k=2/3 keep
-                    // last+d1. The old (3-k) was vLLM's 3-append formula
-                    // applied to a 2-append draft — it reverted ONE too many,
-                    // so the next draft1 overwrote the verified main KV at t0.
+                    // semantics). mtp_family: the ORIGINAL mtp_step's arithmetic
+                    // (828ec86, accept 2.38): draft appends 2 (last@t0,
+                    // d1@t0+1), verify appends 0 (tc data: 14,16,18,20,21 =
+                    // P+Σk proves it) → rollback(3-k) keeps k-1: k=1 → keep 0
+                    // (next draft1 overwrites last's slot), k=2 → keep 1
+                    // (last), k=3 → keep 2 (last+d1). The (2-k) experiment
+                    // (b2268ad) kept the accepted d1's KV at k=2 — the draft
+                    // cache stream then diverges from the original's reference
+                    // ((3-k) matches 828ec86's line 821 EXACTLY) and accept
+                    // collapsed to 1.0 from S6 (FIX12: S1-S3 k=2, S4 k=1,
+                    // S5 k=2, S6+ all k=1).
                     for f in 0..num_dsa {
                         cuda.dsa_host_rollback(seq, f, (3 - k_host) as usize);
                     }
-                    cuda.dsa_host_rollback(seq, mtp_family, (2 - k_host).max(0) as usize);
+                    cuda.dsa_host_rollback(seq, mtp_family, (3 - k_host) as usize);
                     // mtp_commit with k from host (pinned — TODO: k_dev from device)
                     cuda.mtp_commit(k_host)?;
                     let t_commit = t_c.elapsed();
