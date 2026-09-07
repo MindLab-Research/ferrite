@@ -3740,11 +3740,20 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         // BIT-level first 32 u32 — 8-seg f64 sums cannot see 1-ulp diffs
         // (1.5e-8 < 1e-6 print precision) but argmax flips on near-ties
         // (orig d2=315 vs zh 8606, orig S2 d1=98347 vs zh 702). Bits localize it.
-        let mut xbf = [0f32; 32];
+        let mut xbf = [0f32; 4096];
+        let xn2 = h.min(4096);
         ferrite_kernel::cuda::memcpy_d2h_sync(
-            x2.as_f32() as *mut std::ffi::c_void, xbf.as_mut_ptr(), 32, cuda.stream_handle());
-        let xbits: Vec<u32> = xbf.iter().map(|v| v.to_bits()).collect();
-        eprintln!("[zh2d-x2b] {:?}", xbits);
+            x2.as_f32() as *mut std::ffi::c_void, xbf.as_mut_ptr(), xn2, cuda.stream_handle());
+        // exact float equality count vs a SECOND read of the SAME buffer via a
+        // separate D2H (draft1's x2 must be bit-identical; if not, the source
+        // is a stale/aliased read of the buffer across the draft1->draft2
+        // boundary). Also dump the last 8 u32 to locate tail 1-ulp drift.
+        let mut xbf2 = [0f32; 4096];
+        ferrite_kernel::cuda::memcpy_d2h_sync(
+            x2.as_f32() as *mut std::ffi::c_void, xbf2.as_mut_ptr(), xn2, cuda.stream_handle());
+        let neq = xbf.iter().zip(xbf2.iter()).take(xn2).filter(|(a, b)| a != b).count();
+        let xb: Vec<u32> = xbf[..xn2].iter().map(|v| v.to_bits()).collect();
+        eprintln!("[zh2d-x2b] self_neq={} first8={:?} last8={:?}", neq, &xb[..8.min(xn2)], &xb[(xn2-8).min(0)>>0..]);
     }
     let h_normed = cuda.rmsnorm_dev(&x2, s.w(&format!("{pfx}.shared_head.norm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let lm_w = s.w("lm_head.weight")?;
