@@ -380,6 +380,16 @@ fn shard_linear_attn_weight(
     if name.ends_with(".qkv_proj.weight") || name.ends_with(".qkv_conv1d.weight") {
         // [3*proj, X] rows are [q_heads..., k_heads..., v_heads...] — head-split
         // each third by rows [hs*dk, he*dk).
+        // Placeholder guard (direct mmap path): data.len() < numel means the
+        // real bytes live in the mmap segment (device-side preload handles the
+        // split) — shape-only pass-through, no host slicing.
+        if t.as_slice().len() < rows * cols {
+            return Some(Tensor {
+                shape: Shape::new([3 * (he - hs) * dk, cols]),
+                dtype: t.dtype,
+                data: std::sync::Arc::new(vec![0f32; 4]),
+            });
+        }
         let mut data = Vec::new();
         let third = rows / 3;
         let (qs, qe) = (hs * dk, he * dk);
