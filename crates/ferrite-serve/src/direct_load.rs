@@ -192,11 +192,16 @@ pub fn direct_preload_shard(
     shard: &HashMap<String, Tensor>,
 ) -> Result<DirectPreloadStats> {
     let mut st = DirectPreloadStats::default();
+    let mut skipped: Vec<&str> = Vec::new();
     for (name, ph) in shard {
         let Some(view) = dv.views.get(name) else {
             // Names absent from the direct view (skipped/unsupported by the
             // checkpoint adapter — visual tensors etc.): the legacy table
-            // never had them either; nothing to preload.
+            // never had them either; nothing to preload. BUT a shard-table
+            // entry with NO direct view would miss the device cache at
+            // runtime (dev_weight's stub guard errors / silent garbage) —
+            // collect and fail loudly instead of skipping silently.
+            skipped.push(name.as_str());
             continue;
         };
         // window mirror: shard placeholder shape == the window's product
@@ -397,6 +402,19 @@ pub fn direct_preload_shard(
                 }
             }
         }
+    }
+    // Fail-fast: a shard-table entry with real shape but NO direct view would
+    // miss the device cache at runtime — dev_weight's stub guard would error
+    // (or, pre-guard, silently serve garbage). The view lookup must cover
+    // every non-empty shard entry.
+    if let Some(first) = skipped
+        .iter()
+        .find(|n| shard.get(&n.to_string()).map(|t| t.numel() > 0).unwrap_or(false))
+    {
+        return Err(FerriteError::Config(format!(
+            "direct_preload_shard: {} shard entries have no direct view (first: {first}) — they would miss the device cache and serve garbage; load_direct's checkpoint entry lookup must cover them",
+            skipped.len()
+        )));
     }
     Ok(st)
 }

@@ -723,6 +723,19 @@ impl CudaBackend {
                 return Ok(DevRef { ptr: cb.dev, len: cb.len });
             }
         }
+        // MMAP PLACEHOLDER GUARD: a 4-elem stub that missed the cache would
+        // cudaMemcpy numel*4 bytes from a 16-byte Vec — a silent heap OOB
+        // read → garbage f32 weights (norms/hc/A_log/dt_bias) → garbage text
+        // with ZERO errors logged. Fail fast with the numel so the skipped
+        // preload is identifiable. (The bf16 path (dev_weight_bf16) has the
+        // same guard; this closes the f32 blind spot.)
+        if t.as_slice().len() < t.numel() {
+            return Err(FerriteError::InvalidArg(format!(
+                "dev_weight: placeholder stub ({} bytes data vs {} numel) missed the f32 cache — the weight was never preloaded",
+                t.as_slice().len(),
+                t.numel()
+            )));
+        }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut ptr, t.numel() * 4) }, "weight malloc")?;
         ck(
