@@ -1401,7 +1401,13 @@ impl CudaBackend {
         // with NO fp8 registration must fail loudly — its bf16 upload would
         // read 4 elements as the full weight (garbage), and the fp8 map is
         // the only real store (register failed or shard seam dropped it).
-        if w.as_slice().len() < w.numel() && self.fp8_lookup(w).is_none() {
+        // DIRECT-MMAP EXCEPTION: the direct preload path ALSO populates the
+        // weights cache (placeholder ptr+numel is the key — the mmap bytes
+        // were uploaded during direct_preload_shard). Check that first.
+        if w.as_slice().len() < w.numel()
+            && self.fp8_lookup(w).is_none()
+            && !self.weights.lock().unwrap().contains_key(&(w.as_slice().as_ptr() as usize, w.numel()))
+        {
             return Err(FerriteError::InvalidArg(format!(
                 "matmul_dev: fp8 placeholder weight ({} elems data vs {} numel) has no fp8 registration",
                 w.as_slice().len(), w.numel()
