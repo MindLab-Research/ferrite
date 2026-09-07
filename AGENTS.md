@@ -84,28 +84,26 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 
 ## Profiling (what works on this machine)
 
-**nsys 2024.2.3 (apt) DOES NOT WORK with CUDA 13.2 / driver 595 / B300**: zero CUDA rows in the report (CUPTI injection fails silently; even a 3-kernel mini program records nothing). Do not waste time on it. GPU-side timing events inside a captured CUDA graph also do NOT work (`cudaEventElapsedTime` on graph-recorded events returns InvalidValue — sync-only; the dead `FERRITE_MEGA_EVTS` code has been removed for this reason).
-
-**Use ncu (CUDA 13.2 bundled)** — verified working incl. CUDA-graph replays. TWO mandatory pieces:
-
-1. `FERRITE_NCU=1` on the serve — opens a `cudaProfilerStart/Stop` window around the decode loop, **starting at step i==1** (step 0 is the mega/verify graph CAPTURE; ncu's per-kernel replay conflicts with stream capture and hangs the run mid-prefill).
-2. `ncu --profile-from-start off` — without it ncu intercepts every launch from process start (the 80s weight load = 38k H2D/kernel interceptions at ms each → 10+ min stall).
+**LLM-serve kernel breakdown: nsys 2025.6.3** (`/usr/local/cuda-13.2/bin/nsys` — the CUDA 13.2 bundled one; the 2024.2.3 apt version still does NOT work: zero CUDA rows). Verified 2026-09-07 on a 3-kernel mini program (CUPTI injection healthy, cuda_gpu_kern_sum reports correct). ~5-10% overhead, full timeline, works with CUDA graphs:
 
 ```bash
-sudo /usr/local/cuda-13.2/bin/ncu --profile-from-start off --graph-profiling node \
-  --metrics gpu__time_duration.sum --launch-count 500000 \
-  --csv --log-file /tmp/ncu_mtp.csv \
-  env NCCL_NVLS_ENABLE=0 FERRITE_MEGA=1 FERRITE_MTP=1 FERRITE_NCU=1 ... \
-  ./target/release/ferrite-serve --backend cuda --tp 4 --model-dir ... --max-tokens 15 ...
+sudo /usr/local/cuda-13.2/bin/nsys profile --trace=cuda --cuda-graph-trace=node \
+  --sample=none -o /tmp/nsys_out --force-overwrite=true \
+  env NCCL_NVLS_ENABLE=0 FERRITE_MEGA=1 FERRITE_NCCL=1 FERRITE_P2P=1 FERRITE_WORKER_POOL=1 \
+  FERRITE_LAYER_DEV=1 FERRITE_GDN_DEV=1 FERRITE_MOE_DEV=1 FERRITE_DSA_DEV=1 FERRITE_HEAD_DEV=1 \
+  CUDA_VISIBLE_DEVICES=4,5,6,7 LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
+  ./target/release/ferrite-serve ... --max-tokens 20 ...
+sudo /usr/local/cuda-13.2/bin/nsys stats --report cuda_gpu_kern_sum /tmp/nsys_out.nsys-rep
 ```
 
-- `sudo` is REQUIRED (ERR_NVGPUCTRPERM otherwise).
-- `--graph-profiling node` (default) expands kernels inside graph replays.
-- `gpu__time_duration.sum` only = 1 pass per kernel, ~usable overhead.
-- Then aggregate the CSV: `python3 -c` group-by kernel name → total µs. `--launch-count` caps total profiled launches; the whole 15-step MTP run is ~10⁵ kernel instances (all 4 ranks), budget minutes of wall time.
-- Validate the toolchain on a 3-kernel mini program first when in doubt (that is how the nsys incompatibility was found).
+`--cuda-graph-trace=node` expands mega-graph replays into individual kernels in the report. Log FULL output to a file (never `grep|head` pipes — they swallow progress/errors and you can't see which stage hung). Validate the toolchain on the 3-kernel mini first when in doubt: `kernels/cuda/ncu_miniprof.cu` (cudaProfilerStart/Stop window) exists for exactly this.
 
-CPU side: `FERRITE_PPROF=1 FERRITE_PPROF_OUT=serve.svg` (flamegraph over load+decode).
+**ncu: NEVER profile the whole serve with it — it WILL time out (burned ~40 min / 5+ failed attempts 2026-09-07).** ncu's injection overhead is 10-100× per CUDA call; the pre-decode phases alone (mmap load = 38287 cudaMemcpy API interceptions + mega-graph capture with 900+ kernel dry-runs) exceed any sane timeout — the profile window (FERRITE_NCU, decode step ≥1) never even starts (CSV contains only `==PROF== Connected` + `==ERROR== ... 124`). kernel-name filters and launch-count caps do NOT help: the overhead hits pre-window API calls too. ncu IS fine for single-kernel micro-benchmarks (mini program verified) and for known-hotspot deep dives launched outside the serve. In-serve per-kernel time = nsys; kernel deep-dive (SOL/occupancy) = ncu on an isolated repro of that kernel (see tests/bf16_widen_gpu.rs for the Rust-side harness pattern).
+
+Other profiling rules:
+- GPU-side timing events inside a captured CUDA graph do NOT work (`cudaEventElapsedTime` on graph-recorded events returns InvalidValue — sync-only; the dead `FERRITE_MEGA_EVTS` code was removed for this reason).
+- `FERRITE_TIMING` per-layer numbers (at=/mid=/ffn=) are HOST-side Instant deltas around launch+sync — useful for RELATIVE layer comparison only; never quote them as kernel GPU time (they overstate ~10-20× and misled the "DSA at=7.5ms" hunt; the real per-step budget is replay ~15.6ms/45 layers = ~350µs/layer).
+- CPU side: `FERRITE_PPROF=1 FERRITE_PPROF_OUT=serve.svg` (flamegraph over load+decode).
 
 ## GPU test discipline (hard rules)
 
