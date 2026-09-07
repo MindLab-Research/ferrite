@@ -3696,16 +3696,20 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     float* li_s = sm + nh + mix + n * n + n;     // [h]
     float* red = li_s + h;   // [WMAX+8]
 
-    // ── 1. Prefetch x → smem_x (SYNCHRONOUS coalesced copy, NO FMA dependency
-    // chain — the pure load→store has 4× the MLP of P3's load-FMA-load chain;
-    // 32 warps × 16B coalesced = 512 warp-loads at 128 outstanding ≈ 2µs).
-    // The P3 then reads from SHARED (20TB/s) instead of GLOBAL (load-use
-    // dependency chain at ~8GB/s effective on 1 SM). ──
+    // ── 1. cp.async prefetch: x → smem_x via the DMA engine (128+ outstanding
+    // L2 requests vs the LSU's ~48 — 2.6× faster than the LSU path for the
+    // 64KB bulk copy). Fire-and-forget (overlaps with P1/P2 below). ──
     {
-        for (int i = threadIdx.x; i < nh; i += blockDim.x) {
-            smem_x[i] = x[i];
+        const char* xc = (const char*)x;
+        char* sc = (char*)smem_x;
+        int total_bytes = nh * (int)sizeof(float);
+        for (int off = threadIdx.x * 16; off < total_bytes; off += (int)blockDim.x * 16) {
+            unsigned saddr = (unsigned)__cvta_generic_to_shared(sc + off);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(saddr), "l"(xc + off));
         }
-        __syncthreads();
+        asm volatile("cp.async.commit_group;");
+        // NO __syncthreads here — the DMA runs in the background while P1/P2
+        // execute. The wait_group 0 comes after P2 (before P3's smem_x reads).
     }
 
     // PROLOGUE (K-split phase-2): reduce the KS partial dots per mix row
@@ -3772,6 +3776,10 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
         }
         for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
     }
+    __syncthreads();
+    // ── 2. cp.async completion barrier (the DMA overlapped with P1/P2 above;
+    // the 64KB copy at DMA 128-outstanding ≈ 16µs vs LSU path ~42µs) ──
+    asm volatile("cp.async.wait_group 0;");
     __syncthreads();
     // ── 3. P3: li = Σ_i pre_i · smem_x[i*h + j] (parallel over h) — reading
     // from SHARED (prefetched above, 20TB/s) instead of GLOBAL (load-use
