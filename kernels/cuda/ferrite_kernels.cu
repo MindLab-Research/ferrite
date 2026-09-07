@@ -1192,28 +1192,44 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
     float inv_sqrt_d = rsqrtf((float)d);
     // causal guard: query row i may only select keys j < ctx0_pools + i + 1
     int jmax = min(ctx0_pools + row + 1, t);
-    for (int j = threadIdx.x; j < t; j += blockDim.x) {
-        const float* k = ki + (size_t)j * d;
-        float s = 0.f;
-        if (j < jmax) {
-            // float4 dot (d multiple of 4, 16B-aligned DevBuf): 4x load width
-            // over the scalar loop; per-head accumulation stays ascending-l.
-            for (int hi = 0; hi < h; hi++) {
-                const float* q = qi + (size_t)row * (h * d) + hi * d;
-                float dot = 0.f;
-                float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-                for (int l = 0; l + 3 < d; l += 4) {
-                    float4 qv = *reinterpret_cast<const float4*>(q + l);
-                    float4 kv = *reinterpret_cast<const float4*>(k + l);
-                    d0 += qv.x * kv.x; d1 += qv.y * kv.y; d2 += qv.z * kv.z; d3 += qv.w * kv.w;
+    // ═══ H-SPLIT SCORING (v11): 4 threads per pool (4 heads each) — the
+    // 1-block 85µs scoring (129 pools × 16 heads × 64 dims at 1 SM) becomes
+    // 4× parallel (~21µs). The partials [4][t] in the smem's extended area
+    // (sm[t .. t+4t)); block 0 reduces (quarter-ascending = head-ascending).
+    // FP NOTE: the 4-partial sum (h0-3)+(h4-7)+(h8-11)+(h12-15) differs
+    // from the serial h0+h1+...+h15 by ~1-2 ulp — the topk selection is
+    // score-threshold based (robust to this if the scores aren't at ties).
+    {
+        int tid = threadIdx.x;
+        int pool = tid >> 2;      // pool = tid / 4
+        int quarter = tid & 3;    // h quarter (0-3)
+        if (pool < t) {
+            const float* k = ki + (size_t)pool * d;
+            float s = 0.f;
+            if (pool < jmax) {
+                int h0 = quarter * (h >> 2);
+                int h1 = h0 + (h >> 2);
+                for (int hi = h0; hi < h1; hi++) {
+                    const float* q = qi + (size_t)row * (h * d) + hi * d;
+                    float dot = 0.f;
+                    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                    for (int l = 0; l + 3 < d; l += 4) {
+                        float4 qv = *reinterpret_cast<const float4*>(q + l);
+                        float4 kv = *reinterpret_cast<const float4*>(k + l);
+                        d0 += qv.x * kv.x; d1 += qv.y * kv.y; d2 += qv.z * kv.z; d3 += qv.w * kv.w;
+                    }
+                    dot = (d0 + d1) + (d2 + d3);
+                    s += w[(size_t)row * h + hi] * fmaxf(dot, 0.f); // relu
                 }
-                dot = (d0 + d1) + (d2 + d3);
-                s += w[(size_t)row * h + hi] * fmaxf(dot, 0.f); // relu
             }
-            sm[j] = s * inv_sqrt_d;
-        } else {
-            sm[j] = -INFINITY;
+            sm[t + pool * 4 + quarter] = s; // partial (extended smem area)
         }
+    }
+    __syncthreads();
+    // Reduce the 4 partials (quarter-ascending = head-ascending order)
+    for (int j = threadIdx.x; j < t; j += blockDim.x) {
+        float total = sm[t + j * 4] + sm[t + j * 4 + 1] + sm[t + j * 4 + 2] + sm[t + j * 4 + 3];
+        sm[j] = (j < jmax) ? total * inv_sqrt_d : -INFINITY;
     }
     __syncthreads();
     // FAST PATH (select_k >= jmax): ALL causally-valid pools are selected —
@@ -1281,12 +1297,15 @@ extern "C" cudaError_t ferrite_indexer_topk(const float* qi, const float* ki,
                                             float* idx, int n, int h, int d,
                                             int topk, const int* total_ptr, int kpool_val, int n_fixed,
                                             cudaStream_t s) {
-    dim3 block(256);
+    // H-SPLIT (v11): 4 threads per pool (4 heads each) — blockDim 544 = 17 warps
+    // (129 pools × 4 quarters = 516 threads + 28 idle). The smem: t scores +
+    // 4t partials = 5 × max_t floats.
+    dim3 block(544);
     dim3 grid(n);
     // smem sized for MAX possible pools (graph-safe: frozen smem with actual
-    // npools would overflow as context grows)
+    // npools would overflow as context grows) + 4 partials per pool (h-split)
     int max_t = 2048; // max_npools = max_tokens / kpool
-    size_t smem = (size_t)max_t * sizeof(float);
+    size_t smem = (size_t)max_t * 5 * sizeof(float); // scores + 4 partials
     indexer_topk_kernel<<<grid, block, smem, s>>>(qi, ki, w, idx, n, h, d, topk, total_ptr, kpool_val, n_fixed);
     return cudaGetLastError();
 }
