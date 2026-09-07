@@ -2531,6 +2531,8 @@ extern "C" cudaError_t ferrite_moe_fused_act(
     int inter_shared, int topk, int n, float limit, cudaStream_t s) {
     // rows = warps per block (256 threads / 32 = 8); grid.z = token (prefill
     // batch dimension — decode n==1, chunked prefill n up to chunk size).
+    // v11 tried rows=2/blockDim=64 (2304 blocks): 62.0 vs 62.3 — NO gain (act
+    // is memory-bandwidth-bound at ~3.2TB/s effective, more blocks ≠ more MLP).
     int rows = 8;
     int max_rows = inter > inter_shared ? inter : inter_shared;
     dim3 grid((max_rows + rows - 1) / rows, topk + 1, n);
