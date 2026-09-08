@@ -405,3 +405,11 @@ unroll 4 时已经饱和（5 load/轮 × 4 = 20 个在飞），再加只增寄�
 replay 行在 1000-token 时比端到端低 8%（它把 capture/dry-run 期的慢步也平均进去了，
 且行内容与 seq 数无关）。**对外汇报/对比时用 per-seq steady × 16**；replay 行只用于
 同窗口 A/B 的相对比较（且必须看同一区段的连续行）。
+
+## 实测：MTP 在 B=16 下输出乱码（不可用于批量）
+
+`FERRITE_MTP=1` + `--max-seqs 16` + 16 并发：bench 无 replay 行、txtcheck 输出 `先!!!!!`。
+原因：MTP 的 draft/verify 是**单序列设计**（draft=2 用 layers.45 nextn，verify n=3 的 mega_v 图，
+accept/commit 按「一个 seq 的 n 个 token」索引）。批量场景下多 seq 混在一起，accept 索引假设失效。
+→ **MTP 只能用于单序列**；B=16 的对外数字必须走非 MTP 路径（当前 909-957 tok/s）。
+若要批量 MTP，需要为每个 seq 独立维护 draft/verify 的 token 队列（大改）。
