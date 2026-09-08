@@ -4711,6 +4711,15 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     let enorm = cuda.rmsnorm_dev(embed_row, s.w(&format!("{pfx}.enorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let hnorm = cuda.rmsnorm_dev(h_prev, s.w(&format!("{pfx}.hnorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
+        // ALIAS CHECK: the pool must hand out distinct buffers — a collision
+        // here means the capture pass's leaked bufs corrupted the pool
+        // accounting (enorm's data would be overwritten by hnorm's).
+        eprintln!(
+            "[zh2d-ptr] enorm={:p} hnorm={:p} embed_row={:p} h_prev={:p}",
+            enorm.as_f32(), hnorm.as_f32(), embed_row.as_f32(), h_prev.as_f32()
+        );
+    }
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
         // full hnorm checksum (8 segments of 512) — hprev's 4096-float
         // bit-level: front-2 matched orig but S1 d2 diverged 8606 vs 315
         // with x2 8-seg checksums equal => 1-ulp somewhere upstream.
