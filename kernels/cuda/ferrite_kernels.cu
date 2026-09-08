@@ -1239,6 +1239,10 @@ __global__ void router_gemm_route_fused_kernel(
     const __nv_bfloat16* wr = w + (size_t)e * hidden;
     float acc = 0.f;
     // uint4 vectorized (8 bf16 per load — hidden % 8 == 0 for GLM-5.3)
+    // 4 accumulators: the single `acc` is a 512-iteration serial FMA chain per
+    // thread (hidden/8 iterations at blockDim=256); fp32 cannot be
+    // reassociated by the compiler, so split it explicitly.
+    float q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
     for (int k = threadIdx.x * 8; k + 7 < hidden; k += blockDim.x * 8) {
         float4 xa = *reinterpret_cast<const float4*>(x + k);
         float4 xb = *reinterpret_cast<const float4*>(x + k + 4);
@@ -1246,9 +1250,12 @@ __global__ void router_gemm_route_fused_kernel(
         const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
         float2 f0 = __bfloat1622float2(w2[0]), f1 = __bfloat1622float2(w2[1]);
         float2 f2 = __bfloat1622float2(w2[2]), f3 = __bfloat1622float2(w2[3]);
-        acc += xa.x * f0.x + xa.y * f0.y + xa.z * f1.x + xa.w * f1.y
-             + xb.x * f2.x + xb.y * f2.y + xb.z * f3.x + xb.w * f3.y;
+        q0 += xa.x * f0.x + xa.y * f0.y;
+        q1 += xa.z * f1.x + xa.w * f1.y;
+        q2 += xb.x * f2.x + xb.y * f2.y;
+        q3 += xb.z * f3.x + xb.w * f3.y;
     }
+    acc = (q0 + q1) + (q2 + q3);
     for (int k = threadIdx.x + ((hidden >> 3) << 3); k < hidden; k += blockDim.x) {
         acc += x[k] * __bfloat162float(wr[k]);
     }
