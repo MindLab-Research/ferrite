@@ -4986,7 +4986,19 @@ __global__ void p2p_ar_fused_v3_kernel(
     // advanced by phase A's last block — rereading it would be a race).
     unsigned e2 = e + 1u;
     if (tr >= 0) { // one thread per peer polls its own flag (parallel)
-        while ((int)((*(volatile unsigned*)&ready_local[tr]) - e2) < 0) __nanosleep(100);
+        long spins = 0;
+        while ((int)((*(volatile unsigned*)&ready_local[tr]) - e2) < 0) {
+            __nanosleep(100);
+            if (++spins > 500000) { // ~50ms: diagnose + break instead of hanging
+                if (tr == 0) {
+                    printf("[p2p-hang] rank=%d peer=%d e2=%u flag=%u myepoch=%u\n",
+                           my_rank, tr, e2,
+                           (unsigned)*(volatile unsigned*)&ready_local[tr],
+                           (unsigned)*epoch);
+                }
+                break;
+            }
+        }
     }
     __syncthreads();
     if (i < n) {
