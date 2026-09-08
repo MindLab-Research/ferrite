@@ -269,11 +269,12 @@ Other profiling rules:
 - MTP 出师表 200-step: `real 476 tokens` window, text must be flawless 《出师表》 through 将军向宠 section (乱码 = accept/commit bug, ALWAYS check by eye).
 - 500-step: 58.9 tok/s (DSA decay visible), non-MTP 500-step 44.7.
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
-- **B=16 non-MTP (2026-09-08 late, the current best)**: `[megab] replay 16 seqs: 16.84-16.91 ms`
-  = **946-950 tok/s** (300-token window, text = direct 《出师表》 recitation ✓); 1000-token window
-  19.5 ms = 820 tok/s (attention O(t) growth). Progression this session: 546 → 950 tok/s.
+- **B=16 non-MTP (2026-09-08 late, the current best)**: `[megab] replay 16 seqs: 16.58-16.78 ms`
+  = **953-965 tok/s** (300-token window, text = direct 《出师表》 recitation ✓); 1000-token window
+  ~19.7 ms = ~808 tok/s (attention O(t) growth). Progression this session: 546 → 965 tok/s.
   Kept changes: gemv_fp8 T=2 tokens/block, gated_rmsnorm 1 token/block x256, moe_act double-buffered
-  cp.async staging, hc_pre_mix K-loop `#pragma unroll 4`, moe_route warp-shuffle top-k.
+  cp.async.cg staging, hc_pre_mix K-loop `#pragma unroll 4`, moe_route warp-shuffle top-k.
+  Run-to-run/thermal drift is ~±1%; always A/B in the same window.
   See `docs/agent/perf-roadmap.md` for the full kept/reverted list and the next candidates.
 
 ## 2026-09-08 续：half2 FMA 迁移的收益与陷阱（gemv 有效 / moe_down 回退）
