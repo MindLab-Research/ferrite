@@ -649,20 +649,25 @@ static int ferrite_pdl_enabled(void) {
 // NOTE: the KERNEL must start with cudaGridDependencySynchronize() before
 // touching its predecessors' outputs — every pdl_or_plain'd kernel below
 // carries the __CUDA_ARCH__ >= 900 guard block at entry.
+// NOTE: the kernel<<<>>> launch syntax does NOT accept a template parameter
+// (the 6-error "return value type does not match" — the launch triple-bracket
+// is only valid on a literal kernel symbol). Both paths therefore go through
+// cudaLaunchKernelEx (the C++ variadic template): WITHOUT the PDL attr it is
+// a plain launch (identical node in the graph capture), WITH the attr it is
+// the PDL node. graph capture records either faithfully (pdl_exp mode 3).
 template <typename K, typename... Args>
 static inline cudaError_t pdl_or_plain(K kern, dim3 grid, dim3 block,
                                        size_t smem, cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid; cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem; cfg.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
     if (ferrite_pdl_enabled()) {
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = grid; cfg.blockDim = block;
-        cfg.dynamicSmemBytes = smem; cfg.stream = stream;
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = attrs; cfg.numAttrs = 1;
-        return cudaLaunchKernelEx(&cfg, kern, args...);
     }
-    return kern<<<grid, block, smem, stream>>>(args...);
+    return cudaLaunchKernelEx(&cfg, kern, args...);
 }
 
 extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
