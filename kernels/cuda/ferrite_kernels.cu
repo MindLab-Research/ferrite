@@ -4271,11 +4271,11 @@ __global__ void sparse_attn_v2_batched_kernel(
     __syncthreads();
     // 8 THREADS PER SLOT (same fix as the indexer): one serial 256-dim dot per
     // thread left ~44% of the block idle and made the dot latency-bound.
-    const int TG = 2;   // 32 float4 cols/thread/slot
+    const int TG = 1;   // 64 float4 cols/thread/slot (one thread per slot)
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
     const int ngroups = blockDim.x / TG;
-    const unsigned gmask = 0x3u << ((threadIdx.x & 31) & ~1u);   // 2-lane groups (TG=2) — must match TG
+    const unsigned gmask = 0x1u << (threadIdx.x & 31);   // 1-lane groups (TG=1)
     const int glane0 = (threadIdx.x & 31) & ~7;
     for (int s = gid; s < live_k; s += ngroups) {
         int j = idxs[s];
