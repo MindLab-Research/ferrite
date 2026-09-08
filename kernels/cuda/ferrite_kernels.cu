@@ -5846,7 +5846,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             }
             k += 32 * 16;
         }
-        #pragma unroll 2
+        #pragma unroll 4
         for (; k + 15 < k1; k += 32 * 16) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
