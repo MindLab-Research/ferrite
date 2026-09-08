@@ -3243,76 +3243,55 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             klen = inter_shared;
         }
         if (klen > 0) {
-            // REGISTER-CACHE the act row (8 floats/lane = 2 float4)
-            float4 ar[2];
+            // 16-BYTE LANES (uint4): one load covers 512B = TWO h-rows (rows
+            // are contiguous, klen=256). The kernel was request-rate bound at
+            // 1.16TB/s (~15% of peak) with 8-byte lanes; halving the request
+            // count doubles the bytes per in-flight request.
+            float4 ar[4];
             {
                 const float4* a4 = reinterpret_cast<const float4*>(aj);
-                const int f4 = klen >> 2;
-                const int idx = lane * 2;
-                ar[0] = (idx < f4) ? a4[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
-                ar[1] = (idx + 1 < f4) ? a4[idx + 1] : make_float4(0.f, 0.f, 0.f, 0.f);
-            }
-            // PREFETCH all 8 rows' weight bytes into registers BEFORE any
-            // math. Measured 0.11 sectors/cycle/SM (a saturated SM does ~1):
-            // only ONE load was in flight per warp — the compiler serialized
-            // the rows behind their dependency chains.
-            const int i0 = lane * 8;
-            uint2 dv8[8];
-            #pragma unroll
-            for (int hh = 0; hh < 8; hh++) {
-                dv8[hh] = (i0 + 7 < klen)
-                    ? *reinterpret_cast<const uint2*>(dbase + (size_t)(h0 + hh) * klen + i0)
-                    : make_uint2(0u, 0u);
-            }
-            #pragma unroll
-            for (int hh = 0; hh < 8; hh++) {
-                int h = h0 + hh;
-                const float* dsr = dsr_base + (size_t)(h >> 7) * dscols;
-                float y = 0.f;
-                int i = i0;
-                if (i + 7 < klen) {
-                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv8[hh]);
-                    const float xv[8] = {ar[0].x, ar[0].y, ar[0].z, ar[0].w,
-                                         ar[1].x, ar[1].y, ar[1].z, ar[1].w};
-                    const float ds_c = dsr[i >> 7];
-                    #pragma unroll
-                    for (int p = 0; p < 4; p++) {
-                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + p * 2);
-                        const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                        y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
-                    }
-                    i += 32 * 8;
-                }
-                for (; i + 7 < klen; i += 32 * 8) {
-                    const uint2 dv = *reinterpret_cast<const uint2*>(dbase + (size_t)h * klen + i);
-                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
-                    const float xv[8] = {ar[0].x, ar[0].y, ar[0].z, ar[0].w,
-                                         ar[1].x, ar[1].y, ar[1].z, ar[1].w};
-                    const float ds_c = dsr[i >> 7];
-                    #pragma unroll
-                    for (int p = 0; p < 4; p++) {
-                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + p * 2);
-                        const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                        y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
-                    }
-                }
-                for (; i < klen; i++) {
-                    y += (__half2float(__nv_cvt_fp8_to_halfraw(dbase[(size_t)h * klen + i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
-                }
-                py[hh] = y;
-            }
-            // shuffle-reduce the 8 rows' per-lane partials (batched: all row
-            // loads are already in flight, so this no longer stalls them)
-            #pragma unroll
-            for (int hh = 0; hh < 8; hh++) {
-                float y = py[hh];
+                const int base = (lane & 15) * 4; // act[16] per lane, same for both rows
                 #pragma unroll
-                for (int off = 16; off > 0; off >>= 1) {
-                    y += __shfl_down_sync(0xffffffff, y, off);
-                }
-                py[hh] = y; // lane 0 holds the row's dot; p applied at store
+                for (int r = 0; r < 4; r++) ar[r] = a4[base + r];
             }
-        }
+            float py[8];
+            if (klen == 256) {
+                const int i0 = lane * 16;
+                uint4 dv4[4];
+                #pragma unroll
+                for (int c = 0; c < 4; c++)
+                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(h0 + 2 * c) * klen + i0);
+                #pragma unroll
+                for (int c = 0; c < 4; c++) {
+                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
+                    const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + (i0 >> 7)];
+                    const float* arf = reinterpret_cast<const float*>(ar);
+                    float y = 0.f;
+                    #pragma unroll
+                    for (int q = 0; q < 8; q++) {
+                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + q * 2);
+                        const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                        y += (df.x * ds_c) * arf[q * 2] + (df.y * ds_c) * arf[q * 2 + 1];
+                    }
+                    // lanes 0..15 -> row h0+2c, lanes 16..31 -> row h0+2c+1
+                    #pragma unroll
+                    for (int off = 8; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
+                    const float y1 = __shfl_sync(0xffffffff, y, 16);
+                    if (lane == 0) { py[2 * c] = y; py[2 * c + 1] = y1; }
+                }
+            } else {
+                #pragma unroll
+                for (int hh = 0; hh < 8; hh++) {
+                    int h = h0 + hh;
+                    float y = 0.f;
+                    for (int k = lane; k < klen; k += 32)
+                        y += (__half2float(__nv_cvt_fp8_to_halfraw(dbase[(size_t)h * klen + k], __NV_E4M3))
+                              * dsr_base[(size_t)(h >> 7) * dscols + (k >> 7)]) * aj[k];
+                    #pragma unroll
+                    for (int off = 16; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
+                    py[hh] = y;
+                }
+            }
         if (lane == 0) {
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
