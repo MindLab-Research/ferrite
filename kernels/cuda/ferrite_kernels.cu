@@ -3254,7 +3254,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 #pragma unroll
                 for (int r = 0; r < 4; r++) ar[r] = a4[base + r];
             }
-            float py[8];
             if (klen == 256) {
                 const int i0 = lane * 16;
                 const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
