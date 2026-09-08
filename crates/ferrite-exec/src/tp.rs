@@ -727,7 +727,11 @@ impl<B: KernelBackend> TpCluster<B> {
                 // phase 1 alloc per rank, phase 2 the [world] UVA pointer
                 // tables. max_n covers the batched (max_seqs×hidden) + MTP
                 // verify payloads.
-                const P2P_AR_MAX_N: usize = 16 * 4096;
+                // Must cover max_seqs × hidden: the batched decode AR is
+                // size × 5120 (16 × 5120 = 81920). The old 16*4096 = 65536
+                // silently disabled P2P for size=16 → some ranks fell back
+                // to NCCL while others used P2P → deadlock (measured).
+                const P2P_AR_MAX_N: usize = 16 * 8192;
                 let mut addrs = Vec::with_capacity(world);
                 for shard in &shards {
                     match shard
