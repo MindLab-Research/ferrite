@@ -617,6 +617,7 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
         float decay = expf(gh[i]);
         if (decay != 1.0f) {
             float* Si = S + (size_t)i * spitch;
+            #pragma unroll 4
             for (int j = 0; j < dv; j++) Si[j] *= decay;
         }
     }
@@ -624,6 +625,7 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     // 2. kS = S^T k
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
         float acc = 0.f;
+        #pragma unroll 4
         for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
         ks[j] = acc;
     }
@@ -826,6 +828,7 @@ __global__ void gdn_chunk_batched_kernel(
         float decay = expf(gh[i]);
         if (decay != 1.0f) {
             float* Si = S + (size_t)i * spitch;
+            #pragma unroll 4
             for (int j = 0; j < dv; j++) Si[j] *= decay;
         }
     }
@@ -833,6 +836,7 @@ __global__ void gdn_chunk_batched_kernel(
     // 2. kS = S^T k
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
         float acc = 0.f;
+        #pragma unroll 4
         for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
         ks[j] = acc;
     }
