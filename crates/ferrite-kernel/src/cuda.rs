@@ -58,6 +58,9 @@ extern "C" {
     fn ferrite_gemv_bf16_nt(x: *const f32, w: *const std::ffi::c_void,
                              bias: *const f32, out: *mut f32,
                              in_f: i32, out_f: i32, nrows: i32, s: CuStream) -> i32;
+    fn ferrite_gemm_bf16_mma(a: *const f32, w: *const std::ffi::c_void,
+                             bias: *const f32, out: *mut f32,
+                             nrows: i32, in_f: i32, out_f: i32, s: CuStream) -> i32;
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
@@ -1822,6 +1825,18 @@ impl CudaBackend {
             // v4's target: the n=1 HBM floor (~16-18ms) at n=4 → ~2x.
             // Unsupported shapes (in_f%8, n not in the template set) return
             // NotSupported → the v2 batched below (per-row, L2 luck).
+            if n == 16 {
+                // bf16 MMA (m16n8k16): the tensor core hides the 16-token
+                // arithmetic that makes the FMA nt kernel compute-bound at
+                // n=16 (measured 2.5x decay vs n=1). Weights stream once.
+                let r = unsafe {
+                    ferrite_gemm_bf16_mma(x_dev.as_const_f32(), dw.ptr as *const _,
+                                          dbias, do_.as_f32(), n, in_f, out_f, self.stream)
+                };
+                if r == 0 {
+                    return Ok(do_);
+                }
+            }
             if n > 1 {
                 let r = unsafe {
                     ferrite_gemv_bf16_nt(x_dev.as_const_f32(), dw.ptr as *const _,

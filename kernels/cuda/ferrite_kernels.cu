@@ -2498,6 +2498,71 @@ __global__ void gemv_bf16_nt_kernel(const float* __restrict__ x,
     }
 }
 
+// ============================================================
+// BF16 MMA batched decode GEMM: C[16, N] = A[16, K] * B[N, K]^T
+// (m16n8k16 tensor core). The batched decode's rows ARE the batch —
+// exactly the MMA m16 tile — so the weights stream ONCE and the tensor
+// core hides the 16-token arithmetic. The FMA gemv_bf16_nt is
+// compute-bound at n=16 (503 MFLOP / ~60 TFLOPS fp32 = 8.4us vs the
+// 3.9us HBM floor) — measured 2.5x decay vs n=1; SGLang/cutlass avoid
+// it with bf16 MMA and get BS16 = BS1 per-seq throughput.
+// Grid: (ceil(N/32), 1); block: 128 threads (4 warps, each a 16x8 tile).
+// ============================================================
+__global__ void gemm_bf16_mma_kernel(const float* __restrict__ a,        // [16, K] fp32
+                                     const __nv_bfloat16* __restrict__ b, // [N, K] bf16
+                                     const float* __restrict__ bias,      // [N] or null
+                                     float* __restrict__ c,               // [16, N] fp32
+                                     int K, int N) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int n0 = blockIdx.x * 32 + warp * 8; // this warp's 8-col tile
+    const int group = lane >> 2, tig = lane & 3;
+    __shared__ __nv_bfloat16 sa[16][16];
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        #pragma unroll
+        for (int i = threadIdx.x; i < 256; i += 128) {
+            int r = i >> 4, cc = i & 15;
+            sa[r][cc] = __float2bfloat16(a[(size_t)r * K + k0 + cc]);
+        }
+        __syncthreads();
+        unsigned a0 = *(const unsigned*)&sa[group][tig * 2];
+        unsigned a1 = *(const unsigned*)&sa[group + 8][tig * 2];
+        unsigned a2 = *(const unsigned*)&sa[group][tig * 2 + 8];
+        unsigned a3 = *(const unsigned*)&sa[group + 8][tig * 2 + 8];
+        // B (weights) col-major kxn: lane's b0 = W[n0+group][k0+2tig .. +1]
+        const __nv_bfloat16* br = b + (size_t)(n0 + group) * K + k0 + tig * 2;
+        unsigned b0 = *(const unsigned*)br;
+        unsigned b1 = *(const unsigned*)(br + 8);
+        asm volatile(
+            "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+            : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        __syncthreads();
+    }
+    const int n = n0 + tig * 2;
+    if (n + 1 < N) {
+        float bi0 = bias ? bias[n] : 0.f;
+        float bi1 = bias ? bias[n + 1] : 0.f;
+        c[(size_t)group * N + n] = acc[0] + bi0;
+        c[(size_t)group * N + n + 1] = acc[1] + bi1;
+        c[(size_t)(group + 8) * N + n] = acc[2] + bi0;
+        c[(size_t)(group + 8) * N + n + 1] = acc[3] + bi1;
+    }
+}
+
+extern "C" cudaError_t ferrite_gemm_bf16_mma(const float* a, const void* w,
+                                             const float* bias, float* out,
+                                             int nrows, int in_f, int out_f,
+                                             cudaStream_t s) {
+    if (nrows != 16 || out_f <= 0 || in_f <= 0) return cudaErrorNotSupported;
+    if (in_f & 15) return cudaErrorNotSupported; // k16 MMA step
+    dim3 grid((out_f + 31) / 32);
+    gemm_bf16_mma_kernel<<<grid, 128, 0, s>>>(a, (const __nv_bfloat16*)w, bias, out, in_f, out_f);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
                                            const float* bias, float* out,
                                            int in_f, int out_f, int nrows,
