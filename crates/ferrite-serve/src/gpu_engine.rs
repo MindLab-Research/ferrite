@@ -267,19 +267,30 @@ impl ServeEngine for GpuEngine {
                     .iter()
                     .filter_map(|seq| self.arena.get(*seq).map(|g| g.cluster_seq))
                     .collect();
-                let batch_name = format!(
-                    "megab_{}",
-                    live_seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("_")
-                );
-                if self.batch_graph.as_deref() != Some(batch_name.as_str()) {
-                    // Composition changed (admission/retirement freed the old
-                    // graph) — destroy the stale graph, capture fresh this tick.
+                if live_seqs.len() == 1 {
+                    // SINGLE seq: the per-seq mega (GEMV) path. The batched
+                    // B-row GEMM graph is 1.9x SLOWER at B=1 (measured
+                    // [megab] replay 17.95ms vs [mega] 9.55ms on the same
+                    // model/prompt — the batched graph only pays off at B>1).
                     if let Some(old) = self.batch_graph.take() {
                         self.cluster.destroy_batch_graph(&old);
                     }
-                    self.batch_graph = Some(batch_name);
+                    self.cluster.decode_step(live_seqs[0])?;
+                } else {
+                    let batch_name = format!(
+                        "megab_{}",
+                        live_seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("_")
+                    );
+                    if self.batch_graph.as_deref() != Some(batch_name.as_str()) {
+                        // Composition changed (admission/retirement freed the old
+                        // graph) — destroy the stale graph, capture fresh this tick.
+                        if let Some(old) = self.batch_graph.take() {
+                            self.cluster.destroy_batch_graph(&old);
+                        }
+                        self.batch_graph = Some(batch_name);
+                    }
+                    self.cluster.decode_step_batched(&live_seqs)?;
                 }
-                self.cluster.decode_step_batched(&live_seqs)?;
                 // per-seq retirement checks (the incremental reads — same
                 // logic as the per-seq loop, minus the decode_step call)
                 for i in 0..self.live.len() {
