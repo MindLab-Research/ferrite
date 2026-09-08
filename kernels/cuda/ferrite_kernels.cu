@@ -2362,7 +2362,7 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (WPR == 1) {
-        if (lane == 0 && rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + acc;
+        if (lane == 0 && rowg < nrows * out_f) y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + acc;
     } else {
         __shared__ float part[16];
         if (lane == 0) part[warp] = acc;
@@ -2371,7 +2371,7 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
             float sum = 0.f;
             #pragma unroll
             for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
-            if (rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + sum;
+            if (rowg < nrows * out_f) y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + sum;
         }
     }
 }
@@ -3193,20 +3193,20 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // the old warp-serial acc += p*y chain, bit-identical partials from the
     // same lane dot + shuffle tree).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h0 = blockIdx.x * 16;
+    int h0 = blockIdx.x * 8;
     int tok = blockIdx.y;
     if (h0 >= hidden) return;
     int stride = topk * inter + inter_shared;
     const float* act_t = act + (size_t)tok * stride;
     const float* ids_t = ids_f + (size_t)tok * topk;
     const float* probs_t = probs + (size_t)tok * topk;
-    __shared__ float part[16][16]; // [16 h rows][topk+1 slots] per-warp partials
+    __shared__ float part[8][16]; // [8 h rows][topk+1 slots] per-warp partials
     int j = warp;
-    // ---- slot j partials for 16 h rows (routed 0..topk-1, shared = topk) ----
+    // ---- slot j partials for 8 h rows (routed 0..topk-1, shared = topk) ----
     if (j <= topk) {
-        float py[16];
+        float py[8];
         #pragma unroll
-        for (int hh = 0; hh < 16; hh++) py[hh] = 0.f;
+        for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
         const float* aj;
         const unsigned char* dbase;
         const float* dsr_base;
@@ -3247,7 +3247,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             // keep several independent row loads in flight — with the break the
             // pragma was ignored and only 256B was in flight per warp).
             #pragma unroll
-            for (int hh = 0; hh < 16; hh++) {
+            for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
                 float y = 0.f;
                 if (h < hidden) {
@@ -3281,15 +3281,16 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         }
         if (lane == 0) {
             #pragma unroll
-            for (int hh = 0; hh < 16; hh++) {
+            for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
                 if (h < hidden) part[hh][j] = p * py[hh];
             }
         }
     }
     __syncthreads();
-    // ---- fold: warps 0..7 reduce the 16 h rows (2 each), j-ascending ----
-    for (int hh = warp; hh < 16; hh += 8) {
+    // ---- fold: warps 0..7 each reduce one h row, j-ascending (FP-safe) ----
+    if (warp < 8) {
+        int hh = warp;
         int h = h0 + hh;
         if (h < hidden && lane == 0) {
             float acc = 0.f;
@@ -5622,8 +5623,12 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     const int rpb = warps / WPR;               // rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int rowg = blockIdx.x * rpb + warp / WPR;   // global row
-    const int token = rowg / out_f;
-    const int row = rowg - token * out_f;
+    // ROW-major flattening: consecutive blocks handle the SAME weight row for
+    // different tokens, so the 16 tokens share one weight read (L2/L1 hit)
+    // instead of streaming the whole matrix once per token (256MB/call at 16
+    // seqs — the reason this GEMV ran at ~3% of peak).
+    const int row = rowg / nrows;
+    const int token = rowg - row * nrows;
     const int kw = warp % WPR;                 // K-slice id
     float acc = 0.f;
     if (rowg < nrows * out_f) {
@@ -5667,7 +5672,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (WPR == 1) {
-        if (lane == 0 && rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + acc;
+        if (lane == 0 && rowg < nrows * out_f) y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + acc;
     } else {
         __shared__ float part[16];
         if (lane == 0) part[warp] = acc;
