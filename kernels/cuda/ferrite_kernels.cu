@@ -5788,7 +5788,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     // 8 rows per warp-group with the x slice CACHED in registers: the same
     // token's x row is re-read by every (block, row) otherwise (measured
     // 196MB of x vs 49MB of weights per call -> L2-bound).
-    const int R = ((out_f & 7) == 0) ? 8 : 1;
+    const int R = ((out_f & 15) == 0) ? 16 : (((out_f & 7) == 0) ? 8 : 1);
     const int rowg0 = (blockIdx.x * rpb + warp / WPR) * R;
     const int kw = warp % WPR;                 // K-slice id
     const int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
@@ -5890,7 +5890,9 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     long total = (long)nrows * out_f;
     constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
-    dim3 grid((unsigned)((total + rpb * 8 - 1) / (rpb * 8)));
+    // grid MUST match the kernel's R (16 when out_f % 16 == 0)
+    const int Rl = ((out_f & 15) == 0) ? 16 : (((out_f & 7) == 0) ? 8 : 1);
+    dim3 grid((unsigned)((total + rpb * Rl - 1) / (rpb * Rl)));
     dim3 block(256);
     gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
                                                    in_f, out_f, nrows, srows, scols);
