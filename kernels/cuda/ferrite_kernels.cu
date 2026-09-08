@@ -4462,6 +4462,9 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     float sq = 0.f;
+    // unroll 4: 5 independent loads per iteration (x + 4 weight rows) — without
+    // the unroll the compiler serialized them and the loop stalled on the L2.
+    #pragma unroll 4
     for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
         const float xv = x[i];                 // ONE x read serves 4 rows
         sq += xv * xv;                         // Σx² rides free
