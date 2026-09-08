@@ -1992,9 +1992,17 @@ __global__ void hc_pre_kernel(const float* __restrict__ res,
 
     // 5. li = Σ_i pre_i · x[i*h + j] (parallel over h)
     for (int j = threadIdx.x; j < h; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < n; i++) acc += red[16 + i] * x[(size_t)i * h + j];
-        li[(size_t)t * h + j] = acc;
+        // 4 accumulators: a single fp32 accumulator is a serial FMA chain.
+        float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+        int i = 0;
+        for (; i + 3 < n; i += 4) {
+            p0 += red[16 + i]     * x[(size_t)(i)     * h + j];
+            p1 += red[16 + i + 1] * x[(size_t)(i + 1) * h + j];
+            p2 += red[16 + i + 2] * x[(size_t)(i + 2) * h + j];
+            p3 += red[16 + i + 3] * x[(size_t)(i + 3) * h + j];
+        }
+        for (; i < n; i++) p0 += red[16 + i] * x[(size_t)i * h + j];
+        li[(size_t)t * h + j] = (p0 + p1) + (p2 + p3);
     }
     // write comb out
     if (threadIdx.x == 0) {
@@ -4682,8 +4690,18 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         // UNROLLED: n is a runtime value, so without this the 16 rows were
         // read by 16 SERIAL global loads (~600ns each = ~9.6us of the 12us
         // per-block latency). Unrolling overlaps them.
-        #pragma unroll 4
-        for (int i = 0; i < n; i++) acc += ps[i] * x[(size_t)i * h + col];
+        // 4 accumulators (see P1): unroll only overlaps the loads, the fp
+        // accumulator chain stays serial unless split explicitly.
+        float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+        int i = 0;
+        for (; i + 3 < n; i += 4) {
+            p0 += ps[i]     * x[(size_t)(i)     * h + col];
+            p1 += ps[i + 1] * x[(size_t)(i + 1) * h + col];
+            p2 += ps[i + 2] * x[(size_t)(i + 2) * h + col];
+            p3 += ps[i + 3] * x[(size_t)(i + 3) * h + col];
+        }
+        for (; i < n; i++) p0 += ps[i] * x[(size_t)i * h + col];
+        acc = (p0 + p1) + (p2 + p3);
         li[(size_t)t * h + col] = acc;   // li_raw staged in place (P5 overwrites)
     }
     // P4: Σli_raw² block partial (warp tree + red8 serial sum)
