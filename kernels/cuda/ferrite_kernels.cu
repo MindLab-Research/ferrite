@@ -2799,7 +2799,7 @@ __global__ void moe_fused_down_sum_kernel(
     const float* act_t = act + (size_t)tok * stride;
     const float* ids_t = ids_f + (size_t)tok * topk;
     const float* probs_t = probs + (size_t)tok * topk;
-    __shared__ float part[32]; // per-warp partials (topk ≤ 8, 32 max warps)
+    __shared__ float part[64]; // per-warp partials (topk ≤ 8, 32 max warps)
     // Each warp j computes expert j's p*y dot product (parallel)
     {
         int j = warp; // warp ID = expert slot
@@ -5792,11 +5792,11 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     // ONCE and reused for both tokens' dots — the per-token instruction count
     // drops ~32% (this GEMV is issue-bound at n=16, not bandwidth-bound).
     // Each token keeps its own accumulation order -> bit-identical output.
-    const int t0 = blockIdx.y * 2;
-    const bool has1 = (t0 + 1) < nrows;
-    float4 xc[2][4];
+    const int t0 = blockIdx.y * 4;
+    const bool has1 = (t0 + 1) < nrows, has2 = (t0 + 2) < nrows, has3 = (t0 + 3) < nrows;
+    float4 xc[4][4];
     #pragma unroll
-    for (int tt = 0; tt < 2; tt++) {
+    for (int tt = 0; tt < 4; tt++) {
         const int k = k0 + lane * 16;
         if (t0 + tt < nrows && k + 15 < k1) {
             const float* xr0 = x + (size_t)(t0 + tt) * in_f + k;
@@ -5814,31 +5814,37 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     for (int r = 0; r < R; r++) {
     const int row = rowg0 + r;
     if (row >= out_f) continue;
-    float acc0 = 0.f, acc1 = 0.f;
+    float acc0 = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
     {
         const unsigned char* wr = w + (size_t)row * in_f;
         const float* xr0 = x + (size_t)t0 * in_f;
         const float* xr1 = x + (size_t)(t0 + 1) * in_f;
+        const float* xr2 = x + (size_t)(t0 + 2) * in_f;
+        const float* xr3 = x + (size_t)(t0 + 3) * in_f;
         const float* srow = scale + (size_t)(row >> 7) * scols;
         int k = k0 + lane * 16;
         if (k + 15 < k1) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
             const float sc = srow[k >> 7];
-            const float xv0[16] = {xc[0][0].x, xc[0][0].y, xc[0][0].z, xc[0][0].w,
-                                   xc[0][1].x, xc[0][1].y, xc[0][1].z, xc[0][1].w,
-                                   xc[0][2].x, xc[0][2].y, xc[0][2].z, xc[0][2].w,
-                                   xc[0][3].x, xc[0][3].y, xc[0][3].z, xc[0][3].w};
-            const float xv1[16] = {xc[1][0].x, xc[1][0].y, xc[1][0].z, xc[1][0].w,
-                                   xc[1][1].x, xc[1][1].y, xc[1][1].z, xc[1][1].w,
-                                   xc[1][2].x, xc[1][2].y, xc[1][2].z, xc[1][2].w,
-                                   xc[1][3].x, xc[1][3].y, xc[1][3].z, xc[1][3].w};
+            float xv[4][16];
+            #pragma unroll
+            for (int tt = 0; tt < 4; tt++)
+                #pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    xv[tt][q * 4 + 0] = (&xc[tt][q].x)[0];
+                    xv[tt][q * 4 + 1] = (&xc[tt][q].x)[1];
+                    xv[tt][q * 4 + 2] = (&xc[tt][q].x)[2];
+                    xv[tt][q * 4 + 3] = (&xc[tt][q].x)[3];
+                }
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
                 const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3)));
-                acc0 += (wf.x * sc) * xv0[p * 2] + (wf.y * sc) * xv0[p * 2 + 1];
-                acc1 += (wf.x * sc) * xv1[p * 2] + (wf.y * sc) * xv1[p * 2 + 1];
+                acc0 += (wf.x * sc) * xv[0][p * 2] + (wf.y * sc) * xv[0][p * 2 + 1];
+                acc1 += (wf.x * sc) * xv[1][p * 2] + (wf.y * sc) * xv[1][p * 2 + 1];
+                acc2 += (wf.x * sc) * xv[2][p * 2] + (wf.y * sc) * xv[2][p * 2 + 1];
+                acc3 += (wf.x * sc) * xv[3][p * 2] + (wf.y * sc) * xv[3][p * 2 + 1];
             }
             k += 32 * 16;
         }
@@ -5847,60 +5853,64 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
             const float sc = srow[k >> 7];
-            const float4 xa0 = *reinterpret_cast<const float4*>(xr0 + k);
-            const float4 xb0 = *reinterpret_cast<const float4*>(xr0 + k + 4);
-            const float4 xc0 = *reinterpret_cast<const float4*>(xr0 + k + 8);
-            const float4 xd0 = *reinterpret_cast<const float4*>(xr0 + k + 12);
-            const __half2 hx0[8] = {__floats2half2_rn(xa0.x, xa0.y), __floats2half2_rn(xa0.z, xa0.w),
-                                    __floats2half2_rn(xb0.x, xb0.y), __floats2half2_rn(xb0.z, xb0.w),
-                                    __floats2half2_rn(xc0.x, xc0.y), __floats2half2_rn(xc0.z, xc0.w),
-                                    __floats2half2_rn(xd0.x, xd0.y), __floats2half2_rn(xd0.z, xd0.w)};
-            const float4 xa1 = *reinterpret_cast<const float4*>(xr1 + k);
-            const float4 xb1 = *reinterpret_cast<const float4*>(xr1 + k + 4);
-            const float4 xc1 = *reinterpret_cast<const float4*>(xr1 + k + 8);
-            const float4 xd1 = *reinterpret_cast<const float4*>(xr1 + k + 12);
-            const __half2 hx1[8] = {__floats2half2_rn(xa1.x, xa1.y), __floats2half2_rn(xa1.z, xa1.w),
-                                    __floats2half2_rn(xb1.x, xb1.y), __floats2half2_rn(xb1.z, xb1.w),
-                                    __floats2half2_rn(xc1.x, xc1.y), __floats2half2_rn(xc1.z, xc1.w),
-                                    __floats2half2_rn(xd1.x, xd1.y), __floats2half2_rn(xd1.z, xd1.w)};
-            // half2 FMA path (see gemv header): 8 cvt + 8 __hfma2 per 16 values
-            // per token, but the 8 cvt are SHARED by both tokens.
-            __half2 a20 = __float2half2_rn(0.f), a21 = __float2half2_rn(0.f);
+            const float* xrp[4] = {xr0, xr1, xr2, xr3};
+            __half2 hx[4][8];
+            #pragma unroll
+            for (int tt = 0; tt < 4; tt++) {
+                const float4 xa = *reinterpret_cast<const float4*>(xrp[tt] + k);
+                const float4 xb = *reinterpret_cast<const float4*>(xrp[tt] + k + 4);
+                const float4 xc = *reinterpret_cast<const float4*>(xrp[tt] + k + 8);
+                const float4 xd = *reinterpret_cast<const float4*>(xrp[tt] + k + 12);
+                hx[tt][0] = __floats2half2_rn(xa.x, xa.y); hx[tt][1] = __floats2half2_rn(xa.z, xa.w);
+                hx[tt][2] = __floats2half2_rn(xb.x, xb.y); hx[tt][3] = __floats2half2_rn(xb.z, xb.w);
+                hx[tt][4] = __floats2half2_rn(xc.x, xc.y); hx[tt][5] = __floats2half2_rn(xc.z, xc.w);
+                hx[tt][6] = __floats2half2_rn(xd.x, xd.y); hx[tt][7] = __floats2half2_rn(xd.z, xd.w);
+            }
+            // 8 fp8->half2 cvt SHARED by all 4 tokens (see gemv header).
+            __half2 a2[4] = {__float2half2_rn(0.f), __float2half2_rn(0.f),
+                             __float2half2_rn(0.f), __float2half2_rn(0.f)};
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
                 const __half2_raw wraw = __nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3);
                 const __half2 w2 = *reinterpret_cast<const __half2*>(&wraw);
-                a20 = __hfma2(w2, hx0[p], a20);
-                a21 = __hfma2(w2, hx1[p], a21);
+                #pragma unroll
+                for (int tt = 0; tt < 4; tt++) a2[tt] = __hfma2(w2, hx[tt][p], a2[tt]);
             }
-            acc0 += (__half2float(a20.x) + __half2float(a20.y)) * sc;
-            acc1 += (__half2float(a21.x) + __half2float(a21.y)) * sc;
+            acc0 += (__half2float(a2[0].x) + __half2float(a2[0].y)) * sc;
+            acc1 += (__half2float(a2[1].x) + __half2float(a2[1].y)) * sc;
+            acc2 += (__half2float(a2[2].x) + __half2float(a2[2].y)) * sc;
+            acc3 += (__half2float(a2[3].x) + __half2float(a2[3].y)) * sc;
         }
         for (; k < k1; k++) {
             const float sc = srow[k >> 7];
             const float wf8 = __half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc;
             acc0 += wf8 * xr0[k];
             acc1 += wf8 * xr1[k];
+            acc2 += wf8 * xr2[k];
+            acc3 += wf8 * xr3[k];
         }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
         acc0 += __shfl_down_sync(0xffffffff, acc0, off);
         acc1 += __shfl_down_sync(0xffffffff, acc1, off);
+        acc2 += __shfl_down_sync(0xffffffff, acc2, off);
+        acc3 += __shfl_down_sync(0xffffffff, acc3, off);
     }
-    if (lane == 0) { part[warp] = acc0; part[16 + warp] = acc1; }
+    if (lane == 0) { part[warp] = acc0; part[16 + warp] = acc1; part[32 + warp] = acc2; part[48 + warp] = acc3; }
     __syncthreads();
     if (warp % WPR == 0 && lane == 0) {
-        float s0 = 0.f, s1 = 0.f;
+        float s[4] = {0.f, 0.f, 0.f, 0.f};
         #pragma unroll
-        for (int j = 0; j < WPR; j++) {
-            s0 += part[(warp / WPR) * WPR + j];
-            s1 += part[16 + (warp / WPR) * WPR + j];
-        }
+        for (int j = 0; j < WPR; j++)
+            #pragma unroll
+            for (int tt = 0; tt < 4; tt++) s[tt] += part[tt * 16 + (warp / WPR) * WPR + j];
         const float b = bias ? bias[row] : 0.f;
-        y[(size_t)t0 * out_f + row] = b + s0;
-        if (has1) y[(size_t)(t0 + 1) * out_f + row] = b + s1;
+        y[(size_t)t0 * out_f + row] = b + s[0];
+        if (has1) y[(size_t)(t0 + 1) * out_f + row] = b + s[1];
+        if (has2) y[(size_t)(t0 + 2) * out_f + row] = b + s[2];
+        if (has3) y[(size_t)(t0 + 3) * out_f + row] = b + s[3];
     }
     __syncthreads();
     }
@@ -5918,7 +5928,7 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     // grid.y = TOKEN PAIRS (the kernel handles 2 tokens per block).
     const int Rl = ((out_f & 7) == 0) ? 8 : 1;
     dim3 grid((unsigned)((out_f + rpb * Rl - 1) / (rpb * Rl)),
-              (unsigned)((nrows + 1) / 2), 1);
+              (unsigned)((nrows + 3) / 4), 1);
     dim3 block(256);
     gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
                                                    in_f, out_f, nrows, srows, scols);
