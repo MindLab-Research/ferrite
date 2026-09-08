@@ -1598,7 +1598,9 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
                                       const float* __restrict__ k,
                                       const float* __restrict__ v,
                                       const float* __restrict__ idx,
-                                      float* __restrict__ out,
+                                      float* __restrict__ pm,   // [n,h,splits] partial max
+                                      float* __restrict__ pl,   // [n,h,splits] partial sum
+                                      float* __restrict__ po,   // [n,h,splits,dv] partial O
                                       int n, const int* __restrict__ t_ptr, int h, int d, int dv, int topk) {
 #if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
@@ -1607,6 +1609,15 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     int row = blockIdx.x;
     int hd = blockIdx.y;
     if (row >= n || hd >= h) return;
+    // SPLIT-K (SGLang MLA decode's num_splits): grid.z slices the topk slot
+    // range so the block count is heads*splits instead of heads. At TP8 the
+    // old grid (n,h) was 8 blocks on a 148-SM part (36KB smem → 2 SM) —
+    // latency-bound 75µs. Partials are merged by sparse_attn_merge_kernel.
+    const int sp = blockIdx.z;
+    const int splits = gridDim.z;
+    const int slots = (topk + splits - 1) / splits;
+    const int s0 = sp * slots;
+    const int s1 = min(s0 + slots, topk);
     float scale = rsqrtf((float)d);
     // Layout: qs FIRST (float4 reads need the 16B-aligned smem base;
     // topk=8195 is NOT a multiple of 4 — an int[topk] prefix misaligned
@@ -1628,7 +1639,7 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     __syncthreads();
     // 1. scores: float4 dot per slot; bitmap dedup (first wins — duplicate
     // slots carry the same key, so which one survives is value-identical)
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+    for (int s = s0 + threadIdx.x; s < s1; s += blockDim.x) {
         int j = idx_s[s];
         if (j < 0 || j >= t) { sc[s] = -INFINITY; continue; }
         bool dup = false;
@@ -1652,7 +1663,7 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     __syncthreads();
     // 2. softmax (block-wide max → exp → sum via warp shuffles + smem)
     float m = -INFINITY;
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) m = fmaxf(m, sc[s]);
+    for (int s = s0 + threadIdx.x; s < s1; s += blockDim.x) m = fmaxf(m, sc[s]);
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
     __syncthreads();
@@ -1664,7 +1675,7 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     m = ms_;
     bool all_inf = (m == -INFINITY);
     float sum = 0.f;
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+    for (int s = s0 + threadIdx.x; s < s1; s += blockDim.x) {
         sc[s] = all_inf ? 0.f : __expf(sc[s] - m);
         sum += sc[s];
     }
@@ -1678,7 +1689,7 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     __syncthreads();
     float denom = sum_ + 1e-9f;
     __syncthreads();
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) sc[s] /= denom;
+    for (int s = s0 + threadIdx.x; s < s1; s += blockDim.x) sc[s] /= denom;
     __syncthreads();
     // 3. weighted v-gather — split over slots: blockDim = SG x dv lanes, lane
     // (sg, j2) accumulates slots s = sg, sg+SG, ... (w==0 padding skips are
@@ -1688,7 +1699,7 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
         int sg = threadIdx.x / dv, j2 = threadIdx.x - sg * dv;
         if (sg < SG) {
             float a = 0.f;
-            for (int s = sg; s < topk; s += SG) {
+            for (int s = s0 + sg; s < s1; s += SG) {
                 float w = sc[s];
                 if (w == 0.f) continue; // padding / deduped slot (exp→0)
                 int j = idx_s[s];
@@ -1701,17 +1712,52 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
         if (threadIdx.x < dv) {
             float a = 0.f;
             for (int g2 = 0; g2 < SG; g2++) a += red2[(size_t)g2 * dv + threadIdx.x];
-            out[((size_t)row * h + hd) * dv + threadIdx.x] = a;
+            po[(((size_t)row * h + hd) * splits + sp) * dv + threadIdx.x] = a;
         }
+        if (threadIdx.x == 0) {
+            const size_t base = ((size_t)row * h + hd) * splits + sp;
+            pm[base] = m;
+            pl[base] = sum_;
+        }
+    }
+}
+
+// split-K merge (flash-decoding): combine the `splits` partial (max, sum, O)
+// triples with a log-sum-exp rescale.
+__global__ void sparse_attn_merge_kernel(const float* __restrict__ pm,
+                                         const float* __restrict__ pl,
+                                         const float* __restrict__ po,
+                                         float* __restrict__ out,
+                                         int n, int h, int dv, int splits) {
+    int row = blockIdx.x;
+    int hd = blockIdx.y;
+    if (row >= n || hd >= h) return;
+    const size_t base = ((size_t)row * h + hd) * splits;
+    float m = -INFINITY;
+    for (int i = 0; i < splits; i++) m = fmaxf(m, pm[base + i]);
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
+        float l = 0.f, o = 0.f;
+        for (int i = 0; i < splits; i++) {
+            float w = (m == -INFINITY) ? 0.f : __expf(pm[base + i] - m);
+            l += w * pl[base + i];
+            o += w * po[(base + i) * dv + j];
+        }
+        out[((size_t)row * h + hd) * dv + j] = o / (l + 1e-9f);
     }
 }
 
 extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q, const float* k,
                                               const float* v, const float* idx,
-                                              float* out, int n, const int* t_ptr, int h, int d,
-                                              int dv, int topk, cudaStream_t s) {
+                                              float* out, float* scratch,
+                                              int n, const int* t_ptr, int h, int d,
+                                              int dv, int topk, int splits, cudaStream_t s) {
+    if (splits < 1) splits = 1;
+    // scratch layout: pm [n,h,splits] | pl [n,h,splits] | po [n,h,splits,dv]
+    float* pm = scratch;
+    float* pl = pm + (size_t)n * h * splits;
+    float* po = pl + (size_t)n * h * splits;
     dim3 block(512);
-    dim3 grid(n, h);
+    dim3 grid(n, h, splits);
     size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
                   + 16 * sizeof(float) + 4096 * sizeof(unsigned int)
                   + 512 * sizeof(float); // red2: SG(4) x dv(128) split partials
@@ -1720,8 +1766,19 @@ extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q, const float* k,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         if (e != cudaSuccess) return e;
     }
-    return pdl_or_plain(sparse_attn_v2_kernel, grid, block, smem, s,
-                        q, k, v, idx, out, n, t_ptr, h, d, dv, topk);
+    cudaError_t e = pdl_or_plain(sparse_attn_v2_kernel, grid, block, smem, s,
+                        q, k, v, idx, pm, pl, po, n, t_ptr, h, d, dv, topk);
+    if (e != cudaSuccess) return e;
+    if (splits > 1) {
+        dim3 mgrid(n, h);
+        dim3 mblock(128);
+        return sparse_attn_merge_kernel<<<mgrid, mblock, 0, s>>>(pm, pl, po, out, n, h, dv, splits);
+    }
+    // splits == 1: the partial IS the answer (merge would be identity) — but
+    // po's layout differs from out's, so run the merge anyway for uniformity.
+    dim3 mgrid(n, h);
+    dim3 mblock(128);
+    return sparse_attn_merge_kernel<<<mgrid, mblock, 0, s>>>(pm, pl, po, out, n, h, dv, splits);
 }
 
 // ============================================================
