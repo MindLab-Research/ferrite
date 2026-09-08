@@ -38,6 +38,11 @@
   收益 <3%，不值 200+ 行重写（含 MMA 的 B fragment 按 token 重排）。
 - gemv WPR=2（17.87）、gemv 内层 unroll 4（17.67）、hc_pre_mix 8 行（17.74）、
   act 双 tile 预取（19.6，pf[8] 压占用）、gemv T=4（err 700）、moe_down half2（速度中性但改行为）。
+- **gdn_step_v2 改成单次启动（grid(n,h,1)）：错误。** 看起来 16.75ms（+3.5%），但输出从《出师表》
+  变成一段 CHANGELOG —— 因为 `state` 只按 `hd` 索引（`state + hd*dk*dv`，**不含 t**），
+  原 launcher 的 per-token 循环是**有意的串行状态更新**（MTP 验证路径 n>1 必须按顺序推进同一份 state）。
+  批量化 → 16 个 token 竞争同一份 state → 少算+错值。**"变快"再次等于"少算"。**
+  若要批量，必须先让 state 按 (t,h) 索引并在 Rust 侧为每个 seq 分配独立 state。
 - 32-seq 的 5x 异常（90ms）：不在层内，`FERRITE_TIMING` 的 `at=` 在 16/32 seqs 下都是 22-24ms，
   证明该指标是 host 侧 launch+sync 墙钟（超估 10-20x），不能当 GPU 时间。
 
