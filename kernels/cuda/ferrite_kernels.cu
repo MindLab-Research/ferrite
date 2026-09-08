@@ -2926,40 +2926,65 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int dscols, int nt) {
-    // EXPERT-PARALLEL (the bf16 v11 design, fp8): grid (hidden, nt) — ONE
-    // hidden dim per block, 9 warps = the topk routed experts (j-parallel)
-    // + shared. The OLD grid (hidden/8, n) had each warp serially dotting
-    // its h row against ALL 8 experts' fp8 rows — 8 dependent 1.5KB row
-    // reads per warp = a latency chain (measured 1.3TB/s / 16% HBM, 40.6µs
-    // × 44 layers = 1.8ms of the verify step). Now the 8 expert reads fly
-    // in PARALLEL (one per warp) + warp 0 folds the shared expert; warp 0
-    // lane 0 sums the per-expert partials in j-ascending order — the SAME
-    // summation order as the old serial acc += p*y loop (FP-safe, no argmax
-    // drift), and each y is the same lane-vectorized dot + warp shuffle
-    // tree (bit-identical partials).
+    // v12: grid (hidden/8, nt) — warp j owns expert slot j and loops EIGHT h
+    // rows. The act row (tok, slot j — 6KB) is invariant across h: the first
+    // read pulls it into L1 and the 7 re-reads hit L1 (the v11 grid
+    // (hidden, n) re-read each act row from L2 once per h block = 662MB of
+    // L2 traffic at the ~15TB/s L2 peak — THAT was the 44.6µs bottleneck,
+    // not HBM (down weights are only ~21MB/rank). The down weight rows for
+    // 8 consecutive h are one contiguous 12KB run per expert (better HBM
+    // coalescing too). FP: per-h fold stays j-ascending (warp 0..7 each
+    // reduce one h's part[j] column serially — the SAME summation order as
+    // the old warp-serial acc += p*y chain, bit-identical partials from the
+    // same lane dot + shuffle tree).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h = blockIdx.x;
+    int h0 = blockIdx.x * 8;
     int tok = blockIdx.y;
-    if (h >= hidden) return;
+    if (h0 >= hidden) return;
     int stride = topk * inter + inter_shared;
     const float* act_t = act + (size_t)tok * stride;
     const float* ids_t = ids_f + (size_t)tok * topk;
     const float* probs_t = probs + (size_t)tok * topk;
-    __shared__ float part[16]; // per-warp partials (topk+1 <= 16)
-    float py = 0.f;
-    if (warp < topk) {
-        int j = warp; // warp ID = expert slot
-        int eid = (int)ids_t[j];
-        int local = eid - expert_start;
-        if (local >= 0 && local < e_local) {
-            float p = probs_t[j];
-            if (p != 0.f) {
-                const unsigned char* dwr = down_w8_ptrs[local] + (size_t)h * inter;
-                const float* dsr = down_scale_ptrs[local] + (size_t)(h >> 7) * dscols;
-                const float* aj = act_t + (size_t)j * inter;
+    __shared__ float part[8][16]; // [8 h rows][topk+1 slots] per-warp partials
+    int j = warp;
+    // ---- slot j partials for 8 h rows (routed 0..topk-1, shared = topk) ----
+    if (j <= topk) {
+        float py[8];
+        #pragma unroll
+        for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
+        const float* aj;
+        const unsigned char* dbase;
+        const float* dsr_base;
+        int klen;
+        float p = 1.f;
+        if (j < topk) {
+            int eid = (int)ids_t[j];
+            int local = eid - expert_start;
+            if (local >= 0 && local < e_local) {
+                p = probs_t[j];
+                if (p != 0.f) {
+                    dbase = down_w8_ptrs[local];
+                    dsr_base = down_scale_ptrs[local];
+                    aj = act_t + (size_t)j * inter;
+                    klen = inter;
+                    goto dot;
+                }
+            }
+        } else {
+            dbase = shared_down_w8;
+            dsr_base = shared_down_scale;
+            aj = act_t + (size_t)topk * inter;
+            klen = inter_shared;
+        dot:;
+            #pragma unroll 1
+            for (int hh = 0; hh < 8; hh++) {
+                int h = h0 + hh;
+                if (h >= hidden) break;
+                const unsigned char* dwr = dbase + (size_t)h * klen;
+                const float* dsr = dsr_base + (size_t)(h >> 7) * dscols;
                 float y = 0.f;
                 int i = lane * 16;
-                for (; i + 15 < inter; i += 32 * 16) {
+                for (; i + 15 < klen; i += 32 * 16) {
                     uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
                     const float4 aa = *reinterpret_cast<const float4*>(aj + i);
                     const float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
@@ -2976,58 +3001,34 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                         y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
                     }
                 }
-                for (; i < inter; i++) {
+                for (; i < klen; i++) {
                     y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
                 }
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) {
                     y += __shfl_down_sync(0xffffffff, y, off);
                 }
-                if (lane == 0) py = p * y;
+                py[hh] = y; // lane 0 holds the row's dot; p applied at store
             }
         }
-    } else if (warp == topk) {
-        // shared expert (slot topk, weight 1; K = inter_shared, TP-sharded)
-        const unsigned char* dwr = shared_down_w8 + (size_t)h * inter_shared;
-        const float* dsr = shared_down_scale + (size_t)(h >> 7) * dscols;
-        const float* as_ = act_t + (size_t)topk * inter;
-        float y = 0.f;
-        int i = lane * 16;
-        for (; i + 15 < inter_shared; i += 32 * 16) {
-            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
-            const float4 aa = *reinterpret_cast<const float4*>(as_ + i);
-            const float4 ab = *reinterpret_cast<const float4*>(as_ + i + 4);
-            const float4 ac = *reinterpret_cast<const float4*>(as_ + i + 8);
-            const float4 ad = *reinterpret_cast<const float4*>(as_ + i + 12);
-            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
-            const float ds_c = dsr[i >> 7];
-            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
-                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+        if (lane == 0) {
             #pragma unroll
-            for (int p = 0; p < 8; p++) {
-                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
-                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
+            for (int hh = 0; hh < 8; hh++) {
+                int h = h0 + hh;
+                if (h < hidden) part[hh][j] = p * py[hh];
             }
         }
-        for (; i < inter_shared; i++) {
-            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * as_[i];
-        }
-        #pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            y += __shfl_down_sync(0xffffffff, y, off);
-        }
-        if (lane == 0) py = y;
     }
-    if (lane == 0) part[warp] = py;
     __syncthreads();
-    // warp 0 lane 0: fold in j-ascending order (SAME as the old serial
-    // acc += p*y chain — FP-safe: per-slot y partials are bit-identical
-    // (same lane dot + shuffle tree), the fold order is unchanged).
-    if (warp == 0 && lane == 0) {
-        float acc = 0.f;
-        for (int j = 0; j <= topk; j++) acc += part[j];
-        out[(size_t)tok * hidden + h] = acc;
+    // ---- fold: warps 0..7 each reduce one h row, j-ascending (FP-safe) ----
+    if (warp < 8) {
+        int hh = warp;
+        int h = h0 + hh;
+        if (h < hidden && lane == 0) {
+            float acc = 0.f;
+            for (int j = 0; j <= topk; j++) acc += part[hh][j];
+            out[(size_t)tok * hidden + h] = acc;
+        }
     }
 }
 
@@ -3038,8 +3039,8 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     const float* act, float* out,
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
-    dim3 block(288); // 9 warps: topk routed (8) + shared — extra warps idle
-    dim3 grid(hidden, n, 1);
+    dim3 block(288); // 9 warps: topk routed (8) + shared
+    dim3 grid((hidden + 7) / 8, n, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
