@@ -80,3 +80,12 @@
 按 token 单块启动的 launcher（`grid(n)` 在 n=16 时只有 16 个 block，132 个 SM 空转）都是候选。
 已知同类：`rmsnorm_kernel`（grid(n)/block 256，16 block）、`argmax/softmax`（grid(n)）、
 `gdn_step_v2`（grid(1,h,1) 逐 token 启动，但**不可批量**，见上文 state 原因）。
+
+### 陷阱：rmsnorm 的 block 尺寸不可改（硬编码 8 warps）
+
+`rmsnorm_kernel` 的跨 warp 归约是 `__shared__ float red[8]; // 256 threads = 8 warps`
++ `for (i < 8) t += red[i]`。把 launcher 的 `block(256)` 改成 `block(1024)` 会：
+越界写 `red[8..31]`（smem 破坏）+ 只汇总前 8 个 warp 的平方和 → **少算 3/4** →
+"提速 8%"（16.02ms / 999 tok/s）是假象，文本也漂移（"忠志之士"→"忠志之臣"）。
+已回退。**教训：改 block 尺寸前必须先看 kernel 的跨 warp 归约是否硬编码 warp 数。**
+（gated_rmsnorm 的改动是安全的，因为它的归约在改的时候一并改成了 `blockDim.x >> 5` 循环。）
