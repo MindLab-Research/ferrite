@@ -4595,6 +4595,8 @@ __global__ void gdn_step_v2p_kernel(const float* __restrict__ q,
     float* qh = vh + dv;
     float* gh = qh + dk;
     float* red = gh + dk; // [2]: L2 sums (q, k)
+    float* dec = red + 2;          // [dk]: per-channel decay factor exp(gh[i])
+    float* red2 = dec + dk;        // [splits*dv <= 512]: column-split partials
     __shared__ float wq[16], wk[16]; // warp sums for the L2 block-tree
     // 0. load q/k (raw FIR+silu) + gate math + v + state; L2 via smem tree
     const int base = (int)((size_t)t * h + hd) * dk;
@@ -4636,40 +4638,66 @@ __global__ void gdn_step_v2p_kernel(const float* __restrict__ q,
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
         qh[i] = qh[i] * red[0] * q_scl;
         kh[i] = kh[i] * red[1];
+        dec[i] = expf(gh[i]); // per-channel decay factor (absorbs old stage 1)
     }
+    __syncthreads();
+    // fused state load + per-channel decay (was a separate full-S read-modify-
+    // write pass): S[i,j] = Sg[i,j] * dec[i] — bit-identical to the old
+    // two-stage form (x*dec then use == load then *dec).
     float* Sg = state + (size_t)hd * dk * dv;
     for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] =
+            Sg[idx] * dec[idx / dv];
     __syncthreads();
-    // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-        float decay = expf(gh[i]);
-        if (decay != 1.0f) {
-            float* Si = S + (size_t)i * spitch;
-            for (int j = 0; j < dv; j++) Si[j] *= decay;
+    // 1. kS = S^T k — column-parallel with intra-column split: blockDim threads
+    // = splits x dv lanes, each lane reduces a dk/splits row block, per-column
+    // partials joined via red2. (FP-safe class: 1-ulp order change in the ks
+    // and o sums only, gdn approved.)
+    const int splits = (int)(blockDim.x / dv); // 512/128 = 4
+    int rows = (dk + splits - 1) / splits;
+    {
+        int g = threadIdx.x / dv, j = threadIdx.x - g * dv;
+        if (g < splits) {
+            float acc = 0.f;
+            int i0 = g * rows, i1 = min(i0 + rows, dk);
+            for (int i = i0; i < i1; i++)
+                acc += kh[i] * S[(size_t)i * spitch + j];
+            red2[(size_t)g * dv + j] = acc;
         }
+        __syncthreads();
+        if (threadIdx.x < dv) {
+            float a = 0.f;
+            for (int g2 = 0; g2 < splits; g2++)
+                a += red2[(size_t)g2 * dv + threadIdx.x];
+            ks[threadIdx.x] = a;
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    // 2. kS = S^T k
-    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
-        ks[j] = acc;
-    }
-    __syncthreads();
-    // 3. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
+    // 2. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
     for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
         S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
             bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
     __syncthreads();
-    // 4. o = q^T S
-    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
-        out[((size_t)t * h + hd) * dv + j] = acc;
+    // 3. o = q^T S — same column-split scheme as stage 1.
+    {
+        int g = threadIdx.x / dv, j = threadIdx.x - g * dv;
+        if (g < splits) {
+            float acc = 0.f;
+            int i0 = g * rows, i1 = min(i0 + rows, dk);
+            for (int i = i0; i < i1; i++)
+                acc += qh[i] * S[(size_t)i * spitch + j];
+            red2[(size_t)g * dv + j] = acc;
+        }
+        __syncthreads();
+        if (threadIdx.x < dv) {
+            float a = 0.f;
+            for (int g2 = 0; g2 < splits; g2++)
+                a += red2[(size_t)g2 * dv + threadIdx.x];
+            out[((size_t)t * h + hd) * dv + threadIdx.x] = a;
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    // 5. store state back
+    // 4. store state back
     for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
         Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
 }
@@ -4680,7 +4708,7 @@ extern "C" cudaError_t ferrite_gdn_step_v2p(
     float* state, float* out, int h, int dk, int dv,
     cudaStream_t s) {
     size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
-                  + (size_t)(dv + dk + dv + dk + dk + 2) * sizeof(float);
+                  + (size_t)(dv + dk + dv + dk + dk + 2 + dk + 512) * sizeof(float);
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gdn_step_v2p_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
