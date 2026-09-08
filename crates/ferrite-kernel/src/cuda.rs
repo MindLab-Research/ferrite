@@ -2110,6 +2110,19 @@ impl CudaBackend {
         let in_f = x.shape.0[1] as i32;
         let out_f = w.shape.0[0] as i32;
         let dx = DevBuf::alloc(self.dev, self.stream, x.numel())?; dx.upload(x.as_slice())?;
+        // FAST PATHS FIRST: matmul_dev routes n==16 to cuBLAS (nvjet), fp8
+        // weights to the fp8 GEMV/MMA and has the bf16 MMA GEMM. This path
+        // used to go straight to the 32x32 FMA tiled kernel (measured
+        // 176us/call, ~19 calls/step in the batched decode). No regression
+        // for large n: matmul_dev's non-16/small-n branch is the same tiled
+        // kernel.
+        if bias.is_none() {
+            if let Ok(o) = self.matmul_dev(&dx, w, n, in_f, out_f) {
+                let ov = Arc::get_mut(&mut out.data).expect("unique out");
+                o.download(ov)?;
+                return Ok(());
+            }
+        }
         // weights resident in bf16 (half the f32 footprint — the TP4 shard
         // does not fit a 275GB B300 in f32); kernel converts to f32 in registers
         let dw = self.dev_weight_bf16(w)?;
