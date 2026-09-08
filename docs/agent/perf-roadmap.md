@@ -443,3 +443,9 @@ replay 992-996，文本正确。gmask 同步改成 `0x3u << (... & ~1u)`。
 同 sparse_attn 的规律：每线程列数翻倍。per-seq 59.1-59.2 → **60.2-60.3（聚合 963）**，文本正确。
 gmask 同步改成 `0xffu << (... & ~7u)`。**注意**：该测试的最后一行 replay 是 41.03ms 的尾部异常值
 （capture/收尾），判读时只看 per-seq 与连续 replay 行。
+
+### 有效：gemv 权重加载加 `.L2::128B`（+2%）
+
+`uint4 wv = *(const uint4*)(wr + k)` → `ld.global.nc.L2::128B.v4.u32`（内联 PTX，read-only +
+128B L2 预取粒度）：per-seq 58.4-58.7 → **60.2-60.9（聚合 963-974）**，文本正确。
+**结论：流式权重读取的 L2 预取提示值得逐 kernel 试**（act 上已 +0.3%，gemv 上 +2%）。
