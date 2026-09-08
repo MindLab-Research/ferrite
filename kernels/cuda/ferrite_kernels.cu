@@ -3207,6 +3207,10 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         const int cnt = (nt - base < MAXN) ? (nt - base) : MAXN;
         if (j <= topk) {
         float py[8];
+        // unroll 2: the per-token pointer chase (down_w8_ptrs[local] -> the
+        // weight rows) is a 2-level dependent load; overlapping two tokens
+        // keeps a second chase in flight while the first's rows land.
+        #pragma unroll 2
         for (int tt = 0; tt < cnt; tt++) {
         const int tok = base + tt;
         const float* act_t = act + (size_t)tok * stride;
