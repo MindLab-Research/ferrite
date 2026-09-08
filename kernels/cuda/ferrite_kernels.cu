@@ -4336,6 +4336,10 @@ __global__ void sparse_attn_v2_batched_kernel(
         const int c = threadIdx.x % cols;
         if (c < cols && g < G) {
             float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+            // unroll 4: one independent float4 load per iteration, previously
+            // serialized by the compiler (no unroll -> ~300-cycle L2 latency
+            // exposed on every slot).
+            #pragma unroll 4
             for (int s = g; s < live_k; s += G) {
                 const float w = sc[s];
                 if (w == 0.f) continue;
