@@ -2621,6 +2621,9 @@ fn mega_chain_dev(
 
     let mut gdn_idx = 0usize; // verify scratch index (GDN layers only)
     for (layer_idx, plan) in plans.iter().enumerate() {
+        if capture && dev_id == 0 {
+            eprintln!("[megab-cap] L{layer_idx}");
+        }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
         // A: hc_pre + input_layernorm (redundant per rank)
@@ -3015,6 +3018,9 @@ fn mega_chain_dev_batched(
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
 
     for (layer_idx, plan) in plans.iter().enumerate() {
+        if capture && dev_id == 0 {
+            eprintln!("[megab-cap] L{layer_idx}");
+        }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
         // A: hc_pre (n=B — row-independent)
