@@ -4096,6 +4096,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     int seq = blockIdx.x;
     int hd = blockIdx.y;
     int t = *total_tbl[seq]; // per-seq zero-copy pinned read
+    const int live_k = (topk < t) ? topk : t; // live slots only: the indexer writes the rest as -1, so looping to the fixed select_k_max (2048) wasted 18x at short context
     const float* q_s = q + (size_t)seq * (size_t)(h * d);
     const float* k_s = k_tbl[seq];
     const float* v_s = v_tbl[seq];
@@ -4111,10 +4112,10 @@ __global__ void sparse_attn_v2_batched_kernel(
     const int bm_words_max = 4096;
     int bm_words = (t + 31) >> 5; if (bm_words > bm_words_max) bm_words = bm_words_max;
     for (int l = threadIdx.x; l < d; l += blockDim.x) qs[l] = q_s[(size_t)hd * d + l];
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) idxs[s] = (int)idx_s[s];
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x) idxs[s] = (int)idx_s[s];
     for (int w0 = threadIdx.x; w0 < bm_words_max; w0 += blockDim.x) bm[w0] = 0u;
     __syncthreads();
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x) {
         int j = idxs[s];
         if (j < 0 || j >= t) { sc[s] = -INFINITY; continue; }
         bool dup = false;
@@ -4136,7 +4137,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     }
     __syncthreads();
     float m = -INFINITY;
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) m = fmaxf(m, sc[s]);
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x) m = fmaxf(m, sc[s]);
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
     __syncthreads();
@@ -4148,7 +4149,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     m = ms_;
     bool all_inf = (m == -INFINITY);
     float sum = 0.f;
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) {
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x) {
         sc[s] = all_inf ? 0.f : __expf(sc[s] - m);
         sum += sc[s];
     }
@@ -4162,11 +4163,11 @@ __global__ void sparse_attn_v2_batched_kernel(
     __syncthreads();
     float denom = sum_ + 1e-9f;
     __syncthreads();
-    for (int s = threadIdx.x; s < topk; s += blockDim.x) sc[s] /= denom;
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x) sc[s] /= denom;
     __syncthreads();
     for (int j2 = threadIdx.x; j2 < dv; j2 += blockDim.x) {
         float a = 0.f;
-        for (int s = 0; s < topk; s++) {
+        for (int s = 0; s < live_k; s++) {
             float w = sc[s];
             if (w == 0.f) continue;
             int j = idxs[s];
