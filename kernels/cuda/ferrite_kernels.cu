@@ -3193,20 +3193,20 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // the old warp-serial acc += p*y chain, bit-identical partials from the
     // same lane dot + shuffle tree).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h0 = blockIdx.x * 8;
+    int h0 = blockIdx.x * 16;
     int tok = blockIdx.y;
     if (h0 >= hidden) return;
     int stride = topk * inter + inter_shared;
     const float* act_t = act + (size_t)tok * stride;
     const float* ids_t = ids_f + (size_t)tok * topk;
     const float* probs_t = probs + (size_t)tok * topk;
-    __shared__ float part[8][16]; // [8 h rows][topk+1 slots] per-warp partials
+    __shared__ float part[16][16]; // [16 h rows][topk+1 slots] per-warp partials
     int j = warp;
-    // ---- slot j partials for 8 h rows (routed 0..topk-1, shared = topk) ----
+    // ---- slot j partials for 16 h rows (routed 0..topk-1, shared = topk) ----
     if (j <= topk) {
-        float py[8];
+        float py[16];
         #pragma unroll
-        for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
+        for (int hh = 0; hh < 16; hh++) py[hh] = 0.f;
         const float* aj;
         const unsigned char* dbase;
         const float* dsr_base;
@@ -3247,7 +3247,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             // keep several independent row loads in flight — with the break the
             // pragma was ignored and only 256B was in flight per warp).
             #pragma unroll
-            for (int hh = 0; hh < 8; hh++) {
+            for (int hh = 0; hh < 16; hh++) {
                 int h = h0 + hh;
                 float y = 0.f;
                 if (h < hidden) {
@@ -3281,16 +3281,15 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         }
         if (lane == 0) {
             #pragma unroll
-            for (int hh = 0; hh < 8; hh++) {
+            for (int hh = 0; hh < 16; hh++) {
                 int h = h0 + hh;
                 if (h < hidden) part[hh][j] = p * py[hh];
             }
         }
     }
     __syncthreads();
-    // ---- fold: warps 0..7 each reduce one h row, j-ascending (FP-safe) ----
-    if (warp < 8) {
-        int hh = warp;
+    // ---- fold: warps 0..7 reduce the 16 h rows (2 each), j-ascending ----
+    for (int hh = warp; hh < 16; hh += 8) {
         int h = h0 + hh;
         if (h < hidden && lane == 0) {
             float acc = 0.f;
