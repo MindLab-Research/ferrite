@@ -3440,7 +3440,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     dim3 block(288); // 9 warps: topk routed (8) + shared
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
-    dim3 grid((hidden + 7) / 8, (n + 3) / 4, 1);
+    dim3 grid((hidden + 7) / 8, (n + 1) / 2, 1);   // TT=2 tokens per block
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
