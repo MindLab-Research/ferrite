@@ -2799,7 +2799,10 @@ extern "C" cudaError_t ferrite_moe_fused_act(
     // batch dimension — decode n==1, chunked prefill n up to chunk size).
     // v11 tried rows=2/blockDim=64 (2304 blocks): 62.0 vs 62.3 — NO gain (act
     // is memory-bandwidth-bound at ~3.2TB/s effective, more blocks ≠ more MLP).
-    int rows = 8;
+    // TP-occupancy: grid.x = inter/rows. At TP8 inter/rank is 1/8, so rows=8
+    // gave 216 blocks on 148 SM (18% occupancy, latency-bound 15.7µs). rows=4
+    // doubles the block count; the kernel's inner loop is column-parallel.
+    int rows = 4;
     int max_rows = inter > inter_shared ? inter : inter_shared;
     dim3 grid((max_rows + rows - 1) / rows, topk + 1, n);
     moe_fused_act_kernel<<<grid, 256, 0, s>>>(
@@ -2955,7 +2958,10 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8(
     float* act, int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, float limit, int hscols,
     cudaStream_t s) {
-    int rows = 8;
+    // TP-occupancy: grid.x = max_rows/rows. At TP8 inter/rank is 1/8, so
+    // rows=8 left only 216 blocks on 148 SM (18% occupancy, latency-bound
+    // 15.7µs x 40.6/step = 0.64ms). rows=4 doubles the block count.
+    int rows = 4;
     int max_rows = inter > inter_shared ? inter : inter_shared;
     dim3 grid((max_rows + rows - 1) / rows, topk + 1, n);
     moe_fused_act_fp8_kernel<<<grid, 256, 0, s>>>(

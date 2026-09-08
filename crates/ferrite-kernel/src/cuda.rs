@@ -2957,7 +2957,7 @@ impl CudaBackend {
                         b_raw.as_const_f32(), fb.as_const_f32(),
                         dw_dt.as_const_f32(), dw_al.as_const_f32(), lb,
                         gdn_state, core.as_f32(), h as i32, dk as i32, dk as i32,
-                        (64 / (h as i32).max(1)).clamp(1, 8), self.stream,
+                        (256 / (h as i32).max(1)).clamp(1, 32), self.stream,
                     )
                 },
                 "gdn_step_v2p",
