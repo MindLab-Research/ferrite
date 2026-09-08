@@ -4259,6 +4259,15 @@ impl CudaBackend {
                         )
                     };
                     if r == 0 {
+                        {
+                            static ONCE: std::sync::Once = std::sync::Once::new();
+                            ONCE.call_once(|| {
+                                eprintln!(
+                                    "[moe-dbg] e_local={} expert_start={} hi(hidden)={} inter={} inter_shared={} topk={} n={} experts.len()={}",
+                                    tbl.e_local, expert_start, hi, inter, inter_shared, topk, ni, experts.len()
+                                );
+                            });
+                        }
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
                         ck(unsafe {
                             ferrite_moe_fused_down_sum_fp8(
