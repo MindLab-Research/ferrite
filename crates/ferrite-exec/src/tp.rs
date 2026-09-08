@@ -1308,11 +1308,14 @@ impl<B: KernelBackend> TpCluster<B> {
         //    discards it (verify's hf_v replaces it).
         let drafts: Vec<f32> = {
             let toks = Self::fan_out(&mut self.shards, |s| {
-                // h chain: (hprev raw ptr for draft 0, then each draft's h_out)
                 let mut drafts: Vec<f32> = Vec::with_capacity(nd);
-                // draft 0's h_prev = MtpState.hprev (fixed addr — raw ptr to
-                // avoid borrow conflicts across mtp_forward calls)
-                let hprev_ptr: usize = {
+                // draft 0's h_prev = MtpState.hprev — its &DevBuf REFERENCE
+                // address (NOT as_f32(): that is the device data pointer;
+                // reinterpreting it as a DevBuf struct reads floats into the
+                // ptr/len/stage fields → garbage → SEGV. The reference is
+                // stable: MtpState outlives the loop and its DevBufs never
+                // move — the same raw-&DevBuf pattern the pre-N code used).
+                let hprev_ref: usize = {
                     let cuda = s
                         .backend
                         .as_cuda()
@@ -1321,12 +1324,15 @@ impl<B: KernelBackend> TpCluster<B> {
                     let m = m
                         .as_ref()
                         .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    m.hprev.as_f32() as usize
+                    &m.hprev as *const DevBuf as usize
                 };
-                let mut h_prev_addr = hprev_ptr;
+                // h chain: draft i's h_prev = draft i-1's h_out (a normal
+                // pool-allocated DevBuf, kept alive by ownership — the last
+                // draft exports no h (verify's hf_v commit replaces it).
+                let mut prev_h: Option<DevBuf> = None;
                 let mut prev_tok = last;
                 for i in 0..nd {
-                    let (emb, h_out_addr) = {
+                    let (emb, h_out) = {
                         let cuda = s
                             .backend
                             .as_cuda()
@@ -1335,47 +1341,26 @@ impl<B: KernelBackend> TpCluster<B> {
                         let h2 = s.embed(&[prev_tok as u32]);
                         let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
                         emb.upload(h2.as_slice())?;
-                        // every draft except the LAST exports its h (the next
-                        // draft's h_prev); the last one's h is replaced by
-                        // verify's hf_v commit anyway.
-                        let h_out_addr = if i + 1 < nd {
-                            let h = DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?;
-                            let a = h.as_f32() as usize;
-                            std::mem::forget(h); // raw-ptr ownership (freed below)
-                            a
+                        let h_out = if i + 1 < nd {
+                            Some(DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?)
                         } else {
-                            0
+                            None
                         };
-                        (emb, h_out_addr)
+                        (emb, h_out)
+                    }; // cuda dropped — mtp_forward re-acquires internally
+                    let d = match prev_h.as_ref() {
+                        None => {
+                            let hprev: &DevBuf = unsafe { &*(hprev_ref as *const DevBuf) };
+                            mtp_forward(s, seq, &emb, hprev, h_out.as_ref())?
+                        }
+                        Some(ph) => mtp_forward(s, seq, &emb, ph, h_out.as_ref())?,
                     };
-                    let h_prev: &DevBuf = unsafe { &*(h_prev_addr as *const DevBuf) };
-                    let h_out: Option<&DevBuf> = if h_out_addr != 0 {
-                        Some(unsafe { &*(h_out_addr as *const DevBuf) })
-                    } else {
-                        None
-                    };
-                    let d = mtp_forward(s, seq, &emb, h_prev, h_out)?;
-                    // reclaim the h_out DevBuf (forget above — mtp_forward
-                    // used it; return it to the pool via a raw re-drop)
-                    let d_tok = d as u32;
                     drafts.push(d);
-                    if h_out_addr != 0 {
-                        // reconstruct + drop to return to the pool
-                        let cuda = s
-                            .backend
-                            .as_cuda()
-                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                        let h = DevBuf {
-                            ptr: h_out_addr as *mut std::ffi::c_void, len: hidden,
-                            class: (hidden as u32).next_power_of_two(),
-                            dev: cuda.dev(), stream: cuda.stream_handle(),
-                            stage: std::ptr::null_mut(),
-                        };
-                        drop(h); // returns to pool (stage=null — see DevBuf::drop: pool's free skips null stage? NO — pool free() calls cudaFreeHost(null) → SEGV guard)
-                    }
-                    h_prev_addr = h_out_addr;
-                    prev_tok = d_tok;
+                    prev_tok = d as u32;
+                    prev_h = h_out; // draft i's h_out → draft i+1's h_prev
                 }
+                // prev_h ends None (last draft exported no h) — any interim
+                // h_out DevBuf drops back to the pool on the move chain.
                 Ok(drafts)
             })
             .into_iter()
