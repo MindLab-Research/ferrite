@@ -3359,17 +3359,17 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     const float* arf = reinterpret_cast<const float*>(ar);
                     // 2 accumulators: the 8-iteration x2-FMA chain was 16 deep
                     // (fp32 cannot be reassociated by the compiler).
-                    float y0 = 0.f, y1 = 0.f;
+                    float ya = 0.f, yb = 0.f;
                     #pragma unroll
                     for (int q = 0; q < 8; q += 2) {
                         const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + q * 2);
                         const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                        y0 += (df.x * ds_c) * arf[q * 2] + (df.y * ds_c) * arf[q * 2 + 1];
+                        ya += (df.x * ds_c) * arf[q * 2] + (df.y * ds_c) * arf[q * 2 + 1];
                         const __nv_fp8x2_storage_t dx2b = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + (q + 1) * 2);
                         const float2 dfb = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2b, __NV_E4M3)));
-                        y1 += (dfb.x * ds_c) * arf[(q + 1) * 2] + (dfb.y * ds_c) * arf[(q + 1) * 2 + 1];
+                        yb += (dfb.x * ds_c) * arf[(q + 1) * 2] + (dfb.y * ds_c) * arf[(q + 1) * 2 + 1];
                     }
-                    float y = y0 + y1;
+                    float y = ya + yb;
                     // lanes 0..15 -> row h0+2c, lanes 16..31 -> row h0+2c+1
                     #pragma unroll
                     for (int off = 8; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
