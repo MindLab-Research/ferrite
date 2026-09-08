@@ -420,3 +420,8 @@ accept/commit 按「一个 seq 的 n 个 token」索引）。批量场景下多 
 `<thought>` 思考模式** —— 与之前 moe_down half2 完全同类的问题：数值扰动（求和顺序变化）
 越过了 logit 的决策边界。**已 git revert。教训重申：MoE 路径的数值敏感度最高，
 任何求和顺序/精度改动都必须人眼验证文本，且默认倾向于不动。**
+
+### 小幅：act 的 cp.async 加 `.L2::128B` 预取提示
+
+`cp.async.cg.shared.global` → `cp.async.cg.shared.global.L2::128B`（对顺序流的专家权重提高
+L2 预取粒度）：per-seq 59.3-59.8 → **59.2-60.3**（略优），replay 989.5-991.1，文本正确。保留。
