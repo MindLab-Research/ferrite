@@ -1343,7 +1343,12 @@ impl<B: KernelBackend> TpCluster<B> {
                     mtp_verify_n()
                 );
             }
-            return self.mtp_step(seq, &plans, num_dsa);
+            let t_all = std::time::Instant::now();
+            let r = self.mtp_step(seq, &plans, num_dsa);
+            if std::env::var_os("FERRITE_MTP_TIMING").is_some() {
+                eprintln!("[mtp-all] {:.2}ms", t_all.elapsed().as_secs_f64() * 1e3);
+            }
+            return r;
         }
         // Steady state: advance DSA pinned t0/total (the graph's kernels
         // read them zero-copy), write the 4 stagings, one launch per rank,
