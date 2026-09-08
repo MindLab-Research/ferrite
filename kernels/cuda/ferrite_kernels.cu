@@ -5888,7 +5888,7 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           cudaStream_t s) {
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
     long total = (long)nrows * out_f;
-    constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
+    constexpr int WPR = 2;                 // K-split warps per row (2 = more ILP per warp)
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
     dim3 grid((unsigned)((total + rpb * 8 - 1) / (rpb * 8)));
     dim3 block(256);
