@@ -5084,6 +5084,16 @@ impl CudaBackend {
             return Ok(false);
         }
         self.enter();
+        // Zero the "all blocks arrived" counter BEFORE the launch. It is
+        // normally reset by the LAST block of the previous call, but a
+        // GRID-SIZE change (the per-size b2/b4/b8/b16 graphs each capture
+        // their own n*world grid) can leave it non-zero → no block ever
+        // sees prev == gridDim.x-1 → the peers' ready flags are never
+        // stamped → every rank spins forever (measured diag:
+        // myepoch=270 flag=270, off by exactly 1).
+        // cudaMemsetAsync is legal inside capture (it becomes a graph node,
+        // no host-memory dependency — unlike the table H2D copies).
+        ck(unsafe { cudaMemsetAsync(st.ctr, 0, 4, self.stream) }, "p2p ctr zero")?;
         ck(unsafe {
             // v3: fused down+sum single kernel (saves the inter-kernel gap
             // + epoch re-read between publish and collect phases)
