@@ -1769,16 +1769,12 @@ extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q, const float* k,
     cudaError_t e = pdl_or_plain(sparse_attn_v2_kernel, grid, block, smem, s,
                         q, k, v, idx, pm, pl, po, n, t_ptr, h, d, dv, topk);
     if (e != cudaSuccess) return e;
-    if (splits > 1) {
-        dim3 mgrid(n, h);
-        dim3 mblock(128);
-        return sparse_attn_merge_kernel<<<mgrid, mblock, 0, s>>>(pm, pl, po, out, n, h, dv, splits);
-    }
-    // splits == 1: the partial IS the answer (merge would be identity) — but
-    // po's layout differs from out's, so run the merge anyway for uniformity.
+    // The merge is a no-op-ish copy at splits==1 (po's layout differs from
+    // out's), so run it unconditionally.
     dim3 mgrid(n, h);
     dim3 mblock(128);
-    return sparse_attn_merge_kernel<<<mgrid, mblock, 0, s>>>(pm, pl, po, out, n, h, dv, splits);
+    sparse_attn_merge_kernel<<<mgrid, mblock, 0, s>>>(pm, pl, po, out, n, h, dv, splits);
+    return cudaGetLastError();
 }
 
 // ============================================================
