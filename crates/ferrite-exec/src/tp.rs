@@ -944,6 +944,23 @@ impl<B: KernelBackend> TpCluster<B> {
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
+            // DIAG: the dry-run's kernels are ASYNC — sync here so a spinning
+            // kernel is attributed to the dry-run, not to the capture's
+            // cudaStreamEndCapture (which waits for the same kernels).
+            if std::env::var_os("FERRITE_TIMING").is_some() {
+                eprintln!("[megab] dry-run issued, syncing");
+            }
+            Self::fan_out(&mut self.shards, |s| {
+                if let Some(c) = s.backend.as_cuda() {
+                    c.sync()?;
+                }
+                Ok(())
+            })
+            .into_iter()
+            .collect::<Result<Vec<()>>>()?;
+            if std::env::var_os("FERRITE_TIMING").is_some() {
+                eprintln!("[megab] dry-run synced, capturing");
+            }
             Self::fan_out(&mut self.shards, |s| {
                 Self::mega_chain_dev_batched(
                     s, pseqs.as_slice(), in_vals.as_slice(), &plans, num_dsa, true, &gname, size,
