@@ -293,3 +293,18 @@ GDN 的 6 处 dot（`for (i<dk) acc += k[i] * S[i*stride + j]`）是**串行 FMA
 
 **真正的 2x+ 只有一条路**：把 sparse_attn 的分数与加权和做成 **tensor-core（FlashAttention 式）**
 分块矩阵乘 —— 算力可再降 10x+，但属于大重写（含 softmax 的在线归一化、slot 索引的 gather 布局）。
+
+### 实测：fp16 k 缓存 + half2 score 是回归（已回退）
+
+按上面的推算做了完整实现（Rust `dsa_alloc_h` + 两个 append kernel 写 `__half` + 两个 sparse_attn
+kernel 的 `qs2` smem 与 half2 点积 + 每 128 元素折回 fp32），编译通过、**文本正确**，但两个窗口都更慢：
+
+| 窗口 | 基线 | fp16 k 侧 |
+|---|---|---|
+| 300-token | 975-982 | 964.7 |
+| 1000-token | 893-895 | 875-876 |
+
+原因：d=256 的 score 点积在 TG=8 线程下每线程只有 32 个元素，**qs2 的转换（每 block d/2 次）与
+折回分支的开销超过了 half2 带来的收益**；而 k 侧本身只占注意力的约一半算力、注意力又只占步时
+8-11%。→ 已 `git reset` 回退。**结论：这类"半精度化"只在元素数远大于转换开销时才划算**
+（gemv 的 T=2 复用之所以有效，是因为它摊薄的是每 16 元素的转换）。
