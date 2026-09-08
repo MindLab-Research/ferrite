@@ -292,7 +292,9 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x,
 extern "C" cudaError_t ferrite_rmsnorm(const float* x, const float* w,
                                        float* out, int n, int dim, float eps,
                                        cudaStream_t s) {
-    dim3 block(256);
+    // 1024 threads/block (was 256): grid(n) means only 16 blocks at n=16, so
+    // the per-block latency is what matters — 4 elems/thread instead of 16.
+    dim3 block(1024);
     dim3 grid(n);
     rmsnorm_kernel<<<grid, block, 0, s>>>(x, w, out, n, dim, eps);
     return cudaGetLastError();
