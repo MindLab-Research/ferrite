@@ -4530,7 +4530,7 @@ impl CudaBackend {
         // 40µs/layer serve-real bottleneck).
         // HC_P345_NB must match the kernel's #define (16 — see the .cu;
         // NB>16 corrupts the output, bisected 2026-09-08).
-        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * (mix * 8 + 8 + 1 + n + 16 + 1))?;
+        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * (mix * 2 + 2 + 1 + n + 16 + 1))?;
         // SPLIT version (grid(s, mix) — one block per mix row): the
         // single-block kernel ran on ONE SM (~6GB/s of 8TB/s HBM); the mix
         // GEMV (16384×18432) was 57% of the decode step (A_hc+C_hc 24ms of
