@@ -4593,6 +4593,10 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     // i-ascending FMA chain (same numeric order as the old in-smem P3).
     float acc = 0.f;
     if (col < h) {
+        // UNROLLED: n is a runtime value, so without this the 16 rows were
+        // read by 16 SERIAL global loads (~600ns each = ~9.6us of the 12us
+        // per-block latency). Unrolling overlaps them.
+        #pragma unroll 4
         for (int i = 0; i < n; i++) acc += ps[i] * x[(size_t)i * h + col];
         li[(size_t)t * h + col] = acc;   // li_raw staged in place (P5 overwrites)
     }
