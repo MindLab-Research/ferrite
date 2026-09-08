@@ -1419,6 +1419,33 @@ impl<B: KernelBackend> TpCluster<B> {
         // replay) — bisects a draft divergence between the chain itself
         // (embed_one_dev / cast_store / h_d relays) and capture/replay.
         let serial_dev = draft_env == "2";
+        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+            // draft input state: hprev (draft 0's h_prev) + hf_dev (the seed
+            // source) — a divergence here means the state, not the chain.
+            Self::fan_out(&mut self.shards, |s| {
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                let (hp, hf) = {
+                    let m = cuda.mtp.lock().unwrap();
+                    let m = m
+                        .as_ref()
+                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                    (m.hprev.as_f32(), m.hf_dev.as_f32())
+                };
+                let mut a = [0f32; 4];
+                let mut b = [0f32; 4];
+                ferrite_kernel::cuda::memcpy_d2h_sync(
+                    hp as *mut std::ffi::c_void, a.as_mut_ptr(), 4, cuda.stream_handle());
+                ferrite_kernel::cuda::memcpy_d2h_sync(
+                    hf as *mut std::ffi::c_void, b.as_mut_ptr(), 4, cuda.stream_handle());
+                eprintln!("[mtp-hp] hprev={:?} hf_dev={:?}", a, b);
+                Ok::<(), FerriteError>(())
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+        }
         let drafts: Vec<f32> = {
             let mut graph_ok = false;
             if graph_drafts && !serial_dev {
