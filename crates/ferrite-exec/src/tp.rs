@@ -1214,7 +1214,13 @@ impl<B: KernelBackend> TpCluster<B> {
                 // capture only in graph mode "1": mode "2" (host-serial device
                 // chain) must run WITHOUT the capture pass's side effects to
                 // separate "capture+dry" from "the device chain itself".
-                if matches!(std::env::var("FERRITE_DRAFT_GRAPH").as_deref(), Ok("1")) {
+                // FERRITE_DRAFT_DRY_ONLY=1 skips the capture pass (dry only) —
+                // bisects dry's real-execution side effects from the capture
+                // pass's leaked pool buffers.
+                if matches!(
+                    std::env::var("FERRITE_DRAFT_GRAPH").as_deref(),
+                    Ok("1") | Ok("2")
+                ) {
                     let nd = n_v - 1;
                     // dry: tokens_dev[0] ← last, then the nd-step chain (real
                     // execution — P2P ARs rendezvous, dsa appends at T..T+nd-1)
@@ -1271,19 +1277,23 @@ impl<B: KernelBackend> TpCluster<B> {
                             let c = s.backend.as_cuda().unwrap();
                             eprintln!("[cap-t] after-rb {:?}", c.dsa_t_count(seq, mtp_family));
                         }
-                        let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
-                        for i in 0..nd {
-                            // per-iteration borrows: draft_step_dev takes &mut s
-                            // (graph_capture_begin/end only need &CudaBackend).
-                            s.backend
-                                .as_cuda()
-                                .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
-                                .graph_capture_begin();
-                            draft_step_dev(s, seq, i, nd)?;
-                            s.backend
-                                .as_cuda()
-                                .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
-                                .graph_capture_end(&format!("mega_d{seq}_{i}"));
+                        let skip_cap =
+                            std::env::var_os("FERRITE_DRAFT_DRY_ONLY").is_some();
+                        if !skip_cap {
+                            let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
+                            for i in 0..nd {
+                                // per-iteration borrows: draft_step_dev takes &mut s
+                                // (graph_capture_begin/end only need &CudaBackend).
+                                s.backend
+                                    .as_cuda()
+                                    .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                                    .graph_capture_begin();
+                                draft_step_dev(s, seq, i, nd)?;
+                                s.backend
+                                    .as_cuda()
+                                    .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                                    .graph_capture_end(&format!("mega_d{seq}_{i}"));
+                            }
                         }
                         if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
                             let c = s.backend.as_cuda().unwrap();
