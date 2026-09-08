@@ -4204,7 +4204,6 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
                                         float* __restrict__ mx_partial,
-                                        unsigned* __restrict__ ctr2,
                                         int s, int n, int h, int mix) {
 #if __CUDA_ARCH__ >= 900
     // PDL (v5): this kernel's launch overlaps the PREDECESSOR's tail (the
@@ -4213,13 +4212,6 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
     // a normal launch.
     cudaGridDependencySynchronize();
 #endif
-    // ctr2 zeroing folded in here (was a cudaMemsetAsync before every launch
-    // — 2/step/layer = 128 extra 1.5µs GPU ops per decode step, nsys-counted).
-    // Safe: rest345 (the only ctr2 reader) is a LATER kernel on the same
-    // stream, so this write is visible before any atomicAdd.
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x < (unsigned)s) {
-        ctr2[threadIdx.x] = 0u;
-    }
     // K-SPLIT: gridDim.z = KS lanes per mix row — 24 mix rows × 8 lanes =
     // 192 blocks (130% SM) vs the old 24-block single-lane version (16% SM,
     // each block serially dotting the full 18432-dim row). Each lane dots
@@ -4461,6 +4453,7 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     float* pre_s_g = mx_scratch + (size_t)s * mix * HC_MIX_KS + (size_t)s * HC_MIX_KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
+    cudaMemsetAsync(ctr2, 0, sizeof(unsigned) * (size_t)s, stream);
     dim3 mix_grid(s, mix, HC_MIX_KS);
     if (ferrite_pdl_enabled()) {
         cudaLaunchConfig_t cfg = {};
@@ -4471,10 +4464,10 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
         attrs[0].val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = attrs; cfg.numAttrs = 1;
         cudaLaunchKernelEx(&cfg, hc_pre_mix_split_kernel,
-                           res, fw, mx_scratch, ctr2, s, n, h, mix);
+                           res, fw, mx_scratch, s, n, h, mix);
     } else {
         hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
-            res, fw, mx_scratch, ctr2, s, n, h, mix);
+            res, fw, mx_scratch, s, n, h, mix);
     }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
