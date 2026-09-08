@@ -4909,14 +4909,14 @@ __global__ void p2p_ar_down_v2_kernel(
         unsigned prev = (gridDim.x == 1u) ? 0u : atomicAdd(ctr, 1u);
         if (prev == gridDim.x - 1u) { // last block: all stores fenced
             for (int r = 0; r < world; r++)
-                *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
-            // The flag STORES above must themselves become visible to the
-            // peers' polling loads over NVLink (UVA). A volatile store is
-            // only device-scope: without this second system fence the peers
-            // can keep reading the previous stamp forever (measured hang:
-            // prev=1 cur=1 myepoch=1 — the writer's epoch advanced but the
-            // reader never saw the new flag). The first fence orders the
-            // staging data; this one publishes the flag.
+                // SYSTEM-scope atomic store. A plain volatile store is only
+                // device-scope: it never becomes visible in the peer's
+                // address space over NVLink/UVA, so both sides waited
+                // forever for a flag that WAS written but invisible
+                // (measured hang: prev=50 cur=50 myepoch=50, both ranks
+                // stuck in phase B). A system fence cannot rescue a
+                // device-scope store — the store itself must be sys-scope.
+                atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
             __threadfence_system();
             *ctr = 0u;     // reset for the next call (stream-ordered)
             *epoch = e + 1u; // advance AFTER the flags (the next kernel sees it)
