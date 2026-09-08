@@ -269,3 +269,21 @@ Other profiling rules:
 - MTP 出师表 200-step: `real 476 tokens` window, text must be flawless 《出师表》 through 将军向宠 section (乱码 = accept/commit bug, ALWAYS check by eye).
 - 500-step: 58.9 tok/s (DSA decay visible), non-MTP 500-step 44.7.
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
+
+## 2026-09-08 续：half2 FMA 迁移的收益与陷阱（gemv 有效 / moe_down 回退）
+
+**背景**：gemv_fp8_v2 / moe_down 的内层都是 `fp8x2 -> half2 -> float2 -> 2 条标量 FMA`
+（每 16 个元素约 40 条指令）。改成 `fp8x2 -> half2 -> __hfma2`（每 16 个元素 16 条）
+在 gemv 上生效（17.61 -> 17.51 ms，+0.6%），在 moe_down 上**速度中性（17.51 vs 17.51）但
+把模型推入 thinking 模式**（文本从直接背诵《出师表》变成 `<think 嗯，用户要求背诵…`）——
+已回退。教训：
+
+1. **`reinterpret_cast<const __half2*>(float_ptr)` 是错的**：这是把 float 的位模式当
+   half 读（实测输出全 `!!!!!`，且"变快"3.4 ms —— 少算/垃圾值）。必须 `__floats2half2_rn`。
+2. **速度中性但改变输出分布 = 必须回退**：fp16 只在 16 元素 chunk 内累加、随后并入 fp32，
+   理论上误差 ~1e-3（远小于 fp8 权重 1e-2），但**实际翻转了模型行为**。数值改动即使"精度够"
+   也可能越过 logit 的决策边界 —— 唯一可靠的判据是人眼文本，不是误差估计。
+3. 迁移 half2 只对**指令受限且数值敏感度低**的内核安全；MoE 路径（act/down）不要动。
+
+**其他中性/更差的尝试（勿重复）**：gemv WPR=2（17.87）、gemv 内层 unroll 4（17.67）、
+moe_route warp-shuffle top-k（17.61，中性但修掉了 `bidx[threadIdx.x]` 越界写 [32] 数组）。
