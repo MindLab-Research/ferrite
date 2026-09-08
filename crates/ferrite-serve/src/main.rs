@@ -399,9 +399,13 @@ fn run_cuda(
             ferrite_kernel::cuda::profiler_start();
             ncu_started = true;
         }
+        let t_step = std::time::Instant::now();
         let tok = cluster
             .decode_step(seq)
             .unwrap_or_else(|e| panic!("decode step {i}: {e}"));
+        if std::env::var_os("FERRITE_MTP_TIMING").is_some() && i > 0 {
+            eprintln!("[step-all] {:.2}ms", t_step.elapsed().as_secs_f64() * 1e3);
+        }
         if stop.contains(&tok) {
             break;
         }
