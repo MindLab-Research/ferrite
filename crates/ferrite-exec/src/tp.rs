@@ -1695,6 +1695,9 @@ impl<B: KernelBackend> TpCluster<B> {
                 k += 1;
             }
             let k = k as usize;
+            if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                eprintln!("[mtp-k] k={}", k);
+            }
             for f in 0..num_dsa {
                 cuda.dsa_host_rollback(seq, f, (n_v - k) as usize);
             }
