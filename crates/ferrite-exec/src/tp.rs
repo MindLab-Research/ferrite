@@ -2359,6 +2359,19 @@ impl<B: KernelBackend> TpCluster<B> {
             h_d.push(DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?);
         }
         let d_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), nd.max(1))?;
+        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+            eprintln!(
+                "[mtp-bufs] hprev={:p} hf_dev={:p} hf_v={:p} tokens={:p} d_argmax={:p}",
+                hprev.as_f32(), hf_dev.as_f32(), hf_v.as_f32(),
+                tokens_dev.as_f32(), d_argmax_dev.as_f32()
+            );
+            for (i, b) in emb_devs.iter().enumerate() {
+                eprintln!("[mtp-bufs] emb[{i}]={:p}", b.as_f32());
+            }
+            for (i, b) in h_d.iter().enumerate() {
+                eprintln!("[mtp-bufs] h_d[{i}]={:p}", b.as_f32());
+            }
+        }
         *cuda.mtp.lock().unwrap() = Some(MtpState {
             hf_dev, hf_v, hprev, scratch, commit: Some(commit),
             tokens_dev, verify_argmax_dev, k_dev, next_token_dev, n_accepted_dev,
