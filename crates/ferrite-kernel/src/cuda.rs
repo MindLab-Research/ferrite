@@ -2902,7 +2902,10 @@ impl CudaBackend {
         ck(unsafe { cudaMallocHost(&mut ptot as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "dsa dummy pinned")?;
         unsafe {
             *pt0 = 0;
-            *ptot = 1;
+            // total = MAXT (not 1): the indexer/pool kernels derive the
+            // number of pools from it; total=1 gave npools=1 and the padded
+            // rows' topk/pool loops spun (measured hang at size=16).
+            *ptot = MAXT as i32;
         }
         let tup = (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32);
         m.insert(family, tup);
