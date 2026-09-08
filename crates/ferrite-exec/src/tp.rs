@@ -4960,6 +4960,24 @@ pub(crate) fn draft_step_dev<B: KernelBackend>(
             hidden,
             1,
         )?;
+        // embed sanity: the token the kernel read + the row it produced.
+        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
+            let mut t = [0i32; 1];
+            ferrite_kernel::cuda::memcpy_d2h_sync(
+                unsafe { tokens_ptr.add(i) } as *mut std::ffi::c_void,
+                t.as_mut_ptr() as *mut f32,
+                1,
+                cuda.stream_handle(),
+            );
+            let mut e = [0f32; 4];
+            ferrite_kernel::cuda::memcpy_d2h_sync(
+                emb_ptr as *mut std::ffi::c_void,
+                e.as_mut_ptr(),
+                4,
+                cuda.stream_handle(),
+            );
+            eprintln!("[draft-emb] i={i} token={:?} emb[0..4]={:?}", t, e);
+        }
     } // cuda dropped — mtp_forward re-acquires internally
     mtp_forward_raw_argmax(
         s,
