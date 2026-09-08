@@ -4847,14 +4847,20 @@ __global__ void p2p_ar_fused_v3_kernel(
     // gap. Map (token, peer) across threads instead.
     const int total = n * world;
     const int tr = (threadIdx.x < (unsigned)world) ? (int)threadIdx.x : -1;
-    // phase A: down — publish my partial to all peers' staging slots
-    if (i < n) {
-        float v = partial[i];
-        const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)i);
-        // one thread per peer (parallel NVLink stores)
+    // phase A: down — publish my partial to all peers' staging slots.
+    // (token, peer) mapped across threads: total = n * world. The previous
+    // version reused `i` as the peer-mapped index INSIDE `if (i < n)`: at
+    // decode (n=1) only thread 0 ran, writing peer 0 alone while still
+    // stamping EVERY peer's flag → every other rank read a stale partial
+    // (flag said "arrived", staging held the previous epoch's value) →
+    // wrong all-reduce → gibberish text.
+    {
         int r0 = blockIdx.x * blockDim.x + threadIdx.x;
         if (r0 < total) {
-            int rr = r0 % world;
+            int ii = r0 / world;  // token
+            int rr = r0 % world;  // peer
+            float v = partial[ii];
+            const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii);
             staging_tbl[rr][off] = v;
         }
     }
@@ -4896,7 +4902,11 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
     // __threadfence_system(); 4 blocks × 1024 threads keeps the same
     // per-thread work with 4× fewer fence/atomic participants.
     int threads = 1024;
-    int blocks = (n + threads - 1) / threads;
+    // grid must cover phase A's (token, peer) map = n * world threads
+    // (the old (n+threads-1)/threads grid left phase A with n threads only:
+    // at decode n=1 just thread 0 ran → 7 of 8 peers' staging never written).
+    int work = n * world;
+    int blocks = (work + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     p2p_ar_fused_v3_kernel<<<blocks, threads, 0, s>>>(
         partial, staging_tbl, ready_tbl, epoch, ctr,
