@@ -3467,56 +3467,44 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     // PADDED to 80 bytes: stride 64 would start every row on bank 0 (8-way
     // conflict on the fragment reads) — 80 gives banks 0,20,8,28,16,4,24,12.
     const int SA_STRIDE = 80;
-    __shared__ unsigned char sa[8][2 * 16 * 80];
-    // SOFTWARE PIPELINE: prefetch the next 64-K tile into registers BEFORE the
-    // MMA block, so the global-load latency overlaps the tensor-core work.
-    // Without it each warp ran 8 sequential (load-latency -> MMA) rounds and
-    // the kernel was latency-bound (the step time barely changed from 8 to 16
-    // seqs, i.e. it is NOT bandwidth-bound).
-    uint4 pf[4];
-    {
-        int i = 0;
-        for (int t = lane; t < 128; t += 32, i++) {
-            const int proj = t >> 6, off = t & 63;
-            const int row = off >> 2, col = (off & 3) * 16;
-            pf[i] = *reinterpret_cast<const uint4*>(
-                (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + k0 + col);
-        }
-    }
-    for (int kb = k0; kb < k1; kb += 64) {
-        {
-            int i = 0;
-            for (int t = lane; t < 128; t += 32, i++) {
-                const int proj = t >> 6, off = t & 63;
-                const int row = off >> 2, col = (off & 3) * 16;
-                *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) = pf[i];
-            }
-        }
+    // DOUBLE-BUFFERED cp.async staging: global -> smem directly (no register
+    // round-trip) with two buffers, so the next tile's copy is in flight while
+    // the MMAs run on the current one. The old single-buffer + register
+    // prefetch still stalled ~536 cycles/tile (600-cycle DRAM latency vs the
+    // ~64 cycles of MMA work) — that is why the 2-tile *register* prefetch was
+    // slower (32 extra registers); cp.async costs smem instead (40KB/block).
+    __shared__ unsigned char sa[2][8][2 * 16 * 80];
+    #define ACT_ISSUE(TILE, BUF) do { \
+        for (int t = lane; t < 128; t += 32) { \
+            const int proj = t >> 6, off = t & 63; \
+            const int row = off >> 2, col = (off & 3) * 16; \
+            const unsigned char* src_ = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + (TILE) + col; \
+            unsigned char* dst_ = sa[BUF][warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col; \
+            const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
+        } \
+        asm volatile("cp.async.commit_group;\n"); \
+    } while (0)
+    ACT_ISSUE(k0, 0);
+    int sbuf = 0;
+    for (int kb = k0; kb < k1; kb += 64, sbuf ^= 1) {
+        asm volatile("cp.async.wait_group 0;\n");
         __syncwarp();
-        if (kb + 64 < k1) {
-            int i = 0;
-            for (int t = lane; t < 128; t += 32, i++) {
-                const int proj = t >> 6, off = t & 63;
-                const int row = off >> 2, col = (off & 3) * 16;
-                pf[i] = *reinterpret_cast<const uint4*>(
-                    (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + kb + 64 + col);
-            }
-        }
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
         #pragma unroll
         for (int kk = kb; kk < kb + 64; kk += 32) {
             const int kkl = kk - kb;
             unsigned ba[4];  // A fragments from this warp's padded smem slice
-            ba[0] = *(const unsigned*)(sa[warp] + (size_t)r0 * SA_STRIDE + kkl + c0);
-            ba[1] = *(const unsigned*)(sa[warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
-            ba[2] = *(const unsigned*)(sa[warp] + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
-            ba[3] = *(const unsigned*)(sa[warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
+            ba[0] = *(const unsigned*)(sa[sbuf][warp] + (size_t)r0 * SA_STRIDE + kkl + c0);
+            ba[1] = *(const unsigned*)(sa[sbuf][warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
+            ba[2] = *(const unsigned*)(sa[sbuf][warp] + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
+            ba[3] = *(const unsigned*)(sa[sbuf][warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
             unsigned b1_[4]; // up A fragments
-            b1_[0] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0);
-            b1_[1] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
-            b1_[2] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
-            b1_[3] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
+            b1_[0] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0);
+            b1_[1] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
+            b1_[2] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
+            b1_[3] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
             unsigned b[2];   // B: smem xq (n=8 replica)
             b[0] = *(const unsigned*)(sx + kk + c0);
             b[1] = *(const unsigned*)(sx + kk + c0 + 16);
@@ -3540,7 +3528,11 @@ __global__ void moe_fused_act_fp8_mma_kernel(
             g0 += gd0 * gw_sc; g1 += gd2 * gw_sc;   // (r0, col0), (r0+8, col0)
             u0 += ud0 * uw_sc; u1 += ud2 * uw_sc;
         }
+        // Safe to fill the OTHER buffer now: this iteration's MMA operands are
+        // already in registers.
+        if (kb + 64 < k1) ACT_ISSUE(kb + 64, sbuf ^ 1);
     }
+    #undef ACT_ISSUE
     if ((lane & 3) == 0) {
         sgacc[warp * 16 + r0] = g0;
         sgacc[warp * 16 + r0 + 8] = g1;
