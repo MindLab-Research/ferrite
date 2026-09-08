@@ -3502,6 +3502,7 @@ __global__ void moe_fused_act_fp8_mma_kernel(
                 : "r"(b1_[0]), "r"(b1_[1]), "r"(b1_[2]), "r"(b1_[3]),
                   "r"(b[0]), "r"(b[1]));
         }
+        __syncthreads(); // all warps done reading sa before the next kb stages
         const int kblk = kb >> 7;
         const float gw_sc = gs[gs_ws + kblk];
         const float uw_sc = us[gs_ws + kblk];
