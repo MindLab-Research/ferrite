@@ -1083,26 +1083,35 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
         ch[j] = sm[j] + bias[j];
     __syncthreads();
     // selection sort topk on the choice scores (small e in v1; bitonic later)
+    // 256 threads (8 warps): each round's scan over e=288 is 2 iterations
+    // instead of 9 with a single warp. Warp reduce + one smem cross-warp step.
+    __shared__ int wbest[8];
+    __shared__ float wval[8];
     for (int r = 0; r < topk; r++) {
         int best = -1;
         float bv = -1e30f;
         for (int j = threadIdx.x; j < e; j += blockDim.x) {
             if (ch[j] > bv) { bv = ch[j]; best = j; }
         }
-        // WARP-shuffle reduce (the block is ONE warp / 32 threads): the old
-        // smem version did 5 __syncthreads per round (8 rounds = 40 barriers)
-        // and wrote bidx[threadIdx.x] past its [32] bound.
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
             const float ov = __shfl_down_sync(0xffffffff, bv, off);
             const int oi = __shfl_down_sync(0xffffffff, best, off);
             if (ov > bv) { bv = ov; best = oi; }
         }
+        const int wid = threadIdx.x >> 5;
+        if ((threadIdx.x & 31) == 0) { wbest[wid] = best; wval[wid] = bv; }
+        __syncthreads();
         if (threadIdx.x == 0) {
-            ids[(size_t)row * topk + r] = (float)best;
-            ch[best] = -1e30f; // remove
+            int bi = -1;
+            float bvv = -1e30f;
+            for (int w = 0; w < (int)(blockDim.x >> 5); w++) {
+                if (wval[w] > bvv) { bvv = wval[w]; bi = wbest[w]; }
+            }
+            ids[(size_t)row * topk + r] = (float)bi;
+            ch[bi] = -1e30f; // remove
         }
-        __syncthreads(); // ch[best] must be visible to all lanes next round
+        __syncthreads(); // ch[best] must be visible to all threads next round
     }
     // renorm pass (block-wide: 2 passes over topk + block reduce). Was a
     // single-thread loop over topk=2048 (~4.5µs x 42 calls/step = 0.19ms).
@@ -1279,7 +1288,7 @@ extern "C" cudaError_t ferrite_router_gemm_route_fused(
 extern "C" cudaError_t ferrite_moe_route(const float* logits, const float* bias,
                                         float* probs, float* ids, int n, int e,
                                         int topk, float scale, cudaStream_t s) {
-    dim3 block(32);
+    dim3 block(256);   // 8 warps: the top-k scan over e is 2 iters/round vs 9
     dim3 grid(n);
     size_t smem = 2 * (size_t)e * sizeof(float);
     moe_route_kernel<<<grid, block, smem, s>>>(logits, bias, probs, ids, n, e, topk, scale);
