@@ -3201,10 +3201,15 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // (128KB/block) reaches 22GB/s/SM. Processing MAXN tokens per block
     // amortizes that latency MAXN-fold; `part` holds the per-token partials.
     const int MAXN = 64;
+    const int TT = 4; // tokens per block (middle ground: 512 blocks gave too
+                      // little parallelism per SM, 8192 paid the fixed
+                      // per-block latency 16x)
     __shared__ float part[MAXN][8][16]; // [tok][h row][slot]
     int j = warp;
-    for (int base = 0; base < nt; base += MAXN) {
-        const int cnt = (nt - base < MAXN) ? (nt - base) : MAXN;
+    const int t0 = blockIdx.y * TT;
+    const int t1 = (t0 + TT < nt) ? (t0 + TT) : nt;
+    for (int base = t0; base < t1; base += MAXN) {
+        const int cnt = ((t1 - base) < MAXN) ? (t1 - base) : MAXN;
         if (j <= topk) {
         float py[8];
         for (int tt = 0; tt < cnt; tt++) {
@@ -3349,9 +3354,9 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
         return cudaGetLastError();
     }
     dim3 block(288); // 9 warps: topk routed (8) + shared
-    // grid.y == 1: each block now loops over ALL tokens (see the kernel's
-    // MAXN chunking) to amortize the fixed per-block latency.
-    dim3 grid((hidden + 7) / 8, 1, 1);
+    // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
+    // (one token) paid the fixed per-block latency 16x.
+    dim3 grid((hidden + 7) / 8, (n + 3) / 4, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
@@ -5698,9 +5703,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         // (constant within the 16-lane step; k%16==0 keeps the step inside
         // one block).
         int k = k0 + lane * 16;
-        // unroll 4: each iteration has ONE 16-byte weight load + 4 x-loads;
-        // unroll 2 left only ~2 in flight per warp (latency-bound GEMV).
-        #pragma unroll 4
+        #pragma unroll 2
         for (; k + 15 < k1; k += 32 * 16) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
