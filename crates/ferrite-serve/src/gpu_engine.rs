@@ -117,14 +117,12 @@ impl GpuEngine {
 
     /// Release the seq's GPU state + drop the arena entry (idempotent).
     fn free(&mut self, seq: SeqId) {
-        // The batched graph's captured kernel args embed the member seqs'
-        // per-seq state pointers ((seq, layer) GDN states, (seq, family) DSA
-        // caches) — free_seq releases those. Destroy the graph BEFORE the
-        // states go away (a replay after free = use-after-free on the GPU).
-        // The next tick captures fresh for the new composition.
-        if let Some(name) = self.batch_graph.take() {
-            self.cluster.destroy_batch_graph(&name);
-        }
+        // KEEP the per-size batched graphs across retires: the kernel args
+        // reference the per-size POINTER TABLES (content-refreshed each
+        // replay), not embedded seq pointers — a retired seq's slots are
+        // simply overwritten on the next refresh. Destroying here forced a
+        // 1-2s re-capture every membership change.
+        // (free_seq still releases the seq's own GDN states / DSA caches.)
         // Read the params immutably, snapshot the output (needs &self),
         // then free the GPU state + update the arena (&mut self) —
         // sequenced to avoid the borrow conflict.
@@ -274,9 +272,10 @@ impl ServeEngine for GpuEngine {
                     // gdn_layer_dev_batched n==1 alignment (fused
                     // gemv_tri/gemv_qkv_conv) closes most of that gap —
                     // FERRITE_FORCE_BATCHED_B1=1 re-tests the batched path.
-                    if let Some(old) = self.batch_graph.take() {
-                        self.cluster.destroy_batch_graph(&old);
-                    }
+                    // KEEP the per-size batched graphs (the tables are
+                    // content-refreshed, no embedded seq pointers) —
+                    // destroying here forces a 1-2s re-capture when
+                    // concurrency returns.
                     self.cluster.decode_step(live_seqs[0])?;
                 } else {
                     // SGLang-style batch-size keying: tp.rs pads to
