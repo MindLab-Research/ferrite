@@ -3084,12 +3084,15 @@ __global__ void moe_fused_act_fp8_mma_kernel(
             amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
         if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = amax;
         __syncthreads();
-        if (threadIdx.x < 8) {
-            float m = sred[threadIdx.x];
+        // NOTE: the 8-warp final max is a serial loop on thread 0 — a
+        // __shfl_down_sync inside an if(tid<8) branch is a full-mask shuffle
+        // with only 8/32 lanes present = warp deadlock on sm_103a (this
+        // exact bug hung the decode graph for 11 minutes before the kill).
+        if (threadIdx.x == 0) {
+            float m = sred[0];
             #pragma unroll
-            for (int off = 4; off > 0; off >>= 1)
-                m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
-            if (threadIdx.x == 0) sxs[0] = m / 448.0f;
+            for (int w = 1; w < 8; w++) m = fmaxf(m, sred[w]);
+            sxs[0] = m / 448.0f;
         }
         __syncthreads();
         const float inv = 1.0f / sxs[0];
@@ -5191,17 +5194,19 @@ __global__ void gemv_fp8_mma_kernel(
             amax = fmaxf(amax, fabsf(x[k]));
         // v2: warp-shuffle max + 2-level smem (was a 128→1 tree with one
         // __syncthreads PER level — 8 serialized barriers per block).
+        // The 8-warp final max is SERIAL on thread 0: a __shfl_down_sync
+        // inside an if(tid<8) branch is a full-mask shuffle with 8/32 lanes
+        // present = warp deadlock on sm_103a.
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
         if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = amax;
         __syncthreads();
-        if (threadIdx.x < 8) {
-            float m = sred[threadIdx.x];
+        if (threadIdx.x == 0) {
+            float m = sred[0];
             #pragma unroll
-            for (int off = 4; off > 0; off >>= 1)
-                m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
-            if (threadIdx.x == 0) sxs[0] = m / 448.0f;
+            for (int w = 1; w < 8; w++) m = fmaxf(m, sred[w]);
+            sxs[0] = m / 448.0f;
         }
         __syncthreads();
         const float inv = 1.0f / sxs[0];
