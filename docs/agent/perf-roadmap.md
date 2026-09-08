@@ -1,0 +1,66 @@
+# 16-seq decode 性能路线图（2026-09-08 会话结论）
+
+## 目标与现状
+
+- 目标：16 并发、**不开 MTP**、decode ≥ **1600 tok/s**（SGLang 同配置实测）。开 MTP 则目标 3200。
+- 现状（已人眼验证文本）：
+  - 300-token 窗口：**17.42 ms/步 = 918.5 tok/s**
+  - 1000-token 窗口：**18.90 ms/步 = 846 tok/s**（DSA/attention 的 O(t) 增长，-8%）
+- 本会话进度：546 → 918.5 tok/s（**+68%**）。
+
+## 两条决定性实测（不要再重复验证）
+
+1. **通信（AR）只占 7%**：同 build 同负载，`FERRITE_AR_SKIP=1` → 16.4 ms/步；带 P2P AR → 17.6 ms/步。
+   nsys 里 `p2p_ar_publish` 17.6% 是 **capture/dry-run 期自旋超时的假象**（max≈49.5ms，稳态中位 5.1µs）。
+   AR 的 3-kernel 结构**不可省**：并进 store 需要 655K 线程各一次 `__threadfence_system()`（≈2ms/AR）；
+   并进 reduce 丢 acquire 语义（实测乱码，加 fence 仍乱码）。
+2. **延迟受限，不是带宽受限**：8 seqs = 16.30 ms，16 seqs = 17.42 ms（token 翻倍只 +7%）。
+   → "减字节"类优化（tiled GEMM、row-major 权重共享）**全部无效**；"重叠延迟"类有效。
+   → 每个 kernel 只跑在 DRAM/指令峰值的 30-50%，要 1.75x 必须逐 kernel 做 2x。
+
+## 每步分解（nsys 稳态，16 seqs）
+
+| kernel | ms/步 | 备注 |
+|---|---|---|
+| moe_fused_act_fp8_mma | 2.8 | fp8 MMA，n=8 的 B 是同一 x 复制 8 份（8x MMA 浪费，但 MMA 非瓶颈） |
+| hc（mix 1.04 + rest345 1.34 + post） | 2.4 | 270 node/步 |
+| gemv_fp8_v2 | 2.2 | 已做 T=2 M 维复用 |
+| moe_fused_down_sum_fp8 | 2.1 | 16B lane，TT=4 tokens/block |
+| gdn_chunk + gdn_step | 1.6 | grid(B, h) 并行度已足够 |
+| matmul/cuBLAS | 1.5 | |
+| attention（indexer+sparse+kpool） | 1.4 | |
+| P2P AR | 1.2 | 3 kernel × 90 次/步 |
+| misc（norm/rope/cast/route） | 2.0 | |
+
+## 已排除的方向（有数据，勿重试）
+
+- expert-grouped MoE：16 token × topk 8 = 128 次赋值覆盖 ~104 个专家 → 冗余仅 **1.23x**，
+  收益 <3%，不值 200+ 行重写（含 MMA 的 B fragment 按 token 重排）。
+- gemv WPR=2（17.87）、gemv 内层 unroll 4（17.67）、hc_pre_mix 8 行（17.74）、
+  act 双 tile 预取（19.6，pf[8] 压占用）、gemv T=4（err 700）、moe_down half2（速度中性但改行为）。
+- 32-seq 的 5x 异常（90ms）：不在层内，`FERRITE_TIMING` 的 `at=` 在 16/32 seqs 下都是 22-24ms，
+  证明该指标是 host 侧 launch+sync 墙钟（超估 10-20x），不能当 GPU 时间。
+
+## 下一步候选（按预期收益）
+
+1. **act kernel 的 staging 指令数**：每 64-K tile 每 lane 约 4 global load + 4 smem store +
+   16 fragment load + 2 MMA。用 `ldmatrix.sync.aligned.m8n8.x4` 替换 fragment 的逐 4B 读
+   （16 → 2 条），预计省 ~5% 指令；若能把 global load 直接排成 fragment 布局可去掉 smem
+   staging（但会破坏合并访存，需实测）。
+2. **act 的 shared-expert slot M 维复用**：shared 专家权重对 16 token 相同，可套用 gemv 的
+   T=2/T=4 复用（只占 act 的 1/9 工作量，收益有限）。
+3. **hc 三 kernel 融合**：mix → rest345 目前靠 stream 顺序保证依赖（rest345 读 mx_partial +
+   ctr2）。融合需要 grid 级同步（cooperative groups）或让 rest 块自旋等 ctr2——注意
+   HC_P345_NB 不可动（>16 乱码）。
+4. **attention 的依赖链**：sparse_attn 的 live_k 边界已做；indexer 短上下文快路径已做。
+   长上下文（>2048 pool）会退到 O(k·n) 选择，届时优先做基数选择/bitonic。
+5. **AR 49µs → <15µs**（只值 1.2ms，优先级低）：3 → 2 个 graph node 或合并 reduce 都试过失败，
+   结构性做法只剩 EP（FFN 不用 TP）或 AR/计算 overlap。
+
+## 测试纪律（血泪）
+
+- 每次改完**先看 `bash build.sh 103a` 的 error 数**：本会话两次编译失败却测到旧 `.so`（假结果）。
+- 每次必须人眼验证文本（`/tmp/txtcheck.py`）：`!!!!!`、`<think` 开头、EOS 都是回归信号。
+  数值改动即使误差估计够小也可能越过 logit 决策边界（moe_down half2 实测）。
+- GPU 崩溃（err 700）后**必须 kill + 等 30s + 确认 `nvidia-smi --query-compute-apps` 为空**，
+  否则残留进程的坏 context 会给出错误的性能读数（本会话踩过）。
