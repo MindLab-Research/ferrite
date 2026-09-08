@@ -4293,7 +4293,9 @@ __global__ void sparse_attn_v2_batched_kernel(
             const float4* k4 = reinterpret_cast<const float4*>(k_s + ((size_t)j * h + hd) * d);
             float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
             for (int l = lid * 4; l + 3 < d; l += TG * 4) {
-                float4 kk = k4[l >> 2];
+                float4 kk;
+                asm volatile("ld.global.nc.L2::128B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
+                             : "=f"(kk.x), "=f"(kk.y), "=f"(kk.z), "=f"(kk.w) : "l"(k4 + (l >> 2)));
                 float4 qq = *reinterpret_cast<const float4*>(qs + l);
                 acc.x += qq.x * kk.x; acc.y += qq.y * kk.y; acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
             }
