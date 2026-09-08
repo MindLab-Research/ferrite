@@ -5732,7 +5732,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     if (WPR == 1) {
         if (lane == 0 && rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + acc;
     } else {
-        __shared__ float part[16];
+        __shared__ float part[32];
         if (lane == 0) part[warp] = acc;
         __syncthreads();
         if (warp % WPR == 0 && lane == 0) {
@@ -5752,9 +5752,9 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
     long total = (long)nrows * out_f;
     constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
-    const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
+    const int rpb = 1024 / 32 / WPR;       // rows per block (32 warps / 4 = 8)
     dim3 grid((unsigned)((total + rpb - 1) / rpb));
-    dim3 block(256);
+    dim3 block(1024);
     gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
                                                    in_f, out_f, nrows, srows, scols);
     return cudaGetLastError();
