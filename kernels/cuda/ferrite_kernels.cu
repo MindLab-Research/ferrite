@@ -700,33 +700,31 @@ extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         if (e != cudaSuccess) return e;
     }
-    for (int t = 0; t < n; t++) {
-        dim3 block(512);
-        dim3 grid(1, h, 1);
-        const float* qt = q + (size_t)t * h * dk;
-        const float* kt = k + (size_t)t * h * dk;
-        const float* vt = v + (size_t)t * h * dv;
-        const float* betat = beta + (size_t)t * h;
-        const float* gatet = gate + (size_t)t * h * dk;
-        float* ot = out + (size_t)t * h * dv;
-        if (ferrite_pdl_enabled()) {
-            // PDL: launch with programmatic stream serialization — this kernel's
-            // prologue overlaps the upstream (conv_prep_fused) tail; its
-            // cudaGridDependencySynchronize() gates the actual data reads.
-            cudaLaunchConfig_t cfg = {};
-            cfg.gridDim = grid; cfg.blockDim = block;
-            cfg.dynamicSmemBytes = smem; cfg.stream = s;
-            cudaLaunchAttribute attrs[1];
-            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            attrs[0].val.programmaticStreamSerializationAllowed = 1;
-            cfg.attrs = attrs; cfg.numAttrs = 1;
-            cudaLaunchKernelEx(&cfg, gdn_step_v2_kernel,
-                               qt, kt, vt, betat, gatet, a_log, state, ot,
-                               1, h, dk, dv);
-        } else {
-            gdn_step_v2_kernel<<<grid, block, smem, s>>>(qt, kt, vt, betat, gatet,
-                                                          a_log, state, ot, 1, h, dk, dv);
-        }
+    // ONE launch for all n tokens: the kernel indexes t = blockIdx.x with
+    // ABSOLUTE offsets (q[(t*h+hd)*dk + i] etc.), so the old per-token loop
+    // only created n launches of h blocks each (B=16 -> 16 launches x 64
+    // blocks = 12% GPU occupancy). grid(n, h, 1) is the same math.
+    dim3 block(512);
+    dim3 grid(n, h, 1);
+    if (ferrite_pdl_enabled()) {
+        // PDL: launch with programmatic stream serialization — this kernel's
+        // prologue overlaps the upstream (conv_prep_fused) tail; its
+        // cudaGridDependencySynchronize() gates the actual data reads.
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid; cfg.blockDim = block;
+        cfg.dynamicSmemBytes = smem; cfg.stream = s;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, gdn_step_v2_kernel,
+                           q, k, v, beta, gate, a_log, state, out,
+                           n, h, dk, dv);
+    } else {
+        gdn_step_v2_kernel<<<grid, block, smem, s>>>(q, k, v, beta, gate,
+                                                     a_log, state, out, n, h, dk, dv);
+    }
+    {
         cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) return e;
     }
