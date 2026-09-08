@@ -3466,16 +3466,40 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     // conflict on the fragment reads) — 80 gives banks 0,20,8,28,16,4,24,12.
     const int SA_STRIDE = 80;
     __shared__ unsigned char sa[8][2 * 16 * 80];
-    for (int kb = k0; kb < k1; kb += 64) {
-        for (int t = lane; t < 128; t += 32) {
-            const int proj = t >> 6;              // 0: gate, 1: up
-            const int off = t & 63;
+    // SOFTWARE PIPELINE: prefetch the next 64-K tile into registers BEFORE the
+    // MMA block, so the global-load latency overlaps the tensor-core work.
+    // Without it each warp ran 8 sequential (load-latency -> MMA) rounds and
+    // the kernel was latency-bound (the step time barely changed from 8 to 16
+    // seqs, i.e. it is NOT bandwidth-bound).
+    uint4 pf[4];
+    {
+        int i = 0;
+        for (int t = lane; t < 128; t += 32, i++) {
+            const int proj = t >> 6, off = t & 63;
             const int row = off >> 2, col = (off & 3) * 16;
-            const unsigned char* src = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + kb + col;
-            *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) =
-                *reinterpret_cast<const uint4*>(src);
+            pf[i] = *reinterpret_cast<const uint4*>(
+                (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + k0 + col);
+        }
+    }
+    for (int kb = k0; kb < k1; kb += 64) {
+        {
+            int i = 0;
+            for (int t = lane; t < 128; t += 32, i++) {
+                const int proj = t >> 6, off = t & 63;
+                const int row = off >> 2, col = (off & 3) * 16;
+                *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) = pf[i];
+            }
         }
         __syncwarp();
+        if (kb + 64 < k1) {
+            int i = 0;
+            for (int t = lane; t < 128; t += 32, i++) {
+                const int proj = t >> 6, off = t & 63;
+                const int row = off >> 2, col = (off & 3) * 16;
+                pf[i] = *reinterpret_cast<const uint4*>(
+                    (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + kb + 64 + col);
+            }
+        }
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
         #pragma unroll
