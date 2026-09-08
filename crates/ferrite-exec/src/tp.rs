@@ -936,6 +936,27 @@ impl<B: KernelBackend> TpCluster<B> {
             .map(|c| c.graph_io_get(&gname).is_some())
             .unwrap_or(false);
         if !have_graph {
+            // Cross-rank barrier BEFORE the dry-run: the capture path is
+            // serialized by capture_lock and each rank's P2P AR epoch counter
+            // must start in lockstep — measured: dev0 entered the dry-run 36
+            // AR epochs behind its peers and the flag wait deadlocked (dev0
+            // stuck at L0 while dev1-7 were at L35).
+            if let Some(nccl) = &self.nccl {
+                let mut bufs = Vec::with_capacity(nccl.len());
+                for (k, ch) in nccl.iter().enumerate() {
+                    if let Some(cuda) = self.shards[k].backend.as_cuda() {
+                        let b = ferrite_kernel::cuda::DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
+                        ch.all_reduce_f32(b.as_const_f32(), b.as_f32(), 1)?;
+                        bufs.push(b);
+                    }
+                }
+                for k in 0..self.shards.len() {
+                    if let Some(cuda) = self.shards[k].backend.as_cuda() {
+                        cuda.sync()?;
+                    }
+                }
+                drop(bufs);
+            }
             // Capture path: dry-run (REAL execution — warms every pool class,
             // creates every (seq, layer/family) state, advances every seq's
             // DSA t_count + GDN states; returns the step's B tokens) then
