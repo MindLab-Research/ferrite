@@ -3238,10 +3238,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             klen = inter_shared;
         }
         if (klen > 0) {
-            // REGISTER-CACHE the act row: with 8 bytes per lane, each lane needs
-            // only 8 floats (2 float4) — 8 registers instead of the old 48,
-            // which lifts occupancy, and ALL 32 lanes are active (the old
-            // 16B/lane mapping left lanes 16-31 idle for klen=256).
+            // REGISTER-CACHE the act row (8 floats/lane = 2 float4)
             float4 ar[2];
             {
                 const float4* a4 = reinterpret_cast<const float4*>(aj);
@@ -3250,30 +3247,43 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 ar[0] = (idx < f4) ? a4[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
                 ar[1] = (idx + 1 < f4) ? a4[idx + 1] : make_float4(0.f, 0.f, 0.f, 0.f);
             }
-            // UNROLLED h loop (no `break`, so the compiler can really unroll and
-            // keep several independent row loads in flight — with the break the
-            // pragma was ignored and only 256B was in flight per warp).
+            // PREFETCH all 8 rows' weight bytes into registers BEFORE any
+            // math. Measured 0.11 sectors/cycle/SM (a saturated SM does ~1):
+            // only ONE load was in flight per warp — the compiler serialized
+            // the rows behind their dependency chains.
+            const int i0 = lane * 8;
+            uint2 dv8[8];
+            #pragma unroll
+            for (int hh = 0; hh < 8; hh++) {
+                dv8[hh] = (i0 + 7 < klen)
+                    ? *reinterpret_cast<const uint2*>(dbase + (size_t)(h0 + hh) * klen + i0)
+                    : make_uint2(0u, 0u);
+            }
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
-                float y = 0.f;
-                // NO h<hidden guard around the loads: the conditional blocked
-                // the compiler from hoisting the 8 rows' loads (each iteration
-                // waited on the previous one's dependency chain). h < hidden
-                // always holds (grid.x = ceil(hidden/8)); a stray read would
-                // land in the next expert's rows and is discarded by the
-                // guarded store below.
-                {
-                const unsigned char* dwr = dbase + (size_t)h * klen;
                 const float* dsr = dsr_base + (size_t)(h >> 7) * dscols;
-                int i = lane * 8;
-                for (; i + 7 < klen; i += 32 * 8) {
-                    const uint2 dv = *reinterpret_cast<const uint2*>(dwr + i);
-                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
-                    const float ds_c = dsr[i >> 7];
-                    // this lane's act floats: aj[i .. i+7] == ar[0], ar[1]
+                float y = 0.f;
+                int i = i0;
+                if (i + 7 < klen) {
+                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv8[hh]);
                     const float xv[8] = {ar[0].x, ar[0].y, ar[0].z, ar[0].w,
                                          ar[1].x, ar[1].y, ar[1].z, ar[1].w};
+                    const float ds_c = dsr[i >> 7];
+                    #pragma unroll
+                    for (int p = 0; p < 4; p++) {
+                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + p * 2);
+                        const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                        y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
+                    }
+                    i += 32 * 8;
+                }
+                for (; i + 7 < klen; i += 32 * 8) {
+                    const uint2 dv = *reinterpret_cast<const uint2*>(dbase + (size_t)h * klen + i);
+                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+                    const float xv[8] = {ar[0].x, ar[0].y, ar[0].z, ar[0].w,
+                                         ar[1].x, ar[1].y, ar[1].z, ar[1].w};
+                    const float ds_c = dsr[i >> 7];
                     #pragma unroll
                     for (int p = 0; p < 4; p++) {
                         const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + p * 2);
@@ -3282,13 +3292,9 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     }
                 }
                 for (; i < klen; i++) {
-                    y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
+                    y += (__half2float(__nv_cvt_fp8_to_halfraw(dbase[(size_t)h * klen + i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
                 }
-                }
-                py[hh] = y; // per-LANE partial (the shuffle reduction moves
-                            // OUT of the row loop: interleaving it after every
-                            // row serialized the next row's loads — the kernel
-                            // ran at 8% of the ALU/BW roofline, latency-bound)
+                py[hh] = y;
             }
             // shuffle-reduce the 8 rows' per-lane partials (batched: all row
             // loads are already in flight, so this no longer stalls them)
