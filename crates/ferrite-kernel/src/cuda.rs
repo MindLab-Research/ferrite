@@ -2744,14 +2744,19 @@ impl CudaBackend {
             }
         }
         let b = size * std::mem::size_of::<*mut f32>();
-        ck(
-            unsafe { cudaMemcpyAsync(c_tbl, conv_ptrs.as_ptr() as *const _, b, CUDA_MEMCPY_H2D, self.stream) },
-            "gdn tbl update",
-        )?;
-        ck(
-            unsafe { cudaMemcpyAsync(g_tbl, gdn_ptrs.as_ptr() as *const _, b, CUDA_MEMCPY_H2D, self.stream) },
-            "gdn tbl update",
-        )?;
+        // Capture must NOT enqueue an async H2D: the source is a stack Vec,
+        // so a captured memcpy NODE would replay against freed memory
+        // (Xid 13 Out-Of-Range — measured). Sync copy inside capture, async
+        // on the replay path.
+        let upd = |dst: *mut std::ffi::c_void, src: *const std::ffi::c_void| -> Result<()> {
+            if self.capturing() {
+                ck(unsafe { cudaMemcpy(dst, src, b, CUDA_MEMCPY_H2D) }, "gdn tbl capture copy")
+            } else {
+                ck(unsafe { cudaMemcpyAsync(dst, src, b, CUDA_MEMCPY_H2D, self.stream) }, "gdn tbl update")
+            }
+        };
+        upd(c_tbl, conv_ptrs.as_ptr() as *const _)?;
+        upd(g_tbl, gdn_ptrs.as_ptr() as *const _)?;
         Ok((c_tbl as *const *mut f32, g_tbl as *const *mut f32))
     }
 
@@ -2850,8 +2855,14 @@ impl CudaBackend {
                 totp.push(dtot);
             }
         }
+        // capture-aware (see gdn_state_tables): a captured async H2D would
+        // replay against the stack Vec → Xid 13.
         let up = |dst: *mut std::ffi::c_void, src: *const std::ffi::c_void| -> Result<()> {
-            ck(unsafe { cudaMemcpyAsync(dst, src, b, CUDA_MEMCPY_H2D, self.stream) }, "dsa tbl update")
+            if self.capturing() {
+                ck(unsafe { cudaMemcpy(dst, src, b, CUDA_MEMCPY_H2D) }, "dsa tbl capture copy")
+            } else {
+                ck(unsafe { cudaMemcpyAsync(dst, src, b, CUDA_MEMCPY_H2D, self.stream) }, "dsa tbl update")
+            }
         };
         up(t.kn, kn.as_ptr() as *const _)?;
         up(t.v, vv.as_ptr() as *const _)?;
