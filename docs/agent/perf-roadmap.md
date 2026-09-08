@@ -387,3 +387,9 @@ unroll 4 时已经饱和（5 load/轮 × 4 = 20 个在飞），再加只增寄�
 
 每轮 2 个独立 float4 load（smem q + global pool key）。加 unroll 后 16.27-16.31ms（981-983），
 与基线重合 → 保留（原理正确）。该 kernel 本身只有 0.4ms/步，收益空间本来就小。
+
+### 有效：router gemm 的 4 路累加器（+0.7%）
+
+`router_gemm_route_fused_kernel` 的内层是**每线程 512 次迭代全部加到单个 `acc`** 的串行链
+（hidden/8 = 512，blockDim=256）。拆成 4 路后：16.27 → **16.16-16.17ms（989.7-990.3 tok/s）**，
+文本正确。这是本会话"单累加器点积"审计的第 3 个命中（前两个：GDN 6 处 +0.5%、gemv half2 双链 +0.1%）。
