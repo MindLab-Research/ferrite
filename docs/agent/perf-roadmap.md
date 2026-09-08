@@ -224,3 +224,20 @@ GDN 的 6 处 dot（`for (i<dk) acc += k[i] * S[i*stride + j]`）是**串行 FMA
 
 **可复用判据**：`grep -n "for (int i = 0; i < .*; i++) acc +=" ferrite_kernels.cu` —— 任何单累加器
 的 fp32 点积循环都是候选（`#pragma unroll` 只能重叠 load，不能打破累加依赖）。
+
+### 串行 FMA 链审计的完整结果（2026-09-08）
+
+对全部单累加器 fp32/half2 点积做了 4/2 路拆分（`grep -n "for (int i = 0; i < .*; i++) acc +="`）：
+| 位置 | 结果 |
+|---|---|
+| GDN 的 6 处 dot（`acc += k[i]*S[i*stride+j]`） | **+0.5%**（16.47→16.41ms） |
+| gemv 的 8 深 half2 链 | +0.1%（16.41→16.37ms） |
+| hc_pre_rest345 的 P1/P3 | 中性 |
+| moe_down 的 16 深 fp8 链 | 中性 |
+
+累计 960 → **977 tok/s**。结论：只有**纯串行且循环体很小**的 dot（GDN 那种）才吃这个优化；
+其余 kernel 的瓶颈在内存延迟，拆链无效（与 ldmatrix 的结论一致）。
+
+**踩坑记录**：moe_down 的补丁第一次用了 `y1` 变量名，与函数里已有的 `const float y1 = __shfl_sync(...)`
+冲突 → **编译失败但 serve 用旧 .so 继续跑**，测出 981 tok/s 的假象。改名 `ya/yb` 后正常。
+**再次验证铁律：每次必须看 build 的 error 数。**
