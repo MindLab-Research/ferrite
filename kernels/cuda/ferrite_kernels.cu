@@ -4843,7 +4843,8 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     if (e != cudaSuccess) return e;
 
     dim3 p345_grid(s, NB);
-    size_t smem_r = (size_t)(mix + n * n + n + 48 + n * hpb) * sizeof(float);  // + xs staging
+    const int hpb_l = (h + 15) / 16;   // must match the kernel's hpb (NB=16)
+    size_t smem_r = (size_t)(mix + n * n + n + 48 + n * hpb_l) * sizeof(float);  // + xs staging
     if (ferrite_pdl_enabled()) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = p345_grid; cfg.blockDim = dim3(256);
