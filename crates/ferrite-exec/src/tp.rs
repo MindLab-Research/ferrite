@@ -2638,8 +2638,8 @@ fn mega_chain_dev(
 
     let mut gdn_idx = 0usize; // verify scratch index (GDN layers only)
     for (layer_idx, plan) in plans.iter().enumerate() {
-        if capture && dev_id == 0 {
-            eprintln!("[megab-cap] L{layer_idx}");
+        if std::env::var_os("FERRITE_TIMING").is_some() {
+            eprintln!("[megab-cap] dev{dev_id} cap={capture} L{layer_idx}");
         }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
@@ -3035,8 +3035,8 @@ fn mega_chain_dev_batched(
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
 
     for (layer_idx, plan) in plans.iter().enumerate() {
-        if capture && dev_id == 0 {
-            eprintln!("[megab-cap] L{layer_idx}");
+        if std::env::var_os("FERRITE_TIMING").is_some() {
+            eprintln!("[megab-cap] dev{dev_id} cap={capture} L{layer_idx}");
         }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
