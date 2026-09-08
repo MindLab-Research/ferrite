@@ -1196,6 +1196,101 @@ impl<B: KernelBackend> TpCluster<B> {
                 .into_iter()
                 .collect::<Result<Vec<Vec<f32>>>>()?;
                 eprintln!("[mega] MTP: verify graph {gv} captured (n={n_v} = FERRITE_MTP_N, GDN ping-pong scratch)");
+                // DRAFT GRAPHS (FERRITE_DRAFT_GRAPH=1, default): capture the
+                // per-draft chain mega_d{seq}_{i} (cast_store → embed_one_dev
+                // → the full mtp_forward layer chain → argmax). The steady
+                // mtp_step replays them (H2D 4B + advance(1) + one launch
+                // per draft) instead of the host-serialized chain (~0.8ms/
+                // draft of kernel launches + host embed + staging at 4 ranks).
+                // Sequence per rank: DRY (real execution — pool warm, MtpState
+                // bufs seeded, d_argmax/h_d written) → rollback(nd) → CAPTURE
+                // ×nd (records only; the dsa host bookkeeping +1 per draft
+                // runs, pinned t0 writes are valueless at capture) →
+                // rollback(nd) (the capture pass executed nothing; t must
+                // return to the pre-dry T so the first steady step's
+                // advance(1) pins t0=T). The dry appends are the first step's
+                // correct KV (same inputs: last, hf-seeded hprev, catch-up
+                // cache) — the first replay overwrites them bit-identically.
+                if std::env::var_os("FERRITE_DRAFT_GRAPH").map_or(true, |v| v != "0") {
+                    let nd = n_v - 1;
+                    // dry: tokens_dev[0] ← last, then the nd-step chain (real
+                    // execution — P2P ARs rendezvous, dsa appends at T..T+nd-1)
+                    Self::fan_out(&mut self.shards, |s| {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?;
+                        cuda.enter();
+                        let tokens_ptr = {
+                            let m = cuda.mtp.lock().unwrap();
+                            let m = m
+                                .as_ref()
+                                .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                            m.tokens_dev.as_f32() as *mut i32
+                        };
+                        let last_i32 = last as i32;
+                        let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                            tokens_ptr, &last_i32, 1, cuda.stream_handle());
+                        if r != 0 {
+                            return Err(FerriteError::InvalidArg(format!("tokens_dev[0] H2D: {r}")));
+                        }
+                        for i in 0..nd {
+                            draft_step_dev(s, seq, i, nd)?;
+                        }
+                        Ok::<(), FerriteError>(())
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
+                    // rollback(nd) + capture ×nd + rollback(nd) — the same
+                    // fan_out (host-side dsa bookkeeping + capture_lock
+                    // serializes the per-rank graph instantiations, the
+                    // mega_v pattern).
+                    Self::fan_out(&mut self.shards, |s| {
+                        let mtp_family = s
+                            .cfg
+                            .layer_types
+                            .iter()
+                            .filter(|t| matches!(t, ferrite_model::LayerType::DeepseekSparseAttention))
+                            .count();
+                        s.backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                            .enter();
+                        s.backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                            .dsa_host_rollback(seq, mtp_family, nd);
+                        let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
+                        for i in 0..nd {
+                            // per-iteration borrows: draft_step_dev takes &mut s
+                            // (graph_capture_begin/end only need &CudaBackend).
+                            s.backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                                .graph_capture_begin();
+                            draft_step_dev(s, seq, i, nd)?;
+                            s.backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                                .graph_capture_end(&format!("mega_d{seq}_{i}"));
+                        }
+                        // the capture pass executed NOTHING (record only) but
+                        // each draft's dsa host bookkeeping +1 → t advanced
+                        // nd — roll it back to T (the first steady step's
+                        // advance(1) pins t0=T, the replay overwrites the
+                        // dry's KV bit-identically).
+                        s.backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
+                            .dsa_host_rollback(seq, mtp_family, nd);
+                        Ok::<(), FerriteError>(())
+                    })
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()?;
+                    eprintln!(
+                        "[mega] MTP: draft graphs mega_d{seq}_0..{nd} captured (FERRITE_DRAFT_GRAPH)"
+                    );
+                }
             }
             eprintln!(
                 "[mega] captured {gname}: {} layers, {} NCCL ARs/rank; dry-run {:.1}ms + capture {:.1}ms",
@@ -1312,66 +1407,143 @@ impl<B: KernelBackend> TpCluster<B> {
         //    draft i-1's MTP residual h (EAGLE-style recursion). The i<nd-1
         //    drafts export their h (h_out for the next draft); the last
         //    discards it (verify's hf_v replaces it).
+        //    GRAPH PATH (FERRITE_DRAFT_GRAPH=1, default): the whole draft
+        //    chain replays per-draft graphs mega_d{seq}_{i} — H2D 4B (last) +
+        //    dsa_host_advance(1) + ONE launch per draft (vs ~15 kernel
+        //    launches + host embed + 576KB staging). Host cost ~0.5ms/step.
+        //    Fallback: the original host chain (embed lookup + upload +
+        //    mtp_forward per draft).
+        let graph_drafts = std::env::var_os("FERRITE_DRAFT_GRAPH").map_or(true, |v| v != "0");
         let drafts: Vec<f32> = {
-            let toks = Self::fan_out(&mut self.shards, |s| {
-                let mut drafts: Vec<f32> = Vec::with_capacity(nd);
-                // draft 0's h_prev = MtpState.hprev — its &DevBuf REFERENCE
-                // address (NOT as_f32(): that is the device data pointer;
-                // reinterpreting it as a DevBuf struct reads floats into the
-                // ptr/len/stage fields → garbage → SEGV. The reference is
-                // stable: MtpState outlives the loop and its DevBufs never
-                // move — the same raw-&DevBuf pattern the pre-N code used).
-                let hprev_ref: usize = {
+            let mut graph_ok = false;
+            if graph_drafts {
+                // probe once on rank 0's view (all ranks capture in
+                // lockstep — decode_step_mega's first step captures all nd).
+                let probe = Self::fan_out(&mut self.shards, |s| {
                     let cuda = s
                         .backend
                         .as_cuda()
-                        .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                    let m = cuda.mtp.lock().unwrap();
-                    let m = m
-                        .as_ref()
-                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    &m.hprev as *const DevBuf as usize
-                };
-                // h chain: draft i's h_prev = draft i-1's h_out (a normal
-                // pool-allocated DevBuf, kept alive by ownership — the last
-                // draft exports no h (verify's hf_v commit replaces it).
-                let mut prev_h: Option<DevBuf> = None;
-                let mut prev_tok = last;
-                for i in 0..nd {
-                    let (emb, h_out) = {
+                        .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?;
+                    Ok::<_, FerriteError>(
+                        (0..nd)
+                            .all(|i| cuda.graph_exists(&format!("mega_d{seq}_{i}"))),
+                    )
+                })
+                .into_iter()
+                .collect::<Result<Vec<bool>>>()?;
+                graph_ok = probe.iter().all(|&b| b);
+            }
+            if graph_ok {
+                let toks = Self::fan_out(&mut self.shards, |s| {
+                    let cuda = s
+                        .backend
+                        .as_cuda()
+                        .ok_or_else(|| FerriteError::Config("mtp needs cuda backend".into()))?;
+                    cuda.enter();
+                    let (tokens_ptr, d_base) = {
+                        let m = cuda.mtp.lock().unwrap();
+                        let m = m
+                            .as_ref()
+                            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                        (m.tokens_dev.as_f32() as *mut i32, m.d_argmax_dev.as_f32())
+                    };
+                    // tokens_dev[0] = last — the only host-initiated write
+                    let last_i32 = last as i32;
+                    let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                        tokens_ptr, &last_i32, 1, cuda.stream_handle());
+                    if r != 0 {
+                        return Err(FerriteError::InvalidArg(format!("tokens_dev[0] H2D: {r}")));
+                    }
+                    // per-draft replay: advance(1) pins t0/total for the
+                    // graph's dsa append+query (the kernel reads them
+                    // zero-copy), then ONE graph launch.
+                    for i in 0..nd {
+                        cuda.dsa_host_advance(seq, mtp_family, 1);
+                        let gname = format!("mega_d{seq}_{i}");
+                        if !cuda.graph_replay(&gname) {
+                            return Err(FerriteError::InvalidArg(format!("draft graph {gname} missing")));
+                        }
+                    }
+                    // D2H the draft tokens (nd × 4B — verify input + accept
+                    // decisions; the host-side accept logic consumes them).
+                    let mut d = vec![0f32; nd];
+                    let r = ferrite_kernel::cuda::memcpy_d2h_sync(
+                        d_base as *mut std::ffi::c_void,
+                        d.as_mut_ptr(),
+                        nd,
+                        cuda.stream_handle(),
+                    );
+                    if r != 0 {
+                        return Err(FerriteError::InvalidArg(format!("drafts D2H: {r}")));
+                    }
+                    Ok(d)
+                })
+                .into_iter()
+                .collect::<Result<Vec<Vec<f32>>>>()?;
+                toks[0].clone()
+            } else {
+                // host fallback: the original chain (embed lookup + upload +
+                // mtp_forward per draft — pool h_out relays between drafts).
+                let toks = Self::fan_out(&mut self.shards, |s| {
+                    let mut drafts: Vec<f32> = Vec::with_capacity(nd);
+                    // draft 0's h_prev = MtpState.hprev — its &DevBuf REFERENCE
+                    // address (NOT as_f32(): that is the device data pointer;
+                    // reinterpreting it as a DevBuf struct reads floats into the
+                    // ptr/len/stage fields → garbage → SEGV. The reference is
+                    // stable: MtpState outlives the loop and its DevBufs never
+                    // move — the same raw-&DevBuf pattern the pre-N code used).
+                    let hprev_ref: usize = {
                         let cuda = s
                             .backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                        cuda.enter();
-                        let h2 = s.embed(&[prev_tok as u32]);
-                        let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-                        emb.upload(h2.as_slice())?;
-                        let h_out = if i + 1 < nd {
-                            Some(DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?)
-                        } else {
-                            None
-                        };
-                        (emb, h_out)
-                    }; // cuda dropped — mtp_forward re-acquires internally
-                    let d = match prev_h.as_ref() {
-                        None => {
-                            let hprev: &DevBuf = unsafe { &*(hprev_ref as *const DevBuf) };
-                            mtp_forward(s, seq, &emb, hprev, h_out.as_ref())?
-                        }
-                        Some(ph) => mtp_forward(s, seq, &emb, ph, h_out.as_ref())?,
+                        let m = cuda.mtp.lock().unwrap();
+                        let m = m
+                            .as_ref()
+                            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                        &m.hprev as *const DevBuf as usize
                     };
-                    drafts.push(d);
-                    prev_tok = d as u32;
-                    prev_h = h_out; // draft i's h_out → draft i+1's h_prev
-                }
-                // prev_h ends None (last draft exported no h) — any interim
-                // h_out DevBuf drops back to the pool on the move chain.
-                Ok(drafts)
-            })
-            .into_iter()
-            .collect::<Result<Vec<Vec<f32>>>>()?;
-            toks[0].clone()
+                    // h chain: draft i's h_prev = draft i-1's h_out (a normal
+                    // pool-allocated DevBuf, kept alive by ownership — the last
+                    // draft exports no h (verify's hf_v commit replaces it).
+                    let mut prev_h: Option<DevBuf> = None;
+                    let mut prev_tok = last;
+                    for i in 0..nd {
+                        let (emb, h_out) = {
+                            let cuda = s
+                                .backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                            cuda.enter();
+                            let h2 = s.embed(&[prev_tok as u32]);
+                            let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                            emb.upload(h2.as_slice())?;
+                            let h_out = if i + 1 < nd {
+                                Some(DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?)
+                            } else {
+                                None
+                            };
+                            (emb, h_out)
+                        }; // cuda dropped — mtp_forward re-acquires internally
+                        let d = match prev_h.as_ref() {
+                            None => {
+                                let hprev: &DevBuf = unsafe { &*(hprev_ref as *const DevBuf) };
+                                mtp_forward(s, seq, &emb, hprev, h_out.as_ref())?
+                            }
+                            Some(ph) => mtp_forward(s, seq, &emb, ph, h_out.as_ref())?,
+                        };
+                        drafts.push(d);
+                        prev_tok = d as u32;
+                        prev_h = h_out; // draft i's h_out → draft i+1's h_prev
+                    }
+                    // prev_h ends None (last draft exported no h) — any interim
+                    // h_out DevBuf drops back to the pool on the move chain.
+                    Ok(drafts)
+                })
+                .into_iter()
+                .collect::<Result<Vec<Vec<f32>>>>()?;
+                toks[0].clone()
+            }
         };
         let t_draft = t_d.elapsed();
         let t_v = std::time::Instant::now();
@@ -2085,11 +2257,18 @@ impl<B: KernelBackend> TpCluster<B> {
         for _ in 0..nd {
             emb_devs.push(DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?);
         }
+        // h_d [nd-1] × [hidden]: the draft graphs' h relay (draft i's h_out =
+        // draft i+1's h_prev). Fixed addresses for graph lifetime; the last
+        // draft exports no h (verify's hf_v commit replaces it).
+        let mut h_d = Vec::with_capacity(nd.saturating_sub(1));
+        for _ in 0..nd.saturating_sub(1) {
+            h_d.push(DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?);
+        }
         let d_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), nd.max(1))?;
         *cuda.mtp.lock().unwrap() = Some(MtpState {
             hf_dev, hf_v, hprev, scratch, commit: Some(commit),
             tokens_dev, verify_argmax_dev, k_dev, next_token_dev, n_accepted_dev,
-            emb_devs, d_argmax_dev,
+            emb_devs, h_d, d_argmax_dev,
         });
         Ok(())
     }
@@ -4565,6 +4744,100 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
     std::mem::forget(arg);
     result
 }
+
+/// ONE draft step on device — the graph-capturable unit (mega_d{seq}_{i}).
+/// Chain: [i>0] cast_store(d_{i-1} → tokens_dev[i]) → embed_one_dev
+/// (tokens_dev[i] → emb_devs[i]) → mtp_forward_raw_argmax (h relay:
+/// i=0 reads MtpState.hprev, i>0 reads h_d[i-1]; i<nd-1 exports h to
+/// h_d[i]; argmax → d_argmax_dev[i]). Every buffer is a MtpState fixed
+/// address (stable for the graphs' lifetime); the ONLY host input is
+/// tokens_dev[0] ← last (4B H2D before the i=0 replay).
+///
+/// CAPTURE semantics: the chain is recordable end-to-end — dsa_layer_dev's
+/// kernels read the pinned t0/total zero-copy (dsa_host_advance at replay
+/// writes them), P2P/NCCL ARs are graph-safe (mega_v proven), and the
+/// internal pool bufs leak-not-pool during capture (is_capturing). The
+/// dsa host bookkeeping (t_count += 1) runs during the pass — the caller
+/// rolls back around it (dry → rollback(nd) → capture ×nd).
+///
+/// REPLAY cost per draft: H2D 4B (i=0 only) + advance(1) + ONE graph
+/// launch — replaces ~15 kernel launches + host embed + H2D (~0.8ms/draft
+/// of host serialization at 4 ranks).
+#[cfg(feature = "cuda")]
+pub(crate) fn draft_step_dev<B: KernelBackend>(
+    s: &mut Engine<B>,
+    seq: u64,
+    i: usize,
+    nd: usize,
+) -> Result<()> {
+    let hidden = {
+        let cfg = &s.cfg;
+        cfg.hidden_size
+    };
+    // Fixed device pointers from MtpState (scoped — dropped before the
+    // mtp_forward call re-acquires the backend).
+    let (tokens_ptr, emb_ptr, hprev_ptr, h_out_ptr, d_ptr) = {
+        let cuda = s
+            .backend
+            .as_cuda()
+            .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?;
+        let m = cuda.mtp.lock().unwrap();
+        let m = m
+            .as_ref()
+            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+        let tokens = m.tokens_dev.as_f32() as *mut i32;
+        let emb = m.emb_devs[i].as_f32();
+        let d = unsafe { m.d_argmax_dev.as_f32().add(i) };
+        // h relay: draft 0 reads hprev; draft i>0 reads h_d[i-1]; drafts
+        // 0..nd-2 export h to h_d[i] (the last draft discards it).
+        let hprev = if i == 0 {
+            m.hprev.as_f32()
+        } else {
+            m.h_d[i - 1].as_f32()
+        };
+        let h_out = if i + 1 < nd {
+            m.h_d[i].as_f32()
+        } else {
+            std::ptr::null_mut()
+        };
+        (tokens, emb, hprev, h_out, d)
+    };
+    // embed table (replicated weight — every rank reads the full table)
+    let embed_table = s.w("model.embed_tokens.weight")?.clone();
+    {
+        let cuda = s
+            .backend
+            .as_cuda()
+            .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?;
+        cuda.enter();
+        // [i>0] d_{i-1} (f32) → tokens_dev[i] (i32): the cast kernel keeps the
+        // token chain on device (replay: graph i-1's argmax → graph i's embed).
+        if i > 0 {
+            let d_prev = unsafe { d_ptr.sub(1) };
+            cuda.cast_store_i32(
+                d_prev as *const std::ffi::c_void,
+                unsafe { tokens_ptr.add(i) } as *mut std::ffi::c_void,
+            )?;
+        }
+        cuda.embed_one_dev(
+            &embed_table,
+            unsafe { tokens_ptr.add(i) },
+            emb_ptr,
+            hidden,
+            1,
+        )?;
+    } // cuda dropped — mtp_forward re-acquires internally
+    mtp_forward_raw_argmax(
+        s,
+        seq,
+        emb_ptr as *mut std::ffi::c_void,
+        hprev_ptr as *mut std::ffi::c_void,
+        h_out_ptr as *mut std::ffi::c_void,
+        d_ptr as *mut std::ffi::c_void,
+        hidden,
+    )
+}
+
 
 
 

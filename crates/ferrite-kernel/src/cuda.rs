@@ -585,6 +585,13 @@ pub struct MtpState {
     pub n_accepted_dev: DevBuf,   // [1] i32 — tokens accepted this step
     /// draft chain embeds (fixed bufs, embed_one kernel output; one per draft)
     pub emb_devs: Vec<DevBuf>,    // [N-1] × [hidden] f32 — draft i's embed
+    /// draft chain h relay (fixed bufs): h_d[i] = draft i's MTP-residual h
+    /// (mtp_forward's h_out), fed as draft i+1's h_prev. Fixed addresses are
+    /// REQUIRED for the draft graphs (mega_d{seq}_{i}) — a pool-allocated h
+    /// (the host path's fresh DevBuf) would move between capture and replay.
+    /// The LAST draft exports no h (verify's hf_v commit replaces it), so
+    /// only nd-1 = N-2 relays exist.
+    pub h_d: Vec<DevBuf>,         // [N-2] × [hidden] f32 — draft i's h relay
     /// draft argmax outputs (device, from mtp_forward's argmax) — ONE
     /// contiguous [N-1] buffer (draft i's token at offset i; the accept
     /// kernel reads it as the d array).
@@ -4431,6 +4438,11 @@ impl CudaBackend {
     }
     pub fn graph_io_get(&self, name: &str) -> Option<GraphIO> {
         self.graph_io.lock().unwrap().get(name).cloned()
+    }
+    /// Whether a named graph exec exists (the draft graphs' replay-path
+    /// probe — graph_replay would LAUNCH it, so existence needs its own check).
+    pub fn graph_exists(&self, name: &str) -> bool {
+        self.graph_execs.lock().unwrap().contains_key(name)
     }
     /// Destroy a named graph (exec + IO entry) — the batched decode's
     /// composition lifecycle: the "megab_{seqs}" graph's recorded kernel args
