@@ -4819,7 +4819,11 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
     unsigned* const* ready_tbl, unsigned* epoch, unsigned* ctr,
     const float* staging_local, const unsigned* ready_local,
     float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
-    int threads = 256;
+    // 1024-thread blocks: the old 256-thread grid (16 blocks at n=4096) made
+    // every block contend on the same atomicAdd(ctr) and pay its own
+    // __threadfence_system(); 4 blocks × 1024 threads keeps the same
+    // per-thread work with 4× fewer fence/atomic participants.
+    int threads = 1024;
     int blocks = (n + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     p2p_ar_fused_v3_kernel<<<blocks, threads, 0, s>>>(
