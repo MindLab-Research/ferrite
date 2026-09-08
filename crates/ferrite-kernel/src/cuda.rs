@@ -43,6 +43,32 @@ extern "C" {
     fn cudaStreamSynchronize(stream: CuStream) -> i32;
     fn cudaGetErrorString(err: i32) -> *const std::os::raw::c_char;
 
+    // cuBLAS (batched decode m=16 GEMM: bandwidth-bound, needs the split-K
+    // /streaming cuBLAS already implements — see build.rs)
+    fn cublasCreate_v2(handle: *mut *mut std::ffi::c_void) -> i32;
+    fn cublasSetStream_v2(handle: *mut std::ffi::c_void, stream: CuStream) -> i32;
+    fn cublasGemmEx(
+        handle: *mut std::ffi::c_void,
+        transa: i32,
+        transb: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        alpha: *const f32,
+        a: *const std::ffi::c_void,
+        atype: i32,
+        lda: i32,
+        b: *const std::ffi::c_void,
+        btype: i32,
+        ldb: i32,
+        beta: *const f32,
+        c: *mut std::ffi::c_void,
+        ctype: i32,
+        ldc: i32,
+        compute: i32,
+        algo: i32,
+    ) -> i32;
+
     // ferrite kernels (ferrite_kernels.cu bridge)
     fn ferrite_matmul(x: *const f32, w: *const f32, bias: *const f32, out: *mut f32,
                       n: i32, in_f: i32, out_f: i32, s: CuStream) -> i32;
@@ -732,6 +758,9 @@ pub struct CudaBackend {
     /// 23ms). Prefill MUST keep the GEMM (its row-batched accumulation
     /// order sets the first greedy token; per-row flips it 背出师表→English).
     pub small_n_rows: std::sync::atomic::AtomicBool,
+    /// cuBLAS handle for the batched m=16 decode GEMM (lazily created on the
+    /// dry-run/replay path — never inside capture).
+    cublas: std::sync::Mutex<*mut std::ffi::c_void>,
     /// pinned token-id slots (embed_expand's zero-copy kernel input; cached
     /// per n — decode graph n=1, verify graph n=3).
     pinned_ids_cache: std::sync::Mutex<std::collections::HashMap<usize, *mut i32>>,
@@ -798,6 +827,7 @@ impl CudaBackend {
             graph_io: std::sync::Mutex::new(std::collections::HashMap::new()),
             mtp: std::sync::Mutex::new(None),
             small_n_rows: std::sync::atomic::AtomicBool::new(false),
+            cublas: std::sync::Mutex::new(std::ptr::null_mut()),
             pinned_ids_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -1739,6 +1769,50 @@ impl CudaBackend {
     /// BufferCache will dedupe repeated weight uploads), result stays on
     /// device. Building block for fused op chains (expert FFN).
     /// Weights are resident in bf16 (dev_weight_bf16).
+    /// cuBLAS bf16 batched GEMM for the decode m=16 case:
+    /// C[16, N] = A[16, K] * W[N, K]^T. A (fp32 activations) is cast to
+    /// bf16 first; the weights are already bf16. cuBLAS's split-K/streaming
+    /// hides the tiny-m parallelism that sank the hand-rolled MMA kernel
+    /// (grid N/32 = 96 blocks → 5% occupancy → 3x SLOWER than the FMA gemv).
+    fn gemm_cublas(&self, x: &DevBuf, w: *const std::ffi::c_void,
+                   n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
+        let do_ = DevBuf::alloc(self.dev, self.stream, (n * out_f) as usize)?;
+        let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
+        ck(
+            unsafe {
+                ferrite_f32_to_bf16(x.as_const_f32(), xb.as_f32() as *mut std::ffi::c_void,
+                                    (n * in_f) as i64, self.stream)
+            },
+            "cast bf16",
+        )?;
+        // Handle created on first use: the dry-run reaches here BEFORE the
+        // capture pass, and cublasCreate is illegal inside a capture.
+        let h = {
+            let mut g = self.cublas.lock().unwrap();
+            if g.is_null() {
+                ck(unsafe { cublasCreate_v2(&mut *g) }, "cublasCreate")?;
+                ck(unsafe { cublasSetStream_v2(*g, self.stream) }, "cublasSetStream")?;
+            }
+            *g
+        };
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        // column-major view: C'[N,16] = W^T[N,K] * x^T[K,16]
+        let st = unsafe {
+            cublasGemmEx(
+                h, 1, 0, out_f, n, in_f,
+                &alpha, w, 14, in_f,
+                xb.as_const_f32() as *const std::ffi::c_void, 14, in_f,
+                &beta, do_.as_f32() as *mut std::ffi::c_void, 0, out_f,
+                0, 99,
+            )
+        };
+        if st != 0 {
+            return Err(FerriteError::Config(format!("cublasGemmEx failed: {st}")));
+        }
+        Ok(do_)
+    }
+
     pub fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
         // fp8 single-store guard: a placeholder Tensor (data.len() < numel)
         // with NO fp8 registration must fail loudly — its bf16 upload would
@@ -1801,6 +1875,14 @@ impl CudaBackend {
         let dw = self.dev_weight_bf16(w)?;
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
+        if n == 16 && dbias.is_null() {
+            // cuBLAS bf16 batched GEMM (split-K/streaming): the FMA
+            // gemv_bf16_nt is compute-bound at n=16 (measured 2.5x decay
+            // vs n=1) — this is the SGLang/cutlass route.
+            if let Ok(o) = self.gemm_cublas(x_dev, dw.ptr as *const _, n, in_f, out_f) {
+                return Ok(o);
+            }
+        }
         if n == 1 || (n <= 16 && self.small_n_rows.load(std::sync::atomic::Ordering::Relaxed)) {
             // Decode GEMV v2: uint4 vectorized + K-split WPR — 2.09x over v1
             // (bench gemv_v2_bench: 3.11→6.80TB/s lm_head, 2.20→3.91 o_proj,

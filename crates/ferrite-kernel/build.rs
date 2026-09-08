@@ -22,6 +22,11 @@ fn main() {
         if !cuda_lib.is_empty() {
             println!("cargo:rustc-link-search=native={cuda_lib}");
             println!("cargo:rustc-link-lib=dylib=cudart");
+            // cuBLAS: the batched decode's m=16 GEMM is bandwidth-bound and
+            // needs split-K/streaming that cuBLAS already implements (a
+            // hand-rolled m16n8k16 kernel had only N/32 blocks → 5%
+            // occupancy → 3x SLOWER than the FMA gemv it replaced).
+            println!("cargo:rustc-link-lib=dylib=cublas");
         }
     }
     println!("cargo:rerun-if-changed=build.rs");
