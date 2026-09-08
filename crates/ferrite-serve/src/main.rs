@@ -81,16 +81,15 @@ fn main() {
     );
 
     // ---- weights ----
-    // FERRITE_DIRECT_LOAD=1 (+ --backend cuda): the mmap direct path —
-    // placeholder tensors (shape-real, 4-elem data stubs) feed TpCluster's
-    // shape-only shard splits, and the preload phase streams the mmap
-    // slices into the device caches (bf16 verbatim / fp8 GPU dequant /
-    // bf16→f32 expand). The CPU never materializes a weight: legacy peak
-    // RSS was ~660GB of f32; the direct path maps the safetensors files
+    // DIRECT mmap path is the DEFAULT for --backend cuda (FERRITE_LEGACY_LOAD=1
+    // restores the f32-materializing legacy loader for debugging): placeholder
+    // tensors (shape-real, 4-elem data stubs) feed TpCluster's shape-only
+    // shard splits, and the preload phase streams the mmap slices into the
+    // device caches (bf16 verbatim / fp8 GPU dequant / bf16→f32 expand / fp8
+    // native for MoE experts). The CPU never materializes a weight: legacy
+    // peak RSS was ~660GB of f32; the direct path maps the safetensors files
     // and the page cache is the only host-side copy.
-    // W8A8 is incompatible with the direct path in v1 (the fp8 bypass
-    // registers CPU Vec bytes — direct dequants everything to bf16).
-    let use_direct = std::env::var_os("FERRITE_DIRECT_LOAD").is_some() && backend == "cuda";
+    let use_direct = std::env::var_os("FERRITE_LEGACY_LOAD").is_none() && backend == "cuda";
     if use_direct && std::env::var_os("FERRITE_W8A8").is_some() {
         panic!("FERRITE_DIRECT_LOAD and FERRITE_W8A8 are mutually exclusive in v1 (the direct path dequants fp8 → bf16 resident)");
     }
