@@ -118,3 +118,9 @@ grid(B,h) + `state_ptrs[seq]`）**本来就是一次启动、1024 个 block**，
 nsys 里的 "gdn_step 0.6ms" 属于**非批量路径**（`ferrite_gdn_step_v2p`，grid(1,h,dsplits)，
 每 seq 一次），那条路径的 state 是单指针，**批量化会像 gdn_step_v2 一样让多 seq 竞争同一 state**。
 结论：这条不是可攻方向。
+
+## 2026-09-08 有效：cp.async.ca → .cg（+1%）
+
+act 的 staging 用 `cp.async.cg`（只走 L2）替代 `.ca`（L1+L2）：专家权重是**流式读一次**的数据，
+`.ca` 会污染 L1。16.95-16.97 → **16.77-16.79 ms（953-954 tok/s）**，文本正确。
+（`.cg` 要求 16 字节且对齐——正好是这里的拷贝粒度。）
