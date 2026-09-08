@@ -3960,11 +3960,17 @@ impl CudaBackend {
                 // to the dequant act below (kept).
                 let inter_max = inter.max(inter_shared);
                 let act_mma = inter_max % 16 == 0 && hidden % 128 == 0;
-                if act_mma {
+                // v2 (pre-quantized) only for n>1: at n=1 the 864-block grid
+                // shares one x quantize (redundant-but-free ~9µs) while v2 adds
+                // a quant kernel launch + 4KB smem copy per layer (measured
+                // 90.4 -> 84.8 tok/s — the launch tail dominates). At n=3 the
+                // 2592-block grid re-quantized 864x/token — v2 nets -0.5ms/step.
+                let act_mma_v2 = act_mma && n > 1;
+                if act_mma_v2 {
                     // v2 QUANTIZE-ONCE: x -> xq e4m3 + xs, ONE launch per layer
                     // (per token; the act kernel re-quantized x[tok] 864x =
-                    // grid(max_rows/16, topk+1, n) × per-block quant — the 46µs
-                    // act kernel was quantize-BOUND, not A-weight bound).
+                    // grid(max_rows/16, topk+1, n) × per-block quant — the act
+                    // kernel was quantize-BOUND at 46µs, not A-weight bound).
                     let xq = DevBuf::alloc(self.dev, self.stream, n * hi as usize / 4 + 1)?; // e4m3 bytes as f32 slots
                     let xs = DevBuf::alloc(self.dev, self.stream, n)?;
                     ck(
@@ -3987,6 +3993,34 @@ impl CudaBackend {
                             topk as i32, ni, swiglu_limit,
                             xq.as_const_f32() as *const u8, xs.as_const_f32(),
                             self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
+                        ck(unsafe {
+                            ferrite_moe_fused_down_sum_fp8(
+                                dids.as_const_f32(), dprobs.as_const_f32(),
+                                tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
+                                sd.w, sd.scale,
+                                act.as_const_f32(), out.as_f32(),
+                                expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                                topk as i32, ni, dscols, self.stream,
+                            )
+                        }, "moe_fused_down_sum_fp8")?;
+                        return Ok(out);
+                    }
+                    // v2 unsupported (unaligned) — fall through to v1
+                }
+                if act_mma {
+                    let r = unsafe {
+                        ferrite_moe_fused_act_fp8_mma(
+                            x_dev.as_const_f32(), dids.as_const_f32(),
+                            tbl.gate_w8 as *const *const _, tbl.gate_scale as *const *const _,
+                            tbl.up_w8 as *const *const _, tbl.up_scale as *const *const _,
+                            sg.w, sg.scale, su.w, su.scale,
+                            act.as_f32(),
+                            expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                            topk as i32, ni, swiglu_limit, self.stream,
                         )
                     };
                     if r == 0 {
