@@ -4979,8 +4979,9 @@ __global__ void p2p_ar_fused_v3_kernel(
     // (flag said "arrived", staging held the previous epoch's value) →
     // wrong all-reduce → gibberish text.
     {
-        int r0 = blockIdx.x * blockDim.x + threadIdx.x;
-        if (r0 < total) {
+        // grid-stride (single block): total = n*world can exceed the block
+        // size (16 seqs → 655360 > 1024), so every thread must loop.
+        for (int r0 = threadIdx.x; r0 < total; r0 += blockDim.x) {
             int ii = r0 / world;  // token
             int rr = r0 % world;  // peer
             float v = partial[ii];
@@ -5040,11 +5041,12 @@ __global__ void p2p_ar_fused_v3_kernel(
         seen[tr] = cur;
     }
     __syncthreads();
-    if (i < n) {
+    // grid-stride reduce (single block): n can exceed the block size.
+    for (int ii = threadIdx.x; ii < n; ii += blockDim.x) {
         float acc = 0.f;
         for (int r = 0; r < world; r++)
-            acc += staging_local[(size_t)((e & 1u) * world + r) * stride + i];
-        out[i] = acc;
+            acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
+        out[ii] = acc;
     }
 }
 
@@ -5054,17 +5056,15 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
     const float* staging_local, const unsigned* ready_local,
     unsigned* seen,
     float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
-    // 1024-thread blocks: the old 256-thread grid (16 blocks at n=4096) made
-    // every block contend on the same atomicAdd(ctr) and pay its own
-    // __threadfence_system(); 4 blocks × 1024 threads keeps the same
-    // per-thread work with 4× fewer fence/atomic participants.
+    // SINGLE BLOCK, grid-stride (vLLM's custom-AR layout). With blocks > 1 the
+    // flag publish needs "last block arrived" detection via atomicAdd(ctr) —
+    // and that counter provably breaks across graph replays (stale ctr →
+    // no block ever sees last → *epoch never advances → the monotonic wait
+    // deadlocks). gridDim.x == 1 makes the publish unconditional: no counter,
+    // no stale state, no deadlock. Measured AR payload at 16 seqs is 327 KB;
+    // one 1024-thread block moves the 8×2.6 MB of NVLink traffic in ~20-25 µs.
     int threads = 1024;
-    // grid must cover phase A's (token, peer) map = n * world threads
-    // (the old (n+threads-1)/threads grid left phase A with n threads only:
-    // at decode n=1 just thread 0 ran → 7 of 8 peers' staging never written).
-    int work = n * world;
-    int blocks = (work + threads - 1) / threads;
-    if (blocks < 1) blocks = 1;
+    int blocks = 1;
     p2p_ar_fused_v3_kernel<<<blocks, threads, 0, s>>>(
         partial, staging_tbl, ready_tbl, epoch, ctr,
         staging_local, ready_local, seen, out, world, my_rank, n, stride);
