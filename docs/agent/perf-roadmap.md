@@ -325,3 +325,10 @@ kernel 的 `qs2` smem 与 half2 点积 + 每 128 元素折回 fp32），编译�
    把 TG 从 8 降到 4（每线程 16 次迭代 × 4 分量）或让每个线程处理 2 个 slot，
    都能把延迟摊得更薄 —— 与 GDN 的 4 路累加器同一思路。
 3. tensor-core 对 decode（M=1）无益：每个 (seq,head) 的 top-k 位置不同，无法拼成 M>1 的 GEMM。
+
+### 已回退：sparse_attn 的 TG 8→4（挂起）
+
+想通过"每线程 16 个 float4 列"提高 ILP，但 `gmask = 0xffffu << ((threadIdx.x & 31) & ~15u)`
+是**16 车道组掩码**，与 TG=4 的 4 车道组不匹配 → `__shfl_sync(gmask, ...)` 同步失败 → bench 挂死
+（6 分钟后手动 kill）。**教训：改 TG 必须同时改 gmask 的组宽**（`~(TG-1)` 而不是 `~15u`），
+而且 sparse_attn 的 shuffle 归约步长也按 TG 走。这条路线要动就得整组一起改。
