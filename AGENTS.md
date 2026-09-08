@@ -152,10 +152,7 @@ Other profiling rules:
 7. sparse_attn 的 live_k 边界（原按固定 select_k_max=2048 循环）+ indexer 短上下文快路径。
 8. dense-FFN / GDN host 路径的 AR 改 P2P 优先；run_matmul 走快路径。
 
-**关键认知（2026-09-08 late，由 8/16/32 并发对比得出）**：**步长几乎与批量无关** —— 8 seqs = 16.30ms/步、16 seqs = 17.72ms/步（只差 1.4ms），而 32 seqs = 89.8ms（异常，另有问题）。即 **bs=8~16 时 kernel 是延迟受限（latency-bound），不是带宽受限**：每个 kernel 的依赖链/访存延迟占主导，与行数几乎无关。
-→ **推论**：①"减少字节流量"类优化（tiled GEMM、row-major 权重共享）收益有限（实测均变慢）；②**"重叠延迟"类优化（软件流水、寄存器预取、去掉串行 break/守卫）有效**（act 的软件流水 17.99→17.72ms）；③ 要再快，需要减少**每步 kernel 数量**（~1000 个/步：hc 270 + AR 270 + MoE 126 + gdn 68 + …）或进一步拉长依赖链上的重叠。
-
-**已验证无效/更差（勿重复）**：gemv row-major（权重 1-3MB 全在 L2，16x 重读是 L2 命中）、gemv tiled GEMM（smem 内层 2048 次串行读反而更慢 23.7ms）、down TT=1/8/16、ROWS=16/32/64、gemv R=8（无 x 缓存时）、gemv 1024 线程/block、K 循环 unroll 4、token 循环 unroll 2、去掉 fp8 转换链（仅省 4.5%）、act 的共享 sa staging、act 的 128 列 staging、HC_MIX_KS 8→2、**HC_P345_NB 16→8（乱码，AGENTS.md 警告属实）**、gdn_chunk 的 2D 循环（外层 128 次串行更慢）、2-kernel AR 合并（同 kernel 内缺 acquire 语义 → 数值错，加 fence 仍错）。
+**已验证无效/更差（勿重复）**：gemv row-major（**权重矩阵 1-3MB 全在 L2 内，token-major 的 16x 重读是 L2 命中，不是 DRAM 瓶颈**——实测 18.15 vs 17.99ms）、down TT=1/8/16、ROWS=16/64、gemv R=8（无 x 缓存时）、gemv 1024 线程/block、K 循环 unroll 4、token 循环 unroll 2、去掉 fp8 转换链（仅省 4.5%）、act 的共享 sa staging、act 的 128 列 staging（18.93ms，占用率下降）、HC_MIX_KS 8→2。
 
 **教训（乱码=数值回归，且可能是"少算"）**：gemv row-major 曾测得 14.78ms/1082 tok/s 但输出 `!!!`——因为 launcher 的 grid 硬除 `rpb*8` 而 kernel 在 `nrows%8!=0` 时用 R=1，**只算了 1/8 的输出行**。**任何提速都必须同时人眼验证文本，否则"少算"会被误当成"优化"。**
 

@@ -3212,48 +3212,36 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         const int cnt = ((t1 - base) < MAXN) ? (t1 - base) : MAXN;
         if (j <= topk) {
         float py[8];
-        // PREFETCH all tokens' 2-level pointer chase (ids/probs -> expert ptr)
-        // up front: the chains were serial per token (2 dependent global loads
-        // each, ~1.2us) and the kernel is latency-bound.
-        const unsigned char* pdb[4];
-        const float* pds[4];
-        const float* paj[4];
-        int pkl[4];
-        float pp[4];
-        #pragma unroll
-        for (int tt = 0; tt < 4; tt++) {
-            pkl[tt] = 0; pp[tt] = 1.f; pdb[tt] = nullptr; pds[tt] = nullptr; paj[tt] = nullptr;
-            if (tt >= cnt) continue;
-            const int tok = base + tt;
-            const float* act_t = act + (size_t)tok * stride;
-            if (j < topk) {
-                int eid = (int)ids_f[(size_t)tok * topk + j];
-                int local = eid - expert_start;
-                if (local >= 0 && local < e_local) {
-                    float pv = probs[(size_t)tok * topk + j];
-                    if (pv != 0.f) {
-                        pdb[tt] = down_w8_ptrs[local];
-                        pds[tt] = down_scale_ptrs[local];
-                        paj[tt] = act_t + (size_t)j * inter;
-                        pkl[tt] = inter;
-                        pp[tt] = pv;
-                    }
-                }
-            } else {
-                pdb[tt] = shared_down_w8;
-                pds[tt] = shared_down_scale;
-                paj[tt] = act_t + (size_t)topk * inter;
-                pkl[tt] = inter_shared;
-            }
-        }
         for (int tt = 0; tt < cnt; tt++) {
-        const unsigned char* dbase = pdb[tt];
-        const float* dsr_base = pds[tt];
-        const float* aj = paj[tt];
-        int klen = pkl[tt];
-        float p = pp[tt];
+        const int tok = base + tt;
+        const float* act_t = act + (size_t)tok * stride;
+        const float* ids_t = ids_f + (size_t)tok * topk;
+        const float* probs_t = probs + (size_t)tok * topk;
         #pragma unroll
         for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
+        const float* aj = nullptr;
+        const unsigned char* dbase = nullptr;
+        const float* dsr_base = nullptr;
+        int klen = 0;
+        float p = 1.f;
+        if (j < topk) {
+            int eid = (int)ids_t[j];
+            int local = eid - expert_start;
+            if (local >= 0 && local < e_local) {
+                p = probs_t[j];
+                if (p != 0.f) {
+                    dbase = down_w8_ptrs[local];
+                    dsr_base = down_scale_ptrs[local];
+                    aj = act_t + (size_t)j * inter;
+                    klen = inter;
+                }
+            }
+        } else {
+            dbase = shared_down_w8;
+            dsr_base = shared_down_scale;
+            aj = act_t + (size_t)topk * inter;
+            klen = inter_shared;
+        }
         if (klen > 0) {
             // 16-BYTE LANES (uint4): one load covers 512B = TWO h-rows (rows
             // are contiguous, klen=256). The kernel was request-rate bound at
