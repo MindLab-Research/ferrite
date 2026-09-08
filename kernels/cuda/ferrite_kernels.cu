@@ -4979,14 +4979,18 @@ __global__ void p2p_ar_fused_v3_kernel(
     // (flag said "arrived", staging held the previous epoch's value) →
     // wrong all-reduce → gibberish text.
     {
-        // grid-stride (single block): total = n*world can exceed the block
-        // size (16 seqs → 655360 > 1024), so every thread must loop.
-        for (int r0 = threadIdx.x; r0 < total; r0 += blockDim.x) {
-            int ii = r0 / world;  // token
-            int rr = r0 % world;  // peer
+        // COALESCED mapping: consecutive threads write consecutive tokens of
+        // the SAME peer. The old (token, peer) flattening (ii = r0/world,
+        // rr = r0%world) sent adjacent threads to different GPUs — 655K
+        // scattered 4-byte NVLink transactions per AR (~2.5 ms each,
+        // measured 236 ms/step). Now each thread loads one token once and
+        // writes it to all peers' contiguous slots.
+        const int step = gridDim.x * blockDim.x;
+        for (int ii = blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
             float v = partial[ii];
-            const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii);
-            staging_tbl[rr][off] = v;
+            const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
+            for (int rr = 0; rr < world; rr++)
+                staging_tbl[rr][base] = v;
         }
     }
     // NO __threadfence_system() here: the finish kernel runs only after this
