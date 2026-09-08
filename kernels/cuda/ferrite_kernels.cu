@@ -3961,59 +3961,50 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     if (threadIdx.x == 0)
         last = (atomicAdd(&ctr[t], 1u) == (unsigned)NB - 1u) ? 1 : 0;
     __syncthreads();
-    // P2b (block0, PARALLEL sinkhorn — v3): the v2 thread0-serial loop was
-    // ~45µs (20 iters × 32 elements of smem-ld/fdiv dependency chain on ONE
-    // thread). n=4: thread i owns row i / col k (k-ascending per-element op
-    // order inside each row/col is preserved → bit-identical FP), the 41
-    // row/col rounds separate by __syncthreads. ~6µs. Runs AFTER this
-    // block's P4 atomic — parallel with the is_last block's P5 (P5 needs
-    // only li_raw + p4_part; comb/post feed hc_post on the NEXT layer).
-    if (b == 0) {
-        // cb build (n*n threads — element-independent)
-        if (threadIdx.x < n * n)
-            cb[threadIdx.x] = mx_s[2 * n + threadIdx.x] * scale[2] + base[2 * n + threadIdx.x];
-        __syncthreads();
-        // initial row softmax (thread i owns row i)
-        if (threadIdx.x < n) {
-            const int i = threadIdx.x;
-            float rmax = -INFINITY;
-            for (int k = 0; k < n; k++) rmax = fmaxf(rmax, cb[i * n + k]);
-            float denom = 0.f;
-            for (int k = 0; k < n; k++) { cb[i * n + k] = __expf(cb[i * n + k] - rmax); denom += cb[i * n + k]; }
-            for (int k = 0; k < n; k++) cb[i * n + k] = cb[i * n + k] / denom + hc_eps;
-        }
-        __syncthreads();
-        // initial col normalise (thread k owns col k)
-        if (threadIdx.x < n) {
-            const int k = threadIdx.x;
-            float colsum = 0.f;
-            for (int i = 0; i < n; i++) colsum += cb[i * n + k];
-            float d = colsum + hc_eps;
-            for (int i = 0; i < n; i++) cb[i * n + k] /= d;
-        }
+    // P2b (block0, warp1 lanes 0..15 — v4): the v3 4-thread+__syncthreads
+    // sinkhorn was ~6µs (41 block-wide barriers); n*n=16 elements fit ONE
+    // warp's registers — all row/col reductions are __shfl_xor butterflies
+    // (row groups = lanes 4r..4r+3 → xor 1,2; col groups = lanes c,c+4,
+    // c+8,c+12 → xor 4,8). NO barriers, ~1.3µs at iters=20. FP: the sum
+    // order is a butterfly tree vs the serial k-ascending (1ulp class —
+    // the P4-tree change already validated by 出师表; max/div are
+    // order-independent). Runs on warp1 AFTER this block's P4 atomic —
+    // parallel with the is_last block's P5 and never on the atomic-sync
+    // critical path (warp0 handles is_last/P5; warp1's lanes exit the
+    // sinkhorn loop independently).
+    if (b == 0 && threadIdx.x >= 32 && threadIdx.x < 48) {
+        const unsigned m16 = 0x0000ffffu; // warp1 lanes 0..15 (shfl group)
+        const int ln = threadIdx.x - 32;  // 0..15 = r*4+c
+        const float v0 = mx_s[2 * n + ln] * scale[2] + base[2 * n + ln];
+        // initial row softmax: rmax (butterfly max — order-free), denom, /=, +eps
+        float v = v0;
+        float rmax = v;
+        rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 1));
+        rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 2));
+        v = __expf(v - rmax);
+        float denom = v;
+        denom += __shfl_xor_sync(m16, denom, 1);
+        denom += __shfl_xor_sync(m16, denom, 2);
+        v = v / denom + hc_eps;
+        // initial col normalise (xor 4, 8 butterflies)
+        float cs = v;
+        cs += __shfl_xor_sync(m16, cs, 4);
+        cs += __shfl_xor_sync(m16, cs, 8);
+        v /= cs + hc_eps;
         for (int it = 1; it < iters; it++) {
-            __syncthreads();
-            // row normalise (thread i owns row i)
-            if (threadIdx.x < n) {
-                const int i = threadIdx.x;
-                float rowsum = 0.f;
-                for (int k2 = 0; k2 < n; k2++) rowsum += cb[i * n + k2];
-                float d = rowsum + hc_eps;
-                for (int k2 = 0; k2 < n; k2++) cb[i * n + k2] /= d;
-            }
-            __syncthreads();
-            // col normalise (thread k2 owns col k2)
-            if (threadIdx.x < n) {
-                const int k2 = threadIdx.x;
-                float colsum = 0.f;
-                for (int i = 0; i < n; i++) colsum += cb[i * n + k2];
-                float d = colsum + hc_eps;
-                for (int i = 0; i < n; i++) cb[i * n + k2] /= d;
-            }
+            // row normalise (xor 1, 2)
+            float rs = v;
+            rs += __shfl_xor_sync(m16, rs, 1);
+            rs += __shfl_xor_sync(m16, rs, 2);
+            v /= rs + hc_eps;
+            // col normalise (xor 4, 8)
+            float cs2 = v;
+            cs2 += __shfl_xor_sync(m16, cs2, 4);
+            cs2 += __shfl_xor_sync(m16, cs2, 8);
+            v /= cs2 + hc_eps;
         }
-        __syncthreads();
-        if (threadIdx.x < n * n) comb[(size_t)t * n * n + threadIdx.x] = cb[threadIdx.x];
-        if (threadIdx.x < n) pre_s_g[(size_t)t * n + threadIdx.x] = ps[threadIdx.x];
+        comb[(size_t)t * n * n + ln] = v;
+        if (threadIdx.x - 32 < n) pre_s_g[(size_t)t * n + (threadIdx.x - 32)] = ps[threadIdx.x - 32];
     }
     // P4b + P5 (is_last block only): reduce partials → rsq, li = li_raw·inv·nw
     if (!last) return;
