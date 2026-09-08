@@ -506,8 +506,19 @@ __global__ void gdn_step_kernel(const float* __restrict__ q,
     // 2. kS = S^T k -> shared[dv]
     extern __shared__ float ks[];
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * dv + j];
+        // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
+        // may not reassociate fp), so the 4-cycle FMA latency dominated.
+        // Order changes -> ~1e-7 relative, far below the model's tolerance.
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int i = 0;
+        for (; i + 3 < dk; i += 4) {
+            a0 += kh[i]     * S[(size_t)(i)     * dv + j];
+            a1 += kh[i + 1] * S[(size_t)(i + 1) * dv + j];
+            a2 += kh[i + 2] * S[(size_t)(i + 2) * dv + j];
+            a3 += kh[i + 3] * S[(size_t)(i + 3) * dv + j];
+        }
+        for (; i < dk; i++) a0 += kh[i] * S[(size_t)i * dv + j];
+        float acc = (a0 + a1) + (a2 + a3);
         ks[j] = acc;
     }
     __syncthreads();
@@ -519,8 +530,19 @@ __global__ void gdn_step_kernel(const float* __restrict__ q,
     __syncthreads();
     // 5. o = q^T S
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * dv + j];
+        // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
+        // may not reassociate fp), so the 4-cycle FMA latency dominated.
+        // Order changes -> ~1e-7 relative, far below the model's tolerance.
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int i = 0;
+        for (; i + 3 < dk; i += 4) {
+            a0 += qh[i]     * S[(size_t)(i)     * dv + j];
+            a1 += qh[i + 1] * S[(size_t)(i + 1) * dv + j];
+            a2 += qh[i + 2] * S[(size_t)(i + 2) * dv + j];
+            a3 += qh[i + 3] * S[(size_t)(i + 3) * dv + j];
+        }
+        for (; i < dk; i++) a0 += qh[i] * S[(size_t)i * dv + j];
+        float acc = (a0 + a1) + (a2 + a3);
         out[((size_t)t * h + hd) * dv + j] = acc;
     }
 }
@@ -638,8 +660,19 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     __syncthreads();
     // 2. kS = S^T k
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
+        // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
+        // may not reassociate fp), so the 4-cycle FMA latency dominated.
+        // Order changes -> ~1e-7 relative, far below the model's tolerance.
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int i = 0;
+        for (; i + 3 < dk; i += 4) {
+            a0 += kh[i]     * S[(size_t)(i)     * spitch + j];
+            a1 += kh[i + 1] * S[(size_t)(i + 1) * spitch + j];
+            a2 += kh[i + 2] * S[(size_t)(i + 2) * spitch + j];
+            a3 += kh[i + 3] * S[(size_t)(i + 3) * spitch + j];
+        }
+        for (; i < dk; i++) a0 += kh[i] * S[(size_t)i * spitch + j];
+        float acc = (a0 + a1) + (a2 + a3);
         ks[j] = acc;
     }
     __syncthreads();
@@ -650,8 +683,19 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     __syncthreads();
     // 4. o = q^T S
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
+        // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
+        // may not reassociate fp), so the 4-cycle FMA latency dominated.
+        // Order changes -> ~1e-7 relative, far below the model's tolerance.
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int i = 0;
+        for (; i + 3 < dk; i += 4) {
+            a0 += qh[i]     * S[(size_t)(i)     * spitch + j];
+            a1 += qh[i + 1] * S[(size_t)(i + 1) * spitch + j];
+            a2 += qh[i + 2] * S[(size_t)(i + 2) * spitch + j];
+            a3 += qh[i + 3] * S[(size_t)(i + 3) * spitch + j];
+        }
+        for (; i < dk; i++) a0 += qh[i] * S[(size_t)i * spitch + j];
+        float acc = (a0 + a1) + (a2 + a3);
         out[((size_t)t * h + hd) * dv + j] = acc;
     }
     __syncthreads();
@@ -847,8 +891,19 @@ __global__ void gdn_chunk_batched_kernel(
     __syncthreads();
     // 2. kS = S^T k
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
+        // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
+        // may not reassociate fp), so the 4-cycle FMA latency dominated.
+        // Order changes -> ~1e-7 relative, far below the model's tolerance.
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int i = 0;
+        for (; i + 3 < dk; i += 4) {
+            a0 += kh[i]     * S[(size_t)(i)     * spitch + j];
+            a1 += kh[i + 1] * S[(size_t)(i + 1) * spitch + j];
+            a2 += kh[i + 2] * S[(size_t)(i + 2) * spitch + j];
+            a3 += kh[i + 3] * S[(size_t)(i + 3) * spitch + j];
+        }
+        for (; i < dk; i++) a0 += kh[i] * S[(size_t)i * spitch + j];
+        float acc = (a0 + a1) + (a2 + a3);
         ks[j] = acc;
     }
     __syncthreads();
@@ -859,8 +914,19 @@ __global__ void gdn_chunk_batched_kernel(
     __syncthreads();
     // 4. o = q^T S
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-        float acc = 0.f;
-        for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
+        // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
+        // may not reassociate fp), so the 4-cycle FMA latency dominated.
+        // Order changes -> ~1e-7 relative, far below the model's tolerance.
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+        int i = 0;
+        for (; i + 3 < dk; i += 4) {
+            a0 += qh[i]     * S[(size_t)(i)     * spitch + j];
+            a1 += qh[i + 1] * S[(size_t)(i + 1) * spitch + j];
+            a2 += qh[i + 2] * S[(size_t)(i + 2) * spitch + j];
+            a3 += qh[i + 3] * S[(size_t)(i + 3) * spitch + j];
+        }
+        for (; i < dk; i++) a0 += qh[i] * S[(size_t)i * spitch + j];
+        float acc = (a0 + a1) + (a2 + a3);
         out[(size_t)base * dv + j] = acc;
     }
     __syncthreads();
