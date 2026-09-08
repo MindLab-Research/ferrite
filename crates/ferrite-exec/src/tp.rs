@@ -2808,9 +2808,10 @@ fn mega_chain_dev(
                 cuda.dsa_layer_dev(&hn, &w, seq, family, n, hidden)?
             }
         };
+        let ar_skip = std::env::var_os("FERRITE_AR_SKIP").is_some();
         let ar_p2p = match s.backend.as_cuda() {
-            Some(c) => c.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false),
-            None => false,
+            Some(c) if !ar_skip => c.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false),
+            _ => ar_skip,
         };
         if !ar_p2p {
             let cnt = n * hidden;
@@ -2942,9 +2943,10 @@ fn mega_chain_dev(
                 cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
             }
         };
+        let ar_skip2 = std::env::var_os("FERRITE_AR_SKIP").is_some();
         let ar_p2p = match s.backend.as_cuda() {
-            Some(c) => c.p2p_ar_v2(&mut partial2, n * hidden).unwrap_or(false),
-            None => false,
+            Some(c) if !ar_skip2 => c.p2p_ar_v2(&mut partial2, n * hidden).unwrap_or(false),
+            _ => ar_skip2,
         };
         if !ar_p2p {
             nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
@@ -3217,9 +3219,10 @@ fn mega_chain_dev_batched(
                 cuda.dsa_layer_dev_batched(&hn, &w, seqs, family, n, hidden)?
             }
         };
+        let ar_skip = std::env::var_os("FERRITE_AR_SKIP").is_some();
         let ar_p2p = match s.backend.as_cuda() {
-            Some(c) => c.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false),
-            None => false,
+            Some(c) if !ar_skip => c.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false),
+            _ => ar_skip,
         };
         if !ar_p2p {
             let cnt = n * hidden;
@@ -3313,9 +3316,10 @@ fn mega_chain_dev_batched(
                 cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?
             }
         };
+        let ar_skip3 = std::env::var_os("FERRITE_AR_SKIP").is_some();
         let ar_p2p = match s.backend.as_cuda() {
-            Some(c) => c.p2p_ar_v2(&mut partial2, n * hidden).unwrap_or(false),
-            None => false,
+            Some(c) if !ar_skip3 => c.p2p_ar_v2(&mut partial2, n * hidden).unwrap_or(false),
+            _ => ar_skip3,
         };
         if !ar_p2p {
             nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
