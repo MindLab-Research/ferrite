@@ -3250,7 +3250,13 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
                 float y = 0.f;
-                if (h < hidden) {
+                // NO h<hidden guard around the loads: the conditional blocked
+                // the compiler from hoisting the 8 rows' loads (each iteration
+                // waited on the previous one's dependency chain). h < hidden
+                // always holds (grid.x = ceil(hidden/8)); a stray read would
+                // land in the next expert's rows and is discarded by the
+                // guarded store below.
+                {
                 const unsigned char* dwr = dbase + (size_t)h * klen;
                 const float* dsr = dsr_base + (size_t)(h >> 7) * dscols;
                 int i = lane * 8;
