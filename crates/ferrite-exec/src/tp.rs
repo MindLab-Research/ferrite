@@ -1680,6 +1680,74 @@ impl<B: KernelBackend> TpCluster<B> {
             }
         };
         let t_draft = t_d.elapsed();
+        // FERRITE_DRAFT_AB: same-state A/B — undo the device chain's
+        // mtp_family appends, run the ORIGINAL host chain from the identical
+        // state (it re-appends nd — net zero), print both draft vectors.
+        // A value mismatch here localizes the divergence to the chain itself
+        // (embed_one_dev/cast_store/h relays) with NO state-fork confound.
+        if std::env::var_os("FERRITE_DRAFT_AB").is_some() {
+            Self::fan_out(&mut self.shards, |s| {
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                cuda.dsa_host_rollback(seq, mtp_family, nd);
+                Ok::<(), FerriteError>(())
+            })
+            .into_iter()
+            .collect::<Result<Vec<_>>>()?;
+            let refs: Vec<f32> = {
+                let toks = Self::fan_out(&mut self.shards, |s| {
+                    let mut rdrafts: Vec<f32> = Vec::with_capacity(nd);
+                    let hprev_ref: usize = {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                        let m = cuda.mtp.lock().unwrap();
+                        let m = m
+                            .as_ref()
+                            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                        &m.hprev as *const DevBuf as usize
+                    };
+                    let mut prev_h: Option<DevBuf> = None;
+                    let mut prev_tok = last;
+                    for i in 0..nd {
+                        let (emb, h_out) = {
+                            let cuda = s
+                                .backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
+                            cuda.enter();
+                            let h2 = s.embed(&[prev_tok as u32]);
+                            let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
+                            emb.upload(h2.as_slice())?;
+                            let h_out = if i + 1 < nd {
+                                Some(DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?)
+                            } else {
+                                None
+                            };
+                            (emb, h_out)
+                        };
+                        let d = match prev_h.as_ref() {
+                            None => {
+                                let hprev: &DevBuf = unsafe { &*(hprev_ref as *const DevBuf) };
+                                mtp_forward(s, seq, &emb, hprev, h_out.as_ref())?
+                            }
+                            Some(ph) => mtp_forward(s, seq, &emb, ph, h_out.as_ref())?,
+                        };
+                        rdrafts.push(d);
+                        prev_tok = d as u32;
+                        prev_h = h_out;
+                    }
+                    Ok(rdrafts)
+                })
+                .into_iter()
+                .collect::<Result<Vec<Vec<f32>>>>()?;
+                toks[0].clone()
+            };
+            eprintln!("[draft-ab] dev={:?} host={:?}", drafts, refs);
+        }
         let t_v = std::time::Instant::now();
         // 2. verify: dsa advance(n_v) + mega_v replay (the A→B ping-pong
         //    copy-in is graph-recorded — capture-time nodes, not a host
