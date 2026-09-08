@@ -3263,13 +3263,13 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     // half2 FMA (as in gemv_fp8_v2): 8 cvt + 8 __hfma2 per 16
                     // values instead of fp8->half2->float2 + 2 scalar FMAs.
                     // The fp16 sum is only 8 terms, folded into fp32 with ds_c.
-                    const __half2* arh = reinterpret_cast<const __half2*>(arf);
                     __half2 a2 = __float2half2_rn(0.f);
                     #pragma unroll
                     for (int q = 0; q < 8; q++) {
                         const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + q * 2);
                         const __half2_raw draw = __nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3);
-                        a2 = __hfma2(*reinterpret_cast<const __half2*>(&draw), arh[q], a2);
+                        const __half2 ah2 = __floats2half2_rn(arf[q * 2], arf[q * 2 + 1]);
+                        a2 = __hfma2(*reinterpret_cast<const __half2*>(&draw), ah2, a2);
                     }
                     y = (__half2float(a2.x) + __half2float(a2.y)) * ds_c;
                     // lanes 0..15 -> row h0+2c, lanes 16..31 -> row h0+2c+1
