@@ -1599,10 +1599,11 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     float* qs = sm;                                   // [d] float4 reads
     float* sc = sm + d;                                // [topk] scores → weights
     int* idx_s = (int*)(sc + topk);                   // [topk]
-    float* red = (float*)(idx_s + topk);               // [8] warp partials
-    unsigned int* bm = (unsigned int*)(red + 8);       // [4096] dedup bitmap
+    float* red = (float*)(idx_s + topk);               // [16] warp partials
+    unsigned int* bm = (unsigned int*)(red + 16);       // [4096] dedup bitmap
     const int bm_words_max = 4096;
     int bm_words = (t + 31) >> 5; if (bm_words > bm_words_max) bm_words = bm_words_max;
+    float* red2 = (float*)(bm + bm_words_max); // [SG*dv <= 512] stage-3 split partials
     // 0. preload: q head-slice → smem, idx → smem, clear bitmap
     for (int l = threadIdx.x; l < d; l += blockDim.x) qs[l] = q[((size_t)row * h + hd) * d + l];
     for (int s = threadIdx.x; s < topk; s += blockDim.x) idx_s[s] = (int)idx[(size_t)row * topk + s];
@@ -1638,8 +1639,8 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
     __syncthreads();
-    if (threadIdx.x < 8) m = red[threadIdx.x];
-    for (int off = 4; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    if (threadIdx.x < 16) m = red[threadIdx.x];
+    for (int off = 8; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     __shared__ float ms_;
     if (threadIdx.x == 0) ms_ = m;
     __syncthreads();
@@ -1653,8 +1654,8 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
     __syncthreads();
-    if (threadIdx.x < 8) sum = red[threadIdx.x];
-    for (int off = 4; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if (threadIdx.x < 16) sum = red[threadIdx.x];
+    for (int off = 8; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     __shared__ float sum_;
     if (threadIdx.x == 0) sum_ = sum;
     __syncthreads();
@@ -1662,17 +1663,29 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
     __syncthreads();
     for (int s = threadIdx.x; s < topk; s += blockDim.x) sc[s] /= denom;
     __syncthreads();
-    // 3. weighted v-gather: coalesced over j2 (consecutive lanes → dv)
-    for (int j2 = threadIdx.x; j2 < dv; j2 += blockDim.x) {
-        float a = 0.f;
-        for (int s = 0; s < topk; s++) {
-            float w = sc[s];
-            if (w == 0.f) continue; // padding / deduped slot (exp→0)
-            int j = idx_s[s];
-            if (j < 0 || j >= t) continue;
-            a += w * v[((size_t)j * h + hd) * dv + j2];
+    // 3. weighted v-gather — split over slots: blockDim = SG x dv lanes, lane
+    // (sg, j2) accumulates slots s = sg, sg+SG, ... (w==0 padding skips are
+    // order-free), then per-column partials joined via red2. FP-safe class.
+    {
+        const int SG = (int)(blockDim.x / dv); // 512/128 = 4
+        int sg = threadIdx.x / dv, j2 = threadIdx.x - sg * dv;
+        if (sg < SG) {
+            float a = 0.f;
+            for (int s = sg; s < topk; s += SG) {
+                float w = sc[s];
+                if (w == 0.f) continue; // padding / deduped slot (exp→0)
+                int j = idx_s[s];
+                if (j < 0 || j >= t) continue;
+                a += w * v[((size_t)j * h + hd) * dv + j2];
+            }
+            red2[(size_t)sg * dv + j2] = a;
         }
-        out[((size_t)row * h + hd) * dv + j2] = a;
+        __syncthreads();
+        if (threadIdx.x < dv) {
+            float a = 0.f;
+            for (int g2 = 0; g2 < SG; g2++) a += red2[(size_t)g2 * dv + threadIdx.x];
+            out[((size_t)row * h + hd) * dv + threadIdx.x] = a;
+        }
     }
 }
 
@@ -1680,10 +1693,11 @@ extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q, const float* k,
                                               const float* v, const float* idx,
                                               float* out, int n, const int* t_ptr, int h, int d,
                                               int dv, int topk, cudaStream_t s) {
-    dim3 block(256);
+    dim3 block(512);
     dim3 grid(n, h);
     size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
-                  + 8 * sizeof(float) + 4096 * sizeof(unsigned int);
+                  + 16 * sizeof(float) + 4096 * sizeof(unsigned int)
+                  + 512 * sizeof(float); // red2: SG(4) x dv(128) split partials
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
