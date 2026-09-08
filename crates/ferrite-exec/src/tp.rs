@@ -565,10 +565,12 @@ pub(crate) struct VerifyIO {
 }
 
 /// FERRITE_MTP_N: the MTP verify width (draft count + 1). Default 3 = the
-/// historical (d1, d2) two-draft chain (bit-identical). Any 2..=8: the draft
+/// historical (d1, d2) two-draft chain (bit-identical). Any 1..=8: the draft
 /// chain runs n-1 mtp_forward steps, the verify graph runs n rows, the
-/// accept k ranges 1..=n — ONE code path for every n (non-MTP decode is the
-/// same mega chain at n=1, no MTP buffers involved).
+/// accept k ranges 1..=n — ONE code path for every n>=2. N=1 IS plain
+/// decode: decode_step_mega routes it to the SAME mega1 graph path as
+/// non-MTP (no ping-pong B copy, no commit kernel, no MTP buffers — zero
+/// overhead, bit-identical to FERRITE_MTP unset).
 #[cfg(feature = "cuda")]
 pub(crate) fn mtp_verify_n() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
@@ -577,9 +579,9 @@ pub(crate) fn mtp_verify_n() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
-            Some(n) if (2..=8).contains(&n) => n,
+            Some(n) if (1..=8).contains(&n) => n,
             Some(bad) => {
-                eprintln!("[mtp] FERRITE_MTP_N={bad} out of range 2..=8 — using 3 (n=1 = plain decode: just drop FERRITE_MTP)");
+                eprintln!("[mtp] FERRITE_MTP_N={bad} out of range 1..=8 — using 3");
                 3
             }
             None => 3,
@@ -1031,7 +1033,11 @@ impl<B: KernelBackend> TpCluster<B> {
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         let gname = format!("mega{seq}");
-        let mtp = std::env::var_os("FERRITE_MTP").is_some();
+        // N-UNIFIED ROUTING: FERRITE_MTP_N=1 (or FERRITE_MTP unset) takes the
+        // SAME mega1 path — no MTP buffers, no verify graph, no ping-pong
+        // commit. "Non-MTP is n=1" literally: one code path, zero n=1
+        // overhead (bit-identical to the historical non-MTP decode).
+        let mtp = std::env::var_os("FERRITE_MTP").is_some() && mtp_verify_n() > 1;
 
         // Multi-seq serving: the mega graph is keyed per seq (mega{seq}), but
         // mega_seq is a SINGLE-slot marker — a naive != check re-ran the
