@@ -5976,17 +5976,27 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
                                     __floats2half2_rn(xd1.x, xd1.y), __floats2half2_rn(xd1.z, xd1.w)};
             // half2 FMA path (see gemv header): 8 cvt + 8 __hfma2 per 16 values
             // per token, but the 8 cvt are SHARED by both tokens.
+            // TWO half2 chains per token: a single 8-deep hfma2 chain is a
+            // 32-cycle dependency; splitting it halves the latency. Same fp16
+            // chunk accumulation, reassociated.
             __half2 a20 = __float2half2_rn(0.f), a21 = __float2half2_rn(0.f);
+            __half2 b20 = __float2half2_rn(0.f), b21 = __float2half2_rn(0.f);
             #pragma unroll
-            for (int p = 0; p < 8; p++) {
+            for (int p = 0; p < 8; p += 2) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
                 const __half2_raw wraw = __nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3);
                 const __half2 w2 = *reinterpret_cast<const __half2*>(&wraw);
+                const __nv_fp8x2_storage_t wy2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[(p + 1) * 2]);
+                const __half2_raw wraw2 = __nv_cvt_fp8x2_to_halfraw2(wy2, __NV_E4M3);
+                const __half2 w3 = *reinterpret_cast<const __half2*>(&wraw2);
                 a20 = __hfma2(w2, hx0[p], a20);
                 a21 = __hfma2(w2, hx1[p], a21);
+                b20 = __hfma2(w3, hx0[p + 1], b20);
+                b21 = __hfma2(w3, hx1[p + 1], b21);
             }
-            acc0 += (__half2float(a20.x) + __half2float(a20.y)) * sc;
-            acc1 += (__half2float(a21.x) + __half2float(a21.y)) * sc;
+            const __half2 s0 = __hadd2(a20, b20), s1 = __hadd2(a21, b21);
+            acc0 += (__half2float(s0.x) + __half2float(s0.y)) * sc;
+            acc1 += (__half2float(s1.x) + __half2float(s1.y)) * sc;
         }
         for (; k < k1; k++) {
             const float sc = srow[k >> 7];
