@@ -1211,7 +1211,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 // advance(1) pins t0=T). The dry appends are the first step's
                 // correct KV (same inputs: last, hf-seeded hprev, catch-up
                 // cache) — the first replay overwrites them bit-identically.
-                if std::env::var_os("FERRITE_DRAFT_GRAPH").map_or(true, |v| v != "0") {
+                if draft_env == "1" || draft_env == "2" {
                     let nd = n_v - 1;
                     // dry: tokens_dev[0] ← last, then the nd-step chain (real
                     // execution — P2P ARs rendezvous, dsa appends at T..T+nd-1)
@@ -1430,7 +1430,15 @@ impl<B: KernelBackend> TpCluster<B> {
         //    Fallback: the original host chain (embed lookup + upload +
         //    mtp_forward per draft).
         let draft_env = std::env::var("FERRITE_DRAFT_GRAPH").unwrap_or_default();
-        let graph_drafts = draft_env != "0";
+        // DEFAULT OFF: the graph-resident draft chain measured NO step-time
+        // gain (20.3ms vs the host chain's 20.5ms — the draft segment is
+        // GPU-serial (draft i+1 needs draft i's h/token), so the host launch
+        // overhead the graphs remove was already hidden under GPU execution)
+        // and its accept regressed 2.37 -> 1.93 (the device chain's d1
+        // diverges from the host chain's — bisected but not root-caused).
+        // FERRITE_DRAFT_GRAPH=1 re-enables it for debugging; =2 runs the
+        // device chain host-serial (bisect mode).
+        let graph_drafts = draft_env == "1" || draft_env == "2";
         // mode "2": execute the SAME device chain host-serial (no graph
         // replay) — bisects a draft divergence between the chain itself
         // (embed_one_dev / cast_store / h_d relays) and capture/replay.
@@ -1680,74 +1688,6 @@ impl<B: KernelBackend> TpCluster<B> {
             }
         };
         let t_draft = t_d.elapsed();
-        // FERRITE_DRAFT_AB: same-state A/B — undo the device chain's
-        // mtp_family appends, run the ORIGINAL host chain from the identical
-        // state (it re-appends nd — net zero), print both draft vectors.
-        // A value mismatch here localizes the divergence to the chain itself
-        // (embed_one_dev/cast_store/h relays) with NO state-fork confound.
-        if std::env::var_os("FERRITE_DRAFT_AB").is_some() {
-            Self::fan_out(&mut self.shards, |s| {
-                let cuda = s
-                    .backend
-                    .as_cuda()
-                    .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                cuda.dsa_host_rollback(seq, mtp_family, nd);
-                Ok::<(), FerriteError>(())
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-            let refs: Vec<f32> = {
-                let toks = Self::fan_out(&mut self.shards, |s| {
-                    let mut rdrafts: Vec<f32> = Vec::with_capacity(nd);
-                    let hprev_ref: usize = {
-                        let cuda = s
-                            .backend
-                            .as_cuda()
-                            .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                        let m = cuda.mtp.lock().unwrap();
-                        let m = m
-                            .as_ref()
-                            .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                        &m.hprev as *const DevBuf as usize
-                    };
-                    let mut prev_h: Option<DevBuf> = None;
-                    let mut prev_tok = last;
-                    for i in 0..nd {
-                        let (emb, h_out) = {
-                            let cuda = s
-                                .backend
-                                .as_cuda()
-                                .ok_or_else(|| FerriteError::Config("mtp needs cuda".into()))?;
-                            cuda.enter();
-                            let h2 = s.embed(&[prev_tok as u32]);
-                            let emb = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?;
-                            emb.upload(h2.as_slice())?;
-                            let h_out = if i + 1 < nd {
-                                Some(DevBuf::alloc(cuda.dev(), cuda.stream(), hidden)?)
-                            } else {
-                                None
-                            };
-                            (emb, h_out)
-                        };
-                        let d = match prev_h.as_ref() {
-                            None => {
-                                let hprev: &DevBuf = unsafe { &*(hprev_ref as *const DevBuf) };
-                                mtp_forward(s, seq, &emb, hprev, h_out.as_ref())?
-                            }
-                            Some(ph) => mtp_forward(s, seq, &emb, ph, h_out.as_ref())?,
-                        };
-                        rdrafts.push(d);
-                        prev_tok = d as u32;
-                        prev_h = h_out;
-                    }
-                    Ok(rdrafts)
-                })
-                .into_iter()
-                .collect::<Result<Vec<Vec<f32>>>>()?;
-                toks[0].clone()
-            };
-            eprintln!("[draft-ab] dev={:?} host={:?}", drafts, refs);
-        }
         let t_v = std::time::Instant::now();
         // 2. verify: dsa advance(n_v) + mega_v replay (the A→B ping-pong
         //    copy-in is graph-recorded — capture-time nodes, not a host
@@ -5050,7 +4990,9 @@ pub(crate) fn draft_step_dev<B: KernelBackend>(
             hidden,
             1,
         )?;
-        // embed sanity: the token the kernel read + the row it produced.
+        // embed sanity: the token the kernel read + the row it produced, AND
+        // the host lookup of the same token (bit-parity check: any mismatch
+        // here means embed_one_dev's table/stride differs from s.embed's).
         if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
             let mut t = [0i32; 1];
             ferrite_kernel::cuda::memcpy_d2h_sync(
@@ -5066,7 +5008,13 @@ pub(crate) fn draft_step_dev<B: KernelBackend>(
                 4,
                 cuda.stream_handle(),
             );
-            eprintln!("[draft-emb] i={i} token={:?} emb[0..4]={:?}", t, e);
+            let h2 = s.embed(&[t[0] as u32]);
+            let hs = h2.as_slice();
+            let hm = e.iter().zip(hs.iter()).filter(|(a, b)| a != b).count();
+            eprintln!(
+                "[draft-emb] i={i} token={:?} dev={:?} host={:?} first4_mismatch={hm}",
+                t, e, &hs[..4]
+            );
         }
     } // cuda dropped — mtp_forward re-acquires internally
     mtp_forward_raw_argmax(
