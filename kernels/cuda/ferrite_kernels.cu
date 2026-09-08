@@ -5716,22 +5716,56 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     const int warps = blockDim.x >> 5;
     const int rpb = warps / WPR;               // rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int rowg = blockIdx.x * rpb + warp / WPR;   // global row
+    // 8 rows per warp-group with the x slice CACHED in registers: the same
+    // token's x row is re-read by every (block, row) otherwise (measured
+    // 196MB of x vs 49MB of weights per call -> L2-bound).
+    const int R = ((out_f & 7) == 0) ? 8 : 1;
+    const int rowg0 = (blockIdx.x * rpb + warp / WPR) * R;
+    const int kw = warp % WPR;                 // K-slice id
+    const int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
+    const int k0 = kw * kper;
+    const int k1 = min(k0 + kper, in_f);
+    __shared__ float part[16];
+    float4 xc[4];
+    {
+        const int k = k0 + lane * 16;
+        if (k + 15 < k1) {
+            const float* xr0 = x + (size_t)(rowg0 / out_f) * in_f + k;
+            xc[0] = *reinterpret_cast<const float4*>(xr0);
+            xc[1] = *reinterpret_cast<const float4*>(xr0 + 4);
+            xc[2] = *reinterpret_cast<const float4*>(xr0 + 8);
+            xc[3] = *reinterpret_cast<const float4*>(xr0 + 12);
+        } else {
+            xc[0] = xc[1] = xc[2] = xc[3] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    }
+    for (int r = 0; r < R; r++) {
+    const int rowg = rowg0 + r;
+    if (rowg >= nrows * out_f) break;
     const int token = rowg / out_f;
     const int row = rowg - token * out_f;
-    const int kw = warp % WPR;                 // K-slice id
     float acc = 0.f;
-    if (rowg < nrows * out_f) {
+    {
         const unsigned char* wr = w + (size_t)row * in_f;
         const float* xr = x + (size_t)token * in_f;
         const float* srow = scale + (size_t)(row >> 7) * scols;
-        int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
-        int k0 = kw * kper;
-        int k1 = min(k0 + kper, in_f);
-        // vector body: uint4 = 16 fp8; scale fetched per 128-col block
-        // (constant within the 16-lane step; k%16==0 keeps the step inside
-        // one block).
         int k = k0 + lane * 16;
+        if (k + 15 < k1) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
+            const float sc = srow[k >> 7];
+            const float xv[16] = {xc[0].x, xc[0].y, xc[0].z, xc[0].w,
+                                  xc[1].x, xc[1].y, xc[1].z, xc[1].w,
+                                  xc[2].x, xc[2].y, xc[2].z, xc[2].w,
+                                  xc[3].x, xc[3].y, xc[3].z, xc[3].w};
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3)));
+                acc += (wf.x * sc) * xv[p * 2] + (wf.y * sc) * xv[p * 2 + 1];
+            }
+            k += 32 * 16;
+        }
         #pragma unroll 2
         for (; k + 15 < k1; k += 32 * 16) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
@@ -5739,10 +5773,10 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             const float sc = srow[k >> 7];
             const float4 xa = *reinterpret_cast<const float4*>(xr + k);
             const float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
-            const float4 xc = *reinterpret_cast<const float4*>(xr + k + 8);
+            const float4 xcc = *reinterpret_cast<const float4*>(xr + k + 8);
             const float4 xd = *reinterpret_cast<const float4*>(xr + k + 12);
             const float xv[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
-                                  xc.x, xc.y, xc.z, xc.w, xd.x, xd.y, xd.z, xd.w};
+                                  xcc.x, xcc.y, xcc.z, xcc.w, xd.x, xd.y, xd.z, xd.w};
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
@@ -5750,8 +5784,6 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
                 acc += (wf.x * sc) * xv[p * 2] + (wf.y * sc) * xv[p * 2 + 1];
             }
         }
-        // scalar tail: elements past the last full uint4 step (in_f % 16
-        // != 0 slice ends, misaligned k1) — one fp8 per lane iteration.
         for (; k < k1; k++) {
             const float sc = srow[k >> 7];
             acc += (__half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc) * xr[k];
@@ -5762,17 +5794,18 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         acc += __shfl_down_sync(0xffffffff, acc, off);
     }
     if (WPR == 1) {
-        if (lane == 0 && rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + acc;
+        if (lane == 0) y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + acc;
     } else {
-        __shared__ float part[16];
         if (lane == 0) part[warp] = acc;
         __syncthreads();
         if (warp % WPR == 0 && lane == 0) {
             float sum = 0.f;
             #pragma unroll
             for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
-            if (rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + sum;
+            y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + sum;
         }
+        __syncthreads();
+    }
     }
 }
 
@@ -5785,7 +5818,7 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     long total = (long)nrows * out_f;
     constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
-    dim3 grid((unsigned)((total + rpb - 1) / rpb));
+    dim3 grid((unsigned)((total + rpb * 8 - 1) / (rpb * 8)));
     dim3 block(256);
     gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
                                                    in_f, out_f, nrows, srows, scols);
