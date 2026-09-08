@@ -2518,6 +2518,7 @@ __global__ void gemm_bf16_mma_kernel(const float* __restrict__ a,        // [16,
     const int n0 = blockIdx.x * 32 + warp * 8; // this warp's 8-col tile
     const int group = lane >> 2, tig = lane & 3;
     __shared__ __nv_bfloat16 sa[16][16];
+    __shared__ __nv_bfloat16 sb[32][16];       // coalesced B tile (32 rows x k16)
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     for (int k0 = 0; k0 < K; k0 += 16) {
         #pragma unroll
@@ -2525,21 +2526,24 @@ __global__ void gemm_bf16_mma_kernel(const float* __restrict__ a,        // [16,
             int r = i >> 4, cc = i & 15;
             sa[r][cc] = __float2bfloat16(a[(size_t)r * K + k0 + cc]);
         }
+        // B: coalesced 8-byte loads per thread into smem — the direct
+        // per-lane fragment load was scattered (4B x 8 rows) and made the
+        // MMA kernel SLOWER than the FMA gemv (measured 60ms vs 36ms).
+        #pragma unroll
+        for (int i = threadIdx.x; i < 512; i += 128) {
+            int r = i >> 4, cc = i & 15;
+            int nrow = blockIdx.x * 32 + r;
+            sb[r][cc] = (nrow < N) ? b[(size_t)nrow * K + k0 + cc] : __float2bfloat16(0.f);
+        }
         __syncthreads();
         unsigned a0 = *(const unsigned*)&sa[group][tig * 2];
         unsigned a1 = *(const unsigned*)&sa[group + 8][tig * 2];
         unsigned a2 = *(const unsigned*)&sa[group][tig * 2 + 8];
         unsigned a3 = *(const unsigned*)&sa[group + 8][tig * 2 + 8];
-        // B (weights) col-major kxn: lane's b0 = W[n0+group][k0+2tig .. +1].
-        // Guard the tail block (n0+group >= N) — an unguarded load faulted
-        // with Xid 31 MMU at out_f not divisible by 32.
-        const int nrow = n0 + group;
-        unsigned b0 = 0u, b1 = 0u;
-        if (nrow < N) {
-            const __nv_bfloat16* br = b + (size_t)nrow * K + k0 + tig * 2;
-            b0 = *(const unsigned*)br;
-            b1 = *(const unsigned*)(br + 8);
-        }
+        // B fragment from smem: b0 = W[n0+group][k0+2tig .. +1]
+        const int srow = warp * 8 + group;
+        unsigned b0 = *(const unsigned*)&sb[srow][tig * 2];
+        unsigned b1 = *(const unsigned*)&sb[srow][tig * 2 + 8];
         asm volatile(
             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
