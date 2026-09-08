@@ -4260,10 +4260,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     __syncthreads();
     // 8 THREADS PER SLOT (same fix as the indexer): one serial 256-dim dot per
     // thread left ~44% of the block idle and made the dot latency-bound.
-    // TG=4 (was 8): each thread now walks d/(TG*4)=16 float4 columns per slot
-    // instead of 8 -> twice the per-thread ILP on a latency-bound dot. The
-    // shuffle reduce uses TG/2..1 and the 16-lane gmask covers both.
-    const int TG = 4;
+    const int TG = 8;
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
     const int ngroups = blockDim.x / TG;
