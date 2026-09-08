@@ -978,6 +978,12 @@ impl<B: KernelBackend> TpCluster<B> {
             Self::fan_out(&mut self.shards, |s| {
                 if let Some(c) = s.backend.as_cuda() {
                     c.sync()?;
+                    // The dry-run advanced every rank's P2P AR epoch; the
+                    // capture pass does NOT (records only). Reset all
+                    // ranks' protocol state to zero here so the capture and
+                    // every replay start in lockstep (the epoch drift was
+                    // the size>8 deadlock: dev0 at L0 vs peers at L35).
+                    let _ = c.p2p_ar_reset();
                 }
                 Ok(())
             })

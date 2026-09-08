@@ -4942,6 +4942,33 @@ impl CudaBackend {
         Ok(())
     }
 
+        /// Reset the P2P AR protocol state (epoch, ready flags, ctr). The dry-run
+    /// advances the epoch but the capture pass does NOT (it only records), so
+    /// ranks leave the capture with DIFFERENT epoch counters — the next
+    /// replay's flag waits then mismatch and deadlock (dev0 at L0, peers at
+    /// L35). Call once after the dry-run/before capture on EVERY rank so all
+    /// replays start from epoch 0.
+    pub fn p2p_ar_reset(&self) -> Result<()> {
+        let st = {
+            let m = self.p2p_ar.lock().unwrap();
+            match m.as_ref() {
+                Some(st) => *st,
+                None => return Ok(()),
+            }
+        };
+        if st.epoch.is_null() {
+            return Ok(());
+        }
+        self.enter();
+        ck(unsafe { cudaMemsetAsync(st.epoch, 0, 4, self.stream) }, "p2p epoch reset")?;
+        ck(unsafe { cudaMemsetAsync(st.ctr, 0, 4, self.stream) }, "p2p ctr reset")?;
+        // ready_local is the row PEERS write via NVLink; zero it so stale
+        // stamps from before the reset don't satisfy the first wait. The
+        // ping-pong staging needs no reset (fully overwritten each call).
+        ck(unsafe { cudaMemsetAsync(st.ready_local, 0, st.world * 4, self.stream) }, "p2p ready reset")?;
+        Ok(())
+    }
+
     /// One-shot AR v2 (epoch + ping-pong — in-graph, multi-call safe). IN-PLACE
     /// on `buf`: the down kernel stages it to every peer's ping-pong slot,
     /// the sum kernel spins the epoch flags and writes the reduced values
