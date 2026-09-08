@@ -602,6 +602,9 @@ pub struct TpCluster<B: KernelBackend> {
     pub shards: Vec<Engine<B>>,
     pub full_cfg: Glm53FlashConfig,
     pub world: usize,
+    /// Last batched-decode seq set: skip the per-size table refresh when
+    /// unchanged (the refresh is ~45 layers x 2-6 H2D + mutexes per rank).
+    last_batch_seqs: Option<Vec<u64>>,
     /// CUDA graph: true after the first decode_step captures the op sequence
     /// (FERRITE_GRAPH=1 path; replay replaces per-op launches).
     graph_captured: bool,
@@ -809,7 +812,7 @@ impl<B: KernelBackend> TpCluster<B> {
             false
         };
         let _ = nccl;
-        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0, mega_seq: None, nccl: None }
+        TpCluster { shards, full_cfg, world, graph_captured: false, graph_step: 0, mega_seq: None, nccl: None, last_batch_seqs: None }
     }
 
     fn ensure_seq_all(&mut self, seq: u64, tokens: &[u32]) {
@@ -1056,8 +1059,11 @@ impl<B: KernelBackend> TpCluster<B> {
         }
         // Refresh the per-size pointer tables' CONTENT for THIS membership
         // (the graph's device addresses are stable across seq-sets of the
-        // same size — only the pointers change). ~150µs/step.
-        {
+        // same size — only the pointers change). Only when the membership
+        // actually CHANGED: the refresh is 45 layers × 2-6 H2D memcpys +
+        // a mutex per table per rank — running it EVERY step was ~2ms of
+        // host time that the nsys decode window showed as idle GPU gap.
+        if self.last_batch_seqs.as_deref() != Some(seqs) {
             let (la_h, la_dk, la_conv) = {
                 let la = &self.full_cfg.linear_attn;
                 (la.num_heads, la.head_dim, la.short_conv_kernel_size)
@@ -1088,6 +1094,7 @@ impl<B: KernelBackend> TpCluster<B> {
             })
             .into_iter()
             .collect::<Result<Vec<()>>>()?;
+            self.last_batch_seqs = Some(seqs.to_vec());
         }
         // Steady state: per-seq DSA pinned advance (B × num_dsa host writes)
         // + ONE graph replay + B tokens D2H — the entire B-seq step is
