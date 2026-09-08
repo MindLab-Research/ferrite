@@ -193,3 +193,12 @@ cp.async 无额外收益。
 **代价**：这是架构级改动 —— 缓存布局 + cache_append 内核 + sparse_attn 内核 + q 侧预吸收，
 约 300+ 行，且必须逐层数值对齐（建议用 `FERRITE_DSA_PROBE` 逐层比对旧实现）。
 **这是 roadmap 里唯一有两位数百分点潜力的方向。**
+
+## 2026-09-08 有效：moe_route 的 top-k 并行度（+1.2%）
+
+`moe_route_kernel` 的 block 从 32（1 warp）提到 256（8 warps）：每轮对 e=288 的扫描从 9 次
+迭代降到 2 次，配一个 smem 跨 warp 归约（每轮 2 个 syncthreads）。16.66-16.68 → **16.47-16.48 ms
+（971 tok/s）**，文本正确。
+
+**这是"低并行度 launcher"排查法的第三个命中**（前两个：gated_rmsnorm grid 仅 512 线程、
+indexer/kpool 的 block 已提前优化过）。判据：`grep -nE "dim3 block\(32\)|dim3 grid\(n\)"`。
