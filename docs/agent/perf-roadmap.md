@@ -241,3 +241,26 @@ GDN 的 6 处 dot（`for (i<dk) acc += k[i] * S[i*stride + j]`）是**串行 FMA
 **踩坑记录**：moe_down 的补丁第一次用了 `y1` 变量名，与函数里已有的 `const float y1 = __shfl_sync(...)`
 冲突 → **编译失败但 serve 用旧 .so 继续跑**，测出 981 tok/s 的假象。改名 `ya/yb` 后正常。
 **再次验证铁律：每次必须看 build 的 error 数。**
+
+## MLA 吸收的实施清单（下一步开工时的执行顺序）
+
+**目标**：把 DSA 缓存从"按 head 展开的 up-projected k_nope/v"改成"只存 latent"，把长上下文
+每层的 ~1GB 缓存读取降到 ~33MB。
+
+**Step 0（必做）**：`FERRITE_DSA_PROBE=1` 跑一次 300-token 基线，dump 每层 sparse_attn 的
+输入/输出，作为逐层数值对齐的黄金参考（吸收式实现必须能复现到 ~1e-3 以内）。
+
+**Step 1（v 侧 MVP，只改一半）**：
+- `dsa_cache_append`：额外（或替代 v 部分）写入 `latent[T, 512]`；k_nope 保持现状。
+- `sparse_attn_v2_batched`：v 侧改成 `out_latent[512] = Σ w_j·latent_j`，然后
+  `out_head = W_vc_head @ out_latent`（W_vc = kv_b_proj 的后半，需要新增一个权重入参）。
+- 预期：v 部分读取减半（FLOPs 翻倍）。若净收益为正 → 证明方向可行，继续 Step 2。
+
+**Step 2（k 侧吸收）**：
+- q 侧预吸收：`q_abs_head = q_nope_head @ W_kc_head^T`（256→512），在 q 投影处多做一次小 matmul。
+- 分数改为 `q_abs_head · latent_j`，k_nope 缓存整个删除。
+
+**Step 3**：清理旧的 k_nope/v 缓存路径，更新 `AGENTS.md` 的缓存布局说明。
+
+**风险**：吸收后注意力可能从内存受限转为算力受限（FLOPs 约翻倍），收益会缩水 —— 所以 Step 1
+的最小版本必须先测。另注意 DSA 的 indexer 选出的 slot 索引在两种布局下必须一致。
