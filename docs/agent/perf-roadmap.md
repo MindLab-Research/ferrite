@@ -69,3 +69,14 @@
   数值改动即使误差估计够小也可能越过 logit 决策边界（moe_down half2 实测）。
 - GPU 崩溃（err 700）后**必须 kill + 等 30s + 确认 `nvidia-smi --query-compute-apps` 为空**，
   否则残留进程的坏 context 会给出错误的性能读数（本会话踩过）。
+
+## 2026-09-08 有效：低并行度 launcher 的修复（gated_rmsnorm）
+
+`gated_rmsnorm_kernel` 原来是 `block(32,4)` + `grid((n+3)/4)` —— **整个 grid 只有 512 个线程**
+（4 block × 128 线程），每个线程串行走 dim/32 = 128 个元素，纯延迟。改成 1 token/block × 256 线程
+（每线程 16 个元素）后：17.40 → **17.29-17.33 ms（925 tok/s）**，文本正确。
+
+**可复用的排查法**：`grep -nE "dim3 grid\(n\)|dim3 grid\(1, h" ferrite_kernels.cu` —— 凡是
+按 token 单块启动的 launcher（`grid(n)` 在 n=16 时只有 16 个 block，132 个 SM 空转）都是候选。
+已知同类：`rmsnorm_kernel`（grid(n)/block 256，16 block）、`argmax/softmax`（grid(n)）、
+`gdn_step_v2`（grid(1,h,1) 逐 token 启动，但**不可批量**，见上文 state 原因）。
