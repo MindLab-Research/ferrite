@@ -110,3 +110,11 @@ MMA 只有 ~64 周期，而 load 要 ~600 周期，寄存器预取填不满这�
 **可复用判据**：热点 kernel 里"每轮多个互不依赖的 global load"的循环，若没有 unroll，
 先试 `#pragma unroll 4`（比手写预取便宜、不会像寄存器预取那样压占用）。
 本会话已验证有效：hc_pre_mix（+1%）、hc_pre_rest345 的 P3（早前 +0.7%）、act 的 cp.async（+0.8%）。
+
+### 已排查：GDN 在 B=16 下已是批量启动（不要再试"批量 gdn_step"）
+
+设备链的 B=16 路径（cuda.rs `gdn_layer_dev` 的 batched 分支 → `ferrite_gdn_chunk_batched`，
+grid(B,h) + `state_ptrs[seq]`）**本来就是一次启动、1024 个 block**，没有逐 token 的启动开销。
+nsys 里的 "gdn_step 0.6ms" 属于**非批量路径**（`ferrite_gdn_step_v2p`，grid(1,h,dsplits)，
+每 seq 一次），那条路径的 state 是单指针，**批量化会像 gdn_step_v2 一样让多 seq 竞争同一 state**。
+结论：这条不是可攻方向。
