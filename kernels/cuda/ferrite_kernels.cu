@@ -629,9 +629,9 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     }
     __syncthreads();
     // 3. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
-    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-        S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
-            bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
+    for (int i = 0; i < dk; i++)
+        for (int j = threadIdx.x; j < dv; j += blockDim.x)
+            S[(size_t)i * spitch + j] += bt * kh[i] * (vh[j] - ks[j]);
     __syncthreads();
     // 4. o = q^T S
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
@@ -818,8 +818,10 @@ __global__ void gdn_chunk_batched_kernel(
     for (int j = threadIdx.x; j < dv; j += blockDim.x)
         vh[j] = v[(size_t)base * dv + j];
     float* Sg = state_ptrs[seq] + (size_t)hd * dk * dv;
-    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
+    // 2D (no per-element integer division: 64 iters x 2 divs per thread)
+    for (int i = 0; i < dk; i++)
+        for (int j = threadIdx.x; j < dv; j += blockDim.x)
+            S[(size_t)i * spitch + j] = Sg[(size_t)i * dv + j];
     __syncthreads();
     // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
