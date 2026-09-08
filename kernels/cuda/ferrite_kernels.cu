@@ -3358,7 +3358,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
 // (fp8) AND computes e4m3 x e4m3 directly (no per-element cvt).
 // smem: xq[hidden] + reduce[256] + xs[1] + gate sacc[8][16] + up sacc[8][16].
 // ============================================================
-__global__ void moe_fused_act_fp8_mma_kernel(
+__global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
     const float* __restrict__ x,          // [n, hidden]
     const float* __restrict__ ids_f,      // [n, topk]
     const unsigned char* const* __restrict__ gate_w8_ptrs,   // [e_local] [inter, hidden] e4m3
