@@ -2976,6 +2976,22 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             aj = act_t + (size_t)topk * inter;
             klen = inter_shared;
         dot:;
+            // v12.1: REGISTER-CACHE the act row (klen=1536 f32 = 48/lane).
+            // The v12 h-loop re-read aj from L2 every hh iteration (9 warps
+            // x 512 blocks x 8 h x 6KB = 220MB of L2 traffic — THE 44.6µs
+            // bottleneck, measured invariant across v0/v11/v12 structures).
+            // 12 float4 per lane = 48 registers, loaded ONCE per warp;
+            // the h loop then only streams dwr (12KB fp8 per warp, the
+            // actual HBM payload ~27MB/rank).
+            float4 ar[12];
+            {
+                const float4* a4 = reinterpret_cast<const float4*>(aj);
+                const int f4 = klen >> 2;
+                for (int r = 0; r < 12; r++) {
+                    int idx = lane + r * 32;
+                    ar[r] = (idx < f4) ? a4[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+                }
+            }
             #pragma unroll 1
             for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
@@ -2986,12 +3002,14 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 int i = lane * 16;
                 for (; i + 15 < klen; i += 32 * 16) {
                     uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
-                    const float4 aa = *reinterpret_cast<const float4*>(aj + i);
-                    const float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
-                    const float4 ac = *reinterpret_cast<const float4*>(aj + i + 8);
-                    const float4 ad = *reinterpret_cast<const float4*>(aj + i + 12);
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
                     const float ds_c = dsr[i >> 7];
+                    // act row from REGISTERS (ar[r] owns aj[lane + r*32 .. +3])
+                    const int r0_ = (i >> 2) - lane * 4; // float4 index base
+                    const float4 aa = ar[r0_];
+                    const float4 ab = ar[r0_ + 1];
+                    const float4 ac = ar[r0_ + 2];
+                    const float4 ad = ar[r0_ + 3];
                     const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
                                           ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
                     #pragma unroll
@@ -3002,7 +3020,8 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     }
                 }
                 for (; i < klen; i++) {
-                    y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
+                    float av = aj[i]; // tail (klen%16 != 0 — never on GLM)
+                    y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * av;
                 }
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) {
