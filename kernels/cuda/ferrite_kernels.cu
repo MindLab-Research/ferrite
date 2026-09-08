@@ -628,9 +628,9 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     }
     __syncthreads();
     // 3. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
-    for (int idx = threadIdx.x; idx < dk * dvl_; idx += blockDim.x)
-        S[(size_t)(idx / dvl_) * spitch + (idx % dvl_)] +=
-            bt * kh[idx / dvl_] * (vh[idx % dvl_] - ks[idx % dvl_]);
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
+            bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
     __syncthreads();
     // 4. o = q^T S
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
