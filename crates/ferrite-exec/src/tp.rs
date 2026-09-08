@@ -1211,10 +1211,10 @@ impl<B: KernelBackend> TpCluster<B> {
                 // advance(1) pins t0=T). The dry appends are the first step's
                 // correct KV (same inputs: last, hf-seeded hprev, catch-up
                 // cache) — the first replay overwrites them bit-identically.
-                if matches!(
-                    std::env::var("FERRITE_DRAFT_GRAPH").as_deref(),
-                    Ok("1") | Ok("2")
-                ) {
+                // capture only in graph mode "1": mode "2" (host-serial device
+                // chain) must run WITHOUT the capture pass's side effects to
+                // separate "capture+dry" from "the device chain itself".
+                if matches!(std::env::var("FERRITE_DRAFT_GRAPH").as_deref(), Ok("1")) {
                     let nd = n_v - 1;
                     // dry: tokens_dev[0] ← last, then the nd-step chain (real
                     // execution — P2P ARs rendezvous, dsa appends at T..T+nd-1)
