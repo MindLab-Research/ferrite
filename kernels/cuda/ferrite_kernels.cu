@@ -4587,12 +4587,7 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
         const float xv = x[i];                 // ONE x read serves 4 rows
         sq += xv * xv;                         // Σx² rides free
         #pragma unroll
-        for (int mm = 0; mm < 4; mm++) {
-            float wv;
-            asm volatile("ld.global.nc.L2::128B.f32 %0, [%1];\n"
-                         : "=f"(wv) : "l"(row0 + (size_t)mm * nh + i));
-            acc[mm] += wv * xv;
-        }
+        for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
     }
     __shared__ float red[8];
     #pragma unroll
