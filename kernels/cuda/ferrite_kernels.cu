@@ -3466,18 +3466,18 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
     // with 16-byte loads makes every sector fully used. The row stride is
     // PADDED to 80 bytes: stride 64 would start every row on bank 0 (8-way
     // conflict on the fragment reads) — 80 gives banks 0,20,8,28,16,4,24,12.
-    const int SA_STRIDE = 80;
+    const int SA_STRIDE = 48;   // 32-col tile + 16B pad: row starts 0,12,24,4,16,28,8,20 (banks all distinct)
     // DOUBLE-BUFFERED cp.async staging: global -> smem directly (no register
     // round-trip) with two buffers, so the next tile's copy is in flight while
     // the MMAs run on the current one. The old single-buffer + register
     // prefetch still stalled ~536 cycles/tile (600-cycle DRAM latency vs the
     // ~64 cycles of MMA work) — that is why the 2-tile *register* prefetch was
     // slower (32 extra registers); cp.async costs smem instead (40KB/block).
-    __shared__ unsigned char sa[2][8][2 * 16 * 80];
+    __shared__ unsigned char sa[2][8][2 * 16 * 48];
     #define ACT_ISSUE(TILE, BUF) do { \
-        for (int t = lane; t < 128; t += 32) { \
-            const int proj = t >> 6, off = t & 63; \
-            const int row = off >> 2, col = (off & 3) * 16; \
+        for (int t = lane; t < 64; t += 32) { \
+            const int proj = t >> 5, off = t & 31; \
+            const int row = off >> 1, col = (off & 1) * 16; \
             const unsigned char* src_ = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + (TILE) + col; \
             unsigned char* dst_ = sa[BUF][warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col; \
             const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
@@ -3487,13 +3487,13 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
     } while (0)
     ACT_ISSUE(k0, 0);
     int sbuf = 0;
-    for (int kb = k0; kb < k1; kb += 64, sbuf ^= 1) {
+    for (int kb = k0; kb < k1; kb += 32, sbuf ^= 1) {
         asm volatile("cp.async.wait_group 0;\n");
         __syncwarp();
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
         #pragma unroll
-        for (int kk = kb; kk < kb + 64; kk += 32) {
+        for (int kk = kb; kk < kb + 32; kk += 32) {
             const int kkl = kk - kb;
             unsigned ba[4];  // A fragments from this warp's padded smem slice
             ba[0] = *(const unsigned*)(sa[sbuf][warp] + (size_t)r0 * SA_STRIDE + kkl + c0);
@@ -3530,7 +3530,7 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
         }
         // Safe to fill the OTHER buffer now: this iteration's MMA operands are
         // already in registers.
-        if (kb + 64 < k1) ACT_ISSUE(kb + 64, sbuf ^ 1);
+        if (kb + 32 < k1) ACT_ISSUE(kb + 32, sbuf ^ 1);
     }
     #undef ACT_ISSUE
     if ((lane & 3) == 0) {
