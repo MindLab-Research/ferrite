@@ -3366,17 +3366,20 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     const float* arf = reinterpret_cast<const float*>(ar);
                     // 2 accumulators: the 8-iteration x2-FMA chain was 16 deep
                     // (fp32 cannot be reassociated by the compiler).
-                    float ya = 0.f, yb = 0.f;
+                    // 4 accumulators: the 8x2-FMA chain was 16 deep; fp32 cannot
+                    // be reassociated by the compiler.
+                    float ya = 0.f, yb = 0.f, yc = 0.f, yd = 0.f;
                     #pragma unroll
-                    for (int q = 0; q < 8; q += 2) {
-                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + q * 2);
-                        const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                        ya += (df.x * ds_c) * arf[q * 2] + (df.y * ds_c) * arf[q * 2 + 1];
-                        const __nv_fp8x2_storage_t dx2b = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + (q + 1) * 2);
-                        const float2 dfb = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2b, __NV_E4M3)));
-                        yb += (dfb.x * ds_c) * arf[(q + 1) * 2] + (dfb.y * ds_c) * arf[(q + 1) * 2 + 1];
+                    for (int q = 0; q < 8; q += 4) {
+                        #pragma unroll
+                        for (int u = 0; u < 4; u++) {
+                            const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + (q + u) * 2);
+                            const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                            const float t = (df.x * ds_c) * arf[(q + u) * 2] + (df.y * ds_c) * arf[(q + u) * 2 + 1];
+                            if (u == 0) ya += t; else if (u == 1) yb += t; else if (u == 2) yc += t; else yd += t;
+                        }
                     }
-                    float y = ya + yb;
+                    float y = (ya + yb) + (yc + yd);
                     // lanes 0..15 -> row h0+2c, lanes 16..31 -> row h0+2c+1
                     #pragma unroll
                     for (int off = 8; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
