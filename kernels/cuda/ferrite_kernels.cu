@@ -401,6 +401,7 @@ __global__ void conv1d_kernel(const float* __restrict__ x,
                               const float* __restrict__ state_in,
                               float* __restrict__ out,
                               float* __restrict__ state_out,
+                              float* __restrict__ snaps,   // [n-1][ch, hist] t-snapshots (null = none) — MTP verify B_k
                               int n, int ch, int conv) {
     // One block per channel (stream[] is per-channel state — the old (64,4)
     // block shared one stream across 64 channels, a data race).
@@ -419,19 +420,34 @@ __global__ void conv1d_kernel(const float* __restrict__ x,
             acc += w[c * conv + i] * stream[hist + t - (conv - 1) + i];
         out[(size_t)t * ch + c] = acc;
     }
+    // N-UNIFIED snapshots: state after token t = the last hist inputs
+    // [x_{t-hist+1}..x_t] = stream[t+1 .. t+hist] (verified: hist=3,
+    // state after t = [x_{t-2},x_{t-1},x_t] = stream[t+1..t+3]). The old
+    // verify path did a PER-TOKEN conv1d launch + a D2D snapshot copy per t
+    // (n=3: 3 launches + 2 cudaMemcpyAsync per GDN layer × 34 layers); this
+    // writes the snapshots straight from smem in the SAME launch.
+    if (snaps != nullptr) {
+        for (int t = threadIdx.x; t < n - 1; t += blockDim.x) {
+            float* sn = snaps + (size_t)t * ch * hist + (size_t)c * hist;
+            #pragma unroll 4
+            for (int hh = 0; hh < hist; hh++)
+                sn[hh] = stream[t + 1 + hh];
+        }
+        __syncthreads();
+    }
     for (int h = threadIdx.x; h < hist; h += blockDim.x)
         state_out[c * hist + h] = stream[n + h];
 }
 
 extern "C" cudaError_t ferrite_causal_conv1d(const float* x, const float* w,
                                              const float* state_in, float* out,
-                                             float* state_out, int n, int ch,
+                                             float* state_out, float* snaps, int n, int ch,
                                              int conv, cudaStream_t s) {
     int hist = conv - 1;
     dim3 block(128);
     dim3 grid(ch);
     size_t smem = (size_t)(hist + n) * sizeof(float);
-    conv1d_kernel<<<grid, block, smem, s>>>(x, w, state_in, out, state_out, n, ch, conv);
+    conv1d_kernel<<<grid, block, smem, s>>>(x, w, state_in, out, state_out, snaps, n, ch, conv);
     return cudaGetLastError();
 }
 

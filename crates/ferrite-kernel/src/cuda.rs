@@ -197,7 +197,7 @@ extern "C" {
     fn ferrite_swiglu2(gate: *const f32, up: *const f32, out: *mut f32,
                        n: i32, inter: i32, limit: f32, s: CuStream) -> i32;
     fn ferrite_causal_conv1d(x: *const f32, w: *const f32, state_in: *const f32,
-                             out: *mut f32, state_out: *mut f32,
+                             out: *mut f32, state_out: *mut f32, snaps: *mut f32,
                              n: i32, ch: i32, conv: i32, s: CuStream) -> i32;
     fn ferrite_conv1d_batched(x: *const f32, w: *const f32,
                              state_ptrs: *const *mut f32,
@@ -2225,7 +2225,7 @@ impl crate::KernelBackend for CudaBackend {
         let dsi = DevBuf::alloc(self.dev, self.stream, state_in.numel())?; dsi.upload(state_in.as_slice())?;
         let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         let dso = DevBuf::alloc(self.dev, self.stream, state_out.numel())?;
-        ck(unsafe { ferrite_causal_conv1d(dx.as_const_f32(), dw.as_const_f32(), dsi.as_const_f32(), do_.as_f32(), dso.as_f32(), n, ch, conv, self.stream) }, "conv1d")?;
+        ck(unsafe { ferrite_causal_conv1d(dx.as_const_f32(), dw.as_const_f32(), dsi.as_const_f32(), do_.as_f32(), dso.as_f32(), std::ptr::null_mut(), n, ch, conv, self.stream) }, "conv1d")?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         let sv = Arc::get_mut(&mut state_out.data).expect("unique state");
@@ -2838,37 +2838,25 @@ impl CudaBackend {
             )?;
         } else {
             let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
-            if let Some((_, _, cs_base, _)) = state_override {
-                // verify B_k scheme (N-UNIFIED): per-token conv1d (n=1 each)
-                // so the window state can be snapshotted after every t —
-                // snap t (accept-(t+1)'s commit source) lands at
-                // cs_base + t*(ch*hist); conv_state (B) holds the full state.
-                let qkv_p = qkv.as_ref().unwrap();
-                for t in 0..n {
-                    ck(
-                        unsafe {
-                            ferrite_causal_conv1d(
-                                qkv_p.as_const_f32().add(t * ch), dw_conv.as_const_f32(), conv_state,
-                                conv_out.as_f32().add(t * ch), conv_state, 1, ch as i32, conv_size as i32, self.stream,
-                            )
-                        },
-                        "conv1d_v_t",
-                    )?;
-                    if t + 1 < n {
-                        self.copy_raw_dev(conv_state as *const f32, unsafe { cs_base.add(t * ch * hist) }, ch * hist)?;
-                    }
-                }
-            } else {
-                ck(
-                    unsafe {
-                        ferrite_causal_conv1d(
-                            qkv.as_ref().unwrap().as_const_f32(), dw_conv.as_const_f32(), conv_state,
-                            conv_out.as_f32(), conv_state, ni, ch as i32, conv_size as i32, self.stream,
-                        )
-                    },
-                    "conv1d_dev",
-                )?;
-            }
+            // N-UNIFIED (verify 算子 = n=1 算子): ONE conv1d launch for ALL n
+            // tokens (the kernel loops t in smem) + the t-snapshots written
+            // straight from the smem stream — the old verify path launched a
+            // PER-TOKEN conv1d (n launches) + a D2D snapshot copy per t (the
+            // n=3 GDN layer was 8 kernels vs n=1's 2). snaps = the verify
+            // scratch base (cs_base + t*(ch*hist)); non-verify passes null.
+            let snaps = match state_override {
+                Some((_, _, cs_base, _)) => cs_base,
+                None => std::ptr::null_mut(),
+            };
+            ck(
+                unsafe {
+                    ferrite_causal_conv1d(
+                        qkv.as_ref().unwrap().as_const_f32(), dw_conv.as_const_f32(), conv_state,
+                        conv_out.as_f32(), conv_state, snaps, ni, ch as i32, conv_size as i32, self.stream,
+                    )
+                },
+                "conv1d_dev",
+            )?;
             // 3. GPU pre-processing (ferrite_gdn_prep): silu + split + per-head L2
             // norm + KDA q-scale + beta + gate — ONE kernel, zero host round-trips.
             ck(
