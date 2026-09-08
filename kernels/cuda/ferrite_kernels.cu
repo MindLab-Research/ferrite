@@ -4907,6 +4907,9 @@ __global__ void p2p_ar_down_v2_kernel(
         // *epoch never advanced (diag: e==0 for EVERY AR) → peers' flags
         // were never re-stamped → the monotonic wait deadlocked.
         unsigned prev = (gridDim.x == 1u) ? 0u : atomicAdd(ctr, 1u);
+        if (threadIdx.x == 0 && my_rank == 7 && e < 2u)
+            printf("[p2p-prev] rank=%d e=%u prev=%u gridDim=%u ctr=%u\n",
+                   my_rank, e, prev, (unsigned)gridDim.x, (unsigned)*ctr);
         if (prev == gridDim.x - 1u) { // last block: all stores fenced
             for (int r = 0; r < world; r++)
                 // SYSTEM-scope atomic store. A plain volatile store is only
