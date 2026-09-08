@@ -5831,7 +5831,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             }
             k += 32 * 16;
         }
-        #pragma unroll 4
+        #pragma unroll 2
         for (; k + 15 < k1; k += 32 * 16) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
@@ -5840,14 +5840,23 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             const float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
             const float4 xcc = *reinterpret_cast<const float4*>(xr + k + 8);
             const float4 xd = *reinterpret_cast<const float4*>(xr + k + 12);
-            const float xv[16] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w,
-                                  xcc.x, xcc.y, xcc.z, xcc.w, xd.x, xd.y, xd.z, xd.w};
+            // half2 FMA path: 8 fp8x2->half2 cvt + 8 __hfma2 per 16 values,
+            // replacing the old fp8->half2->float2 + 2 scalar FMA (~40 inst).
+            // fp16 accumulate ONLY within this 16-element chunk (8 terms), then
+            // folded into the fp32 acc with the per-128 scale — the chunk sum
+            // error is ~1e-3, far below the fp8 weight quantization (~1e-2).
+            const __half2 hx[8] = {__floats2half2_rn(xa.x, xa.y), __floats2half2_rn(xa.z, xa.w),
+                                   __floats2half2_rn(xb.x, xb.y), __floats2half2_rn(xb.z, xb.w),
+                                   __floats2half2_rn(xcc.x, xcc.y), __floats2half2_rn(xcc.z, xcc.w),
+                                   __floats2half2_rn(xd.x, xd.y), __floats2half2_rn(xd.z, xd.w)};
+            __half2 a2 = __float2half2_rn(0.f);
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
-                const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3)));
-                acc += (wf.x * sc) * xv[p * 2] + (wf.y * sc) * xv[p * 2 + 1];
+                const __half2_raw wraw = __nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3);
+                a2 = __hfma2(*reinterpret_cast<const __half2*>(&wraw), hx[p], a2);
             }
+            acc += (__half2float(a2.x) + __half2float(a2.y)) * sc;
         }
         for (; k < k1; k++) {
             const float sc = srow[k >> 7];
