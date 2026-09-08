@@ -149,7 +149,14 @@ fp8 m16n8k32 的 A 片段布局与 ldmatrix 输出布局确实一致；但速度
 指令/issue 受限，而是内存延迟受限**（与"8→16 seqs 仅 +4%"的扩展曲线一致）。至此 roadmap 里
 "按指令数优化 act" 的方向已全部证伪（cp.async 有效是因为它改了延迟隐藏方式，不是因为省指令）。
 
-### 已回退：moe_down 的 cp.async 跨 token 预取（输出损坏）
+### 已排除（根因明确）：moe_down 的 cp.async 预取不可行
+
+两次尝试都损坏输出，最终定位到**根本障碍**：原代码的 `uint4 dv4[4]` 是**每 lane 私有的 16 字节**，
+cp.async 搬到 smem 后 32 个 lane 会写同一个槽位（竞态）。按 lane 展开 smem 需要
+32 lane × 4 c × 16B × 4 token × 9 warp = **73KB/block**（占用直接崩）。→ down 的加载无法用
+cp.async 预取，除非改数据布局（例如让 lane 的 16 字节在 smem 中交错）。**这条路已封死。**
+
+（历史记录）### 已回退：moe_down 的 cp.async 跨 token 预取（输出损坏）
 
 尝试把 down 的 4 个 uint4 权重加载改成 cp.async 双缓冲（smem 仅 128B/warp，无占用代价，
 理论上能隐藏 ~300 周期的 L2 延迟）：速度 966 tok/s（略快），但**输出损坏**
