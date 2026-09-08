@@ -4178,7 +4178,6 @@ __global__ void sparse_attn_v2_batched_kernel(
         if (valid && !dup) {
             const float4* k4 = reinterpret_cast<const float4*>(k_s + ((size_t)j * h + hd) * d);
             float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-            #pragma unroll 2
             for (int l = lid * 4; l + 3 < d; l += TG * 4) {
                 float4 kk = k4[l >> 2];
                 float4 qq = *reinterpret_cast<const float4*>(qs + l);
