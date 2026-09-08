@@ -4448,9 +4448,8 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
     // applies rsq (rsq itself moved there too — phase 1 is a pure dot now).
     const int KS = gridDim.z;
     int t = blockIdx.x;
-    const int m0 = blockIdx.y * 8;   // 8 mix rows per block (x re-read 24x
-                                     // -> L2-bound; 8 rows = half the x traffic
-                                     // and 8 weight loads in flight per iter)
+    const int m0 = blockIdx.y * 4;   // 4 mix rows per block: x was re-read
+                                     // once per mix row (24x -> L2-bound)
     int z = blockIdx.z;
     if (t >= s) return;
     const float* x = res + (size_t)t * n * h;
@@ -4460,17 +4459,17 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
     int lo = z * seg;
     int hi = min(lo + seg, nh);
 
-    float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
     float sq = 0.f;
     for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
         const float xv = x[i];                 // ONE x read serves 4 rows
         sq += xv * xv;                         // Σx² rides free
         #pragma unroll
-        for (int mm = 0; mm < 8; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
+        for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
     }
     __shared__ float red[8];
     #pragma unroll
-    for (int mm = 0; mm < 8; mm++) {
+    for (int mm = 0; mm < 4; mm++) {
         float a = acc[mm];
         for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
         if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = a;
@@ -4694,7 +4693,7 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     float* pre_s_g = mx_scratch + (size_t)s * mix * HC_MIX_KS + (size_t)s * HC_MIX_KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
-    dim3 mix_grid(s, (mix + 7) / 8, HC_MIX_KS);
+    dim3 mix_grid(s, (mix + 3) / 4, HC_MIX_KS);
     if (ferrite_pdl_enabled()) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
