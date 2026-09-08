@@ -4926,7 +4926,12 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
     // owned by MtpState and live for the seq's lifetime).
     std::mem::forget(emb);
     std::mem::forget(hprev);
-    if let Some(h) = h_out.as_ref() { std::mem::forget(h); }
+    // h_out is an Option<DevBuf> ALIAS: forgetting `h_out.as_ref()` (a
+    // &DevBuf) is a NO-OP — the Some(DevBuf) still dropped and returned the
+    // MtpState-owned h_d[i] address to the pool, so later allocations
+    // (enorm/hnorm in the next call) aliased it and overwrote the draft
+    // chain's h relay. Forget the Option ITSELF (moves the owned DevBuf).
+    std::mem::forget(h_out);
     std::mem::forget(arg);
     result
 }

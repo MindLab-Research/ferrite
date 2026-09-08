@@ -392,7 +392,12 @@ fn is_capturing() -> bool {
 }
 
 fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void) {
-    pool().lock().unwrap().entry((dev, class)).or_default().push(PoolPtrs(ptr, stage));
+    let mut p = pool().lock().unwrap();
+    let v = p.entry((dev, class)).or_default();
+    if std::env::var_os("FERRITE_POOL_DEBUG").is_some() && v.iter().any(|pp| pp.0 == ptr) {
+        eprintln!("[pool-dup] DOUBLE RELEASE dev={dev} class={class} ptr={ptr:?}");
+    }
+    v.push(PoolPtrs(ptr, stage));
 }
 
 fn buf_pool_take(dev: i32, class: u32) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
