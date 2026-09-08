@@ -287,3 +287,9 @@ Other profiling rules:
 
 **其他中性/更差的尝试（勿重复）**：gemv WPR=2（17.87）、gemv 内层 unroll 4（17.67）、
 moe_route warp-shuffle top-k（17.61，中性但修掉了 `bidx[threadIdx.x]` 越界写 [32] 数组）。
+
+**act kernel 双 tile 预取（2026-09-08，已回退）**：把 `uint4 pf[4]`（1 个 tile）改成
+`pf[8]`（2 个 tile，kb 消费 pf[cur] 时重填 pf[cur]=tile(kb+128)）→ **19.6ms（-12%）**，
+文本仍正确。根因：pf[8] = 32 个额外寄存器压低占用，收益被抵消。**结论：act 的瓶颈不是
+单个 warp 的 load 深度**（单 tile 版已经是 8 warp × 4 uint4 = 32 个在飞的 load），
+继续加深度只会伤占用率。
