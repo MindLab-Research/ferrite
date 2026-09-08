@@ -4716,7 +4716,7 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         for (int i = 0; i < 16; i++) {
             if (i < n) {
                 const unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[i * hpb + threadIdx.x]);
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], 4;\n"
                              :: "r"(dst), "l"(x + (size_t)i * h + col));
             }
         }
