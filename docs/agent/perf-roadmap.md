@@ -89,3 +89,14 @@
 "提速 8%"（16.02ms / 999 tok/s）是假象，文本也漂移（"忠志之士"→"忠志之臣"）。
 已回退。**教训：改 block 尺寸前必须先看 kernel 的跨 warp 归约是否硬编码 warp 数。**
 （gated_rmsnorm 的改动是安全的，因为它的归约在改的时候一并改成了 `blockDim.x >> 5` 循环。）
+
+## 2026-09-08 有效：act 的 cp.async 双缓冲 staging（+0.8%）
+
+`moe_fused_act_fp8_mma_kernel` 原来是 global→寄存器(pf[4])→smem 两跳、单缓冲：每 tile 的
+MMA 只有 ~64 周期，而 load 要 ~600 周期，寄存器预取填不满这个窗口（所以 2-tile 寄存器预取
+因 32 个额外寄存器而更慢）。改成 **`cp.async.ca.shared.global` 直写 smem + 双缓冲**
+（`sa[2][8][...]` = 40KB/block，占用从 8 block/SM 降到 5，但每 warp 2 个 tile 在飞）：
+17.33-17.37 → **17.21-17.23 ms（929-930 tok/s）**，文本正确。
+
+要点：cp.async 的写入是异步的，所以必须在**本轮的 fragment load 已经完成后**才 issue 下一块
+（代码里放在 MMA 之后 ✓ —— MMA 的操作数此时已在寄存器里，不读 smem）。
