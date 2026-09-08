@@ -449,3 +449,9 @@ gmask 同步改成 `0xffu << (... & ~7u)`。**注意**：该测试的最后一�
 `uint4 wv = *(const uint4*)(wr + k)` → `ld.global.nc.L2::128B.v4.u32`（内联 PTX，read-only +
 128B L2 预取粒度）：per-seq 58.4-58.7 → **60.2-60.9（聚合 963-974）**，文本正确。
 **结论：流式权重读取的 L2 预取提示值得逐 kernel 试**（act 上已 +0.3%，gemv 上 +2%）。
+
+### 中性：sparse_attn v 侧的 `.L2::128B`
+
+per-seq 59.0-60.0（基线 59.4-60.5），在波动内 → 保留。`.L2::128B` 提示的实测汇总：
+gemv **+2%**、act +0.3%、down/router/mix **略差（已回退）**、sparse_attn v 侧中性。
+**结论：提示必须逐 kernel A/B，不能一概而论。**
