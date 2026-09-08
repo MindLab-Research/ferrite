@@ -3278,6 +3278,18 @@ impl CudaBackend {
         conv_size: usize,
     ) -> Result<DevBuf> {
         self.enter();
+        // ALIGN (2026-09-08): n==1 must take the SAME fused path as the
+        // single-seq chain. gdn_layer_dev uses gemv_tri_dev (b/fa/ga 3-in-1)
+        // and gemv_qkv_conv (the conv FIR + silu + window slide INLINED in
+        // the qkv GEMV epilogue) at n=1; this batched path always ran the
+        // unfused matmul×N + conv1d_batched — measured +8.5ms/step of fixed
+        // cost across the 34 GDN layers (batched graph replayed 17.95ms vs
+        // the mega graph's 9.46ms at B=1; 19.48ms at B=2 — B-independent).
+        if n == 1 {
+            return self.gdn_layer_dev(
+                x, w, seqs[0], layer, 1, hidden, h, dk, lb, rms_eps, conv_size, None,
+            );
+        }
         let proj = h * dk;
         let ni = n as i32;
         let ch = 3 * proj;
