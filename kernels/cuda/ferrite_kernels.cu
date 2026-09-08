@@ -5965,7 +5965,10 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         const float* srow = scale + (size_t)(row >> 7) * scols;
         int k = k0 + lane * 16;
         if (k + 15 < k1) {
-            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            uint4 wv;
+            asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(wv.x), "=r"(wv.y), "=r"(wv.z), "=r"(wv.w)
+                         : "l"(wr + k));
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
             const float sc = srow[k >> 7];
             const float xv0[16] = {xc[0][0].x, xc[0][0].y, xc[0][0].z, xc[0][0].w,
