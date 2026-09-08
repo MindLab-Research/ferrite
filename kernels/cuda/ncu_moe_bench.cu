@@ -205,10 +205,17 @@ int main(int argc, char** argv) {
         CK(cudaMemcpy(gs, h_sc_gate, sc_per, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(us, h_sc_up, sc_per, cudaMemcpyHostToDevice));
         CK(cudaMemcpy(ds, h_sc_down, dsc_per, cudaMemcpyHostToDevice));
-        // bf16 "weights": fp8 bytes widened (garbage values, timing-only)
-        for (size_t i = 0; i < w8_per; i++) { unsigned short b = (unsigned short)h_w8_gate[i] << 8; CK(cudaMemcpy(g16 + i * 2, &b, 2, cudaMemcpyHostToDevice)); }
-        for (size_t i = 0; i < w8_per; i++) { unsigned short b = (unsigned short)h_w8_up[i] << 8; CK(cudaMemcpy(u16 + i * 2, &b, 2, cudaMemcpyHostToDevice)); }
-        for (size_t i = 0; i < dw8_per; i++) { unsigned short b = (unsigned short)h_w8_down[i] << 8; CK(cudaMemcpy(d16 + i * 2, &b, 2, cudaMemcpyHostToDevice)); }
+        // bf16 "weights": fp8 bytes widened on the HOST (one bulk H2D — the
+        // per-element loop was 288×3×2M tiny memcpys, hours; here: 3 copies)
+        static unsigned short* h16 = nullptr;
+        if (!h16) { h16 = (unsigned short*)malloc(w8_per * 2); }
+        for (size_t i = 0; i < w8_per; i++) h16[i] = (unsigned short)h_w8_gate[i] << 8;
+        CK(cudaMemcpy(g16, h16, w8_per * 2, cudaMemcpyHostToDevice));
+        for (size_t i = 0; i < w8_per; i++) h16[i] = (unsigned short)h_w8_up[i] << 8;
+        CK(cudaMemcpy(u16, h16, w8_per * 2, cudaMemcpyHostToDevice));
+        if (!h16) { h16 = (unsigned short*)malloc(dw8_per * 2); }
+        for (size_t i = 0; i < dw8_per; i++) h16[i] = (unsigned short)h_w8_down[i] << 8;
+        CK(cudaMemcpy(d16, h16, dw8_per * 2, cudaMemcpyHostToDevice));
         h_gate_ptrs[e] = g; h_up_ptrs[e] = u; h_down_ptrs[e] = d;
         h_gsc_ptrs[e] = gs; h_usc_ptrs[e] = us; h_dsc_ptrs[e] = ds;
         h_gate16_ptrs[e] = g16; h_up16_ptrs[e] = u16; h_down16_ptrs[e] = d16;

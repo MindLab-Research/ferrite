@@ -3003,19 +3003,23 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         uw8 = shared_up_w8;   us = shared_up_scale;
     }
     // ---- 1. per-block quantize (v1 mode — NO cross-block barrier) ----
+    // blockDim 512 (16 warps): the 256/8-warp launch held Occ at 24% (288
+    // blocks × 8 warps = 16 warps/SM of 64 — ncu: MemTP 49% @ 1.99TB/s);
+    // 16 warps/block × 288 blocks = 32 warps/SM ≈ 48% Occ → more outstanding
+    // loads → the L2/HBM pipe saturates.
     extern __shared__ unsigned char smem[];
     unsigned char* sx = smem;                       // [hidden] e4m3 xq
-    float* sred = (float*)(smem + hidden);         // [256] absmax reduce
-    float* sxs = (float*)(smem + hidden + 256 * 4); // [1] x_scale
-    float* sgacc = sxs + 1;                        // [8][16] gate partials
-    float* suacc = sgacc + 8 * 16;                 // [8][16] up partials
+    float* sred = (float*)(smem + hidden);         // [512] absmax reduce
+    float* sxs = (float*)(smem + hidden + 512 * 4); // [1] x_scale
+    float* sgacc = sxs + 1;                        // [16][16] gate partials
+    float* suacc = sgacc + 16 * 16;               // [16][16] up partials
     {
         float amax = 1e-9f;
-        for (int k = threadIdx.x; k < hidden; k += 256)
+        for (int k = threadIdx.x; k < hidden; k += blockDim.x)
             amax = fmaxf(amax, fabsf(xt[k]));
         sred[threadIdx.x] = amax;
         __syncthreads();
-        for (int off = 128; off > 0; off >>= 1) {
+        for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
             if (threadIdx.x < off)
                 sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
             __syncthreads();
@@ -3023,15 +3027,15 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         if (threadIdx.x == 0) sxs[0] = sred[0] / 448.0f;
         __syncthreads();
         const float inv = 1.0f / sxs[0];
-        for (int k = threadIdx.x; k < hidden; k += 256) {
+        for (int k = threadIdx.x; k < hidden; k += blockDim.x) {
             const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
             sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
         }
         __syncthreads();
     }
-    // ---- 2. gate mma + up mma (same smem xq; 8-warp K-split each) ----
+    // ---- 2. gate mma + up mma (same smem xq; 16-warp K-split each) ----
     const int nblk = (hidden + 127) >> 7;
-    const int bseg = (nblk + 7) / 8;
+    const int bseg = (nblk + 15) / 16;
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, hidden);
@@ -3088,7 +3092,7 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     // quant scale) before the nonlinearity (v1 gemv epilogue semantics).
     if (warp == 0 && lane < 16) {
         float g = 0.f, u = 0.f;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 16; i++) {
             g += sgacc[i * 16 + lane];
             u += suacc[i * 16 + lane];
         }
@@ -3116,9 +3120,12 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
     int max_rows = inter > inter_shared ? inter : inter_shared;
     if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported; // v1 alignment
     dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
-    const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
+    // 512 threads (16 warps): ncu showed the 256/8-warp launch at Occ 24%
+    // (288 blocks × 8 warps = 16 warps/SM of 64) and MemTP 49% — the 16-warp
+    // K-split doubles the in-flight loads per SM (Occ → 48%).
+    const int smem = hidden + 512 * 4 + 4 + 2 * 16 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
+    moe_fused_act_fp8_mma_kernel<<<grid, 512, smem, s>>>(
         x, ids_f,
         (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
         (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
