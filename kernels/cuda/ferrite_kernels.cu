@@ -3583,7 +3583,7 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
             const unsigned char* src_ = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + (TILE) + col; \
             unsigned char* dst_ = sa[BUF][warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col; \
             const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
         } \
         asm volatile("cp.async.commit_group;\n"); \
     } while (0)
