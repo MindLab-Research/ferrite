@@ -152,7 +152,9 @@ Other profiling rules:
 7. sparse_attn 的 live_k 边界（原按固定 select_k_max=2048 循环）+ indexer 短上下文快路径。
 8. dense-FFN / GDN host 路径的 AR 改 P2P 优先；run_matmul 走快路径。
 
-**已验证无效/更差（勿重复）**：gemv row-major、down TT=1/8/16、ROWS=16/64、gemv R=8（无 x 缓存时）、gemv 1024 线程/block、K 循环 unroll 4、token 循环 unroll 2、去掉 fp8 转换链（仅省 4.5% → 非转换瓶颈）、act 的共享 sa staging、HC_MIX_KS 8→2。
+**已验证无效/更差（勿重复）**：gemv row-major（**权重矩阵 1-3MB 全在 L2 内，token-major 的 16x 重读是 L2 命中，不是 DRAM 瓶颈**——实测 18.15 vs 17.99ms）、down TT=1/8/16、ROWS=16/64、gemv R=8（无 x 缓存时）、gemv 1024 线程/block、K 循环 unroll 4、token 循环 unroll 2、去掉 fp8 转换链（仅省 4.5%）、act 的共享 sa staging、act 的 128 列 staging（18.93ms，占用率下降）、HC_MIX_KS 8→2。
+
+**教训（乱码=数值回归，且可能是"少算"）**：gemv row-major 曾测得 14.78ms/1082 tok/s 但输出 `!!!`——因为 launcher 的 grid 硬除 `rpb*8` 而 kernel 在 `nrows%8!=0` 时用 R=1，**只算了 1/8 的输出行**。**任何提速都必须同时人眼验证文本，否则"少算"会被误当成"优化"。**
 
 **当前每步每卡分解（nsys，~300 步反推）**：p2p_ar_publish ~1.8（含 barrier）/ **moe_act 3.4** / matmul_tiled_bf16 3.3（多为 prefill）/ **gemv_fp8 2.4** / **moe_down 2.1** / **indexer 1.6** / hc_rest345 1.34 / hc_mix 1.04 / kpool 1.0 / gdn_chunk 1.0 / gdn_step 0.6 / sparse_attn 0.6 / NCCL AR 残余 0.64。
 
