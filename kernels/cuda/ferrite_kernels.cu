@@ -1952,6 +1952,9 @@ __global__ void hc_post_kernel(const float* __restrict__ x,
     int i = (idx / h) % n;
     int t = idx / (n * h);
     float acc = post[(size_t)t * n + i] * x[(size_t)t * h + j];
+    // n independent (comb broadcast, res coalesced) loads per iteration —
+    // unroll so they are in flight together.
+    #pragma unroll 4
     for (int k = 0; k < n; k++) {
         acc += comb[(size_t)t * n * n + k * n + i] * res[(size_t)(t * n + k) * h + j];
     }
