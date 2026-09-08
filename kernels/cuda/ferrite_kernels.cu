@@ -3495,16 +3495,24 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
         #pragma unroll
         for (int kk = kb; kk < kb + 64; kk += 32) {
             const int kkl = kk - kb;
-            unsigned ba[4];  // A fragments from this warp's padded smem slice
-            ba[0] = *(const unsigned*)(sa[sbuf][warp] + (size_t)r0 * SA_STRIDE + kkl + c0);
-            ba[1] = *(const unsigned*)(sa[sbuf][warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
-            ba[2] = *(const unsigned*)(sa[sbuf][warp] + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
-            ba[3] = *(const unsigned*)(sa[sbuf][warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
+            // ldmatrix.x4 replaces 8 scalar 4-byte smem loads. The fp8
+            // m16n8k32 A fragment is 16 rows x 32 K = four 8x8 b16 tiles, and
+            // its per-lane layout (row l/4, k (l%4)*4) is exactly ldmatrix's
+            // output. Lane l supplies its sub-tile's row address: (l&15) picks
+            // the row, (l>>4) the 16-byte K half. SA_STRIDE=80 keeps every
+            // address 16-byte aligned.
+            const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+                sa[sbuf][warp] + (size_t)(lane & 15) * SA_STRIDE + kkl + ((lane >> 4) * 16));
+            unsigned ba[4];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(ba[0]), "=r"(ba[1]), "=r"(ba[2]), "=r"(ba[3])
+                         : "r"(saddr_a));
+            const unsigned saddr_u = (unsigned)__cvta_generic_to_shared(
+                sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)(lane & 15) * SA_STRIDE + kkl + ((lane >> 4) * 16));
             unsigned b1_[4]; // up A fragments
-            b1_[0] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0);
-            b1_[1] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
-            b1_[2] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
-            b1_[3] = *(const unsigned*)(sa[sbuf][warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(b1_[0]), "=r"(b1_[1]), "=r"(b1_[2]), "=r"(b1_[3])
+                         : "r"(saddr_u));
             unsigned b[2];   // B: smem xq (n=8 replica)
             b[0] = *(const unsigned*)(sx + kk + c0);
             b[1] = *(const unsigned*)(sx + kk + c0 + 16);
