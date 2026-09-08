@@ -3272,6 +3272,16 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
                 }
                 }
+                py[hh] = y; // per-LANE partial (the shuffle reduction moves
+                            // OUT of the row loop: interleaving it after every
+                            // row serialized the next row's loads — the kernel
+                            // ran at 8% of the ALU/BW roofline, latency-bound)
+            }
+            // shuffle-reduce the 8 rows' per-lane partials (batched: all row
+            // loads are already in flight, so this no longer stalls them)
+            #pragma unroll
+            for (int hh = 0; hh < 8; hh++) {
+                float y = py[hh];
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) {
                     y += __shfl_down_sync(0xffffffff, y, off);
