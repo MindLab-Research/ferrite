@@ -5021,7 +5021,11 @@ __global__ void p2p_ar_finish_v3_kernel(
     // Monotonic stamp wait: any NEW stamp satisfies it, so ranks may drift.
     const int tr = (threadIdx.x < (unsigned)world) ? (int)threadIdx.x : -1;
     if (tr >= 0) { // one thread per peer polls its own flag (parallel)
-        unsigned prev = seen[tr];
+        // Per-block seen row: a shared row is corrupted when several finish
+        // blocks poll the same peer (block A stores the new stamp, block B
+        // then sees prev == cur and waits forever).
+        unsigned* my_seen = seen + (size_t)blockIdx.x * (unsigned)world;
+        unsigned prev = my_seen[tr];
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
         long spins = 0;
         while ((int)(cur - prev) <= 0) {
@@ -5029,13 +5033,13 @@ __global__ void p2p_ar_finish_v3_kernel(
             cur = *(volatile unsigned*)&ready_local[tr];
             if (++spins > 500000) { // ~50ms: diagnose + break instead of hanging
                 if (tr == 0) {
-                    printf("[p2p-hang] rank=%d peer=%d prev=%u cur=%u myepoch=%u\n",
-                           my_rank, tr, prev, cur, e);
+                    printf("[p2p-hang] rank=%d peer=%d prev=%u cur=%u myepoch=%u blk=%u\n",
+                           my_rank, tr, prev, cur, e, (unsigned)blockIdx.x);
                 }
                 break;
             }
         }
-        seen[tr] = cur;
+        my_seen[tr] = cur;
     }
     __syncthreads();
     const int step = gridDim.x * blockDim.x;

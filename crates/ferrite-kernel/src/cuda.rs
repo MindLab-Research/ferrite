@@ -5020,8 +5020,13 @@ impl CudaBackend {
         ck(unsafe { cudaMalloc(&mut rd, world * 4) }, "p2p_ar flags malloc")?;
         ck(unsafe { cudaMemset(rd, 0, world * 4) }, "p2p_ar flags zero")?;
         let mut sn: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut sn, world * 4) }, "p2p_ar seen malloc")?;
-        ck(unsafe { cudaMemset(sn, 0, world * 4) }, "p2p_ar seen zero")?;
+        // [MAX_FBLOCKS][world]: every finish-kernel block polls with its OWN
+        // seen row. With a single shared row, block A updated seen[tr] and
+        // block B then read prev == cur == the new stamp → waited forever
+        // (measured: prev=2 cur=2 myepoch=1, 18 stalls per step).
+        const MAX_FBLOCKS: usize = 256;
+        ck(unsafe { cudaMalloc(&mut sn, MAX_FBLOCKS * world * 4) }, "p2p_ar seen malloc")?;
+        ck(unsafe { cudaMemset(sn, 0, MAX_FBLOCKS * world * 4) }, "p2p_ar seen zero")?;
         let mut ep: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut ep, 4) }, "p2p_ar epoch malloc")?;
         ck(unsafe { cudaMemset(ep, 0, 4) }, "p2p_ar epoch zero")?;
@@ -5085,9 +5090,10 @@ impl CudaBackend {
         // stamps from before the reset don't satisfy the first wait. The
         // ping-pong staging needs no reset (fully overwritten each call).
         ck(unsafe { cudaMemsetAsync(st.ready_local, 0, st.world * 4, self.stream) }, "p2p ready reset")?;
-        // seen[] holds each peer's last-observed stamp — zero it so the first
-        // wait of the next replay accepts the peers' first new stamp.
-        ck(unsafe { cudaMemsetAsync(st.seen, 0, st.world * 4, self.stream) }, "p2p seen reset")?;
+        // seen[] holds each peer's last-observed stamp, one row per finish
+        // block (see p2p_ar_alloc) — zero it so the first wait of the next
+        // replay accepts the peers' first new stamp.
+        ck(unsafe { cudaMemsetAsync(st.seen, 0, 256 * st.world * 4, self.stream) }, "p2p seen reset")?;
         Ok(())
     }
 
