@@ -5850,59 +5850,6 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     }
 }
 
-// TILED fp8 GEMM (replaces the token-major GEMV for the attention
-// projections): one block computes a 16-row x 16-token output tile and loads
-// the weight tile [16 x 128] (fp8) + the x tile [16 x 128] (f32) into smem
-// ONCE per K-block. The old kernel re-read the whole weight matrix per token
-// (16x, ~50MB/call from L2 at 1.2TB/s). Strides are padded (132/130) to keep
-// the smem reads bank-conflict-free.
-__global__ void gemm_fp8_tiled_kernel(
-    const float* __restrict__ x, const unsigned char* __restrict__ w,
-    const float* __restrict__ scale, const float* __restrict__ bias,
-    float* __restrict__ y, int in_f, int out_f, int nrows, int scols) {
-    const int SW = 132, SX = 130;
-    __shared__ unsigned char sw[16 * 132];
-    __shared__ float sx[16 * 130];
-    const int m0 = blockIdx.x * 16;
-    const int n0 = blockIdx.y * 16;
-    const int mi = threadIdx.x >> 4;
-    const int ni = threadIdx.x & 15;
-    const int row = m0 + mi;
-    const int tok = n0 + ni;
-    float acc = 0.f;
-    for (int kb = 0; kb < in_f; kb += 128) {
-        for (int t = threadIdx.x; t < 16 * 128; t += blockDim.x) {
-            const int r = t >> 7, c = t & 127;
-            const int rr = m0 + r;
-            sw[r * SW + c] = (rr < out_f && kb + c < in_f) ? w[(size_t)rr * in_f + kb + c] : (unsigned char)0;
-        }
-        for (int t = threadIdx.x; t < 16 * 128; t += blockDim.x) {
-            const int tt = t >> 7, c = t & 127;
-            const int tk = n0 + tt;
-            sx[tt * SX + c] = (tk < nrows && kb + c < in_f) ? x[(size_t)tk * in_f + kb + c] : 0.f;
-        }
-        __syncthreads();
-        if (row < out_f && tok < nrows) {
-            const float sc = scale[(size_t)(row >> 7) * scols + (kb >> 7)];
-            const int kmax = (in_f - kb < 128) ? (in_f - kb) : 128;
-            const unsigned char* wp = sw + mi * SW;
-            const float* xp = sx + ni * SX;
-            float part = 0.f;
-            int k = 0;
-            for (; k + 1 < kmax; k += 2) {
-                const __nv_fp8x2_storage_t w2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(wp + k);
-                const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(w2, __NV_E4M3)));
-                part += wf.x * xp[k] + wf.y * xp[k + 1];
-            }
-            if (k < kmax) part += __half2float(__nv_cvt_fp8_to_halfraw(wp[k], __NV_E4M3)) * xp[k];
-            acc += part * sc;
-        }
-        __syncthreads();
-    }
-    if (row < out_f && tok < nrows)
-        y[(size_t)tok * out_f + row] = (bias ? bias[row] : 0.f) + acc;
-}
-
 extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           const float* scale, const float* bias,
                                           float* out, int in_f, int out_f,
@@ -5910,15 +5857,6 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           cudaStream_t s) {
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
     long total = (long)nrows * out_f;
-    // TILED path (any nrows/out_f; the tile edges are guarded). The old
-    // token-major GEMV re-read the whole weight matrix per token.
-    {
-        dim3 tgrid((unsigned)((out_f + 15) / 16), (unsigned)((nrows + 15) / 16));
-        gemm_fp8_tiled_kernel<<<tgrid, 256, 0, s>>>(
-            x, reinterpret_cast<const unsigned char*>(w), scale, bias, out,
-            in_f, out_f, nrows, scols);
-        return cudaGetLastError();
-    }
     constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
     dim3 grid((unsigned)((total + rpb * 8 - 1) / (rpb * 8)));
