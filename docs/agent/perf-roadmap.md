@@ -280,3 +280,16 @@ GDN 的 6 处 dot（`for (i<dk) acc += k[i] * S[i*stride + j]`）是**串行 FMA
 2. **MLA 吸收**（内存 -64x，但算力 +2x）：只有在算力不是瓶颈时才划算 —— 上面的分析表明
    在长上下文它可能反而变慢。**降级为备选**。
 3. **Tensor-core 化 attention**（FlashAttention 式分块）：算力可再降 10x+，但属大重写。
+
+### 修正：fp16 DSA 缓存只值 ~1.5-2%，不值得做
+
+进一步拆解 sparse_attn 的两半：
+- **k 侧（score 点积）**：累加在 softmax 前，fp16 累加误差 ~1e-3 可接受 → 可用 `__hfma2`（2x）。
+- **v 侧（加权和）**：要对 ~1000 项加权求和，fp16 累加误差 ~1e-2 **不可接受**，必须保持 fp32 累加
+  → 只能拿到"load 宽度减半"的内存收益（该侧内存本就只占 ~0.13ms/2ms）。
+
+所以整体只能省下 k 侧一半算力 ≈ 25% 的 attention ≈ **1.5-2% 的步时**，与 ~100 行的改动
+（append 写 half + 注意力半精度化 + Rust 分配减半 + dummy 同步）不成比例。**降级为低优先级。**
+
+**真正的 2x+ 只有一条路**：把 sparse_attn 的分数与加权和做成 **tensor-core（FlashAttention 式）**
+分块矩阵乘 —— 算力可再降 10x+，但属于大重写（含 softmax 的在线归一化、slot 索引的 gather 布局）。
