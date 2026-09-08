@@ -299,7 +299,7 @@ extern "C" {
                             b_raw: *const f32, fb: *const f32, dt_bias: *const f32,
                             a_log: *const f32, lb: f32,
                             state: *mut f32, out: *mut f32,
-                            h: i32, dk: i32, dv: i32, stream: CuStream) -> i32;
+                            h: i32, dk: i32, dv: i32, dsplits: i32, stream: CuStream) -> i32;
     fn ferrite_add(x: *const f32, y: *const f32, z: *mut f32,
                    n: i32, stream: CuStream) -> i32;
     fn cudaMemset(ptr: *mut std::ffi::c_void, val: i32, bytes: usize) -> i32;
@@ -2956,7 +2956,8 @@ impl CudaBackend {
                         q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
                         b_raw.as_const_f32(), fb.as_const_f32(),
                         dw_dt.as_const_f32(), dw_al.as_const_f32(), lb,
-                        gdn_state, core.as_f32(), h as i32, dk as i32, dk as i32, self.stream,
+                        gdn_state, core.as_f32(), h as i32, dk as i32, dk as i32,
+                        (64 / (h as i32).max(1)).clamp(1, 8), self.stream,
                     )
                 },
                 "gdn_step_v2p",
