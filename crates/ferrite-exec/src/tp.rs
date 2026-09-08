@@ -3479,7 +3479,7 @@ fn attn_shard(
             cuda.graph_capture_begin();
             let mut x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
             x_dev.upload(hn.as_slice())?;
-            let partial = cuda.gdn_layer_dev(
+            let mut partial = cuda.gdn_layer_dev(
                 &x_dev, &gw, seq, layer_idx, n, hidden,
                 la.num_heads, la.head_dim, la.gate_lower_bound,
                 s.cfg.rms_norm_eps, la.short_conv_kernel_size, None,
@@ -3518,7 +3518,7 @@ fn attn_shard(
         }
         let x_dev = DevBuf::alloc(cuda.dev(), cuda.stream(), hn.numel())?;
         x_dev.upload(hn.as_slice())?;
-        let partial = cuda.gdn_layer_dev(
+        let mut partial = cuda.gdn_layer_dev(
             &x_dev, &gw, seq, layer_idx, n, hidden,
             la.num_heads, la.head_dim, la.gate_lower_bound,
             s.cfg.rms_norm_eps, la.short_conv_kernel_size, None,
