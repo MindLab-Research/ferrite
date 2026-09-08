@@ -4722,7 +4722,13 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         topk: d.index_topk,
         rms_eps: cfg.rms_norm_eps,
     };
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
+        eprintln!("[dsa-t] pre  {:?}", cuda.dsa_pinned(seq, mtp_family));
+    }
     let attn_partial = cuda.dsa_layer_dev(&hn, &w, seq, mtp_family, 1, h)?;
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
+        eprintln!("[dsa-t] post {:?}", cuda.dsa_pinned(seq, mtp_family));
+    }
     let mut attn_partial = attn_partial;
     let ar_p2p = cuda.p2p_ar_v2(&mut attn_partial, h).unwrap_or(false);
     if !ar_p2p {

@@ -3233,6 +3233,15 @@ impl CudaBackend {
         m.get(&(seq, family)).map(|c| c.t_count)
     }
 
+    /// Debug getter: (pinned_t0, pinned_total, t_count) — the values the
+    /// captured kernels read zero-copy (pinned) vs the host bookkeeping.
+    pub fn dsa_pinned(&self, seq: u64, family: usize) -> Option<(i32, i32, usize)> {
+        let m = self.dsa_caches.lock().unwrap();
+        m.get(&(seq, family)).map(|c| unsafe {
+            (*c.pinned_t0, *c.pinned_total, c.t_count)
+        })
+    }
+
     // ============================================================
     // BATCHED decode layers (n = B rows from B DIFFERENT seqs): the GEMM
     // projections run at n=B (weights read ONCE per step — the user's
