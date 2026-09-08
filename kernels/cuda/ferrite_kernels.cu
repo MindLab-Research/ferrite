@@ -4825,12 +4825,28 @@ extern "C" cudaError_t ferrite_add(const float* x, const float* y, float* z,
 }
 
 // ============================================================
-// MTP Phase2: fused n-token GDN chunk (verify n=2) — ONE launch per layer
+// MTP Phase2: fused n-token GDN chunk (verify n=2/3) — ONE launch per layer
 // instead of the t-split's 2 chunk_v2 launches + a B0 copy in between.
 // The state stays resident in smem across the t loop (HBM state round-trip
 // eliminated); the t=0 snapshot (B0 = A+t_last for accept-1's commit) is
 // written straight from smem. Saves ~2 launches + 16MB HBM traffic/layer
-// on the 34 GDN layers (verify 23.4ms → ~19ms expected).
+// on the 34 GDN layers.
+//
+// v2p UNIFICATION (n-arbitrary directive — the per-t body is gdn_step_v2p's
+// core, so n=1 decode and n=3 verify share ONE logic):
+//   1. col-split kS/o (v2p stage 1/3): blockDim = splits × dv lanes —
+//      lane (g,j) reduces rows [g*dk/splits, (g+1)*dk/splits), per-column
+//      partials joined via red2. The old one-thread-per-column serial
+//      dk=128-step loop left 384/512 threads idle (dv=128 columns only).
+//   2. uniform idx-strided decay (v2p stage 0 pattern): the old per-thread
+//      full-row loop (thread i owns row i, serial j in 0..dv) idled
+//      blockDim-dk threads; the idx loop spreads dk*dv evenly.
+//   3. t=0's decay FUSED into the state load (S = Sg * exp(gate_0) —
+//      bit-identical to load-then-multiply; v2p's proven pattern).
+// FP class: kS/o's split-partials + serial g-join changes the summation
+// order by 1 ulp (the same change v2p made on the n=1 path — gdn-approved,
+// validated by 出师表). Snapshots gdn0/gdn1 keep the exact t-boundary
+// semantics (post-delta, pre-next-decay).
 // ============================================================
 __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
                                        const float* __restrict__ k,
@@ -4852,51 +4868,90 @@ __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
     float* kh = ks + dv;                   // [dk]
     float* vh = kh + dk;                   // [dv]
     float* qh = vh + dv;                   // [dk]
-    float* gh = qh + dk;                   // [dk]
+    float* dec = qh + dk;                  // [dk] per-channel decay exp(gate)
+    float* red2 = dec + dk;                // [splits*dv <= 512] col-split partials
     float* Sg = state + (size_t)hd * dk * dv;
-    // state load ONCE (smem resident across the whole t loop)
-    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
+    const int splits = (int)(blockDim.x / dv); // 512/128 = 4
+    int rows = (dk + splits - 1) / splits;
+    // state load + t=0 decay FUSED (S = Sg * exp(gate_0[i]) — one pass,
+    // bit-identical to the old load + multiply): the dec0 factor needs
+    // gate[t=0] FIRST, so the t=0 gate read rides this pass (kh/qh/vh load
+    // in the t-loop below as usual).
+    {
+        const size_t th0 = (size_t)0 * h + hd;
+        for (int i = threadIdx.x; i < dk; i += blockDim.x)
+            dec[i] = expf(gate[th0 * dk + i]);
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+            S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx] * dec[idx / dv];
+    }
     __syncthreads();
     for (int t = 0; t < n; t++) {
         float bt = beta[(size_t)t * h + hd];
+        const size_t th = (size_t)t * h + hd;
         for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-            gh[i] = gate[((size_t)t * h + hd) * dk + i];
-            qh[i] = q[((size_t)t * h + hd) * dk + i];
-            kh[i] = k[((size_t)t * h + hd) * dk + i];
+            qh[i] = q[th * dk + i];
+            kh[i] = k[th * dk + i];
         }
         for (int j = threadIdx.x; j < dv; j += blockDim.x)
-            vh[j] = v[((size_t)t * h + hd) * dv + j];
+            vh[j] = v[th * dv + j];
         __syncthreads();
-        // 1. per-channel decay
-        for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-            float decay = expf(gh[i]);
-            if (decay != 1.0f) {
-                float* Si = S + (size_t)i * spitch;
-                for (int j = 0; j < dv; j++) Si[j] *= decay;
+        // 0. per-channel decay for t>0 (t=0 was fused into the load above).
+        //    Uniform idx-stride (dk*dv spread over all threads — the old
+        //    per-thread full-row loop idled blockDim-dk threads).
+        if (t > 0) {
+            for (int i = threadIdx.x; i < dk; i += blockDim.x)
+                dec[i] = expf(gate[th * dk + i]);
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+                S[(size_t)(idx / dv) * spitch + (idx % dv)] *= dec[idx / dv];
+            __syncthreads();
+        }
+        // 1. kS = S^T k — col-split (v2p stage 1): lane (g,j) reduces a
+        // dk/splits row block, per-column partials joined via red2.
+        {
+            int g = threadIdx.x / dv, j = threadIdx.x - g * dv;
+            if (g < splits) {
+                float acc = 0.f;
+                int i0 = g * rows, i1 = min(i0 + rows, dk);
+                for (int i = i0; i < i1; i++)
+                    acc += kh[i] * S[(size_t)i * spitch + j];
+                red2[(size_t)g * dv + j] = acc;
             }
+            __syncthreads();
+            if (threadIdx.x < dv) {
+                float a = 0.f;
+                for (int g2 = 0; g2 < splits; g2++)
+                    a += red2[(size_t)g2 * dv + threadIdx.x];
+                ks[threadIdx.x] = a;
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        // 2. kS = S^T k
-        for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-            float acc = 0.f;
-            for (int i = 0; i < dk; i++) acc += kh[i] * S[(size_t)i * spitch + j];
-            ks[j] = acc;
-        }
-        __syncthreads();
-        // 3. delta rule
+        // 2. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
         for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
             S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
                 bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
         __syncthreads();
-        // 4. o = q^T S
-        for (int j = threadIdx.x; j < dv; j += blockDim.x) {
-            float acc = 0.f;
-            for (int i = 0; i < dk; i++) acc += qh[i] * S[(size_t)i * spitch + j];
-            out[((size_t)t * h + hd) * dv + j] = acc;
+        // 3. o = q^T S — same col-split scheme as stage 1.
+        {
+            int g = threadIdx.x / dv, j = threadIdx.x - g * dv;
+            if (g < splits) {
+                float acc = 0.f;
+                int i0 = g * rows, i1 = min(i0 + rows, dk);
+                for (int i = i0; i < i1; i++)
+                    acc += qh[i] * S[(size_t)i * spitch + j];
+                red2[(size_t)g * dv + j] = acc;
+            }
+            __syncthreads();
+            if (threadIdx.x < dv) {
+                float a = 0.f;
+                for (int g2 = 0; g2 < splits; g2++)
+                    a += red2[(size_t)g2 * dv + threadIdx.x];
+                out[((size_t)t * h + hd) * dv + threadIdx.x] = a;
+            }
+            __syncthreads();
         }
-        __syncthreads();
-        // 5. t=0/t=1 snapshots (B_k = A + t_0..t_k: accept-k's commit source)
+        // 4. t=0/t=1 snapshots (B_k = A + t_0..t_k: accept-k's commit source)
         // straight from smem — B0 = A+t_last (accept-1), B1 = A+t_last+d1
         // (accept-2, n=3 only)
         if ((t == 0 && gdn0 != nullptr) || (t == 1 && gdn1 != nullptr)) {
@@ -4915,13 +4970,14 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
     const float* beta, const float* gate, const float* a_log,
     float* state, float* gdn0, float* gdn1, float* out,
     int n, int h, int dk, int dv, cudaStream_t s) {
+    // smem: S[dk*(dv+1)] + ks[dv] + kh[dk] + vh[dv] + qh[dk] + dec[dk]
+    //      + red2[splits*dv <= 512]
     size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
-                  + (size_t)(dv + dk + dv + dk + dk) * sizeof(float);
+                  + (size_t)(dv + dk + dv + dk + dk + 512) * sizeof(float);
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gdn_chunk_fused_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         if (e != cudaSuccess) {
-
             return e;
         }
     }
@@ -4931,7 +4987,6 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
         q, k, v, beta, gate, a_log, state, gdn0, gdn1, out, n, h, dk, dv);
     cudaError_t le = cudaGetLastError();
     if (le != cudaSuccess) {
-
     }
     return le;
 }
