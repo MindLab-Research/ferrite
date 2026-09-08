@@ -100,3 +100,13 @@ MMA 只有 ~64 周期，而 load 要 ~600 周期，寄存器预取填不满这�
 
 要点：cp.async 的写入是异步的，所以必须在**本轮的 fragment load 已经完成后**才 issue 下一块
 （代码里放在 MMA 之后 ✓ —— MMA 的操作数此时已在寄存器里，不读 smem）。
+
+## 2026-09-08 有效：hc_pre_mix 的 K 循环 unroll 4（+1%）
+
+`hc_pre_mix_split_kernel` 的 K 循环每轮有 5 个**独立** load（x + 4 个权重行），但没有
+`#pragma unroll` —— 编译器把它们串行化了。加 `#pragma unroll 4` 后：
+17.17-17.22 → **17.01-17.07 ms（937-940 tok/s）**，文本正确。
+
+**可复用判据**：热点 kernel 里"每轮多个互不依赖的 global load"的循环，若没有 unroll，
+先试 `#pragma unroll 4`（比手写预取便宜、不会像寄存器预取那样压占用）。
+本会话已验证有效：hc_pre_mix（+1%）、hc_pre_rest345 的 P3（早前 +0.7%）、act 的 cp.async（+0.8%）。
