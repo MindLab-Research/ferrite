@@ -3231,58 +3231,46 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             aj = act_t + (size_t)topk * inter;
             klen = inter_shared;
         dot:;
-            // v12.1: REGISTER-CACHE the act row (klen f32, 48/lane as 12 float4).
-            // The v12 h-loop re-read aj from L2 every hh iteration (9 warps
-            // x 512 blocks x 8 h x 6KB = 220MB of L2 traffic — THE 44.6µs
-            // bottleneck, invariant across v0/v11/v12 grid structures).
-            // Layout: dot iteration i covers f32 [i, i+16) = float4
-            // [i>>2, i>>2+4); per-lane steps i = lane*16 + step*512 →
-            // float4 idx = lane*4 + step*128 + k (k=0..3). Slot r encodes
-            // step=(r>>2), k=(r&3): ar[r] = a4[lane*4 + (r>>2)*128 + (r&3)].
-            float4 ar[12];
+            // REGISTER-CACHE the act row: with 8 bytes per lane, each lane needs
+            // only 8 floats (2 float4) — 8 registers instead of the old 48,
+            // which lifts occupancy, and ALL 32 lanes are active (the old
+            // 16B/lane mapping left lanes 16-31 idle for klen=256).
+            float4 ar[2];
             {
                 const float4* a4 = reinterpret_cast<const float4*>(aj);
                 const int f4 = klen >> 2;
-                #pragma unroll
-                for (int r = 0; r < 12; r++) {
-                    int idx = lane * 4 + (r >> 2) * 128 + (r & 3);
-                    ar[r] = (idx < f4) ? a4[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
-                }
+                const int idx = lane * 2;
+                ar[0] = (idx < f4) ? a4[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
+                ar[1] = (idx + 1 < f4) ? a4[idx + 1] : make_float4(0.f, 0.f, 0.f, 0.f);
             }
-            // UNROLLED h loop: with `#pragma unroll 1` the rows were serialized
-            // (load -> fp8 convert -> FMA -> 5-step shuffle, next row waits) so
-            // only 256B was in flight per warp -> ~10% of HBM bandwidth
-            // (134MB/call in 177us). Unrolling issues several independent row
-            // loads per warp (the rows are contiguous: dwr = dbase + h*klen).
+            // UNROLLED h loop (no `break`, so the compiler can really unroll and
+            // keep several independent row loads in flight — with the break the
+            // pragma was ignored and only 256B was in flight per warp).
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
-                if (h >= hidden) break;
+                float y = 0.f;
+                if (h < hidden) {
                 const unsigned char* dwr = dbase + (size_t)h * klen;
                 const float* dsr = dsr_base + (size_t)(h >> 7) * dscols;
-                float y = 0.f;
-                int i = lane * 16;
-                for (; i + 15 < klen; i += 32 * 16) {
-                    uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+                int i = lane * 8;
+                for (; i + 7 < klen; i += 32 * 8) {
+                    const uint2 dv = *reinterpret_cast<const uint2*>(dwr + i);
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
                     const float ds_c = dsr[i >> 7];
-                    // act row from REGISTERS: slot = step*4 (step = (i-lane*16)/512)
-                    const int slot = ((i >> 2) - lane * 4) >> 5;
-                    const float4 aa = ar[slot];
-                    const float4 ab = ar[slot + 1];
-                    const float4 ac = ar[slot + 2];
-                    const float4 ad = ar[slot + 3];
-                    const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
-                                          ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+                    // this lane's act floats: aj[i .. i+7] == ar[0], ar[1]
+                    const float xv[8] = {ar[0].x, ar[0].y, ar[0].z, ar[0].w,
+                                         ar[1].x, ar[1].y, ar[1].z, ar[1].w};
                     #pragma unroll
-                    for (int p = 0; p < 8; p++) {
-                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                    for (int p = 0; p < 4; p++) {
+                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + p * 2);
                         const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
                         y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
                     }
                 }
                 for (; i < klen; i++) {
                     y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
+                }
                 }
                 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) {
