@@ -2744,19 +2744,21 @@ impl CudaBackend {
             }
         }
         let b = size * std::mem::size_of::<*mut f32>();
-        // Capture must NOT enqueue an async H2D: the source is a stack Vec,
-        // so a captured memcpy NODE would replay against freed memory
-        // (Xid 13 Out-Of-Range — measured). Sync copy inside capture, async
-        // on the replay path.
-        let upd = |dst: *mut std::ffi::c_void, src: *const std::ffi::c_void| -> Result<()> {
-            if self.capturing() {
-                ck(unsafe { cudaMemcpy(dst, src, b, CUDA_MEMCPY_H2D) }, "gdn tbl capture copy")
-            } else {
-                ck(unsafe { cudaMemcpyAsync(dst, src, b, CUDA_MEMCPY_H2D, self.stream) }, "gdn tbl update")
-            }
-        };
-        upd(c_tbl, conv_ptrs.as_ptr() as *const _)?;
-        upd(g_tbl, gdn_ptrs.as_ptr() as *const _)?;
+        // The table CONTENT is written by the dry-run (capturing() == false)
+        // BEFORE the capture pass. Inside capture neither async nor sync
+        // H2D is allowed (err 900 / a captured node replaying freed stack
+        // memory → Xid 13), so skip it there — the recorded kernels read
+        // the table the dry-run already filled.
+        if !self.capturing() {
+            ck(
+                unsafe { cudaMemcpyAsync(c_tbl, conv_ptrs.as_ptr() as *const _, b, CUDA_MEMCPY_H2D, self.stream) },
+                "gdn tbl update",
+            )?;
+            ck(
+                unsafe { cudaMemcpyAsync(g_tbl, gdn_ptrs.as_ptr() as *const _, b, CUDA_MEMCPY_H2D, self.stream) },
+                "gdn tbl update",
+            )?;
+        }
         Ok((c_tbl as *const *mut f32, g_tbl as *const *mut f32))
     }
 
@@ -2855,11 +2857,11 @@ impl CudaBackend {
                 totp.push(dtot);
             }
         }
-        // capture-aware (see gdn_state_tables): a captured async H2D would
-        // replay against the stack Vec → Xid 13.
+        // capture-aware (see gdn_state_tables): the dry-run already filled
+        // the table; inside capture H2D is illegal (err 900 / Xid 13).
         let up = |dst: *mut std::ffi::c_void, src: *const std::ffi::c_void| -> Result<()> {
             if self.capturing() {
-                ck(unsafe { cudaMemcpy(dst, src, b, CUDA_MEMCPY_H2D) }, "dsa tbl capture copy")
+                Ok(())
             } else {
                 ck(unsafe { cudaMemcpyAsync(dst, src, b, CUDA_MEMCPY_H2D, self.stream) }, "dsa tbl update")
             }
