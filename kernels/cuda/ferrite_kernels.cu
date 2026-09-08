@@ -1101,18 +1101,29 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
         }
         __syncthreads();
     }
-    // renorm pass (single thread, small topk) — raw sigmoid scores, no bias
-    if (threadIdx.x == 0) {
-        float sum = 0.f;
-        for (int r = 0; r < topk; r++) {
-            int j = (int)ids[(size_t)row * topk + r];
-            float val = sm[j];
-            probs[(size_t)row * topk + r] = val;
-            sum += val;
-        }
-        for (int r = 0; r < topk; r++)
-            probs[(size_t)row * topk + r] = probs[(size_t)row * topk + r] / (sum + 1e-9f) * scale;
+    // renorm pass (block-wide: 2 passes over topk + block reduce). Was a
+    // single-thread loop over topk=2048 (~4.5µs x 42 calls/step = 0.19ms).
+    float lsum = 0.f;
+    for (int r = threadIdx.x; r < topk; r += blockDim.x) {
+        int j = (int)ids[(size_t)row * topk + r];
+        float val = sm[j];
+        probs[(size_t)row * topk + r] = val;
+        lsum += val;
     }
+    for (int off = 16; off > 0; off >>= 1) lsum += __shfl_down_sync(0xffffffff, lsum, off);
+    __shared__ float rsum[32];
+    if ((threadIdx.x & 31) == 0) rsum[threadIdx.x >> 5] = lsum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float s = 0.f;
+        int nw = (blockDim.x + 31) >> 5;
+        for (int w = 0; w < nw; w++) s += rsum[w];
+        rsum[0] = s + 1e-9f;
+    }
+    __syncthreads();
+    const float rdenom = rsum[0];
+    for (int r = threadIdx.x; r < topk; r += blockDim.x)
+        probs[(size_t)row * topk + r] = probs[(size_t)row * topk + r] / rdenom * scale;
 }
 
 // ============================================================
@@ -1224,19 +1235,29 @@ __global__ void router_gemm_route_fused_kernel(
         }
         __syncthreads();
     }
-    // renorm (the same as moe_route_kernel)
+    // renorm (block-wide: same math as moe_route_kernel's parallel renorm).
+    float lsum2 = 0.f;
+    for (int r = threadIdx.x; r < topk; r += blockDim.x) {
+        int j = (int)ids[r];
+        float val = sm[j];
+        probs[r] = val;
+        lsum2 += val;
+    }
+    for (int off = 16; off > 0; off >>= 1) lsum2 += __shfl_down_sync(0xffffffff, lsum2, off);
+    __shared__ float rsum2[32];
+    if ((threadIdx.x & 31) == 0) rsum2[threadIdx.x >> 5] = lsum2;
+    __syncthreads();
     if (threadIdx.x == 0) {
-        float sum = 0.f;
-        for (int r = 0; r < topk; r++) {
-            int j = (int)ids[r];
-            float val = sm[j];
-            probs[r] = val;
-            sum += val;
-        }
-        for (int r = 0; r < topk; r++)
-            probs[r] = probs[r] / (sum + 1e-9f) * scale;
+        float s = 0.f;
+        int nw = (blockDim.x + 31) >> 5;
+        for (int w = 0; w < nw; w++) s += rsum2[w];
+        rsum2[0] = s + 1e-9f;
         *ctr = 0u; // reset for the next invocation (the mega graph replays)
     }
+    __syncthreads();
+    const float rdenom2 = rsum2[0];
+    for (int r = threadIdx.x; r < topk; r += blockDim.x)
+        probs[r] = probs[r] / rdenom2 * scale;
 }
 
 extern "C" cudaError_t ferrite_router_gemm_route_fused(
