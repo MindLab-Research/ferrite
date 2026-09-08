@@ -309,6 +309,14 @@ impl NcclChannel {
         let r = unsafe { (self.api.ncclAllReduce)(send as *const c_void, recv as *mut c_void, count, NCCL_FLOAT32, NCCL_SUM, self.comm, self.stream) };
         self.api.ck(r, "ncclAllReduce")
     }
+
+    /// bf16 all-reduce: the batched decode's AR is latency-bound
+    /// (320KB / 223us = 2.9GB/s), so halving the payload is the cheap
+    /// experiment before restructuring the AR.
+    pub fn all_reduce_bf16(&self, send: *const c_void, recv: *mut c_void, count: usize) -> Result<()> {
+        let r = unsafe { (self.api.ncclAllReduce)(send, recv, count, NCCL_BFLOAT16, NCCL_SUM, self.comm, self.stream) };
+        self.api.ck(r, "ncclAllReduce bf16")
+    }
 }
 
 impl Drop for NcclChannel {

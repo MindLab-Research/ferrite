@@ -216,6 +216,7 @@ extern "C" {
                                ctr: *mut u32,
                                staging_local: *const f32,
                                ready_local: *const u32,
+                               seen: *mut u32,
                                out: *mut f32, n: i32, world: i32, my_rank: i32,
                                stride: i32,
                                s: CuStream) -> i32;
@@ -2713,6 +2714,7 @@ unsafe impl Sync for DsaBatchTables {}
 pub struct P2pArState {
     pub staging_local: *mut std::ffi::c_void, // [2][world][max_n] f32
     pub ready_local: *mut std::ffi::c_void,   // [world] u32 epoch stamps
+    pub seen: *mut std::ffi::c_void,          // [world] u32 last-observed stamps
     pub epoch: *mut std::ffi::c_void,         // [1] u32 call counter
     pub ctr: *mut std::ffi::c_void,          // [1] u32 block arrivals
     pub staging_tbl: *mut std::ffi::c_void,   // [world] device ptrs (peers' staging bases)
@@ -5001,6 +5003,9 @@ impl CudaBackend {
         let mut rd: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut rd, world * 4) }, "p2p_ar flags malloc")?;
         ck(unsafe { cudaMemset(rd, 0, world * 4) }, "p2p_ar flags zero")?;
+        let mut sn: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut sn, world * 4) }, "p2p_ar seen malloc")?;
+        ck(unsafe { cudaMemset(sn, 0, world * 4) }, "p2p_ar seen zero")?;
         let mut ep: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut ep, 4) }, "p2p_ar epoch malloc")?;
         ck(unsafe { cudaMemset(ep, 0, 4) }, "p2p_ar epoch zero")?;
@@ -5010,6 +5015,7 @@ impl CudaBackend {
         let _ = self.p2p_ar.lock().unwrap().replace(P2pArState {
             staging_local: st,
             ready_local: rd,
+            seen: sn,
             epoch: ep,
             ctr: ct,
             staging_tbl: std::ptr::null_mut(),
@@ -5063,6 +5069,9 @@ impl CudaBackend {
         // stamps from before the reset don't satisfy the first wait. The
         // ping-pong staging needs no reset (fully overwritten each call).
         ck(unsafe { cudaMemsetAsync(st.ready_local, 0, st.world * 4, self.stream) }, "p2p ready reset")?;
+        // seen[] holds each peer's last-observed stamp — zero it so the first
+        // wait of the next replay accepts the peers' first new stamp.
+        ck(unsafe { cudaMemsetAsync(st.seen, 0, st.world * 4, self.stream) }, "p2p seen reset")?;
         Ok(())
     }
 
@@ -5105,6 +5114,7 @@ impl CudaBackend {
                 st.ctr as *mut u32,
                 st.staging_local as *const f32,
                 st.ready_local as *const u32,
+                st.seen as *mut u32,
                 buf.as_f32(),
                 n as i32,
                 st.world as i32,

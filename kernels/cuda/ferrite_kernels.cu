@@ -4944,6 +4944,7 @@ __global__ void p2p_ar_fused_v3_kernel(
     unsigned* epoch, unsigned* ctr,             // this rank's device counters
     const float* __restrict__ staging_local,   // my [2][world][stride]
     const unsigned* __restrict__ ready_local,   // my [world] epoch stamps
+    unsigned* __restrict__ seen,                // my [world] last-observed stamps
     float* __restrict__ out, int world, int my_rank, int n, int stride) {
     unsigned e = *epoch; // this call's epoch (pre-advance)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -4985,21 +4986,29 @@ __global__ void p2p_ar_fused_v3_kernel(
     // phase B: sum — spin until all peers' flags reach e+1, then reduce the
     // (e&1) staging segment. e2 from the local register (epoch already
     // advanced by phase A's last block — rereading it would be a race).
-    unsigned e2 = e + 1u;
+    // phase B: wait for a NEW (monotonic) stamp, not a specific epoch.
+    // The old wait compared against e+1, which required every rank's epoch
+    // counter to stay in lockstep — one skipped/extra AR anywhere left a
+    // rank waiting for a stamp that never came (diag: myepoch=270 flag=270,
+    // off by exactly 1 → deadlock). The seen[] array (per rank, per peer)
+    // remembers the last observed stamp, so any NEW value satisfies the wait
+    // regardless of absolute counter alignment.
     if (tr >= 0) { // one thread per peer polls its own flag (parallel)
+        unsigned prev = seen[tr];
+        unsigned cur = *(volatile unsigned*)&ready_local[tr];
         long spins = 0;
-        while ((int)((*(volatile unsigned*)&ready_local[tr]) - e2) < 0) {
+        while ((int)(cur - prev) <= 0) {
             __nanosleep(100);
+            cur = *(volatile unsigned*)&ready_local[tr];
             if (++spins > 500000) { // ~50ms: diagnose + break instead of hanging
                 if (tr == 0) {
-                    printf("[p2p-hang] rank=%d peer=%d e2=%u flag=%u myepoch=%u\n",
-                           my_rank, tr, e2,
-                           (unsigned)*(volatile unsigned*)&ready_local[tr],
-                           (unsigned)*epoch);
+                    printf("[p2p-hang] rank=%d peer=%d prev=%u cur=%u myepoch=%u\n",
+                           my_rank, tr, prev, cur, (unsigned)*epoch);
                 }
                 break;
             }
         }
+        seen[tr] = cur;
     }
     __syncthreads();
     if (i < n) {
