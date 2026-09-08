@@ -5782,52 +5782,63 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     // token's x row is re-read by every (block, row) otherwise (measured
     // 196MB of x vs 49MB of weights per call -> L2-bound).
     const int R = ((out_f & 7) == 0) ? 8 : 1;
-    const int rowg0 = (blockIdx.x * rpb + warp / WPR) * R;
+    const int rowg0 = (blockIdx.x * rpb + warp / WPR) * R;   // row within token
     const int kw = warp % WPR;                 // K-slice id
     const int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
     const int k0 = kw * kper;
     const int k1 = min(k0 + kper, in_f);
-    __shared__ float part[16];
-    float4 xc[4];
-    {
+    __shared__ float part[32];
+    // TWO tokens per block: the weight row is loaded and fp8->half2 converted
+    // ONCE and reused for both tokens' dots — the per-token instruction count
+    // drops ~32% (this GEMV is issue-bound at n=16, not bandwidth-bound).
+    // Each token keeps its own accumulation order -> bit-identical output.
+    const int t0 = blockIdx.y * 2;
+    float4 xc[2][4];
+    #pragma unroll
+    for (int tt = 0; tt < 2; tt++) {
         const int k = k0 + lane * 16;
-        if (k + 15 < k1) {
-            const float* xr0 = x + (size_t)(rowg0 / out_f) * in_f + k;
-            xc[0] = *reinterpret_cast<const float4*>(xr0);
-            xc[1] = *reinterpret_cast<const float4*>(xr0 + 4);
-            xc[2] = *reinterpret_cast<const float4*>(xr0 + 8);
-            xc[3] = *reinterpret_cast<const float4*>(xr0 + 12);
+        if (t0 + tt < nrows && k + 15 < k1) {
+            const float* xr0 = x + (size_t)(t0 + tt) * in_f + k;
+            xc[tt][0] = *reinterpret_cast<const float4*>(xr0);
+            xc[tt][1] = *reinterpret_cast<const float4*>(xr0 + 4);
+            xc[tt][2] = *reinterpret_cast<const float4*>(xr0 + 8);
+            xc[tt][3] = *reinterpret_cast<const float4*>(xr0 + 12);
         } else {
-            xc[0] = xc[1] = xc[2] = xc[3] = make_float4(0.f, 0.f, 0.f, 0.f);
+            xc[tt][0] = xc[tt][1] = xc[tt][2] = xc[tt][3] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
     }
     // UNROLLED row loop (no `break`: it blocked unrolling, leaving the 8 rows'
     // loads serialized — the kernel is latency-bound, ~32us per block for 8KB).
     #pragma unroll
     for (int r = 0; r < R; r++) {
-    const int rowg = rowg0 + r;
-    if (rowg >= nrows * out_f) continue;
-    const int token = rowg / out_f;
-    const int row = rowg - token * out_f;
-    float acc = 0.f;
+    const int row = rowg0 + r;
+    if (row >= out_f) continue;
+    float acc0 = 0.f, acc1 = 0.f;
     {
         const unsigned char* wr = w + (size_t)row * in_f;
-        const float* xr = x + (size_t)token * in_f;
+        const float* xr0 = x + (size_t)t0 * in_f;
+        const float* xr1 = x + (size_t)(t0 + 1) * in_f;
+        const bool has1 = (t0 + 1) < nrows;
         const float* srow = scale + (size_t)(row >> 7) * scols;
         int k = k0 + lane * 16;
         if (k + 15 < k1) {
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
             const float sc = srow[k >> 7];
-            const float xv[16] = {xc[0].x, xc[0].y, xc[0].z, xc[0].w,
-                                  xc[1].x, xc[1].y, xc[1].z, xc[1].w,
-                                  xc[2].x, xc[2].y, xc[2].z, xc[2].w,
-                                  xc[3].x, xc[3].y, xc[3].z, xc[3].w};
+            const float xv0[16] = {xc[0][0].x, xc[0][0].y, xc[0][0].z, xc[0][0].w,
+                                   xc[0][1].x, xc[0][1].y, xc[0][1].z, xc[0][1].w,
+                                   xc[0][2].x, xc[0][2].y, xc[0][2].z, xc[0][2].w,
+                                   xc[0][3].x, xc[0][3].y, xc[0][3].z, xc[0][3].w};
+            const float xv1[16] = {xc[1][0].x, xc[1][0].y, xc[1][0].z, xc[1][0].w,
+                                   xc[1][1].x, xc[1][1].y, xc[1][1].z, xc[1][1].w,
+                                   xc[1][2].x, xc[1][2].y, xc[1][2].z, xc[1][2].w,
+                                   xc[1][3].x, xc[1][3].y, xc[1][3].z, xc[1][3].w};
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
                 const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3)));
-                acc += (wf.x * sc) * xv[p * 2] + (wf.y * sc) * xv[p * 2 + 1];
+                acc0 += (wf.x * sc) * xv0[p * 2] + (wf.y * sc) * xv0[p * 2 + 1];
+                acc1 += (wf.x * sc) * xv1[p * 2] + (wf.y * sc) * xv1[p * 2 + 1];
             }
             k += 32 * 16;
         }
@@ -5836,50 +5847,62 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
             const float sc = srow[k >> 7];
-            const float4 xa = *reinterpret_cast<const float4*>(xr + k);
-            const float4 xb = *reinterpret_cast<const float4*>(xr + k + 4);
-            const float4 xcc = *reinterpret_cast<const float4*>(xr + k + 8);
-            const float4 xd = *reinterpret_cast<const float4*>(xr + k + 12);
-            // half2 FMA path: 8 fp8x2->half2 cvt + 8 __hfma2 per 16 values,
-            // replacing the old fp8->half2->float2 + 2 scalar FMA (~40 inst).
-            // fp16 accumulate ONLY within this 16-element chunk (8 terms), then
-            // folded into the fp32 acc with the per-128 scale — the chunk sum
-            // error is ~1e-3, far below the fp8 weight quantization (~1e-2).
-            const __half2 hx[8] = {__floats2half2_rn(xa.x, xa.y), __floats2half2_rn(xa.z, xa.w),
-                                   __floats2half2_rn(xb.x, xb.y), __floats2half2_rn(xb.z, xb.w),
-                                   __floats2half2_rn(xcc.x, xcc.y), __floats2half2_rn(xcc.z, xcc.w),
-                                   __floats2half2_rn(xd.x, xd.y), __floats2half2_rn(xd.z, xd.w)};
-            __half2 a2 = __float2half2_rn(0.f);
+            const float4 xa0 = *reinterpret_cast<const float4*>(xr0 + k);
+            const float4 xb0 = *reinterpret_cast<const float4*>(xr0 + k + 4);
+            const float4 xc0 = *reinterpret_cast<const float4*>(xr0 + k + 8);
+            const float4 xd0 = *reinterpret_cast<const float4*>(xr0 + k + 12);
+            const __half2 hx0[8] = {__floats2half2_rn(xa0.x, xa0.y), __floats2half2_rn(xa0.z, xa0.w),
+                                    __floats2half2_rn(xb0.x, xb0.y), __floats2half2_rn(xb0.z, xb0.w),
+                                    __floats2half2_rn(xc0.x, xc0.y), __floats2half2_rn(xc0.z, xc0.w),
+                                    __floats2half2_rn(xd0.x, xd0.y), __floats2half2_rn(xd0.z, xd0.w)};
+            const float4 xa1 = *reinterpret_cast<const float4*>(xr1 + k);
+            const float4 xb1 = *reinterpret_cast<const float4*>(xr1 + k + 4);
+            const float4 xc1 = *reinterpret_cast<const float4*>(xr1 + k + 8);
+            const float4 xd1 = *reinterpret_cast<const float4*>(xr1 + k + 12);
+            const __half2 hx1[8] = {__floats2half2_rn(xa1.x, xa1.y), __floats2half2_rn(xa1.z, xa1.w),
+                                    __floats2half2_rn(xb1.x, xb1.y), __floats2half2_rn(xb1.z, xb1.w),
+                                    __floats2half2_rn(xc1.x, xc1.y), __floats2half2_rn(xc1.z, xc1.w),
+                                    __floats2half2_rn(xd1.x, xd1.y), __floats2half2_rn(xd1.z, xd1.w)};
+            // half2 FMA path (see gemv header): 8 cvt + 8 __hfma2 per 16 values
+            // per token, but the 8 cvt are SHARED by both tokens.
+            __half2 a20 = __float2half2_rn(0.f), a21 = __float2half2_rn(0.f);
             #pragma unroll
             for (int p = 0; p < 8; p++) {
                 const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
                 const __half2_raw wraw = __nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3);
-                a2 = __hfma2(*reinterpret_cast<const __half2*>(&wraw), hx[p], a2);
+                const __half2 w2 = *reinterpret_cast<const __half2*>(&wraw);
+                a20 = __hfma2(w2, hx0[p], a20);
+                a21 = __hfma2(w2, hx1[p], a21);
             }
-            acc += (__half2float(a2.x) + __half2float(a2.y)) * sc;
+            acc0 += (__half2float(a20.x) + __half2float(a20.y)) * sc;
+            acc1 += (__half2float(a21.x) + __half2float(a21.y)) * sc;
         }
         for (; k < k1; k++) {
             const float sc = srow[k >> 7];
-            acc += (__half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc) * xr[k];
+            const float wf8 = __half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc;
+            acc0 += wf8 * xr0[k];
+            acc1 += wf8 * xr1[k];
         }
     }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) {
-        acc += __shfl_down_sync(0xffffffff, acc, off);
+        acc0 += __shfl_down_sync(0xffffffff, acc0, off);
+        acc1 += __shfl_down_sync(0xffffffff, acc1, off);
     }
-    if (WPR == 1) {
-        if (lane == 0) y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + acc;
-    } else {
-        if (lane == 0) part[warp] = acc;
-        __syncthreads();
-        if (warp % WPR == 0 && lane == 0) {
-            float sum = 0.f;
-            #pragma unroll
-            for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
-            y[(size_t)token * out_f + row] = (bias ? bias[row] : 0.f) + sum;
+    if (lane == 0) { part[warp] = acc0; part[16 + warp] = acc1; }
+    __syncthreads();
+    if (warp % WPR == 0 && lane == 0) {
+        float s0 = 0.f, s1 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < WPR; j++) {
+            s0 += part[(warp / WPR) * WPR + j];
+            s1 += part[16 + (warp / WPR) * WPR + j];
         }
-        __syncthreads();
+        const float b = bias ? bias[row] : 0.f;
+        y[(size_t)t0 * out_f + row] = b + s0;
+        if (has1) y[(size_t)(t0 + 1) * out_f + row] = b + s1;
     }
+    __syncthreads();
     }
 }
 
@@ -5889,10 +5912,13 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           int nrows, int srows, int scols,
                                           cudaStream_t s) {
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
-    long total = (long)nrows * out_f;
     constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
-    dim3 grid((unsigned)((total + rpb * 8 - 1) / (rpb * 8)));
+    // grid.x = row tiles (R synced with the kernel: R=1 when out_f%8 != 0),
+    // grid.y = TOKEN PAIRS (the kernel handles 2 tokens per block).
+    const int Rl = ((out_f & 7) == 0) ? 8 : 1;
+    dim3 grid((unsigned)((out_f + rpb * Rl - 1) / (rpb * Rl)),
+              (unsigned)((nrows + 1) / 2), 1);
     dim3 block(256);
     gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
                                                    in_f, out_f, nrows, srows, scols);
