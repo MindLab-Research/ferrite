@@ -3284,7 +3284,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // the old warp-serial acc += p*y chain, bit-identical partials from the
     // same lane dot + shuffle tree).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h0 = blockIdx.x * 4;   // ROWS=4 (was 8): 2x the blocks, half the smem
+    int h0 = blockIdx.x * 8;
     if (h0 >= hidden) return;
     int stride = topk * inter + inter_shared;
     // ALL tokens per block (grid.y == 1). One block read only 18KB and spent
@@ -3295,21 +3295,21 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     const int TT = 4; // tokens per block (middle ground: 512 blocks gave too
                       // little parallelism per SM, 8192 paid the fixed
                       // per-block latency 16x)
-    __shared__ float part[MAXN][4][16]; // [tok][h row][slot]
+    __shared__ float part[MAXN][8][16]; // [tok][h row][slot]
     int j = warp;
     const int t0 = blockIdx.y * TT;
     const int t1 = (t0 + TT < nt) ? (t0 + TT) : nt;
     for (int base = t0; base < t1; base += MAXN) {
         const int cnt = ((t1 - base) < MAXN) ? (t1 - base) : MAXN;
         if (j <= topk) {
-        float py[4];
+        float py[8];
         for (int tt = 0; tt < cnt; tt++) {
         const int tok = base + tt;
         const float* act_t = act + (size_t)tok * stride;
         const float* ids_t = ids_f + (size_t)tok * topk;
         const float* probs_t = probs + (size_t)tok * topk;
         #pragma unroll
-        for (int hh = 0; hh < 4; hh++) py[hh] = 0.f;
+        for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
         const float* aj = nullptr;
         const unsigned char* dbase = nullptr;
         const float* dsr_base = nullptr;
@@ -3350,10 +3350,10 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
                 uint4 dv4[4];
                 #pragma unroll
-                for (int c = 0; c < 2; c++)
+                for (int c = 0; c < 4; c++)
                     dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(h0 + 2 * c) * klen + i0);
                 #pragma unroll
-                for (int c = 0; c < 2; c++) {
+                for (int c = 0; c < 4; c++) {
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
                     const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
@@ -3378,7 +3378,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 }
             } else {
                 #pragma unroll
-                for (int hh = 0; hh < 4; hh++) {
+                for (int hh = 0; hh < 8; hh++) {
                     int h = h0 + hh;
                     float y = 0.f;
                     for (int k = lane; k < klen; k += 32)
@@ -3392,7 +3392,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             }
         if (lane == 0) {
             #pragma unroll
-            for (int hh = 0; hh < 4; hh++) part[tt][hh][j] = p * py[hh];
+            for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
         }
         }
         }
@@ -3433,7 +3433,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     dim3 block(288); // 9 warps: topk routed (8) + shared
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
-    dim3 grid((hidden + 3) / 4, (n + 3) / 4, 1);   // ROWS=4 (kernel h0 = blockIdx.x*4)
+    dim3 grid((hidden + 7) / 8, (n + 3) / 4, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
