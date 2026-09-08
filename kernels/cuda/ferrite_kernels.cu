@@ -3987,8 +3987,11 @@ __global__ void indexer_topk_batched_kernel(
                 float dot = (d0 + d1) + (d2 + d3);
                 s += w_s[hi] * fmaxf(dot, 0.f); // relu
             }
+            // group mask (8 contiguous lanes within the warp): 0xffffffff
+            // would deadlock when some groups have no pools and skip this.
+            const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);
             #pragma unroll
-            for (int off = TG / 2; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffff, s, off);
+            for (int off = TG / 2; off > 0; off >>= 1) s += __shfl_down_sync(gmask, s, off);
             if (lid == 0) sm[j] = s * inv_sqrt_d;
         } else {
             if (lid == 0) sm[j] = -INFINITY;
