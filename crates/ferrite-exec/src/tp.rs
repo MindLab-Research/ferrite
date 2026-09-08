@@ -3527,7 +3527,12 @@ fn attn_shard(
             // TP all-reduce on-device (replaces the host download→sum→upload
             // round-trip; async on this rank's stream — the download below
             // syncs it, which waits for the whole collective).
-            ch.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+            // P2P one-shot first: NCCL RING_LL measured ~390us for this
+            // payload vs ~20us for the P2P kernel.
+            let ar_p2p = cuda.p2p_ar_v2(&mut partial, n * hidden).unwrap_or(false);
+            if !ar_p2p {
+                ch.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+            }
         }
         let mut out = Tensor::zeros(Shape::new([n, hidden]), DType::F32);
         {
