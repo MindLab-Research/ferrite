@@ -90,9 +90,12 @@ extern "C" {
     fn ferrite_embed_expand(table: *const std::ffi::c_void, ids: *const i32,
                             out: *mut f32, n: i32, hidden: i32, mult: i32,
                             vocab: i32, s: CuStream) -> i32;
-    fn ferrite_mtp_accept(d1: *const f32, d2: *const f32, a: *const f32,
+    // N-UNIFIED (FERRITE_MTP_N): d = [n-1] draft argmax (d1..d_{n-1}), a = [n]
+    // verify argmax (a0..a_{n-1}) — the kernel finds the longest matching
+    // prefix k in 1..n. n=3 reduces to the old (d1, d2, a0, a1, a2) form.
+    fn ferrite_mtp_accept(d: *const f32, a: *const f32,
                           k_out: *mut i32, next_token: *mut i32, n_accepted: *mut i32,
-                          s: CuStream) -> i32;
+                          n: i32, s: CuStream) -> i32;
     fn ferrite_embed_expand_dev(table: *const std::ffi::c_void, ids_dev: *const i32,
                                out: *mut f32, n: i32, hidden: i32, mult: i32,
                                vocab: i32, s: CuStream) -> i32;
@@ -234,10 +237,14 @@ extern "C" {
                               out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                               topk: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
+    // N-UNIFIED (FERRITE_MTP_N): plan row = 6 pointers/layer (conv_a, gdn_a,
+    // conv_b, gdn_b, conv_snaps_base, gdn_snaps_base — the per-t snapshots
+    // live in ONE contiguous [n-1][len] scratch each; snapshot j-1 at
+    // base + (j-1)*len). k=n commits B; k=j<n commits snapshot j-1.
     fn ferrite_mtp_commit(k_pin: *const i32, plan: *const *mut f32,
                           n_plans: i32, conv_len: i32, gdn_len: i32,
                           hf_v: *const f32, hprev: *mut f32,
-                          hidden: i32, s: CuStream) -> i32;
+                          hidden: i32, n: i32, s: CuStream) -> i32;
     fn ferrite_softmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
     fn ferrite_hc_pre(res: *const f32, fw: *const f32, scale: *const f32, base: *const f32,
                       li: *mut f32, post: *mut f32, comb: *mut f32,
@@ -521,15 +528,22 @@ impl DevRef {
 /// commits B→A, reject leaves A untouched).
 pub struct MtpState {
     pub hf_dev: DevBuf,
+    /// verify graph's h_final [N*hidden] (N = FERRITE_MTP_N rows; the
+    /// commit kernel's hprev select reads row k-1).
     pub hf_v: DevBuf,
     pub hprev: DevBuf,
-    /// per-GDN-layer (conv, gdn, conv0, gdn0, conv1, gdn1): B = full verify
-    /// state, B0 = t=0 snapshot (accept-1), B1 = t=1 snapshot (accept-2, n=3).
-    pub scratch: Vec<(DevBuf, DevBuf, DevBuf, DevBuf, DevBuf, DevBuf)>,
-    /// Single-kernel accept-commit plan: device-resident [n_gdn][8] pointer
-    /// table (conv_a, gdn_a, conv_b, gdn_b, conv_b0, gdn_b0, conv_b1,
-    /// gdn_b1) + a pinned k slot. One ferrite_mtp_commit launch replaces
-    /// 2*n_gdn cudaMemcpyAsync D2Ds + the hprev row select.
+    /// per-GDN-layer (conv, gdn, conv_snaps, gdn_snaps) N-UNIFIED scratch:
+    /// conv/gdn = the verify B states (the full t-loop chain),
+    /// conv_snaps/gdn_snaps = the [N-1]-deep contiguous t-snapshot bases
+    /// (snap i = A + tokens t_0..t_i, accept-(i+1)'s commit source — the
+    /// kernel indexes base + i*len; the old fixed (conv0,gdn0,conv1,gdn1)
+    /// pairs are snaps 0/1 of the same layout at N=3).
+    pub scratch: Vec<(DevBuf, DevBuf, DevBuf, DevBuf)>,
+    /// Single-kernel accept-commit plan: device-resident [n_gdn][6] pointer
+    /// table (conv_a, gdn_a, conv_b, gdn_b, conv_snaps_base, gdn_snaps_base
+    /// — the N-unified 6-pointer row; the kernel derives snap j-1 at
+    /// base + (j-1)*len) + a pinned k slot. One ferrite_mtp_commit launch
+    /// replaces 2*n_gdn cudaMemcpyAsync D2Ds + the hprev row select.
     pub commit: Option<MtpCommitPlan>,
     /// ZERO-H2D device token chain (user mandate: the entire decode loop
     /// must have no host-to-device transfers — D2H between steps is allowed
@@ -539,33 +553,37 @@ pub struct MtpState {
     /// next_token for seq tracking + API response).
     ///
     /// [0] = last accepted token (written by accept kernel or initial prompt)
-    /// [1] = draft d1 (written by draft chain argmax)
-    /// [2] = draft d2 (written by draft chain argmax)
-    pub tokens_dev: DevBuf,      // [3] i32 — the token chain (device)
-    /// verify graph's argmax output [3] (a0, a1, a2 — the graph writes here
-    /// at replay; the accept kernel reads it to compare against d1/d2)
-    pub verify_argmax_dev: DevBuf, // [3] f32 — argmax of the verify graph
+    /// [1..N-1] = the drafts d1..d_{N-1} (written by the draft chain argmax)
+    pub tokens_dev: DevBuf,      // [N] i32 — the token chain (device)
+    /// verify graph's argmax output [N] (a0..a_{N-1} — the graph writes
+    /// here at replay; the accept kernel reads it to compare against the
+    /// drafts)
+    pub verify_argmax_dev: DevBuf, // [N] f32 — argmax of the verify graph
     /// accept kernel outputs (device, read D2H by host for seq + SSE)
-    pub k_dev: DevBuf,            // [1] i32 — accept count 1/2/3
+    pub k_dev: DevBuf,            // [1] i32 — accept count 1..N
     pub next_token_dev: DevBuf,   // [1] i32 — next step's "last" token
     pub n_accepted_dev: DevBuf,   // [1] i32 — tokens accepted this step
-    /// draft chain embeds (fixed bufs, embed_one kernel output)
-    pub emb1_dev: DevBuf,         // [hidden] f32 — draft 1's embed
-    pub emb2_dev: DevBuf,         // [hidden] f32 — draft 2's embed
-    /// draft argmax outputs (device, from mtp_forward's argmax)
-    pub d1_argmax_dev: DevBuf,    // [1] f32 — draft 1 token (argmax output)
-    pub d2_argmax_dev: DevBuf,    // [1] f32 — draft 2 token (argmax output)
+    /// draft chain embeds (fixed bufs, embed_one kernel output; one per draft)
+    pub emb_devs: Vec<DevBuf>,    // [N-1] × [hidden] f32 — draft i's embed
+    /// draft argmax outputs (device, from mtp_forward's argmax) — ONE
+    /// contiguous [N-1] buffer (draft i's token at offset i; the accept
+    /// kernel reads it as the d array).
+    pub d_argmax_dev: DevBuf,     // [N-1] f32 — draft tokens (argmax outputs)
 }
 
 /// Device-resident commit pointer table for ferrite_mtp_commit. `plan`
-/// packs 8 device pointers per GDN layer as f32 bit patterns (DevBuf is
+/// packs 6 device pointers per GDN layer as f32 bit patterns (DevBuf is
 /// f32-typed; 2 f32 per pointer). `k_pin` is a 4-byte cudaMallocHost slot —
 /// the kernel reads it zero-copy at run time (k is only known AFTER the
 /// verify graph replay returns argmax, so it cannot be baked into a graph).
+/// `mtp_n` = the verify width (FERRITE_MTP_N) — the kernel's k range 1..=n.
 pub struct MtpCommitPlan {
     pub plan: DevBuf,
     pub k_pin: *mut i32,
     pub n: usize,
+    /// verify width N (FERRITE_MTP_N) — the commit kernel's k range 1..=N
+    /// (k=N commits B; k=j<N commits snapshot j-1 at base + (j-1)*len).
+    pub mtp_n: usize,
     pub conv_len: usize,
     pub gdn_len: usize,
     pub hidden: usize,
@@ -2739,7 +2757,7 @@ impl CudaBackend {
         lb: f32,
         rms_eps: f32,
         conv_size: usize,
-        state_override: Option<(*mut f32, *mut f32, *mut f32, *mut f32, *mut f32, *mut f32)>, // (conv, gdn, conv0, gdn0, conv1, gdn1) verify scratch: B = full state, B0 = t=0 snapshot (accept-1), B1 = t=1 snapshot (accept-2, n=3)
+        state_override: Option<(*mut f32, *mut f32, *mut f32, *mut f32)>, // (conv, gdn, conv_snaps_base, gdn_snaps_base) N-UNIFIED verify scratch: B = full state, snaps = the [n-1] contiguous t-snapshots (snap i = A + t_0..t_i, accept-(i+1)'s commit source)
     ) -> Result<DevBuf> {
         self.enter();
         let proj = h * dk;
@@ -2793,7 +2811,7 @@ impl CudaBackend {
         let hist = conv_size.saturating_sub(1).max(1);
         let dw_conv = self.dev_weight(w.conv_w)?;
         let conv_state = match state_override {
-            Some((cs, _, _, _, _, _)) => cs,
+            Some((cs, _, _, _)) => cs,
             None => self.dev_state(&self.conv_states, (seq, layer), ch * hist)?,
         };
         let q = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -2820,10 +2838,11 @@ impl CudaBackend {
             )?;
         } else {
             let conv_out = DevBuf::alloc(self.dev, self.stream, n * ch)?;
-            if let Some((_, _, c0, _, c1, _)) = state_override.filter(|_| n <= 3) {
-                // verify B_k scheme: per-token conv1d (n=1 each) so the window
-                // state can be snapshotted after t=0 (conv0, accept-1) and
-                // t=1 (conv1, accept-2); conv_state (B) holds the full state.
+            if let Some((_, _, cs_base, _)) = state_override {
+                // verify B_k scheme (N-UNIFIED): per-token conv1d (n=1 each)
+                // so the window state can be snapshotted after every t —
+                // snap t (accept-(t+1)'s commit source) lands at
+                // cs_base + t*(ch*hist); conv_state (B) holds the full state.
                 let qkv_p = qkv.as_ref().unwrap();
                 for t in 0..n {
                     ck(
@@ -2835,10 +2854,8 @@ impl CudaBackend {
                         },
                         "conv1d_v_t",
                     )?;
-                    if t == 0 {
-                        self.copy_raw_dev(conv_state as *const f32, c0, ch * hist)?;
-                    } else if t == 1 {
-                        self.copy_raw_dev(conv_state as *const f32, c1, ch * hist)?;
+                    if t + 1 < n {
+                        self.copy_raw_dev(conv_state as *const f32, unsafe { cs_base.add(t * ch * hist) }, ch * hist)?;
                     }
                 }
             } else {
@@ -2901,7 +2918,7 @@ impl CudaBackend {
         // blocks read-modify-write their own slice; single buffer is safe).
         // v2: state staged in smem (padded stride dk+1) — HBM 7 passes → 2.
         let gdn_state = match state_override {
-            Some((_, gs, _, _, _, _)) => gs,
+            Some((_, gs, _, _)) => gs,
             None => self.dev_state(&self.gdn_states, (seq, layer), h * dk * dk)?,
         };
         let core = DevBuf::alloc(self.dev, self.stream, n * proj)?;
@@ -2920,19 +2937,22 @@ impl CudaBackend {
                 },
                 "gdn_step_v2p",
             )?;
-        } else if let Some((_, _, _, g0, _, g1)) = state_override.filter(|_| n <= 3) {
-            // MTP Phase2: fused single-launch n-token chunk — the state stays
-            // resident in smem across the t loop (HBM round-trip eliminated),
-            // the t=0 B0 snapshot (A+t_last, accept-1's commit source) is
-            // written straight from smem. Replaces the 2-launch t-split + the
-            // in-between D2D copy.
+        } else if let Some((_, _, _, gs_base)) = state_override {
+            // MTP Phase2 (N-UNIFIED): fused single-launch n-token chunk — the
+            // state stays resident in smem across the t loop (HBM round-trip
+            // eliminated), the t-th snapshot (A + t_0..t_i, accept-(i+1)'s
+            // commit source) is written straight from smem to the contiguous
+            // [n-1] snapshot scratch (gs_base + i*h*dk*dk). Replaces the
+            // 2-launch t-split + the in-between D2D copy. gdn0 = the snaps
+            // base, gdn1 unused (kept for the FFI's ABI; the kernel takes the
+            // base + derives snap i by stride).
             let dal = self.dev_weight(w.a_log)?;
             ck(
                 unsafe {
                     ferrite_gdn_chunk_fused(
                         q.as_const_f32(), k.as_const_f32(), v.as_const_f32(),
                         beta.as_const_f32(), gate.as_const_f32(), dal.as_const_f32(),
-                        gdn_state, g0, g1, core.as_f32(),
+                        gdn_state, gs_base, std::ptr::null_mut(), core.as_f32(),
                         ni, h as i32, dk as i32, dk as i32, self.stream,
                     )
                 },
@@ -4827,22 +4847,23 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// MTP accept on device: compares draft d1/d2 vs verify a[0..2] (ALL
-    /// device bufs — the argmax outputs never cross to host), writes k +
+    /// MTP accept on device (N-UNIFIED): compares the n-1 drafts d[0..n-2]
+    /// vs the verify argmax a[0..n-1] (ALL device bufs — the argmax outputs
+    /// never cross to host), writes k (longest matching prefix, 1..n) +
     /// next_token + n_accepted to device int slots. The host reads these
     /// 8-12 bytes D2H per step for API response / seq tracking.
     pub fn mtp_accept_dev(
         &self,
-        d1: *const f32,
-        d2: *const f32,
+        d: *const f32,
         a: *const f32,
         k_out: *mut i32,
         next_token: *mut i32,
         n_accepted: *mut i32,
+        n: usize,
     ) -> Result<()> {
         self.enter();
         ck(
-            unsafe { ferrite_mtp_accept(d1, d2, a, k_out, next_token, n_accepted, self.stream) },
+            unsafe { ferrite_mtp_accept(d, a, k_out, next_token, n_accepted, n as i32, self.stream) },
             "mtp_accept",
         )?;
         Ok(())
@@ -4884,6 +4905,8 @@ impl CudaBackend {
     /// MTP accept commit with k from a DEVICE buffer (zero-H2D chain: the
     /// accept kernel wrote k to k_dev on device — no host round-trip).
     /// Same commit kernel as the pinned variant, but reads k from device.
+    /// N-UNIFIED: cp.mtp_n = FERRITE_MTP_N — the kernel's k range 1..=n
+    /// (k=n commits B; k=j<n commits snapshot j-1 at base + (j-1)*len).
     pub fn mtp_commit_dev(&self, k_dev: *const i32) -> Result<()> {
         let m = self.mtp.lock().unwrap();
         let m = m
@@ -4910,6 +4933,7 @@ impl CudaBackend {
                     m.hf_v.as_const_f32(),
                     m.hprev.as_f32(),
                     cp.hidden as i32,
+                    cp.mtp_n as i32,
                     self.stream,
                 )
             },
@@ -4920,11 +4944,12 @@ impl CudaBackend {
 
     /// MTP accept commit (single launch): writes k to the pinned slot
     /// (zero-copy kernel read) and fires ferrite_mtp_commit — the kernel
-    /// selects B_k per GDN layer (k=3 -> B, 2 -> B1, 1 -> B0), copies it
-    /// back to the main state A, and sets hprev <- hf_v row (k-1) for the
-    /// next draft step. Replaces 2*n_gdn cudaMemcpyAsync launches + the
-    /// hprev select. Graph-unsafe (pinned k write) — always called OUTSIDE
-    /// captures, right after the verify replay's D2H sync.
+    /// selects B_k per GDN layer (k=n -> B, j<n -> snapshot j-1), copies
+    /// it back to the main state A, and sets hprev <- hf_v row (k-1) for
+    /// the next draft step. N-UNIFIED (k in 1..=FERRITE_MTP_N). Replaces
+    /// 2*n_gdn cudaMemcpyAsync launches + the hprev select. Graph-unsafe
+    /// (pinned k write) — always called OUTSIDE captures, right after the
+    /// verify replay's D2H sync.
     pub fn mtp_commit(&self, k: i32) -> Result<()> {
         let m = self.mtp.lock().unwrap();
         let m = m
@@ -4949,6 +4974,7 @@ impl CudaBackend {
                     m.hf_v.as_const_f32(),
                     m.hprev.as_f32(),
                     cp.hidden as i32,
+                    cp.mtp_n as i32,
                     self.stream,
                 )
             },

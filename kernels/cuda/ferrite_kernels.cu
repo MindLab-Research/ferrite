@@ -4855,8 +4855,7 @@ __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
                                        const float* __restrict__ gate,
                                        const float* __restrict__ a_log,
                                        float* __restrict__ state,
-                                       float* __restrict__ gdn0,
-                                       float* __restrict__ gdn1,
+                                       float* __restrict__ gdn_snaps, // [n-1][h*dk*dv] base (t-th snapshot = base + t*h*dk*dk); null = no snapshots
                                        float* __restrict__ out,
                                        int n, int h, int dk, int dv) {
     int hd = blockIdx.y;
@@ -4951,11 +4950,13 @@ __global__ void gdn_chunk_fused_kernel(const float* __restrict__ q,
             }
             __syncthreads();
         }
-        // 4. t=0/t=1 snapshots (B_k = A + t_0..t_k: accept-k's commit source)
-        // straight from smem — B0 = A+t_last (accept-1), B1 = A+t_last+d1
-        // (accept-2, n=3 only)
-        if ((t == 0 && gdn0 != nullptr) || (t == 1 && gdn1 != nullptr)) {
-            float* Sk = (t == 0 ? gdn0 : gdn1) + (size_t)hd * dk * dv;
+        // 4. t-snapshots (B_j = A + t_0..t_j: accept-j+1's commit source),
+        //    N-UNIFIED: snap t = A after applying tokens 0..t — ONE
+        //    contiguous [n-1] scratch (Rust allocates [n-1][h*dk*dv]),
+        //    snapshot t at gdn_snaps + t*(h*dk*dk). Straight from smem.
+        //    (n=3 legacy: gdn0 = snap 0, gdn1 = snap 1 — identical layout.)
+        if (gdn_snaps != nullptr && t < n - 1) {
+            float* Sk = gdn_snaps + (size_t)t * h * dk * dv + (size_t)hd * dk * dv;
             for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
                 Sk[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
             __syncthreads();
@@ -4970,8 +4971,12 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
     const float* beta, const float* gate, const float* a_log,
     float* state, float* gdn0, float* gdn1, float* out,
     int n, int h, int dk, int dv, cudaStream_t s) {
-    // smem: S[dk*(dv+1)] + ks[dv] + kh[dk] + vh[dv] + qh[dk] + dec[dk]
-    //      + red2[splits*dv <= 512]
+    // N-UNIFIED entry: gdn0 = the snapshots' contiguous base (the [n-1]
+    // per-layer scratch), gdn1 unused (kept for the FFI's 8-slot ABI; the
+    // kernel takes the base + stride h*dk*dv). Callers with the old
+    // (gdn0, gdn1) pair pass base=gdn0 (the Rust side allocates one
+    // contiguous [n-1] buffer).
+    (void)gdn1;
     size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
                   + (size_t)(dv + dk + dv + dk + dk + 512) * sizeof(float);
     if (smem > 48 * 1024) {
@@ -4984,7 +4989,7 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
     dim3 block(512);
     dim3 grid(1, h, 1);
     gdn_chunk_fused_kernel<<<grid, block, smem, s>>>(
-        q, k, v, beta, gate, a_log, state, gdn0, gdn1, out, n, h, dk, dv);
+        q, k, v, beta, gate, a_log, state, gdn0, out, n, h, dk, dv);
     cudaError_t le = cudaGetLastError();
     if (le != cudaSuccess) {
     }
@@ -4995,39 +5000,46 @@ extern "C" cudaError_t ferrite_gdn_chunk_fused(
 // MTP accept commit (single launch): replaces the per-layer
 // cudaMemcpyAsync ping-pong chain (2 memcpys x n_gdn_layers + hprev
 // select = ~70 launches/step of pure launch overhead) with ONE kernel.
-// k (1..3, the accept length) is read from a PINNED host int at run
+// k (1..n, the accept length) is read from a PINNED host int at run
 // time (zero-copy): the verify graph replay returns argmax to the
 // host, the host computes k, then launches this kernel.
-// plan: [n_plans][8] device-resident pointer table per GDN layer:
+// N-UNIFIED (FERRITE_MTP_N — arbitrary verify width): plan row is
+// SIX pointers per GDN layer (the n=3 hardcode's 8 collapsed — the
+// per-t snapshots live in ONE contiguous [n-1][len] scratch each,
+// so the snapshot bases + strides replace the per-snapshot pointers):
 //   [0]=conv_a(dst) [1]=gdn_a(dst) [2]=conv_b [3]=gdn_b
-//   [4]=conv_b0 [5]=gdn_b0 [6]=conv_b1 [7]=gdn_b1
-// k=3 commits B (full verify state), k=2 B1 (A+t_last+d1), k=1 B0
-// (A+t_last). Tail segment: hprev <- hf_v row (k-1).
+//   [4]=conv_snaps_base [5]=gdn_snaps_base ([n-1] snapshots, stride
+//       conv_len/gdn_len — snap i = A + verify tokens t_0..t_i)
+// k=n commits B (full verify state); k=j<n commits snapshot j-1
+// (A + t_0..t_{j-1}). Tail segment: hprev <- hf_v row (k-1).
 // ============================================================
 __global__ void mtp_commit_kernel(const int* __restrict__ k_pin,
                                    float* const* __restrict__ plan,
                                    int n_plans, int conv_len, int gdn_len,
                                    const float* __restrict__ hf_v,
-                                   float* __restrict__ hprev, int hidden) {
+                                   float* __restrict__ hprev, int hidden, int n) {
     __shared__ int ks;
     if (threadIdx.x == 0) ks = *k_pin;
     __syncthreads();
-    const int k = ks; // 1..3
-    const int row = conv_len + gdn_len;
-    const long lay = (long)n_plans * row;
+    const int k = ks; // 1..n
+    const int row = 6; // pointers per plan row
+    const long lay = (long)n_plans * (conv_len + gdn_len);
     const long total = lay + hidden;
     for (long idx = (long)blockIdx.x * blockDim.x + threadIdx.x; idx < total;
          idx += (long)gridDim.x * blockDim.x) {
         if (idx < lay) {
-            int l = (int)(idx / row);
-            int r = (int)(idx - (long)l * row);
-            float* const* p = plan + (size_t)l * 8;
+            int l = (int)(idx / (conv_len + gdn_len));
+            int r = (int)(idx - (long)l * (conv_len + gdn_len));
+            float* const* p = plan + (size_t)l * row;
             if (r < conv_len) {
-                const float* src = (k == 3) ? p[2] : (k == 2) ? p[6] : p[4];
+                // k=n → B (full); k=j<n → snapshot j-1 (A + t_0..t_{j-1})
+                const float* src = (k == n) ? p[2]
+                    : (p[4] + (size_t)(k - 1) * conv_len);
                 p[0][r] = src[r];
             } else {
                 int rr = r - conv_len;
-                const float* src = (k == 3) ? p[3] : (k == 2) ? p[7] : p[5];
+                const float* src = (k == n) ? p[3]
+                    : (p[5] + (size_t)(k - 1) * gdn_len);
                 p[1][rr] = src[rr];
             }
         } else {
@@ -5041,13 +5053,13 @@ extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
                                           float* const* plan,
                                           int n_plans, int conv_len, int gdn_len,
                                           const float* hf_v, float* hprev,
-                                          int hidden, cudaStream_t s) {
+                                          int hidden, int n, cudaStream_t s) {
     long total = (long)n_plans * (conv_len + gdn_len) + hidden;
     int blocks = (int)((total + 1023) / 1024);
     if (blocks > 4096) blocks = 4096;
     if (blocks < 1) blocks = 1;
     mtp_commit_kernel<<<blocks, 1024, 0, s>>>(k_pin, plan, n_plans, conv_len,
-                                             gdn_len, hf_v, hprev, hidden);
+                                             gdn_len, hf_v, hprev, hidden, n);
     return cudaGetLastError();
 }
 
@@ -5493,47 +5505,37 @@ extern "C" cudaError_t ferrite_embed_expand(
 }
 
 // ============================================================
-// Device-resident MTP accept kernel: compares draft d1/d2 vs verify a0/a1/a2
-// (ALL device buffers — the argmax outputs never cross to host), writes k
-// and next_token to device slots. The host reads 8 bytes D2H per step
-// (k + next_token for API response + seq tracking) — the ENTIRE decode
-// loop is zero-H2D after the initial prompt upload.
+// Device-resident MTP accept kernel (N-UNIFIED, FERRITE_MTP_N): compares
+// the n-1 drafts d[0..n-2] vs the verify argmax a[0..n-1] (ALL device
+// buffers — the argmax outputs never cross to host), writes k (the
+// longest matching prefix length, 1..n) and next_token = a[k-1] to
+// device slots. The host reads 8 bytes D2H per step (k + next_token for
+// API response + seq tracking) — the ENTIRE decode loop is zero-H2D
+// after the initial prompt upload. n=3 (d1,d2,a0,a1,a2) is the default;
+// any n: the prefix loop generalizes the old d1/d2 nesting exactly.
 // ============================================================
 __global__ void mtp_accept_kernel(
-    const float* __restrict__ d1,        // [1] draft argmax (device)
-    const float* __restrict__ d2,        // [1] draft argmax (device)
-    const float* __restrict__ a,         // [3] verify argmax (device: a0,a1,a2)
-    int* __restrict__ k_out,             // [1] accept count 1/2/3
+    const float* __restrict__ d,        // [n-1] draft argmax (device)
+    const float* __restrict__ a,         // [n] verify argmax (device: a0..a_{n-1})
+    int* __restrict__ k_out,             // [1] accept count 1..n
     int* __restrict__ next_token,        // [1] next "last" token for the loop
-    int* __restrict__ n_accepted         // [1] tokens accepted this step (for host read)
-) {
+    int* __restrict__ n_accepted,       // [1] tokens accepted this step (host read)
+    int n) {
     if (threadIdx.x == 0 && blockIdx.x == 0) {
-        int d1_i = (int)d1[0];
-        int d2_i = (int)d2[0];
-        int a0_i = (int)a[0];
-        int a1_i = (int)a[1];
-        int a2_i = (int)a[2];
-        int k, nt;
-        if (d1_i == a0_i) {
-            if (d2_i == a1_i) {
-                k = 3; nt = a2_i; n_accepted[0] = 3;
-            } else {
-                k = 2; nt = a1_i; n_accepted[0] = 2;
-            }
-        } else {
-            k = 1; nt = a0_i; n_accepted[0] = 1;
-        }
+        int k = 1;
+        while (k < n && (int)d[k - 1] == (int)a[k - 1]) k++;
         *k_out = k;
-        *next_token = nt;
+        *next_token = (int)a[k - 1];
+        *n_accepted = k;
     }
 }
 
 extern "C" cudaError_t ferrite_mtp_accept(
-    const float* d1, const float* d2, const float* a,
+    const float* d, const float* a,
     int* k_out, int* next_token, int* n_accepted,
-    cudaStream_t s)
+    int n, cudaStream_t s)
 {
-    mtp_accept_kernel<<<1, 1, 0, s>>>(d1, d2, a, k_out, next_token, n_accepted);
+    mtp_accept_kernel<<<1, 1, 0, s>>>(d, a, k_out, next_token, n_accepted, n);
     return cudaGetLastError();
 }
 
