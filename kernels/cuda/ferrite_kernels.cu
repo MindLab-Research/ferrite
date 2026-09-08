@@ -1080,27 +1080,20 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
         for (int j = threadIdx.x; j < e; j += blockDim.x) {
             if (ch[j] > bv) { bv = ch[j]; best = j; }
         }
-        // warp-ish reduce: use shared
-        __shared__ int bidx[32];
-        __shared__ float bval[32];
-        bidx[threadIdx.x] = best;
-        bval[threadIdx.x] = bv;
-        __syncthreads();
+        // WARP-shuffle reduce (the block is ONE warp / 32 threads): the old
+        // smem version did 5 __syncthreads per round (8 rounds = 40 barriers)
+        // and wrote bidx[threadIdx.x] past its [32] bound.
+        #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
-            if (threadIdx.x + off < 32) {
-                if (bval[threadIdx.x + off] > bval[threadIdx.x]) {
-                    bval[threadIdx.x] = bval[threadIdx.x + off];
-                    bidx[threadIdx.x] = bidx[threadIdx.x + off];
-                }
-            }
-            __syncthreads();
+            const float ov = __shfl_down_sync(0xffffffff, bv, off);
+            const int oi = __shfl_down_sync(0xffffffff, best, off);
+            if (ov > bv) { bv = ov; best = oi; }
         }
         if (threadIdx.x == 0) {
-            int sel = bidx[0];
-            ids[(size_t)row * topk + r] = (float)sel;
-            ch[sel] = -1e30f; // remove
+            ids[(size_t)row * topk + r] = (float)best;
+            ch[best] = -1e30f; // remove
         }
-        __syncthreads();
+        __syncthreads(); // ch[best] must be visible to all lanes next round
     }
     // renorm pass (block-wide: 2 passes over topk + block reduce). Was a
     // single-thread loop over topk=2048 (~4.5µs x 42 calls/step = 0.19ms).
