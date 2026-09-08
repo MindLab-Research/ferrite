@@ -269,9 +269,11 @@ Other profiling rules:
 - MTP 出师表 200-step: `real 476 tokens` window, text must be flawless 《出师表》 through 将军向宠 section (乱码 = accept/commit bug, ALWAYS check by eye).
 - 500-step: 58.9 tok/s (DSA decay visible), non-MTP 500-step 44.7.
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
-- **B=16 non-MTP (2026-09-08 late, the current best)**: `[megab] replay 16 seqs: 16.27-16.48 ms`
-  = **981-985 tok/s** (300-token window, text = direct 《出师表》 recitation ✓); 1000-token window
-  17.80-17.82 ms = **898-899 tok/s**. Progression this session: 546 → ~983 tok/s.
+- **B=16 non-MTP (2026-09-08 late, the current best)** — HONEST end-to-end numbers are the
+  per-seq `steady=` x16 (the `[megab] replay` line under-reports long context by ~8%):
+  **300-token window: 59.8-59.9 tok/s/seq = 957 tok/s aggregate**; **1000-token window:
+  56.8-56.9 tok/s/seq = 909 tok/s aggregate**. Text = direct 《出师表》 recitation ✓.
+  (replay line: 990 @300-tok / 842 @1000-tok.) Progression this session: 546 → ~957 tok/s.
   Kept changes: gemv_fp8 T=2 tokens/block, gated_rmsnorm 1 token/block x256, moe_act double-buffered
   cp.async.cg staging + ldmatrix, hc_pre_mix K-loop `#pragma unroll 4`, **moe_route 256-thread
   top-k**, **rmsnorm blockDim-sized reduce (was a latent 8-warp bug)**, **4/2-accumulator splits of
