@@ -346,3 +346,9 @@ kernel 的 `qs2` smem 与 half2 点积 + 每 128 元素折回 fp32），编译�
 是**16 车道组掩码**，与 TG=4 的 4 车道组不匹配 → `__shfl_sync(gmask, ...)` 同步失败 → bench 挂死
 （6 分钟后手动 kill）。**教训：改 TG 必须同时改 gmask 的组宽**（`~(TG-1)` 而不是 `~15u`），
 而且 sparse_attn 的 shuffle 归约步长也按 TG 走。这条路线要动就得整组一起改。
+
+### 中性：sparse_attn v 侧的 `#pragma unroll 4`
+
+v 侧 slot 循环每轮 1 个独立 float4 load，之前没有 unroll。加上后 16.43-16.44ms（973.5-974.0），
+与基线 971-985 的波动区间重合 → 保留（原理正确、无副作用）。说明该循环的 load 延迟已被
+slot 间的并行度掩盖。
