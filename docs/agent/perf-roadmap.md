@@ -382,3 +382,8 @@ unroll 4 时已经饱和（5 load/轮 × 4 = 20 个在飞），再加只增寄�
 `cp.async.wait_group 1` 保持 1 个在飞（尾部 `wait_group 0` 排空），每轮再补 kb+128：
 16.34 → **16.27-16.30ms（981.6-983.4）**，文本正确。虽然占用从 5 降到 3 block/SM，
 但每 warp 2 个 tile 在飞把 MLP 从 40 提到 48，净收益略正。
+
+### 中性：indexer 的 pool-score 点积加 `#pragma unroll 2`
+
+每轮 2 个独立 float4 load（smem q + global pool key）。加 unroll 后 16.27-16.31ms（981-983），
+与基线重合 → 保留（原理正确）。该 kernel 本身只有 0.4ms/步，收益空间本来就小。
