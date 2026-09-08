@@ -4124,25 +4124,42 @@ __global__ void sparse_attn_v2_batched_kernel(
     for (int s = threadIdx.x; s < live_k; s += blockDim.x) idxs[s] = (int)idx_s[s];
     for (int w0 = threadIdx.x; w0 < bm_words_max; w0 += blockDim.x) bm[w0] = 0u;
     __syncthreads();
-    for (int s = threadIdx.x; s < live_k; s += blockDim.x) {
+    // 8 THREADS PER SLOT (same fix as the indexer): one serial 256-dim dot per
+    // thread left ~44% of the block idle and made the dot latency-bound.
+    const int TG = 8;
+    const int gid = threadIdx.x / TG;
+    const int lid = threadIdx.x % TG;
+    const int ngroups = blockDim.x / TG;
+    const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);
+    const int glane0 = (threadIdx.x & 31) & ~7;
+    for (int s = gid; s < live_k; s += ngroups) {
         int j = idxs[s];
-        if (j < 0 || j >= t) { sc[s] = -INFINITY; continue; }
-        bool dup = false;
-        if ((j >> 5) < bm_words) {
-            unsigned int prev = atomicOr(&bm[j >> 5], 1u << (j & 31));
-            dup = (prev & (1u << (j & 31))) != 0;
+        bool valid = (j >= 0 && j < t);
+        int dup = 0;
+        if (valid && lid == 0) {
+            if ((j >> 5) < bm_words) {
+                unsigned int prev = atomicOr(&bm[j >> 5], 1u << (j & 31));
+                dup = (prev & (1u << (j & 31))) != 0;
+            }
         }
-        if (dup) { sc[s] = -INFINITY; continue; }
-        const float4* k4 = reinterpret_cast<const float4*>(k_s + ((size_t)j * h + hd) * d);
-        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-        for (int l = 0; l + 3 < d; l += 4) {
-            float4 kk = k4[l >> 2];
-            float4 qq = *reinterpret_cast<const float4*>(qs + l);
-            acc.x += qq.x * kk.x; acc.y += qq.y * kk.y; acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
+        dup = __shfl_sync(gmask, dup, glane0);
+        float a = 0.f;
+        if (valid && !dup) {
+            const float4* k4 = reinterpret_cast<const float4*>(k_s + ((size_t)j * h + hd) * d);
+            float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int l = lid * 4; l + 3 < d; l += TG * 4) {
+                float4 kk = k4[l >> 2];
+                float4 qq = *reinterpret_cast<const float4*>(qs + l);
+                acc.x += qq.x * kk.x; acc.y += qq.y * kk.y; acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
+            }
+            a = acc.x + acc.y + acc.z + acc.w;
+            if (lid == 0) {
+                for (int l = d & ~3; l < d; l++) a += qs[l] * k_s[((size_t)j * h + hd) * d + l];
+            }
+            #pragma unroll
+            for (int off = TG / 2; off > 0; off >>= 1) a += __shfl_down_sync(gmask, a, off);
         }
-        float a = acc.x + acc.y + acc.z + acc.w;
-        for (int l = d & ~3; l < d; l++) a += qs[l] * k_s[((size_t)j * h + hd) * d + l];
-        sc[s] = a * scale;
+        if (lid == 0) sc[s] = (valid && !dup) ? (a * scale) : -INFINITY;
     }
     __syncthreads();
     float m = -INFINITY;
