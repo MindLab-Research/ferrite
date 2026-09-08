@@ -4196,10 +4196,12 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // columns per block × 256 threads = 1 column/thread. 16 blocks spread the
 // old single-block P3's 64KB x read over 16 SMs' L2 bandwidth.
 // P345 grid.y: column blocks over h=nh/n. TP shrinks h per rank (hidden is
-// replicated), so a fixed NB left too few blocks on 148-SM parts →
-// latency-bound (measured 13.7µs × 87/step = 1.19ms at NB=64, 12.6 at 16).
-// 256 keeps 4x more blocks in flight; the kernel reads NB from gridDim.y.
-#define HC_P345_NB 256
+// replicated). NOTE 2026-09-08: NB>16 CORRUPTS the output (bisected:
+// 6355741 NB=16 → correct 出师表; 27f6ba0 NB=64 → all-EOS; 117982e NB=256
+// → "the the the"). Root cause TBD; 16 is the last known-good value and the
+// NB sweep showed no measurable gain (rest345 is compute-bound, 12.6µs at
+// NB=16 vs 13.7 at 64 — the extra blocks LOSE).
+#define HC_P345_NB 16
 
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
