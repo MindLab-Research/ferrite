@@ -961,6 +961,28 @@ impl<B: KernelBackend> TpCluster<B> {
             if std::env::var_os("FERRITE_TIMING").is_some() {
                 eprintln!("[megab] dry-run synced, capturing");
             }
+            // Cross-rank barrier BEFORE the serialized capture: capture_lock
+            // serializes the 8 ranks' captures, so a rank that finishes early
+            // would enter the NEXT phase while peers still capture → the P2P
+            // AR's per-layer rendezvous deadlocks (measured: dev0 stuck at
+            // the next dry-run's L0 while dev1-7 were at L35). A 1-element
+            // NCCL all-reduce (+sync) is a pure rendezvous.
+            if let Some(nccl) = &self.nccl {
+                let mut bufs = Vec::with_capacity(nccl.len());
+                for (k, ch) in nccl.iter().enumerate() {
+                    if let Some(cuda) = self.shards[k].backend.as_cuda() {
+                        let b = ferrite_kernel::cuda::DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
+                        ch.all_reduce_f32(b.as_const_f32(), b.as_f32(), 1)?;
+                        bufs.push(b);
+                    }
+                }
+                for k in 0..self.shards.len() {
+                    if let Some(cuda) = self.shards[k].backend.as_cuda() {
+                        cuda.sync()?;
+                    }
+                }
+                drop(bufs);
+            }
             Self::fan_out(&mut self.shards, |s| {
                 Self::mega_chain_dev_batched(
                     s, pseqs.as_slice(), in_vals.as_slice(), &plans, num_dsa, true, &gname, size,
@@ -968,6 +990,25 @@ impl<B: KernelBackend> TpCluster<B> {
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
+            // Symmetric barrier AFTER the capture (rank 0 releases
+            // capture_lock when its capture ends and would race ahead of
+            // peers still capturing — same deadlock as above).
+            if let Some(nccl) = &self.nccl {
+                let mut bufs = Vec::with_capacity(nccl.len());
+                for (k, ch) in nccl.iter().enumerate() {
+                    if let Some(cuda) = self.shards[k].backend.as_cuda() {
+                        let b = ferrite_kernel::cuda::DevBuf::alloc(cuda.dev(), cuda.stream(), 1)?;
+                        ch.all_reduce_f32(b.as_const_f32(), b.as_f32(), 1)?;
+                        bufs.push(b);
+                    }
+                }
+                for k in 0..self.shards.len() {
+                    if let Some(cuda) = self.shards[k].backend.as_cuda() {
+                        cuda.sync()?;
+                    }
+                }
+                drop(bufs);
+            }
             eprintln!(
                 "[megab] captured {gname}: {size} rows ({n} real), {} layers (B-row GEMM + per-seq state kernels)",
                 plans.len()
