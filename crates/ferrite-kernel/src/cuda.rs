@@ -3391,6 +3391,13 @@ impl CudaBackend {
         hidden: usize,
     ) -> Result<DevBuf> {
         self.enter();
+        // ALIGN (2026-09-08): n==1 must take the SAME path as the single-seq
+        // chain. Measured [megab-timing] dsa11=46.7ms vs the mega chain's
+        // dsa11=2.2-5.5ms — a 10-20x gap that IS the batched graph's 8.5ms
+        // fixed cost at B=1 (the GDN n==1 alignment only recovered 0.33ms).
+        if n == 1 {
+            return self.dsa_layer_dev(x, w, seqs[0], family, 1, hidden);
+        }
         let ni = n as i32;
         let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
         // 1-6. projections + layernorm + scale — n=B GEMMs (row-independent
