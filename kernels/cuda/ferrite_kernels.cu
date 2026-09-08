@@ -3193,18 +3193,18 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // the old warp-serial acc += p*y chain, bit-identical partials from the
     // same lane dot + shuffle tree).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h0 = blockIdx.x * ROWS;
+    int h0 = blockIdx.x * 8;
     if (h0 >= hidden) return;
     int stride = topk * inter + inter_shared;
     // ALL tokens per block (grid.y == 1). One block read only 18KB and spent
     // ~2us in fixed per-block latency -> 5.6GB/s/SM, while the act kernel
     // (128KB/block) reaches 22GB/s/SM. Processing MAXN tokens per block
     // amortizes that latency MAXN-fold; `part` holds the per-token partials.
-    const int MAXN = 4;
-    const int TT = 4;  // tokens per block
-    const int ROWS = 16;  // h rows per block (re-sweep WITH the 16-byte lanes:
-                          // 16 rows = 4KB contiguous per (token,slot))
-    __shared__ float part[MAXN][ROWS][16]; // [tok][h row][slot]
+    const int MAXN = 64;
+    const int TT = 4; // tokens per block (middle ground: 512 blocks gave too
+                      // little parallelism per SM, 8192 paid the fixed
+                      // per-block latency 16x)
+    __shared__ float part[MAXN][8][16]; // [tok][h row][slot]
     int j = warp;
     const int t0 = blockIdx.y * TT;
     const int t1 = (t0 + TT < nt) ? (t0 + TT) : nt;
@@ -3257,17 +3257,14 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             if (klen == 256) {
                 const int i0 = lane * 16;
                 const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
-                #pragma unroll
-                for (int cc = 0; cc < ROWS / 8; cc++) {
-                const int hb = h0 + cc * 8;
                 uint4 dv4[4];
                 #pragma unroll
                 for (int c = 0; c < 4; c++)
-                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(hb + 2 * c) * klen + i0);
+                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(h0 + 2 * c) * klen + i0);
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
-                    const float ds_c = dsr_base[(size_t)((hb + 2 * c) >> 7) * dscols + scol];
+                    const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
                     float y = 0.f;
                     #pragma unroll
@@ -3281,7 +3278,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     for (int off = 8; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
                     const float y1 = __shfl_sync(0xffffffff, y, 16);
                     if (lane == 0) { py[2 * c] = y; py[2 * c + 1] = y1; }
-                }
                 }
             } else {
                 #pragma unroll
@@ -3299,14 +3295,14 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             }
         if (lane == 0) {
             #pragma unroll
-            for (int hh = 0; hh < 8; hh++) part[tt][cc * 8 + hh][j] = p * py[hh];
+            for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
         }
         }
         }
         __syncthreads();
         // fold: cnt*8 (tok, h row) pairs, j-ascending (FP-safe)
-        for (int idx = threadIdx.x; idx < cnt * ROWS; idx += blockDim.x) {
-            int tt = idx / ROWS, hh = idx % ROWS;
+        for (int idx = threadIdx.x; idx < cnt * 8; idx += blockDim.x) {
+            int tt = idx >> 3, hh = idx & 7;
             int h = h0 + hh;
             if (h < hidden) {
                 float acc = 0.f;
@@ -3340,7 +3336,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     dim3 block(288); // 9 warps: topk routed (8) + shared
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
-    dim3 grid((hidden + 15) / 16, (n + 3) / 4, 1);
+    dim3 grid((hidden + 7) / 8, (n + 3) / 4, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
