@@ -293,3 +293,14 @@ moe_route warp-shuffle top-k（17.61，中性但修掉了 `bidx[threadIdx.x]` �
 文本仍正确。根因：pf[8] = 32 个额外寄存器压低占用，收益被抵消。**结论：act 的瓶颈不是
 单个 warp 的 load 深度**（单 tile 版已经是 8 warp × 4 uint4 = 32 个在飞的 load），
 继续加深度只会伤占用率。
+
+## 2026-09-08 gemv_fp8 的 M 维复用（有效，+1.1%）
+
+`gemv_fp8_v2_kernel` 改成 **每 block 处理 2 个 token**（grid.y = ceil(n/2)，t0 = blockIdx.y*2）：
+权重行只 load 一次、fp8->half2 只转换一次，两个 token 共用（每个 token 保留自己的累加顺序
+→ 逐位相同）。17.57-17.61 -> **17.40-17.42 ms（919 tok/s）**，文本正确。这是 n=16 下 GEMV
+的正确打法（M 维复用），但收益只有预测的 1/3 —— 说明该 kernel 仍有很大比例是延迟而非指令。
+
+**注意编译陷阱**：第一次提交漏了 `has1` 的作用域（声明在 row 循环的 `{}` 内、epilogue 在外），
+`build.sh` 报 1 error 而 serve 用的是**旧 .so**，测出 17.62ms 的假结果。**每次必须看 build 输出的
+error 数**（本会话第二次踩这个坑）。
