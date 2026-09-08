@@ -13,6 +13,7 @@
 // runner). Layouts match the CPU backend docs exactly.
 
 #include <cuda_runtime.h>
+#include <cstdio>
 #include <cmath>
 #include <cuda_fp8.h>
 
