@@ -4488,6 +4488,72 @@ __global__ void p2p_ar_sum_v2_kernel(
     }
 }
 
+// v3: down+sum fused into ONE kernel — the v2 pair paid a full kernel
+// boundary (~3-4us launch gap + re-read of epoch/ready) between the
+// publish and the collect phases. The fused kernel: phase A publishes the
+// partial (last block flags peers + advances epoch), then EVERY block spins
+// on the peers' ready flags and reduces its own slice. Same parity double-
+// buffer, same lockstep epoch protocol as v2 — semantics bit-identical.
+__global__ void p2p_ar_fused_v3_kernel(
+    const float* __restrict__ partial,          // this rank's partial [n]
+    float* const* __restrict__ staging_tbl,     // [world] peers' staging bases
+    unsigned* const* __restrict__ ready_tbl,    // [world] peers' flag rows
+    unsigned* epoch, unsigned* ctr,             // this rank's device counters
+    const float* __restrict__ staging_local,   // my [2][world][stride]
+    const unsigned* __restrict__ ready_local,   // my [world] epoch stamps
+    float* __restrict__ out, int world, int my_rank, int n, int stride) {
+    unsigned e = *epoch; // this call's epoch (pre-advance)
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // phase A: down — publish my partial to all peers' staging slots
+    if (i < n) {
+        float v = partial[i];
+        const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)i);
+        #pragma unroll 4
+        for (int r = 0; r < world; r++) staging_tbl[r][off] = v;
+    }
+    __threadfence_system(); // peer-visible stores before flag
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned prev = atomicAdd(ctr, 1u);
+        if (prev == gridDim.x - 1u) { // last block: all stores fenced
+            for (int r = 0; r < world; r++)
+                *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
+            *ctr = 0u;     // reset for the next call (stream-ordered)
+            *epoch = e + 1u; // advance AFTER the flags (the next kernel sees it)
+        }
+    }
+    __syncthreads();
+    // phase B: sum — spin until all peers' flags reach e+1, then reduce the
+    // (e&1) staging segment. e2 from the local register (epoch already
+    // advanced by phase A's last block — rereading it would be a race).
+    unsigned e2 = e + 1u;
+    if (threadIdx.x == 0) {
+        for (int r = 0; r < world; r++)
+            while ((int)((*(volatile unsigned*)&ready_local[r]) - e2) < 0) __nanosleep(100);
+    }
+    __syncthreads();
+    if (i < n) {
+        float acc = 0.f;
+        for (int r = 0; r < world; r++)
+            acc += staging_local[(size_t)((e & 1u) * world + r) * stride + i];
+        out[i] = acc;
+    }
+}
+
+extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch, unsigned* ctr,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    p2p_ar_fused_v3_kernel<<<blocks, threads, 0, s>>>(
+        partial, staging_tbl, ready_tbl, epoch, ctr,
+        staging_local, ready_local, out, world, my_rank, n, stride);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_p2p_ar_oneshot_v2(
     const float* partial, float* const* staging_tbl,
     unsigned* const* ready_tbl, unsigned* epoch, unsigned* ctr,

@@ -157,6 +157,16 @@ extern "C" {
                                   out: *mut f32, n: i32, world: i32, my_rank: i32,
                                   stride: i32,
                                   s: CuStream) -> i32;
+    fn ferrite_p2p_ar_fused_v3(partial: *const f32,
+                               staging_tbl: *const *mut f32,
+                               ready_tbl: *const *mut u32,
+                               epoch: *mut u32,
+                               ctr: *mut u32,
+                               staging_local: *const f32,
+                               ready_local: *const u32,
+                               out: *mut f32, n: i32, world: i32, my_rank: i32,
+                               stride: i32,
+                               s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
     fn ferrite_graph_instantiate(e: *mut *mut std::ffi::c_void, g: *mut std::ffi::c_void) -> i32;
@@ -4646,7 +4656,9 @@ impl CudaBackend {
         }
         self.enter();
         ck(unsafe {
-            ferrite_p2p_ar_oneshot_v2(
+            // v3: fused down+sum single kernel (saves the inter-kernel gap
+            // + epoch re-read between publish and collect phases)
+            ferrite_p2p_ar_fused_v3(
                 buf.as_const_f32(),
                 st.staging_tbl as *const *mut f32,
                 st.ready_tbl as *const *mut u32,
