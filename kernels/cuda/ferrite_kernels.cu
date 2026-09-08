@@ -3194,23 +3194,30 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // same lane dot + shuffle tree).
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int h0 = blockIdx.x * 8;
-    int tok = blockIdx.y;
     if (h0 >= hidden) return;
     int stride = topk * inter + inter_shared;
-    const float* act_t = act + (size_t)tok * stride;
-    const float* ids_t = ids_f + (size_t)tok * topk;
-    const float* probs_t = probs + (size_t)tok * topk;
-    __shared__ float part[8][16]; // [8 h rows][topk+1 slots] per-warp partials
+    // ALL tokens per block (grid.y == 1). One block read only 18KB and spent
+    // ~2us in fixed per-block latency -> 5.6GB/s/SM, while the act kernel
+    // (128KB/block) reaches 22GB/s/SM. Processing MAXN tokens per block
+    // amortizes that latency MAXN-fold; `part` holds the per-token partials.
+    const int MAXN = 64;
+    __shared__ float part[MAXN][8][16]; // [tok][h row][slot]
     int j = warp;
-    // ---- slot j partials for 8 h rows (routed 0..topk-1, shared = topk) ----
-    if (j <= topk) {
+    for (int base = 0; base < nt; base += MAXN) {
+        const int cnt = (nt - base < MAXN) ? (nt - base) : MAXN;
+        if (j <= topk) {
         float py[8];
+        for (int tt = 0; tt < cnt; tt++) {
+        const int tok = base + tt;
+        const float* act_t = act + (size_t)tok * stride;
+        const float* ids_t = ids_f + (size_t)tok * topk;
+        const float* probs_t = probs + (size_t)tok * topk;
         #pragma unroll
         for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
-        const float* aj;
-        const unsigned char* dbase;
-        const float* dsr_base;
-        int klen;
+        const float* aj = nullptr;
+        const unsigned char* dbase = nullptr;
+        const float* dsr_base = nullptr;
+        int klen = 0;
         float p = 1.f;
         if (j < topk) {
             int eid = (int)ids_t[j];
@@ -3222,7 +3229,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     dsr_base = down_scale_ptrs[local];
                     aj = act_t + (size_t)j * inter;
                     klen = inter;
-                    goto dot;
                 }
             }
         } else {
@@ -3230,7 +3236,8 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             dsr_base = shared_down_scale;
             aj = act_t + (size_t)topk * inter;
             klen = inter_shared;
-        dot:;
+        }
+        if (klen > 0) {
             // REGISTER-CACHE the act row: with 8 bytes per lane, each lane needs
             // only 8 floats (2 float4) — 8 registers instead of the old 48,
             // which lifts occupancy, and ALL 32 lanes are active (the old
@@ -3297,22 +3304,22 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         }
         if (lane == 0) {
             #pragma unroll
-            for (int hh = 0; hh < 8; hh++) {
-                int h = h0 + hh;
-                if (h < hidden) part[hh][j] = p * py[hh];
+            for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
+        }
+        }
+        }
+        __syncthreads();
+        // fold: cnt*8 (tok, h row) pairs, j-ascending (FP-safe)
+        for (int idx = threadIdx.x; idx < cnt * 8; idx += blockDim.x) {
+            int tt = idx >> 3, hh = idx & 7;
+            int h = h0 + hh;
+            if (h < hidden) {
+                float acc = 0.f;
+                for (int jj = 0; jj <= topk; jj++) acc += part[tt][hh][jj];
+                out[(size_t)(base + tt) * hidden + h] = acc;
             }
         }
-    }
-    __syncthreads();
-    // ---- fold: warps 0..7 each reduce one h row, j-ascending (FP-safe) ----
-    if (warp < 8) {
-        int hh = warp;
-        int h = h0 + hh;
-        if (h < hidden && lane == 0) {
-            float acc = 0.f;
-            for (int j = 0; j <= topk; j++) acc += part[hh][j];
-            out[(size_t)tok * hidden + h] = acc;
-        }
+        __syncthreads();
     }
 }
 
@@ -3336,7 +3343,9 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
         return cudaGetLastError();
     }
     dim3 block(288); // 9 warps: topk routed (8) + shared
-    dim3 grid((hidden + 7) / 8, n, 1);
+    // grid.y == 1: each block now loops over ALL tokens (see the kernel's
+    // MAXN chunking) to amortize the fixed per-block latency.
+    dim3 grid((hidden + 7) / 8, 1, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
