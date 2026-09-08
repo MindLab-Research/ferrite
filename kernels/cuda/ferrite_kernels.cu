@@ -4841,12 +4841,22 @@ __global__ void p2p_ar_fused_v3_kernel(
     float* __restrict__ out, int world, int my_rank, int n, int stride) {
     unsigned e = *epoch; // this call's epoch (pre-advance)
     int i = blockIdx.x * blockDim.x + threadIdx.x;
+    // TP8 vs TP4: the old code serialized the world loop in ONE thread
+    // (8 NVLink stores + 8 flag polls + 8 staging reads, each ~1.5µs at
+    // world=8) — measured 15.3µs at TP8 vs 11.7µs at TP4, the whole TP8
+    // gap. Map (token, peer) across threads instead.
+    const int total = n * world;
+    const int tr = (threadIdx.x < (unsigned)world) ? (int)threadIdx.x : -1;
     // phase A: down — publish my partial to all peers' staging slots
     if (i < n) {
         float v = partial[i];
         const size_t off = (size_t)(((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)i);
-        #pragma unroll 4
-        for (int r = 0; r < world; r++) staging_tbl[r][off] = v;
+        // one thread per peer (parallel NVLink stores)
+        int r0 = blockIdx.x * blockDim.x + threadIdx.x;
+        if (r0 < total) {
+            int rr = r0 % world;
+            staging_tbl[rr][off] = v;
+        }
     }
     __threadfence_system(); // peer-visible stores before flag
     __syncthreads();
@@ -4864,9 +4874,8 @@ __global__ void p2p_ar_fused_v3_kernel(
     // (e&1) staging segment. e2 from the local register (epoch already
     // advanced by phase A's last block — rereading it would be a race).
     unsigned e2 = e + 1u;
-    if (threadIdx.x == 0) {
-        for (int r = 0; r < world; r++)
-            while ((int)((*(volatile unsigned*)&ready_local[r]) - e2) < 0) __nanosleep(100);
+    if (tr >= 0) { // one thread per peer polls its own flag (parallel)
+        while ((int)((*(volatile unsigned*)&ready_local[tr]) - e2) < 0) __nanosleep(100);
     }
     __syncthreads();
     if (i < n) {
