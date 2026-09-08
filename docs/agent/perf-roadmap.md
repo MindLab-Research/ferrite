@@ -174,3 +174,22 @@ cp.async 无额外收益。
 **至此"用 cp.async 提高内存级并行度"这条线也已探完**：act（有效，+0.8%）、down（不可行，
 每 lane 16B 私有数据需 73KB smem）、mix（中性）。剩下的提升空间必须来自**数据布局或算法**，
 不是加载方式。
+
+## 最大的剩余机会：MLA 吸收（absorption）——长上下文的主要衰减源
+
+**实测**：300-token 窗口 960 tok/s，1000-token 窗口仅 ~808（-16%），而用户协议要求 ≥1000 token，
+所以这个衰减直接压低对外数字。
+
+**根因（代码确认）**：DSA 缓存是**非吸收式**的 —— `dsa_cache_append` 在写入时就把 kvb
+（up-projected k/v）按 head 展开成 `k_nope[T, h=64, dk=256]` / `v[T, h, dv]`
+（`k_nope[dst * dk + c] = kvb[...]`）。于是 sparse_attn 每个 (seq, head) 都要重读
+`live_k × 256 × 2 × 4B`：t=1000 时每 seq 约 65MB，16 seq 合计 **~1GB/层**，
+11 个 DSA 层 ≈ **1.5 ms/步**（7.6TB/s 下），这就是 -16% 衰减的主体。
+
+**吸收式做法**（vLLM/SGLang 的 MLA decode 就是这么做的）：缓存只存 latent（512），
+注意力里用 `(q @ W_k^T) @ latent` 的形式算分数，q 侧预吸收。缓存读取量降 **~64x**
+（1000×512×4B×16 ≈ 33MB/层），预计省 **1.5ms（约 8%）**，且分数计算量同时下降。
+
+**代价**：这是架构级改动 —— 缓存布局 + cache_append 内核 + sparse_attn 内核 + q 侧预吸收，
+约 300+ 行，且必须逐层数值对齐（建议用 `FERRITE_DSA_PROBE` 逐层比对旧实现）。
+**这是 roadmap 里唯一有两位数百分点潜力的方向。**
