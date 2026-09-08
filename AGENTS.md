@@ -136,6 +136,26 @@ Other profiling rules:
 5. After `kill -9`, GPU memory release is asynchronous (defunct + CUDA context teardown can take ~30 s) — confirm `nvidia-smi` shows 0 MiB before the next run.
 6. serve is one-shot: exits via `std::process::exit(0)` (exit-time drop of 1.17 TB weights SEGFAULTs → EXIT 139, which also loses profiler buffers).
 
+## 2026-09-08 会话结论：通信不是瓶颈（A/B 实测），计算才是
+
+**用户目标**：16 并发 ≥1600 tok/s（不开 MTP）；若用 MTP 则目标 3200。**当前：21.2 ms/步 = 755 tok/s**（会话内从 546 提升 +38%，每次改动都人眼验证文本）。
+
+**决定性 A/B（同一 16-seq 负载，`FERRITE_AR_SKIP=1` 跳过全部 AR）**：跳 AR 22.05 ms vs 带 P2P AR 23.06 ms → **通信只占 1.78 ms = 7.5%**。32 并发同样（NO-AR 95.5 vs 102.8）。**"通信占 64%" 是陈旧读数**（`p2p_ar_publish` max=55.6ms 是 dry-run/capture 期自旋超时）。
+
+**本会话落地的有效 kernel 优化（全部文本验证通过，累计 29.33→21.2 ms）**：
+1. **moe_fused_down 的 16 字节 lane**（每 lane uint4 覆盖 2 个连续 h 行，klen=256）：**7.5 → 1.7 ms（4x）**。关键认知：该 kernel 原为 request-rate 受限（8B lane 只跑 1.16TB/s = 15% 峰值）。踩过的坑：scale 列索引必须用 `(lane&15)>>3`（lane 16-31 读的是第二行）；补丁里重复声明 `py[8]` 会遮蔽外层变量 → 输出全零。
+2. **moe_fused_act 的 padded per-warp smem staging**：A 片段 4B 加载跨 8 行 = 每指令只用到 32B sector 的一半（2.3x 字节浪费）。暂存 16 行 × 64 列 × 2 投影，**行距必须 padding 到 80B**（64B 会让每行落在 bank 0 → 8 路冲突，实测反而慢 1.6ms）。→ act 74 → 62.7 µs/次。
+3. **sparse_attn 的 live_k 边界**（原按固定 select_k_max=2048 循环，实际槽位 ~112）。
+4. **indexer_topk 快路径**（select_k ≥ jmax 时跳过 O(k·n) 选择）。
+5. **dense-FFN / GDN host 路径的 AR 改 P2P 优先**（原来直调 NCCL）。
+6. 8 行数据预取到寄存器 + shuffle 归约外提 + TT=4 tokens/block + 去掉阻止展开的 `break`/守卫。
+
+**已验证无效/更差（勿重复）**：gemv row-major、down TT=1/8/16、ROWS=16/64、gemv R=8 行/组、gemv 1024 线程/block、K 循环 unroll 4、token 循环 unroll 2、去掉 fp8 转换链（仅省 4.5% → 非转换瓶颈）、act 的共享 sa staging（无 padding 或 4KB/warp 版）。
+
+**当前每步每卡分解（nsys，367 步反推）**：p2p_ar_publish 1.3-2.5（含 barrier 等待）/ moe_act 3.2 / matmul_tiled_bf16 2.7（多为 prefill）/ gemv_fp8 2.5 / indexer 1.9 / moe_down 1.7 / sparse_attn 1.7 / AR 残余 / hc 2.2 / kpool 0.86 / gdn_chunk 0.82 / gdn_step 0.48 / route 0.47。
+
+**下一步**：① matmul_tiled_bf16 是 32×32 FMA（无 tensor core），确认是否为 decode 路径，是则改 cuBLAS/MMA；② indexer/sparse_attn 的 199/180µs 中位（短上下文下应更快）；③ hc 两个 kernel 2.2ms（每 block 仅 256 元素）；④ AR 的 90 次 barrier（49µs/次，理论 11µs）——可试 per-block flag 省掉 publish kernel。
+
 ## B=16 通信 vs 计算：实测推翻旧结论（2026-09-08 late, perf-b1）
 
 **A/B 实测（同一 16-seq 负载，`FERRITE_AR_SKIP=1` 跳过全部 AR）：**
