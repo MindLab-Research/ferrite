@@ -3183,7 +3183,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int dscols, int nt) {
-    __shared__ uint4 dv_sm[9][2][4];   // cp.async double buffer (per warp)
     // v12: grid (hidden/8, nt) — warp j owns expert slot j and loops EIGHT h
     // rows. The act row (tok, slot j — 6KB) is invariant across h: the first
     // read pulls it into L1 and the 7 re-reads hit L1 (the v11 grid
@@ -3215,32 +3214,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         const int cnt = ((t1 - base) < MAXN) ? (t1 - base) : MAXN;
         if (j <= topk) {
         float py[8];
-        // cp.async double-buffered weight prefetch: the 4 uint4 loads for the
-        // NEXT token are issued while the current token's 4 dot rounds run
-        // (~160 cycles of compute vs 300+ of L2 latency). smem cost is only
-        // 128B/warp, so unlike the register prefetch / tt-unroll there is no
-        // occupancy cost.
-        #define DOWN_ISSUE(TOK, BUF) do { \
-            const float* ids2_ = ids_f + (size_t)(TOK) * topk; \
-            const unsigned char* db_ = nullptr; \
-            if (j < topk) { \
-                const int eid_ = (int)ids2_[j]; \
-                const int loc_ = eid_ - expert_start; \
-                if (loc_ >= 0 && loc_ < e_local) db_ = down_w8_ptrs[loc_]; \
-            } else { db_ = shared_down_w8; } \
-            if (db_ != nullptr) { \
-                const int i0_ = lane * 16; \
-                _Pragma("unroll") \
-                for (int c_ = 0; c_ < 4; c_++) { \
-                    const unsigned char* src_ = db_ + (size_t)(h0 + 2 * c_) * 256 + i0_; \
-                    const unsigned int dst_ = (unsigned)__cvta_generic_to_shared(&dv_sm[j][BUF][c_]); \
-                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(dst_), "l"(src_)); \
-                } \
-            } \
-            asm volatile("cp.async.commit_group;\n"); \
-        } while (0)
-        DOWN_ISSUE(base, 0);
-        int dvbuf = 0;
         for (int tt = 0; tt < cnt; tt++) {
         const int tok = base + tt;
         const float* act_t = act + (size_t)tok * stride;
@@ -3284,13 +3257,15 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 for (int r = 0; r < 4; r++) ar[r] = a4[base + r];
             }
             if (klen == 256) {
+                const int i0 = lane * 16;
                 const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
-                asm volatile("cp.async.wait_group 0;\n");
-                __syncwarp();
-                if (tt + 1 < cnt) DOWN_ISSUE(base + tt + 1, dvbuf ^ 1);
+                uint4 dv4[4];
+                #pragma unroll
+                for (int c = 0; c < 4; c++)
+                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(h0 + 2 * c) * klen + i0);
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
-                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv_sm[j][dvbuf][c]);
+                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
                     const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
                     float y = 0.f;
@@ -3324,9 +3299,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
         }
-        dvbuf ^= 1;
         }
-        #undef DOWN_ISSUE
         }
         __syncthreads();
         // fold: cnt*8 (tok, h row) pairs, j-ascending (FP-safe)
