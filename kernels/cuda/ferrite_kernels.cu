@@ -3292,6 +3292,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     py[hh] = y;
                 }
             }
+            }
         if (lane == 0) {
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
