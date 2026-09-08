@@ -5804,9 +5804,12 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
             xc[0] = xc[1] = xc[2] = xc[3] = make_float4(0.f, 0.f, 0.f, 0.f);
         }
     }
+    // UNROLLED row loop (no `break`: it blocked unrolling, leaving the 8 rows'
+    // loads serialized — the kernel is latency-bound, ~32us per block for 8KB).
+    #pragma unroll
     for (int r = 0; r < R; r++) {
     const int rowg = rowg0 + r;
-    if (rowg >= nrows * out_f) break;
+    if (rowg >= nrows * out_f) continue;
     const int token = rowg / out_f;
     const int row = rowg - token * out_f;
     float acc = 0.f;
