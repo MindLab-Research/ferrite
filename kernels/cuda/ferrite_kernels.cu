@@ -1246,7 +1246,9 @@ __global__ void router_gemm_route_fused_kernel(
     for (int k = threadIdx.x * 8; k + 7 < hidden; k += blockDim.x * 8) {
         float4 xa = *reinterpret_cast<const float4*>(x + k);
         float4 xb = *reinterpret_cast<const float4*>(x + k + 4);
-        uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+        uint4 wv;
+        asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(wv.x), "=r"(wv.y), "=r"(wv.z), "=r"(wv.w) : "l"(wr + k));
         const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
         float2 f0 = __bfloat1622float2(w2[0]), f1 = __bfloat1622float2(w2[1]);
         float2 f2 = __bfloat1622float2(w2[2]), f3 = __bfloat1622float2(w2[3]);
