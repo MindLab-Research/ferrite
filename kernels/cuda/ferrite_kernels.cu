@@ -3357,13 +3357,8 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
                 uint4 dv4[4];
                 #pragma unroll
-                for (int c = 0; c < 4; c++) {
-                    uint4 wv;
-                    asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                                 : "=r"(wv.x), "=r"(wv.y), "=r"(wv.z), "=r"(wv.w)
-                                 : "l"(dbase + (size_t)(h0 + 2 * c) * klen + i0));
-                    dv4[c] = wv;
-                }
+                for (int c = 0; c < 4; c++)
+                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(h0 + 2 * c) * klen + i0);
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
