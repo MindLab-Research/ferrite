@@ -5070,14 +5070,18 @@ extern "C" cudaError_t ferrite_gdn_step_v2p(
     const float* a_log, float lb,
     float* state, float* out, int h, int dk, int dv,
     cudaStream_t s) {
+    // TP-occupancy: grid is (1, h) — TP shrinks h per rank (8 at TP8), so
+    // the kernel ran on 8 blocks. blockDim 512->1024 doubles the intra-block
+    // column split (splits = blockDim/dv: 4 -> 8, rows/lane 32 -> 16) and
+    // red2 must cover splits*dv.
     size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
-                  + (size_t)(dv + dk + dv + dk + dk + 2 + dk + 512) * sizeof(float);
+                  + (size_t)(dv + dk + dv + dk + dk + 2 + dk + 1024) * sizeof(float);
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gdn_step_v2p_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         if (e != cudaSuccess) return e;
     }
-    dim3 block(512);
+    dim3 block(1024);
     dim3 grid(1, h, 1);
     return pdl_or_plain(gdn_step_v2p_kernel, grid, block, smem, s,
                         q, k, v, b_raw, fb, dt_bias, a_log, lb, state, out, 1, h, dk, dv);
