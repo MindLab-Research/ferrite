@@ -935,10 +935,14 @@ impl CudaBackend {
                 scale.len(), srows, scols
             )));
         }
-        let mut w: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mut sc: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut w, data.len()) }, "fp8 w malloc")?;
-        ck(unsafe { cudaMalloc(&mut sc, scale.len() * 4) }, "fp8 scale malloc")?;
+        // BUMP-allocated (B300 quirk: the MoE-TP experts fire ~39k register_fp8
+        // calls (288 experts × 3 × 45 layers) — direct cudaMalloc hits the
+        // driver's small-allocation degradation (the same class as the 21600
+        // preload OOM); bump-slicing 1GB blocks keeps the malloc count ~90.
+        // The fp8 weights live for the process lifetime (bump blocks are
+        // never freed — same contract as the bf16 weight cache).
+        let w = self.bump_alloc(data.len().max(256))?;
+        let sc = self.bump_alloc(scale.len() * 4)?;
         ck(unsafe { cudaMemcpy(w, data.as_ptr() as *const _, data.len(), CUDA_MEMCPY_H2D) }, "fp8 w H2D")?;
         ck(unsafe { cudaMemcpy(sc, scale.as_ptr() as *const _, scale.len() * 4, CUDA_MEMCPY_H2D) }, "fp8 scale H2D")?;
         self.fp8_map.lock().unwrap().insert(

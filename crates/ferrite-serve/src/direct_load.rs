@@ -317,11 +317,16 @@ pub fn direct_preload_shard(
                 // scale) and serves dev_weight_bf16 consumers.
                 let scols_full = cols.div_ceil(128);
                 let d = dv.direct.slice(data);
-                // experts under MoE-TP walk the Rows/Cols splits — the fused
-                // MoE kernels read bf16 pointer tables (moe_expert_ptrs), so
-                // experts get dequant-bf16 ONLY (no register_fp8 fp8 copy —
-                // doubling 160×3 experts' residency OOMs: 275GB cap).
+                // experts under MoE-TP walk the Rows/Cols splits — the fp8 MoE
+                // path (moe_layer_dev → moe_expert_ptrs_fp8 → W8A8 mma act +
+                // W8A16 down) reads the checkpoint-native e4m3: register_fp8
+                // for experts TOO, and SKIP the bf16 dequant (the fp8+bf16
+                // double residency OOMs: 288×3×45 expert weights ≈ 155GB bf16
+                // + 78GB fp8 per rank; fp8-ONLY saves ~78GB/rank AND halves
+                // the MoE HBM bytes — SGLang serves MoE from the native fp8).
+                // FERRITE_MOE_BF16=1 restores the old bf16-only path (rollback).
                 let is_expert = name.split(".experts.").nth(1).is_some();
+                let moe_bf16 = std::env::var_os("FERRITE_MOE_BF16").is_some();
                 match split {
                     Split::Replicated => {
                         // fp8 GEMV (W8A16) registration — the SAME numerical path
@@ -348,10 +353,12 @@ pub fn direct_preload_shard(
                         // grid's rows r0/128..r1/128, full cols).
                         let sw = scale_row_window(&scale_full, scols_full, r0 / 128, r1.div_ceil(128));
                         let dr = &d[r0 * cols..r1 * cols];
-                        if !is_expert {
+                        if !is_expert || !moe_bf16 {
                             backend.register_fp8(ph, r1 - r0, cols, dr, &sw)?;
                         }
-                        backend.preload_fp8_dequant(ph, dr, &sw, r1 - r0, cols)?;
+                        if !is_expert || moe_bf16 {
+                            backend.preload_fp8_dequant(ph, dr, &sw, r1 - r0, cols)?;
+                        }
                         st.fp8_rows += 1;
                     }
                     Split::Cols { c0, c1 } => {
@@ -371,10 +378,12 @@ pub fn direct_preload_shard(
                         for r in 0..srows {
                             sg.extend_from_slice(&scale_full[r * scols_full + sc0..r * scols_full + sc1]);
                         }
-                        if !is_expert {
+                        if !is_expert || !moe_bf16 {
                             backend.register_fp8(ph, rows, shard_cols, &dg, &sg)?;
                         }
-                        backend.preload_fp8_col_dequant(ph, d, &scale_full, rows, cols, c0, c1)?;
+                        if !is_expert || moe_bf16 {
+                            backend.preload_fp8_col_dequant(ph, d, &scale_full, rows, cols, c0, c1)?;
+                        }
                         st.fp8_cols += 1;
                     }
                     Split::QkvHeads { .. } => {
