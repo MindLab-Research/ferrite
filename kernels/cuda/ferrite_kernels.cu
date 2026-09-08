@@ -4202,7 +4202,9 @@ extern "C" cudaError_t ferrite_indexer_topk_batched(
     const float* qi, const float* pool_keys, const float* w,
     float* idx, int B, int ih, int idm, int select_k_max, int kpool, int max_npools,
     const int* const* total_tbl, cudaStream_t s) {
-    dim3 block(256);
+    dim3 block(1024); // was 256: the grid is only B=16 blocks, so the block
+                      // size IS the parallelism (16x256 threads used 1.4% of
+                      // the GPU; 16x1024 = 5.5%).
     dim3 grid(B);
     int max_t = 2048; // max_npools (smem frozen for MAX — graph-safe)
     size_t smem = (size_t)max_t * sizeof(float);
