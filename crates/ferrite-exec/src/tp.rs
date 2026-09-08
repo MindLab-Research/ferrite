@@ -1456,12 +1456,18 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                     // per-draft replay: advance(1) pins t0/total for the
                     // graph's dsa append+query (the kernel reads them
-                    // zero-copy), then ONE graph launch.
+                    // zero-copy), then ONE graph launch. The NEXT advance
+                    // overwrites the SAME pinned slot the just-launched
+                    // graph's kernels read — sync between graphs (the last
+                    // graph's read is covered by the D2H below).
                     for i in 0..nd {
                         cuda.dsa_host_advance(seq, mtp_family, 1);
                         let gname = format!("mega_d{seq}_{i}");
                         if !cuda.graph_replay(&gname) {
                             return Err(FerriteError::InvalidArg(format!("draft graph {gname} missing")));
+                        }
+                        if i + 1 < nd {
+                            cuda.sync()?;
                         }
                     }
                     // D2H the draft tokens (nd × 4B — verify input + accept
