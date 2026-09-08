@@ -267,11 +267,13 @@ impl ServeEngine for GpuEngine {
                     .iter()
                     .filter_map(|seq| self.arena.get(*seq).map(|g| g.cluster_seq))
                     .collect();
-                if live_seqs.len() == 1 {
+                if live_seqs.len() == 1 && std::env::var_os("FERRITE_FORCE_BATCHED_B1").is_none() {
                     // SINGLE seq: the per-seq mega (GEMV) path. The batched
-                    // B-row GEMM graph is 1.9x SLOWER at B=1 (measured
-                    // [megab] replay 17.95ms vs [mega] 9.55ms on the same
-                    // model/prompt — the batched graph only pays off at B>1).
+                    // B-row GEMM graph was 1.9x SLOWER at B=1 (measured
+                    // [megab] replay 17.95ms vs [mega] 9.55ms). The
+                    // gdn_layer_dev_batched n==1 alignment (fused
+                    // gemv_tri/gemv_qkv_conv) closes most of that gap —
+                    // FERRITE_FORCE_BATCHED_B1=1 re-tests the batched path.
                     if let Some(old) = self.batch_graph.take() {
                         self.cluster.destroy_batch_graph(&old);
                     }
