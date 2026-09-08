@@ -3003,23 +3003,22 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         uw8 = shared_up_w8;   us = shared_up_scale;
     }
     // ---- 1. per-block quantize (v1 mode — NO cross-block barrier) ----
-    // blockDim 512 (16 warps): the 256/8-warp launch held Occ at 24% (288
-    // blocks × 8 warps = 16 warps/SM of 64 — ncu: MemTP 49% @ 1.99TB/s);
-    // 16 warps/block × 288 blocks = 32 warps/SM ≈ 48% Occ → more outstanding
-    // loads → the L2/HBM pipe saturates.
+    // (512-thread 16-warp variant measured NO gain: 62.0 vs 63.4 tok/s serve,
+    // 16.5 vs 15.2µs isolated — the K-split's sacc reduction overhead cancels
+    // the occupancy gain; 256/8-warp is the optimum at these shapes.)
     extern __shared__ unsigned char smem[];
     unsigned char* sx = smem;                       // [hidden] e4m3 xq
-    float* sred = (float*)(smem + hidden);         // [512] absmax reduce
-    float* sxs = (float*)(smem + hidden + 512 * 4); // [1] x_scale
-    float* sgacc = sxs + 1;                        // [16][16] gate partials
-    float* suacc = sgacc + 16 * 16;               // [16][16] up partials
+    float* sred = (float*)(smem + hidden);         // [256] absmax reduce
+    float* sxs = (float*)(smem + hidden + 256 * 4); // [1] x_scale
+    float* sgacc = sxs + 1;                        // [8][16] gate partials
+    float* suacc = sgacc + 8 * 16;                 // [8][16] up partials
     {
         float amax = 1e-9f;
-        for (int k = threadIdx.x; k < hidden; k += blockDim.x)
+        for (int k = threadIdx.x; k < hidden; k += 256)
             amax = fmaxf(amax, fabsf(xt[k]));
         sred[threadIdx.x] = amax;
         __syncthreads();
-        for (int off = blockDim.x >> 1; off > 0; off >>= 1) {
+        for (int off = 128; off > 0; off >>= 1) {
             if (threadIdx.x < off)
                 sred[threadIdx.x] = fmaxf(sred[threadIdx.x], sred[threadIdx.x + off]);
             __syncthreads();
@@ -3027,15 +3026,15 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         if (threadIdx.x == 0) sxs[0] = sred[0] / 448.0f;
         __syncthreads();
         const float inv = 1.0f / sxs[0];
-        for (int k = threadIdx.x; k < hidden; k += blockDim.x) {
+        for (int k = threadIdx.x; k < hidden; k += 256) {
             const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
             sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
         }
         __syncthreads();
     }
-    // ---- 2. gate mma + up mma (same smem xq; 16-warp K-split each) ----
+    // ---- 2. gate mma + up mma (same smem xq; 8-warp K-split each) ----
     const int nblk = (hidden + 127) >> 7;
-    const int bseg = (nblk + 15) / 16;
+    const int bseg = (nblk + 7) / 8;
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, hidden);
@@ -3092,7 +3091,7 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     // quant scale) before the nonlinearity (v1 gemv epilogue semantics).
     if (warp == 0 && lane < 16) {
         float g = 0.f, u = 0.f;
-        for (int i = 0; i < 16; i++) {
+        for (int i = 0; i < 8; i++) {
             g += sgacc[i * 16 + lane];
             u += suacc[i * 16 + lane];
         }
@@ -3120,12 +3119,9 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
     int max_rows = inter > inter_shared ? inter : inter_shared;
     if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported; // v1 alignment
     dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
-    // 512 threads (16 warps): ncu showed the 256/8-warp launch at Occ 24%
-    // (288 blocks × 8 warps = 16 warps/SM of 64) and MemTP 49% — the 16-warp
-    // K-split doubles the in-flight loads per SM (Occ → 48%).
-    const int smem = hidden + 512 * 4 + 4 + 2 * 16 * 16 * 4;
+    const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    moe_fused_act_fp8_mma_kernel<<<grid, 512, smem, s>>>(
+    moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
         x, ids_f,
         (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
         (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
@@ -3862,92 +3858,12 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
         }
     }
 
-    // ═══ P12-in-mix_split (v12): the LAST BLOCK does P1/P2 (mx reduce +
-    // sinkhorn + pre_s/post/comb to the global scratch). No spin, no deadlock
-    // (s>1 prefill skips via the early return — only s==1 decode fuses).
-    // This is the ENABLING STEP for the GEMV prologue fusion: pre_s in the
-    // global scratch → the GEMV's prologue can compute li = pre_s × x in
-    // its multi-block grid (the hc_pre_rest's 42µs P3 distributed across
-    // the GEMV's blocks). The atomic counter: the 192 blocks increment,
-    // the last block (counter == 192) does the P1/P2. The FP is IDENTICAL
-    // to the hc_pre_rest's P1/P2 (the same mx reduce order, the same
-    // sinkhorn iteration order — the same pre_s/post/comb values). ═══
-    if (s == 1) {  // decode only (s>1 prefill: too many blocks, skip — the
-                   // hc_pre_rest handles P1/P2 for prefill via its normal path)
-        __threadfence();  // the mix partials + Σx² are visible before the counter
-        __syncthreads();
-        __shared__ int is_last;
-        if (threadIdx.x == 0) {
-            unsigned prev = atomicAdd(ctr, 1u);
-            is_last = (prev == (unsigned)(mix * KS - 1)) ? 1 : 0;
-        }
-        __syncthreads();
-        if (is_last) {
-            // ═══ P1: mx reduce (24 rows × 8 KS partials → mx_s) + Σx² → rsq ═══
-            // (the IDENTICAL mx reduce order as the hc_pre_rest's P1: the thread 0
-            // reads the partials serially, the same accumulation order — FP-safe)
-            extern __shared__ float p12_sm[];  // mx_s[mix] + red[48]
-            float* mx_s = p12_sm;               // [mix]
-            float* red2 = p12_sm + mix;         // [48] (warp partials)
-            float msq = 0.f;
-            if (threadIdx.x == 0) {
-                const float* xsq = mx_partial + (size_t)s * mix * KS;
-                for (int z2 = 0; z2 < KS; z2++) msq += xsq[(size_t)t * KS + z2];
-                red2[39] = rsqrtf(msq / (float)nh + rms_eps);
-            }
-            __syncthreads();
-            float r = red2[39];
-            for (int m2 = threadIdx.x; m2 < mix; m2 += blockDim.x) {
-                float acc = 0.f;
-                for (int z2 = 0; z2 < KS; z2++) acc += mx_partial[((size_t)t * mix + m2) * KS + z2];
-                mx_s[m2] = acc * r;
-            }
-            __syncthreads();
-            // ═══ P2: pre_s + post + comb (the sinkhorn) — the IDENTICAL order
-            // as the hc_pre_rest's P2 (the same sigmoid, the same 4-iteration
-            // sinkhorn, the same output values — FP-safe) ═══
-            const float* mx = mx_s;
-            for (int i = threadIdx.x; i < n; i += blockDim.x) {
-                pre_s_g[(size_t)t * n + i] = 1.0f / (1.0f + __expf(-(mx[i] * scale[0] + base[i]))) + hc_eps;
-                post[t * n + i] = 2.0f * (1.0f / (1.0f + __expf(-(mx[n + i] * scale[1] + base[n + i]))));
-            }
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                float cb[64];
-                for (int i = 0; i < n; i++)
-                    for (int k = 0; k < n; k++)
-                        cb[i * n + k] = mx[2 * n + i * n + k] * scale[2] + base[2 * n + i * n + k];
-                for (int i = 0; i < n; i++) {
-                    float rmax = -INFINITY;
-                    for (int k = 0; k < n; k++) rmax = fmaxf(rmax, cb[i * n + k]);
-                    float denom = 0.f;
-                    for (int k = 0; k < n; k++) { cb[i * n + k] = __expf(cb[i * n + k] - rmax); denom += cb[i * n + k]; }
-                    for (int k = 0; k < n; k++) cb[i * n + k] = cb[i * n + k] / denom + hc_eps;
-                }
-                for (int k = 0; k < n; k++) {
-                    float colsum = 0.f;
-                    for (int i = 0; i < n; i++) colsum += cb[i * n + k];
-                    float d = colsum + hc_eps;
-                    for (int i = 0; i < n; i++) cb[i * n + k] /= d;
-                }
-                for (int it = 1; it < iters; it++) {
-                    for (int i = 0; i < n; i++) {
-                        float rowsum = 0.f;
-                        for (int k2 = 0; k2 < n; k2++) rowsum += cb[i * n + k2];
-                        float d = rowsum + hc_eps;
-                        for (int k2 = 0; k2 < n; k2++) cb[i * n + k2] /= d;
-                    }
-                    for (int k2 = 0; k2 < n; k2++) {
-                        float colsum = 0.f;
-                        for (int i = 0; i < n; i++) colsum += cb[i * n + k2];
-                        float d = colsum + hc_eps;
-                        for (int i = 0; i < n; i++) cb[i * n + k2] /= d;
-                    }
-                }
-                for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
-            }
-        }
-    }
+    // (P12 disabled: the is_last-atomic P1/P2 in mix_split cost ~69µs/layer —
+    // 192 blocks' threadfence/atomic serialization + the serial sinkhorn on the
+    // last block — v4 measured 45.4 tok/s vs 63.4 without it. The rest kernel
+    // unconditionally does P1/P2 (the prologue reduce + sigmoid/sinkhorn),
+    // so deleting this block is functionally a no-op; pre_s for the future
+    // GEMV prologue fusion will be computed in the GEMV itself, not here.)
     (void)rms_eps;
 }
 
@@ -4129,7 +4045,11 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     float* pre_s_g = mx_scratch + s * mix * HC_MIX_KS + s * HC_MIX_KS + s;
     cudaMemsetAsync(ctr, 0, sizeof(unsigned), stream);
     dim3 mix_grid(s, mix, HC_MIX_KS);
-    hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+    // P12 smem: the is_last block uses extern __shared__ p12_sm[]
+    // (mx_s[mix] + red2[48]) — launch smem was 0 (v12 bug: smem OOB →
+    // err 700 at hc_pre_dev; 288 bytes fixes it).
+    size_t p12_sm_bytes = (size_t)(mix + 48) * sizeof(float);
+    hc_pre_mix_split_kernel<<<mix_grid, 256, p12_sm_bytes, stream>>>(
         res, fw, mx_scratch, scale, base, pre_s_g, post, comb, ctr,
         s, n, h, mix, rms_eps, hc_eps, iters);
     cudaError_t e = cudaGetLastError();
