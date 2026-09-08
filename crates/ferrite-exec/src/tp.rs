@@ -1111,12 +1111,12 @@ impl<B: KernelBackend> TpCluster<B> {
                     cuda.dsa_host_advance(seq_r, f, 1);
                 }
             }
-            // P2P AR protocol reset BEFORE the replay: the diag showed a
-            // persistent off-by-one between ranks (myepoch=270 flag=270)
-            // when the counters carried across captures/replays. Starting
-            // every replay from epoch 0 on every rank makes the first
-            // flag wait synchronize the ranks instead of deadlocking.
-            let _ = cuda.p2p_ar_reset();
+            // NOTE: do NOT reset the P2P protocol here. p2p_ar_reset is
+            // called once before the capture; resetting per-replay raced
+            // the 8 ranks' parallel replays (one rank's reset landed after
+            // its own replay → its epoch fell back to 0 while peers kept
+            // advancing → its flag froze at 1 and everyone waited forever).
+            // The epoch is monotonic across replays by design.
             let mut out = vec![0f32; size];
             if !cuda.graph_run(&gname, in_vals.as_slice(), &mut out)? {
                 return Err(FerriteError::InvalidArg(format!("batched graph {gname} missing")));
