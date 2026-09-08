@@ -2925,95 +2925,87 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ act,         // [n, topk*inter + inter_shared]
     float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, int dscols, int nt) {
-    // N-TOKEN PLANAR MERGE (verify n=3): grid was (hidden/8, n) — n parallel
-    // token planes each re-launching the full hidden grid. ONE plane loops
-    // the tokens in-kernel: per-tok act/ids/probs rows + the per-tok expert
-    // pointers (routed experts differ per token); the down weight row slice
-    // (h, inter) is re-read per tok (L2-hot — the same slot j's weight row
-    // was re-read by the n planes anyway). Per-tok numerics BIT-IDENTICAL
-    // (the same warp's j-ascending FMA chain + lane shuffle reduction).
+    int inter_shared, int topk, int dscols) {
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int tok = blockIdx.y;
     int h = blockIdx.x * 8 + warp;
     if (h >= hidden) return;
     int stride = topk * inter + inter_shared;
-    for (int tok = 0; tok < nt; tok++) {
-        const float* act_t = act + (size_t)tok * stride;
-        const float* ids_t = ids_f + (size_t)tok * topk;
-        const float* probs_t = probs + (size_t)tok * topk;
-        float acc = 0.f;
-        for (int j = 0; j < topk; j++) {
-            int eid = (int)ids_t[j];
-            int local = eid - expert_start;
-            if (local < 0 || local >= e_local) continue; // another rank's slot (zero act)
-            float p = probs_t[j];
-            if (p == 0.f) continue;
-            const unsigned char* dwr = down_w8_ptrs[local] + (size_t)h * inter;
-            const float* dsr = down_scale_ptrs[local] + (size_t)(h >> 7) * dscols;
-            const float* aj = act_t + (size_t)j * inter;
-            float y = 0.f;
-            int i = lane * 16;
-            for (; i + 15 < inter; i += 32 * 16) {
-                uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
-                const float4 aa = *reinterpret_cast<const float4*>(aj + i);
-                const float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
-                const float4 ac = *reinterpret_cast<const float4*>(aj + i + 8);
-                const float4 ad = *reinterpret_cast<const float4*>(aj + i + 12);
-                const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
-                const float ds_c = dsr[i >> 7];
-                const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
-                                      ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
-    #pragma unroll
-                for (int p = 0; p < 8; p++) {
-                    const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
-                    const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                    y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
-                }
+    const float* act_t = act + (size_t)tok * stride;
+    const float* ids_t = ids_f + (size_t)tok * topk;
+    const float* probs_t = probs + (size_t)tok * topk;
+    float acc = 0.f;
+    for (int j = 0; j < topk; j++) {
+        int eid = (int)ids_t[j];
+        int local = eid - expert_start;
+        if (local < 0 || local >= e_local) continue; // another rank's slot (zero act)
+        float p = probs_t[j];
+        if (p == 0.f) continue;
+        const unsigned char* dwr = down_w8_ptrs[local] + (size_t)h * inter;
+        const float* dsr = down_scale_ptrs[local] + (size_t)(h >> 7) * dscols;
+        const float* aj = act_t + (size_t)j * inter;
+        float y = 0.f;
+        int i = lane * 16;
+        for (; i + 15 < inter; i += 32 * 16) {
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const float4 aa = *reinterpret_cast<const float4*>(aj + i);
+            const float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
+            const float4 ac = *reinterpret_cast<const float4*>(aj + i + 8);
+            const float4 ad = *reinterpret_cast<const float4*>(aj + i + 12);
+            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+            const float ds_c = dsr[i >> 7];
+            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
+                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+#pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
             }
-            for (; i < inter; i++) {
-                y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
-            }
-    #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                y += __shfl_down_sync(0xffffffff, y, off);
-            }
-            acc += p * y;
         }
-        // shared expert (slot topk, weight 1; K length = inter_shared, TP-sharded)
-        {
-            const unsigned char* dwr = shared_down_w8 + (size_t)h * inter_shared;
-            const float* dsr = shared_down_scale + (size_t)(h >> 7) * dscols;
-            const float* as_ = act_t + (size_t)topk * inter;
-            float y = 0.f;
-            int i = lane * 16;
-            for (; i + 15 < inter_shared; i += 32 * 16) {
-                uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
-                const float4 aa = *reinterpret_cast<const float4*>(as_ + i);
-                const float4 ab = *reinterpret_cast<const float4*>(as_ + i + 4);
-                const float4 ac = *reinterpret_cast<const float4*>(as_ + i + 8);
-                const float4 ad = *reinterpret_cast<const float4*>(as_ + i + 12);
-                const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
-                const float ds_c = dsr[i >> 7];
-                const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
-                                      ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
-    #pragma unroll
-                for (int p = 0; p < 8; p++) {
-                    const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
-                    const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
-                    y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
-                }
-            }
-            for (; i < inter_shared; i++) {
-                y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * as_[i];
-            }
-    #pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                y += __shfl_down_sync(0xffffffff, y, off);
-            }
-            acc += y;
+        for (; i < inter; i++) {
+            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
         }
-        if (lane == 0) out[(size_t)tok * hidden + h] = acc;
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_down_sync(0xffffffff, y, off);
+        }
+        acc += p * y;
     }
+    // shared expert (slot topk, weight 1; K length = inter_shared, TP-sharded)
+    {
+        const unsigned char* dwr = shared_down_w8 + (size_t)h * inter_shared;
+        const float* dsr = shared_down_scale + (size_t)(h >> 7) * dscols;
+        const float* as_ = act_t + (size_t)topk * inter;
+        float y = 0.f;
+        int i = lane * 16;
+        for (; i + 15 < inter_shared; i += 32 * 16) {
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const float4 aa = *reinterpret_cast<const float4*>(as_ + i);
+            const float4 ab = *reinterpret_cast<const float4*>(as_ + i + 4);
+            const float4 ac = *reinterpret_cast<const float4*>(as_ + i + 8);
+            const float4 ad = *reinterpret_cast<const float4*>(as_ + i + 12);
+            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+            const float ds_c = dsr[i >> 7];
+            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
+                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+#pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
+            }
+        }
+        for (; i < inter_shared; i++) {
+            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * as_[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_down_sync(0xffffffff, y, off);
+        }
+        acc += y;
+    }
+    if (lane == 0) out[(size_t)tok * hidden + h] = acc;
 }
 
 extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
@@ -3023,12 +3015,12 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     const float* act, float* out,
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
-    dim3 grid((hidden + 7) / 8, 1, 1); // token dim loops IN-KERNEL (n=1: identical)
+    dim3 grid((hidden + 7) / 8, n, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
         (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
-        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols, n);
+        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
     return cudaGetLastError();
 }
 
@@ -3056,151 +3048,147 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     const float* __restrict__ shared_up_scale,
     float* __restrict__ act,              // [n, topk*inter + inter_shared]
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, int nt, float limit) {
-    // N-TOKEN PLANAR MERGE (verify n=3): the old grid carried the token dim
-    // (grid.z = n — 3 parallel planes each re-quantizing + re-launching the
-    // full slot grid; nsys showed act 46µs at n=3 vs ~15µs at n=1, 3× the
-    // SM waves). ONE plane loops the tokens in-kernel: per-tok quant into
-    // sx[tok] (the same v1 per-block quant), the per-tok expert A pointers
-    // (routed experts differ per token), the same mma fragments per token —
-    // per-tok numerics BIT-IDENTICAL to the old per-plane run (same quant,
-    // same A/B fragments, same sacc order). SM waves: 3× → 1×.
+    int inter_shared, int topk, float limit) {
     const int slot = blockIdx.y;
+    const int tok = blockIdx.z;
     const int m0 = blockIdx.x * 16;        // 16 inter rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
     const int stride = topk * inter + inter_shared;
+    const float* xt = x + (size_t)tok * hidden;
     int slot_rows, slot_base;
+    const unsigned char *gw8, *uw8;
+    const float *gs, *us;
     if (slot < topk) {
         slot_rows = inter;
         slot_base = slot * inter;
+        int eid = (int)ids_f[(size_t)tok * topk + slot];
+        int local = eid - expert_start;
+        if (local < 0 || local >= e_local || m0 >= slot_rows) {
+            // another rank's slot or tail rows: zero (act buffer pre-zeroed by
+            // the caller for cross-rank slots; tail rows just skip writes)
+            return;
+        }
+        gw8 = gate_w8_ptrs[local]; gs = gate_scale_ptrs[local];
+        uw8 = up_w8_ptrs[local];  us = up_scale_ptrs[local];
     } else {
         slot_rows = inter_shared;
         slot_base = topk * inter;
         if (m0 >= slot_rows) return;
+        gw8 = shared_gate_w8; gs = shared_gate_scale;
+        uw8 = shared_up_w8;   us = shared_up_scale;
     }
-    // ---- 1. per-token quantize (v1 mode — NO cross-block barrier) ----
-    // smem: sx[nt][hidden] e4m3 + sred[256] + sxs[nt] + sacc[nt][8][16]×2
+    // ---- 1. per-block quantize (v1 mode — NO cross-block barrier) ----
+    // (512-thread 16-warp variant measured NO gain: 62.0 vs 63.4 tok/s serve,
+    // 16.5 vs 15.2µs isolated — the K-split's sacc reduction overhead cancels
+    // the occupancy gain; 256/8-warp is the optimum at these shapes.)
     extern __shared__ unsigned char smem[];
-    unsigned char* sx = smem;                       // [nt][hidden] e4m3 xq
-    float* sred = (float*)(smem + (size_t)nt * hidden); // [256] absmax reduce
-    float* sxs = sred + 256;                        // [nt] x_scale
-    float* sgacc = sxs + nt;                        // [nt][8][16] gate partials
-    float* suacc = sgacc + nt * 8 * 16;             // [nt][8][16] up partials
-    for (int tok = 0; tok < nt; tok++) {
-        const float* xt = x + (size_t)tok * hidden;
-        const unsigned char *gw8, *uw8;
-        const float *gs, *us;
-        if (slot < topk) {
-            int eid = (int)ids_f[(size_t)tok * topk + slot];
-            int local = eid - expert_start;
-            if (local < 0 || local >= e_local || m0 >= slot_rows) {
-                continue; // another rank's slot (down skips it via probs==0/local guard)
-            }
-            gw8 = gate_w8_ptrs[local]; gs = gate_scale_ptrs[local];
-            uw8 = up_w8_ptrs[local];  us = up_scale_ptrs[local];
-        } else {
-            gw8 = shared_gate_w8; gs = shared_gate_scale;
-            uw8 = shared_up_w8;   us = shared_up_scale;
-        }
-        // quant x[tok] -> sx + tok*hidden (same v1 per-block quant)
-        unsigned char* sxt = sx + (size_t)tok * hidden;
-        {
-            float amax = 1e-9f;
-            for (int k = threadIdx.x; k < hidden; k += 256)
-                amax = fmaxf(amax, fabsf(xt[k]));
+    unsigned char* sx = smem;                       // [hidden] e4m3 xq
+    float* sred = (float*)(smem + hidden);         // [256] absmax reduce
+    float* sxs = (float*)(smem + hidden + 256 * 4); // [1] x_scale
+    float* sgacc = sxs + 1;                        // [8][16] gate partials
+    float* suacc = sgacc + 8 * 16;                 // [8][16] up partials
+    {
+        float amax = 1e-9f;
+        for (int k = threadIdx.x; k < hidden; k += 256)
+            amax = fmaxf(amax, fabsf(xt[k]));
+        // v2: warp-shuffle max + 2-level smem (was a 128→1 tree with one
+        // __syncthreads PER level — 8 serialized barriers on the critical
+        // path of all 576 blocks; the shuffle form has a single barrier).
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
+        if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = amax;
+        __syncthreads();
+        // NOTE: the 8-warp final max is a serial loop on thread 0 — a
+        // __shfl_down_sync inside an if(tid<8) branch is a full-mask shuffle
+        // with only 8/32 lanes present = warp deadlock on sm_103a (this
+        // exact bug hung the decode graph for 11 minutes before the kill).
+        if (threadIdx.x == 0) {
+            float m = sred[0];
             #pragma unroll
-            for (int off = 16; off > 0; off >>= 1)
-                amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
-            if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = amax;
-            __syncthreads();
-            if (threadIdx.x == 0) {
-                float m = sred[0];
-                #pragma unroll
-                for (int w = 1; w < 8; w++) m = fmaxf(m, sred[w]);
-                sxs[tok] = m / 448.0f;
-            }
-            __syncthreads();
-            const float inv = 1.0f / sxs[tok];
-            for (int k = threadIdx.x; k < hidden; k += 256) {
-                const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
-                sxt[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
-            }
-            __syncthreads();
-        }
-        // ---- 2. gate mma + up mma (same smem xq; 8-warp K-split each) ----
-        float* sg_t = sgacc + (size_t)tok * 8 * 16;
-        float* su_t = suacc + (size_t)tok * 8 * 16;
-        const int nblk = (hidden + 127) >> 7;
-        const int bseg = (nblk + 7) / 8;
-        const int kW = warp;
-        const int k0 = kW * bseg * 128;
-        const int k1 = min(k0 + bseg * 128, hidden);
-        const int gs_ws = (m0 / 128) * ((hidden + 127) >> 7);
-        float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
-        for (int kb = k0; kb < k1; kb += 128) {
-            float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
-            float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
-            for (int kk = kb; kk < kb + 128; kk += 32) {
-                if (kk + 32 > k1) break;
-                unsigned ba[4];  // A fragments: rows m0+r0 / m0+r0+8 (shared by gate+up)
-                ba[0] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0);
-                ba[1] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
-                ba[2] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
-                ba[3] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
-                unsigned b1_[4]; // up A fragments (same rows, up weights)
-                b1_[0] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0);
-                b1_[1] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
-                b1_[2] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
-                b1_[3] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
-                unsigned b[2];   // B: smem xq (n=8 replica)
-                b[0] = *(const unsigned*)(sxt + kk + c0);
-                b[1] = *(const unsigned*)(sxt + kk + c0 + 16);
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                    : "+f"(gd0), "+f"(gd1), "+f"(gd2), "+f"(gd3)
-                    : "r"(ba[0]), "r"(ba[1]), "r"(ba[2]), "r"(ba[3]),
-                      "r"(b[0]), "r"(b[1]));
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
-                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-                    : "+f"(ud0), "+f"(ud1), "+f"(ud2), "+f"(ud3)
-                    : "r"(b1_[0]), "r"(b1_[1]), "r"(b1_[2]), "r"(b1_[3]),
-                      "r"(b[0]), "r"(b[1]));
-            }
-            const int kblk = kb >> 7;
-            const float gw_sc = gs[gs_ws + kblk];
-            const float uw_sc = us[gs_ws + kblk];
-            if ((lane & 3) == 0) {
-                g0 += gd0 * gw_sc; g1 += gd2 * gw_sc;   // (r0, col0), (r0+8, col0)
-                u0 += ud0 * uw_sc; u1 += ud2 * uw_sc;
-            }
-        }
-        if ((lane & 3) == 0) {
-            sg_t[warp * 16 + r0] = g0;
-            sg_t[warp * 16 + r0 + 8] = g1;
-            su_t[warp * 16 + r0] = u0;
-            su_t[warp * 16 + r0 + 8] = u1;
+            for (int w = 1; w < 8; w++) m = fmaxf(m, sred[w]);
+            sxs[0] = m / 448.0f;
         }
         __syncthreads();
-        // ---- 3. swiglu epilogue: act[r] = silu(min(g, limit)) * clamp(u, ±limit) ----
-        if (warp == 0 && lane < 16) {
-            float g = 0.f, u = 0.f;
-            for (int i = 0; i < 8; i++) {
-                g += sg_t[i * 16 + lane];
-                u += su_t[i * 16 + lane];
-            }
-            g *= sxs[tok];
-            u *= sxs[tok];
-            g = fminf(g, limit);
-            u = fminf(fmaxf(u, -limit), limit);
-            const int r = m0 + lane;
-            if (r < slot_rows) {
-                act[(size_t)tok * stride + slot_base + r] = (g / (1.0f + expf(-g))) * u;
-            }
+        const float inv = 1.0f / sxs[0];
+        for (int k = threadIdx.x; k < hidden; k += 256) {
+            const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
+            sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
         }
-        __syncthreads(); // sacc reuse across tokens
+        __syncthreads();
+    }
+    // ---- 2. gate mma + up mma (same smem xq; 8-warp K-split each) ----
+    const int nblk = (hidden + 127) >> 7;
+    const int bseg = (nblk + 7) / 8;
+    const int kW = warp;
+    const int k0 = kW * bseg * 128;
+    const int k1 = min(k0 + bseg * 128, hidden);
+    const int gs_ws = (m0 / 128) * ((hidden + 127) >> 7);   // scale row (16 rows share m/128)
+    float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
+    for (int kb = k0; kb < k1; kb += 128) {
+        float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
+        float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
+        for (int kk = kb; kk < kb + 128; kk += 32) {
+            if (kk + 32 > k1) break;
+            unsigned ba[4];  // A fragments: rows m0+r0 / m0+r0+8 (shared by gate+up)
+            ba[0] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0);
+            ba[1] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
+            ba[2] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
+            ba[3] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
+            unsigned b1_[4]; // up A fragments (same rows, up weights)
+            b1_[0] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0);
+            b1_[1] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
+            b1_[2] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
+            b1_[3] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
+            unsigned b[2];   // B: smem xq (n=8 replica)
+            b[0] = *(const unsigned*)(sx + kk + c0);
+            b[1] = *(const unsigned*)(sx + kk + c0 + 16);
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(gd0), "+f"(gd1), "+f"(gd2), "+f"(gd3)
+                : "r"(ba[0]), "r"(ba[1]), "r"(ba[2]), "r"(ba[3]),
+                  "r"(b[0]), "r"(b[1]));
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(ud0), "+f"(ud1), "+f"(ud2), "+f"(ud3)
+                : "r"(b1_[0]), "r"(b1_[1]), "r"(b1_[2]), "r"(b1_[3]),
+                  "r"(b[0]), "r"(b[1]));
+        }
+        const int kblk = kb >> 7;
+        const float gw_sc = gs[gs_ws + kblk];
+        const float uw_sc = us[gs_ws + kblk];
+        if ((lane & 3) == 0) {
+            g0 += gd0 * gw_sc; g1 += gd2 * gw_sc;   // (r0, col0), (r0+8, col0)
+            u0 += ud0 * uw_sc; u1 += ud2 * uw_sc;
+        }
+    }
+    if ((lane & 3) == 0) {
+        sgacc[warp * 16 + r0] = g0;
+        sgacc[warp * 16 + r0 + 8] = g1;
+        suacc[warp * 16 + r0] = u0;
+        suacc[warp * 16 + r0 + 8] = u1;
+    }
+    __syncthreads();
+    // ---- 3. swiglu epilogue: act[r] = silu(min(g, limit)) * clamp(u, ±limit) ----
+    // g/u are e4m3(W)·w_scale·e4m3(x/x_s) dots — scale by x_s (the per-token
+    // quant scale) before the nonlinearity (v1 gemv epilogue semantics).
+    if (warp == 0 && lane < 16) {
+        float g = 0.f, u = 0.f;
+        for (int i = 0; i < 8; i++) {
+            g += sgacc[i * 16 + lane];
+            u += suacc[i * 16 + lane];
+        }
+        g *= sxs[0];
+        u *= sxs[0];
+        g = fminf(g, limit);
+        u = fminf(fmaxf(u, -limit), limit);
+        const int r = m0 + lane;
+        if (r < slot_rows) {
+            act[(size_t)tok * stride + slot_base + r] = (g / (1.0f + expf(-g))) * u;
+        }
     }
     (void)e_local;
 }
@@ -3216,10 +3204,8 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
 {
     int max_rows = inter > inter_shared ? inter : inter_shared;
     if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported; // v1 alignment
-    // N-TOKEN PLANAR MERGE: grid (rows/16, topk+1) — the token dim loops
-    // IN-KERNEL (n=1: single pass, bit-identical; n=3: 1 plane vs 3).
-    dim3 grid((unsigned)(max_rows / 16), topk + 1, 1);
-    const int smem = n * hidden + 256 * 4 + 4 * n + 2 * n * 8 * 16 * 4;
+    dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
+    const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
         x, ids_f,
@@ -3227,7 +3213,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
         (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
         (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
         (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
-        act, expert_start, e_local, hidden, inter, inter_shared, topk, n, limit);
+        act, expert_start, e_local, hidden, inter, inter_shared, topk, limit);
     return cudaGetLastError();
 }
 
