@@ -4191,16 +4191,37 @@ __global__ void sparse_attn_v2_batched_kernel(
     __syncthreads();
     for (int s = threadIdx.x; s < live_k; s += blockDim.x) sc[s] /= denom;
     __syncthreads();
-    for (int j2 = threadIdx.x; j2 < dv; j2 += blockDim.x) {
-        float a = 0.f;
-        for (int s = 0; s < live_k; s++) {
-            float w = sc[s];
-            if (w == 0.f) continue;
-            int j = idxs[s];
-            if (j < 0 || j >= t) continue;
-            a += w * v_s[((size_t)j * h + hd) * dv + j2];
+    // float4 + 4 slot groups: the old loop read V one 4-byte element per
+    // thread with consecutive slots 64KB apart (zero coalescing, 12.5%
+    // sector efficiency). 64 float4 columns x 4 slot groups = 256 threads,
+    // 16-byte coalesced loads, then an smem reduction over the groups.
+    {
+        const int cols = dv >> 2;               // float4 columns (256/4 = 64)
+        const int G = (blockDim.x + cols - 1) / cols;   // slot groups (4)
+        const int g = threadIdx.x / cols;
+        const int c = threadIdx.x % cols;
+        if (c < cols && g < G) {
+            float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int s = g; s < live_k; s += G) {
+                const float w = sc[s];
+                if (w == 0.f) continue;
+                const int j = idxs[s];
+                if (j < 0 || j >= t) continue;
+                const float4 vv = *reinterpret_cast<const float4*>(v_s + ((size_t)j * h + hd) * dv + c * 4);
+                a.x += w * vv.x; a.y += w * vv.y; a.z += w * vv.z; a.w += w * vv.w;
+            }
+            __shared__ float4 pred[4 * 64];     // static (4KB), G<=4, cols<=64
+            pred[g * cols + c] = a;
+            __syncthreads();
+            if (g == 0) {
+                float4 tot = pred[c];
+                for (int gg = 1; gg < G; gg++) {
+                    const float4 t2 = pred[gg * cols + c];
+                    tot.x += t2.x; tot.y += t2.y; tot.z += t2.z; tot.w += t2.w;
+                }
+                *reinterpret_cast<float4*>(out_s + (size_t)hd * dv + c * 4) = tot;
+            }
         }
-        out_s[(size_t)hd * dv + j2] = a;
     }
 }
 
