@@ -5000,31 +5000,27 @@ __global__ void p2p_ar_fused_v3_kernel(
     if (blockIdx.x == 0 && threadIdx.x == 0) *ctr = e;
 }
 
-// Phase B in a SEPARATE kernel: publish the epoch stamp, wait for the peers'
-// stamps, reduce. Stream order guarantees every store of the store kernel is
-// visible before this runs — so publishing needs no arrival counter at all.
-__global__ void p2p_ar_finish_v3_kernel(
+// Phase B: publish the epoch stamp + wait for the peers' stamps. ONE block
+// only: with the reduce in a separate kernel (below) there is no reason for
+// 80 blocks × 8 threads to hammer the same 8 flag words — that thundering
+// herd delays the very store they wait for (measured ~200 µs/AR at 16 seqs
+// vs ~15 µs at 1 seq with a single block polling).
+__global__ void p2p_ar_publish_v3_kernel(
     unsigned* const* __restrict__ ready_tbl,
     unsigned* epoch, const unsigned* __restrict__ snap,
     const unsigned* __restrict__ ready_local,
-    unsigned* __restrict__ seen,
-    const float* __restrict__ staging_local,
-    float* __restrict__ out, int world, int my_rank, int n, int stride) {
+    unsigned* __restrict__ seen, int world, int my_rank) {
     const unsigned e = *snap; // stable: *epoch is advanced only below
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
+    if (threadIdx.x == 0) {
         for (int r = 0; r < world; r++)
             *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
         // ONE system fence publishes the 8 stamps (vLLM's custom-AR pattern).
-        // atomicExch_system per peer cost ~2 ms/AR in system-scope atomics.
         __threadfence_system();
         *epoch = e + 1u;
     }
-    // Monotonic stamp wait: any NEW stamp satisfies it, so ranks may drift.
+    __syncthreads(); // our own stamp (tr == my_rank) must be visible
     const int tr = (threadIdx.x < (unsigned)world) ? (int)threadIdx.x : -1;
     if (tr >= 0) { // one thread per peer polls its own flag (parallel)
-        // Per-block seen row: a shared row is corrupted when several finish
-        // blocks poll the same peer (block A stores the new stamp, block B
-        // then sees prev == cur and waits forever).
         unsigned* my_seen = seen + (size_t)blockIdx.x * (unsigned)world;
         unsigned prev = my_seen[tr];
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
@@ -5034,15 +5030,23 @@ __global__ void p2p_ar_finish_v3_kernel(
             cur = *(volatile unsigned*)&ready_local[tr];
             if (++spins > 500000) { // ~50ms: diagnose + break instead of hanging
                 if (tr == 0) {
-                    printf("[p2p-hang] rank=%d peer=%d prev=%u cur=%u myepoch=%u blk=%u\n",
-                           my_rank, tr, prev, cur, e, (unsigned)blockIdx.x);
+                    printf("[p2p-hang] rank=%d peer=%d prev=%u cur=%u myepoch=%u\n",
+                           my_rank, tr, prev, cur, e);
                 }
                 break;
             }
         }
         my_seen[tr] = cur;
     }
-    __syncthreads();
+}
+
+// Phase C: the reduce, with NO polling at all (the publish kernel above ran
+// to completion first, so every peer's staging segment is already in place).
+__global__ void p2p_ar_reduce_v3_kernel(
+    const float* __restrict__ staging_local,
+    float* __restrict__ out, const unsigned* __restrict__ snap,
+    int world, int n, int stride) {
+    const unsigned e = *snap;
     const int step = gridDim.x * blockDim.x;
     for (int ii = blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
         float acc = 0.f;
@@ -5072,11 +5076,17 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
         staging_local, ready_local, seen, out, world, my_rank, n, stride);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
-    int fblocks = (n + threads - 1) / threads;
-    if (fblocks < 1) fblocks = 1;
-    p2p_ar_finish_v3_kernel<<<fblocks, threads, 0, s>>>(
-        ready_tbl, epoch, ctr, ready_local, seen, staging_local, out,
-        world, my_rank, n, stride);
+    // Publish + wait on ONE block (8 pollers, no thundering herd).
+    p2p_ar_publish_v3_kernel<<<1, 32, 0, s>>>(
+        ready_tbl, epoch, ctr, ready_local, seen, world, my_rank);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    // Reduce on many blocks — no polling at all (the publish kernel already
+    // observed every peer's stamp).
+    int rblocks = (n + threads - 1) / threads;
+    if (rblocks < 1) rblocks = 1;
+    p2p_ar_reduce_v3_kernel<<<rblocks, threads, 0, s>>>(
+        staging_local, out, ctr, world, n, stride);
     return cudaGetLastError();
 }
 
