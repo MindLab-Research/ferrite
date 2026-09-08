@@ -1466,6 +1466,29 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                     for i in 0..nd {
                         draft_step_dev(s, seq, i, nd)?;
+                        // per-draft immediate readback: isolates "draft i's own
+                        // argmax is wrong" from "a later draft overwrote it".
+                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                            let cuda = s
+                                .backend
+                                .as_cuda()
+                                .ok_or_else(|| FerriteError::Config("cuda".into()))?;
+                            let d_base = {
+                                let m = cuda.mtp.lock().unwrap();
+                                let m = m
+                                    .as_ref()
+                                    .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                                m.d_argmax_dev.as_f32()
+                            };
+                            let mut v = [0f32; 1];
+                            ferrite_kernel::cuda::memcpy_d2h_sync(
+                                unsafe { d_base.add(i) } as *mut std::ffi::c_void,
+                                v.as_mut_ptr(),
+                                1,
+                                cuda.stream_handle(),
+                            );
+                            eprintln!("[draft-step] i={i} argmax={:?}", v);
+                        }
                     }
                     let mut d = vec![0f32; nd];
                     {
