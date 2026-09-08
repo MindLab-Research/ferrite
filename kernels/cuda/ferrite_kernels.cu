@@ -3457,24 +3457,40 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     const int k1 = min(k0 + bseg * 128, hidden);
     const int gs_ws = (m0 / 128) * ((hidden + 127) >> 7);   // scale row (16 rows share m/128)
     float g0 = 0.f, g1 = 0.f, u0 = 0.f, u1 = 0.f;
-    for (int kb = k0; kb < k1; kb += 128) {
+    // PER-WARP padded smem staging. The A-fragment loads were 4-byte across 8
+    // rows = 8 sectors per instruction with only 16B used each (50% sector
+    // efficiency -> the kernel streamed 2.3x the bytes it needs and was
+    // bandwidth-bound at 3.2ms). Staging 16 rows x 64 cols x 2 projections
+    // with 16-byte loads makes every sector fully used. The row stride is
+    // PADDED to 80 bytes: stride 64 would start every row on bank 0 (8-way
+    // conflict on the fragment reads) — 80 gives banks 0,20,8,28,16,4,24,12.
+    const int SA_STRIDE = 80;
+    __shared__ unsigned char sa[8][2 * 16 * 80];
+    for (int kb = k0; kb < k1; kb += 64) {
+        for (int t = lane; t < 128; t += 32) {
+            const int proj = t >> 6;              // 0: gate, 1: up
+            const int off = t & 63;
+            const int row = off >> 2, col = (off & 3) * 16;
+            const unsigned char* src = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + kb + col;
+            *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) =
+                *reinterpret_cast<const uint4*>(src);
+        }
+        __syncwarp();
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
-        // No `break` guard: it never triggers (k1 is a 128-multiple here) and
-        // a data-dependent break inside the loop blocks unrolling, leaving one
-        // A-fragment load in flight at a time.
         #pragma unroll
-        for (int kk = kb; kk < kb + 128; kk += 32) {
-            unsigned ba[4];  // A fragments: rows m0+r0 / m0+r0+8 (shared by gate+up)
-            ba[0] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0);
-            ba[1] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
-            ba[2] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
-            ba[3] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
-            unsigned b1_[4]; // up A fragments (same rows, up weights)
-            b1_[0] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0);
-            b1_[1] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
-            b1_[2] = *(const unsigned*)(uw8 + (size_t)(m0 + r0) * hidden + kk + c0 + 16);
-            b1_[3] = *(const unsigned*)(uw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0 + 16);
+        for (int kk = kb; kk < kb + 64; kk += 32) {
+            const int kkl = kk - kb;
+            unsigned ba[4];  // A fragments from this warp's padded smem slice
+            ba[0] = *(const unsigned*)(sa[warp] + (size_t)r0 * SA_STRIDE + kkl + c0);
+            ba[1] = *(const unsigned*)(sa[warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
+            ba[2] = *(const unsigned*)(sa[warp] + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
+            ba[3] = *(const unsigned*)(sa[warp] + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
+            unsigned b1_[4]; // up A fragments
+            b1_[0] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0);
+            b1_[1] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0);
+            b1_[2] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)r0 * SA_STRIDE + kkl + c0 + 16);
+            b1_[3] = *(const unsigned*)(sa[warp] + 16 * SA_STRIDE + (size_t)(r0 + 8) * SA_STRIDE + kkl + c0 + 16);
             unsigned b[2];   // B: smem xq (n=8 replica)
             b[0] = *(const unsigned*)(sx + kk + c0);
             b[1] = *(const unsigned*)(sx + kk + c0 + 16);
