@@ -4116,6 +4116,7 @@ __global__ void indexer_topk_batched_kernel(
             for (int hi = lid; hi < ih; hi += TG) {
                 const float* q = q_s + (size_t)hi * idm;
                 float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                #pragma unroll 2
                 for (int l = 0; l + 3 < idm; l += 4) {
                     float4 qv = *reinterpret_cast<const float4*>(q + l);
                     float4 kv = *reinterpret_cast<const float4*>(k + l);
