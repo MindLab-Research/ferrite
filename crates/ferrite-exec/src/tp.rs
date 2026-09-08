@@ -1256,10 +1256,18 @@ impl<B: KernelBackend> TpCluster<B> {
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                             .enter();
+                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                            let c = s.backend.as_cuda().unwrap();
+                            eprintln!("[cap-t] dry-end {:?}", c.dsa_t_count(seq, mtp_family));
+                        }
                         s.backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                             .dsa_host_rollback(seq, mtp_family, nd);
+                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                            let c = s.backend.as_cuda().unwrap();
+                            eprintln!("[cap-t] after-rb {:?}", c.dsa_t_count(seq, mtp_family));
+                        }
                         let _g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
                         for i in 0..nd {
                             // per-iteration borrows: draft_step_dev takes &mut s
@@ -1274,6 +1282,10 @@ impl<B: KernelBackend> TpCluster<B> {
                                 .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                                 .graph_capture_end(&format!("mega_d{seq}_{i}"));
                         }
+                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                            let c = s.backend.as_cuda().unwrap();
+                            eprintln!("[cap-t] after-cap {:?}", c.dsa_t_count(seq, mtp_family));
+                        }
                         // the capture pass executed NOTHING (record only) but
                         // each draft's dsa host bookkeeping +1 → t advanced
                         // nd — roll it back to T (the first steady step's
@@ -1283,6 +1295,10 @@ impl<B: KernelBackend> TpCluster<B> {
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                             .dsa_host_rollback(seq, mtp_family, nd);
+                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+                            let c = s.backend.as_cuda().unwrap();
+                            eprintln!("[cap-t] final {:?}", c.dsa_t_count(seq, mtp_family));
+                        }
                         Ok::<(), FerriteError>(())
                     })
                     .into_iter()
