@@ -3257,6 +3257,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             float py[8];
             if (klen == 256) {
                 const int i0 = lane * 16;
+                const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
                 uint4 dv4[4];
                 #pragma unroll
                 for (int c = 0; c < 4; c++)
@@ -3264,7 +3265,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
-                    const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + (i0 >> 7)];
+                    const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
                     float y = 0.f;
                     #pragma unroll
