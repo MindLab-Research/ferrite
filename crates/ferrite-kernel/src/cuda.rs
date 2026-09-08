@@ -2875,10 +2875,14 @@ impl CudaBackend {
             ck(unsafe { cudaMemset(p, 0, len * 4) }, "dsa dummy zero")?;
             Ok(p as *mut f32)
         };
-        let kn = alloc(h * dk)?;
-        let vv = alloc(h * dv)?;
-        let ki_ = alloc(idm)?;
-        let kg = alloc(idm)?;
+        // SAME token dimension as the real caches: the DSA kernels index the
+        // cache by pool/topk offsets (not just t0), so a 1-token dummy
+        // faults with Xid 13 Out-Of-Range (measured).
+        const MAXT: usize = 8192;
+        let kn = alloc(MAXT * h * dk)?;
+        let vv = alloc(MAXT * h * dv)?;
+        let ki_ = alloc(MAXT * idm)?;
+        let kg = alloc(MAXT * idm)?;
         let mut pt0: *mut i32 = std::ptr::null_mut();
         let mut ptot: *mut i32 = std::ptr::null_mut();
         ck(unsafe { cudaMallocHost(&mut pt0 as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "dsa dummy pinned")?;
