@@ -5793,6 +5793,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
     // drops ~32% (this GEMV is issue-bound at n=16, not bandwidth-bound).
     // Each token keeps its own accumulation order -> bit-identical output.
     const int t0 = blockIdx.y * 2;
+    const bool has1 = (t0 + 1) < nrows;
     float4 xc[2][4];
     #pragma unroll
     for (int tt = 0; tt < 2; tt++) {
@@ -5818,7 +5819,6 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         const unsigned char* wr = w + (size_t)row * in_f;
         const float* xr0 = x + (size_t)t0 * in_f;
         const float* xr1 = x + (size_t)(t0 + 1) * in_f;
-        const bool has1 = (t0 + 1) < nrows;
         const float* srow = scale + (size_t)(row >> 7) * scols;
         int k = k0 + lane * 16;
         if (k + 15 < k1) {
