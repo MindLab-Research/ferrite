@@ -4480,7 +4480,12 @@ impl<B: ferrite_kernel::KernelBackend> TpCluster<B> {
                             let u = cuda.matmul_dev(&x_dev, w_up, n as i32, hi, inter)?;
                             let a = cuda.swiglu2_dev(&g, &u, n as i32, inter, s.cfg.swiglu_limit)?;
                             let d = cuda.matmul_dev(&a, w_down, n as i32, inter, hi)?;
-                            ch.all_reduce_f32(d.as_const_f32(), d.as_f32(), n * hidden)?;
+                            // P2P one-shot AR first (NCCL RING_LL measured
+                            // ~390us vs P2P ~20us for this payload).
+                            let ar_p2p = cuda.p2p_ar_v2(&mut d, n * hidden).unwrap_or(false);
+                            if !ar_p2p {
+                                ch.all_reduce_f32(d.as_const_f32(), d.as_f32(), n * hidden)?;
+                            }
                             let mut out = Tensor::zeros(Shape::new([n, hidden]), hfn_t.dtype);
                             let ov = std::sync::Arc::get_mut(&mut out.data).expect("unique out");
                             d.download(ov)?;
