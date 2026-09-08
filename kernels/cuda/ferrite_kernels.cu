@@ -4993,6 +4993,12 @@ __global__ void p2p_ar_fused_v3_kernel(
     // off by exactly 1 → deadlock). The seen[] array (per rank, per peer)
     // remembers the last observed stamp, so any NEW value satisfies the wait
     // regardless of absolute counter alignment.
+    if (tr == 0 && e < 4u) {
+        printf("[p2p-dbg] rank=%d e=%u wrote=%u peer0_flag=%u seen0=%u\n",
+               my_rank, e, e + 1u,
+               (unsigned)*(volatile unsigned*)&ready_local[0],
+               (unsigned)seen[0]);
+    }
     if (tr >= 0) { // one thread per peer polls its own flag (parallel)
         unsigned prev = seen[tr];
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
