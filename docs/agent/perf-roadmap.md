@@ -375,3 +375,10 @@ unroll 4 时已经饱和（5 load/轮 × 4 = 20 个在飞），再加只增寄�
 
 **坑**：`hpb` 是 kernel 内局部常量，launcher 算 smem 时必须自己写 `(h+15)/16`，
 否则编译失败而 serve 继续用旧 .so（本轮又踩一次，测到 975.4 的假数）。
+
+### 小幅有效：act 的 3 缓冲 cp.async 流水（提前 2 个 tile）
+
+`sa[2]` → `sa[3]`（60KB，`__launch_bounds__(256,3)`），初始发 2 个 tile，循环里
+`cp.async.wait_group 1` 保持 1 个在飞（尾部 `wait_group 0` 排空），每轮再补 kb+128：
+16.34 → **16.27-16.30ms（981.6-983.4）**，文本正确。虽然占用从 5 降到 3 block/SM，
+但每 warp 2 个 tile 在飞把 MLP 从 40 提到 48，净收益略正。
