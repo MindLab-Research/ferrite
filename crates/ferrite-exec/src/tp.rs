@@ -2813,7 +2813,25 @@ fn mega_chain_dev(
             None => false,
         };
         if !ar_p2p {
-            nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+            let cnt = n * hidden;
+            // bf16 payload halves the latency-bound AR (320KB / 223us =
+            // 2.9GB/s, far below the NVLink bandwidth). The casts are cheap
+            // (~5us each) vs the ~100us saved per call.
+            match s.backend.as_cuda() {
+                Some(c) if cnt >= 16384 => {
+                    let xb = DevBuf::alloc(c.dev(), c.stream(), (cnt + 1) / 2)?;
+                    c.cast_f32_to_bf16(&partial, &xb, cnt)?;
+                    nccl.all_reduce_bf16(
+                        xb.as_const_f32() as *const std::ffi::c_void,
+                        xb.as_f32() as *mut std::ffi::c_void,
+                        cnt,
+                    )?;
+                    c.cast_bf16_to_f32(&xb, &mut partial, cnt)?;
+                }
+                _ => {
+                    nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), cnt)?;
+                }
+            }
         }
         if tm {
             let _ = cuda.sync();
@@ -3204,7 +3222,25 @@ fn mega_chain_dev_batched(
             None => false,
         };
         if !ar_p2p {
-            nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), n * hidden)?;
+            let cnt = n * hidden;
+            // bf16 payload halves the latency-bound AR (320KB / 223us =
+            // 2.9GB/s, far below the NVLink bandwidth). The casts are cheap
+            // (~5us each) vs the ~100us saved per call.
+            match s.backend.as_cuda() {
+                Some(c) if cnt >= 16384 => {
+                    let xb = DevBuf::alloc(c.dev(), c.stream(), (cnt + 1) / 2)?;
+                    c.cast_f32_to_bf16(&partial, &xb, cnt)?;
+                    nccl.all_reduce_bf16(
+                        xb.as_const_f32() as *const std::ffi::c_void,
+                        xb.as_f32() as *mut std::ffi::c_void,
+                        cnt,
+                    )?;
+                    c.cast_bf16_to_f32(&xb, &mut partial, cnt)?;
+                }
+                _ => {
+                    nccl.all_reduce_f32(partial.as_const_f32(), partial.as_f32(), cnt)?;
+                }
+            }
         }
         if tm {
             let _ = cuda.sync();

@@ -1770,6 +1770,22 @@ impl CudaBackend {
     /// BufferCache will dedupe repeated weight uploads), result stays on
     /// device. Building block for fused op chains (expert FFN).
     /// Weights are resident in bf16 (dev_weight_bf16).
+    /// f32 → bf16 cast (batched AR's half-payload path).
+    pub fn cast_f32_to_bf16(&self, src: &DevBuf, dst: &DevBuf, n: usize) -> Result<()> {
+        ck(
+            unsafe { ferrite_f32_to_bf16(src.as_const_f32(), dst.as_f32() as *mut _, n as i64, self.stream) },
+            "cast f32->bf16",
+        )
+    }
+
+    /// bf16 → f32 cast.
+    pub fn cast_bf16_to_f32(&self, src: &DevBuf, dst: &mut DevBuf, n: usize) -> Result<()> {
+        ck(
+            unsafe { ferrite_bf16_to_f32(src.as_const_f32() as *const _, dst.as_f32(), n as i64, self.stream) },
+            "cast bf16->f32",
+        )
+    }
+
     /// cuBLAS bf16 batched GEMM for the decode m=16 case:
     /// C[16, N] = A[16, K] * W[N, K]^T. A (fp32 activations) is cast to
     /// bf16 first; the weights are already bf16. cuBLAS's split-K/streaming
