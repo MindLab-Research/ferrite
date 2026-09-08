@@ -4900,7 +4900,13 @@ __global__ void p2p_ar_down_v2_kernel(
     __threadfence_system(); // peer-visible stores before flag
     __syncthreads();
     if (threadIdx.x == 0) {
-        unsigned prev = atomicAdd(ctr, 1u);
+        // Single-block grids (every batched decode size here: n*world <=
+        // 1024 threads) need NO arrival counter — this block IS the last.
+        // The atomicAdd path left ctr stuck non-zero across replays (its
+        // reset raced the graph capture), so no block ever saw "last" and
+        // *epoch never advanced (diag: e==0 for EVERY AR) → peers' flags
+        // were never re-stamped → the monotonic wait deadlocked.
+        unsigned prev = (gridDim.x == 1u) ? 0u : atomicAdd(ctr, 1u);
         if (prev == gridDim.x - 1u) { // last block: all stores fenced
             for (int r = 0; r < world; r++)
                 *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
@@ -4974,7 +4980,13 @@ __global__ void p2p_ar_fused_v3_kernel(
     __threadfence_system(); // peer-visible stores before flag
     __syncthreads();
     if (threadIdx.x == 0) {
-        unsigned prev = atomicAdd(ctr, 1u);
+        // Single-block grid (n*world <= 1024 threads for every batched decode
+        // size): this block IS the last — no arrival counter needed. The
+        // atomicAdd path left ctr stuck non-zero across replays (its reset
+        // raced the capture), so no block ever saw "last" and *epoch never
+        // advanced (diag: e==0 for EVERY AR) → peers' flags were never
+        // re-stamped → the monotonic wait deadlocked.
+        unsigned prev = (gridDim.x == 1u) ? 0u : atomicAdd(ctr, 1u);
         if (prev == gridDim.x - 1u) { // last block: all stores fenced
             for (int r = 0; r < world; r++)
                 *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
