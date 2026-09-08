@@ -1264,18 +1264,10 @@ impl<B: KernelBackend> TpCluster<B> {
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                             .enter();
-                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                            let c = s.backend.as_cuda().unwrap();
-                            eprintln!("[cap-t] dry-end {:?}", c.dsa_t_count(seq, mtp_family));
-                        }
                         s.backend
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                             .dsa_host_rollback(seq, mtp_family, nd);
-                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                            let c = s.backend.as_cuda().unwrap();
-                            eprintln!("[cap-t] after-rb {:?}", c.dsa_t_count(seq, mtp_family));
-                        }
                         let skip_cap =
                             std::env::var_os("FERRITE_DRAFT_DRY_ONLY").is_some();
                         if !skip_cap {
@@ -1294,10 +1286,6 @@ impl<B: KernelBackend> TpCluster<B> {
                                     .graph_capture_end(&format!("mega_d{seq}_{i}"));
                             }
                         }
-                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                            let c = s.backend.as_cuda().unwrap();
-                            eprintln!("[cap-t] after-cap {:?}", c.dsa_t_count(seq, mtp_family));
-                        }
                         // the capture pass executed NOTHING (record only) but
                         // each draft's dsa host bookkeeping +1 → t advanced
                         // nd — roll it back to T (the first steady step's
@@ -1307,10 +1295,6 @@ impl<B: KernelBackend> TpCluster<B> {
                             .as_cuda()
                             .ok_or_else(|| FerriteError::Config("draft graph needs cuda".into()))?
                             .dsa_host_rollback(seq, mtp_family, nd);
-                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                            let c = s.backend.as_cuda().unwrap();
-                            eprintln!("[cap-t] final {:?}", c.dsa_t_count(seq, mtp_family));
-                        }
                         Ok::<(), FerriteError>(())
                     })
                     .into_iter()
@@ -1453,33 +1437,6 @@ impl<B: KernelBackend> TpCluster<B> {
         // replay) — bisects a draft divergence between the chain itself
         // (embed_one_dev / cast_store / h_d relays) and capture/replay.
         let serial_dev = draft_env == "2";
-        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-            // draft input state: hprev (draft 0's h_prev) + hf_dev (the seed
-            // source) — a divergence here means the state, not the chain.
-            Self::fan_out(&mut self.shards, |s| {
-                let cuda = s
-                    .backend
-                    .as_cuda()
-                    .ok_or_else(|| FerriteError::Config("cuda".into()))?;
-                let (hp, hf) = {
-                    let m = cuda.mtp.lock().unwrap();
-                    let m = m
-                        .as_ref()
-                        .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                    (m.hprev.as_f32(), m.hf_dev.as_f32())
-                };
-                let mut a = [0f32; 4];
-                let mut b = [0f32; 4];
-                ferrite_kernel::cuda::memcpy_d2h_sync(
-                    hp as *mut std::ffi::c_void, a.as_mut_ptr(), 4, cuda.stream_handle());
-                ferrite_kernel::cuda::memcpy_d2h_sync(
-                    hf as *mut std::ffi::c_void, b.as_mut_ptr(), 4, cuda.stream_handle());
-                eprintln!("[mtp-hp] hprev={:?} hf_dev={:?}", a, b);
-                Ok::<(), FerriteError>(())
-            })
-            .into_iter()
-            .collect::<Result<Vec<_>>>()?;
-        }
         let drafts: Vec<f32> = {
             let mut graph_ok = false;
             if graph_drafts && !serial_dev {
@@ -1527,29 +1484,6 @@ impl<B: KernelBackend> TpCluster<B> {
                     }
                     for i in 0..nd {
                         draft_step_dev(s, seq, i, nd)?;
-                        // per-draft immediate readback: isolates "draft i's own
-                        // argmax is wrong" from "a later draft overwrote it".
-                        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                            let cuda = s
-                                .backend
-                                .as_cuda()
-                                .ok_or_else(|| FerriteError::Config("cuda".into()))?;
-                            let d_base = {
-                                let m = cuda.mtp.lock().unwrap();
-                                let m = m
-                                    .as_ref()
-                                    .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
-                                m.d_argmax_dev.as_f32()
-                            };
-                            let mut v = [0f32; 1];
-                            ferrite_kernel::cuda::memcpy_d2h_sync(
-                                unsafe { d_base.add(i) } as *mut std::ffi::c_void,
-                                v.as_mut_ptr(),
-                                1,
-                                cuda.stream_handle(),
-                            );
-                            eprintln!("[draft-step] i={i} argmax={:?}", v);
-                        }
                     }
                     let mut d = vec![0f32; nd];
                     {
@@ -1761,9 +1695,6 @@ impl<B: KernelBackend> TpCluster<B> {
                 k += 1;
             }
             let k = k as usize;
-            if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-                eprintln!("[mtp-acc] drafts={:?} out={:?} k={}", drafts, out, k);
-            }
             for f in 0..num_dsa {
                 cuda.dsa_host_rollback(seq, f, (n_v - k) as usize);
             }
@@ -2425,19 +2356,6 @@ impl<B: KernelBackend> TpCluster<B> {
             h_d.push(DevBuf::alloc(cuda.dev(), cuda.stream_handle(), hidden)?);
         }
         let d_argmax_dev = DevBuf::alloc(cuda.dev(), cuda.stream_handle(), nd.max(1))?;
-        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
-            eprintln!(
-                "[mtp-bufs] hprev={:p} hf_dev={:p} hf_v={:p} tokens={:p} d_argmax={:p}",
-                hprev.as_f32(), hf_dev.as_f32(), hf_v.as_f32(),
-                tokens_dev.as_f32(), d_argmax_dev.as_f32()
-            );
-            for (i, b) in emb_devs.iter().enumerate() {
-                eprintln!("[mtp-bufs] emb[{i}]={:p}", b.as_f32());
-            }
-            for (i, b) in h_d.iter().enumerate() {
-                eprintln!("[mtp-bufs] h_d[{i}]={:p}", b.as_f32());
-            }
-        }
         *cuda.mtp.lock().unwrap() = Some(MtpState {
             hf_dev, hf_v, hprev, scratch, commit: Some(commit),
             tokens_dev, verify_argmax_dev, k_dev, next_token_dev, n_accepted_dev,
@@ -4713,15 +4631,6 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     let enorm = cuda.rmsnorm_dev(embed_row, s.w(&format!("{pfx}.enorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let hnorm = cuda.rmsnorm_dev(h_prev, s.w(&format!("{pfx}.hnorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
-        // ALIAS CHECK: the pool must hand out distinct buffers — a collision
-        // here means the capture pass's leaked bufs corrupted the pool
-        // accounting (enorm's data would be overwritten by hnorm's).
-        eprintln!(
-            "[zh2d-ptr] enorm={:p} hnorm={:p} embed_row={:p} h_prev={:p}",
-            enorm.as_f32(), hnorm.as_f32(), embed_row.as_f32(), h_prev.as_f32()
-        );
-    }
-    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
         // full hnorm checksum (8 segments of 512) — hprev's 4096-float
         // bit-level: front-2 matched orig but S1 d2 diverged 8606 vs 315
         // with x2 8-seg checksums equal => 1-ulp somewhere upstream.
@@ -4770,13 +4679,7 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
         topk: d.index_topk,
         rms_eps: cfg.rms_norm_eps,
     };
-    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
-        eprintln!("[dsa-t] pre  {:?}", cuda.dsa_pinned(seq, mtp_family));
-    }
     let attn_partial = cuda.dsa_layer_dev(&hn, &w, seq, mtp_family, 1, h)?;
-    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
-        eprintln!("[dsa-t] post {:?}", cuda.dsa_pinned(seq, mtp_family));
-    }
     let mut attn_partial = attn_partial;
     let ar_p2p = cuda.p2p_ar_v2(&mut attn_partial, h).unwrap_or(false);
     if !ar_p2p {
@@ -5019,32 +4922,6 @@ pub(crate) fn draft_step_dev<B: KernelBackend>(
             hidden,
             1,
         )?;
-        // embed sanity: the token the kernel read + the row it produced, AND
-        // the host lookup of the same token (bit-parity check: any mismatch
-        // here means embed_one_dev's table/stride differs from s.embed's).
-        if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
-            let mut t = [0i32; 1];
-            ferrite_kernel::cuda::memcpy_d2h_sync(
-                unsafe { tokens_ptr.add(i) } as *mut std::ffi::c_void,
-                t.as_mut_ptr() as *mut f32,
-                1,
-                cuda.stream_handle(),
-            );
-            let mut e = [0f32; 4];
-            ferrite_kernel::cuda::memcpy_d2h_sync(
-                emb_ptr as *mut std::ffi::c_void,
-                e.as_mut_ptr(),
-                4,
-                cuda.stream_handle(),
-            );
-            let h2 = s.embed(&[t[0] as u32]);
-            let hs = h2.as_slice();
-            let hm = e.iter().zip(hs.iter()).filter(|(a, b)| a != b).count();
-            eprintln!(
-                "[draft-emb] i={i} token={:?} dev={:?} host={:?} first4_mismatch={hm}",
-                t, e, &hs[..4]
-            );
-        }
     } // cuda dropped — mtp_forward re-acquires internally
     mtp_forward_raw_argmax(
         s,
