@@ -1909,11 +1909,7 @@ impl CudaBackend {
         let do_ = DevBuf::alloc(self.dev, self.stream, out.numel())?;
         let t_ptr = &t as *const i32;
         // split-K (SGLang MLA decode's num_splits): grid = n*h*splits blocks.
-        // FERRITE_SPLITS=N overrides (1 = disable split-K) — bisect knob.
-        let splits = std::env::var("FERRITE_SPLITS")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or((256 / (n * h).max(1)).clamp(1, 32));
+        let splits = (256 / (n * h).max(1)).clamp(1, 32);
         let scratch = DevBuf::alloc(self.dev, self.stream,
             (n as usize) * (h as usize) * (splits as usize) * (2 + dv as usize))?;
         ck(unsafe { ferrite_sparse_attn_v2(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), scratch.as_f32(), n, t_ptr, h, d, dv, topk, splits, self.stream) }, "sparse_attn_v2")?;
@@ -3227,11 +3223,7 @@ impl CudaBackend {
         let attn_out = DevBuf::alloc(self.dev, self.stream, n * h * dv)?;
         // split-K (SGLang MLA decode num_splits): grid = n*h*splits. At TP8
         // the old grid (n,h) was 8 blocks on 148 SM (36KB smem → 2 SM).
-        // FERRITE_SPLITS=N overrides (1 = disable) — bisect knob.
-        let splits = std::env::var("FERRITE_SPLITS")
-            .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or((256 / (n * h).max(1)).clamp(1, 32));
+        let splits = (256 / (n * h).max(1)).clamp(1, 32);
         let sk_scratch = DevBuf::alloc(self.dev, self.stream, n * h * splits * (2 + dv))?;
         ck(
             unsafe {
