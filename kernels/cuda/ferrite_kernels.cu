@@ -639,6 +639,32 @@ static int ferrite_pdl_enabled(void) {
     return cached;
 }
 
+// PDL v5 helper: launch with programmatic stream serialization (B-side PDL).
+// The kernel's OPENING cudaGridDependencySynchronize() gates its data reads
+// on the predecessor's completion; the launch overhead (grid init, prologue)
+// overlaps the predecessor's tail — this is the mega-graph node-gap killer
+// (~900 nodes × ~2µs launch gap per decode step). No-op semantics when
+// FERRITE_PDL is unset (plain <<<>>>); when set, the graph captures the
+// launch-with-attr as a PDL node (ferrite_pdl_exp mode 3 verified capture).
+// NOTE: the KERNEL must start with cudaGridDependencySynchronize() before
+// touching its predecessors' outputs — every pdl_or_plain'd kernel below
+// carries the __CUDA_ARCH__ >= 900 guard block at entry.
+template <typename K, typename... Args>
+static inline cudaError_t pdl_or_plain(K kern, dim3 grid, dim3 block,
+                                       size_t smem, cudaStream_t stream, Args... args) {
+    if (ferrite_pdl_enabled()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid; cfg.blockDim = block;
+        cfg.dynamicSmemBytes = smem; cfg.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+        return cudaLaunchKernelEx(&cfg, kern, args...);
+    }
+    return kern<<<grid, block, smem, stream>>>(args...);
+}
+
 extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
                                             const float* v, const float* beta,
                                             const float* gate, const float* a_log,
@@ -1552,6 +1578,9 @@ __global__ void sparse_attn_v2_kernel(const float* __restrict__ q,
                                       const float* __restrict__ idx,
                                       float* __restrict__ out,
                                       int n, const int* __restrict__ t_ptr, int h, int d, int dv, int topk) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
+#endif
     int t = *t_ptr; // zero-copy pinned read (graph-safe)
     int row = blockIdx.x;
     int hd = blockIdx.y;
@@ -1655,8 +1684,8 @@ extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q, const float* k,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         if (e != cudaSuccess) return e;
     }
-    sparse_attn_v2_kernel<<<grid, block, smem, s>>>(q, k, v, idx, out, n, t_ptr, h, d, dv, topk);
-    return cudaGetLastError();
+    return pdl_or_plain(sparse_attn_v2_kernel, grid, block, smem, s,
+                        q, k, v, idx, out, n, t_ptr, h, d, dv, topk);
 }
 
 // ============================================================
@@ -1799,6 +1828,9 @@ __global__ void hc_post_kernel(const float* __restrict__ x,
                                const float* __restrict__ comb,
                                float* __restrict__ out,
                                int s, int n, int h) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
+#endif
     // out[t,i,j] = post[t,i]*x[t,j] + Σ_k comb[t,k,i]*res[t,k,j]
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = s * n * h;
@@ -1820,8 +1852,8 @@ extern "C" cudaError_t ferrite_hc_post(const float* x, const float* res,
     int total = s * n * h;
     dim3 block(256);
     dim3 grid((total + 255) / 256);
-    hc_post_kernel<<<grid, block, 0, stream>>>(x, res, post, comb, out, s, n, h);
-    return cudaGetLastError();
+    return pdl_or_plain(hc_post_kernel, grid, block, 0, stream,
+                        x, res, post, comb, out, s, n, h);
 }
 
 // ============================================================
@@ -2177,6 +2209,9 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
                                    const float* __restrict__ bias,
                                    float* __restrict__ y,
                                    int in_f, int out_f, int nrows) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
+#endif
     const int warps = blockDim.x >> 5;
     const int rpb = warps / WPR;               // rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -2243,13 +2278,17 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
     int rpb = 8 / wpr;                        // 256 threads = 8 warps
     long total = (long)nrows * out_f;
     dim3 grid((total + rpb - 1) / rpb);
+    dim3 block(256);
+    const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    // PDL v5: the decode chain's dominant GEMV (fb/gb/o_proj on GDN, all
+    // projections on DSA — ~200 nodes/step) launches with programmatic
+    // stream serialization under FERRITE_PDL=1 (kernel-entry gridDepSync).
     switch (wpr) {
-        case 1: gemv_bf16_v2_kernel<1><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
-        case 2: gemv_bf16_v2_kernel<2><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
-        case 4: gemv_bf16_v2_kernel<4><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
-        default: gemv_bf16_v2_kernel<8><<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w, bias, out, in_f, out_f, nrows); break;
+        case 1: return pdl_or_plain(gemv_bf16_v2_kernel<1>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
+        case 2: return pdl_or_plain(gemv_bf16_v2_kernel<2>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
+        case 4: return pdl_or_plain(gemv_bf16_v2_kernel<4>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
+        default: return pdl_or_plain(gemv_bf16_v2_kernel<8>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
     }
-    return cudaGetLastError();
 }
 
 // ============================================================
@@ -2401,6 +2440,9 @@ __global__ void gemv_tri_kernel(const float* __restrict__ x,
                                 float* __restrict__ y2,
                                 float* __restrict__ y3,
                                 int in_f, int o1, int o2, int o3) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
+#endif
     const int T = o1 + o2 + o3;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int rpb = (blockDim.x >> 5) / 4;    // WPR=4, 256 threads → 2 rows/block
@@ -2452,11 +2494,9 @@ extern "C" cudaError_t ferrite_gemv_tri(const float* x, const void* w1, const vo
     if (T <= 0 || in_f <= 0) return cudaSuccess;
     if (in_f & 7) return cudaErrorNotSupported; // host falls back to 3x gemv
     dim3 grid((T + 1) / 2);                     // rpb=2 rows/block (WPR=4)
-    gemv_tri_kernel<<<grid, 256, 0, s>>>(x, (const __nv_bfloat16*)w1,
-                                         (const __nv_bfloat16*)w2,
-                                         (const __nv_bfloat16*)w3,
-                                         y1, y2, y3, in_f, o1, o2, o3);
-    return cudaGetLastError();
+    return pdl_or_plain(gemv_tri_kernel, grid, dim3(256), 0, s,
+                        x, (const __nv_bfloat16*)w1, (const __nv_bfloat16*)w2,
+                        (const __nv_bfloat16*)w3, y1, y2, y3, in_f, o1, o2, o3);
 }
 
 // ============================================================
@@ -3808,6 +3848,13 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
                                         float* __restrict__ mx_partial,
                                         int s, int n, int h, int mix) {
+#if __CUDA_ARCH__ >= 900
+    // PDL (v5): this kernel's launch overlaps the PREDECESSOR's tail (the
+    // attr is set by the launcher under FERRITE_PDL=1); gridDepSync gates
+    // the res/fw reads until the predecessor's writes are visible. No-op on
+    // a normal launch.
+    cudaGridDependencySynchronize();
+#endif
     // K-SPLIT: gridDim.z = KS lanes per mix row — 24 mix rows × 8 lanes =
     // 192 blocks (130% SM) vs the old 24-block single-lane version (16% SM,
     // each block serially dotting the full 18432-dim row). Each lane dots
@@ -3895,6 +3942,11 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
                                      unsigned* __restrict__ ctr,    // [s] is_last counter (pre-zeroed)
                                      int s, int n, int h, int mix, int mix_ks,
                                      float rms_eps, float hc_eps, int iters) {
+#if __CUDA_ARCH__ >= 900
+    // PDL (v5): launch overlaps mix_split's tail; gridDepSync gates the
+    // mx_in reads (mix_split's partial writes) until it completes.
+    cudaGridDependencySynchronize();
+#endif
     const int NB = gridDim.y;
     int t = blockIdx.x;
     if (t >= s) return;
@@ -4046,16 +4098,41 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
     cudaMemsetAsync(ctr2, 0, sizeof(unsigned) * (size_t)s, stream);
     dim3 mix_grid(s, mix, HC_MIX_KS);
-    hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
-        res, fw, mx_scratch, s, n, h, mix);
+    if (ferrite_pdl_enabled()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = 0; cfg.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, hc_pre_mix_split_kernel,
+                           res, fw, mx_scratch, s, n, h, mix);
+    } else {
+        hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+            res, fw, mx_scratch, s, n, h, mix);
+    }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
 
     dim3 p345_grid(s, NB);
     size_t smem_r = (size_t)(mix + n * n + n + 48) * sizeof(float);
-    hc_pre_rest345_kernel<<<p345_grid, 256, smem_r, stream>>>(
-        res, mx_scratch, scale, base, nw, pre_s_g, post, comb, li,
-        p4, ctr2, s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
+    if (ferrite_pdl_enabled()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = p345_grid; cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = smem_r; cfg.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, hc_pre_rest345_kernel,
+                           res, mx_scratch, scale, base, nw, pre_s_g, post, comb, li,
+                           p4, ctr2, s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
+    } else {
+        hc_pre_rest345_kernel<<<p345_grid, 256, smem_r, stream>>>(
+            res, mx_scratch, scale, base, nw, pre_s_g, post, comb, li,
+            p4, ctr2, s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
+    }
     return cudaGetLastError();
 }
 
@@ -4426,6 +4503,9 @@ __global__ void gemv_qkv_conv_kernel(const float* __restrict__ x,
                                      float* __restrict__ k,
                                      float* __restrict__ v,
                                      int in_f, int proj) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
+#endif
     // WPR==1 specialization of gemv_bf16_v2 (out=3*proj >= 16k rows):
     // one warp per row, uint4 body, lane 0 epilogue = FIR + slide + silu.
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -4469,10 +4549,9 @@ extern "C" cudaError_t ferrite_gemv_qkv_conv(
     float* q, float* k, float* v, int in_f, int proj, cudaStream_t s) {
     int out_f = 3 * proj;
     dim3 grid((out_f + 7) / 8);
-    gemv_qkv_conv_kernel<<<grid, 256, 0, s>>>(
-        x, (const __nv_bfloat16*)w, (const float*)cw, cs,
-        q, k, v, in_f, proj);
-    return cudaGetLastError();
+    return pdl_or_plain(gemv_qkv_conv_kernel, grid, dim3(256), 0, s,
+                       x, (const __nv_bfloat16*)w, (const float*)cw, cs,
+                       q, k, v, in_f, proj);
 }
 
 // ============================================================
@@ -4494,6 +4573,9 @@ __global__ void gdn_step_v2p_kernel(const float* __restrict__ q,
                                    float* __restrict__ state,
                                    float* __restrict__ out,
                                    int n, int h, int dk, int dv) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
+#endif
     int t = blockIdx.x;
     int hd = blockIdx.y;
     if (t >= n || hd >= h) return;
@@ -4601,9 +4683,8 @@ extern "C" cudaError_t ferrite_gdn_step_v2p(
     }
     dim3 block(512);
     dim3 grid(1, h, 1);
-    gdn_step_v2p_kernel<<<grid, block, smem, s>>>(
-        q, k, v, b_raw, fb, dt_bias, a_log, lb, state, out, 1, h, dk, dv);
-    return cudaGetLastError();
+    return pdl_or_plain(gdn_step_v2p_kernel, grid, block, smem, s,
+                        q, k, v, b_raw, fb, dt_bias, a_log, lb, state, out, 1, h, dk, dv);
 }
 
 // elementwise add (residual): z = x + y — MTP layer's standard (non-MHC)
