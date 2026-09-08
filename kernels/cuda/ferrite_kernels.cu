@@ -4989,13 +4989,10 @@ __global__ void p2p_ar_fused_v3_kernel(
             staging_tbl[rr][off] = v;
         }
     }
-    __threadfence_system(); // peer-visible stores; the finish kernel publishes
-    // Snapshot the epoch for the finish kernel. That kernel runs only after
-    // this one COMPLETES (stream order), so its block 0 can publish the stamp
-    // with no grid-wide counter and no last-block detection — the mechanism
-    // that deadlocked at gridDim.x > 1. The snapshot keeps `e` stable for
-    // every finish block (block 0 advances *epoch there, so rereading would
-    // be a race).
+    // NO __threadfence_system() here: the finish kernel runs only after this
+    // kernel COMPLETES (stream order), and kernel completion makes every
+    // store visible — a per-thread system fence across 655K threads was
+    // costing ~2 ms per AR.
     if (blockIdx.x == 0 && threadIdx.x == 0) *ctr = e;
 }
 
@@ -5012,9 +5009,9 @@ __global__ void p2p_ar_finish_v3_kernel(
     const unsigned e = *snap; // stable: *epoch is advanced only below
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (int r = 0; r < world; r++)
-            // SYSTEM-scope store: a device-scope (volatile) store never
-            // becomes visible in the peer's address space over NVLink/UVA.
-            atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+            *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
+        // ONE system fence publishes the 8 stamps (vLLM's custom-AR pattern).
+        // atomicExch_system per peer cost ~2 ms/AR in system-scope atomics.
         __threadfence_system();
         *epoch = e + 1u;
     }
