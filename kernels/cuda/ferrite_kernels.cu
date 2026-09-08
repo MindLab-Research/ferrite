@@ -4403,7 +4403,7 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // → "the the the"). Root cause TBD; 16 is the last known-good value and the
 // NB sweep showed no measurable gain (rest345 is compute-bound, 12.6µs at
 // NB=16 vs 13.7 at 64 — the extra blocks LOSE).
-#define HC_P345_NB 16
+#define HC_P345_NB 8
 
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
