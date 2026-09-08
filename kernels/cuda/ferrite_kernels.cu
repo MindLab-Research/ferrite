@@ -3249,7 +3249,12 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                     ar[r] = (idx < f4) ? a4[idx] : make_float4(0.f, 0.f, 0.f, 0.f);
                 }
             }
-            #pragma unroll 1
+            // UNROLLED h loop: with `#pragma unroll 1` the rows were serialized
+            // (load -> fp8 convert -> FMA -> 5-step shuffle, next row waits) so
+            // only 256B was in flight per warp -> ~10% of HBM bandwidth
+            // (134MB/call in 177us). Unrolling issues several independent row
+            // loads per warp (the rows are contiguous: dwr = dbase + h*klen).
+            #pragma unroll
             for (int hh = 0; hh < 8; hh++) {
                 int h = h0 + hh;
                 if (h >= hidden) break;
