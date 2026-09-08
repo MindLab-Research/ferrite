@@ -4136,7 +4136,11 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // Plan N v1: P345 column blocks per token (gridDim.y) — h=4096/16 = 256
 // columns per block × 256 threads = 1 column/thread. 16 blocks spread the
 // old single-block P3's 64KB x read over 16 SMs' L2 bandwidth.
-#define HC_P345_NB 16
+// P345 grid.y: column blocks over h=nh/n. TP shrinks h per rank (hidden is
+// replicated), so a fixed NB=16 left only 16 blocks on 148-SM parts →
+// 5-11% occupancy → latency-bound (measured 12.6µs × 87/step = 1.1ms).
+// 64 keeps 4x more blocks in flight; the kernel reads NB from gridDim.y.
+#define HC_P345_NB 64
 
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
