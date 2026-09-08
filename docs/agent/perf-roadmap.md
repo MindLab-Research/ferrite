@@ -163,3 +163,14 @@ cp.async 预取，除非改数据布局（例如让 lane 的 16 字节在 smem �
 （`】】】】` + "The The The"）→ 立即回退。可能原因：`wait_group 0` 与 fallback 分支
 （klen != 256 不 commit）的 group 计数错位，或 smem 缓冲在同一 warp 的多次 `base` 迭代间
 未正确轮换。**结论：down 的这条路线需要更仔细的同步设计，不是简单替换加载指令。**
+
+### 已回退：hc_pre_mix 的 cp.async 分块预取（中性）
+
+把 4 行权重按 256 元素分块、提前一个 chunk 用 `cp.async.ca` 预取到每线程私有的 smem 槽
+（8KB 双缓冲，无需 syncthreads）：16.73-16.74 → **16.70-16.71 ms（957-958）**，文本正确，
+但差异在 ±1% 热漂移内 → 回退。说明 mix 的 4 个独立 load 已被 `#pragma unroll 4` 充分重叠，
+cp.async 无额外收益。
+
+**至此"用 cp.async 提高内存级并行度"这条线也已探完**：act（有效，+0.8%）、down（不可行，
+每 lane 16B 私有数据需 73KB smem）、mix（中性）。剩下的提升空间必须来自**数据布局或算法**，
+不是加载方式。
