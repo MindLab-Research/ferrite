@@ -271,8 +271,8 @@ Other profiling rules:
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
 - **B=16 non-MTP (2026-09-08 late, the current best)** — HONEST end-to-end numbers are the
   per-seq `steady=` x16 (the `[megab] replay` line under-reports long context by ~8%):
-  **300-token window: 59.8-59.9 tok/s/seq = 957 tok/s aggregate**; **1000-token window:
-  56.8-56.9 tok/s/seq = 909 tok/s aggregate**. Text = direct 《出师表》 recitation ✓.
+  **300-token window: 59.1-60.9 tok/s/seq = 946-974 tok/s aggregate**; **1000-token window:
+  56.8-57.6 tok/s/seq = 909-922 tok/s aggregate** (run-to-run ±2%). Text = direct 《出师表》 ✓.
   (replay line: 990 @300-tok / 842 @1000-tok.) Progression this session: 546 → ~957 tok/s.
   Kept changes: gemv_fp8 T=2 tokens/block, gated_rmsnorm 1 token/block x256, moe_act double-buffered
   cp.async.cg staging + ldmatrix, hc_pre_mix K-loop `#pragma unroll 4`, **moe_route 256-thread
