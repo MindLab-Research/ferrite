@@ -4972,18 +4972,24 @@ __global__ void p2p_ar_fused_v3_kernel(
     // (flag said "arrived", staging held the previous epoch's value) →
     // wrong all-reduce → gibberish text.
     {
-        // COALESCED mapping: consecutive threads write consecutive tokens of
-        // the SAME peer. The old (token, peer) flattening (ii = r0/world,
-        // rr = r0%world) sent adjacent threads to different GPUs — 655K
-        // scattered 4-byte NVLink transactions per AR (~2.5 ms each,
-        // measured 236 ms/step). Now each thread loads one token once and
-        // writes it to all peers' contiguous slots.
+        // COALESCED + 16B-VECTORIZED: consecutive threads write consecutive
+        // tokens of the SAME peer (the old (token,peer) flattening sent
+        // adjacent threads to different GPUs), and each thread moves 16B
+        // instead of 4B. The 4-byte version needed 524K NVLink transactions
+        // per AR (2.1MB in 49us = 43GB/s vs the 750GB/s memcpyPeer floor).
         const int step = gridDim.x * blockDim.x;
-        for (int ii = blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
+        const int n4 = n >> 2;
+        const float4* p4 = reinterpret_cast<const float4*>(partial);
+        for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
+            const float4 v = p4[i4];
+            const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (size_t)i4 * 4;
+            for (int rr = 0; rr < world; rr++)
+                *reinterpret_cast<float4*>(staging_tbl[rr] + base) = v;
+        }
+        for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
             float v = partial[ii];
             const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
-            for (int rr = 0; rr < world; rr++)
-                staging_tbl[rr][base] = v;
+            for (int rr = 0; rr < world; rr++) staging_tbl[rr][base] = v;
         }
     }
     // NO __threadfence_system() here: the finish kernel runs only after this
@@ -5041,7 +5047,17 @@ __global__ void p2p_ar_reduce_v3_kernel(
     int world, int n, int stride) {
     const unsigned e = *snap;
     const int step = gridDim.x * blockDim.x;
-    for (int ii = blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
+    const int n4 = n >> 2;
+    for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int r = 0; r < world; r++) {
+            const float4 v = *reinterpret_cast<const float4*>(
+                staging_local + (size_t)((e & 1u) * world + r) * stride + (size_t)i4 * 4);
+            acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+        }
+        *reinterpret_cast<float4*>(out + (size_t)i4 * 4) = acc;
+    }
+    for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
         float acc = 0.f;
         for (int r = 0; r < world; r++)
             acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
