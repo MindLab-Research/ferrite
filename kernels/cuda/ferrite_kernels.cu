@@ -3464,13 +3464,14 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     // with 16-byte loads makes every sector fully used. The row stride is
     // PADDED to 80 bytes: stride 64 would start every row on bank 0 (8-way
     // conflict on the fragment reads) — 80 gives banks 0,20,8,28,16,4,24,12.
-    const int SA_STRIDE = 80;
-    __shared__ unsigned char sa[8][2 * 16 * 80];
-    for (int kb = k0; kb < k1; kb += 64) {
-        for (int t = lane; t < 128; t += 32) {
-            const int proj = t >> 6;              // 0: gate, 1: up
-            const int off = t & 63;
-            const int row = off >> 2, col = (off & 3) * 16;
+    const int SA_STRIDE = 144;   // 128 cols + 16 pad (pad keeps the 8 rows on
+                                 // different banks; 128 would put them all on bank 0)
+    __shared__ unsigned char sa[8][2 * 16 * 144];
+    for (int kb = k0; kb < k1; kb += 128) {
+        for (int t = lane; t < 256; t += 32) {
+            const int proj = t >> 7;              // 0: gate, 1: up
+            const int off = t & 127;
+            const int row = off >> 3, col = (off & 7) * 16;
             const unsigned char* src = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + kb + col;
             *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) =
                 *reinterpret_cast<const uint4*>(src);
@@ -3479,7 +3480,7 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
         #pragma unroll
-        for (int kk = kb; kk < kb + 64; kk += 32) {
+        for (int kk = kb; kk < kb + 128; kk += 32) {
             const int kkl = kk - kb;
             unsigned ba[4];  // A fragments from this warp's padded smem slice
             ba[0] = *(const unsigned*)(sa[warp] + (size_t)r0 * SA_STRIDE + kkl + c0);
