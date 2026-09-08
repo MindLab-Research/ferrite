@@ -1360,6 +1360,18 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
     float inv_sqrt_d = rsqrtf((float)d);
     // causal guard: query row i may only select keys j < ctx0_pools + i + 1
     int jmax = min(ctx0_pools + row + 1, t);
+    // FAST PATH FIRST (v12): when all causally-valid pools are selected
+    // (select_k >= jmax — ALWAYS true in decode: t pools ~250 << topk_max
+    // 8195), idx is a direct enumeration and the H-split scoring below is
+    // dead code (nothing reads sm[] on this path). 37.7us -> ~5us: skip the
+    // 21us single-block scoring + its ~560KB qi/ki reads entirely.
+    if (select_k >= jmax) {
+        for (int r = threadIdx.x; r < select_k; r += blockDim.x)
+            idx[(size_t)row * topk_max + r] = (r < jmax) ? (float)r : -1.0f;
+        for (int r = select_k + threadIdx.x; r < topk_max; r += blockDim.x)
+            idx[(size_t)row * topk_max + r] = -1.0f;
+        return;
+    }
     // ═══ H-SPLIT SCORING (v11): 4 threads per pool (4 heads each) — the
     // 1-block 85µs scoring (129 pools × 16 heads × 64 dims at 1 SM) becomes
     // 4× parallel (~21µs). The partials [4][t] in the smem's extended area
@@ -1400,20 +1412,9 @@ __global__ void indexer_topk_kernel(const float* __restrict__ qi,
         sm[j] = (j < jmax) ? total * inv_sqrt_d : -INFINITY;
     }
     __syncthreads();
-    // FAST PATH (select_k >= jmax): ALL causally-valid pools are selected —
-    // the O(k×t) serial argmax loop (select_k iterations × full t scan + sync,
-    // ~65µs at k=t=129 × 11 DSA layers = 0.7ms/step) reduces to a direct
-    // enumeration O(t). The downstream (sparse_attn_v2) computes scores from
-    // qi·ki — idx order is irrelevant (weighted sum, commutative).
-    if (select_k >= jmax) {
-        for (int r = threadIdx.x; r < select_k; r += blockDim.x) {
-            idx[(size_t)row * topk_max + r] = (r < jmax) ? (float)r : -1.0f;
-        }
-        for (int r = select_k + threadIdx.x; r < topk_max; r += blockDim.x) {
-            idx[(size_t)row * topk_max + r] = -1.0f;
-        }
-        return;
-    }
+    // (v12: the select_k >= jmax fast path moved BEFORE the scoring — the
+    // H-split scoring is dead code on that branch, which is ALWAYS taken in
+    // decode: t pools ~250 << topk_max 8195.)
     // selection topk (warp-shuffle reduce, blockDim-agnostic): scoring was
     // 32 threads (96 total on the verify chain — 96/4736 cores busy, 144us/
     // inst O(len)); 256 threads = 8x lanes. Strict > keeps the LOWEST lane /
