@@ -279,18 +279,18 @@ impl ServeEngine for GpuEngine {
                     }
                     self.cluster.decode_step(live_seqs[0])?;
                 } else {
-                    let batch_name = format!(
-                        "megab_{}",
-                        live_seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("_")
-                    );
-                    if self.batch_graph.as_deref() != Some(batch_name.as_str()) {
-                        // Composition changed (admission/retirement freed the old
-                        // graph) — destroy the stale graph, capture fresh this tick.
-                        if let Some(old) = self.batch_graph.take() {
-                            self.cluster.destroy_batch_graph(&old);
-                        }
-                        self.batch_graph = Some(batch_name);
-                    }
+                    // SGLang-style batch-size keying: tp.rs pads to
+                    // 1/2/4/8/16/32 and captures ONE graph per padded size,
+                    // so a membership change REUSES the graph (the per-size
+                    // pointer tables' content is refreshed inside
+                    // decode_step_batched) — no re-capture.
+                    let size = [1usize, 2, 4, 8, 16, 32]
+                        .iter()
+                        .copied()
+                        .find(|&s| s >= live_seqs.len())
+                        .unwrap_or(live_seqs.len());
+                    let batch_name = format!("megab_b{size}");
+                    self.batch_graph = Some(batch_name);
                     self.cluster.decode_step_batched(&live_seqs)?;
                 }
                 // per-seq retirement checks (the incremental reads — same

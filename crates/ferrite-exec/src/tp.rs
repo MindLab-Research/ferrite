@@ -884,12 +884,24 @@ impl<B: KernelBackend> TpCluster<B> {
         }
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
-        let gname = format!(
-            "megab_{}",
-            seqs.iter().map(|s| s.to_string()).collect::<Vec<_>>().join("_")
-        );
+        // SGLang-style batch-size padding: ONE graph per padded size
+        // (1,2,4,8,16,32) serves any seq-set of that size — the graph's
+        // per-seq state kernels read the per-size pointer tables, whose
+        // CONTENT is refreshed on every membership change. A
+        // composition-keyed graph forced a re-capture (1-2s) per membership
+        // change (measured: 8 captures while 16 requests streamed in →
+        // throughput collapsed to 74 tok/s).
+        let n = seqs.len();
+        let size = [1usize, 2, 4, 8, 16, 32]
+            .iter()
+            .copied()
+            .find(|&s| s >= n)
+            .unwrap_or(n);
+        let gname = format!("megab_b{size}");
+        let mut pseqs: Vec<u64> = seqs.to_vec();
+        pseqs.resize(size, u64::MAX); // padded rows → dummy states
         // B rows' last tokens → embed (replicated table) → hc_expand [B, nh]
-        let last_toks: Vec<u32> = seqs
+        let mut last_toks: Vec<u32> = seqs
             .iter()
             .map(|&seq_r| -> Result<u32> {
                 let s = self
@@ -902,6 +914,10 @@ impl<B: KernelBackend> TpCluster<B> {
                     .ok_or_else(|| FerriteError::Config("empty context".into()))?)
             })
             .collect::<Result<Vec<u32>>>()?;
+        if last_toks.len() < size {
+            let last = *last_toks.last().unwrap();
+            last_toks.resize(size, last);
+        }
         let h0 = self.shards[0].embed(&last_toks);
         let in_vals = crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult);
 
@@ -919,23 +935,23 @@ impl<B: KernelBackend> TpCluster<B> {
             // recorded pinned t0/total matching the dry-run's).
             let toks = Self::fan_out(&mut self.shards, |s| {
                 Self::mega_chain_dev_batched(
-                    s, seqs, in_vals.as_slice(), &plans, num_dsa, false, &gname, n,
+                    s, pseqs.as_slice(), in_vals.as_slice(), &plans, num_dsa, false, &gname, size,
                 )
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
             Self::fan_out(&mut self.shards, |s| {
                 Self::mega_chain_dev_batched(
-                    s, seqs, in_vals.as_slice(), &plans, num_dsa, true, &gname, n,
+                    s, pseqs.as_slice(), in_vals.as_slice(), &plans, num_dsa, true, &gname, size,
                 )
             })
             .into_iter()
             .collect::<Result<Vec<Vec<f32>>>>()?;
             eprintln!(
-                "[megab] captured {gname}: {n} seqs, {} layers (B-row GEMM + per-seq state kernels)",
+                "[megab] captured {gname}: {size} rows ({n} real), {} layers (B-row GEMM + per-seq state kernels)",
                 plans.len()
             );
-            let out: Vec<u32> = toks[0].iter().map(|t| *t as u32).collect();
+            let out: Vec<u32> = toks[0].iter().take(n).map(|t| *t as u32).collect();
             for (i, &seq_r) in seqs.iter().enumerate() {
                 for s in &mut self.shards {
                     if let Some(rt) = s.seq_runtime_mut(seq_r) {
@@ -944,6 +960,41 @@ impl<B: KernelBackend> TpCluster<B> {
                 }
             }
             return Ok(out);
+        }
+        // Refresh the per-size pointer tables' CONTENT for THIS membership
+        // (the graph's device addresses are stable across seq-sets of the
+        // same size — only the pointers change). ~150µs/step.
+        {
+            let (la_h, la_dk, la_conv) = {
+                let la = &self.full_cfg.linear_attn;
+                (la.num_heads, la.head_dim, la.short_conv_kernel_size)
+            };
+            let plans_r = &plans;
+            let pseqs_r = &pseqs;
+            Self::fan_out(&mut self.shards, |s| {
+                let cuda = s
+                    .backend
+                    .as_cuda()
+                    .ok_or_else(|| FerriteError::Config("batched needs cuda".into()))?;
+                cuda.enter();
+                let (dh, ddk, ddv, didm) = s.dsa_dims();
+                let proj = la_h * la_dk;
+                let hist = la_conv.saturating_sub(1).max(1);
+                for (li, plan) in plans_r.iter().enumerate() {
+                    match plan.attn {
+                        AttnKind::Linear => {
+                            cuda.gdn_state_tables(li, pseqs_r, 3 * proj * hist, proj * la_dk)?;
+                        }
+                        AttnKind::Dsa => {
+                            let fam = s.dsa_family_index(li);
+                            cuda.dsa_ptr_tables(fam, pseqs_r, dh, ddk, ddv, didm)?;
+                        }
+                    }
+                }
+                Ok(())
+            })
+            .into_iter()
+            .collect::<Result<Vec<()>>>()?;
         }
         // Steady state: per-seq DSA pinned advance (B × num_dsa host writes)
         // + ONE graph replay + B tokens D2H — the entire B-seq step is
@@ -960,7 +1011,7 @@ impl<B: KernelBackend> TpCluster<B> {
                     cuda.dsa_host_advance(seq_r, f, 1);
                 }
             }
-            let mut out = vec![0f32; n];
+            let mut out = vec![0f32; size];
             if !cuda.graph_run(&gname, in_vals.as_slice(), &mut out)? {
                 return Err(FerriteError::InvalidArg(format!("batched graph {gname} missing")));
             }
@@ -976,7 +1027,7 @@ impl<B: KernelBackend> TpCluster<B> {
                 n as f64 / dt.as_secs_f64().max(1e-9)
             );
         }
-        let out: Vec<u32> = toks[0].iter().map(|t| *t as u32).collect();
+        let out: Vec<u32> = toks[0].iter().take(n).map(|t| *t as u32).collect();
         for (i, &seq_r) in seqs.iter().enumerate() {
             for s in &mut self.shards {
                 if let Some(rt) = s.seq_runtime_mut(seq_r) {
@@ -2937,6 +2988,9 @@ fn mega_chain_dev_batched(
         // GDN/conv states need no rollback — capture records without
         // executing, and the dry-run's state advance IS the real step.)
         for &seq_r in seqs {
+            if seq_r == u64::MAX {
+                continue; // padded row
+            }
             for f in 0..num_dsa {
                 cuda.dsa_host_rollback(seq_r, f, 1);
             }

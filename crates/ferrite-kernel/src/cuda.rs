@@ -676,13 +676,15 @@ pub struct CudaBackend {
     /// no malloc during capture; the table content is FROZEN per
     /// composition: the (seq, layer) state addresses are stable). Purged
     /// when free_seq drops a member (the tables would dangle).
-    gdn_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, Vec<u64>), (*mut std::ffi::c_void, *mut std::ffi::c_void)>>,
+    gdn_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), (*mut std::ffi::c_void, *mut std::ffi::c_void)>>,
     /// Batched per-seq DSA tables: (family, seq-set) → 6 device pointer
     /// arrays ([B] k_nope / v / k_idx / k_gate cache ptrs + [B] PINNED
     /// t0 / total int ptrs — the kernels dereference the pinned ints
     /// zero-copy, host-written per step: graph-safe). cudaMalloc'd + memcpy'd
     /// once per composition; purged by free_seq when a member cache dies.
-    dsa_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, Vec<u64>), DsaBatchTables>>,
+    dsa_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), DsaBatchTables>>,
+    /// per-family dummy DSA cache for padded batch rows (see dsa_dummy)
+    dsa_dummy_cache: std::sync::Mutex<std::collections::HashMap<usize, (*mut f32, *mut f32, *mut f32, *mut f32, *const i32, *const i32)>>,
     /// P2P one-shot AR state (v2 epoch+ping-pong; FERRITE_P2P): the per-rank
     /// persistent device buffers for the in-graph decode-chain all-reduce —
     /// see P2pArState. Set once at cluster setup (after the peers' UVA
@@ -784,6 +786,7 @@ impl CudaBackend {
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             gdn_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dsa_dummy_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             p2p_ar: std::sync::Mutex::new(None),
             w8a8_scratch: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_stage: std::sync::Mutex::new(Fp8Stage { w8: std::ptr::null_mut(), w8_cap: 0, sc: std::ptr::null_mut(), sc_cap: 0 }),
@@ -2688,36 +2691,68 @@ impl CudaBackend {
     /// content is frozen per composition (the (seq, layer) state addresses
     /// are stable for the states' lifetime). Purged by free_seq (a member's
     /// state freed → the table dangles).
-    fn gdn_state_tables(
+    pub fn gdn_state_tables(
         &self,
         layer: usize,
         seqs: &[u64],
         conv_len: usize,
         gdn_len: usize,
     ) -> Result<(*const *mut f32, *const *mut f32)> {
-        let key = (layer, seqs.to_vec());
-        {
-            let m = self.gdn_tbl_cache.lock().unwrap();
-            if let Some(&(c, g)) = m.get(&key) {
-                return Ok((c as *const *mut f32, g as *const *mut f32));
+        // KEYED BY (layer, SIZE) — NOT the composition. The device table's
+        // address must be stable so ONE per-size CUDA graph serves any
+        // seq-set of that size (SGLang's cuda-graph batch-size padding); a
+        // composition-keyed table forced a graph re-capture on every
+        // membership change (measured: 8 captures while 16 requests streamed
+        // in → throughput collapsed to 74 tok/s). Content (the per-seq state
+        // pointers) is refreshed on EVERY call; padded slots point at a
+        // shared per-layer dummy state (their outputs are discarded).
+        let size = seqs.len();
+        let key = (layer, size);
+        let (c_tbl, g_tbl) = {
+            let mut m = self.gdn_tbl_cache.lock().unwrap();
+            match m.get(&key) {
+                Some(&(c, g)) => (c, g),
+                None => {
+                    let b = size * std::mem::size_of::<*mut f32>();
+                    let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                    ck(unsafe { cudaMalloc(&mut p, b) }, "gdn tbl malloc")?;
+                    let mut q: *mut std::ffi::c_void = std::ptr::null_mut();
+                    ck(unsafe { cudaMalloc(&mut q, b) }, "gdn tbl malloc")?;
+                    m.insert(key, (p, q));
+                    (p, q)
+                }
+            }
+        };
+        let mut conv_ptrs = Vec::with_capacity(size);
+        let mut gdn_ptrs = Vec::with_capacity(size);
+        for &seq_r in seqs {
+            if seq_r == u64::MAX {
+                // padded row → shared dummy state (output discarded)
+                conv_ptrs.push(self.dev_state(&self.conv_states, (u64::MAX, layer), conv_len)?);
+                gdn_ptrs.push(self.dev_state(&self.gdn_states, (u64::MAX, layer), gdn_len)?);
+            } else {
+                conv_ptrs.push(self.dev_state(&self.conv_states, (seq_r, layer), conv_len)?);
+                gdn_ptrs.push(self.dev_state(&self.gdn_states, (seq_r, layer), gdn_len)?);
             }
         }
-        let mut conv_ptrs = Vec::with_capacity(seqs.len());
-        let mut gdn_ptrs = Vec::with_capacity(seqs.len());
-        for &seq_r in seqs {
-            conv_ptrs.push(self.dev_state(&self.conv_states, (seq_r, layer), conv_len)?);
-            gdn_ptrs.push(self.dev_state(&self.gdn_states, (seq_r, layer), gdn_len)?);
+        if conv_ptrs.len() < size {
+            let dc = self.dev_state(&self.conv_states, (u64::MAX, layer), conv_len)?;
+            let dg = self.dev_state(&self.gdn_states, (u64::MAX, layer), gdn_len)?;
+            while conv_ptrs.len() < size {
+                conv_ptrs.push(dc);
+                gdn_ptrs.push(dg);
+            }
         }
-        let mk = |v: &[*mut f32]| -> Result<*mut std::ffi::c_void> {
-            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-            ck(unsafe { cudaMalloc(&mut p, v.len() * std::mem::size_of::<*mut f32>()) }, "gdn tbl malloc")?;
-            ck(unsafe { cudaMemcpy(p, v.as_ptr() as *const _, v.len() * std::mem::size_of::<*mut f32>(), CUDA_MEMCPY_H2D) }, "gdn tbl H2D")?;
-            Ok(p)
-        };
-        let c = mk(&conv_ptrs)?;
-        let g = mk(&gdn_ptrs)?;
-        self.gdn_tbl_cache.lock().unwrap().insert(key, (c, g));
-        Ok((c as *const *mut f32, g as *const *mut f32))
+        let b = size * std::mem::size_of::<*mut f32>();
+        ck(
+            unsafe { cudaMemcpyAsync(c_tbl, conv_ptrs.as_ptr() as *const _, b, CUDA_MEMCPY_H2D, self.stream) },
+            "gdn tbl update",
+        )?;
+        ck(
+            unsafe { cudaMemcpyAsync(g_tbl, gdn_ptrs.as_ptr() as *const _, b, CUDA_MEMCPY_H2D, self.stream) },
+            "gdn tbl update",
+        )?;
+        Ok((c_tbl as *const *mut f32, g_tbl as *const *mut f32))
     }
 
     /// Batched DSA per-seq pointer tables: (family, seq-set) → 6 device
@@ -2729,23 +2764,70 @@ impl CudaBackend {
     /// (the capture pass re-uses the same pointers); purged by free_seq.
     /// REQUIRES all (seq, family) caches to exist (the caller's bookkeeping
     /// loop get-or-creates them first).
-    fn dsa_ptr_tables(&self, family: usize, seqs: &[u64]) -> Result<DsaBatchTables> {
-        let key = (family, seqs.to_vec());
-        {
-            let m = self.dsa_tbl_cache.lock().unwrap();
-            if let Some(&t) = m.get(&key) {
-                return Ok(t);
+    pub fn dsa_ptr_tables(
+        &self,
+        family: usize,
+        seqs: &[u64],
+        h: usize,
+        dk: usize,
+        dv: usize,
+        idm: usize,
+    ) -> Result<DsaBatchTables> {
+        // KEYED BY (family, SIZE) — stable addresses so a per-size CUDA graph
+        // can be reused for any seq-set of that size (see gdn_state_tables).
+        // Padded slots point at a shared per-family dummy cache (1 token:
+        // the padded rows' attention reads only slot 0; their outputs are
+        // discarded).
+        let size = seqs.len();
+        let key = (family, size);
+        let b = size * std::mem::size_of::<*mut f32>();
+        let t = {
+            let mut m = self.dsa_tbl_cache.lock().unwrap();
+            match m.get(&key) {
+                Some(&t) => t,
+                None => {
+                    let mk = || -> Result<*mut std::ffi::c_void> {
+                        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                        ck(unsafe { cudaMalloc(&mut p, b) }, "dsa tbl malloc")?;
+                        Ok(p)
+                    };
+                    let t = DsaBatchTables {
+                        kn: mk()?,
+                        v: mk()?,
+                        kidx: mk()?,
+                        kgate: mk()?,
+                        t0p: mk()?,
+                        totp: mk()?,
+                    };
+                    m.insert(key, t);
+                    t
+                }
             }
-        }
-        let mut kn: Vec<*mut f32> = Vec::with_capacity(seqs.len());
-        let mut vv: Vec<*mut f32> = Vec::with_capacity(seqs.len());
-        let mut ki_: Vec<*mut f32> = Vec::with_capacity(seqs.len());
-        let mut kg: Vec<*mut f32> = Vec::with_capacity(seqs.len());
-        let mut t0p: Vec<*const i32> = Vec::with_capacity(seqs.len());
-        let mut totp: Vec<*const i32> = Vec::with_capacity(seqs.len());
+        };
+        let mut kn: Vec<*mut f32> = Vec::with_capacity(size);
+        let mut vv: Vec<*mut f32> = Vec::with_capacity(size);
+        let mut ki_: Vec<*mut f32> = Vec::with_capacity(size);
+        let mut kg: Vec<*mut f32> = Vec::with_capacity(size);
+        let mut t0p: Vec<*const i32> = Vec::with_capacity(size);
+        let mut totp: Vec<*const i32> = Vec::with_capacity(size);
+        let dummy = if seqs.contains(&u64::MAX) {
+            Some(self.dsa_dummy(family, h, dk, dv, idm)?)
+        } else {
+            None
+        };
         {
             let m = self.dsa_caches.lock().unwrap();
             for &s in seqs {
+                if s == u64::MAX {
+                    let (dk_, dv_, di_, dg_, dt0, dtot) = dummy.expect("dummy built above");
+                    kn.push(dk_);
+                    vv.push(dv_);
+                    ki_.push(di_);
+                    kg.push(dg_);
+                    t0p.push(dt0);
+                    totp.push(dtot);
+                    continue;
+                }
                 let c = m
                     .get(&(s, family))
                     .ok_or_else(|| FerriteError::InvalidArg(format!("no dsa cache ({s},{family}) for batched tables")))?;
@@ -2757,23 +2839,57 @@ impl CudaBackend {
                 totp.push(c.pinned_total as *const i32);
             }
         }
-        let mk = |src: *const u8, len: usize| -> Result<*mut std::ffi::c_void> {
-            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
-            ck(unsafe { cudaMalloc(&mut p, len) }, "dsa tbl malloc")?;
-            ck(unsafe { cudaMemcpy(p, src as *const _, len, CUDA_MEMCPY_H2D) }, "dsa tbl H2D")?;
-            Ok(p)
+        if kn.len() < size {
+            let (dk_, dv_, di_, dg_, dt0, dtot) = self.dsa_dummy(family, h, dk, dv, idm)?;
+            while kn.len() < size {
+                kn.push(dk_);
+                vv.push(dv_);
+                ki_.push(di_);
+                kg.push(dg_);
+                t0p.push(dt0);
+                totp.push(dtot);
+            }
+        }
+        let up = |dst: *mut std::ffi::c_void, src: *const std::ffi::c_void| -> Result<()> {
+            ck(unsafe { cudaMemcpyAsync(dst, src, b, CUDA_MEMCPY_H2D, self.stream) }, "dsa tbl update")
         };
-        let b = seqs.len() * std::mem::size_of::<*mut f32>();
-        let t = DsaBatchTables {
-            kn: mk(kn.as_ptr() as *const u8, b)?,
-            v: mk(vv.as_ptr() as *const u8, b)?,
-            kidx: mk(ki_.as_ptr() as *const u8, b)?,
-            kgate: mk(kg.as_ptr() as *const u8, b)?,
-            t0p: mk(t0p.as_ptr() as *const u8, b)?,
-            totp: mk(totp.as_ptr() as *const u8, b)?,
-        };
-        self.dsa_tbl_cache.lock().unwrap().insert(key, t);
+        up(t.kn, kn.as_ptr() as *const _)?;
+        up(t.v, vv.as_ptr() as *const _)?;
+        up(t.kidx, ki_.as_ptr() as *const _)?;
+        up(t.kgate, kg.as_ptr() as *const _)?;
+        up(t.t0p, t0p.as_ptr() as *const _)?;
+        up(t.totp, totp.as_ptr() as *const _)?;
         Ok(t)
+    }
+
+    /// Shared per-family dummy DSA cache for padded batch rows (1 token;
+    /// zeros; pinned t0/total = 0/1 so the kernels read only slot 0).
+    fn dsa_dummy(&self, family: usize, h: usize, dk: usize, dv: usize, idm: usize) -> Result<(*mut f32, *mut f32, *mut f32, *mut f32, *const i32, *const i32)> {
+        let mut m = self.dsa_dummy_cache.lock().unwrap();
+        if let Some(d) = m.get(&family) {
+            return Ok(*d);
+        }
+        let mut alloc = |len: usize| -> Result<*mut f32> {
+            let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+            ck(unsafe { cudaMalloc(&mut p, len * 4) }, "dsa dummy malloc")?;
+            ck(unsafe { cudaMemset(p, 0, len * 4) }, "dsa dummy zero")?;
+            Ok(p as *mut f32)
+        };
+        let kn = alloc(h * dk)?;
+        let vv = alloc(h * dv)?;
+        let ki_ = alloc(idm)?;
+        let kg = alloc(idm)?;
+        let mut pt0: *mut i32 = std::ptr::null_mut();
+        let mut ptot: *mut i32 = std::ptr::null_mut();
+        ck(unsafe { cudaMallocHost(&mut pt0 as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "dsa dummy pinned")?;
+        ck(unsafe { cudaMallocHost(&mut ptot as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "dsa dummy pinned")?;
+        unsafe {
+            *pt0 = 0;
+            *ptot = 1;
+        }
+        let tup = (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32);
+        m.insert(family, tup);
+        Ok(tup)
     }
 
     /// Whole GDN (linear-attention) layer on device. `x` is the layer's
@@ -3442,6 +3558,9 @@ impl CudaBackend {
         let attn_out = DevBuf::alloc(self.dev, self.stream, n * h * dv)?;
         let dape = self.dev_weight(w.ape)?;
         for &seq_r in seqs {
+            if seq_r == u64::MAX {
+                continue; // padded row → the dummy table slot serves it
+            }
             let _ = {
                 let mut m = self.dsa_caches.lock().unwrap();
                 let existing = m
@@ -3478,7 +3597,7 @@ impl CudaBackend {
             };
         }
         // the (family, seq-set) batched pointer tables (cached per composition)
-        let tbl = self.dsa_ptr_tables(family, seqs)?;
+        let tbl = self.dsa_ptr_tables(family, seqs, h, dk, dv, idm)?;
         // 7. cache append — ONE launch: all B rows → each seq's cache at its
         // own t0 (the per-seq t0s via the pinned-ptr table, zero-copy).
         ck(
@@ -3662,51 +3781,11 @@ impl CudaBackend {
                 }
             }
         }
-        // 4. Batched GDN state tables: any (layer, seq-set) containing this
-        // seq dangles (its conv/gdn state pointers above are freed) —
-        // cudaFree the table pairs + purge the entries. The next
-        // decode_step_batched for the new composition rebuilds (the capture
-        // re-captures: the table rebuild is part of the dry-run).
-        {
-            let mut m = self.gdn_tbl_cache.lock().unwrap();
-            let keys: Vec<(usize, Vec<u64>)> = m
-                .keys()
-                .filter(|(_, s)| s.contains(&seq))
-                .cloned()
-                .collect();
-            for k in keys {
-                if let Some((c, g)) = m.remove(&k) {
-                    unsafe {
-                        cudaFree(c);
-                        cudaFree(g);
-                    }
-                }
-            }
-        }
-        // 5. Batched DSA tables: any (family, seq-set) containing this seq
-        // dangles (its cache pointers above are freed) — cudaFree the 6
-        // table arrays + purge the entries. The next batched DSA layer call
-        // for a new composition rebuilds them.
-        {
-            let mut m = self.dsa_tbl_cache.lock().unwrap();
-            let keys: Vec<(usize, Vec<u64>)> = m
-                .keys()
-                .filter(|(_, s)| s.contains(&seq))
-                .cloned()
-                .collect();
-            for k in keys {
-                if let Some(t) = m.remove(&k) {
-                    unsafe {
-                        cudaFree(t.kn);
-                        cudaFree(t.v);
-                        cudaFree(t.kidx);
-                        cudaFree(t.kgate);
-                        cudaFree(t.t0p);
-                        cudaFree(t.totp);
-                    }
-                }
-            }
-        }
+        // 4/5. The batched GDN/DSA tables are now keyed by (layer|family,
+        // SIZE) and shared across seq-sets — their device addresses must stay
+        // stable for per-size graph reuse, and their content (the per-seq
+        // state pointers) is refreshed on every call, so a freed seq's stale
+        // pointer is overwritten before the next replay. Nothing to purge.
         Ok(())
     }
 
