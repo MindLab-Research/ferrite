@@ -2530,10 +2530,16 @@ __global__ void gemm_bf16_mma_kernel(const float* __restrict__ a,        // [16,
         unsigned a1 = *(const unsigned*)&sa[group + 8][tig * 2];
         unsigned a2 = *(const unsigned*)&sa[group][tig * 2 + 8];
         unsigned a3 = *(const unsigned*)&sa[group + 8][tig * 2 + 8];
-        // B (weights) col-major kxn: lane's b0 = W[n0+group][k0+2tig .. +1]
-        const __nv_bfloat16* br = b + (size_t)(n0 + group) * K + k0 + tig * 2;
-        unsigned b0 = *(const unsigned*)br;
-        unsigned b1 = *(const unsigned*)(br + 8);
+        // B (weights) col-major kxn: lane's b0 = W[n0+group][k0+2tig .. +1].
+        // Guard the tail block (n0+group >= N) — an unguarded load faulted
+        // with Xid 31 MMU at out_f not divisible by 32.
+        const int nrow = n0 + group;
+        unsigned b0 = 0u, b1 = 0u;
+        if (nrow < N) {
+            const __nv_bfloat16* br = b + (size_t)nrow * K + k0 + tig * 2;
+            b0 = *(const unsigned*)br;
+            b1 = *(const unsigned*)(br + 8);
+        }
         asm volatile(
             "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
