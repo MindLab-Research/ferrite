@@ -892,11 +892,15 @@ impl<B: KernelBackend> TpCluster<B> {
         // change (measured: 8 captures while 16 requests streamed in →
         // throughput collapsed to 74 tok/s).
         let n = seqs.len();
-        let size = [1usize, 2, 4, 8, 16, 32]
-            .iter()
-            .copied()
-            .find(|&s| s >= n)
-            .unwrap_or(n);
+        let size = if std::env::var_os("FERRITE_NO_PAD").is_some() {
+            n // bisect knob: no padding (graph per exact size)
+        } else {
+            [1usize, 2, 4, 8, 16, 32]
+                .iter()
+                .copied()
+                .find(|&s| s >= n)
+                .unwrap_or(n)
+        };
         let gname = format!("megab_b{size}");
         let mut pseqs: Vec<u64> = seqs.to_vec();
         pseqs.resize(size, u64::MAX); // padded rows → dummy states
