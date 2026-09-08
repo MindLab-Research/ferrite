@@ -4664,6 +4664,7 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     float* cb = sm + mix;                // [n*n]
     float* ps = sm + mix + n * n;        // [n] pre_s (per-block copy)
     float* red = sm + mix + n * n + n;   // [48]
+    float* xs = red + 48;                // [n * hpb] cp.async staging of the x rows
     __shared__ float red8[8];
     __shared__ int last;
     __shared__ float inv_s;
@@ -4697,20 +4698,29 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     // i-ascending FMA chain (same numeric order as the old in-smem P3).
     float acc = 0.f;
     if (col < h) {
-        // UNROLLED: n is a runtime value, so without this the 16 rows were
-        // read by 16 SERIAL global loads (~600ns each = ~9.6us of the 12us
-        // per-block latency). Unrolling overlaps them.
-        // 4 accumulators (see P1): unroll only overlaps the loads, the fp
-        // accumulator chain stays serial unless split explicitly.
+        // cp.async stage ALL n x-rows for this column block up front: the 16
+        // strided global loads (~600ns each, 16KB apart -> ~9.6us of the 12us
+        // per-block latency) now fly concurrently instead of 4 at a time.
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            if (i < n) {
+                const unsigned dst = (unsigned)__cvta_generic_to_shared(&xs[i * hpb + threadIdx.x]);
+                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                             :: "r"(dst), "l"(x + (size_t)i * h + col));
+            }
+        }
+        asm volatile("cp.async.commit_group;\n");
+        asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
         float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
         int i = 0;
         for (; i + 3 < n; i += 4) {
-            p0 += ps[i]     * x[(size_t)(i)     * h + col];
-            p1 += ps[i + 1] * x[(size_t)(i + 1) * h + col];
-            p2 += ps[i + 2] * x[(size_t)(i + 2) * h + col];
-            p3 += ps[i + 3] * x[(size_t)(i + 3) * h + col];
+            p0 += ps[i]     * xs[(i)     * hpb + threadIdx.x];
+            p1 += ps[i + 1] * xs[(i + 1) * hpb + threadIdx.x];
+            p2 += ps[i + 2] * xs[(i + 2) * hpb + threadIdx.x];
+            p3 += ps[i + 3] * xs[(i + 3) * hpb + threadIdx.x];
         }
-        for (; i < n; i++) p0 += ps[i] * x[(size_t)i * h + col];
+        for (; i < n; i++) p0 += ps[i] * xs[i * hpb + threadIdx.x];
         acc = (p0 + p1) + (p2 + p3);
         li[(size_t)t * h + col] = acc;   // li_raw staged in place (P5 overwrites)
     }
@@ -4833,7 +4843,7 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     if (e != cudaSuccess) return e;
 
     dim3 p345_grid(s, NB);
-    size_t smem_r = (size_t)(mix + n * n + n + 48) * sizeof(float);
+    size_t smem_r = (size_t)(mix + n * n + n + 48 + n * hpb) * sizeof(float);  // + xs staging
     if (ferrite_pdl_enabled()) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = p345_grid; cfg.blockDim = dim3(256);
