@@ -784,6 +784,10 @@ impl<B: KernelBackend> Engine<B> {
                             x_len: x.numel(),
                             out_dev: partial.as_f32() as *mut std::ffi::c_void,
                             out_len: n * self.cfg.hidden_size,
+                            in_dev: std::ptr::null_mut(),
+                            in_n: 0,
+                            in_hidden: 0,
+                            in_mult: 0,
                         },
                     );
                     std::mem::forget(x_dev);
@@ -1239,6 +1243,10 @@ impl<B: KernelBackend> Engine<B> {
                     x_len: x.numel(),
                     out_dev: out_dev.as_f32() as *mut std::ffi::c_void,
                     out_len: n * hidden,
+                    in_dev: std::ptr::null_mut(),
+                    in_n: 0,
+                    in_hidden: 0,
+                    in_mult: 0,
                 },
             );
             std::mem::forget(x_dev);

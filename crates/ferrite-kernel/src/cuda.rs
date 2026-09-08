@@ -4403,6 +4403,18 @@ pub struct GraphIO {
     pub x_len: usize,
     pub out_dev: *mut std::ffi::c_void,
     pub out_len: usize,
+    /// The graph's INPUT DEVICE buffer (res_dev — the stage→dev memcpy's
+    /// destination). Present when captured with a DevBuf input (mega graphs);
+    /// the device-embed replay path (graph_run_dev_input) writes it via
+    /// embed_expand_dev instead of the host staging (12B of token ids vs
+    /// n*mult*hidden f32 of host embed+hc_expand+staging — ~1ms host per
+    /// MTP verify step).
+    pub in_dev: *mut std::ffi::c_void,
+    /// Input row count n (the embed kernel's grid) + hidden/mult for
+    /// embed_expand_dev; 0 = no device input path (host staging only).
+    pub in_n: usize,
+    pub in_hidden: usize,
+    pub in_mult: usize,
 }
 unsafe impl Send for GraphIO {}
 unsafe impl Sync for GraphIO {}
@@ -4431,6 +4443,59 @@ impl CudaBackend {
         }
         self.graph_io.lock().unwrap().remove(name);
     }
+    /// Device-input graph replay: the capture recorded embed_expand_dev as
+    /// the graph's FIRST node (the input is n×4B TOKEN IDS in a device
+    /// buffer, not the n*mult*hidden f32 staging). Host writes the ids
+    /// (12B H2D at n=3) → replay → out D2H. Replaces the host embed
+    /// lookup + hc_expand + 576KB pinned staging write (~1ms of the MTP
+    /// verify step's host budget).
+    pub fn graph_run_ids(
+        &self,
+        name: &str,
+        ids: &[u32],
+        ids_dev: *mut i32,
+        out: &mut [f32],
+    ) -> Result<bool> {
+        let Some(io) = self.graph_io_get(name) else { return Ok(false); };
+        if io.in_n == 0 || ids.len() != io.in_n || out.len() != io.out_len {
+            return Err(FerriteError::InvalidArg(format!(
+                "graph_run_ids {name}: ids {} != in_n {} or out {} != {} (device-input path not captured)",
+                ids.len(), io.in_n, out.len(), io.out_len
+            )));
+        }
+        self.enter();
+        let idata: Vec<i32> = ids.iter().map(|&t| t as i32).collect();
+        ck(
+            unsafe {
+                cudaMemcpyAsync(
+                    ids_dev as *mut std::ffi::c_void,
+                    idata.as_ptr() as *const std::ffi::c_void,
+                    idata.len() * 4,
+                    CUDA_MEMCPY_H2D,
+                    self.stream,
+                )
+            },
+            "ids H2D",
+        )?;
+        if !self.graph_replay(name) {
+            return Ok(false);
+        }
+        ck(
+            unsafe {
+                cudaMemcpyAsync(
+                    out.as_mut_ptr() as *mut std::ffi::c_void,
+                    io.out_dev,
+                    out.len() * 4,
+                    CUDA_MEMCPY_D2H,
+                    self.stream,
+                )
+            },
+            "graph_run_ids D2H",
+        )?;
+        self.sync()?;
+        Ok(true)
+    }
+
     /// Replay a segment graph with fresh input: write `input` to the
     /// captured staging, launch, download the output. (capture never
     /// executes — this is the steady-state path)

@@ -1383,8 +1383,13 @@ impl<B: KernelBackend> TpCluster<B> {
         for d in &drafts {
             toks_in.push(*d as u32);
         }
-        let h2v = self.shards[0].embed(&toks_in);
-        let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
+        // DEVICE-EMBED verify input: the mega_v graph was captured with
+        // embed_expand_dev as its FIRST node (dev_embed) — replay writes
+        // n_v×4B token ids into tokens_dev (graph_run_ids) instead of the
+        // host embed lookup + hc_expand + 576KB pinned staging (~1ms host
+        // per verify step). The embed kernel reads the F32 table cache
+        // (bit-identical to the host lookup) — hc_expand semantics = row
+        // copy × mult, identical.
         let toks_v = Self::fan_out(&mut self.shards, |s| {
             let cuda = s
                 .backend
@@ -1396,8 +1401,22 @@ impl<B: KernelBackend> TpCluster<B> {
                 cuda.dsa_host_advance(seq, f, n_v);
             }
             let mut out = vec![0f32; n_v];
-            if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
-                return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
+            let ids_dev = {
+                let m = cuda.mtp.lock().unwrap();
+                m.as_ref().map(|m| m.tokens_dev.as_f32() as *mut i32)
+            };
+            let ran = match ids_dev {
+                Some(p) => cuda.graph_run_ids(&gvname, &toks_in, p, &mut out)?,
+                None => false,
+            };
+            if !ran {
+                // fallback: host embed + staging (graph NOT captured with the
+                // device-embed path — e.g. legacy graphs before this change)
+                let h2v = s.embed(&toks_in);
+                let in_vals = crate::mhc::hc_expand(&h2v, hc_mult);
+                if !cuda.graph_run(&gvname, in_vals.as_slice(), &mut out)? {
+                    return Err(FerriteError::InvalidArg(format!("mega_v graph {gvname} missing")));
+                }
             }
             // Accept + commit fused into the verify worker (was a THIRD
             // fan_out round-trip): drafts/argmax are bit-identical across
@@ -2235,7 +2254,35 @@ fn mega_chain_dev(
     }
 
     let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
-    res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
+    // capture-time res pointer (BEFORE the hc_post chain reassigns res —
+    // the GraphIO's in_dev must reference the graph input buffer, the one
+    // embed_expand_dev writes / the stage memcpy fills).
+    let res_in_ptr = res.as_f32() as *mut std::ffi::c_void;
+    // Device-embed graph input (MTP graphs): when capturing AND MtpState has
+    // the fixed tokens_dev buffer, record embed_expand_dev as the graph's
+    // FIRST node — replay writes n×4B token ids into tokens_dev (graph_run_ids)
+    // instead of n*mult*hidden f32 host staging (~1ms of the verify step's
+    // host budget: host embed lookup + hc_expand + 576KB pinned write).
+    // The kernel reads the F32 embed cache (dev_weight — bit-identical to the
+    // host lookup; the bf16-table era's 1-ulp accept crash does not apply) and
+    // writes res directly (row copy + mult replication = hc_expand semantics).
+    // Dry-run keeps the host staging (its sampled token needs REAL input).
+    let ids_dev_cap: Option<*mut i32> = {
+        let m = cuda.mtp.lock().unwrap();
+        m.as_ref().map(|m| m.tokens_dev.as_f32() as *mut i32)
+    };
+    let dev_embed = capture && ids_dev_cap.is_some();
+    if dev_embed {
+        let table = s.w("model.embed_tokens.weight")?;
+        cuda.embed_expand_dev_buf(
+            table,
+            ids_dev_cap.unwrap() as *const i32,
+            res.as_f32(),
+            n, hidden, hc_mult,
+        )?;
+    } else {
+        res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
+    }
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
     mprobe!("res0", &res, nh);
 
@@ -2501,6 +2548,13 @@ fn mega_chain_dev(
                 x_len: n * nh,
                 out_dev: arg.as_f32() as *mut std::ffi::c_void,
                 out_len: n,
+                // Device-embed input path: in_dev = the capture-time res buffer
+                // (embed_expand_dev's output target — the graph's first node);
+                // in_n>0 marks the graph as ids-input (graph_run_ids).
+                in_dev: if dev_embed { res_in_ptr } else { std::ptr::null_mut() },
+                in_n: if dev_embed { n } else { 0 },
+                in_hidden: if dev_embed { hidden } else { 0 },
+                in_mult: if dev_embed { hc_mult } else { 0 },
             },
         );
         std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
@@ -2823,6 +2877,10 @@ fn mega_chain_dev_batched(
                 x_len: n * nh,
                 out_dev: arg.as_f32() as *mut std::ffi::c_void,
                 out_len: n,
+                in_dev: std::ptr::null_mut(),
+                in_n: 0,
+                in_hidden: 0,
+                in_mult: 0,
             },
         );
         std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
@@ -2950,6 +3008,10 @@ fn attn_shard(
                     x_len: hn.numel(),
                     out_dev: partial.as_f32() as *mut std::ffi::c_void,
                     out_len: n * hidden,
+                    in_dev: std::ptr::null_mut(),
+                    in_n: 0,
+                    in_hidden: 0,
+                    in_mult: 0,
                 },
             );
             std::mem::forget(x_dev);
