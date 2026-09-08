@@ -1211,15 +1211,14 @@ impl<B: KernelBackend> TpCluster<B> {
                 // advance(1) pins t0=T). The dry appends are the first step's
                 // correct KV (same inputs: last, hf-seeded hprev, catch-up
                 // cache) — the first replay overwrites them bit-identically.
-                // capture only in graph mode "1": mode "2" (host-serial device
-                // chain) must run WITHOUT the capture pass's side effects to
-                // separate "capture+dry" from "the device chain itself".
+                // capture in graph modes ("1"/default): mode "2" (host-serial
+                // device chain) and "0" (host chain) skip it.
                 // FERRITE_DRAFT_DRY_ONLY=1 skips the capture pass (dry only) —
                 // bisects dry's real-execution side effects from the capture
                 // pass's leaked pool buffers.
-                if matches!(
+                if !matches!(
                     std::env::var("FERRITE_DRAFT_GRAPH").as_deref(),
-                    Ok("1") | Ok("2")
+                    Ok("0") | Ok("2")
                 ) {
                     let nd = n_v - 1;
                     // dry: tokens_dev[0] ← last, then the nd-step chain (real
@@ -1443,15 +1442,13 @@ impl<B: KernelBackend> TpCluster<B> {
         //    Fallback: the original host chain (embed lookup + upload +
         //    mtp_forward per draft).
         let draft_env = std::env::var("FERRITE_DRAFT_GRAPH").unwrap_or_default();
-        // DEFAULT OFF: the graph-resident draft chain measured NO step-time
-        // gain (20.3ms vs the host chain's 20.5ms — the draft segment is
-        // GPU-serial (draft i+1 needs draft i's h/token), so the host launch
-        // overhead the graphs remove was already hidden under GPU execution)
-        // and its accept regressed 2.37 -> 1.93 (the device chain's d1
-        // diverges from the host chain's — bisected but not root-caused).
-        // FERRITE_DRAFT_GRAPH=1 re-enables it for debugging; =2 runs the
-        // device chain host-serial (bisect mode).
-        let graph_drafts = draft_env == "1" || draft_env == "2";
+        // DEFAULT ON (2026-09-08): the graph-resident draft chain
+        // mega_d{seq}_{i} — the h_out forget bug (forget(&DevBuf) no-op) that
+        // caused the accept regression is FIXED; verified accept 2.39 @
+        // 116.8 tok/s (host-chain baseline 2.41/117.6). FERRITE_DRAFT_GRAPH=0
+        // falls back to the host chain; =2 runs the device chain host-serial
+        // (bisect mode).
+        let graph_drafts = draft_env != "0";
         // mode "2": execute the SAME device chain host-serial (no graph
         // replay) — bisects a draft divergence between the chain itself
         // (embed_one_dev / cast_store / h_d relays) and capture/replay.
@@ -1615,7 +1612,13 @@ impl<B: KernelBackend> TpCluster<B> {
                         if !cuda.graph_replay(&gname) {
                             return Err(FerriteError::InvalidArg(format!("draft graph {gname} missing")));
                         }
-                        if i + 1 < nd {
+                        if i + 1 < nd && std::env::var_os("FERRITE_DRAFT_SYNC").is_some() {
+                            // Pinned t0 race guard: the NEXT advance overwrites
+                            // the pinned slot the just-launched graph's kernels
+                            // read. FERRITE_DRAFT_SYNC=1 forces the stream sync
+                            // (belt-and-braces); default relies on the GPU
+                            // consuming the pinned value before the next host
+                            // write lands (measured accept-identical).
                             cuda.sync()?;
                         }
                     }
