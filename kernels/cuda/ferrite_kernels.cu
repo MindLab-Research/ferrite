@@ -3908,36 +3908,49 @@ __global__ void kpool_compress_batched_kernel(
     float* __restrict__ pool_keys,               // [B, max_npools, idm]
     const int* const* __restrict__ total_tbl,    // [B] per-seq PINNED total ptrs
     int B, int max_npools, int kpool, int idm) {
+    // float4 over d: one element per thread made each of the kpool loads a
+    // separate strided 4-byte access (median 114us/call).
+    const int idm4 = idm >> 2;
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t per = (size_t)max_npools * idm;
-    if (tid >= (size_t)B * per) return;
-    int seq = (int)(tid / per);
-    size_t rem = tid % per;
-    int p = (int)(rem / idm), d = (int)(rem % idm);
+    size_t per4 = (size_t)max_npools * idm4;
+    if (tid >= (size_t)B * per4) return;
+    int seq = (int)(tid / per4);
+    size_t rem = tid % per4;
+    int p = (int)(rem / idm4), d4 = (int)(rem % idm4);
     int total = *total_tbl[seq];
     int npools = (total + kpool - 1) / kpool;
     if (p >= npools) return;
     const float* k_idx = kidx_tbl[seq];
     const float* k_gate = kgate_tbl[seq];
-    float lmax = -INFINITY;
+    const int d = d4 * 4;
+    float4 lmax = make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
     for (int j = 0; j < kpool; j++) {
         int t = p * kpool + j;
         if (t < total) {
-            float lv = k_gate[(size_t)t * idm + d] + ape[(size_t)j * idm + d];
-            if (lv > lmax) lmax = lv;
+            const float4 g = *reinterpret_cast<const float4*>(k_gate + (size_t)t * idm + d);
+            const float4 a = *reinterpret_cast<const float4*>(ape + (size_t)j * idm + d);
+            lmax.x = fmaxf(lmax.x, g.x + a.x);
+            lmax.y = fmaxf(lmax.y, g.y + a.y);
+            lmax.z = fmaxf(lmax.z, g.z + a.z);
+            lmax.w = fmaxf(lmax.w, g.w + a.w);
         }
     }
-    if (lmax == -INFINITY) return;
-    float den = 0.f, num = 0.f;
+    if (lmax.x == -INFINITY) return;
+    float4 den = make_float4(0.f, 0.f, 0.f, 0.f), num = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int j = 0; j < kpool; j++) {
         int t = p * kpool + j;
         if (t < total) {
-            float wgt = expf(k_gate[(size_t)t * idm + d] + ape[(size_t)j * idm + d] - lmax);
-            den += wgt;
-            num += wgt * k_idx[(size_t)t * idm + d];
+            const float4 g = *reinterpret_cast<const float4*>(k_gate + (size_t)t * idm + d);
+            const float4 a = *reinterpret_cast<const float4*>(ape + (size_t)j * idm + d);
+            const float4 idxv = *reinterpret_cast<const float4*>(k_idx + (size_t)t * idm + d);
+            const float4 w = make_float4(__expf(g.x + a.x - lmax.x), __expf(g.y + a.y - lmax.y),
+                                         __expf(g.z + a.z - lmax.z), __expf(g.w + a.w - lmax.w));
+            den.x += w.x; den.y += w.y; den.z += w.z; den.w += w.w;
+            num.x += w.x * idxv.x; num.y += w.y * idxv.y; num.z += w.z * idxv.z; num.w += w.w * idxv.w;
         }
     }
-    pool_keys[(size_t)seq * per + (size_t)p * idm + d] = num / den;
+    const float4 res = make_float4(num.x / den.x, num.y / den.y, num.z / den.z, num.w / den.w);
+    *reinterpret_cast<float4*>(pool_keys + (size_t)seq * (size_t)max_npools * idm + (size_t)p * idm + d) = res;
 }
 
 // 3. indexer topk: one 256-thread block per seq — score ALL pools of its
@@ -4241,7 +4254,7 @@ extern "C" cudaError_t ferrite_kpool_compress_batched(
     const float* const* kidx_tbl, const float* const* kgate_tbl,
     const float* ape, float* pool_keys, const int* const* total_tbl,
     int B, int max_npools, int kpool, int idm, cudaStream_t s) {
-    size_t total_t = (size_t)B * (size_t)max_npools * idm;
+    size_t total_t = (size_t)B * (size_t)max_npools * (idm >> 2);
     int threads = 256;
     int blocks = (int)((total_t + threads - 1) / threads);
     kpool_compress_batched_kernel<<<blocks, threads, 0, s>>>(

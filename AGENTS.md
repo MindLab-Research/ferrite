@@ -138,6 +138,28 @@ Other profiling rules:
 
 ## 2026-09-08 会话结论：通信不是瓶颈（A/B 实测），计算才是
 
+**用户目标**：16 并发 ≥1600 tok/s（不开 MTP）；若用 MTP 则目标 3200。**当前：18.8 ms/步 = 851 tok/s**（会话内从 546 提升 **+56%**，每次改动都人眼验证文本）。
+
+**决定性 A/B（同一 16-seq 负载，`FERRITE_AR_SKIP=1` 跳过全部 AR）**：跳 AR 22.05 ms vs 带 P2P AR 23.06 ms → **通信只占 1.78 ms = 7.5%**。32 并发同样（NO-AR 95.5 vs 102.8）。**"通信占 64%" 是陈旧读数**（`p2p_ar_publish` 的 max=55.6ms 是 dry-run/capture 期自旋超时；其稳态中位数只有 5.1µs）。
+
+**本会话的有效 kernel 优化（全部文本验证，累计 29.33→18.8 ms）**：
+1. **moe_fused_down 16 字节 lane**（每 lane uint4 覆盖 2 个连续 h 行，klen=256）：**7.5 → 1.9 ms**。根因：8 字节 lane 只有 1.16TB/s（request-rate 受限）。坑：scale 列索引必须 `(lane&15)>>3`；补丁内重复声明 `py[8]` 会遮蔽外层 → 输出全零。
+2. **moe_fused_act padded per-warp smem staging**：A 片段 4B 跨 8 行 = 每指令只用到 32B sector 的一半。暂存 16 行 × 64 列 × 2 投影，**行距 padding 到 80B**（64B 会让每行落 bank 0 → 8 路冲突，反而慢）。act 74 → 62.8 µs。
+3. **indexer 8 线程/pool**（原来是每线程串行 4096-MAC 点积，GPU 利用率 ~1%）：中位 100 → 32 µs。**shuffle 必须用 8-lane 组掩码**（0xffffffff 会让没有 pool 的组跳过 → 捕获死锁）。
+4. **sparse_attn 输出 float4 + 4 槽位分组**（原来 4 字节读、跨槽 64KB 零合并）：121 → 51 µs（2.4x）。
+5. **hc_pre_mix 4 行/block**（x 原来被 24 个 mix 行各读一遍 → L2 受限）：11.8 → 9.5 µs。
+6. **gemv_fp8 8 行/组 + x 寄存器缓存**（x 原被每 (block,row) 重读）：51.7 → 41.7 µs。
+7. sparse_attn 的 live_k 边界（原按固定 select_k_max=2048 循环）+ indexer 短上下文快路径。
+8. dense-FFN / GDN host 路径的 AR 改 P2P 优先；run_matmul 走快路径。
+
+**已验证无效/更差（勿重复）**：gemv row-major、down TT=1/8/16、ROWS=16/64、gemv R=8（无 x 缓存时）、gemv 1024 线程/block、K 循环 unroll 4、token 循环 unroll 2、去掉 fp8 转换链（仅省 4.5% → 非转换瓶颈）、act 的共享 sa staging、HC_MIX_KS 8→2。
+
+**当前每步每卡分解（nsys，~300 步反推）**：p2p_ar_publish ~1.8（含 barrier）/ **moe_act 3.4** / matmul_tiled_bf16 3.3（多为 prefill）/ **gemv_fp8 2.4** / **moe_down 2.1** / **indexer 1.6** / hc_rest345 1.34 / hc_mix 1.04 / kpool 1.0 / gdn_chunk 1.0 / gdn_step 0.6 / sparse_attn 0.6 / NCCL AR 残余 0.64。
+
+**下一步（按预期收益）**：① moe_act 仍 62% 峰值（3.4ms）——试 128 列 staging 或 2-token/block；② indexer 的 139µs 平均（中位 32µs，长尾待查）；③ kpool_compress 中位 114µs（11 次/步）；④ gdn_chunk/step 1.6ms；⑤ AR：publish 中位 5.1µs×90=0.46ms，可试 per-block flag 省掉 publish kernel。
+
+## B=16 通信 vs 计算：实测推翻旧结论（2026-09-08 late, perf-b1）
+
 **用户目标**：16 并发 ≥1600 tok/s（不开 MTP）；若用 MTP 则目标 3200。**当前：21.2 ms/步 = 755 tok/s**（会话内从 546 提升 +38%，每次改动都人眼验证文本）。
 
 **决定性 A/B（同一 16-seq 负载，`FERRITE_AR_SKIP=1` 跳过全部 AR）**：跳 AR 22.05 ms vs 带 P2P AR 23.06 ms → **通信只占 1.78 ms = 7.5%**。32 并发同样（NO-AR 95.5 vs 102.8）。**"通信占 64%" 是陈旧读数**（`p2p_ar_publish` max=55.6ms 是 dry-run/capture 期自旋超时）。
