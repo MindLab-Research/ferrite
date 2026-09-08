@@ -1,5 +1,19 @@
 # 16-seq decode 性能路线图（2026-09-08 会话结论）
 
+> **当前最好（已验证，文本人眼确认）**：300-token 窗口 16.23-16.48ms/步 = **971-985 tok/s**；
+> 1000-token 窗口 ~17.9ms = **893-895 tok/s**。目标 1600（不开 MTP）。会话内 546 → ~975（+79%）。
+>
+> **下一步按优先级**：
+> 1. **MoE 专家分组**（act/down 仅 DRAM 峰值 30-53%；按专家聚簇改善 L2/DRAM 行局部性，预期 2-3%）
+> 2. **sparse_attn 双侧半精度 + warp 级折回**（k 侧单独做过 = 回归；必须 k+v 同时改才摊得平转换开销）
+> 3. **tensor-core attention**（decode 的 M=1 无法直接拼 GEMM；需按 seq 分块 + 在线 softmax，属大重写）
+>
+> **不要再试**（已实测证伪）：gemv WPR=2/unroll4/T=4、act 2-tile 寄存器预取、act 32-K tile、
+> hc_pre_mix 8 行、HC_MIX_KS=16、gdn_step_v2 批量、PDL、rmsnorm block 单独调大、
+> sparse_attn TG=4（gmask 不匹配会挂）、fp16 k-only 缓存、down 的 cp.async（每 lane 私有数据）。
+> **每次改动必须**：看 build error 数 → 同窗口 A/B → 人眼验证文本。
+
+
 ## 目标与现状
 
 - 目标：16 并发、**不开 MTP**、decode ≥ **1600 tok/s**（SGLang 同配置实测）。开 MTP 则目标 3200。
