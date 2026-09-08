@@ -1612,13 +1612,12 @@ impl<B: KernelBackend> TpCluster<B> {
                         if !cuda.graph_replay(&gname) {
                             return Err(FerriteError::InvalidArg(format!("draft graph {gname} missing")));
                         }
-                        if i + 1 < nd && std::env::var_os("FERRITE_DRAFT_SYNC").is_some() {
-                            // Pinned t0 race guard: the NEXT advance overwrites
-                            // the pinned slot the just-launched graph's kernels
-                            // read. FERRITE_DRAFT_SYNC=1 forces the stream sync
-                            // (belt-and-braces); default relies on the GPU
-                            // consuming the pinned value before the next host
-                            // write lands (measured accept-identical).
+                        if i + 1 < nd {
+                            // Pinned t0 race guard (MEASURED NECESSARY: without
+                            // it accept drops 2.39 → 2.22 — the next advance's
+                            // host write to the shared pinned t0 slot lands
+                            // before the just-launched graph's dsa kernels read
+                            // it). Cost is ~0 (step 20.5 vs 20.6ms).
                             cuda.sync()?;
                         }
                     }
