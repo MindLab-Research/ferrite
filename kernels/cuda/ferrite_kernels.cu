@@ -5023,6 +5023,7 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
     const float* partial, float* const* staging_tbl,
     unsigned* const* ready_tbl, unsigned* epoch, unsigned* ctr,
     const float* staging_local, const unsigned* ready_local,
+    unsigned* seen,
     float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
     // 1024-thread blocks: the old 256-thread grid (16 blocks at n=4096) made
     // every block contend on the same atomicAdd(ctr) and pay its own
@@ -5037,7 +5038,7 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
     if (blocks < 1) blocks = 1;
     p2p_ar_fused_v3_kernel<<<blocks, threads, 0, s>>>(
         partial, staging_tbl, ready_tbl, epoch, ctr,
-        staging_local, ready_local, out, world, my_rank, n, stride);
+        staging_local, ready_local, seen, out, world, my_rank, n, stride);
     return cudaGetLastError();
 }
 
