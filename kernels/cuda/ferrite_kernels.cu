@@ -3453,7 +3453,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
 // (fp8) AND computes e4m3 x e4m3 directly (no per-element cvt).
 // smem: xq[hidden] + reduce[256] + xs[1] + gate sacc[8][16] + up sacc[8][16].
 // ============================================================
-__global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
+__global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
     const float* __restrict__ x,          // [n, hidden]
     const float* __restrict__ ids_f,      // [n, topk]
     const unsigned char* const* __restrict__ gate_w8_ptrs,   // [e_local] [inter, hidden] e4m3
@@ -3568,7 +3568,7 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
     // prefetch still stalled ~536 cycles/tile (600-cycle DRAM latency vs the
     // ~64 cycles of MMA work) — that is why the 2-tile *register* prefetch was
     // slower (32 extra registers); cp.async costs smem instead (40KB/block).
-    __shared__ unsigned char sa[2][8][2 * 16 * 80];
+    __shared__ unsigned char sa[3][8][2 * 16 * 80];   // 3-deep pipeline (60KB)
     #define ACT_ISSUE(TILE, BUF) do { \
         for (int t = lane; t < 128; t += 32) { \
             const int proj = t >> 6, off = t & 63; \
@@ -3581,9 +3581,12 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
         asm volatile("cp.async.commit_group;\n"); \
     } while (0)
     ACT_ISSUE(k0, 0);
+    if (k0 + 64 < k1) ACT_ISSUE(k0 + 64, 1);
     int sbuf = 0;
-    for (int kb = k0; kb < k1; kb += 64, sbuf ^= 1) {
-        asm volatile("cp.async.wait_group 0;\n");
+    for (int kb = k0; kb < k1; kb += 64, sbuf = (sbuf + 1) % 3) {
+        // keep one copy in flight (2-deep lookahead); drain fully at the tail
+        if (kb + 128 < k1) asm volatile("cp.async.wait_group 1;\n");
+        else asm volatile("cp.async.wait_group 0;\n");
         __syncwarp();
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
@@ -3633,7 +3636,7 @@ __global__ void __launch_bounds__(256, 5) moe_fused_act_fp8_mma_kernel(
         }
         // Safe to fill the OTHER buffer now: this iteration's MMA operands are
         // already in registers.
-        if (kb + 64 < k1) ACT_ISSUE(kb + 64, sbuf ^ 1);
+        if (kb + 128 < k1) ACT_ISSUE(kb + 128, (sbuf + 2) % 3);
     }
     #undef ACT_ISSUE
     if ((lane & 3) == 0) {
