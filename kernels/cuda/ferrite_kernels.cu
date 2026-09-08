@@ -4470,38 +4470,15 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     float sq = 0.f;
-    // cp.async double-buffered staging of the 4 weight rows, one 256-element
-    // chunk ahead: each thread reads only its OWN slot (threadIdx.x), so no
-    // __syncthreads is needed — just the per-thread wait. The previous
-    // `#pragma unroll 4` still stalled on the L2 (4 loads/iter, ~300 cycles
-    // vs ~16 FMA of compute).
-    __shared__ float wsm[2][4][256];
-    const int nit = (hi - lo + 255) >> 8;
-    #define MIX_ISSUE(CH, BUF) do { \
-        const int idx_ = lo + (CH) * 256 + threadIdx.x; \
-        if (idx_ < hi) { \
-            _Pragma("unroll") \
-            for (int mm_ = 0; mm_ < 4; mm_++) { \
-                const unsigned dst_ = (unsigned)__cvta_generic_to_shared(&wsm[BUF][mm_][threadIdx.x]); \
-                asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" :: "r"(dst_), "l"(row0 + (size_t)mm_ * nh + idx_)); \
-            } \
-        } \
-        asm volatile("cp.async.commit_group;\n"); \
-    } while (0)
-    MIX_ISSUE(0, 0);
-    int mbuf = 0;
-    for (int mc = 0; mc < nit; mc++, mbuf ^= 1) {
-        asm volatile("cp.async.wait_group 0;\n");
-        if (mc + 1 < nit) MIX_ISSUE(mc + 1, mbuf ^ 1);
-        const int i = lo + mc * 256 + threadIdx.x;
-        if (i < hi) {
-            const float xv = x[i];             // ONE x read serves 4 rows
-            sq += xv * xv;                     // Σx² rides free
-            #pragma unroll
-            for (int mm = 0; mm < 4; mm++) acc[mm] += wsm[mbuf][mm][threadIdx.x] * xv;
-        }
+    // unroll 4: 5 independent loads per iteration (x + 4 weight rows) — without
+    // the unroll the compiler serialized them and the loop stalled on the L2.
+    #pragma unroll 4
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const float xv = x[i];                 // ONE x read serves 4 rows
+        sq += xv * xv;                         // Σx² rides free
+        #pragma unroll
+        for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
     }
-    #undef MIX_ISSUE
     __shared__ float red[8];
     #pragma unroll
     for (int mm = 0; mm < 4; mm++) {
