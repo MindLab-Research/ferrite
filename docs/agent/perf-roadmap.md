@@ -425,3 +425,9 @@ accept/commit 按「一个 seq 的 n 个 token」索引）。批量场景下多 
 
 `cp.async.cg.shared.global` → `cp.async.cg.shared.global.L2::128B`（对顺序流的专家权重提高
 L2 预取粒度）：per-seq 59.3-59.8 → **59.2-60.3**（略优），replay 989.5-991.1，文本正确。保留。
+
+### 有效：sparse_attn TG 8→4 重做成功（配 4 车道 gmask，+0.4%）
+
+之前 TG=4 挂起的**真正原因**是 `gmask = 0xffu << ((tid & 31) & ~7u)`（8 车道掩码）没同步改成
+`0xfu << (... & ~3u)`。两个一起改后：per-seq 59.3-60.3 → **60.1-60.9（聚合 962-974）**，文本正确。
+**教训：lane-group 常量（TG / gmask / shuffle 步长）必须一起改；只改一处会挂死而不是报错。**
