@@ -3207,10 +3207,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         const int cnt = (nt - base < MAXN) ? (nt - base) : MAXN;
         if (j <= topk) {
         float py[8];
-        // unroll 2: the per-token pointer chase (down_w8_ptrs[local] -> the
-        // weight rows) is a 2-level dependent load; overlapping two tokens
-        // keeps a second chase in flight while the first's rows land.
-        #pragma unroll 2
         for (int tt = 0; tt < cnt; tt++) {
         const int tok = base + tt;
         const float* act_t = act + (size_t)tok * stride;
@@ -3479,8 +3475,11 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     for (int kb = k0; kb < k1; kb += 128) {
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
+        // No `break` guard: it never triggers (k1 is a 128-multiple here) and
+        // a data-dependent break inside the loop blocks unrolling, leaving one
+        // A-fragment load in flight at a time.
+        #pragma unroll
         for (int kk = kb; kk < kb + 128; kk += 32) {
-            if (kk + 32 > k1) break;
             unsigned ba[4];  // A fragments: rows m0+r0 / m0+r0+8 (shared by gate+up)
             ba[0] = *(const unsigned*)(gw8 + (size_t)(m0 + r0) * hidden + kk + c0);
             ba[1] = *(const unsigned*)(gw8 + (size_t)(m0 + r0 + 8) * hidden + kk + c0);
