@@ -393,3 +393,15 @@ unroll 4 时已经饱和（5 load/轮 × 4 = 20 个在飞），再加只增寄�
 `router_gemm_route_fused_kernel` 的内层是**每线程 512 次迭代全部加到单个 `acc`** 的串行链
 （hidden/8 = 512，blockDim=256）。拆成 4 路后：16.27 → **16.16-16.17ms（989.7-990.3 tok/s）**，
 文本正确。这是本会话"单累加器点积"审计的第 3 个命中（前两个：GDN 6 处 +0.5%、gemv half2 双链 +0.1%）。
+
+## 指标判读：`[megab] replay` 行在长上下文下低估 ~8%，以 per-seq steady 为准
+
+同一 build、同一窗口并排测：
+| 窗口 | per-seq steady | ×16 聚合 | [megab] replay 行 |
+|---|---|---|---|
+| 300-token | 59.8-59.9 tok/s | **957** | 990 |
+| 1000-token | 56.8-56.9 tok/s | **909** | 841-843 |
+
+replay 行在 1000-token 时比端到端低 8%（它把 capture/dry-run 期的慢步也平均进去了，
+且行内容与 seq 数无关）。**对外汇报/对比时用 per-seq steady × 16**；replay 行只用于
+同窗口 A/B 的相对比较（且必须看同一区段的连续行）。
