@@ -4439,6 +4439,12 @@ impl CudaBackend {
     pub fn graph_io_get(&self, name: &str) -> Option<GraphIO> {
         self.graph_io.lock().unwrap().get(name).cloned()
     }
+    /// True while THIS thread is inside a stream capture. Debug/probe paths
+    /// that D2H or sync MUST check this — a cudaMemcpy during capture is
+    /// err 901 (invalidated), which then poisons the whole capture pass.
+    pub fn capturing(&self) -> bool {
+        is_capturing()
+    }
     /// Whether a named graph exec exists (the draft graphs' replay-path
     /// probe — graph_replay would LAUNCH it, so existence needs its own check).
     pub fn graph_exists(&self, name: &str) -> bool {

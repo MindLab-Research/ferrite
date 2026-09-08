@@ -1413,10 +1413,15 @@ impl<B: KernelBackend> TpCluster<B> {
         //    launches + host embed + 576KB staging). Host cost ~0.5ms/step.
         //    Fallback: the original host chain (embed lookup + upload +
         //    mtp_forward per draft).
-        let graph_drafts = std::env::var_os("FERRITE_DRAFT_GRAPH").map_or(true, |v| v != "0");
+        let draft_env = std::env::var("FERRITE_DRAFT_GRAPH").unwrap_or_default();
+        let graph_drafts = draft_env != "0";
+        // mode "2": execute the SAME device chain host-serial (no graph
+        // replay) — bisects a draft divergence between the chain itself
+        // (embed_one_dev / cast_store / h_d relays) and capture/replay.
+        let serial_dev = draft_env == "2";
         let drafts: Vec<f32> = {
             let mut graph_ok = false;
-            if graph_drafts {
+            if graph_drafts && !serial_dev {
                 // probe once on rank 0's view (all ranks capture in
                 // lockstep — decode_step_mega's first step captures all nd).
                 let probe = Self::fan_out(&mut self.shards, |s| {
@@ -1433,7 +1438,64 @@ impl<B: KernelBackend> TpCluster<B> {
                 .collect::<Result<Vec<bool>>>()?;
                 graph_ok = probe.iter().all(|&b| b);
             }
-            if graph_ok {
+            if serial_dev {
+                // host-serial device chain (no graph): the SAME draft_step_dev
+                // calls the capture pass records, executed per step — bisects
+                // the chain (embed_one_dev / cast_store / h_d) from the
+                // capture/replay semantics.
+                let toks = Self::fan_out(&mut self.shards, |s| {
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda backend".into()))?;
+                        cuda.enter();
+                        let tokens_ptr = {
+                            let m = cuda.mtp.lock().unwrap();
+                            let m = m
+                                .as_ref()
+                                .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                            m.tokens_dev.as_f32() as *mut i32
+                        };
+                        let last_i32 = last as i32;
+                        let r = ferrite_kernel::cuda::memcpy_htod_i32(
+                            tokens_ptr, &last_i32, 1, cuda.stream_handle());
+                        if r != 0 {
+                            return Err(FerriteError::InvalidArg(format!("tokens_dev[0] H2D: {r}")));
+                        }
+                    }
+                    for i in 0..nd {
+                        draft_step_dev(s, seq, i, nd)?;
+                    }
+                    let mut d = vec![0f32; nd];
+                    {
+                        let cuda = s
+                            .backend
+                            .as_cuda()
+                            .ok_or_else(|| FerriteError::Config("mtp needs cuda backend".into()))?;
+                        let d_base = {
+                            let m = cuda.mtp.lock().unwrap();
+                            let m = m
+                                .as_ref()
+                                .ok_or_else(|| FerriteError::Config("mtp bufs missing".into()))?;
+                            m.d_argmax_dev.as_f32()
+                        };
+                        let r = ferrite_kernel::cuda::memcpy_d2h_sync(
+                            d_base as *mut std::ffi::c_void,
+                            d.as_mut_ptr(),
+                            nd,
+                            cuda.stream_handle(),
+                        );
+                        if r != 0 {
+                            return Err(FerriteError::InvalidArg(format!("drafts D2H: {r}")));
+                        }
+                    }
+                    Ok(d)
+                })
+                .into_iter()
+                .collect::<Result<Vec<Vec<f32>>>>()?;
+                toks[0].clone()
+            } else if graph_ok {
                 let toks = Self::fan_out(&mut self.shards, |s| {
                     let cuda = s
                         .backend
@@ -4545,7 +4607,7 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     // 1. enorm(embed) ‖ hnorm(h_prev) → this rank's eh_proj input segment
     let enorm = cuda.rmsnorm_dev(embed_row, s.w(&format!("{pfx}.enorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
     let hnorm = cuda.rmsnorm_dev(h_prev, s.w(&format!("{pfx}.hnorm.weight"))?, cfg.rms_norm_eps, 1, h)?;
-    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
         // full hnorm checksum (8 segments of 512) — hprev's 4096-float
         // bit-level: front-2 matched orig but S1 d2 diverged 8606 vs 315
         // with x2 8-seg checksums equal => 1-ulp somewhere upstream.
@@ -4636,7 +4698,7 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     if let Some(ho) = h_out {
         cuda.copy_dev(&x2, 0, ho.as_f32(), h)?;
     }
-    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
         // full-4096 checksum: bit-level compare orig vs zero-H2D x2 (front-2
         // matched but d1 diverged — either x2's tail differs (attn/moe cache
         // diff) or the argmax output buffer is corrupted)
@@ -4677,7 +4739,7 @@ pub(crate) fn mtp_forward_dev_argmax<B: KernelBackend>(
     let logits = cuda.matmul_dev(&h_normed, lm_w, 1, h as i32, cfg.vocab_size as i32)?;
     // argmax writes DIRECTLY to the caller's device slot — zero D2H
     cuda.argmax_dev(&logits, arg_out, 1, cfg.vocab_size)?;
-    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() {
+    if std::env::var_os("FERRITE_MTP_DEBUG").is_some() && !cuda.capturing() {
         // Read back what argmax ACTUALLY wrote vs what it was given: the
         // d1=702-vs-98347 divergence has bit-identical x2 — either argmax
         // read different logits (pool-buffer aliasing) or wrote elsewhere.
