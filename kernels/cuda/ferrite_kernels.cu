@@ -3964,11 +3964,19 @@ __global__ void indexer_topk_batched_kernel(
     float* iv = idx + (size_t)seq * select_k_max;
     extern __shared__ float sm[]; // max_npools scores (sized for MAX at launch)
     float inv_sqrt_d = rsqrtf((float)idm);
-    for (int j = threadIdx.x; j < t; j += blockDim.x) {
+    // 8 THREADS PER POOL: the score loop was one serial 32-head x 128-dim dot
+    // per thread, so only t (~112) threads of 1024 did any work (the whole
+    // kernel ran at ~1% of the GPU). Each group splits the heads and the
+    // shuffle reduces within the group.
+    const int TG = 8;
+    const int gid = threadIdx.x / TG;
+    const int lid = threadIdx.x % TG;
+    const int ngroups = blockDim.x / TG;
+    for (int j = gid; j < t; j += ngroups) {
         const float* k = pk + (size_t)j * idm;
         float s = 0.f;
         if (j < jmax) {
-            for (int hi = 0; hi < ih; hi++) {
+            for (int hi = lid; hi < ih; hi += TG) {
                 const float* q = q_s + (size_t)hi * idm;
                 float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
                 for (int l = 0; l + 3 < idm; l += 4) {
@@ -3979,9 +3987,11 @@ __global__ void indexer_topk_batched_kernel(
                 float dot = (d0 + d1) + (d2 + d3);
                 s += w_s[hi] * fmaxf(dot, 0.f); // relu
             }
-            sm[j] = s * inv_sqrt_d;
+            #pragma unroll
+            for (int off = TG / 2; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffff, s, off);
+            if (lid == 0) sm[j] = s * inv_sqrt_d;
         } else {
-            sm[j] = -INFINITY;
+            if (lid == 0) sm[j] = -INFINITY;
         }
     }
     __syncthreads();
