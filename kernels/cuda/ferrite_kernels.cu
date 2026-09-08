@@ -3464,33 +3464,35 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     // Without it each warp ran 8 sequential (load-latency -> MMA) rounds and
     // the kernel was latency-bound (the step time barely changed from 8 to 16
     // seqs, i.e. it is NOT bandwidth-bound).
-    // TWO tiles in flight (was one): a global load is ~600+ cycles while the
-    // two MMAs are ~64, so a single-tile prefetch left the warp stalled on the
-    // refill every iteration (33% of DRAM peak).
-    uint4 pf[8];
-    #define ACT_PF(TILE, SLOT) do { \
-        int i_ = 0; \
-        for (int t = lane; t < 128; t += 32, i_++) { \
-            const int proj = t >> 6, off = t & 63; \
-            const int row = off >> 2, col = (off & 3) * 16; \
-            pf[(SLOT) + i_] = *reinterpret_cast<const uint4*>( \
-                (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + (TILE) + col); \
-        } \
-    } while (0)
-    ACT_PF(k0, 0);
-    if (k0 + 64 < k1) ACT_PF(k0 + 64, 4);
-    int pfcur = 0;
-    for (int kb = k0; kb < k1; kb += 64, pfcur ^= 1) {
+    uint4 pf[4];
+    {
+        int i = 0;
+        for (int t = lane; t < 128; t += 32, i++) {
+            const int proj = t >> 6, off = t & 63;
+            const int row = off >> 2, col = (off & 3) * 16;
+            pf[i] = *reinterpret_cast<const uint4*>(
+                (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + k0 + col);
+        }
+    }
+    for (int kb = k0; kb < k1; kb += 64) {
         {
             int i = 0;
             for (int t = lane; t < 128; t += 32, i++) {
                 const int proj = t >> 6, off = t & 63;
                 const int row = off >> 2, col = (off & 3) * 16;
-                *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) = pf[pfcur * 4 + i];
+                *reinterpret_cast<uint4*>(sa[warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col) = pf[i];
             }
         }
         __syncwarp();
-        if (kb + 128 < k1) ACT_PF(kb + 128, pfcur * 4);
+        if (kb + 64 < k1) {
+            int i = 0;
+            for (int t = lane; t < 128; t += 32, i++) {
+                const int proj = t >> 6, off = t & 63;
+                const int row = off >> 2, col = (off & 3) * 16;
+                pf[i] = *reinterpret_cast<const uint4*>(
+                    (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + kb + 64 + col);
+            }
+        }
         float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
         float ud0 = 0.f, ud1 = 0.f, ud2 = 0.f, ud3 = 0.f;
         #pragma unroll
@@ -3530,7 +3532,6 @@ __global__ void moe_fused_act_fp8_mma_kernel(
             u0 += ud0 * uw_sc; u1 += ud2 * uw_sc;
         }
     }
-    #undef ACT_PF
     if ((lane & 3) == 0) {
         sgacc[warp * 16 + r0] = g0;
         sgacc[warp * 16 + r0 + 8] = g1;
