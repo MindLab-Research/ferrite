@@ -79,6 +79,26 @@ extern "C" {
                                       act: *mut f32, expert_start: i32, e_local: i32,
                                       hidden: i32, inter: i32, inter_shared: i32,
                                       topk: i32, n: i32, limit: f32, s: CuStream) -> i32;
+    // v2: pre-quantized xq/xs (ferrite_quant_e4m3_tokens ran ONCE per layer —
+    // the act kernel re-quantized x[tok] 864x per layer at n=3 (grid
+    // (max_rows/16, topk+1, n) × per-block quant; the 46µs act kernel is
+    // quantize-BOUND, not A-weight-stream bound).
+    fn ferrite_moe_fused_act_fp8_mma_v2(x: *const f32, ids_f: *const f32,
+                                        gate_w8_ptrs: *const *const std::ffi::c_void,
+                                        gate_scale_ptrs: *const *const std::ffi::c_void,
+                                        up_w8_ptrs: *const *const std::ffi::c_void,
+                                        up_scale_ptrs: *const *const std::ffi::c_void,
+                                        shared_gate_w8: *const std::ffi::c_void,
+                                        shared_gate_scale: *const std::ffi::c_void,
+                                        shared_up_w8: *const std::ffi::c_void,
+                                        shared_up_scale: *const std::ffi::c_void,
+                                        act: *mut f32, expert_start: i32, e_local: i32,
+                                        hidden: i32, inter: i32, inter_shared: i32,
+                                        topk: i32, n: i32, limit: f32,
+                                        xq: *const u8, xs: *const f32,
+                                        s: CuStream) -> i32;
+    fn ferrite_quant_e4m3_tokens(x: *const f32, xq: *mut u8, xs: *mut f32,
+                                  n: i32, hidden: i32, s: CuStream) -> i32;
     fn ferrite_gemv_fp8_mma_v2(xq: *const u8, xs: *const f32, w: *const std::ffi::c_void,
                                 w_scale: *const f32, out: *mut f32, in_f: i32, out_f: i32,
                                 scols: i32, s: CuStream) -> i32;
@@ -3941,15 +3961,32 @@ impl CudaBackend {
                 let inter_max = inter.max(inter_shared);
                 let act_mma = inter_max % 16 == 0 && hidden % 128 == 0;
                 if act_mma {
+                    // v2 QUANTIZE-ONCE: x -> xq e4m3 + xs, ONE launch per layer
+                    // (per token; the act kernel re-quantized x[tok] 864x =
+                    // grid(max_rows/16, topk+1, n) × per-block quant — the 46µs
+                    // act kernel was quantize-BOUND, not A-weight bound).
+                    let xq = DevBuf::alloc(self.dev, self.stream, n * hi as usize / 4 + 1)?; // e4m3 bytes as f32 slots
+                    let xs = DevBuf::alloc(self.dev, self.stream, n)?;
+                    ck(
+                        unsafe {
+                            ferrite_quant_e4m3_tokens(
+                                x_dev.as_const_f32(), xq.as_f32() as *mut u8, xs.as_f32(),
+                                ni, hi, self.stream,
+                            )
+                        },
+                        "quant_e4m3_tokens",
+                    )?;
                     let r = unsafe {
-                        ferrite_moe_fused_act_fp8_mma(
+                        ferrite_moe_fused_act_fp8_mma_v2(
                             x_dev.as_const_f32(), dids.as_const_f32(),
                             tbl.gate_w8 as *const *const _, tbl.gate_scale as *const *const _,
                             tbl.up_w8 as *const *const _, tbl.up_scale as *const *const _,
                             sg.w, sg.scale, su.w, su.scale,
                             act.as_f32(),
                             expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                            topk as i32, ni, swiglu_limit, self.stream,
+                            topk as i32, ni, swiglu_limit,
+                            xq.as_const_f32() as *const u8, xs.as_const_f32(),
+                            self.stream,
                         )
                     };
                     if r == 0 {

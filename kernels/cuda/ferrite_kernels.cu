@@ -3093,7 +3093,9 @@ __global__ void moe_fused_act_fp8_mma_kernel(
     const float* __restrict__ shared_up_scale,
     float* __restrict__ act,              // [n, topk*inter + inter_shared]
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, float limit) {
+    int inter_shared, int topk, float limit,
+    const unsigned char* __restrict__ xq, // [n, hidden] e4m3 — PRE-QUANTIZED (v2; null = per-block v1)
+    const float* __restrict__ xs) {        // [n] per-token scales (v2)
     const int slot = blockIdx.y;
     const int tok = blockIdx.z;
     const int m0 = blockIdx.x * 16;        // 16 inter rows per block
@@ -3123,32 +3125,40 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         gw8 = shared_gate_w8; gs = shared_gate_scale;
         uw8 = shared_up_w8;   us = shared_up_scale;
     }
-    // ---- 1. per-block quantize (v1 mode — NO cross-block barrier) ----
-    // (512-thread 16-warp variant measured NO gain: 62.0 vs 63.4 tok/s serve,
-    // 16.5 vs 15.2µs isolated — the K-split's sacc reduction overhead cancels
-    // the occupancy gain; 256/8-warp is the optimum at these shapes.)
+    // ---- 1. quantize (v1 per-block | v2 PRE-QUANTIZED copy) ----
+    // v2 (xq non-null): the per-token xq/xs were computed ONCE by
+    // ferrite_quant_e4m3_tokens (1 block/token vs 864 re-quantizes here:
+    // grid (max_rows/16, topk+1, n) re-quantized x[tok] 96x9x per layer,
+    // each 16KB read + absmax reduce + 2 barriers = the 46µs kernel's
+    // dominant cost, NOT the expert A-weights stream). Copy the 4KB row
+    // into smem (coalesced, 1 read) + load xs[tok]. FP: xs is the SAME
+    // absmax/448 (fmaxf commutative — the 8-warp serial fold order is
+    // preserved in the quant kernel) — bit-identical act output.
     extern __shared__ unsigned char smem[];
     unsigned char* sx = smem;                       // [hidden] e4m3 xq
     float* sred = (float*)(smem + hidden);         // [256] absmax reduce
     float* sxs = (float*)(smem + hidden + 256 * 4); // [1] x_scale
     float* sgacc = sxs + 1;                        // [8][16] gate partials
     float* suacc = sgacc + 8 * 16;                 // [8][16] up partials
-    {
+    if (xq != nullptr) {
+        const unsigned char* xqt = xq + (size_t)tok * hidden;
+        for (int k = threadIdx.x * 16; k + 15 < hidden; k += 256 * 16) {
+            *reinterpret_cast<uint4*>(sx + k) = *reinterpret_cast<const uint4*>(xqt + k);
+        }
+        for (int k = threadIdx.x + ((hidden >> 4) << 4); k < hidden; k += 256)
+            sx[k] = xqt[k]; // tail (hidden%16 != 0 — never on GLM)
+        if (threadIdx.x == 0) sxs[0] = xs[tok];
+        __syncthreads();
+    } else {
+        const float* xt2 = x + (size_t)tok * hidden;
         float amax = 1e-9f;
         for (int k = threadIdx.x; k < hidden; k += 256)
-            amax = fmaxf(amax, fabsf(xt[k]));
-        // v2: warp-shuffle max + 2-level smem (was a 128→1 tree with one
-        // __syncthreads PER level — 8 serialized barriers on the critical
-        // path of all 576 blocks; the shuffle form has a single barrier).
+            amax = fmaxf(amax, fabsf(xt2[k]));
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
             amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
         if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = amax;
         __syncthreads();
-        // NOTE: the 8-warp final max is a serial loop on thread 0 — a
-        // __shfl_down_sync inside an if(tid<8) branch is a full-mask shuffle
-        // with only 8/32 lanes present = warp deadlock on sm_103a (this
-        // exact bug hung the decode graph for 11 minutes before the kill).
         if (threadIdx.x == 0) {
             float m = sred[0];
             #pragma unroll
@@ -3158,7 +3168,7 @@ __global__ void moe_fused_act_fp8_mma_kernel(
         __syncthreads();
         const float inv = 1.0f / sxs[0];
         for (int k = threadIdx.x; k < hidden; k += 256) {
-            const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
+            const float q = fminf(fmaxf(xt2[k] * inv, -448.0f), 448.0f);
             sx[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
         }
         __syncthreads();
@@ -3258,7 +3268,89 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
         (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
         (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
         (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
-        act, expert_start, e_local, hidden, inter, inter_shared, topk, limit);
+        act, expert_start, e_local, hidden, inter, inter_shared, topk, limit,
+        nullptr, nullptr); // v1: per-block quantize fallback
+    return cudaGetLastError();
+}
+
+// v2: pre-quantized variant — xq/xs come from ferrite_quant_e4m3_tokens
+// (one quantize per token per layer vs 864 in-kernel re-quantizes).
+extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
+    const float* x, const float* ids_f,
+    const void* const* gate_w8_ptrs, const void* const* gate_scale_ptrs,
+    const void* const* up_w8_ptrs, const void* const* up_scale_ptrs,
+    const void* shared_gate_w8, const void* shared_gate_scale,
+    const void* shared_up_w8, const void* shared_up_scale,
+    float* act, int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, float limit,
+    const void* xq, const void* xs, cudaStream_t s)
+{
+    int max_rows = inter > inter_shared ? inter : inter_shared;
+    if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported;
+    dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
+    const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
+    cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
+        x, ids_f,
+        (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
+        (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
+        (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
+        (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
+        act, expert_start, e_local, hidden, inter, inter_shared, topk, limit,
+        (const unsigned char*)xq, (const float*)xs);
+    return cudaGetLastError();
+}
+
+// ============================================================
+// act quantize v2 (2026-09-08): per-token x quantize ONCE per layer —
+// x [n, hidden] -> xq e4m3 [n, hidden] + xs [n]. The act mma kernel's
+// per-block quantize (v1 no-barrier mode) re-quantized the SAME x[tok]
+// (max_rows/16) × (topk+1) = 96 × 9 = 864 times per token per layer
+// (n=3: 2592 blocks × 16KB read + absmax reduce + 2 barriers each —
+// the 46µs act kernel is quantize-BOUND: A weights only stream
+// ~5µs/layer at HBM). One 256-thr block per token: warp-shuffle max +
+// serial 8-warp fold (the SAME reduction order as the act kernel's
+// in-block quantize — fmaxf is order-commutative, xs bit-identical)
+// + the same cvt clamp. The act kernel then copies xq into smem (4KB
+// coalesced, ~0.5µs) instead of re-quantizing (~2µs × 864/SM-wave).
+// ============================================================
+__global__ void quant_e4m3_tokens_kernel(
+    const float* __restrict__ x,          // [n, hidden]
+    unsigned char* __restrict__ xq,      // [n, hidden] e4m3
+    float* __restrict__ xs,              // [n] scale = absmax/448
+    int n, int hidden) {
+    int tok = blockIdx.x;
+    if (tok >= n) return;
+    const float* xt = x + (size_t)tok * hidden;
+    unsigned char* qt = xq + (size_t)tok * hidden;
+    __shared__ float sred[8];
+    float amax = 1e-9f;
+    for (int k = threadIdx.x; k < hidden; k += 256)
+        amax = fmaxf(amax, fabsf(xt[k]));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
+    if ((threadIdx.x & 31) == 0) sred[threadIdx.x >> 5] = amax;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = sred[0];
+        #pragma unroll
+        for (int w = 1; w < 8; w++) m = fmaxf(m, sred[w]);
+        xs[tok] = m / 448.0f;
+    }
+    __syncthreads();
+    const float inv = 1.0f / xs[tok];
+    for (int k = threadIdx.x; k < hidden; k += 256) {
+        const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
+        qt[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+extern "C" cudaError_t ferrite_quant_e4m3_tokens(
+    const float* x, unsigned char* xq, float* xs,
+    int n, int hidden, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    quant_e4m3_tokens_kernel<<<n, 256, 0, s>>>(x, xq, xs, n, hidden);
     return cudaGetLastError();
 }
 
