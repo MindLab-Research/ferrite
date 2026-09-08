@@ -2915,6 +2915,105 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8(
     return cudaGetLastError();
 }
 
+// v0 (n=1 PATH): warp-serial expert loop — restored from 23acab6 as the n=1
+// dispatch target. The v11/v12.1 expert-parallel + register-cache variants all
+// regressed n=1 (90.9 → 87.2: 48 regs/lane occupancy drop + the 9-warp 288-
+// thread block wastes 6 warps' slots at n=1's ~2 routed experts per token —
+// only ~3 of 9 warps have work). v0 keeps 8 h-rows per block, warp = one h
+// row, serial j (the topk experts of ONE token — j loop is short at n=1).
+__global__ void moe_fused_down_sum_fp8_v0_kernel(
+    const float* __restrict__ ids_f,       // [n, topk]
+    const float* __restrict__ probs,       // [n, topk]
+    const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] fp8 [hidden, inter]
+    const float* const* __restrict__ down_scale_ptrs,       // [e_local] [hidden/128, inter/128]
+    const unsigned char* __restrict__ shared_down_w8,      // [hidden, inter_shared]
+    const float* __restrict__ shared_down_scale,
+    const float* __restrict__ act,         // [n, topk*inter + inter_shared]
+    float* __restrict__ out,               // [n, hidden]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols) {
+    int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int tok = blockIdx.y;
+    int h = blockIdx.x * 8 + warp;
+    if (h >= hidden) return;
+    int stride = topk * inter + inter_shared;
+    const float* act_t = act + (size_t)tok * stride;
+    const float* ids_t = ids_f + (size_t)tok * topk;
+    const float* probs_t = probs + (size_t)tok * topk;
+    float acc = 0.f;
+    for (int j = 0; j < topk; j++) {
+        int eid = (int)ids_t[j];
+        int local = eid - expert_start;
+        if (local < 0 || local >= e_local) continue; // another rank's slot (zero act)
+        float p = probs_t[j];
+        if (p == 0.f) continue;
+        const unsigned char* dwr = down_w8_ptrs[local] + (size_t)h * inter;
+        const float* dsr = down_scale_ptrs[local] + (size_t)(h >> 7) * dscols;
+        const float* aj = act_t + (size_t)j * inter;
+        float y = 0.f;
+        int i = lane * 16;
+        for (; i + 15 < inter; i += 32 * 16) {
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const float4 aa = *reinterpret_cast<const float4*>(aj + i);
+            const float4 ab = *reinterpret_cast<const float4*>(aj + i + 4);
+            const float4 ac = *reinterpret_cast<const float4*>(aj + i + 8);
+            const float4 ad = *reinterpret_cast<const float4*>(aj + i + 12);
+            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+            const float ds_c = dsr[i >> 7];
+            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
+                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+#pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
+            }
+        }
+        for (; i < inter; i++) {
+            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * aj[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_down_sync(0xffffffff, y, off);
+        }
+        acc += p * y;
+    }
+    // shared expert (slot topk, weight 1; K length = inter_shared, TP-sharded)
+    {
+        const unsigned char* dwr = shared_down_w8 + (size_t)h * inter_shared;
+        const float* dsr = shared_down_scale + (size_t)(h >> 7) * dscols;
+        const float* as_ = act_t + (size_t)topk * inter;
+        float y = 0.f;
+        int i = lane * 16;
+        for (; i + 15 < inter_shared; i += 32 * 16) {
+            uint4 dv = *reinterpret_cast<const uint4*>(dwr + i);
+            const float4 aa = *reinterpret_cast<const float4*>(as_ + i);
+            const float4 ab = *reinterpret_cast<const float4*>(as_ + i + 4);
+            const float4 ac = *reinterpret_cast<const float4*>(as_ + i + 8);
+            const float4 ad = *reinterpret_cast<const float4*>(as_ + i + 12);
+            const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv);
+            const float ds_c = dsr[i >> 7];
+            const float xv[16] = {aa.x, aa.y, aa.z, aa.w, ab.x, ab.y, ab.z, ab.w,
+                                  ac.x, ac.y, ac.z, ac.w, ad.x, ad.y, ad.z, ad.w};
+#pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&d8[p * 2]);
+                const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
+            }
+        }
+        for (; i < inter_shared; i++) {
+            y += (__half2float(__nv_cvt_fp8_to_halfraw(dwr[i], __NV_E4M3)) * dsr[i >> 7]) * as_[i];
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            y += __shfl_down_sync(0xffffffff, y, off);
+        }
+        acc += y;
+    }
+    if (lane == 0) out[(size_t)tok * hidden + h] = acc;
+}
+
 __global__ void moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
@@ -3059,6 +3158,18 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     const float* act, float* out,
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
+    if (n == 1) {
+        // n=1 PATH (v0 warp-serial): the v12.1 expert-parallel + register-cache
+        // variant's 48 regs/lane dropped occupancy — n=1 measured 90.9 (v0)
+        // vs 87.2 (v12.1) tok/s. grid (hidden/8, 1): each warp owns ONE h row,
+        // serial j loop over topk+shared. The v12.1 h-loop path stays for n>1.
+        moe_fused_down_sum_fp8_v0_kernel<<<dim3((hidden + 7) / 8, 1, 1), 256, 0, s>>>(
+            ids_f, probs,
+            (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
+            (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
+            act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+        return cudaGetLastError();
+    }
     dim3 block(288); // 9 warps: topk routed (8) + shared
     dim3 grid((hidden + 7) / 8, n, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
