@@ -4055,6 +4055,7 @@ __global__ void kpool_compress_batched_kernel(
     const float* k_gate = kgate_tbl[seq];
     const int d = d4 * 4;
     float4 lmax = make_float4(-INFINITY, -INFINITY, -INFINITY, -INFINITY);
+    #pragma unroll 2
     for (int j = 0; j < kpool; j++) {
         int t = p * kpool + j;
         if (t < total) {
@@ -4068,6 +4069,7 @@ __global__ void kpool_compress_batched_kernel(
     }
     if (lmax.x == -INFINITY) return;
     float4 den = make_float4(0.f, 0.f, 0.f, 0.f), num = make_float4(0.f, 0.f, 0.f, 0.f);
+    #pragma unroll 2
     for (int j = 0; j < kpool; j++) {
         int t = p * kpool + j;
         if (t < total) {
