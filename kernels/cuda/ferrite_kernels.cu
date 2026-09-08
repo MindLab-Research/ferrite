@@ -4397,35 +4397,42 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
     // applies rsq (rsq itself moved there too — phase 1 is a pure dot now).
     const int KS = gridDim.z;
     int t = blockIdx.x;
-    int m = blockIdx.y;
+    const int m0 = blockIdx.y * 4;   // 4 mix rows per block: x was re-read
+                                     // once per mix row (24x -> L2-bound)
     int z = blockIdx.z;
-    if (t >= s || m >= mix) return;
+    if (t >= s) return;
     const float* x = res + (size_t)t * n * h;
     const int nh = n * h;
-    const float* row = fw + (size_t)m * nh;
+    const float* row0 = fw + (size_t)m0 * nh;
     int seg = (nh + KS - 1) / KS;
     int lo = z * seg;
     int hi = min(lo + seg, nh);
 
-    float acc = 0.f;
-    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) acc += row[i] * x[i];
-    __shared__ float red[8];
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffff, acc, off);
-    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = acc;
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        float tot = 0.f;
-        for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
-        mx_partial[((size_t)t * mix + m) * KS + z] = tot;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    float sq = 0.f;
+    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
+        const float xv = x[i];                 // ONE x read serves 4 rows
+        sq += xv * xv;                         // Σx² rides free
+        #pragma unroll
+        for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
     }
-    // Σx² fusion (m==0 lane only): this block ALREADY reads x[lo, hi) for
-    // the mix dot — the z-segment's Σx² rides free. The rest kernel's P1
-    // prologue re-read the full nh (16K floats, ~15µs × 90/step = 1.35ms)
-    // just for rsqrt(Σx²/nh + eps); it now reduces these KS partials
-    // (8 adds) instead. Scratch tail: mx_partial[s*mix*KS + t*KS + z].
-    if (m == 0) {
-        float sq = 0.f;
-        for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) sq += x[i] * x[i];
+    __shared__ float red[8];
+    #pragma unroll
+    for (int mm = 0; mm < 4; mm++) {
+        float a = acc[mm];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = a;
+        __syncthreads();
+        if (threadIdx.x == 0 && m0 + mm < mix) {
+            float tot = 0.f;
+            for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
+            mx_partial[((size_t)t * mix + m0 + mm) * KS + z] = tot;
+        }
+        __syncthreads();
+    }
+    // Σx² partial (m0 == 0 lane only): the rest kernel's P1 prologue re-read
+    // the full nh (~15µs x 90/step = 1.35ms) just for rsqrt(Σx²/nh + eps).
+    if (m0 == 0) {
         for (int off = 16; off > 0; off >>= 1) sq += __shfl_down_sync(0xffffffff, sq, off);
         if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sq;
         __syncthreads();
@@ -4631,7 +4638,7 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     float* pre_s_g = mx_scratch + (size_t)s * mix * HC_MIX_KS + (size_t)s * HC_MIX_KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
-    dim3 mix_grid(s, mix, HC_MIX_KS);
+    dim3 mix_grid(s, (mix + 3) / 4, HC_MIX_KS);
     if (ferrite_pdl_enabled()) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
