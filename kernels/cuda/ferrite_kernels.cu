@@ -4989,40 +4989,37 @@ __global__ void p2p_ar_fused_v3_kernel(
             staging_tbl[rr][off] = v;
         }
     }
-    __threadfence_system(); // peer-visible stores before flag
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        // Single-block grid (n*world <= 1024 threads for every batched decode
-        // size): this block IS the last — no arrival counter needed. The
-        // atomicAdd path left ctr stuck non-zero across replays (its reset
-        // raced the capture), so no block ever saw "last" and *epoch never
-        // advanced (diag: e==0 for EVERY AR) → peers' flags were never
-        // re-stamped → the monotonic wait deadlocked.
-        unsigned prev = (gridDim.x == 1u) ? 0u : atomicAdd(ctr, 1u);
-        if (prev == gridDim.x - 1u) { // last block: all stores fenced
-            for (int r = 0; r < world; r++)
-                *(volatile unsigned*)&ready_tbl[r][my_rank] = e + 1u;
-            *ctr = 0u;     // reset for the next call (stream-ordered)
-            *epoch = e + 1u; // advance AFTER the flags (the next kernel sees it)
-        }
+    __threadfence_system(); // peer-visible stores; the finish kernel publishes
+    // Snapshot the epoch for the finish kernel. That kernel runs only after
+    // this one COMPLETES (stream order), so its block 0 can publish the stamp
+    // with no grid-wide counter and no last-block detection — the mechanism
+    // that deadlocked at gridDim.x > 1. The snapshot keeps `e` stable for
+    // every finish block (block 0 advances *epoch there, so rereading would
+    // be a race).
+    if (blockIdx.x == 0 && threadIdx.x == 0) *ctr = e;
+}
+
+// Phase B in a SEPARATE kernel: publish the epoch stamp, wait for the peers'
+// stamps, reduce. Stream order guarantees every store of the store kernel is
+// visible before this runs — so publishing needs no arrival counter at all.
+__global__ void p2p_ar_finish_v3_kernel(
+    unsigned* const* __restrict__ ready_tbl,
+    unsigned* epoch, const unsigned* __restrict__ snap,
+    const unsigned* __restrict__ ready_local,
+    unsigned* __restrict__ seen,
+    const float* __restrict__ staging_local,
+    float* __restrict__ out, int world, int my_rank, int n, int stride) {
+    const unsigned e = *snap; // stable: *epoch is advanced only below
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        for (int r = 0; r < world; r++)
+            // SYSTEM-scope store: a device-scope (volatile) store never
+            // becomes visible in the peer's address space over NVLink/UVA.
+            atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+        __threadfence_system();
+        *epoch = e + 1u;
     }
-    __syncthreads();
-    // phase B: sum — spin until all peers' flags reach e+1, then reduce the
-    // (e&1) staging segment. e2 from the local register (epoch already
-    // advanced by phase A's last block — rereading it would be a race).
-    // phase B: wait for a NEW (monotonic) stamp, not a specific epoch.
-    // The old wait compared against e+1, which required every rank's epoch
-    // counter to stay in lockstep — one skipped/extra AR anywhere left a
-    // rank waiting for a stamp that never came (diag: myepoch=270 flag=270,
-    // off by exactly 1 → deadlock). The seen[] array (per rank, per peer)
-    // remembers the last observed stamp, so any NEW value satisfies the wait
-    // regardless of absolute counter alignment.
-    if (tr == 0 && e < 4u) {
-        printf("[p2p-dbg] rank=%d e=%u wrote=%u peer0_flag=%u seen0=%u\n",
-               my_rank, e, e + 1u,
-               (unsigned)*(volatile unsigned*)&ready_local[0],
-               (unsigned)seen[0]);
-    }
+    // Monotonic stamp wait: any NEW stamp satisfies it, so ranks may drift.
+    const int tr = (threadIdx.x < (unsigned)world) ? (int)threadIdx.x : -1;
     if (tr >= 0) { // one thread per peer polls its own flag (parallel)
         unsigned prev = seen[tr];
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
@@ -5033,7 +5030,7 @@ __global__ void p2p_ar_fused_v3_kernel(
             if (++spins > 500000) { // ~50ms: diagnose + break instead of hanging
                 if (tr == 0) {
                     printf("[p2p-hang] rank=%d peer=%d prev=%u cur=%u myepoch=%u\n",
-                           my_rank, tr, prev, cur, (unsigned)*epoch);
+                           my_rank, tr, prev, cur, e);
                 }
                 break;
             }
@@ -5041,8 +5038,8 @@ __global__ void p2p_ar_fused_v3_kernel(
         seen[tr] = cur;
     }
     __syncthreads();
-    // grid-stride reduce (single block): n can exceed the block size.
-    for (int ii = threadIdx.x; ii < n; ii += blockDim.x) {
+    const int step = gridDim.x * blockDim.x;
+    for (int ii = blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
         float acc = 0.f;
         for (int r = 0; r < world; r++)
             acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
@@ -5056,18 +5053,25 @@ extern "C" cudaError_t ferrite_p2p_ar_fused_v3(
     const float* staging_local, const unsigned* ready_local,
     unsigned* seen,
     float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
-    // SINGLE BLOCK, grid-stride (vLLM's custom-AR layout). With blocks > 1 the
-    // flag publish needs "last block arrived" detection via atomicAdd(ctr) —
-    // and that counter provably breaks across graph replays (stale ctr →
-    // no block ever sees last → *epoch never advances → the monotonic wait
-    // deadlocks). gridDim.x == 1 makes the publish unconditional: no counter,
-    // no stale state, no deadlock. Measured AR payload at 16 seqs is 327 KB;
-    // one 1024-thread block moves the 8×2.6 MB of NVLink traffic in ~20-25 µs.
+    // Multi-block store kernel (fast: 640 blocks × 1024 threads at 16 seqs,
+    // vs one SM issuing 655K scalar stores) + a separate finish kernel that
+    // publishes the stamp. Stream order is what makes the publish safe: the
+    // finish kernel starts only after EVERY store of the store kernel is
+    // visible, so no arrival counter / last-block detection is needed.
     int threads = 1024;
-    int blocks = 1;
+    int work = n * world;
+    int blocks = (work + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
     p2p_ar_fused_v3_kernel<<<blocks, threads, 0, s>>>(
         partial, staging_tbl, ready_tbl, epoch, ctr,
         staging_local, ready_local, seen, out, world, my_rank, n, stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    int fblocks = (n + threads - 1) / threads;
+    if (fblocks < 1) fblocks = 1;
+    p2p_ar_finish_v3_kernel<<<fblocks, threads, 0, s>>>(
+        ready_tbl, epoch, ctr, ready_local, seen, staging_local, out,
+        world, my_rank, n, stride);
     return cudaGetLastError();
 }
 
