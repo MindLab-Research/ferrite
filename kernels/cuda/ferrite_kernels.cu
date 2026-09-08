@@ -3276,8 +3276,9 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                                          ar[1].x, ar[1].y, ar[1].z, ar[1].w};
                     #pragma unroll
                     for (int p = 0; p < 4; p++) {
-                        // DIAG: skip the fp8->half->float conversion chain
-                        y += ((float)d8[p * 2] * ds_c) * xv[p * 2] + ((float)d8[p * 2 + 1] * ds_c) * xv[p * 2 + 1];
+                        const __nv_fp8x2_storage_t dx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(d8 + p * 2);
+                        const float2 df = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(dx2, __NV_E4M3)));
+                        y += (df.x * ds_c) * xv[p * 2] + (df.y * ds_c) * xv[p * 2 + 1];
                     }
                 }
                 for (; i < klen; i++) {
