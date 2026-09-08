@@ -4305,8 +4305,8 @@ impl CudaBackend {
         // Plan N v1: P3/P4/P5 moved off the single-block rest kernel onto a
         // grid(s,16) multi-block launch (the 1-SM 64KB x read was the
         // 40µs/layer serve-real bottleneck).
-        // HC_P345_NB must match the kernel's #define (64 — see the .cu).
-        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * (mix * 8 + 8 + 1 + n + 64 + 1))?;
+        // HC_P345_NB must match the kernel's #define (256 — see the .cu).
+        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * (mix * 8 + 8 + 1 + n + 256 + 1))?;
         // SPLIT version (grid(s, mix) — one block per mix row): the
         // single-block kernel ran on ONE SM (~6GB/s of 8TB/s HBM); the mix
         // GEMV (16384×18432) was 57% of the decode step (A_hc+C_hc 24ms of
