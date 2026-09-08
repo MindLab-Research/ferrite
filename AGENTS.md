@@ -269,12 +269,13 @@ Other profiling rules:
 - MTP 出师表 200-step: `real 476 tokens` window, text must be flawless 《出师表》 through 将军向宠 section (乱码 = accept/commit bug, ALWAYS check by eye).
 - 500-step: 58.9 tok/s (DSA decay visible), non-MTP 500-step 44.7.
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
-- **B=16 non-MTP (2026-09-08 late, the current best)**: `[megab] replay 16 seqs: 16.47-16.55 ms`
-  = **967-971 tok/s** (300-token window, text = direct 《出师表》 recitation ✓); 1000-token window
-  ~19.3 ms = **827-829 tok/s**. Progression this session: 546 → 971 tok/s.
+- **B=16 non-MTP (2026-09-08 late, the current best)**: `[megab] replay 16 seqs: 16.30-16.42 ms`
+  = **975-982 tok/s** (300-token window, text = direct 《出师表》 recitation ✓); 1000-token window
+  ~19.3 ms = **827-829 tok/s**. Progression this session: 546 → 977 tok/s.
   Kept changes: gemv_fp8 T=2 tokens/block, gated_rmsnorm 1 token/block x256, moe_act double-buffered
   cp.async.cg staging + ldmatrix, hc_pre_mix K-loop `#pragma unroll 4`, **moe_route 256-thread
-  top-k**, **rmsnorm blockDim-sized reduce (was a latent 8-warp bug)**.
+  top-k**, **rmsnorm blockDim-sized reduce (was a latent 8-warp bug)**, **4/2-accumulator splits of
+  the serial FMA chains (GDN +0.5%, gemv +0.1%)**.
   Run-to-run/thermal drift is ~±1%; always A/B in the same window.
   **Biggest remaining win: MLA absorption** (see `docs/agent/perf-roadmap.md`) — the DSA cache is
   non-absorbed (per-head up-projected k/v), costing ~1.5 ms/step at t=1000 (~8%).
