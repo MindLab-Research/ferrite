@@ -3214,10 +3214,6 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         const int cnt = ((t1 - base) < MAXN) ? (t1 - base) : MAXN;
         if (j <= topk) {
         float py[8];
-        // unroll the token loop so the next token's weight loads issue while
-        // the current one is still dotting (each (token,slot) is 4 loads then
-        // 4 dot rounds ~160 cycles of compute vs 300+ of L2 latency).
-        #pragma unroll
         for (int tt = 0; tt < cnt; tt++) {
         const int tok = base + tt;
         const float* act_t = act + (size_t)tok * stride;
