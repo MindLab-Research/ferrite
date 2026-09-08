@@ -307,19 +307,28 @@ __global__ void gated_rmsnorm_kernel(const float* __restrict__ x,
                                      const float* __restrict__ w,
                                      float* __restrict__ out,
                                      int n, int dim, float eps) {
-    int row = blockIdx.x * blockDim.y + threadIdx.y;
+    // ONE token per block, 256 threads: the old block(32,4)/grid(n/4) gave only
+    // 512 threads for the whole grid and each thread serially walked dim/32 =
+    // 128 elements (pure latency; the kernel is called per GDN layer).
+    const int row = blockIdx.x;
     if (row >= n) return;
     const float* xr = x + (size_t)row * dim;
     const float* gr = gate + (size_t)row * dim;
     float* or_ = out + (size_t)row * dim;
     float ss = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
-    float lane = ss;
-    for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffff, lane, off);
-    __shared__ float warp_s[32];
-    if (threadIdx.x == 0) warp_s[threadIdx.y] = lane / dim;
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
+    __shared__ float warp_s[8];
+    if ((threadIdx.x & 31) == 0) warp_s[threadIdx.x >> 5] = ss;
     __syncthreads();
-    float inv = rsqrtf(warp_s[threadIdx.y] + eps);
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int wq = 0; wq < (blockDim.x >> 5); wq++) t += warp_s[wq];
+        warp_s[0] = t / dim;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(warp_s[0] + eps);
     for (int i = threadIdx.x; i < dim; i += blockDim.x) {
         // Glm5NextTextRMSNormGated: y = rmsnorm(x) * w * sigmoid(gate)
         or_[i] = xr[i] * inv * w[i] / (1.0f + __expf(-gr[i]));
@@ -330,8 +339,8 @@ extern "C" cudaError_t ferrite_gated_rmsnorm(const float* x, const float* gate,
                                             const float* w, float* out,
                                             int n, int dim, float eps,
                                             cudaStream_t s) {
-    dim3 block(32, 4);
-    dim3 grid((n + 3) / 4);
+    dim3 block(256);
+    dim3 grid(n);
     gated_rmsnorm_kernel<<<grid, block, 0, s>>>(x, gate, w, out, n, dim, eps);
     return cudaGetLastError();
 }
