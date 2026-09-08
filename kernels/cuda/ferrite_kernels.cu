@@ -274,12 +274,15 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x,
     // warp reduce
     float lane = ss;
     for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffff, lane, off);
-    __shared__ float red[8]; // 256 threads = 8 warps
+    // Cross-warp reduce sized by blockDim (the old version hardcoded 8 warps —
+    // growing the block then silently dropped 3/4 of the sum and looked "8%
+    // faster"). 32 slots covers up to 1024 threads.
+    __shared__ float red[32];
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = lane;
     __syncthreads();
     if (threadIdx.x == 0) {
         float t = 0.f;
-        for (int i = 0; i < 8; i++) t += red[i];
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
         red[0] = rsqrtf(t / dim + eps);
     }
     __syncthreads();
@@ -292,7 +295,10 @@ __global__ void rmsnorm_kernel(const float* __restrict__ x,
 extern "C" cudaError_t ferrite_rmsnorm(const float* x, const float* w,
                                        float* out, int n, int dim, float eps,
                                        cudaStream_t s) {
-    dim3 block(256);
+    // 1024 threads/block: grid(n) is only 16 blocks at n=16, so per-block
+    // latency dominates; 4 elems/thread instead of 16. The reduce above is
+    // now blockDim-sized, so this is safe (it was NOT before).
+    dim3 block(1024);
     dim3 grid(n);
     rmsnorm_kernel<<<grid, block, 0, s>>>(x, w, out, n, dim, eps);
     return cudaGetLastError();
