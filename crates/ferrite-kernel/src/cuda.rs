@@ -4161,9 +4161,13 @@ impl CudaBackend {
         let comb = DevBuf::alloc(self.dev, self.stream, s * n * n)?;
         // K-split partials: s * mix * HC_MIX_KS(8) lanes + the Σx² fusion tail
         // [s][KS] (the mix_split m==0 lanes ride free on their existing x
-        // reads — the rest kernel's P1 reduces these instead of re-reading
-        // the full nh, ~15µs × 90/step) + rest scratch (rsq[s] + pre_s[s][n]).
-        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * (mix * 8 + 8 + 1 + n))?;
+        // reads — the restA kernel's P1 reduces these instead of re-reading
+        // the full nh, ~15µs × 90/step) + old ctr [s] + pre_s [s][n] (restA
+        // writes, p345's 16 blocks read) + P345: p4 partials [s][16] + ctr [s].
+        // Plan N v1: P3/P4/P5 moved off the single-block rest kernel onto a
+        // grid(s,16) multi-block launch (the 1-SM 64KB x read was the
+        // 40µs/layer serve-real bottleneck).
+        let mx_scratch = DevBuf::alloc(self.dev, self.stream, s * (mix * 8 + 8 + 1 + n + 16 + 1))?;
         // SPLIT version (grid(s, mix) — one block per mix row): the
         // single-block kernel ran on ONE SM (~6GB/s of 8TB/s HBM); the mix
         // GEMV (16384×18432) was 57% of the decode step (A_hc+C_hc 24ms of

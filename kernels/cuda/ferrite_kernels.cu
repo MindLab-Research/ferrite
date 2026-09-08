@@ -3799,19 +3799,15 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // K-SPLIT lanes per mix row in hc_pre phase 1 (gridDim.z): 24 mix rows × 8
 // = 192 blocks = 130% SM occupancy on B300 (148 SMs) vs 24 blocks (16%).
 #define HC_MIX_KS 8
+// Plan N v1: P345 column blocks per token (gridDim.y) — h=4096/16 = 256
+// columns per block × 256 threads = 1 column/thread. 16 blocks spread the
+// old single-block P3's 64KB x read over 16 SMs' L2 bandwidth.
+#define HC_P345_NB 16
 
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
                                         float* __restrict__ mx_partial,
-                                        // P12-in-mix_split params (v12): the last block does P1/P2
-                                        const float* __restrict__ scale,
-                                        const float* __restrict__ base,
-                                        float* __restrict__ pre_s_g,  // [s][n] output
-                                        float* __restrict__ post,     // [s][n] output
-                                        float* __restrict__ comb,     // [s][n*n] output
-                                        unsigned* __restrict__ ctr,   // [1] atomic counter
-                                        int s, int n, int h, int mix,
-                                        float rms_eps, float hc_eps, int iters) {
+                                        int s, int n, int h, int mix) {
     // K-SPLIT: gridDim.z = KS lanes per mix row — 24 mix rows × 8 lanes =
     // 192 blocks (130% SM) vs the old 24-block single-lane version (16% SM,
     // each block serially dotting the full 18432-dim row). Each lane dots
@@ -3857,69 +3853,48 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
             mx_partial[(size_t)s * mix * KS + (size_t)t * KS + z] = tot2;
         }
     }
-
-    // (P12 disabled: the is_last-atomic P1/P2 in mix_split cost ~69µs/layer —
-    // 192 blocks' threadfence/atomic serialization + the serial sinkhorn on the
-    // last block — v4 measured 45.4 tok/s vs 63.4 without it. The rest kernel
-    // unconditionally does P1/P2 (the prologue reduce + sigmoid/sinkhorn),
-    // so deleting this block is functionally a no-op; pre_s for the future
-    // GEMV prologue fusion will be computed in the GEMV itself, not here.)
-    (void)rms_eps;
 }
 
-// The REST of hc_pre: reads pre-computed mx from global memory, does
-// sinkhorn + li + post + comb. Single block per token.
-// cp.async PREFETCH: the P3's 64KB x-read at 1 SM was ~30-40µs (load-use
-// dependency chain: load i → FMA → load i+1, MLP ~2 at 1 SM's ~32
-// outstanding L2 requests). cp.async DMA-copies x to shared ASYNCHRONOUSLY
-// (overlapped with P1/P2 ~2µs), then P3 reads from shared (20TB/s) —
-// ~3µs. Total hc_pre_rest: 62µs → ~10µs expected.
-__global__ void hc_pre_rest_kernel(const float* __restrict__ res,
-                                   const float* __restrict__ mx_in,
+// ── Plan N v1: hc_pre_rest split into restA (P1/P2) + P345 (multi-block) ──
+// The single-block rest kernel was 62µs/layer in serve (1-SM launch bound:
+// P3's 64KB x-read cold at ~8GB/s effective + the serial P4/P5 tail). restA
+// keeps only P1 (mx partial reduce + rsq) + P2 (sigmoid + sinkhorn + comb)
+// — small serial work, ~15µs. P345 moves P3 (li_raw = Σ pre_s·x, column-
+// independent) + P4 (Σli² partials) + P5 (·rsq·nw) onto a grid(s, NB)
+// multi-block launch: 16 blocks × 256 threads split the h=4096 columns —
+// the x read spreads over 16 SMs' L2 bandwidth instead of 1.
+// FP notes: P3 keeps the per-column i-ascending FMA chain (bit-identical
+// to the old in-smem P3); P4's reduction TREE changes (16 block partials
+// serial-summed vs the old 32-warp tree — 1ulp risk, validated by 出师表);
+// P5 is li_raw·inv·nw — same op order as before.
+
+// restA (Plan N v1): P1 (mx partial reduce + rsq) + P2 (sigmoid pre_s/post
+// + sinkhorn + comb) — the serial-small work, ONE block per token, 256
+// threads. The old rest kernel's P3/P4/P5 (the 64KB x read + rmsnorm tail)
+// moved to hc_pre_p345_kernel (grid(s, NB) multi-block). pre_s now lands
+// in GLOBAL scratch (p345's 16 blocks read it); the 82KB smem + cp.async
+// prefetch are gone (x is p345's input, streamed from L2 across 16 SMs).
+__global__ void hc_pre_restA_kernel(const float* __restrict__ mx_in,
                                    const float* __restrict__ scale,
                                    const float* __restrict__ base,
-                                   const float* __restrict__ nw,
-                                   float* __restrict__ li,
+                                   float* __restrict__ pre_s_g,
                                    float* __restrict__ post,
                                    float* __restrict__ comb,
                                    int s, int n, int h, int mix, int mix_ks,
                                    float rms_eps, float hc_eps, int iters) {
     int t = blockIdx.x;
     if (t >= s) return;
-    const float* x = res + (size_t)t * n * h;
     const int nh = n * h;
     extern __shared__ float sm[];
-    // cp.async staging: x prefetched here (overlaps with P1/P2)
-    float* smem_x = sm;                          // [nh] = n*h floats
-    float* mx_s = sm + nh;                       // [mix]
-    float* cb = sm + nh + mix;                   // [n*n]
-    float* pre_s = sm + nh + mix + n * n;        // [n]
-    float* li_s = sm + nh + mix + n * n + n;     // [h]
-    float* red = li_s + h;   // [WMAX+8]
-
-    // ── 1. cp.async prefetch: x → smem_x via the DMA engine (128+ outstanding
-    // L2 requests vs the LSU's ~48 — 2.6× faster than the LSU path for the
-    // 64KB bulk copy). Fire-and-forget (overlaps with P1/P2 below). ──
-    {
-        const char* xc = (const char*)x;
-        char* sc = (char*)smem_x;
-        int total_bytes = nh * (int)sizeof(float);
-        for (int off = threadIdx.x * 16; off < total_bytes; off += (int)blockDim.x * 16) {
-            unsigned saddr = (unsigned)__cvta_generic_to_shared(sc + off);
-            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(saddr), "l"(xc + off));
-        }
-        asm volatile("cp.async.commit_group;");
-        // NO __syncthreads here — the DMA runs in the background while P1/P2
-        // execute. The wait_group 0 comes after P2 (before P3's smem_x reads).
-    }
+    float* mx_s = sm;                    // [mix]
+    float* cb = sm + mix;                // [n*n]
+    float* red = sm + mix + n * n;       // [48]
 
     // PROLOGUE (K-split phase-2): reduce the KS partial dots per mix row
-    // and apply rsq (Σx² block reduce — was phase-1 per-block redundant).
+    // and apply rsq (Σx² partials from mix_split's m==0 lanes — 8 adds
+    // replace the old full-nh re-read).
     // mx_in layout: [t][mix][ks] partials from hc_pre_mix_split_kernel.
     {
-        // Σx² FUSED into the mix_split (m==0 lanes): the tail [s][mix_ks]
-        // scratch holds the z-segment partials — 8 adds replace the full nh
-        // re-read (16K floats ~15µs × 90/step = 1.35ms).
         float msq = 0.f;
         if (threadIdx.x == 0) {
             const float* xsq = mx_in + (size_t)s * mix * mix_ks;
@@ -3937,9 +3912,11 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
     }
     const float* mx = mx_s;
 
-    // pre / layer_input, post, comb (parallel across n for sigmoid)
+    // pre / layer_input, post, comb (parallel across n for sigmoid).
+    // pre_s goes STRAIGHT to global scratch (p345's 16 blocks read it —
+    // the old in-smem pre_s fed this kernel's own P3, which moved out).
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        pre_s[i] = 1.0f / (1.0f + __expf(-(mx[i] * scale[0] + base[i]))) + hc_eps;
+        pre_s_g[(size_t)t * n + i] = 1.0f / (1.0f + __expf(-(mx[i] * scale[0] + base[i]))) + hc_eps;
         post[t * n + i] = 2.0f * (1.0f / (1.0f + __expf(-(mx[n + i] * scale[1] + base[n + i]))));
     }
     __syncthreads();
@@ -3977,54 +3954,79 @@ __global__ void hc_pre_rest_kernel(const float* __restrict__ res,
         }
         for (int i = 0; i < n * n; i++) comb[(size_t)t * n * n + i] = cb[i];
     }
-    __syncthreads();
-    // ── 2. cp.async completion barrier (the DMA overlapped with P1/P2 above;
-    // the 64KB copy at DMA 128-outstanding ≈ 16µs vs LSU path ~42µs) ──
-    asm volatile("cp.async.wait_group 0;");
-    __syncthreads();
-    // ── 3. P3: li = Σ_i pre_i · smem_x[i*h + j] (parallel over h) — reading
-    // from SHARED (prefetched above, 20TB/s) instead of GLOBAL (load-use
-    // dependency chain at ~8GB/s effective on 1 SM). Staged in li_s smem,
-    // then FUSED rmsnorm tail. NOTE: the n==4 specialized path (4 independent
-    // float4 loads) produced garbled text — reverted; the runtime-n loop's
-    // sequential load→FMA→load chain is numerically correct.
-    for (int j = threadIdx.x << 2; j < h; j += blockDim.x << 2) {
-        if (j + 3 < h) {
-            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-            #pragma unroll
-            for (int i = 0; i < n; i++) {
-                const float* xr = smem_x + (size_t)i * h + j;
-                float4 xv = *reinterpret_cast<const float4*>(xr);
-                a0 += pre_s[i] * xv.x;
-                a1 += pre_s[i] * xv.y;
-                a2 += pre_s[i] * xv.z;
-                a3 += pre_s[i] * xv.w;
-            }
-            li_s[j] = a0; li_s[j + 1] = a1; li_s[j + 2] = a2; li_s[j + 3] = a3;
-        } else {
-            for (int jj = j; jj < h; jj++) {
-                float acc = 0.f;
-                for (int i = 0; i < n; i++) acc += pre_s[i] * smem_x[(size_t)i * h + jj];
-                li_s[jj] = acc;
-            }
-        }
+}
+
+// P345 (Plan N v1): P3 (li_raw per column) + P4 (Σli² block partials) + P5
+// (·rsq·nw) on grid(s, NB=16) — the multi-block split of what the old rest
+// kernel serialized on ONE block (the 64KB x read cold at 1 SM ~8GB/s
+// effective = the 40µs serve-real gap). Block b owns hpb=256 columns; the
+// is_last block (atomic ctr over NB) reduces the partials and runs P5 over
+// ALL h columns (its li_raw reads are L2-hot — the peers just wrote them).
+// FP: P3 keeps the per-column i-ascending FMA chain (bit-identical to the
+// old in-smem P3); P4's reduction TREE changes (16 block partials
+// serial-summed vs the old 32-warp tree — 1ulp risk, validated by 出师表);
+// P5 = li_raw·inv·nw (same op order as the old P5).
+__global__ void hc_pre_p345_kernel(const float* __restrict__ res,
+                                   const float* __restrict__ pre_s_g,
+                                   const float* __restrict__ nw,
+                                   float* __restrict__ li,       // [s][h] in: li_raw, out: li
+                                   float* __restrict__ p4_part,  // [s][NB] Σli² partials
+                                   unsigned* __restrict__ ctr,   // [s] is_last counter (pre-zeroed)
+                                   int s, int n, int h, float rms_eps) {
+    const int NB = gridDim.y;
+    int t = blockIdx.x;
+    if (t >= s) return;
+    const int b = blockIdx.y;
+    const int hpb = (h + NB - 1) / NB;
+    const int col = b * hpb + (int)threadIdx.x;
+    const float* x = res + (size_t)t * n * h;
+    __shared__ float ps[8];
+    __shared__ float red[8];
+    __shared__ int last;
+    __shared__ float inv_s;
+    if (threadIdx.x < 8) {
+        float v = 0.f;
+        if (threadIdx.x < n) v = pre_s_g[(size_t)t * n + threadIdx.x];
+        ps[threadIdx.x] = v;
     }
     __syncthreads();
-    float ss = 0.f;
-    for (int j = threadIdx.x; j < h; j += blockDim.x) ss += li_s[j] * li_s[j];
+    // P3: li_raw[col] = Σ_i pre_s[i]·x[i·h+col] — one column per thread,
+    // i-ascending FMA chain (same numeric order as the old in-smem P3;
+    // warp lanes read consecutive columns = coalesced 128B per row).
+    float acc = 0.f;
+    if (col < h) {
+        for (int i = 0; i < n; i++) acc += ps[i] * x[(size_t)i * h + col];
+        li[(size_t)t * h + col] = acc;   // li_raw staged in place (P5 overwrites)
+    }
+    // P4: Σli_raw² block partial (warp tree + red[8] serial sum)
+    float ss = acc * acc;
     for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
     __syncthreads();
     if (threadIdx.x == 0) {
+        float tot = 0.f;
+        for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red[w];
+        p4_part[(size_t)t * NB + b] = tot;
+    }
+    // is_last election: the last block to arrive reduces the partials and
+    // runs P5 (write visibility: peers' stores → threadfence → atomic).
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0)
+        last = (atomicAdd(&ctr[t], 1u) == (unsigned)NB - 1u) ? 1 : 0;
+    __syncthreads();
+    if (!last) return;
+    if (threadIdx.x == 0) {
         float tt = 0.f;
-        for (int i = 0; i < 32; i++) if (i < (blockDim.x + 31) >> 5) tt += red[i];
-        red[0] = rsqrtf(tt / h + rms_eps);
+        for (int q = 0; q < NB; q++) tt += p4_part[(size_t)t * NB + q];
+        inv_s = rsqrtf(tt / (float)h + rms_eps);
+        ctr[t] = 0u;   // reset for the next launch (stream/graph ordered)
     }
     __syncthreads();
-    float inv = red[0];
-    for (int j = threadIdx.x; j < h; j += blockDim.x) {
-        li[(size_t)t * h + j] = li_s[j] * inv * nw[j];
-    }
+    const float inv = inv_s;
+    // P5: li = li_raw · inv · nw[j] (in-place over ALL h columns, this block)
+    for (int c = threadIdx.x; c < h; c += blockDim.x)
+        li[(size_t)t * h + c] = li[(size_t)t * h + c] * inv * nw[c];
 }
 
 extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
@@ -4035,51 +4037,38 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
                                             int s, int n, int h, int mix,
                                             float rms_eps, float hc_eps, int iters,
                                             cudaStream_t stream) {
-    // Phase 1: K-SPLIT mix computation + P12 (v12: the last block does P1/P2)
-    // grid(s, mix, KS=8) = 192 blocks. The last block (atomic counter) does
-    // the P1 (mx reduce) + P2 (sinkhorn + pre_s/post/comb to global scratch).
-    // The pre_s in the global enables the future GEMV prologue fusion.
-    // Scratch layout: mx partials [0, s*192) + Σx² [s*192, s*200) + ctr [s*200, s*201)
-    // + pre_s [s*201, s*205).
-    unsigned* ctr = (unsigned*)(mx_scratch + s * mix * HC_MIX_KS + s * HC_MIX_KS);
-    float* pre_s_g = mx_scratch + s * mix * HC_MIX_KS + s * HC_MIX_KS + s;
-    cudaMemsetAsync(ctr, 0, sizeof(unsigned), stream);
+    // Plan N v1: three launches —
+    //   1. mix_split  grid(s, mix, KS=8): mx partials + Σx² partials (192 blk)
+    //   2. restA      grid(s): P1 reduce + P2 sigmoid/sinkhorn (serial-small,
+    //                 ~15µs — no more x read, no 82KB smem)
+    //   3. P345       grid(s, NB=16): P3 li_raw columns + P4 partials +
+    //                 is_last P5 (·rsq·nw) — the old rest kernel's P3-P5 ran
+    //                 on ONE block (62µs/layer serve-real: 64KB x cold read
+    //                 at 1 SM); 16 blocks spread it over L2.
+    // Scratch layout: [mx: s*mix*KS][Σx²: s*KS][old ctr: s][pre_s: s*n]
+    // [p4 partials: s*NB][p345 ctr: s] — Rust allocates
+    // s*(mix*8 + 8 + 1 + n + 17) floats.
+    const int NB = HC_P345_NB;
+    float* pre_s_g = mx_scratch + (size_t)s * mix * HC_MIX_KS + (size_t)s * HC_MIX_KS + s;
+    float* p4 = pre_s_g + (size_t)s * n;
+    unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
+    cudaMemsetAsync(ctr2, 0, sizeof(unsigned) * (size_t)s, stream);
     dim3 mix_grid(s, mix, HC_MIX_KS);
-    // P12 smem: the is_last block uses extern __shared__ p12_sm[]
-    // (mx_s[mix] + red2[48]) — launch smem was 0 (v12 bug: smem OOB →
-    // err 700 at hc_pre_dev; 288 bytes fixes it).
-    size_t p12_sm_bytes = (size_t)(mix + 48) * sizeof(float);
-    hc_pre_mix_split_kernel<<<mix_grid, 256, p12_sm_bytes, stream>>>(
-        res, fw, mx_scratch, scale, base, pre_s_g, post, comb, ctr,
-        s, n, h, mix, rms_eps, hc_eps, iters);
+    hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+        res, fw, mx_scratch, s, n, h, mix);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
 
-    // Phase 2: rest (single block per token — sinkhorn + li + post + comb)
-    // + FUSED rmsnorm tail (nw = input_layernorm weight): li comes out
-    // normalized — saves the standalone rmsnorm launch per layer segment.
-    // PROLOGUE: reduce the KS mix partials + rsq (Σx²).
-    // TILE FIX (verify chain was 26.7% of step): grid=s (n=3 verify -> 3
-    // blocks on 148 SMs) at 256 thr = 12.5% SM warp occupancy — the global
-    // reads (nh + h + li writes) stall on latency. 1024 threads = 32 warps
-    // (50% occupancy) cuts the li/prologue rounds 4x. red[] now sized for
-    // 32 warp partials; msq slot moved to red[39]. NOTE: the rmsnorm warp
-    // partial ORDER changed (8 -> up-to-32 ascending) — validated by
-    // 出师表 recitation (garbling = revert this).
-    // smem: smem_x[n*h] (cp.async prefetch staging — the P3 reads from shared
-    // at 20TB/s instead of global's load-use chain at ~8GB/s on 1 SM) +
-    // mx_s[mix] + cb[n*n] + pre_s[n] + li_s[h] + red[40]  (~82.3KB total)
-    size_t smem2 = ((size_t)(n * h + mix + n * n + n) + h + 48) * sizeof(float);
-    // opt-in >48KB dynamic smem (n*h=64KB staging + 18KB existing = 82KB;
-    // the default per-block limit is 48KB). NO static bool — the TP setup has
-    // 4 CUDA contexts (one per GPU); a process-wide static would only set the
-    // attribute on the FIRST context, leaving ranks 1-3 failing silently.
-    cudaFuncSetAttribute(hc_pre_rest_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         (int)smem2);
-    hc_pre_rest_kernel<<<s, 1024, smem2, stream>>>(
-        res, mx_scratch, scale, base, nw, li, post, comb,
+    size_t smem_a = (size_t)(mix + n * n + 48) * sizeof(float);
+    hc_pre_restA_kernel<<<s, 256, smem_a, stream>>>(
+        mx_scratch, scale, base, pre_s_g, post, comb,
         s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+
+    dim3 p345_grid(s, NB);
+    hc_pre_p345_kernel<<<p345_grid, 256, 0, stream>>>(
+        res, pre_s_g, nw, li, p4, ctr2, s, n, h, rms_eps);
     return cudaGetLastError();
 }
 
