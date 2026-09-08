@@ -3201,7 +3201,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // (128KB/block) reaches 22GB/s/SM. Processing MAXN tokens per block
     // amortizes that latency MAXN-fold; `part` holds the per-token partials.
     const int MAXN = 64;
-    const int TT = 8; // tokens per block (middle ground: 512 blocks gave too
+    const int TT = 4; // tokens per block (middle ground: 512 blocks gave too
                       // little parallelism per SM, 8192 paid the fixed
                       // per-block latency 16x)
     __shared__ float part[MAXN][8][16]; // [tok][h row][slot]
@@ -3336,7 +3336,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     dim3 block(288); // 9 warps: topk routed (8) + shared
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
-    dim3 grid((hidden + 7) / 8, (n + 7) / 8, 1);
+    dim3 grid((hidden + 7) / 8, (n + 3) / 4, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
