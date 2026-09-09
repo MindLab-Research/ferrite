@@ -823,6 +823,15 @@ pub struct CudaBackend {
     /// same-x gemvs. Buffers are never freed (a captured graph holds the
     /// addresses) and a capture never allocates.
     xq_cache: std::sync::Mutex<std::collections::HashMap<i32, (DevBuf, DevBuf, usize, u64, bool)>>,
+    /// bf16-cast cache for gemm_cublas: the same-x GEMM groups (DSA:
+    /// wk/weights_proj/gate; GDN: qkv/b/fa/ga) re-cast the SAME x on every
+    /// call — one cast per (ptr, gen) PER CHAIN PASS instead of one per GEMM.
+    /// The `valid` flag is cleared at each chain-pass start (the capture pass
+    /// must re-record its own cast node — a persistent hit would leave the
+    /// graph WITHOUT a cast and the replays would read a stale xb). The
+    /// buffers persist for the graphs' lifetime (the graph nodes reference
+    /// them; bounded by the unique-x count ~100 × 128KB).
+    xb_cache: std::sync::Mutex<std::collections::HashMap<(usize, u64), (DevBuf, bool)>>,
     /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
     /// scale) device tables for the fused MoE kernels.
     moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
@@ -946,6 +955,7 @@ impl CudaBackend {
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             xq_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            xb_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             gdn_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1934,14 +1944,38 @@ impl CudaBackend {
     fn gemm_cublas(&self, x: &DevBuf, w: *const std::ffi::c_void,
                    n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
         let do_ = DevBuf::alloc(self.dev, self.stream, (n * out_f) as usize)?;
-        let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
-        ck(
-            unsafe {
-                ferrite_f32_to_bf16(x.as_const_f32(), xb.as_f32() as *mut std::ffi::c_void,
-                                    (n * in_f) as i64, self.stream)
-            },
-            "cast bf16",
-        )?;
+        // bf16-cast cache (same-x GEMM groups): ONE cast per (ptr, gen) per
+        // chain pass — the 2nd..Nth GEMMs of the group reuse the buffer. The
+        // valid flag resets at each pass start so the CAPTURE pass records
+        // its own cast node (a persistent hit would leave the graph without
+        // a cast → the replays read a stale xb).
+        let key = (x.as_const_f32() as usize, x.gen);
+        let xbp: *const f32;
+        {
+            let mut c = self.xb_cache.lock().unwrap();
+            match c.get_mut(&key) {
+                Some((b, valid)) if *valid => {
+                    xbp = b.as_const_f32();
+                }
+                entry => {
+                    let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
+                    ck(
+                        unsafe {
+                            ferrite_f32_to_bf16(x.as_const_f32(),
+                                                xb.as_f32() as *mut std::ffi::c_void,
+                                                (n * in_f) as i64, self.stream)
+                        },
+                        "cast bf16",
+                    )?;
+                    xbp = xb.as_const_f32();
+                    match entry {
+                        Some((b, v)) => { *b = xb; *v = true; }
+                        None => { c.insert(key, (xb, true)); }
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
         // Handle created on first use: the dry-run reaches here BEFORE the
         // capture pass, and cublasCreate is illegal inside a capture.
         let h = {
@@ -1959,7 +1993,7 @@ impl CudaBackend {
             cublasGemmEx(
                 h, 1, 0, out_f, n, in_f,
                 &alpha, w, 14, in_f,
-                xb.as_const_f32() as *const std::ffi::c_void, 14, in_f,
+                xbp as *const std::ffi::c_void, 14, in_f,
                 &beta, do_.as_f32() as *mut std::ffi::c_void, 0, out_f,
                 0, 99,
             )
@@ -1976,6 +2010,17 @@ impl CudaBackend {
         let mut c = self.xq_cache.lock().unwrap();
         for v in c.values_mut() {
             v.4 = false;
+        }
+    }
+
+    /// Reset the bf16-cast cache's validity at each CHAIN-PASS start — the
+    /// capture pass must re-record its own cast node (a persistent hit would
+    /// leave the graph without a cast → the replays read a stale xb). The
+    /// buffers persist (the graph nodes reference them).
+    pub fn clear_xb_cache(&self) {
+        let mut c = self.xb_cache.lock().unwrap();
+        for v in c.values_mut() {
+            v.1 = false;
         }
     }
 

@@ -3214,6 +3214,9 @@ fn mega_chain_dev_batched(
         .backend
         .as_cuda()
         .ok_or_else(|| FerriteError::Config("batched needs cuda backend".into()))?;
+    // bf16-cast cache validity resets per chain pass: the capture pass must
+    // record its own cast nodes (the graph replays re-cast the fresh x).
+    cuda.clear_xb_cache();
     let nccl = s
         .nccl
         .clone()
