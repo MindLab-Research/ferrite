@@ -3972,6 +3972,19 @@ impl CudaBackend {
     /// kernels (the graph executes those at replay). Call BEFORE every
     /// graph replay.
     pub fn dsa_host_advance(&self, seq: u64, family: usize, n: usize) {
+        // HOST-WRITE ORDERING (2026-09-09 root cause): the pinned t0/total are
+        // written by the HOST here and read zero-copy by the DSA kernels. Host
+        // stores are NOT ordered w.r.t. the device's in-flight reads of the
+        // same slot — if the PREVIOUS step's (or this step's earlier layer's)
+        // kernels are still running they observe the new (larger) total and
+        // index past the cache into an unmapped 2MB page (Xid 31 PDE fault).
+        // Evidence: the batched chain runs clean whenever a per-layer sync is
+        // present (FERRITE_MEGA_PROBE=1) and faults otherwise; a pre-step sync
+        // alone is not enough because the writes happen per layer.
+        // FERRITE_NO_ADV_SYNC=1 disables this for A/B.
+        if std::env::var_os("FERRITE_NO_ADV_SYNC").is_none() {
+            let _ = self.sync();
+        }
         let mut m = self.dsa_caches.lock().unwrap();
         if let Some(c) = m.get_mut(&(seq, family)) {
             let t0 = c.t_count;
