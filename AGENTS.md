@@ -215,7 +215,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 
 steady×16 ≈ **1029**。device 推进的两个坑（f157cb0）：单 seq→batched 切换时 pinned t0 落后 1（batched 首个 append 覆写最后 solo token）→ dry pass 的簿记循环从 map 的 t_count 写回 pinned（handoff sync）；capture pass 不能写（会把 kernel 已推进的值倒退）。
 
-**已验证无效（gate off 保留代码）**：e4m3 MMA down（隔离 2.14x 但 in-serve +0.37ms——in-serve SIMT 本来就 43µs/层 vs 隔离 108µs，隔离基准是幻觉）；n==16 bf16 wmma 投影（无 K-split，6x 回退）；P2P AR 复测仍死锁（30s 监护杀，驱动未 wedge）。
+**已验证无效（gate off 保留代码）**：e4m3 MMA down v1/v2（**修正基准参数后**——旧 bench 误用 inter_shared=512，SIMT 对 klen≠256 走标量慢路径，造出"108µs/指令瓶颈/2.14x"三重假象；正确参数下 SIMT 43.7µs=in-serve 实测，v1 48.6 / v2 连续读 49.4 均**更慢**——down 在 2.5TB/s 有效带宽的地板，勿再试 MMA 化）；n==16 bf16 wmma 投影（无 K-split，6x 回退）；P2P AR 复测仍死锁（30s 监护杀，驱动未 wedge）。**教训：隔离基准必须用生产的真实 shape（inter_shared 等），错一个参数结论全反。**
 
 **当前分解**（每步每卡）：MoE 3.85（act 1.81 已达实测带宽峰/down 1.77/route 0.26）· AR 2.66（NCCL 会合地板 90×29.5µs）· hc 2.11 · 投影 cuBLAS 族 2.2（DSA/GDN 小投影 bf16-only + 每 GEMM 一次 f32→bf16 cast）· DSA 1.11 · GDN 1.18 · 间隙+host ~0.6。
 **通往 1600（≤10ms）**：已识别 kernel 杠杆全做 ≈ 13.2-13.7ms（≈1200 tok/s）；剩余 ~3ms 缺口需结构改动：**MoE 改 EP**（消除 42 次 FFN AR ≈ −1.2ms + dispatch/combine）或单 kernel 自定义 AR（P2P 死锁史，风险高）。
