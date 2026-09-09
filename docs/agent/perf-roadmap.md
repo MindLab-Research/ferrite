@@ -823,3 +823,19 @@ overlapped (2 streams): 0.035 ms/pair  (82% of sequential)
 
 **下一步**：同一手段用到 `moe_fused_down_sum_fp8`（89µs × 42 层 ≈ 3.75ms，仍是 SIMT）与
 `sparse_attn`/`indexer`。
+
+**后续（2026-09-09，同一会话）**：`quant_e4m3_tokens` 改成 1024 线程 + float4（原 256 线程、
+每线程串行 16 次循环、只有 n 个 block = 12% 占用率）。它每步被调 ~200 次（每层每个不同的
+(x, in_f) 一次），**直接在 MMA gemv 的关键路径上**。
+
+| 配置 | 16-seq 中位步时 | 聚合 | 端到端 |
+|---|---|---|---|
+| 基线（SIMT gemv） | 19.20 ms | 833 tok/s | 650 |
+| + CUTLASS 级 fp8 MMA gemv | 17.44 ms | 917 | 716 |
+| **+ 快量化 kernel** | **15.07 ms** | **1062 tok/s** | 459（admit 污染） |
+
+`FERRITE_GEMV_MMA_DEBUG=1` 验证：decode 的**所有** matmul_dev 形状都命中 MMA
+（1536×4096 / 512×4096 / 2048×1536 / 4096×2048 / 4096×1536），无 SIMT 漏网。
+
+**踩坑记录**：`pkill -9 -f nsys` 会匹配自己的 ssh 命令行 → 自杀 exit 255（AGENTS.md 早有记录，
+这次又踩）；用 `pgrep -x nsys` 精确匹配。nsys 的 `stats` 必须在 profile 写完后单独跑。
