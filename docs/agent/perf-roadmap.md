@@ -470,3 +470,12 @@ replay 16.06ms/996 tok/s 看似大胜，**但文本全是 `!!!!!`** —— 128 �
 `ferrite_moe_fused_act_fp8_mma_v2`，Rust 侧先调 `quant_e4m3_tokens` 把 x 量化一次/层，
 再传 `xq`/`xs` 进 kernel（`if (xq != nullptr)` 快路径）。所以"每 block 重复量化同一 token"
 的冗余**不存在**，此项无需优化。
+
+### 已证伪：MoE 专家分组（grid 顺序诊断）
+
+把 act 的 grid 从 `(inter/16, topk+1, n)`（token 最慢 → 同 token 的 9 个 slot 相邻，专家局部性最好）
+换成 `(n, topk+1, inter/16)`（token 最快 → 同 (row-tile,slot) 跨 token 的块相邻，读**不同**专家，
+局部性最差）：per-seq 59.2-59.3 vs 58.7-59.2，**完全相同**。
+
+→ **act 的 L2 局部性不是瓶颈**，专家分组（把权重读取从 1.23x 冗余降到 1x、并让 MMA 的 N=8 装 8 个
+不同 token）**不会带来收益**，已从候选清单移除。act 的 4TB/s 是它在这个访问模式下的实际上限。
