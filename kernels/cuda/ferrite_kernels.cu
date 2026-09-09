@@ -6115,14 +6115,13 @@ __global__ void __launch_bounds__(256, 4) gemv_fp8_tri_kernel(
     int in_f, int o1, int o2, int o3, int nrows, int scols) {
     const int T = o1 + o2 + o3;
 
-    (void)srows;
     const int warps = blockDim.x >> 5;
     const int rpb = warps / WPR;               // rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     // 8 rows per warp-group with the x slice CACHED in registers: the same
     // token's x row is re-read by every (block, row) otherwise (measured
     // 196MB of x vs 49MB of weights per call -> L2-bound).
-    const int R = ((out_f & 7) == 0) ? 8 : 1;
+    const int R = ((T & 7) == 0) ? 8 : 1;
     const int rowg0 = (blockIdx.x * rpb + warp / WPR) * R;   // row within the CONCAT space
     const int kw = warp % WPR;                 // K-slice id
     const int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
