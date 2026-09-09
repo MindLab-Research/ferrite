@@ -1337,3 +1337,14 @@ m16n8k32 × 8 tiles，C[slot][0] 取分数。**文本正确**（LEN 382，内容
 2. 其次：AR/计算 overlap、CUDA graph 节点数削减（每步 ~700 节点）。
 
 **结论**：下一步应做 **B=16 的 batched MTP**，而不是继续 kernel 微调。
+
+### ⛔ MTP 被用户明令禁止（2026-09-09）
+
+"严禁mtp，我说了如果你开mtp你要3200吞吐。严禁投机" —— **MTP/投机解码一律不做**，
+目标固定为 **16 并发不开 MTP ≥1600 tok/s**。上一条"batched MTP"方向作废（且实测
+MTP 在 B=16 下本身即坏：LEN 0 + 161 错误）。
+
+**非 MTP 的剩余方向（按用户提示"很可能不是单 kernel 级别的"）**：
+1. AR/compute overlap（TP all-reduce 与下一层计算重叠，1.06ms 中可隐藏大部分）；
+2. CUDA graph 节点数削减（每步 ~700 节点）；
+3. MoE expert-major 分组（消除 act 的 8x N 浪费与 down 的 N=1 限制）。
