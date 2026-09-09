@@ -4112,7 +4112,7 @@ __global__ void indexer_topk_batched_kernel(
     // per thread, so only t (~112) threads of 1024 did any work (the whole
     // kernel ran at ~1% of the GPU). Each group splits the heads and the
     // shuffle reduces within the group.
-    const int TG = 8;   // 2x the per-thread columns on the latency-bound pool dot
+    const int TG = 4;   // 4x the per-thread columns
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
     const int ngroups = blockDim.x / TG;
@@ -4134,7 +4134,7 @@ __global__ void indexer_topk_batched_kernel(
             }
             // group mask (8 contiguous lanes within the warp): 0xffffffff
             // would deadlock when some groups have no pools and skip this.
-            const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);   // 8-lane groups (TG=8) — must match TG
+            const unsigned gmask = 0xfu << ((threadIdx.x & 31) & ~3u);   // 4-lane groups (TG=4) — must match TG
             #pragma unroll
             for (int off = TG / 2; off > 0; off >>= 1) s += __shfl_down_sync(gmask, s, off);
             if (lid == 0) sm[j] = s * inv_sqrt_d;
