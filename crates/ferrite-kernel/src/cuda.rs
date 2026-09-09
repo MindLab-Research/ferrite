@@ -1953,26 +1953,41 @@ impl CudaBackend {
         let xbp: *const f32;
         {
             let mut c = self.xb_cache.lock().unwrap();
+            let mut dst: *mut f32 = std::ptr::null_mut();
             match c.get_mut(&key) {
                 Some((b, valid)) if *valid => {
                     xbp = b.as_const_f32();
                 }
                 entry => {
-                    let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
+                    // Re-cast INTO the existing buffer on a re-validating hit:
+                    // REPLACING the DevBuf would drop a buffer that
+                    // previously-captured graphs still reference (the graphs
+                    // are kept across retires) — the pool recycles it and the
+                    // replays corrupt (the B=16 36-token Xid crash).
+                    dst = match entry {
+                        Some((b, v)) => {
+                            *v = true;
+                            b.as_f32()
+                        }
+                        None => {
+                            let xb = DevBuf::alloc(
+                                self.dev, self.stream,
+                                ((n * in_f) as usize + 1) / 2,
+                            )?;
+                            let p = xb.as_f32();
+                            c.insert(key, (xb, true));
+                            p
+                        }
+                    };
                     ck(
                         unsafe {
                             ferrite_f32_to_bf16(x.as_const_f32(),
-                                                xb.as_f32() as *mut std::ffi::c_void,
+                                                dst as *mut std::ffi::c_void,
                                                 (n * in_f) as i64, self.stream)
                         },
                         "cast bf16",
                     )?;
-                    xbp = xb.as_const_f32();
-                    match entry {
-                        Some((b, v)) => { *b = xb; *v = true; }
-                        None => { c.insert(key, (xb, true)); }
-                        _ => unreachable!(),
-                    }
+                    xbp = dst as *const f32;
                 }
             }
         }
