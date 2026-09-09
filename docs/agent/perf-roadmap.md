@@ -803,3 +803,23 @@ overlapped (2 streams): 0.035 ms/pair  (82% of sequential)
 
 **已验证的孤立优化（保留）**：gemv `__launch_bounds__(256,4)` —— ncu 复测 53.5→39.0µs、
 占用率 23.3→45.6%、No Eligible 74.8→48.9%、寄存器 84→64；微基准 q_a 46→31µs、head 489→353µs。
+
+### ✅ 保留：CUTLASS 级 fp8 tensor-core gemv（2026-09-09，端到端 −9.2%）
+
+**微基准**（`kernels/cuda/gemv_bench.cu`，n=16，与 fp64 参考逐位一致 maxrel=0）：
+
+| shape | SIMT `gemv_fp8_v2` | **MMA `gemv_fp8_mma_b16`** | 加速 |
+|---|---|---|---|
+| q_a 1536×4096 | 0.031 ms | **0.006 ms** | **5.2x** |
+| lm_head 19360×4096 | 0.353 ms | **0.041 ms** | **8.6x** |
+
+**serve 端（16 并发，live=16 确认）**：19.20 → **17.44 ms/步（−9.2%）**，聚合 **833 → 917 tok/s**，
+端到端 650 → 716.5 tok/s，文本 LEN 139 直接背诵《出师表》✓。
+
+**做法**（复用 act kernel 已验证的骨架）：M=16 token × N=8 输出行/warp × warp 级 K-split；
+3 段 cp.async 流水（`wait_group 2/1/0`）；`ldmatrix.x4` 取 A 片段；B 片段按 `lane>>2` 取不同输出行；
+权重按原生 e4m3 读（1 字节，SIMT 版是 bf16 的 2 字节）；x 每层量化一次并缓存
+（`xq_cache`，捕获期禁止分配，缓冲区永不释放）。**grid = out_f/8 = 192 blocks**（早先失败版是 24 blocks）。
+
+**下一步**：同一手段用到 `moe_fused_down_sum_fp8`（89µs × 42 层 ≈ 3.75ms，仍是 SIMT）与
+`sparse_attn`/`indexer`。
