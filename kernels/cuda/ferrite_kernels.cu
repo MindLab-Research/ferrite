@@ -3476,10 +3476,9 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
     int inter_shared, int topk, float limit,
     const unsigned char* __restrict__ xq, // [n, hidden] e4m3 — PRE-QUANTIZED (v2; null = per-block v1)
     const float* __restrict__ xs) {        // [n] per-token scales (v2)
-    // DIAGNOSTIC: token as the FASTEST grid dim (worst-case expert locality).
-    const int tok = blockIdx.x;
     const int slot = blockIdx.y;
-    const int m0 = blockIdx.z * 16;        // 16 inter rows per block
+    const int tok = blockIdx.z;
+    const int m0 = blockIdx.x * 16;        // 16 inter rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
     const int stride = topk * inter + inter_shared;
@@ -3686,7 +3685,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
 {
     int max_rows = inter > inter_shared ? inter : inter_shared;
     if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported; // v1 alignment
-    dim3 grid((unsigned)n, topk + 1, max_rows / 16);   // DIAGNOSTIC
+    dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
     const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
@@ -3714,7 +3713,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
 {
     int max_rows = inter > inter_shared ? inter : inter_shared;
     if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported;
-    dim3 grid((unsigned)n, topk + 1, max_rows / 16);   // DIAGNOSTIC
+    dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
     const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
