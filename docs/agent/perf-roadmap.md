@@ -940,3 +940,19 @@ B 片段的 per-warp 复用在某些 warp 上的地址错位、或 weight scale 
 
 **测试 prompt**：`/tmp/bench_tr.py` 已用"详细介绍 Transformer 原理…越长越好"（输出 ~2000 tok，
 稳态窗口更长、样本更多）；`/tmp/txtcheck.py` 仍用《出师表》做人眼文本校验。
+
+### sparse_attn TG=8：修掉一个 UB（2026-09-09）
+
+原代码 `TG = 2` 但 `glane0 = (lane & ~7)`（8 对齐）—— dup 去重标志的广播
+`__shfl_sync(gmask, dup, glane0)` 的源 lane 落在 **2-lane 掩码之外**（未定义结果）。
+把 TG 改成 8 让掩码与 glane0 一致（`0xff << (lane & ~7)`），顺带把每 lane 的串行 FMA
+从 128 降到 32。实测 14.61 ms / 1095 tok/s（与 14.33/1117 同处 ±2% 噪声带），
+文本 LEN 139 ✓。**这是正确性修复，不是性能优化，按"禁止回滚"保留。**
+
+### 关键事实：index_kpool = 4（不是 64）
+
+模型 config：`index_topk = 2048`、`index_kpool = 4`、`index_n_heads = 32`、`index_head_dim = 128`、
+`index_kpool_always_select_tail = true`。因此
+`select_k_max = index_topk / kpool = 512`（pool 单位）= **2048 个 token**，
+快路径（`select_k >= jmax`）覆盖 **≤2048 token** 的上下文；超过就走真 top-k。
+（用户曾以为 SGLang 的 top-2048 对应 128K token —— 那是 2048×64 的算法；本模型 kpool=4。）
