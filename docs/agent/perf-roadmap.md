@@ -608,3 +608,24 @@ nsys 在 HTTP 路径不可用（见上），改用**内核跳过消融**（纯�
 **冲 1600 需要三块同时动**：attention（MLA 吸收+tensor core，约 4x）、MoE（DeepGEMM 级 MMA，约 2x）、
 AR（12%→6%）。按 16.7ms 步时粗算：40%→10% + 27%→15% + 12%→6% ≈ 9.2ms/步 ≈ 1740 tok/s。
 `FERRITE_MOE_SKIP` 是**诊断专用**（输出乱码），保留在 launcher 里供后续复测。
+
+### 消融法完整分解（2026-09-08，最终 build，per-seq steady 为准）
+
+| 配置 | per-seq steady | 占比 |
+|---|---|---|
+| 基线 | 58.3–60.0 | — |
+| `FERRITE_GEMV_SKIP=1`（新增） | **81.4** | gemv ≈ **26%** |
+| `FERRITE_MOE_SKIP=1`（新增） | 80.0–81.9 | MoE ≈ **27%** |
+| `FERRITE_AR_SKIP=1` | 66.7–69.0 | AR ≈ 12–13% |
+| `FERRITE_ATTN_SKIP=1`（新增） | 57.4 | indexer+sparse ≈ **0–3%（无收益）** |
+
+**重要转向**：gemv（26%）与 MoE（27%）是并列最大单项，二者合计 53%。而 `indexer_topk_batched` +
+`sparse_attn_v2_batched` 跳过**没有收益** → **"MLA 吸收 + tensor-core sparse_attn（约 4x）"不是主战场**，
+因为注意力的 FLOPs 主要在 **q_a/q_b/kv_a/kv_b/o_proj 这些 gemv 投影**上（它们计入 26% 的 gemv），
+DSA 的打分/选择本身很便宜。→ 优先级改为：**gemv tensor-core 化（26%）→ MoE MMA（27%）→ AR（12%）**。
+
+gemv 为何是 26%：`gemv_bf16_nt_kernel` 是 SIMT FMA + 每元素 `__bfloat1622float2` 转换（uint4 载 8 个
+bf16 → 8 次 cvt），实测约为 fp32 峰值的 1%。权重流量本身只有 ~2.4–3.5GB/步（≈0.4ms），所以 26%
+是**转换+延迟受限**，不是带宽受限 → **tensor core 化是正解**（bf16 `m16n8k16` 或 tf32 `m16n8k8`）。
+注意：上一次 b16 fp8 MMA 实验虽然撞上并行度断崖，**per-seq 仍比基线快 5%**（62.7 vs 59.6），
+说明 tensor core 化本身有效，只是被 fp8-x 的思考模式否决。**下次做 bf16/tf32 x**（精度损失远小于 fp8）。
