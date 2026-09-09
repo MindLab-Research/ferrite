@@ -4756,22 +4756,45 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
             // e4m3 cache: one 16-byte load = 16 K elements (was 8 bf16 / 4
             // fp32). The per-(token, head) scale folds into the score.
             const unsigned char* krow = k_s + ((size_t)j * h + hd) * d;
-            float a8 = 0.f;
-            for (int l = lid * 16; l + 15 < d; l += TG * 16) {
-                unsigned int u0, u1, u2, u3;
-                asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
-                             : "l"(krow + l));
-                const __nv_fp8x2_storage_t* ff = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0);
-                #pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
-                        &__nv_cvt_fp8x2_to_halfraw2(ff[e], __NV_E4M3)));
-                    const float2 qf = *reinterpret_cast<const float2*>(qs + l + e * 2);
-                    a8 += qf.x * kf.x + qf.y * kf.y;
+            // Two independent accumulators over the (d/TG/16 = 2) iterations:
+            // both 16-byte loads issue back-to-back and the two FMA chains
+            // interleave (long-scoreboard was the top stall at 43.5%).
+            float a8 = 0.f, a8b = 0.f;
+            {
+                int l = lid * 16;
+                if (l + 15 < d) {
+                    unsigned int u0, u1, u2, u3;
+                    asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+                                 : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
+                                 : "l"(krow + l));
+                    unsigned int v0 = 0, v1 = 0, v2 = 0, v3 = 0;
+                    const int l2 = l + TG * 16;
+                    if (l2 + 15 < d) {
+                        asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+                                     : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
+                                     : "l"(krow + l2));
+                    }
+                    const __nv_fp8x2_storage_t* ff = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0);
+                    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
+                            &__nv_cvt_fp8x2_to_halfraw2(ff[e], __NV_E4M3)));
+                        const float2 qf = *reinterpret_cast<const float2*>(qs + l + e * 2);
+                        a8 += qf.x * kf.x + qf.y * kf.y;
+                    }
+                    if (l2 + 15 < d) {
+                        const __nv_fp8x2_storage_t* gg = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v0);
+                        #pragma unroll
+                        for (int e = 0; e < 8; e++) {
+                            const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
+                                &__nv_cvt_fp8x2_to_halfraw2(gg[e], __NV_E4M3)));
+                            const float2 qf = *reinterpret_cast<const float2*>(qs + l2 + e * 2);
+                            a8b += qf.x * kf.x + qf.y * kf.y;
+                        }
+                    }
                 }
             }
-            a = a8 * ksc_s[(size_t)j * h + hd];
+            a = (a8 + a8b) * ksc_s[(size_t)j * h + hd];
             if (lid == 0) {
                 for (int l = d & ~15; l < d; l++)
                     a += qs[l] * (__half2float(__nv_cvt_fp8_to_halfraw(krow[l], __NV_E4M3))
