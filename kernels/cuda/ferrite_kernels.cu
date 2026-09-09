@@ -5942,13 +5942,12 @@ extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
 // 128-col scale block boundary (128 % 16 == 0), and slice starts land on
 // scale-block boundaries whenever in_f is 128-aligned (all real shapes).
 template <int WPR>
-// __launch_bounds__(512, 2): ncu showed 84 regs/thread -> Block Limit
-// Registers = 2 -> 23% occupancy, L1/TEX 62.7% (top limiter), and 74.8% of
-// cycles with NO eligible warp (warp starvation). Capping the registers to
-// 64 lifted the occupancy to 45.6% (No-Eligible 48.9%, Duration 53.5->39.0us).
-// 512-thread blocks then measured another 42%: micro-bench q_a 31->18us,
-// lm_head 353->204us (256/4 vs 512/2 differ only in block granularity).
-__global__ void __launch_bounds__(512, 2) gemv_fp8_v2_kernel(const float* __restrict__ x,
+// __launch_bounds__(256, 4): ncu showed 84 regs/thread -> Block Limit
+// Registers = 2 -> 23% occupancy, 74.8% of cycles with NO eligible warp.
+// Capping the registers to 64 lifted the occupancy to 45.6% (No-Eligible
+// 48.9%, Duration 53.5->39.0us). 512-thread blocks measured WORSE (q_a
+// 0.044 vs 0.031 ms) - keep 256.
+__global__ void __launch_bounds__(256, 4) gemv_fp8_v2_kernel(const float* __restrict__ x,
                                    const unsigned char* __restrict__ w,
                                    const float* __restrict__ scale,
                                    const float* __restrict__ bias,
@@ -6120,7 +6119,7 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     const int Rl = ((out_f & 7) == 0) ? 8 : 1;
     dim3 grid((unsigned)((out_f + rpb * Rl - 1) / (rpb * Rl)),
               (unsigned)((nrows + 1) / 2), 1);
-    dim3 block(512);
+    dim3 block(256);
     gemv_fp8_v2_kernel<WPR><<<grid, block, 0, s>>>(x, (const unsigned char*)w, scale, bias, out,
                                                    in_f, out_f, nrows, srows, scols);
     return cudaGetLastError();
