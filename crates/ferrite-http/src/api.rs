@@ -314,6 +314,24 @@ fn error_response(status: StatusCode, msg: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// POST /shutdown — graceful process exit.
+///
+/// Why this exists: profilers (nsys/ncu) only write their report when the
+/// TARGET PROCESS EXITS. An HTTP serve never exits on its own, so profiling a
+/// B=16 run required a SIGKILL, which loses the report (observed: 4 failed
+/// nsys attempts, `/tmp/nsys_*.nsys-rep` never created). With this endpoint the
+/// bench script can end a profiled run cleanly and the report lands.
+///
+/// Responds first, then exits from a detached thread so the 200 is flushed.
+async fn shutdown() -> impl IntoResponse {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        eprintln!("[http] shutdown requested — exiting (exit 0)");
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "status": "shutting_down" }))
+}
+
 /// Build the router (main.rs binds the listener).
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -321,6 +339,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/health", get(health))
         .route("/v1/stats", get(stats))
+        .route("/shutdown", post(shutdown))
         .with_state(state)
 }
 
