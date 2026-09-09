@@ -888,3 +888,28 @@ f16 累加翻转——四条全部有实测证据）。
 rmsnorm 42376 / gated_rmsnorm 62832 / layernorm_affine 20328——decode 部分约 241 个/步
 （norm 125 + bf16 74 + quant 42），每步 ~1.0ms 执行 + 部分间隙。**合并小 kernel 是剩余
 唯一的非结构机会**（预估 0.3-0.5ms）。
+
+## 2026-09-10 收尾：hc_post float4（中性）+ gdn_step 并行度发现
+
+**hc_post float4 向量化（9087438）**：标量版 3.04µs 跑 4MB = 1.3TB/s（3 标量读 + 1 标量写/线程）。
+改成每线程 4 个连续 j（float4，请求数降 4x，宽度 16B）。**实测 B=16 中性**
+（13.46 vs 13.28-13.44ms）、B=2 中性（9.17 vs 9.11-9.32ms）。数值 bit-identical（每 acc lane
+独立 FMA 链，k 顺序不变）。与 mix float4 同样在 B=16 中性——**hc 链的瓶颈不是内存请求数**。
+保留（无风险）。
+
+**gdn_step_v2 的并行度发现（未实施，下会话可选）**：
+- launcher grid = **(1, h, 1)**，block = 512 线程——若 h=8 则仅 8 blocks（SM 利用率 5.4%）
+- kernel 内多阶段只用 128/512 线程（加载 q/k/v/gate 的 `i < dk` 循环、kS 的 `j < dv` 循环）
+- **状态矩阵按 j 维度完全独立**：kS[j]=Σ_i k[i]S[i][j]、decay S[i][j]*=gh[i]、
+  delta S[i][j]+=bt*k[i]*(v[j]-ks[j])、o[j]=Σ_i q[i]S[i][j]——**无跨列依赖**
+- → **列拆分（grid=(1,h,SPLIT)）是数学安全的并行度提升**：SPLIT=4 时 smem 从 67KB
+  降到 ~18KB（占用率同时提升），block 数 4x。预估 −0.2~0.4ms（gdn_step 0.58ms/步）
+- 风险：GDN 状态跨 token 累积，改错会污染整条序列（文本乱码可检测）
+- 需先确认 h（GDN heads）：config.json 字段名与代码 cfg.linear_attn 不同，未查到
+
+**本会话完整尝试清单（15 项）**：10 落地（fp8 down/DSA dummy/AR f32/device-advance/gemm3/
+gdn float4/mix float4/sparse v3/GPU侧embedding/host跳过）+ 5 中性/负结果（expert-major gate/
+W8A16 gate/PDL/--use_fast_math/hc_post float4）。
+
+**当前基线**：13.28-13.46ms replay（±1.5% 噪声）/ **~1194 tok/s**（server 侧 16000/13.4）/
+1126（client 侧，Python SSE 开销 6%）。0 fault，出师表逐字 ✓。
