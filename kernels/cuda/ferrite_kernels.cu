@@ -6099,6 +6099,195 @@ __global__ void __launch_bounds__(256, 4) gemv_fp8_v2_kernel(const float* __rest
     }
 }
 
+// fp8 TRI fusion: three SAME-INPUT weight matrices in ONE launch.
+// The GDN layer does b_proj / f_a / g_a from the same x (34 layers => 3
+// launches each at n>1; the bf16 gemv_tri_dev is n==1-only and the fp8 guard
+// makes it fall back). Rows [0,o1)->w1/y1, [o1,o1+o2)->w2/y2, rest->w3/y3;
+// per-row matrix selection so the R=8 row group may span a boundary.
+// Accumulation order per output row is IDENTICAL to gemv_fp8_v2.
+template <int WPR>
+__global__ void __launch_bounds__(256, 4) gemv_fp8_tri_kernel(
+    const float* __restrict__ x,
+    const unsigned char* __restrict__ w1, const float* __restrict__ s1, const float* __restrict__ b1,
+    const unsigned char* __restrict__ w2, const float* __restrict__ s2, const float* __restrict__ b2,
+    const unsigned char* __restrict__ w3, const float* __restrict__ s3, const float* __restrict__ b3,
+    float* __restrict__ y1, float* __restrict__ y2, float* __restrict__ y3,
+    int in_f, int o1, int o2, int o3, int nrows, int scols) {
+    const int T = o1 + o2 + o3;
+
+    (void)srows;
+    const int warps = blockDim.x >> 5;
+    const int rpb = warps / WPR;               // rows per block
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    // 8 rows per warp-group with the x slice CACHED in registers: the same
+    // token's x row is re-read by every (block, row) otherwise (measured
+    // 196MB of x vs 49MB of weights per call -> L2-bound).
+    const int R = ((out_f & 7) == 0) ? 8 : 1;
+    const int rowg0 = (blockIdx.x * rpb + warp / WPR) * R;   // row within the CONCAT space
+    const int kw = warp % WPR;                 // K-slice id
+    const int kper = ((in_f + WPR - 1) / WPR + 15) & ~15;  // uint4-aligned slice
+    const int k0 = kw * kper;
+    const int k1 = min(k0 + kper, in_f);
+    __shared__ float part[32];
+    // TWO tokens per block: the weight row is loaded and fp8->half2 converted
+    // ONCE and reused for both tokens' dots — the per-token instruction count
+    // drops ~32% (this GEMV is issue-bound at n=16, not bandwidth-bound).
+    // Each token keeps its own accumulation order -> bit-identical output.
+    const int t0 = blockIdx.y * 2;
+    const bool has1 = (t0 + 1) < nrows;
+    float4 xc[2][4];
+    #pragma unroll
+    for (int tt = 0; tt < 2; tt++) {
+        const int k = k0 + lane * 16;
+        if (t0 + tt < nrows && k + 15 < k1) {
+            const float* xr0 = x + (size_t)(t0 + tt) * in_f + k;
+            xc[tt][0] = *reinterpret_cast<const float4*>(xr0);
+            xc[tt][1] = *reinterpret_cast<const float4*>(xr0 + 4);
+            xc[tt][2] = *reinterpret_cast<const float4*>(xr0 + 8);
+            xc[tt][3] = *reinterpret_cast<const float4*>(xr0 + 12);
+        } else {
+            xc[tt][0] = xc[tt][1] = xc[tt][2] = xc[tt][3] = make_float4(0.f, 0.f, 0.f, 0.f);
+        }
+    }
+    // UNROLLED row loop (no `break`: it blocked unrolling, leaving the 8 rows'
+    // loads serialized — the kernel is latency-bound, ~32us per block for 8KB).
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+    const int row = rowg0 + r;
+    if (row >= T) continue;
+    const unsigned char* wr_sel; const float* sr_sel; float* y_sel; int row_l = row;
+    if (row < o1) { wr_sel = w1; sr_sel = s1; y_sel = y1; }
+    else if (row < o1 + o2) { wr_sel = w2; sr_sel = s2; y_sel = y2; row_l = row - o1; }
+    else { wr_sel = w3; sr_sel = s3; y_sel = y3; row_l = row - o1 - o2; }
+    float acc0 = 0.f, acc1 = 0.f;
+    {
+        const unsigned char* wr = wr_sel + (size_t)row_l * in_f;
+        const float* xr0 = x + (size_t)t0 * in_f;
+        const float* xr1 = x + (size_t)(t0 + 1) * in_f;
+        const float* srow = sr_sel + (size_t)(row_l >> 7) * scols;
+        int k = k0 + lane * 16;
+        if (k + 15 < k1) {
+            uint4 wv;
+            asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(wv.x), "=r"(wv.y), "=r"(wv.z), "=r"(wv.w)
+                         : "l"(wr + k));
+            const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
+            const float sc = srow[k >> 7];
+            const float xv0[16] = {xc[0][0].x, xc[0][0].y, xc[0][0].z, xc[0][0].w,
+                                   xc[0][1].x, xc[0][1].y, xc[0][1].z, xc[0][1].w,
+                                   xc[0][2].x, xc[0][2].y, xc[0][2].z, xc[0][2].w,
+                                   xc[0][3].x, xc[0][3].y, xc[0][3].z, xc[0][3].w};
+            const float xv1[16] = {xc[1][0].x, xc[1][0].y, xc[1][0].z, xc[1][0].w,
+                                   xc[1][1].x, xc[1][1].y, xc[1][1].z, xc[1][1].w,
+                                   xc[1][2].x, xc[1][2].y, xc[1][2].z, xc[1][2].w,
+                                   xc[1][3].x, xc[1][3].y, xc[1][3].z, xc[1][3].w};
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
+                const float2 wf = __half22float2(*reinterpret_cast<const __half2*>(&__nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3)));
+                acc0 += (wf.x * sc) * xv0[p * 2] + (wf.y * sc) * xv0[p * 2 + 1];
+                acc1 += (wf.x * sc) * xv1[p * 2] + (wf.y * sc) * xv1[p * 2 + 1];
+            }
+            k += 32 * 16;
+        }
+        #pragma unroll 2
+        for (; k + 15 < k1; k += 32 * 16) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + k);
+            const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
+            const float sc = srow[k >> 7];
+            const float4 xa0 = *reinterpret_cast<const float4*>(xr0 + k);
+            const float4 xb0 = *reinterpret_cast<const float4*>(xr0 + k + 4);
+            const float4 xc0 = *reinterpret_cast<const float4*>(xr0 + k + 8);
+            const float4 xd0 = *reinterpret_cast<const float4*>(xr0 + k + 12);
+            const __half2 hx0[8] = {__floats2half2_rn(xa0.x, xa0.y), __floats2half2_rn(xa0.z, xa0.w),
+                                    __floats2half2_rn(xb0.x, xb0.y), __floats2half2_rn(xb0.z, xb0.w),
+                                    __floats2half2_rn(xc0.x, xc0.y), __floats2half2_rn(xc0.z, xc0.w),
+                                    __floats2half2_rn(xd0.x, xd0.y), __floats2half2_rn(xd0.z, xd0.w)};
+            const float4 xa1 = *reinterpret_cast<const float4*>(xr1 + k);
+            const float4 xb1 = *reinterpret_cast<const float4*>(xr1 + k + 4);
+            const float4 xc1 = *reinterpret_cast<const float4*>(xr1 + k + 8);
+            const float4 xd1 = *reinterpret_cast<const float4*>(xr1 + k + 12);
+            const __half2 hx1[8] = {__floats2half2_rn(xa1.x, xa1.y), __floats2half2_rn(xa1.z, xa1.w),
+                                    __floats2half2_rn(xb1.x, xb1.y), __floats2half2_rn(xb1.z, xb1.w),
+                                    __floats2half2_rn(xc1.x, xc1.y), __floats2half2_rn(xc1.z, xc1.w),
+                                    __floats2half2_rn(xd1.x, xd1.y), __floats2half2_rn(xd1.z, xd1.w)};
+            // half2 FMA path (see gemv header): 8 cvt + 8 __hfma2 per 16 values
+            // per token, but the 8 cvt are SHARED by both tokens.
+            // TWO half2 chains per token: a single 8-deep hfma2 chain is a
+            // 32-cycle dependency; splitting it halves the latency. Same fp16
+            // chunk accumulation, reassociated.
+            __half2 a20 = __float2half2_rn(0.f), a21 = __float2half2_rn(0.f);
+            __half2 b20 = __float2half2_rn(0.f), b21 = __float2half2_rn(0.f);
+            #pragma unroll
+            for (int p = 0; p < 8; p += 2) {
+                const __nv_fp8x2_storage_t wx2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[p * 2]);
+                const __half2_raw wraw = __nv_cvt_fp8x2_to_halfraw2(wx2, __NV_E4M3);
+                const __half2 w2 = *reinterpret_cast<const __half2*>(&wraw);
+                const __nv_fp8x2_storage_t wy2 = *reinterpret_cast<const __nv_fp8x2_storage_t*>(&w8[(p + 1) * 2]);
+                const __half2_raw wraw2 = __nv_cvt_fp8x2_to_halfraw2(wy2, __NV_E4M3);
+                const __half2 w3 = *reinterpret_cast<const __half2*>(&wraw2);
+                a20 = __hfma2(w2, hx0[p], a20);
+                a21 = __hfma2(w2, hx1[p], a21);
+                b20 = __hfma2(w3, hx0[p + 1], b20);
+                b21 = __hfma2(w3, hx1[p + 1], b21);
+            }
+            const __half2 s0 = __hadd2(a20, b20), s1 = __hadd2(a21, b21);
+            acc0 += (__half2float(s0.x) + __half2float(s0.y)) * sc;
+            acc1 += (__half2float(s1.x) + __half2float(s1.y)) * sc;
+        }
+        for (; k < k1; k++) {
+            const float sc = srow[k >> 7];
+            const float wf8 = __half2float(__nv_cvt_fp8_to_halfraw(wr[k], __NV_E4M3)) * sc;
+            acc0 += wf8 * xr0[k];
+            acc1 += wf8 * xr1[k];
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc0 += __shfl_down_sync(0xffffffff, acc0, off);
+        acc1 += __shfl_down_sync(0xffffffff, acc1, off);
+    }
+    if (lane == 0) { part[warp] = acc0; part[16 + warp] = acc1; }
+    __syncthreads();
+    if (warp % WPR == 0 && lane == 0) {
+        float s0 = 0.f, s1 = 0.f;
+        #pragma unroll
+        for (int j = 0; j < WPR; j++) {
+            s0 += part[(warp / WPR) * WPR + j];
+            s1 += part[16 + (warp / WPR) * WPR + j];
+        }
+        const float b = (row < o1) ? (b1 ? b1[row_l] : 0.f)
+                      : (row < o1 + o2) ? (b2 ? b2[row_l] : 0.f)
+                      : (b3 ? b3[row_l] : 0.f);
+        y_sel[(size_t)t0 * (row < o1 ? o1 : (row < o1 + o2 ? o2 : o3)) + row_l] = b + s0;
+        if (has1) y_sel[(size_t)(t0 + 1) * (row < o1 ? o1 : (row < o1 + o2 ? o2 : o3)) + row_l] = b + s1;
+    }
+    __syncthreads();
+    }
+}
+
+}
+
+extern "C" cudaError_t ferrite_gemv_fp8_tri(
+    const float* x,
+    const void* w1, const float* s1, const float* b1,
+    const void* w2, const float* s2, const float* b2,
+    const void* w3, const float* s3, const float* b3,
+    float* y1, float* y2, float* y3,
+    int in_f, int o1, int o2, int o3, int nrows, int scols, cudaStream_t s) {
+    if (in_f <= 0 || nrows <= 0) return cudaSuccess;
+    constexpr int WPR = 8;
+    const int rpb = 256 / 32 / WPR;
+    const int T = o1 + o2 + o3;
+    const int Rl = ((T & 7) == 0) ? 8 : 1;
+    dim3 grid((unsigned)((T + rpb * Rl - 1) / (rpb * Rl)),
+              (unsigned)((nrows + 1) / 2), 1);
+    gemv_fp8_tri_kernel<WPR><<<grid, 256, 0, s>>>(
+        x, (const unsigned char*)w1, s1, b1, (const unsigned char*)w2, s2, b2,
+        (const unsigned char*)w3, s3, b3, y1, y2, y3, in_f, o1, o2, o3, nrows, scols);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           const float* scale, const float* bias,
                                           float* out, int in_f, int out_f,

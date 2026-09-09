@@ -90,6 +90,14 @@ extern "C" {
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_fp8_tri(
+        x: *const f32,
+        w1: *const std::ffi::c_void, s1: *const f32, b1: *const f32,
+        w2: *const std::ffi::c_void, s2: *const f32, b2: *const f32,
+        w3: *const std::ffi::c_void, s3: *const f32, b3: *const f32,
+        y1: *mut f32, y2: *mut f32, y3: *mut f32,
+        in_f: i32, o1: i32, o2: i32, o3: i32, nrows: i32, scols: i32,
+        s: CuStream) -> i32;
     fn ferrite_gemv_fp8_v2(x: *const f32, w: *const std::ffi::c_void,
                            scale: *const f32, bias: *const f32, out: *mut f32,
                            in_f: i32, out_f: i32, nrows: i32,
@@ -3098,9 +3106,43 @@ impl CudaBackend {
             self.gemv_tri_dev(x, w.b_proj, w.f_a, w.g_a, hidden as i32,
                               h as i32, dk as i32, dk as i32)?
         } else {
-            (self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?,
-             self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?,
-             self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?)
+            // fp8 TRI fusion: b_proj / f_a / g_a share the input x. The bf16
+            // gemv_tri_dev is n==1-only and its fp8 guard falls back to 3
+            // launches; the fp8 tri kernel does all three in ONE launch with
+            // the identical per-row accumulation order (34 layers x 3 -> 1).
+            match (self.fp8_lookup(w.b_proj), self.fp8_lookup(w.f_a), self.fp8_lookup(w.g_a)) {
+                (Some(f1), Some(f2), Some(f3))
+                    if (h as i32) % 8 == 0 && (dk as i32) % 8 == 0
+                        && f1.scols == (hidden as i32 + 127) / 128
+                        && f2.scols == (hidden as i32 + 127) / 128
+                        && f3.scols == (hidden as i32 + 127) / 128 =>
+                {
+                    let y1 = DevBuf::alloc(self.dev, self.stream, n * h)?;
+                    let y2 = DevBuf::alloc(self.dev, self.stream, n * dk)?;
+                    let y3 = DevBuf::alloc(self.dev, self.stream, n * dk)?;
+                    let r = unsafe {
+                        ferrite_gemv_fp8_tri(
+                            x.as_const_f32(),
+                            f1.w, f1.scale as *const f32, std::ptr::null(),
+                            f2.w, f2.scale as *const f32, std::ptr::null(),
+                            f3.w, f3.scale as *const f32, std::ptr::null(),
+                            y1.as_f32(), y2.as_f32(), y3.as_f32(),
+                            hidden as i32, h as i32, dk as i32, dk as i32,
+                            ni, f1.scols, self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        (y1, y2, y3)
+                    } else {
+                        (self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?,
+                         self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?,
+                         self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?)
+                    }
+                }
+                _ => (self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?,
+                      self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?,
+                      self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?),
+            }
         };
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
         let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
