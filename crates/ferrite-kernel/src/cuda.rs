@@ -4078,6 +4078,14 @@ extern "C" {
                                   hidden: i32, inter: i32, inter_shared: i32,
                                   topk: i32, n: i32, limit: f32, hscols: i32,
                                   s: CuStream) -> i32;
+    fn ferrite_moe_down_mma(
+        ids_f: *const f32, probs: *const f32,
+        down_w8_ptrs: *const *const std::ffi::c_void,
+        down_scale_ptrs: *const *const f32,
+        shared_down_w8: *const std::ffi::c_void, shared_down_scale: *const f32,
+        act: *const f32, out: *mut f32,
+        expert_start: i32, e_local: i32, hidden: i32, inter: i32,
+        inter_shared: i32, topk: i32, dscols: i32, n: i32, s: CuStream) -> i32;
     fn ferrite_moe_fused_down_sum_fp8(ids_f: *const f32, probs: *const f32,
                                       down_w8_ptrs: *const *const std::ffi::c_void,
                                       down_scale_ptrs: *const *const std::ffi::c_void,
@@ -4373,16 +4381,28 @@ impl CudaBackend {
                             });
                         }
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        ck(unsafe {
-                            ferrite_moe_fused_down_sum_fp8(
+                        let down_mma = unsafe {
+                            ferrite_moe_down_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
                                 tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
-                                sd.w, sd.scale,
+                                sd.w, sd.scale as *const f32,
                                 act.as_const_f32(), out.as_f32(),
                                 expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
                                 topk as i32, ni, dscols, self.stream,
                             )
-                        }, "moe_fused_down_sum_fp8")?;
+                        };
+                        if down_mma != 0 {
+                            ck(unsafe {
+                                ferrite_moe_fused_down_sum_fp8(
+                                    dids.as_const_f32(), dprobs.as_const_f32(),
+                                    tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
+                                    sd.w, sd.scale,
+                                    act.as_const_f32(), out.as_f32(),
+                                    expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                                    topk as i32, ni, dscols, self.stream,
+                                )
+                            }, "moe_fused_down_sum_fp8")?;
+                        }
                         return Ok(out);
                     }
                     // v2 unsupported (unaligned) — fall through to v1
@@ -4401,16 +4421,28 @@ impl CudaBackend {
                     };
                     if r == 0 {
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        ck(unsafe {
-                            ferrite_moe_fused_down_sum_fp8(
+                        let down_mma = unsafe {
+                            ferrite_moe_down_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
                                 tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
-                                sd.w, sd.scale,
+                                sd.w, sd.scale as *const f32,
                                 act.as_const_f32(), out.as_f32(),
                                 expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
                                 topk as i32, ni, dscols, self.stream,
                             )
-                        }, "moe_fused_down_sum_fp8")?;
+                        };
+                        if down_mma != 0 {
+                            ck(unsafe {
+                                ferrite_moe_fused_down_sum_fp8(
+                                    dids.as_const_f32(), dprobs.as_const_f32(),
+                                    tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
+                                    sd.w, sd.scale,
+                                    act.as_const_f32(), out.as_f32(),
+                                    expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                                    topk as i32, ni, dscols, self.stream,
+                                )
+                            }, "moe_fused_down_sum_fp8")?;
+                        }
                         return Ok(out);
                     }
                     // act_mma not supported (unaligned) — fall through to dequant

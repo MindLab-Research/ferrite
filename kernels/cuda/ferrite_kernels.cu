@@ -3466,7 +3466,7 @@ __global__ void __launch_bounds__(256, 4) moe_down_mma_kernel(
     float acc[8][4];
     #pragma unroll
     for (int i = 0; i < 8; i++) { acc[i][0] = 0.f; acc[i][1] = 0.f; acc[i][2] = 0.f; acc[i][3] = 0.f; }
-    float total = 0.f;
+    float total = 0.f, total2 = 0.f;
     const int nslot = topk + (inter_shared > 0 ? 1 : 0);
     for (int slot = 0; slot < nslot; slot++) {
         int eid = (int)ids_f[(size_t)tok * topk + (slot < topk ? slot : 0)];
@@ -3551,31 +3551,36 @@ __global__ void __launch_bounds__(256, 4) moe_down_mma_kernel(
                 : "r"(ba[0]), "r"(ba[1]), "r"(ba[2]), "r"(ba[3]), "r"(b[0]), "r"(b[1]),
                   "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
         }
-        // fold this k-tile: acc[ki] * (wsc * ascale) * p, accumulated in the
-        // same slot order as the SIMT kernel
+        // fold this k-tile. C fragment (m16n8): lane l holds (row l/4, col
+        // (l%4)*2), (row l/4, col+1), (row l/4+8, col), (row l/4+8, col+1).
+        // The 8 N columns are replicas of the same token, so col 0 carries
+        // the answer; the two M rows (l/4 and l/4+8) are distinct h rows.
         {
             const int ki = (k0 >> 5) & 7;
             const float f = wsc * ascale * p;
             if ((lane & 3) == 0) {
-                total += (acc[ki][0] + acc[ki][2]) * f;
+                total += acc[ki][0] * f;
+                total2 += acc[ki][2] * f;
                 acc[ki][0] = 0.f; acc[ki][1] = 0.f; acc[ki][2] = 0.f; acc[ki][3] = 0.f;
             }
         }
     }
     // reduce the 8 warps' K-slice sums (each warp covered a different K range)
-    __shared__ float red[8][32];
-    red[warp][lane] = total;
+    __shared__ float red[8][64];
+    red[warp][lane * 2 + 0] = total;
+    red[warp][lane * 2 + 1] = total2;
     __syncthreads();
     if (warp == 0) {
-        float s = 0.f;
+        float s0 = 0.f, s1 = 0.f;
         #pragma unroll
-        for (int u = 0; u < 8; u++) s += red[u][lane];
-        // C fragment: lanes 0-3 hold (row 0, col 0/1) and (row 8, col 0/1)
-        const int m0 = lane >> 2, n0 = (lane & 3) * 2;
-        if (m0 == 0) {
-            const int hrow = h0 + n0;
-            if (hrow < hidden) out[(size_t)tok * hidden + hrow] = s;
-            if (hrow + 1 < hidden) out[(size_t)tok * hidden + hrow + 1] = s;
+        for (int u = 0; u < 8; u++) {
+            s0 += red[u][lane * 2 + 0];
+            s1 += red[u][lane * 2 + 1];
+        }
+        if ((lane & 3) == 0) {
+            const int hrow = h0 + (lane >> 2);
+            if (hrow < hidden) out[(size_t)tok * hidden + hrow] = s0;
+            if (hrow + 8 < hidden) out[(size_t)tok * hidden + hrow + 8] = s1;
         }
     }
 }
