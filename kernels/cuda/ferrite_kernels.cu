@@ -3491,7 +3491,12 @@ __global__ void __launch_bounds__(256, 4) moe_down_mma_kernel(
             #pragma unroll
             for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_down_sync(0xffffffff, am, off));
             am = __shfl_sync(0xffffffff, am, 0);
-            const float ascale = am / 448.0f + 1e-12f;
+            // DIAG (FERRITE_DOWN_MMA_FIXSCALE=1): bypass the absmax so the
+            // quantize scale and the fold scale are provably identical. If the
+            // uniform ~3% error disappears, the scale plumbing is the bug; if
+            // it stays, the error is elsewhere.
+            const float ascale = (getenv("FERRITE_DOWN_MMA_FIXSCALE") && am > 0.f)
+                ? 1.0f : (am / 448.0f + 1e-12f);
             if (lane == 0) asc[warp] = ascale;
             // every lane needs the 32 quantized values in smem (B fragment is
             // shared across the N=8 replicas) -> 8 lanes write 4 each
