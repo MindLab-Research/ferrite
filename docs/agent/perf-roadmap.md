@@ -1266,3 +1266,11 @@ serve 文本 `<think用户要求背诵《出师表》全文…先帝创业未半
 
 **已确认不可行/已证伪**：gemv 再优化（已位级最优）、bf16/fp8 cache 单独降 sparse_attn 字节
 （延迟非带宽）、去重位图原子操作（消融无收益）、HC_MIX_KS 加倍（serve 中性）。
+
+### indexer 分数循环 4 路 ILP（2026-09-09）
+
+`indexer_topk_batched_kernel` 的慢路径分数循环（`idm=128` → 32 个 float4 迭代）原本只有
+2 条 FMA 链（`#pragma unroll 2`），fp32 FMA 延迟暴露。改成 4 条独立链（每迭代 4 个 float4 加载）：
+**13.88 → 13.68 ms/步（1153 → 1170 tok/s）**，文本 LEN 408 ✓。
+
+**当前累计**（会话起点 833 tok/s → 现在 **1170 tok/s，+40%**）。
