@@ -3270,6 +3270,51 @@ fn mega_chain_dev_batched(
     // res alive for the graph's lifetime (leaked on purpose, like `arg` below).
     let mut input_kept = false;
 
+    // FERRITE_LAYER_SUM (2026-09-09 numerics bisection): per-layer per-row
+    // checksums of the batched chain's intermediates. With N identical
+    // prompts + greedy decode every row must stay BIT-IDENTICAL — any
+    // ROWDIFF != 0 is a real cross-row bug; a shared absmax explosion
+    // localizes symmetric corruption to the layer. dev0 only, never inside
+    // capture (a D2H download during capture is illegal).
+    let lsum = !capture
+        && dev_id == 0
+        && std::env::var_os("FERRITE_LAYER_SUM").is_some();
+    let lsum_step = {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        if lsum {
+            STEP.fetch_add(1, Ordering::Relaxed)
+        } else {
+            0
+        }
+    };
+    let lsum_probe = |buf: &DevBuf, layer: usize, tag: &str, row_len: usize| {
+        if !lsum {
+            return;
+        }
+        let mut host = vec![0f32; buf.len];
+        if let Err(e) = buf.download(&mut host) {
+            eprintln!("[lsum] s{lsum_step} L{layer} {tag}: download err {e}");
+            return;
+        }
+        for r in 0..n {
+            let row = &host[r * row_len..(r + 1) * row_len];
+            let sum: f64 = row.iter().map(|&v| v as f64).sum();
+            let mx = row.iter().fold(0f32, |a, v| a.max(v.abs()));
+            eprintln!(
+                "[lsum] s{lsum_step} L{layer:2} {tag:4} row{r} sum={sum:+.6} absmax={mx:10.4}"
+            );
+        }
+        if n >= 2 && host.len() >= 2 * row_len {
+            let d = host[..row_len]
+                .iter()
+                .zip(&host[row_len..2 * row_len])
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            eprintln!("[lsum] s{lsum_step} L{layer:2} {tag:4} ROWDIFF={d:.3e}");
+        }
+    };
+    lsum_probe(&res, 0, "in", nh * hidden);
+
     for (layer_idx, plan) in plans.iter().enumerate() {
         if std::env::var_os("FERRITE_TIMING").is_some() {
             eprintln!("[megab-cap] dev{dev_id} cap={capture} L{layer_idx}");
@@ -3401,6 +3446,7 @@ fn mega_chain_dev_batched(
         let t_mid = std::time::Instant::now();
         // C: hc_post → hc_pre2
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
+        lsum_probe(&partial, layer_idx, "attn", hidden);
         let (li2, post_f, comb_f) = cuda.hc_pre_dev(
             &res_mid,
             s.w(&format!("{pfx}.hc_ffn_fn"))?,
@@ -3468,6 +3514,7 @@ fn mega_chain_dev_batched(
         if !ar_p2p {
             nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
         }
+        lsum_probe(&partial2, layer_idx, "ffn", hidden);
         if tm {
             let _ = cuda.sync();
             t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
@@ -3475,6 +3522,7 @@ fn mega_chain_dev_batched(
         // E: hc_post2 → next layer's residual
         let new_res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
         let old_res = std::mem::replace(&mut res, new_res);
+        lsum_probe(&res, layer_idx, "res", nh * hidden);
         if !input_kept {
             input_kept = true;
             if capture {
