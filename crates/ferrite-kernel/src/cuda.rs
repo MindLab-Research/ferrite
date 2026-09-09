@@ -4437,6 +4437,19 @@ extern "C" {
                                       hidden: i32, inter: i32, inter_shared: i32,
                                       topk: i32, n: i32, dscols: i32,
                                       s: CuStream) -> i32;
+    fn ferrite_quant_act_rows(act: *const f32, aq: *mut u8, as_: *mut f32,
+                              n: i32, stride: i32, inter: i32, topk: i32,
+                              inter_shared: i32, s: CuStream) -> i32;
+    fn ferrite_moe_down_e4m3_mma(ids_f: *const f32, probs: *const f32,
+                                 down_w8_ptrs: *const *const std::ffi::c_void,
+                                 down_scale_ptrs: *const *const std::ffi::c_void,
+                                 shared_down_w8: *const std::ffi::c_void,
+                                 shared_down_scale: *const std::ffi::c_void,
+                                 aq: *const u8, as_: *const f32, out: *mut f32,
+                                 expert_start: i32, e_local: i32,
+                                 hidden: i32, inter: i32, inter_shared: i32,
+                                 topk: i32, n: i32, dscols: i32,
+                                 s: CuStream) -> i32;
 }
 
 impl CudaBackend {
@@ -4753,28 +4766,75 @@ impl CudaBackend {
                             });
                         }
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        // DEFAULT = the fp8 fused down (moe_fused_down_sum_fp8):
-                        // nsys 2026-09-09 B=16 steady state — the bf16 MMA down
-                        // measured 13.1ms/step/rank (52.3% of the whole step,
-                        // median 357µs × ~37 launches) vs the fp8 fused 2.1ms —
-                        // 6x slower. The "!!!!" text degradation that motivated
-                        // the MMA default was actually the xq-cache stale-hit
-                        // (root cause #5, fixed in 852be75: the (ptr,gen) key),
-                        // NOT the fp8 down kernel. FERRITE_MOE_DOWN_MMA=1 opts
-                        // into the (correct but slow) tensor-core variant.
-                        let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
+                        // DEFAULT = the e4m3 tensor-core down (ferrite_moe_down_e4m3_mma):
+                        // 2.14x over the SIMT fp8 in the isolated bench (/tmp/down_bench2.cu,
+                        // 2026-09-09: 50.8 vs 108.5µs at n=16 random routing) — the SIMT
+                        // version is INSTRUCTION-bound on the fp8→half2→float2 chain
+                        // (the same-expert A/B proved time-invariance to weight traffic).
+                        // The act rows are pre-quantized per (token, slot) — the same
+                        // e4m3 class as the act kernel's upstream x quantization; the
+                        // isolated old-vs-new diff is at the quantization level (~1-3%).
+                        // FERRITE_DOWN_MMA=0 falls back to the SIMT fp8 down;
+                        // FERRITE_MOE_DOWN_MMA=1 opts into the (correct but 6x slower)
+                        // bf16 variant.
+                        let use_down_e4m3 = std::env::var("FERRITE_DOWN_MMA")
+                            .map(|v| v != "0").unwrap_or(true);
+                        let use_down_bf16 = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
-                        let down_mma = if !use_down_mma { 1 } else { unsafe {
-                            ferrite_moe_down_bf16_mma(
-                                dids.as_const_f32(), dprobs.as_const_f32(),
-                                tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
-                                sd.w, sd.scale as *const f32,
-                                act.as_const_f32(), out.as_f32(),
-                                expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                                topk as i32, dscols, ni, self.stream,
-                            )
-                        } };
-                        if down_mma != 0 {
+                        let mut down_done = false;
+                        if use_down_e4m3 && !use_down_bf16 {
+                            let stride = topk as i32 * inter + inter_shared;
+                            let aq = DevBuf::alloc(
+                                self.dev, self.stream,
+                                (ni as usize * stride as usize).div_ceil(4),
+                            )?;
+                            let asc = DevBuf::alloc(
+                                self.dev, self.stream,
+                                ni as usize * (topk + 1),
+                            )?;
+                            let rq = unsafe {
+                                ferrite_quant_act_rows(
+                                    act.as_const_f32(), aq.as_f32() as *mut u8, asc.as_f32(),
+                                    ni, stride, inter, topk as i32, inter_shared, self.stream,
+                                )
+                            };
+                            if rq == 0 {
+                                let rd = unsafe {
+                                    ferrite_moe_down_e4m3_mma(
+                                        dids.as_const_f32(), dprobs.as_const_f32(),
+                                        tbl.down_w8 as *const *const _,
+                                        tbl.down_scale as *const *const _,
+                                        sd.w, sd.scale,
+                                        aq.as_f32() as *const u8, asc.as_const_f32(), out.as_f32(),
+                                        expert_start as i32, tbl.e_local as i32, hi, inter,
+                                        inter_shared, topk as i32, ni, dscols, self.stream,
+                                    )
+                                };
+                                if rd == 0 {
+                                    down_done = true;
+                                } else {
+                                    eprintln!(
+                                        "[opcheck] moe_down_e4m3_mma returned err {rd} — falling back to the SIMT fp8 down"
+                                    );
+                                }
+                            }
+                        }
+                        if !down_done && use_down_bf16 {
+                            let down_mma = unsafe {
+                                ferrite_moe_down_bf16_mma(
+                                    dids.as_const_f32(), dprobs.as_const_f32(),
+                                    tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
+                                    sd.w, sd.scale as *const f32,
+                                    act.as_const_f32(), out.as_f32(),
+                                    expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
+                                    topk as i32, dscols, ni, self.stream,
+                                )
+                            };
+                            if down_mma == 0 {
+                                down_done = true;
+                            }
+                        }
+                        if !down_done {
                             ck(unsafe {
                                 ferrite_moe_fused_down_sum_fp8(
                                     dids.as_const_f32(), dprobs.as_const_f32(),

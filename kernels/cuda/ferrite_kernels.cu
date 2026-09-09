@@ -4368,7 +4368,9 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
     if (n <= 0) return cudaSuccess;
     if (hidden % 32 != 0 || (inter & 31) != 0 || (inter_shared & 31) != 0)
         return cudaErrorNotSupported;
-    if (inter > 512 || inter_shared > 512 || topk > 8) return cudaErrorNotSupported;
+    // the smem tile rows are 272B (256 data + 16 pad): klen must fit. GLM:
+    // inter = inter_shared = moe_inter/tp = 256.
+    if (inter > 256 || inter_shared > 256 || topk > 8) return cudaErrorNotSupported;
     dim3 grid((unsigned)(hidden / 32), (unsigned)n);
     moe_down_e4m3_mma_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
