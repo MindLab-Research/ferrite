@@ -463,3 +463,10 @@ replay 16.06ms/996 tok/s 看似大胜，**但文本全是 `!!!!!`** —— 128 �
 缩放的假设（xq 量化分布 / epilogue 的 `warp == 0 && lane < 16` / sxs 归约）。**已 git revert。**
 这是本会话第 11 次"变快=少算"：**任何改变 blockDim 的改动都要先确认 kernel 内所有 warp/thread
 相关的常量都已同步**（TG、gmask、warp 索引、smem 布局、epilogue 掩码）。
+
+### 已确认（无需改）：act 的 xq 预量化已在用
+
+`moe_fused_act_fp8_mma_kernel` 的 per-block 量化只是 v1 回退；批量路径走
+`ferrite_moe_fused_act_fp8_mma_v2`，Rust 侧先调 `quant_e4m3_tokens` 把 x 量化一次/层，
+再传 `xq`/`xs` 进 kernel（`if (xq != nullptr)` 快路径）。所以"每 block 重复量化同一 token"
+的冗余**不存在**，此项无需优化。
