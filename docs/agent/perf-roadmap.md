@@ -629,3 +629,18 @@ bf16 → 8 次 cvt），实测约为 fp32 峰值的 1%。权重流量本身只�
 是**转换+延迟受限**，不是带宽受限 → **tensor core 化是正解**（bf16 `m16n8k16` 或 tf32 `m16n8k8`）。
 注意：上一次 b16 fp8 MMA 实验虽然撞上并行度断崖，**per-seq 仍比基线快 5%**（62.7 vs 59.6），
 说明 tensor core 化本身有效，只是被 fp8-x 的思考模式否决。**下次做 bf16/tf32 x**（精度损失远小于 fp8）。
+
+### ❌ bf16 tensor-core gemv + warp K-split：5 次迭代全部失败，已回退（2026-09-08）
+
+曾观察到一次 "per-seq 64.1–65.6（+8%）"，但那是**竞态下的假读数**，不是真实收益：
+1. **block 共享 sx/sw tile + 8 个 warp 各持不同 K-slice → 互相覆写**（第一版）。改 per-warp 后
+   `FERRITE_GEMV_BF16_MMA=1` 反而崩到 1.6 tok/s（同一 build 下 =0 仍是 58.9–59.8）。
+2. **per-warp tile 双缓冲 = 58KB 静态 smem > 48KB/block 上限** → launch 失败（err 700）。
+3. 改**动态 smem + cudaFuncSetAttribute** → 该调用**发生在图捕获内** → 捕获失效（138 条 err 900/901）。
+4. 改 **32-K tile + 双缓冲（静态 34.8KB）** 仍然 138 条捕获错误（根因未查明）。
+5. **唯一正确的版本**（per-warp tile、单缓冲、无竞态、文本 LEN 135）实测 **58.2–59.0 = 与基线持平，
+   零收益**。
+
+**结论**：现有 `gemm_bf16_mma`(n=16) 路径已够好，gemv 的 26% 不能靠"换成 MMA"直接拿掉；
+下一步应先在 **ncu 单 kernel 微基准**里把新 kernel 的瓶颈量化（而不是在 serve 里盲试），
+或者转向 MoE（27%）的 DeepGEMM 级 MMA。**诊断开关 FERRITE_GEMV_SKIP/MOE_SKIP/ATTN_SKIP 保留。**
