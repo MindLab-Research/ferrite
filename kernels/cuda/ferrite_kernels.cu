@@ -3668,17 +3668,15 @@ __global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
         #pragma unroll
         for (int t = 0; t < 2; t++) {
             const int kb = t * 16;
-            // A fragment: lane l supplies rows (l&7) and (l&7)+8 at K (l>>3)*8
+            // A fragment for m16n8k16: 16 rows x 16 K = four 8x8 b16 tiles.
+            // Same lane->address pattern as the (proven-correct) fp8 kernel:
+            // lanes 0-15 give the 16 rows, lanes 16-31 the +16-byte K half.
             unsigned a[4];
             {
                 const unsigned saddr = (unsigned)__cvta_generic_to_shared(
-                    sw[warp][(lane & 7)] + kb + ((lane >> 3) * 8));
-                const unsigned saddr2 = (unsigned)__cvta_generic_to_shared(
-                    sw[warp][(lane & 7) + 8] + kb + ((lane >> 3) * 8));
-                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                             : "=r"(a[0]), "=r"(a[1]) : "r"(saddr));
-                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
-                             : "=r"(a[2]), "=r"(a[3]) : "r"(saddr2));
+                    sw[warp][0] + (size_t)(lane & 15) * 40 + ((lane >> 4) * 16) + kb * 2);
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr));
             }
             // B fragment: lane l holds B[(l%4)*2 ..][l/4] for the 16x8 tile
             unsigned b[2];
