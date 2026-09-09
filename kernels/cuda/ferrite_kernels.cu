@@ -4946,11 +4946,15 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     __syncthreads();
     float m = -INFINITY;
     // FIXED 256-stride + 8-warp reduction: the FP association must be IDENTICAL
-    // to the known-good 256-thread build at any BLK. A block-size-dependent
-    // reassociation of these two reductions flipped the model into a
-    // repetition loop (2026-09-09). Only the QK group count may differ — each
-    // slot's dot uses the same 8-lane tree, so the scores stay bit-identical.
-    for (int s = threadIdx.x; s < live_k; s += 256) m = fmaxf(m, sc[s]);
+    // to the known-good 256-thread build at any BLK. The `tid < 256` guard is
+    // REQUIRED — without it the threads 256..511 re-scan slots 256.., 512..,
+    // i.e. every slot >= 256 is summed twice (softmax denominator ~2x too big,
+    // attention weights wrong -> the model degenerates into a repetition loop
+    // once live_k > 256; that is exactly the "only loops with longer output"
+    // symptom). Only the QK group count may differ — each slot's dot uses the
+    // same 8-lane tree, so the scores stay bit-identical.
+    if (threadIdx.x < 256)
+        for (int s = threadIdx.x; s < live_k; s += 256) m = fmaxf(m, sc[s]);
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
     __syncthreads();
@@ -4965,7 +4969,8 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
         sc[s] = all_inf ? 0.f : __expf(sc[s] - m);
     __syncthreads();
     float sum = 0.f;
-    for (int s = threadIdx.x; s < live_k; s += 256) sum += sc[s];
+    if (threadIdx.x < 256)   // same guard: see the max reduction above
+        for (int s = threadIdx.x; s < live_k; s += 256) sum += sc[s];
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
     __syncthreads();

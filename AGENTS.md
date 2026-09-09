@@ -16,6 +16,11 @@ Read `README.md` for the design contract; this file is the operational guide: bu
    serve 端只在结论要落地时才跑一次。
 5. **禁止 MTP / 投机解码**（用户明令："严禁mtp…严禁投机"）。
    目标固定为 **16 并发不开 MTP ≥1600 tok/s**。
+6. **放弃任何优化方向前必须形式化证明它走不通或效果差**（隔离微基准 / 数值等价性证明 /
+   可复现的量化对照）。禁止用"感觉不行"或单次文本观察作为放弃依据（2026-09-09）。
+7. **文本重复/思考模式循环不是可靠的回归判据**：BLK=256 已知正确版本同样会重复，
+   `enable_thinking:false` 也拦不住。判定 kernel 改动正确性用**数值等价性**
+   （同输入跑两条路径，逐位比对输出），文本只作辅助。
 
 **测速纪律**：只看 `FERRITE_TIMING=1` 的 `[megab] replay 16 seqs: Nms` 中位数
 （16000/N = 聚合 tok/s），并确认日志里有 `live=16`；per-seq×16 与 total/wall 只作交叉验证。
