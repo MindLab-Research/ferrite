@@ -95,6 +95,10 @@ nsys stats --report cuda_gpu_kern_sum /tmp/nsys_b16.nsys-rep | head -50
 - **AR 实现方式无关**：`FERRITE_AR_SKIP=1`（P2P/NCCL 的 AR 全跳过）仍崩 → 不是 P2P vs NCCL 的差别。
   （单次 `FERRITE_P2P=1` 跑通过是 1 个样本，最可能是开 P2P 时多出的 staging/ready 表改变了 VA 布局，属运气；
   且 P2P 在 batched n>8 有文档记载的死锁 + 会 wedge 整机，**不可设为默认**。）
+- **P2P 复测（2026-09-09 末，根因 #1-#5 全部修复后，FERRITE_P2P=1+FORCE）**：B=16 仍在捕获/ramp 阶段死锁
+  （30s 日志停滞，监护脚本 kill -9）→ hard-reject 是正确判断，v3 修复并未解决 batched n>8。
+  **好消息：30 秒内早杀后驱动未 wedge**（nvidia-smi 全 0 + b1 sanity 干净通过）。P2P 诊断必须带
+  日志停滞检测 + 精确 PID kill 的监护脚本。
 - **padding 无关**：`FERRITE_NO_PAD=1` 仍崩。
 - **CUDA 图无关**：`FERRITE_MEGA_DRY=1`（不捕获图）仍崩；`FERRITE_DESTROY_BG=1`（retire 时销毁 megab 图）也仍崩。
 - **MoE 只是部分相关**：`FERRITE_MOE_SKIP=1` 能出 10 tok 但仍有 129 fault。
