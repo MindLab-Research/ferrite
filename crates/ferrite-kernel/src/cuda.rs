@@ -3512,7 +3512,14 @@ impl CudaBackend {
                 None => (0usize, (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())),
             };
             if ptrs.0.is_null() {
-                let max_tokens = 8192usize;
+                // FERRITE_DSA_MAXT: diagnostic knob for the per-seq DSA cache
+                // capacity (default 8192). Shrinking it tests whether the
+                // batched-path PDE faults are tied to these huge (~0.5GB each)
+                // allocations.
+                let max_tokens = std::env::var("FERRITE_DSA_MAXT")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8192usize);
                 let kn = self.dsa_alloc(max_tokens * h * dk)?;
                 let vv = self.dsa_alloc(max_tokens * h * dv)?;
                 let kns = self.dsa_alloc(max_tokens * h)?;   // fp8 per-(token,head) scales
@@ -3861,7 +3868,10 @@ impl CudaBackend {
                         (kn, vv, kns, vss, ki_, kg, pt0 as *const i32, ptot as *const i32, t0 + 1)
                     }
                     None => {
-                        let max_tokens = 8192usize;
+                        let max_tokens = std::env::var("FERRITE_DSA_MAXT")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(8192usize);
                         let kn = self.dsa_alloc(max_tokens * h * dk)?;
                         let vv = self.dsa_alloc(max_tokens * h * dv)?;
                         let kns = self.dsa_alloc(max_tokens * h)?;
