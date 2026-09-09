@@ -167,7 +167,7 @@ static void launch_hc_pre(void* v) {
 
 // random fp8 e4m3 bytes (valid range: avoid NaN 0x7F/0xFF)
 static void rand_fp8(unsigned char* p, size_t n) {
-    for (size_t i = 0; i < n; i++) p[i] = (unsigned char)(rand() % 254); // 0..253
+    for (size_t i = 0; i < n; i++) p[i] = (unsigned char)(rand() % 127); // 0..126 (0x7f is e4m3 NaN)
 }
 
 int main(int argc, char** argv) {
