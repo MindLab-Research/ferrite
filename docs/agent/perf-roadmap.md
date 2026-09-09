@@ -1156,3 +1156,13 @@ fp8 路径已无争议（逐位一致）。bf16 路径读出未初始化量级�
 
 **方法论（本轮最大收获）**：serve 中位数有 ±3% 噪声 → **判断 kernel 改动必须用隔离微基准**；
 "kernel 慢但找不到原因" → **先隔离复现 + ncu**（本轮三个合理假设全部被证伪）。
+
+### hc_pre_mix 的 ncu（2026-09-09，纯启动开销）
+
+`hc_pre_mix_split_kernel`：Duration **9.57µs**，grid 只有 (1,6,8)=48 blocks，256 线程。
+- **No Eligible 92.76%**，Issued/Scheduler 0.07，Active Warps 2.00 / Eligible 0.08
+- Memory Throughput **2.26%**、Compute **1.42%**（几乎什么都不做）
+
+**它每步被调用 90 次**（2/层 × 45）→ **0.86ms/步** 是纯 kernel 启动+延迟，不是计算。
+**唯一有效方向是融合**（并入相邻 kernel 或减少调用次数），任何单 kernel 微调都无意义。
+这是"launch 多的 kernel 一定要融合"（用户指令）最典型的一例。
