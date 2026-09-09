@@ -1136,3 +1136,23 @@ fp8 路径已无争议（逐位一致）。bf16 路径读出未初始化量级�
 
 **当前交付状态**：默认路径（SIMT down）不受影响，**1128 tok/s**；两条 MMA 路径都由
 `FERRITE_MOE_DOWN_MMA=1` 门控且默认关闭。
+
+## 会话最终状态（2026-09-09）
+
+**基线（用户确认）**：1062 tok/s。**当前（可靠读数 n≈2000）**：**14.19 ms/步 = 1128 tok/s**。
+
+**本会话验证并保留的改动**（每项都有隔离微基准或多次 serve 中位数支撑）：
+1. CUTLASS 级 fp8 MMA gemv（微基准 5.2-8.6x，位级一致）+ 快量化 kernel
+2. indexer fast-path 提前、kpool 4 路展开、sparse_attn TG=8（修 UB）
+3. MoE down 4 路累加器、sparse_attn 位图+launch_bounds+unroll（隔离 −27%）、
+   MoE act 2 段流水（隔离 −34%）
+4. fp8 DSA KV cache（中性，为后续 MMA 铺路）
+5. nsys 落盘修复（`/shutdown` 接口）
+
+**park 的项（默认关闭，均有实测依据）**：
+- MoE down fp8 MMA：数学已证明正确（e4m3-exact → bad=0），但 act 的 e4m3 量化（6.25%/元素）
+  在 42 层复利后破坏文本 —— 需要 bf16/fp16 act。
+- MoE down bf16 MMA：片段装载仍有 bug（微基准读到 1e34 量级），需继续在微基准对拍。
+
+**方法论（本轮最大收获）**：serve 中位数有 ±3% 噪声 → **判断 kernel 改动必须用隔离微基准**；
+"kernel 慢但找不到原因" → **先隔离复现 + ncu**（本轮三个合理假设全部被证伪）。
