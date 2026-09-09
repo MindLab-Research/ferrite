@@ -4557,12 +4557,26 @@ __global__ void indexer_topk_batched_kernel(
             for (int hi = lid; hi < ih; hi += TG) {
                 const float* q = q_s + (size_t)hi * idm;
                 float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+                float e0 = 0.f, e1 = 0.f, e2 = 0.f, e3 = 0.f;
+                // 4-way unroll (was 2): idm=128 -> 32 float4 iterations, each
+                // pair of loads feeding only 2 chains left the fp32 FMA
+                // latency exposed (the indexer is latency-bound).
+                int l = 0;
                 #pragma unroll 2
-                for (int l = 0; l + 3 < idm; l += 4) {
+                for (; l + 7 < idm; l += 8) {
+                    float4 qv = *reinterpret_cast<const float4*>(q + l);
+                    float4 kv = *reinterpret_cast<const float4*>(k + l);
+                    float4 qw = *reinterpret_cast<const float4*>(q + l + 4);
+                    float4 kw = *reinterpret_cast<const float4*>(k + l + 4);
+                    d0 += qv.x * kv.x; d1 += qv.y * kv.y; d2 += qv.z * kv.z; d3 += qv.w * kv.w;
+                    e0 += qw.x * kw.x; e1 += qw.y * kw.y; e2 += qw.z * kw.z; e3 += qw.w * kw.w;
+                }
+                for (; l + 3 < idm; l += 4) {
                     float4 qv = *reinterpret_cast<const float4*>(q + l);
                     float4 kv = *reinterpret_cast<const float4*>(k + l);
                     d0 += qv.x * kv.x; d1 += qv.y * kv.y; d2 += qv.z * kv.z; d3 += qv.w * kv.w;
                 }
+                d0 += e0; d1 += e1; d2 += e2; d3 += e3;
                 float dot = (d0 + d1) + (d2 + d3);
                 s += w_s[hi] * fmaxf(dot, 0.f); // relu
             }
