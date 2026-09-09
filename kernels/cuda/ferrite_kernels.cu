@@ -3583,7 +3583,7 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
             const unsigned char* src_ = (proj ? uw8 : gw8) + (size_t)(m0 + row) * hidden + (TILE) + col; \
             unsigned char* dst_ = sa[BUF][warp] + proj * (16 * SA_STRIDE) + row * SA_STRIDE + col; \
             const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
-            asm volatile("cp.async.cg.shared.global.L2::256B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
         } \
         asm volatile("cp.async.commit_group;\n"); \
     } while (0)
@@ -4357,7 +4357,7 @@ __global__ void sparse_attn_v2_batched_kernel(
                 const int j = idxs[s];
                 if (j < 0 || j >= t) continue;
                 float4 vv;
-                asm volatile("ld.global.nc.L2::256B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
+                asm volatile("ld.global.nc.L2::128B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
                              : "=f"(vv.x), "=f"(vv.y), "=f"(vv.z), "=f"(vv.w)
                              : "l"(v_s + ((size_t)j * h + hd) * dv + c * 4));
                 a.x += w * vv.x; a.y += w * vv.y; a.z += w * vv.z; a.w += w * vv.w;
@@ -5969,7 +5969,7 @@ __global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
         int k = k0 + lane * 16;
         if (k + 15 < k1) {
             uint4 wv;
-            asm volatile("ld.global.nc.L2::256B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+            asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
                          : "=r"(wv.x), "=r"(wv.y), "=r"(wv.z), "=r"(wv.w)
                          : "l"(wr + k));
             const unsigned char* w8 = reinterpret_cast<const unsigned char*>(&wv);
