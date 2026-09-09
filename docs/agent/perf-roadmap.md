@@ -487,3 +487,9 @@ v 缓存改 fp16（append 写 half、注意力 half2 载入 + fp32 累加）：p
 → 与 moe_down 的 half2 / 4 路累加器同类：数值扰动越过 logit 决策边界。**已 git revert。**
 **规律重申：凡涉及注意力/MoE 的求和顺序或精度改动，一律以"是否仍是直接背诵"为验收标准，
 即使人眼看起来文本连贯也不行（思考模式 = 行为回归）。**
+
+### 已回退：GDN decay 循环的 float4 向量化（misaligned address err 716）
+
+`for (j < dv) Si[j] *= decay` → float4 读写：serve 直接崩（`CUDA sync: misaligned address
+(err 716)`）。原因：`Si`/`S` 是 smem 里的 float*，偏移不保证 16 字节对齐。**教训：smem 上的
+float4 访问必须先确认基址与步长都是 16 的倍数**（或改用 `__ldg`/标量）。已 git revert。
