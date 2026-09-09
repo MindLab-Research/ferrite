@@ -3665,9 +3665,7 @@ __global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
                 __half2float(__nv_cvt_fp8_to_halfraw(v8, __NV_E4M3)));
         }
         __syncwarp();
-        // DIAG: transposed scale index (bisect — the unique-scale experiment
-        // proved the scale lookup is wrong, layout or index).
-        const float wsc = ws[(size_t)(k0 >> 7) * 32 + (h0 >> 7)];
+        const float wsc = ws[(size_t)(h0 >> 7) * dscols + (k0 >> 7)];
         // ---- two m16n8k16 MMAs (K = 32 for this warp) ----
         #pragma unroll
         for (int t = 0; t < 2; t++) {
