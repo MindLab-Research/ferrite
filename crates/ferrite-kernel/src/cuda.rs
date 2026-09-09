@@ -1988,7 +1988,7 @@ impl CudaBackend {
                                                  do_.as_f32(), n, in_f, out_f, f8.scols, self.stream)
                     };
                     if r != 0 {
-                        eprintln!("[opcheck] moe_fused_act_fp8_mma_v2 returned err {r} — the act kernel (v2, n={ni}) is the first failing launch");
+                        eprintln!("[opcheck] gemv_fp8_mma_b16 returned err {r}");
                     }
                     if r == 0 {
                         return Ok(do_);
@@ -4502,6 +4502,9 @@ impl CudaBackend {
                             self.stream,
                         )
                     };
+                    if r != 0 {
+                        eprintln!("[opcheck] moe_fused_act_fp8_mma_v2 returned err {r} (n={ni}) — the v2 act kernel is the first failing launch");
+                    }
                     if r == 0 {
                         {
                             static ONCE: std::sync::Once = std::sync::Once::new();
