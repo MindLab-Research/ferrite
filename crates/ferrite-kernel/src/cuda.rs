@@ -3734,7 +3734,11 @@ impl CudaBackend {
             // f32→bf16 cast) = 9 launches with 2; f32 x consumed DIRECTLY
             // (no cast kernels). Block-level K-split ×8 (17 out-tiles).
             let mut fused: Option<(DevBuf, DevBuf, DevBuf)> = None;
-            if std::env::var("FERRITE_GEMM3").map(|v| v == "1").unwrap_or(false) {
+            // FERRITE_GEMM3 (default ON, =0 opts out): verified 2026-09-10 at
+            // B=16 — replay 14.57→14.41ms, 0 faults, 出师表 verbatim (a
+            // leading-token flip on req0 is the bf16-MMA-vs-cuBLAS 1e-3
+            // reassociation class; the recitation itself is correct).
+            if std::env::var("FERRITE_GEMM3").map(|v| v != "0").unwrap_or(true) {
                 if let (Ok(da), Ok(db), Ok(dc)) = (
                     self.dev_weight_bf16(w.wk),
                     self.dev_weight_bf16(w.weights_proj),
@@ -4002,13 +4006,13 @@ impl CudaBackend {
         // stream once for all B rows; per-row accumulation is the tiled
         // GEMM's, matching the prefill's numeric domain).
         let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
-        // FERRITE_GEMM3: the three SMALL same-x GEMMs {b, f_a, g_a} in ONE
-        // launch (+ a deterministic reduce) — the qkv (25MB weights @6.2TB/s
-        // on cuBLAS) stays put. Replaces 3× (nvjet + reduce + f32→bf16 cast)
-        // = 9 launches with 2 per layer × 34 GDN layers.
+        // FERRITE_GEMM3 (default ON, =0 opts out — see the DSA site for the
+        // verification record): the three SMALL same-x GEMMs {b, f_a, g_a}
+        // in ONE launch (+ a deterministic reduce) — the qkv (25MB weights
+        // @6.2TB/s on cuBLAS) stays put.
         let (b_raw, fa, ga) = {
             let mut fused: Option<(DevBuf, DevBuf, DevBuf)> = None;
-            if std::env::var("FERRITE_GEMM3").map(|v| v == "1").unwrap_or(false) {
+            if std::env::var("FERRITE_GEMM3").map(|v| v != "0").unwrap_or(true) {
                 if let (Ok(da), Ok(db), Ok(dc)) = (
                     self.dev_weight_bf16(w.b_proj),
                     self.dev_weight_bf16(w.f_a),
