@@ -347,6 +347,18 @@ int main(int argc, char** argv) {
             if (r > 5e-2) bad2++;
         }
         printf("BF16-MMA vs SIMT-down: maxrel=%.3e bad=%d/%zu\n", mx2, bad2, olen);
+        // per-token breakdown: localises whether the MMA or the reference side
+        // is wrong when n>=3 (the "exactly n<=2 correct" pattern).
+        for (int t = 0; t < mc.n; t++) {
+            double mt = 0; int bt = 0;
+            for (int r = 0; r < mc.hidden; r++) {
+                double d = fabs((double)a[(size_t)t*mc.hidden+r] - (double)c_[(size_t)t*mc.hidden+r]);
+                double rr = d / fmax(fabs((double)a[(size_t)t*mc.hidden+r]), 1e-3);
+                if (rr > mt) mt = rr;
+                if (rr > 5e-2) bt++;
+            }
+            printf("  tok%d: maxrel=%.3e bad=%d/%d\n", t, mt, bt, mc.hidden);
+        }
         for (int t = 0; t < 2 && t < mc.n; t++)
             printf("  tok%d: ref=%.4g %.4g %.4g %.4g | bf16=%.4g %.4g %.4g %.4g\n", t,
                    a[(size_t)t*mc.hidden+0], a[(size_t)t*mc.hidden+1], a[(size_t)t*mc.hidden+2], a[(size_t)t*mc.hidden+3],
