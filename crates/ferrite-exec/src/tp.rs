@@ -1017,15 +1017,25 @@ impl<B: KernelBackend> TpCluster<B> {
             let last = *last_toks.last().unwrap();
             last_toks.resize(size, last);
         }
-        let h0 = self.shards[0].embed(&last_toks);
-        let in_vals = crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult);
-
-        let have_graph = self
+        // Device-input mode check FIRST (2026-09-10): when the graph's first
+        // node is embed_expand_dev (in_n > 0), replay feeds n×4B token ids
+        // (graph_run_ids) and the host embedding + hc_expand (~125µs/step at
+        // B=16: embed lookup + 1MB Vec alloc/fill) is SKIPPED entirely. The
+        // dry-run/capture passes (have_graph=false) still compute the expanded
+        // input — the dry-run executes it for real.
+        let graph_io = self
             .shards[0]
             .backend
             .as_cuda()
-            .map(|c| c.graph_io_get(&gname).is_some())
-            .unwrap_or(false);
+            .and_then(|c| c.graph_io_get(&gname));
+        let have_graph = graph_io.is_some();
+        let dev_input = graph_io.map(|io| io.in_n > 0).unwrap_or(false);
+        let in_vals: Tensor = if dev_input {
+            Tensor::zeros(Shape::new([0]), DType::F32) // empty — graph_run_ids doesn't use it
+        } else {
+            let h0 = self.shards[0].embed(&last_toks);
+            crate::mhc::hc_expand(&h0, self.full_cfg.hc_mult)
+        };
         if !have_graph {
             // Cross-rank barrier BEFORE the dry-run: the capture path is
             // serialized by capture_lock and each rank's P2P AR epoch counter
