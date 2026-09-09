@@ -3670,18 +3670,17 @@ __global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
         #pragma unroll
         for (int t = 0; t < 2; t++) {
             const int kb = t * 16;
-            // A fragment for m16n8k16: 16 rows x 16 K = four 8x8 b16 tiles.
-            // Same lane->address pattern as the (proven-correct) fp8 kernel:
-            // lanes 0-15 give the 16 rows, lanes 16-31 the +16-byte K half.
+            // A fragment for m16n8k16 via DIRECT smem loads (bisect: replaces
+            // ldmatrix to rule out its addressing). m16n8k16 A layout per
+            // lane l: (row l/4, k (l%4)*2) in a0, (row l/4+8) in a1,
+            // (k +8) in a2, (row+8, k+8) in a3.
             unsigned a[4];
             {
-                // K-half offset is 8 bf16 ELEMENTS (16 bytes) — the fp8
-                // kernel's *16 was 16 fp8 elements; using 16 here skipped to
-                // k=16..31 and the m16n8k16 A read garbage.
-                const unsigned saddr = (unsigned)__cvta_generic_to_shared(
-                    sw[warp][0] + (size_t)(lane & 15) * 40 + ((lane >> 4) * 8) + kb * 2);
-                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr));
+                const int r0 = lane >> 2, cc = (lane & 3) * 2;
+                a[0] = *(const unsigned*)&sw[warp][r0][kb + cc];
+                a[1] = *(const unsigned*)&sw[warp][r0 + 8][kb + cc];
+                a[2] = *(const unsigned*)&sw[warp][r0][kb + cc + 8];
+                a[3] = *(const unsigned*)&sw[warp][r0 + 8][kb + cc + 8];
             }
             // B fragment: lane l holds B[(l%4)*2 ..][l/4] for the 16x8 tile
             unsigned b[2];
