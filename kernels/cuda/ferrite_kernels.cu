@@ -4740,6 +4740,7 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     __shared__ unsigned char q8s[256];          // the Q in e4m3
     __shared__ unsigned char kt[16][40];        // 16 slots x 32 K (+pad)
     {
+        const int lane = threadIdx.x & 31;
         const float qsc = 1.0f;                  // Q quantized with absmax/448
         float am = 1e-9f;
         for (int l = threadIdx.x; l < d; l += blockDim.x) am = fmaxf(am, fabsf(qs[l]));
