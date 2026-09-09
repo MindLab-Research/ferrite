@@ -269,7 +269,7 @@ Other profiling rules:
 - MTP 出师表 200-step: `real 476 tokens` window, text must be flawless 《出师表》 through 将军向宠 section (乱码 = accept/commit bug, ALWAYS check by eye).
 - 500-step: 58.9 tok/s (DSA decay visible), non-MTP 500-step 44.7.
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
-- **B=16 non-MTP (2026-09-08 late, the current best)** — HONEST end-to-end numbers are the
+- **B=16 non-MTP (2026-09-08, CORRECTED after a measurement-methodology audit): TRUE 16-concurrency steady = ~830 tok/s (per-seq 51.6-52.1 x 16, live=16 verified in the serve log); end-to-end wall aggregate (incl. the serial admit ramp) = 667 tok/s. The earlier "954-960" was inflated ~15% because the 300-token runs spent their per-seq windows at partial concurrency. ALWAYS use total_tokens/wall with >=2000-token outputs and verify live=16; script /tmp/bench_tr.py N MAX_TOKENS.
   per-seq `steady=` x16 (the `[megab] replay` line under-reports long context by ~8%):
   **300-token window: 59.4-60.9 tok/s/seq = 950-974 tok/s aggregate**; **1000-token window:
   56.8-57.6 tok/s/seq = 909-922 tok/s aggregate** (run-to-run ±2%). Text = direct 《出师表》 ✓.

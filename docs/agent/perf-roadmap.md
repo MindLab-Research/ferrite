@@ -644,3 +644,26 @@ bf16 → 8 次 cvt），实测约为 fp32 峰值的 1%。权重流量本身只�
 **结论**：现有 `gemm_bf16_mma`(n=16) 路径已够好，gemv 的 26% 不能靠"换成 MMA"直接拿掉；
 下一步应先在 **ncu 单 kernel 微基准**里把新 kernel 的瓶颈量化（而不是在 serve 里盲试），
 或者转向 MoE（27%）的 DeepGEMM 级 MMA。**诊断开关 FERRITE_GEMV_SKIP/MOE_SKIP/ATTN_SKIP 保留。**
+
+### ⚠️ 测量方法学修正（2026-09-08，用户质疑后实测）
+
+**"per-seq steady × 16" 会虚高。** 300-token 负载下服务是**串行 admit**（日志 `live=1 queued=0`
+→ `live=2 queued=14` …），要 ~5–10s 才爬到 `live=16`；per-seq 的中间窗口因此落在**并发不足**的
+区间，单序列分到的负载少 → 单序列速率虚高 → 再 ×16 放大。**实测对比（16×8000 输出，实际每请求
+~2000 token 后自然 EOS）**：
+
+| 指标 | 值 |
+|---|---|
+| 服务端并发 | `live=16 queued=0`（确认 16 个同时在线） |
+| per-seq steady（16 并发稳态） | **51.6–52.1 tok/s** |
+| per-seq × 16（真稳态聚合） | **~830 tok/s** |
+| 端到端 wall 聚合（含 admit 爬升） | **667.4 tok/s** |
+| 旧的 300-token "954–960" | **虚高 ~15%（已作废）** |
+
+**今后测法（强制）**：
+1. 输出 ≥2000 token（让稳态窗口远长于 admit 爬升），prompt 用"详细介绍 Transformer"这类长文任务；
+2. **以 `total_tokens / wall` 为准**，per-seq × 16 只作交叉验证；
+3. 每次跑完 `grep -oE "live=[0-9]+" 服务日志` 确认确实到达 `live=16`；
+4. 脚本 `/tmp/bench_tr.py N MAX_TOKENS`（16×8000 → ~2000 token/请求，48s，含 live 校验）。
+
+**真实基线：16 并发 ~830 tok/s 稳态（667 端到端）。距 1600 是 1.93x，不是此前以为的 1.67x。**
