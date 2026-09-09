@@ -844,6 +844,15 @@ impl<B: KernelBackend> TpCluster<B> {
     /// GDN states, mega graphs, or the serve OOMs after a handful of
     /// requests). Engine-thread only (single writer — no replay races).
     pub fn free_seq(&mut self, seq: u64) {
+        // HARDENING (2026-09-09): the per-size pointer tables are refreshed only
+        // when the batch membership CHANGES (`if last_batch_seqs != Some(seqs)`),
+        // but free_seq frees this seq's per-seq states (DSA caches, GDN states)
+        // from a DIFFERENT thread (HTTP driver) — a replay/dry-run racing with
+        // the free can dereference a freed 2MB-aligned cudaMalloc base (Xid 31
+        // PDE fault). Invalidate the cached membership so the very next batched
+        // step unconditionally rebuilds the table contents, matching the
+        // "refreshed on every call" contract documented in cuda.rs.
+        self.last_batch_seqs = None;
         for s in &mut self.shards {
             s.remove_seq(seq);
         }
