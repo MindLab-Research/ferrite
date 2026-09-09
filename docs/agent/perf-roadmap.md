@@ -529,3 +529,14 @@ decode 的 M=1 看似无法用 MMA，但**同一 seq 的 64 个 head 共享同�
 grid (B,h)=1024 blocks × 544 线程 = 557K 线程，GPU 容量 132×2048 = 270K → 约 2 波（并行度已饱和）。
 split-K=4 → 4096 blocks（8 波）、每块 1/4 工作量 → **总时间不变**。真正的限制是每线程的串行
 slot 循环（gather + 点积），TG 调优（8→2）已到甜点。**不要做 split-K。**
+
+## 新识别的大项（比吸收/分组更清晰）：gemv 的 fp8 MMA 化（预估 ~10%）
+
+**结构同构但无浪费**：gemv_fp8_v2 的 M=16（token 维）、N=8（输出行，**不复制**）、K=4096，
+与 `moe_fused_act_fp8_mma_kernel` 的 MMA 完全同构 —— 但 act 的 B 是同一 x 复制 8 份（8x 浪费），
+gemv 的 B 是 8 个不同输出行（**零浪费**）。当前 gemv 实测 2.6 TMAC/s（fp32 峰值 1%，纯延迟受限）。
+
+**做法**：复用 act 的 fp8 MMA 骨架，角色对调 —— A = xq[16 tokens, 32K]（x 预量化为 fp8，
+act 已经在做 `quant_e4m3_tokens`），B = 权重[32K, 8 out]，累加器 fp32。
+预期 gemv **2.2ms → ~0.5ms（约 10% 总步时）**，是当前最清晰的一项。
+风险：x 从 fp32 变 fp8 量化（act 路径已如此，文本正确），需人眼验证文本。
