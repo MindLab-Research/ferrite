@@ -581,3 +581,15 @@ __global__ void __launch_bounds__(256) gemv_fp8_mma_kernel(
    ≈ 4.5µs，vs 现 gemv 的 41.7µs）。同时必须去掉 K 循环里的 `__syncthreads()`（xq 按 warp 暂存）。
    **注意**：K-split 改变求和顺序（8 份 fp32 部分和），属数值敏感改动，必须人眼验收文本；
    且 fp8 x 只能用于 FFN 投影、注意力投影需保留 bf16 x（否则思考模式）。
+
+### nsys 采样当前 B=16 稳态：已知的踩坑（2026-09-08）
+
+想把 `cuda_gpu_kern_sum` 用于**当前** build 的 B=16 HTTP 路径时，报告只含加载期
+（`dequant_e4m3_block_kernel` 186 次 + `bf16_to_f32_kernel` 179 次，合计 4.5ms）。API 汇总显示
+`cudaMemcpy` 76040 次（9.7s）、`cudaThreadExchangeStreamCaptureMode` 782 次（即捕获阶段已采样），
+但**没有任何 `cudaGraphLaunch` / replay kernel**。结论与后续做法：
+- HTTP serve 的 nsys 采样在**捕获结束后就停了**，replay 阶段未进报告 —— 不要据此判断热路径。
+- `FERRITE_NCU=1` 的 profiler 窗口只存在于 **one-shot** 的 decode 循环（main.rs:397，`i == 1` 开窗），
+  HTTP serve 路径没有该窗口，`--capture-range=cudaProfilerApi` 因此不可用。
+- 远端**没有 sqlite3 CLI**，无法直接查 `CUPTI_ACTIVITY_KIND_*` 表。
+- 因此当前步时的可信分解仍是 **A/B 差分**（`FERRITE_AR_SKIP` 等）而不是 nsys 的绝对占比。
