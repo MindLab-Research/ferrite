@@ -5241,6 +5241,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         dev, stream, stage: std::ptr::null_mut(),
         batch: false,
         immortal: false,
+        gen: ferrite_kernel::cuda::devbuf_next_gen(),
     };
     let hprev = DevBuf {
         ptr: hprev_ptr, len: hidden,
@@ -5248,6 +5249,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         dev, stream, stage: std::ptr::null_mut(),
         batch: false,
         immortal: false,
+        gen: ferrite_kernel::cuda::devbuf_next_gen(),
     };
     let h_out = if !h_out_ptr.is_null() {
         Some(DevBuf {
@@ -5256,6 +5258,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
             dev, stream, stage: std::ptr::null_mut(),
             batch: false,
         immortal: false,
+        gen: ferrite_kernel::cuda::devbuf_next_gen(),
         })
     } else {
         None
@@ -5265,6 +5268,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         class: 1u32, dev, stream, stage: std::ptr::null_mut(),
         batch: false,
         immortal: false,
+        gen: ferrite_kernel::cuda::devbuf_next_gen(),
     };
     let result = mtp_forward_dev_argmax(s, seq, &emb, &hprev, h_out.as_ref(), &mut arg);
     // CRITICAL: these DevBuf views are raw-pointer ALIASES into MtpState's

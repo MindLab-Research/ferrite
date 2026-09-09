@@ -532,6 +532,13 @@ pub struct DevBuf {
 /// The monotonic allocation counter backing DevBuf::gen.
 static DEVBUF_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Next gen for OUT-OF-STRUCT DevBuf construction (raw-pointer alias views,
+/// e.g. MTP state views): a fresh gen per view = a fresh content identity —
+/// the xq cache can never stale-hit through an alias.
+pub fn devbuf_next_gen() -> u64 {
+    DEVBUF_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 impl DevBuf {
     /// Pooled alloc: reuse a released (device, stage) pair of the same size
     /// class when available, else cudaMalloc + cudaMallocHost. The caller
