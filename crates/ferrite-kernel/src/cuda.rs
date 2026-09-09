@@ -170,8 +170,9 @@ extern "C" {
     fn ferrite_dsa_append_batched(kvb: *const f32, ki: *const f32, gate: *const f32,
                                    kn_tbl: *const *mut f32, v_tbl: *const *mut f32,
                                    kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
+                                   kns_tbl: *const *mut f32, vs_tbl: *const *mut f32,
                                    t0_tbl: *const *const i32,
-                                   b: i32, h: i32, dk: i32, dv: i32, idm: i32,
+                                   b: i32, h: i32, dk: i32, dv: i32, idm: i32, ntok: i32,
                                    s: CuStream) -> i32;
     fn ferrite_kpool_compress_batched(kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
                                        ape: *const f32, pool_keys: *mut f32,
@@ -188,6 +189,7 @@ extern "C" {
                                    total_tbl: *const *const i32, n_fixed: i32,
                                    s: CuStream) -> i32;
     fn ferrite_sparse_attn_v2_batched(q: *const f32, k_tbl: *const *mut f32, v_tbl: *const *mut f32,
+                                       ksc_tbl: *const *mut f32, vsc_tbl: *const *mut f32,
                                        idx: *const f32, out: *mut f32, b: i32,
                                        total_tbl: *const *const i32,
                                        h: i32, d: i32, dv: i32, topk: i32,
@@ -723,7 +725,7 @@ pub struct CudaBackend {
     /// once per composition; purged by free_seq when a member cache dies.
     dsa_tbl_cache: std::sync::Mutex<std::collections::HashMap<(usize, usize), DsaBatchTables>>,
     /// per-family dummy DSA cache for padded batch rows (see dsa_dummy)
-    dsa_dummy_cache: std::sync::Mutex<std::collections::HashMap<usize, (*mut f32, *mut f32, *mut f32, *mut f32, *const i32, *const i32)>>,
+    dsa_dummy_cache: std::sync::Mutex<std::collections::HashMap<usize, (*mut f32, *mut f32, *mut f32, *mut f32, *mut f32, *mut f32, *const i32, *const i32)>>,
     /// P2P one-shot AR state (v2 epoch+ping-pong; FERRITE_P2P): the per-rank
     /// persistent device buffers for the in-graph decode-chain all-reduce —
     /// see P2pArState. Set once at cluster setup (after the peers' UVA
@@ -2783,6 +2785,8 @@ pub struct GdnLayerWeights<'a> {
 pub struct DsaCacheState {
     pub k_nope: *mut std::ffi::c_void,
     pub v: *mut std::ffi::c_void,
+    pub k_nope_scale: *mut std::ffi::c_void,
+    pub v_scale: *mut std::ffi::c_void,
     pub k_idx: *mut std::ffi::c_void,
     pub k_gate: *mut std::ffi::c_void,
     pub max_tokens: usize,
@@ -2813,6 +2817,8 @@ impl DsaCacheState {
 pub struct DsaBatchTables {
     pub kn: *mut std::ffi::c_void,
     pub v: *mut std::ffi::c_void,
+    pub kns: *mut std::ffi::c_void,
+    pub vs: *mut std::ffi::c_void,
     pub kidx: *mut std::ffi::c_void,
     pub kgate: *mut std::ffi::c_void,
     pub t0p: *mut std::ffi::c_void,
@@ -3018,6 +3024,8 @@ impl CudaBackend {
                     let t = DsaBatchTables {
                         kn: mk()?,
                         v: mk()?,
+                        kns: mk()?,
+                        vs: mk()?,
                         kidx: mk()?,
                         kgate: mk()?,
                         t0p: mk()?,
@@ -3030,6 +3038,8 @@ impl CudaBackend {
         };
         let mut kn: Vec<*mut f32> = Vec::with_capacity(size);
         let mut vv: Vec<*mut f32> = Vec::with_capacity(size);
+        let mut kns: Vec<*mut f32> = Vec::with_capacity(size);
+        let mut vss: Vec<*mut f32> = Vec::with_capacity(size);
         let mut ki_: Vec<*mut f32> = Vec::with_capacity(size);
         let mut kg: Vec<*mut f32> = Vec::with_capacity(size);
         let mut t0p: Vec<*const i32> = Vec::with_capacity(size);
@@ -3043,9 +3053,11 @@ impl CudaBackend {
             let m = self.dsa_caches.lock().unwrap();
             for &s in seqs {
                 if s == u64::MAX {
-                    let (dk_, dv_, di_, dg_, dt0, dtot) = dummy.expect("dummy built above");
+                    let (dk_, dv_, dks_, dvs_, di_, dg_, dt0, dtot) = dummy.expect("dummy built above");
                     kn.push(dk_);
                     vv.push(dv_);
+                    kns.push(dks_);
+                    vss.push(dvs_);
                     ki_.push(di_);
                     kg.push(dg_);
                     t0p.push(dt0);
@@ -3057,6 +3069,8 @@ impl CudaBackend {
                     .ok_or_else(|| FerriteError::InvalidArg(format!("no dsa cache ({s},{family}) for batched tables")))?;
                 kn.push(c.k_nope as *mut f32);
                 vv.push(c.v as *mut f32);
+                kns.push(c.k_nope_scale as *mut f32);
+                vss.push(c.v_scale as *mut f32);
                 ki_.push(c.k_idx as *mut f32);
                 kg.push(c.k_gate as *mut f32);
                 t0p.push(c.pinned_t0 as *const i32);
@@ -3064,10 +3078,12 @@ impl CudaBackend {
             }
         }
         if kn.len() < size {
-            let (dk_, dv_, di_, dg_, dt0, dtot) = self.dsa_dummy(family, h, dk, dv, idm)?;
+            let (dk_, dv_, dks_, dvs_, di_, dg_, dt0, dtot) = self.dsa_dummy(family, h, dk, dv, idm)?;
             while kn.len() < size {
                 kn.push(dk_);
                 vv.push(dv_);
+                kns.push(dks_);
+                vss.push(dvs_);
                 ki_.push(di_);
                 kg.push(dg_);
                 t0p.push(dt0);
@@ -3085,6 +3101,8 @@ impl CudaBackend {
         };
         up(t.kn, kn.as_ptr() as *const _)?;
         up(t.v, vv.as_ptr() as *const _)?;
+        up(t.kns, kns.as_ptr() as *const _)?;
+        up(t.vs, vss.as_ptr() as *const _)?;
         up(t.kidx, ki_.as_ptr() as *const _)?;
         up(t.kgate, kg.as_ptr() as *const _)?;
         up(t.t0p, t0p.as_ptr() as *const _)?;
@@ -3094,7 +3112,7 @@ impl CudaBackend {
 
     /// Shared per-family dummy DSA cache for padded batch rows (1 token;
     /// zeros; pinned t0/total = 0/1 so the kernels read only slot 0).
-    fn dsa_dummy(&self, family: usize, h: usize, dk: usize, dv: usize, idm: usize) -> Result<(*mut f32, *mut f32, *mut f32, *mut f32, *const i32, *const i32)> {
+    fn dsa_dummy(&self, family: usize, h: usize, dk: usize, dv: usize, idm: usize) -> Result<(*mut f32, *mut f32, *mut f32, *mut f32, *mut f32, *mut f32, *const i32, *const i32)> {
         let mut m = self.dsa_dummy_cache.lock().unwrap();
         if let Some(d) = m.get(&family) {
             return Ok(*d);
@@ -3111,6 +3129,8 @@ impl CudaBackend {
         const MAXT: usize = 8192;
         let kn = alloc(MAXT * h * dk)?;
         let vv = alloc(MAXT * h * dv)?;
+        let dks_ = alloc(MAXT * h)?;
+        let dvs_ = alloc(MAXT * h)?;
         let ki_ = alloc(MAXT * idm)?;
         let kg = alloc(MAXT * idm)?;
         let mut pt0: *mut i32 = std::ptr::null_mut();
@@ -3124,7 +3144,7 @@ impl CudaBackend {
             // rows' topk/pool loops spun (measured hang at size=16).
             *ptot = MAXT as i32;
         }
-        let tup = (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32);
+        let tup = (kn, vv, dks_, dvs_, ki_, kg, pt0 as *const i32, ptot as *const i32);
         m.insert(family, tup);
         Ok(tup)
     }
@@ -3462,16 +3482,18 @@ impl CudaBackend {
         )?;
 
         // 7. cache append (device-resident, in place at slot t0)
-        let (k_nope_dev, v_dev, k_idx_dev, k_gate_dev, t0) = {
+        let (k_nope_dev, v_dev, kn_scale_dev, v_scale_dev, k_idx_dev, k_gate_dev, t0) = {
             let mut m = self.dsa_caches.lock().unwrap();
             let (t0, ptrs) = match m.get(&(seq, family)) {
-                Some(c) => (c.t_count, (c.k_nope, c.v, c.k_idx, c.k_gate)),
-                None => (0usize, (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())),
+                Some(c) => (c.t_count, (c.k_nope, c.v, c.k_nope_scale, c.v_scale, c.k_idx, c.k_gate)),
+                None => (0usize, (std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut())),
             };
             if ptrs.0.is_null() {
                 let max_tokens = 8192usize;
                 let kn = self.dsa_alloc(max_tokens * h * dk)?;
                 let vv = self.dsa_alloc(max_tokens * h * dv)?;
+                let kns = self.dsa_alloc(max_tokens * h)?;   // fp8 per-(token,head) scales
+                let vss = self.dsa_alloc(max_tokens * h)?;
                 let ki_ = self.dsa_alloc(max_tokens * idm)?;
                 let kg = self.dsa_alloc(max_tokens * idm)?;
                 // pinned t0/total (graph-safe zero-copy)
@@ -3482,12 +3504,12 @@ impl CudaBackend {
                 unsafe { *pt0 = 0; *ptot = 0; }
                 m.insert(
                     (seq, family),
-                    DsaCacheState { k_nope: kn, v: vv, k_idx: ki_, k_gate: kg, max_tokens, t_count: n, pinned_t0: pt0, pinned_total: ptot },
+                    DsaCacheState { k_nope: kn, v: vv, k_nope_scale: kns, v_scale: vss, k_idx: ki_, k_gate: kg, max_tokens, t_count: n, pinned_t0: pt0, pinned_total: ptot },
                 );
-                (kn, vv, ki_, kg, 0)
+                (kn, vv, kns, vss, ki_, kg, 0)
             } else {
                 m.get_mut(&(seq, family)).unwrap().t_count += n;
-                (ptrs.0, ptrs.1, ptrs.2, ptrs.3, t0)
+                (ptrs.0, ptrs.1, ptrs.2, ptrs.3, ptrs.4, ptrs.5, t0)
             }
         };
         // Write t0/total to pinned memory (graph-safe: kernels read zero-copy,
@@ -3805,20 +3827,22 @@ impl CudaBackend {
                 let existing = m
                     .get(&(seq_r, family))
                     .filter(|c| !c.k_nope.is_null())
-                    .map(|c| (c.k_nope, c.v, c.k_idx, c.k_gate, c.pinned_t0, c.pinned_total, c.t_count));
+                    .map(|c| (c.k_nope, c.v, c.k_nope_scale, c.v_scale, c.k_idx, c.k_gate, c.pinned_t0, c.pinned_total, c.t_count));
                 match existing {
-                    Some((kn, vv, ki_, kg, pt0, ptot, t0)) => {
+                    Some((kn, vv, kns, vss, ki_, kg, pt0, ptot, t0)) => {
                         m.get_mut(&(seq_r, family)).unwrap().t_count += 1;
                         unsafe {
                             *pt0 = t0 as i32;
                             *ptot = (t0 + 1) as i32;
                         }
-                        (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32, t0 + 1)
+                        (kn, vv, kns, vss, ki_, kg, pt0 as *const i32, ptot as *const i32, t0 + 1)
                     }
                     None => {
                         let max_tokens = 8192usize;
                         let kn = self.dsa_alloc(max_tokens * h * dk)?;
                         let vv = self.dsa_alloc(max_tokens * h * dv)?;
+                        let kns = self.dsa_alloc(max_tokens * h)?;
+                        let vss = self.dsa_alloc(max_tokens * h)?;
                         let ki_ = self.dsa_alloc(max_tokens * idm)?;
                         let kg = self.dsa_alloc(max_tokens * idm)?;
                         let mut pt0: *mut i32 = std::ptr::null_mut();
@@ -3828,9 +3852,9 @@ impl CudaBackend {
                         unsafe { *pt0 = 0; *ptot = 1; }
                         m.insert(
                             (seq_r, family),
-                            DsaCacheState { k_nope: kn, v: vv, k_idx: ki_, k_gate: kg, max_tokens, t_count: 1, pinned_t0: pt0, pinned_total: ptot },
+                            DsaCacheState { k_nope: kn, v: vv, k_nope_scale: kns, v_scale: vss, k_idx: ki_, k_gate: kg, max_tokens, t_count: 1, pinned_t0: pt0, pinned_total: ptot },
                         );
-                        (kn, vv, ki_, kg, pt0 as *const i32, ptot as *const i32, 1)
+                        (kn, vv, kns, vss, ki_, kg, pt0 as *const i32, ptot as *const i32, 1)
                     }
                 }
             };
@@ -3845,8 +3869,9 @@ impl CudaBackend {
                     kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
                     tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
                     tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
+                    tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
                     tbl.t0p as *const *const i32,
-                    ni, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
+                    ni, h as i32, dk as i32, dv as i32, idm as i32, ni, self.stream,
                 )
             },
             "dsa_append_batched",
@@ -3901,6 +3926,7 @@ impl CudaBackend {
             unsafe {
                 ferrite_sparse_attn_v2_batched(
                     qb.as_const_f32(), tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
+                    tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
                     idx.as_const_f32(), attn_out.as_f32(), ni, tbl.totp as *const *const i32,
                     h as i32, dk as i32, dv as i32, out_width as i32, self.stream,
                 )
