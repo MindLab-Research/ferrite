@@ -128,11 +128,12 @@ static void launch_act_fp8(void* v) {
 }
 static void launch_down_fp8(void* v) {
     MoeCtx* c = (MoeCtx*)v;
+    // SIMT signature is (topk, n, dscols) — the MMA ones are (topk, dscols, n)
     CK(ferrite_moe_fused_down_sum_fp8(c->ids_f, c->probs,
         (const void* const*)c->down_w8, (const void* const*)c->down_sc,
         c->sd_w8, c->sd_sc, c->act, c->out,
         0, c->e_local, c->hidden, c->inter, c->inter_shared,
-        c->topk, (c->inter + 127) / 128, c->n, c->s));
+        c->topk, c->n, (c->inter + 127) / 128, c->s));
 }
 static void launch_down_mma(void* v) {
     MoeCtx* c = (MoeCtx*)v;
