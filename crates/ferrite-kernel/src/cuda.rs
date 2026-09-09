@@ -136,7 +136,16 @@ extern "C" {
                                         hidden: i32, inter: i32, inter_shared: i32,
                                         topk: i32, n: i32, limit: f32,
                                         xq: *const u8, xs: *const f32,
+                                        sorted_experts: *const i32,
+                                        sorted_tokens: *const i32,
+                                        sorted_slots: *const i32,
                                         s: CuStream) -> i32;
+    fn ferrite_moe_sort_assignments(ids_f: *const f32,
+                                    sorted_experts: *mut i32,
+                                    sorted_tokens: *mut i32,
+                                    sorted_slots: *mut i32,
+                                    n: i32, topk: i32,
+                                    s: CuStream) -> i32;
     fn ferrite_quant_e4m3_tokens(x: *const f32, xq: *mut u8, xs: *mut f32,
                                   n: i32, hidden: i32, s: CuStream) -> i32;
     fn ferrite_gemv_fp8_mma_v2(xq: *const u8, xs: *const f32, w: *const std::ffi::c_void,
@@ -5000,7 +5009,12 @@ impl CudaBackend {
                 .map(|e| e.gate.shape.0[0])
                 .unwrap_or(shared.gate.shape.0[0]) as i32;
             let inter_shared = shared.gate.shape.0[0] as i32;
-            let act = DevBuf::alloc(self.dev, self.stream, n * (topk * inter as usize + inter_shared as usize))?;
+            let act_rows = n * (topk * inter as usize + inter_shared as usize);
+            // Expert-major (2026-09-10 Phase 1): the sort tables live at the
+            // act buffer's TAIL — same-buffer = no separate pool class, the
+            // pool's determinism carries them through graph capture intact.
+            let sort_elems = n * (topk + 1);
+            let act = DevBuf::alloc(self.dev, self.stream, act_rows + 3 * sort_elems)?;
             let out = DevBuf::alloc(self.dev, self.stream, n * hidden)?;
             // fp8 fused path: experts + shared ALL fp8-registered → e4m3
             // tables (HALF the bf16 tables' HBM bytes — the moe segment was
@@ -5041,6 +5055,23 @@ impl CudaBackend {
                         },
                         "quant_e4m3_tokens",
                     )?;
+                    // Expert-major (2026-09-10 Phase 1): sort the assignments
+                    // by expert ID — same-expert blocks land ADJACENT in the
+                    // act kernel's linearized block schedule → sequential
+                    // weight reads + L2 absorbs the 23% duplicate-expert
+                    // traffic at B=16 (blocks were ~720 apart > 444 window).
+                    let se = unsafe { act.as_f32().add(act_rows) as *mut i32 };
+                    let st = unsafe { act.as_f32().add(act_rows + sort_elems) as *mut i32 };
+                    let ss = unsafe { act.as_f32().add(act_rows + 2 * sort_elems) as *mut i32 };
+                    ck(
+                        unsafe {
+                            ferrite_moe_sort_assignments(
+                                dids.as_const_f32(), se, st, ss,
+                                ni, topk as i32, self.stream,
+                            )
+                        },
+                        "moe_sort_assignments",
+                    )?;
                     let r = unsafe {
                         ferrite_moe_fused_act_fp8_mma_v2(
                             x_dev.as_const_f32(), dids.as_const_f32(),
@@ -5051,6 +5082,7 @@ impl CudaBackend {
                             expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
                             topk as i32, ni, swiglu_limit,
                             xq.as_const_f32() as *const u8, xs.as_const_f32(),
+                            se, st, ss,  // expert-major: the sorted assignment tables
                             self.stream,
                         )
                     };
