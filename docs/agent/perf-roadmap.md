@@ -1076,3 +1076,17 @@ dk*dv：**耗时无变化**（0.065 → 0.065），说明 phase 1 不是瓶颈�
 
 **结论**：GDN 的 25µs/call 受 state 往返延迟主导，与 smem 容量（66KB → 3 blocks/SM）耦合，
 需要重构（state 常驻寄存器/分块）才能改善，属于下一阶段工作。
+
+### MoE act 2 段流水后的新瓶颈（ncu 复查）
+
+| 指标 | 3 段（60KB） | 2 段（40KB） |
+|---|---|---|
+| Duration | 79.8 µs | **54.4 µs** |
+| 理论占用率 | 37.5%（smem 限制） | **50%**（寄存器 4 + smem 4） |
+| Memory Throughput | — | **65.9%（DRAM 65.9%）** |
+| Compute (SM) | — | 56.9% |
+| Eligible warps | 1.34 | 1.92 |
+
+**结论**：降低 smem 后瓶颈从"占用率不足"转移为 **DRAM 带宽**（权重读：9 专家 × 2MB = 18.9MB/call）。
+下一步只有两条路：① 让同一专家服务多个 token（消除 16× 重复读，但被 per-token 路由挡住，
+只有 shared 专家可做）；② 继续提高 occupancy（1 段流水 20KB → 8 blocks，但会失去 prefetch）。
