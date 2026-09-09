@@ -4861,7 +4861,7 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                     const int ss = s0 + rr;
                     if (ss < live_k && lid == 0) {
                         const int j = idxs[ss];
-                        const bool valid = (j >= 0 && j < t);
+                        const bool valid = (j >= 0 && j < t && j < 8192);
                         sc[ss] = valid ? (acc[r * 2] * ksc_s[(size_t)j * h + hd] * scale * qscale)
                                        : -INFINITY;
                     }
@@ -4874,7 +4874,7 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     // the SIMT per-slot dot path (default; skipped when the MMA ran)
     for (int s = (qk_mma ? live_k : gid); s < live_k; s += ngroups) {
         int j = idxs[s];
-        bool valid = (j >= 0 && j < t);
+        bool valid = (j >= 0 && j < t && j < 8192);
         int dup = 0;
         // DIAG (FERRITE_ATTN_NODEDUP=1): the bitmap atomicOr is ~2M shared
         // atomics per layer-call (2048 slots x 1024 blocks) = the suspected
