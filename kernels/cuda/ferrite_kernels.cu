@@ -5942,7 +5942,11 @@ extern "C" cudaError_t ferrite_mtp_commit(const int* k_pin,
 // 128-col scale block boundary (128 % 16 == 0), and slice starts land on
 // scale-block boundaries whenever in_f is 128-aligned (all real shapes).
 template <int WPR>
-__global__ void gemv_fp8_v2_kernel(const float* __restrict__ x,
+// __launch_bounds__(256, 4): ncu showed the kernel at 84 regs/thread ->
+// Block Limit Registers = 2 -> 23% achieved occupancy, L1/TEX 62.7% (the top
+// limiter). Forcing 4 blocks/SM caps the registers and hides the L1 latency:
+// micro-bench q_a 42->31us (-26%), lm_head 471->353us (-25%), kv_a 15->13us.
+__global__ void __launch_bounds__(256, 4) gemv_fp8_v2_kernel(const float* __restrict__ x,
                                    const unsigned char* __restrict__ w,
                                    const float* __restrict__ scale,
                                    const float* __restrict__ bias,
