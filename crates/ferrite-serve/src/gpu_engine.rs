@@ -140,6 +140,16 @@ impl GpuEngine {
                 }
             }
             self.cluster.free_seq(cluster_seq);
+            // DIAGNOSTIC (FERRITE_DESTROY_BG=1): the doc comment on
+            // destroy_batch_graph says a retire MUST destroy the batched graphs
+            // because their recorded kernel args reference the freed per-seq
+            // state — but nothing calls it. Force-destroy them here to test
+            // whether the first replay after a retire is what faults.
+            if std::env::var_os("FERRITE_DESTROY_BG").is_some() {
+                for sz in [1usize, 2, 4, 8, 16, 32, 64] {
+                    self.cluster.destroy_batch_graph(&format!("megab_b{sz}"));
+                }
+            }
         }
         self.arena.remove(seq);
     }
