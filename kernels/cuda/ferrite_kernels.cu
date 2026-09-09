@@ -4036,8 +4036,8 @@ __global__ void dsa_append_batched_kernel(
     const float* __restrict__ kvb,   // [B, h*(dk+dv)]
     const float* __restrict__ ki,    // [B, idm]
     const float* __restrict__ gate,  // [B, idm]
-    float* const* __restrict__ kn_tbl,   // [B] per-seq k_nope ptrs
-    float* const* __restrict__ v_tbl,    // [B]
+    __nv_bfloat16* const* __restrict__ kn_tbl,   // [B] per-seq k_nope ptrs (bf16)
+    __nv_bfloat16* const* __restrict__ v_tbl,    // [B]
     float* const* __restrict__ kidx_tbl, // [B]
     float* const* __restrict__ kgate_tbl,// [B]
     const int* const* __restrict__ t0_tbl, // [B] per-seq PINNED t0 ptrs
@@ -4051,8 +4051,10 @@ __global__ void dsa_append_batched_kernel(
     if (r < row_bytes) {
         int hd = r / (dk + dv), c = r % (dk + dv);
         size_t dst = ((size_t)t0 * h + hd);
-        if (c < dk) kn_tbl[seq][dst * dk + c] = kvb[(size_t)seq * row_bytes + r];
-        else        v_tbl[seq][dst * dv + (c - dk)] = kvb[(size_t)seq * row_bytes + r];
+        // bf16 cache: halves the DRAM traffic of the sparse-attn reads (the
+        // kernel is bandwidth-bound: ~2.4 GB/step at B=16, t~1200).
+        if (c < dk) kn_tbl[seq][dst * dk + c] = __float2bfloat16(kvb[(size_t)seq * row_bytes + r]);
+        else        v_tbl[seq][dst * dv + (c - dk)] = __float2bfloat16(kvb[(size_t)seq * row_bytes + r]);
     } else {
         int j = r - row_bytes; // ki region then gate region
         if (j < idm) kidx_tbl[seq][(size_t)t0 * idm + j] = ki[(size_t)seq * idm + j];
@@ -4271,8 +4273,8 @@ __global__ void pool_expand_batched_kernel(
 // per-seq k/v via tables + per-seq idx row (stride = frozen out_width).
 __global__ void sparse_attn_v2_batched_kernel(
     const float* __restrict__ q,          // [B, h*d]
-    float* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches
-    float* const* __restrict__ v_tbl,      // [B] per-seq v caches
+    const __nv_bfloat16* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches (bf16)
+    const __nv_bfloat16* const* __restrict__ v_tbl,      // [B] per-seq v caches (bf16)
     const float* __restrict__ idx,         // [B, topk_slots]
     float* __restrict__ out,              // [B, h*dv]
     int B, const int* const* __restrict__ total_tbl, // [B] pinned
@@ -4282,8 +4284,8 @@ __global__ void sparse_attn_v2_batched_kernel(
     int t = *total_tbl[seq]; // per-seq zero-copy pinned read
     const int live_k = (topk < t) ? topk : t; // live slots only: the indexer writes the rest as -1, so looping to the fixed select_k_max (2048) wasted 18x at short context
     const float* q_s = q + (size_t)seq * (size_t)(h * d);
-    const float* k_s = k_tbl[seq];
-    const float* v_s = v_tbl[seq];
+    const __nv_bfloat16* k_s = k_tbl[seq];
+    const __nv_bfloat16* v_s = v_tbl[seq];
     const float* idx_s = idx + (size_t)seq * topk;
     float* out_s = out + (size_t)seq * (size_t)(h * dv);
     float scale = rsqrtf((float)d);
@@ -4320,16 +4322,26 @@ __global__ void sparse_attn_v2_batched_kernel(
         dup = __shfl_sync(gmask, dup, glane0);
         float a = 0.f;
         if (valid && !dup) {
-            const float4* k4 = reinterpret_cast<const float4*>(k_s + ((size_t)j * h + hd) * d);
-            float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
-            for (int l = lid * 4; l + 3 < d; l += TG * 4) {
-                float4 kk = k4[l >> 2];
-                float4 qq = *reinterpret_cast<const float4*>(qs + l);
-                acc.x += qq.x * kk.x; acc.y += qq.y * kk.y; acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
+            // bf16 cache: one 16-byte load = 8 K elements (was 4 f32). Same
+            // instruction count, half the bytes — this kernel is DRAM-bound.
+            const __nv_bfloat16* krow = k_s + ((size_t)j * h + hd) * d;
+            float a8 = 0.f;
+            for (int l = lid * 8; l + 7 < d; l += TG * 8) {
+                unsigned int u0, u1, u2, u3;
+                asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
+                             : "l"(krow + l));
+                const __nv_bfloat162* hh = reinterpret_cast<const __nv_bfloat162*>(&u0);
+                #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const float2 kf = __bfloat1622float2(hh[e]);
+                    const float2 qf = *reinterpret_cast<const float2*>(qs + l + e * 2);
+                    a8 += qf.x * kf.x + qf.y * kf.y;
+                }
             }
-            a = acc.x + acc.y + acc.z + acc.w;
+            a = a8;
             if (lid == 0) {
-                for (int l = d & ~3; l < d; l++) a += qs[l] * k_s[((size_t)j * h + hd) * d + l];
+                for (int l = d & ~7; l < d; l++) a += qs[l] * __bfloat162float(krow[l]);
             }
             #pragma unroll
             for (int off = TG / 2; off > 0; off >>= 1) a += __shfl_down_sync(gmask, a, off);
@@ -4371,7 +4383,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     // sector efficiency). 64 float4 columns x 4 slot groups = 256 threads,
     // 16-byte coalesced loads, then an smem reduction over the groups.
     {
-        const int cols = dv >> 2;               // float4 columns (256/4 = 64)
+        const int cols = dv >> 3;               // bf16x8 columns (256/8 = 32)
         const int G = (blockDim.x + cols - 1) / cols;   // slot groups (4)
         const int g = threadIdx.x / cols;
         const int c = threadIdx.x % cols;
@@ -4386,11 +4398,17 @@ __global__ void sparse_attn_v2_batched_kernel(
                 if (w == 0.f) continue;
                 const int j = idxs[s];
                 if (j < 0 || j >= t) continue;
-                float4 vv;
-                asm volatile("ld.global.nc.L2::128B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
-                             : "=f"(vv.x), "=f"(vv.y), "=f"(vv.z), "=f"(vv.w)
-                             : "l"(v_s + ((size_t)j * h + hd) * dv + c * 4));
-                a.x += w * vv.x; a.y += w * vv.y; a.z += w * vv.z; a.w += w * vv.w;
+                unsigned int u0, u1, u2, u3;
+                asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
+                             : "l"(v_s + ((size_t)j * h + hd) * dv + c * 8));
+                const __nv_bfloat162* hh = reinterpret_cast<const __nv_bfloat162*>(&u0);
+                const float2 v0 = __bfloat1622float2(hh[0]);
+                const float2 v1 = __bfloat1622float2(hh[1]);
+                const float2 v2 = __bfloat1622float2(hh[2]);
+                const float2 v3 = __bfloat1622float2(hh[3]);
+                a.x += w * v0.x; a.y += w * v0.y; a.z += w * v1.x; a.w += w * v1.y;
+                a.x += w * v2.x; a.y += w * v2.y; a.z += w * v3.x; a.w += w * v3.y;
             }
             __shared__ float4 pred[4 * 64];     // static (4KB), G<=4, cols<=64
             pred[g * cols + c] = a;
