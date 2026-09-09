@@ -4503,11 +4503,15 @@ __global__ void sparse_attn_v2_batched_kernel(
     __syncthreads();
     // 8 THREADS PER SLOT (same fix as the indexer): one serial 256-dim dot per
     // thread left ~44% of the block idle and made the dot latency-bound.
-    const int TG = 2;   // 32 float4 cols/thread/slot
+    // TG=8: 8 lanes per slot (8 float4 cols each). Was TG=2 while `glane0`
+    // was already 8-aligned — the dup broadcast read a lane OUTSIDE the
+    // 2-lane mask (undefined result). Matching TG to glane0 fixes that and
+    // shortens the per-lane serial FMA chain 128 -> 32.
+    const int TG = 8;
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
     const int ngroups = blockDim.x / TG;
-    const unsigned gmask = 0x3u << ((threadIdx.x & 31) & ~1u);   // 2-lane groups (TG=2) — must match TG
+    const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);   // 8-lane groups (TG=8) — must match TG
     const int glane0 = (threadIdx.x & 31) & ~7;
     for (int s = gid; s < live_k; s += ngroups) {
         int j = idxs[s];
