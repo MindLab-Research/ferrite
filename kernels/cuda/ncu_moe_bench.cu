@@ -317,6 +317,19 @@ int main(int argc, char** argv) {
             if (r > 5e-2) bad++;
         }
         printf("MMA-down vs SIMT-down: maxrel=%.3e bad=%d/%zu (max|ref|=%.4g)\n", mx, bad, olen, mxv);
+        // per-row (h) max ABS error for token 0: shows whether the error is
+        // row-localised (A-fragment load) or uniform (quantization).
+        printf("  tok0 per-h-row max|err| (abs) / max|ref|:\n");
+        for (int r0 = 0; r0 < 64; r0 += 8) {
+            double me = 0, mr = 0;
+            for (int r = r0; r < r0 + 8; r++) {
+                double e = fabs((double)a[r] - (double)b[r]);
+                if (e > me) me = e;
+                if (fabs((double)a[r]) > mr) mr = fabs((double)a[r]);
+            }
+            printf("    h[%2d..%2d] max|err|=%.5g max|ref|=%.5g  ratio=%.3g\n",
+                   r0, r0 + 7, me, mr, mr > 0 ? me / mr : 0.0);
+        }
         for (int t = 0; t < 2 && t < mc.n; t++) {
             printf("  tok%d: ref[0..3]=%.4g %.4g %.4g %.4g | mma[0..3]=%.4g %.4g %.4g %.4g\n", t,
                    a[(size_t)t*mc.hidden+0], a[(size_t)t*mc.hidden+1], a[(size_t)t*mc.hidden+2], a[(size_t)t*mc.hidden+3],
