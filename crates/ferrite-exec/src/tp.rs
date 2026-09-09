@@ -3349,6 +3349,7 @@ fn mega_chain_dev_batched(
             cfg.hc_sinkhorn_iters,
         )?;
         let hn = li;
+        lsum_probe(&hn, layer_idx, "hn");
         if tm {
             let _ = cuda.sync();
             t_a += t_l.elapsed().as_secs_f64() * 1e3;
@@ -3447,6 +3448,7 @@ fn mega_chain_dev_batched(
         let t_mid = std::time::Instant::now();
         // C: hc_post → hc_pre2
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
+        lsum_probe(&res_mid, layer_idx, "rmid");
         lsum_probe(&partial, layer_idx, "attn");
         let (li2, post_f, comb_f) = cuda.hc_pre_dev(
             &res_mid,
@@ -3461,6 +3463,7 @@ fn mega_chain_dev_batched(
             cfg.hc_sinkhorn_iters,
         )?;
         let hfn = li2;
+        lsum_probe(&hfn, layer_idx, "hfn");
         if tm {
             let _ = cuda.sync();
             t_c += t_mid.elapsed().as_secs_f64() * 1e3;
