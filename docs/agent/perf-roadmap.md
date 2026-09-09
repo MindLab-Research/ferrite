@@ -839,3 +839,35 @@ overlapped (2 streams): 0.035 ms/pair  (82% of sequential)
 
 **踩坑记录**：`pkill -9 -f nsys` 会匹配自己的 ssh 命令行 → 自杀 exit 255（AGENTS.md 早有记录，
 这次又踩）；用 `pgrep -x nsys` 精确匹配。nsys 的 `stats` 必须在 profile 写完后单独跑。
+
+### nsys 不落盘的根因与修复（2026-09-09，用户要求必须修）
+
+**根因**：nsys **只在目标进程退出时**写 `.nsys-rep`。HTTP serve 永不退出，而我把 nsys 放在
+ssh 命令的后台，ssh 一返回就被 SIGHUP 杀掉 → 报告永远不落盘（连续 4 次失败）。
+AGENTS.md 里的示例之所以正常，是因为它是 `--max-tokens 20` 的**一次性运行**（进程自然退出）。
+
+**修复**：
+1. 新增 `POST /shutdown`（`crates/ferrite-http/src/api.rs`）：先回 200，再从 detached 线程
+   `std::process::exit(0)`。bench 跑完直接 `curl -X POST /shutdown`，nsys 立刻收尾落盘。
+2. 没有该接口时：`timeout -s INT <sec> sudo nsys profile ...`（SIGINT 让 nsys 优雅收尾），
+   并让 ssh 会话 `wait` 到 nsys 退出。**绝不能用 SIGKILL**（报告丢失）。
+3. 618MB 报告首次 `nsys stats` 要导出 SQLite，约 2-3 分钟（CPU 单线程 100%），不是死循环。
+
+### B=16 真机 kernel 分解（2026-09-09，nsys 618MB 报告，中位×每步次数）
+
+| kernel | 中位/次 | 次数/步 | ms/步 | 占比 |
+|---|---|---|---|---|
+| moe_fused_act_fp8_mma | 47.8µs | 42 | 2.00 | 13% |
+| moe_fused_down_sum_fp8 | 46.8µs | 42 | 1.97 | 13% |
+| **sparse_attn_v2_batched** | **143µs** | 11 | 1.57 | 10% |
+| **indexer_topk_batched** | **97.5µs** | 11 | 1.07 | 7% |
+| kpool_compress_batched | 63.4µs | 11 | 0.70 | 5% |
+| gdn_chunk + gdn_step | 40.7µs | 42 | 1.71 | 11% |
+| gemv_fp8_mma_b16 ✓ | 6.6µs | ~200 | 1.32 | 9% |
+| p2p_ar (3 kernels) | 11.8µs | 90 | 1.06 | 7% |
+| hc (mix+rest345+post) | 22.3µs | ~90 | 1.45 | 10% |
+| quant_e4m3_tokens ✓ | 2.4µs | 200 | 0.48 | 3% |
+| argmax | 65.5µs | 1 | 0.07 | 0.5% |
+
+合计 ≈ 15.0 ms/步 ✓（与 `[megab] replay` 中位一致）。**gemv 已从 4.1ms 降到 1.3ms**（MMA），
+**量化从关键路径消失**。两大新战场：MoE 4.0ms（per-token 专家散射挡住 MMA）、DSA 3.3ms。
