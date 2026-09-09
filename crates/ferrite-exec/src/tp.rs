@@ -2781,6 +2781,13 @@ fn mega_chain_dev(
         if std::env::var_os("FERRITE_TIMING").is_some() {
             eprintln!("[megab-cap] dev{dev_id} cap={capture} L{layer_idx}");
         }
+        // HOST↔DEVICE ORDERING STOPGAP (2026-09-09): a per-layer sync makes the
+        // batched chain run clean (FERRITE_MEGA_PROBE=1 proved it) while every
+        // finer-grained sync we tried (per-step, per-dsa_host_advance) did not.
+        // Enable with FERRITE_LAYER_SYNC=1 until the exact hazard is found.
+        if std::env::var_os("FERRITE_LAYER_SYNC").is_some() {
+            let _ = cuda.sync();
+        }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
         // A: hc_pre + input_layernorm (redundant per rank)
@@ -3197,6 +3204,13 @@ fn mega_chain_dev_batched(
     for (layer_idx, plan) in plans.iter().enumerate() {
         if std::env::var_os("FERRITE_TIMING").is_some() {
             eprintln!("[megab-cap] dev{dev_id} cap={capture} L{layer_idx}");
+        }
+        // HOST↔DEVICE ORDERING STOPGAP (2026-09-09): a per-layer sync makes the
+        // batched chain run clean (FERRITE_MEGA_PROBE=1 proved it) while every
+        // finer-grained sync we tried (per-step, per-dsa_host_advance) did not.
+        // Enable with FERRITE_LAYER_SYNC=1 until the exact hazard is found.
+        if std::env::var_os("FERRITE_LAYER_SYNC").is_some() {
+            let _ = cuda.sync();
         }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
