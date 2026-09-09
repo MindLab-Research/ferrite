@@ -4268,6 +4268,34 @@ impl CudaBackend {
             e_local: t.e_local,
         };
         self.moe_fp8_ptrs.lock().unwrap().insert(key, t);
+        // DIAG (FERRITE_MOE_PTRDBG=1): dump the 6 pointer tables' contents and the
+        // bump-arena ranges — a table pointer outside every arena range means the
+        // kernel will dereference a stale/unmapped allocation base (Xid 31 PDE fault).
+        if std::env::var_os("FERRITE_MOE_PTRDBG").is_some() {
+            let dump = |p: *mut std::ffi::c_void, name: &str| {
+                let mut h = vec![0usize; e_local];
+                unsafe {
+                    cudaMemcpy(h.as_mut_ptr() as *mut _, p, e_local * 8, 2 /* D2H */);
+                }
+                let mn = h.iter().min().copied().unwrap_or(0);
+                let mx = h.iter().max().copied().unwrap_or(0);
+                let zero = h.iter().filter(|&&v| v == 0).count();
+                eprintln!(
+                    "[ptrdbg] {name}: n={} min={mn:#x} max={mx:#x} zero={zero} h[0]={:#x} h[1]={:#x}",
+                    h.len(), h[0], h[1]
+                );
+            };
+            let (base, cap, used) = { self.bump.lock().unwrap().last().copied().unwrap_or((std::ptr::null_mut(), 0, 0)) };
+            eprintln!(
+                "[ptrdbg] bump last block: base={:#x} cap={:#x} used={:#x}  blocks={}",
+                base as usize, cap, used, self.bump.lock().unwrap().len()
+            );
+            dump(t.down_w8, "down_w8");
+            dump(t.down_scale, "down_scale");
+            dump(t.gate_w8, "gate_w8");
+            dump(t.up_w8, "up_w8");
+            eprintln!("[ptrdbg] layer key={key:#x} e_local={e_local}");
+        }
         Ok(Some(out))
     }
 
