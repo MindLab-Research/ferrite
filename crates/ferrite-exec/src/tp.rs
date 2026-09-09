@@ -924,18 +924,14 @@ impl<B: KernelBackend> TpCluster<B> {
                 ));
             }
         }
-        // HOST-WRITE ORDERING (2026-09-09 root cause): the per-seq pinned t0/total
-        // ints are written by the HOST (dsa_host_advance) and read zero-copy by
-        // the DSA kernels. Host stores are NOT ordered w.r.t. the device's
-        // in-flight reads of the same slot — if the previous step's kernels are
-        // still running, they observe the NEXT step's (larger) total and index
-        // past the cache into an unmapped 2MB page (Xid 31 PDE fault).
-        // Evidence: the batched chain runs clean whenever a per-layer sync is
-        // present (FERRITE_MEGA_PROBE=1) and faults otherwise; a 10s delay
-        // before the requests does NOT help. Sync all ranks before the host
-        // bookkeeping of this step.
+        // HOST-WRITE ORDERING (diagnostic; DEFAULT OFF — a per-step sync of all
+        // 8 ranks serializes the host with the GPU and DOUBLED the step time
+        // (29ms vs 13.7ms measured) by killing the host-GPU pipelining. The
+        // ordering race it guarded against turned out to be a red herring —
+        // the real root cause was the dscols/ni FFI arg swap (a396171).
+        // FERRITE_STEP_SYNC=1 opts in for diagnostics.
         #[cfg(feature = "cuda")]
-        if std::env::var_os("FERRITE_STEP_NOSYNC").is_none() {
+        if std::env::var_os("FERRITE_STEP_SYNC").is_some() {
             Self::fan_out(&mut self.shards, |s| {
                 if let Some(c) = s.backend.as_cuda() {
                     if let Err(e) = c.sync() {
