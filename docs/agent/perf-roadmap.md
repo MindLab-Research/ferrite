@@ -720,3 +720,30 @@ bf16 → 8 次 cvt），实测约为 fp32 峰值的 1%。权重流量本身只�
 CUDA 错误 + 中位步时 18.45ms（与基线持平）** → 回退。根因未定位（可疑点：`part2` 的
 `__shared__` 声明位于 row 循环体内、tok2/3 的归约同步与 tok0/1 共用一次 `__syncthreads`）。
 **下次要做 T=4，先把该 kernel 放进单 kernel 微基准（ncu）逐行验证，不要直接上 serve。**
+
+### ⚠️ ncu 定位 + WPR=8 回退（2026-09-09）
+
+**新增工具（已入库，重要）**：`kernels/cuda/gemv_bench.cu` —— gemv 的单 kernel 微基准 + **正确性校验**
+（device fp64 参考核 + 相同 e4m3 解码，报 maxrel）。构建：
+`nvcc -O3 -arch=sm_103a -o /tmp/gemv_bench gemv_bench.cu -L. -lferrite_kernels -lcudart`，
+运行 `LD_LIBRARY_PATH=. /tmp/gemv_bench [iters]`。**改 kernel 先跑它（秒级），不要直接上 serve。**
+
+**ncu 结论（gemv_fp8_v2, q_a 1536×4096, n=16, `--set full` 于微基准）**：
+
+| 指标 | 值 | 含义 |
+|---|---|---|
+| Duration | 53.5 µs | |
+| **L1/TEX 吞吐** | **62.7%** | **真正的限制器** |
+| Mem Busy | 52.4%（124 GB/s） | |
+| **DRAM 吞吐** | **1.62%** | 权重根本没到 DRAM（L1/L2 命中） |
+| L2 吞吐 | 5.2% | |
+| Compute (SM) | 21.0% | |
+| 寄存器/线程 | **84** → Block Limit Registers = **2** | 占用率被寄存器卡死 |
+| 实测占用率 | **23.3%** | |
+
+⇒ gemv 的瓶颈是 **L1/TEX 带宽（x 被同一 warp-group 的 8 个 row 反复读）+ 只有 23% 占用率**，
+不是 DRAM、也不是"权重加载"。**注意：用户提示的"冗余权重加载"经 ncu 修正为"冗余 x 读取"。**
+
+**WPR 4→8（微基准 q_a 46→42µs、head 489→471µs、maxrel=0）在 serve 上失败**：文本变成
+思考模式（LEN 205 ✗）、中位步时 19.32ms 反而略差 → **已回退**。教训：微基准的 maxrel=0 只说明
+相对参考实现无误差，**不代表改 K-split 求和顺序后模型行为不变**；K-split 顺序属数值敏感改动。
