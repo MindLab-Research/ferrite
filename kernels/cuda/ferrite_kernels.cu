@@ -3350,13 +3350,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 const float4* a4 = reinterpret_cast<const float4*>(aj);
                 const int base = (lane & 15) * 4; // act[16] per lane, same for both rows
                 #pragma unroll
-                for (int r = 0; r < 4; r++) {
-                    uint4 wv;
-                    asm volatile("ld.global.nc.L2::128B.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                                 : "=r"(wv.x), "=r"(wv.y), "=r"(wv.z), "=r"(wv.w)
-                                 : "l"(a4 + base + r));
-                    ar[r] = *reinterpret_cast<const float4*>(&wv);
-                }
+                for (int r = 0; r < 4; r++) ar[r] = a4[base + r];
             }
             if (klen == 256) {
                 const int i0 = lane * 16;
