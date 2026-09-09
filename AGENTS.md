@@ -213,6 +213,10 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 | AR 默认 f32（nsys 证明会合延迟主导，bf16 转换 0.43ms 纯浪费） | 15.20 |
 | **device 侧 pinned t0/total 推进**（append kernel 内自增，in-stream 下游可见；步首全 rank 同步只剩 membership 变化步） | **14.57**（B=2 9.88） |
 | **gemm3 融合投影默认开**（DSA{wk,weights_proj,gate}+GDN{b,f_a,g_a} 各一 launch+确定性归约；f32 直入吃掉 ~180 个 cast 节点；块级 K-split×8；m16n8k16 bf16） | **14.43**（B=2 9.93） |
+| **gdn_chunk float4 state 读写 + 全并行 decay**（kernel 原以 0.63TB/s 内存延迟受限运行——grid(16,8)=128 块 × 512 线程 × 4B 在飞；float4=4x 在飞字节；decay 原只用 dk 线程跑 dv 串行） | **14.01**（B=2 9.45） |
+| hc_pre_mix float4 加载（B=16 中性、B=2 −0.5ms，保留） | 14.02 |
+
+steady×16 ≈ **1066**（300 窗口；replay 口径 16000/14.02 = 1142）。gdn 修复的机制：**小 kernel 的内存延迟受限模式**（少量块×标量 4B 加载 → 在飞字节不足）——float4 化是在飞字节的最廉价 4x；gdn_chunk 25.5µs → 预计 ~7µs/层 × 34 层 = −0.42ms 实测兑现。同模式审计清单：rest345（1.14ms，结构已在设计地板）、sparse_attn（0.58ms）、conv1d/gdn_prep（~0.3ms）。
 
 steady×16 ≈ **1046**（300 窗口）。gemm3 的文本：逐字正确（《出师表》至"宫中府中/陟罚臧否"）；req0 偶发 `</s>` 前导 token = bf16-MMA 重结合类（1e-3）翻转近边界 logit，正文不受影响；FERRITE_GEMM3=0 可退回。device 推进的两个坑（f157cb0）：单 seq→batched 切换时 pinned t0 落后 1（batched 首个 append 覆写最后 solo token）→ dry pass 的簿记循环从 map 的 t_count 写回 pinned（handoff sync）；capture pass 不能写（会把 kernel 已推进的值倒退）。
 
