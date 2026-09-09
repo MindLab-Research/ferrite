@@ -559,3 +559,19 @@ __global__ void __launch_bounds__(256) gemv_fp8_mma_kernel(
 `quant_e4m3_tokens` 量化（act 已在用，文本正确）；grid = ceil(out_f/64)，out_f=1536 时 24 blocks
 偏少 —— 若实测并行度不足，把每 warp 的行数从 8 降到 2（grid 96）或加 K-split。
 **验收**：与现 gemv 逐层比对 + 人眼文本（fp8 x 量化有数值风险，参考 v 侧 fp16 的教训）。
+
+**实测结论（2026-09-08，已实现并回退 —— 死路，勿再照此实现）**：
+按上面设计完整实现（kernel + 层内共享 quant 缓存 + 捕获期禁止分配）后测得
+`B=16 聚合 285.9 tok/s`（基线 946，**慢 3.3 倍**），且输出进入思考模式（LEN 167 ≠ 135）。
+两个独立根因：
+1. **并行度断崖**：MMA 的 N=8（输出行）× 8 warp = 每 block 64 行 → grid 仅 `out_f/64`
+   （out_f=1536 时 24 个 block，132 SM 大半空闲），且每 block 的 K 循环是 64 次串行
+   DRAM-latency 迭代。现 gemv 的 launcher 是 `grid(out_f/(rpb*Rl), (n+1)/2)`，并行度高得多。
+   → 必须先解决 split-K / K 跨 warp 划分（+ 跨 warp 归约），否则永远输给现 gemv。
+2. **block 级 barrier 串行化**：xq tile 由线程 0..63 填充、被 8 个 warp 读取 → 必须
+   `__syncthreads()`（act 的 `__syncwarp` 只因其每 warp 各自暂存）。该 barrier 落在
+   K 循环内，把 64 次迭代的访存延迟完全暴露。正确做法是 xq 也按 warp 暂存（8× 冗余但无 barrier）。
+3. 附带教训（可复用）：**捕获期禁止任何分配**。mega-graph 捕获直接跑真实链路（无 dry-run 预热），
+   缓存的首次 miss 触发 `cudaMalloc` → 捕获失效（err 900/901，表现为 `tick fault: CUDA gemv_fp8`）。
+   修法：在非捕获期（prefill）按 in_f 预分配，捕获期只重放 quant kernel。
+4. 数值教训（再次验证）：**fp8 x 量化用在注意力投影上会推入思考模式**，与 v 侧 fp16 同类。
