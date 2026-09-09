@@ -1945,6 +1945,17 @@ impl CudaBackend {
             }
             // CUTLASS-style fp8 tensor-core MMA (micro-bench: q_a 31->6us,
             // lm_head 353->41us, bit-identical to the fp64 reference).
+            if std::env::var("FERRITE_GEMV_MMA_DEBUG").is_ok() {
+                static CNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                let c = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c < 60 {
+                    let hit = n >= 2 && n <= 16 && (out_f & 7) == 0 && (in_f & 63) == 0
+                        && f8.scols == (in_f + 127) / 128;
+                    eprintln!("[gemvdbg] n={} in={} out={} scols={}/{} {}",
+                              n, in_f, out_f, f8.scols, (in_f + 127) / 128,
+                              if hit { "MMA" } else { "SIMT" });
+                }
+            }
             if n >= 2 && n <= 16 && (out_f & 7) == 0 && (in_f & 63) == 0
                 && f8.scols == (in_f + 127) / 128
                 && std::env::var("FERRITE_GEMV_MMA").map(|v| v != "0").unwrap_or(true) {
