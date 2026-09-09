@@ -289,6 +289,12 @@ int main(int argc, char** argv) {
     float t_down8 = bench_kernel("moe_fused_down_sum_fp8", iters, launch_down_fp8, &mc);
     // ===== correctness: MMA down vs SIMT down on the SAME act/ids/probs =====
     {
+        // deterministic act (the timing loops left it NaN from the swiglu of
+        // zero inputs) — this is what made the first compare inconclusive.
+        size_t alen = (size_t)mc.n * (mc.topk * mc.inter + mc.inter_shared);
+        std::vector<float> ha(alen);
+        for (size_t i = 0; i < alen; i++) ha[i] = 0.05f * (float)((int)(i * 7919 % 200) - 100);
+        CK(cudaMemcpy(mc.act, ha.data(), alen * 4, cudaMemcpyHostToDevice));
         size_t olen = (size_t)mc.n * mc.hidden;
         std::vector<float> a(olen), b(olen);
         CK(cudaMemset(mc.out, 0, olen * 4));
