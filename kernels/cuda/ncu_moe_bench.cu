@@ -14,6 +14,7 @@
 // inter_shared 512, topk 8, e_local 288 experts (all on rank, TP slice),
 // expert_start 0. hc: s=1, n=4, h=4096, mix=24, iters=4.
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cmath>
 #include <cuda_runtime.h>
