@@ -201,6 +201,25 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 | `FERRITE_PPROF` + `FERRITE_PPROF_OUT` | built-in 1 kHz CPU flamegraph (pprof crate) |
 | `FERRITE_KERNEL_SO` | override dlopen path of `libferrite_kernels.so` |
 
+## 2026-09-10 会话：数值修复 + B=16 29.01→14.66ms（当前状态与路径）
+
+**修复的 5 个根因**（全部 kernel 级证据链 + 文本验证）：① moe_down `(dscols,ni)` 传反（a396171）；② 图 INPUT 池化别名→`alloc_immortal`（469756a）；③ `dsa_append_batched` 把 B 当 ntok 传→kvb 越界读 3.75MB（ec6d795，B≤8 恰好留在池内空隙故不崩）；④ **DSA K/V 缓存格式分歧**：单 seq 路径（prefill）写 f32 无 scale、batched 读写 fp8+scale（526e002 只迁了一侧）→ prefill 槽被当 e4m3 误读 + scale 缓冲全池垃圾（kernel printf：ksc0=0.000000、softmax sum=NaN）→ 全部 11 个 DSA 层注意力精确为 0（FERRITE_LAYER_SUM 探针）→ 恢复 f32（a0e262d）；⑤ **xq 量化缓存按指针判失效**：池化地址跨层复用→陈旧命中→L+1 层 GEMM 用 L 层的量化激活（逐层数值对比：L0 hfn 精确匹配、L2 ffn 12.6x 偏差）→ (ptr, **gen**) 键（852be75）。
+
+**性能改动**（B=16 replay 中位数，每项都文本验证）：
+| 改动 | 结果 |
+|---|---|
+| moe_down 默认 fp8 fused（bf16 MMA 变体 13.1ms/步 52.3%→2.1ms） | 29.01 → 15.46 |
+| DSA dummy total 8192→1（retire 阶段 indexer 2048-pool 慢路径 968×1.56ms） | 15.42 |
+| AR 默认 f32（nsys 证明会合延迟主导，bf16 转换 0.43ms 纯浪费） | 15.20 |
+| **device 侧 pinned t0/total 推进**（append kernel 内自增，in-stream 下游可见；步首全 rank 同步只剩 membership 变化步） | **14.66**（B=2 9.88） |
+
+steady×16 ≈ **1029**。device 推进的两个坑（f157cb0）：单 seq→batched 切换时 pinned t0 落后 1（batched 首个 append 覆写最后 solo token）→ dry pass 的簿记循环从 map 的 t_count 写回 pinned（handoff sync）；capture pass 不能写（会把 kernel 已推进的值倒退）。
+
+**已验证无效（gate off 保留代码）**：e4m3 MMA down（隔离 2.14x 但 in-serve +0.37ms——in-serve SIMT 本来就 43µs/层 vs 隔离 108µs，隔离基准是幻觉）；n==16 bf16 wmma 投影（无 K-split，6x 回退）；P2P AR 复测仍死锁（30s 监护杀，驱动未 wedge）。
+
+**当前分解**（每步每卡）：MoE 3.85（act 1.81 已达实测带宽峰/down 1.77/route 0.26）· AR 2.66（NCCL 会合地板 90×29.5µs）· hc 2.11 · 投影 cuBLAS 族 2.2（DSA/GDN 小投影 bf16-only + 每 GEMM 一次 f32→bf16 cast）· DSA 1.11 · GDN 1.18 · 间隙+host ~0.6。
+**通往 1600（≤10ms）**：已识别 kernel 杠杆全做 ≈ 13.2-13.7ms（≈1200 tok/s）；剩余 ~3ms 缺口需结构改动：**MoE 改 EP**（消除 42 次 FFN AR ≈ −1.2ms + dispatch/combine）或单 kernel 自定义 AR（P2P 死锁史，风险高）。
+
 ## Performance state (perf-b1, 2026-09-08)
 
 - Non-MTP baseline (n=1): **114.0 tok/s** (HTTP+SSE, 1200-token output, head/tail-trimmed 20/20; replay 8.89 ms/step, TP8). Was 91.2 (200-step one-shot) before the split-K + occupancy series.
