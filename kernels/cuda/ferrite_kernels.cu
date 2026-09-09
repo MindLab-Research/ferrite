@@ -5681,6 +5681,184 @@ extern "C" cudaError_t ferrite_pool_expand_batched(
     return cudaGetLastError();
 }
 
+// ============================================================
+// sparse_attn_v3_split: the three-kernel split chain. The v2 batched kernel
+// runs at 0.66-1.3TB/s — grid (B=16, h=8) = 128 blocks, one block per
+// (seq, head) serially processing ALL live slots (the same memory-latency-
+// bound pattern the gdn_chunk float4 fix proved). The split divides the
+// SLOT dimension across NS=4 blocks per (seq, head) = 512 blocks:
+//   A (QK):   each split dots its slots' K rows → the scores to gmem
+//             (the -1/invalid slots → -INFINITY).
+//   B (PV):   reads ALL its (seq,head)'s scores (L2-hot, ~1KB) for the
+//             GLOBAL max, then exp/sum + the PV accumulate over ITS slots
+//             → partial_out [NS][B][h][dv] + l [NS][B][h].
+//   C (merge): out = Σ_i partial_out_i / Σ_i l_i (split-ascending,
+//             deterministic). The global max in both passes = no rescale.
+// The dedup bitmap is kept as a PER-SPLIT safety net (the idx is built by
+// pool_expand from unique pool slots — cross-split duplicates cannot occur
+// by construction; if one ever did, it would double-count, documented).
+// ============================================================
+__global__ void sparse_attn_qk_split_kernel(
+    const float* __restrict__ q,                 // [B, h*d]
+    const float* const* __restrict__ k_tbl,      // [B] f32 [T, h, d]
+    const float* __restrict__ idx,               // [B, topk]
+    float* __restrict__ scores,                  // [B, h, topk]
+    const int* const* __restrict__ total_tbl,    // [B] pinned
+    int h, int d, int topk, int NS) {
+    const int seq = blockIdx.x, hd = blockIdx.y, sp = blockIdx.z;
+    const int t = *total_tbl[seq];
+    const int live_k = min(topk, t);
+    const int seg = (live_k + NS - 1) / NS;
+    const int s0 = sp * seg, s1 = min(s0 + seg, live_k);
+    const float* q_s = q + (size_t)seq * h * d + (size_t)hd * d;
+    const float* k_s = k_tbl[seq];
+    const float* idx_s = idx + (size_t)seq * topk;
+    const float qscl = rsqrtf((float)d);
+    const int lid = threadIdx.x & 7;             // the 8-lane dot group
+    const int grp = threadIdx.x >> 3;            // 32 concurrent slots/block
+    const unsigned gmask = 0xffu << (threadIdx.x & ~7);
+    float* sc_out = scores + ((size_t)seq * h + hd) * topk;
+    for (int s = s0 + grp; s < s1; s += 32) {
+        const int j = (int)idx_s[s];
+        const bool valid = (j >= 0 && j < t && j < 8192);
+        float a = 0.f;
+        if (valid) {
+            const float* krow = k_s + ((size_t)j * h + hd) * d;
+            const float4* k4 = reinterpret_cast<const float4*>(krow);
+            float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int l = lid * 4; l + 3 < d; l += 32) {
+                float4 kk = k4[l >> 2];
+                float4 qq = *reinterpret_cast<const float4*>(q_s + l);
+                acc.x += qq.x * kk.x; acc.y += qq.y * kk.y;
+                acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
+            }
+            a = (acc.x + acc.y) + (acc.z + acc.w);
+            if (lid == 0) for (int l = d & ~3; l < d; l++) a += q_s[l] * krow[l];
+            #pragma unroll
+            for (int off = 4; off > 0; off >>= 1) a += __shfl_down_sync(gmask, a, off);
+        }
+        if (lid == 0) sc_out[s] = valid ? (a * qscl) : -INFINITY;
+    }
+}
+
+__global__ void sparse_attn_pv_split_kernel(
+    const float* const* __restrict__ v_tbl,      // [B] f32 [T, h, dv]
+    const float* __restrict__ idx,               // [B, topk]
+    const float* __restrict__ scores,            // [B, h, topk]
+    float* __restrict__ part_o,                  // [NS][B, h, dv]
+    float* __restrict__ part_l,                  // [NS][B, h]
+    const int* const* __restrict__ total_tbl,
+    int h, int dv, int topk, int NS) {
+    const int seq = blockIdx.x, hd = blockIdx.y, sp = blockIdx.z;
+    const int t = *total_tbl[seq];
+    const int live_k = min(topk, t);
+    const int seg = (live_k + NS - 1) / NS;
+    const int s0 = sp * seg, s1 = min(s0 + seg, live_k);
+    const float* sc = scores + ((size_t)seq * h + hd) * topk;
+    const float* idx_s = idx + (size_t)seq * topk;
+    const float* v_s = v_tbl[seq];
+    // the GLOBAL max over ALL live slots (the scores are L2-hot ~1KB)
+    float m = -INFINITY;
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x)
+        m = fmaxf(m, sc[s]);
+    __shared__ float red[8];
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffffu, m, off));
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float mm = red[0];
+        #pragma unroll
+        for (int w = 1; w < 8; w++) mm = fmaxf(mm, red[w]);
+        red[0] = mm;
+    }
+    __syncthreads();
+    m = red[0];
+    // the exp/sum + PV over THIS split's slots: the (g, c) structure —
+    // G = 256/cols groups, the c-th float4 column of dv
+    const int cols = dv >> 2;
+    const int g = threadIdx.x / cols, c = threadIdx.x % cols;
+    float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+    float l = 0.f;
+    const int G = (int)(blockDim.x / cols);
+    if (c < cols) {
+        for (int s = s0 + g; s < s1; s += G) {
+            const float scs = sc[s];
+            if (scs != -INFINITY) {
+                const int j = (int)idx_s[s];
+                const float w = __expf(scs - m);
+                l += w;
+                float4 vv;
+                const float* vrow = v_s + ((size_t)j * h + hd) * dv + (c << 2);
+                asm volatile("ld.global.nc.L2::128B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
+                             : "=f"(vv.x), "=f"(vv.y), "=f"(vv.z), "=f"(vv.w)
+                             : "l"(vrow));
+                acc.x += w * vv.x; acc.y += w * vv.y;
+                acc.z += w * vv.z; acc.w += w * vv.w;
+            }
+        }
+    }
+    // the l sum over the g dimension (each g processed DIFFERENT slots; the
+    // c==0 threads hold their g's partial) + the PV partial per column
+    __shared__ float lred[256];
+    if (c == 0) lred[g] = l;
+    __syncthreads();
+    const size_t bh = (size_t)gridDim.x * h;
+    if (threadIdx.x == 0) {
+        float lt = 0.f;
+        for (int gg = 0; gg < G; gg++) lt += lred[gg];
+        part_l[(size_t)sp * bh + (size_t)seq * h + hd] = lt;
+    }
+    if (c < cols) {
+        float* po = part_o + ((size_t)sp * bh + (size_t)seq * h + hd) * dv + (c << 2);
+        po[0] = acc.x; po[1] = acc.y; po[2] = acc.z; po[3] = acc.w;
+    }
+}
+
+__global__ void sparse_attn_merge_kernel(
+    const float* __restrict__ part_o,   // [NS][B, h, dv]
+    const float* __restrict__ part_l,   // [NS][B, h]
+    float* __restrict__ out,            // [B, h, dv]
+    int B, int h, int dv, int NS) {
+    const size_t bh = (size_t)B * h;
+    const size_t tot = bh * dv;
+    for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < tot;
+         i += (size_t)gridDim.x * blockDim.x) {
+        const size_t sh = i / dv;
+        float num = 0.f, den = 0.f;
+        for (int s = 0; s < NS; s++) {
+            num += part_o[(size_t)s * bh * dv + i];
+            den += part_l[(size_t)s * bh + sh];
+        }
+        out[i] = num / (den + 1e-9f);
+    }
+}
+
+extern "C" cudaError_t ferrite_sparse_attn_v3_split(
+    const float* q, float* const* k_tbl, float* const* v_tbl,
+    const float* idx, float* scores, float* part_o, float* part_l,
+    float* out, int B, const int* const* total_tbl,
+    int h, int d, int dv, int topk, cudaStream_t s) {
+    if (B <= 0) return cudaSuccess;
+    if (d % 4 != 0 || dv % 4 != 0) return cudaErrorNotSupported;
+    const int NS = 4;
+    dim3 grid((unsigned)B, (unsigned)h, (unsigned)NS);
+    sparse_attn_qk_split_kernel<<<grid, 256, 0, s>>>(
+        q, (const float* const*)k_tbl, idx, scores, total_tbl, h, d, topk, NS);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    sparse_attn_pv_split_kernel<<<grid, 256, 0, s>>>(
+        (const float* const*)v_tbl, idx, scores, part_o, part_l, total_tbl, h, dv, topk, NS);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    const size_t tot = (size_t)B * h * dv;
+    int mb = (int)((tot + 255) / 256);
+    if (mb > 1024) mb = 1024;
+    sparse_attn_merge_kernel<<<(unsigned)mb, 256, 0, s>>>(
+        part_o, part_l, out, B, h, dv, NS);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     const float* q, float* const* k_tbl, float* const* v_tbl,
     const float* idx, float* out, int B, const int* const* total_tbl,

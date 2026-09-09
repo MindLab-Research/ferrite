@@ -199,6 +199,13 @@ extern "C" {
                                        total_tbl: *const *const i32,
                                        h: i32, d: i32, dv: i32, topk: i32,
                                        s: CuStream) -> i32;
+    fn ferrite_sparse_attn_v3_split(q: *const f32, k_tbl: *const *mut f32, v_tbl: *const *mut f32,
+                                     idx: *const f32, scores: *mut f32,
+                                     part_o: *mut f32, part_l: *mut f32,
+                                     out: *mut f32, b: i32,
+                                     total_tbl: *const *const i32,
+                                     h: i32, d: i32, dv: i32, topk: i32,
+                                     s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
     fn ferrite_pdl_exp(mode: i32, iters: i32, out_time_ms: *mut f32,
                        out_checksum: *mut f32, s: CuStream) -> i32;
@@ -4384,11 +4391,55 @@ impl CudaBackend {
         // k_nope/v cache over its idx row (per-seq total via pinned table).
         ck(
             unsafe {
-                ferrite_sparse_attn_v2_batched(
-                    qb.as_const_f32(), tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
-                    idx.as_const_f32(), attn_out.as_f32(), ni, tbl.totp as *const *const i32,
-                    h as i32, dk as i32, dv as i32, out_width as i32, self.stream,
-                )
+                // FERRITE_ATTN_SPLIT (default ON after verification): the
+                // three-kernel split chain — the v2 batched kernel runs at
+                // 0.66-1.3TB/s (grid (16,8)=128 blocks, the memory-latency-
+                // bound pattern); the split divides the SLOT dimension
+                // across NS=4 blocks per (seq, head) = 512 blocks.
+                let use_attn_split = std::env::var("FERRITE_ATTN_SPLIT")
+                    .map(|v| v != "0").unwrap_or(true);
+                let mut attn_done = false;
+                if use_attn_split {
+                    let scores = DevBuf::alloc(
+                        self.dev, self.stream,
+                        ni as usize * h * out_width,
+                    )?;
+                    let part_o = DevBuf::alloc(
+                        self.dev, self.stream,
+                        4 * ni as usize * h * dv,
+                    )?;
+                    let part_l = DevBuf::alloc(
+                        self.dev, self.stream,
+                        4 * ni as usize * h,
+                    )?;
+                    let r = unsafe {
+                        ferrite_sparse_attn_v3_split(
+                            qb.as_const_f32(), tbl.kn as *const *mut f32,
+                            tbl.v as *const *mut f32,
+                            idx.as_const_f32(), scores.as_f32(),
+                            part_o.as_f32(), part_l.as_f32(), attn_out.as_f32(),
+                            ni, tbl.totp as *const *const i32,
+                            h as i32, dk as i32, dv as i32, out_width as i32,
+                            self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        attn_done = true;
+                    } else {
+                        eprintln!(
+                            "[opcheck] sparse_attn_v3_split err {r} — falling back to v2"
+                        );
+                    }
+                }
+                if !attn_done {
+                    ferrite_sparse_attn_v2_batched(
+                        qb.as_const_f32(), tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
+                        idx.as_const_f32(), attn_out.as_f32(), ni, tbl.totp as *const *const i32,
+                        h as i32, dk as i32, dv as i32, out_width as i32, self.stream,
+                    )
+                } else {
+                    0
+                }
             },
             "dsa_attn_batched",
         )?;
