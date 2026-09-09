@@ -1213,7 +1213,17 @@ impl<B: KernelBackend> TpCluster<B> {
             // advancing → its flag froze at 1 and everyone waited forever).
             // The epoch is monotonic across replays by design.
             let mut out = vec![0f32; size];
-            if !cuda.graph_run(&gname, in_vals.as_slice(), &mut out)? {
+            // Device-embed path (2026-09-10): when the graph was captured
+            // with embed_expand_dev as its FIRST node, feed n×4B token ids
+            // (graph_run_ids) instead of the ~1MB expanded host staging.
+            let dev_io = cuda.graph_io_get(&gname).filter(|i| i.in_n > 0);
+            let ran = if let Some(io) = &dev_io {
+                let ids_ptr = io.in_dev as *mut i32;
+                cuda.graph_run_ids(&gname, &last_toks, ids_ptr, &mut out)?
+            } else {
+                cuda.graph_run(&gname, in_vals.as_slice(), &mut out)?
+            };
+            if !ran {
                 return Err(FerriteError::InvalidArg(format!("batched graph {gname} missing")));
             }
             Ok(out)
@@ -3290,8 +3300,46 @@ fn mega_chain_dev_batched(
     if capture {
         cuda.graph_capture_begin();
     }
-    res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
-    let x_stage = res.stage; // GraphIO: replay writes fresh input here
+    // GPU-SIDE EMBEDDING (2026-09-10): during CAPTURE, record embed_expand_dev
+    // as the graph's FIRST node instead of the ~1MB host staging upload —
+    // at replay, graph_run_ids writes n×4B token ids (64B at B=16) instead of
+    // the host expanding n*mult*hidden f32 (saving ~100µs host staging +
+    // cross-rank host-thread jitter per step; the same mechanism the MTP
+    // verify graphs already use). The dry-run keeps the host staging path
+    // (its execution needs REAL input) but PRE-WARMS the embedding table's
+    // dev_weight cache — an uncached table would record the 2.4GB H2D upload
+    // as a graph node (re-uploaded at EVERY replay).
+    let dev_embed_ids: Option<*mut i32> = if capture {
+        let ids = DevBuf::alloc_immortal(cuda.dev(), cuda.stream(), n)?;
+        let p = ids.as_f32() as *mut i32;
+        std::mem::forget(ids); // leak: the graph reads this buffer forever
+        Some(p)
+    } else {
+        // Pre-warm: run embed_expand_dev once on scratch buffers (outside
+        // capture) so dev_weight caches the table before the capture pass.
+        let table = s.w("model.embed_tokens.weight")?;
+        let warm_out = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
+        let warm_ids = DevBuf::alloc(cuda.dev(), cuda.stream(), n)?;
+        let _ = cuda.embed_expand_dev_buf(
+            table,
+            warm_ids.as_f32() as *const i32,
+            warm_out.as_f32(),
+            n, hidden, hc_mult,
+        );
+        None
+    };
+    if let Some(ids_p) = dev_embed_ids {
+        let table = s.w("model.embed_tokens.weight")?;
+        cuda.embed_expand_dev_buf(
+            table,
+            ids_p as *const i32,
+            res.as_f32(),
+            n, hidden, hc_mult,
+        )?;
+    } else {
+        res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
+    }
+    let x_stage = res.stage; // GraphIO: replay writes fresh input here (ids-input mode ignores this)
     // INPUT KEEPALIVE (2026-09-09 ROOT CAUSE of the B=16 replay faults): the
     // layer loop REASSIGNS res at every layer's E step — the first reassignment
     // DROPS this DevBuf, returning its (ptr, stage) to the pool. The graph
@@ -3610,10 +3658,15 @@ fn mega_chain_dev_batched(
                 x_len: n * nh,
                 out_dev: arg.as_f32() as *mut std::ffi::c_void,
                 out_len: n,
-                in_dev: std::ptr::null_mut(),
-                in_n: 0,
-                in_hidden: 0,
-                in_mult: 0,
+                // Device-embed input path (2026-09-10): in_dev = the token-id
+                // buffer the graph's first node (embed_expand_dev) reads;
+                // in_n>0 marks the graph as ids-input (graph_run_ids at replay).
+                in_dev: dev_embed_ids
+                    .map(|p| p as *mut std::ffi::c_void)
+                    .unwrap_or(std::ptr::null_mut()),
+                in_n: if dev_embed_ids.is_some() { n } else { 0 },
+                in_hidden: if dev_embed_ids.is_some() { hidden } else { 0 },
+                in_mult: if dev_embed_ids.is_some() { hc_mult } else { 0 },
             },
         );
         std::mem::forget(arg); // the graph's argmax output (graph_run reads it)
