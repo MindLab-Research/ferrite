@@ -2122,6 +2122,14 @@ impl CudaBackend {
             // cuBLAS bf16 batched GEMM (split-K/streaming): the FMA
             // gemv_bf16_nt is compute-bound at n=16 (measured 2.5x decay
             // vs n=1) — this is the SGLang/cutlass route.
+            if std::env::var("FERRITE_GEMV_MMA_DEBUG").is_ok() {
+                static CNT2: std::sync::atomic::AtomicUsize =
+                    std::sync::atomic::AtomicUsize::new(0);
+                let c = CNT2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c < 300 {
+                    eprintln!("[gemvdbg] n=16 CUBLAS in={in_f} out={out_f}");
+                }
+            }
             if let Ok(o) = self.gemm_cublas(x_dev, dw.ptr as *const _, n, in_f, out_f) {
                 return Ok(o);
             }
