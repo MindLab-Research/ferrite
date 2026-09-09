@@ -820,3 +820,24 @@ device counter），AR 的 store/reduce 运行时读 counter 决定 staging buff
 
 **与失败方案的关键区别**：不需要 quant_act_rows（f32→e4m3 预量化 kernel）——直接在
 kernel 内 cvt f32→f16（1 指令/2 值）。数值：0.05% vs e4m3 的 6%——128 倍改善。
+
+## 2026-09-10 W8A16 估算修正（读 kernel 代码后）
+
+**上文的 −1.16ms 高估了**。读完 moe_down_mma_kernel（3617 行）后的修正分析：
+
+1. **N=8 浪费**：MMA 的 16×8 tile 只用 column 0（1 token per block）→ tensor core
+   有效吞吐仅 12.5%。B=16 下每 expert ~1.23 token，无法填满 N 维。
+2. **权重转换指令**：fp8→f16 是 per-step 的（不能预转换——预转换 = 2x 带宽 = bf16 MMA
+   的失败原因）。每 block 2048 转换指令 dominates 总指令数 2192 中的 93%。
+3. **修正指令效率**：SIMT 4096 / W8A16 2192 = **1.87x**（非 2.4x）
+4. **修正收益**：43.6µs × (1 − 0.39 × (1−1/1.87)) ≈ 35.7µs → **−0.33ms/步**（非 −1.16ms）
+
+**修正后的 1600 组合路径**：
+- AR v4 counter-kernel: −1.5ms（未实施，×3 失败后的新思路）
+- W8A16 MMA down: −0.33ms（数值安全 0.05%，但收益有限）
+- hc 屏障重构: −1.0ms（高风险）
+- 合计: −2.83ms → 10.45ms ≈ **1531 tok/s（仍差 69）**
+- 需再加微优化 ~0.5ms（gdn/proj/其他）→ ~9.95ms ≈ 1608 ✓（勉强）
+
+**结论不变**：1600 需要多front突破 + 微优化，研究级难度。W8A16 仍是值得实施的
+（数值安全 + 0.33ms），但优先级低于 AR v4（−1.5ms）。
