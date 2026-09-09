@@ -201,7 +201,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 | `FERRITE_PPROF` + `FERRITE_PPROF_OUT` | built-in 1 kHz CPU flamegraph (pprof crate) |
 | `FERRITE_KERNEL_SO` | override dlopen path of `libferrite_kernels.so` |
 
-## 2026-09-10 会话：数值修复 + B=16 29.01→14.66ms（当前状态与路径）
+## 2026-09-10 会话：数值修复 + B=16 29.01→14.43ms（当前状态与路径）
 
 **修复的 5 个根因**（全部 kernel 级证据链 + 文本验证）：① moe_down `(dscols,ni)` 传反（a396171）；② 图 INPUT 池化别名→`alloc_immortal`（469756a）；③ `dsa_append_batched` 把 B 当 ntok 传→kvb 越界读 3.75MB（ec6d795，B≤8 恰好留在池内空隙故不崩）；④ **DSA K/V 缓存格式分歧**：单 seq 路径（prefill）写 f32 无 scale、batched 读写 fp8+scale（526e002 只迁了一侧）→ prefill 槽被当 e4m3 误读 + scale 缓冲全池垃圾（kernel printf：ksc0=0.000000、softmax sum=NaN）→ 全部 11 个 DSA 层注意力精确为 0（FERRITE_LAYER_SUM 探针）→ 恢复 f32（a0e262d）；⑤ **xq 量化缓存按指针判失效**：池化地址跨层复用→陈旧命中→L+1 层 GEMM 用 L 层的量化激活（逐层数值对比：L0 hfn 精确匹配、L2 ffn 12.6x 偏差）→ (ptr, **gen**) 键（852be75）。
 
@@ -211,9 +211,10 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 | moe_down 默认 fp8 fused（bf16 MMA 变体 13.1ms/步 52.3%→2.1ms） | 29.01 → 15.46 |
 | DSA dummy total 8192→1（retire 阶段 indexer 2048-pool 慢路径 968×1.56ms） | 15.42 |
 | AR 默认 f32（nsys 证明会合延迟主导，bf16 转换 0.43ms 纯浪费） | 15.20 |
-| **device 侧 pinned t0/total 推进**（append kernel 内自增，in-stream 下游可见；步首全 rank 同步只剩 membership 变化步） | **14.66**（B=2 9.88） |
+| **device 侧 pinned t0/total 推进**（append kernel 内自增，in-stream 下游可见；步首全 rank 同步只剩 membership 变化步） | **14.57**（B=2 9.88） |
+| **gemm3 融合投影默认开**（DSA{wk,weights_proj,gate}+GDN{b,f_a,g_a} 各一 launch+确定性归约；f32 直入吃掉 ~180 个 cast 节点；块级 K-split×8；m16n8k16 bf16） | **14.43**（B=2 9.93） |
 
-steady×16 ≈ **1029**。device 推进的两个坑（f157cb0）：单 seq→batched 切换时 pinned t0 落后 1（batched 首个 append 覆写最后 solo token）→ dry pass 的簿记循环从 map 的 t_count 写回 pinned（handoff sync）；capture pass 不能写（会把 kernel 已推进的值倒退）。
+steady×16 ≈ **1046**（300 窗口）。gemm3 的文本：逐字正确（《出师表》至"宫中府中/陟罚臧否"）；req0 偶发 `</s>` 前导 token = bf16-MMA 重结合类（1e-3）翻转近边界 logit，正文不受影响；FERRITE_GEMM3=0 可退回。device 推进的两个坑（f157cb0）：单 seq→batched 切换时 pinned t0 落后 1（batched 首个 append 覆写最后 solo token）→ dry pass 的簿记循环从 map 的 t_count 写回 pinned（handoff sync）；capture pass 不能写（会把 kernel 已推进的值倒退）。
 
 **已验证无效（gate off 保留代码）**：e4m3 MMA down v1/v2（**修正基准参数后**——旧 bench 误用 inter_shared=512，SIMT 对 klen≠256 走标量慢路径，造出"108µs/指令瓶颈/2.14x"三重假象；正确参数下 SIMT 43.7µs=in-serve 实测，v1 48.6 / v2 连续读 49.4 均**更慢**——down 在 2.5TB/s 有效带宽的地板，勿再试 MMA 化）；n==16 bf16 wmma 投影（无 K-split，6x 回退）；P2P AR 复测仍死锁（30s 监护杀，驱动未 wedge）；kpool grid cap（15.29 回退——空块不是成本，全 grid 的内存级并行才是）；**bf16 cast 缓存（FERRITE_XB_CACHE=1，4 个变体全崩，同签名 36tok/1fault/err901，永久关闭）**：v1 池化缓冲扰动 batch 池地址稳定性契约；v2 immortal+capture-only（capture 期分配=cudaMalloc inside capture）；v3 ptr-only+dry 预注册（gate 让 dry 从不预注册）；v4 双遍激活+层清位（理论自洽仍崩——存在未定位的更深层机制，B=2 始终正常）。**教训：隔离基准必须用生产 shape；capture 期任何分配都是雷；batch 池分配确定性对图承重；同 x 组的 cast 合并在 B=16 有未解的结构性障碍。****教训：隔离基准必须用生产的真实 shape（inter_shared 等），错一个参数结论全反；capture 期间任何分配都是雷；batch 池的分配确定性对跨 retire 保留的图是承重的。**
 
