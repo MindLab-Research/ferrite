@@ -944,6 +944,23 @@ impl<B: KernelBackend> TpCluster<B> {
                 }
             });
         }
+        // BATCH-POOL ROUTING (2026-09-09): the per-size CUDA graphs record the
+        // per-layer DevBuf pointers, so those addresses must stay stable across
+        // steps. Routing the batched decode's allocations to a DEDICATED pool
+        // (instead of the general LIFO one) stops interleaved PREFILL
+        // allocations from shuffling them — the intermittent B=16 replay
+        // faults at live≈4-5 (~50% of runs). Drop-guard clears on every exit.
+        #[cfg(feature = "cuda")]
+        {
+            struct BatchDecodeGuard;
+            impl Drop for BatchDecodeGuard {
+                fn drop(&mut self) {
+                    ferrite_kernel::cuda::set_batch_decode(false);
+                }
+            }
+            ferrite_kernel::cuda::set_batch_decode(true);
+            let _batch_guard = BatchDecodeGuard;
+        }
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         // SGLang-style batch-size padding: ONE graph per padded size
@@ -5109,17 +5126,20 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         ptr: emb_ptr, len: hidden,
         class: (hidden as u32).next_power_of_two(),
         dev, stream, stage: std::ptr::null_mut(),
+        batch: false,
     };
     let hprev = DevBuf {
         ptr: hprev_ptr, len: hidden,
         class: (hidden as u32).next_power_of_two(),
         dev, stream, stage: std::ptr::null_mut(),
+        batch: false,
     };
     let h_out = if !h_out_ptr.is_null() {
         Some(DevBuf {
             ptr: h_out_ptr, len: hidden,
             class: (hidden as u32).next_power_of_two(),
             dev, stream, stage: std::ptr::null_mut(),
+            batch: false,
         })
     } else {
         None
@@ -5127,6 +5147,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
     let mut arg = DevBuf {
         ptr: argmax_ptr, len: 1,
         class: 1u32, dev, stream, stage: std::ptr::null_mut(),
+        batch: false,
     };
     let result = mtp_forward_dev_argmax(s, seq, &emb, &hprev, h_out.as_ref(), &mut arg);
     // CRITICAL: these DevBuf views are raw-pointer ALIASES into MtpState's

@@ -411,6 +411,33 @@ fn pool() -> &'static std::sync::Mutex<
     BUF_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+/// Dedicated pool for the BATCHED decode path (2026-09-09): the per-size
+/// CUDA graphs (megab_bN) RECORD the per-layer DevBuf pointers, so those
+/// addresses must stay stable across steps. The general LIFO pool gets
+/// shuffled by interleaved PREFILL allocations during the admission ramp —
+/// a prefill taking a graph-referenced buffer makes the replay read/write
+/// the WRONG buffer (the intermittent 2MB-aligned Xid-31 faults at
+/// live≈4-5, ~50% of B=16 runs). Prefills/one-shot keep the general pool.
+static BATCH_BUF_POOL: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(i32, u32), Vec<PoolPtrs>>>,
+> = std::sync::OnceLock::new();
+
+fn batch_pool() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(i32, u32), Vec<PoolPtrs>>,
+> {
+    BATCH_BUF_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True while the engine runs decode_step_batched (set around the fan_out;
+/// GLOBAL because the allocations happen on the fan_out worker threads).
+static IN_BATCH_DECODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark the current execution as the batched decode step: DevBuf::alloc
+/// routes to the dedicated batch pool (see BATCH_BUF_POOL above).
+pub fn set_batch_decode(v: bool) {
+    IN_BATCH_DECODE.store(v, std::sync::atomic::Ordering::Release);
+}
+
 /// True while THIS thread is inside a stream capture. THREAD-LOCAL: the
 /// per-layer graphs capture inside fan_out workers — 4 ranks capture
 /// concurrently and each ends independently; a GLOBAL flag would let the
@@ -429,17 +456,18 @@ fn is_capturing() -> bool {
     CAPTURING.with(|c| c.get())
 }
 
-fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void) {
-    let mut p = pool().lock().unwrap();
+fn buf_pool_release(dev: i32, class: u32, ptr: *mut std::ffi::c_void, stage: *mut std::ffi::c_void, batch: bool) {
+    let mut p = if batch { batch_pool().lock().unwrap() } else { pool().lock().unwrap() };
     let v = p.entry((dev, class)).or_default();
     if std::env::var_os("FERRITE_POOL_DEBUG").is_some() && v.iter().any(|pp| pp.0 == ptr) {
-        eprintln!("[pool-dup] DOUBLE RELEASE dev={dev} class={class} ptr={ptr:?}");
+        eprintln!("[pool-dup] DOUBLE RELEASE dev={dev} class={class} ptr={ptr:?} batch={batch}");
     }
     v.push(PoolPtrs(ptr, stage));
 }
 
-fn buf_pool_take(dev: i32, class: u32) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
-    pool().lock().unwrap().get_mut(&(dev, class)).and_then(|v| v.pop()).map(|p| (p.0, p.1))
+fn buf_pool_take(dev: i32, class: u32, batch: bool) -> Option<(*mut std::ffi::c_void, *mut std::ffi::c_void)> {
+    let mut p = if batch { batch_pool().lock().unwrap() } else { pool().lock().unwrap() };
+    p.get_mut(&(dev, class)).and_then(|v| v.pop()).map(|p| (p.0, p.1))
 }
 
 /// Drop all pooled activation buffers (weights are owned by the weight cache).
@@ -480,6 +508,10 @@ pub struct DevBuf {
     /// Pinned host staging (cudaMallocHost) — the fixed-address rendezvous
     /// for graph-capturable H2D/D2H (see the module comment above).
     pub stage: *mut std::ffi::c_void,
+    /// True when allocated from the dedicated batched-decode pool (its
+    /// addresses are baked into the per-size CUDA graphs and must not be
+    /// shuffled by interleaved prefill allocations).
+    pub batch: bool,
 }
 
 impl DevBuf {
@@ -501,20 +533,23 @@ impl DevBuf {
             unsafe { cudaSetDevice(dev) };
         }
         let class = (len.max(1) as u32).next_power_of_two();
-        if let Some((ptr, stage)) = buf_pool_take(dev, class) {
-            return Ok(DevBuf { ptr, len, class, dev, stream, stage });
+        // Route to the dedicated batched-decode pool when the flag is set (see
+        // BATCH_BUF_POOL above): the graph-recorded addresses stay stable.
+        let batch = IN_BATCH_DECODE.load(std::sync::atomic::Ordering::Acquire);
+        if let Some((ptr, stage)) = buf_pool_take(dev, class, batch) {
+            return Ok(DevBuf { ptr, len, class, dev, stream, stage, batch });
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         // DIAGNOSTIC (FERRITE_POOL_MISS=1): a cudaMalloc inside a stream
         // capture is ILLEGAL (err 900) and would silently invalidate the graph
         // — the dry-run is supposed to warm every pool class first.
         if std::env::var_os("FERRITE_POOL_MISS").is_some() {
-            eprintln!("[pool-miss] dev={dev} class={class} len={len} — cudaMalloc (capture-illegal if inside a capture)");
+            eprintln!("[pool-miss] dev={dev} class={class} len={len} batch={batch} — cudaMalloc (capture-illegal if inside a capture)");
         }
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
         let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "pinned stage malloc")?;
-        Ok(DevBuf { ptr, len, class, dev, stream, stage })
+        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch })
     }
     /// H2D via the pinned stage — graph-capturable: the CPU copy into the
     /// stage happens outside any graph; the recorded memcpy moves
@@ -553,10 +588,11 @@ impl DevBuf {
 }
 
 impl Drop for DevBuf {
-    /// Return the (device, stage) pair to the pool instead of freeing.
+    /// Return the (device, stage) pair to its pool (general or batched-decode)
+    /// instead of freeing.
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            buf_pool_release(self.dev, self.class, self.ptr, self.stage);
+            buf_pool_release(self.dev, self.class, self.ptr, self.stage, self.batch);
         }
     }
 }
