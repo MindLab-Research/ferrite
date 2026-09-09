@@ -3241,20 +3241,21 @@ fn mega_chain_dev_batched(
     } else {
         None
     };
-    // ALLOCATE THE INPUT BEFORE THE CAPTURE (2026-09-09): the input DevBuf
-    // must NOT be allocated inside the capture — a pool miss there is a
-    // cudaMalloc during capture = err 900 (measured). Allocating here (before
-    // graph_capture_begin) makes any miss a legal cudaMalloc.
-    let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
+    // GRAPH INPUT ALLOCATION (2026-09-09, professional fix): the capture pass's
+    // input MUST be an IMMORTAL DevBuf — a direct cudaMalloc+cudaMallocHost
+    // that NEVER enters any pool. A pooled input has two measured failure
+    // modes: (a) the layer loop REASSIGNS res, returning the input to the
+    // pool where the next same-class allocation ALIASES it (the moving
+    // 2MB-aligned Xid-31 replay faults at B=16); (b) the pooled input
+    // consumes the capture pass's only class-(n*nh) buffer → a pool miss
+    // inside the capture = cudaMalloc = err 900. The dry-run uses a NORMAL
+    // pooled input (its buffers recycle legally).
+    let mut res = if capture {
+        DevBuf::alloc_immortal(cuda.dev(), cuda.stream(), n * nh)?
+    } else {
+        DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?
+    };
     if capture {
-        // POOL PRE-WARM (same class as the input): the dry-run left exactly
-        // ONE class-(n*nh) buffer in the pool (its final res), which our
-        // input allocation above just consumed. The capture's layer loop
-        // needs one more for the first hc_post output — pre-warm it NOW
-        // (outside the capture, where a miss is a legal cudaMalloc) and
-        // return it to the pool for the capture's first E step.
-        let spare = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
-        drop(spare); // → back to the pool
         cuda.graph_capture_begin();
     }
     res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
