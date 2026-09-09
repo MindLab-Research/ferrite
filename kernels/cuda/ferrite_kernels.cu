@@ -4746,7 +4746,7 @@ __global__ void pool_expand_batched_kernel(
 // __launch_bounds__(256,8): ncu showed the register limit capping this kernel
 // at 6 blocks/SM (No-Eligible 69.5%, long-scoreboard 43.5% = latency-bound).
 // Forcing 8 blocks/SM trades registers for the latency hiding it needs.
-__global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
+__global__ void __launch_bounds__(512, 4) sparse_attn_v2_batched_kernel(
     const float* __restrict__ q,          // [B, h*d]
     const unsigned char* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches (e4m3)
     const unsigned char* const* __restrict__ v_tbl,      // [B] per-seq v caches (e4m3)
@@ -4772,8 +4772,8 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     float* qs = sm;                                   // [d] float4-aligned base
     float* sc = sm + d;                                // [topk]
     int* idxs = (int*)(sc + topk);                     // [topk]
-    float* red = (float*)(idxs + topk);                // [8]
-    unsigned int* bm = (unsigned int*)(red + 8);       // [256] dedup bitmap
+    float* red = (float*)(idxs + topk);                // [16] warp partials
+    unsigned int* bm = (unsigned int*)(red + 16);       // [256] dedup bitmap
     // 256 words = 8192 tokens = the DSA cache's max_t. Was 4096 words
     // (131072 tokens) = 16KB of smem for nothing: ncu showed shared memory
     // capping this kernel at 5 blocks/SM (No-Eligible 69.5%, top stall
@@ -4948,8 +4948,8 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
     __syncthreads();
-    if (threadIdx.x < 8) m = red[threadIdx.x];
-    for (int off = 4; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    if (threadIdx.x < 16) m = red[threadIdx.x];
+    for (int off = 8; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     __shared__ float ms_;
     if (threadIdx.x == 0) ms_ = m;
     __syncthreads();
@@ -4963,8 +4963,8 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
     __syncthreads();
-    if (threadIdx.x < 8) sum = red[threadIdx.x];
-    for (int off = 4; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if (threadIdx.x < 16) sum = red[threadIdx.x];
+    for (int off = 8; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     __shared__ float sum_;
     if (threadIdx.x == 0) sum_ = sum;
     __syncthreads();
@@ -5013,7 +5013,7 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
                     else { a.z += wv * vv.x; a.w += wv * vv.y; }
                 }
             }
-            __shared__ float4 pred[4 * 64];     // static (4KB), G<=4, cols<=64
+            __shared__ float4 pred[32 * 16];    // static (8KB), G<=32, cols<=16
             pred[g * cols + c] = a;
             __syncthreads();
             if (g == 0) {
@@ -5097,10 +5097,14 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
     static const int qk_mma_ = getenv("FERRITE_ATTN_QK_MMA") ? 1 : 0;
 
-    dim3 block(256);
+    dim3 block(512); // was 256: grid is only B*h = 16*8 = 128 blocks, so the
+                     // block size IS the parallelism (256 threads = 6.9 warps/SM
+                     // = 11% occupancy; 512 = 13.8 warps/SM). The kernel is
+                     // latency-bound (ncu: No-Eligible 69.5%, long-scoreboard
+                     // 43.5%), so more warps/SM is a direct win.
     dim3 grid(B, h);
     size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
-                  + 8 * sizeof(float) + 256 * sizeof(unsigned int);
+                  + 16 * sizeof(float) + 256 * sizeof(unsigned int);
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
