@@ -4151,6 +4151,232 @@ extern "C" cudaError_t ferrite_quant_e4m3_tokens(
     return cudaGetLastError();
 }
 
+// Per-(token, slot) e4m3 quantization of the MoE act rows for the MMA down
+// kernel (mirrors quant_e4m3_tokens but the rows are the STRIDED act slices:
+// row (t, j) = act[t, j*inter .. +inter] for j<topk, and the shared row
+// act[t, topk*inter .. +inter_shared]). One block per row.
+__global__ void quant_act_rows_kernel(
+    const float* __restrict__ act,        // [n, topk*inter + inter_shared]
+    unsigned char* __restrict__ aq,       // same layout, e4m3
+    float* __restrict__ as_,              // [n, topk+1] per-row scales
+    int stride, int inter, int topk, int inter_shared) {
+    const int t = blockIdx.x / (topk + 1);
+    const int j = blockIdx.x % (topk + 1);
+    const int klen = (j < topk) ? inter : inter_shared;
+    const float* row = act + (size_t)t * stride + (size_t)j * inter;
+    unsigned char* qrow = aq + (size_t)t * stride + (size_t)j * inter;
+    __shared__ float sc[1];
+    float am = 1e-9f;
+    for (int k = threadIdx.x; k < klen; k += blockDim.x)
+        am = fmaxf(am, fabsf(row[k]));
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_down_sync(0xffffffff, am, off));
+    __shared__ float red[8];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = am;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float m = red[0];
+        #pragma unroll
+        for (int w = 1; w < 8; w++) m = fmaxf(m, red[w]);
+        sc[0] = m / 448.0f;
+        as_[(size_t)t * (topk + 1) + j] = sc[0];
+    }
+    __syncthreads();
+    const float inv = 1.0f / sc[0];
+    for (int k = threadIdx.x; k < klen; k += blockDim.x) {
+        const float q = fminf(fmaxf(row[k] * inv, -448.0f), 448.0f);
+        qrow[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    }
+}
+
+extern "C" cudaError_t ferrite_quant_act_rows(
+    const float* act, unsigned char* aq, float* as_,
+    int n, int stride, int inter, int topk, int inter_shared, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    quant_act_rows_kernel<<<(unsigned)(n * (topk + 1)), 256, 0, s>>>(
+        act, aq, as_, stride, inter, topk, inter_shared);
+    return cudaGetLastError();
+}
+
+// ============================================================
+// moe_down_e4m3_mma: the tensor-core MoE down projection.
+// out[t, h] = Σ_j p_j · (act[t, j·inter..] · W_ej[h, :]^T) + shared.
+//
+// WHY: the SIMT fp8 down (moe_fused_down_sum_fp8) is INSTRUCTION-bound, not
+// bandwidth-bound — the isolated bench (2026-09-09, /tmp/down_bench.cu)
+// measured 108.8µs for random routing (109MB) vs 102.0µs when ALL tokens
+// share 8 experts (8MB, fully L2-resident): the time is invariant to the
+// weight traffic; the fp8→half2→float2 conversion chain per weight element
+// dominates. This kernel runs the same GEMM on the e4m3 tensor cores
+// (m16n8k32 — the weights are ALREADY e4m3; the act rows are pre-quantized
+// by ferrite_quant_act_rows), mirroring the act kernel's proven staging:
+// A = the weight rows [16 h, 32 k] via ldmatrix, B = the act row broadcast
+// across the n8. The m16 spans 16 h-rows (1 real token column of C).
+//
+// Structure: grid (hidden/32, n) — 32 h-rows (2 m-tiles) × one token; the
+// block loops the (topk+1) slots j-ASCENDING accumulating in registers —
+// the per-token fold order is deterministic. 8 warps split K (each warp one
+// k32 chunk of its slot's klen; klen=inter or inter_shared). The 272B smem
+// row stride (17×16B) makes the ldmatrix bank-conflict-free; double-buffered
+// cp.async pipelines the next slot's weight tile.
+// ============================================================
+__global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
+    const float* __restrict__ ids_f,       // [n, topk]
+    const float* __restrict__ probs,       // [n, topk]
+    const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] [hidden, inter] e4m3
+    const float* const* __restrict__ down_scale_ptrs,       // [e_local] [hidden/128, dscols]
+    const unsigned char* __restrict__ shared_down_w8,       // [hidden, inter_shared]
+    const float* __restrict__ shared_down_scale,
+    const unsigned char* __restrict__ aq,   // [n, stride] e4m3 act rows (pre-quantized)
+    const float* __restrict__ as_,          // [n, topk+1] per-row scales
+    float* __restrict__ out,                // [n, hidden]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols) {
+    const int h0 = blockIdx.x * 32;
+    const int t = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int stride = topk * inter + inter_shared;
+    // smem: aq rows flat at 512B pitch (j<topk rows use 256B), staged weight
+    // tile [32 rows][272B] ×2 buffers, warp partials, slot id/prob/scale.
+    __shared__ unsigned char saq[(/*TOPK_MAX*/ 8 + 1) * 512];
+    __shared__ unsigned char sW[2][32 * 272];
+    __shared__ float part[8][32];
+    __shared__ float ssp[9];   // as_[t,j] × p_j (folded slot scale); 0 = skip
+    // ---- stage the token's act rows + slot metadata ----
+    {
+        const unsigned char* aq_t = aq + (size_t)t * stride;
+        const int topk_inter = topk * inter;
+        for (int off = threadIdx.x * 16; off < stride; off += 256 * 16) {
+            // rows: [topk × inter] slices then ONE inter_shared slice
+            int j, lo, klen;
+            if (off < topk_inter) {
+                j = off / inter; lo = off - j * inter; klen = inter;
+            } else {
+                j = topk; lo = off - topk_inter; klen = inter_shared;
+            }
+            if (lo + 16 <= klen)
+                *reinterpret_cast<uint4*>(saq + j * 512 + lo) =
+                    *reinterpret_cast<const uint4*>(aq_t + off);
+        }
+        // tail (stride%16 — never on GLM)
+        if (threadIdx.x == 0) {
+            for (int j = 0; j <= topk; j++) {
+                const float p = (j < topk) ? probs[(size_t)t * topk + j] : 1.f;
+                const float s = as_[(size_t)t * (topk + 1) + j];
+                float v = s * p;
+                if (j < topk) {
+                    const int eid = (int)ids_f[(size_t)t * topk + j];
+                    const int local = eid - expert_start;
+                    if (local < 0 || local >= e_local || p == 0.f) v = 0.f;  // skip marker
+                }
+                ssp[j] = v;
+            }
+        }
+        __syncthreads();
+    }
+    // ---- the slot loop with double-buffered weight staging ----
+    #define DM_STAGE(J, BUF) do { \
+        const float sp_ = ssp[J]; \
+        if (sp_ != 0.f) { \
+            const unsigned char* wbase = (J < topk) \
+                ? down_w8_ptrs[(int)ids_f[(size_t)t * topk + J] - expert_start] \
+                : shared_down_w8; \
+            const int klen_ = (J < topk) ? inter : inter_shared; \
+            /* 32 rows × klen bytes in 16B chunks; row stride 272 */ \
+            for (int c = threadIdx.x; c < 32 * (klen_ >> 4); c += 256) { \
+                const int r = c / (klen_ >> 4), cc = (c % (klen_ >> 4)) * 16; \
+                const unsigned char* src_ = wbase + (size_t)(h0 + r) * klen_ + cc; \
+                unsigned char* dst_ = sW[BUF] + r * 272 + cc; \
+                const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
+                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
+            } \
+        } \
+        asm volatile("cp.async.commit_group;\n"); \
+    } while (0)
+    DM_STAGE(0, 0);
+    float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;  // m-tile 0/1 × (r0, r0+8)
+    int buf = 0;
+    for (int j = 0; j <= topk; j++, buf ^= 1) {
+        if (j + 1 <= topk) DM_STAGE(j + 1, buf ^ 1);
+        if (j + 1 <= topk) asm volatile("cp.async.wait_group 1;\n");
+        else asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        if (ssp[j] == 0.f) continue;
+        const int klen = (j < topk) ? inter : inter_shared;
+        const float* dsr = (j < topk)
+            ? down_scale_ptrs[(int)ids_f[(size_t)t * topk + j] - expert_start]
+            : shared_down_scale;
+        const int srow = h0 >> 7;
+        // per-warp k32 chunks: klen/32 chunks over 8 warps (klen=256 → 1 each, 512 → 2)
+        for (int kc = warp; kc < (klen >> 5); kc += 8) {
+            const float wsc = dsr[(size_t)srow * dscols + ((kc << 5) >> 7)] * ssp[j];
+            const unsigned char* arow = saq + j * 512 + (kc << 5);
+            #pragma unroll
+            for (int m = 0; m < 2; m++) {
+                // A fragment: 16 rows × 32 k from the staged tile (ldmatrix.x4)
+                const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+                    sW[buf] + (size_t)(m * 16 + (lane & 15)) * 272 + (kc << 5) + ((lane >> 4) * 16));
+                unsigned a[4];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr_a));
+                unsigned b[2];
+                const int c0 = (lane & 3) * 4;
+                b[0] = *(const unsigned*)(arow + c0);
+                b[1] = *(const unsigned*)(arow + c0 + 16);
+                float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(gd0), "+f"(gd1), "+f"(gd2), "+f"(gd3)
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+                if ((lane & 3) == 0) {
+                    if (m == 0) { accA0 += gd0 * wsc; accA1 += gd2 * wsc; }
+                    else        { accB0 += gd0 * wsc; accB1 += gd2 * wsc; }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #undef DM_STAGE
+    // ---- cross-warp K reduction (warp-ascending, deterministic) ----
+    if ((lane & 3) == 0) {
+        const int r0 = lane >> 2;
+        part[warp][r0] = accA0;
+        part[warp][r0 + 8] = accA1;
+        part[warp][16 + r0] = accB0;
+        part[warp][16 + r0 + 8] = accB1;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        for (int r = lane; r < 32; r += 32) {
+            float s = 0.f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) s += part[w][r];
+            out[(size_t)t * hidden + h0 + r] = s;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
+    const float* ids_f, const float* probs,
+    const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
+    const void* shared_down_w8, const void* shared_down_scale,
+    const unsigned char* aq, const float* as_,
+    float* out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    if (hidden % 32 != 0 || (inter & 31) != 0 || (inter_shared & 31) != 0)
+        return cudaErrorNotSupported;
+    if (inter > 512 || inter_shared > 512 || topk > 8) return cudaErrorNotSupported;
+    dim3 grid((unsigned)(hidden / 32), (unsigned)n);
+    moe_down_e4m3_mma_kernel<<<grid, 256, 0, s>>>(
+        ids_f, probs, down_w8_ptrs, down_scale_ptrs,
+        (const unsigned char*)shared_down_w8, shared_down_scale,
+        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+    return cudaGetLastError();
+}
+
 // ============================================================
 // DSA (sparse attention) device chain — the four small kernels the CPU
 // path did on the host between GPU calls (each crossing was a sync):
