@@ -540,3 +540,22 @@ gemv 的 B 是 8 个不同输出行（**零浪费**）。当前 gemv 实测 2.6 
 act 已经在做 `quant_e4m3_tokens`），B = 权重[32K, 8 out]，累加器 fp32。
 预期 gemv **2.2ms → ~0.5ms（约 10% 总步时）**，是当前最清晰的一项。
 风险：x 从 fp32 变 fp8 量化（act 路径已如此，文本正确），需人眼验证文本。
+
+### gemv_fp8_mma 的可执行设计（下一步直接照此实现）
+
+```
+__global__ void __launch_bounds__(256) gemv_fp8_mma_kernel(
+    const unsigned char* xq, const float* xs,     // [n<=16, in_f] fp8 + [n] token scales
+    const unsigned char* w,  const float* ws,     // [out_f, in_f] fp8 + [out_f/128, in_f/128]
+    const float* bias, float* out, int n, int in_f, int out_f, int scols);
+// block = 256 (8 warps); warp w 负责输出行 row0 = blockIdx.x*64 + w*8 .. +7
+// smem: sx[2][16][80]（xq tile，全 warp 共享）+ sw[2][8][8][80]（每 warp 8 行）= 12.8KB
+// 每个 64-K tile: 2 个 mma.m16n8k32（A = xq 经 ldmatrix.x4；B = 权重按 lane>>2 取行）
+// 每跨过 128-K 边界：acc128 += acc * ws[(row0>>7)*scols + (kb>>7)]（8 行必同属一个 128 块）
+// epilogue: C[m][nn]，m = lane>>2 / +8（= token），nn = (lane&3)*2 / +1（= 输出行）
+//           out[m*out_f + row0+nn] = acc128 * xs[m] + bias[row0+nn]
+```
+要点：**B 的 N=8 是 8 个不同输出行，零复制浪费**（与 act 的 B 相反）；x 需先经
+`quant_e4m3_tokens` 量化（act 已在用，文本正确）；grid = ceil(out_f/64)，out_f=1536 时 24 blocks
+偏少 —— 若实测并行度不足，把每 warp 的行数从 8 降到 2（grid 96）或加 K-split。
+**验收**：与现 gemv 逐层比对 + 人眼文本（fp8 x 量化有数值风险，参考 v 侧 fp16 的教训）。
