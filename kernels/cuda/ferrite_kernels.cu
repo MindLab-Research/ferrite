@@ -2810,6 +2810,147 @@ extern "C" cudaError_t ferrite_gemv_tri(const float* x, const void* w1, const vo
 }
 
 // ============================================================
+// gemm3_bf16_mma: THREE same-x bf16 GEMMs in ONE launch (+ a deterministic
+// reduce) for the batched decode's small same-x projection groups —
+// DSA {wk, weights_proj, gate}, GDN {b, f_a, g_a}. Replaces 3× (cuBLAS
+// nvjet splitK + splitKreduce + a separate f32→bf16 cast) = 9 launches per
+// group per layer with 2; x is consumed as f32 DIRECTLY (no cast kernels).
+// m16n8k16 bf16 tensor cores, block-level K-split ×8 (the DSA group is only
+// ~17 out-tiles — a plain warp-split cannot fill the GPU; the kpool lesson),
+// per-block A/B staged once in smem (the whole k-slice fits: 16×520 bf16
+// each), partials + a split-ascending reduce = a deterministic fold.
+// The 520-element row stride (65×16B) keeps the ldmatrix bank-conflict-free.
+// ============================================================
+__global__ void __launch_bounds__(256, 3) gemm3_bf16_mma_kernel(
+    const float* __restrict__ x,          // [n≤16, in_f] f32
+    const __nv_bfloat16* __restrict__ w0, // [o0, in_f]
+    const __nv_bfloat16* __restrict__ w1, // [o1, in_f]
+    const __nv_bfloat16* __restrict__ w2, // [o2, in_f]
+    float* __restrict__ partial,          // [KS][n, o0+o1+o2]
+    int n, int in_f, int o0, int o1, int o2) {
+    const int tiles0 = (o0 + 15) >> 4;
+    const int tiles01 = tiles0 + ((o1 + 15) >> 4);
+    const int tile = blockIdx.x;
+    const int split = blockIdx.y;
+    const int KS = gridDim.y;
+    const __nv_bfloat16* wbase; int obase, ocount, tbase;
+    if (tile < tiles0)       { wbase = w0; obase = 0;       ocount = o0; tbase = 0; }
+    else if (tile < tiles01) { wbase = w1; obase = o0;      ocount = o1; tbase = tiles0; }
+    else                     { wbase = w2; obase = o0 + o1; ocount = o2; tbase = tiles01; }
+    const int r0 = (tile - tbase) << 4;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int kper = ((in_f + KS - 1) / KS) & ~15;   // 16-aligned k-slice
+    const int k0 = split * kper;
+    const int k1 = min(k0 + kper, in_f);
+    const int klen = k1 - k0;
+    __shared__ __nv_bfloat16 sA[16][520];
+    __shared__ __nv_bfloat16 sB[16][520];
+    __shared__ float red[8][16][16];
+    // stage A: x f32 → bf16 (pad rows replicate row 0 — discarded at the
+    // epilogue; a klen of 0 → the block contributes zeros)
+    for (int idx = threadIdx.x; idx < 16 * klen; idx += 256) {
+        const int t = idx / klen, k = idx % klen;
+        const int tt = t < n ? t : 0;
+        sA[t][k] = __float2bfloat16(x[(size_t)tt * in_f + k0 + k]);
+    }
+    // stage B: this weight's 16 out-rows × the k-slice (row-tail zero-filled)
+    for (int idx = threadIdx.x; idx < 16 * klen; idx += 256) {
+        const int r = idx / klen, k = idx % klen;
+        sB[r][k] = (r0 + r < ocount)
+            ? wbase[(size_t)(r0 + r) * in_f + k0 + k]
+            : __nv_bfloat16(0.f);
+    }
+    __syncthreads();
+    float acc[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    const int ktiles = (klen + 15) >> 4;
+    for (int kt = warp; kt < ktiles; kt += 8) {
+        // A fragment [16 tok, 16 k] via ldmatrix.x4 (rows = tokens at the
+        // (lane>>4)*8 second k-half — the m16 = the TOKEN dimension)
+        const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+            &sA[0][0] + (size_t)(lane & 15) * 520 + (kt << 4) + ((lane >> 4) << 3));
+        unsigned a[4];
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr_a));
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            // B fragment [k16, n8]: lane l holds W[n][k=(l%4)*2+{0,1}] and
+            // W[n][k+8] — the weight is ALREADY [n, k] row-major (= B col-major)
+            const int nrow = (half << 3) + (lane >> 2);
+            const int kcol = (kt << 4) + ((lane & 3) << 1);
+            unsigned b0 = *(const unsigned*)(&sB[nrow][kcol]);
+            unsigned b1 = *(const unsigned*)(&sB[nrow][kcol + 8]);
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[half*4+0]), "+f"(acc[half*4+1]),
+                  "+f"(acc[half*4+2]), "+f"(acc[half*4+3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+        }
+    }
+    // the per-warp C partials → smem (the m16n8 C: lane l holds
+    // C[m=l/4, n=(l%4)*2+{0,1}] and C[m+8, ...])
+    const int m = lane >> 2, ncol = (lane & 3) << 1;
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        red[warp][m][(half << 3) + ncol]       = acc[half*4+0];
+        red[warp][m][(half << 3) + ncol + 1]   = acc[half*4+1];
+        red[warp][m + 8][(half << 3) + ncol]     = acc[half*4+2];
+        red[warp][m + 8][(half << 3) + ncol + 1] = acc[half*4+3];
+    }
+    __syncthreads();
+    // the block's C (warp-ascending sum) → the partial slice
+    if (warp == 0) {
+        const int ototal = o0 + o1 + o2;
+        for (int idx = lane; idx < 256; idx += 32) {
+            const int t = idx >> 4, c = idx & 15;
+            if (t < n && r0 + c < ocount) {
+                float s = 0.f;
+                #pragma unroll
+                for (int w = 0; w < 8; w++) s += red[w][t][c];
+                partial[((size_t)split * n + t) * ototal + obase + r0 + c] = s;
+            }
+        }
+    }
+}
+
+__global__ void gemm3_reduce_kernel(
+    const float* __restrict__ partial,    // [KS][n, ototal]
+    float* __restrict__ out0, float* __restrict__ out1, float* __restrict__ out2,
+    int n, int o0, int o1, int o2, int KS) {
+    const int t = blockIdx.y;
+    const int o = blockIdx.x * blockDim.x + threadIdx.x;
+    const int ototal = o0 + o1 + o2;
+    if (t >= n || o >= ototal) return;
+    float s = 0.f;
+    for (int k = 0; k < KS; k++) s += partial[((size_t)k * n + t) * ototal + o];
+    if (o < o0)          out0[(size_t)t * o0 + o] = s;
+    else if (o < o0 + o1) out1[(size_t)t * o1 + (o - o0)] = s;
+    else                  out2[(size_t)t * o2 + (o - o0 - o1)] = s;
+}
+
+extern "C" cudaError_t ferrite_gemm3_bf16_mma(
+    const float* x, const void* w1, const void* w2, const void* w3,
+    float* partial, float* out0, float* out1, float* out2,
+    int n, int in_f, int o1, int o2, int o3, cudaStream_t s) {
+    if (n <= 0 || n > 16) return cudaSuccess;
+    if (in_f <= 0 || (in_f & 15) != 0) return cudaErrorNotSupported;
+    const int ototal = o1 + o2 + o3;
+    if (ototal <= 0) return cudaSuccess;
+    const int tiles = ((o1 + 15) >> 4) + ((o2 + 15) >> 4) + ((o3 + 15) >> 4);
+    const int KS = 8;
+    dim3 grid((unsigned)tiles, (unsigned)KS);
+    gemm3_bf16_mma_kernel<<<grid, 256, 0, s>>>(
+        x, (const __nv_bfloat16*)w1, (const __nv_bfloat16*)w2, (const __nv_bfloat16*)w3,
+        partial, n, in_f, o1, o2, o3);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    dim3 rgrid((unsigned)((ototal + 255) / 256), (unsigned)n);
+    gemm3_reduce_kernel<<<rgrid, 256, 0, s>>>(
+        partial, out0, out1, out2, n, o1, o2, o3, KS);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // Fused MoE decode (n==1) with GPU-side expert dispatch — the TileRT
 // ExpertSelectUpGateSiLU idea, ferrite-style: expert weights stay wherever
 // the dev_weight_bf16 cache put them; a device POINTER TABLE

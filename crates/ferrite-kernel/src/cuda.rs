@@ -92,6 +92,11 @@ extern "C" {
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
+    fn ferrite_gemm3_bf16_mma(x: *const f32, w1: *const std::ffi::c_void,
+                               w2: *const std::ffi::c_void, w3: *const std::ffi::c_void,
+                               partial: *mut f32, out0: *mut f32, out1: *mut f32, out2: *mut f32,
+                               n: i32, in_f: i32, o1: i32, o2: i32, o3: i32,
+                               s: CuStream) -> i32;
     fn ferrite_gemv_fp8_mma_b16(xq: *const u8, xs: *const f32, w: *const u8,
                                   ws: *const f32, out: *mut f32,
                                   n: i32, in_f: i32, out_f: i32, scols: i32,
@@ -3724,11 +3729,56 @@ impl CudaBackend {
             )?;
             (a, b, c)
         } else {
-            (
-                self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?,
-                self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?,
-                self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?,
-            )
+            // FERRITE_GEMM3: the three same-x bf16 GEMMs in ONE launch (+ a
+            // deterministic reduce) — replaces 3× (cuBLAS splitK + reduce +
+            // f32→bf16 cast) = 9 launches with 2; f32 x consumed DIRECTLY
+            // (no cast kernels). Block-level K-split ×8 (17 out-tiles).
+            let mut fused: Option<(DevBuf, DevBuf, DevBuf)> = None;
+            if std::env::var("FERRITE_GEMM3").map(|v| v == "1").unwrap_or(false) {
+                if let (Ok(da), Ok(db), Ok(dc)) = (
+                    self.dev_weight_bf16(w.wk),
+                    self.dev_weight_bf16(w.weights_proj),
+                    self.dev_weight_bf16(w.gate),
+                ) {
+                    let ki_r = DevBuf::alloc(self.dev, self.stream, n * idm)?;
+                    let w_i = DevBuf::alloc(self.dev, self.stream, n * ih)?;
+                    let g = DevBuf::alloc(self.dev, self.stream, n * idm)?;
+                    let partial = DevBuf::alloc(
+                        self.dev, self.stream, 8 * n * (idm + ih + idm),
+                    )?;
+                    let r = unsafe {
+                        ferrite_gemm3_bf16_mma(
+                            x.as_const_f32(),
+                            da.ptr as *const std::ffi::c_void,
+                            db.ptr as *const std::ffi::c_void,
+                            dc.ptr as *const std::ffi::c_void,
+                            partial.as_f32(),
+                            ki_r.as_f32(),
+                            w_i.as_f32(),
+                            g.as_f32(),
+                            ni,
+                            hidden as i32,
+                            idm as i32,
+                            ih as i32,
+                            idm as i32,
+                            self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        fused = Some((ki_r, w_i, g));
+                    } else {
+                        eprintln!("[opcheck] gemm3 (dsa) err {r} — falling back to matmul_dev");
+                    }
+                }
+            }
+            match fused {
+                Some(t) => t,
+                None => (
+                    self.matmul_dev(x, w.wk, ni, hidden as i32, idm as i32)?,
+                    self.matmul_dev(x, w.weights_proj, ni, hidden as i32, ih as i32)?,
+                    self.matmul_dev(x, w.gate, ni, hidden as i32, idm as i32)?,
+                ),
+            }
         };
         let ki = DevBuf::alloc(self.dev, self.stream, n * idm)?;
         let knw = self.dev_weight(w.k_norm_w)?;
@@ -3952,9 +4002,58 @@ impl CudaBackend {
         // stream once for all B rows; per-row accumulation is the tiled
         // GEMM's, matching the prefill's numeric domain).
         let qkv = self.matmul_dev(x, w.qkv_proj, ni, hidden as i32, (3 * proj) as i32)?;
-        let b_raw = self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?;
-        let fa = self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?;
-        let ga = self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?;
+        // FERRITE_GEMM3: the three SMALL same-x GEMMs {b, f_a, g_a} in ONE
+        // launch (+ a deterministic reduce) — the qkv (25MB weights @6.2TB/s
+        // on cuBLAS) stays put. Replaces 3× (nvjet + reduce + f32→bf16 cast)
+        // = 9 launches with 2 per layer × 34 GDN layers.
+        let (b_raw, fa, ga) = {
+            let mut fused: Option<(DevBuf, DevBuf, DevBuf)> = None;
+            if std::env::var("FERRITE_GEMM3").map(|v| v == "1").unwrap_or(false) {
+                if let (Ok(da), Ok(db), Ok(dc)) = (
+                    self.dev_weight_bf16(w.b_proj),
+                    self.dev_weight_bf16(w.f_a),
+                    self.dev_weight_bf16(w.g_a),
+                ) {
+                    let b_r = DevBuf::alloc(self.dev, self.stream, n * h)?;
+                    let f_a_ = DevBuf::alloc(self.dev, self.stream, n * dk)?;
+                    let g_a_ = DevBuf::alloc(self.dev, self.stream, n * dk)?;
+                    let partial = DevBuf::alloc(
+                        self.dev, self.stream, 8 * n * (h + dk + dk),
+                    )?;
+                    let r = unsafe {
+                        ferrite_gemm3_bf16_mma(
+                            x.as_const_f32(),
+                            da.ptr as *const std::ffi::c_void,
+                            db.ptr as *const std::ffi::c_void,
+                            dc.ptr as *const std::ffi::c_void,
+                            partial.as_f32(),
+                            b_r.as_f32(),
+                            f_a_.as_f32(),
+                            g_a_.as_f32(),
+                            ni,
+                            hidden as i32,
+                            h as i32,
+                            dk as i32,
+                            dk as i32,
+                            self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        fused = Some((b_r, f_a_, g_a_));
+                    } else {
+                        eprintln!("[opcheck] gemm3 (gdn) err {r} — falling back to matmul_dev");
+                    }
+                }
+            }
+            match fused {
+                Some(t) => t,
+                None => (
+                    self.matmul_dev(x, w.b_proj, ni, hidden as i32, h as i32)?,
+                    self.matmul_dev(x, w.f_a, ni, hidden as i32, dk as i32)?,
+                    self.matmul_dev(x, w.g_a, ni, hidden as i32, dk as i32)?,
+                ),
+            }
+        };
         let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
         let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
         let dw_conv = self.dev_weight(w.conv_w)?;
