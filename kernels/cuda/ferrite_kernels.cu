@@ -4912,20 +4912,26 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                                      : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
                                      : "l"(krow + l2));
                     }
-                    const __nv_fp8x2_storage_t* ff = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0);
+                    // explicit 16-bit extraction (see the PV comment: &u0 + ff[e]
+                    // over-reads one local uint = UB and produced NaN lanes)
+                    const unsigned int uu[4] = {u0, u1, u2, u3};
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
-                        const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
-                            &__nv_cvt_fp8x2_to_halfraw2(ff[e], __NV_E4M3)));
+                        const __nv_fp8x2_storage_t f8 = (__nv_fp8x2_storage_t)
+                            ((e & 1) ? (uu[e >> 1] >> 16) : (uu[e >> 1] & 0xFFFFu));
+                        const __half2 h2 = __nv_cvt_fp8x2_to_halfraw2(f8, __NV_E4M3);
+                        const float2 kf = __half22float2(h2);
                         const float2 qf = *reinterpret_cast<const float2*>(qs + l + e * 2);
                         a8 += qf.x * kf.x + qf.y * kf.y;
                     }
                     if (l2 + 15 < d) {
-                        const __nv_fp8x2_storage_t* gg = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v0);
+                        const unsigned int vv4[4] = {v0, v1, v2, v3};
                         #pragma unroll
                         for (int e = 0; e < 8; e++) {
-                            const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
-                                &__nv_cvt_fp8x2_to_halfraw2(gg[e], __NV_E4M3)));
+                            const __nv_fp8x2_storage_t f8 = (__nv_fp8x2_storage_t)
+                                ((e & 1) ? (vv4[e >> 1] >> 16) : (vv4[e >> 1] & 0xFFFFu));
+                            const __half2 h2 = __nv_cvt_fp8x2_to_halfraw2(f8, __NV_E4M3);
+                            const float2 kf = __half22float2(h2);
                             const float2 qf = *reinterpret_cast<const float2*>(qs + l2 + e * 2);
                             a8b += qf.x * kf.x + qf.y * kf.y;
                         }
@@ -4997,7 +5003,7 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
         const int g = threadIdx.x / cols;
         const int c = threadIdx.x % cols;
         const bool pv_on = (c < cols && g < G);
-        __shared__ float4 pred[32 * 16];        // static (8KB), G<=32, cols<=16
+        __shared__ float4 pred[4 * 64];         // static (4KB): G*cols == 256 always
         if (pv_on) {
             float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
             // unroll 4: one independent float4 load per iteration, previously
@@ -5013,12 +5019,20 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                 asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
                              : "l"(v_s + ((size_t)j * h + hd) * dv + c * 16));
-                const __nv_fp8x2_storage_t* ff = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0);
+                // fp8x2 element e is the low/high 16-bit half of uu[e>>1].
+                // The old `(const __nv_fp8x2_storage_t*)&u0` + ff[e] read 16B
+                // out of ONE local uint = UB: it only worked when the compiler
+                // happened to keep u0..u3 contiguous. With a different register
+                // pressure it returned garbage -> NaN lanes in vv (measured:
+                // [nan-pv] vv=nan,-0.25). Explicit shifts are well-defined.
+                const unsigned int uu[4] = {u0, u1, u2, u3};
                 const float vs_ = vsc_s[(size_t)j * h + hd];
                 #pragma unroll
                 for (int e = 0; e < 8; e++) {
-                    const float2 vv = __half22float2(*reinterpret_cast<const __half2*>(
-                        &__nv_cvt_fp8x2_to_halfraw2(ff[e], __NV_E4M3)));
+                    const __nv_fp8x2_storage_t f8 = (__nv_fp8x2_storage_t)
+                        ((e & 1) ? (uu[e >> 1] >> 16) : (uu[e >> 1] & 0xFFFFu));
+                    const __half2 h2 = __nv_cvt_fp8x2_to_halfraw2(f8, __NV_E4M3);
+                    const float2 vv = __half22float2(h2);
                     const float wv = w * vs_;
                     if (e == 0) { a.x += wv * vv.x; a.y += wv * vv.y; }
                     else if (e == 1) { a.z += wv * vv.x; a.w += wv * vv.y; }
