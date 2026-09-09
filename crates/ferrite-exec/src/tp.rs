@@ -5187,12 +5187,14 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         class: (hidden as u32).next_power_of_two(),
         dev, stream, stage: std::ptr::null_mut(),
         batch: false,
+        immortal: false,
     };
     let hprev = DevBuf {
         ptr: hprev_ptr, len: hidden,
         class: (hidden as u32).next_power_of_two(),
         dev, stream, stage: std::ptr::null_mut(),
         batch: false,
+        immortal: false,
     };
     let h_out = if !h_out_ptr.is_null() {
         Some(DevBuf {
@@ -5200,6 +5202,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
             class: (hidden as u32).next_power_of_two(),
             dev, stream, stage: std::ptr::null_mut(),
             batch: false,
+        immortal: false,
         })
     } else {
         None
@@ -5208,6 +5211,7 @@ pub(crate) fn mtp_forward_raw_argmax<B: KernelBackend>(
         ptr: argmax_ptr, len: 1,
         class: 1u32, dev, stream, stage: std::ptr::null_mut(),
         batch: false,
+        immortal: false,
     };
     let result = mtp_forward_dev_argmax(s, seq, &emb, &hprev, h_out.as_ref(), &mut arg);
     // CRITICAL: these DevBuf views are raw-pointer ALIASES into MtpState's

@@ -512,6 +512,13 @@ pub struct DevBuf {
     /// addresses are baked into the per-size CUDA graphs and must not be
     /// shuffled by interleaved prefill allocations).
     pub batch: bool,
+    /// True = this buffer NEVER enters any pool and its Drop is a no-op
+    /// (intentionally leaked for the CUDA graph's lifetime). Used for the
+    /// graph's INPUT buffer: its (ptr, stage) are recorded in the graph, so
+    /// it must not be recycled by the pool (aliasing → replay faults) nor
+    /// allocated during the capture (a pool miss there = cudaMalloc inside
+    /// capture = err 900).
+    pub immortal: bool,
 }
 
 impl DevBuf {
@@ -537,7 +544,7 @@ impl DevBuf {
         // BATCH_BUF_POOL above): the graph-recorded addresses stay stable.
         let batch = IN_BATCH_DECODE.load(std::sync::atomic::Ordering::Acquire);
         if let Some((ptr, stage)) = buf_pool_take(dev, class, batch) {
-            return Ok(DevBuf { ptr, len, class, dev, stream, stage, batch });
+            return Ok(DevBuf { ptr, len, class, dev, stream, stage, batch, immortal: false });
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         // DIAGNOSTIC (FERRITE_POOL_MISS=1): a cudaMalloc inside a stream
@@ -549,7 +556,27 @@ impl DevBuf {
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
         let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "pinned stage malloc")?;
-        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch })
+        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch, immortal: false })
+    }
+
+    /// An IMMORTAL DevBuf: direct cudaMalloc + cudaMallocHost, NEVER enters any
+    /// pool, Drop is a no-op (intentionally leaked for the CUDA graph's
+    /// lifetime). Use for graph-recorded INPUT buffers whose (ptr, stage) must
+    /// stay stable: a pooled buffer would be recycled by the layer loop's
+    /// reassignments (aliasing → replay faults) or starve the capture pass's
+    /// pool (a miss inside the capture = cudaMalloc = err 900).
+    pub fn alloc_immortal(dev: i32, stream: CuStream, len: usize) -> Result<Self> {
+        let mut cur: i32 = -1;
+        unsafe { cudaGetDevice(&mut cur) };
+        if cur != dev {
+            unsafe { cudaSetDevice(dev) };
+        }
+        let class = (len.max(1) as u32).next_power_of_two();
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "immortal malloc")?;
+        let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
+        ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "immortal pinned stage malloc")?;
+        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch: false, immortal: true })
     }
     /// H2D via the pinned stage — graph-capturable: the CPU copy into the
     /// stage happens outside any graph; the recorded memcpy moves
@@ -589,8 +616,12 @@ impl DevBuf {
 
 impl Drop for DevBuf {
     /// Return the (device, stage) pair to its pool (general or batched-decode)
-    /// instead of freeing.
+    /// instead of freeing. IMMORTAL buffers (graph-recorded inputs) are
+    /// intentionally leaked — their Drop is a no-op.
     fn drop(&mut self) {
+        if self.immortal {
+            return;
+        }
         if !self.ptr.is_null() {
             buf_pool_release(self.dev, self.class, self.ptr, self.stage, self.batch);
         }
