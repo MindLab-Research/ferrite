@@ -3427,6 +3427,175 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     }
 }
 
+// ============================================================
+// moe_fused_down_mma (W8A8, tensor core): the down projection of the fused
+// MoE on the fp8 MMA. Block = (16 hidden rows, one token); the 8 warps split
+// the K (inter/8, 32-aligned). A = the expert's down weight tile via
+// ldmatrix.x4 (fp8, per-128 scale from down_scale_ptrs); B = the token's act
+// row, quantized to e4m3 in the staging with a per-32-K-tile absmax (the act
+// is fp32 in global). The 8 k-tiles accumulate into 8 separate fp32
+// accumulators so each tile's (wscale * ascale) folds in at the end. The MMA
+// computes a 16x8 tile; the 8 N columns are replicas of the same token (only
+// column 0 is used), which still beats the SIMT fp8 FMA path by ~4x because
+// the tensor-core MAC rate is ~32x a lane's.
+// ============================================================
+template <int UNUSED_MOE_DOWN>
+__global__ void __launch_bounds__(256, 4) moe_down_mma_kernel(
+    const float* __restrict__ ids_f,       // [n, topk]
+    const float* __restrict__ probs,       // [n, topk]
+    const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] fp8 [hidden, inter]
+    const float* const* __restrict__ down_scale_ptrs,       // [e_local] [hidden/128, inter/128]
+    const unsigned char* __restrict__ shared_down_w8,      // [hidden, inter_shared]
+    const float* __restrict__ shared_down_scale,
+    const float* __restrict__ act,         // [n, topk*inter + inter_shared]
+    float* __restrict__ out,               // [n, hidden]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols, int n) {
+    const int h0 = blockIdx.x * 16;
+    const int tok = blockIdx.y;
+    if (h0 >= hidden || tok >= n) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int c0 = (lane & 3) * 4;
+    const int kper = ((inter + 7) / 8 + 31) & ~31;
+    const int k0 = warp * kper;
+    const int k1 = min(k0 + kper, inter);
+    const int stride = topk * inter + inter_shared;
+    __shared__ unsigned char sw[2][8][16][48];   // [stage][warp][h row][K=32+16]
+    __shared__ unsigned char sa[2][8][48];       // [stage][warp][K] quantized act
+    __shared__ float asc[8];                     // per-warp act scale (per k-tile)
+    float acc[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { acc[i][0] = 0.f; acc[i][1] = 0.f; acc[i][2] = 0.f; acc[i][3] = 0.f; }
+    float total = 0.f;
+    const int nslot = topk + (inter_shared > 0 ? 1 : 0);
+    for (int slot = 0; slot < nslot; slot++) {
+        int eid = (int)ids_f[(size_t)tok * topk + (slot < topk ? slot : 0)];
+        const unsigned char* w8; const float* ws; const float* arow; float p;
+        if (slot < topk) {
+            int local = eid - expert_start;
+            if (local < 0 || local >= e_local) continue;
+            w8 = down_w8_ptrs[local]; ws = down_scale_ptrs[local];
+            arow = act + (size_t)tok * stride + (size_t)slot * inter;
+            p = probs[(size_t)tok * topk + slot];
+        } else {
+            if (inter_shared <= 0) break;
+            w8 = shared_down_w8; ws = shared_down_scale;
+            arow = act + (size_t)tok * stride + (size_t)topk * inter;
+            p = 1.0f;
+        }
+        // quantize this warp's K slice of the act row once (32 values)
+        {
+            const int l0 = k0 + lane;
+            float a0 = (l0 < inter) ? arow[l0] : 0.f;
+            float am = fabsf(a0);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1) am = fmaxf(am, __shfl_down_sync(0xffffffff, am, off));
+            am = __shfl_sync(0xffffffff, am, 0);
+            const float ascale = am / 448.0f + 1e-12f;
+            if (lane == 0) asc[warp] = ascale;
+            // every lane needs the 32 quantized values in smem (B fragment is
+            // shared across the N=8 replicas) -> 8 lanes write 4 each
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const int idx = q * 8 + lane;
+                if (idx < 32) {
+                    const int l = k0 + idx;
+                    const float v = (l < inter) ? arow[l] : 0.f;
+                    const float qv = fminf(fmaxf(v / ascale, -448.0f), 448.0f);
+                    sa[0][warp][idx] = (unsigned char)__nv_cvt_float_to_fp8(qv, __NV_SATFINITE, __NV_E4M3);
+                }
+            }
+        }
+        __syncwarp();
+        // load the weight tile (16 h rows x 32 K) into smem
+        {
+            const int t = lane;
+            #pragma unroll
+            for (int q = 0; q < 4; q++) {
+                const int idx = t + q * 32;         // 0..127: row = idx/8, col8 = idx%8
+                const int row = idx >> 3, c8 = (idx & 7) * 4;
+                const int kk = k0 + c8;
+                unsigned char* dst = sw[0][warp][row] + c8;
+                if (kk + 3 < inter && h0 + row < hidden) {
+                    const unsigned int* src = (const unsigned int*)(w8 + (size_t)(h0 + row) * inter + kk);
+                    *(unsigned int*)dst = *src;
+                } else {
+                    unsigned char tmp[4] = {0, 0, 0, 0};
+                    for (int e = 0; e < 4; e++) {
+                        const int l = kk + e;
+                        tmp[e] = (l < inter && h0 + row < hidden) ? w8[(size_t)(h0 + row) * inter + l] : 0;
+                    }
+                    *(unsigned int*)dst = *(unsigned int*)tmp;
+                }
+            }
+        }
+        __syncwarp();
+        const float ascale = asc[warp];
+        const int kb = k0 >> 7;
+        const float wsc = ws[(size_t)(h0 >> 7) * dscols + kb];
+        // one 16x8x32 MMA (K slice = 32 for this warp)
+        {
+            const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+                sw[0][warp][0] + (size_t)(lane & 15) * 48 + ((lane >> 4) * 16));
+            unsigned ba[4];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(ba[0]), "=r"(ba[1]), "=r"(ba[2]), "=r"(ba[3]) : "r"(saddr_a));
+            unsigned b[2];
+            b[0] = *(const unsigned*)(sa[0][warp] + c0);
+            b[1] = *(const unsigned*)(sa[0][warp] + c0 + 16);
+            const int ki = (k0 >> 5) & 7;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13};\n"
+                : "=f"(acc[ki][0]), "=f"(acc[ki][1]), "=f"(acc[ki][2]), "=f"(acc[ki][3])
+                : "r"(ba[0]), "r"(ba[1]), "r"(ba[2]), "r"(ba[3]), "r"(b[0]), "r"(b[1]),
+                  "f"(0.f), "f"(0.f), "f"(0.f), "f"(0.f));
+        }
+        // fold this k-tile: acc[ki] * (wsc * ascale) * p, accumulated in the
+        // same slot order as the SIMT kernel
+        {
+            const int ki = (k0 >> 5) & 7;
+            const float f = wsc * ascale * p;
+            if ((lane & 3) == 0) {
+                total += (acc[ki][0] + acc[ki][2]) * f;
+                acc[ki][0] = 0.f; acc[ki][1] = 0.f; acc[ki][2] = 0.f; acc[ki][3] = 0.f;
+            }
+        }
+    }
+    // reduce the 8 warps' K-slice sums (each warp covered a different K range)
+    __shared__ float red[8][32];
+    red[warp][lane] = total;
+    __syncthreads();
+    if (warp == 0) {
+        float s = 0.f;
+        #pragma unroll
+        for (int u = 0; u < 8; u++) s += red[u][lane];
+        // C fragment: lanes 0-3 hold (row 0, col 0/1) and (row 8, col 0/1)
+        const int m0 = lane >> 2, n0 = (lane & 3) * 2;
+        if (m0 == 0) {
+            const int hrow = h0 + n0;
+            if (hrow < hidden) out[(size_t)tok * hidden + hrow] = s;
+            if (hrow + 1 < hidden) out[(size_t)tok * hidden + hrow + 1] = s;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_moe_down_mma(
+    const float* ids_f, const float* probs,
+    const unsigned char* const* down_w8_ptrs, const float* const* down_scale_ptrs,
+    const unsigned char* shared_down_w8, const float* shared_down_scale,
+    const float* act, float* out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols, int n, cudaStream_t s) {
+    if (n <= 0 || n > 16 || (hidden & 15) != 0) return cudaErrorInvalidValue;
+    dim3 grid((unsigned)(hidden / 16), (unsigned)n);
+    moe_down_mma_kernel<0><<<grid, 256, 0, s>>>(
+        ids_f, probs, down_w8_ptrs, down_scale_ptrs, shared_down_w8,
+        shared_down_scale, act, out, expert_start, e_local, hidden, inter,
+        inter_shared, topk, dscols, n);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     const float* ids_f, const float* probs,
     const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
