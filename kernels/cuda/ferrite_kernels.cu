@@ -5063,6 +5063,7 @@ extern "C" cudaError_t ferrite_indexer_topk_batched(
     static const bool attn_skip_ = getenv("FERRITE_ATTN_SKIP") != nullptr;
     if (attn_skip_) return cudaSuccess;
 
+    static const int idx_mma_ = getenv("FERRITE_IDX_MMA") ? 1 : 0;
     dim3 block(1024); // was 256: the grid is only B=16 blocks, so the block
                       // size IS the parallelism (16x256 threads used 1.4% of
                       // the GPU; 16x1024 = 5.5%).
@@ -5095,7 +5096,6 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     if (attn_skip_) return cudaSuccess;
     static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
     static const int qk_mma_ = getenv("FERRITE_ATTN_QK_MMA") ? 1 : 0;
-    static const int idx_mma_ = getenv("FERRITE_IDX_MMA") ? 1 : 0;
 
     dim3 block(256);
     dim3 grid(B, h);
