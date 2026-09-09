@@ -1348,3 +1348,34 @@ MTP 在 B=16 下本身即坏：LEN 0 + 161 错误）。
 1. AR/compute overlap（TP all-reduce 与下一层计算重叠，1.06ms 中可隐藏大部分）；
 2. CUDA graph 节点数削减（每步 ~700 节点）；
 3. MoE expert-major 分组（消除 act 的 8x N 浪费与 down 的 N=1 限制）。
+
+## 📊 当前时间分布（nsys 实测，2026-09-09 05:40，B=16，不开 MTP）
+
+**总步时 13.68 ms = 1170 tok/s**（会话起点 833 tok/s，**+40%**）。报告：`/tmp/nsys_b16.nsys-rep`
+（618MB，用 `timeout -s INT` + `/shutdown` 落盘）。**每步时间 = median × 每步调用次数**。
+
+| kernel | 中位/次 | 次数/步 | ms/步 | 占比 | 状态 |
+|---|---|---|---|---|---|
+| moe_fused_act_fp8_mma | 47.8µs | 42 | **2.01** | 14% | MMA ✓（N=8 是复制 → 8x 浪费） |
+| moe_fused_down_sum_fp8 | 46.8µs | 42 | **1.97** | 14% | SIMT（bf16 MMA 已实现但 +2% 后未启用） |
+| sparse_attn_v2_batched | 143.5µs | 11 | **1.58** | 11% | SIMT（延迟受限；MMA 版实测 22.6ms 已关闭） |
+| gemv_fp8_mma_b16 | 6.6µs | ~200 | 1.32 | 9% | **CUTLASS 级 MMA ✓（5.2-8.6x）** |
+| indexer_topk_batched | 97.5µs | 11 | 1.07 | 7% | fast-path ✓ + 4 路 ILP ✓（MMA 版不可行） |
+| gdn_chunk + step + prep | 44.7µs | 42 | 1.88 | 13% | 延迟受限（state 128KB/block 往返） |
+| hc (mix+rest+post) | 22.3µs | ~90 | 1.45 | 10% | 92.8% No-Eligible（纯启动开销） |
+| AR (p2p 3 kernels) | 11.8µs | 90 | 1.06 | 7% | 3 kernel/次 |
+| NCCL all-reduce 残余 | 119µs | ~4 | 0.47 | 3% | 未定位的 4 次/步 |
+| kpool_compress | 63.4µs | 11 | 0.70 | 5% | 4 路展开 ✓ |
+| quant_e4m3_tokens | 2.4µs | 200 | 0.48 | 3% | 1024 线程 + float4 ✓ |
+| moe_route | 5.8µs | 42 | 0.24 | 2% | |
+| pool_expand / conv1d | 9.8/2.7µs | 11/42 | 0.22 | 2% | |
+
+**两大块：MoE 4.0ms（28%）+ DSA 3.35ms（24%）= 52%。**
+两者都是**per-token 散射**结构（每个 token 的 top-k 专家不同），
+所以 act 的 N=8 只能是复制、down 的 N 只能是 1 —— **单 kernel 级 MMA 已到极限**，
+必须做 expert-major 分组（把同专家的 token 聚到一起）才能用大 N。
+
+**已耗尽的方向**：gemv MMA（位级最优）、quant、indexer fast-path/ILP、kpool 展开、
+sparse_attn 位图/launch_bounds/unroll（隔离 −27%）、MoE act 2 段流水（隔离 −34%）。
+**已证伪**：sparse_attn QK^T MMA（22.6ms）、indexer 分数 MMA（bench 跑不动）、
+GDN dv 分块（+37%）、bf16/fp8 KV cache 单独（延迟非带宽）、HC_MIX_KS 加倍（serve 中性）。
