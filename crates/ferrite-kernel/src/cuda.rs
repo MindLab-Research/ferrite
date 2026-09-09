@@ -4761,6 +4761,16 @@ extern "C" {
                                   hidden: i32, inter: i32, inter_shared: i32,
                                   topk: i32, n: i32, dscols: i32,
                                   s: CuStream) -> i32;
+    fn ferrite_moe_down_w8a16_mma(ids_f: *const f32, probs: *const f32,
+                                  down_w8_ptrs: *const *const std::ffi::c_void,
+                                  down_scale_ptrs: *const *const std::ffi::c_void,
+                                  shared_down_w8: *const std::ffi::c_void,
+                                  shared_down_scale: *const std::ffi::c_void,
+                                  act: *const f32, out: *mut f32,
+                                  expert_start: i32, e_local: i32,
+                                  hidden: i32, inter: i32, inter_shared: i32,
+                                  topk: i32, n: i32, dscols: i32,
+                                  s: CuStream) -> i32;
 }
 
 impl CudaBackend {
@@ -5172,6 +5182,34 @@ impl CudaBackend {
                                 } else {
                                     eprintln!("[opcheck] moe_down_e4m3_mma2 err {rd} — falling back");
                                 }
+                            }
+                        }
+                        // W8A16 (FERRITE_DOWN_W8A16=1, 2026-09-10 TODO path ②):
+                        // the numerically-safe f16 MMA down — NO act pre-quantization
+                        // (takes f32 act directly, converts to f16 in-kernel; the
+                        // only error source is f32→f16 at ~0.05%, half the 0.1%
+                        // sensitivity threshold). fp8→f16 weight conversion is
+                        // lossless (3-bit fits 10-bit), f16×f16→f32 product exact
+                        // (20<23 bits), f32 accumulate exact.
+                        let use_down_w8a16 = std::env::var("FERRITE_DOWN_W8A16")
+                            .map(|v| v == "1").unwrap_or(false);
+                        if use_down_w8a16 {
+                            let rd = unsafe {
+                                ferrite_moe_down_w8a16_mma(
+                                    dids.as_const_f32(), dprobs.as_const_f32(),
+                                    tbl.down_w8 as *const *const _,
+                                    tbl.down_scale as *const *const _,
+                                    sd.w, sd.scale,
+                                    act.as_const_f32(),
+                                    out.as_f32(),
+                                    expert_start as i32, tbl.e_local as i32, hi, inter,
+                                    inter_shared, topk as i32, ni, dscols, self.stream,
+                                )
+                            };
+                            if rd == 0 {
+                                down_done = true;
+                            } else {
+                                eprintln!("[opcheck] moe_down_w8a16_mma err {rd} — falling back");
                             }
                         }
                         if !down_done && use_down_e4m3 && !use_down_bf16 {
