@@ -913,3 +913,29 @@ W8A16 gate/PDL/--use_fast_math/hc_post float4）。
 
 **当前基线**：13.28-13.46ms replay（±1.5% 噪声）/ **~1194 tok/s**（server 侧 16000/13.4）/
 1126（client 侧，Python SSE 开销 6%）。0 fault，出师表逐字 ✓。
+
+## 2026-09-10 收尾②：gdn_step block 512→1024 中性 + 16 项尝试总结
+
+**gdn_step_v2 block 512→1024（2b6aff4）**：实测 **中性**（B=16 13.42ms、B=2 9.19ms，
+均在噪声内）。**我的延迟链分析错误**：S 是 **smem**（`float* S = sm;`），smem 延迟
+~15ns（20-30 cycles）而非 global 的 600ns——32 个 smem 访问只 ~0.5µs，不是 19µs。
+17.12µs 的真实来源：占用率 10.8%（64 blocks × 512/1024 = 32768-65536 线程 / 302848）
++ 6 个 __syncthreads + 每元素 expf。数值 bit-identical，保留。
+
+**GDN 参数**（config.json text_config.linear_attn_config）：num_heads=**64**、
+head_dim=**128**、short_conv=4、kda_layers 44 个、full_attn_layers 11 个（3,7,...,43）。
+
+**本会话 16 项尝试的最终矩阵**：
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1-10 | fp8 down/DSA dummy/AR f32/device-advance/gemm3/gdn float4/mix float4/sparse v3/GPU embedding/host skip | ✅ 落地 −15.7ms |
+| 11 | expert-major MoE | ❌ gate（L2 已吸收） |
+| 12 | W8A16 MMA down | ❌ gate（数值安全但 +4.57ms） |
+| 13 | PDL | ❌ 无收益（覆盖低） |
+| 14 | --use_fast_math | ❌ 中性 |
+| 15 | hc_post float4 | ❌ 中性 |
+| 16 | gdn_step block 1024 | ❌ 中性 |
+
+**结论（最终）**：非结构优化空间已彻底枯竭——最近 6 项尝试全部中性或负结果。
+1600 @B=16 不开 MTP 需要**架构级突破**：AR 协议（NCCL 地板 2.58ms，P2P ×3 死锁）或
+MoE 访存模式（带宽+数值双地板 3.70ms）。会话交付 +121%（539→1194 tok/s）。
