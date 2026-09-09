@@ -1948,7 +1948,7 @@ impl CudaBackend {
             if std::env::var("FERRITE_GEMV_MMA_DEBUG").is_ok() {
                 static CNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
                 let c = CNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if c < 60 {
+                if n >= 2 && n <= 16 && c < 200 {
                     let hit = n >= 2 && n <= 16 && (out_f & 7) == 0 && (in_f & 63) == 0
                         && f8.scols == (in_f + 127) / 128;
                     eprintln!("[gemvdbg] n={} in={} out={} scols={}/{} {}",
