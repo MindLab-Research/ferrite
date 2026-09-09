@@ -5026,7 +5026,11 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // ============================================================
 // K-SPLIT lanes per mix row in hc_pre phase 1 (gridDim.z): 24 mix rows × 8
 // = 192 blocks = 130% SM occupancy on B300 (148 SMs) vs 24 blocks (16%).
-#define HC_MIX_KS 8
+// 16 (was 8): the mix kernel's 48 blocks leave the GPU mostly idle and the
+// launcher's own comment records a ~50us fixed per-launch cost that scales
+// down with block count (1 blk 55us / 16 blk 11us / 192 blk 5.8us).
+// Doubling the K-split doubles the blocks -> better amortization.
+#define HC_MIX_KS 16
 // Plan N v1: P345 column blocks per token (gridDim.y) — h=4096/16 = 256
 // columns per block × 256 threads = 1 column/thread. 16 blocks spread the
 // old single-block P3's 64KB x read over 16 SMs' L2 bandwidth.
