@@ -2823,6 +2823,11 @@ fn mega_chain_dev(
 
     let mut gdn_idx = 0usize; // verify scratch index (GDN layers only)
     for (layer_idx, plan) in plans.iter().enumerate() {
+        // xb cast-cache validity is per-LAYER (the x buffers are freed and
+        // reallocated across layers at the SAME pooled addresses with
+        // different content — a pass-scoped clear would stale-hit; the
+        // ptr-only key requires this boundary).
+        cuda.clear_xb_cache();
         if std::env::var_os("FERRITE_TIMING").is_some() {
             eprintln!("[megab-cap] dev{dev_id} cap={capture} L{layer_idx}");
         }

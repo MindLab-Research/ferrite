@@ -1968,9 +1968,19 @@ impl CudaBackend {
         // for the kept-across-retire graphs — never perturb it. The DRY pass
         // (not capturing) always casts fresh — transient pooled buffers, no
         // cache growth across steps.
+        // v4: ACTIVE IN BOTH PASSES (the v3 bug: gating on is_capturing() meant
+        // the DRY never pre-registered → the capture's first GEMM always took
+        // the miss path → alloc_immortal DURING the capture = cudaMalloc
+        // inside capture = err 901). The dry pass (legal allocation) registers
+        // the immortal buffers at the x addresses; the capture pass re-validates
+        // (re-cast into the existing buffer, NO allocation) and the same-x
+        // group's 2nd..Nth GEMMs hit — the graph records ONE cast per
+        // (layer, group). The validity is cleared at EACH LAYER boundary
+        // (the x buffers are freed/reallocated across layers at the SAME
+        // pooled addresses with different content — a pass-scoped clear would
+        // stale-hit; this is why the key is ptr-only, no gen).
         let use_xb_cache = std::env::var("FERRITE_XB_CACHE")
-            .map(|v| v == "1").unwrap_or(false)
-            && is_capturing();
+            .map(|v| v == "1").unwrap_or(false);
         let xbp: *const f32;
         if !use_xb_cache {
             let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
