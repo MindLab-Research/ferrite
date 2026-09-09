@@ -2786,7 +2786,10 @@ fn mega_chain_dev(
         // finer-grained sync we tried (per-step, per-dsa_host_advance) did not.
         // Enable with FERRITE_LAYER_SYNC=1 until the exact hazard is found.
         if std::env::var_os("FERRITE_LAYER_SYNC").is_some() {
-            let _ = cuda.sync();
+            match cuda.sync() {
+                Ok(()) => {}
+                Err(e) => eprintln!("[opcheck] FIRST FAILING LAYER = L{layer_idx} (dev{dev_id}): {e}"),
+            }
         }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
@@ -3210,7 +3213,10 @@ fn mega_chain_dev_batched(
         // finer-grained sync we tried (per-step, per-dsa_host_advance) did not.
         // Enable with FERRITE_LAYER_SYNC=1 until the exact hazard is found.
         if std::env::var_os("FERRITE_LAYER_SYNC").is_some() {
-            let _ = cuda.sync();
+            match cuda.sync() {
+                Ok(()) => {}
+                Err(e) => eprintln!("[opcheck] FIRST FAILING LAYER = L{layer_idx} (dev{dev_id}): {e}"),
+            }
         }
         let t_l = std::time::Instant::now();
         let pfx = format!("model.layers.{layer_idx}");
