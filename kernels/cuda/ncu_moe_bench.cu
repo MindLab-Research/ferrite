@@ -297,13 +297,14 @@ int main(int argc, char** argv) {
         // zero inputs) — this is what made the first compare inconclusive.
         size_t alen = (size_t)mc.n * (mc.topk * mc.inter + mc.inter_shared);
         std::vector<float> ha(alen);
-        // wide dynamic range (swiglu-like): mix of tiny and large magnitudes.
-        // The uniform +/-5 fill gave only ~3% dot error; if the error grows
-        // with the range, the quantization scale is the mechanism.
+        // e4m3-EXACT fill: every value is exactly representable in e4m3
+        // (3-bit mantissa, powers of two), so the kernel's act quantization
+        // is an identity. Any remaining residual must be a MATH bug in the
+        // MMA path, not quantization. This is the decisive experiment.
         for (size_t i = 0; i < alen; i++) {
-            float u = (float)((int)(i * 7919 % 2000) - 1000) / 1000.f;   // -1..1
-            float mag = powf(10.f, (float)((int)(i * 104729 % 7)) - 3.f); // 1e-3..1e3
-            ha[i] = u * mag;
+            const int sgn = ((int)(i % 2)) ? 1 : -1;
+            const float mag = powf(2.f, (float)((int)(i % 5) - 2));  // 0.25,0.5,1,2,4
+            ha[i] = sgn * mag;
         }
         CK(cudaMemcpy(mc.act, ha.data(), alen * 4, cudaMemcpyHostToDevice));
         size_t olen = (size_t)mc.n * mc.hidden;
