@@ -4514,7 +4514,10 @@ __global__ void pool_expand_batched_kernel(
 
 // 5. sparse attention: grid (B, h) — the v2 body per (seq, head) with the
 // per-seq k/v via tables + per-seq idx row (stride = frozen out_width).
-__global__ void sparse_attn_v2_batched_kernel(
+// __launch_bounds__(256,8): ncu showed the register limit capping this kernel
+// at 6 blocks/SM (No-Eligible 69.5%, long-scoreboard 43.5% = latency-bound).
+// Forcing 8 blocks/SM trades registers for the latency hiding it needs.
+__global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     const float* __restrict__ q,          // [B, h*d]
     const unsigned char* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches (e4m3)
     const unsigned char* const* __restrict__ v_tbl,      // [B] per-seq v caches (e4m3)
