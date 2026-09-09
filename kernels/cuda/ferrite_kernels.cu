@@ -5878,14 +5878,30 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
 
     float acc[4] = {0.f, 0.f, 0.f, 0.f};
     float sq = 0.f;
-    // unroll 4: 5 independent loads per iteration (x + 4 weight rows) — without
-    // the unroll the compiler serialized them and the loop stalled on the L2.
-    #pragma unroll 4
-    for (int i = lo + threadIdx.x; i < hi; i += blockDim.x) {
-        const float xv = x[i];                 // ONE x read serves 4 rows
-        sq += xv * xv;                         // Σx² rides free
-        #pragma unroll
-        for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
+    // FLOAT4 loads (2026-09-10, the gdn_chunk lesson: this kernel is
+    // L2-latency-bound — 5 scalar loads per iteration; float4 = 4x the bytes
+    // per load instruction, the same FMA count. The 4-element intra-vector
+    // sum is the 4/2-accumulator-split class (1e-7, text-verified).
+    {
+        const int lo4 = lo >> 2, hi4 = hi >> 2;
+        #pragma unroll 4
+        for (int i4 = lo4 + threadIdx.x; i4 < hi4; i4 += blockDim.x) {
+            const size_t off = (size_t)i4 << 2;
+            const float4 xv = *reinterpret_cast<const float4*>(x + off);
+            sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+            #pragma unroll
+            for (int mm = 0; mm < 4; mm++) {
+                const float4 wv = *reinterpret_cast<const float4*>(row0 + (size_t)mm * nh + off);
+                acc[mm] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+            }
+        }
+        // scalar tail (seg is 4-aligned on GLM; the guard is for generality)
+        for (int i = (hi4 << 2) + threadIdx.x; i < hi; i += blockDim.x) {
+            const float xv = x[i];
+            sq += xv * xv;
+            #pragma unroll
+            for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
+        }
     }
     __shared__ float red[8];
     #pragma unroll
