@@ -3,6 +3,31 @@
 Rust-native inference engine for **GLM-5.3-Flash** (hybrid GatedDeltaNet linear attention + DSA sparse attention + MoE), single-node TP over CUDA graphs.
 Read `README.md` for the design contract; this file is the operational guide: build/test loop, every runtime flag, demo configs, and the profiling workflow that actually works on this hardware.
 
+## ⛔ 硬性禁令（用户明令，违反=浪费用户时间，2026-09-09）
+
+1. **任何时候禁止 `git revert`**（含 `git reset` 回退已提交的改动）。
+   实测退化就把改动**改成默认关闭的开关**（env-gated）或修正它，**代码保留**。
+   构建坏了必须修好，不能靠回退。
+2. **文件同步必须用 rsync 完整同步**（`rsync -az --delete` 全量），
+   禁止"我改了本地但远端没同步"这种浪费时间的情况；push 前先确认两端一致。
+3. **严禁重跑已知正确的 baseline**。已经验证过的读数就是权威，
+   不要为了"确认"再跑一遍（包括"确认默认路径没回归"——默认路径按定义不回归）。
+4. **禁止无意义的验证跑测**。只有**新改动**才需要验证，且优先用隔离微基准（秒级）；
+   serve 端只在结论要落地时才跑一次。
+5. **禁止 MTP / 投机解码**（用户明令："严禁mtp…严禁投机"）。
+   目标固定为 **16 并发不开 MTP ≥1600 tok/s**。
+
+**测速纪律**：只看 `FERRITE_TIMING=1` 的 `[megab] replay 16 seqs: Nms` 中位数
+（16000/N = 聚合 tok/s），并确认日志里有 `live=16`；per-seq×16 与 total/wall 只作交叉验证。
+每次改动**必须人眼看生成的文本**（乱码=数值回归，token 计数看不出来）。
+
+**nsys 落盘纪律**：nsys 只在**目标进程退出时**写报告。HTTP serve 永不退出，所以：
+① 用 `POST /shutdown` 让服务优雅退出（接口已存在）；② 或用 `timeout -s INT` 包住 nsys。
+**不要**用 `--capture-range=cudaProfilerApi`（HTTP serve 下 cuProfilerStop 永不触发，会空等）。
+**不要**用 `--duration`（它从进程启动计时，会整段落在 80s 的权重加载上）。
+正确姿势：`nsys launch --session-new=X ...` → 等 health → `nsys start --session=X` →
+跑 bench → `nsys stop --session=X` → `/shutdown` → `nsys stats`。
+
 ## Repo layout (hot paths)
 
 ```
