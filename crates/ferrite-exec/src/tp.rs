@@ -898,13 +898,22 @@ impl<B: KernelBackend> TpCluster<B> {
         // (unmapped 2MB pages), progressively worse (b16 → b4 → b1 all dead).
         // Fail loudly here instead of silently deadlocking + wedging the node.
         if std::env::var_os("FERRITE_P2P").is_some() {
-            return Err(FerriteError::InvalidArg(
-                "FERRITE_P2P is FORBIDDEN on the batched decode path: the in-graph \
-                 P2P all-reduce deadlocks at n>8, and killing the deadlocked process \
-                 wedges the GPU driver (Xid 31 PDE faults on every later run). \
-                 Unset FERRITE_P2P when serving with --max-seqs > 1."
-                    .into(),
-            ));
+            if std::env::var_os("FERRITE_P2P_FORCE").is_some() {
+                eprintln!(
+                    "[p2p] ⚠️  FERRITE_P2P_FORCE=1: batched P2P all-reduce ENABLED — the in-graph \
+                     P2P AR is documented to deadlock at n>8 and a kill afterwards wedges the GPU \
+                     driver. Diagnostic use only."
+                );
+            } else {
+                return Err(FerriteError::InvalidArg(
+                    "FERRITE_P2P is FORBIDDEN on the batched decode path: the in-graph \
+                     P2P all-reduce deadlocks at n>8, and killing the deadlocked process \
+                     wedges the GPU driver (Xid 31 PDE faults on every later run). \
+                     Unset FERRITE_P2P when serving with --max-seqs > 1; set \
+                     FERRITE_P2P_FORCE=1 to override for diagnostics."
+                        .into(),
+                ));
+            }
         }
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
