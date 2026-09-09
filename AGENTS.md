@@ -841,3 +841,27 @@ kernel 内 cvt f32→f16（1 指令/2 值）。数值：0.05% vs e4m3 的 6%—�
 
 **结论不变**：1600 需要多front突破 + 微优化，研究级难度。W8A16 仍是值得实施的
 （数值安全 + 0.33ms），但优先级低于 AR v4（−1.5ms）。
+
+## 2026-09-10 终局：W8A16 MMA down — 数值安全但性能劣化（负结果，gate 保留）
+
+**实施**（83041a0 kernel + f25a939 wiring）：f16 tensor core down，in-kernel fp8→f16 权重转换
++ f32→f16 act 转换，m16n8k16，env-gated `FERRITE_DOWN_W8A16=1`。
+
+**实测（B=16 200-tok）**：replay **17.85ms vs 基线 13.28ms（差 4.57ms）**。
+**文本完全正确**（出师表逐字）、0 fault、无 opcheck 错误。
+
+**关键验证**：数值安全性假设**成立**——f32→f16 的 0.05% 误差确实不翻转模型行为
+（对比 e4m3 activation 的 6% 翻转、f16 累加的 0.8% 翻转）。
+
+**性能劣化根因**（三条叠加）：
+1. **in-kernel fp8→f16 smem 转换 pass**：每 slot 读 8KB fp8 + 写 16KB f16 smem
+   （9 slot/block）——我估算的 ~32ns/pass 严重低估（实际 smem 带宽 + 同步开销）
+2. **N=8 MMA 浪费**：16×8 tile 只用 1 列 → 张量核有效吞吐 12.5%
+3. **62KB smem → 2 block/SM**（launch_bounds(256,2)）→ 占用率远低于 SIMT 版
+
+**教训**：down kernel 的瓶颈**不是纯指令数**——smem 流量 + N=8 浪费 + 占用率主导。
+SIMT 的 2.5 指令/值实际比 MMA+转换开销更便宜（转换把 smem 流量翻 3 倍）。
+
+**处置**：`FERRITE_DOWN_W8A16=1` opt-in（默认 OFF，基线不受影响）。代码保留。
+**MoE down 优化路径彻底关闭**（W8A8 数值翻转 / W8A16 性能劣化 / bf16 2x 带宽 /
+f16 累加翻转——四条全部有实测证据）。
