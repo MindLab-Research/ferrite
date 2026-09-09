@@ -6276,7 +6276,7 @@ extern "C" cudaError_t ferrite_gemv_fp8_tri(
 // Weights are read as native e4m3 (1 byte) — half the bytes of the bf16 SIMT
 // gemv — and the MMA replaces ~2048 serial FMA per lane with tensor ops.
 template <int UNUSED_WPR>
-__global__ void __launch_bounds__(256, 3) gemv_fp8_mma_kernel(
+__global__ void __launch_bounds__(256, 3) gemv_fp8_mma_b16_kernel(
     const unsigned char* __restrict__ xq,   // [n<=16, in_f] e4m3
     const float* __restrict__ xs,           // [n] per-token scales
     const unsigned char* __restrict__ w,    // [out_f, in_f] e4m3
@@ -6367,13 +6367,13 @@ __global__ void __launch_bounds__(256, 3) gemv_fp8_mma_kernel(
     }
 }
 
-extern "C" cudaError_t ferrite_gemv_fp8_mma(
+extern "C" cudaError_t ferrite_gemv_fp8_mma_b16(
     const unsigned char* xq, const float* xs,
     const unsigned char* w, const float* ws,
     float* out, int n, int in_f, int out_f, int scols, cudaStream_t s) {
     if (n <= 0 || n > 16 || (out_f & 7) != 0 || in_f <= 0) return cudaErrorInvalidValue;
     dim3 grid((unsigned)((out_f + 7) / 8));
-    gemv_fp8_mma_kernel<0><<<grid, 256, 0, s>>>(xq, xs, w, ws, out, n, in_f, out_f, scols);
+    gemv_fp8_mma_b16_kernel<0><<<grid, 256, 0, s>>>(xq, xs, w, ws, out, n, in_f, out_f, scols);
     return cudaGetLastError();
 }
 
