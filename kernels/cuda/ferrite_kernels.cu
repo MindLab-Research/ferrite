@@ -4567,6 +4567,10 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     const int ngroups = blockDim.x / TG;
     const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);   // 8-lane groups (TG=8) — must match TG
     const int glane0 = (threadIdx.x & 31) & ~7;
+    // 2-way unroll: ncu showed long-scoreboard (global-load latency) as the
+    // top stall (43.5%) with only 0.48 eligible warps/scheduler. Unrolling
+    // lets the next slot's K loads issue while the current dot computes.
+    #pragma unroll 2
     for (int s = gid; s < live_k; s += ngroups) {
         int j = idxs[s];
         bool valid = (j >= 0 && j < t);
