@@ -2796,6 +2796,11 @@ fn mega_chain_dev(
         res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
     }
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
+    // INPUT KEEPALIVE (2026-09-09 ROOT CAUSE): see the batched chain's comment —
+    // the layer loop REASSIGNS res, dropping the graph's INPUT DevBuf back to
+    // the pool where the next same-class allocation aliases it. Keep the FIRST
+    // res alive for the graph's lifetime (leaked on purpose, like `arg`).
+    let mut input_kept = false;
     mprobe!("res0", &res, nh);
 
     let mut gdn_idx = 0usize; // verify scratch index (GDN layers only)
@@ -3054,7 +3059,16 @@ fn mega_chain_dev(
             t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
         }
         // E: hc_post2 → next layer's residual
-        res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+        let new_res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+        let old_res = std::mem::replace(&mut res, new_res);
+        if !input_kept {
+            // The graph's INPUT buffer (x_stage / the recorded input node) —
+            // must never return to the pool (see INPUT KEEPALIVE above).
+            std::mem::forget(old_res);
+            input_kept = true;
+        } else {
+            drop(old_res);
+        }
         if tm {
             let _ = cuda.sync();
             t_e += t_d.elapsed().as_secs_f64() * 1e3;
@@ -3228,6 +3242,15 @@ fn mega_chain_dev_batched(
     let mut res = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
     res.upload(in_vals)?; // recorded stage→dev memcpy (the graph input)
     let x_stage = res.stage; // GraphIO: replay writes fresh input here
+    // INPUT KEEPALIVE (2026-09-09 ROOT CAUSE of the B=16 replay faults): the
+    // layer loop REASSIGNS res at every layer's E step — the first reassignment
+    // DROPS this DevBuf, returning its (ptr, stage) to the pool. The graph
+    // recorded that (ptr, stage) as its input; the next same-class allocation
+    // then ALIASES the graph's input (at B=16 the input and the working
+    // hidden-states share a size class) → the replay's input node races a
+    // working kernel → the moving 2MB-aligned Xid-31 faults. Keep the FIRST
+    // res alive for the graph's lifetime (leaked on purpose, like `arg` below).
+    let mut input_kept = false;
 
     for (layer_idx, plan) in plans.iter().enumerate() {
         if std::env::var_os("FERRITE_TIMING").is_some() {
@@ -3432,7 +3455,16 @@ fn mega_chain_dev_batched(
             t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
         }
         // E: hc_post2 → next layer's residual
-        res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+        let new_res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
+        let old_res = std::mem::replace(&mut res, new_res);
+        if !input_kept {
+            // The graph's INPUT buffer (x_stage / the recorded input node) —
+            // must never return to the pool (see INPUT KEEPALIVE above).
+            std::mem::forget(old_res);
+            input_kept = true;
+        } else {
+            drop(old_res);
+        }
         if tm {
             let _ = cuda.sync();
             t_e += t_d.elapsed().as_secs_f64() * 1e3;
