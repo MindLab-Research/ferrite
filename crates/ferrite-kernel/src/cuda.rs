@@ -3275,10 +3275,20 @@ impl CudaBackend {
         ck(unsafe { cudaMallocHost(&mut ptot as *mut *mut i32 as *mut *mut std::ffi::c_void, 4) }, "dsa dummy pinned")?;
         unsafe {
             *pt0 = 0;
-            // total = MAXT (not 1): the indexer/pool kernels derive the
-            // number of pools from it; total=1 gave npools=1 and the padded
-            // rows' topk/pool loops spun (measured hang at size=16).
-            *ptot = MAXT as i32;
+            // total = 1 (2026-09-09, was MAXT=8192): the kernels derive their
+            // pool/slot counts from the pinned total — with 8192 every dummy
+            // row ran the indexer's SLOW path (select_k=512 < jmax=2048 → the
+            // full 2048-pool score+select), 1.56ms PER LAUNCH: nsys B=16
+            // window showed 968 instances × 1.56ms ALL clustered in the
+            // retire phase (~0.85ms/step average) — every seq retirement adds
+            // a dummy and every DSA layer's indexer then pays the full path.
+            // total=1 keeps every kernel in its trivial fast path (kpool 1
+            // pool, topk select_k>=jmax fast path, sparse_attn 1 slot). The
+            // historical "total=1 hung at size=16" was measured in the
+            // root-cause-#3/#4/#5 era (ntok/B, cache-format and xq-cache
+            // bugs) and is not reproducible with the fixed kernels — re-
+            // verified by the retire-phase text/stability test.
+            *ptot = 1;
         }
         let tup = (kn, vv, dks_, dvs_, ki_, kg, pt0 as *const i32, ptot as *const i32);
         m.insert(family, tup);
