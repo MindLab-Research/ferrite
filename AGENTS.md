@@ -939,3 +939,33 @@ head_dim=**128**、short_conv=4、kda_layers 44 个、full_attn_layers 11 个（
 **结论（最终）**：非结构优化空间已彻底枯竭——最近 6 项尝试全部中性或负结果。
 1600 @B=16 不开 MTP 需要**架构级突破**：AR 协议（NCCL 地板 2.58ms，P2P ×3 死锁）或
 MoE 访存模式（带宽+数值双地板 3.70ms）。会话交付 +121%（539→1194 tok/s）。
+
+## 2026-09-10 终局：下会话优先行动清单（按价值排序）
+
+**硬件事实（本次实测补充）**：每 GPU 8×NVLink × 53.125 GB/s = **425 GB/s**；
+`/dev/nvidia-nvswitch*` **不存在** → NVLS/SHARP 单步归约不可用。256KB AR 传输仅 0.6µs，
+**28.67µs 全是 NCCL ring 的 14 步（2×(8-1)）协议延迟 ≈ 2µs/步**。
+
+**① AR v4 counter-kernel（−1.5ms，唯一 >1ms 路径）**
+- 现状：P2P oneshot_v2 代码在 `ferrite_kernels.cu:6927`（`p2p_ar_down_v2_kernel`），
+  epoch 是**运行时读取**（`unsigned e = *epoch;`），注释声称 "each replay advances the
+  epoch exactly like a dry-run call"——但实测 capture 前死锁（日志停在 serving 行）。
+- 根因假设：rank 间 epoch 不同步的具体机制未定位（前 3 次尝试死锁模式各不相同：
+  v3 last-block 检测 / v1 未知 / v2 capture epoch）。
+- 新方案：图首节点放 counter-kernel（1 线程 atomicAdd），让 epoch 成为**图内推进**的
+  显式状态；AR 的 store/reduce 读 counter 选 staging parity。
+- 风险控制：**必须**用监护脚本（30s 日志停滞检测 + 精确 PID kill -9），单次测试；
+  P2P 在 batched n>8 有文档记载的死锁史。
+- 收益上限：AR 28.67µs → ~12µs = −1.5ms → 11.9ms = **1345 tok/s**（仍不达 1600）。
+
+**② hc 屏障联合重构（−1.0ms，高风险）**
+- rest345 12.67µs × 90，5-6 个 __syncthreads @ 21.7% 占用率。
+- NB>16 根因已定位（launcher `hpb_l=(h+15)/16` 硬编码 vs kernel `hpb=(h+NB-1)/NB`
+  → 列重叠 → p4_part 重复计数），但修复后占用率不变（总线程 s×h 固定）。
+
+**③ 如果 ①+② 全成仍只有 1468 tok/s** → 1600 需要**结构性突破**：
+- 自定义可进图的无状态 AR 协议（NVLS 硬件不可用，NCCL ring 是 14 步地板）
+- 或改变 MoE 权重分发模式（EP 路由偏斜 2.2x 已否决；DCP 305GB/rank > 180GB 已否决）
+
+**对标**：SGLang 不开 MTP 基座 ≈1300 tok/s（memory 记录）——**ferrite 当前 1194 已达其
+92%**。SGLang 的 3200 是**开 EAGLE/MTP** 的数字。
