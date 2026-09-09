@@ -723,3 +723,46 @@ tick pipelining（server gap 仅 0.12ms）。
 
 **下会话首要任务**：expert-major MoE 分组（完整计划在上方，预估 −0.5~1.0ms）→ 落地后
 ~12.4ms ≈ 1290 tok/s。之后需突破 AR 协议地板（2.58ms）或 MoE 带宽地板——研究级课题。
+
+## 2026-09-10 终局：Expert-Major MoE Phase 1 — 完整闭环负结果
+
+**实施**（3 阶段全部落地，5e36983）：排序 kernel（counting sort，144 元素，1 block）→
+act kernel 重映射（可选 sorted-table 参数，null = token-major 向后兼容）→ Rust 接线
+（sort tables 追加到 act 缓冲区尾部，免独立池分配）。
+
+**实测**：replay p50 = **13.47ms vs 基线 13.28ms（差 0.19ms）**。文本正确、0 fault。
+
+**根因**：排序 kernel 的每层启动开销（42 层 × ~3µs = 0.126ms）超过 L2 吸收收益。
+**核心发现：L2 在 token-major 路径下已经吸收了大部分重复 expert 读取**——
+"block 相隔 720 > 444 并发窗口"的分析过于悲观（CUDA 的 block 调度器不严格按
+线性序处理，L2 的 60MB 能同时容纳多个 expert 的权重）。
+
+**处置**：`FERRITE_MOE_EM=1` opt-in（默认 OFF）。Gate OFF 验证：13.44ms（±2% 噪声内
+= 基线恢复）。代码保留供 Phase 2 实验（fused sort-into-route epilogue 免独立启动）。
+
+**Expert-major 路径正式关闭**（Phase 2 需融合排序进 moe_route 的 epilogue 才有正收益，
+但 down kernel 侧的散射手写也需要解决——复杂度仍高）。
+
+## 会话最终状态（2026-09-10，perf-b1 HEAD=5e36983）
+
+**成果**：replay **29.01 → 13.28ms（+119%）**，server 吞吐 **539 → 1194 tok/s（+121%）**。
+10 项优化落地 + expert-major 完整闭环（负结果，gate 保留）。
+
+**全部路径状态**：
+| 路径 | 状态 | 结论 |
+|---|---|---|
+| 10 项 kernel/host 优化 | ✅ 落地 | fp8 down→GPU侧embedding |
+| Expert-major MoE | ❌ 负结果 | L2 已吸收重复；排序开销 > 收益 |
+| EP | ❌ 2.2x 慢 | 路由偏斜（热门 rank 4x 计算量） |
+| MMA down | ❌ 更慢 | 量化+归约开销 > tensor core 收益 |
+| P2P AR ×3 | ❌ 死锁 | capture 期 epoch desync |
+| NCCL 调优 ×4 | ❌ 更差 | LL128/Simple/Tree 全部比默认差 |
+| DCP | ❌ 内存不足 | 305GB MoE/rank > 180GB HBM |
+| MTP-batched | ❌ <3200 | 修正后 ~1400-1600 |
+| Tick pipelining | ❌ 无意义 | server gap 仅 0.12ms（client 侧 Python SSE） |
+| fast_math | ❌ 中性 | denormals 非瓶颈 |
+
+**通往 1600 的最终判定**：当前 13.28ms，需砍 3.28ms。AR（2.58ms）和 MoE（3.70ms）
+都在各自的地板（协议/带宽）。其余 7ms 中可再挤 ~0.5-1.0ms（hc 屏障、gdn、投影微优化）。
+**即使全部落地：~12.3ms ≈ 1300 tok/s。1600 需要突破 AR 或 MoE 的结构性地板——
+这需要研究级创新（自定义可进图的 AR 协议、或改变 MoE 的权重分发模式），不是增量优化能到达的。**
