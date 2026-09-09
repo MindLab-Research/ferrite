@@ -41,6 +41,7 @@ extern "C" {
     ) -> i32;
     fn cudaStreamCreate(stream: *mut CuStream) -> i32;
     fn cudaStreamSynchronize(stream: CuStream) -> i32;
+    fn cudaDeviceSynchronize() -> i32;
     fn cudaGetErrorString(err: i32) -> *const std::os::raw::c_char;
 
     // cuBLAS (batched decode m=16 GEMM: bandwidth-bound, needs the split-K
@@ -4009,8 +4010,20 @@ impl CudaBackend {
         // last decode's async kernels): sync before freeing. Best-effort —
         // a wedged stream (a failed capture can leave capture mode ON,
         // err 900 on every op) must not block the frees below.
-        if let Err(e) = self.sync() {
-            eprintln!("[cluster] free_seq {seq}: pre-free sync failed ({e}) — freeing anyway");
+        //
+        // ROOT-CAUSE FIX (2026-09-09): a STREAM-only sync is not enough — the
+        // engine's NCCL all-reduce runs on NCCL-internal streams and the
+        // retire is issued from the HTTP driver thread while the engine
+        // thread may still be enqueueing. Measured: `bench_scb.py 16 200`
+        // (its warmup request retires first) faulted on the NEXT batched
+        // step's first dry-run with a 2MB-aligned Xid 31 PDE fault (a freed
+        // DSA cache base), while the same bench WITHOUT the warmup ran clean
+        // (3039 tok, 0 faults). A device-wide sync closes that window.
+        if let Err(e) = unsafe { cudaDeviceSynchronize() } {
+            eprintln!("[cluster] free_seq {seq}: pre-free device sync failed ({e}) — retrying stream sync");
+            if let Err(e) = self.sync() {
+                eprintln!("[cluster] free_seq {seq}: pre-free stream sync failed ({e}) — freeing anyway");
+            }
         }
         // 1. This seq's mega graphs (exact names — mega{seq}, mega_v{seq}):
         //    destroy the exec; drop the GraphIO MAP entries (the pins leak —
