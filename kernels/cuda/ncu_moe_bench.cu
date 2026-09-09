@@ -210,7 +210,14 @@ int main(int argc, char** argv) {
     float* h_sc_down = (float*)malloc(dsc_per);
     if (!h_w8_gate || !h_w8_up || !h_w8_down) { fprintf(stderr, "host alloc\n"); return 1; }
     rand_fp8(h_w8_gate, w8_per); rand_fp8(h_w8_up, w8_per); rand_fp8(h_w8_down, dw8_per);
-    for (size_t i = 0; i < sc_per / 4; i++) { h_sc_gate[i] = 0.001f; h_sc_up[i] = 0.001f; h_sc_down[i] = 0.001f; }
+    // RANDOM per-block scales (was a uniform 0.001): with all-equal scales any
+    // scale-index bug is invisible — the serve (real per-block scales) failed
+    // even at n=2 while this bench passed. Randomising exposes it.
+    for (size_t i = 0; i < sc_per / 4; i++) {
+        h_sc_gate[i] = 0.0005f + 0.0001f * (float)(i % 7);
+        h_sc_up[i]   = 0.0005f + 0.0001f * (float)((i * 3) % 5);
+        h_sc_down[i] = 0.0005f + 0.0001f * (float)((i * 5) % 9);
+    }
 
     // device per-expert allocations
     unsigned char** h_gate_ptrs = (unsigned char**)malloc(E * sizeof(void*));
