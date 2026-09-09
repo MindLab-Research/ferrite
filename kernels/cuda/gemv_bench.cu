@@ -122,6 +122,71 @@ static float bench(int in_f, int out_f, int n, int iters, float tol) {
     return ms;
 }
 
+
+// ---- 2-stream overlap probe -------------------------------------------
+// The decode chain is ONE stream: independent gemvs (q_a and kv_a both read
+// the same normed x) run back-to-back. Both are latency-bound with 23%
+// occupancy, so co-scheduling them should cost ~max(t1,t2), not t1+t2.
+// This measures exactly that before touching the graph capture.
+static void overlap_probe(int iters) {
+    const int in_f = 4096, o1 = 1536, o2 = 512, n = 16;
+    int srows1 = (o1 + 127) / 128, scols = (in_f + 127) / 128;
+    int srows2 = (o2 + 127) / 128;
+    float *x, *o1d, *o2d, *b1, *b2, *sc1, *sc2;
+    unsigned char *w1, *w2;
+    cudaMalloc(&x, (size_t)n * in_f * 4);
+    cudaMalloc(&w1, (size_t)o1 * in_f); cudaMalloc(&w2, (size_t)o2 * in_f);
+    cudaMalloc(&sc1, (size_t)srows1 * scols * 4); cudaMalloc(&sc2, (size_t)srows2 * scols * 4);
+    cudaMalloc(&b1, (size_t)o1 * 4); cudaMalloc(&b2, (size_t)o2 * 4);
+    cudaMalloc(&o1d, (size_t)n * o1 * 4); cudaMalloc(&o2d, (size_t)n * o2 * 4);
+    cudaMemset(x, 0, (size_t)n * in_f * 4);
+    cudaMemset(w1, 1, (size_t)o1 * in_f); cudaMemset(w2, 1, (size_t)o2 * in_f);
+    cudaMemset(sc1, 0, (size_t)srows1 * scols * 4); cudaMemset(sc2, 0, (size_t)srows2 * scols * 4);
+    cudaMemset(b1, 0, (size_t)o1 * 4); cudaMemset(b2, 0, (size_t)o2 * 4);
+
+    cudaStream_t sA, sB;
+    cudaStreamCreate(&sA); cudaStreamCreate(&sB);
+    cudaEvent_t a, b, mid;
+    cudaEventCreate(&a); cudaEventCreate(&b); cudaEventCreate(&mid);
+
+    // sequential (same stream)
+    for (int i = 0; i < 20; i++) {
+        ferrite_gemv_fp8_v2(x, w1, sc1, b1, o1d, in_f, o1, n, srows1, scols, 0);
+        ferrite_gemv_fp8_v2(x, w2, sc2, b2, o2d, in_f, o2, n, srows2, scols, 0);
+    }
+    cudaDeviceSynchronize();
+    cudaEventRecord(a);
+    for (int i = 0; i < iters; i++) {
+        ferrite_gemv_fp8_v2(x, w1, sc1, b1, o1d, in_f, o1, n, srows1, scols, 0);
+        ferrite_gemv_fp8_v2(x, w2, sc2, b2, o2d, in_f, o2, n, srows2, scols, 0);
+    }
+    cudaEventRecord(b); cudaEventSynchronize(b);
+    float seq = 0.f; cudaEventElapsedTime(&seq, a, b); seq /= iters;
+
+    // overlapped (two streams; event join before stopping)
+    for (int i = 0; i < 20; i++) {
+        ferrite_gemv_fp8_v2(x, w1, sc1, b1, o1d, in_f, o1, n, srows1, scols, sA);
+        ferrite_gemv_fp8_v2(x, w2, sc2, b2, o2d, in_f, o2, n, srows2, scols, sB);
+    }
+    cudaStreamSynchronize(sA); cudaStreamSynchronize(sB);
+    cudaEventRecord(a, sA);
+    for (int i = 0; i < iters; i++) {
+        ferrite_gemv_fp8_v2(x, w1, sc1, b1, o1d, in_f, o1, n, srows1, scols, sA);
+        ferrite_gemv_fp8_v2(x, w2, sc2, b2, o2d, in_f, o2, n, srows2, scols, sB);
+    }
+    cudaEventRecord(mid, sA); cudaStreamWaitEvent(sB, mid, 0);
+    cudaEventRecord(b, sB); cudaEventSynchronize(b);
+    float ovl = 0.f; cudaEventElapsedTime(&ovl, a, b); ovl /= iters;
+
+    printf("\n2-stream overlap probe (q_a 1536 + kv_a 512, both from the same x):\n");
+    printf("  sequential (1 stream): %.3f ms/pair\n", seq);
+    printf("  overlapped (2 streams): %.3f ms/pair  (%.0f%% of sequential)\n",
+           ovl, 100.f * ovl / seq);
+    cudaFree(x); cudaFree(w1); cudaFree(w2); cudaFree(sc1); cudaFree(sc2);
+    cudaFree(b1); cudaFree(b2); cudaFree(o1d); cudaFree(o2d);
+    cudaStreamDestroy(sA); cudaStreamDestroy(sB);
+}
+
 int main(int argc, char** argv) {
     int iters = (argc > 1) ? atoi(argv[1]) : 200;
     int dev = 0;
@@ -137,6 +202,7 @@ int main(int argc, char** argv) {
     bench(1536, 64, 16, iters, tol);       // q_b
     bench(4096, 19360, 16, iters, tol);    // lm_head (TP8 shard)
     bench(4096, 1536, 1, iters, tol);      // n=1 sanity
+    overlap_probe(iters);
     printf("done\n");
     return 0;
 }
