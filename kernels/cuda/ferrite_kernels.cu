@@ -879,17 +879,32 @@ __global__ void gdn_chunk_batched_kernel(
     for (int j = threadIdx.x; j < dv; j += blockDim.x)
         vh[j] = v[(size_t)base * dv + j];
     float* Sg = state_ptrs[seq] + (size_t)hd * dk * dv;
-    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
-    __syncthreads();
-    // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-        float decay = expf(gh[i]);
-        if (decay != 1.0f) {
-            float* Si = S + (size_t)i * spitch;
-            for (int j = 0; j < dv; j++) Si[j] *= decay;
+    // state load — FLOAT4 global reads (2026-09-10: the old scalar loop ran
+    // the whole kernel at 0.63TB/s — memory-LATENCY-bound, 65K threads × 4B
+    // in flight; 16B reads = 4x the bytes in flight). The smem side stays
+    // scalar (the spitch=129 padding keeps the column dots conflict-free and
+    // must not be 16B-aligned).
+    {
+        const int n4 = (dk * dv) >> 2;
+        for (int idx4 = threadIdx.x; idx4 < n4; idx4 += blockDim.x) {
+            const int flat = idx4 << 2;
+            const int i = flat / dv, j = flat % dv;  // dv%4==0 → the 4 stay in row i
+            const float4 g = *reinterpret_cast<const float4*>(Sg + flat);
+            float* Srow = S + (size_t)i * spitch + j;
+            Srow[0] = g.x; Srow[1] = g.y; Srow[2] = g.z; Srow[3] = g.w;
         }
+        for (int idx = (n4 << 2) + threadIdx.x; idx < dk * dv; idx += blockDim.x)
+            S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
     }
+    __syncthreads();
+    // 1. per-channel decay: S[i,:] *= exp(gate[h,i]) — IDX-PARALLEL over
+    // dk*dv (the old form used only dk threads each running a SERIAL dv
+    // loop — 3/4 of the block idle; elementwise, no reassociation). The
+    // decays are precomputed in place into gh (dk threads, once).
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) gh[i] = expf(gh[i]);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] *= gh[idx / dv];
     __syncthreads();
     // 2. kS = S^T k
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
@@ -932,9 +947,19 @@ __global__ void gdn_chunk_batched_kernel(
         out[(size_t)base * dv + j] = acc;
     }
     __syncthreads();
-    // 5. store state back
-    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
-        Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+    // 5. store state back — FLOAT4 global writes (see the load comment)
+    {
+        const int n4 = (dk * dv) >> 2;
+        for (int idx4 = threadIdx.x; idx4 < n4; idx4 += blockDim.x) {
+            const int flat = idx4 << 2;
+            const int i = flat / dv, j = flat % dv;
+            const float* Srow = S + (size_t)i * spitch + j;
+            const float4 g = make_float4(Srow[0], Srow[1], Srow[2], Srow[3]);
+            *reinterpret_cast<float4*>(Sg + flat) = g;
+        }
+        for (int idx = (n4 << 2) + threadIdx.x; idx < dk * dv; idx += blockDim.x)
+            Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
+    }
 }
 
 extern "C" cudaError_t ferrite_gdn_chunk_batched(const float* q, const float* k,
