@@ -3767,7 +3767,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
     // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
     // share of the step. Output is garbage by construction; timing only.
-    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr;
+    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr || getenv("FERRITE_SKIP_DOWN") != nullptr;
     if (moe_skip_) return cudaSuccess;
 
     if (n == 1) {
@@ -4063,7 +4063,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
 {
     // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
     // share of the step. Output is garbage by construction; timing only.
-    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr;
+    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr || getenv("FERRITE_SKIP_ACT") != nullptr;
     if (moe_skip_) return cudaSuccess;
 
     int max_rows = inter > inter_shared ? inter : inter_shared;
