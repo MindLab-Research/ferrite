@@ -90,6 +90,10 @@ extern "C" {
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
+    fn ferrite_gemv_fp8_mma_b16(xq: *const u8, xs: *const f32, w: *const u8,
+                                  ws: *const f32, out: *mut f32,
+                                  n: i32, in_f: i32, out_f: i32, scols: i32,
+                                  s: CuStream) -> i32;
     fn ferrite_gemv_fp8_v2(x: *const f32, w: *const std::ffi::c_void,
                            scale: *const f32, bias: *const f32, out: *mut f32,
                            in_f: i32, out_f: i32, nrows: i32,
@@ -696,6 +700,11 @@ pub struct CudaBackend {
     /// registration (same-name golden/fp8 shard pairing), zero call-site
     /// churn in the exec layer.
     fp8_map: std::sync::Mutex<std::collections::HashMap<(usize, usize), Fp8Dev>>,
+    /// in_f -> (xq e4m3 buffer for n<=16, xs[n] scales, last x ptr, valid).
+    /// The MMA gemv needs the x pre-quantized; ONE quant per layer serves all
+    /// same-x gemvs. Buffers are never freed (a captured graph holds the
+    /// addresses) and a capture never allocates.
+    xq_cache: std::sync::Mutex<std::collections::HashMap<i32, (DevBuf, DevBuf, usize, bool)>>,
     /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
     /// scale) device tables for the fused MoE kernels.
     moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
@@ -816,6 +825,7 @@ impl CudaBackend {
             dsa_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
+            xq_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_fp8_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             gdn_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_tbl_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1830,7 +1840,58 @@ impl CudaBackend {
         Ok(do_)
     }
 
+    /// Invalidate the per-x quant cache at a layer boundary (x is rewritten
+    /// every layer). Buffers are kept (captured graphs hold the addresses).
+    pub fn clear_xq_cache(&self) {
+        let mut c = self.xq_cache.lock().unwrap();
+        for v in c.values_mut() {
+            v.3 = false;
+        }
+    }
+
+    /// fp32 x -> e4m3 once per (x, in_f); reused by every same-x gemv of the
+    /// layer. None => would need to allocate inside a graph capture (illegal).
+    fn xq_cached(&self, x_dev: &DevBuf, n: i32, in_f: i32) -> Result<Option<(*const u8, *const f32)>> {
+        let xp = x_dev.as_const_f32() as usize;
+        let rp;
+        {
+            let mut c = self.xq_cache.lock().unwrap();
+            match c.get_mut(&in_f) {
+                Some((q, sc, px, valid)) if *valid && *px == xp => {
+                    return Ok(Some((q.as_f32() as *const u8, sc.as_const_f32())));
+                }
+                Some((q, sc, px, valid)) => {
+                    *px = xp;
+                    *valid = true;
+                    rp = (q.as_f32() as *const u8, sc.as_const_f32());
+                }
+                None => {
+                    if is_capturing() {
+                        return Ok(None);
+                    }
+                    let q = DevBuf::alloc(self.dev, self.stream, (16usize * in_f as usize) / 4 + 1)?;
+                    let sc = DevBuf::alloc(self.dev, self.stream, 16usize)?;
+                    rp = (q.as_f32() as *const u8, sc.as_const_f32());
+                    c.insert(in_f, (q, sc, xp, true));
+                }
+            }
+        }
+        ck(unsafe {
+            ferrite_quant_e4m3_tokens(x_dev.as_const_f32(), rp.0 as *mut u8,
+                                      rp.1 as *mut f32, n, in_f, self.stream)
+        }, "quant_e4m3_tokens")?;
+        Ok(Some(rp))
+    }
+
     pub fn matmul_dev(&self, x_dev: &DevBuf, w: &Tensor, n: i32, in_f: i32, out_f: i32) -> Result<DevBuf> {
+        // Pre-allocate the n<=16 MMA quant buffer OUTSIDE graph capture (the
+        // prefill touches every in_f); the capture then only records the quant
+        // kernel, never a cudaMalloc (err 900 otherwise).
+        if !is_capturing() && !self.xq_cache.lock().unwrap().contains_key(&in_f) {
+            let q = DevBuf::alloc(self.dev, self.stream, (16usize * in_f as usize) / 4 + 1)?;
+            let sc = DevBuf::alloc(self.dev, self.stream, 16usize)?;
+            self.xq_cache.lock().unwrap().insert(in_f, (q, sc, 0, false));
+        }
         // fp8 single-store guard: a placeholder Tensor (data.len() < numel)
         // with NO fp8 registration must fail loudly — its bf16 upload would
         // read 4 elements as the full weight (garbage), and the fp8 map is
@@ -1881,6 +1942,22 @@ impl CudaBackend {
                     return Ok(do_);
                 }
                 // cudaErrorNotSupported (unaligned): fall through to W8A16
+            }
+            // CUTLASS-style fp8 tensor-core MMA (micro-bench: q_a 31->6us,
+            // lm_head 353->41us, bit-identical to the fp64 reference).
+            if n >= 2 && n <= 16 && (out_f & 7) == 0 && (in_f & 63) == 0
+                && f8.scols == (in_f + 127) / 128
+                && std::env::var("FERRITE_GEMV_MMA").map(|v| v != "0").unwrap_or(true) {
+                if let Ok(Some((xq, xs))) = self.xq_cached(x_dev, n, in_f) {
+                    let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
+                    let r = unsafe {
+                        ferrite_gemv_fp8_mma_b16(xq, xs, f8.w as *const u8, f8.scale as *const f32,
+                                                 do_.as_f32(), n, in_f, out_f, f8.scols, self.stream)
+                    };
+                    if r == 0 {
+                        return Ok(do_);
+                    }
+                }
             }
             let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
             ck(unsafe {
@@ -2499,6 +2576,7 @@ impl crate::KernelBackend for CudaBackend {
     }
 
     fn expert_ffn(&self, x: &Tensor, gate_w: &Tensor, up_w: &Tensor, down_w: &Tensor, swiglu_limit: f32, out: &mut Tensor) -> Result<()> {
+        self.clear_xq_cache();
         self.enter();
         // Fused device-resident chain: upload x once, two matmuls + swiglu2
         // + down matmul all on device, single D2H at the end. (The old path
@@ -3059,6 +3137,7 @@ impl CudaBackend {
         conv_size: usize,
         state_override: Option<(*mut f32, *mut f32, *mut f32, *mut f32)>, // (conv, gdn, conv_snaps_base, gdn_snaps_base) N-UNIFIED verify scratch: B = full state, snaps = the [n-1] contiguous t-snapshots (snap i = A + t_0..t_i, accept-(i+1)'s commit source)
     ) -> Result<DevBuf> {
+        self.clear_xq_cache();
         self.enter();
         let proj = h * dk;
         let ni = n as i32;
@@ -3324,6 +3403,7 @@ impl CudaBackend {
         n: usize,
         hidden: usize,
     ) -> Result<DevBuf> {
+        self.clear_xq_cache();
         self.enter();
         let ni = n as i32;
         let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
