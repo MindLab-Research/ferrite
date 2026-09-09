@@ -4689,7 +4689,7 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     const float* __restrict__ idx,         // [B, topk_slots]
     float* __restrict__ out,              // [B, h*dv]
     int B, const int* const* __restrict__ total_tbl, // [B] pinned
-    int h, int d, int dv, int topk, int nodedup) {
+    int h, int d, int dv, int topk, int nodedup, int qk_mma) {
     int seq = blockIdx.x;
     int hd = blockIdx.y;
     int t = *total_tbl[seq]; // per-seq zero-copy pinned read
@@ -4731,6 +4731,10 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);   // 8-lane groups (TG=8) — must match TG
     const int glane0 = (threadIdx.x & 31) & ~7;
     // ---- QK^T on the tensor core (16 slots per MMA tile) ----
+    // DISABLED BY DEFAULT (FERRITE_ATTN_QK_MMA=1 to try): measured 22.6 ms/step
+    // vs 13.7 with the SIMT path — the full-d gather + per-tile sync + the 8x
+    // N-replica waste cost far more than the MMA saves here.
+    if (qk_mma) {
     // ncu: this kernel is latency-bound (No-Eligible 69.5%, long-scoreboard
     // 43.5%, Compute 24.7%). Each slot's 256-dim dot was 32 serial FMAs per
     // lane; the fp8 m16n8k32 does 16 slots x 32 K per instruction.
@@ -4799,8 +4803,9 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
             __syncthreads();
         }
     }
-    // (the old per-slot dot loop is replaced above)
-    for (int s = 0; s < 0; s += ngroups) {
+    }  // end if (qk_mma)
+    // the SIMT per-slot dot path (default; skipped when the MMA ran)
+    for (int s = (qk_mma ? live_k : gid); s < live_k; s += ngroups) {
         int j = idxs[s];
         bool valid = (j >= 0 && j < t);
         int dup = 0;
@@ -5023,6 +5028,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     static const bool attn_skip_ = getenv("FERRITE_ATTN_SKIP") != nullptr;
     if (attn_skip_) return cudaSuccess;
     static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
+    static const int qk_mma_ = getenv("FERRITE_ATTN_QK_MMA") ? 1 : 0;
 
     dim3 block(256);
     dim3 grid(B, h);
@@ -5036,7 +5042,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     sparse_attn_v2_batched_kernel<<<grid, block, smem, s>>>(
         q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
         ksc_tbl, vsc_tbl,
-        idx, out, B, total_tbl, h, d, dv, topk, nodedup_);
+        idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_);
     return cudaGetLastError();
 }
 
