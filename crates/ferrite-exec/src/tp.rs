@@ -3348,15 +3348,18 @@ fn mega_chain_dev_batched(
         None
     };
     // PRE-WARM (2026-09-10, TP<8 capture fix): FERRITE_POOL_MISS=1 showed the
-    // batched capture pass misses the NON-batch pool's class-16384 (one per
-    // rank, at L2) when TP=4 — a cudaMalloc inside the capture = err 900.
-    // Warm that size class here (outside the capture, non-batch flag set).
+    // batched capture pass allocates class-16384 (one per rank, at L2) and
+    // class-262144 (len 245760) that the dry-run did NOT — a pool miss inside
+    // the capture = err 900 (the TP=4/B=8 two-group path was unusable). Warm
+    // BOTH in the CURRENT pool context (batch=true inside the decode guard)
+    // before graph_capture_begin so the in-capture allocs hit.
     if capture {
-        ferrite_kernel::cuda::set_batch_decode(false);
         if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 16384) {
             drop(b);
         }
-        ferrite_kernel::cuda::set_batch_decode(true);
+        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 245760) {
+            drop(b);
+        }
     }
     if capture {
         cuda.graph_capture_begin();
