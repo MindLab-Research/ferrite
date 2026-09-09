@@ -24,6 +24,7 @@ pub type CuStream = *mut std::ffi::c_void;
 extern "C" {
     // cudart (linked into libferrite_kernels.so's dependency closure)
     fn cudaSetDevice(dev: i32) -> i32;
+    fn cudaGetDevice(dev: *mut i32) -> i32;
     fn cudaProfilerStart() -> i32;
     fn cudaProfilerStop() -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
@@ -486,6 +487,19 @@ impl DevBuf {
     /// class when available, else cudaMalloc + cudaMallocHost. The caller
     /// must have `enter()`ed the backend's device.
     pub fn alloc(dev: i32, stream: CuStream, len: usize) -> Result<Self> {
+        // DEFENSIVE (2026-09-09): cudaSetDevice is THREAD-LOCAL. A worker or
+        // engine thread whose binding differs from `dev` would allocate on the
+        // WRONG device — the resulting cross-device pointer is still a "valid"
+        // address for memcheck but is unmapped on `dev`, so kernels fault on it
+        // (2MB-aligned Xid 31 PDE faults). Re-bind before allocating.
+        let mut cur: i32 = -1;
+        unsafe { cudaGetDevice(&mut cur) };
+        if cur != dev {
+            if std::env::var_os("FERRITE_DEV_MISMATCH").is_some() {
+                eprintln!("[dev-mismatch] DevBuf::alloc(dev={dev}) from a thread bound to {cur} — re-binding");
+            }
+            unsafe { cudaSetDevice(dev) };
+        }
         let class = (len.max(1) as u32).next_power_of_two();
         if let Some((ptr, stage)) = buf_pool_take(dev, class) {
             return Ok(DevBuf { ptr, len, class, dev, stream, stage });
