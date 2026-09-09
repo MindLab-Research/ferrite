@@ -3991,7 +3991,19 @@ impl CudaBackend {
                     tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
                     tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
                     tbl.t0p as *const *const i32,
-                    ni, h as i32, dk as i32, dv as i32, idm as i32, ni, self.stream,
+                    // NTOK MUST BE 1 (ROOT CAUSE #3 of the B=16 crashes,
+                    // 2026-09-09): the kernel grid is (B, ntok) and it reads
+                    // `kvb + (seq + tok) * row` — the batched kvb is [B, row]
+                    // with ONE decode token per seq, so any ntok > 1 reads
+                    // rows seq+tok >= B (up to 3.75MB past the buffer at B=16
+                    // → the probabilistic 2MB-aligned Xid-31 faults; at B<=8
+                    // the overshoot stayed inside pool slack and went
+                    // unnoticed) and scribbles garbage cache slots beyond
+                    // total (never read, so outputs were bit-identical).
+                    // The single-seq path passes ni legitimately there
+                    // (kvb = [n tokens of ONE seq]); this batched layout must
+                    // not copy that.
+                    ni, h as i32, dk as i32, dv as i32, idm as i32, 1, self.stream,
                 )
             },
             "dsa_append_batched",
