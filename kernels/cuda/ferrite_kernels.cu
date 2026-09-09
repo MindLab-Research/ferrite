@@ -3764,14 +3764,20 @@ __global__ void quant_e4m3_tokens_kernel(
     unsigned char* __restrict__ xq,      // [n, hidden] e4m3
     float* __restrict__ xs,              // [n] scale = absmax/448
     int n, int hidden) {
+    // 1024 threads + float4 loads/stores (was 256 threads / scalar): the
+    // per-step cost is ~200 calls (one per distinct (x, in_f) per layer), so
+    // this kernel's latency is directly on the MMA gemv's critical path.
     int tok = blockIdx.x;
     if (tok >= n) return;
-    const float* xt = x + (size_t)tok * hidden;
-    unsigned char* qt = xq + (size_t)tok * hidden;
-    __shared__ float sred[8];
+    const float4* x4 = (const float4*)(x + (size_t)tok * hidden);
+    const int n4 = hidden >> 2;
+    __shared__ float sred[32];
     float amax = 1e-9f;
-    for (int k = threadIdx.x; k < hidden; k += 256)
-        amax = fmaxf(amax, fabsf(xt[k]));
+    for (int k = threadIdx.x; k < n4; k += blockDim.x) {
+        const float4 v = x4[k];
+        amax = fmaxf(amax, fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)),
+                                 fmaxf(fabsf(v.z), fabsf(v.w))));
+    }
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
         amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, off));
@@ -3779,15 +3785,20 @@ __global__ void quant_e4m3_tokens_kernel(
     __syncthreads();
     if (threadIdx.x == 0) {
         float m = sred[0];
-        #pragma unroll
-        for (int w = 1; w < 8; w++) m = fmaxf(m, sred[w]);
+        for (int w = 1; w < (blockDim.x >> 5); w++) m = fmaxf(m, sred[w]);
         xs[tok] = m / 448.0f;
     }
     __syncthreads();
     const float inv = 1.0f / xs[tok];
-    for (int k = threadIdx.x; k < hidden; k += 256) {
-        const float q = fminf(fmaxf(xt[k] * inv, -448.0f), 448.0f);
-        qt[k] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+    unsigned char* qt = xq + (size_t)tok * hidden;
+    for (int k = threadIdx.x; k < n4; k += blockDim.x) {
+        const float4 v = x4[k];
+        uchar4 o;
+        o.x = (unsigned char)__nv_cvt_float_to_fp8(fminf(fmaxf(v.x * inv, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3);
+        o.y = (unsigned char)__nv_cvt_float_to_fp8(fminf(fmaxf(v.y * inv, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3);
+        o.z = (unsigned char)__nv_cvt_float_to_fp8(fminf(fmaxf(v.z * inv, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3);
+        o.w = (unsigned char)__nv_cvt_float_to_fp8(fminf(fmaxf(v.w * inv, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3);
+        *(uchar4*)(qt + k * 4) = o;
     }
 }
 
@@ -3795,7 +3806,7 @@ extern "C" cudaError_t ferrite_quant_e4m3_tokens(
     const float* x, unsigned char* xq, float* xs,
     int n, int hidden, cudaStream_t s) {
     if (n <= 0) return cudaSuccess;
-    quant_e4m3_tokens_kernel<<<n, 256, 0, s>>>(x, xq, xs, n, hidden);
+    quant_e4m3_tokens_kernel<<<n, 1024, 0, s>>>(x, xq, xs, n, hidden);
     return cudaGetLastError();
 }
 
