@@ -871,3 +871,23 @@ AGENTS.md 里的示例之所以正常，是因为它是 `--max-tokens 20` 的**�
 
 合计 ≈ 15.0 ms/步 ✓（与 `[megab] replay` 中位一致）。**gemv 已从 4.1ms 降到 1.3ms**（MMA），
 **量化从关键路径消失**。两大新战场：MoE 4.0ms（per-token 专家散射挡住 MMA）、DSA 3.3ms。
+
+### MoE down 的 tensor-core 版（WIP，默认关闭）
+
+`moe_down_mma_kernel`（`ferrite_moe_down_mma`，env `FERRITE_MOE_DOWN_MMA=1` 才启用）：
+block=(16 hidden 行, 1 token)，A=down 权重 fp8（ldmatrix.x4，per-128 scale），B=act 在暂存里量化到
+e4m3（per-warp 32-K absmax），8 个 K-tile 各自累加到独立 fp32 acc 后按 (wscale·ascale·p) 折叠。
+
+**微基准结论（`/tmp/moe_bench 20 15 256 256`，真实形状 I=256/IS=256/n=15）**：
+`tok0: ref=7.348 1.727 -1.411 -0.4795 | mma=7.365 1.696 -1.282 -0.694` —— **token 0/1 吻合到 0.3%**，
+说明 A/B 片段与 C 片段（行=lane/4 与 lane/4+8、列=(lane%4)*2，仅列 0 有效）映射正确；
+但 `maxrel=inf, bad=60207/61440`（98%）—— 后续 token 仍有系统性偏差，**serve 端表现为输出全 `!`**。
+
+**踩过的坑（勿重复）**：
+1. 微基准的随机权重用 `rand() % 254` 会生成 **0x7f = e4m3 的 NaN 编码**，把参考值本身污染成 NaN —— 必须 `% 127`。
+2. 微基准的 `IS` 必须和 kernel 假设一致（kernel 按 `inter` 处理共享专家）；`IS=512` 而 `inter=256` 时
+   共享专家的 K 只算了一半，bad 率虚高。
+3. 微基准的 `ids/probs` 必须按 `[n, topk]` 分配，否则 n>1 读到越界专家 id。
+
+**下一步**：定位后续 token 的偏差（怀疑 shared 槽的 `arow`/`klen` 或 slot 循环里 acc 的复用），
+修好后必须人眼验证《出师表》文本再启用。
