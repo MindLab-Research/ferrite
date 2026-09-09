@@ -4995,16 +4995,11 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     // 16-byte coalesced loads, then an smem reduction over the groups.
     {
         const int cols = dv >> 4;               // e4m3x16 columns (256/16 = 16)
-        // G is FIXED at the 256-thread value: the slot->group assignment (and
-        // hence the FP accumulation order) must not depend on BLK. A BLK-sized
-        // G reassociated this reduction and flipped the model into a
-        // repetition loop (2026-09-09).
-        const int G = 256 / cols;               // slot groups (16 at dv=256)
+        const int G = (blockDim.x + cols - 1) / cols;   // ORIGINAL PV structure
         const int g = threadIdx.x / cols;
         const int c = threadIdx.x % cols;
-        const bool pv_on = (c < cols && g < G);
-        __shared__ float4 pred[4 * 64];         // static (4KB): G*cols == 256 always
-        if (pv_on) {
+        __shared__ float4 pred[4 * 64];         // static (4KB), G<=4, cols<=64
+        if (c < cols && g < G) {
             float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
             // unroll 4: one independent float4 load per iteration, previously
             // serialized by the compiler (no unroll -> ~300-cycle L2 latency
@@ -5045,9 +5040,8 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                 }
             }
             pred[g * cols + c] = a;
-        }
-        __syncthreads();   // unconditional: pv_on diverges when BLK > 256
-        if (pv_on && g == 0) {
+            __syncthreads();
+            if (g == 0) {
                 float4 tot = pred[c];
                 for (int gg = 1; gg < G; gg++) {
                     const float4 t2 = pred[gg * cols + c];
@@ -5055,6 +5049,7 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                 }
                 *reinterpret_cast<float4*>(out_s + (size_t)hd * dv + c * 4) = tot;
             }
+        }
     }
 }
 
