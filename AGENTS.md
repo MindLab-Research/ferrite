@@ -225,10 +225,12 @@ steady×16 ≈ **1046**（300 窗口）。gemm3 的文本：逐字正确（《�
 **当前分解**（每步每卡）：MoE 3.85（act 1.81 已达实测带宽峰/down 1.77/route 0.26）· AR 2.66（NCCL 会合地板 90×29.5µs）· hc 2.11 · 投影 cuBLAS 族 2.2（DSA/GDN 小投影 bf16-only + 每 GEMM 一次 f32→bf16 cast）· DSA 1.11 · GDN 1.18 · 间隙+host ~0.6。
 **通往 1600（≤10ms）的诚实重估（2026-09-10 末）**：已识别 kernel 杠杆（投影融合 −0.5、hc −0.3、act 深挖 −0.3）≈ **−1.1ms → ~13.5ms ≈ 1180 tok/s**。EP 重估：FFN AR 1.24ms 被两次 all-to-all（dispatch+collect，各 ~2MB/rank/层）替代——per-link 字节相当，**净赢只剩 −0.3~−0.6ms**（不是初估的 −1.2）。**校准：SGLang 在同硬件 DCP-8+EAGLE 下 ~3200（含 MTP ≈2.4x）→ 其不开 MTP 基座 ≈1300**——1600 目标超过 SGLang 自身基座 ~23%。剩余候选：DCP 式 KV 切分（SGLang 的实际答案，结构大改）、act 4.8→6.5TB/s、图节点数削减。quick-win 已全部关停：down MMA v1/v2（基准伪影修正后均更慢）、kpool grid cap（15.29 回退——空块不是成本，全 grid 的内存级并行才是）、n==16 bf16 wmma（无 K-split 6x 回退）、P2P（复测仍死锁）。
 
-**下一会话执行单元（2026-09-10 固化设计）**：
-① **小投影融合多 GEMM（−0.3~0.5ms）**：目标 = DSA 组（wk 4096→128、weights_proj 4096→8、gate 4096→128，bf16、同 x）+ GDN 组（b 4096→8、fa/ga 4096→32×2）——每层 6-7 个 3.5µs cuBLAS + 1µs cast。设计：每组每层 ONE launch；grid = Σ_w⌈out_w/16⌉ × **块级 K-split ×8**（DSA 组只有 ~17 块，必须 splitK 防 kpool 式低并行陷阱）；**f32 x 直接进 kernel（吃掉 ~280 个 cast 节点 ≈ −0.28ms）**；**零新增常驻缓冲**（xb-cache 四连崩的教训：batch 池确定性承重）；partials+reduce 保确定性折叠（j/warp 升序）。大 GEMM（qkv 25MB @6.2TB/s、o_proj）留 cuBLAS 不动。
+**下一会话执行单元（2026-09-10 固化设计，按价值排序）**：
+⓪ **sparse_attn flash 式 slot 分割（−0.33ms 预期）**：实测 0.66TB/s 延迟受限（grid(B=16,h=8)=**128 块**，每线程串行 slot 循环；34MB/层 K/V 流量本应 ~7µs 实测 51.8µs）——与 gdn_chunk float4 修复同源（在飞字节不足）。修法：grid (B, h, **4**) = 512 块，每块处理 live_k/4 个 slot 的 online softmax（running max/sum，flash 式），尾部小合并 kernel 归一 4 组 partial（max/sum 合并数学确定序）。f32 cache 布局不变。
+① 小投影融合多 GEMM：**已完成**（gemm3 默认开，DSA/GDN 各一 launch，−0.16ms）。
 ② **DCP 类结构改动**（通往 1600 的唯一已识别路径）：SGLang decode 用 --dcp-size 8（其不开 MTP 基座 ≈1300）；ferrite 的等价物 = DSA 缓存池 + GDN 状态按 rank 切分（注意力无通信化），投影/MoE 每卡全 token 复算或再切分——大架构探索，需专项会话。
 ③ MTP 路线（目标改 3200）：batched MTP 验证链（mega_v n=3×16=48 行 → megab_b64 新尺寸）是重构项。
+④ act 4.8→6.5TB/s 深挖（218MB 权重流已 L2 去重，缺口在 per-expert 128KB 散段 vs nvjet 的 25MB 连续单矩阵 6.2TB/s——需 expert-major 重排或更大连续读）。
 
 ## Performance state (perf-b1, 2026-09-08)
 
