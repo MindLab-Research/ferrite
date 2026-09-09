@@ -591,3 +591,33 @@ NB=16 不可加（64/256 会毁输出，根因未定位）。
 3. **gdn_step 17.1µs**（0.58ms）：float4 已做，需 ncu 定位剩余瓶颈
 4. **kpool 23.2µs**（0.26ms）：grid cap 回退过，需不同的并行化策略
 5. NCCL AR / MoE：均在各自地板（协议/带宽），需结构性突破
+
+## 2026-09-10 末：rest345 NB>16 毁输出的根因定位（未修，价值在认知）
+
+**根因**：`hc_pre_rest345` launcher（ferrite_kernels.cu ~6356 行）`const int hpb_l = (h + 15) / 16`
+硬编码 16；kernel 侧 `hpb = (h + NB - 1) / NB`。当 NB>16 时 hpb < 256 = blockDim.x：
+线程 `tid ≥ hpb` 的 `col = b*hpb + tid` **与 block b+1 的列范围重叠**（多 block 写同一
+li 列，值相同不毁数据），但 **p4_part 的 Σli² 部分和重复计数重叠列** → 归一化分母错 →
+输出损坏（NB=64 → all-EOS，NB=256 → "the the the"）。修法：blockDim.x = hpb 或守卫
+`if (threadIdx.x < hpb)`。**但修好后占用率不变**（总线程 = s×h 固定 65536），性能无收益。
+
+**rest345 12.67µs 的完整构成分析**（nsys med × 代码走读）：
+- launch + PDL gridDepSync: ~1µs
+- P1（4/256 线程 reduce）: ~0.5µs
+- P2a sigmoid（4/256 线程）: ~0.2µs
+- P3 cp.async staging + FMA: ~1-2µs
+- P4 warp/block 归约: ~0.5µs
+- is_last 选举（threadfence + atomicAdd）: ~0.5-1µs
+- P2b sinkhorn（block0 warp1）: ~1.3µs（已优化到 butterfly 无 barrier）
+- P5 归一化（is_last block 全列，16 列/线程，ILP 隐藏延迟）: ~1.5µs
+- **5-6 个 __syncthreads 屏障（各 200-500ns @ 21.7% 占用率）**: ~1-3µs ← 主要可攻项
+- 合计 ~8-11µs ≈ 实测 12.67µs ✓
+
+**结论**：rest345 无单一瓶颈——时间分散在屏障/原子/计算/内存各 ~0.5-1.5µs 组件。
+P2a 去冗余仅省 ~0.05ms（P1+P2a 只用 4/256 线程，并发跨 block，墙钟影响小）。
+P5 分发到全 block 最多省 ~0.08ms。**不值得单独攻**——除非与屏障减少联合重构（风险高）。
+
+**占用率 21.7% 的本质**：总并行度 = s × h = 16 × 4096 = 65536 线程（每线程 1 列），
+B300 容量 148 SM × 2048 = 302K 线程。要提占用率需 MORE 并行工作——但 P3 的 FMA
+（4-8/thread）和 P5 的归一化（1 mul/thread）已是全部工作。这是**任务级并行度不足**，
+不是 kernel 写得差。
