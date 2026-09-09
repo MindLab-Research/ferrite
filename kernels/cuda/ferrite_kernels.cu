@@ -3460,7 +3460,7 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
 // (fp8) AND computes e4m3 x e4m3 directly (no per-element cvt).
 // smem: xq[hidden] + reduce[256] + xs[1] + gate sacc[8][16] + up sacc[8][16].
 // ============================================================
-__global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
+__global__ void __launch_bounds__(128, 7) moe_fused_act_fp8_mma_kernel(
     const float* __restrict__ x,          // [n, hidden]
     const float* __restrict__ ids_f,      // [n, topk]
     const unsigned char* const* __restrict__ gate_w8_ptrs,   // [e_local] [inter, hidden] e4m3
@@ -3555,7 +3555,7 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
     }
     // ---- 2. gate mma + up mma (same smem xq; 8-warp K-split each) ----
     const int nblk = (hidden + 127) >> 7;
-    const int bseg = (nblk + 7) / 8;
+    const int bseg = (nblk + 3) / 4;   // 4 warps/block (was 8)
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, hidden);
@@ -3575,7 +3575,7 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
     // prefetch still stalled ~536 cycles/tile (600-cycle DRAM latency vs the
     // ~64 cycles of MMA work) — that is why the 2-tile *register* prefetch was
     // slower (32 extra registers); cp.async costs smem instead (40KB/block).
-    __shared__ unsigned char sa[3][8][2 * 16 * 80];   // 3-deep pipeline (60KB)
+    __shared__ unsigned char sa[3][4][2 * 16 * 80];   // 3-deep pipeline, 4 warps (30KB)
     #define ACT_ISSUE(TILE, BUF) do { \
         for (int t = lane; t < 128; t += 32) { \
             const int proj = t >> 6, off = t & 63; \
@@ -3688,7 +3688,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
     dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
     const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
+    moe_fused_act_fp8_mma_kernel<<<grid, 128, smem, s>>>(
         x, ids_f,
         (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
         (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
@@ -3716,7 +3716,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
     dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
     const int smem = hidden + 256 * 4 + 4 + 2 * 8 * 16 * 4;
     cudaFuncSetAttribute(moe_fused_act_fp8_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    moe_fused_act_fp8_mma_kernel<<<grid, 256, smem, s>>>(
+    moe_fused_act_fp8_mma_kernel<<<grid, 128, smem, s>>>(
         x, ids_f,
         (const unsigned char* const*)gate_w8_ptrs, (const float* const*)gate_scale_ptrs,
         (const unsigned char* const*)up_w8_ptrs, (const float* const*)up_scale_ptrs,
@@ -6204,7 +6204,7 @@ __global__ void gemv_fp8_mma_kernel(
     }
     // ---- 2. mma body (reads smem xq; fragments per fp8_mma_layout_probe) ----
     const int nblk = (in_f + 127) >> 7;
-    const int bseg = (nblk + 7) / 8;
+    const int bseg = (nblk + 3) / 4;   // 4 warps/block (was 8)
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, in_f);
@@ -6306,7 +6306,7 @@ __global__ void gemv_fp8_mma_v3_kernel(
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
     __shared__ float sacc[8 * 16];
     const int nblk = (in_f + 127) >> 7;
-    const int bseg = (nblk + 7) / 8;
+    const int bseg = (nblk + 3) / 4;   // 4 warps/block (was 8)
     const int kW = warp;
     const int k0 = kW * bseg * 128;
     const int k1 = min(k0 + bseg * 128, in_f);
