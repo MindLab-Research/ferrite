@@ -4777,7 +4777,7 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     const float* __restrict__ idx,         // [B, topk_slots]
     float* __restrict__ out,              // [B, h*dv]
     int B, const int* const* __restrict__ total_tbl, // [B] pinned
-    int h, int d, int dv, int topk, int nodedup, int qk_mma) {
+    int h, int d, int dv, int topk, int nodedup, int qk_mma, int dbg) {
     int seq = blockIdx.x;
     int hd = blockIdx.y;
     int t = *total_tbl[seq]; // per-seq zero-copy pinned read
@@ -4790,6 +4790,24 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     const float* idx_s = idx + (size_t)seq * topk;
     float* out_s = out + (size_t)seq * (size_t)(h * dv);
     float scale = rsqrtf((float)d);
+    // FERRITE_ATTN_DBG (2026-09-09, batched-attention-is-zero hunt): what the
+    // KERNEL sees at (seq0, hd0) — the device-side table contents and the
+    // pinned totals can differ from what the host believes it wrote.
+    if (dbg && seq == 0 && hd == 0 && threadIdx.x == 0) {
+        const int j0 = (int)idx_s[0];
+        printf("[attn-dbg] B=%d h=%d d=%d dv=%d topk=%d t=%d live_k=%d idx0..3=%d,%d,%d,%d "
+               "ksc0=%.6f vsc0=%.6f K[j0]=%d,%d,%d V[j0]=%d,%d,%d q0=%.4f\n",
+               B, h, d, dv, topk, t, live_k,
+               j0, (int)idx_s[1], (int)idx_s[2], (int)idx_s[3],
+               ksc_s[(size_t)(j0 >= 0 ? j0 : 0) * h], vsc_s[(size_t)(j0 >= 0 ? j0 : 0) * h],
+               k_s[(size_t)(j0 >= 0 ? j0 : 0) * h * d],
+               k_s[(size_t)(j0 >= 0 ? j0 : 0) * h * d + 1],
+               k_s[(size_t)(j0 >= 0 ? j0 : 0) * h * d + 2],
+               v_s[(size_t)(j0 >= 0 ? j0 : 0) * h * dv],
+               v_s[(size_t)(j0 >= 0 ? j0 : 0) * h * dv + 1],
+               v_s[(size_t)(j0 >= 0 ? j0 : 0) * h * dv + 2],
+               q_s[0]);
+    }
     extern __shared__ float sm[];
     float* qs = sm;                                   // [d] float4-aligned base
     float* sc = sm + d;                                // [topk]
@@ -5011,6 +5029,12 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     __syncthreads();
     for (int s = threadIdx.x; s < live_k; s += blockDim.x) sc[s] /= denom;
     __syncthreads();
+    if (dbg && seq == 0 && hd == 0 && threadIdx.x == 0) {
+        printf("[attn-dbg] softmax m=%f sum=%f w0..2=%f,%f,%f\n",
+               m, sum_,
+               live_k > 0 ? sc[0] : -1.f, live_k > 1 ? sc[1] : -1.f,
+               live_k > 2 ? sc[2] : -1.f);
+    }
     // float4 + 4 slot groups: the old loop read V one 4-byte element per
     // thread with consecutive slots 64KB apart (zero coalescing, 12.5%
     // sector efficiency). 64 float4 columns x 4 slot groups = 256 threads,
@@ -5142,6 +5166,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     if (attn_skip_) return cudaSuccess;
     static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
     static const int qk_mma_ = getenv("FERRITE_ATTN_QK_MMA") ? 1 : 0;
+    static const int dbg_ = getenv("FERRITE_ATTN_DBG") ? 1 : 0;
 
     // The kernel is latency-bound and the grid is only B*h = 16*8 = 128 blocks,
     // so the block size IS the parallelism (256 threads = 6.9 warps/SM = 11%
@@ -5172,7 +5197,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
         sparse_attn_v2_batched_kernel<512><<<grid, dim3(512), smem, s>>>(
             q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
             ksc_tbl, vsc_tbl,
-            idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_);
+            idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_, dbg_);
     } else {
         if (smem > 48 * 1024) {
             cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel<256>,
@@ -5182,7 +5207,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
         sparse_attn_v2_batched_kernel<256><<<grid, dim3(256), smem, s>>>(
             q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
             ksc_tbl, vsc_tbl,
-            idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_);
+            idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_, dbg_);
     }
     return cudaGetLastError();
 }
