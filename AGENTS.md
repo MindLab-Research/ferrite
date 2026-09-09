@@ -269,7 +269,7 @@ Other profiling rules:
 - MTP 出师表 200-step: `real 476 tokens` window, text must be flawless 《出师表》 through 将军向宠 section (乱码 = accept/commit bug, ALWAYS check by eye).
 - 500-step: 58.9 tok/s (DSA decay visible), non-MTP 500-step 44.7.
 - If accept rate collapses to exactly 1.0 with NCCL fallback → env missing NCCL_NVLS_ENABLE=0.
-- **B=16 non-MTP (2026-09-08, CORRECTED after a measurement-methodology audit): TRUE 16-concurrency steady = ~830 tok/s (per-seq 51.6-52.1 x 16, live=16 verified in the serve log); end-to-end wall aggregate (incl. the serial admit ramp) = 667 tok/s. The earlier "954-960" was inflated ~15% because the 300-token runs spent their per-seq windows at partial concurrency. ALWAYS use total_tokens/wall with >=2000-token outputs and verify live=16; script /tmp/bench_tr.py N MAX_TOKENS.
+- **B=16 non-MTP, TRUE 16-concurrency (2026-09-09, live=16 verified, 1727 steps): 18.42 ms/step median = 869 tok/s aggregate** (15.53 ms = 1030 tok/s at short context; 21.12 ms = 758 tok/s at ~1600-token context; DSA decay 1.39x). End-to-end wall with 8000-token SSE = 608-667 tok/s. Same-metric history: 36.3 ms/step = 441 tok/s / 314-319 end-to-end => the current build is 1.97x faster. **Read the `[megab] replay 16 seqs: Nms` lines with FERRITE_TIMING=1; 16000/N = aggregate tok/s. per-seq x 16 and total/wall are admit-ramp-contaminated — cross-check only.** Script /tmp/bench_tr.py N MAX_TOKENS.
   per-seq `steady=` x16 (the `[megab] replay` line under-reports long context by ~8%):
   **300-token window: 59.4-60.9 tok/s/seq = 950-974 tok/s aggregate**; **1000-token window:
   56.8-57.6 tok/s/seq = 909-922 tok/s aggregate** (run-to-run ±2%). Text = direct 《出师表》 ✓.
