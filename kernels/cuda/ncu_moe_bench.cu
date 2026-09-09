@@ -216,7 +216,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < sc_per / 4; i++) {
         h_sc_gate[i] = 0.0005f + 0.0001f * (float)(i % 7);
         h_sc_up[i]   = 0.0005f + 0.0001f * (float)((i * 3) % 5);
-        h_sc_down[i] = 0.0005f + 0.0001f * (float)((i * 5) % 9);
+        h_sc_down[i] = 0.0002f + 0.0001f * (float)i;   // UNIQUE per index: any index error shows up
     }
 
     // device per-expert allocations
