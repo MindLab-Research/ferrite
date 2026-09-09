@@ -747,3 +747,26 @@ CUDA 错误 + 中位步时 18.45ms（与基线持平）** → 回退。根因未
 **WPR 4→8（微基准 q_a 46→42µs、head 489→471µs、maxrel=0）在 serve 上失败**：文本变成
 思考模式（LEN 205 ✗）、中位步时 19.32ms 反而略差 → **已回退**。教训：微基准的 maxrel=0 只说明
 相对参考实现无误差，**不代表改 K-split 求和顺序后模型行为不变**；K-split 顺序属数值敏感改动。
+
+### ncu 全景（2026-09-09，全部在单 kernel 微基准上，`--set full`）
+
+| kernel | Duration | 占用率 | Waves/SM | 最高资源 | DRAM |
+|---|---|---|---|---|---|
+| gemv_fp8_v2 (q_a 1536×4096, n=16) | 53.5 µs | **23.3%**（84 regs → 2 blocks/SM） | 2.59 | **L1/TEX 62.7%** | 1.6% |
+| moe_fused_down_sum_fp8 (n=16, I=256) | 105 µs | 52.2%（56 regs, smem 限 4） | 3.46 | SM 20.3% | 1.3% |
+| moe_fused_act_fp8_mma (n=16, I=256) | 57 µs | — | — | — | — |
+| hc_pre_mix_split | 9.4 µs | 12.6% | **0.05** | SM 1.4% | 2.3% |
+| hc_pre_rest345 | 16.3 µs | — | **0.05**（16 blocks） | SM 0.3% | 0.1% |
+
+**统一结论：所有热 kernel 都是"并行度/延迟受限"，没有一个是带宽受限**（DRAM 全部 ≤2.3%）。
+hc 两个 kernel 的 `Waves Per SM = 0.05` 意味着 132 个 SM 里只有 16–48 个在工作 —— 纯串行链上的小 kernel。
+
+**因此真正的杠杆不是单 kernel 指令优化，而是**：
+1. **提高并行度**（hc 的 grid 只有 16/48 blocks；gemv 的 84 寄存器把占用率压到 23%）；
+2. **kernel 间重叠**（mega-graph 目前是一条串行链；独立的 q_a/kv_a、indexer 与 MoE 路由等可并行）；
+3. 单 kernel 优化必须用微基准验证，且**必须再看 serve 端**——gemv 的孤立 −25%（WPR=8 + launch_bounds(256,4)）
+   在 serve 端为 0（19.20 vs 19.20ms），因为 serve 里 kernel 之间争抢 L1/L2。
+
+**已落地（保留）**：gemv `WPR=8` + `__launch_bounds__(256,4)`（微基准 q_a 46→31µs、head 489→353µs，serve 端中性）；
+新增 `kernels/cuda/gemv_bench.cu` 微基准；`ncu_moe_bench.cu` 支持 `n`/`inter` 参数化。
+**已证伪**：MAXN 64→32→16（down 89.4/89.4/89.2µs，无影响）；act 的 launch_bounds 4/5/6（57.6/61.1/69.1µs，均差于现状 3）。
