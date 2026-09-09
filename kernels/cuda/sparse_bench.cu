@@ -36,11 +36,7 @@ int main(int argc, char** argv) {
         int* p; CK(cudaMallocHost(&p, 4)); *p = 2048;
         h_tot[b] = p;
         CK(cudaMalloc(&d_tot[b], 4)); CK(cudaMemcpy(d_tot[b], p, 4, cudaMemcpyHostToDevice));
-        CK(cudaMalloc(&h_idx[b], (size_t)TOPK * 4));
-        std::vector<float> iv(TOPK);
-        for (int i = 0; i < TOPK; i++) iv[i] = (i < 2048) ? (float)(i * 2 % T) : -1.0f;
-        CK(cudaMemcpy(h_idx[b], iv.data(), (size_t)TOPK * 4, cudaMemcpyHostToDevice));
-        CK(cudaMalloc(&h_out[b], (size_t)H * DV * 4));
+        (void)h_idx; (void)h_out;
     }
     std::vector<const int*> totp(B);
     for (int b = 0; b < B; b++) totp[b] = h_tot[b];
@@ -52,28 +48,33 @@ int main(int argc, char** argv) {
     CK(cudaMemcpy(d_kn_tbl, kn_p.data(), B * sizeof(void*), cudaMemcpyHostToDevice));
     unsigned char** d_v_tbl; CK(cudaMalloc(&d_v_tbl, B * sizeof(void*)));
     CK(cudaMemcpy(d_v_tbl, v_p.data(), B * sizeof(void*), cudaMemcpyHostToDevice));
-    std::vector<float*> ks_p(B), vs_p(B), idx_p(B), out_p(B);
-    for (int b = 0; b < B; b++) { ks_p[b] = d_ks[b]; vs_p[b] = d_vs[b]; idx_p[b] = h_idx[b]; out_p[b] = h_out[b]; }
+    std::vector<float*> ks_p(B), vs_p(B);
+    for (int b = 0; b < B; b++) { ks_p[b] = d_ks[b]; vs_p[b] = d_vs[b]; }
+    // idx/out are per-seq CONTIGUOUS buffers indexed as idx + seq*topk
+    float* d_idx; CK(cudaMalloc(&d_idx, (size_t)B * TOPK * 4));
+    float* d_out; CK(cudaMalloc(&d_out, (size_t)B * H * DV * 4));
+    {
+        std::vector<float> iv((size_t)B * TOPK);
+        for (int b = 0; b < B; b++)
+            for (int i = 0; i < TOPK; i++) iv[(size_t)b * TOPK + i] = (i < 2048) ? (float)((i * 2 + b) % T) : -1.0f;
+        CK(cudaMemcpy(d_idx, iv.data(), (size_t)B * TOPK * 4, cudaMemcpyHostToDevice));
+    }
     float** d_ks_tbl; CK(cudaMalloc(&d_ks_tbl, B * sizeof(void*)));
     CK(cudaMemcpy(d_ks_tbl, ks_p.data(), B * sizeof(void*), cudaMemcpyHostToDevice));
     float** d_vs_tbl; CK(cudaMalloc(&d_vs_tbl, B * sizeof(void*)));
     CK(cudaMemcpy(d_vs_tbl, vs_p.data(), B * sizeof(void*), cudaMemcpyHostToDevice));
-    float** d_idx_tbl; CK(cudaMalloc(&d_idx_tbl, B * sizeof(void*)));
-    CK(cudaMemcpy(d_idx_tbl, idx_p.data(), B * sizeof(void*), cudaMemcpyHostToDevice));
-    float** d_out_tbl; CK(cudaMalloc(&d_out_tbl, B * sizeof(void*)));
-    CK(cudaMemcpy(d_out_tbl, out_p.data(), B * sizeof(void*), cudaMemcpyHostToDevice));
-    (void)d_idx_tbl; (void)d_out_tbl;
+
 
     cudaEvent_t a, b2; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b2));
     for (int i = 0; i < 5; i++)
         CK(ferrite_sparse_attn_v2_batched(q, (float* const*)d_kn_tbl, (float* const*)d_v_tbl,
-            d_ks_tbl, d_vs_tbl, (const float*)d_idx_tbl[0], d_out_tbl[0], B,
+            d_ks_tbl, d_vs_tbl, d_idx, d_out, B,
             (const int* const*)d_tot_tbl, H, D, DV, TOPK, 0));
     CK(cudaDeviceSynchronize());
     CK(cudaEventRecord(a));
     for (int i = 0; i < iters; i++)
         CK(ferrite_sparse_attn_v2_batched(q, (float* const*)d_kn_tbl, (float* const*)d_v_tbl,
-            d_ks_tbl, d_vs_tbl, (const float*)d_idx_tbl[0], d_out_tbl[0], B,
+            d_ks_tbl, d_vs_tbl, d_idx, d_out, B,
             (const int* const*)d_tot_tbl, H, D, DV, TOPK, 0));
     CK(cudaEventRecord(b2)); CK(cudaEventSynchronize(b2));
     float ms = 0; CK(cudaEventElapsedTime(&ms, a, b2));
