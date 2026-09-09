@@ -2918,9 +2918,9 @@ impl CudaBackend {
         if let Some(st) = m.get(&key) {
             return Ok(st.ptr as *mut f32);
         }
-        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        ck(unsafe { cudaMalloc(&mut ptr, len * 4) }, "state malloc")?;
-        ck(unsafe { cudaMemset(ptr, 0, len * 4) }, "state zero")?;
+        // Pooled: same free+realloc hazard as the DSA caches (2026-09-09) —
+        // reusing the same VA avoids the driver's remap path.
+        let ptr = self.dsa_alloc(len)?;
         m.insert(key, DeviceState { ptr, len });
         Ok(ptr as *mut f32)
     }
@@ -4096,7 +4096,8 @@ impl CudaBackend {
                 .collect();
             for l in keys {
                 if let Some(st) = m.remove(&(seq, l)) {
-                    unsafe { cudaFree(st.ptr) };
+                    // Pooled (see dsa_release) — no cudaFree/remap of the state.
+                    self.dsa_release(st.ptr);
                 }
             }
         }
