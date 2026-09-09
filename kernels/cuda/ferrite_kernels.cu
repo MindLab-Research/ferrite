@@ -4746,7 +4746,8 @@ __global__ void pool_expand_batched_kernel(
 // __launch_bounds__(256,8): ncu showed the register limit capping this kernel
 // at 6 blocks/SM (No-Eligible 69.5%, long-scoreboard 43.5% = latency-bound).
 // Forcing 8 blocks/SM trades registers for the latency hiding it needs.
-__global__ void __launch_bounds__(512, 4) sparse_attn_v2_batched_kernel(
+template <int BLK>
+__global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel(
     const float* __restrict__ q,          // [B, h*d]
     const unsigned char* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches (e4m3)
     const unsigned char* const* __restrict__ v_tbl,      // [B] per-seq v caches (e4m3)
@@ -4944,27 +4945,32 @@ __global__ void __launch_bounds__(512, 4) sparse_attn_v2_batched_kernel(
     }
     __syncthreads();
     float m = -INFINITY;
-    for (int s = threadIdx.x; s < live_k; s += blockDim.x) m = fmaxf(m, sc[s]);
+    // FIXED 256-stride + 8-warp reduction: the FP association must be IDENTICAL
+    // to the known-good 256-thread build at any BLK. A block-size-dependent
+    // reassociation of these two reductions flipped the model into a
+    // repetition loop (2026-09-09). Only the QK group count may differ — each
+    // slot's dot uses the same 8-lane tree, so the scores stay bit-identical.
+    for (int s = threadIdx.x; s < live_k; s += 256) m = fmaxf(m, sc[s]);
     for (int off = 16; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m;
     __syncthreads();
-    if (threadIdx.x < 16) m = red[threadIdx.x];
-    for (int off = 8; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
+    if (threadIdx.x < 8) m = red[threadIdx.x];
+    for (int off = 4; off > 0; off >>= 1) m = fmaxf(m, __shfl_down_sync(0xffffffff, m, off));
     __shared__ float ms_;
     if (threadIdx.x == 0) ms_ = m;
     __syncthreads();
     m = ms_;
     bool all_inf = (m == -INFINITY);
-    float sum = 0.f;
-    for (int s = threadIdx.x; s < live_k; s += blockDim.x) {
+    for (int s = threadIdx.x; s < live_k; s += blockDim.x)
         sc[s] = all_inf ? 0.f : __expf(sc[s] - m);
-        sum += sc[s];
-    }
+    __syncthreads();
+    float sum = 0.f;
+    for (int s = threadIdx.x; s < live_k; s += 256) sum += sc[s];
     for (int off = 16; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum;
     __syncthreads();
-    if (threadIdx.x < 16) sum = red[threadIdx.x];
-    for (int off = 8; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
+    if (threadIdx.x < 8) sum = red[threadIdx.x];
+    for (int off = 4; off > 0; off >>= 1) sum += __shfl_down_sync(0xffffffff, sum, off);
     __shared__ float sum_;
     if (threadIdx.x == 0) sum_ = sum;
     __syncthreads();
@@ -4978,10 +4984,16 @@ __global__ void __launch_bounds__(512, 4) sparse_attn_v2_batched_kernel(
     // 16-byte coalesced loads, then an smem reduction over the groups.
     {
         const int cols = dv >> 4;               // e4m3x16 columns (256/16 = 16)
-        const int G = (blockDim.x + cols - 1) / cols;   // slot groups (4)
+        // G is FIXED at the 256-thread value: the slot->group assignment (and
+        // hence the FP accumulation order) must not depend on BLK. A BLK-sized
+        // G reassociated this reduction and flipped the model into a
+        // repetition loop (2026-09-09).
+        const int G = 256 / cols;               // slot groups (16 at dv=256)
         const int g = threadIdx.x / cols;
         const int c = threadIdx.x % cols;
-        if (c < cols && g < G) {
+        const bool pv_on = (c < cols && g < G);
+        __shared__ float4 pred[32 * 16];        // static (8KB), G<=32, cols<=16
+        if (pv_on) {
             float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
             // unroll 4: one independent float4 load per iteration, previously
             // serialized by the compiler (no unroll -> ~300-cycle L2 latency
@@ -5013,10 +5025,10 @@ __global__ void __launch_bounds__(512, 4) sparse_attn_v2_batched_kernel(
                     else { a.z += wv * vv.x; a.w += wv * vv.y; }
                 }
             }
-            __shared__ float4 pred[32 * 16];    // static (8KB), G<=32, cols<=16
             pred[g * cols + c] = a;
-            __syncthreads();
-            if (g == 0) {
+        }
+        __syncthreads();   // unconditional: pv_on diverges when BLK > 256
+        if (pv_on && g == 0) {
                 float4 tot = pred[c];
                 for (int gg = 1; gg < G; gg++) {
                     const float4 t2 = pred[gg * cols + c];
@@ -5024,7 +5036,6 @@ __global__ void __launch_bounds__(512, 4) sparse_attn_v2_batched_kernel(
                 }
                 *reinterpret_cast<float4*>(out_s + (size_t)hd * dv + c * 4) = tot;
             }
-        }
     }
 }
 
@@ -5097,23 +5108,42 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
     static const int qk_mma_ = getenv("FERRITE_ATTN_QK_MMA") ? 1 : 0;
 
-    dim3 block(512); // was 256: grid is only B*h = 16*8 = 128 blocks, so the
-                     // block size IS the parallelism (256 threads = 6.9 warps/SM
-                     // = 11% occupancy; 512 = 13.8 warps/SM). The kernel is
-                     // latency-bound (ncu: No-Eligible 69.5%, long-scoreboard
-                     // 43.5%), so more warps/SM is a direct win.
+    // The kernel is latency-bound and the grid is only B*h = 16*8 = 128 blocks,
+    // so the block size IS the parallelism (256 threads = 6.9 warps/SM = 11%
+    // occupancy; 512 = 13.8 warps/SM, measured 13.68 -> 12.58 ms/step). The
+    // 512 build initially flipped the model into a repetition loop because the
+    // softmax/PV reductions were reassociated by the block size; the kernel now
+    // pins those associations to the 256-thread layout (see the FIXED comments
+    // in the kernel), so BLK only changes the QK group count. FERRITE_ATTN_BLK=256
+    // is the bisect escape hatch.
+    static const int blk_ = [] {
+        const char* e = getenv("FERRITE_ATTN_BLK");
+        return e ? atoi(e) : 512;
+    }();
     dim3 grid(B, h);
     size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
                   + 16 * sizeof(float) + 256 * sizeof(unsigned int);
-    if (smem > 48 * 1024) {
-        cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        if (e != cudaSuccess) return e;
+    if (blk_ >= 512) {
+        if (smem > 48 * 1024) {
+            cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel<512>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            if (e != cudaSuccess) return e;
+        }
+        sparse_attn_v2_batched_kernel<512><<<grid, dim3(512), smem, s>>>(
+            q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
+            ksc_tbl, vsc_tbl,
+            idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_);
+    } else {
+        if (smem > 48 * 1024) {
+            cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel<256>,
+                                                 cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+            if (e != cudaSuccess) return e;
+        }
+        sparse_attn_v2_batched_kernel<256><<<grid, dim3(256), smem, s>>>(
+            q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
+            ksc_tbl, vsc_tbl,
+            idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_);
     }
-    sparse_attn_v2_batched_kernel<<<grid, block, smem, s>>>(
-        q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
-        ksc_tbl, vsc_tbl,
-        idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_);
     return cudaGetLastError();
 }
 
