@@ -504,3 +504,15 @@ decode 的 M=1 看似无法用 MMA，但**同一 seq 的 64 个 head 共享同�
   （M = head 维 256 的输出、N = 位置）。
 - slot 的 gather 通过 page table 间接寻址（DSA 的 top-k 索引已在 idxs 里）。
 预计算力从 0.26 TMAC/s（fp32 峰值 0.1%）提到 tensor-core 量级，是**唯一可能两位数百分点**的方向。
+
+## 下一步首选：MLA 吸收（v 侧先行）——净收益测算
+
+把上面的数字串起来（t=1000 窗口，每层每 rank）：
+- **现状**：sparse_attn 的 v 侧读 `live_k×64head×256×4B ≈ 0.13ms`，且整个注意力是延迟受限
+  （0.26 TMAC/s = fp32 峰值 0.1%）→ 算力几乎闲置。
+- **v 侧吸收**：缓存改存 latent（512），注意力做 `out_latent = Σ w·latent`（512 维，FLOPs 2x 但算力闲置
+  所以不吃亏），再 `out = W_vc @ out_latent`（每 (seq,head) 一次，256×512 = 131K MAC）。
+  v 侧读量从 0.13ms 降到 ~0.004ms（-1.4ms/步 @11 层）。
+- **代价**：上投影若走 CUDA 核 ≈ +0.5ms/步 → 净 +0.9ms（约 5%）；若上投影也用 tensor-core
+  （M=16 个 head 拼 GEMM）≈ +0.05ms → **净 +1.35ms（约 8%）**。
+→ **这是当前唯一"净收益为正且路径清晰"的方向**；k 侧吸收（分数）可作为第二步。
