@@ -1949,7 +1949,14 @@ impl CudaBackend {
         // valid flag resets at each pass start so the CAPTURE pass records
         // its own cast node (a persistent hit would leave the graph without
         // a cast → the replays read a stale xb).
-        let key = (x.as_const_f32() as usize, x.gen);
+        // Key = the x POINTER ONLY (no gen): the DRY pass (not capturing)
+        // pre-registers the immortal buffer for the group's x address; the
+        // CAPTURE pass then always HITS (or re-validates into the existing
+        // buffer) — NEVER allocates inside the capture (a capture-time
+        // cudaMalloc = err 900, the xq_cached lesson; the v2 crash). Cross-
+        // pass staleness is handled by the per-pass clear_xb_cache (a live x
+        // is never recycled within a pass).
+        let key = x.as_const_f32() as usize;
         // OPT-IN (FERRITE_XB_CACHE=1), CAPTURE-ONLY: consolidate the same-x
         // GEMM groups' f32→bf16 casts into ONE cast node per (layer, group)
         // in the captured graph (~280 → ~90 nodes/kernels per step). The
