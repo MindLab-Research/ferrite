@@ -937,8 +937,14 @@ impl<B: KernelBackend> TpCluster<B> {
         // of exposed host time). FERRITE_STEP_SYNC=1 forces it back for A/B;
         // FERRITE_DEV_ADV=0 (host-owned counters) also restores it.
         #[cfg(feature = "cuda")]
+        let membership_change = self.last_batch_seqs.as_deref() != Some(seqs);
+        #[cfg(feature = "cuda")]
         let step_sync = std::env::var_os("FERRITE_STEP_SYNC").is_some()
-            || !ferrite_kernel::cuda::CudaBackend::dev_adv_enabled();
+            || !ferrite_kernel::cuda::CudaBackend::dev_adv_enabled()
+            // the dry pass (membership change) writes the pinned handoff
+            // values from the host — that write must not race the previous
+            // step's in-flight replay
+            || membership_change;
         #[cfg(feature = "cuda")]
         if step_sync && std::env::var_os("FERRITE_STEP_NOSYNC").is_none() {
             Self::fan_out(&mut self.shards, |s| {

@@ -4000,11 +4000,19 @@ impl CudaBackend {
                 match existing {
                     Some((kn, vv, kns, vss, ki_, kg, pt0, ptot, t0)) => {
                         m.get_mut(&(seq_r, family)).unwrap().t_count += 1;
-                        // FERRITE_DEV_ADV (default ON): the append KERNEL advances the
-                        // pinned t0/total (in-stream) — the host writes below raced the
-                        // in-flight kernels (Xid 31) and are what forced the step-start
-                        // all-rank sync. Count-only here.
-                        if !Self::dev_adv_enabled() {
+                        // FERRITE_DEV_ADV: the append KERNEL owns the per-replay
+                        // increments, but the DRY pass (capture=false) still writes
+                        // the pinned values from the map here — this is the
+                        // single→batched HANDOFF SYNC: the single-seq path leaves
+                        // pinned t0 at the LAST WRITTEN slot (one behind the true
+                        // next slot; its own next advance would fix it, but a
+                        // batched step reads it directly) — writing t_count (the
+                        // true next slot) here fixes the off-by-one that made the
+                        // first batched append OVERWRITE the last solo token (the
+                        // B=2 <model>-loop regression, 2026-09-10). The CAPTURE pass
+                        // must NOT write: the dry pass's kernel already advanced the
+                        // pinned, and rewriting the pre-value would regress it.
+                        if !Self::dev_adv_enabled() || !capture {
                             unsafe {
                                 *pt0 = t0 as i32;
                                 *ptot = (t0 + 1) as i32;
