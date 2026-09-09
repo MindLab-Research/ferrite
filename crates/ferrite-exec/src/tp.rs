@@ -924,6 +924,26 @@ impl<B: KernelBackend> TpCluster<B> {
                 ));
             }
         }
+        // HOST-WRITE ORDERING (2026-09-09 root cause): the per-seq pinned t0/total
+        // ints are written by the HOST (dsa_host_advance) and read zero-copy by
+        // the DSA kernels. Host stores are NOT ordered w.r.t. the device's
+        // in-flight reads of the same slot — if the previous step's kernels are
+        // still running, they observe the NEXT step's (larger) total and index
+        // past the cache into an unmapped 2MB page (Xid 31 PDE fault).
+        // Evidence: the batched chain runs clean whenever a per-layer sync is
+        // present (FERRITE_MEGA_PROBE=1) and faults otherwise; a 10s delay
+        // before the requests does NOT help. Sync all ranks before the host
+        // bookkeeping of this step.
+        #[cfg(feature = "cuda")]
+        if std::env::var_os("FERRITE_STEP_NOSYNC").is_none() {
+            Self::fan_out(&mut self.shards, |s| {
+                if let Some(c) = s.backend.as_cuda() {
+                    if let Err(e) = c.sync() {
+                        eprintln!("[cluster] decode_step_batched: pre-step sync failed: {e}");
+                    }
+                }
+            });
+        }
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         // SGLang-style batch-size padding: ONE graph per padded size
