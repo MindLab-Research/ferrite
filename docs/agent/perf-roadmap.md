@@ -1318,3 +1318,22 @@ m16n8k32 × 8 tiles，C[slot][0] 取分数。**文本正确**（LEN 382，内容
 **结论**：sparse_attn 的 QK^T 是"per-slot gather + M=1"结构，**不适合 MMA**；
 它的 143µs 主要是 long-scoreboard 延迟（已用 launch_bounds/unroll/双累加器改善 27%）。
 代码保留在 `FERRITE_ATTN_QK_MMA=1` 之后（默认走 SIMT），不再作为优化方向。
+
+### indexer 分数 GEMM MMA：bench 无法完成（服务异常），已 env-gated
+
+`FERRITE_IDX_MMA=1` 时文本正确（LEN 462），但 16 并发 bench 跑不动（"3 tok in 1.8s"）——
+与 sparse_attn QK^T MMA 同样的病根：**per-tile 串行 + 1024 线程做极小的 tile 工作**，
+固定开销远大于张量核省下的指令。默认关闭（`FERRITE_IDX_MMA` 未设时走 SIMT）。
+
+### ⚠️ 方向切换（用户指令：优化幅度明显降低就该换方向）
+
+**kernel 级 MMA 化的收益已耗尽**（近三项都在 ±1.5% 噪声内，两个结构性尝试均回归）。
+剩余缺口 1.37x（1170 → 1600）必须靠**别的方向**：
+
+1. **MTP（用户目标里明确允许，且届时目标变为 3200）** —— 当前 MTP 只支持 n=1；
+   若把 draft/verify/commit 扩展到 B=16，按实测 2.4x accept 计算：
+   13.7ms/步 ÷ 2.4 ≈ 5.7ms 有效步时 → 16 并发 ≈ **2800 tok/s**，逼近 3200 目标。
+   这是**唯一能一步跨过 1600 的路径**。
+2. 其次：AR/计算 overlap、CUDA graph 节点数削减（每步 ~700 节点）。
+
+**结论**：下一步应做 **B=16 的 batched MTP**，而不是继续 kernel 微调。
