@@ -271,12 +271,16 @@ int main(int argc, char** argv) {
     // io
     float* h_x = (float*)malloc(H * 4);
     for (int i = 0; i < H; i++) h_x[i] = 0.01f * (rand() % 200 - 100);
-    float* h_ids = (float*)malloc(TOPK * 4);
-    float* h_probs = (float*)malloc(TOPK * 4);
-    for (int k = 0; k < TOPK; k++) { h_ids[k] = (float)((k * 37 + 11) % E); h_probs[k] = 0.12f; }
+    float* h_ids = (float*)malloc((size_t)N * TOPK * 4);
+    float* h_probs = (float*)malloc((size_t)N * TOPK * 4);
+    for (int t = 0; t < N; t++)
+      for (int k = 0; k < TOPK; k++) {
+        h_ids[t * TOPK + k] = (float)(((t * 13 + k) * 37 + 11) % E);
+        h_probs[t * TOPK + k] = 0.12f;
+      }
     CK(cudaMalloc(&mc.x, H * 4)); CK(cudaMemcpy(mc.x, h_x, H * 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&mc.ids_f, TOPK * 4)); CK(cudaMemcpy(mc.ids_f, h_ids, TOPK * 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc(&mc.probs, TOPK * 4)); CK(cudaMemcpy(mc.probs, h_probs, TOPK * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&mc.ids_f, (size_t)N * TOPK * 4)); CK(cudaMemcpy(mc.ids_f, h_ids, (size_t)N * TOPK * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&mc.probs, (size_t)N * TOPK * 4)); CK(cudaMemcpy(mc.probs, h_probs, (size_t)N * TOPK * 4, cudaMemcpyHostToDevice));
     size_t act_len = N * (TOPK * I + IS);
     CK(cudaMalloc(&mc.act, act_len * 4)); CK(cudaMemset(mc.act, 0, act_len * 4));
     CK(cudaMalloc(&mc.out, N * H * 4)); CK(cudaMemset(mc.out, 0, N * H * 4));
