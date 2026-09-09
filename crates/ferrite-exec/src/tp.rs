@@ -949,18 +949,23 @@ impl<B: KernelBackend> TpCluster<B> {
         // steps. Routing the batched decode's allocations to a DEDICATED pool
         // (instead of the general LIFO one) stops interleaved PREFILL
         // allocations from shuffling them — the intermittent B=16 replay
-        // faults at live≈4-5 (~50% of runs). Drop-guard clears on every exit.
+        // faults at live≈4-5 (~50% of runs). The guard must live for the
+        // WHOLE function (an inner {} scope dropped it immediately and the
+        // flag was cleared before any allocation ran — measured no effect).
+        #[cfg(feature = "cuda")]
+        struct BatchDecodeGuard;
+        #[cfg(feature = "cuda")]
+        impl Drop for BatchDecodeGuard {
+            fn drop(&mut self) {
+                ferrite_kernel::cuda::set_batch_decode(false);
+            }
+        }
         #[cfg(feature = "cuda")]
         {
-            struct BatchDecodeGuard;
-            impl Drop for BatchDecodeGuard {
-                fn drop(&mut self) {
-                    ferrite_kernel::cuda::set_batch_decode(false);
-                }
-            }
             ferrite_kernel::cuda::set_batch_decode(true);
-            let _batch_guard = BatchDecodeGuard;
         }
+        #[cfg(feature = "cuda")]
+        let _batch_guard = BatchDecodeGuard;
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         // SGLang-style batch-size padding: ONE graph per padded size
