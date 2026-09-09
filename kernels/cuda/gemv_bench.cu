@@ -18,6 +18,8 @@
 #include <cmath>
 #include <vector>
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 extern "C" {
 cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
