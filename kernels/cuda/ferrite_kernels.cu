@@ -4860,10 +4860,18 @@ __global__ void kpool_compress_batched_kernel(
     int B, int max_npools, int kpool, int idm) {
     // float4 over d: one element per thread made each of the kpool loads a
     // separate strided 4-byte access (median 114us/call).
+    // GRID-STRIDE (2026-09-10): the old 1:1 mapping launched
+    // B×max_npools×idm4/256 blocks (4096 at B=16) — ~97% returned immediately
+    // at short context (npools ~66 of 2048) ≈ 20µs of pure block scheduling
+    // per launch × 11 layers/step (nsys median 23.5µs). The launcher caps the
+    // grid; this loop covers any pool count (16 sequential rounds at the
+    // 8192-token extreme — the memory parallelism is unchanged).
     const int idm4 = idm >> 2;
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t per4 = (size_t)max_npools * idm4;
-    if (tid >= (size_t)B * per4) return;
+    const size_t per4 = (size_t)max_npools * idm4;
+    const size_t total_items = (size_t)B * per4;
+    for (size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         tid < total_items;
+         tid += (size_t)gridDim.x * blockDim.x) {
     int seq = (int)(tid / per4);
     size_t rem = tid % per4;
     int p = (int)(rem / idm4), d4 = (int)(rem % idm4);
@@ -4876,7 +4884,7 @@ __global__ void kpool_compress_batched_kernel(
     if (total < 0) total = 0;
     if (total > max_npools * kpool) total = max_npools * kpool;
     int npools = (total + kpool - 1) / kpool;
-    if (p >= npools) return;
+    if (p >= npools) continue;
     const float* k_idx = kidx_tbl[seq];
     const float* k_gate = kgate_tbl[seq];
     const int d = d4 * 4;
@@ -4892,7 +4900,7 @@ __global__ void kpool_compress_batched_kernel(
             lmax.w = fmaxf(lmax.w, g.w + a.w);
         }
     }
-    if (lmax.x == -INFINITY) return;
+    if (lmax.x == -INFINITY) continue;
     float4 den = make_float4(0.f, 0.f, 0.f, 0.f), num = make_float4(0.f, 0.f, 0.f, 0.f);
     for (int j = 0; j < kpool; j++) {
         int t = p * kpool + j;
@@ -4908,6 +4916,7 @@ __global__ void kpool_compress_batched_kernel(
     }
     const float4 res = make_float4(num.x / den.x, num.y / den.y, num.z / den.z, num.w / den.w);
     *reinterpret_cast<float4*>(pool_keys + (size_t)seq * (size_t)max_npools * idm + (size_t)p * idm + d) = res;
+    }  // grid-stride loop
 }
 
 // 3. indexer topk: one 256-thread block per seq — score ALL pools of its
@@ -5458,6 +5467,12 @@ extern "C" cudaError_t ferrite_kpool_compress_batched(
     size_t total_t = (size_t)B * (size_t)max_npools * (idm >> 2);
     int threads = 256;
     int blocks = (int)((total_t + threads - 1) / threads);
+    // GRID CAP (2026-09-10): B×16 blocks covers the live work at any context
+    // (the kernel's grid-stride loop handles the rest); the old full-size
+    // grid (4096 blocks at B=16) paid ~20µs/launch scheduling ~97% idle
+    // blocks at short context — × 11 DSA layers per step.
+    int cap = B * 16;
+    if (blocks > cap) blocks = cap;
     kpool_compress_batched_kernel<<<blocks, threads, 0, s>>>(
         kidx_tbl, kgate_tbl, ape, pool_keys, total_tbl, B, max_npools, kpool, idm);
     return cudaGetLastError();
