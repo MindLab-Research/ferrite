@@ -67,6 +67,46 @@ sudo nsys stats --report cuda_gpu_kern_sum /tmp/nsys_out.nsys-rep | head -40
 每步时间 = 该 kernel 的 **median × 每步调用次数**（instance 数被 capture 的 ~900 次 dry-run 污染，
 不能直接除步数）。
 
+## 2026-09-09 事故后的 batched 路径现状（已核实，勿重复试错）
+
+**背景**：07:11 为抓 nsys 开 `FERRITE_P2P=1` 跑 B=16 → P2P AR 在 n>8 死锁 → `timeout -s INT` 杀 →
+驱动 wedge（8 卡同时 `NVRM: refcntRequestReference_IMPL: Failed to enter state 1`）→ 之后连 b1 都崩。
+**08:42 重启后驱动状态已恢复**（one-shot 正常），但 batched 路径仍崩 —— 两者是两个独立问题。
+
+**重启后实测（全部严格双产物重编）**：
+
+| 场景 | a9e5d5a | a0cf454 | HEAD |
+|---|---|---|---|
+| one-shot `--prompt/--max-tokens` (n=1) | ✅ | ✅ | ✅ |
+| serve 单次请求（流式/非流式，n=1 非 batched） | ✅ | — | ✅ |
+| serve B=16（`--max-seqs 16`） | ❌ | ❌ | ❌ |
+| `FERRITE_FORCE_BATCHED_B1=1`（**batched 链 + n=1**） | — | — | ❌ |
+
+→ **不是版本回归**（三个版本全崩）；**batched 链本身**有问题（n=1 也崩）。
+故障特征：Xid 31 `FAULT_PDE`、地址**几乎全部精确 2MB 对齐**（= freed/unmapped 的 cudaMalloc 基址）、
+`live16=0`、`captured=0`（崩在 dry-run，未到 capture）、首个报错内核漂移
+（`hc_post_dev` / `graph_run D2H` / `dsa_kpool_batched` / `moe_fused_act_fp8` / `moe_fused_down_sum_fp8`
+—— 因为 act 内核返回值没走 `ck()`，sticky error 顺延）。
+`CUDA_LAUNCH_BLOCKING=1` 时 n=1 batched 的首个报错是 **`moe_fused_down_sum_fp8` @ L8**。
+
+**已用对照排除（勿重复）**：
+- **AR 实现方式无关**：`FERRITE_AR_SKIP=1`（P2P/NCCL 的 AR 全跳过）仍崩 → 不是 P2P vs NCCL 的差别。
+  （单次 `FERRITE_P2P=1` 跑通过是 1 个样本，最可能是开 P2P 时多出的 staging/ready 表改变了 VA 布局，属运气；
+  且 P2P 在 batched n>8 有文档记载的死锁 + 会 wedge 整机，**不可设为默认**。）
+- **padding 无关**：`FERRITE_NO_PAD=1` 仍崩。
+- **CUDA 图无关**：`FERRITE_MEGA_DRY=1`（不捕获图）仍崩。
+- **MoE 只是部分相关**：`FERRITE_MOE_SKIP=1` 能出 10 tok 但仍有 129 fault。
+- **DEV 开关不能用作二分**：`FERRITE_MOE_DEV/GDN_DEV/LAYER_DEV=0` 在 batched 路径直接 panic
+  （`lib.rs:1318`/`lib.rs:643`/`mhc.rs:94 range end 16384 out of range for slice of length 4`）。
+- **短请求 vs 长请求都会崩**（16×60 与 16×1000 都失败）→ 不是"retire 风暴"独有。
+
+**已知的真实缺陷（已提交修复或待修）**：
+- ✅ `free_seq` 后未失效 `last_batch_seqs` → 表内容只在 membership 变化时刷新，retire 后可留悬垂指针（`2d8cb68` 已修）。
+- ⚠️ `destroy_batch_graph` 无任何调用者（文档写明 retire 必须销毁图）。
+- ⚠️ `hc_pre_mix_split_kernel` 读未初始化显存（initcheck 38 条 4B 读）—— 对应未解决的 "hc_pre output explodes"。
+- ⚠️ `gemv_fp8_mma_b16` 的 cp.async 读 `xq` 行 ≥ n（memcheck 盲区，initcheck 报 uninit）。
+- ⚠️ `mhc.rs:94` 占位 stub 被当 16384 切片（`LAYER_DEV=0` 路径 panic）。
+
 ## Repo layout (hot paths)
 
 ```
