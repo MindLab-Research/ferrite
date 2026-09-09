@@ -6268,6 +6268,115 @@ extern "C" cudaError_t ferrite_gemv_fp8_tri(
     return cudaGetLastError();
 }
 
+// CUTLASS-style fp8 MMA gemv (tensor core), modeled on the proven
+// moe_fused_act_fp8_mma structure: M = n<=16 tokens, N = 8 output rows per
+// warp-group, K = in_f split across the block's 8 warps, 3-stage cp.async
+// pipeline, ldmatrix.x4 for A, manual B fragment from per-warp smem tiles
+// (no cross-warp races). grid = ceil(out_f/8) = 192 blocks at out_f=1536.
+// Weights are read as native e4m3 (1 byte) — half the bytes of the bf16 SIMT
+// gemv — and the MMA replaces ~2048 serial FMA per lane with tensor ops.
+template <int UNUSED_WPR>
+__global__ void __launch_bounds__(256, 3) gemv_fp8_mma_kernel(
+    const unsigned char* __restrict__ xq,   // [n<=16, in_f] e4m3
+    const float* __restrict__ xs,           // [n] per-token scales
+    const unsigned char* __restrict__ w,    // [out_f, in_f] e4m3
+    const float* __restrict__ ws,           // [out_f/128, scols]
+    float* __restrict__ out,                // [n, out_f]
+    int n, int in_f, int out_f, int scols) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row0 = blockIdx.x * 8;
+    if (row0 >= out_f) return;
+    const int c0 = (lane & 3) * 4;
+    const int kper = ((in_f + 7) / 8 + 63) & ~63;   // per-warp K slice, 64-aligned
+    const int k0 = warp * kper;
+    const int k1 = min(k0 + kper, in_f);
+    // per-warp tiles, 3-deep (mirrors the act kernel's sa[3][8][...] layout)
+    __shared__ unsigned char sx[3][8][16][80];      // [stage][warp][tok][K]
+    __shared__ unsigned char sw[3][8][8][80];       // [stage][warp][row][K]
+    __shared__ float red[8][32][4];
+    #define GMMA_ISSUE(KB, ST) do { \
+        { \
+            const int t = lane >> 1, half_ = lane & 1; \
+            const unsigned char* src_ = xq + (size_t)t * in_f + (KB) + half_ * 32; \
+            unsigned char* dst_ = sx[ST][warp][t] + half_ * 32; \
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" \
+                         :: "r"((unsigned)__cvta_generic_to_shared(dst_)), "l"(src_)); \
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" \
+                         :: "r"((unsigned)__cvta_generic_to_shared(dst_ + 16)), "l"(src_ + 16)); \
+        } \
+        { \
+            const int r = lane >> 2, q = lane & 3; \
+            const unsigned char* src_ = w + (size_t)(row0 + r) * in_f + (KB) + q * 16; \
+            unsigned char* dst_ = sw[ST][warp][r] + q * 16; \
+            asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" \
+                         :: "r"((unsigned)__cvta_generic_to_shared(dst_)), "l"(src_)); \
+        } \
+        asm volatile("cp.async.commit_group;\n"); \
+    } while (0)
+    GMMA_ISSUE(k0, 0);
+    if (k0 + 64 < k1) GMMA_ISSUE(k0 + 64, 1);
+    if (k0 + 128 < k1) GMMA_ISSUE(k0 + 128, 2);
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    int st = 0;
+    for (int kb = k0; kb < k1; kb += 64, st = (st + 1) % 3) {
+        if (kb + 192 < k1) asm volatile("cp.async.wait_group 2;\n");
+        else if (kb + 128 < k1) asm volatile("cp.async.wait_group 1;\n");
+        else asm volatile("cp.async.wait_group 0;\n");
+        __syncwarp();
+        #pragma unroll
+        for (int kk = 0; kk < 64; kk += 32) {
+            const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+                sx[st][warp][0] + (size_t)(lane & 15) * 80 + kk + ((lane >> 4) * 16));
+            unsigned a[4];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr_a));
+            unsigned b[2];
+            b[0] = *(const unsigned*)(sw[st][warp][(lane >> 2)] + kk + c0);
+            b[1] = *(const unsigned*)(sw[st][warp][(lane >> 2)] + kk + c0 + 16);
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+        }
+        if (kb + 192 < k1) GMMA_ISSUE(kb + 192, st);
+    }
+    #undef GMMA_ISSUE
+    // weight block scale: 8 rows of a warp share one 128-row block only if
+    // row0%128 <= 120 (row0 is 8-aligned, so always true)
+    const float wsc = ws[(size_t)(row0 >> 7) * scols + ((k0) >> 7)];
+    red[warp][lane][0] = acc[0] * wsc; red[warp][lane][1] = acc[1] * wsc;
+    red[warp][lane][2] = acc[2] * wsc; red[warp][lane][3] = acc[3] * wsc;
+    __syncthreads();
+    if (warp == 0) {
+        float s0 = 0.f, s1 = 0.f, s2 = 0.f, s3 = 0.f;
+        #pragma unroll
+        for (int u = 0; u < 8; u++) {
+            s0 += red[u][lane][0]; s1 += red[u][lane][1];
+            s2 += red[u][lane][2]; s3 += red[u][lane][3];
+        }
+        const int m0_ = lane >> 2, n0_ = (lane & 3) * 2;
+        if (m0_ < n) {
+            out[(size_t)m0_ * out_f + row0 + n0_] = s0 * xs[m0_];
+            out[(size_t)m0_ * out_f + row0 + n0_ + 1] = s1 * xs[m0_];
+        }
+        if (m0_ + 8 < n) {
+            out[(size_t)(m0_ + 8) * out_f + row0 + n0_] = s2 * xs[m0_ + 8];
+            out[(size_t)(m0_ + 8) * out_f + row0 + n0_ + 1] = s3 * xs[m0_ + 8];
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_gemv_fp8_mma(
+    const unsigned char* xq, const float* xs,
+    const unsigned char* w, const float* ws,
+    float* out, int n, int in_f, int out_f, int scols, cudaStream_t s) {
+    if (n <= 0 || n > 16 || (out_f & 7) != 0 || in_f <= 0) return cudaErrorInvalidValue;
+    dim3 grid((unsigned)((out_f + 7) / 8));
+    gemv_fp8_mma_kernel<0><<<grid, 256, 0, s>>>(xq, xs, w, ws, out, n, in_f, out_f, scols);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           const float* scale, const float* bias,
                                           float* out, int in_f, int out_f,
