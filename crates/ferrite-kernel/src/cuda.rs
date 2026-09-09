@@ -4005,6 +4005,11 @@ impl CudaBackend {
     /// argument" — the H2D src was the freed stage). The pins leak
     /// ~64KB/seq — negligible vs the ~GBs of DSA caches freed here.
     pub fn free_seq(&self, seq: u64) -> Result<()> {
+        // DIAGNOSTIC (FERRITE_NO_FREE=1): leak instead of freeing — isolates
+        // whether the cudaFree itself is what poisons the next allocation.
+        if std::env::var_os("FERRITE_NO_FREE").is_some() {
+            return Ok(());
+        }
         self.enter();
         // Pending stream work may still reference the seq's buffers (the
         // last decode's async kernels): sync before freeing. Best-effort —
