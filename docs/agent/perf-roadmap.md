@@ -770,3 +770,36 @@ hc 两个 kernel 的 `Waves Per SM = 0.05` 意味着 132 个 SM 里只有 16–4
 **已落地（保留）**：gemv `WPR=8` + `__launch_bounds__(256,4)`（微基准 q_a 46→31µs、head 489→353µs，serve 端中性）；
 新增 `kernels/cuda/gemv_bench.cu` 微基准；`ncu_moe_bench.cu` 支持 `n`/`inter` 参数化。
 **已证伪**：MAXN 64→32→16（down 89.4/89.4/89.2µs，无影响）；act 的 launch_bounds 4/5/6（57.6/61.1/69.1µs，均差于现状 3）。
+
+### 链路级 overlap 分析（2026-09-09，回答"哪里能 overlap 却没 overlap"）
+
+**事实 1：整条 decode 链只有一条 CUDA stream**（`cudaStreamCreate` 仅 1 处，cuda.rs:805），
+所有 kernel 严格串行；独立算子（同一份 x 的多个投影）全部背靠背。
+
+**事实 2：实测双流 overlap 收益**（`gemv_bench.cu` 的 2-stream probe，q_a 1536×4096 +
+kv_a 512×4096，同一份 x，n=16）：
+```
+sequential (1 stream): 0.043 ms/pair
+overlapped (2 streams): 0.035 ms/pair  (82% of sequential)
+```
+**overlap 有效但只能省 20%**（理想 = max(31,13)=31µs，实测 35µs ≈ 理想的 88%），
+因为两个 kernel 争同一条 L1/TEX 通路（ncu: gemv L1 49–63%）。
+
+**事实 3：ncu 显示大量空闲发射槽**。gemv 在 `launch_bounds(256,4)` 后：占用率 45.6%、
+**No Eligible 48.9%**（近一半周期没有可发射 warp）、Active Warps/Scheduler 仅 7.35/16。
+
+**具体"能 overlap 却没 overlap"的位置**：
+1. **同一输入的多投影**：DSA 层 wk / weights_proj / gate 在 **n>1 时退化为 3 次独立 launch**
+   （`gemv_tri_dev` 仅 n==1 启用，cuda.rs:3348）；GDN 层 b_proj / f_a / g_a 同理（34 层 × 3 次）。
+   **注意**：把它们**融合**成一个 kernel 已被证伪（gemv5 48.7µs vs 分开 40.5µs），
+   但**用两条流并发**不同 —— 实测 82%，是可行方向。
+2. **attention 的 q_a∥kv_a、q_b∥kv_b**（同一 x / 同一 norm 输出）。
+3. **AR 无法 overlap**：1.81ms 在关键路径上，后续所有算子都依赖其输出。
+
+**结论**：overlap 天花板约 **20%**（受 L1/TEX 限制），不是 2x 级杠杆。
+真正的结构性问题：**整个 step 是 ~200 个延迟受限小 kernel 的串行和**，
+每块只有张量核峰值 ~1%、DRAM 峰 1–5%、占用率 23–52%。
+要 1.9x 需要**更少更大的 kernel + tensor core**，而非继续调单 kernel。
+
+**已验证的孤立优化（保留）**：gemv `__launch_bounds__(256,4)` —— ncu 复测 53.5→39.0µs、
+占用率 23.3→45.6%、No Eligible 74.8→48.9%、寄存器 84→64；微基准 q_a 46→31µs、head 489→353µs。
