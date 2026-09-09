@@ -4778,7 +4778,7 @@ impl CudaBackend {
                         // FERRITE_MOE_DOWN_MMA=1 opts into the (correct but 6x slower)
                         // bf16 variant.
                         let use_down_e4m3 = std::env::var("FERRITE_DOWN_MMA")
-                            .map(|v| v != "0").unwrap_or(true);
+                            .map(|v| v == "1").unwrap_or(false);
                         let use_down_bf16 = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
                         let mut down_done = false;
