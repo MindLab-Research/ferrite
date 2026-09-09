@@ -3380,7 +3380,7 @@ impl CudaBackend {
             if ptrs.0.is_null() {
                 let max_tokens = 8192usize;
                 let kn = self.dsa_alloc(max_tokens * h * dk)?;
-                let vv = self.dsa_alloc(max_tokens * h * dv)?;
+                let vv = self.dsa_alloc_h(max_tokens * h * dv)?;
                 let ki_ = self.dsa_alloc(max_tokens * idm)?;
                 let kg = self.dsa_alloc(max_tokens * idm)?;
                 // pinned t0/total (graph-safe zero-copy)
@@ -3727,7 +3727,7 @@ impl CudaBackend {
                     None => {
                         let max_tokens = 8192usize;
                         let kn = self.dsa_alloc(max_tokens * h * dk)?;
-                        let vv = self.dsa_alloc(max_tokens * h * dv)?;
+                        let vv = self.dsa_alloc_h(max_tokens * h * dv)?;
                         let ki_ = self.dsa_alloc(max_tokens * idm)?;
                         let kg = self.dsa_alloc(max_tokens * idm)?;
                         let mut pt0: *mut i32 = std::ptr::null_mut();

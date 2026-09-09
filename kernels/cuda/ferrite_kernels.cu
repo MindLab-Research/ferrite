@@ -3845,7 +3845,7 @@ __global__ void dsa_cache_append_kernel(
         if (c < dk) {
             k_nope[dst * dk + c] = kvb[tid];
         } else {
-            v[dst * dv + (c - dk)] = kvb[tid];
+            v[dst * dv + (c - dk)] = __float2half(kvb[tid]);
         }
     } else if (tid < total_elems + n * idm) {
         int j = tid - total_elems;
@@ -4356,11 +4356,14 @@ __global__ void sparse_attn_v2_batched_kernel(
                 if (w == 0.f) continue;
                 const int j = idxs[s];
                 if (j < 0 || j >= t) continue;
-                float4 vv;
-                asm volatile("ld.global.nc.L2::128B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
-                             : "=f"(vv.x), "=f"(vv.y), "=f"(vv.z), "=f"(vv.w)
-                             : "l"(v_s + ((size_t)j * h + hd) * dv + c * 4));
-                a.x += w * vv.x; a.y += w * vv.y; a.z += w * vv.z; a.w += w * vv.w;
+                uint2 vraw;
+                asm volatile("ld.global.nc.L2::128B.v2.u32 {%0,%1}, [%2];\n"
+                             : "=r"(vraw.x), "=r"(vraw.y)
+                             : "l"(reinterpret_cast<const __half*>(v_s) + ((size_t)j * h + hd) * dv + c * 4));
+                const __half2 v0 = *reinterpret_cast<const __half2*>(&vraw.x);
+                const __half2 v1 = *reinterpret_cast<const __half2*>(&vraw.y);
+                a.x += w * __half2float(v0.x); a.y += w * __half2float(v0.y);
+                a.z += w * __half2float(v1.x); a.w += w * __half2float(v1.y);
             }
             __shared__ float4 pred[4 * 64];     // static (4KB), G<=4, cols<=64
             pred[g * cols + c] = a;
