@@ -499,7 +499,14 @@ __global__ void gdn_step_kernel(const float* __restrict__ q,
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
         float decay = expf(gh[i]);
         if (decay != 1.0f) {
-            for (int j = 0; j < dv; j++) S[(size_t)i * dv + j] *= decay;
+            {   // float4 vectorized (identical math)
+                float* Sr = S + (size_t)i * dv;
+                for (int j = 0; j < dv; j += 4) {
+                    float4 sv = *reinterpret_cast<const float4*>(Sr + j);
+                    sv.x *= decay; sv.y *= decay; sv.z *= decay; sv.w *= decay;
+                    *reinterpret_cast<float4*>(Sr + j) = sv;
+                }
+            }
         }
     }
     __syncthreads();
@@ -654,7 +661,11 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
         float decay = expf(gh[i]);
         if (decay != 1.0f) {
             float* Si = S + (size_t)i * spitch;
-            for (int j = 0; j < dv; j++) Si[j] *= decay;
+            for (int j = 0; j < dv; j += 4) {
+                float4 sv = *reinterpret_cast<const float4*>(Si + j);
+                sv.x *= decay; sv.y *= decay; sv.z *= decay; sv.w *= decay;
+                *reinterpret_cast<float4*>(Si + j) = sv;
+            }
         }
     }
     __syncthreads();
@@ -885,7 +896,11 @@ __global__ void gdn_chunk_batched_kernel(
         float decay = expf(gh[i]);
         if (decay != 1.0f) {
             float* Si = S + (size_t)i * spitch;
-            for (int j = 0; j < dv; j++) Si[j] *= decay;
+            for (int j = 0; j < dv; j += 4) {
+                float4 sv = *reinterpret_cast<const float4*>(Si + j);
+                sv.x *= decay; sv.y *= decay; sv.z *= decay; sv.w *= decay;
+                *reinterpret_cast<float4*>(Si + j) = sv;
+            }
         }
     }
     __syncthreads();
