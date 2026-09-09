@@ -889,6 +889,23 @@ impl<B: KernelBackend> TpCluster<B> {
         if n == 0 {
             return Ok(Vec::new());
         }
+        // ⛔ HARD GUARD (2026-09-09 incident): FERRITE_P2P deadlocks the batched
+        // path at n>8 (documented below — capture serializes the ranks' epochs).
+        // A deadlocked in-graph P2P kernel that is then killed (timeout -s INT /
+        // SIGKILL) wedges the GPU driver: all 8 GPUs logged
+        //   NVRM: refcntRequestReference_IMPL: Failed to enter state 1
+        // and every later decode on that node faulted with Xid 31 PDE faults
+        // (unmapped 2MB pages), progressively worse (b16 → b4 → b1 all dead).
+        // Fail loudly here instead of silently deadlocking + wedging the node.
+        if std::env::var_os("FERRITE_P2P").is_some() {
+            return Err(FerriteError::InvalidArg(
+                "FERRITE_P2P is FORBIDDEN on the batched decode path: the in-graph \
+                 P2P all-reduce deadlocks at n>8, and killing the deadlocked process \
+                 wedges the GPU driver (Xid 31 PDE faults on every later run). \
+                 Unset FERRITE_P2P when serving with --max-seqs > 1."
+                    .into(),
+            ));
+        }
         let plans = build_layer_plans(&self.full_cfg);
         let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
         // SGLang-style batch-size padding: ONE graph per padded size
