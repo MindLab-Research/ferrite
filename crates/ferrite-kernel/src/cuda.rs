@@ -4419,7 +4419,7 @@ impl CudaBackend {
                                 sd.w, sd.scale as *const f32,
                                 act.as_const_f32(), out.as_f32(),
                                 expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                                topk as i32, ni, dscols, self.stream,
+                                topk as i32, dscols, ni, self.stream,
                             )
                         } };
                         if down_mma != 0 {
@@ -4430,7 +4430,7 @@ impl CudaBackend {
                                     sd.w, sd.scale,
                                     act.as_const_f32(), out.as_f32(),
                                     expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                                    topk as i32, ni, dscols, self.stream,
+                                    topk as i32, dscols, ni, self.stream,
                                 )
                             }, "moe_fused_down_sum_fp8")?;
                         }
@@ -4464,7 +4464,7 @@ impl CudaBackend {
                                 sd.w, sd.scale as *const f32,
                                 act.as_const_f32(), out.as_f32(),
                                 expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                                topk as i32, ni, dscols, self.stream,
+                                topk as i32, dscols, ni, self.stream,
                             )
                         } };
                         if down_mma != 0 {
@@ -4475,7 +4475,7 @@ impl CudaBackend {
                                     sd.w, sd.scale,
                                     act.as_const_f32(), out.as_f32(),
                                     expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                                    topk as i32, ni, dscols, self.stream,
+                                    topk as i32, dscols, ni, self.stream,
                                 )
                             }, "moe_fused_down_sum_fp8")?;
                         }
@@ -4505,7 +4505,7 @@ impl CudaBackend {
                         sd.w, sd.scale,
                         act.as_const_f32(), out.as_f32(),
                         expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
-                        topk as i32, ni, dscols, self.stream,
+                        topk as i32, dscols, ni, self.stream,
                     )
                 }, "moe_fused_down_sum_fp8")?;
                 return Ok(out);

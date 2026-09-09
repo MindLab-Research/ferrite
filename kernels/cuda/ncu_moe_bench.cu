@@ -132,7 +132,7 @@ static void launch_down_fp8(void* v) {
         (const void* const*)c->down_w8, (const void* const*)c->down_sc,
         c->sd_w8, c->sd_sc, c->act, c->out,
         0, c->e_local, c->hidden, c->inter, c->inter_shared,
-        c->topk, c->n, (c->inter + 127) / 128, c->s));
+        c->topk, (c->inter + 127) / 128, c->n, c->s));
 }
 static void launch_down_mma(void* v) {
     MoeCtx* c = (MoeCtx*)v;
@@ -140,7 +140,7 @@ static void launch_down_mma(void* v) {
         (const void* const*)c->down_w8, (const void* const*)c->down_sc,
         c->sd_w8, c->sd_sc, c->act, c->out,
         0, c->e_local, c->hidden, c->inter, c->inter_shared,
-        c->topk, c->n, (c->inter + 127) / 128, c->s));
+        c->topk, (c->inter + 127) / 128, c->n, c->s));
 }
 static void launch_down_bf16(void* v) {
     MoeCtx* c = (MoeCtx*)v;
@@ -148,7 +148,7 @@ static void launch_down_bf16(void* v) {
         (const void* const*)c->down_w8, (const void* const*)c->down_sc,
         c->sd_w8, c->sd_sc, c->act, c->out,
         0, c->e_local, c->hidden, c->inter, c->inter_shared,
-        c->topk, c->n, (c->inter + 127) / 128, c->s));
+        c->topk, (c->inter + 127) / 128, c->n, c->s));
 }
 static void launch_act_bf16(void* v) {
     MoeCtx* c = (MoeCtx*)v;
