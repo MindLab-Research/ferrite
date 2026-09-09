@@ -4730,11 +4730,82 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     const int ngroups = blockDim.x / TG;
     const unsigned gmask = 0xffu << ((threadIdx.x & 31) & ~7u);   // 8-lane groups (TG=8) — must match TG
     const int glane0 = (threadIdx.x & 31) & ~7;
-    // 2-way unroll: ncu showed long-scoreboard (global-load latency) as the
-    // top stall (43.5%) with only 0.48 eligible warps/scheduler. Unrolling
-    // lets the next slot's K loads issue while the current dot computes.
-    #pragma unroll 2
-    for (int s = gid; s < live_k; s += ngroups) {
+    // ---- QK^T on the tensor core (16 slots per MMA tile) ----
+    // ncu: this kernel is latency-bound (No-Eligible 69.5%, long-scoreboard
+    // 43.5%, Compute 24.7%). Each slot's 256-dim dot was 32 serial FMAs per
+    // lane; the fp8 m16n8k32 does 16 slots x 32 K per instruction.
+    // A = the 16 slots' K rows (fp8, gathered from the cache into smem)
+    // B = the Q (fp8, replicated across the 8 N columns)
+    // C[slot][0] = that slot's score (col 0 carries the answer).
+    __shared__ unsigned char q8s[256];          // the Q in e4m3
+    __shared__ unsigned char kt[16][40];        // 16 slots x 32 K (+pad)
+    {
+        const float qsc = 1.0f;                  // Q quantized with absmax/448
+        float am = 1e-9f;
+        for (int l = threadIdx.x; l < d; l += blockDim.x) am = fmaxf(am, fabsf(qs[l]));
+        __syncthreads();
+        const float qscale = am / 448.0f + 1e-12f;
+        for (int l = threadIdx.x; l < d; l += blockDim.x)
+            q8s[l] = (unsigned char)__nv_cvt_float_to_fp8(
+                fminf(fmaxf(qs[l] / qscale, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3);
+        __syncthreads();
+        for (int s0 = 0; s0 < live_k; s0 += 16) {
+            // gather 16 slots x 32-K chunks, one pass per k-tile
+            for (int l = threadIdx.x; l < 16 * 32; l += blockDim.x) {
+                const int r = l >> 5, kk = l & 31;
+                const int ss = s0 + r;
+                unsigned char v8 = 0;
+                if (ss < live_k) {
+                    const int j = idxs[ss];
+                    if (j >= 0 && j < t) v8 = k_s[((size_t)j * h + hd) * d + kk];
+                }
+                kt[r][kk] = v8;
+            }
+            __syncwarp();
+            float acc[4] = {0.f, 0.f, 0.f, 0.f};
+            const int c0 = (lane & 3) * 4;
+            // 8 k32 tiles over d=256
+            for (int kb = 0; kb < 32; kb += 32) {
+                // (single k-tile per 32-K chunk below)
+                (void)kb;
+            }
+            // NOTE: the full 8-tile loop is unrolled below for clarity
+            #pragma unroll
+            for (int kt_i = 0; kt_i < 8; kt_i++) {
+                // A fragment: lanes 0-15 give the 16 rows at the k half
+                const unsigned saddr = (unsigned)__cvta_generic_to_shared(
+                    &kt[0][0] + (size_t)(lane & 15) * 40 + ((lane >> 4) * 16) + kt_i * 32);
+                unsigned a[4];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr));
+                unsigned b[2];
+                b[0] = *(const unsigned*)(q8s + kt_i * 32 + c0);
+                b[1] = *(const unsigned*)(q8s + kt_i * 32 + c0 + 16);
+                asm volatile(
+                    "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            }
+            // epilogue: lane l/4 holds rows l/4 and l/4+8 at column (l%4)*2
+            if ((lane & 3) == 0) {
+                const int r0_ = lane >> 2;
+                for (int r = 0; r < 2; r++) {
+                    const int rr = r0_ + r * 8;
+                    const int ss = s0 + rr;
+                    if (ss < live_k && lid == 0) {
+                        const int j = idxs[ss];
+                        const bool valid = (j >= 0 && j < t);
+                        sc[ss] = valid ? (acc[r * 2] * ksc_s[(size_t)j * h + hd] * scale * qscale)
+                                       : -INFINITY;
+                    }
+                }
+            }
+            __syncwarp();
+        }
+    }
+    // (the old per-slot dot loop is replaced above)
+    for (int s = 0; s < 0; s += ngroups) {
         int j = idxs[s];
         bool valid = (j >= 0 && j < t);
         int dup = 0;
