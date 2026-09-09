@@ -1367,6 +1367,11 @@ extern "C" cudaError_t ferrite_router_gemm_route_fused(
 extern "C" cudaError_t ferrite_moe_route(const float* logits, const float* bias,
                                         float* probs, float* ids, int n, int e,
                                         int topk, float scale, cudaStream_t s) {
+    // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
+    // share of the step. Output is garbage by construction; timing only.
+    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr;
+    if (moe_skip_) return cudaSuccess;
+
     dim3 block(256);   // 8 warps: the top-k scan over e is 2 iters/round vs 9
     dim3 grid(n);
     size_t smem = 2 * (size_t)e * sizeof(float);
@@ -3425,6 +3430,11 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     const float* act, float* out,
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
+    // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
+    // share of the step. Output is garbage by construction; timing only.
+    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr;
+    if (moe_skip_) return cudaSuccess;
+
     if (n == 1) {
         // n=1 PATH (v0 warp-serial): the v12.1 expert-parallel + register-cache
         // variant's 48 regs/lane dropped occupancy — n=1 measured 90.9 (v0)
@@ -3711,6 +3721,11 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
     int inter_shared, int topk, int n, float limit,
     const void* xq, const void* xs, cudaStream_t s)
 {
+    // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
+    // share of the step. Output is garbage by construction; timing only.
+    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr;
+    if (moe_skip_) return cudaSuccess;
+
     int max_rows = inter > inter_shared ? inter : inter_shared;
     if (max_rows % 16 != 0 || hidden % 128 != 0) return cudaErrorNotSupported;
     dim3 grid((unsigned)(max_rows / 16), topk + 1, n);
