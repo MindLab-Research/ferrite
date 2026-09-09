@@ -4104,7 +4104,7 @@ extern "C" {
                                   hidden: i32, inter: i32, inter_shared: i32,
                                   topk: i32, n: i32, limit: f32, hscols: i32,
                                   s: CuStream) -> i32;
-    fn ferrite_moe_down_mma(
+    fn ferrite_moe_down_bf16_mma(
         ids_f: *const f32, probs: *const f32,
         down_w8_ptrs: *const *const std::ffi::c_void,
         down_scale_ptrs: *const *const f32,
@@ -4413,7 +4413,7 @@ impl CudaBackend {
                         let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
                         let down_mma = if !use_down_mma { 1 } else { unsafe {
-                            ferrite_moe_down_mma(
+                            ferrite_moe_down_bf16_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
                                 tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
                                 sd.w, sd.scale as *const f32,
@@ -4458,7 +4458,7 @@ impl CudaBackend {
                         let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
                         let down_mma = if !use_down_mma { 1 } else { unsafe {
-                            ferrite_moe_down_mma(
+                            ferrite_moe_down_bf16_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
                                 tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
                                 sd.w, sd.scale as *const f32,
