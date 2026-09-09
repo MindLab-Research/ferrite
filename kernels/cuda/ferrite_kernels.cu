@@ -2083,24 +2083,37 @@ __global__ void hc_post_kernel(const float* __restrict__ x,
     cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
 #endif
     // out[t,i,j] = post[t,i]*x[t,j] + Σ_k comb[t,k,i]*res[t,k,j]
+    // VECTORIZED (2026-09-10): one thread per 4 consecutive j (float4). The
+    // scalar version ran at ~1.3TB/s (3 scalar reads + 1 scalar write per
+    // thread = 4x the memory requests, latency-bound at low occupancy);
+    // float4 quarters the request count and widens each to 16B. Numerics
+    // bit-identical: each acc lane is an independent FMA chain in the same
+    // k-ascending order as the scalar loop.
+    const int h4 = h >> 2;
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = s * n * h;
+    int total = s * n * h4;
     if (idx >= total) return;
-    int j = idx % h;
-    int i = (idx / h) % n;
-    int t = idx / (n * h);
-    float acc = post[(size_t)t * n + i] * x[(size_t)t * h + j];
+    int j4 = idx % h4;
+    int i = (idx / h4) % n;
+    int t = idx / (n * h4);
+    const int j = j4 << 2;
+    const float pv = post[(size_t)t * n + i];
+    float4 acc = *reinterpret_cast<const float4*>(x + (size_t)t * h + j);
+    acc.x *= pv; acc.y *= pv; acc.z *= pv; acc.w *= pv;
     for (int k = 0; k < n; k++) {
-        acc += comb[(size_t)t * n * n + k * n + i] * res[(size_t)(t * n + k) * h + j];
+        const float c = comb[(size_t)t * n * n + k * n + i];
+        const float4 rv = *reinterpret_cast<const float4*>(res + (size_t)(t * n + k) * h + j);
+        acc.x += c * rv.x; acc.y += c * rv.y; acc.z += c * rv.z; acc.w += c * rv.w;
     }
-    out[idx] = acc;
+    *reinterpret_cast<float4*>(out + (size_t)t * n * h + (size_t)i * h + j) = acc;
 }
 
 extern "C" cudaError_t ferrite_hc_post(const float* x, const float* res,
                                         const float* post, const float* comb,
                                         float* out, int s, int n, int h,
                                         cudaStream_t stream) {
-    int total = s * n * h;
+    if ((h & 3) != 0) return cudaErrorNotSupported; // float4 path needs h % 4 == 0
+    int total = s * n * (h >> 2);
     dim3 block(256);
     dim3 grid((total + 255) / 256);
     return pdl_or_plain(hc_post_kernel, grid, block, 0, stream,
