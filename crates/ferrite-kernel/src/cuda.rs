@@ -1987,6 +1987,9 @@ impl CudaBackend {
                         ferrite_gemv_fp8_mma_b16(xq, xs, f8.w as *const u8, f8.scale as *const f32,
                                                  do_.as_f32(), n, in_f, out_f, f8.scols, self.stream)
                     };
+                    if r != 0 {
+                        eprintln!("[opcheck] moe_fused_act_fp8_mma_v2 returned err {r} — the act kernel (v2, n={ni}) is the first failing launch");
+                    }
                     if r == 0 {
                         return Ok(do_);
                     }
@@ -4554,6 +4557,9 @@ impl CudaBackend {
                             topk as i32, ni, swiglu_limit, self.stream,
                         )
                     };
+                    if r != 0 {
+                        eprintln!("[opcheck] moe_fused_act_fp8_mma (v1) returned err {r} — the act kernel (n={ni}) is the first failing launch");
+                    }
                     if r == 0 {
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
                         // WIP: the tensor-core down currently produces wrong
