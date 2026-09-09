@@ -297,7 +297,14 @@ int main(int argc, char** argv) {
         // zero inputs) — this is what made the first compare inconclusive.
         size_t alen = (size_t)mc.n * (mc.topk * mc.inter + mc.inter_shared);
         std::vector<float> ha(alen);
-        for (size_t i = 0; i < alen; i++) ha[i] = 0.05f * (float)((int)(i * 7919 % 200) - 100);
+        // wide dynamic range (swiglu-like): mix of tiny and large magnitudes.
+        // The uniform +/-5 fill gave only ~3% dot error; if the error grows
+        // with the range, the quantization scale is the mechanism.
+        for (size_t i = 0; i < alen; i++) {
+            float u = (float)((int)(i * 7919 % 2000) - 1000) / 1000.f;   // -1..1
+            float mag = powf(10.f, (float)((int)(i * 104729 % 7)) - 3.f); // 1e-3..1e3
+            ha[i] = u * mag;
+        }
         CK(cudaMemcpy(mc.act, ha.data(), alen * 4, cudaMemcpyHostToDevice));
         size_t olen = (size_t)mc.n * mc.hidden;
         std::vector<float> a(olen), b(olen);
