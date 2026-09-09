@@ -218,7 +218,7 @@ steady×16 ≈ **1029**。device 推进的两个坑（f157cb0）：单 seq→bat
 **已验证无效（gate off 保留代码）**：e4m3 MMA down v1/v2（**修正基准参数后**——旧 bench 误用 inter_shared=512，SIMT 对 klen≠256 走标量慢路径，造出"108µs/指令瓶颈/2.14x"三重假象；正确参数下 SIMT 43.7µs=in-serve 实测，v1 48.6 / v2 连续读 49.4 均**更慢**——down 在 2.5TB/s 有效带宽的地板，勿再试 MMA 化）；n==16 bf16 wmma 投影（无 K-split，6x 回退）；P2P AR 复测仍死锁（30s 监护杀，驱动未 wedge）。**教训：隔离基准必须用生产的真实 shape（inter_shared 等），错一个参数结论全反。**
 
 **当前分解**（每步每卡）：MoE 3.85（act 1.81 已达实测带宽峰/down 1.77/route 0.26）· AR 2.66（NCCL 会合地板 90×29.5µs）· hc 2.11 · 投影 cuBLAS 族 2.2（DSA/GDN 小投影 bf16-only + 每 GEMM 一次 f32→bf16 cast）· DSA 1.11 · GDN 1.18 · 间隙+host ~0.6。
-**通往 1600（≤10ms）**：已识别 kernel 杠杆全做 ≈ 13.2-13.7ms（≈1200 tok/s）；剩余 ~3ms 缺口需结构改动：**MoE 改 EP**（消除 42 次 FFN AR ≈ −1.2ms + dispatch/combine）或单 kernel 自定义 AR（P2P 死锁史，风险高）。
+**通往 1600（≤10ms）的诚实重估（2026-09-10 末）**：已识别 kernel 杠杆（投影融合 −0.5、hc −0.3、act 深挖 −0.3）≈ **−1.1ms → ~13.5ms ≈ 1180 tok/s**。EP 重估：FFN AR 1.24ms 被两次 all-to-all（dispatch+collect，各 ~2MB/rank/层）替代——per-link 字节相当，**净赢只剩 −0.3~−0.6ms**（不是初估的 −1.2）。**校准：SGLang 在同硬件 DCP-8+EAGLE 下 ~3200（含 MTP ≈2.4x）→ 其不开 MTP 基座 ≈1300**——1600 目标超过 SGLang 自身基座 ~23%。剩余候选：DCP 式 KV 切分（SGLang 的实际答案，结构大改）、act 4.8→6.5TB/s、图节点数削减。quick-win 已全部关停：down MMA v1/v2（基准伪影修正后均更慢）、kpool grid cap（15.29 回退——空块不是成本，全 grid 的内存级并行才是）、n==16 bf16 wmma（无 K-split 6x 回退）、P2P（复测仍死锁）。
 
 ## Performance state (perf-b1, 2026-09-08)
 
