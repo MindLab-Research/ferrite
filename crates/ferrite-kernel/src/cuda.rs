@@ -491,6 +491,12 @@ impl DevBuf {
             return Ok(DevBuf { ptr, len, class, dev, stream, stage });
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        // DIAGNOSTIC (FERRITE_POOL_MISS=1): a cudaMalloc inside a stream
+        // capture is ILLEGAL (err 900) and would silently invalidate the graph
+        // — the dry-run is supposed to warm every pool class first.
+        if std::env::var_os("FERRITE_POOL_MISS").is_some() {
+            eprintln!("[pool-miss] dev={dev} class={class} len={len} — cudaMalloc (capture-illegal if inside a capture)");
+        }
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
         let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "pinned stage malloc")?;
