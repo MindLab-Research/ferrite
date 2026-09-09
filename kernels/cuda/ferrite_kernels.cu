@@ -4541,8 +4541,12 @@ __global__ void sparse_attn_v2_batched_kernel(
     float* sc = sm + d;                                // [topk]
     int* idxs = (int*)(sc + topk);                     // [topk]
     float* red = (float*)(idxs + topk);                // [8]
-    unsigned int* bm = (unsigned int*)(red + 8);       // [4096] dedup bitmap
-    const int bm_words_max = 4096;
+    unsigned int* bm = (unsigned int*)(red + 8);       // [256] dedup bitmap
+    // 256 words = 8192 tokens = the DSA cache's max_t. Was 4096 words
+    // (131072 tokens) = 16KB of smem for nothing: ncu showed shared memory
+    // capping this kernel at 5 blocks/SM (No-Eligible 69.5%, top stall
+    // long-scoreboard 43.5%). 16x smaller bitmap -> ~12 blocks/SM.
+    const int bm_words_max = 256;
     int bm_words = (t + 31) >> 5; if (bm_words > bm_words_max) bm_words = bm_words_max;
     for (int l = threadIdx.x; l < d; l += blockDim.x) qs[l] = q_s[(size_t)hd * d + l];
     for (int s = threadIdx.x; s < live_k; s += blockDim.x) idxs[s] = (int)idx_s[s];
@@ -4764,7 +4768,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     dim3 block(256);
     dim3 grid(B, h);
     size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
-                  + 8 * sizeof(float) + 4096 * sizeof(unsigned int);
+                  + 8 * sizeof(float) + 256 * sizeof(unsigned int);
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(sparse_attn_v2_batched_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
