@@ -22,6 +22,12 @@
 #include <cuda_fp8.h>
 
 extern "C" {
+cudaError_t ferrite_gemv_fp8_mma_b16(const unsigned char* xq, const float* xs,
+                                    const unsigned char* w, const float* ws,
+                                    float* out, int n, int in_f, int out_f,
+                                    int scols, cudaStream_t s);
+cudaError_t ferrite_quant_e4m3_tokens(const float* x, unsigned char* xq,
+                                      float* xs, int n, int hidden, cudaStream_t s);
 cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                 const float* scale, const float* bias,
                                 float* out, int in_f, int out_f,
@@ -187,6 +193,79 @@ static void overlap_probe(int iters) {
     cudaStreamDestroy(sA); cudaStreamDestroy(sB);
 }
 
+
+// MMA path test: quantize x once, run gemv_fp8_mma_b16, compare against a
+// reference built from the SAME quantized x (so only the accumulation differs).
+static void bench_mma(int in_f, int out_f, int n, int iters, float tol) {
+    size_t wx = (size_t)out_f * in_f;
+    int srows = (out_f + 127) / 128, scols = (in_f + 127) / 128;
+    float *x, *out, *ref, *scale, *xs;
+    unsigned char *w, *xq;
+    cudaMalloc(&x, (size_t)n * in_f * 4);
+    cudaMalloc(&xq, (size_t)n * in_f);
+    cudaMalloc(&xs, (size_t)n * 4);
+    cudaMalloc(&w, wx);
+    cudaMalloc(&scale, (size_t)srows * scols * 4);
+    cudaMalloc(&out, (size_t)n * out_f * 4);
+    cudaMalloc(&ref, (size_t)n * out_f * 4);
+    std::vector<float> hx((size_t)n * in_f), hs((size_t)srows * scols);
+    std::vector<unsigned char> hw(wx);
+    srand(77);
+    for (auto& v : hx) v = (float)(rand() % 2000 - 1000) / 1000.f;
+    for (auto& v : hw) v = (unsigned char)(rand() & 0x7f);
+    for (auto& v : hs) v = 0.002f + 0.001f * (rand() % 5);
+    cudaMemcpy(x, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(w, hw.data(), wx, cudaMemcpyHostToDevice);
+    cudaMemcpy(scale, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+
+    cudaError_t qe = ferrite_quant_e4m3_tokens(x, xq, xs, n, in_f, 0);
+    // reference uses the QUANTIZED x (dequantized) -> only the sum order differs
+    std::vector<float> hxq((size_t)n * in_f), hxs(n);
+    cudaMemcpy(hxq.data(), xq, (size_t)n * in_f, cudaMemcpyDeviceToHost);
+    cudaMemcpy(hxs.data(), xs, (size_t)n * 4, cudaMemcpyDeviceToHost);
+
+    cudaError_t e1 = ferrite_gemv_fp8_mma_b16(xq, xs, w, scale, out, n, in_f, out_f, scols, 0);
+    cudaError_t e2 = cudaDeviceSynchronize();
+    if (qe || e1 || e2) {
+        printf("  [MMA %5d x %6d n=%2d] LAUNCH ERROR: q=%s k=%s sync=%s\n",
+               out_f, in_f, n, cudaGetErrorString(qe), cudaGetErrorString(e1), cudaGetErrorString(e2));
+        return;
+    }
+    // CPU reference (double) with the same e4m3 decode
+    std::vector<float> ho((size_t)n * out_f);
+    cudaMemcpy(ho.data(), out, ho.size() * 4, cudaMemcpyDeviceToHost);
+    double maxrel = 0.0; int nbad = 0;
+    for (int t = 0; t < n; t++) {
+        for (int r = 0; r < out_f; r++) {
+            double acc = 0.0;
+            const float* srow = &hs[(size_t)(r >> 7) * scols];
+            for (int k = 0; k < in_f; k++) {
+                const float wv = __half2float(__nv_cvt_fp8_to_halfraw(hw[(size_t)r * in_f + k], __NV_E4M3))
+                                 * srow[k >> 7];
+                const float xv = __half2float(__nv_cvt_fp8_to_halfraw(hxq[(size_t)t * in_f + k], __NV_E4M3))
+                                 * hxs[t];
+                acc += (double)xv * (double)wv;
+            }
+            double d = fabs(ho[(size_t)t * out_f + r] - acc);
+            double rel = d / fmax(fabs(acc), 1e-6);
+            if (rel > maxrel) maxrel = rel;
+            if (rel > tol) nbad++;
+        }
+    }
+    cudaEvent_t a, b;
+    cudaEventCreate(&a); cudaEventCreate(&b);
+    for (int i = 0; i < 20; i++) ferrite_gemv_fp8_mma_b16(xq, xs, w, scale, out, n, in_f, out_f, scols, 0);
+    cudaDeviceSynchronize();
+    cudaEventRecord(a);
+    for (int i = 0; i < iters; i++) ferrite_gemv_fp8_mma_b16(xq, xs, w, scale, out, n, in_f, out_f, scols, 0);
+    cudaEventRecord(b); cudaEventSynchronize(b);
+    float ms = 0.f; cudaEventElapsedTime(&ms, a, b); ms /= iters;
+    printf("  MMA out=%6d in=%5d n=%2d | %.3f ms/call | maxrel=%.2e bad=%d %s\n",
+           out_f, in_f, n, ms, maxrel, nbad, nbad == 0 ? "OK" : "*** MISMATCH ***");
+    cudaFree(x); cudaFree(xq); cudaFree(xs); cudaFree(w); cudaFree(scale);
+    cudaFree(out); cudaFree(ref);
+}
+
 int main(int argc, char** argv) {
     int iters = (argc > 1) ? atoi(argv[1]) : 200;
     int dev = 0;
@@ -202,6 +281,9 @@ int main(int argc, char** argv) {
     bench(1536, 64, 16, iters, tol);       // q_b
     bench(4096, 19360, 16, iters, tol);    // lm_head (TP8 shard)
     bench(4096, 1536, 1, iters, tol);      // n=1 sanity
+    printf("\n--- fp8 MMA (tensor core) ---\n");
+    bench_mma(4096, 1536, 16, iters, 2e-2f);
+    bench_mma(4096, 19360, 16, iters, 2e-2f);
     overlap_probe(iters);
     printf("done\n");
     return 0;
