@@ -8,8 +8,15 @@ Read `README.md` for the design contract; this file is the operational guide: bu
 1. **任何时候禁止 `git revert`**（含 `git reset` 回退已提交的改动）。
    实测退化就把改动**改成默认关闭的开关**（env-gated）或修正它，**代码保留**。
    构建坏了必须修好，不能靠回退。
-2. **文件同步必须用 rsync 完整同步**（`rsync -az --delete` 全量），
-   禁止"我改了本地但远端没同步"这种浪费时间的情况；push 前先确认两端一致。
+2. **版本同步统一用 git**（本地 `git push origin main:perf-b1` → 远端 `git fetch origin refs/heads/perf-b1 && git reset --hard FETCH_HEAD`），
+   **禁止用 rsync 同步代码**。原因（2026-09-09 实测，浪费数小时）：
+   - `rsync -a` 保留本地 mtime → 远端源码 mtime 比二进制旧 → `cargo build --release` 报
+     `Finished in 0.09s`（**不重编译**）→ 二进制陈旧（实测停在 04:54，源码已到 05:24）→ 16 并发路径 err 700。
+   - `rsync --delete` 会**删掉远端的构建产物**（`libferrite_kernels.so` 不在本地树里）。
+   - 正确流程：git 同步后**必须** `cd kernels/cuda && bash build.sh 103a` + `cargo build --release`，
+     并用 `ls -la target/release/ferrite-serve` 确认时间戳**新于**源码；改动 `.cu` 后必须重跑 `build.sh`。
+3. **永远禁止调用硬件复位类 API**（`nvidia-smi --gpu-reset`、重启驱动、任何影响内核/硬件的操作）。
+   崩溃一律先查软件侧：源码同步/二进制时间戳/版本错配/`dmesg` 的 Xid 原文。
 3. **严禁重跑已知正确的 baseline**。已经验证过的读数就是权威，
    不要为了"确认"再跑一遍（包括"确认默认路径没回归"——默认路径按定义不回归）。
 4. **禁止无意义的验证跑测**。只有**新改动**才需要验证，且优先用隔离微基准（秒级）；
