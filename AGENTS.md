@@ -653,3 +653,52 @@ B300 容量 148 SM × 2048 = 302K 线程。要提占用率需 MORE 并行工作�
 - hc 2.10ms：屏障主导无单点 → 需联合重构（高风险）
 - gdn/投影/其他 ~4.9ms：微优化空间合计 ~0.5-1.0ms
 - **即使全部微优化落地：~12.3ms ≈ 1300 tok/s（server 侧）。1600 需突破 AR 或 MoE 地板。**
+
+## 2026-09-10 末：Expert-Major MoE 分组 — 完整实施计划（下会话执行）
+
+**动机**：B=16 下 128 assignments → ~104 unique experts（23% 冗余权重读取）。当前 act/down
+kernel 是 token-major 调度（grid=(inter_blk, topk+1, n)，blockIdx.z=token）：同一 expert 的
+不同 token 的 block 相隔 ~720 blocks，444 并发窗口外 → L2 无法吸收重复 → 实际读 403MB
+（仅需 328MB）。加上顺序读的 DRAM 效率提升，预估 **−0.5~1.0ms**。
+
+**当前 kernel 结构**（ferrite_kernels.cu:3979 moe_fused_act_fp8_mma_kernel）：
+```c
+grid = (max_rows/16, topk+1, n)  // x=inter 16 行/块, y=slot(0-7 路由 + 8 shared), z=token
+int eid = ids_f[tok * topk + slot];       // 路由表 (token, slot) → expert
+gw8 = gate_w8_ptrs[eid - expert_start];   // 指针表间接寻址
+// 输出: act[tok, slot*inter + m0..m0+16]  // (token, slot) 索引写
+```
+
+**实施步骤**：
+
+1. **排序 kernel**（新，或 moe_route 的 epilogue）：
+   - 输入：ids_f [n, topk]（路由表）
+   - 输出：sorted_experts[128], sorted_tokens[128], sorted_slots[128]
+   - 算法：counting sort by expert ID（128 元素 / 288 experts，1 block）
+   - shared expert（slot==topk）**不参与排序**——保持独立处理（它读全 token）
+
+2. **act kernel 改造**：
+   - grid 改为 (inter_blk, n*topk)（去掉 y/z 分离，线性化 assignment）
+   - 每 block：`int a = blockIdx.y; int expert = sorted_experts[a]; int tok = sorted_tokens[a]; int slot = sorted_slots[a];`
+   - 权重读取：连续 block 同 expert → L2 命中
+   - 输出写：`act[tok * stride + slot*inter + m0..]` — 散射写（stride = topk*inter + inter_shared）
+   - shared expert 保持原路径（blockIdx.y == n*topk 的额外一层，或独立 grid 维）
+
+3. **down kernel 改造**（同样的重映射）：
+   - 读 act 用 sorted table 的 (tok, slot) 索引
+   - 输出 out[tok, hidden]：每 token 的 topk 个 slot 的贡献需 atomicAdd 或分离归约
+     （当前 token-major 下同 token 的 8 slot 天然在不同 warp 可并行累加；expert-major 下
+     同 token 的 slot 可能跨 block → 需要 atomic 或 pre-zero + 单独 reduce kernel）
+
+4. **Rust 接线**：routing 后插入排序 kernel；act/down 的 launcher 传 sorted table 指针。
+
+**风险**：
+- 输出写模式从顺序变散射（write coalescing 可能退化，预估被读侧收益覆盖）
+- down 的跨 slot 归约需原子或额外 kernel（+~5µs/层 × 42 = 0.2ms 成本）
+- shared expert 的独立处理路径要小心（它不参与排序）
+
+**验证**：`/tmp/verify_f32.sh`（B=2 文本 + B=16 200-tok）+ 人眼出师表。
+
+**备选（更简单但收益更小）**：只排序不改 kernel——在 moe_route 的 epilogue 按 expert 排序
+(ids, weights) 的输出顺序，使 act/down 的 block 调度顺序自然变为 expert 相邻。前提是
+kernel 的 (y=slot, z=token) 线性化顺序与排序后的路由表一致——需要验证 grid 调度序。
