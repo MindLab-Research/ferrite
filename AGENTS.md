@@ -230,7 +230,13 @@ steady×16 ≈ **1046**（300 窗口）。gemm3 的文本：逐字正确（《�
 **下一会话执行单元（2026-09-10 固化设计，按价值排序）**：
 ⓪ **sparse_attn flash 式 slot 分割（−0.33ms 预期）**：实测 0.66TB/s 延迟受限（grid(B=16,h=8)=**128 块**，每线程串行 slot 循环；34MB/层 K/V 流量本应 ~7µs 实测 51.8µs）——与 gdn_chunk float4 修复同源（在飞字节不足）。修法：grid (B, h, **4**) = 512 块，每块处理 live_k/4 个 slot 的 online softmax（running max/sum，flash 式），尾部小合并 kernel 归一 4 组 partial（max/sum 合并数学确定序）。f32 cache 布局不变。
 ① 小投影融合多 GEMM：**已完成**（gemm3 默认开，DSA/GDN 各一 launch，−0.16ms）。
-② **DCP 类结构改动**（通往 1600 的唯一已识别路径）：SGLang decode 用 --dcp-size 8（其不开 MTP 基座 ≈1300）；ferrite 的等价物 = DSA 缓存池 + GDN 状态按 rank 切分（注意力无通信化），投影/MoE 每卡全 token 复算或再切分——大架构探索，需专项会话。
+② **MoE EP 化 + 带宽提升（通往 1600 的主路径，完整可达性分析 2026-09-10 末）**：
+   **EP 通信替换**：MoE FFN AR（42×29.5µs=1.24ms）→ all-to-all dispatch/combine（16 tok × 8 experts × 4096 f32 = 512KB/方向/层 × 42 层 = 21.5MB/步 ≈ 24µs @NVLink）→ **净省 ~1.22ms**。NCCL group send/recv 或自定义 kernel（P2P 死锁不适用于点对点 send/recv——无轮询/无共享状态）。
+   **EP 权重布局**：每 rank 持 36 专家 full-inter（36×25.2MB×42 层 = 38.1GB ✓ 放得下），**连续读**替代 TP 的散段读 → 带宽效率 47%→~80%（nvjet 级）→ act+down 3.65→~2.5ms，**净省 ~1.15ms**。
+   **合计 EP 净省 ~2.37ms → 11.2ms ≈ 1427 tok/s**。
+   **剩余缺口 1.2ms 的来源**（需配合）：hc 链优化（−0.6ms）、注意力 kernel（−0.4ms）、投影（−0.3ms）、host gap（−0.3ms）→ **~9.6ms ≈ 1664 tok/s ✓ 达标**。
+   **实施顺序**：① EP 权重加载重分组（e_local=36, inter=full）→ ② dispatch/combine kernel（NCCL send/recv 或自定义）→ ③ act/down kernel 适配 EP 布局 → ④ 验证 → ⑤ 逐项攻克剩余 1.2ms。预计 1-2 天。
+   **DCP 不适用于此模型**：full-model-per-rank 需 ~305GB MoE 权重/rank（B300 只有 ~180GB HBM）；SGLang 的 DCP=8+TP=1 能跑是因为 GLM-5.2 fp8 单卡 ~175GB 恰好放下。
 ③ MTP 路线（目标改 3200）：batched MTP 验证链是重构项。**2026-09-10 侦察+经济性实测（B=32 验证，b32 replay 60.65ms vs b16 13.58 = 4.5x @2x 行）**：① 锁定点 = gpu_engine.rs:86（`MtpState` 是 per-rank 单例——verify ping-pong scratch `hf_v/hprev` 共享，多 seq 污染；强制 max_seqs=1）；② mtp_step（tp.rs:1654）/ mtp_step_zero_h2d（tp.rs:2033）均为逐 seq；③ 路由在 decode_step_mega（tp.rs:1276，N>1 → mtp_step）；④ 批化五件事：MtpState → [B] 宽 scratch 或 per-seq、verify mega_v n=3×16=48 行（megab_b64 新尺寸类）、draft 链 16-seq 批化、ferrite_mtp_commit 逐 seq 批化、**dsa_append_batched 的行→seq 映射改造**（n=48 时 seq=row/3, tok=row%3）。**经济性修正（B=32 实测推翻乐观预测）**：n=32 步时 4.5x（其中 ~2x 是 per-row 成本的本征伸缩——AR 载荷/hc 链/gemv 全按行；~1.9x 是 MoE 唯一专家增长 104→~200；另有 n>16 kernel 回退病理——gemm3/mma_b16 的 n≤16 守卫使 32 行落入劣化 fallback，需先扩展到 n≤64）。修正后 MTP-batched @B=16 预测 **~1400-1600 tok/s**（非 2100-2300）——超当前 1078 但**低于 3200**；3200 需要 bs>16 或进一步结构工作。**结论：MTP-batched 不再是优先路径**——与非 MTP 的 DCP 同级，都需大重构。
 ④ act 4.8→6.5TB/s 深挖（218MB 权重流已 L2 去重，缺口在 per-expert 128KB 散段 vs nvjet 的 25MB 连续单矩阵 6.2TB/s——需 expert-major 重排或更大连续读）。
 
