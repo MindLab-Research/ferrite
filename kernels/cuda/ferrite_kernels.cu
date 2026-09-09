@@ -4022,7 +4022,7 @@ __global__ void dsa_append_batched_kernel(
         int hd = r / (dk + dv), c = r % (dk + dv);
         size_t dst = ((size_t)t0 * h + hd);
         if (c < dk) kn_tbl[seq][dst * dk + c] = kvb[(size_t)seq * row_bytes + r];
-        else        v_tbl[seq][dst * dv + (c - dk)] = kvb[(size_t)seq * row_bytes + r];
+        else        reinterpret_cast<__half*>(v_tbl[seq])[dst * dv + (c - dk)] = __float2half(kvb[(size_t)seq * row_bytes + r]);
     } else {
         int j = r - row_bytes; // ki region then gate region
         if (j < idm) kidx_tbl[seq][(size_t)t0 * idm + j] = ki[(size_t)seq * idm + j];
