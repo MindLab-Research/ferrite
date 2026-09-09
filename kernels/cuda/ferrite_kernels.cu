@@ -3642,12 +3642,14 @@ __global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
             arow = act + (size_t)tok * stride + (size_t)topk * inter;
             p = 1.0f;
         }
-        // ---- B: this warp's 32 act values -> bf16 (2 tiles of 16) ----
-        #pragma unroll
-        for (int q = 0; q < 2; q++) {
-            const int base = q * 16 + lane;
-            const int l = k0 + base;
-            sa[warp][base] = __float2bfloat16((l < inter) ? arow[l] : 0.f);
+        // ---- B: this warp's 32 act values -> bf16 ----
+        // BUGFIX: was `for (q < 2) base = q*16 + lane` with lane 0..31 ->
+        // wrote base 16..47 into sa[8][32], corrupting the NEIGHBOURING
+        // warps' smem (the bench read 1e34-magnitude garbage). 32 values =
+        // one write per lane.
+        {
+            const int l = k0 + lane;
+            sa[warp][lane] = __float2bfloat16((l < inter) ? arow[l] : 0.f);
         }
         // ---- A: weight rows h0..h0+15, K slice k0..k0+31 -> bf16 ----
         // 16 rows x 32 K = 512 elements / 32 lanes = 16 each
