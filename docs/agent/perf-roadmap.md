@@ -915,3 +915,14 @@ e4m3（per-warp 32-K absmax），8 个 K-tile 各自累加到独立 fp32 acc 后
 **尚未确证（不要写成结论）**：误差是否来自 act 的 e4m3 量化在真实值域下的次正规丢失、
 B 片段的 per-warp 复用在某些 warp 上的地址错位、或 weight scale 的块索引。
 需要的是把 serve 的 act 真实张量 dump 出来跑微基准，而不是继续推测。
+
+### ✅ indexer fast-path 提前（2026-09-09，−0.62ms/步）
+
+`indexer_topk_batched_kernel` 原本把 **score GEMM 放在 fast-path 判断之前**：当
+`select_k >= jmax`（所有因果合法 pool 全选中）时输出恒为 `{0..jmax-1}`，分数根本没人读
+（`pool_expand` 只取索引，`sparse_attn` 只对选中槽 softmax），整段 GEMM 是纯浪费。
+把它提到循环前：**15.07 → 14.45 ms/步（1062 → 1107 tok/s）**，文本 LEN 139 ✓。
+
+**用户追问"为什么不能快慢一起快"**：快路径不是"另一条更快的路"，而是同一结果的可证明捷径；
+慢路径（长上下文需真 top-k）仍需两件事才能一起快：①分数 GEMM 上 tensor core；
+②选择从 O(k·n) 换成 bitonic/radix。
