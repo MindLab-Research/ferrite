@@ -1249,3 +1249,20 @@ serve 文本 `<think用户要求背诵《出师表》全文…先帝创业未半
 
 **方法论**：① 换 MMA 形状必须重新推导片段布局；② 微基准数据必须让每个索引维度取不同值；
 ③ 改调用点前先核对 C 签名。
+
+## 下一步清单（按"已验证可行 + 预期收益"排序，2026-09-09 交接）
+
+1. **sparse_attn 的 QK^T 上 MMA**（1.57ms/步，最大单 kernel）
+   - 形状：per (seq, head) 已是独立 block；QK^T 本质是 `[slots × d] × [d × 1]`。
+   - 可行方案：A = K 行（**fp8 缓存已就绪**，gather 进 smem），B = Q（量化后复制 8 列），
+     m16n8k32，C 取第 0 列 → 每 slot-tile 16 个 slot。fp8 缓存使字节数已降 4x，
+     张量核还能再吃掉指令数（ncu 显示该 kernel 是 long-scoreboard 延迟受限）。
+   - 预期：143µs → ~40-70µs（1.57ms → 0.4-0.8ms）。
+2. **MoE act 的 N 维浪费**（2.0ms）：N=8 目前是同一 token 的复制（8x 浪费）。
+   只有 shared 专家（1/9 的工作量）能用"8 个不同 token 填 N 维"，收益 ~0.2ms。
+   路由专家受 per-token 散射限制，需要 expert-major 分组才能解决。
+3. **GDN**（1.71ms）：ncu 显示 state 往返延迟主导（128KB/block），需 state 分块/常驻寄存器。
+4. **AR**（1.06ms）：3 kernel/次 × 90；可尝试合并 reduce 进 publish。
+
+**已确认不可行/已证伪**：gemv 再优化（已位级最优）、bf16/fp8 cache 单独降 sparse_attn 字节
+（延迟非带宽）、去重位图原子操作（消融无收益）、HC_MIX_KS 加倍（serve 中性）。
