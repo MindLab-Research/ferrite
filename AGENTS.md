@@ -789,3 +789,34 @@ device counter），AR 的 store/reduce 运行时读 counter 决定 staging buff
 
 **最终判定**：1600 @B=16 不开 MTP 在当前 ferrite 架构 + B300 上需要三项研究级突破同时
 落地。会话已交付 +121%（539→1194），全部已知路径穷尽并入档。
+
+## 2026-09-10 最后一项发现：W8A16 MMA down kernel — 未尝试的数值安全路径（下会话首要任务）
+
+**为什么之前的"MoE 路径不要动"结论不完全适用于此**：失败的两个方案误差来源不同——
+1. e4m3 activation（W8A8 MMA）：activation 量化到 4-bit 尾数 → **~6% 误差** → 翻转
+2. f16 累加（half2 FMA）：16 元素 chunk 内 f16 累加 → **~0.8% 误差** → 翻转
+3. **W8A16 MMA（本方案，未尝试）**：
+   - fp8 e4m3 权重 → f16：3-bit 尾数 fits 10-bit → **无损转换**（cvt.rn.f16x2.e4m3x2）
+   - f32 activation → f16：**~0.05% 误差**（唯一的误差来源）
+   - f16 × f16 → f32 乘积：10+10=20 bits < 23-bit f32 尾数 → **精确**（无舍入）
+   - f32 累加（tensor core accumulator）：**精确**
+   - 总额外误差：~0.05% < 0.1% 敏感阈值的一半 ✓
+
+**指令数**：当前 SIMT 2.5/值（cvt 链+fma）→ W8A16 MMA ~1.06/值（1 weight cvt + 1 act cvt
++ 0.125 MMA/值）= **2.4x 减少**。down kernel 从指令受限（39% 指令 + 内存混合）转为
+纯带宽受限：43.6µs → ~16µs（128MB / 8TB/s）。
+
+**预估收益：−1.16ms → 12.12ms ≈ 1320 tok/s**（配合 AR v4 counter-kernel −1.5ms → 
+10.6ms ≈ 1510；再加 hc 或微优化 → 1600 可达！）
+
+**实施要点**：
+1. 新 kernel：`moe_down_w8a16_mma_kernel` — 加载 fp8 权重 → cvt f16（smem 或寄存器），
+   f32 act → cvt f16，mma.sync.aligned.m16n8k16.f32.f16.f16.f32 累加
+2. act kernel 输出保持 f32（不动）——W8A16 的 activation 转换在 down kernel 内做
+   （per-element，非 per-token scale——直接 cvt.rn.f16x2.f32）
+3. launcher + Rust 接线（同 down MMA v1 的模式，但 act 不需要预量化——省 quant kernel）
+4. 验证：出师表逐字 + `/tmp/verify_f32.sh`（B=2+B=16）
+5. 参考：moe_fused_act_fp8_mma_kernel 的 MMA tiling 模式（已验证的 m16n8k16 结构）
+
+**与失败方案的关键区别**：不需要 quant_act_rows（f32→e4m3 预量化 kernel）——直接在
+kernel 内 cvt f32→f16（1 指令/2 值）。数值：0.05% vs e4m3 的 6%——128 倍改善。
