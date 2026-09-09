@@ -4558,7 +4558,7 @@ impl CudaBackend {
                         )
                     };
                     if r != 0 {
-                        eprintln!("[opcheck] moe_fused_act_fp8_mma (v1) returned err {r} — the act kernel (n={ni}) is the first failing launch");
+                        eprintln!("[opcheck] moe_fused_act_fp8_mma (v1) returned err {r} — the act kernel is the first failing launch");
                     }
                     if r == 0 {
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
