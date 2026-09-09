@@ -3666,6 +3666,9 @@ __global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
         }
         __syncwarp();
         const float wsc = ws[(size_t)(h0 >> 7) * dscols + (k0 >> 7)];
+        if (blockIdx.x == 0 && blockIdx.y == 0 && warp == 0 && slot == 0 && lane == 0)
+            printf("[bf16dbg] h0=%d k0=%d dscols=%d idx=%zu wsc=%f ws[0]=%f ws[1]=%f\n",
+                   h0, k0, dscols, (size_t)(h0 >> 7) * dscols + (k0 >> 7), wsc, ws[0], ws[1]);
         // ---- two m16n8k16 MMAs (K = 32 for this warp) ----
         #pragma unroll
         for (int t = 0; t < 2; t++) {
