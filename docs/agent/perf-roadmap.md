@@ -493,3 +493,14 @@ v 缓存改 fp16（append 写 half、注意力 half2 载入 + fp32 累加）：p
 `for (j < dv) Si[j] *= decay` → float4 读写：serve 直接崩（`CUDA sync: misaligned address
 (err 716)`）。原因：`Si`/`S` 是 smem 里的 float*，偏移不保证 16 字节对齐。**教训：smem 上的
 float4 访问必须先确认基址与步长都是 16 的倍数**（或改用 `__ldg`/标量）。已 git revert。
+
+## tensor-core 化 sparse_attn 的具体形式（下一步重写时的关键洞察）
+
+decode 的 M=1 看似无法用 MMA，但**同一 seq 的 64 个 head 共享同一组 top-k 位置**：
+- M = 16 个 head（每 seq 4 个 MMA tile），N = 位置（每 tile 8 个，来自该 seq 的 top-k 列表），
+  K = 256（dk）。→ `mma.m16n8k32` 的 A = Q[heads, 256]、B = K[256, positions]，
+  每个 (seq, 位置 tile) 一个真正的 GEMM，K 在 16 个 head 间**完全复用**。
+- 分数后接 FlashAttention 式在线 softmax（行最大值/归一化随 tile 迭代），v 侧同理
+  （M = head 维 256 的输出、N = 位置）。
+- slot 的 gather 通过 page table 间接寻址（DSA 的 top-k 索引已在 idxs 里）。
+预计算力从 0.26 TMAC/s（fp32 峰值 0.1%）提到 tensor-core 量级，是**唯一可能两位数百分点**的方向。
