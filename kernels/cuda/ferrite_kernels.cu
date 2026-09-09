@@ -3673,8 +3673,11 @@ __global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
             // lanes 0-15 give the 16 rows, lanes 16-31 the +16-byte K half.
             unsigned a[4];
             {
+                // K-half offset is 8 bf16 ELEMENTS (16 bytes) — the fp8
+                // kernel's *16 was 16 fp8 elements; using 16 here skipped to
+                // k=16..31 and the m16n8k16 A read garbage.
                 const unsigned saddr = (unsigned)__cvta_generic_to_shared(
-                    sw[warp][0] + (size_t)(lane & 15) * 40 + ((lane >> 4) * 16) + kb * 2);
+                    sw[warp][0] + (size_t)(lane & 15) * 40 + ((lane >> 4) * 8) + kb * 2);
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr));
             }
