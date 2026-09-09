@@ -4371,8 +4371,9 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
     if (inter > 512 || inter_shared > 512 || topk > 8) return cudaErrorNotSupported;
     dim3 grid((unsigned)(hidden / 32), (unsigned)n);
     moe_down_e4m3_mma_kernel<<<grid, 256, 0, s>>>(
-        ids_f, probs, down_w8_ptrs, down_scale_ptrs,
-        (const unsigned char*)shared_down_w8, shared_down_scale,
+        ids_f, probs,
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
         aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
     return cudaGetLastError();
 }
