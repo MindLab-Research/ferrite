@@ -3288,7 +3288,7 @@ fn mega_chain_dev_batched(
             0
         }
     };
-    let lsum_probe = |buf: &DevBuf, layer: usize, tag: &str, row_len: usize| {
+    let lsum_probe = |buf: &DevBuf, layer: usize, tag: &str| {
         if !lsum {
             return;
         }
@@ -3297,6 +3297,7 @@ fn mega_chain_dev_batched(
             eprintln!("[lsum] s{lsum_step} L{layer} {tag}: download err {e}");
             return;
         }
+        let row_len = if n > 0 { host.len() / n } else { host.len() };
         for r in 0..n {
             let row = &host[r * row_len..(r + 1) * row_len];
             let sum: f64 = row.iter().map(|&v| v as f64).sum();
@@ -3313,7 +3314,7 @@ fn mega_chain_dev_batched(
             eprintln!("[lsum] s{lsum_step} L{layer:2} {tag:4} ROWDIFF={d:.3e}");
         }
     };
-    lsum_probe(&res, 0, "in", nh * hidden);
+    lsum_probe(&res, 0, "in");
 
     for (layer_idx, plan) in plans.iter().enumerate() {
         if std::env::var_os("FERRITE_TIMING").is_some() {
@@ -3446,7 +3447,7 @@ fn mega_chain_dev_batched(
         let t_mid = std::time::Instant::now();
         // C: hc_post → hc_pre2
         let res_mid = cuda.hc_post_dev(&partial, &res, &post_a, &comb_a, n, hc_mult, hidden)?;
-        lsum_probe(&partial, layer_idx, "attn", hidden);
+        lsum_probe(&partial, layer_idx, "attn");
         let (li2, post_f, comb_f) = cuda.hc_pre_dev(
             &res_mid,
             s.w(&format!("{pfx}.hc_ffn_fn"))?,
@@ -3514,7 +3515,7 @@ fn mega_chain_dev_batched(
         if !ar_p2p {
             nccl.all_reduce_f32(partial2.as_const_f32(), partial2.as_f32(), n * hidden)?;
         }
-        lsum_probe(&partial2, layer_idx, "ffn", hidden);
+        lsum_probe(&partial2, layer_idx, "ffn");
         if tm {
             let _ = cuda.sync();
             t_ffn += t_mid.elapsed().as_secs_f64() * 1e3;
@@ -3522,7 +3523,7 @@ fn mega_chain_dev_batched(
         // E: hc_post2 → next layer's residual
         let new_res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
         let old_res = std::mem::replace(&mut res, new_res);
-        lsum_probe(&res, layer_idx, "res", nh * hidden);
+        lsum_probe(&res, layer_idx, "res");
         if !input_kept {
             input_kept = true;
             if capture {
