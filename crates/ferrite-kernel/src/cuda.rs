@@ -4727,12 +4727,17 @@ impl CudaBackend {
                             });
                         }
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        // bf16 tensor-core down: verified correct (bench bad=0
-                        // for n=1..16 with unique per-block scales; serve text
-                        // is coherent) and slightly faster than the SIMT path.
-                        // Set FERRITE_MOE_DOWN_MMA=0 to fall back.
+                        // DEFAULT = the fp8 fused down (moe_fused_down_sum_fp8):
+                        // nsys 2026-09-09 B=16 steady state — the bf16 MMA down
+                        // measured 13.1ms/step/rank (52.3% of the whole step,
+                        // median 357µs × ~37 launches) vs the fp8 fused 2.1ms —
+                        // 6x slower. The "!!!!" text degradation that motivated
+                        // the MMA default was actually the xq-cache stale-hit
+                        // (root cause #5, fixed in 852be75: the (ptr,gen) key),
+                        // NOT the fp8 down kernel. FERRITE_MOE_DOWN_MMA=1 opts
+                        // into the (correct but slow) tensor-core variant.
                         let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
-                            .map(|v| v != "0").unwrap_or(true);
+                            .map(|v| v == "1").unwrap_or(false);
                         let down_mma = if !use_down_mma { 1 } else { unsafe {
                             ferrite_moe_down_bf16_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
@@ -4776,9 +4781,11 @@ impl CudaBackend {
                     }
                     if r == 0 {
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        // WIP: the tensor-core down currently produces wrong
-                        // values (serve text degraded to "!!!!"); opt in
-                        // explicitly until the fragment/scale bug is fixed.
+                        // The tensor-core down is CORRECT but 6x slower than
+                        // the fp8 fused down (13.1 vs 2.1 ms/step/rank, nsys
+                        // 2026-09-09); the historical "wrong values / !!!!"
+                        // was the xq-cache stale-hit (root cause #5), not this
+                        // kernel. Opt in with FERRITE_MOE_DOWN_MMA=1.
                         let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
                         let down_mma = if !use_down_mma { 1 } else { unsafe {

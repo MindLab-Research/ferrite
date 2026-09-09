@@ -47,19 +47,21 @@ Read `README.md` for the design contract; this file is the operational guide: bu
 （16000/N = 聚合 tok/s），并确认日志里有 `live=16`；per-seq×16 与 total/wall 只作交叉验证。
 每次改动**必须人眼看生成的文本**（乱码=数值回归，token 计数看不出来）。
 
-**nsys 落盘纪律**（已实测：成功方法只有一种）：
-nsys 只在**目标进程退出时**写报告。HTTP serve 永不退出，所以：
-① 用 `POST /shutdown` 让服务优雅退出（接口已存在）；② 或用 `timeout -s INT` 包住 nsys。
-**不要**用 `--capture-range=cudaProfilerApi`（HTTP serve 下 cuProfilerStop 永不触发，会空等）。
-**不要**用 `--duration`（它从进程启动计时，会整段落在 80s 的权重加载上）。
-**不要**用 `nsys launch --session-new`（session 起不来，报告不落盘）。
-**不要**用 SIGKILL 杀 serve（报告丢失）。
-正确姿势（唯一验证成功的一种）：
+**nsys 落盘纪律**（2026-09-09 更新：现在有两种验证成功的方法，优先用 capture-range）：
+nsys 只在**目标进程退出时**写报告。HTTP serve 靠 SIGINT 优雅退出（`kill -INT <pid>` → tokio ctrl_c → `profiler_stop` → `exit(0)`；**POST /shutdown 端点并不存在**，curl 它只会失败）。
+**首选：FERRITE_NCU 窗口 + capture-range（99f0a0e 起内置）**——只抓饱和稳态，报告里**没有** 80s 权重加载和 admissions 爬坡/图捕获的内核，`cuda_gpu_kern_sum` 直接就是稳态分解：
 ```bash
-timeout -s INT 230 sudo nsys profile --trace=cuda --cuda-graph-trace=node --sample=none \
-  -o /tmp/nsys_out --force-overwrite=true env <基准env> ./target/release/ferrite-serve ... &
-# 等 health → 跑 bench（~60s）→ curl -X POST /shutdown → wait
-sudo nsys stats --report cuda_gpu_kern_sum /tmp/nsys_out.nsys-rep | head -40
+timeout -s INT 300 nsys profile --trace=cuda --cuda-graph-trace=node --sample=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
+  -o /tmp/nsys_b16 --force-overwrite=true \
+  env <基准env + FERRITE_NCU=1> ./target/release/ferrite-serve --serve --max-seqs 16 ... &
+# 等 "serving glm" → 跑 bench（16 并发触发 [ncu-win] batch saturated）→ sleep 几秒
+# → kill -INT $(pgrep -f 'ferrite-serve --backend') → wait → nsys stats
+nsys stats --report cuda_gpu_kern_sum /tmp/nsys_b16.nsys-rep | head -50
+```
+窗口语义：`GpuEngine::tick` 在 `live==max_seqs` 时调 `cudaProfilerStart`（一次），`run_serve` 在 `process::exit(0)` 前调 `cudaProfilerStop`——**没有 stop 信号 nsys 会空等**，所以必须优雅退出，不能 SIGKILL。
+旧方法（仍可用，报告混入加载内核，需 head -40 纪律）：`timeout -s INT 230 sudo nsys profile ... env <env> serve &` → bench → SIGINT → wait。
+**不要**用 `--duration`（从进程启动计时，落在加载上）。**不要**用 `nsys launch --session-new`。**不要**用 SIGKILL。
 ```
 **读报告纪律**：`cuda_gpu_kern_sum` 按总时间排序，**权重加载的 `dequant_e4m3_block_kernel`/
 `bf16_to_f32_kernel` 永远排在最前面**（各占 40-57%）。必须 `head -40` 或按名字过滤，
