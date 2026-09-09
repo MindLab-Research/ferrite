@@ -4517,7 +4517,7 @@ __global__ void indexer_topk_batched_kernel(
     const float* __restrict__ w,          // [B, ih]
     float* __restrict__ idx,              // [B, select_k_max]
     int B, int ih, int idm, int select_k_max, int kpool, int max_npools,
-    const int* const* __restrict__ total_tbl) { // [B] pinned
+    const int* const* __restrict__ total_tbl, int idx_mma) { // [B] pinned
     int seq = blockIdx.x;
     if (seq >= B) return;
     int total = *total_tbl[seq];
@@ -4550,7 +4550,73 @@ __global__ void indexer_topk_batched_kernel(
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
     const int ngroups = blockDim.x / TG;
-    for (int j = gid; j < t; j += ngroups) {
+    // ---- tensor-core score GEMM (env FERRITE_IDX_MMA=1) ----
+    // scores[p][hi] = pk[p] . q[hi] is a natural GEMM: BOTH operands are
+    // contiguous (no gather), M = 16 pools, N = 8 heads, K = idm (128 -> 8
+    // m16n8k16 bf16 tiles). s[p] = sum_hi w[hi] * relu(score * inv_sqrt_d).
+    if (idx_mma) {
+        __shared__ __nv_bfloat16 aq[16][128];
+        __shared__ __nv_bfloat16 bq[128][40];
+        __shared__ float cacc[16][40];
+        const int lane = threadIdx.x & 31;
+        const int ntiles = (ih + 7) / 8;
+        for (int j0 = 0; j0 < t; j0 += 16) {
+            for (int l = threadIdx.x; l < 16 * 128; l += blockDim.x) {
+                const int r = l >> 7, c = l & 127;
+                const int p_ = j0 + r;
+                aq[r][c] = __float2bfloat16(p_ < t ? pk[(size_t)p_ * idm + c] : 0.f);
+            }
+            __syncthreads();
+            for (int n0 = 0; n0 < ih; n0 += 8) {
+                for (int l = threadIdx.x; l < 128 * 8; l += blockDim.x) {
+                    const int c = l >> 3, hi = l & 7;
+                    bq[c][hi] = __float2bfloat16(q_s[(size_t)(n0 + hi) * idm + c]);
+                }
+                __syncthreads();
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                #pragma unroll
+                for (int kt = 0; kt < 8; kt++) {
+                    const unsigned sa_ = (unsigned)__cvta_generic_to_shared(
+                        &aq[0][0] + (size_t)(lane & 15) * 128 + ((lane >> 4) * 8) + kt * 16);
+                    unsigned a[4];
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                                 : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(sa_));
+                    unsigned b[2];
+                    const int r0_ = lane >> 2, cc = (lane & 3) * 2;
+                    b[0] = *(const unsigned*)&bq[kt * 16 + cc][r0_];
+                    b[1] = *(const unsigned*)&bq[kt * 16 + cc + 8][r0_];
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+                }
+                if ((lane & 3) == 0) {
+                    const int r0_ = lane >> 2;
+                    for (int rr = 0; rr < 2; rr++) {
+                        const int rw = r0_ + rr * 8;
+                        if (j0 + rw < t) {
+                            const float sc_ = acc[rr * 2] * inv_sqrt_d;
+                            const float wv = w_s[n0 + 0];   // col 0 of this n-tile
+                            if (n0 == 0) cacc[rw][n0 >> 3] = wv * fmaxf(sc_, 0.f);
+                            else cacc[rw][n0 >> 3] = wv * fmaxf(sc_, 0.f);
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+            for (int r = threadIdx.x; r < 16; r += blockDim.x) {
+                const int p_ = j0 + r;
+                if (p_ < t) {
+                    float s_ = 0.f;
+                    for (int nt = 0; nt < ntiles; nt++) s_ += cacc[r][nt];
+                    sm[p_] = (p_ < jmax) ? s_ : -INFINITY;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    for (int j = (idx_mma ? t : gid); j < t; j += ngroups) {
         const float* k = pk + (size_t)j * idm;
         float s = 0.f;
         if (j < jmax) {
@@ -5004,7 +5070,7 @@ extern "C" cudaError_t ferrite_indexer_topk_batched(
     int max_t = 2048; // max_npools (smem frozen for MAX — graph-safe)
     size_t smem = (size_t)max_t * sizeof(float);
     indexer_topk_batched_kernel<<<grid, block, smem, s>>>(
-        qi, pool_keys, w, idx, B, ih, idm, select_k_max, kpool, max_npools, total_tbl);
+        qi, pool_keys, w, idx, B, ih, idm, select_k_max, kpool, max_npools, total_tbl, idx_mma_);
     return cudaGetLastError();
 }
 
@@ -5029,6 +5095,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     if (attn_skip_) return cudaSuccess;
     static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
     static const int qk_mma_ = getenv("FERRITE_ATTN_QK_MMA") ? 1 : 0;
+    static const int idx_mma_ = getenv("FERRITE_IDX_MMA") ? 1 : 0;
 
     dim3 block(256);
     dim3 grid(B, h);
