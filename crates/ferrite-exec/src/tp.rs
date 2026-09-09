@@ -2771,6 +2771,18 @@ fn mega_chain_dev(
     } else {
         None
     };
+    // PRE-WARM (2026-09-10, TP<8 capture fix): FERRITE_POOL_MISS=1 showed the
+    // capture pass misses the NON-batch pool's class-16384 (one per rank, at
+    // L2) when TP=4 — and a cudaMalloc inside the capture = err 900. Warm that
+    // size class here (outside the capture, with the non-batch flag set) so the
+    // in-capture alloc hits the pool. No-op for TP=8 (already warm there).
+    if capture {
+        ferrite_kernel::cuda::set_batch_decode(false);
+        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 16384) {
+            drop(b);
+        }
+        ferrite_kernel::cuda::set_batch_decode(true);
+    }
     if capture {
         cuda.graph_capture_begin();
     }
@@ -3335,6 +3347,17 @@ fn mega_chain_dev_batched(
         );
         None
     };
+    // PRE-WARM (2026-09-10, TP<8 capture fix): FERRITE_POOL_MISS=1 showed the
+    // batched capture pass misses the NON-batch pool's class-16384 (one per
+    // rank, at L2) when TP=4 — a cudaMalloc inside the capture = err 900.
+    // Warm that size class here (outside the capture, non-batch flag set).
+    if capture {
+        ferrite_kernel::cuda::set_batch_decode(false);
+        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 16384) {
+            drop(b);
+        }
+        ferrite_kernel::cuda::set_batch_decode(true);
+    }
     if capture {
         cuda.graph_capture_begin();
     }
