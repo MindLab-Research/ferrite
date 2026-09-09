@@ -1950,7 +1950,28 @@ impl CudaBackend {
         // its own cast node (a persistent hit would leave the graph without
         // a cast → the replays read a stale xb).
         let key = (x.as_const_f32() as usize, x.gen);
+        // OPT-IN ONLY (FERRITE_XB_CACHE=1): measured 2026-09-10 the cache
+        // destabilizes the batch pool's address-stability contract — the
+        // retained xb buffers shift every subsequent capture pass's pooled
+        // intermediate addresses, and the graphs embed those addresses
+        // (B=16 crashed at 36 tokens / 1 Xid fault in BOTH fix variants:
+        // entry-replacement AND re-cast-in-place). The pool's determinism is
+        // load-bearing for the kept-across-retire graphs; do not perturb it.
+        let use_xb_cache = std::env::var("FERRITE_XB_CACHE")
+            .map(|v| v == "1").unwrap_or(false);
         let xbp: *const f32;
+        if !use_xb_cache {
+            let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
+            ck(
+                unsafe {
+                    ferrite_f32_to_bf16(x.as_const_f32(),
+                                        xb.as_f32() as *mut std::ffi::c_void,
+                                        (n * in_f) as i64, self.stream)
+                },
+                "cast bf16",
+            )?;
+            xbp = xb.as_const_f32();
+        } else {
         {
             let mut c = self.xb_cache.lock().unwrap();
             let mut dst: *mut f32 = std::ptr::null_mut();
@@ -1990,6 +2011,7 @@ impl CudaBackend {
                     xbp = dst as *const f32;
                 }
             }
+        }
         }
         // Handle created on first use: the dry-run reaches here BEFORE the
         // capture pass, and cublasCreate is illegal inside a capture.
