@@ -929,13 +929,18 @@ impl<B: KernelBackend> TpCluster<B> {
         // zero-copy by the DSA kernels; without ordering, the previous step's
         // in-flight kernels observe the NEXT step's larger total → the moving
         // 2MB-aligned Xid-31 PDE faults (removing this sync reproduced the
-        // crash at B=16 within 6 tokens). TODO(perf): replace with
-        // device-resident counters (a tiny stream-ordered kernel writing the
-        // t0/total through the tables) to eliminate the sync AND restore the
-        // host-GPU pipelining (~29ms → ~14ms/step). FERRITE_STEP_NOSYNC=1
-        // disables for A/B (will crash at B=16).
+        // crash at B=16 within 6 tokens).
+        // 2026-09-10: FERRITE_DEV_ADV (default ON) moves the advance INTO
+        // dsa_append_batched_kernel (in-stream, device-side) — the host no
+        // longer writes the pinned values in the batched path, so this sync
+        // is no longer needed and KILLS the host/GPU pipeline (~1.1ms/step
+        // of exposed host time). FERRITE_STEP_SYNC=1 forces it back for A/B;
+        // FERRITE_DEV_ADV=0 (host-owned counters) also restores it.
         #[cfg(feature = "cuda")]
-        if std::env::var_os("FERRITE_STEP_NOSYNC").is_none() {
+        let step_sync = std::env::var_os("FERRITE_STEP_SYNC").is_some()
+            || !ferrite_kernel::cuda::CudaBackend::dev_adv_enabled();
+        #[cfg(feature = "cuda")]
+        if step_sync && std::env::var_os("FERRITE_STEP_NOSYNC").is_none() {
             Self::fan_out(&mut self.shards, |s| {
                 if let Some(c) = s.backend.as_cuda() {
                     if let Err(e) = c.sync() {
@@ -1185,7 +1190,14 @@ impl<B: KernelBackend> TpCluster<B> {
             cuda.enter();
             for &seq_r in seqs {
                 for f in 0..num_dsa {
-                    cuda.dsa_host_advance(seq_r, f, 1);
+                    // FERRITE_DEV_ADV: the graph's append kernel advances the
+                    // pinned counters (in-stream) — the host keeps only the
+                    // map's t_count for the retire/bookkeeping logic.
+                    if ferrite_kernel::cuda::CudaBackend::dev_adv_enabled() {
+                        cuda.dsa_host_advance_count_only(seq_r, f, 1);
+                    } else {
+                        cuda.dsa_host_advance(seq_r, f, 1);
+                    }
                 }
             }
             // NOTE: do NOT reset the P2P protocol here. p2p_ar_reset is

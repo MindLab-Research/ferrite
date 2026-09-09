@@ -172,7 +172,7 @@ extern "C" {
     fn ferrite_dsa_append_batched(kvb: *const f32, ki: *const f32, gate: *const f32,
                                    kn_tbl: *const *mut f32, v_tbl: *const *mut f32,
                                    kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
-                                   t0_tbl: *const *const i32,
+                                   t0_tbl: *const *const i32, total_tbl: *const *const i32,
                                    b: i32, h: i32, dk: i32, dv: i32, idm: i32, ntok: i32,
                                    s: CuStream) -> i32;
     fn ferrite_kpool_compress_batched(kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
@@ -4000,9 +4000,15 @@ impl CudaBackend {
                 match existing {
                     Some((kn, vv, kns, vss, ki_, kg, pt0, ptot, t0)) => {
                         m.get_mut(&(seq_r, family)).unwrap().t_count += 1;
-                        unsafe {
-                            *pt0 = t0 as i32;
-                            *ptot = (t0 + 1) as i32;
+                        // FERRITE_DEV_ADV (default ON): the append KERNEL advances the
+                        // pinned t0/total (in-stream) — the host writes below raced the
+                        // in-flight kernels (Xid 31) and are what forced the step-start
+                        // all-rank sync. Count-only here.
+                        if !Self::dev_adv_enabled() {
+                            unsafe {
+                                *pt0 = t0 as i32;
+                                *ptot = (t0 + 1) as i32;
+                            }
                         }
                         (kn, vv, kns, vss, ki_, kg, pt0 as *const i32, ptot as *const i32, t0 + 1)
                     }
@@ -4081,6 +4087,7 @@ impl CudaBackend {
                     tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
                     tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
                     tbl.t0p as *const *const i32,
+                    tbl.totp as *const *const i32,
                     // NTOK MUST BE 1 (ROOT CAUSE #3 of the B=16 crashes,
                     // 2026-09-09): the kernel grid is (B, ntok) and it reads
                     // `kvb + (seq + tok) * row` — the batched kvb is [B, row]
@@ -4232,6 +4239,29 @@ impl CudaBackend {
                 *c.pinned_t0 = t0 as i32;
                 *c.pinned_total = (t0 + n) as i32;
             }
+            c.t_count += n;
+        }
+    }
+
+    /// FERRITE_DEV_ADV (default ON): the BATCHED path's pinned t0/total are
+    /// advanced ON DEVICE by dsa_append_batched_kernel (in-stream, visible to
+    /// the downstream kpool/topk/attn) — the host only keeps the map's
+    /// t_count in sync for the retire/bookkeeping logic. This removes the
+    /// host pinned writes that raced the in-flight kernels (the Xid-31 faults
+    //  that forced the step-start all-rank sync and killed the pipeline).
+    /// The SINGLE-seq path keeps the host-owned advance (above).
+    pub fn dev_adv_enabled() -> bool {
+        static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *V.get_or_init(|| {
+            std::env::var("FERRITE_DEV_ADV").map(|v| v != "0").unwrap_or(true)
+        })
+    }
+
+    /// Count-only advance for the BATCHED replay path under FERRITE_DEV_ADV —
+    /// the graph's append kernel owns the pinned values.
+    pub fn dsa_host_advance_count_only(&self, seq: u64, family: usize, n: usize) {
+        let mut m = self.dsa_caches.lock().unwrap();
+        if let Some(c) = m.get_mut(&(seq, family)) {
             c.t_count += n;
         }
     }

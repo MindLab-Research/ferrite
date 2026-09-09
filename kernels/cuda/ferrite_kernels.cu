@@ -4644,7 +4644,8 @@ __global__ void dsa_append_batched_kernel(
     float* const* __restrict__ kidx_tbl, // [B]
     float* const* __restrict__ kgate_tbl,// [B]
     const int* const* __restrict__ t0_tbl, // [B] per-seq PINNED t0 ptrs
-    int B, int h, int dk, int dv, int idm, int max_t) {
+    const int* const* __restrict__ total_tbl, // [B] per-seq PINNED total ptrs
+    int B, int h, int dk, int dv, int idm, int max_t, int dev_adv) {
     // F32 CACHE FORMAT (2026-09-09, root cause #4 of the batched garbage
     // text): the single-seq path (PREFILL + n=1 decode,
     // dsa_cache_append_kernel) writes the shared (seq, family) DSA K/V cache
@@ -4679,6 +4680,20 @@ __global__ void dsa_append_batched_kernel(
     for (int c = tid; c < idm; c += blockDim.x) {
         kidx_tbl[seq][(size_t)(t0 + tok) * idm + c] = ki[(size_t)seq * idm + c];
         kgate_tbl[seq][(size_t)(t0 + tok) * idm + c] = gate[(size_t)seq * idm + c];
+    }
+    // DEVICE-SIDE ADVANCE (2026-09-10): the pinned t0/total are incremented
+    // HERE (the tok==0 block) instead of by the host — the host writes raced
+    // the in-flight kernels' zero-copy reads (Xid 31 PDE faults), which
+    // forced the step-start all-rank sync and killed the host/GPU pipeline.
+    // In-stream ordering makes the update visible to this launch's downstream
+    // consumers (kpool/topk/expand/attn read `total` AFTER the append in the
+    // stream). The dry pass (real execution) advances exactly once; the
+    // capture pass records without executing (no advance); every replay
+    // advances exactly once — the pre-capture host rollback becomes map-only.
+    // The pinned memory is mutable; the const is only the table typing.
+    if (dev_adv && tok == 0 && threadIdx.x == 0) {
+        *(int*)t0_tbl[seq] = t0 + 1;
+        *(int*)total_tbl[seq] = t0 + 1;
     }
 }
 
@@ -5260,9 +5275,18 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
 extern "C" cudaError_t ferrite_dsa_append_batched(
     const float* kvb, const float* ki, const float* gate,
     float* const* kn_tbl, float* const* v_tbl, float* const* kidx_tbl, float* const* kgate_tbl,
-    const int* const* t0_tbl, int B, int h, int dk, int dv, int idm, int ntok, cudaStream_t s) {
+    const int* const* t0_tbl, const int* const* total_tbl,
+    int B, int h, int dk, int dv, int idm, int ntok, cudaStream_t s) {
     // one block per (seq, token) — f32 cache stores (see the kernel's F32
-    // CACHE FORMAT comment: the single-seq path owns the format).
+    // CACHE FORMAT comment: the single-seq path owns the format). The kernel
+    // advances the pinned t0/total itself (dev_adv) — the host-side
+    // per-step writes raced the in-flight kernels (Xid 31) and forced the
+    // step-start all-rank sync. FERRITE_DEV_ADV=0 restores the host-owned
+    // counters (with the sync, for A/B).
+    static const int dev_adv_ = [] {
+        const char* e = getenv("FERRITE_DEV_ADV");
+        return e ? atoi(e) : 1;
+    }();
     dim3 grid((unsigned)B, (unsigned)(ntok > 0 ? ntok : 1));
     static const int max_t_ = [] {
         const char* e = getenv("FERRITE_DSA_MAXT");
@@ -5270,7 +5294,8 @@ extern "C" cudaError_t ferrite_dsa_append_batched(
     }();
     dsa_append_batched_kernel<<<grid, 256, 0, s>>>(
         kvb, ki, gate,
-        kn_tbl, v_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm, max_t_);
+        kn_tbl, v_tbl, kidx_tbl, kgate_tbl, t0_tbl, total_tbl,
+        B, h, dk, dv, idm, max_t_, dev_adv_);
     return cudaGetLastError();
 }
 
