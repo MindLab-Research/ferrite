@@ -157,13 +157,6 @@ static void launch_act_bf16(void* v) {
         c->sg16, c->su16, c->act, 0, c->e_local, c->hidden, c->inter,
         c->inter_shared, c->topk, c->n, c->limit, c->s));
 }
-static void launch_down_bf16(void* v) {
-    MoeCtx* c = (MoeCtx*)v;
-    CK(ferrite_moe_fused_down_sum(c->ids_f, c->probs,
-        (const void* const*)c->down16, c->sd16, c->act, c->out,
-        0, c->e_local, c->hidden, c->inter, c->inter_shared,
-        c->topk, c->n, c->s));
-}
 
 // ---------------- hc context ----------------
 struct HcCtx {
