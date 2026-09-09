@@ -215,6 +215,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda \
 | **gemm3 融合投影默认开**（DSA{wk,weights_proj,gate}+GDN{b,f_a,g_a} 各一 launch+确定性归约；f32 直入吃掉 ~180 个 cast 节点；块级 K-split×8；m16n8k16 bf16） | **14.43**（B=2 9.93） |
 | **gdn_chunk float4 state 读写 + 全并行 decay**（kernel 原以 0.63TB/s 内存延迟受限运行——grid(16,8)=128 块 × 512 线程 × 4B 在飞；float4=4x 在飞字节；decay 原只用 dk 线程跑 dv 串行） | **14.01**（B=2 9.45） |
 | hc_pre_mix float4 加载（B=16 中性、B=2 −0.5ms，保留） | 14.02 |
+| **sparse_attn_v3 三 kernel 分割**（QK/exp+PV/merge，NS=4×(B,h)=512 块 vs v2 的 128——同 gdn_chunk 延迟受限模式；全局 max 从 L2 热 scores 重读；确定性 split 升序合并；FERRITE_ATTN_SPLIT=0 回退 v2） | **13.61**（B=2 9.28，steady×16≈1075） |
 
 steady×16 ≈ **1066**（300 窗口；replay 口径 16000/14.02 = 1142）。gdn 修复的机制：**小 kernel 的内存延迟受限模式**（少量块×标量 4B 加载 → 在飞字节不足）——float4 化是在飞字节的最廉价 4x；gdn_chunk 25.5µs → 预计 ~7µs/层 × 34 层 = −0.42ms 实测兑现。同模式审计清单：rest345（1.14ms，结构已在设计地板）、sparse_attn（0.58ms）、conv1d/gdn_prep（~0.3ms）。
 
