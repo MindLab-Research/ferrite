@@ -184,7 +184,7 @@ int main(int argc, char** argv) {
     const int E = 288, H = 4096, TOPK = 8;
     const int N = argc > 2 ? atoi(argv[2]) : 1;
     const int I = argc > 3 ? atoi(argv[3]) : 512;
-    const int IS = 512;
+    const int IS = argc > 4 ? atoi(argv[4]) : 512;
     MoeCtx mc = {};
     mc.e_local = E; mc.hidden = H; mc.inter = I; mc.inter_shared = IS;
     mc.topk = TOPK; mc.n = N; mc.limit = 7.0f; mc.s = s;
