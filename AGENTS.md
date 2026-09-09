@@ -21,12 +21,25 @@ Read `README.md` for the design contract; this file is the operational guide: bu
 （16000/N = 聚合 tok/s），并确认日志里有 `live=16`；per-seq×16 与 total/wall 只作交叉验证。
 每次改动**必须人眼看生成的文本**（乱码=数值回归，token 计数看不出来）。
 
-**nsys 落盘纪律**：nsys 只在**目标进程退出时**写报告。HTTP serve 永不退出，所以：
+**nsys 落盘纪律**（已实测：成功方法只有一种）：
+nsys 只在**目标进程退出时**写报告。HTTP serve 永不退出，所以：
 ① 用 `POST /shutdown` 让服务优雅退出（接口已存在）；② 或用 `timeout -s INT` 包住 nsys。
 **不要**用 `--capture-range=cudaProfilerApi`（HTTP serve 下 cuProfilerStop 永不触发，会空等）。
 **不要**用 `--duration`（它从进程启动计时，会整段落在 80s 的权重加载上）。
-正确姿势：`nsys launch --session-new=X ...` → 等 health → `nsys start --session=X` →
-跑 bench → `nsys stop --session=X` → `/shutdown` → `nsys stats`。
+**不要**用 `nsys launch --session-new`（session 起不来，报告不落盘）。
+**不要**用 SIGKILL 杀 serve（报告丢失）。
+正确姿势（唯一验证成功的一种）：
+```bash
+timeout -s INT 230 sudo nsys profile --trace=cuda --cuda-graph-trace=node --sample=none \
+  -o /tmp/nsys_out --force-overwrite=true env <基准env> ./target/release/ferrite-serve ... &
+# 等 health → 跑 bench（~60s）→ curl -X POST /shutdown → wait
+sudo nsys stats --report cuda_gpu_kern_sum /tmp/nsys_out.nsys-rep | head -40
+```
+**读报告纪律**：`cuda_gpu_kern_sum` 按总时间排序，**权重加载的 `dequant_e4m3_block_kernel`/
+`bf16_to_f32_kernel` 永远排在最前面**（各占 40-57%）。必须 `head -40` 或按名字过滤，
+**不要 `head -20` 就下结论**（这正是本会话连续误判"nsys 只抓到加载阶段"的原因）。
+每步时间 = 该 kernel 的 **median × 每步调用次数**（instance 数被 capture 的 ~900 次 dry-run 污染，
+不能直接除步数）。
 
 ## Repo layout (hot paths)
 
