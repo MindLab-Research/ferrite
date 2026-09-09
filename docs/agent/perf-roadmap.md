@@ -455,3 +455,11 @@ gmask 同步改成 `0xffu << (... & ~7u)`。**注意**：该测试的最后一�
 per-seq 59.0-60.0（基线 59.4-60.5），在波动内 → 保留。`.L2::128B` 提示的实测汇总：
 gemv **+2%**、act +0.3%、down/router/mix **略差（已回退）**、sparse_attn v 侧中性。
 **结论：提示必须逐 kernel A/B，不能一概而论。**
+
+### 已回退：act 的 4 warp/block（128 线程）——输出全 `!!!!!`
+
+按"提高占用/MLP"的思路把 block 从 256 降到 128（bseg 8、smem 30KB、launch_bounds(128,7)）：
+replay 16.06ms/996 tok/s 看似大胜，**但文本全是 `!!!!!`** —— 128 线程下 kernel 里还有未同步
+缩放的假设（xq 量化分布 / epilogue 的 `warp == 0 && lane < 16` / sxs 归约）。**已 git revert。**
+这是本会话第 11 次"变快=少算"：**任何改变 blockDim 的改动都要先确认 kernel 内所有 warp/thread
+相关的常量都已同步**（TG、gmask、warp 索引、smem 布局、epilogue 掩码）。
