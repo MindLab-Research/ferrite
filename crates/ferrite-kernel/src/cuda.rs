@@ -4290,10 +4290,10 @@ impl CudaBackend {
                 "[ptrdbg] bump last block: base={:#x} cap={:#x} used={:#x}  blocks={}",
                 base as usize, cap, used, self.bump.lock().unwrap().len()
             );
-            dump(t.down_w8, "down_w8");
-            dump(t.down_scale, "down_scale");
-            dump(t.gate_w8, "gate_w8");
-            dump(t.up_w8, "up_w8");
+            dump(out.down_w8, "down_w8");
+            dump(out.down_scale, "down_scale");
+            dump(out.gate_w8, "gate_w8");
+            dump(out.up_w8, "up_w8");
             eprintln!("[ptrdbg] layer key={key:#x} e_local={e_local}");
         }
         Ok(Some(out))
