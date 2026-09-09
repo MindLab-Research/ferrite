@@ -549,3 +549,45 @@ steady×16 = per-seq steady × 16 作交叉验证。文本每次人眼验证（�
 MoE 权重 > 180GB HBM；MTP-batched 修正后 ~1400-1600 < 3200 目标。
 
 **基线**：远端 HEAD=`66a6687`，replay 13.30ms / 0 fault / 出师表逐字 ✓。
+
+## 2026-09-10 末：nsys 更新（10 项优化后的 kernel 分解，B=16 decode 稳态）
+
+**nsys 条件**：`--cuda-graph-trace=node`，16 seqs × 200 tok bench，replay p50=13.43ms（含 profiler 开销）。
+matmul_tiled_bf16 的 17.8% 全是 **prefill**（decode 路径用 gemm3/gemv/nvjet，不用它）。
+
+| kernel | med µs | calls/step | ms/step | % of 13.30 |
+|---|---|---|---|---|
+| ncclDevKernel AR RING_LL | 28.67 | 90 | 2.58 | 19.4% |
+| moe_fused_act_fp8_mma | 44.5 | 42 | 1.87 | 14.1% |
+| moe_fused_down_sum_fp8 | 43.6 | 42 | 1.83 | 13.8% |
+| hc_pre_rest345 | 12.67 | 90 | 1.14 | 8.6% |
+| hc_pre_mix_split | 7.71 | 90 | 0.69 | 5.2% |
+| gdn_step_v2 | 17.12 | 34 | 0.58 | 4.4% |
+| gdn_chunk_batched | 13.98 | 34 | 0.48 | 3.6% |
+| gemm3_bf16_mma | 11.62 | ~34 | 0.40 | 3.0% |
+| hc_post | 3.04 | 90 | 0.27 | 2.0% |
+| kpool_compress | 23.17 | 11 | 0.26 | 2.0% |
+| nvjet (cuBLAS 各种) | 2.5-9.3 | ~60 | 0.28 | 2.1% |
+| moe_route | 5.95 | 42 | 0.25 | 1.9% |
+| gemv_fp8_mma_b16 | 6.91 | ~34 | 0.23 | 1.7% |
+| 其余小 kernel | — | — | ~1.0 | 7.5% |
+| **合计** | | | **~11.9** | |
+| 图调度间隙（~400 节点） | | | ~0.4 | |
+| + host gap | | | ~0.9 | |
+| **步时间** | | | **~13.2** | ✓ |
+
+**rest345 是指令吞吐受限（非内存）**：65536 线程 × ~100 指令/thread = 6.5M 指令；
+B300 非 FMA 发射率 ~0.59T/s → 理论 ~11µs ≈ 实测 12.67µs ✓。占用率仅 21.7%（256 blk × 256 thr
+/ 148 SM × 2048）。**P2a sigmoid 每 block 冗余计算相同值（16x 冗余）是具体优化点**：
+搬到 mix kernel 算一次写 global，rest345 读 → 省 ~25% 指令 ≈ 0.23ms/步。
+NB=16 不可加（64/256 会毁输出，根因未定位）。
+
+**f32_to_bf16 修正**：372K 实例但多数是 prefill；decode 路径仅 ~74 次/步 × 1.06µs ≈ **0.08ms**
+（不是早前估计的 0.6ms——那是含 prefill 的总数）。非优化目标。
+
+**剩余优化路径（更新后按收益排序）**：
+1. **hc rest345 P2a 去冗余**（−0.23ms，具体可实现）：mix 算 P2a → global → rest345 读
+2. **tick pipelining**（−0.2~0.4ms）：host bookkeeping 与 GPU 执行重叠
+3. **gdn_step 17.1µs**（0.58ms）：float4 已做，需 ncu 定位剩余瓶颈
+4. **kpool 23.2µs**（0.26ms）：grid cap 回退过，需不同的并行化策略
+5. NCCL AR / MoE：均在各自地板（协议/带宽），需结构性突破
