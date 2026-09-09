@@ -3590,6 +3590,146 @@ __global__ void __launch_bounds__(256, 4) moe_down_mma_kernel(
     }
 }
 
+// ============================================================
+// moe_down_bf16_mma: the down projection on the tensor core with bf16
+// operands. The fp8 (e4m3) variant was PROVEN mathematically correct
+// (e4m3-exact act fill -> bad=0) but its act quantization (3-bit mantissa,
+// up to 6.25% per element, ~2-3% on the dot) compounds over 42 layers and
+// destroys the text. bf16 has an 8-bit mantissa (~0.4%), which survives.
+//
+// Weights stay fp8 in memory (half the bytes) and are converted to bf16 in
+// the smem staging; the act is converted fp32 -> bf16 in the staging.
+// Block = (16 hidden rows, one token); the 8 warps split the K
+// (inter/8 = 32 each = two m16n8k16 tiles).
+// ============================================================
+__global__ void __launch_bounds__(256, 4) moe_down_bf16_mma_kernel(
+    const float* __restrict__ ids_f,
+    const float* __restrict__ probs,
+    const unsigned char* const* __restrict__ down_w8_ptrs,
+    const float* const* __restrict__ down_scale_ptrs,
+    const unsigned char* __restrict__ shared_down_w8,
+    const float* __restrict__ shared_down_scale,
+    const float* __restrict__ act,
+    float* __restrict__ out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols, int n) {
+    const int h0 = blockIdx.x * 16;
+    const int tok = blockIdx.y;
+    if (h0 >= hidden || tok >= n) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int c0 = (lane & 3) * 4;
+    const int kper = ((inter + 7) / 8 + 15) & ~15;   // 16-aligned (m16n8k16)
+    const int k0 = warp * kper;
+    const int k1 = min(k0 + kper, inter);
+    const int stride = topk * inter + inter_shared;
+    // A tile: 16 rows x 32 K bf16 (two m16n8k16 tiles), padded stride 40
+    __shared__ __nv_bfloat16 sw[8][16][40];
+    __shared__ __nv_bfloat16 sa[8][32];
+    float total = 0.f, total2 = 0.f;
+    const int nslot = topk + (inter_shared > 0 ? 1 : 0);
+    for (int slot = 0; slot < nslot; slot++) {
+        const unsigned char* w8; const float* ws; const float* arow; float p;
+        if (slot < topk) {
+            const int eid = (int)ids_f[(size_t)tok * topk + slot];
+            const int local = eid - expert_start;
+            if (local < 0 || local >= e_local) continue;
+            w8 = down_w8_ptrs[local]; ws = down_scale_ptrs[local];
+            arow = act + (size_t)tok * stride + (size_t)slot * inter;
+            p = probs[(size_t)tok * topk + slot];
+        } else {
+            if (inter_shared <= 0) break;
+            w8 = shared_down_w8; ws = shared_down_scale;
+            arow = act + (size_t)tok * stride + (size_t)topk * inter;
+            p = 1.0f;
+        }
+        // ---- B: this warp's 32 act values -> bf16 (2 tiles of 16) ----
+        #pragma unroll
+        for (int q = 0; q < 2; q++) {
+            const int base = q * 16 + lane;
+            const int l = k0 + base;
+            sa[warp][base] = __float2bfloat16((l < inter) ? arow[l] : 0.f);
+        }
+        // ---- A: weight rows h0..h0+15, K slice k0..k0+31 -> bf16 ----
+        // 16 rows x 32 K = 512 elements / 32 lanes = 16 each
+        #pragma unroll
+        for (int q = 0; q < 16; q++) {
+            const int idx = lane + q * 32;          // 0..511
+            const int row = idx >> 5, kk = idx & 31;
+            const int l = k0 + kk;
+            unsigned char v8 = 0;
+            if (l < inter && h0 + row < hidden)
+                v8 = w8[(size_t)(h0 + row) * inter + l];
+            sw[warp][row][kk] = __float2bfloat16(
+                __half2float(__nv_cvt_fp8_to_halfraw(v8, __NV_E4M3)));
+        }
+        __syncwarp();
+        const float wsc = ws[(size_t)(h0 >> 7) * dscols + (k0 >> 7)];
+        // ---- two m16n8k16 MMAs (K = 32 for this warp) ----
+        #pragma unroll
+        for (int t = 0; t < 2; t++) {
+            const int kb = t * 16;
+            // A fragment: lane l supplies rows (l&7) and (l&7)+8 at K (l>>3)*8
+            unsigned a[4];
+            {
+                const unsigned saddr = (unsigned)__cvta_generic_to_shared(
+                    sw[warp][(lane & 7)] + kb + ((lane >> 3) * 8));
+                const unsigned saddr2 = (unsigned)__cvta_generic_to_shared(
+                    sw[warp][(lane & 7) + 8] + kb + ((lane >> 3) * 8));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(a[0]), "=r"(a[1]) : "r"(saddr));
+                asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                             : "=r"(a[2]), "=r"(a[3]) : "r"(saddr2));
+            }
+            // B fragment: lane l holds B[(l%4)*2 ..][l/4] for the 16x8 tile
+            unsigned b[2];
+            {
+                const __nv_bfloat16* bp = sa[warp] + kb + (lane & 3) * 2;
+                b[0] = *(const unsigned*)bp;
+                const __nv_bfloat16* bp2 = sa[warp] + kb + 8 + (lane & 3) * 2;
+                b[1] = *(const unsigned*)bp2;
+            }
+            float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(d0), "+f"(d1), "+f"(d2), "+f"(d3)
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            const float f = wsc * p;
+            if ((lane & 3) == 0) { total += d0 * f; total2 += d2 * f; }
+        }
+    }
+    __shared__ float red[8][64];
+    red[warp][lane * 2 + 0] = total;
+    red[warp][lane * 2 + 1] = total2;
+    __syncthreads();
+    if (warp == 0) {
+        float s0 = 0.f, s1 = 0.f;
+        #pragma unroll
+        for (int u = 0; u < 8; u++) { s0 += red[u][lane * 2 + 0]; s1 += red[u][lane * 2 + 1]; }
+        if ((lane & 3) == 0) {
+            const int hrow = h0 + (lane >> 2);
+            if (hrow < hidden) out[(size_t)tok * hidden + hrow] = s0;
+            if (hrow + 8 < hidden) out[(size_t)tok * hidden + hrow + 8] = s1;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_moe_down_bf16_mma(
+    const float* ids_f, const float* probs,
+    const unsigned char* const* down_w8_ptrs, const float* const* down_scale_ptrs,
+    const unsigned char* shared_down_w8, const float* shared_down_scale,
+    const float* act, float* out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols, int n, cudaStream_t s) {
+    if (n <= 0 || n > 16 || (hidden & 15) != 0) return cudaErrorInvalidValue;
+    dim3 grid((unsigned)(hidden / 16), (unsigned)n);
+    moe_down_bf16_mma_kernel<<<grid, 256, 0, s>>>(
+        ids_f, probs, down_w8_ptrs, down_scale_ptrs, shared_down_w8,
+        shared_down_scale, act, out, expert_start, e_local, hidden, inter,
+        inter_shared, topk, dscols, n);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_moe_down_mma(
     const float* ids_f, const float* probs,
     const unsigned char* const* down_w8_ptrs, const float* const* down_scale_ptrs,
