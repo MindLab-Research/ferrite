@@ -593,3 +593,18 @@ __global__ void __launch_bounds__(256) gemv_fp8_mma_kernel(
   HTTP serve 路径没有该窗口，`--capture-range=cudaProfilerApi` 因此不可用。
 - 远端**没有 sqlite3 CLI**，无法直接查 `CUPTI_ACTIVITY_KIND_*` 表。
 - 因此当前步时的可信分解仍是 **A/B 差分**（`FERRITE_AR_SKIP` 等）而不是 nsys 的绝对占比。
+
+### 当前 build 的 B=16 步时分解（消融法，2026-09-08，per-seq steady 为准）
+
+nsys 在 HTTP 路径不可用（见上），改用**内核跳过消融**（纯计时，输出必错）：
+
+| 配置 | per-seq steady | 占比 |
+|---|---|---|
+| 基线 | 58.3–60.0 | — |
+| `FERRITE_AR_SKIP=1` | 66.7–69.0 | AR ≈ **12–13%** |
+| `FERRITE_MOE_SKIP=1`（新增诊断开关） | 80.0–81.9 | MoE ≈ **27%** |
+
+→ 剩余 ~60% 是 attention（DSA+indexer+sparse）+ GDN + norm + gemv + head。
+**冲 1600 需要三块同时动**：attention（MLA 吸收+tensor core，约 4x）、MoE（DeepGEMM 级 MMA，约 2x）、
+AR（12%→6%）。按 16.7ms 步时粗算：40%→10% + 27%→15% + 12%→6% ≈ 9.2ms/步 ≈ 1740 tok/s。
+`FERRITE_MOE_SKIP` 是**诊断专用**（输出乱码），保留在 launcher 里供后续复测。
