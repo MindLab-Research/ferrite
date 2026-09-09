@@ -1020,3 +1020,19 @@ smem 33.8→18.5KB，blocks/SM 上限 5→12。隔离复现无变化（冷缓存
 **教训**：连续三个"看起来很合理"的假设（带宽/原子/并行度）都被实测证伪，
 **ncu 的 No-Eligible/long-scoreboard 才是唯一有效线索**。以后遇到"kernel 慢但找不到原因"，
 先上隔离复现 + ncu，不要靠推测连环试错。
+
+### MoE act 2 段流水（2026-09-09，隔离 −34%）
+
+ncu 对 `moe_fused_act_fp8_mma`：**理论占用率 37.5%，被 shared memory 限制**（ncu 估算可提速
+39.13%）。3 段流水 60KB → 2 段 40KB，且**先发下一 tile 再 `wait_group 1`**（保持 1 个 tile
+在飞，prefetch 深度不变）：隔离微基准 **79.8 → 52.3 µs/call（−34%）**。
+
+**serve 端（n=1994）**：14.19 ms / 1128 tok/s。注意：本轮所有 serve 读数都在 13.7-14.4ms
+的噪声带内（±3%），单 kernel 的 27-34% 隔离收益传导到整步后小于噪声 —— 因此
+**判定 kernel 改动是否有效必须以隔离微基准为准，serve 中位数只做最终确认**。
+
+### MoE down 的 ncu（已到 SIMT 极限）
+
+`moe_fused_down_sum_fp8`：Duration 48.8µs，**Compute 58.1% / Memory 61.1%（L1/TEX 68%）**
+—— ncu 判定"计算与访存已平衡，两者都要降才能提速"。SIMT 版没有单侧优化空间，
+**只有 MMA 能同时降两者**（该方向仍 park，见上）。
