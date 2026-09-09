@@ -523,3 +523,9 @@ decode 的 M=1 看似无法用 MMA，但**同一 seq 的 64 个 head 共享同�
 `mma.m16n8k32`（M=16 个 head、B=latent）**在数学上成立**（否则每个 head 的 K 不同，MMA 拼不起来）；
 此时 524M MAC 在 MMA 速率下 ≈ 0.26ms vs 现状 ~1ms → **约 4x**。所以这两件事必须一起做，
 不能分步验收。
+
+### 已排除（先算后做）：sparse_attn 的 split-K 是中性
+
+grid (B,h)=1024 blocks × 544 线程 = 557K 线程，GPU 容量 132×2048 = 270K → 约 2 波（并行度已饱和）。
+split-K=4 → 4096 blocks（8 波）、每块 1/4 工作量 → **总时间不变**。真正的限制是每线程的串行
+slot 循环（gather + 点积），TG 调优（8→2）已到甜点。**不要做 split-K。**
