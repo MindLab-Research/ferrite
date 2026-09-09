@@ -2119,15 +2119,27 @@ impl CudaBackend {
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
         if n == 16 && dbias.is_null() {
-            // cuBLAS bf16 batched GEMM (split-K/streaming): the FMA
-            // gemv_bf16_nt is compute-bound at n=16 (measured 2.5x decay
-            // vs n=1) — this is the SGLang/cutlass route.
+            // ONE-launch bf16 MMA (m16n8k16, gemm_bf16_mma_kernel) FIRST.
+            // The whole bf16 projection family is ~2 GFLOP/step of real
+            // compute; the cuBLAS route (nvjet splitK + splitKreduce + a
+            // separate f32→bf16 cast = 3 launches) measured 2.6ms/step/rank
+            // — ~100% launch/tail overhead (nsys 2026-09-09). The MMA kernel
+            // was already wired further down but UNREACHABLE for n==16 (the
+            // cuBLAS branch below used to return first). in_f%16≠0 or a
+            // launch error → non-zero → the cuBLAS fallback.
+            let r = unsafe {
+                ferrite_gemm_bf16_mma(x_dev.as_const_f32(), dw.ptr as *const _,
+                                      dbias, do_.as_f32(), n, in_f, out_f, self.stream)
+            };
+            if r == 0 {
+                return Ok(do_);
+            }
             if std::env::var("FERRITE_GEMV_MMA_DEBUG").is_ok() {
                 static CNT2: std::sync::atomic::AtomicUsize =
                     std::sync::atomic::AtomicUsize::new(0);
                 let c = CNT2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if c < 300 {
-                    eprintln!("[gemvdbg] n=16 CUBLAS in={in_f} out={out_f}");
+                    eprintln!("[gemvdbg] n=16 CUBLAS(fallback r={r}) in={in_f} out={out_f}");
                 }
             }
             if let Ok(o) = self.gemm_cublas(x_dev, dw.ptr as *const _, n, in_f, out_f) {

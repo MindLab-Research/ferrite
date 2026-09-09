@@ -2668,12 +2668,17 @@ __global__ void gemm_bf16_mma_kernel(const float* __restrict__ a,        // [16,
         __syncthreads();
     }
     const int n = n0 + tig * 2;
-    if (n + 1 < N) {
-        float bi0 = bias ? bias[n] : 0.f;
-        float bi1 = bias ? bias[n + 1] : 0.f;
+    // per-element guards: the old `if (n + 1 < N)` dropped the LAST element
+    // of an odd out_f together with the out-of-bounds n+1 (all current shapes
+    // are even, this makes odd N safe too)
+    if (n < N) {
+        const float bi0 = bias ? bias[n] : 0.f;
         c[(size_t)group * N + n] = acc[0] + bi0;
-        c[(size_t)group * N + n + 1] = acc[1] + bi1;
         c[(size_t)(group + 8) * N + n] = acc[2] + bi0;
+    }
+    if (n + 1 < N) {
+        const float bi1 = bias ? bias[n + 1] : 0.f;
+        c[(size_t)group * N + n + 1] = acc[1] + bi1;
         c[(size_t)(group + 8) * N + n + 1] = acc[3] + bi1;
     }
 }
