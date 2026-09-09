@@ -492,3 +492,60 @@ error 数**（本会话第二次踩这个坑）。
 **教训**：`FileReplace` 改动控制流结构（尤其 `__syncthreads` 位置、条件作用域）后，
 必须用上面的数值基准验证；`mega graph ... missing` 往往是 sticky CUDA error 的误报，
 真因在更早的 kernel。
+
+## 2026-09-10 末会话总结：B=16 replay 29.01→13.30ms（+118%），10 项优化落地
+
+**严格口径**：`FERRITE_TIMING=1` 的 `[megab] replay 16 seqs` 中位数（16000/N = 聚合 tok/s）；
+steady×16 = per-seq steady × 16 作交叉验证。文本每次人眼验证（出师表逐字）。
+
+| # | 优化 | replay 增量 | 累计 |
+|---|---|---|---|
+| 1 | fp8 fused down 默认 | 29.01→15.46 | 15.46 |
+| 2 | DSA dummy total 8192→1 | →15.42 | 15.42 |
+| 3 | AR 默认 f32 | →15.20 | 15.20 |
+| 4 | device 侧 pinned 推进 | →14.57 | 14.57 |
+| 5 | gemm3 融合投影 | →14.43 | 14.43 |
+| 6 | gdn_chunk float4 | →14.01 | 14.01 |
+| 7 | mix float4 | →14.02 | 14.02 |
+| 8 | sparse_attn_v3 3-kernel 分割 | →13.58 | 13.58 |
+| 9 | **GPU 侧 embedding**（embed_expand_dev 为图第一节点，graph_run_ids 喂 64B token ids 替代 1MB host staging） | →13.43 | 13.43 |
+| 10 | **host 侧 embedding 跳过**（dev_input 模式下 ~125µs/步的 embed+hc_expand 不再计算） | →**13.30** | **13.30** |
+
+**GPU 侧 embedding 的两个关键坑（2026-09-10 实测）**：
+1. ids buffer 分配必须在 `graph_capture_begin()` **之前**——cudaMalloc during capture = err 900
+   （"operation not permitted when stream is capturing"），首次测试 0.4 tok/s 全崩。
+2. dry-run 必须预热 embedding 表的 dev_weight 缓存（用 scratch buffer 跑一次
+   embed_expand_dev_buf）——否则 capture 期 `dev_weight` 的 2.4GB H2D 上传被录成图节点，
+   每步 replay 重传 2.4GB。
+3. `hc_expand` 返回 `Tensor` 不是 `Vec<f32>`——空值用 `Tensor::zeros(Shape::new([0]), DType::F32)`。
+
+**关停路径（本会话新增 3 项，全部有机制级解释）**：
+- `--use_fast_math`：13.59ms（中性，denormals 在 Blackwell 不是瓶颈）
+- `FERRITE_MOE_EP=1`：29.97ms（**2.2x 更慢**——路由偏斜：热门 rank ~20 assignments × 25.2MB
+  vs 冷门 ~5，AR 等最慢 rank；原始 TP 设计 constant topk work per rank 是正确的）
+- down MMA v1/v2、P2P AR ×3、NCCL LL128/Simple、kpool grid cap、mix launch_bounds、
+  bf16 cast 缓存 ×4：见上文各节
+
+**当前每步分解（13.30ms replay + ~0.9ms host gap）**：
+- AR 2.66ms（NCCL 90 调用 × 29.5µs = 协议地板；P2P 三变体全死锁）
+- MoE act+down 3.65ms（带宽地板 47%；B=16 下每 expert 仅 ~1.3 token 摊薄权重读取）
+- hc 链 2.11ms（rest345 1.14 + mix 0.69 + hc_post 0.28；rest345 12.6µs/次 = 理论下限的 50x，
+  **瓶颈未定位，需 ncu isolated repro**）
+- attention 1.4ms（sparse_attn_v3 已优化）
+- projections 1.0ms（gemm3 已融合）
+- other 0.7ms + embed_expand_dev ~0.01ms
+
+**通往 1600 的剩余路径（按预期收益排序，全部需要较大改动）**：
+1. **hc rest345 深度优化**（−0.6ms 目标）：12.6µs/次 vs 0.25µs 内存下限——需 ncu 定位瓶颈
+   （寄存器压力？占用率？sinkhorn 串行？）。NB=16 是最后已知正确值（64/256 会毁输出）。
+2. **tick 循环软件流水线**（−0.2~0.4ms）：host 在 GPU 执行期间做上一步的 detokenize/SSE/
+   bookkeeping（当前在 sync 之后串行做，GPU 空闲 200-400µs）。需拆分 graph_run_ids 为
+   launch/wait 两阶段 + 输出双缓冲。
+3. **attention 内核**（−0.4ms）：sparse_attn_v3 刚优化过，进一步需 ncu。
+4. **AR 结构性削减**（需模型数据流重构）：attention AR + FFN AR 每层 2 次，FFN 输入依赖
+   attention 输出（经 AR + hc_post），无法合并。hc 的 4 流展开可能允许 AR 延迟——需深度分析。
+
+**EP/DCP/MTP-batched 全部关停**（详见上文）：EP 路由偏斜 2.2x 更慢；DCP 每 rank 需 305GB
+MoE 权重 > 180GB HBM；MTP-batched 修正后 ~1400-1600 < 3200 目标。
+
+**基线**：远端 HEAD=`66a6687`，replay 13.30ms / 0 fault / 出师表逐字 ✓。
