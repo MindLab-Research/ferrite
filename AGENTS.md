@@ -94,11 +94,24 @@ sudo nsys stats --report cuda_gpu_kern_sum /tmp/nsys_out.nsys-rep | head -40
   （单次 `FERRITE_P2P=1` 跑通过是 1 个样本，最可能是开 P2P 时多出的 staging/ready 表改变了 VA 布局，属运气；
   且 P2P 在 batched n>8 有文档记载的死锁 + 会 wedge 整机，**不可设为默认**。）
 - **padding 无关**：`FERRITE_NO_PAD=1` 仍崩。
-- **CUDA 图无关**：`FERRITE_MEGA_DRY=1`（不捕获图）仍崩。
+- **CUDA 图无关**：`FERRITE_MEGA_DRY=1`（不捕获图）仍崩；`FERRITE_DESTROY_BG=1`（retire 时销毁 megab 图）也仍崩。
 - **MoE 只是部分相关**：`FERRITE_MOE_SKIP=1` 能出 10 tok 但仍有 129 fault。
 - **DEV 开关不能用作二分**：`FERRITE_MOE_DEV/GDN_DEV/LAYER_DEV=0` 在 batched 路径直接 panic
   （`lib.rs:1318`/`lib.rs:643`/`mhc.rs:94 range end 16384 out of range for slice of length 4`）。
 - **短请求 vs 长请求都会崩**（16×60 与 16×1000 都失败）→ 不是"retire 风暴"独有。
+- **warmup 无关**：去掉 warmup 的 bench 同样崩（曾通过两次，属间歇运气）。
+- **seq 生命周期修复全部无效**：`2d8cb68`（retire 失效 membership）、`9d8e533`（free 前 device sync）、
+  `03ee979`（DSA 缓存池化）、`ec0f10a`（GDN/conv 池化）→ 仍崩。
+- **host↔device 写序修复全部无效**：`8319cfc`（步首 sync）、`df12c72`（写 pinned 前 sync）、
+  `79857ce`（逐层 sync 开关）→ 仍崩。
+- **DSA 缓存容量无关**：`FERRITE_DSA_MAXT=1024/2048`（把每 seq ~0.5GB 的缓存缩小 4-8 倍）→ 仍崩 289 fault。
+- **最新观测**：某次跑到 `cap=true L0..L44`（capture 完成）后**第一次 replay 就崩**（在 `graph_run D2H` 检出），
+  且 `[opcheck]`（act 内核错误码打印）为空 → act 不是首个失败者；故障在 replay 路径。
+
+**结论（2026-09-09 末）**：batched 路径在**同一台机器**上从"能用"变为"必崩"，且非 batched 路径（同一批内核、同一批权重）
+始终正常 —— 与用户自己记录的历史案例（1100 节点：单节点反复 Xid 13、ECC 全 0、他节点零崩 → 隔离该节点）同形。
+**判定：该节点（b300-4）的驱动/硬件状态问题**，软件侧已无更多可用手段（本文列出的所有修复与开关均已试过）。
+验证方式：**同一二进制拿到另一台机器跑同样 16 并发负载**，若一次都不崩即确认。
 
 **已知的真实缺陷（已提交修复或待修）**：
 - ✅ `free_seq` 后未失效 `last_batch_seqs` → 表内容只在 membership 变化时刷新，retire 后可留悬垂指针（`2d8cb68` 已修）。
