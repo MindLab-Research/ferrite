@@ -3995,7 +3995,10 @@ impl CudaBackend {
         // present (FERRITE_MEGA_PROBE=1) and faults otherwise; a pre-step sync
         // alone is not enough because the writes happen per layer.
         // FERRITE_NO_ADV_SYNC=1 disables this for A/B.
-        if std::env::var_os("FERRITE_NO_ADV_SYNC").is_none() {
+        // ⚠️ CAPTURE-ILLEGAL when enabled: a stream sync inside the capture pass
+        // returns err 900 and invalidates the capture (measured). Default OFF;
+        // FERRITE_ADV_SYNC=1 opts in (only meaningful with FERRITE_MEGA_DRY=1).
+        if std::env::var_os("FERRITE_ADV_SYNC").is_some() {
             let _ = self.sync();
         }
         let mut m = self.dsa_caches.lock().unwrap();

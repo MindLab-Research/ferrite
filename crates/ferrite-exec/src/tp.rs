@@ -2785,6 +2785,9 @@ fn mega_chain_dev(
         // batched chain run clean (FERRITE_MEGA_PROBE=1 proved it) while every
         // finer-grained sync we tried (per-step, per-dsa_host_advance) did not.
         // Enable with FERRITE_LAYER_SYNC=1 until the exact hazard is found.
+        // ⚠️ CAPTURE-ILLEGAL: a stream sync inside the capture pass returns
+        // err 900 and invalidates the capture. Default OFF; only meaningful
+        // together with FERRITE_MEGA_DRY=1 (no capture).
         if std::env::var_os("FERRITE_LAYER_SYNC").is_some() {
             match cuda.sync() {
                 Ok(()) => {}
@@ -3212,6 +3215,9 @@ fn mega_chain_dev_batched(
         // batched chain run clean (FERRITE_MEGA_PROBE=1 proved it) while every
         // finer-grained sync we tried (per-step, per-dsa_host_advance) did not.
         // Enable with FERRITE_LAYER_SYNC=1 until the exact hazard is found.
+        // ⚠️ CAPTURE-ILLEGAL: a stream sync inside the capture pass returns
+        // err 900 and invalidates the capture. Default OFF; only meaningful
+        // together with FERRITE_MEGA_DRY=1 (no capture).
         if std::env::var_os("FERRITE_LAYER_SYNC").is_some() {
             match cuda.sync() {
                 Ok(()) => {}
