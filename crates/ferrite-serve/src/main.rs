@@ -626,6 +626,11 @@ fn run_serve(
     // NO exit-time teardown: dropping the cluster (1.17TB weights + CUDA
     // contexts) segfaults (EXIT 139 — the one-shot path's known issue);
     // the driver thread + its engine leak with the process instead.
+    // FERRITE_NCU: CLOSE the capture window before exit — nsys
+    // --capture-range=cudaProfilerApi waits for cudaProfilerStop and never
+    // flushes the report without it.
+    #[cfg(feature = "cuda")]
+    ferrite_kernel::cuda::profiler_stop();
     std::process::exit(0);
 }
 

@@ -191,6 +191,23 @@ impl ServeEngine for GpuEngine {
 
     fn tick(&mut self, plan: &mut TickPlan) -> Result<()> {
         self.ticks += 1;
+        // FERRITE_NCU serve window (nsys --capture-range=cudaProfilerApi):
+        // open the capture only once the batch SATURATES (live == max_seqs) —
+        // skips the 80s weight load AND the admission ramp / per-size graph
+        // captures; closed by run_serve's profiler_stop before exit (nsys
+        // waits for cudaProfilerStop forever without it — the documented
+        // "serve never exits" trap).
+        if std::env::var_os("FERRITE_NCU").is_some() && self.live.len() >= self.max_seqs {
+            static NCU_WIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !NCU_WIN.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                eprintln!(
+                    "[ncu-win] batch saturated (live={}): opening the profiler window",
+                    self.live.len()
+                );
+                #[cfg(feature = "cuda")]
+                ferrite_kernel::cuda::profiler_start();
+            }
+        }
         plan.admissions.clear();
         // 1. Admission — ONE prefill per tick (prefill is a blocking
         //    host-chain forward, ~0.4-2s for chat prompts; one-at-a-time
