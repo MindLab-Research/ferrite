@@ -4594,6 +4594,182 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     }
 }
 
+// ============================================================
+// moe_down_w8a16_mma (2026-09-10, TODO path ②): the down projection on
+// f16 tensor cores with IN-KERNEL fp8→f16 weight conversion + f32→f16
+// act conversion. NUMERICALLY SAFE (unlike the e4m3 W8A8 path):
+//   fp8 e4m3 → f16: LOSSLESS (3-bit mantissa fits 10-bit)
+//   f32 act → f16: ~0.05% (the ONLY error source — half the 0.1% threshold)
+//   f16 × f16 → f32 product: EXACT (10+10=20 bits < 23-bit f32 mantissa)
+//   f32 accumulate: EXACT
+// vs e4m3 activation quantization (~6% error → flips thinking preamble)
+// and f16 accumulation (~0.8% → same). Structure mirrors the e4m3 variant
+// (grid (hidden/32, n), 8-warp K split, double-buffered cp.async staging)
+// with: k16 chunks (vs k32), a fp8→f16 smem conversion pass after each
+// cp.async wait, f16 ldmatrix + mma.m16n8k16.f32.f16.f16.f32.
+// ============================================================
+__global__ void __launch_bounds__(256, 2) moe_down_w8a16_mma_kernel(
+    const float* __restrict__ ids_f,       // [n, topk]
+    const float* __restrict__ probs,       // [n, topk]
+    const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] [hidden, inter] e4m3
+    const float* const* __restrict__ down_scale_ptrs,       // [e_local] [hidden/128, dscols]
+    const unsigned char* __restrict__ shared_down_w8,       // [hidden, inter_shared]
+    const float* __restrict__ shared_down_scale,
+    const float* __restrict__ act,         // [n, stride] f32 — NOT pre-quantized
+    float* __restrict__ out,               // [n, hidden]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols) {
+    const int h0 = blockIdx.x * 32;
+    const int t = blockIdx.y;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int stride = topk * inter + inter_shared;
+    // smem: f16 act rows (512 f16 = 1KB pitch), raw fp8 staging (272B rows),
+    // f16 weight tile (272 f16 = 544B rows), warp partials, slot probs.
+    __shared__ __half sah[/*TOPK_MAX*/ (8 + 1) * 512];
+    __shared__ unsigned char sW8[2][32 * 272];
+    __shared__ __half sW16[2][32 * 272];
+    __shared__ float part[8][32];
+    __shared__ float ssp[9];
+    // ---- stage the token's act rows (f32 → f16) + slot metadata ----
+    {
+        const float* act_t = act + (size_t)t * stride;
+        const int topk_inter = topk * inter;
+        for (int off = threadIdx.x; off < stride; off += 256) {
+            int j, lo, klen;
+            if (off < topk_inter) { j = off / inter; lo = off - j * inter; klen = inter; }
+            else { j = topk; lo = off - topk_inter; klen = inter_shared; }
+            if (lo < klen) sah[j * 512 + lo] = __float2half(act_t[off]);
+        }
+        if (threadIdx.x == 0) {
+            for (int j = 0; j <= topk; j++) {
+                const float p = (j < topk) ? probs[(size_t)t * topk + j] : 1.f;
+                float v = p;
+                if (j < topk) {
+                    const int eid = (int)ids_f[(size_t)t * topk + j];
+                    const int local = eid - expert_start;
+                    if (local < 0 || local >= e_local || p == 0.f) v = 0.f;
+                }
+                ssp[j] = v;
+            }
+        }
+        __syncthreads();
+    }
+    // ---- weight staging: cp.async fp8 → sW8 (same as e4m3 variant) ----
+    #define DM_STAGE_W16(J, BUF) do { \
+        const float sp_ = ssp[J]; \
+        if (sp_ != 0.f) { \
+            const unsigned char* wbase = (J < topk) \
+                ? down_w8_ptrs[(int)ids_f[(size_t)t * topk + J] - expert_start] \
+                : shared_down_w8; \
+            const int klen_ = (J < topk) ? inter : inter_shared; \
+            for (int c = threadIdx.x; c < 32 * (klen_ >> 4); c += 256) { \
+                const int r = c / (klen_ >> 4), cc = (c % (klen_ >> 4)) * 16; \
+                const unsigned char* src_ = wbase + (size_t)(h0 + r) * klen_ + cc; \
+                unsigned char* dst_ = sW8[BUF] + r * 272 + cc; \
+                const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
+                asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
+            } \
+        } \
+        asm volatile("cp.async.commit_group;\n"); \
+    } while (0)
+    DM_STAGE_W16(0, 0);
+    float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;
+    int buf = 0;
+    for (int j = 0; j <= topk; j++, buf ^= 1) {
+        if (j + 1 <= topk) DM_STAGE_W16(j + 1, buf ^ 1);
+        if (j + 1 <= topk) asm volatile("cp.async.wait_group 1;\n");
+        else asm volatile("cp.async.wait_group 0;\n");
+        __syncthreads();
+        if (ssp[j] == 0.f) continue;
+        // ---- fp8 → f16 conversion pass (smem → smem, ~16 cvt/thread) ----
+        {
+            const int klen = (j < topk) ? inter : inter_shared;
+            for (int c = threadIdx.x * 2; c < 32 * klen; c += 512) {
+                const int r = c / klen, cc = c % klen;
+                const __nv_fp8x2_storage_t* src =
+                    (const __nv_fp8x2_storage_t*)(sW8[buf] + r * 272 + cc);
+                __half2* dst = (__half2*)(sW16[buf] + r * 272 + cc);
+                *dst = __nv_cvt_fp8x2_to_halfraw2(*src, __NV_E4M3);
+            }
+            __syncthreads();
+        }
+        const int klen = (j < topk) ? inter : inter_shared;
+        const float* dsr = (j < topk)
+            ? down_scale_ptrs[(int)ids_f[(size_t)t * topk + j] - expert_start]
+            : shared_down_scale;
+        const int srow = h0 >> 7;
+        // per-warp k16 chunks (klen/16 chunks over 8 warps; klen=256 → 2 each)
+        for (int kc = warp; kc < (klen >> 4); kc += 8) {
+            const float wsc = dsr[(size_t)srow * dscols + ((kc << 4) >> 7)] * ssp[j];
+            const __half* arow = sah + j * 512 + (kc << 4);
+            #pragma unroll
+            for (int m = 0; m < 2; m++) {
+                // A fragment: 16 rows × 16 k f16 — ldmatrix.x4 (offsets in f16 elements)
+                const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+                    sW16[buf] + (size_t)(m * 16 + (lane & 15)) * 272 + (kc << 4) + ((lane >> 4) * 8));
+                unsigned a[4];
+                asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                             : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr_a));
+                // B fragment: 16 k × 8 n — 2 f16 per reg, k = (lane&3)*2 and +8
+                const int c0 = (lane & 3) * 2;
+                unsigned b[2];
+                b[0] = *(const unsigned*)(arow + c0);
+                b[1] = *(const unsigned*)(arow + c0 + 8);
+                float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
+                asm volatile(
+                    "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                    "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                    : "+f"(gd0), "+f"(gd1), "+f"(gd2), "+f"(gd3)
+                    : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+                if ((lane & 3) == 0) {
+                    if (m == 0) { accA0 += gd0 * wsc; accA1 += gd2 * wsc; }
+                    else        { accB0 += gd0 * wsc; accB1 += gd2 * wsc; }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    #undef DM_STAGE_W16
+    // ---- cross-warp K reduction (warp-ascending, deterministic) ----
+    if ((lane & 3) == 0) {
+        const int r0 = lane >> 2;
+        part[warp][r0] = accA0;
+        part[warp][r0 + 8] = accA1;
+        part[warp][16 + r0] = accB0;
+        part[warp][16 + r0 + 8] = accB1;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        for (int r = lane; r < 32; r += 32) {
+            float s = 0.f;
+            #pragma unroll
+            for (int w = 0; w < 8; w++) s += part[w][r];
+            out[(size_t)t * hidden + h0 + r] = s;
+        }
+    }
+}
+
+extern "C" cudaError_t ferrite_moe_down_w8a16_mma(
+    const float* ids_f, const float* probs,
+    const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
+    const void* shared_down_w8, const void* shared_down_scale,
+    const float* act,
+    float* out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    if (hidden % 32 != 0 || (inter & 15) != 0 || (inter_shared & 15) != 0)
+        return cudaErrorNotSupported;
+    dim3 grid((unsigned)(hidden / 32), (unsigned)n);
+    moe_down_w8a16_mma_kernel<<<grid, 256, 0, s>>>(
+        ids_f, probs,
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
+        act, out,
+        expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+    return cudaGetLastError();
+}
+
 extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
     const float* ids_f, const float* probs,
     const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
