@@ -3062,10 +3062,16 @@ fn mega_chain_dev(
         let new_res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
         let old_res = std::mem::replace(&mut res, new_res);
         if !input_kept {
-            // The graph's INPUT buffer (x_stage / the recorded input node) —
-            // must never return to the pool (see INPUT KEEPALIVE above).
-            std::mem::forget(old_res);
             input_kept = true;
+            if capture {
+                // ONLY the capture pass's input is the graph's recorded input —
+                // keep it alive for the graph's lifetime. The DRY-RUN's input
+                // must return to the pool so the capture pass's input
+                // allocation hits the pool (a cudaMalloc inside a stream
+                // capture is err 900 — measured).
+                std::mem::forget(old_res);
+            }
+            // else (dry-run): old_res drops at scope end → pool ✓
         } else {
             drop(old_res);
         }
@@ -3458,10 +3464,16 @@ fn mega_chain_dev_batched(
         let new_res = cuda.hc_post_dev(&partial2, &res_mid, &post_f, &comb_f, n, hc_mult, hidden)?;
         let old_res = std::mem::replace(&mut res, new_res);
         if !input_kept {
-            // The graph's INPUT buffer (x_stage / the recorded input node) —
-            // must never return to the pool (see INPUT KEEPALIVE above).
-            std::mem::forget(old_res);
             input_kept = true;
+            if capture {
+                // ONLY the capture pass's input is the graph's recorded input —
+                // keep it alive for the graph's lifetime. The DRY-RUN's input
+                // must return to the pool so the capture pass's input
+                // allocation hits the pool (a cudaMalloc inside a stream
+                // capture is err 900 — measured).
+                std::mem::forget(old_res);
+            }
+            // else (dry-run): old_res drops at scope end → pool ✓
         } else {
             drop(old_res);
         }
