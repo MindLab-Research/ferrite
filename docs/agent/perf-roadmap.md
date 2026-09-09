@@ -1110,3 +1110,14 @@ MMA-down vs SIMT-down: maxrel=6.093e-04  bad=0/4096
 ~0.4%，不伤精度），权重同步 bf16 化（每专家 1MB→2MB，288 专家共 576MB，显存充裕）。
 预估：128 个 (token,slot) × 1M MAC × 8（N 维浪费）≈ 1G MAC / bf16 峰值 ≈ 4µs，
 加权重读 18MB ≈ 2.3µs → **~5-10µs vs SIMT 的 46.8µs（5-9x）**。属于下一阶段工作。
+
+### MoE down bf16 MMA（WIP，默认关闭，env `FERRITE_MOE_DOWN_MMA=1`）
+
+按决定性实验的结论实现 `moe_down_bf16_mma_kernel`（m16n8k16 bf16，权重 fp8→bf16 在 staging
+转换，act fp32→bf16）：**serve 仍输出全 `!`**（n=1，0 CUDA 错误），说明片段装载仍有 bug。
+第一版用两次 `ldmatrix.x2` + `(lane>>3)*8` 寻址（与 m16n8k16 的 A 片段布局不符）；
+改为与**已验证正确**的 fp8 版相同的 `ldmatrix.x4` + `(lane&15)*stride + (lane>>4)*16` 后
+仍然 `!` → 嫌疑转向 **B 片段布局**（`sa[warp] + kb + (lane&3)*2` 与 `+8` 的 k 偏移）。
+
+**必须的下一步**：把 bf16 路径加进 `ncu_moe_bench.cu` 做逐片段对拍（照搬 fp8 版
+"e4m3-exact act → bad=0" 的方法论），**不要在 serve 上盲试**。
