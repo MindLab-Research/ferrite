@@ -999,3 +999,29 @@ MoE 访存模式（带宽+数值双地板 3.70ms）。会话交付 +121%（539�
 
 **风险**：TP=4 的权重内存 = 305/4 = 76GB/rank（+ 其他 ~20GB + KV/状态）≈ 100-130GB
 < 180GB ✓；两组用不同 GPU（无带宽竞争）✓。
+
+## 2026-09-10 终局：TP=4 capture 崩溃的精确定位（4 个 pool-miss）
+
+**诊断工具**：`FERRITE_POOL_MISS=1`（cuda.rs:593，已存在）打印每次池 miss 的 size class。
+
+**结果**（TP=4/B=8，`--max-seqs 8`，GPU 0-3）：
+- 全程 285 个 pool-miss（prefill/dry-run 的正常 miss）
+- **capture 开始后只有 4 个**（每 dev 一个）：`class=16384 len=16384 batch=false`
+- 位置：capture 的 L1 之后（**L2 层**），与 err 900 的崩溃点一致
+
+**谜团（下会话首要排查）**：capture 在 `decode_step_batched` 内，其 `BatchDecodeGuard`
+（tp.rs:966-979）应在**整个函数**期间把 `IN_BATCH_DECODE=true`（注释明说 "guard must
+live for the WHOLE function"）。但 capture 期的分配读到 **batch=false** →
+说明该分配发生在 guard 之外（或另一个未继承的上下文）。
+
+**修复候选（按简单度）**：
+1. 在 capture 前用 batch=false 上下文预热 class=16384（临时 set_batch_decode(false)
+   → alloc+drop → set true），命中池则 capture 期不再 miss
+2. 定位 L2 层那个 64KB 缓冲（16384 f32）的分配点，改用 alloc_immortal
+3. 排查为何 guard 未生效（可能是 capture 路径的某个分配在 guard 建立之前）
+
+**验证方式**：`FERRITE_POOL_MISS=1 FERRITE_TIMING=1 --tp 4 --max-seqs 8` + bench 8 60，
+确认 `TOTAL after first capture marker: 0` 且 faults=0，然后看 replay 时间。
+
+**注意**：TP=4 的 DRY 模式 replay 19.55ms（无图优化）；图化后需实测才能判断
+2 组方案的真实收益（估算 10-13ms/组 → 两组 1230-1600 tok/s）。
