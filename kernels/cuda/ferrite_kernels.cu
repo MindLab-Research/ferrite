@@ -505,7 +505,7 @@ __global__ void gdn_step_kernel(const float* __restrict__ q,
     __syncthreads();
     // 2. kS = S^T k -> shared[dv]
     extern __shared__ float ks[];
-    for (int j = threadIdx.x; j < dv_t; j += blockDim.x) {
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
         // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
         // may not reassociate fp), so the 4-cycle FMA latency dominated.
         // Order changes -> ~1e-7 relative, far below the model's tolerance.
@@ -655,13 +655,13 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     // per-row decay, then sweep all dk*dv elements with the full block.
     for (int i = threadIdx.x; i < dk; i += blockDim.x) gh[i] = expf(gh[i]);
     __syncthreads();
-    for (int idx = threadIdx.x; idx < dk * dv_t; idx += blockDim.x) {
-        const int i = idx / dv_t, j = idx - i * dv_t;
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x) {
+        const int i = idx / dv, j = idx - i * dv;
         S[(size_t)i * spitch + j] *= gh[i];
     }
     __syncthreads();
     // 2. kS = S^T k
-    for (int j = threadIdx.x; j < dv_t; j += blockDim.x) {
+    for (int j = threadIdx.x; j < dv; j += blockDim.x) {
         // 4 accumulators: the fp32 dot was a serial FMA chain (the compiler
         // may not reassociate fp), so the 4-cycle FMA latency dominated.
         // Order changes -> ~1e-7 relative, far below the model's tolerance.
@@ -679,9 +679,9 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     }
     __syncthreads();
     // 3. delta rule: S[i,j] += beta * k_i * (v_j - ks_j)
-    for (int idx = threadIdx.x; idx < dk * dv_t; idx += blockDim.x)
-        S[(size_t)(idx / dv_t) * spitch + (idx % dv_t)] +=
-            bt * kh[idx / dv_t] * (vh[idx % dv_t] - ks[idx % dv_t]);
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] +=
+            bt * kh[idx / dv] * (vh[idx % dv] - ks[idx % dv]);
     __syncthreads();
     // 4. o = q^T S
     for (int j = threadIdx.x; j < dv; j += blockDim.x) {
@@ -702,9 +702,8 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
     }
     __syncthreads();
     // 5. store state back (single HBM write)
-    for (int idx = threadIdx.x; idx < dk * dv_t; idx += blockDim.x)
-        Sg[(size_t)(idx / dv_t) * dv + j0 + (idx % dv_t)] =
-            S[(size_t)(idx / dv_t) * spitch + (idx % dv_t)];
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        Sg[idx] = S[(size_t)(idx / dv) * spitch + (idx % dv)];
 }
 
 // PDL (programmatic dependent launch) enable flag: FERRITE_PDL=1 opt-in.
@@ -755,10 +754,8 @@ extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
                                             float* state, float* out,
                                             int n, int h, int dk, int dv,
                                             cudaStream_t s) {
-    const int DV_TILE = 64;
-    const int dv_t = dv < DV_TILE ? dv : DV_TILE;
-    size_t smem = (size_t)dk * (dv_t + 1) * sizeof(float)
-                  + (size_t)(dv_t + dk + dv_t + dk + dk) * sizeof(float);
+    size_t smem = (size_t)dk * (dv + 1) * sizeof(float)
+                  + (size_t)(dv + dk + dv + dk + dk) * sizeof(float);
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gdn_step_v2_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
@@ -861,25 +858,17 @@ __global__ void gdn_chunk_batched_kernel(
     int h, int dk, int dv) {
     int seq = blockIdx.x;   // B
     int hd = blockIdx.y;     // h
-    // dv-tile split (blockIdx.z): every phase only depends on a dv COLUMN
-    // (decay is per-row, kS/qS are per-column dots, delta is elementwise), so
-    // splitting dv is exact. ncu showed the 128x129 state (66KB smem) capping
-    // this kernel at 3 blocks/SM with the state round-trip dominating.
-    const int DV_TILE = 64;
-    const int j0 = blockIdx.z * DV_TILE;
-    const int dv_t = min(DV_TILE, dv - j0);
-    if (dv_t <= 0) return;
     // gdn_step_v2's body (n=1) with the per-seq state indirection — the 5
     // phases' accumulation order is IDENTICAL (bit-equal per seq vs the
     // per-seq launches; the batched launch only changes the grid).
     float bt = beta[(size_t)seq * h + hd];
-    const size_t spitch = (size_t)dv_t + 1; // padded row stride (bank conflicts)
+    const size_t spitch = (size_t)dv + 1; // padded row stride (bank conflicts)
     extern __shared__ float sm[];
     float* S = sm;                          // [dk * (dv+1)]
-    float* ks = S + (size_t)dk * spitch;   // [dv_t]
-    float* kh = ks + dv_t;                 // [dk]
-    float* vh = kh + dk;                   // [dv_t]
-    float* qh = vh + dv_t;                 // [dk]
+    float* ks = S + (size_t)dk * spitch;   // [dv]
+    float* kh = ks + dv;                   // [dk]
+    float* vh = kh + dk;                   // [dv]
+    float* qh = vh + dv;                   // [dk]
     float* gh = qh + dk;                   // [dk]
     const int base = (int)((size_t)seq * h + hd);
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
@@ -887,18 +876,18 @@ __global__ void gdn_chunk_batched_kernel(
         qh[i] = q[(size_t)base * dk + i];
         kh[i] = k[(size_t)base * dk + i];
     }
-    for (int j = threadIdx.x; j < dv_t; j += blockDim.x)
-        vh[j] = v[(size_t)base * dv + j0 + j];
+    for (int j = threadIdx.x; j < dv; j += blockDim.x)
+        vh[j] = v[(size_t)base * dv + j];
     float* Sg = state_ptrs[seq] + (size_t)hd * dk * dv;
-    for (int idx = threadIdx.x; idx < dk * dv_t; idx += blockDim.x)
-        S[(size_t)(idx / dv_t) * spitch + (idx % dv_t)] = Sg[(size_t)(idx / dv_t) * dv + j0 + (idx % dv_t)];
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x)
+        S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
     __syncthreads();
     // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
     for (int i = threadIdx.x; i < dk; i += blockDim.x) {
         float decay = expf(gh[i]);
         if (decay != 1.0f) {
             float* Si = S + (size_t)i * spitch;
-            for (int j = 0; j < dv_t; j++) Si[j] *= decay;
+            for (int j = 0; j < dv; j++) Si[j] *= decay;
         }
     }
     __syncthreads();
@@ -940,7 +929,7 @@ __global__ void gdn_chunk_batched_kernel(
         }
         for (; i < dk; i++) a0 += qh[i] * S[(size_t)i * spitch + j];
         float acc = (a0 + a1) + (a2 + a3);
-        out[(size_t)base * dv + j0 + j] = acc;
+        out[(size_t)base * dv + j] = acc;
     }
     __syncthreads();
     // 5. store state back
@@ -963,7 +952,7 @@ extern "C" cudaError_t ferrite_gdn_chunk_batched(const float* q, const float* k,
         if (e != cudaSuccess) return e;
     }
     dim3 block(512);
-    dim3 grid(B, h, (unsigned)((dv + DV_TILE - 1) / DV_TILE));
+    dim3 grid(B, h, 1);
     gdn_chunk_batched_kernel<<<grid, block, smem, s>>>(
         q, k, v, beta, gate, a_log, state_ptrs, out, h, dk, dv);
     return cudaGetLastError();
