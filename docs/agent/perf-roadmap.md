@@ -575,3 +575,9 @@ __global__ void __launch_bounds__(256) gemv_fp8_mma_kernel(
    缓存的首次 miss 触发 `cudaMalloc` → 捕获失效（err 900/901，表现为 `tick fault: CUDA gemv_fp8`）。
    修法：在非捕获期（prefill）按 in_f 预分配，捕获期只重放 quant kernel。
 4. 数值教训（再次验证）：**fp8 x 量化用在注意力投影上会推入思考模式**，与 v 侧 fp16 同类。
+5. **若将来重启此方向**：根因 1（并行度断崖）的正解是 **warp 级 K-split** —— 8 个 warp 各算
+   `in_f/8` 的 K，末尾用 smem 归约 8 份 (16×8) fp32 累加器（1KB），block 数仍是 `out_f/64`
+   但每 block 的串行 K 链缩短 8 倍，瓶颈从 DRAM 延迟转为带宽（每 block 256KB / ~57GB/s/SM
+   ≈ 4.5µs，vs 现 gemv 的 41.7µs）。同时必须去掉 K 循环里的 `__syncthreads()`（xq 按 warp 暂存）。
+   **注意**：K-split 改变求和顺序（8 份 fp32 部分和），属数值敏感改动，必须人眼验收文本；
+   且 fp8 x 只能用于 FFN 投影、注意力投影需保留 bf16 x（否则思考模式）。
