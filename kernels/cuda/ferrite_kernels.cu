@@ -3967,6 +3967,58 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
 
 
 // ============================================================
+// moe_sort_assignments (2026-09-10, expert-major Phase 1): counting sort
+// of the n*(topk+1) assignments by expert ID — same-expert assignments
+// land ADJACENT in the linearized block schedule (p = blockIdx.y +
+// blockIdx.z*(topk+1)), turning the act kernel's expert-weight reads from
+// scattered (token-major, duplicate-expert blocks ~720 apart > 444
+// concurrency window → L2 can't absorb the 23% duplicate reads at B=16)
+// to sequential (expert-major → L2 hits). The shared expert (slot==topk)
+// gets expert=-1 → sorts FIRST → its n blocks run consecutively → the
+// 4MB shared weights read once into L2 and reused (a bonus: the current
+// interspersed scheduling evicts them between tokens).
+// One block, 256 threads; O(total²) rank (trivial at 144 elements).
+// ============================================================
+__global__ void moe_sort_assignments_kernel(
+    const float* __restrict__ ids_f,       // [n, topk] routing table
+    int* __restrict__ sorted_experts,      // [n*(topk+1)] output: expert ID (-1 = shared)
+    int* __restrict__ sorted_tokens,       // [n*(topk+1)] output: the assignment's token
+    int* __restrict__ sorted_slots,        // [n*(topk+1)] output: the assignment's original slot
+    int n, int topk) {
+    const int total = n * (topk + 1);
+    extern __shared__ int s_exp[];         // [total]
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        int tok = i / (topk + 1);
+        int slot = i % (topk + 1);
+        s_exp[i] = (slot < topk) ? (int)ids_f[(size_t)tok * topk + slot] : -1;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        int my_e = s_exp[i];
+        int rank = 0;
+        for (int j = 0; j < total; j++) {
+            if (s_exp[j] < my_e || (s_exp[j] == my_e && j < i)) rank++;
+        }
+        int tok = i / (topk + 1);
+        int slot = i % (topk + 1);
+        sorted_experts[rank] = my_e;
+        sorted_tokens[rank] = tok;
+        sorted_slots[rank] = slot;
+    }
+}
+
+extern "C" cudaError_t ferrite_moe_sort_assignments(
+    const float* ids_f,
+    int* sorted_experts, int* sorted_tokens, int* sorted_slots,
+    int n, int topk, cudaStream_t stream) {
+    int total = n * (topk + 1);
+    int smem = total * sizeof(int);
+    moe_sort_assignments_kernel<<<1, 256, smem, stream>>>(
+        ids_f, sorted_experts, sorted_tokens, sorted_slots, n, topk);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // moe_fused_act_fp8_mma (W8A8): the act stage of the fused MoE on the
 // tensor core — per (16-row block, slot, token): v1-mode per-block quant
 // (x -> e4m3 smem, absmax/448), GATE mma + UP mma (both [16, K] against
