@@ -865,3 +865,26 @@ SIMT 的 2.5 指令/值实际比 MMA+转换开销更便宜（转换把 smem 流�
 **处置**：`FERRITE_DOWN_W8A16=1` opt-in（默认 OFF，基线不受影响）。代码保留。
 **MoE down 优化路径彻底关闭**（W8A8 数值翻转 / W8A16 性能劣化 / bf16 2x 带宽 /
 f16 累加翻转——四条全部有实测证据）。
+
+## 2026-09-10 终局：PDL 实测无效（间隙不是启动开销）+ nsys 间隙量化
+
+**nsys 间隙分析**（python3+sqlite 查 CUPTI_ACTIVITY_KIND_KERNEL，profile 最后 30ms 窗口）：
+- 6604 个 kernel，仅 **557 个正间隙**（大部分 kernel 背靠背），总间隙 5.87ms/30ms（19.6%）
+- **间隙中位数 2.98µs**；排除 3 个异常值（router_gemm_route_fused 1.52ms/0.91ms = bench
+  尾部 n=1 路径的**图捕获**，非稳态；down_v0 0.45ms = 首次调用）
+- 剩余 555 个间隙 / 2.25 步 ≈ **247 个间隙/步 × ~4.75µs ≈ 1.2ms/步**
+
+**PDL 实测（FERRITE_PDL=1，serve 确认启动）**：replay p50 = **13.32ms vs 基线 13.28-13.44ms**
+（噪声内，**无收益**）。原因：
+1. PDL 只覆盖 ~4 个 launcher（`ferrite_pdl_enabled` 出现在 gdn_step_v2 + pdl_or_plain + 2 处），
+   覆盖率低——代码注释预期的 "~900 nodes × ~2µs" 从未实现
+2. CUDA graph 内节点调度已预编译优化，launch setup 本就不是间隙主因
+3. 间隙更可能是**数据依赖等待 + kernel 尾部效应**（低占用率 kernel 的最后一个 wave）
+
+**结论**：PDL 路径关闭（保持默认 OFF）。1.2ms 间隙的构成指向 kernel 尾部/依赖，
+不是可简单消除的启动开销。**减少间隙需减少 kernel 数量（融合）或提高占用率（难）**。
+
+**小 kernel 计数**（nsys 实例数，含 prefill 污染）：quant_e4m3 148392 / f32_to_bf16 372528 /
+rmsnorm 42376 / gated_rmsnorm 62832 / layernorm_affine 20328——decode 部分约 241 个/步
+（norm 125 + bf16 74 + quant 42），每步 ~1.0ms 执行 + 部分间隙。**合并小 kernel 是剩余
+唯一的非结构机会**（预估 0.3-0.5ms）。
