@@ -4433,7 +4433,9 @@ extern "C" cudaError_t ferrite_dsa_append_batched(
     int threads = 256;
     int blocks = (int)((total + threads - 1) / threads);
     dsa_append_batched_kernel<<<blocks, threads, 0, s>>>(
-        kvb, ki, gate, kn_tbl, v_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm);
+        kvb, ki, gate,
+        (__nv_bfloat16* const*)kn_tbl, (__nv_bfloat16* const*)v_tbl,
+        kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm);
     return cudaGetLastError();
 }
 
@@ -4498,7 +4500,8 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
         if (e != cudaSuccess) return e;
     }
     sparse_attn_v2_batched_kernel<<<grid, block, smem, s>>>(
-        q, k_tbl, v_tbl, idx, out, B, total_tbl, h, d, dv, topk);
+        q, (const __nv_bfloat16* const*)k_tbl, (const __nv_bfloat16* const*)v_tbl,
+        idx, out, B, total_tbl, h, d, dv, topk);
     return cudaGetLastError();
 }
 
