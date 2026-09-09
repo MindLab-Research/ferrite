@@ -1303,3 +1303,18 @@ q/k/v/gate 被重复加载，且每 block 的工作量减半（固定开销占�
 
 **教训**：ncu 指出的"occupancy 受限"不等于"分块就能更快"——分块带来的冗余加载与
 固定开销可能反噬。**任何结构性改动都必须先在隔离微基准上验证，再考虑 serve。**
+
+### sparse_attn QK^T MMA：实测大幅回归（22.6ms vs 13.7ms），已改为默认关闭
+
+实现：16 slot/tile，A = 16 个 slot 的 K 行（fp8，从 cache gather 进 smem），B = Q（fp8 复制 8 列），
+m16n8k32 × 8 tiles，C[slot][0] 取分数。**文本正确**（LEN 382，内容连贯），但
+**16-seq 中位 22.60 ms / 708 tok/s（vs SIMT 的 13.68/1170）**。
+
+**根因（三条叠加）**：
+1. 每个 16-slot tile 都要重新 gather 16×256 字节（全 d），gather 本身的访存远大于原 dot；
+2. 每个 tile 一次 `__syncthreads`（原实现是每 lane 2 个 16B 加载、无同步）；
+3. N=8 是同一 head 的复制（8x 浪费），且 M=16 的 slot 数太小无法摊薄。
+
+**结论**：sparse_attn 的 QK^T 是"per-slot gather + M=1"结构，**不适合 MMA**；
+它的 143µs 主要是 long-scoreboard 延迟（已用 launch_bounds/unroll/双累加器改善 27%）。
+代码保留在 `FERRITE_ATTN_QK_MMA=1` 之后（默认走 SIMT），不再作为优化方向。
