@@ -1182,8 +1182,16 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
             for (int w = 0; w < (int)(blockDim.x >> 5); w++) {
                 if (wval[w] > bvv) { bvv = wval[w]; bi = wbest[w]; }
             }
-            ids[(size_t)row * topk + r] = (float)bi;
-            ch[bi] = -1e30f; // remove
+            if (bi >= 0) {
+                ids[(size_t)row * topk + r] = (float)bi;
+                ch[bi] = -1e30f; // remove
+            } else {
+                // All logits NaN (e.g. an upstream layer exploded): mark the
+                // slot INVALID instead of indexing ch[-1] (an OOB smem write
+                // that corrupted the sigmoid row) — consumers already skip
+                // ids < expert_start.
+                ids[(size_t)row * topk + r] = -1.0f;
+            }
         }
         __syncthreads(); // ch[best] must be visible to all threads next round
     }
@@ -1192,7 +1200,8 @@ __global__ void moe_route_kernel(const float* __restrict__ logits,
     float lsum = 0.f;
     for (int r = threadIdx.x; r < topk; r += blockDim.x) {
         int j = (int)ids[(size_t)row * topk + r];
-        float val = sm[j];
+        // j can be -1 (all-NaN logits → invalid slot): sm[-1] was an OOB smem read.
+        float val = (j >= 0) ? sm[j] : 0.f;
         probs[(size_t)row * topk + r] = val;
         lsum += val;
     }
@@ -1332,7 +1341,8 @@ __global__ void router_gemm_route_fused_kernel(
     float lsum2 = 0.f;
     for (int r = threadIdx.x; r < topk; r += blockDim.x) {
         int j = (int)ids[r];
-        float val = sm[j];
+        // j can be -1 (all-NaN logits → invalid slot): sm[-1] was an OOB smem read.
+        float val = (j >= 0) ? sm[j] : 0.f;
         probs[r] = val;
         lsum2 += val;
     }
@@ -1371,7 +1381,7 @@ extern "C" cudaError_t ferrite_moe_route(const float* logits, const float* bias,
                                         int topk, float scale, cudaStream_t s) {
     // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
     // share of the step. Output is garbage by construction; timing only.
-    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr;
+    static const bool moe_skip_ = getenv("FERRITE_MOE_SKIP") != nullptr || getenv("FERRITE_SKIP_ROUTE") != nullptr;
     if (moe_skip_) return cudaSuccess;
 
     dim3 block(256);   // 8 warps: the top-k scan over e is 2 iters/round vs 9
