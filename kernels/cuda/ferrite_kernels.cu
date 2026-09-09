@@ -4738,7 +4738,7 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
     // B = the Q (fp8, replicated across the 8 N columns)
     // C[slot][0] = that slot's score (col 0 carries the answer).
     __shared__ unsigned char q8s[256];          // the Q in e4m3
-    __shared__ unsigned char kt[16][40];        // 16 slots x 32 K (+pad)
+    __shared__ unsigned char kt[16][256 + 16];  // 16 slots x FULL d=256 (+pad)
     {
         const int lane = threadIdx.x & 31;
         const float qsc = 1.0f;                  // Q quantized with absmax/448
@@ -4751,9 +4751,9 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
                 fminf(fmaxf(qs[l] / qscale, -448.0f), 448.0f), __NV_SATFINITE, __NV_E4M3);
         __syncthreads();
         for (int s0 = 0; s0 < live_k; s0 += 16) {
-            // gather 16 slots x 32-K chunks, one pass per k-tile
-            for (int l = threadIdx.x; l < 16 * 32; l += blockDim.x) {
-                const int r = l >> 5, kk = l & 31;
+            // gather the FULL d=256 for the 16 slots (one pass)
+            for (int l = threadIdx.x; l < 16 * 256; l += blockDim.x) {
+                const int r = l >> 8, kk = l & 255;
                 const int ss = s0 + r;
                 unsigned char v8 = 0;
                 if (ss < live_k) {
@@ -4762,20 +4762,14 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
                 }
                 kt[r][kk] = v8;
             }
-            __syncwarp();
+            __syncthreads();
             float acc[4] = {0.f, 0.f, 0.f, 0.f};
             const int c0 = (lane & 3) * 4;
-            // 8 k32 tiles over d=256
-            for (int kb = 0; kb < 32; kb += 32) {
-                // (single k-tile per 32-K chunk below)
-                (void)kb;
-            }
-            // NOTE: the full 8-tile loop is unrolled below for clarity
             #pragma unroll
             for (int kt_i = 0; kt_i < 8; kt_i++) {
                 // A fragment: lanes 0-15 give the 16 rows at the k half
                 const unsigned saddr = (unsigned)__cvta_generic_to_shared(
-                    &kt[0][0] + (size_t)(lane & 15) * 40 + ((lane >> 4) * 16) + kt_i * 32);
+                    &kt[0][0] + (size_t)(lane & 15) * (256 + 16) + ((lane >> 4) * 16) + kt_i * 32);
                 unsigned a[4];
                 asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                              : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr));
@@ -4802,7 +4796,7 @@ __global__ void __launch_bounds__(256, 8) sparse_attn_v2_batched_kernel(
                     }
                 }
             }
-            __syncwarp();
+            __syncthreads();
         }
     }
     // (the old per-slot dot loop is replaced above)
