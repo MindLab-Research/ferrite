@@ -2910,11 +2910,17 @@ fn mega_chain_dev(
         };
         if !ar_p2p {
             let cnt = n * hidden;
-            // bf16 payload halves the latency-bound AR (320KB / 223us =
-            // 2.9GB/s, far below the NVLink bandwidth). The casts are cheap
-            // (~5us each) vs the ~100us saved per call.
+            // F32 AR by default (2026-09-09, nsys): the AR is RENDEZVOUS-bound
+            // (~28-30µs/call independent of payload — bf16 1.67ms vs f32
+            // 1.33ms per step/rank), so the bf16 route's two cast kernels
+            // (×44.6 calls/step ≈ 0.43ms) were pure waste AND lossy. The bf16
+            // payload only paid in the old 223µs/call bandwidth-bound era.
+            // FERRITE_AR_BF16=1 restores it.
+            let use_bf16_ar = std::env::var("FERRITE_AR_BF16")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             match s.backend.as_cuda() {
-                Some(c) if cnt >= 16384 => {
+                Some(c) if cnt >= 16384 && use_bf16_ar => {
                     let xb = DevBuf::alloc(c.dev(), c.stream(), (cnt + 1) / 2)?;
                     c.cast_f32_to_bf16(&partial, &xb, cnt)?;
                     nccl.all_reduce_bf16(
@@ -3417,11 +3423,17 @@ fn mega_chain_dev_batched(
         };
         if !ar_p2p {
             let cnt = n * hidden;
-            // bf16 payload halves the latency-bound AR (320KB / 223us =
-            // 2.9GB/s, far below the NVLink bandwidth). The casts are cheap
-            // (~5us each) vs the ~100us saved per call.
+            // F32 AR by default (2026-09-09, nsys): the AR is RENDEZVOUS-bound
+            // (~28-30µs/call independent of payload — bf16 1.67ms vs f32
+            // 1.33ms per step/rank), so the bf16 route's two cast kernels
+            // (×44.6 calls/step ≈ 0.43ms) were pure waste AND lossy. The bf16
+            // payload only paid in the old 223µs/call bandwidth-bound era.
+            // FERRITE_AR_BF16=1 restores it.
+            let use_bf16_ar = std::env::var("FERRITE_AR_BF16")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             match s.backend.as_cuda() {
-                Some(c) if cnt >= 16384 => {
+                Some(c) if cnt >= 16384 && use_bf16_ar => {
                     let xb = DevBuf::alloc(c.dev(), c.stream(), (cnt + 1) / 2)?;
                     c.cast_f32_to_bf16(&partial, &xb, cnt)?;
                     nccl.all_reduce_bf16(

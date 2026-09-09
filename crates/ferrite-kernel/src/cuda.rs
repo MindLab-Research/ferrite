@@ -2119,27 +2119,23 @@ impl CudaBackend {
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
         if n == 16 && dbias.is_null() {
-            // ONE-launch bf16 MMA (m16n8k16, gemm_bf16_mma_kernel) FIRST.
-            // The whole bf16 projection family is ~2 GFLOP/step of real
-            // compute; the cuBLAS route (nvjet splitK + splitKreduce + a
-            // separate f32→bf16 cast = 3 launches) measured 2.6ms/step/rank
-            // — ~100% launch/tail overhead (nsys 2026-09-09). The MMA kernel
-            // was already wired further down but UNREACHABLE for n==16 (the
-            // cuBLAS branch below used to return first). in_f%16≠0 or a
-            // launch error → non-zero → the cuBLAS fallback.
-            let r = unsafe {
-                ferrite_gemm_bf16_mma(x_dev.as_const_f32(), dw.ptr as *const _,
-                                      dbias, do_.as_f32(), n, in_f, out_f, self.stream)
-            };
-            if r == 0 {
-                return Ok(do_);
-            }
-            if std::env::var("FERRITE_GEMV_MMA_DEBUG").is_ok() {
-                static CNT2: std::sync::atomic::AtomicUsize =
-                    std::sync::atomic::AtomicUsize::new(0);
-                let c = CNT2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if c < 300 {
-                    eprintln!("[gemvdbg] n=16 CUBLAS(fallback r={r}) in={in_f} out={out_f}");
+            // ONE-launch bf16 MMA (m16n8k16, gemm_bf16_mma_kernel), opt-in
+            // only (FERRITE_GEMM_BF16_MMA=1): measured 2026-09-09 at B=16 the
+            // kernel is 6x WORSE than cuBLAS (replay 15.42 → 99.17ms/step) —
+            // it has NO K-split (the 4 warps split N; K runs serially per
+            // block: in_f=4096 = 256 tiles × 2 syncs of latency) and too few
+            // blocks (out_f=128 → 4 blocks on 148 SMs). cuBLAS (nvjet splitK
+            // + reduce + cast, 3 launches ≈ 7µs) stays the default until the
+            // kernel gets block-level K-split + the same-x multi-weight
+            // fusion (the fused launch is where the real win is: the whole
+            // bf16 projection family is ~2 GFLOP/step of real compute).
+            if std::env::var("FERRITE_GEMM_BF16_MMA").map(|v| v == "1").unwrap_or(false) {
+                let r = unsafe {
+                    ferrite_gemm_bf16_mma(x_dev.as_const_f32(), dw.ptr as *const _,
+                                          dbias, do_.as_f32(), n, in_f, out_f, self.stream)
+                };
+                if r == 0 {
+                    return Ok(do_);
                 }
             }
             if let Ok(o) = self.gemm_cublas(x_dev, dw.ptr as *const _, n, in_f, out_f) {
