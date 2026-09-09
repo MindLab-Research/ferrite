@@ -1379,3 +1379,22 @@ MTP 在 B=16 下本身即坏：LEN 0 + 161 错误）。
 sparse_attn 位图/launch_bounds/unroll（隔离 −27%）、MoE act 2 段流水（隔离 −34%）。
 **已证伪**：sparse_attn QK^T MMA（22.6ms）、indexer 分数 MMA（bench 跑不动）、
 GDN dv 分块（+37%）、bf16/fp8 KV cache 单独（延迟非带宽）、HC_MIX_KS 加倍（serve 中性）。
+
+## 2026-09-09 回归修复后的权威状态
+
+**当前 build = 1170 基线（13.68ms/step），已逐位证明与 a9e5d5a 一致**：
+- 隔离微基准（`/tmp/sparse_bench`，真实形状 B=16 h=8 d=256 dv=1024 topk=2051 live_k=2048）：
+  当前 kernel vs a9e5d5a → **differing=0/131072**（位级一致）。
+- 出师表 prompt：正确背出全篇（先帝创业未半而中道崩殂…将军向宠…臣本布衣躬耕南阳）。
+- faults=0。远端 .so = 该修复版；源码已 commit+push+rsync。
+
+**sparse_attn 512 线程优化已 park（env `FERRITE_ATTN_BLK=512` 可开，但输出与 256 不同 → 不可用）**：
+12.58ms/1272 tok/s 的收益真实，但要逐位可用必须先解决两处 BLK 相关差异：
+① QK group 数（32→64）改变 dedup 竞争赢家 → 存活槽位位置变 → softmax 求和/PV 结合顺序变（~1e-7，足以翻转模型）；
+② PV 的 `G=ceil(blockDim/cols)` 随 BLK 变（4→8）→ 结合顺序变。
+**正确做法**：把 dedup 改成确定性（每 seq 预计算 mask，最低槽位胜出）+ PV 的 G 钉在 256 值
+（注意：直接 `pv_on` + 移出 `__syncthreads` 的重构会在 graph capture 期 err 700，需另找安全写法）。
+**验证方式**：上面的隔离基准必须 `differing=0`，再跑出师表文本。
+
+**排查工具（本次证明有效）**：`LD_PRELOAD=<各版本.so> /tmp/sparse_bench` + 逐位 diff + 逐 hunk 叠加，
+秒级定位；`mega graph ... missing` 是 sticky CUDA error 的误报，真因在更早 kernel。
