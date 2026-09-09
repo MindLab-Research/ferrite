@@ -3979,6 +3979,45 @@ impl CudaBackend {
                 }
             };
         }
+        // FERRITE_LAYER_SUM inside-DSA probe (2026-09-09: the batched DSA
+        // attention is exactly-zero at every family — discriminate "dead
+        // projections" vs "dead pinned totals"). Host side only, never inside
+        // capture, rank 0 only.
+        if !self.capturing()
+            && crate::shard_idx() == 0
+            && std::env::var_os("FERRITE_LAYER_SUM").is_some()
+        {
+            let mut desc = String::new();
+            {
+                let m = self.dsa_caches.lock().unwrap();
+                for &seq_r in seqs {
+                    if seq_r == u64::MAX {
+                        continue;
+                    }
+                    if let Some(c) = m.get(&(seq_r, family)) {
+                        unsafe {
+                            desc.push_str(&format!(
+                                " seq{:x}:t0={}/tot={}/tc={}",
+                                seq_r as u32, *c.pinned_t0, *c.pinned_total, c.t_count
+                            ));
+                        }
+                    }
+                }
+            }
+            let mx = |b: &DevBuf| -> String {
+                let mut h = vec![0f32; b.len];
+                if b.download(&mut h).is_err() {
+                    return "dl_err".into();
+                }
+                format!("{:.4}", h.iter().fold(0f32, |a, v| a.max(v.abs())))
+            };
+            eprintln!(
+                "[dsap] fam{family} n={n}{desc} qb_mx={} kvb_mx={} qi_mx={}",
+                mx(&qb),
+                mx(&kvb),
+                mx(&qi)
+            );
+        }
         // the (family, seq-set) batched pointer tables (cached per composition)
         let tbl = self.dsa_ptr_tables(family, seqs, h, dk, dv, idm)?;
         // 7. cache append — ONE launch: all B rows → each seq's cache at its
@@ -4052,6 +4091,27 @@ impl CudaBackend {
             },
             "dsa_expand_batched",
         )?;
+        // FERRITE_LAYER_SUM: kpool/topk/expand liveness — pool_keys real? idx
+        // row0 valid pools or all -1?
+        if !self.capturing()
+            && crate::shard_idx() == 0
+            && std::env::var_os("FERRITE_LAYER_SUM").is_some()
+        {
+            let mut pk = vec![0f32; pool_keys.len];
+            let pk_mx = if pool_keys.download(&mut pk).is_ok() {
+                format!("{:.4}", pk.iter().fold(0f32, |a, v| a.max(v.abs())))
+            } else {
+                "dl_err".into()
+            };
+            let mut ih = vec![0f32; idx.len];
+            let idx_desc = if idx.download(&mut ih).is_ok() {
+                let w = out_width.min(40).min(ih.len());
+                format!("{:?}", ih[..w].iter().map(|v| *v as i32).collect::<Vec<_>>())
+            } else {
+                "dl_err".into()
+            };
+            eprintln!("[dsap] fam{family} poolk_mx={pk_mx} idx_r0={idx_desc}");
+        }
         // 11. sparse attention — grid(B, h): each seq's qb row vs its own
         // k_nope/v cache over its idx row (per-seq total via pinned table).
         ck(
@@ -4065,6 +4125,21 @@ impl CudaBackend {
             },
             "dsa_attn_batched",
         )?;
+        // FERRITE_LAYER_SUM: the attention output liveness at the SOURCE
+        // (before o_proj) — exact zeros here = the attention itself is dead.
+        if !self.capturing()
+            && crate::shard_idx() == 0
+            && std::env::var_os("FERRITE_LAYER_SUM").is_some()
+        {
+            let mut h = vec![0f32; attn_out.len];
+            if attn_out.download(&mut h).is_ok() {
+                eprintln!(
+                    "[dsap] fam{family} attn_out mx={:.4} nz={}",
+                    h.iter().fold(0f32, |a, v| a.max(v.abs())),
+                    h.iter().filter(|v| **v != 0f32).count()
+                );
+            }
+        }
         // 12. o_proj GEMM n=B
         let partial = self.matmul_dev(&attn_out, w.o_proj, ni, (h * dv) as i32, hidden as i32)?;
         Ok(partial)
