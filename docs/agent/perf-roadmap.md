@@ -1063,3 +1063,16 @@ ncu 对 `moe_fused_act_fp8_mma`：**理论占用率 37.5%，被 shared memory �
    No-Eligible/long-scoreboard/占用率限制给出了真方向。
 3. **禁止错误归因**（用户明确要求）：MoE down MMA 的系统性误差至今未定位，
    已 park 并如实记录，不再给出推测性结论。
+
+### GDN chunk 的 ncu（2026-09-09）
+
+隔离复现 `kernels/cuda/gdn_bench.cu`（B=16 h=64 dk=dv=128）→ 0.065 ms/call（冷 L2）。
+ncu：理论占用率 **75%**（Block Limit Registers 3 + Shared Mem 3 同时限制），活跃 10.3 warp/SM
+但**可发射仅 1.88**，ncu 估算局部可提速 47% —— 同样是延迟受限。
+
+已试：phase 1（逐通道衰减）原本 1 thread/行（128/512 线程活跃，75% 空闲）→ 改为全块扫描
+dk*dv：**耗时无变化**（0.065 → 0.065），说明 phase 1 不是瓶颈；瓶颈是每 block
+载入/写回 128×128 的 state（128KB）的延迟。改动正确且无害，保留。
+
+**结论**：GDN 的 25µs/call 受 state 往返延迟主导，与 smem 容量（66KB → 3 blocks/SM）耦合，
+需要重构（state 常驻寄存器/分块）才能改善，属于下一阶段工作。
