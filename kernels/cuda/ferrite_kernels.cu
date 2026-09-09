@@ -4523,7 +4523,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     const float* __restrict__ idx,         // [B, topk_slots]
     float* __restrict__ out,              // [B, h*dv]
     int B, const int* const* __restrict__ total_tbl, // [B] pinned
-    int h, int d, int dv, int topk) {
+    int h, int d, int dv, int topk, int nodedup) {
     int seq = blockIdx.x;
     int hd = blockIdx.y;
     int t = *total_tbl[seq]; // per-seq zero-copy pinned read
@@ -4554,7 +4554,6 @@ __global__ void sparse_attn_v2_batched_kernel(
     // was already 8-aligned — the dup broadcast read a lane OUTSIDE the
     // 2-lane mask (undefined result). Matching TG to glane0 fixes that and
     // shortens the per-lane serial FMA chain 128 -> 32.
-    static const bool attn_nodedup_ = getenv("FERRITE_ATTN_NODEDUP") != nullptr;
     const int TG = 8;
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
@@ -4569,7 +4568,7 @@ __global__ void sparse_attn_v2_batched_kernel(
         // atomics per layer-call (2048 slots x 1024 blocks) = the suspected
         // 143us bottleneck. This ablation measures it; correctness of the
         // resulting text is checked by eye before anything is removed.
-        if (valid && lid == 0 && !attn_nodedup_) {
+        if (valid && lid == 0 && !nodedup) {
             if ((j >> 5) < bm_words) {
                 unsigned int prev = atomicOr(&bm[j >> 5], 1u << (j & 31));
                 dup = (prev & (1u << (j & 31))) != 0;
@@ -4760,6 +4759,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     // cache append is NOT skipped — only the scoring/selection + the attention).
     static const bool attn_skip_ = getenv("FERRITE_ATTN_SKIP") != nullptr;
     if (attn_skip_) return cudaSuccess;
+    static const int nodedup_ = getenv("FERRITE_ATTN_NODEDUP") ? 1 : 0;
 
     dim3 block(256);
     dim3 grid(B, h);
@@ -4773,7 +4773,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     sparse_attn_v2_batched_kernel<<<grid, block, smem, s>>>(
         q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
         ksc_tbl, vsc_tbl,
-        idx, out, B, total_tbl, h, d, dv, topk);
+        idx, out, B, total_tbl, h, d, dv, topk, nodedup_);
     return cudaGetLastError();
 }
 
