@@ -359,3 +359,23 @@ moe_route warp-shuffle top-k（17.61，中性但修掉了 `bidx[threadIdx.x]` �
 **注意编译陷阱**：第一次提交漏了 `has1` 的作用域（声明在 row 循环的 `{}` 内、epilogue 在外），
 `build.sh` 报 1 error 而 serve 用的是**旧 .so**，测出 17.62ms 的假结果。**每次必须看 build 输出的
 error 数**（本会话第二次踩这个坑）。
+
+## ⛔ sparse_attn 三次回归的定案（2026-09-09，全部逐位/隔离基准证明）
+
+**判定标准**：出师表 prompt 必须正确背出原文（`先帝创业未半而中道崩殂…将军向宠…臣本布衣`）；
+"思考模式里循环/答不出" **是回归**（用户明确：只豁免"出现思考"，不豁免"思考循环"）。
+**数值判据**：隔离微基准 `/tmp/sparse_bench` 对 `a9e5d5a`（1170 参考）逐位比对，
+`differing=0/131072` 才算通过。文本+数值双过才算修好。
+
+| 改动 | 后果 | 处置 |
+|---|---|---|
+| softmax max/sum 用固定 256 步长**漏加 `tid<256` 守卫** | 线程 256..511 把 slot≥256 多数一遍 → 分母 2x → 权重偏向前 256 个 KV → **live_k>256 后循环** | 加 `if (threadIdx.x < 256)` 守卫（已保留） |
+| PV 重构（`pv_on` + `G=256/cols` + sync 移出条件） | **mega-graph capture 期 err 700** → sticky error → 误报 `mega graph mega1 missing` | 还原原 PV 控制流（已提交） |
+| **"UB 修复"：`reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0)` + `ff[e]` → 显式 `uu[e>>1]>>16 / &0xFFFF`** | **K/V 字节映射改变 → 注意力输出整体偏移 4.0x**（隔离基准 0.0627→0.2533）→ 模型退化 | **禁止重试**。指针模式虽为布局相关 UB，但**就是验证过的字节映射**；已在代码注释里标注 |
+
+**排查方法（有效）**：隔离微基准 + `LD_PRELOAD=<各版本.so>` + 逐位 diff，**秒级**；
+再用"a9 + 逐 hunk 叠加"定位到具体改动（red[16]/guard 各 0 差异，UB 修复 32768 差异）。
+**不要**用文本观察或 e2e 做 kernel 正确性判据（慢且不可靠）。
+**教训**：`FileReplace` 改动控制流结构（尤其 `__syncthreads` 位置、条件作用域）后，
+必须用上面的数值基准验证；`mega graph ... missing` 往往是 sticky CUDA error 的误报，
+真因在更早的 kernel。
