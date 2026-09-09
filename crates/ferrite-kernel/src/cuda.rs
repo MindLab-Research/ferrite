@@ -1376,7 +1376,17 @@ impl CudaBackend {
     /// cudaMalloc count at ~90.
     fn bump_alloc(&self, bytes: usize) -> Result<*mut std::ffi::c_void> {
         let mut blocks = self.bump.lock().unwrap();
-        const CHUNK: usize = 1 << 30; // 1 GiB
+        // CHUNK is env-tunable (FERRITE_BUMP_CHUNK_GB): the driver's small/large
+        // allocation paths differ wildly on this B300 driver (documented below);
+        // fewer, bigger blocks = fewer page-table mappings to get wrong.
+        static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let chunk = *CHUNK.get_or_init(|| {
+            std::env::var("FERRITE_BUMP_CHUNK_GB")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                << 30
+        });
         let need = bytes.next_multiple_of(256);
         if let Some((base, cap, used)) = blocks.last_mut() {
             if *cap - *used >= need {
@@ -1385,7 +1395,7 @@ impl CudaBackend {
                 return Ok(ptr);
             }
         }
-        let sz = need.max(CHUNK);
+        let sz = need.max(chunk);
         let mut base: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut base, sz) }, "bump arena block")?;
         blocks.push((base, sz, need));
