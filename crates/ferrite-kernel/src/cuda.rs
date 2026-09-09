@@ -831,7 +831,7 @@ pub struct CudaBackend {
     /// graph WITHOUT a cast and the replays would read a stale xb). The
     /// buffers persist for the graphs' lifetime (the graph nodes reference
     /// them; bounded by the unique-x count ~100 × 128KB).
-    xb_cache: std::sync::Mutex<std::collections::HashMap<(usize, u64), (DevBuf, bool)>>,
+    xb_cache: std::sync::Mutex<std::collections::HashMap<usize, (DevBuf, bool)>>,
     /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
     /// scale) device tables for the fused MoE kernels.
     moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
