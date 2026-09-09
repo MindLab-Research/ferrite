@@ -172,7 +172,6 @@ extern "C" {
     fn ferrite_dsa_append_batched(kvb: *const f32, ki: *const f32, gate: *const f32,
                                    kn_tbl: *const *mut f32, v_tbl: *const *mut f32,
                                    kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
-                                   kns_tbl: *const *mut f32, vs_tbl: *const *mut f32,
                                    t0_tbl: *const *const i32,
                                    b: i32, h: i32, dk: i32, dv: i32, idm: i32, ntok: i32,
                                    s: CuStream) -> i32;
@@ -191,7 +190,6 @@ extern "C" {
                                    total_tbl: *const *const i32, n_fixed: i32,
                                    s: CuStream) -> i32;
     fn ferrite_sparse_attn_v2_batched(q: *const f32, k_tbl: *const *mut f32, v_tbl: *const *mut f32,
-                                       ksc_tbl: *const *mut f32, vsc_tbl: *const *mut f32,
                                        idx: *const f32, out: *mut f32, b: i32,
                                        total_tbl: *const *const i32,
                                        h: i32, d: i32, dv: i32, topk: i32,
@@ -4028,7 +4026,6 @@ impl CudaBackend {
                     kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
                     tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
                     tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
-                    tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
                     tbl.t0p as *const *const i32,
                     // NTOK MUST BE 1 (ROOT CAUSE #3 of the B=16 crashes,
                     // 2026-09-09): the kernel grid is (B, ntok) and it reads
@@ -4118,7 +4115,6 @@ impl CudaBackend {
             unsafe {
                 ferrite_sparse_attn_v2_batched(
                     qb.as_const_f32(), tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
-                    tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
                     idx.as_const_f32(), attn_out.as_f32(), ni, tbl.totp as *const *const i32,
                     h as i32, dk as i32, dv as i32, out_width as i32, self.stream,
                 )

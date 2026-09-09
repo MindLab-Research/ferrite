@@ -4402,66 +4402,46 @@ extern "C" cudaError_t ferrite_pool_expand(
 // lane covers dk/4 = 64 K and dv/4 = 64 V elements of its head, the 4 lanes
 // shuffle-reduce the absmax, then fp8 + the per-head scale are written.
 __global__ void dsa_append_batched_kernel(
-    const float* __restrict__ kvb,   // [B, h*(dk+dv)]
+    const float* __restrict__ kvb,   // [B, ntok, h*(dk+dv)] rows
     const float* __restrict__ ki,    // [B, idm]
     const float* __restrict__ gate,  // [B, idm]
-    unsigned char* const* __restrict__ kn_tbl,   // [B] per-seq k_nope ptrs (e4m3)
-    unsigned char* const* __restrict__ v_tbl,    // [B] per-seq v ptrs (e4m3)
-    float* const* __restrict__ kns_tbl,          // [B] per-seq k_nope scales [T, h]
-    float* const* __restrict__ vs_tbl,           // [B] per-seq v scales [T, h]
+    float* const* __restrict__ kn_tbl,   // [B] per-seq k_nope ptrs (f32 [T, h, dk])
+    float* const* __restrict__ v_tbl,    // [B] per-seq v ptrs (f32 [T, h, dv])
     float* const* __restrict__ kidx_tbl, // [B]
     float* const* __restrict__ kgate_tbl,// [B]
     const int* const* __restrict__ t0_tbl, // [B] per-seq PINNED t0 ptrs
     int B, int h, int dk, int dv, int idm, int max_t) {
+    // F32 CACHE FORMAT (2026-09-09, root cause #4 of the batched garbage
+    // text): the single-seq path (PREFILL + n=1 decode,
+    // dsa_cache_append_kernel) writes the shared (seq, family) DSA K/V cache
+    // as f32 with NO scales. The fp8-e4m3+scales format (526e002) was
+    // migrated on the batched side ONLY: the prefill's f32 slots were then
+    // misread as e4m3 bytes and the scale buffers (never written by the
+    // single path) held pool garbage — kernel-printf evidence: ksc0=0.000000,
+    // NaN scales → softmax sum=NaN → every DSA layer's attention exactly
+    // zero at n>=2 → garbage text. The two paths share the same cache
+    // buffers, so they MUST use one format. Restored f32 (the last
+    // B=16-text-verified format, pre-b3d41ca). A future fp8/bf16 KV-cache
+    // migration must convert BOTH paths in one change, with text + isolated
+    // bench verification.
     const int seq = blockIdx.x;
     const int tok = blockIdx.y;
     if (seq >= B) return;
-    const int t0 = *t0_tbl[seq];
+    const int t0 = *t0_tbl[seq]; // per-seq pinned t0 (zero-copy)
     // PINNED-READ HARDENING (2026-09-09): a garbage/stale pinned t0 made this
     // kernel WRITE past the per-seq DSA cache ((t0+tok)*h + hd — a 2MB-aligned
     // PDE fault; memcheck cannot see pinned-page sources). Clamp to capacity.
     if (t0 < 0 || t0 + tok >= max_t) return;
     const int tid = threadIdx.x;
-    const int row_bytes = h * (dk + dv);
-    const float* src = kvb + (size_t)seq * row_bytes + (size_t)tok * row_bytes;
-    // 64 heads x 4 lanes for the KV part (h may be < 64 in tests: guard)
-    const int hd = tid >> 2, lane4 = tid & 3;
-    if (hd < h) {
+    const int row = h * (dk + dv);
+    const float* src = kvb + (size_t)seq * row + (size_t)tok * row;
+    for (int r = tid; r < row; r += blockDim.x) {
+        const int hd = r / (dk + dv), c = r % (dk + dv);
         const size_t slot = ((size_t)(t0 + tok) * h + hd);
-        // ---- K: this lane's dk/4 slice ----
-        {
-            const int per = dk >> 2;               // 64
-            const float* ks_ = src + (size_t)hd * (dk + dv);
-            float m = 0.f;
-            for (int i = lane4 * per; i < lane4 * per + per; i++) m = fmaxf(m, fabsf(ks_[i]));
-            #pragma unroll
-            for (int off = 2; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-            const float sc = m / 448.0f + 1e-12f;
-            unsigned char* dst = kn_tbl[seq] + slot * dk;
-            for (int i = lane4 * per; i < lane4 * per + per; i++) {
-                const float q = fminf(fmaxf(ks_[i] / sc, -448.0f), 448.0f);
-                dst[i] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
-            }
-            if (lane4 == 0) kns_tbl[seq][(size_t)(t0 + tok) * h + hd] = sc;
-        }
-        // ---- V: this lane's dv/4 slice ----
-        {
-            const int per = dv >> 2;
-            const float* vs_ = src + (size_t)hd * (dk + dv) + dk;
-            float m = 0.f;
-            for (int i = lane4 * per; i < lane4 * per + per; i++) m = fmaxf(m, fabsf(vs_[i]));
-            #pragma unroll
-            for (int off = 2; off > 0; off >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
-            const float sc = m / 448.0f + 1e-12f;
-            unsigned char* dst = v_tbl[seq] + slot * dv;
-            for (int i = lane4 * per; i < lane4 * per + per; i++) {
-                const float q = fminf(fmaxf(vs_[i] / sc, -448.0f), 448.0f);
-                dst[i] = (unsigned char)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
-            }
-            if (lane4 == 0) vs_tbl[seq][(size_t)(t0 + tok) * h + hd] = sc;
-        }
+        if (c < dk) kn_tbl[seq][slot * dk + c] = src[r];
+        else        v_tbl[seq][slot * dv + (c - dk)] = src[r];
     }
-    // ki / gate: idm = 128 elements, 256 threads cover it in one pass
+    // ki / gate: idm elements, same [T, idm] layout as the single-seq path
     for (int c = tid; c < idm; c += blockDim.x) {
         kidx_tbl[seq][(size_t)(t0 + tok) * idm + c] = ki[(size_t)seq * idm + c];
         kgate_tbl[seq][(size_t)(t0 + tok) * idm + c] = gate[(size_t)seq * idm + c];
@@ -4770,23 +4750,25 @@ __global__ void pool_expand_batched_kernel(
 template <int BLK>
 __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel(
     const float* __restrict__ q,          // [B, h*d]
-    const unsigned char* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches (e4m3)
-    const unsigned char* const* __restrict__ v_tbl,      // [B] per-seq v caches (e4m3)
-    const float* const* __restrict__ ksc_tbl,            // [B] per-seq k scales [T, h]
-    const float* const* __restrict__ vsc_tbl,            // [B] per-seq v scales [T, h]
+    const float* const* __restrict__ k_tbl,      // [B] per-seq k_nope caches (f32 [T, h, d])
+    const float* const* __restrict__ v_tbl,      // [B] per-seq v caches (f32 [T, h, dv])
     const float* __restrict__ idx,         // [B, topk_slots]
     float* __restrict__ out,              // [B, h*dv]
     int B, const int* const* __restrict__ total_tbl, // [B] pinned
     int h, int d, int dv, int topk, int nodedup, int qk_mma, int dbg) {
+    // F32 CACHE READS (2026-09-09, root cause #4 of the batched garbage
+    // text): the K/V caches are f32 [T, h, d] — the format the single-seq
+    // path (prefill + dsa_cache_append_kernel) writes. The fp8+scales reader
+    // (526e002) misread the prefill's f32 slots as e4m3 and read NEVER-WRITTEN
+    // scale buffers (pool garbage: ksc=0.000000 + NaN → softmax sum=NaN →
+    // attention exactly zero). One cache, one format.
     int seq = blockIdx.x;
     int hd = blockIdx.y;
     int t = *total_tbl[seq]; // per-seq zero-copy pinned read
     const int live_k = (topk < t) ? topk : t; // live slots only: the indexer writes the rest as -1, so looping to the fixed select_k_max (2048) wasted 18x at short context
     const float* q_s = q + (size_t)seq * (size_t)(h * d);
-    const unsigned char* k_s = k_tbl[seq];
-    const unsigned char* v_s = v_tbl[seq];
-    const float* ksc_s = ksc_tbl[seq];
-    const float* vsc_s = vsc_tbl[seq];
+    const float* k_s = k_tbl[seq];
+    const float* v_s = v_tbl[seq];
     const float* idx_s = idx + (size_t)seq * topk;
     float* out_s = out + (size_t)seq * (size_t)(h * dv);
     float scale = rsqrtf((float)d);
@@ -4795,17 +4777,13 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     // pinned totals can differ from what the host believes it wrote.
     if (dbg && seq == 0 && hd == 0 && threadIdx.x == 0) {
         const int j0 = (int)idx_s[0];
+        const int jc = j0 >= 0 ? j0 : 0;
         printf("[attn-dbg] B=%d h=%d d=%d dv=%d topk=%d t=%d live_k=%d idx0..3=%d,%d,%d,%d "
-               "ksc0=%.6f vsc0=%.6f K[j0]=%d,%d,%d V[j0]=%d,%d,%d q0=%.4f\n",
+               "K[j0]=%.4f,%.4f,%.4f V[j0]=%.4f,%.4f,%.4f q0=%.4f\n",
                B, h, d, dv, topk, t, live_k,
                j0, (int)idx_s[1], (int)idx_s[2], (int)idx_s[3],
-               ksc_s[(size_t)(j0 >= 0 ? j0 : 0) * h], vsc_s[(size_t)(j0 >= 0 ? j0 : 0) * h],
-               k_s[(size_t)(j0 >= 0 ? j0 : 0) * h * d],
-               k_s[(size_t)(j0 >= 0 ? j0 : 0) * h * d + 1],
-               k_s[(size_t)(j0 >= 0 ? j0 : 0) * h * d + 2],
-               v_s[(size_t)(j0 >= 0 ? j0 : 0) * h * dv],
-               v_s[(size_t)(j0 >= 0 ? j0 : 0) * h * dv + 1],
-               v_s[(size_t)(j0 >= 0 ? j0 : 0) * h * dv + 2],
+               k_s[(size_t)jc * h * d], k_s[(size_t)jc * h * d + 1], k_s[(size_t)jc * h * d + 2],
+               v_s[(size_t)jc * h * dv], v_s[(size_t)jc * h * dv + 1], v_s[(size_t)jc * h * dv + 2],
                q_s[0]);
     }
     extern __shared__ float sm[];
@@ -4868,7 +4846,11 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                 unsigned char v8 = 0;
                 if (ss < live_k) {
                     const int j = idxs[ss];
-                    if (j >= 0 && j < t) v8 = k_s[((size_t)j * h + hd) * d + kk];
+                    // f32 cache: quantize on the fly (the e4m3 MMA needs bytes;
+                    // the per-head ksc rescale is gone with the f32 format)
+                    if (j >= 0 && j < t)
+                        v8 = (unsigned char)__nv_cvt_float_to_fp8(
+                            k_s[((size_t)j * h + hd) * d + kk], __NV_SATFINITE, __NV_E4M3);
                 }
                 kt[r][kk] = v8;
             }
@@ -4901,8 +4883,7 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                     if (ss < live_k && lid == 0) {
                         const int j = idxs[ss];
                         const bool valid = (j >= 0 && j < t && j < 8192);
-                        sc[ss] = valid ? (acc[r * 2] * ksc_s[(size_t)j * h + hd] * scale * qscale)
-                                       : -INFINITY;
+                        sc[ss] = valid ? (acc[r * 2] * scale * qscale) : -INFINITY;
                     }
                 }
             }
@@ -4928,61 +4909,21 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
         dup = __shfl_sync(gmask, dup, glane0);
         float a = 0.f;
         if (valid && !dup) {
-            // bf16 cache: one 16-byte load = 8 K elements (was 4 f32). Same
-            // instruction count, half the bytes — this kernel is DRAM-bound.
-            // e4m3 cache: one 16-byte load = 16 K elements (was 8 bf16 / 4
-            // fp32). The per-(token, head) scale folds into the score.
-            const unsigned char* krow = k_s + ((size_t)j * h + hd) * d;
-            // Two independent accumulators over the (d/TG/16 = 2) iterations:
-            // both 16-byte loads issue back-to-back and the two FMA chains
-            // interleave (long-scoreboard was the top stall at 43.5%).
-            float a8 = 0.f, a8b = 0.f;
-            {
-                int l = lid * 16;
-                if (l + 15 < d) {
-                    unsigned int u0, u1, u2, u3;
-                    asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
-                                 : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
-                                 : "l"(krow + l));
-                    unsigned int v0 = 0, v1 = 0, v2 = 0, v3 = 0;
-                    const int l2 = l + TG * 16;
-                    if (l2 + 15 < d) {
-                        asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
-                                     : "=r"(v0), "=r"(v1), "=r"(v2), "=r"(v3)
-                                     : "l"(krow + l2));
-                    }
-                    // NOTE: the fp8x2 pointer pattern below is layout-dependent
-                    // UB, but it is REQUIRED for bit-compatibility with the
-                    // validated build. Replacing it with explicit 16-bit shifts
-                    // (uu[e>>1] >> 16 / & 0xFFFF) changed the K/V byte mapping and
-                    // shifted the attention output by exactly 4x (measured on the
-                    // isolated bench: 0.0627 -> 0.2533) -> the model degenerated.
-                    // Do NOT re-attempt the "explicit extraction" fix.
-                    const __nv_fp8x2_storage_t* ff = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0);
-                    #pragma unroll
-                    for (int e = 0; e < 8; e++) {
-                        const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
-                            &__nv_cvt_fp8x2_to_halfraw2(ff[e], __NV_E4M3)));
-                        const float2 qf = *reinterpret_cast<const float2*>(qs + l + e * 2);
-                        a8 += qf.x * kf.x + qf.y * kf.y;
-                    }
-                    if (l2 + 15 < d) {
-                        const __nv_fp8x2_storage_t* gg = reinterpret_cast<const __nv_fp8x2_storage_t*>(&v0);
-                        #pragma unroll
-                        for (int e = 0; e < 8; e++) {
-                            const float2 kf = __half22float2(*reinterpret_cast<const __half2*>(
-                                &__nv_cvt_fp8x2_to_halfraw2(gg[e], __NV_E4M3)));
-                            const float2 qf = *reinterpret_cast<const float2*>(qs + l2 + e * 2);
-                            a8b += qf.x * kf.x + qf.y * kf.y;
-                        }
-                    }
-                }
+            // F32 cache reads (2026-09-09, root cause #4 restore — see the
+            // kernel header): float4 dot, NO per-head scale. This is the
+            // pre-b3d41ca structure (the last B=16-text-verified numerics).
+            const float* krow = k_s + ((size_t)j * h + hd) * d;
+            const float4* k4 = reinterpret_cast<const float4*>(krow);
+            float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+            for (int l = lid * 4; l + 3 < d; l += TG * 4) {
+                float4 kk = k4[l >> 2];
+                float4 qq = *reinterpret_cast<const float4*>(qs + l);
+                acc.x += qq.x * kk.x; acc.y += qq.y * kk.y;
+                acc.z += qq.z * kk.z; acc.w += qq.w * kk.w;
             }
-            a = (a8 + a8b) * ksc_s[(size_t)j * h + hd];
+            a = acc.x + acc.y + acc.z + acc.w;
             if (lid == 0) {
-                for (int l = d & ~15; l < d; l++)
-                    a += qs[l] * (__half2float(__nv_cvt_fp8_to_halfraw(krow[l], __NV_E4M3))
-                                  * ksc_s[(size_t)j * h + hd]);
+                for (int l = d & ~3; l < d; l++) a += qs[l] * krow[l];
             }
             #pragma unroll
             for (int off = TG / 2; off > 0; off >>= 1) a += __shfl_down_sync(gmask, a, off);
@@ -5040,11 +4981,16 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
     // sector efficiency). 64 float4 columns x 4 slot groups = 256 threads,
     // 16-byte coalesced loads, then an smem reduction over the groups.
     {
-        const int cols = dv >> 4;               // e4m3x16 columns (256/16 = 16)
-        const int G = (blockDim.x + cols - 1) / cols;   // ORIGINAL PV structure
+        // F32 cache reads (2026-09-09, root cause #4 restore — see the kernel
+        // header): float4 columns of 4 f32 elements, NO per-head scale. This
+        // is the pre-b3d41ca 86fb8f8 structure (the last B=16-text-verified
+        // numerics). NOTE: the fp8 variant's cols=dv>>4 with a single
+        // float4 store per column only covered dv/4 output elements — the
+        // f32 structure's c*4 write covers the full dv again.
+        const int cols = dv >> 2;               // float4 columns (256/4 = 64)
+        const int G = (blockDim.x + cols - 1) / cols;   // slot groups (4)
         const int g = threadIdx.x / cols;
         const int c = threadIdx.x % cols;
-        __shared__ float4 pred[4 * 64];         // static (4KB), G<=4, cols<=64
         if (c < cols && g < G) {
             float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
             // unroll 4: one independent float4 load per iteration, previously
@@ -5056,30 +5002,13 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
                 if (w == 0.f) continue;
                 const int j = idxs[s];
                 if (j < 0 || j >= t) continue;
-                unsigned int u0, u1, u2, u3;
-                asm volatile("ld.global.nc.L2::128B.v4.b32 {%0,%1,%2,%3}, [%4];\n"
-                             : "=r"(u0), "=r"(u1), "=r"(u2), "=r"(u3)
-                             : "l"(v_s + ((size_t)j * h + hd) * dv + c * 16));
-                // NOTE: same as the QK — the pointer pattern is required for
-                // bit-compatibility (see the QK comment; the explicit-shift
-                // variant shifts the output by 4x).
-                const __nv_fp8x2_storage_t* ff = reinterpret_cast<const __nv_fp8x2_storage_t*>(&u0);
-                const float vs_ = vsc_s[(size_t)j * h + hd];
-                #pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    const float2 vv = __half22float2(*reinterpret_cast<const __half2*>(
-                        &__nv_cvt_fp8x2_to_halfraw2(ff[e], __NV_E4M3)));
-                    const float wv = w * vs_;
-                    if (e == 0) { a.x += wv * vv.x; a.y += wv * vv.y; }
-                    else if (e == 1) { a.z += wv * vv.x; a.w += wv * vv.y; }
-                    else if (e == 2) { a.x += wv * vv.x; a.y += wv * vv.y; }
-                    else if (e == 3) { a.z += wv * vv.x; a.w += wv * vv.y; }
-                    else if (e == 4) { a.x += wv * vv.x; a.y += wv * vv.y; }
-                    else if (e == 5) { a.z += wv * vv.x; a.w += wv * vv.y; }
-                    else if (e == 6) { a.x += wv * vv.x; a.y += wv * vv.y; }
-                    else { a.z += wv * vv.x; a.w += wv * vv.y; }
-                }
+                float4 vv;
+                asm volatile("ld.global.nc.L2::128B.v4.f32 {%0,%1,%2,%3}, [%4];\n"
+                             : "=f"(vv.x), "=f"(vv.y), "=f"(vv.z), "=f"(vv.w)
+                             : "l"(v_s + ((size_t)j * h + hd) * dv + c * 4));
+                a.x += w * vv.x; a.y += w * vv.y; a.z += w * vv.z; a.w += w * vv.w;
             }
+            __shared__ float4 pred[4 * 64];     // static (4KB), G<=4, cols<=64
             pred[g * cols + c] = a;
             __syncthreads();
             if (g == 0) {
@@ -5097,9 +5026,9 @@ __global__ void __launch_bounds__(BLK, 2048 / BLK) sparse_attn_v2_batched_kernel
 extern "C" cudaError_t ferrite_dsa_append_batched(
     const float* kvb, const float* ki, const float* gate,
     float* const* kn_tbl, float* const* v_tbl, float* const* kidx_tbl, float* const* kgate_tbl,
-    float* const* kns_tbl, float* const* vs_tbl,
     const int* const* t0_tbl, int B, int h, int dk, int dv, int idm, int ntok, cudaStream_t s) {
-    // one block per (seq, token): 256 threads = 64 heads x 4 lanes
+    // one block per (seq, token) — f32 cache stores (see the kernel's F32
+    // CACHE FORMAT comment: the single-seq path owns the format).
     dim3 grid((unsigned)B, (unsigned)(ntok > 0 ? ntok : 1));
     static const int max_t_ = [] {
         const char* e = getenv("FERRITE_DSA_MAXT");
@@ -5107,8 +5036,7 @@ extern "C" cudaError_t ferrite_dsa_append_batched(
     }();
     dsa_append_batched_kernel<<<grid, 256, 0, s>>>(
         kvb, ki, gate,
-        (unsigned char* const*)kn_tbl, (unsigned char* const*)v_tbl,
-        kns_tbl, vs_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm, max_t_);
+        kn_tbl, v_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm, max_t_);
     return cudaGetLastError();
 }
 
@@ -5157,7 +5085,6 @@ extern "C" cudaError_t ferrite_pool_expand_batched(
 
 extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     const float* q, float* const* k_tbl, float* const* v_tbl,
-    float* const* ksc_tbl, float* const* vsc_tbl,
     const float* idx, float* out, int B, const int* const* total_tbl,
     int h, int d, int dv, int topk, cudaStream_t s) {
     // DIAGNOSTIC ONLY (FERRITE_ATTN_SKIP=1): timing-only ablation (the DSA
@@ -5195,8 +5122,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
             if (e != cudaSuccess) return e;
         }
         sparse_attn_v2_batched_kernel<512><<<grid, dim3(512), smem, s>>>(
-            q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
-            ksc_tbl, vsc_tbl,
+            q, k_tbl, v_tbl,
             idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_, dbg_);
     } else {
         if (smem > 48 * 1024) {
@@ -5205,8 +5131,7 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
             if (e != cudaSuccess) return e;
         }
         sparse_attn_v2_batched_kernel<256><<<grid, dim3(256), smem, s>>>(
-            q, (const unsigned char* const*)k_tbl, (const unsigned char* const*)v_tbl,
-            ksc_tbl, vsc_tbl,
+            q, k_tbl, v_tbl,
             idx, out, B, total_tbl, h, d, dv, topk, nodedup_, qk_mma_, dbg_);
     }
     return cudaGetLastError();
