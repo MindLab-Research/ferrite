@@ -5472,7 +5472,13 @@ extern "C" cudaError_t ferrite_kpool_compress_batched(
     // grid (4096 blocks at B=16) paid ~20µs/launch scheduling ~97% idle
     // blocks at short context — × 11 DSA layers per step.
     int cap = B * 16;
-    if (blocks > cap) blocks = cap;
+    // OPT-IN ONLY (FERRITE_KPOOL_CAP=1): measured 2026-09-10 at B=16 the cap
+    // REGRESSED the replay 14.66 → 15.29ms — the "97% idle blocks" were NOT
+    // the cost (they clear in ~2µs); the full grid's memory-level parallelism
+    // for the LIVE blocks is what matters. Kept for future A/B.
+    if (std::getenv("FERRITE_KPOOL_CAP")) {
+        if (blocks > cap) blocks = cap;
+    }
     kpool_compress_batched_kernel<<<blocks, threads, 0, s>>>(
         kidx_tbl, kgate_tbl, ape, pool_keys, total_tbl, B, max_npools, kpool, idm);
     return cudaGetLastError();
