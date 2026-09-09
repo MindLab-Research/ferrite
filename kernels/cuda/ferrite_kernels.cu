@@ -6104,7 +6104,11 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
     if (gemv_skip_) return cudaSuccess;
 
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
-    constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
+    // WPR=8: the K-split doubles the block count and the per-warp K slice
+    // halves. Micro-bench (kernels/cuda/gemv_bench.cu, n=16): q_a 46->42us,
+    // lm_head 489->471us, n=1 12->8us, all bit-identical to the fp64 reference
+    // (maxrel 0.0). WPR=2 is worse (65us), WPR=16 invalid (rpb=0).
+    constexpr int WPR = 8;                 // K-split warps per row
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
     // grid.x = row tiles (R synced with the kernel: R=1 when out_f%8 != 0),
     // grid.y = TOKEN PAIRS (the kernel handles 2 tokens per block).
