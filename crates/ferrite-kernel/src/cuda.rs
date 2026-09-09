@@ -690,6 +690,13 @@ pub struct CudaBackend {
     /// pre-allocated to max tokens. The CPU path grew host Vecs and cloned
     /// them per call (~MBs memcpy per DSA layer per token).
     dsa_caches: std::sync::Mutex<std::collections::HashMap<(u64, usize), DsaCacheState>>,
+    /// Freed per-seq DSA caches, pooled by size (in floats). Reusing the SAME
+    /// cudaMalloc VA avoids the driver's free+realloc remap path — measured
+    /// 2026-09-09 as the trigger of the 2MB-aligned Xid 31 PDE faults on the
+    /// batched step that follows a seq retirement.
+    dsa_pool: std::sync::Mutex<std::collections::HashMap<usize, Vec<*mut std::ffi::c_void>>>,
+    /// ptr -> its dsa_alloc size (floats), so dsa_release can pool it.
+    dsa_sizes: std::sync::Mutex<std::collections::HashMap<usize, usize>>,
     /// MoE expert POINTER TABLES (fused GPU dispatch): per layer, three
     /// device buffers of e_local raw pointers (gate/up/down) into the
     /// dev_weight_bf16 cache — the fused kernels gather the selected
@@ -826,6 +833,8 @@ impl CudaBackend {
             gdn_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             conv_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             dsa_caches: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dsa_pool: std::sync::Mutex::new(std::collections::HashMap::new()),
+            dsa_sizes: std::sync::Mutex::new(std::collections::HashMap::new()),
             moe_ptrs: std::sync::Mutex::new(std::collections::HashMap::new()),
             fp8_map: std::sync::Mutex::new(std::collections::HashMap::new()),
             xq_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -4050,11 +4059,14 @@ impl CudaBackend {
                 .collect();
             for f in keys {
                 if let Some(c) = m.remove(&(seq, f)) {
+                    // Pool the big device caches (do NOT cudaFree): reusing the
+                    // same VA avoids the driver's free+realloc remap path that
+                    // faulted the next batched step (2026-09-09).
+                    self.dsa_release(c.k_nope);
+                    self.dsa_release(c.v);
+                    self.dsa_release(c.k_idx);
+                    self.dsa_release(c.k_gate);
                     unsafe {
-                        cudaFree(c.k_nope);
-                        cudaFree(c.v);
-                        cudaFree(c.k_idx);
-                        cudaFree(c.k_gate);
                         cudaFreeHost(c.pinned_t0 as *mut std::ffi::c_void);
                         cudaFreeHost(c.pinned_total as *mut std::ffi::c_void);
                     }
@@ -4084,10 +4096,30 @@ impl CudaBackend {
     }
 
     fn dsa_alloc(&self, floats: usize) -> Result<*mut std::ffi::c_void> {
+        // Reuse a pooled buffer of the same size (same VA as a previous seq's
+        // cache) — avoids the driver's free+realloc remap path that faulted
+        // the batched step after a retirement (2026-09-09).
+        let reused = self.dsa_pool.lock().unwrap().get_mut(&floats).and_then(|v| v.pop());
+        if let Some(p) = reused {
+            ck(unsafe { cudaMemset(p, 0, floats * 4) }, "dsa cache zero (reused)")?;
+            self.dsa_sizes.lock().unwrap().insert(p as usize, floats);
+            return Ok(p);
+        }
         let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMalloc(&mut p, floats * 4) }, "dsa cache malloc")?;
         ck(unsafe { cudaMemset(p, 0, floats * 4) }, "dsa cache zero")?;
+        self.dsa_sizes.lock().unwrap().insert(p as usize, floats);
         Ok(p)
+    }
+
+    /// Return a dsa_alloc buffer to the size pool instead of cudaFree'ing it.
+    fn dsa_release(&self, p: *mut std::ffi::c_void) {
+        if p.is_null() {
+            return;
+        }
+        if let Some(floats) = self.dsa_sizes.lock().unwrap().remove(&(p as usize)) {
+            self.dsa_pool.lock().unwrap().entry(floats).or_default().push(p);
+        }
     }
 }
 
