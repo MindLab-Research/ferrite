@@ -6017,7 +6017,13 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // NB=16 vs 13.7 at 64 — the extra blocks LOSE).
 #define HC_P345_NB 16
 
-__global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
+// __launch_bounds__(256, 8): the ncu diagnosis (2026-09-10) — Block Limit
+// REGISTERS = 5 blocks/SM (all other limits ≥ 8), 54.77% achieved occupancy,
+// Memory 19.67% / Compute 29.07% = the latency-bound "everything half"
+// signature. Forcing 8 blocks (≤32 regs) doubles the resident warps; the
+// compiler may spill a little — for a latency-bound kernel the occupancy
+// win dominates.
+__global__ void __launch_bounds__(256, 8) hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
                                         float* __restrict__ mx_partial,
                                         unsigned* __restrict__ ctr2,
