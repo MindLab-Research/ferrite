@@ -5055,23 +5055,34 @@ impl CudaBackend {
                         },
                         "quant_e4m3_tokens",
                     )?;
-                    // Expert-major (2026-09-10 Phase 1): sort the assignments
-                    // by expert ID — same-expert blocks land ADJACENT in the
-                    // act kernel's linearized block schedule → sequential
-                    // weight reads + L2 absorbs the 23% duplicate-expert
-                    // traffic at B=16 (blocks were ~720 apart > 444 window).
-                    let se = unsafe { act.as_f32().add(act_rows) as *mut i32 };
-                    let st = unsafe { act.as_f32().add(act_rows + sort_elems) as *mut i32 };
-                    let ss = unsafe { act.as_f32().add(act_rows + 2 * sort_elems) as *mut i32 };
-                    ck(
-                        unsafe {
-                            ferrite_moe_sort_assignments(
-                                dids.as_const_f32(), se, st, ss,
-                                ni, topk as i32, self.stream,
-                            )
-                        },
-                        "moe_sort_assignments",
-                    )?;
+                    // Expert-major (2026-09-10 Phase 1, MEASURED): 13.47ms vs
+                    // baseline 13.28ms — the sort kernel's per-layer launch
+                    // overhead (42 × ~3µs) exceeded the L2 absorption benefit
+                    // (L2 was ALREADY absorbing most duplicate-expert reads in
+                    // the token-major path; the 444-block window analysis was
+                    // too pessimistic — CUDA's block scheduler doesn't process
+                    // in strict linear order). KEPT behind FERRITE_MOE_EM=1
+                    // (opt-in) for future experimentation (e.g. Phase 2 down
+                    // kernel with a fused sort-into-route epilogue).
+                    static MOE_EM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                    let em = *MOE_EM.get_or_init(|| std::env::var_os("FERRITE_MOE_EM").is_some());
+                    let (se, st, ss): (*const i32, *const i32, *const i32) = if em {
+                        let sem = unsafe { act.as_f32().add(act_rows) as *mut i32 };
+                        let stm = unsafe { act.as_f32().add(act_rows + sort_elems) as *mut i32 };
+                        let ssm = unsafe { act.as_f32().add(act_rows + 2 * sort_elems) as *mut i32 };
+                        ck(
+                            unsafe {
+                                ferrite_moe_sort_assignments(
+                                    dids.as_const_f32(), sem, stm, ssm,
+                                    ni, topk as i32, self.stream,
+                                )
+                            },
+                            "moe_sort_assignments",
+                        )?;
+                        (sem as *const i32, stm as *const i32, ssm as *const i32)
+                    } else {
+                        (std::ptr::null(), std::ptr::null(), std::ptr::null())
+                    };
                     let r = unsafe {
                         ferrite_moe_fused_act_fp8_mma_v2(
                             x_dev.as_const_f32(), dids.as_const_f32(),
@@ -5082,7 +5093,7 @@ impl CudaBackend {
                             expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
                             topk as i32, ni, swiglu_limit,
                             xq.as_const_f32() as *const u8, xs.as_const_f32(),
-                            se, st, ss,  // expert-major: the sorted assignment tables
+                            se, st, ss,  // null = token-major (default) | sorted = expert-major
                             self.stream,
                         )
                     };
