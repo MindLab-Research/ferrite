@@ -6072,6 +6072,33 @@ impl CudaBackend {
         // cudaMemsetAsync is legal inside capture (it becomes a graph node,
         // no host-memory dependency — unlike the table H2D copies).
         ck(unsafe { cudaMemsetAsync(st.ctr, 0, 4, self.stream) }, "p2p ctr zero")?;
+        // FERRITE_P2P_ONESHOT=1: the epoch+ping-pong two-kernel protocol
+        // (p2p_ar_oneshot_v2) instead of the fused_v3 single-kernel.
+        // v2's protocol has NO ctr-based last-block detection (the source
+        // of the fused_v3 deadlock) — it uses epoch parity for the
+        // staging ping-pong and a 2-deep pipeline chain for correctness.
+        // The ctr memset above is harmless (v2's kernel ignores it for
+        // single-block grids; multi-block grids still use it correctly).
+        if std::env::var("FERRITE_P2P_ONESHOT").map(|v| v == "1").unwrap_or(false) {
+            ck(unsafe {
+                ferrite_p2p_ar_oneshot_v2(
+                    buf.as_const_f32(),
+                    st.staging_tbl as *const *mut f32,
+                    st.ready_tbl as *const *mut u32,
+                    st.epoch as *mut u32,
+                    st.ctr as *mut u32,
+                    st.staging_local as *const f32,
+                    st.ready_local as *const u32,
+                    buf.as_f32(),
+                    n as i32,
+                    st.world as i32,
+                    self.dev as i32,
+                    st.max_n as i32,
+                    self.stream,
+                )
+            }, "p2p_ar_oneshot_v2")?;
+            return Ok(true);
+        }
         ck(unsafe {
             // v3: fused down+sum single kernel (saves the inter-kernel gap
             // + epoch re-read between publish and collect phases)
