@@ -969,3 +969,33 @@ MoE 访存模式（带宽+数值双地板 3.70ms）。会话交付 +121%（539�
 
 **对标**：SGLang 不开 MTP 基座 ≈1300 tok/s（memory 记录）——**ferrite 当前 1194 已达其
 92%**。SGLang 的 3200 是**开 EAGLE/MTP** 的数字。
+
+## 2026-09-10 终局：TP=4 路径诊断 —— 2 组方案是唯一可能达标的路径
+
+**动机**：16 并发拆成 **2 组 × (TP=4, B=8)**（每组 4 GPU）→ AR 从 8-rank ring 的
+**14 步降到 6 步**（28.67µs → ~12µs，省 1.5ms），而 **MoE 每 rank 权重读取量恰好相同**：
+- TP=8/B=16：128 assignments × (inter/8 × hidden × 2 × 1B = 2MB) = 256MB
+- TP=4/B=8：64 assignments × (inter/4 × hidden × 2 × 1B = 4MB) = 256MB ✓
+
+**实测（GPU 0-3，--tp 4 --max-seqs 8）**：
+| 配置 | replay | faults | 文本 |
+|---|---|---|---|
+| TP=4/B=8 图化 | 崩溃 | 2 | — |
+| TP=4/B=8 **FERRITE_MEGA_DRY=1** | **19.55ms** | **0** | ✓ 正确 |
+
+**根因**：`CUDA pooled malloc: operation not permitted when stream is capturing (err 900)`
+—— capture 阶段 L0/L1 成功、**L2 失败**（dry-run 已跑完 L4）→ **TP=4 路径的池预热不完整**
+（某个尺寸类未在 dry-run 预热）。dmesg 无 Xid（软件 bug，非硬件）。
+
+**修复方向（下会话）**：
+1. 在 `DevBuf::alloc` 的 err 900 分支打印请求尺寸（定位缺失的 size class）
+2. 或对 L2 层的可疑分配改用 `alloc_immortal`（同图输入 469756a 的修法）
+3. 或用 `FERRITE_POOL_DEBUG=1` 观察池状态
+
+**收益重估**：DRY 19.55ms 含大量 host launch 开销（无图优化）；图化后估算 10-13ms/组
+（AR 1.08 + MoE 3.70 + hc/gdn/proj 减半 ~3.5 + 图间隙 1.3 + host 0.12）→
+**2 组 = 1230-1600 tok/s**。**这是唯一可能达到 1600 的路径**（单组 TP=8 的三大地板
+无法突破）。
+
+**风险**：TP=4 的权重内存 = 305/4 = 76GB/rank（+ 其他 ~20GB + KV/状态）≈ 100-130GB
+< 180GB ✓；两组用不同 GPU（无带宽竞争）✓。
