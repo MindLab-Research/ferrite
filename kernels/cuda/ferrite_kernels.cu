@@ -4086,24 +4086,50 @@ __global__ void kpool_compress_kernel(
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= (int)((size_t)npools * idm)) return;
     int p = tid / idm, d = tid % idm;
-    float lmax = -INFINITY;
-    for (int j = 0; j < kpool; j++) {
-        int t = p * kpool + j;
-        if (t < total) {
-            float lv = k_gate[(size_t)t * idm + d] + ape[j * idm + d];
-            if (lv > lmax) lmax = lv;
-        }
+    // 4-way unrolled: the two serial passes (max, then softmax sum) each
+    // exposed the full DRAM latency of the next load (~128 iterations x 2).
+    // Four independent chains keep 4 loads in flight and hide it.
+    const int jmax_ = (kpool < (total - p * kpool)) ? kpool : (total - p * kpool);
+    float m0 = -INFINITY, m1 = -INFINITY, m2 = -INFINITY, m3 = -INFINITY;
+    int j = 0;
+    for (; j + 3 < jmax_; j += 4) {
+        const int t0 = p * kpool + j;
+        float v0 = k_gate[(size_t)(t0 + 0) * idm + d] + ape[(size_t)(j + 0) * idm + d];
+        float v1 = k_gate[(size_t)(t0 + 1) * idm + d] + ape[(size_t)(j + 1) * idm + d];
+        float v2 = k_gate[(size_t)(t0 + 2) * idm + d] + ape[(size_t)(j + 2) * idm + d];
+        float v3 = k_gate[(size_t)(t0 + 3) * idm + d] + ape[(size_t)(j + 3) * idm + d];
+        m0 = fmaxf(m0, v0); m1 = fmaxf(m1, v1); m2 = fmaxf(m2, v2); m3 = fmaxf(m3, v3);
     }
+    for (; j < jmax_; j++) {
+        const int t = p * kpool + j;
+        m0 = fmaxf(m0, k_gate[(size_t)t * idm + d] + ape[(size_t)j * idm + d]);
+    }
+    const float lmax = fmaxf(fmaxf(m0, m1), fmaxf(m2, m3));
     if (lmax == -INFINITY) return;
-    float den = 0.f, num = 0.f;
-    for (int j = 0; j < kpool; j++) {
-        int t = p * kpool + j;
-        if (t < total) {
-            float wgt = expf(k_gate[(size_t)t * idm + d] + ape[j * idm + d] - lmax);
-            den += wgt;
-            num += wgt * k_idx[(size_t)t * idm + d];
-        }
+    float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
+    float n0 = 0.f, n1 = 0.f, n2 = 0.f, n3 = 0.f;
+    j = 0;
+    for (; j + 3 < jmax_; j += 4) {
+        const int t0 = p * kpool + j;
+        float w0 = expf(k_gate[(size_t)(t0 + 0) * idm + d] + ape[(size_t)(j + 0) * idm + d] - lmax);
+        float w1 = expf(k_gate[(size_t)(t0 + 1) * idm + d] + ape[(size_t)(j + 1) * idm + d] - lmax);
+        float w2 = expf(k_gate[(size_t)(t0 + 2) * idm + d] + ape[(size_t)(j + 2) * idm + d] - lmax);
+        float w3 = expf(k_gate[(size_t)(t0 + 3) * idm + d] + ape[(size_t)(j + 3) * idm + d] - lmax);
+        d0 += w0; d1 += w1; d2 += w2; d3 += w3;
+        n0 += w0 * k_idx[(size_t)(t0 + 0) * idm + d];
+        n1 += w1 * k_idx[(size_t)(t0 + 1) * idm + d];
+        n2 += w2 * k_idx[(size_t)(t0 + 2) * idm + d];
+        n3 += w3 * k_idx[(size_t)(t0 + 3) * idm + d];
     }
+    for (; j < jmax_; j++) {
+        const int t = p * kpool + j;
+        float wgt = expf(k_gate[(size_t)t * idm + d] + ape[(size_t)j * idm + d] - lmax);
+        d0 += wgt;
+        n0 += wgt * k_idx[(size_t)t * idm + d];
+    }
+    // keep the accumulation order deterministic: pairwise within the chain
+    const float den = ((d0 + d1) + (d2 + d3));
+    const float num = ((n0 + n1) + (n2 + n3));
     pool_keys[(size_t)p * idm + d] = num / den;
 }
 
