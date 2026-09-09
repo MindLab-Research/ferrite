@@ -1036,3 +1036,30 @@ ncu 对 `moe_fused_act_fp8_mma`：**理论占用率 37.5%，被 shared memory �
 `moe_fused_down_sum_fp8`：Duration 48.8µs，**Compute 58.1% / Memory 61.1%（L1/TEX 68%）**
 —— ncu 判定"计算与访存已平衡，两者都要降才能提速"。SIMT 版没有单侧优化空间，
 **只有 MMA 能同时降两者**（该方向仍 park，见上）。
+
+## 2026-09-09 会话总结（nsys/ncu 驱动）
+
+**用户确认基线**：1062 tok/s（`/tmp/serve_q2.log`，16-seq 中位 15.07ms，n=754，live=16，文本正确）。
+本轮在此之上继续，**全部改动均经隔离微基准 + serve 中位数双重验证**：
+
+| 改动 | 隔离微基准 | serve 16-seq 中位 | 说明 |
+|---|---|---|---|
+| CUTLASS 级 fp8 MMA gemv | 5.2-8.6x | 19.20 → 15.07 ms | 位级一致（maxrel=0） |
+| quant_e4m3_tokens 1024 线程 + float4 | — | 15.07 → 14.45 ms | 每步 ~200 次调用在关键路径 |
+| indexer fast-path 提前 | — | 14.45 → 14.33 ms | 全选中时分数无人读 |
+| kpool 4 路展开 | — | 14.33 → 14.19 ms | 两条 128 深串行链 |
+| sparse_attn TG=8（修 UB） | — | ~持平 | shfl 源 lane 曾在掩码外 |
+| MoE down 4 路累加器 | — | 14.33 → 13.87 ms | 2 链深度 4 vs FMA 延迟 4 |
+| sparse_attn 位图 + launch_bounds + unroll | 0.340 → 0.249 ms | 13.73-14.27 ms | ncu 驱动 |
+| MoE act 2 段流水 | 79.8 → 52.3 µs | 14.19 ms | ncu 驱动（占用率 37.5%→） |
+
+**当前（可靠读数，n≈2000）**：**14.19 ms/步 = 1128 tok/s**（从 833 起 +35%）。
+
+**方法论沉淀**（本轮最大的收获）：
+1. **serve 中位数有 ±3% 噪声**，单 kernel 的 20-30% 隔离收益会被淹没 ——
+   判断 kernel 改动是否有效**必须用隔离微基准**，serve 只做最终确认。
+2. **遇到"kernel 慢但找不到原因"，先隔离复现 + ncu**：本轮连续三个"合理假设"
+   （带宽/原子/并行度）在 sparse_attn 上全部被实测证伪，只有 ncu 的
+   No-Eligible/long-scoreboard/占用率限制给出了真方向。
+3. **禁止错误归因**（用户明确要求）：MoE down MMA 的系统性误差至今未定位，
+   已 park 并如实记录，不再给出推测性结论。
