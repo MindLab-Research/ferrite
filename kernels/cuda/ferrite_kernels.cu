@@ -2681,6 +2681,10 @@ extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
                                            const float* bias, float* out,
                                            int in_f, int out_f, int nrows,
                                            cudaStream_t s) {
+    // DIAGNOSTIC ONLY (FERRITE_GEMV_SKIP=1): timing-only ablation.
+    static const bool gemv_skip_ = getenv("FERRITE_GEMV_SKIP") != nullptr;
+    if (gemv_skip_) return cudaSuccess;
+
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
     if (in_f & 7) return cudaErrorNotSupported; // host falls back to v2 (→v1)
     int wpr = out_f >= 16384 ? 1 : (out_f >= 4096 ? 2 : (out_f >= 1024 ? 4 : 8));
@@ -4420,6 +4424,11 @@ extern "C" cudaError_t ferrite_indexer_topk_batched(
     const float* qi, const float* pool_keys, const float* w,
     float* idx, int B, int ih, int idm, int select_k_max, int kpool, int max_npools,
     const int* const* total_tbl, cudaStream_t s) {
+    // DIAGNOSTIC ONLY (FERRITE_ATTN_SKIP=1): timing-only ablation (the DSA
+    // cache append is NOT skipped — only the scoring/selection + the attention).
+    static const bool attn_skip_ = getenv("FERRITE_ATTN_SKIP") != nullptr;
+    if (attn_skip_) return cudaSuccess;
+
     dim3 block(1024); // was 256: the grid is only B=16 blocks, so the block
                       // size IS the parallelism (16x256 threads used 1.4% of
                       // the GPU; 16x1024 = 5.5%).
@@ -4445,6 +4454,11 @@ extern "C" cudaError_t ferrite_sparse_attn_v2_batched(
     const float* q, float* const* k_tbl, float* const* v_tbl,
     const float* idx, float* out, int B, const int* const* total_tbl,
     int h, int d, int dv, int topk, cudaStream_t s) {
+    // DIAGNOSTIC ONLY (FERRITE_ATTN_SKIP=1): timing-only ablation (the DSA
+    // cache append is NOT skipped — only the scoring/selection + the attention).
+    static const bool attn_skip_ = getenv("FERRITE_ATTN_SKIP") != nullptr;
+    if (attn_skip_) return cudaSuccess;
+
     dim3 block(256);
     dim3 grid(B, h);
     size_t smem = (size_t)topk * (sizeof(int) + sizeof(float)) + (size_t)d * sizeof(float)
@@ -6085,6 +6099,10 @@ extern "C" cudaError_t ferrite_gemv_fp8_v2(const float* x, const void* w,
                                           float* out, int in_f, int out_f,
                                           int nrows, int srows, int scols,
                                           cudaStream_t s) {
+    // DIAGNOSTIC ONLY (FERRITE_GEMV_SKIP=1): timing-only ablation.
+    static const bool gemv_skip_ = getenv("FERRITE_GEMV_SKIP") != nullptr;
+    if (gemv_skip_) return cudaSuccess;
+
     if (out_f <= 0 || nrows <= 0 || in_f <= 0) return cudaSuccess;
     constexpr int WPR = 4;                 // K-split warps per row (bf16_v2 parity)
     const int rpb = 256 / 32 / WPR;        // rows per block (8 warps / 4)
