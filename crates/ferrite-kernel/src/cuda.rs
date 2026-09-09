@@ -1950,15 +1950,20 @@ impl CudaBackend {
         // its own cast node (a persistent hit would leave the graph without
         // a cast → the replays read a stale xb).
         let key = (x.as_const_f32() as usize, x.gen);
-        // OPT-IN ONLY (FERRITE_XB_CACHE=1): measured 2026-09-10 the cache
-        // destabilizes the batch pool's address-stability contract — the
-        // retained xb buffers shift every subsequent capture pass's pooled
-        // intermediate addresses, and the graphs embed those addresses
-        // (B=16 crashed at 36 tokens / 1 Xid fault in BOTH fix variants:
-        // entry-replacement AND re-cast-in-place). The pool's determinism is
-        // load-bearing for the kept-across-retire graphs; do not perturb it.
+        // OPT-IN (FERRITE_XB_CACHE=1), CAPTURE-ONLY: consolidate the same-x
+        // GEMM groups' f32→bf16 casts into ONE cast node per (layer, group)
+        // in the captured graph (~280 → ~90 nodes/kernels per step). The
+        // cached buffers are IMMORTAL (independent cudaMalloc, never pooled,
+        // never dropped) — the first version used pooled DevBufs and its
+        // retained buffers shifted every subsequent capture pass's pooled
+        // intermediate addresses (the graphs embed those): B=16 crashed at
+        // 36 tok / 1 Xid. The pool's allocation determinism is LOAD-BEARING
+        // for the kept-across-retire graphs — never perturb it. The DRY pass
+        // (not capturing) always casts fresh — transient pooled buffers, no
+        // cache growth across steps.
         let use_xb_cache = std::env::var("FERRITE_XB_CACHE")
-            .map(|v| v == "1").unwrap_or(false);
+            .map(|v| v == "1").unwrap_or(false)
+            && is_capturing();
         let xbp: *const f32;
         if !use_xb_cache {
             let xb = DevBuf::alloc(self.dev, self.stream, ((n * in_f) as usize + 1) / 2)?;
@@ -1980,18 +1985,13 @@ impl CudaBackend {
                     xbp = b.as_const_f32();
                 }
                 entry => {
-                    // Re-cast INTO the existing buffer on a re-validating hit:
-                    // REPLACING the DevBuf would drop a buffer that
-                    // previously-captured graphs still reference (the graphs
-                    // are kept across retires) — the pool recycles it and the
-                    // replays corrupt (the B=16 36-token Xid crash).
                     dst = match entry {
                         Some((b, v)) => {
                             *v = true;
                             b.as_f32()
                         }
                         None => {
-                            let xb = DevBuf::alloc(
+                            let xb = DevBuf::alloc_immortal(
                                 self.dev, self.stream,
                                 ((n * in_f) as usize + 1) / 2,
                             )?;
