@@ -621,3 +621,35 @@ P5 分发到全 block 最多省 ~0.08ms。**不值得单独攻**——除非与�
 B300 容量 148 SM × 2048 = 302K 线程。要提占用率需 MORE 并行工作——但 P3 的 FMA
 （4-8/thread）和 P5 的归一化（1 mul/thread）已是全部工作。这是**任务级并行度不足**，
 不是 kernel 写得差。
+
+## 2026-09-10 末：tick 计时判定 — 0.9ms "host gap" 是 CLIENT 侧（pipelining 关闭）
+
+**实测**（`[tick] total` vs `[megab] replay`，B=16，316/99 样本）：
+- `[tick] total` p50 = **13.40ms**（server 侧完整步：DSA advance + launch + GPU + sync + 退休检查）
+- `[megab] replay` p50 = **13.28ms**（fan_out 内部：graph launch + GPU 执行 + D2H + sync）
+- **server 侧 host gap = 仅 0.12ms**
+
+**结论**：
+1. **server 真实吞吐 = 16000/13.40 = 1194 tok/s**（不是 client 观测的 1126）
+2. client 侧 steady（70.4 tok/s/seq × 16 = 1126）比 server 慢 ~6% —— **Python SSE 解析/
+   轮询开销 ~0.8ms/token**，非 server 问题
+3. **tick pipelining 关闭**——server 侧 host gap 仅 0.12ms，拆分 launch/wait + 双缓冲
+   最多省 ~0.05ms（3 个文件的改动换 0.4% 收益，不值得）
+
+**修正后的步预算（server 侧 13.40ms = 13.28 GPU + 0.12 host）**：
+| 组件 | ms | % |
+|---|---|---|
+| NCCL AR | 2.58 | 19.3% |
+| MoE act+down | 3.70 | 27.6% |
+| hc 链 | 2.10 | 15.7% |
+| gdn step+chunk | 1.06 | 7.9% |
+| 投影 gemm3/gemv/nvjet | ~0.9 | 6.7% |
+| 其他小 kernel | ~2.9 | 21.7% |
+| host | 0.12 | 0.9% |
+
+**通往 1600（需 replay 13.28→9.9ms，砍 3.4ms）的最终路径评估**：
+- AR 2.58ms：NCCL 协议地板（P2P ×3 死锁）→ 需根本性新协议
+- MoE 3.70ms：带宽地板（MMA/EP 失败）→ 需访存模式重构
+- hc 2.10ms：屏障主导无单点 → 需联合重构（高风险）
+- gdn/投影/其他 ~4.9ms：微优化空间合计 ~0.5-1.0ms
+- **即使全部微优化落地：~12.3ms ≈ 1300 tok/s（server 侧）。1600 需突破 AR 或 MoE 地板。**
