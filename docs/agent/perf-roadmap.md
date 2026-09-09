@@ -978,3 +978,27 @@ B 片段的 per-warp 复用在某些 warp 上的地址错位、或 weight scale 
 必须用 ncu 在隔离复现上定位**（带宽/原子/并行度都已排除），不能再靠推测。
 
 **保留的改动**：fp8 KV cache（中性，但为后续 fp8 MMA 铺路）+ TG=8（修 UB）。
+
+### sparse_attn 的 ncu 硬数据（2026-09-09，隔离复现 `kernels/cuda/sparse_bench.cu`）
+
+复现：B=16, h=64, d=dv=256, live_k=2048 → 0.34 ms/call（冷 L2；serve 内 L2 热为 143µs）。
+`ncu --section SpeedOfLight/Occupancy/SchedulerStats/WarpStateStats`：
+
+| 指标 | 值 |
+|---|---|
+| Duration | 345 µs |
+| Compute (SM) | **24.7%** |
+| Memory Throughput | 46.1%（L1/TEX 57.3%、L2 13.7%、DRAM 20.9%） |
+| No Eligible | **69.5%** |
+| Issued Warp / Scheduler | 0.31（每 3.3 周期一条指令） |
+| Active / Eligible Warps per Scheduler | 7.88 / **0.48** |
+| 首要 stall | **long-scoreboard 43.5%**（等全局加载） |
+| Block Limit | Shared Mem **5**（寄存器 6、warp 8） |
+
+**结论：延迟受限，不是带宽**（这与 bf16/fp8 cache 无收益、去重消融无收益三次实测完全一致）。
+
+**已做**：位图 `bm_words_max` 4096→256 words（131072→8192 token 容量 = 缓存的 max_t），
+smem 33.8→18.5KB，blocks/SM 上限 5→12。隔离复现无变化（冷缓存 + 寄存器随后成为新上限 6）。
+
+**下一步（明确的）**：① 压寄存器让 12 个 block 真正落地；② 每 lane 每 slot 只有 2 个
+16 字节加载 → 软件预取/2-slot 交错以喂满 long-scoreboard 等待。
