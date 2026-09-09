@@ -15,6 +15,20 @@ Read `README.md` for the design contract; this file is the operational guide: bu
    - `rsync --delete` 会**删掉远端的构建产物**（`libferrite_kernels.so` 不在本地树里）。
    - 正确流程：git 同步后**必须** `cd kernels/cuda && bash build.sh 103a` + `cargo build --release`，
      并用 `ls -la target/release/ferrite-serve` 确认时间戳**新于**源码；改动 `.cu` 后必须重跑 `build.sh`。
+2b. **每次切版本/同步后必须"双产物重编"：CUDA `.so` 和 Rust 二进制都要重编，保证同源对齐**（用户明令，2026-09-09）：
+   ```bash
+   git fetch origin refs/heads/perf-b1 && git reset --hard FETCH_HEAD   # 或 reset --hard <commit>
+   cd kernels/cuda && bash build.sh 103a && cd ~/ferrite
+   source ~/.cargo/env && cargo build --release
+   ls -la target/release/ferrite-serve kernels/cuda/libferrite_kernels.so   # 两者都必须新于源码
+   md5sum kernels/cuda/libferrite_kernels.so                                # 记下，作为该版本的产物指纹
+   ```
+   **禁止混用不同版本的产物**。实测教训（2026-09-09，浪费数小时）：把 06:57 备份的
+   `/tmp/a9_lib.so`（md5 `f5d8ad2f`）当成"a9e5d5a 的 .so"配新二进制跑，得出
+   "a9e5d5a 也崩"的**错误结论**；而真 a9e5d5a 重编出来是 md5 `f40aae6e`，配套 one-shot
+   **完全正常**（exit=0、零 Xid、`[mega] replay 9.05ms`）。判据：**跑之前先核对
+   `.so` 的 md5 与二进制的时间戳来自同一次 checkout**；`.so` 是源码的派生物，
+   不能跨版本复用，也不能用 `--lib` 指向别的版本的 `.so`。
 3. **永远禁止调用硬件复位类 API**（`nvidia-smi --gpu-reset`、重启驱动、任何影响内核/硬件的操作）。
    崩溃一律先查软件侧：源码同步/二进制时间戳/版本错配/`dmesg` 的 Xid 原文。
 3. **严禁重跑已知正确的 baseline**。已经验证过的读数就是权威，
