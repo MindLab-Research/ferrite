@@ -4412,11 +4412,15 @@ __global__ void dsa_append_batched_kernel(
     float* const* __restrict__ kidx_tbl, // [B]
     float* const* __restrict__ kgate_tbl,// [B]
     const int* const* __restrict__ t0_tbl, // [B] per-seq PINNED t0 ptrs
-    int B, int h, int dk, int dv, int idm) {
+    int B, int h, int dk, int dv, int idm, int max_t) {
     const int seq = blockIdx.x;
     const int tok = blockIdx.y;
     if (seq >= B) return;
     const int t0 = *t0_tbl[seq];
+    // PINNED-READ HARDENING (2026-09-09): a garbage/stale pinned t0 made this
+    // kernel WRITE past the per-seq DSA cache ((t0+tok)*h + hd — a 2MB-aligned
+    // PDE fault; memcheck cannot see pinned-page sources). Clamp to capacity.
+    if (t0 < 0 || t0 + tok >= max_t) return;
     const int tid = threadIdx.x;
     const int row_bytes = h * (dk + dv);
     const float* src = kvb + (size_t)seq * row_bytes + (size_t)tok * row_bytes;
@@ -4483,6 +4487,13 @@ __global__ void kpool_compress_batched_kernel(
     size_t rem = tid % per4;
     int p = (int)(rem / idm4), d4 = (int)(rem % idm4);
     int total = *total_tbl[seq];
+    // PINNED-READ HARDENING (2026-09-09): the pinned total is host-written and
+    // read zero-copy; a garbage/stale value made npools astronomical and the
+    // `t < total` guard pass for out-of-cache t — the gather then read past
+    // the DSA cache (2MB-aligned Xid 31 PDE faults; invisible to memcheck,
+    // which does not track pinned pages). Clamp to the cache capacity.
+    if (total < 0) total = 0;
+    if (total > max_npools * kpool) total = max_npools * kpool;
     int npools = (total + kpool - 1) / kpool;
     if (p >= npools) return;
     const float* k_idx = kidx_tbl[seq];
@@ -5066,10 +5077,14 @@ extern "C" cudaError_t ferrite_dsa_append_batched(
     const int* const* t0_tbl, int B, int h, int dk, int dv, int idm, int ntok, cudaStream_t s) {
     // one block per (seq, token): 256 threads = 64 heads x 4 lanes
     dim3 grid((unsigned)B, (unsigned)(ntok > 0 ? ntok : 1));
+    static const int max_t_ = [] {
+        const char* e = getenv("FERRITE_DSA_MAXT");
+        return e ? atoi(e) : 8192;
+    }();
     dsa_append_batched_kernel<<<grid, 256, 0, s>>>(
         kvb, ki, gate,
         (unsigned char* const*)kn_tbl, (unsigned char* const*)v_tbl,
-        kns_tbl, vs_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm);
+        kns_tbl, vs_tbl, kidx_tbl, kgate_tbl, t0_tbl, B, h, dk, dv, idm, max_t_);
     return cudaGetLastError();
 }
 
