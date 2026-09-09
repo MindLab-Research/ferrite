@@ -4554,6 +4554,7 @@ __global__ void sparse_attn_v2_batched_kernel(
     // was already 8-aligned — the dup broadcast read a lane OUTSIDE the
     // 2-lane mask (undefined result). Matching TG to glane0 fixes that and
     // shortens the per-lane serial FMA chain 128 -> 32.
+    static const bool attn_nodedup_ = getenv("FERRITE_ATTN_NODEDUP") != nullptr;
     const int TG = 8;
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
@@ -4564,7 +4565,11 @@ __global__ void sparse_attn_v2_batched_kernel(
         int j = idxs[s];
         bool valid = (j >= 0 && j < t);
         int dup = 0;
-        if (valid && lid == 0) {
+        // DIAG (FERRITE_ATTN_NODEDUP=1): the bitmap atomicOr is ~2M shared
+        // atomics per layer-call (2048 slots x 1024 blocks) = the suspected
+        // 143us bottleneck. This ablation measures it; correctness of the
+        // resulting text is checked by eye before anything is removed.
+        if (valid && lid == 0 && !attn_nodedup_) {
             if ((j >> 5) < bm_words) {
                 unsigned int prev = atomicOr(&bm[j >> 5], 1u << (j & 31));
                 dup = (prev & (1u << (j & 31))) != 0;
