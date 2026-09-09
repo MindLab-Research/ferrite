@@ -4043,9 +4043,24 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, float limit,
     const unsigned char* __restrict__ xq, // [n, hidden] e4m3 — PRE-QUANTIZED (v2; null = per-block v1)
-    const float* __restrict__ xs) {        // [n] per-token scales (v2)
-    const int slot = blockIdx.y;
-    const int tok = blockIdx.z;
+    const float* __restrict__ xs,         // [n] per-token scales (v2)
+    // Expert-major (2026-09-10 Phase 1): when non-null, the block's linearized
+    // position p = blockIdx.y + blockIdx.z*(topk+1) maps through the SORTED
+    // assignment table (same-expert blocks land adjacent → sequential weight
+    // reads + L2 absorbs the 23% duplicate-expert reads). null = the original
+    // token-major path (backward compatible).
+    const int* __restrict__ sorted_experts,  // [n*(topk+1)] or null
+    const int* __restrict__ sorted_tokens,   // [n*(topk+1)] or null
+    const int* __restrict__ sorted_slots) {  // [n*(topk+1)] or null
+    const int p = blockIdx.y + blockIdx.z * (topk + 1);  // linearized assignment
+    int slot, tok;
+    if (sorted_experts != nullptr) {
+        slot = sorted_slots[p];
+        tok = sorted_tokens[p];
+    } else {
+        slot = blockIdx.y;
+        tok = blockIdx.z;
+    }
     const int m0 = blockIdx.x * 16;        // 16 inter rows per block
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r0 = lane >> 2, c0 = (lane & 3) * 4;
@@ -4057,7 +4072,8 @@ __global__ void __launch_bounds__(256, 3) moe_fused_act_fp8_mma_kernel(
     if (slot < topk) {
         slot_rows = inter;
         slot_base = slot * inter;
-        int eid = (int)ids_f[(size_t)tok * topk + slot];
+        int eid = (sorted_experts != nullptr) ? sorted_experts[p]
+                                              : (int)ids_f[(size_t)tok * topk + slot];
         int local = eid - expert_start;
         if (local < 0 || local >= e_local || m0 >= slot_rows) {
             // another rank's slot or tail rows: zero (act buffer pre-zeroed by
@@ -4268,7 +4284,7 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma(
         (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
         (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
         act, expert_start, e_local, hidden, inter, inter_shared, topk, limit,
-        nullptr, nullptr); // v1: per-block quantize fallback
+        nullptr, nullptr, nullptr, nullptr, nullptr); // v1: per-block quantize + token-major (no sort)
     return cudaGetLastError();
 }
 
@@ -4282,7 +4298,9 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
     const void* shared_up_w8, const void* shared_up_scale,
     float* act, int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, float limit,
-    const void* xq, const void* xs, cudaStream_t s)
+    const void* xq, const void* xs,
+    const void* sorted_experts, const void* sorted_tokens, const void* sorted_slots,
+    cudaStream_t s)
 {
     // DIAGNOSTIC ONLY (FERRITE_MOE_SKIP=1): skip the launch to A/B the MoE's
     // share of the step. Output is garbage by construction; timing only.
@@ -4301,7 +4319,8 @@ extern "C" cudaError_t ferrite_moe_fused_act_fp8_mma_v2(
         (const unsigned char*)shared_gate_w8, (const float*)shared_gate_scale,
         (const unsigned char*)shared_up_w8, (const float*)shared_up_scale,
         act, expert_start, e_local, hidden, inter, inter_shared, topk, limit,
-        (const unsigned char*)xq, (const float*)xs);
+        (const unsigned char*)xq, (const float*)xs,
+        (const int*)sorted_experts, (const int*)sorted_tokens, (const int*)sorted_slots);
     return cudaGetLastError();
 }
 
