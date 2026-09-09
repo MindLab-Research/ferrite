@@ -1291,3 +1291,15 @@ serve 文本 `<think用户要求背诵《出师表》全文…先帝创业未半
 3. sparse_attn 的 QK^T/PV 整体 MMA 化（需 online softmax + gather 进 smem，2-3h）。
 
 当前状态：**13.68-13.88 ms/步 = 1153-1170 tok/s**（会话起点 833 → **+40%**）。
+
+### GDN dv-tile split：实测回归，已回退（2026-09-09）
+
+思路：GDN chunk 的 5 个阶段都只依赖 dv 列（decay 逐行、kS/qS 逐列点积、delta 逐元素），
+所以按 dv 分块（blockIdx.z，DV_TILE=64）应该把 smem 从 66KB 降到 33KB、blocks/SM 从 3 升到 7。
+
+**实测（隔离微基准）：0.065 → 0.089 ms/call（+37% 回归）**。原因：block 数 ×2 让
+q/k/v/gate 被重复加载，且每 block 的工作量减半（固定开销占比上升）。
+**已回退**（git reset 到实验前，force-push 同步远端）。
+
+**教训**：ncu 指出的"occupancy 受限"不等于"分块就能更快"——分块带来的冗余加载与
+固定开销可能反噬。**任何结构性改动都必须先在隔离微基准上验证，再考虑 serve。**
