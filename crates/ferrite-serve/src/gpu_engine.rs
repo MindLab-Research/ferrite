@@ -191,6 +191,12 @@ impl ServeEngine for GpuEngine {
 
     fn tick(&mut self, plan: &mut TickPlan) -> Result<()> {
         self.ticks += 1;
+        // TICK TIMING (FERRITE_TIMING): the server-side total step time —
+        // compare against the [megab] replay median to see whether the
+        // ~0.9ms host gap is server-side (tick > replay → pipelining helps)
+        // or client-side Python SSE parsing (tick ≈ replay → pipelining
+        // is pointless).
+        let tick_start = std::time::Instant::now();
         // FERRITE_NCU serve window (nsys --capture-range=cudaProfilerApi):
         // open the capture only once the batch SATURATES (live == max_seqs) —
         // skips the 80s weight load AND the admission ramp / per-size graph
@@ -359,6 +365,9 @@ impl ServeEngine for GpuEngine {
         }
         for seq in retired {
             self.live.retain(|s| *s != seq);
+        }
+        if std::env::var_os("FERRITE_TIMING").is_some() {
+            eprintln!("[tick] total: {:.2}ms (live={})", tick_start.elapsed().as_secs_f64() * 1e3, self.live.len());
         }
         Ok(())
     }
