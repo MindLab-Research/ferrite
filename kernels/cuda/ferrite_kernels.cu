@@ -4318,6 +4318,16 @@ __global__ void indexer_topk_batched_kernel(
     // per thread, so only t (~112) threads of 1024 did any work (the whole
     // kernel ran at ~1% of the GPU). Each group splits the heads and the
     // shuffle reduces within the group.
+    // FAST PATH FIRST: when every causal-valid pool is selected the output is
+    // exactly {0..jmax-1} and the scores are never read by any consumer
+    // (pool_expand only takes the indices; sparse_attn softmaxes over the
+    // selected slots). The score GEMM below was pure waste in that case —
+    // it used to run BEFORE this check (~97us/call at t~1200, x11 layers).
+    if (select_k >= jmax) {
+        for (int r = threadIdx.x; r < select_k_max; r += blockDim.x)
+            iv[r] = (r < jmax) ? (float)r : -1.0f;
+        return;
+    }
     const int TG = 8;   // 2x the per-thread columns on the latency-bound pool dot
     const int gid = threadIdx.x / TG;
     const int lid = threadIdx.x % TG;
@@ -4349,16 +4359,6 @@ __global__ void indexer_topk_batched_kernel(
         }
     }
     __syncthreads();
-    if (select_k >= jmax) {
-        // FAST PATH (short context): every causal-valid pool is selected, so
-        // the set is exactly {0..jmax-1} — order-independent for the sparse
-        // attention (it softmaxes over the selected positions) and the
-        // consumer filters invalid entries. This skips the O(select_k * t)
-        // selection loop (~200us/call at t~100, x11 layers = 2.2ms/step).
-        for (int r = threadIdx.x; r < select_k_max; r += blockDim.x)
-            iv[r] = (r < jmax) ? (float)r : -1.0f;
-        return;
-    }
     for (int r = 0; r < select_k; r++) {
         __shared__ int bidx[8];
         __shared__ float bval[8];
