@@ -3297,26 +3297,23 @@ fn mega_chain_dev_batched(
     } else {
         DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?
     };
-    if capture {
-        cuda.graph_capture_begin();
-    }
     // GPU-SIDE EMBEDDING (2026-09-10): during CAPTURE, record embed_expand_dev
     // as the graph's FIRST node instead of the ~1MB host staging upload —
     // at replay, graph_run_ids writes n×4B token ids (64B at B=16) instead of
     // the host expanding n*mult*hidden f32 (saving ~100µs host staging +
     // cross-rank host-thread jitter per step; the same mechanism the MTP
-    // verify graphs already use). The dry-run keeps the host staging path
-    // (its execution needs REAL input) but PRE-WARMS the embedding table's
-    // dev_weight cache — an uncached table would record the 2.4GB H2D upload
-    // as a graph node (re-uploaded at EVERY replay).
+    // verify graphs already use). The ids buffer allocation and the embedding
+    // table's dev_weight pre-warm MUST happen BEFORE graph_capture_begin —
+    // cudaMalloc inside capture = err 900, and an uncached table would record
+    // the 2.4GB H2D upload as a graph node (re-uploaded at EVERY replay).
     let dev_embed_ids: Option<*mut i32> = if capture {
         let ids = DevBuf::alloc_immortal(cuda.dev(), cuda.stream(), n)?;
         let p = ids.as_f32() as *mut i32;
         std::mem::forget(ids); // leak: the graph reads this buffer forever
         Some(p)
     } else {
-        // Pre-warm: run embed_expand_dev once on scratch buffers (outside
-        // capture) so dev_weight caches the table before the capture pass.
+        // Pre-warm (dry-run only, OUTSIDE any capture): run embed_expand_dev
+        // once on scratch buffers so dev_weight caches the table.
         let table = s.w("model.embed_tokens.weight")?;
         let warm_out = DevBuf::alloc(cuda.dev(), cuda.stream(), n * nh)?;
         let warm_ids = DevBuf::alloc(cuda.dev(), cuda.stream(), n)?;
@@ -3328,6 +3325,9 @@ fn mega_chain_dev_batched(
         );
         None
     };
+    if capture {
+        cuda.graph_capture_begin();
+    }
     if let Some(ids_p) = dev_embed_ids {
         let table = s.w("model.embed_tokens.weight")?;
         cuda.embed_expand_dev_buf(
