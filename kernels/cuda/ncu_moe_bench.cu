@@ -163,7 +163,12 @@ int main(int argc, char** argv) {
     srand(42);
 
     // ===== MoE (TP4 decode shapes) =====
-    const int E = 288, H = 4096, I = 512, IS = 512, TOPK = 8, N = 1;
+    // N / I parameterizable: the real B=16 TP8 decode is n=16, inter=256
+    // (TP4 was I=512); n=1/I=512 is the old MTP-verify-ish shape.
+    const int E = 288, H = 4096, TOPK = 8;
+    const int N = argc > 2 ? atoi(argv[2]) : 1;
+    const int I = argc > 3 ? atoi(argv[3]) : 512;
+    const int IS = 512;
     MoeCtx mc = {};
     mc.e_local = E; mc.hidden = H; mc.inter = I; mc.inter_shared = IS;
     mc.topk = TOPK; mc.n = N; mc.limit = 7.0f; mc.s = s;
