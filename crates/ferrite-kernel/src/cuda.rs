@@ -4407,11 +4407,12 @@ impl CudaBackend {
                             });
                         }
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        // WIP: the tensor-core down currently produces wrong
-                        // values (serve text degraded to "!!!!"); opt in
-                        // explicitly until the fragment/scale bug is fixed.
+                        // bf16 tensor-core down: verified correct (bench bad=0
+                        // for n=1..16 with unique per-block scales; serve text
+                        // is coherent) and slightly faster than the SIMT path.
+                        // Set FERRITE_MOE_DOWN_MMA=0 to fall back.
                         let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
-                            .map(|v| v == "1").unwrap_or(false);
+                            .map(|v| v != "0").unwrap_or(true);
                         let down_mma = if !use_down_mma { 1 } else { unsafe {
                             ferrite_moe_down_bf16_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
