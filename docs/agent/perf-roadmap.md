@@ -1274,3 +1274,20 @@ serve 文本 `<think用户要求背诵《出师表》全文…先帝创业未半
 **13.88 → 13.68 ms/步（1153 → 1170 tok/s）**，文本 LEN 408 ✓。
 
 **当前累计**（会话起点 833 tok/s → 现在 **1170 tok/s，+40%**）。
+
+### 近期 kernel 微调进入平台期（2026-09-09）
+
+| 改动 | serve 16-seq 中位 | 判定 |
+|---|---|---|
+| bf16 down MMA（默认） | 13.88 ms / 1153 | ✓ 保留 |
+| indexer 分数 4 路 ILP | 13.68 ms / 1170 | ✓ 保留（+1.5%） |
+| sparse_attn QK^T 双累加器 | 13.81 ms / 1159 | 中性（噪声内） |
+
+**结论**：单 kernel 的 ILP/并行度微调已达平台（都在 ±1.5% 噪声带内）。
+剩下的收益必须来自**结构性改动**：
+1. MoE 的 expert-major 分组（把同一专家的 token 聚到一个 block，才能用大 N 的 MMA；
+   当前 per-token 散射让 act 的 N=8 只能是复制、down 只能 N=1）。
+2. GDN 的 state 分块/常驻寄存器（ncu：state 128KB/block 往返延迟主导，smem 66KB → 3 blocks/SM）。
+3. sparse_attn 的 QK^T/PV 整体 MMA 化（需 online softmax + gather 进 smem，2-3h）。
+
+当前状态：**13.68-13.88 ms/步 = 1153-1170 tok/s**（会话起点 833 → **+40%**）。
