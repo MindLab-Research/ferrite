@@ -28,6 +28,13 @@ cudaError_t ferrite_moe_fused_act_fp8_mma(
     const void* shared_up_w8, const void* shared_up_scale,
     float* act, int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int n, float limit, cudaStream_t s);
+cudaError_t ferrite_moe_down_bf16_mma(
+    const float* ids_f, const float* probs,
+    const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
+    const void* shared_down_w8, const void* shared_down_scale,
+    const float* act, float* out,
+    int expert_start, int e_local, int hidden, int inter, int inter_shared,
+    int topk, int dscols, int n, cudaStream_t s);
 cudaError_t ferrite_moe_down_mma(
     const float* ids_f, const float* probs,
     const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
@@ -130,6 +137,14 @@ static void launch_down_fp8(void* v) {
 static void launch_down_mma(void* v) {
     MoeCtx* c = (MoeCtx*)v;
     CK(ferrite_moe_down_mma(c->ids_f, c->probs,
+        (const void* const*)c->down_w8, (const void* const*)c->down_sc,
+        c->sd_w8, c->sd_sc, c->act, c->out,
+        0, c->e_local, c->hidden, c->inter, c->inter_shared,
+        c->topk, c->n, (c->inter + 127) / 128, c->s));
+}
+static void launch_down_bf16(void* v) {
+    MoeCtx* c = (MoeCtx*)v;
+    CK(ferrite_moe_down_bf16_mma(c->ids_f, c->probs,
         (const void* const*)c->down_w8, (const void* const*)c->down_sc,
         c->sd_w8, c->sd_sc, c->act, c->out,
         0, c->e_local, c->hidden, c->inter, c->inter_shared,
@@ -325,6 +340,24 @@ int main(int argc, char** argv) {
             if (r > 5e-2) bad++;
         }
         printf("MMA-down vs SIMT-down: maxrel=%.3e bad=%d/%zu (max|ref|=%.4g)\n", mx, bad, olen, mxv);
+        // ---- bf16 MMA path ----
+        CK(cudaMemset(mc.out, 0, olen * 4));
+        launch_down_bf16(&mc);
+        CK(cudaDeviceSynchronize());
+        std::vector<float> c_(olen);
+        CK(cudaMemcpy(c_.data(), mc.out, olen * 4, cudaMemcpyDeviceToHost));
+        double mx2 = 0; int bad2 = 0;
+        for (size_t i = 0; i < olen; i++) {
+            double d = fabs((double)a[i] - (double)c_[i]);
+            double r = d / fmax(fabs((double)a[i]), 1e-3);
+            if (r > mx2) mx2 = r;
+            if (r > 5e-2) bad2++;
+        }
+        printf("BF16-MMA vs SIMT-down: maxrel=%.3e bad=%d/%zu\n", mx2, bad2, olen);
+        for (int t = 0; t < 2 && t < mc.n; t++)
+            printf("  tok%d: ref=%.4g %.4g %.4g %.4g | bf16=%.4g %.4g %.4g %.4g\n", t,
+                   a[(size_t)t*mc.hidden+0], a[(size_t)t*mc.hidden+1], a[(size_t)t*mc.hidden+2], a[(size_t)t*mc.hidden+3],
+                   c_[(size_t)t*mc.hidden+0], c_[(size_t)t*mc.hidden+1], c_[(size_t)t*mc.hidden+2], c_[(size_t)t*mc.hidden+3]);
         // per-row (h) max ABS error for token 0: shows whether the error is
         // row-localised (A-fragment load) or uniform (quantization).
         printf("  tok0 per-h-row max|err| (abs) / max|ref|:\n");
