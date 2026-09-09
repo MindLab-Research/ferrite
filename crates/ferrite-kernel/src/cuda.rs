@@ -4381,7 +4381,12 @@ impl CudaBackend {
                             });
                         }
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        let down_mma = unsafe {
+                        // WIP: the tensor-core down currently produces wrong
+                        // values (serve text degraded to "!!!!"); opt in
+                        // explicitly until the fragment/scale bug is fixed.
+                        let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
+                            .map(|v| v == "1").unwrap_or(false);
+                        let down_mma = if !use_down_mma { 1 } else { unsafe {
                             ferrite_moe_down_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
                                 tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
@@ -4390,7 +4395,7 @@ impl CudaBackend {
                                 expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
                                 topk as i32, ni, dscols, self.stream,
                             )
-                        };
+                        } };
                         if down_mma != 0 {
                             ck(unsafe {
                                 ferrite_moe_fused_down_sum_fp8(
@@ -4421,7 +4426,12 @@ impl CudaBackend {
                     };
                     if r == 0 {
                         let dscols = self.fp8_lookup(shared.down).map(|f| f.scols).unwrap_or((inter as usize).div_ceil(128) as i32);
-                        let down_mma = unsafe {
+                        // WIP: the tensor-core down currently produces wrong
+                        // values (serve text degraded to "!!!!"); opt in
+                        // explicitly until the fragment/scale bug is fixed.
+                        let use_down_mma = std::env::var("FERRITE_MOE_DOWN_MMA")
+                            .map(|v| v == "1").unwrap_or(false);
+                        let down_mma = if !use_down_mma { 1 } else { unsafe {
                             ferrite_moe_down_mma(
                                 dids.as_const_f32(), dprobs.as_const_f32(),
                                 tbl.down_w8 as *const *const _, tbl.down_scale as *const *const _,
@@ -4430,7 +4440,7 @@ impl CudaBackend {
                                 expert_start as i32, tbl.e_local as i32, hi, inter, inter_shared,
                                 topk as i32, ni, dscols, self.stream,
                             )
-                        };
+                        } };
                         if down_mma != 0 {
                             ck(unsafe {
                                 ferrite_moe_fused_down_sum_fp8(
