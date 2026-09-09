@@ -4012,7 +4012,7 @@ impl CudaBackend {
                         // B=2 <model>-loop regression, 2026-09-10). The CAPTURE pass
                         // must NOT write: the dry pass's kernel already advanced the
                         // pinned, and rewriting the pre-value would regress it.
-                        if !Self::dev_adv_enabled() || !capture {
+                        if !Self::dev_adv_enabled() || !self.capturing() {
                             unsafe {
                                 *pt0 = t0 as i32;
                                 *ptot = (t0 + 1) as i32;
