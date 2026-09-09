@@ -24,7 +24,7 @@
 
 ## 两条决定性实测（不要再重复验证）
 
-1. **通信（AR）只占 7%**：同 build 同负载，`FERRITE_AR_SKIP=1` → 16.4 ms/步；带 P2P AR → 17.6 ms/步。
+1. **通信（AR）占 12–13%（2026-09-08 在最终 build 上重测：`FERRITE_AR_SKIP=1` per-seq steady 66.7–69.0 vs 基线 58.3–60.0）**：同 build 同负载，`FERRITE_AR_SKIP=1` → 16.4 ms/步；带 P2P AR → 17.6 ms/步。
    nsys 里 `p2p_ar_publish` 17.6% 是 **capture/dry-run 期自旋超时的假象**（max≈49.5ms，稳态中位 5.1µs）。
    AR 的 3-kernel 结构**不可省**：并进 store 需要 655K 线程各一次 `__threadfence_system()`（≈2ms/AR）；
    并进 reduce 丢 acquire 语义（实测乱码，加 fence 仍乱码）。
