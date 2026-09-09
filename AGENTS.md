@@ -702,3 +702,24 @@ gw8 = gate_w8_ptrs[eid - expert_start];   // 指针表间接寻址
 **备选（更简单但收益更小）**：只排序不改 kernel——在 moe_route 的 epilogue 按 expert 排序
 (ids, weights) 的输出顺序，使 act/down 的 block 调度顺序自然变为 expert 相邻。前提是
 kernel 的 (y=slot, z=token) 线性化顺序与排序后的路由表一致——需要验证 grid 调度序。
+
+## 2026-09-10 最终收尾：NCCL_ALGO=Tree 复测关停 + 会话终态
+
+**NCCL_ALGO=Tree 复测**（当前 13.28ms 基线，B=16 200-tok）：**13.76ms（差 0.48ms）**。
+旧 "+1%" 读数来自 30.7ms 基线（AR 占比不同）。当前低延迟下 Tree 的每消息开销高于 Ring。
+**关停。**
+
+## 会话终态（2026-09-10，perf-b1 HEAD=1cf2c3a）
+
+**成果**：replay **29.01 → 13.28ms（+119%）**，server 吞吐 **539 → 1194 tok/s（+121%）**，
+client 观测 1126（Python SSE 解析 ~6% 开销，非 server 问题）。
+
+**10 项落地优化**：fp8 down / DSA dummy / AR f32 / device-advance / gemm3 / gdn float4 /
+mix float4 / sparse v3 / **GPU侧embedding** / **host embedding跳过**。
+
+**关停路径（全部有机制级解释）**：EP（2.2x 慢，路由偏斜）、MMA v1/v2、P2P ×3（capture 死锁）、
+NCCL LL128/Simple/Tree、kpool grid cap、mix launch_bounds、bf16 cast ×4、fast_math（中性）、
+tick pipelining（server gap 仅 0.12ms）。
+
+**下会话首要任务**：expert-major MoE 分组（完整计划在上方，预估 −0.5~1.0ms）→ 落地后
+~12.4ms ≈ 1290 tok/s。之后需突破 AR 协议地板（2.58ms）或 MoE 带宽地板——研究级课题。
