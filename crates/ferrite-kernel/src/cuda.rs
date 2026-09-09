@@ -4488,6 +4488,17 @@ extern "C" {
                                  hidden: i32, inter: i32, inter_shared: i32,
                                  topk: i32, n: i32, dscols: i32,
                                  s: CuStream) -> i32;
+    fn ferrite_moe_down_e4m3_mma2(ids_f: *const f32, probs: *const f32,
+                                  down_w8_ptrs: *const *const std::ffi::c_void,
+                                  down_scale_ptrs: *const *const std::ffi::c_void,
+                                  shared_down_w8: *const std::ffi::c_void,
+                                  shared_down_scale: *const std::ffi::c_void,
+                                  aq: *const u8, as_: *const f32,
+                                  partial: *mut f32, out: *mut f32,
+                                  expert_start: i32, e_local: i32,
+                                  hidden: i32, inter: i32, inter_shared: i32,
+                                  topk: i32, n: i32, dscols: i32,
+                                  s: CuStream) -> i32;
 }
 
 impl CudaBackend {
@@ -4820,7 +4831,54 @@ impl CudaBackend {
                         let use_down_bf16 = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
                         let mut down_done = false;
-                        if use_down_e4m3 && !use_down_bf16 {
+                        // v2 (FERRITE_DOWN_MMA2=1): per-(assignment, h-tile)
+                        // blocks — ONE 32KB contiguous weight run per block
+                        // (the act kernel's access shape) vs v1's 9 scattered
+                        // 8KB slices. Partials + a deterministic j-ascending
+                        // reduce.
+                        let use_down_mma2 = std::env::var("FERRITE_DOWN_MMA2")
+                            .map(|v| v == "1").unwrap_or(false);
+                        if use_down_mma2 {
+                            let stride = topk as i32 * inter + inter_shared;
+                            let aq = DevBuf::alloc(
+                                self.dev, self.stream,
+                                (ni as usize * stride as usize).div_ceil(4),
+                            )?;
+                            let asc = DevBuf::alloc(
+                                self.dev, self.stream,
+                                ni as usize * (topk + 1),
+                            )?;
+                            let partial = DevBuf::alloc(
+                                self.dev, self.stream,
+                                ni as usize * (topk + 1) * hi as usize,
+                            )?;
+                            let rq = unsafe {
+                                ferrite_quant_act_rows(
+                                    act.as_const_f32(), aq.as_f32() as *mut u8, asc.as_f32(),
+                                    ni, stride, inter, topk as i32, inter_shared, self.stream,
+                                )
+                            };
+                            if rq == 0 {
+                                let rd = unsafe {
+                                    ferrite_moe_down_e4m3_mma2(
+                                        dids.as_const_f32(), dprobs.as_const_f32(),
+                                        tbl.down_w8 as *const *const _,
+                                        tbl.down_scale as *const *const _,
+                                        sd.w, sd.scale,
+                                        aq.as_f32() as *const u8, asc.as_const_f32(),
+                                        partial.as_f32(), out.as_f32(),
+                                        expert_start as i32, tbl.e_local as i32, hi, inter,
+                                        inter_shared, topk as i32, ni, dscols, self.stream,
+                                    )
+                                };
+                                if rd == 0 {
+                                    down_done = true;
+                                } else {
+                                    eprintln!("[opcheck] moe_down_e4m3_mma2 err {rd} — falling back");
+                                }
+                            }
+                        }
+                        if !down_done && use_down_e4m3 && !use_down_bf16 {
                             let stride = topk as i32 * inter + inter_shared;
                             let aq = DevBuf::alloc(
                                 self.dev, self.stream,

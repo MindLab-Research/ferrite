@@ -4381,6 +4381,158 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
 }
 
 // ============================================================
+// moe_down_e4m3_mma2: v2 — per-(assignment, h-tile) blocks.
+// v1 (grid (hidden/32, n)) reads each block's 9 experts' 8KB slices — the
+// same scattered-run pattern as the SIMT version (2.5TB/s vs the act
+// kernel's 5TB/s). v2 gives every block ONE 32KB CONTIGUOUS run of ONE
+// expert's weights (W_e[h0..h0+128, :]) — the act kernel's access shape.
+// The per-(token, slot) contributions land in a partials buffer
+// [n][topk+1][hidden]; a deterministic reduce (j-ascending) sums them.
+// ============================================================
+__global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma2_kernel(
+    const float* __restrict__ ids_f, const float* __restrict__ probs,
+    const unsigned char* const* __restrict__ down_w8_ptrs,
+    const float* const* __restrict__ down_scale_ptrs,
+    const unsigned char* __restrict__ shared_down_w8,
+    const float* __restrict__ shared_down_scale,
+    const unsigned char* __restrict__ aq, const float* __restrict__ as_,
+    float* __restrict__ partial,          // [n][topk+1][hidden]
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int dscols) {
+    const int h0 = blockIdx.x * 128;
+    const int t = blockIdx.y / (topk + 1);
+    const int j = blockIdx.y % (topk + 1);
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const unsigned char* wbase; const float* dsr; int klen; float sp;
+    if (j < topk) {
+        const int eid = (int)ids_f[(size_t)t * topk + j];
+        const int local = eid - expert_start;
+        const float p = probs[(size_t)t * topk + j];
+        if (local < 0 || local >= e_local || p == 0.f) return;  // the reduce skips this slot
+        wbase = down_w8_ptrs[local]; dsr = down_scale_ptrs[local];
+        klen = inter; sp = as_[(size_t)t * (topk + 1) + j] * p;
+    } else {
+        wbase = shared_down_w8; dsr = shared_down_scale;
+        klen = inter_shared; sp = as_[(size_t)t * (topk + 1) + j];
+    }
+    __shared__ unsigned char sW[128 * 272];
+    __shared__ unsigned char srow[512];
+    __shared__ float part[8][129];
+    // stage the aq row (≤256B)
+    {
+        const unsigned char* arow = aq + (size_t)t * (topk * inter + inter_shared) + (size_t)j * inter;
+        for (int c = (int)threadIdx.x * 16; c < klen; c += 256 * 16)
+            *reinterpret_cast<uint4*>(srow + c) = *reinterpret_cast<const uint4*>(arow + c);
+    }
+    // stage W_e[h0..h0+128, :klen] — 128 rows × klen bytes, contiguous 32KB
+    for (int c = threadIdx.x; c < 128 * (klen >> 4); c += 256) {
+        const int r = c / (klen >> 4), cc = (c % (klen >> 4)) * 16;
+        const unsigned char* src_ = wbase + (size_t)(h0 + r) * klen + cc;
+        unsigned char* dst_ = sW + r * 272 + cc;
+        const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_);
+        asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_));
+    }
+    asm volatile("cp.async.commit_group;\n");
+    asm volatile("cp.async.wait_group 0;\n");
+    __syncthreads();
+    // MMA: warp w owns k-chunk w (klen=256 → 8 warps exactly); 8 m-tiles
+    const int kc = warp;
+    if (kc < (klen >> 5)) {
+        const float wsc = dsr[(size_t)(h0 >> 7) * dscols + ((kc << 5) >> 7)] * sp;
+        const unsigned char* arow = srow + (kc << 5);
+        float acc0[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+        float acc1[8] = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+        #pragma unroll
+        for (int m = 0; m < 8; m++) {
+            const unsigned saddr_a = (unsigned)__cvta_generic_to_shared(
+                sW + (size_t)(m * 16 + (lane & 15)) * 272 + (kc << 5) + ((lane >> 4) * 16));
+            unsigned a[4];
+            asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                         : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(saddr_a));
+            unsigned b[2];
+            const int c0 = (lane & 3) * 4;
+            b[0] = *(const unsigned*)(arow + c0);
+            b[1] = *(const unsigned*)(arow + c0 + 16);
+            float gd0 = 0.f, gd1 = 0.f, gd2 = 0.f, gd3 = 0.f;
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(gd0), "+f"(gd1), "+f"(gd2), "+f"(gd3)
+                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+            if ((lane & 3) == 0) {
+                acc0[m] += gd0 * wsc;   // row m*16 + r0
+                acc1[m] += gd2 * wsc;   // row m*16 + r0 + 8
+            }
+        }
+        if ((lane & 3) == 0) {
+            const int r0 = lane >> 2;
+            #pragma unroll
+            for (int m = 0; m < 8; m++) {
+                part[warp][m * 16 + r0] = acc0[m];
+                part[warp][m * 16 + r0 + 8] = acc1[m];
+            }
+        }
+    }
+    __syncthreads();
+    // cross-warp K-reduce (warp-ascending, deterministic) → the partial
+    if (warp == 0) {
+        const int KW = klen >> 5;
+        for (int r = lane; r < 128; r += 32) {
+            float s = 0.f;
+            for (int w = 0; w < KW; w++) s += part[w][r];
+            partial[(size_t)t * (topk + 1) * hidden + (size_t)j * hidden + h0 + r] = s;
+        }
+    }
+}
+
+__global__ void moe_down_e4m3_reduce_kernel(
+    const float* __restrict__ partial,   // [n][topk+1][hidden]
+    const float* __restrict__ ids_f, const float* __restrict__ probs,
+    float* __restrict__ out,             // [n, hidden]
+    int hidden, int topk, int expert_start, int e_local) {
+    const int t = blockIdx.y;
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= hidden) return;
+    const size_t base = (size_t)t * (topk + 1) * hidden + h;
+    float s = 0.f;
+    for (int j = 0; j < topk; j++) {
+        const int eid = (int)ids_f[(size_t)t * topk + j];
+        const int local = eid - expert_start;
+        const float p = probs[(size_t)t * topk + j];
+        if (local >= 0 && local < e_local && p != 0.f)
+            s += partial[base + (size_t)j * hidden];
+    }
+    s += partial[base + (size_t)topk * hidden];  // the shared expert (always local)
+    out[(size_t)t * hidden + h] = s;
+}
+
+extern "C" cudaError_t ferrite_moe_down_e4m3_mma2(
+    const float* ids_f, const float* probs,
+    const void* const* down_w8_ptrs, const void* const* down_scale_ptrs,
+    const void* shared_down_w8, const void* shared_down_scale,
+    const unsigned char* aq, const float* as_,
+    float* partial, float* out,
+    int expert_start, int e_local, int hidden, int inter,
+    int inter_shared, int topk, int n, int dscols, cudaStream_t s) {
+    if (n <= 0) return cudaSuccess;
+    if (hidden % 128 != 0 || (inter & 31) != 0 || (inter_shared & 31) != 0)
+        return cudaErrorNotSupported;
+    if (inter > 256 || inter_shared > 256 || topk > 8) return cudaErrorNotSupported;
+    dim3 grid((unsigned)(hidden / 128), (unsigned)(n * (topk + 1)));
+    moe_down_e4m3_mma2_kernel<<<grid, 256, 0, s>>>(
+        ids_f, probs,
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
+        aq, as_, partial, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return e;
+    dim3 rgrid((unsigned)((hidden + 255) / 256), (unsigned)n);
+    moe_down_e4m3_reduce_kernel<<<rgrid, 256, 0, s>>>(
+        partial, ids_f, probs, out, hidden, topk, expert_start, e_local);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // DSA (sparse attention) device chain — the four small kernels the CPU
 // path did on the host between GPU calls (each crossing was a sync):
 //   layernorm_affine: ki = LN(x·wk)(k_norm w/b)  [n, idm]
