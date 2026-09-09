@@ -924,14 +924,18 @@ impl<B: KernelBackend> TpCluster<B> {
                 ));
             }
         }
-        // HOST-WRITE ORDERING (diagnostic; DEFAULT OFF — a per-step sync of all
-        // 8 ranks serializes the host with the GPU and DOUBLED the step time
-        // (29ms vs 13.7ms measured) by killing the host-GPU pipelining. The
-        // ordering race it guarded against turned out to be a red herring —
-        // the real root cause was the dscols/ni FFI arg swap (a396171).
-        // FERRITE_STEP_SYNC=1 opts in for diagnostics.
+        // HOST-WRITE ORDERING (REQUIRED, 2026-09-09 measured): the per-seq
+        // pinned t0/total are host-written (dsa_host_advance) and read
+        // zero-copy by the DSA kernels; without ordering, the previous step's
+        // in-flight kernels observe the NEXT step's larger total → the moving
+        // 2MB-aligned Xid-31 PDE faults (removing this sync reproduced the
+        // crash at B=16 within 6 tokens). TODO(perf): replace with
+        // device-resident counters (a tiny stream-ordered kernel writing the
+        // t0/total through the tables) to eliminate the sync AND restore the
+        // host-GPU pipelining (~29ms → ~14ms/step). FERRITE_STEP_NOSYNC=1
+        // disables for A/B (will crash at B=16).
         #[cfg(feature = "cuda")]
-        if std::env::var_os("FERRITE_STEP_SYNC").is_some() {
+        if std::env::var_os("FERRITE_STEP_NOSYNC").is_none() {
             Self::fan_out(&mut self.shards, |s| {
                 if let Some(c) = s.backend.as_cuda() {
                     if let Err(e) = c.sync() {
