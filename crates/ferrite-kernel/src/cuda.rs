@@ -4019,8 +4019,9 @@ impl CudaBackend {
         // step's first dry-run with a 2MB-aligned Xid 31 PDE fault (a freed
         // DSA cache base), while the same bench WITHOUT the warmup ran clean
         // (3039 tok, 0 faults). A device-wide sync closes that window.
-        if let Err(e) = unsafe { cudaDeviceSynchronize() } {
-            eprintln!("[cluster] free_seq {seq}: pre-free device sync failed ({e}) — retrying stream sync");
+        let dev_rc = unsafe { cudaDeviceSynchronize() };
+        if dev_rc != 0 {
+            eprintln!("[cluster] free_seq {seq}: pre-free device sync failed (err {dev_rc}) — retrying stream sync");
             if let Err(e) = self.sync() {
                 eprintln!("[cluster] free_seq {seq}: pre-free stream sync failed ({e}) — freeing anyway");
             }
