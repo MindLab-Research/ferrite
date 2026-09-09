@@ -517,7 +517,20 @@ pub struct DevBuf {
     /// allocated during the capture (a pool miss there = cudaMalloc inside
     /// capture = err 900).
     pub immortal: bool,
+    /// UNIQUE PER ALLOCATION (monotonic). The pool recycles ADDRESSES: two
+    /// different activations can live at the same pointer at different times.
+    /// Content-sensitive caches (the xq quant cache) must key on (ptr, gen) —
+    /// a bare-pointer key stale-hits a recycled buffer holding DIFFERENT
+    /// content (root cause #5 of the batched garbage text, 2026-09-09: layer
+    /// L+1's hfn landed on layer L's freed address → the mma_b16 GEMMs
+    /// consumed L's quantized activations → L1 ffn 1.19x off, L2 ffn 12.6x
+    /// off, compounding garbage downstream; the single-seq path was immune
+    /// because n==1 uses the in-kernel-quant gemv_fp8_mma path, no cache).
+    pub gen: u64,
 }
+
+/// The monotonic allocation counter backing DevBuf::gen.
+static DEVBUF_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl DevBuf {
     /// Pooled alloc: reuse a released (device, stage) pair of the same size
@@ -542,7 +555,8 @@ impl DevBuf {
         // BATCH_BUF_POOL above): the graph-recorded addresses stay stable.
         let batch = IN_BATCH_DECODE.load(std::sync::atomic::Ordering::Acquire);
         if let Some((ptr, stage)) = buf_pool_take(dev, class, batch) {
-            return Ok(DevBuf { ptr, len, class, dev, stream, stage, batch, immortal: false });
+            return Ok(DevBuf { ptr, len, class, dev, stream, stage, batch, immortal: false,
+                               gen: DEVBUF_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) });
         }
         let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
         // DIAGNOSTIC (FERRITE_POOL_MISS=1): a cudaMalloc inside a stream
@@ -554,7 +568,8 @@ impl DevBuf {
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
         let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "pinned stage malloc")?;
-        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch, immortal: false })
+        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch, immortal: false,
+                    gen: DEVBUF_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) })
     }
 
     /// An IMMORTAL DevBuf: direct cudaMalloc + cudaMallocHost, NEVER enters any
@@ -574,7 +589,8 @@ impl DevBuf {
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "immortal malloc")?;
         let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
         ck(unsafe { cudaMallocHost(&mut stage, class as usize * std::mem::size_of::<f32>()) }, "immortal pinned stage malloc")?;
-        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch: false, immortal: true })
+        Ok(DevBuf { ptr, len, class, dev, stream, stage, batch: false, immortal: true,
+                    gen: DEVBUF_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) })
     }
     /// H2D via the pinned stage — graph-capturable: the CPU copy into the
     /// stage happens outside any graph; the recorded memcpy moves
@@ -799,7 +815,7 @@ pub struct CudaBackend {
     /// The MMA gemv needs the x pre-quantized; ONE quant per layer serves all
     /// same-x gemvs. Buffers are never freed (a captured graph holds the
     /// addresses) and a capture never allocates.
-    xq_cache: std::sync::Mutex<std::collections::HashMap<i32, (DevBuf, DevBuf, usize, bool)>>,
+    xq_cache: std::sync::Mutex<std::collections::HashMap<i32, (DevBuf, DevBuf, usize, u64, bool)>>,
     /// fp8 expert pointer tables (per layer, keyed like moe_ptrs) — (w8,
     /// scale) device tables for the fused MoE kernels.
     moe_fp8_ptrs: std::sync::Mutex<std::collections::HashMap<usize, MoeFp8PtrTable>>,
@@ -1952,23 +1968,28 @@ impl CudaBackend {
     pub fn clear_xq_cache(&self) {
         let mut c = self.xq_cache.lock().unwrap();
         for v in c.values_mut() {
-            v.3 = false;
+            v.4 = false;
         }
     }
 
     /// fp32 x -> e4m3 once per (x, in_f); reused by every same-x gemv of the
-    /// layer. None => would need to allocate inside a graph capture (illegal).
+    /// layer. The cache is keyed on (in_f, ptr, GEN): the pool recycles
+    /// addresses, so a bare-pointer key stale-hits a recycled buffer with
+    /// DIFFERENT content (root cause #5). None => would need to allocate
+    /// inside a graph capture (illegal).
     fn xq_cached(&self, x_dev: &DevBuf, n: i32, in_f: i32) -> Result<Option<(*const u8, *const f32)>> {
         let xp = x_dev.as_const_f32() as usize;
+        let xg = x_dev.gen;
         let rp;
         {
             let mut c = self.xq_cache.lock().unwrap();
             match c.get_mut(&in_f) {
-                Some((q, sc, px, valid)) if *valid && *px == xp => {
+                Some((q, sc, px, pgen, valid)) if *valid && *px == xp && *pgen == xg => {
                     return Ok(Some((q.as_f32() as *const u8, sc.as_const_f32())));
                 }
-                Some((q, sc, px, valid)) => {
+                Some((q, sc, px, pgen, valid)) => {
                     *px = xp;
+                    *pgen = xg;
                     *valid = true;
                     rp = (q.as_f32() as *const u8, sc.as_const_f32());
                 }
@@ -1979,7 +2000,7 @@ impl CudaBackend {
                     let q = DevBuf::alloc(self.dev, self.stream, (16usize * in_f as usize) / 4 + 1)?;
                     let sc = DevBuf::alloc(self.dev, self.stream, 16usize)?;
                     rp = (q.as_f32() as *const u8, sc.as_const_f32());
-                    c.insert(in_f, (q, sc, xp, true));
+                    c.insert(in_f, (q, sc, xp, xg, true));
                 }
             }
         }
@@ -1997,7 +2018,7 @@ impl CudaBackend {
         if !is_capturing() && !self.xq_cache.lock().unwrap().contains_key(&in_f) {
             let q = DevBuf::alloc(self.dev, self.stream, (16usize * in_f as usize) / 4 + 1)?;
             let sc = DevBuf::alloc(self.dev, self.stream, 16usize)?;
-            self.xq_cache.lock().unwrap().insert(in_f, (q, sc, 0, false));
+            self.xq_cache.lock().unwrap().insert(in_f, (q, sc, 0, 0, false));
         }
         // fp8 single-store guard: a placeholder Tensor (data.len() < numel)
         // with NO fp8 registration must fail loudly — its bf16 upload would
