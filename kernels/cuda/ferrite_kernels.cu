@@ -650,12 +650,14 @@ __global__ void gdn_step_v2_kernel(const float* __restrict__ q,
         S[(size_t)(idx / dv) * spitch + (idx % dv)] = Sg[idx];
     __syncthreads();
     // 1. per-channel decay: S[i,:] *= exp(gate[h,i])
-    for (int i = threadIdx.x; i < dk; i += blockDim.x) {
-        float decay = expf(gh[i]);
-        if (decay != 1.0f) {
-            float* Si = S + (size_t)i * spitch;
-            for (int j = 0; j < dv; j++) Si[j] *= decay;
-        }
+    // Was: one thread per ROW (only 128 of 512 threads active, 75% idle, and
+    // each active thread ran a serial dv-long loop). Now: precompute the
+    // per-row decay, then sweep all dk*dv elements with the full block.
+    for (int i = threadIdx.x; i < dk; i += blockDim.x) gh[i] = expf(gh[i]);
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < dk * dv; idx += blockDim.x) {
+        const int i = idx / dv, j = idx - i * dv;
+        S[(size_t)i * spitch + j] *= gh[i];
     }
     __syncthreads();
     // 2. kS = S^T k
