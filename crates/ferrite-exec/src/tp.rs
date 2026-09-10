@@ -2753,6 +2753,17 @@ fn mega_chain_dev(
     }
 
     eprintln!("[mcd] enter capture={} seq={}", capture, seq);
+    // PRE-WARM moved to the entry (2026-09-10): the capture was crashing in the
+    // _guard block BELOW (before the old pre-warm site) — warm the pools FIRST.
+    if capture {
+        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 16384) {
+            drop(b);
+        }
+        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 245760) {
+            drop(b);
+        }
+        eprintln!("[mcd] prewarmed");
+    }
     let _guard = if capture {
         // DSA host bookkeeping: the capture pass re-runs dsa_layer_dev's
         // host logic (t_count += 1 WITHOUT executing cache_append). Roll it
