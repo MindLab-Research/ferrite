@@ -738,12 +738,7 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         let _t_moeonly = std::time::Instant::now();
-        let _t_moeonly = std::time::Instant::now();
-        let _t_moeonly = std::time::Instant::now();
         self.moe(layer, ld)?;
-        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
-            eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
-        }
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
