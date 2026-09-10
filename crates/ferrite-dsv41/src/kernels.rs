@@ -351,6 +351,25 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// MoE routing from pre-computed gate scores (the checkpoint's gate is
+    /// bf16, so the gate GEMM is a separate bf16 GEMM). Selection uses
+    /// `act(score) + bias`; the weights come from the unbiased `act(score)`,
+    /// normalised and scaled. `hist` may be null.
+    pub fn dsv41_route_topk(
+        scores: *const f32,
+        bias: *const f32,
+        weights: *mut f32,
+        indices: *mut i32,
+        hist: *mut i32,
+        rows: i32,
+        n_experts: i32,
+        topk: i32,
+        norm_topk_prob: i32,
+        route_scale: f32,
+        score_func: i32,
+        stream: CuStream,
+    ) -> i32;
+
     /// SwiGLU with the training clamps: `out[i] = silu(min(gate, limit)) *
     /// clamp(up, -limit, limit)`, applied in place over `[rows, inter]` for each
     /// half of the fused gate_up buffer.

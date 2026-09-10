@@ -1,0 +1,268 @@
+// DeepSeek-V4.1-Flash glue kernels: engram gated write-back, SwiGLU with the
+// training clamps, row gather / scatter-add, and the hc pre-mix collapse.
+//
+// No quantised weights and no tensor-core work here: these are plain f32
+// elementwise/streaming ops that sit between the big kernels of the chain.
+// Every semantic is pinned by the ABI in crates/ferrite-dsv41/src/kernels.rs
+// and mirrored by the CPU golden in crates/ferrite-dsv41/src/ops.rs.
+//
+// Determinism (each kernel also documents its own case):
+//   * engram_apply / swiglu_limit / gather_rows / hc_collapse: every output
+//     element is produced by exactly one thread and never revisited, so the
+//     results are bitwise stable run-to-run. engram_apply's only cross-thread
+//     reduction is a fixed-shape tree; hc_collapse keeps the golden's
+//     ascending-i FMA chain.
+//   * scatter_add_rows: atomic adds -- rows that receive two or more
+//     contributions accumulate in scheduler-defined order and are therefore
+//     NOT bitwise reproducible (see the kernel comment for the analysis).
+//
+// Build (same TU style as the rest of the DSv4.1 kernels):
+//   nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -c dsv41_glue.cu
+
+#include <cuda_runtime.h>
+#include <cstdint>
+
+namespace {
+
+// ===========================================================================
+// engram gated write-back  (ops.rs::engram_forward)
+// ===========================================================================
+
+// Block-wide all-reduce of three f32 lanes over a 128-thread (4-warp) block.
+// Fixed reduction shape -> deterministic given (dim, blockDim).
+__device__ __forceinline__ void block_sum3(float& a, float& b, float& c) {
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+        b += __shfl_xor_sync(0xFFFFFFFFu, b, off);
+        c += __shfl_xor_sync(0xFFFFFFFFu, c, off);
+    }
+    __shared__ float red[3][8];  // up to 8 warps
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    if (lane == 0) {
+        red[0][wid] = a;
+        red[1][wid] = b;
+        red[2][wid] = c;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        const int nw = blockDim.x >> 5;  // <= 8
+        a = (lane < nw) ? red[0][lane] : 0.f;
+        b = (lane < nw) ? red[1][lane] : 0.f;
+        c = (lane < nw) ? red[2][lane] : 0.f;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+            b += __shfl_xor_sync(0xFFFFFFFFu, b, off);
+            c += __shfl_xor_sync(0xFFFFFFFFu, c, off);
+        }
+        if (lane == 0) {
+            red[0][0] = a;
+            red[1][0] = b;
+            red[2][0] = c;
+        }
+    }
+    __syncthreads();
+    a = red[0][0];
+    b = red[1][0];
+    c = red[2][0];
+}
+
+// One block per (row, i < hc) slot of x -- the slot is exclusively owned by
+// this block, so the in-place x += gate * value update is race-free. `kv` rows
+// are [hc*dim key | dim value]; q_weight/k_weight are [hc, dim].
+//
+// gate = sigmoid( signed_sqrt(max(|dot|, 1e-6)) ), with
+//   dot  = <h, q_w[i] * k_w[i] * k> * rstd * dim^-0.5,
+//   rstd = rsqrt(mean(h^2) + eps) * rsqrt(mean(k^2) + eps),
+// exactly the reference's normalised dot (ops.rs::engram_forward).
+// token_mask may be null; mask[row] == 0 forces gate = 0.
+__global__ void engram_apply_kernel(float* __restrict__ x, const float* __restrict__ kv,
+                                    const float* __restrict__ q_weight,
+                                    const float* __restrict__ k_weight,
+                                    const uint8_t* __restrict__ token_mask, int rows, int hc,
+                                    int dim, float eps) {
+    const int r = blockIdx.x;
+    const int i = blockIdx.y;
+    if (r >= rows || i >= hc) return;
+    const size_t span = (size_t)hc * dim + dim;
+    const float* h = x + ((size_t)r * hc + i) * dim;             // read + written back
+    const float* k = kv + (size_t)r * span + (size_t)i * dim;
+    const float* value = kv + (size_t)r * span + (size_t)hc * dim;
+    const float* qw = q_weight + (size_t)i * dim;
+    const float* kw = k_weight + (size_t)i * dim;
+
+    float hss = 0.f, kss = 0.f, dot = 0.f;
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+        const float hv = h[c];
+        const float kval = k[c];
+        hss += hv * hv;
+        kss += kval * kval;
+        dot += hv * qw[c] * kw[c] * kval;
+    }
+    block_sum3(hss, kss, dot);
+
+    const float rstd = (1.f / sqrtf(hss / (float)dim + eps)) *
+                       (1.f / sqrtf(kss / (float)dim + eps));
+    dot *= rstd * (1.f / sqrtf((float)dim));
+    // signed sqrt with the >=1e-6 magnitude clamp (copysign matches Rust's
+    // signum, including the -0.0 case)
+    const float mag = sqrtf(fmaxf(fabsf(dot), 1e-6f)) * copysignf(1.f, dot);
+    float gate = 1.f / (1.f + expf(-mag));
+    if (token_mask != nullptr && token_mask[r] == 0u) gate = 0.f;
+
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+        x[((size_t)r * hc + i) * dim + c] = h[c] + gate * value[c];
+    }
+}
+
+// ===========================================================================
+// SwiGLU with the training clamps  (fused gate_up [rows, 2*inter])
+// ===========================================================================
+
+// For i < inter, reading g = gate_up[r, i] and u = gate_up[r, inter + i]:
+//   g = min(g, limit), u = clamp(u, -limit, limit)   (limit > 0 only)
+//   gate_up[r, i] = silu(g) * u
+// The up half is never written (no out-of-bounds store either way). limit <= 0
+// disables the clamps. This is the epilogue of dsv41_expert_gate_up_fp4's
+// output layout (gate first, up second), silu = g / (1 + exp(-g)).
+__global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int inter,
+                                    float limit) {
+    const size_t total = (size_t)rows * inter;
+    for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (size_t)gridDim.x * blockDim.x) {
+        const int r = (int)(t / (size_t)inter);
+        const int i = (int)(t % (size_t)inter);
+        float* row = gate_up + (size_t)r * 2 * inter;
+        float g = row[i];
+        float u = row[inter + i];
+        if (limit > 0.f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        row[i] = (g / (1.f + expf(-g))) * u;
+    }
+}
+
+// ===========================================================================
+// Row gather / scatter-add
+// ===========================================================================
+
+// out[i, :] = src[idx[i], :]; idx may repeat (pure copy, bitwise exact).
+__global__ void gather_rows_kernel(const float* __restrict__ src, const int32_t* __restrict__ idx,
+                                   float* __restrict__ out, int n, int dim) {
+    const size_t total = (size_t)n * dim;
+    for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (size_t)gridDim.x * blockDim.x) {
+        const int i = (int)(t / (size_t)dim);
+        const int c = (int)(t % (size_t)dim);
+        out[t] = src[(size_t)idx[i] * dim + c];
+    }
+}
+
+// dst[idx[i], :] += src[i, :] * weight[i] -- one atomicAdd per element.
+//
+// Why atomics (documented choice): this ABI carries no dst-row count, so the
+// destination extent is defined by the idx values alone; a single-pass atomic
+// scatter is the natural O(n * dim) implementation and it cannot lose updates
+// -- every duplicate contribution reaches the row (the read-modify-write
+// serialises at the L2 slice).
+//
+// Determinism: NON-deterministic summation order. When one dst row receives
+// two or more contributions, f32 addition is not associative and the atomic
+// order is scheduler-defined, so those rows can differ run-to-run in the last
+// ulp(s) (and from the sequential CPU golden). Single-contribution rows are
+// exact, and no update is ever dropped. Impact on reproducibility: invisible
+// to tolerance-based comparisons (<=1e-5 style), NOT safe for bitwise
+// replay-diffing of rows that receive duplicates. The deterministic
+// alternative -- one warp/block per dst row, accumulating in ascending i
+// order (== the golden's order) -- costs O(dst_rows * n) index reads and would
+// need a max-idx pre-pass the ABI does not provide; it stays the documented
+// fallback if bitwise reproducibility ever becomes a requirement.
+__global__ void scatter_add_rows_kernel(const float* __restrict__ src,
+                                        const int32_t* __restrict__ idx,
+                                        const float* __restrict__ weight,
+                                        float* __restrict__ dst, int n, int dim) {
+    const size_t total = (size_t)n * dim;
+    for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (size_t)gridDim.x * blockDim.x) {
+        const int i = (int)(t / (size_t)dim);
+        const int c = (int)(t % (size_t)dim);
+        atomicAdd(&dst[(size_t)idx[i] * dim + c], src[t] * weight[i]);
+    }
+}
+
+// ===========================================================================
+// hc pre-mix collapse  (ops.rs::hc_pre)
+// ===========================================================================
+
+// out[r, c] = sum_i pre[r*hc + i] * x[(r*hc + i)*dim + c], accumulated as an
+// FMA chain over ascending i -- the golden's accumulation order. (GLM's
+// ferrite_hc_contract is the UNWEIGHTED sum, a different op.)
+__global__ void hc_collapse_kernel(const float* __restrict__ x, const float* __restrict__ pre,
+                                   float* __restrict__ out, int rows, int hc, int dim) {
+    const size_t total = (size_t)rows * dim;
+    for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (size_t)gridDim.x * blockDim.x) {
+        const int r = (int)(t / (size_t)dim);
+        const int c = (int)(t % (size_t)dim);
+        const float* pre_r = pre + (size_t)r * hc;
+        const float* x_r = x + (size_t)r * hc * dim + c;
+        float acc = 0.f;
+        for (int i = 0; i < hc; i++) acc = fmaf(pre_r[i], x_r[(size_t)i * dim], acc);
+        out[t] = acc;
+    }
+}
+
+}  // namespace
+
+// ============================================================================
+// extern "C" entry points -- the ABI in crates/ferrite-dsv41/src/kernels.rs
+// ============================================================================
+
+extern "C" int dsv41_engram_apply(float* x, const float* kv, const float* q_weight,
+                                  const float* k_weight, const uint8_t* token_mask, int rows,
+                                  int hc, int dim, float eps, cudaStream_t s) {
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaSuccess;
+    const dim3 grid((unsigned)rows, (unsigned)hc);
+    engram_apply_kernel<<<grid, 128, 0, s>>>(x, kv, q_weight, k_weight, token_mask, rows, hc, dim,
+                                             eps);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float limit,
+                                  cudaStream_t s) {
+    if (rows <= 0 || inter <= 0) return (int)cudaSuccess;
+    const size_t total = (size_t)rows * inter;
+    const unsigned blocks = (unsigned)((total + 255) / 256);
+    swiglu_limit_kernel<<<blocks, 256, 0, s>>>(gate_up, rows, inter, limit);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_gather_rows(const float* src, const int32_t* idx, float* out, int n, int dim,
+                                 cudaStream_t s) {
+    if (n <= 0 || dim <= 0) return (int)cudaSuccess;
+    const size_t total = (size_t)n * dim;
+    const unsigned blocks = (unsigned)((total + 255) / 256);
+    gather_rows_kernel<<<blocks, 256, 0, s>>>(src, idx, out, n, dim);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_scatter_add_rows(const float* src, const int32_t* idx, const float* weight,
+                                      float* dst, int n, int dim, cudaStream_t s) {
+    if (n <= 0 || dim <= 0) return (int)cudaSuccess;
+    const size_t total = (size_t)n * dim;
+    const unsigned blocks = (unsigned)((total + 255) / 256);
+    scatter_add_rows_kernel<<<blocks, 256, 0, s>>>(src, idx, weight, dst, n, dim);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_hc_collapse(const float* x, const float* pre, float* out, int rows, int hc,
+                                 int dim, cudaStream_t s) {
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaSuccess;
+    const size_t total = (size_t)rows * dim;
+    const unsigned blocks = (unsigned)((total + 255) / 256);
+    hc_collapse_kernel<<<blocks, 256, 0, s>>>(x, pre, out, rows, hc, dim);
+    return (int)cudaGetLastError();
+}

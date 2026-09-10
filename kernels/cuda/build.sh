@@ -14,7 +14,7 @@ DIR="$(dirname "$0")"
 SRCS=("$DIR/ferrite_kernels.cu")
 # the tcgen05 MXFP4 expert GEMM is its own TU; tests_*.cu carry a main
 # and are deliberately NOT linked into the shared object.
-for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu; do
+for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu "$DIR"/dsv41_glue.cu; do
     [ -f "$f" ] && SRCS+=("$f")
 done
 

@@ -125,6 +125,18 @@ struct Kernels {
         c_int, c_int, c_int, c_int, f32, c_int, f32, c_int, CuStream,
     ) -> c_int,
     add_inplace: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, CuStream) -> c_int>,
+    hc_collapse: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int>,
+    route_topk: Option<
+        unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream) -> c_int,
+    >,
+    engram_apply: Option<
+        unsafe extern "C" fn(*mut f32, *const f32, *const f32, *const f32, *const u8, c_int, c_int, c_int, f32, CuStream) -> c_int,
+    >,
+    swiglu_limit: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, CuStream) -> c_int>,
+    gather_rows: Option<unsafe extern "C" fn(*const f32, *const i32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    scatter_add_rows: Option<
+        unsafe extern "C" fn(*const f32, *const i32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int,
+    >,
     window_append: Option<unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int>,
@@ -284,6 +296,12 @@ impl Device {
                 hc_mixes: f!(h_k, "dsv41_hc_mixes"),
                 moe_route: f!(h_k, "dsv41_moe_route"),
                 add_inplace: sym(h_k, "ferrite_add_inplace").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                route_topk: sym(h_k, "dsv41_route_topk").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                engram_apply: sym(h_k, "dsv41_engram_apply").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                swiglu_limit: sym(h_k, "dsv41_swiglu_limit").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                gather_rows: sym(h_k, "dsv41_gather_rows").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                scatter_add_rows: sym(h_k, "dsv41_scatter_add_rows").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 window_append: sym(h_k, "dsv41_window_append").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 rmsnorm: f!(h_k, "ferrite_rmsnorm"),
                 hc_pre: f!(h_k, "ferrite_hc_pre"),
@@ -827,6 +845,98 @@ impl Device {
         let f = self.need(self.kernels.window_append, "dsv41_window_append")?;
         let rc = unsafe { f(kv, cache, cache_scale, rows, head_dim, window, start_pos, self.stream) };
         self.kerr(rc, "dsv41_window_append")
+    }
+
+    /// MoE routing from pre-computed (bf16-gate) scores.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_topk(
+        &self,
+        scores: *const f32,
+        bias: *const f32,
+        weights: *mut f32,
+        indices: *mut i32,
+        hist: *mut i32,
+        rows: i32,
+        n_experts: i32,
+        topk: i32,
+        norm_topk_prob: bool,
+        route_scale: f32,
+        score_func: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.route_topk, "dsv41_route_topk")?;
+        let rc = unsafe {
+            f(
+                scores, bias, weights, indices, hist, rows, n_experts, topk,
+                norm_topk_prob as i32, route_scale, score_func, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_route_topk")
+    }
+
+    // --------------------------------------------------- glue op wrappers
+
+    pub fn gather_rows(
+        &self,
+        src: *const f32,
+        idx: *const i32,
+        out: *mut f32,
+        n: i32,
+        dim: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.gather_rows, "dsv41_gather_rows")?;
+        let rc = unsafe { f(src, idx, out, n, dim, self.stream) };
+        self.kerr(rc, "dsv41_gather_rows")
+    }
+
+    pub fn scatter_add_rows(
+        &self,
+        src: *const f32,
+        idx: *const i32,
+        weight: *const f32,
+        dst: *mut f32,
+        n: i32,
+        dim: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.scatter_add_rows, "dsv41_scatter_add_rows")?;
+        let rc = unsafe { f(src, idx, weight, dst, n, dim, self.stream) };
+        self.kerr(rc, "dsv41_scatter_add_rows")
+    }
+
+    pub fn swiglu_limit(&self, gate_up: *mut f32, rows: i32, inter: i32, limit: f32) -> Result<()> {
+        let f = self.need(self.kernels.swiglu_limit, "dsv41_swiglu_limit")?;
+        let rc = unsafe { f(gate_up, rows, inter, limit, self.stream) };
+        self.kerr(rc, "dsv41_swiglu_limit")
+    }
+
+    pub fn hc_collapse(
+        &self,
+        x: *const f32,
+        pre: *const f32,
+        out: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.hc_collapse, "dsv41_hc_collapse")?;
+        let rc = unsafe { f(x, pre, out, rows, hc, dim, self.stream) };
+        self.kerr(rc, "dsv41_hc_collapse")
+    }
+
+    pub fn engram_apply(
+        &self,
+        x: *mut f32,
+        kv: *const f32,
+        q_weight: *const f32,
+        k_weight: *const f32,
+        token_mask: *const u8,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        eps: f32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.engram_apply, "dsv41_engram_apply")?;
+        let rc = unsafe { f(x, kv, q_weight, k_weight, token_mask, rows, hc, dim, eps, self.stream) };
+        self.kerr(rc, "dsv41_engram_apply")
     }
 
     // ------------------------------------------- read-only GLM reuse set
