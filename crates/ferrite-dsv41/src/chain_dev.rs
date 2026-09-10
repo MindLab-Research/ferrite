@@ -460,6 +460,10 @@ impl<'a> DevChain<'a> {
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
         )?;
+        // the FFN's pre is what the NEXT layer's attention collapses with
+        // ("attention uses what the previous layer's FFN produced") — grab it
+        // BEFORE upload_pre overwrites the buffer with this layer's attn_pre
+        let ffn_pre = self.dl(self.s.pre.as_f32(), hc)?;
         self.upload_pre(&attn_pre)?;
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
@@ -492,7 +496,7 @@ impl<'a> DevChain<'a> {
             dim as i32,
         )?;
         self.copy_h_back()?;
-        Ok(attn_pre)
+        Ok(ffn_pre)
     }
 
     /// Diagnostic: report the magnitude of a stage's output. `DSV41_STATS=1`.
