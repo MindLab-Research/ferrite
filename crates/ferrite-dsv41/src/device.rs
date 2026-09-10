@@ -1085,6 +1085,26 @@ impl Device {
         if st != 0 {
             return Err(FerriteError::Config(format!("cublasGemmEx: {st}")));
         }
+        // cuBLAS has no cudaGetLastError-style check here, so a fault inside the
+        // GEMM would otherwise surface at the NEXT kernel's sync and be
+        // attributed to the wrong op (the routing kernel was blamed for an
+        // earlier cuBLAS fault).
+        if self.debug_sync {
+            let rc = unsafe { (self.cudart.stream_sync)(self.stream) };
+            if rc != 0 {
+                let msg = unsafe {
+                    let p = (self.cudart.strerror)(rc);
+                    if p.is_null() {
+                        format!("cuda error {rc}")
+                    } else {
+                        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(FerriteError::Config(format!(
+                    "ASYNC FAULT in gemm_bf16 (cuBLAS): {msg}"
+                )));
+            }
+        }
         Ok(())
     }
 }
