@@ -550,3 +550,37 @@ dspark_target_layer_ids=[37,38,39]`
   ② `attention()` 返回时 `s.o` 已是 `dim` 宽（wo_b 输出），按 `nh*hd` 读会读到陈旧尾部 ✗。
 - 官方 `generate.py` 默认 `temperature=1.0`（采样）；**传 `--temperature 0` 才是 argmax 贪心**，
   才能与我的贪心逐 token 对齐 ✓。
+
+### MoE 1.4x 的排查记录（已排除项，供下会话接力）
+
+目标：官方 pos0 `moe_out=0.145160`，我 `0.1037`（修复 memcpy/清零后从 0.0870 升上来的）。
+
+**已逐一排除**：
+- `route_scale` 读取：`config.rs:272-273` 同时兼容 `route_scale` 与 `routed_scaling_factor` ✓（=1.5 ✓）
+- `route_topk` 权重：与参考逐行一致 —— 用**无 bias** 的分数做权重、**带 bias** 的做选择，
+  先 `w /= sum` 再 `* route_scale` ✓（`dsv41_route.cu:114-127`）
+- `swiglu_limit`：gate 只夹上界、up 两侧夹、`silu(g)*u` ✓ 与参考 `Expert.forward` 完全一致
+- gate / shared expert 的分片：都是 `Shard::Replicated` ✓（各 rank 路由一致，必需 ✓）
+- shared expert 三权重命名：checkpoint 就是 `layers.N.ffn.shared_experts.{w1,w2,w3}.{weight,scale}` ✓，
+  形状 `w1/w3=[inter,dim]`、`w2=[dim,inter]` ✓
+- AR 语义：是**求和**（`tp.rs` 的 `all_reduce_inplace` = publish + `add_inplace_raw` 累加各 rank ✓），
+  不是平均 ✓；shared expert 只在 rank 0 算 + SUM AR ⇒ 恰好计入一次 ✓
+- `expert_down_fp4` 的写出：OVERWRITE（`launch_mxf4` 内核 `out[row*n+col] = x` ✓）
+
+**专家内部量（layer0，我的 vs 官方）**：
+| | 官方 | 我的 |
+|---|---|---|
+| x (专家输入) rms | 0.126262 | 0.1265（ffn_in ✓ 同输入）|
+| gate rms | 0.304617 | 0.256–0.274（**~13% 偏小** ✗）|
+| up rms | 0.296332 | 0.244–0.270（~13% 偏小 ✗）|
+| swiglu rms | 0.070088 | 0.038–0.096（抖动大，均值接近 ✓）|
+
+→ 差距不在"缺一项"，而在两路共用的环节，且表现为 ~13% 级而不是 1.4x 级，
+   说明 1.4x 主要来自**多个专家的聚合**（`wsum[e]` 的 6 项求和）而非单专家。
+
+**下会话最该做的两件事**：
+1. 打印我的 `wsum[e]` 与官方的 `weights[idx, top]`（同一 token）逐项对比 —— 这是唯一还没直接
+   量过的环节（路由**权重数值**，不是内核结构）。
+2. 参考的 `fp4_gemm_kernel` 注释写明是 **"FP8 act x FP4 weight"**（激活 fp8、权重 fp4），
+   而我 `quant_fp4` 把**激活也量化成 fp4** ✗ —— 数值上更粗（fp4 e2m1 只有 8 个幅值档）。
+   若 1 无异常，改成"激活 fp8 × 权重 fp4"（参考的 `act_block_size` 默认 128，我用 32）。
