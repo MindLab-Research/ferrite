@@ -1312,3 +1312,51 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
    SM 5.2%，84.9% 周期无可发射 warp。**修正 AGENTS.md 早前"占用率固定不值得攻"的错误结论**：
    per-layer hc_pre 24µs 对应的实际访存仅 ~2MB(0.26µs)，即 ~90x 低效，全部来自
    launch(2 个 kernel) + 6 个 __syncthreads + P1/P2a 跨 block 冗余重算 + 0.22 wave 的延迟暴露。
+
+## 2026-09-10 下午会话：hc 链 −0.7ms + down 寄存器教训 + 测量方法论修正
+
+**同会话背靠背 A/B 的最终状态**：旧 down kernel .so（21997c1be）= 13.02ms vs 当前 HEAD = **12.88ms**（B=16 replay p50，n=244/121，faults=0）。本会话净收益 = **hc 链 2.10 → ~1.4ms**。
+
+### 落地的改动（全部同会话验证）
+
+1. **hc_pre_rest345 的 P5 normalize 循环 float4 化**：nsys serve 实测 rest345 12.67 → 7.26µs（阶段二分归因：normalize 3104ns + sinkhorn 2080 + launch 1344 + P1 1312 + election 896 + P3 896 + P4/P2a ~500）。`li/nw` 是 DevBuf 256B 对齐 + t*h 是 16KB 倍数，float4 安全；逐元素 `(li*inv)*nw` 同序，逐位一致。
+2. **hc mix 的 K-split 默认 KS=16 → 4**（`FERRITE_HC_MIX_KS` 旋钮，上限 16=Rust scratch 尺寸）：隔离扫描 16:14176 / 8:13248 / **4:10432** / 2:11808 ns。KS=16 时 fw(1.5MB) 被重读 16 次=24MB/30MB，每线程只有 1 个 float4 迭代却付 5 归约+8 屏障。KS=4 一举三得（fw 流量 16x↓、block 数 4x↓、每线程工作量 4x↑）。**注意 KS 是数值性改动**（部分和求和顺序变），已人眼验证出师表全文。
+3. **MoE down HTILE 模板化**（`FERRITE_DOWN_HTILE` ∈ {8,16,32,64}，默认 8）：`template<int HTILE_K>` 特化，act 每 token 载入寄存器后跨 8 行 chunk 复用，warp 的权重连续读 run ×N。隔离：8:51.6 / 16:51.7 / 32:57.3µs。
+
+### 三个昂贵教训（本会话 ~1.5 小时的学费）
+
+1. **寄存器数即占用率**：down 重写第一版 `<8>` 编译到 **80 regs → 2 blocks/SM**（旧版 ~62 regs → 3 blocks），serve 43.6 → 56.6µs（+0.55ms replay）。`__launch_bounds__(288, 3)` 压回 72 regs/3 blocks 恢复。**改 kernel 结构后必须 `nvcc -Xptxas -v` 看寄存器数**（cuobjdump 不在此工具链，用 ptxas -v + grep kernel 名）。`ar[4]` 声明在外层作用域会把 16 个寄存器拖着穿过 shuffle/part 阶段。
+2. **运行时边界的循环是毒药**：第一版把 htile 作为运行时 kernel 参数传入 → nvcc 无法展开 chunk 循环/外提不变量/fold 除法无法变移位（隔离 +10µs/call）。模板常量解决。
+3. **跨会话绝对数字不可比（最重要）**：同一段代码 45 分钟内 12.65 → 13.02ms（+0.35ms 机器漂移）。**结论必须来自同会话背靠背 A/B**。诊断利器：`git show <commit>:kernels/cuda/ferrite_kernels.cu > /tmp/old_fc.cu` 编译成 /tmp/old_lib.so，serve 用 `--lib /tmp/old_lib.so` 切换——不动主树、同一二进制、同一环境。
+
+### 其他方法论
+
+- **rest345 阶段二分**（FERRITE_HC_STAGE 临时开关，已移除）：8 个切点一次构建免费扫描，比猜快 10 倍。launch+retire 本身 1.34µs——**小 kernel 的固定成本下限，merge 是唯一出路**。
+- **隔离微基准会误导 down**：同一 kernel 隔离 51.6µs vs serve 48.5µs，且 HTILE 的隔离排序（16 最优 −7%）没有转化到 serve（同会话 A/B 反而 8 略优）。隔离基准只用于淘汰明显差的方案，最终判定必须 serve。
+- **nsys capture-range 在本机丢数据**（serve 退出时 drop 权重 SEGFAULT 丢 profiler buffer）→ 用全程 trace + 按名字过滤加载期 kernel（dequant/bf16_to_f32/memcpy）。
+
+### 当前 nsys 分解（B=16 稳态 med，本会话实测）
+
+| kernel | med µs | ×次/步 | ms/步 |
+|---|---|---|---|
+| ncclDevKernel AR RING_LL | 28.99 | 90 | 2.61 |
+| moe_fused_down（修复后 ~48.5） | ~48.5 | 42 | 2.04 |
+| moe_fused_act | 45.0 | 42 | 1.89 |
+| gdn_step_v2 | 17.1 | 34 | 0.58 |
+| hc_pre_rest345（已优化） | **7.26** | 90 | 0.65 |
+| hc mix（KS=4，~4µs） | ~4 | 90 | 0.36 |
+| 其余（hc_post/gdn_chunk/gemv/gemm3/kpool/sparse/…） | | | ~4.4 |
+| host + 图调度间隙 | | | ~0.5 |
+
+### 通往 1600 的最终路径（10.0ms 需再砍 2.88ms）
+
+| # | 项 | 预期 | 状态 |
+|---|---|---|---|
+| 1 | **AR v5**（自推进 per-slot epoch，见下） | −1.5ms | 设计完成，未实施 |
+| 2 | MoE act sector 利用率（38.77% promotion miss） | −0.3ms | 未实施 |
+| 3 | hc sinkhorn → 独立 aux block | −0.18ms | 未实施 |
+| 4 | 小 kernel 合并（norm/cast/quant ~241 次/步） | −0.3ms | 未实施 |
+| 5 | MoE down one-expert-per-block | −0.5ms | 未实施（HTILE 已证明不是正确入口） |
+| | **合计** | −2.78 → 10.1ms ≈ 1585 | 边缘达标 |
+
+**AR v5 设计（第 4 次尝试，前 3 次死锁根因已定位）**：死锁共同根因 = epoch 状态由 dry-run（真实执行）推进、由 capture（只记录）冻结 → 各 rank 计数器漂移。v5 让 **epoch = AR kernel 自身的执行次数**：每个 AR 调用点有独立 `ctr[slot]`，store kernel 的 block0 `atomicAdd(&ctr[slot],1)` 得本次 epoch；publish 写 `stamp[peer][slot]=epoch`；reduce 轮询 `stamp>=my_epoch` 后按 publish 出来的 epoch 选 staging 奇偶位（读者跟写者走）。dry-run 执行→推进、capture 不执行→不推进、replay 执行→推进，任何路径下各 rank 推进次数相同（TP lockstep），不可能漂移。预期 28.99 → ~11µs。
