@@ -64,7 +64,7 @@ impl SpinBarrier {
 }
 
 use std::ffi::c_uint;
-use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtOrd};
 
 use ferrite_types::{FerriteError, Result};
 
@@ -268,6 +268,27 @@ impl Collective {
     /// sum over ranks, written back to `dst` (which may be the same address as
     /// `src`).
     pub fn all_reduce_inplace(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
+        let _t_ar = std::time::Instant::now();
+        let r = self.all_reduce_inplace_inner(buf, len);
+        AR_HOST_NS.fetch_add(_t_ar.elapsed().as_nanos() as u64, AtOrd::Relaxed);
+        AR_CALLS.fetch_add(1, AtOrd::Relaxed);
+        if AR_CALLS.load(AtOrd::Relaxed) % 512 == 0 {
+            let n = AR_CALLS.load(AtOrd::Relaxed);
+            let us = AR_HOST_NS.load(AtOrd::Relaxed) as f64 / 1000.0;
+            eprintln!(
+                "[ar] calls={n} host_total={:.1}ms avg={:.1}us | barriers={} bar_total={:.1}ms avg={:.1}us",
+                us / 1000.0,
+                us / n as f64,
+                AR_BAR_CALLS.load(AtOrd::Relaxed),
+                AR_BAR_NS.load(AtOrd::Relaxed) as f64 / 1e6,
+                AR_BAR_NS.load(AtOrd::Relaxed) as f64 / 1000.0
+                    / (AR_BAR_CALLS.load(AtOrd::Relaxed).max(1)) as f64
+            );
+        }
+        r
+    }
+
+    fn all_reduce_inplace_inner(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
         self.publish(buf as *const std::ffi::c_void, len)?;
         let slot0 = (self.staging.ptr as *mut u8);
         let n = (len / 4) as i64;
@@ -337,9 +358,21 @@ impl Collective {
     /// Release a round (pairs with `publish`, to keep the next round from
     /// overwriting slots another rank is still reading).
     pub fn end_round(&self) {
+        let _t = std::time::Instant::now();
         self.barrier.wait();
+        AR_BAR_NS.fetch_add(_t.elapsed().as_nanos() as u64, AtOrd::Relaxed);
+        AR_BAR_CALLS.fetch_add(1, AtOrd::Relaxed);
     }
 }
+
+/// Process-wide host-time accounting for the collectives. The ranks are threads
+/// of one process, so plain atomics are enough; this exists because the segment
+/// graph experiment proved that launch counts are NOT the host bottleneck, so the
+/// remaining candidate has to be measured rather than assumed.
+pub static AR_HOST_NS: AtomicU64 = AtomicU64::new(0);
+pub static AR_CALLS: AtomicU64 = AtomicU64::new(0);
+pub static AR_BAR_NS: AtomicU64 = AtomicU64::new(0);
+pub static AR_BAR_CALLS: AtomicU64 = AtomicU64::new(0);
 
 /// Shared state a rank thread needs from its siblings.
 pub struct RankLinks {
