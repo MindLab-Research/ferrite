@@ -4880,7 +4880,7 @@ extern "C" cudaError_t ferrite_quant_act_rows(
 // staging stays amortized) but makes each expert read a 32*HT-row CONTIGUOUS
 // run (64KB at HT=8) instead of 8KB. Template constant: a runtime bound
 // stops nvcc unrolling (measured +10us/call on the earlier HTILE attempt).
-template <int HT>
+template <int HT, int NP>
 __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
@@ -4900,7 +4900,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     // smem: aq rows flat at 512B pitch (j<topk rows use 256B), staged weight
     // tile [32 rows][272B] ×2 buffers, warp partials, slot id/prob/scale.
     __shared__ unsigned char saq[(/*TOPK_MAX*/ 8 + 1) * 512];
-    __shared__ unsigned char sW[2][32 * 272];
+    __shared__ unsigned char sW[NP][32 * 272];
     __shared__ float part[8][32];
     __shared__ float ssp[9];   // as_[t,j] × p_j (folded slot scale); 0 = skip
     // ---- stage the token's act rows + slot metadata ----
@@ -4957,14 +4957,21 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     #pragma unroll
     for (int ch = 0; ch < HT; ch++) {
     const int hb = h0 + ch * 32;
-    DM_STAGE(0, 0);
+    // NP-deep cp.async pipeline (FERRITE_DOWN_NP). Evidence: this kernel runs
+    // at ~38% DRAM and gets WORSE with fewer blocks (HT=4/8) => it is
+    // EXPOSED-LATENCY bound on the 9 sequential slot stagings (2-deep hides
+    // one chunk only; ~700ns latency x 9 chunks x 4.6 block-rounds ~= 45us).
+    #pragma unroll
+    for (int p = 0; p < NP - 1; p++) {
+        if (p <= topk) DM_STAGE(p, p % NP);
+    }
     float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;  // m-tile 0/1 × (r0, r0+8)
-    int buf = 0;
-    for (int j = 0; j <= topk; j++, buf ^= 1) {
-        if (j + 1 <= topk) DM_STAGE(j + 1, buf ^ 1);
-        if (j + 1 <= topk) asm volatile("cp.async.wait_group 1;\n");
-        else asm volatile("cp.async.wait_group 0;\n");
+    for (int j = 0; j <= topk; j++) {
+        const int buf = j % NP;
+        if (NP == 4) asm volatile("cp.async.wait_group 2;\n");   // <=2 pending: j done
+        else asm volatile("cp.async.wait_group 1;\n");
         __syncthreads();
+        if (j + (NP - 1) <= topk) DM_STAGE(j + (NP - 1), (j + (NP - 1)) % NP);
         if (ssp[j] == 0.f) continue;
         const int klen = (j < topk) ? inter : inter_shared;
         const float* dsr = (j < topk)
@@ -5380,11 +5387,21 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
         ht = v;
     }
     dim3 grid((unsigned)(hidden / (32 * ht)), (unsigned)n);
-    #define MD_CALL(R) moe_down_e4m3_mma_kernel<R><<<grid, 256, 0, s>>>( \
+    static int np = -1;
+    if (np < 0) {
+        const char* e = getenv("FERRITE_DOWN_NP");
+        np = (e && atoi(e) == 4) ? 4 : 2;
+    }
+    #define MD_CALL(R) ((np == 4) ? moe_down_e4m3_mma_kernel<R, 4><<<grid, 256, 0, s>>>( \
         ids_f, probs, \
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs, \
         (const unsigned char*)shared_down_w8, (const float*)shared_down_scale, \
-        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols)
+        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols) : \
+        moe_down_e4m3_mma_kernel<R, 2><<<grid, 256, 0, s>>>( \
+        ids_f, probs, \
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs, \
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale, \
+        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols))
     switch (ht) {
         case 2: MD_CALL(2); break;
         case 4: MD_CALL(4); break;
