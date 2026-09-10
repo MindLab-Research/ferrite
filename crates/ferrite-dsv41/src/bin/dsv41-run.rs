@@ -316,7 +316,10 @@ fn rank_body(
             }
         }
         let next = best as u32;
-        if rank == 0 && step < 3 {
+        if rank == 0
+            && step < 3
+            && std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false)
+        {
             let mut top: Vec<(usize, f32)> =
                 logits.iter().copied().enumerate().collect::<Vec<_>>();
             top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
