@@ -4874,6 +4874,13 @@ extern "C" cudaError_t ferrite_quant_act_rows(
 // row stride (17×16B) makes the ldmatrix bank-conflict-free; double-buffered
 // cp.async pipelines the next slot's weight tile.
 // ============================================================
+// HT = h-chunks of 32 rows per block (FERRITE_DOWN_HT, default 1). This
+// kernel runs at ~38% DRAM (45us) while act (ONE expert, 128KB contiguous
+// per block) reaches 71%. HT>1 keeps all 9 slots in the block (the act-row
+// staging stays amortized) but makes each expert read a 32*HT-row CONTIGUOUS
+// run (64KB at HT=8) instead of 8KB. Template constant: a runtime bound
+// stops nvcc unrolling (measured +10us/call on the earlier HTILE attempt).
+template <int HT>
 __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
@@ -4886,7 +4893,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     float* __restrict__ out,                // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int dscols) {
-    const int h0 = blockIdx.x * 32;
+    const int h0 = blockIdx.x * 32 * HT;
     const int t = blockIdx.y;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int stride = topk * inter + inter_shared;
@@ -4939,7 +4946,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
             /* 32 rows × klen bytes in 16B chunks; row stride 272 */ \
             for (int c = threadIdx.x; c < 32 * (klen_ >> 4); c += 256) { \
                 const int r = c / (klen_ >> 4), cc = (c % (klen_ >> 4)) * 16; \
-                const unsigned char* src_ = wbase + (size_t)(h0 + r) * klen_ + cc; \
+                const unsigned char* src_ = wbase + (size_t)(hb + r) * klen_ + cc; \
                 unsigned char* dst_ = sW[BUF] + r * 272 + cc; \
                 const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
                 asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
@@ -4947,6 +4954,9 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
         } \
         asm volatile("cp.async.commit_group;\n"); \
     } while (0)
+    #pragma unroll
+    for (int ch = 0; ch < HT; ch++) {
+    const int hb = h0 + ch * 32;
     DM_STAGE(0, 0);
     float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;  // m-tile 0/1 × (r0, r0+8)
     int buf = 0;
@@ -4960,7 +4970,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
         const float* dsr = (j < topk)
             ? down_scale_ptrs[(int)ids_f[(size_t)t * topk + j] - expert_start]
             : shared_down_scale;
-        const int srow = h0 >> 7;
+        const int srow = hb >> 7;
         // per-warp k32 chunks: klen/32 chunks over 8 warps (klen=256 → 1 each, 512 → 2)
         for (int kc = warp; kc < (klen >> 5); kc += 8) {
             const float wsc = dsr[(size_t)srow * dscols + ((kc << 5) >> 7)] * ssp[j];
@@ -5006,9 +5016,11 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
             float s = 0.f;
             #pragma unroll
             for (int w = 0; w < 8; w++) s += part[w][r];
-            out[(size_t)t * hidden + h0 + r] = s;
+            out[(size_t)t * hidden + hb + r] = s;
         }
     }
+    __syncthreads();   // part[]/sW are reused by the next chunk
+    }  // end chunk loop (HT)
 }
 
 // ============================================================
@@ -5359,12 +5371,27 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
     // the smem tile rows are 272B (256 data + 16 pad): klen must fit. GLM:
     // inter = inter_shared = moe_inter/tp = 256.
     if (inter > 256 || inter_shared > 256 || topk > 8) return cudaErrorNotSupported;
-    dim3 grid((unsigned)(hidden / 32), (unsigned)n);
-    moe_down_e4m3_mma_kernel<<<grid, 256, 0, s>>>(
-        ids_f, probs,
-        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
-        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
-        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+    static int ht = -1;
+    if (ht < 0) {
+        const char* e = getenv("FERRITE_DOWN_HT");
+        int v = e ? atoi(e) : 1;
+        if (v != 1 && v != 2 && v != 4 && v != 8) v = 1;
+        while (v > 1 && (hidden % (32 * v))) v >>= 1;
+        ht = v;
+    }
+    dim3 grid((unsigned)(hidden / (32 * ht)), (unsigned)n);
+    #define MD_CALL(R) moe_down_e4m3_mma_kernel<R><<<grid, 256, 0, s>>>( \
+        ids_f, probs, \
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs, \
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale, \
+        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols)
+    switch (ht) {
+        case 2: MD_CALL(2); break;
+        case 4: MD_CALL(4); break;
+        case 8: MD_CALL(8); break;
+        default: MD_CALL(1); break;
+    }
+    #undef MD_CALL
     return cudaGetLastError();
 }
 
