@@ -1499,3 +1499,23 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **down 的三个已失败理论**：① HTILE（act 重读/局部性）② one-expert 局部性（未实施，被 ③ 取代）③ cp.async 延迟隐藏。**剩余唯一假设：act 对比本身有误导**——act 的 71.9% 可能来自其更高的绝对流量（246MB vs down 132MB，绝对带宽 5.5 vs 2.6TB/s），而 down 的真实约束仍未定位（指令 ~8µs / DRAM 地板 ~22µs / L1 wavefront ~4µs / 实测 50µs——全都不匹配）。**down 优化正式暂停**，除非拿到当前 kernel 的新 ncu 数据（HTILE=8 时代的数据已过时三次）。
 
 **注意**：本轮三轮 serve 均读 11.15-11.17ms（1.5h 前同配置 10.94）——热漂移 +0.21ms。跨时间绝对数字不可比（第三次确认）；目标评估应以同批 A/B 为准。
+
+## 2026-09-10 深夜③：投影族收官 + 小 kernel ROI 封顶 — 增量路径在 ~1480 处耗尽
+
+**投影族最终战果**（per-group-x gemm3 扩展）：
+| 项 | 结果 |
+|---|---|
+| GDN {f_b, g_b} 融合 | **−0.09ms**（三轮 A/B：fused 11.04 vs pre 11.10/11.16，出师表✓）|
+| DSA {q_a,kv_a} + {q_b,wq_b} 融合 | 中性（11.10 vs 11.09/11.12，11 层太小）；保留（gemm2_fused helper 可复用）|
+| **kper 地雷修复** | gemm3 在 in_f<128 时 kper 向下取整为 0 → **静默全零输出**；launcher 现返回 NotSupported（无现有调用踩中，kvb 本会踩中）|
+| qkv/o_proj 路由 gemm3 | **排除**：gemm3 实测带宽仅 ~0.6TB/s（DSA trio 3.7MB/11.6µs）——它赢在杀固定成本而非 GEMM 效率；qkv 的 25MB 权重在 gemm3 下 ~40µs vs cuBLAS 9.2µs（4x 差）|
+
+**小 kernel 桶的 ROI 封顶**（逐项算账）：
+- quant_e4m3（54/步）：xq_cached 已按 (ptr,gen) 缓存（54 次 = 54 个不同 x）；融合到 rest345 P5 双输出需跨块 absmax（is_last 机制），净 −0.04ms（省 0.08 cast + 付 0.036 双写）
+- f32_to_bf16（剩余 ~140/步：qkv 34 + o_proj 45 + kvb 11 + dense 3）：产出方双输出，每处 −0.05ms 级
+- norm 族（rmsnorm/gated 62/步）：qa_ln/kv_ln 融进 gemm3 staging 只省 elementwise 部分归约仍在，~−0.03ms
+- **整桶合计 −0.15~0.25ms → 终点 ~10.85-10.95ms ≈ 1465-1480 tok/s**
+
+**增量路径正式封顶**：当前 11.10ms（机器热态；早间冷态 10.94）= 1440 tok/s。全部剩余增量项（小 kernel 0.2 + cast 0.1 + cublasLt 不确定 0~0.3）落地后 ~10.6-10.9ms ≈ 1470-1510。**1600（10.0ms）只余段融合一条路**（用户提议，设计见 3ccd46f：边界开销 −0.8~1.1ms，TP=8 下 AR 是硬边界 → 每层 3 个段融合核，1-2 周）。
+
+**本冲刺累计**：13.45 → 11.10ms（+21%），AR v5 −1.9ms 是最大单项；运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。
