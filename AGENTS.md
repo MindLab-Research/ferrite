@@ -1287,3 +1287,28 @@ capture 之间扰动共享池状态。
    （它本来就崩），没测 TP=8 基线。**先确认基线没坏再继续调试**。
 3. **调试代码必须立即清理**——bf5ddef 声称 "remove" 但只删了 list 版本，保留了初始版本。
    今后所有调试代码加 `// TODO: REMOVE` 标记并在同一会话内删除。
+
+## 2026-09-10 ncu 隔离微基准（/tmp/ncu_kern.cu → libferrite_kernels.so，生产 shape 真实 launcher）
+
+**方法**：`/tmp/ncu_kern.cu` 链接生产 `.so`，用生产 shape（N=16,HID=4096,INTER=256,INTER_SH=256,
+TOPK=8,ELOCAL=288,DSCOLS=2 / hc S=16,HC=4,MIX=24 / gdn B=16,h=64,dk=dv=128）调真实 launcher，
+warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --launch-count 1`。
+
+| kernel | nsys med | ncu dur | DRAM% | L1/TEX% | SM% | warps/sched | ncu 判定 |
+|---|---|---|---|---|---|---|---|
+| moe_act (14.3%) | 45.3µs | 49.8 | **71.9** | 51.0 | 55.7 | 7.33 (46%) | **DRAM 带宽受限（真实地板）** |
+| moe_down (13.8%) | 43.8µs | 48.2 | **37.6** | **67.6** | 57.6 | 8.26 (52%) | 算/存均衡；**L1TEX 记分板停顿 40.6%** |
+| hc_mix (5.3%) | 7.7µs | 10.9 | 3.1 | 33.8 | 29.6 | 8.50 (53%) | **纯延迟受限** |
+| hc_rest345 (8.7%) | 12.7µs | 15.1 | **1.0** | 9.5 | **5.2** | **3.36 (21%)** | **grid 太小＝0.22 wave！84.9% 周期无 eligible warp** |
+
+**结论**：nsys 分解可信（ncu 仅 +10~40% 开销，小 kernel 相对更高）。三个 kernel 三种不同性质：
+1. **act = 真 DRAM 带宽受限（71.9%）** → 只剩"减流量"杠杆（B=16 下 128 assignments/~104 unique
+   experts 的 23% 重复，L2 Hit 40% 已吸收一部分）；旁证 **L2 Sector Promotion Misses 38.77%**
+   → 32B sector 未用满，可继续榨。
+2. **down = 非带宽受限（37.6%）**，瓶颈是 **L1/TEX 数据路径（67.6%）+ L1TEX 记分板停顿（40.6%）**。
+   block=288 线程(9 warps)=9 个 slot=9 个不同 expert → 每块从 9 个 1MB 矩阵各取 8×256 片段
+   → DRAM 页局部性差。**有 ~1.8x 结构性余量。**
+3. **hc 链 = 严重欠并行**：rest345 grid (16,16)=256 blk × 256 thr = 65536 线程 = **0.22 wave**，
+   SM 5.2%，84.9% 周期无可发射 warp。**修正 AGENTS.md 早前"占用率固定不值得攻"的错误结论**：
+   per-layer hc_pre 24µs 对应的实际访存仅 ~2MB(0.26µs)，即 ~90x 低效，全部来自
+   launch(2 个 kernel) + 6 个 __syncthreads + P1/P2a 跨 block 冗余重算 + 0.22 wave 的延迟暴露。
