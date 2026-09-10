@@ -124,6 +124,7 @@ struct Kernels {
         *const f32, *const u8, *const u8, *const f32, *mut f32, *mut i32, *mut i32,
         c_int, c_int, c_int, c_int, f32, c_int, f32, c_int, CuStream,
     ) -> c_int,
+    add_inplace: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, CuStream) -> c_int>,
     window_append: Option<unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int>,
@@ -212,6 +213,7 @@ impl DevBuf {
 
 const CUDA_MEMCPY_H2D: c_int = 1;
 const CUDA_MEMCPY_D2H: c_int = 2;
+const CUDA_MEMCPY_D2D: c_int = 3;
 
 impl Device {
     /// `kernel_so` is the path to `libferrite_kernels.so` (the dsv41 kernels
@@ -281,6 +283,7 @@ impl Device {
                 apply_rope: f!(h_k, "dsv41_apply_rope"),
                 hc_mixes: f!(h_k, "dsv41_hc_mixes"),
                 moe_route: f!(h_k, "dsv41_moe_route"),
+                add_inplace: sym(h_k, "ferrite_add_inplace").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 window_append: sym(h_k, "dsv41_window_append").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 rmsnorm: f!(h_k, "ferrite_rmsnorm"),
                 hc_pre: f!(h_k, "ferrite_hc_pre"),
@@ -408,6 +411,21 @@ impl Device {
             (self.cudart.memcpy)(out.as_mut_ptr() as *mut c_void, src.ptr, out.len(), CUDA_MEMCPY_D2H)
         };
         check_cudart(st, &self.cudart, "cudaMemcpy D2H (bytes)")
+    }
+
+    /// Device-to-device copy (small row moves: the KV ring append).
+    pub fn memcpy_d2d(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+        let st = unsafe { (self.cudart.memcpy)(dst, src, bytes, CUDA_MEMCPY_D2D) };
+        check_cudart(st, &self.cudart, "cudaMemcpy D2D")
+    }
+
+    /// `dst += src` elementwise over `n` f32.
+    pub fn add_inplace(&self, dst: &DevBuf, src: &DevBuf, n: i64) -> Result<()> {
+        let f = self.need(self.kernels.add_inplace, "ferrite_add_inplace")?;
+        let rc = unsafe {
+            f(dst.ptr as *const f32, src.ptr as *const f32, dst.ptr as *mut f32, n as c_int, self.stream)
+        };
+        self.kerr(rc, "ferrite_add_inplace")
     }
 
     pub fn zero(&self, b: &DevBuf) -> Result<()> {
