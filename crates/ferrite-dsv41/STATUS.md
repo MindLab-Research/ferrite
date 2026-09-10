@@ -1633,3 +1633,31 @@ cargo test --release -p ferrite-dsv41 --test ar_micro -- --nocapture
 2. 检查 store 内核里 `parity_off` 的单位 ✓（我按 float 传的 `parity_off/4` ✓，而 `peer_slots[p]`
    是 u64 基址 ✓、`slot_f` 是 float 单位 ✓ —— 这一处**值得在 harness 里用 N=4 的小尺寸直接验证** ✓）；
 3. 检查 `ar_stamp` 在 bisect 版里的调用时机 ✓（我已把它移到 barrier 之前 ✓）。
+
+### ★★ staging 原始 dump 的决定性证据：**store 全对，问题在 reduce**
+
+`AR_MICRO_DUMP=1 AR_MICRO_N=8 AR_MICRO_WORLD=2` 下直接读 staging（不再是推理 ✓）：
+
+```
+round 0 half 1: slot0[0..4]=[0,0,0,0]        slot1[0..4]=[1000,1000,1000,1000]
+round 1 half 1: slot0[0..4]=[1,1,1,1]        slot1[0..4]=[1001,1001,1001,1001]
+（half 0 始终全 0 = 还未被使用 ✓）
+```
+
+逐条对账（world=2, n=8）：
+- round 0：parity = 1%2 = **1** ✓ → 写 half 1 ✓ **对** ✓；slot0 = rank0 的值 = `0 + 0*1000 = 0` ✓ **对** ✓；
+  slot1 = rank1 的值 = `0 + 1*1000 = 1000` ✓ **对** ✓；
+- round 1：parity = 0 ✓ → hmm **这里写了 half 1** ✗ —— 说明 parity 与我预期相反 ✓，
+  但 **round 0→1 都落在同一个 half 1** ✓ ⇒ **两轮的 parity 相同** ✗✓ ——
+  即 `round % 2` 在两轮里取了同一个值 ✓ ⇒ **`self.round` 的自增没生效**（或 reduce/publish 读的不是同一个值）✗。
+
+⇒ **两个结论**：
+1. **`ar_store` 的半区/slot/地址计算完全正确** ✓✓（这一大块可以排除 ✗）；
+2. **parity 来源有问题** ✗：连续两轮落到同一半区 ✓ ⇒ **`round` 没推进** ✗ 或
+   **store 用的 parity 与 reduce 用的不一致** ✗（`AR_MICRO_ROUNDS=2` 时 round 应为 1、2 ✓ ⇒
+   parity 应为 1、0 ✓ ⇒ 应分别落 half 1 与 half 0 ✓，而实测都落 half 1 ✗）。
+
+**下会话第一步（6 秒）**：在 `publish` 与 `all_reduce_inplace` 两处各打印 `round` 与
+`round % 2` ✓，确认 `self.round` 是否真的在推进 ✓（注意 `fetch_add` 在 publish 里 ✓、
+`load` 在 reduce 里 ✓ —— 若 reduce 在 publish **之前**被调用（例如某条路径先归约 ✓），
+就会读到上一轮的值 ✓）。
