@@ -287,8 +287,10 @@ impl Collective {
             if dev_side { 1 } else { 0 },
         )?;
         self.dev
-            .memcpy_d2d(buf, slot0 as *const std::ffi::c_void, len)?;
-        self.barrier.wait();
+            .memcpy_d2d(buf, base as *const std::ffi::c_void, len)?;
+        if !dev_side {
+            self.barrier.wait();
+        }
         Ok(())
     }
 
