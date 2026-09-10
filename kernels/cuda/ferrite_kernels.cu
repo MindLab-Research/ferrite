@@ -7290,6 +7290,129 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot_v2(
     return cudaGetLastError();
 }
 
+// ============================================================
+// P2P one-shot AR v5 (2026-09-10): capture-safe BY CONSTRUCTION.
+// v2/v3 desynced at the dry-run→capture boundary: the dry-run EXECUTES the
+// protocol (advancing each rank's epoch) while capture only records, and the
+// ranks' dry-runs are not synchronized ("dev0 at dry-run L0, peers at L35";
+// the post-dry-run epoch reset did NOT fix it). v5 removes the desync SOURCE
+// instead of patching the state: the Rust dispatcher only launches v5 when
+// the stream IS CAPTURING — the dry-run and all host paths fall back to
+// NCCL — so the epoch counter is advanced EXCLUSIVELY by replayed graph
+// nodes, and replays are globally lockstep (TP decode cannot run ahead of
+// the peers' all-reduces). Every rank therefore holds the same counter at
+// every point in time, with no arrival counters and no per-block seen[].
+//   store   : e = *epoch (runtime read); partial → every peer's
+//             staging[e & 1] (coalesced float4 — same layout as v3)
+//   publish : stamp peers' ready = e+1 (system-scope), poll every peer's
+//             stamp ≥ e+1, then advance *epoch = e+1
+//   reduce  : sum my staging[e & 1] over the world, ascending rank order
+//             (the same order NCCL's ring produces — 1-ulp consistent)
+// Parity double-buffering is exactly sufficient: any rank's store(k+2) is
+// preceded cross-rank by every rank's reduce(k) — publish(k+1) waits for all
+// peers' k+1 stamps, which requires their store(k+1), which (stream order)
+// follows their reduce(k).
+// ============================================================
+__global__ void p2p_ar_store_v5_kernel(
+    const float* __restrict__ partial,
+    float* const* __restrict__ staging_tbl,  // [world] peers' staging bases
+    const unsigned* __restrict__ epoch,      // this rank's round counter
+    int world, int my_rank, int n, int stride) {
+    const unsigned e = *epoch;
+    const int step = gridDim.x * blockDim.x;
+    const int n4 = n >> 2;
+    const float4* p4 = reinterpret_cast<const float4*>(partial);
+    for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
+        const float4 v = p4[i4];
+        const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (size_t)i4 * 4;
+        #pragma unroll 4
+        for (int rr = 0; rr < world; rr++)
+            *reinterpret_cast<float4*>(staging_tbl[rr] + base) = v;
+    }
+    for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
+        const float v = partial[ii];
+        const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
+        for (int rr = 0; rr < world; rr++) staging_tbl[rr][base] = v;
+    }
+}
+
+__global__ void p2p_ar_publish_v5_kernel(
+    unsigned* const* __restrict__ ready_tbl,  // [world] peers' flag rows
+    unsigned* __restrict__ epoch,
+    const unsigned* __restrict__ ready_local, // my [world] flag row
+    int world, int my_rank) {
+    const unsigned e = *epoch;
+    if (threadIdx.x == 0) {
+        for (int r = 0; r < world; r++)
+            atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+        __threadfence_system();
+        *epoch = e + 1u;   // AFTER stamping: the next round's store reads e+1
+    }
+    __syncthreads();
+    if (threadIdx.x < (unsigned)world) {
+        const int tr = (int)threadIdx.x;
+        unsigned cur = *(volatile unsigned*)&ready_local[tr];
+        long spins = 0;
+        while ((int)(cur - (e + 1u)) < 0) {
+            __nanosleep(100);
+            cur = *(volatile unsigned*)&ready_local[tr];
+            if (++spins > 5000000) { // ~0.5s: diagnose; the watchdog kills
+                printf("[ar5-hang] rank=%d peer=%d need=%u cur=%u\n",
+                       my_rank, tr, e + 1u, cur);
+                break;
+            }
+        }
+    }
+}
+
+__global__ void p2p_ar_reduce_v5_kernel(
+    const float* __restrict__ staging_local,  // my [2][world][stride]
+    float* __restrict__ out,
+    const unsigned* __restrict__ epoch,       // = e+1 after publish
+    int world, int n, int stride) {
+    const unsigned e = *epoch - 1u;           // the round just completed
+    const int step = gridDim.x * blockDim.x;
+    const int n4 = n >> 2;
+    for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
+        float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (int r = 0; r < world; r++) {
+            const float4 v = *reinterpret_cast<const float4*>(
+                staging_local + (size_t)((e & 1u) * world + r) * stride + (size_t)i4 * 4);
+            acc.x += v.x; acc.y += v.y; acc.z += v.z; acc.w += v.w;
+        }
+        *reinterpret_cast<float4*>(out + (size_t)i4 * 4) = acc;
+    }
+    for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
+        float acc = 0.f;
+        for (int r = 0; r < world; r++)
+            acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
+        out[ii] = acc;
+    }
+}
+
+extern "C" cudaError_t ferrite_p2p_ar_v5(
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    const int threads = 1024;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    // The store kernel's completion makes its staging writes peer-visible
+    // (kernel boundary), so publish needs no fence against the store.
+    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    p2p_ar_publish_v5_kernel<<<1, 32, 0, s>>>(
+        ready_tbl, epoch, ready_local, world, my_rank);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    p2p_ar_reduce_v5_kernel<<<blocks, threads, 0, s>>>(
+        staging_local, out, epoch, world, n, stride);
+    return cudaGetLastError();
+}
+
 
 // ============================================================
 // Knife 1b: qkv GEMV + conv FIR/silu/window-slide epilogue (decode n==1).

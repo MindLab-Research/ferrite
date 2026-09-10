@@ -907,12 +907,22 @@ impl<B: KernelBackend> TpCluster<B> {
         // (unmapped 2MB pages), progressively worse (b16 → b4 → b1 all dead).
         // Fail loudly here instead of silently deadlocking + wedging the node.
         if std::env::var_os("FERRITE_P2P").is_some() {
-            if std::env::var_os("FERRITE_P2P_FORCE").is_some() {
-                eprintln!(
-                    "[p2p] ⚠️  FERRITE_P2P_FORCE=1: batched P2P all-reduce ENABLED — the in-graph \
-                     P2P AR is documented to deadlock at n>8 and a kill afterwards wedges the GPU \
-                     driver. Diagnostic use only."
-                );
+            let ar5 = std::env::var_os("FERRITE_P2P_AR5").is_some();
+            if ar5 || std::env::var_os("FERRITE_P2P_FORCE").is_some() {
+                if ar5 {
+                    eprintln!(
+                        "[p2p] FERRITE_P2P_AR5=1: v5 capture-safe protocol ENABLED — the \
+                         dry-run/host paths use NCCL and only replayed (lockstep) graph nodes \
+                         advance the epoch, so the v2/v3 dry-run/capture desync cannot occur. \
+                         First run still requires the 30s-stall watchdog + exact-PID kill."
+                    );
+                } else {
+                    eprintln!(
+                        "[p2p] ⚠️  FERRITE_P2P_FORCE=1: batched P2P all-reduce ENABLED — the in-graph \
+                         P2P AR is documented to deadlock at n>8 and a kill afterwards wedges the GPU \
+                         driver. Diagnostic use only."
+                    );
+                }
             } else {
                 return Err(FerriteError::InvalidArg(
                     "FERRITE_P2P is FORBIDDEN on the batched decode path: the in-graph \

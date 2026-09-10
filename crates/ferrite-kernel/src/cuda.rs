@@ -248,6 +248,15 @@ extern "C" {
                                out: *mut f32, n: i32, world: i32, my_rank: i32,
                                stride: i32,
                                s: CuStream) -> i32;
+    fn ferrite_p2p_ar_v5(partial: *const f32,
+                         staging_tbl: *const *mut f32,
+                         ready_tbl: *const *mut u32,
+                         epoch: *mut u32,
+                         staging_local: *const f32,
+                         ready_local: *const u32,
+                         out: *mut f32, n: i32, world: i32, my_rank: i32,
+                         stride: i32,
+                         s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
     fn ferrite_graph_instantiate(e: *mut *mut std::ffi::c_void, g: *mut std::ffi::c_void) -> i32;
@@ -6161,6 +6170,39 @@ impl CudaBackend {
         };
         if n > st.max_n || st.staging_tbl.is_null() {
             return Ok(false);
+        }
+        // v5 (FERRITE_P2P_AR5=1): the capture-safe protocol. It runs ONLY
+        // while the stream is capturing — the dry-run and every host path
+        // return false here and the caller falls back to NCCL. That is the
+        // entire safety argument: the epoch counter below is advanced
+        // EXCLUSIVELY by replayed graph nodes, and replays are globally
+        // lockstep (TP decode cannot run ahead of the peers' all-reduces),
+        // so the counters cannot desync across the dry-run/capture boundary
+        // — the failure mode that killed v2/v3 ("epoch reset after dry-run
+        // did NOT fix", dev0 at dry-run L0 vs peers at L35).
+        static AR5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AR5.get_or_init(|| std::env::var("FERRITE_P2P_AR5").map(|v| v == "1").unwrap_or(false)) {
+            if !is_capturing() {
+                return Ok(false); // dry-run / host path → NCCL
+            }
+            self.enter();
+            ck(unsafe {
+                ferrite_p2p_ar_v5(
+                    buf.as_const_f32(),
+                    st.staging_tbl as *const *mut f32,
+                    st.ready_tbl as *const *mut u32,
+                    st.epoch as *mut u32,
+                    st.staging_local as *const f32,
+                    st.ready_local as *const u32,
+                    buf.as_f32(),
+                    n as i32,
+                    st.world as i32,
+                    self.dev as i32,
+                    st.max_n as i32,
+                    self.stream,
+                )
+            }, "p2p_ar_v5")?;
+            return Ok(true);
         }
         self.enter();
         // Zero the "all blocks arrived" counter BEFORE the launch. It is
