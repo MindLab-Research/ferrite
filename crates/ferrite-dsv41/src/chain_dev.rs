@@ -145,6 +145,13 @@ pub struct DevChain<'a> {
     cos_comp: DevBuf,
     sin_comp: DevBuf,
     // ---- engram ----
+    /// Per-layer MoE-segment graphs (only with DSV41_GRAPH_MOE=1). The segment is
+    /// everything up to the all-reduce; the AR stays host-issued.
+    moe_graph: Vec<Option<*mut std::ffi::c_void>>,
+    /// Armed from the second step on, once every kernel is warm.
+    moe_graph_armed: bool,
+    /// How many steps this chain has run (the first one warms the kernels).
+    step_count: u32,
     /// n-gram hash state (host side; the token cache spans prefill + decode)
     ngram: Option<crate::engram::NgramHashState>,
     eng_layout: Option<crate::engram::EngramLayout>,
@@ -307,6 +314,9 @@ impl<'a> DevChain<'a> {
             sin,
             cos_comp,
             sin_comp,
+            moe_graph: vec![None; cfg.n_layers],
+            moe_graph_armed: false,
+            step_count: 0,
             ngram,
             eng_layout,
             eng_map,
@@ -461,6 +471,19 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// The MoE's all-reduce, issued OUTSIDE any captured segment: a CUDA graph
+    /// cannot contain the host barrier that this path still uses, so the segment
+    /// boundary sits exactly here.
+    fn moe_reduce(&mut self) -> Result<()> {
+        let dim = self.cfg.dim;
+        // routed experts are expert-parallel, so each rank holds a partial sum
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            c.end_round();
+        }
+        Ok(())
+    }
+
     /// One decode step. Returns the logits for the fed token.
     pub fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>> {
         let cfg = self.cfg;
@@ -517,6 +540,13 @@ impl<'a> DevChain<'a> {
                 }
             }
         }
+        // Arm the MoE-segment graphs from the second step: the first one warms
+        // every kernel, and only then is capture safe.
+        self.moe_graph_armed = std::env::var("DSV41_GRAPH_MOE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+            && self.step_count >= 1;
+        self.step_count = self.step_count.wrapping_add(1);
         let t_step = std::time::Instant::now();
         let mut t_attn = std::time::Duration::ZERO;
         let mut t_moe = std::time::Duration::ZERO;
@@ -738,7 +768,24 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         let _t_moeonly = std::time::Instant::now();
-        self.moe(layer, ld)?;
+        // DSV41_GRAPH_MOE=1 captures the host-free part of the MoE (everything up
+        // to the all-reduce) into one per-layer graph. The first step warms every
+        // kernel; the capture happens on the next one, then it replays.
+        if self.moe_graph_armed {
+            if let Some(e) = self.moe_graph.get(layer).and_then(|x| *x) {
+                self.dev.graph_launch(e)?;
+            } else {
+                self.dev.capture_begin()?;
+                self.moe(layer, ld)?;
+                let g = self.dev.capture_end()?;
+                let e = self.dev.graph_instantiate(g)?;
+                self.dev.graph_free(g, std::ptr::null_mut())?;
+                self.moe_graph[layer] = Some(e);
+            }
+        } else {
+            self.moe(layer, ld)?;
+        }
+        self.moe_reduce()?;
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
@@ -1540,22 +1587,6 @@ impl<'a> DevChain<'a> {
                     inter as i32,
                 )?;
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
-            }
-        }
-        // routed experts are expert-parallel, so each rank holds a partial sum
-        if let Some(c) = self.comm.clone() {
-            if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
-                let pre = self.dl(self.s.o.as_f32(), dim)?;
-                let r = (pre.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
-                eprintln!("[mine] rank{} pre-AR routed_sum_rms={} (routed+shared)", c.rank, r);
-            }
-            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
-            c.end_round();
-            if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
-                let post = self.dl(self.s.o.as_f32(), dim)?;
-                let r = (post.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
-                eprintln!("[mine] rank{} post-AR routed_sum_rms={} ratio={}", c.rank, r,
-                    r / (self.dl(self.s.ex_out.as_f32(), 1)?[0].abs() + 1e-30));
             }
         }
         // the block output is the attention-branch accumulator `o`
