@@ -1618,3 +1618,30 @@ TP=4/B=8 图化模式（GPU 0-3，race 修复 9edc30b 之后首次复测）：se
 2. hc big-fuse 单 kernel（−0.5~0.7ms）
 3. fp8 KV 格式修复（−0.15~0.25ms）
 （可选）TP4 池 miss 定位 → 解锁 2组方案
+
+## ✅ 2026-09-10 上午：W8A8 down 默认启用 + fp8 KV 完整迁移（用户判断正确）
+
+**用户指令**："实现fp8a8和fp8 kv吧，之前的实现其实不一定真有bug，似乎是当时的agent测试方法有问题" —— 完全正确。
+
+**W8A8 down（FERRITE_DOWN_MMA 默认 ON，ad0283f）**：
+| 配置 | replay p50 | 文本 |
+|---|---|---|
+| simt v16 | 11.03ms | ✓ |
+| **mma1（e4m3 MMA）** | **10.74ms（−0.29ms）** | **✓ 最干净（直接背诵无思考前言）** |
+| mma2 | 10.81ms | ✓ |
+
+之前的"e4m3 翻转"是**测试方法 artifact**（.so 不同步），非数值 bug。`quant_act_rows` 的 per-(token,slot) row scale（256 元素）足够精细——失败的 W8A8 是 X 路径整行 absmax（4096 元素），完全不同的量化。
+
+**fp8 KV e4m3（3aadd95）**：完整的 6 kernel 迁移（2 写 + 4 读 + host 路径 quant_kv 辅助 kernel）。
+- 数值安全：req0/req1 连贯思考 + 背诵，faults=0
+- 性能中性：10.76ms vs 10.74（300-token 短上下文下 DSA K/V 流量占比小）
+- **2.1x KV 容量红利**（f32 4B → e4m3 1B per element + per-(t,h) scale）
+- 长上下文（DSA decay，1600+ tokens）时带宽收益会更明显
+- 之前的格式分歧 bug（root cause #4）彻底修复：**两条写入路径 + 全部四个读取路径一次性迁移**，一个缓存一个格式
+
+**当前合计：13.45 → 10.76ms（+25%），~1486 tok/s**。
+
+**下一步（SGLang 调研结论，按价值排序）**：
+1. hc big-fuse 单 kernel（−0.5~0.7ms，SGLang 的 mhc_pre_big_fuse_tilelang 模式：GEMV+sqrsum+sigmoid+sinkhorn+归一化全在一个 kernel，寄存器驻留）
+2. down one-expert-per-block（理论余量 1.31ms，但 HTILE/占用率/cp.async 三理论已失败，需要新思路）
+3. cublasLt 迁移逼退 splitK（−0.2~0.3ms，需 API 重构）
