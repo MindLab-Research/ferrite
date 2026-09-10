@@ -1566,3 +1566,17 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **1600 可达性最终判定**：剩余全部项（小 kernel 0.2 + cublasLt 0~0.3 + 段融合流水化 0.3~0.5）= −0.5~1.0ms → **10.0-10.5ms ≈ 1520-1600 tok/s**。1600 在剩余路径的最乐观端——需要段融合的相位级流水化兑现全部预期 + cublasLt 付费 + 小 kernel 全落地。**三大 kernel（down/act/AR）已无任何单点 >0.2ms 的优化空间。**
 
 **本会话最终成果**：13.45 → **10.96ms（+22.7%），1190 → 1460 tok/s**。运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。HEAD `3d9d543`。
+
+## 2026-09-10 终局②：v16c 定论 + cublasLt 混合类型探针关闭
+
+**v16c（per-device carve-out 修复后）**：v15c 11.10 / v16c 11.06 / v16c2 11.09 —— **仍中性**。用户的 bug 质疑（"真的不是改错代码位置了吗"）是对的：第一版 carve-out 只对 1/8 设备生效（cudaFuncSetAttribute 是 per-context 的，static guard 让它只设了一次）。修复后测试有效，**占用率理论正式死亡——down 是 L1TEX 管道吞吐地板（71%），更多 warms 不帮已饱和的管道**。教训：**多 GPU 进程里的 cudaFuncSetAttribute 必须循环所有设备**（本会话第五个 per-device/per-context 类陷阱）。
+
+**cublasLt 混合类型探针**：f32 A × bf16 B → heuristic 返回 status=7（NOT_SUPPORTED）——**A/B 类型必须一致，cast 消除这条路关闭**。splitK 过滤仍可做但预期 −0~0.2ms（CUBLAS_WORKSPACE_CONFIG 实验 11.03 vs 10.94 已暗示非 splitK 不快）。
+
+**终账（10.96ms / 1460 tok/s，非融合架构极限附近）**：
+- down 2.04（L1TEX 地板）+ act 1.89（DRAM 71% 流量不可减）+ AR 0.60（NVLink 地板）= **4.53ms 三大地板**
+- hc 1.30 + 投影 1.85 + GDN 0.71 + 小 kernel 0.70 + sparse/kpool/route 0.78 + 间隙/host 1.1 ≈ 6.44ms
+- **剩余可砍：小 kernel 0.15~0.25 + cublasLt 0~0.2 + 段融合流水化 0.3~0.5 = −0.45~0.95ms → 10.0~10.5ms ≈ 1520~1600**
+- 1600 在最乐观端；需要段融合的细粒度跨块流水化兑现全部预期
+
+**会话总成果（AR v5 突破 + 全链优化）**：13.45 → **11.06ms（+21.6%），1190 → 1446 tok/s**。运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。HEAD `c7e4393`。
