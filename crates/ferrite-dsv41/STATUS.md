@@ -674,3 +674,29 @@ w2/swiglu/权重做 numpy 复算"对比 —— 分三步各打印一次 rms：
 ① down 之前的 swiglu 向量；② down 之后的单专家向量；③ 累加 6 个之后的向量。
 官方的对应量：单专家 routed 贡献可由 `routed_only/√6` 估 ≈ 0.041，6 个和 = 0.100171。
 我的累加结果 0.0560 —— 看是"单个专家就小"还是"累加漏了专家"。
+
+### ★★★ 最终定位：`expert_down_fp4` 这一支的输出小了好几倍
+
+在同一专家（128，权重 `w=0.28547648` 与官方逐一吻合 ✓）上插桩（探针在 `add_inplace` **之前**读累加器）：
+
+```
+[mine] expert 128 w=0.28547648 down_out_rms=0.00557 / 0.00509 / 0.01843 / 0.01668  accum_rms_before=0
+```
+
+对照：
+- **down 的输入（swiglu 向量）rms = 0.052–0.067 ✓** = 官方的 **0.0701** ✓ —— **输入正确** ✓
+- 官方单专家 routed 贡献估值 ≈ 0.100171/√6 ≈ **0.0409**（含其权重 0.2855）
+- **我的 down 输出 = 0.005–0.018** ✗ → **小了 2–8 倍** ✗
+- `route idx` 与 `wgt` 的数值与官方逐一吻合 ✓（专家选择与权重都对）
+
+→ **输入对、专家权重分片对（w2=ExpertCols 切 inter ✓）、路由权重对、但 down 的输出不对** ✓✓
+   = **`expert_down_fp4` → `launch_mxf4(..., n_total=dim, k=inter_local, b_split=-1,
+     epi_mode=2, limit=0, row_weight=wsum[e], aq=true, ...)` 这一支的实际计算有问题** ✗
+
+**下会话第一刀（很可能一步到位）**：把 `dsv41_expert_down_fp4` 当成独立微基准测 —— 造一个
+[1, inter_local] 的输入和它对应的 w2，用 numpy（fp4 表 + e8m0 row-32 scale）复算，
+逐元素对比。重点看三处：
+1. `n_total=dim=5120` 是否被内核理解成 `[out, in] = [dim, inter]`（W2 的转置语义）
+2. `aq=true` 时 A 的内部量化细节（我外面**又**用 `quant_fp4` 预量化过一次 —— 是否双重量化 ✗）
+3. `epi_mode=2` 的 `row_weight` 是否与 w2 的 `alpha` 语义串联正确
+   （注意：我外面已经不再乘权重，若内核在 `epi_mode=2` 之外还有一次缩放就会差常数倍）
