@@ -1449,3 +1449,19 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 1. **投影族 splitK 关闭 + cast 消除（−0.3~0.4，最有把握）**：nvjet_splitK（3.8µs×57/步）+ splitKreduce（2.8µs×67/步）= 0.41ms——M=16 的 GEMM 不该 splitK；f32_to_bf16 209 次/步（每 GEMM 前的转换）——让产出方直出 bf16（池化 cast 缓存已 4 次失败，勿走池化路）。
 2. **小 kernel 合并（−0.3）**：quant_e4m3_tokens 可并入 hc_pre_rest345 尾部（它量化的就是 li——但 absmax 需跨 block 归约，需用 is_last 机制或独立小 kernel）；norm 族 209 次。
 3. **down one-expert-per-block（−0.5~0.6，最大但最险）**：两阶段归约保确定性；HTILE 教训适用。
+
+## 2026-09-10 冲刺终态：CUBLAS_WORKSPACE_CONFIG 逼退 splitK — 无效（负结果）
+
+同会话背靠背 A/B（base 10.94 vs `CUBLAS_WORKSPACE_CONFIG=:1024:2` 11.03ms，均 faults=0、出师表✓）：经典 `cublasGemmEx` API 不受该配置约束（或非 splitK 变体更慢）。**要消除 splitK 浪费（nvjet_splitK 3.8µs×57/步 + splitKreduce 2.8µs×67/步 = 0.41ms）必须迁移到 cublasLt Matmul + 启发式过滤**（algo 遍历时排除 splitK 变体）——中等工作量的重构，下会话项。
+
+## 冲刺会话总结（2026-09-10 深夜）
+
+**成果**：13.45 → **10.94ms（+23%），1190 → 1464 tok/s**（AR v5 是最大单项：−1.9ms）。
+**本轮新知识**：① nsys 必须 NCCL 模式（v5 自旋×节点追踪 = 300x 放大）；② `POST /shutdown` 是唯一正确收尾；③ gdn_step_v2 不在 b16 稳态路径（prefill/ramp 专属）；④ CUBLAS_WORKSPACE_CONFIG 逼退 splitK 无效。
+**通往 1600 的最终清单（10.94 → 10.0，需 −0.94ms）**：
+| 项 | 预期 | 方案 |
+|---|---|---|
+| 小 kernel 合并 | −0.3 | quant_e4m3（54/步，可并入 rest345 尾部或独立小 kernel 合并）+ f32_to_bf16（209/步）+ norm 族 |
+| down one-expert-per-block | −0.5~0.6 | 两阶段归约保确定性；HTILE 教训适用 |
+| cublasLt 迁移 | −0.2~0.3 | 启发式过滤 splitK；gemm_cublas 重构 |
+| **合计** | **−1.0~1.2 → 9.7-9.9ms ≈ 1620-1650** | |
