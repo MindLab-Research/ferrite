@@ -624,7 +624,13 @@ impl<'a> DevChain<'a> {
         // holds this step's token, since the owner runs earlier in the stack.
         let owner = self.kv_owner(layer);
         let ring_ptr = self.layers[owner].ring.ptr;
-        let idxs_ptr = self.layers[owner].idxs.ptr;
+        // index-source layers compute their OWN selection into their OWN buffer;
+        // non-index layers read the owner's (shared) selection
+        let idxs_ptr = if cfg.is_index_source(layer) {
+            self.layers[layer].idxs.ptr
+        } else {
+            self.layers[owner].idxs.ptr
+        };
         let cache = &self.layers[owner];
         let owns_kv = owner == layer;
         if owns_kv {
@@ -665,20 +671,20 @@ impl<'a> DevChain<'a> {
         // superset-free pruning that at least makes the long-range rows
         // reachable — it is NOT the learned selection).
         let mut take_comp = comp_len.min(cfg.index_topk);
-        if !owns_kv {
-            // A consumer reads the owner's selection buffer, which the owner
-            // filled earlier this step (including its learned top-k). Uploading
-            // here would overwrite it with the placeholder — a consumer must
-            // never write the shared buffer.
-        } else if comp_len > 0 && cfg.is_index_source(layer)
-            && self.indexer(layer, pos, win, comp_len)? {
+        if comp_len > 0 && cfg.is_index_source(layer) {
+            // EVERY index-source layer runs its own indexer (into its own
+            // buffer) — the reference creates one for each, and non-source
+            // layers compute their own queries/selection from the keys the
+            // kv-source published. Only the KEY PUBLISHING is the source's job.
+            if self.indexer(layer, pos, win, comp_len)? {
             // the kernel wrote `comp_len.min(index_topk)` entries at [win, ..)
             take_comp = comp_len.min(cfg.index_topk);
-        } else {
-            // No indexer on this owner yet: keep the most recent compressed rows.
-            // NOT the learned selection — it only makes the long-range rows
-            // reachable, and the config makes every compress owner an index
-            // source, so in practice this branch is a safety net.
+            }
+        } else if !owns_kv && comp_len > 0 {
+            // a non-index consumer reads the owner's selection, which the owner
+            // (an index-source) filled earlier this step — do nothing
+        } else if comp_len > 0 {
+            // the owner has no indexer: recency placeholder (safety net)
             let placeholder = comp_len.min(cfg.index_topk);
             for j in 0..placeholder {
                 idx_host[win + j] = (win + comp_len - placeholder + j) as i32;
