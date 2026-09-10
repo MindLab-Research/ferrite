@@ -3,6 +3,19 @@
 Rust-native inference engine for **GLM-5.3-Flash** (hybrid GatedDeltaNet linear attention + DSA sparse attention + MoE), single-node TP over CUDA graphs.
 Read `README.md` for the design contract; this file is the operational guide: build/test loop, every runtime flag, demo configs, and the profiling workflow that actually works on this hardware.
 
+
+### 测试纪律（用户 2026-09-10 追加，立即生效）
+- **只准测试一轮**：每次验证/测速只跑**一次** serve+bench，不再自动跑 3 轮/多轮求中位数。
+  单轮读数即为结论；需要重复时必须先问用户。（原因：每轮 ~1.5-2.5 分钟，多轮把"看一个数"
+  变成"等十分钟"。）
+- **禁止杀测试**：已经启动的测试必须让它自然跑完（收尾用 `POST /shutdown`），不得中途 kill。
+- 因此脚本模板一律**单轮**：启动 serve → 一次 bench → `POST /shutdown` → 报
+  `replay p50` / `faults` / `opcheck` / 文本，然后结束。
+- 跨版本比较**必须同会话背靠背**：同一二进制 + `--lib` 切换两个 `.so`
+  （`git show <commit>:kernels/cuda/ferrite_kernels.cu > /tmp/old.cu` →
+  `nvcc -O3 -shared -Xcompiler -fPIC --use_fast_math -std=c++17 -gencode arch=compute_103a,code=sm_103a -o /tmp/old_lib.so /tmp/old.cu`），
+  **每次比较各跑一轮**（共 2 轮），不做 3 轮。
+
 ## ⛔ 硬性禁令（用户明令，违反=浪费用户时间，2026-09-09）
 
 1. **任何时候禁止 `git revert`**（含 `git reset` 回退已提交的改动）。
