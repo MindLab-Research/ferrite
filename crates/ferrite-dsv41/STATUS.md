@@ -349,3 +349,44 @@ for i, layer in enumerate(self.layers):
 
 - `tests/attn_parity.rs`：在**正确时点** dump 量化结果（第一次量化 + 就地 norm 前的 qr）。
 - `bin/dsv41-run.rs`：`DSV41_TOP5=1` 时打印每步 top-4 logits（默认关）。
+
+### engram 前向的完整语义（本会话抄录自 model.py:328-368，实现它只需这些）
+
+**接法**（model.py:1261-1262，在**每层 forward 之前**）：
+```python
+for i, layer in enumerate(self.layers):
+    if layer.engram is not None:                    # 仅 layer 1 / 14
+        h = layer.engram(h, engram_hashes[:, :, layer.engram.layer_hash_index, :], engram_mask)
+    h, pre_mix = layer(h, start_pos, pre_mix, image_mask)
+```
+`h` 此刻是 **hc 展开后的 [B, L, hc_mult, dim]** ✓ → engram 直接改写残差流 ✓。
+
+**模块结构**：
+```python
+self.embed = ParallelEngramEmbedding(layout.num_embeddings[idx], layout.head_dim)   # 表 384M 行 × 256
+n_hash_cols = (max_ngram_size - 1) * n_heads          # (4-1)*8 = 24
+self.wkv = Linear(n_hash_cols * head_dim, dim * (hc_mult + 1))   # [24*256=6144 -> 5120*5=25600]
+self.q_weight, self.k_weight = [hc_mult, dim] 参数（各 4×5120）
+```
+
+**forward（逐行等价实现即可）**：
+```python
+kv = self.wkv(self.embed(hash_ids).flatten(-2))      # [B,L,25600]
+key, value = kv.split([hc_mult*dim, dim], -1)        # key [4,5120] per token, value [5120]
+key = key.unflatten(-1, (hc, dim)); weight = q_weight * k_weight   # [4,5120]
+h = x.float()
+rstd = rsqrt(h.square().mean(-1) + eps) * rsqrt(key.square().mean(-1) + eps)   # 各自按 dim 归约
+dot  = (h * weight * key).sum(-1) * rstd * dim**-0.5                           # [B,L,hc]
+gate = sigmoid(copysign(sqrt(|dot|.clamp_min(1e-6)), dot))                     # 带符号 sqrt
+return h + gate.unsqueeze(-1) * value.unsqueeze(-2)                            # value 广播到 hc 份
+```
+
+**n-gram 哈希**（engram.py:129-184，`NgramHashState.forward`）：
+`token_map[input_ids]` → 写入按位置的 cache → 对 shift∈[0, max_ngram_size) 取 `cache[pos-shift]`
+（缺失/越界用 `pad_id=2`）→ `tokens * multipliers` 逐 lookback **XOR** → `% primes[:, i-1]` → `+ offsets`，
+输出 **[B, L, n_engram_layers, n_hash_cols=24]**。
+
+**数据量与分布式**：`engram_num_embeddings=[384006168, 384016682]`，head_dim=256 →
+两层表合计 **189 GiB**（≈256 维 × 4B 显存/行… 实为 bf16，每 rank 分 `ceil(rows/world)` = ~24 GB/rank ✓ 装得下）。
+**查表跨 rank**：每 token 每层只有 24 行 × 256 维 = **24 KB** ✓ → 一次小 all-to-all 即可（数据量可忽略）。
+`wkv` 是 25600×6144 = 157M 参数的稠密 fp8 ✓ 已在权重集里（`DSV41_SKIP_ENGRAM_WEIGHTS` 可跳过）。
