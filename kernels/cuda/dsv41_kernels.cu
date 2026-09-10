@@ -492,8 +492,21 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
         const int nwarp = (blockDim.x + 31) >> 5;
         for (int m = wid; m < mix; m += nwarp) {
             const float* wr = hc_fn + (size_t)m * hc_dim;
-            float acc = 0.f;
-            for (int c = lane; c < hc_dim; c += 32) acc += wr[c] * xr[c];
+            // Four accumulators: a single `acc +=` chain serialises the 160
+            // dependent loads of a full row behind one FMA, which is what made
+            // this kernel latency- rather than bandwidth-bound. The lanes still
+            // read stride-32 so every load stays coalesced; only the summation
+            // order inside the row changes (verified against the model's text).
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            int c = lane;
+            for (; c + 96 < hc_dim; c += 128) {
+                a0 += wr[c] * xr[c];
+                a1 += wr[c + 32] * xr[c + 32];
+                a2 += wr[c + 64] * xr[c + 64];
+                a3 += wr[c + 96] * xr[c + 96];
+            }
+            for (; c < hc_dim; c += 32) a0 += wr[c] * xr[c];
+            float acc = (a0 + a1) + (a2 + a3);
             for (int off = 16; off > 0; off >>= 1) {
                 acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
             }
@@ -1234,7 +1247,15 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
                               int hc_dim, int hc, int sinkhorn_iters, float eps, cudaStream_t s) {
     const int mix = hc * (2 + hc);
     const int smem = (mix + hc * hc) * sizeof(float);
-    hc_mixes_kernel<<<rows, 128, smem, s>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, rows,
+    // One warp per mix row. The kernel assigns row `m` to warp `m` (m += nwarp),
+    // so with 128 threads only 4 rows ran at a time and each warp walked six rows
+    // serially through a latency-bound accumulate chain - measured 808us per call,
+    // 51.5% of the whole decode's GPU time (nsys cuda_gpu_kern_sum). Sizing the
+    // block to `mix` warps puts every row in flight at once.
+    int nthreads = ((mix + 31) / 32) * 32;
+    if (nthreads < 32) nthreads = 32;
+    if (nthreads > 1024) nthreads = 1024;
+    hc_mixes_kernel<<<rows, nthreads, smem, s>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, rows,
                                             hc_dim, hc, sinkhorn_iters, eps);
     return (int)cudaGetLastError();
 }
