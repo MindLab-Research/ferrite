@@ -215,6 +215,56 @@ __global__ void hc_collapse_kernel(const float* __restrict__ x, const float* __r
     }
 }
 
+// ===========================================================================
+// Device-side all-reduce completion (takes the HOST out of the critical path)
+// ===========================================================================
+//
+// The old protocol was: issue the peer copies (async), then cudaDeviceSynchronize
+// so this rank's copies are certainly complete, then a host barrier. That sync
+// ran on every collective call — ~90 per decode step — and while it runs the
+// host cannot enqueue the next layer's work, so CPU and GPU never overlap. These
+// two kernels move the waiting onto the device instead: the stamp kernel runs
+// after the peer copies on the same stream (so it inherits their completion) and
+// writes this rank's round into every rank's stamp array; the reduce kernel
+// spins until every peer has stamped that round, then sums. The host only
+// enqueues.
+
+__global__ void ar_stamp_kernel(const unsigned long long* __restrict__ peer_stamps, int world,
+                                int rank, unsigned round) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
+        for (int p = 0; p < world; ++p) {
+            unsigned* dst = (unsigned*)(peer_stamps[p] + (size_t)rank * sizeof(unsigned));
+            *dst = round;
+        }
+        __threadfence_system();
+    }
+}
+
+__global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restrict__ staging,
+                                 long n, long slot_f, int world,
+                                 const unsigned* __restrict__ stamps, unsigned round) {
+    // every block waits: the stamps are in this rank's own memory (the peers
+    // wrote them through their peer access) and stay in L2, so the spin is cheap
+    if (threadIdx.x == 0) {
+        for (int p = 0; p < world; ++p) {
+            const volatile unsigned* s = stamps + p;
+            while (*s < round) {
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x * blockDim.x) {
+        float acc = 0.f;
+        for (int p = 0; p < world; ++p) {
+            acc += staging[(size_t)p * slot_f + i];
+        }
+        dst[i] = acc;
+    }
+}
+
 }  // namespace
 
 // ============================================================================
@@ -264,5 +314,23 @@ extern "C" int dsv41_hc_collapse(const float* x, const float* pre, float* out, i
     const size_t total = (size_t)rows * dim;
     const unsigned blocks = (unsigned)((total + 255) / 256);
     hc_collapse_kernel<<<blocks, 256, 0, s>>>(x, pre, out, rows, hc, dim);
+    return (int)cudaGetLastError();
+}
+
+// Device-side all-reduce completion entry points (protocol in ar_stamp_kernel /
+// ar_reduce_kernel above).
+extern "C" int dsv41_ar_stamp(const unsigned long long* peer_stamps, int world, int rank,
+                              unsigned round, cudaStream_t s) {
+    if (world <= 0) return (int)cudaSuccess;
+    ar_stamp_kernel<<<1, 32, 0, s>>>(peer_stamps, world, rank, round);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_ar_reduce(float* dst, const float* staging, long n, long slot_f, int world,
+                               const unsigned* stamps, unsigned round, cudaStream_t s) {
+    if (n <= 0 || world <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (blocks > 512) blocks = 512;
+    ar_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, stamps, round);
     return (int)cudaGetLastError();
 }

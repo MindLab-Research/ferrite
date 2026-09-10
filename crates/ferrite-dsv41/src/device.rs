@@ -135,6 +135,10 @@ struct Kernels {
     ) -> c_int,
     add_inplace: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, CuStream) -> c_int>,
     hc_collapse: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int>,
+    ar_stamp: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
+    ar_reduce: Option<
+        unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
+    >,
     compressor_pool: Option<
         unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut c_int, c_int, c_int, c_int, c_int, c_int, f32, CuStream) -> c_int,
     >,
@@ -324,6 +328,8 @@ impl Device {
                 moe_route: f!(h_k, "dsv41_moe_route"),
                 add_inplace: sym(h_k, "ferrite_add").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_stamp: sym(h_k, "dsv41_ar_stamp").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_reduce: sym(h_k, "dsv41_ar_reduce").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 route_topk: sym(h_k, "dsv41_route_topk").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 compressor_pool: sym(h_k, "dsv41_compressor_pool").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 engram_apply: sym(h_k, "dsv41_engram_apply").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1211,6 +1217,31 @@ impl Device {
         let f = self.need(self.kernels.hc_collapse, "dsv41_hc_collapse")?;
         let rc = unsafe { f(x, pre, out, rows, hc, dim, self.stream) };
         self.kerr(rc, "dsv41_hc_collapse")
+    }
+
+    /// Stamp `round` into every rank's stamp array (including our own) after the
+    /// data peer copies have completed on this stream.
+    pub fn ar_stamp(&self, peer_stamps: *const u64, world: i32, rank: i32, round: u32) -> Result<()> {
+        let f = self.need(self.kernels.ar_stamp, "dsv41_ar_stamp")?;
+        let rc = unsafe { f(peer_stamps, world, rank, round, self.stream) };
+        self.kerr(rc, "dsv41_ar_stamp")
+    }
+
+    /// Sum the `world` staging slots into `dst`, spinning on the local stamps
+    /// until every peer has published `round` — the host never waits.
+    pub fn ar_reduce(
+        &self,
+        dst: *mut f32,
+        staging: *const f32,
+        n: i64,
+        slot_f: i64,
+        world: i32,
+        stamps: *const c_uint,
+        round: u32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ar_reduce, "dsv41_ar_reduce")?;
+        let rc = unsafe { f(dst, staging, n, slot_f, world, stamps, round, self.stream) };
+        self.kerr(rc, "dsv41_ar_reduce")
     }
 
     pub fn engram_apply(

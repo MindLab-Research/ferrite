@@ -63,6 +63,9 @@ impl SpinBarrier {
     }
 }
 
+use std::ffi::c_uint;
+use std::sync::atomic::{AtomicU32, Ordering as AtOrd};
+
 use ferrite_types::{FerriteError, Result};
 
 use crate::device::{DevBuf, Device};
@@ -75,8 +78,23 @@ pub struct Collective {
     staging: DevBuf,
     /// Base address of each rank's staging buffer, indexed by rank.
     peers: Vec<u64>,
+    /// Byte offset (from each rank's staging base) of its stamp array: `world`
+    /// u32 slots, slot `w` holding the round that rank `w` has completed.
+    stamps_at: usize,
+    /// Device copy of the peers' STAMP bases, so the stamp kernel can write into
+    /// every rank's array (including our own) without host involvement.
+    peer_stamps: DevBuf,
+    /// Monotonic round counter: each all-reduce is one round. Atomic because
+    /// the collective is shared behind an Arc and only `&self` is available.
+    round: AtomicU32,
     barrier: Arc<SpinBarrier>,
     dev: Arc<Device>,
+}
+
+impl std::fmt::Debug for Collective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Collective(world={}, rank={})", self.world, self.rank)
+    }
 }
 
 impl Collective {
@@ -91,7 +109,11 @@ impl Collective {
         barrier: Arc<SpinBarrier>,
     ) -> Result<Self> {
         let depth = bytes * std::mem::size_of::<f32>() / 4;
-        let staging = dev.alloc(world * bytes)?;
+        // the stamp area rides at the end of each rank's staging: world u32 slots,
+        // slot `w` = the round rank `w` has finished publishing
+        let stamps_at = world * bytes;
+        let staging = dev.alloc(stamps_at + world * 4 + 64)?;
+        let peer_stamps = dev.alloc(world * 8)?;
         let _ = depth;
         Ok(Collective {
             world,
@@ -99,6 +121,9 @@ impl Collective {
             bytes,
             staging,
             peers: vec![0; world],
+            stamps_at,
+            peer_stamps,
+            round: AtomicU32::new(0),
             barrier,
             dev,
         })
@@ -116,6 +141,14 @@ impl Collective {
         if peers.iter().any(|&p| p == 0) {
             return Err(FerriteError::Config("a peer address is 0".into()));
         }
+        // the stamp kernel writes into every rank's stamp area directly, so keep
+        // a device copy of those bases
+        let bases: Vec<u64> = peers.iter().map(|p| p + self.stamps_at as u64).collect();
+        let mut buf = vec![0u8; self.world * 8];
+        for (i, b) in bases.iter().enumerate() {
+            buf[i * 8..i * 8 + 8].copy_from_slice(&b.to_le_bytes());
+        }
+        self.dev.upload_bytes_at(&self.peer_stamps, &buf)?;
         self.peers = peers;
         Ok(())
     }
@@ -144,7 +177,17 @@ impl Collective {
         // Removing it produced wrong output (" toll id " instead of " Paris.") —
         // verified. The real speedup must come from replacing this drain with
         // stream-ordered completion + a device-side stamp, not from dropping it.
-        self.dev.dev_sync()?;
+        // The stamp kernel runs on the same stream AFTER the peer copies, so it
+        // cannot execute before they complete — its write is the guarantee that
+        // this rank's data has landed. The old cudaDeviceSynchronize here blocked
+        // the host (so nothing overlapped) ~90 times per decode step.
+        let round = self.round.fetch_add(1, AtOrd::AcqRel) + 1;
+        self.dev.ar_stamp(
+            self.peer_stamps.ptr as *const u64,
+            self.world as i32,
+            self.rank as i32,
+            round,
+        )?;
         self.barrier.wait();
         Ok(())
     }
@@ -155,11 +198,17 @@ impl Collective {
         self.publish(buf as *const std::ffi::c_void, len)?;
         let slot0 = (self.staging.ptr as *mut u8);
         let n = (len / 4) as i64;
-        for i in 1..self.world {
-            let src = slot0.wrapping_add(i * self.bytes);
-            self.dev
-                .add_inplace_raw(slot0 as *mut std::ffi::c_void, src as *const std::ffi::c_void, n)?;
-        }
+        let slot_f = (self.bytes / 4) as i64;
+        let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
+        self.dev.ar_reduce(
+            slot0 as *mut f32,
+            slot0 as *const f32,
+            n,
+            slot_f,
+            self.world as i32,
+            stamps,
+            self.round.load(AtOrd::Acquire),
+        )?;
         self.dev
             .memcpy_d2d(buf, slot0 as *const std::ffi::c_void, len)?;
         self.barrier.wait();
