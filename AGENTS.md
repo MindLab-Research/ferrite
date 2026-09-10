@@ -48,7 +48,7 @@ Read `README.md` for the design contract; this file is the operational guide: bu
 每次改动**必须人眼看生成的文本**（乱码=数值回归，token 计数看不出来）。
 
 **nsys 落盘纪律**（2026-09-09 更新：现在有两种验证成功的方法，优先用 capture-range）：
-nsys 只在**目标进程退出时**写报告。HTTP serve 靠 SIGINT 优雅退出（`kill -INT <pid>` → tokio ctrl_c → `profiler_stop` → `exit(0)`；**POST /shutdown 端点并不存在**，curl 它只会失败）。
+nsys 只在**目标进程退出时**写报告。HTTP serve 靠 SIGINT 优雅退出（`kill -INT <pid>` → tokio ctrl_c → `profiler_stop` → `exit(0)`；**POST /shutdown 端点存在且是正确的收尾方式**（ferrite-http/src/api.rs:342：respond 后 300ms 由 detached thread `process::exit(0)`——跳过 1.17TB 权重 drop，profiler 报告可靠落盘。⚠️ 2026-09-10 实测教训：`kill -INT` 走 ctrl_c 路径，退出时权重 drop 曾把 nsys 注入拖死（serve 已消失但 nsys 永不写报告，只能 kill -9 清理）。**一切 serve 收尾（尤其带 nsys/ncu 时）必须用 `curl -X POST http://localhost:PORT/shutdown`，不要 kill -INT**）。
 **首选：FERRITE_NCU 窗口 + capture-range（99f0a0e 起内置）**——只抓饱和稳态，报告里**没有** 80s 权重加载和 admissions 爬坡/图捕获的内核，`cuda_gpu_kern_sum` 直接就是稳态分解：
 ```bash
 timeout -s INT 300 nsys profile --trace=cuda --cuda-graph-trace=node --sample=none \
