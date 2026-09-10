@@ -1483,3 +1483,9 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **段融合的独有价值**（增量清单拿不到的）：段内权重预取与计算重叠（TileRT 式 smem 级软件流水）——这是超过 ~1650 之后才需要的。
 
 **优先级决定**：先用增量清单拿下 1600（小 kernel 合并 −0.3 / down one-expert −0.5~0.6 / cublasLt 逼退 splitK −0.2~0.3 → 9.7-9.9ms），段融合作为第二阶段。工期对比：段融合 1-2 周 vs 增量 2-3 天，终点相同。
+
+## 2026-09-10 冲刺收尾：f32_to_bf16 溯源 + 会话终态
+
+**209 次/步 cast 的来源**：`gemm_cublas`（cuda.rs:2036）每次调用都发射独立 `f32_to_bf16` kernel 把 x 转进临时 DevBuf——nvjet 家族 ~218 次/步与 cast 209 次/步一一对应。custom kernel（gemv_bf16/gemm3）不受影响（kernel 内转换）。**消除方案**：①产出方双输出（hc_pre_rest348/rmsnorm/hc_post 同时写 f32+bf16，下游 GEMM 直接吃 bf16）——注意勿走 xb_cache 池化老路（4 次失败，池地址稳定性契约）；②或用自研 GEMM 替换这些 cuBLAS 调用（gemm3 已有模式，直接吃 f32）。预期 −0.2ms。cublasGemmEx 不支持 A=f32×B=bf16 混合（A/B 类型必须一致），该路不通。
+
+**会话终态**：13.45 → **10.94ms（+23%），1464 tok/s**（AR v5 −1.9ms 是最大单项）。剩余 −0.94ms 的三项清单与段融合（第二阶段）设计均已入档。运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。
