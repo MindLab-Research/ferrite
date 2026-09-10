@@ -179,6 +179,7 @@ pub struct Device {
     kernels: Kernels,
     stream: CuStream,
     handle: *mut c_void,
+    debug_sync: bool,
     _libs: (*mut c_void, *mut c_void, *mut c_void),
 }
 
@@ -331,6 +332,7 @@ impl Device {
                 kernels,
                 stream,
                 handle,
+                debug_sync: std::env::var("DSV41_DEBUG_SYNC").map(|v| v != "0").unwrap_or(false),
                 _libs: (h_cudart, h_cublas, h_k),
             })
         }
@@ -467,7 +469,27 @@ impl Device {
         if rc != 0 {
             return Err(FerriteError::Config(format!("{what}: cuda error {rc}")));
         }
-        check_cudart(unsafe { (self.cudart.last_error)() }, &self.cudart, what)
+        check_cudart(unsafe { (self.cudart.last_error)() }, &self.cudart, what)?;
+        // DSV41_DEBUG_SYNC=1 synchronises after every launch so an ASYNC fault
+        // (illegal address inside a kernel) is attributed to the kernel that
+        // caused it instead of surfacing at the next sync.
+        if self.debug_sync {
+            let rc = unsafe { (self.cudart.stream_sync)(self.stream) };
+            if rc != 0 {
+                let msg = unsafe {
+                    let p = (self.cudart.strerror)(rc);
+                    if p.is_null() {
+                        format!("cuda error {rc}")
+                    } else {
+                        std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                    }
+                };
+                return Err(FerriteError::Config(format!(
+                    "ASYNC FAULT in {what}: {msg}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// fp8 e4m3 dense GEMM: `out[m,n] = a[m,k] @ w[n,k]^T`. `a_scale` is f32
