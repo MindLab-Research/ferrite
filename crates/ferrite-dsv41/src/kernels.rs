@@ -131,6 +131,39 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// **Fallback** expert path: identical maths, but the weights were
+    /// *losslessly* re-encoded fp4 -> e4m3 at load time (the reference's own
+    /// `cast_e2m1fn_to_e4m3fn`), so the kernel is the proven fp8 m16n8k32 MMA
+    /// with per-32x32 ue8m0 scales in the epilogue. Used when the tcgen05 MXFP4
+    /// path is unavailable; it costs 1 byte/param instead of 0.5.
+    pub fn dsv41_expert_gate_up_fp8(
+        a: *const u8,
+        a_scale: *const f32,
+        w1: *const u8,
+        w1_scale: *const u8,
+        w3: *const u8,
+        w3_scale: *const u8,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        limit: f32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// **Fallback** expert down projection (see above).
+    pub fn dsv41_expert_down_fp8(
+        act: *const f32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        weight: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        stream: CuStream,
+    ) -> i32;
+
     // ----------------------------------------------------------------- engram
     /// Gather `n_cols` table rows per token, dequantise (fp8 + ue8m0 row-32
     /// scales) and write `[rows, n_cols * head_dim]` bf16/f32 rows.

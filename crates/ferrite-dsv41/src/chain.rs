@@ -205,8 +205,17 @@ fn attention_forward(
         }
     }
 
-    let (mut all_kv, mut all_idx) = (win_rows.clone(), win_idxs.clone());
-    let mut all_cols = win_cols;
+    // Assemble the two KV sources. The row width is
+    //     window columns + (min(index_topk, compress_len) if compressed)
+    // and the compressed indices are shifted past the window rows. Note the
+    // reference concatenates along the last dim, so the window indices and the
+    // compressed indices must be interleaved PER ROW here.
+    let mut all_kv = win_rows.clone();
+    let mut idx_cols = vec![win_cols; rows];
+    let mut per_row_idx: Vec<Vec<i32>> = vec![Vec::new(); rows];
+    for r in 0..rows {
+        per_row_idx[r].extend_from_slice(&win_idxs[r * win_cols..(r + 1) * win_cols]);
+    }
     if cfg.compress_ratio(layer) > 0 {
         let ratio = cfg.compress_ratio(layer);
         // the compressor only runs on kv sources; consumers read the shared cache
@@ -230,49 +239,66 @@ fn attention_forward(
             }
         }
         let compress_len = shared.compress_len;
-        if compress_len > 0 {
-            // indexer: sources run their own; consumers reuse the published idxs
-            let idxs = if cfg.is_index_source(layer) {
-                let mut q2 = matmul(&qr, &w.indexer_wq_b, rows, cfg.q_lora_rank, cfg.index_n_heads * cfg.index_head_dim);
-                ops::apply_rope(&mut q2, rows, cfg.index_head_dim, rd, &w.freqs, start_pos, 1, false);
-                let cands: Option<Vec<bool>> = if cfg.is_candidate_source(layer) {
-                    // publish block candidates for the layers after this one
-                    let logits = vec![0f32; rows * compress_len];
-                    let cl = vec![compress_len; rows];
-                    Some(ops::select_candidate_blocks(
-                        &logits, rows, compress_len, &cl,
-                        cfg.candidate_topk_blocks, cfg.candidate_block_size,
-                    ))
-                } else if shared.candidates.is_some() {
-                    None // consumer mask is applied by the kernel via the published buffer
-                } else {
-                    None
-                };
-                let v = ops::indexer_topk(
-                    &q2, &w.indexer_k[..compress_len * cfg.index_head_dim], &w.indexer_weights,
-                    1, rows, cfg.index_n_heads, cfg.index_head_dim, compress_len,
-                    &vec![compress_len; rows], cands.as_deref(), cfg.index_topk,
-                    all_cols as i32, cfg.index_head_dim as f32,
-                    (cfg.index_n_heads as f32).powf(-0.5),
-                );
-                shared.topk_idxs = Some(layer);
-                v
+        // indexer: sources run their own; consumers reuse what was published
+        let idxs: Vec<i32> = if compress_len > 0 && cfg.is_index_source(layer) {
+            let mut q2 = matmul(
+                &qr, &w.indexer_wq_b, rows, cfg.q_lora_rank,
+                cfg.index_n_heads * cfg.index_head_dim,
+            );
+            ops::apply_rope(&mut q2, rows, cfg.index_head_dim, rd, &w.freqs, start_pos, 1, false);
+            let cands: Option<Vec<bool>> = if cfg.is_candidate_source(layer) {
+                // publish block candidates for the layers after this one
+                let logits = vec![0f32; rows * compress_len];
+                let cl = vec![compress_len; rows];
+                Some(ops::select_candidate_blocks(
+                    &logits, rows, compress_len, &cl,
+                    cfg.candidate_topk_blocks, cfg.candidate_block_size,
+                ))
             } else {
-                w.published_topk.clone()
+                None
             };
-            // concatenate the compressed rows after the window rows
-            let base = all_cols;
+            let v = ops::indexer_topk(
+                &q2, &w.indexer_k[..compress_len * cfg.index_head_dim], &w.indexer_weights,
+                1, rows, cfg.index_n_heads, cfg.index_head_dim, compress_len,
+                &vec![compress_len; rows], cands.as_deref(), cfg.index_topk,
+                0, cfg.index_head_dim as f32,
+                (cfg.index_n_heads as f32).powf(-0.5),
+            );
+            shared.topk_idxs = Some(layer);
+            v
+        } else if cfg.is_index_source(layer) {
+            Vec::new()
+        } else {
+            w.published_topk.clone()
+        };
+        if !idxs.is_empty() && compress_len > 0 {
+            // append the compressed KV rows after the window rows …
+            let base = all_kv.len() / hd;
             all_kv.extend_from_slice(&st.compress_kv[..compress_len * hd]);
-            for v in idxs.iter() {
-                all_idx.push(if *v < 0 { -1 } else { v + base as i32 });
+            // … and shift the per-row indices past them
+            let cols = idxs.len() / rows;
+            for r in 0..rows {
+                for c in 0..cols {
+                    let v = idxs[r * cols + c];
+                    per_row_idx[r].push(if v < 0 { -1 } else { v + base as i32 });
+                    idx_cols[r] += 1;
+                }
             }
-            all_cols += compress_len;
         }
     }
+    // flatten to [rows, max row width] (pad with -1)
+    let row_width = idx_cols.iter().copied().max().unwrap_or(0);
+    let mut all_idx = vec![-1i32; rows * row_width];
+    for r in 0..rows {
+        for (c, &v) in per_row_idx[r].iter().enumerate() {
+            all_idx[r * row_width + c] = v;
+        }
+    }
+    let kv_rows = all_kv.len() / hd;
 
     let scale = (hd as f32).powf(-0.5);
     let o = ops::sparse_attn(
-        &q, &all_kv, &w.attn_sink, &all_idx, 1, rows, nh, hd, all_cols, all_cols, scale,
+        &q, &all_kv, &w.attn_sink, &all_idx, 1, rows, nh, hd, kv_rows, row_width, scale,
     );
     // inverse rope on the output tail, then the grouped low-rank projection
     let mut o = o;
