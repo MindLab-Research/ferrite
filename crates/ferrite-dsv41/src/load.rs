@@ -194,6 +194,8 @@ pub struct Loader<'a> {
     files: HashMap<String, std::fs::File>,
     /// shard file -> byte offset of the data section
     data_base: HashMap<String, u64>,
+    /// shard file -> read-only mmap, so tensors go to the GPU by DMA
+    maps: HashMap<String, (*const u8, usize)>,
     dev: &'a Device,
     /// bytes uploaded so far (for the report)
     pub uploaded: u64,
@@ -225,6 +227,7 @@ impl<'a> Loader<'a> {
             headers: HashMap::new(),
             files: HashMap::new(),
             data_base: HashMap::new(),
+            maps: HashMap::new(),
             dev,
             uploaded: 0,
             skip_prefixes: Vec::new(),
@@ -269,31 +272,75 @@ impl<'a> Loader<'a> {
     }
 
     /// Upload `spec`'s slice for `rank` of `world`.
+    /// mmap a shard once; every tensor read comes straight out of it, so the
+    /// data reaches the GPU by DMA instead of a read() into a host buffer.
+    fn map_shard(&mut self, shard: &str) -> Result<(*const u8, usize)> {
+        if !self.maps.contains_key(shard) {
+            let path = self.dir.join(shard);
+            let f = io(File::open(&path), "open shard for mmap")?;
+            let len = io(f.metadata(), "stat shard")?.len() as usize;
+            let p = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ,
+                    libc::MAP_SHARED,
+                    std::os::unix::io::AsRawFd::as_raw_fd(&f),
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return Err(FerriteError::Config(format!("mmap {path:?} failed")));
+            }
+            // the header length gives the data-section base
+            let hdr = unsafe { std::slice::from_raw_parts(p as *const u8, 8) };
+            let hlen = u64::from_le_bytes(hdr.try_into().unwrap());
+            self.data_base.insert(shard.to_string(), 8 + hlen);
+            self.maps.insert(shard.to_string(), (p as *const u8, len));
+        }
+        Ok(*self.maps.get(shard).unwrap())
+    }
+
+    /// Load one tensor onto the device.
+    ///
+    /// GPU DMA throughout (the GLM approach): the zeroed device buffer receives
+    /// the slice with `cudaMemcpy` (row-contiguous slices) or `cudaMemcpy2D`
+    /// (column slices, whose rows are strided), and a bf16 tensor that must be
+    /// widened is widened ON THE DEVICE. Nothing is staged through host memory.
+    /// `DSV41_CPU_LOAD=1` restores the older read-into-a-Vec path as a fallback.
     fn load_tensor(&mut self, spec: &TensorSpec, world: usize, rank: usize) -> Result<DevTensor> {
-        if self.skip_prefixes.iter().any(|p| spec.name.starts_with(p.as_str())) {
-            // A zero-length placeholder keeps the caller's Option logic intact
-            // while loading nothing: the device bytes are never read because the
-            // matching stage is not wired yet.
+        if self
+            .skip_prefixes
+            .iter()
+            .any(|p| spec.name.starts_with(p.as_str()))
+        {
             return Ok(DevTensor {
                 buf: self.dev.alloc(4)?,
                 shape: vec![0],
                 dtype: "SKIPPED".into(),
             });
         }
+        let cpu_path = std::env::var("DSV41_CPU_LOAD").map(|v| v != "0").unwrap_or(false);
         let h = self.header(&spec.name)?.tensors.get(&spec.name).cloned().ok_or_else(|| {
             FerriteError::Config(format!("{} absent", spec.name))
         })?;
         let esz = dtype_size(&h.dtype);
-        let local = local_shape(
-            // local_shape only needs the shape-derived rules, not the config
-            &Dsv41Config::production(),
-            spec,
-            world,
-            rank,
-        );
-        // row-major strides of the GLOBAL tensor
+        let local = local_shape(&Dsv41Config::production(), spec, world, rank);
+        let n_local: usize = local.iter().product();
         let global = &h.shape;
-        let row_bytes: usize = global[1..].iter().product::<usize>() * esz;
+        let inner: usize = global[1..].iter().product();
+        let row_bytes = inner * esz;
+        let widen = h.dtype == "BF16" && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
+        let out_bytes = n_local * if widen { 4 } else { esz };
+
+        // destination, pre-zeroed so any padding the slice needs stays zero
+        let buf = self.dev.alloc(out_bytes)?;
+        self.dev.zero_at(buf.ptr, out_bytes)?;
+        // where the bytes land: the output, or a bf16 scratch when widening
+        let scratch = if widen { Some(self.dev.alloc(n_local * 2)?) } else { None };
+        let dst = scratch.as_ref().map(|b| b.ptr).unwrap_or(buf.ptr);
+
+        // global slice coordinates (identical to the CPU path)
         let (row0, rows) = match spec.shard {
             Shard::Replicated => (0usize, global[0]),
             Shard::Rows => {
@@ -305,80 +352,72 @@ impl<'a> Loader<'a> {
                     (rank * per, per)
                 }
             }
-            Shard::Heads | Shard::Groups | Shard::Experts => {
-                let per = global[0] / world;
-                (rank * per, per)
-            }
-            // TP-split experts (no EP): the rank's slice of the `inter` axis
-            Shard::ExpertRows => {
+            Shard::Heads | Shard::Groups | Shard::Experts | Shard::ExpertRows => {
                 let per = global[0] / world;
                 (rank * per, per)
             }
             Shard::Cols | Shard::ExpertCols => (0, global[0]),
         };
-        let bytes = if matches!(spec.shard, Shard::Cols | Shard::ExpertCols) {
-            // column slice: gather the local columns of every row
-            let inner: usize = global[1..].iter().product();
-            let per = inner / world;
-            let mut out = Vec::with_capacity(global[0] * per * esz);
-            for r in 0..global[0] {
-                let off = (r * inner + rank * per) as u64 * esz as u64;
-                out.extend_from_slice(&self.read_at(&spec.name, off, per * esz)?);
-            }
-            out
-        } else {
-            let off = row0 as u64 * row_bytes as u64;
-            let len = rows * row_bytes;
-            if len == 0 {
-                Vec::new()
-            } else {
-                self.read_at(&spec.name, off, len)?
-            }
-        };
-        // widen bf16 unless a bf16 tensor core consumes it
-        let (bytes, out_dtype) = if h.dtype == "BF16"
-            && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k))
-        {
-            (bf16_to_f32_bytes(&bytes), "F32".to_string())
-        } else {
-            (bytes, h.dtype.clone())
-        };
-        // The MMA kernel requires the reduction dim to be a multiple of its K
-        // atom (64), and `inter/world` is not one in general (2304/8 = 288). Pad
-        // the slice with ZEROS up to the atom — zero weights contribute nothing,
-        // so the GEMM result is unchanged and no kernel change is needed.
-        let bytes = match spec.shard {
-            Shard::ExpertRows => {
-                let target = padded_inter(global[0] / world);
-                let mut b = bytes;
-                b.resize(target * row_bytes, 0u8);
-                b
-            }
-            Shard::ExpertCols => {
-                let inner: usize = global[1..].iter().product();
-                let per_packed = inner / world;
-                let target = padded_inter(per_packed * 2) / 2;
-                let mut b = Vec::with_capacity(global[0] * target * esz);
+
+        if cpu_path {
+            // ---- fallback: read into a host buffer, then upload ----
+            let raw = if matches!(spec.shard, Shard::Cols | Shard::ExpertCols) {
+                let per = inner / world;
+                let mut out = Vec::with_capacity(global[0] * per * esz);
                 for r in 0..global[0] {
-                    let src = &bytes[r * per_packed * esz..(r + 1) * per_packed * esz];
-                    b.extend_from_slice(src);
-                    b.resize(b.len() + (target - per_packed) * esz, 0u8);
+                    let off = (r * inner + rank * per) as u64 * esz as u64;
+                    out.extend_from_slice(&self.read_at(&spec.name, off, per * esz)?);
                 }
-                b
+                out
+            } else {
+                self.read_at(&spec.name, row0 as u64 * row_bytes as u64, rows * row_bytes)?
+            };
+            let raw = if widen {
+                bf16_to_f32_bytes(&raw)
+            } else {
+                raw
+            };
+            let dstb = Device::view(dst, raw.len().min(out_bytes));
+            self.dev.upload_bytes_at(&dstb, &raw)?;
+        } else {
+            // ---- DMA path ----
+            let shard = self.index.get(&spec.name).unwrap().clone();
+            let (base, _len) = self.map_shard(&shard)?;
+            let data = base.wrapping_add(*self.data_base.get(&shard).unwrap() as usize);
+            match spec.shard {
+                Shard::Cols | Shard::ExpertCols => {
+                    let per = inner / world;
+                    self.dev.upload_from_2d(
+                        dst,
+                        local[1] * esz,
+                        data.wrapping_add(rank * per * esz) as *const std::ffi::c_void,
+                        row_bytes,
+                        per * esz,
+                        global[0],
+                    )?;
+                }
+                _ => {
+                    self.dev.upload_from(
+                        dst,
+                        data.wrapping_add(row0 * row_bytes) as *const std::ffi::c_void,
+                        rows * row_bytes,
+                    )?;
+                }
             }
-            _ => bytes,
-        };
-        let buf = self.dev.upload(&bytes)?;
-        let _ = local;
+        }
+
+        if widen {
+            let tmp = scratch.unwrap();
+            self.dev.bf16_to_f32(tmp.ptr as *const std::ffi::c_void, buf.ptr, n_local as i64)?;
+            self.dev.free(&tmp);
+        }
         Ok(DevTensor {
             buf,
             shape: local,
-            dtype: out_dtype,
+            dtype: if widen { "F32".into() } else { h.dtype },
         })
     }
 
-    /// Load ONE tensor (used by the staged bring-up and by the real-weight
-    /// validation).
     pub fn load_single(&mut self, spec: &TensorSpec, world: usize, rank: usize) -> Result<DevTensor> {
         self.load_tensor(spec, world, rank)
     }

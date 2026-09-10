@@ -40,6 +40,7 @@ struct Cudart {
     device_count: unsafe extern "C" fn(*mut c_int) -> c_int,
     enable_peer: unsafe extern "C" fn(c_int, c_uint) -> c_int,
     memcpy_peer_async: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, CuStream) -> c_int,
+    memcpy_2d_async: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int, CuStream) -> c_int,
     memcpy_peer: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> c_int,
 }
 
@@ -163,6 +164,7 @@ struct Kernels {
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
     f32_to_bf16: unsafe extern "C" fn(*const f32, *mut c_void, c_long, CuStream) -> c_int,
+    bf16_to_f32: unsafe extern "C" fn(*const c_void, *mut c_void, c_long, CuStream) -> c_int,
 }
 
 fn sym(handle: *mut c_void, name: &str) -> Result<*mut c_void> {
@@ -289,6 +291,7 @@ impl Device {
                 device_count: f!(h_cudart, "cudaGetDeviceCount"),
                 enable_peer: f!(h_cudart, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h_cudart, "cudaMemcpyPeerAsync"),
+                memcpy_2d_async: f!(h_cudart, "cudaMemcpy2DAsync"),
                 memcpy_peer: f!(h_cudart, "cudaMemcpyPeer"),
             };
             let cublas = Cublas {
@@ -326,6 +329,7 @@ impl Device {
                 hc_post: f!(h_k, "ferrite_hc_post"),
                 embed_expand_dev: f!(h_k, "ferrite_embed_expand_dev"),
                 f32_to_bf16: f!(h_k, "ferrite_f32_to_bf16"),
+                bf16_to_f32: f!(h_k, "ferrite_bf16_to_f32"),
             };
 
             let mut stream: CuStream = std::ptr::null_mut();
@@ -432,6 +436,7 @@ impl Device {
                 device_count: f!(h, "cudaGetDeviceCount"),
                 enable_peer: f!(h, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h, "cudaMemcpyPeerAsync"),
+                memcpy_2d_async: f!(h, "cudaMemcpy2DAsync"),
                 memcpy_peer: f!(h, "cudaMemcpyPeer"),
             })
         }
@@ -564,6 +569,15 @@ impl Device {
     }
 
     /// Raw byte download (used to prove the loader reproduces the file bytes).
+    /// Raw H2D upload into an existing device buffer at offset 0.
+    pub fn upload_bytes_at(&self, dst: &DevBuf, bytes: &[u8]) -> Result<()> {
+        let n = bytes.len().min(dst.bytes);
+        let st = unsafe {
+            (self.cudart.memcpy)(dst.ptr, bytes.as_ptr() as *const c_void, n, CUDA_MEMCPY_H2D)
+        };
+        check_cudart(st, &self.cudart, "cudaMemcpy H2D (bytes)")
+    }
+
     pub fn download_u8(&self, src: &DevBuf, out: &mut [u8]) -> Result<()> {
         if out.len() > src.bytes {
             return Err(FerriteError::Config(format!(
@@ -576,6 +590,55 @@ impl Device {
             (self.cudart.memcpy)(out.as_mut_ptr() as *mut c_void, src.ptr, out.len(), CUDA_MEMCPY_D2H)
         };
         check_cudart(st, &self.cudart, "cudaMemcpy D2H (bytes)")
+    }
+
+    /// DMA upload straight from mapped host memory (no intermediate buffer):
+    /// this is the path the weights take, mirroring GLM's mmap + cudaMemcpy.
+    pub fn upload_from(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+        let st = unsafe {
+            (self.cudart.memcpy)(
+                dst,
+                src,
+                bytes,
+                CUDA_MEMCPY_H2D,
+            )
+        };
+        check_cudart(st, &self.cudart, "cudaMemcpy H2D (mapped)")
+    }
+
+    /// Strided DMA upload: `height` rows of `width` bytes, each row `spitch`
+    /// apart in the source and `dpitch` apart in the destination. This is how a
+    /// column-sliced tensor (row-parallel weights) is transferred without
+    /// staging it through the CPU.
+    pub fn upload_from_2d(
+        &self,
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<()> {
+        let st = unsafe {
+            (self.cudart.memcpy_2d_async)(
+                dst,
+                dpitch,
+                src,
+                spitch,
+                width,
+                height,
+                CUDA_MEMCPY_H2D,
+                self.stream,
+            )
+        };
+        check_cudart(st, &self.cudart, "cudaMemcpy2DAsync H2D")
+    }
+
+    /// Zero `bytes` at `ptr` (used to lay the padding down before the DMA
+    /// overwrites the real part, so no host-side assembly is needed).
+    pub fn zero_at(&self, ptr: *mut c_void, bytes: usize) -> Result<()> {
+        let st = unsafe { (self.cudart.memset)(ptr, 0, bytes) };
+        check_cudart(st, &self.cudart, "cudaMemset(pad)")
     }
 
     /// Device-to-device copy (small row moves: the KV ring append).
@@ -1224,6 +1287,13 @@ impl Device {
             (self.kernels.embed_expand_dev)(table, ids_dev, out, n, hidden, mult, vocab, self.stream)
         };
         self.kerr(rc, "ferrite_embed_expand_dev")
+    }
+
+    /// bf16 -> f32 on the device (GLM's kernel). Used to widen weights without
+    /// staging them through host memory.
+    pub fn bf16_to_f32(&self, src: *const c_void, dst: *mut c_void, n: i64) -> Result<()> {
+        let rc = unsafe { (self.kernels.bf16_to_f32)(src, dst, n, self.stream) };
+        self.kerr(rc, "ferrite_bf16_to_f32")
     }
 
     pub fn f32_to_bf16(&self, src: *const f32, dst: *mut c_void, n: i64) -> Result<()> {
