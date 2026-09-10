@@ -139,6 +139,8 @@ struct Kernels {
     ar_store: Option<
         unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, CuStream) -> c_int,
     >,
+    gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     expert_gate_up_fp4_indirect: Option<
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
@@ -346,6 +348,8 @@ impl Device {
                 hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_stamp: sym(h_k, "dsv41_ar_stamp").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_store: sym(h_k, "dsv41_ar_store").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                gemv_bf16: sym(h_k, "dsv41_gemv_bf16").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                gemv_f32: sym(h_k, "dsv41_gemv_f32").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1248,6 +1252,21 @@ impl Device {
         let f = self.need(self.kernels.ar_stamp, "dsv41_ar_stamp")?;
         let rc = unsafe { f(peer_stamps, world, rank, round, self.stream) };
         self.kerr(rc, "dsv41_ar_stamp")
+    }
+
+    /// Lean M=1 GEMV over bf16 weights with an f32 activation (out[n] = W[n,k]·x).
+    /// Replaces cuBLAS's gemv2T path, which ran at ~40 GFLOP/s for a single row.
+    pub fn gemv_bf16(&self, w: *const c_void, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
+        let f = self.need(self.kernels.gemv_bf16, "dsv41_gemv_bf16")?;
+        let rc = unsafe { f(w, x, out, n, k, self.stream) };
+        self.kerr(rc, "dsv41_gemv_bf16")
+    }
+
+    /// Same, f32 weights.
+    pub fn gemv_f32(&self, w: *const f32, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
+        let f = self.need(self.kernels.gemv_f32, "dsv41_gemv_f32")?;
+        let rc = unsafe { f(w, x, out, n, k, self.stream) };
+        self.kerr(rc, "dsv41_gemv_f32")
     }
 
     /// Indirect expert gate/up: the weights come from the per-layer pools plus the

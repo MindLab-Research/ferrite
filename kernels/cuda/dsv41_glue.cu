@@ -20,6 +20,7 @@
 //   nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -c dsv41_glue.cu
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 
 namespace {
@@ -239,6 +240,64 @@ __global__ void ar_stamp_kernel(const unsigned long long* __restrict__ peer_stam
         }
         __threadfence_system();
     }
+}
+
+// ===========================================================================
+// Lean M=1 GEMV (single-token projections)
+// ===========================================================================
+//
+// cuBLAS's GemmEx with N=1 picked `gemv2T_kernel` at ~40 GFLOP/s: 396us per call,
+// 72 calls per decode step — while the weight read alone (e.g. wq_b, 335MB bf16)
+// floors at ~112us. These keep a plain f32 accumulation with the same precision
+// but read the weights once, coalesced along K, one warp per output row.
+__global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const float* __restrict__ x,
+                                 float* __restrict__ out, int n, int k) {
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+    for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
+        const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
+        float acc = 0.f;
+        for (int c = lane; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) out[row] = acc;
+    }
+}
+
+__global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __restrict__ x,
+                                float* __restrict__ out, int n, int k) {
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (blockDim.x + 31) >> 5;
+    for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
+        const float* wr = w + (size_t)row * (size_t)k;
+        float acc = 0.f;
+        for (int c = lane; c < k; c += 32) acc += wr[c] * x[c];
+        for (int off = 16; off > 0; off >>= 1) {
+            acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        }
+        if (lane == 0) out[row] = acc;
+    }
+}
+
+extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n, int k,
+                               cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 7) / 8);
+    if (blocks > 4096) blocks = 4096;
+    gemv_bf16_kernel<<<blocks, 256, 0, s>>>((const __nv_bfloat16*)w, x, out, n, k);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n, int k,
+                              cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 7) / 8);
+    if (blocks > 4096) blocks = 4096;
+    gemv_f32_kernel<<<blocks, 256, 0, s>>>(w, x, out, n, k);
+    return (int)cudaGetLastError();
 }
 
 // Publish this rank's payload into EVERY rank's staging slot (including our own)

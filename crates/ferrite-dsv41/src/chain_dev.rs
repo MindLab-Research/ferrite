@@ -351,17 +351,30 @@ impl<'a> DevChain<'a> {
         )
     }
 
-    /// f32 linear for one row (see `gemm_f32`).
+    /// f32 linear for one row. M=1 goes through our own GEMV: cuBLAS's GemmEx
+    /// picked gemv2T at ~40 GFLOP/s for a single row (396us/call, 72 per step)
+    /// while the weight read floors at ~112us.
     fn lin_f32(&self, a: *const f32, k: i32, w: &crate::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
-        self.dev
-            .gemm_f32(a as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k)
+        if std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false) {
+            return self
+                .dev
+                .gemm_f32(a as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k);
+        }
+        self.dev.gemv_f32(w.ptr() as *const f32, a, out, n_out, k)
     }
 
-    /// bf16 linear for one row (cuBLAS; the tensor is natively bf16).
+    /// bf16 linear for one row. The bf16 path converts the *activation* to bf16
+    /// and hands both to cuBLAS; our GEMV takes the activation in f32 and the
+    /// weights natively bf16, which is both leaner and slightly more accurate
+    /// (no activation rounding).
     fn lin_bf16(&self, a: *const f32, k: i32, w: &crate::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
-        self.dev.f32_to_bf16(a, self.s.bf16.ptr as *mut c_void, k as i64)?;
-        self.dev
-            .gemm_bf16(self.s.bf16.ptr as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k)
+        if std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false) {
+            self.dev.f32_to_bf16(a, self.s.bf16.ptr as *mut c_void, k as i64)?;
+            return self
+                .dev
+                .gemm_bf16(self.s.bf16.ptr as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k);
+        }
+        self.dev.gemv_bf16(w.ptr() as *const c_void, a, out, n_out, k)
     }
 
     /// Engram: n-gram memory write-back into the hc residual stream, applied
