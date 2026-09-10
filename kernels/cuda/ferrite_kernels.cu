@@ -4077,20 +4077,32 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     // default (135KB) caps it at 3. Raise it once (the preferred carve-out is
     // a hint — the driver picks the config that fits).
     {
+        // cudaFuncSetAttribute is PER-CONTEXT (per device): the first version
+        // set it once on whichever device happened to be current — 7 of 8
+        // ranks kept the 135KB default carve-out and stayed at 3 blocks/SM
+        // (the serve-neutral result was 87.5% "no change"). Set it on EVERY
+        // device (the user caught this).
         static bool carveout_done = false;
         if (!carveout_done) {
-            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<8>,
-                                 cudaFuncAttributePreferredSharedMemoryCarveout,
-                                 cudaSharedmemCarveoutMaxShared);
-            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<16>,
-                                 cudaFuncAttributePreferredSharedMemoryCarveout,
-                                 cudaSharedmemCarveoutMaxShared);
-            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<32>,
-                                 cudaFuncAttributePreferredSharedMemoryCarveout,
-                                 cudaSharedmemCarveoutMaxShared);
-            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<64>,
-                                 cudaFuncAttributePreferredSharedMemoryCarveout,
-                                 cudaSharedmemCarveoutMaxShared);
+            int ndev = 0, cur = -1;
+            cudaGetDeviceCount(&ndev);
+            cudaGetDevice(&cur);
+            for (int d = 0; d < ndev; d++) {
+                cudaSetDevice(d);
+                cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<8>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared);
+                cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<16>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared);
+                cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<32>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared);
+                cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<64>,
+                                     cudaFuncAttributePreferredSharedMemoryCarveout,
+                                     cudaSharedmemCarveoutMaxShared);
+            }
+            cudaSetDevice(cur);
             carveout_done = true;
         }
     }
