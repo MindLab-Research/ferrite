@@ -36,6 +36,33 @@ Read `README.md` for the design contract; this file is the operational guide: bu
 `LD_LIBRARY_PATH=<tree>/kernels/cuda`（同一棵树）；跨版本比较必须**整树切 commit 后双产物重编**，
 禁止拿 A 树的 .so 配 B 树的二进制。
 
+### ✅ 2026-09-10 定案：逐 commit 完整重编单轮测速，回归点锁定 + 默认路径改回 dc4d7ae
+
+**方法（唯一可信）**：主树 `git reset --hard <commit>` → `bash build.sh 103a` + `cargo build --release`
+（**同一次 checkout 出双产物**，`--lib kernels/cuda/libferrite_kernels.so` 且
+`LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda` 同一棵树）→ 单轮 `bench_save.py 16 300`。
+
+| commit | replay p50 | 判定 |
+|---|---|---|
+| `dc4d7ae` | **10.55ms** | 基准 ✓（10.51 复现）|
+| `850fd0b` cublas algo 旋钮 | 10.59ms | 中性 |
+| **`74e6f89` hc_post 每-token 重写** | **10.80ms** | **+0.25ms ← 真回归**（当时误测为"中性"）|
+| `8e813ef` down HT 模板化 | 10.80ms | 无额外变化 |
+| `42c2ec8` down NP 流水线 | **8.21ms** | **假快**：cp.async 尾块 wait 语义丢失 → MMA 读陈旧 smem |
+| `HEAD`（c7f9152b）| **11.43ms** | 相对基准 +0.88ms |
+
+**关键认知**：序列是**单调且可复现**的 → 变慢来自**源码**，不是 nvcc 构建噪声（这点排除了）。
+
+**处置（用户令："不准测了，性能直接改回去"）**：`kernels/cuda/ferrite_kernels.cu` 直接改回
+`dc4d7ae` 的内容，**只重新加回版本戳**（构建门禁必须仍可生效）；Rust 侧删除对已移除实验
+kernel（slotwise down）的引用。回归/负结果的实验（hc_post 重写、down HT/NP 模板、mix
+token-pair split2）**保留在 perf-b1 的 git 历史里**，不再进入默认路径。
+
+**教训**：① 任何"结构重写"必须用**同口径同会话**的单轮数字判定，"当时看着中性"可能就是回归
+（hc_post 那次 +0.25ms 被我记成中性，导致后续在错误的基线上找问题）；② 提速数字异常漂亮时
+**先验语义不变式**（8.21ms = 陈旧 smem 的假快）；③ 跨版本比较**必须整树切 commit 双产物重编**，
+`--lib` 混用会把 `--lib` 变成静默失效（已加三道加载门禁）。
+
 ## ⛔ 硬性禁令（用户明令，违反=浪费用户时间，2026-09-09）
 
 1. **任何时候禁止 `git revert`**（含 `git reset` 回退已提交的改动）。
