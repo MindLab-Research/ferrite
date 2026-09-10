@@ -538,11 +538,16 @@ impl<'a> DevChain<'a> {
 
         // selection: the window ring, oldest first (the ring index already
         // carries the ageing rotation), padded with -1
-        let win_cols = (pos + 1).min(win);
-        let cols = win_cols.max(1);
-        let mut idx_host = vec![-1i32; cols];
+        // The window row is `win` entries in ring order with empty slots marked
+        // -1, and `sparse_attn` skips negatives. The earlier revision took only
+        // the LEADING `pos+1` entries — but those are the *high* slots, which
+        // are exactly the invalid ones while `pos < window` — so every decode
+        // step selected nothing and the attention output came out identically
+        // zero (confirmed by DSV41_STATS: rms=0.0000 at pos>0 while pos=0 was
+        // fine, since only then do the leading entries happen to be valid).
         let wsel = ops::window_topk_idxs(win, 1, 1, pos);
-        for (c, v) in wsel.iter().enumerate().take(win_cols) {
+        let mut idx_host = vec![-1i32; win];
+        for (c, v) in wsel.iter().enumerate().take(win) {
             idx_host[c] = *v;
         }
         self.ul_i32(cache.idxs.ptr, &idx_host)?;
@@ -558,7 +563,7 @@ impl<'a> DevChain<'a> {
             nh as i32,
             hd as i32,
             win as i32,
-            cols as i32,
+            win as i32,
             1.0 / (hd as f32).sqrt(),
         )?;
         self.dev.apply_rope(
