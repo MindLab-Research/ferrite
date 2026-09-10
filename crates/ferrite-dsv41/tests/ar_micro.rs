@@ -86,19 +86,6 @@ fn collective_all_reduce_matches_host_reference() {
                     }
                     let d = ferrite_dsv41::device::Device::view(buf.ptr, n * 4);
                     dev.download_f32(&d, &mut got).expect("download");
-                    // expected: the ELEMENTWISE sum over ranks of (r + rank*1000).
-                    // Every element holds the same value, so the per-element sum
-                    // is that value summed over the ranks — no `n` factor.
-                    let expect = r as f32 * world as f32
-                        + 1000.0 * (world * (world - 1) / 2) as f32;
-                    if got[0] != expect || got[n - 1] != expect {
-                        failures.lock().unwrap().push(format!(
-                            "rank {rank} round {r}: got {:.1} (first) / {:.1} (last), expected {:.1}",
-                            got[0], got[n - 1], expect
-                        ));
-                        barrier.wait();
-                        continue;
-                    }
                     if rank == 0 && r < 2 && std::env::var("AR_MICRO_DUMP").is_ok() {
                         // Dump the raw staging halves: seeing which bytes the store
                         // actually wrote beats reasoning about the offsets.
@@ -114,6 +101,20 @@ fn collective_all_reduce_matches_host_reference() {
                                 &h[n..(n + 4).min(2 * n)]
                             );
                         }
+                    }
+
+                    // expected: the ELEMENTWISE sum over ranks of (r + rank*1000).
+                    // Every element holds the same value, so the per-element sum
+                    // is that value summed over the ranks — no `n` factor.
+                    let expect = r as f32 * world as f32
+                        + 1000.0 * (world * (world - 1) / 2) as f32;
+                    if got[0] != expect || got[n - 1] != expect {
+                        failures.lock().unwrap().push(format!(
+                            "rank {rank} round {r}: got {:.1} (first) / {:.1} (last), expected {:.1}",
+                            got[0], got[n - 1], expect
+                        ));
+                        barrier.wait();
+                        continue;
                     }
                     // the buffers must keep advancing (a stalled round would repeat)
                     barrier.wait();
