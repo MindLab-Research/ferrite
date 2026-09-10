@@ -16,6 +16,26 @@ Read `README.md` for the design contract; this file is the operational guide: bu
   `nvcc -O3 -shared -Xcompiler -fPIC --use_fast_math -std=c++17 -gencode arch=compute_103a,code=sm_103a -o /tmp/old_lib.so /tmp/old.cu`），
   **每次比较各跑一轮**（共 2 轮），不做 3 轮。
 
+
+### ⛔ 加载错防线（用户 2026-09-10 明令："确保以后再也不可能出现加载错"）
+
+**事故**：二进制带 `DT_NEEDED: libferrite_kernels.so`，启动时由 `LD_LIBRARY_PATH` 映射一份；
+`--lib` 又 dlopen 了另一份**同名不同版本**的 .so → 符号解析绑定到**先加载的那份（链接镜像）**，
+`--lib` 被静默忽略。实测：想测 dc4d7ae 却跑成了主树的 kernel（11.41ms），
+而 dc4d7ae 自己的完整重编是 **10.55ms** —— 读数完全无效，浪费数小时。
+
+**三道防线（全部在 `CudaBackend::with_device/with_library` 的 dlopen 之后，任一不过即拒启）**：
+1. **戳不存在 → 拒**：`.so` 必须导出 `ferrite_kernel_build_id()` + `ferrite_kernel_abi_version()`；
+   `build.sh` 注入 `id = <git HEAD>[-dirty]+cu<sha256(.cu)[:16]>`，并写入 `kernels/cuda/.build_id`；
+   `build.rs` 在编译期把 `.build_id` 的内容嵌进二进制 → **同源校验**（也能抓"只重编一侧"）。
+2. **链接镜像 vs dlopen 镜像不一致 → 拒**：`dlsym(RTLD_DEFAULT, "ferrite_kernel_build_id")` 取
+   **实际生效**的那份（DT_NEEDED 加载的），与 `--lib` 那份比对；再与二进制自身的 id 比对。
+3. **`/proc/self/maps` 中 `libferrite_kernels.so` 的不同路径镜像数 >1 → 拒**。
+
+**正确用法（唯一允许）**：`--lib <tree>/kernels/cuda/libferrite_kernels.so` 且
+`LD_LIBRARY_PATH=<tree>/kernels/cuda`（同一棵树）；跨版本比较必须**整树切 commit 后双产物重编**，
+禁止拿 A 树的 .so 配 B 树的二进制。
+
 ## ⛔ 硬性禁令（用户明令，违反=浪费用户时间，2026-09-09）
 
 1. **任何时候禁止 `git revert`**（含 `git reset` 回退已提交的改动）。

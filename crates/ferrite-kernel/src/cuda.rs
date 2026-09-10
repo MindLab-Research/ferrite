@@ -1945,6 +1945,60 @@ unsafe fn verify_kernel_build(
              `cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release`."
         )));
     }
+    // (2) THE IMAGE THAT IS ACTUALLY USED. The binary carries a DT_NEEDED on
+    // libferrite_kernels.so, so the loader maps a copy found via
+    // LD_LIBRARY_PATH at startup and the LINKED calls bind to THAT image —
+    // not necessarily to the one --lib dlopen()ed beside it. A mismatch here
+    // silently ran the wrong kernels (a run intended to measure commit X
+    // measured 11.4ms while X's own build measured 10.55ms).
+    let global = libc_dlsym(
+        std::ptr::null_mut(),
+        b"ferrite_kernel_build_id\0".as_ptr() as *const std::os::raw::c_char,
+    );
+    if global.is_null() {
+        return Err(FerriteError::InvalidArg(
+            "the LINKED libferrite_kernels.so (found via LD_LIBRARY_PATH) carries \
+             no build stamp — it is a pre-gate or foreign build. Rebuild it from \
+             this checkout and point LD_LIBRARY_PATH at that directory."
+                .to_string(),
+        ));
+    }
+    let gl_fn: extern "C" fn() -> *const std::os::raw::c_char = std::mem::transmute(global);
+    let linked_id = std::ffi::CStr::from_ptr(gl_fn()).to_string_lossy().to_string();
+    if linked_id != so_id {
+        return Err(FerriteError::InvalidArg(format!(
+            "TWO DIFFERENT kernel libraries are live — REFUSING TO START: the \
+             linked image (LD_LIBRARY_PATH) build_id={linked_id}, but the image \
+             dlopen()ed from --lib {so_path} build_id={so_id}. Symbol resolution \
+             binds to the LINKED image, so --lib would have been IGNORED. Use one \
+             tree: --lib <tree>/kernels/cuda/libferrite_kernels.so with \
+             LD_LIBRARY_PATH=<tree>/kernels/cuda (or drop --lib)."
+        )));
+    }
+    if linked_id != bin_id {
+        return Err(FerriteError::InvalidArg(format!(
+            "the LINKED libferrite_kernels.so build_id={linked_id} does not match \
+             this binary's build_id={bin_id} — REFUSING TO START. Rebuild both \
+             artifacts from the same checkout."
+        )));
+    }
+    // (3) belt and braces: count the distinct mapped images.
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let mut seen: Vec<&str> = Vec::new();
+    for line in maps.lines() {
+        if let Some(p) = line.split_whitespace().last() {
+            if p.contains("libferrite_kernels.so") && !seen.contains(&p) {
+                seen.push(p);
+            }
+        }
+    }
+    if seen.len() > 1 {
+        return Err(FerriteError::InvalidArg(format!(
+            "{} DIFFERENT libferrite_kernels.so images are mapped into this \
+             process ({seen:?}) — REFUSING TO START. Exactly one is allowed.",
+            seen.len()
+        )));
+    }
     Ok(())
 }
 
