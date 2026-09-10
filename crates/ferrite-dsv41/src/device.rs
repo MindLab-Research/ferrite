@@ -29,6 +29,7 @@ struct Cudart {
     malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int,
     free: unsafe extern "C" fn(*mut c_void) -> c_int,
     memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int,
+    memcpy_async: Option<unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int, CuStream) -> c_int>,
     memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
     memset_async: Option<unsafe extern "C" fn(*mut c_void, c_int, usize, CuStream) -> c_int>,
     stream_create: unsafe extern "C" fn(*mut CuStream) -> c_int,
@@ -330,6 +331,9 @@ impl Device {
                 malloc: f!(h_cudart, "cudaMalloc"),
                 free: f!(h_cudart, "cudaFree"),
                 memcpy: f!(h_cudart, "cudaMemcpy"),
+                memcpy_async: sym(h_cudart, "cudaMemcpyAsync")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 memset: f!(h_cudart, "cudaMemset"),
                 memset_async: sym(h_cudart, "cudaMemsetAsync")
                     .ok()
@@ -501,6 +505,7 @@ impl Device {
                 malloc: f!(h, "cudaMalloc"),
                 free: f!(h, "cudaFree"),
                 memcpy: f!(h, "cudaMemcpy"),
+                memcpy_async: None,
                 memset: f!(h, "cudaMemset"),
                 memset_async: None,
                 stream_create: f!(h, "cudaStreamCreate"),
@@ -755,6 +760,12 @@ impl Device {
 
     /// Device-to-device copy (small row moves: the KV ring append).
     pub fn memcpy_d2d(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
+        // Async on OUR stream — a synchronous cudaMemcpy runs on the legacy stream
+        // and is illegal while capturable work is being recorded.
+        if let Some(f) = self.cudart.memcpy_async {
+            let st = unsafe { f(dst, src, bytes, CUDA_MEMCPY_D2D, self.stream) };
+            return check_cudart(st, &self.cudart, "cudaMemcpyAsync D2D");
+        }
         let st = unsafe { (self.cudart.memcpy)(dst, src, bytes, CUDA_MEMCPY_D2D) };
         check_cudart(st, &self.cudart, "cudaMemcpy D2D")
     }
@@ -786,8 +797,7 @@ impl Device {
     }
 
     pub fn zero(&self, b: &DevBuf) -> Result<()> {
-        let st = unsafe { (self.cudart.memset)(b.ptr, 0, b.bytes) };
-        check_cudart(st, &self.cudart, "cudaMemset")
+        self.zero_at(b.ptr, b.bytes)
     }
 
     // ------------------------------------------------------------ launches
