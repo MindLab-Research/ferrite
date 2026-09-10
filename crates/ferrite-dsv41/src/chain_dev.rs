@@ -1448,8 +1448,19 @@ impl<'a> DevChain<'a> {
         }
         // routed experts are expert-parallel, so each rank holds a partial sum
         if let Some(c) = self.comm.clone() {
+            if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+                let pre = self.dl(self.s.o.as_f32(), dim)?;
+                let r = (pre.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
+                eprintln!("[mine] rank{} pre-AR routed_sum_rms={} (routed+shared)", c.rank, r);
+            }
             c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
             c.end_round();
+            if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+                let post = self.dl(self.s.o.as_f32(), dim)?;
+                let r = (post.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
+                eprintln!("[mine] rank{} post-AR routed_sum_rms={} ratio={}", c.rank, r,
+                    r / (self.dl(self.s.ex_out.as_f32(), 1)?[0].abs() + 1e-30));
+            }
         }
         // the block output is the attention-branch accumulator `o`
         Ok(())
