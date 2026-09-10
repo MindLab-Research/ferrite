@@ -746,4 +746,43 @@ mod tests {
         let missing = idx.validate(&specs);
         assert!(missing.is_empty(), "{missing:?}");
     }
+
+    /// The full-sharding layout rests on one property: a rank's contiguous head
+    /// block (from `wq_b`) covers exactly the same `o_groups` as its contiguous
+    /// row block of `wo_a`. If that ever stops holding, the attention output
+    /// mixes heads from one group with another group's weights — wrong numbers,
+    /// not a crash — so it is asserted here for every supported world size.
+    #[test]
+    fn head_block_and_group_block_stay_aligned() {
+        let cfg = Dsv41Config::production();
+        let nh = cfg.n_heads;
+        let groups = cfg.o_groups;
+        let hpg = nh / groups;
+        for world in [1usize, 2, 4, 8] {
+            assert_eq!(nh % world, 0, "heads must divide by world");
+            assert_eq!(groups % world, 0, "groups must divide by world");
+            let spec_wq = tensor_specs(&cfg, world)
+                .into_iter()
+                .find(|s| s.name == "layers.6.attn.wq_b.weight")
+                .unwrap();
+            let spec_wa = tensor_specs(&cfg, world)
+                .into_iter()
+                .find(|s| s.name == "layers.6.attn.wo_a.weight")
+                .unwrap();
+            let nlh = local_shape(&cfg, &spec_wq, world, 0)[0] / cfg.head_dim;
+            let nlg = local_shape(&cfg, &spec_wa, world, 0)[0] / cfg.o_lora_rank;
+            assert_eq!(nlh, nh / world, "world {world}: local heads");
+            assert_eq!(nlg, groups / world, "world {world}: local groups");
+            for rank in 0..world {
+                let heads = rank * nlh..(rank + 1) * nlh;
+                let head_groups = heads.start / hpg..heads.end.div_ceil(hpg);
+                let row_groups = rank * nlg..(rank + 1) * nlg;
+                assert_eq!(
+                    head_groups, row_groups,
+                    "world {world} rank {rank}: head block covers groups {head_groups:?} \
+                     but wo_a's row block covers {row_groups:?}"
+                );
+            }
+        }
+    }
 }

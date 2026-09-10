@@ -165,6 +165,50 @@ Deviation to keep in mind: the reference **fp4-quantises the index q/k**
 accurate but not bit-identical — it can flip which position is picked at the
 margins, so it must be validated by the text, not by an equality check.
 
+## Tensor parallel: implemented and verified
+
+One process, one rank per thread. The CUDA runtime binds a device per thread, so
+thread `r` calls `cudaSetDevice(r)` and everything it launches lands on device
+`r`; each rank opens its own `Device`, loads its own slice (the loader already
+slices by `world`/`rank`) and builds its own chain, with a `Barrier` keeping the
+ranks in lockstep. Communication is peer copies plus a local reduction over the
+staging slots **in rank order** — identical on every rank, no NCCL.
+
+Verified: `--tp 4` and `--tp 8` produce the same leading token ids as a
+single-GPU run (`[116169,122294,107153,30155,52695,1538]`).
+
+### Sharding policy (what each rank holds)
+
+| tensor | rule | why |
+|---|---|---|
+| routed experts | expert-parallel **and** cut along `inter` | 96% of the bytes; per-rank ~34 GiB at tp=8 |
+| expert `w2` | cut along **columns** | it is `[dim, inter/2]`, so `inter` is its column dim |
+| `wq_b` | ColumnParallel over heads | local heads = `n_heads/world`; the chain uses the local count for the q path, RoPE, `sparse_attn` and the inverse RoPE |
+| `attn_sink` | per-head slice | matches the local head count |
+| `wo_a` | ColumnParallel per group | rows `groups*o_lora/world`; a rank's contiguous row block **is** its group block, which is what keeps it aligned with the head block of `wq_b` |
+| `wo_b` | RowParallel (input split) | each rank reduces over its `o_lora` slice; all-reduced after |
+| compressor / indexer / `wq_a` / `wkv` / gate | replicated | plain `Linear` in the reference; the indexer's score would need an all-reduce before its top-k (score and top-k are one kernel today) |
+| `embed` / `head` | replicated | the reference splits the vocabulary, which needs a gather — `embed_expand_dev_kernel` substitutes row 0 for an out-of-range id instead of skipping it, so a rank whose slice lacks the token would contribute a real (wrong) row |
+
+### Five TP-only bugs (each invisible at tp=1)
+
+1. `cudaDeviceEnablePeerAccess` needs the *peer's* context to exist; calling it at
+   bind time fails silently and the first peer copy faults.
+2. `cudaMemcpyPeerAsync`'s stream/direction rules did not fit one-thread-per-device;
+   the synchronous form works and the payloads are tens of KB.
+3. Expert `w2` carries the sharded `inter` axis on its **columns**; sharding it by
+   rows sliced its output dim and the down GEMM walked off its weight.
+4. `local_shape` reported expert/group tensors **unsliced** while the loader had
+   sliced them — the metadata contradicted the bytes.
+5. The expert kernels were handed the **global** `inter` width although their
+   weights are `[inter/world, ...]`. (The first attempt at that edit silently did
+   not apply; it is now verified by grepping the call sites.)
+
+Process lessons re-learned: an async fault surfaces at the next checked call, so
+the named op is often innocent — the peer copy was blamed for an expert-kernel
+overrun. And a patch that does not match its anchor fails **silently**; grep the
+call sites afterwards.
+
 ## Verification recipes
 
 ```bash

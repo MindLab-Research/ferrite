@@ -180,7 +180,7 @@ impl<'a> DevChain<'a> {
             q: dev.alloc(fb(nh * hd))?,
             kv: dev.alloc(fb(hd))?,
             o: dev.alloc(fb(nh * hd))?,
-            wo: dev.alloc(fb(cfg.o_lora_rank))?,
+            wo: dev.alloc(fb(cfg.n_groups_o_lora()))?,
             logits: dev.alloc(fb(cfg.vocab_size))?,
             ids: dev.alloc(4)?,
             scores: dev.alloc(fb(n_exp))?,
@@ -696,7 +696,11 @@ impl<'a> DevChain<'a> {
         // [g*o_lora, (g+1)*o_lora) against the head slice [g*hpg*hd, ...)
         let groups = cfg.o_groups;
         let hpg = nh / groups;
-        let olg = cfg.o_lora_rank / groups;
+        // `o_lora_rank` is the PER-GROUP low-rank width (the reference's
+        // wo_a weight is [n_groups * o_lora_rank, hpg*head_dim] viewed as
+        // [n_groups, o_lora_rank, hpg*head_dim]), so a group's row block is
+        // o_lora_rank tall — not o_lora_rank/groups.
+        let olg = cfg.o_lora_rank;
         let nlg = groups / world; // wo_a is ColumnParallel: a block of groups each
         let k = hpg * hd;
         self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
@@ -734,7 +738,8 @@ impl<'a> DevChain<'a> {
         }
         // wo_b is RowParallel: the input (groups*o_lora) is split, so this rank
         // reduces over its own slice and the ranks' partial sums are added.
-        let ol_local = cfg.o_lora_rank / world;
+        let ol_total = groups * cfg.o_lora_rank;
+        let ol_local = ol_total / world;
         self.lin(
             (self.s.wo.ptr as *const f32).wrapping_add(rank * ol_local),
             ol_local as i32,

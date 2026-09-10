@@ -360,6 +360,12 @@ impl Dsv41Config {
     // ---- derived helpers (mirror the reference's inline properties) ----
 
     /// `compress_ratios[layer]` (0 for pure sliding-window layers).
+    /// Full low-rank width of the block-diagonal output projection:
+    /// `o_groups * o_lora_rank` (each group carries its own `o_lora_rank`).
+    pub fn n_groups_o_lora(&self) -> usize {
+        self.o_groups * self.o_lora_rank
+    }
+
     pub fn compress_ratio(&self, layer: usize) -> usize {
         self.compress_ratios.get(layer).copied().unwrap_or(0)
     }
