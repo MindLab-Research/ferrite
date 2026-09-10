@@ -1427,3 +1427,25 @@ MoE 现在是**固定 6 槽位 + 路由无关的发射参数** ✓ ⇒ 满足 CU
 `nm -D` 找不到 ✗、serve 报 "kernel ... is not in the loaded .so" ✓。
 **规则**：`dsv41_*.cu` 里所有导出符号必须在匿名 namespace **之外**（与已有的
 `dsv41_ar_*` 同处 ✓）。
+
+## 图化的最后阻塞与可直接实施的设计（下会话照此做）
+
+**阻塞**：`Collective::publish` 里的 **host `barrier.wait()`** ✗。
+capture 期它会真的执行（并把同步"录掉"）✗，replay 期被跳过 ✗ ⇒ 跨 rank 数据同步丢失 ✗。
+现有的**设备侧 stamp 已就位** ✓（store 内核后盖章 + reduce 内核自旋 ✓），差的只是
+**把 skew 约束也从主机搬到设备** ✓。
+
+**设计（两个戳，双缓冲）**：
+- staging 扩成 `2 × world × bytes`（按 `round % 2` 选半区 ✓）；
+- `stored[world]`（本 rank 在**store 之后**写 ✓，带 `__threadfence_system()` ✓）
+  与 `reduced[world]`（本 rank 在 **reduce 全部完成后**写 ✓）；
+- **store 内核开头先自旋**等 `reduced[p] >= round - 2`（∀p ✓）——
+  保证要写的半区（`round%2`，上次用于 `round-2`）已被所有对端读完 ✓；
+- **reduce 内核自旋**等 `stored[p] >= round`（∀p ✓，即现状 ✓），归约后在**尾部**
+  由 block 0 写 `reduced[round]` ✓（需要全部 block 完成 ✓ ⇒ 用一个 1-block 的收尾内核更稳 ✓）；
+- **删掉 host barrier** ✓。
+
+**验证纪律（不可省）**：改完必须复验文本仍是 `" Paris"` ✓；并专门跑一次
+**乱序/长序列**（例如 128 token 连续解码 ✓）确认没有偶发错值 ✓（skew 类竞态只在长跑中出现 ✓）。
+
+**做完这一步**，整层/整段 capture 才有意义 ✓（否则图会把跨 rank 同步录没 ✗）。
