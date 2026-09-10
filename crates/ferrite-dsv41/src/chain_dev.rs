@@ -908,7 +908,12 @@ impl<'a> DevChain<'a> {
         self.dev.upload_f32_at(self.s.idx_lens.ptr, 0, unsafe {
             std::slice::from_raw_parts(lens.as_ptr() as *const f32, 1)
         })?;
-        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt() / (idx_nh as f32).sqrt();
+        // The INDEXER's scale uses index_head_dim (128), not the attention head_dim
+        // (512): the reference sets `self.softmax_scale = index_head_dim**-0.5`
+        // for the Indexer and folds `n_heads**-0.5` in with the per-head weights.
+        // Using head_dim made every index score 2x too small, so the top-k
+        // selection picked the wrong compressed positions.
+        let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
         // keys live on the KV OWNER's buffer (the source layer that published
         // them); a non-source index layer's own index_k is empty
         let key_owner = self.kv_owner(layer);
