@@ -3525,72 +3525,113 @@ __global__ void __launch_bounds__(288, 3) moe_fused_down_sum_fp8_kernel(
                       // per-block latency 16x)
     const int MAXT = 4;             // tokens staged in part[][]
     __shared__ float part[MAXT][HTILE_K][16]; // [tok][h row in tile][slot]
+    // v14 staging: 9 warps x 2 buffers x (8 rows x 256B) = 36KB — with part this
+    // stays under 3 blocks/SM (register-limited), same occupancy as before.
+    __shared__ __align__(16) unsigned char wst[9][2][2048];
     int j = warp;
     const int t0 = blockIdx.y * TT;
     const int t1 = (t0 + TT < nt) ? (t0 + TT) : nt;
     for (int base = t0; base < t1; base += MAXT) {
         const int cnt = ((t1 - base) < MAXT) ? (t1 - base) : MAXT;
         if (j <= topk) {
-        for (int tt = 0; tt < cnt; tt++) {
-        const int tok = base + tt;
-        const float* act_t = act + (size_t)tok * stride;
-        const float* ids_t = ids_f + (size_t)tok * topk;
-        const float* probs_t = probs + (size_t)tok * topk;
-        const float* aj = nullptr;
-        const unsigned char* dbase = nullptr;
-        const float* dsr_base = nullptr;
-        int klen = 0;
-        float p = 1.f;
-        if (j < topk) {
-            int eid = (int)ids_t[j];
-            int local = eid - expert_start;
-            if (local >= 0 && local < e_local) {
-                p = probs_t[j];
-                if (p != 0.f) {
-                    dbase = down_w8_ptrs[local];
-                    dsr_base = down_scale_ptrs[local];
-                    aj = act_t + (size_t)j * inter;
-                    klen = inter;
+        // ---- v14: cp.async DOUBLE-BUFFERED weight staging (2026-09-10) ----
+        // down ran at 37.6% DRAM while act — with the SAME per-call weight
+        // traffic — reaches 71.9%: act's weights stream through cp.async
+        // double-buffered smem staging (the next tile's copies fly while the
+        // current tile computes), while down loaded its weights straight
+        // from global into registers, eating the full ~600-cycle DRAM
+        // latency on every (token, 8-row chunk). One "stage" here = one
+        // (token, 8-row chunk) = 2KB of ONE expert's contiguous rows; two
+        // per-warp buffers alternate. Each lane copies 4x16B and later reads
+        // back ITS OWN pieces (flat 512*cc + lane*16 — the same-lane mapping
+        // makes wait_group sufficient, no cross-lane barrier). klen != 256
+        // stages commit an EMPTY group (keeps the group count in lockstep)
+        // and compute from global (the old path). Values and FMA order are
+        // unchanged -> bit-identical output.
+        const int nstages = cnt * CHUNKS;
+        const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes
+        auto resolve = [&](int s, const unsigned char*& dbase, const float*& dsr,
+                           const float*& aj, float& p, int& klen) {
+            const int tt = s / CHUNKS;
+            const int tok = base + tt;
+            const float* act_t = act + (size_t)tok * stride;
+            dbase = nullptr; dsr = nullptr; aj = nullptr; p = 1.f; klen = 0;
+            if (j < topk) {
+                const float* ids_t = ids_f + (size_t)tok * topk;
+                int eid = (int)ids_t[j];
+                int local = eid - expert_start;
+                if (local >= 0 && local < e_local) {
+                    const float* probs_t = probs + (size_t)tok * topk;
+                    float pv = probs_t[j];
+                    if (pv != 0.f) {
+                        dbase = down_w8_ptrs[local];
+                        dsr = down_scale_ptrs[local];
+                        aj = act_t + (size_t)j * inter;
+                        p = pv;
+                        klen = inter;
+                    }
+                }
+            } else {
+                dbase = shared_down_w8;
+                dsr = shared_down_scale;
+                aj = act_t + (size_t)topk * inter;
+                klen = inter_shared;
+            }
+        };
+        auto issue = [&](const unsigned char* dbase, int ch, int buf) {
+            unsigned char* dst = wst[warp][buf];
+            if (dbase != nullptr) {
+                const unsigned char* src = dbase + (size_t)(h0 + ch * 8) * 256;
+                #pragma unroll
+                for (int pc = 0; pc < 4; pc++) {
+                    const int f = pc * 512 + lane * 16;
+                    const unsigned sd = (unsigned)__cvta_generic_to_shared(dst + f);
+                    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;\n"
+                                 :: "r"(sd), "l"(src + f));
                 }
             }
-        } else {
-            dbase = shared_down_w8;
-            dsr_base = shared_down_scale;
-            aj = act_t + (size_t)topk * inter;
-            klen = inter_shared;
+            asm volatile("cp.async.commit_group;\n");
+        };
+        {   // prologue: stage 0 into buffer 0
+            const unsigned char* db; const float* ds; const float* a; float pv; int kl;
+            resolve(0, db, ds, a, pv, kl);
+            issue(kl == 256 ? db : nullptr, 0, 0);
         }
-        for (int ch = 0; ch < CHUNKS; ch++) {
+        for (int s = 0; s < nstages; s++) {
+            {   // prefetch stage s+1 into the other buffer, then drain stage s
+                if (s + 1 < nstages) {
+                    const unsigned char* db; const float* ds; const float* a; float pv; int kl;
+                    resolve(s + 1, db, ds, a, pv, kl);
+                    issue(kl == 256 ? db : nullptr, (s + 1) % CHUNKS, (s + 1) & 1);
+                    asm volatile("cp.async.wait_group 1;\n");
+                } else {
+                    asm volatile("cp.async.wait_group 0;\n");
+                }
+            }
+            const unsigned char* dbase; const float* dsr; const float* aj;
+            float p; int klen;
+            resolve(s, dbase, dsr, aj, p, klen);
+            const int tt = s / CHUNKS;
+            const int ch = s % CHUNKS;
+            const int buf = s & 1;
             const int hb = h0 + ch * 8;   // this chunk's 8 h rows
             float py[8];
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
-            if (klen > 0) {
-            // ar is scoped INSIDE the chunk: keeping it in the outer scope held
-            // its 16 registers live across the shuffle/part-write phase and
-            // pushed the kernel to 80 regs (2 blocks/SM, +13us/call in serve).
-            // Per-chunk reload of the act row hits L1 (same row, same block).
-            float4 ar[4];
-            {
-                const float4* a4 = reinterpret_cast<const float4*>(aj);
-                const int abase = (lane & 15) * 4; // act[16] per lane, same for both rows
-                #pragma unroll
-                for (int r = 0; r < 4; r++) ar[r] = a4[abase + r];
-            }
             if (klen == 256) {
-                // 16-BYTE LANES (uint4): one load covers 512B = TWO h-rows
-                // (rows are contiguous, klen=256). The kernel was request-rate
-                // bound at 1.16TB/s (~15% of peak) with 8-byte lanes; halving
-                // the request count doubles the bytes per in-flight request.
-                const int i0 = lane * 16;
-                const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
-                uint4 dv4[4];
-                #pragma unroll
-                for (int c = 0; c < 4; c++)
-                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(hb + 2 * c) * klen + i0);
+                // act row into registers (per stage; L1-hot across chunks)
+                float4 ar[4];
+                {
+                    const float4* a4 = reinterpret_cast<const float4*>(aj);
+                    const int abase = (lane & 15) * 4; // act[16] per lane, same for both rows
+                    #pragma unroll
+                    for (int r = 0; r < 4; r++) ar[r] = a4[abase + r];
+                }
+                const unsigned char* wbase = wst[warp][buf];
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
-                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
-                    const float ds_c = dsr_base[(size_t)((hb + 2 * c) >> 7) * dscols + scol];
+                    const unsigned char* d8 = wbase + (size_t)(2 * c) * 256 + (size_t)lane * 16;
+                    const float ds_c = dsr[(size_t)((hb + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
                     // 4 accumulators (was 2): each chain was 4 deep and the
                     // fp32 FMA latency is 4 cycles, so the tail of every
@@ -3614,25 +3655,23 @@ __global__ void __launch_bounds__(288, 3) moe_fused_down_sum_fp8_kernel(
                     const float y1 = __shfl_sync(0xffffffff, y, 16);
                     if (lane == 0) { py[2 * c] = y; py[2 * c + 1] = y1; }
                 }
-            } else {
+            } else if (klen > 0) {
                 #pragma unroll
                 for (int hh = 0; hh < 8; hh++) {
                     int h = hb + hh;
                     float y = 0.f;
                     for (int k = lane; k < klen; k += 32)
                         y += (__half2float(__nv_cvt_fp8_to_halfraw(dbase[(size_t)h * klen + k], __NV_E4M3))
-                              * dsr_base[(size_t)(h >> 7) * dscols + (k >> 7)]) * aj[k];
+                              * dsr[(size_t)(h >> 7) * dscols + (k >> 7)]) * aj[k];
                     #pragma unroll
                     for (int off = 16; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
                     py[hh] = y;
                 }
             }
-            }
             if (lane == 0) {
                 #pragma unroll
                 for (int hh = 0; hh < 8; hh++) part[tt][ch * 8 + hh][j] = p * py[hh];
             }
-        }
         }
         }
         __syncthreads();
