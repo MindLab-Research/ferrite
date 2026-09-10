@@ -278,6 +278,7 @@ impl<'a> DevChain<'a> {
             cfg.vocab_size as i32,
             self.s.logits.ptr as *mut f32,
         )?;
+        self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
         self.dev.sync()?;
         let mut out = vec![0f32; cfg.vocab_size];
         self.dev.download_f32(&self.s.logits, &mut out)?;
@@ -347,6 +348,9 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         self.attention(layer, pos)?;
+        if layer == 0 {
+            self.stats("L0 attn_out(o)", &self.s.o, dim)?;
+        }
         self.dev.hc_post(
             self.s.o.ptr as *const f32,
             self.s.h.ptr as *const f32,
@@ -392,6 +396,9 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         self.moe(layer, ld)?;
+        if layer == 0 {
+            self.stats("L0 moe_out(o)", &self.s.o, dim)?;
+        }
         self.dev.hc_post(
             self.s.o.ptr as *const f32,
             self.s.h.ptr as *const f32,
@@ -404,6 +411,37 @@ impl<'a> DevChain<'a> {
         )?;
         self.copy_h_back()?;
         Ok(attn_pre)
+    }
+
+    /// Diagnostic: report the magnitude of a stage's output. `DSV41_STATS=1`.
+    /// Turns "the text is wrong" into "stage X is fine / stage Y exploded".
+    fn stats(&self, label: &str, buf: &DevBuf, n: usize) -> Result<()> {
+        if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false) {
+            self.dev.sync()?;
+            let mut v = vec![0f32; n];
+            let b = Device::view(buf.ptr, n * 4);
+            self.dev.download_f32(&b, &mut v)?;
+            let mut mx = f32::NEG_INFINITY;
+            let mut mn = f32::INFINITY;
+            let mut ss = 0f64;
+            let mut nan = 0usize;
+            for &x in &v {
+                if x.is_nan() {
+                    nan += 1;
+                } else {
+                    mx = mx.max(x);
+                    mn = mn.min(x);
+                    ss += (x as f64) * (x as f64);
+                }
+            }
+            eprintln!(
+                "[stats] {label:<26} rms={:9.4} min={:9.4} max={:9.4} nan={nan}",
+                (ss / n as f64).sqrt(),
+                mn,
+                mx
+            );
+        }
+        Ok(())
     }
 
     fn copy_h_back(&self) -> Result<()> {
