@@ -3737,6 +3737,61 @@ impl CudaBackend {
     /// (each a sync) + host-side cache clones per layer per token
     /// (2.8ms/layer measured).
     #[allow(clippy::too_many_arguments)]
+    /// Two GEMMs in ONE gemm3 launch (the per-group-x extension): x0 x w1 and
+    /// x1 x w2 — same-x groups pass x0 == x1, different-input pairs (e.g. the
+    /// GDN {f_b, g_b}) pass their own x each. Replaces 2x (f32->bf16 cast +
+    /// cuBLAS GEMM + splitK reduce). Returns None when disabled (FERRITE_GEMM3=0),
+    /// unsupported (in_f < gemm3's K-split floor, n > 16) or on kernel error —
+    /// callers fall back to matmul_dev.
+    fn gemm2_fused(
+        &self,
+        x0: &DevBuf,
+        x1: &DevBuf,
+        w1: &Tensor,
+        w2: &Tensor,
+        n: usize,
+        in_f: usize,
+        o1: usize,
+        o2: usize,
+    ) -> Result<Option<(DevBuf, DevBuf)>> {
+        if n == 0 || n > 16 {
+            return Ok(None);
+        }
+        if !std::env::var("FERRITE_GEMM3").map(|v| v != "0").unwrap_or(true) {
+            return Ok(None);
+        }
+        if let (Ok(da), Ok(db)) = (self.dev_weight_bf16(w1), self.dev_weight_bf16(w2)) {
+            let out0 = DevBuf::alloc(self.dev, self.stream, n * o1)?;
+            let out1 = DevBuf::alloc(self.dev, self.stream, n * o2)?;
+            let partial = DevBuf::alloc(self.dev, self.stream, 8 * n * (o1 + o2))?;
+            let r = unsafe {
+                ferrite_gemm3_bf16_mma(
+                    x0.as_const_f32(),
+                    x1.as_const_f32(),
+                    std::ptr::null(),
+                    da.ptr as *const std::ffi::c_void,
+                    db.ptr as *const std::ffi::c_void,
+                    std::ptr::null(),
+                    partial.as_f32(),
+                    out0.as_f32(),
+                    out1.as_f32(),
+                    std::ptr::null_mut(),
+                    n as i32,
+                    in_f as i32,
+                    o1 as i32,
+                    o2 as i32,
+                    0,
+                    self.stream,
+                )
+            };
+            if r == 0 {
+                return Ok(Some((out0, out1)));
+            }
+            eprintln!("[opcheck] gemm2_fused({in_f}->{o1},{o2}) err {r} — falling back to matmul_dev");
+        }
+        Ok(None)
+    }
+
     pub fn dsa_layer_dev(
         &self,
         x: &DevBuf,
@@ -3751,19 +3806,36 @@ impl CudaBackend {
         let ni = n as i32;
         let (h, dk, dv, ih, idm, kpool) = (w.h, w.dk, w.dv, w.ih, w.idm, w.kpool);
 
-        // 1. query path: qa → rmsnorm → qb [n, h*dk]. (gemv5 fused same-input
-        // GEMV measured SLOWER than separate tiled — see gdn note.)
-        let qa = self.matmul_dev(x, w.q_a, ni, hidden as i32, (w.q_a.shape.0[0]) as i32)?;
+        // 1+2+3 (2026-09-10, per-group-x gemm3): the {q_a, kv_a} pair (both
+        // take x) and the {q_b, wq_b} pair (both take qa_ln) each fuse into
+        // ONE launch — was 4 casts + 4 cuBLAS GEMMs (+ splitK reduces) per
+        // DSA layer. kvb stays on cuBLAS: its in_f (kv_lora per rank) is
+        // below gemm3's K-split floor (kper would round to 0 — guarded in
+        // the launcher). The GEMMs are independent; the rmsnorms are
+        // elementwise, so the reorder is semantics-free.
+        let (qa, latent) = match self.gemm2_fused(
+            x, x, w.q_a, w.kv_a, n, hidden,
+            w.q_a.shape.0[0], w.kv_a.shape.0[0],
+        )? {
+            Some(t) => t,
+            None => (
+                self.matmul_dev(x, w.q_a, ni, hidden as i32, (w.q_a.shape.0[0]) as i32)?,
+                self.matmul_dev(x, w.kv_a, ni, hidden as i32, (w.kv_a.shape.0[0]) as i32)?,
+            ),
+        };
         let qa_ln = self.rmsnorm_dev(&qa, w.q_a_ln, w.rms_eps, n, w.q_a.shape.0[0])?;
-        let qb = self.matmul_dev(&qa_ln, w.q_b, ni, w.q_a.shape.0[0] as i32, (h * dk) as i32)?;
-
-        // 2. kv path: latent → rmsnorm → kvb [n, h*(dk+dv)]
-        let latent = self.matmul_dev(x, w.kv_a, ni, hidden as i32, (w.kv_a.shape.0[0]) as i32)?;
         let kv_ln = self.rmsnorm_dev(&latent, w.kv_a_ln, w.rms_eps, n, w.kv_a.shape.0[0])?;
+        let (qb, qi) = match self.gemm2_fused(
+            &qa_ln, &qa_ln, w.q_b, w.wq_b, n, w.q_a.shape.0[0],
+            h * dk, ih * idm,
+        )? {
+            Some(t) => t,
+            None => (
+                self.matmul_dev(&qa_ln, w.q_b, ni, w.q_a.shape.0[0] as i32, (h * dk) as i32)?,
+                self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?,
+            ),
+        };
         let kvb = self.matmul_dev(&kv_ln, w.kv_b, ni, w.kv_a.shape.0[0] as i32, (h * (dk + dv)) as i32)?;
-
-        // 3. indexer queries: qi = qa @ wq_b [n, ih*idm]
-        let qi = self.matmul_dev(&qa_ln, w.wq_b, ni, w.q_a.shape.0[0] as i32, (ih * idm) as i32)?;
 
         // 4-6. index keys / per-head weights / kpool gate: three SAME-INPUT(x)
         // GEMVs fused into ONE tri kernel at decode (n==1) — ki = LN(x@wk),

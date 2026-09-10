@@ -2987,6 +2987,11 @@ extern "C" cudaError_t ferrite_gemm3_bf16_mma(
     int n, int in_f, int o1, int o2, int o3, cudaStream_t s) {
     if (n <= 0 || n > 16) return cudaSuccess;
     if (in_f <= 0 || (in_f & 15) != 0) return cudaErrorNotSupported;
+    // K-split floor (2026-09-10, found while routing the DSA pairs): at KS=8
+    // kper = ((in_f+7)/8) & ~15 rounds DOWN to 0 for in_f < 128 — the blocks
+    // would stage nothing and silently write ALL-ZERO output. Reject instead
+    // (the caller falls back to cuBLAS).
+    if ((((in_f + 7) / 8) & ~15) < 16) return cudaErrorNotSupported;
     const int ototal = o1 + o2 + o3;
     if (ototal <= 0) return cudaSuccess;
     const int tiles = ((o1 + 15) >> 4) + ((o2 + 15) >> 4) + ((o3 + 15) >> 4);
