@@ -420,5 +420,16 @@ fn rank_body(
         }
         logits = chain.step(next, ids.len() + step)?;
     }
+    if rank == 0 {
+        let el = t_dec.elapsed();
+        let n = out.len().max(1);
+        eprintln!(
+            "[dsv41] DECODE {} tokens in {:.2}s = {:.1} tok/s ({:.2} ms/token)",
+            out.len(),
+            el.as_secs_f64(),
+            n as f64 / el.as_secs_f64(),
+            el.as_secs_f64() * 1e3 / n as f64
+        );
+    }
     Ok(out)
 }
