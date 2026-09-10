@@ -446,9 +446,23 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
     const float* xr = x + (size_t)r * hc_dim;
     float ss = 0.f;
     for (int c = threadIdx.x; c < hc_dim; c += blockDim.x) ss += xr[c] * xr[c];
+    // warp reduction, then ACROSS WARPS. The earlier version stopped at the
+    // warp level and stored only warp 0's partial sum, so `ss` was 1/nwarps of
+    // the true sum of squares and `inv` was sqrt(nwarps) = 2.83x too large at
+    // blockDim=256. That scaled every hc coefficient wrong, which mis-mixed the
+    // whole residual stream — the model's output had no relation to its input.
+    // (Same class as the documented GLM '8-warp reduce' bug.)
     for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
     __shared__ float sss;
-    if (threadIdx.x == 0) sss = ss;
+    __shared__ float wpart[32];
+    const int nwarp = (blockDim.x + 31) >> 5;
+    if ((threadIdx.x & 31) == 0) wpart[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < nwarp) ? wpart[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+        if (threadIdx.x == 0) sss = v;
+    }
     __syncthreads();
     const float inv = rsqrtf(sss / (float)hc_dim + eps);
     for (int m = threadIdx.x; m < mix; m += blockDim.x) {
@@ -503,8 +517,30 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
         cm[jk] = cm[jk] / row_sum[j] + eps;
     }
     __syncthreads();
-    // step 2..N: alternate column then row normalisation (sinkhorn iterations)
+    // Reference sequence (kernel.py hc_split_sinkhorn):
+    //   comb = softmax(comb, -1) + eps      (rows)
+    //   comb = comb / (colsum + eps)        (columns)
+    //   for _ in range(iters-1): row-normalise, then col-normalise
+    // It ENDS with a column normalisation; ending with a row one (as the first
+    // version did) leaves the rows summing to 1 instead of the columns, so the
+    // mixing weights are off by that factor.
     for (int it = 0; it < sinkhorn_iters; it++) {
+        if (it > 0) {
+            // row normalise (skipped on the first pass: softmax already did it)
+            for (int j = 0; j < hc; j++) {
+                if (threadIdx.x == 0) {
+                    float s = 0.f;
+                    for (int k = 0; k < hc; k++) s += cm[j * hc + k];
+                    row_sum[j] = s;
+                }
+            }
+            __syncthreads();
+            for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+                const int j = jk / hc;
+                cm[jk] = cm[jk] / (row_sum[j] + eps);
+            }
+            __syncthreads();
+        }
         // column normalise
         for (int k = 0; k < hc; k++) {
             if (threadIdx.x == 0) {
@@ -517,20 +553,6 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
         for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
             const int k = jk % hc;
             cm[jk] = cm[jk] / (col_sum[k] + eps);
-        }
-        __syncthreads();
-        // row normalise
-        for (int j = 0; j < hc; j++) {
-            if (threadIdx.x == 0) {
-                float s = 0.f;
-                for (int k = 0; k < hc; k++) s += cm[j * hc + k];
-                row_sum[j] = s;
-            }
-        }
-        __syncthreads();
-        for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
-            const int j = jk / hc;
-            cm[jk] = cm[jk] / (row_sum[j] + eps);
         }
         __syncthreads();
     }
