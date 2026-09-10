@@ -7025,6 +7025,87 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // 13.61 → 13.76ms. The kernel stays at its natural 5 blocks/SM; the mix is
 // at its practical floor on both tried axes (float4 loads: neutral;
 // occupancy: regressed).)
+// SGLANG-STRUCTURE MIX (2026-09-10): sglang's mhc_pre_gemm_sqrsum_splitk
+// uses a `token_block` of tokens per block so the fw tile is loaded once and
+// reused across them. Ours re-read fw per token (KS=4 => 4 re-reads of 1.5MB
+// per token-stream = 24MB of the ~30MB a call moves; at 4.3us that is 7TB/s
+// = DRAM-bound, since with the concurrent MoE weight streams fw does not
+// stay in L2). This variant gives each block TWO tokens: thread halves of
+// 128 work on one token apiece with SHARED fw float4 loads, one barrier,
+// and a 5-slot epilogue writing both tokens' partials.
+__global__ void hc_pre_mix_split2_kernel(const float* __restrict__ res,
+                                         const float* __restrict__ fw,
+                                         float* __restrict__ mx_partial,
+                                         unsigned* __restrict__ ctr2,
+                                         int s, int n, int h, int mix) {
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x < (unsigned)s) {
+        ctr2[threadIdx.x] = 0u;
+    }
+    const int KS = gridDim.z;
+    const int t0 = blockIdx.x * 2;
+    const int m0 = blockIdx.y * 4;
+    const int z = blockIdx.z;
+    const int nh = n * h;
+    const int seg = (nh + KS - 1) / KS;
+    const int lo = z * seg;
+    const int hi = min(lo + seg, nh);
+    const int half = threadIdx.x >> 7;      // 0/1 -> token t0 / t0+1
+    const int tid = threadIdx.x & 127;
+    const int t = t0 + half;
+    const bool active = (t < s);
+    const float* x = res + (size_t)t * n * h;
+    const float* row0 = fw + (size_t)m0 * nh;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    float sq = 0.f;
+    if (active) {
+        const int lo4 = lo >> 2, hi4 = hi >> 2;
+        for (int i4 = lo4 + tid; i4 < hi4; i4 += 128) {
+            const size_t off = (size_t)i4 << 2;
+            const float4 xv = *reinterpret_cast<const float4*>(x + off);
+            sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
+            #pragma unroll
+            for (int mm = 0; mm < 4; mm++) {
+                const float4 wv = *reinterpret_cast<const float4*>(row0 + (size_t)mm * nh + off);
+                acc[mm] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
+            }
+        }
+        for (int i = (hi4 << 2) + tid; i < hi; i += 128) {
+            const float xv = x[i];
+            sq += xv * xv;
+            #pragma unroll
+            for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
+        }
+    }
+    __shared__ float red[2][5][4];   // [half][m-row 0..3 | sq 4][warp-in-half]
+    const int wl = (threadIdx.x >> 5) & 3;
+    #pragma unroll
+    for (int mm = 0; mm < 4; mm++) {
+        float a = acc[mm];
+        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
+        if ((threadIdx.x & 31) == 0) red[half][mm][wl] = a;
+    }
+    for (int off = 16; off > 0; off >>= 1) sq += __shfl_down_sync(0xffffffff, sq, off);
+    if ((threadIdx.x & 31) == 0) red[half][4][wl] = sq;
+    __syncthreads();
+    if (tid < 5) {                       // one thread per (half, m-row|sq)
+        const int tt = t0 + half;
+        if (tt < s) {
+            float tot = 0.f;
+            #pragma unroll
+            for (int w = 0; w < 4; w++) tot += red[half][tid][w];
+            if (tid < 4) {
+                if (m0 + tid < mix)
+                    mx_partial[((size_t)tt * mix + m0 + tid) * KS + z] = tot;
+            } else if (m0 == 0) {
+                mx_partial[(size_t)s * mix * KS + (size_t)tt * KS + z] = tot;
+            }
+        }
+    }
+}
+
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
                                         float* __restrict__ mx_partial,
