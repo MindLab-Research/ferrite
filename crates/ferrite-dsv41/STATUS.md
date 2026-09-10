@@ -209,6 +209,67 @@ the named op is often innocent — the peer copy was blamed for an expert-kernel
 overrun. And a patch that does not match its anchor fails **silently**; grep the
 call sites afterwards.
 
+## Numerical parity against the reference — the method that works
+
+The user's suggestion was decisive: **run the reference implementation's maths on
+the same input and diff value-by-value**. One parity test found the root cause in
+a single shot that hours of text-watching had not.
+
+`tests/hc_parity.rs` runs `dsv41_hc_mixes` on the reference's deterministic input
+and prints pre/post/comb; `/tmp/refcmp/hc_ref.py` computes the same numbers with
+numpy straight from the checkpoint. Result after the fix: **7 significant digits
+agree** (PRE `0.9425751` vs `0.94257504`, POST `0.031103252` vs
+`3.1103250e-02`, COMB row0 `0.7791158` vs `7.7911586e-01`).
+
+### The bug it found (root cause of input-independent output)
+
+`hc_mixes` computed `ss = Σ x[c]²` and reduced it **within each warp only** — the
+cross-warp step was missing, so at `blockDim=256` the sum covered 1/8 of the
+elements and `inv = rsqrt(ss/hc_dim + eps)` was **sqrt(8) = 2.83x too large**.
+Every hc coefficient was then wrong, which mis-mixed the entire residual stream
+in every layer: the output had no relation to the input at any prompt length.
+This is the same class as the GLM "8-warp reduce" bug already in this repo's
+notes — **reductions must be checked for the cross-warp step**.
+
+### Other reference mismatches found and fixed the same session
+
+| item | was | now |
+|---|---|---|
+| `original_seq_len` | read a top-level key that does not exist → **0**, which DISABLES YaRN (`if original_seq_len > 0`) | reads `rope_scaling.original_max_position_embeddings` = **65536** ✓ |
+| Sinkhorn order | ended with a ROW normalisation | reference order: softmax+eps → col → (iters-1)×(row, col), ending COL ✓ |
+| compress rope | one table (theta=10000) for everything | separate table at `compress_rope_theta` = 160000 ✓ |
+| compressed latent | stored in the KV ring **without RoPE** | rotated at the group's first position before the store ✓ |
+| query RoPE | `step=1` → head i at position pos+i | `step=0` (all heads at the same position) ✓ |
+| `layer()` return | the attention block's pre-mix | the FFN block's pre-mix (what the next layer collapses with) ✓ |
+| indexer | only kv-source layers ran it | every index-source layer runs its own; keys read from the kv owner ✓ |
+| window indices | uploaded only on the placeholder path | uploaded every step (the indexer path left them stale) ✓ |
+| KV ring size | window rows only (compressor wrote past the end) | window + max_compress rows ✓ |
+| wo_a offsets | GLOBAL group offsets into a LOCAL slice | local offsets ✓ |
+| weight loading | ~92k individual `cudaMalloc`, per-tensor `File::open`, missing `h.begin` | one pooled allocation per layer, mmap'd shards, DMA (`cudaMemcpy`/`2D`), device-side bf16 widening ✓ |
+| `bind_to` | enabled peer access at bind time (races context creation) | binds only; peer access enabled after all contexts exist ✓ |
+
+## Remaining work
+
+1. **One more numerical bug** (output still degenerate: `時刻_...` then blanks).
+   The parity method is the way to find it: diff the **attention path** next
+   (q/kv projections → sparse attention → inverse rope → wo_a/wo_b) against a
+   numpy reference built from the same weights, exactly as was done for the hc
+   chain. `sparse_attn`'s sink handling and the fp8 activation quantisation are
+   the two least-verified pieces left.
+2. **Engram write-back** (currently skipped; its absence changes quality but the
+   user confirms it is optional, so it is not the cause of the degenerate text).
+3. **Performance to 200 tok/s single-request (5 ms/step)** — not started; the
+   correctness work was blocking. Where the time currently goes:
+   * **~4 device-wide syncs per layer** (downloading hc coefficients, MoE routing
+     indices/weights, the compressor's publish flag) ≈ 160-200 syncs/step. The hc
+     coefficients can stay on the device (ping-pong two buffers — the kernel
+     already takes device pointers), and the publish decision is a pure function
+     of `pos % ratio` computable on the host. **This is the first thing to fix.**
+   * the collective is synchronous (peer copy + device sync + 2 barriers per
+     call, 2 calls per layer = 80/step).
+   * MoE dispatch is host-driven: ~6 experts × 7 launches per layer.
+   * no CUDA graph yet — ~60 launches/layer × 40 = 2400 launches/step.
+
 ## Verification recipes
 
 ```bash
