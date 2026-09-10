@@ -1237,3 +1237,12 @@ Xid 13、ECC 全 0、他节点零崩 → **隔离该节点**）给出处置范�
 - 远端 HEAD `93fc75d`；`build.sh`：`--use_fast_math` 默认 ON（`FERRITE_NO_FAST_MATH=1` 可关）
 - TP=4 实验（capture-legal async alloc / pre-capture sync）：env-gated 默认 OFF
 - `gdn_step_v2` block：默认 **512**（历史已知良好值），`FERRITE_GDN_B1024=1` 选 1024
+
+## 2026-09-10 最后一项测试：两个 gated 实验组合 → SIGSEGV（更糟）
+
+`FERRITE_CAPTURE_ASYNC_ALLOC=1 FERRITE_CAPTURE_SYNC=1`（此前从未同时开启）：
+`faults=0` 但 `captured=0 cap_true=0`，进程 **SIGSEGV (core dumped)**，bench 退出码 1。
+→ 与 capture_lock 卡点一致（该路径不可用）。**两个实验开关保持默认 OFF。**
+
+**至此 b300-4 上 batched 路径的全部可测试组合均已穷尽**（默认 / 两开关单独 / 两开关组合 /
+GDN block 512-1024 / fast_math 开-关 / page cache 冷-热 / 改动前提交），**无一可用**。
