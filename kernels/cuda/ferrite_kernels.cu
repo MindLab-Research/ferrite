@@ -7398,19 +7398,29 @@ __global__ void p2p_ar_store_v5_kernel(
     }
 }
 
-__global__ void p2p_ar_publish_v5_kernel(
+__global__ void p2p_ar_pubred_v5_kernel(
     unsigned* const* __restrict__ ready_tbl,  // [world] peers' flag rows
     unsigned* __restrict__ epoch,
+    const float* __restrict__ staging_local,  // my [2][world][stride]
     const unsigned* __restrict__ ready_local, // my [world] flag row
-    int world, int my_rank) {
+    float* __restrict__ out,
+    int world, int my_rank, int n, int stride) {
+    // publish + reduce fused (2026-09-10): the publish used to be its own
+    // 1-block kernel and the reduce another launch — 3 kernels per AR. v5's
+    // ABSOLUTE-epoch stamps make multi-block polling safe (no per-block
+    // seen[] state: every block waits for the same e+1 on all peers), so one
+    // multi-block kernel can stamp (block 0), poll (all blocks, all peers)
+    // and reduce its slice. Saves one graph node + launch per AR (90/step).
     const unsigned e = *epoch;
-    if (threadIdx.x == 0) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
         for (int r = 0; r < world; r++)
             atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
         __threadfence_system();
         *epoch = e + 1u;   // AFTER stamping: the next round's store reads e+1
     }
     __syncthreads();
+    // every block polls ALL peers' stamps for this round (e+1). Monotonic
+    // stamps + the lockstep replay make this wait exact — no seen[] state.
     if (threadIdx.x < (unsigned)world) {
         const int tr = (int)threadIdx.x;
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
@@ -7425,14 +7435,9 @@ __global__ void p2p_ar_publish_v5_kernel(
             }
         }
     }
-}
-
-__global__ void p2p_ar_reduce_v5_kernel(
-    const float* __restrict__ staging_local,  // my [2][world][stride]
-    float* __restrict__ out,
-    const unsigned* __restrict__ epoch,       // = e+1 after publish
-    int world, int n, int stride) {
-    const unsigned e = *epoch - 1u;           // the round just completed
+    __syncthreads();
+    // reduce this block's slice of staging[e & 1] (ascending rank order —
+    // the same order the standalone reduce used: bit-identical)
     const int step = gridDim.x * blockDim.x;
     const int n4 = n >> 2;
     for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
@@ -7466,12 +7471,12 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
         partial, staging_tbl, epoch, world, my_rank, n, stride);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
-    p2p_ar_publish_v5_kernel<<<1, 32, 0, s>>>(
-        ready_tbl, epoch, ready_local, world, my_rank);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return err;
-    p2p_ar_reduce_v5_kernel<<<blocks, threads, 0, s>>>(
-        staging_local, out, epoch, world, n, stride);
+    // publish + reduce in ONE multi-block launch (see the kernel note) —
+    // the store's completion (kernel boundary) still publishes the staging
+    // writes before this kernel's polls/reduce reads.
+    p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out,
+        world, my_rank, n, stride);
     return cudaGetLastError();
 }
 
