@@ -145,10 +145,24 @@ impl<'a> DevChain<'a> {
         let bf16_cap = dim.max(ql).max(nh * hd).max(cfg.vocab_size);
         let bf16 = dev.alloc(bf16_cap * 2)?;
 
+        // The model's max_position_embeddings (1M) sizes NOTHING at runtime:
+        // index_k alone would be 256-512 MiB per layer (~16.5 GiB over 43
+        // layers), and on a 4 GB host the driver's per-allocation bookkeeping
+        // for that many mappings is what actually dies (a 256 MiB cudaMalloc
+        // 'fails' with 182 GB free). Caches are sized for the positions this
+        // run can actually reach — DSV41_MAX_POS, default 64k.
+        let max_pos = cfg
+            .max_seq_len
+            .min(
+                std::env::var("DSV41_MAX_POS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(65536),
+            );
         let mut layers = Vec::with_capacity(cfg.n_layers + cfg.n_mtp_layers);
         for l in 0..cfg.n_layers + cfg.n_mtp_layers {
             let ratio = cfg.compress_ratio(l).max(1);
-            let max_comp = cfg.max_seq_len / ratio + 2;
+            let max_comp = max_pos / ratio + 2;
             layers.push(LayerCache {
                 ring: dev.alloc(fb(cfg.window_size * hd))?,
                 idxs: dev.alloc(fb(cfg.window_size + cfg.index_topk + 8).max(4))?,
@@ -198,7 +212,7 @@ impl<'a> DevChain<'a> {
         };
 
         // RoPE tables covering the whole context.
-        let table = cfg.max_seq_len.min(1 << 20);
+        let table = max_pos;
         let half = cfg.rope_head_dim / 2;
         let cos = dev.alloc(fb(table * half))?;
         let sin = dev.alloc(fb(table * half))?;
