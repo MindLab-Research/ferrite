@@ -762,13 +762,14 @@ extern "C" cudaError_t ferrite_gdn_chunk_v2(const float* q, const float* k,
         if (e != cudaSuccess) return e;
     }
     for (int t = 0; t < n; t++) {
-        // 2026-09-10: 512 -> 1024 threads. The smem sweeps process dk*dv =
-        // 16384 elements; at 512 threads that is a 32-deep SERIAL scalar
-        // access chain per thread (~19us of pure latency, measured 17.12us —
-        // the kernel is latency-bound, not bandwidth-bound: 64KB at 8TB/s is
-        // 8ns). 1024 threads halves the chain to 16 while raising per-SM
-        // occupancy to 2x1024 = 2048 (from 3x512 = 1536).
-        dim3 block(1024);
+        // Block size (2026-09-10 A/B): 512 = the historical known-good value;
+        // 2b6aff4 raised it to 1024 (measured neutral at the time: 13.42 vs
+        // 13.40ms). With 67KB smem this halves the resident blocks/SM
+        // (3x512=1536 -> 2x1024=2048 threads/SM is the nominal win, but the
+        // per-SM block COUNT halves) — re-measure on the current node before
+        // changing the default. FERRITE_GDN_B1024=1 selects 1024.
+        const int gdn_block = (getenv("FERRITE_GDN_B1024") != nullptr) ? 1024 : 512;
+        dim3 block(gdn_block);
         dim3 grid(1, h, 1);
         const float* qt = q + (size_t)t * h * dk;
         const float* kt = k + (size_t)t * h * dk;
