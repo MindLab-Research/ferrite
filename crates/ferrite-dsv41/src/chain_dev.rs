@@ -579,7 +579,9 @@ impl<'a> DevChain<'a> {
     }
 
     fn upload_pre(&self, v: &[f32]) -> Result<()> {
-        self.dev.upload_f32_at(self.s.pre.ptr, 0, v)
+        // slot 0 is the premix the first layer's attention collapses with; the
+        // layers rotate their own coefficients on the device afterwards
+        self.dev.upload_f32_at(self.s.pre_a.ptr, 0, v)
     }
 
     fn dl(&self, src: *const f32, n: usize) -> Result<Vec<f32>> {
