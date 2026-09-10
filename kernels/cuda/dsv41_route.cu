@@ -15,6 +15,16 @@
 //
 // One block per row, 256 threads. `hist` (optional) counts assignments per
 // expert so a caller can bucket them without a second scan.
+//
+// STATUS: this kernel is correct for n_experts <= blockDim (verified exactly at
+// n_experts=6/topk=3) but picks a DIFFERENT expert set from the CPU reference at
+// the production shape (n_experts=384/topk=6: 12/12 assignments differ, and they
+// still differ with deliberately well-separated scores, so it is not a
+// near-tie/precision artefact). The per-thread second candidate (threads
+// 0..n_experts-blockDim-1 handle two experts) is the prime suspect. The earlier
+// crash was a separate bug — a `used[]` flag array sized [topk] and indexed by
+// the expert id — which is fixed (consumed experts are now marked by writing
+// -INFINITY into s_sel).
 
 #include <cuda_runtime.h>
 #include <cstdint>
@@ -37,12 +47,15 @@ __global__ void route_topk_kernel(const float* __restrict__ scores,
                                   int norm_topk_prob, float route_scale, int score_func) {
     const int r = blockIdx.x;
     if (r >= rows) return;
-    // layout: [n_experts] unbiased act | [n_experts] selection score | [topk] pick | [topk] used
+    // layout: [n_experts] unbiased act | [n_experts] selection score | [topk] pick
+    // A consumed expert is marked by writing -INFINITY into s_sel, so no
+    // per-expert flag array is needed. (An earlier revision kept a `used` array
+    // sized [topk] and indexed it by the expert id — an out-of-bounds smem
+    // access that a small test shape happened not to trip.)
     extern __shared__ float sh[];
     float* s_act = sh;
     float* s_sel = s_act + n_experts;
     int* s_pick = (int*)(s_sel + n_experts);
-    int* s_used = s_pick + topk;
 
     const float* sr = scores + (size_t)r * n_experts;
     for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
@@ -50,7 +63,6 @@ __global__ void route_topk_kernel(const float* __restrict__ scores,
         s_act[e] = a;
         s_sel[e] = a + (bias ? bias[e] : 0.f);
     }
-    for (int t = threadIdx.x; t < topk; t += blockDim.x) s_used[t] = 0;
     __syncthreads();
 
     __shared__ float s_bv[32];
@@ -60,7 +72,6 @@ __global__ void route_topk_kernel(const float* __restrict__ scores,
         float bv = -INFINITY;
         int bi = n_experts;
         for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
-            if (s_used[e]) continue;
             const float v = s_sel[e];
             if (v > bv || (v == bv && e < bi)) {
                 bv = v;
@@ -94,7 +105,9 @@ __global__ void route_topk_kernel(const float* __restrict__ scores,
             if (lane == 0) s_pick[it] = i;
         }
         __syncthreads();
-        if (threadIdx.x == 0 && s_pick[it] < n_experts) s_used[s_pick[it]] = 1;
+        if (threadIdx.x == 0 && s_pick[it] < n_experts) {
+            s_sel[s_pick[it]] = -INFINITY;  // consume it
+        }
         __syncthreads();
     }
 
@@ -131,7 +144,7 @@ extern "C" int dsv41_route_topk(const float* scores, const float* bias, float* w
     if (rows <= 0 || n_experts <= 0 || topk <= 0 || topk > n_experts) {
         return (int)cudaErrorInvalidValue;
     }
-    const size_t smem = (size_t)n_experts * 2 * sizeof(float) + (size_t)topk * 2 * sizeof(int);
+    const size_t smem = (size_t)n_experts * 2 * sizeof(float) + (size_t)topk * sizeof(int);
     if (smem > 200 * 1024) return (int)cudaErrorInvalidValue;
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(route_topk_kernel,
