@@ -60,38 +60,31 @@ GDN recurrence on top.
    compatible with the in-order layer walk but forbids layer-level parallelism
    across a source boundary.
 
-## The M-dimension problem on Blackwell (decides the fp4 route)
+## The fp4 route is not optional (and not fp8)
 
-Blackwell's 5th-gen tensor core instruction (`tcgen05.mma`) is **CTA-level**:
-one thread issues an M=64 or M=128 operation whose accumulator lives in tensor
-memory. A decode step computes with m = 16 rows (16 sequences, one token each),
-and inside the MoE each *expert* sees only ~1.2 rows on average (96 assignments
-over ~85 distinct experts). So:
+The routed experts are fp4 and are 58% of the checkpoint, so they are the whole
+performance story: ~7.5 GB of expert weight traffic per rank per step (~1 ms at
+7.6 TB/s). Three facts pin the implementation:
 
-* the fp8 `mma.sync.m16n8k32` path (warp-level, m16) is a **good fit** for this
-  workload and is what the dense GEMMs use;
-* the only native fp4 path on this part is the CTA-level `tcgen05 kind::mxf4`,
-  which would pad m=1.2-per-expert up to M=64/128 — i.e. **~50x wasted rows**.
+1. **fp4 only.** Routing the experts through an fp8 GEMM (even a lossless
+   fp4→e4m3 re-encode) doubles those bytes → ~2 ms/step, and it is explicitly
+   forbidden. There is no fp8 expert entry point in the ABI, and a test
+   enforces that.
+2. **fp4 needs tcgen05.** `sm_103a` has no warp-level fp4 MMA at all (probed:
+   every `mma.sync` fp4 spelling is rejected by ptxas), so the experts run
+   `tcgen05.mma ... kind::mxf4.block_scale.scale_vec::2X`. That instruction's
+   scale type is fixed to ue8m0, which is exactly the checkpoint's expert scale
+   layout (per-row × k-block-32 e8m0) — zero conversion.
+3. **Organisation matters.** tcgen05 is a CTA-level op (M=64/128) while a decode
+   step has m=16 rows in total and each expert sees ~1.2 of them, so the MoE
+   must be a *grouped* GEMM (sort assignments by expert, M=128 tiles spanning
+   experts with a masked valid-row count), never a per-expert launch. The
+   wasted M rows cost compute, not weight bandwidth — and at these shapes the
+   weight bandwidth is the binding constraint.
 
-The two fp4 options therefore trade against each other:
-
-| route | weight bytes | M utilisation |
-|---|---|---|
-| native MXFP4 `tcgen05` | 0.5 B/param (fp4) | M=64/128 vs m≈1-8 → heavily padded |
-| lossless fp4→e4m3 + `mma.sync` fp8 | 1.0 B/param | m16n8k32 matches m=16 exactly |
-
-Because the two effects are of the same order (2x bytes either way, roughly),
-**which one wins is a measurement question, not a design axiom** — and the
-answer may differ between decode (m=16) and prefill (m large, where tcgen05's
-M=128 amortises). Two consequences:
-
-1. The `tcgen05` grouped GEMM is only worth building with the **grouped/masked
-   organisation** (sort assignments by expert, run M=128 tiles that span several
-   experts with a masked row count), i.e. the DeepGEMM `m_grouped_gemm_nt_masked`
-   shape — not a per-expert launch.
-2. Until that measurement exists, the lossless e4m3 + fp8 path is the
-   *honest default*: correct, tensor-core, no dequantisation, one code path, and
-   exactly what the checkpoint's own converter produces.
+The dense weights are fp8 *in the checkpoint*; they stay fp8 (`mma.sync`
+m16n8k32 e4m3, with the ue8m0 32×32 block scales applied per k-block in the
+epilogue). That is not a fallback, it is their native format.
 
 ## What is *not* worth optimising first
 

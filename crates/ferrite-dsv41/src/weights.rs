@@ -328,37 +328,6 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
     out
 }
 
-/// Convert a routed expert's fp4 weights into the lossless e4m3 form used by
-/// the fallback GEMM path.
-///
-/// Input: the checkpoint's packed fp4 `[out, in/2]` (I8) plus its e8m0
-/// `[out, in/32]` scales. Output: e4m3 `[out, in]` plus one e8m0 scale per
-/// 32x32 tile. The conversion is the reference's `cast_e2m1fn_to_e4m3fn` and is
-/// **exact**: inside a tile each row segment is scaled by a power of two in
-/// `[1, 2^6)`, and an e2m1 value times a power of two stays representable in
-/// e4m3 (the 6-bit offset bound is why `6.0 * 2^6 = 384 <= 448`).
-///
-/// This is *re-encoding*, not dequantisation: the bytes stay 8-bit and are
-/// consumed by the fp8 tensor-core MMA. It costs 1 byte/param against fp4's
-/// 0.5, which is the price of not having the tcgen05 MXFP4 path.
-pub fn convert_expert_fp4_to_e4m3(
-    packed: &[u8],
-    scales: &[u8],
-    out: usize,
-    inn: usize,
-) -> (Vec<u8>, Vec<u8>) {
-    assert_eq!(packed.len(), out * inn / 2, "packed fp4 length");
-    assert_eq!(scales.len(), out * inn / 32, "per-row-32 e8m0 scales");
-    let mut seg = vec![0f32; out * (inn / 32)];
-    for (i, &b) in scales.iter().enumerate() {
-        seg[i] = crate::quant::ue8m0_decode(b);
-    }
-    let mut w8 = vec![0u8; out * inn];
-    let mut s8 = vec![0u8; (out / 32) * (inn / 32)];
-    crate::quant::cast_fp4_to_e4m3(packed, &seg, out, inn, &mut w8, &mut s8);
-    (w8, s8)
-}
-
 /// Whether a spec's first dimension is the one that shrinks under sharding,
 /// and by how much (rows/experts/vocab/engram).
 pub fn shard_factor(cfg: &Dsv41Config, spec: &TensorSpec, world: usize) -> (usize, usize) {
@@ -677,37 +646,6 @@ mod tests {
                     Shard::Cols => assert_eq!(ls[1], spec.shape[1] / f, "{}", spec.name),
                 }
             }
-        }
-    }
-
-    #[test]
-    fn fp4_to_e4m3_expert_conversion_is_exact() {
-        // 32x64 tile: fp4 values times per-segment powers of two, converted to
-        // e4m3 + one ue8m0 scale per 32x32 tile. Decoding both must agree.
-        let (out, inn) = (32usize, 64usize);
-        let mut packed = vec![0u8; out * inn / 2];
-        // alternate codes 4 (+2.0) and 12 (-2.0) in the low/high nibbles
-        for b in packed.iter_mut() {
-            *b = crate::quant::fp4_pack_byte(4, 12);
-        }
-        let mut scales = vec![0u8; out * (inn / 32)];
-        for r in 0..out {
-            for c in 0..(inn / 32) {
-                // a power-of-two scale per (row, 32-col) segment
-                scales[r * (inn / 32) + c] = crate::quant::ue8m0_encode_pow2(-(r as i32 % 5));
-            }
-        }
-        let (w8, s8) = convert_expert_fp4_to_e4m3(&packed, &scales, out, inn);
-        assert_eq!(w8.len(), out * inn);
-        assert_eq!(s8.len(), (out / 32) * (inn / 32));
-        // reference decode of the fp4 original
-        let mut want = vec![0f32; out * inn];
-        crate::quant::dequant_fp4_row32(&packed, &scales, out, inn, &mut want);
-        // decode of the converted e4m3 form
-        let mut got = vec![0f32; out * inn];
-        crate::quant::dequant_fp8_block(&w8, &s8, out, inn, 32, &mut got);
-        for i in 0..out * inn {
-            assert_eq!(got[i], want[i], "element {i}");
         }
     }
 

@@ -30,18 +30,16 @@
 //! completion (CCCL ships wrappers in
 //! `cuda/__ptx/instructions/generated/tcgen05_mma.h`).
 //!
-//! The expert kernels therefore have two implementations behind one ABI:
+//! The routed **experts are fp4 and must be computed on fp4 tensor cores**
+//! (NVFP4 / MXFP4 on Blackwell) — `tcgen05.mma ... kind::mxf4` with the
+//! checkpoint's own e8m0 / k-block-32 scales, which is exactly the hardware MX
+//! layout. Routing fp4 data through an fp8 GEMM is explicitly forbidden (it
+//! would double the expert weight bytes on the dominant term of the step), so
+//! this ABI deliberately has **no fp8 expert entry point**.
 //!
-//! 1. **primary** — `tcgen05.mma ... kind::mxf4` with the checkpoint's own
-//!    e8m0 / k-block-32 scales, which is exactly the hardware MXFP4 layout;
-//! 2. **fallback** — a *lossless* fp4 -> e4m3 re-encode at load time (the
-//!    reference's own `convert.py::cast_e2m1fn_to_e4m3fn`, exact because an
-//!    e2m1 value times a power-of-two offset stays representable in e4m3) fed
-//!    to the proven fp8 `m16n8k32` MMA.
-//!
-//! Neither path dequantises to bf16/f32. The fallback doubles the expert
-//! weight bytes (1 vs 0.5 per parameter), which is why the tcgen05 form is the
-//! performance target.
+//! The dense weights, by contrast, *are* fp8 e4m3 in the checkpoint and stay
+//! fp8 — that is their native format, and the reference computes them the same
+//! way (its `fp8_gemm_kernel`).
 //! * Block scales (ue8m0) are applied per k-block in the epilogue with a
 //!   separate accumulator, exactly like the reference `fp8_gemm_kernel`:
 //!   `acc += dot(a_k, b_k) * scale_a[row, kblk] * scale_b[nblk, kblk]`.
@@ -131,38 +129,10 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
-    /// **Fallback** expert path: identical maths, but the weights were
-    /// *losslessly* re-encoded fp4 -> e4m3 at load time (the reference's own
-    /// `cast_e2m1fn_to_e4m3fn`), so the kernel is the proven fp8 m16n8k32 MMA
-    /// with per-32x32 ue8m0 scales in the epilogue. Used when the tcgen05 MXFP4
-    /// path is unavailable; it costs 1 byte/param instead of 0.5.
-    pub fn dsv41_expert_gate_up_fp8(
-        a: *const u8,
-        a_scale: *const f32,
-        w1: *const u8,
-        w1_scale: *const u8,
-        w3: *const u8,
-        w3_scale: *const u8,
-        out: *mut f32,
-        rows: i32,
-        dim: i32,
-        inter: i32,
-        limit: f32,
-        stream: CuStream,
-    ) -> i32;
-
-    /// **Fallback** expert down projection (see above).
-    pub fn dsv41_expert_down_fp8(
-        act: *const f32,
-        w2: *const u8,
-        w2_scale: *const u8,
-        weight: *const f32,
-        out: *mut f32,
-        rows: i32,
-        dim: i32,
-        inter: i32,
-        stream: CuStream,
-    ) -> i32;
+    // NOTE (user directive, 2026-09-10): the routed experts are fp4 in the
+    // checkpoint and MUST be computed with fp4 tensor cores (NVFP4 / MXFP4 on
+    // Blackwell). Computing them through fp8 is forbidden -- there is
+    // deliberately NO fp8 expert entry point in this ABI.
 
     // ----------------------------------------------------------------- engram
     /// Gather `n_cols` table rows per token, dequantise (fp8 + ue8m0 row-32

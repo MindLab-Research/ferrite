@@ -12,12 +12,20 @@ GLM-5.3-Flash code paths are untouched; the kernels are linked into the same
    buffer and fed to a bf16 GEMM. fp8/fp4 weights stay packed in device memory
    for the whole run; `quant.rs`'s dequant helpers exist only for checkpoint
    verification and for the CPU golden path.
-2. **Every large matmul is a tensor-core MMA over the native format.**
-   * dense weights — fp8 e4m3, `mma.m16n8k32.f32.e4m3.e4m3.f32`;
-   * routed experts — fp4 e2m1, `mma.m16n8k32.kind::f8f6f4.f32.e2m1.e2m1.f32`
-     (the block-scaled `kind::mxf4` form is the follow-up optimisation);
-   * runtime activations stay fp8/fp4 (window KV fp8/128, compressed KV fp4/16,
-     indexer q,k fp4/32).
+2. **Every large matmul is a tensor-core MMA over the native format**, and a
+   quantised operand is never computed in a *different* precision:
+   * routed experts are fp4 (NVFP4 / MXFP4) and run on **fp4 tensor cores** —
+     `tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X` with the
+     checkpoint's own e8m0 / k-block-32 scales, which is exactly the hardware MX
+     layout. **Computing them through fp8 is forbidden** (user directive
+     2026-09-10): it would double the expert weight bytes, and the experts are
+     58% of the checkpoint and the dominant term of a decode step. The ABI
+     therefore has no fp8 expert entry point at all, and a test enforces it.
+   * dense weights are fp8 e4m3 *in the checkpoint* and stay fp8 —
+     `mma.sync.m16n8k32.f32.e4m3.e4m3.f32` (that is their native format; the
+     reference computes them the same way in `fp8_gemm_kernel`).
+   * runtime activations stay in their own formats (window KV fp8/128,
+     compressed KV fp4/16, indexer q,k fp4/32; the expert inputs are fp4).
 3. **Block scales are applied in the epilogue**, per k-block, with a separate
    accumulator — exactly the reference `fp8_gemm_kernel` scheme
    (`acc += dot(a_k, b_k) * scale_a[row, kblk] * scale_b[nblk, kblk]`), never by
@@ -93,14 +101,12 @@ truth for every semantic decision here:
    `kernels.rs`): the only warp-level MMA that compiles is the fp8
    `m16n8k32.f32.e4m3.e4m3.f32`; **every fp4 `mma.sync` form is rejected**
    ("Instruction 'mma with FP6/FP4 floating point type' not supported on
-   .target 'sm_103a'"). fp4 on this part is reachable only through
-   `tcgen05.mma...kind::mxf4.block_scale.scale_vec::2X` (5th-gen tensor cores:
-   tmem accumulator, smem operand + scale descriptors, mbarrier completion).
-   Consequently the expert ABI has two implementations: the primary native-MXFP4
-   `tcgen05` one, and a fallback that losslessly re-encodes fp4 -> e4m3 at load
-   (the reference's own `cast_e2m1fn_to_e4m3fn`) and runs the proven fp8 MMA.
-   The fallback doubles expert weight bytes, so `tcgen05` is the performance
-   target, not a nice-to-have.
+   .target 'sm_103a'", and `kind::mxf4` is an "Illegal modifier" for `mma`).
+   fp4 on this part is reachable only through
+   `tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X` (5th-gen
+   tensor cores: tmem accumulator, smem operand + scale descriptors, mbarrier
+   completion). `kind::mxf4`'s scale type is fixed to **ue8m0**, which is
+   exactly the checkpoint's expert scale format -- no conversion needed.
 2. The engram gather path in `chain.rs::forward` is stubbed (`// NOTE:`): the
    table lookup itself is implemented (kernels + `weights`), but the chain's
    per-layer wiring needs the real table buffers to be threaded through.
