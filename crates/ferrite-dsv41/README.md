@@ -89,10 +89,18 @@ truth for every semantic decision here:
 
 ## Open items to verify on hardware
 
-1. The exact fp4 e2m1 MMA form available for `sm_103a` (`kind::f8f6f4` m16n8k32
-   vs the block-scaled `kind::mxf4` m16n8k64). The kernel is written for the
-   former with the epilogue scale scheme; switching to `kind::mxf4` removes the
-   separate accumulator and halves the epilogue work.
+1. ~~Which fp4 MMA form exists on `sm_103a`~~ — **settled by probe** (see
+   `kernels.rs`): the only warp-level MMA that compiles is the fp8
+   `m16n8k32.f32.e4m3.e4m3.f32`; **every fp4 `mma.sync` form is rejected**
+   ("Instruction 'mma with FP6/FP4 floating point type' not supported on
+   .target 'sm_103a'"). fp4 on this part is reachable only through
+   `tcgen05.mma...kind::mxf4.block_scale.scale_vec::2X` (5th-gen tensor cores:
+   tmem accumulator, smem operand + scale descriptors, mbarrier completion).
+   Consequently the expert ABI has two implementations: the primary native-MXFP4
+   `tcgen05` one, and a fallback that losslessly re-encodes fp4 -> e4m3 at load
+   (the reference's own `cast_e2m1fn_to_e4m3fn`) and runs the proven fp8 MMA.
+   The fallback doubles expert weight bytes, so `tcgen05` is the performance
+   target, not a nice-to-have.
 2. The engram gather path in `chain.rs::forward` is stubbed (`// NOTE:`): the
    table lookup itself is implemented (kernels + `weights`), but the chain's
    per-layer wiring needs the real table buffers to be threaded through.

@@ -10,10 +10,38 @@
 //!
 //! * No weight is ever dequantised into a bf16/f32 buffer. fp8/fp4 weights stay
 //!   packed in device memory for the whole run.
-//! * Every large matmul is a tensor-core MMA over the native format:
-//!   - fp8 e4m3: `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32`;
-//!   - fp4 e2m1: `mma.sync.aligned.m16n8k32.row.col.kind::f8f6f4.f32.e2m1.e2m1.f32`
-//!     (the `kind::mxf4` block-scaled variant is the follow-up optimisation).
+//! * Every large matmul is a tensor-core MMA over the native format.
+//!
+//! # Verified instruction availability on sm_103a (B300, CUDA 13.2, ptxas)
+//!
+//! | form | status |
+//! |---|---|
+//! | `mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` | **works** — dense path |
+//! | `mma.sync...kind::f8f6f4.f32.e2m1.e2m1.f32` | **REJECTED**: `Instruction 'mma with FP6/FP4 ...' not supported on .target 'sm_103a'` |
+//! | any other `mma.sync` fp4/e2m1 form | rejected the same way |
+//! | `tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X` | the only fp4 entry point on Blackwell |
+//!
+//! The probe was run with an explicit
+//! `-gencode arch=compute_103a,code=sm_103a` and the generated PTX confirmed
+//! `.target sm_103a`, so this is not a missing-`a`-suffix artefact. There is no
+//! warp-level fp4 MMA on this part: fp4 lives on the 5th-generation tensor
+//! cores (`tcgen05`), i.e. tensor-memory accumulators, shared-memory operand
+//! descriptors, block-scale descriptors and `tcgen05.commit` + mbarrier
+//! completion (CCCL ships wrappers in
+//! `cuda/__ptx/instructions/generated/tcgen05_mma.h`).
+//!
+//! The expert kernels therefore have two implementations behind one ABI:
+//!
+//! 1. **primary** — `tcgen05.mma ... kind::mxf4` with the checkpoint's own
+//!    e8m0 / k-block-32 scales, which is exactly the hardware MXFP4 layout;
+//! 2. **fallback** — a *lossless* fp4 -> e4m3 re-encode at load time (the
+//!    reference's own `convert.py::cast_e2m1fn_to_e4m3fn`, exact because an
+//!    e2m1 value times a power-of-two offset stays representable in e4m3) fed
+//!    to the proven fp8 `m16n8k32` MMA.
+//!
+//! Neither path dequantises to bf16/f32. The fallback doubles the expert
+//! weight bytes (1 vs 0.5 per parameter), which is why the tcgen05 form is the
+//! performance target.
 //! * Block scales (ue8m0) are applied per k-block in the epilogue with a
 //!   separate accumulator, exactly like the reference `fp8_gemm_kernel`:
 //!   `acc += dot(a_k, b_k) * scale_a[row, kblk] * scale_b[nblk, kblk]`.
