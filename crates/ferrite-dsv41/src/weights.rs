@@ -179,8 +179,10 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
             for (n, o, k) in [("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)] {
                 push(
                     &mut out,
+                    // ON-DISK shape: fp4 e2m1 packs 2 values per byte, so the
+                    // file row is in/2 wide (logical width is `k`).
                     format!("{p}.ffn.experts.{e}.{n}.weight"),
-                    vec![o, k / 2], // fp4 packs 2 values per byte
+                    vec![o, k / 2],
                     Shard::Experts,
                 );
                 push(
@@ -450,18 +452,13 @@ impl SafetensorsIndex {
             match self.tensors.get(&s.name) {
                 None => missing.push(s.name.clone()),
                 Some(v) => {
-                    // fp4 weights are packed in the file: 2 values per byte
-                    let packed = v.dtype == "I8" && v.shape.len() == 2 && s.name.ends_with(".weight")
-                        && s.name.contains(".experts.");
-                    let expect = if packed {
-                        let mut e = s.shape.clone();
-                        e[1] /= 2;
-                        e
-                    } else {
-                        s.shape.clone()
-                    };
-                    if v.shape != expect {
-                        missing.push(format!("{}: shape {:?} != {:?}", s.name, v.shape, expect));
+                    // Spec shapes ARE the on-disk shapes: an fp4 expert weight
+                    // is already described packed ([out, in/2]) and its scale
+                    // as one e8m0 byte per (row, 32 cols). Dividing again here
+                    // would silently expect half a row -- a real defect found
+                    // by tests/real_checkpoint.rs.
+                    if v.shape != s.shape {
+                        missing.push(format!("{}: shape {:?} != {:?}", s.name, v.shape, s.shape));
                     }
                 }
             }
@@ -673,12 +670,12 @@ mod tests {
                 })
                 .collect(),
         };
-        // a spec list shaped like the file: the packed fp4 dim is halved in the file
+        // Specs carry the ON-DISK shapes, so the fp4 expert weight is already
+        // written packed: logical in = 128 -> file row = 64.
         let specs = vec![
-            TensorSpec { name: "ffn.experts.0.w1.weight".into(), shape: vec![4, 128], shard: Shard::Experts },
+            TensorSpec { name: "ffn.experts.0.w1.weight".into(), shape: vec![4, 64], shard: Shard::Experts },
             TensorSpec { name: "ffn.experts.0.w1.scale".into(), shape: vec![4, 4], shard: Shard::Experts },
         ];
-        // `a.weight` is an expert tensor -> the validator expects the packed shape
         let missing = idx.validate(&specs);
         assert!(missing.is_empty(), "{missing:?}");
     }
