@@ -1338,3 +1338,26 @@ cudaLaunchKernel 的 13µs ✗ —— 说明含屏障/依赖等待 ✓）✓ **"
 
 **本会话的最终量化结论（不变）**：每层 ~3.9ms = **主机 ~2.4ms（~130 次 API 调用 × ~18µs）✗
 + GPU ~1.5ms ✓** ⇒ 唯一出路是**用图把这些发射压掉** ✓，其前置是**设备侧分组 MoE** ✓。
+
+## 🏁🏁 最终验收：chat 模板默认编码后，多 prompt 全部正确
+
+参考的 `generate.py` **从不喂裸文本** ✓ —— 它用
+`encode_messages(messages, thinking_mode="chat")` =
+`<|begin_of_sentence|><|User|>{prompt}<|Assistant|></think>`
+= ids `[0, 128803] + prompt + [128804, 128822]`。
+**裸文本路径会让模型不知道自己该作答** ✗（例如 "The capital of Japan is" 立刻输出 EOS ✗，
+"1+1=" 给出 "2" 后不停 ✗）。把该模板设为 runner 的默认编码路径后 ✓：
+
+| prompt | 输出 ids | 判定 |
+|---|---|---|
+| `The capital of France is` | `[51119, 1]` = " Paris" | ✓ 与官方 chat 路径一致 |
+| `The capital of Japan is` | `[106239, 16, 1]` = " Tokyo." | ✓✓ |
+| `1+1=` | `[20, 1]` = "2" 后**正确停止** | ✓✓ |
+| `请背诵《静夜思》` | 连贯作答（`[1342, 4504, ...]`）| ✓ |
+
+（`DSV41_PROMPT_IDS=a,b,c` 仍可覆盖 ✓，用于喂官方 token 做逐 token 对拍 ✓。）
+
+**⚠ 方法论教训（本会话第二次踩到）**：验证必须用**与官方相同的输入形式** ✗ ——
+我之前用裸文本跑，把"模型缺助手框架"误判成"尾部退化" ✗；更早还把"官方 chat 模板的
+特殊 token 导致预测变化"误判成 bug ✗（后来发现官方同 prompt 也给不同 token ✓）。
+**结论：跨实现对比必须同 prompt 编码 ✓、同位置 ✓、同张量宽度 ✓、同是否含 AR ✓。**
