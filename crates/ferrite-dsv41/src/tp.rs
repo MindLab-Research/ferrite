@@ -215,7 +215,10 @@ impl Collective {
             let parity_off = ((round as usize % 2) * self.world * self.bytes) as i64;
             let reduced_local =
                 (self.staging.ptr as *const u8).wrapping_add(self.reduced_at) as *const c_uint;
-            let ctr = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+            // BISECT: pass a null counter so the store kernel does NOT stamp; the
+            // standalone ar_stamp below does it instead (the combination that is
+            // independently verified by the micro-benchmark's default path).
+            let ctr = std::ptr::null_mut::<c_uint>();
             self.dev.ar_store2(
                 self.peer_slots.ptr as *const u64,
                 self.world as i32,
@@ -250,13 +253,13 @@ impl Collective {
         // this rank's data has landed. The old cudaDeviceSynchronize here blocked
         // the host (so nothing overlapped) ~90 times per decode step.
         let round = self.round.fetch_add(1, AtOrd::AcqRel) + 1;
+        self.dev.ar_stamp(
+            self.peer_stamps.ptr as *const u64,
+            self.world as i32,
+            self.rank as i32,
+            round,
+        )?;
         if !dev_side {
-            self.dev.ar_stamp(
-                self.peer_stamps.ptr as *const u64,
-                self.world as i32,
-                self.rank as i32,
-                round,
-            )?;
             self.barrier.wait();
         }
         Ok(())
@@ -289,9 +292,17 @@ impl Collective {
             round,
             self.peer_reduced.ptr as *const u64,
             self.rank as i32,
-            ctr2,
-            if dev_side { 1 } else { 0 },
+            std::ptr::null_mut::<c_uint>(),
+            0, // BISECT: the standalone ar_mark below does the marking
         )?;
+        if dev_side {
+            self.dev.ar_mark(
+                self.peer_reduced.ptr as *const u64,
+                self.world as i32,
+                self.rank as i32,
+                round,
+            )?;
+        }
         self.dev
             .memcpy_d2d(buf, base as *const std::ffi::c_void, len)?;
         if !dev_side {
