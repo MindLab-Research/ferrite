@@ -457,6 +457,13 @@ impl<'a> DevChain<'a> {
             cfg.vocab_size as i32,
         )?;
 
+        // probe: h right after embedding + hc expansion
+        if std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+            let hv = self.dl(self.s.h.as_f32(), hc * dim)?;
+            let r = (hv.iter().map(|v| v * v).sum::<f32>() / hv.len() as f32).sqrt();
+            eprintln!("[mine] xin_rms={}", (r * 1e6).round() / 1e6);
+        }
+
         // the initial collapse takes copy 0 of the stream
         let mut premix = vec![0f32; hc];
         premix[0] = 1.0;
@@ -580,6 +587,17 @@ impl<'a> DevChain<'a> {
             cfg.hc_eps,
         )?;
         let attn_pre = self.dl(self.s.pre.as_f32(), hc)?;
+        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+            let po = self.dl(self.s.post.as_f32(), hc)?;
+            let cb = self.dl(self.s.comb.as_f32(), hc * hc)?;
+            eprintln!("[mine] L0 pre={attn_pre:?}");
+            eprintln!("[mine] L0 post={po:?}");
+            eprintln!("[mine] L0 comb={cb:?}");
+            let rs: Vec<f32> = (0..hc)
+                .map(|j| (0..hc).map(|k| cb[j * hc + k]).sum())
+                .collect();
+            eprintln!("[mine] L0 comb_rowsum={rs:?}");
+        }
         self.upload_pre(premix)?;
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
