@@ -842,9 +842,18 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
 extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const uint8_t* w,
                                  const uint8_t* w_scale, const float* bias, float* out, int m,
                                  int n, int k, cudaStream_t s) {
-    if (m <= 0 || n <= 0 || k <= 0 || (k & 31)) return (int)cudaErrorInvalidValue;
+    if (m <= 0 || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return (int)cudaErrorInvalidValue;
+    // The A tile lives in shared memory: 16 rows x k bytes. At the model's real
+    // k (5120) that is 80 KB, well past the 48 KB static limit, so the kernel
+    // needs the opt-in dynamic size (Blackwell allows ~227 KB/block). Setting
+    // the attribute every call is cheap and avoids the per-device pitfall (the
+    // attribute is per-context, and a TP8 process has one context per rank).
     const int smem = 16 * k;
-    if (smem > 48 * 1024) return (int)cudaErrorInvalidValue;  // tile A must fit
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
     gemm_fp8_kernel<<<grid, 128, smem, s>>>(a, a_scale, w, w_scale, bias, out, m, n, k);
     return (int)cudaGetLastError();
