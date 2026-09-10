@@ -1262,7 +1262,12 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
     // with the four-accumulator unroll (DSV41_HC_MIXES_ACC4): that pair measured
     // 348 ms/token, a 4.3x regression over this alone, and the unroll is neutral
     // by itself (138.4 vs 138.8).
-    int nthreads = ((mix + 31) / 32) * 32;
+    // NOTE: the thread count is mix*32 (one warp per mix row), NOT
+    // ((mix+31)/32)*32 — the latter rounds the row count up to a warp count and
+    // then uses it as a thread count, which for mix=24 yields 32 threads, i.e. a
+    // single warp walking all 24 rows serially: measured 350 ms/token. One warp
+    // per row is 80 ms/token on the same binary (+72%).
+    int nthreads = mix * 32;
     if (nthreads < 32) nthreads = 32;
     if (nthreads > 1024) nthreads = 1024;
     if (const char* e = getenv("DSV41_HC_MIXES_THREADS")) {
