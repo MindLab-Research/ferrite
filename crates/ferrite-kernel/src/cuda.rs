@@ -1899,6 +1899,55 @@ impl CudaBackend {
         }
     }
 
+/// VERSION GATE (user rule 2026-09-10: 严禁组合不同版本的 .so 与二进制).
+/// Right after dlopen, dlsym the .so's build stamp and compare it with this
+/// binary's own git revision + the expected ABI number. ANY mismatch (or a
+/// missing stamp, i.e. a .so built before the stamp existed) is a hard error
+/// — the process must not start. Rationale: a mismatched pair silently
+/// measures garbage (an A/B of "dc4d7ae .so + HEAD binary" produced numbers
+/// that meant nothing and cost hours).
+unsafe fn verify_kernel_build(
+    handle: *mut std::ffi::c_void,
+    so_path: &str,
+) -> Result<()> {
+    const EXPECTED_ABI: u32 = 1;
+    let get_id = libc_dlsym(
+        handle,
+        b"ferrite_kernel_build_id\0".as_ptr() as *const std::os::raw::c_char,
+    );
+    let get_abi = libc_dlsym(
+        handle,
+        b"ferrite_kernel_abi_version\0".as_ptr() as *const std::os::raw::c_char,
+    );
+    if get_id.is_null() || get_abi.is_null() {
+        return Err(FerriteError::InvalidArg(format!(
+            "kernel version gate: {so_path} carries NO build stamp (built before \
+             the gate existed). Rebuild both artifacts: \
+             `cd kernels/cuda && bash build.sh 103a` + `cargo build --release`."
+        )));
+    }
+    let id_fn: extern "C" fn() -> *const std::os::raw::c_char = std::mem::transmute(get_id);
+    let abi_fn: extern "C" fn() -> u32 = std::mem::transmute(get_abi);
+    let so_abi = abi_fn();
+    let so_id = std::ffi::CStr::from_ptr(id_fn()).to_string_lossy().to_string();
+    let bin_id = env!("FERRITE_BUILD_ID");
+    if so_abi != EXPECTED_ABI {
+        return Err(FerriteError::InvalidArg(format!(
+            "kernel ABI mismatch: {so_path} abi={so_abi}, this binary expects {EXPECTED_ABI}. \
+             Rebuild both artifacts."
+        )));
+    }
+    if so_id != bin_id {
+        return Err(FerriteError::InvalidArg(format!(
+            "kernel build-id mismatch — REFUSING TO START (严禁组合不同版本): \
+             .so {so_path} build_id={so_id} vs binary build_id={bin_id}. \
+             Rebuild both artifacts from the same checkout: \
+             `cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release`."
+        )));
+    }
+    Ok(())
+}
+
     /// Load `libferrite_kernels.so` (and its cudart dependency) explicitly,
     /// binding the backend to CUDA device `device` (cudaSetDevice). Each rank
     /// of a TP deployment constructs one backend per GPU.
@@ -1910,6 +1959,7 @@ impl CudaBackend {
                 "dlopen({so_path}) failed — run kernels/cuda/build.sh first"
             )));
         }
+        unsafe { Self::verify_kernel_build(handle, so_path)? };
         let err = unsafe { cudaSetDevice(device) };
         if err != 0 {
             return Err(FerriteError::InvalidArg(format!(
@@ -1930,6 +1980,7 @@ impl CudaBackend {
                 "dlopen({so_path}) failed — run kernels/cuda/build.sh first"
             )));
         }
+        unsafe { Self::verify_kernel_build(handle, so_path)? };
         Ok(Self::new())
     }
 

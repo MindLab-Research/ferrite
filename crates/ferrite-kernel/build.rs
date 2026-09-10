@@ -29,5 +29,30 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=cublas");
         }
     }
+    // KERNEL/BINARY SAME-SOURCE GATE (user rule 2026-09-10): the binary embeds
+    // the build id that kernels/cuda/build.sh last stamped into .build_id
+    // (git revision + .cu content hash). The .so carries the same string and
+    // cuda.rs compares them at dlopen — a mismatched pair refuses to start,
+    // so "rebuild only one artifact" can no longer be measured by accident.
+    let kdir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kernels/cuda");
+    let stamp_path = kdir.join(".build_id");
+    let build_id = std::fs::read_to_string(&stamp_path)
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            let git_id = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{git_id}+cuNOSTAMP")
+        });
+    println!("cargo:rustc-env=FERRITE_BUILD_ID={build_id}");
+    println!("cargo:rerun-if-changed={}", stamp_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 }

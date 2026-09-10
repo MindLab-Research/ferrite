@@ -17,6 +17,20 @@
 #include <cmath>
 #include <cuda_fp8.h>
 
+// ─────────────────────────────────────────────────────────────────────────
+// BUILD STAMP (user rule 2026-09-10): a .so MUST NOT be combined with a
+// Rust binary from another revision. build.sh injects the git revision via
+// -DFERRITE_KERNEL_BUILD_ID; the Rust side dlsym()s these two symbols right
+// after dlopen and REFUSES TO START on any mismatch. Bump the ABI number
+// whenever the extern "C" signatures below change.
+// ─────────────────────────────────────────────────────────────────────────
+#ifndef FERRITE_KERNEL_BUILD_ID
+#define FERRITE_KERNEL_BUILD_ID "unstamped"
+#endif
+#define FERRITE_KERNEL_ABI_VERSION 1u
+extern "C" const char* ferrite_kernel_build_id(void) { return FERRITE_KERNEL_BUILD_ID; }
+extern "C" unsigned ferrite_kernel_abi_version(void) { return FERRITE_KERNEL_ABI_VERSION; }
+
 #define FERRITE_CHECK(call)                                                  \
     do {                                                                     \
         cudaError_t e = (call);                                              \

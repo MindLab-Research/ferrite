@@ -23,9 +23,23 @@ NVCC="${NVCC:-nvcc}"
 # requests (the known pool-size sensitivity). Keep it ON unless investigating.
 FAST_MATH_FLAG="--use_fast_math"
 if [ -n "${FERRITE_NO_FAST_MATH:-}" ]; then FAST_MATH_FLAG=""; fi
+# Build stamp: the Rust side refuses to load a .so built from another
+# revision (user rule: 严禁组合不同版本). Use the git revision of THIS tree.
+BUILD_ID="$(git -C "$(dirname "$0")" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [ -n "$(git -C "$(dirname "$0")" status --porcelain 2>/dev/null)" ]; then
+  BUILD_ID="${BUILD_ID}-dirty"
+fi
+# Same-source enforcement: fold the .cu content hash in. The Rust side embeds
+# whatever this script last wrote to .build_id, so rebuilding only ONE of the
+# two artifacts produces a mismatch and the process REFUSES TO START.
+CU_HASH="$(sha256sum "$SRC" | cut -c1-16)"
+BUILD_ID="${BUILD_ID}+cu${CU_HASH}"
+echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
+
 "$NVCC" -O3 -shared -Xcompiler -fPIC $FAST_MATH_FLAG \
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
+    -DFERRITE_KERNEL_BUILD_ID="\"${BUILD_ID}\"" \
     -o "$OUT" "$SRC"
 
-echo "built ${OUT} for sm_${ARCH} from ${SRC}"
+echo "built ${OUT} for sm_${ARCH} from ${SRC} (build_id ${BUILD_ID})"
