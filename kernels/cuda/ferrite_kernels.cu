@@ -4836,8 +4836,14 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_slotwise_kernel(
     const float* __restrict__ as_,          // [n, topk+1]
     float* __restrict__ partial,            // [n*(topk+1), hidden]
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, int dscols) {
-    const int h0 = blockIdx.x * 32;
+    int inter_shared, int topk, int dscols, int slr) {
+    // R = 32-row chunks per block (FERRITE_DOWN_SLOT_R, default 8 = 256 rows
+    // = 64KB of ONE expert per block — matching the act kernel's grid size
+    // and contiguity). The first slotwise attempt used R=1 (8KB/block, 18432
+    // blocks) and LOST 19% to block scheduling; the bytes-per-block is what
+    // matters.
+    const int R = slr;
+    const int h0 = blockIdx.x * 32 * R;
     const int a = blockIdx.y;
     const int t = a / (topk + 1);
     const int j = a - t * (topk + 1);
@@ -4871,7 +4877,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_slotwise_kernel(
     }
     if (v == 0.f || wbase == nullptr) {
         // skipped assignment -> ZERO partial (the reduce adds it; x+0 is exact)
-        for (int r = threadIdx.x; r < 32; r += blockDim.x)
+        for (int r = threadIdx.x; r < 32 * R; r += blockDim.x)
             partial[(size_t)a * hidden + h0 + r] = 0.f;
         return;
     }
@@ -4879,7 +4885,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_slotwise_kernel(
     #define SW_STAGE(BUF) do { \
         for (int c = threadIdx.x; c < 32 * (klen >> 4); c += 256) { \
             const int r = c / (klen >> 4), cc = (c % (klen >> 4)) * 16; \
-            const unsigned char* src_ = wbase + (size_t)(h0 + r) * klen + cc; \
+            const unsigned char* src_ = wbase + (size_t)(hb + r) * klen + cc; \
             unsigned char* dst_ = sW[BUF] + r * 272 + cc; \
             const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
             asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
@@ -4892,11 +4898,13 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_slotwise_kernel(
             if (off + 16 <= klen)
                 *reinterpret_cast<uint4*>(saq + off) = *reinterpret_cast<const uint4*>(aq_t + off);
     }
+    for (int ch = 0; ch < R; ch++) {
+    const int hb = h0 + ch * 32;
     SW_STAGE(0);
     asm volatile("cp.async.wait_group 0;\n");
     __syncthreads();
     float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;
-    const int srow = h0 >> 7;
+    const int srow = hb >> 7;
     for (int kc = warp; kc < (klen >> 5); kc += 8) {
         const float wsc = dsr[(size_t)srow * dscols + ((kc << 5) >> 7)] * v;
         const unsigned char* arow = saq + (kc << 5);
@@ -4938,9 +4946,11 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_slotwise_kernel(
             float sum = 0.f;
             #pragma unroll
             for (int w = 0; w < 8; w++) sum += part[w][r];
-            partial[(size_t)a * hidden + h0 + r] = sum;
+            partial[(size_t)a * hidden + hb + r] = sum;
         }
     }
+    __syncthreads();
+    }  // end chunk loop
 }
 
 // phase 2: out[t, h] = Σ_j partial[(t*(topk+1)+j)*hidden + h], j-ascending
@@ -5170,13 +5180,22 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_slotwise(
     if (hidden % 32 != 0 || (inter & 31) != 0 || (inter_shared & 31) != 0)
         return cudaErrorNotSupported;
     if (inter > 256 || inter_shared > 256 || topk > 8) return cudaErrorNotSupported;
-    dim3 grid((unsigned)(hidden / 32), (unsigned)(n * (topk + 1)));
+    static int slr = -1;
+    if (slr < 0) {
+        const char* e = getenv("FERRITE_DOWN_SLOT_R");
+        int v = e ? atoi(e) : 8;
+        if (v < 1) v = 1;
+        if (v > 32) v = 32;
+        while (v > 1 && (hidden % (32 * v))) v >>= 1;
+        slr = v;
+    }
+    dim3 grid((unsigned)(hidden / (32 * slr)), (unsigned)(n * (topk + 1)));
     moe_down_e4m3_slotwise_kernel<<<grid, 256, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
         (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
         (const unsigned char*)aq, as_, partial,
-        expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
+        expert_start, e_local, hidden, inter, inter_shared, topk, dscols, slr);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
     const size_t tot = (size_t)n * hidden;
