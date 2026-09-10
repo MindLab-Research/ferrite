@@ -222,7 +222,22 @@ impl Dsv41Config {
                 .chain(us(t, "index_source_layer_ids"))
                 .collect::<Vec<_>>(),
             compress_rope_theta: f(t, "compress_rope_theta").unwrap_or(40000.0) as f32,
-            original_seq_len: u(t, "original_seq_len").unwrap_or(0) as usize,
+            // YaRN is configured through `rope_scaling` in this release:
+            //   {"rope_type":"yarn","factor":16,"beta_fast":32,"beta_slow":1,
+            //    "original_max_position_embeddings":65536}
+            // The earlier version read only a top-level `original_seq_len` and
+            // defaulted to 0 — which DISABLES YaRN entirely (the reference's
+            // `if original_seq_len > 0` branch), so every rope frequency was the
+            // unscaled one and the positional encoding disagreed with the
+            // reference from position 1 onward.
+            original_seq_len: u(t, "original_seq_len")
+                .or_else(|| {
+                    t.get("rope_scaling")
+                        .and_then(|r| r.get("original_max_position_embeddings"))
+                        .and_then(|x| x.as_u64())
+                        .map(|v| v as usize)
+                })
+                .unwrap_or(0),
             rope_theta: f(t, "rope_theta").unwrap_or(10000.0) as f32,
             rope_factor: f(t, "rope_factor")
                 .or_else(|| t.get("rope_scaling").and_then(|r| r.get("factor")).and_then(|x| x.as_f64()))
