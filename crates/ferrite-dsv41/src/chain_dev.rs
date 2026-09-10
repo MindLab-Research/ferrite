@@ -98,6 +98,10 @@ struct Scratch {
     ex_act: DevBuf,    // [2*inter]
     ex_out: DevBuf,    // [dim]
     hist: DevBuf,      // [n_experts] i32
+    idx_q: DevBuf,     // [index_n_heads * index_head_dim]
+    idx_k: DevBuf,     // [index_head_dim]
+    idx_w: DevBuf,     // [index_n_heads]
+    idx_lens: DevBuf,  // [1] i32
     // bf16 staging for the cuBLAS path
     bf16: DevBuf,
 }
@@ -180,6 +184,10 @@ impl<'a> DevChain<'a> {
             ex_act: dev.alloc(fb(2 * inter.max(dim)))?,
             ex_out: dev.alloc(fb(dim))?,
             hist: dev.alloc(fb(n_exp))?,
+            idx_q: dev.alloc(fb(cfg.index_n_heads.max(1) * cfg.index_head_dim.max(1)))?,
+            idx_k: dev.alloc(fb(cfg.index_head_dim.max(1)))?,
+            idx_w: dev.alloc(fb(cfg.index_n_heads.max(1)))?,
+            idx_lens: dev.alloc(4)?,
             bf16,
         };
 
@@ -605,12 +613,22 @@ impl<'a> DevChain<'a> {
         // the most recent ones, which is a deliberate placeholder (it is a
         // superset-free pruning that at least makes the long-range rows
         // reachable — it is NOT the learned selection).
-        let take_comp = comp_len.min(cfg.index_topk);
-        for j in 0..take_comp {
-            idx_host[win + j] = (win + comp_len - take_comp + j) as i32;
+        let mut take_comp = comp_len.min(cfg.index_topk);
+        if comp_len > 0 && cfg.is_index_source(layer) && cfg.indexer_owns_k(layer) && self.indexer(layer, pos, win, comp_len)? {
+            // the kernel wrote `comp_len.min(index_topk)` entries at [win, ..)
+            take_comp = comp_len.min(cfg.index_topk);
+        } else {
+            // Placeholder until every consumer reads its source's published
+            // selection: keep the most recent compressed rows. NOT the learned
+            // selection — it only makes the long-range rows reachable.
+            let placeholder = comp_len.min(cfg.index_topk);
+            for j in 0..placeholder {
+                idx_host[win + j] = (win + comp_len - placeholder + j) as i32;
+            }
+            take_comp = placeholder;
+            self.ul_i32(idxs_ptr, &idx_host)?;
         }
         let n_idx_cols = win + take_comp;
-        self.ul_i32(idxs_ptr, &idx_host)?;
 
         self.dev.sparse_attn(
             self.s.q.as_f32(),
@@ -682,6 +700,123 @@ impl<'a> DevChain<'a> {
             self.s.o.ptr as *mut f32,
         )?;
         Ok(())
+    }
+
+    /// Indexer for one decode step: publish this layer's index key for the
+    /// latent the compressor just produced, then score the published keys and
+    /// let the kernel write the top-k straight into the selection buffer at
+    /// `offset` (`window`, so it lands after the window block).
+    /// Returns false when there was nothing to select from.
+    fn indexer(&mut self, layer: usize, pos: usize, offset: usize, comp_len: usize) -> Result<bool> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let ql = cfg.q_lora_rank;
+        let idx_nh = cfg.index_n_heads;
+        let idx_hd = cfg.index_head_dim;
+        let rd = cfg.rope_head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ld = &self.w.layers[layer];
+        let (Some(wq_b), Some(wq_b_s), Some(wk), Some(kn), Some(wp)) = (
+            ld.idx_wq_b.as_ref(),
+            ld.idx_wq_b_scale.as_ref(),
+            ld.idx_wk.as_ref(),
+            ld.idx_k_norm.as_ref(),
+            ld.idx_weights.as_ref(),
+        ) else {
+            return Ok(false);
+        };
+        // the key for the group whose latent was just published (the latent
+        // stands for its group's FIRST token, so RoPE uses that position)
+        let group = self.layers[layer].compress_len.saturating_sub(1);
+        self.lin_bf16(
+            self.layers[layer].latent.ptr as *const f32,
+            cfg.head_dim as i32,
+            wk,
+            idx_hd as i32,
+            self.s.idx_k.ptr as *mut f32,
+        )?;
+        self.dev.rmsnorm(
+            self.s.idx_k.ptr as *const f32,
+            kn.as_f32(),
+            self.s.idx_k.ptr as *mut f32,
+            1,
+            idx_hd as i32,
+            cfg.norm_eps,
+        )?;
+        self.dev.apply_rope(
+            self.s.idx_k.ptr as *mut f32,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            1,
+            idx_hd as i32,
+            rd as i32,
+            (rd / 2) as i32,
+            (group * ratio) as i32,
+            1,
+            false,
+        )?;
+        self.dev.memcpy_d2d(
+            (self.layers[layer].index_k.ptr as *mut u8).wrapping_add(group * idx_hd * 4) as *mut c_void,
+            self.s.idx_k.ptr as *const c_void,
+            idx_hd * 4,
+        )?;
+        // the queries come from the q_lora stream
+        self.lin(
+            self.s.qr.ptr as *const f32,
+            ql as i32,
+            wq_b,
+            wq_b_s,
+            (idx_nh * idx_hd) as i32,
+            self.s.idx_q.ptr as *mut f32,
+        )?;
+        self.dev.apply_rope(
+            self.s.idx_q.ptr as *mut f32,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            idx_nh as i32,
+            idx_hd as i32,
+            rd as i32,
+            (rd / 2) as i32,
+            pos as i32,
+            1,
+            false,
+        )?;
+        // per-head weights; the reference folds softmax_scale * n_heads^-0.5 into
+        // them, and our kernel applies softmax_scale * head_scale to the sum, so
+        // the same factor can be passed there instead
+        self.lin_bf16(
+            self.s.xn.ptr as *const f32,
+            dim as i32,
+            wp,
+            idx_nh as i32,
+            self.s.idx_w.ptr as *mut f32,
+        )?;
+        let lens = [comp_len as i32];
+        self.dev.upload_f32_at(self.s.idx_lens.ptr, 0, unsafe {
+            std::slice::from_raw_parts(lens.as_ptr() as *const f32, 1)
+        })?;
+        let scale = 1.0f32 / (cfg.head_dim as f32).sqrt() / (idx_nh as f32).sqrt();
+        self.dev.indexer_topk(
+            self.s.idx_q.as_f32(),
+            self.layers[layer].index_k.as_f32(),
+            self.s.idx_w.as_f32(),
+            std::ptr::null(),
+            self.s.idx_lens.as_i32(),
+            // the kernel writes `picked + offset` into out[row*cols + i], so
+            // `out` points at the first compressed slot of the row
+            (self.layers[layer].idxs.ptr as *mut i32).wrapping_add(offset),
+            1,
+            1,
+            idx_nh as i32,
+            idx_hd as i32,
+            comp_len as i32,
+            cfg.index_topk as i32,
+            offset as i32,
+            scale,
+            1.0,
+            false,
+        )?;
+        Ok(true)
     }
 
     /// Compressor for one decode step: the two projections in fp32 (the release

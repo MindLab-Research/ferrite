@@ -138,6 +138,33 @@ Established against the checkpoint and the reference's `Compressor`:
   key for the indexer, and on non-sources reuse the source layer's published
   selection (`is_index_source` / `is_kv_source` already say which is which).
 
+## Indexer — exact reference semantics (for the wiring step)
+
+`Indexer.forward(x, qr, latent, start_pos, offset)` — `x` is the normed attention
+input, `qr` the q_lora stream, `latent` this layer's RoPE-free compressed latent
+(`None` while its group is still filling), `offset` where the selection goes:
+
+1. **Index keys** (only when `owns_k` and a latent came out): `k = k_norm(wk(latent))`,
+   RoPE on the trailing `rope_head_dim` lanes using **the group's first token's
+   position** (`group j → j*ratio`), then fp4 quantisation, then publish into the
+   key cache at `start_pos // ratio`.
+2. **Index queries**: `q = wq_b(qr)` (a ColumnParallel over the q_lora stream,
+   `[4096, 1280]` fp8+scale in the checkpoint), RoPE with the *token's* positions,
+   then fp4 quantisation.
+3. `weights = weights_proj(x) * (softmax_scale * n_heads**-0.5)` — note it is
+   scaled here, not inside the score.
+4. `score = Σ_h relu(q_h · k) * w_h` over the published keys `[.., end_pos//ratio]`,
+   and **an all-reduce over ranks** (TP note).
+5. Visibility: `compress_lens = end_pos // ratio` (decode) — a block is visible
+   once the query has passed its last token.
+6. The top-k result is written at `offset` (the chain passes `window`, which is why
+   the compressed entries land directly after the window block).
+
+Deviation to keep in mind: the reference **fp4-quantises the index q/k**
+(`fp4_act_quant`); our `dsv41_indexer_topk` computes them in f32. That is more
+accurate but not bit-identical — it can flip which position is picked at the
+margins, so it must be validated by the text, not by an equality check.
+
 ## Verification recipes
 
 ```bash
