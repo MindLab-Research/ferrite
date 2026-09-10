@@ -480,11 +480,25 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
     }
     __syncthreads();
     const float inv = rsqrtf(sss / (float)hc_dim + eps);
-    for (int m = threadIdx.x; m < mix; m += blockDim.x) {
-        const float* wr = hc_fn + (size_t)m * hc_dim;
-        float acc = 0.f;
-        for (int c = 0; c < hc_dim; c++) acc += wr[c] * xr[c];
-        mixes[m] = acc * inv;
+    // One WARP per projection row with a shuffle reduction. The previous shape
+    // handed row m to thread m, so only `mix` (=24) lanes had work and each ran
+    // a serial 20480-iteration dependent-load loop: measured 1.06ms per call,
+    // 51% of the whole decode's GPU time (nsys cuda_gpu_kern_sum), at ~1% of
+    // memory bandwidth. Coalescing across a warp and splitting the dot by lane
+    // is the same fix that cured gdn_chunk and sparse_attn.
+    {
+        const int lane = threadIdx.x & 31;
+        const int wid = threadIdx.x >> 5;
+        const int nwarp = (blockDim.x + 31) >> 5;
+        for (int m = wid; m < mix; m += nwarp) {
+            const float* wr = hc_fn + (size_t)m * hc_dim;
+            float acc = 0.f;
+            for (int c = lane; c < hc_dim; c += 32) acc += wr[c] * xr[c];
+            for (int off = 16; off > 0; off >>= 1) {
+                acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            }
+            if (lane == 0) mixes[m] = acc * inv;
+        }
     }
     __syncthreads();
     if (threadIdx.x < (unsigned)hc) {
