@@ -597,6 +597,7 @@ impl<'a> DevChain<'a> {
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
         )?;
+        let _t_all = std::time::Instant::now();
         let attn_pre = self.dl(self.s.pre.as_f32(), hc)?;
         if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
             let po = self.dl(self.s.post.as_f32(), hc)?;
@@ -653,6 +654,10 @@ impl<'a> DevChain<'a> {
         )?;
         self.copy_h_back()?;
 
+        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+            eprintln!("[phs] L{layer} attn={:?}", _t_all.elapsed());
+        }
+        let _t_moe = std::time::Instant::now();
         // ---------------- FFN block ----------------
         self.dev.hc_mixes(
             self.s.h.ptr as *const f32,
@@ -668,6 +673,9 @@ impl<'a> DevChain<'a> {
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
         )?;
+        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+            eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
+        }
         // the FFN's pre is what the NEXT layer's attention collapses with
         // ("attention uses what the previous layer's FFN produced") — grab it
         // BEFORE upload_pre overwrites the buffer with this layer's attn_pre
