@@ -938,17 +938,40 @@ extern "C" int dsv41_quant_fp8(const float* x, uint8_t* y, float* scale, int row
     return (int)cudaGetLastError();
 }
 
+// Per-device fp4 quantise scratch (see the comment in dsv41_quant_fp4).
+static uint8_t* g_q4nib[64] = {nullptr};
+static size_t   g_q4nib_cap[64] = {0};
+
 extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int rows, int cols,
                                int block, int round_scale, cudaStream_t s) {
     if (rows <= 0 || cols % block != 0) return (int)cudaErrorInvalidValue;
     const int nb = cols / block;
-    uint8_t* nib = nullptr;
-    if (cudaMalloc(&nib, (size_t)rows * cols) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
+    // Cached per-device scratch: a TP8 process has one context per rank thread,
+    // so the cache is indexed by device. Growing it is a synchronising
+    // cudaMalloc, which is (a) illegal inside a stream capture and (b) a hot-path
+    // hazard because quant_fp4 runs several times per layer. The warm-up step
+    // sizes every entry, so the capture path never allocates.
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return (int)cudaErrorInvalidDevice;
+    const size_t need = (size_t)rows * cols;
+    if (g_q4nib_cap[dev] < need) {
+        cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+        if (cudaStreamIsCapturing(s, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone)
+            return (int)cudaErrorStreamCaptureUnsupported;
+        if (g_q4nib[dev]) {
+            cudaFree(g_q4nib[dev]);
+            g_q4nib[dev] = nullptr;
+            g_q4nib_cap[dev] = 0;
+        }
+        if (cudaMalloc(&g_q4nib[dev], need) != cudaSuccess) return (int)cudaErrorMemoryAllocation;
+        g_q4nib_cap[dev] = need;
+    }
+    uint8_t* nib = g_q4nib[dev];
     dim3 blk(1, (block < 256 ? block : 256));
     quant_kernel<1><<<dim3(rows * nb), blk, 0, s>>>(x, nib, scale, rows, cols, block, round_scale);
     const size_t n = (size_t)rows * cols;
     fp4_pack_kernel<<<(unsigned)((n / 2 + 255) / 256), 256, 0, s>>>(nib, y, n);
-    cudaFree(nib);
     return (int)cudaGetLastError();
 }
 
