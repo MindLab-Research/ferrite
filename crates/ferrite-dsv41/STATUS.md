@@ -2103,3 +2103,25 @@ e8m0 = 2^(b−127)（`__uint_as_float(b<<23)` ✓）。
 5. **AR（host 4.4% + GPU 11.4%）** = 结构地板，勿动 ✗
 
 **会话累计：2.6 → 15.2 tok/s（5.8x）** ✓✓；正确性四段文本全过 ✓（每次改动都复验 ✓）。
+
+## ⚠️ 负结果：把 GEMV 扩展到专家 **down** 路径 → 破坏正确性（已就地回退 ✓）
+
+**尝试**：把分派条件从 `rows == 1 && !aq` 放宽到 `rows == 1`（想让 down 也吃 GEMV ✓，
+因为它已支持 epi_mode 3 累加与 f32 激活 ✓）。
+**结果**：**模型被破坏** ✗✗ ——
+```
+The capital of France is → ids [0,0,0,...]        （全零 ✗）
+The capital of Japan is → cudaMemcpy D2H: illegal memory access ✗
+1+1=                    → illegal memory access ✗
+```
+**处置**：条件立即恢复为 `rows == 1 && !aq` ✓；**复验四段文本全部恢复** ✓（Paris ✓ /
+Tokyo. ✓ / "2"后停止 ✓ / 静夜思 ✓），吞吐 15.2 tok/s ✓。
+**原因（尚未查清，下会话再做）**：down 的实参形状与 gate/up 不同 ✓ ——
+`dsv41_expert_down_fp4_indirect` 传 `a_f32 = act`（专家的激活缓冲 ✓）、`n_total = dim (4096 ✓)`、
+`k = inter (256 ✓)`、`b_split = -1`、`epi_mode = 3`。我的 GEMV 里至少有一处与这些不匹配
+（候选：`b_split = -1` 时 `hi` 判定的分支选择 ✓；或 down 的 `b` 布局是「转置」的
+`[k, n]` ✗ —— **down 是 GEMM 的 N/K 互换形态** ✓ ⇒ 很可能需要单独的实现 ✓）。
+**教训（已入档）**：**不要因为"我的 kernel 看起来支持"就把新调用点接上** ✓ ——
+先把该调用点的**全部实参语义**读清 ✓，且**必须四段文本复验** ✓。
+**另一处已修**：分派里的 `getenv` 在**每次专家调用**上都执行 ✗（每层 6-8 次 ✓）
+⇒ 注释已写明**必须缓存成 static** ✓（hot-path 纪律 ✓）。
