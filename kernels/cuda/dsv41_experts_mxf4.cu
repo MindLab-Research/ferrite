@@ -589,12 +589,27 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
         bhi_use = bh_base + e * (size_t)bh_stride;
         bhs_use = bhs_base + e * (size_t)bhs_stride;
     }
+    // The activation is ONE row shared by every output row, so stage it once per
+    // block instead of letting each of the 512 output rows re-read it from global:
+    // that re-reading cost 512 x 5120 x 4B = 10.5 MB per call against 0.65 MB of
+    // weights, which is what pinned this kernel at 38 GB/s (0.5 percent).
+    extern __shared__ float s_act[];   // k floats (20 KB at k=5120)
+    const int kbytes = k >> 1;   // packed bytes per row
+    const int ksc = k >> 5;      // e8m0 scales per row
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        if (a_f32 != nullptr) {
+            s_act[j] = a_f32[j];
+        } else {
+            const uint8_t ab = a[j >> 1];
+            const float asc = a_scale[j >> 5];
+            s_act[j] = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
+        }
+    }
+    __syncthreads();
     // one warp per output row
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
-    const int kbytes = k >> 1;   // packed bytes per row
-    const int ksc = k >> 5;      // e8m0 scales per row
 
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
         // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
@@ -615,18 +630,8 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
             const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
             const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
             const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-            float av0, av1;
-            if (a_f32 != nullptr) {
-                av0 = a_f32[j];
-                av1 = a_f32[j + 1];
-            } else {
-                const uint8_t abyte = a[j >> 1];
-                const float asc = a_scale[j >> 5];
-                av0 = dsv41_e2m1_to_f(abyte & 0xFu) * asc;
-                av1 = dsv41_e2m1_to_f((uint8_t)(abyte >> 4)) * asc;
-            }
-            acc += av0 * w0;
-            acc += av1 * w1;
+            acc += s_act[j] * w0;
+            acc += s_act[j + 1] * w1;
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         if (lane == 0) {
@@ -660,7 +665,7 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
         const int warps = 8;
         const int cta = warps * 32;
         const int blocks = (n_total + warps - 1) / warps;
-        expert_gemv_fp4_kernel<<<blocks, cta, 0, s>>>(
+        expert_gemv_fp4_kernel<<<blocks, cta, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode,
             limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
         return cudaGetLastError();
@@ -730,7 +735,7 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
     if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
         const int warps = 8;
         const int blocks = (n_total + warps - 1) / warps;
-        expert_gemv_fp4_kernel<<<blocks, warps * 32, 0, s>>>(
+        expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split,
             epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
             bhs_base, bhs_stride, ids, slot);
