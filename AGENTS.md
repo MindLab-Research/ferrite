@@ -1465,3 +1465,21 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 | down one-expert-per-block | −0.5~0.6 | 两阶段归约保确定性；HTILE 教训适用 |
 | cublasLt 迁移 | −0.2~0.3 | 启发式过滤 splitK；gemm_cublas 重构 |
 | **合计** | **−1.0~1.2 → 9.7-9.9ms ≈ 1620-1650** | |
+
+## 2026-09-10 终局设计：段融合（MegaKernel-lite）——第二阶段路线（用户提议）
+
+**数学**：kernel 边界开销（图间隙 0.4-0.9 + 小 kernel 0.9 + 中间量往返 0.1-0.2）≈ **可回收 −0.8~1.1ms → 9.9-10.1ms ≈ 1580-1620 tok/s**，够到 1600。
+
+**硬约束**：TP=8 下每层 2 个 AR 是跨 rank 集合通信 = 硬 kernel 边界（v5 的 store/publish/reduce 必须独立成核）→ "每层一个 kernel"不存在，可行形态 = **每层 3 个段融合核 + 2×3 AR 核 = 9 launch/层**（现在 ~15-20）：
+```
+[段1: hc_pre(mix+rest345) + 投影 + 注意力核心(GDN: prep/conv/chunk | DSA: kpool/append/qk/pv)]
+  → AR(v5×3) →
+[段2: hc_post + hc_pre2 + norm + MoE(route/act/down)]
+  → AR(v5×3) →
+[段3: hc_post2]
+```
+**大项不吃融合红利**（down 2.11 / act 1.89 / 投影 2.0ms 是带宽受限，13.5GB/步权重流量不变）。融合只回收边界开销。
+
+**段融合的独有价值**（增量清单拿不到的）：段内权重预取与计算重叠（TileRT 式 smem 级软件流水）——这是超过 ~1650 之后才需要的。
+
+**优先级决定**：先用增量清单拿下 1600（小 kernel 合并 −0.3 / down one-expert −0.5~0.6 / cublasLt 逼退 splitK −0.2~0.3 → 9.7-9.9ms），段融合作为第二阶段。工期对比：段融合 1-2 周 vs 增量 2-3 天，终点相同。
