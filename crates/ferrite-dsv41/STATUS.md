@@ -1540,3 +1540,33 @@ exit=0（**未挂死** ✓）  但输出 = "Ll bron_pairCHANTABILITY" ✗（应�
 **下会话若要继续**（这是图化的必经项 ✓）：建议把该协议**在隔离微基准里单步验证**
 （world=2 起 ✓、逐轮打印 `stored/reduced/round` 与各 rank 的观察值 ✓），
 不要在整模型上试 ✗ —— 整模型的反馈周期太长且挂死难以定位 ✓。
+
+## ✅ 新增资产：集合通信隔离微基准（反馈周期 5 分钟 → **6 秒**）
+
+`crates/ferrite-dsv41/tests/ar_micro.rs` —— 8 个 rank 各占一卡，**只跑 all-reduce 循环**，
+每一轮都与**主机端参考和**逐元素比对 ✓：
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+DSV41_KERNELS=$PWD/kernels/cuda/libferrite_kernels.so \
+AR_MICRO_WORLD=8 AR_MICRO_ROUNDS=32 \
+cargo test --release -p ferrite-dsv41 --test ar_micro -- --nocapture
+# 可选 AR_MICRO_N（每 rank 的 float 数，默认 1024）
+```
+
+**实测**：
+| 路径 | 结果 |
+|---|---|
+| **默认（host barrier）** | **✓ OK**（world=8 / 32 轮 / 1024 floats，**6.16s**）|
+| `DSV41_AR_DEV=1` | **✗ world=2 就挂死**（超时无输出）|
+
+⇒ ①**默认路径的集合通信被独立验证正确** ✓（给正确性再加一道证据 ✓）；
+② 设备侧协议的故障是**纯协议逻辑** ✓、与 rank 数无关 ✓（world=2 即挂 ✓）；
+③ **反馈周期从 5 分钟降到 6 秒** ✓✓ —— 下会话可以直接在这个 harness 里逐轮打印
+`round / stored[p] / reduced[p]` 定位自旋不出来的那一处 ✓，**不要再上整模型** ✗。
+
+**写在 harness 里的两个教训**（都已经犯过 ✓）：
+- 测试自己的期望值也会错 ✓：第一版我多乘了一个 `n` ✓，把**正确的** 28000 报成失败 ✗ ——
+  **先验证测试，再怀疑被测对象** ✓；
+- `Device::bind_to` + `enable_peer_access` 需要**所有 rank 的 context 先存在** ✓
+  （两段式 barrier ✓），照搬 runner 的顺序即可 ✓。
