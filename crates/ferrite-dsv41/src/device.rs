@@ -434,6 +434,32 @@ impl Device {
         }
     }
 
+    /// Enable peer access to every other device.
+    ///
+    /// This cannot happen at bind time: `cudaDeviceEnablePeerAccess` needs the
+    /// *peer's* context to exist, and at bind time no rank has opened a device
+    /// yet, so the call fails silently and the later peer copy faults. Call it
+    /// once every rank has created its context.
+    pub fn enable_peer_access(&self) -> Result<usize> {
+        let n = self.device_count();
+        let me = self.device_id();
+        let mut enabled = 0usize;
+        for p in 0..n {
+            if p == me {
+                continue;
+            }
+            let rc = unsafe { (self.cudart.enable_peer)(p, 0) };
+            // 704 = already enabled; both are fine, clear the sticky error
+            unsafe {
+                (self.cudart.last_error)();
+            }
+            if rc == 0 || rc == 704 {
+                enabled += 1;
+            }
+        }
+        Ok(enabled)
+    }
+
     /// Copy `bytes` from this device to `dst_dev` (NVLink peer copy).
     pub fn memcpy_peer(
         &self,

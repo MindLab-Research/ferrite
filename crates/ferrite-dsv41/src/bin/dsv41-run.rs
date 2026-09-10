@@ -202,6 +202,13 @@ fn run_tp(
         }
         let w = loader.load(&cfg, world, rank)?;
         dev.sync()?;
+        // peer access needs every rank's context to exist first
+        barrier.wait();
+        let peers_enabled = dev.enable_peer_access()?;
+        if rank == 0 {
+            println!("[dsv41] rank0: peer access enabled to {peers_enabled} devices");
+        }
+        barrier.wait();
         if rank == 0 {
             println!(
                 "[dsv41] rank0 weights: {:.1} GiB in {:.1}s",
