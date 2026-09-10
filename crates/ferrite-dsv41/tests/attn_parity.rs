@@ -11,7 +11,7 @@
 //!     cargo test --release -p ferrite-dsv41 --test attn_parity -- --nocapture
 
 use ferrite_dsv41::config::Dsv41Config;
-use ferrite_dsv41::device::{DevBuf, Device};
+use ferrite_dsv41::device::Device;
 use ferrite_dsv41::load::Loader;
 use ferrite_dsv41::ops;
 use ferrite_dsv41::weights::{Shard, TensorSpec};
@@ -101,11 +101,11 @@ fn layer0_attention_projections_match_reference() {
     let mut xqb = vec![0u8; dim];
     let mut xscv = vec![0f32; dim / 32 + 8];
     {
-        let src = DevBuf { ptr: xq.ptr, bytes: dim, owned: false };
+        let src = Device::view(xq.ptr, dim);
         let mut b = vec![0u8; dim];
         dev.download_u8(&src, &mut b).unwrap();
         xqb = b;
-        let ss = DevBuf { ptr: xsc.ptr, bytes: (dim / 32 + 8) * 4, owned: false };
+        let ss = Device::view(xsc.ptr, (dim / 32 + 8) * 4);
         dev.download_f32(&ss, &mut xscv).unwrap();
     }
     eprintln!("[attn_parity] xq[0..8]   {:?}", &xqb[..8]);
