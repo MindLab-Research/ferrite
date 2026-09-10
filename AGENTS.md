@@ -1421,3 +1421,9 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 3. gdn_step（0.58ms，17.1µs/次）/ kpool（0.26ms）：float4 已做，需 ncu 定位剩余。
 
 **当前状态**：10.94ms = 1464 tok/s（env：标准 + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`）。HEAD e2e2207，全部验证过（faults=0，出师表✓）。
+
+## ⛔ nsys 铁律（2026-09-10，用户明令）：剖析 serve 必须 NCCL 模式
+
+**带 `FERRITE_P2P=1 FERRITE_P2P_AR5=1` 跑 nsys 会自旋卡死**：AR v5 的 publish kernel 自旋等 peer 盖章，nsys 的 `--cuda-graph-trace=node` 对 8 个 rank 每步 ~400 个节点做 CUPTI 拦截，host 侧抖动被自旋放大——实测 240s 只跑 69 步（≈3.4s/步，比无剖析慢 300 倍），bench 超时、报告丢失。**NCCL 模式（去掉这两个 env）剖析干净（1m53s 全流程）**，且除 AR 外所有 kernel 的中位数对 v5 构建同样有效（代码路径相同）。要 AR 的耗时直接用 90 × ~8µs 代入。
+
+剖析脚本模板：`/tmp/sp4.sh`（GPU 忙则中止 → nsys 全程 trace → bench 加 `timeout 300` → **`curl -X POST http://localhost:8080/shutdown` 收尾**（不是 kill -INT！）→ 等 nsys 最多 300s → `nsys stats --report cuda_gpu_kern_sum | grep -vE "dequant|bf16_to_f32|memcpy|Memset|matmul_tiled"`）。
