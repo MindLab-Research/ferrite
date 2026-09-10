@@ -13,12 +13,12 @@ SRC="$(dirname "$0")/ferrite_kernels.cu"
 NVCC="${NVCC:-nvcc}"
 "$NVCC" --version >/dev/null 2>&1 || { echo "error: nvcc not found (CUDA toolkit required)"; exit 1; }
 
-# -O3 + fPIC shared object; --use_fast_math ENABLED 2026-09-10 (the B300
-# correctness harness passed long ago — the text output has been verified
-# 出师表-verbatim through dozens of runs). The main win is -ftz=true (flush
-# denormals to zero) — the softmax exp(-large) values in sparse_attn/kpool
-# produce denormals that cost ~10x normal float ops on some paths.
-"$NVCC" -O3 -shared -Xcompiler -fPIC --use_fast_math \
+# -O3 + fPIC shared object. --use_fast_math is OPT-IN via FERRITE_FAST_MATH=1
+# (2026-09-10: enforced-by-default measured a ~2x replay regression —
+# 27.99ms vs 13.40ms at full 2032 MHz clock, i.e. not thermal/power).
+FAST_MATH_FLAG=""
+[ -n "$FERRITE_FAST_MATH" ] && FAST_MATH_FLAG="--use_fast_math"
+"$NVCC" -O3 -shared -Xcompiler -fPIC $FAST_MATH_FLAG \
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
     -o "$OUT" "$SRC"
