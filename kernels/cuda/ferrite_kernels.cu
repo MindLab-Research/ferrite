@@ -1997,6 +1997,172 @@ extern "C" cudaError_t ferrite_sparse_attn_v2(const float* q,
 }
 
 // ============================================================
+// hc_pre_fuse_kernel (2026-09-10): the SGLANG MHC big-fuse structure ported
+// (mhc_pre_big_fuse_tilelang): ONE BLOCK PER TOKEN with WARP-SPECIALIZED
+// parallel work streams, instead of ferrite's column-blocked serial phases.
+//   phase 1 (all threads): reduce the mix kernel's KS partials -> mixes[24]
+//     (rms-scaled) + the sqrsum partials -> inv
+//   warp 0            : post_mix sigmoid + comb_mix (row softmax + sinkhorn,
+//                       all in registers/xor-shuffles, ~2us, NO barrier
+//                       coupling) -> writes post/comb
+//   warps 1..7        : pre_mix sigmoid (redundant per thread — no barrier)
+//                       + the pipelined layer_input accumulation
+//                       li_raw[c] = Sigma_i pre[i]*res[i][c], keeping
+//                       li_raw in SMEM and accumulating Sigma(li_raw^2)
+//   one barrier, then ALL threads: li = li_raw*inv*nw (pass 2)
+// This removes rest345's cross-block election (16 blocks vs 272), the P1
+// redundant reduction and the is_last-block normalize from the critical path.
+// ============================================================
+__global__ void hc_pre_fuse_kernel(
+    const float* __restrict__ res,      // [s, n, h] f32
+    const float* __restrict__ nw,       // [h]
+    const float* __restrict__ mx_in,    // [s, mix, ks] partials
+    const float* __restrict__ sq_in,    // [s, ks] sqrsum partials
+    const float* __restrict__ scale,    // [3]
+    const float* __restrict__ base,     // [2n + n*n]
+    float* __restrict__ post,           // [s, n]
+    float* __restrict__ comb,           // [s, n*n]
+    float* __restrict__ li,             // [s, h]
+    int s, int n, int h, int mix, int ks,
+    float rms_eps, float hc_eps, int iters) {
+    const int t = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5, lane = tid & 31;
+    const int nh = n * h;
+    extern __shared__ float smem[];
+    float* s_mx = smem;            // [mix + 1]
+    float* s_li = smem + mix + 2;  // [h] li_raw staging
+    float* s_red = s_li + h;       // [16]
+    // ---- phase 1: reduce the mix partials (all threads) ----
+    if (tid < mix) {
+        float acc = 0.f;
+        const float* row = mx_in + (size_t)t * mix * ks + (size_t)tid * ks;
+        #pragma unroll
+        for (int z = 0; z < ks; z++) acc += row[z];
+        s_mx[tid] = acc;
+    }
+    if (tid == mix) {
+        float ss = 0.f;
+        const float* row = sq_in + (size_t)t * ks;
+        #pragma unroll
+        for (int z = 0; z < ks; z++) ss += row[z];
+        s_mx[mix] = rsqrtf(ss / (float)nh + rms_eps);
+    }
+    __syncthreads();
+    const float inv_rms = s_mx[mix];
+    if (warp == 0) {
+        // ---- warp 0: post_mix + comb_mix (softmax + sinkhorn, registers) ----
+        if (lane < (unsigned)n)
+            post[(size_t)t * n + lane] =
+                2.0f * (1.0f / (1.0f + __expf(-(s_mx[n + lane] * inv_rms * scale[1] + base[n + lane]))));
+        if (lane < (unsigned)(n * n)) {
+            const float v0 = s_mx[2 * n + lane] * inv_rms * scale[2] + base[2 * n + lane];
+            const unsigned m4 = (n == 4) ? 0x000f000fu : 0xffffffffu;
+            float v = v0;
+            float rmax = v;
+            rmax = fmaxf(rmax, __shfl_xor_sync(m4, rmax, 1));
+            rmax = fmaxf(rmax, __shfl_xor_sync(m4, rmax, 2));
+            v = __expf(v - rmax);
+            float den = v;
+            den += __shfl_xor_sync(m4, den, 1);
+            den += __shfl_xor_sync(m4, den, 2);
+            v = v / den + hc_eps;
+            float cs = v;
+            cs += __shfl_xor_sync(m4, cs, 4);
+            cs += __shfl_xor_sync(m4, cs, 8);
+            v /= cs + hc_eps;
+            for (int it = 1; it < iters; it++) {
+                float rs = v;
+                rs += __shfl_xor_sync(m4, rs, 1);
+                rs += __shfl_xor_sync(m4, rs, 2);
+                v /= rs + hc_eps;
+                float cs2 = v;
+                cs2 += __shfl_xor_sync(m4, cs2, 4);
+                cs2 += __shfl_xor_sync(m4, cs2, 8);
+                v /= cs2 + hc_eps;
+            }
+            comb[(size_t)t * n * n + lane] = v;
+        }
+        if (lane == 0) s_red[0] = 0.f;   // warp 0 contributes no Sigma li_raw^2
+    } else {
+        // ---- warps 1..7: pre_mix (redundant per thread) + li_raw accumulation ----
+        float pre[8];
+        #pragma unroll
+        for (int i = 0; i < 8; i++)
+            if (i < n) pre[i] = 1.0f / (1.0f + __expf(-(s_mx[i] * inv_rms * scale[0] + base[i]))) + hc_eps;
+        const int nth = blockDim.x - 32;      // li-phase threads (warps 1..)
+        const int my = tid - 32;
+        const int h4 = h >> 2;
+        float sq = 0.f;
+        for (int c4 = my; c4 < h4; c4 += nth) {
+            float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                if (i < n) {
+                    const float4 xv = *reinterpret_cast<const float4*>(
+                        res + ((size_t)t * n + i) * h + (size_t)c4 * 4);
+                    o.x += pre[i] * xv.x; o.y += pre[i] * xv.y;
+                    o.z += pre[i] * xv.z; o.w += pre[i] * xv.w;
+                }
+            }
+            sq += (o.x * o.x + o.y * o.y) + (o.z * o.z + o.w * o.w);
+            *reinterpret_cast<float4*>(s_li + (size_t)c4 * 4) = o;
+        }
+        // block partial for Sigma li_raw^2 (warp shuffle + shared across warps 1..7)
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) sq += __shfl_down_sync(0xffffffff, sq, off);
+        if (lane == 0) s_red[warp] = sq;   // warp 0 already wrote 0 at s_red[0]
+    }
+    // barriers are BLOCK-WIDE (outside the warp branch): warp 0 finishes its
+    // sinkhorn (~2us) while warps 1..7 run the li pass — the SGLang structure.
+    __syncthreads();
+    if (tid == 0) {
+        float tt = 0.f;
+        #pragma unroll
+        for (int w = 0; w < 8; w++) tt += s_red[w];
+        s_red[0] = tt;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(s_red[0] / (float)h + rms_eps);
+    // pass 2 (all threads): li = li_raw * inv * nw
+    for (int c4 = tid; c4 < h4; c4 += blockDim.x) {
+        const float4 o = *reinterpret_cast<const float4*>(s_li + (size_t)c4 * 4);
+        const float4 w = *reinterpret_cast<const float4*>(nw + (size_t)c4 * 4);
+        float4 r;
+        r.x = o.x * inv * w.x; r.y = o.y * inv * w.y;
+        r.z = o.z * inv * w.z; r.w = o.w * inv * w.w;
+        *reinterpret_cast<float4*>(li + (size_t)t * h + (size_t)c4 * 4) = r;
+    }
+}
+
+extern "C" cudaError_t ferrite_hc_pre_fuse(
+    const float* res, const float* nw,
+    const float* mx_in, const float* sq_in,
+    const float* scale, const float* base,
+    float* post, float* comb, float* li,
+    int s, int n, int h, int mix, int ks,
+    float rms_eps, float hc_eps, int iters, cudaStream_t st) {
+    if (s <= 0 || (h & 3) != 0 || n != 4) return cudaErrorNotSupported;
+    const size_t smem = (size_t)(mix + 2 + h + 16) * sizeof(float);
+    static bool attr_done = false;
+    if (!attr_done) {
+        int ndev = 0, cur = -1;
+        cudaGetDeviceCount(&ndev); cudaGetDevice(&cur);
+        for (int d = 0; d < ndev; d++) {
+            cudaSetDevice(d);
+            cudaFuncSetAttribute(hc_pre_fuse_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+        }
+        cudaSetDevice(cur);
+        attr_done = true;
+    }
+    hc_pre_fuse_kernel<<<(unsigned)s, 256, smem, st>>>(
+        res, nw, mx_in, sq_in, scale, base, post, comb, li,
+        s, n, h, mix, ks, rms_eps, hc_eps, iters);
+    return cudaGetLastError();
+}
+
+// ============================================================
 // MHC hyper-connections (sglang-exact port; see ferrite-exec/src/mhc.rs
 // for the golden CPU math). hc_pre mixes the n residual flows into the
 // layer input; hc_post recombines the sublayer output back. One block
@@ -7141,6 +7307,19 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     // [p4 partials: s*NB][rest345 ctr: s] — Rust allocates
     // s*(mix*8 + 8 + 1 + n + 17) floats.
     const int NB = HC_P345_NB;
+    // SGLANG-STYLE BIG-FUSE (FERRITE_HC_FUSE=1, 2026-09-10): keep the mix
+    // kernel (their gemm_sqrsum equivalent) but replace rest345 with ONE
+    // per-TOKEN block (16 blocks, 256 thr) whose warps run the sinkhorn
+    // (warp 0, registers + xor shuffles, no barrier) CONCURRENTLY with the
+    // layer_input accumulation (warps 1..7) — exactly
+    // mhc_pre_big_fuse_tilelang's structure. One barrier, then the
+    // normalize pass over all threads. No cross-block election, no
+    // redundant P1, no is_last-block normalize on the critical path.
+    static int hc_fuse_env = -1;
+    if (hc_fuse_env < 0) {
+        const char* e = getenv("FERRITE_HC_FUSE");
+        hc_fuse_env = (e && e[0] == '1') ? 1 : 0;
+    }
     // FERRITE_HC_MIX_KS: runtime K-split for the mix GEMV (default HC_MIX_KS
     // = 16). Lower KS => fewer blocks (fewer reductions/barriers), more work
     // per thread, and less fw re-read traffic (fw is re-read once per token
@@ -7174,6 +7353,12 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
+    if (hc_fuse_env && n == 4 && (h & 3) == 0 && s > 0) {
+        const float* sq_in = mx_scratch + (size_t)s * mix * KS;
+        return ferrite_hc_pre_fuse(res, nw, mx_scratch, sq_in, scale, base,
+                                   post, comb, li, s, n, h, mix, KS,
+                                   rms_eps, hc_eps, iters, stream);
+    }
 
     dim3 p345_grid(s, NB + 1);   // +1: the sinkhorn aux block (see the kernel)
     const int hpb_l = (h + 15) / 16;   // must match the kernel's hpb (NB=16)
