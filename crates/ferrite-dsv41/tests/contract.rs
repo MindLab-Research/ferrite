@@ -85,7 +85,10 @@ fn large_matmuls_use_tensor_cores() {
         return;
     }
     let mut mma_forms = 0usize;
-    for (_path, src) in &srcs {
+    for (path, raw) in &srcs {
+        // comments are stripped: the header documents the rejected forms on
+        // purpose, and that documentation must not trip the check
+        let src = code_only(raw);
         for pat in [
             "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32",
             "mma.sync.aligned.m16n8k16",
@@ -93,15 +96,13 @@ fn large_matmuls_use_tensor_cores() {
         ] {
             mma_forms += src.matches(pat).count();
         }
-        // the rejected forms must not reappear
-        for bad in [
-            "kind::f8f6f4",
-            "m16n8k32.row.col.kind::f8f6f4",
-        ] {
+        // the rejected forms must not reappear in CODE
+        for bad in ["kind::f8f6f4", "m16n8k32.row.col.kind::f8f6f4"] {
             assert!(
                 !src.contains(bad),
-                "the fp4 mma.sync form is rejected by ptxas on sm_103a; \
-                 use tcgen05 kind::mxf4 or the lossless e4m3 fallback (found {bad})"
+                "{}: the fp4 mma.sync form is rejected by ptxas on sm_103a; \
+                 use tcgen05 kind::mxf4 or the lossless e4m3 fallback (found {bad})",
+                path.display()
             );
         }
     }
