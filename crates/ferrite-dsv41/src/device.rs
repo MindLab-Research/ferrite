@@ -140,7 +140,16 @@ struct Kernels {
         unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, CuStream) -> c_int,
     >,
     ar_store2: Option<
-        unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, i64, *const c_uint, c_uint, CuStream) -> c_int,
+        unsafe extern "C" fn(
+            *const u64, c_int, c_int, *const f32, i64, i64, i64,
+            *const c_uint, c_uint, *const u64, *mut c_uint, CuStream,
+        ) -> c_int,
+    >,
+    ar_reduce2: Option<
+        unsafe extern "C" fn(
+            *mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint,
+            *const u64, c_int, *mut c_uint, c_int, CuStream,
+        ) -> c_int,
     >,
     ar_mark: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
@@ -353,6 +362,7 @@ impl Device {
                 ar_stamp: sym(h_k, "dsv41_ar_stamp").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_store: sym(h_k, "dsv41_ar_store").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_store2: sym(h_k, "dsv41_ar_store2").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_reduce2: sym(h_k, "dsv41_ar_reduce2").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_mark: sym(h_k, "dsv41_ar_mark").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_bf16: sym(h_k, "dsv41_gemv_bf16").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_f32: sym(h_k, "dsv41_gemv_f32").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1273,10 +1283,40 @@ impl Device {
         parity_off: i64,
         reduced: *const c_uint,
         round: u32,
+        peer_stamps: *const u64,
+        ctr: *mut c_uint,
     ) -> Result<()> {
         let f = self.need(self.kernels.ar_store2, "dsv41_ar_store2")?;
-        let rc = unsafe { f(peer_slots, world, rank, src, n, slot_f, parity_off, reduced, round, self.stream) };
+        let rc = unsafe {
+            f(peer_slots, world, rank, src, n, slot_f, parity_off, reduced, round, peer_stamps, ctr,
+              self.stream)
+        };
         self.kerr(rc, "dsv41_ar_store2")
+    }
+
+    /// Reduce with the same-threads release: the kernel that reads the slots also
+    /// announces `reduced` once every block is done.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ar_reduce2(
+        &self,
+        dst: *mut f32,
+        staging: *const f32,
+        n: i64,
+        slot_f: i64,
+        world: i32,
+        stamps: *const c_uint,
+        round: u32,
+        peer_reduced: *const u64,
+        rank: i32,
+        ctr2: *mut c_uint,
+        do_mark: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ar_reduce2, "dsv41_ar_reduce2")?;
+        let rc = unsafe {
+            f(dst, staging, n, slot_f, world, stamps, round, peer_reduced, rank, ctr2, do_mark,
+              self.stream)
+        };
+        self.kerr(rc, "dsv41_ar_reduce2")
     }
 
     /// Announce that this rank has finished reducing `round`.

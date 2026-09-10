@@ -83,6 +83,8 @@ pub struct Collective {
     stamps_at: usize,
     /// Same, for the `reduced` stamps written after the reduce completes.
     reduced_at: usize,
+    /// Byte offset of the two last-block counters (store, reduce) for this rank.
+    ctr_at: usize,
     /// Device copy of the peers' STAMP bases, so the stamp kernel can write into
     /// every rank's array (including our own) without host involvement.
     peer_stamps: DevBuf,
@@ -124,7 +126,8 @@ impl Collective {
         // waits on the peers' `reduced` stamps before touching it.
         let stamps_at = 2 * world * bytes;
         let reduced_at = stamps_at + world * 4;
-        let staging = dev.alloc(reduced_at + world * 4 + 64)?;
+        let ctr_at = reduced_at + world * 4;
+        let staging = dev.alloc(ctr_at + 64)?;
         let peer_stamps = dev.alloc(world * 8)?;
         let peer_slots = dev.alloc(world * 8)?;
         let peer_reduced = dev.alloc(world * 8)?;
@@ -137,6 +140,7 @@ impl Collective {
             peers: vec![0; world],
             stamps_at,
             reduced_at,
+            ctr_at,
             peer_stamps,
             peer_slots,
             peer_reduced,
@@ -200,6 +204,7 @@ impl Collective {
             let parity_off = ((round as usize % 2) * self.world * self.bytes) as i64;
             let reduced_local =
                 (self.staging.ptr as *const u8).wrapping_add(self.reduced_at) as *const c_uint;
+            let ctr = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
             self.dev.ar_store2(
                 self.peer_slots.ptr as *const u64,
                 self.world as i32,
@@ -210,6 +215,8 @@ impl Collective {
                 parity_off / 4,
                 reduced_local,
                 round,
+                self.peer_stamps.ptr as *const u64,
+                ctr,
             )?;
         } else {
             self.dev.ar_store(
@@ -232,13 +239,13 @@ impl Collective {
         // this rank's data has landed. The old cudaDeviceSynchronize here blocked
         // the host (so nothing overlapped) ~90 times per decode step.
         let round = self.round.fetch_add(1, AtOrd::AcqRel) + 1;
-        self.dev.ar_stamp(
-            self.peer_stamps.ptr as *const u64,
-            self.world as i32,
-            self.rank as i32,
-            round,
-        )?;
         if !dev_side {
+            self.dev.ar_stamp(
+                self.peer_stamps.ptr as *const u64,
+                self.world as i32,
+                self.rank as i32,
+                round,
+            )?;
             self.barrier.wait();
         }
         Ok(())
@@ -260,7 +267,8 @@ impl Collective {
             self.staging.ptr as *const u8
         };
         let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
-        self.dev.ar_reduce(
+        let ctr2 = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
+        self.dev.ar_reduce2(
             base as *mut f32,
             base as *const f32,
             n,
@@ -268,15 +276,11 @@ impl Collective {
             self.world as i32,
             stamps,
             round,
+            self.peer_reduced.ptr as *const u64,
+            self.rank as i32,
+            ctr2,
+            if dev_side { 1 } else { 0 },
         )?;
-        if dev_side {
-            self.dev.ar_mark(
-                self.peer_reduced.ptr as *const u64,
-                self.world as i32,
-                self.rank as i32,
-                round,
-            )?;
-        }
         self.dev
             .memcpy_d2d(buf, slot0 as *const std::ffi::c_void, len)?;
         self.barrier.wait();

@@ -289,12 +289,12 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
 __global__ void ar_store_kernel(const unsigned long long* __restrict__ peer_slots, int world,
                                 int rank, const float* __restrict__ src, long n, long slot_f,
                                 long parity_off, const unsigned* __restrict__ reduced,
-                                unsigned round) {
-    // Credit wait, on the DEVICE — this is what lets the host barrier go away.
-    // The staging is double buffered by round parity, so this write lands in the
-    // half last used by round-2; it must not happen until every peer has finished
-    // REDUCING round-2. EVERY block spins (not just block 0): the other blocks
-    // would otherwise race ahead and overwrite the slot mid-read.
+                                unsigned round, const unsigned long long* __restrict__ peer_stamps,
+                                unsigned* __restrict__ ctr) {
+    // Credit wait, on the DEVICE: the staging is double buffered by round parity,
+    // so this write lands in the half last used by round-2 and must not start
+    // until every peer has finished REDUCING round-2. EVERY block spins, not just
+    // block 0 — the others would otherwise overwrite the slot mid-read.
     if (round >= 3 && threadIdx.x == 0) {
         for (int p = 0; p < world; ++p) {
             const volatile unsigned* m = reduced + p;
@@ -305,11 +305,33 @@ __global__ void ar_store_kernel(const unsigned long long* __restrict__ peer_slot
     }
     __syncthreads();
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    const float v = src[i];
-    for (int p = 0; p < world; ++p) {
-        float* dst = (float*)(peer_slots[p]) + parity_off + (long)rank * slot_f + i;
-        dst[0] = v;
+    if (i < n) {
+        const float v = src[i];
+        for (int p = 0; p < world; ++p) {
+            float* dst = (float*)(peer_slots[p]) + parity_off + (long)rank * slot_f + i;
+            dst[0] = v;
+        }
+    }
+    // Publish THIS round's stamp from inside the writing kernel. A valid release
+    // needs the fence and the signal in the same threads: an earlier version
+    // stamped from a separate kernel, whose __threadfence_system() only ordered
+    // that kernel's own writes, so a peer could see the stamp before the data —
+    // exactly the gap the host barrier had been masking.
+    __threadfence();
+    __shared__ bool is_last;
+    if (threadIdx.x == 0) {
+        const unsigned prev = atomicAdd(ctr, 1u);
+        is_last = (prev == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (is_last && threadIdx.x == 0) {
+        __threadfence_system();
+        for (int p = 0; p < world; ++p) {
+            unsigned* d = (unsigned*)(peer_stamps[p] + (size_t)rank * sizeof(unsigned));
+            *d = round;
+        }
+        __threadfence_system();
+        *ctr = 0;  // ready for the next round (stream order makes this safe)
     }
 }
 
@@ -329,7 +351,9 @@ __global__ void ar_mark_kernel(const unsigned long long* __restrict__ peer_reduc
 
 __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restrict__ staging,
                                  long n, long slot_f, int world,
-                                 const unsigned* __restrict__ stamps, unsigned round) {
+                                 const unsigned* __restrict__ stamps, unsigned round,
+                                 const unsigned long long* __restrict__ peer_reduced, int rank,
+                                 unsigned* __restrict__ ctr2, int do_mark) {
     // every block waits: the stamps are in this rank's own memory (the peers
     // wrote them through their peer access) and stay in L2, so the spin is cheap
     if (threadIdx.x == 0) {
@@ -348,6 +372,25 @@ __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restric
             acc += staging[(size_t)p * slot_f + i];
         }
         dst[i] = acc;
+    }
+    if (!do_mark) return;
+    // Same same-threads rule as the store: announce "round reduced" from inside
+    // the kernel that did the reading, once every block is done.
+    __threadfence();
+    __shared__ bool is_last2;
+    if (threadIdx.x == 0) {
+        const unsigned prev = atomicAdd(ctr2, 1u);
+        is_last2 = (prev == gridDim.x - 1);
+    }
+    __syncthreads();
+    if (is_last2 && threadIdx.x == 0) {
+        __threadfence_system();
+        for (int p = 0; p < world; ++p) {
+            unsigned* d = (unsigned*)(peer_reduced[p] + (size_t)rank * sizeof(unsigned));
+            *d = round;
+        }
+        __threadfence_system();
+        *ctr2 = 0;
     }
 }
 
@@ -412,12 +455,15 @@ extern "C" int dsv41_ar_stamp(const unsigned long long* peer_stamps, int world, 
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_ar_reduce(float* dst, const float* staging, long n, long slot_f, int world,
-                               const unsigned* stamps, unsigned round, cudaStream_t s) {
+extern "C" int dsv41_ar_reduce2(float* dst, const float* staging, long n, long slot_f, int world,
+                                const unsigned* stamps, unsigned round,
+                                const unsigned long long* peer_reduced, int rank,
+                                unsigned* ctr2, int do_mark, cudaStream_t s) {
     if (n <= 0 || world <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (blocks > 512) blocks = 512;
-    ar_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, stamps, round);
+    ar_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, stamps, round,
+                                            peer_reduced, rank, ctr2, do_mark);
     return (int)cudaGetLastError();
 }
 
@@ -427,7 +473,8 @@ extern "C" int dsv41_ar_store(const unsigned long long* peer_slots, int world, i
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (blocks > 512) blocks = 512;
     // legacy entry point: no parity, no credit wait (round 0 skips the wait)
-    ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, 0, nullptr, 0);
+    ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, 0, nullptr, 0,
+                                           nullptr, nullptr);
     return (int)cudaGetLastError();
 }
 
@@ -451,12 +498,14 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
 
 extern "C" int dsv41_ar_store2(const unsigned long long* peer_slots, int world, int rank,
                                const float* src, long n, long slot_f, long parity_off,
-                               const unsigned* reduced, unsigned round, cudaStream_t s) {
+                               const unsigned* reduced, unsigned round,
+                               const unsigned long long* peer_stamps, unsigned* ctr,
+                               cudaStream_t s) {
     if (n <= 0 || world <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (blocks > 512) blocks = 512;
     ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, parity_off,
-                                           reduced, round);
+                                           reduced, round, peer_stamps, ctr);
     return (int)cudaGetLastError();
 }
 
