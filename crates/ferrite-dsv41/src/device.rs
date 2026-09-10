@@ -139,6 +139,10 @@ struct Kernels {
     ar_store: Option<
         unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, CuStream) -> c_int,
     >,
+    ar_store2: Option<
+        unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, i64, *const c_uint, c_uint, CuStream) -> c_int,
+    >,
+    ar_mark: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     expert_gate_up_fp4_indirect: Option<
@@ -348,6 +352,8 @@ impl Device {
                 hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_stamp: sym(h_k, "dsv41_ar_stamp").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_store: sym(h_k, "dsv41_ar_store").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_store2: sym(h_k, "dsv41_ar_store2").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_mark: sym(h_k, "dsv41_ar_mark").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_bf16: sym(h_k, "dsv41_gemv_bf16").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_f32: sym(h_k, "dsv41_gemv_f32").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
@@ -1252,6 +1258,32 @@ impl Device {
         let f = self.need(self.kernels.ar_stamp, "dsv41_ar_stamp")?;
         let rc = unsafe { f(peer_stamps, world, rank, round, self.stream) };
         self.kerr(rc, "dsv41_ar_stamp")
+    }
+
+    /// Publish with a device-side credit wait (replaces the host barrier).
+    #[allow(clippy::too_many_arguments)]
+    pub fn ar_store2(
+        &self,
+        peer_slots: *const u64,
+        world: i32,
+        rank: i32,
+        src: *const f32,
+        n: i64,
+        slot_f: i64,
+        parity_off: i64,
+        reduced: *const c_uint,
+        round: u32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ar_store2, "dsv41_ar_store2")?;
+        let rc = unsafe { f(peer_slots, world, rank, src, n, slot_f, parity_off, reduced, round, self.stream) };
+        self.kerr(rc, "dsv41_ar_store2")
+    }
+
+    /// Announce that this rank has finished reducing `round`.
+    pub fn ar_mark(&self, peer_reduced: *const u64, world: i32, rank: i32, round: u32) -> Result<()> {
+        let f = self.need(self.kernels.ar_mark, "dsv41_ar_mark")?;
+        let rc = unsafe { f(peer_reduced, world, rank, round, self.stream) };
+        self.kerr(rc, "dsv41_ar_mark")
     }
 
     /// Lean M=1 GEMV over bf16 weights with an f32 activation (out[n] = W[n,k]·x).

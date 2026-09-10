@@ -78,15 +78,20 @@ pub struct Collective {
     staging: DevBuf,
     /// Base address of each rank's staging buffer, indexed by rank.
     peers: Vec<u64>,
-    /// Byte offset (from each rank's staging base) of its stamp array: `world`
-    /// u32 slots, slot `w` holding the round that rank `w` has completed.
+    /// Byte offset (from each rank's staging base) of its `stored` stamp array:
+    /// `world` u32 slots, slot `w` = the round rank `w` has finished publishing.
     stamps_at: usize,
+    /// Same, for the `reduced` stamps written after the reduce completes.
+    reduced_at: usize,
     /// Device copy of the peers' STAMP bases, so the stamp kernel can write into
     /// every rank's array (including our own) without host involvement.
     peer_stamps: DevBuf,
     /// Device copy of the peers' STAGING bases, so one store kernel can publish
     /// into every rank's slot instead of `world` host-issued peer copies.
     peer_slots: DevBuf,
+    /// Device copy of the peers' `reduced` stamp areas (written after their
+    /// reduce completes) — the credit the store's device-side wait consumes.
+    peer_reduced: DevBuf,
     /// Monotonic round counter: each all-reduce is one round. Atomic because
     /// the collective is shared behind an Arc and only `&self` is available.
     round: AtomicU32,
@@ -112,12 +117,17 @@ impl Collective {
         barrier: Arc<SpinBarrier>,
     ) -> Result<Self> {
         let depth = bytes * std::mem::size_of::<f32>() / 4;
-        // the stamp area rides at the end of each rank's staging: world u32 slots,
-        // slot `w` = the round rank `w` has finished publishing
-        let stamps_at = world * bytes;
-        let staging = dev.alloc(stamps_at + world * 4 + 64)?;
+        // Layout per rank: [parity 0: world*bytes][parity 1: world*bytes]
+        //                 [stored: world u32][reduced: world u32]
+        // Double buffering by round parity is what lets the host barrier go: a
+        // writer targets the half last used by round-2, and the store kernel
+        // waits on the peers' `reduced` stamps before touching it.
+        let stamps_at = 2 * world * bytes;
+        let reduced_at = stamps_at + world * 4;
+        let staging = dev.alloc(reduced_at + world * 4 + 64)?;
         let peer_stamps = dev.alloc(world * 8)?;
         let peer_slots = dev.alloc(world * 8)?;
+        let peer_reduced = dev.alloc(world * 8)?;
         let _ = depth;
         Ok(Collective {
             world,
@@ -126,8 +136,10 @@ impl Collective {
             staging,
             peers: vec![0; world],
             stamps_at,
+            reduced_at,
             peer_stamps,
             peer_slots,
+            peer_reduced,
             round: AtomicU32::new(0),
             barrier,
             dev,
@@ -159,6 +171,12 @@ impl Collective {
             buf2[i * 8..i * 8 + 8].copy_from_slice(&b.to_le_bytes());
         }
         self.dev.upload_bytes_at(&self.peer_slots, &buf2)?;
+        let mut buf3 = vec![0u8; self.world * 8];
+        for (i, b) in peers.iter().enumerate() {
+            let rb = b + self.reduced_at as u64;
+            buf3[i * 8..i * 8 + 8].copy_from_slice(&rb.to_le_bytes());
+        }
+        self.dev.upload_bytes_at(&self.peer_reduced, &buf3)?;
         self.peers = peers;
         Ok(())
     }
@@ -172,17 +190,22 @@ impl Collective {
     /// staging would otherwise publish unrelated memory.
     fn publish(&self, src: *const std::ffi::c_void, len: usize) -> Result<()> {
         assert!(len <= self.bytes, "collective payload {len} > slot {}", self.bytes);
+        let round = self.round.fetch_add(1, AtOrd::AcqRel) + 1;
         // One device kernel writes this rank's payload into every rank's slot
-        // (including our own). The previous loop issued `world` host-side peer
-        // copies per collective — ~16 API calls per layer with the host inside
-        // the dependency chain.
-        self.dev.ar_store(
+        // (including our own) at the round's parity half, after a device-side
+        // credit wait on the peers' `reduced` stamps.
+        let parity_off = ((round as usize % 2) * self.world * self.bytes) as i64;
+        let reduced_local = (self.staging.ptr as *const u8).wrapping_add(self.reduced_at) as *const c_uint;
+        self.dev.ar_store2(
             self.peer_slots.ptr as *const u64,
             self.world as i32,
             self.rank as i32,
             src as *const f32,
             (len / 4) as i64,
             (self.bytes / 4) as i64,
+            parity_off / 4,
+            reduced_local,
+            round,
         )?;
         // The peer copies are asynchronous on both devices (Device::memcpy_peer
         // maps to the async peer copy), so a device sync is REQUIRED here to make
@@ -201,7 +224,11 @@ impl Collective {
             self.rank as i32,
             round,
         )?;
-        self.barrier.wait();
+        // No host barrier here any more: the store kernel waits on the peers'
+        // `reduced` stamps for round-2 (device side), and the reduce kernel waits
+        // on their `stored` stamps for this round. Nothing in this path needs the
+        // host, which is what lets the whole layer be captured into a graph.
+        let _ = &self.barrier;
         Ok(())
     }
 
@@ -212,15 +239,25 @@ impl Collective {
         let slot0 = (self.staging.ptr as *mut u8);
         let n = (len / 4) as i64;
         let slot_f = (self.bytes / 4) as i64;
+        let round = self.round.load(AtOrd::Acquire);
+        let base = (self.staging.ptr as *const u8)
+            .wrapping_add((round as usize % 2) * self.world * self.bytes);
         let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
         self.dev.ar_reduce(
-            slot0 as *mut f32,
-            slot0 as *const f32,
+            base as *mut f32,
+            base as *const f32,
             n,
             slot_f,
             self.world as i32,
             stamps,
-            self.round.load(AtOrd::Acquire),
+            round,
+        )?;
+        // announce that this rank is done reading this parity half
+        self.dev.ar_mark(
+            self.peer_reduced.ptr as *const u64,
+            self.world as i32,
+            self.rank as i32,
+            round,
         )?;
         self.dev
             .memcpy_d2d(buf, slot0 as *const std::ffi::c_void, len)?;

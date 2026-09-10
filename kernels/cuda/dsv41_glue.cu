@@ -287,13 +287,43 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
 // collective — ~8 API calls per all-reduce, ~16 per layer — with the host in the
 // dependency chain. One kernel replaces them and stays on the GPU.
 __global__ void ar_store_kernel(const unsigned long long* __restrict__ peer_slots, int world,
-                                int rank, const float* __restrict__ src, long n, long slot_f) {
+                                int rank, const float* __restrict__ src, long n, long slot_f,
+                                long parity_off, const unsigned* __restrict__ reduced,
+                                unsigned round) {
+    // Credit wait, on the DEVICE — this is what lets the host barrier go away.
+    // The staging is double buffered by round parity, so this write lands in the
+    // half last used by round-2; it must not happen until every peer has finished
+    // REDUCING round-2. EVERY block spins (not just block 0): the other blocks
+    // would otherwise race ahead and overwrite the slot mid-read.
+    if (round >= 3 && threadIdx.x == 0) {
+        for (int p = 0; p < world; ++p) {
+            const volatile unsigned* m = reduced + p;
+            while (*m < round - 2) {
+            }
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
     const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const float v = src[i];
     for (int p = 0; p < world; ++p) {
-        float* dst = (float*)(peer_slots[p]) + (long)rank * slot_f + i;
+        float* dst = (float*)(peer_slots[p]) + parity_off + (long)rank * slot_f + i;
         dst[0] = v;
+    }
+}
+
+// Announced AFTER the reduce completes, so the peers' next store knows this rank
+// is done reading that parity half.
+__global__ void ar_mark_kernel(const unsigned long long* __restrict__ peer_reduced, int world,
+                               int rank, unsigned round) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        __threadfence_system();
+        for (int p = 0; p < world; ++p) {
+            unsigned* dst = (unsigned*)(peer_reduced[p] + (size_t)rank * sizeof(unsigned));
+            *dst = round;
+        }
+        __threadfence_system();
     }
 }
 
@@ -418,3 +448,20 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
     return (int)cudaGetLastError();
 }
 
+extern "C" int dsv41_ar_store2(const unsigned long long* peer_slots, int world, int rank,
+                               const float* src, long n, long slot_f, long parity_off,
+                               const unsigned* reduced, unsigned round, cudaStream_t s) {
+    if (n <= 0 || world <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (blocks > 512) blocks = 512;
+    ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, parity_off,
+                                           reduced, round);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_ar_mark(const unsigned long long* peer_reduced, int world, int rank,
+                             unsigned round, cudaStream_t s) {
+    if (world <= 0) return (int)cudaSuccess;
+    ar_mark_kernel<<<1, 32, 0, s>>>(peer_reduced, world, rank, round);
+    return (int)cudaGetLastError();
+}
