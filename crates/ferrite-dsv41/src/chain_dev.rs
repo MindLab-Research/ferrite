@@ -1448,7 +1448,9 @@ impl<'a> DevChain<'a> {
                     ex.w2.as_u8(),
                     ex.w2_scale.as_u8(),
                     self.s.ex_in.as_f32(),
-                    self.s.ex_out.ptr as *mut f32,
+                    // accumulates straight into the MoE sum (o was zeroed above),
+                    // which removes one add_inplace launch per expert
+                    self.s.o.ptr as *mut f32,
                     1,
                     dim as i32,
                     inter_local as i32,
@@ -1473,8 +1475,7 @@ impl<'a> DevChain<'a> {
                         wsum[e]
                     );
                 }
-                // accumulate deterministically into o
-                self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                // (the down kernel accumulates into o itself)
             }
         }
 

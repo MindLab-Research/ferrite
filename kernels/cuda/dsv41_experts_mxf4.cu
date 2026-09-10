@@ -507,10 +507,16 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
                     if (col < b_split) x = fminf(x, limit);                        // gate
                     else x = fminf(fmaxf(x, -limit), limit);                       // up
                 }
-            } else if (epi_mode == 2) {  // down: routing weight
+            } else if (epi_mode == 2 || epi_mode == 3) {  // down: routing weight
                 if (row_weight != nullptr) x *= row_weight[row];
             }
-            out[(size_t)row * n_total + col] = x;
+            // epi_mode 3 accumulates straight into the caller's MoE accumulator,
+            // so the host no longer needs one add_inplace launch per expert.
+            if (epi_mode == 3) {
+                out[(size_t)row * n_total + col] += x;
+            } else {
+                out[(size_t)row * n_total + col] = x;
+            }
         }
     }
 
@@ -574,6 +580,10 @@ extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
                                      const uint8_t* w2_scale, const float* weight, float* out,
                                      int rows, int dim, int inter, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0) return (int)cudaErrorInvalidValue;
+    // epi_mode 3 = accumulate into `out`. This entry point is used ONLY by the
+    // routed experts (the shared expert goes through gemm_fp8_mx), and the MoE
+    // needs a sum over the selected experts — so accumulate here rather than
+    // making the host issue one add_inplace launch per expert.
     return (int)launch_mxf4(nullptr, nullptr, act, w2, w2_scale, w2, w2_scale, out, rows, dim,
-                            inter, -1, 2, 0.f, weight, true, stream);
+                            inter, -1, 3, 0.f, weight, true, stream);
 }
