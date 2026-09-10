@@ -288,6 +288,14 @@ fn run_tp(
     let text = tok.decode(&produced, true).unwrap_or_default();
     println!("--- generated ({}) ---", produced.len());
     println!("{text}");
+        {
+        let el = t_dec.elapsed();
+        let n = produced.len().max(1);
+        eprintln!(
+            "[dsv41] DECODE {} tokens in {:?} = {:.2} tok/s ({:.1} ms/token)",
+            produced.len(), el, n as f64 / el.as_secs_f64(), el.as_secs_f64() * 1e3 / n as f64
+        );
+    }
     println!("--- ids: {:?}", &produced[..produced.len().min(24)]);
     Ok(())
 }
@@ -390,6 +398,7 @@ fn rank_body(
         );
     }
     let mut out: Vec<u32> = Vec::new();
+    let t_dec = std::time::Instant::now();
     for step in 0..max_tokens {
         let mut best = 0usize;
         for (i, &v) in logits.iter().enumerate() {
