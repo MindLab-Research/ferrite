@@ -414,3 +414,85 @@ return h + gate.unsqueeze(-1) * value.unsqueeze(-2)                            #
 两层表合计 **189 GiB**（≈256 维 × 4B 显存/行… 实为 bf16，每 rank 分 `ceil(rows/world)` = ~24 GB/rank ✓ 装得下）。
 **查表跨 rank**：每 token 每层只有 24 行 × 256 维 = **24 KB** ✓ → 一次小 all-to-all 即可（数据量可忽略）。
 `wkv` 是 25600×6144 = 157M 参数的稠密 fp8 ✓ 已在权重集里（`DSV41_SKIP_ENGRAM_WEIGHTS` 可跳过）。
+
+---
+
+## ★ 2026-09-11：官方 PyTorch 参考实现已可运行（最强验证工具）+ 逐级对拍结论
+
+### 如何运行官方实现（已跑通，整套流程如下）
+
+```bash
+# 1) 隔离 venv（系统 torch 是 cpu-only，必须另装）
+python3 -m venv /opt/dlami/nvme/dsv41_venv
+/opt/dlami/nvme/dsv41_venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cu128
+/opt/dlami/nvme/dsv41_venv/bin/pip install tilelang transformers safetensors sympy numpy tqdm pillow
+
+# 2) 把 HF 检查点转成官方格式（名字映射/分片/engram 表补齐都由它做）
+cd <ckpt>/inference && python3 convert.py --hf-ckpt-path <ckpt> \
+  --save-path /opt/dlami/nvme/dsv41_mp8 --model-parallel 8 --expert-dtype fp4
+# → model{0..7}-mp8.safetensors（每个 67 GB）
+
+# 3) config：官方 ModelArgs 只认自己的字段名，HF config 的键名不同，必须映射
+#    hidden_size→dim, moe_intermediate_size→moe_inter_dim, num_hidden_layers→n_layers,
+#    num_nextn_predict_layers→n_mtp_layers, num_attention_heads→n_heads,
+#    num_experts_per_tok→n_activated_experts, scoring_func→score_func,
+#    routed_scaling_factor→route_scale, qk_rope_head_dim→rope_head_dim,
+#    rms_norm_eps→norm_eps, sliding_window→window_size,
+#    kv_source_layer_ids→kv_source_layers, index_source_layer_ids→index_source_layers,
+#    candidate_source_layer_id→candidate_source_layer, engram_pad_token_id→engram_pad_id,
+#    dspark_num_experts_per_tok→dspark_n_activated_experts,
+#    rope_scaling{...}→original_seq_len/rope_factor/beta_fast/beta_slow,
+#    + vision_config{num_hidden_layers→vision_n_layers, hidden_size→vision_dim, ...} + image_token_id
+#    （**不映射 vision 会因 state_dict 里有 aligner.*/image_*/gate.bias_vl 而 strict 加载失败**）
+
+# 4) 跑（贪心：generate.py 的 sample() 在 temperature==0 时就是 argmax）
+/opt/dlami/nvme/dsv41_venv/bin/torchrun --nproc_per_node=8 generate.py \
+  --ckpt-path /opt/dlami/nvme/dsv41_mp8 --config <mapped>.json \
+  --input-file /tmp/prompt.txt --max-new-tokens 16 --temperature 0
+```
+
+**官方真值（golden，已确认可用）**：
+```
+Prompt: The capital of France is
+Completion: The capital of France is **Paris**.        ← 官方贪心输出，连贯
+```
+裸 token 序列 `[671,6102,294,8760,344]` 下官方 top5 =
+`[(11111, 20.329), (1613, 17.546), (4588, 16.698), (260, 16.568), (16, 16.458)]`，logits rms **2.8198**。
+
+官方打印出的**权威配置**（与我的 config.rs 解析一致 ✓）：
+`dim=5120 moe_inter_dim=2304 n_layers=40 n_heads=64 n_activated_experts=6 route_scale=1.5
+swiglu_limit=10.0 q_lora_rank=1280 head_dim=512 rope_head_dim=64 norm_eps=1e-20 o_groups=8
+o_lora_rank=1024 window_size=128 index_n_heads=32 index_head_dim=128 index_topk=512
+candidate_source_layer=20 candidate_topk_blocks=2048 candidate_block_size=8 hc_mult=4
+hc_sinkhorn_iters=20 hc_eps=1e-06 engram_layer_ids=[1,14] dspark_block_size=5
+dspark_target_layer_ids=[37,38,39]`
+
+### 逐级对拍结果（同 token 序列 `[671,…]`，官方记 pos0、我记第一步）
+
+| 量 | 官方 | 我的 | 判定 |
+|---|---|---|---|
+| **embed 行 rms (token 671)** | 0.037195 | 0.037195 | **✓ 一致** |
+| **L0 hc pre** | [5.9e-05, 3e-06, 1e-06, 0.993102] | [5.9085e-5, 3.48e-6, 1.44e-6, 0.9930845] | **✓ 一致** |
+| **L0 hc post** | [0.000522, 0.000144, 0.0, 0.079789] | [0.00052252, 0.00014405, 1.78e-9, 0.0798377] | **✓ 一致** |
+| **L0 hc comb** | [0.857548, 0.002101, 0.001035, 0.105167, …] | [0.8575853, 0.0020976, 0.001035, 0.1051372, …] | **✓ 一致** |
+| **comb_rowsum** | [0.965851, 1.017994, 1.084354, 0.931798] | [0.9658552, 1.0180061, 1.0843558, 0.931779] | **✓ 一致** |
+| **xn (attn_norm 输出)** | 0.020712 | 0.0207 | **✓ 一致** |
+| **ffn_in** | 0.126523 | 0.1256 | **✓ 一致（0.7%）** |
+| attn_out (o) | 0.774044 | 0.4606 | ✗ 1.68x（**探针口径存疑，见下**）|
+| moe_out | 0.145160 | 0.0792 | ✗ 1.83x |
+| h (L0) | 0.074201（**5 token 聚合**）| 0.0395（**单 token**）| 口径不同，不可比 |
+
+**结论：hc 全链（pre/post/comb/sinkhorn）、embedding、attn_norm、ffn_in 都与官方一致或吻合到 1% 内** ✓✓。
+**分歧集中在 attn_out / moe_out 的幅度** ✗。
+
+**两个探针陷阱（都踩过，记录以免重犯）**：
+1. `L0 attn_out(o)`：`attention()` 返回时 `s.o` 已是 **dim 宽**（wo_b 输出），我第一次按 `nh*hd` 读 →
+   读到缓冲区尾部陈旧数据（0.1821 这个数是错的 ✗）。有效值是按 `dim` 读的 **0.4606**。
+2. `L0 h`：官方一次 prefill 5 个 token、我逐 token → **rms 口径不同**（官方 0.0742 是 5 token 聚合、
+   我 0.0395 是单 token）✗。要比就必须两边都取 pos0。
+
+**下一步（用官方做神谕，逐级精确定位）**：
+- 在官方 `Attention.forward` 里打印 **pos0 的 q/kv/wo_a 中间量**，与我的同位置数值逐元素对比；
+  `ffn_in` 已吻合说明注意力输出的最终效果接近 ↔ `attn_out` 探针的 1.68x 很可能是探针口径而非真误差 ✗
+  → 先用 pos0 的**逐元素**（不只看 rms）核对，再判定。
+- `moe_out` 的 1.83x 优先查 **shared expert 是否被正确相加**（官方 `n_shared_experts=1`）。
