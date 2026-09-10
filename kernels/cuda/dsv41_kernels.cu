@@ -470,8 +470,70 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
         cm[jk] = mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
     }
     __syncthreads();
-    // (the Sinkhorn iterations themselves are the CPU golden's job; the device
-    // path runs them in the fused hc kernel -- see hc_split_sinkhorn)
+    // Sinkhorn normalisation to doubly-stochastic: each row AND column of comb
+    // sums to ~1, which is what keeps the residual's energy from growing through
+    // the hc_post expansion. Without it comb is unbounded (mixes*scale+base) and
+    // the h stream grows exponentially — rms 0.5 at L0, 3e11 at L5, inf/NaN by L20.
+    // Matches hc_split_sinkhorn in the reference (kernel.py:407).
+    // step 1: row softmax + eps
+    __shared__ float row_max[16], row_sum[16], col_sum[16];
+    for (int j = 0; j < hc; j++) {
+        if (threadIdx.x == 0) {
+            float mx = -INFINITY;
+            for (int k = 0; k < hc; k++) mx = fmaxf(mx, cm[j * hc + k]);
+            row_max[j] = mx;
+        }
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc;
+        cm[jk] = expf(cm[jk] - row_max[j]);
+    }
+    __syncthreads();
+    for (int j = 0; j < hc; j++) {
+        if (threadIdx.x == 0) {
+            float s = 0.f;
+            for (int k = 0; k < hc; k++) s += cm[j * hc + k];
+            row_sum[j] = s;
+        }
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc;
+        cm[jk] = cm[jk] / row_sum[j] + eps;
+    }
+    __syncthreads();
+    // step 2..N: alternate column then row normalisation (sinkhorn iterations)
+    for (int it = 0; it < sinkhorn_iters; it++) {
+        // column normalise
+        for (int k = 0; k < hc; k++) {
+            if (threadIdx.x == 0) {
+                float s = 0.f;
+                for (int j = 0; j < hc; j++) s += cm[j * hc + k];
+                col_sum[k] = s;
+            }
+        }
+        __syncthreads();
+        for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+            const int k = jk % hc;
+            cm[jk] = cm[jk] / (col_sum[k] + eps);
+        }
+        __syncthreads();
+        // row normalise
+        for (int j = 0; j < hc; j++) {
+            if (threadIdx.x == 0) {
+                float s = 0.f;
+                for (int k = 0; k < hc; k++) s += cm[j * hc + k];
+                row_sum[j] = s;
+            }
+        }
+        __syncthreads();
+        for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+            const int j = jk / hc;
+            cm[jk] = cm[jk] / (row_sum[j] + eps);
+        }
+        __syncthreads();
+    }
     for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) comb[(size_t)r * hc * hc + jk] = cm[jk];
 }
 
