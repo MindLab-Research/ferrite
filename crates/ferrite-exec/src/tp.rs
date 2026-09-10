@@ -2767,7 +2767,10 @@ fn mega_chain_dev(
         // Serialize per-rank captures (concurrent cuGraphInstantiate
         // SIGSEGV'd historically); record-mode NCCL enqueue never
         // rendezvous, so serialized capture is deadlock-free.
-        Some(ferrite_kernel::cuda::capture_lock().lock().unwrap())
+        eprintln!("[mcd] capture: rollback done, taking lock");
+        let g = ferrite_kernel::cuda::capture_lock().lock().unwrap();
+        eprintln!("[mcd] capture: lock acquired");
+        Some(g)
     } else {
         None
     };
