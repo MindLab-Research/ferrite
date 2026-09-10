@@ -30,7 +30,6 @@ use crate::weights::{local_shape, padded_inter, tensor_specs, SafetensorsIndex, 
 /// handing them bf16 bytes made each of them read twice its length, which
 /// corrupted values and walked off the end of the allocation.
 const KEEP_BF16: &[&str] = &[
-    "head.weight",
     "ffn.gate.weight",
     "attn.indexer.wq_b.weight",
     "attn.indexer.wk.weight",

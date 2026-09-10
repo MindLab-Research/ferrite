@@ -356,7 +356,10 @@ impl<'a> DevChain<'a> {
             dim as i32,
             cfg.norm_eps,
         )?;
-        self.lin_bf16(
+        // The head keeps f32 activations × f32 weights (the checkpoint stores BF16;
+        // it is widened losslessly at load). Casting the activation to bf16 here cost
+        // ~3 bits on a 129280-way near-tie argmax — the reference keeps it in f32.
+        self.lin_f32(
             self.s.xn.ptr as *const f32,
             dim as i32,
             self.w.head.as_ref().unwrap(),
