@@ -282,7 +282,29 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
     const uint8_t* __restrict__ b_hi_scale,
     float* __restrict__ out,              // [rows, n_out]
     int rows, int n_total, int k, int b_split, int epi_mode, float limit,
-    const float* __restrict__ row_weight) {
+    const float* __restrict__ row_weight,
+    // ---- indirect (graph-friendly) B addressing -------------------------
+    // Given the per-layer pools' bases and per-expert strides plus a device
+    // array of expert ids, the kernel derives its OWN B pointers. That removes
+    // the host from the MoE dispatch: no per-layer routing download (a blocking
+    // cudaMemcpy) and the launch arguments become independent of the routing,
+    // which is what a CUDA graph needs. ids == nullptr keeps the direct path.
+    const uint8_t* __restrict__ b_base, long b_stride,
+    const uint8_t* __restrict__ bs_base, long bs_stride,
+    const uint8_t* __restrict__ bh_base, long bh_stride,
+    const uint8_t* __restrict__ bhs_base, long bhs_stride,
+    const int* __restrict__ ids, int slot) {
+    const uint8_t* b_use = b;
+    const uint8_t* bsc_use = b_scale;
+    const uint8_t* bhi_use = b_hi;
+    const uint8_t* bhs_use = b_hi_scale;
+    if (ids != nullptr) {
+        const size_t e = (size_t)ids[slot];
+        b_use = b_base + e * (size_t)b_stride;
+        bsc_use = bs_base + e * (size_t)bs_stride;
+        bhi_use = bh_base + e * (size_t)bh_stride;
+        bhs_use = bhs_base + e * (size_t)bhs_stride;
+    }
     const int m_base = blockIdx.y * kMTile;
     const int n_base = blockIdx.x * kNTile;
     const int tid = threadIdx.x;
@@ -376,10 +398,10 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
             const int n_glob = n_base + n;
             uint4 val = make_uint4(0, 0, 0, 0);
             if (n_glob < n_total) {
-                const uint8_t* src_base = b;
+                const uint8_t* src_base = b_use;
                 int row = n_glob;
                 if (b_split >= 0 && n_glob >= b_split) {
-                    src_base = b_hi;
+                    src_base = bhi_use;
                     row = n_glob - b_split;
                 }
                 if (row >= 0)
@@ -438,10 +460,10 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
                 const int n_glob = n_base + n;
                 uint8_t v[4] = {0, 0, 0, 0};
                 if (n_glob < n_total) {
-                    const uint8_t* sc = b_scale;
+                    const uint8_t* sc = bsc_use;
                     int row = n_glob;
                     if (b_split >= 0 && n_glob >= b_split) {
-                        sc = b_hi_scale;
+                        sc = bhs_use;
                         row = n_glob - b_split;
                     }
                     if (row >= 0) {
@@ -537,11 +559,14 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
     if (aq)
         mxf4_gemm_kernel<true><<<grid, kThreads, 0, s>>>(a, a_scale, a_f32, b, b_scale, b_hi,
                                                          b_hi_scale, out, rows, n_total, k, b_split,
-                                                         epi_mode, limit, row_weight);
+                                                         epi_mode, limit, row_weight, nullptr, 0,
+                                                         nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
     else
         mxf4_gemm_kernel<false><<<grid, kThreads, 0, s>>>(a, a_scale, a_f32, b, b_scale, b_hi,
                                                           b_hi_scale, out, rows, n_total, k,
-                                                          b_split, epi_mode, limit, row_weight);
+                                                          b_split, epi_mode, limit, row_weight,
+                                                          nullptr, 0, nullptr, 0, nullptr, 0,
+                                                          nullptr, 0, nullptr, 0);
     return cudaGetLastError();
 }
 
@@ -576,6 +601,54 @@ extern "C" int dsv41_expert_gate_up_fp4(const uint8_t* a, const float* a_scale,
 // ABI: dsv41_expert_down_fp4 — [rows, inter] f32 act x W2[dim, inter] fp4
 //      -> [rows, dim], scaled by the per-row routing weight.
 // ============================================================================
+// Indirect (graph-friendly) launcher: B pointers come from the pools + the
+// device-side expert id instead of host-computed pointers.
+inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, const float* a_f32,
+                                        float* out, int rows, int n_total, int k, int b_split,
+                                        int epi_mode, float limit, const float* row_weight,
+                                        bool aq, const uint8_t* b_base, long b_stride,
+                                        const uint8_t* bs_base, long bs_stride,
+                                        const uint8_t* bh_base, long bh_stride,
+                                        const uint8_t* bhs_base, long bhs_stride,
+                                        const int* ids, int slot, cudaStream_t s) {
+    if (rows <= 0 || n_total <= 0 || k <= 0) return cudaSuccess;
+    if (k % kAtomK != 0) return cudaErrorInvalidValue;
+    const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
+                    (unsigned)((rows + kMTile - 1) / kMTile));
+    if (aq)
+        mxf4_gemm_kernel<true><<<grid, kThreads, 0, s>>>(
+            a, a_scale, a_f32, nullptr, nullptr, nullptr, nullptr, out, rows, n_total, k, b_split,
+            epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
+            bhs_base, bhs_stride, ids, slot);
+    else
+        mxf4_gemm_kernel<false><<<grid, kThreads, 0, s>>>(
+            a, a_scale, a_f32, nullptr, nullptr, nullptr, nullptr, out, rows, n_total, k, b_split,
+            epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
+            bhs_base, bhs_stride, ids, slot);
+    return cudaGetLastError();
+}
+
+// gate_up, indirect: derives w1/w3 (+scales) from the pools and ids[slot].
+extern "C" int dsv41_expert_gate_up_fp4_indirect(
+    const uint8_t* a, const float* a_scale, float* out, int rows, int dim, int inter, float limit,
+    const uint8_t* w1_base, long w1_stride, const uint8_t* w1s_base, long w1s_stride,
+    const uint8_t* w3_base, long w3_stride, const uint8_t* w3s_base, long w3s_stride,
+    const int* ids, int slot, cudaStream_t stream) {
+    return (int)launch_mxf4_indirect(a, a_scale, nullptr, out, rows, 2 * inter, dim, inter, 1, limit,
+                                     nullptr, false, w1_base, w1_stride, w1s_base, w1s_stride,
+                                     w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, stream);
+}
+
+// down, indirect, accumulating into `out` (epi_mode 3).
+extern "C" int dsv41_expert_down_fp4_indirect(
+    const float* act, float* out, int rows, int dim, int inter, const float* row_weight,
+    const uint8_t* w2_base, long w2_stride, const uint8_t* w2s_base, long w2s_stride,
+    const int* ids, int slot, cudaStream_t stream) {
+    return (int)launch_mxf4_indirect(nullptr, nullptr, act, out, rows, dim, inter, -1, 3, 0.f,
+                                     row_weight, true, w2_base, w2_stride, w2s_base, w2s_stride,
+                                     w2_base, w2_stride, w2s_base, w2s_stride, ids, slot, stream);
+}
+
 extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
                                      const uint8_t* w2_scale, const float* weight, float* out,
                                      int rows, int dim, int inter, cudaStream_t stream) {

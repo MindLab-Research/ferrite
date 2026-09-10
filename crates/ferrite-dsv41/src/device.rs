@@ -139,6 +139,19 @@ struct Kernels {
     ar_store: Option<
         unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, CuStream) -> c_int,
     >,
+    expert_gate_up_fp4_indirect: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
+            *const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64,
+            *const c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
+    expert_down_fp4_indirect: Option<
+        unsafe extern "C" fn(
+            *const f32, *mut f32, c_int, c_int, c_int, *const f32,
+            *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     ar_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
     >,
@@ -333,6 +346,12 @@ impl Device {
                 hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_stamp: sym(h_k, "dsv41_ar_stamp").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_store: sym(h_k, "dsv41_ar_store").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                expert_down_fp4_indirect: sym(h_k, "dsv41_expert_down_fp4_indirect")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_reduce: sym(h_k, "dsv41_ar_reduce").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 route_topk: sym(h_k, "dsv41_route_topk").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 compressor_pool: sym(h_k, "dsv41_compressor_pool").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1229,6 +1248,72 @@ impl Device {
         let f = self.need(self.kernels.ar_stamp, "dsv41_ar_stamp")?;
         let rc = unsafe { f(peer_stamps, world, rank, round, self.stream) };
         self.kerr(rc, "dsv41_ar_stamp")
+    }
+
+    /// Indirect expert gate/up: the weights come from the per-layer pools plus the
+    /// device-side expert id, so the launch arguments do not depend on the routing.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_gate_up_fp4_indirect(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        limit: f32,
+        w1_base: *const u8,
+        w1_stride: i64,
+        w1s_base: *const u8,
+        w1s_stride: i64,
+        w3_base: *const u8,
+        w3_stride: i64,
+        w3s_base: *const u8,
+        w3s_stride: i64,
+        ids: *const i32,
+        slot: i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_gate_up_fp4_indirect,
+            "dsv41_expert_gate_up_fp4_indirect",
+        )?;
+        let rc = unsafe {
+            f(
+                a, a_scale, out, rows, dim, inter, limit, w1_base, w1_stride, w1s_base, w1s_stride,
+                w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_expert_gate_up_fp4_indirect")
+    }
+
+    /// Indirect expert down; accumulates into `out`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_down_fp4_indirect(
+        &self,
+        act: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        row_weight: *const f32,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+        slot: i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_down_fp4_indirect,
+            "dsv41_expert_down_fp4_indirect",
+        )?;
+        let rc = unsafe {
+            f(
+                act, out, rows, dim, inter, row_weight, w2_base, w2_stride, w2s_base, w2s_stride,
+                ids, slot, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_expert_down_fp4_indirect")
     }
 
     /// Publish `src` into every rank's staging slot for this rank, from the device.

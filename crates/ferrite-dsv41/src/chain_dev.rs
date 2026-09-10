@@ -1353,19 +1353,12 @@ impl<'a> DevChain<'a> {
             cfg.route_scale,
             2, // sqrtsoftplus, per the checkpoint's routing
         )?;
-        let mut idx = vec![0i32; topk];
-        let mut wgt = vec![0f32; topk];
-        // DSV41_MOE_NOSYNC=1 skips this sync purely to MEASURE its cost (the
-        // downloads may then race the routing kernel, so the output is not
-        // trustworthy — it exists to size the prize before investing in a
-        // device-side dispatch).
-        if !std::env::var("DSV41_MOE_NOSYNC").map(|v| v != "0").unwrap_or(false) {
-            self.dev.sync()?;
-        }
-        self.dev.download_f32(&self.s.route_idx, unsafe {
-            std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut f32, topk)
-        })?;
-        self.dev.download_f32(&self.s.route_w, &mut wgt)?;
+        // DEVICE-side dispatch: the routing stays on the device and the expert
+        // kernels read `ids[slot]` themselves. Both downloads here were blocking
+        // cudaMemcpy calls (download_f32 uses the synchronous memcpy), i.e. a
+        // per-layer host stall; they are gone, and the launch arguments no longer
+        // depend on the routing (which is what a CUDA graph needs).
+        let (mut idx, mut wgt) = (Vec::<i32>::new(), Vec::<f32>::new());
 
         // One token: every assignment shares the input row, so expert e's total
         // contribution is expert_e(x) * sum of its routing weights. Accumulating
@@ -1385,12 +1378,38 @@ impl<'a> DevChain<'a> {
         if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[mine] route idx={:?} wgt={:?}", &idx, &wgt);
         }
-        for (slot, &e) in idx.iter().enumerate() {
-            let e = e as usize;
-            if e < ne {
-                wsum[e] += wgt[slot];
-            }
-        }
+        // The experts' tensors are views into one per-layer pool with a uniform
+        // per-expert stride, so the kernels can derive every pointer from a base
+        // plus `ids[slot] * stride`. Taking the stride as the difference of two
+        // experts' pointers keeps this correct for whatever layout the loader
+        // chose.
+        let (w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride) =
+            if ne >= 2 {
+                let (a, b) = (&ld.experts[0], &ld.experts[1]);
+                let d = |x: *mut std::ffi::c_void, y: *mut std::ffi::c_void| {
+                    (y as i64) - (x as i64)
+                };
+                (
+                    a.w1.ptr() as *const u8, d(a.w1.ptr(), b.w1.ptr()),
+                    a.w1_scale.ptr() as *const u8, d(a.w1_scale.ptr(), b.w1_scale.ptr()),
+                    a.w3.ptr() as *const u8, d(a.w3.ptr(), b.w3.ptr()),
+                    a.w3_scale.ptr() as *const u8, d(a.w3_scale.ptr(), b.w3_scale.ptr()),
+                )
+            } else {
+                (std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0, std::ptr::null(), 0)
+            };
+        let (w2_base, w2_stride, w2s_base, w2s_stride) = if ne >= 2 {
+            let (a, b) = (&ld.experts[0], &ld.experts[1]);
+            let d = |x: *mut std::ffi::c_void, y: *mut std::ffi::c_void| {
+                    (y as i64) - (x as i64)
+                };
+            (
+                a.w2.ptr() as *const u8, d(a.w2.ptr(), b.w2.ptr()),
+                a.w2_scale.ptr() as *const u8, d(a.w2_scale.ptr(), b.w2_scale.ptr()),
+            )
+        } else {
+            (std::ptr::null(), 0, std::ptr::null(), 0)
+        };
         if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
             let n_active = wsum.iter().filter(|w| **w != 0.0).count();
             eprintln!(
@@ -1413,76 +1432,51 @@ impl<'a> DevChain<'a> {
                 32,
                 true,
             )?;
-            for e in 0..ne {
-                if wsum[e] == 0.0 {
-                    continue;
-                }
-                let ex = &ld.experts[e];
-                self.dev.expert_gate_up_fp4(
+            // Fixed 6-slot device-driven loop: the expert id comes from
+            // route_idx on the device and the weights from route_w, so there is
+            // no host round trip and the launch arguments are static.
+            for slot in 0..topk {
+                let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);
+                let ids = self.s.route_idx.ptr as *const i32;
+                self.dev.expert_gate_up_fp4_indirect(
                     self.s.xq.as_u8(),
                     self.s.xsc.as_f32(),
-                    ex.w1.as_u8(),
-                    ex.w1_scale.as_u8(),
-                    ex.w3.as_u8(),
-                    ex.w3_scale.as_u8(),
                     self.s.ex_act.ptr as *mut f32,
                     1,
                     dim as i32,
                     inter_local as i32,
                     cfg.swiglu_limit,
+                    w1_base,
+                    w1_stride,
+                    w1s_base,
+                    w1s_stride,
+                    w3_base,
+                    w3_stride,
+                    w3s_base,
+                    w3s_stride,
+                    ids,
+                    slot as i32,
                 )?;
-                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e == 277 {
-                    let gu = self.dl(self.s.ex_act.as_f32(), 2 * inter_local)?;
-                    let g: f32 = (gu[..inter_local].iter().map(|v| v * v).sum::<f32>()
-                        / inter_local as f32)
-                        .sqrt();
-                    let u: f32 = (gu[inter_local..].iter().map(|v| v * v).sum::<f32>()
-                        / inter_local as f32)
-                        .sqrt();
-                    eprintln!("[mine] expert {e} gate_rms={g} up_rms={u}");
-                }
-                self.dev
-                    .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter_local as i32, cfg.swiglu_limit)?;
-                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e == 277 {
-                    let sw = self.dl(self.s.ex_act.as_f32(), inter_local)?;
-                    let r: f32 =
-                        (sw.iter().map(|v| v * v).sum::<f32>() / inter_local as f32).sqrt();
-                    eprintln!("[mine] expert {e} swiglu_rms={r}");
-                }
-                self.ul_f32(self.s.ex_in.ptr, &[wsum[e]])?;
-                self.dev.expert_down_fp4(
+                self.dev.swiglu_limit(
+                    self.s.ex_act.ptr as *mut f32,
+                    1,
+                    inter_local as i32,
+                    cfg.swiglu_limit,
+                )?;
+                self.dev.expert_down_fp4_indirect(
                     self.s.ex_act.ptr as *const f32,
-                    ex.w2.as_u8(),
-                    ex.w2_scale.as_u8(),
-                    self.s.ex_in.as_f32(),
-                    // accumulates straight into the MoE sum (o was zeroed above),
-                    // which removes one add_inplace launch per expert
                     self.s.o.ptr as *mut f32,
                     1,
                     dim as i32,
                     inter_local as i32,
+                    w,
+                    w2_base,
+                    w2_stride,
+                    w2s_base,
+                    w2s_stride,
+                    ids,
+                    slot as i32,
                 )?;
-                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e == 128 {
-                    let sw = self.dl(self.s.ex_act.as_f32(), inter_local)?;
-                    let r = (sw.iter().map(|v| v * v).sum::<f32>() / sw.len() as f32).sqrt();
-                    // if every rank reports the same slice fingerprint, the loader gave
-                    // them all the same inter slice (that would make the AR double-count)
-                    let fp: f32 = sw.iter().take(8).map(|v| v.abs()).sum();
-                    eprintln!("[mine] rank{} E128 swiglu_rms={r} fp={fp}", self.rank());
-                }
-                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
-                    let eo = self.dl(self.s.ex_out.as_f32(), dim)?;
-                    let r: f32 =
-                        (eo.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
-                    let ao = self.dl(self.s.o.as_f32(), dim)?;
-                    let ra: f32 =
-                        (ao.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
-                    eprintln!(
-                        "[mine] expert {e} w={} down_out_rms={r} accum_rms_before={ra}",
-                        wsum[e]
-                    );
-                }
-                // (the down kernel accumulates into o itself)
             }
         }
 
