@@ -196,6 +196,8 @@ pub struct Loader<'a> {
     data_base: HashMap<String, u64>,
     /// shard file -> read-only mmap, so tensors go to the GPU by DMA
     maps: HashMap<String, (*const u8, usize)>,
+    /// (bytes, name) per tensor, for `DSV41_LOAD_TRACE`
+    trace: Vec<(usize, String)>,
     dev: &'a Device,
     /// bytes uploaded so far (for the report)
     pub uploaded: u64,
@@ -228,6 +230,7 @@ impl<'a> Loader<'a> {
             files: HashMap::new(),
             data_base: HashMap::new(),
             maps: HashMap::new(),
+            trace: Vec::new(),
             dev,
             uploaded: 0,
             skip_prefixes: Vec::new(),
@@ -333,6 +336,10 @@ impl<'a> Loader<'a> {
         let widen = h.dtype == "BF16" && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
         let out_bytes = n_local * if widen { 4 } else { esz };
 
+        self.uploaded += out_bytes as u64;
+        if std::env::var("DSV41_LOAD_TRACE").map(|v| v != "0").unwrap_or(false) {
+            self.trace.push((out_bytes, spec.name.clone()));
+        }
         // destination, pre-zeroed so any padding the slice needs stays zero
         let buf = self.dev.alloc(out_bytes)?;
         self.dev.zero_at(buf.ptr, out_bytes)?;
@@ -383,7 +390,13 @@ impl<'a> Loader<'a> {
             // ---- DMA path ----
             let shard = self.index.get(&spec.name).unwrap().clone();
             let (base, _len) = self.map_shard(&shard)?;
-            let data = base.wrapping_add(*self.data_base.get(&shard).unwrap() as usize);
+            // data_base = the shard's data-section start; h.begin = THIS tensor's
+            // offset inside it. Omitting h.begin made every tensor read from the
+            // start of the data section (garbage values, and reads past the end
+            // of the mapping for the later tensors).
+            let data = base
+                .wrapping_add(*self.data_base.get(&shard).unwrap() as usize)
+                .wrapping_add(h.begin as usize);
             match spec.shard {
                 Shard::Cols | Shard::ExpertCols => {
                     let per = inner / world;
@@ -608,6 +621,19 @@ impl<'a> Loader<'a> {
                     w.vision.push((s.name.clone(), t));
                 }
             }
+        }
+        if std::env::var("DSV41_LOAD_TRACE").map(|v| v != "0").unwrap_or(false) {
+            let mut t = self.trace.clone();
+            t.sort_by(|a, b| b.0.cmp(&a.0));
+            for (b, n) in t.iter().take(12) {
+                eprintln!("[load] {:10.2} MiB  {n}", *b as f64 / (1u64 << 20) as f64);
+            }
+            let total: usize = self.trace.iter().map(|(b, _)| *b).sum();
+            eprintln!(
+                "[load] TOTAL {:.2} GiB over {} tensors",
+                total as f64 / (1u64 << 30) as f64,
+                self.trace.len()
+            );
         }
         Ok(w)
     }
