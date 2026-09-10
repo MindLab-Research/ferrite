@@ -1360,3 +1360,35 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 | | **合计** | −2.78 → 10.1ms ≈ 1585 | 边缘达标 |
 
 **AR v5 设计（第 4 次尝试，前 3 次死锁根因已定位）**：死锁共同根因 = epoch 状态由 dry-run（真实执行）推进、由 capture（只记录）冻结 → 各 rank 计数器漂移。v5 让 **epoch = AR kernel 自身的执行次数**：每个 AR 调用点有独立 `ctr[slot]`，store kernel 的 block0 `atomicAdd(&ctr[slot],1)` 得本次 epoch；publish 写 `stamp[peer][slot]=epoch`；reduce 轮询 `stamp>=my_epoch` 后按 publish 出来的 epoch 选 staging 奇偶位（读者跟写者走）。dry-run 执行→推进、capture 不执行→不推进、replay 执行→推进，任何路径下各 rank 推进次数相同（TP lockstep），不可能漂移。预期 28.99 → ~11µs。
+
+## ✅ 2026-09-10 傍晚：AR v5 成功 — B=16 replay 12.88 → 10.95ms（−1.9ms），1455 tok/s
+
+**P2P one-shot AR v5（FERRITE_P2P=1 FERRITE_P2P_AR5=1，env-gated）在第 4 次尝试成功**，两轮验证全绿：
+
+| 验证 | 结果 |
+|---|---|
+| 首测 b16×300 | replay p50 **11.00ms**（NCCL 12.88），faults=0，ar5-hang=0，无监护停滞 |
+| 复测 b16×300 + **b16→retire→b2 图切换** | b16 **10.95ms**，b2 **7.12ms**（NCCL 8.84），faults=0，hang=0 |
+| 文本 | req0 思考前言后逐字背诵《出师表》至"将军向宠"段 ✓（300 token 预算耗尽截断） |
+| AR 每次开销 | 28.99µs → **~8µs**（90 次/步：2.61ms → ~0.7ms） |
+| 事后 GPU | nvidia-smi 全 0（未 wedge） |
+
+**v5 的核心设计（为何第 4 次成功了）**：前三次（fused_v3/oneshot_v1/oneshot_v2）死锁的共同根因是 **epoch 状态由 dry-run（真实执行）推进、由 capture（只记录）冻结，而各 rank 的 dry-run 不同步**（"dev0 at L0, peers at L35"；post-dry-run 的 epoch reset 也修不好）。v5 不是修补状态而是**消除 desync 的来源**：
+- Rust 分发器只在 `is_capturing()` 为真时发射 v5 kernel；dry-run 和所有 host 路径回退 NCCL。
+- 于是 epoch 计数器**只被 replay 的图节点推进**，而 replay 是全局 lockstep（TP decode 不可能跑在对端 all-reduce 前面）→ 计数器在任何时刻跨 rank 相等，结构性不可能漂移。
+- 3 kernel：store（e=\*epoch 运行时读，float4 合并写全部对端 staging[e&1]）→ publish（system-scope 盖章 e+1，轮询每个对端 stamp≥e+1，然后推进 \*epoch）→ reduce（按 rank 升序求和 = NCCL ring 顺序，1-ulp 一致）。
+- 奇偶双缓冲恰好足够：任何 rank 的 store(k+2) 跨 rank 晚于所有 rank 的 reduce(k)（publish(k+1) 等所有对端的 k+1 盖章 ⇒ 对端 store(k+1) ⇒ 流序 ⇒ 对端 reduce(k)）。
+- **图切换正确性**（旧图不重捕获直接切回）：kernel 运行时读 epoch，任意图在任意时刻 replay 都用当前值 → b16→b2 切换已实测验证。
+- p2p_ar_reset（tp.rs:1087，dry-run→capture 屏障）对 v5 是一致的清零（epoch+flags 全 rank 同时归零），无害。
+
+**注意**：v5 env 仍为 opt-in（`FERRITE_P2P=1 FERRITE_P2P_AR5=1`）。标准 bench env 应加上这两个。FERRITE_P2P 同时启用了 host 路径的 P2P 拷贝（prefill/MTP 链），这些路径在两次验证中未出问题。
+
+### 通往 1600 的更新路径（当前 10.95ms = 1461 tok/s，还差 0.95ms）
+
+| 项 | 预期 | 状态 |
+|---|---|---|
+| MoE act sector 利用率（38.77% promotion miss） | −0.3ms | 未实施 |
+| hc sinkhorn → aux block（阶段二分：sinkhorn 2080ns 在关键路径上） | −0.08~0.18ms | 未实施 |
+| 小 kernel 合并（norm/cast/quant ~241 次/步） | −0.3ms | 未实施 |
+| MoE down one-expert-per-block | −0.5ms | 未实施（HTILE 已证明不是入口） |
+| **合计** | **−1.2~1.3ms → 9.7ms ≈ 1650** | **1600 可达** |
