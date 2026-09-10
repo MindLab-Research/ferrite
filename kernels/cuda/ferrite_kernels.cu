@@ -3494,11 +3494,14 @@ __global__ void moe_fused_down_sum_fp8_v0_kernel(
 }
 
 template <int HTILE_K>
-// 2026-09-10: __launch_bounds__(288, 3) — the <8> specialization compiled to
-// 80 registers on its own, which drops the occupancy to 2 blocks/SM (the v12
-// original ran ~62 regs / 3 blocks) and cost +13us/call in serve (43.6 ->
-// 56.6us median, nsys). Forcing 3 blocks/SM caps it at 75 regs.
-__global__ void __launch_bounds__(288, 3) moe_fused_down_sum_fp8_kernel(
+// 2026-09-10 (v16): __launch_bounds__(288, 4) — the fresh ncu on v15 shows the
+// REAL constraint: theoretical occupancy 42.2% (register- AND smem-bound at 3
+// blocks/SM, 27 warps) with 9.49 warp-cycles/instr stalls, PLUS a 136-block
+// partial wave (2.31 waves — the tail may cost up to 33%). Forcing 4 blocks/SM
+// (<=56 regs) + the max smem carve-out (set in the launcher) gives 56%
+// occupancy and 1024/592 = 1.73 waves. ncu's occupancy rule estimated up to
+// 57.81% local speedup. If ptxas spills badly, fall back to (288, 3).
+__global__ void __launch_bounds__(288, 4) moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
     const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] fp8 [hidden, inter]
@@ -4070,6 +4073,27 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
     dim3 grid((hidden + htile_env - 1) / htile_env, (n + 3) / 4, 1);
+    // 4 blocks/SM needs 4x40.96KB = 164KB of smem carve-out; the driver's
+    // default (135KB) caps it at 3. Raise it once (the preferred carve-out is
+    // a hint — the driver picks the config that fits).
+    {
+        static bool carveout_done = false;
+        if (!carveout_done) {
+            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<8>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<16>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<32>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            cudaFuncSetAttribute(moe_fused_down_sum_fp8_kernel<64>,
+                                 cudaFuncAttributePreferredSharedMemoryCarveout,
+                                 cudaSharedmemCarveoutMaxShared);
+            carveout_done = true;
+        }
+    }
     // template dispatch: the chunk count, the fold divisor and the smem size
     // are all compile-time per specialization.
     #define FERRITE_DOWN_LAUNCH(HT) \
