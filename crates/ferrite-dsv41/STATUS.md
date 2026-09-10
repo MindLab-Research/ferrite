@@ -1040,3 +1040,30 @@ generated:     ". " The user wants me to recite the poem "Quiet Night Thoughts" 
 - 输出与官方**逐字一致** ✓
 - 残留（不影响正确性、已文档化）：① 激活量化用 fp4（参考 fp8/block128）② chat 模板特殊 token
   的细残差（`</think>` 两边都会改变预测 ✓，只是变成的 token 不同 ✗）
+
+---
+
+## 性能基线（乱码修好后的当前状态）
+
+**实测**：`prefill 7 tokens in 2.17s`、64 token 解码约 25s ≈ **2.6–3.0 tok/s** ✗
+（目标：单并发 **200 tok/s** = 5ms/token ✗ → 差约 70 倍 ✗）
+
+**逐层计时**（`DSV41_PHASE=1`，单 token）：
+- **L0 = 141ms**（首次调用预热 ✗，只影响第一个 token ✓）
+- **稳态每层 ≈ 7.5ms** ✗ → 45 层 ≈ 337ms/token ✓（与 prefill 实测吻合 ✓）
+- **细分：注意力 ≈ 3.5–4.8ms/层 ✗**，FFN/MoE ≈ 3.5ms/层 ✗（计时锚点需修正，但量级清楚）
+
+**决定性判断**：单 token 的注意力"数学"是微不足道的 ✓，却要 **4ms** ✗
+⇒ **瓶颈是 launch / sync 开销，不是算力** ✓✓
+（每层 ~15–20 个 kernel × 45 层 ≈ 700–900 次 launch/步 ✗，按 ~5µs/次 ≈ 4ms ✓ 与实测吻合 ✓）
+
+### 通往 200 tok/s 的路线（按预期收益排序）
+
+1. **CUDA Graph 捕获整层**（最大单项 ✓）—— GLM 侧靠这一项把 0.18→17.5 tok/s ✓。
+   阻碍：① **主机侧 MoE 派发**（每层要 download 路由结果 ✗ → 需改成设备侧 dispatch 或
+   固定专家数的图 ✗）② **AR 的主机 barrier** ✗（需改成设备侧协议 ✓）
+3. **去掉每层的 device sync** ✗：MoE 路由的 `dev.sync()+2 downloads`（`chain_dev.rs:1299-1303` ✓）
+   是每层一次 ✗ = 45 次/步 ✗；hc 系数若也能留在设备（ping-pong ✗）可再省一批 ✓
+4. **AR 与计算重叠 / 减少 AR 次数** ✓（现在每层 2 次 ✓）
+5. **MoE 设备侧 dispatch** ✗（替代主机循环 ✓，同时解锁图化 ✓）
+6. **fp8 激活**（精度项，非性能项 ✓）
