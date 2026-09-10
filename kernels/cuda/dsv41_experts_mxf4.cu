@@ -630,17 +630,26 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
         const int kper = (k / nwarps + 1) & ~1;      // even, covers the whole row
         const int klo = warp * kper;
         const int khi = (klo + kper < k) ? (klo + kper) : k;
-        for (int j = klo + lane * 2; j < khi; j += 64) {
-            // two consecutive fp4 values share one byte; every 32 k share one scale.
-            // The weight scale is e8m0; the ACTIVATION is fp4 with plain f32 scales
-            // when a_f32 is null (AQ=false is what the decode path calls), so both
-            // operands are unpacked here.
-            const uint8_t byte = brow[j >> 1];
+        // 16-byte lanes. Reading one fp4 BYTE per lane means each warp's memory
+        // request carries only 32 bytes, so the kernel is request-rate bound rather
+        // than bandwidth bound (the same failure the GLM-side moe_down had at an
+        // 8-byte lane, which a 16-byte lane fixed by 4x). One uint4 = 16 bytes = 32
+        // fp4 values = exactly one e8m0 block, so the scale is loaded once per
+        // iteration. kper and k are multiples of 64, hence j stays 32-aligned and
+        // the uint4 load is 16-byte aligned (rows are k/2 = 2560 bytes apart).
+        const int step = 32 * 32;
+        for (int j = klo + lane * 32; j + 31 < khi; j += step) {
+            const uint4 pk = *reinterpret_cast<const uint4*>(brow + (j >> 1));
+            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
             const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-            const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
-            const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-            acc += s_act[j] * w0;
-            acc += s_act[j + 1] * w1;
+#pragma unroll
+            for (int t = 0; t < 16; ++t) {
+                const uint8_t byte = pb[t];
+                const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+                const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+                acc += s_act[j + 2 * t] * w0;
+                acc += s_act[j + 2 * t + 1] * w1;
+            }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         if (lane == 0) s_part[warp] = acc;
