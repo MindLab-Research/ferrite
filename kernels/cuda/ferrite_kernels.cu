@@ -6487,7 +6487,10 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     // mx_in reads (mix_split's partial writes) until it completes.
     cudaGridDependencySynchronize();
 #endif
-    const int NB = gridDim.y;
+    // gridDim.y is NB+1: the last y-block is the SINKHORN AUX (see the aux
+    // branch after P2a) — only the first NB blocks own columns and take
+    // part in the is_last election.
+    const int NB = gridDim.y - 1;
     int t = blockIdx.x;
     if (t >= s) return;
     const int b = blockIdx.y;
@@ -6550,6 +6553,51 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         if (b == 0) post[t * n + i] = 2.0f * (1.0f / (1.0f + __expf(-(mx_s[n + i] * scale[1] + base[n + i]))));
     }
     __syncthreads();
+    // SINKHORN AUX BLOCK (2026-09-10, stage bisection): the sinkhorn (~2.1us,
+    // a serial 20-iteration shuffle chain) used to run on block b==0 AFTER
+    // the is_last election — i.e. on the kernel's critical path, after every
+    // real block had already arrived. Block b == NB is a dedicated aux block:
+    // it runs the same redundant P1/P2a (L2-hot) and then the sinkhorn,
+    // skipping P3/P4/election/P5 entirely, so the serial chain overlaps the
+    // NB real blocks' work and finishes before the is_last path. It MUST
+    // return before the election (ctr counts exactly NB real blocks).
+    if (b == NB) {
+        if (threadIdx.x >= 32 && threadIdx.x < 48) {
+            const unsigned m16 = 0x0000ffffu; // warp1 lanes 0..15 (shfl group)
+            const int ln = threadIdx.x - 32;  // 0..15 = r*4+c
+            const float v0 = mx_s[2 * n + ln] * scale[2] + base[2 * n + ln];
+            // initial row softmax: rmax (butterfly max — order-free), denom, /=, +eps
+            float v = v0;
+            float rmax = v;
+            rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 1));
+            rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 2));
+            v = __expf(v - rmax);
+            float denom = v;
+            denom += __shfl_xor_sync(m16, denom, 1);
+            denom += __shfl_xor_sync(m16, denom, 2);
+            v = v / denom + hc_eps;
+            // initial col normalise (xor 4, 8 butterflies)
+            float cs = v;
+            cs += __shfl_xor_sync(m16, cs, 4);
+            cs += __shfl_xor_sync(m16, cs, 8);
+            v /= cs + hc_eps;
+            for (int it = 1; it < iters; it++) {
+                // row normalise (xor 1, 2)
+                float rs = v;
+                rs += __shfl_xor_sync(m16, rs, 1);
+                rs += __shfl_xor_sync(m16, rs, 2);
+                v /= rs + hc_eps;
+                // col normalise (xor 4, 8)
+                float cs2 = v;
+                cs2 += __shfl_xor_sync(m16, cs2, 4);
+                cs2 += __shfl_xor_sync(m16, cs2, 8);
+                v /= cs2 + hc_eps;
+            }
+            comb[(size_t)t * n * n + ln] = v;
+            if (threadIdx.x - 32 < n) pre_s_g[(size_t)t * n + (threadIdx.x - 32)] = ps[threadIdx.x - 32];
+        }
+        return;   // never reaches P3/P4/the election
+    }
     // P3: li_raw[col] = Σ_i ps[i]·x[i·h+col] — one column per thread,
     // i-ascending FMA chain (same numeric order as the old in-smem P3).
     float acc = 0.f;
@@ -6597,51 +6645,9 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     if (threadIdx.x == 0)
         last = (atomicAdd(&ctr[t], 1u) == (unsigned)NB - 1u) ? 1 : 0;
     __syncthreads();
-    // P2b (block0, warp1 lanes 0..15 — v4): the v3 4-thread+__syncthreads
-    // sinkhorn was ~6µs (41 block-wide barriers); n*n=16 elements fit ONE
-    // warp's registers — all row/col reductions are __shfl_xor butterflies
-    // (row groups = lanes 4r..4r+3 → xor 1,2; col groups = lanes c,c+4,
-    // c+8,c+12 → xor 4,8). NO barriers, ~1.3µs at iters=20. FP: the sum
-    // order is a butterfly tree vs the serial k-ascending (1ulp class —
-    // the P4-tree change already validated by 出师表; max/div are
-    // order-independent). Runs on warp1 AFTER this block's P4 atomic —
-    // parallel with the is_last block's P5 and never on the atomic-sync
-    // critical path (warp0 handles is_last/P5; warp1's lanes exit the
-    // sinkhorn loop independently).
-    if (b == 0 && threadIdx.x >= 32 && threadIdx.x < 48) {
-        const unsigned m16 = 0x0000ffffu; // warp1 lanes 0..15 (shfl group)
-        const int ln = threadIdx.x - 32;  // 0..15 = r*4+c
-        const float v0 = mx_s[2 * n + ln] * scale[2] + base[2 * n + ln];
-        // initial row softmax: rmax (butterfly max — order-free), denom, /=, +eps
-        float v = v0;
-        float rmax = v;
-        rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 1));
-        rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 2));
-        v = __expf(v - rmax);
-        float denom = v;
-        denom += __shfl_xor_sync(m16, denom, 1);
-        denom += __shfl_xor_sync(m16, denom, 2);
-        v = v / denom + hc_eps;
-        // initial col normalise (xor 4, 8 butterflies)
-        float cs = v;
-        cs += __shfl_xor_sync(m16, cs, 4);
-        cs += __shfl_xor_sync(m16, cs, 8);
-        v /= cs + hc_eps;
-        for (int it = 1; it < iters; it++) {
-            // row normalise (xor 1, 2)
-            float rs = v;
-            rs += __shfl_xor_sync(m16, rs, 1);
-            rs += __shfl_xor_sync(m16, rs, 2);
-            v /= rs + hc_eps;
-            // col normalise (xor 4, 8)
-            float cs2 = v;
-            cs2 += __shfl_xor_sync(m16, cs2, 4);
-            cs2 += __shfl_xor_sync(m16, cs2, 8);
-            v /= cs2 + hc_eps;
-        }
-        comb[(size_t)t * n * n + ln] = v;
-        if (threadIdx.x - 32 < n) pre_s_g[(size_t)t * n + (threadIdx.x - 32)] = ps[threadIdx.x - 32];
-    }
+    // P2b (sinkhorn): MOVED to the dedicated aux block (b == NB, right after
+    // P2a) — see the comment there. It used to sit here, on block b==0 after
+    // the election, i.e. on the kernel's critical path.
     // P4b + P5 (is_last block only): reduce partials → rsq, li = li_raw·inv·nw
     if (!last) return;
     if (threadIdx.x == 0) {
@@ -6744,7 +6750,7 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
 
-    dim3 p345_grid(s, NB);
+    dim3 p345_grid(s, NB + 1);   // +1: the sinkhorn aux block (see the kernel)
     const int hpb_l = (h + 15) / 16;   // must match the kernel's hpb (NB=16)
     size_t smem_r = (size_t)(mix + n * n + n + 48 + n * hpb_l) * sizeof(float);  // + xs staging
     if (ferrite_pdl_enabled()) {
