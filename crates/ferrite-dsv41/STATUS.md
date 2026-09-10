@@ -1130,3 +1130,30 @@ self.barrier.wait();
 
 **注意**：所有"删同步"的尝试都必须**同时验证文本仍是 `" Paris."`** ✗ —— 本会话删掉 publish 的
 sync 时文本立刻变成 `" toll id "` ✓，靠这条判据才没有把回归当成提速 ✓。
+
+## ★★★ 又一否定结果：集合通信的 sync **不是**瓶颈（设备侧 stamp 已落地但无提速）
+
+**已实现并验证**（`ar_stamp_kernel` + `ar_reduce_kernel` + FFI + `Collective` 的 stamp 区 ✓）：
+- `publish()` 不再 `cudaDeviceSynchronize` ✗，改为：peer 拷贝（异步、流序 ✓）→ **盖章内核**
+  （同一 stream，因此**必然**在拷贝完成之后执行 ✓，把本 rank 轮次写进每个 rank 的 stamp 区 ✓）
+  → 轮次 barrier ✓；
+- 归约改为设备侧自旋内核 ✓（`stamps[p] >= round` 轮询后求和 ✓），已删掉主机累加循环 ✓。
+- **正确性通过** ✓：文本仍是 `" Paris."`、ids `[11111, 16, 1]` ✓✓（与官方逐字一致 ✓）。
+
+**但吞吐没变**：3.3 tok/s（301.9ms/token）vs 之前 3.5（289ms）✗ —— 噪声内 ✗
+⇒ **`publish` 里那次全设备同步不是瓶颈** ✗（虽然它确实每步跑 ~90 次 ✓）。
+
+**排除法收敛**：注意力 = 1.78ms/层 ✓，整层 = 6.4ms ✗ ⇒ 差值 4.6ms 在 **FFN/MoE** ✓，
+而集合通信已排除 ✗ ⇒ **剩下的唯一同步类嫌疑 = `moe()` 自己的
+`self.dev.sync()?` + 2 次 `dl()` 路由下载**（`chain_dev.rs` 的 MoE 段 ✗，与集合通信无关 ✗）。
+
+### 下会话第一刀（非常具体）
+
+把 MoE 的路由回读换成**不阻塞主机**的形式 ✓：
+1. 最省事：`route_topk` 的输出直接落到 **`cudaHostAlloc(cudaHostAllocMapped)`** 的固定内存 ✓
+   （主机可直接读 ✓），并用一个**小盖章内核**（同 stream ✓）写 pinned flag ✓；主机**自旋**
+   flag（无 CUDA API 调用 ✓）后读 ✓ → 删掉 `dev.sync()` + 2 次 `dl()` ✓；
+2. 或：把 expert 派发整体搬到设备侧（fused MoE ✓）—— 这是终局形态 ✓，且顺带解锁 CUDA Graph ✓。
+
+**纪律（本会话反复验证过）**：任何"删同步"的改动都必须**同时**验证文本仍是 `" Paris."` ✓
+—— 本会话删 `publish` 的 sync 那次文本立刻变成 `" toll id "` ✗，靠这条判据才没把回归当提速 ✓。
