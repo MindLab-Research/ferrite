@@ -659,6 +659,7 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
             if (epi_mode == 3) out[(size_t)row] += x;
             else out[(size_t)row] = x;
         }
+        }
     }
 }
 
