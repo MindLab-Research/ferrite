@@ -6450,16 +6450,36 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     // + rsq. mx_in: [t][mix][ks] partials + Σx² tail [s][mix_ks] at
     // s*mix*mix_ks (written by mix_split's m==0 lanes).
     {
+        // 2026-09-10 (ncu-guided): mix_ks is a RUNTIME arg (always HC_MIX_KS
+        // = 16 by construction in ferrite_hc_pre_split) so nvcc could not
+        // unroll these reductions -> 16 SERIAL dependent L2 loads (~250ns
+        // each) on thread0 plus another 16 on every m-lane, both gating all
+        // 256 blocks at their __syncthreads. ncu: rest345 runs at 0.22 waves,
+        // SM 5.2%, 84.9% of cycles with NO eligible warp. The compile-time-
+        // bound path issues all 16 loads back-to-back; the accumulation order
+        // is the same z-ascending sequence (bit-identical); the runtime loop
+        // stays as the fallback for any other mix_ks.
         if (threadIdx.x == 0) {
+            const float* xsq = mx_in + (size_t)s * mix * mix_ks + (size_t)t * mix_ks;
             float msq = 0.f;
-            const float* xsq = mx_in + (size_t)s * mix * mix_ks;
-            for (int z = 0; z < mix_ks; z++) msq += xsq[(size_t)t * mix_ks + z];
+            if (mix_ks == HC_MIX_KS) {
+                #pragma unroll
+                for (int z = 0; z < HC_MIX_KS; z++) msq += xsq[z];
+            } else {
+                for (int z = 0; z < mix_ks; z++) msq += xsq[z];
+            }
             red[39] = rsqrtf(msq / (float)nh + rms_eps);
         }
         __syncthreads();
         for (int m = threadIdx.x; m < mix; m += blockDim.x) {
+            const float* row = mx_in + ((size_t)t * mix + m) * mix_ks;
             float acc = 0.f;
-            for (int z = 0; z < mix_ks; z++) acc += mx_in[((size_t)t * mix + m) * mix_ks + z];
+            if (mix_ks == HC_MIX_KS) {
+                #pragma unroll
+                for (int z = 0; z < HC_MIX_KS; z++) acc += row[z];
+            } else {
+                for (int z = 0; z < mix_ks; z++) acc += row[z];
+            }
             mx_s[m] = acc * red[39];
         }
         __syncthreads();
