@@ -93,7 +93,8 @@ extern "C" {
     fn ferrite_gemv_tri(x: *const f32, w1: *const std::ffi::c_void, w2: *const std::ffi::c_void,
                         w3: *const std::ffi::c_void, y1: *mut f32, y2: *mut f32, y3: *mut f32,
                         in_f: i32, o1: i32, o2: i32, o3: i32, s: CuStream) -> i32;
-    fn ferrite_gemm3_bf16_mma(x: *const f32, w1: *const std::ffi::c_void,
+    fn ferrite_gemm3_bf16_mma(x0: *const f32, x1: *const f32, x2: *const f32,
+                               w1: *const std::ffi::c_void,
                                w2: *const std::ffi::c_void, w3: *const std::ffi::c_void,
                                partial: *mut f32, out0: *mut f32, out1: *mut f32, out2: *mut f32,
                                n: i32, in_f: i32, o1: i32, o2: i32, o3: i32,
@@ -3798,6 +3799,8 @@ impl CudaBackend {
                     let r = unsafe {
                         ferrite_gemm3_bf16_mma(
                             x.as_const_f32(),
+                            x.as_const_f32(),
+                            x.as_const_f32(),
                             da.ptr as *const std::ffi::c_void,
                             db.ptr as *const std::ffi::c_void,
                             dc.ptr as *const std::ffi::c_void,
@@ -4072,6 +4075,8 @@ impl CudaBackend {
                     let r = unsafe {
                         ferrite_gemm3_bf16_mma(
                             x.as_const_f32(),
+                            x.as_const_f32(),
+                            x.as_const_f32(),
                             da.ptr as *const std::ffi::c_void,
                             db.ptr as *const std::ffi::c_void,
                             dc.ptr as *const std::ffi::c_void,
@@ -4103,8 +4108,56 @@ impl CudaBackend {
                 ),
             }
         };
-        let fb = self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?;
-        let gb = self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?;
+        // FERRITE_GEMM3 for the {f_b, g_b} pair (2026-09-10, the per-group-x
+        // extension): fa x Wfb and ga x Wgb have the same shape [n, dk] ->
+        // [n, proj] but DIFFERENT inputs — previously 2 cuBLAS calls = 2
+        // f32->bf16 casts + 2 nvjet GEMMs (+ splitK reduces) per GDN layer
+        // (68 launches/step). One gemm3 launch replaces all of it.
+        let (fb, gb) = {
+            let mut fused: Option<(DevBuf, DevBuf)> = None;
+            if std::env::var("FERRITE_GEMM3").map(|v| v != "0").unwrap_or(true) {
+                if let (Ok(df), Ok(dg)) = (
+                    self.dev_weight_bf16(w.f_b),
+                    self.dev_weight_bf16(w.g_b),
+                ) {
+                    let fb_ = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+                    let gb_ = DevBuf::alloc(self.dev, self.stream, n * proj)?;
+                    let partial = DevBuf::alloc(self.dev, self.stream, 8 * n * (proj + proj))?;
+                    let r = unsafe {
+                        ferrite_gemm3_bf16_mma(
+                            fa.as_const_f32(),
+                            ga.as_const_f32(),
+                            std::ptr::null(),
+                            df.ptr as *const std::ffi::c_void,
+                            dg.ptr as *const std::ffi::c_void,
+                            std::ptr::null(),
+                            partial.as_f32(),
+                            fb_.as_f32(),
+                            gb_.as_f32(),
+                            std::ptr::null_mut(),
+                            ni,
+                            dk as i32,
+                            proj as i32,
+                            proj as i32,
+                            0,
+                            self.stream,
+                        )
+                    };
+                    if r == 0 {
+                        fused = Some((fb_, gb_));
+                    } else {
+                        eprintln!("[opcheck] gemm3 (fbgb) err {r} — falling back to matmul_dev");
+                    }
+                }
+            }
+            match fused {
+                Some(t) => t,
+                None => (
+                    self.matmul_dev(&fa, w.f_b, ni, dk as i32, proj as i32)?,
+                    self.matmul_dev(&ga, w.g_b, ni, dk as i32, proj as i32)?,
+                ),
+            }
+        };
         let dw_conv = self.dev_weight(w.conv_w)?;
         // 2. per-seq causal conv — BATCHED: ONE launch, B×ch threads (each
         // (seq, channel): the 3-tap FIR + slide vs state_ptrs[seq]'s slice —

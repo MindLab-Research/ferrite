@@ -2867,7 +2867,14 @@ extern "C" cudaError_t ferrite_gemv_tri(const float* x, const void* w1, const vo
 // The 520-element row stride (65×16B) keeps the ldmatrix bank-conflict-free.
 // ============================================================
 __global__ void __launch_bounds__(256, 3) gemm3_bf16_mma_kernel(
-    const float* __restrict__ x,          // [n≤16, in_f] f32
+    // Per-GROUP inputs (2026-09-10): each weight group may take its OWN x —
+    // pass the same pointer for same-x groups (the historical calls), or two
+    // different inputs (e.g. GDN's f_b/f_a pair: fa x Wfb, ga x Wgb) to fuse
+    // two otherwise-unfusable GEMMs into one launch. xg2 may be null when
+    // o2 == 0 (the third tile group never runs).
+    const float* __restrict__ xg0,        // [n≤16, in_f] f32 — group 0's input
+    const float* __restrict__ xg1,        // group 1's input
+    const float* __restrict__ xg2,        // group 2's input (null if o2 == 0)
     const __nv_bfloat16* __restrict__ w0, // [o0, in_f]
     const __nv_bfloat16* __restrict__ w1, // [o1, in_f]
     const __nv_bfloat16* __restrict__ w2, // [o2, in_f]
@@ -2878,10 +2885,10 @@ __global__ void __launch_bounds__(256, 3) gemm3_bf16_mma_kernel(
     const int tile = blockIdx.x;
     const int split = blockIdx.y;
     const int KS = gridDim.y;
-    const __nv_bfloat16* wbase; int obase, ocount, tbase;
-    if (tile < tiles0)       { wbase = w0; obase = 0;       ocount = o0; tbase = 0; }
-    else if (tile < tiles01) { wbase = w1; obase = o0;      ocount = o1; tbase = tiles0; }
-    else                     { wbase = w2; obase = o0 + o1; ocount = o2; tbase = tiles01; }
+    const __nv_bfloat16* wbase; const float* xg; int obase, ocount, tbase;
+    if (tile < tiles0)       { wbase = w0; xg = xg0; obase = 0;       ocount = o0; tbase = 0; }
+    else if (tile < tiles01) { wbase = w1; xg = xg1; obase = o0;      ocount = o1; tbase = tiles0; }
+    else                     { wbase = w2; xg = xg2; obase = o0 + o1; ocount = o2; tbase = tiles01; }
     const int r0 = (tile - tbase) << 4;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int kper = ((in_f + KS - 1) / KS) & ~15;   // 16-aligned k-slice
@@ -2896,7 +2903,7 @@ __global__ void __launch_bounds__(256, 3) gemm3_bf16_mma_kernel(
     for (int idx = threadIdx.x; idx < 16 * klen; idx += 256) {
         const int t = idx / klen, k = idx % klen;
         const int tt = t < n ? t : 0;
-        sA[t][k] = __float2bfloat16(x[(size_t)tt * in_f + k0 + k]);
+        sA[t][k] = __float2bfloat16(xg[(size_t)tt * in_f + k0 + k]);
     }
     // stage B: this weight's 16 out-rows × the k-slice (row-tail zero-filled)
     for (int idx = threadIdx.x; idx < 16 * klen; idx += 256) {
@@ -2974,7 +2981,8 @@ __global__ void gemm3_reduce_kernel(
 }
 
 extern "C" cudaError_t ferrite_gemm3_bf16_mma(
-    const float* x, const void* w1, const void* w2, const void* w3,
+    const float* x0, const float* x1, const float* x2,
+    const void* w1, const void* w2, const void* w3,
     float* partial, float* out0, float* out1, float* out2,
     int n, int in_f, int o1, int o2, int o3, cudaStream_t s) {
     if (n <= 0 || n > 16) return cudaSuccess;
@@ -2985,7 +2993,7 @@ extern "C" cudaError_t ferrite_gemm3_bf16_mma(
     const int KS = 8;
     dim3 grid((unsigned)tiles, (unsigned)KS);
     gemm3_bf16_mma_kernel<<<grid, 256, 0, s>>>(
-        x, (const __nv_bfloat16*)w1, (const __nv_bfloat16*)w2, (const __nv_bfloat16*)w3,
+        x0, x1, x2, (const __nv_bfloat16*)w1, (const __nv_bfloat16*)w2, (const __nv_bfloat16*)w3,
         partial, n, in_f, o1, o2, o3);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
