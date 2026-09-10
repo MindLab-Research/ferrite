@@ -317,6 +317,7 @@ __global__ void ar_store_kernel(const unsigned long long* __restrict__ peer_slot
     // stamped from a separate kernel, whose __threadfence_system() only ordered
     // that kernel's own writes, so a peer could see the stamp before the data —
     // exactly the gap the host barrier had been masking.
+    if (ctr == nullptr) return;  // default path: the separate stamp kernel does this
     __threadfence();
     __shared__ bool is_last;
     if (threadIdx.x == 0) {
@@ -373,7 +374,7 @@ __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restric
         }
         dst[i] = acc;
     }
-    if (!do_mark) return;
+    if (!do_mark || ctr2 == nullptr) return;
     // Same same-threads rule as the store: announce "round reduced" from inside
     // the kernel that did the reading, once every block is done.
     __threadfence();
