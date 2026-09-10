@@ -1373,7 +1373,11 @@ impl<'a> DevChain<'a> {
                 )?;
                 if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e == 128 {
                     let sw = self.dl(self.s.ex_act.as_f32(), inter_local)?;
-                    eprintln!("[mine] E128 swiglu_rms={}", (sw.iter().map(|v| v * v).sum::<f32>() / sw.len() as f32).sqrt());
+                    let r = (sw.iter().map(|v| v * v).sum::<f32>() / sw.len() as f32).sqrt();
+                    // if every rank reports the same slice fingerprint, the loader gave
+                    // them all the same inter slice (that would make the AR double-count)
+                    let fp: f32 = sw.iter().take(8).map(|v| v.abs()).sum();
+                    eprintln!("[mine] rank{} E128 swiglu_rms={r} fp={fp}", self.rank());
                 }
                 if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
                     let eo = self.dl(self.s.ex_out.as_f32(), dim)?;
