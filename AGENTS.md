@@ -1264,3 +1264,26 @@ GDN block ×2、fast_math ×2、page-cache 冷热、改动前提交、两轮连�
 **关键的对照事实（供换机后立即核对）**：本会话前期在同一节点上曾多次稳定测得
 **replay 13.40ms / 1194 tok/s / 0 fault / 出师表逐字**——说明"代码+配置"本身是对的，
 是**节点状态在会话中途劣化**。
+
+## ✅ 2026-09-10 最终修复：pre-warm 的 set_batch_decode 全局原子 race（非节点问题）
+
+**用户纠正**：机器没问题。二分定位到 `2b6aff4`（13.50ms ✓）vs 后续提交（faults=2）。
+
+**根因**：`mega_chain_dev` 的 TP<8 pre-warm 调用 `ferrite_kernel::cuda::set_batch_decode(false)`
+——**全局原子操作**。当一个 rank 持 capture_lock 执行 pre-warm 时，其他 rank 的 dry-run
+线程并发分配，读到 `batch=false`，把缓冲放进**错误的池**（非 batch 池）→ 后续 capture
+在 batch 池 miss → err 900。**间歇性取决于线程时序**——之前的"时好时坏"正是这个 race。
+
+**修复（9edc30b）**：移除两处 pre-warm（mega_chain_dev 的 set_batch_decode 版本 +
+mega_chain_dev_batched 的 class-16384/262144 版本）。后者也移除因为它在 dry-run 与
+capture 之间扰动共享池状态。
+
+**验证**：B=16 replay p50 = **13.45ms**，faults=0，出师表逐字 ✓。B=2 replay 9.18ms，0 fault。
+
+**教训（以后避免类似 bug 的三条防线）**：
+1. **禁止在 capture 路径附近切换全局状态**——set_batch_decode 是隐式上下文，
+   任何临时切换都会与其他线程竞争。应改参数传递。
+2. **每次改动后跑最小回归（verify_f32.sh，3 分钟）**——加 pre-warm 后只测了 TP=4
+   （它本来就崩），没测 TP=8 基线。**先确认基线没坏再继续调试**。
+3. **调试代码必须立即清理**——bf5ddef 声称 "remove" 但只删了 list 版本，保留了初始版本。
+   今后所有调试代码加 `// TODO: REMOVE` 标记并在同一会话内删除。
