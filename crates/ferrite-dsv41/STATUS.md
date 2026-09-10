@@ -1661,3 +1661,19 @@ round 1 half 1: slot0[0..4]=[1,1,1,1]        slot1[0..4]=[1001,1001,1001,1001]
 `round % 2` ✓，确认 `self.round` 是否真的在推进 ✓（注意 `fetch_add` 在 publish 里 ✓、
 `load` 在 reduce 里 ✓ —— 若 reduce 在 publish **之前**被调用（例如某条路径先归约 ✓），
 就会读到上一轮的值 ✓）。
+
+### 本轮进展：**"round 只自增一次"修复消除了挂死**（0.0 仍在，但已缩到 reduce 一步）
+
+`publish` 与 `all_reduce_inplace` **各自**都做了 `fetch_add(1)` ✗ ⇒ 每个 all-reduce 计数器 +2 ✗
+⇒ parity 恒为奇数（**永远写同一个半区** ✓，与 staging dump 完全吻合 ✓）、且 store 与 reduce 在
+两次自增之间读到的 round 差 1 ✓ ⇒ 两半区错开 ✓。
+
+改成 **`all_reduce_inplace` 独占自增并把确切的 round 传给 `publish`** ✓ 之后：
+- **不再挂死** ✓（`DSV41_AR_DEV=1` world=2 → 4 轮跑完 ✓；world=8 → 16 轮跑完 ✓）；
+- **默认路径回归通过** ✓（`AR_MICRO_WORLD=4/8` → **OK** ✓；模型仍是 `Paris` ✓）；
+- 设备侧仍返回 **0.0** ✗ ⇒ 仅剩 **reduce 一步**（store 已被 dump 证明完全正确 ✓）。
+
+**下会话（6 秒一轮）**：在 `AR_MICRO_N=8` 下把 reduce 的内核换成"直接把各 slot 原样拷到 dst"
+（不做求和 ✓）—— 若 dst 拿到了正确数据 ✓ 则问题在求和/索引 ✓；若仍是 0 ✓ 则问题在
+`base`（parity 半区基址）的传递 ✓。**注意**：我观察到 tp.rs 里仍有两处 `fetch_add`
+（201 行 publish 内、255 行）✗ —— 先确认 `all_reduce_inplace` 走的那条路径**只自增一次** ✓。
