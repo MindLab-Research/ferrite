@@ -606,18 +606,16 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
         }
     }
     __syncthreads();
-    // One block per output row, with the block's warps splitting k. The earlier
-    // shape (one warp per row, 8 rows per block) left only 64 blocks for 148 SMs
-    // and one 80-iteration dependent-load chain per warp, i.e. about 3.5 warps per
-    // SM; splitting k gives each row 8 warps and makes the grid n_total blocks.
+    // One warp per output row, 8 rows per block. Two "obvious" improvements were
+    // measured and both were WORSE, so this shape is the keeper: a k-split (one
+    // block per row, 8 warps splitting k -> 512 blocks) gave 15.0 tok/s against this
+    // 15.2, and 16-byte uint4 lanes gave 14.3. The kernel is not occupancy- or
+    // request-rate-bound the way those two assumed.
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
-    __shared__ float s_part[32];
 
-    {
-        const int row = blockIdx.x;
-        if (row < n_total) {
+    for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
         // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
         const bool hi = (b_split > 0) && (row >= b_split);
         const int r = hi ? (row - b_split) : row;
@@ -627,36 +625,18 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
         const uint8_t* srow = bb_s + (size_t)r * ksc;
 
         float acc = 0.f;
-        const int kper = (k / nwarps + 1) & ~1;      // even, covers the whole row
-        const int klo = warp * kper;
-        const int khi = (klo + kper < k) ? (klo + kper) : k;
-        // 16-byte lanes. Reading one fp4 BYTE per lane means each warp's memory
-        // request carries only 32 bytes, so the kernel is request-rate bound rather
-        // than bandwidth bound (the same failure the GLM-side moe_down had at an
-        // 8-byte lane, which a 16-byte lane fixed by 4x). One uint4 = 16 bytes = 32
-        // fp4 values = exactly one e8m0 block, so the scale is loaded once per
-        // iteration. kper and k are multiples of 64, hence j stays 32-aligned and
-        // the uint4 load is 16-byte aligned (rows are k/2 = 2560 bytes apart).
-        const int step = 32 * 32;
-        for (int j = klo + lane * 32; j + 31 < khi; j += step) {
-            const uint4 pk = *reinterpret_cast<const uint4*>(brow + (j >> 1));
-            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&pk);
+        for (int j = lane * 2; j < k; j += 64) {
+            // two consecutive fp4 values share one byte; every 32 k share one scale
+            const uint8_t byte = brow[j >> 1];
             const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-#pragma unroll
-            for (int t = 0; t < 16; ++t) {
-                const uint8_t byte = pb[t];
-                const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
-                const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-                acc += s_act[j + 2 * t] * w0;
-                acc += s_act[j + 2 * t + 1] * w1;
-            }
+            const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+            const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+            acc += s_act[j] * w0;
+            acc += s_act[j + 1] * w1;
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-        if (lane == 0) s_part[warp] = acc;
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            float x = 0.f;
-            for (int w = 0; w < nwarps; ++w) x += s_part[w];
+        if (lane == 0) {
+            float x = acc;
             if (epi_mode == 1) {
                 if (limit > 0.f) {
                     if (row < b_split) x = fminf(x, limit);
@@ -667,7 +647,6 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
             }
             if (epi_mode == 3) out[(size_t)row] += x;
             else out[(size_t)row] = x;
-        }
         }
     }
 }
@@ -691,8 +670,9 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
     // shapes). NOTE: a boot-time env read here would also break CUDA graph
     // capture; cache it in a static if a knob is needed.
     if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
-        const int blocks = n_total;   // one block per output row
-        const int cta = 256;
+        const int warps = 8;
+        const int cta = warps * 32;
+        const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, cta, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode,
             limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
@@ -765,8 +745,9 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
     // buffer). The kernel unpacks either activation form and implements both
     // epilogues, so no separate path is needed for down.
     if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
-        const int blocks = n_total;   // one block per output row
-        expert_gemv_fp4_kernel<<<blocks, 256, (size_t)k * sizeof(float), s>>>(
+        const int warps = 8;
+        const int blocks = (n_total + warps - 1) / warps;
+        expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split,
             epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
             bhs_base, bhs_stride, ids, slot);
