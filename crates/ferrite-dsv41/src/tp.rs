@@ -128,6 +128,12 @@ impl Collective {
         let reduced_at = stamps_at + world * 4;
         let ctr_at = reduced_at + world * 4;
         let staging = dev.alloc(ctr_at + 64)?;
+        // dev.alloc is cudaMalloc, which does NOT zero. The stamp arrays, the
+        // `reduced` marks and the two last-block counters must start at 0: the
+        // store kernel decides "am I the last block" with atomicAdd(ctr), so a
+        // garbage counter means the stamp is never published and the reduce
+        // spins forever — exactly the dev-path hang the micro-benchmark found.
+        dev.zero_at(staging.ptr, ctr_at + 64)?;
         let peer_stamps = dev.alloc(world * 8)?;
         let peer_slots = dev.alloc(world * 8)?;
         let peer_reduced = dev.alloc(world * 8)?;
