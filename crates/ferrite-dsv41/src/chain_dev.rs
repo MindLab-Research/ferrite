@@ -962,11 +962,11 @@ impl<'a> DevChain<'a> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let inter = cfg.moe_inter_dim;
-        // The expert matrices are sharded along `inter` (the reference cuts them
-        // by inter/world), so every expert kernel must be sized by the LOCAL
-        // width — passing the global 2304 made the gate/up kernel write twice
-        // the rows the weight has, which is what faulted under TP.
-        let inter_local = inter / self.world();
+        // MoE is TP-split, NOT expert-parallel: every rank holds every expert,
+        // and each expert's `inter` axis is cut by world. The slice is padded up
+        // to the MMA K atom (64) with zeros by the loader, so the kernels are
+        // sized by the padded local width.
+        let inter_local = crate::weights::padded_inter(inter / self.world());
         let (n_routed, topk) = cfg.moe_config(layer);
 
         // gate: natively bf16, so a bf16 GEMM
@@ -1002,17 +1002,15 @@ impl<'a> DevChain<'a> {
         // contribution is expert_e(x) * sum of its routing weights. Accumulating
         // the distinct experts in index order keeps the sum deterministic.
         self.dev.zero(&self.s.ex_out)?;
+        // No expert parallelism: the local array holds ALL experts, so a global
+        // routing id indexes it directly (with the EP scheme it had to be
+        // rebased by rank*ne).
         let ne = ld.experts.len();
-        // Expert-parallel: the loader hands this rank the CONTIGUOUS block
-        // [rank*ne, (rank+1)*ne) of the global expert ids, so the global id must
-        // be rebased before indexing the local array (the earlier version
-        // indexed it directly, which silently used another rank's experts).
-        let e_base = self.rank() * ne;
         let mut wsum = vec![0f32; ne.max(1)];
         for (slot, &e) in idx.iter().enumerate() {
             let e = e as usize;
-            if e >= e_base && e < e_base + ne {
-                wsum[e - e_base] += wgt[slot];
+            if e < ne {
+                wsum[e] += wgt[slot];
             }
         }
         if !self.opts.skip_experts {

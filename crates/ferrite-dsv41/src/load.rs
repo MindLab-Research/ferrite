@@ -20,7 +20,7 @@ use ferrite_types::{FerriteError, Result};
 
 use crate::config::Dsv41Config;
 use crate::device::{DevBuf, Device};
-use crate::weights::{local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
+use crate::weights::{local_shape, padded_inter, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
 
 /// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
 /// Everything else that arrives as bf16 is widened to f32 on the way in —
@@ -187,6 +187,13 @@ pub struct Loader<'a> {
     index: HashMap<String, String>,
     /// shard file -> header
     headers: HashMap<String, SafetensorsIndex>,
+    /// shard file -> open handle, kept for the whole load. Re-opening per tensor
+    /// cost ~2 syscalls x ~96k tensors x 8 ranks and dominated the load time
+    /// (410 s for 38.6 GiB/rank); the handles and the data-section offsets are
+    /// both cached now.
+    files: HashMap<String, std::fs::File>,
+    /// shard file -> byte offset of the data section
+    data_base: HashMap<String, u64>,
     dev: &'a Device,
     /// bytes uploaded so far (for the report)
     pub uploaded: u64,
@@ -216,6 +223,8 @@ impl<'a> Loader<'a> {
             dir: dir.to_path_buf(),
             index,
             headers: HashMap::new(),
+            files: HashMap::new(),
+            data_base: HashMap::new(),
             dev,
             uploaded: 0,
             skip_prefixes: Vec::new(),
@@ -241,16 +250,17 @@ impl<'a> Loader<'a> {
         let h = self.header(name)?.tensors.get(name).cloned().ok_or_else(|| {
             FerriteError::Config(format!("{name} missing in {shard}"))
         })?;
-        // the data section starts after the 8-byte length + the header json
-        let path = self.dir.join(&shard);
-        let hlen = {
+        if !self.files.contains_key(&shard) {
+            let path = self.dir.join(&shard);
             let mut f = io(File::open(&path), "open shard")?;
             let mut b = [0u8; 8];
             io(f.read_exact(&mut b), "read header len")?;
-            u64::from_le_bytes(b)
-        };
-        let base = 8 + hlen + h.begin;
-        let mut f = io(File::open(&path), "open shard")?;
+            let hlen = u64::from_le_bytes(b);
+            self.data_base.insert(shard.clone(), 8 + hlen);
+            self.files.insert(shard.clone(), f);
+        }
+        let base = *self.data_base.get(&shard).unwrap() + h.begin;
+        let f = self.files.get_mut(&shard).unwrap();
         io(f.seek(SeekFrom::Start(base + off)), "seek")?;
         let mut buf = vec![0u8; len];
         io(f.read_exact(&mut buf), "read tensor bytes")?;
@@ -299,9 +309,14 @@ impl<'a> Loader<'a> {
                 let per = global[0] / world;
                 (rank * per, per)
             }
-            Shard::Cols => (0, global[0]),
+            // TP-split experts (no EP): the rank's slice of the `inter` axis
+            Shard::ExpertRows => {
+                let per = global[0] / world;
+                (rank * per, per)
+            }
+            Shard::Cols | Shard::ExpertCols => (0, global[0]),
         };
-        let bytes = if spec.shard == Shard::Cols {
+        let bytes = if matches!(spec.shard, Shard::Cols | Shard::ExpertCols) {
             // column slice: gather the local columns of every row
             let inner: usize = global[1..].iter().product();
             let per = inner / world;
@@ -327,6 +342,31 @@ impl<'a> Loader<'a> {
             (bf16_to_f32_bytes(&bytes), "F32".to_string())
         } else {
             (bytes, h.dtype.clone())
+        };
+        // The MMA kernel requires the reduction dim to be a multiple of its K
+        // atom (64), and `inter/world` is not one in general (2304/8 = 288). Pad
+        // the slice with ZEROS up to the atom — zero weights contribute nothing,
+        // so the GEMM result is unchanged and no kernel change is needed.
+        let bytes = match spec.shard {
+            Shard::ExpertRows => {
+                let target = padded_inter(global[0] / world);
+                let mut b = bytes;
+                b.resize(target * row_bytes, 0u8);
+                b
+            }
+            Shard::ExpertCols => {
+                let inner: usize = global[1..].iter().product();
+                let per_packed = inner / world;
+                let target = padded_inter(per_packed * 2) / 2;
+                let mut b = Vec::with_capacity(global[0] * target * esz);
+                for r in 0..global[0] {
+                    let src = &bytes[r * per_packed * esz..(r + 1) * per_packed * esz];
+                    b.extend_from_slice(src);
+                    b.resize(b.len() + (target - per_packed) * esz, 0u8);
+                }
+                b
+            }
+            _ => bytes,
         };
         let buf = self.dev.upload(&bytes)?;
         let _ = local;
@@ -427,10 +467,11 @@ impl<'a> Loader<'a> {
             take!(p, ld, "engram.q_weight", engram_q_weight);
             take!(p, ld, "engram.k_weight", engram_k_weight);
 
-            // routed experts this rank owns
+            // EVERY expert, TP-split along `inter` (no expert parallelism):
+            // each rank holds a slice of all of them, and the MoE's all-reduce
+            // sums slices of the same experts.
             let (n_routed, _) = cfg.moe_config(l);
-            let (e0, ne) = expert_lo(n_routed);
-            for e in e0..(e0 + ne).min(n_routed) {
+            for e in 0..n_routed {
                 let g = |n: &str| want(&format!("{p}.ffn.experts.{e}.{n}")).unwrap();
                 ld.experts.push(DevExpert {
                     w1: self.load_tensor(&g("w1.weight"), world, rank)?,
@@ -480,8 +521,7 @@ impl<'a> Loader<'a> {
             take!(p, ld, "ffn.shared_experts.w2.weight", shared_w2);
             take!(p, ld, "ffn.shared_experts.w2.scale", shared_w2_scale);
             let (n_routed, _) = cfg.moe_config(cfg.n_layers + s);
-            let (e0, ne) = expert_lo(n_routed);
-            for e in e0..(e0 + ne).min(n_routed) {
+            for e in 0..n_routed {
                 let g = |n: &str| want(&format!("{p}.ffn.experts.{e}.{n}")).unwrap();
                 ld.experts.push(DevExpert {
                     w1: self.load_tensor(&g("w1.weight"), world, rank)?,

@@ -463,10 +463,10 @@ impl Device {
         Ok(enabled)
     }
 
-    /// Copy `bytes` from this device to `dst_dev` (NVLink peer copy).
-    ///
-    /// Synchronous on purpose: the asynchronous form's stream/direction rules
-    /// produced an illegal access here, and these payloads are tens of KB.
+    /// Copy `bytes` from this device to `dst_dev` over the GPU interconnect
+    /// (NVLink/PCIe peer DMA — the same mechanism GLM's collectives use). The
+    /// copy is issued on this rank's stream, so it never passes through host
+    /// memory; the caller synchronises before reading the result.
     pub fn memcpy_peer(
         &self,
         dst_dev: i32,
@@ -475,9 +475,16 @@ impl Device {
         bytes: usize,
     ) -> Result<()> {
         let st = unsafe {
-            (self.cudart.memcpy_peer)(dst, dst_dev, src, self.device_id(), bytes)
+            (self.cudart.memcpy_peer_async)(
+                dst,
+                dst_dev,
+                src,
+                self.device_id(),
+                bytes,
+                self.stream,
+            )
         };
-        check_cudart(st, &self.cudart, "cudaMemcpyPeer")
+        check_cudart(st, &self.cudart, "cudaMemcpyPeerAsync")
     }
 
     pub fn sync(&self) -> Result<()> {

@@ -35,9 +35,17 @@ pub enum Shard {
     Heads,
     /// `[n_groups*o_lora, hpg*hd]` — both dims sliced by the layer's o_groups.
     Groups,
-    /// Routed-expert ownership. The expert axis is in the *name*
-    /// (`...experts.{e}...`), so each rank simply keeps the tensors of the
-    /// `n_routed / world` experts it owns; the tensor's own shape is whole.
+    /// Routed experts, TP-split along `inter` with **no expert parallelism**:
+    /// every rank keeps every expert. `w1`/`w3` are `[inter, dim/2]`, so their
+    /// `inter` axis is dim 0; `w2` is `[dim, inter/2]`, so its `inter` axis is
+    /// dim 1. The MoE's all-reduce then sums slices of the *same* experts, which
+    /// is what makes the scheme correct.
+    ExpertRows,
+    /// `[dim, inter/2]` — the inter axis is on the columns (fp4 packs two values
+    /// per byte, so the column count is `inter/2`).
+    ExpertCols,
+    /// Historical expert-parallel ownership (each rank keeps a subset of
+    /// experts whole). Kept so older specs still resolve.
     Experts,
 }
 
@@ -201,7 +209,10 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 // dim and left the reduction dim whole — a silent shape mismatch
                 // that made the down GEMM walk off its weight (and only under
                 // TP, which is why single-GPU runs never caught it).
-                let sh = if n == "w2" { Shard::Cols } else { Shard::Experts };
+                // TP-split (no EP): every rank keeps every expert and each
+                // expert's `inter` axis is cut by world — rows for w1/w3, columns
+                // for w2 ([dim, inter/2]).
+                let sh = if n == "w2" { Shard::ExpertCols } else { Shard::ExpertRows };
                 push(
                     &mut out,
                     // ON-DISK shape: fp4 e2m1 packs 2 values per byte, so the
@@ -388,12 +399,21 @@ pub fn shard_factor(cfg: &Dsv41Config, spec: &TensorSpec, world: usize) -> (usiz
         }
         Shard::Cols => (world, spec.shape[1] / world),
         Shard::Heads | Shard::Groups => (world, spec.shape[0] / world),
-        // Expert-parallel cuts the `inter` axis, which is dim 0 for w1/w3
-        // ([inter, dim/2]). w2 carries it on its columns and uses Cols. The
-        // loader already sliced by world here; this reporting must agree with
-        // it (it did not, which made the metadata contradict the bytes).
-        Shard::Experts => (world, spec.shape[0] / world),
+        // TP-split experts: every rank holds every expert, each cut along `inter`
+        Shard::ExpertRows => (world, spec.shape[0] / world),
+        Shard::ExpertCols => (world, spec.shape[1] / world),
+        Shard::Experts => (1, spec.shape[0]),
     }
+}
+
+/// The `inter` axis of a TP-split expert must be padded up to a multiple of the
+/// MMA kernel's K atom (64), because `inter/world` is not one in general
+/// (2304/8 = 288). The padding rows/columns are zero, so they contribute
+/// nothing; the kernel additionally requires `k % 64 == 0`.
+pub const K_ATOM: usize = 64;
+
+pub fn padded_inter(n: usize) -> usize {
+    n.div_ceil(K_ATOM) * K_ATOM
 }
 
 /// The local shape a rank holds for `spec`.
@@ -420,12 +440,20 @@ pub fn local_shape(cfg: &Dsv41Config, spec: &TensorSpec, world: usize, rank: usi
             s[0] /= world;
             s
         }
-        Shard::Experts => {
-            // the expert axis is in the NAME; the tensor's own dim 0 is the
-            // `inter` axis (w1/w3), which expert-parallel splits by world
-            s[0] /= world;
+        // both expert rules cut `inter`; the difference is only which dim it is
+        Shard::ExpertRows => {
+            s[0] = padded_inter(s[0] / world);
             s
         }
+        Shard::ExpertCols => {
+            // on disk the column count is inter/2 (fp4 packs two values a byte)
+            let packed = s[1] / world;
+            let logical = packed * 2;
+            let padded = padded_inter(logical) / 2;
+            s[1] = padded.max(packed);
+            s
+        }
+        Shard::Experts => s, // whole tensor; ownership is by expert index
     }
 }
 
@@ -670,15 +698,17 @@ mod tests {
         assert_eq!(local_shape(&cfg, &get("layers.6.attn.attn_sink"), 8, 0), vec![8]);
         // embed/head still replicated (the vocabulary split needs a gather)
         assert_eq!(local_shape(&cfg, &get("embed.weight"), 8, 0), vec![129280, 5120]);
-        // Expert-parallel cuts the `inter` axis: w1/w3 carry it on their rows,
+        // MoE is TP-split, not expert-parallel: every rank keeps EVERY expert
+        // and holds a slice of each along `inter`, padded up to the MMA K atom
+        // (2304/8 = 288 -> 320) with zeros.
+        assert_eq!(specs.iter().filter(|s| s.name.contains("ffn.experts.0.")).count() % 3, 0);
         assert_eq!(
             local_shape(&cfg, &get("layers.6.ffn.experts.0.w1.weight"), 8, 0),
-            vec![2304 / 8, 5120 / 2]
+            vec![320, 5120 / 2]
         );
-        // w2 carries it on its COLUMNS ([dim, inter/2] on disk).
         assert_eq!(
             local_shape(&cfg, &get("layers.6.ffn.experts.0.w2.weight"), 8, 0),
-            vec![5120, (2304 / 8) / 2]
+            vec![5120, 320 / 2]
         );
         // The engram table is row-sharded with ceil-division; the last rank may
         // be short.
@@ -696,9 +726,19 @@ mod tests {
                 let ls = local_shape(&cfg, &spec, world, 0);
                 match spec.shard {
                     Shard::Replicated => assert_eq!(ls, spec.shape),
-                    // expert-parallel splits the `inter` axis (dim 0 of w1/w3)
-                    Shard::Experts => {
-                        assert_eq!(ls[0], spec.shape[0] / f, "{} world {world}", spec.name)
+                    Shard::Experts => assert_eq!(ls, spec.shape),
+                    // TP-split experts: `inter` cut by world and padded to the
+                    // MMA K atom (which the local shape already reflects)
+                    Shard::ExpertRows => assert_eq!(
+                        ls[0],
+                        padded_inter(spec.shape[0] / f),
+                        "{} world {world}",
+                        spec.name
+                    ),
+                    Shard::ExpertCols => {
+                        // columns are packed 2 fp4 values per byte
+                        let packed = spec.shape[1] / f;
+                        assert_eq!(ls[1], padded_inter(packed * 2) / 2, "{}", spec.name)
                     }
                     Shard::Rows if spec.name.contains("engram.embed") => {
                         // engram rows use ceil-division
