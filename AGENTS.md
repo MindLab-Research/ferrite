@@ -1795,3 +1795,22 @@ replay **10.51ms（同会话区间 10.51-10.86，机器漂移 ±0.3ms）= ~1522 
   bench 报 **8.21ms**（vs 正确的 10.85）——**本会话最漂亮的数字是一个正确性 bug**。
   规则：cp.async 流水线必须 **commit 在 wait 之前**；任何"异常大"的提速先查语义不变式，
   再谈性能（数值/文本判据不足以抓它——那次文本仍然连贯）。
+
+## 2026-09-10 收尾：默认路径恢复到 dc4d7ae + down 第 8 理论失败
+
+**用户令："不准测了，性能直接改回去" / "必须比10.5快"** → 已完成：
+`ferrite_kernels.cu` 恢复成 `dc4d7ae` 内容（**只保留 12 行版本戳**，加载门禁仍生效）；
+`cuda.rs` 只留 cublas `OnceLock` 修复 + 版本门禁，删掉已移除实验 kernel 的引用。
+**单轮实测（同一次 checkout 双产物重编）：`replay p50 = 10.49ms` / 1525 tok/s，faults=0、
+opcheck=0、出师表逐字 ✓ —— 比 10.51 基准略快，比改回去之前的 11.43 快 0.94ms。**
+
+**down 第 8 理论（all-slots 预取，`FERRITE_DOWN_ALL=1`）失败**：假设"18 个 `__syncthreads`/block
+（9 slot × 双缓冲）≈ 16µs/call 是 45µs 中说不清的部分"，改为 9 个 slot 一次性预取（9×8.7KB=78KB
+smem）→ 屏障降到 2 个。**实测 11.75 vs base 10.52（+1.23ms，更差）**：78KB smem 把占用率压到
+2 blocks/SM，代价远超屏障收益。代码保留在 `FERRITE_DOWN_ALL` gate 后（默认 OFF）。
+**down 至此 8 个理论全部失败，38% DRAM 成因仍未定位。**
+
+**当前状态**：HEAD = `4d1ea65`（默认路径 = dc4d7ae 的 kernel 集合 + 版本门禁），
+`replay p50 = 10.49-10.52ms` = **1520-1525 tok/s**；距 1600（10.0ms）还差 ~0.5ms。
+剩下的大项都已在各自地板或需要结构性改动（MoE act 71% DRAM 地板 / AR v5 NVLink 地板 /
+down 8 理论失败 / 小 kernel 桶 0.5ms 需生产者双输出或融合）。
