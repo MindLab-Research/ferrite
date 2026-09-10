@@ -3246,6 +3246,7 @@ fn mega_chain_dev_batched(
     gname: &str,
     n: usize,
 ) -> Result<Vec<f32>> {
+    eprintln!("[chain] mega_chain_dev_batched enter capture={} n={}", capture, n);
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights, GdnLayerWeights, GraphIO};
     let cuda = s
         .backend
