@@ -3630,7 +3630,11 @@ __global__ void __launch_bounds__(288, 3) moe_fused_down_sum_fp8_kernel(
                 const unsigned char* wbase = wst[warp][buf];
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
-                    const unsigned char* d8 = wbase + (size_t)(2 * c) * 256 + (size_t)lane * 16;
+                    // one LDS.128 into a register, then read bytes from the
+                    // register (the first v14 draft read 8x2B straight from
+                    // smem per iteration — +32 LDS/stage of pure overhead)
+                    const uint4 dv4 = *reinterpret_cast<const uint4*>(wbase + (size_t)(2 * c) * 256 + (size_t)lane * 16);
+                    const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4);
                     const float ds_c = dsr[(size_t)((hb + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
                     // 4 accumulators (was 2): each chain was 4 deep and the
