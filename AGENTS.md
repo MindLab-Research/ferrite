@@ -1047,3 +1047,30 @@ live for the WHOLE function"）。但 capture 期的分配读到 **batch=false**
 
 **下会话首步**：在 `decode_step_batched` 的 capture 调用前后 + `mega_chain_dev` 的 dry-run 结束后
 各加一个 eprintln，确定崩溃点；或用 `FERRITE_POOL_MISS=1` 配合逐行日志对齐时间戳。
+
+## 2026-09-10 终局：TP=4 崩溃路径的最终定位（走单序列链）
+
+**完整证据链**（TP=4/B=8，--max-seqs 8，GPU 0-3）：
+| 标记 | 数量 | 含义 |
+|---|---|---|
+| `[megab-cap] cap=false` | 180 (=4 dev × 45 层) | **mega_chain_dev 的 dry-run 完成** |
+| `[megab-cap] cap=true` | **0** | capture 的层循环从未进入 |
+| `[chain]`（batched 链入口探针） | **0** | `mega_chain_dev_batched` 从未调用 |
+| `[prewarm]`（mega_chain_dev:2779 的 capture 分支） | **0** | capture 分支未执行 |
+| `[megab]`（decode_step_batched 的标记） | **0** | 与上一致（未走 batched 链） |
+| `admitted seq` | **1**（live=1） | 只 admit 一个请求 |
+
+**结论**：TP=4 时**只 admit 1 个请求**（gpu_engine.rs:301 的 `live_seqs.len()==1` 分支）
+→ 走 **`decode_step` → `mega_chain_dev`（单序列链）**。其 dry-run 完成，随后在
+dry-run 返回与 capture 分支（2779）之间崩溃（err 900 / 池 miss）。
+
+**为什么只 admit 1 个**：第一个请求的 decode 崩溃 → serve 进入错误态 → 后续请求被拒
+（非 bench 问题；TP=8 同样 bench 能 admit 16）。
+
+**下会话首步（精确定位崩溃点）**：在 `decode_step`/`decode_step_mega` 的
+`mega_chain_dev(..., false, ...)` 调用**之后**加 `eprintln!("[ds] dry-run returned")`，
+再在 `mega_chain_dev(..., true, ...)` 之前加 `eprintln!("[ds] capture call")` —— 即可
+确定崩溃在调用之间还是 capture 调用内部。
+
+**2 组 × TP=4 方案的前提修正**：必须**先让 8 请求真正并发**（否则走 per-seq 单序列链，
+吞吐 121 tok/s 毫无意义）。可能需要 `FERRITE_FORCE_BATCHED_B1` 或调整 admission。
