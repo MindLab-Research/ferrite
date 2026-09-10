@@ -7336,7 +7336,8 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     static int hc_fuse_env = -1;
     if (hc_fuse_env < 0) {
         const char* e = getenv("FERRITE_HC_FUSE");
-        hc_fuse_env = (e && e[0] == '1') ? 1 : 0;
+        // DEFAULT ON (verified 2026-09-10: 10.76 -> 10.51ms, faults=0, text OK)
+        hc_fuse_env = (e && e[0] == '0') ? 0 : 1;
     }
     // FERRITE_HC_MIX_KS: runtime K-split for the mix GEMV (default HC_MIX_KS
     // = 16). Lower KS => fewer blocks (fewer reductions/barriers), more work
