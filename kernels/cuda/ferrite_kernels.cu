@@ -3490,45 +3490,44 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ act,         // [n, topk*inter + inter_shared]
     float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, int dscols, int nt) {
-    // v12: grid (hidden/8, nt) — warp j owns expert slot j and loops EIGHT h
-    // rows. The act row (tok, slot j — 6KB) is invariant across h: the first
-    // read pulls it into L1 and the 7 re-reads hit L1 (the v11 grid
-    // (hidden, n) re-read each act row from L2 once per h block = 662MB of
-    // L2 traffic at the ~15TB/s L2 peak — THAT was the 44.6µs bottleneck,
-    // not HBM (down weights are only ~21MB/rank). The down weight rows for
-    // 8 consecutive h are one contiguous 12KB run per expert (better HBM
-    // coalescing too). FP: per-h fold stays j-ascending (warp 0..7 each
-    // reduce one h's part[j] column serially — the SAME summation order as
-    // the old warp-serial acc += p*y chain, bit-identical partials from the
-    // same lane dot + shuffle tree).
+    int inter_shared, int topk, int dscols, int nt, int htile) {
+    // v13 (2026-09-10, traffic-budget driven): HTILE h-rows per block (was 8;
+    // FERRITE_DOWN_HTILE, power of two, 8..64). The v12 grid (hidden/8, n/4)
+    // re-read every act row once per 8 h rows: 512 h-blocks x 4 token-groups
+    // x 4 tokens x 9 slots x 1KB = ~74MB of L2 act traffic per call on top of
+    // the ~132MB of (DRAM) weight traffic, and each block pulled 2KB fragments
+    // from NINE different 1MB expert matrices. ncu: DRAM 37.6%, L1/TEX pipe
+    // 67.6%, L1TEX scoreboard stall 40.6% — the L1TEX data path, not HBM, was
+    // the binding constraint. HTILE quarters the act requests per 4x and makes
+    // each warp's weight run 4x longer (8KB contiguous per expert per token).
+    // Per-output arithmetic is UNCHANGED (same lane/k decomposition, same
+    // shuffle tree, same j-ascending fold) -> bit-identical at any HTILE.
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h0 = blockIdx.x * 8;
+    int h0 = blockIdx.x * htile;
     if (h0 >= hidden) return;
+    const int CHUNKS = htile >> 3;         // 8-row chunks per block
     int stride = topk * inter + inter_shared;
     // ALL tokens per block (grid.y == 1). One block read only 18KB and spent
     // ~2us in fixed per-block latency -> 5.6GB/s/SM, while the act kernel
-    // (128KB/block) reaches 22GB/s/SM. Processing MAXN tokens per block
-    // amortizes that latency MAXN-fold; `part` holds the per-token partials.
-    const int MAXN = 64;
+    // (128KB/block) reaches 22GB/s/SM. Processing TT tokens per block
+    // amortizes that latency TT-fold; `part` holds the per-token partials.
     const int TT = 4; // tokens per block (middle ground: 512 blocks gave too
                       // little parallelism per SM, 8192 paid the fixed
                       // per-block latency 16x)
-    __shared__ float part[MAXN][8][16]; // [tok][h row][slot]
+    const int MAXT = 4;             // tokens staged in part[][]
+    const int HMAX = 64;            // smem sizing bound for htile
+    __shared__ float part[MAXT][HMAX][16]; // [tok][h row in tile][slot]
     int j = warp;
     const int t0 = blockIdx.y * TT;
     const int t1 = (t0 + TT < nt) ? (t0 + TT) : nt;
-    for (int base = t0; base < t1; base += MAXN) {
-        const int cnt = ((t1 - base) < MAXN) ? (t1 - base) : MAXN;
+    for (int base = t0; base < t1; base += MAXT) {
+        const int cnt = ((t1 - base) < MAXT) ? (t1 - base) : MAXT;
         if (j <= topk) {
-        float py[8];
         for (int tt = 0; tt < cnt; tt++) {
         const int tok = base + tt;
         const float* act_t = act + (size_t)tok * stride;
         const float* ids_t = ids_f + (size_t)tok * topk;
         const float* probs_t = probs + (size_t)tok * topk;
-        #pragma unroll
-        for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
         const float* aj = nullptr;
         const unsigned char* dbase = nullptr;
         const float* dsr_base = nullptr;
@@ -3552,29 +3551,36 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             aj = act_t + (size_t)topk * inter;
             klen = inter_shared;
         }
+        // THE HTILE WIN: the act row is loaded ONCE per token into registers
+        // and reused by every 8-row chunk (v12 re-read it per 8-row block).
+        float4 ar[4];
         if (klen > 0) {
-            // 16-BYTE LANES (uint4): one load covers 512B = TWO h-rows (rows
-            // are contiguous, klen=256). The kernel was request-rate bound at
-            // 1.16TB/s (~15% of peak) with 8-byte lanes; halving the request
-            // count doubles the bytes per in-flight request.
-            float4 ar[4];
-            {
-                const float4* a4 = reinterpret_cast<const float4*>(aj);
-                const int base = (lane & 15) * 4; // act[16] per lane, same for both rows
-                #pragma unroll
-                for (int r = 0; r < 4; r++) ar[r] = a4[base + r];
-            }
+            const float4* a4 = reinterpret_cast<const float4*>(aj);
+            const int abase = (lane & 15) * 4; // act[16] per lane, same for both rows
+            #pragma unroll
+            for (int r = 0; r < 4; r++) ar[r] = a4[abase + r];
+        }
+        for (int ch = 0; ch < CHUNKS; ch++) {
+            const int hb = h0 + ch * 8;   // this chunk's 8 h rows
+            float py[8];
+            #pragma unroll
+            for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
+            if (klen > 0) {
             if (klen == 256) {
+                // 16-BYTE LANES (uint4): one load covers 512B = TWO h-rows
+                // (rows are contiguous, klen=256). The kernel was request-rate
+                // bound at 1.16TB/s (~15% of peak) with 8-byte lanes; halving
+                // the request count doubles the bytes per in-flight request.
                 const int i0 = lane * 16;
                 const int scol = (lane & 15) >> 3; // scale column: lanes 16-31 read the SECOND row's bytes [0..256)
                 uint4 dv4[4];
                 #pragma unroll
                 for (int c = 0; c < 4; c++)
-                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(h0 + 2 * c) * klen + i0);
+                    dv4[c] = *reinterpret_cast<const uint4*>(dbase + (size_t)(hb + 2 * c) * klen + i0);
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     const unsigned char* d8 = reinterpret_cast<const unsigned char*>(&dv4[c]);
-                    const float ds_c = dsr_base[(size_t)((h0 + 2 * c) >> 7) * dscols + scol];
+                    const float ds_c = dsr_base[(size_t)((hb + 2 * c) >> 7) * dscols + scol];
                     const float* arf = reinterpret_cast<const float*>(ar);
                     // 4 accumulators (was 2): each chain was 4 deep and the
                     // fp32 FMA latency is 4 cycles, so the tail of every
@@ -3592,7 +3598,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                         yb1 += (dfb.y * ds_c) * arf[(q + 1) * 2 + 1];
                     }
                     float y = (ya0 + ya1) + (yb0 + yb1);
-                    // lanes 0..15 -> row h0+2c, lanes 16..31 -> row h0+2c+1
+                    // lanes 0..15 -> row hb+2c, lanes 16..31 -> row hb+2c+1
                     #pragma unroll
                     for (int off = 8; off > 0; off >>= 1) y += __shfl_down_sync(0xffffffff, y, off);
                     const float y1 = __shfl_sync(0xffffffff, y, 16);
@@ -3601,7 +3607,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
             } else {
                 #pragma unroll
                 for (int hh = 0; hh < 8; hh++) {
-                    int h = h0 + hh;
+                    int h = hb + hh;
                     float y = 0.f;
                     for (int k = lane; k < klen; k += 32)
                         y += (__half2float(__nv_cvt_fp8_to_halfraw(dbase[(size_t)h * klen + k], __NV_E4M3))
@@ -3612,16 +3618,17 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                 }
             }
             }
-        if (lane == 0) {
-            #pragma unroll
-            for (int hh = 0; hh < 8; hh++) part[tt][hh][j] = p * py[hh];
+            if (lane == 0) {
+                #pragma unroll
+                for (int hh = 0; hh < 8; hh++) part[tt][ch * 8 + hh][j] = p * py[hh];
+            }
         }
         }
         }
         __syncthreads();
-        // fold: cnt*8 (tok, h row) pairs, j-ascending (FP-safe)
-        for (int idx = threadIdx.x; idx < cnt * 8; idx += blockDim.x) {
-            int tt = idx >> 3, hh = idx & 7;
+        // fold: cnt*htile (tok, h row) pairs, j-ascending (FP-safe)
+        for (int idx = threadIdx.x; idx < cnt * htile; idx += blockDim.x) {
+            int tt = idx / htile, hh = idx % htile;
             int h = h0 + hh;
             if (h < hidden) {
                 float acc = 0.f;
@@ -3974,14 +3981,29 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
         return cudaGetLastError();
     }
     dim3 block(288); // 9 warps: topk routed (8) + shared
+    // FERRITE_DOWN_HTILE (power of two, 8..64): h-rows per block. 8 = the
+    // historical v12 layout (bit-identical). Larger tiles cut the act-row
+    // re-reads (once per htile rows instead of per 8) and lengthen each
+    // warp's contiguous weight run per expert — see the kernel's v13 note.
+    static int htile_env = -1;
+    if (htile_env < 0) {
+        const char* e = getenv("FERRITE_DOWN_HTILE");
+        int v = e ? atoi(e) : 8;
+        if (v < 8) v = 8;
+        if (v > 64) v = 64;
+        while (v & (v - 1)) v &= (v - 1);   // round down to a power of two
+        if (v < 8) v = 8;
+        htile_env = v;
+    }
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
-    dim3 grid((hidden + 7) / 8, (n + 3) / 4, 1);
+    dim3 grid((hidden + htile_env - 1) / htile_env, (n + 3) / 4, 1);
     moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
         ids_f, probs,
         (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
         (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
-        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols, n);
+        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols, n,
+        htile_env);
     return cudaGetLastError();
 }
 
