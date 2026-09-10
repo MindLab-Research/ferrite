@@ -594,7 +594,12 @@ impl DevBuf {
         if std::env::var_os("FERRITE_POOL_MISS").is_some() {
             eprintln!("[pool-miss] dev={dev} class={class} len={len} batch={batch} — cudaMalloc (capture-illegal if inside a capture)");
         }
-        if is_capturing() {
+        // ENV-GATED (2026-09-10): measured — it ELIMINATES the TP=4 capture
+        // crash (faults=0) but then STALLS at the capture_lock (1 rank holds
+        // it, never enters the layer loop, 3 wait). cudaMallocAsync likely
+        // blocks inside capture (pool exhaustion). Off by default until the
+        // stall is understood; the code is kept for that investigation.
+        if is_capturing() && std::env::var_os("FERRITE_CAPTURE_ASYNC_ALLOC").is_some() {
             // CAPTURE-LEGAL fallback (2026-09-10, TP<8 fix): cudaMallocAsync
             // draws from the stream's memory pool and IS permitted inside a
             // stream capture (unlike cudaMalloc → err 900). The per-seq
