@@ -2752,6 +2752,7 @@ fn mega_chain_dev(
         };
     }
 
+    eprintln!("[mcd] enter capture={} seq={}", capture, seq);
     let _guard = if capture {
         // DSA host bookkeeping: the capture pass re-runs dsa_layer_dev's
         // host logic (t_count += 1 WITHOUT executing cache_append). Roll it
