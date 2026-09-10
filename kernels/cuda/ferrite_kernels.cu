@@ -3559,21 +3559,23 @@ __global__ void __launch_bounds__(288, 3) moe_fused_down_sum_fp8_kernel(
             aj = act_t + (size_t)topk * inter;
             klen = inter_shared;
         }
-        // THE HTILE WIN: the act row is loaded ONCE per token into registers
-        // and reused by every 8-row chunk (v12 re-read it per 8-row block).
-        float4 ar[4];
-        if (klen > 0) {
-            const float4* a4 = reinterpret_cast<const float4*>(aj);
-            const int abase = (lane & 15) * 4; // act[16] per lane, same for both rows
-            #pragma unroll
-            for (int r = 0; r < 4; r++) ar[r] = a4[abase + r];
-        }
         for (int ch = 0; ch < CHUNKS; ch++) {
             const int hb = h0 + ch * 8;   // this chunk's 8 h rows
             float py[8];
             #pragma unroll
             for (int hh = 0; hh < 8; hh++) py[hh] = 0.f;
             if (klen > 0) {
+            // ar is scoped INSIDE the chunk: keeping it in the outer scope held
+            // its 16 registers live across the shuffle/part-write phase and
+            // pushed the kernel to 80 regs (2 blocks/SM, +13us/call in serve).
+            // Per-chunk reload of the act row hits L1 (same row, same block).
+            float4 ar[4];
+            {
+                const float4* a4 = reinterpret_cast<const float4*>(aj);
+                const int abase = (lane & 15) * 4; // act[16] per lane, same for both rows
+                #pragma unroll
+                for (int r = 0; r < 4; r++) ar[r] = a4[abase + r];
+            }
             if (klen == 256) {
                 // 16-BYTE LANES (uint4): one load covers 512B = TWO h-rows
                 // (rows are contiguous, klen=256). The kernel was request-rate
