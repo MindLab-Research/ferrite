@@ -1595,3 +1595,27 @@ cargo test --release -p ferrite-dsv41 --test ar_micro -- --nocapture
    ✓，否则 `__syncthreads` 会死锁 ✓ —— 这点我已改成无提前 return ✓）。
 
 **harness 入口**：`tests/ar_micro.rs`，见上一节命令 ✓（`AR_MICRO_WORLD/ROUNDS/N` 可调 ✓）。
+
+### 二分决定性结论：**挂死来自"内核内最后块盖章"，不是奇偶/信用逻辑**
+
+用 6 秒微基准（world=2, rounds=4）对照：
+
+| 设备侧路径的盖章方式 | 结果 |
+|---|---|
+| 内核内"最后块"盖章（`atomicAdd(ctr)` + `is_last` + `__syncthreads`）| **✗ 挂死**（第 1 轮即挂 ✓）|
+| **换回独立 `ar_stamp`/`ar_mark` 内核** | **✓ 不再挂**（4 轮全部完成 ✓）**但结果为 0.0**（应 1000.0）✗ |
+
+⇒ 两个**互相独立**的缺陷 ✓：
+1. **挂死 = 内核内的最后块盖章** ✗（与奇偶/信用等待无关 ✓ —— 把信用等待改成永不触发后仍然挂 ✓，
+   换成独立盖章就不挂 ✓）。嫌疑集中在 store 内核尾部那段
+   `__threadfence()` + `atomicAdd(ctr)` + `__syncthreads()` + `__shared__ bool is_last` 的结构 ✗
+   （注意：`__shared__` 声明在 `if (ctr == nullptr) return;` **之后** ✗，且该 return 虽为一致条件 ✓
+   但当 `ctr==nullptr` 时整块跳过 ✓ —— 需确认无路径让部分线程先退出 ✓）。
+2. **数据 = 奇偶半区的读/写对不上** ✗（store 写的半区与 reduce 读的半区不一致 ✅可疑：
+   store 用 `parity_off/4`（float 单位 ✓）、reduce 的 `base` 用字节单位 ✓，两者都按 `round%2` ✓，
+   但 `round` 在 publish 与 reduce 两处的取值时机不同 ✗ —— **reduce 里我读的是
+   `self.round.load()`，而 publish 里是 `fetch_add(+1)`** ✗：同一轮里 reduce 读到的
+   可能是**已经 +1 后的值** ✓ ⇒ 两处算出的 parity 相反 ✓✓ ⇒ 读到零 ✓ —— **这是首要嫌疑** ✓）。
+
+**下会话第一步**：把 parity 从"两处各自算"改成**一次算好、存进 `self.round` 的伴随变量**
+（或让 reduce 用与 publish 相同的 round 值 ✓），再跑 6 秒微基准 ✓。
