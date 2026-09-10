@@ -323,10 +323,24 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
             const float* kr = kv + ((size_t)bb * n + idx) * d;
             float dot = 0.f;
             for (int c = threadIdx.x; c < d; c += blockDim.x) dot += qr[c] * kr[c];
-            // block reduction of the dot product
+            // Two-stage dot reduction. The warp shuffle only covers 32 lanes, so
+            // on its own it drops every warp but the first: with blockDim=128 and
+            // d=512 each thread sums 4 elements, and taking only warp 0's partial
+            // made the score ~1/4 of its true value — which collapsed the softmax
+            // weight (0.95 -> 0.67 for a single visible key) and therefore the
+            // whole attention output. The per-warp sums must be combined across
+            // the block. (Same class of bug as the hc_mixes ss reduction.)
             for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
-            __shared__ float sdot;
-            if (threadIdx.x == 0) sdot = dot;
+            __shared__ float wpart[32];
+            const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+            if (lane == 0) wpart[wid] = dot;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const int nw = (blockDim.x + 31) >> 5;
+                float s = 0.f;
+                for (int w = 0; w < nw; w++) s += wpart[w];
+                sdot = s;
+            }
             __syncthreads();
             dot = sdot * scale;
             const float nm = fmaxf(smax, dot);
