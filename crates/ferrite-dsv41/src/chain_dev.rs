@@ -107,6 +107,14 @@ struct Scratch {
     idx_lens: DevBuf,  // [1] i32
     // bf16 staging for the cuBLAS path
     bf16: DevBuf,
+    // hc premix coefficients, kept DEVICE-resident and rotated between layers.
+    // They used to round-trip through the host every layer (one download each for
+    // attn_pre and ffn_pre, plus two uploads), and a download is a full device
+    // sync — 45 layers x 2 syncs per step, each one draining the CPU/GPU
+    // pipeline, which is where the ~7.5ms/layer went. Three slots, no aliasing.
+    pre_a: DevBuf,
+    pre_b: DevBuf,
+    pre_c: DevBuf,
     // ---- engram (n-gram memory write-back into the hc residual stream) ----
     /// hash ids for one token: `[n_engram_layers * n_hash_cols]` i64
     eng_ids: DevBuf,
@@ -242,6 +250,9 @@ impl<'a> DevChain<'a> {
             idx_w: dev.alloc(fb(cfg.index_n_heads.max(1)))?,
             idx_lens: dev.alloc(4)?,
             bf16,
+            pre_a: dev.alloc(fb(hc).max(8))?,
+            pre_b: dev.alloc(fb(hc).max(8))?,
+            pre_c: dev.alloc(fb(hc).max(8))?,
             eng_ids: dev.alloc(fb(eng_cols * n_eng_layers).max(8) * 2)?, // i64
             eng_rows: dev.alloc(fb(eng_cols * ehd).max(8))?,
             eng_kv: dev.alloc(fb((hc + 1) * dim))?,
@@ -464,9 +475,12 @@ impl<'a> DevChain<'a> {
             eprintln!("[mine] xin_rms={}", (r * 1e6).round() / 1e6);
         }
 
-        // the initial collapse takes copy 0 of the stream
+        // the initial collapse takes copy 0 of the stream; it is uploaded ONCE
+        // into slot 0 and every later layer keeps its coefficients on the device
         let mut premix = vec![0f32; hc];
         premix[0] = 1.0;
+        self.upload_pre(&premix)?;
+        let mut premix_slot_idx = 0usize;
         // engram hashes for this token (all engram layers at once; the reference
         // computes them in one shot and indexes per layer). The state's token
         // cache spans prefill + decode, so this must be called every step.
@@ -499,7 +513,7 @@ impl<'a> DevChain<'a> {
                 self.engram_apply(layer, li)?;
             }
             let _ta = std::time::Instant::now();
-            premix = self.layer(layer, pos, &premix)?;
+            premix_slot_idx = self.layer(layer, pos, premix_slot_idx)?;
             let _el = _ta.elapsed();
             if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
                 let _ = (&mut t_attn, &mut t_moe);
@@ -514,7 +528,7 @@ impl<'a> DevChain<'a> {
         self.upload_pre(&premix)?;
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
-            self.s.pre.as_f32(),
+            self.premix_slot(1).as_f32(), // attn_pre stays on the device
             self.s.x.ptr as *mut f32,
             1,
             hc as i32,
@@ -553,6 +567,17 @@ impl<'a> DevChain<'a> {
         self.comm.as_ref().map(|c| c.rank).unwrap_or(0)
     }
 
+    /// The three device-resident premix slots: 0 is the incoming premix the
+    /// attention collapses with, 1 receives this layer's attn_pre, 2 receives the
+    /// ffn_pre that the next layer uses.
+    fn premix_slot(&self, i: usize) -> &DevBuf {
+        match i % 3 {
+            0 => &self.s.pre_a,
+            1 => &self.s.pre_b,
+            _ => &self.s.pre_c,
+        }
+    }
+
     fn upload_pre(&self, v: &[f32]) -> Result<()> {
         self.dev.upload_f32_at(self.s.pre.ptr, 0, v)
     }
@@ -576,7 +601,11 @@ impl<'a> DevChain<'a> {
 
     /// One transformer layer. Returns the pre-mix the next block's first
     /// collapse must use (this block's *attention* mix).
-    fn layer(&mut self, layer: usize, pos: usize, premix: &[f32]) -> Result<Vec<f32>> {
+    /// `pa` indexes the DEVICE-resident premix the attention collapses with; the
+    /// return value indexes the one the next layer must use. Nothing here touches
+    /// the host: the coefficients used to be downloaded and re-uploaded every
+    /// layer, and a download is a full device sync.
+    fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
@@ -588,7 +617,7 @@ impl<'a> DevChain<'a> {
             ld.hc_attn_fn.as_ref().unwrap().as_f32(),
             ld.hc_attn_scale.as_ref().unwrap().as_f32(),
             ld.hc_attn_base.as_ref().unwrap().as_f32(),
-            self.s.pre.ptr as *mut f32,
+            self.premix_slot(1).ptr as *mut f32, // attn_pre
             self.s.post.ptr as *mut f32,
             self.s.comb.ptr as *mut f32,
             1,
@@ -598,8 +627,8 @@ impl<'a> DevChain<'a> {
             cfg.hc_eps,
         )?;
         let _t_all = std::time::Instant::now();
-        let attn_pre = self.dl(self.s.pre.as_f32(), hc)?;
         if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+            let attn_pre = self.dl(self.premix_slot(1).as_f32(), hc)?;
             let po = self.dl(self.s.post.as_f32(), hc)?;
             let cb = self.dl(self.s.comb.as_f32(), hc * hc)?;
             eprintln!("[mine] L0 pre={attn_pre:?}");
@@ -610,10 +639,9 @@ impl<'a> DevChain<'a> {
                 .collect();
             eprintln!("[mine] L0 comb_rowsum={rs:?}");
         }
-        self.upload_pre(premix)?;
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
-            self.s.pre.as_f32(),
+            self.premix_slot(pa).as_f32(),
             self.s.x.ptr as *mut f32,
             1,
             hc as i32,
@@ -664,7 +692,7 @@ impl<'a> DevChain<'a> {
             ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
             ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
             ld.hc_ffn_base.as_ref().unwrap().as_f32(),
-            self.s.pre.ptr as *mut f32,
+            self.premix_slot(2).ptr as *mut f32, // ffn_pre -> next layer
             self.s.post.ptr as *mut f32,
             self.s.comb.ptr as *mut f32,
             1,
@@ -676,14 +704,11 @@ impl<'a> DevChain<'a> {
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
         }
-        // the FFN's pre is what the NEXT layer's attention collapses with
-        // ("attention uses what the previous layer's FFN produced") — grab it
-        // BEFORE upload_pre overwrites the buffer with this layer's attn_pre
-        let ffn_pre = self.dl(self.s.pre.as_f32(), hc)?;
-        self.upload_pre(&attn_pre)?;
+        // the FFN collapses with THIS layer's attn_pre (slot 1), which stayed on
+        // the device; the FFN's own pre (slot 2) is what the NEXT layer uses.
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
-            self.s.pre.as_f32(),
+            self.premix_slot(1).as_f32(),
             self.s.x.ptr as *mut f32,
             1,
             hc as i32,
@@ -715,7 +740,7 @@ impl<'a> DevChain<'a> {
             dim as i32,
         )?;
         self.copy_h_back()?;
-        Ok(ffn_pre)
+        Ok(2) // slot 2 holds this layer's ffn_pre = the next layer's premix
     }
 
     /// Diagnostic: report the magnitude of a stage's output. `DSV41_STATS=1`.
