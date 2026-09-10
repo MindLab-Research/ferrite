@@ -574,6 +574,11 @@ impl<'a> DevChain<'a> {
             self.s.q.ptr as *mut f32,
         )?;
         // RoPE over the trailing `rope_head_dim` lanes of each head
+        // ALL heads of this token are at the SAME position — step=0. The
+        // earlier step=1 gave head i position pos+i (8 different positions for
+        // 8 local heads), scrambling the positional encoding: every head's
+        // RoPE rotated differently, so the attention scores were positionally
+        // wrong. (The KV rope uses rows=1 so step is irrelevant there.)
         self.dev.apply_rope(
             self.s.q.ptr as *mut f32,
             self.cos.as_f32(),
@@ -583,7 +588,7 @@ impl<'a> DevChain<'a> {
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
             pos as i32,
-            1,
+            0,
             false,
         )?;
 
@@ -727,7 +732,7 @@ impl<'a> DevChain<'a> {
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
             pos as i32,
-            1,
+            0,
             true,
         )?;
 
@@ -875,7 +880,7 @@ impl<'a> DevChain<'a> {
             rd as i32,
             (rd / 2) as i32,
             pos as i32,
-            1,
+            0,
             false,
         )?;
         // per-head weights; the reference folds softmax_scale * n_heads^-0.5 into
