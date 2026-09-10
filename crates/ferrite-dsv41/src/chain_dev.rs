@@ -1371,6 +1371,10 @@ impl<'a> DevChain<'a> {
                     dim as i32,
                     inter_local as i32,
                 )?;
+                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e == 128 {
+                    let sw = self.dl(self.s.ex_act.as_f32(), inter_local)?;
+                    eprintln!("[mine] E128 swiglu_rms={}", (sw.iter().map(|v| v * v).sum::<f32>() / sw.len() as f32).sqrt());
+                }
                 if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
                     let eo = self.dl(self.s.ex_out.as_f32(), dim)?;
                     let r: f32 =
