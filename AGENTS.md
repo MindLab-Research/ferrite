@@ -1094,3 +1094,28 @@ cudaMallocAsync 是否需要在 `graph_capture_begin()` 前做一次 stream sync
 
 **重要**：该修复对 TP=8 无害（TP=8 的池已预热，走不到该分支；且 `immortal=true` 只在
 capture 内触发）。
+
+## ⚠️ 2026-09-10 教训重现：.so 与源码不同步导致"基线回归"假象（浪费 ~40 分钟）
+
+**现象**：TP=8 的 B=1/B=16 突然全部 err 900（池 miss during capture），疑似我的
+TP=4 改动破坏基线。**隔离验证**（远端 `git checkout bf5ddef4f`，即我第一个代码改动
+**之前**的提交）→ **同样崩溃**，证明与代码改动无关。
+
+**真因**：`kernels/cuda/libferrite_kernels.so` 与当前 `ferrite_kernels.cu` 不同步
+（.so 时间戳 `Sep 9 23:38`）。**重跑 `bash build.sh 103a` + `cargo build --release`
+后 faults=0、文本正常**。
+
+**铁律（AGENTS.md 规则 2b 的再次确认）**：
+**每次 git 同步/切版本后，必须"双产物重编"** ——
+```bash
+cd kernels/cuda && bash build.sh 103a && cd ~/ferrite && cargo build --release
+ls -la target/release/ferrite-serve kernels/cuda/libferrite_kernels.so   # 两者都必须新于源码
+md5sum kernels/cuda/libferrite_kernels.so                                 # 记录产物指纹
+```
+**只跑 `cargo build --release` 是不够的**（它不会重编 .cu → .so）。我本会话的 TP=4 测试
+只重编了 Rust 侧，累积多轮后 .so 陈旧 → 误判为"代码回归"。
+
+**诊断模式（下次直接用）**：症状 = 与改动无关的全面崩溃 → **先重编双产物**，再做隔离
+验证（checkout 改动前的提交对比）。
+
+**恢复的代码状态**：a070d40（两个实验开关默认 OFF，默认路径与 13.40ms 基线一致）。
