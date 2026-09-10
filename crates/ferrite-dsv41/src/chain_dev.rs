@@ -623,13 +623,20 @@ impl<'a> DevChain<'a> {
         // superset-free pruning that at least makes the long-range rows
         // reachable — it is NOT the learned selection).
         let mut take_comp = comp_len.min(cfg.index_topk);
-        if comp_len > 0 && cfg.is_index_source(layer) && cfg.indexer_owns_k(layer) && self.indexer(layer, pos, win, comp_len)? {
+        if !owns_kv {
+            // A consumer reads the owner's selection buffer, which the owner
+            // filled earlier this step (including its learned top-k). Uploading
+            // here would overwrite it with the placeholder — a consumer must
+            // never write the shared buffer.
+        } else if comp_len > 0 && cfg.is_index_source(layer) && cfg.indexer_owns_k(layer)
+            && self.indexer(layer, pos, win, comp_len)? {
             // the kernel wrote `comp_len.min(index_topk)` entries at [win, ..)
             take_comp = comp_len.min(cfg.index_topk);
         } else {
-            // Placeholder until every consumer reads its source's published
-            // selection: keep the most recent compressed rows. NOT the learned
-            // selection — it only makes the long-range rows reachable.
+            // No indexer on this owner yet: keep the most recent compressed rows.
+            // NOT the learned selection — it only makes the long-range rows
+            // reachable, and the config makes every compress owner an index
+            // source, so in practice this branch is a safety net.
             let placeholder = comp_len.min(cfg.index_topk);
             for j in 0..placeholder {
                 idx_host[win + j] = (win + comp_len - placeholder + j) as i32;
