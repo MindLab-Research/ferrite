@@ -235,9 +235,8 @@ impl Dsv41Config {
                     t.get("rope_scaling")
                         .and_then(|r| r.get("original_max_position_embeddings"))
                         .and_then(|x| x.as_u64())
-                        .map(|v| v as usize)
                 })
-                .unwrap_or(0),
+                .unwrap_or(0) as usize,
             rope_theta: f(t, "rope_theta").unwrap_or(10000.0) as f32,
             rope_factor: f(t, "rope_factor")
                 .or_else(|| t.get("rope_scaling").and_then(|r| r.get("factor")).and_then(|x| x.as_f64()))
