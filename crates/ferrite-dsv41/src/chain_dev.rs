@@ -1303,6 +1303,9 @@ impl<'a> DevChain<'a> {
         // rebased by rank*ne).
         let ne = ld.experts.len();
         let mut wsum = vec![0f32; ne.max(1)];
+        if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+            eprintln!("[mine] route idx={:?} wgt={:?}", &idx, &wgt);
+        }
         for (slot, &e) in idx.iter().enumerate() {
             let e = e as usize;
             if e < ne {
