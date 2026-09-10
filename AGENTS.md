@@ -1119,3 +1119,35 @@ md5sum kernels/cuda/libferrite_kernels.so                                 # 记�
 验证（checkout 改动前的提交对比）。
 
 **恢复的代码状态**：a070d40（两个实验开关默认 OFF，默认路径与 13.40ms 基线一致）。
+
+## ⚠️ 2026-09-10 未解决：基线从 13.40ms 退到 ~28ms（widen 路径），非代码改动
+
+**症状**：TP=8 的 B=16 replay 从多次验证的 **13.40ms** 变为 **27.9-28.9ms**（2.1x），
+B=2 同样 2x（13.86 vs 9.2ms）。文本正确、faults=0（带 --use_fast_math 时）。
+
+**已排除**：
+- **非我的代码改动**：隔离验证 `git checkout bf5ddef4f`（改动前）+ **双产物重编** → 仍 faults=2
+- **非硬件**：SM clock **2032 MHz 满频**、温度 39°C、功耗 459W、无降频原因激活、ECC 错误全 0
+- **非符号缺失**：`.so` 91 个 `T ferrite_` 符号 vs `.cu` 92 externs，关键 kernel 全在
+- **非 `.cu` 内容**：`git log -1 -- ferrite_kernels.cu` = 2b6aff4，之后未变
+- **`--use_fast_math` 不是主因**：带它 → 27.99ms/faults=0；不带 → faults=2 崩溃（它影响行为但非 2x 之源）
+
+**可测症状（关键线索）**：`[widen] f32-consumer weight: numel=393216 shape=[24, 16384] — widening bf16 residency`
+- 慢运行：**1081 次 widen / 步**；快运行（历史）0 次
+- `cuda.rs:1055 dev_weight`：当 f32-consumer 的 Tensor 是 mmap 占位 stub（`len() < numel()`）
+  且存在 bf16 residency 时，**运行时 cudaMalloc + `ferrite_bf16_to_f32`**（每步、每层）
+- `[hc-dbg] fw[24,16384] widen` —— hc 的 fw 权重被打中
+
+**机器事实**：**内存仅 4GB**（free -g: total 4011MB），模型 **306GB** → mmap 预加载预算极小，
+大量权重落到 widen 恢复路径。**怀疑**：page cache 状态变化（buff/cache 仅 312MB）导致预加载
+覆盖面与历史不同。
+
+**下会话首步（按序）**：
+1. `grep -n "preload_bf16\|PRELOAD_BUDGET\|widen" crates/ferrite-kernel/src/cuda.rs` 找预加载预算逻辑
+   （cuda.rs:1712 注释提到 "2.5 GB never crosses a CPU"），确认预算是否依赖可用内存
+2. 强制加大预加载预算（env 开关）→ 验证 widen 归零 → 性能应回 13.4ms
+3. 或为 hc 的 fw 权重显式选择 f32 加载（避免运行时 widen）
+4. **同时**：确认远端是否曾有未提交的 `.cu`（本会话多次 `git reset --hard` 会抹掉）
+
+**重要提醒**：`.so` 是 `.gitignore` 的（`*.so`）——`git reset --hard` 不会删它，也不会重建它。
+**只跑 `cargo build --release` 不会更新 .so**；这在本会话导致过"基线回归"的误判。
