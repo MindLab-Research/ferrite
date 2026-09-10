@@ -670,6 +670,12 @@ impl<'a> DevChain<'a> {
         // the most recent ones, which is a deliberate placeholder (it is a
         // superset-free pruning that at least makes the long-range rows
         // reachable — it is NOT the learned selection).
+        // ALWAYS upload the window entries: the indexer overwrites the
+        // compressed block on the device, but the window block [0, win) must be
+        // fresh on every step. Only the placeholder branch uploaded them before,
+        // so the index-source path read stale indices — the illegal memory
+        // access in sparse_attn.
+        self.ul_i32(idxs_ptr, &idx_host[..win])?;
         let mut take_comp = comp_len.min(cfg.index_topk);
         if comp_len > 0 && cfg.is_index_source(layer) {
             // EVERY index-source layer runs its own indexer (into its own
