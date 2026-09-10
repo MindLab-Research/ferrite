@@ -3480,6 +3480,7 @@ __global__ void moe_fused_down_sum_fp8_v0_kernel(
     if (lane == 0) out[(size_t)tok * hidden + h] = acc;
 }
 
+template <int HTILE_K>
 __global__ void moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
@@ -3490,7 +3491,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ act,         // [n, topk*inter + inter_shared]
     float* __restrict__ out,               // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
-    int inter_shared, int topk, int dscols, int nt, int htile) {
+    int inter_shared, int topk, int dscols, int nt) {
     // v13 (2026-09-10, traffic-budget driven): HTILE h-rows per block (was 8;
     // FERRITE_DOWN_HTILE, power of two, 8..64). The v12 grid (hidden/8, n/4)
     // re-read every act row once per 8 h rows: 512 h-blocks x 4 token-groups
@@ -3503,9 +3504,13 @@ __global__ void moe_fused_down_sum_fp8_kernel(
     // Per-output arithmetic is UNCHANGED (same lane/k decomposition, same
     // shuffle tree, same j-ascending fold) -> bit-identical at any HTILE.
     int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    int h0 = blockIdx.x * htile;
+    int h0 = blockIdx.x * HTILE_K;
     if (h0 >= hidden) return;
-    const int CHUNKS = htile >> 3;         // 8-row chunks per block
+    // HTILE_K is a TEMPLATE constant: the chunk loop fully unrolls, the
+    // fold divides with a shift, and smem is sized exactly (the first
+    // runtime-htile version measured +10us/call vs the v12 original —
+    // nvcc could not unroll/hoist across a runtime chunk bound).
+    const int CHUNKS = HTILE_K >> 3;      // 8-row chunks per block
     int stride = topk * inter + inter_shared;
     // ALL tokens per block (grid.y == 1). One block read only 18KB and spent
     // ~2us in fixed per-block latency -> 5.6GB/s/SM, while the act kernel
@@ -3515,8 +3520,7 @@ __global__ void moe_fused_down_sum_fp8_kernel(
                       // little parallelism per SM, 8192 paid the fixed
                       // per-block latency 16x)
     const int MAXT = 4;             // tokens staged in part[][]
-    const int HMAX = 64;            // smem sizing bound for htile
-    __shared__ float part[MAXT][HMAX][16]; // [tok][h row in tile][slot]
+    __shared__ float part[MAXT][HTILE_K][16]; // [tok][h row in tile][slot]
     int j = warp;
     const int t0 = blockIdx.y * TT;
     const int t1 = (t0 + TT < nt) ? (t0 + TT) : nt;
@@ -3627,8 +3631,8 @@ __global__ void moe_fused_down_sum_fp8_kernel(
         }
         __syncthreads();
         // fold: cnt*htile (tok, h row) pairs, j-ascending (FP-safe)
-        for (int idx = threadIdx.x; idx < cnt * htile; idx += blockDim.x) {
-            int tt = idx / htile, hh = idx % htile;
+        for (int idx = threadIdx.x; idx < cnt * HTILE_K; idx += blockDim.x) {
+            int tt = idx / HTILE_K, hh = idx % HTILE_K;
             int h = h0 + hh;
             if (h < hidden) {
                 float acc = 0.f;
@@ -4004,12 +4008,21 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     // 4 tokens per block: 512 blocks (all tokens) starved the SMs; 8192
     // (one token) paid the fixed per-block latency 16x.
     dim3 grid((hidden + htile_env - 1) / htile_env, (n + 3) / 4, 1);
-    moe_fused_down_sum_fp8_kernel<<<grid, block, 0, s>>>(
-        ids_f, probs,
-        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
-        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
-        act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols, n,
-        htile_env);
+    // template dispatch: the chunk count, the fold divisor and the smem size
+    // are all compile-time per specialization.
+    #define FERRITE_DOWN_LAUNCH(HT) \
+        moe_fused_down_sum_fp8_kernel<HT><<<grid, block, 0, s>>>( \
+            ids_f, probs, \
+            (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs, \
+            (const unsigned char*)shared_down_w8, (const float*)shared_down_scale, \
+            act, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols, n)
+    switch (htile_env) {
+        case 16: FERRITE_DOWN_LAUNCH(16); break;
+        case 32: FERRITE_DOWN_LAUNCH(32); break;
+        case 64: FERRITE_DOWN_LAUNCH(64); break;
+        default: FERRITE_DOWN_LAUNCH(8);  break;
+    }
+    #undef FERRITE_DOWN_LAUNCH
     return cudaGetLastError();
 }
 
