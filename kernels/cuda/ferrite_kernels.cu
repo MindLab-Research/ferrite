@@ -4968,10 +4968,17 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;  // m-tile 0/1 × (r0, r0+8)
     for (int j = 0; j <= topk; j++) {
         const int buf = j % NP;
-        if (NP == 4) asm volatile("cp.async.wait_group 2;\n");   // <=2 pending: j done
+        // COMMIT BEFORE WAIT — the canonical cp.async pipeline. wait_group N
+        // waits until at most N groups are in flight, so with NP groups
+        // committed (j..j+NP-1) the bound NP-1 guarantees group j is DONE.
+        // (Moving the commit after the wait — as a first cut did — makes the
+        // bound claim completion of a group that was never issued: the MMA
+        // then reads stale SMEM. It "measured" 8.21ms instead of 10.85 —
+        // the fastest-looking number of the session was a correctness bug.)
+        if (j + (NP - 1) <= topk) DM_STAGE(j + (NP - 1), (j + (NP - 1)) % NP);
+        if (NP == 4) asm volatile("cp.async.wait_group 3;\n");
         else asm volatile("cp.async.wait_group 1;\n");
         __syncthreads();
-        if (j + (NP - 1) <= topk) DM_STAGE(j + (NP - 1), (j + (NP - 1)) % NP);
         if (ssp[j] == 0.f) continue;
         const int klen = (j < topk) ? inter : inter_shared;
         const float* dsr = (j < topk)
