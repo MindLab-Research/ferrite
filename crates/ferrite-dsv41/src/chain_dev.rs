@@ -843,7 +843,19 @@ impl<'a> DevChain<'a> {
         // must not keep its own window ring (nothing would ever put the
         // compressed rows there), it reads the owner's — which also already
         // holds this step's token, since the owner runs earlier in the stack.
-        let owner = self.kv_owner(layer);
+        // The window KV is PER-LAYER: the reference computes `_window_kv(x, ...)`
+        // with each layer's own wkv and its own input, and only the *compressed*
+        // KV plus the indexer are shared group-wide ("layers sharing a ratio also
+        // share one compressed KV and one indexer"). Reading the owner's ring for
+        // the window part fed every consumer layer the owner's kv — which is
+        // exactly why layer 2 (the owner) matched the official while layer 3, the
+        // first consumer, dropped ~15%. DSV41_RING_OWNER=1 restores the old
+        // shared-ring behaviour for A/B.
+        let owner = if std::env::var("DSV41_RING_OWNER").map(|v| v != "0").unwrap_or(false) {
+            self.kv_owner(layer)
+        } else {
+            layer
+        };
         let ring_ptr = self.layers[owner].ring.ptr;
         // index-source layers compute their OWN selection into their OWN buffer;
         // non-index layers read the owner's (shared) selection
