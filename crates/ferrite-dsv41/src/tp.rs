@@ -282,8 +282,15 @@ impl Collective {
         };
         let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
         let ctr2 = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
+        // In the device-side path the reduce writes STRAIGHT into the caller's
+        // buffer: keeping dst inside the staging half meant the copy-back below
+        // read the half the reduce had just been writing, and any ordering slip
+        // there returns the rank's own input (the micro-benchmark saw exactly
+        // that: 0.0 for rank 0). Reading from the staging parity half and
+        // writing to the caller separates the two roles completely.
+        let reduce_dst = if dev_side { buf as *mut f32 } else { base as *mut f32 };
         self.dev.ar_reduce2(
-            base as *mut f32,
+            reduce_dst,
             base as *const f32,
             n,
             slot_f,
@@ -303,9 +310,10 @@ impl Collective {
                 round,
             )?;
         }
-        self.dev
-            .memcpy_d2d(buf, base as *const std::ffi::c_void, len)?;
         if !dev_side {
+            // the non-dev path reduces in place in slot 0, so copy it out
+            self.dev
+                .memcpy_d2d(buf, base as *const std::ffi::c_void, len)?;
             self.barrier.wait();
         }
         Ok(())
