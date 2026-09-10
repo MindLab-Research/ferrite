@@ -1253,14 +1253,18 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
                               int hc_dim, int hc, int sinkhorn_iters, float eps, cudaStream_t s) {
     const int mix = hc * (2 + hc);
     const int smem = (mix + hc * hc) * sizeof(float);
-    // NOTE (negative result, 2026 session): sizing this block to `mix` warps (so
-    // every mix row is in flight at once) made decode 2.7x SLOWER (348 ms/token vs
-    // 130), even though it reads like an obvious win: the grid is `rows`, which is
-    // tiny, so growing the block by 6x collapsed the blocks-per-SM and the kernel
-    // simply lost occupancy. Measured, not reasoned - and it was tested together
-    // with the four-accumulator unroll below, so the two are not yet separated.
-    // DSV41_HC_MIXES_THREADS re-enables the wide block for a controlled retest.
-    int nthreads = 128;
+    // One warp per mix row — every row in flight at once. Isolated A/B, same
+    // session, 32 tokens: 128 threads = 138.8 ms/token, `mix` warps (768) =
+    // 80.4 ms/token, i.e. +72%. The kernel hands row m to warp m (m += nwarp), so
+    // at 128 threads only 4 of the 24 rows ran and each warp walked six rows
+    // serially; with the grid being just `rows`, the occupancy was there but the
+    // work per warp was six dependent rows deep. Note this must NOT be combined
+    // with the four-accumulator unroll (DSV41_HC_MIXES_ACC4): that pair measured
+    // 348 ms/token, a 4.3x regression over this alone, and the unroll is neutral
+    // by itself (138.4 vs 138.8).
+    int nthreads = ((mix + 31) / 32) * 32;
+    if (nthreads < 32) nthreads = 32;
+    if (nthreads > 1024) nthreads = 1024;
     if (const char* e = getenv("DSV41_HC_MIXES_THREADS")) {
         const int v = atoi(e);
         if (v >= 32 && v <= 1024) nthreads = v;
