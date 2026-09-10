@@ -31,7 +31,7 @@ use std::ffi::c_void;
 
 use ferrite_types::{FerriteError, Result};
 
-use crate::config::Dsv41Config;
+use crate::config::{Dsv41Config, KvMode};
 use crate::device::{DevBuf, Device};
 use crate::load::{Dsv41DevWeights, LayerDev};
 use crate::ops;
@@ -575,14 +575,23 @@ impl<'a> DevChain<'a> {
         let slot = pos % win;
         // raw pointers rather than a live borrow: `compress` below needs
         // &mut self (it updates this layer's published count and buffers)
-        let ring_ptr = self.layers[layer].ring.ptr;
-        let idxs_ptr = self.layers[layer].idxs.ptr;
-        let cache = &self.layers[layer];
-        self.dev.memcpy_d2d(
-            (cache.ring.ptr as *mut u8).wrapping_add(slot * fb(hd)) as *mut c_void,
-            self.s.kv.ptr as *const c_void,
-            fb(hd),
-        )?;
+        // The release shares one KV store across a group of layers: the kv
+        // source maintains it and its consumers read it. A consumer therefore
+        // must not keep its own window ring (nothing would ever put the
+        // compressed rows there), it reads the owner's — which also already
+        // holds this step's token, since the owner runs earlier in the stack.
+        let owner = self.kv_owner(layer);
+        let ring_ptr = self.layers[owner].ring.ptr;
+        let idxs_ptr = self.layers[owner].idxs.ptr;
+        let cache = &self.layers[owner];
+        let owns_kv = owner == layer;
+        if owns_kv {
+            self.dev.memcpy_d2d(
+                (cache.ring.ptr as *mut u8).wrapping_add(slot * fb(hd)) as *mut c_void,
+                self.s.kv.ptr as *const c_void,
+                fb(hd),
+            )?;
+        }
 
         // selection: the window ring, oldest first (the ring index already
         // carries the ageing rotation), padded with -1
@@ -873,6 +882,22 @@ impl<'a> DevChain<'a> {
             self.layers[layer].compress_len = len;
         }
         Ok(len)
+    }
+
+    /// The layer whose KV store `layer` reads: itself, unless it is a consumer
+    /// of a group whose compressed KV is maintained by the source above it.
+    fn kv_owner(&self, layer: usize) -> usize {
+        if self.cfg.kv_mode(layer) != KvMode::CompressConsumer {
+            return layer;
+        }
+        for l in (0..layer).rev() {
+            if self.cfg.kv_mode(l) == KvMode::CompressSource
+                && self.cfg.compress_ratio(l) == self.cfg.compress_ratio(layer)
+            {
+                return l;
+            }
+        }
+        layer
     }
 
     /// How many compressed rows the source layer of `layer` has published.
