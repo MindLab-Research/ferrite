@@ -1067,3 +1067,29 @@ generated:     ". " The user wants me to recite the poem "Quiet Night Thoughts" 
 4. **AR 与计算重叠 / 减少 AR 次数** ✓（现在每层 2 次 ✓）
 5. **MoE 设备侧 dispatch** ✗（替代主机循环 ✓，同时解锁图化 ✓）
 6. **fp8 激活**（精度项，非性能项 ✓）
+
+## 性能进展（本会话）
+
+**精确基线**（`[dsv41] DECODE` 行，只计解码循环、不含 ~45s 权重加载）：
+- 优化前：**2.6 tok/s**（~390ms/token）
+- 优化后：**3.5 tok/s**（289ms/token）—— 128 token / 37.01s
+
+**已落地的性能修复（同属"每层 device sync"这一类）**：
+- **hc premix 系数设备驻留（三槽轮转）** ✗→✓：原来每层 `attn_pre`/`ffn_pre` 各下载一次
+  （下载 = 一次 `cudaDeviceSynchronize` ✗）+ 两次上传 = **每步 90 次同步** ✗，
+  每次都排空 CPU/GPU 流水线 ✓。
+  实测：**L1 注意力 3.5–4.8ms → 1.78–1.80ms（2.2x）** ✓，正确性不变（仍是 " Paris." ✓）。
+
+**结论**：每层 ~6.4ms ✗ 中，注意力只占 1.8ms ✓ ⇒ **剩余 ~4.6ms/层 仍是同步/主机阻塞** ✗。
+
+### 下一刀（最高价值，同一模式）
+
+MoE 的路由每层要 `dev.sync()` + 2 次下载（`chain_dev.rs:1299-1303` ✗）= 每步 45 次
+`cudaDeviceSynchronize` ✗。**改法：固定内存零拷贝回读 + 主机自旋** ✓
+（vLLM/SGLang 的标准做法 ✓）：
+1. `route_topk` 内核除写设备缓冲外，**再写一份 pinned host 内存**（`cudaHostAllocMapped` ✓，
+   主机可直接读 ✓）并在末尾写一个 flag（`__threadfence_system()` ✓，与我 AR 的 publish 同法 ✓）；
+2. 主机**自旋**在 pinned flag 上（µs 级 ✓，不调用任何 CUDA API ✓）；
+3. 删掉 `dev.sync()` ✓。
+预期：再省 ~2-4ms/层 ✓ ⇒ 有望到 ~10-15 tok/s；之后才轮到
+**CUDA Graph**（需先消灭主机侧 MoE 派发 ✗，即上面第 1 步的设备侧路由 + 固定专家集 ✗）与内核级优化 ✓。
