@@ -138,10 +138,14 @@ impl Collective {
                     .memcpy_peer(p as i32, dst, src as *const std::ffi::c_void, len)?;
             }
         }
-        // the peer copies are asynchronous on both devices: a device sync makes
-        // this rank's issue complete, and the barrier makes every rank's writes
-        // visible before anyone reduces
-        self.dev.dev_sync()?;
+        // The peer copies above use the SYNCHRONOUS cuMemcpyPeer (see Device::
+        // memcpy_peer), so they have already landed by the time this returns; the
+        // old comment here claimed they were asynchronous and defended a
+        // cudaDeviceSynchronize. That sync ran on EVERY collective call — ~90
+        // per decode step — and each one drains the whole pipeline, which is the
+        // dominant per-layer cost. Stream ordering plus the barrier below is
+        // enough: this rank's copies are complete, and every rank's writes are
+        // issued before anyone reduces.
         self.barrier.wait();
         Ok(())
     }
