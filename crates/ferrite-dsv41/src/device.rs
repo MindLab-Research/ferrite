@@ -1075,6 +1075,49 @@ impl Device {
         self.kerr(rc, "ferrite_f32_to_bf16")
     }
 
+    /// f32 x f32 -> f32 GEMM. Used where the release runs a projection in fp32
+    /// (the compressor's, for the pooling's accuracy): the checkpoint stores
+    /// those as bf16, widening is exact, so this reproduces the promotion.
+    pub fn gemm_f32(
+        &self,
+        x: *const c_void,
+        w: *const c_void,
+        out: *mut f32,
+        rows: i32,
+        n_out: i32,
+        k: i32,
+    ) -> Result<()> {
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        let st = unsafe {
+            (self.cublas.gemm_ex)(
+                self.handle,
+                CUBLAS_OP_T,
+                CUBLAS_OP_N,
+                n_out,
+                rows,
+                k,
+                &alpha as *const f32 as *const c_void,
+                w,
+                CUDA_R_32F,
+                k,
+                x,
+                CUDA_R_32F,
+                k,
+                &beta as *const f32 as *const c_void,
+                out as *mut c_void,
+                CUDA_R_32F,
+                n_out,
+                CUDA_R_32F,
+                99,
+            )
+        };
+        if st != 0 {
+            return Err(FerriteError::Config(format!("cublasGemmEx(f32): {st}")));
+        }
+        Ok(())
+    }
+
     /// bf16 x bf16 -> f32 GEMM for the weights that are natively bf16 (the
     /// head, the compressor and indexer projections, the vision tower).
     /// This is not a dequantisation: those tensors are bf16 in the checkpoint.
