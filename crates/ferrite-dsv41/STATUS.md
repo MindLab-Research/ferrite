@@ -289,3 +289,63 @@ cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release
 DSV41_LAYERS=3 DSV41_STATS=1 DSV41_MODEL_DIR=... DSV41_KERNELS=$PWD/kernels/cuda/libferrite_kernels.so \
   CUDA_VISIBLE_DEVICES=0 ./target/release/dsv41-run --prompt "你好" --max-tokens 8
 ```
+
+---
+
+## 2026-09-11 会话：退化输出的根因定位（engram 是架构组件，不是可选附加）
+
+### 本会话对拍/诊断的全部结论（均有数据）
+
+1. **hc 链已与参考逐位一致（7 位有效数字）** ✓ — `hc_mixes` 的 `ss`(Σx²) 曾只做 warp 内归约、
+   漏跨 warp → blockDim=256 时 `inv = rsqrt(ss/hc_dim+eps)` 偏大 √8=2.83× → 所有 pre/post/comb 错。
+   （这是"输出与输入无关"的真根因，已修。）
+2. **激活量化器与参考完全一致** ✓：`DSV41_TOP5` 诊断 + attn_parity 同输入对拍，
+   XSC[0..4] 两边**逐位相同**（0.001953125 / 0.00048828125 …），XQ 字节仅 1 个码差
+   （我 numpy 编码器的取整）。`fp8_block_size = 32` 与 config 一致 ✓。
+3. **投影输出统计量吻合** ✓：`qr` rms 0.3999 vs 参考 0.3844（4%）；大元素吻合（-0.3162 vs -0.3165），
+   小元素（|v|<0.2·rms）差异达 10-20% —— **属 fp8 量化噪声量级**，非结构性 bug。
+4. **模型确实响应 prompt** ✓（三个 prompt → 三种不同输出）：`The capital of France is` →
+   [3108,3108,3108]；`1+1=` → [19,31,19]（prompt 是 [19,13,19,31] → **复读**）；`你好` → [90133,65,3108]。
+   → **token 3108 = `'...ĊĊ'`（字面 "..." + 两个换行）**，不是特殊 token（EOS=1、pad=2）。
+5. **top-5 logits 每步都在变且分布合理**（step0: 11.44/11.03/10.76 …）→ logits 无 NaN、非陈旧值、
+   head 路径（hc_collapse → rmsnorm → lin_bf16）**已施加最终 norm** ✓。
+6. **残差流 rms 逐层 ×55 增长**（L0 0.0596 → L35 3.2882），L35 min/max=±16.7（5×rms 离群）。
+   pre-norm 架构下增长本身可能正常，但**未与参考核对**。
+7. **窗口/index 尺寸配置正确** ✓（`sliding_window=128` ✓ `index_topk=512` ✓）；
+   `head.weight`/`embed.weight` 是 `Shard::Replicated`（weights.rs:83-90，非切分，属**性能项**非正确性项）。
+
+### ★ 剩余退化的主因（本会话新定位）
+
+`config.json` 的 `engram_layer_ids = [1, 14]`，`engram_num_embeddings = [384006168, 384016682]`，
+`engram_max_ngram_size = 4 / n_heads = 8 / head_dim = 256`。
+
+参考实现 `model.py:106` 的注释是 **"engram: n-gram hash lookups added into the residual stream
+at a few layers"**，且 `model.py:1261-1262` 在**每层 forward 内**：
+```python
+for i, layer in enumerate(self.layers):
+    if layer.engram is not None:      # layer 1 和 14
+        ...                            # n-gram 哈希查表 → 加入残差流
+```
+
+→ **engram 是架构组件，不是可选附加** ✗。我当前完全跳过它 → **第 1 层的残差流就缺一大块**
+（8 heads × 256 dim = 2048 维的查表值加进 5120 维残差）→ 下游全部系统性偏移 ✓
+—— 这正好解释"响应输入但形同随机/自信地错/复读"的签名 ✓✓。
+
+**因此：在 engram 接入之前，40 层文本不可能连贯**。TODO#10 把它列为"可选/分阶段"是**误判**，
+应提到正确性阻塞项。
+
+### 下一步（按序）
+
+1. **实现 engram 前向查表**（阻塞项）：n-gram hash（`engram.py` 的 NgramHashState：token_map →
+   compressed id → 逐 lookback XOR 乘法 → `% primes[:, i-1]` → + offsets）→ 8 heads × 256 维查表 →
+   加进第 1/14 层的残差流。**注意表是跨 rank 切分的**（model.py:108 注释：每 rank 分配
+   `ceil(rows/world_size)`）→ 查表需要跨 rank 取行（all-to-all 或每 rank 本地行 + AR）。
+2. 之后再做正式参考对拍（跑官方 PyTorch 前几层，比对逐层 h 统计）确认残差 ×55 增长是否正常。
+3. 正确性达标后才启动性能工作（目标：单并发 200 tok/s 不开 MTP）——已识别的首批优化点：
+   每层 4 次全设备同步（hc 系数/MoE 路由/compressor 标志）、80 次/步同步集合通信、
+   主机侧 MoE 派发、无 CUDA graph（~2400 launch/步）。
+
+### 本会话代码改动
+
+- `tests/attn_parity.rs`：在**正确时点** dump 量化结果（第一次量化 + 就地 norm 前的 qr）。
+- `bin/dsv41-run.rs`：`DSV41_TOP5=1` 时打印每步 top-4 logits（默认关）。
