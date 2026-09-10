@@ -790,6 +790,11 @@ impl<'a> DevChain<'a> {
             false,
         )?;
 
+        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+            let q = self.dl(self.s.q.as_f32(), nlh * hd)?;
+            let r = (q.iter().map(|v| v * v).sum::<f32>() / q.len() as f32).sqrt();
+            eprintln!("[mine] L0 q[0..4]={:?} q_full_rms={}", &q[..4], r);
+        }
         // window KV (single shared head)
         self.lin(
             self.s.xn.ptr as *const f32,
@@ -820,6 +825,11 @@ impl<'a> DevChain<'a> {
             false,
         )?;
 
+        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+            let kv = self.dl(self.s.kv.as_f32(), hd)?;
+            let r = (kv.iter().map(|v| v * v).sum::<f32>() / kv.len() as f32).sqrt();
+            eprintln!("[mine] L0 kv[0..4]={:?} kv_rms={}", &kv[..4], r);
+        }
         let win = cfg.window_size;
         let slot = pos % win;
         // raw pointers rather than a live borrow: `compress` below needs
@@ -934,6 +944,11 @@ impl<'a> DevChain<'a> {
             true,
         )?;
 
+        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+            let o = self.dl(self.s.o.as_f32(), nlh * hd)?;
+            let r = (o.iter().map(|v| v * v).sum::<f32>() / o.len() as f32).sqrt();
+            eprintln!("[mine] L0 sparse_o[0..4]={:?} sparse_rms={}", &o[..4], r);
+        }
         // block-diagonal grouped output projection: group g owns rows
         // [g*o_lora, (g+1)*o_lora) against the head slice [g*hpg*hd, ...)
         let groups = cfg.o_groups;
