@@ -1339,8 +1339,24 @@ impl<'a> DevChain<'a> {
                     inter_local as i32,
                     cfg.swiglu_limit,
                 )?;
+                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e < 100 {
+                    let gu = self.dl(self.s.ex_act.as_f32(), 2 * inter_local)?;
+                    let g: f32 = (gu[..inter_local].iter().map(|v| v * v).sum::<f32>()
+                        / inter_local as f32)
+                        .sqrt();
+                    let u: f32 = (gu[inter_local..].iter().map(|v| v * v).sum::<f32>()
+                        / inter_local as f32)
+                        .sqrt();
+                    eprintln!("[mine] expert {e} gate_rms={g} up_rms={u}");
+                }
                 self.dev
                     .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter_local as i32, cfg.swiglu_limit)?;
+                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) && e < 100 {
+                    let sw = self.dl(self.s.ex_act.as_f32(), inter_local)?;
+                    let r: f32 =
+                        (sw.iter().map(|v| v * v).sum::<f32>() / inter_local as f32).sqrt();
+                    eprintln!("[mine] expert {e} swiglu_rms={r}");
+                }
                 self.ul_f32(self.s.ex_in.ptr, &[wsum[e]])?;
                 self.dev.expert_down_fp4(
                     self.s.ex_act.ptr as *const f32,
