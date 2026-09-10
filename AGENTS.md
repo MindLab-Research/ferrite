@@ -1410,3 +1410,14 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **当前每步分解（AR v5 后的推断）**：AR ~0.7 · MoE down ~2.0 · MoE act 1.89 · hc ~1.3（rest345 7.26µs×90=0.65 + mix ~4µs×90=0.36 + post 0.27）· gdn ~1.06 · 投影+小 kernel ~3.5 · host/间隙 ~0.5。
 
 **通往 1600（还需 −0.94ms）**：act sector 利用率（−0.3）· 小 kernel 合并 norm/cast/quant（−0.3）· down one-expert-per-block（−0.5，最不确定）。三项落地 ≈ 9.85ms ≈ **1624 tok/s**。
+
+## 2026-09-10 深夜侦察：act sector 项基本关闭，down one-expert 成为最大剩余项
+
+**act sector 利用率（原 −0.3ms 估计）**：读 `moe_fused_act_fp8_mma_kernel`（ferrite_kernels.cu:4098）确认权重主通路**已是 sector 满利用**——per-warp smem staging（SA_STRIDE=80B padding 防 bank 冲突）+ 双缓冲 `cp.async.cg.shared.global.L2::128B` 16B/加载（ACT_ISSUE 宏，4234），每个 64B 行块 = 2 个满 32B sector。注释记载这已把"4B 跨 8 行 = 50% sector 效率"的 2.3x 流量浪费修掉（当年 3.2ms→带宽受限前的改造）。ncu 的 38.77% L2 Sector Promotion Misses 只能来自次要流量（gs/us scale 标量读、xq 暂存、ldmatrix 的 smem 侧）。**该项降级：预期 ≤0.1ms，不值得先做。**
+
+**剩余路径重排（10.94ms → 10.0ms 需 −0.94ms）**：
+1. **MoE down one-expert-per-block（−0.5~0.8ms，最大单项）**：down 现在 ~48.5µs×42=2.04ms，DRAM 地板 = 132MB 权重/次 ÷ 7.6TB/s = 17.4µs → 0.73ms/步，**理论余量 1.31ms**。设计：grid (hidden_tiles, n×(topk+1))，每 block 只读一个 expert 的连续权重片；跨 slot 求和用**两阶段**（phase1 写 per-slot partial 到 scratch [n][topk+1][hidden]，phase2 固定序归约——确定性，避免 atomicAdd 的非确定序）或 atomicAdd（快但序不确定）。**HTILE 教训适用：隔离基准对 down 有误导性（L2 条件不同），必须以 serve 判定；且改结构后必查 `nvcc -Xptxas -v` 寄存器数（80 regs → 2 blocks/SM 的陷阱）。**
+2. **小 kernel 合并（−0.3ms）**：norm/cast/quant ~241 次/步 × 1.34µs 固定成本。最有把握的一项。
+3. gdn_step（0.58ms，17.1µs/次）/ kpool（0.26ms）：float4 已做，需 ncu 定位剩余。
+
+**当前状态**：10.94ms = 1464 tok/s（env：标准 + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`）。HEAD e2e2207，全部验证过（faults=0，出师表✓）。
