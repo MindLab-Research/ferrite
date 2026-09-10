@@ -19,6 +19,7 @@ pub mod engram;
 pub mod kernels;
 pub mod ops;
 pub mod quant;
+pub mod vision;
 pub mod weights;
 
 pub use config::{Dsv41Config, KvMode};
