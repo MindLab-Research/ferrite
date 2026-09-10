@@ -331,6 +331,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
             // whole attention output. The per-warp sums must be combined across
             // the block. (Same class of bug as the hc_mixes ss reduction.)
             for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            __shared__ float sdot;
             __shared__ float wpart[32];
             const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
             if (lane == 0) wpart[wid] = dot;
