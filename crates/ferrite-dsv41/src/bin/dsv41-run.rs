@@ -115,11 +115,28 @@ fn main() -> Result<()> {
             .split(',')
             .filter_map(|s| s.trim().parse::<u32>().ok())
             .collect(),
-        Err(_) => tok
-            .encode(prompt.clone(), true)
-            .map_err(|e| ferrite_types::FerriteError::Config(format!("encode: {e}")))?
-            .get_ids()
-            .to_vec(),
+        Err(_) => {
+            // Match the reference's generate.py, which never feeds raw text: it
+            // wraps the user turn in the checkpoint's chat template
+            // (encode_messages(messages, thinking_mode="chat")) =
+            //   <|begin_of_sentence|><|User|>{prompt}<|Assistant|></think>
+            // for this checkpoint = ids [0, 128803] + prompt + [128804, 128822].
+            // Without the trailing </think> the model does not know it is the
+            // assistant's turn: e.g. "The capital of Japan is" then answers EOS
+            // immediately, while with the template it answers " Tokyo.".
+            let body = tok
+                .encode(prompt.clone(), false)
+                .map_err(|e| ferrite_types::FerriteError::Config(format!("encode: {e}")))?
+                .get_ids()
+                .to_vec();
+            let mut v = Vec::with_capacity(body.len() + 4);
+            v.push(0u32); // <|begin_of_sentence|>
+            v.push(128803u32); // <|User|>
+            v.extend_from_slice(&body);
+            v.push(128804u32); // <|Assistant|>
+            v.push(128822u32); // </think>
+            v
+        }
     };
     if ids.is_empty() {
         return Err(ferrite_types::FerriteError::Config("empty prompt".into()));
