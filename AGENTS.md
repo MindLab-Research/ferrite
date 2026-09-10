@@ -1025,3 +1025,25 @@ live for the WHOLE function"）。但 capture 期的分配读到 **batch=false**
 
 **注意**：TP=4 的 DRY 模式 replay 19.55ms（无图优化）；图化后需实测才能判断
 2 组方案的真实收益（估算 10-13ms/组 → 两组 1230-1600 tok/s）。
+
+## 2026-09-10 终局：TP=4 调查结论（2 组方案需要更多工作）
+
+**探针实测**（TP=4/B=8，`--max-seqs 8`，GPU 0-3）：
+- `[megab-cap]` 180 行**全部 cap=false**（无一个 cap=true）→ capture 从未进入层循环
+- `[chain]`（mega_chain_dev_batched 入口）**0 次** → batched 链未被调用
+- `[prewarm]`（mega_chain_dev + batched 链的 capture 前）**0 次** → 两条链的 capture 分支未执行
+- `admitted seq` **仅 1 个**，`live=1` → 只成功 admit 了一个请求
+
+**结论**：
+1. **TP=4 时第一个请求的 decode 就崩溃**（err 900）→ 后续请求被拒（所以 live=1，非 bench 问题）
+2. 崩溃的 capture **不在** mega_chain_dev(2787)/mega_chain_dev_batched(3371)（探针为 0），
+   也不在 1553（那是 MTP draft 图）→ **主图捕获的第三处路径仍未定位**
+3. `[megab-cap] cap=false` 来自 2864（mega_chain_dev）→ 走的是 per-seq 路径
+
+**2 组 × TP=4 方案的当前状态**：
+- DRY 模式可工作但 19.55ms/步（per-seq 串行，aggregate 121 tok/s）——**不能反映 batched 性能**
+- 要让方案成立，需要：① 定位并修复主图 capture 的池 miss ② 让 8 请求真正并发走 batched 路径
+- 预估收益（若成立）：AR 14→6 步（−1.5ms）+ MoE 权重流量不变 → 每组 10-13ms → 两组 1230-1600
+
+**下会话首步**：在 `decode_step_batched` 的 capture 调用前后 + `mega_chain_dev` 的 dry-run 结束后
+各加一个 eprintln，确定崩溃点；或用 `FERRITE_POOL_MISS=1` 配合逐行日志对齐时间戳。
