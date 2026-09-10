@@ -165,6 +165,10 @@ fn main() -> Result<()> {
 /// collective's barrier, and every rank computes the same logits (the shared
 /// reductions make the streams identical), so sampling needs no broadcast.
 #[allow(clippy::too_many_arguments)]
+/// Tensor-parallel run: one thread per rank, each bound to its own device and
+/// holding its own slice of the weights. Ranks stay in lockstep through the
+/// collective's barrier, and every rank arrives at the same logits (the shared
+/// reductions make the streams identical), so sampling needs no broadcast.
 fn run_tp(
     dir: &str,
     so: &str,
@@ -177,91 +181,35 @@ fn run_tp(
 ) -> Result<()> {
     let cfg = cfg.clone();
     let world = tp;
+    println!(
+        "[dsv41] TP{world}: dim={} layers={} hc*dim={} vocab={}",
+        cfg.dim,
+        cfg.n_layers,
+        cfg.hc_mult * cfg.dim,
+        cfg.vocab_size
+    );
     let barrier = Arc::new(Barrier::new(world));
     let t_small = Arc::new(Mutex::new(vec![0u64; world]));
     let t_big = Arc::new(Mutex::new(vec![0u64; world]));
-    let dir_owned = dir.to_string();
-    let dir = dir_owned.clone();
+    let dir = dir.to_string();
     let so = so.to_string();
-    let hc_dim = cfg.hc_mult * cfg.dim;
-    let vocab = cfg.vocab_size;
-    println!(
-        "[dsv41] TP{world}: dim={} layers={} hc*dim={} vocab={}",
-        cfg.dim, cfg.n_layers, hc_dim, vocab
-    );
-
     let t0 = std::time::Instant::now();
-    let dir_for_ranks = dir.clone();
-    let so_for_ranks = so.clone();
-    let produced: Vec<u32> = tp::run_ranks(world, move |rank| {
-        Device::bind_to(rank as i32)?;
-        let dev = Arc::new(Device::open(&so_for_ranks)?);
-        let mut loader = Loader::new(std::path::Path::new(&dir_for_ranks), &dev)?;
-        if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS").map(|v| v != "0").unwrap_or(true) {
-            loader.skip_prefixes.push("engram.embed.".into());
-        }
-        let w = loader.load(&cfg, world, rank)?;
-        dev.sync()?;
-        // peer access needs every rank's context to exist first
-        barrier.wait();
-        let peers_enabled = dev.enable_peer_access()?;
-        if rank == 0 {
-            println!("[dsv41] rank0: peer access enabled to {peers_enabled} devices");
-        }
-        barrier.wait();
-        if rank == 0 {
-            println!(
-                "[dsv41] rank0 weights: {:.1} GiB in {:.1}s",
-                loader.uploaded as f64 / (1u64 << 30) as f64,
-                t0.elapsed().as_secs_f64()
-            );
-        }
-        // collectives: allocate, then hand the staging addresses around
-        let mut c_small = Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
-        let mut c_big = Collective::new(dev.clone(), world, rank, vocab * 4, barrier.clone())?;
-        {
-            t_small.lock().unwrap()[rank] = c_small.staging_base();
-            t_big.lock().unwrap()[rank] = c_big.staging_base();
-        }
-        barrier.wait();
-        let ps = t_small.lock().unwrap().clone();
-        let pb = t_big.lock().unwrap().clone();
-        barrier.wait();
-        c_small.set_peers(ps)?;
-        c_big.set_peers(pb)?;
 
-        let mut chain = DevChain::new(&dev, &cfg, &w, RunOpts::from_env())?;
-        chain.comm = Some(Arc::new(c_small));
-        chain.reset()?;
-        // prefill, then greedy decode — every rank walks the same tokens
-        let t1 = std::time::Instant::now();
-        let mut logits = Vec::new();
-        for (i, &t) in ids.iter().enumerate() {
-            logits = chain.step(t, i)?;
+    let dir_r = dir.clone();
+    let so_r = so.clone();
+    let cfg_r = cfg.clone();
+    let ids_r = ids.clone();
+    let b_r = barrier.clone();
+    let ts_r = t_small.clone();
+    let tb_r = t_big.clone();
+    let produced: Vec<u32> = tp::run_ranks(world, move |rank| {
+        let r = rank_body(
+            &dir_r, &so_r, &cfg_r, &ids_r, world, rank, max_tokens, eos, &b_r, &ts_r, &tb_r, t0,
+        );
+        if let Err(ref e) = r {
+            eprintln!("[rank {rank}] FAILED: {e}");
         }
-        if rank == 0 {
-            println!(
-                "[dsv41] prefill {} tokens in {:.2}s",
-                ids.len(),
-                t1.elapsed().as_secs_f64()
-            );
-        }
-        let mut out: Vec<u32> = Vec::new();
-        for step in 0..max_tokens {
-            let mut best = 0usize;
-            for (i, &v) in logits.iter().enumerate() {
-                if v > logits[best] {
-                    best = i;
-                }
-            }
-            let next = best as u32;
-            out.push(next);
-            if Some(next) == eos {
-                break;
-            }
-            logits = chain.step(next, ids.len() + step)?;
-        }
-        Ok(out)
+        r
     })?;
 
     let tok = tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
@@ -271,4 +219,96 @@ fn run_tp(
     println!("{text}");
     println!("--- ids: {:?}", &produced[..produced.len().min(24)]);
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rank_body(
+    dir: &str,
+    so: &str,
+    cfg: &Dsv41Config,
+    ids: &[u32],
+    world: usize,
+    rank: usize,
+    max_tokens: usize,
+    eos: Option<u32>,
+    barrier: &Arc<Barrier>,
+    t_small: &Arc<Mutex<Vec<u64>>>,
+    t_big: &Arc<Mutex<Vec<u64>>>,
+    t0: std::time::Instant,
+) -> Result<Vec<u32>> {
+    Device::bind_to(rank as i32)?;
+    let dev = Arc::new(Device::open(so)?);
+    let mut loader = Loader::new(std::path::Path::new(dir), &dev)?;
+    if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS")
+        .map(|v| v != "0")
+        .unwrap_or(true)
+    {
+        loader.skip_prefixes.push("engram.embed.".into());
+    }
+    let w = loader.load(cfg, world, rank)?;
+    dev.sync()?;
+    // peer access needs every rank's context to exist first
+    barrier.wait();
+    let peers = dev.enable_peer_access()?;
+    if rank == 0 {
+        println!(
+            "[dsv41] rank0: peer access to {peers} devices; weights {:.1} GiB in {:.1}s",
+            loader.uploaded as f64 / (1u64 << 30) as f64,
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    barrier.wait();
+
+    let hc_dim = cfg.hc_mult * cfg.dim;
+    let vocab = cfg.vocab_size;
+    let mut c_small = Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
+    let mut c_big = Collective::new(dev.clone(), world, rank, vocab * 4, barrier.clone())?;
+    {
+        t_small.lock().unwrap()[rank] = c_small.staging_base();
+        t_big.lock().unwrap()[rank] = c_big.staging_base();
+    }
+    barrier.wait();
+    let ps = t_small.lock().unwrap().clone();
+    let pb = t_big.lock().unwrap().clone();
+    barrier.wait();
+    c_small.set_peers(ps)?;
+    c_big.set_peers(pb)?;
+    // the big collective is for the vocabulary gather, which arrives with the
+    // head split; keep it alive so its staging address stays valid
+    let _keep_big = Arc::new(c_big);
+
+    let mut chain = DevChain::new(&dev, cfg, &w, RunOpts::from_env())?;
+    chain.comm = Some(Arc::new(c_small));
+    chain.reset()?;
+    if rank == 0 {
+        eprintln!("[dsv41] rank0: chain ready, entering prefill");
+    }
+    let t1 = std::time::Instant::now();
+    let mut logits = Vec::new();
+    for (i, &tk) in ids.iter().enumerate() {
+        logits = chain.step(tk, i)?;
+    }
+    if rank == 0 {
+        println!(
+            "[dsv41] prefill {} tokens in {:.2}s",
+            ids.len(),
+            t1.elapsed().as_secs_f64()
+        );
+    }
+    let mut out: Vec<u32> = Vec::new();
+    for step in 0..max_tokens {
+        let mut best = 0usize;
+        for (i, &v) in logits.iter().enumerate() {
+            if v > logits[best] {
+                best = i;
+            }
+        }
+        let next = best as u32;
+        out.push(next);
+        if Some(next) == eos {
+            break;
+        }
+        logits = chain.step(next, ids.len() + step)?;
+    }
+    Ok(out)
 }
