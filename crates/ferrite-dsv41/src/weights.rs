@@ -446,10 +446,23 @@ pub fn local_shape(cfg: &Dsv41Config, spec: &TensorSpec, world: usize, rank: usi
             s
         }
         Shard::ExpertCols => {
-            // on disk the column count is inter/2 (fp4 packs two values a byte)
+            // The on-disk column count is inter/2 for the fp4 weight (two values
+            // per byte) but inter/32 for its ue8m0 scale (one byte per 32 values).
+            // Both must be padded to the SAME logical K, because the mxf4 kernel
+            // indexes the scale as `sc[row * (k/32) + kblock]` — a scale row that
+            // is not exactly k/32 wide makes every row past the first read from
+            // the wrong offset. Using the fp4 formula for the scale (as this did)
+            // gave a 32-wide row where the kernel expects 10, which is exactly why
+            // the routed down projection came out short while gate/up (whose
+            // ExpertRows split only slices rows) stayed correct.
+            let is_scale = spec.name.ends_with(".scale");
             let packed = s[1] / world;
-            let logical = packed * 2;
-            let padded = padded_inter(logical) / 2;
+            let logical = if is_scale { packed * 32 } else { packed * 2 };
+            let padded = if is_scale {
+                padded_inter(logical) / 32
+            } else {
+                padded_inter(logical) / 2
+            };
             s[1] = padded.max(packed);
             s
         }
