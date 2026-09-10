@@ -1074,3 +1074,23 @@ dry-run 返回与 capture 分支（2779）之间崩溃（err 900 / 池 miss）�
 
 **2 组 × TP=4 方案的前提修正**：必须**先让 8 请求真正并发**（否则走 per-seq 单序列链，
 吞吐 121 tok/s 毫无意义）。可能需要 `FERRITE_FORCE_BATCHED_B1` 或调整 admission。
+
+## 2026-09-10 终局：cudaMallocAsync 修复消除 TP=4 崩溃，但卡在 capture 前
+
+**实施（efc75c2）**：`DevBuf::alloc` 的池 miss 分支改为——若 `is_capturing()` 为真，
+用 `cudaMallocAsync(ptr, size, stream)`（**图内合法**，从 stream 内存池取）+ `immortal=true`；
+否则保持 `cudaMalloc`。这是**根本修复**：per-seq capture 的分配序列含**动态尺寸类**
+（DSA t_count 派生，如 len=422），固定预热列表无法覆盖。
+
+**实测（TP=4/B=8）**：**faults=0（崩溃消除！）**、dry-run 完成 45 层（`cap=false L44`）、
+`[mega-timing] 45L: attn=32.5 ffn=40.1 head=0.38` 打印——**但之后无 `cap=true`、无 decode**。
+
+**当前卡点**：dry-run 返回后、capture 进入前（`_guard` = `capture_lock().lock()` 处）。
+4 个 rank 串行 capture，可能锁争用或 `cudaMallocAsync` 的异步语义与 capture 交互。
+
+**下会话排查**：① 在 `_guard` 前后各加 eprintln（确定是等锁还是别处）② 检查
+cudaMallocAsync 是否需要在 `graph_capture_begin()` 前做一次 stream sync（异步分配的
+可见性）③ 若锁争用，改 per-rank 锁或去掉串行化（历史 SIGSEGV 风险需重估）。
+
+**重要**：该修复对 TP=8 无害（TP=8 的池已预热，走不到该分支；且 `immortal=true` 只在
+capture 内触发）。
