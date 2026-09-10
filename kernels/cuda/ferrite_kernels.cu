@@ -2029,10 +2029,11 @@ __global__ void hc_pre_fuse_kernel(
     const int tid = threadIdx.x;
     const int warp = tid >> 5, lane = tid & 31;
     const int nh = n * h;
-    extern __shared__ float smem[];
-    float* s_mx = smem;            // [mix + 1]
-    float* s_li = smem + mix + 2;  // [h] li_raw staging
-    float* s_red = s_li + h;       // [16]
+    const int h4 = h >> 2;
+    extern __shared__ float hc_smem[];
+    float* s_mx = hc_smem;            // [mix + 2]
+    float* s_li = hc_smem + mix + 2;  // [h] li_raw staging
+    float* s_red = s_li + h;          // [16]
     // ---- phase 1: reduce the mix partials (all threads) ----
     if (tid < mix) {
         float acc = 0.f;
@@ -2092,7 +2093,6 @@ __global__ void hc_pre_fuse_kernel(
             if (i < n) pre[i] = 1.0f / (1.0f + __expf(-(s_mx[i] * inv_rms * scale[0] + base[i]))) + hc_eps;
         const int nth = blockDim.x - 32;      // li-phase threads (warps 1..)
         const int my = tid - 32;
-        const int h4 = h >> 2;
         float sq = 0.f;
         for (int c4 = my; c4 < h4; c4 += nth) {
             float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
