@@ -282,24 +282,6 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     }
 }
 
-extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n, int k,
-                               cudaStream_t s) {
-    if (n <= 0 || k <= 0) return (int)cudaSuccess;
-    unsigned blocks = (unsigned)((n + 7) / 8);
-    if (blocks > 4096) blocks = 4096;
-    gemv_bf16_kernel<<<blocks, 256, 0, s>>>((const __nv_bfloat16*)w, x, out, n, k);
-    return (int)cudaGetLastError();
-}
-
-extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n, int k,
-                              cudaStream_t s) {
-    if (n <= 0 || k <= 0) return (int)cudaSuccess;
-    unsigned blocks = (unsigned)((n + 7) / 8);
-    if (blocks > 4096) blocks = 4096;
-    gemv_f32_kernel<<<blocks, 256, 0, s>>>(w, x, out, n, k);
-    return (int)cudaGetLastError();
-}
-
 // Publish this rank's payload into EVERY rank's staging slot (including our own)
 // directly from the device. The old path issued `world` host-side peer copies per
 // collective — ~8 API calls per all-reduce, ~16 per layer — with the host in the
@@ -417,3 +399,22 @@ extern "C" int dsv41_ar_store(const unsigned long long* peer_slots, int world, i
     ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f);
     return (int)cudaGetLastError();
 }
+
+extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n, int k,
+                               cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 7) / 8);
+    if (blocks > 4096) blocks = 4096;
+    gemv_bf16_kernel<<<blocks, 256, 0, s>>>((const __nv_bfloat16*)w, x, out, n, k);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n, int k,
+                              cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 7) / 8);
+    if (blocks > 4096) blocks = 4096;
+    gemv_f32_kernel<<<blocks, 256, 0, s>>>(w, x, out, n, k);
+    return (int)cudaGetLastError();
+}
+
