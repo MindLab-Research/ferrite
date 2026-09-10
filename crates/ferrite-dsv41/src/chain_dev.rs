@@ -496,7 +496,9 @@ impl<'a> DevChain<'a> {
                 self.engram_apply(layer, li)?;
             }
             premix = self.layer(layer, pos, &premix)?;
-            if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false) && layer % 5 == 0 {
+            if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false)
+                && layer % std::env::var("DSV41_STATS_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(5) == 0
+            {
                 self.stats(&format!("L{layer} h"), &self.s.h, hc * dim)?;
             }
         }
