@@ -2785,10 +2785,12 @@ fn mega_chain_dev(
         ferrite_kernel::cuda::set_batch_decode(true);
     }
     if capture {
-        // cudaMallocAsync (the capture-legal pool fallback) enqueues ASYNC
-        // work on this stream; make it visible before the capture begins,
-        // otherwise cuStreamBeginCapture can stall (TP=4 measured).
-        let _ = cuda.sync();
+        // ENV-GATED (2026-09-10): this sync was added for the cudaMallocAsync
+        // fallback but measured a TP=8 baseline REGRESSION (err 900) — keep it
+        // opt-in until that is understood.
+        if std::env::var_os("FERRITE_CAPTURE_SYNC").is_some() {
+            let _ = cuda.sync();
+        }
         cuda.graph_capture_begin();
     }
 
