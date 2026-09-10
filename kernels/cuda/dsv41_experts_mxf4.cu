@@ -647,8 +647,7 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, cta, 0, s>>>(
             a_f32, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode, limit,
-            row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base,
-            bhs_stride, ids, slot);
+            row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
@@ -710,6 +709,18 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
                                         const int* ids, int slot, cudaStream_t s) {
     if (rows <= 0 || n_total <= 0 || k <= 0) return cudaSuccess;
     if (k % kAtomK != 0) return cudaErrorInvalidValue;
+    // M=1 (decode): the tcgen05 tile is M=128 by hardware, so the tensor-core path
+    // is 128x redundant and its grid collapses to a handful of blocks. The GEMV is
+    // bandwidth-bound with one warp per output row. (Same dispatch as launch_mxf4.)
+    if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
+        const int warps = 8;
+        const int blocks = (n_total + warps - 1) / warps;
+        expert_gemv_fp4_kernel<<<blocks, warps * 32, 0, s>>>(
+            a_f32, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split, epi_mode, limit,
+            row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base,
+            bhs_stride, ids, slot);
+        return cudaGetLastError();
+    }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
                     (unsigned)((rows + kMTile - 1) / kMTile));
     if (aq)
