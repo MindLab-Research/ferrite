@@ -41,6 +41,7 @@ struct Cudart {
     enable_peer: unsafe extern "C" fn(c_int, c_uint) -> c_int,
     memcpy_peer_async: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, CuStream) -> c_int,
     memcpy_2d_async: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int, CuStream) -> c_int,
+    memcpy_2d: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int) -> c_int,
     mem_info: unsafe extern "C" fn(*mut usize, *mut usize) -> c_int,
     memcpy_peer: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> c_int,
 }
@@ -293,6 +294,7 @@ impl Device {
                 enable_peer: f!(h_cudart, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h_cudart, "cudaMemcpyPeerAsync"),
                 memcpy_2d_async: f!(h_cudart, "cudaMemcpy2DAsync"),
+                memcpy_2d: f!(h_cudart, "cudaMemcpy2D"),
                 mem_info: f!(h_cudart, "cudaMemGetInfo"),
                 memcpy_peer: f!(h_cudart, "cudaMemcpyPeer"),
             };
@@ -439,6 +441,7 @@ impl Device {
                 enable_peer: f!(h, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h, "cudaMemcpyPeerAsync"),
                 memcpy_2d_async: f!(h, "cudaMemcpy2DAsync"),
+                memcpy_2d: f!(h, "cudaMemcpy2D"),
                 mem_info: f!(h, "cudaMemGetInfo"),
                 memcpy_peer: f!(h, "cudaMemcpyPeer"),
             })
@@ -644,19 +647,14 @@ impl Device {
         width: usize,
         height: usize,
     ) -> Result<()> {
+        // SYNCHRONOUS: the async form returns before the copy runs, so a fault
+        // inside it only surfaces at some later call — where it reappears as a
+        // misleading "out of memory" on the next cudaMalloc (a sticky context
+        // error). Synchronous reports the real failure, with the real sizes.
         let st = unsafe {
-            (self.cudart.memcpy_2d_async)(
-                dst,
-                dpitch,
-                src,
-                spitch,
-                width,
-                height,
-                CUDA_MEMCPY_H2D,
-                self.stream,
-            )
+            (self.cudart.memcpy_2d)(dst, dpitch, src, spitch, width, height, CUDA_MEMCPY_H2D)
         };
-        check_cudart(st, &self.cudart, "cudaMemcpy2DAsync H2D")
+        check_cudart(st, &self.cudart, "cudaMemcpy2D H2D")
     }
 
     /// Zero `bytes` at `ptr` (used to lay the padding down before the DMA
