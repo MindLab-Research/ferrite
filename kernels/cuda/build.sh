@@ -17,7 +17,7 @@ NVCC="${NVCC:-nvcc}"
 # (2026-09-10: enforced-by-default measured a ~2x replay regression —
 # 27.99ms vs 13.40ms at full 2032 MHz clock, i.e. not thermal/power).
 FAST_MATH_FLAG=""
-[ -n "$FERRITE_FAST_MATH" ] && FAST_MATH_FLAG="--use_fast_math"
+if [ -n "${FERRITE_FAST_MATH:-}" ]; then FAST_MATH_FLAG="--use_fast_math"; fi
 "$NVCC" -O3 -shared -Xcompiler -fPIC $FAST_MATH_FLAG \
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
