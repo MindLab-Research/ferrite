@@ -60,6 +60,39 @@ GDN recurrence on top.
    compatible with the in-order layer walk but forbids layer-level parallelism
    across a source boundary.
 
+## The M-dimension problem on Blackwell (decides the fp4 route)
+
+Blackwell's 5th-gen tensor core instruction (`tcgen05.mma`) is **CTA-level**:
+one thread issues an M=64 or M=128 operation whose accumulator lives in tensor
+memory. A decode step computes with m = 16 rows (16 sequences, one token each),
+and inside the MoE each *expert* sees only ~1.2 rows on average (96 assignments
+over ~85 distinct experts). So:
+
+* the fp8 `mma.sync.m16n8k32` path (warp-level, m16) is a **good fit** for this
+  workload and is what the dense GEMMs use;
+* the only native fp4 path on this part is the CTA-level `tcgen05 kind::mxf4`,
+  which would pad m=1.2-per-expert up to M=64/128 — i.e. **~50x wasted rows**.
+
+The two fp4 options therefore trade against each other:
+
+| route | weight bytes | M utilisation |
+|---|---|---|
+| native MXFP4 `tcgen05` | 0.5 B/param (fp4) | M=64/128 vs m≈1-8 → heavily padded |
+| lossless fp4→e4m3 + `mma.sync` fp8 | 1.0 B/param | m16n8k32 matches m=16 exactly |
+
+Because the two effects are of the same order (2x bytes either way, roughly),
+**which one wins is a measurement question, not a design axiom** — and the
+answer may differ between decode (m=16) and prefill (m large, where tcgen05's
+M=128 amortises). Two consequences:
+
+1. The `tcgen05` grouped GEMM is only worth building with the **grouped/masked
+   organisation** (sort assignments by expert, run M=128 tiles that span several
+   experts with a masked row count), i.e. the DeepGEMM `m_grouped_gemm_nt_masked`
+   shape — not a per-expert launch.
+2. Until that measurement exists, the lossless e4m3 + fp8 path is the
+   *honest default*: correct, tensor-core, no dequantisation, one code path, and
+   exactly what the checkpoint's own converter produces.
+
 ## What is *not* worth optimising first
 
 * The attention math: one KV head, a 128-slot window and 512 compressed

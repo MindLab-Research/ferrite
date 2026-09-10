@@ -767,6 +767,16 @@ extern "C" int dsv41_moe_route(const float* x, const uint8_t* gate_w, const uint
 //      accumulator back with tcgen05.ld and apply the per-row routing weight.
 //   5. Keep the pipeline fed: 4-8 k-stages, cta_group::1 to start.
 //
+// IMPORTANT — the organisation matters more than the plumbing. tcgen05 is a
+// CTA-level op (M=64/128), while a decode step has m=16 rows in total and each
+// expert sees ~1.2 of them. A per-expert launch would pad m=1.2 up to M=64/128
+// (~50x wasted rows), so this must be a GROUPED GEMM: sort the (token, slot)
+// assignments by expert, then run M=128 tiles that span several experts with a
+// masked valid-row count (the DeepGEMM m_grouped_gemm_nt_masked shape). See
+// crates/ferrite-dsv41/PERF.md — at m=16 the lossless-e4m3+fp8 route and the
+// MXFP4 route trade ~2x bytes against M-padding waste, so this needs a
+// measurement before it displaces the fallback.
+//
 // The entry points dsv41_expert_gate_up_fp4 / dsv41_expert_down_fp4 are the ABI
 // for this and currently return cudaErrorNotSupported, so a caller can never
 // silently receive a non-native path. Until this lands, the lossless fp4 -> e4m3
