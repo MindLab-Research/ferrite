@@ -14,7 +14,7 @@
 //! they are ~189 GiB and the engram write-back is still a separate increment, so
 //! loading them would only add minutes to a run that cannot use them yet.
 
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use ferrite_dsv41::chain_dev::{DevChain, RunOpts};
 use ferrite_dsv41::tp::{self, Collective};
@@ -259,7 +259,7 @@ fn run_tp(
         cfg.hc_mult * cfg.dim,
         cfg.vocab_size
     );
-    let barrier = Arc::new(Barrier::new(world));
+    let barrier = Arc::new(ferrite_dsv41::tp::SpinBarrier::new(world));
     let t_small = Arc::new(Mutex::new(vec![0u64; world]));
     let t_big = Arc::new(Mutex::new(vec![0u64; world]));
     let dir = dir.to_string();
@@ -302,7 +302,7 @@ fn rank_body(
     rank: usize,
     max_tokens: usize,
     eos: Option<u32>,
-    barrier: &Arc<Barrier>,
+    barrier: &Arc<ferrite_dsv41::tp::SpinBarrier>,
     t_small: &Arc<Mutex<Vec<u64>>>,
     t_big: &Arc<Mutex<Vec<u64>>>,
     t0: std::time::Instant,

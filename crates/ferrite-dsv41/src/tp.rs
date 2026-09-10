@@ -17,7 +17,51 @@
 //! The reduction sums the slots in **rank order**, identically on every rank, so
 //! the result is bit-identical across ranks and reproducible run to run.
 
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+/// Spin barrier. `std::sync::Barrier` parks and unparks threads through the
+/// futex, which costs microseconds and, worse, an unbounded wakeup latency: with
+/// ~3 waits per all-reduce and ~90 all-reduces per step that alone can dominate
+/// the step. The ranks are a handful of threads on the same machine, so a
+/// generation-counting spin is both correct and far cheaper.
+pub struct SpinBarrier {
+    n: usize,
+    count: AtomicUsize,
+    gen: AtomicUsize,
+}
+
+impl SpinBarrier {
+    pub fn new(n: usize) -> Self {
+        Self {
+            n,
+            count: AtomicUsize::new(0),
+            gen: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn wait(&self) {
+        if self.n <= 1 {
+            return;
+        }
+        let g = self.gen.load(Ordering::Acquire);
+        if self.count.fetch_add(1, Ordering::AcqRel) + 1 == self.n {
+            // last in: reset the count before releasing the others
+            self.count.store(0, Ordering::Release);
+            self.gen.fetch_add(1, Ordering::Release);
+        } else {
+            let mut spins = 0u32;
+            while self.gen.load(Ordering::Acquire) == g {
+                spins += 1;
+                if spins < 4096 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+    }
+}
 
 use ferrite_types::{FerriteError, Result};
 
@@ -31,7 +75,7 @@ pub struct Collective {
     staging: DevBuf,
     /// Base address of each rank's staging buffer, indexed by rank.
     peers: Vec<u64>,
-    barrier: Arc<Barrier>,
+    barrier: Arc<SpinBarrier>,
     dev: Arc<Device>,
 }
 
@@ -44,7 +88,7 @@ impl Collective {
         world: usize,
         rank: usize,
         bytes: usize,
-        barrier: Arc<Barrier>,
+        barrier: Arc<SpinBarrier>,
     ) -> Result<Self> {
         let depth = bytes * std::mem::size_of::<f32>() / 4;
         let staging = dev.alloc(world * bytes)?;
@@ -143,7 +187,7 @@ impl Collective {
 
 /// Shared state a rank thread needs from its siblings.
 pub struct RankLinks {
-    pub barrier: Arc<Barrier>,
+    pub barrier: Arc<SpinBarrier>,
     /// Filled by each rank at startup: `peers[rank] = staging base address`.
     pub peers_small: Vec<u64>,
     pub peers_big: Vec<u64>,
@@ -152,7 +196,7 @@ pub struct RankLinks {
 impl RankLinks {
     pub fn new(world: usize) -> Self {
         RankLinks {
-            barrier: Arc::new(Barrier::new(world)),
+            barrier: Arc::new(SpinBarrier::new(world)),
             peers_small: vec![0; world],
             peers_big: vec![0; world],
         }
@@ -201,7 +245,7 @@ pub fn exchange(
     big: u64,
     table_small: &std::sync::Mutex<Vec<u64>>,
     table_big: &std::sync::Mutex<Vec<u64>>,
-    barrier: &Arc<Barrier>,
+    barrier: &Arc<SpinBarrier>,
 ) -> (Vec<u64>, Vec<u64>) {
     {
         let mut t = table_small.lock().unwrap();
