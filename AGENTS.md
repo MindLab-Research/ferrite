@@ -1608,3 +1608,13 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 | hc big-fuse（单 kernel，寄存器驻留，sinkhorn 内联） | −0.5~0.7ms | SGLang mhc_pre_big_fuse_tilelang 默认 ON |
 | fp8 KV 格式统一（修 root cause #4） | −0.15~0.25ms | SGLang quant_k_cache |
 | **合计** | **−1.45~1.95ms → 9.1-9.6ms ≈ 1670-1760** | |
+
+## 2026-09-10 TP4 图化复测：仍崩（9edc30b race 修复不充分）
+
+TP=4/B=8 图化模式（GPU 0-3，race 修复 9edc30b 之后首次复测）：serve 起来了（31s），cap=8（部分图捕获成功）但 **err900=65、faults=2、0 token**——第一个请求的 decode 就崩。结论：set_batch_decode race 只是 TP4 池 miss 的原因之一，仍有未定位的尺寸类预热缺口（FERRITE_POOL_MISS=1 可定位）。**"2组方案"（2×TP4）依然被阻塞**；SGLang 的 tp4 优势之一正是他们没有这个问题。
+
+**当前行动优先级不变**（下会话）：
+1. down per-token-group W8A8 MMA（−0.8~1.0ms，SGLang 已验证数值方案）
+2. hc big-fuse 单 kernel（−0.5~0.7ms）
+3. fp8 KV 格式修复（−0.15~0.25ms）
+（可选）TP4 池 miss 定位 → 解锁 2组方案
