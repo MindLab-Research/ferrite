@@ -6652,10 +6652,23 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     // [p4 partials: s*NB][rest345 ctr: s] — Rust allocates
     // s*(mix*8 + 8 + 1 + n + 17) floats.
     const int NB = HC_P345_NB;
-    float* pre_s_g = mx_scratch + (size_t)s * mix * HC_MIX_KS + (size_t)s * HC_MIX_KS + s;
+    // FERRITE_HC_MIX_KS: runtime K-split for the mix GEMV (default HC_MIX_KS
+    // = 16). Lower KS => fewer blocks (fewer reductions/barriers), more work
+    // per thread, and less fw re-read traffic (fw is re-read once per token
+    // stream: KS=16 costs 16x1.5MB=24MB of the 30MB a call moves). The
+    // scratch below is sized for HC_MIX_KS, so KS is capped at it.
+    static int mix_ks_env = -1;
+    if (mix_ks_env < 0) {
+        const char* e = getenv("FERRITE_HC_MIX_KS");
+        mix_ks_env = e ? atoi(e) : HC_MIX_KS;
+        if (mix_ks_env < 1) mix_ks_env = 1;
+        if (mix_ks_env > HC_MIX_KS) mix_ks_env = HC_MIX_KS;
+    }
+    const int KS = mix_ks_env;
+    float* pre_s_g = mx_scratch + (size_t)s * mix * KS + (size_t)s * KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
-    dim3 mix_grid(s, (mix + 3) / 4, HC_MIX_KS);
+    dim3 mix_grid(s, (mix + 3) / 4, KS);
     if (ferrite_pdl_enabled()) {
         cudaLaunchConfig_t cfg = {};
         cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
@@ -6686,11 +6699,11 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
         cfg.attrs = attrs; cfg.numAttrs = 1;
         cudaLaunchKernelEx(&cfg, hc_pre_rest345_kernel,
                            res, mx_scratch, scale, base, nw, pre_s_g, post, comb, li,
-                           p4, ctr2, s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
+                           p4, ctr2, s, n, h, mix, KS, rms_eps, hc_eps, iters);
     } else {
         hc_pre_rest345_kernel<<<p345_grid, 256, smem_r, stream>>>(
             res, mx_scratch, scale, base, nw, pre_s_g, post, comb, li,
-            p4, ctr2, s, n, h, mix, HC_MIX_KS, rms_eps, hc_eps, iters);
+            p4, ctr2, s, n, h, mix, KS, rms_eps, hc_eps, iters);
     }
     return cudaGetLastError();
 }
