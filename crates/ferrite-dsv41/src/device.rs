@@ -30,6 +30,7 @@ struct Cudart {
     free: unsafe extern "C" fn(*mut c_void) -> c_int,
     memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_int) -> c_int,
     memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
+    memset_async: Option<unsafe extern "C" fn(*mut c_void, c_int, usize, CuStream) -> c_int>,
     stream_create: unsafe extern "C" fn(*mut CuStream) -> c_int,
     stream_sync: unsafe extern "C" fn(CuStream) -> c_int,
     dev_sync: unsafe extern "C" fn() -> c_int,
@@ -330,6 +331,9 @@ impl Device {
                 free: f!(h_cudart, "cudaFree"),
                 memcpy: f!(h_cudart, "cudaMemcpy"),
                 memset: f!(h_cudart, "cudaMemset"),
+                memset_async: sym(h_cudart, "cudaMemsetAsync")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 stream_create: f!(h_cudart, "cudaStreamCreate"),
                 stream_sync: f!(h_cudart, "cudaStreamSynchronize"),
                 dev_sync: f!(h_cudart, "cudaDeviceSynchronize"),
@@ -498,6 +502,7 @@ impl Device {
                 free: f!(h, "cudaFree"),
                 memcpy: f!(h, "cudaMemcpy"),
                 memset: f!(h, "cudaMemset"),
+                memset_async: None,
                 stream_create: f!(h, "cudaStreamCreate"),
                 stream_sync: f!(h, "cudaStreamSynchronize"),
                 dev_sync: f!(h, "cudaDeviceSynchronize"),
@@ -735,6 +740,15 @@ impl Device {
     /// Zero `bytes` at `ptr` (used to lay the padding down before the DMA
     /// overwrites the real part, so no host-side assembly is needed).
     pub fn zero_at(&self, ptr: *mut c_void, bytes: usize) -> Result<()> {
+        // MUST be the async variant on our own stream: the synchronous cudaMemset
+        // runs on the legacy stream (0), and CUDA forbids a capturing stream from
+        // depending on it — "operation would make the legacy stream depend on a
+        // capturing blocking stream" is exactly the error the MoE segment graph
+        // hit. Stream-ordered is also the correct semantics here anyway.
+        if let Some(f) = self.cudart.memset_async {
+            let st = unsafe { f(ptr, 0, bytes, self.stream) };
+            return check_cudart(st, &self.cudart, "cudaMemsetAsync");
+        }
         let st = unsafe { (self.cudart.memset)(ptr, 0, bytes) };
         check_cudart(st, &self.cudart, "cudaMemset(pad)")
     }
