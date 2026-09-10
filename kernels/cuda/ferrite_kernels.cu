@@ -6410,9 +6410,6 @@ __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
 // in parallel with the is_last block's P5 (no dependency: P5 needs only
 // li_raw + partials, sinkhorn feeds hc_post). Wall clock ≈ max(block0
 // ~13µs, is_last P5 ~7µs) ≈ 13µs vs v1's 67µs chain.
-// TEMP DIAG (remove): env-gated early-return stage so one build can attribute
-// rest345's ~10us by phase without rebuilding per stage. Set FERRITE_HC_STAGE.
-__device__ int g_hc_stage = 0;
 
 __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
                                      const float* __restrict__ mx_in,
@@ -6449,7 +6446,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     __shared__ float red8[8];
     __shared__ int last;
     __shared__ float inv_s;
-    if (g_hc_stage <= 0) return;   // TEMP DIAG: pure launch+retire cost
 
     // P1 (redundant per block, bit-identical): reduce the KS mix partials
     // + rsq. mx_in: [t][mix][ks] partials + Σx² tail [s][mix_ks] at
@@ -6489,7 +6485,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         }
         __syncthreads();
     }
-    if (g_hc_stage <= 1) return;   // TEMP DIAG
     // P2a: sigmoid pre_s (redundant per block — feeds this block's P3 from
     // SMEM). post (b==0 only, global).
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -6497,7 +6492,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         if (b == 0) post[t * n + i] = 2.0f * (1.0f / (1.0f + __expf(-(mx_s[n + i] * scale[1] + base[n + i]))));
     }
     __syncthreads();
-    if (g_hc_stage <= 2) return;   // TEMP DIAG
     // P3: li_raw[col] = Σ_i ps[i]·x[i·h+col] — one column per thread,
     // i-ascending FMA chain (same numeric order as the old in-smem P3).
     float acc = 0.f;
@@ -6528,7 +6522,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         acc = (p0 + p1) + (p2 + p3);
         li[(size_t)t * h + col] = acc;   // li_raw staged in place (P5 overwrites)
     }
-    if (g_hc_stage <= 3) return;   // TEMP DIAG
     // P4: Σli_raw² block partial (warp tree + red8 serial sum)
     float ss = acc * acc;
     for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffff, ss, off);
@@ -6539,7 +6532,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         for (int w = 0; w < 8; w++) if (w < (blockDim.x + 31) >> 5) tot += red8[w];
         p4_part[(size_t)t * NB + b] = tot;
     }
-    if (g_hc_stage <= 4) return;   // TEMP DIAG
     // is_last election (the last block to arrive runs P5 over ALL columns —
     // write visibility: peers' stores → threadfence → atomic).
     __threadfence();
@@ -6547,7 +6539,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     if (threadIdx.x == 0)
         last = (atomicAdd(&ctr[t], 1u) == (unsigned)NB - 1u) ? 1 : 0;
     __syncthreads();
-    if (g_hc_stage <= 5) return;   // TEMP DIAG
     // P2b (block0, warp1 lanes 0..15 — v4): the v3 4-thread+__syncthreads
     // sinkhorn was ~6µs (41 block-wide barriers); n*n=16 elements fit ONE
     // warp's registers — all row/col reductions are __shfl_xor butterflies
@@ -6611,7 +6602,6 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
         ctr[t] = 0u;   // reset for the next launch (stream/graph ordered)
     }
     __syncthreads();
-    if (g_hc_stage <= 6) return;   // TEMP DIAG
     const float inv = inv_s;
     // 2026-09-10 (stage bisection): this loop measured 3104ns — it runs on
     // the is_last block ONLY (16 blocks machine-wide after every other block
@@ -6662,16 +6652,6 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     // [p4 partials: s*NB][rest345 ctr: s] — Rust allocates
     // s*(mix*8 + 8 + 1 + n + 17) floats.
     const int NB = HC_P345_NB;
-    // TEMP DIAG (remove): FERRITE_HC_STAGE=N makes rest345 return right after
-    // phase N (1=P1, 2=+P2a, 3=+P3, 4=+P4, 5=+election, 6=+inv-reduce). One
-    // build, free sweeps — /tmp/ncu_kern hc + nsys per stage.
-    static int hc_stage_env = -999999;
-    if (hc_stage_env == -999999) {
-        const char* e = getenv("FERRITE_HC_STAGE");
-        hc_stage_env = e ? atoi(e) : 0;
-        int v = hc_stage_env;
-        cudaMemcpyToSymbol(g_hc_stage, &v, sizeof(int));
-    }
     float* pre_s_g = mx_scratch + (size_t)s * mix * HC_MIX_KS + (size_t)s * HC_MIX_KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
