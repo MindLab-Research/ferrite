@@ -126,6 +126,9 @@ struct Kernels {
     ) -> c_int,
     add_inplace: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, CuStream) -> c_int>,
     hc_collapse: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int>,
+    compressor_pool: Option<
+        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut c_int, c_int, c_int, c_int, c_int, c_int, f32, CuStream) -> c_int,
+    >,
     route_topk: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream) -> c_int,
     >,
@@ -299,6 +302,7 @@ impl Device {
                 add_inplace: sym(h_k, "ferrite_add").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 route_topk: sym(h_k, "dsv41_route_topk").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                compressor_pool: sym(h_k, "dsv41_compressor_pool").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 engram_apply: sym(h_k, "dsv41_engram_apply").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 swiglu_limit: sym(h_k, "dsv41_swiglu_limit").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gather_rows: sym(h_k, "dsv41_gather_rows").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -895,6 +899,34 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_route_topk")
+    }
+
+    /// Compressor pooling half (bf16 projections are done by the caller).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_pool(
+        &self,
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latents: *mut f32,
+        out_rows: *mut i32,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        start_pos: i32,
+        eps: f32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.compressor_pool, "dsv41_compressor_pool")?;
+        let rc = unsafe {
+            f(
+                kvp, scp, norm_w, state_kv, state_score, latents, out_rows, b, seqlen, head_dim,
+                ratio, start_pos, eps, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_compressor_pool")
     }
 
     // --------------------------------------------------- glue op wrappers

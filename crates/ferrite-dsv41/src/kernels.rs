@@ -351,6 +351,28 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// Compressor, pooling half only: the projections run on the bf16
+    /// tensor-core path (the checkpoint stores them bf16), so this entry takes
+    /// their outputs and does the state carry, the gated pool, the RMSNorm and
+    /// the out_rows decision. `out_rows` is a DEVICE pointer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_compressor_pool(
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latents: *mut f32,
+        out_rows: *mut i32,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        start_pos: i32,
+        eps: f32,
+        stream: CuStream,
+    ) -> i32;
+
     /// MoE routing from pre-computed gate scores (the checkpoint's gate is
     /// bf16, so the gate GEMM is a separate bf16 GEMM). Selection uses
     /// `act(score) + bias`; the weights come from the unbiased `act(score)`,

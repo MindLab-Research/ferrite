@@ -934,6 +934,51 @@ static void compressor_free(void* p, cudaStream_t s) {
     }
 }
 
+// Compressor, pooling half only.
+//
+// The checkpoint stores the compressor's `wkv`/`wgate` in **bf16** (the release
+// promotes them to fp32 at runtime for the pooling), so the projections run on
+// the bf16 tensor-core path — cuBLAS from the chain — and this entry takes their
+// outputs. It mirrors exactly the second half of `dsv41_compressor`: the state
+// carry, the gated pool, the RMSNorm and the out_rows decision.
+//
+// `kvp`/`scp` are [rows, head_dim]; `out_rows` is a DEVICE pointer (a host
+// pointer here is a device store to host memory — the trap the first draft of
+// the chain fell into).
+extern "C" int dsv41_compressor_pool(const float* kvp, const float* scp, const float* norm_w,
+                                     float* state_kv, float* state_score, float* latents,
+                                     int* out_rows, int b, int seqlen, int head_dim, int ratio,
+                                     int start_pos, float eps, cudaStream_t s) {
+    if (b <= 0 || seqlen <= 0 || head_dim <= 0 || ratio <= 0) return (int)cudaErrorInvalidValue;
+    if (ratio > 1) {
+        const size_t work = start_pos == 0 ? (size_t)b * (seqlen % ratio) * head_dim
+                                           : (size_t)b * head_dim;
+        const int blocks = (int)((work + 255) / 256);
+        if (work > 0)
+            compressor_state_kernel<<<(blocks > 0 ? blocks : 1), 256, 0, s>>>(
+                kvp, scp, state_kv, state_score, b, seqlen, head_dim, ratio, start_pos);
+    }
+    int mode, grid_n, out_rows_val;
+    if (ratio == 1) {
+        mode = 0;
+        grid_n = seqlen;
+        out_rows_val = seqlen;
+    } else if (start_pos == 0) {
+        mode = 1;
+        grid_n = b * (seqlen / ratio);
+        out_rows_val = seqlen / ratio;
+    } else {
+        mode = 2;
+        grid_n = b;
+        out_rows_val = ((start_pos + 1) % ratio == 0) ? 1 : 0;
+    }
+    const unsigned launch = (unsigned)(grid_n > 0 ? grid_n : 1);
+    compressor_pool_kernel<<<launch, 128, 0, s>>>(kvp, scp, norm_w, state_kv, state_score, latents,
+                                                  out_rows, mode, grid_n, out_rows_val, b, seqlen,
+                                                  head_dim, ratio, start_pos, eps);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_t* wkv_scale,
                                 const uint8_t* wgate, const uint8_t* wgate_scale,
                                 const float* norm_w, float* state_kv, float* state_score,

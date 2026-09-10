@@ -99,6 +99,17 @@ Two process lessons, both re-learned the hard way:
 
 ## Compressor / indexer — ground truth for wiring them up
 
+**⚠️ Blocker found at the wiring step:** `dsv41_compressor`'s ABI takes fp8
+weight pointers (`const uint8_t* wkv, const uint8_t* wkv_scale, ...`), but the
+checkpoint's compressor weights are **BF16** and the reference runs the pooling
+in **fp32**. The kernel as written cannot consume them. Two ways forward, both
+small: (a) give `compressor_pool_kernel`/`compressor_state_kernel` a bf16 entry
+(the state carry and the pooling themselves are dtype-agnostic — `k` is fp32 in
+the state buffers already), or (b) keep the kernel for the GEMM-free part and
+feed it activations computed by two `lin_bf16` calls in the chain. Do not "fix"
+this by quantising the bf16 weights to fp8 — that is both lossy and contrary to
+the standing rule that quantisation formats come from the checkpoint.
+
 Established against the checkpoint and the reference's `Compressor`:
 
 * **Compressor tensors exist only on the kv sources 🌐 `[2,8,14,20]`**; indexer
