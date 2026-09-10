@@ -155,19 +155,19 @@ pub struct Dsv41DevWeights {
 }
 
 /// Reads a checkpoint shard-by-shard on demand, uploading the rank's slice.
-pub struct Loader {
+pub struct Loader<'a> {
     dir: PathBuf,
     /// tensor name -> shard file
     index: HashMap<String, String>,
     /// shard file -> header
     headers: HashMap<String, SafetensorsIndex>,
-    dev: Device,
+    dev: &'a Device,
     /// bytes uploaded so far (for the report)
     pub uploaded: u64,
 }
 
-impl Loader {
-    pub fn new(dir: &Path, dev: Device) -> Result<Self> {
+impl<'a> Loader<'a> {
+    pub fn new(dir: &Path, dev: &'a Device) -> Result<Self> {
         let idx_path = dir.join("model.safetensors.index.json");
         let txt = std::fs::read_to_string(&idx_path).map_err(|e| {
             FerriteError::Config(format!("read {}: {e}", idx_path.display()))

@@ -66,7 +66,7 @@ fn fp8_gemm_on_real_checkpoint_matches_cpu_reference() {
     );
 
     // ---- load through the crate's own loader (exercises slicing + upload) ----
-    let mut loader = Loader::new(&dir, dev).expect("loader");
+    let mut loader = Loader::new(&dir, &dev).expect("loader");
     let spec_w = TensorSpec { name: name_w.into(), shape: shp_w.clone(), shard: Shard::Replicated };
     let s = tensor_specs_probe(&cfg, &spec_w, world, rank);
     assert_eq!(s, shp_w, "identity slice must be the whole tensor");
