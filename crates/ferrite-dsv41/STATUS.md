@@ -1226,3 +1226,31 @@ launch ✗ ⇒ **每次专家 launch ≈ 106µs** ✗✗（正常 CUDA launch �
 | **hc_mixes 投影并行化（正确 ✓）** | **3.7** | **272** |
 
 **下一步（唯一路径）**：设备侧分组 MoE → 再整层图化 ✓。两者都做之前，吞吐不会量级跃升 ✓。
+
+## nsys 完整内核清单（DSV41_LAYERS=2 跑，`cuda_gpu_kern_sum`）
+
+| time% | total | calls | avg/call | kernel | 备注 |
+|---|---|---|---|---|---|
+| 51.4 | 305.8ms | 288 | **1061µs** ✗ | `hc_mixes_kernel` | **已修** ✓（一 warp 一行 + shuffle 归约）|
+| 14.1 | 83.6ms | 864 | 96.8µs | `mxf4_gemm_kernel<0>` | 专家 gate/up/down |
+| 10.9 | 64.5ms | 846 | 76.3µs | `gemm_fp8_kernel` | fp8 投影 / shared expert |
+| 6.8 | 40.4ms | 2232 | 18.1µs | `bf16_to_f32_kernel` | 权重加宽（**加载期一次性** ✓）|
+| 4.8 | 28.5ms | 72 | **395.9µs** ✗✗ | `gemv2T_kernel` | **cuBLAS 的 M=1 GEMV，396µs/次** ✗ |
+| 3.2 | 18.8ms | 864 | 21.8µs | `mxf4_gemm_kernel<1>` | 同上 |
+| 2.7 | 16.2ms | **16** | **1009.8µs** ✗✗ | `rope_precompute_kernel` | **每步重算整张 RoPE 表（1ms/次）** ✗ |
+| 2.7 | 15.9ms | 360 | 44.1µs | `ar_reduce_kernel` | 我新加的自旋归约 ✓ |
+| 0.5 | 3.2ms | 144 | 22.2µs | `sparse_attn_kernel` | |
+
+单实例数还显示：`quant_kernel` 828、`add_kernel` 882、`swiglu_limit_kernel` 882、
+`fp4_pack_kernel` 864 ✗ —— 都是**逐专家**的小内核 ✓；总实例 ≈ 8542 ✗ / ~18 个 layer-pass
+⇒ **约 470 次内核发射/层** ✗✗，与"主机发射受限"的结论一致 ✓（cudaLaunchKernel 平均 13µs ✓）。
+
+### 下会话可直接拿的三刀（按代价/收益）
+
+1. **`rope_precompute_kernel` 每步重算** ✗✓（**最省事、最干净**）：16 次调用 × **1009µs** ✗✗ ——
+   RoPE 表只依赖 (seq_len, theta, 参数) ✓，是**静态的** ✗，应当在 chain 构造时算一次 ✓、
+   之后只做 `apply_rope` ✓。预期省 ~2ms/步 ✓。
+2. **`gemv2T_kernel` 396µs/次** ✗✗（72 次 ✓）：这是 cuBLAS 给 M=1 选的 GEMV 内核 ✗ ——
+   M=1 时它极差 ✓。改用自研 GEMV 或让 cuBLAS 走 GemmEx 的 narrow 路径 ✗，预期省 ~0.5ms/步 ✓。
+3. **合并逐专家小内核** ✗（quant/add/swiglu/fp4_pack 各 ~850 次 ✓）→ 直接并入派发内核 ✓，
+   同时把每层约 470 次发射往下压 ✓ —— 这一步与"设备侧分组 MoE"是同一件事 ✓。
