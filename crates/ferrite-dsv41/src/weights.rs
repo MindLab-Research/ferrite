@@ -94,26 +94,31 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         // redundant work). Sharding them properly needs the reference's
         // per-group split, whose rows are strided rather than a contiguous
         // range, so it is a separate change.
-        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Replicated);
+        // ColumnParallel over the attention heads: each rank keeps a contiguous
+        // block of heads, which at tp=8 is exactly one o_groups block — that is
+        // what keeps the head block and wo_a's row block aligned.
+        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Heads);
+        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Heads);
         push(&mut out, format!("{p}.attn.wkv.weight"), vec![hd, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.scale"), vec![hd / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.kv_norm.weight"), vec![hd], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Heads);
         push(
             &mut out,
             format!("{p}.attn.wo_a.weight"),
             vec![groups * ol, hpg * hd],
-            Shard::Replicated,
+            Shard::Groups,
         );
         push(
             &mut out,
             format!("{p}.attn.wo_a.scale"),
             vec![groups * ol / 32, hpg * hd / 32],
-            Shard::Replicated,
+            Shard::Groups,
         );
-        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Replicated);
+        // RowParallel: the input (groups*o_lora) is split, so each rank holds a
+        // partial sum and the chain all-reduces after it.
+        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Cols);
+        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Cols);
         // compressor (only kv sources have one)
         let ratio = cfg.compress_ratio(l);
         if cfg.is_kv_source(l) {
@@ -275,16 +280,21 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         // redundant work). Sharding them properly needs the reference's
         // per-group split, whose rows are strided rather than a contiguous
         // range, so it is a separate change.
-        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Replicated);
+        // ColumnParallel over the attention heads: each rank keeps a contiguous
+        // block of heads, which at tp=8 is exactly one o_groups block — that is
+        // what keeps the head block and wo_a's row block aligned.
+        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Heads);
+        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Heads);
         push(&mut out, format!("{p}.attn.wkv.weight"), vec![hd, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.scale"), vec![hd / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.kv_norm.weight"), vec![hd], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wo_a.weight"), vec![groups * ol, hpg * hd], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wo_a.scale"), vec![groups * ol / 32, hpg * hd / 32], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Heads);
+        push(&mut out, format!("{p}.attn.wo_a.weight"), vec![groups * ol, hpg * hd], Shard::Groups);
+        push(&mut out, format!("{p}.attn.wo_a.scale"), vec![groups * ol / 32, hpg * hd / 32], Shard::Groups);
+        // RowParallel: the input (groups*o_lora) is split, so each rank holds a
+        // partial sum and the chain all-reduces after it.
+        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Cols);
+        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Cols);
         let (n_routed, _) = cfg.moe_config(mtp_layer);
         push(&mut out, format!("{p}.ffn.gate.weight"), vec![n_routed, dim], Shard::Replicated);
         push(&mut out, format!("{p}.ffn.gate.bias"), vec![n_routed], Shard::Replicated);
@@ -650,7 +660,15 @@ mod tests {
         let get = |n: &str| specs.iter().find(|s| s.name == n).unwrap().clone();
         // Dense projections are replicated for now (only the experts, 96% of the
         // bytes, are sharded), so their local shape is the whole tensor.
-        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wq_b.weight"), 8, 0), vec![32768, 1280]);
+        // ColumnParallel over heads: 64/8 heads * 512 dim
+        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wq_b.weight"), 8, 0), vec![4096, 1280]);
+        // ColumnParallel per group: 8192/8 output rows, the group's head slice
+        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wo_a.weight"), 8, 0), vec![1024, 4096]);
+        // RowParallel: the reduction dim (groups*o_lora) is split
+        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wo_b.weight"), 8, 0), vec![5120, 1024]);
+        // per-head sink
+        assert_eq!(local_shape(&cfg, &get("layers.6.attn.attn_sink"), 8, 0), vec![8]);
+        // embed/head still replicated (the vocabulary split needs a gather)
         assert_eq!(local_shape(&cfg, &get("embed.weight"), 8, 0), vec![129280, 5120]);
         // Expert-parallel cuts the `inter` axis: w1/w3 carry it on their rows,
         assert_eq!(

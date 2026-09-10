@@ -515,6 +515,10 @@ impl<'a> DevChain<'a> {
         let hd = cfg.head_dim;
         let nh = cfg.n_heads;
         let ql = cfg.q_lora_rank;
+        let world = self.world();
+        let rank = self.rank();
+        // wq_b is ColumnParallel: this rank owns a contiguous block of heads
+        let nlh = nh / world;
         let ld = &self.w.layers[layer];
 
         // queries: wq_a -> q_norm -> wq_b
@@ -539,7 +543,7 @@ impl<'a> DevChain<'a> {
             ql as i32,
             ld.wq_b.as_ref().unwrap(),
             ld.wq_b_scale.as_ref().unwrap(),
-            (nh * hd) as i32,
+            (nlh * hd) as i32,
             self.s.q.ptr as *mut f32,
         )?;
         // RoPE over the trailing `rope_head_dim` lanes of each head
@@ -547,7 +551,7 @@ impl<'a> DevChain<'a> {
             self.s.q.ptr as *mut f32,
             self.cos.as_f32(),
             self.sin.as_f32(),
-            nh as i32,
+            nlh as i32,
             hd as i32,
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
@@ -669,7 +673,7 @@ impl<'a> DevChain<'a> {
             self.s.o.ptr as *mut f32,
             1,
             1,
-            nh as i32,
+            nlh as i32,
             hd as i32,
             (win + comp_len) as i32,
             n_idx_cols.max(1) as i32,
@@ -679,7 +683,7 @@ impl<'a> DevChain<'a> {
             self.s.o.ptr as *mut f32,
             self.cos.as_f32(),
             self.sin.as_f32(),
-            nh as i32,
+            nlh as i32,
             hd as i32,
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
@@ -693,49 +697,56 @@ impl<'a> DevChain<'a> {
         let groups = cfg.o_groups;
         let hpg = nh / groups;
         let olg = cfg.o_lora_rank / groups;
+        let nlg = groups / world; // wo_a is ColumnParallel: a block of groups each
         let k = hpg * hd;
-        self.quant1(self.s.o.ptr as *const f32, (nh * hd) as i32)?;
-        for g in 0..groups {
+        self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
+        for g in 0..nlg {
+            // the rank's groups are a contiguous block, and its head block maps
+            // onto exactly those groups (a group is hpg heads and olg output rows)
+            let g_glob = rank * nlg + g; // global group this rank block covers
             let a = self.s.xq.as_u8().wrapping_add(g * k);
             let asc = self.s.xsc.as_f32().wrapping_add((g * k / 32) as usize);
+            // weights and the output use GLOBAL group offsets (that is the
+            // layout on disk and the layout the chain's `wo` buffer mirrors)
             let wp = ld
                 .wo_a
                 .as_ref()
                 .unwrap()
                 .as_u8()
-                .wrapping_add(g * olg * k);
+                .wrapping_add(g_glob * olg * k);
             let wsp = ld
                 .wo_a_scale
                 .as_ref()
                 .unwrap()
                 .as_u8()
-                .wrapping_add((g * olg / 32) * (k / 32));
+                .wrapping_add((g_glob * olg / 32) * (k / 32));
             self.dev.gemm_fp8_mx(
                 a,
                 asc,
                 wp,
                 wsp,
                 std::ptr::null(),
-                (self.s.wo.ptr as *mut f32).wrapping_add(g * olg),
+                (self.s.wo.ptr as *mut f32).wrapping_add(g_glob * olg),
                 1,
                 olg as i32,
                 k as i32,
             )?;
         }
+        // wo_b is RowParallel: the input (groups*o_lora) is split, so this rank
+        // reduces over its own slice and the ranks' partial sums are added.
+        let ol_local = cfg.o_lora_rank / world;
         self.lin(
-            self.s.wo.ptr as *const f32,
-            cfg.o_lora_rank as i32,
+            (self.s.wo.ptr as *const f32).wrapping_add(rank * ol_local),
+            ol_local as i32,
             ld.wo_b.as_ref().unwrap(),
             ld.wo_b_scale.as_ref().unwrap(),
             dim as i32,
             self.s.o.ptr as *mut f32,
         )?;
-        // NOTE: in the current TP configuration the dense projections are
-        // replicated (only the experts, 96% of the bytes, are sharded), so this
-        // output is already complete on every rank and must NOT be reduced —
-        // summing it would multiply it by the world size. The reduce belongs
-        // here once wo_b's weights are column-sharded, which needs the
-        // reference's per-group row split.
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            c.end_round();
+        }
         Ok(())
     }
 
