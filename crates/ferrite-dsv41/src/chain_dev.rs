@@ -490,12 +490,21 @@ impl<'a> DevChain<'a> {
                 }
             }
         }
+        let t_step = std::time::Instant::now();
+        let mut t_attn = std::time::Duration::ZERO;
+        let mut t_moe = std::time::Duration::ZERO;
         for layer in 0..cfg.n_layers {
             // the engram writes into the residual stream BEFORE the block runs
             if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
                 self.engram_apply(layer, li)?;
             }
+            let _ta = std::time::Instant::now();
             premix = self.layer(layer, pos, &premix)?;
+            let _el = _ta.elapsed();
+            if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+                let _ = (&mut t_attn, &mut t_moe);
+                eprintln!("[phase] L{layer} layer={:?}", _el);
+            }
             if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false)
                 && layer % std::env::var("DSV41_STATS_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(5) == 0
             {
