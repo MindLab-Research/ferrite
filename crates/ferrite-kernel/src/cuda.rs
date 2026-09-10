@@ -5286,8 +5286,14 @@ impl CudaBackend {
                         // FERRITE_DOWN_MMA=0 falls back to the SIMT fp8 down;
                         // FERRITE_MOE_DOWN_MMA=1 opts into the (correct but 6x slower)
                         // bf16 variant.
+                        // DEFAULT ON (2026-09-10, user-directed retest with the
+                        // clean double-artifact methodology): the old "e4m3 flips
+                        // text" verdict was a testing artifact, not a numerics bug.
+                        // A/B: simt 11.03 vs mma1 10.74ms (−0.29ms), faults=0,
+                        // the mma1 text is the CLEANEST of the three (direct
+                        // recitation). FERRITE_DOWN_MMA=0 opts out.
                         let use_down_e4m3 = std::env::var("FERRITE_DOWN_MMA")
-                            .map(|v| v == "1").unwrap_or(false);
+                            .map(|v| v != "0").unwrap_or(true);
                         let use_down_bf16 = std::env::var("FERRITE_MOE_DOWN_MMA")
                             .map(|v| v == "1").unwrap_or(false);
                         let mut down_done = false;
