@@ -1392,3 +1392,21 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 | 小 kernel 合并（norm/cast/quant ~241 次/步） | −0.3ms | 未实施 |
 | MoE down one-expert-per-block | −0.5ms | 未实施（HTILE 已证明不是入口） |
 | **合计** | **−1.2~1.3ms → 9.7ms ≈ 1650** | **1600 可达** |
+
+## 2026-09-10 会话终态：13.45 → 10.94ms（+23%），1190 → 1464 tok/s
+
+**运行配方**：标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`（AR v5 仍为 opt-in）。
+
+| 改动 | 验证 | commit |
+|---|---|---|
+| rest345 float4 normalize | 隔离 3104→1280ns；serve rest345 12.67→7.26µs | cb25f05 |
+| mix K-split KS=4（旋钮 FERRITE_HC_MIX_KS） | 隔离 14176→10432ns（fw 流量 24→1.5MB/次） | 21997c1 |
+| down HTILE 模板（旋钮 FERRITE_DOWN_HTILE=8/16/32/64，默认 8） | 同会话 A/B 12.88 vs 旧 13.02 | 14162a1 + 9992c71 |
+| **AR v5（FERRITE_P2P_AR5）** | **12.88→10.95ms（AR 29→~8µs），三轮：b16×2 + b16→b2 图切换 + b16×900 长窗口，全绿** | e893428 |
+| rest345 sinkhorn aux block | serve 中性 10.94ms（sinkhorn 本不在关键路径），结构更优保留 | 144d839 |
+
+**会话教训（都已在上文详述）**：① 80 寄存器 → 2 blocks/SM 的占用率陷阱（改 kernel 结构必查 `nvcc -Xptxas -v`）；② 运行时边界循环让 nvcc 放弃展开/外提；③ **跨会话绝对数字不可比**（45 分钟漂移 +0.35ms）——同会话背靠背 A/B 是唯一可信判据，`git show <c>:...cu | nvcc → /tmp/old_lib.so + --lib` 是干净 A/B 的做法；④ nsys capture-range 在本机丢 buffer，用全程 trace + 名字过滤；⑤ 后台启动 serve 必须让 `env` 作为首词（`cd x && env … &` 会产生 kill 不掉的孤儿进程占端口占卡）。
+
+**当前每步分解（AR v5 后的推断）**：AR ~0.7 · MoE down ~2.0 · MoE act 1.89 · hc ~1.3（rest345 7.26µs×90=0.65 + mix ~4µs×90=0.36 + post 0.27）· gdn ~1.06 · 投影+小 kernel ~3.5 · host/间隙 ~0.5。
+
+**通往 1600（还需 −0.94ms）**：act sector 利用率（−0.3）· 小 kernel 合并 norm/cast/quant（−0.3）· down one-expert-per-block（−0.5，最不确定）。三项落地 ≈ 9.85ms ≈ **1624 tok/s**。
