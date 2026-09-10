@@ -1489,3 +1489,13 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **209 次/步 cast 的来源**：`gemm_cublas`（cuda.rs:2036）每次调用都发射独立 `f32_to_bf16` kernel 把 x 转进临时 DevBuf——nvjet 家族 ~218 次/步与 cast 209 次/步一一对应。custom kernel（gemv_bf16/gemm3）不受影响（kernel 内转换）。**消除方案**：①产出方双输出（hc_pre_rest348/rmsnorm/hc_post 同时写 f32+bf16，下游 GEMM 直接吃 bf16）——注意勿走 xb_cache 池化老路（4 次失败，池地址稳定性契约）；②或用自研 GEMM 替换这些 cuBLAS 调用（gemm3 已有模式，直接吃 f32）。预期 −0.2ms。cublasGemmEx 不支持 A=f32×B=bf16 混合（A/B 类型必须一致），该路不通。
 
 **会话终态**：13.45 → **10.94ms（+23%），1464 tok/s**（AR v5 −1.9ms 是最大单项）。剩余 −0.94ms 的三项清单与段融合（第二阶段）设计均已入档。运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。
+
+## 2026-09-10 深夜②：down v14/v15（cp.async 双缓冲 staging）— serve 中性，第三个 down 理论失败
+
+**实测**（三轮背靠背 serve A/B，`git show bfef692:...cu → /tmp/prev14_lib.so + --lib`）：prev14 11.15 / v15 11.16 / prev14b 11.17ms——**完全中性**。隔离基准 −5%（54.1 vs 51.7µs）未转化（隔离的 L2 热条件第三次误导 down）。
+
+**认知更新：down 的 37.6% DRAM 不是 per-warp 延迟暴露**——如果每 warp 裸吃 ~600 周期 DRAM 延迟，D=2 流水线（隐藏一半）应有可测收益。中性 = 延迟已被 27 warps/SM 的跨 warp 隐藏覆盖。v15 保留（中性、结构与 act 同构、72 regs/0 spill、36KB smem 不降占用率）。
+
+**down 的三个已失败理论**：① HTILE（act 重读/局部性）② one-expert 局部性（未实施，被 ③ 取代）③ cp.async 延迟隐藏。**剩余唯一假设：act 对比本身有误导**——act 的 71.9% 可能来自其更高的绝对流量（246MB vs down 132MB，绝对带宽 5.5 vs 2.6TB/s），而 down 的真实约束仍未定位（指令 ~8µs / DRAM 地板 ~22µs / L1 wavefront ~4µs / 实测 50µs——全都不匹配）。**down 优化正式暂停**，除非拿到当前 kernel 的新 ncu 数据（HTILE=8 时代的数据已过时三次）。
+
+**注意**：本轮三轮 serve 均读 11.15-11.17ms（1.5h 前同配置 10.94）——热漂移 +0.21ms。跨时间绝对数字不可比（第三次确认）；目标评估应以同批 A/B 为准。
