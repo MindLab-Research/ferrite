@@ -4908,19 +4908,22 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
                 *reinterpret_cast<uint4*>(saq + j * 512 + lo) =
                     *reinterpret_cast<const uint4*>(aq_t + off);
         }
-        // tail (stride%16 — never on GLM)
-        if (threadIdx.x == 0) {
-            for (int j = 0; j <= topk; j++) {
-                const float p = (j < topk) ? probs[(size_t)t * topk + j] : 1.f;
-                const float s = as_[(size_t)t * (topk + 1) + j];
-                float v = s * p;
-                if (j < topk) {
-                    const int eid = (int)ids_f[(size_t)t * topk + j];
-                    const int local = eid - expert_start;
-                    if (local < 0 || local >= e_local || p == 0.f) v = 0.f;  // skip marker
-                }
-                ssp[j] = v;
+        // Slot metadata: ONE THREAD PER SLOT (was thread 0 reading all 9
+        // serially -> a ~9-deep dependent L2-latency chain on the block's
+        // critical path, with every other warp idling at the barrier). Each
+        // slot's three loads (probs/as_/ids_f) now issue in parallel across
+        // 9 threads = one round trip. Numerically identical.
+        if (threadIdx.x <= (unsigned)topk && threadIdx.x < 9) {
+            const int j = (int)threadIdx.x;
+            const float p = (j < topk) ? probs[(size_t)t * topk + j] : 1.f;
+            const float sc = as_[(size_t)t * (topk + 1) + j];
+            float v = sc * p;
+            if (j < topk) {
+                const int eid = (int)ids_f[(size_t)t * topk + j];
+                const int local = eid - expert_start;
+                if (local < 0 || local >= e_local || p == 0.f) v = 0.f;  // skip marker
             }
+            ssp[j] = v;
         }
         __syncthreads();
     }
@@ -5050,19 +5053,22 @@ __global__ void __launch_bounds__(256, 2) moe_down_e4m3_mma_all_kernel(
                 *reinterpret_cast<uint4*>(saq + j * 512 + lo) =
                     *reinterpret_cast<const uint4*>(aq_t + off);
         }
-        // tail (stride%16 — never on GLM)
-        if (threadIdx.x == 0) {
-            for (int j = 0; j <= topk; j++) {
-                const float p = (j < topk) ? probs[(size_t)t * topk + j] : 1.f;
-                const float s = as_[(size_t)t * (topk + 1) + j];
-                float v = s * p;
-                if (j < topk) {
-                    const int eid = (int)ids_f[(size_t)t * topk + j];
-                    const int local = eid - expert_start;
-                    if (local < 0 || local >= e_local || p == 0.f) v = 0.f;  // skip marker
-                }
-                ssp[j] = v;
+        // Slot metadata: ONE THREAD PER SLOT (was thread 0 reading all 9
+        // serially -> a ~9-deep dependent L2-latency chain on the block's
+        // critical path, with every other warp idling at the barrier). Each
+        // slot's three loads (probs/as_/ids_f) now issue in parallel across
+        // 9 threads = one round trip. Numerically identical.
+        if (threadIdx.x <= (unsigned)topk && threadIdx.x < 9) {
+            const int j = (int)threadIdx.x;
+            const float p = (j < topk) ? probs[(size_t)t * topk + j] : 1.f;
+            const float sc = as_[(size_t)t * (topk + 1) + j];
+            float v = sc * p;
+            if (j < topk) {
+                const int eid = (int)ids_f[(size_t)t * topk + j];
+                const int local = eid - expert_start;
+                if (local < 0 || local >= e_local || p == 0.f) v = 0.f;  // skip marker
             }
+            ssp[j] = v;
         }
         __syncthreads();
     }
