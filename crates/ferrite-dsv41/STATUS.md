@@ -327,12 +327,36 @@ for i, layer in enumerate(self.layers):
         ...                            # n-gram 哈希查表 → 加入残差流
 ```
 
-→ **engram 是架构组件，不是可选附加** ✗。我当前完全跳过它 → **第 1 层的残差流就缺一大块**
-（8 heads × 256 dim = 2048 维的查表值加进 5120 维残差）→ 下游全部系统性偏移 ✓
-—— 这正好解释"响应输入但形同随机/自信地错/复读"的签名 ✓✓。
+→ **engram 是架构组件，不是可选附加** ✗（`h = layer.engram(h, ...)` 直接改写 hc 残差流）。
 
-**因此：在 engram 接入之前，40 层文本不可能连贯**。TODO#10 把它列为"可选/分阶段"是**误判**，
-应提到正确性阻塞项。
+**精确状态（2026-09-11 逐处核实，非推测）**：
+| 位置 | 事实 |
+|---|---|
+| `src/engram.rs` | `TokenMap` / `EngramLayout` / `NgramHashState` **已实现** ✓ |
+| `src/ops.rs` | `ops::engram_forward`（CPU 版门控写回）**已实现** ✓ |
+| `kernels/cuda/dsv41_glue.cu` | `dsv41_engram_apply`（门控写回 kernel）**已实现** ✓ |
+| `kernels/cuda/dsv41_kernels.cu` | `dsv41_engram_hash` / `dsv41_engram_gather` **已实现** ✓ |
+| `src/device.rs` | 三个 FFI wrapper **已实现** ✓ |
+| `src/load.rs:186-191` | `LayerDev` 的 `engram_wkv`/`q_weight`/`k_weight` 字段**存在且已加载** ✓ |
+| **`src/chain_dev.rs` 层循环** | **从不调用 engram** ✗✗（只有 `chain.rs:563-606` 的 CPU 链调 ✓） |
+| **`bin/dsv41-run.rs:103,253`** | `skip_prefixes.push("engram.embed.")` → **189 GiB 表未加载** ✗✗ |
+| `load.rs:236-237` 注释 | 自陈 "skip the 189 GiB engram tables **while the engram write-back is not yet wired**" ✗ |
+
+→ **设备链（tp=8 跑的路径）里第 1/14 层的残差流完全缺 engram 写回** ✓ = 退化根因 ✓✓。
+（CPU 链 `chain.rs` 有 engram 但它的 `row_off = 0` 且注释说"device path all-reduces afterwards"，
+即 CPU 版只是参考实现，设备版本就该另写。）
+
+**接线清单（下会话直接做，零件全在）**：
+1. `dsv41-run.rs` 删掉两处 `skip_prefixes.push("engram.embed.")` → 表按 row-parallel 加载
+   （`Shard::Rows`，`part_rows = ceil(384M/world)` ≈ 24 GB/rank ✓ 275 GB 装得下）
+2. `chain_dev.rs::step()`：host 侧用 `NgramHashState::forward_row(...)` 算本步 token 的
+   24 个 n-gram id → upload → `dev.engram_hash`（或直接用 host 结果）
+3. 层循环里 layer∈{1,14} 时、**在 `self.layer()` 之前**：
+   `dev.engram_gather(table, scale, ids, buf, rows=1, n_cols=24, head_dim=256, part_start, part_rows)`
+   → **跨 rank all-reduce/AR**（只补非本 rank 的行；24 行 × 256 维 = 24 KB，AR 成本可忽略）
+   → `wkv` GEMM（`[6144] × [6144,25600]`，权重已加载 ✓）
+   → `dev.engram_apply(h, kv, q_weight, k_weight, null, 1, hc, dim, eps)`
+4. 验证：`L1 h` 的 rms 应在 engram 后发生变化；出师表/Paris 文本应开始连贯。
 
 ### 下一步（按序）
 
