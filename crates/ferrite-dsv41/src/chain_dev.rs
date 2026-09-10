@@ -877,9 +877,12 @@ impl<'a> DevChain<'a> {
             std::slice::from_raw_parts(lens.as_ptr() as *const f32, 1)
         })?;
         let scale = 1.0f32 / (cfg.head_dim as f32).sqrt() / (idx_nh as f32).sqrt();
+        // keys live on the KV OWNER's buffer (the source layer that published
+        // them); a non-source index layer's own index_k is empty
+        let key_owner = self.kv_owner(layer);
         self.dev.indexer_topk(
             self.s.idx_q.as_f32(),
-            self.layers[layer].index_k.as_f32(),
+            self.layers[key_owner].index_k.as_f32(),
             self.s.idx_w.as_f32(),
             std::ptr::null(),
             self.s.idx_lens.as_i32(),
