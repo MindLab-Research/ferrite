@@ -1659,3 +1659,44 @@ TP=4/B=8 图化模式（GPU 0-3，race 修复 9edc30b 之后首次复测）：se
 **down 至此 6 个理论全部失败**：① HTILE（局部性/act 重读）② one-expert 局部性 ③ cp.async 延迟隐藏 ④ 占用率 3→4 blocks/SM ⑤ wave 尾 ⑥ slotwise 单 expert/block。**唯一未被否证的观察：每 block 字节量越大越快（act 128KB/block = 71%，down 8-72KB/block = 38%）**——若要继续，方向是**每 block 读更多连续字节**（大 h-tile，如 256 行 × 9 slots = 576KB/block、grid 仅 16×16=256 blocks），但并行度会降（256 blocks 太少）。**down 暂停。**
 
 **当前基线**：10.76ms = **1486 tok/s**（env：标准 + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`；`FERRITE_DOWN_SLOT` 默认 OFF）。
+
+## 2026-09-10 下午（SGLang 路线会话）：hc big-fuse 落地 −0.25ms，down 第 7 理论失败
+
+**用户指令**：严格按 SGLang 的思路做（不再自己发明）。据此复刻了 SGLang `mhc_pre_big_fuse` /
+`mhc_post` 的结构。
+
+### ✅ 落地：SGLang 结构 hc_pre big-fuse（−0.25ms，已默认 ON）
+- **SGLang 结构**（`mhc_pre_big_fuse_with_norm_tilelang`）：**每 token 一个 block + warp 分工并行**
+  —— `tid<32` 做 post_mix sigmoid + comb_mix 行 softmax + sinkhorn（**全在寄存器/xor shuffle**，
+  ~2µs，**无 barrier 耦合**）；`tid>=32` **同时**做 `li_raw = Σ pre[i]·res[i]`（float4、SMEM 暂存）
+  和 Σli_raw²。一个 block-wide barrier，然后全线程做 normalize（`li = li_raw·inv·nw`）。
+- 取代 rest345 的"按列分块 + 串行相位 + 跨块选举 + is_last 块做 normalize"。
+- **实测**：base 10.76/10.75 vs fuse **10.51ms**（同会话背靠背），faults=0、opcheck=0、出师表逐字
+  （`</think>` 后直接背诵）。`FERRITE_HC_FUSE=0` 回退 rest345。
+- **两个真实 bug（都已修，值得记住）**：
+  ① `__shfl_xor_sync` 的 mask 必须**精确等于参与 lane**：我写了 `0x000f000f`（含 lanes 16-19，
+  但它们在 `lane < 16` 之外不执行该指令）→ **err 715 illegal instruction**。参照实现用
+  `m16 = 0x0000ffff`（warp lanes 0-15）。
+  ② `s_li = hc_smem + mix + 2` = 104B 偏移，随后做 **float4 访问 → err 716 misaligned address**。
+  必须把 li 暂存偏移 padding 到 16B 边界（28 floats = 112B）。
+  ③ 另修：`__syncthreads()` 不能放在 warp 分支内（原写法只有 warps 1-7 到达 → 死锁）；`h4` 作用域；
+  `smem` 与文件内已有同名 `__shared__` 冲突（改名 `hc_smem`）。
+
+### ⬜ 中性/负结果（全部同会话背靠背 A/B）
+| 改动 | 结果 |
+|---|---|
+| **hc_post 每-token block 重写**（SGLang `mhc_post_tilelang` 结构：grid=s、post/comb 进 SMEM、每线程一次产出全部 n 个输出；res 流量 5.25MB→2.25MB/次） | **中性**（10.79/10.86 vs 10.82）——并行度从 65536 线程降到 4096，抵消了流量收益。保留（结构更贴近 SGLang） |
+| **cublasGemmEx algo=-1**（CUBLAS_GEMM_DEFAULT，绕开选到 splitK 的启发式） | **中性**（10.57 vs 10.51/10.56）→ splitK 不是可摘的浪费。旋钮 `FERRITE_CUBLAS_ALGO` 保留 |
+| **down HT 放大**（`FERRITE_DOWN_HT`，template HT：保持 9 slot/block 不变，只把同一 expert 的连续读从 8KB 放大到 64KB） | **更差**：ht1 **10.81/10.86**、ht4 11.09、ht8 11.62 → **并行度下降的代价 > 连续读的收益** |
+| **down slotwise（每 block 一个 assignment/一个 expert）R=8** | **更差**：11.31 vs 10.51（每 block 只摊 1 个 token，权重不摊销；且 18432→2304 blocks 的重排无效） |
+
+**down 至此 7 个理论全部实测失败**：HTILE / cp.async 延迟隐藏 / 占用率 / wave 尾 / act 流量 /
+slotwise 单 expert / h-tile 放大。**38% DRAM 的成因仍未定位**（唯一未被否证的观察：act 每 block
+128KB 连续 = 71%，down 每 block 9 个 expert 的 8KB 片段 = 38%，但任何"改这个变量"的尝试都失败）。
+
+### 当前状态
+replay **10.51ms（同会话区间 10.51-10.86，机器漂移 ±0.3ms）= ~1522 tok/s**，faults=0、出师表 ✓。
+运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。
+**距离 1600（10.0ms）还差 ~0.5ms**：SGLang 剩余的大项是 DeepGEMM / TRT-LLM 的 C++ 库
+（我们无法直接移植），以及他们**激活全程 bf16**（我们 f32 → 多出 cast 与 2x hc 流量）这一
+**模型级 dtype 改动**（精度风险高）。
