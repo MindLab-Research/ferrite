@@ -6273,6 +6273,17 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // down with block count (1 blk 55us / 16 blk 11us / 192 blk 5.8us).
 // Doubling the K-split doubles the blocks -> better amortization.
 #define HC_MIX_KS 16
+// Tuned default for the mix GEMV's K-split (FERRITE_HC_MIX_KS overrides at
+// runtime; the scratch below is sized for the HC_MIX_KS maximum, so any
+// value <= it is safe). 2026-09-10 sweep (isolated micro-bench, per call):
+//   KS=16 mix 6528 + rest345 7648 = 14176ns
+//   KS= 8                5344 + 7904 = 13248ns
+//   KS= 4                3936 + 6496 = 10432ns   <-- best
+//   KS= 2                5280 + 6528 = 11808ns
+// Lower KS re-reads fw fewer times (KS=16 costs 16x1.5MB=24MB of the ~30MB a
+// call moves), leaves fewer blocks to pay the 5 reductions + 8 barriers, and
+// gives each thread more than one float4 of work; too low starves the grid.
+#define HC_MIX_KS_DEFAULT 4
 // Plan N v1: P345 column blocks per token (gridDim.y) — h=4096/16 = 256
 // columns per block × 256 threads = 1 column/thread. 16 blocks spread the
 // old single-block P3's 64KB x read over 16 SMs' L2 bandwidth.
@@ -6660,7 +6671,7 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     static int mix_ks_env = -1;
     if (mix_ks_env < 0) {
         const char* e = getenv("FERRITE_HC_MIX_KS");
-        mix_ks_env = e ? atoi(e) : HC_MIX_KS;
+        mix_ks_env = e ? atoi(e) : HC_MIX_KS_DEFAULT;
         if (mix_ks_env < 1) mix_ks_env = 1;
         if (mix_ks_env > HC_MIX_KS) mix_ks_env = HC_MIX_KS;
     }
