@@ -1093,3 +1093,40 @@ MoE 的路由每层要 `dev.sync()` + 2 次下载（`chain_dev.rs:1299-1303` ✗
 3. 删掉 `dev.sync()` ✓。
 预期：再省 ~2-4ms/层 ✓ ⇒ 有望到 ~10-15 tok/s；之后才轮到
 **CUDA Graph**（需先消灭主机侧 MoE 派发 ✗，即上面第 1 步的设备侧路由 + 固定专家集 ✗）与内核级优化 ✓。
+
+## ★★★★ 性能瓶颈已用实验钉死：`Collective::publish` 里的全设备同步（每步 ~90 次）
+
+`tp.rs` 的 `publish()`（每次 all-reduce 都会走）里有：
+```rust
+self.dev.memcpy_peer(...)   // 8 次 peer 拷贝（异步）
+self.dev.dev_sync()?;       // ← cudaDeviceSynchronize
+self.barrier.wait();
+```
+
+**实验证明它是必需的** ✓：删掉后输出立刻从 `" Paris."` 变成 `" toll id "`（错 ✗）——
+因为 peer 拷贝确实是异步的，host barrier 只保证各 rank **已发起**，不保证**已落地** ✓。
+
+**但它每步跑约 90 次** ✗（每层 2 次 all-reduce × 45 层）✓，每次都**排空整个流水线** ✗✗
+—— 这正是"注意力 1.78ms/层、而整层 6.4ms"的全部差额来源 ✓✓。
+（此前把 hc premix 系数改为设备驻留之所以能拿到 2.2x，就是因为它顺带**每层少了 2 次**
+这种同步 ✓，与此完全一致 ✓。）
+
+### 正确的修法（下会话第一刀，按代价排序）
+
+1. **把 peer 拷贝放到独立 stream，只 sync 那条 stream** ✓（最小改动：`cuStreamSynchronize`
+   只等拷贝，不等主 stream 上的其余工作 ✗）+ 用 event 维持与 reduce 的顺序 ✓。
+   预期：把每次同步的代价从"整个流水线"降到"仅 8 次 peer 拷贝" ✓。
+2. **设备侧 stamp**（与 GLM 的 AR v5 同法 ✓，已验证可行 ✓）：拷贝后在同一 stream 上跑一个
+   1-block 内核，写 `__threadfence_system()` 保护的 stamp；reduce 内核自旋等所有 rank 的 stamp
+   ⇒ **主机完全不参与** ✓✓（这是终局形态 ✓）。
+3. 或**减少 all-reduce 次数** ✗（每层 2 次：注意力输出 + MoE 输出 ✗）—— 需重构数据流 ✗。
+
+### 本会话性能账（同口径，仅解码）
+
+| 版本 | tok/s | 每层 |
+|---|---|---|
+| 会话初 | 2.6 | ~7.5ms |
+| hc premix 设备驻留后 | **3.5** | ~6.4ms（其中注意力 1.78ms ✓）|
+
+**注意**：所有"删同步"的尝试都必须**同时验证文本仍是 `" Paris."`** ✗ —— 本会话删掉 publish 的
+sync 时文本立刻变成 `" toll id "` ✓，靠这条判据才没有把回归当成提速 ✓。
