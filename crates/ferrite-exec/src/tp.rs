@@ -2787,6 +2787,10 @@ fn mega_chain_dev(
         ferrite_kernel::cuda::set_batch_decode(true);
     }
     if capture {
+        // cudaMallocAsync (the capture-legal pool fallback) enqueues ASYNC
+        // work on this stream; make it visible before the capture begins,
+        // otherwise cuStreamBeginCapture can stall (TP=4 measured).
+        let _ = cuda.sync();
         cuda.graph_capture_begin();
     }
 
