@@ -1026,11 +1026,11 @@ impl<'a> DevChain<'a> {
                     self.s.ex_act.ptr as *mut f32,
                     1,
                     dim as i32,
-                    inter as i32,
+                    inter_local as i32,
                     cfg.swiglu_limit,
                 )?;
                 self.dev
-                    .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter as i32, cfg.swiglu_limit)?;
+                    .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter_local as i32, cfg.swiglu_limit)?;
                 self.ul_f32(self.s.ex_in.ptr, &[wsum[e]])?;
                 self.dev.expert_down_fp4(
                     self.s.ex_act.ptr as *const f32,
@@ -1040,7 +1040,7 @@ impl<'a> DevChain<'a> {
                     self.s.ex_out.ptr as *mut f32,
                     1,
                     dim as i32,
-                    inter as i32,
+                    inter_local as i32,
                 )?;
                 // accumulate deterministically into o
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
