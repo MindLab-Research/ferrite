@@ -2031,9 +2031,13 @@ __global__ void hc_pre_fuse_kernel(
     const int nh = n * h;
     const int h4 = h >> 2;
     extern __shared__ float hc_smem[];
-    float* s_mx = hc_smem;            // [mix + 2]
-    float* s_li = hc_smem + mix + 2;  // [h] li_raw staging
-    float* s_red = s_li + h;          // [16]
+    float* s_mx = hc_smem;                 // [mix + 2]
+    // s_li MUST be 16B-aligned: its accesses are float4 (err 716 misaligned
+    // address was the launch failure). mix + 2 = 26 floats = 104B, so round
+    // the offset up to 28 floats (112B).
+    const int off_li = ((mix + 2) + 3) & ~3;
+    float* s_li = hc_smem + off_li;        // [h] li_raw staging (float4)
+    float* s_red = s_li + h;               // [16]
     // ---- phase 1: reduce the mix partials (all threads) ----
     if (tid < mix) {
         float acc = 0.f;
@@ -2157,7 +2161,7 @@ extern "C" cudaError_t ferrite_hc_pre_fuse(
     int s, int n, int h, int mix, int ks,
     float rms_eps, float hc_eps, int iters, cudaStream_t st) {
     if (s <= 0 || (h & 3) != 0 || n != 4) return cudaErrorNotSupported;
-    const size_t smem = (size_t)(mix + 2 + h + 16) * sizeof(float);
+    const size_t smem = (size_t)(((mix + 2 + 3) & ~3) + h + 16) * sizeof(float);
     static bool attr_done = false;
     if (!attr_done) {
         int ndev = 0, cur = -1;
