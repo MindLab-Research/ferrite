@@ -670,7 +670,7 @@ impl<'a> DevChain<'a> {
             // filled earlier this step (including its learned top-k). Uploading
             // here would overwrite it with the placeholder — a consumer must
             // never write the shared buffer.
-        } else if comp_len > 0 && cfg.is_index_source(layer) && cfg.indexer_owns_k(layer)
+        } else if comp_len > 0 && cfg.is_index_source(layer)
             && self.indexer(layer, pos, win, comp_len)? {
             // the kernel wrote `comp_len.min(index_topk)` entries at [win, ..)
             take_comp = comp_len.min(cfg.index_topk);
@@ -798,9 +798,16 @@ impl<'a> DevChain<'a> {
         ) else {
             return Ok(false);
         };
-        // the key for the group whose latent was just published (the latent
-        // stands for its group's FIRST token, so RoPE uses that position)
-        let group = self.layers[layer].compress_len.saturating_sub(1);
+        // Only kv-source layers publish index keys (they own the compressor's
+        // latent). Non-source index layers compute their own queries and
+        // selection from the keys their source already published.
+        let owns_k = cfg.indexer_owns_k(layer);
+        let group = if owns_k {
+            self.layers[layer].compress_len.saturating_sub(1)
+        } else {
+            0
+        };
+        if owns_k {
         self.lin_bf16(
             self.layers[layer].latent.ptr as *const f32,
             cfg.head_dim as i32,
@@ -833,6 +840,7 @@ impl<'a> DevChain<'a> {
             self.s.idx_k.ptr as *const c_void,
             idx_hd * 4,
         )?;
+        } // end owns_k (key publishing only)
         // the queries come from the q_lora stream
         self.lin(
             self.s.qr.ptr as *const f32,
