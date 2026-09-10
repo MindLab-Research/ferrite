@@ -336,6 +336,14 @@ impl<'a> DevChain<'a> {
         Ok(out)
     }
 
+    /// Tensor-parallel degree / this rank's index (1 / 0 without a collective).
+    fn world(&self) -> usize {
+        self.comm.as_ref().map(|c| c.world).unwrap_or(1)
+    }
+    fn rank(&self) -> usize {
+        self.comm.as_ref().map(|c| c.rank).unwrap_or(0)
+    }
+
     fn upload_pre(&self, v: &[f32]) -> Result<()> {
         self.dev.upload_f32_at(self.s.pre.ptr, 0, v)
     }
@@ -974,15 +982,20 @@ impl<'a> DevChain<'a> {
         // the distinct experts in index order keeps the sum deterministic.
         self.dev.zero(&self.s.ex_out)?;
         let ne = ld.experts.len();
-        let mut wsum = vec![0f32; n_routed.max(1)];
+        // Expert-parallel: the loader hands this rank the CONTIGUOUS block
+        // [rank*ne, (rank+1)*ne) of the global expert ids, so the global id must
+        // be rebased before indexing the local array (the earlier version
+        // indexed it directly, which silently used another rank's experts).
+        let e_base = self.rank() * ne;
+        let mut wsum = vec![0f32; ne.max(1)];
         for (slot, &e) in idx.iter().enumerate() {
             let e = e as usize;
-            if e < n_routed {
-                wsum[e] += wgt[slot];
+            if e >= e_base && e < e_base + ne {
+                wsum[e - e_base] += wgt[slot];
             }
         }
         if !self.opts.skip_experts {
-            for e in 0..ne.min(n_routed) {
+            for e in 0..ne {
                 if wsum[e] == 0.0 {
                     continue;
                 }

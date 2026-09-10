@@ -271,6 +271,11 @@ fn rank_body(
     let ps = t_small.lock().unwrap().clone();
     let pb = t_big.lock().unwrap().clone();
     barrier.wait();
+    if rank == 0 {
+        println!("[dsv41] peers_small = {:x?}", ps);
+        println!("[dsv41] peers_big   = {:x?}", pb);
+        eprintln!("[dsv41] rank0 own staging = {:#x}", c_small.staging_base());
+    }
     c_small.set_peers(ps)?;
     c_big.set_peers(pb)?;
     // the big collective is for the vocabulary gather, which arrives with the
