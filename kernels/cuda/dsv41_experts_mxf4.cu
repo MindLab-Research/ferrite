@@ -661,7 +661,11 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
     // M=1 (decode) takes the GEMV: the tcgen05 tile is M=128 by hardware, so the
     // tensor-core path is 128x redundant here and its grid collapses to a handful
     // of blocks. The GEMV is bandwidth-bound with one warp per output row.
-    if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
+    // rows == 1 covers BOTH the expert gate/up (fp4 activation, AQ=false) and the
+    // expert down (f32 activation, AQ=true, epi_mode 3 accumulating into the MoE
+    // buffer). The kernel unpacks either activation form and implements both
+    // epilogues, so no separate path is needed for down.
+    if (rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
         const int warps = 8;
         const int cta = warps * 32;
         const int blocks = (n_total + warps - 1) / warps;
@@ -732,7 +736,11 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
     // M=1 (decode): the tcgen05 tile is M=128 by hardware, so the tensor-core path
     // is 128x redundant and its grid collapses to a handful of blocks. The GEMV is
     // bandwidth-bound with one warp per output row. (Same dispatch as launch_mxf4.)
-    if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
+    // rows == 1 covers BOTH the expert gate/up (fp4 activation, AQ=false) and the
+    // expert down (f32 activation, AQ=true, epi_mode 3 accumulating into the MoE
+    // buffer). The kernel unpacks either activation form and implements both
+    // epilogues, so no separate path is needed for down.
+    if (rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
         const int warps = 8;
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
