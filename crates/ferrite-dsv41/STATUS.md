@@ -1619,3 +1619,17 @@ cargo test --release -p ferrite-dsv41 --test ar_micro -- --nocapture
 
 **下会话第一步**：把 parity 从"两处各自算"改成**一次算好、存进 `self.round` 的伴随变量**
 （或让 reduce 用与 publish 相同的 round 值 ✓），再跑 6 秒微基准 ✓。
+
+### ⚠ 更正：上面第 2 条的 parity 猜想**已被核对否决** ✗
+
+`publish` 用 `let round = self.round.fetch_add(1) + 1` ✓（返回旧值再 +1，计数器变为 round ✓），
+`all_reduce_inplace` 用 `self.round.load()` ✓ —— **两者取到的是同一个值** ✓ ⇒ parity 一致 ✓，
+不是 0.0 的原因 ✗。
+（教训：**在文档里写下的猜想也要先核对再留给下会话** ✗ —— 否则会把人带偏 ✓。）
+
+**0.0 的真正排查方向（下会话用 6 秒 harness 逐个排除 ✓）**：
+1. 在 harness 里把 `AR_MICRO_ROUNDS=1`、`AR_MICRO_WORLD=2` 下**打印 staging 两个半区的原始内容** ✓
+   （直接看 store 到底写到哪个字节 ✓，比推理快得多 ✓）；
+2. 检查 store 内核里 `parity_off` 的单位 ✓（我按 float 传的 `parity_off/4` ✓，而 `peer_slots[p]`
+   是 u64 基址 ✓、`slot_f` 是 float 单位 ✓ —— 这一处**值得在 harness 里用 N=4 的小尺寸直接验证** ✓）；
+3. 检查 `ar_stamp` 在 bisect 版里的调用时机 ✓（我已把它移到 barrier 之前 ✓）。
