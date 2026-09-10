@@ -620,8 +620,15 @@ impl<'a> DevChain<'a> {
             // s.o holds n_heads*head_dim here, NOT dim — the earlier `dim` made the
             // probe read only the first 10 heads, so its rms was not comparable
             // with the reference's (which averages over the whole tensor).
-            self.stats("L0 attn_out(o)", &self.s.o, cfg.n_heads * cfg.head_dim)?;
+            // `attention()` writes the dim-wide wo_b output into s.o, so the
+            // comparable width is `dim` (reading n_heads*head_dim ran past the
+            // valid data into stale bytes).
+            self.stats("L0 attn_out(o)", &self.s.o, dim)?;
             self.stats("L0 xn(attn_in)", &self.s.xn, dim)?;
+            let ob = self.dl(self.s.o.as_f32(), dim)?;
+            let xb = self.dl(self.s.xn.as_f32(), dim)?;
+            eprintln!("[mine] L0 o[0..4]={:?}", &ob[..4]);
+            eprintln!("[mine] L0 xn[0..4]={:?}", &xb[..4]);
         }
         self.dev.hc_post(
             self.s.o.ptr as *const f32,
