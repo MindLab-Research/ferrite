@@ -1951,3 +1951,29 @@ M=1 专用内核要解决的问题 ✓。
 > **任何"为大 M 设计的 kernel"在 decode（M=1）下都会退化成固定开销主导。**
 > 判定方法：`实测时间 vs 权重字节量/带宽` —— 相差 100 倍以上就是形状错了 ✓
 > （hc_mixes 是 808µs vs 地板 ~1µs ✓；专家 GEMM 是 97.8µs vs 地板 0.1µs ✓）。
+
+### ★★★★★ 专家 GEMM 的根因是**硬件约束**（结案）：必须换非 tensor-core 的 M=1 GEMV
+
+读 `dsv41_experts_mxf4.cu` 得到决定性事实：
+```c
+constexpr int kMTile = 128;   // MMA M (1-CTA kind::mxf4 is fixed at 128)  ← 硬件固定
+constexpr int kNTile = 64;
+const int m_base = blockIdx.y * kMTile;
+dim3 grid((n_total + kNTile - 1)/kNTile, (rows + kMTile - 1)/kMTile);   // rows=1 ⇒ (5, 1)
+```
+- **tcgen05 的 1-CTA `kind::mxf4` MMA 的 M 被硬件固定为 128** ✗ ⇒ decode 的 **M=1** 下，
+  内核**必须算 128×64 的 tile 才能产出 1 行** ⇒ **128 倍冗余计算** ✗✗
+- **grid = (5, 1)** ⇒ 只有 **5 个 block**（148 个 SM 几乎全闲 ✗）⇒ 无并行度 ✓
+- B 侧字节量其实是对的（5 × 64×2560 = 0.82MB ≈ 全部权重 ✓），**所以不是带宽问题，
+  是"算得多 + 并行少"** ✓ ⇒ 97.8µs ✓，有效带宽 16.8GB/s（0.2%）✓
+
+**⇒ 结论（不可绕）**：M=1 下 **不能** 用 tcgen05 fp4 MMA ✓ —— 必须写**非 tensor-core 的
+fp4 GEMV**（每线程若干 k、多 block 覆盖 n=320、按 32 元素 ue8m0 scale 块解包 ✓）。
+预期：0.8MB / 5TB/s ≈ 0.16µs；即便 10% 效率 1.6µs ⇒ **~60x** ✓✓
+⇒ 若把 31.2% 压到 ~5%，**总时间约 −25%**（12.5 → ~16 tok/s ✓）。
+`gemm_fp8_kernel`（19.0%，64.8µs）同理 ✓。
+
+**精确的"形状错误"判据（本次两条重大发现的通则）**：
+> `实测单次耗时` vs `权重字节量 ÷ 带宽` 差 100 倍以上 ⇒ 形状/硬件约束不匹配 ✓
+> - hc_mixes：808µs vs 地板 ~1µs ⇒ 已修（185µs ✓，+74% 吞吐 ✓）
+> - 专家 GEMM：97.8µs vs 地板 0.1µs ⇒ **tcgen05 的 M=128 硬约束** ⇒ 需换 kernel ✓
