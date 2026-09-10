@@ -197,10 +197,15 @@ impl Collective {
         let round = self.round.fetch_add(1, AtOrd::AcqRel) + 1;
         let dev_side = std::env::var("DSV41_AR_DEV").map(|v| v != "0").unwrap_or(false);
         if dev_side {
-            // EXPERIMENTAL (opt-in): fully device-side protocol — parity staging
-            // plus a credit wait on the peers' `reduced` stamps, no host barrier.
-            // Not the default because it produced wrong output (' Paris' became
-            // garbage tokens) — kept for the graph work, gated off.
+            // ⛔ DO NOT ENABLE: this path HANGS. It was an attempt at a fully
+            // device-side collective (parity staging + a credit wait on the
+            // peers' `reduced` stamps + in-kernel stamping, no host barrier) to
+            // make the layer graph-capturable. Two bugs were found and fixed
+            // (the release needed the fence and the signal in the same threads;
+            // the in-kernel stamping dereferenced a null counter on the default
+            // path) but it still deadlocks, so the default remains the
+            // host-barrier path and this one is left behind the switch for the
+            // next session to finish. See STATUS.md.
             let parity_off = ((round as usize % 2) * self.world * self.bytes) as i64;
             let reduced_local =
                 (self.staging.ptr as *const u8).wrapping_add(self.reduced_at) as *const c_uint;

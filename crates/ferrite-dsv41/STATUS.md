@@ -1487,3 +1487,23 @@ CUDA 内存模型里，一次有效的 release 需要**执行 fence 的线程与
 `ar_store_kernel` 每个 block 写完各自的部分 → `__threadfence_system()` → 由 block 0
 （或最后一个完成的 block ✓）写 `stored[round]` ✓；归约内核同样在归约后写 `reduced[round]` ✓。
 这样"写 + 屏障 + 信号"落在同一批线程里 ✓，才是合法的 release ✓。
+
+## ⛔ 设备侧集合通信（去 host barrier）：**仍会挂死，已标注 DO-NOT-ENABLE**
+
+在"同线程 release"修正之后复测 ✓：默认路径正常（`Paris` ✓），`DSV41_AR_DEV=1` **仍挂死** ✗
+（serve 启动后无输出、超时 ✓）。该路径已在代码里用醒目注释标为 **⛔ DO NOT ENABLE** ✓，
+默认（host barrier）不受影响 ✓。
+
+**已在本轮修掉的两个真 bug（都是我自己引入的 ✗，都靠复验文本发现 ✓）**：
+1. `ar_store_kernel` 的无条件"最后块盖章"在**默认路径**上传入 `ctr = nullptr` ✗ →
+   `atomicAdd(nullptr)` → **两条路径一起挂死** ✗。修：`if (ctr == nullptr) return;` ✅
+2. 更早那次：stamp 与数据**分在两个内核**里 ✗ → fence 覆盖不到数据的写 ✗ →
+   可见性缺口（被 host barrier 掩盖 ✓）。修：盖章并进写入内核 ✓（仍未解决挂死 ✗）。
+
+**下会话排查提示**：挂死最可能在 store 内核的**信用等待**里自旋不出来 ✗ ——
+首轮 round<3 跳过等待 ✓，但 `reduced[]` 的**初值**是 0 ✓ 而 `round-2` 在 round≥3 时 ≥1 ✓，
+若某 rank 的 reduce 从未把 `reduced` 推进到该值 ✗（例如 `ar_reduce2` 的 `do_mark` 与
+`ctr2` 传参不匹配 ✗），等待者就永远自旋 ✗。建议先做**单 rank 演练**（world=1 时所有等待
+应立即通过 ✓）再上 8 rank ✓。
+
+**默认路径复验**：`Paris` ✓ / `Tokyo` ✓ / `1+1=` → `2` 后停止 ✓ / 静夜思 ✓。
