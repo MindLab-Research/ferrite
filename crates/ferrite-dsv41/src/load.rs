@@ -379,11 +379,10 @@ impl<'a> Loader<'a> {
             } else {
                 self.read_at(&spec.name, row0 as u64 * row_bytes as u64, rows * row_bytes)?
             };
-            let raw = if widen {
-                bf16_to_f32_bytes(&raw)
-            } else {
-                raw
-            };
+            // the CPU path fills the SAME `dst` the DMA path would (the bf16
+            // scratch when widening); the device-side conversion below then
+            // produces the f32 in `buf`. Widening on the host here too would
+            // convert twice.
             let dstb = Device::view(dst, raw.len().min(out_bytes));
             self.dev.upload_bytes_at(&dstb, &raw)?;
         } else {

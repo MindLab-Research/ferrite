@@ -187,6 +187,8 @@ macro_rules! f {
 // ------------------------------------------------------------------- Device
 
 pub struct Device {
+    /// bytes this handle has allocated (for the OOM diagnostic)
+    allocated: std::cell::Cell<usize>,
     cudart: Cudart,
     cublas: Cublas,
     kernels: Kernels,
@@ -358,6 +360,7 @@ impl Device {
                 stream,
                 handle,
                 debug_sync: std::env::var("DSV41_DEBUG_SYNC").map(|v| v != "0").unwrap_or(false),
+                allocated: std::cell::Cell::new(0),
                 _cudart_handle: h_cudart,
                 _libs: (h_cudart, h_cublas, h_k),
             })
@@ -390,28 +393,16 @@ impl Device {
     /// process drive several devices — one rank per thread — without juggling
     /// contexts by hand.
     pub fn bind_to(gpu: i32) -> Result<()> {
-        // the runtime must be initialised before the device can be set, so go
-        // through a device-0 query first
+        // ONLY bind the device. Enabling peer access here is actively harmful:
+        // the peers' contexts are being created concurrently by the other rank
+        // threads, so the calls cannot succeed and racing context creation can
+        // poison this context — after which every cudaMalloc fails as a bogus
+        // "out of memory". Peer access is enabled once, after every rank has a
+        // context (enable_peer_access, called past the load barrier).
         let d = Device::open_dummy_cudart()?;
         let rc = unsafe { (d.set_device)(gpu) };
         if rc != 0 {
             return Err(FerriteError::Config(format!("cudaSetDevice({gpu}): {rc}")));
-        }
-        let mut n: c_int = 0;
-        unsafe {
-            (d.device_count)(&mut n);
-        }
-        for p in 0..n {
-            if p != gpu {
-                // "already enabled" (704) and "unsupported" (801) are fine: the
-                // copy below will report a real failure if access is missing
-                unsafe {
-                    (d.enable_peer)(p, 0);
-                }
-                unsafe {
-                    (d.last_error)();
-                }
-            }
         }
         Ok(())
     }
@@ -519,9 +510,10 @@ impl Device {
                 bytes as f64 / (1u64 << 20) as f64,
                 self.device_id(),
                 free as f64 / (1u64 << 20) as f64,
-                0.0
+                self.allocated.get() as f64 / (1u64 << 30) as f64
             )));
         }
+        self.allocated.set(self.allocated.get() + bytes);
         Ok(DevBuf { ptr: p, bytes, owned: true })
     }
 
