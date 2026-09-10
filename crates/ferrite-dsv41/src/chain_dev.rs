@@ -60,6 +60,17 @@ struct LayerCache {
     ring: DevBuf,
     /// the selection for the current token: `[window + index_topk]` i32, -1 unused
     idxs: DevBuf,
+    /// compressor carry state, `[ratio, head_dim]`, and the projections' outputs
+    state_kv: DevBuf,
+    state_score: DevBuf,
+    kvp: DevBuf,
+    scp: DevBuf,
+    latent: DevBuf,
+    out_rows: DevBuf,
+    /// compressed rows published so far in this sequence
+    compress_len: usize,
+    /// pre-RoPE keys of those rows, `[max_compress, index_head_dim]`
+    index_k: DevBuf,
 }
 
 struct Scratch {
@@ -125,10 +136,20 @@ impl<'a> DevChain<'a> {
         let bf16 = dev.alloc(bf16_cap * 2)?;
 
         let mut layers = Vec::with_capacity(cfg.n_layers + cfg.n_mtp_layers);
-        for _ in 0..cfg.n_layers + cfg.n_mtp_layers {
+        for l in 0..cfg.n_layers + cfg.n_mtp_layers {
+            let ratio = cfg.compress_ratio(l).max(1);
+            let max_comp = cfg.max_seq_len / ratio + 2;
             layers.push(LayerCache {
                 ring: dev.alloc(fb(cfg.window_size * hd))?,
                 idxs: dev.alloc(fb(cfg.window_size + cfg.index_topk + 8).max(4))?,
+                state_kv: dev.alloc(fb(ratio * hd))?,
+                state_score: dev.alloc(fb(ratio * hd))?,
+                kvp: dev.alloc(fb(hd))?,
+                scp: dev.alloc(fb(hd))?,
+                latent: dev.alloc(fb(hd))?,
+                out_rows: dev.alloc(4)?,
+                compress_len: 0,
+                index_k: dev.alloc(fb(max_comp * cfg.index_head_dim.max(1)))?,
             });
         }
 
@@ -193,8 +214,17 @@ impl<'a> DevChain<'a> {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        for c in self.layers.iter() {
+        for c in self.layers.iter_mut() {
             self.dev.zero(&c.ring)?;
+            self.dev.zero(&c.state_kv)?;
+            self.dev.zero(&c.state_score)?;
+            c.compress_len = 0;
+            // score_state is -inf except where filled; zeroing it would make an
+            // empty slot look like a real (0-weight) entry, so seed it with -inf
+            let neg = f32::NEG_INFINITY;
+            let n = c.state_score.bytes / 4;
+            let v = vec![neg; n];
+            self.dev.upload_f32_at(c.state_score.ptr, 0, &v)?;
         }
         Ok(())
     }
@@ -219,6 +249,12 @@ impl<'a> DevChain<'a> {
             n_out,
             k,
         )
+    }
+
+    /// f32 linear for one row (see `gemm_f32`).
+    fn lin_f32(&self, a: *const f32, k: i32, w: &crate::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
+        self.dev
+            .gemm_f32(a as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k)
     }
 
     /// bf16 linear for one row (cuBLAS; the tensor is natively bf16).
@@ -529,6 +565,10 @@ impl<'a> DevChain<'a> {
 
         let win = cfg.window_size;
         let slot = pos % win;
+        // raw pointers rather than a live borrow: `compress` below needs
+        // &mut self (it updates this layer's published count and buffers)
+        let ring_ptr = self.layers[layer].ring.ptr;
+        let idxs_ptr = self.layers[layer].idxs.ptr;
         let cache = &self.layers[layer];
         self.dev.memcpy_d2d(
             (cache.ring.ptr as *mut u8).wrapping_add(slot * fb(hd)) as *mut c_void,
@@ -546,24 +586,44 @@ impl<'a> DevChain<'a> {
         // zero (confirmed by DSV41_STATS: rms=0.0000 at pos>0 while pos=0 was
         // fine, since only then do the leading entries happen to be valid).
         let wsel = ops::window_topk_idxs(win, 1, 1, pos);
-        let mut idx_host = vec![-1i32; win];
+        let mut idx_host = vec![-1i32; win + cfg.index_topk];
         for (c, v) in wsel.iter().enumerate().take(win) {
             idx_host[c] = *v;
         }
-        self.ul_i32(cache.idxs.ptr, &idx_host)?;
+        // Compressed KV. Only the kv sources run the compressor; every other
+        // layer of the same group reads the latents they published, which is
+        // why they all live in this layer's own copy of the sequence's rows.
+        let mut comp_len = self.layers[layer].compress_len;
+        if cfg.compress_ratio(layer) > 0 && cfg.is_kv_source(layer) {
+            comp_len = self.compress(layer, pos)?;
+        } else if cfg.compress_ratio(layer) > 0 {
+            // a consumer inherits the count published by its source layer
+            comp_len = self.source_compress_len(layer);
+        }
+        // Selection over the compressed rows. The release scores them with the
+        // indexer and keeps `index_topk`; until the indexer is wired this takes
+        // the most recent ones, which is a deliberate placeholder (it is a
+        // superset-free pruning that at least makes the long-range rows
+        // reachable — it is NOT the learned selection).
+        let take_comp = comp_len.min(cfg.index_topk);
+        for j in 0..take_comp {
+            idx_host[win + j] = (win + comp_len - take_comp + j) as i32;
+        }
+        let n_idx_cols = win + take_comp;
+        self.ul_i32(idxs_ptr, &idx_host)?;
 
         self.dev.sparse_attn(
             self.s.q.as_f32(),
-            cache.ring.as_f32(),
+            ring_ptr as *const f32,
             ld.attn_sink.as_ref().unwrap().as_f32(),
-            cache.idxs.as_i32(),
+            idxs_ptr as *const i32,
             self.s.o.ptr as *mut f32,
             1,
             1,
             nh as i32,
             hd as i32,
-            win as i32,
-            win as i32,
+            (win + comp_len) as i32,
+            n_idx_cols.max(1) as i32,
             1.0 / (hd as f32).sqrt(),
         )?;
         self.dev.apply_rope(
@@ -622,6 +682,75 @@ impl<'a> DevChain<'a> {
             self.s.o.ptr as *mut f32,
         )?;
         Ok(())
+    }
+
+    /// Compressor for one decode step: the two projections in fp32 (the release
+    /// promotes them), then the pooling half, then the latent lands in this
+    /// layer's KV buffer at row `window + compress_len`. Returns the new count.
+    fn compress(&mut self, layer: usize, pos: usize) -> Result<usize> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hd = cfg.head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ld = &self.w.layers[layer];
+        let (Some(wkv), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            return Ok(self.layers[layer].compress_len);
+        };
+        let cache = &self.layers[layer];
+        self.lin_f32(self.s.xn.ptr as *const f32, dim as i32, wkv, hd as i32, cache.kvp.ptr as *mut f32)?;
+        if let Some(wg) = ld.comp_wgate.as_ref() {
+            self.lin_f32(self.s.xn.ptr as *const f32, dim as i32, wg, hd as i32, cache.scp.ptr as *mut f32)?;
+        } else {
+            // ratio == 1: no gate; the pooling reduces to the plain projection
+            self.dev.zero(&cache.scp)?;
+        }
+        self.dev.compressor_pool(
+            cache.kvp.as_f32(),
+            cache.scp.as_f32(),
+            norm.as_f32(),
+            cache.state_kv.ptr as *mut f32,
+            cache.state_score.ptr as *mut f32,
+            cache.latent.ptr as *mut f32,
+            cache.out_rows.ptr as *mut i32,
+            1,
+            1,
+            hd as i32,
+            ratio as i32,
+            pos as i32,
+            cfg.norm_eps,
+        )?;
+        // the kernel reports on the device whether a latent came out this step
+        let mut n = [0i32; 1];
+        let b = Device::view(cache.out_rows.ptr, 4);
+        self.dev.download_f32(&b, unsafe {
+            std::slice::from_raw_parts_mut(n.as_mut_ptr() as *mut f32, 1)
+        })?;
+        let mut len = self.layers[layer].compress_len;
+        if n[0] > 0 {
+            let dst = (self.layers[layer].ring.ptr as *mut u8)
+                .wrapping_add((self.cfg.window_size + len) * hd * 4);
+            self.dev.memcpy_d2d(
+                dst as *mut c_void,
+                self.layers[layer].latent.ptr as *const c_void,
+                hd * 4,
+            )?;
+            len += 1;
+            self.layers[layer].compress_len = len;
+        }
+        Ok(len)
+    }
+
+    /// How many compressed rows the source layer of `layer` has published.
+    /// Consumers share the source's cache, so they report the same count.
+    fn source_compress_len(&self, layer: usize) -> usize {
+        // the config lists compressors per layer; a consumer reads the most
+        // recent source at or before it (the reference's kv_source mapping)
+        for l in (0..=layer).rev() {
+            if self.cfg.is_kv_source(l) && self.cfg.compress_ratio(l) == self.cfg.compress_ratio(layer) {
+                return self.layers[l].compress_len;
+            }
+        }
+        0
     }
 
     /// MoE: bf16 gate GEMM, `noaux_tc` routing, MXFP4 experts, fp8 shared expert.
