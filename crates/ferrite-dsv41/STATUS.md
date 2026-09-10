@@ -645,3 +645,32 @@ AR 语义（求和 ✓）、`expert_down_fp4` 的覆盖式写出（已知 ✓ �
 
 **接手第一步**：把 `expert_down_fp4` 的输出与"手工 numpy 复算（用官方走同一专家的权重+激活）"
 对比，直接看 down 这一支是差 2x 还是差在 wsum。
+
+### ★★ 官方消融给出最终定位：**shared 完全正确，routed 差 1.79x**
+
+给官方 `MoE.forward` 加 `REF_ABLATE=routed|shared` 探针，取 layer0 **pos0**：
+
+| 分支 | 官方 | 我的 | 判定 |
+|---|---|---|---|
+| **shared_only** | **0.080769** | **0.0818** | **✓ 1.3% 吻合** |
+| **routed_only** | **0.100171** | **0.0560** | **✗ 1.79x 偏小** |
+| full | 0.145146 | 0.1037 | ✗ |
+
+→ **shared expert 的权重、fp8 GEMM、以及"仅 rank0 计算 + SUM AR"的接法全部正确** ✓✓
+→ **路由（专家选择 + 权重数值）已证实与官方一致** ✓✓
+→ **唯一错的环节 = 每个 routed 专家自身的输出** ✗
+
+**已核对无误的相关代码**（都查过了，不是这些）：
+- 专家分片：`weights.rs:215` `if n == "w2" { Shard::ExpertCols } else { Shard::ExpertRows }`
+  —— w2 切 dim1（inter=K ✓）、w1/w3 切 dim0（inter=N ✓）✓
+- 全部 384 专家都在本地（`e=277` 的调试能打印 ✓，`ne=384` ✓）
+- `expert_down_fp4` → `launch_mxf4(..., n_total=dim, k=inter_local, b_split=-1, epi_mode=2,
+  limit=0, row_weight=wsum[e], aq=true)` 的参数逐位映射正确 ✓；
+  内核 `epi_mode==2` 就是 `x *= row_weight[row]` ✓
+- `epi_mode==1` 的 gate/up 夹取（`col < b_split` 判 gate ✓）与我的 `swiglu_limit` 重复但等价 ✓
+
+**下会话第一刀（最省事）**：把 `expert_down_fp4` 那一支的输出直接与"用官方同一专家的
+w2/swiglu/权重做 numpy 复算"对比 —— 分三步各打印一次 rms：
+① down 之前的 swiglu 向量；② down 之后的单专家向量；③ 累加 6 个之后的向量。
+官方的对应量：单专家 routed 贡献可由 `routed_only/√6` 估 ≈ 0.041，6 个和 = 0.100171。
+我的累加结果 0.0560 —— 看是"单个专家就小"还是"累加漏了专家"。
