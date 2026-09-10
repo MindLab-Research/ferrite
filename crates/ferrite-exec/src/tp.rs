@@ -2756,7 +2756,13 @@ fn mega_chain_dev(
     // PRE-WARM moved to the entry (2026-09-10): the capture was crashing in the
     // _guard block BELOW (before the old pre-warm site) — warm the pools FIRST.
     if capture {
-        for sz in [4096usize, 16384, 245760] {
+        // Batch pre-warm (2026-09-10): the per-seq capture's allocation
+        // sequence differs from the dry-run's (DSA t_count shifts change the
+        // idx_pools/idx size classes), so warm EVERY size class observed in
+        // the FERRITE_POOL_MISS log at once instead of whack-a-mole.
+        for sz in [
+            4usize, 8, 16, 32, 2048, 3072, 4096, 7680, 16384, 30720, 61440, 245760,
+        ] {
             if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), sz) {
                 drop(b);
             }
