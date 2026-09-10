@@ -884,3 +884,59 @@ loader 分片已被 8 个不同指纹证伪 ✓）。
 2. 重点怀疑：**复用层是否重新算了 wkv/kv_norm**（应当**不**重算 ✗，直接用 owner 的缓存 ✗），
    以及**窗口环的位置推进**（`slot = pos % win`）在 owner / 复用层之间是否一致；
 3. 也应顺手核对 `index_k`（indexer 的键）在 owner / 复用层之间的读取来源 ✓。
+
+## 🎉 2026-09-11 会话结论：**乱码已修好** —— 本会话共修 4 个真 bug
+
+多 prompt 验证（tp=8、完整 40 层、贪心）：
+
+| prompt | 输出 | 判定 |
+|---|---|---|
+| `The capital of France is` | **" Paris"** | ✓ 与官方真值一致 |
+| `The capital of Japan is` | **" Tokyo"** | ✓ |
+| `请背诵《静夜思》` | "The user wants me to recite the poem \"Quiet Night Thoughts\" (" | ✓ 完全理解中文请求 |
+| `1+1=` | "3 1 = …(2) 3.22" | 数字为主 ✓，尾部仍退化 ✗ |
+
+### 本会话修掉的 4 个 bug（全部有官方对照/消融数据）
+
+1. **`sparse_attn_kernel` 的 dot 只归约了第 0 个 warp** ✗
+   `__shfl_xor_sync` 只覆盖 32 lane，而累加按 blockDim.x 分摊 → blockDim=128 时 score 只有
+   真值 1/4 → 单 KV 的 softmax 权重 0.95→0.667 → 整个注意力输出被均匀缩小 0.67x。
+   修：加 `wpart[32]` 跨 warp 二级归约。**验证**：o[1..3] 与官方逐元素吻合。
+
+2. **MoE 的专家求和被整段丢弃** ✗
+   循环后 `memcpy_d2d(o, ex_out)` 把累加结果覆盖成最后一个专家的输出；且 `o` 从未清零
+   （还留着注意力输出）。修：清零 `o` + 删掉覆盖 memcpy。
+
+3. **mxf4 的 ue8m0 scale 被按 fp4 的"每字节 2 值"切片** ✗✗
+   scale 是 **[N, K/32]**（1 字节对应 32 个值），但 `local_shape` 的 `ExpertCols` 套用了
+   权重的 `logical = packed*2` → 宽度算成 32（应为 `padded_inter(288)/32 = 10`）→ 内核
+   `sc[row*(k/32)+kblock]` 从第一行起全部错位。修：按张量种类选打包方式。
+   **验证**：world 扫描 tp=1/2/4/8 结果**完全一致** 0.0960（官方 0.100171，差 4%）。
+
+4. **窗口 KV 被错误地跨层共享** ✗✗（最后一个，也是让文本变对的那个）
+   参考 `Attention.forward` 里窗口 KV 是 `_window_kv(x, ...)`——**用每层自己的 wkv 和自己的
+   输入**算的；只有**压缩 KV + indexer** 是 group 共享（`ModelArgs` 注释原文：
+   "layers sharing a ratio also share one compressed KV and one indexer"）。我的实现让所有层读
+   kv owner 的环，又用 `owns_kv` 让消费层从不写入 → 每个消费层都拿 owner 的 kv 做注意力。
+   修：窗口 KV 每层独立（`DSV41_RING_OWNER=1` 可回退 A/B）。
+   **验证**：pos0 逐层 h 对比 —— L3 从 −15% ✗ 收敛到 **−2.8%** ✓，L4–L7 全部 ≤3% ✓。
+
+### pos0 逐层 h 最终对照（官方 vs 修复后）
+
+| layer | 官方 | 我（修复后） |
+|---|---|---|
+| L0 | 0.050829 | 0.0509 ✓ |
+| L1（engram） | 0.065082 | 0.0652 ✓ |
+| L2 | 0.072498 | 0.0724 ✓ |
+| L3 | 0.094116 | 0.0915 ✓ |
+| L4 | 0.099214 | 0.0977 ✓ |
+| L5 | 0.113166 | 0.1096 ✓ |
+| L6 | 0.125146 | 0.1235 ✓ |
+| L7 | 0.158411 | 0.1543 ✓ |
+
+### 剩余 ~2-3% 偏差的最可能来源（下会话）
+
+参考 `fp4_gemm_kernel` 的 docstring 明写 **"FP8 act x FP4 weight"** —— **激活走 fp8**、
+权重走 fp4，且 `act_block_size` 默认 **128**；而我 `quant_fp4` 把**激活也压成 fp4**
+（每块只有 8 个幅值档，误差远大于 fp8 的 3 位尾数）。逐层 2-3% 的偏差在 40 层后放大，
+正是长文本尾部退化的来源。**下一步**：把激活量化改成 fp8（block 128，与参考一致）。
