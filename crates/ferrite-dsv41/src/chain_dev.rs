@@ -1391,6 +1391,13 @@ impl<'a> DevChain<'a> {
                 wsum[e] += wgt[slot];
             }
         }
+        if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+            let n_active = wsum.iter().filter(|w| **w != 0.0).count();
+            eprintln!(
+                "[mine] L{layer} route idx={:?} active_experts={} of {} (topk={})",
+                &idx, n_active, ne, topk
+            );
+        }
         if !self.opts.skip_experts {
             // The input row is identical for every expert, so quantise it ONCE
             // here instead of inside the loop: the fp4 path was re-quantising and
