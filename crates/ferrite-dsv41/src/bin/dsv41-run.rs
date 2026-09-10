@@ -316,6 +316,18 @@ fn rank_body(
             }
         }
         let next = best as u32;
+        if rank == 0 && step < 3 {
+            let mut top: Vec<(usize, f32)> =
+                logits.iter().copied().enumerate().collect::<Vec<_>>();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!(
+                "[top5] step {step} n={} top={:?} span={:?}",
+                logits.len(),
+                &top[..4.min(top.len())],
+                (logits.iter().cloned().fold(f32::MIN, f32::max),
+                 logits.iter().cloned().fold(f32::MAX, f32::min))
+            );
+        }
         out.push(next);
         if Some(next) == eos {
             break;
