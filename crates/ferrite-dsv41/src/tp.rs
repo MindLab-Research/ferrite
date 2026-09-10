@@ -84,6 +84,9 @@ pub struct Collective {
     /// Device copy of the peers' STAMP bases, so the stamp kernel can write into
     /// every rank's array (including our own) without host involvement.
     peer_stamps: DevBuf,
+    /// Device copy of the peers' STAGING bases, so one store kernel can publish
+    /// into every rank's slot instead of `world` host-issued peer copies.
+    peer_slots: DevBuf,
     /// Monotonic round counter: each all-reduce is one round. Atomic because
     /// the collective is shared behind an Arc and only `&self` is available.
     round: AtomicU32,
@@ -114,6 +117,7 @@ impl Collective {
         let stamps_at = world * bytes;
         let staging = dev.alloc(stamps_at + world * 4 + 64)?;
         let peer_stamps = dev.alloc(world * 8)?;
+        let peer_slots = dev.alloc(world * 8)?;
         let _ = depth;
         Ok(Collective {
             world,
@@ -123,6 +127,7 @@ impl Collective {
             peers: vec![0; world],
             stamps_at,
             peer_stamps,
+            peer_slots,
             round: AtomicU32::new(0),
             barrier,
             dev,
@@ -149,6 +154,11 @@ impl Collective {
             buf[i * 8..i * 8 + 8].copy_from_slice(&b.to_le_bytes());
         }
         self.dev.upload_bytes_at(&self.peer_stamps, &buf)?;
+        let mut buf2 = vec![0u8; self.world * 8];
+        for (i, b) in peers.iter().enumerate() {
+            buf2[i * 8..i * 8 + 8].copy_from_slice(&b.to_le_bytes());
+        }
+        self.dev.upload_bytes_at(&self.peer_slots, &buf2)?;
         self.peers = peers;
         Ok(())
     }
@@ -162,15 +172,18 @@ impl Collective {
     /// staging would otherwise publish unrelated memory.
     fn publish(&self, src: *const std::ffi::c_void, len: usize) -> Result<()> {
         assert!(len <= self.bytes, "collective payload {len} > slot {}", self.bytes);
-        for p in 0..self.world {
-            let dst = (self.peers[p] + (self.rank * self.bytes) as u64) as *mut std::ffi::c_void;
-            if p == self.rank {
-                self.dev.memcpy_d2d(dst, src as *const std::ffi::c_void, len)?;
-            } else {
-                self.dev
-                    .memcpy_peer(p as i32, dst, src as *const std::ffi::c_void, len)?;
-            }
-        }
+        // One device kernel writes this rank's payload into every rank's slot
+        // (including our own). The previous loop issued `world` host-side peer
+        // copies per collective — ~16 API calls per layer with the host inside
+        // the dependency chain.
+        self.dev.ar_store(
+            self.peer_slots.ptr as *const u64,
+            self.world as i32,
+            self.rank as i32,
+            src as *const f32,
+            (len / 4) as i64,
+            (self.bytes / 4) as i64,
+        )?;
         // The peer copies are asynchronous on both devices (Device::memcpy_peer
         // maps to the async peer copy), so a device sync is REQUIRED here to make
         // this rank's issue complete before the barrier lets anyone reduce.

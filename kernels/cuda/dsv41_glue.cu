@@ -241,6 +241,21 @@ __global__ void ar_stamp_kernel(const unsigned long long* __restrict__ peer_stam
     }
 }
 
+// Publish this rank's payload into EVERY rank's staging slot (including our own)
+// directly from the device. The old path issued `world` host-side peer copies per
+// collective — ~8 API calls per all-reduce, ~16 per layer — with the host in the
+// dependency chain. One kernel replaces them and stays on the GPU.
+__global__ void ar_store_kernel(const unsigned long long* __restrict__ peer_slots, int world,
+                                int rank, const float* __restrict__ src, long n, long slot_f) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = src[i];
+    for (int p = 0; p < world; ++p) {
+        float* dst = (float*)(peer_slots[p]) + (long)rank * slot_f + i;
+        dst[0] = v;
+    }
+}
+
 __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restrict__ staging,
                                  long n, long slot_f, int world,
                                  const unsigned* __restrict__ stamps, unsigned round) {
@@ -332,5 +347,14 @@ extern "C" int dsv41_ar_reduce(float* dst, const float* staging, long n, long sl
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (blocks > 512) blocks = 512;
     ar_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, stamps, round);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_ar_store(const unsigned long long* peer_slots, int world, int rank,
+                              const float* src, long n, long slot_f, cudaStream_t s) {
+    if (n <= 0 || world <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (blocks > 512) blocks = 512;
+    ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f);
     return (int)cudaGetLastError();
 }
