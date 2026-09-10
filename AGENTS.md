@@ -1542,3 +1542,27 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **结论**：1600 = 全部剩余项 + down 或 act 的突破。down 的三个理论已失败（HTILE/one-expert 延迟隐藏/cp.async staging），**下一步必须是拿当前 kernel 的新 ncu 数据**（37.6% DRAM / 67.6% L1TEX 的旧读数来自 HTILE=8 时代，已过时三次）。
 
 **AR v5 pubred 融合保留**（中性、结构更优：2 kernel/AR、绝对 epoch 轮询的多块安全性已验证）。
+
+## 2026-09-10 终局：down/act/AR 三大 kernel 全部触底 — 系统性定论
+
+**down v16 的占用率实验（第五个理论）**：launch_bounds(288,4) 完全生效（ncu 确认 56 regs、233KB carve-out、4 blocks/SM、理论占用率 42→56%、达成 49%、waves 2.31→1.73）——**serve 仍然中性**（10.96 vs 10.96）。HTILE=32@592 slots（单波）隔离仍 −10%（并行度减半的代价超过 act 流量减半的收益）。**定论：down 是 L1TEX 管道吞吐受限（71%）的结构性地板，2.04ms = 本实现的下限。** 五理论（HTILE 局部性 / cp.async 延迟隐藏 / 占用率 / wave 尾 / act 流量）全部实测失败，勿再试。
+
+**act 的最终 ncu**：DRAM 71.00%（真带宽受限）、L1TEX 51%、Compute 56%、占用率 50%/46%、waves 3.89。流量 = 144 assignments × (gate 1MB + up 1MB) ≈ 288MB（71% × 7.6 × 45µs ≈ 244MB 吻合，L2 吸收重复）。**流量不可减（每 assignment 必读其 expert 的 gate+up 一次）→ act 1.89ms = 地板。**
+
+**AR v5 pubred**：2 kernel/AR（store + pubred），~6-8µs/次 ≈ 0.6ms，NVLink 传输 1.75MB@425GB/s = 4.1µs 是地板。
+
+**最终分解（10.96ms，全部触底项标注）**：
+| 项 | ms | 状态 |
+|---|---|---|
+| down 2.04 | L1TEX 结构地板 | ⛔ 关闭 |
+| act 1.89 | DRAM 带宽地板（71%，流量不可减） | ⛔ 关闭 |
+| hc 链 1.30 | rest345 7.26µs（launch 1.34+P1 1.31+P3 0.9+election 0.9+normalize 1.28 的固有串行） | ~地板 |
+| 投影族 ~1.85 | cuBLAS/gemm3 各在其位；splitK 0.41 待 cublasLt（不确定） | 剩 −0~0.3 |
+| GDN 0.71 | 状态流量地板（4.4GB/步） | ⛔ 关闭 |
+| AR v5 0.60 | NVLink 地板 | ⛔ 关闭 |
+| 小 kernel ~0.70 | 合并磨活 | 剩 −0.15~0.25 |
+| sparse/DSA 0.27 + kpool 0.26 + route 0.25 + 间隙 ~0.5-1.0 + host 0.12 | | 段融合流水化 −0.3~0.5（不确定） |
+
+**1600 可达性最终判定**：剩余全部项（小 kernel 0.2 + cublasLt 0~0.3 + 段融合流水化 0.3~0.5）= −0.5~1.0ms → **10.0-10.5ms ≈ 1520-1600 tok/s**。1600 在剩余路径的最乐观端——需要段融合的相位级流水化兑现全部预期 + cublasLt 付费 + 小 kernel 全落地。**三大 kernel（down/act/AR）已无任何单点 >0.2ms 的优化空间。**
+
+**本会话最终成果**：13.45 → **10.96ms（+22.7%），1190 → 1460 tok/s**。运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。HEAD `3d9d543`。
