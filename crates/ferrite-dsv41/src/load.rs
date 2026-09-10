@@ -22,6 +22,32 @@ use crate::config::Dsv41Config;
 use crate::device::{DevBuf, Device};
 use crate::weights::{local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
 
+/// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
+/// Everything else that arrives as bf16 is widened to f32 on the way in —
+/// an exact conversion (bf16 -> f32 is lossless), NOT a dequantisation. It is
+/// required because the consuming kernels (rmsnorm weights, the hyper-connection
+/// parameters, the routing bias, the embedding table) take f32 pointers;
+/// handing them bf16 bytes made each of them read twice its length, which
+/// corrupted values and walked off the end of the allocation.
+const KEEP_BF16: &[&str] = &[
+    "head.weight",
+    "ffn.gate.weight",
+    "attn.indexer.wq_b.weight",
+    "attn.indexer.wk.weight",
+    "attn.indexer.weights_proj.weight",
+];
+
+fn bf16_to_f32_bytes(b: &[u8]) -> Vec<u8> {
+    let n = b.len() / 2;
+    let mut out = Vec::with_capacity(n * 4);
+    for i in 0..n {
+        let h = u16::from_le_bytes([b[i * 2], b[i * 2 + 1]]);
+        let f = f32::from_bits((h as u32) << 16);
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
 fn io<T>(r: std::io::Result<T>, what: &str) -> Result<T> {
     r.map_err(|e| FerriteError::Config(format!("{what}: {e}")))
 }
@@ -294,12 +320,20 @@ impl<'a> Loader<'a> {
                 self.read_at(&spec.name, off, len)?
             }
         };
+        // widen bf16 unless a bf16 tensor core consumes it
+        let (bytes, out_dtype) = if h.dtype == "BF16"
+            && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k))
+        {
+            (bf16_to_f32_bytes(&bytes), "F32".to_string())
+        } else {
+            (bytes, h.dtype.clone())
+        };
         let buf = self.dev.upload(&bytes)?;
         let _ = local;
         Ok(DevTensor {
             buf,
             shape: local,
-            dtype: h.dtype,
+            dtype: out_dtype,
         })
     }
 
@@ -511,6 +545,23 @@ mod tests {
         assert_eq!(dtype_size("I8"), 1);
         assert_eq!(dtype_size("BF16"), 2);
         assert_eq!(dtype_size("F32"), 4);
+    }
+
+    #[test]
+    fn bf16_widening_is_exact() {
+        // every bf16 pattern must round-trip exactly through the widening we do
+        // on the way to the device
+        let mut raw = Vec::new();
+        for h in [0u16, 1, 0x3f80, 0xbf80, 0x7f7f, 0x0080, 0x8000, 0xc000] {
+            raw.extend_from_slice(&h.to_le_bytes());
+        }
+        let w = bf16_to_f32_bytes(&raw);
+        assert_eq!(w.len(), raw.len() * 2);
+        for i in 0..(raw.len() / 2) {
+            let h = u16::from_le_bytes([raw[i * 2], raw[i * 2 + 1]]);
+            let got = f32::from_le_bytes([w[i * 4], w[i * 4 + 1], w[i * 4 + 2], w[i * 4 + 3]]);
+            assert_eq!(got.to_bits(), (h as u32) << 16, "bf16 {h:#06x} widened wrong");
+        }
     }
 
     #[test]
