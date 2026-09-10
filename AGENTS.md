@@ -1427,3 +1427,25 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 **带 `FERRITE_P2P=1 FERRITE_P2P_AR5=1` 跑 nsys 会自旋卡死**：AR v5 的 publish kernel 自旋等 peer 盖章，nsys 的 `--cuda-graph-trace=node` 对 8 个 rank 每步 ~400 个节点做 CUPTI 拦截，host 侧抖动被自旋放大——实测 240s 只跑 69 步（≈3.4s/步，比无剖析慢 300 倍），bench 超时、报告丢失。**NCCL 模式（去掉这两个 env）剖析干净（1m53s 全流程）**，且除 AR 外所有 kernel 的中位数对 v5 构建同样有效（代码路径相同）。要 AR 的耗时直接用 90 × ~8µs 代入。
 
 剖析脚本模板：`/tmp/sp4.sh`（GPU 忙则中止 → nsys 全程 trace → bench 加 `timeout 300` → **`curl -X POST http://localhost:8080/shutdown` 收尾**（不是 kill -INT！）→ 等 nsys 最多 300s → `nsys stats --report cuda_gpu_kern_sum | grep -vE "dequant|bf16_to_f32|memcpy|Memset|matmul_tiled"`）。
+
+## 2026-09-10 深夜：最终冲刺的精确分解（NCCL 模式 nsys + sqlite 稳态窗口查询）
+
+**方法**：NCCL 模式剖析（铁律见上）+ `sqlite3 /tmp/sp4.sqlite` 查最后 100ms 窗口（纯 b16 稳态，8 rank 归一化，AR=90/step 校验吻合）。**gdn_step_v2 不在稳态路径**（65280 实例全部来自 prefill/ramp；稳态 GDN = chunk_batched 0.48 + prep 0.13 + conv1d 0.10，chunk_batched 在 DRAM 地板——状态读写 4.4GB/步不可减）。
+
+**当前 10.94ms（v5 AR）的精确构成**：
+
+| 项 | ms/步 | 地板 | 可砍 |
+|---|---|---|---|
+| MoE down | 2.11 | ~1.5（L1TEX 管道） | **−0.5~0.6（one-expert-per-block）** |
+| MoE act | 1.89 | ~1.5（71.9% DRAM） | −0.4（难） |
+| 投影族（nvjet×4 + gemv×3 + gemm3 + splitKreduce） | ~2.0 | | **−0.3~0.4（splitK 对 M=16 反优化 + cast 合并）** |
+| hc 链（rest345 0.65 + mix 0.43 + post 0.29） | 1.37 | | −0.1 |
+| AR v5 | 0.72 | ~0.6 | ~0 |
+| 小 kernel（quant_e4m3 54/步 0.14 + f32_to_bf16 209/步 0.21 + norm 族 0.15 + argmax/misc 0.4） | ~0.9 | | **−0.3（合并）** |
+| kpool 0.26 + sparse/DSA 0.27 + route 0.25 + GDN 0.71 + 图间隙/host ~0.9 | ~2.4 | | −0.2 |
+| **合计** | **10.94** | | **−1.7~1.9 理论 → 9.0-9.2ms** |
+
+**冲刺剩余路径（按 把握×收益 排序）**：
+1. **投影族 splitK 关闭 + cast 消除（−0.3~0.4，最有把握）**：nvjet_splitK（3.8µs×57/步）+ splitKreduce（2.8µs×67/步）= 0.41ms——M=16 的 GEMM 不该 splitK；f32_to_bf16 209 次/步（每 GEMM 前的转换）——让产出方直出 bf16（池化 cast 缓存已 4 次失败，勿走池化路）。
+2. **小 kernel 合并（−0.3）**：quant_e4m3_tokens 可并入 hc_pre_rest345 尾部（它量化的就是 li——但 absmax 需跨 block 归约，需用 is_last 机制或独立小 kernel）；norm 族 209 次。
+3. **down one-expert-per-block（−0.5~0.6，最大但最险）**：两阶段归约保确定性；HTILE 教训适用。
