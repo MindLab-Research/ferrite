@@ -99,6 +99,22 @@ fn collective_all_reduce_matches_host_reference() {
                         barrier.wait();
                         continue;
                     }
+                    if rank == 0 && r < 2 && std::env::var("AR_MICRO_DUMP").is_ok() {
+                        // Dump the raw staging halves: seeing which bytes the store
+                        // actually wrote beats reasoning about the offsets.
+                        let bytes = 2 * world * n * 4;
+                        let d = ferrite_dsv41::device::Device::view(c.staging_base() as *mut std::ffi::c_void, bytes);
+                        let mut raw = vec![0f32; 2 * world * n];
+                        dev.download_f32(&d, &mut raw).expect("dump staging");
+                        for half in 0..2 {
+                            let h = &raw[half * world * n..(half + 1) * world * n];
+                            eprintln!(
+                                "[ar_micro] round {r} half {half}: slot0[0..4]={:?} slot1[0..4]={:?}",
+                                &h[..4.min(n)],
+                                &h[n..(n + 4).min(2 * n)]
+                            );
+                        }
+                    }
                     // the buffers must keep advancing (a stalled round would repeat)
                     barrier.wait();
                 }
