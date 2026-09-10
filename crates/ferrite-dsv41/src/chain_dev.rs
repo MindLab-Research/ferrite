@@ -1371,6 +1371,18 @@ impl<'a> DevChain<'a> {
                     dim as i32,
                     inter_local as i32,
                 )?;
+                if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+                    let eo = self.dl(self.s.ex_out.as_f32(), dim)?;
+                    let r: f32 =
+                        (eo.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
+                    let ao = self.dl(self.s.o.as_f32(), dim)?;
+                    let ra: f32 =
+                        (ao.iter().map(|v| v * v).sum::<f32>() / dim as f32).sqrt();
+                    eprintln!(
+                        "[mine] expert {e} w={} down_out_rms={r} accum_rms_before={ra}",
+                        wsum[e]
+                    );
+                }
                 // accumulate deterministically into o
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
             }
