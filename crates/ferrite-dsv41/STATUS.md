@@ -1570,3 +1570,28 @@ cargo test --release -p ferrite-dsv41 --test ar_micro -- --nocapture
   **先验证测试，再怀疑被测对象** ✓；
 - `Device::bind_to` + `enable_peer_access` 需要**所有 rank 的 context 先存在** ✓
   （两段式 barrier ✓），照搬 runner 的顺序即可 ✓。
+
+### 微基准定位到的故障边界（下会话从这里接手）
+
+修掉 harness 自身的假挂之后（失败路径原先直接 `return` ✗ → 跳过 harness barrier ✗ →
+对端永久等待 ✓，看起来像协议挂死 ✗）复测：
+
+| 路径 | world=2 rounds=4 |
+|---|---|
+| **默认（host barrier）** | **✓ rank0 completed 4 rounds** ✓ |
+| `DSV41_AR_DEV=1` | **✗ 无输出 = 真挂**（非 harness 假挂 ✓）|
+
+且 `rounds=2`（信用等待尚未启用 ✓，它要求 `round >= 3` ✓）**同样挂** ✗
+⇒ **挂死发生在第 1 轮的 store→stamp→reduce 序列里** ✓，与信用等待无关 ✗✓。
+
+**下会话最快的二分（每次 6 秒 ✓）**：
+1. 把 store 内核里 `round >= 3` 改成 `round >= 99999`（等于关掉信用等待 ✓）——
+   若仍挂 ✗ ⇒ 问题在 stamp/reduce 的握手 ✓（首查：reduce 自旋的 `stamps[p] >= round` 是否
+   真被 store 内核的"最后块"写到了 ✓；store 里 `is_last` 用 `atomicAdd(ctr)` 判定，
+   注意每轮结束会把 `ctr` 归零 ✓）；
+2. 再把 store 尾部的 in-kernel 盖章**临时换回**独立的 `dsv41_ar_stamp` 调用 ✗→✓
+   （即恢复"分层内核"的旧写法 ✓）—— 若这样就不挂 ✓ ⇒ 问题就在 in-kernel 盖章的
+   `__shared__`/`__syncthreads` 结构里 ✓（注意 store 内核里 `if (i < n)` 后**不能有提前 return**
+   ✓，否则 `__syncthreads` 会死锁 ✓ —— 这点我已改成无提前 return ✓）。
+
+**harness 入口**：`tests/ar_micro.rs`，见上一节命令 ✓（`AR_MICRO_WORLD/ROUNDS/N` 可调 ✓）。
