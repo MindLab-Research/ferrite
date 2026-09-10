@@ -1752,3 +1752,32 @@ Dump 显示 AR 之后 half 1 仍是 `slot0=[0,0,0,0]` / `slot1=[1000,1000,1000,1
 **段图所需的 FFI**（本 crate 尚无）：`cuStreamBeginCapture_v2` / `cuStreamEndCapture` /
 `cuGraphInstantiate_v2` / `cuGraphLaunch` / `cuGraphExecDestroy` —— 5 个符号 ✓，
 照 `device.rs` 现有的 `sym(h_k, ...)` 模式绑定即可 ✓。
+
+## ★★★★ 段图已跑通（正确 ✓）但**不带来提速** —— 驳倒"发射数是瓶颈"的假设
+
+**已落地并验证**（`DSV41_GRAPH_MOE=1`，默认关）：
+- 5 个 CUDA graph 符号 + `Device::{capture_begin,capture_end,graph_instantiate,graph_launch,graph_free}` ✓
+- `moe()` 的 AR 拆成 `moe_reduce()`（图外、主机发射 ✓）
+- 每层 MoE 段（gate/route/6 专家/shared ✓）捕获成图 ✓：首步捕获 40 个层图、次步起全部回放 ✓
+- **文本正确**：`The capital of France is → [51119, 1]` = " Paris" ✓✓
+
+**为跑通它修掉的 4 个真缺陷（都是宝贵的捕获纪律）**：
+| # | 缺陷 | 现象 |
+|---|---|---|
+| 1 | `zero_at` 用**同步 `cudaMemset`**（跑在 legacy stream 0 ✗） | `operation would make the legacy stream depend on a capturing blocking stream` |
+| 2 | `memcpy_d2d` 用**同步 `cudaMemcpy`** ✗ | 同上 |
+| 3 | **`dsv41_quant_fp4` 每次调用 `cudaMalloc`+`cudaFree`** ✗✗ | `cudaErrorMemoryAllocation`(2) at launch —— **同时是热路径的同步慢指令**（每层调 6-8 次）→ 改为**每设备缓存 scratch**（只在非捕获期增长 ✓） |
+| 4 | **捕获模式用 `Global`(0)** ✗✗ | `cudaErrorStreamCaptureUnjoined`(901) + `cudaGraphInstantiate`(900) —— Global 下**任何线程**的 CUDA 活动都作废捕获 ✓，而 TP8 是 8 个 rank 线程各跑一条流 ✓ → 必须用 **`cudaStreamCaptureModeRelaxed`(2)** |
+
+**结果：吞吐完全不变** ✗（7.5 tok/s，133.1ms/token，两路径同值 ✓；PHASE 逐层数据亦无差别 ✓）。
+
+### 由此得到的**决定性结论**（下会话必须以它开局）
+> **"每层 ~130 次发射 × ~18µs = 主机瓶颈"这个假设是错的** ✗✗。
+> 把 MoE 的 ~46 次发射压成 1 次（图回放 ✓）**对墙钟零影响** ⇒ 主机时间不在"发射数"上，
+> 而在别处（最可能是 **AR 的跨 rank 主机 barrier** 与 **逐层 host↔device 同步点**）。
+
+**因此下一步必须是 nsys 实际剖析**（不要再按"发射数"推理 ✓），先回答：
+45 层解码稳态下，**主机时间**到底落在哪些调用上（barrier？`download_f32`？peer 拷贝？各占多少）。
+
+**同时保留的收益**：段图基础设施本身是有价值的 ✓（整层图化的必经之路 ✓），
+且本轮顺手修掉的 **per-call `cudaMalloc`** 是纯赚 ✓（去掉了热路径上的同步慢指令 ✓）。
