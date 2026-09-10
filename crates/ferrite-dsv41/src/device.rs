@@ -44,6 +44,15 @@ struct Cudart {
     memcpy_2d: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int) -> c_int,
     mem_info: unsafe extern "C" fn(*mut usize, *mut usize) -> c_int,
     memcpy_peer: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> c_int,
+    // ---- CUDA graph capture (segment graphs: the layers are
+    // [hc+attn] -> AR -> [hc+MoE] -> AR and nothing between the two ARs needs the
+    // host, so each segment can be captured while the ARs stay host-issued) ----
+    stream_begin_capture: Option<unsafe extern "C" fn(CuStream, c_int) -> c_int>,
+    stream_end_capture: Option<unsafe extern "C" fn(CuStream, *mut *mut c_void) -> c_int>,
+    graph_instantiate: Option<unsafe extern "C" fn(*mut *mut c_void, *mut c_void, u64) -> c_int>,
+    graph_launch: Option<unsafe extern "C" fn(*mut c_void, CuStream) -> c_int>,
+    graph_exec_destroy: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    graph_destroy: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
 }
 
 struct Cublas {
@@ -335,6 +344,24 @@ impl Device {
                 memcpy_2d: f!(h_cudart, "cudaMemcpy2D"),
                 mem_info: f!(h_cudart, "cudaMemGetInfo"),
                 memcpy_peer: f!(h_cudart, "cudaMemcpyPeer"),
+                stream_begin_capture: sym(h_cudart, "cudaStreamBeginCapture")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                stream_end_capture: sym(h_cudart, "cudaStreamEndCapture")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                graph_instantiate: sym(h_cudart, "cudaGraphInstantiate")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                graph_launch: sym(h_cudart, "cudaGraphLaunch")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                graph_exec_destroy: sym(h_cudart, "cudaGraphExecDestroy")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                graph_destroy: sym(h_cudart, "cudaGraphDestroy")
+                    .ok()
+                    .map(|p| unsafe { std::mem::transmute_copy(&p) }),
             };
             let cublas = Cublas {
                 create: f!(h_cublas, "cublasCreate_v2"),
@@ -485,6 +512,12 @@ impl Device {
                 memcpy_2d: f!(h, "cudaMemcpy2D"),
                 mem_info: f!(h, "cudaMemGetInfo"),
                 memcpy_peer: f!(h, "cudaMemcpyPeer"),
+                stream_begin_capture: None,
+                stream_end_capture: None,
+                graph_instantiate: None,
+                graph_launch: None,
+                graph_exec_destroy: None,
+                graph_destroy: None,
             })
         }
     }
@@ -1268,6 +1301,54 @@ impl Device {
         let f = self.need(self.kernels.ar_stamp, "dsv41_ar_stamp")?;
         let rc = unsafe { f(peer_stamps, world, rank, round, self.stream) };
         self.kerr(rc, "dsv41_ar_stamp")
+    }
+
+    // ---- CUDA graph capture helpers (segment graphs) ----
+    /// Begin capturing work queued on this device's stream.
+    pub fn capture_begin(&self) -> Result<()> {
+        let f = self.need(self.cudart.stream_begin_capture, "cudaStreamBeginCapture")?;
+        let rc = unsafe { f(self.stream, 0 /* cudaStreamCaptureModeGlobal */) };
+        self.kerr(rc, "cudaStreamBeginCapture")
+    }
+
+    /// End the capture and return the graph handle.
+    pub fn capture_end(&self) -> Result<*mut c_void> {
+        let f = self.need(self.cudart.stream_end_capture, "cudaStreamEndCapture")?;
+        let mut g: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { f(self.stream, &mut g) };
+        self.kerr(rc, "cudaStreamEndCapture")?;
+        Ok(g)
+    }
+
+    /// Instantiate a captured graph into an executable.
+    pub fn graph_instantiate(&self, g: *mut c_void) -> Result<*mut c_void> {
+        let f = self.need(self.cudart.graph_instantiate, "cudaGraphInstantiate")?;
+        let mut e: *mut c_void = std::ptr::null_mut();
+        let rc = unsafe { f(&mut e, g, 0) };
+        self.kerr(rc, "cudaGraphInstantiate")?;
+        Ok(e)
+    }
+
+    pub fn graph_launch(&self, e: *mut c_void) -> Result<()> {
+        let f = self.need(self.cudart.graph_launch, "cudaGraphLaunch")?;
+        let rc = unsafe { f(e, self.stream) };
+        self.kerr(rc, "cudaGraphLaunch")
+    }
+
+    pub fn graph_free(&self, g: *mut c_void, e: *mut c_void) -> Result<()> {
+        if !e.is_null() {
+            if let Some(f) = self.cudart.graph_exec_destroy {
+                let rc = unsafe { f(e) };
+                self.kerr(rc, "cudaGraphExecDestroy")?;
+            }
+        }
+        if !g.is_null() {
+            if let Some(f) = self.cudart.graph_destroy {
+                let rc = unsafe { f(g) };
+                self.kerr(rc, "cudaGraphDestroy")?;
+            }
+        }
+        Ok(())
     }
 
     /// Publish with a device-side credit wait (replaces the host barrier).
