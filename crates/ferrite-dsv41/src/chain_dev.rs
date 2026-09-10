@@ -722,12 +722,12 @@ impl<'a> DevChain<'a> {
             dim as i32,
             self.s.o.ptr as *mut f32,
         )?;
-        // wo_b splits the reduction dim (its weights are column-sharded), so
-        // each rank holds a partial sum
-        if let Some(c) = self.comm.clone() {
-            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
-            c.end_round();
-        }
+        // NOTE: in the current TP configuration the dense projections are
+        // replicated (only the experts, 96% of the bytes, are sharded), so this
+        // output is already complete on every rank and must NOT be reduced —
+        // summing it would multiply it by the world size. The reduce belongs
+        // here once wo_b's weights are column-sharded, which needs the
+        // reference's per-group row split.
         Ok(())
     }
 

@@ -88,26 +88,32 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         push(&mut out, format!("{p}.attn.wq_a.weight"), vec![ql, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wq_a.scale"), vec![ql / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.q_norm.weight"), vec![ql], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Heads);
-        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Heads);
+        // TP note: the experts are 96% of the weights and are the only thing
+        // sharded for now; the dense projections are replicated so each rank
+        // computes them identically (no reduction needed, at the cost of
+        // redundant work). Sharding them properly needs the reference's
+        // per-group split, whose rows are strided rather than a contiguous
+        // range, so it is a separate change.
+        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.weight"), vec![hd, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.scale"), vec![hd / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.kv_norm.weight"), vec![hd], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Heads);
+        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Replicated);
         push(
             &mut out,
             format!("{p}.attn.wo_a.weight"),
             vec![groups * ol, hpg * hd],
-            Shard::Groups,
+            Shard::Replicated,
         );
         push(
             &mut out,
             format!("{p}.attn.wo_a.scale"),
             vec![groups * ol / 32, hpg * hd / 32],
-            Shard::Groups,
+            Shard::Replicated,
         );
-        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Cols);
-        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Cols);
+        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Replicated);
         // compressor (only kv sources have one)
         let ratio = cfg.compress_ratio(l);
         if cfg.is_kv_source(l) {
@@ -136,19 +142,19 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 &mut out,
                 format!("{p}.attn.indexer.wq_b.weight"),
                 vec![inh * ihd, ql],
-                Shard::Heads,
+                Shard::Replicated,
             );
             push(
                 &mut out,
                 format!("{p}.attn.indexer.wq_b.scale"),
                 vec![inh * ihd / 32, ql / 32],
-                Shard::Heads,
+                Shard::Replicated,
             );
             push(
                 &mut out,
                 format!("{p}.attn.indexer.weights_proj.weight"),
                 vec![inh, dim],
-                Shard::Heads,
+                Shard::Replicated,
             );
             if cfg.indexer_owns_k(l) {
                 push(
@@ -256,16 +262,22 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         push(&mut out, format!("{p}.attn.wq_a.weight"), vec![ql, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wq_a.scale"), vec![ql / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.q_norm.weight"), vec![ql], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Heads);
-        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Heads);
+        // TP note: the experts are 96% of the weights and are the only thing
+        // sharded for now; the dense projections are replicated so each rank
+        // computes them identically (no reduction needed, at the cost of
+        // redundant work). Sharding them properly needs the reference's
+        // per-group split, whose rows are strided rather than a contiguous
+        // range, so it is a separate change.
+        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.weight"), vec![hd, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.scale"), vec![hd / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.kv_norm.weight"), vec![hd], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Heads);
-        push(&mut out, format!("{p}.attn.wo_a.weight"), vec![groups * ol, hpg * hd], Shard::Groups);
-        push(&mut out, format!("{p}.attn.wo_a.scale"), vec![groups * ol / 32, hpg * hd / 32], Shard::Groups);
-        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Cols);
-        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Cols);
+        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_a.weight"), vec![groups * ol, hpg * hd], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_a.scale"), vec![groups * ol / 32, hpg * hd / 32], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Replicated);
         let (n_routed, _) = cfg.moe_config(mtp_layer);
         push(&mut out, format!("{p}.ffn.gate.weight"), vec![n_routed, dim], Shard::Replicated);
         push(&mut out, format!("{p}.ffn.gate.bias"), vec![n_routed], Shard::Replicated);
