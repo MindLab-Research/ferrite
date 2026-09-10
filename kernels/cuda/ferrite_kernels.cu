@@ -7422,20 +7422,36 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     float* pre_s_g = mx_scratch + (size_t)s * mix * KS + (size_t)s * KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
-    dim3 mix_grid(s, (mix + 3) / 4, KS);
-    if (ferrite_pdl_enabled()) {
-        cudaLaunchConfig_t cfg = {};
-        cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
-        cfg.dynamicSmemBytes = 0; cfg.stream = stream;
-        cudaLaunchAttribute attrs[1];
-        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-        attrs[0].val.programmaticStreamSerializationAllowed = 1;
-        cfg.attrs = attrs; cfg.numAttrs = 1;
-        cudaLaunchKernelEx(&cfg, hc_pre_mix_split_kernel,
-                           res, fw, mx_scratch, ctr2, s, n, h, mix);
-    } else {
-        hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+    // FERRITE_HC_MIX_PAIR=0 reverts to the per-token kernel.
+    static int mix_pair = -1;
+    if (mix_pair < 0) {
+        const char* e = getenv("FERRITE_HC_MIX_PAIR");
+        mix_pair = (e && e[0] == '0') ? 0 : 1;
+    }
+    if (mix_pair) {
+        dim3 mix_grid((s + 1) / 2, (mix + 3) / 4, KS);
+        hc_pre_mix_split2_kernel<<<mix_grid, 256, 0, stream>>>(
             res, fw, mx_scratch, ctr2, s, n, h, mix);
+        cudaError_t e1 = cudaGetLastError();
+        if (e1 != cudaSuccess) return e1;
+    } else {
+        dim3 mix_grid(s, (mix + 3) / 4, KS);
+        if (ferrite_pdl_enabled()) {
+            cudaLaunchConfig_t cfg = {};
+            cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
+            cfg.dynamicSmemBytes = 0; cfg.stream = stream;
+            cudaLaunchAttribute attrs[1];
+            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+            attrs[0].val.programmaticStreamSerializationAllowed = 1;
+            cfg.attrs = attrs; cfg.numAttrs = 1;
+            cudaLaunchKernelEx(&cfg, hc_pre_mix_split_kernel,
+                               res, fw, mx_scratch, ctr2, s, n, h, mix);
+        } else {
+            hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+                res, fw, mx_scratch, ctr2, s, n, h, mix);
+        }
+        cudaError_t e0 = cudaGetLastError();
+        if (e0 != cudaSuccess) return e0;
     }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
