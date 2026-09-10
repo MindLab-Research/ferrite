@@ -59,7 +59,9 @@ extern "C" {
     /// `bias` may be null. Uses m16n8k32 fp8 MMA with the epilogue scheme above.
     pub fn dsv41_gemm_fp8_mx(
         a: *const u8,
-        a_scale: *const u8,
+        // a_scale: f32 power-of-two activation scales, one per (row, k/32) --
+        // the reference's `scales_a` type. (w_scale below is ue8m0 BYTES.)
+        a_scale: *const f32,
         w: *const u8,
         w_scale: *const u8,
         bias: *const f32,

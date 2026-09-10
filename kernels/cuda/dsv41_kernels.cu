@@ -146,7 +146,12 @@ __global__ void fp4_pack_kernel(const uint8_t* __restrict__ nib, uint8_t* __rest
 // One warp per 16x16 output tile (two n-tiles of 8). Each step consumes exactly
 // one 32-wide k block, which is also exactly one scale block, so the scales are
 // applied per k-block into a running fp32 accumulator -- the reference scheme.
-__global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const uint8_t* __restrict__ a_scale,
+// NOTE on scale types: the ACTIVATION scales are f32 power-of-two values (the
+// reference's `scales_a` is fp32; `act_quant` with round_scale returns
+// 2^ceil(log2(amax/448)) as a float), while the WEIGHT scales are ue8m0 bytes
+// straight out of the checkpoint. Mixing the two up silently zeroes the output,
+// which is what tests_dsv41_gemm_fp8.cu guards against.
+__global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                                 const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                                 const float* __restrict__ bias, float* __restrict__ out, int m,
                                 int n, int k) {
@@ -164,7 +169,10 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const uint8_t* __
     }
     __syncthreads();
 
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};  // rows m0+gid, m0+gid+8 x 2 columns
+    // NOTE: the warp owns 16 columns = TWO 8-wide n-tiles, so each n-tile needs
+    // its own accumulator (a single acc[4] would sum the two tiles together and
+    // the second tile's columns would never be written).
+    float acc[2][4] = {{0.f, 0.f, 0.f, 0.f}, {0.f, 0.f, 0.f, 0.f}};
     const int nb_k = k >> 5;
     for (int kb = 0; kb < nb_k; kb++) {
         // A fragment: 4 regs, 4 e4m3 each
@@ -175,12 +183,18 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const uint8_t* __
             const int c = tg * 4 + 16 * (i >> 1);
             af[i] = *(const uint32_t*)&sa[r * k + kb * 32 + c];
         }
-        float c0[4] = {0.f, 0.f, 0.f, 0.f};
-        #pragma unroll
+#pragma unroll
         for (int nt = 0; nt < 2; nt++) {
-            const int ncol = n0 + nt * 8 + gid;
+            // Clamp to the last valid row/column: when `n` is not a multiple of
+            // the 64-column block tile the tail warp/n-tile computes garbage
+            // columns (dropped in the epilogue) and must not read out of
+            // bounds. Real model shapes are multiples of 64, but relying on
+            // that is a bug waiting to happen (found by
+            // tests_dsv41_gemm_fp8.cu with n=96).
+            const int ncol = min(n0 + nt * 8 + gid, n - 1);       // B row (read)
+            const int scol = min(n0 + nt * 8 + tg * 2, n - 1);    // C columns (scale)
             uint32_t bf[2];
-            #pragma unroll
+#pragma unroll
             for (int i = 0; i < 2; i++) {
                 const int kk = kb * 32 + tg * 4 + 16 * i;
                 bf[i] = *(const uint32_t*)&w[(size_t)ncol * k + kk];
@@ -192,27 +206,31 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const uint8_t* __
                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
                 : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
             // per-k-block scales: activation per row, weight per (n/32, k/32)
-            const float sar0 = ue8m0_to_f(a_scale[(size_t)(m0 + gid) * nb_k + kb]);
-            const float sar1 = ue8m0_to_f(a_scale[(size_t)(m0 + gid + 8) * nb_k + kb]);
-            const float sb0 = ue8m0_to_f(w_scale[(size_t)(ncol >> 5) * nb_k + kb]);
-            const float sb1 = ue8m0_to_f(w_scale[(size_t)((ncol + 1) >> 5) * nb_k + kb]);
-            c0[0] += d[0] * sar0 * sb0;  // (gid, 2*tg)
-            c0[1] += d[1] * sar0 * sb1;  // (gid, 2*tg+1)
-            c0[2] += d[2] * sar1 * sb0;  // (gid+8, 2*tg)
-            c0[3] += d[3] * sar1 * sb1;
+            const int mr0 = min(m0 + gid, m - 1), mr1 = min(m0 + gid + 8, m - 1);
+            const float sar0 = a_scale[(size_t)mr0 * nb_k + kb];
+            const float sar1 = a_scale[(size_t)mr1 * nb_k + kb];
+            const float sb0 = ue8m0_to_f(w_scale[(size_t)(scol >> 5) * nb_k + kb]);
+            const float sb1 = ue8m0_to_f(w_scale[(size_t)(min(scol + 1, n - 1) >> 5) * nb_k + kb]);
+            acc[nt][0] += d[0] * sar0 * sb0;  // (gid, 2*tg)     of n-tile nt
+            acc[nt][1] += d[1] * sar0 * sb1;  // (gid, 2*tg+1)
+            acc[nt][2] += d[2] * sar1 * sb0;  // (gid+8, 2*tg)
+            acc[nt][3] += d[3] * sar1 * sb1;
         }
-        acc[0] += c0[0]; acc[1] += c0[1]; acc[2] += c0[2]; acc[3] += c0[3];
     }
-    // epilogue: C fragment rows gid / gid+8, columns 2*tg / 2*tg+1
-    if (m0 + gid < m) {
-        const int col = n0 + tg * 2;
-        out[(size_t)(m0 + gid) * n + col] = acc[0] + (bias ? bias[col] : 0.f);
-        out[(size_t)(m0 + gid) * n + col + 1] = acc[1] + (bias ? bias[col + 1] : 0.f);
-    }
-    if (m0 + gid + 8 < m) {
-        const int col = n0 + tg * 2;
-        out[(size_t)(m0 + gid + 8) * n + col] = acc[2] + (bias ? bias[col] : 0.f);
-        out[(size_t)(m0 + gid + 8) * n + col + 1] = acc[3] + (bias ? bias[col + 1] : 0.f);
+    // epilogue: both n-tiles, C fragment rows gid / gid+8, columns 2*tg / 2*tg+1
+#pragma unroll
+    for (int nt = 0; nt < 2; nt++) {
+        const int col = n0 + nt * 8 + tg * 2;
+        const float b0 = (bias && col < n) ? bias[col] : 0.f;
+        const float b1 = (bias && col + 1 < n) ? bias[col + 1] : 0.f;
+        if (m0 + gid < m) {
+            if (col < n) out[(size_t)(m0 + gid) * n + col] = acc[nt][0] + b0;
+            if (col + 1 < n) out[(size_t)(m0 + gid) * n + col + 1] = acc[nt][1] + b1;
+        }
+        if (m0 + gid + 8 < m) {
+            if (col < n) out[(size_t)(m0 + gid + 8) * n + col] = acc[nt][2] + b0;
+            if (col + 1 < n) out[(size_t)(m0 + gid + 8) * n + col + 1] = acc[nt][3] + b1;
+        }
     }
 }
 
@@ -508,6 +526,285 @@ __global__ void moe_route_kernel(const float* __restrict__ x, const uint8_t* __r
     }
 }
 
+
+// --------------------------------------------------------- indexer (level 2)
+// One CTA per (b, m) row of `indexer_topk` (ops.rs golden):
+//   score[p] = sum_h relu(q[b,m,h,:] . k[b,p,:]) * weights[b,m,h]
+//              * softmax_scale * head_scale
+//   p >= compress_lens[m] -> -inf ; candidate-masked -> -inf
+// then top-`cols` with the golden's stable tie rule (equal scores keep the
+// lower position), the picked positions re-sorted ascending, and `p + offset`
+// written for reachable positions / -1 otherwise.
+__global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __restrict__ ik,
+                                    const float* __restrict__ w, const uint8_t* __restrict__ cand,
+                                    const int32_t* __restrict__ lens, int32_t* __restrict__ out,
+                                    int m, int nh, int hd, int n_pos, int topk, int offset,
+                                    float softmax_scale, float head_scale, int uses_cand) {
+    extern __shared__ float smem[];
+    const int cols = topk < n_pos ? topk : n_pos;
+    float* s_score = smem;                  // [n_pos]
+    int* s_pick = (int*)(s_score + n_pos);  // [cols]
+    int* s_sort = s_pick + cols;            // [cols]
+    uint8_t* s_used = (uint8_t*)(s_sort + cols);  // [n_pos]
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    const int mm = blockIdx.x, bb = blockIdx.y;
+    const size_t row = (size_t)bb * m + mm;
+
+    int cl = n_pos;
+    if (lens != nullptr) cl = lens[mm];
+    if (cl > n_pos) cl = n_pos;
+    for (int i = tid; i < n_pos; i += nthr) s_used[i] = 0;
+    __syncthreads();
+
+    // ---- scores
+    const float* qrow = q + row * (size_t)nh * hd;
+    for (int p = tid; p < n_pos; p += nthr) {
+        const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
+        float acc = 0.f;
+        for (int h = 0; h < nh; ++h) {
+            const float* qh = qrow + (size_t)h * hd;
+            float dot = 0.f;
+            for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
+            acc += fmaxf(dot, 0.f) * w[row * (size_t)nh + h];
+        }
+        float sv = acc * softmax_scale * head_scale;
+        if (p >= cl) sv = -INFINITY;
+        if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
+        s_score[p] = sv;
+    }
+    __syncthreads();
+
+    // ---- stable top-`cols` (iterative block argmax; ties -> lower index)
+    __shared__ float s_bv[32];
+    __shared__ int s_bi[32];
+    const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
+    for (int it = 0; it < cols; ++it) {
+        float bv = -INFINITY;
+        int bi = -1;  // filled on the first scanned entry, even if it is -inf
+        for (int p = tid; p < n_pos; p += nthr) {
+            if (s_used[p]) continue;
+            const float v = s_score[p];
+            if (bi < 0 || v > bv) {
+                bv = v;
+                bi = p;
+            }
+        }
+        if (bi < 0) bi = n_pos;  // this thread had no entries, use the sentinel
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            s_bv[warp] = bv;
+            s_bi[warp] = bi;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            float xv = -INFINITY;
+            int xi = n_pos;
+            for (int widx = 0; widx < nw; ++widx) {
+                const float v = s_bv[widx];
+                const int i = s_bi[widx];
+                if (v > xv || (v == xv && i < xi)) {
+                    xv = v;
+                    xi = i;
+                }
+            }
+            s_pick[it] = xi;
+            if (xi < n_pos) s_used[xi] = 1;  // consume it (marking -inf is a no-op)
+        }
+        __syncthreads();
+    }
+
+    // ---- sort the picked positions ascending (unique -> rank by counting)
+    if (cols > 0) {
+        for (int i = tid; i < cols; i += nthr) {
+            const int pi = s_pick[i];
+            int rank = 0;
+            for (int j = 0; j < cols; ++j) {
+                const int pj = s_pick[j];
+                if (pj < pi || (pj == pi && j < i)) ++rank;
+            }
+            s_sort[rank] = pi;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < cols; i += nthr) {
+        const int p = s_sort[i];
+        out[row * (size_t)cols + i] = (p < cl) ? (p + offset) : -1;
+    }
+}
+
+// ---------------------------------------------------------------- compressor
+// f32 -> e4m3 with one power-of-two ue8m0 scale per (row, 32-column block):
+// the activation layout the fp8 GEMM path (gemm_fp8_kernel) consumes.
+// One warp per 32-element block, one scale byte per block.
+__global__ void quant_e4m3_pow2_kernel(const float* __restrict__ x, uint8_t* __restrict__ y,
+                                       float* __restrict__ scale, int rows, int nb) {
+    const int unit = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (unit >= rows * nb) return;
+    const float* src = x + (size_t)unit * 32;
+    float amax = fabsf(src[lane]);
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
+    const float sc = fmaxf(fast_round_scale(amax, 1.0f / 448.0f), 1e-30f);
+    if (lane == 0) scale[unit] = sc;   // f32, matching the GEMM's `scales_a`
+    const float q = fminf(fmaxf(src[lane] / sc, -448.f), 448.f);
+    y[unit * 32 + lane] = (uint8_t)__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3);
+}
+
+// Carries the current step's projections into the compressor state:
+//   start_pos == 0 (prefill): the trailing `seqlen % ratio` rows -> slots 0..rem-1
+//   start_pos  > 0 (decode) : the single row -> slot (start_pos % ratio)
+__global__ void compressor_state_kernel(const float* __restrict__ kvp,
+                                        const float* __restrict__ scp,
+                                        float* __restrict__ state_kv,
+                                        float* __restrict__ state_score, int b, int seqlen,
+                                        int hd, int ratio, int start_pos) {
+    const size_t stride = (size_t)gridDim.x * blockDim.x;
+    if (start_pos == 0) {
+        const int rem = seqlen % ratio;
+        if (rem <= 0) return;
+        const int cut = seqlen - rem;
+        const size_t total = (size_t)b * rem * hd;
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride) {
+            const int c = (int)(i % hd);
+            const size_t rt = i / hd;
+            const int bbi = (int)(rt / rem), t = (int)(rt % rem);
+            const size_t src = ((size_t)bbi * seqlen + cut + t) * hd + c;
+            const size_t dst = ((size_t)bbi * ratio + t) * hd + c;
+            state_kv[dst] = kvp[src];
+            state_score[dst] = scp[src];
+        }
+    } else {
+        const int slot = start_pos % ratio;
+        const size_t total = (size_t)b * hd;
+        for (size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += stride) {
+            const int c = (int)(i % hd);
+            const int bbi = (int)(i / hd);
+            const size_t src = (size_t)bbi * hd + c;
+            const size_t dst = ((size_t)bbi * ratio + slot) * hd + c;
+            state_kv[dst] = kvp[src];
+            state_score[dst] = scp[src];
+        }
+    }
+}
+
+// Pooling + RMSNorm epilogue of the compressor (ops.rs compressor_forward):
+//   mode 0 (ratio == 1)      : latents[row] = rmsnorm(kvp[row]) for all rows
+//   mode 1 (ratio > 1, prefill): one latent per completed group of `ratio` rows,
+//                              pooled with a per-channel softmax over the group
+//   mode 2 (ratio > 1, decode) : pool the `ratio` state slots (only when the step
+//                              completes a group; `out_rows_val` carries that)
+// `*out_rows` is written unconditionally by block 0 so the caller always sees
+// the decision (0 = nothing written).
+__global__ void compressor_pool_kernel(const float* __restrict__ kvp,
+                                       const float* __restrict__ scp,
+                                       const float* __restrict__ norm_w,
+                                       const float* __restrict__ state_kv,
+                                       const float* __restrict__ state_score,
+                                       float* __restrict__ latents, int32_t* __restrict__ out_rows,
+                                       int mode, int grid_n, int out_rows_val, int b, int seqlen,
+                                       int hd, int ratio, int start_pos, float eps) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) *out_rows = out_rows_val;
+    if ((int)blockIdx.x >= grid_n) return;
+    // an unfinished decode group updates the state but writes no latent
+    if (mode == 2 && out_rows_val == 0) return;
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    __shared__ float s_red[32];
+
+    // channels this thread owns (strided; inactive threads contribute 0 to ss)
+    float yv[16];
+    int cn[16];
+    int nown = 0;
+    for (int c = tid; c < hd; c += nthr) {
+        if (nown >= 16) break;
+        cn[nown++] = c;
+    }
+
+    int out_row = -1;
+    int bb = 0;
+    int ngroups = 0;
+
+    if (mode == 0) {  // ratio == 1: plain projection row
+        out_row = (int)blockIdx.x;
+        for (int i = 0; i < nown; ++i) yv[i] = kvp[(size_t)out_row * hd + cn[i]];
+    } else if (mode == 1) {  // prefill: pool group g of batch bb
+        ngroups = grid_n / b;
+        bb = (int)blockIdx.x / ngroups;
+        const int g = (int)blockIdx.x % ngroups;
+        out_row = bb * ngroups + g;
+        for (int i = 0; i < nown; ++i) {
+            const int c = cn[i];
+            float mx = -INFINITY;
+            float sv[32];
+            float vv[32];
+            const int rr = ratio < 32 ? ratio : 32;
+            for (int r = 0; r < rr; ++r) {
+                const size_t rw = ((size_t)bb * seqlen + (size_t)g * ratio + r) * hd + c;
+                sv[r] = scp[rw];
+                vv[r] = kvp[rw];
+                mx = fmaxf(mx, sv[r]);
+            }
+            float den = 0.f, acc = 0.f;
+            for (int r = 0; r < rr; ++r) {
+                const float e = expf(sv[r] - mx);
+                den += e;
+                acc += e * vv[r];
+            }
+            yv[i] = den > 0.f ? acc / den : 0.f;
+        }
+    } else {  // decode: pool the carried state slots
+        for (int i = 0; i < nown; ++i) {
+            const int c = cn[i];
+            float mx = -INFINITY;
+            float sv[32];
+            float vv[32];
+            const int rr = ratio < 32 ? ratio : 32;
+            for (int r = 0; r < rr; ++r) {
+                sv[r] = state_score[((size_t)bb * ratio + r) * hd + c];
+                vv[r] = state_kv[((size_t)bb * ratio + r) * hd + c];
+                mx = fmaxf(mx, sv[r]);
+            }
+            float den = 0.f, acc = 0.f;
+            for (int r = 0; r < rr; ++r) {
+                const float e = expf(sv[r] - mx);
+                den += e;
+                acc += e * vv[r];
+            }
+            yv[i] = den > 0.f ? acc / den : 0.f;
+        }
+        out_row = bb;
+    }
+
+    // RMSNorm over the pooled row (weights + eps, exactly as the golden)
+    {
+        float ss = 0.f;
+        for (int i = 0; i < nown; ++i) ss += yv[i] * yv[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
+        if (lane == 0) s_red[warp] = ss;
+        __syncthreads();
+        float total = 0.f;
+        for (int widx = 0; widx < nw; ++widx) total += s_red[widx];
+        const float inv = rsqrtf(total / (float)hd + eps);
+        for (int i = 0; i < nown; ++i) {
+            const int c = cn[i];
+            latents[(size_t)out_row * hd + c] = yv[i] * inv * norm_w[c];
+        }
+    }
+    (void)start_pos;
+}
+
 }  // namespace
 
 #define DSV41_LAUNCH_CHECK()                     \
@@ -542,7 +839,7 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const uint8_t* a_scale, const uint8_t* w,
+extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const uint8_t* w,
                                  const uint8_t* w_scale, const float* bias, float* out, int m,
                                  int n, int k, cudaStream_t s) {
     if (m <= 0 || n <= 0 || k <= 0 || (k & 31)) return (int)cudaErrorInvalidValue;
@@ -584,14 +881,22 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_indexer_topk(const float*, const float*, const float*, const uint8_t*,
-                                  const int32_t*, int32_t*, int, int, int, int, int, int, int, float,
-                                  float, int, cudaStream_t) {
-    // The indexer's score + candidate mask + top-k selection is implemented on
-    // top of candidate_blocks_kernel + a shared top-k helper in the follow-up
-    // (see TODO); returning NotSupported keeps a caller from silently taking a
-    // non-fused path.
-    return (int)cudaErrorNotSupported;
+extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const float* weights,
+                                  const uint8_t* candidates, const int32_t* compress_lens,
+                                  int32_t* out, int b, int m, int nh, int hd, int n_pos, int topk,
+                                  int offset, float softmax_scale, float head_scale,
+                                  int uses_candidates, cudaStream_t s) {
+    if (b <= 0 || m <= 0 || nh <= 0 || hd <= 0 || topk <= 0) return (int)cudaErrorInvalidValue;
+    if (n_pos <= 0) return (int)cudaSuccess;  // nothing to select from
+    const int cols = topk < n_pos ? topk : n_pos;
+    const size_t smem =
+        (size_t)n_pos * (sizeof(float) + 1) + (size_t)cols * 2 * sizeof(int) + 64;
+    if (smem > 200 * 1024) return (int)cudaErrorInvalidValue;  // one CTA holds all scores
+    dim3 grid((unsigned)m, (unsigned)b);
+    indexer_topk_kernel<<<grid, 256, smem, s>>>(q, index_k, weights, candidates, compress_lens,
+                                                out, m, nh, hd, n_pos, topk, offset, softmax_scale,
+                                                head_scale, uses_candidates);
+    return (int)cudaGetLastError();
 }
 
 extern "C" int dsv41_candidate_blocks(const float* logits, const int32_t* compress_lens,
@@ -602,13 +907,120 @@ extern "C" int dsv41_candidate_blocks(const float* logits, const int32_t* compre
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_compressor(const float*, const uint8_t*, const uint8_t*, const uint8_t*,
-                                const uint8_t*, const float*, float*, float*, float*, int32_t*, int,
-                                int, int, int, int, int, float, cudaStream_t) {
-    // ratio-1 is a plain RMSNorm'd projection (handled by dsv41_gemm_fp8_mx +
-    // a norm); the ratio>1 softmax-gated pooling with its carried state is the
-    // next step (see TODO). NotSupported until then.
-    return (int)cudaErrorNotSupported;
+// The compressor's projections use the existing fp8 MMA path: activations are
+// quantised to e4m3 (per-(row, 32) power-of-two ue8m0 scales) and the fp8 GEMM
+// applies the checkpoint's 32x32 weight scales per k-block. head_dim must be a
+// multiple of 64 (the GEMM's column tile) and dim a multiple of 32.
+static int compressor_alloc(void** p, size_t n, cudaStream_t s) {
+    cudaError_t e = cudaMallocAsync(p, n, s);
+    if (e == cudaSuccess) return 0;
+    cudaGetLastError();
+    return (int)cudaMalloc(p, n);
+}
+static void compressor_free(void* p, cudaStream_t s) {
+    if (p == nullptr) return;
+    if (cudaFreeAsync(p, s) != cudaSuccess) {
+        cudaGetLastError();
+        cudaFree(p);
+    }
+}
+
+extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_t* wkv_scale,
+                                const uint8_t* wgate, const uint8_t* wgate_scale,
+                                const float* norm_w, float* state_kv, float* state_score,
+                                float* latents, int32_t* out_rows, int b, int seqlen, int dim,
+                                int head_dim, int ratio, int start_pos, float eps, cudaStream_t s) {
+    if (b <= 0 || seqlen <= 0 || dim <= 0 || head_dim <= 0 || ratio <= 0)
+        return (int)cudaErrorInvalidValue;
+    if ((dim & 31) || (head_dim & 63)) return (int)cudaErrorInvalidValue;
+    if (ratio > 1 && (wgate == nullptr || wgate_scale == nullptr || state_kv == nullptr ||
+                      state_score == nullptr))
+        return (int)cudaErrorInvalidValue;
+
+    const int rows = b * seqlen;
+    const int nb = dim >> 5;
+    const size_t sz_xq = (size_t)rows * dim;
+    const size_t sz_xs = (size_t)rows * nb * sizeof(float);   // f32 activation scales
+    const size_t sz_p = (size_t)rows * head_dim * sizeof(float);
+    void* xq = nullptr;
+    void* xs = nullptr;
+    void* kvp = nullptr;
+    void* scp = nullptr;
+    int rc = 0;
+    rc |= compressor_alloc(&xq, sz_xq, s);
+    rc |= compressor_alloc(&xs, sz_xs, s);
+    rc |= compressor_alloc(&kvp, sz_p, s);
+    if (ratio > 1) rc |= compressor_alloc(&scp, sz_p, s);
+    if (rc != 0) {
+        compressor_free(xq, s);
+        compressor_free(xs, s);
+        compressor_free(kvp, s);
+        compressor_free(scp, s);
+        return (int)cudaErrorMemoryAllocation;
+    }
+
+    // 1. activation quantisation (e4m3 + per-(row,32) power-of-two scales)
+    {
+        const int units = rows * nb;
+        const int blocks = (units + 3) / 4;  // 4 warps per CTA, one block each
+        quant_e4m3_pow2_kernel<<<blocks, 128, 0, s>>>(x, (uint8_t*)xq, (float*)xs, rows, nb);
+    }
+    // 2. kv / gate projections (the existing fp8 MMA path)
+    {
+        const int smem = 16 * dim;
+        if (smem > 200 * 1024) {
+            compressor_free(xq, s);
+            compressor_free(xs, s);
+            compressor_free(kvp, s);
+            compressor_free(scp, s);
+            return (int)cudaErrorInvalidValue;
+        }
+        cudaFuncSetAttribute(gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        dim3 grid((head_dim + 63) / 64, (rows + 15) / 16);
+        gemm_fp8_kernel<<<grid, 128, smem, s>>>((const uint8_t*)xq, (const float*)xs, wkv,
+                                                wkv_scale, nullptr, (float*)kvp, rows, head_dim,
+                                                dim);
+        if (ratio > 1)
+            gemm_fp8_kernel<<<grid, 128, smem, s>>>((const uint8_t*)xq, (const float*)xs, wgate,
+                                                    wgate_scale, nullptr, (float*)scp, rows,
+                                                    head_dim, dim);
+    }
+    // 3. state update (trailing partial group on prefill / the current slot on decode)
+    if (ratio > 1) {
+        const size_t work = start_pos == 0 ? (size_t)b * (seqlen % ratio) * head_dim
+                                           : (size_t)b * head_dim;
+        const int blocks = (int)((work + 255) / 256);
+        if (work > 0)
+            compressor_state_kernel<<<(blocks > 0 ? blocks : 1), 256, 0, s>>>(
+                (const float*)kvp, (const float*)scp, state_kv, state_score, b, seqlen, head_dim,
+                ratio, start_pos);
+    }
+    // 4. pooling + RMSNorm + the out_rows decision
+    int mode, grid_n, out_rows_val;
+    if (ratio == 1) {
+        mode = 0;
+        grid_n = rows;
+        out_rows_val = seqlen;
+    } else if (start_pos == 0) {
+        mode = 1;
+        grid_n = b * (seqlen / ratio);
+        out_rows_val = seqlen / ratio;
+    } else {
+        mode = 2;
+        grid_n = b;
+        out_rows_val = ((start_pos + 1) % ratio == 0) ? 1 : 0;
+    }
+    {
+        const unsigned launch = (unsigned)(grid_n > 0 ? grid_n : 1);
+        compressor_pool_kernel<<<launch, 128, 0, s>>>(
+            (const float*)kvp, (const float*)scp, norm_w, state_kv, state_score, latents, out_rows,
+            mode, grid_n, out_rows_val, b, seqlen, head_dim, ratio, start_pos, eps);
+    }
+    compressor_free(xq, s);
+    compressor_free(xs, s);
+    compressor_free(kvp, s);
+    compressor_free(scp, s);
+    return (int)cudaGetLastError();
 }
 
 extern "C" int dsv41_rope_precompute(float* cos, float* sin, int dim, int seqlen,

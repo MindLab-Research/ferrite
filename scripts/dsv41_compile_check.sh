@@ -14,7 +14,7 @@ set -euo pipefail
 REMOTE="${REMOTE:-ubuntu@43.202.208.136}"
 ARCH="${ARCH:-103a}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-FILES=(kernels/cuda/dsv41_kernels.cu kernels/cuda/dsv41_vision.cu)
+FILES=($(cd "$DIR" && ls kernels/cuda/dsv41_*.cu kernels/cuda/tests_*.cu 2>/dev/null))
 
 echo "== local syntax sanity (headers/ABI in the crate) =="
 (cd "$DIR" && cargo test -p ferrite-dsv41 --quiet 2>&1 | tail -3)
@@ -40,5 +40,11 @@ ssh -o BatchMode=yes "$REMOTE" "cd /tmp/dsv41_cc && for f in *.cu; do
   echo \"--- \$f ---\"
   nvcc -gencode arch=compute_${ARCH},code=sm_${ARCH} -O3 -std=c++17 -Xptxas -v \\
        -c \"\$f\" -o \"\${f%.cu}.o\" 2>&1 | grep -E 'error|warning|Used [0-9]+ registers|registers' | head -30 || true
+done"
+echo "== self-test programs: compile only (run them yourself with ./t_*) =="
+ssh -o BatchMode=yes "$REMOTE" "cd /tmp/dsv41_cc && for f in tests_*.cu; do
+  [ -f \"\$f\" ] || continue
+  printf '%-26s ' \"\$f\"
+  nvcc -gencode arch=compute_${ARCH},code=sm_${ARCH} -O3 -std=c++17 -o /tmp/dsv41_cc/\${f%.cu}.bin \"\$f\" 2>&1 | grep -cE 'error'
 done"
 echo "== done (compile only; no GPU work was started) =="
