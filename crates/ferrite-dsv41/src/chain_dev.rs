@@ -946,6 +946,11 @@ impl<'a> DevChain<'a> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let inter = cfg.moe_inter_dim;
+        // The expert matrices are sharded along `inter` (the reference cuts them
+        // by inter/world), so every expert kernel must be sized by the LOCAL
+        // width — passing the global 2304 made the gate/up kernel write twice
+        // the rows the weight has, which is what faulted under TP.
+        let inter_local = inter / self.world();
         let (n_routed, topk) = cfg.moe_config(layer);
 
         // gate: natively bf16, so a bf16 GEMM
