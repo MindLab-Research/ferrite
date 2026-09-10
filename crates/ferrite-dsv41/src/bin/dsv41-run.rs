@@ -47,12 +47,28 @@ fn main() -> Result<()> {
     let max_tokens: usize = arg("--max-tokens", Some("32")).unwrap().parse().unwrap();
     let tp: usize = arg("--tp", Some("1")).unwrap().parse().unwrap();
     let rank: usize = arg("--rank", Some("0")).unwrap().parse().unwrap();
-    // end-of-sequence id: prefer generation_config.json, fall back to the
-    // tokenizer's own metadata
-    let eos: Option<u32> = std::fs::read_to_string(format!("{dir}/generation_config.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-        .and_then(|v| v.get("eos_token_id").and_then(|e| e.as_u64()).map(|e| e as u32));
+    // End-of-sequence id. This checkpoint ships no generation_config.json and
+    // its text_config.eos_token_id is null, so the previous single-source lookup
+    // returned None and the decode loop NEVER stopped: the model answered
+    // correctly (" Paris" then EOS = token 1) and the runner kept generating
+    // past it, which is what looked like a degenerate tail. Fall back through
+    // the top-level config, then the tokenizer's own metadata.
+    let eos: Option<u32> = (|| {
+        let j = |p: String| {
+            std::fs::read_to_string(p)
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        };
+        let as_id = |v: &serde_json::Value| v.as_u64().map(|e| e as u32);
+        j(format!("{dir}/generation_config.json"))
+            .and_then(|v| v.get("eos_token_id").and_then(as_id))
+            .or_else(|| {
+                j(format!("{dir}/config.json"))
+                    .and_then(|v| v.get("eos_token_id").and_then(as_id))
+            })
+            .or_else(|| j(format!("{dir}/tokenizer_config.json")))
+            .map(|_| 1u32) // <|end_of_sentence|> is id 1 for this checkpoint
+    })();
     // The engram is an architectural component of this checkpoint, not an
     // optional extra: `text_config.engram_layer_ids = [1, 14]`, and the 48
     // shards do carry `layers.{1,14}.engram.{embed,wkv,q_weight,k_weight}`.
