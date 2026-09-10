@@ -719,32 +719,28 @@ impl<'a> DevChain<'a> {
         let k = hpg * hd;
         self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
         for g in 0..nlg {
-            // the rank's groups are a contiguous block, and its head block maps
-            // onto exactly those groups (a group is hpg heads and olg output rows)
-            let g_glob = rank * nlg + g; // global group this rank block covers
+            // The weight tensor is ALREADY the rank's local slice (Shard::Groups
+            // cut it at load time), so every offset must be LOCAL: group g of
+            // this rank's block sits at local row g*olg. The earlier version
+            // indexed with the GLOBAL group number (rank*nlg+g), which walks off
+            // the end of the local buffer for any rank but 0 — the illegal
+            // memory access in gemm_fp8_mx at tp=8.
             let a = self.s.xq.as_u8().wrapping_add(g * k);
             let asc = self.s.xsc.as_f32().wrapping_add((g * k / 32) as usize);
-            // weights and the output use GLOBAL group offsets (that is the
-            // layout on disk and the layout the chain's `wo` buffer mirrors)
-            let wp = ld
-                .wo_a
-                .as_ref()
-                .unwrap()
-                .as_u8()
-                .wrapping_add(g_glob * olg * k);
+            let wp = ld.wo_a.as_ref().unwrap().as_u8().wrapping_add(g * olg * k);
             let wsp = ld
                 .wo_a_scale
                 .as_ref()
                 .unwrap()
                 .as_u8()
-                .wrapping_add((g_glob * olg / 32) * (k / 32));
+                .wrapping_add((g * olg / 32) * (k / 32));
             self.dev.gemm_fp8_mx(
                 a,
                 asc,
                 wp,
                 wsp,
                 std::ptr::null(),
-                (self.s.wo.ptr as *mut f32).wrapping_add(g_glob * olg),
+                (self.s.wo.ptr as *mut f32).wrapping_add(g * olg),
                 1,
                 olg as i32,
                 k as i32,
@@ -754,8 +750,9 @@ impl<'a> DevChain<'a> {
         // reduces over its own slice and the ranks' partial sums are added.
         let ol_total = groups * cfg.o_lora_rank;
         let ol_local = ol_total / world;
+        // this rank wrote its groups at local offsets [0, nlg*olg) = [0, ol_local)
         self.lin(
-            (self.s.wo.ptr as *const f32).wrapping_add(rank * ol_local),
+            self.s.wo.ptr as *const f32,
             ol_local as i32,
             ld.wo_b.as_ref().unwrap(),
             ld.wo_b_scale.as_ref().unwrap(),
