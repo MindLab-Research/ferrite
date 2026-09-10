@@ -742,6 +742,9 @@ impl<'a> DevChain<'a> {
             dim as i32,
         )?;
         self.copy_h_back()?;
+        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+            eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
+        }
         Ok(2) // slot 2 holds this layer's ffn_pre = the next layer's premix
     }
 
