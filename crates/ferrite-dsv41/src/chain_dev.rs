@@ -1392,22 +1392,25 @@ impl<'a> DevChain<'a> {
             }
         }
         if !self.opts.skip_experts {
+            // The input row is identical for every expert, so quantise it ONCE
+            // here instead of inside the loop: the fp4 path was re-quantising and
+            // re-packing the same 5120-element row for each of the ~6 selected
+            // experts, i.e. 6x the quant_fp4 + fp4_pack launches (two of the
+            // per-expert small kernels nsys counts ~850 times).
+            self.dev.quant_fp4(
+                self.s.xn.ptr as *const f32,
+                self.s.xq.ptr as *mut u8,
+                self.s.xsc.ptr as *mut f32,
+                1,
+                dim as i32,
+                32,
+                true,
+            )?;
             for e in 0..ne {
                 if wsum[e] == 0.0 {
                     continue;
                 }
                 let ex = &ld.experts[e];
-                // the input row is the same for every expert: quantise once per
-                // expert (the fp4 kernel consumes it in place of a gather)
-                self.dev.quant_fp4(
-                    self.s.xn.ptr as *const f32,
-                    self.s.xq.ptr as *mut u8,
-                    self.s.xsc.ptr as *mut f32,
-                    1,
-                    dim as i32,
-                    32,
-                    true,
-                )?;
                 self.dev.expert_gate_up_fp4(
                     self.s.xq.as_u8(),
                     self.s.xsc.as_f32(),
