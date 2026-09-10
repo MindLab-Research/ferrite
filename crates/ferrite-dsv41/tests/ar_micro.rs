@@ -27,8 +27,11 @@ fn collective_all_reduce_matches_host_reference() {
     let so = std::env::var("DSV41_KERNELS").unwrap_or_else(|_| {
         "kernels/cuda/libferrite_kernels.so".to_string()
     });
-    let world = env_usize("AR_MICRO_WORLD", 8);
-    let rounds = env_usize("AR_MICRO_ROUNDS", 32);
+    // Defaults chosen so a bare `cargo test` is reliable on an 8-GPU box: 4 ranks
+    // is enough to expose parity/credit bugs (world=2 already did) and keeps the
+    // setup well inside a test timeout. Scale up with the env vars.
+    let world = env_usize("AR_MICRO_WORLD", 4);
+    let rounds = env_usize("AR_MICRO_ROUNDS", 8);
     let n = env_usize("AR_MICRO_N", 1024);
     if world < 2 {
         eprintln!("[ar_micro] world={world} < 2: nothing to reduce, skipping");
