@@ -56,6 +56,16 @@ fn main() -> Result<()> {
     let cfg_txt = std::fs::read_to_string(format!("{dir}/config.json"))
         .map_err(|e| ferrite_types::FerriteError::Config(format!("config.json: {e}")))?;
     let cfg = Dsv41Config::from_json_str(&cfg_txt)?;
+    // Bring-up truncation: a full single-GPU run is impossible (the checkpoint
+    // is ~286 GiB without the engram tables against ~180 GiB of HBM), so the
+    // pipeline is first exercised on the leading layers with real weights.
+    let mut cfg = cfg;
+    if let Ok(n) = std::env::var("DSV41_LAYERS") {
+        let n: usize = n.parse().unwrap_or(cfg.n_layers);
+        cfg.n_layers = n;
+        cfg.n_mtp_layers = 0;
+        eprintln!("[dsv41] TRUNCATED RUN: {n} layers, no draft layers");
+    }
     eprintln!(
         "[dsv41] config: dim={} layers={} heads={} hc={} experts={}/topk={} window={} index_topk={}",
         cfg.dim, cfg.n_layers, cfg.n_heads, cfg.hc_mult, cfg.n_routed_experts,
