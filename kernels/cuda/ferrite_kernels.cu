@@ -6593,6 +6593,14 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     }
     __syncthreads();
     const float inv = inv_s;
+    // 2026-09-10 (ncu-guided): the bound h is a RUNTIME arg, so nvcc could not
+    // unroll this loop -> each of the 16 iterations serialized on its two
+    // dependent L2 loads (li + nw, ~250-350ns) = ~4-5us of a ~10us kernel.
+    // This loop runs on the is_last block ONLY, so it sets the kernel's end
+    // time (every other block has already exited). Est. Local Speedup on this
+    // kernel was 35% at the CTA barriers; this is the other half of the fixed
+    // cost. Same op order per element (li*inv*nw), just 4 elements in flight.
+    #pragma unroll 4
     for (int c = threadIdx.x; c < h; c += blockDim.x)
         li[(size_t)t * h + c] = li[(size_t)t * h + c] * inv * nw[c];
 }
