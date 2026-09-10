@@ -5046,18 +5046,6 @@ extern "C" {
                                       hidden: i32, inter: i32, inter_shared: i32,
                                       topk: i32, n: i32, dscols: i32,
                                       s: CuStream) -> i32;
-    fn ferrite_moe_down_e4m3_slotwise(
-        ids_f: *const f32, probs: *const f32,
-        down_w8_ptrs: *const *const std::ffi::c_void,
-        down_scale_ptrs: *const *const f32,
-        shared_down_w8: *const std::ffi::c_void,
-        shared_down_scale: *const f32,
-        aq: *const std::ffi::c_void, as_: *const f32,
-        partial: *mut f32, out: *mut f32,
-        expert_start: i32, e_local: i32, hidden: i32, inter: i32,
-        inter_shared: i32, topk: i32, n: i32, dscols: i32,
-        s: CuStream,
-    ) -> i32;
     fn ferrite_quant_act_rows(act: *const f32, aq: *mut u8, as_: *mut f32,
                               n: i32, stride: i32, inter: i32, topk: i32,
                               inter_shared: i32, s: CuStream) -> i32;
@@ -5537,54 +5525,6 @@ impl CudaBackend {
                                 down_done = true;
                             } else {
                                 eprintln!("[opcheck] moe_down_w8a16_mma err {rd} — falling back");
-                            }
-                        }
-                        // SLOTWISE (FERRITE_DOWN_SLOT=1, 2026-09-10): one
-                        // (token, slot) assignment = ONE expert per block —
-                        // the act kernel's access shape (the 9-slots-per-block
-                        // kernels, SIMT and MMA alike, stall at ~38% DRAM vs
-                        // act's 71%). Bit-identical output (j-outer left fold
-                        // == per-slot partials summed j-ascending).
-                        let use_down_slot = std::env::var("FERRITE_DOWN_SLOT")
-                            .map(|v| v == "1").unwrap_or(false);
-                        if !down_done && use_down_slot {
-                            let stride = topk as i32 * inter + inter_shared;
-                            let aq = DevBuf::alloc(
-                                self.dev, self.stream,
-                                (ni as usize * stride as usize).div_ceil(4),
-                            )?;
-                            let asc = DevBuf::alloc(
-                                self.dev, self.stream,
-                                ni as usize * (topk + 1),
-                            )?;
-                            let partial = DevBuf::alloc(
-                                self.dev, self.stream,
-                                ni as usize * (topk + 1) * hi as usize,
-                            )?;
-                            let rq = unsafe {
-                                ferrite_quant_act_rows(
-                                    act.as_const_f32(), aq.as_f32() as *mut u8, asc.as_f32(),
-                                    ni, stride, inter, topk as i32, inter_shared, self.stream,
-                                )
-                            };
-                            if rq == 0 {
-                                let rd = unsafe {
-                                    ferrite_moe_down_e4m3_slotwise(
-                                        dids.as_const_f32(), dprobs.as_const_f32(),
-                                        tbl.down_w8 as *const *const std::ffi::c_void,
-                                        tbl.down_scale as *const *const f32,
-                                        sd.w, sd.scale as *const f32,
-                                        aq.as_f32() as *const std::ffi::c_void, asc.as_const_f32(),
-                                        partial.as_f32(), out.as_f32(),
-                                        expert_start as i32, tbl.e_local as i32, hi, inter,
-                                        inter_shared, topk as i32, ni, dscols, self.stream,
-                                    )
-                                };
-                                if rd == 0 {
-                                    down_done = true;
-                                } else {
-                                    eprintln!("[opcheck] moe_down_slotwise err {rd} — falling back");
-                                }
                             }
                         }
                         if !down_done && use_down_e4m3 && !use_down_bf16 {

@@ -18,11 +18,9 @@
 #include <cuda_fp8.h>
 
 // ─────────────────────────────────────────────────────────────────────────
-// BUILD STAMP (user rule 2026-09-10): a .so MUST NOT be combined with a
-// Rust binary from another revision. build.sh injects the git revision via
-// -DFERRITE_KERNEL_BUILD_ID; the Rust side dlsym()s these two symbols right
-// after dlopen and REFUSES TO START on any mismatch. Bump the ABI number
-// whenever the extern "C" signatures below change.
+// BUILD STAMP: a .so MUST NOT be combined with a binary from another
+// revision. build.sh injects the git revision + .cu hash; cuda.rs dlsym()s
+// these two symbols after dlopen and REFUSES TO START on any mismatch.
 // ─────────────────────────────────────────────────────────────────────────
 #ifndef FERRITE_KERNEL_BUILD_ID
 #define FERRITE_KERNEL_BUILD_ID "unstamped"
@@ -2346,55 +2344,39 @@ __global__ void hc_post_kernel(const float* __restrict__ x,
     cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
 #endif
     // out[t,i,j] = post[t,i]*x[t,j] + Σ_k comb[t,k,i]*res[t,k,j]
-    // SGLANG-STRUCTURE (2026-09-10, mhc_post_tilelang): ONE BLOCK PER TOKEN
-    // (grid = s) with post/comb hoisted to SMEM, and every thread computing
-    // ALL n outputs for its 4-column group. The old flat (t,i,j4) grid read
-    // `res` once per OUTPUT index i -> n=4x redundant res traffic (4MB/call
-    // instead of 1MB). Now res/x are read once per (t, j4): total traffic
-    // 2.25MB/call (the floor) vs 5.25MB.
+    // VECTORIZED (2026-09-10): one thread per 4 consecutive j (float4). The
+    // scalar version ran at ~1.3TB/s (3 scalar reads + 1 scalar write per
+    // thread = 4x the memory requests, latency-bound at low occupancy);
+    // float4 quarters the request count and widens each to 16B. Numerics
+    // bit-identical: each acc lane is an independent FMA chain in the same
+    // k-ascending order as the scalar loop.
     const int h4 = h >> 2;
-    const int t = blockIdx.x;
-    if (t >= s) return;
-    __shared__ float s_c[8], s_a[64];   // post[n], comb[n*n] (k-major: a[k*n+i])
-    if (threadIdx.x < (unsigned)n) s_c[threadIdx.x] = post[(size_t)t * n + threadIdx.x];
-    if (threadIdx.x < (unsigned)(n * n))
-        s_a[threadIdx.x] = comb[(size_t)t * n * n + threadIdx.x];
-    __syncthreads();
-    for (int j4 = threadIdx.x; j4 < h4; j4 += blockDim.x) {
-        const int j = j4 << 2;
-        const float4 xv = *reinterpret_cast<const float4*>(x + (size_t)t * h + j);
-        float4 rv[8];
-        #pragma unroll
-        for (int k = 0; k < 8; k++)
-            if (k < n)
-                rv[k] = *reinterpret_cast<const float4*>(res + (size_t)(t * n + k) * h + j);
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            if (i < n) {
-                const float pv = s_c[i];
-                float4 acc;
-                acc.x = pv * xv.x; acc.y = pv * xv.y; acc.z = pv * xv.z; acc.w = pv * xv.w;
-                #pragma unroll
-                for (int k = 0; k < 8; k++) {
-                    if (k < n) {
-                        const float c = s_a[k * n + i];   // comb[t,k,i]
-                        acc.x += c * rv[k].x; acc.y += c * rv[k].y;
-                        acc.z += c * rv[k].z; acc.w += c * rv[k].w;
-                    }
-                }
-                *reinterpret_cast<float4*>(out + (size_t)t * n * h + (size_t)i * h + j) = acc;
-            }
-        }
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = s * n * h4;
+    if (idx >= total) return;
+    int j4 = idx % h4;
+    int i = (idx / h4) % n;
+    int t = idx / (n * h4);
+    const int j = j4 << 2;
+    const float pv = post[(size_t)t * n + i];
+    float4 acc = *reinterpret_cast<const float4*>(x + (size_t)t * h + j);
+    acc.x *= pv; acc.y *= pv; acc.z *= pv; acc.w *= pv;
+    for (int k = 0; k < n; k++) {
+        const float c = comb[(size_t)t * n * n + k * n + i];
+        const float4 rv = *reinterpret_cast<const float4*>(res + (size_t)(t * n + k) * h + j);
+        acc.x += c * rv.x; acc.y += c * rv.y; acc.z += c * rv.z; acc.w += c * rv.w;
     }
+    *reinterpret_cast<float4*>(out + (size_t)t * n * h + (size_t)i * h + j) = acc;
 }
 
 extern "C" cudaError_t ferrite_hc_post(const float* x, const float* res,
                                         const float* post, const float* comb,
                                         float* out, int s, int n, int h,
                                         cudaStream_t stream) {
-    if ((h & 3) != 0 || n > 8) return cudaErrorNotSupported; // float4 path needs h % 4 == 0
+    if ((h & 3) != 0) return cudaErrorNotSupported; // float4 path needs h % 4 == 0
+    int total = s * n * (h >> 2);
     dim3 block(256);
-    dim3 grid(s);   // SGLang structure: one block per token
+    dim3 grid((total + 255) / 256);
     return pdl_or_plain(hc_post_kernel, grid, block, 0, stream,
                         x, res, post, comb, out, s, n, h);
 }
@@ -4888,13 +4870,6 @@ extern "C" cudaError_t ferrite_quant_act_rows(
 // row stride (17×16B) makes the ldmatrix bank-conflict-free; double-buffered
 // cp.async pipelines the next slot's weight tile.
 // ============================================================
-// HT = h-chunks of 32 rows per block (FERRITE_DOWN_HT, default 1). This
-// kernel runs at ~38% DRAM (45us) while act (ONE expert, 128KB contiguous
-// per block) reaches 71%. HT>1 keeps all 9 slots in the block (the act-row
-// staging stays amortized) but makes each expert read a 32*HT-row CONTIGUOUS
-// run (64KB at HT=8) instead of 8KB. Template constant: a runtime bound
-// stops nvcc unrolling (measured +10us/call on the earlier HTILE attempt).
-template <int HT, int NP>
 __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
@@ -4907,14 +4882,14 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
     float* __restrict__ out,                // [n, hidden]
     int expert_start, int e_local, int hidden, int inter,
     int inter_shared, int topk, int dscols) {
-    const int h0 = blockIdx.x * 32 * HT;
+    const int h0 = blockIdx.x * 32;
     const int t = blockIdx.y;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int stride = topk * inter + inter_shared;
     // smem: aq rows flat at 512B pitch (j<topk rows use 256B), staged weight
     // tile [32 rows][272B] ×2 buffers, warp partials, slot id/prob/scale.
     __shared__ unsigned char saq[(/*TOPK_MAX*/ 8 + 1) * 512];
-    __shared__ unsigned char sW[NP][32 * 272];
+    __shared__ unsigned char sW[2][32 * 272];
     __shared__ float part[8][32];
     __shared__ float ssp[9];   // as_[t,j] × p_j (folded slot scale); 0 = skip
     // ---- stage the token's act rows + slot metadata ----
@@ -4960,7 +4935,7 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
             /* 32 rows × klen bytes in 16B chunks; row stride 272 */ \
             for (int c = threadIdx.x; c < 32 * (klen_ >> 4); c += 256) { \
                 const int r = c / (klen_ >> 4), cc = (c % (klen_ >> 4)) * 16; \
-                const unsigned char* src_ = wbase + (size_t)(hb + r) * klen_ + cc; \
+                const unsigned char* src_ = wbase + (size_t)(h0 + r) * klen_ + cc; \
                 unsigned char* dst_ = sW[BUF] + r * 272 + cc; \
                 const unsigned int sd_ = (unsigned int)__cvta_generic_to_shared(dst_); \
                 asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], 16;\n" :: "r"(sd_), "l"(src_)); \
@@ -4968,37 +4943,20 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
         } \
         asm volatile("cp.async.commit_group;\n"); \
     } while (0)
-    #pragma unroll
-    for (int ch = 0; ch < HT; ch++) {
-    const int hb = h0 + ch * 32;
-    // NP-deep cp.async pipeline (FERRITE_DOWN_NP). Evidence: this kernel runs
-    // at ~38% DRAM and gets WORSE with fewer blocks (HT=4/8) => it is
-    // EXPOSED-LATENCY bound on the 9 sequential slot stagings (2-deep hides
-    // one chunk only; ~700ns latency x 9 chunks x 4.6 block-rounds ~= 45us).
-    #pragma unroll
-    for (int p = 0; p < NP - 1; p++) {
-        if (p <= topk) DM_STAGE(p, p % NP);
-    }
+    DM_STAGE(0, 0);
     float accA0 = 0.f, accA1 = 0.f, accB0 = 0.f, accB1 = 0.f;  // m-tile 0/1 × (r0, r0+8)
-    for (int j = 0; j <= topk; j++) {
-        const int buf = j % NP;
-        // COMMIT BEFORE WAIT — the canonical cp.async pipeline. wait_group N
-        // waits until at most N groups are in flight, so with NP groups
-        // committed (j..j+NP-1) the bound NP-1 guarantees group j is DONE.
-        // (Moving the commit after the wait — as a first cut did — makes the
-        // bound claim completion of a group that was never issued: the MMA
-        // then reads stale SMEM. It "measured" 8.21ms instead of 10.85 —
-        // the fastest-looking number of the session was a correctness bug.)
-        if (j + (NP - 1) <= topk) DM_STAGE(j + (NP - 1), (j + (NP - 1)) % NP);
-        if (NP == 4) asm volatile("cp.async.wait_group 3;\n");
-        else asm volatile("cp.async.wait_group 1;\n");
+    int buf = 0;
+    for (int j = 0; j <= topk; j++, buf ^= 1) {
+        if (j + 1 <= topk) DM_STAGE(j + 1, buf ^ 1);
+        if (j + 1 <= topk) asm volatile("cp.async.wait_group 1;\n");
+        else asm volatile("cp.async.wait_group 0;\n");
         __syncthreads();
         if (ssp[j] == 0.f) continue;
         const int klen = (j < topk) ? inter : inter_shared;
         const float* dsr = (j < topk)
             ? down_scale_ptrs[(int)ids_f[(size_t)t * topk + j] - expert_start]
             : shared_down_scale;
-        const int srow = hb >> 7;
+        const int srow = h0 >> 7;
         // per-warp k32 chunks: klen/32 chunks over 8 warps (klen=256 → 1 each, 512 → 2)
         for (int kc = warp; kc < (klen >> 5); kc += 8) {
             const float wsc = dsr[(size_t)srow * dscols + ((kc << 5) >> 7)] * ssp[j];
@@ -5044,11 +5002,9 @@ __global__ void __launch_bounds__(256, 3) moe_down_e4m3_mma_kernel(
             float s = 0.f;
             #pragma unroll
             for (int w = 0; w < 8; w++) s += part[w][r];
-            out[(size_t)t * hidden + hb + r] = s;
+            out[(size_t)t * hidden + h0 + r] = s;
         }
     }
-    __syncthreads();   // part[]/sW are reused by the next chunk
-    }  // end chunk loop (HT)
 }
 
 // ============================================================
@@ -5399,37 +5355,12 @@ extern "C" cudaError_t ferrite_moe_down_e4m3_mma(
     // the smem tile rows are 272B (256 data + 16 pad): klen must fit. GLM:
     // inter = inter_shared = moe_inter/tp = 256.
     if (inter > 256 || inter_shared > 256 || topk > 8) return cudaErrorNotSupported;
-    static int ht = -1;
-    if (ht < 0) {
-        const char* e = getenv("FERRITE_DOWN_HT");
-        int v = e ? atoi(e) : 1;
-        if (v != 1 && v != 2 && v != 4 && v != 8) v = 1;
-        while (v > 1 && (hidden % (32 * v))) v >>= 1;
-        ht = v;
-    }
-    dim3 grid((unsigned)(hidden / (32 * ht)), (unsigned)n);
-    static int np = -1;
-    if (np < 0) {
-        const char* e = getenv("FERRITE_DOWN_NP");
-        np = (e && atoi(e) == 4) ? 4 : 2;
-    }
-    #define MD_CALL(R) ((np == 4) ? moe_down_e4m3_mma_kernel<R, 4><<<grid, 256, 0, s>>>( \
-        ids_f, probs, \
-        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs, \
-        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale, \
-        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols) : \
-        moe_down_e4m3_mma_kernel<R, 2><<<grid, 256, 0, s>>>( \
-        ids_f, probs, \
-        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs, \
-        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale, \
-        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols))
-    switch (ht) {
-        case 2: MD_CALL(2); break;
-        case 4: MD_CALL(4); break;
-        case 8: MD_CALL(8); break;
-        default: MD_CALL(1); break;
-    }
-    #undef MD_CALL
+    dim3 grid((unsigned)(hidden / 32), (unsigned)n);
+    moe_down_e4m3_mma_kernel<<<grid, 256, 0, s>>>(
+        ids_f, probs,
+        (const unsigned char* const*)down_w8_ptrs, (const float* const*)down_scale_ptrs,
+        (const unsigned char*)shared_down_w8, (const float*)shared_down_scale,
+        aq, as_, out, expert_start, e_local, hidden, inter, inter_shared, topk, dscols);
     return cudaGetLastError();
 }
 
@@ -7039,87 +6970,6 @@ extern "C" cudaError_t ferrite_p2p_enable(int dev, int peer) {
 // 13.61 → 13.76ms. The kernel stays at its natural 5 blocks/SM; the mix is
 // at its practical floor on both tried axes (float4 loads: neutral;
 // occupancy: regressed).)
-// SGLANG-STRUCTURE MIX (2026-09-10): sglang's mhc_pre_gemm_sqrsum_splitk
-// uses a `token_block` of tokens per block so the fw tile is loaded once and
-// reused across them. Ours re-read fw per token (KS=4 => 4 re-reads of 1.5MB
-// per token-stream = 24MB of the ~30MB a call moves; at 4.3us that is 7TB/s
-// = DRAM-bound, since with the concurrent MoE weight streams fw does not
-// stay in L2). This variant gives each block TWO tokens: thread halves of
-// 128 work on one token apiece with SHARED fw float4 loads, one barrier,
-// and a 5-slot epilogue writing both tokens' partials.
-__global__ void hc_pre_mix_split2_kernel(const float* __restrict__ res,
-                                         const float* __restrict__ fw,
-                                         float* __restrict__ mx_partial,
-                                         unsigned* __restrict__ ctr2,
-                                         int s, int n, int h, int mix) {
-#if __CUDA_ARCH__ >= 900
-    cudaGridDependencySynchronize();
-#endif
-    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x < (unsigned)s) {
-        ctr2[threadIdx.x] = 0u;
-    }
-    const int KS = gridDim.z;
-    const int t0 = blockIdx.x * 2;
-    const int m0 = blockIdx.y * 4;
-    const int z = blockIdx.z;
-    const int nh = n * h;
-    const int seg = (nh + KS - 1) / KS;
-    const int lo = z * seg;
-    const int hi = min(lo + seg, nh);
-    const int half = threadIdx.x >> 7;      // 0/1 -> token t0 / t0+1
-    const int tid = threadIdx.x & 127;
-    const int t = t0 + half;
-    const bool active = (t < s);
-    const float* x = res + (size_t)t * n * h;
-    const float* row0 = fw + (size_t)m0 * nh;
-    float acc[4] = {0.f, 0.f, 0.f, 0.f};
-    float sq = 0.f;
-    if (active) {
-        const int lo4 = lo >> 2, hi4 = hi >> 2;
-        for (int i4 = lo4 + tid; i4 < hi4; i4 += 128) {
-            const size_t off = (size_t)i4 << 2;
-            const float4 xv = *reinterpret_cast<const float4*>(x + off);
-            sq += xv.x * xv.x + xv.y * xv.y + xv.z * xv.z + xv.w * xv.w;
-            #pragma unroll
-            for (int mm = 0; mm < 4; mm++) {
-                const float4 wv = *reinterpret_cast<const float4*>(row0 + (size_t)mm * nh + off);
-                acc[mm] += wv.x * xv.x + wv.y * xv.y + wv.z * xv.z + wv.w * xv.w;
-            }
-        }
-        for (int i = (hi4 << 2) + tid; i < hi; i += 128) {
-            const float xv = x[i];
-            sq += xv * xv;
-            #pragma unroll
-            for (int mm = 0; mm < 4; mm++) acc[mm] += row0[(size_t)mm * nh + i] * xv;
-        }
-    }
-    __shared__ float red[2][5][4];   // [half][m-row 0..3 | sq 4][warp-in-half]
-    const int wl = (threadIdx.x >> 5) & 3;
-    #pragma unroll
-    for (int mm = 0; mm < 4; mm++) {
-        float a = acc[mm];
-        for (int off = 16; off > 0; off >>= 1) a += __shfl_down_sync(0xffffffff, a, off);
-        if ((threadIdx.x & 31) == 0) red[half][mm][wl] = a;
-    }
-    for (int off = 16; off > 0; off >>= 1) sq += __shfl_down_sync(0xffffffff, sq, off);
-    if ((threadIdx.x & 31) == 0) red[half][4][wl] = sq;
-    __syncthreads();
-    if (tid < 5) {                       // one thread per (half, m-row|sq)
-        const int tt = t0 + half;
-        if (tt < s) {
-            float tot = 0.f;
-            #pragma unroll
-            for (int w = 0; w < 4; w++) tot += red[half][tid][w];
-            if (tid < 4) {
-                if (m0 + tid < mix)
-                    mx_partial[((size_t)tt * mix + m0 + tid) * KS + z] = tot;
-            } else if (m0 == 0) {
-                mx_partial[(size_t)s * mix * KS + (size_t)tt * KS + z] = tot;
-            }
-        }
-    }
-}
-
 __global__ void hc_pre_mix_split_kernel(const float* __restrict__ res,
                                         const float* __restrict__ fw,
                                         float* __restrict__ mx_partial,
@@ -7517,36 +7367,20 @@ extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
     float* pre_s_g = mx_scratch + (size_t)s * mix * KS + (size_t)s * KS + s;
     float* p4 = pre_s_g + (size_t)s * n;
     unsigned* ctr2 = (unsigned*)(p4 + (size_t)s * NB);
-    // FERRITE_HC_MIX_PAIR=0 reverts to the per-token kernel.
-    static int mix_pair = -1;
-    if (mix_pair < 0) {
-        const char* e = getenv("FERRITE_HC_MIX_PAIR");
-        mix_pair = (e && e[0] == '0') ? 0 : 1;
-    }
-    if (mix_pair) {
-        dim3 mix_grid((s + 1) / 2, (mix + 3) / 4, KS);
-        hc_pre_mix_split2_kernel<<<mix_grid, 256, 0, stream>>>(
-            res, fw, mx_scratch, ctr2, s, n, h, mix);
-        cudaError_t e1 = cudaGetLastError();
-        if (e1 != cudaSuccess) return e1;
+    dim3 mix_grid(s, (mix + 3) / 4, KS);
+    if (ferrite_pdl_enabled()) {
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
+        cfg.dynamicSmemBytes = 0; cfg.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+        cudaLaunchKernelEx(&cfg, hc_pre_mix_split_kernel,
+                           res, fw, mx_scratch, ctr2, s, n, h, mix);
     } else {
-        dim3 mix_grid(s, (mix + 3) / 4, KS);
-        if (ferrite_pdl_enabled()) {
-            cudaLaunchConfig_t cfg = {};
-            cfg.gridDim = mix_grid; cfg.blockDim = dim3(256);
-            cfg.dynamicSmemBytes = 0; cfg.stream = stream;
-            cudaLaunchAttribute attrs[1];
-            attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-            attrs[0].val.programmaticStreamSerializationAllowed = 1;
-            cfg.attrs = attrs; cfg.numAttrs = 1;
-            cudaLaunchKernelEx(&cfg, hc_pre_mix_split_kernel,
-                               res, fw, mx_scratch, ctr2, s, n, h, mix);
-        } else {
-            hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
-                res, fw, mx_scratch, ctr2, s, n, h, mix);
-        }
-        cudaError_t e0 = cudaGetLastError();
-        if (e0 != cudaSuccess) return e0;
+        hc_pre_mix_split_kernel<<<mix_grid, 256, 0, stream>>>(
+            res, fw, mx_scratch, ctr2, s, n, h, mix);
     }
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return e;
