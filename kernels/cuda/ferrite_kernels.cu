@@ -3985,10 +3985,16 @@ extern "C" cudaError_t ferrite_moe_fused_down_sum_fp8(
     // historical v12 layout (bit-identical). Larger tiles cut the act-row
     // re-reads (once per htile rows instead of per 8) and lengthen each
     // warp's contiguous weight run per expert — see the kernel's v13 note.
+    // 2026-09-10 sweep (isolated bench, production routing): 8 -> 58080ns,
+    // 16 -> 53776ns (best), 32 -> 58112, 64 -> 58368. 32/64 REGRESS: the
+    // grid drops to 512/256 blocks and falls under the occupancy floor
+    // (0.58 waves at 64 = half the SMs idle). The act-traffic cut alone is
+    // worth ~7%; the 9-experts-per-block locality issue needs the separate
+    // one-expert-per-block restructure.
     static int htile_env = -1;
     if (htile_env < 0) {
         const char* e = getenv("FERRITE_DOWN_HTILE");
-        int v = e ? atoi(e) : 8;
+        int v = e ? atoi(e) : 16;
         if (v < 8) v = 8;
         if (v > 64) v = 64;
         while (v & (v - 1)) v &= (v - 1);   // round down to a power of two
