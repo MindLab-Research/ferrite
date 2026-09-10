@@ -66,6 +66,18 @@ fn layer0_attention_projections_match_reference() {
     // first GEMM's activation quantisation, shared by the wq_a and wkv paths
     dev.quant_fp8(dx.as_f32(), xq.ptr as *mut u8, xsc.ptr as *mut f32, 1, dim as i32, 32, true)
         .unwrap();
+    dev.sync().unwrap();
+    // dump THIS quantisation (the x one) — the later qr quantisation overwrites it
+    {
+        let src = Device::view(xq.ptr, dim);
+        let mut b = vec![0u8; dim];
+        dev.download_u8(&src, &mut b).unwrap();
+        eprintln!("[attn_parity] XQ[0..8]  {:?}", &b[..8]);
+        let ss = Device::view(xsc.ptr, (dim / 32 + 8) * 4);
+        let mut sc = vec![0f32; dim / 32 + 8];
+        dev.download_f32(&ss, &mut sc).unwrap();
+        eprintln!("[attn_parity] XSC[0..4] {:?}", &sc[..4]);
+    }
     dev.gemm_fp8_mx(
         xq.as_u8(), xsc.as_f32(), wq_a.as_u8(), wq_a_s.as_u8(), std::ptr::null(),
         qr.ptr as *mut f32, 1, ql as i32, dim as i32,
@@ -76,6 +88,14 @@ fn layer0_attention_projections_match_reference() {
         kv.ptr as *mut f32, 1, cfg.head_dim as i32, dim as i32,
     )
     .unwrap();
+    dev.sync().unwrap();
+    {
+        let src = Device::view(qr.ptr, ql * 4);
+        let mut v = vec![0f32; ql];
+        dev.download_f32(&src, &mut v).unwrap();
+        let rms = (v.iter().map(|x| x * x).sum::<f32>() / ql as f32).sqrt();
+        eprintln!("[attn_parity] QR_raw[:4] {:?}  rms {rms}", &v[..4]);
+    }
     // q_norm then the second projection
     dev.rmsnorm(
         qr.ptr as *const f32, q_norm.as_f32(), qr.ptr as *mut f32,
@@ -96,22 +116,6 @@ fn layer0_attention_projections_match_reference() {
     )
     .unwrap();
     dev.sync().unwrap();
-
-    // --- isolate the activation quantiser: dump xq bytes + scales ---
-    let mut xqb = vec![0u8; dim];
-    let mut xscv = vec![0f32; dim / 32 + 8];
-    {
-        let src = Device::view(xq.ptr, dim);
-        let mut b = vec![0u8; dim];
-        dev.download_u8(&src, &mut b).unwrap();
-        xqb = b;
-        let ss = Device::view(xsc.ptr, (dim / 32 + 8) * 4);
-        dev.download_f32(&ss, &mut xscv).unwrap();
-    }
-    eprintln!("[attn_parity] xq[0..8]   {:?}", &xqb[..8]);
-    eprintln!("[attn_parity] xsc[0..4]  {:?}", &xscv[..4]);
-    let _ = &xqb;
-    let _ = &xscv;
 
     let mut qrv = vec![0f32; ql];
     let mut qv = vec![0f32; cfg.n_heads * cfg.head_dim];
