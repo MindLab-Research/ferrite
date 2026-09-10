@@ -262,6 +262,9 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         let (n_routed, _) = cfg.moe_config(mtp_layer);
         push(&mut out, format!("{p}.ffn.gate.weight"), vec![n_routed, dim], Shard::Replicated);
         push(&mut out, format!("{p}.ffn.gate.bias"), vec![n_routed], Shard::Replicated);
+        if cfg.vision_enabled() {
+            push(&mut out, format!("{p}.ffn.gate.bias_vl"), vec![n_routed], Shard::Replicated);
+        }
         for e in 0..n_routed {
             for (n, o, k) in [("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)] {
                 push(&mut out, format!("{p}.ffn.experts.{e}.{n}.weight"), vec![o, k / 2], Shard::Experts);
@@ -305,8 +308,10 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
     // vision tower (replicated: the reference never shards it)
     if cfg.vision_enabled() {
         let vd = cfg.vision_dim;
-        push(&mut out, "vision.patch_embed.weight", vec![vd, cfg.vision_patch_size * cfg.vision_patch_size * 3], Shard::Replicated);
-        push(&mut out, "vision.patch_embed.bias", vec![vd], Shard::Replicated);
+        // the release names this as a conv projection ("proj"); verified
+        // against the checkpoint by tests/real_checkpoint.rs
+        push(&mut out, "vision.patch_embed.proj.weight", vec![vd, 3, cfg.vision_patch_size, cfg.vision_patch_size], Shard::Replicated);
+        push(&mut out, "vision.patch_embed.proj.bias", vec![vd], Shard::Replicated);
         push(&mut out, "vision.norm.weight", vec![vd], Shard::Replicated);
         for b in 0..cfg.vision_n_layers {
             let p = format!("vision.blocks.{b}");
@@ -510,7 +515,9 @@ mod tests {
             "mtp.0.main_norm.weight",
             "mtp.2.markov_head.embed.weight",
             "mtp.2.confidence_head.proj.weight",
-            "vision.patch_embed.weight",
+            "mtp.0.ffn.gate.bias_vl",
+            "layers.3.ffn.gate.bias_vl",
+            "vision.patch_embed.proj.weight",
             "vision.blocks.31.mlp.w1.weight",
             "aligner.w1.weight",
         ] {
@@ -562,6 +569,7 @@ mod tests {
         assert_eq!(find("mtp.2.markov_head.embed.weight"), vec![129280, 256]);
         assert_eq!(find("mtp.2.confidence_head.proj.weight"), vec![1, 5376]);
         // vision
+        assert_eq!(find("vision.patch_embed.proj.weight"), vec![1024, 3, 14, 14]);
         assert_eq!(find("vision.blocks.0.attn.wqkv.weight"), vec![3072, 1024]);
         assert_eq!(find("vision.blocks.0.mlp.w1.weight"), vec![5632, 1024]);
         assert_eq!(find("aligner.w1.weight"), vec![5120, 9216]);

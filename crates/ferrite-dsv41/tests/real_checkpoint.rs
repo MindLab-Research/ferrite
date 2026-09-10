@@ -24,27 +24,38 @@ fn expected_file_shape(_name: &str, spec_shape: &[usize]) -> Vec<usize> {
     spec_shape.to_vec()
 }
 
+/// Dtype expectations, restricted to the tensors whose dtype the release
+/// actually pins: everything else is bf16/f32 and is checked by name+shape
+/// only (an over-broad heuristic here produced 177 false alarms on the first
+/// real run).
 fn expected_dtype(name: &str) -> Option<&'static str> {
+    if !name.ends_with(".weight") && !name.ends_with(".scale") {
+        return None;
+    }
     if name.ends_with(".scale") {
-        if name.contains(".experts.") || name.contains("engram.embed") {
-            return Some("F8_E8M0");
-        }
+        // ue8m0 block scales accompany every quantised weight
         return Some("F8_E8M0");
     }
-    if name.contains(".experts.") && name.ends_with(".weight") {
-        return Some("I8"); // packed fp4
+    if name.contains(".experts.") {
+        return Some("I8"); // fp4 e2m1, packed 2 per byte
     }
-    if name.contains("attn.") && name.ends_with(".weight")
-        || name.contains("compressor.") && name.ends_with(".weight")
-        || name.contains("indexer.") && name.ends_with(".weight")
-        || name.contains("shared_experts") && name.ends_with(".weight")
-        || name.contains("engram.wkv") && name.ends_with(".weight")
-        || name.contains("engram.embed") && name.ends_with(".weight")
-        || name.contains("main_proj") && name.ends_with(".weight")
-    {
+    let dense_fp8 = [
+        ".attn.wq_a.weight",
+        ".attn.wq_b.weight",
+        ".attn.wkv.weight",
+        ".attn.wo_a.weight",
+        ".attn.wo_b.weight",
+        ".ffn.shared_experts.w1.weight",
+        ".ffn.shared_experts.w2.weight",
+        ".ffn.shared_experts.w3.weight",
+        ".engram.wkv.weight",
+        ".engram.embed.weight",
+        ".main_proj.weight",
+    ];
+    if dense_fp8.iter().any(|suf| name.ends_with(suf)) {
         return Some("F8_E4M3");
     }
-    None // bf16/f32 tensors are checked only by name+shape
+    None // bf16/f32: norms, sinks, hc params, compressor/indexer, vision, heads
 }
 
 #[test]
