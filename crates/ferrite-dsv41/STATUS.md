@@ -97,6 +97,36 @@ Two process lessons, both re-learned the hard way:
   rank (8 devices), peer copies + a local sum kernel. AR payloads here are tiny
   (`dim` floats per site).
 
+## Compressor / indexer — ground truth for wiring them up
+
+Established against the checkpoint and the reference's `Compressor`:
+
+* **Compressor tensors exist only on the kv sources 🌐 `[2,8,14,20]`**; indexer
+  tensors only on `[2,8,14,20,24,28,32,36]`. (The config derives both correctly;
+  layer 6 has neither — the earlier "layer 6 has none" observation is the
+  expected shape of the model, not a spec gap.)
+* **Every compressor weight is BF16, not fp8** — `compressor.wkv.weight` is
+  `[512, 5120]` BF16 on all four layers, `compressor.wgate.weight` exists only
+  where `ratio > 1` (layers 2/8/14), and layer 20 (`ratio == 1`) has no gate.
+  The reference *promotes* them to fp32 at runtime for the pooling; the stored
+  values are bf16, so widening to f32 at load is lossless and reproduces that.
+* Indexer: `wq_b` is **fp8 + scale** `[4096, 1280]`, while `wk` `[128, 512]`,
+  `weights_proj` `[32, 5120]` and `k_norm` `[128]` are BF16.
+* Reference semantics, per step:
+  * `ratio == 1` → `latent = norm(wkv(x))`, one token per group;
+  * `ratio > 1` → `kv = wkv(x)`, `score = wgate(x)`, the completed group of
+    `ratio` tokens is pooled as `Σ kv_t · softmax_t(score)`, and an incomplete
+    group waits in `kv_state`/`score_state` (shaped `[b, ratio, head_dim]`);
+  * the latent is returned **pre-RoPE** — the indexer consumes the unrotated
+    form and attention applies RoPE afterwards.
+* Both halves already exist as kernels: `compressor_state_kernel` (stashes the
+  trailing partial group for prefill, one slot per decode step) and
+  `compressor_pool_kernel` (gated pooling) — read their bodies for the exact
+  argument order. What is missing is the chain wiring: call them on kv sources,
+  append the latent to the KV buffer at row `window + compress_len`, publish the
+  key for the indexer, and on non-sources reuse the source layer's published
+  selection (`is_index_source` / `is_kv_source` already say which is which).
+
 ## Verification recipes
 
 ```bash
