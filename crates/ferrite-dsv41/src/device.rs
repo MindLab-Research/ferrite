@@ -40,6 +40,7 @@ struct Cudart {
     device_count: unsafe extern "C" fn(*mut c_int) -> c_int,
     enable_peer: unsafe extern "C" fn(c_int, c_uint) -> c_int,
     memcpy_peer_async: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, CuStream) -> c_int,
+    memcpy_peer: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> c_int,
 }
 
 struct Cublas {
@@ -288,6 +289,7 @@ impl Device {
                 device_count: f!(h_cudart, "cudaGetDeviceCount"),
                 enable_peer: f!(h_cudart, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h_cudart, "cudaMemcpyPeerAsync"),
+                memcpy_peer: f!(h_cudart, "cudaMemcpyPeer"),
             };
             let cublas = Cublas {
                 create: f!(h_cublas, "cublasCreate_v2"),
@@ -430,6 +432,7 @@ impl Device {
                 device_count: f!(h, "cudaGetDeviceCount"),
                 enable_peer: f!(h, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h, "cudaMemcpyPeerAsync"),
+                memcpy_peer: f!(h, "cudaMemcpyPeer"),
             })
         }
     }
@@ -461,6 +464,9 @@ impl Device {
     }
 
     /// Copy `bytes` from this device to `dst_dev` (NVLink peer copy).
+    ///
+    /// Synchronous on purpose: the asynchronous form's stream/direction rules
+    /// produced an illegal access here, and these payloads are tens of KB.
     pub fn memcpy_peer(
         &self,
         dst_dev: i32,
@@ -469,16 +475,9 @@ impl Device {
         bytes: usize,
     ) -> Result<()> {
         let st = unsafe {
-            (self.cudart.memcpy_peer_async)(
-                dst,
-                dst_dev,
-                src,
-                self.device_id(),
-                bytes,
-                self.stream,
-            )
+            (self.cudart.memcpy_peer)(dst, dst_dev, src, self.device_id(), bytes)
         };
-        check_cudart(st, &self.cudart, "cudaMemcpyPeerAsync")
+        check_cudart(st, &self.cudart, "cudaMemcpyPeer")
     }
 
     pub fn sync(&self) -> Result<()> {
