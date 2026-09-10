@@ -451,7 +451,8 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
                                 const float* __restrict__ hc_scale,
                                 const float* __restrict__ hc_base, float* __restrict__ pre,
                                 float* __restrict__ post, float* __restrict__ comb, int rows,
-                                int hc_dim, int hc, int sinkhorn_iters, float eps) {
+                                int hc_dim, int hc, int sinkhorn_iters, float eps,
+                                bool hc_mixes_acc4) {
     const int r = blockIdx.x;
     if (r >= rows) return;
     const int mix = hc * (2 + hc);
@@ -492,21 +493,24 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
         const int nwarp = (blockDim.x + 31) >> 5;
         for (int m = wid; m < mix; m += nwarp) {
             const float* wr = hc_fn + (size_t)m * hc_dim;
-            // Four accumulators: a single `acc +=` chain serialises the 160
-            // dependent loads of a full row behind one FMA, which is what made
-            // this kernel latency- rather than bandwidth-bound. The lanes still
-            // read stride-32 so every load stays coalesced; only the summation
-            // order inside the row changes (verified against the model's text).
-            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-            int c = lane;
-            for (; c + 96 < hc_dim; c += 128) {
-                a0 += wr[c] * xr[c];
-                a1 += wr[c + 32] * xr[c + 32];
-                a2 += wr[c + 64] * xr[c + 64];
-                a3 += wr[c + 96] * xr[c + 96];
+            // Single accumulate chain = the original, verified behaviour. A
+            // four-accumulator unroll was tried together with the wide block above
+            // and must be retested alone (HC_MIXES_ACC4=1) before being believed.
+            float acc = 0.f;
+            if (hc_mixes_acc4) {
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                int c = lane;
+                for (; c + 96 < hc_dim; c += 128) {
+                    a0 += wr[c] * xr[c];
+                    a1 += wr[c + 32] * xr[c + 32];
+                    a2 += wr[c + 64] * xr[c + 64];
+                    a3 += wr[c + 96] * xr[c + 96];
+                }
+                for (; c < hc_dim; c += 32) a0 += wr[c] * xr[c];
+                acc = (a0 + a1) + (a2 + a3);
+            } else {
+                for (int c = lane; c < hc_dim; c += 32) acc += wr[c] * xr[c];
             }
-            for (; c < hc_dim; c += 32) a0 += wr[c] * xr[c];
-            float acc = (a0 + a1) + (a2 + a3);
             for (int off = 16; off > 0; off >>= 1) {
                 acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
             }
@@ -1242,21 +1246,27 @@ extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, in
     return (int)cudaGetLastError();
 }
 
+static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
+
 extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, float* pre, float* post, float* comb, int rows,
                               int hc_dim, int hc, int sinkhorn_iters, float eps, cudaStream_t s) {
     const int mix = hc * (2 + hc);
     const int smem = (mix + hc * hc) * sizeof(float);
-    // One warp per mix row. The kernel assigns row `m` to warp `m` (m += nwarp),
-    // so with 128 threads only 4 rows ran at a time and each warp walked six rows
-    // serially through a latency-bound accumulate chain - measured 808us per call,
-    // 51.5% of the whole decode's GPU time (nsys cuda_gpu_kern_sum). Sizing the
-    // block to `mix` warps puts every row in flight at once.
-    int nthreads = ((mix + 31) / 32) * 32;
-    if (nthreads < 32) nthreads = 32;
-    if (nthreads > 1024) nthreads = 1024;
+    // NOTE (negative result, 2026 session): sizing this block to `mix` warps (so
+    // every mix row is in flight at once) made decode 2.7x SLOWER (348 ms/token vs
+    // 130), even though it reads like an obvious win: the grid is `rows`, which is
+    // tiny, so growing the block by 6x collapsed the blocks-per-SM and the kernel
+    // simply lost occupancy. Measured, not reasoned - and it was tested together
+    // with the four-accumulator unroll below, so the two are not yet separated.
+    // DSV41_HC_MIXES_THREADS re-enables the wide block for a controlled retest.
+    int nthreads = 128;
+    if (const char* e = getenv("DSV41_HC_MIXES_THREADS")) {
+        const int v = atoi(e);
+        if (v >= 32 && v <= 1024) nthreads = v;
+    }
     hc_mixes_kernel<<<rows, nthreads, smem, s>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, rows,
-                                            hc_dim, hc, sinkhorn_iters, eps);
+                                            hc_dim, hc, sinkhorn_iters, eps, g_hc_acc4);
     return (int)cudaGetLastError();
 }
 
