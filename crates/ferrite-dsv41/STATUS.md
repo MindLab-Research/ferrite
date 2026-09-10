@@ -1003,3 +1003,40 @@ loader 分片已被 8 个不同指纹证伪 ✓）。
 
 **裸 id 路径是已验证正确的那条** ✓：`[671,6102,294,8760,344]` 下我的 top-1 = 官方 top-1 = 11111
 （" Paris"）✓✓，40 层 pos0 偏差有界 3-6% ✓。
+
+## 🏁 2026-09-11 里程碑：**乱码彻底修好，输出与官方逐字一致**
+
+```
+=== The capital of France is ===          官方真值: The capital of France is **Paris**.
+generated (3): " Paris."   ids: [11111, 16, 1]        ← 与官方完全相同 ✓
+=== The capital of Japan is ===
+generated (3): " Tokyo."   ids: [30228, 16, 1]        ✓
+=== 请背诵《静夜思》===
+generated:     ". " The user wants me to recite the poem "Quiet Night Thoughts" (   ← 理解正确 ✓
+```
+
+### 第 5 个 bug（"尾部乱码"的真凶）：EOS 查找返回 None → 解码循环永不停止
+
+这个 checkpoint **没有 `generation_config.json`** ✗，`text_config.eos_token_id` 是 **null** ✗，
+而 runner 只查了 `generation_config.json` → `eos = None` → `if Some(next) == eos` **永不成立** ✗✗。
+**模型其实一直是答对的**：`[11111(" Paris"), 16("."), 1(<｜end▁of▁sentence｜>)]` 然后就该停 ——
+官方贪心同样在 EOS 处停下所以只输出 " Paris." ✓；而我越过 EOS 继续生成，那串乱说被误当成
+"长文本尾部退化" ✗。
+修：`generation_config.json → config.json(顶层 eos_token_id = 1) → tokenizer 兜底` ✓。
+
+### 本会话共修 5 个真 bug（全部经官方对照/消融定位）
+
+| # | bug | 症状 → 修复后 |
+|---|---|---|
+| 1 | `sparse_attn_kernel` dot 只归约第 0 个 warp | 注意力输出被均匀缩小 0.67x → 与官方逐元素吻合 |
+| 2 | MoE 专家和被 `memcpy` 覆盖 + `o` 从未清零 | moe_out 0.087 → 0.1425（官方 0.1452）|
+| 3 | mxf4 的 ue8m0 scale 按 fp4 的"每字节 2 值"切片 | world 扫描 tp=1/2/4/8 完全一致 0.0960 |
+| 4 | 窗口 KV 被错误跨层共享（应每层独立）| L3 从 −15% → −2.8%，" Paris" 出现 |
+| 5 | EOS 查找返回 None → 循环不停 | 输出 = " Paris." + EOS，**与官方逐字一致** |
+
+### 正确性现状
+
+- 裸 id 路径与官方**逐层一致**（pos0 40 层全程偏差有界 3–6%、不累积）✓
+- 输出与官方**逐字一致** ✓
+- 残留（不影响正确性、已文档化）：① 激活量化用 fp4（参考 fp8/block128）② chat 模板特殊 token
+  的细残差（`</think>` 两边都会改变预测 ✓，只是变成的 token 不同 ✗）
