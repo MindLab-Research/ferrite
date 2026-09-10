@@ -121,6 +121,10 @@ pub struct DevChain<'a> {
     s: Scratch,
     cos: DevBuf,
     sin: DevBuf,
+    /// the compressor's KV uses a DIFFERENT rope theta (160000 vs 10000);
+    /// without separate tables every rope call uses the main theta
+    cos_comp: DevBuf,
+    sin_comp: DevBuf,
 }
 
 fn fb(n: usize) -> usize {
@@ -222,16 +226,21 @@ impl<'a> DevChain<'a> {
         let half = cfg.rope_head_dim / 2;
         let cos = dev.alloc(fb(table * half))?;
         let sin = dev.alloc(fb(table * half))?;
+        let cos_comp = dev.alloc(fb(table * half))?;
+        let sin_comp = dev.alloc(fb(table * half))?;
+        // main rope (theta=10000) for the query and window KV
         dev.rope_precompute(
-            cos.ptr as *mut f32,
-            sin.ptr as *mut f32,
-            cfg.rope_head_dim as i32,
-            table as i32,
-            cfg.original_seq_len as i32,
-            cfg.rope_theta,
-            cfg.rope_factor,
-            cfg.beta_fast,
-            cfg.beta_slow,
+            cos.ptr as *mut f32, sin.ptr as *mut f32,
+            cfg.rope_head_dim as i32, table as i32,
+            cfg.original_seq_len as i32, cfg.rope_theta,
+            cfg.rope_factor, cfg.beta_fast, cfg.beta_slow,
+        )?;
+        // compressor rope (theta=160000) for the compressed latent
+        dev.rope_precompute(
+            cos_comp.ptr as *mut f32, sin_comp.ptr as *mut f32,
+            cfg.rope_head_dim as i32, table as i32,
+            cfg.original_seq_len as i32, cfg.compress_rope_theta,
+            cfg.rope_factor, cfg.beta_fast, cfg.beta_slow,
         )?;
         let _ = bf16_cap;
 
@@ -245,6 +254,8 @@ impl<'a> DevChain<'a> {
             s,
             cos,
             sin,
+            cos_comp,
+            sin_comp,
         })
     }
 
@@ -975,8 +986,8 @@ impl<'a> DevChain<'a> {
             let group_first = len * ratio;
             self.dev.apply_rope(
                 self.layers[layer].latent.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
                 1,
                 hd as i32,
                 cfg.rope_head_dim as i32,
