@@ -1157,3 +1157,34 @@ sync 时文本立刻变成 `" toll id "` ✓，靠这条判据才没有把回归
 
 **纪律（本会话反复验证过）**：任何"删同步"的改动都必须**同时**验证文本仍是 `" Paris."` ✓
 —— 本会话删 `publish` 的 sync 那次文本立刻变成 `" toll id "` ✗，靠这条判据才没把回归当提速 ✓。
+
+## ★★★★ 消融定位：MoE 专家占解码的 41%（每次专家 launch ≈ 106µs ✗）
+
+同口径（`[dsv41] DECODE`，仅解码）：
+
+| 配置 | ms/token | tok/s |
+|---|---|---|
+| 基线 | **211.7** | 4.7 |
+| `DSV41_SKIP_EXPERTS=1`（关掉 routed 专家） | **125.7** | 8.0 |
+| `DSV41_SKIP_ENGRAM_WEIGHTS=1` | 209.4 | 4.8（无影响 ✓）|
+
+⇒ **routed 专家一项就占 86ms/token = 41%** ✗✓。而单 token 只做 6 专家 × 3 个 GEMM = 18 次
+launch ✗ ⇒ **每次专家 launch ≈ 106µs** ✗✗（正常 CUDA launch 是 3–5µs ✗）—— 差 20–30 倍 ✓✓。
+
+**已排除**（本会话）：
+- 集合通信的 sync ✗（设备侧 stamp 已落地，无提速 ✓）
+- MoE 路由的 `dev.sync()` + 2 次下载 ✗（`DSV41_MOE_NOSYNC=1` 实测无提速：290 vs 287ms ✓）
+- `launch_mxf4` 内部无任何分配 / `cudaFuncSetAttribute` / 设备属性查询 ✗（grep 过 ✓），
+  启动处就是干净的 `mxf4_gemm_kernel<<<grid, kThreads, 0, s>>>` ✓
+
+⇒ **106µs/launch 的停顿在启动器之外** ✗，下一步必须直接测：
+1. 用 nsys 抓一个**单 layer**（`DSV41_LAYERS=1` ✓）的 CUDA API 时间线 ✗，看 `cuLaunchKernel`
+   的 CPU 侧耗时与 GPU 侧间隙 ✓（若是 CPU 侧 → 查我 Rust 包装里每次调用的开销 ✗；
+   若是 GPU 侧间隙 → 查内核本身的 M=1 路径 ✗）；
+2. 直接用**隔离微基准**调 `dsv41_expert_gate_up_fp4`（M=1、N=640、K=5120）测它的 GPU 时间 ✗
+   —— 判断 106µs 是 CPU launch 还是 GPU 执行 ✓；
+3. 若确认是 launch 开销 → 图化（但需先消灭主机侧派发 ✗）或把 6 个专家**合并成一次
+   分组 GEMM** ✓（一个内核处理全部 assignment ✓，同时解锁图化 ✓——终局形态 ✓）。
+
+**参考**：即使专家全部关掉也有 125.7ms/token ✗（= 2.8ms/层 ✓），其中注意力实测 1.78ms/层 ✓
+⇒ 仍有 ~1ms/层 分布在 hc 链 / shared expert / 投影 / 集合通信上 ✓。
