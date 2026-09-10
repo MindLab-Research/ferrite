@@ -70,11 +70,14 @@ performance story: ~7.5 GB of expert weight traffic per rank per step (~1 ms at
    fp4→e4m3 re-encode) doubles those bytes → ~2 ms/step, and it is explicitly
    forbidden. There is no fp8 expert entry point in the ABI, and a test
    enforces that.
-2. **fp4 needs tcgen05.** `sm_103a` has no warp-level fp4 MMA at all (probed:
-   every `mma.sync` fp4 spelling is rejected by ptxas), so the experts run
-   `tcgen05.mma ... kind::mxf4.block_scale.scale_vec::2X`. That instruction's
-   scale type is fixed to ue8m0, which is exactly the checkpoint's expert scale
-   layout (per-row × k-block-32 e8m0) — zero conversion.
+2. **fp4 needs tcgen05 — implemented and verified.** `sm_103a` has no
+   warp-level fp4 MMA at all (probed: every `mma.sync` fp4 spelling is rejected
+   by ptxas), so the experts run
+   `tcgen05.mma ... kind::mxf4.block_scale.scale_vec::2X` with the
+   checkpoint's own ue8m0 / k-block-32 scales (that instruction's scale type is
+   fixed to ue8m0, so there is zero conversion). The implementation lives in
+   `kernels/cuda/dsv41_experts_mxf4.cu` and passes its GPU numerics self-test
+   exactly (`maxdiff = 0.0` on 7 shapes incl. both ABI entry points).
 3. **Organisation matters.** tcgen05 is a CTA-level op (M=64/128) while a decode
    step has m=16 rows in total and each expert sees ~1.2 of them, so the MoE
    must be a *grouped* GEMM (sort assignments by expert, M=128 tiles spanning
@@ -85,6 +88,12 @@ performance story: ~7.5 GB of expert weight traffic per rank per step (~1 ms at
 The dense weights are fp8 *in the checkpoint*; they stay fp8 (`mma.sync`
 m16n8k32 e4m3, with the ue8m0 32×32 block scales applied per k-block in the
 epilogue). That is not a fallback, it is their native format.
+
+## Remaining work on this path
+
+The GEMM itself is done; what is left before an end-to-end run is the
+elementwise/reduction work that is still stubbed (`dsv41_indexer_topk`,
+`dsv41_compressor`) and the end-to-end bring-up on real weights.
 
 ## What is *not* worth optimising first
 

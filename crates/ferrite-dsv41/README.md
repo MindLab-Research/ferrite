@@ -91,9 +91,23 @@ truth for every semantic decision here:
   (primes against the reference's golden values, hand-computed rolling XOR),
   every operator's CPU golden behaviour, the weight map (shapes checked against
   the released safetensors header), DSpark index generation.
-* `kernels/cuda/*.cu` — compile-checked with `nvcc -arch=sm_103a` (no GPU run).
-* **Not yet done**: on-device numerics against the reference model, and the
-  end-to-end chain run. Those need the B300 and are the next step.
+* `kernels/cuda/dsv41_experts_mxf4.cu` — the native fp4 expert GEMM
+  (`tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X`).
+  **Numerically verified on the GPU**: `tests_tcgen05_mxf4.cu` compares against
+  a CPU reference in the crate's own quant semantics and reports
+  `maxdiff = 0.000e+00` (EXACT) on 7 shapes, including the two ABI entry points
+  (gate/up 128x64x32 and down 128x64x64). Reproduce with
+  `nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
+   -o t tests_tcgen05_mxf4.cu && ./t`.
+* The three `.cu` files link into one shared object with 16 exported `dsv41_*`
+  symbols (`build.sh` picks them up; `tests_*.cu` is deliberately excluded
+  because it carries a `main`).
+* **Still stubs** (`cudaErrorNotSupported`, not part of the GEMM/fp4 contract):
+  `dsv41_indexer_topk` (the fused score + candidate mask + top-k selection) and
+  `dsv41_compressor` (the ratio>1 softmax-gated pooling with its carried
+  state). Both are elementwise/reduction work, not matmuls.
+* **Not yet done**: on-device numerics against the reference model weights, and
+  the end-to-end chain run. Those need the B300.
 
 ## Open items to verify on hardware
 

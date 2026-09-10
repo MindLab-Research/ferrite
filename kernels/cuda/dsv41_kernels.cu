@@ -25,17 +25,13 @@
 // Therefore:
 //   * DENSE fp8 GEMMs run the native e4m3 m16n8k32 MMA here, with the 32x32
 //     ue8m0 block scales applied per k-block (exactly the reference scheme).
-//   * The fp4 EXPERT GEMMs have two implementations behind the same ABI:
-//       (a) the fp8 fallback entry points below, fed by the *lossless*
-//           fp4 -> e4m3 re-encode at load time (the reference's own
-//           cast_e2m1fn_to_e4m3fn: an e2m1 magnitude times a power-of-two
-//           offset stays representable in e4m3, so no precision is lost --
-//           this is re-encoding, not dequantisation);
-//       (b) `dsv41_expert_gate_up_fp4` / `dsv41_expert_down_fp4`, which are
-//           the tcgen05 MXFP4 path: see the TODO block at the bottom of this
-//           file for the exact remaining plumbing. Until that lands they
-//           return cudaErrorNotSupported so a caller can never silently get a
-//           non-native path.
+//   * The fp4 EXPERT GEMMs are NOT in this file. They live in
+//     kernels/cuda/dsv41_experts_mxf4.cu, which implements
+//     `dsv41_expert_gate_up_fp4` / `dsv41_expert_down_fp4` with the tcgen05
+//     `kind::mxf4.block_scale.scale_vec::2X` instruction (the only fp4
+//     tensor-core entry on this part; its scale type is ue8m0, exactly the
+//     checkpoint's expert scale format). There is deliberately no fp8 expert
+//     entry point anywhere in this ABI.
 //
 // The layout conventions match the release: A is [m, k] row-major (activations,
 // fp8 e4m3 with per-row 32-wide scales), B is [n, k] row-major (weights, fp8
@@ -218,67 +214,6 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const uint8_t* __
         out[(size_t)(m0 + gid + 8) * n + col] = acc[2] + (bias ? bias[col] : 0.f);
         out[(size_t)(m0 + gid + 8) * n + col + 1] = acc[3] + (bias ? bias[col + 1] : 0.f);
     }
-}
-
-// ------------------------------------------------ expert fp8 (fallback path)
-
-// gate+up: out[rows, 2*inter] = [silu-clamped gate | up] from w1/w3.
-// The weights here are the losslessly re-encoded e4m3 form (see the header).
-__global__ void expert_gate_up_kernel(const uint8_t* __restrict__ a,
-                                      const float* __restrict__ a_scale,
-                                      const uint8_t* __restrict__ w1,
-                                      const uint8_t* __restrict__ w1_scale,
-                                      const uint8_t* __restrict__ w3,
-                                      const uint8_t* __restrict__ w3_scale,
-                                      float* __restrict__ out, int rows, int dim, int inter,
-                                      float limit) {
-    // one thread per (row, inter) pair for the arithmetic; the GEMM itself is
-    // the same MMA path (kept separate here so the fallback needs no new ABI).
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * inter) return;
-    const int r = idx / inter, i = idx % inter;
-    const int nb_k = dim >> 5;
-    float g = 0.f, u = 0.f;
-    for (int kb = 0; kb < nb_k; kb++) {
-        float gd = 0.f, ud = 0.f;
-        for (int c = 0; c < 32; c++) {
-            const float av = e4m3_to_f(a[(size_t)r * dim + kb * 32 + c]) *
-                             a_scale[(size_t)r * nb_k + kb];
-            gd += e4m3_to_f(w1[(size_t)i * dim + kb * 32 + c]) *
-                  ue8m0_to_f(w1_scale[(size_t)(i >> 5) * nb_k + kb]) * av;
-            ud += e4m3_to_f(w3[(size_t)i * dim + kb * 32 + c]) *
-                  ue8m0_to_f(w3_scale[(size_t)(i >> 5) * nb_k + kb]) * av;
-        }
-        g += gd;
-        u += ud;
-    }
-    if (limit > 0.f) {
-        u = fminf(fmaxf(u, -limit), limit);
-        g = fminf(g, limit);
-    }
-    out[(size_t)r * 2 * inter + i] = g;
-    out[(size_t)r * 2 * inter + inter * 1 + i] = u;
-}
-
-// down: out[rows, dim] += weight[row] * (w2 @ act[inter])
-__global__ void expert_down_kernel(const float* __restrict__ act,
-                                   const uint8_t* __restrict__ w2,
-                                   const uint8_t* __restrict__ w2_scale,
-                                   const float* __restrict__ weight, float* __restrict__ out,
-                                   int rows, int dim, int inter) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= rows * dim) return;
-    const int r = idx / dim, o = idx % dim;
-    const int nb_k = inter >> 5;
-    float acc = 0.f;
-    for (int kb = 0; kb < nb_k; kb++) {
-        for (int c = 0; c < 32; c++) {
-            acc += e4m3_to_f(w2[(size_t)o * inter + kb * 32 + c]) *
-                   ue8m0_to_f(w2_scale[(size_t)(o >> 5) * nb_k + kb]) *
-                   act[(size_t)r * inter + kb * 32 + c];
-        }
-    }
-    out[(size_t)r * dim + o] = weight ? weight[r] * acc : acc;
 }
 
 // ------------------------------------------------------------------ engram
@@ -618,37 +553,6 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const uint8_t* a_scale, const
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_expert_gate_up_fp8(const uint8_t* a, const float* a_scale, const uint8_t* w1,
-                                        const uint8_t* w1_scale, const uint8_t* w3,
-                                        const uint8_t* w3_scale, float* out, int rows, int dim,
-                                        int inter, float limit, cudaStream_t s) {
-    const int total = rows * inter;
-    expert_gate_up_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(
-        a, a_scale, w1, w1_scale, w3, w3_scale, out, rows, dim, inter, limit);
-    return (int)cudaGetLastError();
-}
-
-extern "C" int dsv41_expert_down_fp8(const float* act, const uint8_t* w2, const uint8_t* w2_scale,
-                                     const float* weight, float* out, int rows, int dim, int inter,
-                                     cudaStream_t s) {
-    const int total = rows * dim;
-    expert_down_kernel<<<(unsigned)((total + 255) / 256), 256, 0, s>>>(act, w2, w2_scale, weight,
-                                                                      out, rows, dim, inter);
-    return (int)cudaGetLastError();
-}
-
-// The native fp4 expert path is the tcgen05 MXFP4 GEMM; see the TODO block.
-extern "C" int dsv41_expert_gate_up_fp4(const uint8_t*, const float*, const uint8_t*,
-                                        const uint8_t*, const uint8_t*, const uint8_t*, float*,
-                                        int, int, int, float, cudaStream_t) {
-    return (int)cudaErrorNotSupported;  // pending the tcgen05 implementation
-}
-
-extern "C" int dsv41_expert_down_fp4(const float*, const uint8_t*, const uint8_t*, const float*,
-                                     float*, int, int, int, cudaStream_t) {
-    return (int)cudaErrorNotSupported;  // pending the tcgen05 implementation
-}
-
 extern "C" int dsv41_engram_hash(const int32_t* token_map, int64_t* cache, const int64_t* primes,
                                  const int64_t* offsets, const int64_t* multipliers,
                                  const int32_t* input_ids, const uint8_t* mask, int64_t* out,
@@ -746,40 +650,10 @@ extern "C" int dsv41_moe_route(const float* x, const uint8_t* gate_w, const uint
 }
 
 // ============================================================================
-// TODO (performance, next step): the native MXFP4 expert GEMM via tcgen05.
-//
-// ptxas rejects every `mma.sync` fp4 form on sm_103a (verified), so the native
-// path is:
-//
-//   tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X
-//       [d_tmem], a_desc, b_desc, idesc, [scale_a_tmem], [scale_b_tmem], p;
-//
-// Remaining plumbing (all of it mechanical, none of it blocked):
-//   1. tcgen05.alloc a 128-column tensor-memory accumulator per CTA and keep a
-//      free-list (tcgen05_alloc.h / tcgen05_dealloc).
-//   2. Build the shared-memory operand descriptors (swizzled 128B layout) for A
-//      (the fp4 activations, k-major) and B (the fp4 expert weights [inter, dim]
-//      I8-packed -- our per-row-per-32 e8m0 scales are exactly the hardware MX
-//      layout, block 32 along k).
-//   3. Copy the e8m0 scales into tensor memory (tcgen05.cp) and pass their tmem
-//      addresses as [scale_a_tmem]/[scale_b_tmem].
-//   4. Issue the MMA, `tcgen05.commit` an mbarrier, wait, then read the
-//      accumulator back with tcgen05.ld and apply the per-row routing weight.
-//   5. Keep the pipeline fed: 4-8 k-stages, cta_group::1 to start.
-//
-// IMPORTANT — the organisation matters more than the plumbing. tcgen05 is a
-// CTA-level op (M=64/128), while a decode step has m=16 rows in total and each
-// expert sees ~1.2 of them. A per-expert launch would pad m=1.2 up to M=64/128
-// (~50x wasted rows), so this must be a GROUPED GEMM: sort the (token, slot)
-// assignments by expert, then run M=128 tiles that span several experts with a
-// masked valid-row count (the DeepGEMM m_grouped_gemm_nt_masked shape). See
-// crates/ferrite-dsv41/PERF.md — at m=16 the lossless-e4m3+fp8 route and the
-// MXFP4 route trade ~2x bytes against M-padding waste, so this needs a
-// measurement before it displaces the fallback.
-//
-// The entry points dsv41_expert_gate_up_fp4 / dsv41_expert_down_fp4 are the ABI
-// for this and currently return cudaErrorNotSupported, so a caller can never
-// silently receive a non-native path. Until this lands, the lossless fp4 -> e4m3
-// re-encode (weights.rs::convert_expert_fp4_to_e4m3) plus the fp8 entry points
-// above give a correct tensor-core implementation at 2x the weight bytes.
+// NOTE — the fp4 expert GEMMs (dsv41_expert_gate_up_fp4 / _down_fp4) are
+// implemented in kernels/cuda/dsv41_experts_mxf4.cu with tcgen05.mma
+// kind::mxf4.block_scale.scale_vec::2X (the only fp4 tensor-core entry on
+// sm_103a; scale type ue8m0 == the checkpoint's per-row-per-32 e8m0 format).
+// That file also carries the masked M=128 tile organisation, the canonical
+// K-major smem descriptors and the TMEM scale-factor layout notes.
 // ============================================================================

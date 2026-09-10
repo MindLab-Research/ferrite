@@ -12,7 +12,9 @@ DIR="$(dirname "$0")"
 # DeepSeek-V4.1-Flash kernels live in their own translation units; they are
 # linked into the same .so so the engine keeps a single dlopen target.
 SRCS=("$DIR/ferrite_kernels.cu")
-for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_vision.cu; do
+# the tcgen05 MXFP4 expert GEMM is its own TU; tests_*.cu carry a main
+# and are deliberately NOT linked into the shared object.
+for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu; do
     [ -f "$f" ] && SRCS+=("$f")
 done
 
