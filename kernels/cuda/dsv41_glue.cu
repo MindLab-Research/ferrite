@@ -426,7 +426,8 @@ extern "C" int dsv41_ar_store(const unsigned long long* peer_slots, int world, i
     if (n <= 0 || world <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (blocks > 512) blocks = 512;
-    ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f);
+    // legacy entry point: no parity, no credit wait (round 0 skips the wait)
+    ar_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, 0, nullptr, 0);
     return (int)cudaGetLastError();
 }
 
