@@ -1580,3 +1580,31 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 - 1600 在最乐观端；需要段融合的细粒度跨块流水化兑现全部预期
 
 **会话总成果（AR v5 突破 + 全链优化）**：13.45 → **11.06ms（+21.6%），1190 → 1446 tok/s**。运行配方 = 标准 env + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`。HEAD `c7e4393`。
+
+## 2026-09-10 上午：SGLang GLM-5.3-Flash 支持调研（PR #36507）——为什么他们快/我们差在哪
+
+**来源**：PR #36507 "GLM-5.3-Flash support"（JustinTong0323，2026-09-06 合入，100 文件）+ #38621（NVFP4 loading）。clone 于 /tmp/sglang。**参数核对：无差别**（topk=8 ✓、45 层、34 GDN + 11 DSA、hidden 4096、288 专家、moe_inter 2048、index_topk 2048、hc_mult 4、sinkhorn 20——SGLang 代码里默认 topk=7 只是 fallback，checkpoint 覆盖为 8）。
+
+**前提纠正**：我们自己在 B300 集群实测过 SGLang 不开 MTP ≈ **1300 tok/s** < ferrite 当前 **1446**。"SGLang 更快"的印象来自 EAGLE/MTP 数字（3200，draft 5 步 6 token）。但用户贴的这个 config（deep_gemm + trtllm + fp8 KV + tp4+ep4）与我们当时测的不同，不确定它跑多少。
+
+**TP4+EP4 不是提速原因——反而每 rank 带宽更差**：
+- TP8（ferrite）：每 rank 每层 ~104 unique experts × 3MB（inter/8=256）≈ 312MB
+- TP4+EP4：每 rank ~28 unique experts × 24MB（full inter 2048）≈ 672MB —— **2.2x 更多字节/rank**
+- 聚合流量相同（~2.5GB/层），但 4 卡分摊 → MoE 每步更慢。tp4 的意义是**容量**（306GB/4=76GB/rank 能装进 4 卡），不是速度。"八卡跑 tp4"=2 个独立实例=我们探索过的"2组方案"（AGENTS.md 已有：估算 1230-1600，TP=4 capture bug 已被 9edc30b 修复）。
+
+**4 个真实架构差距（按大小排序，都已在 SGLang 代码中核实）**：
+
+1. **MoE down：DeepGEMM fp8×fp8 tensor core + 双侧细粒度 block scale**（`deep_gemm.fp8_m_grouped_gemm_nt_masked`，deep_gemm.py）vs 我们的 SIMT down（2.04ms，L1TEX 管道 71% 地板）。权重侧用 checkpoint 原生 128×128 block scale；**激活侧用 per-token-group(1×128) fp8 量化**（`per_token_group_quant`，group_size=128）。我们 W8A8 失败的根因就是激活用了粗粒度 scale（~6% 误差→翻转）；DeepGEMM 的细粒度解决了精度。**预期差距 ~0.8-1.0ms——最大单项。ferrite 修法：per-token-group-128 激活量化 + block-scale 加载进 MMA 操作数的 W8A8。**
+2. **MHC（超连接）big-fuse：ONE TileLang kernel 算完整个 hc_pre**（`mhc_pre_big_fuse_tilelang`，默认 ON：`SGLANG_OPT_USE_TILELANG_MHC_PRE=True`）——GEMV(mix)+sqrsum+sigmoid+**sinkhorn 全内联**+归一化全在一个 kernel、每 token 96 线程、数据全程在寄存器/fragment、支持 PDL。vs 我们的 3-kernel 链（mix 4.8 + rest345 7.26 + post 3.2 = 1.37ms）。**差距 ~0.5-0.7ms。我们此前的"融合不值得"结论只算了 launch 成本（0.2µs），漏了中间量全局往返（mx partials/li_raw 的写读）和 P1 冗余重读——SGLang 的融合赢在这些。**
+3. **fp8_e4m3 KV cache**（quant_k_cache.py）vs 我们的 f32（a0e262d 因 prefill/batched 格式分歧 bug 回退）。KV 读取减半 + 1.8x 容量。**~0.15-0.25ms + 容量红利。我们已知根因（单 seq 写 f32 无 scale、batched 读写 fp8+scale），修的是格式统一。**
+4. **trtllm DSA decode 后端**（TRT-LLM 生产级 sparse MLA kernel）vs 我们手搓的 kpool+sparse+append 链（~0.6ms）。**~0.2-0.3ms。**
+
+**合计潜在差距 ~1.6-2.2ms**——如果 SGLang 这个 config 全部兑现，4 卡可达 ~9-10ms/步。但注意他们 tp4+ep4 的 MoE 带宽劣势（672 vs 312MB/rank）会吃掉一部分，尤其 B=16 时。
+
+**ferrite 的行动清单（更新）**：
+| 项 | 预期 | 依据 |
+|---|---|---|
+| down 的 per-token-group W8A8 MMA（DeepGEMM 式细粒度 scale） | −0.8~1.0ms | SGLang 已验证该数值方案可行（生产级） |
+| hc big-fuse（单 kernel，寄存器驻留，sinkhorn 内联） | −0.5~0.7ms | SGLang mhc_pre_big_fuse_tilelang 默认 ON |
+| fp8 KV 格式统一（修 root cause #4） | −0.15~0.25ms | SGLang quant_k_cache |
+| **合计** | **−1.45~1.95ms → 9.1-9.6ms ≈ 1670-1760** | |
