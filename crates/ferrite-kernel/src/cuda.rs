@@ -175,7 +175,9 @@ extern "C" {
                         vocab: i32, s: CuStream) -> i32;
     fn ferrite_cast_store_i32(src: *const std::ffi::c_void, dst: *mut std::ffi::c_void, s: CuStream) -> i32;
     fn ferrite_dsa_cache_append(kvb: *const f32, ki: *const f32, gate: *const f32,
-                                 k_nope: *mut f32, v: *mut f32, k_idx: *mut f32, k_gate: *mut f32,
+                                 k_q: *mut std::ffi::c_void, v_q: *mut std::ffi::c_void,
+                                 k_sc: *mut f32, v_sc: *mut f32,
+                                 k_idx: *mut f32, k_gate: *mut f32,
                                  t0_ptr: *const i32, n: i32, h: i32, dk: i32, dv: i32, idm: i32,
                                  s: CuStream) -> i32;
     fn ferrite_kpool_compress(k_idx: *const f32, k_gate: *const f32, ape: *const f32,
@@ -186,10 +188,12 @@ extern "C" {
                             total_ptr: *const i32, n_fixed: i32,
                             s: CuStream) -> i32;
     fn ferrite_dsa_append_batched(kvb: *const f32, ki: *const f32, gate: *const f32,
-                                   kn_tbl: *const *mut f32, v_tbl: *const *mut f32,
+                                   kq_tbl: *const *mut std::ffi::c_void, vq_tbl: *const *mut std::ffi::c_void,
+                                   ksc_tbl: *const *mut f32, vsc_tbl: *const *mut f32,
                                    kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
                                    t0_tbl: *const *const i32, total_tbl: *const *const i32,
-                                   b: i32, h: i32, dk: i32, dv: i32, idm: i32, ntok: i32,
+                                   b: i32, ntok: i32, h: i32, dk: i32, dv: i32, idm: i32,
+                                   max_t: i32, dev_adv: i32,
                                    s: CuStream) -> i32;
     fn ferrite_kpool_compress_batched(kidx_tbl: *const *mut f32, kgate_tbl: *const *mut f32,
                                        ape: *const f32, pool_keys: *mut f32,
@@ -205,12 +209,16 @@ extern "C" {
                                    b: i32, select_k_max: i32, kpool: i32, max_npools: i32,
                                    total_tbl: *const *const i32, n_fixed: i32,
                                    s: CuStream) -> i32;
-    fn ferrite_sparse_attn_v2_batched(q: *const f32, k_tbl: *const *mut f32, v_tbl: *const *mut f32,
+    fn ferrite_sparse_attn_v2_batched(q: *const f32,
+                                       kq_tbl: *const *mut std::ffi::c_void, ksc_tbl: *const *mut f32,
+                                       vq_tbl: *const *mut std::ffi::c_void, vsc_tbl: *const *mut f32,
                                        idx: *const f32, out: *mut f32, b: i32,
                                        total_tbl: *const *const i32,
                                        h: i32, d: i32, dv: i32, topk: i32,
                                        s: CuStream) -> i32;
-    fn ferrite_sparse_attn_v3_split(q: *const f32, k_tbl: *const *mut f32, v_tbl: *const *mut f32,
+    fn ferrite_sparse_attn_v3_split(q: *const f32,
+                                     kq_tbl: *const *mut std::ffi::c_void, ksc_tbl: *const *mut f32,
+                                     vq_tbl: *const *mut std::ffi::c_void, vsc_tbl: *const *mut f32,
                                      idx: *const f32, scores: *mut f32,
                                      part_o: *mut f32, part_l: *mut f32,
                                      out: *mut f32, b: i32,
@@ -218,6 +226,8 @@ extern "C" {
                                      h: i32, d: i32, dv: i32, topk: i32,
                                      s: CuStream) -> i32;
     fn ferrite_scale_inplace(x: *mut f32, s: f32, n: i32, st: CuStream) -> i32;
+    fn ferrite_quant_kv(x: *const f32, xq: *mut std::ffi::c_void, xsc: *mut f32,
+                        th: i32, d: i32, s: CuStream) -> i32;
     fn ferrite_pdl_exp(mode: i32, iters: i32, out_time_ms: *mut f32,
                        out_checksum: *mut f32, s: CuStream) -> i32;
     fn ferrite_p2p_ar_oneshot(partial: *const f32,
@@ -321,7 +331,10 @@ extern "C" {
     fn ferrite_sparse_attn(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
                            out: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                            topk: i32, s: CuStream) -> i32;
-    fn ferrite_sparse_attn_v2(q: *const f32, k: *const f32, v: *const f32, idx: *const f32,
+    fn ferrite_sparse_attn_v2(q: *const f32,
+                              kq: *const std::ffi::c_void, ksc: *const f32,
+                              vq: *const std::ffi::c_void, vsc: *const f32,
+                              idx: *const f32,
                               out: *mut f32, scratch: *mut f32, n: i32, t_ptr: *const i32, h: i32, d: i32, dv: i32,
                               topk: i32, splits: i32, s: CuStream) -> i32;
     fn ferrite_argmax(logits: *const f32, out: *mut f32, n: i32, dim: i32, s: CuStream) -> i32;
@@ -2421,7 +2434,21 @@ impl CudaBackend {
         let splits = (256 / (n * h).max(1)).clamp(1, 32);
         let scratch = DevBuf::alloc(self.dev, self.stream,
             (n as usize) * (h as usize) * (splits as usize) * (2 + dv as usize))?;
-        ck(unsafe { ferrite_sparse_attn_v2(dq.as_const_f32(), dk.as_const_f32(), dv_.as_const_f32(), di.as_const_f32(), do_.as_f32(), scratch.as_f32(), n, t_ptr, h, d, dv, topk, splits, self.stream) }, "sparse_attn_v2")?;
+        // fp8 KV (2026-09-10): the kernel reads e4m3 + per-(t,h) scales —
+        // quantize the uploaded f32 k/v on device (this is the non-hot
+        // Tensor/host path; the device path writes the cache directly).
+        let th_k = (t * h) as usize;
+        let dkq = DevBuf::alloc(self.dev, self.stream, k_nope.numel().div_ceil(4))?;
+        let dksc = DevBuf::alloc(self.dev, self.stream, th_k)?;
+        let dvq = DevBuf::alloc(self.dev, self.stream, v.numel().div_ceil(4))?;
+        let dvsc = DevBuf::alloc(self.dev, self.stream, th_k)?;
+        ck(unsafe { ferrite_quant_kv(dk.as_const_f32(), dkq.as_f32() as *mut std::ffi::c_void, dksc.as_f32(), th_k as i32, d, self.stream) }, "quant_kv_k")?;
+        ck(unsafe { ferrite_quant_kv(dv_.as_const_f32(), dvq.as_f32() as *mut std::ffi::c_void, dvsc.as_f32(), th_k as i32, dv, self.stream) }, "quant_kv_v")?;
+        ck(unsafe { ferrite_sparse_attn_v2(dq.as_const_f32(),
+                                            dkq.as_f32() as *const std::ffi::c_void, dksc.as_const_f32(),
+                                            dvq.as_f32() as *const std::ffi::c_void, dvsc.as_const_f32(),
+                                            di.as_const_f32(),
+                                            do_.as_f32(), scratch.as_f32(), n, t_ptr, h, d, dv, topk, splits, self.stream) }, "sparse_attn_v2")?;
         let ov = Arc::get_mut(&mut out.data).expect("unique out");
         do_.download(ov)?;
         Ok(())
@@ -3969,7 +3996,9 @@ impl CudaBackend {
             unsafe {
                 ferrite_dsa_cache_append(
                     kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
-                    k_nope_dev as *mut f32, v_dev as *mut f32, k_idx_dev as *mut f32, k_gate_dev as *mut f32,
+                    k_nope_dev, v_dev,   // e4m3 payloads (f32-sized buffers, 1/4 used)
+                    kn_scale_dev as *mut f32, v_scale_dev as *mut f32,   // per-(t,h) scales
+                    k_idx_dev as *mut f32, k_gate_dev as *mut f32,
                     pinned_t0, ni, h as i32, dk as i32, dv as i32, idm as i32, self.stream,
                 )
             },
@@ -4047,7 +4076,10 @@ impl CudaBackend {
         ck(
             unsafe {
                 ferrite_sparse_attn_v2(
-                    qb.as_const_f32(), k_nope_dev as *const f32, v_dev as *const f32, idx.as_const_f32(),
+                    qb.as_const_f32(),
+                    k_nope_dev as *const std::ffi::c_void, kn_scale_dev as *const f32,
+                    v_dev as *const std::ffi::c_void, v_scale_dev as *const f32,
+                    idx.as_const_f32(),
                     attn_out.as_f32(), sk_scratch.as_f32(), ni, pinned_total, h as i32, dk as i32, dv as i32,
                     out_width as i32, splits as i32, self.stream,
                 )
@@ -4464,7 +4496,8 @@ impl CudaBackend {
             unsafe {
                 ferrite_dsa_append_batched(
                     kvb.as_const_f32(), ki.as_const_f32(), gate.as_const_f32(),
-                    tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
+                    tbl.kn as *const *mut std::ffi::c_void, tbl.v as *const *mut std::ffi::c_void,
+                    tbl.kns as *const *mut f32, tbl.vs as *const *mut f32,
                     tbl.kidx as *const *mut f32, tbl.kgate as *const *mut f32,
                     tbl.t0p as *const *const i32,
                     tbl.totp as *const *const i32,
@@ -4480,7 +4513,8 @@ impl CudaBackend {
                     // The single-seq path passes ni legitimately there
                     // (kvb = [n tokens of ONE seq]); this batched layout must
                     // not copy that.
-                    ni, h as i32, dk as i32, dv as i32, idm as i32, 1, self.stream,
+                    ni, 1, h as i32, dk as i32, dv as i32, idm as i32,
+                    8192, 1, self.stream,
                 )
             },
             "dsa_append_batched",
@@ -4577,8 +4611,9 @@ impl CudaBackend {
                     )?;
                     let r = unsafe {
                         ferrite_sparse_attn_v3_split(
-                            qb.as_const_f32(), tbl.kn as *const *mut f32,
-                            tbl.v as *const *mut f32,
+                            qb.as_const_f32(),
+                            tbl.kn as *const *mut std::ffi::c_void, tbl.kns as *const *mut f32,
+                            tbl.v as *const *mut std::ffi::c_void, tbl.vs as *const *mut f32,
                             idx.as_const_f32(), scores.as_f32(),
                             part_o.as_f32(), part_l.as_f32(), attn_out.as_f32(),
                             ni, tbl.totp as *const *const i32,
@@ -4596,7 +4631,9 @@ impl CudaBackend {
                 }
                 if !attn_done {
                     ferrite_sparse_attn_v2_batched(
-                        qb.as_const_f32(), tbl.kn as *const *mut f32, tbl.v as *const *mut f32,
+                        qb.as_const_f32(),
+                        tbl.kn as *const *mut std::ffi::c_void, tbl.kns as *const *mut f32,
+                        tbl.v as *const *mut std::ffi::c_void, tbl.vs as *const *mut f32,
                         idx.as_const_f32(), attn_out.as_f32(), ni, tbl.totp as *const *const i32,
                         h as i32, dk as i32, dv as i32, out_width as i32, self.stream,
                     )
