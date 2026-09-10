@@ -1289,7 +1289,13 @@ impl<'a> DevChain<'a> {
         // One token: every assignment shares the input row, so expert e's total
         // contribution is expert_e(x) * sum of its routing weights. Accumulating
         // the distinct experts in index order keeps the sum deterministic.
+        // `expert_down_fp4` OVERWRITES its output (launch_mxf4 writes
+        // out[row*n + col] = x), so the scratch AND the accumulator both start
+        // from zero — `o` still held the attention output at this point, and the
+        // memcpy that used to follow the loop replaced the finished sum with the
+        // last expert's contribution alone.
         self.dev.zero(&self.s.ex_out)?;
+        self.dev.zero(&self.s.o)?;
         // No expert parallelism: the local array holds ALL experts, so a global
         // routing id indexes it directly (with the EP scheme it had to be
         // rebased by rank*ne).
@@ -1348,7 +1354,6 @@ impl<'a> DevChain<'a> {
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
             }
         }
-        self.dev.memcpy_d2d(self.s.o.ptr, self.s.ex_out.ptr as *const c_void, fb(dim))?;
 
         // shared expert: fp8, every token. Its weights are replicated, so under
         // a collective exactly one rank may contribute it — otherwise the
