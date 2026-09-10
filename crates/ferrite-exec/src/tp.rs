@@ -3246,7 +3246,6 @@ fn mega_chain_dev_batched(
     gname: &str,
     n: usize,
 ) -> Result<Vec<f32>> {
-    eprintln!("[chain] mega_chain_dev_batched enter capture={} n={}", capture, n);
     use ferrite_kernel::cuda::{DevBuf, DsaLayerWeights, ExpertWeights, GdnLayerWeights, GraphIO};
     let cuda = s
         .backend
@@ -3355,18 +3354,12 @@ fn mega_chain_dev_batched(
     // BOTH in the CURRENT pool context (batch=true inside the decode guard)
     // before graph_capture_begin so the in-capture allocs hit.
     if capture {
-        eprintln!("[prewarm] dev={} start", cuda.dev());
         if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 16384) {
             drop(b);
-        } else {
-            eprintln!("[prewarm] dev={} 16384 FAILED", cuda.dev());
         }
         if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 245760) {
             drop(b);
-        } else {
-            eprintln!("[prewarm] dev={} 245760 FAILED", cuda.dev());
         }
-        eprintln!("[prewarm] dev={} done", cuda.dev());
     }
     if capture {
         cuda.graph_capture_begin();
