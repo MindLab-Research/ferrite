@@ -295,7 +295,7 @@ __global__ void ar_store_kernel(const unsigned long long* __restrict__ peer_slot
     // so this write lands in the half last used by round-2 and must not start
     // until every peer has finished REDUCING round-2. EVERY block spins, not just
     // block 0 — the others would otherwise overwrite the slot mid-read.
-    if (round >= 3 && threadIdx.x == 0) {
+    if (round >= 99999 && threadIdx.x == 0) { // BISECT: credit wait disabled
         for (int p = 0; p < world; ++p) {
             const volatile unsigned* m = reduced + p;
             while (*m < round - 2) {
