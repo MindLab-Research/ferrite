@@ -1645,3 +1645,17 @@ TP=4/B=8 图化模式（GPU 0-3，race 修复 9edc30b 之后首次复测）：se
 1. hc big-fuse 单 kernel（−0.5~0.7ms，SGLang 的 mhc_pre_big_fuse_tilelang 模式：GEMV+sqrsum+sigmoid+sinkhorn+归一化全在一个 kernel，寄存器驻留）
 2. down one-expert-per-block（理论余量 1.31ms，但 HTILE/占用率/cp.async 三理论已失败，需要新思路）
 3. cublasLt 迁移逼退 splitK（−0.2~0.3ms，需 API 重构）
+
+## 2026-09-10 午后：down 第 6 理论（slotwise / one-expert-per-block）— 失败（−19%）
+
+**动机**：W8A8 后 serve 剖析显示 e4m3 MMA down 中位数 45.3µs ≈ SIMT 48.5µs——**两者都只有 ~38% DRAM**，而 act kernel 是 **71%**。假设：down 每 block 碰 9 个不同 expert（每 SM ~27 条并发 DRAM 流）→ row-buffer 抖动；act 每 block 1 个 expert（~5 条流）。
+
+**实施**（FERRITE_DOWN_SLOT=1，env gate 保留）：每 block 一个 (token, slot) assignment = 一个 expert，32 h-rows；phase-2 按 j 升序归约 partial（与块内累加逐位等价）。
+
+**实测**（三轮 A/B）：base **10.76/10.78ms** vs slot **12.86ms（−19%，慢 2.1ms）**。faults=0、opcheck=0、文本正常。
+
+**根因（重要认知）**：网格从 2048 blocks → **18432 blocks**，每 block 只读 **8KB** 权重（32 行 × 256B）。**block 粒度太小 → 调度/ramp/staging 固定开销主导**。反推 act 的 71%：act 每 block 读 **128KB**（16 行 × 4096 k × 2 投影 = gate+up），是 slotwise down 的 **16 倍**。→ **真正变量是"每 block 的字节量"（摊薄固定开销），不是 expert 流数**（也解释了 HTILE/cp.async 为何中性：它们没改每 block 字节量）。
+
+**down 至此 6 个理论全部失败**：① HTILE（局部性/act 重读）② one-expert 局部性 ③ cp.async 延迟隐藏 ④ 占用率 3→4 blocks/SM ⑤ wave 尾 ⑥ slotwise 单 expert/block。**唯一未被否证的观察：每 block 字节量越大越快（act 128KB/block = 71%，down 8-72KB/block = 38%）**——若要继续，方向是**每 block 读更多连续字节**（大 h-tile，如 256 行 × 9 slots = 576KB/block、grid 仅 16×16=256 blocks），但并行度会降（256 blocks 太少）。**down 暂停。**
+
+**当前基线**：10.76ms = **1486 tok/s**（env：标准 + `FERRITE_P2P=1 FERRITE_P2P_AR5=1`；`FERRITE_DOWN_SLOT` 默认 OFF）。
