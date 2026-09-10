@@ -8,7 +8,15 @@ set -euo pipefail
 
 ARCH="${1:-100a}"
 OUT="${FERRITE_OUT:-libferrite_kernels.so}"
-SRC="$(dirname "$0")/ferrite_kernels.cu"
+DIR="$(dirname "$0")"
+# DeepSeek-V4.1-Flash kernels live in their own translation units; they are
+# linked into the same .so so the engine keeps a single dlopen target.
+SRCS=("$DIR/ferrite_kernels.cu")
+# the tcgen05 MXFP4 expert GEMM is its own TU; tests_*.cu carry a main
+# and are deliberately NOT linked into the shared object.
+for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_experts_mxf4.cu "$DIR"/dsv41_vision.cu; do
+    [ -f "$f" ] && SRCS+=("$f")
+done
 
 NVCC="${NVCC:-nvcc}"
 "$NVCC" --version >/dev/null 2>&1 || { echo "error: nvcc not found (CUDA toolkit required)"; exit 1; }
@@ -32,7 +40,7 @@ fi
 # Same-source enforcement: fold the .cu content hash in. The Rust side embeds
 # whatever this script last wrote to .build_id, so rebuilding only ONE of the
 # two artifacts produces a mismatch and the process REFUSES TO START.
-CU_HASH="$(sha256sum "$SRC" | cut -c1-16)"
+CU_HASH="$(sha256sum "${SRCS[@]}" | sha256sum | cut -c1-16)"
 BUILD_ID="${BUILD_ID}+cu${CU_HASH}"
 echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
 
@@ -40,6 +48,6 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
     -DFERRITE_KERNEL_BUILD_ID="\"${BUILD_ID}\"" \
-    -o "$OUT" "$SRC"
+    -o "$OUT" "${SRCS[@]}"
 
-echo "built ${OUT} for sm_${ARCH} from ${SRC} (build_id ${BUILD_ID})"
+echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]} (build_id ${BUILD_ID})"

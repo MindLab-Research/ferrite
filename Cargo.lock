@@ -380,6 +380,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrite-dsv41"
+version = "0.1.0"
+dependencies = [
+ "ferrite-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "ferrite-exec"
 version = "0.1.0"
 dependencies = [
