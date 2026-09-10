@@ -11,6 +11,7 @@ members = [
     "crates/ferrite-serve",
     "crates/ferrite-dispatch",
     "crates/ferrite-http",
+    "crates/ferrite-dsv41",
 ]
 
 [workspace.package]

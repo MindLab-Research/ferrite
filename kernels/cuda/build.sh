@@ -8,7 +8,13 @@ set -euo pipefail
 
 ARCH="${1:-100a}"
 OUT="${FERRITE_OUT:-libferrite_kernels.so}"
-SRC="$(dirname "$0")/ferrite_kernels.cu"
+DIR="$(dirname "$0")"
+# DeepSeek-V4.1-Flash kernels live in their own translation units; they are
+# linked into the same .so so the engine keeps a single dlopen target.
+SRCS=("$DIR/ferrite_kernels.cu")
+for f in "$DIR"/dsv41_kernels.cu "$DIR"/dsv41_vision.cu; do
+    [ -f "$f" ] && SRCS+=("$f")
+done
 
 NVCC="${NVCC:-nvcc}"
 "$NVCC" --version >/dev/null 2>&1 || { echo "error: nvcc not found (CUDA toolkit required)"; exit 1; }
@@ -18,6 +24,6 @@ NVCC="${NVCC:-nvcc}"
 "$NVCC" -O3 -shared -Xcompiler -fPIC \
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
-    -o "$OUT" "$SRC"
+    -o "$OUT" "${SRCS[@]}"
 
-echo "built ${OUT} for sm_${ARCH} from ${SRC}"
+echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]}"

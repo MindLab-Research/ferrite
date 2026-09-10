@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-dsv41"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DeepSeek-V4.1-Flash support: config, fp4/fp8-MX/ue8m0 quant primitives, engram n-gram hashing, engine ops and the model chain."
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ferrite-types = { path = "../ferrite-types" }
