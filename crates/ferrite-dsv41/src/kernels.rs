@@ -333,6 +333,55 @@ extern "C" {
         score_func: i32,
         stream: CuStream,
     ) -> i32;
+    // ------------------------------------------------------------- glue ops
+    /// Engram write-back: `x[i,j,:] += gate * value[j,:]` where the gate is the
+    /// reference's normalised-dot sigmoid (signed sqrt + sigmoid) of the stream
+    /// against the key, and `kv` holds `[rows, hc*dim + dim]` (the wkv output
+    /// over the gathered rows). `token_mask` may be null (text-only batches).
+    pub fn dsv41_engram_apply(
+        x: *mut f32,
+        kv: *const f32,
+        q_weight: *const f32,
+        k_weight: *const f32,
+        token_mask: *const u8,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        eps: f32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// SwiGLU with the training clamps: `out[i] = silu(min(gate, limit)) *
+    /// clamp(up, -limit, limit)`, applied in place over `[rows, inter]` for each
+    /// half of the fused gate_up buffer.
+    pub fn dsv41_swiglu_limit(
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// Gather `n` rows of `dim` floats by index (`src` rows may repeat).
+    pub fn dsv41_gather_rows(
+        src: *const f32,
+        idx: *const i32,
+        out: *mut f32,
+        n: i32,
+        dim: i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// Accumulate `src[i, :] * weight[i]` into `dst[idx[i], :]`.
+    pub fn dsv41_scatter_add_rows(
+        src: *const f32,
+        idx: *const i32,
+        weight: *const f32,
+        dst: *mut f32,
+        n: i32,
+        dim: i32,
+        stream: CuStream,
+    ) -> i32;
 }
 
 /// Convenience: the reference's `score_func` selector.
@@ -340,4 +389,5 @@ pub mod score_func {
     pub const SOFTMAX: i32 = 0;
     pub const SIGMOID: i32 = 1;
     pub const SQRTSOFTPLUS: i32 = 2;
+
 }

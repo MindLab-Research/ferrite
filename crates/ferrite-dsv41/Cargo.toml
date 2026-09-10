@@ -7,6 +7,11 @@ description = "DeepSeek-V4.1-Flash support: config, fp4/fp8-MX/ue8m0 quant primi
 
 [dependencies]
 thiserror.workspace = true
+# dlopen for libcudart / libcublas / libferrite_kernels.so. Deliberately NOT a
+# link-time dependency: the crate keeps building and unit-testing on a box with
+# no CUDA (the CPU golden path), and the GPU path resolves its symbols at
+# runtime exactly like ferrite-kernel does.
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 ferrite-types = { path = "../ferrite-types" }
