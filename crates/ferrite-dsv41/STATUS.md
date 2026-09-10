@@ -820,3 +820,35 @@ rank4 rms=0.1164 fp=0.2802   rank7 rms=0.1409 fp=2.1919
      空间上够大 ✓，但 **loader 只填 9 行、其余为零**，而内核按 320 行 B 需要 **10** 行 scale ✗
      —— 若内核读第 10 行（下标 9）会读到**零** scale → 那 32 个补齐行的反量化尺度为 0 → 无影响 ✓；
      但若它读的是别的布局（SFA/SFB 的 tiling）就可能错 ✗。**这一条最值得先查。**
+
+### ★★★ 最终判别：结果随 world **单调下降** → 每段自身少算（不是 AR、不是分片重复）
+
+同一条 prompt、L0、pos0、skip shared：
+
+| world | routed_only rms |
+|---|---|
+| **1** | **0.0901** ✓（官方 0.100171）|
+| 2 | 0.0759 ✗ |
+| 4 | 0.0756 ✗ |
+| 8 | 0.0560 ✗ |
+
+**数学上必须完全相同**（同一个 Σ_{i=1..2304} w2[:,i]·swiglu[i]，只是切成 N 段分别算再相加）✗。
+world=1 正确、world 越大越少 ✗ ⇒ **每一段自身的计算在少算** ✗（AR 已被注意力逐元素吻合证伪 ✓，
+loader 分片已被 8 个不同指纹证伪 ✓）。
+
+**最强嫌疑：权重 scale 张量（SFA/SFB）的分片布局与内核期望不一致** ✗
+- fp4/fp8 的 scale 在内核里是按 **K atom 分块**排布的（`dsv41_experts_mxf4.cu` 的注释：
+  "SFB occupies ceil(N/32) columns per atom; consecutive atoms take ..."、"Two consecutive
+  K-atoms share ONE 32-bit SF word"）✗
+- 我的 loader 按普通 `[rows, cols]` 行主序切片（`ExpertRows`/`ExpertCols`）✗
+- **支持证据**：每片 swiglu 幅度跨 4 倍（0.067–0.267 ✗）——正常均匀切片不会这样 ✗
+- world=1 时整张 scale 原样使用 ✓ 所以正确 ✓；一旦按行/列切，SF 的 atom 配对就被切断 ✗
+  → 每段用错 scale → 幅值被削弱 ✗（row_weight 是常数，所以表现为整体偏小而非乱码）
+- 另注：`rescale` 后 `load.rs` 只为 `Shard::Rows` 做了 scale 的 `*2` 兼容，expert 的
+  `ExpertRows/ExpertCols` 分支**没有对应的 scale 布局处理** ✗（`weights.rs:317-318` 只是把
+  scale 的 shape 写成 `[o/32, k/32]`，切片规则与权重同样，但**内核要的 atom 布局不同** ✗）
+
+**下会话第一刀**：读 `mxf4_gemm_kernel` 里 SFA/SFB 的加载代码（`dsv41_experts_mxf4.cu:399-476`），
+确定它对 B scale 的期望布局（是 `[N/32, K/32]` 行主序，还是按 atom 交错 ✗），然后
+让 `local_shape`/loader 对 expert 的 scale 张量按**同样的 atom 语义**切片；
+最省事的验证是 **world=2**（只切一刀 ✓）：若修好后 world=2 能回到 0.0901 ✓ 就说明方向对 ✓。
