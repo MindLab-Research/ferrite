@@ -1316,7 +1316,12 @@ impl Device {
     /// staging them through host memory.
     pub fn bf16_to_f32(&self, src: *const c_void, dst: *mut c_void, n: i64) -> Result<()> {
         let rc = unsafe { (self.kernels.bf16_to_f32)(src, dst, n, self.stream) };
-        self.kerr(rc, "ferrite_bf16_to_f32")
+        self.kerr(rc, "ferrite_bf16_to_f32")?;
+        // load-time op: synchronise so a fault inside the kernel is attributed
+        // here rather than to whatever call happens to run next
+        self.dev_sync().map_err(|e| {
+            FerriteError::Config(format!("ferrite_bf16_to_f32 (n={n}): {e}"))
+        })
     }
 
     pub fn f32_to_bf16(&self, src: *const f32, dst: *mut c_void, n: i64) -> Result<()> {
@@ -1445,8 +1450,15 @@ impl Drop for DevBuf {
 impl Device {
     pub fn free(&self, b: &DevBuf) {
         if b.owned && !b.ptr.is_null() {
-            unsafe {
-                (self.cudart.free)(b.ptr);
+            let rc = unsafe { (self.cudart.free)(b.ptr) };
+            if rc != 0 {
+                // report the failure: an unchecked failed free leaves the context
+                // poisoned and shows up later as a bogus "out of memory"
+                let msg = unsafe {
+                    let p = (self.cudart.strerror)(rc);
+                    std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
+                };
+                eprintln!("[dsv41] cudaFree({:p}) failed: {msg}", b.ptr);
             }
         }
     }
