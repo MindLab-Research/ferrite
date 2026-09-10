@@ -753,3 +753,33 @@ self.experts_end_idx)` 只迭代自己那 48 个 → **rank 0 永远不处理专
 3. 或不逐专家比，只比"routed_only / shared_only / full"三个全量（已做的）+
    再比"**每个专家的权重 w_e**"（已证一致 ✓）+ "**top-6 名单**"（已证一致 ✓）——
    剩下唯一不可比的中间量就是各专家的 swiglu/down，而它们受 EP/TP 差异影响。
+
+### ★★★ 决定性判别：tp=1 ✓ 正确，tp=8 ✗ 偏小 → bug 在 MoE 的 TP/AR 路径
+
+同一次 prompt、同一层（L0，pos0）、同样关掉 shared expert：
+
+| 配置 | routed_only (L0 moe_out) |
+|---|---|
+| **我的 tp=1**（`DSV41_LAYERS=1`，inter 不切、无 AR） | **0.0901** |
+| 官方（EP8，AR 后全量） | **0.100171** |
+| **我的 tp=8**（inter 切 1/8 + AR 求和） | **0.0560** |
+
+→ **tp=1 与官方吻合（10% 内）** ✓✓，**tp=8 却小 1.79x** ✗✗
+→ **专家计算本身（fp4 gate/up/down、swiglu、路由）是正确的** ✓✓
+→ **bug 在"每 rank 的 inter 切片 + AR 求和"这条 TP 路径上** ✗
+
+顺带确认（都不是这个 bug）：
+- 每个 rank 的 expert 切片补齐（288→320）**已被清零** ✓：
+  `load.rs:383-385`「destination, pre-zeroed so any padding the slice needs stays zero」
+  + `load.rs:604-606`「one allocation; the K padding is already zero」✓
+- `local_shape` 的 ExpertRows/ExpertCols 补齐与 `padded_inter(288)=320` 一致 ✓
+- `dev.alloc` 用 cudaMalloc（不清零），但加载路径显式 `zero_at` 了 ✓
+
+**下会话第一刀（最小、最可能一步到位）**：在 tp=8 下打印
+① 每个 rank 的 `ex_out`（down 的**本 rank 部分和**）与它在 inter 上的切片范围；
+② AR **之后**的 `o`；
+然后核对"Σ 各 rank 部分和 == 全量" —— 重点看：
+- 各 rank 是否真的拿到**不同**的 inter 切片（若 8 个 rank 拿到同一片，AR 会重复相加；
+  若切片的并集不是完整 inter，就会整体偏小 ✗）；
+- `wsum[e]`（每专家权重和）是否在**每个** rank 上都算对了（它在 all-reduce 前就被当作
+  down 的 row_weight 用掉，若某 rank 上 wsum 为空，该 rank 的贡献就整段丢失 ✗）。
