@@ -152,6 +152,9 @@ pub struct DevChain<'a> {
     moe_graph_armed: bool,
     /// How many steps this chain has run (the first one warms the kernels).
     step_count: u32,
+    /// Diagnostics for the MoE segment graphs.
+    moe_graph_captures: u32,
+    moe_graph_replays: u32,
     /// n-gram hash state (host side; the token cache spans prefill + decode)
     ngram: Option<crate::engram::NgramHashState>,
     eng_layout: Option<crate::engram::EngramLayout>,
@@ -317,6 +320,8 @@ impl<'a> DevChain<'a> {
             moe_graph: vec![None; cfg.n_layers],
             moe_graph_armed: false,
             step_count: 0,
+            moe_graph_captures: 0,
+            moe_graph_replays: 0,
             ngram,
             eng_layout,
             eng_map,
@@ -773,6 +778,11 @@ impl<'a> DevChain<'a> {
         // kernel; the capture happens on the next one, then it replays.
         if self.moe_graph_armed {
             if let Some(e) = self.moe_graph.get(layer).and_then(|x| *x) {
+                self.moe_graph_replays = self.moe_graph_replays.wrapping_add(1);
+                if self.moe_graph_replays == 1 {
+                    eprintln!("[gmo] first MoE segment replay at L{layer} (captures={})",
+                        self.moe_graph_captures);
+                }
                 self.dev.graph_launch(e)?;
             } else {
                 self.dev.capture_begin()?;
@@ -781,6 +791,10 @@ impl<'a> DevChain<'a> {
                 let e = self.dev.graph_instantiate(g)?;
                 self.dev.graph_free(g, std::ptr::null_mut())?;
                 self.moe_graph[layer] = Some(e);
+                self.moe_graph_captures = self.moe_graph_captures.wrapping_add(1);
+                if self.moe_graph_captures == 1 {
+                    eprintln!("[gmo] MoE segment graph armed: first capture at L{layer}");
+                }
             }
         } else {
             self.moe(layer, ld)?;
