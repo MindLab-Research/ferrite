@@ -12,7 +12,7 @@
 //! the embedding expander and the f32->bf16 cast. Reuse means calling the
 //! existing symbol; no GLM source is touched.
 
-use std::ffi::{c_char, c_int, c_long, c_void, CString};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CString};
 
 use ferrite_types::{FerriteError, Result};
 
@@ -35,6 +35,11 @@ struct Cudart {
     dev_sync: unsafe extern "C" fn() -> c_int,
     last_error: unsafe extern "C" fn() -> c_int,
     strerror: unsafe extern "C" fn(c_int) -> *const c_char,
+    set_device: unsafe extern "C" fn(c_int) -> c_int,
+    get_device: unsafe extern "C" fn(*mut c_int) -> c_int,
+    device_count: unsafe extern "C" fn(*mut c_int) -> c_int,
+    enable_peer: unsafe extern "C" fn(c_int, c_uint) -> c_int,
+    memcpy_peer_async: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, CuStream) -> c_int,
 }
 
 struct Cublas {
@@ -183,6 +188,7 @@ pub struct Device {
     stream: CuStream,
     handle: *mut c_void,
     debug_sync: bool,
+    _cudart_handle: *mut c_void,
     _libs: (*mut c_void, *mut c_void, *mut c_void),
 }
 
@@ -277,6 +283,11 @@ impl Device {
                 dev_sync: f!(h_cudart, "cudaDeviceSynchronize"),
                 last_error: f!(h_cudart, "cudaGetLastError"),
                 strerror: f!(h_cudart, "cudaGetErrorString"),
+                set_device: f!(h_cudart, "cudaSetDevice"),
+                get_device: f!(h_cudart, "cudaGetDevice"),
+                device_count: f!(h_cudart, "cudaGetDeviceCount"),
+                enable_peer: f!(h_cudart, "cudaDeviceEnablePeerAccess"),
+                memcpy_peer_async: f!(h_cudart, "cudaMemcpyPeerAsync"),
             };
             let cublas = Cublas {
                 create: f!(h_cublas, "cublasCreate_v2"),
@@ -337,6 +348,7 @@ impl Device {
                 stream,
                 handle,
                 debug_sync: std::env::var("DSV41_DEBUG_SYNC").map(|v| v != "0").unwrap_or(false),
+                _cudart_handle: h_cudart,
                 _libs: (h_cudart, h_cublas, h_k),
             })
         }
@@ -344,6 +356,103 @@ impl Device {
 
     pub fn stream(&self) -> CuStream {
         self.stream
+    }
+
+    /// This context's device ordinal.
+    pub fn device_id(&self) -> i32 {
+        let mut d: c_int = -1;
+        unsafe {
+            (self.cudart.get_device)(&mut d);
+        }
+        d
+    }
+
+    pub fn device_count(&self) -> i32 {
+        let mut n: c_int = 0;
+        unsafe {
+            (self.cudart.device_count)(&mut n);
+        }
+        n
+    }
+
+    /// Bind this thread to `gpu` and let it reach every other device. Device
+    /// selection in the CUDA runtime is per-thread, which is what lets one
+    /// process drive several devices — one rank per thread — without juggling
+    /// contexts by hand.
+    pub fn bind_to(gpu: i32) -> Result<()> {
+        // the runtime must be initialised before the device can be set, so go
+        // through a device-0 query first
+        let d = Device::open_dummy_cudart()?;
+        let rc = unsafe { (d.set_device)(gpu) };
+        if rc != 0 {
+            return Err(FerriteError::Config(format!("cudaSetDevice({gpu}): {rc}")));
+        }
+        let mut n: c_int = 0;
+        unsafe {
+            (d.device_count)(&mut n);
+        }
+        for p in 0..n {
+            if p != gpu {
+                // "already enabled" (704) and "unsupported" (801) are fine: the
+                // copy below will report a real failure if access is missing
+                unsafe {
+                    (d.enable_peer)(p, 0);
+                }
+                unsafe {
+                    (d.last_error)();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn open_dummy_cudart() -> Result<Cudart> {
+        unsafe {
+            let h = libc::dlopen(
+                CString::new("libcudart.so").unwrap().as_ptr(),
+                libc::RTLD_NOW | libc::RTLD_GLOBAL,
+            );
+            if h.is_null() {
+                return Err(FerriteError::Config("dlopen(libcudart.so) failed".into()));
+            }
+            Ok(Cudart {
+                malloc: f!(h, "cudaMalloc"),
+                free: f!(h, "cudaFree"),
+                memcpy: f!(h, "cudaMemcpy"),
+                memset: f!(h, "cudaMemset"),
+                stream_create: f!(h, "cudaStreamCreate"),
+                stream_sync: f!(h, "cudaStreamSynchronize"),
+                dev_sync: f!(h, "cudaDeviceSynchronize"),
+                last_error: f!(h, "cudaGetLastError"),
+                strerror: f!(h, "cudaGetErrorString"),
+                set_device: f!(h, "cudaSetDevice"),
+                get_device: f!(h, "cudaGetDevice"),
+                device_count: f!(h, "cudaGetDeviceCount"),
+                enable_peer: f!(h, "cudaDeviceEnablePeerAccess"),
+                memcpy_peer_async: f!(h, "cudaMemcpyPeerAsync"),
+            })
+        }
+    }
+
+    /// Copy `bytes` from this device to `dst_dev` (NVLink peer copy).
+    pub fn memcpy_peer(
+        &self,
+        dst_dev: i32,
+        dst: *mut c_void,
+        src: *const c_void,
+        bytes: usize,
+    ) -> Result<()> {
+        let st = unsafe {
+            (self.cudart.memcpy_peer_async)(
+                dst,
+                dst_dev,
+                src,
+                self.device_id(),
+                bytes,
+                self.stream,
+            )
+        };
+        check_cudart(st, &self.cudart, "cudaMemcpyPeerAsync")
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -450,6 +559,21 @@ impl Device {
         let f = self.need(self.kernels.add_inplace, "ferrite_add")?;
         let rc = unsafe {
             f(dst.ptr as *const f32, src.ptr as *const f32, dst.ptr as *mut f32, n as c_int, self.stream)
+        };
+        self.kerr(rc, "ferrite_add")
+    }
+
+    /// Device-wide synchronisation (used by the all-reduce, which must know
+    /// that its peer copies have landed before summing them).
+    pub fn dev_sync(&self) -> Result<()> {
+        check_cudart(unsafe { (self.cudart.dev_sync)() }, &self.cudart, "cudaDeviceSynchronize")
+    }
+
+    /// `dst += src` elementwise over `n` f32 at raw addresses.
+    pub fn add_inplace_raw(&self, dst: *mut c_void, src: *const c_void, n: i64) -> Result<()> {
+        let f = self.need(self.kernels.add_inplace, "ferrite_add")?;
+        let rc = unsafe {
+            f(dst as *const f32, src as *const f32, dst as *mut f32, n as c_int, self.stream)
         };
         self.kerr(rc, "ferrite_add")
     }

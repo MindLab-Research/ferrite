@@ -22,6 +22,7 @@ pub mod kernels;
 pub mod load;
 pub mod ops;
 pub mod quant;
+pub mod tp;
 pub mod vision;
 pub mod weights;
 

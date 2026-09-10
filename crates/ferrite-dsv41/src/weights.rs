@@ -71,8 +71,15 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
     let inter = cfg.moe_inter_dim;
 
     // embeddings / head (vocab-parallel)
-    push(&mut out, "embed.weight", vec![cfg.vocab_size, dim], Shard::Rows);
-    push(&mut out, "head.weight", vec![cfg.vocab_size, dim], Shard::Rows);
+    // NOTE (TP bring-up): the reference splits these two over the vocabulary
+    // (ParallelEmbedding / ParallelHead). We keep them replicated for now —
+    // numerically identical, costs 2 x 2.6 GiB per rank — because the split
+    // needs a gather: `embed_expand_dev_kernel` maps an out-of-range id to row
+    // 0 rather than skipping it, so a rank whose slice lacks the token would
+    // contribute a real (wrong) row instead of nothing. Switching back is a
+    // one-line change once the gather is in.
+    push(&mut out, "embed.weight", vec![cfg.vocab_size, dim], Shard::Replicated);
+    push(&mut out, "head.weight", vec![cfg.vocab_size, dim], Shard::Replicated);
     push(&mut out, "norm.weight", vec![dim], Shard::Replicated);
 
     for l in 0..cfg.n_layers {

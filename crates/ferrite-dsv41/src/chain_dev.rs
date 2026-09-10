@@ -31,7 +31,10 @@ use std::ffi::c_void;
 
 use ferrite_types::{FerriteError, Result};
 
+use std::sync::Arc;
+
 use crate::config::{Dsv41Config, KvMode};
+use crate::tp::Collective;
 use crate::device::{DevBuf, Device};
 use crate::load::{Dsv41DevWeights, LayerDev};
 use crate::ops;
@@ -111,6 +114,9 @@ pub struct DevChain<'a> {
     pub cfg: &'a Dsv41Config,
     pub w: &'a Dsv41DevWeights,
     pub opts: RunOpts,
+    /// Tensor-parallel collective. `None` runs the model on one device; when
+    /// present, the row-parallel sites reduce across ranks.
+    pub comm: Option<Arc<Collective>>,
     layers: Vec<LayerCache>,
     s: Scratch,
     cos: DevBuf,
@@ -214,6 +220,7 @@ impl<'a> DevChain<'a> {
             cfg,
             w,
             opts,
+            comm: None,
             layers,
             s,
             cos,
@@ -715,6 +722,12 @@ impl<'a> DevChain<'a> {
             dim as i32,
             self.s.o.ptr as *mut f32,
         )?;
+        // wo_b splits the reduction dim (its weights are column-sharded), so
+        // each rank holds a partial sum
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            c.end_round();
+        }
         Ok(())
     }
 
@@ -1017,8 +1030,11 @@ impl<'a> DevChain<'a> {
         }
         self.dev.memcpy_d2d(self.s.o.ptr, self.s.ex_out.ptr as *const c_void, fb(dim))?;
 
-        // shared expert: fp8, every token
-        if !self.opts.skip_shared_expert {
+        // shared expert: fp8, every token. Its weights are replicated, so under
+        // a collective exactly one rank may contribute it — otherwise the
+        // all-reduce below would sum it `world` times.
+        let shared_rank = self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true);
+        if !self.opts.skip_shared_expert && shared_rank {
             if let (Some(w1), Some(w1s), Some(w3), Some(w3s), Some(w2), Some(w2s)) = (
                 ld.shared_w1.as_ref(),
                 ld.shared_w1_scale.as_ref(),
@@ -1067,6 +1083,11 @@ impl<'a> DevChain<'a> {
                 )?;
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
             }
+        }
+        // routed experts are expert-parallel, so each rank holds a partial sum
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            c.end_round();
         }
         // the block output is the attention-branch accumulator `o`
         Ok(())

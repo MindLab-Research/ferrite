@@ -14,7 +14,10 @@
 //! they are ~189 GiB and the engram write-back is still a separate increment, so
 //! loading them would only add minutes to a run that cannot use them yet.
 
+use std::sync::{Arc, Barrier, Mutex};
+
 use ferrite_dsv41::chain_dev::{DevChain, RunOpts};
+use ferrite_dsv41::tp::{self, Collective};
 use ferrite_dsv41::config::Dsv41Config;
 use ferrite_dsv41::device::Device;
 use ferrite_dsv41::load::Loader;
@@ -88,6 +91,11 @@ fn main() -> Result<()> {
     }
     eprintln!("[dsv41] prompt {} tokens: {:?}", ids.len(), &ids[..ids.len().min(8)]);
 
+    // ---- tensor parallel path ----
+    if tp > 1 {
+        return run_tp(&dir, &so, &cfg, ids.clone(), prompt.len(), max_tokens, tp, eos);
+    }
+
     // ---- weights ----
     let t0 = std::time::Instant::now();
     let mut loader = Loader::new(std::path::Path::new(&dir), &dev)?;
@@ -145,6 +153,112 @@ fn main() -> Result<()> {
         dt,
         produced.len() as f64 / dt
     );
+    let text = tok.decode(&produced, true).unwrap_or_default();
+    println!("--- generated ({}) ---", produced.len());
+    println!("{text}");
+    println!("--- ids: {:?}", &produced[..produced.len().min(24)]);
+    Ok(())
+}
+
+/// Tensor-parallel run: one thread per rank, each bound to its own device and
+/// holding its own slice of the weights. Ranks stay in lockstep through the
+/// collective's barrier, and every rank computes the same logits (the shared
+/// reductions make the streams identical), so sampling needs no broadcast.
+#[allow(clippy::too_many_arguments)]
+fn run_tp(
+    dir: &str,
+    so: &str,
+    cfg: &Dsv41Config,
+    ids: Vec<u32>,
+    _prompt_len: usize,
+    max_tokens: usize,
+    tp: usize,
+    eos: Option<u32>,
+) -> Result<()> {
+    let cfg = cfg.clone();
+    let world = tp;
+    let barrier = Arc::new(Barrier::new(world));
+    let t_small = Arc::new(Mutex::new(vec![0u64; world]));
+    let t_big = Arc::new(Mutex::new(vec![0u64; world]));
+    let dir_owned = dir.to_string();
+    let dir = dir_owned.clone();
+    let so = so.to_string();
+    let hc_dim = cfg.hc_mult * cfg.dim;
+    let vocab = cfg.vocab_size;
+    println!(
+        "[dsv41] TP{world}: dim={} layers={} hc*dim={} vocab={}",
+        cfg.dim, cfg.n_layers, hc_dim, vocab
+    );
+
+    let t0 = std::time::Instant::now();
+    let dir_for_ranks = dir.clone();
+    let so_for_ranks = so.clone();
+    let produced: Vec<u32> = tp::run_ranks(world, move |rank| {
+        Device::bind_to(rank as i32)?;
+        let dev = Arc::new(Device::open(&so_for_ranks)?);
+        let mut loader = Loader::new(std::path::Path::new(&dir_for_ranks), &dev)?;
+        if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS").map(|v| v != "0").unwrap_or(true) {
+            loader.skip_prefixes.push("engram.embed.".into());
+        }
+        let w = loader.load(&cfg, world, rank)?;
+        dev.sync()?;
+        if rank == 0 {
+            println!(
+                "[dsv41] rank0 weights: {:.1} GiB in {:.1}s",
+                loader.uploaded as f64 / (1u64 << 30) as f64,
+                t0.elapsed().as_secs_f64()
+            );
+        }
+        // collectives: allocate, then hand the staging addresses around
+        let mut c_small = Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
+        let mut c_big = Collective::new(dev.clone(), world, rank, vocab * 4, barrier.clone())?;
+        {
+            t_small.lock().unwrap()[rank] = c_small.staging_base();
+            t_big.lock().unwrap()[rank] = c_big.staging_base();
+        }
+        barrier.wait();
+        let ps = t_small.lock().unwrap().clone();
+        let pb = t_big.lock().unwrap().clone();
+        barrier.wait();
+        c_small.set_peers(ps)?;
+        c_big.set_peers(pb)?;
+
+        let mut chain = DevChain::new(&dev, &cfg, &w, RunOpts::from_env())?;
+        chain.comm = Some(Arc::new(c_small));
+        chain.reset()?;
+        // prefill, then greedy decode — every rank walks the same tokens
+        let t1 = std::time::Instant::now();
+        let mut logits = Vec::new();
+        for (i, &t) in ids.iter().enumerate() {
+            logits = chain.step(t, i)?;
+        }
+        if rank == 0 {
+            println!(
+                "[dsv41] prefill {} tokens in {:.2}s",
+                ids.len(),
+                t1.elapsed().as_secs_f64()
+            );
+        }
+        let mut out: Vec<u32> = Vec::new();
+        for step in 0..max_tokens {
+            let mut best = 0usize;
+            for (i, &v) in logits.iter().enumerate() {
+                if v > logits[best] {
+                    best = i;
+                }
+            }
+            let next = best as u32;
+            out.push(next);
+            if Some(next) == eos {
+                break;
+            }
+            logits = chain.step(next, ids.len() + step)?;
+        }
+        Ok(out)
+    })?;
+
+    let tok = tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
+        .map_err(|e| ferrite_types::FerriteError::Config(format!("tokenizer: {e}")))?;
     let text = tok.decode(&produced, true).unwrap_or_default();
     println!("--- generated ({}) ---", produced.len());
     println!("{text}");
