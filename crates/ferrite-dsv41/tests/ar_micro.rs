@@ -78,7 +78,11 @@ fn collective_all_reduce_matches_host_reference() {
                             .lock()
                             .unwrap()
                             .push(format!("rank {rank} round {r}: all_reduce: {e}"));
-                        return;
+                        // keep participating in the harness barrier: returning here
+                        // would leave the other ranks waiting forever and look like
+                        // a protocol hang instead of reporting the real error
+                        barrier.wait();
+                        continue;
                     }
                     let d = ferrite_dsv41::device::Device::view(buf.ptr, n * 4);
                     dev.download_f32(&d, &mut got).expect("download");
@@ -92,7 +96,8 @@ fn collective_all_reduce_matches_host_reference() {
                             "rank {rank} round {r}: got {:.1} (first) / {:.1} (last), expected {:.1}",
                             got[0], got[n - 1], expect
                         ));
-                        return;
+                        barrier.wait();
+                        continue;
                     }
                     // the buffers must keep advancing (a stalled round would repeat)
                     barrier.wait();
