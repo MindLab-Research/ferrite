@@ -2107,13 +2107,24 @@ impl CudaBackend {
         let alpha: f32 = 1.0;
         let beta: f32 = 0.0;
         // column-major view: C'[N,16] = W^T[N,K] * x^T[K,16]
+        // gemm algo: 99 = CUBLAS_GEMM_DEFAULT_TENSOR_OP (the heuristic, which
+        // picks split-K variants for our m=16 shapes: nsys counted
+        // nvjet_splitK 3.8us x 57/step + cublasLt::splitKreduce 2.8us x 67/step
+        // = 0.41ms of pure K-split + reduce overhead). -1 =
+        // CUBLAS_GEMM_DEFAULT bypasses the heuristic. FERRITE_CUBLAS_ALGO
+        // overrides for the A/B.
+        static ALGO: i32 = -2;
+        let algo = if ALGO == -2 {
+            std::env::var("FERRITE_CUBLAS_ALGO").ok()
+                .and_then(|v| v.parse::<i32>().ok()).unwrap_or(99)
+        } else { ALGO };
         let st = unsafe {
             cublasGemmEx(
                 h, 1, 0, out_f, n, in_f,
                 &alpha, w, 14, in_f,
                 xbp as *const std::ffi::c_void, 14, in_f,
                 &beta, do_.as_f32() as *mut std::ffi::c_void, 0, out_f,
-                0, 99,
+                0, algo,
             )
         };
         if st != 0 {
