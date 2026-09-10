@@ -3481,7 +3481,11 @@ __global__ void moe_fused_down_sum_fp8_v0_kernel(
 }
 
 template <int HTILE_K>
-__global__ void moe_fused_down_sum_fp8_kernel(
+// 2026-09-10: __launch_bounds__(288, 3) — the <8> specialization compiled to
+// 80 registers on its own, which drops the occupancy to 2 blocks/SM (the v12
+// original ran ~62 regs / 3 blocks) and cost +13us/call in serve (43.6 ->
+// 56.6us median, nsys). Forcing 3 blocks/SM caps it at 75 regs.
+__global__ void __launch_bounds__(288, 3) moe_fused_down_sum_fp8_kernel(
     const float* __restrict__ ids_f,       // [n, topk]
     const float* __restrict__ probs,       // [n, topk]
     const unsigned char* const* __restrict__ down_w8_ptrs,  // [e_local] fp8 [hidden, inter]
