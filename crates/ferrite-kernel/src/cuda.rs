@@ -28,6 +28,7 @@ extern "C" {
     fn cudaProfilerStart() -> i32;
     fn cudaProfilerStop() -> i32;
     fn cudaMalloc(ptr: *mut *mut std::ffi::c_void, size: usize) -> i32;
+    fn cudaMallocAsync(ptr: *mut *mut std::ffi::c_void, size: usize, stream: CuStream) -> i32;
     fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     fn cudaFree(ptr: *mut std::ffi::c_void) -> i32;
     fn cudaMemcpy(dst: *mut std::ffi::c_void, src: *const std::ffi::c_void, count: usize, kind: i32) -> i32;
@@ -592,6 +593,20 @@ impl DevBuf {
         // — the dry-run is supposed to warm every pool class first.
         if std::env::var_os("FERRITE_POOL_MISS").is_some() {
             eprintln!("[pool-miss] dev={dev} class={class} len={len} batch={batch} — cudaMalloc (capture-illegal if inside a capture)");
+        }
+        if is_capturing() {
+            // CAPTURE-LEGAL fallback (2026-09-10, TP<8 fix): cudaMallocAsync
+            // draws from the stream's memory pool and IS permitted inside a
+            // stream capture (unlike cudaMalloc → err 900). The per-seq
+            // capture's alloc sequence cannot be fully pre-warmed (DSA
+            // t_count derives dynamic size classes like len=422), so fall back
+            // to async alloc instead of faulting the graph. immortal=true: the
+            // graph owns the buffer for its lifetime.
+            ck(unsafe { cudaMallocAsync(&mut ptr, class as usize * std::mem::size_of::<f32>(), stream) },
+               "capture async malloc")?;
+            return Ok(DevBuf { ptr, len, class, dev, stream, stage: std::ptr::null_mut(), batch,
+                               immortal: true,
+                               gen: DEVBUF_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) });
         }
         ck(unsafe { cudaMalloc(&mut ptr, class as usize * std::mem::size_of::<f32>()) }, "pooled malloc")?;
         let mut stage: *mut std::ffi::c_void = std::ptr::null_mut();
