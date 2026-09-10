@@ -783,3 +783,40 @@ self.experts_end_idx)` 只迭代自己那 48 个 → **rank 0 永远不处理专
   若切片的并集不是完整 inter，就会整体偏小 ✗）；
 - `wsum[e]`（每专家权重和）是否在**每个** rank 上都算对了（它在 all-reduce 前就被当作
   down 的 row_weight 用掉，若某 rank 上 wsum 为空，该 rank 的贡献就整段丢失 ✗）。
+
+### 又否证两个假设（tp=8 MoE 1.6x）
+
+**(a) "loader 给所有 rank 同一片" ✗ 被否证** —— 每 rank 打印专家 128 的 swiglu 指纹：
+```
+rank6 rms=0.0695 fp=0.0570   rank2 rms=0.1749 fp=0.6628
+rank5 rms=0.0726 fp=0.0665   rank1 rms=0.0671 fp=0.3643
+rank0 rms=0.0935 fp=0.1138   rank3 rms=0.2674 fp=0.3691
+rank4 rms=0.1164 fp=0.2802   rank7 rms=0.1409 fp=2.1919
+```
+→ 8 片互不相同 ✓，分片本身没问题 ✗；但**幅度跨 4 倍**（0.067–0.267）。
+
+**(b) "AR 没有求和" ✗ 被否证** —— AR 与注意力用的是**同一个 `Collective`**，
+而注意力输出已与官方**逐元素吻合**（o[1..3]）✓✓ → AR 的 publish+add 路径是对的 ✓。
+
+**因此剩下唯一可能就是"tp=8 各分片的 down 输出加起来 ≠ tp=1 的全量 down"** ✗，且
+**数学上二者必须严格相等**（同一个 Σ_{i=1..2304} w2[:,i]·swiglu[i]，只是切成 8 段）✓。
+注意 tp=8 与 tp=1 的 **max 几乎相同**（0.3062 vs 0.3096 ✓）而 **rms 差 1.6x** ——
+这是"部分段缺失/被削弱"的特征 ✗。
+
+**下会话第一刀（一定做这个）**：
+- 打印 **tp=8 各 rank 在 AR 之后的 `o`**（应当 rank 间完全相同、且等于 tp=1 的值 0.0901）。
+  若 AR 后各 rank 不同 ✗ → 收集器有问题；
+  若相同但 = 0.0560 ✗ → 各 rank 的 down 输出确实小，接着**逐个 rank 单独和 tp=1 对同一段的 down 结果**：
+  让 tp=8 只保留一个 rank 的贡献（其余强制清零）再 AR，看该段的量是否等于 tp=1 同段的量。
+- 另一个高价值嫌疑（两处都还没排除）：
+  ① `expert_down_fp4` 的 A 用 `aq=true` → 内核把**激活压成 fp4**，而参考 `fp4_gemm_kernel`
+     的 docstring 明写 **"FP8 act x FP4 weight"**（激活 8bit、权重 4bit）—— 我只改过权重侧语义，
+     激活侧仍是 4bit；这在 tp=1/tp=8 下都会有偏差，但**分片越细，4bit 激活的块尺度越粗**，
+     可能放大误差；
+  ② `local_shape` 里 `ExpertRows`（w1/w3 的 inter=N）用 `padded_inter(288)=320`，
+     而 `ExpertCols`（w2 的 inter=K，以**字节**计）走的是 `padded_inter(logical)/2 = 160` 字节 ✓
+     —— 这两条都已核对一致 ✓，但**门/升的 scale 张量**（shape `[inter/32, dim/32]`）在
+     `ExpertRows` 下会被算成 `padded_inter(72/8=9) = 64` 行（而真实只需 10 行）✗ —— 
+     空间上够大 ✓，但 **loader 只填 9 行、其余为零**，而内核按 320 行 B 需要 **10** 行 scale ✗
+     —— 若内核读第 10 行（下标 9）会读到**零** scale → 那 32 个补齐行的反量化尺度为 0 → 无影响 ✓；
+     但若它读的是别的布局（SFA/SFB 的 tiling）就可能错 ✗。**这一条最值得先查。**
