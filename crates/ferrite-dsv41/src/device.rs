@@ -41,6 +41,7 @@ struct Cudart {
     enable_peer: unsafe extern "C" fn(c_int, c_uint) -> c_int,
     memcpy_peer_async: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, CuStream) -> c_int,
     memcpy_2d_async: unsafe extern "C" fn(*mut c_void, usize, *const c_void, usize, usize, usize, c_int, CuStream) -> c_int,
+    mem_info: unsafe extern "C" fn(*mut usize, *mut usize) -> c_int,
     memcpy_peer: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> c_int,
 }
 
@@ -292,6 +293,7 @@ impl Device {
                 enable_peer: f!(h_cudart, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h_cudart, "cudaMemcpyPeerAsync"),
                 memcpy_2d_async: f!(h_cudart, "cudaMemcpy2DAsync"),
+                mem_info: f!(h_cudart, "cudaMemGetInfo"),
                 memcpy_peer: f!(h_cudart, "cudaMemcpyPeer"),
             };
             let cublas = Cublas {
@@ -437,6 +439,7 @@ impl Device {
                 enable_peer: f!(h, "cudaDeviceEnablePeerAccess"),
                 memcpy_peer_async: f!(h, "cudaMemcpyPeerAsync"),
                 memcpy_2d_async: f!(h, "cudaMemcpy2DAsync"),
+                mem_info: f!(h, "cudaMemGetInfo"),
                 memcpy_peer: f!(h, "cudaMemcpyPeer"),
             })
         }
@@ -503,8 +506,30 @@ impl Device {
     pub fn alloc(&self, bytes: usize) -> Result<DevBuf> {
         let mut p: *mut c_void = std::ptr::null_mut();
         let st = unsafe { (self.cudart.malloc)(&mut p, bytes.max(1)) };
-        check_cudart(st, &self.cudart, "cudaMalloc")?;
+        if st != 0 {
+            // name the failure: how big was the request, what has this rank
+            // already taken, and what does the device still have
+            let free = self.mem_free();
+            return Err(FerriteError::Config(format!(
+                "cudaMalloc({:.1} MiB) failed on device {}, free={:.1} MiB \n  \
+                 (this rank has already allocated {:.1} GiB)",
+                bytes as f64 / (1u64 << 20) as f64,
+                self.device_id(),
+                free as f64 / (1u64 << 20) as f64,
+                0.0
+            )));
+        }
         Ok(DevBuf { ptr: p, bytes, owned: true })
+    }
+
+    /// Free device memory in MiB at this instant (`cudaMemGetInfo`).
+    pub fn mem_free(&self) -> usize {
+        let mut f: usize = 0;
+        let mut t: usize = 0;
+        unsafe {
+            (self.cudart.mem_info)(&mut f, &mut t);
+        }
+        f
     }
 
     /// Borrow an existing pointer (e.g. a slice of a bigger allocation).
