@@ -725,3 +725,31 @@ w2/swiglu/权重做 numpy 复算"对比 —— 分三步各打印一次 rms：
    的 swiglu / 单专家 down 输出（**在 AR 之后**取全量，或两边都取 AR 前的部分和）；
 2. 只对"同一专家、同一位置、同一是否含 AR"的量做比较 —— 本次会话的多个反复都源于口径不一致
    （token 序列、prefill 粒度、探针宽度、AR 前后、专家 id）。
+
+### ★ 为什么"逐专家对比"一直对不上：**参考实现用的是专家并行（EP），我是 TP 切 inter**
+
+`model.py:867-870`：
+```python
+self.n_local_experts = n_routed_experts // world_size      # 384/8 = 48
+self.experts_start_idx = rank * self.n_local_experts
+self.experts_end_idx = self.experts_start_idx + self.n_local_experts
+```
+→ 每个 rank 只持有自己的 48 个专家，`MoE.forward` 里 `for i in range(self.experts_start_idx,
+self.experts_end_idx)` 只迭代自己那 48 个 → **rank 0 永远不处理专家 277** ✗
+（这就是我加在参考里的 `i == 277` 探针从不触发的原因 ✓；也说明**不能用"某个专家的内部量"
+在两边直接对比** —— 除非换成两边都持有的那个专家）。
+
+对比我的方案（用户明令的 TP-only ✓）：每 rank 持有**全部 384 个专家**，每个专家的 `inter`
+维切 `world` 份（288 → 补齐到 320）→ AR 求和 = 完整结果 ✓。
+
+**两种方案在全量 AR 之后都应是同一个值** ✓ —— 所以"**routed_only 全量**"这个量是对齐可比的：
+官方 0.100171 vs 我 0.0560（1.79x）✗。**逐专家的中间量不可直接比** ✗（这是本会话多次误判的来源）。
+
+**下会话对齐方案（三选一，推荐第一个）**：
+1. 把参考的 EP 关掉，改成和我一样的 inter 切分（改动集中在 `MoE.__init__` 的 experts 构造 +
+   一个把 inter 切 world 份的 load 后处理），之后所有中间量都能逐专家逐元素对比；
+2. 或反之：把我的专家改成 EP 跑一次只为对拍（我的 spec 里本来就有 `Shard::Experts` 的
+   EP 分支，但用户明令**必须 TP**，所以只能作为临时对拍手段，不能作为默认）；
+3. 或不逐专家比，只比"routed_only / shared_only / full"三个全量（已做的）+
+   再比"**每个专家的权重 w_e**"（已证一致 ✓）+ "**top-6 名单**"（已证一致 ✓）——
+   剩下唯一不可比的中间量就是各专家的 swiglu/down，而它们受 EP/TP 差异影响。
