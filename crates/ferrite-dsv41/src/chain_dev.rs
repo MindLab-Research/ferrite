@@ -967,6 +967,24 @@ impl<'a> DevChain<'a> {
         })?;
         let mut len = self.layers[layer].compress_len;
         if n[0] > 0 {
+            // RoPE the latent at the group's FIRST token position, using the
+            // COMPRESSOR's rope table (compress_rope_theta, not the main one).
+            // The reference (model.py:755-758) does exactly this before storing
+            // into the compress_kv_cache — without it the compressed rows carry
+            // no positional encoding and the attention dot products are wrong.
+            let group_first = len * ratio;
+            self.dev.apply_rope(
+                self.layers[layer].latent.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                1,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                group_first as i32,
+                0,
+                false,
+            )?;
             let dst = (self.layers[layer].ring.ptr as *mut u8)
                 .wrapping_add((self.cfg.window_size + len) * hd * 4);
             self.dev.memcpy_d2d(
