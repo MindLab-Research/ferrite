@@ -361,7 +361,15 @@ impl<'a> Loader<'a> {
             FerriteError::Config(format!("{} absent", spec.name))
         })?;
         let esz = dtype_size(&h.dtype);
-        let local = local_shape(&Dsv41Config::production(), spec, world, rank);
+        // Take the GLOBAL shape from the checkpoint header, not from the caller's
+        // spec: several shard rules read spec.shape, and a caller that passes an
+        // empty shape (as the parity tests do) would then slice wrongly.
+        let spec_full = TensorSpec {
+            name: spec.name.clone(),
+            shape: h.shape.clone(),
+            shard: spec.shard.clone(),
+        };
+        let local = local_shape(&Dsv41Config::production(), &spec_full, world, rank);
         let n_local: usize = local.iter().product();
         let global = &h.shape;
         let inner: usize = global[1..].iter().product();
