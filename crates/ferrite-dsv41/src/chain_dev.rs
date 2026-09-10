@@ -163,8 +163,14 @@ impl<'a> DevChain<'a> {
         for l in 0..cfg.n_layers + cfg.n_mtp_layers {
             let ratio = cfg.compress_ratio(l).max(1);
             let max_comp = max_pos / ratio + 2;
+            // The KV buffer holds the window ring FOLLOWED by the compressed
+            // latents: rows [0, window) are the ring, [window, window+max_comp)
+            // are the compressor's output. The earlier allocation was window
+            // rows only, so the compressor's memcpy_d2d wrote past the end —
+            // silent corruption at 3 layers (adjacent allocation masked it),
+            // SIGSEGV in the driver at 24+.
             layers.push(LayerCache {
-                ring: dev.alloc(fb(cfg.window_size * hd))?,
+                ring: dev.alloc(fb((cfg.window_size + max_comp) * hd))?,
                 idxs: dev.alloc(fb(cfg.window_size + cfg.index_topk + 8).max(4))?,
                 state_kv: dev.alloc(fb(ratio * hd))?,
                 state_score: dev.alloc(fb(ratio * hd))?,
