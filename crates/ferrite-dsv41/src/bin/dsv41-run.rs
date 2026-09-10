@@ -52,23 +52,22 @@ fn main() -> Result<()> {
     // returned None and the decode loop NEVER stopped: the model answered
     // correctly (" Paris" then EOS = token 1) and the runner kept generating
     // past it, which is what looked like a degenerate tail. Fall back through
-    // the top-level config, then the tokenizer's own metadata.
-    let eos: Option<u32> = (|| {
-        let j = |p: String| {
+    // the top-level config.json, then the tokenizer's own metadata.
+    let eos: Option<u32> = {
+        let json = |p: String| {
             std::fs::read_to_string(p)
                 .ok()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         };
-        let as_id = |v: &serde_json::Value| v.as_u64().map(|e| e as u32);
-        j(format!("{dir}/generation_config.json"))
-            .and_then(|v| v.get("eos_token_id").and_then(as_id))
-            .or_else(|| {
-                j(format!("{dir}/config.json"))
-                    .and_then(|v| v.get("eos_token_id").and_then(as_id))
-            })
-            .or_else(|| j(format!("{dir}/tokenizer_config.json")))
-            .map(|_| 1u32) // <|end_of_sentence|> is id 1 for this checkpoint
-    })();
+        let id_of = |v: &serde_json::Value| v.get("eos_token_id").and_then(|e| e.as_u64());
+        let from_gen = json(format!("{dir}/generation_config.json")).and_then(|v| id_of(&v));
+        let from_cfg = json(format!("{dir}/config.json")).and_then(|v| id_of(&v));
+        let has_tok = json(format!("{dir}/tokenizer_config.json")).is_some();
+        from_gen
+            .or(from_cfg)
+            .map(|e| e as u32)
+            .or(if has_tok { Some(1u32) } else { None })
+    };
     // The engram is an architectural component of this checkpoint, not an
     // optional extra: `text_config.engram_layer_ids = [1, 14]`, and the 48
     // shards do carry `layers.{1,14}.engram.{embed,wkv,q_weight,k_weight}`.
