@@ -6449,6 +6449,7 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     __shared__ float red8[8];
     __shared__ int last;
     __shared__ float inv_s;
+    if (g_hc_stage <= 0) return;   // TEMP DIAG: pure launch+retire cost
 
     // P1 (redundant per block, bit-identical): reduce the KS mix partials
     // + rsq. mx_in: [t][mix][ks] partials + Σx² tail [s][mix_ks] at
@@ -6595,24 +6596,49 @@ __global__ void hc_pre_rest345_kernel(const float* __restrict__ res,
     // P4b + P5 (is_last block only): reduce partials → rsq, li = li_raw·inv·nw
     if (!last) return;
     if (threadIdx.x == 0) {
+        // 2026-09-10 (stage bisection): this ran on ONE thread with a runtime
+        // NB bound -> 16 SERIAL dependent L2 reads ≈ 2us, on the kernel's end
+        // path (stage 5->6 delta measured 2112ns for sinkhorn ∥ this loop).
+        // Compile-time-bound unrolled path (same q-ascending order).
         float tt = 0.f;
-        for (int q = 0; q < NB; q++) tt += p4_part[(size_t)t * NB + q];
+        if (NB == HC_P345_NB) {
+            #pragma unroll
+            for (int q = 0; q < HC_P345_NB; q++) tt += p4_part[(size_t)t * NB + q];
+        } else {
+            for (int q = 0; q < NB; q++) tt += p4_part[(size_t)t * NB + q];
+        }
         inv_s = rsqrtf(tt / (float)h + rms_eps);
         ctr[t] = 0u;   // reset for the next launch (stream/graph ordered)
     }
     __syncthreads();
     if (g_hc_stage <= 6) return;   // TEMP DIAG
     const float inv = inv_s;
-    // 2026-09-10 (ncu-guided): the bound h is a RUNTIME arg, so nvcc could not
-    // unroll this loop -> each of the 16 iterations serialized on its two
-    // dependent L2 loads (li + nw, ~250-350ns) = ~4-5us of a ~10us kernel.
-    // This loop runs on the is_last block ONLY, so it sets the kernel's end
-    // time (every other block has already exited). Est. Local Speedup on this
-    // kernel was 35% at the CTA barriers; this is the other half of the fixed
-    // cost. Same op order per element (li*inv*nw), just 4 elements in flight.
-    #pragma unroll 4
-    for (int c = threadIdx.x; c < h; c += blockDim.x)
-        li[(size_t)t * h + c] = li[(size_t)t * h + c] * inv * nw[c];
+    // 2026-09-10 (stage bisection): this loop measured 3104ns — it runs on
+    // the is_last block ONLY (16 blocks machine-wide after every other block
+    // exited), so it is latency-bound, not bandwidth-bound: 16 scalar
+    // iterations x 2 dependent loads. float4 quarters the iterations AND
+    // widens each access to 16B (li/nw are DevBuf-256B aligned, t*h is a
+    // 16KB multiple). Per-element op order (li*inv)*nw unchanged.
+    if ((h & 3) == 0) {
+        float4* li4 = reinterpret_cast<float4*>(li + (size_t)t * h);
+        const float4* nw4 = reinterpret_cast<const float4*>(nw);
+        const int h4 = h >> 2;
+        #pragma unroll 4
+        for (int c4 = threadIdx.x; c4 < h4; c4 += blockDim.x) {
+            const float4 lv = li4[c4];
+            const float4 wv = nw4[c4];
+            float4 r;
+            r.x = lv.x * inv * wv.x;
+            r.y = lv.y * inv * wv.y;
+            r.z = lv.z * inv * wv.z;
+            r.w = lv.w * inv * wv.w;
+            li4[c4] = r;
+        }
+    } else {
+        #pragma unroll 4
+        for (int c = threadIdx.x; c < h; c += blockDim.x)
+            li[(size_t)t * h + c] = li[(size_t)t * h + c] * inv * nw[c];
+    }
 }
 
 extern "C" cudaError_t ferrite_hc_pre_split(const float* res, const float* fw,
