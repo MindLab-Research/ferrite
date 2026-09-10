@@ -190,19 +190,26 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         // routed experts (expert-parallel; listed per global index)
         for e in 0..n_routed {
             for (n, o, k) in [("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)] {
+                // Expert-parallel shards the `inter` axis, but that axis sits on
+                // the ROWS of w1/w3 ([inter, dim/2]) and on the COLUMNS of w2
+                // ([dim, inter/2]). Sharding w2 by rows instead sliced its output
+                // dim and left the reduction dim whole — a silent shape mismatch
+                // that made the down GEMM walk off its weight (and only under
+                // TP, which is why single-GPU runs never caught it).
+                let sh = if n == "w2" { Shard::Cols } else { Shard::Experts };
                 push(
                     &mut out,
                     // ON-DISK shape: fp4 e2m1 packs 2 values per byte, so the
                     // file row is in/2 wide (logical width is `k`).
                     format!("{p}.ffn.experts.{e}.{n}.weight"),
                     vec![o, k / 2],
-                    Shard::Experts,
+                    sh,
                 );
                 push(
                     &mut out,
                     format!("{p}.ffn.experts.{e}.{n}.scale"),
                     vec![o, k / 32],
-                    Shard::Experts,
+                    sh,
                 );
             }
         }
@@ -371,7 +378,11 @@ pub fn shard_factor(cfg: &Dsv41Config, spec: &TensorSpec, world: usize) -> (usiz
         }
         Shard::Cols => (world, spec.shape[1] / world),
         Shard::Heads | Shard::Groups => (world, spec.shape[0] / world),
-        Shard::Experts => (1, spec.shape[0]),
+        // Expert-parallel cuts the `inter` axis, which is dim 0 for w1/w3
+        // ([inter, dim/2]). w2 carries it on its columns and uses Cols. The
+        // loader already sliced by world here; this reporting must agree with
+        // it (it did not, which made the metadata contradict the bytes).
+        Shard::Experts => (world, spec.shape[0] / world),
     }
 }
 
@@ -399,7 +410,12 @@ pub fn local_shape(cfg: &Dsv41Config, spec: &TensorSpec, world: usize, rank: usi
             s[0] /= world;
             s
         }
-        Shard::Experts => s, // whole tensor; ownership is by expert index
+        Shard::Experts => {
+            // the expert axis is in the NAME; the tensor's own dim 0 is the
+            // `inter` axis (w1/w3), which expert-parallel splits by world
+            s[0] /= world;
+            s
+        }
     }
 }
 
@@ -628,27 +644,29 @@ mod tests {
     }
 
     #[test]
-    fn sharding_halves_heads_and_quarters_vocab() {
+    fn sharding_reflects_the_tp_policy() {
         let cfg = Dsv41Config::production();
         let specs = tensor_specs(&cfg, 8);
         let get = |n: &str| specs.iter().find(|s| s.name == n).unwrap().clone();
-        // 64 heads / 8 ranks = 8 heads * 512 dim
-        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wq_b.weight"), 8, 0), vec![4096, 1280]);
-        // vocab rows split evenly
-        assert_eq!(local_shape(&cfg, &get("embed.weight"), 8, 0), vec![129280 / 8, 5120]);
-        // engram rows use ceil-division and the last rank may be short
+        // Dense projections are replicated for now (only the experts, 96% of the
+        // bytes, are sharded), so their local shape is the whole tensor.
+        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wq_b.weight"), 8, 0), vec![32768, 1280]);
+        assert_eq!(local_shape(&cfg, &get("embed.weight"), 8, 0), vec![129280, 5120]);
+        // Expert-parallel cuts the `inter` axis: w1/w3 carry it on their rows,
+        assert_eq!(
+            local_shape(&cfg, &get("layers.6.ffn.experts.0.w1.weight"), 8, 0),
+            vec![2304 / 8, 5120 / 2]
+        );
+        // w2 carries it on its COLUMNS ([dim, inter/2] on disk).
+        assert_eq!(
+            local_shape(&cfg, &get("layers.6.ffn.experts.0.w2.weight"), 8, 0),
+            vec![5120, (2304 / 8) / 2]
+        );
+        // The engram table is row-sharded with ceil-division; the last rank may
+        // be short.
         let e = get("layers.1.engram.embed.weight");
         let per = 384006168usize.div_ceil(8);
         assert_eq!(local_shape(&cfg, &e, 8, 0), vec![per, 256]);
-        let last = 384006168 - per * 7;
-        assert_eq!(local_shape(&cfg, &e, 8, 7), vec![last, 256]);
-        // experts are expert-parallel
-        assert_eq!(local_shape(&cfg, &get("layers.6.ffn.experts.0.w1.weight"), 8, 0), vec![2304, 2560]);
-        // wo_a is block-diagonal over o_groups: only the OUTPUT dim (groups *
-        // o_lora) splits; each group keeps its own hpg*hd = 4096-wide input.
-        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wo_a.weight"), 8, 0), vec![8192 / 8, 4096]);
-        // wo_b is row-parallel: only the input shrinks
-        assert_eq!(local_shape(&cfg, &get("layers.6.attn.wo_b.weight"), 8, 0), vec![5120, 8192 / 8]);
     }
 
     #[test]
@@ -660,7 +678,10 @@ mod tests {
                 let ls = local_shape(&cfg, &spec, world, 0);
                 match spec.shard {
                     Shard::Replicated => assert_eq!(ls, spec.shape),
-                    Shard::Experts => assert_eq!(ls, spec.shape),
+                    // expert-parallel splits the `inter` axis (dim 0 of w1/w3)
+                    Shard::Experts => {
+                        assert_eq!(ls[0], spec.shape[0] / f, "{} world {world}", spec.name)
+                    }
                     Shard::Rows if spec.name.contains("engram.embed") => {
                         // engram rows use ceil-division
                         assert_eq!(ls[0], spec.shape[0].div_ceil(f), "{} world {world}", spec.name)
