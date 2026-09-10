@@ -1977,3 +1977,42 @@ fp4 GEMV**（每线程若干 k、多 block 覆盖 n=320、按 32 元素 ue8m0 sc
 > `实测单次耗时` vs `权重字节量 ÷ 带宽` 差 100 倍以上 ⇒ 形状/硬件约束不匹配 ✓
 > - hc_mixes：808µs vs 地板 ~1µs ⇒ 已修（185µs ✓，+74% 吞吐 ✓）
 > - 专家 GEMM：97.8µs vs 地板 0.1µs ⇒ **tcgen05 的 M=128 硬约束** ⇒ 需换 kernel ✓
+
+## 下会话首选任务：**M=1 fp4 GEMV**（完整可执行方案，无需再推导）
+
+### 已确定的格式事实（本会话从 `dsv41_experts_mxf4.cu` 读出，勿再猜）
+| 项 | 事实 | 出处 |
+|---|---|---|
+| scale 类型 | **e8m0**，`ue8m0_to_f(b) = __uint_as_float((uint32_t)b << 23)` ⇒ **值 = 2^(b−127)** | 文件头注释 + `ue8m0_to_f` |
+| scale 粒度 | **per (row, k/32)** —— 每 32 个 k 元素一个 u8 | `b_scale: [b_rows, k/32] e8m0` |
+| B 权重 | **fp4，字节打包 `[n_rows, k/2]`**（每字节 2 个 fp4 值）| `b: [b_rows, k/2] fp4` |
+| A（激活，AQ=true）| `a_f32: [rows, k]` f32 —— **decode 走 AQ=true**（`mxf4_gemm_kernel<true>`）| 形参注释 |
+| M 约束 | **tcgen05 1-CTA `kind::mxf4` 的 M 固定 128** ⇒ M=1 时 128x 冗余 + grid=(5,1) | `kMTile = 128` 注释 |
+| 专家 B 的定位 | 间接寻址：`b_base + e*b_stride`（e 来自 `ids[slot]`）| kernel 形参 |
+
+### 实施方案（建议新 kernel `dsv41_expert_gemv_fp4`，放在 `dsv41_experts_mxf4.cu`）
+1. **形状**：`grid = (n_total / ROWS_PER_CTA)`（n_total=320 ⇒ 取 32 行/CTA ⇒ 10 blocks；
+   想让 148 SM 忙起来可让 1 block = 4 行 × 128 线程 ⇒ 80 blocks ✓）。
+   每 warp 负责 1 行；行内按 32 元素一块：`s = 2^(bs[row][kb]−127)`，
+   `acc += a_f32[j] * fp4_to_f32(nib) * s`。
+2. **解包**：`uint8_t byte = b[row*(k/2) + j/2]; nib = (j&1) ? (byte>>4) : (byte&0xF);`
+   ⇒ **低半字节 = 偶数下标**（与 cuda_fp4/NVFP4 约定一致 ✓；若文本不对，最先试交换 nibble ✓）。
+   `fp4_to_f32`：e2m1 ⇒ 指数/尾数查表或位运算（**与 checkpoint 的转换脚本同源** ✓）。
+3. **零解包开销的保障**：读 fp4 的字节量 = k/2 per row ⇒ 320×2560 = 0.82MB ✓；
+   按 7.6TB/s 地板 0.11µs，即便 5% 效率也 ~2µs（对比 97.8µs ⇒ **~50x** ✓）。
+4. **epilogue**（必须与现内核逐项一致）：`epi_mode == 1` ⇒ gate 列 `fminf(x, limit)`、
+   up 列 `fminf(fmaxf(x,-limit), limit)`；`epi_mode == 3` ⇒ `out += x`（累加进 MoE 缓冲）；
+   `row_weight != nullptr` ⇒ `x *= row_weight[row]`。**照着抄，不要重新解释** ✓。
+5. **接线**：在 `launch_mxf4` 里按 `rows == 1` 分派到新 kernel（`gemv_bf16_kernel` 已有同样
+   的"小 M 走 GEMV"先例 ✓）；`gemm_fp8_kernel` 同理（19.0%，64.8µs ✓）。
+6. **验证（缺一不可）**：
+   - 逐元素对拍：同 env 下与旧 `mxf4_gemm` 的输出比对（应 <1e-3 相对误差）✓
+   - **四段文本**：`The capital of France is` → " Paris" ✓；`The capital of Japan is` → " Tokyo." ✓；
+     `1+1=` → "2" 后停止 ✓；`请背诵《静夜思》` → 连贯 ✓
+   - 同二进制背靠背 A/B 测吞吐（**一次只改一个变量** ✓）
+7. **预期**：31.2% → ~5% ⇒ 总时间约 **−25%**（12.5 → ~16 tok/s ✓）；再加 gemm_fp8 同理。
+
+### 本会话已确立的两条铁律（下一任务务必遵守）
+1. **一次只改一个变量** ✓（本会话把"宽 block + 4 累加器"一起改 ⇒ 348ms ✗，导致我给宽 block 误定罪 ✓；
+   拆分后才发现宽 block 单独是 +72% ✓ 而 4 累加器与它同开才是恶性交互 ✓）
+2. **同二进制背靠背比较** ✓（跨构建比较掩盖了我自己公式 `((mix+31)/32)*32`=32 线程的真因 ✓）
