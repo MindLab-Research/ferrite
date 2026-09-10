@@ -546,6 +546,90 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
     if (warp == 0) tc_dealloc(tmem_base, kTmemCols);
 }
 
+// ---------------------------------------------------------------------------
+// M=1 fp4 GEMV. The tcgen05 kind::mxf4 MMA has M pinned at 128 by the hardware
+// (see kMTile), so at decode's M=1 the tensor-core path computes a 128x64 tile to
+// emit ONE row and launches a grid of (n/64, 1) - five blocks for the whole
+// expert. Measured 97.8 us per call for 1.64 MB of weights, i.e. 16.8 GB/s, 0.2%
+// of the part. This kernel does the same arithmetic with none of that machinery:
+// one warp per output row, block-scale-aware fp4 unpacking, no tmem, no MMA.
+// Format (read off mxf4_gemm_kernel, must match bit for bit):
+//   b       [n, k/2]  fp4, two values per byte, LOW nibble first
+//   b_scale [n, k/32] e8m0, value = 2^(byte-127) = __uint_as_float(byte<<23)
+//   a_f32   [1, k]    f32 activations (the AQ=true path)
+__device__ __forceinline__ float dsv41_e2m1_to_f(uint8_t n) {
+    // 1 sign, 2 exponent, 1 mantissa; exponent 0 is the subnormal pair {0, 0.5}
+    const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float m = mag[n & 7u];
+    return (n & 8u) ? -m : m;
+}
+
+__global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
+                                       const uint8_t* __restrict__ b,
+                                       const uint8_t* __restrict__ b_scale,
+                                       const uint8_t* __restrict__ b_hi,
+                                       const uint8_t* __restrict__ b_hi_scale,
+                                       float* __restrict__ out, int n_total, int k, int b_split,
+                                       int epi_mode, float limit, const float* __restrict__ row_weight,
+                                       const uint8_t* __restrict__ b_base, long b_stride,
+                                       const uint8_t* __restrict__ bs_base, long bs_stride,
+                                       const uint8_t* __restrict__ bh_base, long bh_stride,
+                                       const uint8_t* __restrict__ bhs_base, long bhs_stride,
+                                       const int* __restrict__ ids, int slot) {
+    const uint8_t* b_use = b;
+    const uint8_t* bsc_use = b_scale;
+    const uint8_t* bhi_use = b_hi;
+    const uint8_t* bhs_use = b_hi_scale;
+    if (ids != nullptr) {
+        const size_t e = (size_t)ids[slot];
+        b_use = b_base + e * (size_t)b_stride;
+        bsc_use = bs_base + e * (size_t)bs_stride;
+        bhi_use = bh_base + e * (size_t)bh_stride;
+        bhs_use = bhs_base + e * (size_t)bhs_stride;
+    }
+    // one warp per output row
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int kbytes = k >> 1;   // packed bytes per row
+    const int ksc = k >> 5;      // e8m0 scales per row
+
+    for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
+        // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
+        const bool hi = (b_split > 0) && (row >= b_split);
+        const int r = hi ? (row - b_split) : row;
+        const uint8_t* bb = hi ? bhi_use : b_use;
+        const uint8_t* bb_s = hi ? bhs_use : bsc_use;
+        const uint8_t* brow = bb + (size_t)r * kbytes;
+        const uint8_t* srow = bb_s + (size_t)r * ksc;
+
+        float acc = 0.f;
+        for (int j = lane * 2; j < k; j += 64) {
+            // two consecutive fp4 values share one byte; every 32 k share one scale
+            const uint8_t byte = brow[j >> 1];
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const float v0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+            const float v1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+            acc += a_f32[j] * v0;
+            acc += a_f32[j + 1] * v1;
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) {
+            float x = acc;
+            if (epi_mode == 1) {
+                if (limit > 0.f) {
+                    if (row < b_split) x = fminf(x, limit);
+                    else x = fminf(fmaxf(x, -limit), limit);
+                }
+            } else if (epi_mode == 2 || epi_mode == 3) {
+                if (row_weight != nullptr) x *= row_weight[row];
+            }
+            if (epi_mode == 3) out[(size_t)row] += x;
+            else out[(size_t)row] = x;
+        }
+    }
+}
+
 // --------------------------------------------------------------- launchers
 inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const float* a_f32,
                                const uint8_t* b, const uint8_t* b_scale, const uint8_t* b_hi,
@@ -554,6 +638,19 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
                                bool aq, cudaStream_t s) {
     if (rows <= 0 || n_total <= 0 || k <= 0) return cudaSuccess;
     if (k % kAtomK != 0) return cudaErrorInvalidValue;  // K must be a multiple of 64
+    // M=1 (decode) takes the GEMV: the tcgen05 tile is M=128 by hardware, so the
+    // tensor-core path is 128x redundant here and its grid collapses to a handful
+    // of blocks. The GEMV is bandwidth-bound with one warp per output row.
+    if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
+        const int warps = 8;
+        const int cta = warps * 32;
+        const int blocks = (n_total + warps - 1) / warps;
+        expert_gemv_fp4_kernel<<<blocks, cta, 0, s>>>(
+            a_f32, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode, limit,
+            row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base,
+            bhs_stride, ids, slot);
+        return cudaGetLastError();
+    }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
                     (unsigned)((rows + kMTile - 1) / kMTile));
     if (aq)
