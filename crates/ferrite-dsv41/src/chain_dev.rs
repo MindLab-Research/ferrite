@@ -137,8 +137,11 @@ impl<'a> DevChain<'a> {
             h2: dev.alloc(fb(hc * dim))?,
             x: dev.alloc(fb(dim))?,
             xn: dev.alloc(fb(dim))?,
-            xq: dev.alloc(dim)?,
-            xsc: dev.alloc(fb(dim / 32 + 8))?,
+            // sized for the LARGEST activation quantised anywhere in the chain
+            // (the attention output has n_heads*head_dim elements, well past
+            // `dim` — sizing these by `dim` overflowed on the output projection)
+            xq: dev.alloc(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))?,
+            xsc: dev.alloc(fb(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter) / 32 + 8))?,
             pre: dev.alloc(fb(hc))?,
             post: dev.alloc(fb(hc))?,
             comb: dev.alloc(fb(hc * hc))?,
