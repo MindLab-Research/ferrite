@@ -124,9 +124,9 @@ struct Kernels {
         *const f32, *const u8, *const u8, *const f32, *mut f32, *mut i32, *mut i32,
         c_int, c_int, c_int, c_int, f32, c_int, f32, c_int, CuStream,
     ) -> c_int,
-    window_append: unsafe extern "C" fn(
+    window_append: Option<unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
-    ) -> c_int,
+    ) -> c_int>,
     // ---- GLM kernels reused read-only (identical geometry) ----
     rmsnorm: unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, f32, CuStream) -> c_int,
     hc_pre: unsafe extern "C" fn(
@@ -281,7 +281,7 @@ impl Device {
                 apply_rope: f!(h_k, "dsv41_apply_rope"),
                 hc_mixes: f!(h_k, "dsv41_hc_mixes"),
                 moe_route: f!(h_k, "dsv41_moe_route"),
-                window_append: f!(h_k, "dsv41_window_append"),
+                window_append: sym(h_k, "dsv41_window_append").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 rmsnorm: f!(h_k, "ferrite_rmsnorm"),
                 hc_pre: f!(h_k, "ferrite_hc_pre"),
                 hc_post: f!(h_k, "ferrite_hc_post"),
@@ -416,6 +416,16 @@ impl Device {
     }
 
     // ------------------------------------------------------------ launches
+
+    /// Fetch an optional kernel, failing with a clear message if the .so was
+    /// built before that kernel existed (staged bring-up).
+    fn need<T: Copy>(&self, f: Option<T>, name: &str) -> Result<T> {
+        f.ok_or_else(|| {
+            FerriteError::Config(format!(
+                "kernel {name} is not in the loaded .so — rebuild kernels/cuda (bash build.sh 103a)"
+            ))
+        })
+    }
 
     fn kerr(&self, rc: c_int, what: &str) -> Result<()> {
         if rc != 0 {
@@ -796,9 +806,8 @@ impl Device {
         window: i32,
         start_pos: i32,
     ) -> Result<()> {
-        let rc = unsafe {
-            (self.kernels.window_append)(kv, cache, cache_scale, rows, head_dim, window, start_pos, self.stream)
-        };
+        let f = self.need(self.kernels.window_append, "dsv41_window_append")?;
+        let rc = unsafe { f(kv, cache, cache_scale, rows, head_dim, window, start_pos, self.stream) };
         self.kerr(rc, "dsv41_window_append")
     }
 
