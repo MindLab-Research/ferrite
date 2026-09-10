@@ -107,6 +107,17 @@ struct Scratch {
     idx_lens: DevBuf,  // [1] i32
     // bf16 staging for the cuBLAS path
     bf16: DevBuf,
+    // ---- engram (n-gram memory write-back into the hc residual stream) ----
+    /// hash ids for one token: `[n_engram_layers * n_hash_cols]` i64
+    eng_ids: DevBuf,
+    /// gathered table rows: `[n_hash_cols * engram_head_dim]` f32 (0 for rows
+    /// another rank owns, so the collective sums one real row per column)
+    eng_rows: DevBuf,
+    /// the wkv projection's output: `[hc*dim + dim]` f32 (key then value)
+    eng_kv: DevBuf,
+    /// fp8 activation + per-32 scale for the wkv GEMM over `eng_rows`
+    eng_xq: DevBuf,
+    eng_xsc: DevBuf,
 }
 
 pub struct DevChain<'a> {
@@ -125,6 +136,11 @@ pub struct DevChain<'a> {
     /// without separate tables every rope call uses the main theta
     cos_comp: DevBuf,
     sin_comp: DevBuf,
+    // ---- engram ----
+    /// n-gram hash state (host side; the token cache spans prefill + decode)
+    ngram: Option<crate::engram::NgramHashState>,
+    eng_layout: Option<crate::engram::EngramLayout>,
+    eng_map: Option<crate::engram::TokenMap>,
 }
 
 fn fb(n: usize) -> usize {
@@ -137,6 +153,7 @@ impl<'a> DevChain<'a> {
         cfg: &'a Dsv41Config,
         w: &'a Dsv41DevWeights,
         opts: RunOpts,
+        map: Option<crate::engram::TokenMap>,
     ) -> Result<Self> {
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
@@ -146,6 +163,12 @@ impl<'a> DevChain<'a> {
         let n_exp = cfg.n_routed_experts.max(1);
         let topk = cfg.n_activated_experts.max(1);
         let ql = cfg.q_lora_rank;
+        // engram sizing: (max_ngram_size - 1) * n_heads hash columns, one row
+        // of `engram_head_dim` each, for the layers the config lists (1 and 14).
+        let n_eng_layers = cfg.engram_layer_ids.len().max(1);
+        let eng_cols =
+            cfg.engram_max_ngram_size.saturating_sub(1).max(1) * cfg.engram_n_heads.max(1);
+        let ehd = cfg.engram_head_dim.max(1);
         let bf16_cap = dim.max(ql).max(nh * hd).max(cfg.vocab_size);
         let bf16 = dev.alloc(bf16_cap * 2)?;
 
@@ -219,6 +242,11 @@ impl<'a> DevChain<'a> {
             idx_w: dev.alloc(fb(cfg.index_n_heads.max(1)))?,
             idx_lens: dev.alloc(4)?,
             bf16,
+            eng_ids: dev.alloc(fb(eng_cols * n_eng_layers).max(8) * 2)?, // i64
+            eng_rows: dev.alloc(fb(eng_cols * ehd).max(8))?,
+            eng_kv: dev.alloc(fb((hc + 1) * dim))?,
+            eng_xq: dev.alloc((eng_cols * ehd).max(8))?, // fp8 bytes
+            eng_xsc: dev.alloc(fb((eng_cols * ehd).max(8) / 32 + 8))?,
         };
 
         // RoPE tables covering the whole context.
@@ -244,6 +272,18 @@ impl<'a> DevChain<'a> {
         )?;
         let _ = bf16_cap;
 
+        // engram host-side state: the hash needs the compressed token map (a pure
+        // function of the tokenizer, precomputed) and keeps a token cache that
+        // spans prefill + decode.
+        let eng_layout = crate::engram::EngramLayout::from_config(cfg);
+        let (ngram, eng_layout, eng_map) = match (eng_layout, map) {
+            (Some(lay), Some(m)) => {
+                let st = crate::engram::NgramHashState::new(cfg, &m);
+                (Some(st), Some(lay), Some(m))
+            }
+            _ => (None, None, None),
+        };
+
         Ok(DevChain {
             dev,
             cfg,
@@ -256,6 +296,9 @@ impl<'a> DevChain<'a> {
             sin,
             cos_comp,
             sin_comp,
+            ngram,
+            eng_layout,
+            eng_map,
         })
     }
 
@@ -310,6 +353,90 @@ impl<'a> DevChain<'a> {
             .gemm_bf16(self.s.bf16.ptr as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k)
     }
 
+    /// Engram: n-gram memory write-back into the hc residual stream, applied
+    /// BEFORE the block at the layers the config lists (1 and 14). Mirrors the
+    /// reference's `Engram.forward`: gather the `n_cols` hash rows from the
+    /// (row-sharded) table, project them with `wkv` into one key per hc copy
+    /// plus a shared value, gate that value by the normalised dot of the stream
+    /// against the key, and add it to every copy.
+    fn engram_apply(&mut self, layer: usize, li: usize) -> Result<()> {
+        let cfg = self.cfg;
+        let (dim, hc, ehd) = (cfg.dim, cfg.hc_mult, cfg.engram_head_dim);
+        let n_cols = cfg.engram_max_ngram_size.saturating_sub(1) * cfg.engram_n_heads;
+        let (table, tsc, wkv, wsc, qw, kw) = {
+            let ld = &self.w.layers[layer];
+            (
+                ld.engram_embed.as_ref(),
+                ld.engram_embed_scale.as_ref(),
+                ld.engram_wkv.as_ref(),
+                ld.engram_wkv_scale.as_ref(),
+                ld.engram_q_weight.as_ref(),
+                ld.engram_k_weight.as_ref(),
+            )
+        };
+        let (Some(table), Some(tsc), Some(wkv), Some(wsc), Some(qw), Some(kw)) =
+            (table, tsc, wkv, wsc, qw, kw)
+        else {
+            return Ok(());
+        };
+        // This rank's slice of the row-parallel table: convert.py shards
+        // `ceil(rows / world)` rows and zero-pads the tail.
+        let world = self.world().max(1);
+        let rank = self.rank();
+        let global_rows = cfg.engram_num_embeddings.get(li).copied().unwrap_or(0) as usize;
+        let per = global_rows.div_ceil(world);
+        let ids = (self.s.eng_ids.ptr as *const i64).wrapping_add(li * n_cols);
+        self.dev.engram_gather(
+            table.ptr() as *const u8,
+            tsc.ptr() as *const u8,
+            ids,
+            self.s.eng_rows.ptr as *mut f32,
+            1,
+            n_cols as i32,
+            ehd as i32,
+            (rank * per) as i64,
+            per as i64,
+        )?;
+        // rows another rank owns arrived as 0, so the sum yields the real row
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.eng_rows.ptr as *mut std::ffi::c_void, fb(n_cols * ehd))?;
+        }
+        // kv = wkv(gathered): [(hc + 1) * dim] = [key(hc*dim), value(dim)]
+        self.dev.quant_fp8(
+            self.s.eng_rows.ptr as *const f32,
+            self.s.eng_xq.ptr as *mut u8,
+            self.s.eng_xsc.ptr as *mut f32,
+            1,
+            (n_cols * ehd) as i32,
+            32,
+            true,
+        )?;
+        self.dev.gemm_fp8_mx(
+            self.s.eng_xq.ptr as *const u8,
+            self.s.eng_xsc.ptr as *const f32,
+            wkv.ptr() as *const u8,
+            wsc.ptr() as *const u8,
+            std::ptr::null(),
+            self.s.eng_kv.ptr as *mut f32,
+            1,
+            ((hc + 1) * dim) as i32,
+            (n_cols * ehd) as i32,
+        )?;
+        // gated write-back into h (in place)
+        self.dev.engram_apply(
+            self.s.h.ptr as *mut f32,
+            self.s.eng_kv.ptr as *const f32,
+            qw.ptr() as *const f32,
+            kw.ptr() as *const f32,
+            std::ptr::null(),
+            1,
+            hc as i32,
+            dim as i32,
+            cfg.norm_eps,
+        )?;
+        Ok(())
+    }
+
     /// One decode step. Returns the logits for the fed token.
     pub fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>> {
         let cfg = self.cfg;
@@ -333,7 +460,34 @@ impl<'a> DevChain<'a> {
         // the initial collapse takes copy 0 of the stream
         let mut premix = vec![0f32; hc];
         premix[0] = 1.0;
+        // engram hashes for this token (all engram layers at once; the reference
+        // computes them in one shot and indexes per layer). The state's token
+        // cache spans prefill + decode, so this must be called every step.
+        let mut eng_layer_of: Vec<(usize, usize)> = Vec::new();
+        if let (Some(ng), Some(lay), Some(map)) =
+            (self.ngram.as_mut(), self.eng_layout.as_ref(), self.eng_map.as_ref())
+        {
+            let hs = ng.forward_row(lay, map, 0, &[token], pos, None);
+            let n_cols = lay.n_hash_cols();
+            if hs.len() >= lay.layers.len() * n_cols {
+                let mut bytes = Vec::with_capacity(hs.len() * 8);
+                for v in hs.iter() {
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                self.dev
+                    .upload_bytes_at(&self.s.eng_ids, &bytes[..lay.layers.len() * n_cols * 8])?;
+            }
+            for l in 0..cfg.n_layers {
+                if let Some(li) = lay.engram_index(l) {
+                    eng_layer_of.push((l, li));
+                }
+            }
+        }
         for layer in 0..cfg.n_layers {
+            // the engram writes into the residual stream BEFORE the block runs
+            if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
+                self.engram_apply(layer, li)?;
+            }
             premix = self.layer(layer, pos, &premix)?;
             if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false) && layer % 5 == 0 {
                 self.stats(&format!("L{layer} h"), &self.s.h, hc * dim)?;

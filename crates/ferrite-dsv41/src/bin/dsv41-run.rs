@@ -53,7 +53,13 @@ fn main() -> Result<()> {
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
         .and_then(|v| v.get("eos_token_id").and_then(|e| e.as_u64()).map(|e| e as u32));
-    let skip_engram_w = std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS").map(|v| v != "0").unwrap_or(true);
+    // The engram is an architectural component of this checkpoint, not an
+    // optional extra: `text_config.engram_layer_ids = [1, 14]`, and the 48
+    // shards do carry `layers.{1,14}.engram.{embed,wkv,q_weight,k_weight}`.
+    // The reference applies it as `h = layer.engram(h, hashes, mask)` BEFORE the
+    // block at those layers, i.e. it writes into the hc residual stream there.
+    // Skipping it starves layers 1 and 14 of that write-back. Default = load.
+    let skip_engram_w = std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS").map(|v| v != "0").unwrap_or(false);
 
     // ---- config (from the checkpoint's own config.json) ----
     let cfg_txt = std::fs::read_to_string(format!("{dir}/config.json"))
@@ -104,6 +110,23 @@ fn main() -> Result<()> {
     }
     let w = loader.load(&cfg, tp, rank)?;
     dev.sync()?;
+    // The engram's n-gram hash keys tokens by a compressed id space that is a
+    // pure function of the tokenizer (the reference's `build_compressed_token_map`),
+    // so it is precomputed once into engram_token_map.bin (129280 i64 little-endian).
+    let eng_map = std::fs::read(format!("{dir}/engram_token_map.bin"))
+        .ok()
+        .filter(|b| b.len() % 8 == 0 && !b.is_empty())
+        .map(|b| {
+            let v: Vec<i64> = b
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            ferrite_dsv41::engram::TokenMap::from_table(v, cfg.engram_compressed_vocab_size)
+        });
+    eprintln!(
+        "[dsv41] engram: {}",
+        if eng_map.is_some() { "token map loaded" } else { "NO token map (engram disabled)" }
+    );
     eprintln!(
         "[dsv41] weights loaded: {:.1} GiB in {:.1}s",
         loader.uploaded as f64 / (1u64 << 30) as f64,
@@ -112,7 +135,7 @@ fn main() -> Result<()> {
 
     // ---- chain ----
     let opts = RunOpts::from_env();
-    let mut chain = DevChain::new(&dev, &cfg, &w, opts)?;
+    let mut chain = DevChain::new(&dev, &cfg, &w, opts, eng_map.clone())?;
     chain.reset()?;
 
     // ---- prefill (one token per step: the KV ring is per-sequence) ----
@@ -246,14 +269,32 @@ fn rank_body(
     Device::bind_to(rank as i32)?;
     let dev = Arc::new(Device::open(so)?);
     let mut loader = Loader::new(std::path::Path::new(dir), &dev)?;
+    // the engram write-back is an architectural component of this checkpoint
+    // (text_config.engram_layer_ids = [1,14]); default = load its tables.
     if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS")
         .map(|v| v != "0")
-        .unwrap_or(true)
+        .unwrap_or(false)
     {
         loader.skip_prefixes.push("engram.embed.".into());
     }
     let w = loader.load(cfg, world, rank)?;
     dev.sync()?;
+    let eng_map = std::fs::read(format!("{dir}/engram_token_map.bin"))
+        .ok()
+        .filter(|b| b.len() % 8 == 0 && !b.is_empty())
+        .map(|b| {
+            let v: Vec<i64> = b
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            ferrite_dsv41::engram::TokenMap::from_table(v, cfg.engram_compressed_vocab_size)
+        });
+    if rank == 0 {
+        eprintln!(
+            "[dsv41] engram: {}",
+            if eng_map.is_some() { "token map loaded" } else { "NO token map (engram disabled)" }
+        );
+    }
     // peer access needs every rank's context to exist first
     barrier.wait();
     let peers = dev.enable_peer_access()?;
@@ -289,7 +330,7 @@ fn rank_body(
     // head split; keep it alive so its staging address stays valid
     let _keep_big = Arc::new(c_big);
 
-    let mut chain = DevChain::new(&dev, cfg, &w, RunOpts::from_env())?;
+    let mut chain = DevChain::new(&dev, cfg, &w, RunOpts::from_env(), eng_map)?;
     chain.comm = Some(Arc::new(c_small));
     chain.reset()?;
     if rank == 0 {
