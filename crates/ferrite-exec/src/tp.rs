@@ -2756,11 +2756,10 @@ fn mega_chain_dev(
     // PRE-WARM moved to the entry (2026-09-10): the capture was crashing in the
     // _guard block BELOW (before the old pre-warm site) — warm the pools FIRST.
     if capture {
-        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 16384) {
-            drop(b);
-        }
-        if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), 245760) {
-            drop(b);
+        for sz in [4096usize, 16384, 245760] {
+            if let Ok(b) = DevBuf::alloc(cuda.dev(), cuda.stream(), sz) {
+                drop(b);
+            }
         }
         eprintln!("[mcd] prewarmed");
     }
