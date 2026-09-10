@@ -474,7 +474,14 @@ impl<'a> Loader<'a> {
             .get(&spec.name)
             .cloned()
             .ok_or_else(|| FerriteError::Config(format!("{} absent", spec.name)))?;
-        let local = local_shape(&Dsv41Config::production(), spec, world, 0);
+        // local_shape reads the GLOBAL shape off the spec — the caller passes
+        // the checkpoint's shape, not the empty placeholder
+        let spec_full = TensorSpec {
+            name: spec.name.clone(),
+            shape: h.shape.clone(),
+            shard: spec.shard.clone(),
+        };
+        let local = local_shape(&Dsv41Config::production(), &spec_full, world, 0);
         let widen = h.dtype == "BF16" && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
         let bytes = local.iter().product::<usize>() * if widen { 4 } else { dtype_size(&h.dtype) };
         Ok(TensorPlan {
