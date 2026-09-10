@@ -1355,7 +1355,13 @@ impl<'a> DevChain<'a> {
         )?;
         let mut idx = vec![0i32; topk];
         let mut wgt = vec![0f32; topk];
-        self.dev.sync()?;
+        // DSV41_MOE_NOSYNC=1 skips this sync purely to MEASURE its cost (the
+        // downloads may then race the routing kernel, so the output is not
+        // trustworthy — it exists to size the prize before investing in a
+        // device-side dispatch).
+        if !std::env::var("DSV41_MOE_NOSYNC").map(|v| v != "0").unwrap_or(false) {
+            self.dev.sync()?;
+        }
         self.dev.download_f32(&self.s.route_idx, unsafe {
             std::slice::from_raw_parts_mut(idx.as_mut_ptr() as *mut f32, topk)
         })?;
