@@ -140,6 +140,13 @@ fn main() -> Result<()> {
             }
         }
         let next = best as u32;
+        if step < 3 {
+            let mut top: Vec<(usize, f32)> =
+                logits.iter().copied().enumerate().collect::<Vec<_>>().iter().map(|&(i, v)| (i, v)).collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[top5] step {step} n={} : {:?}", logits.len(),
+                &top[..5.min(top.len())].iter().map(|(i, v)| (*i, *v)).collect::<Vec<_>>());
+        }
         produced.push(next);
         if Some(next) == eos {
             break;
