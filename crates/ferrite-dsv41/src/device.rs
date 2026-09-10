@@ -202,6 +202,7 @@ pub struct Device {
 /// A plain device allocation. No pooling: the load-and-run path is
 /// latency-tolerant, and skipping the pool keeps this crate free of any
 /// interaction with GLM's capture-sensitive allocator.
+#[derive(Clone)]
 pub struct DevBuf {
     pub ptr: *mut c_void,
     pub bytes: usize,

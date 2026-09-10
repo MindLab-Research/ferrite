@@ -64,7 +64,30 @@ fn dtype_size(dt: &str) -> usize {
     }
 }
 
+
+/// Everything needed to place one tensor's slice on the device WITHOUT
+/// allocating: the geometry of the local slice plus where it lives in the
+/// mmap'd shard. Extracted from load_tensor so the expert pool can plan
+/// thousands of slices, allocate ONE buffer, then DMA them all in.
+pub struct TensorPlan {
+    pub local: Vec<usize>,
+    pub bytes: usize,
+    pub dtype: String,
+    pub shard: String,
+    pub begin: u64,
+    pub global: Vec<usize>,
+    pub shard_rule: Shard,
+    pub widen: bool,
+}
+
+impl TensorPlan {
+    pub fn esz(&self) -> usize {
+        dtype_size(&self.dtype)
+    }
+}
+
 /// A tensor living on the device in its checkpoint format.
+#[derive(Clone)]
 pub struct DevTensor {
     pub buf: DevBuf,
     pub shape: Vec<usize>,
@@ -92,7 +115,11 @@ impl DevTensor {
     }
 }
 
-/// One expert's on-device weights (the rank's own experts only).
+/// One expert's on-device weights. The tensors are VIEWS into a single pooled
+/// allocation per layer — one cudaMalloc per layer instead of six per expert
+/// (40 layers x 384 experts x 6 = ~92k individual allocations was exhausting the
+/// 4 GB host's driver bookkeeping, which is what made a 16 MiB cudaMalloc 'fail'
+/// with 186 GB free on the device).
 pub struct DevExpert {
     pub w1: DevTensor,
     pub w1_scale: DevTensor,
@@ -101,6 +128,10 @@ pub struct DevExpert {
     pub w2: DevTensor,
     pub w2_scale: DevTensor,
 }
+
+/// A big device allocation that experts are carved out of. Dropped when the
+/// weights are dropped, which frees the whole pool at once.
+pub struct ExpertPool(pub DevBuf);
 
 /// Per-layer device weights. Every optional group mirrors a config test
 /// (`is_kv_source`, `is_index_source`, engram layers, ...).
@@ -144,6 +175,8 @@ pub struct LayerDev {
     pub gate_bias: Option<DevTensor>,
     pub gate_bias_vl: Option<DevTensor>,
     pub experts: Vec<DevExpert>,
+    /// owns the memory the experts' tensors view into
+    pub expert_pool: Option<DevBuf>,
     pub shared_w1: Option<DevTensor>,
     pub shared_w1_scale: Option<DevTensor>,
     pub shared_w3: Option<DevTensor>,
@@ -430,6 +463,161 @@ impl<'a> Loader<'a> {
         })
     }
 
+
+    /// Plan a tensor's placement: computes the local slice geometry exactly as
+    /// load_tensor does, but allocates nothing. The expert pool plans all of a
+    /// layer's experts first, then allocates one block for all of them.
+    fn plan_tensor(&mut self, spec: &TensorSpec, world: usize) -> Result<TensorPlan> {
+        let h = self
+            .header(&spec.name)?
+            .tensors
+            .get(&spec.name)
+            .cloned()
+            .ok_or_else(|| FerriteError::Config(format!("{} absent", spec.name)))?;
+        let local = local_shape(&Dsv41Config::production(), spec, world, 0);
+        let widen = h.dtype == "BF16" && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
+        let bytes = local.iter().product::<usize>() * if widen { 4 } else { dtype_size(&h.dtype) };
+        Ok(TensorPlan {
+            local,
+            bytes,
+            dtype: h.dtype.clone(),
+            shard: self.index.get(&spec.name).unwrap().clone(),
+            begin: h.begin,
+            global: h.shape,
+            shard_rule: spec.shard.clone(),
+            widen,
+        })
+    }
+
+    /// DMA a planned tensor's slice into `dst` (which must be at least
+    /// `plan.bytes` for the raw form, or `plan.bytes` f32 when widening).
+    /// This is the transfer half of load_tensor; the expert pool calls it with
+    /// offsets into its single allocation.
+    fn dma_plan(&mut self, plan: &TensorPlan, dst: *mut std::ffi::c_void, world: usize, rank: usize) -> Result<()> {
+        let esz = plan.esz();
+        let inner: usize = plan.global[1..].iter().product();
+        let row_bytes = inner * esz;
+        // widen needs a bf16 staging area then an on-device conversion
+        let (target, scratch) = if plan.widen {
+            let sc = self.dev.alloc(plan.local.iter().product::<usize>() * 2)?;
+            (sc.ptr, Some(sc))
+        } else {
+            (dst, None)
+        };
+        let (row0, rows) = match plan.shard_rule {
+            Shard::Replicated => (0usize, plan.global[0]),
+            Shard::Rows => {
+                if plan.shard.contains("engram.embed") {
+                    let per = plan.global[0].div_ceil(world);
+                    (rank * per, per.min(plan.global[0].saturating_sub(rank * per)))
+                } else {
+                    let per = plan.global[0] / world;
+                    (rank * per, per)
+                }
+            }
+            Shard::Heads | Shard::Groups | Shard::Experts | Shard::ExpertRows => {
+                let per = plan.global[0] / world;
+                (rank * per, per)
+            }
+            Shard::Cols | Shard::ExpertCols => (0, plan.global[0]),
+        };
+        let (map_base, _) = self.map_shard(&plan.shard)?;
+        let data = map_base
+            .wrapping_add(*self.data_base.get(&plan.shard).unwrap_or(&0) as usize)
+            .wrapping_add(plan.begin as usize);
+        match plan.shard_rule {
+            Shard::Cols | Shard::ExpertCols => {
+                let per = inner / world;
+                self.dev.upload_from_2d(
+                    target,
+                    plan.local[1] * esz,
+                    data.wrapping_add(rank * per * esz) as *const std::ffi::c_void,
+                    row_bytes,
+                    per * esz,
+                    plan.global[0],
+                )?;
+            }
+            _ => {
+                self.dev.upload_from(
+                    target,
+                    data.wrapping_add(row0 * row_bytes) as *const std::ffi::c_void,
+                    rows * row_bytes,
+                )?;
+            }
+        }
+        if plan.widen {
+            let sc = scratch.unwrap();
+            let n: i64 = plan.local.iter().product::<usize>() as i64;
+            self.dev.bf16_to_f32(sc.ptr as *const std::ffi::c_void, dst, n)?;
+            self.dev.free(&sc);
+        }
+        Ok(())
+    }
+
+
+    /// All of one layer's experts in ONE device allocation.
+    ///
+    /// ~92k individual cudaMallocs (384 experts x 6 tensors x 40 layers x ...)
+    /// exhaust a 4 GB host's driver bookkeeping — a 16 MiB cudaMalloc 'fails'
+    /// with 186 GB free on the device. One pooled buffer per layer instead.
+    /// Expert weights are fp4-packed and their scales e8m0, never bf16, so the
+    /// widening pass never triggers here.
+    fn load_expert_pool(
+        &mut self,
+        prefix: &str,
+        n_routed: usize,
+        _layer: usize,
+        world: usize,
+        rank: usize,
+    ) -> Result<(Vec<DevExpert>, DevBuf)> {
+        const NAMES: [&str; 6] = [
+            "w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale",
+        ];
+        // pass 1: plan every slice (no allocation)
+        let mut plans: Vec<TensorPlan> = Vec::with_capacity(n_routed * 6);
+        for e in 0..n_routed {
+            for n in NAMES {
+                let name = format!("{prefix}.ffn.experts.{e}.{n}");
+                let spec = TensorSpec {
+                    name: name.clone(),
+                    shape: vec![], // unused by plan_tensor (it reads the header)
+                    shard: if n.starts_with("w2") { Shard::ExpertCols } else { Shard::ExpertRows },
+                };
+                plans.push(self.plan_tensor(&spec, world)?);
+            }
+        }
+        let total: usize = plans.iter().map(|p| p.bytes).sum();
+        // one allocation; the K padding is already zero
+        let pool = self.dev.alloc(total.max(1))?;
+        self.dev.zero_at(pool.ptr, total.max(1))?;
+        // pass 2: DMA each slice into its offset
+        let base = pool.ptr as *mut u8;
+        let mut views: Vec<DevTensor> = Vec::with_capacity(plans.len());
+        let mut off = 0usize;
+        for plan in &plans {
+            let dst = base.wrapping_add(off) as *mut std::ffi::c_void;
+            self.dma_plan(plan, dst, world, rank)?;
+            views.push(DevTensor {
+                buf: Device::view(dst, plan.bytes),
+                shape: plan.local.clone(),
+                dtype: if plan.widen { "F32".into() } else { plan.dtype.clone() },
+            });
+            off += plan.bytes;
+        }
+        let mut experts = Vec::with_capacity(n_routed);
+        for e in 0..n_routed {
+            let i = e * 6;
+            experts.push(DevExpert {
+                w1: views[i].clone(),
+                w1_scale: views[i + 1].clone(),
+                w3: views[i + 2].clone(),
+                w3_scale: views[i + 3].clone(),
+                w2: views[i + 4].clone(),
+                w2_scale: views[i + 5].clone(),
+            });
+        }
+        Ok((experts, pool))
+    }
     pub fn load_single(&mut self, spec: &TensorSpec, world: usize, rank: usize) -> Result<DevTensor> {
         self.load_tensor(spec, world, rank)
     }
@@ -520,19 +708,13 @@ impl<'a> Loader<'a> {
 
             // EVERY expert, TP-split along `inter` (no expert parallelism):
             // each rank holds a slice of all of them, and the MoE's all-reduce
-            // sums slices of the same experts.
+            // sums slices of the same experts. All 384 experts live in ONE
+            // pooled allocation — 6 cudaMallocs per expert (92k over the model)
+            // exhausted the 4 GB host's driver bookkeeping.
             let (n_routed, _) = cfg.moe_config(l);
-            for e in 0..n_routed {
-                let g = |n: &str| want(&format!("{p}.ffn.experts.{e}.{n}")).unwrap();
-                ld.experts.push(DevExpert {
-                    w1: self.load_tensor(&g("w1.weight"), world, rank)?,
-                    w1_scale: self.load_tensor(&g("w1.scale"), world, rank)?,
-                    w3: self.load_tensor(&g("w3.weight"), world, rank)?,
-                    w3_scale: self.load_tensor(&g("w3.scale"), world, rank)?,
-                    w2: self.load_tensor(&g("w2.weight"), world, rank)?,
-                    w2_scale: self.load_tensor(&g("w2.scale"), world, rank)?,
-                });
-            }
+            let (experts, pool) = self.load_expert_pool(&p, n_routed, l, world, rank)?;
+            ld.experts = experts;
+            ld.expert_pool = Some(pool);
             w.layers[l] = ld;
         }
 
@@ -572,17 +754,9 @@ impl<'a> Loader<'a> {
             take!(p, ld, "ffn.shared_experts.w2.weight", shared_w2);
             take!(p, ld, "ffn.shared_experts.w2.scale", shared_w2_scale);
             let (n_routed, _) = cfg.moe_config(cfg.n_layers + s);
-            for e in 0..n_routed {
-                let g = |n: &str| want(&format!("{p}.ffn.experts.{e}.{n}")).unwrap();
-                ld.experts.push(DevExpert {
-                    w1: self.load_tensor(&g("w1.weight"), world, rank)?,
-                    w1_scale: self.load_tensor(&g("w1.scale"), world, rank)?,
-                    w3: self.load_tensor(&g("w3.weight"), world, rank)?,
-                    w3_scale: self.load_tensor(&g("w3.scale"), world, rank)?,
-                    w2: self.load_tensor(&g("w2.weight"), world, rank)?,
-                    w2_scale: self.load_tensor(&g("w2.scale"), world, rank)?,
-                });
-            }
+            let (experts, pool) = self.load_expert_pool(&p, n_routed, cfg.n_layers + s, world, rank)?;
+            ld.experts = experts;
+            ld.expert_pool = Some(pool);
             if s == 0 {
                 take!(p, ld, "main_proj.weight", attn_norm); // placeholder
                 if let Some(sp) = want(&format!("{p}.main_proj.weight")) {
