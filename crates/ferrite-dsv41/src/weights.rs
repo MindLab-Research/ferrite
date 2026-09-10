@@ -310,7 +310,8 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         let vd = cfg.vision_dim;
         // the release names this as a conv projection ("proj"); verified
         // against the checkpoint by tests/real_checkpoint.rs
-        push(&mut out, "vision.patch_embed.proj.weight", vec![vd, 3, cfg.vision_patch_size, cfg.vision_patch_size], Shard::Replicated);
+        // stored 2-D (flattened conv kernel: 3 * patch * patch), verified on the release
+        push(&mut out, "vision.patch_embed.proj.weight", vec![vd, 3 * cfg.vision_patch_size * cfg.vision_patch_size], Shard::Replicated);
         push(&mut out, "vision.patch_embed.proj.bias", vec![vd], Shard::Replicated);
         push(&mut out, "vision.norm.weight", vec![vd], Shard::Replicated);
         for b in 0..cfg.vision_n_layers {
@@ -569,7 +570,7 @@ mod tests {
         assert_eq!(find("mtp.2.markov_head.embed.weight"), vec![129280, 256]);
         assert_eq!(find("mtp.2.confidence_head.proj.weight"), vec![1, 5376]);
         // vision
-        assert_eq!(find("vision.patch_embed.proj.weight"), vec![1024, 3, 14, 14]);
+        assert_eq!(find("vision.patch_embed.proj.weight"), vec![1024, 3 * 14 * 14]);
         assert_eq!(find("vision.blocks.0.attn.wqkv.weight"), vec![3072, 1024]);
         assert_eq!(find("vision.blocks.0.mlp.w1.weight"), vec![5632, 1024]);
         assert_eq!(find("aligner.w1.weight"), vec![5120, 9216]);
