@@ -324,6 +324,9 @@ impl<'a> DevChain<'a> {
         premix[0] = 1.0;
         for layer in 0..cfg.n_layers {
             premix = self.layer(layer, pos, &premix)?;
+            if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false) && layer % 5 == 0 {
+                self.stats(&format!("L{layer} h"), &self.s.h, hc * dim)?;
+            }
         }
         self.upload_pre(&premix)?;
         self.dev.hc_collapse(
