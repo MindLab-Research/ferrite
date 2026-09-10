@@ -2332,39 +2332,55 @@ __global__ void hc_post_kernel(const float* __restrict__ x,
     cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
 #endif
     // out[t,i,j] = post[t,i]*x[t,j] + Σ_k comb[t,k,i]*res[t,k,j]
-    // VECTORIZED (2026-09-10): one thread per 4 consecutive j (float4). The
-    // scalar version ran at ~1.3TB/s (3 scalar reads + 1 scalar write per
-    // thread = 4x the memory requests, latency-bound at low occupancy);
-    // float4 quarters the request count and widens each to 16B. Numerics
-    // bit-identical: each acc lane is an independent FMA chain in the same
-    // k-ascending order as the scalar loop.
+    // SGLANG-STRUCTURE (2026-09-10, mhc_post_tilelang): ONE BLOCK PER TOKEN
+    // (grid = s) with post/comb hoisted to SMEM, and every thread computing
+    // ALL n outputs for its 4-column group. The old flat (t,i,j4) grid read
+    // `res` once per OUTPUT index i -> n=4x redundant res traffic (4MB/call
+    // instead of 1MB). Now res/x are read once per (t, j4): total traffic
+    // 2.25MB/call (the floor) vs 5.25MB.
     const int h4 = h >> 2;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = s * n * h4;
-    if (idx >= total) return;
-    int j4 = idx % h4;
-    int i = (idx / h4) % n;
-    int t = idx / (n * h4);
-    const int j = j4 << 2;
-    const float pv = post[(size_t)t * n + i];
-    float4 acc = *reinterpret_cast<const float4*>(x + (size_t)t * h + j);
-    acc.x *= pv; acc.y *= pv; acc.z *= pv; acc.w *= pv;
-    for (int k = 0; k < n; k++) {
-        const float c = comb[(size_t)t * n * n + k * n + i];
-        const float4 rv = *reinterpret_cast<const float4*>(res + (size_t)(t * n + k) * h + j);
-        acc.x += c * rv.x; acc.y += c * rv.y; acc.z += c * rv.z; acc.w += c * rv.w;
+    const int t = blockIdx.x;
+    if (t >= s) return;
+    __shared__ float s_c[8], s_a[64];   // post[n], comb[n*n] (k-major: a[k*n+i])
+    if (threadIdx.x < (unsigned)n) s_c[threadIdx.x] = post[(size_t)t * n + threadIdx.x];
+    if (threadIdx.x < (unsigned)(n * n))
+        s_a[threadIdx.x] = comb[(size_t)t * n * n + threadIdx.x];
+    __syncthreads();
+    for (int j4 = threadIdx.x; j4 < h4; j4 += blockDim.x) {
+        const int j = j4 << 2;
+        const float4 xv = *reinterpret_cast<const float4*>(x + (size_t)t * h + j);
+        float4 rv[8];
+        #pragma unroll
+        for (int k = 0; k < 8; k++)
+            if (k < n)
+                rv[k] = *reinterpret_cast<const float4*>(res + (size_t)(t * n + k) * h + j);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            if (i < n) {
+                const float pv = s_c[i];
+                float4 acc;
+                acc.x = pv * xv.x; acc.y = pv * xv.y; acc.z = pv * xv.z; acc.w = pv * xv.w;
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    if (k < n) {
+                        const float c = s_a[k * n + i];   // comb[t,k,i]
+                        acc.x += c * rv[k].x; acc.y += c * rv[k].y;
+                        acc.z += c * rv[k].z; acc.w += c * rv[k].w;
+                    }
+                }
+                *reinterpret_cast<float4*>(out + (size_t)t * n * h + (size_t)i * h + j) = acc;
+            }
+        }
     }
-    *reinterpret_cast<float4*>(out + (size_t)t * n * h + (size_t)i * h + j) = acc;
 }
 
 extern "C" cudaError_t ferrite_hc_post(const float* x, const float* res,
                                         const float* post, const float* comb,
                                         float* out, int s, int n, int h,
                                         cudaStream_t stream) {
-    if ((h & 3) != 0) return cudaErrorNotSupported; // float4 path needs h % 4 == 0
-    int total = s * n * (h >> 2);
+    if ((h & 3) != 0 || n > 8) return cudaErrorNotSupported; // float4 path needs h % 4 == 0
     dim3 block(256);
-    dim3 grid((total + 255) / 256);
+    dim3 grid(s);   // SGLang structure: one block per token
     return pdl_or_plain(hc_post_kernel, grid, block, 0, stream,
                         x, res, post, comb, out, s, n, h);
 }
