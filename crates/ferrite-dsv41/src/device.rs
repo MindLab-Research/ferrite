@@ -296,7 +296,7 @@ impl Device {
                 apply_rope: f!(h_k, "dsv41_apply_rope"),
                 hc_mixes: f!(h_k, "dsv41_hc_mixes"),
                 moe_route: f!(h_k, "dsv41_moe_route"),
-                add_inplace: sym(h_k, "ferrite_add_inplace").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                add_inplace: sym(h_k, "ferrite_add").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 hc_collapse: sym(h_k, "dsv41_hc_collapse").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 route_topk: sym(h_k, "dsv41_route_topk").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 engram_apply: sym(h_k, "dsv41_engram_apply").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -439,13 +439,15 @@ impl Device {
         check_cudart(st, &self.cudart, "cudaMemcpy D2D")
     }
 
-    /// `dst += src` elementwise over `n` f32.
+    /// `dst += src` elementwise over `n` f32 (GLM's `ferrite_add` with z == x:
+    /// each thread reads its own operands before writing, so it is safe
+    /// in place).
     pub fn add_inplace(&self, dst: &DevBuf, src: &DevBuf, n: i64) -> Result<()> {
-        let f = self.need(self.kernels.add_inplace, "ferrite_add_inplace")?;
+        let f = self.need(self.kernels.add_inplace, "ferrite_add")?;
         let rc = unsafe {
             f(dst.ptr as *const f32, src.ptr as *const f32, dst.ptr as *mut f32, n as c_int, self.stream)
         };
-        self.kerr(rc, "ferrite_add_inplace")
+        self.kerr(rc, "ferrite_add")
     }
 
     pub fn zero(&self, b: &DevBuf) -> Result<()> {
