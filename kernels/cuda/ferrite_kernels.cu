@@ -2058,28 +2058,32 @@ __global__ void hc_pre_fuse_kernel(
                 2.0f * (1.0f / (1.0f + __expf(-(s_mx[n + lane] * inv_rms * scale[1] + base[n + lane]))));
         if (lane < (unsigned)(n * n)) {
             const float v0 = s_mx[2 * n + lane] * inv_rms * scale[2] + base[2 * n + lane];
-            const unsigned m4 = (n == 4) ? 0x000f000fu : 0xffffffffu;
+            // m16 = warp-lane mask for the 16 comb elements (lanes 0..15):
+            // the shfl mask MUST match the participating lanes exactly, or
+            // the shfl.sync convergence rule is violated (err 715 illegal
+            // instruction — measured). This is rest345's sinkhorn mask.
+            const unsigned m16 = 0x0000ffffu;
             float v = v0;
             float rmax = v;
-            rmax = fmaxf(rmax, __shfl_xor_sync(m4, rmax, 1));
-            rmax = fmaxf(rmax, __shfl_xor_sync(m4, rmax, 2));
+            rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 1));
+            rmax = fmaxf(rmax, __shfl_xor_sync(m16, rmax, 2));
             v = __expf(v - rmax);
             float den = v;
-            den += __shfl_xor_sync(m4, den, 1);
-            den += __shfl_xor_sync(m4, den, 2);
+            den += __shfl_xor_sync(m16, den, 1);
+            den += __shfl_xor_sync(m16, den, 2);
             v = v / den + hc_eps;
             float cs = v;
-            cs += __shfl_xor_sync(m4, cs, 4);
-            cs += __shfl_xor_sync(m4, cs, 8);
+            cs += __shfl_xor_sync(m16, cs, 4);
+            cs += __shfl_xor_sync(m16, cs, 8);
             v /= cs + hc_eps;
             for (int it = 1; it < iters; it++) {
                 float rs = v;
-                rs += __shfl_xor_sync(m4, rs, 1);
-                rs += __shfl_xor_sync(m4, rs, 2);
+                rs += __shfl_xor_sync(m16, rs, 1);
+                rs += __shfl_xor_sync(m16, rs, 2);
                 v /= rs + hc_eps;
                 float cs2 = v;
-                cs2 += __shfl_xor_sync(m4, cs2, 4);
-                cs2 += __shfl_xor_sync(m4, cs2, 8);
+                cs2 += __shfl_xor_sync(m16, cs2, 4);
+                cs2 += __shfl_xor_sync(m16, cs2, 8);
                 v /= cs2 + hc_eps;
             }
             comb[(size_t)t * n * n + lane] = v;
@@ -2095,16 +2099,26 @@ __global__ void hc_pre_fuse_kernel(
         const int my = tid - 32;
         float sq = 0.f;
         for (int c4 = my; c4 < h4; c4 += nth) {
-            float4 o = make_float4(0.f, 0.f, 0.f, 0.f);
+            // 4-way accumulator split (same association as rest345's P3:
+            // acc = (p0+p1)+(p2+p3)) — keeps the numerics on the verified
+            // rest345 association instead of a linear chain.
+            float4 a0 = make_float4(0.f, 0.f, 0.f, 0.f);
+            float4 a1 = a0, a2 = a0, a3 = a0;
             #pragma unroll
             for (int i = 0; i < 8; i++) {
                 if (i < n) {
                     const float4 xv = *reinterpret_cast<const float4*>(
                         res + ((size_t)t * n + i) * h + (size_t)c4 * 4);
-                    o.x += pre[i] * xv.x; o.y += pre[i] * xv.y;
-                    o.z += pre[i] * xv.z; o.w += pre[i] * xv.w;
+                    float4* dst = (i == 0) ? &a0 : ((i == 1) ? &a1 : ((i == 2) ? &a2 : &a3));
+                    dst->x += pre[i] * xv.x; dst->y += pre[i] * xv.y;
+                    dst->z += pre[i] * xv.z; dst->w += pre[i] * xv.w;
                 }
             }
+            float4 o;
+            o.x = (a0.x + a1.x) + (a2.x + a3.x);
+            o.y = (a0.y + a1.y) + (a2.y + a3.y);
+            o.z = (a0.z + a1.z) + (a2.z + a3.z);
+            o.w = (a0.w + a1.w) + (a2.w + a3.w);
             sq += (o.x * o.x + o.y * o.y) + (o.z * o.z + o.w * o.w);
             *reinterpret_cast<float4*>(s_li + (size_t)c4 * 4) = o;
         }
