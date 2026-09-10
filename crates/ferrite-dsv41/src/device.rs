@@ -1331,7 +1331,12 @@ impl Device {
     /// Begin capturing work queued on this device's stream.
     pub fn capture_begin(&self) -> Result<()> {
         let f = self.need(self.cudart.stream_begin_capture, "cudaStreamBeginCapture")?;
-        let rc = unsafe { f(self.stream, 0 /* cudaStreamCaptureModeGlobal */) };
+        // cudaStreamCaptureModeRelaxed (2), NOT Global. Global invalidates the
+        // capture on ANY CUDA activity in ANY thread of the context — and TP8 runs
+        // one rank thread per device with its own all-reduce work, so the other
+        // ranks' traffic invalidated every capture (cudaErrorStreamCaptureUnjoined,
+        // 901). Relaxed only rejects the capturing thread's own illegal calls.
+        let rc = unsafe { f(self.stream, 2 /* cudaStreamCaptureModeRelaxed */) };
         self.kerr(rc, "cudaStreamBeginCapture")
     }
 
