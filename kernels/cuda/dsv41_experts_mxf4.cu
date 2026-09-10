@@ -565,6 +565,8 @@ __device__ __forceinline__ float dsv41_e2m1_to_f(uint8_t n) {
 }
 
 __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
+                                       const uint8_t* __restrict__ a,
+                                       const float* __restrict__ a_scale,
                                        const uint8_t* __restrict__ b,
                                        const uint8_t* __restrict__ b_scale,
                                        const uint8_t* __restrict__ b_hi,
@@ -605,13 +607,26 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
 
         float acc = 0.f;
         for (int j = lane * 2; j < k; j += 64) {
-            // two consecutive fp4 values share one byte; every 32 k share one scale
+            // two consecutive fp4 values share one byte; every 32 k share one scale.
+            // The weight scale is e8m0; the ACTIVATION is fp4 with plain f32 scales
+            // when a_f32 is null (AQ=false is what the decode path calls), so both
+            // operands are unpacked here.
             const uint8_t byte = brow[j >> 1];
             const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-            const float v0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
-            const float v1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-            acc += a_f32[j] * v0;
-            acc += a_f32[j + 1] * v1;
+            const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+            const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+            float av0, av1;
+            if (a_f32 != nullptr) {
+                av0 = a_f32[j];
+                av1 = a_f32[j + 1];
+            } else {
+                const uint8_t abyte = a[j >> 1];
+                const float asc = a_scale[j >> 5];
+                av0 = dsv41_e2m1_to_f(abyte & 0xFu) * asc;
+                av1 = dsv41_e2m1_to_f((uint8_t)(abyte >> 4)) * asc;
+            }
+            acc += av0 * w0;
+            acc += av1 * w1;
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         if (lane == 0) {
@@ -646,8 +661,8 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
         const int cta = warps * 32;
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, cta, 0, s>>>(
-            a_f32, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode, limit,
-            row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
+            a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode,
+            limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
@@ -716,9 +731,9 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
         const int warps = 8;
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, warps * 32, 0, s>>>(
-            a_f32, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split, epi_mode, limit,
-            row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base,
-            bhs_stride, ids, slot);
+            a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split,
+            epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
+            bhs_base, bhs_stride, ids, slot);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
