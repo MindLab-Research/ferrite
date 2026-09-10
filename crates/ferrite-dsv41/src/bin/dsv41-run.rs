@@ -86,12 +86,27 @@ fn main() -> Result<()> {
     eprintln!("[dsv41] device ready (kernels: {so})");
 
     // ---- tokenizer ----
-    let tok = tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
-        .map_err(|e| ferrite_types::FerriteError::Config(format!("tokenizer: {e}")))?;
-    let enc = tok
-        .encode(prompt.clone(), true)
-        .map_err(|e| ferrite_types::FerriteError::Config(format!("encode: {e}")))?;
-    let ids: Vec<u32> = enc.get_ids().to_vec();
+    // `DSV41_PROMPT_IDS=1,2,3` bypasses the tokenizer and feeds explicit ids.
+    // The reference's generate.py does not feed raw text: it wraps the user turn
+    // in the checkpoint's chat template (`encode_messages(messages,
+    // thinking_mode="chat")`), which for this model ends in
+    // `<|Assistant|></think>` — i.e. it tells the model to answer directly.
+    // Without those markers the model keeps going in thinking mode, which is the
+    // "思考过程 (Thinking..." drift seen in the raw-text runs.
+    let ids: Vec<u32> = match std::env::var("DSV41_PROMPT_IDS") {
+        Ok(v) => v
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect(),
+        Err(_) => {
+            let tok = tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
+                .map_err(|e| ferrite_types::FerriteError::Config(format!("tokenizer: {e}")))?;
+            let enc = tok
+                .encode(prompt.clone(), true)
+                .map_err(|e| ferrite_types::FerriteError::Config(format!("encode: {e}")))?;
+            enc.get_ids().to_vec()
+        }
+    };
     if ids.is_empty() {
         return Err(ferrite_types::FerriteError::Config("empty prompt".into()));
     }
