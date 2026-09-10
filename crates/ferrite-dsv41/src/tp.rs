@@ -191,22 +191,36 @@ impl Collective {
     fn publish(&self, src: *const std::ffi::c_void, len: usize) -> Result<()> {
         assert!(len <= self.bytes, "collective payload {len} > slot {}", self.bytes);
         let round = self.round.fetch_add(1, AtOrd::AcqRel) + 1;
-        // One device kernel writes this rank's payload into every rank's slot
-        // (including our own) at the round's parity half, after a device-side
-        // credit wait on the peers' `reduced` stamps.
-        let parity_off = ((round as usize % 2) * self.world * self.bytes) as i64;
-        let reduced_local = (self.staging.ptr as *const u8).wrapping_add(self.reduced_at) as *const c_uint;
-        self.dev.ar_store2(
-            self.peer_slots.ptr as *const u64,
-            self.world as i32,
-            self.rank as i32,
-            src as *const f32,
-            (len / 4) as i64,
-            (self.bytes / 4) as i64,
-            parity_off / 4,
-            reduced_local,
-            round,
-        )?;
+        let dev_side = std::env::var("DSV41_AR_DEV").map(|v| v != "0").unwrap_or(false);
+        if dev_side {
+            // EXPERIMENTAL (opt-in): fully device-side protocol — parity staging
+            // plus a credit wait on the peers' `reduced` stamps, no host barrier.
+            // Not the default because it produced wrong output (' Paris' became
+            // garbage tokens) — kept for the graph work, gated off.
+            let parity_off = ((round as usize % 2) * self.world * self.bytes) as i64;
+            let reduced_local =
+                (self.staging.ptr as *const u8).wrapping_add(self.reduced_at) as *const c_uint;
+            self.dev.ar_store2(
+                self.peer_slots.ptr as *const u64,
+                self.world as i32,
+                self.rank as i32,
+                src as *const f32,
+                (len / 4) as i64,
+                (self.bytes / 4) as i64,
+                parity_off / 4,
+                reduced_local,
+                round,
+            )?;
+        } else {
+            self.dev.ar_store(
+                self.peer_slots.ptr as *const u64,
+                self.world as i32,
+                self.rank as i32,
+                src as *const f32,
+                (len / 4) as i64,
+                (self.bytes / 4) as i64,
+            )?;
+        }
         // The peer copies are asynchronous on both devices (Device::memcpy_peer
         // maps to the async peer copy), so a device sync is REQUIRED here to make
         // this rank's issue complete before the barrier lets anyone reduce.
@@ -224,11 +238,9 @@ impl Collective {
             self.rank as i32,
             round,
         )?;
-        // No host barrier here any more: the store kernel waits on the peers'
-        // `reduced` stamps for round-2 (device side), and the reduce kernel waits
-        // on their `stored` stamps for this round. Nothing in this path needs the
-        // host, which is what lets the whole layer be captured into a graph.
-        let _ = &self.barrier;
+        if !dev_side {
+            self.barrier.wait();
+        }
         Ok(())
     }
 
@@ -240,8 +252,13 @@ impl Collective {
         let n = (len / 4) as i64;
         let slot_f = (self.bytes / 4) as i64;
         let round = self.round.load(AtOrd::Acquire);
-        let base = (self.staging.ptr as *const u8)
-            .wrapping_add((round as usize % 2) * self.world * self.bytes);
+        let dev_side = std::env::var("DSV41_AR_DEV").map(|v| v != "0").unwrap_or(false);
+        let base = if dev_side {
+            (self.staging.ptr as *const u8)
+                .wrapping_add((round as usize % 2) * self.world * self.bytes)
+        } else {
+            self.staging.ptr as *const u8
+        };
         let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
         self.dev.ar_reduce(
             base as *mut f32,
@@ -252,13 +269,14 @@ impl Collective {
             stamps,
             round,
         )?;
-        // announce that this rank is done reading this parity half
-        self.dev.ar_mark(
-            self.peer_reduced.ptr as *const u64,
-            self.world as i32,
-            self.rank as i32,
-            round,
-        )?;
+        if dev_side {
+            self.dev.ar_mark(
+                self.peer_reduced.ptr as *const u64,
+                self.world as i32,
+                self.rank as i32,
+                round,
+            )?;
+        }
         self.dev
             .memcpy_d2d(buf, slot0 as *const std::ffi::c_void, len)?;
         self.barrier.wait();
