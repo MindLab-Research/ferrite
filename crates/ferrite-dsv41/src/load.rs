@@ -164,6 +164,9 @@ pub struct Loader<'a> {
     dev: &'a Device,
     /// bytes uploaded so far (for the report)
     pub uploaded: u64,
+    /// tensor-name prefixes to skip entirely (bring-up: the 189 GiB engram
+    /// tables while the engram write-back is not yet wired)
+    pub skip_prefixes: Vec<String>,
 }
 
 impl<'a> Loader<'a> {
@@ -189,6 +192,7 @@ impl<'a> Loader<'a> {
             headers: HashMap::new(),
             dev,
             uploaded: 0,
+            skip_prefixes: Vec::new(),
         })
     }
 
@@ -230,6 +234,16 @@ impl<'a> Loader<'a> {
 
     /// Upload `spec`'s slice for `rank` of `world`.
     fn load_tensor(&mut self, spec: &TensorSpec, world: usize, rank: usize) -> Result<DevTensor> {
+        if self.skip_prefixes.iter().any(|p| spec.name.starts_with(p.as_str())) {
+            // A zero-length placeholder keeps the caller's Option logic intact
+            // while loading nothing: the device bytes are never read because the
+            // matching stage is not wired yet.
+            return Ok(DevTensor {
+                buf: self.dev.alloc(4)?,
+                shape: vec![0],
+                dtype: "SKIPPED".into(),
+            });
+        }
         let h = self.header(&spec.name)?.tensors.get(&spec.name).cloned().ok_or_else(|| {
             FerriteError::Config(format!("{} absent", spec.name))
         })?;

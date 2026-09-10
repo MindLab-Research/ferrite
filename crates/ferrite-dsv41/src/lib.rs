@@ -13,6 +13,7 @@
 //!   * [`weights`] — checkpoint tensor names -> the engine's TP-sharded layout
 
 pub mod chain;
+pub mod chain_dev;
 pub mod config;
 pub mod device;
 pub mod dspark;

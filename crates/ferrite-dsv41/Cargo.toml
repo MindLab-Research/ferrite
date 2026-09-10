@@ -12,6 +12,8 @@ thiserror.workspace = true
 # no CUDA (the CPU golden path), and the GPU path resolves its symbols at
 # runtime exactly like ferrite-kernel does.
 libc = "0.2"
+# the checkpoint ships tokenizer.json; same crate/version as ferrite-serve
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde.workspace = true
 serde_json.workspace = true
 ferrite-types = { path = "../ferrite-types" }
