@@ -2113,11 +2113,13 @@ impl CudaBackend {
         // = 0.41ms of pure K-split + reduce overhead). -1 =
         // CUBLAS_GEMM_DEFAULT bypasses the heuristic. FERRITE_CUBLAS_ALGO
         // overrides for the A/B.
-        static ALGO: i32 = -2;
-        let algo = if ALGO == -2 {
+        // Cached ONCE per process (a per-call std::env::var is a host-side
+        // regression: this function runs 200+ times per decode step).
+        static ALGO: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+        let algo = *ALGO.get_or_init(|| {
             std::env::var("FERRITE_CUBLAS_ALGO").ok()
                 .and_then(|v| v.parse::<i32>().ok()).unwrap_or(99)
-        } else { ALGO };
+        });
         let st = unsafe {
             cublasGemmEx(
                 h, 1, 0, out_f, n, in_f,
