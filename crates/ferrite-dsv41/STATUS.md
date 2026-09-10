@@ -617,3 +617,31 @@ dspark_target_layer_ids=[37,38,39]`
 
 **接手建议**：先按 1 把激活量化改成 fp8（block 128，与参考 `fp4_gemm_kernel` 一致），
 这一步同时影响 routed 与 shared 两路，是最有可能一次性消掉这 1.4x 的改动。
+
+### ★ 消融实验把 MoE 的 1.4x 精确定位到 **routed expert 路径**
+
+同一 token、同一层，用两个开关分别关掉一支：
+
+| 配置 | L0 `moe_out(o)` rms |
+|---|---|
+| `DSV41_SKIP_SHARED_EXPERT=1`（**仅 routed**）| **0.0560** |
+| `DSV41_SKIP_EXPERTS=1`（**仅 shared**）| **0.0818** |
+| 全量 | 0.1037 |
+| 官方 pos0 | **0.145160** |
+
+两支近似正交（√(0.0818²+0.0560²)=0.0991 ≈ 0.1037 ✓）。反推官方：
+若其 shared ≈ 0.0818（结构已核对一致），则 **官方 routed ≈ √(0.1452²−0.0818²) = 0.1199**
+→ **我的 routed 只有 0.0560，约 2.1x 偏小** ✗✗
+
+**已排除（都有数据）**：路由（同 6 个专家、权重差 1-2% ✓）、专家内部量级
+（gate/up/swiglu 与官方同量级 ✓）、shared expert（同名同形状同分片、量级正常 ✓）、
+AR 语义（求和 ✓）、`expert_down_fp4` 的覆盖式写出（已知 ✓ 且已按此修正 ✓）。
+
+**因此 bug 在"每个 routed 专家自身的输出/累加"** —— 最可疑：
+- `expert_down_fp4` → `launch_mxf4(nullptr, nullptr, act, w2, w2_scale, w2, w2_scale, out,
+  rows, dim, inter, -1, 2, 0.f, weight, true, s)` 里的 **`n_split=2`**（注意 gate_up 那一支
+  的对应参数不同）—— 若它把 N 维切成 2 份而只算了一份，输出就会小一半；
+- 或者 `wsum[e]`（每个专家的**权重和**）没有正确传到 down GEMM 的 `alpha/weight` 位置。
+
+**接手第一步**：把 `expert_down_fp4` 的输出与"手工 numpy 复算（用官方走同一专家的权重+激活）"
+对比，直接看 down 这一支是差 2x 还是差在 wsum。
