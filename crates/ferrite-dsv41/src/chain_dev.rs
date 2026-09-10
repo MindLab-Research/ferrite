@@ -617,7 +617,11 @@ impl<'a> DevChain<'a> {
         )?;
         self.attention(layer, pos)?;
         if layer == 0 {
-            self.stats("L0 attn_out(o)", &self.s.o, dim)?;
+            // s.o holds n_heads*head_dim here, NOT dim — the earlier `dim` made the
+            // probe read only the first 10 heads, so its rms was not comparable
+            // with the reference's (which averages over the whole tensor).
+            self.stats("L0 attn_out(o)", &self.s.o, cfg.n_heads * cfg.head_dim)?;
+            self.stats("L0 xn(attn_in)", &self.s.xn, dim)?;
         }
         self.dev.hc_post(
             self.s.o.ptr as *const f32,
@@ -670,6 +674,7 @@ impl<'a> DevChain<'a> {
         self.moe(layer, ld)?;
         if layer == 0 {
             self.stats("L0 moe_out(o)", &self.s.o, dim)?;
+            self.stats("L0 ffn_in", &self.s.xn, dim)?;
         }
         self.dev.hc_post(
             self.s.o.ptr as *const f32,
