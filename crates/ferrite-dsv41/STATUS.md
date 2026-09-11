@@ -3467,3 +3467,25 @@ synchronize()|.sync()|from_device|device_to_host`，**step 路径上只有两处
 （GPU 大段空转已被地基判定与本次分解双重印证 ✓）。
 
 **方法学**：剖析的"份额"可信、"绝对时间"不可信 ⇒ 优化判据仍然只用 **`[dsv41] step pos=N: X.XXms` 逐步直打中位数** ✓ + 四段文本人眼 ✓。
+
+### ❌ 已否决：DSV4.1 的"层内并发"方向（2026-09-11，读设备路径后自我纠正）
+
+**曾经的理由（错 ✗）**：`chain.rs:126/138`（**CPU 参考路径** ✗）里两次 `hc_mixes` 第一实参都是 `x`，
+看起来互相独立 ⇒ 以为可多流并发。
+
+**设备路径（`chain_dev.rs:966-1039`，即真正被剖析的那条 ✗）实际是**：
+```
+hc_mixes(self.s.h, hc_attn_*)  -> premix_slot(1)=attn_pre, s.post, s.comb
+hc_collapse(self.s.h, premix_slot(pa), s.x)     // pa = 上一层遗留的 premix（跨层滞后 ✓）
+rmsnorm(s.x -> s.xn) ; attention(layer,pos) ; hc_post(s.o, s.h, post, comb -> s.h2) ; copy_h_back()
+hc_mixes(self.s.h, hc_ffn_*)   -> premix_slot(2)=ffn_pre
+```
+⇒ **两次 `hc_mixes` 都读 `self.s.h`** ✗，而 `s.h` 恰在注意力块末尾被 `hc_post` + `copy_h_back` 改写 ✓
+⇒ **ffn 的 mix 依赖注意力输出，二者严格串行** ✗ ⇒ **层内不存在可并发分支** ✗。
+
+**结论**：该链**天然串行**（每层的每个阶段都吃前一阶段的输出 ✓），杠杆只剩两条：
+① **每核并行度**（例：`hc_mixes` 的 1 SM ✗ ⇒ spread 变体 ✓）；
+② **减少 kernel 数**（融合小核 ✓，当前 364 个/步 ✗）。
+
+**顺带发现的可用旋钮**：`DSV41_PHASE=1` 打出 `[phs] L{layer} attn=...` 的**逐层分相计时** ✓
+（可直接区分 attn 段 / ffn 段的墙钟 ✓，比整步中位数更细 ✓，与"逐步直打"口径互补 ✓）。
