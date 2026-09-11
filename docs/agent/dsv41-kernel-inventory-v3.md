@@ -54,12 +54,12 @@
 | 14 | `apply_rope_kernel` | 88 | 1.3 | **0.11** | 1.2% | 同 | 0 |
 | 15 | `rmsnorm_rope_kernel`（NR_FUSE）| 40 | 2.5 | **0.10** | 1.0% | 同 | 0 |
 | 16 | `indexer_score_kernel`（Step A）| 4 | 19.7 | **0.08** | 0.8% | 同 | 0 |
-| 17 | `quant_kernel<1>` | 40 | 1.6 | **0.07** | 0.7% | 同 | 0 |
+| 17 | `quant_kernel<1>` †† | 40 | 1.6 | **0.07** | 0.7% | 同 | 0 |
 | 18 | `engram_apply_kernel` | 2 | 32.6 | **0.07** | 0.7% | 同 | 0 |
 | 19 | `argmax_kernel`（切片 + 跨 rank）| 1 | 59.1 | **0.06** | 0.6% | 同 | 0 |
 | 20 | `add_kernel` | 40 | 1.4 | **0.05** | 0.6% | 同 | 0 |
 | 21 | `swiglu_limit_kernel`（共享专家 w2 前）| 40 | 1.2 | **0.05** | 0.5% | 同 | 0 |
-| 22 | `fp4_pack_kernel` | 40 | 1.1 | **0.05** | 0.5% | 同 | 0 |
+| 22 | `fp4_pack_kernel` †† | 40 | 1.1 | **0.05** | 0.5% | 同 | 0 |
 | 23 | `ring_append_kernel` | 40 | 1.1 | **0.05** | 0.5% | 同 | 0 |
 | 24 | `window_idxs_kernel` | 40 | 1.0 | **0.04** | 0.4% | 同 | 0 |
 | 25 | `rmsnorm_kernel` | **4** | 1.9 | **0.01** | 0.1% | 44 / 2.8 / 0.12 | **−0.12** |
@@ -76,6 +76,15 @@ epilogue** 顺带完成，40 次独立 launch 与 40 个图节点消失。语义
 tie-break、同一 renorm）。真正省下的只有 launch/节点开销（route 的 ~3µs 执行时间仍在 gemv 末尾的
 关键路径上）⇒ 预期 **−0.06~0.10ms/step**，而非表列的 0.21ms。仅 bf16-gate 路径可融（`DSV41_MIX_GATE=1`
 的 fp8x2 gate 与 `DSV41_CUBLAS_M1=1` 保持两段式）。
+
+†† **`quant_kernel<1>` + `fp4_pack_kernel` 已融合为 `quant_fp4_fused_kernel`（`DSV41_QUANT_FP4_FUSE`，默认 ON，
+2026-09-11）**：`dsv41_quant_fp4` 现在一次 launch 完成"量化 + 打包"，中间 `g_q4nib` scratch（rows*cols 字节）
+不再分配、不再读写，40 个图节点消失（80 → 40）。字节 bit-exact：同一份 amax/shfl 归约、
+同一条最近 e2m1 查表、同一 `(lo&0xF)|(hi<<4)` nibble 装配（lo = 偶数元素）。**成立前提是 `block` 为偶数**
+（nibble 对不会跨 block 边界，故 pair t 的落点是 block 的纯函数）；`block > 256` 或奇数 block 时 launcher
+自动回退到旧两段路径（`DSV41_QUANT_FP4_FUSE=0` 是显式回退开关）。生产形状 rows=1/cols=5120/block=32 走融合路径。
+⇒ 表列的 0.07 + 0.05 仍计在执行时间上，融合只回收 launch/节点开销（≈0.06ms/step 量级），
+且省掉一次 rows*cols 的 scratch 往返带宽。
 
 ### `gemm_fp8_gemv` 246 次的代码级分解（2026-09-11 只读代码审计，`chain_dev.rs`）
 
@@ -197,12 +206,12 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | kernel | 次/步 | µs/次 | ms/步 |
 |---|---|---|---|
 | `indexer_score_kernel` | 4 | 19.7 | 0.079 |
-| `quant_kernel<1>` | 40 | 1.6 | 0.065 |
+| `quant_kernel<1>` ††（已并入 `quant_fp4_fused_kernel`）| 40 | 1.6 | 0.065 |
 | `engram_apply_kernel` | 2 | 32.6 | 0.065 |
 | `argmax_kernel` | 1 | 59.1 | 0.059 |
 | `add_kernel` | 40 | 1.4 | 0.054 |
 | `swiglu_limit_kernel` | 40 | 1.2 | 0.049 |
-| `fp4_pack_kernel` | 40 | 1.1 | 0.046 |
+| `fp4_pack_kernel` ††（已并入 `quant_fp4_fused_kernel`）| 40 | 1.1 | 0.046 |
 | `ring_append_kernel` | 40 | 1.1 | 0.045 |
 | `window_idxs_kernel` | 40 | 1.0 | 0.042 |
 | `comp_placeholder_kernel` | 30 | 1.0 | 0.030 |

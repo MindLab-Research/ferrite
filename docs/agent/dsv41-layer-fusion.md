@@ -75,7 +75,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 27 | `lin_bf16 gate` | moe :1693 | k=5120 → n=384 |
 | 28 | `route_topk` | :1700 | score_func=2；smem **3096 B**。**已融合**：`DSV41_ROUTE_FUSE`（默认 ON）时由 #27 的 gate GEMV（`ferrite_gemv_bf16_v2_route`）last-block epilogue 顺带完成，本行消失（老 `.so` / MIX_GATE / CUBLAS_M1 自动回退到本行）|
 | 29 | `zero` ×2 | :1728/:1729 | memset |
-| 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32 |
+| 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32。**已融合**：`DSV41_QUANT_FP4_FUSE`（默认 ON）时 `dsv41_quant_fp4` 发射单核 `quant_fp4_fused_kernel`（量化+打包一步，bit-exact），旧 `quant_kernel<1>` + `fp4_pack_kernel` 两段路径保留为回退（env=0，或 block 奇数/>256） |
 | 31 | **batched 路径（`moe_batch()` 代码默认 OFF**，:190 `unwrap_or(false)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`gateup_fused` 开时**跳过** `swiglu_limit_batched`；`gateup_fused = DSV41_GATEUP_FUSE!=0 && supports_gateup_fuse() && expert_fp4_mode()==2`，:2344/:2383 —— 必须与 `.cu:1367` 的 `g_fuse && g_expert_fp4_mode==2 && dim%512==0` 逐字镜像）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 OFF）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|
 | 31' | sequential 回退（逐 slot ×topk）| :2433-2477 | `expert_gate_up_fp4_indirect` / `swiglu_limit` / `expert_down_fp4_indirect` |
 | 32 | 共享专家（`shared_rank`：`DSV41_SHARED_TP` 时 = **所有 rank**，各自 `inter/world` 切片；否则仅 rank 0）| :2504-2588 | gate/up 二选一：`DSV41_SH_EXP_MX2`（默认 ON）⇒ **一次 `gemm_fp8_mx2`**(w1,w3)；否则两次 `gemm_fp8_mx`。前置 `quant1(xn)`（`sh_via_mixed` 时由 `gemm_bf16_fp8x2` 顺带完成）。swiglu 二选一（A4）：`DSV41_SWIGLU_Q`（**默认 ON**，`chain_dev.rs:301-331`）⇒ `swiglu_limit_q` 一次启动直出 `(xq,xsc)`（warp=1 个 32-block，amax 一次 shuffle；`inter%32` 不满足则返回 1 回退）；否则 `swiglu_limit` + `quant1(ex_act)`。⚠️ 它曾被记为 "round-18 数值 bug 暂缓"，实为**误归因**：A4 代码首次出现在 `f3b1be1`（其 commit message 报告的正是 round-18 那次跑分），而 `f3b1be1^` 里根本没有 `swiglu_limit_q`/`act_q`——round-18 的乱码与 A4 无关（根因是 gateup/down 融合的 `.cu`/Rust 默认值分裂，见下文），A4/A5 只是被 `f6a1c08` 连带批量 gate OFF。逐项核对：f32 写回同一个寄存器 `v`（无 global 回读）、amax 是同一组 32 值的 fmaxf 树（warp 恰好覆盖一个量化块，无需跨 warp 归约）、scale/字节算式与 `quant_kernel<0>`(block=32, round_scale=1) 逐项同式 ⇒ 逐位相同；证据 = `kernels/cuda/tests_dsv41_glue.cu` 的 `swiglu_q` 用例（对真实 `dsv41_quant_fp8` 比 xq/xsc/f32 逐位）。w2 二选一（A5）：`DSV41_MOE_EPI_ADD`（**默认 OFF**，`chain_dev.rs:292-299`；与 A4 一起被 `f6a1c08` 批量 gate OFF，`=1` 可重开）⇒ `gemm_fp8_mx_add` 把 `add_inplace` 折进 GEMV 的 lane-0 epilogue，**直写 `s.o`**（结合律 `o+(acc+bias)` 不变 ⇒ 逐位相同）；否则 `gemm_fp8_mx`(w2→`ex_out`) + `add_inplace(o, ex_out)`。两处 gate 均 OnceLock 缓存、`supports_*()` 探测 `.so` 符号（老 `.so` 自动回退） |
@@ -322,3 +322,60 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   ⚠️ 若上机后仍只有 −0.2ms，下一个怀疑对象是**图节点开销本身**（审计：1355 节点 ≈ 2.0ms，
   ~1.5µs/节点；split 每次多 1 个 kernel 节点 + 2 个 event 节点 ⇒ 约 0.3-0.5ms/步），
   而不是调度——判据：nsys 看 tail_late 的 span 是否与投影时间轴重叠。
+- **注意力双链 `DSV41_DUAL_CHAIN`（默认 ON，2026-09-11 实现，待上机实测）** ✓：
+  `attention()` 里 `lin2`（wq_a+wkv mx2）之后，q 链（`NORM_FUSE`/`lin_rope` + wq_b gemv + rope）
+  与 kv 链（`rmsnorm_rope(s.kv)`；`NR_FUSE=0` 或老 `.so` 时退化为 `rmsnorm` + `apply_rope`）互不
+  读写，把 kv 链挪到**第二条 side stream** 与 q 链并行。实现要点：
+  - **真正的汇合点是 ring append，不是 sparse_attn** ✗（题面如此，但代码里 `ring_win_fuse`/
+    `ring_append` 立即读 `s.kv` 写 ring，`sparse_attn` 只读 ring）⇒ join 落在 kv 链之后、
+    `ring_win_fuse` 之前（也就在 layer==0 的 debug 读 `s.kv` 之前）。
+  - `devrt.rs`：加 `side_stream2`（**默认优先级**——kv 链是填充、q 链才是关键路径，不能反过来抢占）
+    + `fork2_ev`/`join2_ev`（`cudaEventDisableTiming`，图捕获内合法），并暴露 `record_event`
+    （tail split 的 fork/join 在 C 侧做，双链的两半由 Rust 发，需要这个原语）。
+  - **必须独立于 `side_stream`** ✗：hc tail split 的 LATE 半在 `lin2` **之前**就已 fork
+    （`hc_mixes_auto`），此刻仍在 side stream 上，共用一条会把两者串行。
+  - `device.rs`：`supports_dual_chain` / `dual_chain_fork` / `dual_chain_join`，以及
+    `rmsnorm_rope_on` / `rmsnorm_on` / `apply_rope_on`（带 stream 参数；原方法委托，调用点不变）。
+  - `chain_dev.rs::attention()`：`lin2` 后 fork → kv 链发 `side_stream2` → 紧接 join；
+    `kv_stream = if dual { side2 } else { main }` ⇒ 非 dual 路径与旧行为逐 launch 相同。
+  - **位级一致** ✓：kernel 与操作数不变，只是发射流不同；两链共享的只有只读的 `cos/sin/pos_ctr`。
+  - 两个静默回退门：① `kv_early` 必须为真——未融合的 `lin(wkv)` 会写**共享**的 `s.xq`/`s.xsc`，
+    与 q 链的 `lin_rope`/`lin2_rope` 竞争，该路径保持串行；② `supports_dual_chain()`。
+  - ⚠️ **收益预期须修正** ✗：v3 清单实测 `rmsnorm_rope_kernel` = **2.5µs/次**（40 次 = 0.10ms/步）；
+    且代码里**不存在名为 `kvb` 的投影**（absorbed MLA：kv_b 已被 wq_b 吸收，`n = nlh*hd`）⇒
+    这条改动能兑现的是 **≈0.10ms**，不是题面的 0.42ms。0.42ms 对应的是"把 wkv 的 GEMV 从 `lin2`
+    里拆出来一起挪到侧流"（≈9.5µs + 2.5µs），那要先**解融合 lin2**，属另一项改动。
+  - 开关：`DSV41_DUAL_CHAIN=0` 回退串行（同二进制 A/B）。
+- **MoE 双链 `DSV41_MOE_DUAL`（默认 ON，2026-09-11 实现，待上机实测）** ✓：
+  `moe()` 里 routed experts 链（`quant_fp4` → `expert_gate_up_fp4_batched` → `swiglu` →
+  `expert_down_reduce_fp4_batched`，写 `s.o`）与 shared expert 链（`quant1(xn)` → `gemm_fp8_mx2`
+  w1/w3 → `swiglu_limit_q` → w2 GEMV）互不依赖：**输入都是 `xn`，但走不同量化路径**
+  （routed 读 `s.xq4`/`s.xsc4` 的 fp4，shared 读 `s.xq`/`s.xsc` 的 fp8，含 T1 缓存）。
+  把 shared 链整段发到**第二条 side stream**（复用 `side_stream2` + `fork2_ev`/`join2_ev`），
+  与 routed 链并行。实现要点：
+  - **fork 点在 `moe()` 顶部**（`sh_w` 算完之后、gate 之前）✓：shared 链只依赖 `xn`（及其 T1
+    fp8），不依赖 gate/route，所以 fork 越早越好；host 侧的发射顺序（fork → routed → shared →
+    join）不影响重叠——重叠由"fork event 在 routed 链之前记在主流派"保证。
+  - ⚠️ **输出缓冲竞态** ✓：routed 的 `down_reduce` **覆写 `s.o`**，`moe_down_reduce` 也是覆写；
+    shared 的 w2 若仍用 A5 融合 epilogue 写 `s.o` 就与 routed 并发写同一 buffer。⇒ `MOE_DUAL`
+    下**强制关掉 A5 融合**，w2 恒写**独立的 `s.ex_out`**，join 之后在主流派跑
+    `add_inplace(&s.o, &s.ex_out)`——这正是串行非融合路径原有的那条 add，**操作数与顺序完全不变
+    ⇒ 位级一致**（A5 注释本就说 fused 与 pair 位级等价）。
+  - ⚠️ **`s.ex_act` 共享** ✓：batched routed 链写 `s.ex_act_b`（`[topk][2*inter]`），而**串行
+    fallback 循环复用 `s.ex_act`** ——与 shared 链同一个 buffer。⇒ `MOE_DUAL` 只挂在 `batched`
+    路径上（`moe_batch() && topk>0 && ne>=2 && supports_moe_batch()`）。
+  - ⚠️ **MIX_GATE 必须关** ✓：混合 gate+w1+w3 launch 在主流派写 `s.xq`/`s.ex_act`，而 shared 链的
+    `quant1(xn)` 也写 `s.xq` ⇒ 该配置下强制串行（`DSV41_MIX_GATE` 默认本就 OFF）。
+  - ⚠️ **`sh_w` 不含 w2** ✓：`sh_w` 只有 w1/w3，shared 下半段还需要 `shared_w2`/`w2_scale` 才会
+    真正执行。缺 w2 时整段被跳过，而 join 仍会把**陈旧的 `ex_out`** 并进 `s.o` ⇒ 谓词里必须一并
+    检查 `shared_w2(_scale).is_some()`。
+  - `device.rs`：新增带 stream 参数的一族 `*_on`（`quant_fp8_on` / `gemm_fp8_mx_on` /
+    `gemm_fp8_mx2_on` / `gemm_fp8_mx_add_on` / `swiglu_limit_on` / `swiglu_limit_q_on`；原方法
+    委托，调用点不变），`chain_dev.rs` 加 `quant1_on`（同 T1/T2 指针门控）。
+  - **复用 `side_stream2`（不新开 side_stream3）** ✓：两条双链同层内**时间窗不重叠**（注意力的 kv
+    链在 `lin2` 之后、MoE 的 shared 链在 attention 之后），且 `fork2/join2` 事件本就被设计为
+    "每次 record/wait 对在图内按程序序消歧"（hc tail split 已 40×/捕获复用 `fork_ev`/`join_ev`）。
+  - 开关：`DSV41_MOE_DUAL=0` 回退串行（同二进制 A/B）。
+  - ⚠️ **收益预期须修正** ✗：题面 `−0.88ms(40×22µs)` 假设共享链 22µs 可完全隐藏；实际可隐藏
+    部分 ≤ min(routed, shared) 且受 SM/带宽争抢影响。上机后须用 `DSV41_MOE_DUAL=0/1` 同会话背靠背
+    单轮实测（`scripts/dsv41_serve_ab.sh`），并同时验证 `opcheck`/faults 与文本。

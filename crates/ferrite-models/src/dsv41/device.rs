@@ -639,6 +639,42 @@ impl Device {
         self.stream
     }
 
+    /// True when the runtime owns the SECOND side stream and its fork/join
+    /// events. A cudart without the event primitives, or a failed stream create,
+    /// reports false and the caller keeps the serial kv chain.
+    pub fn supports_dual_chain(&self) -> bool {
+        !self.rt.side_stream2().is_null()
+            && !self.rt.fork2_event().is_null()
+            && !self.rt.join2_event().is_null()
+    }
+
+    /// The second side stream (the dual chain's kv half). Only meaningful when
+    /// [`Self::supports_dual_chain`] is true.
+    pub fn side_stream2(&self) -> CuStream {
+        self.rt.side_stream2()
+    }
+
+    /// Attention dual chain — fork. Record the fork event on the MAIN stream
+    /// (the side stream may not start before the fork point's work is done) and
+    /// make `side_stream2` wait it. Legal inside a capture: both ops become
+    /// graph edges.
+    pub fn dual_chain_fork(&self) -> Result<()> {
+        self.rt.record_event(self.rt.fork2_event(), self.stream)?;
+        self.rt
+            .stream_wait_event(self.rt.side_stream2(), self.rt.fork2_event())
+    }
+
+    /// Attention dual chain — join. Record the join event on `side_stream2` and
+    /// make the MAIN stream wait it. Must run after the kv half is fully issued
+    /// and before its first consumer (ring append / sparse_attn). Legal inside a
+    /// capture.
+    pub fn dual_chain_join(&self) -> Result<()> {
+        self.rt
+            .record_event(self.rt.join2_event(), self.rt.side_stream2())?;
+        self.rt
+            .stream_wait_event(self.stream, self.rt.join2_event())
+    }
+
     pub fn device_id(&self) -> i32 {
         self.rt.device_id()
     }
@@ -851,9 +887,29 @@ impl Device {
         n: i32,
         k: i32,
     ) -> Result<()> {
+        self.gemm_fp8_mx_on(a, a_scale, w, w_scale, bias, out, m, n, k, self.stream)
+    }
+
+    /// [`Self::gemm_fp8_mx`] issued on `s` instead of the main stream. The MoE
+    /// dual chain's shared half (`DSV41_MOE_DUAL`) sends its w1/w3 and w2 GEMVs
+    /// here so they run beside the routed experts' fp4 chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_on(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        s: CuStream,
+    ) -> Result<()> {
         let rc = unsafe {
             (self.kernels.gemm_fp8_mx)(
-                a, a_scale, w, w_scale, bias, out, m, n, k, self.stream,
+                a, a_scale, w, w_scale, bias, out, m, n, k, s,
                 std::ptr::null(), std::ptr::null(), 0, 0, 0,
                 std::ptr::null_mut(), std::ptr::null_mut(),
             )
@@ -957,6 +1013,32 @@ impl Device {
         n2: i32,
         k: i32,
     ) -> Result<bool> {
+        self.gemm_fp8_mx2_on(
+            a, a_scale, w1, w1_scale, bias1, out1, n1, w2, w2_scale, bias2, out2, n2, k,
+            self.stream,
+        )
+    }
+
+    /// [`Self::gemm_fp8_mx2`] issued on `s` instead of the main stream (the MoE
+    /// dual chain's shared-expert w1/w3 pair).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx2_on(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w1: *const u8,
+        w1_scale: *const u8,
+        bias1: *const f32,
+        out1: *mut f32,
+        n1: i32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        bias2: *const f32,
+        out2: *mut f32,
+        n2: i32,
+        k: i32,
+        s: CuStream,
+    ) -> Result<bool> {
         let rc = unsafe {
             (self.kernels.gemm_fp8_mx2)(
                 a,
@@ -972,7 +1054,7 @@ impl Device {
                 out2,
                 n2,
                 k,
-                self.stream,
+                s,
             )
         };
         if rc == 1 {
@@ -1183,7 +1265,10 @@ impl Device {
                 self.stream,
             )
         };
-        if rc == 1 {
+        // Round-42 fix: the C side's shape-decline is now 2 (never 1, which
+        // collides with cudaErrorInvalidValue and made a REAL launch failure
+        // look like a graceful decline while the sticky error propagated).
+        if rc == 2 {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_rope_norm")?;
@@ -1213,9 +1298,29 @@ impl Device {
         n: i32,
         k: i32,
     ) -> Result<bool> {
+        self.gemm_fp8_mx_add_on(a, a_scale, w, w_scale, bias, out, m, n, k, self.stream)
+    }
+
+    /// [`Self::gemm_fp8_mx_add`] issued on `s` instead of the main stream. Not
+    /// used by the MoE dual chain (its w2 must land in a DISJOINT scratch while
+    /// the routed down-reduce owns `s.o`), but kept beside its siblings so the
+    /// two paths cannot drift.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_add_on(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        s: CuStream,
+    ) -> Result<bool> {
         let f = self.need(self.kernels.gemm_fp8_mx_add, "dsv41_gemm_fp8_mx_add")?;
-        let rc =
-            unsafe { f(a, a_scale, w, w_scale, bias, out, m, n, k, self.stream) };
+        let rc = unsafe { f(a, a_scale, w, w_scale, bias, out, m, n, k, s) };
         if rc == 1 {
             return Ok(false);
         }
@@ -1247,7 +1352,8 @@ impl Device {
     ) -> Result<bool> {
         let f = self.need(self.kernels.gemm_fp8_mx_f32, "dsv41_gemm_fp8_mx_f32")?;
         let rc = unsafe { f(a_f32, w, w_scale, bias, out, n, k, self.stream) };
-        if rc == 1 {
+        // Round-42 fix: decline is 2 now (1 collides with cudaErrorInvalidValue).
+        if rc == 2 {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_f32")?;
@@ -1264,6 +1370,22 @@ impl Device {
         block: i32,
         round_scale: bool,
     ) -> Result<()> {
+        self.quant_fp8_on(x, y, scale, rows, cols, block, round_scale, self.stream)
+    }
+
+    /// [`Self::quant_fp8`] issued on `s` instead of the main stream (the MoE
+    /// dual chain's shared half quantises `xn` beside the routed fp4 chain).
+    pub fn quant_fp8_on(
+        &self,
+        x: *const f32,
+        y: *mut u8,
+        scale: *mut f32,
+        rows: i32,
+        cols: i32,
+        block: i32,
+        round_scale: bool,
+        s: CuStream,
+    ) -> Result<()> {
         let rc = unsafe {
             (self.kernels.quant_fp8)(
                 x,
@@ -1273,7 +1395,7 @@ impl Device {
                 cols,
                 block,
                 round_scale as i32,
-                self.stream,
+                s,
             )
         };
         self.kerr(rc, "dsv41_quant_fp8")
@@ -1539,10 +1661,35 @@ impl Device {
         step: i32,
         inverse: bool,
     ) -> Result<()> {
+        self.apply_rope_on(
+            x, cos, sin, rows, row_len, dim, half, base, mul, off, step, inverse, self.stream,
+        )
+    }
+
+    /// [`Self::apply_rope`] issued on `s` instead of the main stream. Used by
+    /// the attention dual chain (`DSV41_DUAL_CHAIN`), which runs the kv half —
+    /// kv norm + rope — on the runtime's second side stream under the q chain.
+    /// Kernel and operands are unchanged, so the result is bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_rope_on(
+        &self,
+        x: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        rows: i32,
+        row_len: i32,
+        dim: i32,
+        half: i32,
+        base: *const c_int,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        s: CuStream,
+    ) -> Result<()> {
         let rc = unsafe {
             (self.kernels.apply_rope)(
-                x, cos, sin, rows, row_len, dim, half, base, mul, off, step, inverse as i32,
-                self.stream,
+                x, cos, sin, rows, row_len, dim, half, base, mul, off, step, inverse as i32, s,
             )
         };
         self.kerr(rc, "dsv41_apply_rope")
@@ -1569,13 +1716,43 @@ impl Device {
         inverse: bool,
         eps: f32,
     ) -> Result<bool> {
+        self.rmsnorm_rope_on(
+            x, w, out, cos, sin, n, dim, rope_len, half, base, mul, off, step, inverse, eps,
+            self.stream,
+        )
+    }
+
+    /// [`Self::rmsnorm_rope`] issued on `s` instead of the main stream. This is
+    /// the kv half of the attention dual chain (`DSV41_DUAL_CHAIN`): it reads
+    /// `s.kv` (written by `lin2`, i.e. before the fork) and writes it back, so it
+    /// shares no buffer with the q chain and stays bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_rope_on(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        n: i32,
+        dim: i32,
+        rope_len: i32,
+        half: i32,
+        base: *const c_int,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<bool> {
         let f = match self.kernels.rmsnorm_rope {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
             f(x, w, out, cos, sin, n, dim, rope_len, half, base, mul, off, step, inverse as i32,
-              eps, self.stream)
+              eps, s)
         };
         self.kerr(rc, "dsv41_rmsnorm_rope")?;
         Ok(true)
@@ -1807,8 +1984,21 @@ impl Device {
     }
 
     pub fn swiglu_limit(&self, gate_up: *mut f32, rows: i32, inter: i32, limit: f32) -> Result<()> {
+        self.swiglu_limit_on(gate_up, rows, inter, limit, self.stream)
+    }
+
+    /// [`Self::swiglu_limit`] issued on `s` instead of the main stream (the MoE
+    /// dual chain's shared half, on its `SWIGLU_Q`-off fallback).
+    pub fn swiglu_limit_on(
+        &self,
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        s: CuStream,
+    ) -> Result<()> {
         let f = self.need(self.kernels.swiglu_limit, "dsv41_swiglu_limit")?;
-        let rc = unsafe { f(gate_up, rows, inter, limit, self.stream) };
+        let rc = unsafe { f(gate_up, rows, inter, limit, s) };
         self.kerr(rc, "dsv41_swiglu_limit")
     }
 
@@ -1830,8 +2020,23 @@ impl Device {
         xq: *mut u8,
         xsc: *mut f32,
     ) -> Result<bool> {
+        self.swiglu_limit_q_on(gate_up, rows, inter, limit, xq, xsc, self.stream)
+    }
+
+    /// [`Self::swiglu_limit_q`] issued on `s` instead of the main stream (the
+    /// MoE dual chain's shared half).
+    pub fn swiglu_limit_q_on(
+        &self,
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+        s: CuStream,
+    ) -> Result<bool> {
         let f = self.need(self.kernels.swiglu_limit_q, "dsv41_swiglu_limit_q")?;
-        let rc = unsafe { f(gate_up, rows, inter, limit, xq, xsc, self.stream) };
+        let rc = unsafe { f(gate_up, rows, inter, limit, xq, xsc, s) };
         if rc == 1 {
             return Ok(false);
         }
@@ -2574,7 +2779,24 @@ impl Device {
         dim: i32,
         eps: f32,
     ) -> Result<()> {
-        let rc = unsafe { (self.kernels.rmsnorm)(x, w, out, n, dim, eps, self.stream) };
+        self.rmsnorm_on(x, w, out, n, dim, eps, self.stream)
+    }
+
+    /// [`Self::rmsnorm`] issued on `s` instead of the main stream. Only the
+    /// attention dual chain's kv fallback (`DSV41_DUAL_CHAIN` with `NR_FUSE`
+    /// off, or an `.so` without `dsv41_rmsnorm_rope`) uses it; every other
+    /// caller stays on the main stream.
+    pub fn rmsnorm_on(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        n: i32,
+        dim: i32,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<()> {
+        let rc = unsafe { (self.kernels.rmsnorm)(x, w, out, n, dim, eps, s) };
         self.kerr(rc, "ferrite_rmsnorm")
     }
 

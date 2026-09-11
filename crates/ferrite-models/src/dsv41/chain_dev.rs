@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use crate::dsv41::config::{Dsv41Config, KvMode};
 use crate::dsv41::tp::Collective;
-use crate::dsv41::device::{DevBuf, Device};
+use crate::dsv41::device::{CuStream, DevBuf, Device};
 use crate::dsv41::load::{Dsv41DevWeights, LayerDev};
 
 /// Runtime switches for isolating a stage during bring-up.
@@ -277,6 +277,52 @@ fn expert_fp4_mode() -> i32 {
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// DUAL_CHAIN (DSV41_DUAL_CHAIN, default ON): the kv half of `attention()` (kv
+/// norm + rope) is issued on the runtime's SECOND side stream so it overlaps the
+/// q chain (rmsnorm_q/NORM_FUSE + wq_b + rope) that stays on the main stream.
+/// The two chains touch disjoint buffers (`s.kv` vs `s.qr`/`s.q`/`s.xq`) and meet
+/// only at the kv chain's first consumer, so the split is bit-identical — the
+/// kernels and their operands are untouched, only the stream they are issued on.
+/// "0" is the A/B arm (serial).
+///
+/// Two shape/runtime gates, both silent:
+/// - `kv_early` (the fused `lin2` took): the unfused fallback's `wkv` lin would
+///   quantise into the SHARED `s.xq`/`s.xsc`, which the q chain also writes, so
+///   overlapping them there would race on the activation buffer.
+/// - `Device::supports_dual_chain()`: the runtime must own the second side
+///   stream and both disable-timing fork/join events (see `devrt.rs`).
+fn dual_chain() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_DUAL_CHAIN").map(|v| v != "0").unwrap_or(true))
+}
+
+/// MOE_DUAL (DSV41_MOE_DUAL, default ON): the MoE's SHARED expert half is issued
+/// on the runtime's second side stream so it overlaps the ROUTED experts' fp4
+/// chain on the main stream. The two halves of `moe()` read `xn` through
+/// DISJOINT quantisations (routed: `quant_fp4` -> `s.xq4`/`s.xsc4`; shared:
+/// `quant1` -> `s.xq`/`s.xsc`) and write DISJOINT buffers, so the split is
+/// bit-identical — the kernels and their operands are untouched, only the
+/// stream they are issued on. The shared half's w2 lands in `s.ex_out` (it may
+/// NOT use `s.o`, which the routed down-reduce is writing concurrently) and the
+/// join then runs the SAME `add_inplace(&s.o, &s.ex_out)` the serial non-fused
+/// path already ran, in the same order.
+///
+/// Gated OFF (serial) when any of these holds, each a genuine data race or a
+/// missing runtime capability:
+/// - `MIX_GATE` (`DSV41_MIX_GATE`): its fused gate+w1+w3 launch makes the
+///   shared half a consumer of the gate and writes `s.xq` on the MAIN stream,
+///   which the shared half's own `quant1(xn)` would then race.
+/// - the routed path is not the BATCHED one: the sequential loop reuses
+///   `s.ex_act`, which the shared half writes.
+/// - no shared expert on this rank (`sh_w` None), or `SKIP_EXPERTS`.
+/// - `Device::supports_dual_chain()`: the runtime must own the second side
+///   stream and both disable-timing fork/join events (see `devrt.rs`).
+/// "0" is the A/B arm (serial).
+fn moe_dual() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_DUAL").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_ROPE_FUSE=0 reverts the q rope (and, under IDX_FUSE, the idx_q rope) to
@@ -858,6 +904,15 @@ impl<'a> DevChain<'a> {
 
     /// Quantise `src` (one row of `k` floats) to fp8 into `s.xq`/`s.xsc`.
     fn quant1(&self, src: *const f32, k: i32) -> Result<()> {
+        self.quant1_on(src, k, self.dev.stream())
+    }
+
+    /// [`Self::quant1`] with an explicit stream. The MoE dual chain's shared half
+    /// (`DSV41_MOE_DUAL`) quantises `xn` on the side stream, so its `s.xq`/`s.xsc`
+    /// write overlaps the routed experts' fp4 chain. The T1/T2 pointer gating and
+    /// its consume-once semantics are unchanged — there is exactly one quant1 of
+    /// `xn` in `moe()`, and the flag's host-side order is the same either way.
+    fn quant1_on(&self, src: *const f32, k: i32, stream: CuStream) -> Result<()> {
         // T1: when the hc tail just emitted the fp8 of `xn` alongside its f32
         // write-back, the next quant1 over `xn` is redundant. Pointer-gated so
         // every other source (qr, o, ex_act, engram rows) still quantises, and
@@ -877,8 +932,16 @@ impl<'a> DevChain<'a> {
             self.s.xq_of_qr_valid.set(false);
             return Ok(());
         }
-        self.dev
-            .quant_fp8(src, self.s.xq.ptr as *mut u8, self.s.xsc.ptr as *mut f32, 1, k, 32, true)
+        self.dev.quant_fp8_on(
+            src,
+            self.s.xq.ptr as *mut u8,
+            self.s.xsc.ptr as *mut f32,
+            1,
+            k,
+            32,
+            true,
+            stream,
+        )
     }
 
     /// fp8 dense linear for one row: `out[1, n_out] = a[1, k] @ w[n_out, k]^T`.
@@ -2257,6 +2320,22 @@ fn hc_tail_split() -> bool {
                 self.s.qr.ptr as *mut f32,
             )?;
         }
+        // DUAL_CHAIN (DSV41_DUAL_CHAIN, default ON): fork the kv half onto the
+        // runtime's second side stream HERE, so its kv norm + rope runs while the
+        // q chain below (NORM_FUSE/lin_rope + wq_b gemv + rope, ~13.5us/layer)
+        // owns the main stream. `s.kv` is complete at this point — `lin2`/the
+        // fallback just wrote it, and nothing on the q side reads it — so this is
+        // exactly the two chains' last shared node.
+        //
+        // Gated on `kv_early`: the unfused path above ran `lin(wq_a)` and would
+        // run `lin(wkv)` below (line ~2449), whose `quant1` writes the SHARED
+        // `s.xq`/`s.xsc` that the q chain's `lin_rope`/`lin2_rope` also write.
+        // Overlapping those two would be a genuine data race on the activation
+        // buffer, so that path stays serial.
+        let dual = dual_chain() && kv_early && self.dev.supports_dual_chain();
+        if dual {
+            self.dev.dual_chain_fork()?;
+        }
         // L2+L3 decision, hoisted above the norm block: which wq_b launch is
         // taken decides whether NORM_FUSE may run at all. The two-family
         // IDX_FUSE launch shares ONE `xq` between wq_b and idx_wq_b, so it cannot
@@ -2456,12 +2535,18 @@ fn hc_tail_split() -> bool {
                 self.s.kv.ptr as *mut f32,
             )?;
         }
+        // DUAL_CHAIN: every launch from here to the join below is the kv half.
+        // It rides the second side stream when the fork above took, so it runs
+        // under the q chain instead of after it. `kv_stream` is the main stream
+        // on every other path, so the serial behaviour is byte-for-byte the old
+        // one (same launch order, same stream).
+        let kv_stream = if dual { self.dev.side_stream2() } else { self.dev.stream() };
         // The kv norm and its rope are an adjacent pair on the same row: one
         // fused launch, bit-identical to the two (same reduction tree at
         // blockDim 1024, elementwise rope). DSV41_NR_FUSE=0 reverts, and so
         // does an .so without the symbol.
         let nr_fused = nr_fuse()
-            && self.dev.rmsnorm_rope(
+            && self.dev.rmsnorm_rope_on(
                 self.s.kv.ptr as *const f32,
                 ld.kv_norm.as_ref().unwrap().as_f32(),
                 self.s.kv.ptr as *mut f32,
@@ -2475,17 +2560,19 @@ fn hc_tail_split() -> bool {
                 1,
                 false,
                 cfg.norm_eps,
+                kv_stream,
             )?;
         if !nr_fused {
-        self.dev.rmsnorm(
+        self.dev.rmsnorm_on(
             self.s.kv.ptr as *const f32,
             ld.kv_norm.as_ref().unwrap().as_f32(),
             self.s.kv.ptr as *mut f32,
             1,
             hd as i32,
             cfg.norm_eps,
+            kv_stream,
         )?;
-        self.dev.apply_rope(
+        self.dev.apply_rope_on(
             self.s.kv.ptr as *mut f32,
             self.cos.as_f32(),
             self.sin.as_f32(),
@@ -2496,7 +2583,16 @@ fn hc_tail_split() -> bool {
             self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
             1,
             false,
+            kv_stream,
         )?;
+        }
+        // DUAL_CHAIN join: the kv half is fully issued (nothing below writes
+        // `s.kv` until the ring append, which is its first consumer). Join the
+        // side stream back so everything from here on — the debug read right
+        // below, `ring_win_fuse`/`ring_append`, `sparse_attn` — sees the
+        // finished `s.kv`. A no-op when the fork did not take.
+        if dual {
+            self.dev.dual_chain_join()?;
         }
 
         if layer == 0 && hc_dbg() {
@@ -3210,6 +3306,41 @@ fn hc_tail_split() -> bool {
             None
         };
         let mut sh_via_mixed = false;
+        // The shared half's down tensors (w2/w2s) live outside `sh_w`; whether
+        // they exist decides if that half runs at all, so MOE_DUAL must know it
+        // before it forks.
+        let sh_w2_ok = ld.shared_w2.is_some() && ld.shared_w2_scale.is_some();
+        // MOE_DUAL (DSV41_MOE_DUAL, default ON): fork the SHARED expert half onto
+        // the second side stream HERE, before the gate/routed chain is issued.
+        // The fork event is recorded on the main stream at a point where `xn`
+        // (and the T1 fp8 of `xn`, when the hc tail emitted it) is already
+        // complete, so the shared half reads exactly what the serial code read -
+        // it just no longer WAITS for the gate + routed experts in between.
+        //
+        // The predicate mirrors `batched` below (the routed path must be the
+        // batched one: the sequential loop reuses `s.ex_act`, which the shared
+        // half writes). `!mix_gate_shared()` is required because the mixed
+        // gate+w1+w3 launch is a main-stream writer of `s.xq`/`s.ex_act` that the
+        // shared half would consume. See `moe_dual()` for the full contract.
+        let dual = moe_dual()
+            && !mix_gate_shared()
+            && !self.opts.skip_experts
+            && sh_w.is_some()
+            // `sh_w` covers w1/w3 only; the shared half also needs w2 to run at
+            // all. Without it the block below is skipped, yet the join would still
+            // merge `ex_out` — a stale buffer — into `s.o`.
+            && sh_w2_ok
+            && moe_batch()
+            && topk > 0
+            && ld.experts.len() >= 2
+            && self.dev.supports_moe_batch()
+            && self.dev.supports_dual_chain();
+        if dual {
+            self.dev.dual_chain_fork()?;
+        }
+        // The stream the shared half's launches go to: the side stream under
+        // MOE_DUAL, the main stream (byte-for-byte the old order) otherwise.
+        let sh_st = if dual { self.dev.side_stream2() } else { self.dev.stream() };
         if let Some((w1, w1s, w3, w3s)) = sh_w {
             // T2: only the MIX_GATE path reads the fp8 of `xn` here. With
             // MIX_GATE off this quantisation has no consumer at all (the mixed
@@ -3570,13 +3701,18 @@ fn hc_tail_split() -> bool {
                 // When the mixed gate launch already produced w1/w3 from the same
                 // quantised activation, only swiglu/quant/down remain here.
                 if !sh_via_mixed {
-                    self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
+                    // MOE_DUAL: issued on `sh_st` (the side stream under the dual
+                    // chain, the main stream otherwise). `s.xq`/`s.xsc` are written
+                    // ONLY by this half of `moe()` - the routed chain reads `xn`
+                    // through the disjoint `s.xq4`/`s.xsc4`, and the mixed gate
+                    // launch (the one main-stream `s.xq` writer) forces `dual` off.
+                    self.quant1_on(self.s.xn.ptr as *const f32, dim as i32, sh_st)?;
                     // gate and up land contiguously so `swiglu_limit` sees [gate|up].
                     // `sh_il` (inter/world) is this rank's slice: the weights are
                     // Rows-sharded, so one launch still covers both projections and
                     // the all-reduce below reconstructs the full shared expert.
                     let sh_fused = sh_exp_mx2()
-                        && self.dev.gemm_fp8_mx2(
+                        && self.dev.gemm_fp8_mx2_on(
                             self.s.xq.as_u8(),
                             self.s.xsc.as_f32(),
                             w1.as_u8(),
@@ -3590,9 +3726,10 @@ fn hc_tail_split() -> bool {
                             (self.s.ex_act.ptr as *mut f32).wrapping_add(sh_il),
                             sh_il as i32,
                             dim as i32,
+                            sh_st,
                         )?;
                     if !sh_fused {
-                        self.dev.gemm_fp8_mx(
+                        self.dev.gemm_fp8_mx_on(
                             self.s.xq.as_u8(),
                             self.s.xsc.as_f32(),
                             w1.as_u8(),
@@ -3602,8 +3739,9 @@ fn hc_tail_split() -> bool {
                             1,
                             sh_il as i32,
                             dim as i32,
+                            sh_st,
                         )?;
-                        self.dev.gemm_fp8_mx(
+                        self.dev.gemm_fp8_mx_on(
                             self.s.xq.as_u8(),
                             self.s.xsc.as_f32(),
                             w3.as_u8(),
@@ -3613,6 +3751,7 @@ fn hc_tail_split() -> bool {
                             1,
                             sh_il as i32,
                             dim as i32,
+                            sh_st,
                         )?;
                     }
                 }
@@ -3622,31 +3761,43 @@ fn hc_tail_split() -> bool {
                 // ex_act_b as f32 directly (no quant to fold).
                 let act_q = swiglu_q()
                     && self.dev.supports_swiglu_q()
-                    && self.dev.swiglu_limit_q(
+                    && self.dev.swiglu_limit_q_on(
                         self.s.ex_act.ptr as *mut f32,
                         1,
                         sh_il as i32,
                         cfg.swiglu_limit,
                         self.s.xq.ptr as *mut u8,
                         self.s.xsc.ptr as *mut f32,
+                        sh_st,
                     )?;
                 if !act_q {
-                    self.dev.swiglu_limit(
+                    self.dev.swiglu_limit_on(
                         self.s.ex_act.ptr as *mut f32,
                         1,
                         sh_il as i32,
                         cfg.swiglu_limit,
+                        sh_st,
                     )?;
-                    self.quant1(self.s.ex_act.ptr as *const f32, sh_il as i32)?;
+                    self.quant1_on(self.s.ex_act.ptr as *const f32, sh_il as i32, sh_st)?;
                 }
                 // w2 is Cols-sharded: [dim, sh_il] locally, so the reduction is over
                 // this rank's slice and the output is a PARTIAL [dim] that the MoE
                 // all-reduce sums with the other ranks'.
-                // A5: the w2 GEMV's epilogue adds straight into `s.o` (the MoE
-                // accumulator AR#2 reduces), dropping the standalone ferrite_add
-                // launch (40/step). Association is unchanged -- o + (acc + bias)
-                // either way -- so the result is bit-identical.
-                let fused = moe_epi_add()
+                //
+                // MOE_DUAL: the w2 GEMV may NOT fold into `s.o` — the routed chain
+                // is writing `s.o` on the main stream at the same time. It always
+                // writes the DISJOINT `s.ex_out` here, and the join below runs the
+                // same `add_inplace(&s.o, &s.ex_out)` the serial non-fused path ran
+                // (same operand, same order => bit-identical). The A5 fused epilogue
+                // is exactly that pair, so forcing it off under MOE_DUAL costs only
+                // the one extra launch on the side stream.
+                //
+                // A5 (serial only): the w2 GEMV's epilogue adds straight into `s.o`
+                // (the MoE accumulator AR#2 reduces), dropping the standalone
+                // ferrite_add launch (40/step). Association is unchanged --
+                // o + (acc + bias) either way -- so the result is bit-identical.
+                let fused = !dual
+                    && moe_epi_add()
                     && self.dev.supports_gemm_fp8_add()
                     && self.dev.gemm_fp8_mx_add(
                         self.s.xq.as_u8(),
@@ -3660,7 +3811,7 @@ fn hc_tail_split() -> bool {
                         sh_il as i32,
                     )?;
                 if !fused {
-                    self.dev.gemm_fp8_mx(
+                    self.dev.gemm_fp8_mx_on(
                         self.s.xq.as_u8(),
                         self.s.xsc.as_f32(),
                         w2.as_u8(),
@@ -3670,10 +3821,22 @@ fn hc_tail_split() -> bool {
                         1,
                         dim as i32,
                         sh_il as i32,
+                        sh_st,
                     )?;
-                    self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                    if !dual {
+                        self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                    }
                 }
             }
+        }
+        // MOE_DUAL join: the shared half is fully issued (its last consumer of
+        // `s.ex_out` here is the add just below). Wait the side stream back on the
+        // main stream, then merge exactly as the serial path did — the routed
+        // down-reduce wrote `s.o` on the main stream, so this add sees the same two
+        // operands in the same order. A no-op when the fork did not take.
+        if dual {
+            self.dev.dual_chain_join()?;
+            self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
         }
         // the block output is the attention-branch accumulator `o`
         Ok(())

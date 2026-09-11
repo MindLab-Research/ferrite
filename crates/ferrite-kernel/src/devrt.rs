@@ -324,6 +324,17 @@ pub struct DevRuntime {
     /// the graph instantiation can decide whether the node-priority flag is
     /// worth passing, and so a log can state what was actually in effect.
     side_prio: c_int,
+    /// SECOND side stream — the attention dual chain (`DSV41_DUAL_CHAIN`): the
+    /// kv half of `attention()` (kv norm + rope) is issued here so it overlaps
+    /// the whole q chain (rmsnorm_q/NORM_FUSE + wq_b + rope) on `stream`.
+    /// Deliberately a DIFFERENT stream from `side_stream`: the hc tail split's
+    /// LATE half is still live when it is issued (the tail fork happens in
+    /// `hc_mixes_auto`, i.e. *before* attention's `lin2`), so sharing one stream
+    /// would serialise the two instead of overlapping them.
+    /// Created WITHOUT a priority hint: the kv chain is filler, the q chain is
+    /// the critical path, so it must never preempt it.
+    /// Null when uncreatable → the model keeps the serial kv chain.
+    side_stream2: CuStream,
     /// Flags for `cudaGraphInstantiate`. Non-zero only when the side stream is a
     /// priority stream AND `DSV41_GRAPH_NODE_PRIORITY` is not 0.
     graph_instantiate_flags: u64,
@@ -333,6 +344,12 @@ pub struct DevRuntime {
     /// fully ordered within the capture, so program order disambiguates them.
     fork_ev: *mut c_void,
     join_ev: *mut c_void,
+    /// Fork/join events for the attention dual chain — same contract as
+    /// `fork_ev`/`join_ev` (disable-timing so a whole-step capture may contain
+    /// them), but recorded by the MODEL rather than by a kernel launcher,
+    /// because the dual chain's two halves are issued from Rust.
+    fork2_ev: *mut c_void,
+    join2_ev: *mut c_void,
     handle: *mut c_void,
     /// the kernel `.so` — model crates resolve their own symbols in it
     kernel_handle: *mut c_void,
@@ -486,6 +503,18 @@ impl DevRuntime {
                 // priority actually reached the capture)
                 eprintln!("[hc_tail] side stream priority = {side_prio} (greatest)");
             }
+            // Second side stream: the attention dual chain's kv half. Plain
+            // create (default priority) — see the field comment for why it is
+            // separate from `side_stream` and why it must NOT take the
+            // greatest-priority hint.
+            let mut side_stream2: CuStream = std::ptr::null_mut();
+            if (cudart.stream_create)(&mut side_stream2) != 0 {
+                let _ = (cudart.last_error)();   // clear the sticky flag
+                side_stream2 = std::ptr::null_mut();
+            }
+            if side_stream2.is_null() {
+                eprintln!("[dual_chain] second side stream unavailable — kv chain stays serial");
+            }
             // Node-priority instantiation is what makes the captured priority
             // effective at replay. `DSV41_GRAPH_NODE_PRIORITY=0` pins it off.
             let node_prio = side_prio != 0
@@ -499,6 +528,8 @@ impl DevRuntime {
             };
             let mut fork_ev: *mut c_void = std::ptr::null_mut();
             let mut join_ev: *mut c_void = std::ptr::null_mut();
+            let mut fork2_ev: *mut c_void = std::ptr::null_mut();
+            let mut join2_ev: *mut c_void = std::ptr::null_mut();
             if let Some(make_ev) = cudart.event_create_flags {
                 if make_ev(&mut fork_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
                     let _ = (cudart.last_error)();
@@ -514,6 +545,26 @@ impl DevRuntime {
                         fork_ev = std::ptr::null_mut();
                     }
                 }
+                // Dual chain: same disable-timing requirement — both events land
+                // inside the whole-step capture, where a timing event makes
+                // cudaStreamEndCapture fail.
+                if make_ev(&mut fork2_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    fork2_ev = std::ptr::null_mut();
+                }
+                if make_ev(&mut join2_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    join2_ev = std::ptr::null_mut();
+                }
+                if (fork2_ev.is_null() || join2_ev.is_null()) && !fork2_ev.is_null() {
+                    if let Some(d) = cudart.event_destroy {
+                        let _ = d(fork2_ev);
+                        fork2_ev = std::ptr::null_mut();
+                    }
+                }
+                if (fork2_ev.is_null() || join2_ev.is_null()) && !side_stream2.is_null() {
+                    eprintln!("[dual_chain] fork/join events unavailable — kv chain stays serial");
+                }
             }
             Ok(DevRuntime {
                 cudart,
@@ -521,9 +572,12 @@ impl DevRuntime {
                 stream,
                 side_stream,
                 side_prio,
+                side_stream2,
                 graph_instantiate_flags,
                 fork_ev,
                 join_ev,
+                fork2_ev,
+                join2_ev,
                 handle,
                 kernel_handle: h_k,
                 debug_sync: std::env::var("FERRITE_DEBUG_SYNC")
@@ -556,6 +610,13 @@ impl DevRuntime {
         self.side_prio
     }
 
+    /// Second side stream — the attention dual chain's kv half
+    /// (`DSV41_DUAL_CHAIN`). Null when the runtime could not create one;
+    /// callers gate on `is_null` (see `Device::supports_dual_chain`).
+    pub fn side_stream2(&self) -> CuStream {
+        self.side_stream2
+    }
+
     /// Fork event for the hc tail split: recorded on the main stream by the
     /// kernel launcher, waited on the side stream. Null when unavailable.
     pub fn fork_event(&self) -> *mut c_void {
@@ -567,6 +628,32 @@ impl DevRuntime {
     /// unavailable.
     pub fn join_event(&self) -> *mut c_void {
         self.join_ev
+    }
+
+    /// Fork event for the attention dual chain (`DSV41_DUAL_CHAIN`): recorded on
+    /// the MAIN stream by the model, waited on `side_stream2`. Null when
+    /// unavailable.
+    pub fn fork2_event(&self) -> *mut c_void {
+        self.fork2_ev
+    }
+
+    /// Join event for the attention dual chain: recorded on `side_stream2` by
+    /// the model, waited on the MAIN stream before the kv chain's first
+    /// consumer. Null when unavailable.
+    pub fn join2_event(&self) -> *mut c_void {
+        self.join2_ev
+    }
+
+    /// Record `ev` on `stream`. Legal inside a capture (becomes a graph node).
+    /// The hc tail split does this on the C side; the attention dual chain's two
+    /// halves are issued from Rust, so the primitive is exposed here.
+    pub fn record_event(&self, ev: *mut c_void, stream: CuStream) -> Result<()> {
+        let f = self
+            .cudart
+            .event_record
+            .ok_or_else(|| FerriteError::Config("cudaEventRecord missing".into()))?;
+        let rc = unsafe { f(ev, stream) };
+        self.kerr(rc, "cudaEventRecord")
     }
 
     /// Make `stream` wait for `ev`. Legal inside a capture (becomes a graph

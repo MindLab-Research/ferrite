@@ -138,6 +138,80 @@ __global__ void fp4_pack_kernel(const uint8_t* __restrict__ nib, uint8_t* __rest
     packed[i] = (uint8_t)((lo & 0x0Fu) | (hi << 4));
 }
 
+// Fused fp4 quantise + pack: the same thing dsv41_quant_fp4 gets from
+// `quant_kernel<1>` followed by `fp4_pack_kernel`, in ONE launch and without the
+// nibble scratch array (which cost a full write + read of rows*cols bytes per
+// call -- 40 calls/step, and the second kernel was 40 extra graph nodes).
+//
+// NUMERIC CONTRACT: the amax loop, the shfl_xor tree, the thread layout and the
+// scale arithmetic below are `quant_kernel<1>`'s, term for term, and the code
+// selection is its nearest-e2m1 loop, so the per-element nibble is bit-identical
+// to what the old path stored in g_q4nib; the byte assembly is
+// `fp4_pack_kernel`'s `(lo & 0xF) | (hi << 4)` with lo = element 2t, hi = 2t+1.
+// The two kernels therefore emit identical bytes; only the number of launches
+// (and the scratch round trip) changes.
+//
+// Why the fusion is legal layout-wise: the launcher only takes this path for an
+// EVEN `block`, so a nibble pair (2i, 2i+1) can never straddle a block boundary
+// and pair t of (row r, block b) lands at a byte that is a pure function of the
+// block:
+//     y[(r*cols + b*block)/2 + t]
+// The block's codes are exchanged through shared memory: thread `threadIdx.y`
+// owns element `i = threadIdx.y` (the strided loop covers block > blockDim.y, as
+// in quant_kernel), then the lower half of the block packs the pairs. `block` is
+// <= 256 on this path (the launcher declines otherwise), which bounds s_code.
+//
+// NOTE: the early `idx` return is uniform within a block because the launcher
+// sets blockDim.x = 1, so no __syncthreads() below is reached by only half of a
+// block -- keep blockDim.x = 1 if this is ever re-tiled.
+__global__ void quant_fp4_fused_kernel(const float* __restrict__ x, uint8_t* __restrict__ y,
+                                       float* __restrict__ scale, int rows, int cols, int block,
+                                       int round_scale) {
+    __shared__ uint8_t s_code[256];   // one e2m1 nibble per element of the block
+    __shared__ float samax;
+    const int nb = cols / block;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;  // one thread-block per (row, block)
+    if (idx >= rows * nb) return;
+    const int r = idx / nb, b = idx % nb;
+    const float* src = x + (size_t)r * cols + (size_t)b * block;
+    // amax over the block (quant_kernel<1>'s reduction, verbatim)
+    float amax = 0.f;
+    for (int i = threadIdx.y; i < block; i += blockDim.y) amax = fmaxf(amax, fabsf(src[i]));
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+    if (threadIdx.y == 0 && (threadIdx.x & 31) == 0) samax = amax;
+    __syncthreads();
+    amax = samax;
+    // kept in quant_kernel's exact shape (`maxv` + `1.0f / maxv`): under
+    // --use_fast_math a literal fold and a folded variable COULD round the
+    // reciprocal differently, and a 1-ULP difference in max_inv can flip the
+    // exponent fast_round_scale picks at a power-of-two boundary.
+    const float maxv = 6.0f;
+    const float sc = round_scale ? fmaxf(fast_round_scale(amax, 1.0f / maxv), 1e-30f)
+                                 : fmaxf(amax / maxv, 1e-30f);
+    if (threadIdx.x == 0 && threadIdx.y == 0) scale[idx] = sc;
+    const float inv = 1.0f / sc;
+    for (int i = threadIdx.y; i < block; i += blockDim.y) {
+        const float v = fminf(fmaxf(src[i] * inv, -6.0f), 6.0f);
+        // nearest code in the e2m1 table (magnitudes are the low 8 codes)
+        uint8_t best = 0;
+        float bd = 1e30f;
+        const float a = fabsf(v);
+        const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+        #pragma unroll
+        for (int c = 0; c < 8; c++) {
+            const float d = fabsf(a - mags[c]);
+            if (d < bd) { bd = d; best = (uint8_t)c; }
+        }
+        best |= (v < 0.f) ? 0x8u : 0u;
+        s_code[i] = best;
+    }
+    __syncthreads();
+    // pack straight into the caller's buffer (low nibble = even element)
+    uint8_t* dst = y + (((size_t)r * cols + (size_t)b * block) >> 1);
+    for (int t = threadIdx.y; t < (block >> 1); t += blockDim.y)
+        dst[t] = (uint8_t)((s_code[2 * t] & 0x0Fu) | (uint8_t)(s_code[2 * t + 1] << 4));
+}
+
 // ------------------------------------------------------- dense fp8 MMA GEMM
 
 // out[m, n] = a[m, k] . w[n, k]^T, fp8 e4m3 both sides.
@@ -1877,14 +1951,36 @@ extern "C" int dsv41_quant_fp8(const float* x, uint8_t* y, float* scale, int row
     return (int)cudaGetLastError();
 }
 
-// Per-device fp4 quantise scratch (see the comment in dsv41_quant_fp4).
+// Per-device fp4 quantise scratch (see the comment in dsv41_quant_fp4). Only the
+// legacy two-launch path uses it; the fused default never touches it.
 static uint8_t* g_q4nib[64] = {nullptr};
 static size_t   g_q4nib_cap[64] = {0};
 
+// Fused quantise+pack (see quant_fp4_fused_kernel) is the default: it turns the
+// two launches into one and drops the rows*cols-byte scratch round trip. Set
+// DSV41_QUANT_FP4_FUSE=0 for the legacy quant_kernel<1> + fp4_pack_kernel pair —
+// same bytes, two launches, kept for bisection / old-shape fallback. Read once:
+// this runs 40x/step and a per-call getenv on the hot path is the slip every
+// other gate in this file avoids.
+static const int g_q4_fuse = [] {
+    const char* e = getenv("DSV41_QUANT_FP4_FUSE");
+    return e != nullptr ? atoi(e) : 1;
+}();
+
 extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int rows, int cols,
                                int block, int round_scale, cudaStream_t s) {
-    if (rows <= 0 || cols % block != 0) return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || block <= 0 || cols % block != 0) return (int)cudaErrorInvalidValue;
     const int nb = cols / block;
+    const size_t n = (size_t)rows * cols;
+    // Fused path: legal whenever a nibble pair cannot straddle a block boundary
+    // (even block) and the block fits quant_fp4_fused_kernel's staging array
+    // (<= 256). The production shape -- rows=1, cols=5120, block=32 -- is both.
+    if (g_q4_fuse != 0 && (block & 1) == 0 && block <= 256 && (n & 1) == 0) {
+        quant_fp4_fused_kernel<<<dim3(rows * nb), dim3(1, block), 0, s>>>(
+            x, y, scale, rows, cols, block, round_scale);
+        return (int)cudaGetLastError();
+    }
+    // Legacy path (DSV41_QUANT_FP4_FUSE=0, or a shape the fused kernel declines).
     // Cached per-device scratch: a TP8 process has one context per rank thread,
     // so the cache is indexed by device. Growing it is a synchronising
     // cudaMalloc, which is (a) illegal inside a stream capture and (b) a hot-path
@@ -1893,7 +1989,7 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64) return (int)cudaErrorInvalidDevice;
-    const size_t need = (size_t)rows * cols;
+    const size_t need = n;
     if (g_q4nib_cap[dev] < need) {
         cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
         if (cudaStreamIsCapturing(s, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone)
@@ -1909,7 +2005,6 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
     uint8_t* nib = g_q4nib[dev];
     dim3 blk(1, (block < 256 ? block : 256));
     quant_kernel<1><<<dim3(rows * nb), blk, 0, s>>>(x, nib, scale, rows, cols, block, round_scale);
-    const size_t n = (size_t)rows * cols;
     fp4_pack_kernel<<<(unsigned)((n / 2 + 255) / 256), 256, 0, s>>>(nib, y, n);
     return (int)cudaGetLastError();
 }
@@ -2539,9 +2634,15 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
+        // Round-42 root cause: the 232448 magic failed on this machine and the
+        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
+        // so the Rust side silently fell back while the sticky error propagated
+        // to the next launcher (quant_fp8). Request exactly what this launch
+        // needs and CLEAR the sticky flag on failure so the caller sees a clean
+        // decline-vs-error split (decline is now 2, never 1).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
@@ -2580,9 +2681,9 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
                                            int rope_step, int rope_inverse, int rope_rd,
                                            int rope_hd, cudaStream_t s) {
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
-    if (no_gemv || qr_raw == nullptr || qr_w == nullptr) return 1;
-    if (n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
-    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 1;
+    if (no_gemv || qr_raw == nullptr || qr_w == nullptr) return 2;
+    if (n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
+    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 2;
     if ((n & 31) || rope_rd <= 0 || (rope_rd & 1) || rope_hd <= 0 || (rope_hd & 31) ||
         rope_rd > rope_hd)
         return 1;
@@ -2596,9 +2697,15 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
     // mode 4 only: `warps` weight rows + the block-wide activation row.
     const size_t gsmem = (size_t)(warps + 1) * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
+        // Round-42 root cause: the 232448 magic failed on this machine and the
+        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
+        // so the Rust side silently fell back while the sticky error propagated
+        // to the next launcher (quant_fp8). Request exactly what this launch
+        // needs and CLEAR the sticky flag on failure so the caller sees a clean
+        // decline-vs-error split (decline is now 2, never 1).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // `a`/`a_scale` are null: the prologue produces the activation and the
     // kernel never dereferences them on this path (the `qr_raw` guard skips both
@@ -2644,9 +2751,15 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
+        // Round-42 root cause: the 232448 magic failed on this machine and the
+        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
+        // so the Rust side silently fell back while the sticky error propagated
+        // to the next launcher (quant_fp8). Request exactly what this launch
+        // needs and CLEAR the sticky flag on failure so the caller sees a clean
+        // decline-vs-error split (decline is now 2, never 1).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
@@ -2682,9 +2795,15 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
+        // Round-42 root cause: the 232448 magic failed on this machine and the
+        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
+        // so the Rust side silently fell back while the sticky error propagated
+        // to the next launcher (quant_fp8). Request exactly what this launch
+        // needs and CLEAR the sticky flag on failure so the caller sees a clean
+        // decline-vs-error split (decline is now 2, never 1).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode,
@@ -2719,7 +2838,7 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
                                      const uint8_t* w_scale, const float* bias, float* out,
                                      int n, int k, cudaStream_t s) {
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
-    if (no_gemv || a_f32 == nullptr || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    if (no_gemv || a_f32 == nullptr || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
     // The s_af materialisation (where the f32 lands) is the vec>=3 branch only.
     if (g_gemv_fp8_mode < 3) return 1;
     const int warps = g_gemv_warps;
@@ -2738,9 +2857,15 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     const size_t gsmem = (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                 : (size_t)warps * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
+        // Round-42 root cause: the 232448 magic failed on this machine and the
+        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
+        // so the Rust side silently fell back while the sticky error propagated
+        // to the next launcher (quant_fp8). Request exactly what this launch
+        // needs and CLEAR the sticky flag on failure so the caller sees a clean
+        // decline-vs-error split (decline is now 2, never 1).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         nullptr, nullptr, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
@@ -2921,9 +3046,15 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;
     if (gsmem > 48 * 1024) {
+        // Round-42 root cause: the 232448 magic failed on this machine and the
+        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
+        // so the Rust side silently fell back while the sticky error propagated
+        // to the next launcher (quant_fp8). Request exactly what this launch
+        // needs and CLEAR the sticky flag on failure so the caller sees a clean
+        // decline-vs-error split (decline is now 2, never 1).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
