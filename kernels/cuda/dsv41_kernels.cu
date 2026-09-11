@@ -2947,7 +2947,11 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
             for (int i = 0; i < hc; ++i)
                 acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
             o_r[c] = acc;
-            s2 += acc * acc;
+            // __fmaf_rn, not `s2 += acc * acc`: with the 4x unroll the four s2
+            // chains become independent and --use_fast_math may reassociate them
+            // (the baseline's single chain could not be), which moves the
+            // rmsnorm denominator and therefore every output of the layer.
+            s2 = __fmaf_rn(acc, acc, s2);
         }
         // the same reduction tree rmsnorm_kernel uses
         for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);
