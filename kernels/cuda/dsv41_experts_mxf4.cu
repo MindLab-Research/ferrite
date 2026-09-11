@@ -693,8 +693,8 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
 // order in which a lane visits its elements changes.
 static const int g_expert_fp4_mode = [] {
     const char* e = getenv("DSV41_EXPERT_FP4_MODE");
-    if (e == nullptr) return 0;       // 0 scalar, 1 vectorised, 2 shared lut + split accumulators
-    return atoi(e);
+    if (e == nullptr) return 2;       // 2 = shared lut + split accumulators: -5.38 ms, text identical
+    return atoi(e);                   // 0 scalar, 1 vectorised (both kept for bisection)
 }();
 
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
