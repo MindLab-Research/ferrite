@@ -47,7 +47,7 @@ prof() { # $1 = max_tokens, $2 = output tag
     env CUDA_VISIBLE_DEVICES="$GPUS" DSV41_MODEL_DIR="$MODEL_DIR" DSV41_KERNELS="$KERNELS" \
     DSV41_AR_V5=0 DSV41_GRAPH_STEP=0 \
     "$BIN" --prompt "$PROMPT" --max-tokens "$1" --tp 8 >"$OUT/$2.log" 2>&1 || true
-  grep -E "DECODE|\[dsv41\] decode" "$OUT/$2.log" | tail -3 || true
+  grep -E "DECODE|\[dsv41\] step" "$OUT/$2.log" | tail -3 || true
   # CSV, never the table (kernel names contain spaces)
   "$NSYS" stats --report cuda_gpu_kern_sum --format csv "$OUT/$2.nsys-rep" 2>/dev/null \
     | tail -n +2 >"$OUT/$2.csv"

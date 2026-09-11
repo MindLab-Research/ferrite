@@ -809,53 +809,44 @@ fn pool_rank_body(
     })?;
 
     // ---- the lockstep command loop ----
-    // Decode timing in the GLM house style (`[megab] replay ...`): printed from the
-    // RANK thread, so it is pure decode wall time with no HTTP/SSE/driver overhead.
-    // One line per DECODE_REPORT steps, plus the request's tail at the next prefill.
+    // Decode timing, the GLM house style (ferrite-exec/tp.rs's `[megab] replay`
+    // print): the wall of ONE full step, printed EVERY step, never averaged over
+    // a segment. The accumulator this replaces carried two bugs that a segment
+    // average hid for a whole session:
+    //   1. the timer started AFTER the first DecodeRun batch completed while that
+    //      batch's steps were still counted, so with LOOKAHEAD=16 the first
+    //      report of every request divided 16 steps' wall by 32 - exactly half
+    //      the true per-step time;
+    //   2. the tail segment ended when the NEXT request's prefill arrived, so
+    //      curl/HTTP/admission latency was spread over the tail steps.
+    // Together they made a uniform ~37 ms/step read as "18 ms early, 38 ms late"
+    // and got misexplained as a context-length effect. DSV41_TIMING=0 silences
+    // the per-step lines.
     let timing = std::env::var("DSV41_TIMING").map(|v| v != "0").unwrap_or(true);
-    let mut dec_t0: Option<std::time::Instant> = None;
-    let mut dec_steps: usize = 0;
-    const DECODE_REPORT: usize = 32;
+    let step_time = |pos: usize, dt: std::time::Duration| {
+        if timing && rank == 0 {
+            eprintln!(
+                "[dsv41] step pos={}: {:.2}ms ({:.1} tok/s)",
+                pos,
+                dt.as_secs_f32() * 1e3,
+                1.0 / dt.as_secs_f64().max(1e-9)
+            );
+        }
+    };
     let rx = rxs[rank].lock().unwrap();
     loop {
         match rx.recv() {
             Ok(RankCmd::Prefill(ids)) => {
-                if timing && rank == 0 && dec_steps > 0 {
-                    if let Some(t0) = dec_t0 {
-                        let dt = t0.elapsed().as_secs_f64();
-                        eprintln!(
-                            "[dsv41] decode: {} steps in {:.2}s = {:.1} steps/s ({:.2} ms/step)",
-                            dec_steps,
-                            dt,
-                            dec_steps as f64 / dt,
-                            dt * 1e3 / dec_steps as f64
-                        );
-                    }
-                }
-                dec_t0 = None;
-                dec_steps = 0;
                 let r = prefill_chain(&mut chain, &ids).map(|t| vec![t]);
                 if res_tx.send((rank, r)).is_err() {
                     return Ok(()); // the pool is gone
                 }
             }
             Ok(RankCmd::Decode { token, pos }) => {
+                let st = std::time::Instant::now();
                 let r = chain.step_dev(token, pos).map(|t| vec![t]);
-                if rank == 0 && r.is_ok() {
-                    dec_t0.get_or_insert_with(std::time::Instant::now);
-                    dec_steps += 1;
-                    if timing && dec_steps % DECODE_REPORT == 0 {
-                        if let Some(t0) = dec_t0 {
-                            let dt = t0.elapsed().as_secs_f64();
-                            eprintln!(
-                                "[dsv41] decode: {} steps in {:.2}s = {:.1} steps/s ({:.2} ms/step)",
-                                dec_steps,
-                                dt,
-                                dec_steps as f64 / dt,
-                                dt * 1e3 / dec_steps as f64
-                            );
-                        }
-                    }
+                if r.is_ok() {
+                    step_time(pos, st.elapsed());
                 }
                 if res_tx.send((rank, r)).is_err() {
                     return Ok(());
@@ -868,8 +859,10 @@ fn pool_rank_body(
                 let mut t = token;
                 let mut r = Ok(());
                 for i in 0..n {
+                    let st = std::time::Instant::now();
                     match chain.step_dev(t, pos + i) {
                         Ok(next) => {
+                            step_time(pos + i, st.elapsed());
                             out.push(next);
                             t = next;
                             if stop_set.contains(&next) {
@@ -880,24 +873,6 @@ fn pool_rank_body(
                             r = Err(e);
                             break;
                         }
-                    }
-                }
-                if rank == 0 && r.is_ok() {
-                    dec_t0.get_or_insert_with(std::time::Instant::now);
-                    dec_steps += out.len();
-                    if timing && dec_steps >= DECODE_REPORT {
-                        if let Some(t0) = dec_t0 {
-                            let dt = t0.elapsed().as_secs_f64();
-                            eprintln!(
-                                "[dsv41] decode: {} steps in {:.2}s = {:.1} steps/s ({:.2} ms/step)",
-                                dec_steps,
-                                dt,
-                                dec_steps as f64 / dt,
-                                dt * 1e3 / dec_steps as f64
-                            );
-                        }
-                        dec_t0 = Some(std::time::Instant::now());
-                        dec_steps = 0;
                     }
                 }
                 if res_tx.send((rank, r.map(|_| out))).is_err() {
