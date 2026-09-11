@@ -566,6 +566,7 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
+            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -573,6 +574,7 @@ struct Kernels {
             c_int,
             c_int,
             c_int,
+            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -580,7 +582,7 @@ struct Kernels {
     /// producer kernel's epilogue (`dsv41_gemm_fp8_mx`'s staging args), so this
     /// entry skips `p2p_ar_store_v5_kernel` and only polls/reduces. Same shapes as
     /// `ferrite_p2p_ar_v5` minus `partial` and `staging_tbl` (the caller is not
-    /// storing from here).
+    /// storing from here). It ALWAYS stamps: the fused producer store never does.
     p2p_ar_pubred_v5: Option<
         unsafe extern "C" fn(
             *const *mut u32,
@@ -606,6 +608,7 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
+            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -618,6 +621,7 @@ struct Kernels {
             *const f32,
             c_int,
             c_int,
+            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -632,6 +636,7 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
+            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -639,6 +644,7 @@ struct Kernels {
             c_int,
             c_int,
             c_int,
+            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -651,6 +657,7 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
+            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -663,6 +670,7 @@ struct Kernels {
             *const f32,
             c_int,
             c_int,
+            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -2679,6 +2687,7 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
+        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2686,11 +2695,12 @@ impl Device {
         world: c_int,
         my_rank: c_int,
         stride: c_int,
+        stamp_in_store: c_int,
     ) -> Result<()> {
         let f = self.need(self.kernels.p2p_ar_v5, "ferrite_p2p_ar_v5")?;
         let rc = unsafe {
-            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n, world,
-              my_rank, stride, self.stream)
+            f(partial, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out, n,
+              world, my_rank, stride, stamp_in_store, self.stream)
         };
         self.kerr(rc, "ferrite_p2p_ar_v5")
     }
@@ -2737,6 +2747,7 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
+        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2749,14 +2760,16 @@ impl Device {
         hc_comb: *const f32,
         hc_n: c_int,
         hc_h: c_int,
+        stamp_in_store: c_int,
     ) -> Result<bool> {
         let f = match self.kernels.p2p_ar_v5_hcpost {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n, world,
-              my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, self.stream)
+            f(partial, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out, n,
+              world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, stamp_in_store,
+              self.stream)
         };
         // 1 == the launcher declined the shape (see `ferrite_p2p_ar_v5_hcpost`);
         // the caller then runs the unfused pair as before.
@@ -2780,6 +2793,7 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
+        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2787,14 +2801,15 @@ impl Device {
         world: c_int,
         my_rank: c_int,
         stride: c_int,
+        stamp_in_store: c_int,
     ) -> Result<bool> {
         let f = match self.kernels.p2p_ar_v5_add {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(partial, bias, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
-              world, my_rank, stride, self.stream)
+            f(partial, bias, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out,
+              n, world, my_rank, stride, stamp_in_store, self.stream)
         };
         if rc == 1 {
             return Ok(false);
@@ -2814,6 +2829,7 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
+        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2826,14 +2842,16 @@ impl Device {
         hc_comb: *const f32,
         hc_n: c_int,
         hc_h: c_int,
+        stamp_in_store: c_int,
     ) -> Result<bool> {
         let f = match self.kernels.p2p_ar_v5_hcpost_add {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(partial, bias, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
-              world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, self.stream)
+            f(partial, bias, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out,
+              n, world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, stamp_in_store,
+              self.stream)
         };
         if rc == 1 {
             return Ok(false);

@@ -7312,3 +7312,18 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **唯一现存未启用的 fold**：`DSV41_AR_STORE_FUSE`（默认 OFF，round 19 因数值耦合关闭）——ar-stamp-fold subagent 正在分析其修复可行性。
 
 **结论**：epilogue folding 路径贡献 0 新 ms。剩余路径 = expert cpasync(−0.48) + w2 warm(−0.25) + ar stamp fold(−0.1~0.25) + gemv_bf16(−0.09)。
+
+### v10 验证回归分析：三项组合 +0.08ms（2026-09-12 07:00）
+
+| 臂 | p50 | tok/s | vs 基线 6.23 |
+|---|---|---|---|
+| v10（PDEPTH=5 + w2warm + bf16cpasync） | 6.31ms | 158.5 | **+0.08 回归** |
+
+四段全对，faults=0。**operand-supply 理论在 serve 中未兑现**（第三次隔离→生产失效：a32-vec4 → AR grid → PDEPTH pipeline）。
+
+**可能的回归源**：
+1. **PDEPTH=5 的 smem 42.8KB** → blocks/SM 4→2（占用率损失抵消流水线收益）
+2. **w2-prewarm 的 warmer kernel** 与 gateup 尾部争 SM（PDL 重叠窗口）
+3. **bf16-cpasync 的无条件 commit** 添加固定开销
+
+**bisect 进行中**：v10np1（pipeline OFF）/ v10np2（浅 pipeline）/ v10nw（warm OFF）

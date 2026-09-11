@@ -263,10 +263,12 @@ extern "C" {
                          staging_tbl: *const *mut f32,
                          ready_tbl: *const *mut u32,
                          epoch: *mut u32,
+                         arrive: *mut u32,
                          staging_local: *const f32,
                          ready_local: *const u32,
                          out: *mut f32, n: i32, world: i32, my_rank: i32,
                          stride: i32,
+                         stamp_in_store: i32,
                          s: CuStream) -> i32;
     fn ferrite_graph_begin(s: CuStream) -> i32;
     fn ferrite_graph_end(s: CuStream, g: *mut *mut std::ffi::c_void) -> i32;
@@ -6546,6 +6548,10 @@ impl CudaBackend {
                     st.staging_tbl as *const *mut f32,
                     st.ready_tbl as *const *mut u32,
                     st.epoch as *mut u32,
+                    // STAMP FOLD is DSV41-only for now (DSV41_AR_STAMP_FOLD):
+                    // the shared GLM path keeps the pre-fold protocol, so it
+                    // passes no arrival state and lets pubred stamp.
+                    std::ptr::null_mut(),
                     st.staging_local as *const f32,
                     st.ready_local as *const u32,
                     buf.as_f32(),
@@ -6553,6 +6559,7 @@ impl CudaBackend {
                     st.world as i32,
                     self.dev as i32,
                     st.max_n as i32,
+                    0,
                     self.stream,
                 )
             }, "p2p_ar_v5")?;
