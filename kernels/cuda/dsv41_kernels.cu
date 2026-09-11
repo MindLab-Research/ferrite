@@ -1715,30 +1715,26 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_wait_all();
             __syncwarp();
             float acc = 0.f;
-            // 1-deep prefetch pipeline: 4 loads in flight (2 current + 2 next),
-            // arithmetic uses the EXACT baseline expression form (single
-            // acc += A * sa * (B * sb) per iteration). This is the minimal
-            // change from the baseline — if this works, extend to 2/4-deep.
+            // SPLIT DIAGNOSTIC: prefetch ONLY ap (activation), read row_s
+            // at the point of use. If this is correct, the issue is with
+            // prefetching row_s (cp.async shared memory). If it degenerates,
+            // the issue is with prefetching ap (or with any prefetching).
             {
                 uint8_t av_cur = ap[0 * 32 + lane];
-                uint8_t rv_cur = row_s[0 * 32 + lane];
                 int kb = 0;
                 for (; kb + 1 < nb_k; ++kb) {
-                    // Prefetch next iteration (loads in flight while computing)
                     uint8_t av_next = ap[(kb + 1) * 32 + lane];
-                    uint8_t rv_next = row_s[(kb + 1) * 32 + lane];
-                    // Compute current — EXACT baseline form, no intrinsics
                     float sb = ue8m0_to_f(wsr[kb]);
                     float sa = a_scale[kb];
-                    acc += e4m3_to_f(av_cur) * sa * (e4m3_to_f(rv_cur) * sb);
+                    acc += e4m3_to_f(av_cur) * sa *
+                           (e4m3_to_f(row_s[kb * 32 + lane]) * sb);
                     av_cur = av_next;
-                    rv_cur = rv_next;
                 }
-                // Last iteration (no prefetch needed)
                 if (kb < nb_k) {
                     float sb = ue8m0_to_f(wsr[kb]);
                     float sa = a_scale[kb];
-                    acc += e4m3_to_f(av_cur) * sa * (e4m3_to_f(rv_cur) * sb);
+                    acc += e4m3_to_f(av_cur) * sa *
+                           (e4m3_to_f(row_s[kb * 32 + lane]) * sb);
                 }
             }
             __syncwarp();
