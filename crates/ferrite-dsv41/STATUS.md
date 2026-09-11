@@ -7432,3 +7432,27 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 ### 200 tok/s 的判定
 当前 6.23ms 距 5.0ms 差 1.23ms。全部已识别路径（含在飞）兑现后 ~6.05ms。
 剩余 1.05ms 需要突破 LUT gather 地板 = 研究级（无 smem 的 fp4/fp8 解码或完全不同的 GEMV 设计）。
+
+### v13 回归根因定案：fold 代码存在性 + 寄存器假设证伪（2026-09-12 09:30）
+
+**bisect 结果**：
+| 臂 | p50 | 判定 |
+|---|---|---|
+| v13（fold 代码全 OFF + compress-fuse ON） | 6.63ms | +0.40 回归 |
+| v13nc（COMPRESS_FUSE=0） | 6.62ms | compress-fuse 不是源 |
+| v13nq（全 gate 显式 OFF） | 6.60ms | gate 无关——**代码存在性是源** |
+
+**寄存器假设证伪**（register-regression-check）：
+1. hc_mixes_tail 在 decode 只有 1 个 block（rows=1，grid=1×1024）——占用率不是变量
+2. 远程 nvcc -Xptxas -v：pre-fold 和当前都 **40 registers**（无膨胀）
+3. 1024 线程 + 64K regs：阈值只有 32/64 两档——fold 若推过 64 会 701 硬失败而非慢
+4. mags[8] 是 const + unroll——编译器折成立即数不占寄存器
+
+**真机制（部分）**：fork_ev 是 kernel 级——加进 EARLY 的工作在关键路径。但 fold OFF 时 fp4 块不执行——只能解释 fold ON 的 +0.14ms（35%），OFF 时的 +0.33ms 仍未归因。
+
+**处置决策：直接清理 fold 代码**（三项 fold 全部证明失败，无保留价值）：
+1. AR 侧（ferrite_kernels.cu）：恢复 store/pubred 的 pre-fold 签名——ar-fold-cleanup 进行中
+2. hc_mixes_tail 侧（dsv41_kernels.cu）：等 sparse-merge 完成后清理 xq4/xsc4
+3. Rust FFI 同步（tp.rs/device.rs）
+
+**未归因的 0.33ms 教训**：即使是 gated-off 的死代码，kernel 签名变化和指令布局也可能影响性能（I-cache、参数传递、代码布局）。失败实验的代码应该在验证失败后立即清理，而不是留在树里。
