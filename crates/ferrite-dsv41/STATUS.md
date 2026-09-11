@@ -6970,3 +6970,35 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 `cargo check -p ferrite-models` ✅ 通过（无 Rust 侧改动，ABI 未变）。上机先跑隔离 harness
 `tests_dsv41_sparse_pfsplit.cu`（已更新头注释：不设 env 现在是 C=4，不是 pf），再 serve A/B：
 `DSV41_SPARSE_SPLIT=0`（旧 pf+orope 融合）vs 默认（split C=4 + merge 融合），四段文本 + 逐位/RMS 对照。
+
+### 200 tok/s 冲刺路线图（2026-09-12 02:00，6.66ms 基线）
+
+**当前**：6.66ms / 150.2 tok/s（cp.async + warps8 + EARLY 侧流 + K-split + 全部前序优化）
+**目标**：5.0ms / 200 tok/s
+**Gap**：1.66ms
+
+**已提交待验证**（远端 8f7046ae 正在跑）：
+| 项 | 预期 | 机制 |
+|---|---|---|
+| wo-pair 两段核 | −0.13ms | wo_a+wo_b 合并（grid-sync barrier） |
+| sparse key-split C=4 | −0.20ms | 8→32 blocks（5%→22% SM 占用）+ merge epilogue |
+| warps-big-gate | （扫描用） | DSV41_GEMV_WARPS_BIG=4/6/8/16 |
+
+**实施中**（subagent）：
+| 项 | 预期 | 机制 |
+|---|---|---|
+| dots+LATE 合并 | −0.12ms | dots 的最后 block 做 LATE（选举模式） |
+| down 回归修复 | −0.24ms | 17.2→23.8µs 的 +38% 回归回收 |
+| 链式对 wq_a→wq_b | −0.13ms | grid-sync 两段核 |
+| 链式对 w1w3→w2 | −0.26ms | swiglu 在 phase1 epilogue |
+
+**总计潜在**：−1.08ms → **5.58ms ≈ 179 tok/s**
+
+**还差 0.58ms** 的来源（按可行性）：
+1. warps sweep 的最优值（−0.1~0.2ms，gate 已就绪）
+2. hc_mixes_tail 的 sinkhorn 轮数减少（20→10 轮？）
+3. expert gateup 的 prologue 优化（cp.async 同款）
+4. AR store 的 160KB 远程写优化
+5. PDL 重评（当前 OFF 但 cp.async 后可能有收益）
+
+**如果全部落地**：5.0-5.3ms ≈ 189-200 tok/s（边缘但可能达标）
