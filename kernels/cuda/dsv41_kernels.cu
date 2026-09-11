@@ -1586,6 +1586,12 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
+// cp.async helpers are defined further down (hc_mix_dots uses them); declare
+// them here so the fp8 gemv can stage its weight row asynchronously too.
+__device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
+__device__ __forceinline__ void dsv41_cp_commit();
+__device__ __forceinline__ void dsv41_cp_wait_all();
+
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const float* __restrict__ a_scale,
                                      const uint8_t* __restrict__ w,
@@ -1678,11 +1684,15 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // of garbage. Count sixteen-byte units, and cover a k that is not a
             // multiple of sixteen with a byte tail.
             const int n16 = k >> 4;
-            for (int i = lane; i < n16; i += 32) {
-                *reinterpret_cast<uint4*>(row_s + (i << 4)) =
-                    *reinterpret_cast<const uint4*>(wr + (i << 4));
-            }
+            // Stage the weight row with cp.async: the bytes travel global ->
+            // shared directly, so the ten in-flight sixteen-byte loads stop
+            // tying up ten uint4 register pairs per lane while they wait, and
+            // the row is consumed exactly as before.
             for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+            for (int i = lane; i < n16; i += 32)
+                dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
             __syncwarp();
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
