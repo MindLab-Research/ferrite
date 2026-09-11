@@ -16,8 +16,9 @@
 ## gemm_fp8_gemv 微基准（2026-09-11 最后一轮，隔离探针 /tmp/gp6/gprobe6..10.cu）
 
 > 底座复刻 = `kernels/cuda/dsv41_kernels.cu` 的 `gemm_fp8_gemv_kernel`（mode 4 / warps=4 / LUT /
-> a32 / unroll 4）。**行号会随文件增长漂移**，2026-09-11 复核：kernel 体在 `:2958` 起、a32 物化在
-> `:3188-3219`、launcher 的 smem 公式在 `:3483-3491`。探针 smem 48384B 是**P1 之前、B1 row slot
+> a32 / unroll 4）。**行号会随文件增长漂移**，2026-09-11 晚间复核：`gemm_fp8_gemv_kernel` 定义在
+> `:3004`、块级 prologue 在 `:3127-3268`（a32 融合物化 `:3243-3261`）、row 循环 `:3272-3413`（含
+> 权重行 cp.async `:3316-3332`）、launcher 的 smem 公式在 `:3533-3541`。探针 smem 48384B 是**P1 之前、B1 row slot
 > 之前**的旧形状；同形状今天 = **43392B**（P1 去掉 k-byte `s_a`，B1 加 128B）。所有数字为
 > 171-call CUDA graph、k=5120、warps=4、3 次独立 graph 构建的 µs/call（重复性 ±0.01µs）。
 >

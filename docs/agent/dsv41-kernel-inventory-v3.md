@@ -549,6 +549,28 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    去掉 `(vec == 4) ? (warps + 1) * k` 的额外行 ⇒ 默认形状（k=5120/warps=4/mode 4）gsmem
    **47104 → 41984 B**。签名/门不变，无 Rust 改动。⚠️ 该核**没有** a32=0 回退臂，因此一旦
    回归只能 revert（不同于单族 `gemm_fp8_gemv_kernel` 有 `DSV41_GEMV_A32=0` 对照臂）。
+0.5 **P2 自适应 warps（2026-09-11 已落地代码，待实测）——每 block 行数按 n 选择**：
+   每调用的固定成本是**块级 prologue**（激活 uint4 staging + LUT 构建 + a32 物化），每 block 付一次、
+   近似与 n 无关（perf-roadmap 2026-09-11：2.85µs/call 跨 416 blocks，n 涨 6.5× 只涨 ~5%）。
+   P1 后 mode 4 / k=5120 / warps=4 的 gsmem = 43392B ⇒ 232448/43392 = 5.35 → **5 blocks/SM**
+   （~30% 余量）。大 shape 可以让每 block 处理 **8 行**：gsmem = 8×5120 + 23552 = **64512B**
+   ⇒ 232448/64512 = 3.6 → 3 blocks/SM，但 block 数**减半**，固定 prologue 摊到 2 倍行数上。
+   延迟敏感的**小 shape**（`wq_a+wkv` 合并 n=1280+512=1792、`sh_w13` n=640）反之需要更多 block
+   （更多在飞 warp）⇒ 用 n 分档。
+   - **实现**：`dsv41_kernels.cu` 新增 `g_gemv_warps_adaptive`（env **`DSV41_GEMV_WARPS_ADAPTIVE`**，
+     默认 ON，`=0` 回退固定 `DSV41_GEMV_FP8_WARPS`）+ 常量 `kGemvWarpsBigN=2048` /
+     `kGemvWarpsBig=8` + 内联 `dsv41_gemv_warps_for(n)`。**只改 launcher 的 warps 选择，kernel
+     不变**（`gemm_fp8_gemv_kernel` 早已按 `blockDim` 参数化）。
+   - **覆盖面 = 4 个原本选 `g_gemv_warps` 的 launcher**：`dsv41_gemm_fp8_mx` /
+     `_mx_add` / `_mx_f32` / `_mx2`（mx2 用 **n1+n2 总行数**，两族共享同一 block grid）。
+     B1（`xq != nullptr`）仍在其后**强制 32**，不受影响。
+   - **rope 族不动**（`mx_rope` / `mx_rope_norm` / `mx2_rope` 保持 nwarps=32）：rope epilogue
+     的 pair 交换依赖 `e = blockIdx.x*nwarps + warp` 且 `grid*nwarps == n`；`mx_rope_norm`
+     的 NORM_FUSE prologue 归约树还必须跑在参照的 1024 线程上才逐位等价。
+     ⇒ **wq_b 在默认 NORM_FUSE 路径下仍走 32**；只有它的非融合 fallback 走 `dsv41_gemm_fp8_mx`
+     时才吃到 8 行/block。**wo_b（f32, n=5120）/ w2（add, n=5120）/ 其余 n≥2048 的 `lin`** 均已覆盖。
+   - ⚠️ 待实测：`DSV41_GEMV_WARPS_ADAPTIVE=0` vs `=1` 的同窗口 A/B（文本 + nsys 的
+     `gemm_fp8_gemv` 每步 ms）。无 Rust 改动，`cargo check -p ferrite-models` 通过。
 1. **`down_reduce` +0.31ms 的定案**：隔离微基准（同一 kernel，HEAD vs `01291b2^`），或 revert 后重采 profile。**这是唯一挡住 0.31ms 回收的事。**
 2. **AR v5 的隔离绝对值**：0.66（v2 约定，被 §3 反证支持）vs 1.49（`86af349`，host-barrier 口径）。需要 device-side v5 的隔离测量。
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。

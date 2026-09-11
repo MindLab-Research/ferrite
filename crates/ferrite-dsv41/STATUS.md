@@ -6811,6 +6811,12 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 3. **hc tail C**：HC_TAIL_PRIO Greatest→Default（LATE 是 1-block 核，greatest 反而抢 SM）
 4. **expert launch_bounds**：gateup `(1024)` + down `(256,4)` 固化寄存器（防 01291b2 型悬崖）
 5. **gemv_bf16_fp8x2 的 a32 死槽**：gemv-bf16-fp8x2-dead 实施中
+6. **gemm P2 自适应 warps（本轮新增，2026-09-12）**：`dsv41_kernels.cu` 的 4 个 `g_gemv_warps`
+   launcher（`mx` / `mx_add` / `mx_f32` / `mx2`）改为 `dsv41_gemv_warps_for(n)`：**n ≥ 2048 → 8 行/block**
+   （block 数减半、块级 prologue 摊薄；gsmem 64512B → 3 blocks/SM），小 n 保持 4。
+   门 **`DSV41_GEMV_WARPS_ADAPTIVE`（默认 ON，=0 回退固定 4）**。rope 族（32 warps）不动：
+   rope pair 交换与 NORM_FUSE 的 1024 线程逐位归约都依赖它。覆盖 wo_b(5120)/w2(5120)/所有
+   n≥2048 的 lin；wq_b 仅在非 NORM_FUSE fallback 吃到。无 Rust 改动。预期 −0.1~0.3ms。
 
 **全部落地预期**：6.57 − 0.3~0.5 = ~6.07~6.27ms ≈ **160-165 tok/s**
 **距离 200（5.0ms）**：还需 ~1.07ms
@@ -6842,3 +6848,15 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 - expert launch_bounds
 
 **距离 200 tok/s（5.0ms）还差 1.84ms**——gemm 3.02ms 仍是最大项。
+
+### P1 A/B 定案（2026-09-12 00:55）
+
+| 臂 | p50 | tok/s | 判定 |
+|---|---|---|---|
+| P1 direct（默认，s_a 死槽消除） | 6.84ms | 146.2 | 基线 |
+| P1 staged（DSV41_GEMV_A32_STAGED=1，s_a 中间缓存） | 6.84ms | 146.2 | **完全中性** |
+
+**P1 的 direct vs staged 零差异**——+0.27ms 的回退（6.57→6.84）来自 B+C 的 EARLY 回主流（+0.14ms）
+和 HC_TAIL_PRIO 降 default 的影响。P1 保持默认 ON（direct，smem 更少 → 更多 blocks/SM 的潜力）。
+
+**当前 HC_TAIL_PRIO greatest A/B 正在跑**——如果 greatest 更快，说明 C 的 PRIO 降 default 是错误。
