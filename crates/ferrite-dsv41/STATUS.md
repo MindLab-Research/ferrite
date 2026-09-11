@@ -3362,3 +3362,20 @@ ssh … 'cd ~/ferrite && cargo build --release'                                 
 ```
 `git reset --hard FETCH_HEAD` 是文档 2b 规定的**同步**流程 ✓（不是 revert ✗）；它不动被
 gitignore 的 `libferrite_kernels.so` 与 `target/` ✓。
+
+### ✅ 合成校验器两处 bug 定性（2026-09-11）—— **内核未被牵连** ✓
+
+首轮"验收 FAILURES"✗ 的两个现象**全部**是校验器自身建模错 ✗：
+
+1. **`NOT deterministic at pick 0`（n≥255 全部）** ✗ —— 校验器两次调用里，第二次**漏了 `+ offset`** ✗：
+   ```c
+   topk(…, dout + offset, …);   // 第 1 次（符合 Rust 调用点契约：传已偏移指针 ✓）
+   topk(…, dout,          …);   // 第 2 次 ✗ 少了偏移 ⇒ picks 落在 dout[0..cols)
+   ```
+   比较却读 `hout2[offset+i]` ✗ ⇒ **pick 0 必然不等** ⇒ 与"非确定性"无关 ✓。
+2. **`picked=512/64`、`n=255 → 257 out of range`** ✗ —— 校验器按**全 512 宽**计数 ✗，而内核只写
+   `want = min(topk, n)` 个有效槽 ✓（尾部未写、保持 memset 零 ✗ ⇒ 零被当 pick 且 `0 < offset` ✗）。
+   `512 − 255 = 257` **精确吻合** ✓；真实消费方按 `[offset, offset+n)` 过滤非法项 ✓ ⇒ 契约一致 ✓。
+
+**⇒ 内核行为无需改动** ✓；**生产侧证据独立成立** ✓（分块内核：四段文本干净全对 · 98 步 · 0 fault ✓）。
+校验器已修（补偏移 + 只核已写区间）+ 重编 + 重跑 ✓。
