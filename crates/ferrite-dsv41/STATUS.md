@@ -2525,3 +2525,32 @@ SPLIT=8~16 ⇒ **64~128 个 block** ✓，每块做 `topk/SPLIT` 个 slot 的 **
 launcher 里看 grid 的计算 → 若 grid 只有个位数/几十个 block 而 SM 有 148 个 ⇒ 立刻怀疑占用率 ✗
 → 用复现器做"参数扫描 + 空 kernel 地板"两件事 ⇒ 若耗时与参数无关 ⇒ 固定开销主导 ⇒ 切分网格 ✓
 ```
+
+## sparse_attn 根因精确化（读代码后）：**每 slot 一次全块两阶段归约 × 512 次迭代**
+
+```c
+const int row = blockIdx.x;                     // b*m = 1  ⇒ blockIdx.x 只有 1
+for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {   // h = 8 ⇒ 总共 8 个 block ✗
+    float acc[512];                             // 每线程 512 float、动态索引 ⇒ local memory ✗
+    for (int t = 0; t < topk; t++) {            // topk = 512 次迭代
+        const int idx = idxs[... ];
+        float dot = 0;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) dot += qr[c] * kr[c];
+        for (off) dot += __shfl_xor_sync(...);   // warp 级
+        __shared__ float sdot; __shared__ float wpart[32];
+        if (lane == 0) wpart[wid] = dot;
+        __syncthreads();                         // ← 每次迭代都有全块屏障 ✗✗
+        ... 跨 warp 归约 ...
+    }
+```
+⇒ **512 次迭代 × 每迭代 ~2 个全块屏障 ≈ 上千个屏障** ✗✗，且只有 **8 个 block**
+（`grid = (b*m, h)` ✓）⇒ 每个屏障的**暴露延迟**最大 ✓ ⇒ **实测 383µs，且与 n 无关** ✓✓
+（这也解释了复现器里 `idxs` 全零、n 从 128 到 2048 耗时不变 ✓ —— 成本在迭代数 × 屏障，不在 gather ✓）。
+
+**修法（从"切 grid"升级为直击要害 ✓）**：**把每个 slot 交给一个 warp** ✓ ⇒ 每个 slot 的
+`q·k` 变成**纯 warp 内 shuffle 归约（零屏障 ✓）**；block 内 4 个 warp 每次处理 4 个 slot ✓，
+**只在每个"批次"边界做一次全块归约**（合并 max/sum 与加权 v 累加 ✓）⇒ 屏障数 **降低 ~100 倍** ✓。
+`acc[512]` 的动态索引数组应改成**每线程负责固定的 d 子集**（静态索引 ⇒ 寄存器 ✓ 不 spill ✓）。
+⚠ 这是数值性改动（归约结合顺序变 ✓）⇒ **必须四段文本复验** ✓；并且**先在复现器上对拍**
+（`/tmp/sa_repro.cu` 需要扩展成能跑两条路径并逐元素比对 ✓）再进模型 ✓。
+**预期**：383µs → 数十 µs ⇒ 占比 9.1% → ~1~2% ⇒ 整体 **+7~8%** ✓。
