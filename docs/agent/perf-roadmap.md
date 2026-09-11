@@ -1558,3 +1558,27 @@ sinkhorn ✓），多出的一次 launch ~1.34 µs/次 × 90 = 60 µs/步 ✓ **
 **结论**：`DSV41_HC_MIXES_SPREAD` 默认关 ✓，代码保留（图修好后可重测 ✓）。
 `hc_mixes` 的真正构成需**逐相位关断**（Σx² / 投影 / sigmoid / cm / sinkhorn / comb）按 nsys 份额拆 ✓，
 不要再靠"改块形状"猜 ✗。
+
+### MoE gemv 族的审计结论（2026-09-11，真基线 36.7ms/step 口径）
+
+**两个 kernel 都已读完，GLM 方法论在此族的状态：**
+
+**expert_gemv_fp4（22.9%）——GLM 房式的招全部用过或试过：**
+- ✅ 已做：激活 staging 进 smem（kernel 注释记载：原来每行重读 512×5120×4B=10.5MB，
+  把 kernel 钉在 38 GB/s；staging 后只剩 0.65MB 权重流）
+- ✅ 已做：down 并入 GEMV（epi_mode==3，row_weight[0] 的越界 bug 已修）· 8 行/block · warp-per-row
+- ❌ **已试且更差（kernel 注释原文，勿重试）**："a k-split (one block per row, 8 warps
+  splitting k -> 512 blocks) gave 15.0 tok/s against this 15.2, and **16-byte uint4 lanes
+  gave 14.3**. The kernel is not occupancy- or request-rate-bound the way those two assumed."
+
+**gemm_fp8_gemv（20.4%）**：同族模式（warp-per-row、1B/lane/iter 的 a+w 载入、e4m3 解码、
+32×32 block scale）；激活未 staging 但 m==1 ⇒ `a` 是 L2 命中，非主要矛盾。
+
+**结构性假设（下一步先测再动，勿直接改 kernel）**：该族每 rank 每步
+**~628（fp4）+ ~289（fp8）≈ 900 次小 kernel 启动**（每个 (layer, topk-expert) 一次 launch；
+kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+收尾地板在 ~10µs 级
+（hc_mixes 展开实验实测：多 2 次 launch = +60µs ⇒ ~30µs/次 ✗ 远高于 GLM 图内的 0.2µs），
+则 900 次 ≈ 9ms/步，与该族 15.9ms 份额同量级 ⇒ **真正的杠杆是批化**
+（每层一次 launch、grid=(expert,row)，`ids` 表间接寻址 kernel 已原生支持 ✅）
+**或修好整步图**（#10，图内启动 ~0.2µs）。
+**行动顺序：先隔离复现器测 per-call 成本 vs 空 kernel 地板 ⇒ 数据决定批化还是修图。**
