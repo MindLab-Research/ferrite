@@ -15,9 +15,15 @@
 
 ## gemm_fp8_gemv 微基准（2026-09-11 最后一轮，隔离探针 /tmp/gp6/gprobe6..10.cu）
 
-> 底座复刻 = `kernels/cuda/dsv41_kernels.cu:1722-1931`（mode 4 / warps=4 / LUT / a32 / unroll 4），
-> smem 48384B，与 launcher 公式 `:1962-1967` 逐字节吻合。所有数字为 171-call CUDA graph、
-> k=5120、warps=4、3 次独立 graph 构建的 µs/call（重复性 ±0.01µs）。
+> 底座复刻 = `kernels/cuda/dsv41_kernels.cu` 的 `gemm_fp8_gemv_kernel`（mode 4 / warps=4 / LUT /
+> a32 / unroll 4）。**行号会随文件增长漂移**，2026-09-11 复核：kernel 体在 `:2958` 起、a32 物化在
+> `:3188-3219`、launcher 的 smem 公式在 `:3483-3491`。探针 smem 48384B 是**P1 之前、B1 row slot
+> 之前**的旧形状；同形状今天 = **43392B**（P1 去掉 k-byte `s_a`，B1 加 128B）。所有数字为
+> 171-call CUDA graph、k=5120、warps=4、3 次独立 graph 构建的 µs/call（重复性 ±0.01µs）。
+>
+> **2026-09-11 复核：本节两个"有效杠杆"（a32 4 元素向量化、ROW_FIRST）在主 kernel 里仍未落地**
+> ——`:3195-3218` 的 a32 物化仍是标量 `s_af[idx] = s_lut[b[j]] * s_as[idx>>5]`（只有 `#pragma unroll`），
+> row cp.async 仍在 block staging 之后。它们是最低风险、位一致的下一步。
 
 **本轮的硬结论：每调用成本不是"LDS 链"，是块级 staging 的冗余。** 用 nop 空 kernel 标定每
 kernel 的 graph 槽位只有 0.52–0.71µs（此前怀疑的 launch 开销被排除），随后逐项分解（n=1664）：
