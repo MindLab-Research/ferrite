@@ -6479,3 +6479,27 @@ mode3+a32off = 22912 B。工具：`scripts/dsv41_a32_bench.sh`（隔离基准，
 1. gemm 246 launches → grouped/persistent GEMM（压到 ~40 次）
 2. hc dots 0.56ms → 融进 attention epilogue
 3. MoE 1.47ms → 权重 FP4 下沉 + gateup/down 单核融合
+
+### 最终审计更新：含 EARLY 并发 + 在飞项（2026-09-11 深夜，explore，纯分析）
+
+**本次新增项**：EARLY 并发（已提交 `e152f47`，−0.14ms，bit-exact，EARLY 在侧流头部、藏在 dots 4.9µs 窗口内）；dots→attention epilogue（分析中，−0.3~0.5）；gateup 累加器（分析中，−0.1~0.2）。
+
+**更新后的三档**（tok/s 沿用本表口径 ≈815/ms，由 4.05ms↔203 反推；200 tok/s ↔ ~4.08ms）：
+
+| 档 | 计算 | ms | tok/s |
+|---|---|---|---|
+| 保守 | 5.90 − 0.14(EARLY) − 0.30(dots低) − 0.10(gateup低) | **5.36** | 152 |
+| 中间 | 4.60 − 0.14 − 0.40(dots中) − 0.15(gateup中) | **3.91** | 208 |
+| 乐观 | 4.05 − 0.14 − 0.50(dots高) − 0.20(gateup高) | **3.21** | 254 |
+
+**投影分解（中间值，更新）**：原表 gemm 1.35(a32已含) · hc 1.40 · MoE 1.47 · gate+route 0.39 · AR 0.37 · sparse 0.26 · quant 0.07 · rmsnorm 0.10 · misc 0.84
+⇒ 更新：hc **0.86**（EARLY −0.14 + dots −0.40）、MoE **1.32**（gateup −0.15）。⚠️ 原表各行相加 = 6.25 ≠ 4.60（既有口径不一致，疑似混入 measured/partial），故本次只给**增量**。
+
+**若 a32 失败（二元项 +0.74）**：保守 6.10 / 中间 4.65 / 乐观 3.95 → 134 / 175 / 206 tok/s。
+
+**剩余机会清单**：
+- **已关闭**：权重串联（FLOPs×2.22，净 +0.5ms）/ MoE 单核（cross-CTA grid.sync 违 hcpm）/ k-split / uint4 / T=4（专家三阴性）/ wo_a-epi(B1, +0.24) / hcpm-mb(+3.3) / hc dots→pubred（P1e：pubred 仅 2-5 SM，24 行权重流不够）。
+- **在飞/已提交待验**：EARLY / PDL 链 / sparse-o-rope / AR pubred / NORM_FUSE / wob-f32 / fp4-pack / expert-interleave / tail-late priority / a32。
+- **未尝试**：grouped/persistent GEMM（246→~40 launch，next-wave top-1）+ Stage C 段核 P2-P5 + expert 机制重构（非 GEMV）。
+
+**最终判定**：乐观 3.21ms（≈254 tok/s）明确超 200；中间 3.91ms（≈208）刚过；保守 5.36ms（≈152）差约 27%（−1.28ms）。**关键变量** = ① a32 二元项（−0.74）；② 四侧流共享同一侧流预算，不可线性叠加；③ dots 融合的真实收益——P1e 复核指出融进消费者只省**图节点 ~0.12ms**（0.56ms 点积计算仍要付），除非点积真能在 attention 窗口内被隐藏；④ 朴素求和的重复计账（PDL/fp4-pack/sparse-o-rope/hc_post 同属 launch 消除）。
