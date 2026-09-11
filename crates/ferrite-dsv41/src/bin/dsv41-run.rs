@@ -436,15 +436,22 @@ fn rank_body(
 // ============================================================================
 
 struct ServeShared {
+    /// BROADCAST, not a work queue: every rank must execute the same request in
+    /// lockstep (the all-reduce makes them one collective), so the job stays in
+    /// the slot and each rank picks it up when the GENERATION advances past what
+    /// it has seen. Taking it (the first cut) left the other ranks waiting and
+    /// deadlocked the running rank inside its first all-reduce.
     job: std::sync::Mutex<Option<ServeJob>>,
+    /// rank 0 takes this when the flow finishes and sends the tokens back.
+    resp: std::sync::Mutex<Option<std::sync::mpsc::Sender<Vec<u32>>>>,
     cv: std::sync::Condvar,
     shutdown: std::sync::atomic::AtomicBool,
 }
 
 struct ServeJob {
+    generation: u64,
     ids: Vec<u32>,
     max_tokens: usize,
-    tx: std::sync::mpsc::Sender<Vec<u32>>,
 }
 
 fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
@@ -542,6 +549,7 @@ fn run_tp_serve(
     );
     let shared = std::sync::Arc::new(ServeShared {
         job: std::sync::Mutex::new(None),
+        resp: std::sync::Mutex::new(None),
         cv: std::sync::Condvar::new(),
         shutdown: std::sync::atomic::AtomicBool::new(false),
     });
@@ -597,9 +605,13 @@ fn run_tp_serve(
                         continue;
                     }
                     let (tx, rx) = std::sync::mpsc::channel::<Vec<u32>>();
+                    // publish resp BEFORE the job: rank 0 can only reach its
+                    // take() after running the flow, which requires the job.
+                    *shared.resp.lock().unwrap() = Some(tx);
                     {
                         let mut g = shared.job.lock().unwrap();
-                        *g = Some(ServeJob { ids, max_tokens: qmax, tx });
+                        let generation = g.as_ref().map(|j| j.generation).unwrap_or(0) + 1;
+                        *g = Some(ServeJob { generation, ids, max_tokens: qmax });
                     }
                     let t_gen = std::time::Instant::now();
                     shared.cv.notify_all();
@@ -660,16 +672,23 @@ fn run_tp_serve(
             });
         let mut chain = DevChain::new(&dev, &cfg, &w, RunOpts::from_env(), eng_map)?;
         chain.comm = Some(std::sync::Arc::new(c_small));
+        // every rank must be loaded before the first request: the running ranks
+        // spin inside the all-reduce until the last one joins
+        barrier.wait();
         if rank == 0 {
             eprintln!("[dsv41] rank0: chain ready in {:.1}s, serving", t0.elapsed().as_secs_f64());
         }
-        // ---- the request loop: one prefill+decode per job ----
+        // ---- the request loop: one prefill+decode per GENERATION ----
+        let mut seen: u64 = 0;
         loop {
             let job = {
                 let mut g = shared.job.lock().unwrap();
                 loop {
-                    if let Some(j) = g.take() {
-                        break Some(j);
+                    let cur = g.as_ref().map(|j| j.generation).unwrap_or(0);
+                    if cur > seen {
+                        seen = cur;
+                        let j = g.as_ref().unwrap();
+                        break Some((j.ids.clone(), j.max_tokens));
                     }
                     if shared.shutdown.load(Ordering::SeqCst) {
                         break None;
@@ -677,25 +696,25 @@ fn run_tp_serve(
                     g = shared.cv.wait(g).unwrap();
                 }
             };
-            let Some(job) = job else { break };
+            let Some((ids, max_tokens)) = job else { break };
             chain.reset()?;
             let mut next_tok = 0u32;
-            for (i, &tk) in job.ids.iter().enumerate() {
+            for (i, &tk) in ids.iter().enumerate() {
                 next_tok = chain.step(tk, i)?;
             }
             let mut produced: Vec<u32> = Vec::new();
-            let pos0 = job.ids.len();
+            let pos0 = ids.len();
             let t_dec = std::time::Instant::now();
-            for step in 0..job.max_tokens {
+            for step in 0..max_tokens {
                 produced.push(next_tok);
                 if Some(next_tok) == eos {
                     break;
                 }
                 next_tok = chain.step_dev(next_tok, pos0 + step)?;
             }
-            let dt = t_dec.elapsed().as_secs_f64();
-            let n = produced.len().max(1);
             if rank == 0 {
+                let dt = t_dec.elapsed().as_secs_f64();
+                let n = produced.len().max(1);
                 eprintln!(
                     "[dsv41] DECODE {} tokens in {:.2}s = {:.2} tok/s ({:.1} ms/token)",
                     produced.len(),
@@ -703,7 +722,9 @@ fn run_tp_serve(
                     produced.len() as f64 / dt,
                     dt * 1e3 / n as f64
                 );
-                let _ = job.tx.send(produced);
+                if let Some(tx) = shared.resp.lock().unwrap().take() {
+                    let _ = tx.send(produced);
+                }
             }
         }
         Ok(())
