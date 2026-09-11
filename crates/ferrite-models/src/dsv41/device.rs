@@ -61,7 +61,8 @@ struct Kernels {
     /// RoPE fusion: the M=1 GEMV whose epilogue also rotates the trailing
     /// `rope_rd` lanes of each head (`dsv41_apply_rope`'s rotation, term for
     /// term). Optional: a stale `.so` has no entry and the caller keeps the
-    /// (gemm_fp8_mx, apply_rope) pair. Returns 1 when the shape cannot take it.
+    /// (gemm_fp8_mx, apply_rope) pair. Returns 2 when the shape cannot take it
+    /// (never 1, which is cudaErrorInvalidValue).
     gemm_fp8_mx_rope: Option<
         // ABI: the stream is the LAST parameter, matching the kernel's
         // `dsv41_gemm_fp8_mx_rope(..., cudaStream_t s)` exactly. It must NOT sit
@@ -113,7 +114,7 @@ struct Kernels {
     /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
     /// epilogue (`out += w @ a`). A separate symbol, so a stale `.so` simply has
     /// no entry and the caller keeps the gemm_fp8_mx + add_inplace pair. Returns
-    /// 1 when the shape cannot use the GEMV.
+    /// 2 when the shape cannot use the GEMV (never 1 — cudaErrorInvalidValue).
     gemm_fp8_mx_add: Option<
         unsafe extern "C" fn(
             *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
@@ -124,7 +125,8 @@ struct Kernels {
     /// (`dsv41_gemm_fp8_mx_f32`) instead of an fp8 (`a`, `a_scale`) pair, so the
     /// `quant1(s.wo)` launch between wo_a and wo_b disappears. A separate symbol,
     /// so a stale `.so` simply has no entry and the caller keeps the
-    /// (quant1, gemm_fp8_mx) pair. Returns 1 when the shape/mode cannot use it.
+    /// (quant1, gemm_fp8_mx) pair. Returns 2 when the shape/mode cannot use it
+    /// (never 1 — cudaErrorInvalidValue, the round-42 collision).
     /// ABI: stream LAST — `dsv41_gemm_fp8_mx_f32(a_f32, w, w_scale, bias, out, n,
     /// k, s)` (this symbol has no C++ default tail args, so it does NOT follow
     /// `gemm_fp8_mx`'s "stream after the shape" layout).
@@ -333,9 +335,16 @@ struct Kernels {
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, i64, c_int, c_int, c_int, f32, c_int,
             *const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64,
-            *const c_int, CuStream,
+            *const c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// Load-time gate/up interleave (DSV41_EXPERT_ILV): rewrites an expert's
+    /// w1/w3 blocks into one 8-byte-granule-interleaved region so the fused
+    /// gate/up GEMV fetches both with one LDG.128. Optional: an .so without it
+    /// leaves DSV41_EXPERT_ILV inert and the plain layout (and its fallbacks)
+    /// stay in force.
+    interleave_gateup_fp4:
+        Option<unsafe extern "C" fn(*const u8, *const u8, *mut u8, i64, CuStream) -> c_int>,
     expert_down_fp4_batched: Option<
         unsafe extern "C" fn(
             *const f32, i64, *mut f32, i64, c_int, c_int, c_int, *const f32, i64, c_int,
@@ -599,6 +608,7 @@ impl Device {
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
             expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
+            interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
             expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
@@ -868,6 +878,13 @@ impl Device {
             && self.kernels.swiglu_limit_batched.is_some()
     }
 
+    /// True when the loaded .so carries the load-time gate/up interleave entry
+    /// point (`dsv41_interleave_gateup_fp4`, ABI 2). Without it DSV41_EXPERT_ILV
+    /// stays inert and the pools keep the plain w1/w3 layout.
+    pub fn supports_expert_ilv(&self) -> bool {
+        self.kernels.interleave_gateup_fp4.is_some()
+    }
+
     /// True when the loaded .so carries the fused down+reduce entry point
     /// (`dsv41_expert_down_reduce_fp4_batched`). A stale .so leaves
     /// DSV41_DOWN_FUSE inert and the (batched down, moe_down_reduce) pair runs.
@@ -953,6 +970,14 @@ impl Device {
                 std::ptr::null(), std::ptr::null(), 0, 0, 0, xq, xsc,
             )
         };
+        // ⚠️ LEGACY decline contract (rounds 37-41), deliberately left as-is:
+        // `rc == 1` here means BOTH "the fused path declined" AND the real
+        // `cudaErrorInvalidValue`. `dsv41_gemm_fp8_mx` also returns 1 from its
+        // SetAttribute/launch paths WITHOUT clearing the sticky flag, so a real
+        // failure is read as a graceful fallback and the sticky error survives -
+        // exactly the crash class r42 fixed for the gemv launchers. Only
+        // reachable with DSV41_WO_QUANT_FUSE=1 (default OFF). Migrate this symbol
+        // to the r42/r43 convention (decline == 2) before flipping it ON.
         if rc == 1 {
             return Ok(false);
         }
@@ -1120,7 +1145,10 @@ impl Device {
                 self.stream,
             )
         };
-        if rc == 1 {
+        // r43 decline-code fix: the launcher's shape decline is 2 (never 1, which
+        // is cudaErrorInvalidValue and would make a real launch failure look like
+        // a graceful fallback).
+        if rc == 2 {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_rope")?;
@@ -1189,7 +1217,8 @@ impl Device {
                 self.stream,
             )
         };
-        if rc == 1 {
+        // r43 decline-code fix: shape decline is 2 (see gemm_fp8_mx_rope).
+        if rc == 2 {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx2_rope")?;
@@ -1321,7 +1350,8 @@ impl Device {
     ) -> Result<bool> {
         let f = self.need(self.kernels.gemm_fp8_mx_add, "dsv41_gemm_fp8_mx_add")?;
         let rc = unsafe { f(a, a_scale, w, w_scale, bias, out, m, n, k, s) };
-        if rc == 1 {
+        // r43 decline-code fix: shape decline is 2 (see gemm_fp8_mx_rope).
+        if rc == 2 {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_add")?;
@@ -1788,6 +1818,11 @@ impl Device {
             f(wb, biasb, outb, nb, a, a_scale, wf1, ws1, outf1, nf, wf2, ws2, outf2, x, k,
               self.stream)
         };
+        // ⚠️ LEGACY decline contract (rounds 37-41), left as-is: `rc == 1` is
+        // both "declined" and `cudaErrorInvalidValue`, and the launcher's
+        // SetAttribute failure also returns 1 without clearing the sticky flag -
+        // the r42 crash class. Fallback-safe, but a genuine launch failure is
+        // reported as a decline. Migrate to decline == 2 if re-touched.
         if rc == 1 {
             return Ok(false);
         }
@@ -2611,6 +2646,7 @@ impl Device {
         w3s_base: *const u8,
         w3s_stride: i64,
         ids: *const i32,
+        ilv: i32,
     ) -> Result<()> {
         let f = self.need(
             self.kernels.expert_gate_up_fp4_batched,
@@ -2619,11 +2655,30 @@ impl Device {
         let rc = unsafe {
             f(
                 a, a_scale, out, out_slot_stride, rows, dim, inter, limit, slots, w1_base,
-                w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+                w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids, ilv,
                 self.stream,
             )
         };
         self.kerr(rc, "dsv41_expert_gate_up_fp4_batched")
+    }
+
+    /// Interleave one expert's gate/up fp4 blocks on the device (DSV41_EXPERT_ILV,
+    /// load-time only): `dst[16i..16i+8) = g[8i..8i+8)`, `dst[16i+8..16i+16) =
+    /// u[8i..8i+8)` for `bytes/8` granules. A pure permutation — bit-identical
+    /// weights, half the load instructions in the fused gate/up GEMV.
+    pub fn interleave_gateup_fp4(
+        &self,
+        g: *const u8,
+        u: *const u8,
+        dst: *mut u8,
+        bytes: i64,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.interleave_gateup_fp4,
+            "dsv41_interleave_gateup_fp4",
+        )?;
+        let rc = unsafe { f(g, u, dst, bytes, self.stream) };
+        self.kerr(rc, "dsv41_interleave_gateup_fp4")
     }
 
     /// Batched indirect expert down: ONE launch covers all `slots` slots and

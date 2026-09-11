@@ -107,6 +107,20 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 
 每阶段独立 env gate、默认 OFF；验收 = 同二进制背靠背 A/B + 人眼四段文本 + parity 测试。
 
+### P1e 候选（hc_pre dots 融进前驱 hc_post）：可行性复核（explore 2026-09-11，纯代码分析）
+
+**命题**：dots 的输入 `x` 就是前驱 `hc_post` 刚写出的残差 `s.h`（`hc_mixes_auto` 传 `x = s.h`、`hc_dim = hc*dim = 20480`；`hc_post_inplace` 原位写 `res[i*h + j]`，域完全一致）⇒ 二者是同一条 Producer/Consumer 链，dots 是 hc_post 的自然延伸。**这一点成立**。但**载体（pubred AR epilogue）选错了**，三条硬阻塞：
+
+1. **`p2p_ar_pubred_v5_hcpost` 不在默认路径上**：它需要 `DSV41_HCPOST_EPI=1`，该门**默认 OFF**（`chain_dev.rs:1948`），且与**默认 ON** 的 tail split（第 41 轮实测 −0.20ms）**互斥**——`hc_mixes_auto` 的 split 分支显式要求 `!Self::hcpost_epi()`（`:1779-1781`）。即默认配置（8.23ms 最优）里这个核根本不跑；打开它要先付 −0.20ms。
+2. **跨 TU 设备符号**：`g_hc_part` 是 `dsv41_kernels.cu:3632` 的 `__device__` 全局，而 `p2p_ar_pubred_v5_hcpost_kernel` 在 `ferrite_kernels.cu:8523`；`build.sh` **无 `-rdc=true`** ⇒ 跨 TU 设备符号不可见（hc_post 数学当初正为此在 `ferrite_kernels.cu:8467` **逐句复制**而非共享）。要在 pubred 里写 `g_hc_part`，只能额外把 partial 缓冲当 kernel 参数从 Rust 传指针进来，并让读端（tail）也改走该指针。
+3. **grid 并行度**：pubred grid = `ceil(n/1024)=5` block，但活跃线程只有 `n4 = 1280`（≈**1.25 block**），其余 3840 线程在 reduce/epilogue 全程空转。24 行点积的权重流是 **1.92MB**，现在由 **24 block/24 SM** 拉（531GB/s、7.4µs）。融进 pubred 等于把同样字节压到 ~2 个 SM ⇒ 正是 P1c/P1d 记录过的「单块/少块装不下 24 个权重行」形态，回归风险高。
+
+**默认路径下的正确载体是 `dsv41_hc_post_inplace`**（`dsv41_kernels.cu:3838`，launcher `:3875`）：与 `g_hc_part`/`hc_mixes_tail_kernel` **同 TU**（无跨 TU 问题）；线程所有权与 pubred epilogue 同构（一线程 4 列 × 全部 hc 行）；**默认 ON**（`fuse_c()` 默认 true，`chain_dev.rs:1312` 在 `!hcpost_epi()` 时走它），且与 tail split 兼容。
+
+**若要做，需一并解决（按序）**：① `hc_mixes_tail_kernel` 的 `mixes` 只读 `g_hc_part[r][m][0]`（`:4100`）——**不 sum ck**，K-split 必须给它加 split-sum（或新变体）；② 前端要 **tail-only 入口**（跳过 dots launch：`hc_front:4687` / `hc_front_split:4781` 各一个）；③ **ss 非逐位**：`ss_in=1` 的 partial 由 `hc_mix_dots_kernel:3982` 按 `m*32+lane` 残差类生成、tail 读 `[r][tid][1]`（`:4081`），该分组在列所有权下无法逐位复现 ⇒ 须容差门禁 + 同二进制 A/B；④ **engram 层（1、14）必须排除 MoE 侧融合**：`engram_apply`（`chain_dev.rs:1230`，调用点 `:1572`）在 block 前**原位改写 `s.h`**，切断了「上一层 MoE hc_post → 本层 attn hc_pre」的直连。
+
+**收益口径修正**：`hc_mix_dots` 是 **80 次/步**（2/层 × 40 层，`STATUS.md:3981`），不是 40 次。融合只省**图节点**（~1.5µs/节点 × 80 ≈ **0.12ms**），点积计算本身（7.0µs × 80 = 0.56ms）仍要付 ⇒ **融合后点积计算绝不能变慢**，否则收益被吞掉。
+
 ## 7. 关键风险与回退
 
 1. **跨 rank 同步进核（hc-merge 复现）**——最高风险。回退：AR 永远保留独立 launch / PDL 重叠；任何"省一个 kernel"的方案先证明不产生尾块长自旋。

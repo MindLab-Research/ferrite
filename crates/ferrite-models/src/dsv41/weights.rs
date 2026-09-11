@@ -463,6 +463,22 @@ pub fn shared_expert_tp() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SHARED_TP").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_EXPERT_ILV (default ON): store the ROUTED experts' w1 (gate) and w3 (up)
+/// fp4 weights INTERLEAVED at an 8-byte granule, so the fused gate/up GEMV
+/// fetches a gate chunk and the matching up chunk with ONE LDG.128 instead of
+/// two LDG.64s. PURE PERMUTATION of the checkpoint bytes (bit-identical weights,
+/// same decode, same fma chains), so the only expected delta is the TEX/issue
+/// side of the kernel.
+///
+/// This is a LOAD-TIME layout decision, so the flag must be read before the
+/// weights are built; the loader additionally requires the fused batched gate/up
+/// read to be available (see `Loader::ilv_ok`) — the sequential fallback cannot
+/// address the interleaved layout and refuses to run on it.
+pub fn gateup_ilv() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_EXPERT_ILV").map(|v| v != "0").unwrap_or(true))
+}
+
 pub fn local_shape(cfg: &Dsv41Config, spec: &TensorSpec, world: usize, rank: usize) -> Vec<usize> {
     let mut s = spec.shape.clone();
     match spec.shard {

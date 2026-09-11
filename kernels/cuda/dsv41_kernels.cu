@@ -2600,7 +2600,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 // entry point, not a new parameter on dsv41_gemm_fp8_mx: that symbol has one
 // fixed ABI and six call sites, so the rope form gets its own name and the
 // stale-.so fallback stays a plain symbol probe (supports_rope_fuse on the Rust
-// side). The whole q/idx_q rope shape is M=1 decode, so this declines (returns 1)
+// side). The whole q/idx_q rope shape is M=1 decode, so this declines (returns 2)
 // for anything the fused epilogue cannot do, and the caller keeps the
 // (gemm_fp8_mx, apply_rope) pair.
 //
@@ -2617,12 +2617,16 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
                                       int rope_step, int rope_inverse, int rope_rd, int rope_hd,
                                       cudaStream_t s) {
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
-    if (no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
-    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 1;
-    if (g_gemv_fp8_mode < 3) return 1;
+    // r43 decline-code fix (same class as r42's rope_norm/f32): the decline
+    // sentinel is 2, NOT 1 - 1 is cudaErrorInvalidValue, so a genuine launch /
+    // SetAttribute failure returning 1 was indistinguishable from a graceful
+    // shape decline and got swallowed by the caller's rc==1 fallback.
+    if (no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
+    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 2;
+    if (g_gemv_fp8_mode < 3) return 2;
     if ((n & 31) || rope_rd <= 0 || (rope_rd & 1) || rope_hd <= 0 || (rope_hd & 31) ||
         rope_rd > rope_hd)
-        return 1;
+        return 2;
     const int warps = 32;
     const int blocks = n / 32;
     const int nb_k = k >> 5;
@@ -2685,7 +2689,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
     if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 2;
     if ((n & 31) || rope_rd <= 0 || (rope_rd & 1) || rope_hd <= 0 || (rope_hd & 31) ||
         rope_rd > rope_hd)
-        return 1;
+        return 2;  // r42-fix round 2: decline must never be 1 (cudaErrorInvalidValue)
     const int warps = 32;
     const int blocks = n / 32;
     const int nb_k = k >> 5;
@@ -2721,7 +2725,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
 // 128) but the SAME rope length, cos/sin table and position counter. Everything
 // else is shared with dsv41_gemm_fp8_mx_rope; the pair never straddles the family
 // boundary because n1 and the head width are multiples of 32 and a pair start is
-// even. Returns 1 (decline) on any shape the fused epilogue cannot do.
+// even. Returns 2 (decline) on any shape the fused epilogue cannot do.
 extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, const uint8_t* w1,
                                        const uint8_t* w1_scale, const float* bias1, float* out1,
                                        int n1, const uint8_t* w2, const uint8_t* w2_scale,
@@ -2731,12 +2735,13 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
                                        int rope_step, int rope_inverse, int rope_rd, int rope_hd1,
                                        int rope_hd2, cudaStream_t s) {
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
-    if (no_gemv || n1 <= 0 || n2 <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
-    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 1;
-    if (g_gemv_fp8_mode < 3) return 1;
-    if (((n1 | n2) & 31) || rope_rd <= 0 || (rope_rd & 1)) return 1;
-    if (!(rope_hd1 > 0 && (rope_hd1 & 31) == 0 && rope_rd <= rope_hd1)) return 1;
-    if (!(rope_hd2 > 0 && (rope_hd2 & 31) == 0 && rope_rd <= rope_hd2)) return 1;
+    // r43 decline-code fix: sentinel 2, never 1 (== cudaErrorInvalidValue).
+    if (no_gemv || n1 <= 0 || n2 <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
+    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 2;
+    if (g_gemv_fp8_mode < 3) return 2;
+    if (((n1 | n2) & 31) || rope_rd <= 0 || (rope_rd & 1)) return 2;
+    if (!(rope_hd1 > 0 && (rope_hd1 & 31) == 0 && rope_rd <= rope_hd1)) return 2;
+    if (!(rope_hd2 > 0 && (rope_hd2 & 31) == 0 && rope_rd <= rope_hd2)) return 2;
     const int n = n1 + n2;
     const int warps = 32;
     const int blocks = n / 32;
@@ -2772,7 +2777,7 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
 // fallback is a plain symbol probe (supports_gemm_fp8_add on the Rust side).
 // M=1 only -- that is the shared expert's down projection, the one place in the
 // chain that added a standalone `ferrite_add` after the GEMV (40 launches/step).
-// Returns 1 when the shape cannot use the GEMV, so the caller keeps the
+// Returns 2 when the shape cannot use the GEMV, so the caller keeps the
 // two-launch (gemm_fp8_mx + add_inplace) pair; any other value is the usual
 // cudaError_t status.
 extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
@@ -2780,7 +2785,8 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
                                      const float* bias, float* out, int m, int n, int k,
                                      cudaStream_t s) {
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
-    if (m != 1 || no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    // r43 decline-code fix: sentinel 2, never 1 (== cudaErrorInvalidValue).
+    if (m != 1 || no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
     const int warps = g_gemv_warps;
     const int blocks = (n + warps - 1) / warps;
     const int nb_k = k >> 5;
@@ -2836,7 +2842,7 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
     if (no_gemv || a_f32 == nullptr || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
     // The s_af materialisation (where the f32 lands) is the vec>=3 branch only.
-    if (g_gemv_fp8_mode < 3) return 1;
+    if (g_gemv_fp8_mode < 3) return 2;  // r42-fix round 2: decline must never be 1 (cudaErrorInvalidValue)
     const int warps = g_gemv_warps;
     const int blocks = (n + warps - 1) / warps;
     const int nb_k = k >> 5;
@@ -3522,6 +3528,12 @@ extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, in
 // inverse rope) disappears. Returns 1 when the shape cannot take the fused
 // emission (rows*row_len not a multiple of 32) - the caller then runs the plain
 // dsv41_apply_rope + dsv41_quant_fp8 pair, which this is bit-identical to.
+//
+// ⚠️ LEGACY decline contract (rounds 37-41, kept as-is): the sentinel is 1,
+// which IS cudaErrorInvalidValue, and the trailing `cudaGetLastError()` can also
+// yield 1. A genuine 1 is therefore read by `Device::apply_rope_q` (rc == 1) as a
+// decline and silently falls back. Harmless (the fallback is bit-identical) but
+// invisible; migrate to decline == 2 if this path is ever re-touched.
 extern "C" int dsv41_apply_rope_q(float* x, const float* cos, const float* sin, int rows,
                                   int row_len, int dim, int half, const int* base, int mul, int off,
                                   int step, int inverse, uint8_t* xq, float* xsc, cudaStream_t s) {
@@ -3561,6 +3573,11 @@ extern "C" int dsv41_rmsnorm_rope(const float* x, const float* w, float* out, co
 // replaces. Requires every warp to be fully active inside the loop, which holds
 // only when dim and the final partial pass are multiples of 32 - the launcher
 // declines otherwise (returns 1) and the caller runs rmsnorm + quant_fp8.
+//
+// ⚠️ LEGACY decline contract: the sentinel 1 collides with cudaErrorInvalidValue
+// (n <= 0 / dim <= 0 also return 1), so `Device::rmsnorm_q` (rc == 1) cannot tell
+// a decline from a real failure. Kept as-is per the rounds 37-41 freeze; migrate
+// to decline == 2 if re-touched.
 __global__ void rmsnorm_q_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                  float* __restrict__ out, int n, int dim, float eps,
                                  uint8_t* __restrict__ xq, float* __restrict__ xsc) {

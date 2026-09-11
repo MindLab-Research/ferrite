@@ -26,7 +26,10 @@
 #ifndef FERRITE_KERNEL_BUILD_ID
 #define FERRITE_KERNEL_BUILD_ID "unstamped"
 #endif
-#define FERRITE_KERNEL_ABI_VERSION 1u
+// ABI 2 (2026-09-11): dsv41_expert_gate_up_fp4_batched gained a trailing `int ilv`
+// (expert gate/up interleaved layout, DSV41_EXPERT_ILV). The bump makes a stale
+// .so a hard refusal instead of reading the new argument as the stream.
+#define FERRITE_KERNEL_ABI_VERSION 2u
 extern "C" const char* ferrite_kernel_build_id(void) { return FERRITE_KERNEL_BUILD_ID; }
 extern "C" unsigned ferrite_kernel_abi_version(void) { return FERRITE_KERNEL_ABI_VERSION; }
 

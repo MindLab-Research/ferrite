@@ -379,3 +379,52 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   - ⚠️ **收益预期须修正** ✗：题面 `−0.88ms(40×22µs)` 假设共享链 22µs 可完全隐藏；实际可隐藏
     部分 ≤ min(routed, shared) 且受 SM/带宽争抢影响。上机后须用 `DSV41_MOE_DUAL=0/1` 同会话背靠背
     单轮实测（`scripts/dsv41_serve_ab.sh`），并同时验证 `opcheck`/faults 与文本。
+
+---
+
+## 7. launcher decline-code 约定 + 全量审计（2026-09-11，r42/r43）
+
+**背景**：r42/r43 的 serve 崩溃根因是 decline 哨兵与 CUDA 错误码**语义撞车**：
+`cudaErrorInvalidValue == 1`，而多个融合 launcher 用 `return 1` 表示"形状不支持，请回退"。
+后果有两个方向——
+1. **误判为回退**：C 侧真实错误恰好是 1 时，Rust 的 `rc == 1` 把它当成优雅 decline 静默吞掉；
+   launcher 若不 `cudaGetLastError()` 清 sticky，错误还会**泄漏到下一个 launcher** 并让 serve 崩
+   （r42 的实际机制：SetAttribute 失败 → sticky 存活 → 下一个 `quant_fp8` 的 kerr 报错）。
+2. **误判为硬错**：Rust 写 `rc == 2` 而 C 侧仍 `return 1`（r42 的 rope_norm/f32 就是这样），
+   真 decline 被当错误抛出 ⇒ 融合路径永远不生效。
+
+**约定（新符号起）**：**decline 哨兵一律用 `2`，永不用 `1`**（2 在实际路径上远不可能被
+`cudaError_t` 真实返回，1 是最常见的 InvalidValue）。C 侧 `return 2;` ↔ Rust 侧 `if rc == 2 { Ok(false) }`。
+
+### 7.1 审计结果（全部 launch 的 decline 点）
+
+| launcher（C） | decline 码 | Rust 检查 | 判定 |
+|---|---|---|---|
+| `dsv41_gemm_fp8_mx_rope` | `2`（r43 修） | `gemm_fp8_mx_rope: rc==2`（r43 修） | ✅ 已迁移 |
+| `dsv41_gemm_fp8_mx2_rope` | `2`（r43 修） | `gemm_fp8_mx2_rope: rc==2`（r43 修） | ✅ 已迁移 |
+| `dsv41_gemm_fp8_mx_add` | `2`（r43 修） | `gemm_fp8_mx_add_on: rc==2`（r43 修） | ✅ 已迁移 |
+| `dsv41_gemm_fp8_mx_rope_norm` | `2` | `rc==2` | ✅ r42-fix（4 处） |
+| `dsv41_gemm_fp8_mx_f32` | `2` | `rc==2` | ✅ r42-fix（2 处） |
+| `dsv41_apply_rope_q` | `1`（字面量） | `apply_rope_q: rc==1` | ⚠️ 旧符号，注释标注，未改 |
+| `dsv41_rmsnorm_q` | `1`（字面量） | `rmsnorm_q: rc==1` | ⚠️ 旧符号，注释标注，未改 |
+| `dsv41_swiglu_limit_q` | `1`（字面量） | `swiglu_limit_q_on: rc==1` | ⚠️ 旧符号，注释标注，未改 |
+| `dsv41_gemm_fp8_mx`（xq/staging/shape） | `cudaErrorInvalidValue` | `gemm_fp8_mx_q: rc==1` | ⚠️ 旧符号；且 2542/2580 的 SetAttribute 失败路径**不清 sticky**（同 r42 crash 类）→ 已注释 |
+| `dsv41_gemm_fp8_mx2`（shape） | `cudaErrorInvalidValue` | `gemm_fp8_mx2_on: rc==1` | ⚠️ 旧符号（r42 已给其 SetAttribute 路径加 sticky clear） |
+| `dsv41_gemm_bf16_fp8x2`（shape） | `cudaErrorInvalidValue` | `gemm_bf16_fp8x2: rc==1` | ⚠️ 旧符号；3015 的 SetAttribute 失败路径不清 sticky → 已注释 |
+| `dsv41_argmax_sliced`（shape） | `cudaErrorInvalidValue` | `argmax_sliced: rc==1` | ⚠️ 旧符号 |
+| `ferrite_p2p_ar_v5_hcpost`（shape） | `cudaErrorInvalidValue` | `p2p_ar_v5_hcpost: rc==1` | ⚠️ 旧符号 |
+| `dsv41_hc_front{,_split,_persist,_persist_mb}` | `cudaErrorInvalidValue`（gate off / 形状） | `rc==1` | ⚠️ 旧符号（gate-off 就是靠 InvalidValue 表意） |
+| `dsv41_interleave_gateup_fp4`（r43 新增） | 无 decline（坏形状直接 `cudaErrorInvalidValue`） | `kerr`，无 rc 检查 | ✅ 硬报错语义，安全 |
+| `dsv41_quant_fp4_fused`（r42 新增） | 无 decline（不满足条件就走 legacy 两 launch） | — | ✅ 安全 |
+
+**结论**：一致性矩阵**全部匹配**（无 "C 返回 1 / Rust 查 2" 或 "C decline 无 Rust 检查" 的破口）。
+所有残余风险收敛为同一类：**旧符号的 decline 码 = `cudaErrorInvalidValue`**，C 侧真实错误 1 会被
+Rust 的 `rc==1` 读成回退。按"rounds 37-41 已冻结、改动有回归风险"的原则**保持现状，仅在源码注释里
+标注隐患**（`device.rs:973` / `:1821`、`dsv41_kernels.cu` apply_rope_q/rmsnorm_q 头注释、
+`dsv41_glue.cu` swiglu_limit_q 头注释）。
+
+**下次改动纪律**：
+- 新增/重触任何带 decline 的 launcher ⇒ 用 `2`，Rust 配 `rc == 2`；**不要**再出现 `return 1` 哨兵。
+- 若某旧符号要重新启用（如 `DSV41_WO_QUANT_FUSE=1` 重新打开 `gemm_fp8_mx_q`），先把它迁到 2，
+  否则 r42 的 sticky-leak 崩溃会复现。
+- `dsv41_kernels.cu` gemv 段（约 :2500-2900）有其它 agent 在飞改动时，只动 `return 1→2` 的行。

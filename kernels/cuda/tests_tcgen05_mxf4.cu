@@ -225,6 +225,79 @@ int run_gate_up_case() {
     return md == 0 ? 0 : 1;
 }
 
+// DSV41_EXPERT_ILV: the interleaved gate/up layout (dsv41_interleave_gateup_fp4)
+// must give BIT-IDENTICAL outputs to the plain layout through the fused batched
+// gate/up GEMV (dsv41_expert_gate_up_fp4_batched, ilv 0 vs 1). Same weights, same
+// activation, same scales — only the weight bytes' ORDER inside each 8-byte
+// granule pair changes, which is exactly what the LDG.128 fold relies on.
+// dim must be a multiple of 512 for the fused branch (the launcher's own gate),
+// and DSV41_GATEUP_FUSE must not be disabled in the environment.
+int run_ilv_case() {
+    const int D = 512, I = 64;
+    std::vector<uint8_t> a(D / 2);
+    std::vector<float> as(D / 32);
+    std::vector<uint8_t> w1((size_t)I * D / 2), w3((size_t)I * D / 2);
+    std::vector<uint8_t> w1s((size_t)I * D / 32), w3s((size_t)I * D / 32);
+    rng_state = 97;
+    for (int k = 0; k < D; ++k) {
+        if (k % 32 == 0) as[k / 32] = (float)ldexp(1.0, (int)(xrand() % 5) - 2);
+        a[k / 2] |= (uint8_t)((xrand() & 0xF) << (4 * (k & 1)));
+    }
+    for (int i = 0; i < I; ++i)
+        for (int k = 0; k < D; ++k) {
+            if (k % 32 == 0) {
+                w1s[(size_t)i * (D / 32) + k / 32] = e8m0_of_exp((int)(xrand() % 5) - 2);
+                w3s[(size_t)i * (D / 32) + k / 32] = e8m0_of_exp((int)(xrand() % 5) - 2);
+            }
+            w1[(size_t)i * (D / 2) + k / 2] |= (uint8_t)((xrand() & 0xF) << (4 * (k & 1)));
+            w3[(size_t)i * (D / 2) + k / 2] |= (uint8_t)((xrand() & 0xF) << (4 * (k & 1)));
+        }
+    uint8_t *da, *dw1, *dw3, *dw1s, *dw3s, *dilv;
+    float *das, *dout;
+    int *dids;
+    cudaMalloc(&da, a.size());
+    cudaMalloc(&das, as.size() * 4);
+    cudaMalloc(&dw1, w1.size());
+    cudaMalloc(&dw3, w3.size());
+    cudaMalloc(&dw1s, w1s.size());
+    cudaMalloc(&dw3s, w3s.size());
+    cudaMalloc(&dilv, 2 * w1.size());
+    cudaMalloc(&dout, (size_t)I * 4);
+    cudaMalloc(&dids, sizeof(int));
+    const int id0 = 0;
+    cudaMemcpy(da, a.data(), a.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(das, as.data(), as.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(dw1, w1.data(), w1.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dw3, w3.data(), w3.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dw1s, w1s.data(), w1s.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dw3s, w3s.data(), w3s.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dids, &id0, sizeof(int), cudaMemcpyHostToDevice);
+    std::vector<float> plain((size_t)I, 0.f), ilv((size_t)I, 0.f);
+    // plain layout: w1 rows in `dw1`, w3 rows in `dw3`
+    int rc0 = dsv41_expert_gate_up_fp4_batched(da, das, dout, 0, 1, D, I, 10.f, 1, dw1, 0, dw1s, 0,
+                                               dw3, 0, dw3s, 0, dids, /*ilv=*/0, 0);
+    cudaMemcpy(plain.data(), dout, plain.size() * 4, cudaMemcpyDeviceToHost);
+    // interleaved layout: one 2*I*(D/2)-byte region holds gate and up alternating,
+    // the scales stay in their own buffers, the w3 pointer aliases w1's region.
+    int rci = dsv41_interleave_gateup_fp4(dw1, dw3, dilv, (long)w1.size(), 0);
+    int rc1 = dsv41_expert_gate_up_fp4_batched(da, das, dout, 0, 1, D, I, 10.f, 1, dilv, 0, dw1s,
+                                               0, dilv, 0, dw3s, 0, dids, /*ilv=*/1, 0);
+    cudaError_t e = cudaDeviceSynchronize();
+    cudaMemcpy(ilv.data(), dout, ilv.size() * 4, cudaMemcpyDeviceToHost);
+    int bad = 0;
+    for (int i = 0; i < I; ++i) {
+        uint32_t x = 0, y = 0;
+        memcpy(&x, &plain[i], 4);
+        memcpy(&y, &ilv[i], 4);
+        if (x != y) ++bad;
+    }
+    printf("  [gate_up ILV D=%d I=%d] rc=%d/%d err=%s bitdiff=%d %s\n", D, I, rc0, rci,
+           cudaGetErrorString(e), bad, (rc0 == 0 && rc1 == 0 && bad == 0) ? "EXACT" : "MISMATCH");
+    cudaFree(da); cudaFree(das); cudaFree(dw1); cudaFree(dw3); cudaFree(dw1s); cudaFree(dw3s);
+    cudaFree(dilv); cudaFree(dout); cudaFree(dids);
+    return (rc0 == 0 && rc1 == 0 && bad == 0) ? 0 : 1;
+}
+
 int run_down_case() {
     const int R = 128, D = 64, I = 64;
     std::vector<float> act((size_t)R * I);
@@ -291,6 +364,7 @@ int main() {
     fails += run_case(128, 64, 512, 4);   // 8 atoms, two K stages
     fails += run_case(256, 64, 128, 5);   // two M tiles
     fails += run_gate_up_case();
+    fails += run_ilv_case();
     fails += run_down_case();
     printf(fails ? "RESULT: %d case(s) FAILED\n" : "RESULT: all cases EXACT\n", fails);
     return fails ? 1 : 0;

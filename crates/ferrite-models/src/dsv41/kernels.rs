@@ -446,6 +446,11 @@ extern "C" {
     // experts, same per-row K dot order).
     /// Batched fp4 gate/up: `out` holds `slots` [2*inter] blocks, `out_slot_stride`
     /// floats apart. `a`/`a_scale` is the ONE shared quantised activation row.
+    ///
+    /// `ilv` (ABI 2): the w1/w3 pools are interleaved at an 8-byte granule
+    /// (DSV41_EXPERT_ILV), so the fused gate/up body derives the up bytes from
+    /// the gate pointer and reads both with one LDG.128. Only valid together
+    /// with the fused layout; the launcher rejects `ilv` + unfused.
     #[allow(clippy::too_many_arguments)]
     pub fn dsv41_expert_gate_up_fp4_batched(
         a: *const u8,
@@ -466,6 +471,18 @@ extern "C" {
         w3s_base: *const u8,
         w3s_stride: i64,
         ids: *const i32,
+        ilv: i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// Load-time gate/up interleave (DSV41_EXPERT_ILV): a pure 8-byte-granule
+    /// permutation of `g`/`u` into `dst`, `bytes` per side. Bit-identical data,
+    /// halved load instructions in the fused gate/up GEMV.
+    pub fn dsv41_interleave_gateup_fp4(
+        g: *const u8,
+        u: *const u8,
+        dst: *mut u8,
+        bytes: i64,
         stream: CuStream,
     ) -> i32;
 

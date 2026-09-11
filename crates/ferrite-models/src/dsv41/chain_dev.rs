@@ -29,7 +29,7 @@
 
 use std::ffi::c_void;
 
-use ferrite_types::Result;
+use ferrite_types::{FerriteError, Result};
 
 use std::sync::Arc;
 
@@ -233,9 +233,21 @@ fn eng_host() -> bool {
 /// path is the live verified one. Read ONCE and cached (the house rule from
 /// dsv41_glue.cu's g_hc_spread and eng_host() above — a per-call getenv is a
 /// hot-path slip), and `"0"` means OFF even though it is "set".
-fn moe_batch() -> bool {
+/// `pub(crate)`: the loader's `ilv_ok` reads these same gates to decide the
+/// routed experts' weight layout, so the two sides can never drift.
+pub(crate) fn moe_batch() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Mirrors dsv41_experts_mxf4.cu's dispatch test
+/// (`rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr`, a BARE getenv: any
+/// value at all, even "0", sends the rows==1 call through the tcgen05 GEMM).
+/// That GEMM reads the plain w1/w3 layout, so the loader's `ilv_ok` must see
+/// this knob before it interleaves the pools.
+pub(crate) fn no_gemv_fp4() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("DSV41_NO_GEMV_FP4").is_some())
 }
 
 /// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
@@ -264,7 +276,7 @@ fn down_fuse() -> bool {
 /// act_slot by `inter` and skips the separate swiglu launch -> silent data
 /// misalignment, not a perf difference. Read ONCE and cached like the other
 /// gates (per-call getenv is a hot-path slip).
-fn expert_fp4_mode() -> i32 {
+pub(crate) fn expert_fp4_mode() -> i32 {
     static M: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *M.get_or_init(|| {
         std::env::var("DSV41_EXPERT_FP4_MODE")
@@ -491,7 +503,7 @@ fn ar_store_fuse() -> bool {
 }
 
 /// DSV41_GATEUP_FUSE (default ON): gate/up fusion in the batched MoE path.
-fn gateup_fuse() -> bool {
+pub(crate) fn gateup_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_GATEUP_FUSE").map(|v| v != "0").unwrap_or(true))
 }
@@ -3448,6 +3460,20 @@ fn hc_tail_split() -> bool {
         // still needs both zeros as its add base.
         let ne = ld.experts.len();
         let batched = moe_batch() && topk > 0 && ne >= 2 && self.dev.supports_moe_batch();
+        // The routed experts' gate/up pools may be stored INTERLEAVED
+        // (DSV41_EXPERT_ILV, decided at load time). Only the FUSED batched
+        // gate/up read can address that layout, so the batched path stops being
+        // optional: refuse loudly instead of running the sequential or unfused
+        // fallback against bytes laid out for another reader.
+        let ilv = ld.experts_ilv;
+        if ilv && !batched {
+            return Err(FerriteError::Config(
+                "routed expert gate/up weights are interleaved (DSV41_EXPERT_ILV) but the \
+                 batched MoE path is unavailable — run with DSV41_EXPERT_ILV=0, or restore \
+                 DSV41_MOE_BATCH/DSV41_GATEUP_FUSE so the fused batched call is used"
+                    .into(),
+            ));
+        }
         if !batched {
             self.dev.zero(&self.s.ex_out)?;
             self.dev.zero(&self.s.o)?;
@@ -3558,6 +3584,12 @@ fn hc_tail_split() -> bool {
                     w3s_base,
                     w3s_stride,
                     ids,
+                    // Interleaved gate/up pools (DSV41_EXPERT_ILV): the kernel's
+                    // fused body derives the up bytes from the gate pointer and
+                    // reads one LDG.128 per group. `w3_base`/`w3_stride` still
+                    // point at the same doubled region (the loader makes w3's
+                    // view alias w1's), they are simply not read.
+                    ilv as i32,
                 )?;
                 // gate_up+swiglu fusion: when the fused path ran (kernel wrote
                 // the swiglu'd inter-width result directly), skip the separate

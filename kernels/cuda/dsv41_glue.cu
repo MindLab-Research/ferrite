@@ -750,7 +750,12 @@ extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float lim
 // A4: swiglu + the fp8 pair the following GEMV consumes, in one launch. Returns
 // 1 when the shape cannot use it (a caller that cannot meet the inter % 32 warp
 // alignment keeps the swiglu_limit + quant1 pair), any other value is the usual
-// cudaError_t status. M=1 row is the shared expert's down path.
+// cudaError_t status.
+//
+// ⚠️ LEGACY decline contract: 1 == cudaErrorInvalidValue, so a genuine error 1
+// (incl. the trailing cudaGetLastError()) is indistinguishable from the decline
+// and `Device::swiglu_limit_q_on` (rc == 1) swallows it as a fallback. Kept as-is
+// per the rounds 37-41 freeze; migrate to decline == 2 if re-touched. M=1 row is the shared expert's down path.
 extern "C" int dsv41_swiglu_limit_q(float* gate_up, int rows, int inter, float limit,
                                     uint8_t* xq, float* xsc, cudaStream_t s) {
     if (rows <= 0 || inter <= 0 || (inter & 31) || xq == nullptr || xsc == nullptr) return 1;

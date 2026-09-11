@@ -698,6 +698,18 @@ static const int g_expert_fp4_mode = [] {
 }();
 
 
+// ILV = the w1 (gate) / w3 (up) fp4 weights were stored INTERLEAVED at load
+// time (8-byte granule alternation, built by dsv41_interleave_gateup_fp4): the
+// gate chunk of a row and the matching up chunk sit 8 bytes apart, so the fused
+// gate/up branch fetches both with ONE LDG.128 instead of two LDG.64s. Same 16
+// bytes, same decode, same fma chains - only the load count changes.
+//
+// A TEMPLATE parameter, not a runtime flag: the branch below folds away in the
+// non-interleaved instantiation, so the default (plain-layout) path keeps the
+// exact codegen it had. The launcher picks the instantiation from its explicit
+// `ilv` argument; nothing here guesses, and the Rust side refuses to combine an
+// interleaved pool with anything but the fused batched gate/up call.
+template <bool ILV>
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
                                                const uint8_t* __restrict__ a,
                                                const float* __restrict__ a_scale,
@@ -800,8 +812,11 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         // fuse_swiglu when (dim % 512) == 0, so the two-chunk-per-scale tail loop
         // of the unfused body has no work here.
         if (fuse_swiglu && b_split > 0) {
-            const uint8_t* g_row = b_use + (size_t)row * kbytes;
-            const uint8_t* u_row = bhi_use + (size_t)row * kbytes;
+            // ILV: gate and up live in ONE region with an 8-byte granule
+            // alternation, so the row pitch doubles and the up pointer is derived
+            // from the gate pointer (the `b_hi` base is not read at all).
+            const uint8_t* g_row = b_use + (size_t)row * (ILV ? (kbytes << 1) : kbytes);
+            const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row * kbytes);
             const uint8_t* g_srow = bsc_use + (size_t)row * ksc;
             const uint8_t* u_srow = bhs_use + (size_t)row * ksc;
             const int nv2f = k >> 9;   // 16 values per lane per group; no tail (k % 512 == 0)
@@ -827,21 +842,36 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 for (int i = 0; i < 16; ++i) sa[i] = s_act[j + i];
                 // ---- gate chain: row `row` of the `b`/`bsc` pair ----
                 const float gsc = __uint_as_float(((uint32_t)g_srow[j >> 5]) << 23);
-                const uint8_t* gp = g_row + (g2 << 8) + (lane << 3);
-                // One LDG.64 instead of two LDG.32. gp = g_row + (g2<<8) + (lane<<3)
-                // is 8-byte aligned: the pool base is a 256-byte-aligned device
-                // allocation, every per-expert stride is a multiple of 8 (all six
-                // per-expert tensor sizes here are multiples of 8 because
-                // dim % 512 == 0 gives dim/2 = 256k and dim/32 = 16k bytes per row),
-                // and lane<<3 / g2<<8 are multiples of 8. BIT-EXACT: the 8 bytes at
-                // gp are identical to gw.x at gp and gw.y at gp+4; only the number of
-                // load instructions changes.
-                const uint2 gw = *reinterpret_cast<const uint2*>(gp);
+                // q = this lane's 8 gate bytes inside the logical row; q + (g2<<8)
+                // + (lane<<3) is a multiple of 8. The pool base is a 256-byte
+                // aligned device allocation, every per-expert stride is a multiple
+                // of 8 (all six per-expert tensor sizes here are multiples of 8
+                // because dim % 512 == 0 gives dim/2 = 256k and dim/32 = 16k bytes
+                // per row), and lane<<3 / g2<<8 are multiples of 8.
+                //
+                // PLAIN layout: ONE LDG.64 for the gate (here) and one for the up
+                // (below); gw.x/gw.y are the bytes at gp and gp+4, BIT-EXACT vs
+                // two LDG.32s.
+                // INTERLEAVED layout (ILV): the gate chunk sits at 2*q and the
+                // matching up chunk at 2*q + 8, so ONE LDG.128 fetches both -
+                // v.x/v.y are the gate pair and v.z/v.w the up pair, the very same
+                // 16 bytes the four LDG.32s returned. 2*q is 16-byte aligned for
+                // the same reason q is 8-byte aligned. Same decode, same fma
+                // chains, half the load instructions.
+                const int q = (g2 << 8) + (lane << 3);
+                uint32_t gw0, gw1, uw0 = 0u, uw1 = 0u;
+                if (ILV) {
+                    const uint4 v4 = *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
+                    gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
+                } else {
+                    const uint2 gw = *reinterpret_cast<const uint2*>(g_row + q);
+                    gw0 = gw.x; gw1 = gw.y;
+                }
                 float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
-                const float2 gt0 = s_lut2[gw.x & 0xFFu];
-                const float2 gt1 = s_lut2[(gw.x >> 8) & 0xFFu];
-                const float2 gt2 = s_lut2[(gw.x >> 16) & 0xFFu];
-                const float2 gt3 = s_lut2[(gw.x >> 24) & 0xFFu];
+                const float2 gt0 = s_lut2[gw0 & 0xFFu];
+                const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
+                const float2 gt2 = s_lut2[(gw0 >> 16) & 0xFFu];
+                const float2 gt3 = s_lut2[(gw0 >> 24) & 0xFFu];
                 gp0 = fmaf(sa[0], gt0.x, gp0);
                 gp1 = fmaf(sa[1], gt0.y, gp1);
                 gp2 = fmaf(sa[2], gt1.x, gp2);
@@ -850,10 +880,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 gp1 = fmaf(sa[5], gt2.y, gp1);
                 gp2 = fmaf(sa[6], gt3.x, gp2);
                 gp3 = fmaf(sa[7], gt3.y, gp3);
-                const float2 gu0 = s_lut2[gw.y & 0xFFu];
-                const float2 gu1 = s_lut2[(gw.y >> 8) & 0xFFu];
-                const float2 gu2 = s_lut2[(gw.y >> 16) & 0xFFu];
-                const float2 gu3 = s_lut2[(gw.y >> 24) & 0xFFu];
+                const float2 gu0 = s_lut2[gw1 & 0xFFu];
+                const float2 gu1 = s_lut2[(gw1 >> 8) & 0xFFu];
+                const float2 gu2 = s_lut2[(gw1 >> 16) & 0xFFu];
+                const float2 gu3 = s_lut2[(gw1 >> 24) & 0xFFu];
                 gp0 = fmaf(sa[8], gu0.x, gp0);
                 gp1 = fmaf(sa[9], gu0.y, gp1);
                 gp2 = fmaf(sa[10], gu1.x, gp2);
@@ -865,15 +895,18 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 g = fmaf(gsc, (gp0 + gp1) + (gp2 + gp3), g);
                 // ---- up chain: row `row` of the `b_hi`/`bhs` pair ----
                 const float usc = __uint_as_float(((uint32_t)u_srow[j >> 5]) << 23);
-                const uint8_t* up = u_row + (g2 << 8) + (lane << 3);
-                // Same LDG.64 fold as the gate chain above (up-row load, identical
-                // 8-byte alignment argument); uw.x/uw.y == the old uw0/uw1.
-                const uint2 uw = *reinterpret_cast<const uint2*>(up);
+                // INTERLEAVED: the up pair already arrived in the LDG.128 above
+                // (uw0/uw1). PLAIN: the second LDG.64 of the row, identical
+                // 8-byte alignment argument; uw.x/uw.y == the old uw0/uw1.
+                if (!ILV) {
+                    const uint2 uw = *reinterpret_cast<const uint2*>(u_row + q);
+                    uw0 = uw.x; uw1 = uw.y;
+                }
                 float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
-                const float2 ut0 = s_lut2[uw.x & 0xFFu];
-                const float2 ut1 = s_lut2[(uw.x >> 8) & 0xFFu];
-                const float2 ut2 = s_lut2[(uw.x >> 16) & 0xFFu];
-                const float2 ut3 = s_lut2[(uw.x >> 24) & 0xFFu];
+                const float2 ut0 = s_lut2[uw0 & 0xFFu];
+                const float2 ut1 = s_lut2[(uw0 >> 8) & 0xFFu];
+                const float2 ut2 = s_lut2[(uw0 >> 16) & 0xFFu];
+                const float2 ut3 = s_lut2[(uw0 >> 24) & 0xFFu];
                 up0 = fmaf(sa[0], ut0.x, up0);
                 up1 = fmaf(sa[1], ut0.y, up1);
                 up2 = fmaf(sa[2], ut1.x, up2);
@@ -882,10 +915,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 up1 = fmaf(sa[5], ut2.y, up1);
                 up2 = fmaf(sa[6], ut3.x, up2);
                 up3 = fmaf(sa[7], ut3.y, up3);
-                const float2 uu0 = s_lut2[uw.y & 0xFFu];
-                const float2 uu1 = s_lut2[(uw.y >> 8) & 0xFFu];
-                const float2 uu2 = s_lut2[(uw.y >> 16) & 0xFFu];
-                const float2 uu3 = s_lut2[(uw.y >> 24) & 0xFFu];
+                const float2 uu0 = s_lut2[uw1 & 0xFFu];
+                const float2 uu1 = s_lut2[(uw1 >> 8) & 0xFFu];
+                const float2 uu2 = s_lut2[(uw1 >> 16) & 0xFFu];
+                const float2 uu3 = s_lut2[(uw1 >> 24) & 0xFFu];
                 up0 = fmaf(sa[8], uu0.x, up0);
                 up1 = fmaf(sa[9], uu0.y, up1);
                 up2 = fmaf(sa[10], uu1.x, up2);
@@ -1301,6 +1334,50 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
 }  // namespace
 
 // ============================================================================
+// LOAD-TIME gate/up interleave (DSV41_EXPERT_ILV, default ON on the Rust side)
+// ============================================================================
+// Rewrites an expert's w1 (gate) and w3 (up) fp4 row blocks into ONE region with
+// an 8-byte granule alternation:
+//     dst[16*i .. 16*i+8) = gate[8*i .. 8*i+8)
+//     dst[16*i+8 .. 16*i+16) = up[8*i .. 8*i+8)
+// so the fused gate/up GEMV fetches a gate chunk and its matching up chunk with
+// ONE LDG.128 instead of two LDG.64s (see expert_gemv_fp4_batched_kernel<ILV>).
+// PURE PERMUTATION: every byte keeps its value and its position inside its own
+// 8-byte granule, so the kernel decodes exactly the same numbers and the mxf4
+// accumulations are untouched — bit-identical, only the load count halves.
+//
+// `bytes` is the size of EACH side (gate == up == the local [inter, dim/2] byte
+// count); it must be a multiple of 8. `dst` must not overlap `g`/`u`.
+namespace {
+__global__ void interleave_gateup_fp4_kernel(const uint2* __restrict__ g,
+                                             const uint2* __restrict__ u,
+                                             uint2* __restrict__ dst, long n8) {
+    const long stride = (long)blockDim.x * (long)gridDim.x;
+    // read-only sources, one write pair per iteration: the loop lets any grid
+    // size cover the tensor, and every thread writes DISJOINT 16-byte slots.
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n8; i += stride) {
+        dst[2 * i] = g[i];
+        dst[2 * i + 1] = u[i];
+    }
+}
+}  // namespace
+
+extern "C" int dsv41_interleave_gateup_fp4(const uint8_t* g, const uint8_t* u, uint8_t* dst,
+                                           long bytes, cudaStream_t stream) {
+    if (bytes <= 0) return (int)cudaSuccess;
+    if ((bytes & 7) != 0) return (int)cudaErrorInvalidValue;   // 8-byte granule only
+    if (g == nullptr || u == nullptr || dst == nullptr) return (int)cudaErrorInvalidValue;
+    const long n8 = bytes >> 3;
+    const int threads = 256;
+    long nb = (n8 + threads - 1) / threads;
+    if (nb > 4096) nb = 4096;                                  // grid-stride covers the rest
+    interleave_gateup_fp4_kernel<<<(unsigned)nb, threads, 0, stream>>>(
+        reinterpret_cast<const uint2*>(g), reinterpret_cast<const uint2*>(u),
+        reinterpret_cast<uint2*>(dst), n8);
+    return (int)cudaGetLastError();
+}
+
+// ============================================================================
 // Test hook (used by kernels/cuda/tests_tcgen05_mxf4.cu; not part of the ABI).
 // ============================================================================
 extern "C" int dsv41_mxf4_test_gemm(const uint8_t* a, const float* a_scale, const uint8_t* b,
@@ -1417,11 +1494,16 @@ extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
 // blockIdx.y = slot. `out` holds `slots` consecutive [2*inter] blocks, one per
 // slot, `out_slot_stride` floats apart; nothing accumulates across slots. The
 // activation is the ONE shared quantised row `a`/`a_scale`.
+// `ilv` (trailing, new in ABI 2): the w1/w3 pools are INTERLEAVED (DSV41_EXPERT_ILV
+// on the Rust side). It selects the kernel's ILV instantiation and REQUIRES the
+// fused read: gate and up of a row then come from one region, so the unfused
+// (b_split-split) body, which walks the `b` and `b_hi` pools separately, would
+// read the wrong bytes. Rejected loudly instead of silently.
 extern "C" int dsv41_expert_gate_up_fp4_batched(
     const uint8_t* a, const float* a_scale, float* out, long out_slot_stride, int rows, int dim,
     int inter, float limit, int slots, const uint8_t* w1_base, long w1_stride,
     const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
-    const uint8_t* w3s_base, long w3s_stride, const int* ids, cudaStream_t stream) {
+    const uint8_t* w3s_base, long w3s_stride, const int* ids, int ilv, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
     // gate_up+swiglu fusion: each warp produces the PAIR (gate_i, up_i) and the
@@ -1440,14 +1522,22 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
         return atoi(e) != 0 ? 1 : 0;
     }();
     const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0) ? 1 : 0;
+    // Interleaved weights are only addressable by the FUSED body (see the header
+    // comment): refuse the combination rather than read the wrong bytes.
+    if (ilv && !fuse) return (int)cudaErrorInvalidValue;
     const int n_total = fuse ? inter : 2 * inter;
+    const size_t smem = (size_t)dim * sizeof(float) + 256 * sizeof(float2);
     dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
-    expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
-                                         (size_t)dim * sizeof(float) + 256 * sizeof(float2),
-                                         stream>>>(
-        nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
-        w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
-        g_expert_fp4_mode, fuse);
+    if (ilv)
+        expert_gemv_fp4_batched_kernel<true><<<grid, warps * 32, smem, stream>>>(
+            nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
+            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+            g_expert_fp4_mode, fuse);
+    else
+        expert_gemv_fp4_batched_kernel<false><<<grid, warps * 32, smem, stream>>>(
+            nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
+            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+            g_expert_fp4_mode, fuse);
     return (int)cudaGetLastError();
 }
 
@@ -1464,9 +1554,9 @@ extern "C" int dsv41_expert_down_fp4_batched(
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
     dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots);
-    expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
-                                         (size_t)inter * sizeof(float) + 256 * sizeof(float2),
-                                         stream>>>(
+    expert_gemv_fp4_batched_kernel<false><<<grid, warps * 32,
+                                            (size_t)inter * sizeof(float) + 256 * sizeof(float2),
+                                            stream>>>(
         act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
         row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
         w2s_base, w2s_stride, ids, g_expert_fp4_mode, /*fuse_swiglu=*/0);

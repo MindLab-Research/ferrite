@@ -20,7 +20,7 @@ use ferrite_types::{FerriteError, Result};
 
 use crate::dsv41::config::Dsv41Config;
 use crate::dsv41::device::{DevBuf, Device};
-use crate::dsv41::weights::{local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
+use crate::dsv41::weights::{gateup_ilv, local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
 
 /// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
 /// Everything else that arrives as bf16 is widened to f32 on the way in —
@@ -178,6 +178,11 @@ pub struct LayerDev {
     pub experts: Vec<DevExpert>,
     /// owns the memory the experts' tensors view into
     pub expert_pool: Option<DevBuf>,
+    /// The routed experts' w1/w3 are stored INTERLEAVED in one region
+    /// (DSV41_EXPERT_ILV). The consumer MUST pass `ilv = 1` to the batched
+    /// gate/up launcher; the sequential (unfused) fallback cannot read this
+    /// layout and refuses to run on it.
+    pub experts_ilv: bool,
     pub shared_w1: Option<DevTensor>,
     pub shared_w1_scale: Option<DevTensor>,
     pub shared_w3: Option<DevTensor>,
@@ -585,6 +590,16 @@ impl<'a> Loader<'a> {
     /// with 186 GB free on the device. One pooled buffer per layer instead.
     /// Expert weights are fp4-packed and their scales e8m0, never bf16, so the
     /// widening pass never triggers here.
+    ///
+    /// `ilv` (DSV41_EXPERT_ILV, decided by [`Loader::ilv_ok`]) stores w1 (gate)
+    /// and w3 (up) in ONE region with an 8-byte granule alternation
+    /// (`gate[0..8] + up[0..8] + gate[8..16] + ...`) so the fused gate/up GEMV
+    /// fetches both halves of a row chunk with ONE LDG.128 instead of two
+    /// LDG.64s. The pool's TOTAL size and every other plane's bytes are
+    /// unchanged — this is a permutation plus a per-expert reorder, and it is
+    /// bit-identical by construction (the same bytes, decoded the same way).
+    /// The scales stay in their own blocks: the kernel reads gate/up scales from
+    /// separate pointers regardless of how the weights are stored.
     fn load_expert_pool(
         &mut self,
         prefix: &str,
@@ -592,7 +607,8 @@ impl<'a> Loader<'a> {
         _layer: usize,
         world: usize,
         rank: usize,
-    ) -> Result<(Vec<DevExpert>, DevBuf)> {
+        ilv: bool,
+    ) -> Result<(Vec<DevExpert>, DevBuf, bool)> {
         const NAMES: [&str; 6] = [
             "w1.weight", "w1.scale", "w3.weight", "w3.scale", "w2.weight", "w2.scale",
         ];
@@ -610,22 +626,111 @@ impl<'a> Loader<'a> {
             }
         }
         let total: usize = plans.iter().map(|p| p.bytes).sum();
+        // The interleave needs the gate and up planes to be byte-identical (they
+        // are: both are ExpertRows [padded_inter, dim/2]) and an 8-byte granule.
+        // Any surprise falls back to the plain layout instead of mis-indexing.
+        let w1b = if plans.len() >= 3 { plans[0].bytes } else { 0 };
+        let ilv = ilv
+            && n_routed > 0
+            && plans.len() == n_routed * 6
+            && w1b > 0
+            && w1b % 8 == 0
+            && plans[2].bytes == w1b
+            && plans[0].local.len() == 2
+            && plans[0].local[1] * dtype_size(&plans[0].dtype) % 8 == 0
+            && !plans[0].widen
+            && !plans[2].widen;
+        // Per-expert byte offsets of the six planes.
+        //   plain        : [w1][w1.scale][w3][w3.scale][w2][w2.scale]
+        //   interleaved  : [w1||w3 interleaved][w1.scale][w3.scale][w2][w2.scale]
+        // (w3.weight shares offset 0 with w1.weight in the interleaved case: one
+        // region holds both, and the kernel derives the up bytes from the gate
+        // pointer. Rust's per-expert STRIDES are pointer differences between
+        // experts, which stay uniform in both layouts.)
+        let (block, poff) = if ilv {
+            let mut o = [0usize; 6];
+            o[1] = 2 * w1b;
+            o[3] = o[1] + plans[1].bytes;
+            o[4] = o[3] + plans[3].bytes;
+            o[5] = o[4] + plans[4].bytes;
+            (o[5] + plans[5].bytes, o)
+        } else {
+            let mut o = [0usize; 6];
+            let mut acc = 0usize;
+            for (k, slot) in o.iter_mut().enumerate() {
+                *slot = acc;
+                acc += plans[k].bytes;
+            }
+            (acc, o)
+        };
+        debug_assert!(block * n_routed <= total.max(1));
         // one allocation; the K padding is already zero
         let pool = self.dev.alloc(total.max(1))?;
         self.dev.zero_at(pool.ptr, total.max(1))?;
-        // pass 2: DMA each slice into its offset
         let base = pool.ptr as *mut u8;
         let mut views: Vec<DevTensor> = Vec::with_capacity(plans.len());
-        let mut off = 0usize;
-        for plan in &plans {
-            let dst = base.wrapping_add(off) as *mut std::ffi::c_void;
-            self.dma_plan(plan, dst, world, rank)?;
-            views.push(DevTensor {
-                buf: Device::view(dst, plan.bytes),
-                shape: plan.local.clone(),
-                dtype: if plan.widen { "F32".into() } else { plan.dtype.clone() },
-            });
-            off += plan.bytes;
+        // Interleaved: the gate/up pair is staged in a scratch (the permute
+        // kernel may not write into either source). Zeroed ONCE: `dma_plan`
+        // writes only the real rows, so the K padding rows stay zero in the
+        // scratch and every expert's doubled region is rebuilt from them.
+        let tmp = if ilv { Some(self.dev.alloc(2 * w1b)?) } else { None };
+        if let Some(t) = &tmp {
+            self.dev.zero_at(t.ptr, 2 * w1b)?;
+        }
+        for e in 0..n_routed {
+            let i = e * 6;
+            let pb = base.wrapping_add(e * block);
+            if let Some(t) = &tmp {
+                let tpb = t.ptr as *mut u8;
+                self.dma_plan(&plans[i], tpb as *mut std::ffi::c_void, world, rank)?;
+                self.dma_plan(
+                    &plans[i + 2],
+                    tpb.wrapping_add(w1b) as *mut std::ffi::c_void,
+                    world,
+                    rank,
+                )?;
+                self.dev.interleave_gateup_fp4(
+                    tpb as *const u8,
+                    tpb.wrapping_add(w1b) as *const u8,
+                    pb,
+                    w1b as i64,
+                )?;
+                for k in [1usize, 3, 4, 5] {
+                    self.dma_plan(
+                        &plans[i + k],
+                        pb.wrapping_add(poff[k]) as *mut std::ffi::c_void,
+                        world,
+                        rank,
+                    )?;
+                }
+            } else {
+                for k in 0..6 {
+                    self.dma_plan(
+                        &plans[i + k],
+                        pb.wrapping_add(poff[k]) as *mut std::ffi::c_void,
+                        world,
+                        rank,
+                    )?;
+                }
+            }
+            // views. k == 0 (w1) and k == 2 (w3) share the doubled interleaved
+            // region; the doubled shape documents its true extent.
+            for k in 0..6 {
+                let p = &plans[i + k];
+                let (ptr, bytes, shape) = if ilv && (k == 0 || k == 2) {
+                    (pb, 2 * w1b, vec![p.local[0], p.local[1] * 2])
+                } else {
+                    (pb.wrapping_add(poff[k]), p.bytes, p.local.clone())
+                };
+                views.push(DevTensor {
+                    buf: Device::view(ptr as *mut std::ffi::c_void, bytes),
+                    shape,
+                    dtype: if p.widen { "F32".into() } else { p.dtype.clone() },
+                });
+            }
+        }
+        if let Some(t) = tmp {
+            self.dev.free(&t);
         }
         let mut experts = Vec::with_capacity(n_routed);
         for e in 0..n_routed {
@@ -639,8 +744,36 @@ impl<'a> Loader<'a> {
                 w2_scale: views[i + 5].clone(),
             });
         }
-        Ok((experts, pool))
+        Ok((experts, pool, ilv))
     }
+
+    /// Whether the routed experts' w1/w3 can be stored INTERLEAVED
+    /// (DSV41_EXPERT_ILV). Every term is a LOAD-TIME guarantee that the only
+    /// consumers able to read that layout — the FUSED batched gate/up GEMV — are
+    /// the ones that will actually run. The sequential fallback and the unfused
+    /// batched body walk the gate and up pools separately and would read the
+    /// wrong bytes, so they must not be reachable:
+    ///   * DSV41_MOE_BATCH not disabled and the batched symbol set present;
+    ///   * DSV41_GATEUP_FUSE not disabled and the fused signature present;
+    ///   * fp4 expert mode 2 (the shared-LUT body the fused loop mirrors);
+    ///   * dim % 512 == 0 (the launcher's own fuse gate);
+    ///   * DSV41_NO_GEMV_FP4 unset — that knob routes the rows==1 call through
+    ///     the tcgen05 GEMM, which assumes the plain layout.
+    /// All of these are cached once (`OnceLock`), so the runtime `batched`
+    /// decision in chain_dev.rs cannot drift from the layout fixed here.
+    fn ilv_ok(&self, cfg: &Dsv41Config) -> bool {
+        use crate::dsv41::chain_dev as cd;
+        gateup_ilv()
+            && cd::moe_batch()
+            && cd::gateup_fuse()
+            && cd::expert_fp4_mode() == 2
+            && !cd::no_gemv_fp4()
+            && cfg.dim % 512 == 0
+            && self.dev.supports_moe_batch()
+            && self.dev.supports_gateup_fuse()
+            && self.dev.supports_expert_ilv()
+    }
+
     pub fn load_single(&mut self, spec: &TensorSpec, world: usize, rank: usize) -> Result<DevTensor> {
         self.load_tensor(spec, world, rank)
     }
@@ -656,6 +789,10 @@ impl<'a> Loader<'a> {
             ..Default::default()
         };
         let want = |n: &str| specs.iter().find(|s| s.name == n).cloned();
+        // ONE layout decision for the whole model (routed experts' gate/up):
+        // every layer and the MTP blocks share it, so a mixed layout can never
+        // arise from a per-layer difference. See `ilv_ok`.
+        let ilv_ok = self.ilv_ok(cfg);
         // A macro rather than a closure: a closure capturing `self` mutably
         // would conflict with the very next `self.load_tensor` call, and it has
         // to span both the backbone and the draft loops.
@@ -735,9 +872,11 @@ impl<'a> Loader<'a> {
             // pooled allocation — 6 cudaMallocs per expert (92k over the model)
             // exhausted the 4 GB host's driver bookkeeping.
             let (n_routed, _) = cfg.moe_config(l);
-            let (experts, pool) = self.load_expert_pool(&p, n_routed, l, world, rank)?;
+            let (experts, pool, experts_ilv) =
+                self.load_expert_pool(&p, n_routed, l, world, rank, ilv_ok)?;
             ld.experts = experts;
             ld.expert_pool = Some(pool);
+            ld.experts_ilv = experts_ilv;
             w.layers[l] = ld;
         }
 
@@ -777,9 +916,11 @@ impl<'a> Loader<'a> {
             take!(p, ld, "ffn.shared_experts.w2.weight", shared_w2);
             take!(p, ld, "ffn.shared_experts.w2.scale", shared_w2_scale);
             let (n_routed, _) = cfg.moe_config(cfg.n_layers + s);
-            let (experts, pool) = self.load_expert_pool(&p, n_routed, cfg.n_layers + s, world, rank)?;
+            let (experts, pool, experts_ilv) =
+                self.load_expert_pool(&p, n_routed, cfg.n_layers + s, world, rank, ilv_ok)?;
             ld.experts = experts;
             ld.expert_pool = Some(pool);
+            ld.experts_ilv = experts_ilv;
             if s == 0 {
                 take!(p, ld, "main_proj.weight", attn_norm); // placeholder
                 if let Some(sp) = want(&format!("{p}.main_proj.weight")) {

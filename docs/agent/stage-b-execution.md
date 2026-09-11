@@ -31,3 +31,26 @@
 | **4-deep sparse prefetch** | −0.03~0.05 | ⚠️ ROI 不足：N=4 恰好整除（零 tail）是唯一实益，但 0.34ms 的核再省 10-15% 只有 ~0.04ms；排在 #5/#6 之后。**6-deep 不做**（余 4，tail 变长） |
 | **MoE cooperative 段核 / 段 A 融合** | −0.4~0.7 / −0.6~1.0 | ⚠️ 收益最大但属 Stage C 结构性改动（同编译单元 + 数值契约），**不在 Stage B 范围**；Stage B 先拿满增量收益再上 |
 | 批量 sed 翻默认值、给 sparse/quant 加 blockDim、拆 split=8、MTP | — | ❌ 历史阴性/明令禁止（`roadmap-200-tokps.md` §6） |
+
+## 3. 本轮实施：expert gate/up 权重交错布局（`DSV41_EXPERT_ILV`，默认 ON）
+
+**来源**：`expert-gateup-audit` 的 (c) 选项 —— `expert_gemv_fp4_batched_kernel` 的融合 gateup 分支每 group 读两次 8B（gate 行一个 LDG.64、up 行一个 LDG.64），而这两段的地址只差一个固定的行内偏移。把 w1/w3 在**加载时**按 8 字节粒度交错进**同一块区域**后，每 group 只需 **1×LDG.128**（前 8B = gate chunk、后 8B = 对应的 up chunk）。预期 gateup −9% TEX ≈ **−0.09ms**。
+
+**布局**（每 expert 一块，池总大小不变，仅顺序变化）：
+
+| | 每 expert 的 6 个平面 |
+|---|---|
+| 关（原样） | `[w1][w1.scale][w3][w3.scale][w2][w2.scale]` |
+| 开 | `[w1‖w3 交错 2×w1bytes][w1.scale][w3.scale][w2][w2.scale]` |
+
+交错规则：`dst[16i..16i+8) = gate[8i..8i+8)`，`dst[16i+8..16i+16) = up[8i..8i+8)`。scale 保持分离（kernel 本来就分开读 gate/up scale）。kernel 侧 gate 字节在 `row*2*kbytes + 2*q`，up 在 `+8`（`q = (g2<<8)+(lane<<3)`，`2*q` 天然 16B 对齐 ⇒ LDG.128 合法）。**纯置换**：同样的字节、同样的 e2m1 解码、同样的 g/u 双 fma 链 ⇒ 位级安全，变的只是 load 指令数。
+
+**改动点**：
+- `kernels/cuda/dsv41_experts_mxf4.cu`：`expert_gemv_fp4_batched_kernel` 变 `template <bool ILV>`（融合分支一次 uint4 取 4 word；`ILV=false` 实例代码与原来同源）；新增 `dsv41_interleave_gateup_fp4`（加载期置换核，device-to-device）；`dsv41_expert_gate_up_fp4_batched` 增尾参 `int ilv`，`ilv && !fuse` 直接返回错误。
+- `crates/ferrite-models/src/dsv41/load.rs`：`load_expert_pool(..., ilv)` 重排偏移 + 临时 scratch（一次 zero，padding 行保持 0）+ 逐 expert 调置换核；`ilv_ok()` 汇总所有加载期前提（MOE_BATCH/GATEUP_FUSE 未关、`DSV41_NO_GEMV_FP4` 未设、mode==2、`dim%512==0`、.so 三个符号齐备）；`LayerDev.experts_ilv` 记录实际布局。
+- `chain_dev.rs`：把 `ilv` 传给 batched 调用；**交错布局下若非 batched 路径直接报错**（顺序/未融合版无法寻址交错池）。
+- `weights.rs`：`gateup_ilv()` env（`DSV41_EXPERT_ILV=0` 关闭）；无新符号的旧 .so 自动退化为原布局。
+- ABI：`FERRITE_KERNEL_ABI_VERSION` 1→2（`EXPECTED_ABI` 同步），防止旧 .so 按旧签名解释新参数。
+- 自测：`tests_tcgen05_mxf4.cu` 新增 `run_ilv_case()`（同一组权重 plain vs interleaved 走 batched 融合核，**逐位比较**）。
+
+**远端验证口径（必做）**：①`nvcc -arch=sm_103a -O2 -std=c++17 -o /tmp/t tests_tcgen05_mxf4.cu && /tmp/t` → `run_ilv_case` 必须 EXACT；②同一次 checkout 出双产物，`DSV41_EXPERT_ILV=1` vs `=0` 背靠背单轮，四段文本逐字节相同 + `faults=0`，再看 p50（这才是 −0.09ms 的判据）；③加载正确性：`DSV41_LOAD_TRACE=1` 看每 rank 权重字节数不变（交错不改变总量），并用 `DSV41_MOEDBG=1` 确认路由/输出正常（若交错写错，第一层 MoE 输出就会崩）。
