@@ -1260,10 +1260,18 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // correct arithmetic that nonetheless flips near-boundary logits.
             extern __shared__ uint8_t s_w[];
             uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
-            for (int i = lane; i < (k >> 5); i += 32) {
-                *reinterpret_cast<uint4*>(row_s + (i << 5)) =
-                    *reinterpret_cast<const uint4*>(wr + (i << 5));
+            // Sixteen bytes per lane per iteration. The first cut counted
+            // thirty-two-byte k-blocks while copying one uint4 each, so only the
+            // first half of every block was staged, the odd halves stayed
+            // uninitialised, and the result was a five percent "speed-up" on a page
+            // of garbage. Count sixteen-byte units, and cover a k that is not a
+            // multiple of sixteen with a byte tail.
+            const int n16 = k >> 4;
+            for (int i = lane; i < n16; i += 32) {
+                *reinterpret_cast<uint4*>(row_s + (i << 4)) =
+                    *reinterpret_cast<const uint4*>(wr + (i << 4));
             }
+            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
             __syncwarp();
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
