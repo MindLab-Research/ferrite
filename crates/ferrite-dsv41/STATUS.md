@@ -5343,3 +5343,11 @@ sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
 - 真正省的 = idx_wp 那个 8-block 小 slot ≈ **−0.25~0.5ms**（不是 −1.0ms）
 - `gemv_bf16_fp8x2` 不建 LUT/a32（用 e4m3_to_f 位运算）——"每族各做一遍"的假设不成立，可省的只有 fp8 激活 staging 一遍
 - 设计文档在 `~/.xbot/users/web-4/workspace/dsv41-xn-megakernel-design.md`
+
+### cross-layer-pipe 设计（报告已取回）
+
+字面"ffn mixes 挪到 L+1 attn 段"**不可行**（届时 s.h 已被 hc_post 覆写、dots 读错数据）。
+**修正方案**：把每次 front 拆成 ⟨A⟩collapse_norm（留原位，MoE 依赖 xn）+ ⟨B⟩mixes dots+tail（推迟，与 AR 合并进同一 launch——AR v5 只有 5 个 1024 线程 block，poll 窗口上百个 SM 空闲）。
+⚠️ 最大陷阱：AR 核的 `step = gridDim.x*blockDim.x` 会因新增 block 而错位——必须按 `blockIdx.x < ar_blocks` 分区。
+⚠️ post/comb 是单份共享缓冲，需双缓冲；单层流水安全（3 槽 i%3），双层需扩 4 槽。
+预期 −0.3~0.5ms（80 个 ⟨B⟩ 各 ~8-12µs 藏进 AR poll）。
