@@ -6820,3 +6820,25 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 - subagent 只做调研/探索/写代码
 - 确保 .so/rust 版本匹配（多层防线已实施）
 - cargo 没有增量缓存问题（用户确认）
+
+### 🎉 全部优化验证成功：6.84ms / 146.2 tok/s（2026-09-12 00:45）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| **allv2（K-split + P1 + B+C + dead slots + launch_bounds）** | **6.84ms** | **146.2** | 四段全对 | 0 |
+
+**vs K-split only（6.57ms）**：+0.27ms——P1 的 a32 死槽消除可能反而增加了 global 读取（s_a 中间缓存本来挡住了一部分 global→smem 流量）
+**vs 原始基线（13.28ms）**：**−6.44ms（−48.5%），75.3→146.2 tok/s（+94.2%）**
+
+**会话全部优化**（26 项，全部验证通过）：
+- 6 个 fork/join 侧流（tail/dual-chain/MoE-dual/compress/EARLY/dots-to-side + B 优化）
+- P1 a32 死槽消除 ×2（gemm + gemv_bf16_fp8x2）
+- K-split（warp 翻倍）
+- 9 个融合（sparse-o-rope/fp4-pack/hc_post/NORM_FUSE/wob-f32/elementwise/comp_placeholder/add→AR store/quant 消除）
+- 3 个 AR 优化（grid 失衡修复/pubred 优化/多流优先级）
+- 5 个占用率修复（gateup K-split/indexer/engram/a32 开关/down 4-value）
+- struct pack + __launch_bounds__ + runtime smem ceiling
+- hc tail B+C（EARLY 回主流 + PRIO 降 default）
+- expert launch_bounds
+
+**距离 200 tok/s（5.0ms）还差 1.84ms**——gemm 3.02ms 仍是最大项。
