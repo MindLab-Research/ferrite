@@ -7069,3 +7069,14 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **已提交待验证**（远端 90c20a3e 正在跑）：
 - down 回归修复（launch_bounds 移除 + ILV 不再全局禁用）
 - dots-late merge（DSV41_HC_DL_MERGE，默认 OFF，=1 开启）
+
+### wo-pair +0.46ms 回退的根因定案（wo-pair-diagnosis，2026-09-12 02:45）
+
+**结构性回退，非 barrier 开销**。三个因素：
+1. **共享 smem 池被 phase1 撑大**（≈0.30ms）：pool 按 kmax=5120 分配，phase2 (wo_b k=1024) 只需 17.5KB 却被迫用 42.3KB → 5 blk/SM（vs 独立 8 blk/SM）→ **占用率 96→20 warp/SM（4.8x 崩塌）**
+2. **co_res 截断 + stride 失衡**（≈0.10ms）：grid 被截断到 740，行循环 stride=2960 → 半数 warp 跑 2 行 → barrier 等最慢者
+3. **barrier + 丢 PDL**（≈0.06~0.10ms）：sense-reversing barrier 80 次/步 + wo_b 从 PDL consumer 变 plain launch
+
+**教训**：异 k 链式对（ka≠kb 且 min×2 < max）的共享 smem 池注定占用率崩塌。**DSV41_WO_PAIR 保持 OFF**。如果要做类似的两段核，必须每段独立分配 smem（两次 cudaFuncSetAttribute 不可行——CUDA 只支持一个 dynamic smem 大小）或用两个独立 launch + PDL 串接。
+
+**对 sh-pair 的影响**：sh_w13 k=5120 vs sh_w2 k=640——比例更极端（8:1），同样的崩塌风险。sh-pair-occupancy 正在审查。
