@@ -6397,3 +6397,27 @@ sparse 0.34 · v2(gate+route) 0.39 · quant 0.13 · 其它 ~0.9
 - + tail-late priority（−0.3~0.6）+ NORM_FUSE（−0.13）+ wob-f32（−0.06）≈ 7.5-7.7ms
 - + dual-chain attn（−0.42）+ MoE dual（−0.5~0.88）+ fp4-pack（−0.06）≈ 6.5-7.2ms
 - + PDL 链（−0.3~0.6）+ sparse-o-rope（−0.06~0.10）+ AR pubred（−0.1~0.2）≈ **5.9-6.7ms ≈ 149-169 tok/s**
+
+### a32/占用率洞察的完整影响计算（2026-09-11 深夜）
+
+**gemv-creative 的发现**：mode 4 的 a32 staging（s_af = k×f32 = 20KB）把每 block smem 推到
+~47.4KB → 仅 4 blocks/SM = 25% 占用率。a32 的收益（−6/−8/−13%）是在 n=256/1024/1664 的
+探针上测的，**从未在生产 n=5120 复测**。如果关掉 a32 → 8 blocks/SM → 占用率翻倍，
+gemv 8.5µs → 5-6µs 可期（LDS 吞吐 + 每行 barrier 是硬底，2-3µs 不现实）。
+
+**完整 post-recovery 预期计算**：
+| 项 | 预期 | 累计 |
+|---|---|---|
+| Round 41 基线 | 8.23ms | 8.23 |
+| tail-late priority | −0.3~0.6 | 7.6-7.9 |
+| NORM_FUSE + wob-f32 | −0.19 | 7.4-7.7 |
+| dual-chain + MoE-dual | −0.9~1.3 | 6.1-6.8 |
+| fp4-pack + interleave | −0.15 | 6.0-6.7 |
+| PDL 链 + expert PDL | −0.3~0.7 | 5.3-6.4 |
+| sparse-o-rope + AR pubred | −0.16~0.3 | 5.0-6.1 |
+| hc_post compat + engram f32 | −0.15 | 4.9-6.0 |
+| **a32 实验（如果 positive）** | **−0.74** | **4.2-5.2ms** |
+| **最终预期** | | **4.2-5.2ms ≈ 192-238 tok/s** |
+
+**如果 a32 实验验证成功（占用率是 gemv 的真因），200 tok/s（5ms）在当前优化集内可达！**
+恢复后的验证顺序：哨兵 → serve base → a32 A/B（DSV41_GEMV_FP8_MODE=3 vs 4）→ 全量验证。
