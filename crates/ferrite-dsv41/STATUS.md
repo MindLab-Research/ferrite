@@ -7080,3 +7080,20 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **教训**：异 k 链式对（ka≠kb 且 min×2 < max）的共享 smem 池注定占用率崩塌。**DSV41_WO_PAIR 保持 OFF**。如果要做类似的两段核，必须每段独立分配 smem（两次 cudaFuncSetAttribute 不可行——CUDA 只支持一个 dynamic smem 大小）或用两个独立 launch + PDL 串接。
 
 **对 sh-pair 的影响**：sh_w13 k=5120 vs sh_w2 k=640——比例更极端（8:1），同样的崩塌风险。sh-pair-occupancy 正在审查。
+
+### 🎉 v4/v4dl 验证成功：6.48ms / 154.3 tok/s（2026-09-12 03:00）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| v4（down fix + defaults） | 6.54ms | 152.9 | 四段全对 | 0 |
+| **v4dl（+ dots-late merge ON）** | **6.48ms** | **154.3** | 四段全对 | 0 |
+
+**dots-late merge 兑现 −0.06ms**。HC_DL_MERGE 已翻默认 ON（代码确认）。
+
+**会话累计：13.28 → 6.48ms（+104.9%），75.3 → 154.3 tok/s（+105%）——超过 2x！**
+
+**距离 200 tok/s（5.0ms）还差 1.48ms**
+**已提交待验证**：AR store parallel（−0.2ms）+ act cp.async（−0.25ms 实施中）
+**在飞**：sh-pair（−0.26ms 占用率审查中）
+**如果全部兑现**：6.48 − 0.71 = 5.77ms ≈ 174 tok/s
+**还需 ~0.77ms 新优化**
