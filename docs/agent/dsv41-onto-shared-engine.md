@@ -111,3 +111,34 @@ epoch 放在 staging 尾部（`ctr_at` ✓），reduce 直写调用方缓冲 ✓
 - **AR 的 publish 会自旋** ⇒ 剖析时必须用 NCCL 模式（去掉 P2P/AR v5 的 env ✓）。
 - **图捕获期**：epoch 由 **reduce 的最后一块**推进 ✓ ⇒ 只被 replay 推进 ✓（不能有 dry-run 参与 ✓）。
 - **测试旋钮必须 static 缓存** ✗（每次 AR 调用都 `getenv` 是热路径罪 ✓）。
+
+## Phase 3 的精确输入（图原语合并，已读双方 ✓）
+
+**共享侧已有**（`kernels/cuda/ferrite_kernels.cu:7022+`，绑定在 `ferrite-kernel/src/cuda.rs` ✓）：
+```c
+ferrite_graph_begin(s)        -> cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal)
+ferrite_graph_end(s, &g)      -> cudaStreamEndCapture
+ferrite_graph_instantiate(&e, g) -> cudaGraphInstantiate(e, g, 0)
+ferrite_graph_launch(e, s)    -> cudaGraphLaunch
+ferrite_graph_destroy_exec(e) -> cudaGraphExecDestroy
+```
+
+**⚠ 关键差异（本会话实测）**：共享侧用 **`ThreadLocal`** ✓；DSV4 是**单进程 8 个 rank 线程** ✓
+（每个 rank 一条流、但**共享 CUDA 上下文的 legacy stream** ✗）⇒ 用 `Global` 会被**其它 rank 的同步
+API 调用**作废（实测 `cudaErrorStreamCaptureUnjoined` 901 / instantiate 900 ✗）⇒ DSV4 必须用
+**`Relaxed`** ✓（最宽松：只拒绝捕获线程自己的非法调用 ✓）。
+**建议**：把**模式作为参数**（或共享默认改 **`Relaxed`** ✓ —— 它是 `ThreadLocal` 的超集，对 GLM 无害 ✓）。
+
+**必须随共享 API 一起"继承"的 4 个捕获纪律**（本会话逐个踩过并修好 ✓，写进共享实现的注释 ✓）：
+1. **捕获区内禁止任何同步流 API** ✗：`cudaMemset`/`cudaMemcpy`（会跑在 legacy stream ✗ —— 报
+   "operation would make the legacy stream depend on a capturing blocking stream" ✓）⇒ 一律用
+   `cudaMemsetAsync`/`cudaMemcpyAsync` + 自己的流 ✓。
+2. **捕获区内禁止分配** ✗：`cudaMalloc`（err 900 ✓）⇒ 预分配；若确需在捕获期分配，用
+   `cudaMallocAsync` + 自己的流 ✓（并从 stream 池取 ✓）。
+3. **先热身再捕获** ✓：第一步跑真实路径（预热 kernel/建懒态/给 cuBLAS 定 workspace ✓），
+   第二步才捕获 ✓；**捕获只记录不执行** ⇒ 捕完**立刻 launch 一次**以完成本步 ✓。
+4. **冻结点审计**（最隐蔽 ✗）：任何**以宿主计算值作为 kernel 参数或 `cudaMemcpy` 源/目的地址**
+   的调用都会被烤死 ✗ —— 本会话的真凶就是 `memcpy_d2d(ring + (pos%win)*hd, ...)` ✗
+   ⇒ 必须改成**设备侧派生**（新 kernel 内用 `*pos_ctr` 算 ✓：`window_idxs`/`compress_commit`/
+   `ring_append` 三个 DSV4 kernel 就是为此而生 ✓，**保留在模型侧** ✓）。
+   判据：症状与生成长度相关、拐点与某个宿主计数周期吻合（本例 ratio=4 ✓）⇒ 直指该路径 ✓。
