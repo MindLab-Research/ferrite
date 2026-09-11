@@ -142,3 +142,35 @@ API 调用**作废（实测 `cudaErrorStreamCaptureUnjoined` 901 / instantiate 9
    ⇒ 必须改成**设备侧派生**（新 kernel 内用 `*pos_ctr` 算 ✓：`window_idxs`/`compress_commit`/
    `ring_append` 三个 DSV4 kernel 就是为此而生 ✓，**保留在模型侧** ✓）。
    判据：症状与生成长度相关、拐点与某个宿主计数周期吻合（本例 ratio=4 ✓）⇒ 直指该路径 ✓。
+
+## Phase 4-6 的具体清单（模块归属已按代码头部注释逐个判定 ✓）
+
+**`crates/ferrite-dsv41/src/` 13 个模块的归属**（行数为证 ✓）：
+| 模块 | 行数 | 归属 | 依据 |
+|---|---|---|---|
+| `chain.rs` | 684 | **模型** ✓ | 头部注释："The model chain. Layer order is the reference's, which is *not* the usual one" ✓ |
+| `ops.rs` | 1060 | **模型** ✓ | "CPU reference implementations … the numerical golden standard" ✓（保留为对拍基准 ✓）|
+| `chain_dev.rs` | 1819 | **拆分** ✗ | 设备编排设备态（位置计数器/图分支/premix D2D ✗ → 共享）+ **层链逻辑** ✓（attention/compress/moe/indexer/hc ✓ → 模型 ✓）|
+| `load.rs` / `weights.rs` | 883 / 841 | **模型** ✓ | DSV4 checkpoint 布局 + fp4/fp8 分片 + 引擎的 engram 表 ✓ |
+| `config.rs` | 596 | **模型** ✓ | HF `config.json`（嵌套 `text_config`）与官方键名映射 ✓ |
+| `quant.rs` / `engram.rs` | 528 / 451 | **模型** ✓ | 量化辅助 / n-gram 哈希（含本会话的设备化 kernel 对接 ✓）|
+| `vision.rs` | 1402 | **模型** ✓ | DSV4 的视觉塔 ✓（迁移时一并带走 ✓）|
+| `dspark.rs` | 335 | **模型** ✓ | draft/投机相关（**注意：用户的 MTP 禁令与此模块的启用条件需在迁移时确认 ✓**）|
+| `kernels.rs` | 434 | **模型** ✓ | "Kernel ABI … `dsv41_kernels.cu` implements exactly these extern C" ✓（随模型走 ✓）|
+| `device.rs` | 1416 | **共享** ✗ | 换成 `ferrite-kernel` 等价接口（Phase 1 ✓）|
+| `tp.rs` | 506 | **共享** ✗ | `Collective`/`SpinBarrier` 换成共享实现（Phase 2 ✓）|
+
+**Phase 5（单一二进制）**：`ferrite-serve --model {glm53,dsv41}` ✓ —— 只按**数据**分叉：
+`StopSpec`（停词集 ✓）/`ChatFrame`（chat 模板 ✓）/`EngineDriver` 实现 ✓ —— 机制全部在共享栈 ✓
+（`ferrite-http` 的 `ServeEngine`/`SingleFlight`/`Seg::Id`/`StopSpec`/`ChatFrame` ✓ 本会话已通用化 ✓）。
+
+**Phase 6（删除核对表）**：
+1. `crates/ferrite-dsv41/` 整目录 ✗ → workspace `members` 同步 ✓；
+2. **ABI 边界核对** ✓：`dsv41_*.cu` 的 `extern "C"` 符号与 `kernels.rs` 的声明一一对应 ✓
+   （迁移后 ksel 仍需能 dlopen 到同一 `.so` ✓ —— `build.sh` 已把 dsv41 的四个 TU 一起编译 ✓）；
+3. **环境变量核对** ✓：`DSV41_*`（MODEL_DIR/KERNELS/GRAPH_STEP/TIMING/AR_V5/ENG_HOST/… ✓）
+   在共享侧仍要生效 ✓ —— 其中 `DSV41_AR_V5`/`DSV41_GRAPH_STEP` 的语义会随 Phase 2/3 变化 ✓
+   （开图即需要设备侧 AR ✓）；
+4. **文档**：把 `crates/ferrite-dsv41/STATUS.md` 的知识**合并进**共享文档 ✓
+   （本会话的全部根因与纪律 ✓），然后随 crate 一起删除 ✓；
+5. **终验收**：GLM 与 DSV4 各一次（四段+长文亲自读 ✓ + `/v1/stats` ✓ + 稳态 step time ✓）。
