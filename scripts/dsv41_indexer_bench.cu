@@ -52,6 +52,14 @@ static void bench_idx(int n_pos, int nh, int hd, int topk, int reps) {
     std::sort(ts.begin(), ts.end());
     printf("  indexer n_pos=%-6d nh=%d hd=%d topk=%d  median %8.2f us  (min %8.2f)\n", n_pos, nh, hd,
            topk, ts[ts.size() / 2] * 1000.0, ts.front() * 1000.0);
+    // Fingerprint: the selection the kernel produced must not move when a
+    // scheduling switch changes (it may only get faster).
+    {
+        int32_t ho[8] = {0};
+        cudaMemcpy(ho, out, sizeof(ho), cudaMemcpyDeviceToHost);
+        printf("    picks[0..7] = %d %d %d %d %d %d %d %d\n", ho[0], ho[1], ho[2], ho[3], ho[4],
+               ho[5], ho[6], ho[7]);
+    }
     cudaFree(q); cudaFree(ik); cudaFree(w); cudaFree(lens); cudaFree(out);
 }
 
