@@ -260,22 +260,17 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // DIAGNOSTIC: s_x removed as well (the last unverified piece). The
-    // activation is read straight from global memory exactly as the baseline did,
-    // and the accumulation uses the baseline expression form.
+    // Baseline single-chain loop: the four-way manual unroll that lived here
+    // since a4053cd turned out to be the second-round regression. With
+    // --use_fast_math, four INDEPENDENT `acc += w*x` expressions are
+    // reassociable (the single dependency chain is not), and the drift
+    // accumulates over 40 layers into a degenerate model. The isolation
+    // comparison had missed it because it compared single-chain vs fmaf,
+    // not unrolled vs single-chain.
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
-        int c = lane;
-        for (; c + 96 < k; c += 128) {
-            const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
-            const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
-            acc += __bfloat162float(w0) * x0;
-            acc += __bfloat162float(w1) * x1;
-            acc += __bfloat162float(w2) * x2;
-            acc += __bfloat162float(w3) * x3;
-        }
-        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
+        for (int c = lane; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
@@ -288,20 +283,11 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // DIAGNOSTIC: s_x removed as well (matching gemv_bf16).
+    // Baseline single-chain loop (same as gemv_bf16 - see the note there).
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const float* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
-        int c = lane;
-        for (; c + 96 < k; c += 128) {
-            const float w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
-            const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
-            acc += w0 * x0;
-            acc += w1 * x1;
-            acc += w2 * x2;
-            acc += w3 * x3;
-        }
-        for (; c < k; c += 32) acc += wr[c] * x[c];
+        for (int c = lane; c < k; c += 32) acc += wr[c] * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
