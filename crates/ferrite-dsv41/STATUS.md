@@ -3209,3 +3209,21 @@ if (lens != nullptr && *lens > 0) n_pos = *lens;   // 扫描上界跟设备 clen
 `dsv41_indexer_topk` 的 grid 恒为 `(m, b) = (1, 1)`（DSV4.1 的 serve 连 prefill 也是
 **一次一 token 前向** ✓，且全树只有一个调用点 ✓）⇒ **本来就只有 1 个 block** ✓，
 占用率不受影响、prefill 无回退 ✓。
+
+### 该修法的包络与长期改进路径（必须写明，勿误以为已彻底无界 ✓）
+
+修法把 indexer 的 smem **压成常量**（idx_cap ≈ 8600 行 ⇒ ~47.1KB，46KiB 预算 ✓），并让 kernel
+把实时计数**钳位**到它 ✓ ⇒ **越界结构上不可能** ✓（原 bug 消除 ✓）。代价是一条**明确记录的边界**：
+当某层的压缩行数 `*lens` 超过 idx_cap 时，扫描只覆盖 `[0, idx_cap)` ✗ —— 更后的候选**静默漏掉**
+（被 -inf 掩码视为不存在 ✓ 不崩、但 top-k 质量下降 ✗）。
+
+- **可达性**：压缩行数 ≈ 上下文 / ratio。DSV41_MAX_POS 默认为 64k ✗ ⇒ 对 ratio=1 的层约 8600 token
+  就可能触及 ✗；典型 ratio（DSA 层）大得多 ⇒ 需要 数十万 token 上下文才会触及 ✓。
+  **当前 serve 的实测上下文（数千 token）远在包络内 ✓**，但**长上下文（>8600×ratio）会静默降质** ✗。
+- **长期正解（两选一，均已评估）**：
+  ① **查设备的 opt-in 上限再用真实上限**：`cudaDeviceGetAttribute(cudaDevAttrMaxSharedMemoryPerBlockOptin)`
+     + `cudaFuncSetAttribute(..., 查到值)` —— 注意**不能抄魔数** ✗（我抄 `232448` 那次实测就是
+     `cuda error 1` ✗，因为那段 gemm_fp8 代码在本机从未执行过 ✓）。上限约 227KB ⇒ idx_cap ≈ 44000 ✓。
+  ② **分块扫描**：smem 只需覆盖一块候选，多块累加 top-k（确定性归并 ✓）—— 无上限 ✓ 但要改 kernel ✓。
+- **另一条明确的设计约束**：可用默认是 **47KiB** 而非名义 48KiB ✗（驱动每 block 保留 1KiB ✓）——
+  两次实测都在这条线上撞过 ✓（48KiB 那次 `cuda error 1` ✓）。
