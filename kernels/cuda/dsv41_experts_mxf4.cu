@@ -755,7 +755,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             for (int g = 0; g < nv; ++g) {
                 const int j = (g << 8) + (lane << 3);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-                const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 6) + off);
+                // 256 packed values are 128 bytes, so group g starts at g*128, not g*64.
+            const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 7) + off);
                 acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
                 acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
                 acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);

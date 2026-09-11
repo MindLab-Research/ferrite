@@ -981,13 +981,13 @@ impl<'a> DevChain<'a> {
 /// the hot path must never touch the environment per call.
 fn fuse_c() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Segment B cluster 1 fusion: hc_collapse + rmsnorm(ffn_norm) in one kernel.
 fn fuse_b1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(true))
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
