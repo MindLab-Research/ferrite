@@ -2611,7 +2611,14 @@ static inline size_t dsv41_gemv_a32_bytes(int k) {
 // prologue writes s_a and the decode still reads it) and passes norm_fuse=true.
 // MUST stay in lockstep with the kernel's `a32_direct` / `s_ws` computation.
 static inline size_t dsv41_gemv_sa_bytes(int k, bool norm_fuse) {
-    return (g_gemv_a32 && !norm_fuse && !g_gemv_a32_staged) ? (size_t)0 : (size_t)k;
+    // Forward-declared P1 gate (definition at g_gemv_a32_staged below) -
+    // use a local getenv read to avoid C++ forward-reference issues
+    static int cached_staged = -1;
+    if (cached_staged < 0) {
+        const char* se = getenv("DSV41_GEMV_A32_STAGED");
+        cached_staged = (se != nullptr && se[0] == '1') ? 1 : 0;
+    }
+    return (g_gemv_a32 && !norm_fuse && cached_staged == 0) ? (size_t)0 : (size_t)k;
 }
 
 // Rows per gemv block, shared by the single-family and the two-family launchers.
@@ -6190,32 +6197,50 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 }
 
 // hc tail split entry (DSV41_HC_TAIL_SPLIT, Rust-gated). Same front end as
-// dsv41_hc_front, but the DOTS and the LATE half leave the main stream: the
-// EARLY half (collapse + rmsnorm + T1 fp8) stays on `main`, the dots and the
-// LATE half (ss + sigmoid + sinkhorn + comb) run in that order on `side`.
-// Issued sequence (dependency view, not host order):
-//   main: tail_early(HC_TAIL_EARLY) -> record(fork_ev) [-> projections -> ...]
-//   side: wait(fork_ev) -> dots -> tail_late(HC_TAIL_LATE) -> record(join_ev)
+// dsv41_hc_front, but the ENTIRE tail chain — and the dots — leave the main
+// stream: the EARLY half (collapse + rmsnorm + T1 fp8), the dots and the LATE
+// half (ss + sigmoid + sinkhorn + comb) all run in that order on `side`, while
+// main blocks only on the EARLY half. Issued sequence (dependency view, not host
+// order):
+//   main: record(fork_ev) -> wait(fork_ev) [-> projections -> ...]
+//   side: wait(fork_ev) -> tail_early(HC_TAIL_EARLY) -> record(fork_ev)
+//         -> dots -> tail_late(HC_TAIL_LATE) -> record(join_ev)
 // The caller MUST then wait(join_ev) on the main stream before the hc_post that
 // consumes `comb`; the projection chain right after this call is ordered after
-// EARLY by MAIN's own program order (same stream), so the launcher issues no
-// main-stream wait at all.
+// EARLY by the launcher's own main-stream wait on the re-recorded `fork_ev`.
 //
-// WHY EARLY STAYED ON MAIN (B, 2026-09-11). An earlier variant ran EARLY on
-// `side` too ("concurrent with the dots") and paid for it with an in_ev/early_ev
-// pair: record(in_ev) on main + wait(in_ev) on side (to pin EARLY after the
-// main-stream hc_post that fills `s.h`) plus record(early_ev) on side +
-// wait(early_ev) on main (to pin the projections after EARLY). That is 4 graph
-// ops per front for ZERO main-stream win: main still had to wait for EARLY
-// (early_ev) — it paid the 1.7 us as a cross-stream round trip instead of as a
-// local launch. EARLY on main needs no event at all (stream order orders it
-// after its producers and before its consumers), while the dots+LATE chain
-// still hangs off main's path, so the split is back to ONE fork/join pair — 2
-// graph ops per front, i.e. -2 nodes/front x 80 front/step. The dots-on-side
-// win is untouched: main still never waits the dots (4.9 us) or LATE (10.7 us).
-// `in_ev`/`early_ev` remain in the ABI as dead parameters (the runtime still
-// passes whatever it created, possibly null) so a stale `.so` keeps resolving
-// the same symbol; the launcher neither validates nor touches them.
+// WHY EARLY IS BACK ON `side` (2026-09-11, REVERTING B). The A/B on 6.84 ms put
+// the +0.27 ms regression on B (EARLY-on-main) + C: P1 was neutral (see the
+// HEAD doc commits). EARLY-on-main removed the cross-stream event pair but
+// parked its 1.7 us ON main's critical path, in front of the projection group —
+// and main never avoided that wait. Pulling EARLY, the dots AND the LATE half
+// onto `side` makes the front's main-stream cost the EARLY completion (1.7 us)
+// instead of the dots (4.9 us). The side chain
+// EARLY(1.7) + dots(4.9) + LATE(10.7) = ~17 us still sits far inside the ~50 us
+// projection window that must elapse before hc_post consumes `comb`
+// (dsv41-layer-fusion.md, DSV41_HC_TAIL_PRIO note), so `join_ev` is still
+// already satisfied when main reaches hc_tail_join. (C — the LATE kernel's
+// priority demotion — is kept and is NOT part of this revert.)
+//
+// WHY `fork_ev` CARRIES BOTH EDGES. The pre-B variant expressed the two extra
+// edges with a dedicated in_ev/early_ev pair; those event objects were deleted
+// with B and are gone from the runtime that passes this ABI, so the two slots
+// stay dead (`in_ev`/`early_ev` are neither validated nor touched). The two
+// edges are therefore carried by the ONE live fork event, re-recorded once per
+// front:
+//   (i)  main -> side: record(fork_ev) on `s`, then wait it on `side` before
+//        EARLY. EARLY reads `x` (= s.h) and `pre_collapse`, both written by
+//        MAIN-stream work preceding this call, so without this edge `side` is a
+//        graph ROOT for EARLY/dots/LATE and a whole-step capture could run EARLY
+//        before the main-stream hc_post that fills s.h (stale residual bytes).
+//   (ii) side -> main: record(fork_ev) on `side` immediately after EARLY, then
+//        wait it on `s`. This orders the projection group after EARLY's writes
+//        of out/xq/xsc WITHOUT waiting the dots or the LATE half behind it.
+// Each record is immediately followed by its matching wait in program order, so
+// the whole-step capture's record/wait disambiguation rule holds (see the
+// fork_ev note in devrt.rs): a re-recorded event is never waited by a later,
+// non-adjacent path — and `join_ev` stays a SINGLE record per front, so
+// hc_tail_join's existing main-stream wait keeps its exact meaning.
 //
 // WHY THE DOTS CAN LEAVE MAIN (dots-on-side, 2026-09-11). The projection group
 // that follows this call reads ONLY the EARLY outputs — lin2 reads `xn` (= `out`)
@@ -6224,23 +6249,23 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 // hc_mixes_tail_kernel (also on `side`, after the dots in stream order). So main
 // never has a data dependence on the dots, and the main-stream front cost drops
 // from the dots (4.9 us) to the EARLY half (1.7 us). The side chain becomes
-// dots(4.9) + LATE(10.7) = ~15.6 us (EARLY no longer sits in it), still far
-// inside the ~50 us projection window that must elapse before hc_post consumes
-// `comb` (dsv41-layer-fusion.md, DSV41_HC_TAIL_PRIO note), so `join_ev` is still
+// EARLY(1.7) + dots(4.9) + LATE(10.7) = ~17 us, still far inside the ~50 us
+// projection window that must elapse before hc_post consumes `comb`
+// (dsv41-layer-fusion.md, DSV41_HC_TAIL_PRIO note), so `join_ev` is still
 // already satisfied when main reaches hc_tail_join.
 // The dots and LATE share ONE stream, so stream order already publishes
-// `g_hc_part` before the LATE reads — no second fork event. The single
-// `fork_ev` (main, after EARLY) is what pins BOTH of them after main's writes of
-// `s.h`/`pre_collapse`: without it the side stream is a graph ROOT for those
-// nodes and the whole-step capture (DSV41_GRAPH_STEP, default ON) may start the
-// dots/LATE before the main-stream hc_post that fills s.h — i.e. on stale
+// `g_hc_part` before the LATE reads — no second fork event. The main->side
+// `fork_ev` record/wait pair (i) is what pins EARLY, the dots AND LATE after
+// main's writes of `s.h`/`pre_collapse`: without it the side stream is a graph
+// ROOT for those nodes and the whole-step capture (DSV41_GRAPH_STEP, default ON)
+// may start them before the main-stream hc_post that fills s.h — i.e. on stale
 // residual bytes.
 // All stream/event ops are legal under cudaStreamCaptureModeRelaxed, so a
 // whole-step capture turns the fork/join into graph edges. Bit-identical to
 // dsv41_hc_front: the same statements execute with the same operands on
-// whichever stream (the EARLY-on-main / dots+LATE-on-side split is free — the
-// halves are disjoint in statements and in memory: EARLY writes out/xq/xsc, the
-// dots write g_hc_part, LATE writes pre/post/comb).
+// whichever stream (the EARLY+dots+LATE-on-side split is free — the three are
+// disjoint in statements and in memory: EARLY writes out/xq/xsc, the dots write
+// g_hc_part, LATE writes pre/post/comb).
 // Returns InvalidValue (1) when the gate is off, when there is no collapse half
 // to keep (w_norm == nullptr), or when the shapes are outside the spread tables —
 // all mean "use dsv41_hc_front instead".
@@ -6255,10 +6280,11 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
-    // `fork_ev` IS required again (it is the main->side edge since B), while
-    // `in_ev`/`early_ev` are dead parameters (EARLY-on-main needs no event):
-    // they are neither validated nor touched — a runtime that failed to create
-    // only those two still gets the split.
+    // `fork_ev` carries BOTH split edges — main->side input-ready at (0) and
+    // side->main EARLY-done at (2) — so it is required. `in_ev`/`early_ev` are
+    // dead parameters (their event objects were deleted with B and the runtime
+    // passes null): they are neither validated nor touched, so a runtime that
+    // failed to create only those two still gets the split.
     if (side == nullptr || fork_ev == nullptr || join_ev == nullptr)
         return (int)cudaErrorInvalidValue;
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
@@ -6280,23 +6306,19 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
             return (int)e;
         }
     }
-    // (0) EARLY half on MAIN (collapse + rmsnorm + T1 fp8). It is only 1.7 us and
-    // its ONLY consumer is the projection group immediately after this call, so
-    // main's own program order orders it both after its producers (`s.h` /
-    // `pre_collapse`, written by the previous hc_post / AR fold) and before its
-    // consumers — no event needed. Same statements, same operands and same
-    // 1024-thread block as dsv41_hc_front's EARLY ⇒ bit-identical bytes.
-    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
-        x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
-        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) return (int)e;
-    // (1) fork: the side chain (dots -> LATE) may not start before this point in
-    // main's program order. Both the dots and LATE read `x` (= s.h), whose
-    // producer is main-stream work, so publishing AFTER EARLY is a correct (and
-    // the cheapest) fork position: side has no other dependence on EARLY. This is
-    // the ONLY main<->side edge the split needs.
-    e = cudaEventRecord(fork_ev, s);
+    // (0) hc-input-ready edge, main -> side: record `fork_ev` on MAIN before the
+    // side chain and wait it on `side`. EARLY, the dots and LATE all read `x`
+    // (= s.h) and/or `pre_collapse`, both written by MAIN-stream work that
+    // precedes this call (the previous hc_post / AR fold); without this edge the
+    // side stream is a graph ROOT for those nodes and a whole-step capture
+    // (DSV41_GRAPH_STEP, default ON) could run EARLY before the hc_post that
+    // fills s.h — i.e. on stale residual bytes. This is the pre-B `in_ev` edge,
+    // now carried by `fork_ev` (the in_ev/early_ev pair was deleted with B and
+    // the runtime no longer passes them).
+    // NOTE the SAME event is used again at (2) for the opposite (side -> main)
+    // edge. Each record is immediately followed by its matching wait, which is
+    // the program-order disambiguation a whole-step capture relies on.
+    cudaError_t e = cudaEventRecord(fork_ev, s);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
@@ -6306,7 +6328,32 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // (2) dots on the SIDE stream — off main's path entirely. `g_hc_part` is
+    // (1) EARLY half FIRST on the SIDE stream (collapse + rmsnorm + T1 fp8). It is
+    // what main blocks on, so it heads the side chain; the dots and LATE behind
+    // it are off main's path entirely. Same statements, same operands and same
+    // 1024-thread block as dsv41_hc_front's EARLY ⇒ bit-identical bytes.
+    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
+        x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    // (2) EARLY-done edge, side -> main: record `fork_ev` on `side` right after
+    // EARLY and wait it on MAIN. The projection group right after this call reads
+    // EARLY's outputs (`out` / `xq` / `xsc`), so it must not start before this
+    // point; the dots and LATE stay behind it on `side` and keep running
+    // concurrently with the projections. This is the pre-B `early_ev` edge,
+    // carried by `fork_ev`. Record and wait are ADJACENT in program order.
+    e = cudaEventRecord(fork_ev, side);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
+    e = cudaStreamWaitEvent(s, fork_ev, 0);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
+    // (3) dots on the SIDE stream — off main's path entirely. `g_hc_part` is
     // written here and read only by the LATE branch below, which is on the same
     // stream, so no second event is needed to publish it. Main does NOT wait this
     // kernel (nor LATE): the projection group that follows consumes only the
@@ -6316,7 +6363,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    // (3) LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
+    // (4) LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
     // Stream order after the dots is the whole synchronisation: same-stream ops
     // cannot overtake one another, so every `g_hc_part[r][m][ck]` read below sees
     // the dots' write. Block size from g_hc_late_t when the ss partials come from
@@ -6330,7 +6377,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    // (4) join: record on the side stream; the MODEL waits it on main
+    // (5) join: record on the side stream; the MODEL waits it on main
     // (`hc_tail_join`) before the earliest consumer of `post`/`comb` — the
     // fused AR epilogue when the hc-post fold is on, the standalone hc_post
     // otherwise. Nothing to wait here: main has no consumer before that point.
@@ -6340,9 +6387,9 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         return (int)e;
     }
     // `in_ev`/`early_ev` are kept in the signature for ABI compatibility but are
-    // deliberately neither validated nor recorded/waited: since EARLY-on-main
-    // there is no main<->side edge to publish besides fork_ev. See the header
-    // comment.
+    // deliberately neither validated nor recorded/waited: the runtime no longer
+    // creates them (they went away with B) and the split's two edges are both
+    // carried by `fork_ev`. See the header comment.
     (void)in_ev;
     (void)early_ev;
     return (int)cudaGetLastError();
