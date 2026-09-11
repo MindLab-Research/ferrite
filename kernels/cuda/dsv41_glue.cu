@@ -263,11 +263,10 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
-        // Compiler-directed unroll: the same treatment that took the fp8 gemv
-        // from 20.6 to 19.5 us. Note the earlier failure was a MANUAL 4-way
-        // unroll (which rewrote the source structure); a pragma only tells nvcc
-        // to widen the loop while keeping the single-chain semantics.
-#pragma unroll 4
+        // NO #pragma unroll here: measured 13.39ms with it vs 13.30ms without
+        // (same session, same binary path). The fp8 gemv gained from an unroll
+        // pragma but this one loses - the two kernels have different
+        // register/occupancy profiles.
         for (int c = lane; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
@@ -284,8 +283,7 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const float* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
-        // Compiler-directed unroll (see gemv_bf16's note).
-#pragma unroll 4
+        // NO #pragma unroll (see gemv_bf16's note: lost 0.09ms with it).
         for (int c = lane; c < k; c += 32) acc += wr[c] * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
