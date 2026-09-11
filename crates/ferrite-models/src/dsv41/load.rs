@@ -375,7 +375,14 @@ impl<'a> Loader<'a> {
         let global = &h.shape;
         let inner: usize = global[1..].iter().product();
         let row_bytes = inner * esz;
-        let widen = h.dtype == "BF16" && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
+        // The head is kept in bf16 by EXACT name, not the KEEP_BF16 suffix list:
+        // "head.weight" is also the suffix of "markov_head.head.weight", whose
+        // consumer expects the widened f32 layout. The head gemv widens each
+        // weight losslessly in-kernel (bf16 is a truncated f32), so the logits
+        // stay bit-identical while the step's largest single weight read - the
+        // full-vocab head, replicated on every rank - halves.
+        let widen = h.dtype == "BF16" && spec.name != "head.weight"
+            && !KEEP_BF16.iter().any(|k| spec.name.ends_with(k));
         let out_bytes = n_local * if widen { 4 } else { esz };
 
         self.uploaded += out_bytes as u64;

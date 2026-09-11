@@ -906,16 +906,31 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         }
-        // The head keeps f32 activations × f32 weights (the checkpoint stores BF16;
-        // it is widened losslessly at load). Casting the activation to bf16 here cost
-        // ~3 bits on a 129280-way near-tie argmax — the reference keeps it in f32.
-        self.lin_f32(
-            self.s.xn.ptr as *const f32,
-            dim as i32,
-            self.w.head.as_ref().unwrap(),
-            cfg.vocab_size as i32,
-            self.s.logits.ptr as *mut f32,
-        )?;
+        // The head keeps the ACTIVATION in f32 (casting it to bf16 cost ~3 bits on
+        // a 129280-way near-tie argmax - the reference keeps it in f32). The
+        // weights now stay bf16 when the checkpoint stores them that way: the gemv
+        // widens each one losslessly in-kernel (bf16 is a truncated f32) with the
+        // same accumulation order as the f32 kernel, so the logits are
+        // bit-identical while the step's largest single weight read - the
+        // full-vocab head, replicated on every rank - halves.
+        let head = self.w.head.as_ref().unwrap();
+        if head.dtype == "BF16" {
+            self.dev.gemv_bf16(
+                head.ptr(),
+                self.s.xn.ptr as *const f32,
+                self.s.logits.ptr as *mut f32,
+                cfg.vocab_size as i32,
+                dim as i32,
+            )?;
+        } else {
+            self.lin_f32(
+                self.s.xn.ptr as *const f32,
+                dim as i32,
+                head,
+                cfg.vocab_size as i32,
+                self.s.logits.ptr as *mut f32,
+            )?;
+        }
         self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
         // Device-side argmax (the GLM HEAD_DEV pattern): the next token lands
         // straight in s.ids, which the next step's embedding reads — no 517 KB
