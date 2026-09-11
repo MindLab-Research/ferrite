@@ -2634,14 +2634,13 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
-        // Round-42 root cause: the 232448 magic failed on this machine and the
-        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
-        // so the Rust side silently fell back while the sticky error propagated
-        // to the next launcher (quant_fp8). Request exactly what this launch
-        // needs and CLEAR the sticky flag on failure so the caller sees a clean
-        // decline-vs-error split (decline is now 2, never 1).
+        // Round-43 revert: the (int)gsmem form set the per-function attribute
+        // to THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The 232448 ceiling (the device max opt-in,
+        // verified working rounds 37-41) is the correct semantic. Keep the
+        // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
@@ -2697,14 +2696,13 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
     // mode 4 only: `warps` weight rows + the block-wide activation row.
     const size_t gsmem = (size_t)(warps + 1) * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
-        // Round-42 root cause: the 232448 magic failed on this machine and the
-        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
-        // so the Rust side silently fell back while the sticky error propagated
-        // to the next launcher (quant_fp8). Request exactly what this launch
-        // needs and CLEAR the sticky flag on failure so the caller sees a clean
-        // decline-vs-error split (decline is now 2, never 1).
+        // Round-43 revert: the (int)gsmem form set the per-function attribute
+        // to THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The 232448 ceiling (the device max opt-in,
+        // verified working rounds 37-41) is the correct semantic. Keep the
+        // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // `a`/`a_scale` are null: the prologue produces the activation and the
@@ -2751,14 +2749,13 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
-        // Round-42 root cause: the 232448 magic failed on this machine and the
-        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
-        // so the Rust side silently fell back while the sticky error propagated
-        // to the next launcher (quant_fp8). Request exactly what this launch
-        // needs and CLEAR the sticky flag on failure so the caller sees a clean
-        // decline-vs-error split (decline is now 2, never 1).
+        // Round-43 revert: the (int)gsmem form set the per-function attribute
+        // to THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The 232448 ceiling (the device max opt-in,
+        // verified working rounds 37-41) is the correct semantic. Keep the
+        // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
@@ -2795,14 +2792,13 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
-        // Round-42 root cause: the 232448 magic failed on this machine and the
-        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
-        // so the Rust side silently fell back while the sticky error propagated
-        // to the next launcher (quant_fp8). Request exactly what this launch
-        // needs and CLEAR the sticky flag on failure so the caller sees a clean
-        // decline-vs-error split (decline is now 2, never 1).
+        // Round-43 revert: the (int)gsmem form set the per-function attribute
+        // to THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The 232448 ceiling (the device max opt-in,
+        // verified working rounds 37-41) is the correct semantic. Keep the
+        // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
@@ -2857,14 +2853,13 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     const size_t gsmem = (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                 : (size_t)warps * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
-        // Round-42 root cause: the 232448 magic failed on this machine and the
-        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
-        // so the Rust side silently fell back while the sticky error propagated
-        // to the next launcher (quant_fp8). Request exactly what this launch
-        // needs and CLEAR the sticky flag on failure so the caller sees a clean
-        // decline-vs-error split (decline is now 2, never 1).
+        // Round-43 revert: the (int)gsmem form set the per-function attribute
+        // to THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The 232448 ceiling (the device max opt-in,
+        // verified working rounds 37-41) is the correct semantic. Keep the
+        // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
@@ -3046,14 +3041,13 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;
     if (gsmem > 48 * 1024) {
-        // Round-42 root cause: the 232448 magic failed on this machine and the
-        // error (1 == cudaErrorInvalidValue) collided with the old decline code,
-        // so the Rust side silently fell back while the sticky error propagated
-        // to the next launcher (quant_fp8). Request exactly what this launch
-        // needs and CLEAR the sticky flag on failure so the caller sees a clean
-        // decline-vs-error split (decline is now 2, never 1).
+        // Round-43 revert: the (int)gsmem form set the per-function attribute
+        // to THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The 232448 ceiling (the device max opt-in,
+        // verified working rounds 37-41) is the correct semantic. Keep the
+        // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)gsmem);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
