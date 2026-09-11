@@ -5195,6 +5195,22 @@ UB 运气（越界写恰好落在未用区域）。因此 **hcd/r3 两个"err 70
 
 测 sinkhorn（warp0 串行 ~20 轮）能否与 collapse（1024 线程）重叠：A=串行基线 / B=无 sinkhorn 地板 / C=warp0 sinkhorn + 其余 collapse。若 C−B ≪ A−B 则重叠可回收 ~0.2ms/步。
 
+**探针结果（2026-09-11，`/tmp/tail_probe` → `/tmp/tail_probe2` → `/tmp/tail_probe3`，B300 单 block 生产 shape）**：
+
+| 臂 | µs/次 | 说明 |
+|---|---|---|
+| A 串行基线 | 13.01 | front+sinkhorn+collapseP1+rmstail |
+| B 无 sinkhorn（地板）| 6.50 | |
+| C 折叠 C：warp0 sinkhorn 后再做自己的 collapse 份额 | 12.79 | 收 0.16µs |
+| D **warp0 只做 sinkhorn**，warp1..31 collapse，warp31 额外重放 warp0 的 32 个叶子部分和（`c = lane + 1024k`）→ `red[0]`；**A vs D 逐位一致 0/5120** ✓ | 12.78 | 收 0.23µs |
+| E D 去掉 phantom（上限）| 13.09 | 无收益 |
+
+**相位预算（`/tmp/tail_phase_probe.cu`，差异法，已扣发射税）**：`front 4.87 + sinkhorn 6.46 + collapseP1 0.46 + rmstail 1.18 = 12.97 ≈ A 13.01` ✓
+
+**结论：否决。** 可藏窗口（collapse 相位 1）只有 **0.46µs**，要做的事是 **6.46µs** 的 sinkhorn——差一个数量级，31 warp 在 sinkhorn 期间空转不是"排序问题"，而是**整个 tail 的临界路径就是 warp0 的串行链**：ss(32 lane 全局读)→mixes(24 线程跨步全局读)→cm(16)→sinkhorn(39 次 fp32 IEEE 除 + 80 次 shfl 的依赖链)→comb 全是 warp0，全块 barrier 只是把它们串起来。重叠实测收益 **0.23µs/次 = 0.018ms/步**（预期 0.2ms 的 1/11）。
+
+⇒ 真要摘这 ~11µs，只有**换核/跨层流水**（persistent-arch P4：把 L 的 tail 链藏进 L+1 的 attn/AR 窗口，或把 tail 与 dots 合并成一个 persistent 形状），同核内**没有**等长窗口可藏。注意：即使按 STATUS 原估的 2.6µs 口径，窗口 0.46µs 仍小 5 倍，结论不随口径变。
+
 ## 2026-09-11 晚（第 9-12 轮）：逐步落地与两次编译教训
 
 ### 验证矩阵（同会话背靠背，判据 = 四段文本 + faults + p50）
@@ -5697,3 +5713,17 @@ MIX_GATE=OFF + GATEUP_FUSE=ON + DOWN_FUSE=ON + HEAD_SLICE=ON + sparse 3-deep + i
 
 **隐藏的最大项**：~700 launch × ~1.5µs ≈ **0.9ms 节点尾延迟**（在"间隙"里，不在 kernel 行里）——
 Stage C persistent 架构（700→120 节点）是根治。
+
+### 第 28 轮：down-vec-320 基本中性（9.42ms / 106.2 tok/s）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| dv320（down K=320 向量化） | 9.42ms | 106.2 | 四段全对 | 0 |
+
+down 向量化（nv8 循环：4 值 uint32 组替代标量尾巴）在 serve 级别基本中性
+（9.38→9.42，在 ±0.05ms 噪声内）。可能原因：down 本身只 0.69ms，K=320 路径
+只占其中一部分；且 nvcc 可能对标量路径已做了部分向量化。
+
+代码保留（逐位一致、无风险）。
+
+**会话最终基线：9.38ms / 106.6 tok/s（round 25/27 确认）。**

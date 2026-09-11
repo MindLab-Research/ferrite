@@ -82,7 +82,7 @@
 | 排名 | 机会 | 目标项 | 预期收益 | 阶段 | 依据 / 风险 |
 |---|---|---|---|---|---|
 | **1** | **MoE cooperative 段核**（gate→route→quant→gate_up→swiglu→down→reduce 一核，中间量留 smem） | expert 家族 1.72ms | **−0.4~0.7** | Stage C P3（但收益最大，可提前）| 省 ~440KB/层 global 往返 + 4 个节点尾延迟。⚠️ slot 升序累加是数值契约；同编译单元否则 1 ULP |
-| **2** | **hc 链两招**：① sinkhorn 藏进 collapse 重叠（探针已部署 `/tmp/tail_probe`）② 段 C `hc_post`+`copy_h_back` → `hc_post_inplace`（省 80KB D2D×2/层）| hc 链 1.70ms（tail 0.99 + dots 0.56）| **−0.36~0.46** | ②= Stage C P1 | ② parity 既有，低风险；① tail 是**单 block 串行**（1 块/1024 线程 = 0.68% 占用，20 轮 sinkhorn + 7 barrier），探针测重叠可回收 ~0.2 |
+| **2** | **hc 链两招**：① ~~sinkhorn 藏进 collapse 重叠~~ **实测否决**（`/tmp/tail_probe{,2,3}`：可藏窗口 = collapse P1 仅 0.46µs，sinkhorn 6.5µs，收益 0.018ms/步；tail 是 warp0 串行链，同核内无等长窗口可藏，只有跨层流水/换核能藏）② 段 C `hc_post`+`copy_h_back` → `hc_post_inplace`（省 80KB D2D×2/层）| hc 链 1.70ms（tail 0.99 + dots 0.56）| **−0.15~0.25**（① 的 −0.21 已被实测划掉，只剩 ②）| ②= Stage C P1 | ② parity 既有，低风险 |
 | **3** | **cross-layer-pipe**：每次 front 拆 ⟨A⟩collapse_norm（留原位）+ ⟨B⟩mixes dots+tail（推迟，与 AR 合并进同一 launch——AR v5 仅 5×1024 线程 block，poll 窗口上百 SM 空闲）| 残差/节点延迟 | **−0.3~0.5** | **Stage B** | 字面"ffn mixes 挪到 L+1"**不可行**（届时 `s.h` 已被 hc_post 覆写）。⚠️ AR 核 `step = gridDim.x*blockDim.x` 会因新增 block 错位 ⇒ 必须按 `blockIdx.x < ar_blocks` 分区；post/comb 单份共享缓冲需双缓冲 |
 | **4** | **xn-megafuse（2 launch）**：A 簇 `wq_a+wkv+idx_wp`（1824 行）、B 簇 `gate+sh w1/w3`（960 行）| gemm_fp8_gemv 1.98ms（206 次）| **−0.25~0.5** | **Stage B** | 5 族**不可能**一次 launch（`s.xn` 是复用缓冲，两簇被 AR#1 + 整段 attention 隔开）。真正省的是 `idx_wp` 那个 8-block 小 slot。⚠️ 本行原依据"`gemv_bf16_fp8x2` 不建 LUT/a32，可省的只有 fp8 激活 staging 一遍"**已失效**：2026-09-11 混合核 fp8 族已补齐 LUT+a32（`dsv41_kernels.cu:2107-2142 / 2176-2182 / 2207-2214`），B 簇的"再省一遍 LUT/a32"空间随之消失 |
 | **5** | **quant 生产者直出 fp8**（−0.28）+ **AR store 融合**（−80 节点，−0.08）| quant 0.26ms + 节点数 | **−0.28~0.36** | Stage A 尾巴 | quant 是**纯固定成本**（1.6µs/次 × 166 = 0.26ms），只能靠消除调用；AR store 是纯逐元素拷贝，可融进 producer epilogue（补丁在 `~/.xbot/users/web-4/workspace/ar-fuse-store/`）|
@@ -173,6 +173,14 @@ python3 /tmp/kdiff.py /tmp/dsv41-prof-v3/one.csv /tmp/dsv41-prof-v3/many.csv 30
 - ⚠️ **default-value 分裂**：`.cu` 的 `g_fuse` 与 Rust 的 `unwrap_or` 必须逐字镜像，否则 kernel 融了但 host 没融 → 乱码（第 18-21 轮 6 轮排查的根因）。
 - ⚠️ **批量 sed 翻默认值 = clobber**：`f3b1be1` 用 `unwrap_or(true)→false` 批量改，误关 7 个老门（MOE_BATCH 一项就 +560 launch/步 = +8.7ms）。
   子代理改共享文件后必须 `git diff` 检查**所有**改动。
+- ⚠️ **down 的 `k` 是 320，不是 5120**：`expert_gemv_fp4_down_reduce_kernel` 的 `k = inter_local = padded(2304/8) = 320`，
+  而 `vec==2` 原本只有 `nv2 = k>>9` 的 512 值/组主循环 ⇒ `nv2 == 0`，**整条 per-slot dot 掉进 2 值标量尾巴**
+  （LDG.U8 + 标量 `dsv41_e2m1_to_f`，5 迭代/槽）。2026-09-11 补了 **256 值/组（每 lane 一个 uint32 = 8 nibble）**
+  的中间循环：`320 = 1×256 + 64` ⇒ 1 个向量迭代 + 1 个尾巴迭代。**`k = dim = 5120` 的 gate_up 侧不受影响**
+  （`nv8 == nv2<<1`，新循环 0 次迭代）。改分组时注意：(a) 256 值 = 128 packed 字节 ⇒ 字节基址 `g<<7`、lane 偏移 `lane<<2`；
+  (b) 每 lane 8 值 = 1/4 个 32 值 scale 块 ⇒ 仍用 `srow[j>>5]`；(c) 尾巴起点必须从 `nv2<<9` 改成 `nv8<<8`。
+  另注：本次只在**融合核**里改，`expert_gemv_fp4_batched_kernel` 的 down 侧（`k=inter` 同样 320）另有 doc 的
+  "逐位与 batched 一致"契约——两条路径现在**不再逐位相同**（都是合法浮点、差值仅末位）。
 
 ---
 

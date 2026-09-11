@@ -42,8 +42,8 @@
 | 4 | `DSV41_SWIGLU_Q` | swiglu_limit_q(dsv41_glue.cu:176) 直出 (xq,xsc) | −0.06 | 四段文本 |
 | 5 | `DSV41_MOE_EPI_ADD` | gemm_fp8_mx_add 把 add_inplace 折进 lane-0 epilogue，直写 s.o | −0.08 | 结合律 `o+(acc+bias)` 不变 ⇒ **逐位** |
 
-**补差（另两项增量，合计 −0.49）**：`quant_kernel` 生产者直出 fp8（−0.28）；hc sinkhorn 藏进 collapse 重叠（−0.21，探针 /tmp/tail_probe）。
-⇒ 5 补丁 −0.92 + 补差 −0.49 ≈ **落点 8.8ms（~115 tok/s）**。
+**补差（实测后只剩一项）**：`quant_kernel` 生产者直出 fp8（−0.28）；~~hc sinkhorn 藏进 collapse 重叠（−0.21，探针 /tmp/tail_probe）~~ **实测否决 → 0.018ms/步**（`/tmp/tail_phase_probe.cu`：可藏窗口 collapse P1 = 0.46µs ≪ sinkhorn 6.5µs）。
+⇒ 5 补丁 −0.92 + 补差 −0.28 ≈ **落点 9.0ms（~112 tok/s）**。
 
 ## 3. Stage B：结构性 8.8 → 7.2ms
 
