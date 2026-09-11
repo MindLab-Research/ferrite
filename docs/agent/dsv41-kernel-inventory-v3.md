@@ -182,14 +182,31 @@ routed 链上是 fp4 expert 核（`expert_gemv_fp4_*`），shared 链上是 w1/w
 
 - **输的是「8 值」这个宽度，不是「宽加载」**：4 值/lane 的工作集（1×uint16 + 1×float4 +
   2×float2 L1TEX 操作）仍能塞进 40 寄存器的调度；8 值省下的指令抵不过它吃掉的寄存器。
-- **56 regs / 4 blocks/SM 那一臂是全场最快** ⇒ 上面「40 寄存器是单 wave 红线，多寄存器必然
-  +49%」的归因**不成立**。01291b2 的 +45% 与占用率无关（同二进制内 mode 4 vs mode 2 只差 ~3%，
-  而同会话里 `after`/`before` 比值在 1.06–1.27 之间漂），**需要重新定因**。
+
+> 🚨 **本节下方「56 regs / 4 blocks/SM 是全场最快 ⇒ 占用率归因不成立」的结论已于 2026-09-12 推翻。**
+> 该结论只对**这个隔离微基准**成立：微基准把同一组 buffer 连跑 N 次，整个工作集
+> （w2 = 8 slots × dim × k/2 = 9.17 MB + 40KB act）**常驻 L2**；生产里 w2 在本步此前从未被读过
+> （gate/up 只读 w1/w3），9.17 MB/层 × 40 层 = 367 MB/步 ≫ L2，**必然来自 HBM**。
+> 实测 9.17 MB / 23.8 µs = 385 GB/s，远低于 HBM 峰值 ⇒ 生产是**延迟受限**，此时
+> 常驻线程数（4 vs 6 blocks/SM = 1024 vs 1536 threads/SM）与 wave 数（1.51 vs 1.01）才是决定项。
+> 所以「隔离 0.87x 更快」与「生产 +38% 更慢」可以同时为真——**两者测的不是同一个内核状态**。
+> 见 §4 的 down 定案与 `dsv41_experts_mxf4.cu` 的 `__launch_bounds__` 注记。
+
+- ~~**56 regs / 4 blocks/SM 那一臂是全场最快** ⇒ 上面「40 寄存器是单 wave 红线，多寄存器必然
+  +49%」的归因**不成立**。01291b2 的 +45% 与占用率无关~~ —— **错**。01291b2 的 40 → 54 regs 就是
+  6 → 4 blocks/SM = 1.01 → 1.51 waves 的悬崖，与 nsys 的 +45% 吻合；隔离微基准没有复现生产的
+  缓存状态，因此不构成反证。**教训：任何用「连跑同一组 buffer」的隔离基准去否定占用率/带宽归因
+  之前，先确认它的工作集是否落在 L2 内；L2-hot 基准天然对占用率不敏感。**
 - **已落地**：`vec == 3` = 4 值/lane（1×`LDG.U16` 权重 + 1×`LDS.128` 激活 + 2×`LDS.64` LUT，
   1.25 op/值 vs 原 2.5；scale 覆盖整 4 值组 ⇒ 每组只做一次 scale-FMA）。两个核
   （`expert_gemv_fp4_down_reduce_kernel` 与 `expert_gemv_fp4_batched_kernel`）各有一份
   **逐字镜像**，闸门 `DSV41_DOWN_VEC4`（默认 ON，`=0` 回退到 `DSV41_EXPERT_FP4_MODE`）。
   只作用于 down 启动：gate/up 的 swiglu 融合要求 `mode == 2`。
+- ⚠️ **寄存器分配是 per-function**：vec==3 分支的 56 regs 覆盖整个
+  `expert_gemv_fp4_down_reduce_kernel`，**连 vec==2 实例也一起被拖到 4 blocks/SM** ⇒
+  `DSV41_DOWN_VEC4=0` 并不能恢复占用率（分支还在函数里）。唯一恢复手段是
+  `__launch_bounds__(256, 6)`（把 regs 压到 42 上限；bench 上该臂实测 40 regs 无 spill）。
+  这正是 `9fe0766` 引入、`287d2b7` 未修复的 down_reduce 17.2 → 23.8 µs 回归的根因。
 - ⚠️ mode 3 的 lane→k 映射与 mode 2 不同 ⇒ **融合/未融合的逐位一致契约靠「镜像分支」维持，
   改一边必须同时改另一边**（这正是 01291b2 回退的第二个理由，现在用镜像解决了）。
 

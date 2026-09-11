@@ -416,6 +416,26 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     `hc_post`）—— 后者由 `ar_hc_post_fold`/`layer` 里的 `hc_tail_join()`（wait `join_ev`）保证；
     前者由 `fork_ev`（记录在主流 EARLY 之后）保证。
     env gate **复用 `DSV41_HC_TAIL_SPLIT`**（未新增开关；A/B = tail-split on/off）。
+    - **2026-09-11（同日）dots 与 LATE 合并成单节点（hc-dl-merge，默认 ON）✓ 待实测**：
+      side 链上 dots(4.9µs) 与 LATE(10.7µs) 本是一个依赖对（LATE 读 dots 写的
+      `g_hc_part`），却占**两个图节点**（审计 1355 节点 ≈ 2.0ms，~1.5µs/节点 ⇒ 每 front
+      省 1 节点 = 2/层 × 61 层）。合并核 `hc_dots_late_kernel`
+      （`dsv41_kernels.cu:6632`），grid=`(mix, rows)`、block=`DSV41_HC_DOTS_T`(128)：
+      **每个 dot 块 publish 后 `__threadfence()` + `atomicAdd(&g_hc_dl_done[r],1)`，
+      看到最后一个计数的块跑 LATE 半**——`hc_pre_persist_mb_kernel` 的机制，
+      **无 ticket、无自旋**（这正是 `hc_front_kernel` 的 tail 自旋 +3.2ms 的反例）。
+      门：`DSV41_HC_DL_MERGE`（默认 ON；`=0` 回两 launch 作 A/B 臂）。
+      **逐位等价**：dot 分支是 `hc_mix_dots_kernel` 逐句照抄（同一 cp.async staging、
+      同一 warp0 float4 三累加器 lane 链、同一 ss replay 残数 `m*32`/步长 `mix*32`）；
+      tail 是 `hc_mixes_tail_kernel` 的 LATE 分支逐句照抄且 `ss_in==1`（读 dots 的 ss
+      分块，只需 warp 0 ⇒ 在 128 线程下依然成立；自算 ss 路径需 ≥mix*32 线程，故
+      `DSV41_HC_SS=0` 时 launcher 自动回两 launch）。**K-split 不用**：`ck` 槽会与 ss
+      分块槽（第三维 `DSV41_HC_SPREAD_S=8`）冲突且 `split>1` 非逐位 ⇒ 本核固定 split=1。
+      **无死锁**：没有任何块等另一个块（选举不是自旋），grid 精确 `(mix, rows)` 无边界
+      早退 ⇒ 计数不可能漏块；被选举块在**最后一次读 `g_hc_part` 之后**把计数器复位为 0
+      （图回放安全，与 `g_hc_ticket`/`g_hc_mb_done` 同一纪律）。
+      **EARLY 不动**：EARLY+LATE 合并已证不可行（main 的等待从 1.7µs 变 17µs，因为 tail
+      只能排在整格 drain 之后），EARLY 保持侧流头部的独立 launch。
   ⚠️ 若上机后仍只有 −0.2ms，下一个怀疑对象是**图节点开销本身**（审计：1355 节点 ≈ 2.0ms，
   ~1.5µs/节点；split 每次多 1 个 kernel 节点 + 2 个 event 节点 ⇒ 约 0.3-0.5ms/步），
   而不是调度——判据：nsys 看 tail_late 的 span 是否与投影时间轴重叠。

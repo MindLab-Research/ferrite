@@ -6943,7 +6943,48 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 
 **距离 200 tok/s（5.0ms）**：gap 1.66ms。
 
-### sparse key-split 默认开启 + merge 融合 epilogue（2026-09-11，sparse-attn-v8 实施）
+### 🔴 down_reduce +38% 回归定案：`__launch_bounds__(256, 4)` = 1.51-wave 配置（2026-09-12，待上机验证）
+
+**结论**：`expert_gemv_fp4_down_reduce_kernel` 的 17.2 → 23.8 µs 回归**不是** ILV、不是 K-split、
+也不是「4 值向量化本身慢」——是 **`9fe0766`（down 4-value）把该 kernel 的寄存器需求从 40 抬到 56
+⇒ 65536/(256×56) = 4.57 ⇒ 4 blocks/SM ⇒ 896-block 的 grid 从 1.01 waves 掉到 1.51 waves**。
+`287d2b7` 加的 `__launch_bounds__(256, 4)` 只是把这个错误配置**钉死**了（56 ≤ 64，ptxas 无事可做）。
+
+**逐条排除**：
+
+| 假设 | 判定 | 证据 |
+|---|---|---|
+| ① ILV 改了 w2 的读法 | ❌ 不可能 | `load.rs:650-665`：ilv 布局下 w2 的 per-expert 偏移 = `2*w1b + w1s + w3s`，与 plain 布局**逐字节相同**，per-expert block 总大小也相同；`interleave_gateup_fp4_kernel`（`dsv41_experts_mxf4.cu:1729`）只写 `dst[2i]/dst[2i+1]`，w2 平面由 `dma_plan` 原样拷贝。ILV 是加载期一次性置换，稳态无关。 |
+| ② `launch_bounds(256,4)` 压寄存器 | ⚠️ 半对 | (256,4) 的 cap 是 64 regs，**不是绑定约束**（自然 56 ≤ 64）。真正的元凶是 vec==3 分支本身的 56 regs；而**寄存器分配是 per-function** ⇒ 56 regs 覆盖整个 kernel，**vec==2 实例也一起掉到 4 blocks/SM** ⇒ `DSV41_DOWN_VEC4=0` 不能恢复占用率。 |
+| ③ K-split 间接影响 | ❌ 不可能 | K-split（`dsv41_experts_mxf4.cu:1223-1245`）只在 warp 内跨 half 合并 `(g,u)` 部分和，输出仍是 row-major `out[row] = silu(g)*u`，`act_stride = inter_local` 与 pitch 不变 ⇒ down 的输入假设不受影响。gateup 自身时间也未变（24.0→24.4 µs）。 |
+| ④ vec4 的隔离条件 ≠ 生产 | ✅ **就是它（的机制）** | 见下。 |
+
+**根因机制（为什么隔离 0.87x 与生产 +38% 能同时为真）**：
+- 隔离微基准（`/tmp/dv320`）把**同一组 buffer 连跑 300 次** ⇒ 工作集 w2 = 8 slots × 7168 × 160 B
+  = **9.17 MB** + 40 KB act **全在 L2**（B300 L2 ≫ 9.17 MB）⇒ 测的是 L2-hot 内核，
+  此时多出来的 ILP 值钱、多出来的 wave 不值钱，于是「56 regs / 4 blocks/SM」被测成最快（0.87）。
+- 生产里 **w2 在本步此前从未被读过**（gate/up 只读 w1/w3）⇒ 9.17 MB/层 × 40 层 = **367 MB/步 ≫ L2**
+  ⇒ **必然来自 HBM**。实测 9.17 MB / 23.8 µs = **385 GB/s**，远低于 HBM 峰值 ⇒ 该核在**延迟受限**
+  区间，决定项是常驻线程数（4×256=1024 vs 6×256=1536 /SM）与 wave 数（1.51 vs 1.01），
+  不是 L1TEX 指令数。**这正是任务里假设 ④ 说的「隔离的 L2 条件与生产不同」**，且它同时解释了
+  为什么 `01291b2` 的「40→54 regs = +45%」占用率归因是**对的**（隔离基准没能复现缓存状态，
+  所以不构成反证）。
+
+**修复（已落代码）**：`kernels/cuda/dsv41_experts_mxf4.cu`
+`__launch_bounds__(256, 4)` → `__launch_bounds__(256, 6)`（cap 42 regs；bench 上该臂实测 40 regs
+**无 spill**，隔离 0.90 ⇒ ptxas 有合法紧凑调度）。6 blocks/SM × 148 SM = 888 ≈ 896 grid = **1.01 waves**。
+同步改正了 vec==2 分支里「不要归因占用率」的错误注记，与
+`docs/agent/dsv41-kernel-inventory-v3.md` §2(B-修正) 的相反结论。
+
+**预期**：23.8 → ~18-19 µs ⇒ **−0.2 ms/步**（任务给的 −0.24ms 目标基本可回收）。
+
+**上机验证（一轮）**：同一二进制 + `--lib` 两臂（AGENTS.md 的 nvcc 配方），
+臂 A = `(256,6)`、臂 B = `(256,4)`；读 `expert_down_reduce` 的 nsys per-call µs。
+判据：臂 A ≤ 19 µs 且四段文本逐位一致（该改动只动占用率，不动数值 ⇒ **必须 bit-exact**）。
+若臂 A 出现 spill（`ptxas -v` 报 spill stores），再退回按「缩小 vec==3 体的活跃值集」降寄存器，
+而不是把 pin 调回 4。
+
+
 
 **问题（v8 剖面）**：`sparse_attn_orope` 40×/步、med 7.7µs = 0.31ms/步，但只有 8 块 × 128 线程
 （8/148 SM ≈ 5% 占用）——**延迟/占用受限，不是带宽**（10.5MB/次全 L2 命中）。真顺位 = key-split，

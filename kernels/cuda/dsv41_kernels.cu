@@ -6581,6 +6581,179 @@ static const int g_hc_late_t = [] {
     return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 128;
 }();
 
+// ============================================================================
+// hc dots + LATE in ONE launch (`DSV41_HC_DL_MERGE`, default ON).
+//
+// WHY THIS MERGE IS LEGAL — and why the EARLY+LATE one is not. hc_front_kernel
+// folded EARLY into the tail block and paid +3.2 ms/step: its tail block SPUN on
+// a ticket while the dots ran, so it held an SM hostage for the whole dots phase
+// — and it parked the 1.7 us EARLY wait on MAIN's critical path, in front of the
+// projection group, which is exactly why the EARLY-on-main / EARLY+LATE arm was
+// reverted. The tail's ONLY dependency on the dots is `g_hc_part`, so it can be
+// ELECTED to the LAST dot block to publish (hc_pre_persist_mb_kernel's
+// mechanism) instead of polled for: no ticket, no spin, no extra resident block,
+// and EARLY stays its own launch at the head of the side chain.
+//
+// WHAT IT SAVES. ONE graph node per front (2 per layer x 61 layers) on the
+// whole-step capture (DSV41_GRAPH_STEP, default ON): the LATE launch's per-node
+// overhead and its scheduler slot. The work itself does not move.
+//
+// BIT-EXACTNESS by construction. The dot branch is hc_mix_dots_kernel's body
+// verbatim (same cp.async staging, same warp-0 float4 three-accumulator lane
+// chain, same ss replay residue m*32 / stride mix*32 into g_hc_part[r][m][1]);
+// the tail is hc_mixes_tail_kernel's LATE branch verbatim at ss_in == 1, which
+// reads the dots' ss partials and needs only warp 0 — so it stays valid at the
+// dots' block size (g_hc_dots_t), unlike the self-ss path that needs >= mix*32
+// threads. The launcher therefore requires DSV41_HC_SS=1 (the default) and falls
+// back to the two-launch pair otherwise.
+//
+// K-SPLIT IS NOT USED HERE (grid.x = mix, exactly like the dots kernel). At
+// split > 1 the ck slots collide with the ss partial slot (the third dimension
+// is DSV41_HC_SPREAD_S = 8) and the reduction order stops being bit-exact.
+// hc_pre_persist_mb_kernel keeps the K-split arm for the non-bit-exact
+// experiment, where its self-ss tail can afford the 1024 threads it needs.
+//
+// ELECTION DISCIPLINE (why it cannot hang). Every dot block publishes, fences
+// and then bumps the per-row counter; the block that sees the final count runs
+// the tail, every other block falls off the end. NO block ever waits on another
+// block, so there is nothing to deadlock — and the grid is EXACT (mix, rows)
+// with no bounds check, so no block can drop out of the count. The elected block
+// RESETS the counter after its last g_hc_part read, so the next launch (or graph
+// replay) starts clean — the discipline g_hc_ticket / g_hc_mb_done use.
+// ============================================================================
+static const bool g_hc_dl_merge = [] {
+    const char* e = getenv("DSV41_HC_DL_MERGE");
+    if (e == nullptr) return true;
+    return e[0] != '0';
+}();
+
+__device__ unsigned g_hc_dl_done[DSV41_HC_SPREAD_MAXR];
+
+__global__ void hc_dots_late_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
+                                    const float* __restrict__ hc_scale,
+                                    const float* __restrict__ hc_base, float* __restrict__ pre,
+                                    float* __restrict__ post, float* __restrict__ comb, int hc,
+                                    int dim, int sinkhorn_iters, float eps, int mix) {
+    const int m = blockIdx.x;
+    const int r = blockIdx.y;
+    const int hc_dim = hc * dim;
+    const int ss_stride = mix * 32;
+    const int nwarp = ss_stride >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    extern __shared__ float hc_sm[];
+    float* s_x = hc_sm;                 // hc_dim floats: the staged activation row
+    float* s_w = hc_sm + hc_dim;        // hc_dim floats: this projection row
+    __shared__ unsigned s_elected;
+    __shared__ float sss;
+    __shared__ float p_mixes[64];
+    __shared__ float p_cm[64];
+
+    // ---------------- dot: one projection row over the whole K ---------------
+    const int n4 = hc_dim >> 2;
+    const float4* xg = reinterpret_cast<const float4*>(x + (size_t)r * hc_dim);
+    const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim);
+    float4* sx = reinterpret_cast<float4*>(s_x);
+    float4* sw = reinterpret_cast<float4*>(s_w);
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sx[i], &xg[i]);
+    dsv41_cp_commit();
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sw[i], &wg[i]);
+    dsv41_cp_commit();
+    dsv41_cp_wait_all();
+    __syncthreads();   // the staging spans warps
+    if (threadIdx.x < 32) {
+        // hc_mix_dots_kernel's float4 three-accumulator lane chain, verbatim
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+        int c = lane;
+        for (; c + 64 < n4; c += 96) {
+            const float4 w0 = sw[c], w1 = sw[c + 32], w2 = sw[c + 64];
+            const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
+            a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+            a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+            a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+        }
+        for (; c < n4; c += 32) {
+            const float4 w = sw[c], v = sx[c];
+            a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+        }
+        for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += s_w[k] * s_x[k];
+        float acc = (a0 + a1) + a2;
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) g_hc_part[r][m][0] = acc;
+        // The tail's warp-m ss replay (c = lane + m*32, stride mix*32), exactly as
+        // hc_mix_dots_kernel writes it when ss_out != 0.
+        float s2 = 0.f;
+        for (int c2 = lane + m * 32; c2 < hc_dim; c2 += mix * 32) s2 += s_x[c2] * s_x[c2];
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_xor_sync(0xFFFFFFFFu, s2, off);
+        if (lane == 0) g_hc_part[r][m][1] = s2;
+    }
+    // Publish and elect. g_hc_part's writer is warp0/lane0 == threadIdx.x 0, so
+    // the release fence below orders exactly those stores; s_elected is
+    // block-uniform, so the branch that follows is uniform too.
+    if (threadIdx.x == 0) {
+        __threadfence();
+        s_elected = (atomicAdd(&g_hc_dl_done[r], 1u) == (unsigned)(mix - 1)) ? 1u : 0u;
+    }
+    __syncthreads();
+    if (s_elected == 0u) return;    // no barrier follows on this path - safe
+
+    // ---------------- tail: the LATE half, by the elected dot block ----------
+    // Acquire: every other dot block stored g_hc_part BEFORE its release fence +
+    // atomicAdd, and this block observed the final count.
+    __threadfence();
+    if (threadIdx.x < 32) {
+        // ss_in == 1: the dots' ss partials, only the cross-warp tree remains.
+        float v = (threadIdx.x < nwarp) ? g_hc_part[r][threadIdx.x][1] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+        if (threadIdx.x == 0) sss = v;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sss / (float)hc_dim + eps);
+    for (int m2 = threadIdx.x; m2 < mix; m2 += blockDim.x)
+        p_mixes[m2] = g_hc_part[r][m2][0] * inv;
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(p_mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(p_mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        p_cm[jk] = p_mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int hh = hc * hc;
+        float c = (lane < hh) ? p_cm[lane] : 0.f;
+        float mx = c;
+        for (int off = 1; off < hc; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+        c = expf(c - mx);
+        float rs = c;
+        for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+        c = c / rs + eps;
+        for (int it = 0; it < sinkhorn_iters; ++it) {
+            if (it > 0) {
+                float st = c;
+                for (int off = 1; off < hc; off <<= 1)
+                    st += __shfl_xor_sync(0xFFFFFFFFu, st, off);
+                c = c / (st + eps);
+            }
+            float t = c;
+            for (int off = hc; off < hh; off <<= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+            c = c / (t + eps);
+        }
+        if (lane < hh) p_cm[lane] = c;
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
+        comb[(size_t)r * hc * hc + jk] = p_cm[jk];
+    // Reset LAST: the loops above were the final g_hc_part reads of this row.
+    if (threadIdx.x == 0) atomicExch(&g_hc_dl_done[r], 0u);
+}
+
 extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
@@ -6669,7 +6842,8 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 // order):
 //   main: record(fork_ev) -> wait(fork_ev) [-> projections -> ...]
 //   side: wait(fork_ev) -> tail_early(HC_TAIL_EARLY) -> record(fork_ev)
-//         -> dots -> tail_late(HC_TAIL_LATE) -> record(join_ev)
+//         -> dots+late in ONE node (DSV41_HC_DL_MERGE, ON) -> record(join_ev)
+//         [fallback / A/B arm (`DSV41_HC_DL_MERGE=0`): dots -> tail_late]
 // The caller MUST then wait(join_ev) on the main stream before the hc_post that
 // consumes `comb`; the projection chain right after this call is ordered after
 // EARLY by the launcher's own main-stream wait on the re-recorded `fork_ev`.
@@ -6824,6 +6998,33 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // kernel (nor LATE): the projection group that follows consumes only the
     // EARLY outputs, and the hc_post that consumes `comb` is ~50 us away — it
     // waits `join_ev` instead (see the header comment).
+    // (3) dots + LATE in ONE launch on the SIDE stream (`DSV41_HC_DL_MERGE`,
+    // default ON; see hc_dots_late_kernel's header). The tail is elected to the
+    // last dot block to publish `g_hc_part` — no ticket and no spin, so nothing
+    // holds an SM hostage the way hc_front_kernel's tail block did. `g_hc_part`
+    // is written and read by that one kernel, and main does not wait it: main's
+    // only edge into the side chain is the EARLY completion above (edge 2), and
+    // the hc_post that consumes `comb` is ~50 us away waiting `join_ev`. The
+    // two-launch pair below stays as the A/B arm (`DSV41_HC_DL_MERGE=0`) and as
+    // the fallback when the merge cannot run (the self-ss arm has no ss partials
+    // to hand the elected block, and the 160 KiB opt-in can be refused).
+    bool dl_merged = false;
+    if (g_hc_dl_merge && g_hc_ss) {
+        cudaError_t e3 = cudaFuncSetAttribute(
+            hc_dots_late_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(hc_dots_late_kernel));
+        if (e3 == cudaSuccess) {
+            hc_dots_late_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t,
+                                  smem, side>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, hc,
+                                                dim, sinkhorn_iters, eps, mix);
+            e = cudaGetLastError();
+            if (e != cudaSuccess) return (int)e;
+            dl_merged = true;
+        } else {
+            (void)cudaGetLastError();   // clear the sticky flag, then take the pair
+        }
+    }
+    if (!dl_merged) {
     hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, side>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     e = cudaGetLastError();
@@ -6842,6 +7043,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
+    }   // end of the `if (!dl_merged)` two-launch fallback / A/B arm
     // (5) join: record on the side stream; the MODEL waits it on main
     // (`hc_tail_join`) before the earliest consumer of `post`/`comb` — the
     // fused AR epilogue when the hc-post fold is on, the standalone hc_post

@@ -1420,19 +1420,50 @@ __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __
 // puts every slot's [0,k) slice in smem once per block, false reads each slot's
 // slice from global.
 //
-// __launch_bounds__(256, 4): the launcher hardcodes warps=8 => blockDim is
-// ALWAYS 256 (`dsv41_expert_down_reduce_fp4_batched`), so unlike the gate/up
-// kernel this can be the literal block size. The (256, 4) pair caps registers
-// at 65536/(256*4) = 64/thread, which is exactly the ceiling the /tmp/dv320
-// microbench's FASTEST arm needs: "4-value uint16 (mode 3), no launch_bounds"
-// ran 56 regs / 4 blocks/SM / 0.87x (fastest), while the forced
-// `__launch_bounds__(256,6)` arm (40 regs, 6 blocks/SM) was SLOWER at 0.90x.
-// Pinning 4 blocks/SM therefore freezes the winning configuration instead of
-// the higher-occupancy loser, and 56 <= 64 means ptxas has nothing to spill.
-// This is the 01291b2 guard: that regression was 40 -> 54 regs, i.e. 6 -> 4
-// blocks/SM and a 1.01 -> 1.51 wave cliff at this exact shape.
+// __launch_bounds__(256, 6) - 6 blocks/SM, NOT 4. The launcher hardcodes
+// warps=8 => blockDim is ALWAYS 256 (`dsv41_expert_down_reduce_fp4_batched`),
+// so unlike the gate/up kernel this can be the literal block size.
+//
+// WHY 6 AND NOT 4 (the 2026-09-12 correction; this pair was (256, 4) and that
+// was the +38% regression): the grid is ceil(dim / 8) = 896 blocks at the
+// production dim = 7168. The kernel was DESIGNED around 6 blocks/SM:
+//   6 blocks/SM x 148 SM = 888 resident ~= 896 grid  -> 1.01 waves
+//   4 blocks/SM x 148 SM = 592 resident -> 1.51 waves, i.e. a second wave with
+//   304 of 148-SM slots busy and a 1.5x tail.
+// mode 2 (2-value tail) needs 40 regs => 6 blocks/SM and stayed at 17.2 us.
+// mode 3 (4-value) needs 56 regs free-running. Register allocation is
+// PER-FUNCTION, so that 56 covers the WHOLE kernel - even the vec==2
+// instantiation - and 65536/(256*56) = 4.57 => 4 blocks/SM => 1.51 waves.
+// That is the entire regression: 17.2 -> 23.8 us on nsys v7/v8 is exactly the
+// 1.01 -> 1.51 wave cliff at this shape, and `DSV41_DOWN_VEC4=0` does NOT
+// restore occupancy (the 56-reg mode-3 branch is still in the function).
+//
+// WHY THE ISOLATION MICROBENCH MISSED IT (/tmp/dv320, and the arm table in the
+// vec==2 comment below): that bench re-runs the SAME buffers back-to-back, so
+// its entire working set (w2 = 8 slots x dim x k/2 = 9.17 MB + a 40 KB act
+// buffer) is L2-RESIDENT. Production streams w2 from HBM: w2 is never touched
+// earlier in the step (the gate/up pass reads w1/w3, not w2), 9.17 MB per layer
+// x 40 layers = 367 MB/step >> L2, measured 9.17 MB / 23.8 us = 385 GB/s, far
+// below the HBM peak -> the kernel is LATENCY-bound, where resident threads
+// (1024 -> 1536 per SM) and the wave count decide, not the instruction count.
+// Hence "0.87x in isolation" coexisted with "+38% in production": at 4 blocks/SM
+// the extra ILP wins on an L2-hot bench and loses on an HBM-cold stream.
+// The same trap invalidated the 01291b2 verdict in the other direction - the
+// 40 -> 54 reg occupancy cliff it attributed the +45% to was real; the
+// microbench that "disproved" it was simply not reproducing the cache state.
+//
+// 42 regs is the hard cap here (65536/(256*6) = 42.67). The bench node's
+// (256,6) mode-3 arm compiled to 40 regs with no spill and measured 0.90,
+// i.e. ptxas has a compact legal schedule for the 4-value loop - this is not a
+// spill-heavy pin. If a future change does start spilling, shrink the vec==3
+// body's live set (float4 activation + 2 float2 LUT pairs) rather than raising
+// the pin: 4 blocks/SM is a 1.51-wave configuration at this grid and is not
+// recoverable by any instruction-level tuning.
+//
+// A/B on the bench node (same .so, one line): flip 6 -> 4 here and rebuild
+// (see the AGENTS.md `--lib` recipe). Predicted: 23.8 -> ~18-19 us, -0.2 ms/step.
 template <bool STAGED>
-__launch_bounds__(256, 4)
+__launch_bounds__(256, 6)
 __global__ void expert_gemv_fp4_down_reduce_kernel(
     const float* __restrict__ act_base, long act_stride, float* __restrict__ out, int n_total,
     int k, int slots, const float* __restrict__ row_weight, long rw_stride,
@@ -1606,10 +1637,17 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                 // last width whose working set (1 uint16 + 1 float4 + 2 float2) still
                 // fits a 40-register schedule; 8 values buys fewer instructions than it
                 // pays for in registers.
-                // The earlier occupancy attribution ("40 regs is the red line, 54 regs
-                // -> 4 blocks/SM -> +49%") does NOT reproduce: the 56-reg/4-block
-                // mode 3 arm is the FASTEST of all. Do not attribute the 01291b2
-                // regression to occupancy without re-measuring it.
+                // ⚠️ THESE NUMBERS ARE L2-HOT AND MUST NOT BE USED TO PICK A REGISTER
+                // PIN. The bench re-runs one buffer set, so w2 stays in L2; production
+                // streams w2 from HBM (never touched earlier in the step) and is
+                // latency-bound, where blocks/SM and the wave count decide. Acting on
+                // the "0.87 @ 56 regs / 4 blocks/SM is fastest" line is what produced
+                // the +38% production regression: 56 regs is a 4-blocks/SM = 1.51-wave
+                // configuration at this 896-block grid, against the designed
+                // 6 blocks/SM = 1.01 waves. See the __launch_bounds__ note on the
+                // kernel declaration. The 01291b2 occupancy cliff (40 -> 54 regs,
+                // 6 -> 4 blocks/SM) was real; this bench "disproved" it only because
+                // it does not reproduce the production cache state.
                 // Bit-parity note: mode 3's lane map differs from mode 2's, so the
                 // unfused path needs the same branch - expert_gemv_fp4_batched_kernel
                 // carries a verbatim mirror and both read g_down_fp4_mode.
