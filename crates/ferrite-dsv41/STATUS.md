@@ -7204,3 +7204,18 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 2. AR reduce grid（−0.08~0.16ms）实施中
 3. 节点削减（−0.10ms）hc 合回 + quant 融合
 4. Stage C（−0.3~0.5ms）可行性分析中
+
+### Stage C 段融合定案：全量不可行，最小版仅 0.1-0.2ms（2026-09-12 05:00）
+
+**全量段核不可行**（与 GLM hcpm 失败同根因）：
+1. **smem 池按 max(k) 分配 → 窄段占用率崩塌**（wo_pair 实测 +0.46ms 的同款问题）
+2. **grid.sync 与整步图捕获不兼容**（STATUS.md:4112）
+3. **段内依赖图近乎全串行**——融合省的是 launch 不是重叠
+
+**最小可行版本**（epilogue folding 模式）：
+- 「同激活单 launch 多投影」（wq_a+wkv 的 mx2 范式）
+- 「消费者折进生产者 epilogue」的选举融合（hc_dots_late 先例）
+- 每次折叠 −0.05~0.06ms
+- **预期 0.1-0.2ms，不是 0.3-0.5ms**
+
+**预算转向**：expert 机制重构 + gemv 合并 + epilogue folding 清单（epilogue-folding 分析中）

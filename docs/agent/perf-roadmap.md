@@ -25,6 +25,19 @@
 > **2026-09-11 复核：本节两个"有效杠杆"（a32 4 元素向量化、ROW_FIRST）在主 kernel 里仍未落地**
 > ——`:3195-3218` 的 a32 物化仍是标量 `s_af[idx] = s_lut[b[j]] * s_as[idx>>5]`（只有 `#pragma unroll`），
 > row cp.async 仍在 block staging 之后。它们是最低风险、位一致的下一步。
+>
+> **✅ 2026-09-12：两个杠杆都已落地（`d4a7f0e` 之后的 commit，见下）** ——
+> 行号又漂了：`gemm_fp8_gemv_kernel` 定义在 `:3326`，共用 helper `dsv41_a32_mat4` / `dsv41_f4_ok`
+> 在 `:63-100`，a32 物化在 `:3672-3743`（a32_direct 与 P4 的 `s_a` 两分支都改成 4 元素向量化），
+> consume 循环的 `#pragma unroll` 在 `:3842`（4 → 32）。ROW_FIRST 由 P3（`DSV41_GEMV_CPASYNC`，
+> 默认 ON）覆盖 —— 即权重行 cp.async 先于块级 staging 发布。
+> 实现要点：helper 是 `uint32_t b4 → 4 次 LUT → 4 次乘同一个 `as[idx>>5]` → 1 次 float4 写`；
+> **位一致**：idx 是 4 的倍数而 scale 块是 32 元素 ⇒ `idx & 31 <= 28`，四个元素永不跨 scale 边界，
+> 乘积逐项与标量循环相同。**唯一新增的守卫**是 float4 存所需的 16B 对齐
+> （`s_af` 的字节偏移 = k/8 + 1024，只有 k 不是 128 的倍数才会失败；失败时走原标量循环，
+> 不写会 err 716）。远端 `nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math`
+> 编译通过，且 `gemm_fp8_gemv_kernel` 的寄存器/栈剖面与改动前**完全一致**
+> （32 regs / 24B stack / 28B spill stores，零回归）。
 
 **本轮的硬结论：每调用成本不是"LDS 链"，是块级 staging 的冗余。** 用 nop 空 kernel 标定每
 kernel 的 graph 槽位只有 0.52–0.71µs（此前怀疑的 launch 开销被排除），随后逐项分解（n=1664）：
