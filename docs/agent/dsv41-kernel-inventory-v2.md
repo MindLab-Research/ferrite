@@ -108,6 +108,8 @@ Top-3/4 是 roadmap 定义的 Stage B 本体（结构性，8.8→7.2 段）；To
 | `compressor_state_kernel` | 3 | 1.6 | 0.005 |
 | `rope_precompute_kernel` / `bf16_to_f32_kernel` | 0 | — | 0.000 |
 
+⚠️ **`kpool_compress` 不在 `kernels/cuda/dsv41_kernels.cu`**（该文件只有单序列链，`dsv41_compressor_pool` / `compress_commit`）：它住在 `kernels/cuda/ferrite_kernels.cu:5851`（`kpool_compress_kernel`）与其 batched 版 `:6090`（launcher `:6702`），唯一调用点是 **batched DSA 链** `cuda.rs:4645`（`dsa_layer_dev_batched`）。同文件里的 `sparse_attn_pf_kernel`（`dsv41_kernels.cu:484`，launcher `:2413`）则是 **单序列** 路径（`chain_dev.rs:1899`），两者不共享数据链、不同口径，做重叠评估前先确认它们是否出现在同一次 profile 里。
+
 ---
 
 ## 4. 与 gap-analysis 推演对比：哪些准了 / 偏了

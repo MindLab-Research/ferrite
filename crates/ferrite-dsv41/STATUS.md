@@ -5569,3 +5569,33 @@ down+reduce（删 grid.y 的 slot 维，升序 slot 累加 = reduce 的数值契
 
 **与 gap-analysis 推演对比**：gemm_fp8_gemv 预测 2.18 实测 1.98（LUT 更狠）；expert 预测 1.75 实测 1.72 ✓；
 xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合预测 −0.7 实测 −0.51。
+
+### ✅ 第 24 轮 final 定案：9.62ms / 104.0 tok/s（会话最终基线）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| **final（全部默认：融合 ON + 7 老门 ON + env 缓存）** | **9.62ms** | **104.0** | 四段全对 | 0 |
+
+**会话最终成果：13.28 → 9.62ms（+38.2%），75.3 → 104.0 tok/s。**
+
+全部已落地优化（按收益排序）：
+| # | 优化 | 增量 | 累计 |
+|---|---|---|---|
+| 1 | shared expert TP 切分 | −1.43 | 11.85 |
+| 2 | sparse 3-deep 预取 | −1.09* | 10.76 |
+| 3 | e4m3 LUT | −0.42 | 10.34 |
+| 4 | gateup+swiglu 融合 + down+reduce 融合 | −0.51 | 9.62-9.65 |
+| 5 | T1 norm epilogue fp8 | −0.31 | 10.03 |
+| 6 | a32 预解码 | −0.30 | 9.73 |
+| 7 | lm_head v5 epoch 切分 | −0.35 | 10.51 |
+| 8 | P1 hist 死码 + P2 zero 冗余 | −0.27 | 10.24 |
+| 9 | dots128 | −0.12 | 10.42 |
+| 10 | indexer 两步走 | −0.10 | 10.14 |
+| 11 | env 热路径 OnceLock | （host 侧） | — |
+
+*sparse 3-deep 的 −1.09ms 是 round 13 的 nosparse A/B 测得的（对照 = 2-deep，不是 3-deep vs 0-deep）
+
+**通往 200 tok/s 的路线图（docs/agent/roadmap-200-tokps.md）**：
+- Stage B（当前 9.62 → ~7.2ms）：共享专家混合核加 LUT+a32（−0.3）→ xn-megafuse（−0.25~0.5）→ 跨层流水（−0.3~0.5）→ AR store 融合（−0.08）
+- Stage C（7.2 → ~5.3ms）：persistent 段核（40×3=120 节点 vs 700，残差 1.15→0.18ms）
+- Stage D（5ms 突破）：真实工作地板 ~5.3ms，需另攻 expert L1TEX 地板 + hc 段融合
