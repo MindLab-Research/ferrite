@@ -7219,3 +7219,14 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 - **预期 0.1-0.2ms，不是 0.3-0.5ms**
 
 **预算转向**：expert 机制重构 + gemv 合并 + epilogue folding 清单（epilogue-folding 分析中）
+
+### hc 节点合回分析定案：hc 已是最优，无剩余机会（2026-09-12 05:15）
+
+**hc-tail-mergeback 的发现**：
+1. **hc_post 已折进 AR pubred epilogue**（DSV41_HCPOST_EPI 默认 ON）——默认 TP8 路径**没有独立 hc_post 节点**。"240 hc 节点"是 fold 修复前的旧账，实际只剩 EARLY 80 + DL 80
+2. **EARLY+LATE 合并已被双重否决**：tail 自旋 +3.2ms；main 等待 1.7→17µs
+3. **EARLY 回主流实测 +0.14ms 回退**（9558491 已回退）
+4. **事件节点已是最简**（fork_ev 一物两用：输入边 + EARLY-done 边）
+5. **折进 pubred 的 epilogue 与已否决的 dots→pubred 同源**：5 block 归约序变化非逐位
+
+**结论**：hc 族节点削减的预期从 −0.12ms 修正为 **0**。节点削减总量从 248 修正为 ~168 nodes（quant 40 + norm/misc 120 + route 8）≈ −0.07ms@0.411µs。
