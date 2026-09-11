@@ -2462,7 +2462,8 @@ __global__ void compressor_pool_kernel(const float* __restrict__ kvp,
 // Round-45 root cause: the per-kernel static smem varies (128B-772B+), so
 // any hardcoded ceiling will be wrong for some kernel. Compute the true
 // ceiling at runtime: device opt-in max minus the kernel's static smem.
-static inline int dsv41_smem_ceiling(const void* kern) {
+template <typename KernPtr>
+static inline int dsv41_smem_ceiling(KernPtr /*kern*/) {
     static int cached = -1;
     if (cached >= 0) return cached;
     int dev = 0; cudaGetDevice(&dev);
@@ -3403,7 +3404,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     const int smem = 16 * k;
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_kernel));
         if (e != cudaSuccess) return (int)e;
     }
     // M=1 (decode): skip the 16-row tile entirely - it wastes 15/16 of itself and
@@ -3441,7 +3442,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
                                                       : (size_t)0;
         if (gsmem > 48 * 1024) {
             cudaError_t e = cudaFuncSetAttribute(
-                gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+                gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
             if (e != cudaSuccess) return (int)e;
         }
         // PDL (see dsv41_pdl_or_plain): the GEMV is a consumer of the previous
@@ -3530,7 +3531,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // gemv-struct-pack: four by-value structs; unassigned fields keep the old
@@ -3607,7 +3608,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // `a`/`a_scale` are null: the prologue produces the activation and the
@@ -3678,7 +3679,7 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // gemv-struct-pack: four by-value structs; both families (and their two head
@@ -3740,7 +3741,7 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // gemv-struct-pack: four by-value structs; `epi_add` is the only non-default
@@ -3814,7 +3815,7 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // PDL (see dsv41_pdl_or_plain): the wo_b GEMV reads wo_a's fp32 output, so it
@@ -3981,7 +3982,7 @@ extern "C" int dsv41_gemm_bf16_fp8x2(const void* wb, const float* biasb, float* 
                          scale_bytes;
     if (gsmem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gemv_bf16_fp8x2_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemv_bf16_fp8x2_kernel));
         if (e != cudaSuccess) return (int)e;
     }
     gemv_bf16_fp8x2_kernel<<<blocks, warps * 32, gsmem, s>>>(
@@ -4017,7 +4018,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // gemv-struct-pack: four by-value structs; both families travel in GemvCore
@@ -4065,7 +4066,7 @@ extern "C" int dsv41_gemv_occupancy(int warps, size_t gsmem) {
     if (gsmem > 48 * 1024) {
         if (cudaFuncSetAttribute(gemm_fp8_gemv_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 dsv41_smem_ceiling(kern)) != cudaSuccess)
+                                 dsv41_smem_ceiling(gemm_fp8_gemv_kernel)) != cudaSuccess)
             (void)cudaGetLastError();
     }
     int blocks = 0;
@@ -5870,7 +5871,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if (g_hc_merge) {
         cudaError_t e2 = cudaFuncSetAttribute(hc_front_kernel,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              dsv41_smem_ceiling(kern));  // 232448-260 static
+                                              dsv41_smem_ceiling(hc_front_kernel));  // 232448-260 static
         if (e2 != cudaSuccess) {
             (void)cudaGetLastError();
             return (int)e2;
@@ -5884,7 +5885,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     // ---- the two-launch path (kept for A/B) ----
     {
         cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(hc_mix_dots_kernel));
         if (e != cudaSuccess) {
             (void)cudaGetLastError();   // clear the sticky flag before reporting
             return (int)e;
@@ -5989,7 +5990,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
     {
         cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(hc_mix_dots_kernel));
         if (e != cudaSuccess) {
             (void)cudaGetLastError();
             return (int)e;
@@ -6097,7 +6098,7 @@ extern "C" int dsv41_hc_front_persist(const float* x, const float* hc_fn, const 
     // set it on EVERY call exactly like the two-launch launcher does.
     const size_t smem = (size_t)hc_dim * sizeof(float);
     cudaError_t e = cudaFuncSetAttribute(hc_pre_persist_kernel,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(hc_pre_persist_kernel));
     if (e != cudaSuccess) {
         (void)cudaGetLastError();
         return (int)e;
@@ -6389,7 +6390,7 @@ extern "C" int dsv41_hc_front_persist_mb(const float* x, const float* hc_fn,
     // The attribute is per-context, and a TP8 process has one context per rank,
     // so set it EVERY call - the existing launchers carry the same warning.
     cudaError_t e = cudaFuncSetAttribute(hc_pre_persist_mb_kernel,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(kern));
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(hc_pre_persist_mb_kernel));
     if (e != cudaSuccess) {
         (void)cudaGetLastError();
         return (int)e;

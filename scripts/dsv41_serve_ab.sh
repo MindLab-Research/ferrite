@@ -13,6 +13,9 @@
 #
 # The caller owns the tree: fetch and reset, rebuild BOTH products (the .so and
 # the binary, since the .so's build id is embedded in the binary), then run arms.
+# If the caller did NOT (or rebuilt them out of order), the pre-flight gate below
+# now SELF-HEALS: it rebuilds the pair in the one order that works instead of
+# aborting. See the gate for why `cargo build` alone can never fix it.
 set -uo pipefail
 
 TAG="${1:?usage: dsv41_serve_ab.sh <tag> [VAR=VALUE ...]}"
@@ -22,26 +25,65 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="/tmp/ab_${TAG}.log"
 MODEL_DIR="${DSV41_MODEL_DIR:-/opt/dlami/nvme/models/DeepSeek-V4.1-Flash}"
 
-# Pre-flight same-source gate. This driver does NOT build (the caller does), but
-# it must not launch a serve onto a mismatched pair: .so and .build_id are both
-# gitignored/untracked, so a `git checkout` + `git clean` can leave a STALE .so
-# while the caller only rebuilt the binary. The id gate in cuda.rs/devrt.rs would
-# still abort at dlopen, but that costs a full serve + log read to discover.
-# Fail here, with the reason, before spawning anything.
+# Pre-flight same-source gate. This driver does not normally build (the caller
+# does), but it must not launch a serve onto a mismatched pair: .so and .build_id
+# are both gitignored/untracked, so a `git checkout` + `git clean` leaves them
+# behind while the caller may only have rebuilt the binary. The id gate in
+# cuda.rs/devrt.rs would still abort at dlopen, but that costs a full serve +
+# log read to discover — so detect here and rebuild here, before spawning.
+#
+# WHY `cargo build` ALONE CANNOT HEAL IT (2026-09-11): cargo is incremental and
+# the stamp is baked in by ferrite-kernel/build.rs (`rerun-if-changed` on
+# .build_id + build.rs). If cargo does not observe a change it simply relinks an
+# OLD FERRITE_BUILD_ID, so the mismatch is permanent no matter how many times the
+# binary is rebuilt. The only working order is:
+#     build.sh (rewrites .build_id) -> touch build.rs (force the rerun)
+#     -> cargo build --release (bakes the fresh stamp into the binary)
+#
+# WHY THE CHECK USES `grep -cF` AND NOT `grep -qF`: this script runs under
+# `set -o pipefail`. `strings BIN | grep -qF id` makes grep exit at its first
+# match, so `strings` gets SIGPIPE (141) and pipefail reports the PIPELINE as
+# failed EVEN THOUGH THE ID WAS FOUND — the gate then misfires "stale" on a
+# perfectly good pair. `grep -c` reads the whole stream (no early exit, no
+# SIGPIPE) and still exits 0 iff there is >=1 match.
 SO="$ROOT/kernels/cuda/libferrite_kernels.so"
-for f in "$SO" "$ROOT/target/release/dsv41-run"; do
+BIN="$ROOT/target/release/dsv41-run"
+K="$ROOT/kernels/cuda"
+ARCH="${ARCH:-103a}"   # B300 = sm_103a (build.sh's default 100a is stale)
+for f in "$SO" "$BIN"; do
     [ -e "$f" ] || { echo "FATAL: missing $f - run: PHASES=0 scripts/dsv41_recovery_verify.sh"; exit 1; }
 done
-[ -f "$ROOT/kernels/cuda/.build_id" ] || {
-    echo "FATAL: kernels/cuda/.build_id missing (git clean? build.rs would embed +cuNOSTAMP)"
-    echo "       rebuild the .so FIRST: kernels/cuda/build.sh ${ARCH:-103a}, then cargo build --release"
-    exit 1
+
+# true iff $BIN literally embeds the id the .so currently carries.
+# No `strings` -> cannot verify -> assume OK (preserves the old behaviour).
+embeds_id() {
+    command -v strings >/dev/null 2>&1 || return 0
+    [ -f "$K/.build_id" ] || return 1
+    strings "$BIN" | grep -cF -- "$(cat "$K/.build_id")" >/dev/null
 }
-if command -v strings >/dev/null 2>&1 && \
-   ! strings "$ROOT/target/release/dsv41-run" | grep -qF "$(cat "$ROOT/kernels/cuda/.build_id")"; then
-    echo "FATAL: dsv41-run does not embed the current .build_id - stale/mismatched pair."
-    echo "       rebuild BOTH in order: kernels/cuda/build.sh 103a, then cargo build --release"
-    exit 1
+
+if ! embeds_id; then
+    # Auto-rebuild if build_id mismatch (the .so timestamp may not have
+    # changed even though content did, so cargo skips the rebuild).
+    echo "WARN: build_id mismatch, auto-rebuilding (build.sh ${ARCH} -> cargo build)..."
+    command -v nvcc >/dev/null 2>&1 || {
+        echo "FATAL: nvcc not found - cannot rebuild the .so (toolkit needed, no GPU)"
+        exit 1
+    }
+    ( cd "$K" && bash build.sh "$ARCH" ) || { echo "FATAL: kernels/cuda/build.sh $ARCH failed"; exit 1; }
+    # build.sh always rewrites .build_id, but an identical-content rewrite can
+    # land within the same mtime second - cargo would then skip build.rs and
+    # relink the old stamp. Touching it forces the rerun unconditionally.
+    touch "$ROOT/crates/ferrite-kernel/build.rs"
+    ( cd "$ROOT" && cargo build --release ) || { echo "FATAL: cargo build --release failed"; exit 1; }
+    # Re-check, never trust the rebuild blindly (post-build proof, not assumption).
+    if ! embeds_id; then
+        echo "FATAL: $BIN still does not embed the .build_id after a rebuild - stale/mismatched pair."
+        echo "       .so/.build_id id: $(cat "$K/.build_id" 2>/dev/null || echo '<.build_id missing>')"
+        echo "       rebuild manually: (cd kernels/cuda && bash build.sh $ARCH) && cargo build --release"
+        exit 1
+    fi
+    echo "WARN: rebuild OK, pair is same-source again"
 fi
 
 # Exact-PID cleanup only: pkill -f would match the caller's own command line.
