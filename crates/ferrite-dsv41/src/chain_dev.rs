@@ -232,8 +232,12 @@ pub struct DevChain<'a> {
     moe_graph_captures: u32,
     moe_graph_replays: u32,
     /// n-gram hash state (host side; the token cache spans prefill + decode)
-    /// The whole-step CUDA graph (built on the second step; see step_impl).
+    /// The whole-step CUDA graph (captured on the first DECODE step; see step_impl).
     step_graph: Option<*mut std::ffi::c_void>,
+    /// Decode-path steps only: the capture must NOT happen during prefill, because
+    /// the host's launch decisions (which branches, which kernel args) can differ
+    /// between prefill and decode and a capture freezes them.
+    decode_steps: u32,
     /// Device-side engram hash state (built lazily on the first step).
     eng_dev: Option<EngDev>,
     ngram: Option<crate::engram::NgramHashState>,
@@ -406,6 +410,7 @@ impl<'a> DevChain<'a> {
             moe_graph_captures: 0,
             moe_graph_replays: 0,
             step_graph: None,
+            decode_steps: 0,
             eng_dev: None,
             ngram,
             eng_layout,
@@ -600,6 +605,7 @@ impl<'a> DevChain<'a> {
     /// that step returned it — the host value feeds only the n-gram hash, so this
     /// path does ZERO host-to-device traffic.
     pub fn step_dev(&mut self, token: u32, pos: usize) -> Result<u32> {
+        self.decode_steps = self.decode_steps.wrapping_add(1);
         self.step_impl(token, pos)
     }
 
@@ -633,7 +639,11 @@ impl<'a> DevChain<'a> {
                 && !probes
                 && std::env::var("DSV41_GRAPH_STEP").map(|v| v == "1").unwrap_or(false)
         });
-        if want && self.step_count >= 1 {
+        // ONLY on the decode path: capturing during prefill froze the prefill
+        // branches into the graph, so the decode replays took the wrong ones (the
+        // observable symptom was output that looked like a plausible continuation of
+        // something else - the model was being fed a mis-processed prompt).
+        if want && self.decode_steps >= 1 {
             if let Some(e) = self.step_graph {
                 self.dev.graph_launch(e)?;
             } else {
