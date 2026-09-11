@@ -691,10 +691,10 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
 // inside one scale block: lanes 0-3 share block 0, lanes 4-7 block 1, which is what
 // (lane >> 2) selects. The per-element product keeps its original shape; only the
 // order in which a lane visits its elements changes.
-static const bool g_expert_fp4_vec = [] {
-    const char* e = getenv("DSV41_EXPERT_FP4_VEC");
-    if (e == nullptr) return false;   // opt-in until the text check passes
-    return e[0] != '0';
+static const int g_expert_fp4_mode = [] {
+    const char* e = getenv("DSV41_EXPERT_FP4_MODE");
+    if (e == nullptr) return 0;       // 0 scalar, 1 vectorised, 2 shared lut + split accumulators
+    return atoi(e);
 }();
 
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
@@ -722,6 +722,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // Same activation staging as the sequential kernel: the ONE shared quantised
     // row for gate/up, the slot's own f32 swiglu slice for down.
     extern __shared__ float s_act[];   // k floats
+    // The sixteen possible e2m1 values, built once per block: one shared lookup
+    // replaces the eight-way select tree that dsv41_e2m1_to_f expands to
+    // at a data-dependent index, which is most of this kernel's instruction count.
+    float* s_lut = s_act + k;
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
     for (int j = threadIdx.x; j < k; j += blockDim.x) {
@@ -733,6 +737,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             s_act[j] = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
         }
     }
+        if (threadIdx.x < 16) s_lut[threadIdx.x] = dsv41_e2m1_to_f((uint8_t)threadIdx.x);
     __syncthreads();
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -748,7 +753,44 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         const uint8_t* srow = bb_s + (size_t)r * ksc;
 
         float acc = 0.f;
-        if (vec) {
+        if (vec == 2) {
+            // Same 256-values-per-group shape as the vectorised branch, but the
+            // unpack is a shared lookup and the accumulation is split four ways so
+            // the dependency chain is forty fmas deep instead of a hundred and sixty.
+            const int nv2 = k >> 8;
+            const int off2 = lane << 2;                  // byte offset of this lane's uint32
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            for (int g = 0; g < nv2; ++g) {
+                const int j = (g << 8) + (lane << 3);
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                const uint8_t* bp = brow + (g << 7) + off2;
+                const uint32_t w0 = *reinterpret_cast<const uint32_t*>(bp);
+                const uint32_t w1 = *reinterpret_cast<const uint32_t*>(bp + 4);
+                a0 = fmaf(s_act[j + 0], s_lut[w0 & 0xFu] * sc, a0);
+                a1 = fmaf(s_act[j + 1], s_lut[(w0 >> 4) & 0xFu] * sc, a1);
+                a2 = fmaf(s_act[j + 2], s_lut[(w0 >> 8) & 0xFu] * sc, a2);
+                a3 = fmaf(s_act[j + 3], s_lut[(w0 >> 12) & 0xFu] * sc, a3);
+                a0 = fmaf(s_act[j + 4], s_lut[(w0 >> 16) & 0xFu] * sc, a0);
+                a1 = fmaf(s_act[j + 5], s_lut[(w0 >> 20) & 0xFu] * sc, a1);
+                a2 = fmaf(s_act[j + 6], s_lut[(w0 >> 24) & 0xFu] * sc, a2);
+                a3 = fmaf(s_act[j + 7], s_lut[(w0 >> 28) & 0xFu] * sc, a3);
+                a0 = fmaf(s_act[j + 8], s_lut[w1 & 0xFu] * sc, a0);
+                a1 = fmaf(s_act[j + 9], s_lut[(w1 >> 4) & 0xFu] * sc, a1);
+                a2 = fmaf(s_act[j + 10], s_lut[(w1 >> 8) & 0xFu] * sc, a2);
+                a3 = fmaf(s_act[j + 11], s_lut[(w1 >> 12) & 0xFu] * sc, a3);
+                a0 = fmaf(s_act[j + 12], s_lut[(w1 >> 16) & 0xFu] * sc, a0);
+                a1 = fmaf(s_act[j + 13], s_lut[(w1 >> 20) & 0xFu] * sc, a1);
+                a2 = fmaf(s_act[j + 14], s_lut[(w1 >> 24) & 0xFu] * sc, a2);
+                a3 = fmaf(s_act[j + 15], s_lut[(w1 >> 28) & 0xFu] * sc, a3);
+            }
+            acc = (a0 + a1) + (a2 + a3);
+            for (int j = (nv2 << 8) + lane * 2; j < k; j += 64) {
+                const uint8_t byte = brow[j >> 1];
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                acc += s_act[j] * (s_lut[byte & 0xFu] * sc);
+                acc += s_act[j + 1] * (s_lut[byte >> 4] * sc);
+            }
+        } else if (vec) {
             // 32 lanes * 8 values = 256 values per iteration, four scale blocks.
             const int nv = k >> 8;              // full 256-value iterations
             const int off = lane << 2;          // byte offset of this lane's uint32
@@ -984,10 +1026,12 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     const int warps = 8;
     const int n_total = 2 * inter;
     dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
-    expert_gemv_fp4_batched_kernel<<<grid, warps * 32, (size_t)dim * sizeof(float), stream>>>(
+    expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
+                                         (size_t)dim * sizeof(float) + 16 * sizeof(float),
+                                         stream>>>(
         nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
         w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
-        g_expert_fp4_vec ? 1 : 0);
+        g_expert_fp4_mode);
     return (int)cudaGetLastError();
 }
 
@@ -1004,10 +1048,12 @@ extern "C" int dsv41_expert_down_fp4_batched(
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
     dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots);
-    expert_gemv_fp4_batched_kernel<<<grid, warps * 32, (size_t)inter * sizeof(float), stream>>>(
+    expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
+                                         (size_t)inter * sizeof(float) + 16 * sizeof(float),
+                                         stream>>>(
         act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
         row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
-        w2s_base, w2s_stride, ids, g_expert_fp4_vec ? 1 : 0);
+        w2s_base, w2s_stride, ids, g_expert_fp4_mode);
     return (int)cudaGetLastError();
 }
 
