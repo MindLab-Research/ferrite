@@ -764,6 +764,13 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
                                     const int32_t* __restrict__ lens, int32_t* __restrict__ out,
                                     int m, int nh, int hd, int n_pos, int topk, int offset,
                                     float softmax_scale, float head_scale, int uses_cand) {
+    // n_pos arrives as a launch argument, and it is a PER-STEP value (the number of
+    // committed latents). A CUDA graph capture freezes launch arguments, so every
+    // replay would apply the capture step's bound and the compressed-slot
+    // retrieval would silently degrade as the generation grows. The device counter
+    // is already passed in as `lens`; prefer it whenever it is available and
+    // non-zero (falling back keeps the pre-prefill / uninitialised case working).
+    if (lens != nullptr && *lens > 0) n_pos = *lens;
     extern __shared__ float smem[];
     const int cols = topk < n_pos ? topk : n_pos;
     float* s_score = smem;                  // [n_pos]

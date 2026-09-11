@@ -17,6 +17,11 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde.workspace = true
 serde_json.workspace = true
 ferrite-types = { path = "../ferrite-types" }
+# The SHARED runtime device layer (stream, byte-granular allocation, H2D/D2H/
+# D2D copies, peer access, CUDA-graph capture, cuBLAS GEMMs). Deliberately
+# WITHOUT the `cuda` feature: `devrt` resolves every symbol through dlopen at
+# first use, so this crate still builds and unit-tests on a box with no CUDA.
+ferrite-kernel = { path = "../ferrite-kernel" }
 # The shared HTTP/SSE serving stack (axum routes, the engine driver thread, the
 # chat-tokenizer/stop-set boundary, the single-flight engine adapter). The
 # DSV41 serve mode uses the SAME code GLM serves through — no std::net server,

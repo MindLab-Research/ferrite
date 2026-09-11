@@ -463,7 +463,6 @@ impl Device {
 
     /// Device-wide synchronisation (used by the all-reduce, which must know
     /// that its peer copies have landed before summing them).
-
     pub fn add_inplace_raw(&self, dst: *mut c_void, src: *const c_void, n: i64) -> Result<()> {
         let f = self.need(self.kernels.add_inplace, "ferrite_add")?;
         let rc = unsafe {
@@ -550,7 +549,6 @@ impl Device {
 
     /// Native fp4 experts (tcgen05 MXFP4): gate and up in one pass.
     #[allow(clippy::too_many_arguments)]
-
     pub fn expert_gate_up_fp4(
         &self,
         a: *const u8,
@@ -574,7 +572,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn expert_down_fp4(
         &self,
         act: *const f32,
@@ -593,7 +590,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn engram_hash(
         &self,
         token_map: *const i32,
@@ -623,7 +619,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn engram_gather(
         &self,
         table: *const u8,
@@ -646,7 +641,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn sparse_attn(
         &self,
         q: *const f32,
@@ -672,7 +666,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn indexer_topk(
         &self,
         q: *const f32,
@@ -702,7 +695,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn candidate_blocks(
         &self,
         logits: *const f32,
@@ -722,7 +714,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn compressor(
         &self,
         x: *const f32,
@@ -754,7 +745,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn rope_precompute(
         &self,
         cos: *mut f32,
@@ -777,7 +767,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn apply_rope(
         &self,
         x: *mut f32,
@@ -803,7 +792,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn hc_mixes(
         &self,
         x: *const f32,
@@ -829,7 +817,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn moe_route(
         &self,
         x: *const f32,
@@ -858,7 +845,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn window_append(
         &self,
         kv: *const f32,
@@ -876,7 +862,6 @@ impl Device {
 
     /// MoE routing from pre-computed (bf16-gate) scores.
     #[allow(clippy::too_many_arguments)]
-
     pub fn route_topk(
         &self,
         scores: *const f32,
@@ -903,7 +888,6 @@ impl Device {
 
     /// Compressor pooling half (bf16 projections are done by the caller).
     #[allow(clippy::too_many_arguments)]
-
     pub fn compressor_pool(
         &self,
         kvp: *const f32,
@@ -930,8 +914,6 @@ impl Device {
         };
         self.kerr(rc, "dsv41_compressor_pool")
     }
-
-    // --------------------------------------------------- glue op wrappers
 
     pub fn gather_rows(
         &self,
@@ -982,16 +964,13 @@ impl Device {
 
     /// Stamp `round` into every rank's stamp array (including our own) after the
     /// data peer copies have completed on this stream.
-
     pub fn ar_stamp(&self, peer_stamps: *const u64, world: i32, rank: i32, round: u32) -> Result<()> {
         let f = self.need(self.kernels.ar_stamp, "dsv41_ar_stamp")?;
         let rc = unsafe { f(peer_stamps, world, rank, round, self.stream) };
         self.kerr(rc, "dsv41_ar_stamp")
     }
 
-    // ---- CUDA graph capture helpers (segment graphs) ----
     /// Begin capturing work queued on this device's stream.
-
     pub fn ar_store2(
         &self,
         peer_slots: *const u64,
@@ -1017,7 +996,6 @@ impl Device {
     /// Reduce with the same-threads release: the kernel that reads the slots also
     /// announces `reduced` once every block is done.
     #[allow(clippy::too_many_arguments)]
-
     pub fn ar_reduce2(
         &self,
         dst: *mut f32,
@@ -1041,7 +1019,6 @@ impl Device {
     }
 
     /// Announce that this rank has finished reducing `round`.
-
     pub fn ar_mark(&self, peer_reduced: *const u64, world: i32, rank: i32, round: u32) -> Result<()> {
         let f = self.need(self.kernels.ar_mark, "dsv41_ar_mark")?;
         let rc = unsafe { f(peer_reduced, world, rank, round, self.stream) };
@@ -1050,7 +1027,6 @@ impl Device {
 
     /// Lean M=1 GEMV over bf16 weights with an f32 activation (out[n] = W[n,k]·x).
     /// Replaces cuBLAS's gemv2T path, which ran at ~40 GFLOP/s for a single row.
-
     pub fn gemv_bf16(&self, w: *const c_void, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
         let f = self.need(self.kernels.gemv_bf16, "dsv41_gemv_bf16")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };
@@ -1062,7 +1038,6 @@ impl Device {
     /// and makes the step graph-capturable). Single thread, bit-identical to the
     /// host reference.
     #[allow(clippy::too_many_arguments)]
-
     pub fn engram_hash_step(
         &self,
         map: *const i64,
@@ -1089,7 +1064,6 @@ impl Device {
 
     /// AR v5 (graph-capturable): store(e) - write my buffer to every peer's
     /// staging half e&1. The epoch is read from DEVICE memory at runtime.
-
     pub fn ar_v5_store(
         &self,
         peer_slots: *const u64,
@@ -1107,7 +1081,6 @@ impl Device {
 
     /// AR v5: publish(e) - stamp e+1 to every peer (system scope), then poll my
     /// own stamps until every peer has published; replaces the host barrier.
-
     pub fn ar_v5_publish(
         &self,
         peer_stamps: *const u64,
@@ -1123,7 +1096,6 @@ impl Device {
 
     /// AR v5: reduce(e) - sum the peers' staging half e&1 straight into the
     /// caller's buffer; the last block advances the device epoch.
-
     pub fn ar_v5_reduce(
         &self,
         dst: *mut f32,
@@ -1142,7 +1114,6 @@ impl Device {
     /// Stable argmax (ties -> lowest index); writes the winning index as i32 and
     /// advances the device position counter (the argmax is the step's last
     /// kernel, so the counter is stable during the step).
-
     pub fn argmax(&self, v: *const f32, out: *mut c_int, n: i32, pos_ctr: *mut c_int) -> Result<()> {
         let f = self.need(self.kernels.argmax, "dsv41_argmax")?;
         let rc = unsafe { f(v, out, n, pos_ctr, self.stream) };
@@ -1152,7 +1123,6 @@ impl Device {
     /// The decode-step window indices (the trailing window in ring-slot order),
     /// read from the device position counter - replaces the host computation
     /// and its per-layer H2D upload.
-
     pub fn window_idxs(&self, idxs: *mut i32, pos_ctr: *const c_int, window: i32) -> Result<()> {
         let f = self.need(self.kernels.window_idxs, "dsv41_window_idxs")?;
         let rc = unsafe { f(idxs, pos_ctr, window, self.stream) };
@@ -1162,7 +1132,6 @@ impl Device {
     /// Publish the roped index key into the owner's group slot, with the slot
     /// derived from the DEVICE latent counter (a host-computed destination would
     /// be frozen by a graph capture - the same class as the ring append).
-
     pub fn index_k_publish(
         &self,
         dst_base: *mut f32,
@@ -1178,7 +1147,6 @@ impl Device {
     /// Append the KV row into the window ring at the DEVICE-derived slot. This
     /// replaces a cudaMemcpy whose destination address was host-computed and
     /// therefore frozen by a graph capture (every replay wrote the same slot).
-
     pub fn ring_append(
         &self,
         ring: *mut f32,
@@ -1197,7 +1165,6 @@ impl Device {
     /// and advances the counter. Replaces the host's download + branch + rope +
     /// copy, which was a sync D2H per layer per step and uncapturable.
     #[allow(clippy::too_many_arguments)]
-
     pub fn compress_commit(
         &self,
         latent: *const f32,
@@ -1222,7 +1189,6 @@ impl Device {
 
     /// The recency placeholder for the compressed rows (the no-indexer safety
     /// net): idxs[win + j] = win + clen - take + j - replaces an upload.
-
     pub fn comp_placeholder(
         &self,
         idxs: *mut i32,
@@ -1237,7 +1203,6 @@ impl Device {
 
     /// The single 4-byte host read per decode step (EOS check + printing). The
     /// token itself stays on the device; only this value crosses back.
-
     pub fn gemv_f32(&self, w: *const f32, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
         let f = self.need(self.kernels.gemv_f32, "dsv41_gemv_f32")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };
@@ -1247,7 +1212,6 @@ impl Device {
     /// Indirect expert gate/up: the weights come from the per-layer pools plus the
     /// device-side expert id, so the launch arguments do not depend on the routing.
     #[allow(clippy::too_many_arguments)]
-
     pub fn expert_gate_up_fp4_indirect(
         &self,
         a: *const u8,
@@ -1283,7 +1247,6 @@ impl Device {
 
     /// Indirect expert down; accumulates into `out`.
     #[allow(clippy::too_many_arguments)]
-
     pub fn expert_down_fp4_indirect(
         &self,
         act: *const f32,
@@ -1313,7 +1276,6 @@ impl Device {
     }
 
     /// Publish `src` into every rank's staging slot for this rank, from the device.
-
     pub fn ar_store(
         &self,
         peer_slots: *const u64,
@@ -1330,7 +1292,6 @@ impl Device {
 
     /// Sum the `world` staging slots into `dst`, spinning on the local stamps
     /// until every peer has published `round` — the host never waits.
-
     pub fn ar_reduce(
         &self,
         dst: *mut f32,
@@ -1363,8 +1324,6 @@ impl Device {
         self.kerr(rc, "dsv41_engram_apply")
     }
 
-    // ------------------------------------------- read-only GLM reuse set
-
     pub fn rmsnorm(
         &self,
         x: *const f32,
@@ -1379,7 +1338,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn hc_pre(
         &self,
         res: *const f32,
@@ -1407,7 +1365,6 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-
     pub fn hc_post(
         &self,
         x: *const f32,
@@ -1424,7 +1381,6 @@ impl Device {
     }
 
     /// Embedding gather + hc expansion, straight onto the residual stream.
-
     pub fn embed_expand_dev(
         &self,
         table: *const c_void,
@@ -1443,7 +1399,6 @@ impl Device {
 
     /// bf16 -> f32 on the device (GLM's kernel). Used to widen weights without
     /// staging them through host memory.
-
     pub fn bf16_to_f32(&self, src: *const c_void, dst: *mut c_void, n: i64) -> Result<()> {
         let rc = unsafe { (self.kernels.bf16_to_f32)(src, dst, n, self.stream) };
         self.kerr(rc, "ferrite_bf16_to_f32")?;
@@ -1458,8 +1413,4 @@ impl Device {
         let rc = unsafe { (self.kernels.f32_to_bf16)(src, dst, n, self.stream) };
         self.kerr(rc, "ferrite_f32_to_bf16")
     }
-
-    /// f32 x f32 -> f32 GEMM. Used where the release runs a projection in fp32
-    /// (the compressor's, for the pooling's accuracy): the checkpoint stores
-    /// those as bf16, widening is exact, so this reproduces the promotion.
 }
