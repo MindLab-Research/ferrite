@@ -764,6 +764,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             const int nv2 = k >> 9;
             const int off2 = lane << 3;                  // 16 values = 8 bytes per lane
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            // Compiler-directed unroll (same treatment that worked on the fp8
+            // gemv: let nvcc choose the register strategy, keep single-chain
+            // source semantics).
+#pragma unroll 2
             for (int g = 0; g < nv2; ++g) {
                 const int j = (g << 9) + (lane << 4);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
