@@ -5494,6 +5494,7 @@ swiglu 把"已 swiglu 的结果"当 gate、把**未写区**当 up → 数据错�
 | down+reduce | DSV41_DOWN_FUSE | OFF | −0.3ms（估计） |
 | AR store | DSV41_AR_STORE_FUSE | OFF | −0.08ms |
 | swiglu fp8 (A4) | DSV41_SWIGLU_Q | OFF | −0.06ms |
+| ↳ ⚠️ 已更正（见文末 "A4 翻回默认 ON"）：A4 无数值 bug，gate 现为**默认 ON** | | | |
 | epi_add (A5) | DSV41_MOE_EPI_ADD | OFF | −0.08ms |
 
 **下一步**：统一两侧默认后验证 safe3 → 然后逐个翻 ON 测真实收益。
@@ -6169,6 +6170,7 @@ DSV41_ATTN_PF_SPLIT=C 显式开启）。
 **quant-170-audit 的关键归因**（170 次 quant 的分解）：
 - wo_b quant1 = 40（B1 OFF，已知）
 - **ex_act quant1 = 40——A4 swiglu_q 实际默认 OFF**（round-18 数值 bug 暂缓）——swiglu-q-fix 正在修
+  ⚠️ 后续更正（见文末 "A4 翻回默认 ON"）：该"round-18 数值 bug"是**误归因**（A4 代码在 `f3b1be1` 才进树，而 round-18 跑分早于它）；A4 逐位等于 `swiglu_limit`+`quant1`，gate 已翻为**默认 ON**
 - s.o quant1 = 40——o-rope fp8 生效后应消失（第 40 轮已含）
 - qr 双重量化 ≈ 40-48——FFI 修复后消失（第 40 轮已含）
 - engram = 2
@@ -6208,3 +6210,54 @@ swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
 - 第二层（已识别未实施）：rmsnorm_q+wq_b −0.13 + o-rope→sparse_attn −0.10 + AR PDL −0.16 = **−0.39 → 7.06ms ≈ 142 tok/s**
 - 第三层（研究级）：persistent 段核 −0.5~1.0 + expert 突破 −0.5 = **−1.0~1.5 → 5.5~6.0ms ≈ 167-182 tok/s**
 - 第四层（200 需要）：全 persistent + 图调度间隙消除 = **5.0ms = 200 tok/s**
+
+### 🔧 A4（swiglu_q）翻回默认 ON —— "round-18 数值 bug" 是误归因（2026-09-11）
+
+**结论：A4 没有数值 bug，gate 已翻回默认 ON**（`DSV41_SWIGLU_Q=0` 回退到 `swiglu_limit` + `quant1(ex_act)`）。
+
+**时间线（`git show` 实证）**：
+- `f3b1be1^` 的 `dsv41_glue.cu` **没有** `swiglu_limit_q`、`chain_dev.rs` **没有** `act_q`（grep 计数 0）；
+- A4 代码是随 `f3b1be1`（15:43）进树、**当次默认 `unwrap_or(true)`（ON）**；
+- 而 `f3b1be1` 自己的 commit message 报告的正是 round-18 的 9.44ms 跑分 ⇒ **A4 根本不在产生乱码的那份二进制里**；
+- `f6a1c08`（15:51）以 "part of the round-18 numerical-bug family" 为由把它翻成 OFF —— 属于 A4A5/AR-store 的**连带批量 gating**。
+- round-18 乱码的真实根因仍是 **gateup/down 融合的 `.cu`/Rust 默认值分裂**（见"第 18-21 轮定案"）。
+
+**逐项核对（三个疑点全过）**：
+| 疑点 | 结论 |
+|---|---|
+| amax 跨 warp 归约缺失？ | ✗ 不需要：launcher 以 `wpb=8`、`t` 计**块号**、`i=(b<<5)|lane`，一个 warp 恰好覆盖一个 32 元素量化块（`inter%32` 不满足则返回 1 回退）；这正是 wo_b1 教训里"warp 的 32 lane 就是被量化向量的 32 个连续元素"的情形 |
+| 量化块粒度不对（per-32 vs per-256）？ | ✗ 与 `quant1(ex_act)` 相同：`quant_kernel<0>` **block=32**、round_scale=1 |
+| scale 的 2^x 编码 vs 直接除法？ | ✗ `glue_fast_round_scale` 与 `dsv41_kernels.cu:73 fast_round_scale` **逐字符相同**；再用 `fmaxf(..., 1e-30)`、clamp ±448、`__nv_fp8_e4m3`，与 quant_kernel 逐项同式 |
+| f32 写回 | 同一个寄存器 `v`（无 global 回读）⇒ f32 行也不变 |
+| 映射正确性 | 脚本静态模拟 `rows×inter ∈ {1×288, 1×2304, 1×256, 2×288, 1×5120}`：元素**恰好写一次**、每个 32-block 的 amax 集合**正确**、xsc 索引唯一 |
+
+**已加证据**：`kernels/cuda/tests_dsv41_glue.cu` 新增 `swiglu_q` 用例 —— 对**真实** `dsv41_quant_fp8`(block=32,round_scale=1) 比 `xq`/`xsc`/f32 **逐位**（含 adversarial 块：amax 落在单 lane、全零块触发 1e-30 地板、恰好 ±448）。
+构建行改为 `nvcc … tests_dsv41_glue.cu dsv41_kernels.cu -o /tmp/t_glue`（跨 TU 取真实 quant 核；**本机无 nvcc/GPU，未跑** ⇒ 首次 GPU 轮次请顺带跑一次）。
+
+**下一步**：serve A/B（A4 ON vs `DSV41_SWIGLU_Q=0`）验证四段文本 + p50，预期 −0.06ms / −40 图节点。
+
+### 🎉 第 41 轮：hc tail split + swiglu_q 落地（8.23ms / 121.5 tok/s，+61.4% 会话累计）
+
+| 臂 | p10 | p50 | p90 | tok/s | 文本 | faults |
+|---|---|---|---|---|---|---|
+| **ts41（tail split + swiglu_q 默认 ON）** | **8.15** | **8.23** | **8.31** | **121.5** | 四段全对 | 0 |
+
+**两项落地（8.49 → 8.23 = −0.26ms）**：
+
+1. **hc tail split（−0.20ms 实测 vs −0.86 理论）**：tail 的 collapse+rmsnorm+T1（tail_early）
+   与 mixes+sigmoid+sinkhorn+comb（tail_late）拆成两个半核；tail_late 走 side stream 与
+   主流的投影链并行，hc_post 前 event join。位级一致（两半无共享输出）。
+   **侧流并行未完全兑现**（−0.20 vs −0.86）：图回放中侧流的 1 block tail_late 可能排在
+   主流投影块之后的 SM 队列——fork/join 的图依赖边保证了正确性但不保证同时调度。
+   后续可查：side stream 的优先级（cudaStreamCreateWithPriority）或 tail_late 拆多块。
+
+2. **swiglu_q A4 翻 ON（−0.06ms）**：swiglu-q-fix 的重大勘误——**A4 从未有数值 bug**！
+   round-18 的乱码根因是 gateup/down 融合的 .cu/Rust 默认值分裂（STATUS 5475 定案），
+   A4 的代码在 round-18 的二进制里**根本不存在**（f3b1be1 才进树）——误归因导致 gate
+   被 f6a1c08 连带批量 OFF。逐行对照确认 swiglu_limit_q == swiglu_limit + quant_kernel<0>
+   （同一表达式、同一 fast_round_scale、同一 e4m3 编码）。
+
+**会话累计：13.28 → 8.23ms（+61.4%），75.3 → 121.5 tok/s。**
+
+**在飞三项**（dots→pubred −0.12 + rmsnorm 融合 −0.13 + o-rope→attn −0.10）→ 全落地
+~7.9ms ≈ 127 tok/s。

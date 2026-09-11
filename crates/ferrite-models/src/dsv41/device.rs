@@ -91,6 +91,25 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// NORM_FUSE: the M=1 rope GEMV whose PROLOGUE produces the fp8 activation it
+    /// consumes. Instead of reading a pre-quantised (`a`, `a_scale`) pair it takes
+    /// the RAW f32 row plus the norm weight and eps, and reduces / normalises /
+    /// encodes it in shared memory with `rmsnorm_q_kernel`'s arithmetic, term for
+    /// term. The standalone `rmsnorm_q` launch between `qr`'s producer and the
+    /// wq_b gemv therefore disappears (one launch + one graph node per attention).
+    /// Optional: a stale `.so` has no entry and the caller keeps the pair.
+    /// ABI: stream LAST, as in `dsv41_gemm_fp8_mx_rope_norm(..., cudaStream_t s)`.
+    gemm_fp8_mx_rope_norm: Option<
+        unsafe extern "C" fn(
+            // qr_raw (f32 row), qr_w (norm weight), qr_eps
+            *const f32, *const f32, f32,
+            // w, w_scale, bias, out, n, k
+            *const u8, *const u8, *const f32, *mut f32, c_int, c_int,
+            // rope_cos, rope_sin, rope_base, mul, off, step, inverse, rd, hd
+            *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
     /// epilogue (`out += w @ a`). A separate symbol, so a stale `.so` simply has
     /// no entry and the caller keeps the gemm_fp8_mx + add_inplace pair. Returns
@@ -522,6 +541,7 @@ impl Device {
             gemm_fp8_mx2: km!(rt, "dsv41_gemm_fp8_mx2"),
             gemm_fp8_mx_rope: ko!(rt, "dsv41_gemm_fp8_mx_rope"),
             gemm_fp8_mx2_rope: ko!(rt, "dsv41_gemm_fp8_mx2_rope"),
+            gemm_fp8_mx_rope_norm: ko!(rt, "dsv41_gemm_fp8_mx_rope_norm"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
@@ -1077,6 +1097,82 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx2_rope")?;
+        Ok(true)
+    }
+
+    /// NORM_FUSE: true when the loaded .so carries the norm-fused rope GEMV
+    /// (`dsv41_gemm_fp8_mx_rope_norm`). A stale .so leaves DSV41_NORM_FUSE inert
+    /// and the (rmsnorm_q, gemm_fp8_mx_rope) pair runs.
+    pub fn supports_gemm_fp8_norm(&self) -> bool {
+        self.kernels.gemm_fp8_mx_rope_norm.is_some()
+    }
+
+    /// Producer/consumer fusion of `rmsnorm_q` into the M=1 rope GEMV: the kernel
+    /// PROLOGUE computes the RMSNorm of the raw f32 row `qr_raw` (k elements,
+    /// weight `qr_w`, eps `qr_eps`) and the fp8 e4m3 encoding of the result --
+    /// bytes plus per-32-block scales -- with `rmsnorm_q_kernel`'s arithmetic,
+    /// term for term, straight into shared memory. The standalone `rmsnorm_q`
+    /// launch and the `xq`/`xsc` hand-off disappear; the gemv's own dot and rope
+    /// epilogue are untouched, so `out` is bit-identical to
+    /// (`rmsnorm_q`, `gemm_fp8_mx_rope`).
+    ///
+    /// `qr_raw` is the row the caller would have handed to `rmsnorm_q`, and it
+    /// must stay valid for the whole launch - on this path it is NOT normalised in
+    /// place. The shape gates are the rope launcher's exactly (plus a forced
+    /// 32-warp block, the reference's 1024-thread reduction tree); Ok(false) on
+    /// any decline, so the caller keeps the old pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_rope_norm(
+        &self,
+        qr_raw: *const f32,
+        qr_w: *const f32,
+        qr_eps: f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        rope_base: *const c_int,
+        rope_mul: i32,
+        rope_off: i32,
+        rope_step: i32,
+        rope_inverse: bool,
+        rope_rd: i32,
+        rope_hd: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mx_rope_norm else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                qr_raw,
+                qr_w,
+                qr_eps,
+                w,
+                w_scale,
+                bias,
+                out,
+                n,
+                k,
+                rope_cos,
+                rope_sin,
+                rope_base,
+                rope_mul,
+                rope_off,
+                rope_step,
+                rope_inverse as i32,
+                rope_rd,
+                rope_hd,
+                self.stream,
+            )
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx_rope_norm")?;
         Ok(true)
     }
 

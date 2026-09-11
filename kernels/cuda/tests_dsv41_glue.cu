@@ -1,11 +1,13 @@
 // tests_dsv41_glue.cu — numerical self-test for the five glue kernels in
-// dsv41_glue.cu: engram_apply / swiglu_limit / gather_rows / scatter_add_rows /
-// hc_collapse. The CPU references mirror crates/ferrite-dsv41/src/ops.rs
-// (engram_forward, the expert swiglu epilogue, hc_pre) line by line; gather /
-// scatter follow the index-copy / accumulate semantics of the ABI.
+// dsv41_glue.cu: engram_apply / swiglu_limit / swiglu_limit_q (A4) /
+// gather_rows / scatter_add_rows / hc_collapse. The CPU references mirror
+// crates/ferrite-dsv41/src/ops.rs (engram_forward, the expert swiglu epilogue,
+// hc_pre) line by line; gather / scatter follow the index-copy / accumulate
+// semantics of the ABI. The swiglu_limit_q case compares against the REAL
+// dsv41_quant_fp8 (dsv41_kernels.cu), so that TU is linked in too.
 //
 // Build: nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
-//            tests_dsv41_glue.cu -o /tmp/t_glue
+//            tests_dsv41_glue.cu dsv41_kernels.cu -o /tmp/t_glue
 // Run:   CUDA_VISIBLE_DEVICES=0 ./t_glue
 #include "dsv41_glue.cu"
 
@@ -14,6 +16,10 @@
 #include <cstdio>
 #include <cstring>
 #include <vector>
+
+// dsv41_kernels.cu (linked as a separate TU; only needed by the A4 case).
+extern "C" int dsv41_quant_fp8(const float* x, uint8_t* y, float* scale, int rows, int cols,
+                               int block, int round_scale, cudaStream_t s);
 
 namespace {
 
@@ -254,6 +260,100 @@ int run_swiglu_case(int rows, int inter, float limit, uint32_t seed) {
 }
 
 // --------------------------------------------------------------------------
+// A4 (DSV41_SWIGLU_Q): swiglu_limit_q must be BIT-IDENTICAL to the pair it
+// replaces -- `dsv41_swiglu_limit` + the real `dsv41_quant_fp8`(block=32,
+// round_scale=1) -- on all three products: the f32 write-back, the e4m3 bytes
+// and the per-32-block scales. This is the evidence the round-18 gating never
+// produced (A4 was parked OFF "as part of the A4A5 numerical-bug family" without
+// a numerics test; see the swiglu_q gate comment in chain_dev.rs).
+// --------------------------------------------------------------------------
+int run_swiglu_q_case(int rows, int inter, float limit, uint32_t seed) {
+    if (inter % 32 != 0) {
+        printf("  [swiglu_q rows=%d inter=%d] SKIP (inter %% 32 != 0)\n", rows, inter);
+        return 0;
+    }
+    rng = seed;
+    const size_t n = (size_t)rows * 2 * inter;   // gate_up
+    const size_t nq = (size_t)rows * inter;      // fp8 row
+    const size_t nsc = nq / 32;
+    std::vector<float> gu(n);
+    for (auto& v : gu) v = frand() * 3.f;
+    // Adversarial blocks: (a) the amax on a single lane with the other 31 near
+    // the denormal floor -- the fused warp shuffle and quant_kernel's block
+    // reduce must pick the same value; (b) an all-zero block (scale floor
+    // 1e-30); (c) a block whose scaled value lands exactly on the +-448 clamp.
+    for (int r = 0; r < rows; ++r) {
+        float* row = gu.data() + (size_t)r * 2 * inter;
+        for (int j = 0; j < 32; ++j) row[j] = (j == 17) ? -400.f : 1e-6f * (float)j;
+        if (inter >= 64)
+            for (int j = 32; j < 64; ++j) row[j] = 0.f;
+        if (inter >= 96) {
+            for (int j = 64; j < 96; ++j) row[j] = 1.f;
+            row[64 + 7] = 448.f;   // exactly the clamp
+        }
+    }
+
+    float *g_a, *g_b, *sc_a, *sc_b;
+    uint8_t *q_a, *q_b;
+    CHECK(cudaMalloc(&g_a, n * 4));
+    CHECK(cudaMalloc(&g_b, n * 4));
+    CHECK(cudaMalloc(&q_a, nq));
+    CHECK(cudaMalloc(&q_b, nq));
+    CHECK(cudaMalloc(&sc_a, nsc * 4));
+    CHECK(cudaMalloc(&sc_b, nsc * 4));
+
+    // arm A: the unfused pair (the path DSV41_SWIGLU_Q=0 keeps)
+    CHECK(cudaMemcpy(g_a, gu.data(), n * 4, cudaMemcpyHostToDevice));
+    dsv41_swiglu_limit(g_a, rows, inter, limit, 0);
+    dsv41_quant_fp8(g_a, q_a, sc_a, rows, inter, 32, 1, 0);
+    // arm B: the fused epilogue
+    CHECK(cudaMemcpy(g_b, gu.data(), n * 4, cudaMemcpyHostToDevice));
+    const int rc = dsv41_swiglu_limit_q(g_b, rows, inter, limit, q_b, sc_b, 0);
+    const cudaError_t e = cudaDeviceSynchronize();
+
+    std::vector<float> fa(n), fb(n), sa(nsc), sb(nsc);
+    std::vector<uint8_t> qa(nq), qb(nq);
+    CHECK(cudaMemcpy(fa.data(), g_a, n * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(fb.data(), g_b, n * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(qa.data(), q_a, nq, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(qb.data(), q_b, nq, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(sa.data(), sc_a, nsc * 4, cudaMemcpyDeviceToHost));
+    CHECK(cudaMemcpy(sb.data(), sc_b, nsc * 4, cudaMemcpyDeviceToHost));
+
+    const bool f32_eq = std::memcmp(fa.data(), fb.data(), n * 4) == 0;
+    const bool q_eq = std::memcmp(qa.data(), qb.data(), nq) == 0;
+    const bool sc_eq = std::memcmp(sa.data(), sb.data(), nsc * 4) == 0;
+    // the fused kernel writes only the gate half; the up half must stay EXACTLY
+    // the input (same contract as swiglu_limit_kernel)
+    float md_up = 0.f;
+    for (int r = 0; r < rows; ++r)
+        for (int i = 0; i < inter; ++i)
+            md_up = std::fmax(md_up, std::fabs(fb[(size_t)r * 2 * inter + inter + i] -
+                                              gu[(size_t)r * 2 * inter + inter + i]));
+    // and the f32 row must equal the plain swiglu_limit's output (arm A).
+    float md_f32 = 0.f;
+    for (int r = 0; r < rows; ++r)
+        for (int i = 0; i < inter; ++i)
+            md_f32 = std::fmax(md_f32, std::fabs(fb[(size_t)r * 2 * inter + i] -
+                                                fa[(size_t)r * 2 * inter + i]));
+
+    const bool ok = rc == 0 && e == cudaSuccess && f32_eq && q_eq && sc_eq && md_up == 0.f &&
+                    md_f32 == 0.f;
+    printf("  [swiglu_q rows=%d inter=%d limit=%g] rc=%d err=%s | xq %s xsc %s f32 %s "
+           "(maxdiff %.1e) | up-half %.1e %s\n",
+           rows, inter, (double)limit, rc, cudaGetErrorString(e), q_eq ? "bit-exact" : "DIFF",
+           sc_eq ? "bit-exact" : "DIFF", f32_eq ? "bit-exact" : "DIFF", (double)md_f32,
+           (double)md_up, ok ? "OK" : "MISMATCH");
+    cudaFree(g_a);
+    cudaFree(g_b);
+    cudaFree(q_a);
+    cudaFree(q_b);
+    cudaFree(sc_a);
+    cudaFree(sc_b);
+    return ok ? 0 : 1;
+}
+
+// --------------------------------------------------------------------------
 // gather_rows case (repeating indices, exact copy)
 // --------------------------------------------------------------------------
 int run_gather_case(uint32_t seed) {
@@ -431,6 +531,12 @@ int main() {
     printf("--- swiglu_limit ---\n");
     fails += run_swiglu_case(3, 5, 10.f, 202);  // clamps fire
     fails += run_swiglu_case(3, 5, 0.f, 202);   // limit <= 0: no clamps
+
+    printf("--- swiglu_limit_q (A4, parity vs swiglu_limit + dsv41_quant_fp8) ---\n");
+    fails += run_swiglu_q_case(1, 288, 10.f, 606);   // TP8 sh_il (production)
+    fails += run_swiglu_q_case(1, 2304, 10.f, 607);  // TP1 inter (production)
+    fails += run_swiglu_q_case(1, 256, 0.f, 608);    // no clamps
+    fails += run_swiglu_q_case(3, 64, 10.f, 609);    // rows > 1
 
     printf("--- gather / scatter ---\n");
     fails += run_gather_case(303);

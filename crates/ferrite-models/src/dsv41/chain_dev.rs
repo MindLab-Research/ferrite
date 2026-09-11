@@ -102,6 +102,14 @@ struct Scratch {
     /// here: `s.xq` is rewritten by the o/wo quantisations between the wq_b and
     /// the indexer's idx_wq_b, so only the FIRST qr consumer can be spared.
     xq_of_qr_valid: std::cell::Cell<bool>,
+    /// NORM_FUSE: set by `attention()` when the wq_b rope GEMV took the fused
+    /// path, i.e. `qr` is still the RAW wq_a output (no `rmsnorm_q` ran, so its
+    /// normalisation happens inside each consumer's gemv prologue). `indexer()`
+    /// reads it to send idx_wq_b down the same fused launch instead of
+    /// `quant1(qr)` over the - now raw - buffer; it clears the flag when it
+    /// consumes it. Written on EVERY `attention()` path, so a layer that never
+    /// reaches the indexer cannot leak a stale value into the next step.
+    qr_raw: std::cell::Cell<bool>,
     /// L2+L3: set by `attention()` when the wq_b + idx_wq_b pair was computed
     /// in ONE mx2 launch (`DSV41_IDX_FUSE`), so `indexer()` skips its own
     /// `lin(idx_wq_b)`. Cleared after the indexer consumes it (and whenever the
@@ -290,7 +298,9 @@ fn sh_exp_mx2() -> bool {
 }
 
 /// A5: DSV41_MOE_EPI_ADD=0 reverts the shared expert's w2 to the
-/// (gemm_fp8_mx, ferrite_add) pair. DEFAULT ON for the A/B. Read ONCE and cached
+/// (gemm_fp8_mx, ferrite_add) pair. DEFAULT OFF (parked with the other
+/// round-18-era fusion gates; the A5 epilogue itself is bit-identical, see the
+/// call site's note -- DSV41_MOE_EPI_ADD=1 re-enables). Read ONCE and cached
 /// like the other gates — a per-call getenv is exactly the hot-path slip they
 /// avoid (this branch runs 40x/step, inside graph capture).
 fn moe_epi_add() -> bool {
@@ -299,12 +309,35 @@ fn moe_epi_add() -> bool {
 }
 
 /// A4: DSV41_SWIGLU_Q=0 reverts the shared expert's swiglu to the
-/// (swiglu_limit, quant1) pair. DEFAULT OFF (the A4A5 fused path is
-/// part of the round-18 numerical-bug family; keep the safe unfused path
-/// until the bug is fixed). DSV41_SWIGLU_Q=1 re-enables.
+/// (swiglu_limit, quant1) pair. DEFAULT ON: the fused epilogue is bit-identical
+/// to that pair, on all three products --
+///   * the f32 write-back is the SAME register value `v` (never a global
+///     re-read), so the f32 row is unchanged;
+///   * the amax is an fmaxf tree over the SAME 32 values: the launcher declines
+///     unless `inter % 32 == 0` and every warp owns exactly one 32-element
+///     scale block (t counts blocks, `i = (b << 5) | lane`), so no cross-warp
+///     reduction is needed -- this is precisely the shape quant_kernel<0>'s
+///     block=32 reduce covers (see the wo_b1 lesson in STATUS.md);
+///   * the scale/byte arithmetic is quant_kernel<0>'s term for term
+///     (fmaxf(fast_round_scale(amax, 1/448), 1e-30) -> clamp +-448 ->
+///     __nv_fp8_e4m3), one `1.0f / sc` per element exactly as the quant kernel
+///     computes its `inv`.
+/// Evidence: kernels/cuda/tests_dsv41_glue.cu `swiglu_q` case asserts xq / xsc /
+/// the f32 row are all bit-exact against `dsv41_swiglu_limit` + the real
+/// `dsv41_quant_fp8`(block=32, round_scale=1) -- the test the round-18 gating
+/// never ran.
+///
+/// ⚠️ The "round-18 numerical bug" this gate was parked on is a MISATTRIBUTION:
+/// the A4 code first appears in f3b1be1, whose own message reports the round-18
+/// run, and `f3b1be1^` contains no `swiglu_limit_q` / `act_q` at all -- A4 was
+/// not in the binary that produced the garbage texts. That failure's root cause
+/// was the `.cu`/Rust DEFAULT SPLIT of the gateup+swiglu fusion (STATUS.md round
+/// 18-21, `.cu:1362` g_fuse vs the Rust gate); A4/A5 were then swept OFF with it
+/// (f6a1c08) "for the safe baseline". DSV41_SWIGLU_Q=0 still reverts.
+/// Read ONCE and cached like the other gates.
 fn swiglu_q() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
@@ -427,6 +460,35 @@ fn gateup_fuse() -> bool {
 fn qr_epi() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_QR_EPI").map(|v| v != "0").unwrap_or(true))
+}
+
+/// NORM_FUSE (DSV41_NORM_FUSE, default ON): the wq_b (and, on the indexer side,
+/// idx_wq_b) M=1 rope GEMV computes the RMSNorm + fp8 encoding of its own `qr`
+/// input in its PROLOGUE, so the standalone `rmsnorm_q` launch - 40 per step,
+/// 0.13 ms measured with nsys v5 - and its graph node disappear. Same
+/// producer/consumer shape as the hc-tail / swiglu / B1 epilogues, but on the
+/// consumer's side: the activation is produced where it is consumed, so nothing
+/// is written to global memory or read back.
+///
+/// Bit-identical by construction: the prologue's cross-warp reduction tree, its
+/// blockDim-strided element loop, the per-32-block amax shuffle and the
+/// `fast_round_scale` + clamp + `__nv_fp8_e4m3` round are
+/// `rmsnorm_q_kernel`'s, term for term, and the launcher forces the same
+/// 1024-thread block. The gemv then reads the same bytes out of shared memory,
+/// so its dot - and therefore its output - is unchanged.
+///
+/// `=0` reverts to the (rmsnorm_q, gemm_fp8_mx_rope) pair; an .so without
+/// `dsv41_gemm_fp8_mx_rope_norm` falls back on its own. Cached like the other
+/// gates: this branch runs 40x/step inside the layer loop.
+///
+/// ⚠️ The fused path leaves `qr` UNNORMALISED, so every later reader of `qr`
+/// must use the same fused launch. `attention()` records that in `s.qr_raw`, and
+/// `indexer()` sends its idx_wq_b down the fused launch when it is set. That is
+/// also why the fusion is refused while `IDX_FUSE` is on: the two-family launch
+/// shares one `xq` between wq_b and idx_wq_b and cannot leave `qr` raw.
+fn norm_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_NORM_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// B2 (DSV41_OROPE_Q, default ON): the inverse o-rope's epilogue emits the fp8
@@ -631,6 +693,7 @@ impl<'a> DevChain<'a> {
             xsc4: dev.alloc(fb(dim / 32 + 8))?,
             xq_of_xn_valid: std::cell::Cell::new(false),
             xq_of_qr_valid: std::cell::Cell::new(false),
+            qr_raw: std::cell::Cell::new(false),
             idx_q_ready: std::cell::Cell::new(false),
             idx_q_rope: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
@@ -992,6 +1055,52 @@ impl<'a> DevChain<'a> {
             rope_rd,
             rope_hd1,
             rope_hd2,
+        )
+    }
+
+    /// NORM_FUSE: the rope GEMV whose PROLOGUE also normalises + quantises the
+    /// raw f32 row `a_raw` (k elements, norm weight `qw`, eps `eps`), instead of
+    /// reading a pre-quantised `xq`/`xsc`. No `quant1` runs and neither `xq` nor
+    /// `xsc` is touched, so this must only be used when `a_raw` really is the raw
+    /// producer output - i.e. when `attention()` took the same fused path and
+    /// left `qr` unnormalised (see `s.qr_raw`). Ok(false) when the .so lacks the
+    /// symbol or the shape declines, so the caller keeps its old pair.
+    #[allow(clippy::too_many_arguments)]
+    fn lin_rope_norm(
+        &self,
+        a_raw: *const f32,
+        qw: *const f32,
+        eps: f32,
+        k: i32,
+        w: &crate::dsv41::load::DevTensor,
+        ws: &crate::dsv41::load::DevTensor,
+        n_out: i32,
+        out: *mut f32,
+        rope_rd: i32,
+        rope_hd: i32,
+    ) -> Result<bool> {
+        if !rope_fuse() || !self.dev.supports_gemm_fp8_norm() {
+            return Ok(false);
+        }
+        self.dev.gemm_fp8_mx_rope_norm(
+            a_raw,
+            qw,
+            eps,
+            w.as_u8(),
+            ws.as_u8(),
+            std::ptr::null(),
+            out,
+            n_out,
+            k,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+            1,
+            0,
+            0,
+            false,
+            rope_rd,
+            rope_hd,
         )
     }
 
@@ -1588,7 +1697,10 @@ impl<'a> DevChain<'a> {
         // one-launch phase structure, but the dots are spread instead of pinned
         // to one SM. The fallback chain is
         // (persist_mb -> persist -> two-launch -> hc_mixes), each step silent.
-        let fused = if Self::hc_tail_split() && self.dev.supports_hc_tail_split() && !norm_w.is_null()
+        let fused = if Self::hc_tail_split()
+            && !Self::hcpost_epi()
+            && self.dev.supports_hc_tail_split()
+            && !norm_w.is_null()
         {
             // Tail split (`DSV41_HC_TAIL_SPLIT`, default ON). The collapse +
             // rmsnorm + fp8 (EARLY) stays on the main stream — its consumer is the
@@ -1596,6 +1708,9 @@ impl<'a> DevChain<'a> {
             // comb (LATE) runs on the side stream, joined in `layer` just before
             // the hc_post that reads `comb`. `norm_w` non-null is required: with
             // no collapse half there is nothing to keep on the critical path.
+            // `!hcpost_epi()` is required too: the AR fold (`DSV41_HCPOST_EPI=1`)
+            // consumes `comb`/`post` INSIDE attention()/moe_reduce(), i.e. before
+            // the join, so that dev-only mode keeps the single-launch tail.
             self.dev.hc_front_split(
                 self.s.h.ptr as *const f32,
                 hc_fn,
@@ -2126,35 +2241,11 @@ fn hc_tail_split() -> bool {
                 self.s.qr.ptr as *mut f32,
             )?;
         }
-        // T2 (attention side): the rmsnorm epilogue can emit the fp8 of its OWN
-        // normalised output (`ferrite_rmsnorm_q`), which is exactly what the
-        // wq_b projection's quant1(qr) - the very next qr consumer - would
-        // compute. Same absmax, same fast_round_scale, same clamp/e4m3 round
-        // sequence (T1's, term for term), so the emitted pair is bit-identical
-        // to the launch it replaces. Falls back to the plain rmsnorm (and a
-        // cleared flag) on an .so without the symbol.
-        let qr_q = qr_epi()
-            && self.dev.rmsnorm_q(
-                self.s.qr.ptr as *const f32,
-                ld.q_norm.as_ref().unwrap().as_f32(),
-                self.s.qr.ptr as *mut f32,
-                1,
-                ql as i32,
-                cfg.norm_eps,
-                self.s.xq.ptr as *mut u8,
-                self.s.xsc.ptr as *mut f32,
-            )?;
-        self.s.xq_of_qr_valid.set(qr_q);
-        if !qr_q {
-            self.dev.rmsnorm(
-                self.s.qr.ptr as *const f32,
-                ld.q_norm.as_ref().unwrap().as_f32(),
-                self.s.qr.ptr as *mut f32,
-                1,
-                ql as i32,
-                cfg.norm_eps,
-            )?;
-        }
+        // L2+L3 decision, hoisted above the norm block: which wq_b launch is
+        // taken decides whether NORM_FUSE may run at all. The two-family
+        // IDX_FUSE launch shares ONE `xq` between wq_b and idx_wq_b, so it cannot
+        // take a path that leaves `qr` raw.
+        //
         // L2+L3 fusion (verified by p1p2-zero-hist): `wq_b` and the indexer's
         // `idx_wq_b` read the SAME `qr` buffer (rmsnorm writes it in place at
         // :1572, neither touches it between :1580 and :1937), both k=ql=1280,
@@ -2162,24 +2253,88 @@ fn hc_tail_split() -> bool {
         // index-source layers carry idx_wq_b; the other 32 fall through to the
         // single. The indexer() below skips its own lin when idx_q is already
         // computed (self.s.idx_q_ready flag).
-        // DSV41_IDX_FUSE (default ON) turns this on. It is a SHAPE gate as much
-        // as an env gate: only an index-source layer carries idx_wq_b, and mx2
-        // can still decline the shape (Ok(false)) - in which case BOTH singles
-        // must run, so idx_q_ready stays false and the indexer computes its own
-        // query. The flag is written on EVERY path here (true or false), so a
-        // layer that never calls the indexer cannot leave a stale value behind.
+        // DSV41_IDX_FUSE (default OFF in the code: `.unwrap_or(false)` - the
+        // "default ON" note in the old comment here was stale) turns this on. It
+        // is a SHAPE gate as much as an env gate: only an index-source layer
+        // carries idx_wq_b, and mx2 can still decline the shape (Ok(false)) - in
+        // which case BOTH singles must run, so idx_q_ready stays false and the
+        // indexer computes its own query. The flag is written on EVERY path
+        // here (true or false), so a layer that never calls the indexer cannot
+        // leave a stale value behind.
         let idx_fused = idx_fuse()
             && cfg.is_index_source(layer)
             && ld.idx_wq_b.is_some()
             && ld.idx_wq_b_scale.is_some();
-        // DSV41_ROPE_FUSE: the same launch can ALSO rotate s.q (family 1) and
-        // s.idx_q (family 2) in its epilogue, so neither gets a standalone
-        // apply_rope. `q_roped`/`idx_q_roped` record which ropes the fused
-        // epilogue actually performed; every path sets them, so a layer that
-        // never reaches the indexer cannot leave a stale flag behind.
+        // NORM_FUSE (DSV41_NORM_FUSE, default ON): the wq_b rope GEMV's PROLOGUE
+        // computes the RMSNorm + fp8 encoding of `qr` itself, so the standalone
+        // `rmsnorm_q` launch (and its graph node) disappears - 40 per step. It is
+        // bit-identical by construction: the prologue's reduction tree, element
+        // loop, amax shuffle and e4m3 round are `rmsnorm_q_kernel`'s, term for
+        // term, at the same 1024-thread block, and the gemv then reads the same
+        // bytes out of shared memory. Tried FIRST so that a decline (shape, stale
+        // .so, IDX_FUSE) falls straight through to the pair below.
+        //
+        // ⚠️ This path leaves `qr` UNNORMALISED. Every later reader of `qr` must
+        // therefore use the same fused launch - `indexer()` does, driven by
+        // `s.qr_raw` (set below on EVERY path). That is why it is refused when
+        // `idx_fused` (one shared `xq`) is on.
+        let mut norm_fused = false;
         let mut q_roped = false;
         let mut idx_q_roped = false;
-        if idx_fused {
+        if norm_fuse() && !idx_fused && self.dev.supports_gemm_fp8_norm() {
+            norm_fused = self.lin_rope_norm(
+                self.s.qr.ptr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                cfg.norm_eps,
+                ql as i32,
+                ld.wq_b.as_ref().unwrap(),
+                ld.wq_b_scale.as_ref().unwrap(),
+                (nlh * hd) as i32,
+                self.s.q.ptr as *mut f32,
+                cfg.rope_head_dim as i32,
+                hd as i32,
+            )?;
+            q_roped = norm_fused;
+        }
+        self.s.qr_raw.set(norm_fused);
+        if !norm_fused {
+            // T2 (attention side): the rmsnorm epilogue can emit the fp8 of its OWN
+            // normalised output (`ferrite_rmsnorm_q`), which is exactly what the
+            // wq_b projection's quant1(qr) - the very next qr consumer - would
+            // compute. Same absmax, same fast_round_scale, same clamp/e4m3 round
+            // sequence (T1's, term for term), so the emitted pair is bit-identical
+            // to the launch it replaces. Falls back to the plain rmsnorm (and a
+            // cleared flag) on an .so without the symbol.
+            let qr_q = qr_epi()
+                && self.dev.rmsnorm_q(
+                    self.s.qr.ptr as *const f32,
+                    ld.q_norm.as_ref().unwrap().as_f32(),
+                    self.s.qr.ptr as *mut f32,
+                    1,
+                    ql as i32,
+                    cfg.norm_eps,
+                    self.s.xq.ptr as *mut u8,
+                    self.s.xsc.ptr as *mut f32,
+                )?;
+            self.s.xq_of_qr_valid.set(qr_q);
+            if !qr_q {
+                self.dev.rmsnorm(
+                    self.s.qr.ptr as *const f32,
+                    ld.q_norm.as_ref().unwrap().as_f32(),
+                    self.s.qr.ptr as *mut f32,
+                    1,
+                    ql as i32,
+                    cfg.norm_eps,
+                )?;
+            }
+        }
+        // DSV41_ROPE_FUSE: the same launch can ALSO rotate s.q (family 1) and
+        // s.idx_q (family 2) in its epilogue, so neither gets a standalone
+        // apply_rope. `q_roped`/`idx_q_roped` (declared beside `norm_fused`
+        // above) record which ropes the fused epilogue actually performed; every
+        // path sets them, so a layer that never reaches the indexer cannot leave
+        // a stale flag behind.
+        if !norm_fused && idx_fused {
             // ONE launch for both: wq_b -> s.q, idx_wq_b -> s.idx_q (and, under
             // rope fuse, both rotations).
             idx_q_roped = self.lin2_rope(
@@ -2218,7 +2373,7 @@ fn hc_tail_split() -> bool {
         } else {
             self.s.idx_q_ready.set(false);
         }
-        if !self.s.idx_q_ready.get() {
+        if !norm_fused && !self.s.idx_q_ready.get() {
             q_roped = self.lin_rope(
                 self.s.qr.ptr as *const f32,
                 ql as i32,
@@ -2739,17 +2894,54 @@ fn hc_tail_split() -> bool {
         // DSV41_ROPE_FUSE: whichever launch produced s.idx_q can also have rotated
         // it - `lin_rope` here, the attention mx2's family-2 epilogue there - so
         // the standalone rope below runs only when neither did.
+        // NORM_FUSE: `attention()` left `qr` RAW when the wq_b launch took the
+        // fused path, so this idx_wq_b projection must normalise + quantise `qr`
+        // in its own gemv prologue as well - `quant1(qr)` over a raw row would
+        // index entirely the wrong values. The flag is consumed here either way,
+        // so a layer that never reaches the indexer cannot leak it.
+        let qr_is_raw = self.s.qr_raw.get();
+        self.s.qr_raw.set(false);
         let idx_q_roped = if !self.s.idx_q_ready.get() {
-            let roped = self.lin_rope(
-                self.s.qr.ptr as *const f32,
-                ql as i32,
-                wq_b,
-                wq_b_s,
-                (idx_nh * idx_hd) as i32,
-                self.s.idx_q.ptr as *mut f32,
-                rd as i32,
-                idx_hd as i32,
-            )?;
+            let mut roped = false;
+            if qr_is_raw {
+                roped = self.lin_rope_norm(
+                    self.s.qr.ptr as *const f32,
+                    ld.q_norm.as_ref().unwrap().as_f32(),
+                    cfg.norm_eps,
+                    ql as i32,
+                    wq_b,
+                    wq_b_s,
+                    (idx_nh * idx_hd) as i32,
+                    self.s.idx_q.ptr as *mut f32,
+                    rd as i32,
+                    idx_hd as i32,
+                )?;
+                if !roped {
+                    // The fused launcher declined on a shape the plain rope
+                    // launcher would reject too; materialise the norm first so the
+                    // fallbacks below still quantise NORMALISED values.
+                    self.dev.rmsnorm(
+                        self.s.qr.ptr as *const f32,
+                        ld.q_norm.as_ref().unwrap().as_f32(),
+                        self.s.qr.ptr as *mut f32,
+                        1,
+                        ql as i32,
+                        cfg.norm_eps,
+                    )?;
+                }
+            }
+            if !roped {
+                roped = self.lin_rope(
+                    self.s.qr.ptr as *const f32,
+                    ql as i32,
+                    wq_b,
+                    wq_b_s,
+                    (idx_nh * idx_hd) as i32,
+                    self.s.idx_q.ptr as *mut f32,
+                    rd as i32,
+                    idx_hd as i32,
+                )?;
+            }
             if !roped {
                 self.lin(
                     self.s.qr.ptr as *const f32,

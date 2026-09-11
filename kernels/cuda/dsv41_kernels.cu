@@ -2039,7 +2039,20 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const int* __restrict__ rope_base = nullptr,
                                      int rope_mul = 0, int rope_off = 0, int rope_step = 0,
                                      int rope_inverse = 0, int rope_rd = 0, int rope_hd1 = 0,
-                                     int rope_hd2 = 0) {
+                                     int rope_hd2 = 0,
+                                     // NORM_FUSE (see dsv41_gemm_fp8_mx_rope_norm): when
+                                     // `qr_raw` is non-null the gemv OWNS the production of
+                                     // the fp8 activation it consumes. The prologue computes
+                                     // the RMSNorm of the f32 row `qr_raw` (k elements) with
+                                     // `qr_w` / `qr_eps` and encodes it into `s_a` / `s_as`
+                                     // with rmsnorm_q_kernel's arithmetic, term for term, so
+                                     // the standalone rmsnorm_q launch between qr's producer
+                                     // and this gemv disappears. `a` / `a_scale` are then
+                                     // never read (the launcher passes null). The reduction
+                                     // tree only matches the reference at blockDim 1024, so
+                                     // the launcher forces 32 warps.
+                                     const float* qr_raw = nullptr,
+                                     const float* qr_w = nullptr, float qr_eps = 0.f) {
     // Read the round ONCE, like p2p_ar_store_v5_kernel (ferrite_kernels.cu). When
     // the table is null this is a no-op (epoch is null too) and the kernel is the
     // old one bit for bit.
@@ -2104,7 +2117,50 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     // in every launcher's `scale_bytes` (see dsv41_gemm_fp8_mx); it is only
     // dereferenced when `xq` is non-null, which requires nwarps == 32.
     float* s_rows = s_af + k;
-    if (vec == 4) {
+    // NORM_FUSE prologue (see dsv41_gemm_fp8_mx_rope_norm). With `qr_raw`
+    // non-null this block owns the activation's fp8 production: it reduces the
+    // f32 row, applies the norm weight and encodes the scaled values into
+    // `s_a` / `s_as` with `rmsnorm_q_kernel`'s arithmetic, term for term -- the
+    // same blockDim-strided element loop, the same shuffle-down tree, the same
+    // thread-0 cross-warp sum, the same `fast_round_scale` + clamp + e4m3 round.
+    // The standalone rmsnorm_q launch is gone and the gemv reads the identical
+    // bytes out of shared memory. `a` / `a_scale` are never touched here.
+    //
+    // BIT-IDENTITY depends on the blockDim: the reference runs 1024 threads, so
+    // the launcher forces 32 warps and the partial sums are visited in exactly
+    // the reference's order.
+    __shared__ float s_norm_red[32];
+    if (qr_raw != nullptr) {
+        float ss = 0.f;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) {
+            const float t = qr_raw[i];
+            ss += t * t;
+        }
+        float lane_sum = ss;
+        for (int off = 16; off > 0; off >>= 1)
+            lane_sum += __shfl_down_sync(0xffffffffu, lane_sum, off);
+        if ((threadIdx.x & 31) == 0) s_norm_red[threadIdx.x >> 5] = lane_sum;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < nwarps; ++i) t += s_norm_red[i];
+            s_norm_red[0] = rsqrtf(t / (float)k + qr_eps);
+        }
+        __syncthreads();
+        const float inv = s_norm_red[0];
+        const int lane31 = threadIdx.x & 31;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) {
+            const float v = qr_raw[i] * inv * qr_w[i];
+            float am = fabsf(v);
+            for (int off = 16; off > 0; off >>= 1)
+                am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, off));
+            const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
+            if (lane31 == 0) s_as[i >> 5] = sc;
+            const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+            const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+            s_a[i] = *(const uint8_t*)&f8;
+        }
+    } else if (vec == 4) {
         const int n16a = k >> 4;
         // NOTE: this staging was tried as cp.async and faulted with err 700
         // (illegal access, surfacing as a sticky error on dsv41_route_topk) while
@@ -2120,8 +2176,11 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     }
     if (vec >= 3) {
         // The activation scales are the same for every output row, so they are
-        // read once per block instead of once per row per k-block.
-        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
+        // read once per block instead of once per row per k-block. On the
+        // NORM_FUSE path (`qr_raw` non-null) the prologue above already wrote
+        // them, and `a_scale` is null.
+        if (qr_raw == nullptr)
+            for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
         // Build the e4m3 decode table once per block (256 entries, two iterations
         // per thread at the default block size).
         for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
@@ -2462,6 +2521,66 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
         a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
         nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
         rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd, 0);
+    return (int)cudaGetLastError();
+}
+
+// NORM_FUSE: the M=1 rope GEMV whose PROLOGUE produces the quantised activation
+// it consumes, so the `rmsnorm_q` launch between `qr`'s producer and this gemv
+// disappears (one launch + its graph node per attention, 40 per step). `qr_raw`
+// is the f32 row that `dsv41_rmsnorm_q` would have turned into the (`xq`,
+// `xsc`) pair; the kernel reduces it, applies `qr_w`/`qr_eps` and encodes the
+// result into `s_a`/`s_as` with rmsnorm_q_kernel's arithmetic, term for term.
+//
+// A SEPARATE entry point for the usual reason: `dsv41_gemm_fp8_mx_rope` has one
+// fixed ABI, so a stale .so stays a plain symbol probe (supports_gemm_fp8_norm
+// on the Rust side) and the caller keeps the (rmsnorm_q, gemm_fp8_mx_rope) pair.
+//
+// Two differences from the plain rope launcher, both deliberate:
+//   * the block size is FORCED to 32 warps because the prologue's reduction tree
+//     is rmsnorm_q_kernel's 1024-thread tree - the partial sums (and therefore
+//     `inv`, and therefore every emitted byte) only match the reference at this
+//     width;
+//   * the mode is FORCED to 4 (the block-wide activation copy), because that is
+//     the only mode where the activation the consume loop reads lives in shared
+//     memory. The DSV41_GEMV_FP8_MODE env gate does not apply here.
+// It reuses the rope shape checks verbatim, so any shape the rope launcher takes
+// this one takes too (and vice versa), and a decline leaves the caller on the
+// old pair.
+extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_w, float qr_eps,
+                                           const uint8_t* w, const uint8_t* w_scale,
+                                           const float* bias, float* out, int n, int k,
+                                           const float* rope_cos, const float* rope_sin,
+                                           const int* rope_base, int rope_mul, int rope_off,
+                                           int rope_step, int rope_inverse, int rope_rd,
+                                           int rope_hd, cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv || qr_raw == nullptr || qr_w == nullptr) return 1;
+    if (n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 1;
+    if ((n & 31) || rope_rd <= 0 || (rope_rd & 1) || rope_hd <= 0 || (rope_hd & 31) ||
+        rope_rd > rope_hd)
+        return 1;
+    const int warps = 32;
+    const int blocks = n / 32;
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+    // mode 4 only: `warps` weight rows + the block-wide activation row.
+    const size_t gsmem = (size_t)(warps + 1) * (size_t)k + scale_bytes;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    // `a`/`a_scale` are null: the prologue produces the activation and the
+    // kernel never dereferences them on this path (the `qr_raw` guard skips both
+    // staging sites; mode 4 takes `s_a`).
+    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        nullptr, nullptr, w, w_scale, bias, out, n, k, /*vec=*/4, nullptr, nullptr, nullptr,
+        nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
+        rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd, 0, qr_raw, qr_w, qr_eps);
     return (int)cudaGetLastError();
 }
 
