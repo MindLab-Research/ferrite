@@ -176,11 +176,14 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 且必然破坏 parity 逐位契约）；③ wo_a 的 `nlg=1`、wo_b 的 k=`ol_local`=1024 都极小，中间量只有
 4KB，不存在可回收的「中间流量」。**结论：不可行，勿试。**
 
-**真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 ON**，`=0` 回退；launcher 用 `cudaLaunchKernelEx` 发射），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
+**真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 ON**；PDL 臂走 `cudaLaunchKernelEx` + attribute，`=0` 回退臂走 **`cudaLaunchKernel` + 显式 `void*[]` 参数数组**，即 `<<<>>>` 本身编译出的那条运行时 API），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
+
+> ⚠️ **2026-09-11 round-45 修复**：回退臂**不得**走 `cudaLaunchKernelEx`。Extended Launch 会把参数包多转发一层模板，gemv 家族 36+ 参数时实测会返回 `cudaErrorInvalidValue`（"cuda error 1"），而同一份参数列表用 `cudaLaunchKernel` 数组形式则正常。**不要**把两条臂合并回单个 `cudaLaunchKernelEx` 调用。同理待查：`dsv41_experts_pdl_or_plain`（`dsv41_experts_mxf4.cu:873`）仍是「两条臂都走 Ex」的旧写法。
+
 
 | consumer kernel | launcher | 入口 sync |
 |---|---|---|
-| `gemm_fp8_gemv_kernel` | `dsv41_gemm_fp8_mx`（M=1 分支） | `dsv41_kernels.cu:2578` |
+| `gemm_fp8_gemv_kernel` | `dsv41_gemm_fp8_mx`（M=1 分支） | `dsv41_kernels.cu:2830` |
 | 同上 | `dsv41_gemm_fp8_mx_rope` | 同上 |
 | 同上 | `dsv41_gemm_fp8_mx_rope_norm` | 同上 |
 | 同上 | `dsv41_gemm_fp8_mx2_rope` | 同上 |

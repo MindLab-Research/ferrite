@@ -2622,9 +2622,14 @@ __device__ __forceinline__ void dsv41_cp_wait_all();
 //     node-transition cost, NOT bandwidth, which is why it needs no node
 //     removal, no grid change and no cross-block sync -- it sidesteps the
 //     hcpm / hc-merge / B1 failure modes entirely.
-//   * DSV41_PDL=0 -> the same cudaLaunchKernelEx path WITHOUT the attribute: a
-//     plain launch, which records the identical node in a stream capture. This
-//     is the A/B arm and the rollback.
+//   * DSV41_PDL=0 -> cudaLaunchKernel, the runtime API the `<<<>>>` form itself
+//     compiles to: a plain launch with an explicit void* argument array, which
+//     records the identical node in a stream capture. This is the A/B arm and
+//     the rollback. It MUST NOT go through cudaLaunchKernelEx: the Extended
+//     Launch path marshals the same arguments through its variadic template, and
+//     for the 36+ parameter GEMV family that forwarding has been observed to
+//     return cudaErrorInvalidValue ("cuda error 1") on a launch whose plain
+//     argument list is well formed.
 //
 // CONTRACT (must be preserved by every future caller): a kernel routed through
 // this helper MUST call cudaGridDependencySynchronize() before reading ANY
@@ -2639,9 +2644,12 @@ __device__ __forceinline__ void dsv41_cp_wait_all();
 // split/merge/warp attention variants (A/B arms nobody should silently start
 // running under PDL).
 //
-// NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
-// through cudaLaunchKernelEx (its two-pack template accepts the implicit
-// conversions the `<<<>>>` form would take).
+// NOTE: the `<<<>>>` launch syntax takes no launch attribute, so the PDL arm
+// uses cudaLaunchKernelEx (whose variadic template accepts the implicit
+// conversions the `<<<>>>` form would take) while the NON-PDL arm deliberately
+// uses cudaLaunchKernel with an explicit argument array -- that array is the
+// only launch path that is byte-for-byte the `<<<>>>` one. Do NOT "simplify"
+// this back to a single cudaLaunchKernelEx call.
 //
 // ARCH: the host gate above is not arch-gated, the device sync is -- so this
 // file MUST be built for sm_90+ (kernels/cuda/build.sh defaults to 100a and the
@@ -2664,16 +2672,30 @@ static int dsv41_pdl_enabled(void) {
 template <typename K, typename... Args>
 static inline cudaError_t dsv41_pdl_or_plain(K kern, dim3 grid, dim3 block, size_t smem,
                                              cudaStream_t stream, Args... args) {
-    cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = grid; cfg.blockDim = block;
-    cfg.dynamicSmemBytes = smem; cfg.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
     if (dsv41_pdl_enabled()) {
+        // PDL path: cudaLaunchKernelEx with the programmatic attribute.
+        cudaLaunchConfig_t cfg = {};
+        cfg.gridDim = grid; cfg.blockDim = block;
+        cfg.dynamicSmemBytes = smem; cfg.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
         cfg.attrs = attrs; cfg.numAttrs = 1;
+        return cudaLaunchKernelEx(&cfg, kern, args...);
     }
-    return cudaLaunchKernelEx(&cfg, kern, args...);
+    // NON-PDL path: cudaLaunchKernel -- the runtime API equivalent of `<<<>>>`.
+    //
+    // Round-45 fix: cudaLaunchKernelEx even WITHOUT the attribute is a DIFFERENT
+    // launch path than `<<<>>>`. Its variadic two-pack template must forward the
+    // deduced argument pack through an extra function layer, and for the GEMV
+    // family that means 36+ parameters; the resulting marshaling can fail with
+    // cudaErrorInvalidValue (a.k.a. "cuda error 1") even though the plain-launch
+    // argument list is well formed. cudaLaunchKernel takes an explicit void*
+    // array, so the argument marshaling is byte-for-byte the one `<<<>>>` emits.
+    // The caller still spells out every trailing default (see the call sites):
+    // the array form applies no default arguments either.
+    void* arg_ptrs[] = { (void*)&args... };
+    return cudaLaunchKernel(kern, grid, block, (void**)arg_ptrs, smem, stream);
 }
 
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,

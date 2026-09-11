@@ -128,7 +128,7 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 | 副本 | 位置 | gate / 默认 | 覆盖 |
 |---|---|---|---|
 | GLM | `ferrite_kernels.cu:753` `pdl_or_plain` | `FERRITE_PDL` / **OFF** | ~4 launcher（`sparse_attn_v2`、`hc_post`、`gemv_bf16_v2` 族、`gemv_tri`）；实测**中性**（`AGENTS.md:942`，且当时覆盖面窄） |
-| DSV41 attn | `dsv41_kernels.cu:2665` `dsv41_pdl_or_plain` | `DSV41_PDL` / **ON**（`=0` 回退） | attention 投影链 consumer 端 **8 个 launch 点** |
+| DSV41 attn | `dsv41_kernels.cu:2665` `dsv41_pdl_or_plain` | `DSV41_PDL` / **ON**（`=0` 回退走 `cudaLaunchKernel`） | attention 投影链 consumer 端 **8 个 launch 点** |
 | DSV41 expert | `dsv41_experts_mxf4.cu:873` `dsv41_experts_pdl_or_plain` | `DSV41_PDL` / **ON** | `quant_fp4 → gateup → down_reduce` 共 **3 个 launch 点** |
 
 - ⚠️ **每个新 TU 要带自己的副本**：`pdl_or_plain` 是 file-static，`dsv41_kernels.cu` / `dsv41_experts_mxf4.cu` / `ferrite_kernels.cu` 各有一份逐条同义的实现。新增 `.cu` 若要用 PDL，必须复制一份，不能链到别处。
