@@ -278,10 +278,13 @@ __global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const 
 且 `dsv41` 侧**没有任何 fp8 KV 通路**（`kv` 形参就是 `const float*`，fp8 KV 只存在于
 另一模型的 `ferrite_kernels.cu:5955/6209`）。**本项应关闭。**
 
-**真顺位（若继续投入）**：① key-split（`DSV41_ATTN_PF_SPLIT=C`，隔离台架实测 per-slot 成本降 ~7x，
-`dsv41_kernels.cu:845-857`）——但 `C>0` 会让本融合 decline 回退到 3 launch（`:4660`），
-前置条件是**把 phase 2/3 折进 `sparse_attn_merge_kernel`**（`:1133`，其 grid `(b*m,h)` 与 pf 完全相同，
-`chain_dev.rs:2875-2881` 已写明）；② 单块内提并行（加 warp 数）——**但 merge epilogue 只折 4 个 warp**
-（`sh_acc[4][512]`、`w < nwarp && w < 4`，`:1524/1537-1540`），改 blockDim 必须先改这个静默截断。
+**真顺位（若继续投入）**：① key-split —— ✅ **已实施（2026-09-11，sparse-attn-v8）**：
+`sparse_attn_merge_kernel`（`dsv41_kernels.cu:1189`）现在带可选 rope+fp8 epilogue，`dsv41_sparse_attn_orope`
+的 `split_c>0` 分支不再 decline，直接跑 split + merge 两 launch 且保留两个融合；gate `DSV41_SPARSE_SPLIT`
+默认 C=4（`kSparseSplitDefault`，`dsv41_resolve_sparse_split_c()` 统一解析，plain 与 orope 共用以免选择不一致）。
+隔离台架 per-slot 成本降 ~7x（`dsv41_kernels.cu:845-857`）。
+② 单块内提并行（加 warp 数）——**但 merge epilogue 只折 4 个 warp**
+（`sh_acc[4][512]`、`w < nwarp && w < 4`，`:1631/1644-1647`），改 blockDim 必须先改这个静默截断；
+key-split C=4 恰好 4 warp，所以走的是 split 维度而不是这条。
 
 **未验证项（上机前必做）**：① 本机无 nvcc/GPU，`.cu` **未编译**（仅括号平衡自检 + 逐行静态复核）；② `--use_fast_math` 下 rope 的 `x0*cc - x1*ss` 收缩需 parity 逐位确认；③ 建议 `DSV41_SPARSE_OROPE=0` 与 ON 各跑一次逐步 RMS 对照。

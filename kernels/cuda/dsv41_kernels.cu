@@ -887,7 +887,6 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 // point. C=8 still wins in the long-context steady state, so DSV41_SPARSE_SPLIT=C
 // remains the explicit knob.
 #define kSparseSplitDefault 4   // DSV41_SPARSE_SPLIT default (0 restores the pf kernel)
-#define kAttnPfSplitDefault 0   // DSV41_ATTN_PF_SPLIT default (unset -> DSV41_SPARSE_SPLIT)
 #define kAttnMaxC 16
 #define kAttnMaxBM 8
 #define kAttnMaxH 64
@@ -900,7 +899,9 @@ __device__ float g_attn_part[kAttnMaxBM][kAttnMaxH][kAttnMaxC][kAttnStride];
 //   DSV41_ATTN_SPLIT     legacy explicit knob (> 0 wins; arms that pass it predate
 //                        the prefetch port and must keep selecting a split kernel)
 //   DSV41_ATTN_PF_SPLIT  harness A/B knob - ANY explicit value wins, including 0
-//                        (that is the "restore the single-block pf kernel" arm)
+//                        (that is the "restore the single-block pf kernel" arm;
+//                        the OLD static default of 0 is now expressed by
+//                        DSV41_SPARSE_SPLIT=0 / DSV41_ATTN_PF_SPLIT=0)
 //   DSV41_SPARSE_SPLIT   the gate this round adds; default kSparseSplitDefault = 4
 // A malformed value falls back to the default rather than silently disabling the
 // split. The plain `dsv41_sparse_attn` and the fused `dsv41_sparse_attn_orope`
@@ -4991,8 +4992,14 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     dim3 grid(b * m, h);
     if (!seq) {
         const int split_c = g_sparse_split_c;
-        if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
-            h <= kAttnMaxH) {
+        if (pf_off) {
+            // DSV41_ATTN_PF=0 is the documented "restore the plain warp kernel" A/B
+            // arm. It is tested BEFORE the split on purpose: the split now defaults
+            // ON, so the old order would leave this arm unreachable.
+            sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen,
+                                                         window, index_topk, scale);
+        } else if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
+                   h <= kAttnMaxH) {
             // One block per (chunk, row, head); the split writes the partials,
             // the merge folds the sink and normalises (rope/xq are null here, so
             // the merge's fused epilogue is skipped and this arm is unchanged).
@@ -5007,8 +5014,7 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                 sink, out, b, m, h, d, split_c, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
                 nullptr, nullptr);
             return (int)cudaGetLastError();
-        }
-        if (!pf_off) {
+        } else {
             // PDL (see dsv41_pdl_or_plain): sparse_attn_pf is the consumer of
             // wq_b / apply_rope (q), the indexer (idxs) and the compressor
             // (*clen), so its grid may start during the producer's tail; the
@@ -5018,9 +5024,7 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                                                kv, sink, idxs, out, b, m, h, d, clen, window,
                                                index_topk, scale);
             if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
-        } else
-            sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
-                                                     scale);
+        }
     } else {
         sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale);
     }
@@ -5079,6 +5083,11 @@ extern "C" int dsv41_sparse_attn_orope(
     }();
     const int split_c = g_sparse_split_c;
     if (seq) return 2;
+    // Mirror the plain launcher's order (warp arm before split): with the split
+    // defaulting ON, a pf_off arm must still land on the warp kernel AND this
+    // fused path must decline it, or the fallback and the fused path would run
+    // different kernels for the same env.
+    if (pf_off) return 2;
     if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM && h <= kAttnMaxH) {
         // The key-split arm, mirroring `dsv41_sparse_attn`'s split arm exactly;
         // the ONLY difference is that the merge gets the rope/fp8 epilogue

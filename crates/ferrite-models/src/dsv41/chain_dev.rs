@@ -910,6 +910,11 @@ impl<'a> DevChain<'a> {
         // The fused route's election counter must start at 0 (cudaMalloc does
         // not zero). From here on the kernel self-resets it every call.
         dev.zero(&s.route_ctr)?;
+        // chain-pair-grid-sync: the wo_a -> wo_b barrier pair must also start at
+        // zero (arrive == 0, sense == 0). It is self-resetting after that, so this
+        // is the ONLY initialisation it ever needs -- do not re-zero it per step
+        // (that would race the kernel's own reset).
+        dev.zero(&s.wo_bar)?;
 
         // RoPE tables covering the whole context.
         let table = max_pos;

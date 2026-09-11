@@ -25,6 +25,11 @@
 //   DSV41_ATTN_PF_SPLIT=1 ./t_sparse_pfsplit c1   50   # must be bit-identical to pf
 //   DSV41_ATTN_PF_SPLIT=8 ./t_sparse_pfsplit c8   50   # tolerance vs pf
 //
+// ⚠️ The DEFAULT chunk count now comes from `DSV41_SPARSE_SPLIT`
+// (kSparseSplitDefault = 4, sparse-attn-v8); `DSV41_ATTN_PF_SPLIT` still wins
+// when set EXPLICITLY, so the three lines above are unaffected. An arm that
+// forgets to set it runs C=4, not pf.
+//
 // Shape is the production one, scaled to TP8: window 128, 512 live compressed
 // rows (topk = window + clen = 640), head_dim 512, 8 local heads - i.e. the
 // 1.31 MB of kv rows the deep dive measured.

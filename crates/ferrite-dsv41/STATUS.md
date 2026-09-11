@@ -6874,7 +6874,24 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 | wo_a→wo_b | 2 launch | 1 两段核 | 40/步 |
 
 原子 barrier + __threadfence（非 cooperative launch → 图捕获安全）。
-**wo_a→wo_b 正在实施中（chain-pair-grid-sync）**。
+
+**wo_a→wo_b 已实施（chain-pair-grid-sync，2026-09-12）**——gate `DSV41_WO_PAIR`（默认 OFF）：
+| 落点 | 内容 |
+|---|---|
+| `dsv41_kernels.cu` | `gemm_fp8_wo_pair_kernel` + launcher `dsv41_gemm_fp8_wo_pair` |
+| `device.rs` | FFI `gemm_fp8_wo_pair` + `supports_wo_pair()` + wrapper |
+| `chain_dev.rs` | `wo_pair_fuse()` gate + 调用点（替换 wo_a 循环 + wo_b 两次调用） |
+| barrier state | `Scratch.wo_bar` `[arrive, sense]` u32×2，init 时 zero 一次 |
+
+**结构**：phase1 = wo_a（mode4 + a32，写 f32 `s.wo[na=o_lora_rank=1024]`）→ `__syncthreads()` → grid barrier（sense-reversing：`atomicAdd(bar,1)`，最后到达者 `atomicExch(bar,0)` 清零 + `atomicXor(bar+1,1)` 翻 sense；waiter 自旋 `atomicAdd(bar+1,0) == s0`）→ `__syncthreads()` → phase2 = wo_b f32 形态（k=1024 重暂存进 `s_af`，写 `s.o[nb=dim=5120]`）。smem = max(两段) 单池复用，warps=`g_gemv_warps`(4)。
+
+**两条硬约束（改动前必读）**：
+1. ⚠️ **residency 死锁**：grid 必须 ≤ `cudaOccupancyMaxActiveBlocksPerMultiprocessor(kernel, warps*32, gsmem) × SMs`（launcher 里缓存为 `co_res`）。超了 → 后到的 block 永不驻留 → 已驻留的 block 在 barrier 自旋 → 挂死（图捕获里 watchdog 看不到）。
+2. ⚠️ **fence**：producer 写 → `__threadfence()` → atomicAdd；consumer 过 barrier → `__threadfence()` acquire。缺一条会读到 stale 行。
+3. ⚠️ **不能有并发流**：barrier 要求全 grid 同时驻留，若旁边侧流还有 kernel 占着 SM，co_res 就不成立。已确认 attention 内 dual_chain(2898) / compress_side(3085) 都在 wo_a 之前 join；但 EARLY/hc tail 侧流若与 wo 重叠会破坏该前提。
+4. **不覆盖**：B1（`xq/xsc`）、AR-store epilogue、mode≠4 / a32=0、nlg≠1 —— launcher 一律返回 2（decline）回落到两次 launch。
+5. 数值：每行一个 warp、相同的 lane 序 / LUT / ue8m0 scale 行 / `kb*32+lane` 累加序 → 逐位一致；grid 与 rows/block 划分可以不同（行之间独立）。
+6. ⚠️ **本机无 nvcc**（宿主机 + 全部 docker 镜像均无 CUDA toolkit），`.cu` **未编译验证**；Rust 侧 `cargo check -p ferrite-models` 通过。首次启用前必须在有 nvcc 的机器上 `bash kernels/cuda/build.sh`。
 
 **cp.async 权重先行**（cpasync-weights-first 实施中，−0.57ms 预期）：
 - 重排 prologue：cp.async 发射权重读（不依赖激活）→ 激活 staging/LUT/a32 → wait → dot
@@ -6925,3 +6942,31 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 - 更激进的 prologue 流水线
 
 **距离 200 tok/s（5.0ms）**：gap 1.66ms。
+
+### sparse key-split 默认开启 + merge 融合 epilogue（2026-09-11，sparse-attn-v8 实施）
+
+**问题（v8 剖面）**：`sparse_attn_orope` 40×/步、med 7.7µs = 0.31ms/步，但只有 8 块 × 128 线程
+（8/148 SM ≈ 5% 占用）——**延迟/占用受限，不是带宽**（10.5MB/次全 L2 命中）。真顺位 = key-split，
+但前置条件是：`split_c > 0` 会让 `dsv41_sparse_attn_orope` return 2（decline），把 o-rope + o-quant
+两个 epilogue 融合全部丢掉——所以 C=4 会付出和 C=8 一样的固定代价（round-39 回归的另一半）。
+
+**本次实施**（`kernels/cuda/dsv41_kernels.cu`）：
+1. **`sparse_attn_merge_kernel` 加 rope+fp8 epilogue**：`cos != nullptr` 时，块内把归一化后的
+   head 行走 smem（`sh_row[512]`）→ 逆 rope（orope phase 2 逐行搬运）→ 存回 `out` + fp8 发射
+   （phase 3 逐行搬运）。`cos == nullptr && xq == nullptr`（plain split 路径）保持原样直存，
+   不加 smem / 不加 barrier，**字节不变**。`d <= 512` 由 launcher 保证（plain reject / orope decline）。
+2. **`dsv41_sparse_attn_orope` 支持 split**：删掉 `split_c > 0 → return 2`，改为跑
+   `sparse_attn_split_kernel` + `sparse_attn_merge_kernel`（带 cos/sin/base/xq/xsc），
+   与 `dsv41_sparse_attn` 同一 stream、同两 launch。仍 decline 的只剩 `DSV41_ATTN_SEQ` 与 `DSV41_ATTN_PF=0`。
+3. **env gate `DSV41_SPARSE_SPLIT`（默认 ON，C=4）**：新 `dsv41_resolve_sparse_split_c()`，优先级
+   `DSV41_ATTN_SPLIT`(>0) > `DSV41_ATTN_PF_SPLIT`(任一显式值，含 0) > `DSV41_SPARSE_SPLIT` > `kSparseSplitDefault=4`。
+   plain 与 orope **共用**该解析器（否则两者选择不一致会让可融合 shape 误 decline）；
+   function-local static 缓存，无 per-call getenv。
+4. `sh_acc[4][512]` 的 4-warp 截断**不需要动**：C=4 时 split kernel 正好 `nwarp=4`，merge 没有 warp 部分和。
+
+**预期**：sparse_attn 9.8 → 3-5µs/call（0.31 → ~0.15ms/步）→ 步时 **−0.2ms**。
+
+⚠️ **未验证项（本机无 nvcc/GPU）**：`.cu` 未编译（仅括号平衡 + 参数个数 + 逐行静态复核）；
+`cargo check -p ferrite-models` ✅ 通过（无 Rust 侧改动，ABI 未变）。上机先跑隔离 harness
+`tests_dsv41_sparse_pfsplit.cu`（已更新头注释：不设 env 现在是 C=4，不是 pf），再 serve A/B：
+`DSV41_SPARSE_SPLIT=0`（旧 pf+orope 融合）vs 默认（split C=4 + merge 融合），四段文本 + 逐位/RMS 对照。
