@@ -5763,3 +5763,12 @@ hc-sinkhorn-hide（否决）、gateup s_act CSE）全部中性或否决——**�
 - ⏳ 仍有潜力：hc_post_inplace 融入 pubred epilogue（−0.15ms）——persistent-p1-impl 中
 
 **结论：通往 200 tok/s（5ms）的增量优化路径在 ~9.0-9.2ms 处触底。需要 Stage C。**
+
+### rmsnorm-q-gateup 勘误（2026-09-11 末）
+
+quant-producer-direct 报告的 4 条前提中 3 条与当前代码不符：
+1. **"gateup 目前 staging 整个 dim=5120 f32"** — 错误：`expert_gemv_fp4_batched_kernel` 的 staging 走 fp8 解码路径（`a/a_scale`），不是 f32 拷贝
+2. **"gemm_fp8_gemv 的 a32 已做"** — a32 在 `gemm_fp8_gemv_kernel`（单族），不在 expert 核
+3. **"gateup 消费 f32 staging"** — expert 核的 staging 在 smem 里已经是解码后的 f32（从 fp8）
+
+**结论**：gateup 核已经用 fp8 激活 + kernel 内解码（不是 f32 staging），quant-producer-direct 的"消除 f32 staging"方案不适用。rmsnorm_q_gateup 的真机会在 **rmsnorm_q_kernel 已存在但未被正确接入**——需要进一步核实接入点。
