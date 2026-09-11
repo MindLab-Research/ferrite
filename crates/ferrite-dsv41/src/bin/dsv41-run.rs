@@ -47,6 +47,8 @@ fn main() -> Result<()> {
     let max_tokens: usize = arg("--max-tokens", Some("32")).unwrap().parse().unwrap();
     let tp: usize = arg("--tp", Some("1")).unwrap().parse().unwrap();
     let rank: usize = arg("--rank", Some("0")).unwrap().parse().unwrap();
+    let serve = std::env::args().any(|a| a == "--serve");
+    let port: u16 = arg("--port", Some("8090")).unwrap().parse().unwrap();
     // End-of-sequence id. This checkpoint ships no generation_config.json and
     // its text_config.eos_token_id is null, so the previous single-source lookup
     // returned None and the decode loop NEVER stopped: the model answered
@@ -97,7 +99,14 @@ fn main() -> Result<()> {
     );
 
     // ---- device ----
-    let dev = Device::open(&so)?;
+    if serve {
+        if tp < 2 {
+            eprintln!("[dsv41] --serve needs --tp >= 2 (the ranks each hold a shard)");
+            return Ok(());
+        }
+        return run_tp_serve(&dir, &so, &cfg, tp, eos, port);
+    }
+let dev = Device::open(&so)?;
     eprintln!("[dsv41] device ready (kernels: {so})");
 
     // ---- tokenizer ----
@@ -415,4 +424,289 @@ fn rank_body(
         );
     }
     Ok(out)
+}
+
+// ============================================================================
+// HTTP serve mode (verification grade): the model loads ONCE and every
+// verification round is a curl, instead of a ~80 s cold start per prompt.
+//   POST /generate?max_tokens=32   body = the prompt text  -> the generated text
+//   GET  /health                                            -> "ok"
+//   POST /shutdown                                          -> clean exit
+// Deliberately std::net only: no tokio dependency for a localhost verifier.
+// ============================================================================
+
+struct ServeShared {
+    job: std::sync::Mutex<Option<ServeJob>>,
+    cv: std::sync::Condvar,
+    shutdown: std::sync::atomic::AtomicBool,
+}
+
+struct ServeJob {
+    ids: Vec<u32>,
+    max_tokens: usize,
+    tx: std::sync::mpsc::Sender<Vec<u32>>,
+}
+
+fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
+    use std::io::Read;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        if buf.len() > (1 << 22) {
+            break;
+        }
+    }
+    let split = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..split]).to_string();
+    let mut body = buf[split..].to_vec();
+    let clen = head
+        .to_ascii_lowercase()
+        .lines()
+        .find(|l| l.starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    while body.len() < clen {
+        let n = stream.read(&mut tmp)?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&tmp[..n]);
+    }
+    Ok((head, body))
+}
+
+fn write_response(
+    stream: &mut std::net::TcpStream,
+    status: &str,
+    body: &str,
+    extra: &[(&str, String)],
+) {
+    use std::io::Write;
+    let mut head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (k, v) in extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
+    }
+    head.push_str("\r\n");
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(body.as_bytes());
+    let _ = stream.flush();
+}
+
+/// The chat-template encoding used by the one-shot path: [bos, <|User|>] +
+/// prompt + [<|Assistant|>, </think>] (the reference's
+/// encode_messages(thinking_mode="chat") for this checkpoint).
+fn encode_prompt_ids(tok: &tokenizers::Tokenizer, prompt: &str) -> Result<Vec<u32>> {
+    let body = tok
+        .encode(prompt.to_string(), false)
+        .map_err(|e| ferrite_types::FerriteError::Config(format!("encode: {e}")))?
+        .get_ids()
+        .to_vec();
+    let mut v = Vec::with_capacity(body.len() + 4);
+    v.push(0u32);
+    v.push(128803u32);
+    v.extend_from_slice(&body);
+    v.push(128804u32);
+    v.push(128822u32);
+    Ok(v)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tp_serve(
+    dir: &str,
+    so: &str,
+    cfg: &Dsv41Config,
+    tp: usize,
+    eos: Option<u32>,
+    port: u16,
+) -> Result<()> {
+    let world = tp;
+    let tok = std::sync::Arc::new(
+        tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
+            .map_err(|e| ferrite_types::FerriteError::Config(format!("tokenizer: {e}")))?,
+    );
+    let shared = std::sync::Arc::new(ServeShared {
+        job: std::sync::Mutex::new(None),
+        cv: std::sync::Condvar::new(),
+        shutdown: std::sync::atomic::AtomicBool::new(false),
+    });
+    // the listener: binds immediately, serves while the ranks load (~80 s)
+    {
+        let shared = shared.clone();
+        let tok = tok.clone();
+        let listener = std::net::TcpListener::bind(("0.0.0.0", port)).map_err(|e|
+            ferrite_types::FerriteError::Config(format!("bind {port}: {e}")))?;
+        eprintln!("[dsv41] serving on 0.0.0.0:{port} (loading in background)");
+        std::thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let (head, body) = match read_request(&mut stream) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let first = head.lines().next().unwrap_or("").to_string();
+                let mut parts = first.split_whitespace();
+                let method = parts.next().unwrap_or("");
+                let target = parts.next().unwrap_or("");
+                let (path, query) = match target.split_once('?') {
+                    Some((p, q)) => (p, q),
+                    None => (target, ""),
+                };
+                let qmax = query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("max_tokens="))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(32);
+                if method == "GET" && path == "/health" {
+                    write_response(&mut stream, "200 OK", "ok", &[]);
+                    continue;
+                }
+                if method == "POST" && path == "/shutdown" {
+                    shared.shutdown.store(true, Ordering::SeqCst);
+                    shared.cv.notify_all();
+                    write_response(&mut stream, "200 OK", "shutting down", &[]);
+                    break;
+                }
+                if method == "POST" && path == "/generate" {
+                    let prompt = String::from_utf8_lossy(&body).to_string();
+                    let ids = match encode_prompt_ids(&tok, &prompt) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            write_response(&mut stream, "400 Bad Request", &format!("{e}"), &[]);
+                            continue;
+                        }
+                    };
+                    if ids.is_empty() {
+                        write_response(&mut stream, "400 Bad Request", "empty prompt", &[]);
+                        continue;
+                    }
+                    let (tx, rx) = std::sync::mpsc::channel::<Vec<u32>>();
+                    {
+                        let mut g = shared.job.lock().unwrap();
+                        *g = Some(ServeJob { ids, max_tokens: qmax, tx });
+                    }
+                    let t_gen = std::time::Instant::now();
+                    shared.cv.notify_all();
+                    let produced = match rx.recv_timeout(std::time::Duration::from_secs(1800)) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            write_response(&mut stream, "504 Gateway Timeout", "rank timeout", &[]);
+                            continue;
+                        }
+                    };
+                    let dt = t_gen.elapsed().as_secs_f64();
+                    let text = tok.decode(&produced, true).unwrap_or_default();
+                    let extra = [
+                        ("X-Tokens", format!("{}", produced.len())),
+                        ("X-Seconds", format!("{dt:.3}")),
+                        (
+                            "X-Tok-S",
+                            format!("{:.2}", produced.len() as f64 / dt.max(1e-9)),
+                        ),
+                    ];
+                    write_response(&mut stream, "200 OK", &text, &extra);
+                    if shared.shutdown.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    continue;
+                }
+                write_response(&mut stream, "404 Not Found", "unknown path", &[]);
+            }
+        });
+    }
+    let dir = dir.to_string();
+    let so = so.to_string();
+    let cfg = cfg.clone();
+    let t0 = std::time::Instant::now();
+    tp::run_ranks(world, move |rank| {
+        use std::sync::atomic::Ordering;
+        // ---- build ONCE (the same prologue as rank_body) ----
+        ferrite_dsv41::device::Device::bind_to(rank as i32)?;
+        let dev = std::sync::Arc::new(ferrite_dsv41::device::Device::open(&so)?);
+        let mut loader = ferrite_dsv41::load::Loader::new(std::path::Path::new(&dir), &dev)?;
+        if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS").is_ok() {
+            loader.skip_prefixes.push("engram.embed.".into());
+        }
+        let w = loader.load(&cfg, world, rank)?;
+        let hc_dim = cfg.hc_mult * cfg.dim;
+        let barrier = std::sync::Arc::new(ferrite_dsv41::tp::SpinBarrier::new(world));
+        let c_small =
+            ferrite_dsv41::tp::Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
+        let eng_map = std::fs::read(format!("{dir}/engram_token_map.bin"))
+            .ok()
+            .filter(|b| b.len() % 8 == 0 && !b.is_empty())
+            .map(|b| {
+                let v: Vec<i64> = b
+                    .chunks_exact(8)
+                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                    .collect();
+                ferrite_dsv41::engram::TokenMap::from_table(v, cfg.engram_compressed_vocab_size)
+            });
+        let mut chain = DevChain::new(&dev, &cfg, &w, RunOpts::from_env(), eng_map)?;
+        chain.comm = Some(std::sync::Arc::new(c_small));
+        if rank == 0 {
+            eprintln!("[dsv41] rank0: chain ready in {:.1}s, serving", t0.elapsed().as_secs_f64());
+        }
+        // ---- the request loop: one prefill+decode per job ----
+        loop {
+            let job = {
+                let mut g = shared.job.lock().unwrap();
+                loop {
+                    if let Some(j) = g.take() {
+                        break Some(j);
+                    }
+                    if shared.shutdown.load(Ordering::SeqCst) {
+                        break None;
+                    }
+                    g = shared.cv.wait(g).unwrap();
+                }
+            };
+            let Some(job) = job else { break };
+            chain.reset()?;
+            let mut next_tok = 0u32;
+            for (i, &tk) in job.ids.iter().enumerate() {
+                next_tok = chain.step(tk, i)?;
+            }
+            let mut produced: Vec<u32> = Vec::new();
+            let pos0 = job.ids.len();
+            let t_dec = std::time::Instant::now();
+            for step in 0..job.max_tokens {
+                produced.push(next_tok);
+                if Some(next_tok) == eos {
+                    break;
+                }
+                next_tok = chain.step_dev(next_tok, pos0 + step)?;
+            }
+            let dt = t_dec.elapsed().as_secs_f64();
+            let n = produced.len().max(1);
+            if rank == 0 {
+                eprintln!(
+                    "[dsv41] DECODE {} tokens in {:.2}s = {:.2} tok/s ({:.1} ms/token)",
+                    produced.len(),
+                    dt,
+                    produced.len() as f64 / dt,
+                    dt * 1e3 / n as f64
+                );
+                let _ = job.tx.send(produced);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
