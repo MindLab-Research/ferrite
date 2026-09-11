@@ -2626,6 +2626,53 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
+// P2 (gemm-prologue-pipeline, 2026-09-11/12): ADAPTIVE rows per block.
+//
+// The per-call cost of the M=1 GEMV family is dominated by the BLOCK-level
+// prologue, not the consume loop: the activation uint4 staging + LUT build + a32
+// materialisation is paid ONCE per block and is nearly n-independent (the
+// 2026-09-11 probe measured 2.85us of block-level staging across 416 blocks, and
+// it grew only ~5 percent when n grew 6.5x). With P1 (a32 dead-slot) the mode-4
+// smem at k=5120/warps=4 is 43392B = 232448/43392 = 5.35 -> 5 blocks/SM, i.e.
+// ~30 percent residency headroom. The roomey shapes can therefore afford EIGHT
+// rows per block: gsmem = 8*k + scale_bytes = 8*5120 + 23552 = 64512B ->
+// 232448/64512 = 3.6 -> 3 blocks/SM, but every block now carries twice the rows,
+// so the block count HALVES and the fixed prologue is amortised over 2x the
+// rows. The latency-bound SMALL shapes (wq_a+wkv n=512+1792, sh_w13 n=640) want
+// the opposite -- more blocks = more warps in flight -- so the choice is gated
+// on n, with the crossover at 2048.
+//
+// ONLY the four host launchers that already select `g_gemv_warps` use this
+// helper: dsv41_gemm_fp8_mx / _mx_add / _mx_f32 / _mx2. The rope family
+// (mx_rope / mx_rope_norm / mx2_rope) KEEPS nwarps == 32 unconditionally:
+//   * mx_rope / mx2_rope: the rope epilogue exchanges a pair across two ADJACENT
+//     warps (`s_rows[warp]` / `s_rows[warp+1]`, `e = blockIdx.x*nwarps + warp`)
+//     and the launcher relies on grid*nwarps == n.
+//   * mx_rope_norm: same epilogue PLUS the NORM_FUSE prologue, whose cross-warp
+//     reduction tree must run at the reference's 1024 threads to stay
+//     bit-identical to the standalone rmsnorm_q it replaces.
+// B1 (the fused fp8-row emit) is an M=1 epilogue that likewise requires
+// nwarps == 32, and dsv41_gemm_fp8_mx keeps its explicit `warps = 32` override
+// for it -- the adaptive value below is computed first and then overwritten.
+//
+// DSV41_GEMV_WARPS_ADAPTIVE: default ON. "=0" restores the fixed
+// DSV41_GEMV_FP8_WARPS everywhere (the A/B arm and the rollback).
+// Read once (static): these launchers run a few hundred times per step and a
+// per-call getenv on the hot path is the slip every gate in this file avoids.
+static const bool g_gemv_warps_adaptive = [] {
+    const char* e = getenv("DSV41_GEMV_WARPS_ADAPTIVE");
+    if (e == nullptr) return true;
+    return atoi(e) != 0;
+}();
+// The large-n arm. Kept as named constants rather than literals so the crossover
+// is auditable (and tweakable) in one place.
+static const int kGemvWarpsBigN = 2048;   // n at/above which 8 rows/block wins
+static const int kGemvWarpsBig = 8;       // rows/block once n is large
+static inline int dsv41_gemv_warps_for(int n) {
+    if (g_gemv_warps_adaptive && n >= kGemvWarpsBigN) return kGemvWarpsBig;
+    return g_gemv_warps;
+}
+
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
@@ -3077,7 +3124,8 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // `s_a` (qr_raw non-null, it is decoded by the same loop), and when a32=0
     // (that A/B arm reads `s_lut[s_a[j]] * s_as[j>>5]` inline in the consume
     // loop). The launchers mirror this with dsv41_gemv_sa_bytes().
-    const bool a32_direct = (a32 != 0) && (vec == 4) && (qr_raw == nullptr);
+    const bool a32_direct = (a32 != 0) && (vec == 4) && (qr_raw == nullptr)
+            && !dsv41_gemv_a32_staged();  // P1 gate: =1 falls back to staged (s_a intermediate)
     uint8_t* s_ws = s_a + (size_t)((vec == 4 && !a32_direct) ? k : 0);
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     // The e4m3 decode as a 256-entry shared-memory table. The bit-manipulation
@@ -3467,7 +3515,9 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         // iteration the epilogue's `blockIdx.x * nwarps + warp` index assumes.
         // Modes 0/1 allocate no dynamic shared memory, so they cannot stage the
         // row values - decline and let the caller keep the two-launch path.
-        int warps = g_gemv_warps;
+        // P2: n >= 2048 asks for 8 rows/block (adaptive), the small shapes keep
+        // the fixed g_gemv_warps (4). B1 below overrides to 32 regardless.
+        int warps = dsv41_gemv_warps_for(n);
         int blocks = (n + warps - 1) / warps;
         if (xq != nullptr) {
             if (xsc == nullptr || (n & 31) || g_gemv_fp8_mode < 3)
@@ -3780,7 +3830,8 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
     // r43 decline-code fix: sentinel 2, never 1 (== cudaErrorInvalidValue).
     if (m != 1 || no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
-    const int warps = g_gemv_warps;
+    // P2: adaptive rows/block (8 for n >= 2048, else the fixed g_gemv_warps).
+    const int warps = dsv41_gemv_warps_for(n);
     const int blocks = (n + warps - 1) / warps;
     const int nb_k = k >> 5;
     const int nb_k_al = (nb_k + 15) & ~15;
@@ -3851,7 +3902,8 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     if (no_gemv || a_f32 == nullptr || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
     // The s_af materialisation (where the f32 lands) is the vec>=3 branch only.
     if (g_gemv_fp8_mode < 3) return 2;  // r42-fix round 2: decline must never be 1 (cudaErrorInvalidValue)
-    const int warps = g_gemv_warps;
+    // P2: adaptive rows/block (8 for n >= 2048, else the fixed g_gemv_warps).
+    const int warps = dsv41_gemv_warps_for(n);
     const int blocks = (n + warps - 1) / warps;
     const int nb_k = k >> 5;
     const int nb_k_al = (nb_k + 15) & ~15;
@@ -4079,7 +4131,9 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     if (no_gemv || n1 <= 0 || n2 <= 0 || k <= 0 || (k & 31) || (k & 3))
         return (int)cudaErrorInvalidValue;
     const int n = n1 + n2;
-    const int warps = g_gemv_warps;
+    // P2: adaptive rows/block on the TOTAL row count (both families share one
+    // block grid); 8 for n >= 2048, else the fixed g_gemv_warps.
+    const int warps = dsv41_gemv_warps_for(n);
     const int blocks = (n + warps - 1) / warps;
     const int nb_k = k >> 5;
     const int nb_k_al = (nb_k + 15) & ~15;
