@@ -100,6 +100,12 @@ struct Kernels {
         *const f32, *const f32, *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int,
         *const c_int, c_int, c_int, c_int, c_int, f32, CuStream,
     ) -> c_int>,
+    // bf16 gate + fp8 shared expert in ONE launch (same activation). Optional:
+    // falls back to the separate launches.
+    gemm_bf16_fp8x2: Option<unsafe extern "C" fn(
+        *const c_void, *const f32, *mut f32, c_int, *const u8, *const f32, *const u8, *const u8,
+        *mut f32, c_int, *const u8, *const u8, *mut f32, *const f32, c_int, CuStream,
+    ) -> c_int>,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
         c_int, c_int, c_int, c_int, f32, CuStream,
@@ -316,6 +322,7 @@ impl Device {
             rope_precompute: km!(rt, "dsv41_rope_precompute"),
             apply_rope: km!(rt, "dsv41_apply_rope"),
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
+            gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
             moe_route: km!(rt, "dsv41_moe_route"),
             add_inplace: ko!(rt, "ferrite_add"),
@@ -951,6 +958,43 @@ impl Device {
               eps, self.stream)
         };
         self.kerr(rc, "dsv41_rmsnorm_rope")?;
+        Ok(true)
+    }
+
+    /// bf16 gate + fp8 shared expert in one launch (same activation); `Ok(false)`
+    /// when the loaded .so predates the kernel, so the caller runs the separate
+    /// launches instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_bf16_fp8x2(
+        &self,
+        wb: *const c_void,
+        biasb: *const f32,
+        outb: *mut f32,
+        nb: i32,
+        a: *const u8,
+        a_scale: *const f32,
+        wf1: *const u8,
+        ws1: *const u8,
+        outf1: *mut f32,
+        nf: i32,
+        wf2: *const u8,
+        ws2: *const u8,
+        outf2: *mut f32,
+        x: *const f32,
+        k: i32,
+    ) -> Result<bool> {
+        let f = match self.kernels.gemm_bf16_fp8x2 {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(wb, biasb, outb, nb, a, a_scale, wf1, ws1, outf1, nf, wf2, ws2, outf2, x, k,
+              self.stream)
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_bf16_fp8x2")?;
         Ok(true)
     }
 

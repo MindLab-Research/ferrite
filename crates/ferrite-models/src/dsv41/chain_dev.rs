@@ -191,6 +191,12 @@ fn sh_exp_mx2() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
+fn mix_gate_shared() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
+}
+
 fn build_eng_dev(
     dev: &Device,
     lay: &crate::dsv41::engram::EngramLayout,
@@ -1974,14 +1980,57 @@ fn fuse_b1() -> bool {
         let inter_local = crate::dsv41::weights::padded_inter(inter / self.world());
         let (n_routed, topk) = cfg.moe_config(layer);
 
-        // gate: natively bf16, so a bf16 GEMM
-        self.lin_bf16(
-            self.s.xn.ptr as *const f32,
-            dim as i32,
-            ld.gate_w.as_ref().unwrap(),
-            n_routed as i32,
-            self.s.scores.ptr as *mut f32,
-        )?;
+        // gate: natively bf16, so a bf16 GEMM. When this rank owns the shared
+        // expert, the shared expert's w1/w3 read the SAME `xn`, so gate + w1 + w3
+        // share one launch and save one ~20us fixed launch floor per layer. Each
+        // row keeps its own family's lane order and accumulation, so all three
+        // outputs are bit-identical to the separate launches. DSV41_MIX_GATE=0
+        // (or an .so without the symbol) falls back.
+        let shared_rank = self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true);
+        let sh_w = if !self.opts.skip_shared_expert && shared_rank {
+            match (
+                ld.shared_w1.as_ref(),
+                ld.shared_w1_scale.as_ref(),
+                ld.shared_w3.as_ref(),
+                ld.shared_w3_scale.as_ref(),
+            ) {
+                (Some(a), Some(b), Some(c), Some(d)) => Some((a, b, c, d)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut sh_via_mixed = false;
+        if let Some((w1, w1s, w3, w3s)) = sh_w {
+            self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
+            sh_via_mixed = mix_gate_shared()
+                && self.dev.gemm_bf16_fp8x2(
+                    ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
+                    std::ptr::null(),
+                    self.s.scores.ptr as *mut f32,
+                    n_routed as i32,
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    w1.as_u8(),
+                    w1s.as_u8(),
+                    self.s.ex_act.ptr as *mut f32,
+                    inter as i32,
+                    w3.as_u8(),
+                    w3s.as_u8(),
+                    (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                    self.s.xn.ptr as *const f32,
+                    dim as i32,
+                )?;
+        }
+        if !sh_via_mixed {
+            self.lin_bf16(
+                self.s.xn.ptr as *const f32,
+                dim as i32,
+                ld.gate_w.as_ref().unwrap(),
+                n_routed as i32,
+                self.s.scores.ptr as *mut f32,
+            )?;
+        }
         self.dev.route_topk(
             self.s.scores.as_f32(),
             ld.gate_bias.as_ref().map(|b| b.as_f32()).unwrap_or(std::ptr::null()),
@@ -2202,8 +2251,8 @@ fn fuse_b1() -> bool {
 
         // shared expert: fp8, every token. Its weights are replicated, so under
         // a collective exactly one rank may contribute it — otherwise the
-        // all-reduce below would sum it `world` times.
-        let shared_rank = self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true);
+        // all-reduce below would sum it `world` times. (`shared_rank` is computed
+        // up at the gate, where the mixed launch decides whether to fold w1/w3 in.)
         if !self.opts.skip_shared_expert && shared_rank {
             if let (Some(w1), Some(w1s), Some(w3), Some(w3s), Some(w2), Some(w2s)) = (
                 ld.shared_w1.as_ref(),
@@ -2213,53 +2262,57 @@ fn fuse_b1() -> bool {
                 ld.shared_w2.as_ref(),
                 ld.shared_w2_scale.as_ref(),
             ) {
-                self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
-                // gate and up land contiguously so `swiglu_limit` sees [gate|up].
-                // Same activation, same k, only the weights differ: one mx2 launch
-                // covers both projections - each row is still one warp walking the
-                // same lane order, so both outputs are bit-identical to the two
-                // single-family launches this replaces, minus one ~20us launch
-                // floor per layer. DSV41_SH_EXP_MX2=0 (or an .so without the
-                // symbol) falls back to the pair.
-                let sh_fused = sh_exp_mx2()
-                    && self.dev.gemm_fp8_mx2(
-                        self.s.xq.as_u8(),
-                        self.s.xsc.as_f32(),
-                        w1.as_u8(),
-                        w1s.as_u8(),
-                        std::ptr::null(),
-                        self.s.ex_act.ptr as *mut f32,
-                        inter as i32,
-                        w3.as_u8(),
-                        w3s.as_u8(),
-                        std::ptr::null(),
-                        (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
-                        inter as i32,
-                        dim as i32,
-                    )?;
-                if !sh_fused {
-                    self.dev.gemm_fp8_mx(
-                        self.s.xq.as_u8(),
-                        self.s.xsc.as_f32(),
-                        w1.as_u8(),
-                        w1s.as_u8(),
-                        std::ptr::null(),
-                        self.s.ex_act.ptr as *mut f32,
-                        1,
-                        inter as i32,
-                        dim as i32,
-                    )?;
-                    self.dev.gemm_fp8_mx(
-                        self.s.xq.as_u8(),
-                        self.s.xsc.as_f32(),
-                        w3.as_u8(),
-                        w3s.as_u8(),
-                        std::ptr::null(),
-                        (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
-                        1,
-                        inter as i32,
-                        dim as i32,
-                    )?;
+                // When the mixed gate launch already produced w1/w3 from the same
+                // quantised activation, only swiglu/quant/down remain here.
+                if !sh_via_mixed {
+                    self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
+                    // gate and up land contiguously so `swiglu_limit` sees [gate|up].
+                    // Same activation, same k, only the weights differ: one mx2 launch
+                    // covers both projections - each row is still one warp walking the
+                    // same lane order, so both outputs are bit-identical to the two
+                    // single-family launches this replaces, minus one ~20us launch
+                    // floor per layer. DSV41_SH_EXP_MX2=0 (or an .so without the
+                    // symbol) falls back to the pair.
+                    let sh_fused = sh_exp_mx2()
+                        && self.dev.gemm_fp8_mx2(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w1.as_u8(),
+                            w1s.as_u8(),
+                            std::ptr::null(),
+                            self.s.ex_act.ptr as *mut f32,
+                            inter as i32,
+                            w3.as_u8(),
+                            w3s.as_u8(),
+                            std::ptr::null(),
+                            (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                            inter as i32,
+                            dim as i32,
+                        )?;
+                    if !sh_fused {
+                        self.dev.gemm_fp8_mx(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w1.as_u8(),
+                            w1s.as_u8(),
+                            std::ptr::null(),
+                            self.s.ex_act.ptr as *mut f32,
+                            1,
+                            inter as i32,
+                            dim as i32,
+                        )?;
+                        self.dev.gemm_fp8_mx(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w3.as_u8(),
+                            w3s.as_u8(),
+                            std::ptr::null(),
+                            (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                            1,
+                            inter as i32,
+                            dim as i32,
+                        )?;
+                    }
                 }
                 self.dev
                     .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter as i32, cfg.swiglu_limit)?;

@@ -1801,6 +1801,114 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 // both outputs are bit-identical to two separate launches. M=1 only: a caller
 // that cannot use it gets cudaErrorInvalidValue back and runs the two
 // single-family calls instead.
+// Three projections that read the SAME activation in one launch: the bf16 MoE
+// gate (rows [0, nb)) and the fp8 shared expert's two halves (rows [nb, nb+nf)
+// and [nb+nf, nb+2nf)). The routing gate and the shared expert are computed from
+// the same normalised hidden state, so they were paying two ~20us launch /
+// staging floors per layer; this removes one. Each row keeps its own family's
+// lane order and accumulation, so every output is bit-identical to the two
+// (three, before the mx2 fusion) launches it replaces.
+__global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
+                                       const float* __restrict__ biasb,
+                                       float* __restrict__ outb, int nb,
+                                       const uint8_t* __restrict__ a,
+                                       const float* __restrict__ a_scale,
+                                       const uint8_t* __restrict__ wf1,
+                                       const uint8_t* __restrict__ ws1,
+                                       float* __restrict__ outf1, int nf,
+                                       const uint8_t* __restrict__ wf2,
+                                       const uint8_t* __restrict__ ws2,
+                                       float* __restrict__ outf2,
+                                       const float* __restrict__ x, int k, int vec) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int nb_k = k >> 5;
+    extern __shared__ uint8_t s_w[];
+    uint8_t* s_a = s_w + (size_t)nwarps * (size_t)k;   // block-level fp8 activation
+    if (vec == 4) {
+        const int n16a = k >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x)
+            *reinterpret_cast<uint4*>(s_a + (i << 4)) =
+                *reinterpret_cast<const uint4*>(a + (i << 4));
+        for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
+        __syncthreads();
+    }
+    const int total = nb + 2 * nf;
+    for (int row = blockIdx.x * nwarps + warp; row < total; row += gridDim.x * nwarps) {
+        if (row < nb) {
+            // ---- bf16 family: gemv_bf16_kernel's loop, four iterations in flight
+            const __nv_bfloat16* wr = wb + (size_t)row * (size_t)k;
+            float acc = 0.f;
+            int c = lane;
+            for (; c + 96 < k; c += 128) {
+                const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
+                const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
+                acc += __bfloat162float(w0) * x0;
+                acc += __bfloat162float(w1) * x1;
+                acc += __bfloat162float(w2) * x2;
+                acc += __bfloat162float(w3) * x3;
+            }
+            for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) outb[row] = acc + (biasb ? biasb[row] : 0.f);
+        } else {
+            // ---- fp8 family: gemm_fp8_gemv_kernel's mode 3/4 row path
+            const bool second = (row - nb) >= nf;
+            const int rrow = (row - nb) - (second ? nf : 0);
+            const uint8_t* wrow = ((second ? wf2 : wf1) + (size_t)rrow * (size_t)k);
+            const uint8_t* wsc = (second ? ws2 : ws1) + (size_t)(rrow >> 5) * nb_k;
+            const uint8_t* ap = (vec == 4) ? s_a : a;
+            uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
+            const int n16 = k >> 4;
+            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wrow[i];
+            for (int i = lane; i < n16; i += 32)
+                dsv41_cp_async16(row_s + (i << 4), wrow + (i << 4));
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
+            __syncwarp();
+            float acc = 0.f;
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsc[kb]);
+                const float sa = a_scale[kb];
+                const int j = kb * 32 + lane;
+                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
+            }
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) (second ? outf2 : outf1)[rrow] = acc;
+            __syncwarp();
+        }
+    }
+}
+
+extern "C" int dsv41_gemm_bf16_fp8x2(const void* wb, const float* biasb, float* outb, int nb,
+                                     const uint8_t* a, const float* a_scale, const uint8_t* wf1,
+                                     const uint8_t* ws1, float* outf1, int nf,
+                                     const uint8_t* wf2, const uint8_t* ws2, float* outf2,
+                                     const float* x, int k, cudaStream_t s) {
+    static const int warps = [] {
+        const char* e = getenv("DSV41_MIX_WARPS");
+        if (e == nullptr) return 4;
+        const int v = atoi(e);
+        return (v >= 1 && v <= 16) ? v : 4;
+    }();
+    const int vec = g_gemv_fp8_mode;              // 3 or 4
+    if (vec < 3 || nb < 0 || nf <= 0 || k <= 0 || (k & 31) || (k & 15))
+        return (int)cudaErrorInvalidValue;
+    const int total = nb + 2 * nf;
+    const int blocks = (total + warps - 1) / warps;
+    const size_t gsmem = (vec == 4) ? (size_t)(warps + 1) * (size_t)k : (size_t)warps * (size_t)k;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gemv_bf16_fp8x2_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemv_bf16_fp8x2_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        (const __nv_bfloat16*)wb, biasb, outb, nb, a, a_scale, wf1, ws1, outf1, nf, wf2, ws2, outf2,
+        x, k, vec);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
                                   const uint8_t* w1, const uint8_t* w1_scale,
                                   const float* bias1, float* out1, int n1,
