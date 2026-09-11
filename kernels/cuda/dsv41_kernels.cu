@@ -1805,7 +1805,11 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     }
     // M=1 (decode): skip the 16-row tile entirely - it wastes 15/16 of itself and
     // its 16*k bytes of shared memory cap the occupancy. One warp per output row.
-    if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
+    // The env probe is read ONCE (static): this launcher runs ~171 times per step
+    // and a per-call getenv on the hot path is exactly the slip the other gates
+    // in this file already avoid.
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (m == 1 && !no_gemv) {
         const int warps = g_gemv_warps;
         const int blocks = (n + warps - 1) / warps;
         const int nb_k = k >> 5;
