@@ -7043,3 +7043,13 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 5. PDL 重评（当前 OFF 但 cp.async 后可能有收益）
 
 **如果全部落地**：5.0-5.3ms ≈ 189-200 tok/s（边缘但可能达标）
+
+### 2026-09-12 02:15：v3 验证中性 + allon 验证中 + down 回归修复
+
+| 臂 | p50 | tok/s | 判定 |
+|---|---|---|---|
+| v3（新代码默认 = wo_pair OFF + sparse_split ON + 其它默认） | 6.68ms | 149.7 | 与 6.66 中性 |
+| allon（DSV41_WO_PAIR=1 + SPARSE_SPLIT=1 + WARPS_BIG=8） | 后台跑中 | — | — |
+
+**v3 中性的原因**：wo-pair 和 sparse key-split 都是默认 OFF gate——需要显式开启。
+allon 臂正在跑，预期 wo-pair(−0.13) + sparse key-split(−0.2) = 6.66−0.33 = ~6.33ms。
