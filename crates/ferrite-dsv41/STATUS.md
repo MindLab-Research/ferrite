@@ -7133,7 +7133,13 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 - 0.2µs/节点（图内 launch 槽位）vs 1.5µs/节点（审计的 ramp-down 残留）→ **差 7 倍**
 - v4dl 后 ~1150 kernel 节点 + ~320 event 节点
 - 按 0.2µs = 0.16ms（2.5%）；按 1.5µs = ~1.2ms（18%）
-- **node-gap-measurement 正在设计精确测量方法**（nsys --cuda-graph-trace=node + sqlite 相邻节点空隙）
+- **node-gap-measurement：改用独立微基准 `kernels/cuda/graph_bench.cu`**（2026-09-11）——
+  原本设计的 `--tp 1 + DSV41_GRAPH_STEP=1` nsys 路线**不可行**：模型 306GB > 单卡 180GB 显存，
+  `--tp 1` 载不进权重 ✗。改为不加载模型的纯 CUDA 微基准：N 个空/真实 kernel 建图，
+  对比 `图 replay 总时 / N`（设备 dispatch 地板）vs `逐个 launch 的 host 提交开销` vs
+  `Σkernel 执行时间`（globaltimer 实测 + `T_real_graph − T_empty_graph` 交叉校验）。
+  注意口径陷阱：**单次 `cudaGraphLaunch` 的 host 提交（~3-5µs）÷ N 得到的"0.2µs"是摊薄数，
+  不是设备侧 dispatch** ✗；真正隔离 dispatch 的是**空 kernel 图**（去除执行后 T/N）。
 - PDL A/B 中性（6.97/6.90）可能说明 1.5µs 被高估，也可能说明 cp.async 已吃掉共享窗口
 
 **节点削减剩余机会**（按 1.5µs 口径）：
