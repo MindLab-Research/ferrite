@@ -2994,12 +2994,20 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
             return (int)e;
         }
     }
-    // 128 threads = 4 warps staging cooperatively; the dot itself still runs in
-    // warp 0 with the same lane assignment (the staging used to be one warp's
-    // ~20 KiB of cp.async against a 160 KiB row pair).
-    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), 128, smem, s>>>(x, hc_fn, rows,
-                                                                              hc_dim, mix,
-                                                                              g_hc_ss ? 1 : 0);
+    // Multi-warp staging is GATED OFF by default. The 128-thread form faulted with
+    // err 700 (illegal access, surfacing as a sticky error on dsv41_route_topk) on
+    // its first A/B and the root cause is not yet identified, so the default stays
+    // at the known-good 32 threads (one warp stages + computes). The kernel body is
+    // thread-count agnostic: the staging strides by blockDim.x and the compute is
+    // guarded by threadIdx.x < 32, so raising this is a one-line experiment.
+    static const int dots_t = [] {
+        const char* e = getenv("DSV41_HC_DOTS_T");
+        if (e == nullptr) return 32;
+        const int v = atoi(e);
+        return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 32;
+    }();
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)dots_t, smem, s>>>(
+        x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
