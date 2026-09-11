@@ -2087,7 +2087,11 @@ fn fuse_b1() -> bool {
         } else {
             self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true)
         };
-        let sh_w = if !self.opts.skip_shared_expert {
+        // Only the rank(s) that actually contribute the shared expert take it: all
+        // of them under DSV41_SHARED_TP (each owns its inter/world slice), rank 0
+        // alone under the replicated layout. Without this the fused gate+shared
+        // launch would run on every rank in both cases - correct but 7/8 wasted.
+        let sh_w = if !self.opts.skip_shared_expert && shared_rank {
             match (
                 ld.shared_w1.as_ref(),
                 ld.shared_w1_scale.as_ref(),
