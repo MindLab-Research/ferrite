@@ -3139,3 +3139,22 @@ Phase 2 把 AR 换成共享 `ferrite_p2p_ar_v5` 后，用尖锐复现（3 短请
 2. `compute-sanitizer --tool memcheck`（代价大：306GB 权重加载会拉长到 10-20 分钟，但能点名
    故障 kernel + 地址，是终局手段）；
 3. 已排除项见上方"完整排除集"（勿重复）。
+
+## 2026-09-11 图故障定性反转（用户点名时间观后 58 秒实验定案）+ sanitizer 教训
+
+**单请求 max_tokens=64 也在 pos≈18 崩**（rank 0 非法访存；正常步 34.4ms；响应 1 token）。
+⇒ **"多请求才会崩"理论死亡**：旧"单请求必过"全是 max_tokens=24 的测试假象（步数不够多）。
+真相：**图重放每步带随机概率的竞态**（rank 漂移 0/3/4/7 ✓ 死亡位置漂移 pos≈18/~30 ✓
+token 到死都逐个正确 ✓ ⇒ 辅助路径的数据依赖越界，不影响 argmax）。
+
+**compressor_pool 已审清白**：Rust 侧 `pos as i32` 映射到 launcher 的 `start_pos`，decode 下
+只参与 `work = b*head_dim`（常量网格）✓；`mode/grid_n` 注释自证"decode 恒定可烤" ✓；
+`out_rows_val` 由设备计数器派生 ✓。**余下嫌疑（数据依赖索引类）**：
+① `indexer_topk` 的 `n_pos = *lens`（设备 clen）驱动的候选池扫描；
+② `sparse_attn` 消费的 top-k 选中索引（若选到垃圾索引 ⇒ OOB 读）；
+③ `engram` 哈希的 cache 索引（token 值依赖）。
+
+**sanitizer 教训（勿再用）**：memcheck × AR v5 自旋 = **28 秒/步**（770x 病态）+ ar5-hang 风暴
+（`[ar5-hang] rank=3 peer=0..7 need=1 cur=0`）。仪器化让 publish 自旋看起来对端冻结。
+⇒ 图路径的取证只能走：数据依赖索引的代码审计 + 隔离复现器。**时间观（用户令）**：B300 上
+36ms/步，任何"分钟级不前进"的 run 立刻有问题，第一时间查日志而不是等待。
