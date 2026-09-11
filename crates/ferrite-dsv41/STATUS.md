@@ -5501,3 +5501,25 @@ swiglu 把"已 swiglu 的结果"当 gate、把**未写区**当 up → 数据错�
 
 **结论：gemm_fp8_gemv 家族已到指令级地板**（~11.6µs 固定项 + bytes/1.5TB/s），171 次/步 × ~13µs = ~2.2ms。
 唯一剩余杠杆 = 减少 launch 数（xn-megafuse、段融合）或消除家族（段 B 内嵌）。
+
+### 🎯 safe3 退化根因定案（perf-regression-diag 的发现）
+
+**+8.7ms 退化（18.87 vs 10.16ms）= `f3b1be1` 在关新融合时误关了 7 个老门。**
+
+`f3b1be1` 的 diff 除了声称的 GATEUP_FUSE/DOWN_FUSE，还夹带了 7 个 `unwrap_or(true)→unwrap_or(false)`：
+- DSV41_MOE_BATCH（MoE 批化路径——OFF 后走逐 expert 串行 = **+560 次 launch/步**，最大单项）
+- DSV41_NR_FUSE（kv rmsnorm+rope 融合）
+- DSV41_SH_EXP_MX2（共享专家双族融合）
+- DSV41_MIX_GATE（gate+w1/w3 混合核）
+- DSV41_HEAD_SLICE（词表切分 lm_head）
+- DSV41_FUSE_C / DSV41_FUSE_B1（hc 前端融合）
+
+这 7 个与 A4A5/AR-store 融合毫无关系——是**子代理拿着过期副本回写整个文件**式 clobber。
+gemv-kernel-audit 同时确认：gemm_fp8_gemv 的非融合路径 bit 级不变、寄存器 48→40（0 spill）、
+occupancy 不变——kernel 签名变化不是退化源。
+
+**修复**：7 个门恢复默认 ON，A4A5 融合门保持默认 OFF。验证中（safe4 + fon 两臂）。
+
+**教训**：
+1. 子代理修改共享文件时，必须在 commit 前 `git diff` 检查**所有**改动（不只是它声称的）
+2. "gate OFF 一个融合"的 commit 绝不能批量 sed（`unwrap_or(true)→false`）——必须逐个确认
