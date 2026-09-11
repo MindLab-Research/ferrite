@@ -2929,3 +2929,20 @@ self.dev.memcpy_d2d(ring + slot*fb(hd), self.s.kv, fb(hd));   // ← 目的地�
 
 **另一个纪律坑**：验证命令**必须重跑 `build.sh`**（本次漏跑 ⇒ 新 kernel 不在 `.so` ⇒ 5 个请求全 fault ✗，
 浪费一轮 ✓）。**改 `.cu` 就重编 `.so`** ✓。
+
+## serve 端计时已就位 + 一个关键发现：**rank 侧 21.8-45.2 ms/step，端到端 129 ms/token**
+
+**新增**（GLM 口径 ✓，打在 **rank 线程** ⇒ 纯 decode 时间，无 HTTP/SSE/driver 开销 ✓）：
+```
+[dsv41] decode: 32 steps in 0.70s = 46.0 steps/s (21.76 ms/step)    ← 短上下文
+[dsv41] decode: 32 steps in 1.42s = 22.6 steps/s (44.23 ms/step)    ← 长上下文（DSA decay 1.39x 一致）
+```
+`DSV41_TIMING=0` 可关。**lookahead 批命令**（一次命令跑 16 步 ✓）也已验证：四段 + 整首《静夜思》+ 长篇
+散文全对 ✓、**0 fault** ✓。
+
+**发现（下一个优化项）** ✓：单请求**端到端**只有 7.75 tok/s（129 ms/token ✗），而 **rank 侧只要
+21.8-45.2 ms/step** ⇒ **共享 serve 路径（driver/SSE）额外吃 ~85 ms/token** ✗✗。
+排查方向（按可能性）：① **逐 token 的 detokenize**（vocab 大 ⇒ 每 token 解码成文本给 SSE ✗）；
+② driver 的逐 token 事件/通道往返 ✗；③ SSE 分块刷写的 syscall ✗。
+**对照**：此前**手写 serve** 端到端 = 21.7 tok/s ≈ rank 侧时间（无额外开销 ✓）⇒ 差距全在共享栈的
+流式/驱动环节 ✓ —— 修法应在共享栈内做（**通用** ✓，GLM 侧同样受益 ✓）。
