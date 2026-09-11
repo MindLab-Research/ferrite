@@ -5386,16 +5386,34 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 }
 
 // hc tail split entry (DSV41_HC_TAIL_SPLIT, Rust-gated). Same front end as
-// dsv41_hc_front, but the tail's LATE half runs on `side` so it overlaps the
-// projection group that consumes the EARLY half (see the split comment above
-// hc_mixes_tail_kernel). Issued sequence:
-//   main: dots -> record(fork_ev) -> tail_early(HC_TAIL_EARLY)
-//   side: wait(fork_ev) -> tail_late(HC_TAIL_LATE) -> record(join_ev)
+// dsv41_hc_front, but BOTH tail halves are pulled off the dots' critical path:
+// the EARLY half (collapse + rmsnorm + T1 fp8) runs on `side` CONCURRENT with the
+// dots, and the LATE half (ss + sigmoid + sinkhorn + comb) runs after it on the
+// same side stream, overlapping the projection group that consumes the EARLY
+// output. Issued sequence (dependency view, not host order):
+//   main: record(in_ev) -> dots -> record(fork_ev) -> wait(early_ev)
+//   side: wait(in_ev) -> tail_early(HC_TAIL_EARLY) -> record(early_ev)
+//         -> wait(fork_ev) -> tail_late(HC_TAIL_LATE) -> record(join_ev)
 // The caller MUST then wait(join_ev) on the main stream before the hc_post that
-// consumes `comb`. All four stream/event ops are legal under
-// cudaStreamCaptureModeRelaxed, so a whole-step capture turns the fork/join into
-// graph edges. Bit-identical to dsv41_hc_front: both halves execute the same
-// statements, in the same order, with the same operands.
+// consumes `comb` (the main-stream `wait(early_ev)` is issued here, before the
+// projection chain that reads `out`/`xq`/`xsc`).
+//
+// WHY EARLY NEEDS `in_ev` AND NOT JUST "no dependency on dots". EARLY reads `x`
+// (= s.h) and `pre_collapse` (a premix slot); both are written by MAIN-stream
+// work that precedes this call (the previous hc_post / AR fold). It genuinely
+// has zero data dependence on the dots (it never reads g_hc_part — that is all
+// in the LATE branch), so it must NOT wait `fork_ev` (which publishes
+// g_hc_part): waiting there would serialise it after the dots and lose the
+// whole overlap. But it does need a main->side edge that pins it after its own
+// producers, and `in_ev` — recorded on main BEFORE the dots — is exactly that
+// edge. Without it the side stream is a graph ROOT for this node and the whole
+// step capture (DSV41_GRAPH_STEP, default ON) lets EARLY run before the
+// main-stream hc_post that fills s.h, i.e. it reads stale residual bytes.
+// All stream/event ops are legal under cudaStreamCaptureModeRelaxed, so a
+// whole-step capture turns the fork/join into graph edges. Bit-identical to
+// dsv41_hc_front: both halves execute the same statements, in the same order,
+// with the same operands (the EARLY/LATE order swap is free — they are disjoint
+// in statements and in memory: EARLY writes out/xq/xsc, LATE writes pre/post/comb).
 // Returns InvalidValue (1) when the gate is off, when there is no collapse half
 // to keep (w_norm == nullptr), or when the shapes are outside the spread tables —
 // all mean "use dsv41_hc_front instead".
@@ -5405,11 +5423,13 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
                                     float* comb, float* out, int rows, int hc, int dim,
                                     int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
                                     float* xsc, cudaStream_t s, cudaStream_t side,
-                                    cudaEvent_t fork_ev, cudaEvent_t join_ev) {
+                                    cudaEvent_t in_ev, cudaEvent_t fork_ev,
+                                    cudaEvent_t early_ev, cudaEvent_t join_ev) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
-    if (side == nullptr || fork_ev == nullptr || join_ev == nullptr)
+    if (side == nullptr || in_ev == nullptr || fork_ev == nullptr || early_ev == nullptr ||
+        join_ev == nullptr)
         return (int)cudaErrorInvalidValue;
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     if (!g_hc_front) return (int)cudaErrorInvalidValue;   // caller keeps the old path
@@ -5430,11 +5450,40 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
             return (int)e;
         }
     }
+    // (0) hc-input-ready edge: record on MAIN before the dots, wait on the side
+    // stream before EARLY. See the header comment — EARLY has no dependence on the
+    // dots, but it must stay ordered after the MAIN-stream work that produces
+    // `x`/`s.h` and `pre_collapse`.
+    cudaError_t e = cudaEventRecord(in_ev, s);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
+    e = cudaStreamWaitEvent(side, in_ev, 0);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
+    // (1) EARLY half on the SIDE stream (collapse + rmsnorm + T1 fp8), concurrent
+    // with the dots below (4.9us > 1.7us, so it is fully hidden). Same statement
+    // sequence, same operands and same 1024-thread block as the old main-stream
+    // EARLY, so the emitted bytes are bit-identical.
+    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
+        x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    e = cudaEventRecord(early_ev, side);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
+    // (2) dots on MAIN (the only inner producer of g_hc_part).
     hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, s>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
-    cudaError_t e = cudaGetLastError();
+    e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    // fork: the side stream may not start before g_hc_part is published
+    // fork: the side stream may not start the LATE half before g_hc_part is published
     e = cudaEventRecord(fork_ev, s);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
@@ -5445,7 +5494,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
+    // (3) LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
     // Block size from g_hc_late_t when the ss partials come from the dots kernel
     // (the default): one warp does all the LATE work, so a 1024-thread block only
     // buys 31 idle warps and a 1024-thread SM slot to queue for. The self-computed
@@ -5461,10 +5510,14 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // EARLY half on the main stream (collapse + rmsnorm + T1 fp8)
-    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
-        x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
-        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
+    // (4) join the EARLY half back onto MAIN: the projection chain right after this
+    // call consumes `out`/`xq`/`xsc`. EARLY started before the dots and is shorter,
+    // so this wait is already satisfied when main reaches it.
+    e = cudaStreamWaitEvent(s, early_ev, 0);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
     return (int)cudaGetLastError();
 }
 

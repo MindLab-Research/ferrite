@@ -463,10 +463,13 @@ struct Kernels {
         ) -> c_int,
     >,
     /// hc TAIL SPLIT (`DSV41_HC_TAIL_SPLIT`, default ON): same front end as
-    /// `hc_front`, but the tail's LATE half (ss/sigmoid/sinkhorn/comb) is issued
-    /// on a side stream so it overlaps the projection group that consumes the
-    /// EARLY half (collapse/rmsnorm/fp8). The caller waits the join event before
-    /// the hc_post that consumes `comb`. Optional: a stale `.so` falls back to the
+    /// `hc_front`, but BOTH tail halves leave the dots' critical path — the LATE
+    /// half (ss/sigmoid/sinkhorn/comb) on a side stream, and the EARLY half
+    /// (collapse/rmsnorm/fp8) on that same side stream *before* it, concurrent
+    /// with the dots. The C launcher records the `in_ev` (main, pre-dots) /
+    /// `fork_ev` (main, post-dots) / `early_ev` (side, post-EARLY) / `join_ev`
+    /// (side) edges itself; the caller waits the join event before the hc_post
+    /// that consumes `comb`. Optional: a stale `.so` falls back to the
     /// single-launch `hc_front`.
     hc_front_split: Option<
         unsafe extern "C" fn(
@@ -474,7 +477,7 @@ struct Kernels {
             *const f32, *const f32,
             *mut f32, *mut f32, *mut f32, *mut f32,
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
-            CuStream, CuStream, *mut c_void, *mut c_void,
+            CuStream, CuStream, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
         ) -> c_int,
     >,
     embed_expand_dev: unsafe extern "C" fn(

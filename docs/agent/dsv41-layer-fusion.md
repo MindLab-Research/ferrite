@@ -335,6 +335,19 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   （全是 elementwise + warp0 sinkhorn），唯一例外是 `DSV41_HC_SS=0` 的自算 ss 路径（读
   `wpart[threadIdx.x>>5]`，需要 warps 0..mix-1）⇒ launcher 在该路径上仍用 1024。
   开关：`DSV41_HC_TAIL_PRIO=0` / `DSV41_GRAPH_NODE_PRIORITY=0` / `DSV41_HC_LATE_T=1024`。
+  - **2026-09-11（同日）EARLY 也搬上 side stream（hc-early-opt）**：EARLY 半
+    （collapse+rmsnorm+fp8）对 dots 的输出零数据依赖（不读 `g_hc_part`），却没有数据理由被排在
+    dots 之后 ⇒ 移到 side stream **头部、`fork_ev` 之前**，与 dots 并发（dots 4.9µs > EARLY
+    1.7µs ⇒ 预期全藏 **−0.14ms**）。⚠️ **关键修正**：EARLY 读 `x`(=`s.h`) 与 `pre_collapse`
+    （premix slot），是**主流上游**写的（上一段 hc_post / AR fold）⇒ side 的 EARLY 仍需要一条
+    main→side 边；"不等任何 event"会把它变成图 ROOT，抢先于 hc_post 读 `s.h`（整步 capture
+    `DSV41_GRAPH_STEP` 默认 ON）⇒ 读到陈旧 residual。故新增 **`in_ev`**（main 在 dots **前**
+    record、side 在 EARLY 前 wait）与 **`early_ev`**（side 在 EARLY 后 record、main 在
+    `hc_front_split` 内 wait——投影链在它之后读 `out`/`xq`/`xsc`）；`fork_ev`（dots 后，LATE 等
+    `g_hc_part`）与 `join_ev` 语义不变。`devrt.rs` 加 `in_ev`/`early_ev` 两个
+    `cudaEventDisableTiming`，`supports_hc_tail_split` 也要求它们非空。位级不变（EARLY/LATE 的
+    语句与操作数不动，两半内存不交——EARLY 写 out/xq/xsc，LATE 写 pre/post/comb——顺序互换无
+    副作用）。
   ⚠️ 若上机后仍只有 −0.2ms，下一个怀疑对象是**图节点开销本身**（审计：1355 节点 ≈ 2.0ms，
   ~1.5µs/节点；split 每次多 1 个 kernel 节点 + 2 个 event 节点 ⇒ 约 0.3-0.5ms/步），
   而不是调度——判据：nsys 看 tail_late 的 span 是否与投影时间轴重叠。
