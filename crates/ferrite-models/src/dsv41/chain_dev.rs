@@ -190,6 +190,18 @@ fn moe_batch() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
+/// (expert_down_fp4_batched + moe_down_reduce) pair. DEFAULT ON: the fused
+/// kernel produces the same bits in one launch (see
+/// expert_gemv_fp4_down_reduce_kernel in dsv41_experts_mxf4.cu for the contract:
+/// ascending serial slot loop, verbatim K loop, explicitly rounded per-slot
+/// product). Read ONCE and cached like the other gates, and `"0"` means OFF even
+/// though it is "set".
+fn down_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
 /// DSV41_NR_FUSE=0 reverts the kv chain to the two-launch rmsnorm + rope pair.
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2362,32 +2374,62 @@ fn fuse_b1() -> bool {
                 // row_weight is PER SLOT here: route_w is [topk] and contiguous,
                 // so the kernel reads route_w[slot] (rw_stride = 1) — the exact
                 // scalar the sequential call passed as `route_w + slot`.
-                self.dev.expert_down_fp4_batched(
-                    self.s.ex_act_b.ptr as *const f32,
-                    act_slot,
-                    self.s.ex_down_b.ptr as *mut f32,
-                    down_slot,
-                    1,
-                    dim as i32,
-                    inter_local as i32,
-                    self.s.route_w.ptr as *const f32,
-                    1,
-                    topk as i32,
-                    w2_base,
-                    w2_stride,
-                    w2s_base,
-                    w2s_stride,
-                    ids,
-                )?;
-                // Fixed-order sum, slot 0 first: the SAME order the sequential
-                // `o[row] += x` accumulation used (from the zeroed `o`), so the
-                // result is bit-identical (fp addition is not associative).
-                self.dev.moe_down_reduce(
-                    self.s.ex_down_b.ptr as *const f32,
-                    self.s.o.ptr as *mut f32,
-                    dim as i32,
-                    topk as i32,
-                )?;
+                //
+                // DSV41_DOWN_FUSE (default ON) folds this down GEMV and the
+                // fixed-order sum into ONE launch
+                // (dsv41_expert_down_reduce_fp4_batched): ascending serial slot
+                // loop + verbatim K loop + explicitly rounded per-slot product,
+                // hence bit-identical to the pair, and the [topk][dim] scratch is
+                // never touched. DSV41_DOWN_FUSE=0 (or a stale .so) runs the pair
+                // exactly as before. `act_slot` is passed as the fused kernel's
+                // `act_stride`: it is whatever pitch the gate/up call wrote, so
+                // the gate_up+swiglu fusion's inter-width layout is picked up here
+                // without any change in this call.
+                if down_fuse() && self.dev.supports_down_fuse() {
+                    self.dev.expert_down_reduce_fp4_batched(
+                        self.s.ex_act_b.ptr as *const f32,
+                        act_slot,
+                        self.s.o.ptr as *mut f32,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        self.s.route_w.ptr as *const f32,
+                        1,
+                        topk as i32,
+                        w2_base,
+                        w2_stride,
+                        w2s_base,
+                        w2s_stride,
+                        ids,
+                    )?;
+                } else {
+                    self.dev.expert_down_fp4_batched(
+                        self.s.ex_act_b.ptr as *const f32,
+                        act_slot,
+                        self.s.ex_down_b.ptr as *mut f32,
+                        down_slot,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        self.s.route_w.ptr as *const f32,
+                        1,
+                        topk as i32,
+                        w2_base,
+                        w2_stride,
+                        w2s_base,
+                        w2s_stride,
+                        ids,
+                    )?;
+                    // Fixed-order sum, slot 0 first: the SAME order the sequential
+                    // `o[row] += x` accumulation used (from the zeroed `o`), so the
+                    // result is bit-identical (fp addition is not associative).
+                    self.dev.moe_down_reduce(
+                        self.s.ex_down_b.ptr as *const f32,
+                        self.s.o.ptr as *mut f32,
+                        dim as i32,
+                        topk as i32,
+                    )?;
+                }
             } else {
                 for slot in 0..topk {
                     let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);

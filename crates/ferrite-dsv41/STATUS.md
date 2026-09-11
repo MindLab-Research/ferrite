@@ -5417,3 +5417,20 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 而 swiglu 的输出 ex_act_b 直接作为 f32 被 down 消费（`act!=nullptr` 分支）——**没有 quant 需要融合**。
 报告改为：swiglu_limit_kernel 的 `swiglu_limit_q_kernel` 变体（可选 fp8 输出），供未来需要 fp8 down 时用。
 当前**不适用**——T1 已覆盖唯一的 quant 场景。
+
+### AR store 融合的可行性核实（读代码确认）
+
+- `ferrite_p2p_ar_v5`（ferrite_kernels.cu:8199）= store 核 + pubred 核，**store 是纯逐元素拷贝**（每 block 独立写自己那段 payload 到 peer 槽）——无 ctr/ticket
+- 两个 AR 调用点：attn 侧载体是 `gemm_fp8_gemv_kernel`（wo_b 的输出）；moe 侧有两个最后写者（rank0 是 add_inplace、其他 rank 是 moe_down_reduce）
+- **融合方案**：给 producer kernel 加可选参数（staging_tbl/epoch/world/rank/stride），epilogue 处把自己的输出行同时写进本 rank 的 out 和每个 peer 的槽
+- **数值**：store 只搬数据不求和（求和在 pubred）⇒ 位级不变
+- **风险**：GEMV 加参数触发重编译 → fast_math 下 ptxas 可能改结合 → 必须逐位验证
+- 补丁骨架已在 ar-fuse 报告中（`~/.xbot/users/web-4/workspace/ar-fuse-store/`）
+
+### 当前 subagent 产出矩阵（≥3 并行 ✓）
+
+| subagent | 状态 | 产出 |
+|---|---|---|
+| down-reduce-impl | running | down+reduce 合一的完整 kernel 实现 |
+| kv-page-design | running | DSA/KV 页化 + 前缀命中设计 |
+| gemv-fixed-cost3 | running | gemv 家族最后一轮微基准（launch_bounds、cp.async、2行/warp、const LUT） |
