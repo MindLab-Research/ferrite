@@ -1811,3 +1811,67 @@ extern "C" int dsv41_moe_route(const float* x, const uint8_t* gate_w, const uint
 // That file also carries the masked M=128 tile organisation, the canonical
 // K-major smem descriptors and the TMEM scale-factor layout notes.
 // ============================================================================
+
+// ---------------------------------------------------------------------------
+// Segment C fused: the hyper-connection post-mix evaluated IN PLACE on the
+// residual stream, so the separate h2 staging buffer and its device-to-device
+// copy both disappear.
+//
+//   out[i,j] = post[i]*x[j] + sum_k comb[k,i]*res[k,j]      (s == 1 in decode)
+//
+// One thread owns a four-float column and walks ALL n hyper-connection rows
+// itself, which matters twice over: the residual is read once instead of once
+// per output row, and the aliasing res == out becomes safe by construction
+// because a thread's read set and write set are the same columns it alone
+// touches. A per-(i,j) thread would need a barrier at best and would still race
+// across blocks.
+//
+// The per-element accumulation keeps the original shape and the same ascending k
+// order, so the result is bit-identical to hc_post + copy_h_back.
+__global__ void dsv41_hc_post_inplace_kernel(float* __restrict__ res,
+                                             const float* __restrict__ x,
+                                             const float* __restrict__ post,
+                                             const float* __restrict__ comb, int n, int h) {
+    const int h4 = h >> 2;
+    const int j4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j4 >= h4) return;
+    const int j = j4 << 2;
+    float4 r[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= n) break;
+        r[k] = *reinterpret_cast<const float4*>(res + (size_t)k * h + j);
+    }
+    const float4 xv = *reinterpret_cast<const float4*>(x + j);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (i >= n) break;
+        const float pv = post[i];
+        float4 acc = xv;
+        acc.x *= pv;
+        acc.y *= pv;
+        acc.z *= pv;
+        acc.w *= pv;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= n) break;
+            const float c = comb[(size_t)k * n + i];
+            acc.x += c * r[k].x;
+            acc.y += c * r[k].y;
+            acc.z += c * r[k].z;
+            acc.w += c * r[k].w;
+        }
+        *reinterpret_cast<float4*>(res + (size_t)i * h + j) = acc;
+    }
+}
+
+extern "C" int dsv41_hc_post_inplace(float* res, const float* x, const float* post,
+                                     const float* comb, int n, int h, cudaStream_t s) {
+    // h % 4 == 0 keeps the float4 path valid; n <= 8 is the register-staging bound
+    // above (hc is 4 in this model, 8 is headroom, not an envelope on the data).
+    if (res == nullptr || x == nullptr || post == nullptr || comb == nullptr) return (int)cudaErrorInvalidValue;
+    if ((h & 3) != 0 || n <= 0 || n > 8) return (int)cudaErrorInvalidValue;
+    const int h4 = h >> 2;
+    dsv41_hc_post_inplace_kernel<<<(unsigned)((h4 + 255) / 256), 256, 0, s>>>(res, x, post, comb, n, h);
+    return (int)cudaGetLastError();
+}

@@ -963,6 +963,14 @@ impl<'a> DevChain<'a> {
     /// return value indexes the one the next layer must use. Nothing here touches
     /// the host: the coefficients used to be downloaded and re-uploaded every
     /// layer, and a download is a full device sync.
+/// Segment C fusion: hc_post written straight back onto the residual stream, which
+/// drops the h2 staging buffer and its device-to-device copy. Read once, because
+/// the hot path must never touch the environment per call.
+fn fuse_c() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(false))
+}
+
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -1014,17 +1022,28 @@ impl<'a> DevChain<'a> {
             cfg.norm_eps,
         )?;
         self.attention(layer, pos)?;
-        self.dev.hc_post(
-            self.s.o.ptr as *const f32,
-            self.s.h.ptr as *const f32,
-            self.s.post.as_f32(),
-            self.s.comb.as_f32(),
-            self.s.h2.ptr as *mut f32,
-            1,
-            hc as i32,
-            dim as i32,
-        )?;
-        self.copy_h_back()?;
+        if Self::fuse_c() {
+            self.dev.hc_post_inplace(
+                self.s.h.ptr as *mut f32,
+                self.s.o.ptr as *const f32,
+                self.s.post.as_f32(),
+                self.s.comb.as_f32(),
+                hc as i32,
+                dim as i32,
+            )?;
+        } else {
+            self.dev.hc_post(
+                self.s.o.ptr as *const f32,
+                self.s.h.ptr as *const f32,
+                self.s.post.as_f32(),
+                self.s.comb.as_f32(),
+                self.s.h2.ptr as *mut f32,
+                1,
+                hc as i32,
+                dim as i32,
+            )?;
+            self.copy_h_back()?;
+        }
 
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} attn={:?}", _t_all.elapsed());
@@ -1097,17 +1116,28 @@ impl<'a> DevChain<'a> {
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
-        self.dev.hc_post(
-            self.s.o.ptr as *const f32,
-            self.s.h.ptr as *const f32,
-            self.s.post.as_f32(),
-            self.s.comb.as_f32(),
-            self.s.h2.ptr as *mut f32,
-            1,
-            hc as i32,
-            dim as i32,
-        )?;
-        self.copy_h_back()?;
+        if Self::fuse_c() {
+            self.dev.hc_post_inplace(
+                self.s.h.ptr as *mut f32,
+                self.s.o.ptr as *const f32,
+                self.s.post.as_f32(),
+                self.s.comb.as_f32(),
+                hc as i32,
+                dim as i32,
+            )?;
+        } else {
+            self.dev.hc_post(
+                self.s.o.ptr as *const f32,
+                self.s.h.ptr as *const f32,
+                self.s.post.as_f32(),
+                self.s.comb.as_f32(),
+                self.s.h2.ptr as *mut f32,
+                1,
+                hc as i32,
+                dim as i32,
+            )?;
+            self.copy_h_back()?;
+        }
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
         }
