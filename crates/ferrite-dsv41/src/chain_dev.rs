@@ -71,6 +71,14 @@ struct LayerCache {
     out_rows: DevBuf,
     /// compressed rows published so far in this sequence
     compress_len: usize,
+    /// CONSTANT bound for the indexer's candidate scan and for the shared memory its
+    /// launcher allocates from it. A CUDA graph capture freezes launch arguments, and
+    /// the kernel scans up to the live device counter (`*lens`); sizing that shared
+    /// memory from the per-step host count therefore left every replay indexing past
+    /// the allocation as the device count grew - which is the whole-step graph's
+    /// stochastic illegal access. The kernel masks every position past the live count
+    /// to -inf, so a larger constant only costs masked iterations.
+    idx_cap: usize,
     /// pre-RoPE keys of those rows, `[max_compress, index_head_dim]`
     index_k: DevBuf,
 }
@@ -332,6 +340,17 @@ impl<'a> DevChain<'a> {
         for l in 0..cfg.n_layers + cfg.n_mtp_layers {
             let ratio = cfg.compress_ratio(l).max(1);
             let max_comp = max_pos / ratio + 2;
+            // The indexer's launcher sizes its dynamic shared memory from the n_pos
+            // launch argument, which a graph capture freezes; the kernel scans up to
+            // the live device counter instead. That value must therefore be the
+            // CONSTANT bound this layer can ever reach - min(pool capacity, what the
+            // 200 KiB shared-memory budget can hold for the score array plus the
+            // per-pick scratch). Passing the per-step host count here is what let a
+            // replayed graph index past the allocation once the device count grew.
+            let idx_cap = {
+                let budget = 200 * 1024usize - 64 - cfg.index_topk * 2 * std::mem::size_of::<i32>();
+                max_comp.min(budget / (std::mem::size_of::<f32>() + 1)).max(1)
+            };
             // The KV buffer holds the window ring FOLLOWED by the compressed
             // latents: rows [0, window) are the ring, [window, window+max_comp)
             // are the compressor's output. The earlier allocation was window
@@ -341,6 +360,7 @@ impl<'a> DevChain<'a> {
             layers.push(LayerCache {
                 ring: dev.alloc(fb((cfg.window_size + max_comp) * hd))?,
                 idxs: dev.alloc(fb(cfg.window_size + cfg.index_topk + 8).max(4))?,
+                idx_cap,
                 state_kv: dev.alloc(fb(ratio * hd))?,
                 state_score: dev.alloc(fb(ratio * hd))?,
                 kvp: dev.alloc(fb(hd))?,
@@ -1583,7 +1603,11 @@ impl<'a> DevChain<'a> {
             1,
             idx_nh as i32,
             idx_hd as i32,
-            comp_len as i32,
+            // The CONSTANT bound, not the live count: the launcher sizes its dynamic
+            // shared memory from this argument and a captured graph freezes it, while
+            // the kernel scans up to the device counter it also receives. Positions
+            // past the live count are masked to -inf, so a larger constant is exact.
+            self.layers[key_owner].idx_cap as i32,
             cfg.index_topk as i32,
             offset as i32,
             scale,
