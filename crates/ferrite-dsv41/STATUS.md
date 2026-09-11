@@ -5118,3 +5118,18 @@ nsys 的计数口径是"8 个 rank 求和后再除以步数"，所以 `gemv_bf16
 **验证协议**：同一次 checkout 双产物重编 → `dfl`（默认，复制+rank0）与
 `stp`（`DSV41_SHARED_TP=1`）**同会话背靠背**两轮，判据仍是四段文本 + faults + p50。
 通过后 `shared_expert_tp()` 默认翻 ON（这是唯一真正的"rank0 串行 2.2ms"来源）。
+
+### 🎯 默认路径 err 700 的最终根因：gemv_bf16 的动态 smem 越界（2026-09-11 晚）
+
+`CUDA_LAUNCH_BLOCKING=1` 在默认臂上抓到真凶：**`dsv41_gemv_bf16: cuda error 700`**。
+我在 `gemv_bf16_kernel` 加 activation staging 时用了 `extern __shared__ float s_xb[]`
+（动态共享内存，k×4 = 20KB），**但 launcher `dsv41_gemv_bf16` 仍传 0** → 每次调用
+越界写 20KB。修复：launcher 传 `(size_t)k * sizeof(float)`（k=5120 → 20KB < 48KB，无需 attribute）。
+
+**重大推论（待复测验证）**：这个 bug 从 `ea26e5e`（b2 臂）就存在，b2 臂"通过"纯属
+UB 运气（越界写恰好落在未用区域）。因此 **hcd/r3 两个"err 700"臂的定罪可能是冤案**：
+- `DSV41_HC_DOTS_T=128`（hc_mix_dots 多 warp staging，~0.35ms）——很可能无辜；
+- activation cp.async（已删）——同样可能无辜。
+**教训**：① 给 kernel 加 `extern __shared__` 时，launcher 的第三参必须同步改
+（这类 bug 是 UB，可能"通过"好几轮才爆）；② "某改动 err 700"的归因必须先
+`CUDA_LAUNCH_BLOCKING=1` 拿到真凶内核名，再结合"该内核近期是否被改过"判断。
