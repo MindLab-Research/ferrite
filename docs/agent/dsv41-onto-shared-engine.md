@@ -368,3 +368,24 @@ host-barrier 路径 ✓；DSV41 自有的三个 AR kernel（`dsv41_ar_v5_{store,
 - **顺带**：`crates/ferrite-dsv41/Cargo.toml` 的 `thiserror`/`serde`/`libc`/`tokenizers` 在**模型侧**已不再需要
   （只 `serde_json`/`libc`/`ferrite-types`/`ferrite-kernel` 被用到）—— 但 `bin/`/`tests/` 还要用
   `tokenizers`/`ferrite-http`，故 5a **不动**旧 crate 的依赖清单，留给 Phase 6 一并清理。
+
+### ✅ Phase 5a 完成（2026-09-11）：模型定义已搬进共享 crate，旧 crate 变薄垫片
+
+**新增 crate `crates/ferrite-models`**（模块路径 `ferrite-models/src/dsv41/`）。**为什么不是复用
+已有的 `ferrite-model`（单数）**：那是**包依赖环** ✗ —— `ferrite-kernel/Cargo.toml` 已声明
+`ferrite-model = { path = "../ferrite-model" }`（虽是 dead dep，cargo 仍视为边 ✗），而 dsv41 的
+`device/tp/chain_dev/load` 必须用 `ferrite_kernel::devrt` ⇒ `ferrite-model → ferrite-kernel →
+ferrite-model` = 环 ⇒ 放不下 ✓。规格终态目录本就写的是 `ferrite-models/`（新增）✓。
+
+**搬迁（`git mv`，保留历史 ✓）**：13 个模型文件（chain / chain_dev / config / device / dspark /
+engram / kernels / load / ops / quant / tp / vision / weights）→ `ferrite-models/src/dsv41/`；
+`configs/*.json` → `ferrite-models/configs/`。**`device.rs`/`tp.rs` 也一并搬** ✓ —— 它们仍被
+`chain_dev`/`load` 以 `crate::device`/`crate::tp` 引用 ✗，留在旧 crate 就会让新 crate 反向依赖
+旧 crate ⇒ 环 ✓。其通用内脏早已转发 `ferrite_kernel::devrt` / `ferrite_p2p_ar_v5` ✓，文件里剩的是
+DSV4 的 ABI 表 + 52 个启动封装 + staging 参数（DSV4 专有 ✓）；**Phase 4 设备层收敛后可删这两个文件** ✓。
+
+**垫片**：`crates/ferrite-dsv41/src/lib.rs` 改为 `pub use ferrite_models::dsv41::{...}` ✓ ⇒
+`dsv41-run` 二进制与 `tests/` **零改动** ✓。**crate 仍在 workspace 里**（删除是 Phase 6 ✓）。
+
+**剩余**：Phase 5b（单一二进制 `ferrite-serve --model dsv41` ✓）、Phase 6（删 `crates/ferrite-dsv41` ✓）、
+Phase 4（`CudaBackend` 与 `devrt` 两设备层收敛 —— **GLM 生产路径，风险最高，必须先隔离验证** ✓）。
