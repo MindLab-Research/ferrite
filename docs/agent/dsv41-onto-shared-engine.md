@@ -389,3 +389,31 @@ DSV4 的 ABI 表 + 52 个启动封装 + staging 参数（DSV4 专有 ✓）；**
 
 **剩余**：Phase 5b（单一二进制 `ferrite-serve --model dsv41` ✓）、Phase 6（删 `crates/ferrite-dsv41` ✓）、
 Phase 4（`CudaBackend` 与 `devrt` 两设备层收敛 —— **GLM 生产路径，风险最高，必须先隔离验证** ✓）。
+
+### Phase 5b 规格（单一二进制 `ferrite-serve --model dsv41`）—— 读码后的精确落差
+
+**现状两套入口**（必须合一 ✗）：
+- `crates/ferrite-serve/src/main.rs`：自研 `get_arg`（**无 clap** ✓ 保持一致），读 `--model-dir`
+  （默认 `.`）、`--model-name`（默认 `glm-5.3-flash`）、`--max-tokens`、`--port`、`--max-seqs`… ⇒
+  `config.json` →（`ferrite_model::direct::load_direct` 或 `load_hf_checkpoint`）→ `gpu_engine` ⇒
+  `ferrite-http` 的 axum router（`/v1/chat/completions`、SSE、`/v1/stats`、`/shutdown` ✓）。
+- `crates/ferrite-dsv41/src/bin/dsv41-run.rs`：另一套 `arg()` + `--prompt/--max-tokens/--serve/--tp`
+  ⇒ 自己建 `TpRankPool` + `SingleFlight` ⇒ 同一个 `ferrite-http` router ✓。
+
+**落差 = 只差"分叉点"** ✗：两者下游已经是同一套（router/SSE/usage/cancel/stats ✓），差的只是
+**谁来构造引擎** ✓。⇒ 规格：
+
+1. **`--model {glm53,dsv41}`**（默认 `glm53` ✓ 保持现行为），或**从 config 嗅探**（DSV4.1 的
+   `config.json` 有嵌套 `text_config` ✓，GLM 的不同 ✓）—— 二者取一，**优先显式 `--model`** ✓
+   （嗅探作为缺省回退 ✓）。
+2. **分叉点放在 cfg 读取之后、引擎构造之前** ✓：`glm53` 走现有路径（零改动 ✓）；`dsv41` 构造
+   `ferrite_models::dsv41::chain_dev::DevChain` + TP rank pool（把 `dsv41-run` 里那套搬进
+   `ferrite-serve` 的一个模块 ✓，`--tp`/`--serve` 语义不变 ✓）。
+3. **数据注入沿用既有 seam** ✓：`StopSpec`（DSV4 的停词集 ✓）+ `ChatFrame`（DSV4 的 chat 模板 ✓）
+   由 `api::router_with` 注入 ✓ —— 这正是本会话共享栈统一时留下的接缝 ✓，**不要再写第二套路由** ✗。
+4. **`dsv41-run` 的命运**：保留其**一次性模式**（`--prompt`，用于隔离验证/微基准 ✓ 不碰 HTTP ✓）；
+   **删掉它的 `--serve` 分支与整个 `TpRankPool` HTTP 粘合** ✓（搬到 `ferrite-serve` ✓）。
+5. **验收**：`ferrite-serve --model dsv41` 跑 12 连发（四段+长文+出师表 ✓ 人眼 ✓）+ `glm53` 跑
+   一次同口径请求确认**零回归** ✓ + `/v1/stats` ✓；**两个模型共用一套 SSE/usage/cancel 路径** ✓。
+6. **之后才是 Phase 6**：删 `crates/ferrite-dsv41`（其 `src/` 已搬空 ✓ 只剩 `bin/` 与测试 ✓，
+   把一次性模式搬进 `ferrite-serve --model dsv41 --prompt ...` 后即可整体删除 ✓）。
