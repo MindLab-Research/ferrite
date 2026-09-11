@@ -2025,8 +2025,11 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const unsigned int bits = __float_as_uint(v[i]);
         const unsigned int key = (bits >> 31) ? ~bits : (bits | 0x80000000u);
+        // The tie key must be the GLOBAL index (idx_off + i): a vocabulary slice
+        // that packed its local index would win or lose ties by the wrong rule,
+        // since the cross-rank final compares these keys directly.
         const unsigned long long pk =
-            ((unsigned long long)key << 32) | (0xFFFFFFFFu - (unsigned)i);
+            ((unsigned long long)key << 32) | (0xFFFFFFFFu - (unsigned)(idx_off + i));
         if (pk > my) my = pk;
     }
     for (int off = 16; off > 0; off >>= 1) {
