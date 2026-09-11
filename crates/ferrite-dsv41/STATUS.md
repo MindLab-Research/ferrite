@@ -4105,3 +4105,21 @@ ULP 红线（`epen`/`IM` 案例），**不可拆**。所以：
    hc collapse 的 fmaf —— 本会话给这两处加的 `#pragma unroll 2` 不触发该风险。
 3. **诊断工具**：微基准加**确定性变化输入 + 输出指纹**（打印 `out[0..3]`），
    同一二进制切换开关对比数值 ⇒ **秒级**判定改动是否移动了求和（不必等两轮 serve A/B）。
+
+## 段融合（mega-kernel）的可行性边界（2026-09-11，查证 + 推断）
+
+用户纲领要求"尽可能每层一个 mega kernel，然后 tile 化"。跨算子（gemv → norm → gemv）
+的合并需要 **grid 级同步**，而查证结论是：**CUDA cooperative groups 的 `grid.sync()`
+在 stream capture（即本工程的整步 CUDA graph）中不被支持** —— 图捕获要求显式流依赖，
+`cudaLaunchCooperativeKernel` 与 capture 不兼容。
+
+⇒ **段融合只有三条路径**：
+1. **persistent kernel**（一个核常驻，核内用 device 侧原子/自旋同步跨算子）——
+   先例是 v5 AR 的自旋，但 AGENTS.md 已记载它的坑：capture 期各 rank 的 epoch 不同步；
+   要做必须先把同步协议设计成"cptime 内不可漂移"。
+2. **核内 tile 化 + 软件流水**（**不跨核**）：把一层的算子在同一核内按 tile 流水，
+   避免中间量落回显存 —— **不需要 grid 同步**，是现有做法的加强版。
+3. **放弃整步图**：逐核发射可以把一段做成一个 cooperative 核，但每步 ~1500 次发射
+   的 host 开销实测约 2.9ms（关图步时 17.33ms vs 图内 14.42ms），会吃掉全部收益。
+
+⇒ **结论：mega-kernel 应走 (2)**（核内 tile + 流水），这是唯一与整步图兼容的方向。
