@@ -1934,10 +1934,23 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
     // too large for that budget fails the launch LOUDLY here - the previous constant
     // bound instead kept the launch valid and silently dropped the far candidates.
     if (smem > 47 * 1024) return (int)cudaErrorInvalidValue;
+    // One block per (token, batch) row, 256 threads by default: at single-stream
+    // decode that is ONE block on one SM, and the chunk's score loop is
+    // candidates x nh x hd multiply-accumulates (2048 x 64 x 128 at a 2k latent
+    // count) - the block size is the only parallelism this shape has. The sort,
+    // the merge and the rank pass are all data-independent over the thread
+    // count, so a wider block changes no result, only the wall time.
+    static const int idx_threads = [] {
+        const char* e = getenv("DSV41_IDX_THREADS");
+        if (e == nullptr) return 1024;
+        const int v = atoi(e);
+        return (v >= 64 && v <= 1024) ? v : 1024;
+    }();
     dim3 grid((unsigned)m, (unsigned)b);
-    indexer_topk_kernel<<<grid, 256, smem, s>>>(q, index_k, weights, candidates, compress_lens,
-                                                out, m, nh, hd, n_pos, topk, offset, softmax_scale,
-                                                head_scale, uses_candidates);
+    indexer_topk_kernel<<<grid, idx_threads, smem, s>>>(q, index_k, weights, candidates,
+                                                        compress_lens, out, m, nh, hd, n_pos, topk,
+                                                        offset, softmax_scale, head_scale,
+                                                        uses_candidates);
     return (int)cudaGetLastError();
 }
 
