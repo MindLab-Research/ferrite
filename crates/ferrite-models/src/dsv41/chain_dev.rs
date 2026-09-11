@@ -310,6 +310,32 @@ fn dual_chain() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DUAL_CHAIN").map(|v| v != "0").unwrap_or(true))
 }
 
+/// COMPRESS_SIDE (DSV41_COMPRESS_SIDE, default ON): a kv-source layer's four
+/// compressor launches (`lin_f32` kvp/scp + `compressor_pool` + `compress_commit`,
+/// ~30us) are issued on the runtime's THIRD side stream so they overlap the q
+/// chain (~13.5us) and the kv chain (which rides `side_stream2`) that own the
+/// main stream in the same window. The compressor reads `s.xn` + the position
+/// counter + this layer's own state, and writes only layer-private buffers
+/// (`kvp`/`scp`/`state_kv`/`state_score`/`latent`/`out_rows` + the ring's
+/// COMPRESSED rows + this layer's device counter) — disjoint from both the q
+/// chain's `qr`/`q`/`xq`/`xsc` and the kv chain's `s.kv` — so the split is
+/// bit-identical: the kernels and their operands are untouched, only the stream
+/// they are issued on. "0" is the A/B arm (serial).
+///
+/// Gates (each silent, falling back to the serial compressor):
+/// - `cublas_m1()`: the cuBLAS-M1 path binds one handle to the MAIN stream, so
+///   an f32 projection issued on the side stream would go to the wrong stream.
+///   Only an A/B knob (default OFF).
+/// - `Device::supports_compress_side()`: the runtime must own the third side
+///   stream and both disable-timing fork/join events (see `devrt.rs`).
+/// The per-layer shape gates (ratio > 0, kv source, `comp_wkv`/`comp_norm`
+/// present) live at the call site, where `compress()`'s own early return has
+/// the same conditions.
+fn compress_side() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_COMPRESS_SIDE").map(|v| v != "0").unwrap_or(true))
+}
+
 /// MOE_DUAL (DSV41_MOE_DUAL, default ON): the MoE's SHARED expert half is issued
 /// on the runtime's second side stream so it overlaps the ROUTED experts' fp4
 /// chain on the main stream. The two halves of `moe()` read `xn` through
@@ -1223,6 +1249,22 @@ impl<'a> DevChain<'a> {
                 .gemm_f32(a as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k);
         }
         self.dev.gemv_f32(w.ptr() as *const f32, a, out, n_out, k)
+    }
+
+    /// [`Self::lin_f32`] issued on `s` instead of the main stream. Only the
+    /// compressor's kvp/scp projections use it (`DSV41_COMPRESS_SIDE`), and the
+    /// caller excludes the cuBLAS-M1 path (one handle, bound to the main
+    /// stream), so this always takes our own GEMV.
+    fn lin_f32_on(
+        &self,
+        a: *const f32,
+        k: i32,
+        w: &crate::dsv41::load::DevTensor,
+        n_out: i32,
+        out: *mut f32,
+        s: ferrite_kernel::devrt::CuStream,
+    ) -> Result<()> {
+        self.dev.gemv_f32_on(w.ptr() as *const f32, a, out, n_out, k, s)
     }
 
     /// bf16 linear for one row. The bf16 path converts the *activation* to bf16
@@ -2421,6 +2463,33 @@ fn hc_tail_split() -> bool {
         if dual {
             self.dev.dual_chain_fork()?;
         }
+        // COMPRESS_SIDE (DSV41_COMPRESS_SIDE, default ON): the kv-source layer's
+        // four compressor launches (~30us) are forked onto the THIRD side stream
+        // HERE — the same point as the dual chain, right after `lin2` — so they
+        // run under the q chain (~13.5us, main) AND the kv chain (side_stream2)
+        // instead of serially between `ring_win_fuse` and the indexer. The
+        // compressor reads `s.xn` (final since the pre-attention rmsnorm), the
+        // position counter and this layer's own state; it writes only
+        // layer-private buffers + the ring's COMPRESSED rows + this layer's
+        // device counter, so it shares nothing with either chain. See
+        // `compress_side()` for the gates.
+        //
+        // The compressor must be a kv source with the comp weights present (the
+        // same predicate `compress()` early-returns on) — otherwise the fork
+        // would open an empty side-stream window for nothing.
+        let comp_side = compress_side()
+            && cfg.compress_ratio(layer) > 0
+            && cfg.is_kv_source(layer)
+            && !cublas_m1()
+            && ld.comp_wkv.is_some()
+            && ld.comp_norm.is_some()
+            && self.dev.supports_compress_side();
+        let mut comp_len_side: Option<usize> = None;
+        if comp_side {
+            self.dev.compress_side_fork()?;
+            let s3 = self.dev.side_stream3();
+            comp_len_side = Some(self.compress_on(layer, pos, s3)?);
+        }
         // L2+L3 decision, hoisted above the norm block: which wq_b launch is
         // taken decides whether NORM_FUSE may run at all. The two-family
         // IDX_FUSE launch shares ONE `xq` between wq_b and idx_wq_b, so it cannot
@@ -2768,12 +2837,26 @@ fn hc_tail_split() -> bool {
         // layer of the same group reads the latents they published, which is
         // why they all live in this layer's own copy of the sequence's rows.
         let mut comp_len = self.layers[layer].compress_len;
-        if cfg.compress_ratio(layer) > 0 && cfg.is_kv_source(layer) {
-            comp_len = self.compress(layer, pos)?;
+        // COMPRESS_SIDE: when the compressor already ran on the third side
+        // stream, its host-side counter mirror is already updated (inside
+        // `compress_on`) and only the JOIN is left, placed just before the
+        // compressor's first consumer below. `pending_comp_join` is false on
+        // every serial path.
+        let pending_comp_join = if cfg.compress_ratio(layer) > 0 && cfg.is_kv_source(layer) {
+            if let Some(cl) = comp_len_side {
+                comp_len = cl;
+                true
+            } else {
+                comp_len = self.compress(layer, pos)?;
+                false
+            }
         } else if cfg.compress_ratio(layer) > 0 {
             // a consumer inherits the count published by its source layer
             comp_len = self.source_compress_len(layer);
-        }
+            false
+        } else {
+            false
+        };
         // Selection over the compressed rows. The release scores them with the
         // indexer and keeps `index_topk`; until the indexer is wired this takes
         // the most recent ones, which is a deliberate placeholder (it is a
@@ -2789,6 +2872,17 @@ fn hc_tail_split() -> bool {
         if !rw_fused {
             self.dev
                 .window_idxs(idxs_ptr as *mut i32, self.s.pos_ctr.ptr as *const i32, win as i32)?;
+        }
+        // COMPRESS_SIDE join. The compressor's FIRST consumers are the indexer
+        // below — a kv-source index layer reads this layer's `latent` (written
+        // by `compressor_pool`) and the device latent counter it advances — and,
+        // for every layer, `sparse_attn` (reads the ring's compressed rows +
+        // that counter). `window_idxs` above reads neither (only `pos_ctr`), so
+        // the join goes here: the latest point that is still before both, which
+        // lets the compressor overlap `window_idxs` too. A no-op when the fork
+        // did not take.
+        if pending_comp_join {
+            self.dev.compress_side_join()?;
         }
         if comp_len > 0 && cfg.is_index_source(layer) {
             // EVERY index-source layer runs its own indexer (into its own
@@ -3291,6 +3385,27 @@ fn hc_tail_split() -> bool {
     /// promotes them), then the pooling half, then the latent lands in this
     /// layer's KV buffer at row `window + compress_len`. Returns the new count.
     fn compress(&mut self, layer: usize, pos: usize) -> Result<usize> {
+        self.compress_on(layer, pos, self.dev.stream())
+    }
+
+    /// [`Self::compress`] with every launch issued on `s`. The serial path
+    /// passes the main stream (byte-for-byte the old behaviour); the
+    /// `DSV41_COMPRESS_SIDE` path passes the third side stream so the four
+    /// launches overlap the q/kv chains that own the main stream in the same
+    /// window. Kernels and operands are identical, so the two streams produce
+    /// bit-identical bytes.
+    ///
+    /// The compressor reads `s.xn` (read-only), the device position counter and
+    /// this layer's own state, and writes only this layer's private buffers plus
+    /// the ring's compressed rows and this layer's device counter — never
+    /// `s.qr`/`s.q`/`s.xq`/`s.xsc` (q chain) nor `s.kv` (kv chain). That
+    /// disjointness is what makes the concurrent issue legal.
+    fn compress_on(
+        &mut self,
+        layer: usize,
+        pos: usize,
+        s: ferrite_kernel::devrt::CuStream,
+    ) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hd = cfg.head_dim;
@@ -3300,14 +3415,14 @@ fn hc_tail_split() -> bool {
             return Ok(self.layers[layer].compress_len);
         };
         let cache = &self.layers[layer];
-        self.lin_f32(self.s.xn.ptr as *const f32, dim as i32, wkv, hd as i32, cache.kvp.ptr as *mut f32)?;
+        self.lin_f32_on(self.s.xn.ptr as *const f32, dim as i32, wkv, hd as i32, cache.kvp.ptr as *mut f32, s)?;
         if let Some(wg) = ld.comp_wgate.as_ref() {
-            self.lin_f32(self.s.xn.ptr as *const f32, dim as i32, wg, hd as i32, cache.scp.ptr as *mut f32)?;
+            self.lin_f32_on(self.s.xn.ptr as *const f32, dim as i32, wg, hd as i32, cache.scp.ptr as *mut f32, s)?;
         } else {
             // ratio == 1: no gate; the pooling reduces to the plain projection
-            self.dev.zero(&cache.scp)?;
+            self.dev.zero_on(cache.scp, s)?;
         }
-        self.dev.compressor_pool(
+        self.dev.compressor_pool_on(
             cache.kvp.as_f32(),
             cache.scp.as_f32(),
             norm.as_f32(),
@@ -3322,13 +3437,14 @@ fn hc_tail_split() -> bool {
             pos as i32,
             self.s.pos_ctr.ptr as *const std::os::raw::c_int,
             cfg.norm_eps,
+            s,
         )?;
         // FUSED COMMIT (device-side): reads out_rows on the device, ropes the
         // latent, stores it into the ring and advances this layer's device
         // counter. The old form downloaded out_rows (a sync D2H per layer per
         // step), branched on the host, roped, copied and bumped a host counter -
         // all impossible to capture in a graph.
-        self.dev.compress_commit(
+        self.dev.compress_commit_on(
             cache.latent.as_f32(),
             self.cos_comp.as_f32(),
             self.sin_comp.as_f32(),
@@ -3340,6 +3456,7 @@ fn hc_tail_split() -> bool {
             (cfg.rope_head_dim / 2) as i32,
             cfg.window_size as i32,
             ratio as i32,
+            s,
         )?;
         // The host keeps a MIRROR of the device counter using the SAME deterministic
         // rule the kernel applies ((pos + 1) % ratio == 0 commits one latent). The

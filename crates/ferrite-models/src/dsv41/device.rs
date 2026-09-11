@@ -700,6 +700,43 @@ impl Device {
             .stream_wait_event(self.stream, self.rt.join2_event())
     }
 
+    /// True when the runtime owns the THIRD side stream and its fork/join
+    /// events. A cudart without the event primitives, or a failed stream create,
+    /// reports false and the caller keeps the serial compressor.
+    pub fn supports_compress_side(&self) -> bool {
+        !self.rt.side_stream3().is_null()
+            && !self.rt.fork3_event().is_null()
+            && !self.rt.join3_event().is_null()
+    }
+
+    /// The third side stream (the compressor's four launches). Only meaningful
+    /// when [`Self::supports_compress_side`] is true.
+    pub fn side_stream3(&self) -> CuStream {
+        self.rt.side_stream3()
+    }
+
+    /// Compressor side stream — fork. Record the fork event on the MAIN stream
+    /// and make `side_stream3` wait it. Legal inside a capture: both ops become
+    /// graph edges.
+    pub fn compress_side_fork(&self) -> Result<()> {
+        self.rt.record_event(self.rt.fork3_event(), self.stream)?;
+        self.rt
+            .stream_wait_event(self.rt.side_stream3(), self.rt.fork3_event())
+    }
+
+    /// Compressor side stream — join. Record the join event on `side_stream3`
+    /// and make the MAIN stream wait it. Must run after the compressor is fully
+    /// issued and before its first consumer: the `indexer`'s `latent` read (a
+    /// kv-source index layer reads `self.layers[layer].latent`, written by
+    /// `compressor_pool`) and `sparse_attn`'s compressed ring rows. Legal inside
+    /// a capture.
+    pub fn compress_side_join(&self) -> Result<()> {
+        self.rt
+            .record_event(self.rt.join3_event(), self.rt.side_stream3())?;
+        self.rt
+            .stream_wait_event(self.stream, self.rt.join3_event())
+    }
+
     pub fn device_id(&self) -> i32 {
         self.rt.device_id()
     }
@@ -792,6 +829,12 @@ impl Device {
 
     pub fn zero(&self, b: &DevBuf) -> Result<()> {
         self.rt.zero(b)
+    }
+
+    /// [`Self::zero`] issued on `s` instead of the main stream. Only the
+    /// compressor's `ratio == 1` no-gate path uses it (`DSV41_COMPRESS_SIDE`).
+    pub fn zero_on(&self, b: &DevBuf, s: CuStream) -> Result<()> {
+        self.rt.zero_at_on(b.ptr, b.bytes, s)
     }
 
     pub fn memcpy_d2d(&self, dst: *mut c_void, src: *const c_void, bytes: usize) -> Result<()> {
@@ -2050,11 +2093,40 @@ impl Device {
         pos_ctr: *const c_int,
         eps: f32,
     ) -> Result<()> {
+        self.compressor_pool_on(
+            kvp, scp, norm_w, state_kv, state_score, latents, out_rows, b, seqlen, head_dim,
+            ratio, start_pos, pos_ctr, eps, self.stream,
+        )
+    }
+
+    /// [`Self::compressor_pool`] issued on `s` instead of the main stream. The
+    /// compressor's pooling half runs on the third side stream under
+    /// `DSV41_COMPRESS_SIDE`; kernel and operands are unchanged, so the result
+    /// is bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_pool_on(
+        &self,
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latents: *mut f32,
+        out_rows: *mut i32,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        start_pos: i32,
+        pos_ctr: *const c_int,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<()> {
         let f = self.need(self.kernels.compressor_pool, "dsv41_compressor_pool")?;
         let rc = unsafe {
             f(
                 kvp, scp, norm_w, state_kv, state_score, latents, out_rows, b, seqlen, head_dim,
-                ratio, start_pos, pos_ctr, eps, self.stream,
+                ratio, start_pos, pos_ctr, eps, s,
             )
         };
         self.kerr(rc, "dsv41_compressor_pool")
@@ -2578,10 +2650,35 @@ impl Device {
         window: i32,
         ratio: i32,
     ) -> Result<()> {
+        self.compress_commit_on(
+            latent, cos, sin, ring, out_rows, clen, hd, rope_dim, half, window, ratio,
+            self.stream,
+        )
+    }
+
+    /// [`Self::compress_commit`] issued on `s` instead of the main stream. The
+    /// commit (rope + ring store + counter bump) runs on the third side stream
+    /// under `DSV41_COMPRESS_SIDE`; kernel and operands are unchanged, so the
+    /// result is bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compress_commit_on(
+        &self,
+        latent: *const f32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        out_rows: *const c_int,
+        clen: *mut c_int,
+        hd: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        ratio: i32,
+        s: CuStream,
+    ) -> Result<()> {
         let f = self.need(self.kernels.compress_commit, "dsv41_compress_commit")?;
         let rc = unsafe {
-            f(latent, cos, sin, ring, out_rows, clen, hd, rope_dim, half, window, ratio,
-              self.stream)
+            f(latent, cos, sin, ring, out_rows, clen, hd, rope_dim, half, window, ratio, s)
         };
         self.kerr(rc, "dsv41_compress_commit")
     }
@@ -2613,14 +2710,30 @@ impl Device {
     /// (none exist today) keep v1's bit-exact path. `DSV41_GEMV_F32_V2=0`
     /// pins v1 (A/B escape hatch).
     pub fn gemv_f32(&self, w: *const f32, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
+        self.gemv_f32_on(w, x, out, n, k, self.stream)
+    }
+
+    /// [`Self::gemv_f32`] issued on `s` instead of the main stream. The
+    /// compressor's kvp/scp projections (`DSV41_COMPRESS_SIDE`) run the f32
+    /// GEMV on the third side stream; kernel and operands are unchanged, so the
+    /// result is bit-identical.
+    pub fn gemv_f32_on(
+        &self,
+        w: *const f32,
+        x: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        s: CuStream,
+    ) -> Result<()> {
         if gemv_f32_v2_wanted(n) {
             if let Some(f) = self.kernels.gemv_f32_v2 {
-                let rc = unsafe { f(w, x, out, n, k, self.stream) };
+                let rc = unsafe { f(w, x, out, n, k, s) };
                 return self.kerr(rc, "dsv41_gemv_f32_v2");
             }
         }
         let f = self.need(self.kernels.gemv_f32, "dsv41_gemv_f32")?;
-        let rc = unsafe { f(w, x, out, n, k, self.stream) };
+        let rc = unsafe { f(w, x, out, n, k, s) };
         self.kerr(rc, "dsv41_gemv_f32")
     }
 

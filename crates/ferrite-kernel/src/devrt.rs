@@ -335,6 +335,20 @@ pub struct DevRuntime {
     /// the critical path, so it must never preempt it.
     /// Null when uncreatable → the model keeps the serial kv chain.
     side_stream2: CuStream,
+    /// THIRD side stream — the compressor (`DSV41_COMPRESS_SIDE`): the four
+    /// compressor launches (kvp/scp projections + pool + commit) of a kv-source
+    /// layer are issued here so they overlap the whole q chain on `stream`.
+    /// Deliberately a DIFFERENT stream from BOTH `side_stream` and
+    /// `side_stream2`: `side_stream2` already carries the attention kv chain
+    /// (norm + rope) in the SAME window (both are live between the fork at
+    /// `lin2` and the kv join), so sharing it would serialise 10.6us of kv half
+    /// behind 30us of compressor and blow the ~14us window. The compressor's
+    /// buffers are disjoint from both chains (layer-private kvp/scp/state/latent
+    /// + the ring's COMPRESSED rows, never `s.kv`/`s.qr`/`s.xq`), so the three
+    /// streams never touch the same bytes.
+    /// Created WITHOUT a priority hint for the same reason as `side_stream2`.
+    /// Null when uncreatable → the model keeps the serial compressor.
+    side_stream3: CuStream,
     /// Flags for `cudaGraphInstantiate`. Non-zero only when the side stream is a
     /// priority stream AND `DSV41_GRAPH_NODE_PRIORITY` is not 0.
     graph_instantiate_flags: u64,
@@ -515,6 +529,18 @@ impl DevRuntime {
             if side_stream2.is_null() {
                 eprintln!("[dual_chain] second side stream unavailable — kv chain stays serial");
             }
+            // Third side stream: the compressor half (`DSV41_COMPRESS_SIDE`).
+            // Plain create (default priority) — see the field comment for why it
+            // must be a THIRD stream (the kv chain already owns side_stream2 in
+            // the same window) and why it must not take the priority hint.
+            let mut side_stream3: CuStream = std::ptr::null_mut();
+            if (cudart.stream_create)(&mut side_stream3) != 0 {
+                let _ = (cudart.last_error)();   // clear the sticky flag
+                side_stream3 = std::ptr::null_mut();
+            }
+            if side_stream3.is_null() {
+                eprintln!("[compress_side] third side stream unavailable — compressor stays serial");
+            }
             // Node-priority instantiation is what makes the captured priority
             // effective at replay. `DSV41_GRAPH_NODE_PRIORITY=0` pins it off.
             let node_prio = side_prio != 0
@@ -530,6 +556,8 @@ impl DevRuntime {
             let mut join_ev: *mut c_void = std::ptr::null_mut();
             let mut fork2_ev: *mut c_void = std::ptr::null_mut();
             let mut join2_ev: *mut c_void = std::ptr::null_mut();
+            let mut fork3_ev: *mut c_void = std::ptr::null_mut();
+            let mut join3_ev: *mut c_void = std::ptr::null_mut();
             if let Some(make_ev) = cudart.event_create_flags {
                 if make_ev(&mut fork_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
                     let _ = (cudart.last_error)();
@@ -565,6 +593,25 @@ impl DevRuntime {
                 if (fork2_ev.is_null() || join2_ev.is_null()) && !side_stream2.is_null() {
                     eprintln!("[dual_chain] fork/join events unavailable — kv chain stays serial");
                 }
+                // Compressor side stream: same disable-timing requirement (its
+                // fork/join land inside the whole-step capture too).
+                if make_ev(&mut fork3_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    fork3_ev = std::ptr::null_mut();
+                }
+                if make_ev(&mut join3_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    join3_ev = std::ptr::null_mut();
+                }
+                if (fork3_ev.is_null() || join3_ev.is_null()) && !fork3_ev.is_null() {
+                    if let Some(d) = cudart.event_destroy {
+                        let _ = d(fork3_ev);
+                        fork3_ev = std::ptr::null_mut();
+                    }
+                }
+                if (fork3_ev.is_null() || join3_ev.is_null()) && !side_stream3.is_null() {
+                    eprintln!("[compress_side] fork/join events unavailable — compressor stays serial");
+                }
             }
             Ok(DevRuntime {
                 cudart,
@@ -573,11 +620,14 @@ impl DevRuntime {
                 side_stream,
                 side_prio,
                 side_stream2,
+                side_stream3,
                 graph_instantiate_flags,
                 fork_ev,
                 join_ev,
                 fork2_ev,
                 join2_ev,
+                fork3_ev,
+                join3_ev,
                 handle,
                 kernel_handle: h_k,
                 debug_sync: std::env::var("FERRITE_DEBUG_SYNC")
@@ -642,6 +692,28 @@ impl DevRuntime {
     /// consumer. Null when unavailable.
     pub fn join2_event(&self) -> *mut c_void {
         self.join2_ev
+    }
+
+    /// Third side stream — the compressor (`DSV41_COMPRESS_SIDE`). Null when the
+    /// runtime could not create one; callers gate on `is_null` (see
+    /// `Device::supports_compress_side`).
+    pub fn side_stream3(&self) -> CuStream {
+        self.side_stream3
+    }
+
+    /// Fork event for the compressor side stream (`DSV41_COMPRESS_SIDE`):
+    /// recorded on the MAIN stream by the model, waited on `side_stream3`. Null
+    /// when unavailable.
+    pub fn fork3_event(&self) -> *mut c_void {
+        self.fork3_ev
+    }
+
+    /// Join event for the compressor side stream: recorded on `side_stream3` by
+    /// the model, waited on the MAIN stream before the compressor's first
+    /// consumer (the indexer's latent read / `sparse_attn`'s compressed rows).
+    /// Null when unavailable.
+    pub fn join3_event(&self) -> *mut c_void {
+        self.join3_ev
     }
 
     /// Record `ev` on `stream`. Legal inside a capture (becomes a graph node).
@@ -954,6 +1026,18 @@ impl DevRuntime {
 
     pub fn zero(&self, b: &DevBuf) -> Result<()> {
         self.zero_at(b.ptr, b.bytes)
+    }
+
+    /// [`Self::zero_at`] issued on `s` instead of the main stream. Only the
+    /// compressor's `ratio == 1` no-gate path uses it (the scp projection is
+    /// zeroed on the compressor's side stream, `DSV41_COMPRESS_SIDE`).
+    pub fn zero_at_on(&self, ptr: *mut c_void, bytes: usize, s: CuStream) -> Result<()> {
+        if let Some(f) = self.cudart.memset_async {
+            let st = unsafe { f(ptr, 0, bytes, s) };
+            return check_cudart(st, &self.cudart, "cudaMemsetAsync");
+        }
+        let st = unsafe { (self.cudart.memset)(ptr, 0, bytes) };
+        check_cudart(st, &self.cudart, "cudaMemset(pad)")
     }
 
     /// Device-to-device copy (small row moves: the KV ring append).

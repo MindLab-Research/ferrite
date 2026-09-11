@@ -167,6 +167,32 @@ routed 链上是 fp4 expert 核（`expert_gemv_fp4_*`），shared 链上是 w1/w
 - **矛盾解释**：serve A/B 判 "neutral"（9.42 vs 9.38）落在 §3 的 ±0.3ms 机时漂移带内，
   **不是有效反证**。nsys 的逐核 per-call 才是可信信号。
 
+#### (B-修正, 2026-09-11 晚)：**「占用率红线」不成立；4 值 uint16 才是正确宽度**
+
+在 bench 节点用同一个隔离微基准（`/tmp/dv320`，生产形状 `dim=7168, k=320, slots=8, 256 线程,
+896 块`，5 轮交错；基线 = 2 值尾循环）重测了三种宽度：
+
+| 臂 | regs | blocks/SM | waves | 相对基线 |
+|---|---|---|---|---|
+| 2 值尾（mode 2，基线）| 40 | 6 | 1.01 | 1.00 |
+| **4 值 uint16（mode 3）+ `__launch_bounds__(256,6)`** | 40 | 6 | 1.01 | **0.90** |
+| **4 值 uint16（mode 3，无 launch_bounds）** | 56 | 4 | 1.51 | **0.87（最快）** |
+| 8 值 uint32（mode 4 = 01291b2 的形状）| 40 | 6 | 1.01 | 1.03 |
+| 8 值 uint32（mode 4）| 62 | 4 | 1.51 | 0.97 |
+
+- **输的是「8 值」这个宽度，不是「宽加载」**：4 值/lane 的工作集（1×uint16 + 1×float4 +
+  2×float2 L1TEX 操作）仍能塞进 40 寄存器的调度；8 值省下的指令抵不过它吃掉的寄存器。
+- **56 regs / 4 blocks/SM 那一臂是全场最快** ⇒ 上面「40 寄存器是单 wave 红线，多寄存器必然
+  +49%」的归因**不成立**。01291b2 的 +45% 与占用率无关（同二进制内 mode 4 vs mode 2 只差 ~3%，
+  而同会话里 `after`/`before` 比值在 1.06–1.27 之间漂），**需要重新定因**。
+- **已落地**：`vec == 3` = 4 值/lane（1×`LDG.U16` 权重 + 1×`LDS.128` 激活 + 2×`LDS.64` LUT，
+  1.25 op/值 vs 原 2.5；scale 覆盖整 4 值组 ⇒ 每组只做一次 scale-FMA）。两个核
+  （`expert_gemv_fp4_down_reduce_kernel` 与 `expert_gemv_fp4_batched_kernel`）各有一份
+  **逐字镜像**，闸门 `DSV41_DOWN_VEC4`（默认 ON，`=0` 回退到 `DSV41_EXPERT_FP4_MODE`）。
+  只作用于 down 启动：gate/up 的 swiglu 融合要求 `mode == 2`。
+- ⚠️ mode 3 的 lane→k 映射与 mode 2 不同 ⇒ **融合/未融合的逐位一致契约靠「镜像分支」维持，
+  改一边必须同时改另一边**（这正是 01291b2 回退的第二个理由，现在用镜像解决了）。
+
 ### (C) 的教训：这个核不是 smem-load-bound
 CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认），**预期 −0.15ms，实收 −0.02ms（12%）**。
 ⇒ `expert_gemv_fp4_batched` 的关键路径**不在 LDS**。下一刀只能打 **FMA/issue**（4 累加器→2、或换 warp 内归约），
@@ -208,6 +234,60 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | **4** | **AR 节点数**（不是 AR 时间）：246 节点/步，生产 0.66ms 是协议地板 | 节点尾延迟 | **−0.3~0.5** | Stage C persistent 把 3 核/层 → 1 核/段；**建议先用图节点数直接量残余**（v2 遗留待办）|
 | **5** | **FMA-side 打 gate_up**：CSE 已证明 smem 不是瓶颈 | 1.01ms | **−0.1~0.2** | 风险：数值契约（4 累计器→2 改变求和顺序 ⇒ 需 parity 测试）|
 | **6** | **`gemv_f32` 的 v2 化**（compressor 的 kvp/scp，n=128×k=5120 / 7 次/步）| 0.12ms | **−0.08~0.10** | ✅ **已落地**（2026-09-11）：v1 只有 16 blocks / 128 warps（148 SM 的 11%）+ 160 次串行 4B load ⇒ 16.4µs = 48x 内存地板（0.34µs），与 gate 修前同病。新增 `gemv_f32_v2_kernel`（`dsv41_glue.cu`，模板 WPR：float4 16B/load + K-split + smem fold，`__fmaf_rn` 钉住 FFMA 舍入）→ n=128 走 WPR=8 = 1024 warps。`device.rs::gemv_f32` 按 `n < GEMV_F32_V2_MAX_N=2048` 分派，`DSV41_GEMV_F32_V2=0` 回退 v1。**待实测**：16.4µs 的改善幅度（预期对齐 bf16 gate v2 的 3-5µs 档）|
+
+### 4.1 `DSV41_GATEUP_ROWS`（2026-09-11 已落地）：行拆分**不是**占用率修复——它是该假说的证伪探针
+
+**代码**（`kernels/cuda/dsv41_experts_mxf4.cu`）：gate/up batched launcher 的 CTA 形状从硬编码
+`warps=8` 改为 `dsv41_gateup_rows()`（env **`DSV41_GATEUP_ROWS`**，默认 **8 = HEAD 原形**，范围 1..32）。
+`blockDim = rows*32`、`grid = (ceil(n_total/rows), slots)`；kernel 的 row 窗口循环本来就闭合
+（`row = blockIdx.x*nwarps + warp; row += gridDim.x*nwarps`，`nwarps` 由 `blockDim` 推导），
+所以**除 launcher 的三行外 kernel 无需改行数**。**逐位一致**：每行的 dot 全在单个 warp 内完成
+（shfl 树 + lane 0 写 `out[row]`），行间无归约，输出布局与 pitch 都不变 ⇒ down_reduce 的输入假设不受影响。
+顺带修掉一个隐形地雷：LUT 构建原写作 `if (threadIdx.x < 256)`，rows<8（blockDim<256）时会漏建
+表项 128..255 → 改成 256 步长的 stride 循环（≥256 线程时逐位相同）。
+⚠️ down 方向（`dsv41_expert_down_fp4_batched` / `dsv41_expert_down_reduce_fp4_batched`）**保持 8 warp 不变**：
+它的 grid 是 (⌈5120/8⌉,6) = 3840 CTA，本来不欠填充，且 `expert_gemv_fp4_down_reduce_kernel` 里
+同样留着 `threadIdx.x < 256` 的写法（其 launcher 恒定 256 线程，故目前安全——改它的 blockDim 前必须先改那一行）。
+
+**为什么预期 ≈0（别把它当 −0.5ms 的刀）**：
+`rows × slots` 就是全部工作切分（DSV4.1：320 行 × 6 slot = **1920 个 row-dot，一 warp 一个**），
+把同样的 1920 个 warp 重新打包成 240 / 480 / 960 个**更小的 CTA**：
+- **warp 总数不变 ⇒ 每 SM 驻留 warp 数不变**（1920/148 = **13 warp/SM，与 rows 无关**）。
+  延迟遮盖由"驻留 warp 数"决定，不由"驻留 CTA 数"决定 ⇒ "1.6 → 3.2 → 6.5 blocks/SM"不产生任何新并行度；
+  若寄存器是驻留上限，半宽 CTA 让 blocks/SM 翻倍、warp/SM 不变，**严格等号**。
+- **每 warp 的 MLP 不变**（仍 10 组 × unroll 4 × 1 LDG.128/组）⇒ in-flight 字节不变。
+- 两个副作用是**负**的：`s_act`（k floats = 20KB）+ 256 项 LUT 是 **per-CTA**、被该 CTA 的行共享，
+  行数减半 ⇒ **每行的 prologue 翻倍**（另有 smem store 量翻倍）；CTA 越小，能遮盖该 prologue 的
+  warp 越少。⇒ rows=2/1 很可能是**净负**。
+
+**该假说其实已被现成数据部分否证**：down 方向的 CTA 有 **3840 个**（gateup 的 16x）、warp **30720 个**
+（16x），搬的字节只有 gateup 的一半 —— 若"CTA/warp 数 → 有效带宽"成立，down 应碾压 gateup；
+实测 down v2 = 17.2µs / 4.92MB = **286 GB/s**，gateup 25.3µs / 9.83MB = **389 GB/s**：
+**down 每字节效率更低**。⇒ 这个家族的限制量是**每 warp 的 in-flight 字节（MLP）与每 warp 的固定开销**，
+不是 CTA 数。（388 GB/s vs 7.6TB/s 峰值 = 5%，DRAM 地板 1.3µs/层 vs 25.3µs = 19x ⇒ 不是带宽墙。）
+
+**真正的决策量（本机无 nvcc/GPU，必须先到节点上量）**：`expert_gemv_fp4_batched_kernel<true|false>` 的
+**regs/thread**（`cuobjdump --dump-resource-usage`）+ ncu `sm__warps_active.avg.pct_of_peak_sustained_active`。
+两种情形**药方相反**：
+- **regs ≤ 64/线程** ⇒ 每 SM 可驻 4 CTA = 32 warp，而现在只有 13 ⇒ grid 确实欠填充，加 warp 有效
+  （但**只能用 K-split**：行拆分永远加不出 warp）。
+- **regs ≥ 128/线程** ⇒ 每 SM 只能驻 2 CTA = 16 warp，现在 13/16 = **已达可驻留上限的 81%** ⇒
+  瓶颈是**寄存器**（药方是减寄存器 / 加 MLP / 加 unroll 深度），K-split 多出的 warp 会挤成第二波，
+  收益 ≈ −20% 或归零。参照同族 down 核：**40 regs/thread ⇒ 6 CTA/SM**（§3B 的隔离微基准实测）。
+
+**执行顺序**：(1) `DSV41_GATEUP_ROWS=4/2` A/B（证伪 CTA 数假说；逐位一致，唯一变量是 CTA 形状）；
+(2) 同轮抓 regs/thread；(3) 按结论选 K-split（加 warp）还是 MLP/寄存器路线。
+
+**K-split 设计（未实施：它改求和结合顺序 ⇒ 需要 parity 门）**：
+- 结构：`grid=(ceil(n_total/4), slots)` + `blockDim=8 warps`，warp `w` 与 `w+4` 认领**同一行**，
+  各做 g2 ∈ [0,5) / [5,10)（k=5120 → k>>9 = 10 组，切在 32-值 scale block 边界上），各自做 warp 内
+  shfl 树，两个 partial 落 smem（4 行 × 2 方向 × 2 partial = 32B），`__syncthreads()` 后由一侧合并并写 `out[row]`。
+- ⚠️ 合并必须在 **clamp/silu 之前**（`g = a_g + b_g`、`u = a_u + b_u`，再 `fminf/fmaxf` + silu），否则语义错；
+  固定"先 a 后 b" ⇒ 仍确定，但**不再与单 warp 路径逐位一致** ⇒ 需要 parity/容忍度测试（这是方向 2 的真实代价，
+  也是先做方向 3 的原因）。另注意 build.sh 的 `--use_fast_math` 会重排浮点：新代码的每个 add/mul 要用
+  `__fadd_rn`/`__fmul_rn` 或 `fmaf` 钉住（2026-09-11 的 4-路展开漂 1ULP 事故）。
+- 结构优势：CTA 仍是 240 → **per-row 的 s_act prologue 不翻倍**（行拆分做不到这点）；代价是每 warp 的
+  in-flight 字节减半且 warp 数翻倍 ⇒ 净效果取决于上面那个 regs 结论（0.81 波 → 1.62 波时 ≈ −19% 而非 −50%）。
 
 ---
 
@@ -297,6 +377,11 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。
 4. **`gemv_bf16` 两族拆分**：把 9 次 lm_head/engram（≈45µs）单独归因，看 HEAD_SLICE 是否还有空间。
 5. **`gemm_fp8_gemv` 的 mean/median 尾巴**（9.5 vs 7.9µs）来自哪几步：若是前几步 warmup，则生产口径应再降。
+6. **gateup 的 CTA 粒度 vs warp 数（`DSV41_GATEUP_ROWS`，已落地，见 §4.1）**：`=8|4|2|1` 的 A/B
+   （逐位一致，唯一变量是 CTA 形状；预期 flat——flat 即证伪 "1.6 blocks/SM 是真瓶颈" 的读法），
+   **同轮**抓 `cuobjdump --dump-resource-usage`（`expert_gemv_fp4_batched_kernel<true|false>` 的 regs/thread）
+   + ncu `sm__warps_active.avg.pct_of_peak_sustained_active`。这两个数决定下一步是 K-split（regs 低、grid 欠填充）
+   还是 MLP/寄存器路线（regs 高、已近可驻留上限）。
 
 ---
 

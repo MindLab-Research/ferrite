@@ -696,6 +696,34 @@ static const int g_expert_fp4_mode = [] {
     if (e == nullptr) return 2;       // 2 = shared lut + split accumulators: -5.38 ms, text identical
     return atoi(e);                   // 0 scalar, 1 vectorised (both kept for bisection)
 }();
+// DOWN direction lane map, separate from the gate/up one on purpose.
+//
+// Why: at the production down shape (k = inter_local = 320) `nv2 = k >> 9 = 0`,
+// so the whole vec==2 main loop is dead code and 100% of the dot used to run in
+// the 2-value tail (1 LDG.U8 weight + 1 LDG.U8 scale + 1 LDS.64 LUT + 2 LDS.32
+// activation per 2 values). Mode 3 is a 4-value/lane tail: 1 LDG.U16 weight +
+// 1 LDS.128 activation + 2 LDS.64 LUT per 4 values (1.25 L1TEX op/value vs 2.5),
+// and the scale covers the whole 4-value group so it is applied once per
+// accumulator instead of once per element. Measured in isolation at the exact
+// production shape (dim=7168, k=320, 256 threads, 896 blocks, sm_103a, nvcc
+// 13.2, /tmp/dv320 evidence on the bench node), 5 interleaved rounds:
+//   mode 2, 40 regs, 6 blocks/SM, 1.01 waves : 1.00 (baseline)
+//   mode 3, 40 regs, 6 blocks/SM, 1.01 waves : 0.90   (+launch_bounds__(256,6))
+//   mode 3, 56 regs, 4 blocks/SM, 1.51 waves : 0.87   <- fastest
+// i.e. the 4-value form wins in 5/5 rounds and, at this shape, the extra
+// registers cost LESS than the shorter tail - the "40 registers is a hard
+// occupancy red line" reading does not reproduce (see the note in the vec==2
+// branch below). The 8-value uint32 form (01291b2) is the one that loses:
+//   mode 4, 40 regs, 6 blocks/SM : 1.03   mode 4, 62 regs, 4 blocks/SM : 0.97
+//
+// It is NOT fed to the gate/up launch: that path needs vec==2 for its fused
+// swiglu body (`fuse` requires g_expert_fp4_mode == 2). Set DSV41_DOWN_VEC4=0
+// to fall back to DSV41_EXPERT_FP4_MODE for the down launches (bisection).
+static const int g_down_fp4_mode = [] {
+    const char* e = getenv("DSV41_DOWN_VEC4");
+    if (e != nullptr && atoi(e) == 0) return g_expert_fp4_mode;
+    return g_expert_fp4_mode == 2 ? 3 : g_expert_fp4_mode;
+}();
 
 // ---------------------------------------------------------------------------
 // PDL (programmatic dependent launch) for the DSV41 EXPERT chain.
@@ -1328,7 +1356,41 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
             const uint8_t* srow = w2s_base + e * (size_t)w2s_stride + (size_t)row * ksc;
 
             float acc = 0.f;
-            if (vec == 2) {
+            if (vec == 3) {
+                // 4 values per lane for k < 512, where the vec==2 main loop below
+                // cannot run at all (nv2 = k >> 9 = 0 at the production
+                // k = inter_local = 320). One LDG.U16 = 2 packed bytes = 4 nibbles,
+                // one LDS.128 = the 4 activations, two LDS.64 = the LUT pairs:
+                // 5 L1TEX ops per 4 values against 10 in the 2-value tail. The four
+                // values of a group sit inside ONE 32-value scale block (j = lane*4,
+                // block = j >> 5 = lane >> 3), so `sc` multiplies the accumulator once
+                // per group instead of once per element: 6 FP ops per 4 values.
+                const int nv4 = k >> 7;
+                float a0 = 0.f, a1 = 0.f;
+                for (int g = 0; g < nv4; ++g) {
+                    const int j = (g << 7) + (lane << 2);
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    const uint16_t w =
+                        *reinterpret_cast<const uint16_t*>(brow + (g << 6) + (lane << 1));
+                    const float4 av = *reinterpret_cast<const float4*>(s_act + j);
+                    const float2 t0 = s_lut2[w & 0xFFu];
+                    const float2 t1 = s_lut2[(w >> 8) & 0xFFu];
+                    float p0 = av.x * t0.x;
+                    p0 = fmaf(av.y, t0.y, p0);
+                    float p1 = av.z * t1.x;
+                    p1 = fmaf(av.w, t1.y, p1);
+                    a0 = fmaf(sc, p0, a0);
+                    a1 = fmaf(sc, p1, a1);
+                }
+                acc = a0 + a1;
+                for (int j = (nv4 << 7) + lane * 2; j < k; j += 64) {
+                    const uint8_t byte = brow[j >> 1];
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    const float2 t = s_lut2[byte];
+                    acc += s_act[j] * (t.x * sc);
+                    acc += s_act[j + 1] * (t.y * sc);
+                }
+            } else if (vec == 2) {
                 // Same 256-values-per-group shape as the vectorised branch, but the
                 // unpack is a shared lookup and the accumulation is split four ways so
                 // the dependency chain is forty fmas deep instead of a hundred and sixty.
@@ -1387,18 +1449,24 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                     a2 = fmaf(sc, p2, a2);
                     a3 = fmaf(sc, p3, a3);
                 }
-                // DO NOT widen this tail into a uint32 / 8-value loop. Measured in
-                // isolation on sm_103a (nvcc 13.2, k=320, dim=7168, slots=8, 256
-                // threads/block): the uint32 form needs 54 regs/thread vs the 40
-                // below, which drops residency from 6 to 4 blocks/SM, so the
-                // 896-block grid goes from 1.01 to 1.51 waves and the kernel takes
-                // 38.8us instead of 26.1us (+49%) - the exact shape of the +45%
-                // nsys measured on this kernel after 01291b2. The LDG.U8s it saves
-                // are worth far less than the lost blocks: this kernel is
-                // occupancy-bound, and ~40 registers is what keeps it in one wave.
-                // (01291b2 also broke bit-parity with the unfused pair, whose
-                // vec==2 branch in expert_gemv_fp4_batched_kernel still sums a
-                // k=320 tail in 2-value steps; reverting restores it.)
+                // The two wider tails are NOT equivalent - re-measured on the bench
+                // node (sm_103a, nvcc 13.2, k=320, dim=7168, slots=8, 256 threads,
+                // 896 blocks, 5 interleaved rounds, 2-value tail = 1.00):
+                //   uint16 / 4-value (mode 3): 0.90 @ 40 regs + launch_bounds(256,6)
+                //                             0.87 @ 56 regs / 4 blocks/SM  <- fastest
+                //   uint32 / 8-value (mode 4 = the 01291b2 form): 1.03 @ 40 regs,
+                //                             0.97 @ 62 regs
+                // => the loser is the 8-VALUE loop, not "wider loads". 4 values is the
+                // last width whose working set (1 uint16 + 1 float4 + 2 float2) still
+                // fits a 40-register schedule; 8 values buys fewer instructions than it
+                // pays for in registers.
+                // The earlier occupancy attribution ("40 regs is the red line, 54 regs
+                // -> 4 blocks/SM -> +49%") does NOT reproduce: the 56-reg/4-block
+                // mode 3 arm is the FASTEST of all. Do not attribute the 01291b2
+                // regression to occupancy without re-measuring it.
+                // Bit-parity note: mode 3's lane map differs from mode 2's, so the
+                // unfused path needs the same branch - expert_gemv_fp4_batched_kernel
+                // carries a verbatim mirror and both read g_down_fp4_mode.
                 acc = (a0 + a1) + (a2 + a3);
                 for (int j = (nv2 << 9) + lane * 2; j < k; j += 64) {
                     const uint8_t byte = brow[j >> 1];
@@ -1744,7 +1812,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
         (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
         nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
         w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
-        g_expert_fp4_mode, /*fuse_swiglu=*/0);
+        g_down_fp4_mode, /*fuse_swiglu=*/0);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -1809,12 +1877,12 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
         le = dsv41_experts_pdl_or_plain(
             expert_gemv_fp4_down_reduce_kernel<true>, grid, dim3(warps * 32), staged_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
-            w2_stride, w2s_base, w2s_stride, ids, g_expert_fp4_mode);
+            w2_stride, w2s_base, w2s_stride, ids, g_down_fp4_mode);
     } else {
         le = dsv41_experts_pdl_or_plain(
             expert_gemv_fp4_down_reduce_kernel<false>, grid, dim3(warps * 32), lut_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
-            w2_stride, w2s_base, w2s_stride, ids, g_expert_fp4_mode);
+            w2_stride, w2s_base, w2s_stride, ids, g_down_fp4_mode);
     }
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
