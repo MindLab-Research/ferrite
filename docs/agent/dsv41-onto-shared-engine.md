@@ -210,6 +210,14 @@ epoch 仍在设备内存（图可回放）；归约仍按 **rank 升序**（逐�
 标量、无此约束。DSV41 的 `bytes` 均为 `hc_dim*4` / `vocab*4` / `n*4`（16 的倍数），理论满足，但**必须** e2e 复验。
 另：共享 pubred 由 **block 0** 推进 epoch（DSV41 旧实现由 reduce 最后一块推进）——同为「每次调用恰好 +1、设备侧」✓。
 
+**⚠ attn 侧 store 已进一步融合（2026-09-11）**：wo_b 的 AR 不再走 `ferrite_p2p_ar_v5` 的 store kernel。`dsv41_gemm_fp8_mx`
+新增 5 个可选尾参（`staging_tbl`/`epoch`/`world`/`my_rank`/`stride`），当 `staging_tbl != nullptr`（**仅 M=1**）时
+`gemm_fp8_gemv_kernel` 的 lane-0 epilogue 把 `acc+bias` 同时写进 `out_[rrow]` 和每个 peer 的 staging 槽；随后
+`chain_dev.rs` 直调该 gemm（绕过 `lin` 的 quant1，先手动 `quant1`），再用新的 **pubred-only** 入口
+`ferrite_p2p_ar_pubred_v5`（ferrite_kernels.cu，跳过 store kernel）做 publish+reduce。此时 **gemv 与 pubred 必须同段紧邻**
+（同为一次 AR 的两个半边，都读同一个 `*epoch`；中间不得插入任何其它 all-reduce）。`stride` 单位是 **float 元素数**
+（`bytes/4`，`Collective::slot_stride_elems`），传成字节会越界踩 `stamps`。
+
 **验证状态**：`cargo check --workspace` **0 error** ✓；`ar_micro` **编译通过** ✓（`cargo test --no-run`）。
 ⚠ **本机无 GPU、无 nvcc** ⇒ `ar_micro` **未实跑**、`.cu` **未重编**：需在远端 `bash kernels/cuda/build.sh 103a`
 重编 `.so`（改了 `dsv41_glue.cu` ⇒ BUILD_ID/CU_HASH 变化，Rust 侧会拒绝加载旧 `.so`），再跑

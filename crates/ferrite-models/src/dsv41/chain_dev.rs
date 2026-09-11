@@ -1906,16 +1906,60 @@ fn fuse_b1() -> bool {
         let ol_total = groups * cfg.o_lora_rank;
         let ol_local = ol_total / world;
         // this rank wrote its groups at local offsets [0, nlg*olg) = [0, ol_local)
-        self.lin(
-            self.s.wo.ptr as *const f32,
-            ol_local as i32,
-            ld.wo_b.as_ref().unwrap(),
-            ld.wo_b_scale.as_ref().unwrap(),
-            dim as i32,
-            self.s.o.ptr as *mut f32,
-        )?;
-        if let Some(c) = self.comm.clone() {
-            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+        // == lin()'s quant1 half, hoisted so the fp8 activation exists before the
+        // direct gemm_fp8_mx below (lin() would re-quantise, and cannot pass the AR
+        // staging args). Under AR v5 the epilogue ALSO stores the row partial into
+        // every peer's slot, so the following all_reduce becomes publish+reduce
+        // only -- the standalone store kernel disappears for this site.
+        let comm = self.comm.clone();
+        // AR store fusion: gated OFF by default (round 19 showed the fused path
+        // breaks the four texts even with GATEUP/DOWN_FUSE off, because this
+        // changes wo_b's all_reduce to pubred-only which depends on the gemv
+        // epilogue having stored the partials - a coupling that must be debugged
+        // together with the GATEUP_FUSE numerical bug). DSV41_AR_STORE_FUSE=1
+        // re-enables.
+        let ar_store_fused = std::env::var("DSV41_AR_STORE_FUSE")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+            && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
+        self.quant1(self.s.wo.ptr as *const f32, ol_local as i32)?;
+        if ar_store_fused {
+            let c = comm.as_ref().unwrap();
+            self.dev.gemm_fp8_mx_ar(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                ld.wo_b.as_ref().unwrap().as_u8(),
+                ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                self.s.o.ptr as *mut f32,
+                dim as i32,
+                ol_local as i32,
+                c.peer_slots_f32(),
+                c.epoch_u32(),
+                c.world as i32,
+                c.rank as i32,
+                c.slot_stride_elems(),
+            )?;
+        } else {
+            self.dev.gemm_fp8_mx(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                ld.wo_b.as_ref().unwrap().as_u8(),
+                ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                self.s.o.ptr as *mut f32,
+                1,
+                dim as i32,
+                ol_local as i32,
+            )?;
+        }
+        if let Some(c) = comm {
+            if fused {
+                // store already done by the fused epilogue; publish+reduce only.
+                // Must stay adjacent to the gemv above (same *epoch).
+                c.all_reduce_inplace_pubred_only(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            } else {
+                c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            }
             c.end_round();
         }
         Ok(())

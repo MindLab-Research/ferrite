@@ -237,6 +237,61 @@ impl Collective {
         ar_v5()
     }
 
+    /// Peers' staging bases as an f32 pointer table — the `staging_tbl` form the
+    /// fused epilogue store walks (`staging_tbl[rr][...] = v`). Bit-identical to
+    /// `peer_slots_u64` (both are 8-byte device addresses), typed for the kernel.
+    pub fn peer_slots_f32(&self) -> *const *mut f32 {
+        self.peer_slots.ptr as *const *mut f32
+    }
+
+    /// This rank's device epoch as a READ-ONLY pointer — what the fused store in
+    /// the producer kernel's epilogue dereferences (`*epoch`); the write side
+    /// (pubred advancing it) goes through `epoch_dev`.
+    pub fn epoch_u32(&self) -> *const c_uint {
+        self.epoch_dev() as *const c_uint
+    }
+
+    /// Per-slot stride in FLOAT ELEMENTS (`bytes/4`) — the unit every v5 kernel
+    /// indexes with. Passing `bytes` instead walks 4x past the slot into the
+    /// stamp row and silently corrupts it.
+    pub fn slot_stride_elems(&self) -> i32 {
+        (self.bytes / 4) as i32
+    }
+
+    /// AR v5 publish + reduce ONLY: the store half already ran inside the producer
+    /// kernel's epilogue (see `Device::gemm_fp8_mx_ar`), so this skips
+    /// `p2p_ar_store_v5_kernel` and goes straight to the pubred kernel. `len` must
+    /// equal the payload the fused store wrote. The fused producer and this call
+    /// MUST be adjacent on the stream (no other all-reduce in between): both read
+    /// the same `*epoch`, and pubred advances it at the end.
+    pub fn all_reduce_inplace_pubred_only(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+    ) -> Result<()> {
+        debug_assert!(
+            ar_v5(),
+            "fused-store AR requires AR v5 (the producer kernel read *epoch)"
+        );
+        let n = (len / 4) as c_int;
+        let stride = self.slot_stride_elems();
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        self.dev.p2p_ar_pubred_v5(
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+        )
+    }
+
     /// Publish `len` bytes from `src` into slot `rank` of every rank. `len`
     /// must not exceed the slot size: a site with a shorter payload than the
     /// staging would otherwise publish unrelated memory.
