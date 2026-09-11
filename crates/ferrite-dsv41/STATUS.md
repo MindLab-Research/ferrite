@@ -6175,3 +6175,36 @@ DSV41_ATTN_PF_SPLIT=C 显式开启）。
 
 **在飞三项**：dots→pubred（−0.12）+ hc tail 分裂 side stream（−0.86，最大单项）+
 swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
+
+### nsys v5 剖析（8.49ms 新基线的完整验证，2026-09-11 深夜）
+
+**Round 40 修复全部生效的验证**：
+| 项 | v4（修复前） | v5（修复后） | 判定 |
+|---|---|---|---|
+| apply_rope | 88 次/步 | **44 次** | ✓ rope fusion FFI 修复生效（q rope 40 消除） |
+| quant_kernel<0> | 170 次/步 | **86 次** | ✓ o-rope fp8 + qr 双重量化修复生效 |
+
+**当前 8.49ms 的完整分解**（nsys v5 many，9.44ms 含剖析开销）：
+| kernel | 次/步 | µs/次 | ms/步 | 在飞优化 |
+|---|---|---|---|---|
+| gemm_fp8_gemv | 246 | 10.2 | 2.50 | 需 persistent（研究级） |
+| hc_mixes_tail | 80 | 12.4 | 1.00 | **tail split（−0.86）实施中** |
+| expert_gateup | 40 | 24.0 | 0.96 | L1TEX 地板 |
+| expert_down_reduce | 40 | 17.2 | 0.69 | L1TEX 地板（8 理论失败） |
+| ar_reduce（profile 模式） | 82 | 7.9 | 0.65 | 生产 v5 = store+pubred ~0.66 |
+| hc_mix_dots | 80 | 7.0 | 0.56 | **dots→pubred（−0.12）实施中** |
+| ar_store+stamp（profile） | 164 | 5.3+4.2 | 0.77 | 生产已并入 pubred |
+| gemv_bf16_v2 (gate+route) | 48 | 8.2 | 0.39 | route fusion ✓ 已生效 |
+| sparse_attn_pf | 40 | 8.5 | 0.34 | split OFF（短上下文回归） |
+| gemv_bf16 (lm_head) | 1 | 325.9 | 0.33 | profile artifact（生产切片 ~40µs） |
+| hc_post_inplace | 80 | 1.9 | 0.15 | profile artifact（生产已 fold 进 pubred） |
+| quant<0> | 86 | 1.5 | 0.13 | **swiglu_q（−40）修复中** |
+| rmsnorm_q | 40 | 3.1 | 0.13 | 未来：+wq_b gemv 融合 |
+| apply_rope | 44 | 2.4 | 0.10 | o-rope 40 + idx 4（可再融） |
+| rmsnorm_rope | 40 | 2.6 | 0.10 | kv norm+rope 已融合 |
+
+**通往 200 tok/s 的分层路径**（基于 v5 数据的诚实重估）：
+- 第一层（在飞）：dots→pubred −0.12 + tail split −0.86 + swiglu_q −0.06 = **−1.04 → 7.45ms ≈ 134 tok/s**
+- 第二层（已识别未实施）：rmsnorm_q+wq_b −0.13 + o-rope→sparse_attn −0.10 + AR PDL −0.16 = **−0.39 → 7.06ms ≈ 142 tok/s**
+- 第三层（研究级）：persistent 段核 −0.5~1.0 + expert 突破 −0.5 = **−1.0~1.5 → 5.5~6.0ms ≈ 167-182 tok/s**
+- 第四层（200 需要）：全 persistent + 图调度间隙消除 = **5.0ms = 200 tok/s**

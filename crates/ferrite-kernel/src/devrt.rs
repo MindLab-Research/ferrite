@@ -66,7 +66,19 @@ struct Cudart {
     graph_launch: Option<unsafe extern "C" fn(*mut c_void, CuStream) -> c_int>,
     graph_exec_destroy: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
     graph_destroy: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    // ---- side-stream fork/join (DSV41_HC_TAIL_SPLIT) ----
+    // The kernel launcher records fork/join and the model waits the join; Rust
+    // only needs the record/wait primitives and the disable-timing create (an
+    // event used inside a capture MUST be created with cudaEventDisableTiming).
+    event_create_flags: Option<unsafe extern "C" fn(*mut *mut c_void, c_uint) -> c_int>,
+    event_record: Option<unsafe extern "C" fn(*mut c_void, CuStream) -> c_int>,
+    event_destroy: Option<unsafe extern "C" fn(*mut c_void) -> c_int>,
+    stream_wait_event: Option<unsafe extern "C" fn(CuStream, *mut c_void, c_uint) -> c_int>,
 }
+
+/// `cudaEventDisableTiming` — required for any event recorded inside a stream
+/// capture (a timing event makes `cudaStreamEndCapture` fail).
+pub const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x02;
 
 struct Cublas {
     create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
@@ -280,6 +292,17 @@ pub struct DevRuntime {
     cudart: Cudart,
     cublas: Cublas,
     stream: CuStream,
+    /// Side stream for the hc tail split (DSV41_HC_TAIL_SPLIT). Created once, only
+    /// ever fed the LATE tail half, and joined back onto `stream` before hc_post.
+    /// Null when `cudaStreamCreate` is unavailable, in which case the model keeps
+    /// the single-launch path (`side_stream()` returns null).
+    side_stream: CuStream,
+    /// Fork/join events for the tail split, created with `cudaEventDisableTiming`
+    /// so they are legal inside a stream capture. Recorded by the kernel launcher,
+    /// waited by the model. Reused for every tail call: each record/wait pair is
+    /// fully ordered within the capture, so program order disambiguates them.
+    fork_ev: *mut c_void,
+    join_ev: *mut c_void,
     handle: *mut c_void,
     /// the kernel `.so` — model crates resolve their own symbols in it
     kernel_handle: *mut c_void,
@@ -347,6 +370,18 @@ impl DevRuntime {
                 graph_destroy: sym(h_cudart, "cudaGraphDestroy")
                     .ok()
                     .map(|p| std::mem::transmute_copy(&p)),
+                event_create_flags: sym(h_cudart, "cudaEventCreateWithFlags")
+                    .ok()
+                    .map(|p| std::mem::transmute_copy(&p)),
+                event_record: sym(h_cudart, "cudaEventRecord")
+                    .ok()
+                    .map(|p| std::mem::transmute_copy(&p)),
+                event_destroy: sym(h_cudart, "cudaEventDestroy")
+                    .ok()
+                    .map(|p| std::mem::transmute_copy(&p)),
+                stream_wait_event: sym(h_cudart, "cudaStreamWaitEvent")
+                    .ok()
+                    .map(|p| std::mem::transmute_copy(&p)),
             };
             let cublas = Cublas {
                 create: f!(h_cublas, "cublasCreate_v2"),
@@ -365,10 +400,42 @@ impl DevRuntime {
             if st != 0 {
                 return Err(FerriteError::Config(format!("cublasSetStream: {st}")));
             }
+            // Side stream + fork/join events for the hc tail split. BEST EFFORT:
+            // any failure (or a cudart without the symbols) leaves them null and
+            // the model keeps the single-launch tail, so the GLM path and every
+            // other consumer are unaffected. The events MUST be disable-timing:
+            // a timing event makes cudaStreamEndCapture fail once the fork/join
+            // lands inside the whole-step graph.
+            let mut side_stream: CuStream = std::ptr::null_mut();
+            if (cudart.stream_create)(&mut side_stream) != 0 {
+                let _ = (cudart.last_error)();   // clear the sticky flag
+                side_stream = std::ptr::null_mut();
+            }
+            let mut fork_ev: *mut c_void = std::ptr::null_mut();
+            let mut join_ev: *mut c_void = std::ptr::null_mut();
+            if let Some(make_ev) = cudart.event_create_flags {
+                if make_ev(&mut fork_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    fork_ev = std::ptr::null_mut();
+                }
+                if make_ev(&mut join_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    join_ev = std::ptr::null_mut();
+                }
+                if (fork_ev.is_null() || join_ev.is_null()) && !fork_ev.is_null() {
+                    if let Some(d) = cudart.event_destroy {
+                        let _ = d(fork_ev);
+                        fork_ev = std::ptr::null_mut();
+                    }
+                }
+            }
             Ok(DevRuntime {
                 cudart,
                 cublas,
                 stream,
+                side_stream,
+                fork_ev,
+                join_ev,
                 handle,
                 kernel_handle: h_k,
                 debug_sync: std::env::var("FERRITE_DEBUG_SYNC")
@@ -385,6 +452,36 @@ impl DevRuntime {
     /// This runtime's stream (model kernel launches submit here).
     pub fn stream(&self) -> CuStream {
         self.stream
+    }
+
+    /// The side stream the hc tail split feeds its LATE half (null when the
+    /// runtime could not create one). Callers must gate on `is_null`.
+    pub fn side_stream(&self) -> CuStream {
+        self.side_stream
+    }
+
+    /// Fork event for the hc tail split: recorded on the main stream by the
+    /// kernel launcher, waited on the side stream. Null when unavailable.
+    pub fn fork_event(&self) -> *mut c_void {
+        self.fork_ev
+    }
+
+    /// Join event for the hc tail split: recorded on the side stream by the
+    /// kernel launcher, waited on the main stream before hc_post. Null when
+    /// unavailable.
+    pub fn join_event(&self) -> *mut c_void {
+        self.join_ev
+    }
+
+    /// Make `stream` wait for `ev`. Legal inside a capture (becomes a graph
+    /// dependency edge); this is the join half of the tail split.
+    pub fn stream_wait_event(&self, stream: CuStream, ev: *mut c_void) -> Result<()> {
+        let f = self
+            .cudart
+            .stream_wait_event
+            .ok_or_else(|| FerriteError::Config("cudaStreamWaitEvent missing".into()))?;
+        let rc = unsafe { f(stream, ev, 0) };
+        self.kerr(rc, "cudaStreamWaitEvent")
     }
 
     /// Resolve a kernel symbol in the loaded `.so` (required).
@@ -463,6 +560,10 @@ impl DevRuntime {
                 graph_launch: None,
                 graph_exec_destroy: None,
                 graph_destroy: None,
+                event_create_flags: None,
+                event_record: None,
+                event_destroy: None,
+                stream_wait_event: None,
             })
         }
     }

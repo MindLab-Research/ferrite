@@ -1588,7 +1588,35 @@ impl<'a> DevChain<'a> {
         // one-launch phase structure, but the dots are spread instead of pinned
         // to one SM. The fallback chain is
         // (persist_mb -> persist -> two-launch -> hc_mixes), each step silent.
-        let fused = if Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
+        let fused = if Self::hc_tail_split() && self.dev.supports_hc_tail_split() && !norm_w.is_null()
+        {
+            // Tail split (`DSV41_HC_TAIL_SPLIT`, default ON). The collapse +
+            // rmsnorm + fp8 (EARLY) stays on the main stream — its consumer is the
+            // projection group immediately below — while ss + sigmoid + sinkhorn +
+            // comb (LATE) runs on the side stream, joined in `layer` just before
+            // the hc_post that reads `comb`. `norm_w` non-null is required: with
+            // no collapse half there is nothing to keep on the critical path.
+            self.dev.hc_front_split(
+                self.s.h.ptr as *const f32,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_w,
+                pre_collapse,
+                self.premix_slot(pre_slot).ptr as *mut f32,
+                self.s.post.ptr as *mut f32,
+                self.s.comb.ptr as *mut f32,
+                out,
+                1,
+                hc as i32,
+                dim as i32,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+            )?
+        } else if Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
             self.dev.hc_front_persist_mb(
                 self.s.h.ptr as *const f32,
                 hc_fn,
@@ -1756,6 +1784,20 @@ fn hc_persist_mb() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_HC_PERSIST_MB").map(|v| v != "0").unwrap_or(false))
 }
 
+/// hc TAIL SPLIT gate (`DSV41_HC_TAIL_SPLIT`, default ON). The tail kernel's two
+/// halves are independent: the collapse/rmsnorm/fp8 (EARLY) feeds the next
+/// projection, the ss/sigmoid/sinkhorn/comb (LATE) feeds hc_post a whole
+/// projection + AR later. Splitting them lets the LATE half run on a side stream
+/// underneath the projections, hiding its ~10.7us of serialised sinkhorn latency.
+/// Falls back silently to the single-launch `hc_front` when the `.so` has no
+/// `dsv41_hc_front_split`, when the runtime could not create the side stream or
+/// events, or when there is no collapse half (`DSV41_FUSE_B1=0`). Bit-identical
+/// either way, so "0" is a pure A/B arm. "1"/unset enables.
+fn hc_tail_split() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HC_TAIL_SPLIT").map(|v| v != "0").unwrap_or(true))
+}
+
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -1840,6 +1882,10 @@ fn hc_persist_mb() -> bool {
         )?;
         }
         let attn_hc_folded = self.attention(layer, pos)?;
+        // Tail split join: the attention (projections + AR) has now consumed the
+        // EARLY half, so the LATE half's `comb` must be visible to hc_post. A
+        // no-op unless hc_mixes_auto issued a split above.
+        self.dev.hc_tail_join()?;
         if Self::fuse_c() {
             // Segment-C P1: the fold already wrote this layer's hc_post onto
             // `s.h` from the AR pubred epilogue, so only the un-folded path
@@ -1968,6 +2014,9 @@ fn hc_persist_mb() -> bool {
         if phase_dbg() {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
+        // Tail split join for the FFN front end (same contract as the attention
+        // side): the MoE consumed the EARLY half, so wait the LATE half's comb.
+        self.dev.hc_tail_join()?;
         if Self::fuse_c() {
             // Segment-C P1: same fold as the attention side, on the MoE AR.
             if !moe_hc_folded {

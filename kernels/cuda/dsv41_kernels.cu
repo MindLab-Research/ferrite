@@ -3713,6 +3713,18 @@ __global__ void hc_mix_dots_kernel(const float* __restrict__ x, const float* __r
 // sigmoid split, the sinkhorn and the comb write - all as hc_mixes_kernel does
 // them, with the walk over hc_dim striding by ss_stride (= mix*32) so the
 // per-lane partial sums group exactly as they did at blockDim 768.
+// hc tail split (DSV41_HC_TAIL_SPLIT): the body below is two INDEPENDENT halves.
+//   EARLY = collapse + rmsnorm + T1 fp8 (writes out/xq/xsc), whose consumer is the
+//           projection group that immediately follows (lin2's wq_a+wkv);
+//   LATE  = ss + mixes + sigmoid + sinkhorn + comb (writes pre/post/comb), whose
+//           consumer is hc_post, a whole projection + AR away.
+// They share no output, so running them as two launches (LATE on a side stream)
+// is bit-identical to the single launch: every statement runs in the same order
+// with the same operands. `mode` selects the halves; HC_TAIL_FULL is the original
+// kernel, byte-for-byte the same arithmetic.
+#define HC_TAIL_FULL 0
+#define HC_TAIL_EARLY 1
+#define HC_TAIL_LATE 2
 __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ hc_scale,
                                      const float* __restrict__ hc_base, float* __restrict__ pre,
@@ -3721,7 +3733,7 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ w_norm,
                                      const float* __restrict__ pre_collapse,
                                      float* __restrict__ out, float eps_norm, int ss_in,
-                                     uint8_t* __restrict__ xq, float* __restrict__ xsc) {
+                                     uint8_t* __restrict__ xq, float* __restrict__ xsc, int mode) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -3732,6 +3744,8 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
     __shared__ float wpart[32];
     const float* xr = x + (size_t)r * hc_dim;
     const int nwarp = ss_stride >> 5;
+    // ---------------- LATE half (ss -> mixes -> sigmoid -> sinkhorn -> comb) ----
+    if (mode != HC_TAIL_EARLY) {
     if (ss_in != 0) {
         // The ss partials came from the dots kernel, computed from the same
         // staged row with the identical per-warp grouping - only the
@@ -3801,12 +3815,14 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
     __syncthreads();
     for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
         comb[(size_t)r * hc * hc + jk] = cm[jk];
+    }   // end LATE half
+    // ---------------- EARLY half (collapse + rmsnorm + T1 fp8) ----------------
     // Collapse + rmsnorm, the body of dsv41_hc_collapse_norm_kernel. It reads the
     // `pre` of the slot the caller names for the collapse, which is NOT the one the
     // mixes just wrote: the block walks the premix slots so the attention half
     // collapses with the previous layer's coefficients. Folding it in here is what
     // makes this the whole front end in two launches.
-    if (w_norm != nullptr) {
+    if (mode != HC_TAIL_LATE && w_norm != nullptr) {
         __syncthreads();
         float* o_r = out + (size_t)r * dim;
         float s2 = 0.f;
@@ -4302,6 +4318,16 @@ static const bool g_hc_ss = [] {
     return e[0] != '0';
 }();
 
+// Dots block size for the two-launch path (hc_mix_dots_kernel). File scope so the
+// split entry and dsv41_hc_front share ONE value: a divergence between the two
+// would silently change the staged-row lane grouping and break bit-exactness.
+static const int g_hc_dots_t = [] {
+    const char* e = getenv("DSV41_HC_DOTS_T");
+    if (e == nullptr) return 128;
+    const int v = atoi(e);
+    return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 128;
+}();
+
 extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
@@ -4370,19 +4396,84 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     // A/B window. Four warps keep four times the cp.async in flight against the
     // 160 KiB row pair; the dot itself still runs in warp 0 with the identical
     // lane assignment, so every partial is bit-identical.
-    static const int dots_t = [] {
-        const char* e = getenv("DSV41_HC_DOTS_T");
-        if (e == nullptr) return 128;
-        const int v = atoi(e);
-        return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 128;
-    }();
-    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)dots_t, smem, s>>>(
+    // Block size comes from the file-scope g_hc_dots_t so the split entry stages
+    // the row with the identical lane grouping.
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, s>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
-        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc);
+        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_FULL);
+    return (int)cudaGetLastError();
+}
+
+// hc tail split entry (DSV41_HC_TAIL_SPLIT, Rust-gated). Same front end as
+// dsv41_hc_front, but the tail's LATE half runs on `side` so it overlaps the
+// projection group that consumes the EARLY half (see the split comment above
+// hc_mixes_tail_kernel). Issued sequence:
+//   main: dots -> record(fork_ev) -> tail_early(HC_TAIL_EARLY)
+//   side: wait(fork_ev) -> tail_late(HC_TAIL_LATE) -> record(join_ev)
+// The caller MUST then wait(join_ev) on the main stream before the hc_post that
+// consumes `comb`. All four stream/event ops are legal under
+// cudaStreamCaptureModeRelaxed, so a whole-step capture turns the fork/join into
+// graph edges. Bit-identical to dsv41_hc_front: both halves execute the same
+// statements, in the same order, with the same operands.
+// Returns InvalidValue (1) when the gate is off, when there is no collapse half
+// to keep (w_norm == nullptr), or when the shapes are outside the spread tables —
+// all mean "use dsv41_hc_front instead".
+extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const float* hc_scale,
+                                    const float* hc_base, const float* w_norm,
+                                    const float* pre_collapse, float* pre, float* post,
+                                    float* comb, float* out, int rows, int hc, int dim,
+                                    int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
+                                    float* xsc, cudaStream_t s, cudaStream_t side,
+                                    cudaEvent_t fork_ev, cudaEvent_t join_ev) {
+    if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
+        pre == nullptr || post == nullptr || comb == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (side == nullptr || fork_ev == nullptr || join_ev == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    if (!g_hc_front) return (int)cudaErrorInvalidValue;   // caller keeps the old path
+    if (rows > DSV41_HC_SPREAD_MAXR) return (int)cudaErrorInvalidValue;
+    if ((w_norm == nullptr) != (pre_collapse == nullptr)) return (int)cudaErrorInvalidValue;
+    // The split only pays when there IS an EARLY half to leave on the critical
+    // path; without a collapse the caller uses dsv41_hc_front.
+    if (w_norm == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
+    const int mix = hc * (2 + hc);
+    if (mix > 64) return (int)cudaErrorInvalidValue;
+    const int hc_dim = hc * dim;
+    const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
+    {
+        cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) {
+            (void)cudaGetLastError();
+            return (int)e;
+        }
+    }
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, s>>>(
+        x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    // fork: the side stream may not start before g_hc_part is published
+    e = cudaEventRecord(fork_ev, s);
+    if (e != cudaSuccess) return (int)e;
+    e = cudaStreamWaitEvent(side, fork_ev, 0);
+    if (e != cudaSuccess) return (int)e;
+    // LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb)
+    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
+        x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
+        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    e = cudaEventRecord(join_ev, side);
+    if (e != cudaSuccess) return (int)e;
+    // EARLY half on the main stream (collapse + rmsnorm + T1 fp8)
+    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
+        x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
     return (int)cudaGetLastError();
 }
 

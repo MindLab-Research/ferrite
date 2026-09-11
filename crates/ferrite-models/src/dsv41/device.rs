@@ -407,6 +407,21 @@ struct Kernels {
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
         ) -> c_int,
     >,
+    /// hc TAIL SPLIT (`DSV41_HC_TAIL_SPLIT`, default ON): same front end as
+    /// `hc_front`, but the tail's LATE half (ss/sigmoid/sinkhorn/comb) is issued
+    /// on a side stream so it overlaps the projection group that consumes the
+    /// EARLY half (collapse/rmsnorm/fp8). The caller waits the join event before
+    /// the hc_post that consumes `comb`. Optional: a stale `.so` falls back to the
+    /// single-launch `hc_front`.
+    hc_front_split: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, *const f32, *const f32,
+            *const f32, *const f32,
+            *mut f32, *mut f32, *mut f32, *mut f32,
+            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
+            CuStream, CuStream, *mut c_void, *mut c_void,
+        ) -> c_int,
+    >,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -490,6 +505,10 @@ pub struct Device {
     /// Cached stream handle — the kernel wrappers submit here
     /// (identical to `rt.stream()`).
     stream: CuStream,
+    /// Set when `hc_front_split` issued a tail LATE half whose `join_event` the
+    /// main stream has not yet waited. `hc_tail_join` consumes it. Interior
+    /// mutability because every kernel wrapper takes `&self`.
+    hc_split_armed: std::cell::Cell<bool>,
 }
 
 impl Device {
@@ -567,6 +586,7 @@ impl Device {
             hc_front: km!(rt, "dsv41_hc_front"),
             hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
             hc_front_persist_mb: ko!(rt, "dsv41_hc_front_persist_mb"),
+            hc_front_split: ko!(rt, "dsv41_hc_front_split"),
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
@@ -574,7 +594,7 @@ impl Device {
             p2p_ar_pubred_v5: ko!(rt, "ferrite_p2p_ar_pubred_v5"),
             p2p_ar_v5_hcpost: ko!(rt, "ferrite_p2p_ar_v5_hcpost"),
         };
-        Ok(Device { rt, kernels, stream })
+        Ok(Device { rt, kernels, stream, hc_split_armed: std::cell::Cell::new(false) })
     }
 
     // ------------------------------------------- shared device primitives
@@ -2583,6 +2603,99 @@ impl Device {
         }
         self.kerr(rc, "dsv41_hc_front")?;
         Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the tail-split entry
+    /// (`dsv41_hc_front_split`) AND the runtime owns a side stream + the two
+    /// fork/join events. A stale `.so`, or a cudart without the event primitives,
+    /// reports false and the caller keeps the single-launch `hc_front`.
+    pub fn supports_hc_tail_split(&self) -> bool {
+        self.kernels.hc_front_split.is_some()
+            && !self.rt.side_stream().is_null()
+            && !self.rt.fork_event().is_null()
+            && !self.rt.join_event().is_null()
+    }
+
+    /// hc tail split front end (`DSV41_HC_TAIL_SPLIT`): the dots and the EARLY
+    /// tail half (collapse + rmsnorm + T1 fp8, writing `out`/`xq`/`xsc`) stay on
+    /// the main stream, while the LATE half (ss + sigmoid + sinkhorn + comb,
+    /// writing `pre`/`post`/`comb`) runs on the side stream so it overlaps the
+    /// projection group that consumes `out`. Returns Ok(true) when it ran — the
+    /// caller MUST then call [`Self::hc_tail_join`] before the hc_post that reads
+    /// `comb`. Ok(false) means "fall back to hc_front / hc_mixes".
+    ///
+    /// Same ABI as `hc_front` plus (side stream, fork event, join event), which
+    /// the C++ launcher records/waits internally. The split is bit-identical to
+    /// `hc_front`: both halves execute the same statements with the same operands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_front_split(
+        &self,
+        x: *const f32,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        w_norm: *const f32,
+        pre_collapse: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        eps_norm: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.hc_front_split, "dsv41_hc_front_split")?;
+        let rc = unsafe {
+            f(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                w_norm,
+                pre_collapse,
+                pre,
+                post,
+                comb,
+                out,
+                rows,
+                hc,
+                dim,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+                self.stream,
+                self.rt.side_stream(),
+                self.rt.fork_event(),
+                self.rt.join_event(),
+            )
+        };
+        // InvalidValue (1) = gate off / no collapse half / shape outside the
+        // spread tables → the caller keeps the two-launch path.
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_hc_front_split")?;
+        self.hc_split_armed.set(true);
+        Ok(true)
+    }
+
+    /// Join the side stream issued by [`Self::hc_front_split`] back onto the main
+    /// stream. Must run BEFORE the hc_post that consumes `comb`. A no-op when no
+    /// split is pending, so both hc_post sites can call it unconditionally — a
+    /// wait on an event that was never recorded is an illegal capture op, which
+    /// is exactly what the `armed` flag prevents.
+    pub fn hc_tail_join(&self) -> Result<()> {
+        if self.hc_split_armed.replace(false) {
+            self.rt.stream_wait_event(self.stream, self.rt.join_event())?;
+        }
+        Ok(())
     }
 
     /// True when the loaded `.so` carries the Stage-C persistent prototype
