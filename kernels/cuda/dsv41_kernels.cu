@@ -2611,7 +2611,7 @@ static inline size_t dsv41_gemv_a32_bytes(int k) {
 // prologue writes s_a and the decode still reads it) and passes norm_fuse=true.
 // MUST stay in lockstep with the kernel's `a32_direct` / `s_ws` computation.
 static inline size_t dsv41_gemv_sa_bytes(int k, bool norm_fuse) {
-    return (g_gemv_a32 && !norm_fuse) ? (size_t)0 : (size_t)k;
+    return (g_gemv_a32 && !norm_fuse && !g_gemv_a32_staged) ? (size_t)0 : (size_t)k;
 }
 
 // Rows per gemv block, shared by the single-family and the two-family launchers.
@@ -2672,6 +2672,74 @@ static inline int dsv41_gemv_warps_for(int n) {
     if (g_gemv_warps_adaptive && n >= kGemvWarpsBigN) return kGemvWarpsBig;
     return g_gemv_warps;
 }
+
+// P1 staged gate (DSV41_GEMV_A32_STAGED), default OFF = the P1 direct form.
+//
+// P1 (a32 dead-slot elimination) merges the two mode-4 activation passes into
+// one: global uint4 -> LUT decode -> straight into `s_af`, so the k-byte `s_a`
+// intermediate is never allocated (smem 48512 -> 43392 B at k=5120/warps=4 ->
+// 5 blocks/SM instead of 4). "=1" puts the intermediate back:
+//
+//     global -> s_a (uint4 copy) -> s_lut[s_a[i]] * s_as[i>>5] -> s_af
+//
+// which is the A/B arm and the rollback if the fused pass turns out to increase
+// global traffic (the staged copy acted as a per-block cache of the activation
+// row). The 2026-09-12 A/B measured the two arms as IDENTICAL (6.84ms / 146.2
+// tok/s), so the direct form stays the default.
+//
+// LAYOUT COUPLING -- the gate is read by BOTH sides or the two disagree:
+//   * the kernel turns it into `a32_direct = false`, which allocates the `s_a`
+//     slot and shifts `s_ws`/`s_as`/`s_lut`/`s_af`/`s_rows` past it;
+//   * the launchers must reserve the same k bytes (dsv41_gemv_sa_bytes below).
+// Getting one side only = every pointer after the missing slot is short by k
+// bytes. Do NOT re-add a second gate without threading it through both.
+static const bool g_gemv_a32_staged = [] {
+    const char* e = getenv("DSV41_GEMV_A32_STAGED");
+    if (e == nullptr) return false;
+    return atoi(e) != 0;
+}();
+
+// P3 (gemm-prologue-overlap, 2026-09-11/12): cp.async WEIGHT-FIRST prologue,
+// default ON. "=0" restores the issue-after-barrier ordering (A/B + rollback).
+//
+// WHAT IT FIXES. The row loop issued the weight row's cp.asyncs AFTER the
+// block-wide prologue barrier, so the row transfer sat on the critical path in
+// front of the dot: issue -> commit -> wait_all -> consume. Nothing in the loop
+// covers it (the only other work there is the scale-byte staging). The
+// block-level activation staging and the barrier behind it are good cover, and
+// the weight row does NOT depend on any of it -- `w` / `w_scale` are model
+// constants, everything the prologue computes is `a`-side. So the ISSUE moves
+// above the staging: [cp.async weight row] -> [activation staging/LUT/a32] ->
+// barriers -> [wait_all] -> [dot]. Same slot, same bytes, same consume order, so
+// the result stays bit-identical.
+//
+// NO EXTRA SHARED MEMORY. The prefetch lands in the SAME per-warp row slot the
+// loop would have staged into (`s_w + warp*k`), so gsmem is unchanged and the
+// 5-blocks/SM occupancy of the P1 layout is preserved. A separate double-buffer
+// slot would have cost another warps*k bytes (48512 B at warps=4 -> 4
+// blocks/SM): it would have paid for the overlap with residency, which is the
+// trap the gemm-prologue-overlap analysis flagged for the double-buffered
+// variant. Consequently the scale row (`s_ws`) is deliberately NOT prefetched --
+// it is a handful of byte loads, it already overlaps the weight transfer inside
+// the loop, and moving it above the barrier would put a synchronous stall in
+// front of the barrier that every warp has to reach.
+//
+// IT SITS AFTER cudaGridDependencySynchronize() ON PURPOSE. `w` can be written by
+// the previous node on the stream, and under PDL that producer may still be
+// running when this grid starts, so an early read would be a race -- the
+// prefetch therefore lives below the opening sync with every other
+// producer-output read, and is a REORDERING of the loop's own staging rather
+// than a new early read.
+//
+// SCOPE. Only the first row of each warp's strided walk gets prefetched (the one
+// that is live whenever gridDim.x*nwarps >= n, i.e. every production shape); the
+// loop recognises it by `row == pf_row` and skips its own staging for that
+// iteration, keeping the old sequence for the rest.
+static const bool g_gemv_cpasync = [] {
+    const char* e = getenv("DSV41_GEMV_CPASYNC");
+    if (e == nullptr) return true;
+    return atoi(e) != 0;
+}();
 
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
@@ -2847,6 +2915,17 @@ struct GemvCore {
     // decode+scale into the consume loop. The launcher's `scale_bytes` MUST
     // reserve dsv41_gemv_a32_bytes(k) to match, and `s_rows` follows it.
     int a32 = 0;
+    // P1 staged gate (DSV41_GEMV_A32_STAGED, see g_gemv_a32_staged): 1 puts the
+    // k-byte `s_a` intermediate back in front of `s_af`. The launcher MUST then
+    // reserve it too (dsv41_gemv_sa_bytes), or every pointer after the missing
+    // slot is short by k bytes.
+    int a32_staged = 0;
+    // P3 (DSV41_GEMV_CPASYNC, see g_gemv_cpasync): 1 moves the row loop's
+    // weight-row cp.async ISSUE above the block prologue, so the transfer
+    // overlaps the activation staging / LUT / a32 materialisation and the dot
+    // only waits for what is left. 0 keeps the issue-after-barrier order. The
+    // prefetch reuses the per-warp `s_w` row slot, so smem does not change.
+    int cpasync = 0;
     // --- second family: rows [n1, n1+n2) of the SAME activation -------------
     // A single-family launch passes n1 == n and leaves the family-2 pointers
     // untouched (null), so every row maps to family 1 and the behaviour is
@@ -3029,6 +3108,8 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     int k = gc.k;
     int vec = gc.vec;
     int a32 = gc.a32;
+    int a32_staged = gc.a32_staged;   // P1 staged gate (see g_gemv_a32_staged)
+    int cpasync = gc.cpasync;         // P3 cp.async weight-first prologue
     const uint8_t* __restrict__ w2 = gc.w2;
     const uint8_t* __restrict__ w2_scale = gc.w2_scale;
     const float* __restrict__ bias2 = gc.bias2;
@@ -3125,7 +3206,7 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // (that A/B arm reads `s_lut[s_a[j]] * s_as[j>>5]` inline in the consume
     // loop). The launchers mirror this with dsv41_gemv_sa_bytes().
     const bool a32_direct = (a32 != 0) && (vec == 4) && (qr_raw == nullptr)
-            && !dsv41_gemv_a32_staged();  // P1 gate: =1 falls back to staged (s_a intermediate)
+            && !a32_staged;  // P1 gate: =1 falls back to staged (s_a intermediate)
     uint8_t* s_ws = s_a + (size_t)((vec == 4 && !a32_direct) ? k : 0);
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     // The e4m3 decode as a 256-entry shared-memory table. The bit-manipulation
@@ -3155,6 +3236,37 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // B1 row stage's place instead (launchers drop the same k floats - see
     // dsv41_gemv_a32_bytes).
     float* s_rows = a32 ? (s_af + k) : (s_lut + 256);
+    // -----------------------------------------------------------------------
+    // P3 (DSV41_GEMV_CPASYNC): cp.async WEIGHT-FIRST prologue. See
+    // g_gemv_cpasync above for the full reasoning; the short version is that the
+    // row loop's weight transfer used to start only after the block barrier
+    // below, leaving nothing to hide its latency, while the weight row depends
+    // on none of the activation work that fills that barrier. So issue it here,
+    // let the staging below run underneath it, and let loop iteration 0 only
+    // WAIT for it (it recognises the row by `row == pf_row`).
+    //
+    // The traffic is identical to what the loop was already doing (same bytes,
+    // same slot) -- the only difference is WHEN the instruction is issued. It is
+    // issued after cudaGridDependencySynchronize(), like every other read of a
+    // producer's output, because `w` can be written by the previous node.
+    int pf_row = ((cpasync != 0) && (vec >= 3)) ? (blockIdx.x * nwarps + warp) : -1;
+    if (pf_row >= n) pf_row = -1;   // the last block's tail warps have no row
+    if (pf_row >= 0) {
+        // Family/pointer select copied from the row loop verbatim: a family-2
+        // row reads w2 / w2_scale, rows below n1 read w / w_scale. Drifting from
+        // the loop here would silently stage the WRONG row (no crash, wrong dot).
+        const uint8_t* pf_w;
+        if (pf_row < n1) pf_w = w + (size_t)pf_row * k;
+        else             pf_w = w2 + (size_t)(pf_row - n1) * k;
+        uint8_t* pf_s = s_w + (size_t)warp * (size_t)k;
+        const int n16p = k >> 4;
+        for (int i = lane; i < n16p; i += 32) dsv41_cp_async16(pf_s + (i << 4), pf_w + (i << 4));
+        dsv41_cp_commit();
+        // k % 16 tail: unreachable for every launcher (all of them reject
+        // k & 31), kept so the prefetched row is staged by exactly the rule the
+        // loop uses. A hole here would be a partially-staged row, not a crash.
+        for (int i = (n16p << 4) + lane; i < k; i += 32) pf_s[i] = pf_w[i];
+    }
     // NORM_FUSE prologue (see dsv41_gemm_fp8_mx_rope_norm). With `qr_raw`
     // non-null this block owns the activation's fp8 production: it reduces the
     // f32 row, applies the norm weight and encodes the scaled values into
@@ -3312,10 +3424,18 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             // of garbage. Count sixteen-byte units, and cover a k that is not a
             // multiple of sixteen with a byte tail.
             const int n16 = k >> 4;
+            // P3: the prologue already staged THIS row (and committed its group)
+            // when this is the warp's first row -- the common case, since every
+            // production shape launches at least one warp per row. In that case
+            // the issue below is skipped and only the wait at the end is needed;
+            // the wait_all retires the prologue's group either way.
+            const bool prefetched = (row == pf_row);
             // Stage the weight row with cp.async (the correct baseline path).
-            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
-            for (int i = lane; i < n16; i += 32)
-                dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            if (!prefetched) {
+                for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+                for (int i = lane; i < n16; i += 32)
+                    dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            }
             // Stage this row's ue8m0 scale bytes too: they are one global load per
             // kb in the consume loop, and that load is exactly the latency the loop
             // stalls on (constant-scales measured 21-34 percent faster).
@@ -3325,9 +3445,15 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             // multiple of 16. It is 72 for the shared expert (inter 2304) and 40
             // for q_lora (1280), and cp.async16 there faults with err 716
             // (misaligned address), which surfaces on the NEXT checked launch
-            // (measured: a sticky error reported by dsv41_route_topk). The weight
-            // cp.asyncs are issued first, so these loads overlap their latency.
+            // (measured: a sticky error reported by dsv41_route_topk). On the
+            // non-prefetched iterations the weight cp.asyncs are issued first, so
+            // these loads overlap their latency; on the P3-prefetched iteration
+            // they are instead the last global reads before the dot, which is the
+            // price of moving the (much larger) weight transfer above the barrier.
             for (int i = lane; i < nb_k; i += 32) row_sc[i] = wsr[i];
+            // Unconditional on purpose: on the prefetched iteration this commits
+            // an EMPTY group (a no-op) after the prologue's group was already
+            // committed, and wait_all below retires both.
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
@@ -3559,6 +3685,8 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         gc.bias = bias; gc.out = out;
         gc.n = n; gc.k = k;
         gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+        gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+        gc.cpasync = (g_gemv_cpasync ? 1 : 0);
         gc.n1 = n;                     // single family: every row is family 1
         GemvEpi ge{};
         ge.staging_tbl = staging_tbl; ge.epoch = epoch;
@@ -3643,6 +3771,8 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
     gc.bias = bias; gc.out = out;
     gc.n = n; gc.k = k;
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+    gc.cpasync = (g_gemv_cpasync ? 1 : 0);
     gc.n1 = n;                     // single family
     GemvRope gr{};
     gr.rope_cos = rope_cos; gr.rope_sin = rope_sin; gr.rope_base = rope_base;
@@ -3797,6 +3927,8 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
     gc.bias = bias1; gc.out = out1;
     gc.n = n; gc.k = k;
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+    gc.cpasync = (g_gemv_cpasync ? 1 : 0);
     gc.w2 = w2; gc.w2_scale = w2_scale;
     gc.bias2 = bias2; gc.out2 = out2;
     gc.n1 = n1;
@@ -3861,6 +3993,8 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     gc.bias = bias; gc.out = out;
     gc.n = n; gc.k = k;
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+    gc.cpasync = (g_gemv_cpasync ? 1 : 0);
     gc.n1 = n;                     // single family
     GemvEpi ge{};
     ge.epi_add = 1;                // A5: out[row] += acc + bias
@@ -3943,6 +4077,8 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     gc.bias = bias; gc.out = out;
     gc.n = n; gc.k = k;
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+    gc.cpasync = (g_gemv_cpasync ? 1 : 0);
     gc.n1 = n;                     // single family
     GemvFusion gf{};
     gf.a_f32 = a_f32;              // raw f32 activation, no fp8 round trip
@@ -4164,6 +4300,8 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     gc.bias = bias1; gc.out = out1;
     gc.n = n; gc.k = k;
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+    gc.cpasync = (g_gemv_cpasync ? 1 : 0);
     gc.w2 = w2; gc.w2_scale = w2_scale;
     gc.bias2 = bias2; gc.out2 = out2;
     gc.n1 = n1;

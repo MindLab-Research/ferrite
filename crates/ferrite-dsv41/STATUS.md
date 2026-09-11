@@ -6860,3 +6860,27 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 和 HC_TAIL_PRIO 降 default 的影响。P1 保持默认 ON（direct，smem 更少 → 更多 blocks/SM 的潜力）。
 
 **当前 HC_TAIL_PRIO greatest A/B 正在跑**——如果 greatest 更快，说明 C 的 PRIO 降 default 是错误。
+
+### gemm-ctx-resident 分析结论（2026-09-12 01:10）
+
+**mx3 不可行**：wq_a+wkv 和 sh_w13 的输入不同（attn_xn vs ffn_xn，被 AR#1 隔开）——
+"s.xn 同名≠同值"，依赖图有硬边界。
+
+**3 条链式对可做 grid-sync 两段核**（−0.4~0.6ms）：
+| 对 | 当前 | 合并后 | 省 |
+|---|---|---|---|
+| wq_a→qnorm→wq_b | 2 launch | 1 两段核 | 40/步 |
+| w1w3→swiglu→w2 | 2 launch | 1 两段核 | 40/步 |
+| wo_a→wo_b | 2 launch | 1 两段核 | 40/步 |
+
+原子 barrier + __threadfence（非 cooperative launch → 图捕获安全）。
+**wo_a→wo_b 正在实施中（chain-pair-grid-sync）**。
+
+**cp.async 权重先行**（cpasync-weights-first 实施中，−0.57ms 预期）：
+- 重排 prologue：cp.async 发射权重读（不依赖激活）→ 激活 staging/LUT/a32 → wait → dot
+- 预期 prologue 从 7.3µs → 5µs
+
+**warps8 自适应**（已提交，n≥2048 → warps=8 → block 数减半 → prologue 摊薄）
+
+**全部落地预期**：6.84 − 0.57 (cp.async) − 0.14 (EARLY 恢复) − 0.4~0.6 (链式对) = **5.7-5.7ms ≈ 175-186 tok/s**
+加 warps8 的额外收益（未计入）→ 可能接近 200。
