@@ -1725,13 +1725,10 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // bench shows bandwidth rising with the row count (72 GB/s at 256
             // rows against 3.3 TB/s at 16160) purely because more warps keep
             // more loads in flight.
-#pragma unroll 8
+#pragma unroll 4
             for (int kb = 0; kb < nb_k; ++kb) {
-                // DIAGNOSTIC (temporary): constant scales isolate the cost of the
-                // two global scalar loads per kb (a_scale and the row's ue8m0
-                // scale byte), which the cp.async staging does NOT cover.
-                const float sb = 1.f;            // ue8m0_to_f(wsr[kb]);
-                const float sa = 1.f;            // a_scale[kb];    // m == 1
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const float sa = a_scale[kb];    // m == 1
                 const int j = kb * 32 + lane;
                 acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
             }
