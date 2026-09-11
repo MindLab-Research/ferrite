@@ -1295,7 +1295,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
                                          stream>>>(
         act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
         row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
-        w2s_base, w2s_stride, ids, g_expert_fp4_mode);
+        w2s_base, w2s_stride, ids, g_expert_fp4_mode, /*fuse_swiglu=*/0);
     return (int)cudaGetLastError();
 }
 

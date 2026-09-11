@@ -13,6 +13,50 @@
 > sparse_attn TG=4（gmask 不匹配会挂）、fp16 k-only 缓存、down 的 cp.async（每 lane 私有数据）。
 > **每次改动必须**：看 build error 数 → 同窗口 A/B → 人眼验证文本。
 
+## gemm_fp8_gemv 微基准（2026-09-11 最后一轮，隔离探针 /tmp/gp6/gprobe6..10.cu）
+
+> 底座复刻 = `kernels/cuda/dsv41_kernels.cu:1722-1931`（mode 4 / warps=4 / LUT / a32 / unroll 4），
+> smem 48384B，与 launcher 公式 `:1962-1967` 逐字节吻合。所有数字为 171-call CUDA graph、
+> k=5120、warps=4、3 次独立 graph 构建的 µs/call（重复性 ±0.01µs）。
+
+**本轮的硬结论：每调用成本不是"LDS 链"，是块级 staging 的冗余。** 用 nop 空 kernel 标定每
+kernel 的 graph 槽位只有 0.52–0.71µs（此前怀疑的 launch 开销被排除），随后逐项分解（n=1664）：
+
+| 组成 | µs/call |
+|---|---|
+| nop416（纯槽位） | 0.71 |
+| 权重行 cp.async staging | 1.18 |
+| 块级 staging（激活+LUT+a32） | **2.85** |
+| consume 循环 | 4.45 |
+| 合计（= b4 实测 9.31） | 9.19 |
+
+块级 2.85µs 再分解：**a32 物化 ~1.55**、激活 uint4 staging ~0.8、LUT 构建 ~0.3、a_scale ~0.1。
+它**跨 416 个 block 冗余重复**，且几乎与 n 无关（n 涨 6.5× 只涨 5%）——这才是"固定项"的真身。
+
+**两个有效杠杆（位一致性已 fingerprint 验证，且在 mode R/U 两种数据分布下都复现）**：
+
+1. **a32 物化改 4 元素向量化**（1 次 uint32 读 `s_a` + 1 次 float4 写 `s_af`）：a32 是**指令数**
+   瓶颈而非 ILP 瓶颈 —— unroll 4/8/16 全中性，手写 4 路 ILP 简单版也中性，**只有 4 元素向量化有效**
+   （−13%/−9.6%/−6.2% @n=256/1024/1664）。位运算解码（无 smem gather）反而**慢 6%** ——
+   e4m3 LUT 在 a32 构建里同样赢过位运算，与 consume 循环的结论一致。
+2. **ROW_FIRST 重排**：行 cp.async 与块级 staging 写的是**不相交的 smem 区域**，却是串行的。
+   先发行行 cp.async（权重 + scale，`nb_k%16==0` 时）再跑块级 staging，把权重行的
+   global→shared 延迟藏进块级构建：额外 −1.8%/−1.0%/−0.5%。
+   scale 行的 cp.async 需 16B 全局对齐，必须用运行时守卫 `(nb_k & 15) == 0` 回退普通字节 load
+   （即 `:1874-1880` 记的 err-716 教训，不能写成无条件）。
+
+叠加已落地的 `unroll 4`→`32`，最优组合 **rf_u32_ilp（ROW_FIRST + unroll32 + a32 向量化）**：
+**5.02 / 6.67 / 8.58 µs/call，即 −24% / −12% / −7.7%**（n=256/1024/1664）。
+
+**本轮新增的"勿再试"**（全部实测）：`__launch_bounds__(128, minBlocks)` 1/2/4/8/12
+（**零效果** —— ptxas 报底座仅 32 寄存器，离上限 512 差一个数量级，占用率 100% 由 smem 决定，
+探针实测 4 块/SM、25%）；a32 挪到显存 + prep kernel（占用率 25%→62.5%，**却慢 81%** ——
+证明瓶颈是操作数供给延迟而非占用率）；rows/warp=2（smem 69504B→3 块/SM，**慢 20%**）；
+e4m3 LUT 放 `__constant__`（**慢 6.6×**，常量缓存是广播式，权重字节在 32 lane 上随机 → 全序列化）；
+LUT 放 global 走 `__ldg`（**慢 15%**）；n=256 关掉 a32（noa32un16 5.36 < b4 6.64）在 n≥1024 反而慢 11%
+（交叉点约 n≈700，但该分支需要 launcher 按 n 派发，收益 <2% 总步时，暂不做）。
+
+
 
 ## 目标与现状
 

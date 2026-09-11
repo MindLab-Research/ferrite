@@ -76,7 +76,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 28 | `route_topk` | :1700 | score_func=2；smem **3096 B** |
 | 29 | `zero` ×2 | :1728/:1729 | memset |
 | 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32 |
-| 31 | **batched 路径（`moe_batch()` 代码默认 ON**，:188 `unwrap_or(true)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`DSV41_GATEUP_FUSE` 开时**跳过** `swiglu_limit_batched`）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 ON）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|
+| 31 | **batched 路径（`moe_batch()` 代码默认 ON**，:188 `unwrap_or(true)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`gateup_fused` 开时**跳过** `swiglu_limit_batched`；`gateup_fused = DSV41_GATEUP_FUSE!=0 && supports_gateup_fuse() && expert_fp4_mode()==2`，:2344/:2383 —— 必须与 `.cu:1268` 的 `g_fuse && g_expert_fp4_mode==2 && dim%512==0` 逐字镜像）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 ON）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|
 | 31' | sequential 回退（逐 slot ×topk）| :2433-2477 | `expert_gate_up_fp4_indirect` / `swiglu_limit` / `expert_down_fp4_indirect` |
 | 32 | 共享专家（**仅 rank 0**）| :1918-1970 | `quant1` + `gemm_fp8_mx`(w1) + `gemm_fp8_mx`(w3) + `swiglu_limit` + `quant1` + `gemm_fp8_mx`(w2) + `add_inplace` |
 | 33 | **AR#2** | `moe_reduce()` :638 | `s.o`, 20480 B |
@@ -150,6 +150,14 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 
 ## 6. 已知风险 / 待确认
 
+- **`gateup_fused` 曾与 `.cu` 融合条件不一致（已修复 2026-09-11）** ✗→✓：Rust 侧原来只判
+  `DSV41_GATEUP_FUSE` + `supports_gateup_fuse()`，漏了 `.cu:1268` 的 `g_expert_fp4_mode == 2`。
+  当 `DSV41_EXPERT_FP4_MODE=0/1` 时 kernel 写满 `2*inter` 不融合，而 host 仍按融合推进
+  `act_slot=inter` 并跳过 swiglu ⇒ **静默数据错位**（非性能问题）。现两处均加
+  `&& expert_fp4_mode() == 2`（`chain_dev.rs:2344`/`:2383`，helper 见 `:218`，OnceLock 缓存、
+  未设默认 2、非法值按 atoi 语义取 0）。
+  残留：`.cu` 还有 `(dim % 512) == 0` 这一项未镜像——`dim` 恒为 5120（`%512==0` 恒真），
+  故当前为惰性；若未来支持非 512 对齐的 dim，需一并镜像。
 - **`DSV41_MOE_BATCH` 默认值的注释与实现矛盾** ✗（注释 :173 写 DEFAULT OFF，实现 :179 是 `unwrap_or(true)` ✓）
   ⇒ 融合核按 **batched 路径为准**（代码为准 ✓），并顺手修正注释 ✓。
 - **`DSV41_GRAPH_MOE` 是死路径** ✗（`moe_graph_armed` 全仓无赋值点 ✓）⇒ 其注释/字段应清理 ✓；

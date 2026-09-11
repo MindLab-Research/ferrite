@@ -202,6 +202,28 @@ fn down_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Mirrors the CUDA launcher's `g_expert_fp4_mode` (dsv41_experts_mxf4.cu:694):
+/// unset => 2 (the shared-lut + split-accumulator path), else the parsed value
+/// (0 scalar / 1 vectorised, kept for bisection). `atoi` semantics on a
+/// malformed value => 0.
+///
+/// This matters because the batched gate/up launcher only fuses gate_up+swiglu
+/// when `g_fuse && g_expert_fp4_mode == 2 && dim % 512 == 0`
+/// (dsv41_experts_mxf4.cu:1268). The host must test the SAME mode before it
+/// assumes the fused inter-width layout: at mode 0/1 the kernel writes the
+/// full 2*inter (gate|up), so a host that still believes "fused" advances
+/// act_slot by `inter` and skips the separate swiglu launch -> silent data
+/// misalignment, not a perf difference. Read ONCE and cached like the other
+/// gates (per-call getenv is a hot-path slip).
+fn expert_fp4_mode() -> i32 {
+    static M: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_FP4_MODE")
+            .map(|v| v.parse::<i32>().unwrap_or(0))
+            .unwrap_or(2)
+    })
+}
+
 /// DSV41_NR_FUSE=0 reverts the kv chain to the two-launch rmsnorm + rope pair.
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2322,7 +2344,8 @@ fn fuse_b1() -> bool {
                 let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
                     .map(|v| v != "0")
                     .unwrap_or(true)
-                    && self.dev.supports_gateup_fuse();
+                    && self.dev.supports_gateup_fuse()
+                    && expert_fp4_mode() == 2;
                 let act_slot = if gateup_fused {
                     inter_local as i64
                 } else {
@@ -2360,7 +2383,8 @@ fn fuse_b1() -> bool {
                 let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
                     .map(|v| v != "0")
                     .unwrap_or(true)
-                    && self.dev.supports_gateup_fuse();
+                    && self.dev.supports_gateup_fuse()
+                    && expert_fp4_mode() == 2;
                 if !gateup_fused {
                     self.dev.swiglu_limit_batched(
                         self.s.ex_act_b.ptr as *mut f32,
