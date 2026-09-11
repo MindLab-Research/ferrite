@@ -1955,8 +1955,12 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     const int n = n1 + n2;
     const int warps = g_gemv_warps;
     const int blocks = (n + warps - 1) / warps;
-    const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k
-                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float);
+    const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;
     if (gsmem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(
