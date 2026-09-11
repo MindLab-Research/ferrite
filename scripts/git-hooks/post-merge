@@ -1,0 +1,28 @@
+#!/usr/bin/env sh
+# ferrite post-merge hook — drop the previous revision's kernel artifacts.
+#
+# Same rationale as scripts/git-hooks/post-checkout: the .so (gitignored) and
+# .build_id (untracked) survive a `git pull`, so after a merge that changed the
+# .cu sources the tree would hold a stale .so. Deleting both forces a same-source
+# rebuild. Modern `git pull` runs post-merge, not post-checkout, hence this file.
+#
+# Installed by: bash scripts/install_git_hooks.sh
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+K="$ROOT/kernels/cuda"
+[ -d "$K" ] || exit 0
+
+removed=""
+for f in libferrite_kernels.so .build_id; do
+    if [ -e "$K/$f" ]; then
+        rm -f "$K/$f"
+        removed="$removed $f"
+    fi
+done
+
+if [ -n "$removed" ]; then
+    echo "[ferrite post-merge] removed stale kernel artifact(s):$removed" >&2
+    echo "[ferrite post-merge] rebuild BOTH from this revision before any measurement:" >&2
+    echo "    cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release" >&2
+fi
+exit 0

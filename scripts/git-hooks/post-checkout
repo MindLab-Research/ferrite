@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+# ferrite post-checkout hook — drop the previous revision's kernel artifacts.
+#
+# WHY: kernels/cuda/libferrite_kernels.so is gitignored (*.so) and .build_id is
+# untracked, so `git checkout <rev>` / `git reset --hard` do NOT touch them. The
+# tree then holds a .so built from revision A while the sources are revision B,
+# and — because cargo is incremental and build.rs only re-ran if .build_id
+# changed — a plain `cargo build --release` could relink a stale stamp and
+# produce a pair that only the runtime gate catches after a full model load.
+#
+# Deleting both forces the next build to regenerate them together, which is the
+# only way to get a same-source pair:
+#     cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release
+# (the compile-time gate in crates/ferrite-kernel/build.rs makes a release build
+#  fail-closed until that has happened, so this hook cannot be silently skipped).
+#
+# Installed by: bash scripts/install_git_hooks.sh
+# Args (post-checkout): $1=prev HEAD  $2=new HEAD  $3=1 branch checkout, 0 file
+# checkout. We act on both: even a file-level checkout of a .cu makes the .so
+# stale.
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+K="$ROOT/kernels/cuda"
+[ -d "$K" ] || exit 0
+
+removed=""
+for f in libferrite_kernels.so .build_id; do
+    if [ -e "$K/$f" ]; then
+        rm -f "$K/$f"
+        removed="$removed $f"
+    fi
+done
+
+if [ -n "$removed" ]; then
+    echo "[ferrite post-checkout] removed stale kernel artifact(s):$removed" >&2
+    echo "[ferrite post-checkout] rebuild BOTH from this revision before any measurement:" >&2
+    echo "    cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release" >&2
+fi
+exit 0

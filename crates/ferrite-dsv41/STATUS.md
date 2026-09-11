@@ -6686,3 +6686,22 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 - so-version-guarantee subagent 正在实施多层防线
 - 已有：build_id + ABI version + serve_ab 前置检查 + recovery script 构建顺序
 - 待加：cargo build.rs 编译期防陈旧 + dsv41-run 启动时 /proc/self/maps 唯一性检查
+
+### 🎉 2026-09-11 23:30：serve 全量验证成功——6.90ms / 144.9 tok/s
+
+| 项目 | 结果 |
+|---|---|
+| **serve p50** | **6.90ms → 144.9 tok/s**（p10=6.81, p90=6.99, 98 steps） |
+| 四段文本 | 逐字正确（Paris/静夜思/1+1=2/出师表）✅ |
+| faults | 0 |
+| one-shot | 1+1=2, exit 0 ✅ |
+| .so/binary | build_id 匹配（PAIR-OK）✅ |
+
+**会话累计：13.28 → 6.90ms（+92.5%），75.3 → 144.9 tok/s（+92.4%）**
+
+**vs Round 41 基线**：8.23 → 6.90ms = **−1.33ms（−16.2%）**，121.5 → 144.9 tok/s（+19.3%）
+
+**修复链的完整代价**：r42-45 的三层根因（static smem → launch API → register oversubscription）
++ ABI 不匹配 + SIGPIPE 门禁误判——最终全部解决，serve 恢复运行且进一步加速。
+
+**距离 200 tok/s（5.0ms）还差 1.90ms**——a32 A/B 正在验证中。

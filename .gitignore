@@ -9,6 +9,10 @@ Cargo.lock.bak
 *.a
 *.cubin
 *.ptx
+# build.sh's same-source stamp. Ignored on purpose: an untracked .build_id made
+# build.sh's own `git status --porcelain` dirty-check fire on every rebuild
+# after the first, so every id carried a spurious "-dirty".
+.build_id
 
 # Python tooling (bench scripts etc.)
 __pycache__/

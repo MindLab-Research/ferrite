@@ -32,6 +32,26 @@ Read `README.md` for the design contract; this file is the operational guide: bu
    **实际生效**的那份（DT_NEEDED 加载的），与 `--lib` 那份比对；再与二进制自身的 id 比对。
 3. **`/proc/self/maps` 中 `libferrite_kernels.so` 的不同路径镜像数 >1 → 拒**。
 
+> ✅ 防线 1–3 两处实现都有：GLM serve 路径在 `cuda.rs::verify_kernel_build`，
+> DSV41/`devrt` 路径在 `devrt.rs::verify_kernel_build`（`dsv41-run` 经
+> `Device::open → DevRuntime::open`，`ferrite-models/src/dsv41/device.rs:630` 必过此门）。
+> 两者都在 dlopen 之后、首次 kernel 调用之前执行；任一不过即 `Err`，调用方不启动。
+
+**编译期防线（2026-09-11 追加，`crates/ferrite-kernel/build.rs`）**——运行期门只能拒绝
+"已经配错的**一对**"，挡不住你**生产**这一对；以下三道把错误前移到 `cargo build`：
+
+4. **半成品状态 → 编译失败**：`.so` 与 `.build_id` 必须**同时存在**；只存在其一 →
+   `cargo build` 直接 `REFUSING TO BUILD`（这是"只重编一侧"的签名）。二者都不存在时，
+   **debug**（`cargo check`）允许（嵌入 `cuNOSTAMP` 哨兵，运行期拒启），**release** 一律失败。
+5. **源码比 .so 新 → 编译失败（防陈旧）**：任一 `.cu` 的 mtime 晚于 `.so` → release 构建报错，
+   并给出唯一可用顺序 `build.sh` → `cargo build`。`build.rs` 现已 `rerun-if-changed` 全部 `.cu`，
+   所以"改了 .cu 没重编 .so"必然触发。
+   - 逃逸阀（仅 CI / 无 CUDA 机器，**绝不可用于测量**）：`FERRITE_ALLOW_NO_KERNELS=1`、
+     `FERRITE_ALLOW_STALE_KERNELS=1`；反向强制：`FERRITE_REQUIRE_KERNELS=1`（debug 也校验）。
+6. **git hook**：`scripts/git-hooks/{post-checkout,post-merge}` 在切分支 / merge 后**自动删除**
+   `.so` + `.build_id`（二者 gitignored/untracked，`git checkout` 根本不会碰）→ 被迫重编同源双产物。
+   安装：`bash scripts/install_git_hooks.sh`（**每个 clone 一次**；hooks 不在 `.git` 里，无法版本化）。
+
 **残余洞（2026-09-11 核查）**：
 - 防线 3 靠**路径字符串** `contains("libferrite_kernels.so")` 匹配 → 改名的手编 nvcc 产物
   （`/tmp/libt.so`、`/tmp/probe*.so`、`/tmp/libdsv41_all.so` … 实测均**无 build stamp**）
