@@ -1744,10 +1744,20 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                 const float sa2 = a_scale[kb + 2], sa3 = a_scale[kb + 3];
                 const uint8_t av0 = ap[j0], av1 = ap[j1], av2 = ap[j2], av3 = ap[j3];
                 const uint8_t rv0 = row_s[j0], rv1 = row_s[j1], rv2 = row_s[j2], rv3 = row_s[j3];
-                acc += e4m3_to_f(av0) * sa0 * (e4m3_to_f(rv0) * sb0);
-                acc += e4m3_to_f(av1) * sa1 * (e4m3_to_f(rv1) * sb1);
-                acc += e4m3_to_f(av2) * sa2 * (e4m3_to_f(rv2) * sb2);
-                acc += e4m3_to_f(av3) * sa3 * (e4m3_to_f(rv3) * sb3);
+                // __*_rn on every operation: with --use_fast_math the plain
+                // operators in a four-way unrolled body may be reassociated (the
+                // scalar loop's single dependency chain could not be), and the
+                // resulting drift over 40 layers degenerates the model. The
+                // explicit rounding intrinsics pin the baseline's exact
+                // (A*sa)*(B*sb) then add.
+                acc = __fadd_rn(
+                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av0), sa0), __fmul_rn(e4m3_to_f(rv0), sb0)));
+                acc = __fadd_rn(
+                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av1), sa1), __fmul_rn(e4m3_to_f(rv1), sb1)));
+                acc = __fadd_rn(
+                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av2), sa2), __fmul_rn(e4m3_to_f(rv2), sb2)));
+                acc = __fadd_rn(
+                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av3), sa3), __fmul_rn(e4m3_to_f(rv3), sb3)));
             }
             for (; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
