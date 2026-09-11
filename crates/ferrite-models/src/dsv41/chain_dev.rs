@@ -88,6 +88,12 @@ struct Scratch {
     /// quant1 (qr, o, ex_act, engram rows) is untouched - different source.
     /// Cell because quant1 takes &self (the whole lin/lin2 chain does).
     xq_of_xn_valid: std::cell::Cell<bool>,
+    /// L2+L3: set by `attention()` when the wq_b + idx_wq_b pair was computed
+    /// in ONE mx2 launch (`DSV41_IDX_FUSE`), so `indexer()` skips its own
+    /// `lin(idx_wq_b)`. Cleared after the indexer consumes it (and whenever the
+    /// fused launch declines the shape). Cell because the lin/lin2 chain takes
+    /// &self while the indexer takes &mut self.
+    idx_q_ready: std::cell::Cell<bool>,
     /// MoE scatter destination (written by the dispatch kernels; the host never
     /// reads it back, which is why rustc flags it).
     #[allow(dead_code)]
@@ -256,9 +262,27 @@ fn swiglu_q() -> bool {
 }
 
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
+/// DEFAULT OFF (round 25: 9.38 vs 9.71ms - the mixed kernel's fp8 branch,
+/// even WITH the LUT+a32 port, is a net loss against the separate path
+/// where the shared expert's mx2 already has the full optimization set).
 fn mix_gate_shared() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_IDX_FUSE=0 reverts the wq_b + idx_wq_b pair to two launches.
+///
+/// L2+L3 fusion: `wq_b` and the indexer's `idx_wq_b` read the SAME `qr` buffer
+/// (rmsnorm writes it in place; neither touches it in between), both have
+/// k = q_lora_rank, and the mx2 contract is bit-identical to the two singles
+/// (each row is still one warp in the same lane order). Only the index-source
+/// layers carry `idx_wq_b`; every other layer falls through to the single
+/// `lin(wq_b)`. Read ONCE and cached (the layer loop runs 40x/step, inside the
+/// graph-capture region) — per-call getenv is the hot-path slip the other gates
+/// already avoid.
+fn idx_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_IDX_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_HEAD_SLICE enables the vocabulary-sliced lm_head: each rank projects
@@ -514,6 +538,7 @@ impl<'a> DevChain<'a> {
             xq: dev.alloc(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))?,
             xsc: dev.alloc(fb(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter) / 32 + 8))?,
             xq_of_xn_valid: std::cell::Cell::new(false),
+            idx_q_ready: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
             post: dev.alloc(fb(hc))?,
             comb: dev.alloc(fb(hc * hc))?,
@@ -1702,8 +1727,35 @@ fn fuse_b1() -> bool {
         // index-source layers carry idx_wq_b; the other 32 fall through to the
         // single. The indexer() below skips its own lin when idx_q is already
         // computed (self.s.idx_q_ready flag).
-        let idx_fused = false;
-        if !idx_fused {
+        // DSV41_IDX_FUSE (default ON) turns this on. It is a SHAPE gate as much
+        // as an env gate: only an index-source layer carries idx_wq_b, and mx2
+        // can still decline the shape (Ok(false)) - in which case BOTH singles
+        // must run, so idx_q_ready stays false and the indexer computes its own
+        // query. The flag is written on EVERY path here (true or false), so a
+        // layer that never calls the indexer cannot leave a stale value behind.
+        let idx_fused = idx_fuse()
+            && cfg.is_index_source(layer)
+            && ld.idx_wq_b.is_some()
+            && ld.idx_wq_b_scale.is_some();
+        if idx_fused {
+            // ONE launch for both: wq_b -> s.q, idx_wq_b -> s.idx_q.
+            let fused = self.lin2(
+                self.s.qr.ptr as *const f32,
+                ql as i32,
+                ld.wq_b.as_ref().unwrap(),
+                ld.wq_b_scale.as_ref().unwrap(),
+                (nlh * hd) as i32,
+                self.s.q.ptr as *mut f32,
+                ld.idx_wq_b.as_ref().unwrap(),
+                ld.idx_wq_b_scale.as_ref().unwrap(),
+                (cfg.index_n_heads * cfg.index_head_dim) as i32,
+                self.s.idx_q.ptr as *mut f32,
+            )?;
+            self.s.idx_q_ready.set(fused);
+        } else {
+            self.s.idx_q_ready.set(false);
+        }
+        if !self.s.idx_q_ready.get() {
             self.lin(
                 self.s.qr.ptr as *const f32,
                 ql as i32,
@@ -2103,15 +2155,21 @@ fn fuse_b1() -> bool {
             idx_hd as i32,
         )?;
         } // end owns_k (key publishing only)
-        // the queries come from the q_lora stream
-        self.lin(
-            self.s.qr.ptr as *const f32,
-            ql as i32,
-            wq_b,
-            wq_b_s,
-            (idx_nh * idx_hd) as i32,
-            self.s.idx_q.ptr as *mut f32,
-        )?;
+        // the queries come from the q_lora stream. Skipped when attention()
+        // already produced s.idx_q in the SAME mx2 launch as wq_b
+        // (DSV41_IDX_FUSE); the one-shot flag is consumed here either way, so a
+        // non-index-source layer's stale value can never leak into the next step.
+        if !self.s.idx_q_ready.get() {
+            self.lin(
+                self.s.qr.ptr as *const f32,
+                ql as i32,
+                wq_b,
+                wq_b_s,
+                (idx_nh * idx_hd) as i32,
+                self.s.idx_q.ptr as *mut f32,
+            )?;
+        }
+        self.s.idx_q_ready.set(false);
         self.dev.apply_rope(
             self.s.idx_q.ptr as *mut f32,
             self.cos.as_f32(),

@@ -5377,7 +5377,9 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 |---|---|---|---|---|
 | l23（默认 + L2L3 脚手架） | **10.16ms** | **98.4** | 四段全对 | 0 |
 
-脚手架 = `idx_fused` 标志位（当前 false，真正的 lin2 接线待 subagent 补丁到达后开启）。
+脚手架 = `idx_fused` 标志位（**2026-09-11 已接线**：`chain_dev.rs` 的 `idx_fuse()` =
+`DSV41_IDX_FUSE` 环境 gate、默认 ON，配合 `Scratch::idx_q_ready` 让 indexer 跳过自己的
+`lin(idx_wq_b)`；wq_b + idx_wq_b 在 index-source 层走一次 `lin2`/`gemm_fp8_mx2`）。
 本轮的 −0.11ms 可能是噪声，也可能是代码重组的副效应。真正收益待接线后量化。
 
 **会话累计：13.28 → 10.16ms（+30.7%），75.3 → 98.4 tok/s。**
@@ -5645,3 +5647,21 @@ xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合�
 ⇒ `.cu` 未编译、未实测。落地前必须 `kernels/cuda/build.sh` 重建 `.so`（build_id 会变化，
 Rust 侧强制同源）并在 b300 上跑真实权重一致性 + nsys 差值。
 
+
+### ✅ 第 25 轮定案：MIX_GATE 翻 OFF（9.38ms / 106.6 tok/s）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| **mg0（MIX_GATE=0）** | **9.38ms** | **106.6** | 四段全对 | 0 |
+| mg1（MIX_GATE=1 对照） | 9.71ms | 103.0 | 四段全对 | 0 |
+
+**混合核融合是净亏**（−0.33ms）：它的 fp8 分支即使补了 LUT+a32，也不如分离路径
+（gate 走 gemv_bf16 12µs + shared 走 gemm_fp8_mx2 带 LUT+a32 13µs = 25µs
+vs 混合核 27-28µs + 16µs 固定成本）。已翻默认 OFF。
+
+**会话累计：13.28 → 9.38ms（+41.6%），75.3 → 106.6 tok/s。**
+
+**gemm_fp8_gemv 206 次/步的归因定案（expert-w2-206）**：
+40×4（attention）+ 40（shared w2）+ 4（idx_wq_b）+ 2（engram）= 206。
++35 vs 旧口径 171 = **SHARED_TP 切分效应**（w2 从 rank0 独占 5 次均值变为 8 rank 全跑 40 次），
+非冗余——同一份工作重分布，关键路径反而 −1.43ms。
