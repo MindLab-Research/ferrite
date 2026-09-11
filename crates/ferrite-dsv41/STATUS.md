@@ -7456,3 +7456,21 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 3. Rust FFI 同步（tp.rs/device.rs）
 
 **未归因的 0.33ms 教训**：即使是 gated-off 的死代码，kernel 签名变化和指令布局也可能影响性能（I-cache、参数传递、代码布局）。失败实验的代码应该在验证失败后立即清理，而不是留在树里。
+
+### fold-correctness-audit 定案：quant-fold gate 缺陷解释 v13 全部回归（2026-09-12 10:00）
+
+**审计发现（三个 fold 逐一）**：
+| fold | FFI | gate | 位一致 | 判定 |
+|---|---|---|---|---|
+| quant-fold | ✓ | **✗ 缺陷** | ✓ | gate=0 时 layer() 仍传非空 xq4（chain_dev.rs:2567），kernel 只看 xq4!=nullptr（:6971）——**fp4 直出照做** |
+| swiglu-fold | ✓ | ✓ 真回退 | ✓ | PASS（新符号可探测）|
+| ar-stamp-fold | ✓ | ✓ | — | FFI/gate PASS，功能已知失效 |
+
+**v13 回归之谜解开**：
+- v13/v13nq（6.60-6.63ms）≈ v12（folds ON，6.59ms）——因为 quant-fold 的 gate 缺陷使 fold **一直生效**！
+- "+0.33ms 未归因" = gate 缺陷（fp4 工作在 EARLY 里做了）+ swiglu-fold 正确回退
+- "代码存在性"假设错误——是 gate 缺陷
+
+**跨切面风险**：quant-fold 和 ar-stamp-fold 改动了既有符号的 ABI（中间插参数）——旧 .so + 新 Rust = 709（与 gate 无关）。建议 ABI 版本符号。
+
+**处置**：hc-fold-cleanup（进行中）将彻底删除 fold 代码——修复 gate 缺陷 + 消除 ABI 风险。
