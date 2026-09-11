@@ -40,27 +40,41 @@ if pgrep -x dsv41-run >/dev/null 2>&1; then
   exit 1
 fi
 
+# Both pins are load-bearing and must stay: with the graph on, ar_v5 is forced on (a host
+# barrier is not a CUDA call and cannot be captured), and the v5 publish spin under nsys's
+# per-node graph tracing is a documented 300x pathology - 240 s for 69 steps. The per-kernel
+# costs are identical in both modes, so this is the only usable attribution configuration;
+# subtract ~1500-2000 launches x (3.05 us standalone - 0.2 us in-graph) to read the graph-on
+# step.
+#
+# NOTE (2026-09-11): these comments used to sit INSIDE the backslash-continued command below.
+# A comment line has no trailing backslash, so it terminated the command: what actually ran
+# was `env VAR=0 VAR2=0` (which merely prints the environment - that env dump was the tell)
+# and the binary then ran as a separate command with no nsys around it. nsys profiled `env`,
+# so every report had zero CUDA kernels and the CSV was empty. Comments stay outside the
+# continuation. Also: never swallow the stats stderr - that is what hid this for hours - and
+# fail loudly on an empty CSV, because a zero-row diff silently prints "0.0 ms".
 prof() { # $1 = max_tokens, $2 = output tag
   echo "== profiling max_tokens=$1 -> $OUT/$2 =="
   timeout -s KILL 900 "$NSYS" profile --trace=cuda --cuda-graph-trace=node --sample=none \
     -o "$OUT/$2" --force-overwrite=true \
     env CUDA_VISIBLE_DEVICES="$GPUS" DSV41_MODEL_DIR="$MODEL_DIR" DSV41_KERNELS="$KERNELS" \
     DSV41_AR_V5=0 DSV41_GRAPH_STEP=0 \
-    # Both pins are load-bearing and must stay: with the graph on, ar_v5 is forced on
-    # (a host barrier is not a CUDA call and cannot be captured), and the v5 publish
-    # spin under nsys's per-node graph tracing is a documented 300x pathology - 240 s
-    # for 69 steps. The per-kernel costs are identical in both modes, so this is the
-    # only usable attribution configuration; subtract ~1500-2000 launches x
-    # (3.05 us standalone - 0.2 us in-graph) to read the graph-on step. \
-
     "$BIN" --prompt "$PROMPT" --max-tokens "$1" --tp 8 >"$OUT/$2.log" 2>&1 || true
   grep -E "DECODE|\[dsv41\] step" "$OUT/$2.log" | tail -3 || true
   # CSV, never the table (kernel names contain spaces)
-  "$NSYS" stats --report cuda_gpu_kern_sum --format csv "$OUT/$2.nsys-rep" 2>/dev/null \
+  "$NSYS" stats --report cuda_gpu_kern_sum --format csv "$OUT/$2.nsys-rep" \
     | tail -n +2 >"$OUT/$2.csv"
+  local rows; rows=$(wc -l <"$OUT/$2.csv")
+  echo "   [$2] $rows kernel rows"
+  if [ "$rows" -lt 5 ]; then
+    echo "FATAL: $OUT/$2.csv has $rows rows - the profile did not capture the binary." >&2
+    echo "       did the binary actually run? see $OUT/$2.log (last lines):" >&2
+    tail -5 "$OUT/$2.log" >&2
+    exit 1
+  fi
 }
 
-prof 1 "$OUT/one.csv.tag" 2>/dev/null || true
 prof 1 one
 prof "$N" many
 

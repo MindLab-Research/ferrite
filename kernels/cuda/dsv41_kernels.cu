@@ -790,6 +790,23 @@ __global__ void moe_route_kernel(const float* __restrict__ x, const uint8_t* __r
 // then top-`cols` with the golden's stable tie rule (equal scores keep the
 // lower position), the picked positions re-sorted ascending, and `p + offset`
 // written for reachable positions / -1 otherwise.
+//
+// The candidates are visited in fixed-size CHUNKS (kIndexerChunk), so the dynamic
+// shared memory is a function of compile-time constants only - never of the
+// candidate count. That count is a PER-STEP value and a CUDA graph capture freezes
+// the launch (its arguments AND the launcher's shared-memory size), so a score
+// array sized from it either degraded silently or indexed past a smaller
+// allocation on every replay. Each chunk's own stable top-k is merged into a
+// running top-`cols` set, which leaves the scan bound free to be the live device
+// counter for any value.
+constexpr int kIndexerChunk = 4096;  // candidates per chunk (shared memory is sized from this)
+
+// Selection key: higher score first, and on an EQUAL score the lower position
+// first (the golden's stable rule). Returns true when (av, ap) is the worse key.
+__device__ __forceinline__ bool idx_key_worse(float av, int ap, float bv, int bp) {
+    return (av < bv) || (av == bv && ap > bp);
+}
+
 __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __restrict__ ik,
                                     const float* __restrict__ w, const uint8_t* __restrict__ cand,
                                     const int32_t* __restrict__ lens, int32_t* __restrict__ out,
@@ -801,109 +818,158 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     // retrieval would silently degrade as the generation grows. The device counter
     // is already passed in as `lens`; prefer it whenever it is available and
     // non-zero (falling back keeps the pre-prefill / uninitialised case working).
-    // It is CLAMPED to the argument: the launcher sizes its dynamic shared memory
-    // from that same argument, which is a per-layer CONSTANT (idx_cap in chain_dev.rs)
-    // precisely because a capture freezes it. Without the clamp a replay would index
-    // past that allocation as the device count grew - which is exactly what faulted
-    // before this pair of changes.
-    if (lens != nullptr && *lens > 0 && *lens < n_pos) n_pos = *lens;
+    // This is safe for ANY bound only because the shared memory below is a function
+    // of the chunk constant alone - it does not grow with the candidate count.
+    if (lens != nullptr && *lens > 0) n_pos = *lens;
     extern __shared__ float smem[];
-    const int cols = topk < n_pos ? topk : n_pos;
-    float* s_score = smem;                  // [n_pos]
-    int* s_pick = (int*)(s_score + n_pos);  // [cols]
-    int* s_sort = s_pick + cols;            // [cols]
-    uint8_t* s_used = (uint8_t*)(s_sort + cols);  // [n_pos]
+    const int cols = topk < n_pos ? topk : n_pos;  // out slots (sparse_attn's stride)
+    const int cap = topk;                          // array capacity: cols <= topk
+    float* s_score = smem;                            // [kIndexerChunk] chunk scores
+    int* s_pick = (int*)(s_score + kIndexerChunk);    // [cap] chunk picks (chunk-local)
+    float* s_rv = (float*)(s_pick + cap);             // [cap] running values (key order)
+    int* s_rp = (int*)(s_rv + cap);                   // [cap] running positions
+    uint8_t* s_used = (uint8_t*)(s_rp + cap);         // [kIndexerChunk] consumed flags
     const int tid = threadIdx.x, nthr = blockDim.x;
     const int mm = blockIdx.x, bb = blockIdx.y;
     const size_t row = (size_t)bb * m + mm;
+    __shared__ float s_bv[32];
+    __shared__ int s_bi[32];
+    __shared__ int s_nr;  // running-set size (thread 0 owns it; the output reads it)
+    const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
 
     int cl = n_pos;
     if (lens != nullptr) cl = lens[mm];
     if (cl > n_pos) cl = n_pos;
-    for (int i = tid; i < n_pos; i += nthr) s_used[i] = 0;
-    __syncthreads();
-
-    // ---- scores
     const float* qrow = q + row * (size_t)nh * hd;
-    for (int p = tid; p < n_pos; p += nthr) {
-        const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
-        float acc = 0.f;
-        for (int h = 0; h < nh; ++h) {
-            const float* qh = qrow + (size_t)h * hd;
-            float dot = 0.f;
-            for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
-            acc += fmaxf(dot, 0.f) * w[row * (size_t)nh + h];
-        }
-        float sv = acc * softmax_scale * head_scale;
-        if (p >= cl) sv = -INFINITY;
-        if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
-        s_score[p] = sv;
-    }
-    __syncthreads();
+    if (tid == 0) s_nr = 0;
 
-    // ---- stable top-`cols` (iterative block argmax; ties -> lower index)
-    __shared__ float s_bv[32];
-    __shared__ int s_bi[32];
-    const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
-    for (int it = 0; it < cols; ++it) {
-        float bv = -INFINITY;
-        int bi = -1;  // filled on the first scanned entry, even if it is -inf
-        for (int p = tid; p < n_pos; p += nthr) {
-            if (s_used[p]) continue;
-            const float v = s_score[p];
-            if (bi < 0 || v > bv) {
-                bv = v;
-                bi = p;
+    for (int base = 0; base < n_pos; base += kIndexerChunk) {
+        const int len = (n_pos - base < kIndexerChunk) ? (n_pos - base) : kIndexerChunk;
+        for (int i = tid; i < len; i += nthr) s_used[i] = 0;
+        __syncthreads();
+
+        // ---- scores for this chunk
+        for (int i = tid; i < len; i += nthr) {
+            const int p = base + i;
+            const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
+            float acc = 0.f;
+            for (int h = 0; h < nh; ++h) {
+                const float* qh = qrow + (size_t)h * hd;
+                float dot = 0.f;
+                for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
+                acc += fmaxf(dot, 0.f) * w[row * (size_t)nh + h];
             }
-        }
-        if (bi < 0) bi = n_pos;  // this thread had no entries, use the sentinel
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
-            if (ov > bv || (ov == bv && oi < bi)) {
-                bv = ov;
-                bi = oi;
-            }
-        }
-        if (lane == 0) {
-            s_bv[warp] = bv;
-            s_bi[warp] = bi;
+            float sv = acc * softmax_scale * head_scale;
+            if (p >= cl) sv = -INFINITY;
+            if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
+            s_score[i] = sv;
         }
         __syncthreads();
-        if (tid == 0) {
-            float xv = -INFINITY;
-            int xi = n_pos;
-            for (int widx = 0; widx < nw; ++widx) {
-                const float v = s_bv[widx];
-                const int i = s_bi[widx];
-                if (v > xv || (v == xv && i < xi)) {
-                    xv = v;
-                    xi = i;
+
+        // ---- this chunk's stable top-`k` (iterative block argmax; ties -> lower index)
+        const int k = cols < len ? cols : len;
+        for (int it = 0; it < k; ++it) {
+            float bv = -INFINITY;
+            int bi = len;  // sentinel: this thread has no unconsumed entry
+            for (int i = tid; i < len; i += nthr) {
+                if (s_used[i]) continue;
+                const float v = s_score[i];
+                if (bi >= len || v > bv) {
+                    bv = v;
+                    bi = i;
                 }
             }
-            s_pick[it] = xi;
-            if (xi < n_pos) s_used[xi] = 1;  // consume it (marking -inf is a no-op)
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (lane == 0) {
+                s_bv[warp] = bv;
+                s_bi[warp] = bi;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                float xv = -INFINITY;
+                int xi = len;
+                for (int widx = 0; widx < nw; ++widx) {
+                    const float v = s_bv[widx];
+                    const int i = s_bi[widx];
+                    if (v > xv || (v == xv && i < xi)) {
+                        xv = v;
+                        xi = i;
+                    }
+                }
+                s_pick[it] = xi;  // k <= len, so a real entry is always found
+                s_used[xi] = 1;   // consume it (marking -inf is a no-op)
+            }
+            __syncthreads();
+        }
+
+        // ---- merge this chunk's picks into the running top-`cols` (thread 0)
+        if (tid == 0) {
+            // Both lists are in key order (best first), so a backwards two-pointer
+            // merge over the WORST ends fills the new running set from its tail, and
+            // the elements past `cols` are dropped first. A pick takes a slot only on
+            // a STRICTLY better key, so an equal score keeps the incumbent - which is
+            // the earlier, lower position: chunks run in ascending position order, and
+            // the argmax above already yields equal scores in ascending index order.
+            // The merge is in place: the write index d equals i + j + 1 with both read
+            // indices included, so d >= i (the running index) and a slot is only
+            // overwritten after it has been read.
+            const int t = s_nr + k;
+            const int keep = t < cols ? t : cols;
+            int i = s_nr - 1, j = k - 1;
+            for (int drop = t - keep; drop > 0; --drop) {
+                if (i < 0) --j;
+                else if (j < 0) --i;
+                else if (idx_key_worse(s_rv[i], s_rp[i], s_score[s_pick[j]], base + s_pick[j])) --i;
+                else --j;
+            }
+            for (int d = keep - 1; d >= 0; --d) {
+                if (i < 0) {
+                    const int p = base + s_pick[j];
+                    s_rv[d] = s_score[s_pick[j]];
+                    s_rp[d] = p;
+                    --j;
+                } else if (j < 0) {
+                    s_rv[d] = s_rv[i];
+                    s_rp[d] = s_rp[i];
+                    --i;
+                } else if (idx_key_worse(s_rv[i], s_rp[i], s_score[s_pick[j]], base + s_pick[j])) {
+                    s_rv[d] = s_rv[i];
+                    s_rp[d] = s_rp[i];
+                    --i;
+                } else {
+                    const int p = base + s_pick[j];
+                    s_rv[d] = s_score[s_pick[j]];
+                    s_rp[d] = p;
+                    --j;
+                }
+            }
+            s_nr = keep;
         }
         __syncthreads();
     }
 
-    // ---- sort the picked positions ascending (unique -> rank by counting)
-    if (cols > 0) {
-        for (int i = tid; i < cols; i += nthr) {
-            const int pi = s_pick[i];
-            int rank = 0;
-            for (int j = 0; j < cols; ++j) {
-                const int pj = s_pick[j];
-                if (pj < pi || (pj == pi && j < i)) ++rank;
-            }
-            s_sort[rank] = pi;
-        }
-    }
-    __syncthreads();
+    // ---- output: the golden sorts the SELECTION by position ascending, so rank the
+    // running picks by position (they are unique) and write `p + offset` for
+    // reachable positions / -1 otherwise. The chunk loop covers all of `*lens`, so
+    // every candidate the direct path used to see is still here.
     for (int i = tid; i < cols; i += nthr) {
-        const int p = s_sort[i];
-        out[row * (size_t)cols + i] = (p < cl) ? (p + offset) : -1;
+        if (i >= s_nr) {
+            out[row * (size_t)cols + i] = -1;
+            continue;
+        }
+        const int pi = s_rp[i];
+        int rank = 0;
+        for (int j = 0; j < s_nr; ++j)
+            if (s_rp[j] < pi) ++rank;
+        out[row * (size_t)cols + rank] = (pi < cl) ? (pi + offset) : -1;
     }
 }
 
@@ -1293,19 +1359,21 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
                                   int uses_candidates, cudaStream_t s) {
     if (b <= 0 || m <= 0 || nh <= 0 || hd <= 0 || topk <= 0) return (int)cudaErrorInvalidValue;
     if (n_pos <= 0) return (int)cudaSuccess;  // nothing to select from
-    const int cols = topk < n_pos ? topk : n_pos;
-    const size_t smem =
-        (size_t)n_pos * (sizeof(float) + 1) + (size_t)cols * 2 * sizeof(int) + 64;
-    if (smem > 200 * 1024) return (int)cudaErrorInvalidValue;  // one CTA holds all scores
-    // The bound arrives as a CONSTANT per layer (idx_cap in chain_dev.rs), so this
-    // shared memory does not depend on the current step - a capture freezes launch
-    // arguments, and sizing it from the per-step count once left every replay indexing
-    // past the allocation as the device count grew. idx_cap is sized for 46 KiB, which
-    // needs no opt-in attribute; the usable default is 47 KiB, not the nominal 48 KiB,
-    // because the driver reserves 1 KiB per block (a constant at the nominal limit is
-    // what failed the launch with cudaErrorInvalidValue). The kernel clamps the live
-    // device counter to this same bound, and the guard above covers any shape that
-    // could not fit at all.
+    // Dynamic shared memory from COMPILE-TIME constants only: the chunk score array
+    // (kIndexerChunk entries) plus the running top-`cols` set, whose arrays are sized
+    // by the `topk` upper bound on cols. n_pos is deliberately absent - it is a
+    // PER-STEP value and a CUDA graph capture freezes the launch (arguments AND this
+    // size), so a size derived from it was applied unchanged to every replay while the
+    // kernel scanned the live (growing) device count: either a stale bound (silent
+    // candidate loss) or an index past a smaller allocation. The kernel's chunk loop
+    // makes any scan bound safe, so it now scans `*lens` for any value.
+    const size_t smem = (size_t)kIndexerChunk * (sizeof(float) + 1) +
+                        (size_t)topk * (sizeof(int) + sizeof(float) + sizeof(int)) + 64;
+    // Stay inside the 47 KiB USABLE default (48 KiB nominal minus the 1 KiB the driver
+    // reserves per block), so no cudaFuncSetAttribute opt-in is ever needed. A `topk`
+    // too large for that budget fails the launch LOUDLY here - the previous constant
+    // bound instead kept the launch valid and silently dropped the far candidates.
+    if (smem > 47 * 1024) return (int)cudaErrorInvalidValue;
     dim3 grid((unsigned)m, (unsigned)b);
     indexer_topk_kernel<<<grid, 256, smem, s>>>(q, index_k, weights, candidates, compress_lens,
                                                 out, m, nh, hd, n_pos, topk, offset, softmax_scale,
