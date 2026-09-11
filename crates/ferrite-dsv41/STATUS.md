@@ -2427,3 +2427,43 @@ sinkhorn 单线程化实测 17.3 tok/s（57.85 / 57.93ms 两次）vs 改前 17.6
 - **工具**：差分法（decode-only 分布 ✓）+ 隔离复现器（秒级反馈 + 发射地板 ✓）
 - **已实测否决**：GEMV k-split · 16B uint4 · smem 暂存激活 · sinkhorn 去屏障 · down 复用分派（破坏正确性，已回退 ✓）
 - **两次自我推翻已入档**（全运行平均不等于 decode ✓；权重重读不是 hc_mixes 的瓶颈 ✓）
+
+## 专家 down 上次崩溃的根因（读代码所得，下会话执行前必看）
+
+**现象**（已回退 ✓）：把 GEMV 分派放宽到 `rows == 1`（不限 AQ）后 ⇒ 一个 prompt 返回全零、
+两个报 illegal memory access ✗。
+
+**实参对照（读 `dsv41_expert_down_fp4_indirect` 与我的 kernel）**：
+| 参数 | gate/up（GEMV 已成功 ✓）| **down（崩溃 ✗）** |
+|---|---|---|
+| `rows` | 1 | 1 |
+| `n_total` | `2*inter` | **`dim` = 4096** |
+| `k` | `dim` = 4096 | **`inter` = 256** |
+| `b_split` | `inter`（gate/up 分界）| **`-1`** |
+| `epi_mode` | 1（带 clamp）| **3（累加进 MoE 缓冲）** |
+| `aq` | false（激活是 fp4 ✓）| **true**（激活是 f32 `act` ✓）|
+| `row_weight` | nullptr | **非空（路由权重 ✓）** |
+
+**我的 kernel 里最可疑的一处** ✓：读权重用的是
+```c
+const int kbytes = k >> 1;                       // = 128（k=256）
+const uint8_t* brow = b_use + (size_t)r * kbytes; // ← 假设每行紧密排布 k/2 字节 ✗
+```
+⇒ 若 down 的权重池每行有 **padding/对齐**（很常见 ✓），`r*kbytes` 会**越界** ⇒
+illegal memory access ✓✓。**修法**：把"每行跨距"作为独立参数传入（gate/up 传 `k/2` ✓，
+down 传池的真实 stride ✓），或从 Rust 侧一并传 `b_row_stride` ✓。
+**其余需核对的**：`epi_mode == 3` 时 `out[row] += x`（累加 ✓）与 `row_weight` 的乘序 ✓、
+以及 `b_split = -1` 下 `hi` 判定（我的代码 `(b_split > 0) && ...` ⇒ false ✓ 正确 ✓）。
+
+**验证路径（务必用复现器，秒级 ✓）**：把 `/tmp/hc_repro.cu` 当模板，写一个
+`/tmp/down_repro.cu`：造 `[dim, inter]` 的 fp4 权重 + e8m0 尺度 + 一条 f32 激活 ⇒
+① 先跑旧 `mxf4_gemm` 路径取参考输出 ✓ ② 再跑 GEMV 路径对拍（应 <1e-3 ✓）
+③ 对拍通过后再接进模型跑四段文本 ✓（不要跳过 ①——上次就是直接接进模型才付出了代价 ✗）。
+
+**附：本会话已建立的三件工具/口径（下会话直接可用 ✓）**
+1. **差分法取 decode-only 分布**：`--max-tokens 1` 与 `--max-tokens N` 两表相减 ✓
+   （`nsys stats --report cuda_gpu_kern_sum --format csv` + python 解析 ✓；
+   **切勿用 table 格式配 awk ✗**——kernel 名含空格会错列 ✓）
+2. **隔离复现器**（含空 kernel 发射地板对照 ✓）：真实 shape + 预热 + 500 次计时 ✓
+3. **两条判据**：多卡 nsys 只用于**排序** ✓（绝对耗时不可信 ✗）；最终结论一律取
+   **同二进制背靠背 A/B + 四段文本** ✓
