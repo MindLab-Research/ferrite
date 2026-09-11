@@ -213,6 +213,16 @@ struct Scratch {
     /// count (the wo pair runs on the main stream, serialised, which is what makes
     /// one pair sufficient).
     wo_bar: DevBuf, // [2] u32
+    // ---- chain-pair-batch 链2: shared expert w1w3 -> swiglu -> w2 scratch ----
+    /// The swiglu epilogue's fp8 pair (`dsv41_gemm_fp8_sh_pair`'s phase-1
+    /// output / phase-2 activation). It needs its OWN buffers rather than
+    /// `xq`/`xsc`: phase 1 READS `xq` (the quantised `xn`) as its activation
+    /// while its epilogue WRITES these bytes, and inside one grid-sync launch
+    /// there is no barrier between the read and the write — a block that emitted
+    /// early would clobber bytes a later block still has to stage (the exact
+    /// hazard `wo_q`/`wo_qsc` document for the wo pair).
+    sh_q: DevBuf,   // [inter] fp8 bytes
+    sh_qsc: DevBuf, // [inter/32 + 8] f32
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -433,6 +443,33 @@ fn moe_epi_add() -> bool {
 fn swiglu_q() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(true))
+}
+
+/// chain-pair-batch 链2 (DSV41_SH_PAIR, default OFF): the shared expert's
+/// (w1w3 -> swiglu -> w2) chain as ONE grid-sync launch
+/// (`dsv41_gemm_fp8_sh_pair`) instead of three. Phase 1 walks BOTH of a row's
+/// weight rows (w1 = gate, w3 = up) in one warp over the same fp8 activation and
+/// applies the swiglu epilogue in-register (so the separate swiglu launch
+/// disappears), a sense-reversing device-wide barrier joins it to phase 2, and
+/// phase 2 is the standalone w2 GEMV. Every output is bit-identical to the three
+/// calls this replaces; what disappears is two launches + two graph nodes per
+/// layer (80/step).
+///
+/// Default OFF because it is a NEW kernel whose only verified property so far is
+/// the decline path (`gate.shape_ok()`); "=1" is the bring-up arm and the text
+/// check is what flips it, like every other gate here.
+///
+/// Shape gates, all mirrored by the kernel's own specialisation:
+///   * `dim % 32 == 0` and `sh_il % 32 == 0`: phase 1's k-blocks and BOTH phases'
+///     32-element scale rows. `sh_il % 32 == 0` ALSO makes one block own whole
+///     32-row scale blocks (the fp8 epilogue's amax is a single block tree) and
+///     keeps phase 2's cp.async16 weight rows 16-byte aligned.
+///   * a real w2 (the shared half needs it to run at all).
+///   * no MIX_GATE (`sh_via_mixed`): the mixed launch produces w1/w3 from its own
+///     `s.xq` write, so phase 1 would consume the wrong activation.
+fn sh_pair() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SH_PAIR").map(|v| v == "1").unwrap_or(false))
 }
 
 /// ADD_EPI (DSV41_ADD_EPI, default ON): fold the shared expert's merge
@@ -905,6 +942,11 @@ impl<'a> DevChain<'a> {
             // chain-pair-grid-sync: the [arrive, sense] barrier pair. 8 bytes; the
             // kernel self-resets it, so it only has to START at zero (see below).
             wo_bar: dev.alloc(8)?,
+            // chain-pair-batch 链2: the fused shared-expert chain's swiglu fp8
+            // output. Sized by the FULL `inter` (>= every rank's local slice);
+            // phase 1 writes it before phase 2 ever reads it, so no zero-fill.
+            sh_q: dev.alloc(inter.max(8))?,
+            sh_qsc: dev.alloc(fb(inter.max(8) / 32 + 8))?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does

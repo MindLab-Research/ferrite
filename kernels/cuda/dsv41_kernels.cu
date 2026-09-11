@@ -4550,6 +4550,383 @@ extern "C" int dsv41_gemm_fp8_wo_pair(const uint8_t* a, const float* a_scale,
     return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// chain-pair-batch 链2 (2026-09-12): the shared expert's w1w3 -> swiglu -> w2
+// chain as ONE launch.
+//
+// WHY. That chain is three already-fused kernels that are strictly serial:
+//
+//     w1w3  : gemm_fp8_mx2    [1, dim] fp8 -> [1, 2*il] f32   (gate | up)
+//     swiglu: swiglu_limit_q  [1, 2*il]      -> [1, il] f32 + fp8(xq/xsc)
+//     w2    : gemm_fp8_mx     fp8(xq/xsc) [1, il] -> [1, dim] f32
+//
+// Three launches + three graph nodes per layer (120/step) pay three prologue
+// floors for a strictly serial dependency. This kernel keeps all three bodies
+// and connects them with a DEVICE-WIDE BARRIER instead of a stream edge.
+//
+// STRUCTURE
+//   phase 1  every warp owns ONE inter row i and walks BOTH of that row's
+//            weight rows -- w1 (the gate) and w3 (the up) -- over the fp8
+//            activation (`a`/`a_scale`, k = dim). The dot is the staged
+//            gemm_fp8_gemv_kernel mode-4 consume loop over the a32-predecoded
+//            `s_af`, with the two chains sharing every `av`. The epilogue is
+//            swiglu_limit_kernel's clamp + silu and swiglu_limit_q_kernel's fp8
+//            emit: the f32 lands in `act` (= the Rust side's ex_act), the fp8
+//            pair in `aq`/`aqsc` (the phase-2 activation).
+//   barrier  sense-reversing, arrived once per block by thread 0.
+//   phase 2  the w2 M=1 GEMV in gemm_fp8_gemv_kernel's staged mode-4 + a32
+//            form: rows [0, dim), k = il (= phase 1's row count), consuming
+//            `aq`/`aqsc` into `out`.
+//
+// WHY THE PAIR STRUCTURE (not gemm_fp8_mx2's "row split in two"). swiglu is
+// silu(gate_i) * up_i: a kernel that maps rows [0, il) to w1's rows and
+// [il, 2*il) to w3's (what mx2 does) puts the two halves of one silu on two
+// DIFFERENT warps, so the epilogue would need a global round trip -- which is
+// exactly the swiglu launch this fuses away. One warp must hold gate_i AND up_i.
+//
+// BIT-IDENTITY. Each phase-1 dot walks `j = kb*32 + lane` for kb ascending with
+// a single accumulator per chain (the `#pragma unroll 4` only overlaps loads;
+// it cannot reassociate a serial `+=` chain) over the SAME `s_lut[byte]*sb`
+// product, so gate_i / up_i are bit-identical to what gemm_fp8_mx2's family
+// rows produce. The epilogue copies swiglu_limit_kernel's `(g/(1+expf(-g)))*u`
+// with the same clamps, and the fp8 emit copies swiglu_limit_q_kernel's amax
+// tree + fast_round_scale + clamp + __nv_fp8_e4m3 -- bit-identical because one
+// block owns exactly ONE 32-row scale block (nwarps == 32 and n1 % 32 == 0).
+// Phase 2 is gemm_fp8_gemv_kernel's body verbatim, so `out` is bit-identical to
+// the standalone w2 launch.
+//
+// WHY THE fp8 OUTPUT NEEDS ITS OWN BUFFER. Phase 1's INPUT is the fp8 of `xn`
+// (`a`/`a_scale`, k = dim bytes) and its fp8 OUTPUT is the swiglu pair (n1
+// bytes). In the serial chain those two share one buffer (swiglu_limit_q
+// overwrites the `xn` quant). Inside one grid-sync kernel that is a
+// cross-block RACE: block A would overwrite bytes block B has not staged yet,
+// and there is no barrier between the read and the write. The Rust caller
+// therefore passes a DISJOINT pair (`sh_q`/`sh_qsc`).
+//
+// DEADLOCK SAFETY -- the one hard constraint, same as gemm_fp8_wo_pair_kernel.
+// The barrier completes only when ALL gridDim.x blocks are resident at the same
+// time, so the launcher caps the grid at co_res (occupancy x SMs at THIS block
+// size and THIS dynamic smem). NEVER raise the grid past co_res: a block that
+// never becomes resident never arrives, the resident ones spin forever, and the
+// device hangs (the watchdog cannot see it inside a captured graph).
+//
+// MEMORY ORDERING. Producer: __syncthreads() (this block's act[]/aq[]/aqsc[]
+// stores are done) -> __threadfence() -> the arrive atomicAdd. Consumer: the
+// spin observes the sense flip -> __threadfence() -> __syncthreads() -> reads.
+//
+// NOT COVERED (the launcher returns 2, never 1 -- 1 is cudaErrorInvalidValue --
+// and the Rust caller keeps the three launches):
+//   * any fp8 mode other than 4, or a32 off / a32-staged;
+//   * a shape where dim or il is not a multiple of 32.
+
+// The barrier state: a MODULE-level [arrive, sense] pair, deliberately separate
+// from `s.wo_bar` (two concurrent grids on one pair corrupt each other's arrive
+// count). Zero-initialised by the module loader; every launch self-resets it --
+// the last arriver zeroes `arrive` and flips `sense`, which releases this
+// launch's waiters -- so a captured graph replays correctly and nothing
+// re-initialises it per step.
+__device__ unsigned g_sh_arrive = 0;
+__device__ unsigned g_sh_sense = 0;
+
+__global__ void __launch_bounds__(1024)
+gemm_fp8_sh_pair_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                        const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wg_scale,
+                        const uint8_t* __restrict__ wu, const uint8_t* __restrict__ wu_scale,
+                        float limit, int n1, int k1,
+                        float* __restrict__ act, uint8_t* __restrict__ aq,
+                        float* __restrict__ aqsc,
+                        const uint8_t* __restrict__ w2, const uint8_t* __restrict__ w2_scale,
+                        int n2, float* __restrict__ out, int cpasync) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;              // 32 (the fp8 emit requires it)
+    const int nb_k1 = k1 >> 5;                              // phase-1 k-blocks
+    const int nb_k2 = n1 >> 5;                              // phase-2 k-blocks (k2 = n1)
+    const int nb_k2_al = (nb_k2 + 15) & ~15;                // 16B units
+    const int k1max = (k1 > n1) ? k1 : n1;
+    const int nb_kmax = (nb_k1 > nb_k2) ? nb_k1 : nb_k2;
+
+    // ---- ONE shared-memory pool for BOTH phases (smem = max) -----------------
+    // The two phases never overlap in time (the grid barrier plus the
+    // __syncthreads() after it separate them), so every slot is sized by the
+    // WIDER phase and re-used by the narrower one. The kernel has NO static
+    // shared memory, so the launcher's dynamic request is exactly this sum, and
+    // dsv41_gemm_fp8_sh_pair computes it with the IDENTICAL expression -- any
+    // drift here is a silent pointer shift (see the launcher note).
+    //
+    // s_w sits FIRST so its offset is 0: phase 2 stages weight rows into it with
+    // cp.async16, which needs a 16-byte-aligned destination. Every later slot is
+    // 4-byte aligned by construction (n1 and nb_k2_al are multiples of 4).
+    extern __shared__ uint8_t s_pool[];
+    uint8_t* s_w = s_pool;                                       // [nwarps][n1]   (phase 2)
+    uint8_t* s_ws = s_w + (size_t)nwarps * (size_t)n1;           // [nwarps][nb_k2_al]
+    float* s_lut = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k2_al);
+    float* s_as = s_lut + 256;                                   // [nb_kmax]
+    float* s_rows = s_as + nb_kmax;                              // [nwarps]
+    float* s_af = s_rows + nwarps;                               // [k1max]
+
+    // ============= phase 1: w1w3 + swiglu -> act f32 / aq fp8 ================
+    {
+        // The e4m3 decode table is phase-INDEPENDENT and never overwritten, so
+        // it is built once, before the activation's own staging.
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+        for (int i = threadIdx.x; i < nb_k1; i += blockDim.x) s_as[i] = a_scale[i];
+        __syncthreads();               // s_lut + s_as published
+        // a32 (the SAME predecoded activation the standalone GEMV materialises):
+        // one pass global uint4 -> LUT -> s_af. The emitted f32 is bit-identical
+        // to the staged `s_lut[s_a[i]] * s_as[i>>5]` product -- same bytes, same
+        // LUT entry, same scale, only the k-byte `s_a` round trip is gone.
+        const int n16a = k1 >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+            const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int idx = (i << 4) + j;
+                s_af[idx] = s_lut[b[j]] * s_as[idx >> 5];
+            }
+        }
+        for (int i = (n16a << 4) + threadIdx.x; i < k1; i += blockDim.x)
+            s_af[i] = s_lut[a[i]] * s_as[i >> 5];
+        __syncthreads();               // s_af published for every warp
+
+        // One block covers nwarps CONSECUTIVE rows and n1 is a multiple of
+        // nwarps, so `base` decides for the WHOLE block: either all nwarps warps
+        // are live or none is. That is what makes the epilogue's
+        // __syncthreads() legal (uniform control flow) and the amax tree cover
+        // exactly one 32-row scale block.
+        const int base = blockIdx.x * nwarps;
+        if (base < n1) {
+            const int row = base + warp;
+            const uint8_t* g_row = wg + (size_t)row * (size_t)k1;
+            const uint8_t* u_row = wu + (size_t)row * (size_t)k1;
+            const uint8_t* gsc = wg_scale + (size_t)(row >> 5) * (size_t)nb_k1;
+            const uint8_t* usc = wu_scale + (size_t)(row >> 5) * (size_t)nb_k1;
+            float g = 0.f, u = 0.f;
+            // The gemm_fp8_gemv_kernel consume loop, twice (gate chain + up
+            // chain), sharing every `av`. Single accumulator per chain and
+            // `kb` ascending = the standalone row's summation order.
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k1; ++kb) {
+                const float sbg = ue8m0_to_f(gsc[kb]);
+                const float sbu = ue8m0_to_f(usc[kb]);
+                const int j = (kb << 5) + lane;
+                const float av = s_af[j];
+                g += av * (s_lut[g_row[j]] * sbg);
+                u += av * (s_lut[u_row[j]] * sbu);
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                g += __shfl_xor_sync(0xFFFFFFFFu, g, off);
+                u += __shfl_xor_sync(0xFFFFFFFFu, u, off);
+            }
+            if (lane == 0) {
+                // swiglu_limit_kernel's clamp + silu, term for term. `v` is the
+                // SAME register value both consumers below use (the f32 store and
+                // the fp8 amax), never a global re-read.
+                if (limit > 0.f) {
+                    g = fminf(g, limit);                    // gate clamp
+                    u = fminf(fmaxf(u, -limit), limit);     // up clamp
+                }
+                const float v = (g / (1.f + expf(-g))) * u;
+                act[row] = v;
+                s_rows[warp] = v;
+            }
+            __syncthreads();   // every warp's v staged; block == one scale block
+            // swiglu_limit_q_kernel's emit, term for term. `fmaxf` is exact and
+            // associative, so this tree is bit-identical to the kernel's per-lane
+            // shfl tree over the same 32 values.
+            float am = (lane < nwarps) ? fabsf(s_rows[lane]) : 0.f;
+            for (int off = 16; off > 0; off >>= 1)
+                am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));
+            const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
+            if (lane == 0) {
+                aqsc[blockIdx.x] = sc;
+                const float q = fminf(fmaxf(s_rows[warp] * (1.0f / sc), -448.0f), 448.0f);
+                const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+                aq[row] = *(const uint8_t*)&f8;
+            }
+        }
+    }
+
+    // ============================= grid barrier ==============================
+    // sense-reversing, arrived once per block by thread 0. Safe ONLY because the
+    // launcher caps gridDim.x at the residency number (see co_res in
+    // dsv41_gemm_fp8_sh_pair).
+    __syncthreads();                   // this block's act[]/aq[] stores are complete
+    if (threadIdx.x == 0) {
+        __threadfence();                               // release: act[]/aq[] visible
+        const unsigned s0 = atomicAdd(&g_sh_sense, 0u);    // current sense
+        if (atomicAdd(&g_sh_arrive, 1u) == (unsigned)gridDim.x - 1u) {
+            atomicExch(&g_sh_arrive, 0u);              // reset for the next launch
+            __threadfence();
+            atomicXor(&g_sh_sense, 1u);                // flip -> release waiters
+        } else {
+            while (atomicAdd(&g_sh_sense, 0u) == s0) __nanosleep(32);
+            __threadfence();                           // acquire
+        }
+    }
+    __syncthreads();
+
+    // ===================== phase 2: w2 (fp8 -> f32), k = n1 ==================
+    {
+        // Re-stage the two inputs of the standalone w2 launch: its per-32-block
+        // scale row, and the block-wide a32-predecoded activation. Same product
+        // (`s_lut[aq[i]] * s_as[i>>5]`), same bytes -> same s_af.
+        for (int i = threadIdx.x; i < nb_k2; i += blockDim.x) s_as[i] = aqsc[i];
+        __syncthreads();               // s_as published (s_lut is already built)
+        const int n16a = n1 >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+            const uint4 v = *reinterpret_cast<const uint4*>(aq + (i << 4));
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int idx = (i << 4) + j;
+                s_af[idx] = s_lut[b[j]] * s_as[idx >> 5];
+            }
+        }
+        for (int i = (n16a << 4) + threadIdx.x; i < n1; i += blockDim.x)
+            s_af[i] = s_lut[aq[i]] * s_as[i >> 5];
+        __syncthreads();               // s_af published
+
+        // P3 (cp.async weights-first, DSV41_GEMV_CPASYNC): the first row this
+        // warp will consume depends on none of the staging above, so issue it
+        // BEFORE the barrier's consume loop and let the two overlap. Same bytes,
+        // same slot; only the issue point moves.
+        int pf_row = (cpasync != 0) ? ((int)blockIdx.x * nwarps + warp) : -1;
+        if (pf_row >= n2) pf_row = -1;
+        if (pf_row >= 0) {
+            const uint8_t* pf_w = w2 + (size_t)pf_row * (size_t)n1;
+            uint8_t* pf_s = s_w + (size_t)warp * (size_t)n1;
+            const int n16p = n1 >> 4;
+            for (int i = lane; i < n16p; i += 32) dsv41_cp_async16(pf_s + (i << 4), pf_w + (i << 4));
+            dsv41_cp_commit();
+            for (int i = (n16p << 4) + lane; i < n1; i += 32) pf_s[i] = pf_w[i];
+        }
+
+        for (int row = blockIdx.x * nwarps + warp; row < n2; row += gridDim.x * nwarps) {
+            const uint8_t* wr = w2 + (size_t)row * (size_t)n1;
+            const uint8_t* wsr = w2_scale + (size_t)(row >> 5) * (size_t)nb_k2;
+            uint8_t* row_s = s_w + (size_t)warp * (size_t)n1;
+            uint8_t* row_sc = s_ws + (size_t)warp * (size_t)nb_k2_al;
+            float acc = 0.f;
+            const bool prefetched = (row == pf_row);
+            if (!prefetched) {
+                const int n16 = n1 >> 4;
+                for (int i = (n16 << 4) + lane; i < n1; i += 32) row_s[i] = wr[i];
+                for (int i = lane; i < n16; i += 32)
+                    dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            }
+            // PLAIN byte loads, NOT cp.async: cp.async16 needs a 16-byte-aligned
+            // global address and `wsr` only has that when nb_k2 is a multiple of
+            // 16. Same reason (and the same err 716) as the standalone kernel.
+            for (int i = lane; i < nb_k2; i += 32) row_sc[i] = wsr[i];
+            // Unconditional: on the prefetched iteration this commits an EMPTY
+            // group after the prologue's, and wait_all retires both.
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
+            __syncwarp();
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k2; ++kb) {
+                const float sb = ue8m0_to_f(row_sc[kb]);
+                const int j = (kb << 5) + lane;
+                acc += s_af[j] * (s_lut[row_s[j]] * sb);
+            }
+            __syncwarp();
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) out[row] = acc;
+        }
+    }
+}
+
+// The chain-pair launcher. TWO deliberate differences from every other launcher
+// in this family, both copied from dsv41_gemm_fp8_wo_pair:
+//   * the launch is PLAIN (`<<<>>>`), NOT via dsv41_pdl_or_plain. A grid-wide
+//     barrier and PDL are a bad pair: PDL lets this grid start while the
+//     producer is still resident, and the barrier needs the WHOLE grid resident
+//     before any block may pass it.
+//   * the grid is CAPPED by residency (co_res). That cap is a correctness
+//     requirement, not tuning -- see the kernel's DEADLOCK SAFETY note.
+//
+// One more difference of its own: `warps` is pinned to 32 (not g_gemv_warps).
+// The fp8 emit needs one block to own exactly one 32-row scale block, i.e.
+// nwarps == 32 and n1 % 32 == 0; a smaller block would split a scale block
+// across blocks and the amax would need a cross-block reduction.
+//
+// Returns 2 (decline, never 1) for any shape or arm the fused kernel does not
+// implement, so the Rust caller keeps the three-launch chain bit for bit.
+extern "C" int dsv41_gemm_fp8_sh_pair(const uint8_t* a, const float* a_scale,
+                                      const uint8_t* wg, const uint8_t* wg_scale,
+                                      const uint8_t* wu, const uint8_t* wu_scale,
+                                      float limit, int n1, int k1,
+                                      float* act, uint8_t* aq, float* aqsc,
+                                      const uint8_t* w2, const uint8_t* w2_scale,
+                                      int n2, float* out, cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    if (a == nullptr || a_scale == nullptr || wg == nullptr || wg_scale == nullptr ||
+        wu == nullptr || wu_scale == nullptr || act == nullptr || aq == nullptr ||
+        aqsc == nullptr || w2 == nullptr || w2_scale == nullptr || out == nullptr)
+        return 2;
+    if (n1 <= 0 || k1 <= 0 || n2 <= 0) return 2;
+    // Phase 1's k-blocks and BOTH phases' 32-element scale rows: k1 is the
+    // activation width, n1 is phase 1's row count (= phase 2's k). n1 % 32 also
+    // guarantees one block owns whole scale blocks (nwarps == 32) and n1 % 16
+    // the cp.async16 alignment of phase 2's weight rows.
+    if ((k1 & 31) || (n1 & 31)) return 2;
+    // Specialised bodies: only the production arm (mode 4 = staged weights +
+    // block-wide activation; a32 = the predecoded `s_af`; a32_direct) is
+    // implemented, and only the plain (non-NORM_FUSE) activation source.
+    if (g_gemv_fp8_mode != 4 || !g_gemv_a32 || g_gemv_a32_staged) return 2;
+
+    const int warps = 32;
+    const int nb_k1 = k1 >> 5;
+    const int nb_k2 = n1 >> 5;
+    const int nb_k2_al = (nb_k2 + 15) & ~15;
+    const int k1max = (k1 > n1) ? k1 : n1;
+    const int nb_kmax = (nb_k1 > nb_k2) ? nb_k1 : nb_k2;
+    // MUST match the kernel's pointer arithmetic EXACTLY (s_w first, then s_ws,
+    // then the four float tables). Any drift shifts every pointer after it.
+    const size_t gsmem = (size_t)warps * (size_t)n1          // phase-2 weight rows
+                       + (size_t)warps * (size_t)nb_k2_al    // phase-2 ue8m0 scale rows
+                       + 256 * sizeof(float)                 // e4m3 LUT
+                       + (size_t)nb_kmax * sizeof(float)     // activation scales
+                       + (size_t)warps * sizeof(float)       // fp8-emit row stage
+                       + (size_t)k1max * sizeof(float);      // s_af
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_sh_pair_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_sh_pair_kernel));
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    // ---- co_res: the residency cap. Cached because the model's shape is fixed
+    // and this launcher runs 40 times per step (a per-call occupancy query is a
+    // driver round trip). Keyed on the parameters that define the answer.
+    static int co_res_cached = 0;
+    static size_t co_res_gsmem = 0;
+    if (co_res_cached == 0 || co_res_gsmem != gsmem) {
+        int per_sm = 0;
+        cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm, gemm_fp8_sh_pair_kernel, warps * 32, gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+        int dev = 0, sms = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        co_res_cached = per_sm * sms;
+        co_res_gsmem = gsmem;
+    }
+    if (co_res_cached <= 0) return 2;   // no resident configuration -> decline
+
+    const int rows = (n1 > n2) ? n1 : n2;
+    int blocks = (rows + warps - 1) / warps;
+    if (blocks > co_res_cached) blocks = co_res_cached;   // HARD deadlock guard
+    if (blocks <= 0) return 2;
+
+    gemm_fp8_sh_pair_kernel<<<dim3(blocks), dim3(warps * 32), gsmem, s>>>(
+        a, a_scale, wg, wg_scale, wu, wu_scale, limit, n1, k1,
+        act, aq, aqsc, w2, w2_scale, n2, out, g_gemv_cpasync ? 1 : 0);
+    return (int)cudaGetLastError();
+}
+
 // Two projections over the SAME activation in one gemv launch: the kernel maps
 // rows below n1 to the first family and the rest to the second, both sharing the
 // block-wide staged activation. wq_a and wkv in the attention are the pair - two

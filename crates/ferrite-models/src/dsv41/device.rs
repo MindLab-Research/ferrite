@@ -158,6 +158,38 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// chain-pair-batch 链2: the shared expert's (w1w3 -> swiglu -> w2) chain as
+    /// ONE grid-sync launch (`dsv41_gemm_fp8_sh_pair`). Phase 1 computes the
+    /// gate/up PAIR per warp (both weight rows over the same fp8 activation,
+    /// k = dim) and applies the swiglu epilogue, emitting the f32 activation AND
+    /// the fp8 pair; a sense-reversing device-wide barrier joins it to phase 2,
+    /// the w2 M=1 GEMV (k = the shared expert's local inter = phase 1's row
+    /// count). Three launches (w1w3, swiglu, w2) become one.
+    ///
+    /// The barrier state is the kernel's OWN module-level `[arrive, sense]` pair
+    /// (`g_sh_arrive`/`g_sh_sense`), deliberately separate from `wo_bar`; it is
+    /// zero-initialised by the module loader and self-resetting per launch, so no
+    /// device buffer travels through this ABI.
+    ///
+    /// `aq`/`aqsc` is the phase-1 fp8 output and MUST be disjoint from `a`/`a_scale`
+    /// (phase 1 reads the `xn` quant while it writes the swiglu pair; one buffer
+    /// would be a cross-block race inside a single grid-sync launch).
+    ///
+    /// A separate symbol, so a stale `.so` simply has no entry and the caller
+    /// keeps the three launches. Returns 2 when the shape/arm cannot use it
+    /// (never 1 — cudaErrorInvalidValue, the round-42 collision).
+    /// ABI: stream LAST.
+    gemm_fp8_sh_pair: Option<
+        unsafe extern "C" fn(
+            // phase 1: fp8 activation (k = dim), w1/w3 weights + scales, limit, n1/k1
+            *const u8, *const f32, *const u8, *const u8, *const u8, *const u8, f32, c_int, c_int,
+            // phase 1 outputs: f32 activation, fp8 pair, per-32-block scale
+            *mut f32, *mut u8, *mut f32,
+            // phase 2: w2 weights + scale, row count, out
+            *const u8, *const u8, c_int, *mut f32,
+            CuStream,
+        ) -> c_int,
+    >,
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -661,6 +693,7 @@ impl Device {
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             gemm_fp8_mx_f32: ko!(rt, "dsv41_gemm_fp8_mx_f32"),
             gemm_fp8_wo_pair: ko!(rt, "dsv41_gemm_fp8_wo_pair"),
+            gemm_fp8_sh_pair: ko!(rt, "dsv41_gemm_fp8_sh_pair"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
@@ -1566,6 +1599,59 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_wo_pair")?;
+        Ok(true)
+    }
+
+    /// chain-pair-batch 链2: true when the loaded .so carries the fused shared
+    /// expert chain (`dsv41_gemm_fp8_sh_pair`). A stale .so leaves DSV41_SH_PAIR
+    /// inert and the (w1w3, swiglu, w2) three-launch chain runs.
+    pub fn supports_sh_pair(&self) -> bool {
+        self.kernels.gemm_fp8_sh_pair.is_some()
+    }
+
+    /// chain-pair-batch 链2: the shared expert's (w1w3 -> swiglu -> w2) chain as
+    /// ONE launch, joined by the kernel's own device-wide sense-reversing barrier
+    /// instead of two stream edges. Nothing about the numerics changes: phase 1
+    /// is gemm_fp8_mx2's two rows walked by ONE warp with swiglu_limit_q's
+    /// epilogue, phase 2 is the standalone w2 GEMV, so `act`, `aq`/`aqsc` and
+    /// `out` are bit-identical to the three launches this replaces.
+    ///
+    /// Ok(false) => the shape/arm cannot use it and the caller keeps the three
+    /// calls. `aq`/`aqsc` must be DISJOINT from `a`/`a_scale` (see the FFI note).
+    /// ABI: stream LAST (this symbol has no C++ default tail args).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_sh_pair(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        wg: *const u8,
+        wg_scale: *const u8,
+        wu: *const u8,
+        wu_scale: *const u8,
+        limit: f32,
+        n1: i32,
+        k1: i32,
+        act: *mut f32,
+        aq: *mut u8,
+        aqsc: *mut f32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        n2: i32,
+        out: *mut f32,
+        s: CuStream,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.gemm_fp8_sh_pair, "dsv41_gemm_fp8_sh_pair")?;
+        let rc = unsafe {
+            f(
+                a, a_scale, wg, wg_scale, wu, wu_scale, limit, n1, k1, act, aq, aqsc, w2, w2_scale,
+                n2, out, s,
+            )
+        };
+        // A shape/arm decline is 2 (1 collides with cudaErrorInvalidValue).
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_sh_pair")?;
         Ok(true)
     }
 
