@@ -5159,3 +5159,38 @@ UB 运气（越界写恰好落在未用区域）。因此 **hcd/r3 两个"err 70
    必须 `CUDA_LAUNCH_BLOCKING=1` 拿真凶。
 3. **一个改动的"中性"测量如果在它引入 bug 的状态下取得，这个测量本身无效**——b2 的 13.19ms
    既是 gemv_bf16 staging 的"中性证明"，又是后来一切混乱的源头。
+
+### ✅ 第 4 轮定案：切分翻默认 ON（2026-09-11 晚）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| base（回退两个坏改动后） | 13.22ms | 75.6 | 四段全对 | 0 |
+| **stp（DSV41_SHARED_TP=1）** | **11.79ms** | **84.8** | 四段全对 | 0 |
+
+**切分收益 = −1.43ms（+12%）**，已翻默认 ON（`DSV41_SHARED_TP=0` 可回退）。
+第 5 轮（def2 默认确认 + d128 叠加 + tail 探针）正在远端跑；若结果丢失：
+`ssh ubuntu@43.202.208.136` 后看 `/tmp/ab_def2.log`、`/tmp/ab_d128.log`，并直接跑 `/tmp/tail_probe`。
+
+### lm_head TP 切分（方案 B）完整设计（lmhead-impl 产出，待实现，−0.24ms）
+
+现状：每 rank 各算全词表 129280×5120（298µs，8× 冗余）；方案 A（rank0 独占）无效（8 rank 并行，墙钟不变）。
+**方案 B**：每 rank 算 1/world 词表（16160 行 ≈ 48µs）+ 跨 rank argmax。修法 = 把这次往返做成 v5 epoch 序列里的**一个正常 round**：
+
+1. `argmax_kernel<<<1,1024>>>` 本地切片归约 → `packed = (value_key<<32)|(0xFFFFFFFF-global_idx)`（复用现有 kernel，`dsv41_kernels.cu:2023-2056`）。
+2. **新单线程 xchg 内核**：`e=*epoch` → 把 key 写入**每个 peer** 的 `((e&1)*world+my_rank)*bytes+0`（与 v5 store 同 parity 寻址，`ferrite_kernels.cu:8128`）→ `__threadfence_system()` → 向每个 peer `atomicExch_system(&stamp_tbl[r][my_rank], e+1)` → fence → `*epoch=e+1` → 自旋等所有 peer `ready_local[r]>=e+1`（绝对 stamp 轮询，无 seen[]，`ferrite_kernels.cu:8154-8176` 的协议）→ 读本地 staging 的 world 个 key 取 max → `*out=0xFFFFFFFF-(best&0xFFFFFFFF)`、`*pos_ctr+=1`。
+3. 复用件：`ctr_at` epoch（`tp.rs:127-151`）、`stamps_at` ready 行、`peer_stamps`/`peer_slots`（`tp.rs:173-189`）。**不碰** `c.round`/`reduced_at`。
+4. 死锁论证：stamp 绝对单调、双缓冲（store(k+2) 前置于 reduce(k)，`ferrite_kernels.cu:8112-8115`）。
+5. 旧 `argmax_pub_kernel`/`argmax_final_kernel`（写 `bytes-16` 无 parity 项）是死锁根因，**弃用**。
+6. 验证：四段文本 + 构造跨 rank tie 的单测。
+
+### e4m3→f32 LUT（gemv-fixed-cost2 已验证，待移植，预期 −0.5~0.9ms）
+
+- **256 码穷举逐位一致（0/256 不符）** ✓（host+device 双验，方法同此前 e4m3_to_f 位操作版）。
+- 隔离基准（图内、生产 shape）：n=256: 10.50→**8.33µs**；n=1024: 13.19→**9.23µs**；n=1664: 17.57→**11.22µs**（**−20~30%**）。
+- `gemm_fp8_gemv` 家族 171 次/步 × 2.90ms 是最大单项 → 预期 −0.5~0.9ms/步。
+- 探针框架在远端 `/tmp/dsv41x/gprobe3.cu`（含 ILP2/SPLITK2/GMEMW 等变体：ILP2/SPLITK2 无赢，GMEMW 位一致）。
+- **待办**：等 gemv-fixed-cost2 的最终移植方案（LUT 放哪：smem 256 floats/block vs constant），然后主树替换 `e4m3_to_f` 的位操作分支版。
+
+### hc tail 重叠探针（已部署远端 /tmp/tail_probe）
+
+测 sinkhorn（warp0 串行 ~20 轮）能否与 collapse（1024 线程）重叠：A=串行基线 / B=无 sinkhorn 地板 / C=warp0 sinkhorn + 其余 collapse。若 C−B ≪ A−B 则重叠可回收 ~0.2ms/步。
