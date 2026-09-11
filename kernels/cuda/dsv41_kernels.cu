@@ -3249,7 +3249,10 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // same slot) -- the only difference is WHEN the instruction is issued. It is
     // issued after cudaGridDependencySynchronize(), like every other read of a
     // producer's output, because `w` can be written by the previous node.
-    int pf_row = ((cpasync != 0) && (vec >= 3)) ? (blockIdx.x * nwarps + warp) : -1;
+    // NOTE the explicit (int) cast: `blockIdx.x * nwarps + warp` is UNSIGNED
+    // (blockIdx.x is uint3), so the bare ternary would promote -1 to 0xFFFFFFFF
+    // and leave pf_row == -1 holding on an implementation detail.
+    int pf_row = ((cpasync != 0) && (vec >= 3)) ? ((int)blockIdx.x * nwarps + warp) : -1;
     if (pf_row >= n) pf_row = -1;   // the last block's tail warps have no row
     if (pf_row >= 0) {
         // Family/pointer select copied from the row loop verbatim: a family-2

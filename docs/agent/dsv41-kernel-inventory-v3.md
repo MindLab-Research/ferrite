@@ -571,6 +571,37 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
      时才吃到 8 行/block。**wo_b（f32, n=5120）/ w2（add, n=5120）/ 其余 n≥2048 的 `lin`** 均已覆盖。
    - ⚠️ 待实测：`DSV41_GEMV_WARPS_ADAPTIVE=0` vs `=1` 的同窗口 A/B（文本 + nsys 的
      `gemm_fp8_gemv` 每步 ms）。无 Rust 改动，`cargo check -p ferrite-models` 通过。
+0.6 **P3 cp.async 权重先行（2026-09-11 已落地代码，待实测）——prologue 里唯一可动的串行段**：
+   每 block 的固定成本是块级 prologue（激活 uint4 staging + LUT + a32 物化），而**权重行**的
+   cp.async 原本在 `__syncthreads()` **之后**才发射 ⇒ 传输延迟（k=5120 时每 warp 5KB）完全
+   暴露在 dot 前面。权重行不依赖任何激活产物（`w`/`w_scale` 是模型常量），所以把它提到
+   staging **之前**发射、让 staging + barrier 做覆盖，loop 第 0 次迭代只 `wait_all` 即可。
+   - **实现**：`g_gemv_cpasync`（env **`DSV41_GEMV_CPASYNC`**，默认 ON，`=0` 回退旧发射顺序）
+     → `GemvCore.cpasync`；内核 prologue 在 `s_rows` 之后新增 `pf_row = blockIdx.x*nwarps+warp`
+     的预取块（同一套 family/指针选择，逐字照抄 row 循环），loop 内 `const bool prefetched =
+     (row == pf_row)` 决定是否跳过本轮发射；`wait_all` 无条件保留（多迭代 launch 仍正确）。
+   - **smem 不变**：预取写进 row 循环本来就要写的同一个 per-warp 槽（`s_w + warp*k`），
+     gsmem 仍是 43392B @ k=5120/warps=4/mode4 ⇒ **5 blocks/SM 保持**。分析里"+5KB 权重
+     staging buffer"的双缓冲版本才会掉到 4 blocks/SM（自付费），故未采用；`s_ws` 的 scale 行
+     也刻意不预取（同步字节 load，提到 barrier 前会顶住 barrier）。
+   - **必须在 `cudaGridDependencySynchronize()` 之后发射**：`w` 可能由流上前一个节点写
+     （requant 链），PDL 下 producer 还在跑 ⇒ 提前读是竞态。所以这是"循环内暂存的重新排序"，
+     不是新的提前读。
+   - **逐位等价**：同字节、同槽、同消费顺序，只有发射时机变了；新增状态只有一个 commit group，
+     由 loop 的 `wait_all` 回收。残留风险：`pf_row` 的活跃区间跨整个 prologue（+1 寄存器），
+     `__launch_bounds__(1024)` 把它压在 64 regs 内 ⇒ 只会 spill 不会 701；需实测 regs 数。
+   - 验证：本机无 nvcc（`cargo check -p ferrite-models` 通过；.cu 需远端 `build.sh 103a` 重编）。
+     ⚠️ `.cu` 改动后必须 `.so` 重编，否则运行期 build-id 门禁拒启。
+   - 预期（分析口径）：~2-3µs/call × 246 call ⇒ −0.5~0.7ms。**待 user 亲自单轮 A/B**：
+     `DSV41_GEMV_CPASYNC=1`（默认）vs `=0`，同窗口，文本 + nsys `gemm_fp8_gemv` 每步 ms。
+0.55 **P1 staged gate 的落地修正（2026-09-12）**：`6fc9a1a` 引入的 `DSV41_GEMV_A32_STAGED`
+   当时只写了**调用**（`a32_direct = ... && !dsv41_gemv_a32_staged();`），该函数在全仓库
+   **没有任何定义**（内核里也不能读 env）⇒ HEAD 的 `.cu` 实际**编不过**，且即便编过，
+   launcher 侧 `dsv41_gemv_sa_bytes` 没有同门 ⇒ 内核多算一个 k 字节槽、host 不 reserve，
+   尾部所有指针短 k 字节（越界）。现已按既有模式补齐：host gate `g_gemv_a32_staged`
+   → `GemvCore.a32_staged`（6 个 M=1 launcher 全部接线）→ 内核 `&& !a32_staged`，
+   并把 `dsv41_gemv_sa_bytes(k, norm_fuse)` 加上 `&& !g_gemv_a32_staged`（**布局耦合，
+   两边必须同时改**）。
 1. **`down_reduce` +0.31ms 的定案**：隔离微基准（同一 kernel，HEAD vs `01291b2^`），或 revert 后重采 profile。**这是唯一挡住 0.31ms 回收的事。**
 2. **AR v5 的隔离绝对值**：0.66（v2 约定，被 §3 反证支持）vs 1.49（`86af349`，host-barrier 口径）。需要 device-side v5 的隔离测量。
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。
