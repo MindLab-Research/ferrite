@@ -1715,7 +1715,27 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
-            for (int kb = 0; kb < nb_k; ++kb) {
+            float acc = 0.f;
+            int kb = 0;
+            // Four steps in flight: the eight byte loads are independent, so the
+            // shared-memory latency is covered instead of exposed per step. The
+            // accumulation order (and the (A*sa)*(B*sb) association) is untouched,
+            // so the sum is bit-identical.
+            for (; kb + 3 < nb_k; kb += 4) {
+                const int j0 = (kb + 0) * 32 + lane, j1 = (kb + 1) * 32 + lane;
+                const int j2 = (kb + 2) * 32 + lane, j3 = (kb + 3) * 32 + lane;
+                const float sb0 = ue8m0_to_f(wsr[kb + 0]), sb1 = ue8m0_to_f(wsr[kb + 1]);
+                const float sb2 = ue8m0_to_f(wsr[kb + 2]), sb3 = ue8m0_to_f(wsr[kb + 3]);
+                const float sa0 = a_scale[kb + 0], sa1 = a_scale[kb + 1];
+                const float sa2 = a_scale[kb + 2], sa3 = a_scale[kb + 3];
+                const uint8_t av0 = ap[j0], av1 = ap[j1], av2 = ap[j2], av3 = ap[j3];
+                const uint8_t rv0 = row_s[j0], rv1 = row_s[j1], rv2 = row_s[j2], rv3 = row_s[j3];
+                acc += e4m3_to_f(av0) * sa0 * (e4m3_to_f(rv0) * sb0);
+                acc += e4m3_to_f(av1) * sa1 * (e4m3_to_f(rv1) * sb1);
+                acc += e4m3_to_f(av2) * sa2 * (e4m3_to_f(rv2) * sb2);
+                acc += e4m3_to_f(av3) * sa3 * (e4m3_to_f(rv3) * sb3);
+            }
+            for (; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
                 const float sa = a_scale[kb];    // m == 1
                 const int j = kb * 32 + lane;
