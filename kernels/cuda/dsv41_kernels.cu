@@ -305,6 +305,7 @@ __global__ void engram_gather_kernel(const uint8_t* __restrict__ table,
 
 // q[b,m,h,d] x kv[b,n,d] (ONE KV head) with idxs[b,m,topk]; online softmax with
 // the sink folded into the denominator after the loop.
+#define kMaxPer 8   // d <= 512 with blockDim >= 64; the launcher uses 128 (per = 4)
 __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __restrict__ kv,
                                    const float* __restrict__ sink, const int32_t* __restrict__ idxs,
                                    float* __restrict__ out, int b, int m, int h, int d, int n,
@@ -314,15 +315,28 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
     const int bb = row / m, mm = row % m;
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
         const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
-        float acc[512];
-        for (int c = threadIdx.x; c < d; c += blockDim.x) acc[c] = 0.f;
+        // acc is a COMPILE-TIME-sized array (d <= 512 and blockDim is 128 here, so
+        // per-thread <= 4) indexed by the loop counter, NOT by the element index.
+        // The element-to-thread mapping and the per-thread summation order are
+        // unchanged - thread tid still sums elements tid, tid+blockDim, ... in that
+        // order - so the partials are identical and the output stays bit-identical.
+        // The old `float acc[512]` indexed by `c` was dynamically indexed and spilled
+        // to local memory, which is the largest recoverable cost in this kernel.
+        const int per = (d + (int)blockDim.x - 1) / (int)blockDim.x;
+        float acc[kMaxPer];
+#pragma unroll
+        for (int i = 0; i < kMaxPer; ++i) acc[i] = 0.f;
         float smax = -1e30f, se = 0.f;
         for (int t = 0; t < topk; t++) {
             const int idx = idxs[(size_t)(bb * m + mm) * topk + t];
             if (idx < 0) continue;
             const float* kr = kv + ((size_t)bb * n + idx) * d;
             float dot = 0.f;
-            for (int c = threadIdx.x; c < d; c += blockDim.x) dot += qr[c] * kr[c];
+#pragma unroll
+            for (int i = 0; i < kMaxPer; ++i) {
+                const int c = threadIdx.x + i * (int)blockDim.x;
+                if (c < d) dot += qr[c] * kr[c];
+            }
             // Two-stage dot reduction. The warp shuffle only covers 32 lanes, so
             // on its own it drops every warp but the first: with blockDim=128 and
             // d=512 each thread sums 4 elements, and taking only warp 0's partial
@@ -347,7 +361,11 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
             const float nm = fmaxf(smax, dot);
             const float corr = expf(smax - nm);
             const float e = expf(dot - nm);
-            for (int c = threadIdx.x; c < d; c += blockDim.x) acc[c] = acc[c] * corr + e * kr[c];
+#pragma unroll
+            for (int i = 0; i < kMaxPer; ++i) {
+                const int c = threadIdx.x + i * (int)blockDim.x;
+                if (c < d) acc[i] = acc[i] * corr + e * kr[c];
+            }
             se = se * corr + e;
             smax = nm;
             __syncthreads();
@@ -355,7 +373,8 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
         se += expf(sink[hh] - smax);
         float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
         for (int c = threadIdx.x; c < d; c += blockDim.x)
-            orow[c] = (se > 0.f) ? acc[c] / se : 0.f;
+            const int i = c / (int)blockDim.x;
+            orow[c] = (se > 0.f) ? acc[i] / se : 0.f;
     }
 }
 
