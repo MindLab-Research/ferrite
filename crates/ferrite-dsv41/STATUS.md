@@ -2676,3 +2676,46 @@ reduce(k)（被覆盖半区的最后读者）✓✓。**无主机 barrier、无 
 | 无任何 H2D | 解码稳态仅剩 **engram 哈希的每步上传** ✗（host 算 `ng.forward_row` → upload）⇒ 需设备化 |
 | tile 对齐 | ✓ |
 | 单 CUDA graph | **所有硬阻塞已除** ✓（AR v5 ✓ HEAD_DEV ✓ premix D2D ✓）⇒ 剩 engram 的图外喂数问题 |
+
+## 单图捕获的完整依赖清单（审计完成，可直接执行）
+
+**已就位 ✓**（本会话落地）：
+| 依赖 | 状态 |
+|---|---|
+| AR 无主机 barrier | ✅ AR v5（epoch 设备驻留、运行时读取 ⇒ 图可回放 ✓）|
+| token 留设备 | ✅ HEAD_DEV（argmax 写 s.ids，embed 直读 ✓）|
+| premix | ✅ D2D 每步刷新（图可捕获 ✓）|
+| 集合同步原语 | ✅ publish 链（图内的会合等待 ✓）|
+
+**剩余的每步动态宿主量（图捕获会冻结 kernel 参数 ✗ ⇒ 必须设备化）**：
+| # | 量 | 位置 | 设备化方案（GLM 的 pinned 推进模式 ✓）|
+|---|---|---|---|
+| 1 | `pos` | `layer(layer, pos, ..)` → `attention()` 里两处 `pos as i32` 作 kernel 参数（chain_dev.rs:961/996）| 设备计数器 + 图首小 kernel 自增（或消费 kernel 内读+推进，如 AR v5 的 epoch ✓）|
+| 2 | `compress_len` | `LayerCache.compress_len`（每层宿主状态，每步变化）| 同上：设备计数器数组 [n_layers]，或从 pos 派生 |
+| 3 | **engram 哈希** | host `ng.forward_row(lay, map, 0, &[token], pos, None)` → `upload_bytes_at(eng_ids)`（**解码路径最后一处 H2D** ✗）| 见下 |
+
+### engram 哈希设备化的设计（已读 forward_row 全文 ✓）
+**逻辑**（decode 时 seqlen=1）：cache[pos] = map.get(token)（DEAD 规则）；对 shift∈0..max_ngram 取
+lookback（blocked 规则→pad_id）；rolling = tokens[0]×mult[0]，逐 i：rolling ^= tokens[i]×mult[i]，
+对每 (layer li, head h)：`out[..] = rolling.rem_euclid(lm) + off`（lm/off 来自 `layer.column()`）。
+**需要的设备缓冲**（一次性上传 ✓）：
+- `map 表`：token→compressed id（含 DEAD 编码）[vocab] i64 —— 加载时上传
+- `mults`：每 layer 的 mult[0..max_ngram]（小）
+- `cols`：每 layer 的 (lm, off) 对 [layers][n_cols]（小）
+- `cache`：[max_seq] i64 跨步状态；`pos_ctr`：设备计数器
+**kernel**（~60 行）：读 s.ids 的 token + *pos_ctr → 更新 cache → 算哈希写 eng_ids → 推进 pos_ctr。
+**prefill 衔接**：prefill 走 host 路径（现状 ✓），结束后把 host cache 一次性上传设备 + 初始化 pos_ctr
+（一次性 H2D，非热路径 ✓）。
+**图结构**：图 = [engram_hash → embed → 45×(layer + 2×AR v5) → head → argmax]；图外只有 4B 读（EOS/打印 ✓）。
+
+### 执行顺序（下会话）
+1. engram kernel + 设备缓冲 + prefill 衔接（验证：四段文本**亲自读** + 微基准对拍 host 路径）
+2. pos/compress_len 设备化（图首推进 kernel）
+3. 图捕获（第一步热身、第二步捕获、之后回放 —— 复用 DSV41_GRAPH_MOE 的捕获框架 ✓
+   与其 4 个已修的坑：async memset/memcpy、Relaxed 模式、分配时机）
+4. 验证：四段文本 + A/B + 长跑稳定性（AR v5 的 epoch 跨图切换 —— b16→b2 场景在 GLM 已验证 ✓）
+
+### 本会话总结（供回顾）
+**2.6 → 21.4 tok/s（8.2x）**，八项收益全部同二进制 A/B：hc_mixes 块形状 +74% · fp4 GEMV +21% ·
+fp8 GEMV +16% · warp sinkhorn +5% · down 并入 GEMV +7% · sparse_attn flash 分槽 +6% · HEAD_DEV ~+1% ·
+AR v5 +1%（结构解锁）。**三项结构性资产**：AR v5（第 6 次尝试成功）· HEAD_DEV · 差分法+复现器测量体系。
