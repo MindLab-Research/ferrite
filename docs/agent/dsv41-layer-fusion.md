@@ -63,7 +63,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 20 | `lin wo_b` | :1426 | k=`ol_local`=128 → n=5120 |
 | 21 | **AR#1** | :1434 | `s.o`, 20480 B |
 
-### 段 B（`layer()` :1017-1096 + `moe()` :2147-2593；行号 2026-09-11 复核：`fn moe` = 2147，`fn layer` = 1295，`fn attention` = 1567）
+### 段 B（`layer()` :1017-1096 + `moe()`；行号 2026-09-11 复核：`fn moe` = 2210，`fn layer` = 1314，`fn attention` = 1586，`fn step_body` = 930，`fn moe_reduce` = 795 —— ⚠️ 本节表格内的 `chain_dev.rs` 调用点行号基于更早的修订，使用前需以当前文件复核）
 
 | # | 调用 | 出处 | 形状 |
 |---|---|---|---|
@@ -168,6 +168,19 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   40 层共多 ~560 次 launch/步（本 workload 是 per-call-fixed-cost bound，~10-15µs/次）⇒ 就是那 ~8.7ms。
   修复：把这 7 个默认值还原 `true`，只保留新融合门（GATEUP/DOWN/AR_STORE/SWIGLU_Q/MOE_EPI_ADD）默认 OFF。
   注意 `DSV41_MOE_BATCH` 的 doc 注释仍写 "DEFAULT OFF"，与 round-16 基线以及 -3.2ms 的实测收益矛盾，应一并订正。
+- **✅ gemv kernel 签名 +6 参数（epi_add + AR 5 个）已排除，与 +8.7ms 无关（2026-09-11 ptxas 实测）** ✓：
+  `gemm_fp8_gemv_kernel` 14 → 20 参数（`dsv41_kernels.cu:1722`），但以生产 flag
+  （`-O3 --use_fast_math -gencode arch=compute_103a,code=sm_103a -Xptxas -v`）对比 `314f5df` 与 HEAD：
+  **寄存器 48 → 40（不升反降），两版均 0 spill，34 个 kernel 中只有这一个的寄存器数变了**。
+  occupancy 也不是寄存器约束：mode 4 的 `gsmem` = 5·5120+22784 = **48384 B**（mode 3 = 43264 B），
+  按 smem 算约 4 blocks/SM，而寄存器上限 48 regs→10 blocks、40 regs→12 blocks，**均非绑定项** ⇒ occupancy 不变。
+  launcher 侧的每次调用开销也**未增加**：`dsv41_gemm_fp8_mx` 的两次 `cudaFuncSetAttribute`
+  与 `cudaGetLastError` 与基线逐字节同构，唯一新增是 tile 路径上的 `staging_tbl != nullptr` 早退
+  （`:2032`，M=1 热路径不经过）；`dsv41_gemm_fp8_mx2` 仅是 kernel 实参多传 `0/nullptr`。
+  lane-0 的 `epi_add` 三元与 AR 循环都在 `staging_tbl == nullptr` 下短路，且每 warp 只 1 次。
+  ⇒ 定位退化**不要**再看这里，看 launch 次数（见上一条）。
+  注意 smem 只剩 768 B 余量（49152 − 48384），任何给 mode 4 加 smem 的改动都会
+  越过 48 KB 门槛而触发 `cudaFuncSetAttribute`，需一并复核 launcher。
 - **`DSV41_GRAPH_MOE` 是死路径** ✗（`moe_graph_armed` 全仓无赋值点 ✓）⇒ 其注释/字段应清理 ✓；
   我先前把它当作"段 B 边界定义"是错的 ✗（已在本文件更正 ✓）。
 - **`s.o` 在段 A 内有双重生命周期** ✗：sparse_attn 的输出（`nlh*hd`=4096）与 wo_b 的输出（`dim`=5120）

@@ -5523,3 +5523,23 @@ occupancy 不变——kernel 签名变化不是退化源。
 **教训**：
 1. 子代理修改共享文件时，必须在 commit 前 `git diff` 检查**所有**改动（不只是它声称的）
 2. "gate OFF 一个融合"的 commit 绝不能批量 sed（`unwrap_or(true)→false`）——必须逐个确认
+
+### ✅ 第 22-23 轮定案：融合路径落地为默认（9.65ms / 103.6 tok/s）
+
+| 轮 | 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|---|
+| 22 | safe4（7 老门恢复 + 融合 OFF） | 全败 | — | (failed) ×4 | 0 |
+| **22** | **fon（老门 ON + GATEUP_FUSE=1 + DOWN_FUSE=1）** | **9.65ms** | **103.6** | **四段全对** | **0** |
+| 23 | def（融合默认 ON） | 验证中 | — | — | — |
+
+**融合路径 = gateup+swiglu（每 warp 产一对，swiglu 做 epilogue，ex_act_b 写出减半）+
+down+reduce（删 grid.y 的 slot 维，升序 slot 累加 = reduce 的数值契约，ex_down_b 全程留寄存器）。**
+合计 −0.51ms（10.16→9.65）。
+
+**会话累计：13.28 → 9.65ms（+37.6%），75.3 → 103.6 tok/s。**
+
+**教训（第 18-23 轮共 6 轮排查）**：
+1. 融合 bug 的根因不是 kernel 数值错误——是**两侧默认值分裂**（.cu 的 g_fuse return 1 vs Rust unwrap_or(false)）
+2. f3b1be1 在关新融合时误关了 7 个老门（MOE_BATCH/NR_FUSE/SH_EXP_MX2/MIX_GATE/HEAD_SLICE/FUSE_C/FUSE_B1）→ +8.7ms 退化
+3. **子代理修改共享文件后必须 `git diff` 检查所有改动**——批量 sed 翻默认值是 clobber
+4. gemv-kernel-audit 确认：gemm_fp8_gemv 的 +6 参数签名变化 bit 级不变、寄存器 48→40（0 spill）——不是退化源

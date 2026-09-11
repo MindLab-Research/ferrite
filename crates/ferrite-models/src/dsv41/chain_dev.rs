@@ -200,7 +200,7 @@ fn moe_batch() -> bool {
 /// though it is "set".
 fn down_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Mirrors the CUDA launcher's `g_expert_fp4_mode` (dsv41_experts_mxf4.cu:694):
@@ -2406,7 +2406,7 @@ fn fuse_b1() -> bool {
                 // `ex_down_b` [topk][dim]; both disjoint.
                 let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
                     .map(|v| v != "0")
-                    .unwrap_or(false)
+                    .unwrap_or(true)
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 let act_slot = if gateup_fused {
@@ -2445,7 +2445,7 @@ fn fuse_b1() -> bool {
                 // here, so we mirror the same condition.
                 let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
                     .map(|v| v != "0")
-                    .unwrap_or(false)
+                    .unwrap_or(true)
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 if !gateup_fused {
