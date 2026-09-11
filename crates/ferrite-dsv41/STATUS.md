@@ -2639,3 +2639,40 @@ GEMV 的 n_total/k 均 2 的幂 ✓ —— **基本无问题** ✓。
    cudaMemcpyPeerAsync staging 上。
 2. engram 哈希设备化（消最后一处 H2D；读 s.ids 的设备 token ⇒ 可进图）。
 3. 整步单图捕获（embed → 45 层 → head → argmax 全进一张图；4B 读在图外）。
+
+## ★★★★★★ 里程碑：**AR v5 完全工作**（第 6 次尝试成功）—— 单图最后硬阻塞移除
+
+**此前 5 次设备侧 AR 尝试全部失败**（见上文各节）；本次移植 **GLM AR v5 协议**成功 ✓✓。
+
+**协议（与 GLM 完全同构 ✓）**：
+| kernel | 职责 |
+|---|---|
+| `ar_v5_store(e)` | 把本 rank 缓冲写到**所有对端**的 staging 半区 `e&1`（epoch **运行时从设备内存读** ⇒ 图可回放 ✓）|
+| `ar_v5_publish(e)` | 1 block：`__threadfence_system` 后向所有对端盖章 `e+1`（本 rank 槽位），再轮询**自己的** stamps 直到全部 `≥ e+1` ⇒ 所有对端的 store(e) 完成 |
+| `ar_v5_reduce(e)` | 求和对端 staging 半区 `e&1` **直写调用方缓冲**（p 升序 = 旧路径序 ⇒ 逐位一致 ✓）；**最后一块**推进 epoch（`*epoch = e+1`、清 ctr）⇒ 每次回放恰好一轮 ✓ |
+
+**为什么不需要 credit 等待**（旧设计的 `reduced[p] ≥ round-2` 自旋 ✗ 已删）：**publish 链**替代之 ——
+publish(k) 证明所有对端 store(k) 完成；而我的 store(k+2) 前有我的 publish(k+1) ⇒ 所有对端已完成
+reduce(k)（被覆盖半区的最后读者）✓✓。**无主机 barrier、无 copy-back、无 credit** ✓。
+`end_round()` 在 v5 下为 no-op ✓。开关 `DSV41_AR_V5=1`（**static 缓存** —— 每次 AR 调用的热路径 ✓）。
+
+**验证（三层全过 ✓）**：
+| 层 | 结果 |
+|---|---|
+| 微基准 | `[ar_micro] OK: world=4 rounds=8 n=1024` ✓（2.47s）|
+| 模型四段 | Paris / Tokyo / "2" / 《静夜思》——李白 —— **与 host 路径逐字相同** ✓✓（亲自读）|
+| 同二进制 A/B | v5 **21.4 tok/s（46.71ms）** vs host 21.2（47.23ms）⇒ **+1%** ✓（GPU-bound 下符合预期）|
+
+**本项踩的 2 个构建坑（都已修，值得记住）**：
+1. `const unsigned* epoch` 却要 `*epoch = e+1` ⇒ `modifiable lvalue` 编译错 ✗ ⇒ reduce 的 epoch 参数须非 const ✓。
+2. **launcher 插在匿名 namespace 内** ⇒ 内部链接 ⇒ `nm -D` 找不到 ⇒ "kernel not in the loaded .so" ✗✗
+   （与早前 gemv 入口同坑 ✓）⇒ 移到 namespace 关闭之后 ✓。**判据：绿色构建 ≠ 符号存在，`nm -D` 必查** ✓。
+
+**会话累计：2.6 → 21.4 tok/s（8.2x）**。
+
+### 用户三项指令的进度（更新）
+| 指令 | 状态 |
+|---|---|
+| 无任何 H2D | 解码稳态仅剩 **engram 哈希的每步上传** ✗（host 算 `ng.forward_row` → upload）⇒ 需设备化 |
+| tile 对齐 | ✓ |
+| 单 CUDA graph | **所有硬阻塞已除** ✓（AR v5 ✓ HEAD_DEV ✓ premix D2D ✓）⇒ 剩 engram 的图外喂数问题 |
