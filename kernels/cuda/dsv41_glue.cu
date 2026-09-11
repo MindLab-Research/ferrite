@@ -344,7 +344,18 @@ __global__ void ar_stamp_kernel(const unsigned long long* __restrict__ peer_stam
 
 // AR v5 lives in the SHARED kernel set now: DSV41 calls ferrite_p2p_ar_v5
 // (ferrite_kernels.cu) with its own staging tables. The three DSV41-specific
-// kernels (ar_v5_store/publish/reduce) and their extern "C" launchers were
+// kernels (ar_v5_store/publish/reduce) and their 
+static inline int dsv41_smem_ceiling(const void* /*kern*/) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int dev = 0; cudaGetDevice(&dev);
+    int optin = 0;
+    cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cached = optin - 1024;
+    return cached;
+}
+
+extern "C" launchers were
 // deleted — one protocol, one implementation.
 
 // ===========================================================================
@@ -989,7 +1000,7 @@ extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n,
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gemv_bf16_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             232448);
+                                             dsv41_smem_ceiling(gemv_bf16_kernel));  // runtime ceiling
         if (e != cudaSuccess) return (int)e;
     }
     gemv_bf16_kernel<<<blocks, 256, smem, s>>>((const __nv_bfloat16*)w, x, out, n, k);
