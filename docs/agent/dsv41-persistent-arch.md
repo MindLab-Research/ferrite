@@ -155,6 +155,20 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 
 **为什么 wo_a→wo_b 链式核不行**（复核 gemv-call-pair-wo，`STATUS.md:5973`）：wo_b 的 k = ol_local = 1024 **恰是 wo_a 的完整 n** ⇒ consumer 必须等 producer 全部 drain，链式核内部即跨块栅栏（选举已被证伪 +3.3ms）。异 k（4096 vs 1024）也不能共享 mx2 的同一份 staging。**只有 B1 epilogue 落地**（`gemm_fp8_gemv_kernel:2113` 的 xq/xsc 尾参 + 跨 warp amax epilogue）。
 
+**方向 6「权重串联」否决（explore 2026-09-11，纯代码分析）**：`wo_b∘wo_a` 之间**无非线性**
+（`ref_inference/model.py:785-788` 是 einsum→Linear，无 norm/激活；o-rope 在 wo_a **之前**，
+`chain_dev.rs:2966-3049`；默认 `DSV41_WOB_F32` 路径 wo_b 直读 f32 `s.wo`，中间**已无** fp8 量化）
+⇒ 数学上可以把 `wo_eff = wo_b_local @ wo_a_local` 在加载期预计算成 **单矩阵 [dim=5120, k=4096]**
+（= 21M 参数 / 21MB fp8）。**但 FLOPs 不是「不变」而是 ×2.22**：现值
+`wo_a 1024×4096 (4.19M) + wo_b 5120×1024 (5.24M) = 9.44M` MACs/rank，串联后 `5120×4096 = 20.97M`。
+低秩因子化（o_lora=1024）本来就是省 FLOPs 的手段，串联等于把它取消。按实测 per-call
+（wo_b 5.24MB ≈ 9.5µs，即 ~0.55 TFLOP/s 的占用率/延迟地板）线性外推，串联核 ≈38µs vs 现值
+17µs ⇒ **+21µs/层 × 40 = +0.84ms**，最多只回收 40 次 launch（≤0.34ms）⇒ **净 +0.5ms**。
+另外 ① wo_b 是 RowParallel，**AR#1 不会被消掉**；② 串联必须把训练好的 fp8 权重先反量化再乘、
+再重新量化到 32×32 ue8m0 ⇒ **新增一个精度源**（不是任务书假设的 1e-6，而是 ~1e-3 量级、
+且必然破坏 parity 逐位契约）；③ wo_a 的 `nlg=1`、wo_b 的 k=`ol_local`=1024 都极小，中间量只有
+4KB，不存在可回收的「中间流量」。**结论：不可行，勿试。**
+
 **真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 ON**，`=0` 回退；launcher 用 `cudaLaunchKernelEx` 发射），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
 
 | consumer kernel | launcher | 入口 sync |

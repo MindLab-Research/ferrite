@@ -444,6 +444,18 @@ pub struct DevRuntime {
     /// fully ordered within the capture, so program order disambiguates them.
     fork_ev: *mut c_void,
     join_ev: *mut c_void,
+    /// "hc input ready" event for the tail split: recorded on the MAIN stream
+    /// BEFORE the dots (the program point at which EARLY's inputs — `x`/`s.h` and
+    /// `pre_collapse` — are final) and waited on the SIDE stream BEFORE the EARLY
+    /// half. This is the main→side edge that lets EARLY run concurrently with the
+    /// dots without losing its ordering against the main-stream work that
+    /// produces its operands. Null when unavailable.
+    in_ev: *mut c_void,
+    /// "EARLY done" event for the tail split: recorded on the SIDE stream after
+    /// the EARLY half and waited on the MAIN stream before `hc_front_split`
+    /// returns, so the projection chain that consumes `out`/`xq`/`xsc` sees it.
+    /// Null when unavailable.
+    early_ev: *mut c_void,
     /// Fork/join events for the attention dual chain — same contract as
     /// `fork_ev`/`join_ev` (disable-timing so a whole-step capture may contain
     /// them), but recorded by the MODEL rather than by a kernel launcher,
@@ -628,6 +640,8 @@ impl DevRuntime {
             };
             let mut fork_ev: *mut c_void = std::ptr::null_mut();
             let mut join_ev: *mut c_void = std::ptr::null_mut();
+            let mut in_ev: *mut c_void = std::ptr::null_mut();
+            let mut early_ev: *mut c_void = std::ptr::null_mut();
             let mut fork2_ev: *mut c_void = std::ptr::null_mut();
             let mut join2_ev: *mut c_void = std::ptr::null_mut();
             let mut fork3_ev: *mut c_void = std::ptr::null_mut();
@@ -645,6 +659,25 @@ impl DevRuntime {
                     if let Some(d) = cudart.event_destroy {
                         let _ = d(fork_ev);
                         fork_ev = std::ptr::null_mut();
+                    }
+                }
+                // Tail-split EARLY concurrency (DSV41_HC_TAIL_SPLIT): the pre-dots
+                // `in_ev` and the post-EARLY `early_ev`. Same disable-timing
+                // requirement — both land inside the whole-step capture. If they
+                // cannot be created the launcher is never entered (see
+                // `Device::supports_hc_tail_split`) and the model keeps hc_front.
+                if make_ev(&mut in_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    in_ev = std::ptr::null_mut();
+                }
+                if make_ev(&mut early_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
+                    let _ = (cudart.last_error)();
+                    early_ev = std::ptr::null_mut();
+                }
+                if (in_ev.is_null() || early_ev.is_null()) && !in_ev.is_null() {
+                    if let Some(d) = cudart.event_destroy {
+                        let _ = d(in_ev);
+                        in_ev = std::ptr::null_mut();
                     }
                 }
                 // Dual chain: same disable-timing requirement — both events land
@@ -700,6 +733,8 @@ impl DevRuntime {
                 graph_instantiate_flags,
                 fork_ev,
                 join_ev,
+                in_ev,
+                early_ev,
                 fork2_ev,
                 join2_ev,
                 fork3_ev,
@@ -764,6 +799,22 @@ impl DevRuntime {
     /// unavailable.
     pub fn join_event(&self) -> *mut c_void {
         self.join_ev
+    }
+
+    /// "hc input ready" event for the hc tail split: recorded on the MAIN stream
+    /// by the kernel launcher BEFORE the dots, waited on the side stream BEFORE
+    /// the EARLY half (the edge that keeps EARLY ordered after its main-stream
+    /// producers while running concurrently with the dots). Null when
+    /// unavailable.
+    pub fn in_event(&self) -> *mut c_void {
+        self.in_ev
+    }
+
+    /// "EARLY done" event for the hc tail split: recorded on the SIDE stream by
+    /// the kernel launcher after the EARLY half, waited on the main stream
+    /// before `hc_front_split` returns. Null when unavailable.
+    pub fn early_event(&self) -> *mut c_void {
+        self.early_ev
     }
 
     /// Fork event for the attention dual chain (`DSV41_DUAL_CHAIN`): recorded on

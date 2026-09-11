@@ -3214,6 +3214,8 @@ impl Device {
             && !self.rt.side_stream().is_null()
             && !self.rt.fork_event().is_null()
             && !self.rt.join_event().is_null()
+            && !self.rt.in_event().is_null()
+            && !self.rt.early_event().is_null()
     }
 
     /// hc tail split front end (`DSV41_HC_TAIL_SPLIT`): the dots and the EARLY
@@ -3272,7 +3274,9 @@ impl Device {
                 xsc,
                 self.stream,
                 self.rt.side_stream(),
+                self.rt.in_event(),
                 self.rt.fork_event(),
+                self.rt.early_event(),
                 self.rt.join_event(),
             )
         };
