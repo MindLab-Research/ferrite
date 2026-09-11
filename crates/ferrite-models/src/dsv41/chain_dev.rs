@@ -274,6 +274,74 @@ fn head_slice() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
 }
 
+// ---------------------------------------------------------------------------
+// Diagnostic / A-B gates that live INSIDE the per-layer hot path (the layer
+// loop runs 40x per step, inside the CUDA-graph capture region). A per-call
+// `std::env::var` there takes the environment lock and may allocate a String —
+// pure host cost that inflates graph construction and replay latency, exactly
+// the hot-path slip the other gates above already avoid. Read ONCE and cache,
+// same house rule as eng_host()/fuse_c().
+// ---------------------------------------------------------------------------
+
+/// DSV41_PHASE=1 prints per-layer segment timings.
+fn phase_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_HCDBG=1 dumps L0 activation magnitudes for the hyper-connection debug.
+fn hc_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_STATS=1 enables the per-stage magnitude probes (and disables the step graph).
+fn stats_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_STATS_EVERY (default 5): probe only every Nth layer.
+fn stats_every() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DSV41_STATS_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5)
+    })
+}
+
+/// DSV41_MOEDBG=1 dumps the router's selection per layer.
+fn moe_dbg() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_RING_OWNER=1 restores the old shared-ring window behaviour for A/B.
+fn ring_owner_shared() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_RING_OWNER").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_AR_STORE_FUSE=1 re-enables the wo_b all-reduce store epilogue.
+fn ar_store_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_AR_STORE_FUSE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_GATEUP_FUSE (default ON): gate/up fusion in the batched MoE path.
+fn gateup_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_GATEUP_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// DSV41_CUBLAS_M1=1 routes the M=1 f32/bf16 linears through cuBLAS.
+fn cublas_m1() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false))
+}
+
 fn build_eng_dev(
     dev: &Device,
     lay: &crate::dsv41::engram::EngramLayout,
@@ -683,7 +751,7 @@ impl<'a> DevChain<'a> {
     /// picked gemv2T at ~40 GFLOP/s for a single row (396us/call, 72 per step)
     /// while the weight read floors at ~112us.
     fn lin_f32(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
-        if std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false) {
+        if cublas_m1() {
             return self
                 .dev
                 .gemm_f32(a as *const c_void, w.ptr() as *const c_void, out, 1, n_out, k);
@@ -696,7 +764,7 @@ impl<'a> DevChain<'a> {
     /// weights natively bf16, which is both leaner and slightly more accurate
     /// (no activation rounding).
     fn lin_bf16(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
-        if std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false) {
+        if cublas_m1() {
             self.dev.f32_to_bf16(a, self.s.bf16.ptr as *mut c_void, k as i64)?;
             return self
                 .dev
@@ -943,7 +1011,7 @@ impl<'a> DevChain<'a> {
         )?;
 
         // probe: h right after embedding + hc expansion
-        if std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+        if hc_dbg() {
             let hv = self.dl(self.s.h.as_f32(), hc * dim)?;
             let r = (hv.iter().map(|v| v * v).sum::<f32>() / hv.len() as f32).sqrt();
             eprintln!("[mine] xin_rms={}", (r * 1e6).round() / 1e6);
@@ -1019,13 +1087,11 @@ impl<'a> DevChain<'a> {
             let _ta = std::time::Instant::now();
             premix_slot_idx = self.layer(layer, pos, premix_slot_idx)?;
             let _el = _ta.elapsed();
-            if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+            if phase_dbg() {
                 let _ = (&mut t_attn, &mut t_moe);
                 eprintln!("[phase] L{layer} layer={:?}", _el);
             }
-            if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false)
-                && layer % std::env::var("DSV41_STATS_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(5) == 0
-            {
+            if stats_dbg() && layer % stats_every() == 0 {
                 self.stats(&format!("L{layer} h"), &self.s.h, hc * dim)?;
             }
         }
@@ -1351,7 +1417,7 @@ fn fuse_b1() -> bool {
         // the attention - is redundant and quant1 skips it (pointer-gated).
         self.s.xq_of_xn_valid.set(hc_done && !hc_nw.is_null());
         let _t_all = std::time::Instant::now();
-        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+        if layer == 0 && hc_dbg() {
             let attn_pre = self.dl(self.premix_slot(1).as_f32(), hc)?;
             let po = self.dl(self.s.post.as_f32(), hc)?;
             let cb = self.dl(self.s.comb.as_f32(), hc * hc)?;
@@ -1418,7 +1484,7 @@ fn fuse_b1() -> bool {
             self.copy_h_back()?;
         }
 
-        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+        if phase_dbg() {
             eprintln!("[phs] L{layer} attn={:?}", _t_all.elapsed());
         }
         let _t_moe = std::time::Instant::now();
@@ -1451,7 +1517,7 @@ fn fuse_b1() -> bool {
         // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
         // MoE's quant1(xn) - its first xq consumer - is redundant and skips.
         self.s.xq_of_xn_valid.set(ffn_done && !ffn_nw.is_null());
-        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+        if phase_dbg() {
             eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
         }
         // the FFN collapses with THIS layer's attn_pre (slot 1), which stayed on
@@ -1515,7 +1581,7 @@ fn fuse_b1() -> bool {
             self.moe(layer, ld)?;
         }
         self.moe_reduce()?;
-        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+        if phase_dbg() {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
         if Self::fuse_c() {
@@ -1540,7 +1606,7 @@ fn fuse_b1() -> bool {
             )?;
             self.copy_h_back()?;
         }
-        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
+        if phase_dbg() {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
         }
         Ok(2) // slot 2 holds this layer's ffn_pre = the next layer's premix
@@ -1549,7 +1615,7 @@ fn fuse_b1() -> bool {
     /// Diagnostic: report the magnitude of a stage's output. `DSV41_STATS=1`.
     /// Turns "the text is wrong" into "stage X is fine / stage Y exploded".
     fn stats(&self, label: &str, buf: &DevBuf, n: usize) -> Result<()> {
-        if std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false) {
+        if stats_dbg() {
             self.dev.sync()?;
             let mut v = vec![0f32; n];
             let b = Device::view(buf.ptr, n * 4);
@@ -1666,7 +1732,7 @@ fn fuse_b1() -> bool {
             false,
         )?;
 
-        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+        if layer == 0 && hc_dbg() {
             let q = self.dl(self.s.q.as_f32(), nlh * hd)?;
             let r = (q.iter().map(|v| v * v).sum::<f32>() / q.len() as f32).sqrt();
             eprintln!("[mine] L0 q[0..4]={:?} q_full_rms={}", &q[..4], r);
@@ -1726,7 +1792,7 @@ fn fuse_b1() -> bool {
         )?;
         }
 
-        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+        if layer == 0 && hc_dbg() {
             let kv = self.dl(self.s.kv.as_f32(), hd)?;
             let r = (kv.iter().map(|v| v * v).sum::<f32>() / kv.len() as f32).sqrt();
             eprintln!("[mine] L0 kv[0..4]={:?} kv_rms={}", &kv[..4], r);
@@ -1747,7 +1813,7 @@ fn fuse_b1() -> bool {
         // exactly why layer 2 (the owner) matched the official while layer 3, the
         // first consumer, dropped ~15%. DSV41_RING_OWNER=1 restores the old
         // shared-ring behaviour for A/B.
-        let owner = if std::env::var("DSV41_RING_OWNER").map(|v| v != "0").unwrap_or(false) {
+        let owner = if ring_owner_shared() {
             self.kv_owner(layer)
         } else {
             layer
@@ -1858,7 +1924,7 @@ fn fuse_b1() -> bool {
             true,
         )?;
 
-        if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
+        if layer == 0 && hc_dbg() {
             let o = self.dl(self.s.o.as_f32(), nlh * hd)?;
             let r = (o.iter().map(|v| v * v).sum::<f32>() / o.len() as f32).sqrt();
             eprintln!("[mine] L0 sparse_o[0..4]={:?} sparse_rms={}", &o[..4], r);
@@ -1920,9 +1986,7 @@ fn fuse_b1() -> bool {
         // epilogue having stored the partials - a coupling that must be debugged
         // together with the GATEUP_FUSE numerical bug). DSV41_AR_STORE_FUSE=1
         // re-enables.
-        let ar_store_fused = std::env::var("DSV41_AR_STORE_FUSE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
+        let ar_store_fused = ar_store_fuse()
             && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
         self.quant1(self.s.wo.ptr as *const f32, ol_local as i32)?;
         if ar_store_fused {
@@ -2328,7 +2392,7 @@ fn fuse_b1() -> bool {
             self.dev.zero(&self.s.o)?;
         }
         let wsum = vec![0f32; ne.max(1)];
-        if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+        if moe_dbg() {
             eprintln!("[mine] route idx={:?} wgt={:?}", &idx, &wgt);
         }
         // The experts' tensors are views into one per-layer pool with a uniform
@@ -2363,7 +2427,7 @@ fn fuse_b1() -> bool {
         } else {
             (std::ptr::null(), 0, std::ptr::null(), 0)
         };
-        if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
+        if moe_dbg() {
             let n_active = wsum.iter().filter(|w| **w != 0.0).count();
             eprintln!(
                 "[mine] L{layer} route idx={:?} active_experts={} of {} (topk={})",
@@ -2404,9 +2468,7 @@ fn fuse_b1() -> bool {
                 // 2*inter_local (unfused: gate|up) or inter_local (fused: the
                 // swiglu'd result written by the kernel's epilogue).
                 // `ex_down_b` [topk][dim]; both disjoint.
-                let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
+                let gateup_fused = gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 let act_slot = if gateup_fused {
@@ -2443,9 +2505,7 @@ fn fuse_b1() -> bool {
                 // path (the kernel sets it when mode==2 && dim%512==0), and skip
                 // swiglu when it did. We can't read the kernel's decision from
                 // here, so we mirror the same condition.
-                let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
-                    .map(|v| v != "0")
-                    .unwrap_or(true)
+                let gateup_fused = gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 if !gateup_fused {
