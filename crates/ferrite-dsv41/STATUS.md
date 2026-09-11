@@ -4716,3 +4716,66 @@ __launch_bounds__(128, 8) → 64 regs 上限 → nvcc 没有寄存器做重排
 这解释了为什么 `#pragma unroll 4`（编译器自行展开、在预算内选择）是安全的：
 nvcc 知道自己的寄存器预算，不会做出越界的重排。手写展开强制了展开因子，
 把"要不要重排"的决定权从编译器手里拿走了。
+
+### 🔍 深挖 3ms：解耦"load 在飞"与"算术重排"（2026-09-11 12:00）
+
+**用户判断正确**：3ms 太重要，值得深挖。之前"寄存器阈值"的归因已被用户推翻（NVIDIA 不可能有硬件 bug）。
+
+**重新分析手写展开为什么既快又退化**：
+
+快的来源：**4 对独立 load（ap[j0..j3] + row_s[j0..j3]）同时发射** → 隐藏 L1 延迟 → 3ms 收益。
+退化的来源：**4 条独立的 `acc +=` 表达式在同一作用域** → fast_math 有重排自由 → 数值漂移。
+
+**关键认知：这两个效果可以解耦！**
+
+手写展开把"load 提前"和"算术展开"混在了一起。我们可以只做前者：
+
+```cuda
+// 预取流水线：4 对 load 在飞，但算术保持单链
+uint8_t av0 = ap[0*32+lane], rv0 = row_s[0*32+lane];  // 预取
+uint8_t av1 = ap[1*32+lane], rv1 = row_s[1*32+lane];
+uint8_t av2 = ap[2*32+lane], rv2 = row_s[2*32+lane];
+uint8_t av3 = ap[3*32+lane], rv3 = row_s[3*32+lane];
+
+for (kb = 0; kb + 3 < nb_k; kb += 4) {
+    // 发射下一批 4 对 load（在计算当前批时飞行）
+    uint8_t av4 = ap[(kb+4)*32+lane], rv4 = row_s[(kb+4)*32+lane];
+    uint8_t av5 = ap[(kb+5)*32+lane], rv5 = row_s[(kb+5)*32+lane];
+    uint8_t av6 = ap[(kb+6)*32+lane], rv6 = row_s[(kb+6)*32+lane];
+    uint8_t av7 = ap[(kb+7)*32+lane], rv7 = row_s[(kb+7)*32+lane];
+
+    // 算术：逐条 acc += ...（与基线完全相同的单链形式）
+    { float sb=..., sa=...; acc += e4m3_to_f(av0)*sa*(e4m3_to_f(rv0)*sb); }
+    { float sb=..., sa=...; acc += e4m3_to_f(av1)*sa*(e4m3_to_f(rv1)*sb); }
+    { float sb=..., sa=...; acc += e4m3_to_f(av2)*sa*(e4m3_to_f(rv2)*sb); }
+    { float sb=..., sa=...; acc += e4m3_to_f(av3)*sa*(e4m3_to_f(rv3)*sb); }
+
+    // 轮转：新 load 变为"已加载"
+    av0=av4; rv0=rv4; av1=av5; rv1=rv5; av2=av6; rv2=rv6; av3=av7; rv3=rv7;
+}
+```
+
+**为什么这不会退化**：
+1. 算术部分**逐条 `acc += A * sa * (B * sb)`**——与基线的单链完全相同的源码形式
+2. fast_math 无法重排：每条 `+=` 读/写同一个 `acc`，依赖链清晰
+3. **load 的提前不改变数值**（只是把数据更早搬进寄存器）
+4. 寄存器：~8 个 uint8_t + ~8 个地址 ≈ 20 额外寄存器（在 64 regs 预算内）
+
+**与手写展开的关键区别**：
+- 手写展开：4 条独立的 `acc +=` 表达式在同一作用域 → fast_math 有重排自由 → 退化
+- 预取流水线：4 条 `acc +=` 也在同一作用域 BUT load 是从寄存器读（不依赖数组索引） → 编译器不能重排算术因为每条依赖前一条的 acc
+
+等等——4 条 `acc +=` 在同一作用域，fast_math 仍然可以重排它们（把手写展开的教训）。
+**所以必须用 `__fadd_rn` 逐条钉住加法**，或者……
+
+**更安全的做法**：把 4 条算术也放在一个内层循环里（编译器不展开）：
+```cuda
+for (int j = 0; j < 4; ++j) {
+    float sb = ue8m0_to_f(wsr[kb + j]);
+    float sa = a_scale[kb + j];
+    acc += e4m3_to_f(av[j]) * sa * (e4m3_to_f(rv[j]) * sb);
+}
+```
+但 `av[j]` 和 `rv[j]` 是数组 → 可能落 local memory → 慢。
+
+**最终方案：用 4 个命名变量 + 显式顺序的 4 条算术 + `__fadd_rn` 钉住**
