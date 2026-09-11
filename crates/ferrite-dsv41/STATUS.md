@@ -3344,3 +3344,21 @@ smem 与 per-step 值解耦后消失 ✓。**两种加速模式的干净对照�
 
 **`cl = min(lens[mm], n_pos)`** 读作**一致性护栏**（输出数不得超出已扫描范围 ✓ 而非任意包络 ✓）；
 **待合成扫描确认**（`n_pos` 1→40000 全尺寸 + `lens[mm] > *lens` 是否可达 ✓）。
+
+### ⚠️ 流程教训（2026-09-11）：远端命令前**必须先同步**（否则测的是旧码 ✗）
+
+**症状**：剖析脚本修好并提交后，远端重跑**仍是 `0.0 ms` + 环境变量 dump** ✗（连两次 ✗），一度
+让我怀疑"修复无效" ✗。
+**根因**：我的远端命令一直是 `ssh … 'cd ~/ferrite && …'`，**从不先 `git fetch/reset`** ✗ ⇒ 远端
+停在 `baf35c77e`，跑的是**旧脚本**（注释仍插在续行里 ✗）⇒ 假象 ✗。同理**分块重写当时只在
+本地** ✗ —— 任何远端验证（验收/测速/剖析）若不先同步，测的都是旧码 ✗✗。
+
+**⇒ 铁律（远端任何 run 之前，三步不可省）**：
+```bash
+ssh … 'cd ~/ferrite && git fetch origin main && git reset --hard FETCH_HEAD'   # 1) 同步
+ssh … 'cd ~/ferrite/kernels/cuda && bash build.sh 103a …'                      # 2) 双产物重编
+ssh … 'cd ~/ferrite && cargo build --release'                                  #    （.so + 二进制）
+# 3) 产物指纹核对：ls -la 两者都新于源码 + md5sum 记录
+```
+`git reset --hard FETCH_HEAD` 是文档 2b 规定的**同步**流程 ✓（不是 revert ✗）；它不动被
+gitignore 的 `libferrite_kernels.so` 与 `target/` ✓。
