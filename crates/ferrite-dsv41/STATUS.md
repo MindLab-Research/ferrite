@@ -3427,3 +3427,43 @@ synchronize()|.sync()|from_device|device_to_host`，**step 路径上只有两处
    MoE 批化 −3.2ms 正是吃了这一口 ✓）。
 3. 200 tok/s = **5.0 ms/步**（当前 32.08 ✗，差 6.4x）⇒ 只有把链缩短/延迟填满才有可能 ✗，
    而这与"0.53 GB/420 GB/s 有效带宽"量级的余量吻合 ✓（**方向成立，实现需结构变化** ✓）。
+
+## 📊 2026-09-11 首次有效 nsys 分解 + 三大结构发现
+
+**前提**：剖析脚本修复后首跑（`DSV41_MOE_BATCH=1`，图与 AR v5 按文档 pin 关 ✓）。注意脚本自带警告
+"multi-device nsys times are not trustworthy" ✓ —— 本次证实：剖析总时 **41.97 ms/步/卡** ✗ 而真实步时
+33.94ms ✗ ⇒ **约 10x 膨胀**，主要来自 **AR 自旋**（与 AGENTS.md 明载的 v5 自旋被节点追踪放大同源 ✓）
+⇒ **只有"份额"可用，绝对 us/call 不可用** ✓。
+
+| 份额 | kernel | 调用/步 | 判读 |
+|---|---|---|---|
+| **27.7%** | `gemm_fp8_gemv_kernel` | 59 | DSV4.1 投影族；grid = `(n+7)/8` ⇒ 160-640 blocks ✓ **并行度良好** |
+| **21.4%** | `expert_gemv_fp4_batched_kernel` | 21.5 | MoE 专家；grid = `(2·inter/8, slots)` = **4032 blocks** ✓ 良好 |
+| 18.5% | `ar_reduce_kernel` | 22（store/stamp/reduce 各 858 ✓）| **自旋被放大 ✗** ⇒ 真实占比远小 |
+| **13.1%** | `hc_mixes_kernel` | 21.5 | **grid = rows = 1** ✗✗ |
+| 3.4% | `sparse_attn_warp` | 10.7 | 良好（多维 grid ✓）|
+| 2.4% | `gemv_bf16` | 12.8 | 良好（`(n+7)/8` ✓）|
+| 1.8% | `indexer_topk`（分块版 ✓）| 1.05 | 良好 |
+| 1.8% | `rmsnorm` | 44（1726 次 ✓）| 小核链 |
+| 1.6% | `gemv_f32` | 2.2 | 良好 |
+| 1.1% | `quant` | 58（2259 次 ✓）| 小核链 |
+| 0.7% | `route_topk` | 10.7 | **grid = rows = 1** ✗ |
+| 0.6% | `hc_post` | 21.5 | |
+| 0.5% | `apply_rope` | 34（1338 次 ✓）| **grid = rows = 1** ✗ |
+
+**发现 1：每步 364 个 kernel** ✗（14,181 次 / 39 步 ✓，与"~400 节点"旧记载吻合 ✓）⇒ 链极长 ✓。
+
+**发现 2：`grid = rows` 模式在 bs=1 下退化成"1 个 SM"** ✗ —— 已确认三处：`hc_mixes_kernel`
+（`<<<rows, mix*32>>>` ✓ 768 线程全挤在一个 block ✗）、`apply_rope_kernel`（`<<<rows,128>>>` ✗）、
+`route_topk_kernel`（`<<<rows,256>>>` ✗）。**hc_mixes 占 13.1% 是其中唯一值得单独立项的** ✓
+（另外两个 0.5%/0.7% ✗ ⇒ 归入小核链融合 ✓）。**`hc_mixes` 已有现成分块版**
+（`DSV41_HC_MIXES_SPREAD`：`hc_mixes_ss/rows/post` 三核，grid = `mix×rows×split` = **192 blocks** ✓，
+代码注释载明"算术顺序逐位等同单块核，已直接比对验证 ✓"）⇒ 直接 A/B 即可 ✓。
+
+**发现 3：层内本可并发却被单流串行化** ✗ —— `chain.rs:9-13` 显示
+`attn_pre/post/comb = hc_mixes(x, hc_attn_*)` 与 `ffn_pre/post/comb = hc_mixes(x, hc_ffn_*)`
+**都只吃层输入 x** ✓，且 **ffn 分支不依赖注意力输出** ✓ ⇒ 二者在层内互相独立 ✗；但代码顺序发射
++ 单流（`grep` 确认无 aux 流 ✗）⇒ 图按序串行化 ✗。这是"填满延迟"的第二个具体入口 ✓
+（GPU 大段空转已被地基判定与本次分解双重印证 ✓）。
+
+**方法学**：剖析的"份额"可信、"绝对时间"不可信 ⇒ 优化判据仍然只用 **`[dsv41] step pos=N: X.XXms` 逐步直打中位数** ✓ + 四段文本人眼 ✓。
