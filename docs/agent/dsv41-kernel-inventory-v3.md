@@ -386,6 +386,16 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 
 ⚠️ `kpool_compress` 仍不在本 profile 里（它只服务 batched DSA 链 `cuda.rs:4645`，与单序列 `sparse_attn_pf_kernel` 不是同一条数据链）。
 
+⚠️ **本表是 `db2917501`（09-11 16:48）的**剖析快照**，不是当前代码的 launch 清单**。表里四个 elementwise 小核
+此后都已被融合/消除（2026-09-11 explore 逐核复核；数字仍保留供溯源）：
+
+| 表内条目 | 当前状态（代码 + env 默认） | 出处 |
+|---|---|---|
+| `add_kernel` 40× | ✅ **ADD_EPI 已实施**（`DSV41_ADD_EPI`，默认 ON）：`moe` 的共享专家合并 `s.o += s.ex_out` 折进 MoE AR#2 的 **store** epilogue（`ferrite_p2p_ar_v5_add` / `..._hcpost_add`）。旧 `.so`/符号缺失/未跑共享专家 → 自动回退独立 `ferrite_add` | `chain_dev.rs::add_epi` / `moe_reduce` / `tp.rs::all_reduce_inplace_add` |
+| `swiglu_limit_kernel` 40× | ✅ **已无独立 launch**：routed batched 路径由 gate/up 融合的 epilogue 承担（`gateup_fused` 默认 ON ⇒ `swiglu_limit_batched` 被跳过）；共享专家由 A4 `swiglu_limit_q`（默认 ON）直出 fp8 | `chain_dev.rs:3838 / 4027-4047` |
+| `fp4_pack_kernel` 40× †† | ✅ **已融合**：`g_q4_fuse` 默认 1 ⇒ 单核 `quant_fp4_fused_kernel`；本表 tree（16:48）早于落地它的 `2d7eead`（18:39）⇒ 该行是**融合前**数据 | `dsv41_kernels.cu:2310-2332` |
+| `ring_append_kernel` + `window_idxs_kernel` | ✅ **已合并为一个** `dsv41_ring_win_fuse`（`DSV41_RING_WIN_FUSE` 默认 ON，每层 1 次、非 owner 层仍写 idxs）；本表 tree 早于落地它的 `710c107`（17:54）⇒ 两行都是**合并前**数据 | `chain_dev.rs:2802` |
+
 ### indexer_score v2（Step A，✅ 2026-09-11 已实施，**待 A/B**）
 
 > **病**（v1，`dsv41_kernels.cu` 的 `indexer_score_kernel`）：与修好前的 gate 同构——每个 FMA 配一次**标量**
@@ -435,6 +445,13 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
   想优化 lm_head 就不能看 22.4µs 这个均值。
 - ⚠️ **env 默认门翻转会改变 kernel 混合**：`MIX_GATE` ON→OFF 让一个核换成两个核。
   **跨 commit 比较 profile，等于同时比较 env 默认值**。本文头部必须记 env，v2 就是踩了这个（它的表是 MIX_GATE=ON 口径）。
+- ⚠️ **profile 的 .so 版本 ≠ 代码版本**（ADD_EPI 复核时踩到）：nsys 表里的 `swiglu_limit`/`fp4_pack`/`ring_append`+`window_idxs`
+  在本表 tree（`db2917501`）之后才被融合，**照表去"实施融合"会去重做已完成的事**。判据一律是
+  `git merge-base --is-ancestor <落地 commit> <profile tree>`，不是核名字还在不在表里。
+- ⚠️ **ADD_EPI 的 host 决策在捕获时被烘焙**：整个 step 被捕获成一个 CUDA graph（`step_body`，`chain_dev.rs:1617-1646`），
+  `moe()` 里的 host 分支只在**捕获那次**执行，AR 的参数（含 bias 指针）被写进图。所以 `moe_add_in` 必须
+  **per-layer 且只读不消费**（`Vec<Option<*const f32>>` + `moe_reduce(layer)` 读）——写成 `take()` 会让每次
+  replay 丢融合，写成单字段会让 per-layer MoE 图（`DSV41_GRAPH_MOE`）互相覆盖。
 - ⚠️ **一个 commit 可能塞进多个优化**：`db2917501` 标题只写 CSE，实际还含 `rmsnorm_q` 融合（−0.05ms）。
   归因时一律 `git show <commit>` 看 hunk。
 - ⚠️ **`/tmp/dsv41-prof-v3` 是 v2 的证据目录**。本次采集前后已把 v2 的数据改存为

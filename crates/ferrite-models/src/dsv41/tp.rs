@@ -355,6 +355,104 @@ impl Collective {
         Ok(true)
     }
 
+    /// AR v5 with the elementwise residual `add_in` folded into the STORE
+    /// epilogue (`ferrite_p2p_ar_v5_add`, chain_dev.rs `add_epi()`): the value
+    /// published to every peer is `buf[i] + add_in[i]` instead of `buf[i]`, which
+    /// is exactly what the standalone `add_inplace(buf, add_in)` immediately
+    /// before this AR produced. The pubred/reduce is the unchanged v5 one, so the
+    /// result is BIT-IDENTICAL (same operands, same ascending-rank order) and one
+    /// launch shorter. `Ok(false)` when the .so lacks the symbol, so the caller
+    /// runs the standalone add + `all_reduce_inplace` as before.
+    ///
+    /// `add_in` must be final on this stream before the call (the MoE dual-chain
+    /// join already guarantees it at the only call site).
+    pub fn all_reduce_inplace_add(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        add_in: *const f32,
+    ) -> Result<bool> {
+        if !ar_v5() {
+            return Ok(false);
+        }
+        let n = (len / 4) as c_int;
+        let stride = self.slot_stride_elems();
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        self.dev.p2p_ar_v5_add(
+            buf as *const f32,
+            add_in,
+            self.peer_slots.ptr as *const *mut f32,
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+        )
+    }
+
+    /// `all_reduce_inplace_hcpost` + the ADD_EPI residual in one launch (see
+    /// [`Self::all_reduce_inplace_add`] and [`Self::all_reduce_inplace_hcpost`]).
+    /// Same shape gate as the plain hcpost fold; `Ok(false)` when it declines or
+    /// the .so is stale, so the caller falls back to add + `all_reduce_inplace` +
+    /// `hc_post_inplace`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_inplace_hcpost_add(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        add_in: *const f32,
+        res: *mut f32,
+        post: *const f32,
+        comb: *const f32,
+        hc_n: i32,
+        hc_h: i32,
+    ) -> Result<bool> {
+        if !ar_v5()
+            || hc_n <= 0
+            || hc_n > 8
+            || hc_h <= 0
+            || (hc_h & 3) != 0
+            || (len / 4) as i32 != hc_h
+        {
+            return Ok(false);
+        }
+        let n = (len / 4) as c_int;
+        let stride = self.slot_stride_elems();
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        if !self.dev.p2p_ar_v5_hcpost_add(
+            buf as *const f32,
+            add_in,
+            self.peer_slots.ptr as *const *mut f32,
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+            res,
+            post,
+            comb,
+            hc_n as c_int,
+            hc_h as c_int,
+        )? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Publish `len` bytes from `src` into slot `rank` of every rank. `len`
     /// must not exceed the slot size: a site with a shorter payload than the
     /// staging would otherwise publish unrelated memory.

@@ -89,19 +89,50 @@ __global__ void engram_apply_kernel(float* __restrict__ x, const float* __restri
     const int i = blockIdx.y;
     if (r >= rows || i >= hc) return;
     const size_t span = (size_t)hc * dim + dim;
-    const float* h = x + ((size_t)r * hc + i) * dim;             // read + written back
+    float* h = x + ((size_t)r * hc + i) * dim;                   // read + written back
     const float* k = kv + (size_t)r * span + (size_t)i * dim;
     const float* value = kv + (size_t)r * span + (size_t)hc * dim;
     const float* qw = q_weight + (size_t)i * dim;
     const float* kw = k_weight + (size_t)i * dim;
 
+    // Only hc blocks are launched (4 in the production config) and each block's
+    // whole job is a dim-long strided scan plus a fixed-shape tree reduction, so
+    // the kernel is latency-bound, not bandwidth-bound: it moves ~90 KB per
+    // block (dim=5120 x 5 arrays x 4 B) against a ~0.1 us DRAM floor yet
+    // measured 32.6 us/call. The float4 body cuts the per-thread round trips 4x
+    // (dim/4 = 1280 vectors over 256 threads = 5 rounds instead of 40 scalar
+    // ones) and the launcher uses 256 threads (8 warps, the block_sum3 limit).
+    // The reduction order changes, so this is NOT bit-identical to the scalar
+    // body - the same trade the engram f32 direct-read path already made; the
+    // numerical self-test (tests_dsv41_glue.cu, 1e-6) is the gate.
+    // vec4 needs 16B everywhere: dim % 4 == 0 makes every row offset a multiple
+    // of 16 B, and the four bases are cudaMalloc'd tensors (the launcher never
+    // hands in an interior pointer).
+    const bool vec4 = ((dim & 3) == 0) &&
+                      ((((uintptr_t)h | (uintptr_t)k | (uintptr_t)qw | (uintptr_t)kw) & 15u) == 0);
+
     float hss = 0.f, kss = 0.f, dot = 0.f;
-    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
-        const float hv = h[c];
-        const float kval = k[c];
-        hss += hv * hv;
-        kss += kval * kval;
-        dot += hv * qw[c] * kw[c] * kval;
+    const int n4 = dim >> 2;
+    if (vec4) {
+        const float4* h4 = reinterpret_cast<const float4*>(h);
+        const float4* k4 = reinterpret_cast<const float4*>(k);
+        const float4* q4 = reinterpret_cast<const float4*>(qw);
+        const float4* w4 = reinterpret_cast<const float4*>(kw);
+        for (int c = threadIdx.x; c < n4; c += blockDim.x) {
+            const float4 hv = h4[c], kv = k4[c], qv = q4[c], wv = w4[c];
+            hss += hv.x * hv.x + hv.y * hv.y + hv.z * hv.z + hv.w * hv.w;
+            kss += kv.x * kv.x + kv.y * kv.y + kv.z * kv.z + kv.w * kv.w;
+            dot += hv.x * qv.x * wv.x * kv.x + hv.y * qv.y * wv.y * kv.y +
+                   hv.z * qv.z * wv.z * kv.z + hv.w * qv.w * wv.w * kv.w;
+        }
+    } else {
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            const float hv = h[c];
+            const float kval = k[c];
+            hss += hv * hv;
+            kss += kval * kval;
+            dot += hv * qw[c] * kw[c] * kval;
+        }
     }
     block_sum3(hss, kss, dot);
 
@@ -114,8 +145,18 @@ __global__ void engram_apply_kernel(float* __restrict__ x, const float* __restri
     float gate = 1.f / (1.f + expf(-mag));
     if (token_mask != nullptr && token_mask[r] == 0u) gate = 0.f;
 
-    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
-        x[((size_t)r * hc + i) * dim + c] = h[c] + gate * value[c];
+    if (vec4) {
+        float4* h4 = reinterpret_cast<float4*>(h);
+        const float4* v4 = reinterpret_cast<const float4*>(value);
+        for (int c = threadIdx.x; c < n4; c += blockDim.x) {
+            const float4 hv = h4[c], vv = v4[c];
+            h4[c] = make_float4(hv.x + gate * vv.x, hv.y + gate * vv.y, hv.z + gate * vv.z,
+                                hv.w + gate * vv.w);
+        }
+    } else {
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            h[c] = h[c] + gate * value[c];
+        }
     }
 }
 
@@ -480,9 +521,14 @@ __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restric
 // compressed-token cache at the DEVICE-side position counter, look back
 // max_ngram tokens with the blocked rule (a position below zero or a DEAD entry
 // pads every further lookback), then the rolling XOR hash per (layer, ngram,
-// head): out = rolling.rem_euclid(lm) + off. Single thread on purpose: a few
-// hundred integer ops once per step, and serial execution keeps it bit-identical
-// to the host reference (which is also serial).
+// head): out = rolling.rem_euclid(lm) + off.
+//
+// Was ONE thread walking all n_layers*n_cols = 48 columns serially, each a
+// 64-bit modulo (a software routine on sm_103a) plus two table reads: 17.6 us
+// of pure serial latency. Every column is now an independent lane (the hash is
+// integer and each eng_ids element is written by exactly one thread, so the
+// result is bit-identical); the token gather is recomputed per lane, which is
+// <= max_ngram (<= 8) L1/L2 cache reads.
 __global__ void engram_hash_step_kernel(const long long* __restrict__ map, long long* __restrict__ cache,
                                    const long long* __restrict__ mults,
                                    const unsigned long long* __restrict__ lms,
@@ -490,33 +536,38 @@ __global__ void engram_hash_step_kernel(const long long* __restrict__ map, long 
                                    long long* __restrict__ eng_ids, const int* __restrict__ token,
                                    const int* __restrict__ pos_ctr, long long map_len, int n_layers,
                                    int max_ngram, int n_heads, long long pad_id) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const int p = *pos_ctr;
-    const long long t = (long long)token[0];
-    cache[p] = ((unsigned long long)t < (unsigned long long)map_len) ? map[t] : 0;
-    long long tokens[8];
-    bool blocked = false;
-    for (int shift = 0; shift < max_ngram; ++shift) {
-        const long long q = p - (long long)shift;
-        const long long src = (q >= 0) ? cache[q] : 0;
-        blocked = blocked || (q < 0) || (src == -1);  // -1 == DEAD
-        tokens[shift] = blocked ? pad_id : src;
+    // One lane refreshes cache[p]; the barrier publishes it to the columns
+    // (only pos_ctr itself was advanced by the previous kernel).
+    if (threadIdx.x == 0) {
+        const long long t = (long long)token[0];
+        cache[p] = ((unsigned long long)t < (unsigned long long)map_len) ? map[t] : 0;
     }
+    __syncthreads();
     const int n_cols = (max_ngram - 1) * n_heads;
-    for (int li = 0; li < n_layers; ++li) {
+    const int total = n_layers * n_cols;
+    for (int idx = threadIdx.x; idx < total; idx += blockDim.x) {
+        const int li = idx / n_cols;
+        const int col = idx - li * n_cols;
+        const int shift = col / n_heads + 1;  // col = (shift-1)*n_heads + head
+        // tokens[0..shift] with the same cumulative blocked rule the serial
+        // walk used (blocked[sh] covers every lookback up to sh).
+        long long tokens[8];
+        bool blocked = false;
+        for (int sh = 0; sh <= shift; ++sh) {
+            const long long q = p - (long long)sh;
+            const long long src = (q >= 0) ? cache[q] : 0;
+            blocked = blocked || (q < 0) || (src == -1);  // -1 == DEAD
+            tokens[sh] = blocked ? pad_id : src;
+        }
         const long long* m = mults + (size_t)li * 4;
         long long rolling = tokens[0] * m[0];
-        for (int i = 1; i < max_ngram; ++i) {
-            rolling ^= tokens[i] * m[i];
-            for (int h = 0; h < n_heads; ++h) {
-                const int col = (i - 1) * n_heads + h;
-                const long long lm = (long long)lms[(size_t)li * n_cols + col];
-                const long long off = (long long)offs[(size_t)li * n_cols + col];
-                long long v = rolling % lm;
-                if (v < 0) v += lm;  // rem_euclid
-                eng_ids[(size_t)li * n_cols + col] = v + off;
-            }
-        }
+        for (int i = 1; i <= shift; ++i) rolling ^= tokens[i] * m[i];
+        const long long lm = (long long)lms[(size_t)li * n_cols + col];
+        const long long off = (long long)offs[(size_t)li * n_cols + col];
+        long long v = rolling % lm;
+        if (v < 0) v += lm;  // rem_euclid
+        eng_ids[(size_t)li * n_cols + col] = v + off;
     }
     // NOTE: the counter is NOT advanced here any more - the argmax, the
     // LAST kernel of the step, advances it, so every kernel in between
@@ -529,8 +580,8 @@ extern "C" int dsv41_engram_hash_step(const long long* map, long long* cache, co
                                  long long* eng_ids, const int* token, const int* pos_ctr,
                                  long long map_len, int n_layers, int max_ngram, int n_heads,
                                  long long pad_id, cudaStream_t s) {
-    engram_hash_step_kernel<<<1, 32, 0, s>>>(map, cache, mults, lms, offs, eng_ids, token, pos_ctr,
-                                        map_len, n_layers, max_ngram, n_heads, pad_id);
+    engram_hash_step_kernel<<<1, 128, 0, s>>>(map, cache, mults, lms, offs, eng_ids, token,
+                                        pos_ctr, map_len, n_layers, max_ngram, n_heads, pad_id);
     return (int)cudaGetLastError();
 }
 
@@ -732,8 +783,10 @@ extern "C" int dsv41_engram_apply(float* x, const float* kv, const float* q_weig
                                   const float* k_weight, const uint8_t* token_mask, int rows,
                                   int hc, int dim, float eps, cudaStream_t s) {
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaSuccess;
+    // 256 = 8 warps, the most block_sum3's __shared__ red[3][8] can combine
+    // (the gated_rmsnorm lesson: never widen past a hardcoded warp count).
     const dim3 grid((unsigned)rows, (unsigned)hc);
-    engram_apply_kernel<<<grid, 128, 0, s>>>(x, kv, q_weight, k_weight, token_mask, rows, hc, dim,
+    engram_apply_kernel<<<grid, 256, 0, s>>>(x, kv, q_weight, k_weight, token_mask, rows, hc, dim,
                                              eps);
     return (int)cudaGetLastError();
 }

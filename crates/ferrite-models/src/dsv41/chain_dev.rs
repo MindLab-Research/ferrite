@@ -426,6 +426,25 @@ fn swiglu_q() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(true))
 }
 
+/// ADD_EPI (DSV41_ADD_EPI, default ON): fold the shared expert's merge
+/// `s.o += s.ex_out` into the MoE all-reduce's STORE epilogue instead of running
+/// the standalone `ferrite_add` kernel between them.
+///
+/// The AR's store already publishes `s.o` to every peer's staging slot and the
+/// reduced sum is what `hc_post` consumes, so publishing `s.o[i] + s.ex_out[i]`
+/// is exactly the pair's value: same operands, same ascending-rank reduce ⇒
+/// BIT-IDENTICAL, one launch (and one graph node) shorter, and — unlike folding
+/// into a producer — it needs NO reorder of the MoE chain (so no change to the
+/// PDL adjacency of the expert launches) and no change to the `dual` fork.
+///
+/// Falls back to the standalone `add_inplace` when the loaded .so has no
+/// `ferrite_p2p_ar_v5_add` / `..._hcpost_add` symbol (old build), when the
+/// protocol is not AR v5, or when no shared expert ran this layer.
+fn add_epi() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ADD_EPI").map(|v| v != "0").unwrap_or(true))
+}
+
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
 /// DEFAULT OFF (round 25: 9.38 vs 9.71ms - the mixed kernel's fp8 branch,
 /// even WITH the LUT+a32 port, is a net loss against the separate path
@@ -708,6 +727,19 @@ pub struct DevChain<'a> {
     ngram: Option<crate::dsv41::engram::NgramHashState>,
     eng_layout: Option<crate::dsv41::engram::EngramLayout>,
     eng_map: Option<crate::dsv41::engram::TokenMap>,
+    /// ADD_EPI (see [`DevChain::add_epi`]): `moe()` defers the shared-expert
+    /// merge `s.o += s.ex_out` into the following MoE all-reduce's store
+    /// epilogue and records the bias here, indexed by layer; `moe_reduce(layer)`
+    /// READS it. `None` means the standalone `add_inplace` already ran (or no
+    /// shared expert on this rank).
+    ///
+    /// Per-layer and never consumed on purpose: the whole step is captured into
+    /// ONE CUDA graph, so every host decision here — including this field — is
+    /// evaluated once at capture and the AR's arguments are baked into the graph.
+    /// A `take()` would drop the bias for every replay, and a single shared field
+    /// would let one layer's capture clobber another's under a per-layer MoE
+    /// graph (`DSV41_GRAPH_MOE`).
+    moe_add_in: Vec<Option<*const f32>>,
 }
 
 fn fb(n: usize) -> usize {
@@ -907,6 +939,7 @@ impl<'a> DevChain<'a> {
             ngram,
             eng_layout,
             eng_map,
+            moe_add_in: vec![None; cfg.n_layers],
         })
     }
 
@@ -1417,6 +1450,7 @@ impl<'a> DevChain<'a> {
         c: &std::sync::Arc<Collective>,
         buf: *mut std::ffi::c_void,
         len: usize,
+        add_in: Option<*const f32>,
     ) -> Result<bool> {
         if !Self::hcpost_epi() || !Self::fuse_c() {
             // fuse_c() is the same gate the caller uses to choose between the
@@ -1434,6 +1468,24 @@ impl<'a> DevChain<'a> {
         // armed (the `hc_split_armed` flag), or when the split is off.
         self.dev.hc_tail_join()?;
         let (dim, hc) = (self.cfg.dim, self.cfg.hc_mult);
+        // ADD_EPI: the deferred shared-expert merge rides along in the store
+        // epilogue. Declines (no symbol) leave the caller on add + the plain
+        // hcpost fold, so nothing is ever dropped.
+        if let Some(p) = add_in {
+            if self.dev.supports_ar_hcpost_add() {
+                return c.all_reduce_inplace_hcpost_add(
+                    buf,
+                    len,
+                    p,
+                    self.s.h.ptr as *mut f32,
+                    self.s.post.as_f32(),
+                    self.s.comb.as_f32(),
+                    hc as i32,
+                    dim as i32,
+                );
+            }
+            return Ok(false);
+        }
         c.all_reduce_inplace_hcpost(
             buf,
             len,
@@ -1445,20 +1497,65 @@ impl<'a> DevChain<'a> {
         )
     }
 
+    /// ADD_EPI readiness: the biased AR entry this layer's fold would actually
+    /// use must exist in the loaded .so. With the default hc-post fold
+    /// ([`Self::hcpost_epi`] + [`Self::fuse_c`]) the MoE AR goes through the
+    /// `hcpost_add` entry; otherwise it needs the plain `_add` entry. Either way a
+    /// missing symbol keeps the standalone `add_inplace` (and the fold's own
+    /// shape decline has the same effect at `moe_reduce`).
+    fn add_epi_ready(&self) -> bool {
+        if !add_epi() {
+            return false;
+        }
+        if Self::hcpost_epi() && Self::fuse_c() {
+            self.dev.supports_ar_hcpost_add()
+        } else {
+            self.dev.supports_ar_add()
+        }
+    }
+
     /// The MoE's all-reduce, issued OUTSIDE any captured segment: a CUDA graph
     /// cannot contain the host barrier that this path still uses, so the segment
     /// boundary sits exactly here. Returns whether the segment-C hc-post was
     /// folded into the reduce (see [`Self::ar_hc_post_fold`]).
-    fn moe_reduce(&mut self) -> Result<bool> {
+    fn moe_reduce(&mut self, layer: usize) -> Result<bool> {
         let dim = self.cfg.dim;
+        // ADD_EPI: the merge `moe(layer, ..)` deferred (see `add_epi()`). READ,
+        // never consumed: the step-body graph is captured after the first decode
+        // step, so this host-side value (and the AR args it feeds) is baked at
+        // capture; a `take()` would silently drop the merge on every replay.
+        let add_in = self.moe_add_in[layer];
         // routed experts are expert-parallel, so each rank holds a partial sum
         if let Some(c) = self.comm.clone() {
-            let folded = self.ar_hc_post_fold(&c, self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            let folded =
+                self.ar_hc_post_fold(&c, self.s.o.ptr as *mut std::ffi::c_void, fb(dim), add_in)?;
             if !folded {
-                c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                // ADD_EPI on the plain AR: publish `o + ex_out` straight from the
+                // store epilogue. `added == false` (no symbol) falls back to the
+                // standalone merge before the untouched AR.
+                let mut added = false;
+                if let Some(p) = add_in {
+                    if self.dev.supports_ar_add() {
+                        added = c.all_reduce_inplace_add(
+                            self.s.o.ptr as *mut std::ffi::c_void,
+                            fb(dim),
+                            p,
+                        )?;
+                    }
+                }
+                if !added {
+                    if add_in.is_some() {
+                        self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                    }
+                    c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                }
             }
             c.end_round();
             return Ok(folded);
+        }
+        // Single device: no AR to fold into, so the merge has to run here.
+        if add_in.is_some() {
+            self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
         }
         Ok(false)
     }
@@ -2335,7 +2432,7 @@ fn hc_tail_split() -> bool {
         } else {
             self.moe(layer, ld)?;
         }
-        let moe_hc_folded = self.moe_reduce()?;
+        let moe_hc_folded = self.moe_reduce(layer)?;
         if phase_dbg() {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
@@ -3165,8 +3262,12 @@ fn hc_tail_split() -> bool {
                 // `layer()` skips the standalone launch. The fused entry carries
                 // its own store, which is why it cannot coexist with
                 // `ar_store_fused` (that path has no store left to skip).
-                hc_folded =
-                    self.ar_hc_post_fold(&c, self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                hc_folded = self.ar_hc_post_fold(
+                    &c,
+                    self.s.o.ptr as *mut std::ffi::c_void,
+                    fb(dim),
+                    None,
+                )?;
                 if !hc_folded {
                     c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
                 }
@@ -3505,6 +3606,9 @@ fn hc_tail_split() -> bool {
     /// MoE: bf16 gate GEMM, `noaux_tc` routing, MXFP4 experts, fp8 shared expert.
     fn moe(&mut self, layer: usize, ld: &LayerDev) -> Result<()> {
         let cfg = self.cfg;
+        // ADD_EPI: cleared here and set only by the deferral below (see
+        // `add_epi()`); `moe_reduce(layer)` reads it right after this segment.
+        self.moe_add_in[layer] = None;
         let dim = cfg.dim;
         let inter = cfg.moe_inter_dim;
         // MoE is TP-split, NOT expert-parallel: every rank holds every expert,
@@ -4089,7 +4193,14 @@ fn hc_tail_split() -> bool {
                         sh_st,
                     )?;
                     if !dual {
-                        self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                        // ADD_EPI: defer the merge into the MoE all-reduce's
+                        // store epilogue when the .so carries the biased entry
+                        // (see `add_epi()`); otherwise the standalone add.
+                        if self.add_epi_ready() {
+                            self.moe_add_in[layer] = Some(self.s.ex_out.ptr as *const f32);
+                        } else {
+                            self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                        }
                     }
                 }
             }
@@ -4101,7 +4212,13 @@ fn hc_tail_split() -> bool {
         // operands in the same order. A no-op when the fork did not take.
         if dual {
             self.dev.dual_chain_join()?;
-            self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+            // ADD_EPI: the join just made `s.ex_out` final on the main stream, so
+            // the following AR's store can publish `s.o + s.ex_out` itself.
+            if self.add_epi_ready() {
+                self.moe_add_in[layer] = Some(self.s.ex_out.ptr as *const f32);
+            } else {
+                self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+            }
         }
         // the block output is the attention-branch accumulator `o`
         Ok(())

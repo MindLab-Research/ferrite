@@ -1002,6 +1002,19 @@ impl Device {
         self.kernels.expert_down_reduce_fp4_batched.is_some()
     }
 
+    /// True when the loaded .so carries the ADD_EPI (residual-in-store) all-reduce
+    /// entry (`ferrite_p2p_ar_v5_add`). A stale .so leaves DSV41_ADD_EPI inert and
+    /// the standalone `add_inplace` + `all_reduce_inplace` pair runs.
+    pub fn supports_ar_add(&self) -> bool {
+        self.kernels.p2p_ar_v5_add.is_some()
+    }
+
+    /// Same probe for the hc-post fold's ADD_EPI variant
+    /// (`ferrite_p2p_ar_v5_hcpost_add`) — the one the default MoE AR uses.
+    pub fn supports_ar_hcpost_add(&self) -> bool {
+        self.kernels.p2p_ar_v5_hcpost_add.is_some()
+    }
+
     pub fn gemm_fp8_mx(
         &self,
         a: *const u8,
