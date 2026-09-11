@@ -85,9 +85,15 @@ tot = sum(r[0] for r in rows) or 1.0
 steps = max(n - 1, 1)
 print(f"decode-only net GPU time = {tot/1e6:.1f} ms over {steps} steps / 8 ranks"
       f" = {tot/1e6/steps/8:.2f} ms per step per rank")
+# nsys reports durations in NANOSECONDS, so both the total and the per-call mean are
+# ns; the per-call column used to be printed raw under a "us/call" header, which read
+# as absurd (hc_mixes showed 153182.6). Divide by 1000 and say what each column means.
+# Note the instances and the durations are both summed over the ranks (one process
+# hosts all eight here), so "calls/step" counts all ranks together and the per-call
+# mean is each rank's own cost.
 print(f"{'share':>7} {'calls/step':>10} {'us/call':>9}  kernel")
 for dt, di, k, avg in rows[:15]:
-    print(f"{dt/tot*100:6.1f}% {di/steps:10.0f} {avg:9.1f}  {k[:52]}")
+    print(f"{dt/tot*100:6.1f}% {di/steps:10.0f} {avg/1000:9.1f}  {k[:52]}")
 PY
 echo
 echo "note: attribute the all-reduce separately (NCCL mode here); for absolute per-call"
