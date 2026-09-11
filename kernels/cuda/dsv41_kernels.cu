@@ -1456,6 +1456,111 @@ extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, in
 
 static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
 
+// ---------------------------------------------------------------------------
+// SPREAD variant of hc_mixes (DSV41_HC_MIXES_SPREAD), see the note by the kernels.
+// ---------------------------------------------------------------------------
+#define DSV41_HC_SPREAD_MAXR 8192
+__device__ float g_hc_inv[DSV41_HC_SPREAD_MAXR];
+__device__ float g_hc_mix[DSV41_HC_SPREAD_MAXR][64];
+
+// Phase A: one block per token, the sum of squares -> g_hc_inv[r]. The two-stage
+// reduction is copied verbatim from hc_mixes_kernel so the sum lands in the same order.
+__global__ void hc_mixes_ss_kernel(const float* __restrict__ x, int rows, int hc_dim, float eps) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const float* xr = x + (size_t)r * hc_dim;
+    float ss = 0.f;
+    for (int c = threadIdx.x; c < hc_dim; c += blockDim.x) ss += xr[c] * xr[c];
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+    __shared__ float wpart[32];
+    const int nwarp = (blockDim.x + 31) >> 5;
+    if ((threadIdx.x & 31) == 0) wpart[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < nwarp) ? wpart[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+        if (threadIdx.x == 0) g_hc_inv[r] = rsqrtf(v / (float)hc_dim + eps);
+    }
+}
+
+// Phase B: grid (mix, rows), one warp per (row, projection row). Each block reads one
+// projection row's weights, which is what puts the 1.5 MB of weights across `mix` SMs
+// instead of one. The accumulation is the same lane-strided single chain as the
+// single-block kernel, so the dot product is bit-identical.
+__global__ void hc_mixes_rows_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
+                                     int rows, int hc_dim, int mix) {
+    const int m = blockIdx.x;
+    const int r = blockIdx.y;
+    if (m >= mix || r >= rows) return;
+    const float* xr = x + (size_t)r * hc_dim;
+    const float* wr = hc_fn + (size_t)m * hc_dim;
+    float acc = 0.f;
+    for (int c = threadIdx.x; c < hc_dim; c += blockDim.x) acc += wr[c] * xr[c];
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    if (threadIdx.x == 0) g_hc_mix[r][m] = acc * g_hc_inv[r];
+}
+
+// Phase C: one block per token, the sigmoid/cm/sinkhorn/comb tail moved over verbatim
+// from hc_mixes_kernel (the sinkhorn already lives in one warp's registers).
+__global__ void hc_mixes_post_kernel(const float* __restrict__ hc_scale,
+                                     const float* __restrict__ hc_base, float* __restrict__ pre,
+                                     float* __restrict__ post, float* __restrict__ comb, int rows,
+                                     int hc, int sinkhorn_iters, float eps) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const int mix = hc * (2 + hc);
+    __shared__ float sm[64];
+    __shared__ float cm[64];
+    float* mixes = sm;
+    for (int m = threadIdx.x; m < mix; m += blockDim.x) mixes[m] = g_hc_mix[r][m];
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        cm[jk] = mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    {
+        const int hh = hc * hc;
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (warp == 0) {
+            float c = (lane < hh) ? cm[lane] : 0.f;
+            float mx = c;
+            for (int off = 1; off < hc; off <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+            c = expf(c - mx);
+            float rs = c;
+            for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+            c = c / rs + eps;
+            for (int it = 0; it < sinkhorn_iters; ++it) {
+                if (it > 0) {
+                    float s = c;
+                    for (int off = 1; off < hc; off <<= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, off);
+                    c = c / (s + eps);
+                }
+                float t = c;
+                for (int off = hc; off < hh; off <<= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+                c = c / (t + eps);
+            }
+            if (lane < hh) cm[lane] = c;
+        }
+    }
+    __syncthreads();
+    {
+        const int hh = hc * hc;
+        for (int jk = threadIdx.x; jk < hh; jk += blockDim.x) comb[(size_t)r * hh + jk] = cm[jk];
+    }
+}
+
+// Read ONCE: a per-call getenv is a hot-path slip, and this launcher runs ~90 times a step.
+static const bool g_hc_spread = getenv("DSV41_HC_MIXES_SPREAD") != nullptr;
+
 extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, float* pre, float* post, float* comb, int rows,
                               int hc_dim, int hc, int sinkhorn_iters, float eps, cudaStream_t s) {
@@ -1481,6 +1586,17 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
     if (const char* e = getenv("DSV41_HC_MIXES_THREADS")) {
         const int v = atoi(e);
         if (v >= 32 && v <= 1024) nthreads = v;
+    }
+    if (g_hc_spread && rows <= DSV41_HC_SPREAD_MAXR && mix <= 64) {
+        // Spread variant: one block per (row, projection row), so each of the `mix`
+        // 64 KB weight rows is read on its own SM instead of all 1.5 MB on one. The
+        // arithmetic order is identical in every phase, so the outputs are
+        // bit-identical to the single-block kernel (verified against it directly).
+        hc_mixes_ss_kernel<<<rows, 256, 0, s>>>(x, rows, hc_dim, eps);
+        hc_mixes_rows_kernel<<<dim3(mix, rows), 32, 0, s>>>(x, hc_fn, rows, hc_dim, mix);
+        hc_mixes_post_kernel<<<rows, 32, 0, s>>>(hc_scale, hc_base, pre, post, comb, rows, hc,
+                                                 sinkhorn_iters, eps);
+        return (int)cudaGetLastError();
     }
     hc_mixes_kernel<<<rows, nthreads, smem, s>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, rows,
                                             hc_dim, hc, sinkhorn_iters, eps, g_hc_acc4);
