@@ -46,12 +46,13 @@
 
 ## 2. AR 与段边界（问题 3）
 
-AR v5 = `store`（纯逐元素拷 partial → peer staging，`ferrite_kernels.cu:8117`）+ `pubred`（stamp + 自旋 + 归约，`ferrite_kernels.cu:8140`）**两个 launch**。每层 2 AR ⇒ 现 4 节点/层、160 节点/步。融合分两级：
+AR v5 = `store`（纯逐元素拷 partial → peer staging，`ferrite_kernels.cu:8317`）+ `pubred`（stamp + 自旋 + 归约，`ferrite_kernels.cu:8340`）**两个 launch**。每层 2 AR ⇒ 现 4 节点/层、160 节点/步。融合分两级：
 
 - **安全级（保留 AR 节点）**：`store` 折进段的**最后写者** epilogue（段 A = wo_b 的 gemm；段 B = `add_inplace`/`moe_down_reduce`）；`pubred` 仍独立 launch，其自旋窗口用 **PDL**（`ferrite_kernels.cu:748` 的 `pdl_or_plain`，`FERRITE_PDL=1`）与下一段重叠。节点 = 120 + 80。
 - **激进级（零 AR 节点）**：store 折进段 X 末写者并在**同一 epilogue stamp**；pubred 折进段 X+1 的**段首**（全块 head poll → reduce → 推进 epoch）。节点 = 120。⚠️ 这是 v5 协议改动（stamp 从 pubred 移到 store），列 P5。
 
-**hc-merge 铁律复用**：绝不把跨 rank 同步塞进单核。pubred 的自旋必须"**全 block 等同一绝对 epoch**"（`ferrite_kernels.cu:8150`）——若某尾块单独长自旋 ⇒ 扣 SM 当人质 ⇒ +3.2ms 回归。段内藏自旋只允许**段首全块栅栏**形态，不允许尾块独等。
+**hc-merge 铁律复用**：绝不把跨 rank 同步塞进单核。pubred 的自旋必须"**全 block 等同一绝对 epoch**"（`ferrite_kernels.cu:8370`）——若某尾块单独长自旋 ⇒ 扣 SM 当人质 ⇒ +3.2ms 回归。段内藏自旋只允许**段首全块栅栏**形态，不允许尾块独等。
+**stamp 的并行化边界（2026-09-11）**：stamp 已由 thread 0 串行 → `thread r 写 peer r`（8 个不相交远端地址，跨 slot 顺序无关，因为每个 peer 只盯自己那一格），但 `__threadfence_system()` + `*epoch = e+1` 仍必须在 **block 0 的 `__syncthreads()` 之后**才有 thread 0 发出——顺序保证靠"barrier join 所有 stamp"，不靠单线程串行。任何把 stamp 折进 store epilogue（P5 激进级）的改造必须保留这一"先齐备、再 fence、再推进 epoch"的形状。
 
 ## 3. 激活常驻（问题 4）
 
@@ -154,7 +155,24 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 
 **为什么 wo_a→wo_b 链式核不行**（复核 gemv-call-pair-wo，`STATUS.md:5973`）：wo_b 的 k = ol_local = 1024 **恰是 wo_a 的完整 n** ⇒ consumer 必须等 producer 全部 drain，链式核内部即跨块栅栏（选举已被证伪 +3.3ms）。异 k（4096 vs 1024）也不能共享 mx2 的同一份 staging。**只有 B1 epilogue 落地**（`gemm_fp8_gemv_kernel:2113` 的 xq/xsc 尾参 + 跨 warp amax epilogue）。
 
-**推荐的真正「persistent」杠杆 = PDL 串链**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。给注意力投影链的 consumer 端（wq_b / sparse / wo_a / wo_b）加 `cudaGridDependencySynchronize()` 入口，让 prologue（smem staging、LUT 构建、idx 加载、q staging）在 producer 的 ramp-down 期间执行——**不减节点、不改 grid、无跨块同步**，回收的是节点过渡固定成本而非带宽。
+**真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 ON**，`=0` 回退；launcher 用 `cudaLaunchKernelEx` 发射），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
+
+| consumer kernel | launcher | 入口 sync |
+|---|---|---|
+| `gemm_fp8_gemv_kernel` | `dsv41_gemm_fp8_mx`（M=1 分支） | `dsv41_kernels.cu:2578` |
+| 同上 | `dsv41_gemm_fp8_mx_rope` | 同上 |
+| 同上 | `dsv41_gemm_fp8_mx_rope_norm` | 同上 |
+| 同上 | `dsv41_gemm_fp8_mx2_rope` | 同上 |
+| 同上 | `dsv41_gemm_fp8_mx_add` | 同上 |
+| 同上 | `dsv41_gemm_fp8_mx_f32`（wo_b） | 同上 |
+| 同上 | `dsv41_gemm_fp8_mx2` | 同上 |
+| `sparse_attn_pf_kernel` | `dsv41_sparse_attn`（pf 分支） | `dsv41_kernels.cu:574` |
+
+**未覆盖（刻意）**：M>1 的 `gemm_fp8_kernel` tile 路径、`sparse_attn_split/merge/warp` 三个 A/B 变体——它们仍走 plain launch。
+
+**关键修正（与本节早期假设不同）**：「把 prologue 藏进 producer ramp-down」对这两个 kernel **headroom 很小**——它们的 prologue 主体（gemv 的 activation staging、sparse 的 q-row staging / `*clen`）**本身就读 producer 的输出**，必须在 sync 之后；真正不依赖 producer 的只有 gemv 的 256 项 e4m3 LUT（每线程 1 次迭代）和指针设置，hoist 收益 < 结构化改写的风险（gemv 的权重行 cp.async 在 row loop 内，其 commit/wait 配对承载比特一致性）。因此 sync 放在 kernel 入口（与 `gemv_bf16_v2_kernel:2887` 既有先例一致），**回收的是节点过渡/launch 开销，不是 prologue 的算术**。真正的收益量级必须在图上 A/B。
+
+**风险线**：`DSV41_PDL` 默认 ON ⇒ rebuild 后所有 DSV41 运行即生效。GLM 路径上 PDL 曾测为**中性**（且当时只覆盖 4 个 launcher），所以**上线前必须先做 `DSV41_PDL=0/1` 的图 A/B**；`=0` 是回退臂。host 侧 gate 不做 arch 判断、device 侧 sync 有 `__CUDA_ARCH__ >= 900` 守卫，故本文件必须按 sm_90+ 编译（build.sh 默认 100a）；不支持的设备上 attribute 会让 launch 显式报错，不会静默。
 
 **骨架（三合一核）**：
 
@@ -177,3 +195,25 @@ __global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const 
 ```
 
 **验收**：`DSV41_SPARSE_OROPE=0` 回退旧双 launch；`sparse_orope_parity.rs` 逐位比（同设备、确定性输入）。
+
+### 10.1 实现落地（2026-09-11，未上机编译、未跑 parity）
+
+已按上骨架落地，**新增而非改写**（不改 `dsv41_sparse_attn` / `apply_rope_kernel` 的既有行为）：
+
+| 位置 | 内容 |
+|------|------|
+| `dsv41_kernels.cu:1282` | `sparse_attn_orope_kernel`：phase 1 逐句照抄 `sparse_attn_pf_kernel`；phase 2 = `apply_rope_kernel:1218-1224`；phase 3 = `:1230-1246` |
+| `dsv41_kernels.cu:3702` | `dsv41_sparse_attn_orope` launcher（新函数，未改 `dsv41_sparse_attn`）。**decline 哨兵 = 1/2/3**：1=形状不可用；2=plain 调用不会选 pf（`DSV41_ATTN_SEQ` / key-split / `DSV41_ATTN_PF=0`）；3=发射形状不精确。**刻意避开哨兵 1**（与 `cudaErrorInvalidValue` 冲突，见 `dsv41_apply_rope_q` 的 legacy 陷阱） |
+| `device.rs:172/590/1594` | `sparse_attn_orope` 可选符号（`ko!`）+ struct `Option` 字段 + wrapper（`Ok(false)` = 回退） |
+| `chain_dev.rs:565/2766` | `sparse_orope()` env gate（`DSV41_SPARSE_OROPE`，默认 ON）；调用点先试融合，`!s_orope` 才跑 `sparse_attn` + `apply_rope_q` + `quant1` |
+
+**两处对骨架的修正**：
+
+1. **smem 预算是 2 KB 而不是 16 KB**。§10 正文写对了（`512 f32 = 2KB/block`），但任务书写成 `nlh*hd*4B = 16KB`——那是 grid 全体的 o 行总量，不是单 block 的。grid=(b*m,h) 下 `gridDim.y == h`，一个 block 恰好一个 head，`sh_row[512]` 足够。总静态 smem = 8448 B（`sh_smax/sh_se/sh_acc` 不变）+ 2048 B = **10.5 KB**，远在 48 KB 默认线内，**无需 `cudaFuncSetAttribute`**。
+2. **新增两个栅栏而非一个**：phase 2（rope）读其它 lane 写的 `sh_row` 列 → 需要 phase1→phase2 栅栏；phase 3（全局 store + fp8 发射）读 rope 改过的列 → 需要 phase2→phase3 栅栏。加原 merge 栅栏与 hh 循环末栅栏，共 4 个/head，全在 block 内。
+
+**bit-identical 的关键等价**：per-head 发射的 flat block 索引 = `((row*h+hh)*d)/32 + blk`；因 `d % 32 == 0`，head 起点必落在 32-block 边界，故它 == flat 版 `xsc` 的同一下标。**若 `hd % 32 != 0` 此等价失效** —— launcher 的 `(d & 31) != 0 → return 1` 为此硬门。
+
+**phase 3 直接写 roped 值到 global**（而非写未 rope 的中间值再原地旋转）：旧双 launch 的净效果同样是 `s.o` 最终 = roped；`sparse_attn` 与 `apply_rope` 之间无人读 `s.o`，中间态不可观测。
+
+**未验证项（上机前必做）**：① 本机无 nvcc/GPU，`.cu` **未编译**（仅括号平衡自检 + 逐行静态复核）；② `--use_fast_math` 下 rope 的 `x0*cc - x1*ss` 收缩需 parity 逐位确认；③ 建议 `DSV41_SPARSE_OROPE=0` 与 ON 各跑一次逐步 RMS 对照。

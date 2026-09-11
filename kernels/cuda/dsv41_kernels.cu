@@ -561,6 +561,18 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                                       int b, int m, int h, int d,
                                       const int* __restrict__ clen, int window, int index_topk,
                                       float scale) {
+#if __CUDA_ARCH__ >= 900
+    // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have launched
+    // this grid with programmatic stream serialization, so the grid is already
+    // resident and this call is what makes the producers' writes visible. Three
+    // of the reads below are producer outputs: `*clen` (the compressor's live
+    // counter), `idxs` (the indexer) and `q` (wq_b / apply_rope). It is placed
+    // BEFORE the `row >= b*m` early return so every block in the grid reaches
+    // it. No-op on a plain launch. The win is the node-gap (launch overlap):
+    // this kernel's prologue is q-row staging, which IS producer-dependent, so
+    // there is nothing worth hoisting above the sync.
+    cudaGridDependencySynchronize();
+#endif
     const int n = window + *clen;
     const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int row = blockIdx.x;
@@ -2376,6 +2388,78 @@ __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
 __device__ __forceinline__ void dsv41_cp_commit();
 __device__ __forceinline__ void dsv41_cp_wait_all();
 
+// ---------------------------------------------------------------------------
+// PDL (programmatic dependent launch) for the DSV41 attention projection chain.
+//
+// `pdl_or_plain` in ferrite_kernels.cu is file-static in ANOTHER translation
+// unit, so this one carries its own copy under the DSV41 gate. Semantics are
+// identical to that one (which is the verified-capture-compatible precedent):
+//
+//   * DSV41_PDL unset or =1 (DEFAULT ON) -> the launch carries
+//     cudaLaunchAttributeProgrammaticStreamSerialization, so the consumer grid
+//     is allowed to start while the producer is still draining its tail. The
+//     consumer kernel then gates every read of the producer's output on the
+//     OPENING cudaGridDependencySynchronize() -- that is the whole point: the
+//     consumer's launch/setup cost (grid rasterisation, CTA scheduling, register
+//     allocation, and any prologue that does NOT read the producer) moves off
+//     the critical path and into the producer's ramp-down window. This is
+//     node-transition cost, NOT bandwidth, which is why it needs no node
+//     removal, no grid change and no cross-block sync -- it sidesteps the
+//     hcpm / hc-merge / B1 failure modes entirely.
+//   * DSV41_PDL=0 -> the same cudaLaunchKernelEx path WITHOUT the attribute: a
+//     plain launch, which records the identical node in a stream capture. This
+//     is the A/B arm and the rollback.
+//
+// CONTRACT (must be preserved by every future caller): a kernel routed through
+// this helper MUST call cudaGridDependencySynchronize() before reading ANY
+// output written by the previous kernel on the stream, and the call must be
+// unconditional inside `#if __CUDA_ARCH__ >= 900`. The call is a documented
+// no-op on a plain launch, so it stays in place when DSV41_PDL=0.
+//
+// COVERED HERE: gemm_fp8_gemv_kernel (all SEVEN M=1 launchers: mx, rope,
+// rope_norm, mx2_rope, add, f32, mx2) and sparse_attn_pf_kernel -- i.e. the
+// consumer side of lin2 -> wq_b/rope -> sparse -> wo_a -> wo_b.
+// DELIBERATELY NOT COVERED: the M>1 gemm_fp8_kernel tile path, and the
+// split/merge/warp attention variants (A/B arms nobody should silently start
+// running under PDL).
+//
+// NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
+// through cudaLaunchKernelEx (its two-pack template accepts the implicit
+// conversions the `<<<>>>` form would take).
+//
+// ARCH: the host gate above is not arch-gated, the device sync is -- so this
+// file MUST be built for sm_90+ (kernels/cuda/build.sh defaults to 100a and the
+// rest of the file already requires Blackwell tcgen05), otherwise the attribute
+// would be requested without a matching sync. On an unsupported device the
+// attribute makes cudaLaunchKernelEx fail loudly, so the mismatch cannot be
+// silent.
+static int dsv41_pdl_enabled(void) {
+    // Read once: these launchers run a few hundred times per step and a per-call
+    // getenv on the hot path is exactly the slip every other gate in this file
+    // avoids.
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("DSV41_PDL");
+        cached = (e != nullptr && e[0] == '0') ? 0 : 1;   // explicit "0" rolls back
+    }
+    return cached;
+}
+
+template <typename K, typename... Args>
+static inline cudaError_t dsv41_pdl_or_plain(K kern, dim3 grid, dim3 block, size_t smem,
+                                             cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid; cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem; cfg.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    if (dsv41_pdl_enabled()) {
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+    }
+    return cudaLaunchKernelEx(&cfg, kern, args...);
+}
+
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const float* __restrict__ a_scale,
                                      const uint8_t* __restrict__ w,
@@ -2482,6 +2566,24 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      // Requires `vec >= 3` (the s_af materialisation lives
                                      // there); the launcher enforces it.
                                      const float* a_f32 = nullptr) {
+#if __CUDA_ARCH__ >= 900
+    // PDL (DSV41_PDL, see dsv41_pdl_or_plain above): the launcher may have
+    // launched this grid with programmatic stream serialization, so the grid is
+    // already resident and this call is what makes the producer's activation /
+    // scale / epoch writes visible. It MUST stay before the first read of any
+    // producer output (`*epoch` below is one, `a`/`a_scale`/`a_f32` further
+    // down are the big ones). No-op on a plain launch.
+    //
+    // Why the sync sits at the very top and not after a longer prologue: the
+    // only producer-INDEPENDENT work this kernel has before the staging is the
+    // 256-entry e4m3 LUT (one iteration per thread) and the pointer/register
+    // setup -- both cheaper than the restructuring needed to move them past the
+    // sync, and the weight-row staging that WOULD be worth hoisting lives inside
+    // the row loop whose cp.async commit/wait pairing is numerically load-
+    // bearing. The win here is the node-gap (launch overlap), not prologue
+    // hiding.
+    cudaGridDependencySynchronize();
+#endif
     // Read the round ONCE, like p2p_ar_store_v5_kernel (ferrite_kernels.cu). When
     // the table is null this is a no-op (epoch is null too) and the kernel is the
     // old one bit for bit.
@@ -2898,10 +3000,18 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
                 gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
             if (e != cudaSuccess) return (int)e;
         }
-        gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
-                                                              k, g_gemv_fp8_mode, nullptr, nullptr,
-                                                              nullptr, nullptr, n, 0, staging_tbl,
-                                                              epoch, world, my_rank, stride, xq, xsc);
+        // PDL (see dsv41_pdl_or_plain): the GEMV is a consumer of the previous
+        // chain node (lin2's producer, wq_b after the norm/rope, wo_a, wo_b), so
+        // its grid may start during the producer's tail and the kernel's entry
+        // cudaGridDependencySynchronize() gates the activation reads. NOTE the
+        // full 36-argument list: the cudaLaunchKernelEx path does not apply the
+        // kernel's default arguments, so every trailing slot is spelled out.
+        cudaError_t le = dsv41_pdl_or_plain(
+            gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w,
+            w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, 0,
+            staging_tbl, epoch, world, my_rank, stride, xq, xsc, nullptr, nullptr, nullptr, 0, 0,
+            0, 0, 0, 0, 0, nullptr, nullptr, 0.f, nullptr);
+        if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
         return (int)cudaGetLastError();
     }
     // B1 is an M=1 epilogue only: the tile path has no lane-0 row epilogue and
@@ -2966,10 +3076,13 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
             gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
-        a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
-        nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
-        rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd, 0);
+    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w, w_scale,
+        bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, 0, nullptr,
+        nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off,
+        rope_step, rope_inverse, rope_rd, rope_hd, 0, nullptr, nullptr, 0.f, nullptr);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -3031,10 +3144,13 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
     // `a`/`a_scale` are null: the prologue produces the activation and the
     // kernel never dereferences them on this path (the `qr_raw` guard skips both
     // staging sites; mode 4 takes `s_a`).
-    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
-        nullptr, nullptr, w, w_scale, bias, out, n, k, /*vec=*/4, nullptr, nullptr, nullptr,
-        nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
-        rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd, 0, qr_raw, qr_w, qr_eps);
+    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, nullptr, nullptr, w,
+        w_scale, bias, out, n, k, /*vec=*/4, nullptr, nullptr, nullptr, nullptr, n, 0, nullptr,
+        nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off,
+        rope_step, rope_inverse, rope_rd, rope_hd, 0, qr_raw, qr_w, qr_eps, nullptr);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -3082,10 +3198,13 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
             gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
-        a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
-        n1, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
-        rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd1, rope_hd2);
+    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w1, w1_scale,
+        bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2, n1, 0, nullptr, nullptr, 0,
+        0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off, rope_step,
+        rope_inverse, rope_rd, rope_hd1, rope_hd2, nullptr, nullptr, 0.f, nullptr);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -3126,9 +3245,13 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
             gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
-        a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode,
-        nullptr, nullptr, nullptr, nullptr, n, /*epi_add=*/1);
+    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w, w_scale,
+        bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, /*epi_add=*/1,
+        nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
+        0, nullptr, nullptr, 0.f, nullptr);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -3187,10 +3310,15 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
             gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
-        nullptr, nullptr, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
-        nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
-        0, 0, 0, 0, 0, nullptr, nullptr, 0.f, a_f32);
+    // PDL (see dsv41_pdl_or_plain): the wo_b GEMV reads wo_a's fp32 output, so it
+    // is the second consumer in the tail of the chain, exactly where the
+    // node-gap matters.
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, nullptr, nullptr, w,
+        w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, 0,
+        nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
+        0, nullptr, nullptr, 0.f, a_f32);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -3375,9 +3503,13 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
             gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
-        a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
-        n1, 0, nullptr, nullptr, 0, 0, 0);
+    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w1, w1_scale,
+        bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2, n1, 0, nullptr, nullptr, 0,
+        0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr,
+        0.f, nullptr);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -3586,10 +3718,17 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                 sink, out, b, m, h, d, split_c);
             return (int)cudaGetLastError();
         }
-        if (!pf_off)
-            sparse_attn_pf_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d,
-                                                       clen, window, index_topk, scale);
-        else
+        if (!pf_off) {
+            // PDL (see dsv41_pdl_or_plain): sparse_attn_pf is the consumer of
+            // wq_b / apply_rope (q), the indexer (idxs) and the compressor
+            // (*clen), so its grid may start during the producer's tail; the
+            // kernel's entry cudaGridDependencySynchronize() gates all three
+            // reads. The split/merge and warp A/B arms deliberately stay plain.
+            cudaError_t le = dsv41_pdl_or_plain(sparse_attn_pf_kernel, grid, dim3(128), 0, s, q,
+                                               kv, sink, idxs, out, b, m, h, d, clen, window,
+                                               index_topk, scale);
+            if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
+        } else
             sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
                                                      scale);
     } else {

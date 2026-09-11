@@ -8351,21 +8351,35 @@ __global__ void p2p_ar_pubred_v5_kernel(
     // multi-block kernel can stamp (block 0), poll (all blocks, all peers)
     // and reduce its slice. Saves one graph node + launch per AR (90/step).
     const unsigned e = *epoch;
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (int r = 0; r < world; r++)
-            atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+    // Stamp the peers in parallel: thread r publishes round e+1 into peer r's
+    // ready row. Thread 0 used to loop over `world` slots serially (8
+    // atomicExch_system = 0.4-0.8us, the bulk of the stamp stage). The slots
+    // are disjoint remote addresses and each peer only watches its own slot,
+    // so the cross-slot write ORDER is irrelevant — the fence/epoch ordering is
+    // what matters and is joined by the barrier below. (world <= blockDim.x.)
+    if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
+        atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
         __threadfence_system();
-        *epoch = e + 1u;   // AFTER stamping: the next round's store reads e+1
     }
     __syncthreads();
+    // AFTER all of this rank's stamps are out: the next round's store reads e+1.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *epoch = e + 1u;
     // every block polls ALL peers' stamps for this round (e+1). Monotonic
     // stamps + the lockstep replay make this wait exact — no seen[] state.
     if (threadIdx.x < (unsigned)world) {
         const int tr = (int)threadIdx.x;
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
         long spins = 0;
+        // Adaptive backoff: in the lockstep replay the peers stamp within a few
+        // ns of each other, so a stamp frequently lands just after a probe —
+        // sleeping a flat 100ns then costs a full extra round trip. The first
+        // probe sleeps 32ns; every later one keeps the proven 100ns cadence so
+        // the NVLink polling traffic stays low for the slow-peer case.
+        unsigned ns = 32;
         while ((int)(cur - (e + 1u)) < 0) {
-            __nanosleep(100);
+            __nanosleep(ns);
+            ns = 100;
             cur = *(volatile unsigned*)&ready_local[tr];
             if (++spins > 5000000) { // ~0.5s: diagnose; the watchdog kills
                 printf("[ar5-hang] rank=%d peer=%d need=%u cur=%u\n",
@@ -8533,19 +8547,24 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
     float* __restrict__ hc_res, const float* __restrict__ hc_post,
     const float* __restrict__ hc_comb, int hc_n, int hc_h) {
     const unsigned e = *epoch;
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        for (int r = 0; r < world; r++)
-            atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+    // Parallel stamp — same protocol/transformation as
+    // `p2p_ar_pubred_v5_kernel` (thread r stamps peer r; the barrier joins the
+    // stamps before e+1 is published to the next round's store).
+    if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
+        atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
         __threadfence_system();
-        *epoch = e + 1u;
     }
     __syncthreads();
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *epoch = e + 1u;
     if (threadIdx.x < (unsigned)world) {
         const int tr = (int)threadIdx.x;
         unsigned cur = *(volatile unsigned*)&ready_local[tr];
         long spins = 0;
+        unsigned ns = 32;   // first probe 32ns, then the proven 100ns cadence
         while ((int)(cur - (e + 1u)) < 0) {
-            __nanosleep(100);
+            __nanosleep(ns);
+            ns = 100;
             cur = *(volatile unsigned*)&ready_local[tr];
             if (++spins > 5000000) {
                 printf("[ar5-hang] rank=%d peer=%d need=%u cur=%u\n",

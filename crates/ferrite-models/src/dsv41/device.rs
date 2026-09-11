@@ -161,6 +161,20 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const i32, *mut f32,
         c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32, CuStream,
     ) -> c_int,
+    // P1 (DSV41_SPARSE_OROPE): sparse attention + inverse o-rope + fp8 emission
+    // in ONE launch, replacing the `sparse_attn` + `apply_rope_q` (+ `quant1`)
+    // triple. Same block geometry as `sparse_attn_pf_kernel` (grid=(b*m,h),
+    // block=128, one head's full d row per block); the o row is normalised into
+    // shared memory and the rope + fp8 passes run in the same launch, so the
+    // emitted bytes are `dsv41_quant_fp8(roped o)`'s. Optional: an older .so
+    // without it keeps the three-launch path. Returns 0 on success, 1/2/3 when
+    // the shape declines (caller then runs the fallback).
+    sparse_attn_orope: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *const f32, *const i32, *mut f32,
+        c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
+        *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+        *mut u8, *mut f32, CuStream,
+    ) -> c_int>,
     indexer_topk: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
         c_int, c_int, c_int, c_int, c_int, c_int, c_int, f32, f32, c_int, CuStream,
@@ -573,6 +587,7 @@ impl Device {
             engram_hash: km!(rt, "dsv41_engram_hash"),
             engram_gather: km!(rt, "dsv41_engram_gather"),
             sparse_attn: km!(rt, "dsv41_sparse_attn"),
+            sparse_attn_orope: ko!(rt, "dsv41_sparse_attn_orope"),
             indexer_topk: km!(rt, "dsv41_indexer_topk"),
             candidate_blocks: km!(rt, "dsv41_candidate_blocks"),
             compressor: km!(rt, "dsv41_compressor"),
@@ -1572,6 +1587,60 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_sparse_attn")
+    }
+
+    /// P1 (DSV41_SPARSE_OROPE): sparse attention + inverse o-rope + fp8 emission
+    /// of the roped output, in ONE launch. Replaces the
+    /// `sparse_attn` + `apply_rope_q` (+ `quant1`) triple the caller would
+    /// otherwise run; the three-launch sequence is bit-identical, so a decline
+    /// (or a missing symbol) is always safe to fall back on.
+    ///
+    /// `Ok(false)` means "fall back" (symbol absent, or the C launcher's shape
+    /// decline returned 1/2/3). `Ok(true)` means this launch produced both the
+    /// roped `out` row and the fp8 `xq`/`xsc` of it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sparse_attn_orope(
+        &self,
+        q: *const f32,
+        kv: *const f32,
+        sink: *const f32,
+        idxs: *const i32,
+        out: *mut f32,
+        b: i32,
+        m: i32,
+        h: i32,
+        d: i32,
+        clen: *const c_int,
+        window: i32,
+        index_topk: i32,
+        scale: f32,
+        cos: *const f32,
+        sin: *const f32,
+        base: *const c_int,
+        rope_rd: i32,
+        half: i32,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = match self.kernels.sparse_attn_orope {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
+              rope_rd, half, mul, off, step, inverse as i32, xq, xsc, self.stream)
+        };
+        // 1/2/3 are the decline sentinels (see the C launcher); anything else is
+        // a real launch error.
+        if (1..=3).contains(&rc) {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_sparse_attn_orope")?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]

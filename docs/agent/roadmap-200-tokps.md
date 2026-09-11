@@ -25,7 +25,7 @@
 | expert_gemv_fp4_batched (dsv41_experts_mxf4.cu:701) | 1.78 | **L1TEX 管道地板**，内层杠杆全阴性 |
 | hc 链（hc_mix_dots :3048 + hc_mixes_tail :3109）| 1.59 | sinkhorn 可藏 |
 | gemv_bf16_kernel (dsv41_glue.cu:317) | 0.74 | lm_head 切分后 |
-| AR v5（store ferrite_kernels.cu:8117 + pubred :8140）| 0.66 | **NVLink 协议地板** |
+| AR v5（store ferrite_kernels.cu:8317 + pubred :8340）| 0.66 | **NVLink 协议地板**；pubred 的 stamp 已改**并行写**（thread r → peer r，barrier 后再 fence/推进 epoch）+ poll 首轮 32ns 自适应退避（2026-09-11，待重编实测）|
 | sparse_attn | 0.32 | 3 深后 |
 | 残差（节点尾延迟）| ~1.15 | 700 节点 × ~1.5µs ramp-down，**只能靠减少节点数消** |
 

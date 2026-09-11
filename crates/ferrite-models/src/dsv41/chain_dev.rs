@@ -560,6 +560,24 @@ fn orope_q() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_OROPE_Q").map(|v| v != "0").unwrap_or(true))
 }
 
+/// P1 (DSV41_SPARSE_OROPE, default ON): folds the inverse o-rope AND the fp8
+/// emission of the roped attention output INTO the sparse-attention launch.
+/// `sparse_attn_pf_kernel` and the o-rope call shape of `apply_rope_kernel` own
+/// the same block (grid=(b*m,h), block=128, one head's full d row), so this is a
+/// geometry-preserving fusion: the o row is normalised into shared memory, then
+/// the rope + fp8 passes run in the same launch, emitting exactly the bytes the
+/// `quant1(s.o)` launch would have. It removes TWO launches per layer (40 each
+/// per step): the standalone `apply_rope_q` and the `quant1` that followed it.
+///
+/// "0" reverts to `sparse_attn` + `apply_rope_q` + `quant1`. An .so without
+/// `dsv41_sparse_attn_orope`, or a declining shape (the plain call would not
+/// have picked `sparse_attn_pf_kernel`, or hd % 32 != 0), falls back on its own
+/// — the fallback is bit-identical by construction.
+fn sparse_orope() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SPARSE_OROPE").map(|v| v != "0").unwrap_or(true))
+}
+
 /// B2 (DSV41_RING_WIN_FUSE, default ON): one launch does the window ring append
 /// and the window indices (two adjacent, mutually independent one-block
 /// kernels), saving 40 launches/step. "0" reverts; an .so without
@@ -2738,21 +2756,58 @@ fn hc_tail_split() -> bool {
             )?;
         }
 
-        self.dev.sparse_attn(
-            self.s.q.as_f32(),
-            ring_ptr as *const f32,
-            ld.attn_sink.as_ref().unwrap().as_f32(),
-            idxs_ptr as *const i32,
-            self.s.o.ptr as *mut f32,
-            1,
-            1,
-            nlh as i32,
-            hd as i32,
-            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
-            win as i32,
-            cfg.index_topk as i32,
-            1.0 / (hd as f32).sqrt(),
-        )?;
+        // P1 (DSV41_SPARSE_OROPE, default ON): the sparse attention's epilogue
+        // also runs the inverse o-rope and emits the fp8 of the roped output
+        // (exactly what the `apply_rope_q` + `quant1` pair below produced), in
+        // ONE launch - two launches per layer (80 per step) disappear. The
+        // fusion is geometry-preserving: `sparse_attn_pf_kernel` and the o-rope
+        // call shape of `apply_rope_kernel` own the same block, so the emitted
+        // bytes are bit-identical. A decline (or a missing symbol) falls back to
+        // the three-launch sequence, which is why the second call is kept.
+        let s_orope = sparse_orope()
+            && self.dev.sparse_attn_orope(
+                self.s.q.as_f32(),
+                ring_ptr as *const f32,
+                ld.attn_sink.as_ref().unwrap().as_f32(),
+                idxs_ptr as *const i32,
+                self.s.o.ptr as *mut f32,
+                1,
+                1,
+                nlh as i32,
+                hd as i32,
+                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                win as i32,
+                cfg.index_topk as i32,
+                1.0 / (hd as f32).sqrt(),
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                1,
+                0,
+                0,
+                true,
+                self.s.xq.ptr as *mut u8,
+                self.s.xsc.ptr as *mut f32,
+            )?;
+        if !s_orope {
+            self.dev.sparse_attn(
+                self.s.q.as_f32(),
+                ring_ptr as *const f32,
+                ld.attn_sink.as_ref().unwrap().as_f32(),
+                idxs_ptr as *const i32,
+                self.s.o.ptr as *mut f32,
+                1,
+                1,
+                nlh as i32,
+                hd as i32,
+                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                win as i32,
+                cfg.index_topk as i32,
+                1.0 / (hd as f32).sqrt(),
+            )?;
+        }
         // B2 (DSV41_OROPE_Q, default ON): the inverse rope's epilogue emits the
         // fp8 of the whole `s.o` region (nlh*hd) in the same launch, which is
         // exactly what the `quant1(s.o)` below would have computed - so that
@@ -2760,7 +2815,8 @@ fn hc_tail_split() -> bool {
         // The rope pass touches only the trailing `rope_head_dim` lanes of each
         // head, so the emission is a second, warp-per-32-block pass over the
         // WHOLE flat region, bit-identical to dsv41_quant_fp8 (rows=1, block=32).
-        let o_q_epi = orope_q()
+        let o_q_epi = !s_orope
+            && orope_q()
             && self.dev.apply_rope_q(
                 self.s.o.ptr as *mut f32,
                 self.cos.as_f32(),
@@ -2775,7 +2831,7 @@ fn hc_tail_split() -> bool {
                 self.s.xq.ptr as *mut u8,
                 self.s.xsc.ptr as *mut f32,
             )?;
-        if !o_q_epi {
+        if !s_orope && !o_q_epi {
             self.dev.apply_rope(
                 self.s.o.ptr as *mut f32,
                 self.cos.as_f32(),
@@ -2806,9 +2862,10 @@ fn hc_tail_split() -> bool {
         let olg = cfg.o_lora_rank;
         let nlg = groups / world; // wo_a is ColumnParallel: a block of groups each
         let k = hpg * hd;
-        // B2: the o-rope epilogue above already emitted `s.xq`/`s.xsc` from the
-        // rotated `s.o`; only the fallback path still quantises here.
-        if !o_q_epi {
+        // B2/P1: the o-rope epilogue above already emitted `s.xq`/`s.xsc` from the
+        // rotated `s.o` (or, with SPARSE_OROPE, the fused sparse kernel did);
+        // only the fallback path still quantises here.
+        if !s_orope && !o_q_epi {
             self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
         }
         // B1 (DSV41_WO_QUANT_FUSE): the wo_a gemv's epilogue emits the fp8 of its
