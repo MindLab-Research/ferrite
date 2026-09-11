@@ -752,6 +752,105 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     const int nwarps = (blockDim.x + 31) >> 5;
 
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
+        // gate_up + swiglu fusion (fuse_swiglu && b_split > 0, gate/up direction).
+        // Here n_total == inter and this warp owns ONE inter row `row`: it walks
+        // BOTH halves of that row - the gate row `row` of the `b` pair and the up
+        // row `row` of the `b_hi` pair - and writes the swiglu'd result straight
+        // into out[row]. The caller then never materialises the 2*inter gate/up
+        // buffer nor runs the separate swiglu pass.
+        // NUMERIC CONTRACT: each K walk below is the vec==2 shape of the unfused
+        // body (same group order j = (g<<9) + (lane<<4), same `#pragma unroll 2`,
+        // same single scale multiply per accumulator), so gate/up accumulate to
+        // the same floats the unfused rows do; only the epilogue differs (swiglu
+        // instead of the plain write). k = dim and the launcher only sets
+        // fuse_swiglu when (dim % 512) == 0, so the two-chunk-per-scale tail loop
+        // of the unfused body has no work here.
+        if (fuse_swiglu && b_split > 0) {
+            const uint8_t* g_row = b_use + (size_t)row * kbytes;
+            const uint8_t* u_row = bhi_use + (size_t)row * kbytes;
+            const uint8_t* g_srow = bsc_use + (size_t)row * ksc;
+            const uint8_t* u_srow = bhs_use + (size_t)row * ksc;
+            const int nv2f = k >> 9;   // 16 values per lane per group; no tail (k % 512 == 0)
+            float g = 0.f, u = 0.f;
+#pragma unroll 2
+            for (int g2 = 0; g2 < nv2f; ++g2) {
+                const int j = (g2 << 9) + (lane << 4);
+                // ---- gate chain: row `row` of the `b`/`bsc` pair ----
+                const float gsc = __uint_as_float(((uint32_t)g_srow[j >> 5]) << 23);
+                const uint8_t* gp = g_row + (g2 << 8) + (lane << 3);
+                const uint32_t gw0 = *reinterpret_cast<const uint32_t*>(gp);
+                const uint32_t gw1 = *reinterpret_cast<const uint32_t*>(gp + 4);
+                float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
+                const float2 gt0 = s_lut2[gw0 & 0xFFu];
+                const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
+                const float2 gt2 = s_lut2[(gw0 >> 16) & 0xFFu];
+                const float2 gt3 = s_lut2[(gw0 >> 24) & 0xFFu];
+                gp0 = fmaf(s_act[j + 0], gt0.x, gp0);
+                gp1 = fmaf(s_act[j + 1], gt0.y, gp1);
+                gp2 = fmaf(s_act[j + 2], gt1.x, gp2);
+                gp3 = fmaf(s_act[j + 3], gt1.y, gp3);
+                gp0 = fmaf(s_act[j + 4], gt2.x, gp0);
+                gp1 = fmaf(s_act[j + 5], gt2.y, gp1);
+                gp2 = fmaf(s_act[j + 6], gt3.x, gp2);
+                gp3 = fmaf(s_act[j + 7], gt3.y, gp3);
+                const float2 gu0 = s_lut2[gw1 & 0xFFu];
+                const float2 gu1 = s_lut2[(gw1 >> 8) & 0xFFu];
+                const float2 gu2 = s_lut2[(gw1 >> 16) & 0xFFu];
+                const float2 gu3 = s_lut2[(gw1 >> 24) & 0xFFu];
+                gp0 = fmaf(s_act[j + 8], gu0.x, gp0);
+                gp1 = fmaf(s_act[j + 9], gu0.y, gp1);
+                gp2 = fmaf(s_act[j + 10], gu1.x, gp2);
+                gp3 = fmaf(s_act[j + 11], gu1.y, gp3);
+                gp0 = fmaf(s_act[j + 12], gu2.x, gp0);
+                gp1 = fmaf(s_act[j + 13], gu2.y, gp1);
+                gp2 = fmaf(s_act[j + 14], gu3.x, gp2);
+                gp3 = fmaf(s_act[j + 15], gu3.y, gp3);
+                g = fmaf(gsc, (gp0 + gp1) + (gp2 + gp3), g);
+                // ---- up chain: row `row` of the `b_hi`/`bhs` pair ----
+                const float usc = __uint_as_float(((uint32_t)u_srow[j >> 5]) << 23);
+                const uint8_t* up = u_row + (g2 << 8) + (lane << 3);
+                const uint32_t uw0 = *reinterpret_cast<const uint32_t*>(up);
+                const uint32_t uw1 = *reinterpret_cast<const uint32_t*>(up + 4);
+                float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
+                const float2 ut0 = s_lut2[uw0 & 0xFFu];
+                const float2 ut1 = s_lut2[(uw0 >> 8) & 0xFFu];
+                const float2 ut2 = s_lut2[(uw0 >> 16) & 0xFFu];
+                const float2 ut3 = s_lut2[(uw0 >> 24) & 0xFFu];
+                up0 = fmaf(s_act[j + 0], ut0.x, up0);
+                up1 = fmaf(s_act[j + 1], ut0.y, up1);
+                up2 = fmaf(s_act[j + 2], ut1.x, up2);
+                up3 = fmaf(s_act[j + 3], ut1.y, up3);
+                up0 = fmaf(s_act[j + 4], ut2.x, up0);
+                up1 = fmaf(s_act[j + 5], ut2.y, up1);
+                up2 = fmaf(s_act[j + 6], ut3.x, up2);
+                up3 = fmaf(s_act[j + 7], ut3.y, up3);
+                const float2 uu0 = s_lut2[uw1 & 0xFFu];
+                const float2 uu1 = s_lut2[(uw1 >> 8) & 0xFFu];
+                const float2 uu2 = s_lut2[(uw1 >> 16) & 0xFFu];
+                const float2 uu3 = s_lut2[(uw1 >> 24) & 0xFFu];
+                up0 = fmaf(s_act[j + 8], uu0.x, up0);
+                up1 = fmaf(s_act[j + 9], uu0.y, up1);
+                up2 = fmaf(s_act[j + 10], uu1.x, up2);
+                up3 = fmaf(s_act[j + 11], uu1.y, up3);
+                up0 = fmaf(s_act[j + 12], uu2.x, up0);
+                up1 = fmaf(s_act[j + 13], uu2.y, up1);
+                up2 = fmaf(s_act[j + 14], uu3.x, up2);
+                up3 = fmaf(s_act[j + 15], uu3.y, up3);
+                u = fmaf(usc, (up0 + up1) + (up2 + up3), u);
+            }
+            for (int off = 16; off > 0; off >>= 1) {
+                g += __shfl_xor_sync(0xFFFFFFFFu, g, off);
+                u += __shfl_xor_sync(0xFFFFFFFFu, u, off);
+            }
+            if (lane == 0) {
+                if (limit > 0.f) {
+                    g = fminf(g, limit);                     // gate clamp
+                    u = fminf(fmaxf(u, -limit), limit);      // up clamp
+                }
+                out[(size_t)row] = (g / (1.f + expf(-g))) * u;   // silu(gate) * up
+            }
+            continue;
+        }
         // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
         const bool hi = (b_split > 0) && (row >= b_split);
         const int r = hi ? (row - b_split) : row;

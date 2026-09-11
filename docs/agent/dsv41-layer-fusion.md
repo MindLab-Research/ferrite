@@ -63,7 +63,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 20 | `lin wo_b` | :1426 | k=`ol_local`=128 → n=5120 |
 | 21 | **AR#1** | :1434 | `s.o`, 20480 B |
 
-### 段 B（`layer()` :1017-1096 + `moe()` :1681-1974）
+### 段 B（`layer()` :1017-1096 + `moe()` :2147-2593；行号 2026-09-11 复核：`fn moe` = 2147，`fn layer` = 1295，`fn attention` = 1567）
 
 | # | 调用 | 出处 | 形状 |
 |---|---|---|---|
@@ -76,9 +76,9 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 28 | `route_topk` | :1700 | score_func=2；smem **3096 B** |
 | 29 | `zero` ×2 | :1728/:1729 | memset |
 | 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32 |
-| 31 | **batched 路径（`moe_batch()` 代码默认 ON**，:188 `unwrap_or(true)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`gateup_fused` 开时**跳过** `swiglu_limit_batched`；`gateup_fused = DSV41_GATEUP_FUSE!=0 && supports_gateup_fuse() && expert_fp4_mode()==2`，:2344/:2383 —— 必须与 `.cu:1268` 的 `g_fuse && g_expert_fp4_mode==2 && dim%512==0` 逐字镜像）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 ON）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|
+| 31 | **batched 路径（`moe_batch()` 代码默认 ON**，:188 `unwrap_or(true)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`gateup_fused` 开时**跳过** `swiglu_limit_batched`；`gateup_fused = DSV41_GATEUP_FUSE!=0 && supports_gateup_fuse() && expert_fp4_mode()==2`，:2344/:2383 —— 必须与 `.cu:1367` 的 `g_fuse && g_expert_fp4_mode==2 && dim%512==0` 逐字镜像）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 ON）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|
 | 31' | sequential 回退（逐 slot ×topk）| :2433-2477 | `expert_gate_up_fp4_indirect` / `swiglu_limit` / `expert_down_fp4_indirect` |
-| 32 | 共享专家（**仅 rank 0**）| :1918-1970 | `quant1` + `gemm_fp8_mx`(w1) + `gemm_fp8_mx`(w3) + `swiglu_limit` + `quant1` + `gemm_fp8_mx`(w2) + `add_inplace` |
+| 32 | 共享专家（`shared_rank`：`DSV41_SHARED_TP` 时 = **所有 rank**，各自 `inter/world` 切片；否则仅 rank 0）| :2504-2588 | gate/up 二选一：`DSV41_SH_EXP_MX2`（默认 ON）⇒ **一次 `gemm_fp8_mx2`**(w1,w3)；否则两次 `gemm_fp8_mx`。前置 `quant1(xn)`（`sh_via_mixed` 时由 `gemm_bf16_fp8x2` 顺带完成）。后接 `swiglu_limit` + `quant1(ex_act)` + `gemm_fp8_mx`(w2) + `add_inplace(o, ex_out)` |
 | 33 | **AR#2** | `moe_reduce()` :638 | `s.o`, 20480 B |
 
 ### 段 C
@@ -99,7 +99,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | `hc_mixes` | `(mix + hc*hc)*4` = **160 B** | kernels.cu:1749-1750 |
 | `indexer_topk` | `kIndexerChunk*5 + topk*12 + 64` = **26688 B**（编译期常量，与 per-step 计数解耦 ✓）| kernels.cu:1414-1415 |
 | `route_topk` | `n_experts*8 + topk*4` = **3096 B** | route.cu:147 |
-| `expert_*_fp4(_batched)` | **`k*sizeof(float)`** = 激活行驻 smem（gate/up: `dim*4`=20480 B；down: `inter_local*4`）| experts_mxf4.cu:800/874/949/968 |
+| `expert_*_fp4(_batched)` | **`k*sizeof(float)`** = 激活行驻 smem（gate/up: `dim*4`=20480 B；down: `inter_local*4`），另加 `256*sizeof(float2)` 的 LUT | experts_mxf4.cu:1210/1284/1370/1392 |
 
 **推论（关键）：**最大的一项是 `expert_*` 把**激活行整条**（`k*4`）驻 smem ✓ —— 这已经是"tile 对齐"的既有范式 ✓。
 若融合核沿用"整条激活行 + 输出 tile"的布局：
@@ -151,7 +151,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 ## 6. 已知风险 / 待确认
 
 - **`gateup_fused` 曾与 `.cu` 融合条件不一致（已修复 2026-09-11）** ✗→✓：Rust 侧原来只判
-  `DSV41_GATEUP_FUSE` + `supports_gateup_fuse()`，漏了 `.cu:1268` 的 `g_expert_fp4_mode == 2`。
+  `DSV41_GATEUP_FUSE` + `supports_gateup_fuse()`，漏了 `.cu:1367` 的 `g_expert_fp4_mode == 2`。
   当 `DSV41_EXPERT_FP4_MODE=0/1` 时 kernel 写满 `2*inter` 不融合，而 host 仍按融合推进
   `act_slot=inter` 并跳过 swiglu ⇒ **静默数据错位**（非性能问题）。现两处均加
   `&& expert_fp4_mode() == 2`（`chain_dev.rs:2344`/`:2383`，helper 见 `:218`，OnceLock 缓存、
