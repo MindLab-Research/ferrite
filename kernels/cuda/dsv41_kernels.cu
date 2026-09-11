@@ -1606,6 +1606,13 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
+// Four-step ILP in the fp8 gemv kb loop, isolated on top of nuclear+e4m3.
+static const int g_gemv_ilp = [] {
+    const char* e = getenv("DSV41_GEMV_ILP");
+    if (e == nullptr) return 1;
+    return atoi(e) != 0 ? 1 : 0;
+}();
+
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
