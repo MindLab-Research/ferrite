@@ -1664,6 +1664,32 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
   （审计命令的坑：必须用 `-gencode arch=compute_103a,code=sm_103a` ✗ —— 只给 `-arch=sm_103a`
   会生成 compute_103 PTX 而 mxf4/tcgen05 全部报 "not supported on sm_103" ✗，那是标志问题不是代码问题 ✓。）
 
+### down + reduce 融合已落地（`DSV41_DOWN_FUSE`，默认开，待 e2e 验收 + 远程编译）
+
+- **新 kernel（老入口一行未动 ⇒ `DSV41_DOWN_FUSE=0` 字节级回退 ✓）**：
+  `expert_gemv_fp4_down_reduce_kernel<STAGED>`（`dsv41_experts_mxf4.cu`，模板参数选 act staging）
+  + launcher `dsv41_expert_down_reduce_fp4_batched`。把批化 down 的**两次启动**（`expert_down_fp4_batched`
+  写 `[slots][dim]` scratch + `moe_down_reduce` 定点序求和）合成**一次**：grid 只有 x 维
+  （`⌈dim/8⌉`），每 warp 独占自己的输出行，**串行升序**走 slot、累加在寄存器里，`out[row]` 覆盖写。
+- **数值契约（逐位一致）**：K 点积 + butterfly shuffle **逐字照抄** batched kernel（同一 lane 序、
+  同一 group 序、同 `#pragma unroll 2`）⇒ 每 slot 的 `c_s` 逐位相同；slot 串行升序 ⇒ 复现
+  `((0 + c_0*rw_0) + c_1*rw_1) + ...`。**⚠️ 唯一的实现修正**：`tot` 用
+  `__fadd_rn(tot, __fmul_rn(acc, rwv))` ✗ 不是字面的 `tot += acc * rwv` —— fast_math 下后者会
+  被收缩成 FMA（乘之后再舍入），与 scratch 路径的 `fl(c_s*rw_s)` 再加**最后一位不同** ⇒
+  必须显式分开乘/加才能逐位一致 ✓。
+- **act staging（STAGED=true）**：一次把全部 slot 的 act 摊到 smem `[slot][k]`（slot-major 线性），
+  LUT 紧随其后；`act_stride` 是调用方的 slice 间距，**每 slice 只读前 k 个**（今天 = 2*inter 的
+  swiglu 半边；gate_up+swiglu 融合把 slice 压成 inter 后调用方传更小的间距，kernel 不用改 ✓）。
+  smem = `slots*inter*4 + 2048`；超过设备 opt-in 上限时走 STAGED=false（只 stage LUT，act 直读 global）。
+- **per-context 教训已贯彻**：`cudaFuncSetAttribute` 是 **per device** —— launcher 每次启动用
+  `cudaGetDevice` + 每设备一次 `cudaDevAttrMaxSharedMemoryPerBlockOptin` 探测，按需把 STAGED kernel
+  的上限抬到该设备的上限（不再"在某个恰好是 current 的 device 上设一次" ✗）。
+- **gate_up+swiglu 交互**：`chain_dev.rs` 把 `act_slot`（= 融合时 inter_local，否则 2*inter_local）
+  直接作为 `act_stride` 传给融合 kernel ⇒ 融合方向切换 layout 时这一处**无需改** ✓。
+- **待办**：① `cargo check -p ferrite-models` 通过 ✓；② **远程 `bash kernels/cuda/build.sh 103a`
+  未跑**（本地无 nvcc）⇒ 需核对 STAGED kernel 的寄存器数/smem 指令选择，以及 `__fmul_rn/__fadd_rn`
+  没有被打回 FMA；③ e2e 验收（四段文本 + 逐步计时：每层少一次启动）。
+
 ### 图修好后（DSV41_GRAPH_STEP=1 成为默认）的优先级重排（2026-09-11）
 
 **前提**：单图的根因（indexer 的 dynamic smem 取自被烤死的每步计数）已修 ⇒ 整步图可用 ⇒

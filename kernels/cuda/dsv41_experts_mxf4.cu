@@ -616,99 +616,6 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     const int nwarps = (blockDim.x + 31) >> 5;
 
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
-        // gate_up+swiglu fusion (moe-coop 1(a)): when `b_split > 0 && fuse_swiglu`
-        // the launcher shrinks n_total from 2*inter to inter, and each warp
-        // produces the PAIR (gate_i, up_i) - two K loops against W1/W3, the
-        // swiglu epilogue in registers, one inter-width write instead of the
-        // old 2*inter write + a separate swiglu kernel pass.
-        if (fuse_swiglu && b_split > 0) {
-            const uint8_t* g_row = b_use + (size_t)row * kbytes;
-            const uint8_t* u_row = bhi_use + (size_t)row * kbytes;
-            const uint8_t* g_srow = bsc_use + (size_t)row * ksc;
-            const uint8_t* u_srow = bhs_use + (size_t)row * ksc;
-            float g = 0.f, u = 0.f;
-            // Two INDEPENDENT accumulation chains (the same per-chain lane
-            // order as the single-row path) - the shfl reduce below does both.
-#pragma unroll 2
-            for (int g2 = 0; g2 < (k >> 9); ++g2) {
-                const int j = (g2 << 9) + (lane << 4);
-                const float gsc = __uint_as_float(((uint32_t)g_srow[j >> 5]) << 23);
-                const uint8_t* gp = g_row + (g2 << 8) + (lane << 3);
-                const uint32_t gw0 = *reinterpret_cast<const uint32_t*>(gp);
-                const uint32_t gw1 = *reinterpret_cast<const uint32_t*>(gp + 4);
-                float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
-                const float2 gt0 = s_lut2[gw0 & 0xFFu];
-                const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
-                const float2 gt2 = s_lut2[(gw0 >> 16) & 0xFFu];
-                const float2 gt3 = s_lut2[(gw0 >> 24) & 0xFFu];
-                gp0 = fmaf(s_act[j + 0], gt0.x, gp0);
-                gp1 = fmaf(s_act[j + 1], gt0.y, gp1);
-                gp2 = fmaf(s_act[j + 2], gt1.x, gp2);
-                gp3 = fmaf(s_act[j + 3], gt1.y, gp3);
-                gp0 = fmaf(s_act[j + 4], gt2.x, gp0);
-                gp1 = fmaf(s_act[j + 5], gt2.y, gp1);
-                gp2 = fmaf(s_act[j + 6], gt3.x, gp2);
-                gp3 = fmaf(s_act[j + 7], gt3.y, gp3);
-                const float2 gu0 = s_lut2[gw1 & 0xFFu];
-                const float2 gu1 = s_lut2[(gw1 >> 8) & 0xFFu];
-                const float2 gu2 = s_lut2[(gw1 >> 16) & 0xFFu];
-                const float2 gu3 = s_lut2[(gw1 >> 24) & 0xFFu];
-                gp0 = fmaf(s_act[j + 8], gu0.x, gp0);
-                gp1 = fmaf(s_act[j + 9], gu0.y, gp1);
-                gp2 = fmaf(s_act[j + 10], gu1.x, gp2);
-                gp3 = fmaf(s_act[j + 11], gu1.y, gp3);
-                gp0 = fmaf(s_act[j + 12], gu2.x, gp0);
-                gp1 = fmaf(s_act[j + 13], gu2.y, gp1);
-                gp2 = fmaf(s_act[j + 14], gu3.x, gp2);
-                gp3 = fmaf(s_act[j + 15], gu3.y, gp3);
-                g += gsc * ((gp0 + gp1) + (gp2 + gp3));
-                // same for the up row
-                const float usc = __uint_as_float(((uint32_t)u_srow[j >> 5]) << 23);
-                const uint8_t* up = u_row + (g2 << 8) + (lane << 3);
-                const uint32_t uw0 = *reinterpret_cast<const uint32_t*>(up);
-                const uint32_t uw1 = *reinterpret_cast<const uint32_t*>(up + 4);
-                float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
-                const float2 ut0 = s_lut2[uw0 & 0xFFu];
-                const float2 ut1 = s_lut2[(uw0 >> 8) & 0xFFu];
-                const float2 ut2 = s_lut2[(uw0 >> 16) & 0xFFu];
-                const float2 ut3 = s_lut2[(uw0 >> 24) & 0xFFu];
-                up0 = fmaf(s_act[j + 0], ut0.x, up0);
-                up1 = fmaf(s_act[j + 1], ut0.y, up1);
-                up2 = fmaf(s_act[j + 2], ut1.x, up2);
-                up3 = fmaf(s_act[j + 3], ut1.y, up3);
-                up0 = fmaf(s_act[j + 4], ut2.x, up0);
-                up1 = fmaf(s_act[j + 5], ut2.y, up1);
-                up2 = fmaf(s_act[j + 6], ut3.x, up2);
-                up3 = fmaf(s_act[j + 7], ut3.y, up3);
-                const float2 uv0 = s_lut2[uw1 & 0xFFu];
-                const float2 uv1 = s_lut2[(uw1 >> 8) & 0xFFu];
-                const float2 uv2 = s_lut2[(uw1 >> 16) & 0xFFu];
-                const float2 uv3 = s_lut2[(uw1 >> 24) & 0xFFu];
-                up0 = fmaf(s_act[j + 8], uv0.x, up0);
-                up1 = fmaf(s_act[j + 9], uv0.y, up1);
-                up2 = fmaf(s_act[j + 10], uv1.x, up2);
-                up3 = fmaf(s_act[j + 11], uv1.y, up3);
-                up0 = fmaf(s_act[j + 12], uv2.x, up0);
-                up1 = fmaf(s_act[j + 13], uv2.y, up1);
-                up2 = fmaf(s_act[j + 14], uv3.x, up2);
-                up3 = fmaf(s_act[j + 15], uv3.y, up3);
-                u += usc * ((up0 + up1) + (up2 + up3));
-            }
-            // The vec==2 tail (k % 512) and the non-vec==2 paths are impossible
-            // in the fused direction: the launcher only sets fuse_swiglu when
-            // mode==2 && k%512==0 (verified: dim=5120, k>>9=10 exact).
-            for (int off = 16; off > 0; off >>= 1) {
-                g += __shfl_xor_sync(0xFFFFFFFFu, g, off);
-                u += __shfl_xor_sync(0xFFFFFFFFu, u, off);
-            }
-            if (lane == 0) {
-                if (limit > 0.f) {
-                    g = fminf(g, limit);
-                    u = fminf(fmaxf(u, -limit), limit);
-                }
-                out[(size_t)row] = (g / (1.f + expf(-g))) * u;
-            }
-            continue;
         }
         // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
         const bool hi = (b_split > 0) && (row >= b_split);
@@ -804,6 +711,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
                                                long bhs_stride, const int* __restrict__ ids,
                                                int vec, int fuse_swiglu) {
+    const int slot = (int)blockIdx.y;
+    const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
     const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
                                               : nullptr;
     out += (size_t)slot * (size_t)out_slot_stride;
