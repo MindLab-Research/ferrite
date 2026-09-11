@@ -61,6 +61,11 @@ pub fn build_layer_plans(cfg: &Glm53FlashConfig) -> Vec<LayerPlan> {
 }
 
 /// Count of each attention family (sanity for pool sizing).
+///
+/// Kept as a diagnostic entry point: the pool sizing and the profiling scripts
+/// use it, and it is the cheapest way to assert a config's family split. Marked
+/// allow(dead_code) because nothing inside the crate calls it today.
+#[allow(dead_code)]
 pub fn attn_kind_counts(cfg: &Glm53FlashConfig) -> (usize, usize) {
     let plans = build_layer_plans(cfg);
     let lin = plans.iter().filter(|p| p.attn == AttnKind::Linear).count();

@@ -207,7 +207,9 @@ impl Rng {
         self.0 = x;
         x.wrapping_mul(0x2545F4914F6CDD1D)
     }
-    /// Uniform in (-1, 1).
+    /// Uniform in (-1, 1). One of the generator family the smoke tests use;
+    /// retained deliberately (its siblings are called).
+    #[allow(dead_code)]
     fn next_f32(&mut self) -> f32 {
         ((self.next_u64() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     }

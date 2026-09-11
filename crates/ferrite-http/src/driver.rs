@@ -372,10 +372,6 @@ impl<E: ServeEngine + 'static> EngineDriver<E> {
         *self.stats.write().unwrap_or_else(|e| e.into_inner()) = stats;
     }
 
-    fn stop_id(&self) -> u32 {
-        self.engine.stop_id()
-    }
-
     fn usage_of(&self, ctx: &ReqCtx, extra: Option<usize>) -> Usage {
         let completion = self
             .engine

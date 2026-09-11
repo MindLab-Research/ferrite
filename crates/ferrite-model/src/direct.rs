@@ -317,7 +317,6 @@ fn placeholder(shape: Vec<usize>) -> Tensor {
 pub fn load_direct(dir: &Path, cfg: &crate::config::Glm53FlashConfig) -> Result<DirectView> {
     let direct = Arc::new(DirectWeights::open(dir)?);
     let jobs = checkpoint_jobs(cfg);
-    let lm = "model.language_model";
     let mut placeholders = HashMap::new();
     let mut views = HashMap::new();
     let mut fp8_raw = HashMap::new();

@@ -163,7 +163,6 @@ pub fn commit_row(
     max_new_tokens: usize,
     page_size: usize,
 ) -> Result<RowCommit> {
-    let append = accept.committed_tokens();
     for i in 0..accept.k as usize {
         row_tokens.push(accept.accepted[i]);
     }
