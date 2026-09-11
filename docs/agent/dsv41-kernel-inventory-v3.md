@@ -312,7 +312,27 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 **执行顺序**：(1) `DSV41_GATEUP_ROWS=4/2` A/B（证伪 CTA 数假说；逐位一致，唯一变量是 CTA 形状）；
 (2) 同轮抓 regs/thread；(3) 按结论选 K-split（加 warp）还是 MLP/寄存器路线。
 
-**K-split 设计（未实施：它改求和结合顺序 ⇒ 需要 parity 门）**：
+**K-split 设计（✅ 2026-09-11 已实施，env 门 `DSV41_GATEUP_KSPLIT`，默认 1 = OFF）**：
+
+> **落地状态（2026-09-11）**：`kernels/cuda/dsv41_experts_mxf4.cu` 的 fused gate/up 分支已实现
+> K-split。env `DSV41_GATEUP_KSPLIT`（默认 **1**，范围 1..8，`dsv41_gateup_ksplit()` 缓存读取）；
+> launcher `dsv41_expert_gate_up_fp4_batched` 里 `int ksplit = fuse ? dsv41_gateup_ksplit() : 1;`
+> （**非 fused 分支强制 1**——只有 fused 体实现了跨 half 合并，否则两个 half 会各自算整行并 race 同一个
+> `out[row]`），并在 `warps*ksplit > 32` 时递减（blockDim ≤ 1024）。grid.x **仍按 rows 算**
+> （`ceil(n_total/rows)`），blockDim = rows*ksplit*32，即：
+> - **默认 rows=8 + ksplit=2 ⇒ 240 CTA / 16 warps（512 线程）**，smem 仅多出 `rows*ksplit*8B = 128B`
+>   （ksplit==1 时一字节不加 ⇒ 占用率与 HEAD 完全一致）；
+> - `DSV41_GATEUP_ROWS=4 DSV41_GATEUP_KSPLIT=2` ⇒ 480 CTA / 3.2 per SM（即任务书里那个形状，仍然可达，
+>   但**不是推荐形状**——它把 per-CTA prologue 翻倍，见下面的"形状修正"）。
+>
+> 合并走 **CTA 内 smem + `__syncthreads`**（不是跨 block scratch）：一半的 lane0 写 `s_ks[warp]`，
+> 一次 barrier 后 `half==0` 的 lane0 按 **升序 half** 用 `__fadd_rn` 折叠（`ksplit=2` 时就是
+> `__fadd_rn(g_half0, g_half1)`，即 `(g0..g4)+(g5..g9)`）**在 clamp/silu 之前**。窗口循环在
+> ksplit>1 时退化为**单趟**（`row_stop = row_base+1`），且越界 warp 用 `active` 守卫（**不能**用
+> loop 边界守卫——barrier 必须被 CTA 内所有 warp 到达，否则死锁；越界 warp 的 load 重定向到 row 0）。
+> 验证：远端 `nvcc 13.2 -gencode arch=compute_103a,code=sm_103a --use_fast_math` **编译干净**；
+> `cargo check -p ferrite-models` 通过。**parity A/B（文本）与 nsys 微基准尚未跑**——翻转前必须先做。
+
 - 结构：`grid=(ceil(n_total/4), slots)` + `blockDim=8 warps`，warp `w` 与 `w+4` 认领**同一行**，
   各做 g2 ∈ [0,5) / [5,10)（k=5120 → k>>9 = 10 组，切在 32-值 scale block 边界上），各自做 warp 内
   shfl 树，两个 partial 落 smem（4 行 × 2 方向 × 2 partial = 32B），`__syncthreads()` 后由一侧合并并写 `out[row]`。
@@ -322,19 +342,19 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
   `__fadd_rn`/`__fmul_rn` 或 `fmaf` 钉住（2026-09-11 的 4-路展开漂 1ULP 事故）。
 - 结构优势：CTA 仍是 240 → **per-row 的 s_act prologue 不翻倍**（行拆分做不到这点）；代价是每 warp 的
   in-flight 字节减半且 warp 数翻倍 ⇒ 净效果取决于上面那个 regs 结论（0.81 波 → 1.62 波时 ≈ −19% 而非 −50%）。
-- **形状修正（2026-09-11 核对代码，比上面的 4-行/8-warp 方案更优）**：`blockDim=8 warps + rows_per_cta=4`
+- **形状修正（2026-09-11 核对代码，比上面的 4-行/8-warp 方案更优，已按此落地）**：`blockDim=8 warps + rows_per_cta=4`
   会把 CTA 数从 240 翻到 480，per-CTA 的 `s_act`（20KB）+ LUT prologue **随之翻倍**。更优形状 =
-  **保持 rows=8/CTA、blockDim 加到 16 warps（512 线程）**：warp `w` → `row_local = w >> 1`、`half = w & 1`，
+  **保持 rows=8/CTA、blockDim 加到 16 warps（512 线程）**：warp `w` → `row_local = w / ksplit`、`half = w % ksplit`，
   grid 仍 `(40, 6) = 240 CTA` ⇒ warp 数 1920 → 3840（**26/SM**）而 prologue 不翻倍。每 warp 仍
   `#pragma unroll 4`（可升 5）× 1 LDG.128（ILV）⇒ **每行 in-flight 字节 64 → 128B**，这才是 MLP 增益的来源
   （不是"每 warp 更深"——每 warp 只有 5 组，比原来浅）。
 - **切点/合并实现**：half A = `g2 ∈ [0,5)`、half B = `[5,10)`（沿 **512 值 group 边界**连续切；每 warp 覆盖
   2560 个连续激活，scale block 不跨界）。ILV 地址 `g_row + 2*q`（`q=(g2<<8)+(lane<<3)`）对任意 g2 都是 16B 对齐，
-  **两半的地址算术无需改**，只改循环上下界。两半各跑**同形 5 步 shfl 树** → lane0 写 `s_p[row_local][half]`，
-  **加一次 `__syncthreads`**（因此必须把 `:966` 那个 grid-stride 窗口循环改成单趟；launcher 已按
-  `ceil(n_total/rows)` 定 grid，且 grid.x 现在要按 **rows（8）** 而非 warps(16) 算），
-  最后由 `half==0` 的 lane0 做 `g = __fadd_rn(p0.x, p1.x)`、`u = __fadd_rn(p0.y, p1.y)`，**再** clamp + silu 写 `out[row]`。
-- `DSV41_GATEUP_KSPLIT=4` 不可取：`nv2f = k>>9 = 10` 不被 4 整除（只能 3/3/2/2 不均衡）⇒ 取 **2**（或 5）。
+  **两半的地址算术无需改**，只改循环上下界（`g_begin = half*nv2f/ksplit`，`g_end = (half+1)*nv2f/ksplit`）。两半各跑**同形 5 步 shfl 树** → lane0 写 `s_ks[warp]`，
+  **加一次 `__syncthreads`**（因此把 `:1017` 那个 grid-stride 窗口循环在 ksplit>1 时改成单趟；launcher 已按
+  `ceil(n_total/rows)` 定 grid，grid.x 按 **rows（8）** 而非 warps(16) 算），
+  最后由 `half==0` 的 lane0 做 `g = __fadd_rn(g_half0, g_half1)`、`u = __fadd_rn(u_half0, u_half1)`，**再** clamp + silu 写 `out[row]`。
+- `DSV41_GATEUP_KSPLIT=4` 不可取：`nv2f = k>>9 = 10` 不被 4 整除（只能 3/3/2/2 不均衡）⇒ 取 **2**（或 5）。内核的通用公式对任意 ksplit/rows 都闭合，但**只有 2 是设计点**。
 
 ---
 

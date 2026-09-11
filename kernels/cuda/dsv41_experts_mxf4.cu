@@ -822,6 +822,50 @@ static int dsv41_gateup_rows(void) {
     return cached;
 }
 
+// K-SPLIT for the FUSED gate/up body (DSV41_GATEUP_KSPLIT, default 1 = OFF).
+//
+// WHY: the fused branch was measured at ~6% issue with ~94% of cycles stalled
+// on the K loads, i.e. the warp has too few in-flight load slots. Re-packing
+// the SAME warps into more CTAs (DSV41_GATEUP_ROWS) cannot add a single warp -
+// rows x slots (320 x 6 = 1920 row-dots) IS the whole work split, one warp per
+// row. The only way to ADD warps is to hand ONE row to ksplit warps and give
+// each a contiguous slice of the K groups.
+//
+// SHAPE: ksplit warps per row => blockDim = rows*ksplit*32 and the SAME
+// grid.x = ceil(n_total/rows) as before (rows = DSV41_GATEUP_ROWS, the CTA's
+// ROW count, unchanged). At the recommended rows=8 / ksplit=2 that is
+// 16 warps = 512 threads and still 40 x 6 = 240 CTAs: the warp count doubles
+// (1920 -> 3840, ~26/SM) WITHOUT doubling the per-CTA `s_act` (k floats) + LUT
+// prologue (which is why rows=4/ksplit=2 - 480 CTAs - was rejected by the
+// design review: it halves the rows sharing each CTA's prologue).
+//
+// PARITY: splitting the K walk changes the SUMMATION ORDER - originally one
+// serial chain g0+g1+...+g9, now (g0..g4) + (g5..g9) with the halves summed by
+// ONE deterministic __fadd_rn at the group boundary (half 0 owns [0,5), half 1
+// owns [5,10), always merged in ascending half order). Mathematically identical,
+// not bit-identical; the per-layer drift is ~1e-7. Hence DEFAULT OFF (1) - the
+// whole point of this gate is to validate the text A/B before flipping it ON.
+//
+// The per-half group range is [half*nv2f/ksplit, (half+1)*nv2f/ksplit) with
+// nv2f = k>>9 (10 at k=5120) - a cut on 512-value group boundaries, so no
+// 32-value scale block is ever straddled. nv2f=10 is NOT divisible by 4 (only
+// 3/3/2/2), so the meaningful values are 2 (or 5); 4 is allowed but unbalanced.
+constexpr int kGateUpKsplitMax = 8;
+
+static int dsv41_gateup_ksplit(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int v = 1;
+        if (const char* e = getenv("DSV41_GATEUP_KSPLIT")) {
+            v = atoi(e);
+            if (v < 1) v = 1;
+            if (v > kGateUpKsplitMax) v = kGateUpKsplitMax;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
 // NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
 // through cudaLaunchKernelEx (its variadic template applies the kernel's
 // declared parameter types to the arguments, exactly like `<<<>>>` would).
@@ -864,7 +908,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bs_stride, const uint8_t* __restrict__ bh_base,
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
                                                long bhs_stride, const int* __restrict__ ids,
-                                               int vec, int fuse_swiglu) {
+                                               int vec, int fuse_swiglu, int ksplit) {
     const int slot = (int)blockIdx.y;
     const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
     const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
@@ -887,6 +931,13 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // 256-entry byte->float2 table: one LDS.64 yields both nibbles' e2m1 values
     // (the old 16-entry scalar table needed two LDS.32 plus a shift per value).
     float2* s_lut2 = reinterpret_cast<float2*>(s_act + k);
+    // K-split partials (DSV41_GATEUP_KSPLIT>1, fused gate/up only): ONE (gate,up)
+    // float2 per warp, indexed by the CTA-local warp id. The ksplit halves of a
+    // row are consecutive warps (warp = row_local*ksplit + half), so half 0 reads
+    // s_ks[warp+1 .. warp+ksplit-1] to fold its partners. Laid out right after the
+    // 256-entry LUT and allocated by the launcher ONLY when ksplit>1, so the
+    // ksplit==1 launch keeps the original dynamic-smem size (and occupancy).
+    float2* s_ks = reinterpret_cast<float2*>(s_lut2 + 256);
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
     // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
@@ -963,33 +1014,67 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
 
-    for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
+    // K-SPLIT row mapping (DSV41_GATEUP_KSPLIT, default 1 = original).
+    // With ksplit warps per row, nwarps = rows*ksplit, so the CTA's ROW count is
+    // nwarps/ksplit and warp `w` owns row_local `w/ksplit`, half `w%ksplit`.
+    // ksplit==1 => rows_per_cta == nwarps, row_local == warp: the exact original
+    // mapping. grid.x is still ceil(n_total/rows) (the launcher sizes it by the
+    // ROW count), i.e. ONE pass; ksplit>1 therefore stops the window loop after
+    // its single iteration and lets the warps whose row is past n_total reach the
+    // fused branch's cross-half __syncthreads() as well (guard by `active`, not
+    // by the loop bound, or that barrier would deadlock the CTA).
+    const int rows_per_cta = (ksplit > 0) ? (nwarps / ksplit) : nwarps;
+    const int row_local = (ksplit > 0) ? (warp / ksplit) : warp;
+    const int half = (ksplit > 0) ? (warp % ksplit) : 0;
+    const int row_base = blockIdx.x * rows_per_cta + row_local;
+    const int row_stop = (ksplit > 1) ? (row_base + 1) : n_total;   // ksplit>1: one trip
+    for (int row = row_base; row < row_stop; row += gridDim.x * rows_per_cta) {
         // gate_up + swiglu fusion (fuse_swiglu && b_split > 0, gate/up direction).
         // Here n_total == inter and this warp owns ONE inter row `row`: it walks
         // BOTH halves of that row - the gate row `row` of the `b` pair and the up
         // row `row` of the `b_hi` pair - and writes the swiglu'd result straight
         // into out[row]. The caller then never materialises the 2*inter gate/up
         // buffer nor runs the separate swiglu pass.
-        // NUMERIC CONTRACT: each K walk below is the vec==2 shape of the unfused
-        // body (same group order j = (g<<9) + (lane<<4), same single scale
-        // multiply per accumulator), so gate/up accumulate to the same floats the
-        // unfused rows do; only the epilogue differs (swiglu instead of the plain
-        // write). The fused loop below is `#pragma unroll 4` while the unfused
-        // body stays at 2: unroll DEPTH is not part of the contract - the per-group
-        // fma chains still run in ascending g2 order with one `g`/`u` update each,
-        // so the float sequence (and therefore the bit pattern) is unchanged.
+        // NUMERIC CONTRACT (corrected 2026-09-11): this fused body is NOT the
+        // vec==2 shape of the unfused body - the old comment claiming "same single
+        // scale multiply per accumulator / same floats as the unfused rows" was
+        // left over from 7100ebfe and invalidated by 667c6f66. The unfused vec==2
+        // body keeps FOUR accumulators a0..a3 persistent across the groups (four
+        // scale-FMAs per group, epilogue (a0+a1)+(a2+a3)); this fused body folds
+        // each group into ONE 4-element tree and does ONE scale multiply per
+        // group. The two are already NOT bit-identical at ksplit==1. What IS still
+        // guaranteed here: the per-group fma chains run in ascending g2 order with
+        // one `g`/`u` update each (unroll DEPTH is not part of the contract), so
+        // ksplit==1 reproduces the pre-K-split fused bit pattern exactly.
+        // ksplit>1 changes the summation order to (g0..g4)+(g5..g9) - see
+        // dsv41_gateup_ksplit().
         // k = dim and the launcher only sets
         // fuse_swiglu when (dim % 512) == 0, so the two-chunk-per-scale tail loop
         // of the unfused body has no work here.
         if (fuse_swiglu && b_split > 0) {
+            // K-split: warps whose `row` is past n_total still enter this branch
+            // (they must reach the cross-half __syncthreads() below, or the CTA
+            // would deadlock). `active` gates the final write; the loads of an
+            // inactive warp are redirected to row 0 (a valid, harmless row) so no
+            // out-of-range pointer is ever dereferenced. `row` is warp-uniform, so
+            // the shfl tree below stays warp-uniform.
+            const bool active = (row < n_total);
+            const int row_c = active ? row : 0;
             // ILV: gate and up live in ONE region with an 8-byte granule
             // alternation, so the row pitch doubles and the up pointer is derived
             // from the gate pointer (the `b_hi` base is not read at all).
-            const uint8_t* g_row = b_use + (size_t)row * (ILV ? (kbytes << 1) : kbytes);
-            const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row * kbytes);
-            const uint8_t* g_srow = bsc_use + (size_t)row * ksc;
-            const uint8_t* u_srow = bhs_use + (size_t)row * ksc;
+            const uint8_t* g_row = b_use + (size_t)row_c * (ILV ? (kbytes << 1) : kbytes);
+            const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row_c * kbytes);
+            const uint8_t* g_srow = bsc_use + (size_t)row_c * ksc;
+            const uint8_t* u_srow = bhs_use + (size_t)row_c * ksc;
             const int nv2f = k >> 9;   // 16 values per lane per group; no tail (k % 512 == 0)
+            // K-split group slice: this half walks the CONTIGUOUS groups
+            // [half*nv2f/ksplit, (half+1)*nv2f/ksplit). ksplit==1 => [0, nv2f), the
+            // original bounds. j and q below are unchanged because the cut always
+            // lands on a 512-value group boundary (never inside a 32-value scale
+            // block). half 0 owns the LOW half, half 1 the HIGH half.
+            const int g_begin = (half * nv2f) / ksplit;
+            const int g_end = ((half + 1) * nv2f) / ksplit;
             float g = 0.f, u = 0.f;
             // unroll 4 (was 2): the audit measured this branch at ~6% issue with
             // ~94% of cycles stalled on the K loads, i.e. too few in-flight load
@@ -998,7 +1083,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             // contract above): each group's fma chain is independent except for the
             // single `g`/`u` update per group, which still happens in g2 order.
 #pragma unroll 4
-            for (int g2 = 0; g2 < nv2f; ++g2) {
+            for (int g2 = g_begin; g2 < g_end; ++g2) {
                 const int j = (g2 << 9) + (lane << 4);
                 // Hoist the lane's 16 activation floats into registers ONCE per
                 // group: the gate chain and the up chain read the SAME 16 slots of
@@ -1103,7 +1188,34 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 g += __shfl_xor_sync(0xFFFFFFFFu, g, off);
                 u += __shfl_xor_sync(0xFFFFFFFFu, u, off);
             }
-            if (lane == 0) {
+            // ---- K-split cross-half merge (ksplit > 1 only) ----
+            // Each half' lane 0 now holds its own half's complete (gate, up) sum.
+            // Park it in smem, one barrier, then half 0 folds the partners in
+            // ASCENDING half order. The merge is deterministic and uses __fadd_rn
+            // so --use_fast_math cannot reassociate it. It happens BEFORE the
+            // clamp/silu (the clamp is on the summed gate/up, not on a partial).
+            // This is where the summation order changes vs ksplit==1:
+            //   (g0+..+g4) + (g5+..+g9)   instead of   g0+..+g9 serially.
+            // Mathematically equivalent, not bit-identical (~1e-7/layer) - that
+            // is the parity cost of K-split, hence DSV41_GATEUP_KSPLIT defaults
+            // to 1 (OFF) until the text A/B validates it.
+            if (ksplit > 1) {
+                if (lane == 0) s_ks[warp] = make_float2(g, u);
+                __syncthreads();
+                if (half == 0 && lane == 0) {
+                    float2 acc = make_float2(g, u);
+                    for (int h = 1; h < ksplit; ++h) {
+                        const float2 o = s_ks[warp + h];
+                        acc.x = __fadd_rn(acc.x, o.x);
+                        acc.y = __fadd_rn(acc.y, o.y);
+                    }
+                    g = acc.x; u = acc.y;
+                }
+            }
+            // Only half 0 of a live row writes it (half>0 have their partials
+            // already folded into half 0). Inactive warps wrote a valid row 0
+            // number above but must not clobber the real out[row].
+            if (active && half == 0 && lane == 0) {
                 if (limit > 0.f) {
                     g = fminf(g, limit);                     // gate clamp
                     u = fminf(fmaxf(u, -limit), limit);      // up clamp
@@ -1766,9 +1878,23 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // Interleaved weights are only addressable by the FUSED body (see the header
     // comment): refuse the combination rather than read the wrong bytes.
     if (ilv && !fuse) return (int)cudaErrorInvalidValue;
+    // K-split (DSV41_GATEUP_KSPLIT, default 1 = original). Only the FUSED body
+    // implements the cross-half merge, so the unfused arm always runs ksplit=1
+    // (otherwise both halves of a row would compute the full row and race on the
+    // same out[row]). blockDim must stay <= 1024 threads: warps*ksplit <= 32.
+    int ksplit = fuse ? dsv41_gateup_ksplit() : 1;
+    while (ksplit > 1 && warps * ksplit > 32) --ksplit;
     const int n_total = fuse ? inter : 2 * inter;
-    const size_t smem = (size_t)dim * sizeof(float) + 256 * sizeof(float2);
-    dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
+    // grid.x is the ROW count (n_total/rows), NOT the warp count: with ksplit the
+    // CTA carries rows*ksplit warps but still owns `rows` rows. At rows=8 /
+    // ksplit=2 this stays (40, 6) = 240 CTAs with 16 warps each (3840 warps in
+    // flight vs 1920) - the recommended shape, which does NOT double the per-CTA
+    // s_act+LUT prologue. rows=4 / ksplit=2 additionally gives the 480-CTA shape.
+    const int ctas_x = (n_total + warps - 1) / warps;
+    const size_t smem = (size_t)dim * sizeof(float) + 256 * sizeof(float2) +
+                        ((ksplit > 1) ? (size_t)(warps * ksplit) * sizeof(float2) : (size_t)0);
+    dim3 grid((unsigned)ctas_x, (unsigned)slots);
+    const unsigned block_threads = (unsigned)(warps * ksplit * 32);
     // PDL (see dsv41_experts_pdl_or_plain): the consumer's grid may start during
     // quant_fp4's tail; the kernel's entry cudaGridDependencySynchronize() gates
     // the activation staging. NOTE the full argument list: the cudaLaunchKernelEx
@@ -1777,16 +1903,16 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     cudaError_t le;
     if (ilv)
         le = dsv41_experts_pdl_or_plain(
-            expert_gemv_fp4_batched_kernel<true>, grid, dim3(warps * 32), smem, stream, nullptr, 0,
-            a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0, w1_base,
-            w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
-            g_expert_fp4_mode, fuse);
+            expert_gemv_fp4_batched_kernel<true>, grid, dim3(block_threads), smem, stream, nullptr,
+            0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
+            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride,
+            ids, g_expert_fp4_mode, fuse, ksplit);
     else
         le = dsv41_experts_pdl_or_plain(
-            expert_gemv_fp4_batched_kernel<false>, grid, dim3(warps * 32), smem, stream, nullptr, 0,
-            a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0, w1_base,
-            w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
-            g_expert_fp4_mode, fuse);
+            expert_gemv_fp4_batched_kernel<false>, grid, dim3(block_threads), smem, stream, nullptr,
+            0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
+            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride,
+            ids, g_expert_fp4_mode, fuse, ksplit);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -1812,7 +1938,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
         (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
         nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
         w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
-        g_down_fp4_mode, /*fuse_swiglu=*/0);
+        g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
