@@ -5838,3 +5838,29 @@ hc_post 的 0.15ms 才会真正浮现）。
 | 其它 | 0.35 | | |
 
 **两项大杠杆 = gate v2（−0.5）+ AR 3→1（−0.5）= 9.38 → 8.4ms（~119 tok/s）**
+
+### nsys-v3-profile 的关键勘误（2026-09-11 末）
+
+1. **nsys median vs mean**：聚合口径必须用 **mean**（gemm_fp8_gemv med 7.9 vs mean 9.5µs，差 0.39ms/步）——之前表里用 median 低估了
+2. **AR 真实成本 = 0.66ms（不是 1.49ms）**：nsys-v3 报告的 1.49 是 host-barrier 口径的误用；按 0.66 换算与 serve 实测 9.57 差 0.7% ✓；但 AR 的 246 图节点/步的结构性论点仍成立
+3. **down-vec-320（01291b2）实测 +0.31ms 回归**（down_reduce 17.2→24.9µs，+45%，两次采集复现）——与 serve A/B "neutral" 矛盾，需要隔离验证（down-vec-revert 正在处理）
+4. **gateup CSE 只回收了预测的 12%**（−0.02 vs 预期 −0.15）——expert_gemv_fp4_batched **不是 smem-load-bound**，继续在 smem 侧找收益是白费
+5. **nsys-v3 后的生产基线 = 9.64ms（mean 口径）**，与 serve 实测 9.57 差 0.7% ✓
+
+**post-CSE 真实分解（mean 口径，9.64ms）**：
+| 项 | ms/步 | 备注 |
+|---|---|---|
+| gemm_fp8_gemv | **2.33** | 246 次 × 9.5µs（mean），指令级地板 |
+| gemv_bf16 | **1.10** | 49 次 × 22.4µs——gate 延迟受限（v2 可 −0.5ms） |
+| expert_gateup fused | 1.01 | 40 次 × 25.3µs，L1TEX |
+| expert_down_reduce | 1.00 | 40 次 × 24.9µs（+45% 回归！） |
+| hc_tail | 0.99 | 80 次 × 12.4µs |
+| AR v5 | **0.66** | 82 次 × ~8µs（NVLink 协议地板） |
+| hc_dots | 0.56 | 80 次 × 7.0µs |
+| sparse_attn | 0.34 | 40 次 |
+| 其它（route/quant/rope/rmsnorm/misc） | ~1.65 | |
+
+**两项大杠杆**：
+1. **gate v2**（gemv_bf16 → gemv_bf16_v2，−0.5ms）——gate-v2-switch 正在实施
+2. **down-vec-320 revert**（+0.31ms 回收）——down-vec-revert 正在验证
+合计：9.38 → 8.6ms ≈ **116 tok/s**（如果两项都兑现）

@@ -161,6 +161,14 @@ struct Kernels {
     >,
     ar_mark: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    // v2 (vectorized uint4 + K-split) M=1 GEMV, from ferrite_kernels.cu. Optional:
+    // an older .so without the symbol keeps the v1 kernel above. Note the ABI
+    // differs from `dsv41_gemv_bf16`: (x, w, bias, out, in_f=k, out_f=n, nrows, s).
+    gemv_bf16_v2: Option<
+        unsafe extern "C" fn(
+            *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
@@ -424,6 +432,7 @@ impl Device {
             ar_reduce2: ko!(rt, "dsv41_ar_reduce2"),
             ar_mark: ko!(rt, "dsv41_ar_mark"),
             gemv_bf16: ko!(rt, "dsv41_gemv_bf16"),
+            gemv_bf16_v2: ko!(rt, "ferrite_gemv_bf16_v2"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
