@@ -275,7 +275,8 @@ impl Collective {
             let n = (len / 4) as i64;
             let slot_f = (self.bytes / 4) as i64;
             let base8 = self.staging.ptr as *const u8;
-            let epoch = base8.wrapping_add(self.ctr_at) as *const c_uint;
+            let epoch_r = base8.wrapping_add(self.ctr_at) as *const c_uint;
+            let epoch_w = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
             let ctr2 = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
             let stamps = base8.wrapping_add(self.stamps_at) as *const c_uint;
             self.dev.ar_v5_store(
@@ -285,14 +286,14 @@ impl Collective {
                 buf as *const f32,
                 n,
                 slot_f,
-                epoch,
+                epoch_r,
             )?;
             self.dev.ar_v5_publish(
                 self.peer_stamps.ptr as *const u64,
                 stamps,
                 self.world as i32,
                 self.rank as i32,
-                epoch,
+                epoch_r,
             )?;
             self.dev.ar_v5_reduce(
                 buf as *mut f32,
@@ -300,7 +301,7 @@ impl Collective {
                 n,
                 slot_f,
                 self.world as i32,
-                epoch,
+                epoch_w,
                 ctr2,
             )?;
             return Ok(());

@@ -173,7 +173,7 @@ struct Kernels {
         unsafe extern "C" fn(*const u64, *const c_uint, c_int, c_int, *const c_uint, CuStream) -> c_int,
     >,
     ar_v5_reduce: Option<
-        unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, *mut c_uint, CuStream) -> c_int,
+        unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *mut c_uint, *mut c_uint, CuStream) -> c_int,
     >,
     expert_gate_up_fp4_indirect: Option<
         unsafe extern "C" fn(
@@ -1500,7 +1500,7 @@ impl Device {
         n: i64,
         slot_f: i64,
         world: c_int,
-        epoch: *const c_uint,
+        epoch: *mut c_uint,
         ctr: *mut c_uint,
     ) -> Result<()> {
         let f = self.need(self.kernels.ar_v5_reduce, "dsv41_ar_v5_reduce")?;

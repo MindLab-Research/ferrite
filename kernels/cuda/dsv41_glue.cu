@@ -291,7 +291,7 @@ __global__ void ar_v5_publish_kernel(const unsigned long long* __restrict__ peer
 
 __global__ void ar_v5_reduce_kernel(float* __restrict__ dst, const float* __restrict__ staging,
                                     long n, long slot_f, int world,
-                                    const unsigned* __restrict__ epoch,
+                                    unsigned* __restrict__ epoch,
                                     unsigned* __restrict__ ctr) {
     const unsigned e = *epoch;
     const long parity = (long)(e & 1u) * world * slot_f;
@@ -334,7 +334,7 @@ extern "C" int dsv41_ar_v5_publish(const unsigned long long* peer_stamps, const 
 }
 
 extern "C" int dsv41_ar_v5_reduce(float* dst, const float* staging, long n, long slot_f, int world,
-                                  const unsigned* epoch, unsigned* ctr, cudaStream_t s) {
+                                  unsigned* epoch, unsigned* ctr, cudaStream_t s) {
     if (n <= 0 || world <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 255) / 256);
     if (blocks > 512) blocks = 512;
