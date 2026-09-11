@@ -2214,15 +2214,12 @@ fn fuse_b1() -> bool {
         // OVERWRITES `o`: out[i] = acc), and zeroing `o` there would destroy the
         // attention residual AR#1 just summed into it. The sequential path below
         // still needs both zeros as its add base.
+        let ne = ld.experts.len();
         let batched = moe_batch() && topk > 0 && ne >= 2 && self.dev.supports_moe_batch();
         if !batched {
             self.dev.zero(&self.s.ex_out)?;
             self.dev.zero(&self.s.o)?;
         }
-        // No expert parallelism: the local array holds ALL experts, so a global
-        // routing id indexes it directly (with the EP scheme it had to be
-        // rebased by rank*ne).
-        let ne = ld.experts.len();
         let wsum = vec![0f32; ne.max(1)];
         if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[mine] route idx={:?} wgt={:?}", &idx, &wgt);
