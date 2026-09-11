@@ -1729,9 +1729,15 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // Stage this row's ue8m0 scale bytes too: they are one global load per
             // kb in the consume loop, and that load is exactly the latency the loop
             // stalls on (constant-scales measured 21-34 percent faster).
-            for (int i = ((nb_k >> 4) << 4) + lane; i < nb_k; i += 32) row_sc[i] = wsr[i];
-            for (int i = lane; i < (nb_k >> 4); i += 32)
-                dsv41_cp_async16(row_sc + (i << 4), wsr + (i << 4));
+            //
+            // PLAIN byte loads, NOT cp.async: cp.async16 needs a 16-byte-aligned
+            // global address and `wsr` only has that when nb_k (= k/32) is a
+            // multiple of 16. It is 72 for the shared expert (inter 2304) and 40
+            // for q_lora (1280), and cp.async16 there faults with err 716
+            // (misaligned address), which surfaces on the NEXT checked launch
+            // (measured: a sticky error reported by dsv41_route_topk). The weight
+            // cp.asyncs are issued first, so these loads overlap their latency.
+            for (int i = lane; i < nb_k; i += 32) row_sc[i] = wsr[i];
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
