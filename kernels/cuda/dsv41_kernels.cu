@@ -2611,7 +2611,7 @@ __device__ __forceinline__ void dsv41_cp_wait_all();
 // unit, so this one carries its own copy under the DSV41 gate. Semantics are
 // identical to that one (which is the verified-capture-compatible precedent):
 //
-//   * DSV41_PDL unset or =1 (DEFAULT ON) -> the launch carries
+//   * DSV41_PDL=1 (opt-in; unset = DEFAULT OFF) -> the launch carries
 //     cudaLaunchAttributeProgrammaticStreamSerialization, so the consumer grid
 //     is allowed to start while the producer is still draining its tail. The
 //     consumer kernel then gates every read of the producer's output on the
@@ -2664,7 +2664,13 @@ static int dsv41_pdl_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char* e = getenv("DSV41_PDL");
-        cached = (e != nullptr && e[0] == '0') ? 0 : 1;   // explicit "0" rolls back
+        // Round-45 fix: default OFF. PDL was introduced default-ON but never
+        // production-verified; its cudaLaunchKernelEx path with the 36+ GEMV
+        // parameters is the prime suspect for the drifting "cuda error 1"
+        // (InvalidValue) that blocked rounds 42-45. The non-PDL path now uses
+        // cudaLaunchKernel (identical to <<<>>> marshaling). Flip to default
+        // OFF until a clean serve A/B proves the PDL path safe.
+        cached = (e != nullptr && e[0] == '1') ? 1 : 0;   // explicit "1" enables
     }
     return cached;
 }

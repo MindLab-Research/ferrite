@@ -322,8 +322,9 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   修复：把这 7 个默认值还原 `true`，只保留新融合门（GATEUP/DOWN/AR_STORE/SWIGLU_Q/MOE_EPI_ADD）默认 OFF。
   注意 `DSV41_MOE_BATCH` 的 doc 注释仍写 "DEFAULT OFF"，与 round-16 基线以及 -3.2ms 的实测收益矛盾，应一并订正。
 - **✅ gemv kernel 签名 +6 参数（epi_add + AR 5 个）已排除，与 +8.7ms 无关（2026-09-11 ptxas 实测）** ✓：
-  `gemm_fp8_gemv_kernel` 14 → 22 参数（`dsv41_kernels.cu:1722`：epi_add + AR 5 个 + B1 的
-  `xq`/`xsc`），但以生产 flag
+  `gemm_fp8_gemv_kernel` 14 → 22 参数（当次实验值；该签名现位于 `dsv41_kernels.cu:2701`，
+  已增至 **37 个参数**：epi_add + AR 5 个 + B1 的 `xq`/`xsc` + rope 7 个 + NORM_FUSE 3 个 +
+  f32 的 `a_f32`），但以生产 flag
   （`-O3 --use_fast_math -gencode arch=compute_103a,code=sm_103a -Xptxas -v`）对比 `314f5df` 与 HEAD：
   **寄存器 48 → 40（不升反降），两版均 0 spill，34 个 kernel 中只有这一个的寄存器数变了**。
   occupancy 也不是寄存器约束：mode 4 的 `gsmem` = 5·5120+22784 = **48384 B**（mode 3 = 43264 B），
