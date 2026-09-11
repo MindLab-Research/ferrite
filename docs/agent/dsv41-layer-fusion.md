@@ -55,7 +55,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 12 | `window_idxs`（每步无条件）| :1325 | `idxs[win+index_topk+8]i32`。**B2**：`ring_win_fuse` 一次启动同时做 #11+#12，`ring==null` 时仍写 idxs（非 owner 层的独立 `window_idxs` 也消失）|
 | 13 | `compress()`（kv-source 层）| :1308-1314 → :1589-1649 | pool + commit 两核 |
 | 14 | `indexer()`（仅 8 个 source 层）| :1332 → :1446-1584 | idx_k（512→128）+ norm + rope + publish + idx_wq_b（1280→4096）+ rope + idx_weights（5120→32）+ `indexer_topk`（smem **26688 B**，与 per-step `n_pos` 解耦 ✓）|
-| 15 | `comp_placeholder`（无 indexer 时）| :1340 | 写 `idxs[win..]` |
+| 15 | `comp_placeholder`（无 indexer 时）| :1340 | 写 `idxs[win..]`。**B3**：已折进 `ring_win_fuse` 的 epilogue（`DSV41_COMP_PLACEHOLDER_FUSE` 默认 ON），独立 launch 消失 —— 见 §6 ③ |
 | 16 | `sparse_attn` | :1348 | b=1,m=1,h=nlh,d=512, window=128, index_topk=512 → `s.o` |
 | 17 | `apply_rope`（**反向**）| :1363 | rows=nlh, inverse=true。**B2**：`apply_rope_q` 在 epilogue 直出 #18 的 fp8（见 §6）|
 | 18 | `quant1`（o 量化）| :1392 | 长度 `nlh*hd`=4096。**B2**：由 #17 的 epilogue 承担，本行在融合路径消失 |
@@ -166,6 +166,15 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     `window_idxs` 都消失。调用点从原 `window_idxs` 位置（compress **之后**）上移到 `ring_append` 位置
     （compress **之前**）——安全，因为二者之间没有代码写 `idxs[0,win)`，唯一读者是 `sparse_attn`。
     每步省 40 次 launch。
+  - **③ `comp_placeholder` 折进 ring_win_fuse 的 epilogue**（B3，`DSV41_COMP_PLACEHOLDER_FUSE` 默认 ON）——
+    #15 写的 `idxs[win, win+take)`（`take = min(*clen, index_topk)`，**设备端**派生）与 #12 写的
+    `idxs[0,win)` 是同一缓冲的**不相交**两块，唯一读者同为 `sparse_attn`；#12 与 #15 之间唯一的写者
+    （indexer）自己拥有 `[win, ..)`，所以它走同一入口但**关掉** placeholder 半边。新符号
+    `dsv41_ring_win_fuse_ph`（grid = `max(window, hd, index_topk)/128`，覆盖原独立 launch 的
+    `ceil(index_topk/128)` 块），`clen==nullptr` 时与 `dsv41_ring_win_fuse` 逐字节相同。
+    `chain_dev.rs` 的 `ph_ok` 额外排除 **compress source**（`clen[layer]` 正被本步 compressor 推进 ⇒
+    在 ring_win 处读会 race；生产配置里 `kv_source ⊆ index_source`，那些层本就不需要 placeholder）。
+    每步省 30 次 launch / 30 个图节点。
   - 收益：合计 −80 个图节点（若每次 launch ~1.5-2µs，则 −0.10~0.15ms 量级）；**尚未上机实测**。
   - 回退：`DSV41_OROPE_Q=0` / `DSV41_RING_WIN_FUSE=0`，或老 `.so`（`ko!` 符号探测自动回退）。
   - ⚠️ 与 sparse 段的并行改动无关：apply_rope 在 `dsv41_kernels.cu:1131`，sparse 段在 `:2839+`。

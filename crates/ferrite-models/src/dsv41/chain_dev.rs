@@ -3067,12 +3067,19 @@ fn hc_tail_split() -> bool {
             // (an index-source) filled earlier this step — do nothing
         } else if comp_len > 0 {
             // the owner has no indexer: recency placeholder (safety net)
-            self.dev.comp_placeholder(
-                idxs_ptr as *mut i32,
-                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
-                win as i32,
-                cfg.index_topk as i32,
-            )?;
+            // B3: `ph_fused` means the `ring_win_fuse` launch above already wrote
+            // these entries with the same device-derived bound, so the standalone
+            // launch (and its graph node) is skipped. It stays on every path that
+            // could not fold it: an age-less .so, `DSV41_COMP_PLACEHOLDER_FUSE=0`,
+            // or a layer excluded by `ph_ok`.
+            if !ph_fused {
+                self.dev.comp_placeholder(
+                    idxs_ptr as *mut i32,
+                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                    win as i32,
+                    cfg.index_topk as i32,
+                )?;
+            }
         }
 
         // P1 (DSV41_SPARSE_OROPE, default ON): the sparse attention's epilogue

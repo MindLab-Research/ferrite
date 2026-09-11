@@ -2782,15 +2782,15 @@ impl Device {
     /// B3: [`Self::ring_win_fuse`] whose epilogue ALSO writes the
     /// `comp_placeholder` recency block (`idxs[window + j] = window + *clen -
     /// take + j`, `take = min(*clen, index_topk)`) for `j < take` - one launch
-    /// and one graph node fewer per layer. The two `idxs` blocks are disjoint
-    /// and the bound is read from the DEVICE counter by both kernels, so the
-    /// fused launch is bit-identical to the pair it replaces.
+    /// and one graph node fewer per layer. The two `idxs` blocks are disjoint and
+    /// the bound is read from the DEVICE counter by both kernels, so the fused
+    /// launch is bit-identical to the pair it replaces.
     ///
     /// `clen == null` (with `index_topk == 0`) keeps the placeholder half off,
-    /// which reproduces `ring_win_fuse` byte for byte - the caller uses that for
-    /// a layer whose [window, ..) block belongs to someone else (an index-source
-    /// layer's indexer, or a compress source whose counter this step's
-    /// compressor is still advancing). `Ok(false)` means the .so lacks
+    /// which reproduces `ring_win_fuse` byte for byte - the caller uses that for a
+    /// layer whose [window, ..) block belongs to someone else (an index-source
+    /// layer's indexer, or a compress source whose counter this step's compressor
+    /// is still advancing). `Ok(false)` means the .so lacks
     /// `dsv41_ring_win_fuse_ph`; the caller then runs the `ring_win_fuse` +
     /// `comp_placeholder` pair as before.
     #[allow(clippy::too_many_arguments)]
@@ -2809,9 +2809,7 @@ impl Device {
             Some(f) => f,
             None => return Ok(false),
         };
-        let rc = unsafe {
-            f(ring, kv, pos_ctr, window, hd, idxs, clen, index_topk, self.stream)
-        };
+        let rc = unsafe { f(ring, kv, pos_ctr, window, hd, idxs, clen, index_topk, self.stream) };
         self.kerr(rc, "dsv41_ring_win_fuse_ph")?;
         Ok(true)
     }
