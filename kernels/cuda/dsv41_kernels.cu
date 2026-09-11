@@ -471,6 +471,125 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
     }
 }
 
+// ---------------------------------------------------------------------------
+// Split sparse attention (DSV41_ATTN_SPLIT). The warp version runs one block per
+// (token, head) - eight blocks on this model's decode - which leaves 95 percent
+// of the machine idle and pays for it in latency: 26 us per layer, forty layers,
+// one millisecond a step. This shape splits the KEY range across `C` blocks per
+// head, each computing an online-softmax partial (max, sum, d-wide PV
+// accumulator) into a fixed device scratch, and a second kernel merges the
+// partials in ascending chunk order - a deterministic combine, so the result
+// differs from the single-block version only in the last bits of the summation
+// grouping. The sink fold and the normalisation live in the merge, exactly where
+// the warp version had them.
+#define kAttnMaxC 16
+#define kAttnMaxBM 8
+#define kAttnMaxH 64
+#define kAttnStride (2 + 512)
+__device__ float g_attn_part[kAttnMaxBM][kAttnMaxH][kAttnMaxC][kAttnStride];
+
+// grid (C, b*m, h): block (ck, row, hh) owns keys [topk*ck/C, topk*(ck+1)/C).
+__global__ void sparse_attn_split_kernel(const float* __restrict__ q,
+                                         const float* __restrict__ kv,
+                                         const int32_t* __restrict__ idxs, int b, int m, int h,
+                                         int d, const int* __restrict__ clen, int window,
+                                         int index_topk, float scale, int C) {
+    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+    const int ck = blockIdx.x;
+    const int row = blockIdx.y;
+    if (row >= b * m || ck >= C) return;
+    const int hh = blockIdx.z;
+    if (hh >= h) return;
+    const int bb = row / m, mm = row % m;
+    const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int nwarp = (int)blockDim.x >> 5;
+    const int lo = (int)((long long)topk * ck / C);
+    const int hi = (int)((long long)topk * (ck + 1) / C);
+    const int32_t* row_idx = idxs + (size_t)(bb * m + mm) * topk;
+    float my_acc[kMaxPerW];
+#pragma unroll
+    for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
+    float my_smax = -1e30f, my_se = 0.f;
+    for (int t = lo + wid; t < hi; t += nwarp) {
+        const int idx = row_idx[t];
+        if (idx < 0) continue;
+        const float* kr = kv + ((size_t)bb * (window + *clen) + idx) * d;
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) dot += qr[c] * kr[c];
+        }
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+        dot *= scale;
+        const float nm = fmaxf(my_smax, dot);
+        const float corr = expf(my_smax - nm);
+        const float e = expf(dot - nm);
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) my_acc[i] = my_acc[i] * corr + e * kr[c];
+        }
+        my_se = my_se * corr + e;
+        my_smax = nm;
+    }
+    // merge the block's warps exactly as the warp version does, then publish the
+    // chunk partial (the sink fold is the merge kernel's job)
+    __shared__ float sh_smax[32], sh_se[32];
+    __shared__ float sh_acc[4][512];
+    if (lane == 0) {
+        sh_smax[wid] = my_smax;
+        sh_se[wid] = my_se;
+    }
+#pragma unroll
+    for (int i = 0; i < kMaxPerW; ++i) {
+        const int c = lane + i * 32;
+        if (c < d) sh_acc[wid][c] = my_acc[i];
+    }
+    __syncthreads();
+    float smax = -1e30f;
+    for (int w = 0; w < nwarp; ++w) smax = fmaxf(smax, sh_smax[w]);
+    float wsc[4];
+    for (int w = 0; w < nwarp && w < 4; ++w) wsc[w] = expf(sh_smax[w] - smax);
+    float* P = &g_attn_part[row][hh][ck][0];
+    if (threadIdx.x == 0) {
+        float se = 0.f;
+        for (int w = 0; w < nwarp; ++w) se += sh_se[w] * wsc[w < 4 ? w : 0];
+        P[0] = smax;
+        P[1] = se;
+    }
+    for (int c = threadIdx.x; c < d; c += blockDim.x) {
+        float a = 0.f;
+        for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
+        P[2 + c] = a;
+    }
+}
+
+// grid (b*m, h): combine the C chunk partials in ascending chunk order, fold the
+// sink into se (not into smax, as the warp version does) and normalise.
+__global__ void sparse_attn_merge_kernel(const float* __restrict__ sink, float* __restrict__ out,
+                                         int b, int m, int h, int d, int C) {
+    const int row = blockIdx.x;
+    if (row >= b * m) return;
+    const int hh = blockIdx.y;
+    if (hh >= h) return;
+    const float* P = &g_attn_part[row][hh][0][0];
+    float smax = -1e30f;
+    for (int ck = 0; ck < C; ++ck) smax = fmaxf(smax, P[(size_t)ck * kAttnStride]);
+    float se = 0.f;
+    for (int ck = 0; ck < C; ++ck)
+        se += P[(size_t)ck * kAttnStride + 1] * expf(P[(size_t)ck * kAttnStride] - smax);
+    se += expf(sink[hh] - smax);
+    float* orow = out + ((size_t)row * h + hh) * d;
+    for (int c = threadIdx.x; c < d; c += blockDim.x) {
+        float a = 0.f;
+        for (int ck = 0; ck < C; ++ck)
+            a += P[(size_t)ck * kAttnStride + 2 + c] * expf(P[(size_t)ck * kAttnStride] - smax);
+        orow[c] = (se > 0.f) ? a / se : 0.f;
+    }
+}
+
 // ------------------------------------------------------------ indexer / rope
 
 __global__ void candidate_blocks_kernel(const float* __restrict__ logits,
@@ -1392,9 +1511,14 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         // occupancy); the per-row accumulation does not depend on it.
         static const int g_warps = [] {
             const char* e = getenv("DSV41_GEMV_FP8_WARPS");
-            if (e == nullptr) return 8;
+            // Four rows per block measured 15.91 against 16.14 ms for eight, same
+            // session, same binary, text unchanged: halving the rows doubles the
+            // block count and the warps in flight, which is what this
+            // latency-bound family actually needs. Two was no better than four and
+            // stages the activation twice as often, so four it is.
+            if (e == nullptr) return 4;
             const int v = atoi(e);
-            return (v >= 1 && v <= 32) ? v : 8;
+            return (v >= 1 && v <= 32) ? v : 4;
         }();
         const int warps = g_warps;
         const int blocks = (n + warps - 1) / warps;
@@ -1493,8 +1617,26 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     // version for A/B. Cached in a static: this runs per attention call, and a
     // per-call getenv is exactly the hot-path slip this project has been bitten by.
     static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
+    // Chunked key split (DSV41_ATTN_SPLIT=C): off until the A/B passes, then the
+    // default becomes the winning chunk count.
+    static const int g_attn_split = [] {
+        const char* e = getenv("DSV41_ATTN_SPLIT");
+        if (e == nullptr) return 0;
+        return atoi(e);
+    }();
     dim3 grid(b * m, h);
     if (!seq) {
+        if (g_attn_split > 0 && g_attn_split <= kAttnMaxC && b * m <= kAttnMaxBM &&
+            h <= kAttnMaxH) {
+            sparse_attn_split_kernel<<<dim3((unsigned)g_attn_split, (unsigned)(b * m),
+                                            (unsigned)h), 128, 0, s>>>(
+                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, g_attn_split);
+            cudaError_t e2 = cudaGetLastError();
+            if (e2 != cudaSuccess) return (int)e2;
+            sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
+                sink, out, b, m, h, d, g_attn_split);
+            return (int)cudaGetLastError();
+        }
         sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
                                                      scale);
     } else {
