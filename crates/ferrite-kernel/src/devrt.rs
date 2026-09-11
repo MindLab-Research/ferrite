@@ -31,6 +31,11 @@ const CUDA_MEMCPY_D2D: c_int = 3;
 
 // ---------------------------------------------------------------- fn tables
 
+// The full cudart surface a device runtime needs. A couple of entries have no
+// caller yet (`memcpy_2d_async` — the strided upload is synchronous by design;
+// `memcpy_peer` — the peer copy path uses the async form): they stay so the
+// table is the complete primitive set, not a snapshot of today's call sites.
+#[allow(dead_code)]
 struct Cudart {
     malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> c_int,
     free: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -114,7 +119,7 @@ pub fn sym(handle: *mut c_void, name: &str) -> Result<*mut c_void> {
 
 macro_rules! f {
     ($h:expr, $name:expr) => {
-        unsafe { std::mem::transmute_copy(&sym($h, $name)?) }
+        std::mem::transmute_copy(&sym($h, $name)?)
     };
 }
 
