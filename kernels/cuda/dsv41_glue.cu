@@ -278,16 +278,15 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
         for (; c + 96 < k; c += 128) {
             const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
             const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
-            // __fmaf_rn, NOT __fmul_rn+__fadd_rn: the baseline `acc += w*x`
-            // compiles to a fused multiply-add under --use_fast_math (one
-            // rounding), so a separate mul then add (two roundings) is a
-            // DIFFERENT number even though the order looks identical.
-            acc = __fmaf_rn(__bfloat162float(w0), x0, acc);
-            acc = __fmaf_rn(__bfloat162float(w1), x1, acc);
-            acc = __fmaf_rn(__bfloat162float(w2), x2, acc);
-            acc = __fmaf_rn(__bfloat162float(w3), x3, acc);
+            // DIAGNOSTIC: baseline expression form (the compiler fuses each into
+            // an FFMA), keeping the shared-memory staging. If the text recovers,
+            // the __fmaf_rn pinning is the culprit rather than s_x.
+            acc += __bfloat162float(w0) * x0;
+            acc += __bfloat162float(w1) * x1;
+            acc += __bfloat162float(w2) * x2;
+            acc += __bfloat162float(w3) * x3;
         }
-        for (; c < k; c += 32) acc = __fmaf_rn(__bfloat162float(wr[c]), s_x[c], acc);
+        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * s_x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
@@ -314,14 +313,14 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
         for (; c + 96 < k; c += 128) {
             const float w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
             const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
-            // __fmaf_rn matches the baseline's fused multiply-add under
-            // --use_fast_math (one rounding, not two).
-            acc = __fmaf_rn(w0, x0, acc);
-            acc = __fmaf_rn(w1, x1, acc);
-            acc = __fmaf_rn(w2, x2, acc);
-            acc = __fmaf_rn(w3, x3, acc);
+            // DIAGNOSTIC: baseline expression form (compiler fuses to FFMA),
+            // shared-memory staging kept - same experiment as gemv_bf16.
+            acc += w0 * x0;
+            acc += w1 * x1;
+            acc += w2 * x2;
+            acc += w3 * x3;
         }
-        for (; c < k; c += 32) acc = __fmaf_rn(wr[c], s_x[c], acc);
+        for (; c < k; c += 32) acc += wr[c] * s_x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }

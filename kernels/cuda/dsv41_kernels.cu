@@ -1898,15 +1898,13 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             for (; c + 96 < k; c += 128) {
                 const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
                 const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
-                // __fmaf_rn (not mul+add): the baseline fuses this into one FFMA
-                // under --use_fast_math, so two roundings would be a different
-                // number.
-                acc = __fmaf_rn(__bfloat162float(w0), x0, acc);
-                acc = __fmaf_rn(__bfloat162float(w1), x1, acc);
-                acc = __fmaf_rn(__bfloat162float(w2), x2, acc);
-                acc = __fmaf_rn(__bfloat162float(w3), x3, acc);
+                // DIAGNOSTIC: baseline expression form (compiler fuses to FFMA).
+                acc += __bfloat162float(w0) * x0;
+                acc += __bfloat162float(w1) * x1;
+                acc += __bfloat162float(w2) * x2;
+                acc += __bfloat162float(w3) * x3;
             }
-            for (; c < k; c += 32) acc = __fmaf_rn(__bfloat162float(wr[c]), x[c], acc);
+            for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
             for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
             if (lane == 0) outb[row] = acc + (biasb ? biasb[row] : 0.f);
         } else {
