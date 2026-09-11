@@ -4336,3 +4336,18 @@ Paris ✓ 静夜思 ✓ 2 ✓ 出师表 ✓，13.29ms / 98 步 / 0 fault。
 2. **fp8 gemv ILP**（4 路展开 + fmaf）——device 对比证明 fmaf 与基线写法 64/64 逐位相同，
    但展开改变了循环结构。
 3. 其他 .cu 改动——已全部回退到 mg1 状态。
+
+### ✅ 隔离实验进展（2026-09-11 11:10）
+
+| 实验 | 配置 | 结果 |
+|---|---|---|
+| **nuclear** | 全部 .cu = 5cddf22 + Rust = HEAD | **正确**（13.29ms）⇒ 根因在 .cu，Rust 无害 |
+| **e4only** | nuclear + e4m3_to_f 位操作 | **正确**（13.47ms）⇒ **e4m3 位操作安全** |
+| **ilponly** | e4only + fp8 gemv ILP | 跑中 |
+
+**编译系统验证**：build.sh 编译全部 5 个 dsv41_*.cu 文件到 libferrite_kernels.so；.so 的 mtime
+和 binary 的 mtime 均新于源码；build_id（sha256 全部 .cu 内容）嵌入 .so 且 Rust 编译时校验。
+**确认不存在"没重新编译"的问题。**
+
+**用户质疑的回应**：编译系统工作正常。核弹实验（nuclear）和 e4only 均在同一编译流程下
+产生了正确结果，证明 .so 和 binary 确实反映了源码状态。
