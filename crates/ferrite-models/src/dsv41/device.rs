@@ -1476,7 +1476,26 @@ impl Device {
 
     /// Lean M=1 GEMV over bf16 weights with an f32 activation (out[n] = W[n,k]·x).
     /// Replaces cuBLAS's gemv2T path, which ran at ~40 GFLOP/s for a single row.
+    ///
+    /// Small-n dispatch: the v1 kernel gives one warp per output row at 8 rows /
+    /// block, so a latency-bound small matrix gets only n/8 blocks (the MoE gate
+    /// at n=384 -> 48 of 148 SMs, 12.5% occupancy, scalar 160-iteration K loop,
+    /// measured 17.2us). `gemv_bf16_v2` vectorizes (uint4 = 8 bf16/load) and
+    /// K-splits across WPR warps per row, so the gate becomes 384 blocks x 8
+    /// warps. Only shapes below `GEMV_V2_MAX_N` are diverted: the lm_head
+    /// (n = vocab / per-rank slice, >= 16k rows) keeps the v1 path, whose
+    /// accumulation order is bit-exact with the pre-v2 baseline. v2's K-slice
+    /// partials change f32 summation order by ~1e-6 (documented in
+    /// ferrite_kernels.cu), which is far below any routing/top-k threshold.
+    /// `DSV41_GEMV_V2=0` pins v1 (A/B escape hatch).
     pub fn gemv_bf16(&self, w: *const c_void, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
+        if gemv_bf16_v2_wanted(n) {
+            if let Some(f) = self.kernels.gemv_bf16_v2 {
+                // ABI differs from v1: (x, w, bias, out, in_f=k, out_f=n, nrows=1).
+                let rc = unsafe { f(x, w, std::ptr::null(), out, k, n, 1, self.stream) };
+                return self.kerr(rc, "ferrite_gemv_bf16_v2");
+            }
+        }
         let f = self.need(self.kernels.gemv_bf16, "dsv41_gemv_bf16")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_gemv_bf16")
@@ -2189,4 +2208,20 @@ impl Device {
         // the default `0` from the launcher's `g_fuse` fallback.)
         self.kernels.expert_gate_up_fp4_batched.is_some()
     }
+}
+
+/// Row count below which the M=1 bf16 GEMV diverts to the vectorized + K-split
+/// v2 kernel. Above this the shape already streams weights efficiently on v1,
+/// and the lm_head (n = vocab, or its per-rank slice) must stay on v1's
+/// bit-exact path. The small-n users are the MoE gate (384), the indexer's
+/// wk (index_head_dim) and wp (index_n_heads) projections.
+const GEMV_V2_MAX_N: i32 = 2048;
+
+/// `DSV41_GEMV_V2=0` pins every M=1 bf16 GEMV to v1 (A/B / bisect escape
+/// hatch). Default ON: the .so exposes `ferrite_gemv_bf16_v2`.
+fn gemv_bf16_v2_wanted(n: i32) -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    n > 0
+        && n < GEMV_V2_MAX_N
+        && *F.get_or_init(|| std::env::var("DSV41_GEMV_V2").map(|v| v != "0").unwrap_or(true))
 }

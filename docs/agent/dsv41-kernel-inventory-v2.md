@@ -128,7 +128,7 @@ Top-3/4 是 roadmap 定义的 Stage B 本体（结构性，8.8→7.2 段）；To
 |---|---|---|---|
 | `gemm_fp8_gemv` | 2.18 | **1.98** | ✅ **准，略优于预测**——LUT 比估计更狠（17.0→9.6µs，预测 11.6µs）。91% 固定项结论不变 |
 | `expert_gemv_fp4_batched` | 1.75 | **1.03 + down_reduce 0.69 = 1.72** | ✅ 准（家族合计）；但**结构被融合拆成两核**，单行预测已不适用 |
-| `gemv_bf16` | 0.74 | **0.41**（MIX_GATE=ON）/ **0.84**（MIX_GATE=OFF，49 次） | ✅ 准——MIX_GATE=ON 时把 40 次 gate 移走得 −0.33；但第 25 轮定案 OFF 后 gate 回到 `gemv_bf16`，0.84ms 成第 2 大项。**gate 未到带宽地板**（48 blocks / 12.5% occupancy 的延迟受限），可削减项是把 gate 换到向量化 + K-split 的 `gemv_bf16_v2_kernel`（`ferrite_kernels.cu:2731`） |
+| `gemv_bf16` | 0.74 | **0.41**（MIX_GATE=ON）/ **0.84**（MIX_GATE=OFF，49 次） | ✅ 准——MIX_GATE=ON 时把 40 次 gate 移走得 −0.33；但第 25 轮定案 OFF 后 gate 回到 `gemv_bf16`，0.84ms 成第 2 大项。**gate 未到带宽地板**（48 blocks / 12.5% occupancy 的延迟受限）。**已落地**：`device.rs::gemv_bf16` 现按 `n < GEMV_V2_MAX_N=2048` 分派到 `ferrite_gemv_bf16_v2`（`ferrite_kernels.cu:2793`，向量化 uint4 + K-split，gate n=384 → 384 blocks × 8 warps；`DSV41_GEMV_V2=0` 可关闭）。lm_head（n≥16k）仍走 v1 位精确路径 |
 | hc 链 | 1.59 | **1.55** | ✅ 准（tail 0.99 + dots 0.56）|
 | AR v5 | 0.66 | **0.66** | ✅ 准（协议地板）|
 | `sparse_attn` | 0.32 | **0.34** | ✅ 准 |
