@@ -362,7 +362,7 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 
 | kernel | 次/步 | µs/次 | ms/步 |
 |---|---|---|---|
-| `indexer_score_kernel` | 4 | 19.7 | 0.079 |
+| `indexer_score_kernel`（Step A，v2 已落地见下）| 4 | 19.7 | 0.079 |
 | `quant_kernel<1>` ††（已并入 `quant_fp4_fused_kernel`）| 40 | 1.6 | 0.065 |
 | `engram_apply_kernel` | 2 | 32.6 | 0.065 |
 | `argmax_kernel` | 1 | 59.1 | 0.059 |
@@ -385,6 +385,44 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | `bf16_to_f32_kernel` | 0 | — | 0.000 |
 
 ⚠️ `kpool_compress` 仍不在本 profile 里（它只服务 batched DSA 链 `cuda.rs:4645`，与单序列 `sparse_attn_pf_kernel` 不是同一条数据链）。
+
+### indexer_score v2（Step A，✅ 2026-09-11 已实施，**待 A/B**）
+
+> **病**（v1，`dsv41_kernels.cu` 的 `indexer_score_kernel`）：与修好前的 gate 同构——每个 FMA 配一次**标量**
+> load（q、k 各 128 次/lane/候选）、128 深依赖 FMA 链、头归约是 O(nh)=32 次 broadcast shuffle 且累加器在 lane 0，
+> 而 grid 只有 **256 CTA × 8 warp = 2048 warp**（148 SM ⇒ **13.8 warp/SM = 21% 占用**；注意不是"几个 block"，
+> 是 1.7 CTA/SM）。
+>
+> **修**（`gemv_bf16_v2` 模式直接套用，新增 `indexer_score_kernel_v2<WPR>`）：
+> (a) **float4 (16B) q/k load + 4 个独立累加器** ⇒ 32 个向量步替代 128 个标量步，每条累加器链降到 8；
+> (b) **WPR 个 warp 对同一候选切 hd**，同 block smem 折叠（`s_part[warp][lane]`，无 atomic、无第二内核；
+> relu/权重必须在**完整 hd 点积之后**，所以折叠发生在 relu 之前）；
+> (c) 头归约改 **5 步 `shfl_down` 树**（32 次 shuffle + lane0 上 32 长依赖加链 ⇒ 5+5）；
+> (d) CTA 数不再钉死 256：`kIdxScoreBlocksV2 = 1024`（8192 warp = 55/SM 请求）。
+>
+> **env**（`dsv41_indexer_topk` launcher 内各读一次）：`DSV41_IDX_SCORE_V2`（0 = 逐字回退 v1）、
+> `DSV41_IDX_SCORE_WPR`（1/2/4/8，默认 **1**）、`DSV41_IDX_SCORE_BLOCKS`（覆盖 grid.x）。
+> 前提 `hd % 4 == 0 && 0 < nh <= 32`（float4 行对齐 + 树折叠 32 lane），否则自动回落 v1。
+>
+> **WPR 默认 1 的理由**：K-split 是**延迟**修复不是吞吐修复（总工作量不变），而它的折叠每轮要两次
+> `__syncthreads`。index-source 层 `compress_ratio == 1`（`configs/dsv41_flash.json`）⇒ **n_pos 随序列长度走（万级）**，
+> 单 warp 一候选的映射已足够填满机器，此时 barrier 开销超过它隐藏的延迟。WPR=2/4/8 留给短上下文那种
+> n_pos 撑不满 8192 warp 的情形。
+>
+> ⚠️ **K-split 分支的 barrier 在循环体内 ⇒ 必须整 CTA 统一轮数**：`p = base + r*pstep + g`（g 随 warp 变）会让
+> 低编号 group 多跑一轮、`n_pos` 不整除 stride 时**死锁**。实现改为由 block 的 base 算 `nround`，越界 group
+> 用 `live` 守卫（load 重定向到候选 0、跳过 store、但仍到达 barrier）。
+>
+> **已核**：远端 `nvcc 13.2 -gencode arch=compute_103a,code=sm_103a` 编译干净（仅既有 warning）；
+> `ptxas -v`：WPR=1 **40 regs / 0 barrier / 0 smem**（v1 32 regs），WPR≥2 40 regs / 1 barrier / 1024B smem。
+> 40 regs ⇒ 每 SM 驻 6 CTA = **48 warp/SM（75%）**，比 v1 的 13.8 高 3.5x；`cargo check -p ferrite-models` 通过。
+>
+> **未做（翻转默认前必须）**：parity A/B（文本）与 nsys 隔离微基准
+> （`scripts/dsv41_indexer_bench.cu`，n_pos ∈ {32,128,512,2048,4096}）。求和顺序变了（float4 lane、K 切片
+> partial、树折叠）⇒ 分数 ~1e-7 漂移，远低于 top-k 选择边际；golden 是 1 元素点积（`ops.rs`）。
+> 下一步若还要压：这个 score 本质是 `[nh,hd] × [hd,n_pos]` 的 GEMM（N 极大），CUDA core 的 128 warp-FMA/候选
+> 是硬地板，再往下只能走 tensor core + 列归约 epilogue。
+
 
 ---
 

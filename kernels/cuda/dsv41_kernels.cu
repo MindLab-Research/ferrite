@@ -1908,7 +1908,21 @@ __device__ float g_idx_score[kIdxMaxRows][kIdxMaxPos];
 
 // Grid (kIdxScoreBlocks, m, b): one warp per candidate, grid-strided over the live
 // range, so the LAUNCH SHAPE never depends on n_pos.
-constexpr int kIdxScoreBlocks = 256;   // 256 blocks x 8 warps = 2048 warps in flight
+constexpr int kIdxScoreBlocks = 256;    // v1's grid: 2048 warps over 148 SMs = 13.8/SM
+// v2's grid. 256 CTAs x 8 warps is 13.8 warps/SM (21% occupancy) — the same
+// "too few blocks" disease gate v1 had at 48. 1024 CTAs x 8 = 8192 warps = 55/SM
+// (~86%), just under the 8-CTA/SM residency limit for a 256-thread block. Still a
+// compile-time constant: a CUDA graph replay must not see an n_pos-derived grid,
+// and the kernel's grid-stride loop covers any live candidate count.
+constexpr int kIdxScoreBlocksV2 = 1024;
+// v2's K-split default. WPR warps split the hd reduction of ONE candidate; WPR=1
+// is the no-smem/no-sync variant. The split is worth it only when the candidate
+// count is small enough that 8 warps/CTA cannot fill the machine: the fold costs
+// two __syncthreads per (rpb-candidate) round, and with the live n_pos of a
+// decode step (index-source layers have compress_ratio == 1, so n_pos tracks the
+// sequence length — tens of thousands) the sync overhead exceeds the latency it
+// hides. Default 1, DSV41_IDX_SCORE_WPR=2/4/8 for the short-context end.
+constexpr int kIdxScoreWprDefault = 1;
 
 __global__ void indexer_score_kernel(const float* __restrict__ q, const float* __restrict__ ik,
                                      const float* __restrict__ w, const uint8_t* __restrict__ cand,
@@ -1949,6 +1963,160 @@ __global__ void indexer_score_kernel(const float* __restrict__ q, const float* _
         if (p >= cl) sv = -INFINITY;
         if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
         if (lane == 0) g_idx_score[row][p] = sv;
+    }
+}
+
+// ----------------------------------------------------- indexer score v2
+// v1 above has gate-v1's disease (ferrite_kernels.cu: gemv_bf16_kernel ->
+// gemv_bf16_v2_kernel): one SCALAR load per FMA on BOTH q and k (256 scalar LDG
+// per lane per candidate), a 128-deep dependent FMA chain, an O(nh)=32 broadcast
+// shuffle head fold whose accumulator lives on lane 0, and only 2048 warps on the
+// machine. The gate's v2 fix maps over directly:
+//   (a) float4 (16B) q/k loads + FOUR independent accumulators: 32 vector steps
+//       instead of 128 scalar ones, each accumulator's chain down to 8;
+//   (b) WPR warps split the hd reduction of ONE candidate, folded in the same
+//       block through shared memory (gemv_bf16_v2's `part[warp]`, no atomics, no
+//       second kernel). WPR=1 keeps v1's one-warp-per-candidate mapping with the
+//       vector body and touches neither smem nor a barrier;
+//   (c) the head fold is a 5-step shfl_down tree instead of nh broadcast
+//       shuffles (nh == 32 here, so this is 32 shuffles + a 32-long dependent add
+//       chain on lane 0 -> 5 shuffles + 5 adds);
+//   (d) the CTA count is no longer pinned at 256 (kIdxScoreBlocksV2).
+// NOTE the K-split is a latency fix, not a throughput fix (the total work is
+// unchanged): it pays off only when the candidate count is too small to fill the
+// machine with one warp per candidate. Its fold is two __syncthreads per round,
+// which at a large live n_pos costs more than it hides — hence the WPR=1 default.
+//
+// The summation ORDER changes (float4 lanes, K-slice partials, tree folds) =>
+// f32 drift ~1e-7 on the score, orders of magnitude below the top-k margin (the
+// golden in ops.rs is a 1-element dot, and acceptance is token-level A/B parity).
+// DSV41_IDX_SCORE_V2=0 restores v1 verbatim.
+// Also KEEP the (nh <= 32) and (hd % 4 == 0) preconditions: the tree fold sums 32
+// lanes and the vector body needs 16B-aligned rows — the launcher falls back to
+// v1 when either fails.
+
+// The scale + mask tail of the two stage-A kernels, statement for statement as
+// v1 wrote it inline (both stages must publish the same value to the sort).
+__device__ __forceinline__ void idx_score_store(float* __restrict__ grow, int p, int cl, float sv,
+                                                float softmax_scale, float head_scale,
+                                                const uint8_t* __restrict__ cand, size_t row,
+                                                int n_pos, int uses_cand) {
+    float sc = sv * softmax_scale * head_scale;
+    if (p >= cl) sc = -INFINITY;
+    if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sc = -INFINITY;
+    grow[p] = sc;
+}
+
+// 5-step shfl_down tree (ascending-h becomes a balanced tree: same sum, other
+// rounding). Lanes >= nh carry 0 and contribute nothing.
+__device__ __forceinline__ float idx_head_fold(float sv) {
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) sv += __shfl_down_sync(0xFFFFFFFFu, sv, off);
+    return sv;
+}
+
+template <int WPR>
+__global__ void indexer_score_kernel_v2(const float* __restrict__ q, const float* __restrict__ ik,
+                                        const float* __restrict__ w, const uint8_t* __restrict__ cand,
+                                        const int32_t* __restrict__ lens, int m, int nh, int hd,
+                                        int n_pos, float softmax_scale, float head_scale,
+                                        int uses_cand) {
+    // Same live-counter rule as v1 (and the fused kernel): the device counter
+    // wins over the host fallback, the declared bound is a defensive ceiling.
+    if (lens != nullptr && *lens > 0) n_pos = *lens;
+    if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos;
+    const int mm = blockIdx.y, bb = blockIdx.z;
+    const size_t row = (size_t)bb * m + mm;
+    if (row >= kIdxMaxRows) return;
+    int cl = n_pos;
+    if (lens != nullptr) cl = lens[mm];
+    if (cl > n_pos) cl = n_pos;
+    const float* qrow = q + row * (size_t)nh * hd;
+    const float* wrow = w + row * (size_t)nh;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int nwarp = (int)(blockDim.x >> 5);
+    const int rpb = nwarp / WPR;   // candidates in flight per CTA
+    const int g = warp / WPR;      // this warp's candidate slot inside the CTA
+    const int kw = warp % WPR;     // this warp's hd slice
+    // The per-warp slice is rounded up to a multiple of 4 floats so every float4
+    // access in [c0, c1) is 16B aligned: the rows are hd-strided and the launcher
+    // guarantees hd % 4 == 0.
+    const int kper = ((hd + WPR - 1) / WPR + 3) & ~3;
+    const int c0 = kw * kper;
+    const int c1 = (c0 + kper < hd) ? (c0 + kper) : hd;
+    // [warp][lane]: one hd-slice partial per head. blockDim.x is pinned at 256 by
+    // the launcher, so nwarp == 8 and the first dim is 8. WPR == 1 never writes it
+    // (the template keeps the array at one row so the un-split kernel allocates
+    // nothing meaningful).
+    __shared__ float s_part[WPR > 1 ? 8 : 1][32];
+    // Uniform trip count for the WHOLE CTA. The K-split fold carries
+    // __syncthreads INSIDE the loop, so a per-warp bound (p = base + r*pstep + g,
+    // g-varying) would let the low groups run one round more than the high ones
+    // and hang the block whenever n_pos does not divide the stride. Every group
+    // steps the same number of rounds; a group whose candidate is past n_pos
+    // contributes zeros and skips its store.
+    const int base = (int)blockIdx.x * rpb;
+    const int pstep = (int)gridDim.x * rpb;
+    const int nround = (n_pos > base) ? (n_pos - base + pstep - 1) / pstep : 0;
+
+    for (int r = 0; r < nround; ++r) {
+        const int p = base + r * pstep + g;
+        const bool live = p < n_pos;
+        const float* krow = ik + ((size_t)bb * n_pos + (live ? p : 0)) * hd;
+        float dot = 0.f;
+        if (live && lane < nh) {
+            const float* qh = qrow + (size_t)lane * hd;
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+            int c = c0;
+            // 4 float4 per operand per iteration -> 4 independent chains.
+            for (; c + 15 < c1; c += 16) {
+                const float4 qa = *reinterpret_cast<const float4*>(qh + c);
+                const float4 ka = *reinterpret_cast<const float4*>(krow + c);
+                const float4 qb = *reinterpret_cast<const float4*>(qh + c + 4);
+                const float4 kb = *reinterpret_cast<const float4*>(krow + c + 4);
+                const float4 qc = *reinterpret_cast<const float4*>(qh + c + 8);
+                const float4 kc = *reinterpret_cast<const float4*>(krow + c + 8);
+                const float4 qd = *reinterpret_cast<const float4*>(qh + c + 12);
+                const float4 kd = *reinterpret_cast<const float4*>(krow + c + 12);
+                a0 += qa.x * ka.x + qa.y * ka.y + qa.z * ka.z + qa.w * ka.w;
+                a1 += qb.x * kb.x + qb.y * kb.y + qb.z * kb.z + qb.w * kb.w;
+                a2 += qc.x * kc.x + qc.y * kc.y + qc.z * kc.z + qc.w * kc.w;
+                a3 += qd.x * kd.x + qd.y * kd.y + qd.z * kd.z + qd.w * kd.w;
+            }
+            for (; c + 3 < c1; c += 4) {
+                const float4 qa = *reinterpret_cast<const float4*>(qh + c);
+                const float4 ka = *reinterpret_cast<const float4*>(krow + c);
+                a0 += qa.x * ka.x + qa.y * ka.y + qa.z * ka.z + qa.w * ka.w;
+            }
+            for (; c < c1; ++c) a0 += qh[c] * krow[c];
+            dot = (a0 + a1) + (a2 + a3);
+        }
+        if (WPR == 1) {
+            // No K-split: this warp owns the whole dot and publishes directly.
+            const float sv = (live && lane < nh) ? fmaxf(dot, 0.f) * wrow[lane] : 0.f;
+            const float tot = idx_head_fold(sv);
+            if (lane == 0 && live)
+                idx_score_store(g_idx_score[row], p, cl, tot, softmax_scale, head_scale, cand, row,
+                                n_pos, uses_cand);
+        } else {
+            // Stage the per-slice partial of every head, fold the WPR slices in
+            // the group's kw==0 warp (relu/weights must see the FULL hd dot, so
+            // the fold has to happen before them), then the head tree.
+            s_part[warp][lane] = dot;
+            __syncthreads();
+            if (kw == 0) {
+                float full = 0.f;
+#pragma unroll
+                for (int j = 0; j < WPR; ++j) full += s_part[g * WPR + j][lane];
+                const float sv = (live && lane < nh) ? fmaxf(full, 0.f) * wrow[lane] : 0.f;
+                const float tot = idx_head_fold(sv);
+                if (lane == 0 && live)
+                    idx_score_store(g_idx_score[row], p, cl, tot, softmax_scale, head_scale, cand,
+                                    row, n_pos, uses_cand);
+            }
+            // Before the next round overwrites s_part.
+            __syncthreads();
+        }
     }
 }
 
@@ -3919,10 +4087,59 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
     // ---- Stage A: the scoring pass, in parallel, into g_idx_score.
     // Same stream as stage B => program order makes A's writes visible to B:
     // no fence, no sync, no extra stream.
-    dim3 sgrid((unsigned)kIdxScoreBlocks, (unsigned)m, (unsigned)b);
-    indexer_score_kernel<<<sgrid, 256, 0, s>>>(q, index_k, weights, candidates, compress_lens,
-                                               m, nh, hd, n_pos, softmax_scale, head_scale,
-                                               uses_candidates);
+    // v2 = the gemv_bf16_v2 fix (float4 body + optional K-split) with a v1 escape
+    // hatch. Every gate here is read ONCE: this launcher runs 4x per step and a
+    // per-call getenv on the hot path is the slip the other gates in this file
+    // already avoid.
+    static const bool idx_v2 = [] {
+        const char* e = getenv("DSV41_IDX_SCORE_V2");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    static const int idx_wpr = [] {
+        const char* e = getenv("DSV41_IDX_SCORE_WPR");
+        const int v = (e == nullptr) ? kIdxScoreWprDefault : atoi(e);
+        return (v == 1 || v == 2 || v == 4 || v == 8) ? v : kIdxScoreWprDefault;
+    }();
+    static const int idx_blocks = [] {
+        const char* e = getenv("DSV41_IDX_SCORE_BLOCKS");
+        if (e == nullptr) return 0;
+        const int v = atoi(e);
+        return (v >= 1 && v <= 65535) ? v : 0;
+    }();
+    // Preconditions of the v2 body: the float4 lane walk needs 16B-aligned rows
+    // and the head tree folds exactly 32 lanes. Anything else keeps v1.
+    const bool use_v2 = idx_v2 && (hd & 3) == 0 && nh > 0 && nh <= 32;
+    const unsigned nblk =
+        (unsigned)(idx_blocks > 0 ? idx_blocks : (use_v2 ? kIdxScoreBlocksV2 : kIdxScoreBlocks));
+    dim3 sgrid(nblk, (unsigned)m, (unsigned)b);
+    if (use_v2) {
+        switch (idx_wpr) {
+            case 2:
+                indexer_score_kernel_v2<2><<<sgrid, 256, 0, s>>>(
+                    q, index_k, weights, candidates, compress_lens, m, nh, hd, n_pos, softmax_scale,
+                    head_scale, uses_candidates);
+                break;
+            case 4:
+                indexer_score_kernel_v2<4><<<sgrid, 256, 0, s>>>(
+                    q, index_k, weights, candidates, compress_lens, m, nh, hd, n_pos, softmax_scale,
+                    head_scale, uses_candidates);
+                break;
+            case 8:
+                indexer_score_kernel_v2<8><<<sgrid, 256, 0, s>>>(
+                    q, index_k, weights, candidates, compress_lens, m, nh, hd, n_pos, softmax_scale,
+                    head_scale, uses_candidates);
+                break;
+            default:
+                indexer_score_kernel_v2<1><<<sgrid, 256, 0, s>>>(
+                    q, index_k, weights, candidates, compress_lens, m, nh, hd, n_pos, softmax_scale,
+                    head_scale, uses_candidates);
+                break;
+        }
+    } else {
+        indexer_score_kernel<<<sgrid, 256, 0, s>>>(q, index_k, weights, candidates, compress_lens,
+                                                   m, nh, hd, n_pos, softmax_scale, head_scale,
+                                                   uses_candidates);
+    }
     cudaError_t es = cudaGetLastError();
     if (es != cudaSuccess) return (int)es;
     // Dynamic shared memory from COMPILE-TIME constants only: the sort's

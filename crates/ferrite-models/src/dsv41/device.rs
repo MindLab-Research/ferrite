@@ -552,6 +552,51 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// AR v5 with the elementwise residual `add` folded into the store epilogue
+    /// (`ferrite_p2p_ar_v5_add`): same shapes as `p2p_ar_v5` plus a `bias`
+    /// pointer published as `partial[i] + bias[i]`. Replaces the standalone
+    /// `ferrite_add` launch immediately before the MoE all-reduce (ADD_EPI).
+    p2p_ar_v5_add: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// `ferrite_p2p_ar_v5_hcpost` + the ADD_EPI residual (same shapes as
+    /// `p2p_ar_v5_hcpost`, `bias` inserted right after `partial`).
+    p2p_ar_v5_hcpost_add: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *mut f32,
+            *const f32,
+            *const f32,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
 }
 
 // ------------------------------------------------------------------- Device
@@ -657,6 +702,8 @@ impl Device {
             p2p_ar_v5: ko!(rt, "ferrite_p2p_ar_v5"),
             p2p_ar_pubred_v5: ko!(rt, "ferrite_p2p_ar_pubred_v5"),
             p2p_ar_v5_hcpost: ko!(rt, "ferrite_p2p_ar_v5_hcpost"),
+            p2p_ar_v5_add: ko!(rt, "ferrite_p2p_ar_v5_add"),
+            p2p_ar_v5_hcpost_add: ko!(rt, "ferrite_p2p_ar_v5_hcpost_add"),
         };
         Ok(Device { rt, kernels, stream, hc_split_armed: std::cell::Cell::new(false) })
     }
@@ -2522,6 +2569,81 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "ferrite_p2p_ar_v5_hcpost")?;
+        Ok(true)
+    }
+
+    /// `ferrite_p2p_ar_v5_add` — AR v5 with the elementwise residual folded into
+    /// the store epilogue. `bias` is published as `partial[i] + bias[i]` (see the
+    /// kernel note); the reduce is the unchanged v5 one, so the result is
+    /// bit-identical to `add_inplace` + `p2p_ar_v5`. `Ok(false)` on a stale .so
+    /// (no symbol), so the caller keeps the standalone add.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_v5_add(
+        &self,
+        partial: *const f32,
+        bias: *const f32,
+        staging_tbl: *const *mut f32,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+    ) -> Result<bool> {
+        let f = match self.kernels.p2p_ar_v5_add {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(partial, bias, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
+              world, my_rank, stride, self.stream)
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "ferrite_p2p_ar_v5_add")?;
+        Ok(true)
+    }
+
+    /// `ferrite_p2p_ar_v5_hcpost_add` — the hc-post fold AND the ADD_EPI
+    /// residual in one launch. `Ok(false)` on a stale .so or a declined shape;
+    /// the caller then falls back to the unfused path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_v5_hcpost_add(
+        &self,
+        partial: *const f32,
+        bias: *const f32,
+        staging_tbl: *const *mut f32,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+        hc_res: *mut f32,
+        hc_post: *const f32,
+        hc_comb: *const f32,
+        hc_n: c_int,
+        hc_h: c_int,
+    ) -> Result<bool> {
+        let f = match self.kernels.p2p_ar_v5_hcpost_add {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(partial, bias, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
+              world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, self.stream)
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "ferrite_p2p_ar_v5_hcpost_add")?;
         Ok(true)
     }
 

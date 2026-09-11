@@ -8314,24 +8314,38 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot_v2(
 // peers' k+1 stamps, which requires their store(k+1), which (stream order)
 // follows their reduce(k).
 // ============================================================
+// `bias` (nullable, ADD_EPI): the elementwise residual that used to be applied
+// by a standalone `add_kernel` immediately before this all-reduce. Folding it
+// into the store epilogue is BIT-EXACT — the value published to every peer is
+// `partial[i] + bias[i]` instead of the separate kernel's `partial[i] +
+// bias[i]`, and the pubred/reduce that follows is untouched, so the AR sums the
+// same operands in the same ascending-rank order. It also keeps the AR a
+// single launch (no reorder of the MoE chain, no PDL-adjacency change).
 __global__ void p2p_ar_store_v5_kernel(
     const float* __restrict__ partial,
     float* const* __restrict__ staging_tbl,  // [world] peers' staging bases
     const unsigned* __restrict__ epoch,      // this rank's round counter
-    int world, int my_rank, int n, int stride) {
+    int world, int my_rank, int n, int stride,
+    const float* __restrict__ bias) {        // optional residual (nullptr = none)
     const unsigned e = *epoch;
     const int step = gridDim.x * blockDim.x;
     const int n4 = n >> 2;
     const float4* p4 = reinterpret_cast<const float4*>(partial);
+    const float4* b4 = reinterpret_cast<const float4*>(bias);
     for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
-        const float4 v = p4[i4];
+        float4 v = p4[i4];
+        if (b4 != nullptr) {
+            const float4 b = b4[i4];
+            v.x += b.x; v.y += b.y; v.z += b.z; v.w += b.w;
+        }
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (size_t)i4 * 4;
         #pragma unroll 4
         for (int rr = 0; rr < world; rr++)
             *reinterpret_cast<float4*>(staging_tbl[rr] + base) = v;
     }
     for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
-        const float v = partial[ii];
+        float v = partial[ii];
+        if (bias != nullptr) v += bias[ii];
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
         for (int rr = 0; rr < world; rr++) staging_tbl[rr][base] = v;
     }
@@ -8431,12 +8445,38 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     // The store kernel's completion makes its staging writes peer-visible
     // (kernel boundary), so publish needs no fence against the store.
     p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
-        partial, staging_tbl, epoch, world, my_rank, n, stride);
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     // publish + reduce in ONE multi-block launch (see the kernel note) —
     // the store's completion (kernel boundary) still publishes the staging
     // writes before this kernel's polls/reduce reads.
+    p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out,
+        world, my_rank, n, stride);
+    return cudaGetLastError();
+}
+
+// AR v5 with the elementwise residual `add` folded into the store epilogue
+// (ADD_EPI, chain_dev.rs `add_epi()`): `partial[i] + bias[i]` is published to
+// every peer instead of `partial[i]`, which is exactly what the standalone
+// `ferrite_add(&s.o, &s.ex_out)` immediately before the AR produced. One launch
+// replaces two; the pubred/reduce is byte-for-byte the v5 one, so the AR sums
+// the same operands in the same order (bit-identical). The caller MUST have
+// `bias` final before this call (the dual-chain join / the shared half's join
+// already guarantees it in `moe()`).
+extern "C" cudaError_t ferrite_p2p_ar_v5_add(
+    const float* partial, const float* bias, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    const int threads = (world > 256) ? 1024 : 256;
+    int blocks = ((n >> 2) + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out,
         world, my_rank, n, stride);
@@ -8625,7 +8665,34 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
     int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
-        partial, staging_tbl, epoch, world, my_rank, n, stride);
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
+        hc_res, hc_post, hc_comb, hc_n, hc_h);
+    return cudaGetLastError();
+}
+
+// Same as `ferrite_p2p_ar_v5_hcpost` plus the ADD_EPI residual folded into the
+// store epilogue (see `ferrite_p2p_ar_v5_add`). The hc-post half is unchanged:
+// it consumes `out` (the reduced sum) and the store, not `partial`. One launch
+// replaces the standalone `ferrite_add` + this AR.
+extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_add(
+    const float* partial, const float* bias, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride,
+    float* hc_res, const float* hc_post, const float* hc_comb,
+    int hc_n, int hc_h, cudaStream_t s) {
+    if (hc_res == nullptr || hc_post == nullptr || hc_comb == nullptr ||
+        hc_n <= 0 || hc_n > 8 || (hc_h & 3) != 0 || n != hc_h)
+        return cudaErrorInvalidValue;
+    const int threads = (world > 256) ? 1024 : 256;
+    int blocks = ((n >> 2) + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
