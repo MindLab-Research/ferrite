@@ -1224,8 +1224,11 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
                     dot = fmaxf(dot, 0.f) * w[row * (size_t)nh + lane];
                 }
                 float acc = 0.f;
-                if (lane == 0) {
-                    for (int h = 0; h < nh; ++h) acc += __shfl_sync(0xFFFFFFFFu, dot, h);
+                // The shuffle must run on every lane (the mask demands it), so
+                // the gather is uniform and only the sum is lane-0's.
+                for (int h = 0; h < nh; ++h) {
+                    const float dv = __shfl_sync(0xFFFFFFFFu, dot, h);
+                    if (lane == 0) acc += dv;
                 }
                 acc = __shfl_sync(0xFFFFFFFFu, acc, 0);
                 float sv = acc * softmax_scale * head_scale;
