@@ -22,6 +22,28 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LOG="/tmp/ab_${TAG}.log"
 MODEL_DIR="${DSV41_MODEL_DIR:-/opt/dlami/nvme/models/DeepSeek-V4.1-Flash}"
 
+# Pre-flight same-source gate. This driver does NOT build (the caller does), but
+# it must not launch a serve onto a mismatched pair: .so and .build_id are both
+# gitignored/untracked, so a `git checkout` + `git clean` can leave a STALE .so
+# while the caller only rebuilt the binary. The id gate in cuda.rs/devrt.rs would
+# still abort at dlopen, but that costs a full serve + log read to discover.
+# Fail here, with the reason, before spawning anything.
+SO="$ROOT/kernels/cuda/libferrite_kernels.so"
+for f in "$SO" "$ROOT/target/release/dsv41-run"; do
+    [ -e "$f" ] || { echo "FATAL: missing $f - run: PHASES=0 scripts/dsv41_recovery_verify.sh"; exit 1; }
+done
+[ -f "$ROOT/kernels/cuda/.build_id" ] || {
+    echo "FATAL: kernels/cuda/.build_id missing (git clean? build.rs would embed +cuNOSTAMP)"
+    echo "       rebuild the .so FIRST: kernels/cuda/build.sh ${ARCH:-103a}, then cargo build --release"
+    exit 1
+}
+if command -v strings >/dev/null 2>&1 && \
+   ! strings "$ROOT/target/release/dsv41-run" | grep -qF "$(cat "$ROOT/kernels/cuda/.build_id")"; then
+    echo "FATAL: dsv41-run does not embed the current .build_id - stale/mismatched pair."
+    echo "       rebuild BOTH in order: kernels/cuda/build.sh 103a, then cargo build --release"
+    exit 1
+fi
+
 # Exact-PID cleanup only: pkill -f would match the caller's own command line.
 for p in $(pgrep -x dsv41-run); do kill -9 "$p"; done
 sleep 8

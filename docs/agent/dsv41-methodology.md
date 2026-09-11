@@ -355,8 +355,8 @@ AR 是两处物理边界（每层 20KB），严格「每层 1 算子」不存在
 | 资产 | 用途 |
 |---|---|
 | `scripts/dsv41_a32_bench.{cu,sh}` | a32/占用率隔离微基准（smem + blocks/SM + µs + 指纹） |
-| `scripts/dsv41_recovery_verify.sh` | 驱动恢复后的哨兵 → base → a32 A/B 一键序列 |
-| `scripts/dsv41_serve_ab.sh <tag> [ENV]` | 同二进制背靠背 A/B（逐步直打 p50 + faults） |
+| `scripts/dsv41_recovery_verify.sh` | 驱动恢复后的哨兵 → base → a32 A/B 一键序列；phase 0 强制同源构建顺序：`rm -f` 陈旧 `.so`+`.build_id` → `build.sh` → `cargo build`，并校验 binary 内嵌 build_id（`.so`/`.build_id` 均 gitignored/untracked，`git clean` 不会清） |
+| `scripts/dsv41_serve_ab.sh <tag> [ENV]` | 同二进制背靠背 A/B（逐步直打 p50 + faults）；启动前预检 `.so`/binary/`.build_id` 同源，不匹配即 fail-fast |
 | `scripts/dsv41_gemv_bench.cu` / `dsv41_indexer_bench.cu` | GEMV shape 扫描 / indexer n_pos 扫描（带选择指纹） |
 | `scripts/dsv41_profile.sh` | nsys 采集 + 差分口径（1-token 差分得 decode-only 分解） |
 | `/tmp/{hc,sa,ikp}_repro.cu`（模板） | 隔离复现器：直接链 `.so` + 预热 + 循环断言 + 空 kernel 地板 |

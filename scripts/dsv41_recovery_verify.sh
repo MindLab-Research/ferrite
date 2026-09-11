@@ -2,7 +2,12 @@
 # One-shot post-reboot verification for b300-4, in the order the reboot-recovery
 # plan fixes (STATUS.md "恢复计划"):
 #
-#   0. build BOTH products (the .so FIRST - its build id is baked into the binary)
+#   0. build BOTH products, same-source: rm the stale .so + .build_id (both
+#      gitignored/untracked, so a git reset leaves them), then kernels/cuda/
+#      build.sh (writes the new .build_id), THEN cargo build --release (build.rs
+#      reads that stamp at compile time and bakes it into the binary). The
+#      reverse order, or a stale .so, yields a binary whose embedded build id
+#      differs from the .so's and every serve aborts at dlopen.
 #   1. sentinel    : one-shot --tp 8 --prompt "1+1=" --max-tokens 3, exit 0 = alive
 #   2. base serve  : dsv41_serve_ab.sh base  (~8.2ms = no regression vs round-42;
 #                    ~7ms = the accumulated landing all works)
@@ -170,17 +175,44 @@ PY
 for phase in $PHASES; do
     case "$phase" in
     0)
-        log "== phase 0: build both products =="
+        log "== phase 0: build both products (same-source, .so first) =="
         if [ "${SKIP_BUILD:-0}" != "1" ]; then
             have nvcc || { log "FATAL: nvcc not found (CUDA toolkit required, no GPU needed)"; exit 1; }
+            # ── SAME-SOURCE BUILD ORDER (2026-09-11, gemv-fix root cause) ──────
+            # The .so is gitignored (*.so in .gitignore) and .build_id is
+            # untracked, so `git checkout` and `git clean -fd` leave BOTH behind.
+            # cargo build NEVER recompiles the .so, and ferrite-kernel/build.rs
+            # reads .build_id at COMPILE TIME. Rebuilding only one artifact (or
+            # building cargo first and the .so after) therefore produces a
+            # binary whose embedded FERRITE_BUILD_ID differs from the id the .so
+            # reports at dlopen -> the same-source gate in cuda.rs/devrt.rs
+            # aborts the serve with "kernel build id mismatch".
+            # Fix: drop both stale artifacts, then build the .so FIRST (it writes
+            # the fresh .build_id), THEN cargo build so build.rs bakes that same
+            # stamp into the binary.
+            rm -f "$K/libferrite_kernels.so" "$K/.build_id"
+            log "removed stale .so + .build_id (gitignored/untracked - a reset does NOT)"
             ( cd "$K" && bash build.sh "$ARCH" ) || { log "FATAL: kernel build failed"; exit 1; }
-            log "kernel .so: $(cat "$K/.build_id" 2>/dev/null) $(ls -l "$K/libferrite_kernels.so" | awk '{print $5}') bytes"
+            [ -f "$K/.build_id" ] || { log "FATAL: build.sh ran but left no .build_id"; exit 1; }
+            [ -f "$K/libferrite_kernels.so" ] || { log "FATAL: build.sh ran but produced no .so"; exit 1; }
+            log "kernel .so: $(cat "$K/.build_id") $(ls -l "$K/libferrite_kernels.so" | awk '{print $5}') bytes"
             # the binary embeds .build_id through ferrite-kernel/build.rs, so it
             # MUST be built after the .so - otherwise the id check refuses to start.
             # shellcheck disable=SC1090
             source "$HOME/.cargo/env" 2>/dev/null || true
             ( cd "$ROOT" && cargo build --release ) || { log "FATAL: cargo build failed"; exit 1; }
-            log "binary: $BIN"
+            # Post-build proof, not an assumption: the binary must literally
+            # contain the stamp the .so carries. cargo could otherwise skip
+            # build.rs (up-to-date tree) and relink an OLD stamp while the .so is
+            # fresh - exactly the mismatch this phase exists to prevent.
+            stamp="$(cat "$K/.build_id")"
+            if have strings && ! strings "$BIN" | grep -qF "$stamp"; then
+                log "FATAL: $BIN does not embed build_id '$stamp' - the two artifacts are NOT same-source."
+                log "  Likely: cargo did not re-run build.rs. Force it with"
+                log "  'touch crates/ferrite-kernel/build.rs && cargo build --release', then re-run phase 0."
+                exit 1
+            fi
+            log "binary: $BIN (embeds build_id $stamp)"
         else
             log "SKIP_BUILD=1: reusing $K/libferrite_kernels.so + $BIN"
         fi
