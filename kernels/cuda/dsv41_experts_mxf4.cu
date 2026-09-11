@@ -1366,8 +1366,8 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
         // MUST agree: the kernel's `fuse` decision changes the act slot layout
         // (inter vs 2*inter) and whether the host runs a separate swiglu pass.
         // A mismatch silently corrupts the activations (round-18 bug).
-        if (e == nullptr) return 0;
-        return atoi(e);
+        if (e == nullptr) return 1;
+        return atoi(e) != 0 ? 1 : 0;
     }();
     const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0) ? 1 : 0;
     const int n_total = fuse ? inter : 2 * inter;
