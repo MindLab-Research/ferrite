@@ -2210,8 +2210,15 @@ fn fuse_b1() -> bool {
         // from zero — `o` still held the attention output at this point, and the
         // memcpy that used to follow the loop replaced the finished sum with the
         // last expert's contribution alone.
-        self.dev.zero(&self.s.ex_out)?;
-        self.dev.zero(&self.s.o)?;
+        // P2: both zeros are redundant in the DEFAULT batched path (moe_down_reduce
+        // OVERWRITES `o`: out[i] = acc), and zeroing `o` there would destroy the
+        // attention residual AR#1 just summed into it. The sequential path below
+        // still needs both zeros as its add base.
+        let batched = moe_batch() && topk > 0 && ne >= 2 && self.dev.supports_moe_batch();
+        if !batched {
+            self.dev.zero(&self.s.ex_out)?;
+            self.dev.zero(&self.s.o)?;
+        }
         // No expert parallelism: the local array holds ALL experts, so a global
         // routing id indexes it directly (with the EP scheme it had to be
         // rebased by rank*ne).
