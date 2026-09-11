@@ -195,7 +195,7 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 
 **风险线**：`DSV41_PDL` 默认 ON ⇒ rebuild 后所有 DSV41 运行即生效。GLM 路径上 PDL 曾测为**中性**（且当时只覆盖 4 个 launcher），所以**上线前必须先做 `DSV41_PDL=0/1` 的图 A/B**；`=0` 是回退臂。host 侧 gate 不做 arch 判断、device 侧 sync 有 `__CUDA_ARCH__ >= 900` 守卫，故本文件必须按 sm_90+ 编译（build.sh 默认 100a）；不支持的设备上 attribute 会让 launch 显式报错，不会静默。
 
-**expert 链的 PDL 扩展（已实施 2026-09-11，未上机验证）**：同一模式延伸到 `quant_fp4 → gateup → down_reduce`。`dsv41_experts_mxf4.cu` 是独立 TU，因此带**自己的副本 `dsv41_experts_pdl_or_plain`**（`dsv41_experts_mxf4.cu:747-774`），gate 复用 `DSV41_PDL`（默认 ON、`=0` 回退），语义与另两个副本逐条相同。覆盖的 consumer 是 **3 个 launch 点 / 2 个 kernel**：
+**expert 链的 PDL 扩展（已实施 2026-09-11，未上机验证）**：同一模式延伸到 `quant_fp4 → gateup → down_reduce`。`dsv41_experts_mxf4.cu` 是独立 TU，因此带**自己的副本 `dsv41_experts_pdl_or_plain`**（gate 判定 `dsv41_experts_pdl_enabled` 在 `dsv41_experts_mxf4.cu:775`，helper 在 `:873`），gate 复用 `DSV41_PDL`（默认 ON、`=0` 回退），语义与另两个副本逐条相同。覆盖的 consumer 是 **3 个 launch 点 / 2 个 kernel**（helper 有 5 个调用点：gateup 的 ilv/unilv 分支 + down + down_reduce）：
 
 | consumer kernel | launcher | 入口 sync |
 |---|---|---|
@@ -207,7 +207,7 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 **producer 关系（已核实）**：gateup 的 producer = `quant_fp4_fused_kernel`（写 `a`/`a_scale`）；down / down_reduce 的 producer = gateup launch（写 swiglu 后的 `act_base`）。`ids`（`route_idx`）与 `row_weight`（`route_w`）由 **router 在 producer 之前的若干个 kernel** 写，PDL secondary 释放时已 flush，因此在 sync 之前读它们是安全的 —— 这正是被 hoist 的指针工作。
 **与 attention 链不同的 headroom**：这里真的有可 hoist 的**非平凡** prologue —— 256 项 e2m1 LUT —— 它已从 staging 之后**移到 sync 之前**（只写本 CTA 的 smem，由既有 `__syncthreads()` 发布，与 staging 的 smem 区间不重叠 ⇒ 顺序中立、逐位不变）。所以 expert 链回收的是 **节点过渡 + LUT/指针 prologue 之和**，比 attention 链仅回收节点过渡略多。
 **为什么 `quant_fp4_fused_kernel` 不加 PDL**：① 它对紧邻 producer（`gemv_bf16_route` 写的 `scores`/`route_idx`/`route_w`）**没有任何数据依赖**（只读 `xn`），本可完全重叠；但那样会削弱 `route_idx` 对 gateup 的**传递可见性** —— gateup 的 sync 只保证 quant 的写可见，不保证 quant 没等过的 route 的写可见。② 若在 quant 入口加 sync 则安全（恢复全序）、收益仅节点间隙，但 `dsv41_quant_fp4` 是**共用工具**（attention 链每层 6+ 次 `quant1` 也走它），加 attribute 会越出 pdl-chain-impl 逐点审计过的范围。需要时为 expert 链单开一个带 attr 的入口更合适。
-**验证**：`DSV41_PDL=0/1` 图 A/B；`DSV41_EXPERT_ILV=1` 与 `=0` 各跑一次（ILV/FUSE 组合的逐位契约见 `dsv41-kernel-inventory-v3.md`）。本机**无 nvcc**，`.cu` 未编译（仅做括号平衡 + 变参展开的 host 桩测试，见下）。
+**验证**：`DSV41_PDL=0/1` 图 A/B；`DSV41_EXPERTS_ILV=1` 与 `=0` 各跑一次（ILV/FUSE 组合的逐位契约见 `dsv41-kernel-inventory-v3.md`）。**具体入口**：`scripts/dsv41_recovery_verify.sh` 的 **phase 3b**（`PHASES="3b"`）——两个臂都钉在 phase 3 选出的 a32 配置上（`PDL_BASE_MODE`/`PDL_BASE_A32`，避免多变量），判定 = 四段文本**逐字相同**（主）+ p50 差值（次，>2% 才动默认）。本机**无 nvcc**，`.cu` 未编译（仅做括号平衡 + 变参展开的 host 桩测试，见下）。
 
 **骨架（三合一核）**：
 

@@ -80,6 +80,9 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 ## 4. 本会话（2026-09-11）新基建 → 统一抽象候选
 
 > 本节是本次更新的主体：把 DSV41 会话验证过的 6 类模式整理成**跨模型可复用的统一抽象**，并标注提升路径。凡标注「待上机 A/B」的，是本次会话在本机（无 nvcc/GPU）实现、尚未有生产读数的项。
+>
+> 📖 **同批模式的「怎么做」手册见 `dsv41-methodology.md`**（成功模式 A-E + 反模式 6.1-6.5 + 判定纪律 + 工具索引）；
+> 本节是架构视角（是什么、放在哪一层），该文件是操作视角（怎么复用、怎么不踩坑）。
 
 ### 4.1 fork/join 侧流模式 —— 层内并行的统一原语（本会话最大方法论收获）
 
@@ -130,7 +133,7 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 
 - ⚠️ **每个新 TU 要带自己的副本**：`pdl_or_plain` 是 file-static，`dsv41_kernels.cu` / `dsv41_experts_mxf4.cu` / `ferrite_kernels.cu` 各有一份逐条同义的实现。新增 `.cu` 若要用 PDL，必须复制一份，不能链到别处。
 - ⚠️ **producer 端不加 attribute**：`quant_fp4_fused_kernel` 刻意**不加**——它对紧邻 producer（`gemv_bf16_route` 写的 `scores`/`route_idx`/`route_w`）无数据依赖，但提前启动会削弱 `route_idx` 对 gateup 的传递可见性。若在 quant 入口加 sync 则安全但收益仅节点间隙。
-- ⚠️ **未上机验证**：DSV41 侧 11 个 PDL 点均在本机（无 nvcc）实现，上线前必须做 `DSV41_PDL=0/1` 图 A/B。
+- ⚠️ **未上机验证**：DSV41 侧 11 个 PDL 点均在本机（无 nvcc）实现，上线前必须做 `DSV41_PDL=0/1` 图 A/B —— 入口 `scripts/dsv41_recovery_verify.sh` phase 3b（`PHASES="3b"`，两臂钉同一 a32 配置；文本逐字相同为主判据，p50 为次）。
 - 与 `§4.1` 的关系：PDL 是**串行链**上省节点间隙，侧流是**并行链**上抢窗口；二者正交，可叠加。
 - ⚠️ **不要把 PDL 当 launch 开销的解药**：GLM 的 2026-09-10 实验已证「1.2ms 间隙是数据依赖等待 + kernel 尾部效应，不是 launch 开销」——PDL 只覆盖 ramp-down 那一小段。
 
