@@ -1853,7 +1853,8 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         // weights [nwarps][k] + (mode 4) block activation [k] + per-warp ue8m0
         // scale rows [nwarps][nb_k_al] + block activation scales [nb_k] f32.
         const size_t scale_bytes =
-            (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float);
+            (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+            (size_t)k * sizeof(float);   // a32: the pre-decoded activation row
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                              : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                       : (size_t)0;
