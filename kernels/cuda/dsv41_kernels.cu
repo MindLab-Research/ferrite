@@ -1250,12 +1250,28 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     const int tail0 = n_vec << 2;           // first block of the scalar tail
     const int blk_off = lane >> 3;          // which of the four blocks this lane owns
     const int byte_off = lane << 2;         // byte offset inside the 128-element group
+    // The activation row is the same for every output row, so it is staged once per
+    // block rather than re-read by each of the `nwarps` warps - eight byte-loads per
+    // element where one will do, and sixteen-byte loads instead of one byte. The
+    // barrier sits outside the row loop on purpose: that loop advances by warp, so a
+    // barrier inside it would be reached a different number of times per warp.
+    extern __shared__ uint8_t s_w[];
+    uint8_t* s_a = s_w + (size_t)nwarps * (size_t)k;
+    if (vec == 4) {
+        const int n16a = k >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+            *reinterpret_cast<uint4*>(s_a + (i << 4)) =
+                *reinterpret_cast<const uint4*>(a + (i << 4));
+        }
+        for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
+        __syncthreads();
+    }
     for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
         const uint8_t* wr = w + (size_t)row * k;
         const int srow = row >> 5;               // 32x32 block scale row
         const uint8_t* wsr = w_scale + (size_t)srow * nb_k;
         float acc = 0.f;
-        if (vec == 3) {
+        if (vec >= 3) {
             // Order-preserving staging. The row is fetched with sixteen-byte loads
             // into this warp's slice of shared memory and then consumed exactly the
             // way the scalar loop consumes it - element kb*32 + lane, kb ascending -
@@ -1263,7 +1279,9 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // scalar path. That is the whole point: the vectorised branch reorders a
             // lane's elements from a thirty-two stride to four consecutive values,
             // correct arithmetic that nonetheless flips near-boundary logits.
-            extern __shared__ uint8_t s_w[];
+            // Mode 4 additionally reads the activation out of the block-wide copy
+            // staged above rather than from global memory.
+            const uint8_t* ap = (vec == 4) ? s_a : a;
             uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
             // Sixteen bytes per lane per iteration. The first cut counted
             // thirty-two-byte k-blocks while copying one uint4 each, so only the
@@ -1282,7 +1300,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                 const float sb = ue8m0_to_f(wsr[kb]);
                 const float sa = a_scale[kb];    // m == 1
                 const int j = kb * 32 + lane;
-                acc += e4m3_to_f(a[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
+                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
             }
             __syncwarp();
         } else if (vec) {
@@ -1337,7 +1355,9 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
         const int warps = 8;
         const int blocks = (n + warps - 1) / warps;
-        const size_t gsmem = (g_gemv_fp8_mode == 3) ? (size_t)warps * (size_t)k : (size_t)0;
+        const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k
+                             : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k
+                                                      : (size_t)0;
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
                                                               k, g_gemv_fp8_mode);
         return (int)cudaGetLastError();
