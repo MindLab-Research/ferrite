@@ -4866,3 +4866,57 @@ for (int j = 0; j < 4; ++j) {
 
 **最终结论不变**：kernel 用法正确，基准版本正确；退化的根因不在于"用错了 API"
 而在于"任何编译变化都暴露一个未知机制"。需要另一台机器来区分硬件 vs 编译器问题。
+
+---
+
+## ✅✅✅ 2026-09-11 根因定案：变量遮蔽（`float acc` shadowing）——推翻"硬件/编译器"结论
+
+### 真相
+
+fp8 gemv 的 cp.async 分支里有一行 **内层 `float acc = 0.f;`**，遮蔽了循环外声明的
+外层累加器（`gemm_fp8_gemv_kernel`，dsv41_kernels.cu:1714 附近）。后果：
+- 内层循环把结果累加进**内层** `acc`（循环结束即离开作用域，被丢弃）；
+- 循环后的 warp 归约 `for (off...) acc += __shfl_xor_sync(..., acc, off);` 读的是
+  **外层 acc（恒为 0）**；
+- 输出 = `0 + bias` = 只有 bias ⇒ 模型输出变成固定乱码（"Vers Donearic" ×4）；
+- 而"快 3ms"是因为**编译器对恒零的归约做了死代码消除**——整个 kb 循环（含所有 fp8 加载、
+  cp.async staging、FFMA 链）被判定为死代码删除。13.28 − 10.18 ≈ 3.1ms ≈ gemv 族实测
+  3.70ms，完全吻合。
+
+**`git log -S "            float acc = 0.f;"` 的追踪**：
+- `4574f50`（4-deep prefetch"3ms 加速"版）**引入**该行；
+- `e9d5efc`（manual unroll + LB(128,8)）**保留**该行；
+- `7600ee7`（back to pragma unroll 4）**移除**该行 ⇒ 正确基线 13.30ms；
+- `8aee115`（"restore the correct baseline"）**又把它加回来** ⇒ 恢复后仍退化 10.18ms
+  （这就是"同源码不同结果"之谜——源码根本不同！）。
+
+**因此**：
+- ❌ "b300-4 硬件/驱动退化" —— 错误归因，机器一直是好的；
+- ❌ "sm_103a 编译器 bug" —— 错误归因；
+- ❌ "寄存器阈值 64/73 是硬边界" —— lb7/lb8 实验里两个版本都带遮蔽行，
+  lb8"正确"是寄存器压力恰好让编译器把内层 acc 合并/消除，属于巧合；
+- ❌ "fast_math / s_a staging / cp.async / 算术形式 / 寄存器压力" 8 个假设的排除实验
+  —— **全部无效**（被测的都是同一个死代码路径）。
+
+### 修复（commit f477ca8）
+
+移除内层 `float acc = 0.f;`，让循环累加进外层累加器。**双产物同源重编**
+（`build.sh 103a` + `cargo build --release`，so_md5=ec9fce22c52256679643ae1b0a2a3b29）
+后单轮 A/B：
+
+```
+fixA   steps= 98 p10=13.07 p50=13.28 p90=13.48 -> 75.3 tok/s  faults: 0
+四段全对：Paris ✓ 静夜思 ✓ 2 ✓ 出师表 ✓
+```
+
+基线完全恢复。**教训**：① kernel 改动的"提速"必须同时过**数值/文本正确性**——异常漂亮的
+提速先查语义不变式（这里是死代码消除）；② 同一行代码在多个提交里反复出现/消失时，
+`git log -S` 是第一诊断工具；③ 内层作用域重声明同名累加器是 C/C++ 的经典陷阱，
+编译器**不会**警告（合法遮蔽）。
+
+### 附带修复
+
+`head_slice()` 默认由 `true` 改为 `false`（env 由 `DSV41_HEAD_SLICE` 控制，
+现在 `=1` 才启用）：sliced 跨 rank argmax kernel（`dsv41_argmax_sliced`/`argmax_pub_kernel`）
+在 nuclear diagnostic（6be01ea）中删除后从未恢复，旧默认 `true` 会①白算一次 1/world 词表
+gemv 再 fallback 全量②把一个 NULL packed 缓冲传给会解引用它的 kernel。
