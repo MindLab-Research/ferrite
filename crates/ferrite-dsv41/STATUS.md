@@ -5084,3 +5084,22 @@ nsys 的计数口径是"8 个 rank 求和后再除以步数"，所以 `gemv_bf16
 | `quant_kernel` | 176 | 1.6 | 0.28 | 纯固定成本 | 待做：生产者直出 fp8 |
 | `sparse_attn_pf` 8 block | 40 | 10.5 | 0.42 | 0.34% 占用率；`DSV41_ATTN_SPLIT=8` **实测更差**（13.51ms） | 需新的切分维度 |
 | `hc_mixes_tail` 单 block | 80 | 12.2 | 0.97 | 20 轮 sinkhorn 串行（~2.6µs，31/32 warp 空转）+ 7 barrier | 待做（重叠 sinkhorn 与 collapse） |
+
+### shared expert TP 切分的 err 700：根因与修复（2026-09-11 晚）
+
+**症状**：切分开启后 serve 报 `dsv41_route_topk: cuda error 700`（非法访存），四段输出空。
+
+**定位手段（关键）**：`CUDA_LAUNCH_BLOCKING=1` 让首个失败内核**当场**报错，
+一次性把归因从 `route_topk`（诚实但误导的 sticky 顺延）改到
+**`dsv41_gemm_bf16_fp8x2: cuda error 700`（rank 0）**。
+**教训：本文件的 sticky error 顺延问题（act 内核返回值不走 ck()）会让归因偏到下游内核；
+凡"某内核非法访存"的现场，先开 `CUDA_LAUNCH_BLOCKING=1` 取真凶，再读代码。**
+
+**根因**：我把 shared expert 计算块里的 `inter` 改成 `sh_il` 时**只覆盖了后段**
+（`!sh_via_mixed` 的 mx2 回退 + swiglu/quant/w2），**漏掉了前面那个融合 launch
+`gemm_bf16_fp8x2`**——它仍以 `nf = inter (2304)` 调 kernel，而权重已按 `Shard::Rows`
+切成 **288 行**，于是混合核对 family-1/family-2 的行号 288..2303 做 `wf + rrow*k`
+越界读。修复 = 那里也传 `sh_il`。
+
+**教训**：改一处"尺寸来源"必须**全量 grep 该尺寸的所有传递点**（`grep -n "inter as i32"`），
+不能只改肉眼看到的第一处；融合 launch 的参数列表比单族 launch 长，最容易被漏。
