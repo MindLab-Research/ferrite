@@ -643,7 +643,16 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                     else x = fminf(fmaxf(x, -limit), limit);
                 }
             } else if (epi_mode == 2 || epi_mode == 3) {
-                if (row_weight != nullptr) x *= row_weight[row];
+                // row_weight is the routing weight for the (token, slot) being
+                // computed - ONE scalar, the caller passes route_w + slot (see the
+                // expert loop in chain_dev.rs). It is indexed by the M row, and
+                // this kernel exists only for M == 1, so the index is ALWAYS 0.
+                // The original mxf4_gemm did not catch fire because its M loop is
+                // bounded by rows (= 1), so it only ever touched row_weight[0];
+                // indexing it by the output column `row` here read 4096 floats past
+                // a one-float pointer, which is the out-of-bounds access seen when
+                // the down path first used this kernel.
+                if (row_weight != nullptr) x *= row_weight[0];
             }
             if (epi_mode == 3) out[(size_t)row] += x;
             else out[(size_t)row] = x;
@@ -669,7 +678,7 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
     // the expert's act buffer and its n_total/k are dim/inter, not the gate/up
     // shapes). NOTE: a boot-time env read here would also break CUDA graph
     // capture; cache it in a static if a knob is needed.
-    if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
+    if (rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
         const int warps = 8;
         const int cta = warps * 32;
         const int blocks = (n_total + warps - 1) / warps;
@@ -744,7 +753,7 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
     // expert down (f32 activation, AQ=true, epi_mode 3 accumulating into the MoE
     // buffer). The kernel unpacks either activation form and implements both
     // epilogues, so no separate path is needed for down.
-    if (rows == 1 && !aq && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
+    if (rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr) {
         const int warps = 8;
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
