@@ -7230,3 +7230,20 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 5. **折进 pubred 的 epilogue 与已否决的 dots→pubred 同源**：5 block 归约序变化非逐位
 
 **结论**：hc 族节点削减的预期从 −0.12ms 修正为 **0**。节点削减总量从 248 修正为 ~168 nodes（quant 40 + norm/misc 120 + route 8）≈ −0.07ms@0.411µs。
+
+### M>1 expert batching 定案：单请求价值 = 0（2026-09-12 05:30）
+
+**expert-m2-batching 的发现**：
+1. **单请求 M=1 没有第二个 token 可批**；层内 6 专家已在一个 launch（DSV41_MOE_BATCH）
+2. **原假设部分错误**：expert kernel 不是 DRAM 带宽受限（只跑到 30-40% 峰值），瓶颈是 **LUT 解码 + convert-FMA 指令流**（L1TEX 管道）
+3. DRAM 地板 0.56ms vs 实测 1.3-2.0ms——有 2-3x 指令开销
+4. 跨请求 batching 需 B≥64 才有 amortization——改变任务定义
+
+**剩余方向**（按性价比）：
+1. **expert kernel MMA 化**（M=1 补 0 到 M=8/16，硬件 fp4 解码）——唯一绕过指令地板的路径（expert-mma-analysis 分析中）
+2. **重叠延迟**（PDL/侧流/跨层流水）——repo 已验证方向
+3. ⛔ 勿再试：k-split/uint4/加 blockDim/降 rows（全部实测阴性）
+
+**v8 复盘**：a32-vec4 + unroll32 + AR grid = 中性（−0.01ms）。原因：
+- a32-vec4 的 −13% 是在无 P4 的 gprobe 上测的——P4 的 cp.async 已隐藏 staging，vec4 在其上增益≈0
+- AR pubred 的 8µs 主导项是 stamp/poll 的 NVLink 往返（~6µs），reduce 网格形状只影响 ~1-2µs
