@@ -2094,7 +2094,10 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ hc_scale,
                                      const float* __restrict__ hc_base, float* __restrict__ pre,
                                      float* __restrict__ post, float* __restrict__ comb, int hc,
-                                     int dim, int sinkhorn_iters, float eps, int ss_stride) {
+                                     int dim, int sinkhorn_iters, float eps, int ss_stride,
+                                     const float* __restrict__ w_norm,
+                                     const float* __restrict__ pre_collapse,
+                                     float* __restrict__ out, float eps_norm) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -2163,6 +2166,36 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
     __syncthreads();
     for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
         comb[(size_t)r * hc * hc + jk] = cm[jk];
+    // Collapse + rmsnorm, the body of dsv41_hc_collapse_norm_kernel. It reads the
+    // `pre` of the slot the caller names for the collapse, which is NOT the one the
+    // mixes just wrote: the block walks the premix slots so the attention half
+    // collapses with the previous layer's coefficients. Folding it in here is what
+    // makes this the whole front end in two launches.
+    if (w_norm != nullptr) {
+        __syncthreads();
+        float* o_r = out + (size_t)r * dim;
+        float s2 = 0.f;
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < hc; ++i)
+                acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
+            o_r[c] = acc;
+            s2 += acc * acc;
+        }
+        // the same reduction tree rmsnorm_kernel uses
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);
+        __shared__ float red[32];
+        if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s2;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+            red[0] = rsqrtf(t / dim + eps_norm);
+        }
+        __syncthreads();
+        const float inv2 = red[0];
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * inv2 * w_norm[c];
+    }
 }
 
 static const bool g_hc_front = [] {
@@ -2171,14 +2204,20 @@ static const bool g_hc_front = [] {
 }();
 
 extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
-                              const float* hc_base, float* pre, float* post, float* comb, int rows,
-                              int hc, int dim, int sinkhorn_iters, float eps, cudaStream_t s) {
+                              const float* hc_base, const float* w_norm, const float* pre_collapse,
+                              float* pre, float* post, float* comb, float* out, int rows, int hc,
+                              int dim, int sinkhorn_iters, float eps, float eps_norm,
+                              cudaStream_t s) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     if (!g_hc_front) return (int)cudaErrorInvalidValue;   // caller keeps the old path
     if (rows > DSV41_HC_SPREAD_MAXR) return (int)cudaErrorInvalidValue;
+    // The collapse half is optional (w_norm null skips it), but when it is asked
+    // for it must have somewhere to read and write.
+    if ((w_norm == nullptr) != (pre_collapse == nullptr)) return (int)cudaErrorInvalidValue;
+    if (w_norm != nullptr && out == nullptr) return (int)cudaErrorInvalidValue;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
     const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
@@ -2194,6 +2233,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
-        x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32);
+        x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
+        pre_collapse, out, eps_norm);
     return (int)cudaGetLastError();
 }

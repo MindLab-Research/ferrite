@@ -952,8 +952,13 @@ impl<'a> DevChain<'a> {
     /// hc_mixes, with the fused spread front end in front of it. The fused kernel
     /// answers InvalidValue when its gate is off or the row count is past the
     /// spread tables, which is reported here as Ok(false) and the single-block
-    /// kernel then runs exactly as before, so both shapes are bit-identical and
-    /// the switch is free to make.
+    /// kernel then runs exactly as before, so both shapes are numerically
+    /// identical and the switch is free to make.
+    ///
+    /// When the fused path runs it also does the collapse + rmsnorm of
+    /// `hc_collapse_norm`, reading `pre_collapse` (the premix slot the caller
+    /// collapses with, which is deliberately not the one the mixes write) and
+    /// writing `out`; the returned bool then tells the caller to skip that call.
     #[allow(clippy::too_many_arguments)]
     fn hc_mixes_auto(
         &mut self,
@@ -965,23 +970,31 @@ impl<'a> DevChain<'a> {
         dim: usize,
         sinkhorn_iters: i32,
         eps: f32,
-    ) -> Result<()> {
+        norm_w: *const f32,
+        pre_collapse: *const f32,
+        out: *mut f32,
+        eps_norm: f32,
+    ) -> Result<bool> {
         let fused = self.dev.hc_front(
             self.s.h.ptr as *const f32,
             hc_fn,
             hc_scale,
             hc_base,
+            norm_w,
+            pre_collapse,
             self.premix_slot(pre_slot).ptr as *mut f32,
             self.s.post.ptr as *mut f32,
             self.s.comb.ptr as *mut f32,
+            out,
             1,
             hc as i32,
             dim as i32,
             sinkhorn_iters,
             eps,
+            eps_norm,
         )?;
         if fused {
-            return Ok(());
+            return Ok(true);
         }
         self.dev.hc_mixes(
             self.s.h.ptr as *const f32,
@@ -996,7 +1009,8 @@ impl<'a> DevChain<'a> {
             hc as i32,
             sinkhorn_iters,
             eps,
-        )
+        )?;
+        Ok(false)
     }
 
 
@@ -1047,7 +1061,19 @@ fn fuse_b1() -> bool {
         let ld = &self.w.layers[layer];
 
         // ---------------- attention block ----------------
-        self.hc_mixes_auto(
+        // The fused front end, when it runs, also collapses and normalises; the
+        // collapse reads `premix_slot(pa)` rather than the slot the mixes write,
+        // and only the fuse_b1 shape wants that fold at all.
+        let (hc_nw, hc_pc, hc_out): (*const f32, *const f32, *mut f32) = if Self::fuse_b1() {
+            (
+                ld.attn_norm.as_ref().unwrap().as_f32(),
+                self.premix_slot(pa).as_f32(),
+                self.s.xn.ptr as *mut f32,
+            )
+        } else {
+            (std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
+        };
+        let hc_done = self.hc_mixes_auto(
             ld.hc_attn_fn.as_ref().unwrap().as_f32(),
             ld.hc_attn_scale.as_ref().unwrap().as_f32(),
             ld.hc_attn_base.as_ref().unwrap().as_f32(),
@@ -1056,6 +1082,10 @@ fn fuse_b1() -> bool {
             dim,
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
+            hc_nw,
+            hc_pc,
+            hc_out,
+            cfg.norm_eps,
         )?;
         let _t_all = std::time::Instant::now();
         if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
@@ -1071,16 +1101,18 @@ fn fuse_b1() -> bool {
             eprintln!("[mine] L0 comb_rowsum={rs:?}");
         }
         if Self::fuse_b1() {
-            self.dev.hc_collapse_norm(
-                self.s.h.ptr as *mut f32,
-                self.premix_slot(pa).as_f32(),
-                ld.attn_norm.as_ref().unwrap().as_f32(),
-                self.s.xn.ptr as *mut f32,
-                1,
-                hc as i32,
-                dim as i32,
-                cfg.norm_eps,
-            )?;
+            if !hc_done {
+                self.dev.hc_collapse_norm(
+                    self.s.h.ptr as *mut f32,
+                    self.premix_slot(pa).as_f32(),
+                    ld.attn_norm.as_ref().unwrap().as_f32(),
+                    self.s.xn.ptr as *mut f32,
+                    1,
+                    hc as i32,
+                    dim as i32,
+                    cfg.norm_eps,
+                )?;
+            }
         } else {
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
@@ -1128,7 +1160,16 @@ fn fuse_b1() -> bool {
         }
         let _t_moe = std::time::Instant::now();
         // ---------------- FFN block ----------------
-        self.hc_mixes_auto(
+        let (ffn_nw, ffn_pc, ffn_out): (*const f32, *const f32, *mut f32) = if Self::fuse_b1() {
+            (
+                ld.ffn_norm.as_ref().unwrap().as_f32(),
+                self.premix_slot(1).as_f32(),
+                self.s.xn.ptr as *mut f32,
+            )
+        } else {
+            (std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
+        };
+        let ffn_done = self.hc_mixes_auto(
             ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
             ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
             ld.hc_ffn_base.as_ref().unwrap().as_f32(),
@@ -1137,6 +1178,10 @@ fn fuse_b1() -> bool {
             dim,
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
+            ffn_nw,
+            ffn_pc,
+            ffn_out,
+            cfg.norm_eps,
         )?;
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
@@ -1144,16 +1189,18 @@ fn fuse_b1() -> bool {
         // the FFN collapses with THIS layer's attn_pre (slot 1), which stayed on
         // the device; the FFN's own pre (slot 2) is what the NEXT layer uses.
         if Self::fuse_b1() {
-            self.dev.hc_collapse_norm(
-                self.s.h.ptr as *mut f32,
-                self.premix_slot(1).as_f32(),
-                ld.ffn_norm.as_ref().unwrap().as_f32(),
-                self.s.xn.ptr as *mut f32,
-                1,
-                hc as i32,
-                dim as i32,
-                cfg.norm_eps,
-            )?;
+            if !ffn_done {
+                self.dev.hc_collapse_norm(
+                    self.s.h.ptr as *mut f32,
+                    self.premix_slot(1).as_f32(),
+                    ld.ffn_norm.as_ref().unwrap().as_f32(),
+                    self.s.xn.ptr as *mut f32,
+                    1,
+                    hc as i32,
+                    dim as i32,
+                    cfg.norm_eps,
+                )?;
+            }
         } else {
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,

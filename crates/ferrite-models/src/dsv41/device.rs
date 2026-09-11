@@ -234,8 +234,9 @@ struct Kernels {
     /// Returns an error when DSV41_HC_FRONT is off, so the caller keeps hc_mixes.
     hc_front: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32,
-        *mut f32, *mut f32, *mut f32,
-        c_int, c_int, c_int, c_int, f32, CuStream,
+        *const f32, *const f32,
+        *mut f32, *mut f32, *mut f32, *mut f32,
+        c_int, c_int, c_int, c_int, f32, f32, CuStream,
     ) -> c_int,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
@@ -1573,14 +1574,18 @@ impl Device {
         hc_fn: *const f32,
         hc_scale: *const f32,
         hc_base: *const f32,
+        w_norm: *const f32,
+        pre_collapse: *const f32,
         pre: *mut f32,
         post: *mut f32,
         comb: *mut f32,
+        out: *mut f32,
         rows: i32,
         hc: i32,
         dim: i32,
         sinkhorn_iters: i32,
         eps: f32,
+        eps_norm: f32,
     ) -> Result<bool> {
         let rc = unsafe {
             (self.kernels.hc_front)(
@@ -1588,14 +1593,18 @@ impl Device {
                 hc_fn,
                 hc_scale,
                 hc_base,
+                w_norm,
+                pre_collapse,
                 pre,
                 post,
                 comb,
+                out,
                 rows,
                 hc,
                 dim,
                 sinkhorn_iters,
                 eps,
+                eps_norm,
                 self.stream,
             )
         };
