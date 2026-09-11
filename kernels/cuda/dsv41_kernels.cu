@@ -60,6 +60,45 @@ __device__ __forceinline__ float e4m3_to_f(uint8_t b) {
     return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
 }
 
+// ---------------------------------------------------------------------------
+// a32 4-element vectorisation (gemm-5us-feasibility, 2026-09-12).
+//
+// The a32 block-wide materialisation (`s_af[i] = s_lut[a[i]] * s_as[i>>5]`)
+// measured 1.55 us/call of the fp8 GEMV's block-level staging, and the isolated
+// probe showed its cost is INSTRUCTION COUNT, not ILP: unrolling 4/8/16 is all
+// neutral, hand-written 4-way ILP is neutral, and ONLY the 4-element
+// vectorisation -- one 32-bit read of four fp8 bytes, four LUT lookups, ONE
+// float4 store -- moves the kernel (5.02/6.67/8.58 us at n=256/1024/1664,
+// -24/-12/-7.7% against the scalar form).
+//
+// BIT-IDENTICAL BY CONSTRUCTION. `idx` must be a MULTIPLE OF FOUR and a scale
+// block is 32 elements, so idx..idx+3 can never straddle a scale boundary
+// (idx & 31 <= 28): all four products use the SAME `as[idx >> 5]` the scalar
+// loop would look up, and each one is the same `lut[byte] * sa` term in the
+// same order. Only the store WIDTH changes, so no sum, and not a single result
+// bit, moves.
+//
+// REQUIREMENTS on the caller (a misaligned float4 store is err 716, the trap the
+// weight-row cp.async already hit -- the guard must be a UNIFORM branch):
+//   * idx % 4 == 0;
+//   * `dst + idx` 16-byte aligned -> gate with dsv41_f4_ok(s_af).
+__device__ __forceinline__ bool dsv41_f4_ok(const void* p) {
+    return (reinterpret_cast<unsigned long long>(p) & 15ull) == 0ull;
+}
+
+__device__ __forceinline__ void dsv41_a32_mat4(uint32_t b4, int idx,
+                                               const float* __restrict__ lut,
+                                               const float* __restrict__ as,
+                                               float* __restrict__ dst) {
+    const float sa = as[idx >> 5];
+    float4 o;
+    o.x = lut[b4 & 0xFFu] * sa;
+    o.y = lut[(b4 >> 8) & 0xFFu] * sa;
+    o.z = lut[(b4 >> 16) & 0xFFu] * sa;
+    o.w = lut[b4 >> 24] * sa;
+    *reinterpret_cast<float4*>(dst + idx) = o;
+}
+
 // The e2m1 code table (convert.py FP4_TABLE).
 __device__ __constant__ float kFp4Table[16] = {
     0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f,
@@ -3637,22 +3676,70 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
                 // materialisation applied to the bytes it read back from shared
                 // memory, so the emitted f32 is bit-identical -- the smem round
                 // trip (and the k-byte slot) is all that disappears.
+                // 4-element vectorisation (dsv41_a32_mat4, see its header): the
+                // uint4 read stays the WIDE 16-byte global load it always was,
+                // but each group of four decoded values now lands as ONE float4
+                // store instead of four scalar ones. Same terms, same order ->
+                // bit-identical; the UNIFORM guard keeps the scalar loop when
+                // `s_af` is not 16-byte aligned (err 716 trap).
                 const int n16a = k >> 4;
-                for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
-                    const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
-                    const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+                if (dsv41_f4_ok(s_af)) {
+                    for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                        const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
+                        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
 #pragma unroll
-                    for (int j = 0; j < 16; ++j) {
-                        const int idx = (i << 4) + j;
-                        s_af[idx] = s_lut[b[j]] * s_as[idx >> 5];
+                        for (int j = 0; j < 16; j += 4) {
+                            const int idx = (i << 4) + j;
+                            const uint32_t b4 = (uint32_t)b[j] |
+                                                ((uint32_t)b[j + 1] << 8) |
+                                                ((uint32_t)b[j + 2] << 16) |
+                                                ((uint32_t)b[j + 3] << 24);
+                            dsv41_a32_mat4(b4, idx, s_lut, s_as, s_af);
+                        }
+                    }
+                } else {
+                    for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                        const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
+                        const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) {
+                            const int idx = (i << 4) + j;
+                            s_af[idx] = s_lut[b[j]] * s_as[idx >> 5];
+                        }
                     }
                 }
                 for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x)
                     s_af[i] = s_lut[a[i]] * s_as[i >> 5];
             } else {
                 const uint8_t* ap0 = (vec == 4) ? s_a : a;
-                for (int i = threadIdx.x; i < k; i += blockDim.x)
-                    s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+                // 4-element vectorisation (dsv41_a32_mat4, see its header): one
+                // 32-bit read of FOUR fp8 bytes, four LUT lookups and ONE float4
+                // store per step instead of four scalar stores. This is the P4
+                // default path (`act_async` staged the row into `s_a`), and the
+                // isolated probe's -24/-12/-7.7% at n=256/1024/1664. The four
+                // decoded values are idx..idx+3 with idx % 4 == 0, so they always
+                // share `s_as[idx>>5]` (a scale block is 32 elements) and the
+                // products are the scalar loop's term for term -> bit-identical.
+                // The guard is UNIFORM per block: it only protects the float4
+                // STORE against a k whose `s_af` offset is not 16-byte aligned
+                // (offset = k/8 + 1024 bytes over a 16-byte-multiple base, so it
+                // holds for every production k -- all of them multiples of 128);
+                // a shape that fails it keeps the scalar loop rather than hit
+                // err 716. The source read only needs 4-byte alignment, which
+                // the staged row and the launcher's k % 16 == 0 guarantee.
+                if (dsv41_f4_ok(s_af) && dsv41_f4_ok(ap0)) {
+                    const int k4 = k >> 2;
+                    for (int i = threadIdx.x; i < k4; i += blockDim.x) {
+                        const int idx = i << 2;
+                        const uint32_t b4 = *reinterpret_cast<const uint32_t*>(ap0 + idx);
+                        dsv41_a32_mat4(b4, idx, s_lut, s_as, s_af);
+                    }
+                    for (int i = (k4 << 2) + threadIdx.x; i < k; i += blockDim.x)
+                        s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+                } else {
+                    for (int i = threadIdx.x; i < k; i += blockDim.x)
+                        s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+                }
             }
         }
         __syncthreads();
@@ -3742,7 +3829,17 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             // garbage. This shadowing was the root cause of the "3ms speedup
             // + degeneration" mystery (the speedup was the compiler dead-coding
             // the warp reduction on a known-zero value).
-#pragma unroll 4
+            // unroll 4 -> 32 (rf_u32, gemm-5us-feasibility): the isolated probe's
+            // winning combination is ROW_FIRST + unroll32 + the a32 vec4 build,
+            // and ROW_FIRST is already what P3 does. This is a pure
+            // LOAD-OVERLAP unroll of a SINGLE serial `acc +=` chain -- unrolling
+            // cannot reassociate the chain (each iteration's acc depends on the
+            // previous one), so the summation order, and therefore every output
+            // bit, is unchanged. Do NOT "improve" this into split accumulators:
+            // that WOULD reassociate, and under --use_fast_math a multi-way
+            // unrolled gemv body with plain operators drifted ~1 ULP per layer
+            // and degenerated the model after 40 layers (see kernels/cuda/build.sh).
+#pragma unroll 32
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(row_sc[kb]);
                 const int j = kb * 32 + lane;

@@ -7181,3 +7181,26 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 3. Stage C persistent/grouped GEMM——把 per-block prologue 摊到多层/多投影（246→~40 次）——唯一量级够的路径
 
 **⛔ 勿再试**：a32 挪出 smem（慢 81%）、LUT 放 constant/global（慢 6.6×/15%）、nsys 的"profiling 开销 2.3µs"（实核就是 9.3µs）
+
+### graph_bench 定案：node dispatch = 0.411µs/node（2026-09-12 04:45）
+
+**B300 sm_103 实测**（/tmp/graph_bench，2000 节点 × 100 次）：
+| 测量 | 值 |
+|---|---|
+| host submit / launch | 2.904µs |
+| 图 N-node replay | 1.800µs/node（dispatch + exec） |
+| **图 N EMPTY nodes** | **0.411µs/node ← dispatch 地板** |
+| kernel exec（globaltimer） | 1.408µs |
+| 图比流省的开销 | 2.493µs/node |
+
+**判定**：
+- "0.2µs" 是假象（一次 cudaGraphLaunch 的 host 提交摊到 N 节点）
+- "1.5µs" 是审计高估
+- **真实 0.411µs/node → 中等级杠杆**：1800 节点 ≈ 0.74ms/步（但真实 kernel 有流水线掩盖，有效成本更低）
+- **削减 248 节点 → −0.10ms**（值得做但不是首要）
+
+**优先级重排**：
+1. a32-vec4 + unroll32（−0.2~0.35ms）实施中
+2. AR reduce grid（−0.08~0.16ms）实施中
+3. 节点削减（−0.10ms）hc 合回 + quant 融合
+4. Stage C（−0.3~0.5ms）可行性分析中
