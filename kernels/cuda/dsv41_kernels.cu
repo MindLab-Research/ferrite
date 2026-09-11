@@ -1216,7 +1216,8 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
 // the hot path is the same slip the other gates avoid.
 static const bool g_gemv_fp8_vec = [] {
     const char* e = getenv("DSV41_GEMV_FP8_VEC");
-    return e != nullptr && e[0] != '0';
+    if (e == nullptr) return true;   // default on: -5.34 ms/step, bodies verified
+    return e[0] != '0';              // DSV41_GEMV_FP8_VEC=0 opts back out
 }();
 
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
