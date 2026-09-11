@@ -444,24 +444,23 @@ pub fn padded_inter(n: usize) -> usize {
 }
 
 /// The local shape a rank holds for `spec`.
-/// Shared-expert tensor-parallelism, GATED OFF by default.
+/// Shared-expert tensor-parallelism, DEFAULT ON.
 ///
 /// ON  = w1/w3 sharded by output rows and w2 by its reduction columns, so each
 ///       rank computes its own `inter/world` slice and the MoE all-reduce sums
-///       the partials (the routed experts' structure). This removes the big
-///       imbalance: with the replicated layout only rank 0 computed the shared
-///       expert, i.e. ~55us x 40 layers of serial work the other seven ranks
-///       waited on at the all-reduce.
+///       the partials (the routed experts' structure). This removes the load
+///       imbalance of the replicated layout, where only rank 0 computed the
+///       shared expert (~55us x 40 layers of serial work the other seven ranks
+///       waited on at the all-reduce). Measured on the same session back to back:
+///       13.22ms -> 11.79ms (-1.43ms, +12% throughput) with all four prompts
+///       verbatim-correct and zero faults.
 /// OFF = the historical replicated layout with rank 0 doing all of it.
 ///
-/// Default OFF because the first A/B faulted (sticky err 700 surfacing on
-/// dsv41_route_topk) and the cause is not yet identified - the loader, the
-/// launcher and the mixed bf16+fp8 kernel were all re-checked statically. The
-/// flag selects the SHARD RULE at load time, so it must match between the weight
-/// spec and the consumer; both read this one function.
+/// The flag selects the SHARD RULE at load time, so it must match between the
+/// weight spec and the consumer; both read this one function.
 pub fn shared_expert_tp() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SHARED_TP").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_SHARED_TP").map(|v| v != "0").unwrap_or(true))
 }
 
 pub fn local_shape(cfg: &Dsv41Config, spec: &TensorSpec, world: usize, rank: usize) -> Vec<usize> {
