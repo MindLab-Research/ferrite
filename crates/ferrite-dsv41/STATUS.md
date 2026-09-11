@@ -4417,3 +4417,39 @@ if (flag) { 新代码 } else { 基线代码 }     ← 编译产物 ≠ 纯基线
 
 ⇒ **fp8 gemv kernel 中 ILP 分支的存在改变了编译，导致退化**。根因可能是寄存器压力
 （ILP 分支需要 16+ 额外寄存器）影响了 cp.async staging 的调度。
+
+### ✅ 会话终态：clean = 可交付基线（2026-09-11 11:25）
+
+**核弹法排查链**（从 10.1ms 退化到根因定位再到修复，共 12 轮 serve 实验）：
+
+| 实验 | .cu 状态 | 结果 |
+|---|---|---|
+| mg1check | 全 .cu = 5cddf22 | **正确** 13.29ms |
+| e4only | + e4m3 位操作 | **正确** 13.47ms |
+| ilponly | + fp8 ILP 代码 | **退化** 10.21ms |
+| ilpoff | 同上 + ILP=0（gate 关） | **仍退化**（gate 无效！） |
+| **clean** | **物理删除 ILP** | **正确** **13.46ms** |
+
+**clean 基线** = mg1 + e4m3 位操作 = **13.46ms / 74.3 tok/s**（四段全对、98 步、0 fault）。
+
+**本轮全部有效优化**（mg1 已含）：
+| 优化 | 步时增量 | 验证 |
+|---|---|---|
+| sparse_attn 保序预取 | −1.01ms | ✓ |
+| fp8 gemv cp.async staging | −0.32ms | ✓ |
+| 共享专家 gate+up mx2 | −0.20ms | ✓ |
+| indexer warp-per-candidate | −0.38ms | ✓ |
+| gate+共享专家混合核 | −0.25ms | ✓ |
+| e4m3_to_f 位操作 | ~−1.9ms（微基准） | ✓（e4only） |
+
+**被证明有害/无效（物理删除，不可 gate）**：
+- fp8 gemv ILP 4路展开（gate 也退化——**代码存在改变编译**）
+- gemv_bf16/f32 手写展开 + s_x smem（跟随 ILP 一起失败）
+- expert/hc `#pragma unroll 4`（无性能贡献）
+
+**最重要的方法论发现**：`gate ≠ 回退`。在 `--use_fast_math` 下，`if (changed) { ... } else { 基线 }`
+的存在本身就改变了 nvcc 的寄存器分配/指令调度，即使运行时走 else。要验证 kernel 改动安全，
+必须**物理删除**改动代码。
+
+**通往 200 tok/s**：当前 74.3 tok/s，需砍 ~8.5ms。结构性方向见"段融合可行性边界"一节
+（核内 tile 化 + 流水，不是跨算子合并）。
