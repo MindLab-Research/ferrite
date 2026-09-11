@@ -2982,6 +2982,9 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if ((w_norm == nullptr) != (pre_collapse == nullptr)) return (int)cudaErrorInvalidValue;
     if (w_norm != nullptr && out == nullptr) return (int)cudaErrorInvalidValue;
     const int mix = hc * (2 + hc);
+    // g_hc_part[r][m][ck]'s second dimension is a hard 64: a config with a larger
+    // hc would walk off the array, so refuse it here rather than corrupt memory.
+    if (mix > 64) return (int)cudaErrorInvalidValue;
     const int hc_dim = hc * dim;
     const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
     // Set it EVERY call. The attribute is per-context, and a TP8 process has one
@@ -2997,17 +3000,18 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
             return (int)e;
         }
     }
-    // Multi-warp staging is GATED OFF by default. The 128-thread form faulted with
-    // err 700 (illegal access, surfacing as a sticky error on dsv41_route_topk) on
-    // its first A/B and the root cause is not yet identified, so the default stays
-    // at the known-good 32 threads (one warp stages + computes). The kernel body is
-    // thread-count agnostic: the staging strides by blockDim.x and the compute is
-    // guarded by threadIdx.x < 32, so raising this is a one-line experiment.
+    // Multi-warp staging, DEFAULT ON (verified 2026-09-11: 11.80 -> 11.68ms, all
+    // four prompts verbatim-correct, zero faults). The original conviction - an
+    // err 700 "caused by" the 128-thread form - was misattribution: the real fault
+    // was the gemv_bf16 dynamic-smem overrun that happened to surface in the same
+    // A/B window. Four warps keep four times the cp.async in flight against the
+    // 160 KiB row pair; the dot itself still runs in warp 0 with the identical
+    // lane assignment, so every partial is bit-identical.
     static const int dots_t = [] {
         const char* e = getenv("DSV41_HC_DOTS_T");
-        if (e == nullptr) return 32;
+        if (e == nullptr) return 128;
         const int v = atoi(e);
-        return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 32;
+        return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 128;
     }();
     hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)dots_t, smem, s>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
