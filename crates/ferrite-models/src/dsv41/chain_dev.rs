@@ -185,6 +185,12 @@ fn nr_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_SH_EXP_MX2=0 reverts the shared expert's gate/up to two launches.
+fn sh_exp_mx2() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(true))
+}
+
 fn build_eng_dev(
     dev: &Device,
     lay: &crate::dsv41::engram::EngramLayout,
@@ -2208,29 +2214,53 @@ fn fuse_b1() -> bool {
                 ld.shared_w2_scale.as_ref(),
             ) {
                 self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
-                // gate and up land contiguously so `swiglu_limit` sees [gate|up]
-                self.dev.gemm_fp8_mx(
-                    self.s.xq.as_u8(),
-                    self.s.xsc.as_f32(),
-                    w1.as_u8(),
-                    w1s.as_u8(),
-                    std::ptr::null(),
-                    self.s.ex_act.ptr as *mut f32,
-                    1,
-                    inter as i32,
-                    dim as i32,
-                )?;
-                self.dev.gemm_fp8_mx(
-                    self.s.xq.as_u8(),
-                    self.s.xsc.as_f32(),
-                    w3.as_u8(),
-                    w3s.as_u8(),
-                    std::ptr::null(),
-                    (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
-                    1,
-                    inter as i32,
-                    dim as i32,
-                )?;
+                // gate and up land contiguously so `swiglu_limit` sees [gate|up].
+                // Same activation, same k, only the weights differ: one mx2 launch
+                // covers both projections - each row is still one warp walking the
+                // same lane order, so both outputs are bit-identical to the two
+                // single-family launches this replaces, minus one ~20us launch
+                // floor per layer. DSV41_SH_EXP_MX2=0 (or an .so without the
+                // symbol) falls back to the pair.
+                let sh_fused = sh_exp_mx2()
+                    && self.dev.gemm_fp8_mx2(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        w1.as_u8(),
+                        w1s.as_u8(),
+                        std::ptr::null(),
+                        self.s.ex_act.ptr as *mut f32,
+                        inter as i32,
+                        w3.as_u8(),
+                        w3s.as_u8(),
+                        std::ptr::null(),
+                        (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                        inter as i32,
+                        dim as i32,
+                    )?;
+                if !sh_fused {
+                    self.dev.gemm_fp8_mx(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        w1.as_u8(),
+                        w1s.as_u8(),
+                        std::ptr::null(),
+                        self.s.ex_act.ptr as *mut f32,
+                        1,
+                        inter as i32,
+                        dim as i32,
+                    )?;
+                    self.dev.gemm_fp8_mx(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        w3.as_u8(),
+                        w3s.as_u8(),
+                        std::ptr::null(),
+                        (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                        1,
+                        inter as i32,
+                        dim as i32,
+                    )?;
+                }
                 self.dev
                     .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter as i32, cfg.swiglu_limit)?;
                 self.quant1(self.s.ex_act.ptr as *const f32, inter as i32)?;
