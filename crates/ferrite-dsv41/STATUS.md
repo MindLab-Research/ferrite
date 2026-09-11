@@ -5943,3 +5943,38 @@ lm_head（n=16160）已在带宽地板（165MB/7.6TB/s = 21.8µs），不受此�
 
 **⚠️ 遗留待核**：246（nsys 实测）vs 242（代码推导）的 4 次差——可能是镜像差（gemv_bf16 的 −4），
 不要按 242 改文档/做预算，先跑逐符号 CSV 对齐。
+
+### 🎉 第 34 轮：gateup MLP unroll + down-vec revert 落地（8.60ms / 116.3 tok/s）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| all（gate v2 + MLP unroll + down revert） | **8.60ms** | **116.3** | 四段全对 | 0 |
+
+**本轮 −0.32ms**（8.92 → 8.60）：gateup MLP unroll（#pragma unroll 4 + uint2 宽加载，~−0.15）
++ down-vec-320 revert（nsys-v3 发现的 +45% 回归回收，~−0.24）——两项合计 −0.32（部分重叠）。
+
+**会话累计：13.28 → 8.60ms（+54.4%），75.3 → 116.3 tok/s。**
+
+**hc-dots-tail-fuse 的修正结论**：collapse 提前到 dots 的前提成立（不依赖 g_hc_part），
+但**收益口算被高估一倍**（collapse ~1.7µs × 80 = 0.14ms 是上限，且 dots 的 staging
+窗口可能不够藏 collapse——需要实测）。
+
+**gemv-call-pair-wo 的结论**：wo_a→wo_b 的 A（异 k mx2）/B（链式核）/C（mx_add）全部不可行；
+**B1（wo_a epilogue 直出 fp8）是可落地方案**——与 T1 同款模式，消掉 40 次 quant1。
+wo-b1-impl subagent 正在实施。
+
+**当前 8.60ms 的推演分解**：
+| 项 | ms | 状态 |
+|---|---|---|
+| gemm_fp8_gemv | ~2.0 | 246 次；wo_b1 融合可减 40 次 quant1 |
+| expert fp4 | ~1.75 | MLP unroll + down revert 后 |
+| hc 链 | ~1.55 | dots 0.56 + tail 0.99 |
+| gemv_bf16(lm_head) | ~0.72 | 带宽地板 |
+| AR v5 | ~0.66 | ar-2to1-impl 设计中 |
+| gate v2 后 | ~0.38 | 已优化 |
+| sparse/route/quant/其它 | ~1.54 | 部分可融合 |
+
+**通往 200 tok/s（5ms）的 gap = 3.6ms**：
+- Stage B 剩余（wo_b1 −0.06 + hc fuse −0.1 + AR opt −0.3）≈ −0.5ms → ~8.1ms
+- **Stage C persistent（700→120 节点）= −1.0~1.5ms → ~6.8ms ≈ 147 tok/s**
+- 仍差 1.8ms → 需要段内流水化 + 图调度间隙消除 + 可能的 expert/hc 结构突破
