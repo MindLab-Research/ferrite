@@ -993,7 +993,7 @@ __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __
 }
 
 // ============================================================================
-// down + reduce FUSED (DSV41_DOWN_FUSE on the Rust side, DEFAULT ON)
+// down + reduce FUSED (DSV41_DOWN_FUSE on the Rust side, DEFAULT OFF since f3b1be1)
 // ============================================================================
 // The batched down direction used to cost TWO launches per layer: the per-slot
 // down GEMV (epi_mode 2, writing the [slots][dim] scratch) and
@@ -1361,7 +1361,12 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // where the fused K-loop is the verbatim copy of the single-row one.
     static const int g_fuse = [] {
         const char* e = getenv("DSV41_GATEUP_FUSE");
-        if (e == nullptr) return 1;
+        // DEFAULT OFF, mirroring the Rust side (chain_dev.rs:
+        // `DSV41_GATEUP_FUSE` .map(|v| v != "0").unwrap_or(false)). Both sides
+        // MUST agree: the kernel's `fuse` decision changes the act slot layout
+        // (inter vs 2*inter) and whether the host runs a separate swiglu pass.
+        // A mismatch silently corrupts the activations (round-18 bug).
+        if (e == nullptr) return 0;
         return atoi(e);
     }();
     const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0) ? 1 : 0;
@@ -1409,7 +1414,7 @@ extern "C" int dsv41_moe_down_reduce(const float* part, float* out, int n, int s
 }
 
 // ============================================================================
-// down + reduce FUSED entry point (DSV41_DOWN_FUSE on the Rust side, DEFAULT ON)
+// down + reduce FUSED entry point (DSV41_DOWN_FUSE on the Rust side, DEFAULT OFF since f3b1be1)
 // ============================================================================
 // ONE launch covers the whole [slots] down GEMV and the ascending-slot sum,
 // writing straight into `out` (OVERWRITE, exactly like moe_down_reduce_kernel:

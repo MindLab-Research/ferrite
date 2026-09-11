@@ -5452,3 +5452,29 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 | arch-blueprint | running | ferrite 统一架构蓝图（写入 docs/agent/ferrite-unified-arch.md） |
 | down-reduce-wire | running | down+reduce 的 Rust 侧接线（device.rs FFI + chain_dev 替换） |
 | gemv-fixed-cost3 | running | gemv 最后一轮微基准（launch_bounds、cp.async、2行/warp、const LUT） |
+
+### 🎯 第 18-21 轮定案：融合速度突破与数值 bug 根因（2026-09-11 深夜）
+
+**融合路径速度**：gateup+swiglu + down+reduce 全开 = **9.44ms / 105.9 tok/s**（−0.72ms，四段全乱码）
+
+**根因（scale-bug-verify 的定论）**：
+**两侧默认值分裂**——`.cu:1362` 的 `g_fuse` 未设 env 时 return 1（融合 ON），而 Rust 侧 `chain_dev.rs` 已改 OFF。
+没有任何 env 时 kernel 融合（写 inter 宽、n_total=320）但 host 按 2*inter=640 传 act_slot 并调 swiglu → 
+swiglu 把"已 swiglu 的结果"当 gate、把**未写区**当 up → 数据错乱 → 乱码。
+
+**修复**：两侧统一默认 OFF（`.cu` 的 g_fuse return 0 + Rust 的 unwrap_or(false)）。
+显式 `DSV41_GATEUP_FUSE=1 DSV41_DOWN_FUSE=1` 时两侧一致 ON。
+
+**⚠️ 附加发现**：AR store 融合也被无条件启用了（`ar_store_fused = uses_v5()` 恒真），把 wo_b 的 AR 
+改成了 pubred-only——这单独就能破坏非融合路径。已加 env gate（`DSV41_AR_STORE_FUSE`，默认 OFF）。
+
+**已 gate OFF 的融合清单**（全部有 env 可重开）：
+| 融合 | env | 默认 | 速度收益 |
+|---|---|---|---|
+| gateup+swiglu | DSV41_GATEUP_FUSE | OFF | −0.4ms（估计） |
+| down+reduce | DSV41_DOWN_FUSE | OFF | −0.3ms（估计） |
+| AR store | DSV41_AR_STORE_FUSE | OFF | −0.08ms |
+| swiglu fp8 (A4) | DSV41_SWIGLU_Q | OFF | −0.06ms |
+| epi_add (A5) | DSV41_MOE_EPI_ADD | OFF | −0.08ms |
+
+**下一步**：统一两侧默认后验证 safe3 → 然后逐个翻 ON 测真实收益。

@@ -191,8 +191,9 @@ fn moe_batch() -> bool {
 }
 
 /// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
-/// (expert_down_fp4_batched + moe_down_reduce) pair. DEFAULT ON: the fused
-/// kernel produces the same bits in one launch (see
+/// (expert_down_fp4_batched + moe_down_reduce) pair. DEFAULT OFF (was ON until
+/// f3b1be1 enabled it by default and round-18 corruption forced the flip back; the
+/// fused kernel produces the same bits in one launch (see
 /// expert_gemv_fp4_down_reduce_kernel in dsv41_experts_mxf4.cu for the contract:
 /// ascending serial slot loop, verbatim K loop, explicitly rounded per-slot
 /// product). Read ONCE and cached like the other gates, and `"0"` means OFF even
@@ -2461,7 +2462,7 @@ fn fuse_b1() -> bool {
                 // so the kernel reads route_w[slot] (rw_stride = 1) — the exact
                 // scalar the sequential call passed as `route_w + slot`.
                 //
-                // DSV41_DOWN_FUSE (default ON) folds this down GEMV and the
+                // DSV41_DOWN_FUSE (default OFF) folds this down GEMV and the
                 // fixed-order sum into ONE launch
                 // (dsv41_expert_down_reduce_fp4_batched): ascending serial slot
                 // loop + verbatim K loop + explicitly rounded per-slot product,

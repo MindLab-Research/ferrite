@@ -1708,7 +1708,7 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
   （审计命令的坑：必须用 `-gencode arch=compute_103a,code=sm_103a` ✗ —— 只给 `-arch=sm_103a`
   会生成 compute_103 PTX 而 mxf4/tcgen05 全部报 "not supported on sm_103" ✗，那是标志问题不是代码问题 ✓。）
 
-### down + reduce 融合已落地（`DSV41_DOWN_FUSE`，默认开，待 e2e 验收 + 远程编译）
+### down + reduce 融合已落地（`DSV41_DOWN_FUSE`，默认关，待 e2e 验收 + 远程编译）
 
 - **新 kernel（老入口一行未动 ⇒ `DSV41_DOWN_FUSE=0` 字节级回退 ✓）**：
   `expert_gemv_fp4_down_reduce_kernel<STAGED>`（`dsv41_experts_mxf4.cu`，模板参数选 act staging）
