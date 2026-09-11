@@ -486,10 +486,10 @@ __global__ void engram_hash_step_kernel(const long long* __restrict__ map, long 
                                    const unsigned long long* __restrict__ lms,
                                    const unsigned long long* __restrict__ offs,
                                    long long* __restrict__ eng_ids, const int* __restrict__ token,
-                                   long long* __restrict__ pos_ctr, long long map_len, int n_layers,
+                                   const int* __restrict__ pos_ctr, long long map_len, int n_layers,
                                    int max_ngram, int n_heads, long long pad_id) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    const long long p = *pos_ctr;
+    const int p = *pos_ctr;
     const long long t = (long long)token[0];
     cache[p] = ((unsigned long long)t < (unsigned long long)map_len) ? map[t] : 0;
     long long tokens[8];
@@ -516,16 +516,64 @@ __global__ void engram_hash_step_kernel(const long long* __restrict__ map, long 
             }
         }
     }
-    *pos_ctr = p + 1;
+    // NOTE: the counter is NOT advanced here any more - the argmax, the
+    // LAST kernel of the step, advances it, so every kernel in between
+    // (the window indices, the compressor, the rope) reads a stable
+    // current position.
 }
 
 extern "C" int dsv41_engram_hash_step(const long long* map, long long* cache, const long long* mults,
                                  const unsigned long long* lms, const unsigned long long* offs,
-                                 long long* eng_ids, const int* token, long long* pos_ctr,
+                                 long long* eng_ids, const int* token, const int* pos_ctr,
                                  long long map_len, int n_layers, int max_ngram, int n_heads,
                                  long long pad_id, cudaStream_t s) {
     engram_hash_step_kernel<<<1, 32, 0, s>>>(map, cache, mults, lms, offs, eng_ids, token, pos_ctr,
                                         map_len, n_layers, max_ngram, n_heads, pad_id);
+    return (int)cudaGetLastError();
+}
+
+// The decode-step window indices, on the device: replaces the host's
+// ops::window_topk_idxs + a per-layer H2D upload. This is the decode branch
+// (seqlen=1) of that function, VERBATIM - the trailing window in RING-SLOT
+// order, where `oldest` is where the ring wraps - plus its start_pos == 0
+// special case. Reads the position from the DEVICE counter (stable during the
+// step: the argmax, the last kernel, is what advances it).
+__global__ void window_idxs_kernel(int32_t* __restrict__ idxs, const int* __restrict__ pos_ctr,
+                                   int window) {
+    const int c = threadIdx.x + (int)blockIdx.x * blockDim.x;
+    if (c >= window) return;
+    const int start_pos = *pos_ctr;
+    if (start_pos == 0) {
+        idxs[c] = (c == 0) ? 0 : -1;
+        return;
+    }
+    const int oldest = (start_pos % window) + 1;
+    long long idx = ((long long)c < (long long)window - oldest)
+                        ? (long long)oldest + c
+                        : (long long)c - ((long long)window - oldest);
+    if (idx > (long long)start_pos) idx = -1;
+    idxs[c] = (int)idx;
+}
+
+// The recency placeholder for the compressed rows (the safety net when the
+// group's owner has no indexer): idxs[win + j] = win + clen - take + j. Also
+// removes a per-layer upload; clen is still a host value this round.
+__global__ void comp_placeholder_kernel(int32_t* __restrict__ idxs, int clen, int window, int take) {
+    const int j = threadIdx.x + (int)blockIdx.x * blockDim.x;
+    if (j >= take) return;
+    idxs[window + j] = window + clen - take + j;
+}
+
+extern "C" int dsv41_window_idxs(int32_t* idxs, const int* pos_ctr, int window, cudaStream_t s) {
+    if (window <= 0) return (int)cudaSuccess;
+    window_idxs_kernel<<<(unsigned)((window + 127) / 128), 128, 0, s>>>(idxs, pos_ctr, window);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_comp_placeholder(int32_t* idxs, int clen, int window, int take,
+                                      cudaStream_t s) {
+    if (take <= 0) return (int)cudaSuccess;
+    comp_placeholder_kernel<<<(unsigned)((take + 127) / 128), 128, 0, s>>>(idxs, clen, window, take);
     return (int)cudaGetLastError();
 }
 

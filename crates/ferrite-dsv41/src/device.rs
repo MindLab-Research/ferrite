@@ -165,7 +165,7 @@ struct Kernels {
     ar_mark: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
-    argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, CuStream) -> c_int>,
+    argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     ar_v5_store: Option<
         unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, *const c_uint, CuStream) -> c_int,
     >,
@@ -175,6 +175,9 @@ struct Kernels {
     ar_v5_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *mut c_uint, *mut c_uint, CuStream) -> c_int,
     >,
+    window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
+    comp_placeholder:
+        Option<unsafe extern "C" fn(*mut i32, c_int, c_int, c_int, CuStream) -> c_int>,
     engram_hash_step: Option<
         unsafe extern "C" fn(
             *const i64,
@@ -184,7 +187,7 @@ struct Kernels {
             *const u64,
             *mut i64,
             *const i32,
-            *mut i64,
+            *const i32,
             i64,
             c_int,
             c_int,
@@ -434,6 +437,8 @@ impl Device {
                 ar_v5_publish: sym(h_k, "dsv41_ar_v5_publish").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_v5_reduce: sym(h_k, "dsv41_ar_v5_reduce").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 engram_hash_step: sym(h_k, "dsv41_engram_hash_step").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                window_idxs: sym(h_k, "dsv41_window_idxs").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                comp_placeholder: sym(h_k, "dsv41_comp_placeholder").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1491,7 +1496,7 @@ impl Device {
         offs: *const u64,
         eng_ids: *mut i64,
         token: *const i32,
-        pos_ctr: *mut i64,
+        pos_ctr: *const i32,
         map_len: i64,
         n_layers: c_int,
         max_ngram: c_int,
@@ -1555,11 +1560,30 @@ impl Device {
         self.kerr(rc, "dsv41_ar_v5_reduce")
     }
 
-    /// Stable argmax (ties -> lowest index); writes the winning index as i32.
-    pub fn argmax(&self, v: *const f32, out: *mut c_int, n: i32) -> Result<()> {
+    /// Stable argmax (ties -> lowest index); writes the winning index as i32 and
+    /// advances the device position counter (the argmax is the step's last
+    /// kernel, so the counter is stable during the step).
+    pub fn argmax(&self, v: *const f32, out: *mut c_int, n: i32, pos_ctr: *mut c_int) -> Result<()> {
         let f = self.need(self.kernels.argmax, "dsv41_argmax")?;
-        let rc = unsafe { f(v, out, n, self.stream) };
+        let rc = unsafe { f(v, out, n, pos_ctr, self.stream) };
         self.kerr(rc, "dsv41_argmax")
+    }
+
+    /// The decode-step window indices (the trailing window in ring-slot order),
+    /// read from the device position counter - replaces the host computation
+    /// and its per-layer H2D upload.
+    pub fn window_idxs(&self, idxs: *mut i32, pos_ctr: *const c_int, window: i32) -> Result<()> {
+        let f = self.need(self.kernels.window_idxs, "dsv41_window_idxs")?;
+        let rc = unsafe { f(idxs, pos_ctr, window, self.stream) };
+        self.kerr(rc, "dsv41_window_idxs")
+    }
+
+    /// The recency placeholder for the compressed rows (the no-indexer safety
+    /// net): idxs[win + j] = win + clen - take + j - replaces an upload.
+    pub fn comp_placeholder(&self, idxs: *mut i32, clen: i32, window: i32, take: i32) -> Result<()> {
+        let f = self.need(self.kernels.comp_placeholder, "dsv41_comp_placeholder")?;
+        let rc = unsafe { f(idxs, clen, window, take, self.stream) };
+        self.kerr(rc, "dsv41_comp_placeholder")
     }
 
     /// The single 4-byte host read per decode step (EOS check + printing). The

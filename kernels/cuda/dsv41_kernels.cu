@@ -1165,7 +1165,8 @@ extern "C" int dsv41_engram_gather(const uint8_t* table, const uint8_t* table_sc
 // per thread, all coalesced, and it removes any cross-block combine. This is the
 // GLM HEAD_DEV pattern - the sampled token never leaves the device except as the
 // single 4-byte read the host needs for EOS and printing.
-__global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out, int n) {
+__global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out, int n,
+                              int* __restrict__ pos_ctr) {
     unsigned long long my = 0ull;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const unsigned int bits = __float_as_uint(v[i]);
@@ -1187,12 +1188,17 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
         for (int w = 0; w < nw; ++w)
             if (wb[w] > m) m = wb[w];
         *out = (int)(0xFFFFFFFFu - (unsigned)(m & 0xFFFFFFFFu));
+        // the argmax is the LAST kernel of the step: this is where the
+        // device position counter advances, so every kernel of the NEXT
+        // step (the engram hash, the window indices, the compressor) sees
+        // pos + 1 while every kernel of THIS step saw a stable position.
+        if (pos_ctr != nullptr) *pos_ctr = *pos_ctr + 1;
     }
 }
 
-extern "C" int dsv41_argmax(const float* v, int* out, int n, cudaStream_t s) {
+extern "C" int dsv41_argmax(const float* v, int* out, int n, int* pos_ctr, cudaStream_t s) {
     if (n <= 0) return (int)cudaErrorInvalidValue;
-    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n);
+    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, pos_ctr);
     return (int)cudaGetLastError();
 }
 

@@ -93,6 +93,9 @@ struct Scratch {
     wo: DevBuf,    // [o_lora]
     logits: DevBuf,
     ids: DevBuf,   // [1] i32
+    /// The device position counter: the argmax (the step's last kernel)
+    /// advances it, so every kernel during the step reads a stable current pos.
+    pos_ctr: DevBuf, // [1] i32
     // MoE
     scores: DevBuf,    // [n_experts] f32
     route_idx: DevBuf, // [topk] i32
@@ -140,7 +143,6 @@ struct EngDev {
     mults: DevBuf,  // [n_layers * 4] i64
     lms: DevBuf,    // [n_layers * n_cols] u64
     offs: DevBuf,   // [n_layers * n_cols] u64
-    pos: DevBuf,    // [1] i64
     max_seq: usize,
 }
 
@@ -188,15 +190,12 @@ fn build_eng_dev(
     dev.upload_bytes_at(&d_offs, &up(&offs))?;
     let d_cache = dev.alloc(max_seq * 8)?;
     dev.zero_at(d_cache.ptr, max_seq * 8)?;
-    let d_pos = dev.alloc(8)?;
-    dev.zero_at(d_pos.ptr, 8)?;
     Ok(EngDev {
         map: d_map,
         cache: d_cache,
         mults: d_mults,
         lms: d_lms,
         offs: d_offs,
-        pos: d_pos,
         max_seq,
     })
 }
@@ -323,6 +322,7 @@ impl<'a> DevChain<'a> {
             wo: dev.alloc(fb(cfg.n_groups_o_lora()))?,
             logits: dev.alloc(fb(cfg.vocab_size))?,
             ids: dev.alloc(4)?,
+            pos_ctr: dev.alloc(4)?,
             scores: dev.alloc(fb(n_exp))?,
             route_idx: dev.alloc(fb(topk).max(4))?,
             route_w: dev.alloc(fb(topk).max(4))?,
@@ -413,9 +413,9 @@ impl<'a> DevChain<'a> {
             pm[0] = 1.0;
             self.dev.upload_f32_at(self.s.premix_const.ptr, 0, &pm)?;
         }
+        self.dev.zero_at(self.s.pos_ctr.ptr, 4)?;
         if let Some(e) = self.eng_dev.as_ref() {
             self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?;
-            self.dev.zero_at(e.pos.ptr, 8)?;
         }
         for c in self.layers.iter_mut() {
             self.dev.zero(&c.ring)?;
@@ -662,7 +662,7 @@ impl<'a> DevChain<'a> {
                     e.offs.ptr as *const u64,
                     self.s.eng_ids.ptr as *mut i64,
                     self.s.ids.as_i32(),
-                    e.pos.ptr as *mut i64,
+                    self.s.pos_ctr.ptr as *const i32,
                     map.map.len() as i64,
                     lay.layers.len() as i32,
                     lay.max_ngram_size as i32,
@@ -744,6 +744,7 @@ impl<'a> DevChain<'a> {
             self.s.logits.ptr as *const f32,
             self.s.ids.ptr as *mut std::ffi::c_int,
             cfg.vocab_size as i32,
+            self.s.pos_ctr.ptr as *mut std::ffi::c_int,
         )?;
         if std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false) {
             let mut lg = vec![0f32; cfg.vocab_size];
@@ -1157,11 +1158,9 @@ impl<'a> DevChain<'a> {
         // step selected nothing and the attention output came out identically
         // zero (confirmed by DSV41_STATS: rms=0.0000 at pos>0 while pos=0 was
         // fine, since only then do the leading entries happen to be valid).
-        let wsel = ops::window_topk_idxs(win, 1, 1, pos);
-        let mut idx_host = vec![-1i32; win + cfg.index_topk];
-        for (c, v) in wsel.iter().enumerate().take(win) {
-            idx_host[c] = *v;
-        }
+        // The window indices are computed ON THE DEVICE from the position counter
+        // (the decode branch of ops::window_topk_idxs, verbatim) - no host
+        // compute and no per-layer H2D upload any more.
         // Compressed KV. Only the kv sources run the compressor; every other
         // layer of the same group reads the latents they published, which is
         // why they all live in this layer's own copy of the sequence's rows.
@@ -1182,7 +1181,8 @@ impl<'a> DevChain<'a> {
         // fresh on every step. Only the placeholder branch uploaded them before,
         // so the index-source path read stale indices — the illegal memory
         // access in sparse_attn.
-        self.ul_i32(idxs_ptr, &idx_host[..win])?;
+        self.dev
+            .window_idxs(idxs_ptr as *mut i32, self.s.pos_ctr.ptr as *const i32, win as i32)?;
         let mut take_comp = comp_len.min(cfg.index_topk);
         if comp_len > 0 && cfg.is_index_source(layer) {
             // EVERY index-source layer runs its own indexer (into its own
@@ -1199,11 +1199,13 @@ impl<'a> DevChain<'a> {
         } else if comp_len > 0 {
             // the owner has no indexer: recency placeholder (safety net)
             let placeholder = comp_len.min(cfg.index_topk);
-            for j in 0..placeholder {
-                idx_host[win + j] = (win + comp_len - placeholder + j) as i32;
-            }
             take_comp = placeholder;
-            self.ul_i32(idxs_ptr, &idx_host)?;
+            self.dev.comp_placeholder(
+                idxs_ptr as *mut i32,
+                comp_len as i32,
+                win as i32,
+                placeholder as i32,
+            )?;
         }
         let n_idx_cols = win + take_comp;
 
