@@ -628,7 +628,38 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
                 for (; c < hc_dim; c += 32) a0 += wr[c] * xr[c];
                 acc = (a0 + a1) + (a2 + a3);
             } else {
-                for (int c = lane; c < hc_dim; c += 32) acc += wr[c] * xr[c];
+                // 16 bytes per thread per iteration instead of 4. A phase-by-phase
+                // shutdown sweep puts 78 percent of this kernel (39.7 of 50.8 us) in
+                // this dot product, and it moves 1.5 MB of weights at only 38 GB/s -
+                // one warp per projection row, about 1.7 GB/s each, which is the
+                // signature of too few bytes in flight per warp rather than of an
+                // arithmetic or SM-count limit (spreading the 24 rows over 24 or even
+                // 192 blocks changed nothing). Widening the loads is the cheapest
+                // multiplier of in-flight bytes, the same move that fixed gdn_chunk,
+                // sparse_attn and gemv_fp8. Four accumulators alone are NOT the answer:
+                // the existing acc4 branch measures 52.1 against 49.3 us, because four
+                // separate 4-byte streams add addresses without adding bytes per load.
+                // The summation order changes, so this is not bit-identical - validate
+                // with the four prompts and DSV41_TOKTRACE.
+                const float4* wr4 = reinterpret_cast<const float4*>(wr);
+                const float4* xr4 = reinterpret_cast<const float4*>(xr);
+                const int n4 = hc_dim >> 2;
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+                int c = lane;
+                for (; c + 64 < n4; c += 96) {
+                    const float4 w0 = wr4[c], w1 = wr4[c + 32], w2 = wr4[c + 64];
+                    const float4 v0 = xr4[c], v1 = xr4[c + 32], v2 = xr4[c + 64];
+                    a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+                    a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+                    a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+                }
+                for (; c < n4; c += 32) {
+                    const float4 w = wr4[c], v = xr4[c];
+                    a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+                }
+                // scalar tail for shapes whose hc_dim is not a multiple of four
+                for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += wr[k] * xr[k];
+                acc = (a0 + a1) + a2;
             }
             for (int off = 16; off > 0; off >>= 1) {
                 acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
