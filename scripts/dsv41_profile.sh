@@ -18,6 +18,16 @@
 # identical between the two paths (verified by DSV41_TOKTRACE: one request is
 # bit-identical), so the per-kernel table is valid for both.
 #
+# ⚠️ CONSEQUENCE FOR NODE-GAP MEASUREMENT (2026-09-11): with both pins above there
+# is NO graph in the trace, so --cuda-graph-trace=node expands nothing and the
+# gaps this profile can see are host launch gaps (~2-5us), NOT in-graph node
+# slots. In-graph gaps need DSV41_GRAPH_STEP=1, and the graph forces ar_v5() true
+# regardless of DSV41_AR_V5 (tp.rs:701-702: `graph || env`), i.e. the v5 spin is
+# unavoidable at --tp 8. The way to trace the whole-step graph is --tp 1 (world=1:
+# the v5 publish polls its OWN stamp, so nothing to amplify; chain_dev.rs:1722
+# still captures on decode step 1) and then exclude the ar/event rows from the
+# gap statistics.
+#
 # Also: never parse the default table output with awk - kernel names contain
 # spaces and the columns shift. Use --format csv.
 #
