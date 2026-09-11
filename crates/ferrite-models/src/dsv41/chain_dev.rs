@@ -201,7 +201,7 @@ fn mix_gate_shared() -> bool {
 /// every rank (the sliced path drops that read by `world`).
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
 }
 
 fn build_eng_dev(
