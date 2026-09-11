@@ -2074,15 +2074,19 @@ fn fuse_b1() -> bool {
         // row keeps its own family's lane order and accumulation, so all three
         // outputs are bit-identical to the separate launches. DSV41_MIX_GATE=0
         // (or an .so without the symbol) falls back.
-        // Shared expert: EVERY rank computes its own inter/world slice and the MoE
-        // all-reduce below sums the partials - the same structure the routed
-        // experts already use. The weights are sharded to match (w1/w3 by Rows,
-        // w2 by Cols, see weights.rs), so a rank only ever holds its slice. It
-        // used to be replicated and rank-0-only, which made rank 0 do ~55us x 40
-        // layers of work the other seven did not while the whole cluster waited
-        // for it at the all-reduce.
-        let sh_il = inter / self.world();
-        let shared_rank = true;
+        // Shared expert. Under DSV41_SHARED_TP every rank computes its own
+        // inter/world slice (the weights are sharded to match, see weights.rs) and
+        // the MoE all-reduce below sums the partials - the routed experts'
+        // structure, which removes rank 0's ~55us x 40 layers of serial work that
+        // the other seven ranks waited on. Default: the historical replicated
+        // layout, computed on rank 0 alone.
+        let stp = crate::dsv41::weights::shared_expert_tp();
+        let sh_il = if stp { inter / self.world() } else { inter };
+        let shared_rank = if stp {
+            true
+        } else {
+            self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true)
+        };
         let sh_w = if !self.opts.skip_shared_expert {
             match (
                 ld.shared_w1.as_ref(),

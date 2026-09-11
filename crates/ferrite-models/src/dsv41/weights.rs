@@ -229,24 +229,22 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 );
             }
         }
-        // shared expert (TP-split exactly like the routed experts: w1/w3 by their
-        // OUTPUT rows (inter), w2 by its REDUCTION columns (inter), so every rank
-        // projects its own inter/world slice and the existing MoE all-reduce sums
-        // the partials). It used to be Shard::Replicated and only rank 0 computed
-        // it, which cost rank 0 ~55us x 40 layers of serial work while the other
-        // seven ranks idled at the all-reduce.
+        // shared expert: sharded by output rows (w1/w3) and reduction columns (w2)
+        // only under DSV41_SHARED_TP; the replicated, rank-0-only layout is the
+        // default (see shared_expert_tp()).
+        let stp = shared_expert_tp();
         for (n, o, k) in [("w1", inter, dim), ("w3", inter, dim)] {
             push(
                 &mut out,
                 format!("{p}.ffn.shared_experts.{n}.weight"),
                 vec![o, k],
-                Shard::Rows,
+                if stp { Shard::Rows } else { Shard::Replicated },
             );
             push(
                 &mut out,
                 format!("{p}.ffn.shared_experts.{n}.scale"),
                 vec![o / 32, k / 32],
-                Shard::Rows,
+                if stp { Shard::Rows } else { Shard::Replicated },
             );
         }
         for (n, o, k) in [("w2", dim, inter)] {
@@ -254,13 +252,13 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 &mut out,
                 format!("{p}.ffn.shared_experts.{n}.weight"),
                 vec![o, k],
-                Shard::Cols,
+                if stp { Shard::Cols } else { Shard::Replicated },
             );
             push(
                 &mut out,
                 format!("{p}.ffn.shared_experts.{n}.scale"),
                 vec![o / 32, k / 32],
-                Shard::Cols,
+                if stp { Shard::Cols } else { Shard::Replicated },
             );
         }
         // engram table (row-parallel), plus its per-layer wkv and gates
@@ -337,15 +335,19 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 push(&mut out, format!("{p}.ffn.experts.{e}.{n}.scale"), vec![o, k / 32], Shard::Experts);
             }
         }
-        // shared expert, TP-split like the routed experts (see the main-stage
-        // comment): w1/w3 by output rows, w2 by its reduction columns.
+        // shared expert: same gated shard choice as the main stage.
+        let stp2 = shared_expert_tp();
         for (n, o, k) in [("w1", inter, dim), ("w3", inter, dim)] {
-            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k], Shard::Rows);
-            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32], Shard::Rows);
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k],
+                 if stp2 { Shard::Rows } else { Shard::Replicated });
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32],
+                 if stp2 { Shard::Rows } else { Shard::Replicated });
         }
         for (n, o, k) in [("w2", dim, inter)] {
-            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k], Shard::Cols);
-            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32], Shard::Cols);
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k],
+                 if stp2 { Shard::Cols } else { Shard::Replicated });
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32],
+                 if stp2 { Shard::Cols } else { Shard::Replicated });
         }
         if s == 0 {
             // the draft stage reads the attention input of the target layers
@@ -442,6 +444,26 @@ pub fn padded_inter(n: usize) -> usize {
 }
 
 /// The local shape a rank holds for `spec`.
+/// Shared-expert tensor-parallelism, GATED OFF by default.
+///
+/// ON  = w1/w3 sharded by output rows and w2 by its reduction columns, so each
+///       rank computes its own `inter/world` slice and the MoE all-reduce sums
+///       the partials (the routed experts' structure). This removes the big
+///       imbalance: with the replicated layout only rank 0 computed the shared
+///       expert, i.e. ~55us x 40 layers of serial work the other seven ranks
+///       waited on at the all-reduce.
+/// OFF = the historical replicated layout with rank 0 doing all of it.
+///
+/// Default OFF because the first A/B faulted (sticky err 700 surfacing on
+/// dsv41_route_topk) and the cause is not yet identified - the loader, the
+/// launcher and the mixed bf16+fp8 kernel were all re-checked statically. The
+/// flag selects the SHARD RULE at load time, so it must match between the weight
+/// spec and the consumer; both read this one function.
+pub fn shared_expert_tp() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SHARED_TP").map(|v| v != "0").unwrap_or(false))
+}
+
 pub fn local_shape(cfg: &Dsv41Config, spec: &TensorSpec, world: usize, rank: usize) -> Vec<usize> {
     let mut s = spec.shape.clone();
     match spec.shard {
