@@ -1600,3 +1600,43 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
 **注意**：Phase 2 已把 AR 换成共享实现（store+pubred 双 kernel），旧图的跨请求故障排除集
 全部对着 DSV41 自有 AR 测的 ✗ ⇒ **必须先用共享 AR 重测图的跨请求行为**（尖锐复现：3 短 + 长请求），
 数据可能直接改变结论。
+
+### MoE gemv 批化 —— 已实现（2026-09-11，`DSV41_MOE_BATCH`，默认关）
+
+**代码状态**：批化变体已落地，env 门禁 `DSV41_MOE_BATCH`（`chain_dev.rs` 的 `moe_batch()`，`OnceLock`
+读一次 ⇒ 图可捕获），**默认关**：`"0"` 也算关。旧路径（逐 slot 循环）保持原样，是 fallback 与 A/B 基准。
+
+**批化的实际形状（关键：逐个 slot 的输出是否 disjoint）**：
+| 方向 | 原状 | 能否直接批化 | 采用方案 |
+|---|---|---|---|
+| gate/up | 每 slot **覆盖写同一个 `ex_act`** | 否 | 新增 scratch `ex_act_b[topk][2*inter]`，每 slot 写自己的 slice |
+| swiglu | 每 slot 就地处理 `ex_act` | 是 | 新增 `swiglu_limit_batched`，`grid.y = slot` |
+| down | 每 slot **累加进同一个 `o`**（epi_mode 3）| 否 | 新增 scratch `ex_down_b[topk][dim]`（epi_mode 2，**非累加**）+ 定点序归约 |
+| 归约 | （原来隐含在累加里）| — | `moe_down_reduce`：`o[i] = (((0+c_0)+c_1)+…)` 按 slot 升序 |
+
+⇒ 每层从 `3*topk` 次启动（gate/up + swiglu + down）降到 **4 次**（gate/up、swiglu、down、reduce）。
+`topk=6` 时每层 18→4。
+
+**数值论证（bit-identical）**：
+1. 批化 gate/up/down 内核是 `expert_gemv_fp4_kernel` 的**逐行拷贝**，只把 3 处换成"以 `blockIdx.y`
+   为 slot"：专家 id（`ids[blockIdx.y]`）、激活基址（`a_f32 + slot*act_stride`）、输出基址
+   （`out + slot*out_slot_stride`）。K 维点积顺序、warp shuffle 归约、`gridDim.x` 的行分配**全部不变**
+   ⇒ 每个输出元素逐位相同。
+2. `row_weight` 由"每调用指针 + `row_weight[0]`"变为"`row_weight[slot*rw_stride]`"，`rw_stride=1`
+   ⇒ 取到的是同一个标量。
+3. down：顺序路径是 `o[i] = (((0 + c_0) + c_1) + …)`（`o` 先被 zero）；批化把 `c_s` 写进
+   `ex_down_b[s][i]`，归约从 `acc=0.0f` 起**按 s 升序**相加 ⇒ 与顺序路径逐位相同（fp 加法不结合，
+   顺序即契约，**归约内核里绝不能并行 slot 循环**）。
+
+**遗留 / 未做**：
+- **fp8 兄弟（`gemm_fp8_gemv_kernel`，20.4% 份额）不适用批化**：它的调用者是 `lin()`（每层 4 个注意力
+  投影）+ 共享专家（每层 3 个 fp8 gemm），**没有 (layer, topk-expert) 结构**（ABI 明确禁止 fp8 专家：
+  `kernels.rs` 的 user directive）。它那 ~289 次启动是"每层 7 次"的结构量，不是可批化的逐专家量。
+  唯一可合并的是共享专家 `w1`/`w3` 那对（写 `ex_act` 的相离两半）⇒ 2→1，但那是"权表"机制而非专家间接
+  寻址，且省的是 ~43 次启动（~0.13ms），暂不动。
+- 如果整步图先修好（图内 ~0.2µs/launch），批化的收益会从 ~2.5ms 掉到 ~0.16ms ⇒ **批化与修图是替代
+  关系**，先修图则批化优先级下降。
+
+**验证状态**：`cargo check --workspace` = 0 errors（本地）。**CUDA 侧未编译**（本地无 nvcc）：
+`dsv41_experts_mxf4.cu` / `dsv41_glue.cu` 的改动需要在远端 `bash kernels/cuda/build.sh 103a` 重建，
+并核对新 kernel 的寄存器数（house rule：寄存器上涨会静默腰斩占用率）。

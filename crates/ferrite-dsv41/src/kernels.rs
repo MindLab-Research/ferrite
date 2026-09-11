@@ -403,6 +403,81 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    // ------------------------------------------------- batched MoE experts fp4
+    // DSV41_MOE_BATCH (default OFF): ONE launch per (layer, direction) instead
+    // of one per (layer, top-k slot). Grid.y is the slot; every block derives
+    // its expert from `ids[blockIdx.y]`. Per-slot outputs are DISJOINT, so a
+    // batched result is bit-identical to the sequential per-slot loop (same
+    // experts, same per-row K dot order).
+    /// Batched fp4 gate/up: `out` holds `slots` [2*inter] blocks, `out_slot_stride`
+    /// floats apart. `a`/`a_scale` is the ONE shared quantised activation row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_expert_gate_up_fp4_batched(
+        a: *const u8,
+        a_scale: *const f32,
+        out: *mut f32,
+        out_slot_stride: i64,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        limit: f32,
+        slots: i32,
+        w1_base: *const u8,
+        w1_stride: i64,
+        w1s_base: *const u8,
+        w1s_stride: i64,
+        w3_base: *const u8,
+        w3_stride: i64,
+        w3s_base: *const u8,
+        w3s_stride: i64,
+        ids: *const i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// Batched fp4 down: WRITES the [slots][dim] scratch (no accumulation), with
+    /// the routing weight PER SLOT at `row_weight[slot * rw_stride]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_expert_down_fp4_batched(
+        act_base: *const f32,
+        act_stride: i64,
+        out: *mut f32,
+        out_slot_stride: i64,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        row_weight: *const f32,
+        rw_stride: i64,
+        slots: i32,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// `out[i] = sum over slots in ASCENDING slot order` — the same order the
+    /// sequential `out[i] += x` loop used, hence bit-identical (fp addition is
+    /// not associative).
+    pub fn dsv41_moe_down_reduce(
+        part: *const f32,
+        out: *mut f32,
+        n: i32,
+        slots: i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// Batched SwiGLU: grid.y = slot over `slots` consecutive [2*inter] blocks.
+    pub fn dsv41_swiglu_limit_batched(
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        slot_stride: i64,
+        slots: i32,
+        stream: CuStream,
+    ) -> i32;
+
     /// Gather `n` rows of `dim` floats by index (`src` rows may repeat).
     pub fn dsv41_gather_rows(
         src: *const f32,

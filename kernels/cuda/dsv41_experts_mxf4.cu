@@ -660,6 +660,121 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     }
 }
 
+// ---------------------------------------------------------------------------
+// BATCHED M=1 fp4 expert GEMV (env-gated by DSV41_MOE_BATCH on the Rust side,
+// default OFF). ONE launch per (layer, direction) covers every top-k slot:
+// grid = (rows_blocks, slots) with blockIdx.y = the slot, so each block derives
+// its own expert from ids[slot]. The launch COUNT is the MoE family's real
+// lever - the per-call launch floor is ~3.05 us (measured, see the "空 kernel
+// 启动地板实测" section of docs/agent/perf-roadmap.md) while the inner-loop
+// levers were measured and are exhausted (see the note in
+// expert_gemv_fp4_kernel).
+//
+// This is a line-for-line copy of expert_gemv_fp4_kernel with three
+// substitutions, which is what makes a batched result BIT-IDENTICAL to the
+// sequential loop: (a) the expert id / weight base come from ids[blockIdx.y];
+// (b) the f32 activation is read from a_f32 + blockIdx.y * act_stride (the
+// per-slot swiglu slice; gate/up passes a_f32 == nullptr and uses the shared
+// quantised `a`); (c) the output goes to out + blockIdx.y * out_slot_stride.
+// The per-row K dot order and the warp shuffle reduction are unchanged.
+//
+// Per-slot outputs MUST be disjoint - this kernel never accumulates across
+// slots. The down direction therefore writes a [slots][n_total] scratch that
+// moe_down_reduce_kernel sums in a FIXED ascending-slot order (fp addition is
+// not associative, so the order is part of the numerical contract).
+//
+// row_weight is PER SLOT here: it is read at row_weight[slot * rw_stride],
+// which is the same scalar the sequential caller passed as `route_w + slot`
+// (whose kernel then read row_weight[0]).
+__global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
+                                               const uint8_t* __restrict__ a,
+                                               const float* __restrict__ a_scale,
+                                               float* __restrict__ out, long out_slot_stride,
+                                               int n_total, int k, int b_split, int epi_mode,
+                                               float limit, const float* __restrict__ row_weight,
+                                               long rw_stride, const uint8_t* __restrict__ b_base,
+                                               long b_stride, const uint8_t* __restrict__ bs_base,
+                                               long bs_stride, const uint8_t* __restrict__ bh_base,
+                                               long bh_stride, const uint8_t* __restrict__ bhs_base,
+                                               long bhs_stride, const int* __restrict__ ids) {
+    const int slot = (int)blockIdx.y;
+    const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
+    const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
+                                              : nullptr;
+    out += (size_t)slot * (size_t)out_slot_stride;
+    const size_t e = (size_t)ids[slot];
+    const uint8_t* b_use = b_base + e * (size_t)b_stride;
+    const uint8_t* bsc_use = bs_base + e * (size_t)bs_stride;
+    const uint8_t* bhi_use = bh_base + e * (size_t)bh_stride;
+    const uint8_t* bhs_use = bhs_base + e * (size_t)bhs_stride;
+    // Same activation staging as the sequential kernel: the ONE shared quantised
+    // row for gate/up, the slot's own f32 swiglu slice for down.
+    extern __shared__ float s_act[];   // k floats
+    const int kbytes = k >> 1;   // packed bytes per row
+    const int ksc = k >> 5;      // e8m0 scales per row
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        if (act != nullptr) {
+            s_act[j] = act[j];
+        } else {
+            const uint8_t ab = a[j >> 1];
+            const float asc = a_scale[j >> 5];
+            s_act[j] = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
+        }
+    }
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;
+
+    for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
+        // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
+        const bool hi = (b_split > 0) && (row >= b_split);
+        const int r = hi ? (row - b_split) : row;
+        const uint8_t* bb = hi ? bhi_use : b_use;
+        const uint8_t* bb_s = hi ? bhs_use : bsc_use;
+        const uint8_t* brow = bb + (size_t)r * kbytes;
+        const uint8_t* srow = bb_s + (size_t)r * ksc;
+
+        float acc = 0.f;
+        for (int j = lane * 2; j < k; j += 64) {
+            const uint8_t byte = brow[j >> 1];
+            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+            const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+            const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+            acc += s_act[j] * w0;
+            acc += s_act[j + 1] * w1;
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) {
+            float x = acc;
+            if (epi_mode == 1) {
+                if (limit > 0.f) {
+                    if (row < b_split) x = fminf(x, limit);
+                    else x = fminf(fmaxf(x, -limit), limit);
+                }
+            } else if (epi_mode == 2 || epi_mode == 3) {
+                if (rw != nullptr) x *= rw[0];
+            }
+            if (epi_mode == 3) out[(size_t)row] += x;
+            else out[(size_t)row] = x;
+        }
+    }
+}
+
+// Fixed-order reduction of the batched down scratch:
+//   out[i] = ((0 + part[0][i]) + part[1][i]) + ... + part[slots-1][i]
+// i.e. the SAME ascending-slot order the sequential loop's `out[i] += x` used,
+// starting from 0.0f. fp addition is not associative, so this order is part of
+// the numerical contract - do NOT parallelise the slot loop.
+__global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __restrict__ out,
+                                       int n, int slots) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float acc = 0.f;
+        for (int s = 0; s < slots; ++s) acc += part[(size_t)s * n + i];
+        out[i] = acc;
+    }
+}
+
 // --------------------------------------------------------------- launchers
 inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const float* a_f32,
                                const uint8_t* b, const uint8_t* b_scale, const uint8_t* b_hi,
@@ -808,4 +923,61 @@ extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
     // making the host issue one add_inplace launch per expert.
     return (int)launch_mxf4(nullptr, nullptr, act, w2, w2_scale, w2, w2_scale, out, rows, dim,
                             inter, -1, 3, 0.f, weight, true, stream);
+}
+
+// ============================================================================
+// BATCHED expert entry points (DSV41_MOE_BATCH, default OFF). The Rust chain
+// picks these to collapse one launch per (layer, top-k slot) into one launch
+// per (layer, direction). See expert_gemv_fp4_batched_kernel for the numeric
+// contract: per-slot outputs are DISJOINT, and a batched result is bit-identical
+// to the sequential per-slot loop.
+// ============================================================================
+
+// gate/up, batched over the top-k slots: grid = (row_blocks, slots) and
+// blockIdx.y = slot. `out` holds `slots` consecutive [2*inter] blocks, one per
+// slot, `out_slot_stride` floats apart; nothing accumulates across slots. The
+// activation is the ONE shared quantised row `a`/`a_scale`.
+extern "C" int dsv41_expert_gate_up_fp4_batched(
+    const uint8_t* a, const float* a_scale, float* out, long out_slot_stride, int rows, int dim,
+    int inter, float limit, int slots, const uint8_t* w1_base, long w1_stride,
+    const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
+    const uint8_t* w3s_base, long w3s_stride, const int* ids, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    const int warps = 8;
+    const int n_total = 2 * inter;
+    dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
+    expert_gemv_fp4_batched_kernel<<<grid, warps * 32, (size_t)dim * sizeof(float), stream>>>(
+        nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
+        w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids);
+    return (int)cudaGetLastError();
+}
+
+// down, batched: writes a [slots][dim] scratch (epi_mode 2 = write, scaled by
+// the PER-SLOT routing weight; NOT accumulating). act_base holds `slots`
+// consecutive [2*inter] slices `act_stride` floats apart - the swiglu half is
+// the first `inter` floats of each slice, exactly the buffer the sequential call
+// passed per slot. The fixed-order reduction is a separate kernel
+// (dsv41_moe_down_reduce) so the host keeps control of the summation order.
+extern "C" int dsv41_expert_down_fp4_batched(
+    const float* act_base, long act_stride, float* out, long out_slot_stride, int rows, int dim,
+    int inter, const float* row_weight, long rw_stride, int slots, const uint8_t* w2_base,
+    long w2_stride, const uint8_t* w2s_base, long w2s_stride, const int* ids, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    const int warps = 8;
+    dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots);
+    expert_gemv_fp4_batched_kernel<<<grid, warps * 32, (size_t)inter * sizeof(float), stream>>>(
+        act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
+        row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
+        w2s_base, w2s_stride, ids);
+    return (int)cudaGetLastError();
+}
+
+// Fixed-order sum of the batched down scratch: out[i] = sum of part[s][i] over
+// s = 0,1,... in that order. See moe_down_reduce_kernel.
+extern "C" int dsv41_moe_down_reduce(const float* part, float* out, int n, int slots,
+                                     cudaStream_t stream) {
+    if (n <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    const unsigned blocks = (unsigned)((n + 255) / 256);
+    moe_down_reduce_kernel<<<blocks, 256, 0, stream>>>(part, out, n, slots);
+    return (int)cudaGetLastError();
 }

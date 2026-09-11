@@ -168,6 +168,25 @@ struct Kernels {
             *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // Batched MoE experts (DSV41_MOE_BATCH, default OFF): one launch per
+    // (layer, direction) instead of one per (layer, slot). See the launcher
+    // comments in dsv41_experts_mxf4.cu for the numerics contract.
+    expert_gate_up_fp4_batched: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *mut f32, i64, c_int, c_int, c_int, f32, c_int,
+            *const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64,
+            *const c_int, CuStream,
+        ) -> c_int,
+    >,
+    expert_down_fp4_batched: Option<
+        unsafe extern "C" fn(
+            *const f32, i64, *mut f32, i64, c_int, c_int, c_int, *const f32, i64, c_int,
+            *const u8, i64, *const u8, i64, *const c_int, CuStream,
+        ) -> c_int,
+    >,
+    moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    swiglu_limit_batched:
+        Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, i64, c_int, CuStream) -> c_int>,
     ar_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
     >,
@@ -278,6 +297,10 @@ impl Device {
             index_k_publish: ko!(rt, "dsv41_index_k_publish"),
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
+            expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
+            expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
+            moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
+            swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
             compressor_pool: ko!(rt, "dsv41_compressor_pool"),
@@ -486,6 +509,16 @@ impl Device {
                 "kernel {name} is not in the loaded .so — rebuild kernels/cuda (bash build.sh 103a)"
             ))
         })
+    }
+
+    /// True when the loaded .so carries the whole DSV41_MOE_BATCH kernel set.
+    /// The batched dispatch is optional, so a stale .so falls back to the
+    /// sequential expert loop instead of failing the step.
+    pub fn supports_moe_batch(&self) -> bool {
+        self.kernels.expert_gate_up_fp4_batched.is_some()
+            && self.kernels.expert_down_fp4_batched.is_some()
+            && self.kernels.moe_down_reduce.is_some()
+            && self.kernels.swiglu_limit_batched.is_some()
     }
 
     pub fn gemm_fp8_mx(
@@ -1266,6 +1299,104 @@ impl Device {
         self.kerr(rc, "dsv41_expert_down_fp4_indirect")
     }
 
+    /// Batched indirect expert gate/up: ONE launch covers all `slots` top-k
+    /// slots (grid.y = slot). `out` holds `slots` consecutive [2*inter] blocks,
+    /// `out_slot_stride` floats apart; the slots never share a written element.
+    /// DSV41_MOE_BATCH only — see `moe_batch()` in chain_dev.rs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_gate_up_fp4_batched(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        out: *mut f32,
+        out_slot_stride: i64,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        limit: f32,
+        slots: i32,
+        w1_base: *const u8,
+        w1_stride: i64,
+        w1s_base: *const u8,
+        w1s_stride: i64,
+        w3_base: *const u8,
+        w3_stride: i64,
+        w3s_base: *const u8,
+        w3s_stride: i64,
+        ids: *const i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_gate_up_fp4_batched,
+            "dsv41_expert_gate_up_fp4_batched",
+        )?;
+        let rc = unsafe {
+            f(
+                a, a_scale, out, out_slot_stride, rows, dim, inter, limit, slots, w1_base,
+                w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_expert_gate_up_fp4_batched")
+    }
+
+    /// Batched indirect expert down: ONE launch covers all `slots` slots and
+    /// WRITES the [slots][dim] scratch (no accumulation across slots). The
+    /// routing weight is PER SLOT (read at `row_weight[slot * rw_stride]`).
+    /// `act_base` holds `slots` [2*inter] slices `act_stride` floats apart.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_down_fp4_batched(
+        &self,
+        act_base: *const f32,
+        act_stride: i64,
+        out: *mut f32,
+        out_slot_stride: i64,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        row_weight: *const f32,
+        rw_stride: i64,
+        slots: i32,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_down_fp4_batched,
+            "dsv41_expert_down_fp4_batched",
+        )?;
+        let rc = unsafe {
+            f(
+                act_base, act_stride, out, out_slot_stride, rows, dim, inter, row_weight,
+                rw_stride, slots, w2_base, w2_stride, w2s_base, w2s_stride, ids, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_expert_down_fp4_batched")
+    }
+
+    /// Fixed-order sum of the batched down scratch into `out` (see the kernel
+    /// comment: the ascending-slot order is the numerical contract).
+    pub fn moe_down_reduce(&self, part: *const f32, out: *mut f32, n: i32, slots: i32) -> Result<()> {
+        let f = self.need(self.kernels.moe_down_reduce, "dsv41_moe_down_reduce")?;
+        let rc = unsafe { f(part, out, n, slots, self.stream) };
+        self.kerr(rc, "dsv41_moe_down_reduce")
+    }
+
+    /// Batched swiglu: grid.y = slot over `slots` consecutive [2*inter] blocks.
+    pub fn swiglu_limit_batched(
+        &self,
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        slot_stride: i64,
+        slots: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.swiglu_limit_batched, "dsv41_swiglu_limit_batched")?;
+        let rc = unsafe { f(gate_up, rows, inter, limit, slot_stride, slots, self.stream) };
+        self.kerr(rc, "dsv41_swiglu_limit_batched")
+    }
     /// Publish `src` into every rank's staging slot for this rank, from the device.
     pub fn ar_store(
         &self,

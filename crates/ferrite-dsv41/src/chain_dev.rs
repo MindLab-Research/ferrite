@@ -109,6 +109,14 @@ struct Scratch {
     ex_in: DevBuf,     // [dim]
     ex_act: DevBuf,    // [2*inter]
     ex_out: DevBuf,    // [dim]
+    /// DSV41_MOE_BATCH only: the per-slot gate/up outputs, `[topk][2*inter]`.
+    /// The sequential loop reused ONE ex_act per slot (overwrite); the batched
+    /// gate/up writes every slot in one launch, so it needs disjoint slices.
+    ex_act_b: DevBuf,
+    /// DSV41_MOE_BATCH only: the per-slot down scratch, `[topk][dim]`. The
+    /// batched down WRITES here (no cross-slot accumulation) and a fixed-order
+    /// reduction sums the slots into `o` in the sequential order.
+    ex_down_b: DevBuf,
     hist: DevBuf,      // [n_experts] i32
     idx_q: DevBuf,     // [index_n_heads * index_head_dim]
     idx_k: DevBuf,     // [index_head_dim]
@@ -155,6 +163,37 @@ struct EngDev {
 fn eng_host() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_GRAPH_CAP_LAYERS=N stops the layer loop after N layers (DEBUG ONLY). It
+/// exists to bisect the whole-step graph's illegal access: the capture records
+/// whatever the loop executes, so a capped capture produces a graph containing only
+/// layers 0..N - if that graph replays clean for a few hundred steps while an
+/// uncapped one faults, the culprit is in the layers at or past the cap, and the
+/// range narrows on each run. Unset means usize::MAX and no behavior change. Read
+/// ONCE (the house pattern - a per-step getenv would be a hot-path slip).
+fn graph_cap_layers() -> usize {
+    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("DSV41_GRAPH_CAP_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(usize::MAX)
+    })
+}
+
+/// DSV41_MOE_BATCH=1 collapses the routed-expert fp4 GEMV family from one
+/// launch per (layer, top-k slot) to one launch per (layer, direction), which
+/// is the MoE family's real lever (the per-call launch floor is ~3.05 us and
+/// the inner loops are measured-exhausted — see docs/agent/perf-roadmap.md).
+///
+/// DEFAULT OFF: the batched path is a separate kernel set and the sequential
+/// path is the live verified one. Read ONCE and cached (the house rule from
+/// dsv41_glue.cu's g_hc_spread and eng_host() above — a per-call getenv is a
+/// hot-path slip), and `"0"` means OFF even though it is "set".
+fn moe_batch() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(false))
 }
 
 fn build_eng_dev(
@@ -341,6 +380,11 @@ impl<'a> DevChain<'a> {
             ex_in: dev.alloc(fb(dim))?,
             ex_act: dev.alloc(fb(2 * inter.max(dim)))?,
             ex_out: dev.alloc(fb(dim))?,
+            // DSV41_MOE_BATCH scratch (allocated unconditionally: it is a few
+            // hundred KB and keeps the allocation graph static). Sized by the
+            // FULL `inter`, which is >= the padded local width the kernels use.
+            ex_act_b: dev.alloc(fb(topk.max(1) * 2 * inter))?,
+            ex_down_b: dev.alloc(fb(topk.max(1) * dim))?,
             hist: dev.alloc(fb(n_exp))?,
             idx_q: dev.alloc(fb(cfg.index_n_heads.max(1) * cfg.index_head_dim.max(1)))?,
             idx_k: dev.alloc(fb(cfg.index_head_dim.max(1)))?,
@@ -821,6 +865,11 @@ impl<'a> DevChain<'a> {
         let mut t_attn = std::time::Duration::ZERO;
         let mut t_moe = std::time::Duration::ZERO;
         for layer in 0..cfg.n_layers {
+            // DSV41_GRAPH_CAP_LAYERS (debug): see graph_cap_layers. Only the capture
+            // is affected in practice - a graph replay never re-enters step_body.
+            if layer >= graph_cap_layers() {
+                break;
+            }
             // the engram writes into the residual stream BEFORE the block runs
             if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
                 self.engram_apply(layer, li)?;
@@ -1753,17 +1802,35 @@ impl<'a> DevChain<'a> {
             // Fixed 6-slot device-driven loop: the expert id comes from
             // route_idx on the device and the weights from route_w, so there is
             // no host round trip and the launch arguments are static.
-            for slot in 0..topk {
-                let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);
+            //
+            // DSV41_MOE_BATCH=1 (default OFF) replaces the loop below with ONE
+            // launch per direction (grid.y = slot). Requirements, all checked
+            // here so an old .so or a degenerate layer falls back to the
+            // verified sequential path instead of failing:
+            //   * topk > 0 and ne >= 2 (the indirect weight-base scheme);
+            //   * the batched symbols are actually present in the loaded .so.
+            let batched = moe_batch()
+                && topk > 0
+                && ne >= 2
+                && self.dev.supports_moe_batch();
+            if batched {
+                // Per-slot strides. `ex_act_b` holds [topk][2*inter_local] and
+                // `ex_down_b` [topk][dim]; both slices are disjoint, which is
+                // what the batched gate/up and down require (the sequential
+                // loop instead reused one ex_act and accumulated into `o`).
+                let act_slot = (2 * inter_local) as i64;
+                let down_slot = dim as i64;
                 let ids = self.s.route_idx.ptr as *const i32;
-                self.dev.expert_gate_up_fp4_indirect(
+                self.dev.expert_gate_up_fp4_batched(
                     self.s.xq.as_u8(),
                     self.s.xsc.as_f32(),
-                    self.s.ex_act.ptr as *mut f32,
+                    self.s.ex_act_b.ptr as *mut f32,
+                    act_slot,
                     1,
                     dim as i32,
                     inter_local as i32,
                     cfg.swiglu_limit,
+                    topk as i32,
                     w1_base,
                     w1_stride,
                     w1s_base,
@@ -1773,28 +1840,88 @@ impl<'a> DevChain<'a> {
                     w3s_base,
                     w3s_stride,
                     ids,
-                    slot as i32,
                 )?;
-                self.dev.swiglu_limit(
-                    self.s.ex_act.ptr as *mut f32,
+                self.dev.swiglu_limit_batched(
+                    self.s.ex_act_b.ptr as *mut f32,
                     1,
                     inter_local as i32,
                     cfg.swiglu_limit,
+                    act_slot,
+                    topk as i32,
                 )?;
-                self.dev.expert_down_fp4_indirect(
-                    self.s.ex_act.ptr as *const f32,
-                    self.s.o.ptr as *mut f32,
+                // row_weight is PER SLOT here: route_w is [topk] and contiguous,
+                // so the kernel reads route_w[slot] (rw_stride = 1) — the exact
+                // scalar the sequential call passed as `route_w + slot`.
+                self.dev.expert_down_fp4_batched(
+                    self.s.ex_act_b.ptr as *const f32,
+                    act_slot,
+                    self.s.ex_down_b.ptr as *mut f32,
+                    down_slot,
                     1,
                     dim as i32,
                     inter_local as i32,
-                    w,
+                    self.s.route_w.ptr as *const f32,
+                    1,
+                    topk as i32,
                     w2_base,
                     w2_stride,
                     w2s_base,
                     w2s_stride,
                     ids,
-                    slot as i32,
                 )?;
+                // Fixed-order sum, slot 0 first: the SAME order the sequential
+                // `o[row] += x` accumulation used (from the zeroed `o`), so the
+                // result is bit-identical (fp addition is not associative).
+                self.dev.moe_down_reduce(
+                    self.s.ex_down_b.ptr as *const f32,
+                    self.s.o.ptr as *mut f32,
+                    dim as i32,
+                    topk as i32,
+                )?;
+            } else {
+                for slot in 0..topk {
+                    let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);
+                    let ids = self.s.route_idx.ptr as *const i32;
+                    self.dev.expert_gate_up_fp4_indirect(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        self.s.ex_act.ptr as *mut f32,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                        w1_base,
+                        w1_stride,
+                        w1s_base,
+                        w1s_stride,
+                        w3_base,
+                        w3_stride,
+                        w3s_base,
+                        w3s_stride,
+                        ids,
+                        slot as i32,
+                    )?;
+                    self.dev.swiglu_limit(
+                        self.s.ex_act.ptr as *mut f32,
+                        1,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                    )?;
+                    self.dev.expert_down_fp4_indirect(
+                        self.s.ex_act.ptr as *const f32,
+                        self.s.o.ptr as *mut f32,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        w,
+                        w2_base,
+                        w2_stride,
+                        w2s_base,
+                        w2s_stride,
+                        ids,
+                        slot as i32,
+                    )?;
+                }
             }
         }
 

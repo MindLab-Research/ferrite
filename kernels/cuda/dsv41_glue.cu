@@ -633,6 +633,40 @@ extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float lim
     return (int)cudaGetLastError();
 }
 
+// Batched form (DSV41_MOE_BATCH, default OFF): grid.y = the top-k slot, one
+// launch per layer instead of one per (layer, slot). Identical arithmetic per
+// slot - the slot only shifts the base pointer, so the result is bit-for-bit
+// the sequential loop's. The batched gate/up writes each slot's [2*inter] block
+// at a disjoint offset `slot * slot_stride`, and this kernel then rewrites the
+// first `inter` floats of every block in place.
+__global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int rows, int inter,
+                                            float limit, long slot_stride) {
+    float* base = gate_up + (size_t)blockIdx.y * (size_t)slot_stride;
+    const size_t total = (size_t)rows * inter;
+    for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
+         t += (size_t)gridDim.x * blockDim.x) {
+        const int r = (int)(t / (size_t)inter);
+        const int i = (int)(t % (size_t)inter);
+        float* row = base + (size_t)r * 2 * inter;
+        float g = row[i];
+        float u = row[inter + i];
+        if (limit > 0.f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        row[i] = (g / (1.f + expf(-g))) * u;
+    }
+}
+
+extern "C" int dsv41_swiglu_limit_batched(float* gate_up, int rows, int inter, float limit,
+                                          long slot_stride, int slots, cudaStream_t s) {
+    if (rows <= 0 || inter <= 0 || slots <= 0) return (int)cudaSuccess;
+    const size_t total = (size_t)rows * inter;
+    dim3 grid((unsigned)((total + 255) / 256), (unsigned)slots);
+    swiglu_limit_batched_kernel<<<grid, 256, 0, s>>>(gate_up, rows, inter, limit, slot_stride);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_gather_rows(const float* src, const int32_t* idx, float* out, int n, int dim,
                                  cudaStream_t s) {
     if (n <= 0 || dim <= 0) return (int)cudaSuccess;
