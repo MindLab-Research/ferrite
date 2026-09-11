@@ -45,7 +45,7 @@
 | 7 | `hc_mix_dots_kernel` | 80 | 7.0 | **0.56** | 5.8% | 0.59 | −0.03 | 4 warp 协同 staging |
 | 8 | `gemv_bf16_kernel`（lm_head 切片 + engram） | 9 | 45.0 | **0.41** | 4.2% | 0.98 (44@22.3) | −0.57 | ① lm_head 1/8 词表切分 ② **MIX_GATE**（`chain_dev.rs:2324` `sh_via_mixed = mix_gate_shared() && gemm_bf16_fp8x2(...)`）把 gate+w1/w3 合成 `gemv_bf16_fp8x2` → 调用 **44→9**，与 fp8x2 的 **5→40** 数值对应（−35/+35）；精确拆分待代码/历史核 |
 | 9 | `sparse_attn_pf_kernel` | 40 | 8.5 | **0.34** | 3.5% | 0.42 (10.5µs) | −0.08 | 3 深预取 |
-| 10 | `quant_kernel<0>` | 166 | 1.6 | **0.26** | 2.7% | 0.28 (176) | −0.02 | P2 冗余 zero 跳过（调用 −10）；**纯固定成本，未到预测的 0.15** |
+| 10 | `quant_kernel<0>` | 166 | 1.6 | **0.26** | 2.7% | 0.28 (176) | −0.02 | P2 冗余 zero 跳过（调用 −10）；**纯固定成本，未到预测的 0.15**。T2（`db29175`）已摘掉 80 次里的 40：qr 路的 rmsnorm epilogue 直出（`dsv41_rmsnorm_q`）+ MoE 侧 fp4 独立 scratch 让 T1 flag 存活到 `:2701`；剩 `:1995`(`o`→wo_a)、`:2043`(`wo`→wo_b) 两个整行 absmax 的 site |
 | 11 | `route_topk_kernel` | 40 | 5.2 | **0.21** | 2.2% | 0.21 | 0 | P1 只删了 `hist` 死码（`route_hist` 已消失），固定成本未降 |
 | 12 | `dsv41_hc_post_inplace_kernel` | 80 | 1.9 | **0.15** | 1.5% | 0.15 | 0 | — |
 | 13 | `rmsnorm_kernel` | 44 | 2.8 | **0.12** | 1.3% | 0.13 | 0 | — |

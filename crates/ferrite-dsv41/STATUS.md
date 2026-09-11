@@ -5743,3 +5743,23 @@ down 向量化（nv8 循环：4 值 uint32 组替代标量尾巴）在 serve 级
 代码保留（逐位一致、无风险）。
 
 **会话最终基线：9.38ms / 106.6 tok/s（round 25/27 确认）。**
+
+### 第 30 轮：gateup CSE 中性 + AR store 中性（增量路径的边际递减）
+
+| 轮 | 臂 | p50 | 结论 |
+|---|---|---|---|
+| 29 | arsf vs arsn | 9.71 vs 9.70 | AR store 融合**中性**（-82 节点未兑现为墙钟收益） |
+| 30 | cse（gateup sa[16]） | 9.50 | gateup CSE **中性**（LDS 减半被寄存器压力抵消） |
+
+**增量路径的边际递减**：最近的 5 项增量优化（down-vec-320、AR store、gateup CSE、
+hc-sinkhorn-hide（否决）、gateup s_act CSE）全部中性或否决——**当前 9.38ms 基线的
+增量空间已基本用尽**。剩余的大杠杆全部需要结构级改动（Stage C persistent 段核）。
+
+**Stage B 最终清单更新**：
+- ✅ 已落地有收益：gateup+swiglu 融合（−0.51）、MIX_GATE=OFF（−0.33）、P1/P2（−0.27）
+- ❌ 中性：down-vec-320、AR store、gateup CSE
+- ❌ 否决：hc-sinkhorn-hide（窗口不够）、wo-quant-eliminate（生产者归属错）、idx_fuse（+0.33 回归）
+- ⏳ 仍有潜力：rmsnorm-q-gateup（fp8 激活直进 gateup，−0.15~0.25ms）——subagent 实施中
+- ⏳ 仍有潜力：hc_post_inplace 融入 pubred epilogue（−0.15ms）——persistent-p1-impl 中
+
+**结论：通往 200 tok/s（5ms）的增量优化路径在 ~9.0-9.2ms 处触底。需要 Stage C。**
