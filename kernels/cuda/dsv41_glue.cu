@@ -644,6 +644,30 @@ __global__ void ring_append_kernel(float* __restrict__ ring, const float* __rest
         dst[i] = kv[i];
 }
 
+// Publish this step's roped index key into the owner layer's group slot. The
+// destination USED to be a host-computed address (index_k + (compress_len-1) *
+// idx_hd), i.e. the same "host-computed address frozen by a graph capture" class
+// as the window ring append: every replay would write the same group slot, so the
+// indexer's compressed keys went stale as soon as the graph was used. The slot is
+// derived from the DEVICE latent counter inside the kernel.
+__global__ void index_k_publish_kernel(float* __restrict__ dst_base,
+                                       const float* __restrict__ src,
+                                       const int* __restrict__ clen, int idx_hd) {
+    const int c = *clen;
+    const int group = (c > 0) ? (c - 1) : 0;
+    float* dst = dst_base + (size_t)group * (size_t)idx_hd;
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < idx_hd; i += gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+extern "C" int dsv41_index_k_publish(float* dst_base, const float* src, const int* clen,
+                                     int idx_hd, cudaStream_t s) {
+    if (idx_hd <= 0) return (int)cudaSuccess;
+    index_k_publish_kernel<<<(unsigned)((idx_hd + 127) / 128), 128, 0, s>>>(dst_base, src, clen,
+                                                                           idx_hd);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_ring_append(float* ring, const float* kv, const int* pos_ctr, int window,
                                  int hd, cudaStream_t s) {
     if (hd <= 0 || window <= 0) return (int)cudaSuccess;

@@ -1427,10 +1427,14 @@ impl<'a> DevChain<'a> {
             1,
             false,
         )?;
-        self.dev.memcpy_d2d(
-            (self.layers[layer].index_k.ptr as *mut u8).wrapping_add(group * idx_hd * 4) as *mut c_void,
-            self.s.idx_k.ptr as *const c_void,
-            idx_hd * 4,
+        // DEVICE-derived destination: a host-computed group slot here is exactly
+        // the frozen-address bug that made the window ring go stale under the
+        // graph (the index key would land in the same group every replay).
+        self.dev.index_k_publish(
+            self.layers[layer].index_k.ptr as *mut f32,
+            self.s.idx_k.ptr as *const f32,
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer),
+            idx_hd as i32,
         )?;
         } // end owns_k (key publishing only)
         // the queries come from the q_lora stream

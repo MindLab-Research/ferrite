@@ -2992,3 +2992,24 @@ self.dev.memcpy_d2d(ring + slot*fb(hd), self.s.kv, fb(hd));   // ← 目的地�
 - `ferrite-kernel`（3 条）/`ferrite-exec`（24 条）：**在 subagent 的文件范围内** ✗ ⇒ 等它释放后再清 ✓。
 - **性能**：稳态 21.8-44.2 ms/step vs 目标 5 ms（**4.35x** ✗）⇒ 取证顺序已入 `docs/agent/perf-roadmap.md` ✓
   （差分法新分解 → M=1 形状审计 → 已知候选 → 段融合 ✓）。
+
+## ⚠ 审计发现的**第二处同类真 bug（已修 ✓）**：indexer 的 index_k 发布地址
+
+**审计方法**（受用户 GLM 经验启发 ✓）：**把"宿主算出的地址被烤进图"当作一个 bug 类** ✓，
+逐处检查步内所有 `memcpy_*` 的源/目的地址与 kernel 参数里的指针运算 ✓。
+
+**发现**（`chain_dev.rs` 原 1430 行）：
+```rust
+let group = if owns_k { self.layers[layer].compress_len.saturating_sub(1) } else { 0 };  // 每步变 ✗
+...
+memcpy_d2d(index_k.ptr + group * idx_hd * 4, self.s.idx_k.ptr, idx_hd*4);   // ← 目的地址被烤进图 ✗
+```
+⇒ 图每次重放都把 indexer 的压缩 key 写进**同一个组槽位** ✗ ⇒ 压缩 KV 的 key 陈旧 ✓
+（我此前的五段文本测试**掩盖了它** —— 短上下文由 128 槽窗口主导 ✓，压缩路径影响小 ✓）。
+
+**修法**（与 ring_append 同一模式 ✓）：新 `dsv41_index_k_publish` kernel —— 组号由 **`*clen[owner]`
+在设备上算** ✓（`group = clen > 0 ? clen-1 : 0` ✓）；launcher 放在**匿名 namespace 之外** ✓。
+
+**其余审计结论**（无问题 ✓）：`pre_a` 的 16B D2D（常量 ✓）、`h→h2` 拷贝（定址 ✓）、
+indexer 的 `for g in 0..nlg`（`nlg = cfg.o_groups/world` **静态模型维度** ✓，非每步值 ✓）、
+`eng_ids + li*n_cols`（静态 ✓）、`clen + owner`（每层静态 ✓）。

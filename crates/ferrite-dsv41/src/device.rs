@@ -180,6 +180,8 @@ struct Kernels {
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
         Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, c_int, CuStream) -> c_int>,
+    index_k_publish:
+        Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, CuStream) -> c_int>,
     compress_commit: Option<
         unsafe extern "C" fn(
             *const f32,
@@ -459,6 +461,7 @@ impl Device {
                 comp_placeholder: sym(h_k, "dsv41_comp_placeholder").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 compress_commit: sym(h_k, "dsv41_compress_commit").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ring_append: sym(h_k, "dsv41_ring_append").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                index_k_publish: sym(h_k, "dsv41_index_k_publish").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1604,6 +1607,21 @@ impl Device {
         let f = self.need(self.kernels.window_idxs, "dsv41_window_idxs")?;
         let rc = unsafe { f(idxs, pos_ctr, window, self.stream) };
         self.kerr(rc, "dsv41_window_idxs")
+    }
+
+    /// Publish the roped index key into the owner's group slot, with the slot
+    /// derived from the DEVICE latent counter (a host-computed destination would
+    /// be frozen by a graph capture - the same class as the ring append).
+    pub fn index_k_publish(
+        &self,
+        dst_base: *mut f32,
+        src: *const f32,
+        clen: *const c_int,
+        idx_hd: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.index_k_publish, "dsv41_index_k_publish")?;
+        let rc = unsafe { f(dst_base, src, clen, idx_hd, self.stream) };
+        self.kerr(rc, "dsv41_index_k_publish")
     }
 
     /// Append the KV row into the window ring at the DEVICE-derived slot. This
