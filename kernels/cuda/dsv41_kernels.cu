@@ -2602,6 +2602,17 @@ static const bool g_gemv_a32 = [] {
 static inline size_t dsv41_gemv_a32_bytes(int k) {
     return g_gemv_a32 ? (size_t)k * sizeof(float) : (size_t)0;
 }
+// P1 (a32 dead-slot): the k-byte fp8 activation staging row `s_a` (mode 4) is
+// NOT allocated when the fused a32 pass writes `s_af` straight from global
+// memory -- i.e. a32=1 and the NORM_FUSE prologue is not the producer. Every
+// launcher except dsv41_gemm_fp8_mx_rope_norm has qr_raw == nullptr, so for them
+// the condition collapses to the a32 gate and mode 4 asks for `warps * k` rows
+// instead of `(warps + 1) * k`. The NORM_FUSE launcher keeps the extra row (its
+// prologue writes s_a and the decode still reads it) and passes norm_fuse=true.
+// MUST stay in lockstep with the kernel's `a32_direct` / `s_ws` computation.
+static inline size_t dsv41_gemv_sa_bytes(int k, bool norm_fuse) {
+    return (g_gemv_a32 && !norm_fuse) ? (size_t)0 : (size_t)k;
+}
 
 // Rows per gemv block, shared by the single-family and the two-family launchers.
 // Four rows per block measured 15.91 against 16.14 ms for eight, same session,
@@ -3054,7 +3065,20 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // are now staged the same way the weights are. Values and their use order are
     // untouched, so the result is bit-identical.
     const int nb_k_al = (nb_k + 15) & ~15;          // 16-byte units for cp.async
-    uint8_t* s_ws = s_a + (size_t)((vec == 4) ? k : 0);
+    // P1 (a32 dead-slot elimination, 2026-09-11). With a32=1 the consume loop's
+    // ONLY activation reader is `s_af` (line ~3257); on the plain fp8 mode-4 path
+    // `s_a` has exactly one reader left -- the materialisation below
+    // (`s_af[i] = s_lut[s_a[i]] * s_as[i>>5]`). Fusing that decode into the
+    // staging pass (global uint4 load -> same LUT -> same scale -> straight into
+    // `s_af`) removes the last reader, so the whole k-byte slot is not allocated:
+    // smem 48512 -> 43392 B at k=5120 / warps=4 / mode 4 -> 5 blocks/SM instead
+    // of 4. Same bytes, same LUT entry, same product -> bit-identical (`s_a` was
+    // only ever a copy of `a`). The slot stays when the NORM_FUSE prologue WRITES
+    // `s_a` (qr_raw non-null, it is decoded by the same loop), and when a32=0
+    // (that A/B arm reads `s_lut[s_a[j]] * s_as[j>>5]` inline in the consume
+    // loop). The launchers mirror this with dsv41_gemv_sa_bytes().
+    const bool a32_direct = (a32 != 0) && (vec == 4) && (qr_raw == nullptr);
+    uint8_t* s_ws = s_a + (size_t)((vec == 4 && !a32_direct) ? k : 0);
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     // The e4m3 decode as a 256-entry shared-memory table. The bit-manipulation
     // form chains LDS.8 -> ~10 ALU ops -> FMUL per operand; the table is a single
@@ -3126,10 +3150,13 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
             s_a[i] = *(const uint8_t*)&f8;
         }
-    } else if (vec == 4 && a_f32 == nullptr) {
+    } else if (vec == 4 && a_f32 == nullptr && !a32_direct) {
         // On the f32 path `a` is null and the block-wide copy is not read (the
         // consume loop reads `s_af`, which the a32 block below fills from a_f32),
-        // so the copy is skipped to avoid dereferencing null.
+        // so the copy is skipped to avoid dereferencing null. `a32_direct` skips
+        // it too: the fused a32 block below reads the SAME bytes straight from `a`
+        // (same uint4 stride) and decodes them into `s_af` in one pass, so this
+        // copy would have no reader.
         const int n16a = k >> 4;
         // NOTE: this staging was tried as cp.async and faulted with err 700
         // (illegal access, surfacing as a sticky error on dsv41_route_topk) while
@@ -3165,6 +3192,25 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
                 // built above because the WEIGHT side of the consume loop decodes
                 // through it.
                 for (int i = threadIdx.x; i < k; i += blockDim.x) s_af[i] = a_f32[i];
+            } else if (a32_direct) {
+                // P1: one pass global -> s_af. The uint4 load is the SAME wide
+                // read the (now removed) staging loop performed into `s_a` and
+                // the decode is the SAME `s_lut[b] * s_as[i>>5]` product the
+                // materialisation applied to the bytes it read back from shared
+                // memory, so the emitted f32 is bit-identical -- the smem round
+                // trip (and the k-byte slot) is all that disappears.
+                const int n16a = k >> 4;
+                for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                    const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
+                    const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+                    for (int j = 0; j < 16; ++j) {
+                        const int idx = (i << 4) + j;
+                        s_af[idx] = s_lut[b[j]] * s_as[idx >> 5];
+                    }
+                }
+                for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x)
+                    s_af[i] = s_lut[a[i]] * s_as[i >> 5];
             } else {
                 const uint8_t* ap0 = (vec == 4) ? s_a : a;
                 for (int i = threadIdx.x; i < k; i += blockDim.x)
@@ -4058,7 +4104,10 @@ extern "C" size_t dsv41_gemv_gsmem(int mode, int warps, int k) {
     const size_t scale_bytes = (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) +
                                256 * sizeof(float) + dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);
     if (mode == 3) return (size_t)warps * (size_t)k + scale_bytes;
-    if (mode == 4) return (size_t)(warps + 1) * (size_t)k + scale_bytes;
+    // P1: mode 4 asks for `warps` weight rows and, only when `s_a` is actually
+    // alive (a32=0; this probe mirrors the qr_raw==nullptr launchers), the extra
+    // activation row. See dsv41_gemv_sa_bytes.
+    if (mode == 4) return (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes;
     return 0;   // scalar / vectorised allocate no dynamic smem
 }
 
@@ -5911,17 +5960,32 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 }
 
 // hc tail split entry (DSV41_HC_TAIL_SPLIT, Rust-gated). Same front end as
-// dsv41_hc_front, but the ENTIRE tail chain — and the dots — leave the main
-// stream: the EARLY half (collapse + rmsnorm + T1 fp8), the dots, and the LATE
-// half (ss + sigmoid + sinkhorn + comb) all run in that order on `side`, while
-// main blocks only on the EARLY half. Issued sequence (dependency view, not host
-// order):
-//   main: record(in_ev) -> wait(early_ev)
-//   side: wait(in_ev) -> tail_early(HC_TAIL_EARLY) -> record(early_ev)
-//         -> dots -> tail_late(HC_TAIL_LATE) -> record(join_ev)
+// dsv41_hc_front, but the DOTS and the LATE half leave the main stream: the
+// EARLY half (collapse + rmsnorm + T1 fp8) stays on `main`, the dots and the
+// LATE half (ss + sigmoid + sinkhorn + comb) run in that order on `side`.
+// Issued sequence (dependency view, not host order):
+//   main: tail_early(HC_TAIL_EARLY) -> record(fork_ev) [-> projections -> ...]
+//   side: wait(fork_ev) -> dots -> tail_late(HC_TAIL_LATE) -> record(join_ev)
 // The caller MUST then wait(join_ev) on the main stream before the hc_post that
-// consumes `comb` (the main-stream `wait(early_ev)` is issued here, before the
-// projection chain that reads `out`/`xq`/`xsc`).
+// consumes `comb`; the projection chain right after this call is ordered after
+// EARLY by MAIN's own program order (same stream), so the launcher issues no
+// main-stream wait at all.
+//
+// WHY EARLY STAYED ON MAIN (B, 2026-09-11). An earlier variant ran EARLY on
+// `side` too ("concurrent with the dots") and paid for it with an in_ev/early_ev
+// pair: record(in_ev) on main + wait(in_ev) on side (to pin EARLY after the
+// main-stream hc_post that fills `s.h`) plus record(early_ev) on side +
+// wait(early_ev) on main (to pin the projections after EARLY). That is 4 graph
+// ops per front for ZERO main-stream win: main still had to wait for EARLY
+// (early_ev) — it paid the 1.7 us as a cross-stream round trip instead of as a
+// local launch. EARLY on main needs no event at all (stream order orders it
+// after its producers and before its consumers), while the dots+LATE chain
+// still hangs off main's path, so the split is back to ONE fork/join pair — 2
+// graph ops per front, i.e. -2 nodes/front x 80 front/step. The dots-on-side
+// win is untouched: main still never waits the dots (4.9 us) or LATE (10.7 us).
+// `in_ev`/`early_ev` remain in the ABI as dead parameters (the runtime still
+// passes whatever it created, possibly null) so a stale `.so` keeps resolving
+// the same symbol; the launcher neither validates nor touches them.
 //
 // WHY THE DOTS CAN LEAVE MAIN (dots-on-side, 2026-09-11). The projection group
 // that follows this call reads ONLY the EARLY outputs — lin2 reads `xn` (= `out`)
@@ -5972,10 +6036,11 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
-    // `fork_ev` is deliberately NOT required to be non-null: it is a dead
-    // parameter since dots-on-side (stream order publishes `g_hc_part`), so a
-    // runtime that failed to create ONLY that event must still get the split.
-    if (side == nullptr || in_ev == nullptr || early_ev == nullptr || join_ev == nullptr)
+    // `fork_ev` IS required again (it is the main->side edge since B), while
+    // `in_ev`/`early_ev` are dead parameters (EARLY-on-main needs no event):
+    // they are neither validated nor touched — a runtime that failed to create
+    // only those two still gets the split.
+    if (side == nullptr || fork_ev == nullptr || join_ev == nullptr)
         return (int)cudaErrorInvalidValue;
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     if (!g_hc_front) return (int)cudaErrorInvalidValue;   // caller keeps the old path
@@ -5996,40 +6061,38 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
             return (int)e;
         }
     }
-    // (0) hc-input-ready edge: record on MAIN before the side chain, wait on the
-    // side stream before EARLY. See the header comment — EARLY and the dots are
-    // mutually independent, but both must stay ordered after the MAIN-stream work
-    // that produces `x`/`s.h` and `pre_collapse`.
-    cudaError_t e = cudaEventRecord(in_ev, s);
-    if (e != cudaSuccess) {
-        (void)cudaGetLastError();   // clear the sticky flag before reporting
-        return (int)e;
-    }
-    e = cudaStreamWaitEvent(side, in_ev, 0);
-    if (e != cudaSuccess) {
-        (void)cudaGetLastError();   // clear the sticky flag before reporting
-        return (int)e;
-    }
-    // (1) EARLY half FIRST on the SIDE stream (collapse + rmsnorm + T1 fp8). It is
-    // what main blocks on, so it heads the side chain; the dots behind it are off
-    // main's path entirely. Same statement sequence, same operands and same
-    // 1024-thread block as the old main-stream EARLY, so the emitted bytes are
-    // bit-identical.
-    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
+    // (0) EARLY half on MAIN (collapse + rmsnorm + T1 fp8). It is only 1.7 us and
+    // its ONLY consumer is the projection group immediately after this call, so
+    // main's own program order orders it both after its producers (`s.h` /
+    // `pre_collapse`, written by the previous hc_post / AR fold) and before its
+    // consumers — no event needed. Same statements, same operands and same
+    // 1024-thread block as dsv41_hc_front's EARLY ⇒ bit-identical bytes.
+    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
         w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
-    e = cudaGetLastError();
+    cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    e = cudaEventRecord(early_ev, side);
+    // (1) fork: the side chain (dots -> LATE) may not start before this point in
+    // main's program order. Both the dots and LATE read `x` (= s.h), whose
+    // producer is main-stream work, so publishing AFTER EARLY is a correct (and
+    // the cheapest) fork position: side has no other dependence on EARLY. This is
+    // the ONLY main<->side edge the split needs.
+    e = cudaEventRecord(fork_ev, s);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // (2) dots on the SIDE stream, right behind EARLY. `g_hc_part` is written here
-    // and read only by the LATE branch below, which is on the same stream, so no
-    // fork event is needed to publish it (the old record(fork_ev)/wait pair is
-    // gone — see the header comment). Main does NOT wait this kernel: the
-    // projection group that follows consumes only the EARLY outputs.
+    e = cudaStreamWaitEvent(side, fork_ev, 0);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
+    // (2) dots on the SIDE stream — off main's path entirely. `g_hc_part` is
+    // written here and read only by the LATE branch below, which is on the same
+    // stream, so no second event is needed to publish it. Main does NOT wait this
+    // kernel (nor LATE): the projection group that follows consumes only the
+    // EARLY outputs, and the hc_post that consumes `comb` is ~50 us away — it
+    // waits `join_ev` instead (see the header comment).
     hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, side>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     e = cudaGetLastError();
@@ -6048,26 +6111,21 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
+    // (4) join: record on the side stream; the MODEL waits it on main
+    // (`hc_tail_join`) before the earliest consumer of `post`/`comb` — the
+    // fused AR epilogue when the hc-post fold is on, the standalone hc_post
+    // otherwise. Nothing to wait here: main has no consumer before that point.
     e = cudaEventRecord(join_ev, side);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // (4) join the EARLY half back onto MAIN: the projection chain right after this
-    // call consumes `out`/`xq`/`xsc`. This is now the ONLY thing main waits on
-    // (EARLY = 1.7 us), so the front's main-stream cost is the EARLY half, not the
-    // dots. The wait is satisfied as soon as side finishes EARLY — the dots and
-    // LATE behind it keep running concurrently with the projections.
-    e = cudaStreamWaitEvent(s, early_ev, 0);
-    if (e != cudaSuccess) {
-        (void)cudaGetLastError();   // clear the sticky flag before reporting
-        return (int)e;
-    }
-    // `fork_ev` is kept in the signature for ABI compatibility but is
-    // deliberately neither validated nor recorded/waited: it is a dead parameter
-    // since dots-on-side (same-stream order publishes `g_hc_part`). See the
-    // header comment.
-    (void)fork_ev;
+    // `in_ev`/`early_ev` are kept in the signature for ABI compatibility but are
+    // deliberately neither validated nor recorded/waited: since EARLY-on-main
+    // there is no main<->side edge to publish besides fork_ev. See the header
+    // comment.
+    (void)in_ev;
+    (void)early_ev;
     return (int)cudaGetLastError();
 }
 

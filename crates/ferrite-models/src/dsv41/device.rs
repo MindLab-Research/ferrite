@@ -470,16 +470,16 @@ struct Kernels {
         ) -> c_int,
     >,
     /// hc TAIL SPLIT (`DSV41_HC_TAIL_SPLIT`, default ON): same front end as
-    /// `hc_front`, but the WHOLE tail chain leaves `main` — the EARLY half
-    /// (collapse/rmsnorm/fp8), the dots and the LATE half (ss/sigmoid/sinkhorn/
-    /// comb) all run in that order on the side stream, inside the `in_ev` /
-    /// `early_ev` / `join_ev` edges. `main` waits ONLY `early_ev` here (the
-    /// projection group that follows reads just the EARLY outputs; the dots are
-    /// read only by the LATE branch, on the same side stream), and the caller
-    /// waits `join_ev` before the hc_post that consumes `comb`. `fork_ev` stays
-    /// in the ABI but is no longer recorded — the dots/LATE pair needs no fork
-    /// now that they share a stream. Optional: a stale `.so` falls back to the
-    /// single-launch `hc_front`.
+    /// `hc_front`, but the DOTS and the LATE half (ss/sigmoid/sinkhorn/comb)
+    /// leave `main` and run in that order on the side stream, between `fork_ev`
+    /// and `join_ev`. The EARLY half (collapse/rmsnorm/fp8) stays on `main`: its
+    /// only consumer is the projection group right after the call, so stream
+    /// order orders it on both sides — an EARLY-on-side variant needed an extra
+    /// in_ev/early_ev pair for no main-stream win and was reverted (2026-09-11).
+    /// `main` therefore never waits the dots (4.9 us) or LATE (10.7 us) here; the
+    /// caller waits `join_ev` before the hc_post that consumes `comb`.
+    /// `in_ev`/`early_ev` remain in the ABI as dead slots (the caller passes
+    /// null). Optional: a stale `.so` falls back to the single-launch `hc_front`.
     hc_front_split: Option<
         unsafe extern "C" fn(
             *const f32, *const f32, *const f32, *const f32,
@@ -3394,16 +3394,14 @@ impl Device {
     /// event primitives, reports false and the caller keeps the single-launch
     /// `hc_front`.
     ///
-    /// `fork_event` is deliberately NOT gated on: the dots-on-side change left it
-    /// a dead parameter (same-stream order publishes `g_hc_part`), so requiring it
-    /// to be non-null would needlessly disable the split when only that one event
-    /// failed to create. It is still passed for ABI compatibility.
+    /// `in_event`/`early_event` are deliberately NOT gated on: since EARLY runs
+    /// on main (2026-09-11) they are dead ABI slots, so requiring them would
+    /// needlessly disable the split when only those two failed to create.
     pub fn supports_hc_tail_split(&self) -> bool {
         self.kernels.hc_front_split.is_some()
             && !self.rt.side_stream().is_null()
+            && !self.rt.fork_event().is_null()
             && !self.rt.join_event().is_null()
-            && !self.rt.in_event().is_null()
-            && !self.rt.early_event().is_null()
     }
 
     /// hc tail split front end (`DSV41_HC_TAIL_SPLIT`): the EARLY tail half
@@ -3462,9 +3460,11 @@ impl Device {
                 xsc,
                 self.stream,
                 self.rt.side_stream(),
-                self.rt.in_event(),
+                // Dead ABI slots (EARLY-on-main): the launcher neither validates
+                // nor records/waits them. See `supports_hc_tail_split`.
+                std::ptr::null_mut(),
                 self.rt.fork_event(),
-                self.rt.early_event(),
+                std::ptr::null_mut(),
                 self.rt.join_event(),
             )
         };

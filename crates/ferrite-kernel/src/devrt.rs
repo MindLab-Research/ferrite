@@ -439,28 +439,19 @@ pub struct DevRuntime {
     /// captured priority, so it must not be keyed on a single stream.
     graph_instantiate_flags: u64,
     /// Fork/join events for the tail split, created with `cudaEventDisableTiming`
-    /// so they are legal inside a stream capture. Recorded by the kernel launcher,
-    /// waited by the model. Reused for every tail call — the SAME event object is
-    /// re-recorded 80x per step (40 tail calls x record/wait), so the capture
-    /// relies on PROGRAM ORDER to disambiguate the records: each fork is
-    /// immediately followed by its matching join, and a new path that re-records
-    /// an event but waits it later would silently bind earlier nodes. Any new
-    /// side-chain must therefore keep the fork-then-join ADJACENT in program
-    /// order, or allocate a separate event pool.
+    /// so they are legal inside a stream capture. Recorded by the kernel launcher
+    /// (`fork_ev` on main right after the EARLY half, waited on the side stream;
+    /// `join_ev` on the side stream after the LATE half, waited on main by the
+    /// model), so the pair is the split's ONLY main<->side edge. Reused for every
+    /// tail call — the SAME event object is re-recorded 80x per step (40 tail
+    /// calls x record/wait), so the capture relies on PROGRAM ORDER to
+    /// disambiguate the records: each fork is immediately followed by its
+    /// matching join, and a new path that re-records an event but waits it later
+    /// would silently bind earlier nodes. Any new side-chain must therefore keep
+    /// the fork-then-join ADJACENT in program order, or allocate a separate event
+    /// pool.
     fork_ev: *mut c_void,
     join_ev: *mut c_void,
-    /// "hc input ready" event for the tail split: recorded on the MAIN stream
-    /// BEFORE the dots (the program point at which EARLY's inputs — `x`/`s.h` and
-    /// `pre_collapse` — are final) and waited on the SIDE stream BEFORE the EARLY
-    /// half. This is the main→side edge that lets EARLY run concurrently with the
-    /// dots without losing its ordering against the main-stream work that
-    /// produces its operands. Null when unavailable.
-    in_ev: *mut c_void,
-    /// "EARLY done" event for the tail split: recorded on the SIDE stream after
-    /// the EARLY half and waited on the MAIN stream before `hc_front_split`
-    /// returns, so the projection chain that consumes `out`/`xq`/`xsc` sees it.
-    /// Null when unavailable.
-    early_ev: *mut c_void,
     /// Fork/join events for the attention dual chain — same contract as
     /// `fork_ev`/`join_ev` (disable-timing so a whole-step capture may contain
     /// them), but recorded by the MODEL rather than by a kernel launcher,
@@ -585,7 +576,14 @@ impl DevRuntime {
             // --- the three side streams, each with its OWN priority policy. The
             // knobs are deliberately independent (an A/B must be able to move one
             // stream without touching the others):
-            //   `DSV41_HC_TAIL_PRIO`  (default greatest) tail_late  ~10.7us
+            //   `DSV41_HC_TAIL_PRIO`  (default DEFAULT, 2026-09-11) tail dots+LATE
+            //       ~17us on the side stream. DEMOTED from `greatest`: LATE is a
+            //       ONE-BLOCK kernel (g_hc_late_t warps — 31 of 32 warps idle
+            //       under a 1024-thread block), so a preemptive priority hands it
+            //       an SM it cannot use and DELAYS the block-parallel work it is
+            //       supposed to hide under (it only has ~17us of a ~50us slack
+            //       window, i.e. it is not latency-critical). `DSV41_HC_TAIL_PRIO=greatest`
+            //       restores the old over-allocation as the A/B arm.
             //   `DSV41_DUAL_PRIO`     (default default)  kv chain ~10.6us / MoE shared ~22us
             //   `DSV41_COMPRESS_PRIO` (default greatest) compressor ~30us
             // Values: "0" = device default, "mid" = midpoint of the range,
@@ -593,7 +591,7 @@ impl DevRuntime {
             // A non-zero priority is only half the story: the graph capture copies
             // each stream's priority onto ITS nodes, and the replay honours them
             // only when `cudaGraphInstantiate` gets the node-priority flag below.
-            let tail_prio = parse_side_prio("DSV41_HC_TAIL_PRIO", SidePrio::Greatest);
+            let tail_prio = parse_side_prio("DSV41_HC_TAIL_PRIO", SidePrio::Default);
             let dual_prio = parse_side_prio("DSV41_DUAL_PRIO", SidePrio::Default);
             let compress_prio = parse_side_prio("DSV41_COMPRESS_PRIO", SidePrio::Greatest);
             let (side_stream, side_prio) = create_side_stream(&cudart, tail_prio);
@@ -645,8 +643,6 @@ impl DevRuntime {
             };
             let mut fork_ev: *mut c_void = std::ptr::null_mut();
             let mut join_ev: *mut c_void = std::ptr::null_mut();
-            let mut in_ev: *mut c_void = std::ptr::null_mut();
-            let mut early_ev: *mut c_void = std::ptr::null_mut();
             let mut fork2_ev: *mut c_void = std::ptr::null_mut();
             let mut join2_ev: *mut c_void = std::ptr::null_mut();
             let mut fork3_ev: *mut c_void = std::ptr::null_mut();
@@ -666,27 +662,13 @@ impl DevRuntime {
                         fork_ev = std::ptr::null_mut();
                     }
                 }
-                // Tail-split EARLY concurrency (DSV41_HC_TAIL_SPLIT): `in_ev`
-                // (recorded on main at the start of the split, waited on side
-                // before the whole side chain) and `early_ev` (recorded on side
-                // after the EARLY half, waited on main before the projection).
-                // Same disable-timing requirement — both land inside the
-                // whole-step capture. If they cannot be created the launcher is
-                // never entered (see `Device::supports_hc_tail_split`) and the
-                // model keeps hc_front.
-                if make_ev(&mut in_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
-                    let _ = (cudart.last_error)();
-                    in_ev = std::ptr::null_mut();
-                }
-                if make_ev(&mut early_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
-                    let _ = (cudart.last_error)();
-                    early_ev = std::ptr::null_mut();
-                }
-                if (in_ev.is_null() || early_ev.is_null()) && !in_ev.is_null() {
-                    if let Some(d) = cudart.event_destroy {
-                        let _ = d(in_ev);
-                        in_ev = std::ptr::null_mut();
-                    }
+                // (The tail-split `in_ev`/`early_ev` pair was removed with the
+                // EARLY-on-main change: with the EARLY half on the main stream
+                // there is no other main<->side edge, and the two dead event
+                // objects only cost a create + a destroy. The launcher's ABI
+                // still carries the two slots — the model passes null.)
+                if (fork_ev.is_null() || join_ev.is_null()) && !side_stream.is_null() {
+                    eprintln!("[hc_tail] fork/join events unavailable — tail split falls back to single-launch");
                 }
                 // Dual chain: same disable-timing requirement — both events land
                 // inside the whole-step capture, where a timing event makes
@@ -741,8 +723,6 @@ impl DevRuntime {
                 graph_instantiate_flags,
                 fork_ev,
                 join_ev,
-                in_ev,
-                early_ev,
                 fork2_ev,
                 join2_ev,
                 fork3_ev,
@@ -796,8 +776,9 @@ impl DevRuntime {
         self.side_stream2
     }
 
-    /// Fork event for the hc tail split: recorded on the main stream by the
-    /// kernel launcher, waited on the side stream. Null when unavailable.
+    /// Fork event for the hc tail split: recorded on the MAIN stream by the
+    /// kernel launcher right after the EARLY half, waited on the side stream
+    /// before the dots. Null when unavailable.
     pub fn fork_event(&self) -> *mut c_void {
         self.fork_ev
     }
@@ -807,22 +788,6 @@ impl DevRuntime {
     /// unavailable.
     pub fn join_event(&self) -> *mut c_void {
         self.join_ev
-    }
-
-    /// "hc input ready" event for the hc tail split: recorded on the MAIN stream
-    /// by the kernel launcher BEFORE the dots, waited on the side stream BEFORE
-    /// the EARLY half (the edge that keeps EARLY ordered after its main-stream
-    /// producers while running concurrently with the dots). Null when
-    /// unavailable.
-    pub fn in_event(&self) -> *mut c_void {
-        self.in_ev
-    }
-
-    /// "EARLY done" event for the hc tail split: recorded on the SIDE stream by
-    /// the kernel launcher after the EARLY half, waited on the main stream
-    /// before `hc_front_split` returns. Null when unavailable.
-    pub fn early_event(&self) -> *mut c_void {
-        self.early_ev
     }
 
     /// Fork event for the attention dual chain (`DSV41_DUAL_CHAIN`): recorded on

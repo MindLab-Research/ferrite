@@ -999,7 +999,7 @@ extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n,
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gemv_bf16_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             dsv41_smem_ceiling(gemv_bf16_kernel));  // runtime ceiling
+                                             dsv41_smem_ceiling(nullptr));  // runtime ceiling
         if (e != cudaSuccess) return (int)e;
     }
     gemv_bf16_kernel<<<blocks, 256, smem, s>>>((const __nv_bfloat16*)w, x, out, n, k);
