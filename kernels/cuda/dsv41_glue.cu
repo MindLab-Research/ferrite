@@ -316,32 +316,6 @@ __global__ void ar_v5_reduce_kernel(float* __restrict__ dst, const float* __rest
     }
 }
 
-extern "C" int dsv41_ar_v5_store(const unsigned long long* peer_slots, int world, int rank,
-                                 const float* src, long n, long slot_f, const unsigned* epoch,
-                                 cudaStream_t s) {
-    if (n <= 0 || world <= 0) return (int)cudaSuccess;
-    unsigned blocks = (unsigned)((n + 255) / 256);
-    if (blocks > 512) blocks = 512;
-    ar_v5_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, epoch);
-    return (int)cudaGetLastError();
-}
-
-extern "C" int dsv41_ar_v5_publish(const unsigned long long* peer_stamps, const unsigned* stamps,
-                                   int world, int rank, const unsigned* epoch, cudaStream_t s) {
-    if (world <= 0) return (int)cudaSuccess;
-    ar_v5_publish_kernel<<<1, 32, 0, s>>>(peer_stamps, stamps, world, rank, epoch);
-    return (int)cudaGetLastError();
-}
-
-extern "C" int dsv41_ar_v5_reduce(float* dst, const float* staging, long n, long slot_f, int world,
-                                  unsigned* epoch, unsigned* ctr, cudaStream_t s) {
-    if (n <= 0 || world <= 0) return (int)cudaSuccess;
-    unsigned blocks = (unsigned)((n + 255) / 256);
-    if (blocks > 512) blocks = 512;
-    ar_v5_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, epoch, ctr);
-    return (int)cudaGetLastError();
-}
-
 // ===========================================================================
 // Lean M=1 GEMV (single-token projections)
 // ===========================================================================
@@ -496,6 +470,36 @@ __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restric
 }
 
 }  // namespace
+
+// ---- AR v5 launchers (outside the anonymous namespace: extern "C" entries
+// must have external linkage or dlsym cannot find them - the same trap the
+// gemv entry points hit earlier) ----
+extern "C" int dsv41_ar_v5_store(const unsigned long long* peer_slots, int world, int rank,
+                                 const float* src, long n, long slot_f, const unsigned* epoch,
+                                 cudaStream_t s) {
+    if (n <= 0 || world <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (blocks > 512) blocks = 512;
+    ar_v5_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, epoch);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_ar_v5_publish(const unsigned long long* peer_stamps, const unsigned* stamps,
+                                   int world, int rank, const unsigned* epoch, cudaStream_t s) {
+    if (world <= 0) return (int)cudaSuccess;
+    ar_v5_publish_kernel<<<1, 32, 0, s>>>(peer_stamps, stamps, world, rank, epoch);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_ar_v5_reduce(float* dst, const float* staging, long n, long slot_f, int world,
+                                  unsigned* epoch, unsigned* ctr, cudaStream_t s) {
+    if (n <= 0 || world <= 0) return (int)cudaSuccess;
+    unsigned blocks = (unsigned)((n + 255) / 256);
+    if (blocks > 512) blocks = 512;
+    ar_v5_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, epoch, ctr);
+    return (int)cudaGetLastError();
+}
+
 
 // ============================================================================
 // extern "C" entry points -- the ABI in crates/ferrite-dsv41/src/kernels.rs
