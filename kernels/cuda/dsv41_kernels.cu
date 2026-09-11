@@ -536,51 +536,47 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
     // the h stream grows exponentially — rms 0.5 at L0, 3e11 at L5, inf/NaN by L20.
     // Matches hc_split_sinkhorn in the reference (kernel.py:407).
     // step 1: row softmax + eps
-    // The sinkhorn runs on ONE thread. hc is 4 here, so comb is a 4x4 matrix - 16
-    // values - and the original form paid a block-wide __syncthreads around every
-    // sub-step of every one of sinkhorn_iters (20) passes. Decode calls this
-    // kernel with rows == 1, i.e. grid = one block = ONE SM, where a barrier costs
-    // microseconds of exposed latency: measured 185 us per call, 49 percent of the
-    // whole step, on a 384 KB weight set that is entirely L2-resident (2.1 GB/s
-    // effective - 3000x below L2, so it was never a bandwidth problem). Doing the
-    // same arithmetic in one thread changes NOTHING numerically - the operations and
-    // their order are identical, so the output is bit-identical - and removes every
-    // barrier inside the normalisation.
+    // The sinkhorn lives in ONE WARP's registers. hc is 4, so comb is sixteen
+    // values - lanes 0..15, lane l holding cm[l] with l = j*hc + k - and the
+    // row/column reductions are xor butterflies (offsets 1,2 within a row group;
+    // 4,8 across rows). Measured motivation: an isolated repro shows this kernel
+    // costs a FLAT 58 us per call from rows=1 to rows=64, i.e. it is all fixed
+    // overhead, and it runs 803 times per decode step (28.1 percent of the GPU
+    // time). The only structure that can absorb a fixed 58 us is the twenty-pass
+    // normalisation: block-wide barriers in the original, and in the single-thread
+    // version dynamically indexed local arrays that spill. Registers plus shuffles
+    // need neither.
     __syncthreads();
-    if (threadIdx.x == 0) {
-        // locals: only this thread uses them, so shared memory (and the declaration
-        // it needed) is gone entirely
-        float rmax[16], rsum[16], csum[16];
+    {
         const int hh = hc * hc;
-        for (int j = 0; j < hc; j++) {
-            float mx = -INFINITY;
-            for (int k = 0; k < hc; k++) mx = fmaxf(mx, cm[j * hc + k]);
-            rmax[j] = mx;
-        }
-        for (int jk = 0; jk < hh; jk++) cm[jk] = expf(cm[jk] - rmax[jk / hc]);
-        for (int j = 0; j < hc; j++) {
-            float s = 0.f;
-            for (int k = 0; k < hc; k++) s += cm[j * hc + k];
-            rsum[j] = s;
-        }
-        for (int jk = 0; jk < hh; jk++) cm[jk] = cm[jk] / rsum[jk / hc] + eps;
-        for (int it = 0; it < sinkhorn_iters; it++) {
-            if (it > 0) {
-                for (int j = 0; j < hc; j++) {
-                    float s = 0.f;
-                    for (int k = 0; k < hc; k++) s += cm[j * hc + k];
-                    rsum[j] = s;
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (warp == 0) {
+            float c = (lane < hh) ? cm[lane] : 0.f;
+            // row softmax: max then sum over the hc lanes of this row group
+            float mx = c;
+            for (int off = 1; off < hc; off <<= 1) mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+            c = expf(c - mx);
+            float rs = c;
+            for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+            c = c / rs + eps;
+            for (int it = 0; it < sinkhorn_iters; ++it) {
+                if (it > 0) {
+                    float s = c;
+                    for (int off = 1; off < hc; off <<= 1) s += __shfl_xor_sync(0xFFFFFFFFu, s, off);
+                    c = c / (s + eps);
                 }
-                for (int jk = 0; jk < hh; jk++) cm[jk] = cm[jk] / (rsum[jk / hc] + eps);
+                float t = c;
+                for (int off = hc; off < hh; off <<= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+                c = c / (t + eps);
             }
-            for (int k = 0; k < hc; k++) {
-                float s = 0.f;
-                for (int j = 0; j < hc; j++) s += cm[j * hc + k];
-                csum[k] = s;
-            }
-            for (int jk = 0; jk < hh; jk++) cm[jk] = cm[jk] / (csum[jk % hc] + eps);
+            if (lane < hh) cm[lane] = c;
         }
-        for (int jk = 0; jk < hh; jk++) comb[(size_t)r * hh + jk] = cm[jk];
+    }
+    __syncthreads();
+    {
+        const int hh = hc * hc;
+        for (int jk = threadIdx.x; jk < hh; jk += blockDim.x) comb[(size_t)r * hh + jk] = cm[jk];
     }
 }
 
