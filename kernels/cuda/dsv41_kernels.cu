@@ -992,6 +992,43 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
     return (int)cudaGetLastError();
 }
 
+// M=1 fp8 GEMV. gemm_fp8_kernel's tile is 16 rows x (4 warps * 16) columns with
+// smem = 16*k bytes, so at decode's M=1 a typical n=4096 projection launches
+// grid = (64, 1) with 128 threads: 64 warps over 148 SMs, about 0.43 per SM, and
+// 15/16 of the A tile is wasted (64.8 us per call, 19 percent of decode, nsys).
+// This is the same shape of problem the expert fp4 GEMM had, and it takes the same
+// cure: one warp per output row, no tile, no tmem.
+// Formats read off gemm_fp8_kernel and matched exactly:
+//   a       [1, k]        e4m3, one byte per value
+//   a_scale [1, k/32]     f32
+//   w       [n, k]        e4m3, one byte per value
+//   w_scale [n/32, k/32]  e8m0  (block 32x32)
+//   out     [1, n]        = a @ w^T + bias
+__global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
+                                     const float* __restrict__ a_scale,
+                                     const uint8_t* __restrict__ w,
+                                     const uint8_t* __restrict__ w_scale,
+                                     const float* __restrict__ bias,
+                                     float* __restrict__ out, int n, int k) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int nb_k = k >> 5;   // k-blocks of 32
+    for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
+        const uint8_t* wr = w + (size_t)row * k;
+        const int srow = row >> 5;               // 32x32 block scale row
+        float acc = 0.f;
+        for (int kb = 0; kb < nb_k; ++kb) {
+            const float sb = ue8m0_to_f(w_scale[(size_t)srow * nb_k + kb]);
+            const float sa = a_scale[kb];        // m == 1
+            const int j = kb * 32 + lane;
+            acc += e4m3_to_f(a[j]) * sa * (e4m3_to_f(wr[j]) * sb);
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) out[row] = acc + (bias ? bias[row] : 0.f);
+    }
+}
+
 extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const uint8_t* w,
                                  const uint8_t* w_scale, const float* bias, float* out, int m,
                                  int n, int k, cudaStream_t s) {
@@ -1006,6 +1043,14 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         cudaError_t e = cudaFuncSetAttribute(
             gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
         if (e != cudaSuccess) return (int)e;
+    }
+    // M=1 (decode): skip the 16-row tile entirely - it wastes 15/16 of itself and
+    // its 16*k bytes of shared memory cap the occupancy. One warp per output row.
+    if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
+        const int warps = 8;
+        const int blocks = (n + warps - 1) / warps;
+        gemm_fp8_gemv_kernel<<<blocks, warps * 32, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k);
+        return (int)cudaGetLastError();
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
     gemm_fp8_kernel<<<grid, 128, smem, s>>>(a, a_scale, w, w_scale, bias, out, m, n, k);
