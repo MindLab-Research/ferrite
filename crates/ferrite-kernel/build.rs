@@ -27,6 +27,10 @@ fn main() {
             // hand-rolled m16n8k16 kernel had only N/32 blocks → 5%
             // occupancy → 3x SLOWER than the FMA gemv it replaced).
             println!("cargo:rustc-link-lib=dylib=cublas");
+            // cuBLASLt: explicit algorithm selection for m<=32 decode shapes,
+            // where cublasGemmEx's heuristic picks splitK (nvjet_splitK +
+            // splitKreduce ≈ 0.41ms/step of pure K-split overhead).
+            println!("cargo:rustc-link-lib=dylib=cublasLt");
         }
     }
     // KERNEL/BINARY SAME-SOURCE GATE (user rule 2026-09-10): the binary embeds
