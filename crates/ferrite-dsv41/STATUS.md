@@ -5287,3 +5287,34 @@ sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
 （第 12 轮 all 臂 10.86 vs 第 9 轮 a32f 10.65 的 +0.21ms 差异来自其它因素或跨轮噪声——同轮对照才是可信判据。）
 
 **会话累计：13.28 → 10.54ms（+26.4%），75.3 → 94.9 tok/s。**
+
+## gap-analysis 定案（2026-09-11 深夜）：通往 200 tok/s 的诚实路线图
+
+**新分解推演（10.65ms 口径，AR 已换成 v5 的 0.66）**：
+
+| kernel | 新 ms/步 | 状态 |
+|---|---|---|
+| gemm_fp8_gemv | 2.18 | LUT+a32 后的固定项 15.5→11.6µs；**91% 是固定项** |
+| expert_gemv_fp4_batched | 1.78 | 批化已完成（80 次 = gate_up+down 各 40）；内层杠杆全部阴性 |
+| gemv_bf16 | 0.98→0.74 | lm_head 切分已落地（−0.24） |
+| hc 链 | 1.59 | hc-merge −0.20 之后 sinkhorn 可藏（−0.21） |
+| AR v5 | 0.66 | 协议地板 |
+| sparse_attn | 0.42→0.32 | 3 深预取已验证 |
+| 残差（节点尾延迟） | ~1.15 | 700 节点 × ~1.5µs ramp-down，**只能靠减少节点数消** |
+
+**Top-3 结构性机会**：
+1. **xn-megafuse（−1.0ms）**：读 xn 的 5 个投影族（wq_a+wkv fp8 mx2、gate bf16 + sh w1/w3 fp8 mixed、idx_wp bf16）合成一次 launch——每层 −2 launch ⇒ −80 次/步，激活 staging 从 3 遍降到 1 遍。kernel 有先例（双族 dispatch + mixed staging），机械扩展。
+2. **MoE 段 cooperative 核（−0.3~0.5ms）**：gate→route→quant→gate_up→swiglu→down→定序 reduce 一核内，中间量留 smem（省 ~440KB/层 global 往返 + 4 个节点尾延迟）。
+3. **跨层软件流水（−0.3~0.5ms）**：hc 的产物天然错位（ffn mixes 写 slot 2、只被下一层 attn collapse 读）——把 L 的 ffn mixes 挪到 L+1 的 attn 段内下发，hc 成本藏进 AR/attention 尾延迟。
+
+**诚实判定**：Top-3 全落地 ≈ 8.3~8.8ms（114~120 tok/s）。**200 tok/s（5ms）需要 persistent/mega-kernel 架构重写**（跨层流水 + 激活常驻 smem，= dsv41-layer-fusion.md 的段 A/B/C）——这是 B=1 的唯一路径。**若目标是 16 并发 1600 tok/s（用户原始目标），M>1 batching 的收益上限更大**（dsv41 的 decode 构造上 M=1-only，batching 是新的 M>1 kernel 族，但预算有 2× 余量）。
+
+**零风险快赢（small-kernel-fuse 审计发现，合计 −0.40~0.55ms）**：
+- P1：route_topk 的 `hist` 死代码（传 null 省 memset+route_hist × 80/步）
+- P2：删 `zero(ex_out)` 与 `zero(&o)` 的冗余 memset × 40~80/步
+- (a) swiglu_limit + quant1(ex_act) 融合（T1 同款，−40 launch ≈ 60-90µs）
+- (c) add_inplace 折进 w2 gemm epilogue（−40 launch + 40×40KB 往返 ≈ 80-120µs）
+
+**重要勘误（gap-analysis 发现）**：
+- 旧 nsys 表的 AR 行（3.46ms）是 host-barrier 路径，默认 v5 是 0.66ms——推演必须先换
+- `head_slice()` 默认已 ON（10.51→10.54 确认）；STATUS.md 早前"死锁 OFF"的记载已过时
