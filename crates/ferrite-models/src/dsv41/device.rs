@@ -108,8 +108,8 @@ struct Kernels {
     ) -> c_int>,
     // Cross-rank argmax over a vocabulary-sliced lm_head (DSV41_HEAD_SLICE).
     argmax_sliced: Option<unsafe extern "C" fn(
-        *const f32, c_int, c_int, *mut c_int, *mut u64, *mut c_int, *const u64, c_int, c_int,
-        *const f32, i64, i64, CuStream,
+        *const f32, c_int, c_int, *mut c_int, *mut u64, *mut c_int, *const *mut u64,
+        *const *mut u32, *mut c_uint, *mut u64, *const c_uint, c_int, c_int, c_long, CuStream,
     ) -> c_int>,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
@@ -1008,6 +1008,7 @@ impl Device {
     /// published u64 per rank, a final cross-rank pick. `Ok(false)` when the
     /// loaded .so predates the kernel.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn argmax_sliced(
         &self,
         v: *const f32,
@@ -1016,20 +1017,22 @@ impl Device {
         out: *mut c_int,
         packed: *mut u64,
         pos_ctr: *mut c_int,
-        peer_slots: *const u64,
+        peer_staging: *const *mut u64,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *mut u64,
+        ready_local: *const c_uint,
         world: i32,
         rank: i32,
-        staging: *const f32,
-        slot_bytes: i64,
-        off: i64,
+        stride_bytes: i64,
     ) -> Result<bool> {
         let f = match self.kernels.argmax_sliced {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(v, n, idx_off, out, packed, pos_ctr, peer_slots, world, rank, staging, slot_bytes, off,
-              self.stream)
+            f(v, n, idx_off, out, packed, pos_ctr, peer_staging, ready_tbl, epoch, staging_local,
+              ready_local, world, rank, stride_bytes, self.stream)
         };
         if rc == 1 {
             return Ok(false);

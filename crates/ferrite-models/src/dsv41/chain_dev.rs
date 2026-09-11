@@ -1032,7 +1032,11 @@ impl<'a> DevChain<'a> {
             && head.dtype == "BF16"
             && world > 1
             && cfg.vocab_size % world == 0
-            && self.comm.is_some();
+            && self
+                .comm
+                .as_ref()
+                .map(|c| c.uses_v5())
+                .unwrap_or(false);
         if head.dtype == "BF16" {
             if sliced {
                 let head_ptr =
@@ -1073,6 +1077,12 @@ impl<'a> DevChain<'a> {
         // crosses to the host and back.
         if sliced {
             let c = self.comm.as_ref().unwrap();
+            // One round of the shared v5 epoch sequence: the local slice reduces
+            // through argmax_kernel (packed key carries the GLOBAL index, ties ->
+            // lowest), then the exchange kernel lands the key in every peer's
+            // CURRENT parity slot, stamps, advances the device epoch, polls, and
+            // maxes. stride = the slot size; the key sits at the slot's offset 0
+            // under the same parity addressing the AR store uses.
             let ok = self.dev.argmax_sliced(
                 self.s.logits.ptr as *const f32,
                 seg as i32,
@@ -1080,12 +1090,14 @@ impl<'a> DevChain<'a> {
                 self.s.ids.ptr as *mut std::ffi::c_int,
                 self.s.argmax_packed.ptr as *mut u64,
                 self.s.pos_ctr.ptr as *mut std::ffi::c_int,
-                c.peer_slots_dev() as *const u64,
+                c.peer_slots_u64(),
+                c.peer_stamps_u32(),
+                c.epoch_dev(),
+                c.staging_dev() as *mut u64,
+                c.ready_local_dev(),
                 world as i32,
                 rank as i32,
-                c.staging_dev() as *const f32,
                 c.bytes as i64,
-                (c.bytes - 16) as i64,   // 8-byte key + 4-byte flag, clear of the AR payload
             )?;
             if !ok {
                 // The loaded .so has no cross-rank argmax. A slice-local argmax

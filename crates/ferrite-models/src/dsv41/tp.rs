@@ -207,6 +207,36 @@ impl Collective {
         self.staging.ptr as *const std::ffi::c_void
     }
 
+    /// Peers' staging bases as a u64 pointer array — the typed form the
+    /// vocabulary-sliced argmax exchange walks (`staging_tbl`).
+    pub fn peer_slots_u64(&self) -> *const *mut u64 {
+        self.peer_slots.ptr as *const *mut u64
+    }
+
+    /// Peers' ready-row bases (staging base + stamps_at) as a u32 pointer
+    /// array — the argmax exchange stamps `ready_tbl[r][my_rank]`.
+    pub fn peer_stamps_u32(&self) -> *const *mut u32 {
+        self.peer_stamps.ptr as *const *mut u32
+    }
+
+    /// This rank's device epoch (`staging + ctr_at`) — the v5 round counter the
+    /// argmax exchange reads and advances.
+    pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
+        (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut std::ffi::c_uint
+    }
+
+    /// This rank's own ready row (`staging + stamps_at`).
+    pub fn ready_local_dev(&self) -> *const std::ffi::c_uint {
+        (self.staging.ptr as *const u8).wrapping_add(self.stamps_at)
+            as *const std::ffi::c_uint
+    }
+
+    /// True iff the device-side v5 protocol is live (epoch/stamps meaningful).
+    /// The sliced lm_head must not run its exchange outside that protocol.
+    pub fn uses_v5(&self) -> bool {
+        ar_v5()
+    }
+
     /// Publish `len` bytes from `src` into slot `rank` of every rank. `len`
     /// must not exceed the slot size: a site with a shorter payload than the
     /// staging would otherwise publish unrelated memory.

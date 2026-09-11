@@ -2096,26 +2096,56 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
 // free of a correctness question: the whole vocabulary is still compared, just
 // 1/world of it per rank - which is 8x less weight traffic per step (the full
 // 129280-row head measured 298us against 48us for one rank's 16160-row slice).
-__global__ void argmax_pub_kernel(const unsigned long long* __restrict__ peer_slots, int world,
-                                  int rank, const unsigned long long* __restrict__ packed,
-                                  long slot_f, long off) {
+// Cross-rank argmax as ONE v5 epoch round (DSV41_HEAD_SLICE).
+// The old argmax_pub/final wrote bytes-16 with NO parity/epoch: not part of
+// the v5 round sequence -> a peer could stamp round k while another read
+// round j's slot => cross-rank deadlock. Here the key lands at
+// ((e&1)*world+my_rank)*stride_bytes - the SAME parity addressing the v5 store
+// uses (ferrite_kernels.cu:8128) - then stamp peers' ready=e+1, advance
+// *epoch, poll all peers >= e+1, and max. Single thread touches world u64s
+// only, so the stamp/poll/reduce order is trivial (no __syncthreads, no
+// seen[]). Absolute stamps + the parity double buffer make this hang-free by
+// the same argument as the v5 AR itself (ferrite_kernels.cu:8112-8176).
+__global__ void argmax_xchg_v5_kernel(
+    const unsigned long long* __restrict__ packed,        // my slice key
+    unsigned long long* const* __restrict__ staging_tbl,  // [world] peers' staging BASEs
+    unsigned* const* __restrict__ ready_tbl,              // [world] peers' ready rows
+    unsigned* __restrict__ epoch,
+    unsigned long long* __restrict__ staging_local,       // my staging base
+    const unsigned* __restrict__ ready_local,             // my [world] row
+    int* __restrict__ out, int* __restrict__ pos_ctr,
+    int world, int my_rank, long stride_bytes) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const unsigned e = *epoch;
     const unsigned long long pk = packed[0];
-    for (int p = 0; p < world; ++p) {
-        unsigned long long* dst = reinterpret_cast<unsigned long long*>(
-            reinterpret_cast<char*>(peer_slots[p]) + (size_t)rank * (size_t)slot_f + off);
-        *dst = pk;
+    const size_t off =
+        (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (size_t)stride_bytes;
+    for (int r = 0; r < world; r++)
+        *reinterpret_cast<unsigned long long*>(reinterpret_cast<char*>(staging_tbl[r]) + off) = pk;
+    __threadfence_system();                               // key visible BEFORE stamp
+    for (int r = 0; r < world; r++)
+        atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+    __threadfence_system();
+    *epoch = e + 1u;                                      // only after stamping (v5 rule)
+    for (int r = 0; r < world; r++) {
+        volatile unsigned* p = (volatile unsigned*)&ready_local[r];
+        long spins = 0;
+        while ((int)(*p - (e + 1u)) < 0) {                // absolute stamp, monotone
+            __nanosleep(200);
+            if (++spins > 25000000) {                     // ~5 s watchdog
+                printf("[argmax-hang] rank=%d peer=%d need=%u\n", my_rank, r, e + 1u);
+                break;
+            }
+        }
     }
-}
-
-__global__ void argmax_final_kernel(const float* __restrict__ staging, int world, long slot_f,
-                                    long off, int* __restrict__ out, int* __restrict__ pos_ctr) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    __threadfence_system();                               // observe peers' staged keys
     unsigned long long best = 0ull;
-    for (int p = 0; p < world; ++p) {
-        const unsigned long long pk = *reinterpret_cast<const unsigned long long*>(
-            reinterpret_cast<const char*>(staging) + (size_t)p * (size_t)slot_f + off);
-        if (pk > best) best = pk;
+    for (int r = 0; r < world; r++) {
+        const size_t ro =
+            (size_t)((e & 1u) * (unsigned)world + (unsigned)r) * (size_t)stride_bytes;
+        const unsigned long long k = *reinterpret_cast<const unsigned long long*>(
+            reinterpret_cast<const char*>(staging_local) + ro);
+        if (k > best) best = k;                           // ascending rank; ties -> lowest idx
     }
     *out = (int)(0xFFFFFFFFu - (unsigned)(best & 0xFFFFFFFFu));
     if (pos_ctr != nullptr) *pos_ctr = *pos_ctr + 1;
@@ -2127,25 +2157,24 @@ extern "C" int dsv41_argmax(const float* v, int* out, int n, int* pos_ctr, cudaS
     return (int)cudaGetLastError();
 }
 
-// Vocabulary-sliced argmax (lm_head split across ranks): rank-local reduce over
-// the slice, publish the packed comparison key into every peer's staging slot,
-// then a one-thread final picks the winner across ranks. `off` must sit where
-// the all-reduce payload never lands (the caller passes slot_bytes - 16), so the
-// argmax key and the collective staging do not collide. pos_ctr advances here,
-// once per step, exactly as the single-rank argmax did.
-extern "C" int dsv41_argmax_sliced(const float* v, int n, int idx_off, int* out,
-                                   unsigned long long* packed, int* pos_ctr,
-                                   const unsigned long long* peer_slots, int world, int rank,
-                                   const float* staging, long slot_bytes, long off,
-                                   cudaStream_t s) {
-    if (n <= 0 || world <= 0 || off + 8 > slot_bytes) return (int)cudaErrorInvalidValue;
+// Vocabulary-sliced argmax (lm_head split across ranks), as ONE round of the
+// shared v5 epoch sequence: the local slice reduces through argmax_kernel
+// (packed key carries the GLOBAL index, ties -> lowest), then the exchange
+// kernel publishes into every peer's CURRENT parity slot and advances the same
+// device epoch the ARs use. pos_ctr advances here, once per step, exactly as
+// the single-rank argmax did.
+extern "C" int dsv41_argmax_sliced(
+    const float* v, int n, int idx_off, int* out, unsigned long long* packed, int* pos_ctr,
+    unsigned long long* const* staging_tbl, unsigned* const* ready_tbl, unsigned* epoch,
+    unsigned long long* staging_local, const unsigned* ready_local, int world, int rank,
+    long stride_bytes, cudaStream_t s) {
+    if (n <= 0 || world <= 0) return (int)cudaErrorInvalidValue;
     argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, nullptr, idx_off, packed);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    argmax_pub_kernel<<<1, 1, 0, s>>>(peer_slots, world, rank, packed, slot_bytes, off);
-    e = cudaGetLastError();
-    if (e != cudaSuccess) return (int)e;
-    argmax_final_kernel<<<1, 1, 0, s>>>(staging, world, slot_bytes, off, out, pos_ctr);
+    argmax_xchg_v5_kernel<<<1, 1, 0, s>>>(
+        packed, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, pos_ctr, world,
+        rank, stride_bytes);
     return (int)cudaGetLastError();
 }
 
