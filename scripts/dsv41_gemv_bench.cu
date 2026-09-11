@@ -19,7 +19,8 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 static int g_n = 0, g_k = 0;
 
 static void run_b(void* w, const void* x, void* out) {
-    dsv41_gemv_bf16(w, (const float*)x, (float*)out, g_n, g_k, 0);
+    const int rc = dsv41_gemv_bf16(w, (const float*)x, (float*)out, g_n, g_k, 0);
+    if (rc != 0) printf("    bf16 launch returned %d\n", rc);
 }
 // fp8: w = weights (n*k bytes) immediately followed by the per-32-row scale
 // blocks ((n/32)*(k/32) bytes); x = fp8 activation (k bytes) over k/32 f32
@@ -29,7 +30,8 @@ static void run_f(void* w, const void* x, void* out) {
     const float* asc = (const float*)(a + g_k);
     const uint8_t* wq = (const uint8_t*)w;
     const uint8_t* wsc = wq + (size_t)g_n * (size_t)g_k;
-    dsv41_gemm_fp8_mx(a, asc, wq, wsc, nullptr, (float*)out, 1, g_n, g_k, 0);
+    const int rc = dsv41_gemm_fp8_mx(a, asc, wq, wsc, nullptr, (float*)out, 1, g_n, g_k, 0);
+    if (rc != 0) printf("    fp8 launch returned %d\n", rc);
 }
 
 static void bench(const char* tag, int n, int k, int fp8, int reps) {
