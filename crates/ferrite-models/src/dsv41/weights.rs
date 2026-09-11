@@ -229,19 +229,38 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 );
             }
         }
-        // shared expert (the same expert on every rank)
-        for (n, o, k) in [("w1", inter, dim), ("w3", inter, dim), ("w2", dim, inter)] {
+        // shared expert (TP-split exactly like the routed experts: w1/w3 by their
+        // OUTPUT rows (inter), w2 by its REDUCTION columns (inter), so every rank
+        // projects its own inter/world slice and the existing MoE all-reduce sums
+        // the partials). It used to be Shard::Replicated and only rank 0 computed
+        // it, which cost rank 0 ~55us x 40 layers of serial work while the other
+        // seven ranks idled at the all-reduce.
+        for (n, o, k) in [("w1", inter, dim), ("w3", inter, dim)] {
             push(
                 &mut out,
                 format!("{p}.ffn.shared_experts.{n}.weight"),
                 vec![o, k],
-                Shard::Replicated,
+                Shard::Rows,
             );
             push(
                 &mut out,
                 format!("{p}.ffn.shared_experts.{n}.scale"),
                 vec![o / 32, k / 32],
-                Shard::Replicated,
+                Shard::Rows,
+            );
+        }
+        for (n, o, k) in [("w2", dim, inter)] {
+            push(
+                &mut out,
+                format!("{p}.ffn.shared_experts.{n}.weight"),
+                vec![o, k],
+                Shard::Cols,
+            );
+            push(
+                &mut out,
+                format!("{p}.ffn.shared_experts.{n}.scale"),
+                vec![o / 32, k / 32],
+                Shard::Cols,
             );
         }
         // engram table (row-parallel), plus its per-layer wkv and gates
@@ -318,9 +337,15 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
                 push(&mut out, format!("{p}.ffn.experts.{e}.{n}.scale"), vec![o, k / 32], Shard::Experts);
             }
         }
-        for (n, o, k) in [("w1", inter, dim), ("w3", inter, dim), ("w2", dim, inter)] {
-            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k], Shard::Replicated);
-            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32], Shard::Replicated);
+        // shared expert, TP-split like the routed experts (see the main-stage
+        // comment): w1/w3 by output rows, w2 by its reduction columns.
+        for (n, o, k) in [("w1", inter, dim), ("w3", inter, dim)] {
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k], Shard::Rows);
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32], Shard::Rows);
+        }
+        for (n, o, k) in [("w2", dim, inter)] {
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.weight"), vec![o, k], Shard::Cols);
+            push(&mut out, format!("{p}.ffn.shared_experts.{n}.scale"), vec![o / 32, k / 32], Shard::Cols);
         }
         if s == 0 {
             // the draft stage reads the attention input of the target layers

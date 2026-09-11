@@ -2074,8 +2074,16 @@ fn fuse_b1() -> bool {
         // row keeps its own family's lane order and accumulation, so all three
         // outputs are bit-identical to the separate launches. DSV41_MIX_GATE=0
         // (or an .so without the symbol) falls back.
-        let shared_rank = self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true);
-        let sh_w = if !self.opts.skip_shared_expert && shared_rank {
+        // Shared expert: EVERY rank computes its own inter/world slice and the MoE
+        // all-reduce below sums the partials - the same structure the routed
+        // experts already use. The weights are sharded to match (w1/w3 by Rows,
+        // w2 by Cols, see weights.rs), so a rank only ever holds its slice. It
+        // used to be replicated and rank-0-only, which made rank 0 do ~55us x 40
+        // layers of work the other seven did not while the whole cluster waited
+        // for it at the all-reduce.
+        let sh_il = inter / self.world();
+        let shared_rank = true;
+        let sh_w = if !self.opts.skip_shared_expert {
             match (
                 ld.shared_w1.as_ref(),
                 ld.shared_w1_scale.as_ref(),
@@ -2355,12 +2363,9 @@ fn fuse_b1() -> bool {
                 if !sh_via_mixed {
                     self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
                     // gate and up land contiguously so `swiglu_limit` sees [gate|up].
-                    // Same activation, same k, only the weights differ: one mx2 launch
-                    // covers both projections - each row is still one warp walking the
-                    // same lane order, so both outputs are bit-identical to the two
-                    // single-family launches this replaces, minus one ~20us launch
-                    // floor per layer. DSV41_SH_EXP_MX2=0 (or an .so without the
-                    // symbol) falls back to the pair.
+                    // `sh_il` (inter/world) is this rank's slice: the weights are
+                    // Rows-sharded, so one launch still covers both projections and
+                    // the all-reduce below reconstructs the full shared expert.
                     let sh_fused = sh_exp_mx2()
                         && self.dev.gemm_fp8_mx2(
                             self.s.xq.as_u8(),
@@ -2369,12 +2374,12 @@ fn fuse_b1() -> bool {
                             w1s.as_u8(),
                             std::ptr::null(),
                             self.s.ex_act.ptr as *mut f32,
-                            inter as i32,
+                            sh_il as i32,
                             w3.as_u8(),
                             w3s.as_u8(),
                             std::ptr::null(),
-                            (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
-                            inter as i32,
+                            (self.s.ex_act.ptr as *mut f32).wrapping_add(sh_il),
+                            sh_il as i32,
                             dim as i32,
                         )?;
                     if !sh_fused {
@@ -2386,7 +2391,7 @@ fn fuse_b1() -> bool {
                             std::ptr::null(),
                             self.s.ex_act.ptr as *mut f32,
                             1,
-                            inter as i32,
+                            sh_il as i32,
                             dim as i32,
                         )?;
                         self.dev.gemm_fp8_mx(
@@ -2395,16 +2400,23 @@ fn fuse_b1() -> bool {
                             w3.as_u8(),
                             w3s.as_u8(),
                             std::ptr::null(),
-                            (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                            (self.s.ex_act.ptr as *mut f32).wrapping_add(sh_il),
                             1,
-                            inter as i32,
+                            sh_il as i32,
                             dim as i32,
                         )?;
                     }
                 }
-                self.dev
-                    .swiglu_limit(self.s.ex_act.ptr as *mut f32, 1, inter as i32, cfg.swiglu_limit)?;
-                self.quant1(self.s.ex_act.ptr as *const f32, inter as i32)?;
+                self.dev.swiglu_limit(
+                    self.s.ex_act.ptr as *mut f32,
+                    1,
+                    sh_il as i32,
+                    cfg.swiglu_limit,
+                )?;
+                self.quant1(self.s.ex_act.ptr as *const f32, sh_il as i32)?;
+                // w2 is Cols-sharded: [dim, sh_il] locally, so the reduction is over
+                // this rank's slice and the output is a PARTIAL [dim] that the MoE
+                // all-reduce sums with the other ranks'.
                 self.dev.gemm_fp8_mx(
                     self.s.xq.as_u8(),
                     self.s.xsc.as_f32(),
@@ -2414,7 +2426,7 @@ fn fuse_b1() -> bool {
                     self.s.ex_out.ptr as *mut f32,
                     1,
                     dim as i32,
-                    inter as i32,
+                    sh_il as i32,
                 )?;
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
             }
