@@ -7347,3 +7347,21 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 4. **gateup 的 80% issue 停等不是权重读取延迟**——cp.async 修复不了；真正瓶颈可能是 LUT 的 smem 随机 gather 延迟（与"LUT 放 constant 慢 6.6x"发现一致）
 
 **方法论铁律（第三次确认）**：隔离探针只用于淘汰明显差的方案；正向收益必须 serve A/B 确认。
+
+### v11 崩溃事故复盘：部分提交的 FFI 错位（2026-09-12 08:00）
+
+**症状**：v11/v11sf 双双 cuda error 709 @ dsv41_hc_front_split，0 步，faults=4。
+
+**根因**：commit 006bd0c（docs 提交，git add -A）扫入了 quant-early-fold subagent 的**部分实施**：
+- dsv41_kernels.cu 的 kernel 侧改动（hc_mixes_tail_kernel 新增 xq4/xsc4 参数）被提交
+- 但 Rust 侧（device.rs 的 FFI 声明 + chain_dev.rs 的调用）还在本地工作树未提交
+- 远端构建 = 新 .cu（新参数签名）+ 旧 Rust（旧 FFI）→ **参数错位 → 垃圾指针 → 709**
+
+**修复**：106db01 补上完整的 Rust 侧（cargo check 0 errors）。
+
+**教训（第 4 次部分提交事故）**：
+1. **git add -A 在 subagent 并行工作时是危险的**——每个 docs 提交都可能扫入进行中的实施
+2. **FFI 边界（.cu ↔ Rust）是原子性单位**——kernel 侧和 Rust 侧必须同一 commit
+3. **预防措施**：以后 docs 提交用 `git add <specific-files>` 而非 -A；或者等 subagent 完成后再统一提交
+
+**这已是第 4 次类似事故**（前 3 次：a32-vec4 被 docs 扫入、ar-reduce-grid 被 docs 扫入、expert-pipeline 被 docs 扫入）——前 3 次幸运地自包含（kernel 侧改动不涉及 FFI 签名），这次终于踩雷。
