@@ -2928,7 +2928,7 @@ static const bool g_gemv_cpasync = [] {
 // bytes (the failure mode the P1 comments warn about).
 static const bool g_gemv_act_cpasync = [] {
     const char* e = getenv("DSV41_GEMV_ACT_CPASYNC");
-    if (e == nullptr) return false;   // A/B arm: default OFF
+    if (e == nullptr) return true;    // A/B verified ON: 6.44->6.24ms (-0.20ms, 2026-09-12)
     return atoi(e) != 0;
 }();
 
