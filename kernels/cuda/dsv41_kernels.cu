@@ -1704,16 +1704,12 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // of garbage. Count sixteen-byte units, and cover a k that is not a
             // multiple of sixteen with a byte tail.
             const int n16 = k >> 4;
-            // Stage the weight row with cp.async: the bytes travel global ->
-            // shared directly, so the ten in-flight sixteen-byte loads stop
-            // tying up ten uint4 register pairs per lane while they wait, and
-            // the row is consumed exactly as before.
-            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
-            for (int i = lane; i < n16; i += 32)
-                dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
-            dsv41_cp_commit();
-            dsv41_cp_wait_all();
+            // DIAGNOSTIC: replace cp.async with regular shared memory writes.
+            // If the prefetch works without cp.async, the root cause is the
+            // interaction between cp.async completion and early reads.
+            for (int i = lane; i < k; i += 32) row_s[i] = wr[i];
             __syncwarp();
+            // (no cp.async, no commit, no wait_all)
             float acc = 0.f;
             // SPLIT DIAGNOSTIC: prefetch ONLY ap (activation), read row_s
             // at the point of use. If this is correct, the issue is with
