@@ -5740,7 +5740,11 @@ down 向量化（nv8 循环：4 值 uint32 组替代标量尾巴）在 serve 级
 （9.38→9.42，在 ±0.05ms 噪声内）。可能原因：down 本身只 0.69ms，K=320 路径
 只占其中一部分；且 nvcc 可能对标量路径已做了部分向量化。
 
-代码保留（逐位一致、无风险）。
+~~代码保留（逐位一致、无风险）。~~ **⚠️ 本判定已被推翻（见文末「down-vec-320 定案」）**：
+nsys-v3 隔离显示该核 17.2 → 24.9µs（+45%），微基准复现并通过 `ptxas` 定位为
+**40 → 54 寄存器导致的 6 → 4 blocks/SM 占用率悬崖**。该改动**不是"逐位一致"**：
+它同时破坏了与未融合路径（`expert_gemv_fp4_batched_kernel` 的 vec==2 分支仍按 2 值
+步长走尾巴）的逐位一致契约。已回退。
 
 **会话最终基线：9.38ms / 106.6 tok/s（round 25/27 确认）。**
 
@@ -5757,7 +5761,7 @@ hc-sinkhorn-hide（否决）、gateup s_act CSE）全部中性或否决——**�
 
 **Stage B 最终清单更新**：
 - ✅ 已落地有收益：gateup+swiglu 融合（−0.51）、MIX_GATE=OFF（−0.33）、P1/P2（−0.27）
-- ❌ 中性：down-vec-320、AR store、gateup CSE
+- ❌ 中性：AR store、gateup CSE；**down-vec-320 实为 +0.31ms 回归（已回退，见文末定案）**
 - ❌ 否决：hc-sinkhorn-hide（窗口不够）、wo-quant-eliminate（生产者归属错）、idx_fuse（+0.33 回归）
 - ⏳ 仍有潜力：rmsnorm-q-gateup（fp8 激活直进 gateup，−0.15~0.25ms）——subagent 实施中
 - ⏳ 仍有潜力：hc_post_inplace 融入 pubred epilogue（−0.15ms）——persistent-p1-impl 中
@@ -5843,7 +5847,7 @@ hc_post 的 0.15ms 才会真正浮现）。
 
 1. **nsys median vs mean**：聚合口径必须用 **mean**（gemm_fp8_gemv med 7.9 vs mean 9.5µs，差 0.39ms/步）——之前表里用 median 低估了
 2. **AR 真实成本 = 0.66ms（不是 1.49ms）**：nsys-v3 报告的 1.49 是 host-barrier 口径的误用；按 0.66 换算与 serve 实测 9.57 差 0.7% ✓；但 AR 的 246 图节点/步的结构性论点仍成立
-3. **down-vec-320（01291b2）实测 +0.31ms 回归**（down_reduce 17.2→24.9µs，+45%，两次采集复现）——与 serve A/B "neutral" 矛盾，需要隔离验证（down-vec-revert 正在处理）
+3. **down-vec-320（01291b2）实测 +0.31ms 回归**（down_reduce 17.2→24.9µs，+45%，两次采集复现）——与 serve A/B "neutral" 矛盾。**已隔离定案并回退（见文末「down-vec-320 定案」）**
 4. **gateup CSE 只回收了预测的 12%**（−0.02 vs 预期 −0.15）——expert_gemv_fp4_batched **不是 smem-load-bound**，继续在 smem 侧找收益是白费
 5. **nsys-v3 后的生产基线 = 9.64ms（mean 口径）**，与 serve 实测 9.57 差 0.7% ✓
 
@@ -5853,7 +5857,7 @@ hc_post 的 0.15ms 才会真正浮现）。
 | gemm_fp8_gemv | **2.33** | 246 次 × 9.5µs（mean），指令级地板 |
 | gemv_bf16 | **1.10** | 49 次 × 22.4µs——gate 延迟受限（v2 可 −0.5ms） |
 | expert_gateup fused | 1.01 | 40 次 × 25.3µs，L1TEX |
-| expert_down_reduce | 1.00 | 40 次 × 24.9µs（+45% 回归！） |
+| expert_down_reduce | 1.00 | 40 次 × 24.9µs（+45% 回归，**已回退 → 目标 17.2**） |
 | hc_tail | 0.99 | 80 次 × 12.4µs |
 | AR v5 | **0.66** | 82 次 × ~8µs（NVLink 协议地板） |
 | hc_dots | 0.56 | 80 次 × 7.0µs |
@@ -5862,5 +5866,58 @@ hc_post 的 0.15ms 才会真正浮现）。
 
 **两项大杠杆**：
 1. **gate v2**（gemv_bf16 → gemv_bf16_v2，−0.5ms）——gate-v2-switch 正在实施
-2. **down-vec-320 revert**（+0.31ms 回收）——down-vec-revert 正在验证
+2. ~~**down-vec-320 revert**（+0.31ms 回收）——down-vec-revert 正在验证~~
+   ✅ **已完成**：nv8 循环已回退（见下「down-vec-320 定案」），预期回收 +0.31ms
 合计：9.38 → 8.6ms ≈ **116 tok/s**（如果两项都兑现）
+
+---
+
+### down-vec-320 定案：nv8 循环是**寄存器/占用率**回归，不是宽加载本身（2026-09-11）
+
+**结论：回退（已落地）。** nsys 的 +45% 是真的，serve A/B 的 "neutral" 是 ±0.3ms 单臂噪声下的伪中性
+（见 `docs/agent/dsv41-kernel-inventory-v3.md` §3 机时漂移警告）。
+
+**隔离方法**（本机无 nvcc/GPU ⇒ 全部在远端 `ubuntu@43.202.208.136`，nvcc 13.2，`-gencode arch=compute_103a,code=sm_103a --use_fast_math`，与 `build.sh` 同参）：
+把 `dsv41_experts_mxf4.cu` 原样 `#include` 进一个 micro-bench（kernel 在匿名 namespace 里，
+只能这样触达），跑**生产形状** `dim=7168, k=inter_local=320, slots=8, vec=2, 256线程×896 block`，
+用 `cudaOccupancyMaxActiveBlocksPerMultiprocessor` 直接读驻留块数。证据目录 `/tmp/dv320/`（远端）。
+
+| 版本 | regs/thread | blocks/SM | waves（896 blocks / 148 SMs） | per-call |
+|---|---|---|---|---|
+| `01291b2^`（标量尾巴） | **40** | **6** | **1.01** | **26.1µs** |
+| `01291b2`（nv8 uint32 循环） | **54** | **4** | **1.51** | **38.8µs（+49%）** |
+| 回退后（当前 tree） | **40** | 6 | 1.01 | **26.1µs**（逐位复原） |
+
+- **根因**：nv8 循环多出 `word` + 4×float2 LUT 值 + 4 个累加器 ⇒ 40 → 54 寄存器。sm_103a 每
+  SM 64K 寄存器、256 线程/block ⇒ 驻留块数 6 → 4，**刚好把 896-block 的 grid 从 1 个 wave
+  推到 1.5 个 wave**。微基准的 1.51×/1.49× 与 nsys 的 1.45× 三者吻合。
+- **"指令更少"是真的但无关**：宽的 `LDG.32` 省下的几条 `LDG.U8` 远小于丢掉的并行度——
+  这个核是**占用率/延迟受限**（不是 issue 也不是 smem）。40 寄存器是"单 wave"红线。
+- **附带发现（第二个必须回退的理由）**：01291b2 把 k=320 的**求和顺序**改了（8 值先进 4 个
+  累加器再合并），但对应的未融合路径 `expert_gemv_fp4_batched_kernel` 的 vec==2 分支**没有**
+  同步改，其尾巴仍按 2 值步长累加 ⇒ `DSV41_DOWN_FUSE=1/0` 两条路径**不再逐位一致**，
+  违反 `:1015-1029` 写死的数值契约。回退后契约复原（微基准 sum 与 `01291b2^` 逐位相同）。
+- **对后续优化的教训**：这个文件的 kernel 已经有两次"源码更少 ⇒ 实测更慢"（gateup CSE 只回收
+  12%、nv8 反慢 49%）。**改专家核前先量寄存器数与 blocks/SM**，别只看指令数。
+
+
+### 🎉 第 32 轮：gate v2 验证通过（8.92ms / 112.1 tok/s，−0.46ms）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| **gv2（gate v2 switch）** | **8.92ms** | **112.1** | 四段全对 | 0 |
+
+**gate v2 = 预期 −0.5ms 兑现了 92%**：MoE gate 的 bf16 gemv（n=384，延迟受限 3% 峰值带宽）
+dispatch 到已有的 `gemv_bf16_v2_kernel`（uint4 向量化 + K-split WPR=4，1536 warps 在飞）。
+17.2µs → 预估 3-5µs × 40 次/步。
+
+**会话累计：13.28 → 8.92ms（+48.9%），75.3 → 112.1 tok/s。**
+
+**关键认知**：gate 的 17.2µs 是**延迟/并发受限**（228GB/s = 3% 峰值），不是带宽受限——
+v2 核的 uint4 向量化（160→20 迭代）+ K-split（4 warp/行）一举解决了并发不足的问题。
+lm_head（n=16160）已在带宽地板（165MB/7.6TB/s = 21.8µs），不受此改动影响。
+
+**下一步（按 gateup-audit 的优先序）**：
+1. gateup MLP unroll（#pragma unroll 2→4 + uint2 宽加载，−0.10~0.25ms）——subagent 实施中
+2. down-vec-320 revert（+0.31ms 回收，nsys-v3 发现的回归）——subagent 验证中
+3. AR pubred 优化（自旋退避/PDL）——subagent 设计中

@@ -1143,49 +1143,20 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                     a2 = fmaf(sc, p2, a2);
                     a3 = fmaf(sc, p3, a3);
                 }
-                // 256-value chunks: 8 values per lane, loaded as ONE uint32 (four
-                // packed bytes = eight fp4 nibbles) and unpacked through the same
-                // s_lut2. 32 lanes * 8 = 256 values = 128 packed bytes per group,
-                // so the byte base advances by g << 7 and the lane's word sits at
-                // lane << 2. Four values per 32-value scale block, hence the scale
-                // lookup at j >> 5 still covers the whole lane iteration.
-                //
-                // THIS is the live path for the down direction: k = inter_local =
-                // padded(2304/8) = 320, so nv2 == 0 and the 512-value loop above
-                // never runs. Before this loop existed the entire per-slot dot fell
-                // into the 2-value scalar tail below (byte LDG.U8 + scalar
-                // e2m1_to_f, five 64-stride iterations per slot); 320 = 1 * 256 + 64
-                // is now one uint32-wide iteration plus a single tail iteration.
-                // The chunks covered here are exactly the 256-value blocks not
-                // already consumed by the 512-value loop: (nv2 << 1) <= nv8 and the
-                // difference is 0 or 1, so this loop adds at most one iteration for
-                // k >= 512 and does not change any k that is a multiple of 512.
-                const int nv8 = k >> 8;
-                for (int g = (nv2 << 1); g < nv8; ++g) {
-                    const int j = (g << 8) + (lane << 3);
-                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-                    const uint32_t word =
-                        *reinterpret_cast<const uint32_t*>(brow + (g << 7) + (lane << 2));
-                    float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
-                    const float2 t0 = s_lut2[word & 0xFFu];
-                    const float2 t1 = s_lut2[(word >> 8) & 0xFFu];
-                    const float2 t2 = s_lut2[(word >> 16) & 0xFFu];
-                    const float2 t3 = s_lut2[(word >> 24) & 0xFFu];
-                    p0 = fmaf(s_act[j + 0], t0.x, p0);
-                    p1 = fmaf(s_act[j + 1], t0.y, p1);
-                    p2 = fmaf(s_act[j + 2], t1.x, p2);
-                    p3 = fmaf(s_act[j + 3], t1.y, p3);
-                    p0 = fmaf(s_act[j + 4], t2.x, p0);
-                    p1 = fmaf(s_act[j + 5], t2.y, p1);
-                    p2 = fmaf(s_act[j + 6], t3.x, p2);
-                    p3 = fmaf(s_act[j + 7], t3.y, p3);
-                    a0 = fmaf(sc, p0, a0);
-                    a1 = fmaf(sc, p1, a1);
-                    a2 = fmaf(sc, p2, a2);
-                    a3 = fmaf(sc, p3, a3);
-                }
+                // DO NOT widen this tail into a uint32 / 8-value loop. Measured in
+                // isolation on sm_103a (nvcc 13.2, k=320, dim=7168, slots=8, 256
+                // threads/block): the uint32 form needs 54 regs/thread vs the 40
+                // below, which drops residency from 6 to 4 blocks/SM, so the
+                // 896-block grid goes from 1.01 to 1.51 waves and the kernel takes
+                // 38.8us instead of 26.1us (+49%) - the exact shape of the +45%
+                // nsys measured on this kernel after 01291b2. The LDG.U8s it saves
+                // are worth far less than the lost blocks: this kernel is
+                // occupancy-bound, and ~40 registers is what keeps it in one wave.
+                // (01291b2 also broke bit-parity with the unfused pair, whose
+                // vec==2 branch in expert_gemv_fp4_batched_kernel still sums a
+                // k=320 tail in 2-value steps; reverting restores it.)
                 acc = (a0 + a1) + (a2 + a3);
-                for (int j = (nv8 << 8) + lane * 2; j < k; j += 64) {
+                for (int j = (nv2 << 9) + lane * 2; j < k; j += 64) {
                     const uint8_t byte = brow[j >> 1];
                     const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                     const float2 t = s_lut2[byte];
