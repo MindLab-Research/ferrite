@@ -688,3 +688,18 @@ if (e != cudaSuccess) {
 **纪律**：任何**非 `cudaGetLastError()` 来源**的 CUDA 调用（`cudaEventRecord`、`cudaStreamWaitEvent`、
 `cudaFuncSetAttribute`、`cudaMalloc` …）在返回错误码前都必须先 `(void)cudaGetLastError()` 清 sticky，
 否则错误会泄漏给下一个 launcher 造成归因错位。
+
+## ring_win_fuse 全折叠设计（ringwin-fold-impl 产出，2026-09-12，待实施）
+
+**目标**：把 ring_win_fuse_ph（1.3µs × 40/步，三合一：placeholder + ring append + window idxs）整个折进 kv 生产者 rmsnorm_rope_kernel（1 block × 1024 线程），省 40 launch。
+
+**可行性**：
+- kv 定稿生产者是 rmsnorm_rope_kernel（NR_FUSE 路径，非 lin_rope_norm——那是 q 侧）
+- win=128 / hd=512 / index_topk=512 全部 ≤1024——三半都能塞进同一 1024 线程 block
+- 只折 append 半省不到 launch（idxs 仍需 launch）——必须全折
+- 位一致：append 公式原样（ring[pos%win*hd+gid]=kv[gid]）；idxs/placeholder 表达式原样搬；norm 归约树在 blockDim=1024 时逐位对齐（kernel 注释明写 load-bearing）
+
+**改动**：
+1. rmsnorm_rope_kernel 加可选尾参（ring/window/idxs/clen/index_topk，全 null = 旧行为）
+2. device.rs: supports_rmsnorm_rope_ring() + rmsnorm_rope_ring_on()
+3. chain_dev.rs: nr_fuse 命中时走新入口；!nr_fused 回退老路径
