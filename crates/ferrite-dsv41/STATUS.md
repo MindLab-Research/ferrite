@@ -5258,3 +5258,20 @@ lm_head 切分 = **−0.35ms**（v5 epoch 交换轮协议验证通过：每 rank
 **待归因**：all 臂 10.86 vs 第 9 轮 a32f 10.65 = +0.21ms——sparse 3 深 / indexer 两步 /
 expert float2 LUT 三者之一（或噪声 ±0.1）。第 13 轮的 nosparse 臂（DSV41_ATTN_PF=0）测
 sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
+
+### hc-merge（B'）已实现（待验证）
+
+单 kernel `hc_front_kernel`（`dsv41_kernels.cu:3187+`）取代 dots+tail 两 launch：
+- grid=(mix+1, rows)、1024 线程、160KB smem（两分支共用）
+- `m<mix`：全 32 warp 分摊 staging → warp0 按**原 lane 映射**算 dot → `__threadfence()` → `atomicAdd(&g_hc_ticket[r],1)`
+- `m==mix`：**先做** collapse+rmsnorm+fp8（T1 epilogue 整段前移，只依赖 x/w_norm/pre_collapse）
+  → thread0 自旋 `ticket==mix`（`__nanosleep(64)` 退避 + ~5s watchdog）→ `__syncthreads()+__threadfence()`
+  → tail body（ss/mixes/sigmoid/sinkhorn/comb 逐句照抄）→ ticket 自复位 0
+- **无任何提前 return**（grid 精确）；`DSV41_HC_MERGE=0` 回退两 launch 路径
+- 死锁安全：B300 驻留 ~296 块 ≫ 2×(mix+1)=50；当前唯一调用点 rows==1
+- ⚠️ 中途 abort（如 err 700）会留 ticket=mix → 下一次 launch 死锁——abort 已毒化 context，可接受
+
+### 第 13 轮（验证中）
+
+- def3：全部默认（含 lm_head 切分 ON）——预期 ~10.5ms
+- nsp：DSV41_ATTN_PF=0（sparse 2 深对照）——归因 all 臂 +0.21ms 回归是否来自 sparse 3 深
