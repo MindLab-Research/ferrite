@@ -1711,11 +1711,13 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
-            float acc = 0.f;
-            // Baseline: compiler-directed unroll. The 3ms manual-unroll path
-            // is blocked by a degeneration whose root cause survived 8
-            // elimination experiments (see STATUS.md); pragma unroll 4 keeps
-            // the register budget the compiler chooses and stays correct.
+            // NOTE: no `float acc = 0.f;` here! The outer acc (line ~1687)
+            // is the accumulator — declaring a new one inside this block
+            // SHADOWS it, the warp reduction after the block reads the outer
+            // zero, and every experiment since the prefetch series was testing
+            // garbage. This shadowing was the root cause of the "3ms speedup
+            // + degeneration" mystery (the speedup was the compiler dead-coding
+            // the warp reduction on a known-zero value).
 #pragma unroll 4
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);

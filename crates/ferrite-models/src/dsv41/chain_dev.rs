@@ -197,11 +197,18 @@ fn mix_gate_shared() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
 }
 
-/// DSV41_HEAD_SLICE=0 keeps the lm_head reading the full replicated vocabulary on
-/// every rank (the sliced path drops that read by `world`).
+/// DSV41_HEAD_SLICE=1 enables the vocabulary-sliced lm_head: each rank projects
+/// only its 1/world slice and one published u64 per rank picks the winner.
+///
+/// DEFAULT OFF (2026-09-11): the sliced cross-rank argmax kernel
+/// (`dsv41_argmax_sliced` / `argmax_pub_kernel`) was deleted by the nuclear
+/// diagnostic (6be01ea) and never reinstated, so the sliced path would run a
+/// wasted 1/world gemv and then fall back to the full head anyway. Turning the
+/// flag on would also hand a NULL packed buffer to a kernel that dereferences
+/// it — re-enable only after the kernel is restored.
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v == "1").unwrap_or(false))
 }
 
 fn build_eng_dev(
