@@ -1288,26 +1288,61 @@ impl<'a> DevChain<'a> {
             c.all_reduce_inplace(self.s.eng_rows.ptr as *mut std::ffi::c_void, fb(n_cols * ehd))?;
         }
         // kv = wkv(gathered): [(hc + 1) * dim] = [key(hc*dim), value(dim)]
-        self.dev.quant_fp8(
-            self.s.eng_rows.ptr as *const f32,
-            self.s.eng_xq.ptr as *mut u8,
-            self.s.eng_xsc.ptr as *mut f32,
-            1,
-            (n_cols * ehd) as i32,
-            32,
-            true,
-        )?;
-        self.dev.gemm_fp8_mx(
-            self.s.eng_xq.ptr as *const u8,
-            self.s.eng_xsc.ptr as *const f32,
-            wkv.ptr() as *const u8,
-            wsc.ptr() as *const u8,
-            std::ptr::null(),
-            self.s.eng_kv.ptr as *mut f32,
-            1,
-            ((hc + 1) * dim) as i32,
-            (n_cols * ehd) as i32,
-        )?;
+        //
+        // engram f32 direct read (the same lever as wo_b's DSV41_WOB_F32): the GEMV
+        // stages the RAW f32 `eng_rows` through `dsv41_gemm_fp8_mx_f32` instead of
+        // the `quant_fp8` pair, so the quantisation launch disappears (one per
+        // engram layer: L1 + L14 = 2/step). Only the data path changes - the grid
+        // stays the plain `g_gemv_warps` / ceil(n/warps) shape - so it avoids B1's
+        // 32-warp SM-utilisation loss. NOT bit-identical: it skips the
+        // quantise->dequantise round trip and is strictly MORE accurate, which is
+        // the right direction for a row that feeds the gated write-back.
+        //
+        // ⚠️ It is the POST-AR row that is read, never the pre-AR per-rank row: the
+        // collective above sums the ranks in f32 and this reads that sum directly.
+        // Emitting fp8 BEFORE the AR would be a different (and wrong) program, since
+        // fp8(Σ rows) != Σ fp8(row) - that is the quant-final-sweep warning, and it
+        // does not apply to the post-AR read.
+        //
+        // Gate = the symbol probe only (`supports_gemm_fp8_f32`): a stale .so has no
+        // entry, and a shape decline (Ok(false), e.g. k not a multiple of 32) falls
+        // through to the (quant_fp8, gemm_fp8_mx) pair below. Both are host-side and
+        // shape-deterministic, so the captured decode graph stays consistent across
+        // its replays (same contract as wo_b's f32 branch).
+        let mut eng_f32 = false;
+        if self.dev.supports_gemm_fp8_f32() {
+            eng_f32 = self.dev.gemm_fp8_mx_f32(
+                self.s.eng_rows.ptr as *const f32,
+                wkv.ptr() as *const u8,
+                wsc.ptr() as *const u8,
+                std::ptr::null(),
+                self.s.eng_kv.ptr as *mut f32,
+                ((hc + 1) * dim) as i32,
+                (n_cols * ehd) as i32,
+            )?;
+        }
+        if !eng_f32 {
+            self.dev.quant_fp8(
+                self.s.eng_rows.ptr as *const f32,
+                self.s.eng_xq.ptr as *mut u8,
+                self.s.eng_xsc.ptr as *mut f32,
+                1,
+                (n_cols * ehd) as i32,
+                32,
+                true,
+            )?;
+            self.dev.gemm_fp8_mx(
+                self.s.eng_xq.ptr as *const u8,
+                self.s.eng_xsc.ptr as *const f32,
+                wkv.ptr() as *const u8,
+                wsc.ptr() as *const u8,
+                std::ptr::null(),
+                self.s.eng_kv.ptr as *mut f32,
+                1,
+                ((hc + 1) * dim) as i32,
+                (n_cols * ehd) as i32,
+            )?;
+        }
         // gated write-back into h (in place)
         self.dev.engram_apply(
             self.s.h.ptr as *mut f32,
@@ -1345,6 +1380,15 @@ impl<'a> DevChain<'a> {
             // staging branch would apply the mix TWICE.
             return Ok(false);
         }
+        // Tail-split join, placed HERE rather than after the AR in `layer`.
+        // The fused epilogue below is the first consumer of the LATE half's
+        // `comb`/`post` (and its `hc_res` write to `s.h` clobbers memory the
+        // LATE half is still reading), so the side stream's `join_ev` must be
+        // waited on the main stream BEFORE this launch — otherwise the split's
+        // post-AR join in `layer` orders nothing and the graph has no edge
+        // between the side LATE node and this kernel. No-op when no split is
+        // armed (the `hc_split_armed` flag), or when the split is off.
+        self.dev.hc_tail_join()?;
         let (dim, hc) = (self.cfg.dim, self.cfg.hc_mult);
         c.all_reduce_inplace_hcpost(
             buf,
@@ -1807,19 +1851,27 @@ impl<'a> DevChain<'a> {
         // to one SM. The fallback chain is
         // (persist_mb -> persist -> two-launch -> hc_mixes), each step silent.
         let fused = if Self::hc_tail_split()
-            && !Self::hcpost_epi()
             && self.dev.supports_hc_tail_split()
             && !norm_w.is_null()
         {
             // Tail split (`DSV41_HC_TAIL_SPLIT`, default ON). The collapse +
             // rmsnorm + fp8 (EARLY) stays on the main stream — its consumer is the
             // projection group immediately below — while ss + sigmoid + sinkhorn +
-            // comb (LATE) runs on the side stream, joined in `layer` just before
-            // the hc_post that reads `comb`. `norm_w` non-null is required: with
-            // no collapse half there is nothing to keep on the critical path.
-            // `!hcpost_epi()` is required too: the AR fold (`DSV41_HCPOST_EPI=1`)
-            // consumes `comb`/`post` INSIDE attention()/moe_reduce(), i.e. before
-            // the join, so that dev-only mode keeps the single-launch tail.
+            // comb (LATE) runs on the side stream, joined just before the first
+            // consumer of `comb`. `norm_w` non-null is required: with no collapse
+            // half there is nothing to keep on the critical path.
+            //
+            // (2026-09-11) The `!hcpost_epi()` exclusion is GONE. It existed only
+            // because the AR fold consumes `comb`/`post` inside
+            // attention()/moe_reduce() — i.e. EARLIER than the join that used to
+            // be the only one (`layer`, after the AR). With the fold on, that join
+            // was posted too late: it ordered nothing. The fix is local — the
+            // AR fold now waits the split's `join_ev` itself, immediately before
+            // the fused AR (`ar_hc_post_fold`), which is exactly the point where
+            // the LATE half's outputs (`post`/`comb`, and `s.h` which LATE reads
+            // and the fold's `hc_res` write clobbers) stop being safe to touch.
+            // The post-AR join in `layer` stays for the un-folded path (a no-op
+            // once the early join has consumed the armed flag).
             self.dev.hc_front_split(
                 self.s.h.ptr as *const f32,
                 hc_fn,
@@ -1971,13 +2023,16 @@ fn fuse_b1() -> bool {
 /// Segment-C AR fold (P1 of the persistent roadmap): `hc_post_inplace` moved
 /// into the AR pubred epilogue that produced its `x` (see
 /// `ferrite_p2p_ar_v5_hcpost`). Saves the standalone launch at each of the two
-/// per-layer AR sites. DEFAULT OFF — the fold rewrites a bit-exactness-sensitive
-/// chain (the AR sum feeds the hc_post, and the epilogue lives in a different
-/// translation unit than `dsv41_hc_post_inplace_kernel`), so it must clear the
-/// same-binary A/B token-parity gate before it can be flipped on.
+/// per-layer AR sites. DEFAULT ON (2026-09-11) — round 31 measured it neutral
+/// (the −0.15ms of the removed launches is offset by the pubred grid's wider
+/// column walk), and it now coexists with the default-ON tail split because
+/// [`Self::ar_hc_post_fold`] waits the split's join event before its launch.
+/// The fold still rewrites a bit-exactness-sensitive chain (the AR sum feeds the
+/// hc_post, and the epilogue lives in a different translation unit than
+/// `dsv41_hc_post_inplace_kernel`), so `DSV41_HCPOST_EPI=0` remains the A/B arm.
 fn hcpost_epi() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HCPOST_EPI").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_HCPOST_EPI").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Stage-C persistent prototype gate (docs/agent/dsv41-persistent-arch.md §1):

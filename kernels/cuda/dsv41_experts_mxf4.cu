@@ -697,6 +697,82 @@ static const int g_expert_fp4_mode = [] {
     return atoi(e);                   // 0 scalar, 1 vectorised (both kept for bisection)
 }();
 
+// ---------------------------------------------------------------------------
+// PDL (programmatic dependent launch) for the DSV41 EXPERT chain.
+//
+// `dsv41_pdl_or_plain` (dsv41_kernels.cu, the attention projection chain) and
+// `pdl_or_plain` (ferrite_kernels.cu) are file-static in OTHER translation
+// units, so this one carries its own copy under the SAME `DSV41_PDL` gate
+// (DEFAULT ON; an explicit "0" rolls back). The semantics are identical to
+// those two, which are the verified-capture precedents:
+//
+//   * DSV41_PDL unset or != "0" -> the launch carries
+//     cudaLaunchAttributeProgrammaticStreamSerialization, so the consumer grid
+//     may be scheduled while the producer is still draining its tail. The
+//     producer needs no cudaTriggerProgrammaticLaunchCompletion(): the implicit
+//     trigger fires when its CTAs exit. The win is node-transition cost
+//     (grid rasterisation, CTA scheduling, register allocation, plus whatever
+//     prologue does NOT read the producer), NOT bandwidth.
+//   * DSV41_PDL=0 -> the same cudaLaunchKernelEx path WITHOUT the attribute: a
+//     plain launch, which records the identical node in a stream capture. This
+//     is the A/B arm and the rollback.
+//
+// CONTRACT (must hold for every kernel routed through this helper): the kernel
+// MUST call cudaGridDependencySynchronize() before reading ANY output written
+// by the PREVIOUS kernel on the stream, unconditionally inside
+// `#if __CUDA_ARCH__ >= 900`. The call is a documented no-op on a plain launch,
+// so it stays in place when DSV41_PDL=0.
+//
+// COVERED HERE: the two consumers of the routed-expert fp4 chain
+// (quant_fp4 -> gateup -> down_reduce):
+//   * expert_gemv_fp4_batched_kernel<ILV>  -- BOTH the batched gate/up and the
+//     batched down direction run through this one kernel (the staging source
+//     is what differs: `a`/`a_scale` for gate/up, `act` for down);
+//   * expert_gemv_fp4_down_reduce_kernel<STAGED> -- the fused down + reduce.
+// The sequential per-slot (`*_indirect`) entries are deliberately NOT covered:
+// they are the fallback arm nobody should silently start running under PDL.
+//
+// PRODUCER NOTE: the gate/up batched call's producer is quant_fp4_fused_kernel
+// (it wrote `a`/`a_scale`); the down call's and down_reduce's producer is the
+// gate/up launch (it wrote the swiglu'd activation `act`). `ids` and
+// `row_weight` are NOT outputs of the immediately preceding kernel -- the
+// router wrote them several kernels earlier, so they are already flushed by the
+// time this PDL-secondary grid is released, and reading them before the sync is
+// exactly the hoisted pointer work below.
+//
+// ARCH: the device sync is arch-gated, the host gate is not. This TU is built
+// for sm_100a/sm_103a only (build.sh), so the guard is always taken. On an
+// unsupported device the attribute makes cudaLaunchKernelEx fail loudly, so a
+// mismatch cannot be silent.
+static int dsv41_experts_pdl_enabled(void) {
+    // Read once: these launchers run 40x/step and a per-call getenv on the hot
+    // path is the slip every other gate in this file avoids.
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("DSV41_PDL");
+        cached = (e != nullptr && e[0] == '0') ? 0 : 1;   // explicit "0" rolls back
+    }
+    return cached;
+}
+
+// NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
+// through cudaLaunchKernelEx (its variadic template applies the kernel's
+// declared parameter types to the arguments, exactly like `<<<>>>` would).
+template <typename K, typename... Args>
+static inline cudaError_t dsv41_experts_pdl_or_plain(K kern, dim3 grid, dim3 block, size_t smem,
+                                                     cudaStream_t stream, Args... args) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid; cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem; cfg.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = 1;
+    if (dsv41_experts_pdl_enabled()) {
+        cfg.attrs = attrs; cfg.numAttrs = 1;
+    }
+    return cudaLaunchKernelEx(&cfg, kern, args...);
+}
+
 
 // ILV = the w1 (gate) / w3 (up) fp4 weights were stored INTERLEAVED at load
 // time (8-byte granule alternation, built by dsv41_interleave_gateup_fp4): the
@@ -746,6 +822,31 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     float2* s_lut2 = reinterpret_cast<float2*>(s_act + k);
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
+    // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
+    // have launched this grid with programmatic stream serialization, so the
+    // grid is already resident here and this call is what makes the PRODUCER's
+    // writes visible. The producer output this kernel consumes is the staged
+    // activation below -- quant_fp4's packed row (`a`/`a_scale`) for the
+    // gate/up direction, the gate/up launch's swiglu'd f32 slice (`act`) for
+    // the down direction -- so the sync MUST stay before the first staging load.
+    //
+    // Everything ABOVE is producer-INDEPENDENT and is deliberately spent in
+    // the producer's ramp-down instead of after it: the slot/pointer setup is
+    // pure argument arithmetic, `ids[slot]` and the four per-expert weight
+    // bases read buffers the ROUTER wrote (several kernels before the
+    // producer, hence already flushed when this grid is released), and the LUT
+    // below is built from device constants. The LUT build is the one piece of
+    // real prologue work here, which is why it is hoisted above the sync. It
+    // only touches this CTA's own smem, so ordering it before the sync is safe
+    // and the existing __syncthreads() still publishes it.
+    //
+    // No-op on a plain launch (DSV41_PDL=0).
+    if (threadIdx.x < 256)
+        s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
+                                          dsv41_e2m1_to_f((uint8_t)(threadIdx.x >> 4)));
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
     // Vectorized staging (audit #2): one uint4 = 16 bytes = 32 fp4 values =
     // exactly one scale block, so each thread-iteration is 1 LDG.128 + 1 scale
     // load instead of 20 serial LDG.8s. BIT-EXACT: the nibble order (low ->
@@ -785,9 +886,6 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         }
     }
     }
-    if (threadIdx.x < 256)
-        s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
-                                          dsv41_e2m1_to_f((uint8_t)(threadIdx.x >> 4)));
     __syncthreads();
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -1130,6 +1228,28 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
     const int nwarps = (blockDim.x + 31) >> 5;
+    // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
+    // have launched this grid with programmatic stream serialization, so the
+    // grid is already resident here and this call is what makes the PRODUCER's
+    // writes visible. The producer is the gate/up batched launch, which wrote
+    // the swiglu'd f32 activation `act_base`. The sync MUST stay before the
+    // first read of it -- the STAGED staging loop below, or the per-slot
+    // `act_base` reads inside the row loop for the non-staged fallback (both
+    // are after this point either way).
+    //
+    // Producer-INDEPENDENT work hoisted above the sync: the 256-entry e2m1 LUT
+    // (built from device constants, written to this CTA's own smem, published by
+    // the existing __syncthreads()) and the pitch/register setup. `ids` and
+    // `row_weight` are the router's output (several kernels before the producer,
+    // hence already flushed) and are not read until the row loop.
+    //
+    // No-op on a plain launch (DSV41_PDL=0).
+    if (threadIdx.x < 256)
+        s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
+                                          dsv41_e2m1_to_f((uint8_t)(threadIdx.x >> 4)));
+#if __CUDA_ARCH__ >= 900
+    cudaGridDependencySynchronize();
+#endif
     if (STAGED) {
         // ONE cooperative pass stages every slot's activation. `act_stride` is
         // the caller's slice pitch and only the first `k` floats of each slice
@@ -1142,9 +1262,6 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
             for (int j = threadIdx.x; j < k; j += blockDim.x) dst[j] = src[j];
         }
     }
-    if (threadIdx.x < 256)
-        s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
-                                          dsv41_e2m1_to_f((uint8_t)(threadIdx.x >> 4)));
     __syncthreads();
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -1533,16 +1650,25 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     const int n_total = fuse ? inter : 2 * inter;
     const size_t smem = (size_t)dim * sizeof(float) + 256 * sizeof(float2);
     dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
+    // PDL (see dsv41_experts_pdl_or_plain): the consumer's grid may start during
+    // quant_fp4's tail; the kernel's entry cudaGridDependencySynchronize() gates
+    // the activation staging. NOTE the full argument list: the cudaLaunchKernelEx
+    // path does not apply the kernel's default arguments, so every trailing slot
+    // is spelled out.
+    cudaError_t le;
     if (ilv)
-        expert_gemv_fp4_batched_kernel<true><<<grid, warps * 32, smem, stream>>>(
-            nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
-            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+        le = dsv41_experts_pdl_or_plain(
+            expert_gemv_fp4_batched_kernel<true>, grid, dim3(warps * 32), smem, stream, nullptr, 0,
+            a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0, w1_base,
+            w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
             g_expert_fp4_mode, fuse);
     else
-        expert_gemv_fp4_batched_kernel<false><<<grid, warps * 32, smem, stream>>>(
-            nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
-            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+        le = dsv41_experts_pdl_or_plain(
+            expert_gemv_fp4_batched_kernel<false>, grid, dim3(warps * 32), smem, stream, nullptr, 0,
+            a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0, w1_base,
+            w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
             g_expert_fp4_mode, fuse);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -1559,12 +1685,16 @@ extern "C" int dsv41_expert_down_fp4_batched(
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
     dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots);
-    expert_gemv_fp4_batched_kernel<false><<<grid, warps * 32,
-                                            (size_t)inter * sizeof(float) + 256 * sizeof(float2),
-                                            stream>>>(
-        act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
-        row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
-        w2s_base, w2s_stride, ids, g_expert_fp4_mode, /*fuse_swiglu=*/0);
+    // PDL (see dsv41_experts_pdl_or_plain): same consumer contract as the
+    // gate/up call above -- the producer is the gate/up launch that wrote the
+    // swiglu'd `act_base`, and the kernel's entry sync gates the staging.
+    cudaError_t le = dsv41_experts_pdl_or_plain(
+        expert_gemv_fp4_batched_kernel<false>, grid, dim3(warps * 32),
+        (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
+        nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
+        w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
+        g_expert_fp4_mode, /*fuse_swiglu=*/0);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
@@ -1618,14 +1748,21 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
     const size_t staged_bytes = (size_t)slots * (size_t)inter * sizeof(float) + lut_bytes;
     const size_t cap = (dev >= 0 && dev < 64) ? (size_t)dev_optin[dev] : (size_t)0;
     const dim3 grid((unsigned)((dim + warps - 1) / warps));
+    // PDL (see dsv41_experts_pdl_or_plain): consumer of the gate/up launch; the
+    // kernel's entry sync gates the activation staging (STAGED) and the per-slot
+    // reads of the non-staged fallback.
+    cudaError_t le;
     if (staged_bytes <= cap) {
-        expert_gemv_fp4_down_reduce_kernel<true><<<grid, warps * 32, staged_bytes, stream>>>(
+        le = dsv41_experts_pdl_or_plain(
+            expert_gemv_fp4_down_reduce_kernel<true>, grid, dim3(warps * 32), staged_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
             w2_stride, w2s_base, w2s_stride, ids, g_expert_fp4_mode);
     } else {
-        expert_gemv_fp4_down_reduce_kernel<false><<<grid, warps * 32, lut_bytes, stream>>>(
+        le = dsv41_experts_pdl_or_plain(
+            expert_gemv_fp4_down_reduce_kernel<false>, grid, dim3(warps * 32), lut_bytes, stream,
             act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
             w2_stride, w2s_base, w2s_stride, ids, g_expert_fp4_mode);
     }
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }

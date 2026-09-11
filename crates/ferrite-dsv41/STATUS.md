@@ -6031,6 +6031,17 @@ wo-b1-impl subagent 正在实施。
 
 **修正后的生产节点数 ≈ 1355/步**（1557 − 82[AR第3核] − 80[hc_post fold] − 40[gate v2]）
 
+⚠️ **2026-09-11 代码逐核复核更正**：上一行的 `− 80[hc_post fold]` **不成立**。`DSV41_HCPOST_EPI`
+（`chain_dev.rs` 的 `hcpost_epi()`）**env 默认 OFF**，且与**默认 ON** 的 `DSV41_HC_TAIL_SPLIT`
+**互斥**（`hc_mixes_auto` 的 split 分支显式要求 `!Self::hcpost_epi()`，见 persistent-arch.md §115）
+⇒ 默认配置里这个 fold **根本不跑**，`dsv41_hc_post_inplace` 仍是 2 site/层 = **80 节点/步**。
+再叠加 tail split 把 tail 核拆成 LATE(side)+EARLY(main) 两半（80 → **160**），默认配置的
+hc 家族 = dots 80 + tail 160 + post_inplace 80 = **320/步**（不是 240−80=160）。
+按当前代码逐核重数（默认 env、40 层 + compress/indexer/engram + head/tail）：**≈1156 kernel 节点/步**
+（主流 ≈916，侧流 ≈240；另计 fork/join event 节点 ≈320）。逐 family：gemm_fp8 250 · gemv_bf16 53 ·
+hc 320 · AR(store+pubred) 164 · quant(quant_fp4 40+quant_fp8 2) 42 · routed(gateup+down) 80 ·
+shared(swiglu_q+add) 80 · sparse_orope 40 · ring_win 40 · compress 16 · indexer 20 · engram 4 · head/tail 8。
+
 **关键认知**：
 1. **图节点 1355 × ~1.5µs ≈ 2.0ms 的固定开销**——比我之前估的 1.5ms 更大！
    Stage C persistent（1355 → ~120）的理论收益 = **−1.8ms**（不是 −1.2ms）

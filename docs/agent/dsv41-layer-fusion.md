@@ -198,6 +198,22 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     未碰 hc（:3700+）/sparse（:2839+）段；并行 agent 的 `xq_of_qr_valid` 修复在 `chain_dev.rs` 另一处，
     与本改动共存无冲突。
 
+- **✅ engram 的 wkv 投影直读 f32（复用 `supports_gemm_fp8_f32`，无新 gate）** ✓（2026-09-11）：
+  `engram_apply()` 的 `wkv` 投影原本是 `quant_fp8(eng_rows) → gemm_fp8_mx`，现在先试
+  `gemm_fp8_mx_f32(eng_rows, wkv, wsc, ..., n=(hc+1)*dim, k=n_cols*ehd)`——与 wo_b 同一个符号、
+  同一套回退契约，仅多一个调用点。省 **2 次/步** `quant_fp8` launch（L1 + L14 两个 engram 层），
+  并省掉 `eng_xq`/`eng_xsc` 的 4-bit 尾数损失（**更精确**，与 wob-f32 同论证）。
+  - **语义边界**：读的是 **AR 之后** 的 f32 行（`all_reduce_inplace` 在 f32 上求和后，本直读就是那次
+    求和的逐元素拷贝）。quant-final-sweep 的警告「engram 的 fp8 不能由 `engram_gather` 直出」针对的是
+    **AR 之前** 发射 fp8（`fp8(Σ rows) ≠ Σ fp8(row)`），与本改动的 POST-AR 读取是两回事，不冲突。
+  - **回退**：老 `.so`（无 `dsv41_gemm_fp8_mx_f32` 符号）或 shape decline（`Ok(false)`，如
+    `k = n_cols*ehd` 非 32 倍数）→ 自动落回 `(quant_fp8, gemm_fp8_mx)` 对。生产形状
+    `k = 24*256 = 6144`（32 倍数 ✓，`vec` 分支满足）。两个分支都是 host 侧 + shape 确定性的，
+    故捕获的 decode graph 跨 replay 一致。
+  - **无新 env gate**（`DSV41_WOB_F32` 只管 wo_b 调用点，不影响本路径）——回退靠符号探测/形状。
+  - **验证**：`cargo check -p ferrite-models` ✓（尚未上机 parity；`DSV41_WOB_F32` 的 A/B 轮次可顺带
+    覆盖 engram 四段文本）。
+
 - **✅ q rope / idx_q rope 已折进 GEMV epilogue（DSV41_ROPE_FUSE，默认 ON）** ✓（2026-09-11）：
   新的两个 C 符号 `dsv41_gemm_fp8_mx_rope`（单族，q rope）与 `dsv41_gemm_fp8_mx2_rope`
   （两族，wq_b 的 q rope + idx_wq_b 的 idx_q rope 各用各自 head 宽度 `rope_hd1/hd2`）把
