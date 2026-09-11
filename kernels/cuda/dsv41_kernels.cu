@@ -1606,10 +1606,6 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
-static const bool g_gemv_act_async = [] {
-    return getenv("DSV41_GEMV_ACT_ASYNC") != nullptr;
-}();
-
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
@@ -1669,21 +1665,15 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     if (vec == 4) {
         const int n16a = k >> 4;
-        // GATED (default OFF): issuing this as cp.async faulted with err 700
-        // (illegal access, surfacing as a sticky error on dsv41_route_topk) on its
-        // first A/B while the identical synchronous form passed moments earlier.
-        // The addresses look legal (`a` is a cudaMalloc'd DevBuf and every offset
-        // is a multiple of 16), so the cause is not yet identified - keep the
-        // known-good dependent-copy form as the default and leave the async
-        // variant behind DSV41_GEMV_ACT_ASYNC for a bisect.
-        if (g_gemv_act_async) {
-            for (int i = threadIdx.x; i < n16a; i += blockDim.x)
-                dsv41_cp_async16(s_a + (i << 4), a + (i << 4));
-        } else {
-            for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
-                *reinterpret_cast<uint4*>(s_a + (i << 4)) =
-                    *reinterpret_cast<const uint4*>(a + (i << 4));
-            }
+        // NOTE: this staging was tried as cp.async and faulted with err 700
+        // (illegal access, surfacing as a sticky error on dsv41_route_topk) while
+        // the identical synchronous form passes. The addresses look legal (a is a
+        // cudaMalloc'd DevBuf and every offset is a multiple of 16), so the cause
+        // is unidentified; the dependent-copy form is the correct baseline. Do not
+        // re-try without first reading the dbg-err700 findings.
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+            *reinterpret_cast<uint4*>(s_a + (i << 4)) =
+                *reinterpret_cast<const uint4*>(a + (i << 4));
         }
         for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
     }
