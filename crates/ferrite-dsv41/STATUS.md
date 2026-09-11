@@ -3803,3 +3803,69 @@ p90 27.25→21.96 ⇒ **37.8 → 47.4 tok/s**；**五段文本逐字相同（含
 1. **"更快 + 乱码" ⇒ 粒度/寻址**（第三次验证 ✓）：改动"每单位吃多少字节/换算基址"时，**计数单位、移位、尾循环起点是一组必须同改的耦合常量** ✓。
 2. **共享核 ≠ 可随意拆**：`hc_mixes` 的 `pre` 槽是**轮转**的（attn 用 pa、ffn 用 1）⇒ 融合前必须把"写哪个槽 / 读哪个槽"分别查清 ✓。
 3. **单块核的两重病**：① 只用一个 SM 的 L1 带宽 ✗；② 每 warp 在飞字节太少 ⇒ 延迟受限 ✗。**分开治**：分散治①，cp.async/宽加载治② —— 只做①不做②收益极小（实测 −0.63ms ✓），这次两者同做 ✓。
+
+---
+
+# 2026-09-11 ③：hc 前段融合落地 —— 19.96 → 16.85ms（59.3 tok/s），两项默认翻新
+
+**四臂判决（同会话、同二进制、同一台机器 ✓）**：
+
+| 臂 | 配置 | p50 | tok/s | 判定 |
+|---|---|---|---|---|
+| h0 | 参照（mode 3 默认） | 19.96ms | 50.1 | 基线 |
+| **h1** | **DSV41_HC_FRONT=1** | **16.85ms** | **59.3** | **−3.1ms ✓✓ 翻默认** |
+| m4 | DSV41_GEMV_FP8_MODE=4 | 19.24ms | 52.0 | −0.72ms ✓ 翻默认 |
+| w16 | DSV41_GEMV_FP8_WARPS=16 | 20.93ms | 47.8 | **更差 ✗ 否决**（默认仍 8） |
+
+四段文本（Paris / 静夜思 / 1+1=2 / 出师表）全部逐字正确 ✓，faults=0 ✓。
+h1 与 m4 作用于不同 kernel 族 ⇒ 可叠加（组合默认 ≈ 16.1ms ≈ 62 tok/s，单轮确认中）。
+
+## hc 前段融合的最终形态（默认 ON）
+
+```
+旧（每半层 2 个 1-block 核）：hc_mixes（1 block 读 1.5MB 权重，卡单 SM L1 ~50GB/s ⇒ ~39µs）
+                          + hc_collapse_norm（另 1 block）
+新（2 个核，但 dots 已分散 + cp.async 整行在飞）：
+  hc_mix_dots_kernel  grid=(mix, rows)、1 warp/block —— x 与权重行都 cp.async 进 smem（160KB）
+                      点积 = 单块核 float4 三累加器链逐句照抄 ⇒ 保序 ⇒ 逐位等价 ✓
+  hc_mixes_tail_kernel 1 block × 1024 线程 —— ss（仍按 mix*32=768 步长 ⇒ warp24..31 贡献精确 0，
+                      与 blockDim=768 分组一致 ✓）+ sigmoid + sinkhorn（逐句照抄 ✓）+ comb
+                      + collapse/rmsnorm（hc_collapse_norm 的体折入 ⇒ 少 1 launch + 少 1 次残差重读 ✓）
+```
+
+**实测收益**：~39µs/call × 122 次/步（~5.5ms）⇒ 尾核 ~4µs + dots ~2-3µs ⇒ **−3.1ms** ✓。
+（为什么此前 spread 只拿到 −0.63ms ✗：那是"只分散不加在飞字节"——每 warp 的 1.7GB/s 是
+**warp 级在飞字节限制**，分到 24 个 SM 也不变 ✗。这次分散 + cp.async 两者同做 ✓。）
+
+## ⛔ 卡死事故与修复（本轮最重要的坑）
+
+**症状**：`DSV41_HC_FRONT=1` 的 h1 臂 serve 起来后**无任何 step**（日志停在 "chain ready" ✓、
+mtime 3.5 分钟不动 ✓、bench 全部 `(failed)`）⇒ 首次 decode 卡死 ✗。
+
+**根因**：`cudaFuncSetAttribute(MaxDynamicSharedMemorySize)` 是 **per-context** 的，TP8 进程有
+**8 个 context（每 rank 一个）** ✗ —— 我用 `static bool` 只设一次 ⇒ **只有 1 个 rank** 拿到
+160KB 动态 smem 许可 ⇒ 其余 7 个 rank 的核带着未授予的 smem 启动 ⇒ `cp.async.wait_all`
+永不返回 ⇒ 死等 ✗✗。**代码库自己的 gemm_fp8 launcher 注释就写着这个坑**（"the attribute is
+per-context, and a TP8 process has one context per rank"）—— 没读到位 ✗。
+
+**修法**：每次调用都设（便宜 ✓），失败时先 `cudaGetLastError()` 清 sticky 标志再返回错误码 ✓。
+
+**诊断路径（可复用）**：日志 mtime 停滞 + `pgrep -x dsv41-run` 存活 + log 停在 "chain ready"
+⇒ 执行核自旋 ⇒ 优先查"哪类调用在 capture/dry-run 之外还依赖一次性初始化" ✓。
+
+## mode 4（激活块级暂存）与 warps=16 的判决
+
+- **mode 4 ✓（默认）**：激活对每个输出行都相同 ⇒ 8 个 warp 各自重读全部 k 字节 = **8× 冗余**
+  ✗ ⇒ 块级暂存一次（16B 宽加载 + 一次 `__syncthreads`）⇒ **−0.72ms** ✓。
+  ⚠️ **barrier 必须在 row 循环之外**：该循环按 warp 递增 ⇒ 循环内 barrier 会各类 warp 次数不同 ⇒ 死锁 ✗。
+- **warps=16 ✗**：每 block 16 行反而更慢（+0.97ms）⇒ block 数减半的摊薄收益 < 占用率损失 ✗ ⇒ 默认仍 8 ✓。
+
+## 本轮方法论沉淀
+
+1. **诊断卡死的顺序**：`stat` 日志 mtime → `pgrep -x`（禁 `-f`）→ 看停在哪一行 ⇒ 三步定位"执行期自旋"vs"加载期挂" ✓。
+2. **per-context/per-device 类 API 在 TP 进程里必须每次设**（或按设备循环设）—— 这是本工程第 6 个同型陷阱 ✓。
+3. **分散与在飞字节是两个独立的病**：单块核 = ①单 SM L1 上限 + ②每 warp 在飞字节不足；**只治其一收益极小**（spread 只 −0.63ms ✗），两者同治才有 −3.1ms ✓。
+4. **专家路径的本质（算账）**：每 token 每 rank 只读 topk=6 个专家 ⇒ 531MB/步 ⇒ DRAM 地板 ~70µs，
+   实测 ~3.6ms = **50× 地板** ⇒ **指令吞吐受限**（~4-5 条/值 × 3.9M 值/专家 × 240 ≈ 4.7G 条 ≈ 4ms ✓）；
+   mode 2 的 LUT 已把每值指令压到 ~2.5-3 条，接近 SIMT 地板 ⇒ **专家侧继续压指令的边际收益有限，
+   下一主攻 = fp8 gemv（5.5ms vs 0.04ms 地板 = 100× ✗）与段 A 融合** ✓。
