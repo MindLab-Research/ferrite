@@ -2221,12 +2221,18 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
     const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
-    static bool hc_attr = false;
-    if (!hc_attr) {
+    // Set it EVERY call. The attribute is per-context, and a TP8 process has one
+    // context per rank, so a process-wide guard leaves seven of the eight ranks
+    // without the 160 KB opt-in - the kernel then launches with shared memory it
+    // was not granted and the cp.async waits never retire. The existing gemm_fp8
+    // launcher carries the same warning for the same reason.
+    {
         cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
-        hc_attr = true;
+        if (e != cudaSuccess) {
+            (void)cudaGetLastError();   // clear the sticky flag before reporting
+            return (int)e;
+        }
     }
     hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), 32, smem, s>>>(x, hc_fn, rows, hc_dim,
                                                                              mix);
