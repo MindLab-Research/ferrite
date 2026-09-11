@@ -862,6 +862,49 @@ __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict
     }
 }
 
+// rmsnorm + apply_rope on one row, one launch (the kv chain's adjacent pair:
+// the norm writes the trailing rope section, the rope rotates it in place).
+// The reduction tree is rmsnorm_kernel's verbatim at the same blockDim, and the
+// rope half is elementwise - both are bit-identical to the two-launch sequence,
+// which is the only reason this is allowed to exist.
+__global__ void rmsnorm_rope_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                    float* __restrict__ out, const float* __restrict__ cos,
+                                    const float* __restrict__ sin, int n, int dim,
+                                    int rope_len, int half, const int* __restrict__ base, int mul,
+                                    int off, int step, int inverse, float eps) {
+    const int row_i = blockIdx.x;
+    if (row_i >= n) return;
+    const float* xr = x + (size_t)row_i * dim;
+    float* or_ = out + (size_t)row_i * dim;
+    // identical tree to rmsnorm_kernel (blockDim-sized cross-warp reduce)
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
+    float lane = ss;
+    for (int o = 16; o > 0; o >>= 1) lane += __shfl_down_sync(0xffffffffu, lane, o);
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = lane;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+        red[0] = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) or_[i] = xr[i] * inv * w[i];
+    if (rope_len <= 0) return;
+    __syncthreads();   // the rope pass reads what the norm pass wrote
+    const int t = (*base) * mul + off + row_i * step;
+    float* rr = or_ + (dim - rope_len);
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float c = cos[(size_t)t * half + i];
+        const float s = sin[(size_t)t * half + i] * (inverse ? -1.f : 1.f);
+        const float x0 = rr[2 * i], x1 = rr[2 * i + 1];
+        rr[2 * i] = x0 * c - x1 * s;
+        rr[2 * i + 1] = x0 * s + x1 * c;
+    }
+}
+
 // ------------------------------------------------------------------ hc / moe
 
 // hc_mixes: one projection per token of the flattened hc*dim stream, then the
@@ -2081,6 +2124,18 @@ extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, in
                                 cudaStream_t s) {
     apply_rope_kernel<<<rows, 128, 0, s>>>(x, cos, sin, rows, row_len, dim, half, base, mul, off, step,
                                            inverse);
+    return (int)cudaGetLastError();
+}
+
+// rmsnorm + rope on the same row, one launch. 1024 threads is load-bearing: the
+// reduction tree must match ferrite_rmsnorm's at blockDim 1024 bit for bit.
+extern "C" int dsv41_rmsnorm_rope(const float* x, const float* w, float* out, const float* cos,
+                                  const float* sin, int n, int dim, int rope_len, int half,
+                                  const int* base, int mul, int off, int step, int inverse,
+                                  float eps, cudaStream_t s) {
+    if (n <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    rmsnorm_rope_kernel<<<n, 1024, 0, s>>>(x, w, out, cos, sin, n, dim, rope_len, half, base, mul,
+                                          off, step, inverse, eps);
     return (int)cudaGetLastError();
 }
 

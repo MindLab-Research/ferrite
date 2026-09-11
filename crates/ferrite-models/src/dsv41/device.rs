@@ -94,6 +94,12 @@ struct Kernels {
         *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int, *const c_int, c_int, c_int,
         c_int, c_int, CuStream,
     ) -> c_int,
+    // rmsnorm + rope on one row in a single launch (the kv chain's adjacent
+    // pair). Optional: an older .so without it falls back to the two launches.
+    rmsnorm_rope: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int,
+        *const c_int, c_int, c_int, c_int, c_int, f32, CuStream,
+    ) -> c_int>,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
         c_int, c_int, c_int, c_int, f32, CuStream,
@@ -309,6 +315,7 @@ impl Device {
             compressor: km!(rt, "dsv41_compressor"),
             rope_precompute: km!(rt, "dsv41_rope_precompute"),
             apply_rope: km!(rt, "dsv41_apply_rope"),
+            rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
             moe_route: km!(rt, "dsv41_moe_route"),
             add_inplace: ko!(rt, "ferrite_add"),
@@ -912,6 +919,39 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_apply_rope")
+    }
+
+    /// rmsnorm + rope on one row in a single launch; `Ok(false)` when the
+    /// loaded .so predates the kernel, so the caller runs the two launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_rope(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        n: i32,
+        dim: i32,
+        rope_len: i32,
+        half: i32,
+        base: *const c_int,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        eps: f32,
+    ) -> Result<bool> {
+        let f = match self.kernels.rmsnorm_rope {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(x, w, out, cos, sin, n, dim, rope_len, half, base, mul, off, step, inverse as i32,
+              eps, self.stream)
+        };
+        self.kerr(rc, "dsv41_rmsnorm_rope")?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -179,6 +179,12 @@ fn moe_batch() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_NR_FUSE=0 reverts the kv chain to the two-launch rmsnorm + rope pair.
+fn nr_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
 fn build_eng_dev(
     dev: &Device,
     lay: &crate::dsv41::engram::EngramLayout,
@@ -1471,6 +1477,27 @@ fn fuse_b1() -> bool {
                 self.s.kv.ptr as *mut f32,
             )?;
         }
+        // The kv norm and its rope are an adjacent pair on the same row: one
+        // fused launch, bit-identical to the two (same reduction tree at
+        // blockDim 1024, elementwise rope). DSV41_NR_FUSE=0 reverts, and so
+        // does an .so without the symbol.
+        let nr_fused = nr_fuse()
+            && self.dev.rmsnorm_rope(
+                self.s.kv.ptr as *const f32,
+                ld.kv_norm.as_ref().unwrap().as_f32(),
+                self.s.kv.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                1,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
+                1,
+                false,
+                cfg.norm_eps,
+            )?;
+        if !nr_fused {
         self.dev.rmsnorm(
             self.s.kv.ptr as *const f32,
             ld.kv_norm.as_ref().unwrap().as_f32(),
@@ -1491,6 +1518,7 @@ fn fuse_b1() -> bool {
             1,
             false,
         )?;
+        }
 
         if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
             let kv = self.dl(self.s.kv.as_f32(), hd)?;
