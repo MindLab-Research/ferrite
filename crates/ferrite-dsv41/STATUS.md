@@ -4123,3 +4123,23 @@ ULP 红线（`epen`/`IM` 案例），**不可拆**。所以：
    的 host 开销实测约 2.9ms（关图步时 17.33ms vs 图内 14.42ms），会吃掉全部收益。
 
 ⇒ **结论：mega-kernel 应走 (2)**（核内 tile + 流水），这是唯一与整步图兼容的方向。
+
+## 两个真根因（2026-09-11 深夜）：比"ILP 有问题"精确得多
+
+首次部署（f4f62fa）的失败曾被我记成"ILP 破坏数值"，实测是**两个独立 bug 叠加**：
+
+1. **`gemv_bf16` 的激活 staging 没传 smem 大小**：同一次提交里加了
+   `extern __shared__ float s_x[]`，而 launcher 仍是 `<<<blocks, 256, 0, s>>>`
+   ⇒ `s_x` 指向零大小的共享分配，staging 写越界 ⇒ **faults=4、输出全空**
+   （第二次部署 c98b4ac 的症状；第一次的"文本退化"里也有它）。
+   修复 = 传 `k * sizeof(float)`，且 `k` 大到超过 48KB 时走动态 smem 属性。
+2. **`--use_fast_math` 下 4 路展开体可重排** ⇒ 每层 ~1 ULP × 40 层 × 3 个投影 ⇒ 模型退化。
+   修复 = 展开体的**每一次乘/加**都用 `__fmul_rn` / `__fadd_rn`
+   （fp8 gemv、gemv_bf16、混合核的 bf16 分支 **三处**）。
+
+**系统性排查（举一反三）**：扫过全部 `extern __shared__` 的 kernel 与其 launcher ——
+expert 的 sequential/batched（含 `+16*sizeof(float)` 的 LUT 槽）、indexer、hc 两个、route
+**都正确传了**，只有 gemv_bf16 漏了。
+
+⇒ **今后 kernel 改动的固定检查项**：① 用了 `extern __shared__` 就核对 launcher 的第三个参数；
+② 任何"多路展开/多累加器"的重写都在 `--use_fast_math` 下用 rn 内建钉住。
