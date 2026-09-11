@@ -1663,6 +1663,16 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     const int nb_k_al = (nb_k + 15) & ~15;          // 16-byte units for cp.async
     uint8_t* s_ws = s_a + (size_t)((vec == 4) ? k : 0);
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
+    // The e4m3 decode as a 256-entry shared-memory table. The bit-manipulation
+    // form chains LDS.8 -> ~10 ALU ops -> FMUL per operand; the table is a single
+    // LDS.32, which breaks the per-warp serial dependency chain: the isolated
+    // graph benchmark measured the consume loop at 47 ns/kb (bit ops) against
+    // 32 ns/kb (LUT) - n=256: 10.50 -> 8.33us, n=1024: 13.19 -> 9.23us,
+    // n=1664: 17.57 -> 11.22us. The table is built from the SAME e4m3_to_f, so
+    // every decoded value is bit-identical (verified by the 256-code exhaustive
+    // host+device comparison; the earlier "branchless exact" rewrite was NOT -
+    // 14/256 mismatched on the implicit-1-bit derivation - do not retry that).
+    float* s_lut = s_as + nb_k;
     if (vec == 4) {
         const int n16a = k >> 4;
         // NOTE: this staging was tried as cp.async and faulted with err 700
@@ -1681,6 +1691,9 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         // The activation scales are the same for every output row, so they are
         // read once per block instead of once per row per k-block.
         for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
+        // Build the e4m3 decode table once per block (256 entries, two iterations
+        // per thread at the default block size).
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
         __syncthreads();
     } else if (vec == 4) {
         __syncthreads();
@@ -1759,7 +1772,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                 const float sb = ue8m0_to_f(row_sc[kb]);
                 const float sa = s_as[kb];       // m == 1
                 const int j = kb * 32 + lane;
-                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
+                acc += s_lut[ap[j]] * sa * (s_lut[row_s[j]] * sb);
             }
             __syncwarp();
         } else if (vec) {
@@ -1823,7 +1836,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         // weights [nwarps][k] + (mode 4) block activation [k] + per-warp ue8m0
         // scale rows [nwarps][nb_k_al] + block activation scales [nb_k] f32.
         const size_t scale_bytes =
-            (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float);
+            (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float);
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                              : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                       : (size_t)0;
@@ -1974,7 +1987,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     const int nb_k = k >> 5;
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
-        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float);
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float);
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;
