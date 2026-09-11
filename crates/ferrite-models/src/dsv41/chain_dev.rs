@@ -1062,7 +1062,7 @@ impl<'a> DevChain<'a> {
                 rank as i32,
                 c.staging_dev() as *const f32,
                 c.bytes as i64,
-                (c.bytes - 8) as i64,
+                (c.bytes - 16) as i64,   // 8-byte key + 4-byte flag, clear of the AR payload
             )?;
             if !ok {
                 // The loaded .so has no cross-rank argmax. A slice-local argmax

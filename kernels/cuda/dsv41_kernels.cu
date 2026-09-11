@@ -2066,23 +2066,40 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
 // exactly the full-vocabulary argmax's.
 __global__ void argmax_pub_kernel(const unsigned long long* __restrict__ peer_slots, int world,
                                   int rank, const unsigned long long* __restrict__ packed,
-                                  long slot_f, long off) {
+                                  long slot_f, long off, const int* __restrict__ pos_ctr) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     const unsigned long long pk = packed[0];
+    // The step counter is the round: every rank is at the same pos (lockstep),
+    // and pos_ctr is only advanced by the final kernel, so both sides read the
+    // same value.
+    const unsigned round = (pos_ctr != nullptr) ? (unsigned)*pos_ctr : 0u;
     for (int p = 0; p < world; ++p) {
-        unsigned long long* dst = reinterpret_cast<unsigned long long*>(
-            reinterpret_cast<char*>(peer_slots[p]) + (size_t)rank * (size_t)slot_f + off);
-        *dst = pk;
+        char* base =
+            reinterpret_cast<char*>(peer_slots[p]) + (size_t)rank * (size_t)slot_f + off;
+        *reinterpret_cast<unsigned long long*>(base) = pk;
+        __threadfence_system();
+        *reinterpret_cast<volatile unsigned*>(base + 8) = round;   // flag written LAST
+        __threadfence_system();
     }
 }
 
 __global__ void argmax_final_kernel(const float* __restrict__ staging, int world, long slot_f,
-                                    long off, int* __restrict__ out, int* __restrict__ pos_ctr) {
+                                    long off, int* __restrict__ out,
+                                    int* __restrict__ pos_ctr) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    // Wait for every peer's publish before reading: without this the final can
+    // read a slot the peer has not written yet (they are independent kernels on
+    // independent streams of different contexts).
+    const unsigned round = (pos_ctr != nullptr) ? (unsigned)*pos_ctr : 0u;
     unsigned long long best = 0ull;
     for (int p = 0; p < world; ++p) {
-        const unsigned long long pk = *reinterpret_cast<const unsigned long long*>(
-            reinterpret_cast<const char*>(staging) + (size_t)p * (size_t)slot_f + off);
+        const char* base =
+            reinterpret_cast<const char*>(staging) + (size_t)p * (size_t)slot_f + off;
+        const volatile unsigned* fl = reinterpret_cast<const volatile unsigned*>(base + 8);
+        while (*fl < round) {
+        }
+        __threadfence_system();
+        const unsigned long long pk = *reinterpret_cast<const unsigned long long*>(base);
         if (pk > best) best = pk;
     }
     *out = (int)(0xFFFFFFFFu - (unsigned)(best & 0xFFFFFFFFu));
@@ -2106,11 +2123,13 @@ extern "C" int dsv41_argmax_sliced(const float* v, int n, int idx_off, int* out,
                                    const unsigned long long* peer_slots, int world, int rank,
                                    const float* staging, long slot_bytes, long off,
                                    cudaStream_t s) {
-    if (n <= 0 || world <= 0 || off + 8 > slot_bytes) return (int)cudaErrorInvalidValue;
+    // off must leave room for the 8-byte packed key plus the 4-byte publish flag,
+    // and sit clear of the all-reduce payload.
+    if (n <= 0 || world <= 0 || off + 12 > slot_bytes) return (int)cudaErrorInvalidValue;
     argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, nullptr, idx_off, packed);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    argmax_pub_kernel<<<1, 1, 0, s>>>(peer_slots, world, rank, packed, slot_bytes, off);
+    argmax_pub_kernel<<<1, 1, 0, s>>>(peer_slots, world, rank, packed, slot_bytes, off, pos_ctr);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     argmax_final_kernel<<<1, 1, 0, s>>>(staging, world, slot_bytes, off, out, pos_ctr);
