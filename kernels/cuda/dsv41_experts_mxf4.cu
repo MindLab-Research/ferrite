@@ -686,6 +686,17 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
 // row_weight is PER SLOT here: it is read at row_weight[slot * rw_stride],
 // which is the same scalar the sequential caller passed as `route_w + slot`
 // (whose kernel then read row_weight[0]).
+// Four bytes (eight fp4 values) per lane per iteration instead of one byte, behind
+// DSV41_EXPERT_FP4_VEC. The mx block scale covers 32 values, so eight fp4 always sit
+// inside one scale block: lanes 0-3 share block 0, lanes 4-7 block 1, which is what
+// (lane >> 2) selects. The per-element product keeps its original shape; only the
+// order in which a lane visits its elements changes.
+static const bool g_expert_fp4_vec = [] {
+    const char* e = getenv("DSV41_EXPERT_FP4_VEC");
+    if (e == nullptr) return false;   // opt-in until the text check passes
+    return e[0] != '0';
+}();
+
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
                                                const uint8_t* __restrict__ a,
                                                const float* __restrict__ a_scale,
@@ -696,7 +707,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long b_stride, const uint8_t* __restrict__ bs_base,
                                                long bs_stride, const uint8_t* __restrict__ bh_base,
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
-                                               long bhs_stride, const int* __restrict__ ids) {
+                                               long bhs_stride, const int* __restrict__ ids,
+                                               int vec) {
     const int slot = (int)blockIdx.y;
     const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
     const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
@@ -736,13 +748,38 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         const uint8_t* srow = bb_s + (size_t)r * ksc;
 
         float acc = 0.f;
-        for (int j = lane * 2; j < k; j += 64) {
-            const uint8_t byte = brow[j >> 1];
-            const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-            const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
-            const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-            acc += s_act[j] * w0;
-            acc += s_act[j + 1] * w1;
+        if (vec) {
+            // 32 lanes * 8 values = 256 values per iteration, four scale blocks.
+            const int nv = k >> 8;              // full 256-value iterations
+            const int off = lane << 2;          // byte offset of this lane's uint32
+            for (int g = 0; g < nv; ++g) {
+                const int j = (g << 8) + (lane << 3);
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 6) + off);
+                acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
+                acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
+                acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
+                acc += s_act[j + 3] * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
+                acc += s_act[j + 4] * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
+                acc += s_act[j + 5] * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
+                acc += s_act[j + 6] * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
+                acc += s_act[j + 7] * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
+            }
+            for (int j = (nv << 8) + lane * 2; j < k; j += 64) {
+                const uint8_t byte = brow[j >> 1];
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                acc += s_act[j] * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
+                acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
+            }
+        } else {
+            for (int j = lane * 2; j < k; j += 64) {
+                const uint8_t byte = brow[j >> 1];
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+                const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+                acc += s_act[j] * w0;
+                acc += s_act[j + 1] * w1;
+            }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         if (lane == 0) {
@@ -948,7 +985,8 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
     expert_gemv_fp4_batched_kernel<<<grid, warps * 32, (size_t)dim * sizeof(float), stream>>>(
         nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
-        w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids);
+        w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
+        g_expert_fp4_vec ? 1 : 0);
     return (int)cudaGetLastError();
 }
 
@@ -968,7 +1006,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
     expert_gemv_fp4_batched_kernel<<<grid, warps * 32, (size_t)inter * sizeof(float), stream>>>(
         act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
         row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
-        w2s_base, w2s_stride, ids);
+        w2s_base, w2s_stride, ids, g_expert_fp4_vec ? 1 : 0);
     return (int)cudaGetLastError();
 }
 
