@@ -5242,3 +5242,19 @@ SACT padding（每 16 float 插 1 空位破 16 路 bank conflict）**实测 +0.2
 1. **GLM+DSV41 架构统一**（arch-unify 报告已产出）：7 项重复逻辑清单 + 分层蓝图（ferrite-types ← ferrite-kernel{devrt} ← ferrite-exec ← ferrite-models{层描述} ← serve ← http）；fast wins = build_id 门禁合并、argmax 共享、graph 捕获统一 Relaxed。
 2. **KV cache 管理 + 前缀命中**（kvcache-prefix 报告已产出）：现状 = per-seq 连续大 buffer 无前缀复用；方案 = page 化 + 前缀哈希。
 3. **1M 上下文 prefill**（prefill-1m 调研中）。
+
+### ✅ 第 12 轮定案：lm_head 切分翻默认（10.51ms / 95.1 tok/s）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| all（expert SACT-drop + sparse 3 深 + indexer 两步） | 10.86ms | 92.1 | 四段全对 | 0 |
+| **hsd（+DSV41_HEAD_SLICE=1）** | **10.51ms** | **95.1** | 四段全对 | 0 |
+
+lm_head 切分 = **−0.35ms**（v5 epoch 交换轮协议验证通过：每 rank 算 1/8 词表 48µs + 单线程
+交换核按 parity 槽写 key/stamp/poll/max）。已翻默认 ON。
+
+**会话累计：13.28 → 10.51ms（+26.4%），75.3 → 95.1 tok/s。**
+
+**待归因**：all 臂 10.86 vs 第 9 轮 a32f 10.65 = +0.21ms——sparse 3 深 / indexer 两步 /
+expert float2 LUT 三者之一（或噪声 ±0.1）。第 13 轮的 nosparse 臂（DSV41_ATTN_PF=0）测
+sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
