@@ -4507,3 +4507,18 @@ clean+pragma-unroll 的 13.33ms **快 3.1ms**，但**模型退化**。
 - `#pragma unroll` = 告诉 nvcc "可以展开"，**由编译器在寄存器预算内选择展开因子**。
 - 手写展开 = **强制**展开因子与变量生命周期，可能越过占用率边界 → cp.async 时序变化 → 退化。
 - 因此：**性能改动应优先用 pragma，而不是重写循环结构**。
+
+### #pragma unroll 的适用范围（2026-09-11 11:50）
+
+| kernel | 循环 | 结果 |
+|---|---|---|
+| fp8 gemv（kb 消费） | `#pragma unroll 4` | **−0.17ms** ✓（微基准 20.6→19.5µs） |
+| expert fp4（g 组） | `#pragma unroll 2` | 中性（13.34） |
+| hc collapse（c 列） | `#pragma unroll 4` | 中性偏正（13.30） |
+| **gemv_bf16 / gemv_f32（c）** | `#pragma unroll 4` | **+0.09ms 负面** ✗ → **物理回退** |
+
+**结论**：`#pragma unroll` **不是万能的** —— 其效果取决于该 kernel 的寄存器/占用率剖面。
+fp8 gemv 受益（消费循环长、每元素 2 次 smem 读），gemv_bf16（每行一个 warp、循环简单、
+首尾还有 warp 归约）反而变慢。
+**必须逐 kernel A/B 验证，不能批量应用** —— 这一点与本会话"gate ≠ 回退"的教训同源：
+**编译器的行为只能实测，不能推断**。
