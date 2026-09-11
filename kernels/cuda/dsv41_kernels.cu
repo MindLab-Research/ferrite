@@ -548,9 +548,9 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
     // barrier inside the normalisation.
     __syncthreads();
     if (threadIdx.x == 0) {
-        float* rmax = row_max;
-        float* rsum = row_sum;
-        float* csum = col_sum;
+        // locals: only this thread uses them, so shared memory (and the declaration
+        // it needed) is gone entirely
+        float rmax[16], rsum[16], csum[16];
         const int hh = hc * hc;
         for (int j = 0; j < hc; j++) {
             float mx = -INFINITY;
