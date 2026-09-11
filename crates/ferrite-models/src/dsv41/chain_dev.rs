@@ -3420,7 +3420,7 @@ fn hc_tail_split() -> bool {
             self.lin_f32_on(self.s.xn.ptr as *const f32, dim as i32, wg, hd as i32, cache.scp.ptr as *mut f32, s)?;
         } else {
             // ratio == 1: no gate; the pooling reduces to the plain projection
-            self.dev.zero_on(cache.scp, s)?;
+            self.dev.zero_on(&cache.scp, s)?;
         }
         self.dev.compressor_pool_on(
             cache.kvp.as_f32(),

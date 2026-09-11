@@ -364,6 +364,12 @@ pub struct DevRuntime {
     /// because the dual chain's two halves are issued from Rust.
     fork2_ev: *mut c_void,
     join2_ev: *mut c_void,
+    /// Fork/join events for the compressor side stream (`DSV41_COMPRESS_SIDE`)
+    /// — same contract as `fork2_ev`/`join2_ev` (disable-timing so a whole-step
+    /// capture may contain them), recorded by the MODEL because the compressor's
+    /// four launches are issued from Rust.
+    fork3_ev: *mut c_void,
+    join3_ev: *mut c_void,
     handle: *mut c_void,
     /// the kernel `.so` — model crates resolve their own symbols in it
     kernel_handle: *mut c_void,

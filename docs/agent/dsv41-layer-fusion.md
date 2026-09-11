@@ -395,6 +395,39 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   - ⚠️ **收益预期须修正** ✗：题面 `−0.88ms(40×22µs)` 假设共享链 22µs 可完全隐藏；实际可隐藏
     部分 ≤ min(routed, shared) 且受 SM/带宽争抢影响。上机后须用 `DSV41_MOE_DUAL=0/1` 同会话背靠背
     单轮实测（`scripts/dsv41_serve_ab.sh`），并同时验证 `opcheck`/faults 与文本。
+- **compress 侧流 `DSV41_COMPRESS_SIDE`（默认 ON，2026-09-11 实现，待上机实测）** ✓：
+  kv-source 层（2/8/14/20）的 4 个 compress launch（`lin_f32` kvp/scp + `compressor_pool` +
+  `compress_commit` ≈ 30µs/层）与 q 链、kv 链都零依赖，整段挪到**第三条 side stream**
+  （`side_stream3`）与主流并行。实现要点：
+  - **必须新开 `side_stream3`，不能复用 `side_stream2`** ✓：kv 链与 compress 的**时间窗完全重叠**
+    （都在 `lin2` 之后、各自消费者之前），共用一条会把 10.6µs 的 kv 链串到 30µs 的 compress 后面
+    ⇒ 40.6µs 远超 ~14µs 的窗口。第三条流默认优先级（compress 是填充，不能抢占 q 链）。
+  - **fork 点 = `lin2` 之后、与 `dual_chain_fork` 同点**（`chain_dev.rs::attention()` 内两条
+    fork 相邻）：此刻 `s.xn` 已定稿（pre-attention rmsnorm 写入），compress 只读它 + `pos_ctr` +
+    本层 state。
+  - ⚠️ **join 点不是 sparse_attn 前，而是 indexer 之前** ✗（题面给的是 `sparse_attn:2822`）：
+    indexer 的 key 发布读**本层 `latent`**（`compressor_pool` 写，`chain_dev.rs::indexer` 里
+    `lin_bf16(self.layers[layer].latent, ...)`）以及 **compress 推进的 `clen` 设备计数器**
+    （`index_k_publish`/`apply_rope` 的 base=`clen+layer`）⇒ 对 2/8/14/20 这些既是 kv_source
+    又是 index_source 的层，join 必须早于 indexer。最终落在 **`window_idxs` 之后、indexer 之前**
+    （`window_idxs` 只读 `pos_ctr`，可与 compress 并行）——这是"仍早于首个消费者"的最晚点。
+    非 index-source 的 kv layer（本模型没有）才可能推到 sparse_attn 前。
+  - **缓冲不相交** ✓：compress 只写本层私有 `kvp`/`scp`/`state_kv`/`state_score`/`latent`/`out_rows`
+    + ring 的**压缩行**（`window + clen`）+ `clen[layer]`；q 链是 `qr`/`q`/`xq`/`xsc`，kv 链是 `s.kv`，
+    `ring_win_fuse`/`ring_append` 只碰 ring 的**窗口行**（`pos % win`）与 `idxs[0,win)` ⇒ 零冲突，
+    因此三流并发仍**位级一致**（kernel 与操作数不变，只是发射流不同）。
+  - `devrt.rs`：加 `side_stream3` + `fork3_ev`/`join3_ev`（`cudaEventDisableTiming`，图捕获内合法）
+    + `zero_at_on`；`device.rs`：`supports_compress_side` / `side_stream3` / `compress_side_fork` /
+    `compress_side_join`，以及 `gemv_f32_on` / `compressor_pool_on` / `compress_commit_on` /
+    `zero_on`（原方法委托，调用点不变）；`chain_dev.rs`：`compress_side()` 门 + `lin_f32_on` +
+    `compress_on(layer, pos, stream)`（`compress()` 变成传主流派的薄包装）。
+  - 静默回退门：`cublas_m1()`（cuBLAS-M1 只有一个 handle、绑定主流派，不能发侧流；默认 OFF）、
+    `supports_compress_side()`、以及本层 `comp_wkv`/`comp_norm` 是否存在（与 `compress()` 自身的
+    early-return 同谓词）。
+  - **收益预期** ⚠️：compress ≈30µs > 窗口 ~14µs（q 链 13.5µs + `ring_win_fuse`/`window_idxs` ~1µs），
+    只能藏住窗口那部分 ⇒ 预期 **−0.05~0.06ms/步**（4 层 × ~14µs），不是 30µs×4。
+  - 开关：`DSV41_COMPRESS_SIDE=0` 回退串行（同二进制 A/B）。上机须同会话背靠背单轮实测，并
+    同时验证 `opcheck`/faults 与文本。
 
 ---
 
