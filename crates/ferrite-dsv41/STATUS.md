@@ -5043,3 +5043,44 @@ lm_head（129280 行 × 5120，298µs）**，而 1/8 切片只要 48µs（6.2x�
 每层两次 hc_front 的输入 h 不同（attention 后 / MoE 后各变一次），系数必须重算；
 跨层的"下载-上传往返"早已消除（`chain_dev.rs:1208-1213`，全 device-resident）；
 "错位复用"其实已经实现——collapse 用的正是上一层 slot（`1238-1246` / `1360-1361`）。
+
+## 2026-09-11 傍晚：shared expert 的 TP 切分（最大发现的不均衡）
+
+### 发现
+
+`fuse-census` 普查时读出：**shared expert 只在 rank0 上计算，且在 MoE 的 all-reduce 之前**
+（`chain_dev.rs:2077` 的 `shared_rank = comm.rank == 0`）。而它的权重 spec 是
+`Shard::Replicated`（`weights.rs:232-246` / `:321-324`）——**每个 rank 都装了全量，却只有 rank0 用它**。
+
+nsys 的计数口径是"8 个 rank 求和后再除以步数"，所以 `gemv_bf16_fp8x2 5 次/步` 实际是
+**rank0 上 40 次/步**（= 每层一次），55µs/次 ⇒ **rank0 每步多做 ~2.2ms**，而 rank1-7
+只跑 ~11.7µs 的 bf16 gate 后在 AR 上空等。
+
+### 改法（无需改内核）
+
+把 shared expert 改成与 routed expert 同构的 TP 切分：
+- `weights.rs`：w1/w3 从 `Replicated` → `Shard::Rows`（按输出行 inter 切），
+  w2 从 `Replicated` → `Shard::Cols`（按**归约列** inter 切）。`local_shape` 已有这两条规则，
+  加载器的 DMA 也已支持列切片（cudaMemcpy2D），**所以内核与 launcher 都不用动**。
+- `chain_dev.rs`：`shared_rank = true`（所有 rank 都算），`sh_il = inter / world`（=288@TP8），
+  gemv 的 n/k 用 `sh_il`；每个 rank 的 w2 输出是 **partial**，`add_inplace(o, ex_out)` 后
+  由既有的 `moe_reduce()` all-reduce 求和 → 与 routed expert 完全同构。
+- 数值：shared expert 的求和结合律变化（8 个 partial 相加 vs 一次算完），属末位差异；
+  路由分数不变（混合 launch 的输出与分开 launch 逐位一致，代码注释已声明）。
+
+**副产品**：shared expert 的显存从"每 rank 全量"降到 1/8（此前 8 份冗余）。
+
+### 状态
+
+代码已提交（`7be735d`），**A/B 待验证**（见下方"验证矩阵"）。
+
+### 同类机会（按已量化的收益排序，供后续）
+
+| 项 | 次/步 | µs/次 | ms/步 | 机制 | 状态 |
+|---|---|---|---|---|---|
+| shared expert 不均衡 | — | — | **~2.2（rank0 串行）** | 已改 TP 切分 | 待 A/B |
+| lm_head 全词表**未切分** | 1 | 298 | 0.30 | 8 个 rank 各算全词表（8× 冗余权重读）。**曾实现切分**（`argmax_sliced`），但 `argmax_pub` 写 peer staging 的 `off=bytes-16` 与 AR 暂存冲突 → **死锁** | 需专用交换缓冲 + 一次 barrier |
+| `indexer_topk` 单 block | 4 | 50.1 | 0.20 | 128 级标量 FMA 依赖链 × ⌈len/32⌉ 波次 + 66 个 barrier 排序 pass + thread0 串行归并；`n_pos = compress_len = 2048` | 待做：候选分块+归并（不改数值） |
+| `quant_kernel` | 176 | 1.6 | 0.28 | 纯固定成本 | 待做：生产者直出 fp8 |
+| `sparse_attn_pf` 8 block | 40 | 10.5 | 0.42 | 0.34% 占用率；`DSV41_ATTN_SPLIT=8` **实测更差**（13.51ms） | 需新的切分维度 |
+| `hc_mixes_tail` 单 block | 80 | 12.2 | 0.97 | 20 轮 sinkhorn 串行（~2.6µs，31/32 warp 空转）+ 7 barrier | 待做（重叠 sinkhorn 与 collapse） |
