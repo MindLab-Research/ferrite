@@ -757,13 +757,17 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             // Same 256-values-per-group shape as the vectorised branch, but the
             // unpack is a shared lookup and the accumulation is split four ways so
             // the dependency chain is forty fmas deep instead of a hundred and sixty.
-            const int nv2 = k >> 8;
-            const int off2 = lane << 2;                  // byte offset of this lane's uint32
+            // Sixteen values per lane per group: 32 lanes * 16 = 512 values, and 512
+            // packed fp4 values are 256 bytes, so the group stride is k >> 9 and the
+            // byte base advances by g << 8. Sixteen is also exactly half a 32-value
+            // scale block, so one scale lookup covers the whole lane iteration.
+            const int nv2 = k >> 9;
+            const int off2 = lane << 3;                  // 16 values = 8 bytes per lane
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
             for (int g = 0; g < nv2; ++g) {
-                const int j = (g << 8) + (lane << 3);
+                const int j = (g << 9) + (lane << 4);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-                const uint8_t* bp = brow + (g << 7) + off2;
+                const uint8_t* bp = brow + (g << 8) + off2;
                 const uint32_t w0 = *reinterpret_cast<const uint32_t*>(bp);
                 const uint32_t w1 = *reinterpret_cast<const uint32_t*>(bp + 4);
                 a0 = fmaf(s_act[j + 0], s_lut[w0 & 0xFu] * sc, a0);
@@ -784,7 +788,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 a3 = fmaf(s_act[j + 15], s_lut[(w1 >> 28) & 0xFu] * sc, a3);
             }
             acc = (a0 + a1) + (a2 + a3);
-            for (int j = (nv2 << 8) + lane * 2; j < k; j += 64) {
+            for (int j = (nv2 << 9) + lane * 2; j < k; j += 64) {
                 const uint8_t byte = brow[j >> 1];
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 acc += s_act[j] * (s_lut[byte & 0xFu] * sc);
