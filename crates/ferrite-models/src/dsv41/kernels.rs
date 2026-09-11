@@ -4,7 +4,7 @@
 //! symbols; the model chain calls them through these declarations. The ABI is
 //! the contract between the Rust chain and the CUDA kernels, so the semantics
 //! of every entry point are spelled out here (and mirrored by the CPU golden
-//! implementations in [`crate::ops`]).
+//! implementations in [`crate::dsv41::ops`]).
 //!
 //! # Performance contract (non-negotiable)
 //!

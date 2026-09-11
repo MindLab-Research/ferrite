@@ -17,6 +17,10 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde.workspace = true
 serde_json.workspace = true
 ferrite-types = { path = "../ferrite-types" }
+# The model definition itself: config, quant primitives, engram tables,
+# reference ops, the layer chain and the weight layout. This crate re-exports
+# it as a shim so existing consumers (src/bin + tests) keep their module paths.
+ferrite-models = { path = "../ferrite-models" }
 # The SHARED runtime device layer (stream, byte-granular allocation, H2D/D2H/
 # D2D copies, peer access, CUDA-graph capture, cuBLAS GEMMs). Deliberately
 # WITHOUT the `cuda` feature: `devrt` resolves every symbol through dlopen at

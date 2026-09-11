@@ -1,13 +1,6 @@
-//! DeepSeek-V4.1-Flash support for ferrite — a re-export shim.
+//! DeepSeek-V4.1-Flash model definition (moved out of `ferrite-dsv41`).
 //!
-//! The model definition moved to [`ferrite_models::dsv41`] (one engine, models
-//! as data). This crate keeps the historical module paths so every existing
-//! consumer — the `dsv41-run` binary in `src/bin` and the integration tests in
-//! `tests/` — builds unchanged. It stays in the workspace while the serve path
-//! converges onto the single `ferrite-serve --model dsv41` binary; the crate
-//! itself is deleted in a later phase.
-//!
-//! The model-owned modules now live at:
+//! Layout:
 //!   * [`config`]  — the released config, with every derived layer role
 //!   * [`quant`]   — fp4 (e2m1) / fp8-e4m3 / ue8m0 block-scale primitives,
 //!                   both directions, bit-exact against the reference kernels
@@ -18,8 +11,23 @@
 //!                   (the numerical golden standard the CUDA kernels match)
 //!   * [`chain`]   — the model chain: Transformer forward + the DSpark draft
 //!   * [`weights`] — checkpoint tensor names -> the engine's TP-sharded layout
+//!
+//! `device` / `tp` travel with the model: their generic guts already delegate
+//! to the shared `ferrite-kernel::devrt` / `ferrite_p2p_ar_v5`, what remains
+//! here is the DSV4 kernel ABI table and the per-rank staging parameters.
 
-pub use ferrite_models::dsv41::{
-    chain, chain_dev, config, device, dspark, engram, kernels, load, ops, quant, tp, vision, weights,
-};
-pub use ferrite_models::dsv41::{Dsv41Config, KvMode};
+pub mod chain;
+pub mod chain_dev;
+pub mod config;
+pub mod device;
+pub mod dspark;
+pub mod engram;
+pub mod kernels;
+pub mod load;
+pub mod ops;
+pub mod quant;
+pub mod tp;
+pub mod vision;
+pub mod weights;
+
+pub use config::{Dsv41Config, KvMode};

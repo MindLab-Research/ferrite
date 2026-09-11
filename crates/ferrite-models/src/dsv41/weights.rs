@@ -12,7 +12,7 @@
 //! **Loading never dequantises.** A shard is a byte-range view into the file;
 //! the runtime keeps `weight` and `scale` as separate device buffers in exactly
 //! these layouts, which is what lets the GEMM kernels be pure tensor-core MMAs
-//! (see [`crate::kernels`]). Dequantisation exists only in [`crate::quant`] for
+//! (see [`crate::dsv41::kernels`]). Dequantisation exists only in [`crate::dsv41::quant`] for
 //! the CPU golden path and for checkpoint verification.
 
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ use std::path::Path;
 
 use ferrite_types::{FerriteError, Result};
 
-use crate::config::Dsv41Config;
+use crate::dsv41::config::Dsv41Config;
 
 /// How a tensor is distributed over `world` ranks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

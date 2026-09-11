@@ -21,8 +21,8 @@
 //! Only the draft *forward* is implemented here (matching the reference, which
 //! ships no speculative-decoding loop either).
 
-use crate::config::Dsv41Config;
-use crate::ops;
+use crate::dsv41::config::Dsv41Config;
+use crate::dsv41::ops;
 
 /// `get_dspark_topk_idxs`: the window slots plus the draft block itself.
 ///

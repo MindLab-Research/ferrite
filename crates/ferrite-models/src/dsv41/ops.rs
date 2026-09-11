@@ -19,8 +19,8 @@
 //! The `quant` dequantisation helpers exist only for checkpoint loading and
 //! for the tests below.
 
-use crate::config::Dsv41Config;
-use crate::quant::{self, FP4_MAX, FP8_MAX};
+use crate::dsv41::config::Dsv41Config;
+use crate::dsv41::quant::{self, FP4_MAX, FP8_MAX};
 
 pub const NEG_INF: f32 = -1e30;
 

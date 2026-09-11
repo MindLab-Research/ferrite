@@ -43,7 +43,7 @@
 //! size on awkward ratios) may differ. In production, feed the buffer the
 //! reference's PIL pass would produce; the ViT consumes pixels, not paths.
 
-use crate::config::Dsv41Config;
+use crate::dsv41::config::Dsv41Config;
 use ferrite_types::{FerriteError, Result};
 
 // ===========================================================================

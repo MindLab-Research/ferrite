@@ -6,7 +6,7 @@
 //! fetches `(max_ngram_size - 1) * n_heads = 24` rows of `head_dim = 256`
 //! fp8 weights. The hash ids are turned into a key/value pair by `wkv`, gated
 //! by a normalised dot product against the residual stream, and added back
-//! into every hc copy (see [`crate::ops::engram_forward`]).
+//! into every hc copy (see [`crate::dsv41::ops::engram_forward`]).
 //!
 //! Faithful to `inference/engram.py`:
 //!   * the primes are drawn deterministically (`find_next_prime`, starting at
@@ -24,7 +24,7 @@
 //! `hash_ids` layout is `[batch, seq, n_engram_layers, n_hash_cols]` with
 //! `n_hash_cols = (max_ngram_size - 1) * n_heads`, matching the reference.
 
-use crate::config::Dsv41Config;
+use crate::dsv41::config::Dsv41Config;
 
 /// `DEAD` marks a position that takes no part in an n-gram (an image span).
 pub const DEAD: i64 = -1;
@@ -311,7 +311,7 @@ impl NgramHashState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Dsv41Config;
+    use crate::dsv41::config::Dsv41Config;
 
     #[test]
     fn primes_match_reference_values() {

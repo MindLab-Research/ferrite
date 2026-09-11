@@ -33,10 +33,10 @@ use ferrite_types::Result;
 
 use std::sync::Arc;
 
-use crate::config::{Dsv41Config, KvMode};
-use crate::tp::Collective;
-use crate::device::{DevBuf, Device};
-use crate::load::{Dsv41DevWeights, LayerDev};
+use crate::dsv41::config::{Dsv41Config, KvMode};
+use crate::dsv41::tp::Collective;
+use crate::dsv41::device::{DevBuf, Device};
+use crate::dsv41::load::{Dsv41DevWeights, LayerDev};
 
 /// Runtime switches for isolating a stage during bring-up.
 #[derive(Debug, Clone, Default)]
@@ -189,8 +189,8 @@ fn moe_batch() -> bool {
 
 fn build_eng_dev(
     dev: &Device,
-    lay: &crate::engram::EngramLayout,
-    map: &crate::engram::TokenMap,
+    lay: &crate::dsv41::engram::EngramLayout,
+    map: &crate::dsv41::engram::TokenMap,
     max_seq: usize,
 ) -> Result<EngDev> {
     let n_cols = lay.n_hash_cols();
@@ -271,9 +271,9 @@ pub struct DevChain<'a> {
     decode_steps: u32,
     /// Device-side engram hash state (built lazily on the first step).
     eng_dev: Option<EngDev>,
-    ngram: Option<crate::engram::NgramHashState>,
-    eng_layout: Option<crate::engram::EngramLayout>,
-    eng_map: Option<crate::engram::TokenMap>,
+    ngram: Option<crate::dsv41::engram::NgramHashState>,
+    eng_layout: Option<crate::dsv41::engram::EngramLayout>,
+    eng_map: Option<crate::dsv41::engram::TokenMap>,
 }
 
 fn fb(n: usize) -> usize {
@@ -286,7 +286,7 @@ impl<'a> DevChain<'a> {
         cfg: &'a Dsv41Config,
         w: &'a Dsv41DevWeights,
         opts: RunOpts,
-        map: Option<crate::engram::TokenMap>,
+        map: Option<crate::dsv41::engram::TokenMap>,
     ) -> Result<Self> {
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
@@ -434,10 +434,10 @@ impl<'a> DevChain<'a> {
         // engram host-side state: the hash needs the compressed token map (a pure
         // function of the tokenizer, precomputed) and keeps a token cache that
         // spans prefill + decode.
-        let eng_layout = crate::engram::EngramLayout::from_config(cfg);
+        let eng_layout = crate::dsv41::engram::EngramLayout::from_config(cfg);
         let (ngram, eng_layout, eng_map) = match (eng_layout, map) {
             (Some(lay), Some(m)) => {
-                let st = crate::engram::NgramHashState::new(cfg, &m);
+                let st = crate::dsv41::engram::NgramHashState::new(cfg, &m);
                 (Some(st), Some(lay), Some(m))
             }
             _ => (None, None, None),
@@ -526,7 +526,7 @@ impl<'a> DevChain<'a> {
     }
 
     /// fp8 dense linear for one row: `out[1, n_out] = a[1, k] @ w[n_out, k]^T`.
-    fn lin(&self, a: *const f32, k: i32, w: &crate::load::DevTensor, ws: &crate::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
+    fn lin(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, ws: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
         self.quant1(a, k)?;
         self.dev.gemm_fp8_mx(
             self.s.xq.as_u8(),
@@ -544,7 +544,7 @@ impl<'a> DevChain<'a> {
     /// f32 linear for one row. M=1 goes through our own GEMV: cuBLAS's GemmEx
     /// picked gemv2T at ~40 GFLOP/s for a single row (396us/call, 72 per step)
     /// while the weight read floors at ~112us.
-    fn lin_f32(&self, a: *const f32, k: i32, w: &crate::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
+    fn lin_f32(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
         if std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false) {
             return self
                 .dev
@@ -557,7 +557,7 @@ impl<'a> DevChain<'a> {
     /// and hands both to cuBLAS; our GEMV takes the activation in f32 and the
     /// weights natively bf16, which is both leaner and slightly more accurate
     /// (no activation rounding).
-    fn lin_bf16(&self, a: *const f32, k: i32, w: &crate::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
+    fn lin_bf16(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
         if std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false) {
             self.dev.f32_to_bf16(a, self.s.bf16.ptr as *mut c_void, k as i64)?;
             return self
@@ -1702,7 +1702,7 @@ impl<'a> DevChain<'a> {
         // and each expert's `inter` axis is cut by world. The slice is padded up
         // to the MMA K atom (64) with zeros by the loader, so the kernels are
         // sized by the padded local width.
-        let inter_local = crate::weights::padded_inter(inter / self.world());
+        let inter_local = crate::dsv41::weights::padded_inter(inter / self.world());
         let (n_routed, topk) = cfg.moe_config(layer);
 
         // gate: natively bf16, so a bf16 GEMM

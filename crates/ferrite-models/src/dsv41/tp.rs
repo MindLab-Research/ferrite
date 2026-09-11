@@ -68,7 +68,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtOrd};
 
 use ferrite_types::{FerriteError, Result};
 
-use crate::device::{DevBuf, Device};
+use crate::dsv41::device::{DevBuf, Device};
 
 /// Collective with a fixed payload size.
 pub struct Collective {

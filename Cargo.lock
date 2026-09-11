@@ -385,6 +385,7 @@ version = "0.1.0"
 dependencies = [
  "ferrite-http",
  "ferrite-kernel",
+ "ferrite-models",
  "ferrite-types",
  "libc",
  "serde",
@@ -450,6 +451,16 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "ferrite-models"
+version = "0.1.0"
+dependencies = [
+ "ferrite-kernel",
+ "ferrite-types",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]

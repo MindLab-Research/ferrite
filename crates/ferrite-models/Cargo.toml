@@ -1,0 +1,17 @@
+[package]
+name = "ferrite-models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-model static definitions for ferrite (one engine, models as data): the DeepSeek-V4.1-Flash config, quant primitives, engram tables, reference ops, layer chain and weight layout."
+
+[dependencies]
+# libc types for the kernel ABI declarations / device-side host structs.
+libc = "0.2"
+serde_json.workspace = true
+ferrite-types = { path = "../ferrite-types" }
+# The SHARED runtime device layer (stream, byte-granular allocation, H2D/D2H/
+# D2D copies, peer access, CUDA-graph capture, cuBLAS GEMMs). Deliberately
+# WITHOUT the `cuda` feature: `devrt` resolves every symbol through dlopen at
+# first use, so this crate still builds and unit-tests on a box with no CUDA.
+ferrite-kernel = { path = "../ferrite-kernel" }

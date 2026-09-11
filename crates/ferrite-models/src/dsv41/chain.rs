@@ -27,10 +27,10 @@
 //! The engine keeps every weight in its checkpoint format (fp8 e4m3 with
 //! ue8m0 32x32 blocks, or fp4 e2m1 with per-row-per-32 ue8m0 scales) and runs
 //! the matmuls on tensor cores over that native format — see
-//! [`crate::kernels`] for the ABI and the performance contract.
+//! [`crate::dsv41::kernels`] for the ABI and the performance contract.
 
-use crate::config::Dsv41Config;
-use crate::ops;
+use crate::dsv41::config::Dsv41Config;
+use crate::dsv41::ops;
 
 /// Where a per-layer tensor lives. The device buffers are opaque here so the
 /// chain can be compiled and unit-tested without a GPU.
@@ -487,8 +487,8 @@ pub struct EngramHostWeights {
     pub q_weight: Vec<f32>,
     pub k_weight: Vec<f32>,
     /// Token id -> compressed id.
-    pub token_map: crate::engram::TokenMap,
-    pub layout: crate::engram::EngramLayout,
+    pub token_map: crate::dsv41::engram::TokenMap,
+    pub layout: crate::dsv41::engram::EngramLayout,
     pub pad_id: i64,
 }
 
@@ -499,22 +499,22 @@ pub struct ModelHostWeights {
     pub head: Vec<f32>,         // [vocab, dim]
     pub layers: Vec<LayerHostWeights>,
     pub engram: Vec<Option<EngramHostWeights>>, // indexed by layer
-    pub draft: Vec<crate::dspark::DraftHostWeights>,
+    pub draft: Vec<crate::dsv41::dspark::DraftHostWeights>,
 }
 
 /// Full model state (one per sequence).
 pub struct ModelState {
     pub layers: Vec<LayerState>,
     pub shared: SharedAttnState,
-    pub ngram: Option<crate::engram::NgramHashState>,
+    pub ngram: Option<crate::dsv41::engram::NgramHashState>,
 }
 
 impl ModelState {
-    pub fn new(cfg: &Dsv41Config, map: Option<crate::engram::TokenMap>) -> Self {
+    pub fn new(cfg: &Dsv41Config, map: Option<crate::dsv41::engram::TokenMap>) -> Self {
         ModelState {
             layers: (0..cfg.n_layers + cfg.n_mtp_layers).map(|_| LayerState::new(cfg)).collect(),
             shared: SharedAttnState::new(),
-            ngram: map.map(|m| crate::engram::NgramHashState::new(cfg, &m)),
+            ngram: map.map(|m| crate::dsv41::engram::NgramHashState::new(cfg, &m)),
         }
     }
 }
@@ -649,7 +649,7 @@ pub fn forward_spec(
     let dim = cfg.dim;
     let bs = cfg.dspark_block_size;
     let hc = cfg.hc_mult;
-    let (mut h, main_x) = crate::dspark::forward_embed(
+    let (mut h, main_x) = crate::dsv41::dspark::forward_embed(
         cfg,
         main_hidden,
         input_ids,
@@ -664,7 +664,7 @@ pub fn forward_spec(
         let layer = cfg.n_layers + s;
         if start_pos == 0 {
             // seed the draft window from the main stream and return
-            crate::dspark::dspark_attention(
+            crate::dsv41::dspark::dspark_attention(
                 cfg, &h, &main_x, 0, &mut st.layers[layer].window_kv, d,
             );
             continue;
@@ -680,5 +680,5 @@ pub fn forward_spec(
     }
     let u = vec![1.0f32; bs * cfg.vocab_size];
     let last = w.draft.last().unwrap();
-    Some(crate::dspark::forward_head(cfg, &h, &pre_mix, input_ids, last, &u))
+    Some(crate::dsv41::dspark::forward_head(cfg, &h, &pre_mix, input_ids, last, &u))
 }

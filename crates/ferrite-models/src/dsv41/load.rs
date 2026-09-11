@@ -1,8 +1,8 @@
 //! Real-checkpoint loader: safetensors -> device buffers, in the checkpoint's
 //! own formats.
 //!
-//! Config-driven: the tensor list comes from [`crate::weights::tensor_specs`]
-//! (itself derived from [`crate::config::Dsv41Config`]), so a different
+//! Config-driven: the tensor list comes from [`crate::dsv41::weights::tensor_specs`]
+//! (itself derived from [`crate::dsv41::config::Dsv41Config`]), so a different
 //! geometry/TP degree needs no code change here.
 //!
 //! **No dequantisation.** Whatever the file holds is what lands in device
@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 
 use ferrite_types::{FerriteError, Result};
 
-use crate::config::Dsv41Config;
-use crate::device::{DevBuf, Device};
-use crate::weights::{local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
+use crate::dsv41::config::Dsv41Config;
+use crate::dsv41::device::{DevBuf, Device};
+use crate::dsv41::weights::{local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
 
 /// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
 /// Everything else that arrives as bf16 is widened to f32 on the way in —
