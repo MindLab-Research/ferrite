@@ -625,7 +625,13 @@ impl<'a> DevChain<'a> {
             // ar_v5() therefore also turns on with the graph (see tp.rs).
             let host_hash = std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false);
             let probes = std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false);
-            !host_hash && !probes && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true)
+            // OPT-IN for now (DSV41_GRAPH_STEP=1): capture works and replays without
+            // error, but a replay produces wrong output, and correctness is the red
+            // line - the device-ification alone is verified correct (graph off gives
+            // ' Paris' / '2'), so only the graph needs the bisection.
+            !host_hash
+                && !probes
+                && std::env::var("DSV41_GRAPH_STEP").map(|v| v == "1").unwrap_or(false)
         });
         if want && self.step_count >= 1 {
             if let Some(e) = self.step_graph {
@@ -1518,8 +1524,15 @@ impl<'a> DevChain<'a> {
             cfg.window_size as i32,
             ratio as i32,
         )?;
-        // the host no longer tracks the count; consumers read the device counter
-        Ok(0)
+        // The host keeps a MIRROR of the device counter using the SAME deterministic
+        // rule the kernel applies ((pos + 1) % ratio == 0 commits one latent). The
+        // host branches on this (whether to run the indexer, how many compressed
+        // slots to expect) and the kernels read the device counter itself - so the
+        // two agree by construction, without the download that used to be here.
+        if (pos + 1) % ratio == 0 {
+            self.layers[layer].compress_len += 1;
+        }
+        Ok(self.layers[layer].compress_len)
     }
 
     /// The layer whose KV store `layer` reads: itself, unless it is a consumer
