@@ -943,18 +943,20 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     extern __shared__ float smem[];
     const int cols = topk < n_pos ? topk : n_pos;  // out slots (sparse_attn's stride)
     const int cap = topk;                          // array capacity: cols <= topk
-    float* s_score = smem;                            // [kIndexerChunk] chunk scores
-    int* s_pick = (int*)(s_score + kIndexerChunk);    // [cap] chunk picks (chunk-local)
-    float* s_rv = (float*)(s_pick + cap);             // [cap] running values (key order)
+    // The chunk's candidates live as (score, position) pairs, sorted in place by a
+    // bitonic network: the value at [2i], the position as float bits at [2i+1].
+    // The iterative block argmax this replaces ran one full-chunk scan, two
+    // barriers and a serial cross-warp merge PER PICK - hundreds of passes per
+    // call, the better part of 150 us. The sort produces the same descending
+    // (score, position-ascending) total order the argmax picked in, so the
+    // selection itself is unchanged.
+    float* s_pair = smem;                             // [2*kIndexerChunk] (score, position)
+    float* s_rv = s_pair + 2 * kIndexerChunk;         // [cap] running values (key order)
     int* s_rp = (int*)(s_rv + cap);                   // [cap] running positions
-    uint8_t* s_used = (uint8_t*)(s_rp + cap);         // [kIndexerChunk] consumed flags
     const int tid = threadIdx.x, nthr = blockDim.x;
     const int mm = blockIdx.x, bb = blockIdx.y;
     const size_t row = (size_t)bb * m + mm;
-    __shared__ float s_bv[32];
-    __shared__ int s_bi[32];
     __shared__ int s_nr;  // running-set size (thread 0 owns it; the output reads it)
-    const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
 
     int cl = n_pos;
     if (lens != nullptr) cl = lens[mm];
@@ -964,7 +966,16 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
 
     for (int base = 0; base < n_pos; base += kIndexerChunk) {
         const int len = (n_pos - base < kIndexerChunk) ? (n_pos - base) : kIndexerChunk;
-        for (int i = tid; i < len; i += nthr) s_used[i] = 0;
+        // Pad to the network's power of two. The padding pairs carry -INFINITY
+        // with a position above the chunk's real ones, so they sort behind every
+        // real entry and the first `k <= len` slots of the sorted array are always
+        // real candidates.
+        int P = 1;
+        while (P < len) P <<= 1;
+        for (int i = len + tid; i < P; i += nthr) {
+            s_pair[2 * i] = -INFINITY;
+            s_pair[2 * i + 1] = __int_as_float(base + i);
+        }
         __syncthreads();
 
         // ---- scores for this chunk
@@ -981,53 +992,43 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
             float sv = acc * softmax_scale * head_scale;
             if (p >= cl) sv = -INFINITY;
             if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
-            s_score[i] = sv;
+            s_pair[2 * i] = sv;
+            s_pair[2 * i + 1] = __int_as_float(p);
         }
         __syncthreads();
 
-        // ---- this chunk's stable top-`k` (iterative block argmax; ties -> lower index)
+        // ---- this chunk's stable top-`k`: bitonic sort of the (score, position)
+        // pairs. The order it produces - score descending, position ascending on
+        // ties - is the same total order the iterative argmax used to pick in, so
+        // the selection is identical; the sort is one pass with log^2(P) barriers
+        // against k passes with 2k barriers and a serial cross-warp merge each.
+        // After the sort, s_pair[2*j] is the j-th best score and
+        // __float_as_int(s_pair[2*j+1]) its position, for j < k <= len.
         const int k = cols < len ? cols : len;
-        for (int it = 0; it < k; ++it) {
-            float bv = -INFINITY;
-            int bi = len;  // sentinel: this thread has no unconsumed entry
-            for (int i = tid; i < len; i += nthr) {
-                if (s_used[i]) continue;
-                const float v = s_score[i];
-                if (bi >= len || v > bv) {
-                    bv = v;
-                    bi = i;
-                }
-            }
-#pragma unroll
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-                const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
-                if (ov > bv || (ov == bv && oi < bi)) {
-                    bv = ov;
-                    bi = oi;
-                }
-            }
-            if (lane == 0) {
-                s_bv[warp] = bv;
-                s_bi[warp] = bi;
-            }
-            __syncthreads();
-            if (tid == 0) {
-                float xv = -INFINITY;
-                int xi = len;
-                for (int widx = 0; widx < nw; ++widx) {
-                    const float v = s_bv[widx];
-                    const int i = s_bi[widx];
-                    if (v > xv || (v == xv && i < xi)) {
-                        xv = v;
-                        xi = i;
+        for (int k2 = 2; k2 <= P; k2 <<= 1) {
+            for (int j2 = k2 >> 1; j2 > 0; j2 >>= 1) {
+                __syncthreads();
+                for (int i = tid; i < P; i += nthr) {
+                    const int l = i ^ j2;
+                    if (l <= i) continue;
+                    // the final pass sorts the whole array best-first (descending)
+                    const bool up = (i & k2) == 0;
+                    const float va = s_pair[2 * i], vb = s_pair[2 * l];
+                    const int ia = __float_as_int(s_pair[2 * i + 1]);
+                    const int ib = __float_as_int(s_pair[2 * l + 1]);
+                    // "a first" = a has the higher score, or an equal score at the
+                    // lower position - idx_key_worse's rule
+                    const bool a_first = (va > vb) || (va == vb && ia < ib);
+                    if (up ? !a_first : a_first) {
+                        s_pair[2 * i] = vb;
+                        s_pair[2 * i + 1] = __int_as_float(ib);
+                        s_pair[2 * l] = va;
+                        s_pair[2 * l + 1] = __int_as_float(ia);
                     }
                 }
-                s_pick[it] = xi;  // k <= len, so a real entry is always found
-                s_used[xi] = 1;   // consume it (marking -inf is a no-op)
             }
-            __syncthreads();
         }
+        __syncthreads();
 
         // ---- merge this chunk's picks into the running top-`cols` (thread 0)
         if (tid == 0) {
@@ -1046,26 +1047,26 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
             for (int drop = t - keep; drop > 0; --drop) {
                 if (i < 0) --j;
                 else if (j < 0) --i;
-                else if (idx_key_worse(s_rv[i], s_rp[i], s_score[s_pick[j]], base + s_pick[j])) --i;
+                else if (idx_key_worse(s_rv[i], s_rp[i], s_pair[2 * j], __float_as_int(s_pair[2 * j + 1]))) --i;
                 else --j;
             }
             for (int d = keep - 1; d >= 0; --d) {
                 if (i < 0) {
-                    const int p = base + s_pick[j];
-                    s_rv[d] = s_score[s_pick[j]];
+                    const int p = __float_as_int(s_pair[2 * j + 1]);
+                    s_rv[d] = s_pair[2 * j];
                     s_rp[d] = p;
                     --j;
                 } else if (j < 0) {
                     s_rv[d] = s_rv[i];
                     s_rp[d] = s_rp[i];
                     --i;
-                } else if (idx_key_worse(s_rv[i], s_rp[i], s_score[s_pick[j]], base + s_pick[j])) {
+                } else if (idx_key_worse(s_rv[i], s_rp[i], s_pair[2 * j], __float_as_int(s_pair[2 * j + 1]))) {
                     s_rv[d] = s_rv[i];
                     s_rp[d] = s_rp[i];
                     --i;
                 } else {
-                    const int p = base + s_pick[j];
-                    s_rv[d] = s_score[s_pick[j]];
+                    const int p = __float_as_int(s_pair[2 * j + 1]);
+                    s_rv[d] = s_pair[2 * j];
                     s_rp[d] = p;
                     --j;
                 }
@@ -1652,16 +1653,17 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
                                   int uses_candidates, cudaStream_t s) {
     if (b <= 0 || m <= 0 || nh <= 0 || hd <= 0 || topk <= 0) return (int)cudaErrorInvalidValue;
     if (n_pos <= 0) return (int)cudaSuccess;  // nothing to select from
-    // Dynamic shared memory from COMPILE-TIME constants only: the chunk score array
-    // (kIndexerChunk entries) plus the running top-`cols` set, whose arrays are sized
-    // by the `topk` upper bound on cols. n_pos is deliberately absent - it is a
-    // PER-STEP value and a CUDA graph capture freezes the launch (arguments AND this
-    // size), so a size derived from it was applied unchanged to every replay while the
-    // kernel scanned the live (growing) device count: either a stale bound (silent
-    // candidate loss) or an index past a smaller allocation. The kernel's chunk loop
-    // makes any scan bound safe, so it now scans `*lens` for any value.
-    const size_t smem = (size_t)kIndexerChunk * (sizeof(float) + 1) +
-                        (size_t)topk * (sizeof(int) + sizeof(float) + sizeof(int)) + 64;
+    // Dynamic shared memory from COMPILE-TIME constants only: the sort's
+    // (score, position) pairs - two floats per candidate - plus the running
+    // top-`cols` set (a value and a position per slot). n_pos is deliberately
+    // absent - it is a PER-STEP value and a CUDA graph capture freezes the launch
+    // (arguments AND this size), so a size derived from it was applied unchanged
+    // to every replay while the kernel scanned the live (growing) device count:
+    // either a stale bound (silent candidate loss) or an index past a smaller
+    // allocation. The kernel's chunk loop makes any scan bound safe, so it now
+    // scans `*lens` for any value.
+    const size_t smem = (size_t)kIndexerChunk * (2 * sizeof(float)) +
+                        (size_t)topk * (sizeof(float) + sizeof(int)) + 64;
     // Stay inside the 47 KiB USABLE default (48 KiB nominal minus the 1 KiB the driver
     // reserves per block), so no cudaFuncSetAttribute opt-in is ever needed. A `topk`
     // too large for that budget fails the launch LOUDLY here - the previous constant
