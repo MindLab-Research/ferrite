@@ -328,14 +328,16 @@ impl<'a> DevChain<'a> {
             // the live device counter instead and clamps it to this same argument. That
             // value must therefore be the CONSTANT bound this layer can ever reach -
             // min(pool capacity, what the shared-memory budget can hold for the score
-            // array plus the per-pick scratch). The budget is the 48 KiB DEFAULT rather
-            // than the device maximum on purpose: staying under it needs no
-            // cudaFuncSetAttribute opt-in, which keeps this path identical in shape to
-            // the rest of the serve (and the earlier attempt at a ~200 KiB constant did
-            // fail at the attribute). Passing the per-step host count here is what let a
-            // replayed graph index past the allocation once the device count grew.
+            // array plus the per-pick scratch). The budget is 46 KiB, not the nominal
+            // 48 KiB default: the driver reserves 1 KiB per block, so the usable default
+            // dynamic size is 47 KiB, and a constant sized at exactly the nominal limit
+            // fails the launch with cudaErrorInvalidValue (measured - that is what the
+            // earlier 200 KiB / attribute cut and the first 48 KiB cut both hit). Any
+            // opt-in attribute is deliberately avoided. Passing the per-step host count
+            // here is what let a replayed graph index past the allocation as the device
+            // count grew.
             let idx_cap = {
-                let budget = 48 * 1024usize - 64 - cfg.index_topk * 2 * std::mem::size_of::<i32>();
+                let budget = 46 * 1024usize - 64 - cfg.index_topk * 2 * std::mem::size_of::<i32>();
                 max_comp.min(budget / (std::mem::size_of::<f32>() + 1)).max(1)
             };
             // The KV buffer holds the window ring FOLLOWED by the compressed

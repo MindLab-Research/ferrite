@@ -320,3 +320,51 @@ host-barrier 路径 ✓；DSV41 自有的三个 AR kernel（`dsv41_ar_v5_{store,
 **对后续 Phase 的意义**：Phase 3（图原语换共享）在 Phase 0/1 的 `devrt` 里已经就位 ✓；
 剩下的只有 Phase 4（`CudaBackend` 与 `devrt` 两设备层收敛 —— **注意这是 GLM 生产路径，风险最高，
 必须先有隔离验证**）与 Phase 5/6（engine 契约 → 单一二进制 → 删 crate）。
+
+### ✅ Phase 5a 完成（2026-09-11）：模型定义搬进共享 `crates/ferrite-models`，旧 crate 变 shim
+
+**为什么是新建 `ferrite-models`（复数）而不是塞进 `ferrite-model`（单数）**：
+`ferrite-kernel` 的 `Cargo.toml` 里**已声明** `ferrite-model = { path = "../ferrite-model" }`
+（代码里只有 1 处注释引用，事实上的 dead dep），所以 `ferrite-model` 一旦反向依赖
+`ferrite-kernel`（dsv41 的 `device`/`tp`/`chain_dev`/`load` 需要 `ferrite_kernel::devrt`）
+就是**包依赖环** ⇒ `ferrite-model` **放不下**。规格的终态目录本就写的是
+`crates/ferrite-models/`（新增）⇒ 按规格新建，**零改动其他 crate 的依赖图** ✓。
+
+**落地**（13 个模块整体搬家，`git mv` 保留历史）：
+
+| 旧路径 | 新路径 |
+|---|---|
+| `crates/ferrite-dsv41/src/{chain,chain_dev,config,device,dspark,engram,kernels,load,ops,quant,tp,vision,weights}.rs` | `crates/ferrite-models/src/dsv41/*.rs` |
+| `crates/ferrite-dsv41/configs/*.json` | `crates/ferrite-models/configs/*.json` |
+| `crates/ferrite-dsv41/src/lib.rs` | 改写为 shim：`pub use ferrite_models::dsv41::{...13 modules...}` + `{Dsv41Config, KvMode}` |
+
+**为什么 `device.rs`/`tp.rs` 也一起搬**（它们已被标为「共享化」）：它们**仍被 `chain_dev.rs`/`load.rs` 以
+`crate::device`/`crate::tp` 引用**，留在旧 crate 就会让新 crate 反向依赖旧 crate ⇒ 环。
+它们的**通用内脏**本来就已转发给共享 `ferrite-kernel::devrt` / `ferrite_p2p_ar_v5` ✓，留在文件里的
+只是 **DSV4 kernel ABI 表 + 52 个启动封装 + DSV41 staging 参数**（DSV4 专有 ⇒ 随模型走 ✓）。
+
+**机械改动（无行为变化）**：
+1. 搬走的 13 个文件里 `crate::X` → `crate::dsv41::X`（47 处，全部指向模块自身集合，无一处指向 lib 根）；
+2. `config.rs` 的 `include_str!("../configs/…")` → `"../../configs/…"`（`configs/` 已随模型搬到
+   `ferrite-models/configs/`；`Dsv41Config::production()` 是公开 API，靠它读 `/config.json`）；
+3. `crates/ferrite-dsv41/src/lib.rs` 改为 shim（`bin/dsv41-run.rs` 与 `tests/*` **零改动** ✓）；
+4. **测试文本读取路径**：`tests/contract.rs` 三处 `CARGO_MANIFEST_DIR/src/{kernels,weights}.rs`
+   → `.../../ferrite-models/src/dsv41/…`（该测试 textually 读源码，不修就运行时失败 ✗ 而非编译失败）；
+5. **顺带修掉一个既有 latent bug**：`chain.rs` 测试模块用 `KvMode` 未 import（aed0785 起就在，
+   只有 `--all-targets` 才暴露 ✗）⇒ 补 `use crate::dsv41::KvMode;`（仅测试，零行为变化 ✓）。
+
+**验证**：`cargo check --workspace` **0 error** ✓；`cargo check --workspace --all-targets` **0 error** ✓
+（迁移前该组合是**有错误**的 ✓）；`cargo test -p ferrite-dsv41 --no-run` ✓；`cargo test -p ferrite-models --no-run` ✓；
+`cargo test -p ferrite-dsv41 --test contract` 4 passed ✓；`cargo check -p ferrite-kernel --features cuda` ✓（GLM 路径未碰）。
+⚠ 未做 GPU e2e（无 GPU/nvcc 本机）—— 行为等价由「逐字搬家 + 只改路径」保证，待远端复验。
+
+**留给后续 Phase**：
+- **5b（单一二进制）**：`ferrite-serve --model dsv41` —— `TpRankPool` 的 engine 适配（含 look-ahead
+  批命令）从 `crates/ferrite-dsv41/src/bin/dsv41-run.rs` 挪进共享 engine（`ferrite-exec`/`ferrite-http`
+  的 `ServeEngine`）✓；chat frame / stop set 按模型注入 ✓。
+- **6（删 crate）**：`crates/ferrite-dsv41/`（含 `bin/`、`tests/`、`README.md`、`PERF.md`、`STATUS.md`）
+  + workspace `members` 同步；注意 `contract.rs` 的文本断言与 `kernels.rs` 的 ABI 核对要**先搬到**
+  `ferrite-models` 的 tests，否则契约检查随 crate 一起消失 ✗。
+- **顺带**：`crates/ferrite-dsv41/Cargo.toml` 的 `thiserror`/`serde`/`libc`/`tokenizers` 在**模型侧**已不再需要
+  （只 `serde_json`/`libc`/`ferrite-types`/`ferrite-kernel` 被用到）—— 但 `bin/`/`tests/` 还要用
+  `tokenizers`/`ferrite-http`，故 5a **不动**旧 crate 的依赖清单，留给 Phase 6 一并清理。

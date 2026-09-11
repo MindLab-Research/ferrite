@@ -1300,9 +1300,11 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
     // The bound arrives as a CONSTANT per layer (idx_cap in chain_dev.rs), so this
     // shared memory does not depend on the current step - a capture freezes launch
     // arguments, and sizing it from the per-step count once left every replay indexing
-    // past the allocation as the device count grew. It is kept inside the 48 KiB
-    // default so no opt-in attribute is needed; the kernel clamps the live device
-    // counter to this same bound, and the launcher's guard above covers any shape that
+    // past the allocation as the device count grew. idx_cap is sized for 46 KiB, which
+    // needs no opt-in attribute; the usable default is 47 KiB, not the nominal 48 KiB,
+    // because the driver reserves 1 KiB per block (a constant at the nominal limit is
+    // what failed the launch with cudaErrorInvalidValue). The kernel clamps the live
+    // device counter to this same bound, and the guard above covers any shape that
     // could not fit at all.
     dim3 grid((unsigned)m, (unsigned)b);
     indexer_topk_kernel<<<grid, 256, smem, s>>>(q, index_k, weights, candidates, compress_lens,
