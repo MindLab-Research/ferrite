@@ -5380,3 +5380,25 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 本轮的 −0.11ms 可能是噪声，也可能是代码重组的副效应。真正收益待接线后量化。
 
 **会话累计：13.28 → 10.16ms（+30.7%），75.3 → 98.4 tok/s。**
+
+### 架构统一 fast wins（arch-unify-fast 报告要点）
+
+1. **build_id 门禁合并**：devrt.rs 的 verify_kernel_build 缺 linked-image 分支（cuda.rs:1909 是超集）——把超集上移到 devrt，cuda.rs 侧删掉自己的副本改调共享。
+2. **argmax 共享**：GLM 的 `ferrite_argmax`（ferrite_kernels.cu:1478）与 DSV41 的签名不同（DSV41 带 pos_ctr/idx_off/packed）——不能直接共享，但可以给 GLM 版加可选参数（默认 null 走旧路径）。
+3. **graph 捕获模式**：GLM cuda.rs:2823 是 ThreadLocal(1)，DSV41 devrt.rs:845 是 Relaxed(2)——Relaxed 是 ThreadLocal 的超集，统一到 2。
+
+### gate_up+swiglu 融合（gate-swiglu-fuse 补丁，已产出）
+
+- 每 warp 产一对 (gate_i, up_i)：对 W1/W3 各跑一次 K 循环，g/u 留寄存器，epilogue 做 swiglu
+- 出口从 out[2·inter] 变 out[inter]（ex_act_b 写出量减半）
+- act_slot 从 2·inter_local 变 inter_local；down 读 [0..inter) 不变
+- 7 条逐位等价论证（K 循环照抄、双独立归约链、clamp 幂等、silu 同式）
+- smem/寄存器不变（+2 reg）
+- 调用方：swiglu_limit_batched 整段删除
+
+### down+reduce 合一（down-reduce-fuse，subagent 设计中）
+
+- 删 grid.y 的 slot 维：每 warp 对自己的行 for slot { dot + 累加 }
+- 升序 slot 累加 = reduce 的数值契约（零同步、零 cooperative）
+- ex_down_b 全程留寄存器 → 写+读两遍 global 消失
+- act staging：一次 stage 全部 slot（6×320×4B=7.7KB + LUT 2KB ≈ 10KB/块）
