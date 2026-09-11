@@ -39,7 +39,17 @@ static void bench(const char* tag, int n, int k, int fp8, int reps) {
     cudaMemset(w, 0x3c, wbytes);
     void* x = nullptr;
     cudaMalloc(&x, (size_t)k * 4 + 256);
-    cudaMemset(x, 0, (size_t)k * 4 + 256);
+    // Deterministic but VARYING patterns (a constant memset makes every
+    // summation order produce the same value, which hides exactly the
+    // differences this printout is meant to expose).
+    {
+        std::vector<uint8_t> hw(wbytes);
+        for (size_t i = 0; i < wbytes; ++i) hw[i] = (uint8_t)((i * 37 + 11) & 0x7Fu);
+        cudaMemcpy(w, hw.data(), wbytes, cudaMemcpyHostToDevice);
+        std::vector<uint8_t> hx((size_t)k * 4 + 256);
+        for (size_t i = 0; i < hx.size(); ++i) hx[i] = (uint8_t)((i * 53 + 7) & 0xFFu);
+        cudaMemcpy(x, hx.data(), hx.size(), cudaMemcpyHostToDevice);
+    }
     void* out = nullptr;
     cudaMalloc(&out, (size_t)n * 4);
     void (*run)(void*, const void*, void*) = fp8 ? run_f : run_b;
@@ -61,6 +71,13 @@ static void bench(const char* tag, int n, int k, int fp8, int reps) {
     std::sort(ts.begin(), ts.end());
     printf("  %-18s n=%-7d k=%d  w=%7.2fMB  median %8.2f us  (min %8.2f)\n", tag, n, k,
            wbytes / 1048576.0, ts[ts.size() / 2] * 1000.0, ts.front() * 1000.0);
+    // Numerical fingerprint: same binary + different kernel switches must print
+    // the same numbers, otherwise the "optimisation" moved the sums.
+    {
+        float ho[4] = {0, 0, 0, 0};
+        cudaMemcpy(ho, out, sizeof(ho), cudaMemcpyDeviceToHost);
+        printf("    out[0..3] = %.9g %.9g %.9g %.9g\n", ho[0], ho[1], ho[2], ho[3]);
+    }
     cudaFree(w); cudaFree(x); cudaFree(out);
 }
 
