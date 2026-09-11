@@ -166,6 +166,15 @@ struct Kernels {
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, CuStream) -> c_int>,
+    ar_v5_store: Option<
+        unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, *const c_uint, CuStream) -> c_int,
+    >,
+    ar_v5_publish: Option<
+        unsafe extern "C" fn(*const u64, *const c_uint, c_int, c_int, *const c_uint, CuStream) -> c_int,
+    >,
+    ar_v5_reduce: Option<
+        unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, *mut c_uint, CuStream) -> c_int,
+    >,
     expert_gate_up_fp4_indirect: Option<
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
@@ -403,6 +412,9 @@ impl Device {
                 gemv_bf16: sym(h_k, "dsv41_gemv_bf16").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_f32: sym(h_k, "dsv41_gemv_f32").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 argmax: sym(h_k, "dsv41_argmax").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_v5_store: sym(h_k, "dsv41_ar_v5_store").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_v5_publish: sym(h_k, "dsv41_ar_v5_publish").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ar_v5_reduce: sym(h_k, "dsv41_ar_v5_reduce").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1447,6 +1459,55 @@ impl Device {
     }
 
     /// Same, f32 weights.
+    /// AR v5 (graph-capturable): store(e) - write my buffer to every peer's
+    /// staging half e&1. The epoch is read from DEVICE memory at runtime.
+    pub fn ar_v5_store(
+        &self,
+        peer_slots: *const u64,
+        world: c_int,
+        rank: c_int,
+        src: *const f32,
+        n: i64,
+        slot_f: i64,
+        epoch: *const c_uint,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ar_v5_store, "dsv41_ar_v5_store")?;
+        let rc = unsafe { f(peer_slots, world, rank, src, n, slot_f, epoch, self.stream) };
+        self.kerr(rc, "dsv41_ar_v5_store")
+    }
+
+    /// AR v5: publish(e) - stamp e+1 to every peer (system scope), then poll my
+    /// own stamps until every peer has published; replaces the host barrier.
+    pub fn ar_v5_publish(
+        &self,
+        peer_stamps: *const u64,
+        stamps: *const c_uint,
+        world: c_int,
+        rank: c_int,
+        epoch: *const c_uint,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ar_v5_publish, "dsv41_ar_v5_publish")?;
+        let rc = unsafe { f(peer_stamps, stamps, world, rank, epoch, self.stream) };
+        self.kerr(rc, "dsv41_ar_v5_publish")
+    }
+
+    /// AR v5: reduce(e) - sum the peers' staging half e&1 straight into the
+    /// caller's buffer; the last block advances the device epoch.
+    pub fn ar_v5_reduce(
+        &self,
+        dst: *mut f32,
+        staging: *const f32,
+        n: i64,
+        slot_f: i64,
+        world: c_int,
+        epoch: *const c_uint,
+        ctr: *mut c_uint,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ar_v5_reduce, "dsv41_ar_v5_reduce")?;
+        let rc = unsafe { f(dst, staging, n, slot_f, world, epoch, ctr, self.stream) };
+        self.kerr(rc, "dsv41_ar_v5_reduce")
+    }
+
     /// Stable argmax (ties -> lowest index); writes the winning index as i32.
     pub fn argmax(&self, v: *const f32, out: *mut c_int, n: i32) -> Result<()> {
         let f = self.need(self.kernels.argmax, "dsv41_argmax")?;

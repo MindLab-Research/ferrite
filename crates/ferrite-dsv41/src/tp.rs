@@ -268,6 +268,43 @@ impl Collective {
     /// sum over ranks, written back to `dst` (which may be the same address as
     /// `src`).
     pub fn all_reduce_inplace(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
+        // AR v5: fully device-side (store -> publish -> reduce), NO host barrier,
+        // NO copy-back, and the epoch lives in device memory so a captured graph
+        // replays correctly. The protection is the publish chain, not a credit.
+        if ar_v5() {
+            let n = (len / 4) as i64;
+            let slot_f = (self.bytes / 4) as i64;
+            let base8 = self.staging.ptr as *const u8;
+            let epoch = base8.wrapping_add(self.ctr_at) as *const c_uint;
+            let ctr2 = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
+            let stamps = base8.wrapping_add(self.stamps_at) as *const c_uint;
+            self.dev.ar_v5_store(
+                self.peer_slots.ptr as *const u64,
+                self.world as i32,
+                self.rank as i32,
+                buf as *const f32,
+                n,
+                slot_f,
+                epoch,
+            )?;
+            self.dev.ar_v5_publish(
+                self.peer_stamps.ptr as *const u64,
+                stamps,
+                self.world as i32,
+                self.rank as i32,
+                epoch,
+            )?;
+            self.dev.ar_v5_reduce(
+                buf as *mut f32,
+                self.staging.ptr as *const f32,
+                n,
+                slot_f,
+                self.world as i32,
+                epoch,
+                ctr2,
+            )?;
+            return Ok(());
+        }
         let _t_ar = std::time::Instant::now();
         let r = self.all_reduce_inplace_inner(buf, len);
         AR_HOST_NS.fetch_add(_t_ar.elapsed().as_nanos() as u64, AtOrd::Relaxed);
@@ -358,6 +395,11 @@ impl Collective {
     /// Release a round (pairs with `publish`, to keep the next round from
     /// overwriting slots another rank is still reading).
     pub fn end_round(&self) {
+        // v5 needs no host barrier: the publish chain already guarantees every
+        // peer is past the previous round's reduce before the next store runs.
+        if ar_v5() {
+            return;
+        }
         let _t = std::time::Instant::now();
         self.barrier.wait();
         AR_BAR_NS.fetch_add(_t.elapsed().as_nanos() as u64, AtOrd::Relaxed);
@@ -373,6 +415,13 @@ pub static AR_HOST_NS: AtomicU64 = AtomicU64::new(0);
 pub static AR_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static AR_BAR_NS: AtomicU64 = AtomicU64::new(0);
 pub static AR_BAR_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// AR v5 (the graph-capturable all-reduce) switch, read ONCE: this is on the
+/// per-call hot path, and a per-call getenv is a hot-path slip.
+static AR_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn ar_v5() -> bool {
+    *AR_V5.get_or_init(|| std::env::var("DSV41_AR_V5").map(|v| v != "0").unwrap_or(false))
+}
 
 /// Shared state a rank thread needs from its siblings.
 pub struct RankLinks {
