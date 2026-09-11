@@ -3414,13 +3414,17 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     // without the 160 KB opt-in - the kernel then launches with shared memory it
     // was not granted and the cp.async waits never retire. The existing gemm_fp8
     // launcher carries the same warning for the same reason.
-    // hc-merge, DEFAULT ON: one launch for the whole front (dots + tail with the
-    // collapse hoisted before the spin). DSV41_HC_MERGE=0 restores the two-launch
-    // path below for A/B.
+    // hc-merge, DEFAULT OFF: the single-kernel form measured +3.2ms/step
+    // (13.75 vs 10.54 at round 14, texts correct, zero faults). The tail block's
+    // ticket spin holds an SM hostage for the whole dots phase, and at 1024
+    // threads/block 31 of 32 warps idle during the dot compute (the two-launch
+    // form's dots ran 128-thread blocks where only 3 warps idled). The gate
+    // stays for a future attempt that gives the tail branch its own small block
+    // instead of a full 1024-thread one. DSV41_HC_MERGE=1 re-enables.
     static const bool g_hc_merge = [] {
         const char* e = getenv("DSV41_HC_MERGE");
-        if (e == nullptr) return true;
-        return e[0] != '0';
+        if (e == nullptr) return false;
+        return e[0] == '1';
     }();
     if (g_hc_merge) {
         cudaError_t e2 = cudaFuncSetAttribute(hc_front_kernel,
