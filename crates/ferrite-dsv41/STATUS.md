@@ -6503,3 +6503,22 @@ mode3+a32off = 22912 B。工具：`scripts/dsv41_a32_bench.sh`（隔离基准，
 - **未尝试**：grouped/persistent GEMM（246→~40 launch，next-wave top-1）+ Stage C 段核 P2-P5 + expert 机制重构（非 GEMV）。
 
 **最终判定**：乐观 3.21ms（≈254 tok/s）明确超 200；中间 3.91ms（≈208）刚过；保守 5.36ms（≈152）差约 27%（−1.28ms）。**关键变量** = ① a32 二元项（−0.74）；② 四侧流共享同一侧流预算，不可线性叠加；③ dots 融合的真实收益——P1e 复核指出融进消费者只省**图节点 ~0.12ms**（0.56ms 点积计算仍要付），除非点积真能在 attention 窗口内被隐藏；④ 朴素求和的重复计账（PDL/fp4-pack/sparse-o-rope/hc_post 同属 launch 消除）。
+
+### 架构级最终评估（arch-review-final，2026-09-11 深夜）
+
+**判定**：kernel 级优化已触到「开销回收」上界；**200 tok/s（~4.1ms）已低于真实工作地板**（~5.3ms：
+expert 1.78 + hc 1.59 + gemv_bf16 0.74 + AR 0.66 + sparse 0.32）——继续消 launch 到不了，
+必须改变真实工作的形态。
+
+**已无架构空间的三处**：
+1. 执行模型（每层 2 段 + 2 AR 是硬结构；5 条侧流已吃干独立链）
+2. 内存/精度（激活已在 L2；bf16 徒增精度险；权重 fp4 已地板）
+3. M 维（M=1 GEMV 的 L1TEX/指令地板正是当前瓶颈根源）
+
+**仅剩两把真杠杆**：
+- **① 专家 grouped GEMM（唯一 top-1）**：top-6 专家的 gate_up/down 合成 M=topk 的批 GEMM、走
+  tensor core，同时 246→~40 launch——唯一同时压 launch 与抬 SM 利用率的结构改动
+- **② P4 跨层流水**：ffn premix 挪进 L+1 的 attn 段、hc ⟨B⟩ 藏进 AR poll 窗口（−0.3~0.5ms）
+
+**结论**：开销量已近极限（8.23→~5ms 是回收上界）。真正的第二个 2x 只剩「专家核 GEMM 化」
+与「M>1 batching」（serve 级）两条架构路径；其余方向确认已接近架构极限。
