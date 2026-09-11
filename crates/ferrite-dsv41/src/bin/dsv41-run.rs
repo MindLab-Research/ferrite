@@ -518,7 +518,19 @@ enum RankCmd {
     /// One steady-state decode step (zero H2D — the token already sits in the
     /// device's `ids` buffer).
     Decode { token: u32, pos: usize },
+    /// `n` steady-state decode steps in ONE command. The rank threads are already
+    /// lockstep by construction (they run the same loop), so the per-token
+    /// command + world-way ack round trip was pure overhead: it dominated the step
+    /// (7.75 tok/s end-to-end vs 21.7 with the old direct loop). The pool issues
+    /// this and serves `decode()` from its look-ahead buffer; the engine contract
+    /// is unchanged. Stops early on a stop token, exactly like the driver would.
+    DecodeRun { token: u32, pos: usize, n: usize },
 }
+
+/// How many tokens one `DecodeRun` asks for. The round trip is amortized over
+/// this many steps; the cost of over-running is bounded by it (the pool discards
+/// the tail when the driver stops, and the next request resets the chain).
+const LOOKAHEAD: usize = 16;
 
 /// The model is ~80 s of mmap + upload; the first request waits for it.
 const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
@@ -540,9 +552,12 @@ struct TpRankPool {
     /// One command channel per rank (the broadcast fan-out).
     cmd: Vec<std::sync::mpsc::Sender<RankCmd>>,
     /// Rank replies: (rank, token-or-error).
-    res: std::sync::mpsc::Receiver<(usize, Result<u32>)>,
+    res: std::sync::mpsc::Receiver<(usize, Result<Vec<u32>>)>,
     /// One-shot load reports — a failed load arrives as `Err` from its rank.
     ready: std::sync::mpsc::Receiver<Result<usize>>,
+    /// Tokens already computed by the last `DecodeRun`, handed out one per
+    /// `StepEngine::decode` call (so the round trip is per LOOKAHEAD tokens).
+    lookahead: std::collections::VecDeque<u32>,
     /// The scope-owner thread, held (never joined) so the pool owns the ranks'
     /// lifetime: dropping the pool drops the command senders and each rank's
     /// `recv` then ends its loop.
@@ -577,17 +592,22 @@ impl TpRankPool {
         let cfg = cfg.clone();
         let max_ctx = cfg.max_seq_len;
         // the ranks must outlive this call, so the run_ranks scope parks here
+        // the ranks also need the stop set (the batched run stops early on a stop
+        // token, so the pool's look-ahead never runs past the driver's decision)
+        let stops_for_ranks = stops.clone();
         let owner = std::thread::Builder::new()
             .name("dsv41-tp-pool".into())
             .spawn(move || {
                 tp::run_ranks(world, move |rank| {
                     rank_loop(
-                        rank, world, &cfg, &dir, &so, &rxs, &res_tx, &ready_tx, &barrier, &staging,
+                        rank, world, &stops_for_ranks, &cfg, &dir, &so, &rxs, &res_tx, &ready_tx, &barrier,
+                        &staging,
                     )
                 })
             })
             .map_err(|e| ferrite_types::FerriteError::Config(format!("spawn tp pool: {e}")))?;
         Ok(TpRankPool {
+            lookahead: std::collections::VecDeque::new(),
             world,
             cmd,
             res,
@@ -626,19 +646,24 @@ impl TpRankPool {
     /// Broadcast one command, then collect EVERY rank's reply. Rank 0's token is
     /// the answer; any rank's error fails the step (a broken rank means a broken
     /// lockstep engine — the adapter poisons the pool on Err).
-    fn broadcast(&mut self, cmd: RankCmd) -> Result<u32> {
+    /// One round trip for `n` decode steps (see `RankCmd::DecodeRun`).
+    fn decode_run(&mut self, token: u32, pos: usize, n: usize) -> Result<Vec<u32>> {
+        self.broadcast(RankCmd::DecodeRun { token, pos, n })
+    }
+
+    fn broadcast(&mut self, cmd: RankCmd) -> Result<Vec<u32>> {
         for (r, tx) in self.cmd.iter().enumerate() {
             tx.send(cmd.clone()).map_err(|_| {
                 ferrite_types::FerriteError::Config(format!("tp pool: rank {r} is gone"))
             })?;
         }
-        let mut token: Option<u32> = None;
+        let mut tokens: Option<Vec<u32>> = None;
         let mut fault: Option<ferrite_types::FerriteError> = None;
         for _ in 0..self.world {
             match self.res.recv_timeout(STEP_TIMEOUT) {
                 Ok((rank, Ok(t))) => {
                     if rank == 0 {
-                        token = Some(t);
+                        tokens = Some(t);
                     }
                 }
                 Ok((rank, Err(e))) => {
@@ -656,7 +681,7 @@ impl TpRankPool {
         if let Some(e) = fault {
             return Err(e);
         }
-        token.ok_or_else(|| {
+        tokens.ok_or_else(|| {
             ferrite_types::FerriteError::Config("tp pool: rank 0 produced no token".into())
         })
     }
@@ -665,11 +690,31 @@ impl TpRankPool {
 impl StepEngine for TpRankPool {
     fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
         self.ensure_loaded()?;
-        self.broadcast(RankCmd::Prefill(prompt.to_vec()))
+        // a new request resets the chain, so any un-consumed look-ahead is stale
+        self.lookahead.clear();
+        let mut v = self.broadcast(RankCmd::Prefill(prompt.to_vec()))?;
+        Ok(if v.is_empty() { 0 } else { v.remove(0) })
     }
 
+    /// Serve one decode step, but only pay a command+ack round trip once every
+    /// LOOKAHEAD steps: the rank threads are lockstep by construction, so the
+    /// per-token round trip was pure overhead (it dominated the step and cost
+    /// ~2.8x end-to-end). The rank's n-step run produces exactly what n separate
+    /// calls would, so the buffered tokens are the values the driver expects.
     fn decode(&mut self, token: u32, pos: usize) -> Result<u32> {
-        self.broadcast(RankCmd::Decode { token, pos })
+        if let Some(t) = self.lookahead.pop_front() {
+            return Ok(t);
+        }
+        let n = LOOKAHEAD.min(self.max_ctx.saturating_sub(pos)).max(1);
+        let mut v = self.broadcast(RankCmd::DecodeRun { token, pos, n })?;
+        if v.is_empty() {
+            return Err(ferrite_types::FerriteError::Config(
+                "tp pool: decode run produced no token".into(),
+            ));
+        }
+        let first = v.remove(0);
+        self.lookahead.extend(v);
+        Ok(first)
     }
 
     fn is_stop(&self, token: u32) -> bool {
@@ -695,16 +740,17 @@ impl StepEngine for TpRankPool {
 fn rank_loop(
     rank: usize,
     world: usize,
+    stops: &[u32],
     cfg: &Dsv41Config,
     dir: &str,
     so: &str,
     rxs: &Arc<Vec<Mutex<std::sync::mpsc::Receiver<RankCmd>>>>,
-    res_tx: &std::sync::mpsc::Sender<(usize, Result<u32>)>,
+    res_tx: &std::sync::mpsc::Sender<(usize, Result<Vec<u32>>)>,
     ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
 ) -> Result<()> {
-    let r = pool_rank_body(rank, world, cfg, dir, so, rxs, res_tx, ready_tx, barrier, staging);
+    let r = pool_rank_body(rank, world, stops, cfg, dir, so, rxs, res_tx, ready_tx, barrier, staging);
     if let Err(e) = &r {
         let _ = ready_tx.send(Err(ferrite_types::FerriteError::Config(e.to_string())));
     }
@@ -715,11 +761,12 @@ fn rank_loop(
 fn pool_rank_body(
     rank: usize,
     world: usize,
+    stop_set: &[u32],
     cfg: &Dsv41Config,
     dir: &str,
     so: &str,
     rxs: &Arc<Vec<Mutex<std::sync::mpsc::Receiver<RankCmd>>>>,
-    res_tx: &std::sync::mpsc::Sender<(usize, Result<u32>)>,
+    res_tx: &std::sync::mpsc::Sender<(usize, Result<Vec<u32>>)>,
     ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
@@ -765,18 +812,98 @@ fn pool_rank_body(
     })?;
 
     // ---- the lockstep command loop ----
+    // Decode timing in the GLM house style (`[megab] replay ...`): printed from the
+    // RANK thread, so it is pure decode wall time with no HTTP/SSE/driver overhead.
+    // One line per DECODE_REPORT steps, plus the request's tail at the next prefill.
+    let timing = std::env::var("DSV41_TIMING").map(|v| v != "0").unwrap_or(true);
+    let mut dec_t0: Option<std::time::Instant> = None;
+    let mut dec_steps: usize = 0;
+    const DECODE_REPORT: usize = 32;
     let rx = rxs[rank].lock().unwrap();
     loop {
         match rx.recv() {
             Ok(RankCmd::Prefill(ids)) => {
-                let r = prefill_chain(&mut chain, &ids);
+                if timing && rank == 0 && dec_steps > 0 {
+                    if let Some(t0) = dec_t0 {
+                        let dt = t0.elapsed().as_secs_f64();
+                        eprintln!(
+                            "[dsv41] decode: {} steps in {:.2}s = {:.1} steps/s ({:.2} ms/step)",
+                            dec_steps,
+                            dt,
+                            dec_steps as f64 / dt,
+                            dt * 1e3 / dec_steps as f64
+                        );
+                    }
+                }
+                dec_t0 = None;
+                dec_steps = 0;
+                let r = prefill_chain(&mut chain, &ids).map(|t| vec![t]);
                 if res_tx.send((rank, r)).is_err() {
                     return Ok(()); // the pool is gone
                 }
             }
             Ok(RankCmd::Decode { token, pos }) => {
-                let r = chain.step_dev(token, pos);
+                let r = chain.step_dev(token, pos).map(|t| vec![t]);
+                if rank == 0 && r.is_ok() {
+                    dec_t0.get_or_insert_with(std::time::Instant::now);
+                    dec_steps += 1;
+                    if timing && dec_steps % DECODE_REPORT == 0 {
+                        if let Some(t0) = dec_t0 {
+                            let dt = t0.elapsed().as_secs_f64();
+                            eprintln!(
+                                "[dsv41] decode: {} steps in {:.2}s = {:.1} steps/s ({:.2} ms/step)",
+                                dec_steps,
+                                dt,
+                                dec_steps as f64 / dt,
+                                dt * 1e3 / dec_steps as f64
+                            );
+                        }
+                    }
+                }
                 if res_tx.send((rank, r)).is_err() {
+                    return Ok(());
+                }
+            }
+            Ok(RankCmd::DecodeRun { token, pos, n }) => {
+                // n steps in one command; stops early on a stop token so the pool's
+                // buffer never runs past the driver's stop decision
+                let mut out: Vec<u32> = Vec::with_capacity(n);
+                let mut t = token;
+                let mut r = Ok(());
+                for i in 0..n {
+                    match chain.step_dev(t, pos + i) {
+                        Ok(next) => {
+                            out.push(next);
+                            t = next;
+                            if stop_set.contains(&next) {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            r = Err(e);
+                            break;
+                        }
+                    }
+                }
+                if rank == 0 && r.is_ok() {
+                    dec_t0.get_or_insert_with(std::time::Instant::now);
+                    dec_steps += out.len();
+                    if timing && dec_steps >= DECODE_REPORT {
+                        if let Some(t0) = dec_t0 {
+                            let dt = t0.elapsed().as_secs_f64();
+                            eprintln!(
+                                "[dsv41] decode: {} steps in {:.2}s = {:.1} steps/s ({:.2} ms/step)",
+                                dec_steps,
+                                dt,
+                                dec_steps as f64 / dt,
+                                dt * 1e3 / dec_steps as f64
+                            );
+                        }
+                        dec_t0 = Some(std::time::Instant::now());
+                        dec_steps = 0;
+                    }
+                }
+                if res_tx.send((rank, r.map(|_| out))).is_err() {
                     return Ok(());
                 }
             }
