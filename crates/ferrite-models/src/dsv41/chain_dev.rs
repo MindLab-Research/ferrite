@@ -429,6 +429,26 @@ fn qr_epi() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_QR_EPI").map(|v| v != "0").unwrap_or(true))
 }
 
+/// B2 (DSV41_OROPE_Q, default ON): the inverse o-rope's epilogue emits the fp8
+/// of the whole roped region, so the `quant1(s.o)` launch right before wo_a
+/// (40/step) disappears. The emitted pair is `dsv41_quant_fp8(o)`'s, term for
+/// term (same 32-element block, same fast_round_scale, same clamp + e4m3), so
+/// the model output is unchanged; "0" reverts to rope + quant1. An .so without
+/// `dsv41_apply_rope_q`, or a declining shape, falls back on its own.
+fn orope_q() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_OROPE_Q").map(|v| v != "0").unwrap_or(true))
+}
+
+/// B2 (DSV41_RING_WIN_FUSE, default ON): one launch does the window ring append
+/// and the window indices (two adjacent, mutually independent one-block
+/// kernels), saving 40 launches/step. "0" reverts; an .so without
+/// `dsv41_ring_win_fuse` falls back on its own.
+fn ring_win_fuse() -> bool {
+    static F: std::sync::OnceLock<bool>::new();
+    *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
 /// DSV41_CUBLAS_M1=1 routes the M=1 f32/bf16 linears through cuBLAS.
 fn cublas_m1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2290,7 +2310,30 @@ fn hc_persist_mb() -> bool {
         };
         let cache = &self.layers[owner];
         let owns_kv = owner == layer;
-        if owns_kv {
+        // B2 (DSV41_RING_WIN_FUSE, default ON): the ring append and the window
+        // indices are two adjacent, mutually independent one-block kernels (the
+        // append writes the ring at pos % win; the indices read nothing but
+        // `pos_ctr`). One launch now does both. The indices may move up to here
+        // because nothing between this point and `sparse_attn` writes idxs[0,
+        // win) - `compress` touches the ring's compressed rows only - and
+        // sparse_attn is the only reader. `ring == null` for a consumer layer
+        // (it does not own its store) still performs the indices half, so the
+        // later standalone `window_idxs` disappears for EVERY layer. Falls back
+        // to the two launches on an .so without the symbol.
+        let rw_fused = ring_win_fuse()
+            && self.dev.ring_win_fuse(
+                if owns_kv {
+                    cache.ring.ptr as *mut f32
+                } else {
+                    std::ptr::null_mut()
+                },
+                self.s.kv.ptr as *const f32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                win as i32,
+                hd as i32,
+                idxs_ptr as *mut i32,
+            )?;
+        if !rw_fused && owns_kv {
             // DEVICE-side slot: a host-computed destination address would be frozen
             // by the graph capture (slot = pos % win at capture time), so every
             // replay wrote the same ring row and the window went stale.
@@ -2335,8 +2378,12 @@ fn hc_persist_mb() -> bool {
         // fresh on every step. Only the placeholder branch uploaded them before,
         // so the index-source path read stale indices — the illegal memory
         // access in sparse_attn.
-        self.dev
-            .window_idxs(idxs_ptr as *mut i32, self.s.pos_ctr.ptr as *const i32, win as i32)?;
+        // B2: the fused launch above already wrote the window indices (for every
+        // layer, owner or not); only the fallback path writes them here.
+        if !rw_fused {
+            self.dev
+                .window_idxs(idxs_ptr as *mut i32, self.s.pos_ctr.ptr as *const i32, win as i32)?;
+        }
         if comp_len > 0 && cfg.is_index_source(layer) {
             // EVERY index-source layer runs its own indexer (into its own
             // buffer) — the reference creates one for each, and non-source
@@ -2373,18 +2420,42 @@ fn hc_persist_mb() -> bool {
             cfg.index_topk as i32,
             1.0 / (hd as f32).sqrt(),
         )?;
-        self.dev.apply_rope(
-            self.s.o.ptr as *mut f32,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
-            nlh as i32,
-            hd as i32,
-            cfg.rope_head_dim as i32,
-            (cfg.rope_head_dim / 2) as i32,
-            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
-            0,
-            true,
-        )?;
+        // B2 (DSV41_OROPE_Q, default ON): the inverse rope's epilogue emits the
+        // fp8 of the whole `s.o` region (nlh*hd) in the same launch, which is
+        // exactly what the `quant1(s.o)` below would have computed - so that
+        // launch (one per layer per step) is skipped when the fused call took.
+        // The rope pass touches only the trailing `rope_head_dim` lanes of each
+        // head, so the emission is a second, warp-per-32-block pass over the
+        // WHOLE flat region, bit-identical to dsv41_quant_fp8 (rows=1, block=32).
+        let o_q_epi = orope_q()
+            && self.dev.apply_rope_q(
+                self.s.o.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                nlh as i32,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
+                0,
+                true,
+                self.s.xq.ptr as *mut u8,
+                self.s.xsc.ptr as *mut f32,
+            )?;
+        if !o_q_epi {
+            self.dev.apply_rope(
+                self.s.o.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                nlh as i32,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
+                0,
+                true,
+            )?;
+        }
 
         if layer == 0 && hc_dbg() {
             let o = self.dl(self.s.o.as_f32(), nlh * hd)?;
@@ -2402,7 +2473,11 @@ fn hc_persist_mb() -> bool {
         let olg = cfg.o_lora_rank;
         let nlg = groups / world; // wo_a is ColumnParallel: a block of groups each
         let k = hpg * hd;
-        self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
+        // B2: the o-rope epilogue above already emitted `s.xq`/`s.xsc` from the
+        // rotated `s.o`; only the fallback path still quantises here.
+        if !o_q_epi {
+            self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
+        }
         // B1 (DSV41_WO_QUANT_FUSE): the wo_a gemv's epilogue emits the fp8 of its
         // own output into `wo_q`/`wo_qsc` with quant_kernel's arithmetic, so the
         // `quant1(s.wo)` launch that used to sit between the two projections (one

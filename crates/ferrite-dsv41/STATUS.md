@@ -6111,3 +6111,35 @@ epoch 化 or 两阶段 kernel 而非选举）。
 - Producer/Consumer 链式融合（不改变 grid 形态）：dots→pubred epilogue、tail→lin2 prologue ≈ −0.3ms → ~7.7ms
 - 剩余 ~2.7ms 需要：全层 persistent（研究级）或 expert 结构突破（研究级）
 - **诚实评估：200 tok/s 在当前架构上需要 Stage C 完整落地 + expert 突破，工作量 1-2 周+**
+
+### 第 38 轮 + hcpm 根因 + IMPLEMENT 终局（2026-09-11 深夜）
+
+**第 38 轮：route fusion 中性**
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| rtf（route fusion ON） | 8.67ms | 115.3 | 四段全对 | 0 |
+| rtf0（OFF，控制） | 8.65ms | 115.6 | 四段全对 | 0 |
+
+route fusion（gate gemv 的 last-block epilogue 做 top-k）= 中性。384 块的 atomicAdd
+选举开销恰好抵消省下的 40 次 launch。保留默认 ON（位级一致 + 图节点少 40 个）。
+
+**hcpm (+3.3ms) 根因（hcpm-regression-analysis 的裁决）**：
+- ❌ fence/atomic/counter 全部证伪（量化 ≤2µs，与 41µs 差 20 倍；旁证：hc_front_kernel
+  只有 24 块却同样 +3.2ms——块数无关）
+- ✅ **主因：tail 的纯串行 L2 依赖链（ss→mixes→sinkhorn→comb）被塞进 dots 的同一 grid**
+  ——tail 只能等最后一次 publish，必然与整格 drain 串行，无法与任何工作重叠
+- ✅ 次因 1：hcpm 丢了 ss_in=1 优化（tail 整行 20480 float 重读）
+- ✅ 次因 2：g_hc_part 读取 8x 放大（runtime split 参数阻止展开）
+- ✅ 次因 3：三合一帧 >32 regs → 1 block/SM → 1.3 波（down-vec-320 同模式）
+- **重设计方向**：tail 保持独立 launch；dots 融进 pubred AR 的 epilogue（Producer/Consumer
+  链式融合）——hc-dots-pubred-fuse subagent 正在实施
+
+**IMPLEMENT 终局**：
+- logit probe（DSV41_TOP5）实测：附近位置 top-2 margin 小到 **0.0003**（12.450155 vs 12.449865）
+- 结合用户洞察（chat template 强制 </think> 抑制思考）：模型在该边界的思考 token
+  （IMPLEMENT/IMPLEMENTATION）与正确 token 近并列，被抑制的思考偶尔胜出泄漏到 content
+- **修复方向（用户决定）**：开 reasoning 模式（去掉 template 尾部的 </think>）——
+  但会改变输出格式（思考前言）。当前 template 明确选择 chat 模式（跳过思考直答）
+
+**当前基线 8.65ms / 115.6 tok/s（rtf0 控制臂）**。在飞三项（sparse key-split −0.20 +
+attn-tail 融合 −0.12 + dots→pubred −0.12）≈ 全落地 ~8.2ms ≈ 122 tok/s。

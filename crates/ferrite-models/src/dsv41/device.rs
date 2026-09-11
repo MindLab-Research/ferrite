@@ -220,6 +220,21 @@ struct Kernels {
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     ring_append:
         Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, c_int, CuStream) -> c_int>,
+    // B2: apply_rope whose epilogue ALSO emits the fp8 (byte + per-32-block
+    // scale) of the whole roped region, so the consumer's `quant_fp8(o)` launch
+    // (40/step) disappears. Optional: falls back to (apply_rope, quant_fp8).
+    // Returns 1 when the shape cannot take the fused emission.
+    apply_rope_q: Option<unsafe extern "C" fn(
+        *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int, *const c_int, c_int, c_int,
+        c_int, c_int, *mut u8, *mut f32, CuStream,
+    ) -> c_int>,
+    // B2: one launch for the `ring_append` + `window_idxs` pair (two adjacent,
+    // mutually independent one-block kernels). `ring == null` skips the append
+    // half but still writes the indices, so the standalone `window_idxs` launch
+    // disappears for every layer. Optional: falls back to the two.
+    ring_win_fuse: Option<unsafe extern "C" fn(
+        *mut f32, *const f32, *const c_int, c_int, c_int, *mut i32, CuStream,
+    ) -> c_int>,
     index_k_publish:
         Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, CuStream) -> c_int>,
     compress_commit: Option<
@@ -515,6 +530,8 @@ impl Device {
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
             compress_commit: ko!(rt, "dsv41_compress_commit"),
             ring_append: ko!(rt, "dsv41_ring_append"),
+            apply_rope_q: ko!(rt, "dsv41_apply_rope_q"),
+            ring_win_fuse: ko!(rt, "dsv41_ring_win_fuse"),
             index_k_publish: ko!(rt, "dsv41_index_k_publish"),
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
@@ -1998,6 +2015,68 @@ impl Device {
         let f = self.need(self.kernels.ring_append, "dsv41_ring_append")?;
         let rc = unsafe { f(ring, kv, pos_ctr, window, hd, self.stream) };
         self.kerr(rc, "dsv41_ring_append")
+    }
+
+    /// B2: apply_rope whose epilogue emits the fp8 of the whole roped region
+    /// (byte + per-32-block scale), the exact pair `quant_fp8(o)` would have
+    /// produced. `Ok(false)` means the .so predates the symbol or the shape
+    /// declined - the caller then runs the (apply_rope, quant1) pair.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_rope_q(
+        &self,
+        x: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        rows: i32,
+        row_len: i32,
+        dim: i32,
+        half: i32,
+        base: *const c_int,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = match self.kernels.apply_rope_q {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(x, cos, sin, rows, row_len, dim, half, base, mul, off, step, inverse as i32, xq, xsc,
+              self.stream)
+        };
+        // 1 == shape declined (caller falls back); any other non-zero is a real
+        // launch error.
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_apply_rope_q")?;
+        Ok(true)
+    }
+
+    /// B2: one launch for the ring append and the window indices. `ring` may be
+    /// null (a consumer layer that does not own its store) - the indices half
+    /// still runs, which is what removes the standalone `window_idxs` launch for
+    /// every layer. `Ok(false)` means the .so lacks the symbol and the caller
+    /// must run `ring_append` + `window_idxs` as before.
+    pub fn ring_win_fuse(
+        &self,
+        ring: *mut f32,
+        kv: *const f32,
+        pos_ctr: *const c_int,
+        window: i32,
+        hd: i32,
+        idxs: *mut i32,
+    ) -> Result<bool> {
+        let f = match self.kernels.ring_win_fuse {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe { f(ring, kv, pos_ctr, window, hd, idxs, self.stream) };
+        self.kerr(rc, "dsv41_ring_win_fuse")?;
+        Ok(true)
     }
 
     /// The fused compressor commit: reads `out_rows` on the device, ropes the

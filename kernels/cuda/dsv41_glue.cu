@@ -677,6 +677,49 @@ extern "C" int dsv41_ring_append(float* ring, const float* kv, const int* pos_ct
     return (int)cudaGetLastError();
 }
 
+// B2: ONE launch for the pair above and `window_idxs_kernel`. They are adjacent
+// in the step, both one-block kernels gated on nothing but `*pos_ctr`, and
+// neither consumes the other's output (the append writes the ring; the indices
+// read only the counter), so nothing is reordered by fusing them. `ring == null`
+// (a consumer layer that does not own its store) still performs the indices
+// half, which lets the later standalone `window_idxs` launch disappear for
+// EVERY layer, owner or not. Arithmetic is term for term the two kernels': the
+// ring slot is (*pos_ctr % window), the indices reproduce the decode branch of
+// ops::window_topk_idxs including the start_pos == 0 special case - so the
+// fused launch is byte-identical to the pair it replaces.
+__global__ void ring_win_fused_kernel(float* __restrict__ ring, const float* __restrict__ kv,
+                                      const int* __restrict__ pos_ctr, int window, int hd,
+                                      int32_t* __restrict__ idxs) {
+    const int gid = threadIdx.x + (int)blockIdx.x * blockDim.x;
+    const int start_pos = *pos_ctr;
+    if (ring != nullptr && gid < hd) {
+        const int slot = start_pos % window;
+        ring[(size_t)slot * (size_t)hd + gid] = kv[gid];
+    }
+    if (gid >= window) return;
+    const int c = gid;
+    if (start_pos == 0) {
+        idxs[c] = (c == 0) ? 0 : -1;
+        return;
+    }
+    const int oldest = (start_pos % window) + 1;
+    long long idx = ((long long)c < (long long)window - oldest)
+                        ? (long long)oldest + c
+                        : (long long)c - ((long long)window - oldest);
+    if (idx > (long long)start_pos) idx = -1;
+    idxs[c] = (int)idx;
+}
+
+extern "C" int dsv41_ring_win_fuse(float* ring, const float* kv, const int* pos_ctr, int window,
+                                   int hd, int32_t* idxs, cudaStream_t s) {
+    if (window <= 0) return (int)cudaSuccess;  // both halves are no-ops at window <= 0
+    const int n = (window > hd) ? window : hd;
+    ring_win_fused_kernel<<<(unsigned)((n + 127) / 128), 128, 0, s>>>(ring, kv, pos_ctr, window, hd,
+                                                                     idxs);
+    return (int)cudaGetLastError();
+}
+
+
 // AR v5 launchers removed: DSV41 now calls the shared ferrite_p2p_ar_v5
 // (ferrite_kernels.cu). The three DSV41 entry points (dsv41_ar_v5_store /
 // _publish / _reduce) and their kernels lived here.

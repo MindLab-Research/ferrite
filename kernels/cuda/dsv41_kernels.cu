@@ -1102,10 +1102,23 @@ __global__ void rope_precompute_kernel(float* __restrict__ cos, float* __restric
 // latent count, mul = ratio, off = -ratio, i.e. (clen - 1) * ratio). This is what
 // makes the call capturable in a graph: the counter advances on the device (the
 // argmax does it) and nothing about the launch arguments changes per step.
+//
+// B2 (o-rope fp8 epilogue): when `xq`/`xsc` are non-null, the kernel ALSO emits
+// the fp8 (byte + per-32-block scale) of the WHOLE region [0, rows*row_len) in
+// the same launch, which is exactly what the consumer's `quant1(s.o)` ->
+// `dsv41_quant_fp8` would have produced (rows=1, block=32, round_scale). NOTE
+// the rope pass below touches only the trailing `dim` columns of each row and
+// processes a PAIR per lane, so it CANNOT own a quant block: the emission is a
+// SECOND pass (one warp per 32-block, quant_kernel<0>'s arithmetic term for
+// term) after a barrier makes the rotated writes visible. `dsv41_apply_rope`
+// passes null/null and the kernel is byte-identical to before; the epilogue
+// variant is reached through `dsv41_apply_rope_q`, which declines (returns 1)
+// unless rows*row_len is a multiple of 32 so every warp is fully active.
 __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict__ cos,
                                   const float* __restrict__ sin, int rows, int row_len, int dim,
                                   int half, const int* __restrict__ base, int mul, int off,
-                                  int step, int inverse) {
+                                  int step, int inverse, uint8_t* __restrict__ xq,
+                                  float* __restrict__ xsc) {
     const int r = blockIdx.x;
     if (r >= rows) return;
     const int t = (*base) * mul + off + r * step;
@@ -1117,9 +1130,31 @@ __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict
         row[2 * i] = x0 * c - x1 * s;
         row[2 * i + 1] = x0 * s + x1 * c;
     }
+    if (xq == nullptr) return;
+    // fp8 epilogue: the barrier makes the rope writes above visible to the
+    // quant pass, which reads a different lane's column of the SAME row.
+    __syncthreads();
+    const int total = rows * row_len;   // multiple of 32 (guarded by the launcher)
+    const int lane = threadIdx.x & 31;
+    const int gwarp = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    const int nwarp = gridDim.x * (blockDim.x >> 5);
+    for (int b = gwarp; b < total / 32; b += nwarp) {
+        const int col = b * 32 + lane;
+        const float v = x[col];
+        // one shuffle for the whole 32-element block: every warp is fully
+        // active inside a block (blockDim is a multiple of 32 and `col` starts
+        // at a block boundary), which is what makes this quant_kernel<0>-exact.
+        float a = fabsf(v);
+        for (int off2 = 16; off2 > 0; off2 >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off2));
+        const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+        if (lane == 0) xsc[b] = sc;
+        const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+        const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+        xq[col] = *(const uint8_t*)&f8;
+    }
 }
 
-// rmsnorm + apply_rope on one row, one launch (the kv chain's adjacent pair:
 // the norm writes the trailing rope section, the rope rotates it in place).
 // The reduction tree is rmsnorm_kernel's verbatim at the same blockDim, and the
 // rope half is elementwise - both are bit-identical to the two-launch sequence,
@@ -2839,8 +2874,19 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     // version for A/B. Cached in a static: this runs per attention call, and a
     // per-call getenv is exactly the hot-path slip this project has been bitten by.
     static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
-    // Chunked key split (DSV41_ATTN_SPLIT=C): off until the A/B passes, then the
-    // default becomes the winning chunk count.
+    // Chunked key split with the three-deep prefetch pipeline: DEFAULT ON
+    // (DSV41_ATTN_PF_SPLIT=0 restores the single-block pf kernel, =C picks the
+    // chunk count, default kAttnPfSplitDefault). DSV41_ATTN_SPLIT=C is the older
+    // explicit knob for the same kernel and still wins when set - arms that pass
+    // it predate the prefetch port and must keep selecting this kernel rather
+    // than silently fall through to the single-block shape they A/B against.
+    static const int g_attn_pf_split = [] {
+        const char* e = getenv("DSV41_ATTN_PF_SPLIT");
+        if (e == nullptr) return kAttnPfSplitDefault;  // default ON
+        const int v = atoi(e);
+        if (v == 0) return 0;                          // explicit opt-out -> pf
+        return (v >= 1 && v <= kAttnMaxC) ? v : kAttnPfSplitDefault;
+    }();
     static const int g_attn_split = [] {
         const char* e = getenv("DSV41_ATTN_SPLIT");
         if (e == nullptr) return 0;
@@ -2854,15 +2900,20 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     }();
     dim3 grid(b * m, h);
     if (!seq) {
-        if (g_attn_split > 0 && g_attn_split <= kAttnMaxC && b * m <= kAttnMaxBM &&
+        const int split_c = (g_attn_split > 0) ? g_attn_split : g_attn_pf_split;
+        if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
             h <= kAttnMaxH) {
-            sparse_attn_split_kernel<<<dim3((unsigned)g_attn_split, (unsigned)(b * m),
+            // One block per (chunk, row, head); the split writes the partials,
+            // the merge folds the sink and normalises. Both launches stay on the
+            // SAME stream: program order makes the partials visible to the merge
+            // with no fence and no sync.
+            sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
-                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, g_attn_split);
+                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
-                sink, out, b, m, h, d, g_attn_split);
+                sink, out, b, m, h, d, split_c);
             return (int)cudaGetLastError();
         }
         if (!pf_off)
@@ -3117,7 +3168,22 @@ extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, in
                                 int dim, int half, const int* base, int mul, int off, int step, int inverse,
                                 cudaStream_t s) {
     apply_rope_kernel<<<rows, 128, 0, s>>>(x, cos, sin, rows, row_len, dim, half, base, mul, off, step,
-                                           inverse);
+                                           inverse, nullptr, nullptr);
+    return (int)cudaGetLastError();
+}
+
+// B2: apply_rope whose epilogue emits the fp8 of the whole roped region, so the
+// consumer's `quant1(o)` launch (40 per step: one per layer, right after the
+// inverse rope) disappears. Returns 1 when the shape cannot take the fused
+// emission (rows*row_len not a multiple of 32) - the caller then runs the plain
+// dsv41_apply_rope + dsv41_quant_fp8 pair, which this is bit-identical to.
+extern "C" int dsv41_apply_rope_q(float* x, const float* cos, const float* sin, int rows,
+                                  int row_len, int dim, int half, const int* base, int mul, int off,
+                                  int step, int inverse, uint8_t* xq, float* xsc, cudaStream_t s) {
+    if (rows <= 0 || row_len <= 0) return 1;
+    if (((long long)rows * (long long)row_len) % 32 != 0) return 1;
+    apply_rope_kernel<<<rows, 128, 0, s>>>(x, cos, sin, rows, row_len, dim, half, base, mul, off,
+                                           step, inverse, xq, xsc);
     return (int)cudaGetLastError();
 }
 
