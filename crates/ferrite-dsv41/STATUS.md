@@ -7261,3 +7261,19 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 - **不是 FMA 吞吐受限，是操作数供给/延迟受限**——若是指令吞吐受限 IPC 应逼近上限而非 0.8
 
 **路径**：expert-cpasync-full 实施完整 cp.async 流水（D 组在飞）——乐观 4-5x → MoE 1.47→~0.4ms（−1.0ms，不确定度高）
+
+### 跨层流水定案：L2 预热收益有限，真金在同层 w2 预热（2026-09-12 06:00）
+
+**cross-layer-pipe 的发现**：
+1. **80% 被路由挡死**：L+1 的专家权重取哪 6/384 由 gate(xn) 决定（AR#1 输出派生）——跨层预取不可行
+2. **可预取的 20%**（静态稠密权重 ~20MB/rank/层）落在 gemm_fp8_gemv 上，但该核 91% 是固定成本 → L2 命中只省 ~9% → **−0.05~0.15ms**
+3. **真正的机会：同层 w2 预热**——gateup 后 topk 已知，down 要读的 w2（9.17MB）可在 swiglu/down 期间预热进 L2 → **−0.2~0.3ms**（w2-prefetch-impl 实施中）
+4. down kernel 286GB/s 延迟受限——L2 命中把延迟 ~600ns → ~200ns
+
+**nsys v9 的新鲜分解**（生产 v5 AR 口径的 6.23ms）：
+- gemm: ~2.2-2.4ms（35-38%）
+- **expert gateup 23.9µs + down 17.4µs = 1.65ms（26%）← 最大可攻项**
+- AR v5: ~0.65ms（10%）
+- hc 侧流: 隐藏在主流下（DL 14.9µs < 主流窗口 50µs）
+- sparse+merge: ~0.36ms · gemv_bf16: ~0.44ms · misc: ~0.3ms
+- down fix 验证 ✓（17.4µs vs 回归期 23.8µs，恢复 pre-regression 17.2µs）
