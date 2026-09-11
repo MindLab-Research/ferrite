@@ -4014,3 +4014,30 @@ replicated on every rank**）。
    `indexer_topk` 属第①类且**只有 blockDim 一条不牺牲正确性的杠杆**。
 4. **`kIndexerChunk=4096`**、smem 由编译期常量推出（36KB，单 block，永不需 smem 属性opt-in）——
    所以 blockDim 与 smem 无关，可安全放大到 1024。
+
+## 隔离微基准（`/tmp/gbf_bench2.cu`、`/tmp/idx_bench.cu`，生产 .so + 生产 shape）
+
+| 形状 | 中位耗时 | 权重 | 洞察 |
+|---|---|---|---|
+| fp8 `wq_b` n=1024 k=5120 | 22.66 us | 5.0MB | |
+| fp8 `wq_a+wkv` n=1664 | 24.83 us | 8.1MB | |
+| **fp8 `sharedexp` n=256** | **20.19 us** | 1.25MB | **与 1024 行同价 ⇒ ~20us 全是每调用的固定开销** |
+| bf16 gate n=384 k=5120 | 12.42 us | 3.75MB | 固定开销主导 |
+| **bf16 lm_head n=129280** | **298.30 us** | **1262MB** | 全量复制到每 rank ⇒ **切分 /8 后 48.5us（省 0.25ms/步）** |
+| bf16 lm_head n=16160 | 48.51 us | 158MB | 切分后的形状 |
+| indexer n_pos=32 | **188 us** | — | 见下 |
+| indexer n_pos=128 / 512 / 2048 / 4096 | 299 / 1165 / 4548 / 9063 us | — | n_pos 增长时灾难性 |
+
+**两条硬结论**：
+1. **fp8 gemv 的 ~20us 与行数无关**（256 行与 1664 行同价）⇒ 每次调用是**固定成本**
+   （staging + 每 warp 一行 × 160 步串行 kb 链，且行数=并行度上限：1024 行 = 1024 warp = 7 warp/SM）。
+   ⇒ **唯一杠杆是减少调用次数（合并同输入的投影）**，合并清单：
+   ✅ wq_a+wkv（已有）· ✅ 共享专家 w1+w3（本次）· ❌ wq_b/wo_b（输入不同）·
+   ❌ gate bf16 vs 共享专家 fp8（类型不同）· ❌ 跨层（输入不同）。
+2. **`indexer_topk` 的 score 循环是"每候选 1 线程 × nh(32) 头 × hd(128) 串行"**
+   = 16384 cycle 的串行链/候选，且只有 `len` 个线程在工作（1024 线程里）。
+   **改成 warp-per-candidate（lane h 算头 h）+ 按 h 升序的 lane-indexed shfl gather** ⇒
+   逐位等价（每头 dot 的 c 升序不变，头的求和仍按 h 升序）而墙钟 32×。
+
+**`argmax_kernel` 的关键语义**（lm_head 切分时必须保持）：`pos_ctr` 在**这个核里**每步 +1，
+且用 u64 打包 `(value_key, ~index)` 保证**并列取最小 index** —— 跨 rank 归约必须复刻这条规则。
