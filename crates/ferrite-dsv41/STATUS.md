@@ -2467,3 +2467,30 @@ down 传池的真实 stride ✓），或从 Rust 侧一并传 `b_row_stride` ✓
 2. **隔离复现器**（含空 kernel 发射地板对照 ✓）：真实 shape + 预热 + 500 次计时 ✓
 3. **两条判据**：多卡 nsys 只用于**排序** ✓（绝对耗时不可信 ✗）；最终结论一律取
    **同二进制背靠背 A/B + 四段文本** ✓
+
+## ★★★★★ 落地：专家 down 并入 GEMV（修掉 true 根因）—— **18.5 → 19.8 tok/s（+7%）**
+
+**真正的根因（不是行跨距 ✗，我先前那个假设已被代码自我否决）** ✓：
+调用点（`chain_dev.rs` 的专家循环）传的是 **`route_w + slot`** ⇒ **`row_weight` 是每 (token, slot) 的一个 float** ✓，
+即**属于 M 行维度** ✓；而我的 GEMV 写成 `x *= row_weight[row]`，其中 `row` 遍历的是
+**输出列 n（0..n_total=4096）** ✗✗ ⇒ **越界读 4096 个 float** ⇒ 全零 + illegal memory access ✓✓。
+**为什么原 `mxf4_gemm` 没炸** ✓：它的 M 循环上界是 `rows`（=1 ✓）⇒ **只会访问 `row_weight[0]`** ✓；
+**转置的 down 调用是我这个 kernel 第一次把该索引用错轴的地方** ✓。
+
+**修法（一行）**：`if (row_weight != nullptr) x *= row_weight[0];`（M==1 恒为 0 ✓）
++ 把分派重新放宽到 `rows == 1`（不限 AQ ✓）⇒ down 也走 GEMV ✓。
+
+**验证（同二进制）**：
+| | 改前 | 改后 |
+|---|---|---|
+| 吞吐 | 18.5 tok/s（54.1ms）| **19.8 tok/s（50.46ms）** ✓ |
+| 四段文本 | 全对 ✓ | **全对 ✓**（Paris / Tokyo. / “2”后停止 / 静夜思连贯）|
+
+**会话累计：2.6 → 19.8 tok/s（7.6x）** ✓✓ —— 五个 kernel 级收益：
+hc_mixes 块形状 +74% · fp4 GEMV(gate/up) +21% · fp8 GEMV +16% · warp sinkhorn +5% · down 并入 GEMV +7% ✓
+
+### 教训（新增，务必记住）
+> **区分"输出列 n"与"M 行"** ✓：任何"每行/每 token"的量（路由权重、mask、bias、scale ✓）
+> 在 M=1 的 GEMV 里索引都必须是 **0（M 行）**，而不是输出列的 `row` ✗。
+> 反面教材：`row_weight[row]` 在 M=128 的 GEMM 里"碰巧"只看 `[0]` 而没暴露 ✓ ——
+> 移植 kernel 时必须逐个确认每个参数的**维度归属** ✓。
