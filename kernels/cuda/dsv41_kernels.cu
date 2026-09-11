@@ -50,15 +50,14 @@ __device__ __forceinline__ float ue8m0_to_f(uint8_t b) {
 
 __device__ __forceinline__ float e4m3_to_f(uint8_t b) {
     // sign(1) exp(4) mantissa(3), bias 7; subnormals (exp 0) are m * 2^-9.
-    const uint32_t s = (b & 0x80u) ? 0x80000000u : 0u;
-    const uint32_t e = (b >> 3) & 0x0Fu;
-    const uint32_t m = b & 0x07u;
-    if (e == 0) {
+    const uint32_t s = ((uint32_t)b & 0x80u) << 24;
+    const uint32_t e = ((uint32_t)b >> 3) & 0x0Fu;
+    const uint32_t m = (uint32_t)b & 0x07u;
+    if (e == 0u) {
         const float v = (float)m * (1.0f / 512.0f);
-        return s ? -v : v;
+        return (b & 0x80u) ? -v : v;
     }
-    const float v = (1.0f + (float)m * 0.125f) * exp2f((float)((int)e - 7));
-    return s ? -v : v;
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
 }
 
 // The e2m1 code table (convert.py FP4_TABLE).
