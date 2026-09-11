@@ -6766,3 +6766,24 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 1. interleave_gateup_fp4 2.91ms 的身份调查（subagent 进行中）
 2. gemm 3.02ms 的进一步优化（subagent 进行中）
 3. down_reduce +38% 回归的根因（subagent 进行中）
+
+### nsys v7 修正：interleave_gateup_fp4 是加载期一次性成本（非每步）
+
+**interleave-gateup-investigate 的发现**：
+- `interleave_gateup_fp4` 是 `DSV41_EXPERT_ILV` 的加载期辅助置换核
+- 15744 次 = 40 层 × 384 experts + 3 MTP 层 × 128 experts = **加载期一次性 34.6ms**
+- nsys-interpreter 误把它除以步数报成"每步 2.91ms/22.2%"——**不是稳态成本**
+- v5 没有这个 kernel 只因 v5 没有 ILV
+
+**修正后的 6.90ms 实际每步分解**（去掉 interleave 2.91ms 和 lm_head artifact 0.28ms）：
+| kernel | ms/步 | % |
+|---|---|---|
+| gemm_fp8_gemv | 3.02 | 44% |
+| hc_mixes_tail (side) | 1.13 | 16% |
+| expert gateup (K-split ON 后 ~0.79) | 0.79 | 12% |
+| expert down_reduce | 0.95 | 14% |
+| AR (v5 生产路径) | ~0.66 | 10% |
+| hc_mix_dots (side) | 0.57 | 8% |
+| 其它 | ~0.4 | 6% |
+
+**⚠️ nsys 读数陷阱**：加载期 kernel 按步数归因会误导优先级——所有从 nsys 表推导的分解必须先剔除加载期 launch。

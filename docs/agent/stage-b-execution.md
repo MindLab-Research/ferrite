@@ -58,4 +58,6 @@
 - ABI：`FERRITE_KERNEL_ABI_VERSION` 1→2（`EXPECTED_ABI` 同步），防止旧 .so 按旧签名解释新参数。
 - 自测：`tests_tcgen05_mxf4.cu` 新增 `run_ilv_case()`（同一组权重 plain vs interleaved 走 batched 融合核，**逐位比较**）。
 
+**nsys 读数陷阱（2026-09-11 查证）**：`dsv41_interleave_gateup_fp4` 只在**加载期**跑，调用点唯一（`load.rs:692`，`load_expert_pool` 内逐 expert 一次）。总 launch 数固定 = `40 骨干层 × 384 + 3 MTP 层 × 128 = 15744`，与 `n_routed_experts=384` / `dspark_n_routed_experts=128` / `n_mtp_layers=3` 精确吻合（`moe_config()` 对 MTP 层回退到 dspark 值）。实测单次 ~2.2µs ⇒ 一次性总耗时 ~34.6ms；若 capture 窗口覆盖了 `load()`，nsys-interpreter 除以窗口内步数就会把它报成"每步 2.91ms / 22.2%"——**这不是稳态每步成本**（对比 v5 为空正是因为 v5 无 ILV）。归因时应剔除加载期 launch 或分开 capture 窗口。
+
 **远端验证口径（必做）**：①`nvcc -arch=sm_103a -O2 -std=c++17 -o /tmp/t tests_tcgen05_mxf4.cu && /tmp/t` → `run_ilv_case` 必须 EXACT；②同一次 checkout 出双产物，`DSV41_EXPERT_ILV=1` vs `=0` 背靠背单轮，四段文本逐字节相同 + `faults=0`，再看 p50（这才是 −0.09ms 的判据）；③加载正确性：`DSV41_LOAD_TRACE=1` 看每 rank 权重字节数不变（交错不改变总量），并用 `DSV41_MOEDBG=1` 确认路由/输出正常（若交错写错，第一层 MoE 输出就会崩）。
