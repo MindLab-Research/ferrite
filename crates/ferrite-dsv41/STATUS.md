@@ -5805,3 +5805,36 @@ quant-producer-direct 报告的 4 条前提中 3 条与当前代码不符：
 - AR 1.49ms 是被低估的第 2 大项——**AR 的图节点数（246/步）是 Stage C persistent 的最强论据**
 - hc_post 融合（−0.15）+ AR store 融合进 producer（−0.37 store 消失）= AR 从 3 kernel 降到 1 kernel/次
 - **Stage C persistent 把 AR 从 3 kernel/层 降到 1 kernel/段 = 120 vs 246 AR 节点**
+
+### 第 31 轮：hc_post fold 中性 + gate v2 发现（−0.5ms 机会）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| hcp（hc_post 融入 pubred AR） | 9.50ms | 105.3 | 四段全对 | 0 |
+
+hc_post fold 中性（−0.15ms 未兑现为墙钟收益——AR 的协议延迟地板吞掉了它）。
+但代码保留（位级一致、零风险），为 Stage C persistent 做准备（当 AR 从 3→1 kernel 时，
+hc_post 的 0.15ms 才会真正浮现）。
+
+### gateup-sact-cse-v2 的重大发现：gate 换 v2 核可回收 0.5ms
+
+- **gate（n=384, bf16, 40 次/步）实测 17.2µs = 228GB/s = 峰值的 3%——不是带宽受限，是延迟/并发受限**
+- 病根：384 行 / 8 warp/block = 仅 48 blocks（148 SM 的 32%）；160 次串行标量 bf16 读（无 unroll）
+- **已有的 `gemv_bf16_v2_kernel`**（ferrite_kernels.cu:2731）专为这种 shape 写的：
+  uint4 向量读（160→20 迭代）+ K-split（WPR warp/行，4 warp/行 → 1536 warps）
+- **预期 17.2→3-5µs × 40 次 = −0.5ms/步**
+- lm_head（n=16160）已在带宽地板（165MB/7.6TB/s = 21.8µs ≈ 实测）——无法再优化
+- gate-v2-switch subagent 正在实施
+
+**nsys-v3 后的更新分解（9.38ms 的真实构成）**：
+| 项 | ms | 地板判定 | 可砍 |
+|---|---|---|---|
+| gemm_fp8_gemv | 1.94 | 指令级 | 只能减 launch 数 |
+| gemv_bf16(gate) | 0.84 | **延迟受限（3% 峰值）** | **−0.5ms（v2 核）** |
+| expert fp4 | 2.0 | L1TEX | 结构级 |
+| hc 链 | 1.55 | — | hc_post 已 fold |
+| AR | 1.49 | NVLink 协议 | 3→1 kernel（−0.5ms） |
+| sparse+route+quant | 0.73 | — | 生产者直出 |
+| 其它 | 0.35 | | |
+
+**两项大杠杆 = gate v2（−0.5）+ AR 3→1（−0.5）= 9.38 → 8.4ms（~119 tok/s）**

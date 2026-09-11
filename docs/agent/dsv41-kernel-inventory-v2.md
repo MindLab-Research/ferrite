@@ -6,6 +6,16 @@
 它此前被"per-rank 平均"的 nsys 口径藏成 0.275ms（rank0 串行），TP 切分后才暴露为每 rank 的真实成本。
 **第二大发现**：`gemm_fp8_gemv` 调用数 171 → **206 次/步（+35）**，gap-analysis 的 171 已过时，来源待归因。
 
+> ## ⚠️ 更正（2026-09-11 17:0x，读本文前必看）
+> 1. **本文的表是 `DSV41_MIX_GATE=ON` 口径**——采集时的 tree `60a01a5` 该门默认还是 `unwrap_or(true)`。
+>    `ef77bc7`（round-25 定案）已把它翻成 **OFF 并成为生产默认**，kernel 混合随之改变：
+>    `gemv_bf16_fp8x2`（本文的 #2）**不再被调用**，其工作拆回 40 次 `gemv_bf16` + 40 次 `gemm_fp8_gemv`。
+>    ⇒ **不要把本文 §1 的表当生产口径用**；post-CSE 的生产口径见 **`docs/agent/dsv41-kernel-inventory-v3.md`**。
+> 2. **本文的证据目录已改名**：`/tmp/dsv41-prof-v3` 被 v3 采集覆盖，本文的数据现存放于
+>    **`/tmp/dsv41-prof-v2-mixgate`**（`one.csv`/`many.csv`/`*.nsys-rep` 原样保留，勿删）。
+> 3. 本文 §5 待实测 #4（"55dc747 env 缓存未含"）**已过时**：该 commit 早已在 HEAD 之内，v3 采集已含。
+> 4. 本文 #2 行关于 `gemv_bf16_fp8x2` 33µs/call 的数字仍有效，但该核在 HEAD 上调用数为 **0**。
+
 ---
 
 ## 0. 采集状态与口径（读之前必看）
@@ -43,7 +53,7 @@
 | 5 | `expert_gemv_fp4_down_reduce_kernel<true>`（down+reduce 融合） | 40 | 17.2 | **0.69** | 7.1% | 新增 | — | down+reduce 合一：删 `grid.y` slot 维、升序 slot 累加（= reduce 数值契约）、`ex_down_b` 全程留寄存器；替代旧 down + `moe_down_reduce` |
 | 6 | **AR v5**（store + pubred） | 80 | — | **0.66** | 6.8% | 0.66 | 0 | NVLink 协议地板 |
 | 7 | `hc_mix_dots_kernel` | 80 | 7.0 | **0.56** | 5.8% | 0.59 | −0.03 | 4 warp 协同 staging |
-| 8 | `gemv_bf16_kernel`（lm_head 切片 + engram） | 9 | 45.0 | **0.41** | 4.2% | 0.98 (44@22.3) | −0.57 | ① lm_head 1/8 词表切分 ② **MIX_GATE**（`chain_dev.rs:2324` `sh_via_mixed = mix_gate_shared() && gemm_bf16_fp8x2(...)`）把 gate+w1/w3 合成 `gemv_bf16_fp8x2` → 调用 **44→9**，与 fp8x2 的 **5→40** 数值对应（−35/+35）；精确拆分待代码/历史核 |
+| 8 | `gemv_bf16_kernel`（lm_head 切片 + engram） | 9 | 45.0 | **0.41** | 4.2% | 0.98 (44@22.3) | −0.57 | ① lm_head 1/8 词表切分 ② **MIX_GATE**（`chain_dev.rs:2324` `sh_via_mixed = mix_gate_shared() && gemm_bf16_fp8x2(...)`）把 gate+w1/w3 合成 `gemv_bf16_fp8x2` → 调用 **44→9**，与 fp8x2 的 **5→40** 数值对应（−35/+35）；精确拆分待代码/历史核。**⚠️ 本行为 MIX_GATE=ON 口径**——第 25 轮定案 `MIX_GATE=OFF`（9.38ms）后重新拆分：`gemv_bf16` **9→49 次 / 0.41→0.84ms**（40 次 gate n=384 + 1 次 lm_head n=16160 + ~8 其它），`gemv_bf16_fp8x2` **40→5 次**。gate 单次 med 17.2µs 是**并发受限**（`dsv41_glue.cu:817` `blocks=(n+7)/8` → 仅 48 blocks / 8 warps = 12.5% occupancy），非带宽地板（3.93MB 的 DRAM 地板仅 0.5µs）；lm_head 侧 2020 blocks 才是带宽地板（165.5MB→21.8µs） |
 | 9 | `sparse_attn_pf_kernel` | 40 | 8.5 | **0.34** | 3.5% | 0.42 (10.5µs) | −0.08 | 3 深预取 |
 | 10 | `quant_kernel<0>` | 166 | 1.6 | **0.26** | 2.7% | 0.28 (176) | −0.02 | P2 冗余 zero 跳过（调用 −10）；**纯固定成本，未到预测的 0.15**。T2（`db29175`）已摘掉 80 次里的 40：qr 路的 rmsnorm epilogue 直出（`dsv41_rmsnorm_q`）+ MoE 侧 fp4 独立 scratch 让 T1 flag 存活到 `:2701`；剩 `:1995`(`o`→wo_a)、`:2043`(`wo`→wo_b) 两个整行 absmax 的 site |
 | 11 | `route_topk_kernel` | 40 | 5.2 | **0.21** | 2.2% | 0.21 | 0 | P1 只删了 `hist` 死码（`route_hist` 已消失），固定成本未降 |
@@ -118,7 +128,7 @@ Top-3/4 是 roadmap 定义的 Stage B 本体（结构性，8.8→7.2 段）；To
 |---|---|---|---|
 | `gemm_fp8_gemv` | 2.18 | **1.98** | ✅ **准，略优于预测**——LUT 比估计更狠（17.0→9.6µs，预测 11.6µs）。91% 固定项结论不变 |
 | `expert_gemv_fp4_batched` | 1.75 | **1.03 + down_reduce 0.69 = 1.72** | ✅ 准（家族合计）；但**结构被融合拆成两核**，单行预测已不适用 |
-| `gemv_bf16` | 0.74 | **0.41** | ✅ **优于预测**——MIX_GATE 把 40 次 gate 调用移走，额外 −0.33 |
+| `gemv_bf16` | 0.74 | **0.41**（MIX_GATE=ON）/ **0.84**（MIX_GATE=OFF，49 次） | ✅ 准——MIX_GATE=ON 时把 40 次 gate 移走得 −0.33；但第 25 轮定案 OFF 后 gate 回到 `gemv_bf16`，0.84ms 成第 2 大项。**gate 未到带宽地板**（48 blocks / 12.5% occupancy 的延迟受限），可削减项是把 gate 换到向量化 + K-split 的 `gemv_bf16_v2_kernel`（`ferrite_kernels.cu:2731`） |
 | hc 链 | 1.59 | **1.55** | ✅ 准（tail 0.99 + dots 0.56）|
 | AR v5 | 0.66 | **0.66** | ✅ 准（协议地板）|
 | `sparse_attn` | 0.32 | **0.34** | ✅ 准 |
@@ -150,9 +160,9 @@ Top-3/4 是 roadmap 定义的 Stage B 本体（结构性，8.8→7.2 段）；To
 ssh ubuntu@43.202.208.136
 cd /home/ubuntu/ferrite
 export DSV41_GATEUP_FUSE=1 DSV41_DOWN_FUSE=1
-bash scripts/dsv41_profile.sh 30 /tmp/dsv41-prof-v3
+bash scripts/dsv41_profile.sh 30 /tmp/dsv41-prof-v2-mixgate   # 原 /tmp/dsv41-prof-v3，已被 v3 采集覆盖前改名
 # 差分（脚本已内置；N 必须与实参一致——prof2 当时用 40、我按 30 算会整体 ×1.3）
-python3 /tmp/kdiff.py /tmp/dsv41-prof-v3/one.csv /tmp/dsv41-prof-v3/many.csv 30
+python3 /tmp/kdiff.py /tmp/dsv41-prof-v2-mixgate/one.csv /tmp/dsv41-prof-v2-mixgate/many.csv 30
 ```
 
 **待实测清单**（本次未做）：
