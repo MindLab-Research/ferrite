@@ -792,7 +792,16 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
     if (n <= 0 || k <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
-    gemv_f32_kernel<<<blocks, 256, 0, s>>>(w, x, out, n, k);
+    // Same as gemv_bf16: the kernel stages the activation row in shared memory,
+    // so the size is the caller's to pass. Launching with 0 made that staging
+    // walk off an empty allocation on the sibling kernel.
+    const size_t smem = (size_t)k * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gemv_f32_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemv_f32_kernel<<<blocks, 256, smem, s>>>(w, x, out, n, k);
     return (int)cudaGetLastError();
 }
 
