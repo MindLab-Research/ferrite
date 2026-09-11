@@ -2776,3 +2776,47 @@ A/B 中性（21.2 vs 21.3 tok/s —— 哈希本身极小，收益是**消 H2D +
 **方法论沉淀**：全运行 nsys 平均 ≠ decode（差分法 ✓）；多卡 nsys 单次耗时不可信（复现器 ✓）；
 L2 常驻工作集上"流量大"≠瓶颈；一次只改一个变量；同二进制背靠背；构建后必查 error 数与 nm；
 匿名 namespace = dlsym 盲区；"输出列 n"≠"M 行"。
+
+## ★★★★★★ 本阶段：设备化 → 整步单图 → serve 并入共享栈（用户三项指令）
+
+### ① 全部每步动态值设备化（图捕获的前提）
+| # | 量 | 设备化方式 |
+|---|---|---|
+| 1 | `pos` | 单一点位计数器 `s.pos_ctr`；**argmax（步内最后一个 kernel）推进它** ⇒ 步内所有 kernel 读到的都是稳定当前值 ✓ |
+| 2 | `compress_len`（每层） | `s.clen[n_layers]` 设备计数器 ✓ |
+| 3 | compress 的下载+分支+rope+拷贝 | **新 `dsv41_compress_commit`**：读设备 `out_rows` → rope（照 `apply_rope_kernel` 的数学：`hd-rope_dim` 偏移、`cos[t*half+i]`、成对旋转）→ 存 ring 第 `window+*clen` 行 → 推进 `*clen` ✓ **无 `__syncthreads`**（每线程自读对、写目标 ⇒ 规避早退 UB ✓）|
+| 4 | `apply_rope` 的 pos/group 位置 | 统一为**设备指针 + 乘加**：`t = (*base)*mul + off` ⇒ 覆盖 `pos`(mul=1,off=0) 与 `(clen-1)*ratio`(base=&clen, mul=ratio, off=-ratio) 两种 ✓ |
+| 5 | `compressor_pool`/`compressor_state` | 读设备 `pos_ctr`；**`out_rows_val` 由 kernel 从计数器算出**（`((*pos_ctr+1)%ratio==0)`）✓ |
+| 6 | `sparse_attn` 的 `n`/`topk` | 改为读设备 clen：`n = window+*clen`、`topk = window+min(*clen,index_topk)` ✓ |
+| 7 | recency placeholder | 同上（take 由 kernel 算，launch 用上限 + 内核守卫）✓ |
+| 8 | indexer 的 `idx_lens` | **去掉每步上传**，直读设备 clen ✓ |
+| 9 | 窗口索引 `window_topk_idxs` | 新 `dsv41_window_idxs`（decode 分支**逐位移植** + start_pos==0 特例）✓ 消每层每步 H2D ✓ |
+
+### ② 整步单图（用户指令③）
+`step_impl`（主机侧：图分支 + 同步 + 4B 读）↔ **`step_body`（纯设备算子，无主机往返）** ✓。
+- 捕获在**第二步**（第一步热身 kernel/懒建设备态/给 cublas 定 workspace ✓）；
+- **捕获只记录不执行** ⇒ 捕完立刻 launch 一次以完成本步 ✓；
+- 门禁：`DSV41_ENG_HOST`/`DSV41_STATS` 与图互斥（它们在录制区内做主机往返 ✗）；
+  **开图即强制 AR v5**（主机 barrier 不是 CUDA 调用 ⇒ 不会被录进图 ⇒ 回放会静默丢失跨 rank 同步 ✗✗）；
+- 开关：`DSV41_GRAPH_STEP=0` 关闭（默认开 ✓）。
+
+### ③ serve 并入共享栈（用户："能共享的必须共享，严禁重复造轮子"）
+删掉手写 `std::net` 服务器 ✓，改为复用 `crates/ferrite-http`（GLM 同一套）：
+`api::router`(axum/SSE/usage/cancel//shutdown) + `driver::EngineDriver` + 共享 `serve.rs::launch` ✓；
+新增的是**通用能力**（不泄漏引擎约束）：`engine.rs` 的 `ServeEngine` trait、`single_flight.rs`（**batch=1 锁步引擎**的通用包装）、`StopSpec`/`ChatFrame` 通用化（按模型只分叉**数据** ✓）。GLM 路径零改动 ✓。
+
+### ⚠️ 唯一一次 e2e 揪出的两个根因（都已修 ✓）
+1. **捕获区内仍有同步 D2H** ✗：`layer 0` 有一处**无 env 门控**的遗留探针（`self.dl(...)` 每步下载 ✗）
+   ⇒ 报 `cudaMemcpy D2H: operation would make the legacy stream depend on a capturing
+   blocking stream` ✓（与先前删掉的 `moe_out` 探针同类 ✗）。**审计法**：逐函数列出全部下载点，
+   逐个核对门控（其余四处均有 `DSV41_HCDBG` ✓）；**门控必须写在条件里，不能只写在函数内部** ✓。
+2. **chat 模板标记被字面量编码** ✗：frame 用 `Seg::Special("<|User|>")` 但该 checkpoint
+   **未把标记名注册为 special** ⇒ 退化成字面量文本 ⇒ prompt ≠ 已验证的
+   `[0,128803]+body+[128804,128822]` ✓。修法（**通用** ✓）：共享 `Seg` 增加 `Seg::Id(u32)`，
+   DSV41 的 frame 钉死这些 id ✓ —— 任何"标记不是 special"的模型都能用同一机制 ✓。
+
+### 纪律教训（已入档）
+- **严禁 `pgrep -f "…dsv41-run"` 配 kill** ✗：它匹配 ssh 命令行本身 ⇒ 自杀（exit 255）✗；
+  用 **`pgrep -x dsv41-run`**（精确进程名）✓。
+- **改完立刻 commit/push**：本轮两次"数字与旧版完全相同"都是**没推送**（远端跑旧 `.so`）✗。
+- **多卡 nsys 的单次耗时不可信**（只用于排序 ✓）；最终判据一律 **同二进制 A/B + 亲自读四段文本** ✓。
