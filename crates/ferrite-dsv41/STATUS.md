@@ -2567,3 +2567,21 @@ for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {   // h = 8 ⇒ 总共 8 个
    **数值逐位一致 ✓（只是数据放哪）** ⇒ 用 `/tmp/sa_repro.cu` 秒级量化 ✓。
 2. **第二步**（视第 1 步收益决定）：每 slot 一 warp 消掉 slot 内的跨 warp 归约 ✓（屏障 ~4x ✓）。
 3. **第三步**（可选）：`grid = (b*m, h, SPLIT)` 沿 topk 切分 + flash 式合并 ✓（并行度 8→64+ ✓）。
+
+## ★★★★★ 落地：sparse_attn flash-decode 分槽 —— 19.9 → 21.1 tok/s（+6%）
+
+**实现**：`sparse_attn_warp_kernel`（新增 ✓，默认启用；`DSV41_ATTN_SEQ=1` 回退顺序版做 A/B ✓，
+knob 用 static 缓存 ✓）。每 warp 独占 slot 子集（`t = wid, wid+nwarp, ...`）、32 lane 覆盖全 head_dim、
+自跑 online softmax ⇒ **循环内零屏障**（顺序版每 slot 2 次 `__syncthreads` × 512 slot ≈ 1000 次 ✗）；
+块尾经 8KB smem 合并 4 个 partial（仅有的 ~3 次屏障 ✓）。寄存器干净（0 spill ✓）。
+
+**同口径验证**：
+| | 顺序版 | flash 版 |
+|---|---|---|
+| 复现器（n=128/2048）| 329.96 / 329.94 µs | **86.71 / 86.71 µs（3.8x）** |
+| 模型 A/B | 19.9 tok/s（50.27ms）| **21.1 tok/s（47.46ms）** |
+| 文本 | Paris/Tokyo/2/静夜思 ✓ | 同样全对 ✓（静夜思输出略变：归约结合序变化，属预期）|
+
+**会话累计：2.6 → 21.1 tok/s（8.1x）**，六项 kernel 级收益 ✓。
+**⚠ 过程坑（已入档）**：第一次验证的数字与旧版**两位小数都相同** ⇒ 是我**没 commit/push**，
+远端跑的旧 `.so` ✗。**判据：不同 kernel 的数字完全相同 = 构建没变，先查 git 状态** ✓。
