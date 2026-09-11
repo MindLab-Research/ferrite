@@ -510,13 +510,19 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
         float my_smax = -1e30f, my_se = 0.f;
-        // Two kv-row buffers, alternating by slot parity; kBase is the row base.
-        float kb0[kMaxPerW], kb1[kMaxPerW];
+        // Three kv-row buffers, rotating by slot; kBase is the row base.
+        // (The two-deep form gave each row load one compute phase of distance;
+        // three gives two, which the isolated probe measured as the last
+        // lossless lever this kernel has - the slot ORDER, the per-dot reduce
+        // tree and the softmax update chain are untouched, so it is
+        // bit-identical; only the load ISSUE time moves earlier.)
+        float kb0[kMaxPerW], kb1[kMaxPerW], kb2[kMaxPerW];
         const size_t kBase = (size_t)bb * n * d;
-        // Prologue: fire the idx loads for the first two slots, then their rows.
+        // Prologue: fire the idx loads for the first three slots, then their rows.
         int t = wid;
         int ia = (t < topk) ? irow[t] : -1;
         int ib = (t + nwarp < topk) ? irow[t + nwarp] : -1;
+        int ic = (t + 2 * nwarp < topk) ? irow[t + 2 * nwarp] : -1;
         if (ia >= 0) {
 #pragma unroll
             for (int i = 0; i < kMaxPerW; ++i) {
@@ -531,13 +537,25 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                 if (c < d) kb1[i] = kv[kBase + (size_t)ib * d + c];
             }
         }
-        // Main loop: two slots per pass. Slot t lives in kb0, t+nwarp in kb1.
-        // The load for the NEXT kb0 slot is fired right after kb0's compute,
-        // giving the row load a full compute phase of distance.
-        for (; t + nwarp < topk; t += 2 * nwarp) {
-            const int te = t + 2 * nwarp;   // next slot destined for kb0
-            const int tf = te + nwarp;      // next slot destined for kb1
-            int ie = (te < topk) ? irow[te] : -1;
+        if (ic >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb2[i] = kv[kBase + (size_t)ic * d + c];
+            }
+        }
+        // Main loop: three slots per pass. Slot t lives in kb0, t+nwarp in kb1,
+        // t+2*nwarp in kb2; each buffer's next row load is fired right after
+        // that buffer's compute, so every row has two compute phases of
+        // distance. The three next-slot indices are hoisted to the loop top
+        // (loads have no side effects - pure earlier issue).
+        for (; t + 2 * nwarp < topk; t += 3 * nwarp) {
+            const int td = t + 3 * nwarp;   // next slot destined for kb0
+            const int te = td + nwarp;      // next slot destined for kb1
+            const int tf = te + nwarp;      // next slot destined for kb2
+            const int id = (td < topk) ? irow[td] : -1;
+            const int ie = (te < topk) ? irow[te] : -1;
+            const int iff = (tf < topk) ? irow[tf] : -1;
             if (ia >= 0) {
                 float dot = 0.f;
 #pragma unroll
@@ -559,12 +577,12 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
-            // kb0 is dead now: fire the row load for slot te into it.
-            if (ie >= 0) {
+            // kb0 is dead now: fire the row load for slot td into it.
+            if (id >= 0) {
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) kb0[i] = kv[kBase + (size_t)ie * d + c];
+                    if (c < d) kb0[i] = kv[kBase + (size_t)id * d + c];
                 }
             }
             if (ib >= 0) {
@@ -588,19 +606,49 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                 my_se = my_se * corr + e;
                 my_smax = nm;
             }
-            // kb1 is dead now: fire the row load for slot tf into it.
-            int iff = (tf < topk) ? irow[tf] : -1;
+            // kb1 is dead now: fire the row load for slot te into it.
+            if (ie >= 0) {
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) kb1[i] = kv[kBase + (size_t)ie * d + c];
+                }
+            }
+            if (ic >= 0) {
+                float dot = 0.f;
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) dot += qv[i] * kb2[i];
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+                dot *= scale;
+                const float nm = fmaxf(my_smax, dot);
+                const float corr = expf(my_smax - nm);
+                const float e = expf(dot - nm);
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+                }
+                my_se = my_se * corr + e;
+                my_smax = nm;
+            }
+            // kb2 is dead now: fire the row load for slot tf into it.
             if (iff >= 0) {
 #pragma unroll
                 for (int i = 0; i < kMaxPerW; ++i) {
                     const int c = lane + i * 32;
-                    if (c < d) kb1[i] = kv[kBase + (size_t)iff * d + c];
+                    if (c < d) kb2[i] = kv[kBase + (size_t)iff * d + c];
                 }
             }
-            ia = ie;
-            ib = iff;
+            ia = id;
+            ib = ie;
+            ic = iff;
         }
-        // Tail: at most one slot left (t < topk here means its row is in kb0).
+        // Tail: at most two slots left (rows for t and t+nwarp in kb0/kb1; the
+        // kb2 slot is necessarily past topk or the loop would have continued).
         if (t < topk && ia >= 0) {
             float dot = 0.f;
 #pragma unroll
@@ -617,6 +665,26 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
             for (int i = 0; i < kMaxPerW; ++i) {
                 const int c = lane + i * 32;
                 if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        if (t + nwarp < topk && ib >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb1[i];
+            }
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
             }
             my_se = my_se * corr + e;
             my_smax = nm;
@@ -2132,10 +2200,7 @@ __global__ void argmax_xchg_v5_kernel(
         long spins = 0;
         while ((int)(*p - (e + 1u)) < 0) {                // absolute stamp, monotone
             __nanosleep(200);
-            if (++spins > 25000000) {                     // ~5 s watchdog
-                printf("[argmax-hang] rank=%d peer=%d need=%u\n", my_rank, r, e + 1u);
-                break;
-            }
+            if (++spins > 25000000) break;                // ~5 s watchdog; give up
         }
     }
     __threadfence_system();                               // observe peers' staged keys
