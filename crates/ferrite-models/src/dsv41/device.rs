@@ -263,7 +263,7 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const f32,
         *const f32, *const f32,
         *mut f32, *mut f32, *mut f32, *mut f32,
-        c_int, c_int, c_int, c_int, f32, f32, CuStream,
+        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
     ) -> c_int,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
@@ -1767,6 +1767,8 @@ impl Device {
         sinkhorn_iters: i32,
         eps: f32,
         eps_norm: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
     ) -> Result<bool> {
         let rc = unsafe {
             (self.kernels.hc_front)(
@@ -1786,6 +1788,8 @@ impl Device {
                 sinkhorn_iters,
                 eps,
                 eps_norm,
+                xq,
+                xsc,
                 self.stream,
             )
         };

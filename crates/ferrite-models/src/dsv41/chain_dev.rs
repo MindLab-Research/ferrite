@@ -82,6 +82,12 @@ struct Scratch {
     xn: DevBuf,    // [dim]
     xq: DevBuf,    // [dim] fp8 e4m3
     xsc: DevBuf,   // [dim/32 + 8] f32 scales
+    /// T1: set right after the hc tail emitted the fp8 quantisation of `xn`
+    /// alongside its f32 write-back; the NEXT quant1 whose source is `xn` skips
+    /// its launch (pointer-gated in quant1) and clears the flag. Any other
+    /// quant1 (qr, o, ex_act, engram rows) is untouched - different source.
+    /// Cell because quant1 takes &self (the whole lin/lin2 chain does).
+    xq_of_xn_valid: std::cell::Cell<bool>,
     /// MoE scatter destination (written by the dispatch kernels; the host never
     /// reads it back, which is why rustc flags it).
     #[allow(dead_code)]
@@ -386,6 +392,7 @@ impl<'a> DevChain<'a> {
             // `dim` — sizing these by `dim` overflowed on the output projection)
             xq: dev.alloc(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))?,
             xsc: dev.alloc(fb(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter) / 32 + 8))?,
+            xq_of_xn_valid: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
             post: dev.alloc(fb(hc))?,
             comb: dev.alloc(fb(hc * hc))?,
@@ -539,6 +546,15 @@ impl<'a> DevChain<'a> {
 
     /// Quantise `src` (one row of `k` floats) to fp8 into `s.xq`/`s.xsc`.
     fn quant1(&self, src: *const f32, k: i32) -> Result<()> {
+        // T1: when the hc tail just emitted the fp8 of `xn` alongside its f32
+        // write-back, the next quant1 over `xn` is redundant. Pointer-gated so
+        // every other source (qr, o, ex_act, engram rows) still quantises, and
+        // the flag clears on the first hit - a later quant1(xn) (e.g. the
+        // kv-early fallback path) re-quantises identical bytes, harmlessly.
+        if src == self.s.xn.ptr as *const f32 && self.s.xq_of_xn_valid.get() {
+            self.s.xq_of_xn_valid.set(false);
+            return Ok(());
+        }
         self.dev
             .quant_fp8(src, self.s.xq.ptr as *mut u8, self.s.xsc.ptr as *mut f32, 1, k, 32, true)
     }
@@ -1146,6 +1162,8 @@ impl<'a> DevChain<'a> {
         pre_collapse: *const f32,
         out: *mut f32,
         eps_norm: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
     ) -> Result<bool> {
         let fused = self.dev.hc_front(
             self.s.h.ptr as *const f32,
@@ -1164,6 +1182,8 @@ impl<'a> DevChain<'a> {
             sinkhorn_iters,
             eps,
             eps_norm,
+            xq,
+            xsc,
         )?;
         if fused {
             return Ok(true);
@@ -1258,7 +1278,13 @@ fn fuse_b1() -> bool {
             hc_pc,
             hc_out,
             cfg.norm_eps,
+            self.s.xq.ptr as *mut u8,
+            self.s.xsc.ptr as *mut f32,
         )?;
+        // T1: when the fused front ran the collapse, it also emitted the fp8
+        // quantisation of `xn` (s.xq/s.xsc), so the next quant1(xn) - lin2's, in
+        // the attention - is redundant and quant1 skips it (pointer-gated).
+        self.s.xq_of_xn_valid.set(hc_done && !hc_nw.is_null());
         let _t_all = std::time::Instant::now();
         if layer == 0 && std::env::var("DSV41_HCDBG").map(|v| v != "0").unwrap_or(false) {
             let attn_pre = self.dl(self.premix_slot(1).as_f32(), hc)?;
@@ -1354,7 +1380,12 @@ fn fuse_b1() -> bool {
             ffn_pc,
             ffn_out,
             cfg.norm_eps,
+            self.s.xq.ptr as *mut u8,
+            self.s.xsc.ptr as *mut f32,
         )?;
+        // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
+        // MoE's quant1(xn) - its first xq consumer - is redundant and skips.
+        self.s.xq_of_xn_valid.set(ffn_done && !ffn_nw.is_null());
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
         }

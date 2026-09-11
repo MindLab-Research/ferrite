@@ -2847,7 +2847,8 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      int dim, int sinkhorn_iters, float eps, int ss_stride,
                                      const float* __restrict__ w_norm,
                                      const float* __restrict__ pre_collapse,
-                                     float* __restrict__ out, float eps_norm, int ss_in) {
+                                     float* __restrict__ out, float eps_norm, int ss_in,
+                                     uint8_t* __restrict__ xq, float* __restrict__ xsc) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -2959,7 +2960,30 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
         }
         __syncthreads();
         const float inv2 = red[0];
-        for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * inv2 * w_norm[c];
+        // Optional fused fp8 emission (T1): the SAME normalised value this loop
+        // writes as f32 is what quant_kernel would quantise next, so emit the
+        // e4m3 byte and the per-32-block scale here and the consumer skips its
+        // quant launch. blockDim strides keep a warp's 32 lanes inside exactly one
+        // 32-element block per pass (block index = warp + 32*pass), so the amax is
+        // a single warp shuffle - no barrier, no extra pass over global memory.
+        // The scale/quant arithmetic is quant_kernel's, term for term
+        // (fast_round_scale(amax, 1/448), clamp +-448, __nv_fp8_e4m3), so the
+        // emitted pair is bit-identical to the launch it replaces.
+        const int lane31 = threadIdx.x & 31;
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            const float v = o_r[c] * inv2 * w_norm[c];
+            o_r[c] = v;
+            if (xq != nullptr) {
+                float a = fabsf(v);
+                for (int off = 16; off > 0; off >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+                const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+                if (lane31 == 0) xsc[c >> 5] = sc;
+                const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+                xq[c] = *(const uint8_t*)&f8;
+            }
+        }
     }
 }
 
@@ -2983,7 +3007,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
                               int dim, int sinkhorn_iters, float eps, float eps_norm,
-                              cudaStream_t s) {
+                              uint8_t* xq, float* xsc, cudaStream_t s) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
@@ -3032,6 +3056,6 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
-        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0);
+        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc);
     return (int)cudaGetLastError();
 }
