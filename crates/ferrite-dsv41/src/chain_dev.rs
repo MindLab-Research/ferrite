@@ -671,6 +671,16 @@ impl<'a> DevChain<'a> {
         // the ONLY host read on the decode path: 4 bytes for EOS and printing
         self.dev.sync()?;
         let tok = self.dev.download_u32(self.s.ids.ptr)?;
+        // Token trace for bisecting the graph's cumulative error. It runs OUTSIDE
+        // the captured region on purpose (the token is already on the host here),
+        // so DSV41_TOKTRACE=1 changes nothing about the capture and the two modes'
+        // token sequences can be compared step by step.
+        if std::env::var("DSV41_TOKTRACE").map(|v| v != "0").unwrap_or(false) {
+            eprintln!(
+                "[toktr] ds={} pos={} tok={}",
+                self.decode_steps, self.step_count, tok
+            );
+        }
         if std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false) {
             let mut lg = vec![0f32; cfg.vocab_size];
             let b = Device::view(self.s.logits.ptr, cfg.vocab_size * 4);
