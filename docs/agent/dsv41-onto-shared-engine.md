@@ -295,3 +295,28 @@ Phase 0/1（`device.rs` → 共享 `devrt` 的字节级不池化分配）落地�
 instantiate 后已释放 ✓，故第二参数选 `cudaGraphExecDestroy` ✓），下一请求重新捕获（几 ms ✓）。
 **更长远的正解**（迁移时一并做 ✓）：把 step 期的缓冲区改为**构造期一次性分配** ✓
 （地址在整个进程内稳定 ✓）⇒ 图可安全保留 ✓。
+
+### ✅ Phase 2 完成（2026-09-11）：DSV41 的 AR 已换到共享实现，GLM 生产内核**零改动**
+
+**最关键的结论**：`kernels/cuda/ferrite_kernels.cu`（GLM 生产文件）**一行未改** ✓ ——
+四个能力 gap **全部在 DSV41 侧闭合**：
+
+| gap（映射表列的）| 收敛方向 | 依据 |
+|---|---|---|
+| staging 表形态 | DSV41 侧 ✓ | DSV41 的 staging **本就是共享布局**（parity 半区在偏移 0、ready 行在 `stamps_at`、epoch 在 `ctr_at`）✓ |
+| 指针表类型 | DSV41 侧 ✓ | 64 位下 `u64[]` 与 `float*[]`/`u32*[]` **位兼容**（都是 8 字节设备地址）✓ |
+| epoch 位置 | DSV41 侧 ✓ | `staging + ctr_at` 直接作为 `unsigned* epoch` 传入 ✓（设备侧运行期读 ⇒ 图可回放 ✓） |
+| out 直写 | 共享侧已支持 ✓ | `ferrite_p2p_ar_v5` 的 reduce 本就直写调用方缓冲 ✓ |
+
+**落地**：`Collective::all_reduce_inplace` 在 `ar_v5()` 为真时调 `Device::p2p_ar_v5`
+（转发到共享 `ferrite_p2p_ar_v5`，2 kernel：store + pubred）；`DSV41_AR_V5=0` 仍走原
+host-barrier 路径 ✓；DSV41 自有的三个 AR kernel（`dsv41_ar_v5_{store,publish,reduce}`）
+与其启动封装**已删除** ✓（`dsv41_glue.cu` 留墓碑注释说明去向 ✓）。
+
+**统一复验（全绿 ✓）**：`bash build.sh 103a` 0 错误 · `nm -D` 旧符号 0 / 共享符号在 ✓ ·
+`cargo test --test ar_micro` 通过（与 host 参考数值一致 ✓）· 12 连发文本全对 ✓ · 0 fault ✓ ·
+逐步计时 p50 **36.38ms**（关图基线 36.66ms，噪声内 ✓）。
+
+**对后续 Phase 的意义**：Phase 3（图原语换共享）在 Phase 0/1 的 `devrt` 里已经就位 ✓；
+剩下的只有 Phase 4（`CudaBackend` 与 `devrt` 两设备层收敛 —— **注意这是 GLM 生产路径，风险最高，
+必须先有隔离验证**）与 Phase 5/6（engine 契约 → 单一二进制 → 删 crate）。
