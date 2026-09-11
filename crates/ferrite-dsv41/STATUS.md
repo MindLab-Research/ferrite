@@ -7247,3 +7247,17 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **v8 复盘**：a32-vec4 + unroll32 + AR grid = 中性（−0.01ms）。原因：
 - a32-vec4 的 −13% 是在无 P4 的 gprobe 上测的——P4 的 cp.async 已隐藏 staging，vec4 在其上增益≈0
 - AR pubred 的 8µs 主导项是 stamp/poll 的 NVLink 往返（~6µs），reduce 网格形状只影响 ~1-2µs
+
+### expert MMA 分析定案：sm_103a 无小 M fp4 MMA，真正瓶颈是操作数供给（2026-09-12 05:45）
+
+**MMA 前提不成立**：
+1. sm_103a 没有 M=8/16 的 fp4 MMA——tcgen05 mxf4 的 M 硬件钉死 128
+2. masked M=128 已实测否决（16.8GB/s = 峰值 0.2%，远差于 SIMT 的 30-40%）
+3. perf-roadmap:103 的"8x MMA 浪费"是 fp8 的 B 复制，不可外推到 fp4
+
+**真正瓶颈**（关键更正）：
+- expert kernel 22.2µs/call，443GB/s，IPC 0.8/4，**80% issue 槽停等**
+- 全程 LDG→STS 串行，主循环无 cp.async（第一组 512B 预取已做，第 2..nv2f 组仍串行）
+- **不是 FMA 吞吐受限，是操作数供给/延迟受限**——若是指令吞吐受限 IPC 应逼近上限而非 0.8
+
+**路径**：expert-cpasync-full 实施完整 cp.async 流水（D 组在飞）——乐观 4-5x → MoE 1.47→~0.4ms（−1.0ms，不确定度高）
