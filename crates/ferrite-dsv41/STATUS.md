@@ -2219,3 +2219,34 @@ gemm_fp8_kernel<<<grid, 128, smem, s>>>(a, a_scale, w, w_scale, bias, out, m, n,
 **为什么这次没直接改**：R 行的重构会同时触及 smem 布局 / 每行归约 / sinkhorn 三处 ✓，
 本会话已有 3 次"半途重构"的代价（两次 build 失败导致误读旧 `.so`、一次 down 路径破坏正确性）
 ⇒ 按纪律**先把分析与预期收益固化**，留给下一次独立完成 ✓。
+
+## ⚠️⚠️ 自我更正：上一条"hc_mixes 权重被每行重读"的诊断**站不住脚**（勿按它动手）
+
+上一条我按 `185µs ÷ 384KB = 2.1 GB/s` 推出"权重被每行重读 ⇒ M 维复用可 −40%" ✗。
+**用同一套算式自检就会发现它自相矛盾** ✓：
+- `hc_fn` 只有 **384 KB** ⇒ **完全在 L2（60MB）里** ✓ ⇒ 重读本应是 **L2 命中**，而非 DRAM ✓
+- 实测等效带宽 **2.1 GB/s** 比 L2（~10 TB/s）低 **约 3000 倍** ✗✗
+⇒ **重读根本不是瓶颈** ✓；**185µs 的真实成因仍未查明** ✗。
+
+**这与本会话三次已实测否决的"显然推断"是同一模式** ✓：
+| 推断 | 实测 |
+|---|---|
+| 激活被 512 行重读（10.5MB）⇒ smem 暂存 | **+1%** ✗（20KB 激活本就在 L2 ✓）|
+| GEMV 占用率不足 ⇒ k-split | **15.0 vs 15.2** ✗ |
+| warp 请求只有 32B ⇒ 16B uint4 lane | **14.3** ✗（更慢）|
+| hc_mixes 权重重读 ⇒ M 维复用 | **未验证，且算式自驳** ✗ |
+
+### ⇒ 铁律（本会话第 4 次确认）
+> **"某项流量很大 ⇒ 它就是瓶颈"在 L2 常驻的工作集上不成立** ✓。
+> 先算 **有效带宽 vs 该层（L2/DRAM）的容量与带宽**：差 100 倍以内 ⇒ **不是带宽问题** ✓，
+> 必须用 **ncu 看 stall 原因 / 占用率 / wave 数 / issue 率** ✓，不要再凭"流量大"改代码 ✗。
+
+### 因此 `hc_mixes`（仍是 49% 的大头 ✓）的正确下一步是**测量**而不是重构
+1. **ncu 隔离复现**（本 crate 的微基准模式已有先例：`kernels/cuda/ncu_miniprof.cu` ✓）
+   —— 需要：`hc_mixes` 的真实 shape（S=rows, hc_dim, hc, sinkhorn_iters ✓）
+   + `--set full` 或至少 `smsp__warp_issue_stalled_*` / `sm__throughput` / `achieved_occupancy`
+2. 待查候选（**不预设**）：grid=`rows` 的实际大小 ✗ · 每个 block 的 `__syncthreads` 数量 ✗ ·
+   sinkhorn 的**逐 j 串行 + thread0 单线程**（`row_max/row_sum/col_sum` 各是一个 for-over-j 的
+   thread0 循环 ✓ 且每步前后各有一次 `__syncthreads` ✓）✗ ← **这个结构最可疑** ✓
+   （hc=4 时该循环只有 4 次迭代 ✓ 却要付全块屏障 ✓，且 `sinkhorn_iters` 次重复 ✓）
+3. 只有在 ncu 指出具体 stall 后再改 ✓；**一次只改一个变量** ✓；改完先看 build 的 ` error: ` ✓
