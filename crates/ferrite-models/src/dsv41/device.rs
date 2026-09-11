@@ -311,6 +311,18 @@ struct Kernels {
         *mut f32, *mut f32, *mut f32, *mut f32,
         c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
     ) -> c_int,
+    /// Stage-C persistent prototype: the whole hc front end in ONE block as a
+    /// `__syncthreads` phase machine (no ticket, no spin). Same ABI as
+    /// `hc_front`. Optional so a stale `.so` simply falls back to the two-launch
+    /// path; the caller gates it with `DSV41_HC_PERSIST=1` (default OFF).
+    hc_front_persist: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, *const f32, *const f32,
+            *const f32, *const f32,
+            *mut f32, *mut f32, *mut f32, *mut f32,
+            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
+        ) -> c_int,
+    >,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -463,6 +475,7 @@ impl Device {
             hc_post_inplace: km!(rt, "dsv41_hc_post_inplace"),
             hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
             hc_front: km!(rt, "dsv41_hc_front"),
+            hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
@@ -2159,6 +2172,76 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_hc_front")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the Stage-C persistent prototype
+    /// (`dsv41_hc_front_persist`). A stale `.so` reports false and the caller
+    /// keeps the two-launch `hc_front` path.
+    pub fn supports_hc_persist(&self) -> bool {
+        self.kernels.hc_front_persist.is_some()
+    }
+
+    /// Stage-C persistent prototype: the whole hc front end in ONE block as a
+    /// `__syncthreads` phase machine (no ticket, no spin). Same arguments and
+    /// same fallback contract as [`Self::hc_front`] — Ok(false) means "the
+    /// kernel refused this shape, use hc_mixes instead".
+    ///
+    /// ⚠️ This preserves bit-exactness by construction (see the kernel comment)
+    /// but is EXPECTED to be slower than the two-launch dots until the segment
+    /// kernels land: the 24 projection rows now share ONE SM. Gated behind
+    /// `DSV41_HC_PERSIST=1` (default OFF) for exactly that reason.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_front_persist(
+        &self,
+        x: *const f32,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        w_norm: *const f32,
+        pre_collapse: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        eps_norm: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.hc_front_persist, "dsv41_hc_front_persist")?;
+        let rc = unsafe {
+            f(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                w_norm,
+                pre_collapse,
+                pre,
+                post,
+                comb,
+                out,
+                rows,
+                hc,
+                dim,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+                self.stream,
+            )
+        };
+        // Same contract as hc_front: InvalidValue means "use hc_mixes instead".
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_hc_front_persist")?;
         Ok(true)
     }
 

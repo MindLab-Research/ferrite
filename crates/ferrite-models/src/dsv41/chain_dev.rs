@@ -1400,26 +1400,53 @@ impl<'a> DevChain<'a> {
         xq: *mut u8,
         xsc: *mut f32,
     ) -> Result<bool> {
-        let fused = self.dev.hc_front(
-            self.s.h.ptr as *const f32,
-            hc_fn,
-            hc_scale,
-            hc_base,
-            norm_w,
-            pre_collapse,
-            self.premix_slot(pre_slot).ptr as *mut f32,
-            self.s.post.ptr as *mut f32,
-            self.s.comb.ptr as *mut f32,
-            out,
-            1,
-            hc as i32,
-            dim as i32,
-            sinkhorn_iters,
-            eps,
-            eps_norm,
-            xq,
-            xsc,
-        )?;
+        // Stage-C persistent prototype (DSV41_HC_PERSIST=1, default OFF): the
+        // whole front end as ONE phase-machine block instead of the two-launch
+        // dots+tail pair. Selected only when the .so carries the symbol; the
+        // fallback chain (persist -> two-launch -> hc_mixes) is unchanged.
+        let fused = if Self::hc_persist() && self.dev.supports_hc_persist() {
+            self.dev.hc_front_persist(
+                self.s.h.ptr as *const f32,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_w,
+                pre_collapse,
+                self.premix_slot(pre_slot).ptr as *mut f32,
+                self.s.post.ptr as *mut f32,
+                self.s.comb.ptr as *mut f32,
+                out,
+                1,
+                hc as i32,
+                dim as i32,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+            )?
+        } else {
+            self.dev.hc_front(
+                self.s.h.ptr as *const f32,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_w,
+                pre_collapse,
+                self.premix_slot(pre_slot).ptr as *mut f32,
+                self.s.post.ptr as *mut f32,
+                self.s.comb.ptr as *mut f32,
+                out,
+                1,
+                hc as i32,
+                dim as i32,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+            )?
+        };
         if fused {
             return Ok(true);
         }
@@ -1491,6 +1518,18 @@ fn fuse_b1() -> bool {
 fn hcpost_epi() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_HCPOST_EPI").map(|v| v != "0").unwrap_or(false))
+}
+
+/// Stage-C persistent prototype gate (docs/agent/dsv41-persistent-arch.md §1):
+/// `DSV41_HC_PERSIST=1` makes the hc front end run as ONE `__syncthreads` phase
+/// machine (`dsv41_hc_front_persist`) instead of the two-launch dots+tail pair.
+/// DEFAULT OFF — the merge is bit-exact by construction but trades the dots'
+/// 24-way block parallelism for a single block, so it must clear the same-binary
+/// A/B + token-parity gate before it can be considered. A `.so` without the
+/// symbol silently keeps the two-launch path (`Device::supports_hc_persist`).
+fn hc_persist() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HC_PERSIST").map(|v| v != "0").unwrap_or(false))
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {

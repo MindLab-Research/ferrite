@@ -5978,3 +5978,34 @@ wo-b1-impl subagent 正在实施。
 - Stage B 剩余（wo_b1 −0.06 + hc fuse −0.1 + AR opt −0.3）≈ −0.5ms → ~8.1ms
 - **Stage C persistent（700→120 节点）= −1.0~1.5ms → ~6.8ms ≈ 147 tok/s**
 - 仍差 1.8ms → 需要段内流水化 + 图调度间隙消除 + 可能的 expert/hc 结构突破
+
+### 图节点审计（2026-09-11 末）：1557 节点/步（Stage C 的目标基线）
+
+从 nsys-v3 的实例数推算（328 步归一）：
+
+| kernel | 节点/步 | 备注 |
+|---|---|---|
+| gemm_fp8_gemv | 245 | 投影族 |
+| quant_kernel<0> + <1> | 125+40 = **165** | 两个变体：FP4=0（fp8）和 FP4=1（nib fp4?） |
+| AR store+stamp+reduce | 82×3 = 246 | 剖析路径；生产 = store+pubred = 164 |
+| apply_rope | **87** | 40 层 + 47 额外？（per-head 调用？） |
+| hc_dots + tail + post | 80×3 = 240 | hc_post 已 fold 进 pubred → 生产 ~160 |
+| gemv_bf16 | 48 | gate v2 后 ~8 |
+| window_idxs + ring_append + add + swiglu | 40×4 = 160 | 每个 40 次/步 |
+| expert down_reduce + rmsnorm_q + sparse_pf | 40×3 = 120 | |
+| 其它（route/gateup/kpool/...） | ~300 | |
+
+**修正后的生产节点数 ≈ 1355/步**（1557 − 82[AR第3核] − 80[hc_post fold] − 40[gate v2]）
+
+**关键认知**：
+1. **图节点 1355 × ~1.5µs ≈ 2.0ms 的固定开销**——比我之前估的 1.5ms 更大！
+   Stage C persistent（1355 → ~120）的理论收益 = **−1.8ms**（不是 −1.2ms）
+2. **quant 165 次/步**——quant_kernel<1>（FP4=1）是 40 次/步的第二个变体
+   （可能是 nib/4-bit 量化路径，为 indexer 或 KV 用的？）
+3. **apply_rope 87 次/步**——超出 40 层的预期（40 + 47 额外），可能是 per-head 调用
+4. **add_kernel 40 次/步**——A5 moe_epi_add 应该已消除这个（如果 fused 成功）
+
+**通往 200 tok/s 的数学**：
+- 当前 8.60ms = 计算 ~6.6ms + 固定开销 ~2.0ms
+- Stage C persistent 落地 → 6.6 + 0.25 = **~6.85ms ≈ 146 tok/s**
+- 再加段内流水化 + expert/hc 突破 → 5.0ms ≈ **200 tok/s**（需再砍 1.85ms 计算）

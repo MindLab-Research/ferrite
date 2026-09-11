@@ -3573,6 +3573,221 @@ __global__ void hc_front_kernel(const float* __restrict__ x, const float* __rest
     }
 }
 
+// ============================================================================
+// Stage C persistent prototype (docs/agent/dsv41-persistent-arch.md §1): the
+// WHOLE hc front end in ONE block, ordered by __syncthreads() phase barriers.
+// grid = (rows,), block = 1024, dynamic smem = one staged activation row
+// (hc_dim floats = 80 KiB at dim 5120 / hc_mult 4).
+//
+// Why this shape: the two-launch form is 24 dot blocks + 1 tail block (25
+// blocks, 2 launches) that publish through global memory + stream order. Here
+// one block runs all four phases of the front end, so every dependency the
+// stream used to order becomes a single __syncthreads() and the second launch
+// disappears. This is the mechanism the segment kernels (P2/P3) will scale up.
+//
+// NO ticket, NO spin — the hc-merge lesson (hc_front_kernel, DSV41_HC_MERGE):
+// a tail block that spins on a ticket holds an SM hostage while 31 of its 32
+// warps idle, and measured +3.2 ms/step. A phase machine has no spin by
+// construction; every barrier is unconditional and reached by the whole block.
+//
+// Bit-exactness is by construction, not by luck:
+//   * Each projection row's dot is computed by ONE warp with hc_mix_dots_kernel's
+//     EXACT lane assignment (c = lane, the +96 three-float4 chain, the +32
+//     remainder, the scalar tail), and the ss partial uses hc_mixes_tail_kernel's
+//     exact grouping (c2 = lane + m*32, stride mix*32). Sums therefore do not move.
+//   * The activation row is staged with cp.async into the SAME smem layout the
+//     dots kernel used, so sx[c] holds the same bits. The weight row is read
+//     straight from global: wg[c] == the staged sw[c]. SMEM STAGING OF THE
+//     WEIGHT WAS A LATENCY OPTIMISATION, NEVER AN ARITHMETIC ONE — the values
+//     and the accumulation order are identical either way.
+//   * The tail body (ss combine -> mixes -> sigmoid -> sinkhorn -> comb) is
+//     hc_mixes_tail_kernel's, statement for statement; the collapse + rmsnorm +
+//     fp8 is the tail's / dsv41_hc_collapse_norm_kernel's, statement for statement.
+//
+// ⚠️ THE SMEM BUDGET IS FINE, THE PARALLELISM IS NOT. Two-launch stages x + ONE
+// weight row = 160 KiB per (row, mix) block and gets 24-way BLOCK parallelism
+// (24 SMs, measured 531 GB/s aggregate / 22 GB/s per SM, 7.4 us). One block
+// cannot hold 24 weight rows (24 x 80 KiB = 1.9 MiB), so the dots here run on a
+// SINGLE SM: 24 warps reading 1.9 MiB of weights from DRAM. That is expected to
+// be slower than the 24-block dots, so this kernel is a MECHANISM + PARITY
+// prototype, not (yet) a win — measure before trusting. DSV41_HC_PERSIST=1
+// selects it from the Rust side (default OFF).
+// ============================================================================
+__global__ void hc_pre_persist_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
+                                      const float* __restrict__ hc_scale,
+                                      const float* __restrict__ hc_base, float* __restrict__ pre,
+                                      float* __restrict__ post, float* __restrict__ comb, int hc,
+                                      int dim, int sinkhorn_iters, float eps, int ss_stride,
+                                      const float* __restrict__ w_norm,
+                                      const float* __restrict__ pre_collapse,
+                                      float* __restrict__ out, float eps_norm, int ss_in,
+                                      uint8_t* __restrict__ xq, float* __restrict__ xsc,
+                                      int hc_dim, int mix) {
+    const int r = blockIdx.x;
+    extern __shared__ float hc_sm[];
+    float* s_x = hc_sm;                 // hc_dim floats: the staged activation row
+    __shared__ float sss;
+    __shared__ float wpart[32];
+    __shared__ float p_mixes[64];
+    __shared__ float p_cm[64];
+    __shared__ float p_red[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int n4 = hc_dim >> 2;
+    const float* xr = x + (size_t)r * hc_dim;
+    const int nwarp = ss_stride >> 5;
+
+    // ---------------- phase 1: stage the activation row (all warps) ---------
+    {
+        const float4* xg = reinterpret_cast<const float4*>(xr);
+        float4* sx = reinterpret_cast<float4*>(s_x);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sx[i], &xg[i]);
+        dsv41_cp_commit();
+        dsv41_cp_wait_all();
+        __syncthreads();
+    }
+
+    // ---------------- phase 2: the mix projection dots (one row per warp) ---
+    if (warp < mix) {
+        const int m = warp;
+        const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim);
+        const float4* sx = reinterpret_cast<const float4*>(s_x);
+        const float* wrow = hc_fn + (size_t)m * hc_dim;
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+        int c = lane;
+        for (; c + 64 < n4; c += 96) {
+            const float4 w0 = wg[c], w1 = wg[c + 32], w2 = wg[c + 64];
+            const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
+            a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+            a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+            a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+        }
+        for (; c < n4; c += 32) {
+            const float4 w = wg[c], v = sx[c];
+            a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+        }
+        for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += wrow[k] * s_x[k];
+        float acc = (a0 + a1) + a2;
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) g_hc_part[r][m][0] = acc;
+        if (ss_in != 0) {
+            float s2 = 0.f;
+            for (int c2 = lane + m * 32; c2 < hc_dim; c2 += mix * 32) s2 += s_x[c2] * s_x[c2];
+            for (int off = 16; off > 0; off >>= 1) s2 += __shfl_xor_sync(0xFFFFFFFFu, s2, off);
+            if (lane == 0) g_hc_part[r][m][1] = s2;
+        }
+    }
+    __syncthreads();   // phase barrier: g_hc_part is now visible to the whole block
+
+    // ---------------- phase 3: the tail body (hc_mixes_tail minus collapse) -
+    if (ss_in != 0) {
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < nwarp) ? g_hc_part[r][threadIdx.x][1] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
+    } else {
+        float ss = 0.f;
+        for (int c = threadIdx.x; c < hc_dim; c += ss_stride) ss += xr[c] * xr[c];
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+        if ((threadIdx.x & 31) == 0 && warp < nwarp) wpart[warp] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < nwarp) ? wpart[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sss / (float)hc_dim + eps);
+    for (int m2 = threadIdx.x; m2 < mix; m2 += blockDim.x)
+        p_mixes[m2] = g_hc_part[r][m2][0] * inv;
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(p_mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(p_mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        p_cm[jk] = p_mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int hh = hc * hc;
+        float c = (lane < hh) ? p_cm[lane] : 0.f;
+        float mx = c;
+        for (int off = 1; off < hc; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+        c = expf(c - mx);
+        float rs = c;
+        for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+        c = c / rs + eps;
+        for (int it = 0; it < sinkhorn_iters; ++it) {
+            if (it > 0) {
+                float s = c;
+                for (int off = 1; off < hc; off <<= 1)
+                    s += __shfl_xor_sync(0xFFFFFFFFu, s, off);
+                c = c / (s + eps);
+            }
+            float t = c;
+            for (int off = hc; off < hh; off <<= 1)
+                t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+            c = c / (t + eps);
+        }
+        if (lane < hh) p_cm[lane] = c;
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
+        comb[(size_t)r * hc * hc + jk] = p_cm[jk];
+
+    // ---------------- phase 4: collapse + rmsnorm + fp8 (all warps) ---------
+    // The body of dsv41_hc_collapse_norm_kernel. It reads the `pre` of the slot
+    // the caller names for the collapse, which is NOT the one the mixes just
+    // wrote: the caller walks the premix slots so the attention half collapses
+    // with the previous layer's coefficients.
+    if (w_norm != nullptr) {
+        __syncthreads();
+        float* o_r = out + (size_t)r * dim;
+        float s2 = 0.f;
+#pragma unroll 4
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < hc; ++i)
+                acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
+            o_r[c] = acc;
+            s2 += acc * acc;
+        }
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);
+        if ((threadIdx.x & 31) == 0) p_red[threadIdx.x >> 5] = s2;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += p_red[i];
+            p_red[0] = rsqrtf(t / dim + eps_norm);
+        }
+        __syncthreads();
+        const float inv2 = p_red[0];
+        const int lane31 = threadIdx.x & 31;
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            const float v = o_r[c] * inv2 * w_norm[c];
+            o_r[c] = v;
+            if (xq != nullptr) {
+                float a = fabsf(v);
+                for (int off = 16; off > 0; off >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+                const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+                if (lane31 == 0) xsc[c >> 5] = sc;
+                const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+                xq[c] = *(const uint8_t*)&f8;
+            }
+        }
+    }
+}
+
 // ss computed in the dots kernel from the staged row (default on); "0" restores
 // the in-tail scan for A/B. Bit-identical by construction either way.
 static const bool g_hc_ss = [] {
@@ -3662,5 +3877,43 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
         pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc);
+    return (int)cudaGetLastError();
+}
+
+// Persistent prototype entry (DSV41_HC_PERSIST=1, Rust-gated). Same contract as
+// dsv41_hc_front, but the whole front end runs as ONE block per row with no
+// ticket and no spin (see hc_pre_persist_kernel). Kept as a SEPARATE symbol so
+// the two-launch path stays byte-for-byte untouched and a stale .so simply
+// resolves it to None (the Rust side then keeps calling dsv41_hc_front).
+extern "C" int dsv41_hc_front_persist(const float* x, const float* hc_fn, const float* hc_scale,
+                                      const float* hc_base, const float* w_norm,
+                                      const float* pre_collapse, float* pre, float* post,
+                                      float* comb, float* out, int rows, int hc, int dim,
+                                      int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
+                                      float* xsc, cudaStream_t s) {
+    if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
+        pre == nullptr || post == nullptr || comb == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    if (rows > DSV41_HC_SPREAD_MAXR) return (int)cudaErrorInvalidValue;
+    if ((w_norm == nullptr) != (pre_collapse == nullptr)) return (int)cudaErrorInvalidValue;
+    if (w_norm != nullptr && out == nullptr) return (int)cudaErrorInvalidValue;
+    const int mix = hc * (2 + hc);
+    if (mix > 64) return (int)cudaErrorInvalidValue;
+    const int hc_dim = hc * dim;
+    // Only the staged activation row lives in dynamic smem (one weight row per
+    // warp is read from global; 24 of them would not fit). 80 KiB still needs
+    // the opt-in, and the attribute is per-context (one per rank under TP8), so
+    // set it on EVERY call exactly like the two-launch launcher does.
+    const size_t smem = (size_t)hc_dim * sizeof(float);
+    cudaError_t e = cudaFuncSetAttribute(hc_pre_persist_kernel,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        return (int)e;
+    }
+    hc_pre_persist_kernel<<<(unsigned)rows, 1024u, smem, s>>>(
+        x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32,
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, hc_dim, mix);
     return (int)cudaGetLastError();
 }
