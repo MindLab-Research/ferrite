@@ -5478,3 +5478,14 @@ swiglu 把"已 swiglu 的结果"当 gate、把**未写区**当 up → 数据错�
 | epi_add (A5) | DSV41_MOE_EPI_ADD | OFF | −0.08ms |
 
 **下一步**：统一两侧默认后验证 safe3 → 然后逐个翻 ON 测真实收益。
+
+### 第 21 轮 safe3 结果：文本正确但性能异常退化
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| safe3（全融合 OFF） | **18.87ms** | **53.0** | 四段全对 | 0 |
+
+⚠️ **严重性能退化**（预期 ~10.16ms，实际 18.87ms = +8.7ms）。文本正确、faults=0 排除数值错误。
+**疑因**：safe-arm-diagnose 的报告指出 serve 在"rank 加载完成前就被杀掉"是第 19 轮的问题——但第 21 轮跑完了（98 步）且文本正确，所以不是超时。18.87ms vs 10.16ms 的差距最可能来自 **A4A5-impl / AR-store-impl 留在主树的非融合路径改动**（如 gemm_fp8_mx 的新参数、epi_add、AR pubred-only 的分支逻辑），这些改动在默认 OFF 下仍可能引入额外的 host 开销或 kernel 签名变化导致的间接性能影响。
+
+**待查**：用 DSV41_TIMING=1 的 per-step 日志对比 safe3（18.87ms）vs 上一轮正确基线（10.16ms）的分段耗时差异，定位退化源。
