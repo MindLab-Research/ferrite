@@ -5772,3 +5772,36 @@ quant-producer-direct 报告的 4 条前提中 3 条与当前代码不符：
 3. **"gateup 消费 f32 staging"** — expert 核的 staging 在 smem 里已经是解码后的 f32（从 fp8）
 
 **结论**：gateup 核已经用 fp8 激活 + kernel 内解码（不是 f32 staging），quant-producer-direct 的"消除 f32 staging"方案不适用。rmsnorm_q_gateup 的真机会在 **rmsnorm_q_kernel 已存在但未被正确接入**——需要进一步核实接入点。
+
+### nsys-v3 剖析（gateup CSE 后的 ~9.5ms 基线，2026-09-11 末）
+
+| kernel | 次/步 | med µs | ms/步 | % |
+|---|---|---|---|---|
+| gemm_fp8_gemv | ~246 | 7.9 | **1.94** | 21.8% |
+| **gemv_bf16（gate + lm_head）** | ~49 | 17.2 | **0.84** | 10.2% |
+| expert fp4 batched（gateup） | 40 | 25.0 | 1.00 | 9.5% |
+| expert fp4 down_reduce | 40 | 24.9 | 1.00 | 9.3% |
+| hc_mixes_tail | 80 | 12.4 | **0.99** | 9.3% |
+| **AR reduce** | 82 | 8.5 | **0.70** | 7.5% |
+| hc_mix_dots | 80 | 7.0 | 0.56 | 5.2% |
+| **AR store+stamp** | 164 | 5.4+4.2 | **0.79** | 7.5% |
+| sparse_attn_pf | 40 | 7.9 | 0.32 | 3.0% |
+| route_topk | 40 | 5.2 | 0.21 | 2.0% |
+| quant_kernel | ~126 | 1.6 | 0.20 | 1.8% |
+| **hc_post_inplace** | 80 | 1.9 | **0.15** | 1.4% |
+| rmsnorm_q | 40 | 3.1 | 0.12 | 1.2% |
+| 其它 | | | ~0.35 | ~3.6% |
+
+**三个关键新发现**：
+1. **AR 合计 1.49ms（15.6%）**——reduce 0.70 + store 0.37 + stamp 0.33 = 比之前预估的 0.66 大 2.3x！
+   （原因：nsys 的按调用中位数低估了 v5 AR 的协议延迟——AR store 的 med 5.4µs 是好的但 stamp 的 4.2µs
+   是自旋等待时间的下界；每步 82 次 AR × 3 kernel = 246 个图节点）
+2. **gemv_bf16 的 med=17.2µs** × 49 次 = 0.84ms——MIX_GATE=OFF 后 gate 走 gemv_bf16
+   （384 行 × 49 次含 lm_head 切分后的 40+9）——它是第 2 大项
+3. **hc_post_inplace 0.15ms** 确认（hc-post-pubred subagent 正在融合进 pubred AR）
+
+**通往 200 tok/s 的路径更新（基于 nsys-v3 的真实数据）**：
+- 当前 9.38ms = gemv 1.94 + bf16 0.84 + expert 2.0 + hc 1.55 + AR 1.49 + sparse 0.32 + 其它 1.24
+- AR 1.49ms 是被低估的第 2 大项——**AR 的图节点数（246/步）是 Stage C persistent 的最强论据**
+- hc_post 融合（−0.15）+ AR store 融合进 producer（−0.37 store 消失）= AR 从 3 kernel 降到 1 kernel/次
+- **Stage C persistent 把 AR 从 3 kernel/层 降到 1 kernel/段 = 120 vs 246 AR 节点**

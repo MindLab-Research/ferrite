@@ -292,6 +292,69 @@ impl Collective {
         )
     }
 
+    /// AR v5 with the segment-C `hc_post_inplace` fused into the pubred
+    /// epilogue (see `ferrite_p2p_ar_v5_hcpost`). Returns `Ok(true)` when the
+    /// fused path ran — the caller MUST then skip the standalone
+    /// `hc_post_inplace`; `Ok(false)` means the protocol or the shape declined
+    /// and the caller must use the plain `all_reduce_inplace` +
+    /// `hc_post_inplace` pair instead.
+    ///
+    /// The fused kernel reads and writes `res` in place (one thread owns each
+    /// payload column and walks all `hc_n` rows itself), so `res` must be the
+    /// residual stream (`[hc_n][hc_h]`, row stride `hc_h`) and `len` must be
+    /// `hc_h` floats: the AR payload axis and the hc-post column axis are the
+    /// same one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_inplace_hcpost(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        res: *mut f32,
+        post: *const f32,
+        comb: *const f32,
+        hc_n: i32,
+        hc_h: i32,
+    ) -> Result<bool> {
+        // Same shape gate as `dsv41_hc_post_inplace`: h % 4 == 0 (float4 path)
+        // and 1 <= n <= 8 (the register-staging bound).
+        if !ar_v5()
+            || hc_n <= 0
+            || hc_n > 8
+            || hc_h <= 0
+            || (hc_h & 3) != 0
+            || (len / 4) as i32 != hc_h
+        {
+            return Ok(false);
+        }
+        let n = (len / 4) as c_int;
+        let stride = (self.bytes / 4) as c_int;
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        if !self.dev.p2p_ar_v5_hcpost(
+            buf as *const f32,
+            self.peer_slots.ptr as *const *mut f32,
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+            res,
+            post,
+            comb,
+            hc_n as c_int,
+            hc_h as c_int,
+        )? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Publish `len` bytes from `src` into slot `rank` of every rank. `len`
     /// must not exceed the slot size: a site with a shorter payload than the
     /// staging would otherwise publish unrelated memory.

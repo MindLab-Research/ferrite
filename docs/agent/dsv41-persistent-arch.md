@@ -86,6 +86,7 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 |---|---|---|---|
 | **P0（前置）** | 统一融合 env 两侧默认（`.cu` `g_fuse` return 0 + Rust `unwrap_or(false)`）；`DSV41_AR_STORE_FUSE` 逐位验后翻 ON | −0.08ms + 铺路 | 低 |
 | **P1** | 段 C 融合：`hc_post` + `copy_h_back` → `hc_post_inplace`（省 80KB D2D ×2/层） | −0.15~0.25ms | 低（parity 既有） |
+| **P1b（已实施，env 默认关）** | `hc_post_inplace` 再折进**产生它 `x` 的那个 AR** 的 pubred epilogue（`DSV41_HCPOST_EPI=1`，核 `ferrite_p2p_ar_v5_hcpost`）：2 个 site/层 = 80~90 节点。这是"相邻两核合一"的第一步，也是段核的第一个可运行原型 | −0.15ms | 中（跨 CU 位级：epilogue 用显式 `__fmul_rn`/`__fmaf_rn`，须过 `ar_hcpost_parity.rs` + 同二进制 token 逐字 A/B） |
 | **P2** | 段 A 融合：hc 链 + attention 投影链一核，中间量留 smem；−6~8 launch/层 | −0.6~1.0ms | 中（hc 归约 / split=1） |
 | **P3** | 段 B 融合：MoE cooperative（gate→route→quant→gate_up→swiglu→down→reduce 一核，中间量留 smem） | −0.4~0.7ms | 中（slot 定序） |
 | **P4** | 跨层流水：ffn mixes 挪到 L+1 的 attn 段内下发，hc 的 ⟨B⟩ 半藏进 AR poll 窗口（PDL） | −0.3~0.5ms | 中 |

@@ -347,6 +347,32 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// AR v5 with the segment-C `hc_post_inplace` folded into the pubred
+    /// epilogue (`ferrite_p2p_ar_v5_hcpost`): same shapes as `p2p_ar_v5` plus the
+    /// residual stream `hc_res` (`[hc_n][hc_h]`) and the hyper-connection
+    /// `post`/`comb`, written straight back onto `hc_res`. Saves the standalone
+    /// `dsv41_hc_post_inplace` launch at each DSV41 AR (2 per layer).
+    p2p_ar_v5_hcpost: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *mut f32,
+            *const f32,
+            *const f32,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
 }
 
 // ------------------------------------------------------------------- Device
@@ -433,6 +459,7 @@ impl Device {
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
             p2p_ar_v5: ko!(rt, "ferrite_p2p_ar_v5"),
             p2p_ar_pubred_v5: ko!(rt, "ferrite_p2p_ar_pubred_v5"),
+            p2p_ar_v5_hcpost: ko!(rt, "ferrite_p2p_ar_v5_hcpost"),
         };
         Ok(Device { rt, kernels, stream })
     }
@@ -1529,6 +1556,53 @@ impl Device {
               self.stream)
         };
         self.kerr(rc, "ferrite_p2p_ar_pubred_v5")
+    }
+
+    /// AR v5 with the segment-C `hc_post_inplace` folded into the pubred
+    /// epilogue (`ferrite_p2p_ar_v5_hcpost`). Same shapes as [`Self::p2p_ar_v5`]
+    /// plus the residual stream `hc_res` (`[hc_n][hc_h]`, row stride `hc_h`) and
+    /// the hyper-connection `hc_post`/`hc_comb`, written straight back onto
+    /// `hc_res` in the same ascending-k order the standalone kernel uses. `n`
+    /// (the payload element count) must equal `hc_h`.
+    ///
+    /// `Ok(false)` when the loaded .so predates the entry (or the launcher
+    /// rejects the shape, returns 1), so the caller runs the plain
+    /// `all_reduce_inplace` + `hc_post_inplace` pair instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_v5_hcpost(
+        &self,
+        partial: *const f32,
+        staging_tbl: *const *mut f32,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+        hc_res: *mut f32,
+        hc_post: *const f32,
+        hc_comb: *const f32,
+        hc_n: c_int,
+        hc_h: c_int,
+    ) -> Result<bool> {
+        let f = match self.kernels.p2p_ar_v5_hcpost {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n, world,
+              my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, self.stream)
+        };
+        // 1 == the launcher declined the shape (see `ferrite_p2p_ar_v5_hcpost`);
+        // the caller then runs the unfused pair as before.
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "ferrite_p2p_ar_v5_hcpost")?;
+        Ok(true)
     }
 
     /// Stable argmax (ties -> lowest index); writes the winning index as i32 and

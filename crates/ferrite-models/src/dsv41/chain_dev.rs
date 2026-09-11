@@ -922,17 +922,56 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// Fold the segment-C `hc_post_inplace` into the AR that just produced `s.o`.
+    ///
+    /// The AR is the last writer of `o` — the hc-post's `x` — and the hc-post
+    /// reads/writes only the residual stream, so the two can share one launch:
+    /// the fused pubred epilogue writes `res` in place from the AR result it
+    /// already holds in registers. Returns `Ok(true)` when the fold ran, in
+    /// which case the caller MUST skip the standalone `hc_post_inplace`. Every
+    /// decline (env off, segment C not in-place, no v5 protocol, shape mismatch,
+    /// or an .so without the symbol) returns `Ok(false)` and leaves the caller on
+    /// the exact pair it used before.
+    fn ar_hc_post_fold(
+        &self,
+        c: &std::sync::Arc<Collective>,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+    ) -> Result<bool> {
+        if !Self::hcpost_epi() || !Self::fuse_c() {
+            // fuse_c() is the same gate the caller uses to choose between the
+            // in-place hc-post and the h2-staging pair; folding under the
+            // staging branch would apply the mix TWICE.
+            return Ok(false);
+        }
+        let (dim, hc) = (self.cfg.dim, self.cfg.hc_mult);
+        c.all_reduce_inplace_hcpost(
+            buf,
+            len,
+            self.s.h.ptr as *mut f32,
+            self.s.post.as_f32(),
+            self.s.comb.as_f32(),
+            hc as i32,
+            dim as i32,
+        )
+    }
+
     /// The MoE's all-reduce, issued OUTSIDE any captured segment: a CUDA graph
     /// cannot contain the host barrier that this path still uses, so the segment
-    /// boundary sits exactly here.
-    fn moe_reduce(&mut self) -> Result<()> {
+    /// boundary sits exactly here. Returns whether the segment-C hc-post was
+    /// folded into the reduce (see [`Self::ar_hc_post_fold`]).
+    fn moe_reduce(&mut self) -> Result<bool> {
         let dim = self.cfg.dim;
         // routed experts are expert-parallel, so each rank holds a partial sum
         if let Some(c) = self.comm.clone() {
-            c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            let folded = self.ar_hc_post_fold(&c, self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            if !folded {
+                c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+            }
             c.end_round();
+            return Ok(folded);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// One decode step. Returns the logits for the fed token.
@@ -1442,6 +1481,18 @@ fn fuse_b1() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(true))
 }
 
+/// Segment-C AR fold (P1 of the persistent roadmap): `hc_post_inplace` moved
+/// into the AR pubred epilogue that produced its `x` (see
+/// `ferrite_p2p_ar_v5_hcpost`). Saves the standalone launch at each of the two
+/// per-layer AR sites. DEFAULT OFF — the fold rewrites a bit-exactness-sensitive
+/// chain (the AR sum feeds the hc_post, and the epilogue lives in a different
+/// translation unit than `dsv41_hc_post_inplace_kernel`), so it must clear the
+/// same-binary A/B token-parity gate before it can be flipped on.
+fn hcpost_epi() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HCPOST_EPI").map(|v| v != "0").unwrap_or(false))
+}
+
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -1525,16 +1576,21 @@ fn fuse_b1() -> bool {
             cfg.norm_eps,
         )?;
         }
-        self.attention(layer, pos)?;
+        let attn_hc_folded = self.attention(layer, pos)?;
         if Self::fuse_c() {
-            self.dev.hc_post_inplace(
-                self.s.h.ptr as *mut f32,
-                self.s.o.ptr as *const f32,
-                self.s.post.as_f32(),
-                self.s.comb.as_f32(),
-                hc as i32,
-                dim as i32,
-            )?;
+            // Segment-C P1: the fold already wrote this layer's hc_post onto
+            // `s.h` from the AR pubred epilogue, so only the un-folded path
+            // launches the standalone kernel here.
+            if !attn_hc_folded {
+                self.dev.hc_post_inplace(
+                    self.s.h.ptr as *mut f32,
+                    self.s.o.ptr as *const f32,
+                    self.s.post.as_f32(),
+                    self.s.comb.as_f32(),
+                    hc as i32,
+                    dim as i32,
+                )?;
+            }
         } else {
             self.dev.hc_post(
                 self.s.o.ptr as *const f32,
@@ -1645,19 +1701,22 @@ fn fuse_b1() -> bool {
         } else {
             self.moe(layer, ld)?;
         }
-        self.moe_reduce()?;
+        let moe_hc_folded = self.moe_reduce()?;
         if phase_dbg() {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
         if Self::fuse_c() {
-            self.dev.hc_post_inplace(
-                self.s.h.ptr as *mut f32,
-                self.s.o.ptr as *const f32,
-                self.s.post.as_f32(),
-                self.s.comb.as_f32(),
-                hc as i32,
-                dim as i32,
-            )?;
+            // Segment-C P1: same fold as the attention side, on the MoE AR.
+            if !moe_hc_folded {
+                self.dev.hc_post_inplace(
+                    self.s.h.ptr as *mut f32,
+                    self.s.o.ptr as *const f32,
+                    self.s.post.as_f32(),
+                    self.s.comb.as_f32(),
+                    hc as i32,
+                    dim as i32,
+                )?;
+            }
         } else {
             self.dev.hc_post(
                 self.s.o.ptr as *const f32,
@@ -1714,7 +1773,10 @@ fn fuse_b1() -> bool {
     }
 
     /// MLA window path + grouped output projection.
-    fn attention(&mut self, layer: usize, pos: usize) -> Result<()> {
+    /// Decode attention for one layer. Returns whether the segment-C hc-post was
+    /// folded into this layer's attention all-reduce (see
+    /// [`Self::ar_hc_post_fold`]); the caller then skips the standalone launch.
+    fn attention(&mut self, layer: usize, pos: usize) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hd = cfg.head_dim;
@@ -2131,17 +2193,27 @@ fn fuse_b1() -> bool {
                 ol_local as i32,
             )?;
         }
+        let mut hc_folded = false;
         if let Some(c) = comm {
             if ar_store_fused {
                 // store already done by the fused epilogue; publish+reduce only.
                 // Must stay adjacent to the gemv above (same *epoch).
                 c.all_reduce_inplace_pubred_only(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
             } else {
-                c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                // Segment-C fold: when it runs, the pubred epilogue has already
+                // written THIS layer's hc_post onto the residual stream, so
+                // `layer()` skips the standalone launch. The fused entry carries
+                // its own store, which is why it cannot coexist with
+                // `ar_store_fused` (that path has no store left to skip).
+                hc_folded =
+                    self.ar_hc_post_fold(&c, self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                if !hc_folded {
+                    c.all_reduce_inplace(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
+                }
             }
             c.end_round();
         }
-        Ok(())
+        Ok(hc_folded)
     }
 
     /// Indexer for one decode step: publish this layer's index key for the
