@@ -38,14 +38,18 @@ for _ in $(seq 1 40); do
 done
 
 echo "### $TAG   extra-env: ${*:-<none>}"
+OUT="/tmp/ab_${TAG}_out.txt"
+: >"$OUT"
 for P in "The capital of France is" "请背诵《静夜思》" "1+1=" "请背诵《出师表》开头"; do
     printf -- "  [%s] " "$P"
     timeout 300 curl -s -m 260 -X POST "http://localhost:$PORT/v1/chat/completions" \
         -H "Content-Type: application/json" \
         -d "{\"model\":\"dsv41\",\"messages\":[{\"role\":\"user\",\"content\":\"$P\"}],\"max_tokens\":48,\"temperature\":0}" \
+        | tee -a "$OUT" \
         | python3 -c 'import sys,json; d=json.load(sys.stdin); print(repr(d["choices"][0]["message"]["content"][:40]))' 2>/dev/null \
         || echo "(failed)"
 done
+echo "  full outputs: $OUT"
 
 python3 - "$LOG" "$TAG" <<'PY'
 import re
