@@ -412,7 +412,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     要求非空——2026-09-11 清理：`.cu` 的非空检查与 `supports_hc_tail_split` 都去掉了它）。新发射序列：
     `main: record(in_ev) -> wait(early_ev)`；`side: wait(in_ev) -> EARLY -> record(early_ev) -> dots -> LATE -> record(join_ev)`。
     ⇒ **main 的 front 代价从 dots（4.9µs）降到 EARLY（1.7µs）**，saving ≈ 3.2µs/front × 2 front/layer
-    × 80 层 ≈ **−0.5ms 上界**（注意：题面给的 "dots 7.4µs / EARLY 4.9µs" 与文档记录相反——实测
+    × 40 层（= 80 front）≈ **−0.26ms 上界**（注意：题面给的 "dots 7.4µs / EARLY 4.9µs" 与文档记录相反——实测
     dots **4.9µs**、EARLY **1.7µs**、LATE **10.7µs**）。side 链变成
     EARLY(1.7)+dots(4.9)+LATE(10.7) ≈ **17.3µs**，仍远小于 `join_ev` 必须被满足的
     hc 投影窗口（~50µs，见 `DSV41_HC_TAIL_PRIO` 条目）⇒ join 依旧"到达即满足"。

@@ -508,6 +508,18 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    跨 arm 指纹校验）+ `scripts/dsv41_recovery_verify.sh`（哨兵→base→A/B 一键）。
    `dsv41_a32_bench.cu` 经 `dsv41_gemv_gsmem` / `dsv41_gemv_occupancy` 两个 host 探针把
    "20KB⇒4→8 blocks/SM" 从估算变成实测。
+
+   **新增可砍项（2026-09-11 explore 读码，未实测）——a32 ON 时 `s_a` 是死槽**：mode 4 的
+   k 字节激活 staging（`s_a`，`dsv41_kernels.cu:3129-3145`）在 `a32==1` 时**只被读一次**——
+   就是 `s_af` 的物化循环（`:3171` 的 `s_lut[ap0[i]] * s_as[i>>5]`，`ap0 = s_a`）；消费循环在
+   a32 分支只碰 `s_af`（`:3257`），`ap`（`:3211`）在该分支是死代码。⇒ 可把"uint4 跨步拷贝 →
+   第二趟逐字节解码"合成**一趟**（global uint4 → LUT 查表 → ×`s_as` → 直接写 `s_af`），
+   并让 `s_a` 槽仅在 `a32==0` 时分配（与 `dsv41_gemv_a32_bytes` 同构的按需尺寸函数）。
+   收益：k=5120/warps=4 时 gsmem **48512 → 43392B**（blocks/SM 4 → 5，+25% 驻留）+ 少一趟 k
+   遍历；`s_af[j]` 仍是同一乘积 ⇒ **逐位等价**（`s_a` 只是 `a` 的副本）。⚠️ 反证风险：
+   `MODE=3` 已等价于"不 staging、从 global 读"且实测更慢（19.96 vs 19.24）——但那是把 global
+   读留在**物化循环里逐字节**；本方案保留 uint4 宽读，只是把两趟并成一趟，属于 mode 3/4 之间的
+   第三点，需实测。
 1. **`down_reduce` +0.31ms 的定案**：隔离微基准（同一 kernel，HEAD vs `01291b2^`），或 revert 后重采 profile。**这是唯一挡住 0.31ms 回收的事。**
 2. **AR v5 的隔离绝对值**：0.66（v2 约定，被 §3 反证支持）vs 1.49（`86af349`，host-barrier 口径）。需要 device-side v5 的隔离测量。
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。

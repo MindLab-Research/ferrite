@@ -355,8 +355,7 @@ static inline int dsv41_smem_ceiling(const void* /*kern*/) {
     return cached;
 }
 
-extern "C" launchers were
-// deleted — one protocol, one implementation.
+// Legacy extern "C" launchers were removed — one protocol, one implementation.
 
 // ===========================================================================
 // Lean M=1 GEMV (single-token projections)
