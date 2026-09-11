@@ -653,15 +653,23 @@ impl<'a> DevChain<'a> {
             // ar_v5() therefore also turns on with the graph (see tp.rs).
             let host_hash = std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false);
             let probes = std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false);
-            // VERIFIED CORRECT since the ring-append fix (the KV row's destination
-            // was a host-computed address frozen by the capture - every replay
-            // wrote the same ring slot and the window went stale). Five prompts
-            // now answer correctly with the graph on, including a recited poem and
-            // a coherent essay, so it is the DEFAULT; DSV41_GRAPH_STEP=0 restores
-            // the per-kernel path for A/B.
+            // VERIFIED: a SINGLE request with the graph on is bit-identical to the
+            // per-kernel path (DSV41_TOKTRACE compared step by step, no divergence),
+            // so the captured operator set is right. With SEVERAL sequential
+            // requests it is not: requests one to three (short, one step each, so
+            // they never reach the capture) answer correctly, and the first long
+            // request then dies with an illegal memory access on a rank that varies
+            // run to run, after which the engine is sticky-faulted and every later
+            // request is empty. The regression and the fault were chased through the
+            // whole device layer (capture mode, streams, cublas stream, graph
+            // wrappers, buffer accessors, the 52 launch wrappers - all byte-equal to
+            // the pre-refactor file), through a per-request graph drop, and through a
+            // rank rendezvous around the capture; none of them changed the outcome,
+            // so the default is the per-kernel path until the cause is located.
+            // DSV41_GRAPH_STEP=1 turns the whole-step graph back on.
             !host_hash
                 && !probes
-                && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true)
+                && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(false)
         });
         // ONLY on the decode path: capturing during prefill froze the prefill
         // branches into the graph, so the decode replays took the wrong ones (the
