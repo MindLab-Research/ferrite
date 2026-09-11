@@ -5543,3 +5543,29 @@ down+reduce（删 grid.y 的 slot 维，升序 slot 累加 = reduce 的数值契
 2. f3b1be1 在关新融合时误关了 7 个老门（MOE_BATCH/NR_FUSE/SH_EXP_MX2/MIX_GATE/HEAD_SLICE/FUSE_C/FUSE_B1）→ +8.7ms 退化
 3. **子代理修改共享文件后必须 `git diff` 检查所有改动**——批量 sed 翻默认值是 clobber
 4. gemv-kernel-audit 确认：gemm_fp8_gemv 的 +6 参数签名变化 bit 级不变、寄存器 48→40（0 spill）——不是退化源
+
+### kernel-inventory-v2 的关键新发现（2026-09-11 深夜，live nsys 剖析）
+
+| 排名 | kernel | 次/步 | µs/次 | ms/步 | % |
+|---|---|---|---|---|---|
+| 1 | gemm_fp8_gemv | **206** | 9.6 | **1.98** | 20.4% |
+| 2 | **gemv_bf16_fp8x2（共享专家混合核）** | 40 | 33.0 | **1.32** | **13.6%** |
+| 3 | expert_gemv_fp4_batched（融合后） | 40 | 25.7 | 1.03 | 10.6% |
+| 4 | hc_mixes_tail | 80 | 12.4 | 0.99 | 10.2% |
+| 5 | expert_gemv_fp4_down_reduce（融合后） | 40 | 17.2 | 0.69 | 7.1% |
+| 6 | AR v5 | 80 | — | 0.66 | 6.8% |
+
+**两个 gap-analysis 漏掉的发现**：
+1. **共享专家混合核跃居第 2**（1.32ms/13.6%）——旧口径的"per-rank 平均"（0.275ms）把 rank0 串行藏了。
+   TP 切分只解决了 rank 不均衡，没有降低总成本。**可削减：fp8 族加 e4m3 LUT + a32 预解码（同单族 gemv 的已验证优化，预期 −0.3ms）。**
+2. **gemm_fp8_gemv 调用数 171→206（+35）**——来源待归因（可能是 down-reduce 融合后新增的 w2 调用 + shard expert 侧？）。
+
+**Top-5 剩余机会（更新版，按预期收益）**：
+1. 共享专家混合核加 LUT+a32 → −0.3ms
+2. MoE cooperative 段核（expert 家族 1.72ms）→ −0.4~0.7ms
+3. hc 链两招（sinkhorn 藏 + hc_post_inplace）→ −0.36~0.46ms
+4. cross-layer-pipe → −0.3~0.5ms
+5. xn-megafuse 2-launch → −0.25~0.5ms
+
+**与 gap-analysis 推演对比**：gemm_fp8_gemv 预测 2.18 实测 1.98（LUT 更狠）；expert 预测 1.75 实测 1.72 ✓；
+xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合预测 −0.7 实测 −0.51。
