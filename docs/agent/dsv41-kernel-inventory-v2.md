@@ -43,7 +43,7 @@
 | 5 | `expert_gemv_fp4_down_reduce_kernel<true>`（down+reduce 融合） | 40 | 17.2 | **0.69** | 7.1% | 新增 | — | down+reduce 合一：删 `grid.y` slot 维、升序 slot 累加（= reduce 数值契约）、`ex_down_b` 全程留寄存器；替代旧 down + `moe_down_reduce` |
 | 6 | **AR v5**（store + pubred） | 80 | — | **0.66** | 6.8% | 0.66 | 0 | NVLink 协议地板 |
 | 7 | `hc_mix_dots_kernel` | 80 | 7.0 | **0.56** | 5.8% | 0.59 | −0.03 | 4 warp 协同 staging |
-| 8 | `gemv_bf16_kernel`（lm_head 切片 + engram） | 9 | 45.0 | **0.41** | 4.2% | 0.98 (44@22.3) | −0.57 | ① lm_head 1/8 词表切分 ② **MIX_GATE 把 gate(40 次) 移进 `gemv_bf16_fp8x2`** → 调用 −35 |
+| 8 | `gemv_bf16_kernel`（lm_head 切片 + engram） | 9 | 45.0 | **0.41** | 4.2% | 0.98 (44@22.3) | −0.57 | ① lm_head 1/8 词表切分 ② **MIX_GATE**（`chain_dev.rs:2324` `sh_via_mixed = mix_gate_shared() && gemm_bf16_fp8x2(...)`）把 gate+w1/w3 合成 `gemv_bf16_fp8x2` → 调用 **44→9**，与 fp8x2 的 **5→40** 数值对应（−35/+35）；精确拆分待代码/历史核 |
 | 9 | `sparse_attn_pf_kernel` | 40 | 8.5 | **0.34** | 3.5% | 0.42 (10.5µs) | −0.08 | 3 深预取 |
 | 10 | `quant_kernel<0>` | 166 | 1.6 | **0.26** | 2.7% | 0.28 (176) | −0.02 | P2 冗余 zero 跳过（调用 −10）；**纯固定成本，未到预测的 0.15** |
 | 11 | `route_topk_kernel` | 40 | 5.2 | **0.21** | 2.2% | 0.21 | 0 | P1 只删了 `hist` 死码（`route_hist` 已消失），固定成本未降 |
