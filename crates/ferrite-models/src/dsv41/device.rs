@@ -111,6 +111,26 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// SWIGLU_FOLD: the M=1 w2 GEMV whose PROLOGUE produces the fp8 activation
+    /// it consumes, so the shared expert's `swiglu_limit_q` launch disappears.
+    /// Instead of reading a pre-quantised (`a`, `a_scale`) pair it takes the RAW
+    /// f32 gate|up row `gu` (`ex_act`, [2k]) plus the swiglu `limit`, applies
+    /// `swiglu_limit_q_kernel`'s clamps + silu and encodes the result into
+    /// shared memory with that kernel's amax tree / scale / e4m3 byte, term for
+    /// term. `epi_add` folds the A5 `out += acc` merge into the same launch.
+    /// Optional: a stale `.so` has no entry and the caller keeps the
+    /// (swiglu_limit_q, gemm_fp8_mx) pair. Returns 2 when the shape/mode cannot
+    /// use it (never 1 — cudaErrorInvalidValue, the round-42 collision).
+    /// ABI: stream LAST.
+    gemm_fp8_mx_swiglu: Option<
+        unsafe extern "C" fn(
+            // gu (f32 [2k] gate|up row), swiglu limit
+            *const f32, f32,
+            // w, w_scale, bias, out, n, k, epi_add
+            *const u8, *const u8, *const f32, *mut f32, c_int, c_int, c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
     /// epilogue (`out += w @ a`). A separate symbol, so a stale `.so` simply has
     /// no entry and the caller keeps the gemm_fp8_mx + add_inplace pair. Returns
@@ -707,6 +727,7 @@ impl Device {
             gemm_fp8_mx_rope: ko!(rt, "dsv41_gemm_fp8_mx_rope"),
             gemm_fp8_mx2_rope: ko!(rt, "dsv41_gemm_fp8_mx2_rope"),
             gemm_fp8_mx_rope_norm: ko!(rt, "dsv41_gemm_fp8_mx_rope_norm"),
+            gemm_fp8_mx_swiglu: ko!(rt, "dsv41_gemm_fp8_mx_swiglu"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             gemm_fp8_mx_f32: ko!(rt, "dsv41_gemm_fp8_mx_f32"),
             gemm_fp8_wo_pair: ko!(rt, "dsv41_gemm_fp8_wo_pair"),
@@ -1514,6 +1535,71 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_rope_norm")?;
+        Ok(true)
+    }
+
+    /// SWIGLU_FOLD: true when the loaded .so carries the swiglu-fused w2 GEMV
+    /// (`dsv41_gemm_fp8_mx_swiglu`). A stale .so leaves DSV41_SWIGLU_FOLD inert
+    /// and the (swiglu_limit_q, gemm_fp8_mx) pair runs.
+    pub fn supports_swiglu_fold(&self) -> bool {
+        self.kernels.gemm_fp8_mx_swiglu.is_some()
+    }
+
+    /// SWIGLU_FOLD: the shared expert's w2 M=1 GEMV whose PROLOGUE produces the
+    /// fp8 activation it consumes. `gu` is the f32 gate|up row the caller would
+    /// have handed to `swiglu_limit_q` (`ex_act`, [2k]: gate first, up second);
+    /// the prologue applies that kernel's clamps + silu and encodes the result
+    /// into shared memory with its amax tree / `fast_round_scale` / e4m3 byte,
+    /// term for term. The standalone `swiglu_limit_q` launch and the `xq`/`xsc`
+    /// hand-off disappear; the gemv's own dot is untouched, so `out` is
+    /// bit-identical to (`swiglu_limit_q`, `gemm_fp8_mx`).
+    ///
+    /// `epi_add` folds the A5 `out += acc + bias` merge into the same launch
+    /// (bit-identical to gemm_fp8_mx_add + the caller's merge: same operands,
+    /// commutative add); pass `false` to overwrite `out` and let the caller do
+    /// its own merge (the MOE_DUAL / non-A5 shape).
+    ///
+    /// `gu` must NOT alias `out`. Ok(false) on any decline (wrong mode, shape
+    /// not a multiple of 32, null pointer, or a stale `.so`), so the caller
+    /// keeps the old pair.
+    /// ABI: stream LAST.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_swiglu_on(
+        &self,
+        gu: *const f32,
+        limit: f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        epi_add: bool,
+        s: CuStream,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mx_swiglu else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                gu,
+                limit,
+                w,
+                w_scale,
+                bias,
+                out,
+                n,
+                k,
+                epi_add as i32,
+                s,
+            )
+        };
+        // Round-42 fix: the C side's shape-decline is 2 (never 1, which collides
+        // with cudaErrorInvalidValue).
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx_swiglu")?;
         Ok(true)
     }
 

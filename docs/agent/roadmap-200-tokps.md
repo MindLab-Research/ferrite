@@ -41,6 +41,7 @@
 | 2 | `DSV41_DOWN_FUSE` | expert_gemv_fp4_down_reduce(dsv41_experts_mxf4.cu:1027) 合并 down(:701 写 scratch)+moe_down_reduce(:986) | −0.3 | **逐位**：`__fadd_rn/__fmul_rn` 显式分开乘/加（fast_math 防 FMA 收缩），slot 升序累加 |
 | 3 | `DSV41_AR_STORE_FUSE` | p2p_ar_store_v5(:8117) 折进 producer epilogue（attn=gemm_fp8_gemv / moe=add_inplace 或 moe_down_reduce）| −0.08（−80 节点）| ⚠️ GEMV 加参数触发重编译 ⇒ 新 .so `AR_ST=0` vs 旧 .so token **逐位一致**（fast_math ptxas 可能改结合）|
 | 4 | `DSV41_SWIGLU_Q` | swiglu_limit_q(dsv41_glue.cu:176) 直出 (xq,xsc) | −0.06 | **逐位**（`tests_dsv41_glue.cu` 的 swiglu_q 用例：xq/xsc/f32 对 `swiglu_limit`+`dsv41_quant_fp8` 逐位）；**已翻默认 ON**——原"round-18 数值 bug"是误归因（A4 代码 `f3b1be1` 才进树，而该 commit 报的正是 round-18 那次跑分）|
+| 4b | `DSV41_SWIGLU_FOLD`（small-kernel-merge #2）| **共享专家**的 `swiglu_limit_q` 整体搬进 w2 GEMV **prologue**（`dsv41_gemm_fp8_mx_swiglu`，chain_dev.rs 的 sh_w2 调用点）⇒ 该 launch（1.7µs × 40/步）与它的图节点消失 | **−0.068**（预估）| **逐位**：prologue 用 `swiglu_limit_q_kernel` 的逐项算式（clamp + silu + per-warp 32-lane amax 树 + `fast_round_scale` + clamp + e4m3），只因 `k%32==0` 且 blockDim%32==0 而 lane→element 映射相同；consume loop 与 standalone `gemm_fp8_mx` 同 grid/同 warps ⇒ `out` 逐位。**默认 ON**，decline（stale .so / mode≠4 / `sh_il%32≠0`）回退 A4/A5 老路径 |
 | 5 | `DSV41_MOE_EPI_ADD` | gemm_fp8_mx_add 把 add_inplace 折进 lane-0 epilogue，直写 s.o | −0.08 | 结合律 `o+(acc+bias)` 不变 ⇒ **逐位** |
 
 **补差（实测后只剩一项）**：`quant_kernel` 生产者直出 fp8（−0.28）；~~hc sinkhorn 藏进 collapse 重叠（−0.21，探针 /tmp/tail_probe）~~ **实测否决 → 0.018ms/步**（`/tmp/tail_phase_probe.cu`：可藏窗口 collapse P1 = 0.46µs ≪ sinkhorn 6.5µs）。

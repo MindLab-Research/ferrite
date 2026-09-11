@@ -3272,6 +3272,35 @@ struct GemvFusion {
     // tighter value (wo_b -> AR sum -> hc_post). Requires `vec >= 3` (the s_af
     // materialisation lives there); the launcher enforces it.
     const float* a_f32 = nullptr;
+    // SWIGLU_FOLD (see dsv41_gemm_fp8_mx_swiglu): when `gu` is non-null the gemv
+    // OWNS the production of the fp8 activation it consumes, exactly like the
+    // NORM_FUSE `qr_raw` above. `gu` is the shared expert's f32 gate|up row
+    // (`ex_act`, [2k]: gate first, up second) and the prologue applies
+    // swiglu_limit_kernel's clamp + silu -- `v = (min(g,limit) /
+    // (1 + expf(-min(g,limit)))) * clamp(u,-limit,limit)` -- then encodes it into
+    // `s_a` / `s_as` with swiglu_limit_q_kernel's per-32-block amax tree,
+    // fast_round_scale, clamp and __nv_fp8_e4m3 byte. The standalone
+    // `swiglu_limit_q` launch between `ex_act`'s producer (the shared w1w3 mx2)
+    // and this gemv therefore disappears (one launch + one graph node per layer).
+    //
+    // BIT-IDENTITY. swiglu_limit_q_kernel gives ONE WARP one 32-element scale
+    // block (i = (b << 5) | lane) and takes the amax with a per-lane
+    // shuffle-xor tree; the prologue's blockDim-strided loop visits the same
+    // elements in the same lane order because blockDim is a multiple of 32 and
+    // k % 32 == 0 -- lane l of warp w holds i = iter*blockDim + w*32 + l, so its
+    // 32 lanes are exactly one scale block and the trees are the same 32 values.
+    // The f32 write-back swiglu_limit_q performs on `ex_act` is NOT reproduced:
+    // `ex_act` has no reader after that kernel (the shared w2 gemv is its only
+    // consumer, through the fp8 pair), so the value is dead. `a`/`a_scale` are
+    // never read on this path (the launcher passes them null).
+    //
+    // The reference kernel's amax never spans warps, so -- unlike NORM_FUSE --
+    // the block width is NOT pinned to 32 warps; the launcher keeps the caller's
+    // adaptive `dsv41_gemv_warps_for(n)` so the consume loop is bit-identical to
+    // the standalone `dsv41_gemm_fp8_mx` call it replaces. Requires vec == 4 (the
+    // prologue writes `s_a`, which only mode 4 allocates).
+    const float* gu = nullptr;
+    float swiglu_limit = 0.f;
 };
 
 struct GemvEpi {
@@ -3405,6 +3434,8 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     const float* qr_w = gf.qr_w;
     float qr_eps = gf.qr_eps;
     const float* a_f32 = gf.a_f32;
+    const float* gu = gf.gu;
+    float swiglu_limit = gf.swiglu_limit;
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain above): the launcher may have
     // launched this grid with programmatic stream serialization, so the grid is
@@ -3478,13 +3509,17 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // term -- dsv41_gemv_sa_bytes() reserves k bytes for it unconditionally, and
     // a kernel that skipped the slot would put every later pointer k bytes early.
     const bool a32_direct = (a32 != 0) && (vec == 4) && (qr_raw == nullptr)
+            && (gu == nullptr)                     // SWIGLU_FOLD: the prologue writes s_a
             && !a32_staged && (act_cpasync == 0);  // P1/P4 gates: fall back to staged
     // P4: only the sites where the synchronous staging loop below would run get
     // the async treatment. `a_f32 != nullptr` is excluded because on that path
     // `a` is NULL (its launcher passes null) and an async copy from it would
-    // fault; that branch fills `s_af` straight from `a_f32` instead.
+    // fault; that branch fills `s_af` straight from `a_f32` instead. SWIGLU_FOLD
+    // (`gu != nullptr`) is excluded for the SAME reason: its launcher also
+    // passes `a` null and its prologue fills `s_a` itself.
     const bool act_async = (act_cpasync != 0) && (a32 != 0) && (vec == 4) &&
-                           (qr_raw == nullptr) && !a32_staged && (a_f32 == nullptr);
+                           (qr_raw == nullptr) && (gu == nullptr) && !a32_staged &&
+                           (a_f32 == nullptr);
     uint8_t* s_ws = s_a + (size_t)((vec == 4 && !a32_direct) ? k : 0);
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     // The e4m3 decode as a 256-entry shared-memory table. The bit-manipulation
@@ -3628,6 +3663,41 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
             const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
             s_a[i] = *(const uint8_t*)&f8;
         }
+    } else if (gu != nullptr) {
+        // SWIGLU_FOLD prologue (see dsv41_gemm_fp8_mx_swiglu and the GemvFusion
+        // `gu` field). This block owns the fp8 production of the activation it
+        // consumes: read the f32 gate|up row `gu` (gate at [i], up at [k + i]),
+        // apply swiglu_limit_kernel's clamps + silu, and encode the result into
+        // `s_a` / `s_as` with swiglu_limit_q_kernel's per-32-block amax tree +
+        // fast_round_scale + clamp + e4m3 byte, term for term -- the standalone
+        // swiglu_limit_q launch disappears and the gemv reads the identical
+        // bytes out of shared memory.
+        //
+        // BIT-IDENTITY: swiglu_limit_q_kernel gives one WARP one 32-element
+        // scale block (i = (b << 5) | lane). Here lane l of warp w holds
+        // i = iter*blockDim + w*32 + l, and blockDim % 32 == 0 with k % 32 == 0
+        // (the launcher declines otherwise), so its 32 lanes span exactly ONE
+        // block and the shuffle-xor tree sees the same 32 values in the same
+        // lane order. `fmaxf` is exact and associative, so the amax -- and
+        // therefore `sc`, the byte and the scale -- is bit-identical.
+        const int lane31 = threadIdx.x & 31;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) {
+            float g = gu[i];
+            float u = gu[k + i];
+            if (swiglu_limit > 0.f) {
+                g = fminf(g, swiglu_limit);
+                u = fminf(fmaxf(u, -swiglu_limit), swiglu_limit);
+            }
+            const float v = (g / (1.f + expf(-g))) * u;
+            float am = fabsf(v);
+            for (int off = 16; off > 0; off >>= 1)
+                am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, off));
+            const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
+            if (lane31 == 0) s_as[i >> 5] = sc;
+            const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+            const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+            s_a[i] = *(const uint8_t*)&f8;
+        }
     } else if (vec == 4 && a_f32 == nullptr && !a32_direct) {
         // On the f32 path `a` is null and the block-wide copy is not read (the
         // consume loop reads `s_af`, which the a32 block below fills from a_f32),
@@ -3669,8 +3739,9 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
         // The activation scales are the same for every output row, so they are
         // read once per block instead of once per row per k-block. On the
         // NORM_FUSE path (`qr_raw` non-null) the prologue above already wrote
-        // them, and `a_scale` is null.
-        if (qr_raw == nullptr && a_f32 == nullptr)
+        // them, and `a_scale` is null. SWIGLU_FOLD (`gu` non-null) is the same:
+        // its prologue wrote `s_as` and its launcher passes `a_scale` null.
+        if (qr_raw == nullptr && gu == nullptr && a_f32 == nullptr)
             for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
         // Build the e4m3 decode table once per block (256 entries, two iterations
         // per thread at the default block size).
@@ -4810,6 +4881,100 @@ extern "C" int dsv41_gemm_fp8_wo_pair(const uint8_t* a, const float* a_scale,
         a, a_scale, wa, wa_scale, wa_bias, na, ka,
         wb, wb_scale, wb_bias, nb, kb,
         mid, out, bar, warps, g_gemv_cpasync ? 1 : 0);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// SWIGLU_FOLD (2026-09-12): the shared expert's w2 M=1 GEMV whose PROLOGUE
+// produces the fp8 activation it consumes, so the `swiglu_limit_q` launch
+// between `ex_act`'s producer (the shared w1w3 `gemm_fp8_mx2`) and this gemv
+// disappears (one launch + its graph node per layer, 40 per step).
+//
+// NORM_FUSE isomorph. `dsv41_gemm_fp8_mx_rope_norm` solved the same shape of
+// problem -- a strictly serial producer of the activation living in its own
+// launch -- by moving that producer into the gemv's prologue and filling
+// `s_a`/`s_as` in shared memory. Here the producer is the shared expert's
+// swiglu + fp8 pair: `swiglu_limit_q_kernel` (dsv41_glue.cu) reads the f32
+// `ex_act` row [2*il] (gate | up), applies the training clamps and silu, and
+// emits the e4m3 byte + per-32-block scale the w2 GEMV consumes. Unlike
+// NORM_FUSE there is NO cross-warp reduction (one warp owns one 32-element
+// scale block: i = (b << 5) | lane), so the block width is NOT pinned to 32
+// warps -- this launcher keeps the caller's adaptive `dsv41_gemv_warps_for(n)`,
+// which is what makes the whole launch (grid, consume loop and all)
+// bit-identical to the standalone `dsv41_gemm_fp8_mx` it replaces.
+//
+// A SEPARATE entry point for the usual reason: `dsv41_gemm_fp8_mx` has one
+// fixed ABI, so a stale .so stays a plain symbol probe (`supports_swiglu_fold`
+// on the Rust side) and the caller keeps the (swiglu_limit_q, gemm_fp8_mx) pair.
+//
+// `epi_add` folds the shared expert's merge (`out += acc + bias` -- the A5
+// epilogue, byte-identical to the standalone gemm_fp8_mx + ferrite_add pair: the
+// same operands in the same commutative order) into the SAME launch when the
+// caller would otherwise run gemm_fp8_mx_add. 0 overwrites `out` and the caller
+// keeps its own merge.
+//
+// DECLINE (returns 2, never 1 -- 1 is cudaErrorInvalidValue):
+//   * any mode other than 4 (the prologue writes `s_a`, which only mode 4
+//     allocates) -- the DSV41_GEMV_FP8_MODE gate does not apply here;
+//   * `k` not a multiple of 32 (one warp per scale block) or not a multiple of 4;
+//   * a null `gu`/`w`/`w_scale`/`out`.
+// `DSV41_NO_GEMV_FP8` also declines (the whole M=1 GEMV family is off).
+extern "C" int dsv41_gemm_fp8_mx_swiglu(const float* gu, float limit,
+                                        const uint8_t* w, const uint8_t* w_scale,
+                                        const float* bias, float* out, int n, int k,
+                                        int epi_add, cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv || gu == nullptr) return 2;
+    if (w == nullptr || w_scale == nullptr || out == nullptr) return 2;
+    if (n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 2;
+    if (g_gemv_fp8_mode != 4) return 2;
+    // P2: adaptive rows/block, exactly like dsv41_gemm_fp8_mx -- the reference
+    // amax tree is per-warp, so the width is free and matching the caller's
+    // standalone launch keeps the consume loop (and therefore `out`) identical.
+    const int warps = dsv41_gemv_warps_for(n);
+    const int blocks = (n + warps - 1) / warps;
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    // Same layout as dsv41_gemm_fp8_mx mode 4, with `norm_fuse = true` so the
+    // k-byte `s_a` row is always reserved (the prologue writes it and the a32
+    // materialisation reads it back): weight rows [warps][k] + activation row
+    // [k] + per-warp ue8m0 scale rows [warps][nb_k_al] + activation scales
+    // [nb_k] f32 + 256-entry LUT + a32 row + B1 row slot.
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + B1 row stage
+    const size_t gsmem = (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, true) + scale_bytes;
+    if (gsmem > 48 * 1024) {
+        // Round-43 revert: the (int)gsmem form set the per-function attribute to
+        // THIS call's need, which can silently cap later launches of the same
+        // kernel that need more. The ceiling (the device max opt-in) is correct.
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemm_fp8_gemv_kernel));
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    // `a`/`a_scale` are null: the prologue produces the activation and the kernel
+    // never dereferences them on this path (the `gu` guard skips both staging
+    // sites, exactly like the `qr_raw` guard does for NORM_FUSE). `act_cpasync`
+    // is forced off for the same reason (an async copy from the null `a` would
+    // fault); the kernel's `act_async` also excludes `gu != nullptr`.
+    GemvCore gc{};
+    gc.w = w; gc.w_scale = w_scale;
+    gc.bias = bias; gc.out = out;
+    gc.n = n; gc.k = k;
+    gc.vec = 4;                    // forced: only mode 4 owns the `s_a` row
+    gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
+    gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+    gc.act_cpasync = 0;            // the activation comes from the prologue
+    gc.n1 = n;                     // single family
+    GemvFusion gf{};
+    gf.gu = gu; gf.swiglu_limit = limit;
+    GemvEpi ge{};
+    ge.epi_add = epi_add;          // A5 merge fold (0 = overwrite `out`)
+    GemvRope gr{};
+    cudaError_t le = dsv41_pdl_or_plain(
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
 
