@@ -1606,13 +1606,6 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
-// Four-step ILP in the fp8 gemv kb loop, isolated on top of nuclear+e4m3.
-static const int g_gemv_ilp = [] {
-    const char* e = getenv("DSV41_GEMV_ILP");
-    if (e == nullptr) return 0;    // DEFAULT OFF: the 4-way unroll degenerates the
-    return atoi(e) != 0 ? 1 : 0;   // model even with fmaf pinning (see STATUS.md)
-}();
-
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
@@ -1635,8 +1628,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const uint8_t* __restrict__ w2 = nullptr,
                                      const uint8_t* __restrict__ w2_scale = nullptr,
                                      const float* __restrict__ bias2 = nullptr,
-                                     float* __restrict__ out2 = nullptr, int n1 = 0,
-                                     int ilp = 0) {
+                                     float* __restrict__ out2 = nullptr, int n1 = 0) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -1722,36 +1714,11 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
-            float acc = 0.f;
-            if (ilp) {
-            int kb = 0;
-            for (; kb + 3 < nb_k; kb += 4) {
-                const int j0 = (kb + 0) * 32 + lane, j1 = (kb + 1) * 32 + lane;
-                const int j2 = (kb + 2) * 32 + lane, j3 = (kb + 3) * 32 + lane;
-                const float sb0 = ue8m0_to_f(wsr[kb + 0]), sb1 = ue8m0_to_f(wsr[kb + 1]);
-                const float sb2 = ue8m0_to_f(wsr[kb + 2]), sb3 = ue8m0_to_f(wsr[kb + 3]);
-                const float sa0 = a_scale[kb + 0], sa1 = a_scale[kb + 1];
-                const float sa2 = a_scale[kb + 2], sa3 = a_scale[kb + 3];
-                const uint8_t av0 = ap[j0], av1 = ap[j1], av2 = ap[j2], av3 = ap[j3];
-                const uint8_t rv0 = row_s[j0], rv1 = row_s[j1], rv2 = row_s[j2], rv3 = row_s[j3];
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av0), sa0), __fmul_rn(e4m3_to_f(rv0), sb0), acc);
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av1), sa1), __fmul_rn(e4m3_to_f(rv1), sb1), acc);
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av2), sa2), __fmul_rn(e4m3_to_f(rv2), sb2), acc);
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av3), sa3), __fmul_rn(e4m3_to_f(rv3), sb3), acc);
-            }
-            for (; kb < nb_k; ++kb) {
-                const float sb = ue8m0_to_f(wsr[kb]);
-                const float sa = a_scale[kb];
-                const int j = kb * 32 + lane;
-                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
-            }
-            } else {
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
                 const float sa = a_scale[kb];    // m == 1
                 const int j = kb * 32 + lane;
                 acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
-            }
             }
             __syncwarp();
         } else if (vec) {
@@ -1816,7 +1783,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         }
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
                                                               k, g_gemv_fp8_mode, nullptr, nullptr,
-                                                              nullptr, nullptr, n, g_gemv_ilp);
+                                                              nullptr, nullptr, n);
         return (int)cudaGetLastError();
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
@@ -1963,7 +1930,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
-        n1, g_gemv_ilp);
+        n1);
     return (int)cudaGetLastError();
 }
 
