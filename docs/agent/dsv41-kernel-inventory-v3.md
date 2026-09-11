@@ -70,6 +70,25 @@
 \* **`gemv_bf16` 的 22.4µs 是两个 population 的混合**：40 次共享专家 gate（≈17.3µs）+ 9 次 lm_head/engram（≈45µs）。
 只报均值会把 45µs 那一族藏起来——这是 §6 的新陷阱。
 
+### `gemm_fp8_gemv` 246 次的代码级分解（2026-09-11 只读代码审计，`chain_dev.rs`）
+
+单层 attention 侧 4 次：`lin2(wq_a,wkv)`（`xn`, k=5120, n=1280+512, **mx2 已融合**）:1795；
+`wq_b`（`qr`, k=1280, n=nlh·hd=4096；8 个 index-source 层用 IDX_FUSE mx2 带上 idx_wq_b）:1865/1882；
+`wo_a` 循环 :2135（`o`, k=hpg·hd=4096, n=olg=1024，`nlg=o_groups/world=8/8=`**1**）；
+`wo_b` :2184（`wo`, k=ol_local=1024, n=dim=5120）。
+单层 MoE 侧 2 次（共享专家，SHARED_TP=1 全 rank）：`w1/w3` mx2 :2849（k=5120, n=2·sh_il=512）；
+`w2` :2933（k=sh_il=256, n=dim=5120；`MOE_EPI_ADD` 默认 OFF 故走末行而非 mx_add :2921）。
+
+⇒ 6 × 40层 = 240，再加 engram 的 fp8 gemv :899 在 L1/L14 = **2** ⇒ **代码推导 242**。
+与下表 246 差 4，且 `gemv_bf16` 反向差 −4（代码推 40 gate + 4 idx_wk + 8 idx_w + 1 HEAD_SLICE = 53 vs 表 49）：
+**镜像差指向 4 次调用的符号归属，而非 4 个隐藏调用**——需一次逐符号 CSV 交叉核对定案，勿直接改动本表的 246。
+
+**融合空间（同一审计）**：attention 侧"同激活 + 同 k"的对已被 A1(mx2)/A2(idx mx2)/M1(mx2) 用完 ⇒
+**无任何可 mx2 合并的对**。剩余只有两类：① 链式两段核（wo_a→wo_b，k 4096→1024，跨 stage 同步；
+wq_a→wq_b / w1w3→w2 同构但需 grid 级同步，不可行），② 异激活融合需先加第二 fp8 激活缓冲
+（`s.xq/xsc` 是**单缓冲**，T1/T2 一次性旗标建立在"只存最近一次量化"之上），且 mx2 只有单一 k。
+⇒ 单层 6 次 → 1 次只能走 Stage C persistent 段核。
+
 ### 家族汇总（生产口径 9.64ms 为分母）
 
 | 家族 | ms/步 | % | 备注 |

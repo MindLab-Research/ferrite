@@ -804,14 +804,14 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // per-expert tensor sizes here are multiples of 8 because
                 // dim % 512 == 0 gives dim/2 = 256k and dim/32 = 16k bytes per row),
                 // and lane<<3 / g2<<8 are multiples of 8. BIT-EXACT: the 8 bytes at
-                // gp are identical to gw0 at gp and gw1 at gp+4; only the number of
+                // gp are identical to gw.x at gp and gw.y at gp+4; only the number of
                 // load instructions changes.
                 const uint2 gw = *reinterpret_cast<const uint2*>(gp);
                 float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
-                const float2 gt0 = s_lut2[gw0 & 0xFFu];
-                const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
-                const float2 gt2 = s_lut2[(gw0 >> 16) & 0xFFu];
-                const float2 gt3 = s_lut2[(gw0 >> 24) & 0xFFu];
+                const float2 gt0 = s_lut2[gw.x & 0xFFu];
+                const float2 gt1 = s_lut2[(gw.x >> 8) & 0xFFu];
+                const float2 gt2 = s_lut2[(gw.x >> 16) & 0xFFu];
+                const float2 gt3 = s_lut2[(gw.x >> 24) & 0xFFu];
                 gp0 = fmaf(sa[0], gt0.x, gp0);
                 gp1 = fmaf(sa[1], gt0.y, gp1);
                 gp2 = fmaf(sa[2], gt1.x, gp2);
@@ -820,10 +820,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 gp1 = fmaf(sa[5], gt2.y, gp1);
                 gp2 = fmaf(sa[6], gt3.x, gp2);
                 gp3 = fmaf(sa[7], gt3.y, gp3);
-                const float2 gu0 = s_lut2[gw1 & 0xFFu];
-                const float2 gu1 = s_lut2[(gw1 >> 8) & 0xFFu];
-                const float2 gu2 = s_lut2[(gw1 >> 16) & 0xFFu];
-                const float2 gu3 = s_lut2[(gw1 >> 24) & 0xFFu];
+                const float2 gu0 = s_lut2[gw.y & 0xFFu];
+                const float2 gu1 = s_lut2[(gw.y >> 8) & 0xFFu];
+                const float2 gu2 = s_lut2[(gw.y >> 16) & 0xFFu];
+                const float2 gu3 = s_lut2[(gw.y >> 24) & 0xFFu];
                 gp0 = fmaf(sa[8], gu0.x, gp0);
                 gp1 = fmaf(sa[9], gu0.y, gp1);
                 gp2 = fmaf(sa[10], gu1.x, gp2);
@@ -836,13 +836,14 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // ---- up chain: row `row` of the `b_hi`/`bhs` pair ----
                 const float usc = __uint_as_float(((uint32_t)u_srow[j >> 5]) << 23);
                 const uint8_t* up = u_row + (g2 << 8) + (lane << 3);
-                const uint32_t uw0 = *reinterpret_cast<const uint32_t*>(up);
-                const uint32_t uw1 = *reinterpret_cast<const uint32_t*>(up + 4);
+                // Same LDG.64 fold as the gate chain above (up-row load, identical
+                // 8-byte alignment argument); uw.x/uw.y == the old uw0/uw1.
+                const uint2 uw = *reinterpret_cast<const uint2*>(up);
                 float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
-                const float2 ut0 = s_lut2[uw0 & 0xFFu];
-                const float2 ut1 = s_lut2[(uw0 >> 8) & 0xFFu];
-                const float2 ut2 = s_lut2[(uw0 >> 16) & 0xFFu];
-                const float2 ut3 = s_lut2[(uw0 >> 24) & 0xFFu];
+                const float2 ut0 = s_lut2[uw.x & 0xFFu];
+                const float2 ut1 = s_lut2[(uw.x >> 8) & 0xFFu];
+                const float2 ut2 = s_lut2[(uw.x >> 16) & 0xFFu];
+                const float2 ut3 = s_lut2[(uw.x >> 24) & 0xFFu];
                 up0 = fmaf(sa[0], ut0.x, up0);
                 up1 = fmaf(sa[1], ut0.y, up1);
                 up2 = fmaf(sa[2], ut1.x, up2);
@@ -851,10 +852,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 up1 = fmaf(sa[5], ut2.y, up1);
                 up2 = fmaf(sa[6], ut3.x, up2);
                 up3 = fmaf(sa[7], ut3.y, up3);
-                const float2 uu0 = s_lut2[uw1 & 0xFFu];
-                const float2 uu1 = s_lut2[(uw1 >> 8) & 0xFFu];
-                const float2 uu2 = s_lut2[(uw1 >> 16) & 0xFFu];
-                const float2 uu3 = s_lut2[(uw1 >> 24) & 0xFFu];
+                const float2 uu0 = s_lut2[uw.y & 0xFFu];
+                const float2 uu1 = s_lut2[(uw.y >> 8) & 0xFFu];
+                const float2 uu2 = s_lut2[(uw.y >> 16) & 0xFFu];
+                const float2 uu3 = s_lut2[(uw.y >> 24) & 0xFFu];
                 up0 = fmaf(sa[8], uu0.x, up0);
                 up1 = fmaf(sa[9], uu0.y, up1);
                 up2 = fmaf(sa[10], uu1.x, up2);
