@@ -6599,3 +6599,34 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 **做法**：先跑单层 microbench（复用 `tests_tcgen05_mxf4.cu` 脚手架 + `gemv_bench.cu` 模式，
 2 分钟），**打不过 25.3µs 就不进集成**——这是本仓库"in-serve 试错每次烧 ~1h"的教训。
 前置：b300-4 驱动解楔 + a32/EARLY/dots→side 等在飞项先验证（a32 若成，"SM 饥饿"前提会变）。
+
+### 会话终局快照（2026-09-11 深夜，环境阻塞第 3 小时）
+
+**验证基线**：13.28 → 8.23ms（+61.4%），75.3 → 121.5 tok/s（round 41，四段全对）
+
+**累积待验证**（全部已提交，含实施细节）：
+| # | 优化 | 预期 | 状态 |
+|---|---|---|---|
+| 1 | tail split + tail-late priority | −0.3~0.6 | 已提交 |
+| 2 | NORM_FUSE + wob-f32 + engram f32 | −0.19 | 已提交 |
+| 3 | dual-chain attention | −0.42 | 已提交 |
+| 4 | MoE dual-chain | −0.5~0.88 | 已提交 |
+| 5 | fp4-pack + expert-interleave | −0.15 | 已提交 |
+| 6 | PDL chain（attn + expert） | −0.3~0.7 | 已提交 |
+| 7 | sparse-o-rope + AR pubred | −0.26~0.4 | 已提交 |
+| 8 | hc_post compat + hc_post fold | −0.15 | 已提交 |
+| 9 | AR grid 失衡修复 | −0.12~0.16 | 已提交 |
+| 10 | multistream priority | （调度） | 已提交 |
+| 11 | EARLY concurrent | −0.14 | 已提交 |
+| 12 | **dots to side** | **−0.256** | 已提交 |
+| 13 | **gateup K-split** | **−0.19** | 已提交（gate OFF，parity 风险） |
+| 14 | down 4-value 向量化 | −0.09 | 已提交 |
+| 15 | a32 真开关 | −0.74（实验） | 已提交（A/B 决定） |
+| 16 | indexer v2 | −0.05~0.07 | 实施中 |
+| 17 | elementwise 融合 | −0.10~0.15 | 实施中 |
+
+**投影（中间档，含全部已提交）**：4.05 − 0.256 − 0.19 = **3.60ms ≈ 218 tok/s**（有余量！）
+**保守（a32 失败）**：5.40 − 0.256 = 5.14ms ≈ 160（仍不达 200——a32 是关键）
+**乐观（全上界 + a32 + indexer + 融合）**：3.45 − 0.19 − 0.17 = **3.09ms ≈ 254 tok/s**
+
+**恢复步骤**：POST_RECOVERY_COMMANDS.md（哨兵 → recovery_verify.sh → a32 A/B → K-split 文本 A/B）
