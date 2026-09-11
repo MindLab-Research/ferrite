@@ -3022,3 +3022,35 @@ indexer 的 `for g in 0..nlg`（`nlg = cfg.o_groups/world` **静态模型维度*
 **可复用模式（本会话第 4 个隔离复现器）**：`/tmp/{hc,sa,ikp}_repro.cu`
 = 直接链 `libferrite_kernels.so` ✓ + 预热 ✓ + 循环断言 ✓ + **空 kernel 地板对照**（hc/sa 版 ✓）。
 ⚠ 模板坑（已踩两次 ✗）：返回 `int` 的 FFI **不能**用 `cudaError_t` 包装宏 ✓ ⇒ 单独定义 `HCM`/`IKP` 宏 ✓。
+
+## ⚠ 审计发现的**第三处**同类：`indexer_topk` 的两个每步实参（**已入档，待迁移统一修** ✗→✓）
+
+```rust
+self.dev.indexer_topk(
+    ..., idx_lens_ptr,                       // ← 这里已经是设备指针 ✓（前一处修复时接的）
+    (self.layers[layer].idxs.ptr as *mut i32).wrapping_add(offset),   // ← offset 每步变 ✗
+    1, 1, idx_nh, idx_hd,
+    comp_len as i32,                         // ← 每步宿主值作 kernel 参数 ✗✗
+    cfg.index_topk as i32,
+    offset as i32,                           // ← 同上 ✗
+    scale, 1.0, false);
+```
+⇒ 图捕获会**冻结 `comp_len` 与 `offset`** ✗：之后每步都用**捕获那步的** latent 数做 top-k 界 ✗、
+都往**同一个 idxs 偏移**写 ✗ ⇒ 压缩槽位的检索质量随生成退化 ✓（短上下文被 128 槽窗口掩盖 ✓，
+与五段文本仍通过一致 ✓）。
+
+**修法（与前两处同一模式 ✓，且更简单）**：kernel 本已收到设备指针 `compress_lens` ✓ ⇒
+**让它从 `*compress_lens` 推 `comp_len` 与 `offset`** ✓（`offset` 的公式在宿主侧已知 ✓，改成
+"窗口基址 + 设备计数" ✓），宿主实参传常量 ✓。**不需要新 kernel** ✓。
+
+**为什么此刻不动手** ✗（诚实说明）：唯一需要改的 Rust 文件是 `device.rs`（实参个数 ✗）✓ ——
+**而 subagent 正在改它** ✗ ⇒ 并发编辑会把对方的改动覆盖掉 ✗（它有独立的读-改-写窗口 ✓）。
+⇒ **留给迁移统一处理** ✓（修法已如上写明 ✓，且前两处已验证的模式可直接套 ✓）。
+
+### 冻结点审计的完整清单（本案类，供迁移一次性扫清 ✓）
+| # | 位置 | 性质 | 状态 |
+|---|---|---|---|
+| 1 | KV 环追加：`memcpy_d2d(ring + (pos%win)*hd, kv)` | 目的地址每步变 ✗ | **已修 + 已验证** ✓（`ring_append` ✓）|
+| 2 | index_k 发布：`memcpy_d2d(index_k + (compress_len-1)*idx_hd, …)` | 同上 ✗ | **已修 + 隔离验证 OK ✓** |
+| 3 | `indexer_topk(..., comp_len, offset)` | 每步值作**参数** ✗ | 已入档 ✓（修法明确 ✓，待迁移）|
+| — | `pre_a` 16B D2D · `h→h2` · `for g in 0..nlg`（静态模型维度 ✓）· `eng_ids+li*n_cols` · `clen+owner` | 常量/每层静态 ✓ | 无需改 ✓ |
