@@ -386,6 +386,19 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 
 ⚠️ `kpool_compress` 仍不在本 profile 里（它只服务 batched DSA 链 `cuda.rs:4645`，与单序列 `sparse_attn_pf_kernel` 不是同一条数据链）。
 
+⚠️ **misc 残余四项的最终判定（2026-09-11 explore，正式关闭 misc 优化线）**：
+`rope_precompute` 的 **16 次不是 per-step**——代码里只有 **2 个调用点**，都在 `DevChain::new` 内
+（`chain_dev.rs:892/899`，主流 θ=10000 + compress 流 θ=160000），表**一次性覆盖整个上下文**
+（`table = max_pos`，`DSV41_MAX_POS` 默认 64k，`chain_dev.rs:780-904`），`reset()` 不重建
+（`chain_dev.rs:946`）。⇒ 16 次 = profiled 窗口内 **8 次链构造**（每进程 3 个 `DevChain::new` 调用点：
+`dsv41-run.rs:199/394/802`），per-step 成本 **0**；"缓存"已是用尽（整段表即缓存）。
+`gemv_f32_v2`（7×, 0.029ms）与 compress 的 `compressor_pool`/`compress_commit` 都在 `side_stream3` 上
+（`lin_f32_on` → `gemv_f32_on`，`device.rs:2860`），与 q/kv 链重叠 ⇒ 非关键路径（v2 已落地，
+`dsv41_glue.cu:969-1038`，4.1µs/次 = 2.6MB 权重的 ~12× HBM 地板，但藏得住）。
+全表真正留在关键路径的 misc 残余只有 `embed_expand_dev`（1×, 0.012ms，`ferrite_kernels.cu:10057`，
+`chain_dev.rs:1693`）：n=1 单块、读 1 行 + hc 展开，DAG 头，11.6µs 是**单核 launch 延迟地板**。
+⇒ **misc 线关闭；关键路径残余 ≈ 0.012ms（embed 地板），无值得做的项。**
+
 ⚠️ **本表是 `db2917501`（09-11 16:48）的**剖析快照**，不是当前代码的 launch 清单**。表里四个 elementwise 小核
 此后都已被融合/消除（2026-09-11 explore 逐核复核；数字仍保留供溯源）：
 
@@ -395,6 +408,7 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | `swiglu_limit_kernel` 40× | ✅ **已无独立 launch**：routed batched 路径由 gate/up 融合的 epilogue 承担（`gateup_fused` 默认 ON ⇒ `swiglu_limit_batched` 被跳过）；共享专家由 A4 `swiglu_limit_q`（默认 ON）直出 fp8 | `chain_dev.rs:3838 / 4027-4047` |
 | `fp4_pack_kernel` 40× †† | ✅ **已融合**：`g_q4_fuse` 默认 1 ⇒ 单核 `quant_fp4_fused_kernel`；本表 tree（16:48）早于落地它的 `2d7eead`（18:39）⇒ 该行是**融合前**数据 | `dsv41_kernels.cu:2310-2332` |
 | `ring_append_kernel` + `window_idxs_kernel` | ✅ **已合并为一个** `dsv41_ring_win_fuse`（`DSV41_RING_WIN_FUSE` 默认 ON，每层 1 次、非 owner 层仍写 idxs）；本表 tree 早于落地它的 `710c107`（17:54）⇒ 两行都是**合并前**数据 | `chain_dev.rs:2802` |
+| `compressor_pool_kernel`/`compress_commit_kernel`（4×/步）| ✅ **已移出关键路径**（`DSV41_COMPRESS_SIDE` 默认 ON，`ec439e3` 19:42）：kv-source 层的 4 个 compress launch 在 `lin2` 后 fork 到 `side_stream3`，join 延到本层尾部（`window_idxs` 之前），与 q 链（主流 ~13.5µs）+ kv 链（side2）重叠。本表 tree（16:48）**早于**该 commit ⇒ 表里这两行是**串行时代**数据 | `chain_dev.rs:2581-2593 / 2985-2987 / 3508-3575`；`device.rs:759-790` |
 
 ### indexer_score v2（Step A，✅ 2026-09-11 已实施，**待 A/B**）
 
@@ -504,6 +518,27 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    **同轮**抓 `cuobjdump --dump-resource-usage`（`expert_gemv_fp4_batched_kernel<true|false>` 的 regs/thread）
    + ncu `sm__warps_active.avg.pct_of_peak_sustained_active`。这两个数决定下一步是 K-split（regs 低、grid 欠填充）
    还是 MLP/寄存器路线（regs 高、已近可驻留上限）。
+
+---
+
+## 8. 最终机会扫描补遗（2026-09-11 晚，纯代码复核）
+
+逐核过了一遍 §1/§5 全表 + `chain_dev.rs::step_body`（:1688-1940）与 `layer()` 的全部 `self.dev.*` 调用点（162 处），
+**除下面 3 条外，每个核都能对上一条已落地优化或一条明确的关闭决策**：
+
+| 未覆盖项 | 现状（代码 + profile） | 判定 |
+|---|---|---|
+| `argmax_kernel` + `argmax_xchg_v5_kernel` | §1 #19 记 **1 次 / 59.1µs = 0.059ms**，无任何优化/关闭记录。`dsv41_kernels.cu:3822` 是 **单 CTA**（`<<<1,1024>>>`）扫 16K 元素 + 32 项 smem 归约，纯计算应 ≈2-5µs ⇒ 59µs 绝大多数是 `argmax_xchg_v5` 的 **v5 epoch 自旋**（协议，非可回收）。**须一次探针把两核拆开**（nsys 单列或 host 计时）：若确认是自旋 ⇒ 关闭；若确在归约 ⇒ 单 CTA 是 148 SM 的 1/148，有 fixable 空间 | **>0.02ms，报告** |
+| `quant_kernel<0>` 残差 126× | §1 #10 = 0.19ms，per-call 1.5µs 已在 launch/图节点地板（5120 元素实算 ≈0.1µs）。`rmsnorm_q`（40）、`o-rope-q`（40）、`sparse-o-rope` 已各吃掉一批；**剩下的 ~3 次/层只能走"生产核 epilogue 直出 fp8"**（同一模式已被证明 3 次）——单点 ≤0.02ms，是**模式级残差**不是单核 | **模式级，边际** |
+| `comp_placeholder_kernel` | §5 列 30 次 / 1.0µs = **0.030ms**，无决策。它写的是 `idxs[win+j]`，与 `ring_win_fused_kernel` 写的 `idxs[0,win)` **同一缓冲、同一 win**（`chain_dev.rs:3001`）⇒ **可折进 ring_win_fuse 的 epilogue**，30 个 launch/节点消失 | **>0.02ms，报告（边际）** |
+
+**以下为逐条排除（已覆盖 / 不适用）**：`gated_rmsnorm_kernel`、`layernorm_affine_kernel` —— 不在 DSV4.1 解码链
+（只在 `ferrite-exec`/`ferrite-kernel` 的其他模型路径）；`bf16_to_f32_kernel` —— **0 次/步**，仅 load-time（`load.rs:477/579`）；
+`f32_to_bf16` —— 只在 `DSV41_CUBLAS_M1=1` 的 `lin_bf16` 里（默认 OFF）；`window_idxs`+`ring_append` —— 已并入
+`ring_win_fused_kernel`；`kpool_compress(_batched)` —— 不在单序列 profile（batched DSA 链 `cuda.rs:4645`）；
+`sparse_attn_pf`（0.34ms）—— 已审（STATUS `5085`：0.34% 占用；key-split × 3 深预取已落地为默认）；
+`indexer_topk_kernel`（Step B，0.027ms）/`compressor_pool`（0.021ms）—— 略过阈，未单独优化，潜力 ≤0.02 量级；
+`embed_expand_dev`（0.012）、`engram_gather`（0.005）、`index_k_publish`（0.005）、`compressor_state`（0.005）—— **关闭（<0.02）**。
 
 ---
 
