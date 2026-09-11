@@ -392,6 +392,22 @@ impl Collective {
         (self.staging.ptr as *mut u8).wrapping_add(i * self.bytes) as *mut std::ffi::c_void
     }
 
+    /// Host-side rendezvous, used around a whole-step CUDA graph capture.
+    ///
+    /// A capture RECORDS instead of executing, so a rank that is recording is not
+    /// publishing its all-reduce stamps. The device-side AR deliberately has no
+    /// host rendezvous of its own (`end_round` returns early under `ar_v5`, because
+    /// the publish chain covers the normal case), which leaves the ranks free to
+    /// drift apart around a capture: a peer that is EXECUTING its AR polls for a
+    /// stamp the recording rank is only writing down, gives up, and reads staging
+    /// that was never published. Measured before this was added: with the
+    /// whole-step graph on, a single request was bit-identical to the per-kernel
+    /// path, but the fourth of six sequential requests failed with an illegal
+    /// memory access on a rank that varied between runs - the signature of a race.
+    pub fn host_barrier(&self) {
+        self.barrier.wait();
+    }
+
     /// Release a round (pairs with `publish`, to keep the next round from
     /// overwriting slots another rank is still reading).
     pub fn end_round(&self) {

@@ -668,12 +668,30 @@ impl<'a> DevChain<'a> {
         // observable symptom was output that looked like a plausible continuation of
         // something else - the model was being fed a mis-processed prompt).
         if want && self.decode_steps >= 1 {
+            // Rendezvous with the peers BEFORE the branch. A capture only RECORDS
+            // its all-reduce kernels, while the device-side AR has no host barrier
+            // of its own (end_round returns early under ar_v5, since the publish
+            // chain covers the normal case). Without this the ranks keep their
+            // microsecond-level skew, and a peer that is EXECUTING its AR polls for
+            // a stamp that a still-recording rank is only writing down, gives up,
+            // and reads staging that was never published. Measured: with the graph
+            // on, one request was bit-identical to the per-kernel path, yet the
+            // fourth of six sequential requests died with an illegal access on a
+            // rank that varied run to run - a race, not a deterministic fault.
+            if let Some(c) = self.comm.as_ref() {
+                c.host_barrier();
+            }
             if let Some(e) = self.step_graph {
                 self.dev.graph_launch(e)?;
             } else {
                 self.dev.capture_begin()?;
                 self.step_body(token, pos)?;
                 let g = self.dev.capture_end()?;
+                // The recording is finished; align again so no rank starts
+                // replaying (and thus publishing) while a peer is still capturing.
+                if let Some(c) = self.comm.as_ref() {
+                    c.host_barrier();
+                }
                 let e = self.dev.graph_instantiate(g)?;
                 self.dev.graph_free(g, std::ptr::null_mut())?;
                 self.dev.graph_launch(e)?; // the capture did not execute
