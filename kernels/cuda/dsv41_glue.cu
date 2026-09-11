@@ -471,6 +471,64 @@ __global__ void ar_reduce_kernel(float* __restrict__ dst, const float* __restric
 
 }  // namespace
 
+// The decode-step n-gram hash on the device: removes the LAST per-step H2D on
+// the decode path (the host used to run NgramHashState::forward_row and upload
+// the ids) and makes the whole step graph-capturable. Faithful port of
+// forward_row at seqlen=1 (the only shape step_impl calls): update the
+// compressed-token cache at the DEVICE-side position counter, look back
+// max_ngram tokens with the blocked rule (a position below zero or a DEAD entry
+// pads every further lookback), then the rolling XOR hash per (layer, ngram,
+// head): out = rolling.rem_euclid(lm) + off. Single thread on purpose: a few
+// hundred integer ops once per step, and serial execution keeps it bit-identical
+// to the host reference (which is also serial).
+__global__ void engram_hash_step_kernel(const long long* __restrict__ map, long long* __restrict__ cache,
+                                   const long long* __restrict__ mults,
+                                   const unsigned long long* __restrict__ lms,
+                                   const unsigned long long* __restrict__ offs,
+                                   long long* __restrict__ eng_ids, const int* __restrict__ token,
+                                   long long* __restrict__ pos_ctr, long long map_len, int n_layers,
+                                   int max_ngram, int n_heads, long long pad_id) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const long long p = *pos_ctr;
+    const long long t = (long long)token[0];
+    cache[p] = ((unsigned long long)t < (unsigned long long)map_len) ? map[t] : 0;
+    long long tokens[8];
+    bool blocked = false;
+    for (int shift = 0; shift < max_ngram; ++shift) {
+        const long long q = p - (long long)shift;
+        const long long src = (q >= 0) ? cache[q] : 0;
+        blocked = blocked || (q < 0) || (src == -1);  // -1 == DEAD
+        tokens[shift] = blocked ? pad_id : src;
+    }
+    const int n_cols = (max_ngram - 1) * n_heads;
+    for (int li = 0; li < n_layers; ++li) {
+        const long long* m = mults + (size_t)li * 4;
+        long long rolling = tokens[0] * m[0];
+        for (int i = 1; i < max_ngram; ++i) {
+            rolling ^= tokens[i] * m[i];
+            for (int h = 0; h < n_heads; ++h) {
+                const int col = (i - 1) * n_heads + h;
+                const long long lm = (long long)lms[(size_t)li * n_cols + col];
+                const long long off = (long long)offs[(size_t)li * n_cols + col];
+                long long v = rolling % lm;
+                if (v < 0) v += lm;  // rem_euclid
+                eng_ids[(size_t)li * n_cols + col] = v + off;
+            }
+        }
+    }
+    *pos_ctr = p + 1;
+}
+
+extern "C" int dsv41_engram_hash_step(const long long* map, long long* cache, const long long* mults,
+                                 const unsigned long long* lms, const unsigned long long* offs,
+                                 long long* eng_ids, const int* token, long long* pos_ctr,
+                                 long long map_len, int n_layers, int max_ngram, int n_heads,
+                                 long long pad_id, cudaStream_t s) {
+    engram_hash_step_kernel<<<1, 32, 0, s>>>(map, cache, mults, lms, offs, eng_ids, token, pos_ctr,
+                                        map_len, n_layers, max_ngram, n_heads, pad_id);
+    return (int)cudaGetLastError();
+}
+
 // ---- AR v5 launchers (outside the anonymous namespace: extern "C" entries
 // must have external linkage or dlsym cannot find them - the same trap the
 // gemv entry points hit earlier) ----

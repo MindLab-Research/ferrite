@@ -131,6 +131,76 @@ struct Scratch {
     eng_xsc: DevBuf,
 }
 
+/// Device-resident state for the engram n-gram hash: the compressed-token map,
+/// the per-layer multipliers and the (prime, offset) columns, all uploaded ONCE,
+/// plus the cross-step token cache and the position counter (zeroed at reset).
+struct EngDev {
+    map: DevBuf,    // [vocab] i64
+    cache: DevBuf,  // [max_seq] i64
+    mults: DevBuf,  // [n_layers * 4] i64
+    lms: DevBuf,    // [n_layers * n_cols] u64
+    offs: DevBuf,   // [n_layers * n_cols] u64
+    pos: DevBuf,    // [1] i64
+    max_seq: usize,
+}
+
+/// DSV41_ENG_HOST=1 keeps the host hash + per-step upload (the A/B fallback).
+fn eng_host() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false))
+}
+
+fn build_eng_dev(
+    dev: &Device,
+    lay: &crate::engram::EngramLayout,
+    map: &crate::engram::TokenMap,
+    max_seq: usize,
+) -> Result<EngDev> {
+    let n_cols = lay.n_hash_cols();
+    let nl = lay.layers.len();
+    let d_map = dev.alloc(map.map.len() * 8)?;
+    dev.upload_bytes_at(
+        &d_map,
+        unsafe { std::slice::from_raw_parts(map.map.as_ptr() as *const u8, map.map.len() * 8) },
+    )?;
+    let mut mults: Vec<i64> = Vec::with_capacity(nl * 4);
+    for li in 0..nl {
+        mults.extend_from_slice(lay.multipliers(li));
+    }
+    let mut lms: Vec<u64> = Vec::with_capacity(nl * n_cols);
+    let mut offs: Vec<u64> = Vec::with_capacity(nl * n_cols);
+    for li in 0..nl {
+        for c in 0..n_cols {
+            let (lm, off) = lay.layers[li].column(c);
+            lms.push(lm);
+            offs.push(off);
+        }
+    }
+    let up = |v: &[u64]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>() };
+    let d_mults = dev.alloc(mults.len() * 8)?;
+    dev.upload_bytes_at(
+        &d_mults,
+        unsafe { std::slice::from_raw_parts(mults.as_ptr() as *const u8, mults.len() * 8) },
+    )?;
+    let d_lms = dev.alloc(lms.len() * 8)?;
+    dev.upload_bytes_at(&d_lms, &up(&lms))?;
+    let d_offs = dev.alloc(offs.len() * 8)?;
+    dev.upload_bytes_at(&d_offs, &up(&offs))?;
+    let d_cache = dev.alloc(max_seq * 8)?;
+    dev.zero_at(d_cache.ptr, max_seq * 8)?;
+    let d_pos = dev.alloc(8)?;
+    dev.zero_at(d_pos.ptr, 8)?;
+    Ok(EngDev {
+        map: d_map,
+        cache: d_cache,
+        mults: d_mults,
+        lms: d_lms,
+        offs: d_offs,
+        pos: d_pos,
+        max_seq,
+    })
+}
+
 pub struct DevChain<'a> {
     pub dev: &'a Device,
     pub cfg: &'a Dsv41Config,
@@ -159,6 +229,8 @@ pub struct DevChain<'a> {
     moe_graph_captures: u32,
     moe_graph_replays: u32,
     /// n-gram hash state (host side; the token cache spans prefill + decode)
+    /// Device-side engram hash state (built lazily on the first step).
+    eng_dev: Option<EngDev>,
     ngram: Option<crate::engram::NgramHashState>,
     eng_layout: Option<crate::engram::EngramLayout>,
     eng_map: Option<crate::engram::TokenMap>,
@@ -326,6 +398,7 @@ impl<'a> DevChain<'a> {
             step_count: 0,
             moe_graph_captures: 0,
             moe_graph_replays: 0,
+            eng_dev: None,
             ngram,
             eng_layout,
             eng_map,
@@ -339,6 +412,10 @@ impl<'a> DevChain<'a> {
             let mut pm = vec![0f32; self.cfg.hc_mult];
             pm[0] = 1.0;
             self.dev.upload_f32_at(self.s.premix_const.ptr, 0, &pm)?;
+        }
+        if let Some(e) = self.eng_dev.as_ref() {
+            self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?;
+            self.dev.zero_at(e.pos.ptr, 8)?;
         }
         for c in self.layers.iter_mut() {
             self.dev.zero(&c.ring)?;
@@ -555,15 +632,43 @@ impl<'a> DevChain<'a> {
         if let (Some(ng), Some(lay), Some(map)) =
             (self.ngram.as_mut(), self.eng_layout.as_ref(), self.eng_map.as_ref())
         {
-            let hs = ng.forward_row(lay, map, 0, &[token], pos, None);
-            let n_cols = lay.n_hash_cols();
-            if hs.len() >= lay.layers.len() * n_cols {
-                let mut bytes = Vec::with_capacity(hs.len() * 8);
-                for v in hs.iter() {
-                    bytes.extend_from_slice(&v.to_le_bytes());
+            if eng_host() {
+                let hs = ng.forward_row(lay, map, 0, &[token], pos, None);
+                let n_cols = lay.n_hash_cols();
+                if hs.len() >= lay.layers.len() * n_cols {
+                    let mut bytes = Vec::with_capacity(hs.len() * 8);
+                    for v in hs.iter() {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                    self.dev
+                        .upload_bytes_at(&self.s.eng_ids, &bytes[..lay.layers.len() * n_cols * 8])?;
                 }
-                self.dev
-                    .upload_bytes_at(&self.s.eng_ids, &bytes[..lay.layers.len() * n_cols * 8])?;
+            } else {
+                // DEVICE hash: the token is read straight from s.ids (the buffer
+                // the previous step's argmax wrote, or the prefill upload) and
+                // the position counter lives on the device — no H2D, and the
+                // call is graph-capturable. Bit-identical to the host reference
+                // (the same serial arithmetic).
+                if self.eng_dev.is_none() {
+                    let e = build_eng_dev(&self.dev, lay, map, ng.max_seq)?;
+                    self.eng_dev = Some(e);
+                }
+                let e = self.eng_dev.as_ref().unwrap();
+                self.dev.engram_hash_step(
+                    e.map.ptr as *const i64,
+                    e.cache.ptr as *mut i64,
+                    e.mults.ptr as *const i64,
+                    e.lms.ptr as *const u64,
+                    e.offs.ptr as *const u64,
+                    self.s.eng_ids.ptr as *mut i64,
+                    self.s.ids.as_i32(),
+                    e.pos.ptr as *mut i64,
+                    map.map.len() as i64,
+                    lay.layers.len() as i32,
+                    lay.max_ngram_size as i32,
+                    lay.n_heads as i32,
+                    ng.pad_id,
+                )?;
             }
             for l in 0..cfg.n_layers {
                 if let Some(li) = lay.engram_index(l) {

@@ -175,6 +175,24 @@ struct Kernels {
     ar_v5_reduce: Option<
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *mut c_uint, *mut c_uint, CuStream) -> c_int,
     >,
+    engram_hash_step: Option<
+        unsafe extern "C" fn(
+            *const i64,
+            *mut i64,
+            *const i64,
+            *const u64,
+            *const u64,
+            *mut i64,
+            *const i32,
+            *mut i64,
+            i64,
+            c_int,
+            c_int,
+            c_int,
+            i64,
+            CuStream,
+        ) -> c_int,
+    >,
     expert_gate_up_fp4_indirect: Option<
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
@@ -415,6 +433,7 @@ impl Device {
                 ar_v5_store: sym(h_k, "dsv41_ar_v5_store").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_v5_publish: sym(h_k, "dsv41_ar_v5_publish").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 ar_v5_reduce: sym(h_k, "dsv41_ar_v5_reduce").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                engram_hash_step: sym(h_k, "dsv41_engram_hash_step").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1459,6 +1478,34 @@ impl Device {
     }
 
     /// Same, f32 weights.
+    /// The decode-step n-gram hash on the device (removes the last per-step H2D
+    /// and makes the step graph-capturable). Single thread, bit-identical to the
+    /// host reference.
+    #[allow(clippy::too_many_arguments)]
+    pub fn engram_hash_step(
+        &self,
+        map: *const i64,
+        cache: *mut i64,
+        mults: *const i64,
+        lms: *const u64,
+        offs: *const u64,
+        eng_ids: *mut i64,
+        token: *const i32,
+        pos_ctr: *mut i64,
+        map_len: i64,
+        n_layers: c_int,
+        max_ngram: c_int,
+        n_heads: c_int,
+        pad_id: i64,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.engram_hash_step, "dsv41_engram_hash_step")?;
+        let rc = unsafe {
+            f(map, cache, mults, lms, offs, eng_ids, token, pos_ctr, map_len, n_layers, max_ngram,
+              n_heads, pad_id, self.stream)
+        };
+        self.kerr(rc, "dsv41_engram_hash_step")
+    }
+
     /// AR v5 (graph-capturable): store(e) - write my buffer to every peer's
     /// staging half e&1. The epoch is read from DEVICE memory at runtime.
     pub fn ar_v5_store(
