@@ -7277,3 +7277,22 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 - hc 侧流: 隐藏在主流下（DL 14.9µs < 主流窗口 50µs）
 - sparse+merge: ~0.36ms · gemv_bf16: ~0.44ms · misc: ~0.3ms
 - down fix 验证 ✓（17.4µs vs 回归期 23.8µs，恢复 pre-regression 17.2µs）
+
+### 200 tok/s 可达性重估（2026-09-12 06:15，基于 nsys v9 新鲜数据）
+
+**roadmap 的"5.3ms 真实工作地板"已过时**——写于 operand-supply 发现（80% issue 停等）和侧流优化系列之前。
+
+**当前 6.23ms 的可达路径**（全部在飞或已识别）：
+| 项 | 预期 | 状态 |
+|---|---|---|
+| expert-cpasync-full（gateup 23.9→12µs @2x） | −0.48ms | 实施中（PDEPTH=2，raw PTX） |
+| w2-prefetch（down 17.4→12µs L2 warm） | −0.22ms | 实施中 |
+| down 的完整 cp.async（同 gateup 模式） | −0.35ms | 待 expert-cpasync-full 验证后 |
+| epilogue-folding | −0.1~0.2ms | 分析中 |
+| 节点削减（quant+norm ~168 nodes） | −0.07ms | 已识别 |
+| gemv_bf16 的 cp.async（P3/P4 同款） | −0.09ms | 未覆盖 |
+| **合计** | **−1.31~−1.41ms** | |
+
+**落点：6.23 − 1.31~1.41 = 4.82~4.92ms ≈ 204-208 tok/s ✓ 可达 200！**
+
+**关键依赖**：expert-cpasync-full 的 2x 假设必须兑现（当前 80% issue 停等 → 流水线化后理论大幅改善，但 GLM 侧的 cp.async 中性教训提示隔离/生产差异）

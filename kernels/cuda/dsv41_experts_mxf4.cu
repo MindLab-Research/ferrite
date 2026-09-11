@@ -919,35 +919,133 @@ static int dsv41_gateup_cpasync(void) {
     return cached;
 }
 
-// Number of bytes the weight-first prologue stages per warp (fixed 512: one
-// k-group of gate+up). Shared by the kernel's pointer arithmetic and the
+// Number of bytes ONE k-group of gate+up occupies per warp (fixed 512 = one
+// 512-value group). Shared by the kernel's pointer arithmetic and the
 // launcher's dynamic-smem formula - keep them on this constant.
 constexpr int kGateUpPfBytes = 512;
 
-// cp.async.cg 16-byte global -> shared copy and the commit/wait pair.
-// __pipeline_memcpy_async(16) is the documented spelling of cp.async.cg (4/8
-// bytes would lower to cp.async.ca). The pre-sm_80 arm keeps the TU compilable
-// for any arch with identical data movement (this TU is only built for
-// sm_100a/sm_103a, so it is never taken in production).
+// P4.2 (DSV41_GATEUP_PIPELINE) maximum pipeline depth. 3 is the largest depth
+// whose ring still fits the 48 KB DEFAULT dynamic-smem limit at the production
+// shape (see dsv41_gateup_pipeline): the launcher clamps the requested depth
+// down until the total fits, so this is a ceiling, not a promise.
+constexpr int kGateUpPfDepthMax = 3;
+
+// P4.2 (DSV41_GATEUP_PIPELINE, default 2): DEPTH of the fused gate/up weight
+// pipeline, in k-groups in flight per warp.
+//
+// WHY: the P4 prologue (above) only covers group 0. Every later group's LDG fell
+// between the barrier and its own dot, so a warp's weight stream was a chain of
+// ~600-cycle HBM loads with only ~50 cycles of FMA between them - the measured
+// symptom is an expert gateup at 22.2us/call, 443 GB/s and IPC 0.8/4, i.e. the
+// issue slots are 80 percent stalled on operand supply, not on arithmetic. A
+// register-resident unroll (the `#pragma unroll 4` below) cannot fix it: the LDG
+// destination registers sit on the consumer's scoreboard, so the warp stalls
+// anyway, and 64 regs/thread (the __launch_bounds__(1024) cap) buy only a few
+// groups of slack. cp.async takes the load OFF the register scoreboard: the warp
+// issues the copies for group g+D, and by the time it needs group g the data is
+// already in smem - the wait is on a cp.async group counter, not on a register.
+//
+// HOW: per-warp ring of PDEPTH kGateUpPfBytes slots. The prologue issues
+// PDEPTH groups (group g_begin .. g_begin+PDEPTH-1); iteration i of the group
+// loop waits with wait_prior(PDEPTH-1) - which, because exactly one commit
+// group is added per iteration (empty commits at the tail), always covers
+// group i - reads slot i%PDEPTH, then immediately issues group i+PDEPTH into
+// that same (now consumed) slot. PDEPTH == 1 is the P4 behaviour, kept as the
+// A/B arm (`DSV41_GATEUP_PIPELINE=1`).
+//
+// The value is a COMPILE-TIME kernel template parameter because
+// cp.async.wait_group takes an immediate operand - the launcher picks the
+// instantiation matching the depth it clamped to.
+static int dsv41_gateup_pipeline(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        int v = 2;
+        if (const char* e = getenv("DSV41_GATEUP_PIPELINE")) v = atoi(e);
+        if (v < 1) v = 1;
+        if (v > kGateUpPfDepthMax) v = kGateUpPfDepthMax;
+        cached = v;
+    }
+    return cached;
+}
+
+// cp.async global -> shared copies and the commit/wait triple.
+//
+// Written as raw PTX (instead of __pipeline_memcpy_async / __pipeline_commit /
+// __pipeline_wait_prior) for ONE reason: the CUDA header's forms carry no
+// "memory" clobber, so the compiler is free to move the surrounding shared
+// loads across the copy issue. In the ring the copy for group i+PDEPTH lands in
+// the very slot group i is being read from, so the read MUST be issued before
+// the copy - the clobber is what guarantees it (the timing argument alone would
+// hold today, but a compiler that hoists the copy above the LDS would make the
+// ring silently read the wrong group, with no crash and no failed check).
+//
+// 16 bytes lowers to cp.async.cg (L2 only), 8 bytes can only be cp.async.ca -
+// cp.async.cg exists for 16 bytes alone. The pre-sm_80 arms keep the TU
+// compilable for any arch with identical data movement (this TU is only built
+// for sm_100a/sm_103a, so they are never taken in production).
 __device__ __forceinline__ void dsv41_gateup_pf16(void* smem, const void* gmem) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    __pipeline_memcpy_async(smem, gmem, 16);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(
+                     (uint32_t)__cvta_generic_to_shared(smem)),
+                 "l"(gmem)
+                 : "memory");
 #else
     *reinterpret_cast<uint4*>(smem) = *reinterpret_cast<const uint4*>(gmem);
 #endif
 }
-__device__ __forceinline__ void dsv41_gateup_pf_commit() {
+// 8-byte variant, used by the PLAIN (non-interleaved) layout: there a lane
+// consumes 8 gate bytes AND 8 up bytes per group, and 8-byte copies keep the
+// copy assignment LANE-LOCAL (see dsv41_gateup_pf_group), so no __syncwarp /
+// __syncthreads is needed to publish a staged group to its consumer.
+__device__ __forceinline__ void dsv41_gateup_pf8(void* smem, const void* gmem) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    __pipeline_commit();
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;" ::"r"(
+                     (uint32_t)__cvta_generic_to_shared(smem)),
+                 "l"(gmem)
+                 : "memory");
+#else
+    *reinterpret_cast<uint2*>(smem) = *reinterpret_cast<const uint2*>(gmem);
 #endif
 }
-// Waits for EVERY outstanding group of THIS thread. Called with no outstanding
-// group when the prefetch did not arm, which is a documented no-op. The
-// completion is published block-wide by the __syncthreads() that follows it.
-__device__ __forceinline__ void dsv41_gateup_pf_wait() {
+__device__ __forceinline__ void dsv41_gateup_pf_commit() {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-    __pipeline_wait_prior(0);
+    asm volatile("cp.async.commit_group;" ::: "memory");
 #endif
+}
+// Waits for ALL BUT THE NEWEST N commit groups of THIS thread. N is an
+// immediate in PTX, hence the template. Called with no outstanding group when
+// the prefetch did not arm, which is a documented no-op.
+template <int N>
+__device__ __forceinline__ void dsv41_gateup_pf_wait_prior() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
+#endif
+}
+
+// Stage ONE k-group (512 B of gate+up) of row (`g_row`, `u_row`) into the
+// per-warp ring slot `dst`, LANE-LOCAL: every lane copies exactly the bytes it
+// will consume, so a staged group is visible to its consumer as soon as that
+// lane's own wait_group retires - no __syncwarp / __syncthreads is required
+// (this is what lets the pipeline run without a barrier per group).
+//   ILV   : lane L consumes the 16 B at g_row + gi*512 + L*16 (gate pair first,
+//           up pair second - the interleaver stores dst[2i]=gate[i],
+//           dst[2i+1]=up[i] at 8-byte granularity) -> one 16-byte copy.
+//   plain : lane L consumes 8 B at g_row + gi*256 + L*8 and 8 B at
+//           u_row + gi*256 + L*8, staged at dst + L*8 and dst + 256 + L*8 -
+//           exactly the offsets the consumer reads (the P4 prologue produced
+//           the same buffer contents with a cross-lane 16-byte mapping plus the
+//           pre-loop barrier; the 8-byte form removes that dependency).
+// Byte offsets: the row is walked in 512-VALUE groups, so a group's gate (plain)
+// chunk is 256 B and its interleaved chunk is 512 B.
+template <bool ILV>
+__device__ __forceinline__ void dsv41_gateup_pf_group(uint8_t* dst, const uint8_t* g_row,
+                                                      const uint8_t* u_row, int gi, int lane) {
+    if (ILV) {
+        dsv41_gateup_pf16(dst + (lane << 4), g_row + (size_t)gi * 512 + (lane << 4));
+    } else {
+        dsv41_gateup_pf8(dst + (lane << 3), g_row + (size_t)gi * 256 + (lane << 3));
+        dsv41_gateup_pf8(dst + 256 + (lane << 3), u_row + (size_t)gi * 256 + (lane << 3));
+    }
 }
 
 // NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
@@ -994,7 +1092,13 @@ static inline cudaError_t dsv41_experts_pdl_or_plain(K kern, dim3 grid, dim3 blo
 // check, so every DSV41_GATEUP_KSPLIT=2 (512 threads) / DSV41_GATEUP_ROWS=16+
 // launch would fail with "too many resources requested". Measured usage was
 // 48 regs / 0 spill, so the 64 cap is headroom, not a spill risk.
-template <bool ILV>
+// A second template parameter, PDEPTH (P4.2): the fused gate/up weight
+// pipeline depth in k-groups. It must be a compile-time constant because the
+// per-group wait is `cp.async.wait_group N` with N an immediate - the launcher
+// selects the instantiation matching the depth it clamped to (see
+// dsv41_gateup_pipeline). PDEPTH == 1 is the P4 behaviour (prologue stages
+// group 0 only, every later group read straight from global).
+template <bool ILV, int PDEPTH>
 __launch_bounds__(1024)
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
                                                const uint8_t* __restrict__ a,
@@ -1045,6 +1149,14 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // `nwarps*kGateUpPfBytes` when it sets it - moving this pointer without the
     // matching change in dsv41_expert_gate_up_fp4_batched's smem formula would
     // shift s_ks (and read/write past the allocation).
+    // P4.2 (DSV41_GATEUP_PIPELINE): the per-warp staging area is a RING of
+    // PDEPTH slots of kGateUpPfBytes (PDEPTH == 1 reproduces the P4 layout byte
+    // for byte, because warp*(512*1) IS warp*512). Slot (g2-g_begin)%PDEPTH
+    // holds group g2 while it is in flight. `pf` is non-zero only for the FUSED
+    // gate/up launch, and that launcher reserves exactly
+    // `nwarps*kGateUpPfBytes*PDEPTH` when it sets it - moving this pointer
+    // without the matching change in dsv41_expert_gate_up_fp4_batched's smem
+    // formula would shift s_ks (and read/write past the allocation).
     uint8_t* s_pf = reinterpret_cast<uint8_t*>(s_lut2 + 256);
     // K-split partials (DSV41_GATEUP_KSPLIT>1, fused gate/up only): ONE (gate,up)
     // float2 per warp, indexed by the CTA-local warp id. The ksplit halves of a
@@ -1053,7 +1165,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // (and, when pf != 0, after the per-warp prefetch buffer) and allocated by
     // the launcher ONLY when ksplit>1, so the ksplit==1 launch keeps the original
     // dynamic-smem size (and occupancy).
-    float2* s_ks = reinterpret_cast<float2*>(s_pf + (size_t)nwarps * kGateUpPfBytes);
+    float2* s_ks = reinterpret_cast<float2*>(s_pf + (size_t)nwarps * kGateUpPfBytes * PDEPTH);
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
     // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
@@ -1109,42 +1221,48 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     const int row_base = blockIdx.x * rows_per_cta + row_local;
     const int nv2f = k >> 9;                    // 512-value groups per row
     const int g_begin = (half * nv2f) / ksplit; // this warp's first group
+    // Hoisted out of the row loop together with g_begin: the prologue has to
+    // know how many groups this warp's slice has before it issues PDEPTH of
+    // them (P4 only ever needed to know where the slice STARTS). Same
+    // expression, one definition.
+    const int g_end = ((half + 1) * nv2f) / ksplit;
     // Armed only for the fused gate/up body (the one body that implements the
     // substitution) and only for a warp that owns a real row. `pf` is set by the
     // launcher together with the matching smem reservation.
     bool pf_ok = (pf != 0) && (fuse_swiglu != 0) && (b_split > 0) && ((k & 511) == 0) &&
                  (row_base < n_total);
-    uint8_t* pf_slot = s_pf + (size_t)warp * kGateUpPfBytes;
+    // P4.2: this warp's ring of PDEPTH slots (512 B each). PDEPTH == 1 gives
+    // back the P4 single slot: warp*(512*1) == warp*512.
+    uint8_t* pf_ring = s_pf + (size_t)warp * (kGateUpPfBytes * PDEPTH);
     if (pf_ok) {
         // Family/pitch select copied from the row loop verbatim: drifting from
         // it here would silently stage the WRONG row (no crash, wrong dot).
         const uint8_t* g_row = b_use + (size_t)row_base * (ILV ? (kbytes << 1) : kbytes);
         const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row_base * kbytes);
-        // Group `g_begin` of the gate row is at byte offset g_begin*256 (plain)
-        // / g_begin*512 (interleaved; gate and up share one region).
-        const size_t gb = (size_t)g_begin * (size_t)(ILV ? 512 : 256);
-        const uint8_t* src_g = g_row + gb;
-        const uint8_t* src_u = u_row + gb;
-        // 16-byte alignment is a cp.async.cg REQUIREMENT on both sides. The pool
-        // base is 256-byte aligned and every per-expert stride / row pitch here
-        // is a multiple of 16 (dim % 512 == 0), so this always holds today; the
-        // guard keeps a future odd stride from faulting (err 716) instead of
-        // falling back silently - same lesson as the gemv scale row.
-        const bool al_ok = (((uintptr_t)src_g & 15u) == 0) &&
-                           (ILV || (((uintptr_t)src_u & 15u) == 0));
+        // Alignment is a cp.async REQUIREMENT on both sides (16 B for the .cg
+        // copy, 8 B for the .ca one). The pool base is 256-byte aligned and
+        // every per-expert stride / row pitch here is a multiple of 16
+        // (dim % 512 == 0), so this always holds today; the guard keeps a future
+        // odd stride from faulting (err 716) instead of falling back silently -
+        // same lesson as the gemv scale row. Checking the ROW base is enough:
+        // every group / lane offset added below is a multiple of 16 (ILV) or of
+        // 8 (plain), and 16-aligned implies 8-aligned.
+        const bool al_ok = (((uintptr_t)g_row & 15u) == 0) &&
+                           (ILV || (((uintptr_t)u_row & 15u) == 0));
         if (al_ok) {
-            if (ILV) {
-                dsv41_gateup_pf16(pf_slot + (lane << 4), src_g + (lane << 4));
-            } else if (lane < 16) {
-                dsv41_gateup_pf16(pf_slot + (lane << 4), src_g + (lane << 4));
-            } else {
-                // Lanes 16..31 carry the up row's 16 chunks into the second half
-                // of the slot (dst + 16*16 = +256), so the consumer's fixed
-                // offsets (gate at lane*8, up at 256 + lane*8) hold for every
-                // lane while the copies stay 16 B wide.
-                dsv41_gateup_pf16(pf_slot + (lane << 4), src_u + ((size_t)(lane - 16) << 4));
+            // Issue the first PDEPTH groups (or as many as the slice holds).
+            // ONE commit per iteration, including the out-of-range tail: the
+            // loop's wait_prior(PDEPTH-1) is only correct if the number of
+            // commit groups issued before consuming group i is exactly
+            // PDEPTH + i, which the empty commits at the tail preserve.
+#pragma unroll
+            for (int r = 0; r < PDEPTH; ++r) {
+                const int gi = g_begin + r;
+                if (gi < g_end)
+                    dsv41_gateup_pf_group<ILV>(pf_ring + (size_t)r * kGateUpPfBytes, g_row,
+                                               u_row, gi, lane);
+                dsv41_gateup_pf_commit();
             }
-            dsv41_gateup_pf_commit();
         } else {
             pf_ok = false;
         }
@@ -1194,7 +1312,15 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // consumer lane is not always the copying lane). No-op when nothing was
     // committed. This is the "commit + wait before the dot" point of the scheme:
     // the actual dot runs right after the row loop's first iteration starts.
-    dsv41_gateup_pf_wait();
+    //
+    // P4.2 (PDEPTH > 1): NOT drained here. With a ring nothing is published to
+    // other lanes - every staged byte is copied by the very lane that reads it
+    // (dsv41_gateup_pf_group) - so the only owner of the wait is the consumer
+    // iteration itself (wait_prior(PDEPTH-1) in the group loop). Draining here
+    // would serialize the whole depth away. The __syncthreads() below stays:
+    // it is what publishes the ACTIVATION staging (s_act), which is still
+    // block-cooperative.
+    if constexpr (PDEPTH == 1) dsv41_gateup_pf_wait_prior<0>();
     __syncthreads();
 
     // K-SPLIT row mapping (DSV41_GATEUP_KSPLIT, default 1 = original):
@@ -1256,7 +1382,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             // original bounds. j and q below are unchanged because the cut always
             // lands on a 512-value group boundary (never inside a 32-value scale
             // block). half 0 owns the LOW half, half 1 the HIGH half.
-            const int g_end = ((half + 1) * nv2f) / ksplit;
+            // g_end is the PROLOGUE's copy (the P4.2 pipeline issues the first
+            // PDEPTH groups before the row loop, so it needs the slice bounds
+            // too) - defined once, above, and reused here. ksplit==1 => [0, nv2f),
+            // the original bounds.
             float g = 0.f, u = 0.f;
             // unroll 4 (was 2): the audit measured this branch at ~6% issue with
             // ~94% of cycles stalled on the K loads, i.e. too few in-flight load
@@ -1296,24 +1425,70 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // the same reason q is 8-byte aligned. Same decode, same fma
                 // chains, half the load instructions.
                 const int q = (g2 << 8) + (lane << 3);
-                // P4 (DSV41_GATEUP_CPASYNC): this warp's FIRST group was staged
-                // into s_pf before the prologue barrier, so the first iteration's
-                // bytes come from smem. Same bytes, same slot, same consume
-                // order -> BIT-EXACT; the only difference is which memory the
-                // LDG/LDS reads. `from_pf` is constant false when the launch has
-                // pf == 0, so the non-prefetching shapes keep their codegen.
-                const bool from_pf = pf_ok && (row == row_base) && (g2 == g_begin);
+                // Three ways to get this group's 16 weight bytes (gw0/gw1 gate,
+                // uw0/uw1 up), all BIT-EXACT: same bytes, same lane offsets,
+                // same consume order - only which memory they come from and WHEN
+                // the copy is issued change.
+                //
+                //   PDEPTH == 1  (P4): the warp's FIRST group was staged into the
+                //   single s_pf slot before the prologue barrier; every later
+                //   group is the direct global read, on the dot's critical path.
+                //   `from_pf` is constant false when the launch has pf == 0, so
+                //   the non-prefetching shapes keep their codegen.
+                //
+                //   PDEPTH > 1  (P4.2): EVERY group of this warp's slice comes
+                //   from its ring slot (g2-g_begin)%PDEPTH, and the slot is
+                //   refilled with group g2+PDEPTH right after it is read. The
+                //   wait_prior(PDEPTH-1) covers group g2 because exactly one
+                //   commit group was added per consumed group (see the prologue).
+                //
+                //   fallback: the prefetch did not arm (inactive warp, or the
+                //   alignment guard rejected the row) -> the same direct global
+                //   reads as PDEPTH == 1.
                 uint32_t gw0, gw1, uw0 = 0u, uw1 = 0u;
-                if (ILV) {
-                    const uint4 v4 = from_pf
-                        ? *reinterpret_cast<const uint4*>(pf_slot + (size_t)(lane << 4))
-                        : *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
+                if constexpr (PDEPTH == 1) {
+                    const bool from_pf = pf_ok && (row == row_base) && (g2 == g_begin);
+                    if (ILV) {
+                        const uint4 v4 = from_pf
+                            ? *reinterpret_cast<const uint4*>(pf_ring + (size_t)(lane << 4))
+                            : *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
+                        gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
+                    } else {
+                        const uint2 gw = from_pf
+                            ? *reinterpret_cast<const uint2*>(pf_ring + (size_t)(lane << 3))
+                            : *reinterpret_cast<const uint2*>(g_row + q);
+                        gw0 = gw.x; gw1 = gw.y;
+                    }
+                } else if (pf_ok && (row == row_base)) {
+                    const int pi = g2 - g_begin;
+                    uint8_t* slot = pf_ring + (size_t)(pi % PDEPTH) * kGateUpPfBytes;
+                    dsv41_gateup_pf_wait_prior<PDEPTH - 1>();
+                    if (ILV) {
+                        const uint4 v4 = *reinterpret_cast<const uint4*>(slot + (size_t)(lane << 4));
+                        gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
+                    } else {
+                        const uint2 gw = *reinterpret_cast<const uint2*>(slot + (size_t)(lane << 3));
+                        gw0 = gw.x; gw1 = gw.y;
+                        const uint2 uw =
+                            *reinterpret_cast<const uint2*>(slot + 256 + (size_t)(lane << 3));
+                        uw0 = uw.x; uw1 = uw.y;
+                    }
+                    // The slot has just been consumed - start group g2+PDEPTH in
+                    // it. Out-of-range groups still COMMIT (with no copy): the
+                    // commit count must stay `PDEPTH + groups consumed` for the
+                    // wait above to keep covering group g2 in the tail.
+                    const int gi = g2 + PDEPTH;
+                    if (gi < g_end)
+                        dsv41_gateup_pf_group<ILV>(slot, g_row, u_row, gi, lane);
+                    dsv41_gateup_pf_commit();
+                } else if (ILV) {
+                    const uint4 v4 = *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
                     gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
                 } else {
-                    const uint2 gw = from_pf
-                        ? *reinterpret_cast<const uint2*>(pf_slot + (size_t)(lane << 3))
-                        : *reinterpret_cast<const uint2*>(g_row + q);
+                    const uint2 gw = *reinterpret_cast<const uint2*>(g_row + q);
                     gw0 = gw.x; gw1 = gw.y;
+                    const uint2 uw = *reinterpret_cast<const uint2*>(u_row + q);
+                    uw0 = uw.x; uw1 = uw.y;
                 }
                 float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
                 const float2 gt0 = s_lut2[gw0 & 0xFFu];
@@ -1346,14 +1521,17 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // INTERLEAVED: the up pair already arrived in the LDG.128 above
                 // (uw0/uw1). PLAIN: the second LDG.64 of the row, identical
                 // 8-byte alignment argument; uw.x/uw.y == the old uw0/uw1.
-                if (!ILV) {
-                    // P4: the staged slot keeps the up row's chunks in its second
-                    // half (dst + 256), so the plain layout reads both rows out of
-                    // s_pf with the same +256 separation the two pools have.
-                    const uint2 uw = from_pf
-                        ? *reinterpret_cast<const uint2*>(pf_slot + 256 + (size_t)(lane << 3))
-                        : *reinterpret_cast<const uint2*>(u_row + q);
-                    uw0 = uw.x; uw1 = uw.y;
+                // PDEPTH > 1 loads both rows in the read block above (from the
+                // ring slot or, on the fallback, from gmem), so this deferred
+                // load only exists on the P4 arm - keeping its exact emission
+                // order for the DSV41_GATEUP_PIPELINE=1 A/B.
+                if constexpr (PDEPTH == 1) {
+                    if (!ILV) {
+                        const uint2 uw = from_pf
+                            ? *reinterpret_cast<const uint2*>(pf_ring + 256 + (size_t)(lane << 3))
+                            : *reinterpret_cast<const uint2*>(u_row + q);
+                        uw0 = uw.x; uw1 = uw.y;
+                    }
                 }
                 float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
                 const float2 ut0 = s_lut2[uw0 & 0xFFu];
@@ -1382,6 +1560,12 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 up3 = fmaf(sa[15], uu3.y, up3);
                 u = fmaf(usc, (up0 + up1) + (up2 + up3), u);
             }
+            // P4.2: retire the pipeline's tail commits. All REAL groups were
+            // waited for in-loop (iteration i waits group i), so what is left
+            // here are the empty commits issued past the end of the slice -
+            // wait(0) is therefore immediate. Kept so no thread can leave a
+            // dangling commit group pending when the CTA unwinds.
+            if constexpr (PDEPTH > 1) dsv41_gateup_pf_wait_prior<0>();
             for (int off = 16; off > 0; off >>= 1) {
                 g += __shfl_xor_sync(0xFFFFFFFFu, g, off);
                 u += __shfl_xor_sync(0xFFFFFFFFu, u, off);
