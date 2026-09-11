@@ -390,37 +390,31 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   （全是 elementwise + warp0 sinkhorn），唯一例外是 `DSV41_HC_SS=0` 的自算 ss 路径（读
   `wpart[threadIdx.x>>5]`，需要 warps 0..mix-1）⇒ launcher 在该路径上仍用 1024。
   开关：`DSV41_HC_TAIL_PRIO=0` / `DSV41_GRAPH_NODE_PRIORITY=0` / `DSV41_HC_LATE_T=1024`。
-  - **2026-09-11（同日）EARLY 也搬上 side stream（hc-early-opt）**：EARLY 半
-    （collapse+rmsnorm+fp8）对 dots 的输出零数据依赖（不读 `g_hc_part`），却没有数据理由被排在
-    dots 之后 ⇒ 移到 side stream **头部、`fork_ev` 之前**，与 dots 并发（dots 4.9µs > EARLY
-    1.7µs ⇒ 预期全藏 **−0.14ms**）。⚠️ **关键修正**：EARLY 读 `x`(=`s.h`) 与 `pre_collapse`
-    （premix slot），是**主流上游**写的（上一段 hc_post / AR fold）⇒ side 的 EARLY 仍需要一条
-    main→side 边；"不等任何 event"会把它变成图 ROOT，抢先于 hc_post 读 `s.h`（整步 capture
-    `DSV41_GRAPH_STEP` 默认 ON）⇒ 读到陈旧 residual。故新增 **`in_ev`**（main 在 dots **前**
-    record、side 在 EARLY 前 wait）与 **`early_ev`**（side 在 EARLY 后 record、main 在
-    `hc_front_split` 内 wait——投影链在它之后读 `out`/`xq`/`xsc`）；`fork_ev`（dots 后，LATE 等
-    `g_hc_part`）与 `join_ev` 语义不变。`devrt.rs` 加 `in_ev`/`early_ev` 两个
-    `cudaEventDisableTiming`，`supports_hc_tail_split` 也要求它们非空。位级不变（EARLY/LATE 的
-    语句与操作数不动，两半内存不交——EARLY 写 out/xq/xsc，LATE 写 pre/post/comb——顺序互换无
-    副作用）。
-  - **2026-09-11（同日）dots 也搬上 side stream（dots-on-side）**：投影链的第一步
+  - **2026-09-11（同日）EARLY 曾搬上 side stream（hc-early-opt），随后回退** ↩：
+    EARLY 半（collapse+rmsnorm+fp8）对 dots 的输出零数据依赖（不读 `g_hc_part`），当时据此把
+    它挪到 side stream 头部与 dots 并发。**但主流的 wins 是 0**：main 仍要等 side 的
+    `early_ev`（即仍付 EARLY 的 1.7µs，只是从"本地 launch"变成"跨流往返"），代价却是
+    **每个 front 多 4 个图节点**（record/wait `in_ev` + record/wait `early_ev`）。
+    **B（2026-09-11，已实施）**：EARLY 回到主流——主流自己的程序序就同时钉住了它的生产
+    （上一段 hc_post / AR fold）与消费（紧随的投影链），**零 event**；dots+LATE 仍在 side。
+    发射序列回到**单一 fork/join 对**：`main: EARLY -> record(fork_ev) [-> 投影链 …]`；
+    `side: wait(fork_ev) -> dots -> LATE -> record(join_ev)` ⇒ 每 front **净 −2 图节点**
+    （×2 front/层 ×40 层 = 80 front ≈ **−0.2ms**）。`in_ev`/`early_ev` 作为**死参数**保留在
+    ABI（Rust 侧已不再创建，传 null；`supports_hc_tail_split` 也不再要求它们非空）；
+    `fork_ev` 恢复为**必需**（它现在是唯一的 main→side 边：dots 与 LATE 都读 `x`=`s.h`，
+    必须钉在主流写之后）。side 链变为 dots(4.9)+LATE(10.7) ≈ **15.6µs**（EARLY 不再在它里面），
+    仍远小于 ~50µs 的 hc 投影窗口 ⇒ join 依旧"到达即满足"。
+    - **2026-09-11（同日）dots 也搬上 side stream（dots-on-side，保留）**：投影链的第一步
     `lin2`（`chain_dev.rs:2430`）**只读 EARLY 的输出**（`s.xn` = `out`，以及 `xq_of_xn_valid`
     时的 `xq`/`xsc`），而 dots 只写 `g_hc_part`——它唯一的读者是 `hc_mixes_tail_kernel` 的
     LATE 分支（`dsv41_kernels.cu` 的 `HC_TAIL_LATE`）。二者在同一条 side stream 上，
-    **流内顺序**即保证 `g_hc_part` 的 publish happens-before LATE 的读 ⇒ `fork_ev` 的
-    record/wait 对整体删除（ABI 保留该参数与事件以便旧 `.so` 照常解析符号；`fork_ev` 已不再被
-    要求非空——2026-09-11 清理：`.cu` 的非空检查与 `supports_hc_tail_split` 都去掉了它）。新发射序列：
-    `main: record(in_ev) -> wait(early_ev)`；`side: wait(in_ev) -> EARLY -> record(early_ev) -> dots -> LATE -> record(join_ev)`。
-    ⇒ **main 的 front 代价从 dots（4.9µs）降到 EARLY（1.7µs）**，saving ≈ 3.2µs/front × 2 front/layer
-    × 40 层（= 80 front）≈ **−0.26ms 上界**（注意：题面给的 "dots 7.4µs / EARLY 4.9µs" 与文档记录相反——实测
-    dots **4.9µs**、EARLY **1.7µs**、LATE **10.7µs**）。side 链变成
-    EARLY(1.7)+dots(4.9)+LATE(10.7) ≈ **17.3µs**，仍远小于 `join_ev` 必须被满足的
-    hc 投影窗口（~50µs，见 `DSV41_HC_TAIL_PRIO` 条目）⇒ join 依旧"到达即满足"。
+    **流内顺序**即保证 `g_hc_part` 的 publish happens-before LATE 的读 ⇒ 不需要第二条 fork。
+    ⇒ main 不再付 dots 的 4.9µs（只付 EARLY 1.7µs；dots-on-side 的净收益 ≈ 3.2µs/front ≈ −0.26ms
+    上界，其中 EARLY 那 1.7µs 已被 B 放回主流、与"EARLY 在 side 并被 early_ev 等"等价）。
     ⚠️ **正确性依赖两点**：(a) main 上没有任何 kernel 读 `g_hc_part`；(b) side 对 `s.h` 的读
     （dots 与 LATE 都读 `x`=`s.h`）必须早于 main 对 `s.h` 的写（AR fold 的 `hc_res` / 下一段
-    `hc_post`）—— 后者由 `ar_hc_post_fold`/`layer` 里的 `hc_tail_join()`（wait `join_ev`）保证，
-    未改动。(c) 每个 front 的 `in_ev` 边仍是必须的：ffn front 的 side 链要排在 attn 段的
-    `hc_post` 之后，否则读到陈旧 `s.h`。
+    `hc_post`）—— 后者由 `ar_hc_post_fold`/`layer` 里的 `hc_tail_join()`（wait `join_ev`）保证；
+    前者由 `fork_ev`（记录在主流 EARLY 之后）保证。
     env gate **复用 `DSV41_HC_TAIL_SPLIT`**（未新增开关；A/B = tail-split on/off）。
   ⚠️ 若上机后仍只有 −0.2ms，下一个怀疑对象是**图节点开销本身**（审计：1355 节点 ≈ 2.0ms，
   ~1.5µs/节点；split 每次多 1 个 kernel 节点 + 2 个 event 节点 ⇒ 约 0.3-0.5ms/步），
@@ -518,8 +512,10 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 - **三条侧流的优先级分配（`devrt.rs::create_side_stream`，每流独立 env gate）** ✓：
   优先级只在**图回放**且节点 READY 时决定谁先拿 SM（`cudaGraphInstantiateFlagUseNodePriority`，
   全局一个标志），因此只有"最长且最晚被消费 = 真正卡窗口"的链才值得 greatest。
-  - `DSV41_HC_TAIL_PRIO`（tail_late ~10.7µs，hc 投影窗口 ~50µs）：默认 greatest。**疑似过度分配**
-    ——39µs 的余量下优先级不带来收益，反而可能抢走投影 wave 的 SM。A/B：`=0`。
+  - `DSV41_HC_TAIL_PRIO`（tail dots+LATE ~15.6µs，hc 投影窗口 ~50µs）：**默认已改为 default(0)**
+    （C，2026-09-11）。原为 greatest，后判为**过度分配**：LATE 是**单 block** 核（`g_hc_late_t`
+    个 warp 里只有 1 个 warp 有活干），被 greatest 提前放行只会占住一个它用不满的 SM、并推迟
+    它本该藏在其下的块并行工作；它又有 ~34µs 余量，延迟本就不敏感。A/B：`=greatest`（或 `=1`）恢复旧行为。
   - `DSV41_DUAL_PRIO`（kv 链 ~10.6µs vs q 链 13.5µs；MoE shared ~22µs vs routed ~42µs）：默认
     **default(0)**。它两条链都在主流自己的串行路径上，压主流不划算；需要时可 `=mid`/`=greatest`。
   - `DSV41_COMPRESS_PRIO`（compress ~30µs，是三条侧流里最长的，且汇合点最晚——在 indexer/

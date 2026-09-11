@@ -3483,8 +3483,11 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         const size_t scale_bytes =
             (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
             dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + B1 row stage
+        // P1: mode 4's +1 activation row (s_a) is only allocated while a32=0 --
+        // with a32 on, the fused pass decodes straight from global into s_af and
+        // s_a has no reader left (dsv41_gemv_sa_bytes / the kernel's a32_direct).
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
-                             : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                             : (g_gemv_fp8_mode == 4) ? (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes
                                                       : (size_t)0;
         if (gsmem > 48 * 1024) {
             cudaError_t e = cudaFuncSetAttribute(
@@ -3567,8 +3570,10 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
         dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+    // P1: the mode-4 activation row is not allocated when a32 folds the decode
+    // into s_af (dsv41_gemv_sa_bytes); mode 3 never had one.
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
-                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
         // Round-43 revert: the (int)gsmem form set the per-function attribute
@@ -3646,6 +3651,9 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
         dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
     // mode 4 only: `warps` weight rows + the block-wide activation row.
+    // P1 does NOT apply here: the NORM_FUSE prologue WRITES `s_a` and the
+    // materialisation loop still decodes it, so the slot stays allocated even
+    // with a32 on (the kernel's `a32_direct` excludes qr_raw != nullptr).
     const size_t gsmem = (size_t)(warps + 1) * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
         // Round-43 revert: the (int)gsmem form set the per-function attribute
@@ -3715,8 +3723,10 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
         dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+    // P1: the mode-4 activation row is not allocated when a32 folds the decode
+    // into s_af (dsv41_gemv_sa_bytes); mode 3 never had one.
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
-                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
         // Round-43 revert: the (int)gsmem form set the per-function attribute
@@ -3777,8 +3787,10 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
         dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the B1 row stage slot
+    // P1: the mode-4 activation row is not allocated when a32 folds the decode
+    // into s_af (dsv41_gemv_sa_bytes); mode 3 never had one.
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
-                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes
                                                   : (size_t)0;
     if (gsmem > 48 * 1024) {
         // Round-43 revert: the (int)gsmem form set the per-function attribute
@@ -3850,10 +3862,14 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
         dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + B1 row stage
-    // Mode 4 allocates the (unused) block-wide activation copy; keep the caller's
-    // mode so gsmem matches the branch the kernel's `vec` takes.
-    const size_t gsmem = (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
-                                                : (size_t)warps * (size_t)k + scale_bytes;
+    // Mode 4 allocates the block-wide activation copy; keep the caller's mode so
+    // gsmem matches the branch the kernel's `vec` takes. On the f32 path the copy
+    // is never written or read, so P1's dead-slot rule applies just the same
+    // (a32=1 -> no activation row at all).
+    const size_t gsmem =
+        (g_gemv_fp8_mode == 4)
+            ? (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes
+            : (size_t)warps * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
         // Round-43 revert: the (int)gsmem form set the per-function attribute
         // to THIS call's need, which can silently cap later launches of the same
@@ -4054,8 +4070,11 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
         dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the B1 row stage slot
+    // P1: mode 4's `+1` activation row is only allocated while `s_a` lives
+    // (a32=0) -- the fused a32 pass reads global directly. See
+    // dsv41_gemv_sa_bytes and the kernel's `a32_direct`.
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
-                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)warps * (size_t)k + dsv41_gemv_sa_bytes(k, false) + scale_bytes
                                                    : (size_t)0;
     if (gsmem > 48 * 1024) {
         // Round-43 revert: the (int)gsmem form set the per-function attribute
@@ -5993,35 +6012,24 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 // write ONLY `g_hc_part`, whose sole reader is the LATE branch of
 // hc_mixes_tail_kernel (also on `side`, after the dots in stream order). So main
 // never has a data dependence on the dots, and the main-stream front cost drops
-// from the dots (4.9 us) to the EARLY half (1.7 us) — the fork/join events no
-// longer appear on main's path at all. The side chain becomes
-// EARLY(1.7) + dots(4.9) + LATE(10.7) = ~17 us, still far inside the ~50 us
-// projection window that must elapse before hc_post consumes `comb`
-// (dsv41-layer-fusion.md, DSV41_HC_TAIL_PRIO note), so `join_ev` is still
+// from the dots (4.9 us) to the EARLY half (1.7 us). The side chain becomes
+// dots(4.9) + LATE(10.7) = ~15.6 us (EARLY no longer sits in it), still far
+// inside the ~50 us projection window that must elapse before hc_post consumes
+// `comb` (dsv41-layer-fusion.md, DSV41_HC_TAIL_PRIO note), so `join_ev` is still
 // already satisfied when main reaches hc_tail_join.
-// The `fork_ev` record/wait pair is GONE: with the dots and the LATE half on one
-// stream, stream order already publishes `g_hc_part` before the LATE reads, so
-// an explicit fork would only add a graph node. `fork_ev` stays in the ABI
-// (ferrite-kernel still creates and passes it) so a stale .so keeps resolving
-// the same symbol, but it is NOT required to be non-null any more: a runtime
-// that failed to create only that event still gets the split.
-//
-// WHY EARLY NEEDS `in_ev` AND NOT JUST "no dependency on dots". EARLY reads `x`
-// (= s.h) and `pre_collapse` (a premix slot); both are written by MAIN-stream
-// work that precedes this call (the previous hc_post / AR fold). It genuinely
-// has zero data dependence on the dots (it never reads g_hc_part — that is all
-// in the LATE branch), so it must NOT wait `fork_ev` (which publishes
-// g_hc_part): waiting there would serialise it after the dots and lose the
-// whole overlap. But it does need a main->side edge that pins it after its own
-// producers, and `in_ev` — recorded on main BEFORE the dots — is exactly that
-// edge. Without it the side stream is a graph ROOT for this node and the whole
-// step capture (DSV41_GRAPH_STEP, default ON) lets EARLY run before the
-// main-stream hc_post that fills s.h, i.e. it reads stale residual bytes.
+// The dots and LATE share ONE stream, so stream order already publishes
+// `g_hc_part` before the LATE reads — no second fork event. The single
+// `fork_ev` (main, after EARLY) is what pins BOTH of them after main's writes of
+// `s.h`/`pre_collapse`: without it the side stream is a graph ROOT for those
+// nodes and the whole-step capture (DSV41_GRAPH_STEP, default ON) may start the
+// dots/LATE before the main-stream hc_post that fills s.h — i.e. on stale
+// residual bytes.
 // All stream/event ops are legal under cudaStreamCaptureModeRelaxed, so a
 // whole-step capture turns the fork/join into graph edges. Bit-identical to
-// dsv41_hc_front: both halves execute the same statements, in the same order,
-// with the same operands (the EARLY/LATE order swap is free — they are disjoint
-// in statements and in memory: EARLY writes out/xq/xsc, LATE writes pre/post/comb).
+// dsv41_hc_front: the same statements execute with the same operands on
+// whichever stream (the EARLY-on-main / dots+LATE-on-side split is free — the
+// halves are disjoint in statements and in memory: EARLY writes out/xq/xsc, the
+// dots write g_hc_part, LATE writes pre/post/comb).
 // Returns InvalidValue (1) when the gate is off, when there is no collapse half
 // to keep (w_norm == nullptr), or when the shapes are outside the spread tables —
 // all mean "use dsv41_hc_front instead".

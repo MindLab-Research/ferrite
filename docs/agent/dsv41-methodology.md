@@ -47,8 +47,8 @@ grid 失衡导致的空转 SM）。架构级评估（`STATUS.md:6547`）的结�
 | # | 名称 | 拆出的两条链 | fork 点 | join 点 | gate / 案例 |
 |---|---|---|---|---|---|
 | 1 | **hc tail split** | EARLY（collapse+rmsnorm+fp8 ≈1.7µs）vs LATE（ss+mixes+sinkhorn+comb ≈10.7µs） | `hc_front_split` 内（C 侧） | 主流 hc_post 前 | `DSV41_HC_TAIL_SPLIT`（`chain_dev.rs:2238`）；round 41 实测仅 −0.20ms（理论 −0.86，缺口见 §2.2 的调度坑） |
-| 2 | **EARLY-on-side** | EARLY 移到侧流头部与 dots 并发（dots 4.9µs > EARLY 1.7µs） | side 链头（`in_ev` 之后） | `early_ev` | `e152f47`，−0.14ms，bit-exact |
-| 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before ⇒ **删掉 `fork_ev`** | `806ec7a`，关键路径 −0.256ms（确定性值，非区间） |
+| 2 | **EARLY-on-side**（已**回退**，见 #3 与 B） | EARLY 移到侧流头部与 dots 并发（dots 4.9µs > EARLY 1.7µs） | side 链头（`in_ev` 之后） | `early_ev` | `e152f47` 引入、`806ec7a` 后成为净负担：main 仍付 1.7µs（改付 `early_ev` 的跨流往返），却每 front 多 4 个图节点 ⇒ **B 回退**（EARLY 回主流，零 event） |
+| 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before ⇒ 只需**一对** `fork_ev`/`join_ev` | `806ec7a`，关键路径 −0.256ms（确定性值，非区间）。B 之后的发射序列：`main: EARLY -> record(fork_ev)`；`side: wait(fork_ev) -> dots -> LATE -> record(join_ev)` |
 | 4 | **attention dual-chain** | q 链（norm/lin_rope+wq_b+rope ≈13.5µs，关键路径）vs kv 链（rmsnorm_rope ≈10.6µs，填充） | `lin2` 之后 | kv 链之后、`ring_win_fuse` **之前** | `DSV41_DUAL_CHAIN`（`chain_dev.rs:312`）；`2d7eead` |
 | 5 | **MoE dual** | routed experts（≈42µs）vs shared expert（≈22µs） | `moe()` 顶部（`sh_w` 后、gate 前） | routed 之后 join，再 `add_inplace(&s.o,&s.ex_out)` | `DSV41_MOE_DUAL`（`chain_dev.rs:365`）；`2d7eead` |
 | 6 | **compress side** | kv-source 层（2/8/14/20）的 4 个 compress launch（≈30µs） | `lin2` 之后（与 dual_chain 同点） | `window_idxs` 之后、**indexer 之前** | `DSV41_COMPRESS_SIDE`（`chain_dev.rs:338`）；`ec439e3`，需**新开 `side_stream3`** |
@@ -58,14 +58,17 @@ grid 失衡导致的空转 SM）。架构级评估（`STATUS.md:6547`）的结�
 `devrt.rs` 的 `create_side_stream`（`:144`，`cudaStreamCreateWithPriority` + `cudaStreamNonBlocking`）、
 `side_stream()`（`:765`）/`side_stream2()`（`:790`）/`side_stream3()`（`:840`）、
 `record_event`（`:862`）、`stream_wait_event`（`:873`）、事件对 `fork/join`（`:796`/`:803`）、
-`in/early`（`:812`/`:819`）、`fork2/join2`（`:826`/`:833`）、`fork3/join3`（`:847`/`:855`）、
+`fork2/join2`（`:826`/`:833`）、`fork3/join3`（`:847`/`:855`）、
 `SidePrio` 解析（`parse_side_prio`，`:126`）。
+（`in_ev`/`early_ev` 已随 B 删除：EARLY 回主流后不需要它们，`.cu` 侧只保留同名死参数位。）
 
 ### 必须遵守的三条规则（从 6 个实现里提炼）
 
 - ⚠️ **规则 1：fork 点必须在 mainstream 上游的写之后。** side 链若读主流上游写的缓冲
-  （`s.h`/`pre_collapse`），必须补一条 `main→side` 的 `in_ev` 边；否则该 kernel 会变成图 ROOT、
-  抢在生产者之前读到陈旧值（整步 capture 时图内无隐式顺序）。
+  （`s.h`/`pre_collapse`），必须有一条 `main→side` 的边把它钉在生产者之后；否则该 kernel 会变成
+  图 ROOT、抢在生产者之前读到陈旧值（整步 capture 时图内无隐式顺序）。**实现上优先用"把生产者
+  自己留在主流 + 一次 `fork_ev`"**（B 的做法）：只有当被搬走的节点与主流上游**零依赖**时才需要
+  额外事件，而那种"并发"通常并不省主流的时间（main 仍要等它的结果），却多付 2 个图节点。
 - ⚠️ **规则 2：join 点 = 最早消费者之前，不是直觉位置。** compress 的 join 在 `indexer` 之前
   （连 `sparse_attn` 之前都不够）；attention dual-chain 的 join 在 `ring_append` 之前
   （不是 `sparse_attn`——ring append 立即读 `s.kv`）。**先找到真正的首个消费者，再定 join。**
@@ -78,7 +81,9 @@ grid 失衡导致的空转 SM）。架构级评估（`STATUS.md:6547`）的结�
 机制是 `cudaGraphInstantiateFlagUseNodePriority`（`devrt.rs:1391`，flags 在 `:636` 构造；
 当且仅当**任一**侧流优先级非默认才开启，`:633` 的 `DSV41_GRAPH_NODE_PRIORITY` 是总开关）。
 
-- `DSV41_HC_TAIL_PRIO`（默认 greatest）——**疑似过度分配**（39µs 余量下无收益，反抢投影 wave 的 SM）。
+- `DSV41_HC_TAIL_PRIO`（**默认已改为 default**，C 2026-09-11；旧默认 greatest）——过度分配：
+  LATE 是 1-block 核（只有 1 个 warp 有活干），greatest 让它抢到一个用不满的 SM 并推迟它本该
+  藏在其下的块并行工作，而它有 ~34µs 余量、不延迟敏感。`=greatest`/`=1` 是恢复旧行为的 A/B 臂。
 - `DSV41_DUAL_PRIO`（默认 default）——两条链都在主流自己的串行路径上，压主流不划算。
 - `DSV41_COMPRESS_PRIO`（默认 greatest）——三条侧流里唯一真正 gate 住 attention 的链。
 - **唯一证据**：stderr 的 `[hc_tail]/[dual_chain]/[compress_side] side stream priority = N`；
