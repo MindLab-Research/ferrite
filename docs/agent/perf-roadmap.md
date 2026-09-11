@@ -1453,3 +1453,51 @@ DSV4 侧本会话新增了同口径的 `[dsv41] decode: N steps in Ts = X steps/
 
 **纪律（沿用）**：① 一次只改一个变量；② 同二进制背靠背 A/B 才算证据；③ 每次改动**亲自读四段文本** ✓；
 ④ 改 `.cu` 必 `bash build.sh 103a` 重编 `.so` ✓（漏跑会得到"新 kernel 不在 .so"的假故障 ✓）。
+
+## 2026-09-11 DSV41 新 decode 分解（差分法，N=40）+ 下一个优化点
+
+命令：`bash scripts/dsv41_profile.sh 40 /tmp/dsv41-prof`（脚本已固定 `DSV41_AR_V5=0 DSV41_GRAPH_STEP=0` ✓ ——
+前者避免自旋 × nsys 节点追踪的 300x 放大 ✓，后者避免捕获 ~400 节点的追踪开销 ✓；
+两条路径的算子耗时相同 ✓（`DSV41_TOKTRACE` 证明单请求逐 token 一致 ✓））。
+
+```
+decode-only net GPU time = 17789.3 ms over 39 steps / 8 ranks = 57.02 ms per step per rank
+  share calls      kernel
+  28.1%   837      hc_mixes_kernel            ← 头号目标
+  22.9%  5022      expert_gemv_fp*
+  20.4%  2311      gemm_fp8_gemv_kernel
+  14.0%   858      ar_reduce_kernel
+   2.5%   418      sparse_attn_wa*
+   1.8%   501      gemv_bf16_kernel
+   1.4%    41      indexer_topk
+   1.3%  1726      rmsnorm_kernel
+   1.2%    84      gemv_f32_kernel
+   1.0%   858      ar_store_kernel
+   0.8%   858      ar_stamp_kernel
+   0.8%  2259      quant_kernel
+   0.7%  2563      swiglu_limit_kernel
+   0.5%   418      route_topk_kernel
+   0.5%   837      hc_post_kernel
+```
+
+**⚠️ 量纲注意**：上表的**份额**可信 ✓，但脚本打印的 `us/call` 一列有量纲异常 ✗
+（`hc_mixes` 打出 153182.6 µs/call ✗ 显然不对 ✓）⇒ 需要核对差分公式里共享列的换算 ✓
+（见 TODO #10）；**绝对耗时要走隔离复现器** ✓（脚本尾部的既有告诫 ✓）。
+
+### 头号目标：`hc_mixes_kernel`（28.1%）—— 与 GLM 侧的"块形状/K-split"同类
+`kernels/cuda/dsv41_kernels.cu:569` 注释即写明 **"Grid: one block per token"** ✓，
+启动为 `<<<rows, nthreads, smem, s>>>`（`nthreads = mix*32 = 24*32 = 768` ✓）。
+**decode 时 rows=1** ✗ ⇒ **每层每步只有 1 个 block、768 线程（1 SM，占用率 ~1/148 ✗）**，
+却要算 24×16384 = **393K MAC** ✗ ⇒ 任务级并行度不足 ✓。
+
+**设计（与我在 GLM 侧已兑现的 K-split 同形）**：
+1. 把 K 维（`hc_dim` = hc×dim = 4×4096 = 16384 ✓）切成 8~16 段 ✓，每段一个 block ✓
+   （grid = rows × SPLIT ✓），每块算**完整 24 维 mix 的局部和** ✓（24 个 float ✓）→
+   `atomicAdd` 到一个 24-float scratch ✓（或写 [rows][SPLIT][24] 再确定性归约 ✓，后者的
+   求和顺序固定 ✓ ⇒ **优先选它**，数值可复现 ✓）。
+2. **Σx² 的归约**同样按 SPLIT 分块 + 二次小 kernel 归并 ✓（或让 block 0 在全量 x 上算 ✓ ——
+   它已经是全量读 ✓，成本低 ✓）。
+3. **sigmoid / sinkhorn 的拆分后处理**留在"归并后"的小 kernel 里 ✓（24 维 ✓ 极便宜 ✓）。
+
+**验收**：`scripts/dsv41_profile.sh` 看 `hc_mixes` 份额下降 ✓ + **四段文本亲自读** ✓ +
+`DSV41_TOKTRACE` 与改前逐 token 比对 ✓（数值等价性判据 ✓）。
