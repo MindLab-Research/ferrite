@@ -260,15 +260,13 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // Stage the activation row once per block. Every row this block owns reads
-    // the SAME k floats, and each one used to be a separate global (L2) load
-    // inside the row loop; from shared memory the loop is left with a single
-    // global stream (the weight row). Values and the c = lane, lane+32, ...
-    // order are untouched, so every row's sum stays bit-identical. Same
-    // treatment that measured 5-11 percent on the fp8 gemv's staged operands.
-    extern __shared__ float s_xb[];
-    for (int i = threadIdx.x; i < k; i += blockDim.x) s_xb[i] = x[i];
-    __syncthreads();
+    // REVERTED (2026-09-11): staging the activation row into shared memory measured
+    // a 2.3x STEP-TIME regression once the dynamic-smem argument was actually
+    // allocated (the staging had silently run past a zero-sized allocation before,
+    // which is why the earlier arm looked neutral). Reading `x` straight from
+    // global is the correct baseline here: every block touches the same k floats,
+    // so they stay L2-resident, and the barrier-free row loop keeps the launch
+    // footprint at zero shared memory.
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
@@ -276,7 +274,7 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
         // (same session, same binary path). The fp8 gemv gained from an unroll
         // pragma but this one loses - the two kernels have different
         // register/occupancy profiles.
-        for (int c = lane; c < k; c += 32) acc += __bfloat162float(wr[c]) * s_xb[c];
+        for (int c = lane; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }

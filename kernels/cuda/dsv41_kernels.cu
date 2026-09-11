@@ -1681,8 +1681,8 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         // The activation scales are the same for every output row, so they are
         // read once per block instead of once per row per k-block.
         for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
-        dsv41_cp_commit();
-        dsv41_cp_wait_all();
+        __syncthreads();
+    } else if (vec == 4) {
         __syncthreads();
     }
     for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
