@@ -1704,34 +1704,24 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // of garbage. Count sixteen-byte units, and cover a k that is not a
             // multiple of sixteen with a byte tail.
             const int n16 = k >> 4;
-            // DIAGNOSTIC: replace cp.async with regular shared memory writes.
-            // If the prefetch works without cp.async, the root cause is the
-            // interaction between cp.async completion and early reads.
-            for (int i = lane; i < k; i += 32) row_s[i] = wr[i];
+            // Stage the weight row with cp.async (the correct baseline path).
+            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+            for (int i = lane; i < n16; i += 32)
+                dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
             __syncwarp();
-            // (no cp.async, no commit, no wait_all)
             float acc = 0.f;
-            // SPLIT DIAGNOSTIC: prefetch ONLY ap (activation), read row_s
-            // at the point of use. If this is correct, the issue is with
-            // prefetching row_s (cp.async shared memory). If it degenerates,
-            // the issue is with prefetching ap (or with any prefetching).
-            {
-                uint8_t av_cur = ap[0 * 32 + lane];
-                int kb = 0;
-                for (; kb + 1 < nb_k; ++kb) {
-                    uint8_t av_next = ap[(kb + 1) * 32 + lane];
-                    float sb = ue8m0_to_f(wsr[kb]);
-                    float sa = a_scale[kb];
-                    acc += e4m3_to_f(av_cur) * sa *
-                           (e4m3_to_f(row_s[kb * 32 + lane]) * sb);
-                    av_cur = av_next;
-                }
-                if (kb < nb_k) {
-                    float sb = ue8m0_to_f(wsr[kb]);
-                    float sa = a_scale[kb];
-                    acc += e4m3_to_f(av_cur) * sa *
-                           (e4m3_to_f(row_s[kb * 32 + lane]) * sb);
-                }
+            // Baseline: compiler-directed unroll. The 3ms manual-unroll path
+            // is blocked by a degeneration whose root cause survived 8
+            // elimination experiments (see STATUS.md); pragma unroll 4 keeps
+            // the register budget the compiler chooses and stays correct.
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const float sa = a_scale[kb];    // m == 1
+                const int j = kb * 32 + lane;
+                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
             }
             __syncwarp();
         } else if (vec) {
