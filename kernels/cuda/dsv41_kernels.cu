@@ -2722,6 +2722,15 @@ static inline size_t dsv41_gemv_a32_bytes(int k) {
 // instead of `(warps + 1) * k`. The NORM_FUSE launcher keeps the extra row (its
 // prologue writes s_a and the decode still reads it) and passes norm_fuse=true.
 // MUST stay in lockstep with the kernel's `a32_direct` / `s_ws` computation.
+//
+// P4 (DSV41_GEMV_ACT_CPASYNC, act-cpasync): the async activation staging has to
+// land SOMEWHERE, and the only slot that costs no new memory is the mode-4 `s_a`
+// row P1 eliminated. So the gate re-opens that slot exactly like a32_staged does
+// (the kernel's `a32_direct` loses the same `&& !act_async` term), and this
+// function must reserve it or every pointer after it is short by k bytes. Read
+// with a local getenv for the same forward-reference reason as cached_staged,
+// and parsed with the same rule as g_gemv_act_cpasync below (unset = on, "0" =
+// off) so the host side and the kernel's `act_cpasync` field cannot disagree.
 static inline size_t dsv41_gemv_sa_bytes(int k, bool norm_fuse) {
     // Forward-declared P1 gate (definition at g_gemv_a32_staged below) -
     // use a local getenv read to avoid C++ forward-reference issues
@@ -2730,7 +2739,14 @@ static inline size_t dsv41_gemv_sa_bytes(int k, bool norm_fuse) {
         const char* se = getenv("DSV41_GEMV_A32_STAGED");
         cached_staged = (se != nullptr && se[0] == '1') ? 1 : 0;
     }
-    return (g_gemv_a32 && !norm_fuse && cached_staged == 0) ? (size_t)0 : (size_t)k;
+    // Forward-declared P4 gate (definition at g_gemv_act_cpasync below).
+    static int cached_act = -1;
+    if (cached_act < 0) {
+        const char* ae = getenv("DSV41_GEMV_ACT_CPASYNC");
+        cached_act = (ae != nullptr && atoi(ae) == 0) ? 0 : 1;
+    }
+    return (g_gemv_a32 && !norm_fuse && cached_staged == 0 && cached_act == 0) ? (size_t)0
+                                                                             : (size_t)k;
 }
 
 // Rows per gemv block, shared by the single-family and the two-family launchers.
@@ -2880,11 +2896,52 @@ static const bool g_gemv_cpasync = [] {
     return atoi(e) != 0;
 }();
 
+// P4 (gemm-act-cpasync, 2026-09-12): cp.async ACTIVATION staging, default OFF
+// (A/B arm; "=1" enables, an unset variable keeps today's synchronous staging).
+//
+// WHAT IT DOES. The mode-4 block-wide fp8 activation row is currently staged
+// into `s_a` by a SYNCHRONOUS wide copy, and -- only while P1's fused
+// `a32_direct` pass is disabled -- that copy is a plain global->shared transfer
+// with no decode attached to it. This gate turns it into cp.async issued in the
+// prologue, so the DRAM round trip leaves the thread's critical path: the
+// LUT build / scale staging run underneath the transfer and the wait is
+// collected just before the barrier that publishes `s_a`. Same bytes, same
+// slot, same LUT entry, same per-block scale -> bit-identical.
+//
+// WHY IT RE-OPENS THE P1 SLOT. `a32_direct` (a32=1 / mode 4 / no NORM_FUSE)
+// decodes straight from global into `s_af` and therefore leaves the k-byte `s_a`
+// row UNALLOCATED (P1: 48512 -> 43392 B at k=5120/warps=4 -> 5 blocks/SM
+// instead of 4). An async copy needs a place to land, so this gate forces
+// `a32_direct` false and pays that k bytes back (dsv41_gemv_sa_bytes mirrors the
+// condition). IT IS THEREFORE NOT A FREE WIN AT warps=4: the small-n arm loses a
+// block/SM (5 -> 4), while the warps=8 arm (n >= 2048) and the forced-32-warp
+// rope launchers keep their residency (3 and 1 blocks/SM either way). That
+// trade-off is exactly why the gate defaults OFF -- the measured P1 A/B called
+// staged-vs-direct NEUTRAL, so "staged + async copy" has to prove itself before
+// it becomes the default, not the other way round.
+//
+// LAYOUT COUPLING -- read by BOTH sides or the two disagree:
+//   * the kernel reads `gc.act_cpasync` (a GemvCore field) into `act_async`,
+//     which forces `a32_direct` false and skips the synchronous copy;
+//   * dsv41_gemv_sa_bytes() must reserve the same k bytes for every launcher.
+// Getting one side only = every pointer after the missing slot is short by k
+// bytes (the failure mode the P1 comments warn about).
+static const bool g_gemv_act_cpasync = [] {
+    const char* e = getenv("DSV41_GEMV_ACT_CPASYNC");
+    if (e == nullptr) return false;   // A/B arm: default OFF
+    return atoi(e) != 0;
+}();
+
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
 __device__ __forceinline__ void dsv41_cp_commit();
 __device__ __forceinline__ void dsv41_cp_wait_all();
+// P4: retire all but the most recently committed cp.async group. Needed because
+// the activation group is committed BEFORE the P3 weight group, so this retires
+// the activation while leaving the (larger) weight row in flight for the row
+// loop's own wait.
+__device__ __forceinline__ void dsv41_cp_wait_group1();
 
 // ---------------------------------------------------------------------------
 // PDL (programmatic dependent launch) for the DSV41 attention projection chain.
@@ -3065,6 +3122,13 @@ struct GemvCore {
     // only waits for what is left. 0 keeps the issue-after-barrier order. The
     // prefetch reuses the per-warp `s_w` row slot, so smem does not change.
     int cpasync = 0;
+    // P4 (DSV41_GEMV_ACT_CPASYNC, see g_gemv_act_cpasync): 1 stages the mode-4
+    // block-wide fp8 activation row with cp.async (global -> `s_a`, LUT decode
+    // after the wait) instead of the synchronous wide copy. It forces
+    // `a32_direct` false so the k-byte `s_a` row exists -- the launcher MUST then
+    // reserve it (dsv41_gemv_sa_bytes mirrors this field). 0 keeps today's
+    // synchronous staging / fused `a32_direct` path bit for bit.
+    int act_cpasync = 0;
     // --- second family: rows [n1, n1+n2) of the SAME activation -------------
     // A single-family launch passes n1 == n and leaves the family-2 pointers
     // untouched (null), so every row maps to family 1 and the behaviour is
@@ -3249,6 +3313,7 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     int a32 = gc.a32;
     int a32_staged = gc.a32_staged;   // P1 staged gate (see g_gemv_a32_staged)
     int cpasync = gc.cpasync;         // P3 cp.async weight-first prologue
+    int act_cpasync = gc.act_cpasync; // P4 cp.async activation staging
     const uint8_t* __restrict__ w2 = gc.w2;
     const uint8_t* __restrict__ w2_scale = gc.w2_scale;
     const float* __restrict__ bias2 = gc.bias2;
@@ -3344,8 +3409,18 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // `s_a` (qr_raw non-null, it is decoded by the same loop), and when a32=0
     // (that A/B arm reads `s_lut[s_a[j]] * s_as[j>>5]` inline in the consume
     // loop). The launchers mirror this with dsv41_gemv_sa_bytes().
+    // P4 (DSV41_GEMV_ACT_CPASYNC, see g_gemv_act_cpasync): like a32_staged this
+    // gate re-opens the k-byte `s_a` row, so `a32_direct` must lose the same
+    // term -- dsv41_gemv_sa_bytes() reserves k bytes for it unconditionally, and
+    // a kernel that skipped the slot would put every later pointer k bytes early.
     const bool a32_direct = (a32 != 0) && (vec == 4) && (qr_raw == nullptr)
-            && !a32_staged;  // P1 gate: =1 falls back to staged (s_a intermediate)
+            && !a32_staged && (act_cpasync == 0);  // P1/P4 gates: fall back to staged
+    // P4: only the sites where the synchronous staging loop below would run get
+    // the async treatment. `a_f32 != nullptr` is excluded because on that path
+    // `a` is NULL (its launcher passes null) and an async copy from it would
+    // fault; that branch fills `s_af` straight from `a_f32` instead.
+    const bool act_async = (act_cpasync != 0) && (a32 != 0) && (vec == 4) &&
+                           (qr_raw == nullptr) && !a32_staged && (a_f32 == nullptr);
     uint8_t* s_ws = s_a + (size_t)((vec == 4 && !a32_direct) ? k : 0);
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     // The e4m3 decode as a 256-entry shared-memory table. The bit-manipulation
@@ -3376,6 +3451,36 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
     // dsv41_gemv_a32_bytes).
     float* s_rows = a32 ? (s_af + k) : (s_lut + 256);
     // -----------------------------------------------------------------------
+    // P4 (DSV41_GEMV_ACT_CPASYNC): cp.async ACTIVATION staging. See
+    // g_gemv_act_cpasync above for the reasoning and the layout coupling; the
+    // short version is that the block-wide fp8 activation row used to be staged
+    // by a SYNCHRONOUS wide copy, which parks every participating thread on the
+    // DRAM round trip before the LUT is even built. Issuing the same bytes as
+    // cp.async instead takes that transfer off the thread's critical path: the
+    // scale staging + LUT build run underneath it, and the wait below collects
+    // it just before the barrier that publishes `s_a`.
+    //
+    // GROUP ORDER IS LOAD-BEARING -- this block sits ABOVE the P3 weight prefetch
+    // on purpose. The activation group is therefore the OLDER one, which is what
+    // lets `dsv41_cp_wait_group1()` below retire the activation while the (much
+    // larger) weight row stays in flight for the row loop's own wait. Reversing
+    // the two issues turns that wait into "stall until the weight row lands" and
+    // throws P3's overlap away.
+    //
+    // The commit is UNCONDITIONAL for every thread (empty groups included), so
+    // every thread carries the same group count into the `wait_group 1`; a
+    // warp-dependent count would retire a different group per warp.
+    //
+    // Same bytes, same slot, same LUT entry, same per-block scale as the
+    // synchronous copy -> bit-identical. The k % 16 tail below stays a plain
+    // read (unreachable: every launcher rejects `k & 31`).
+    if (act_async) {
+        const int n16a = k >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x)
+            dsv41_cp_async16(s_a + (i << 4), a + (i << 4));
+        dsv41_cp_commit();
+    }
+    // -----------------------------------------------------------------------
     // P3 (DSV41_GEMV_CPASYNC): cp.async WEIGHT-FIRST prologue. See
     // g_gemv_cpasync above for the full reasoning; the short version is that the
     // row loop's weight transfer used to start only after the block barrier
@@ -3403,12 +3508,19 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
         uint8_t* pf_s = s_w + (size_t)warp * (size_t)k;
         const int n16p = k >> 4;
         for (int i = lane; i < n16p; i += 32) dsv41_cp_async16(pf_s + (i << 4), pf_w + (i << 4));
-        dsv41_cp_commit();
         // k % 16 tail: unreachable for every launcher (all of them reject
         // k & 31), kept so the prefetched row is staged by exactly the rule the
         // loop uses. A hole here would be a partially-staged row, not a crash.
         for (int i = (n16p << 4) + lane; i < k; i += 32) pf_s[i] = pf_w[i];
     }
+    // P3 P4 SHARED: committed UNCONDITIONALLY, i.e. also for the tail warps that
+    // have no prefetched row (they commit an EMPTY group, which is a no-op) and
+    // also when the P3 gate is off. That keeps the per-thread commit-group count
+    // identical across the block, which is what makes the `wait_group 1` in the
+    // prologue epilogue retire the SAME group for every thread. The row loop's
+    // own `cp.async.wait_all` retires this group on the prefetched iteration, so
+    // moving the commit below the tail copy changes nothing observable.
+    dsv41_cp_commit();
     // NORM_FUSE prologue (see dsv41_gemm_fp8_mx_rope_norm). With `qr_raw`
     // non-null this block owns the activation's fp8 production: it reduces the
     // f32 row, applies the norm weight and encodes the scaled values into
@@ -3466,9 +3578,26 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
         // cudaMalloc'd DevBuf and every offset is a multiple of 16), so the cause
         // is unidentified; the dependent-copy form is the correct baseline. Do not
         // re-try without first reading the dbg-err700 findings.
-        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
-            *reinterpret_cast<uint4*>(s_a + (i << 4)) =
-                *reinterpret_cast<const uint4*>(a + (i << 4));
+        //
+        // [2026-09-12] P4 re-opens that cp.async attempt behind
+        // DSV41_GEMV_ACT_CPASYNC (default OFF, A/B arm). Two things changed since
+        // the note above was written, and BOTH matter before trusting the arm:
+        //   1. the err-700 round that produced this note was later traced to a
+        //      DIFFERENT kernel's out-of-bounds dynamic smem (gemv_bf16 staging
+        //      with a launcher that still passed smem = 0 -- see STATUS.md
+        //      "默认路径 err 700 的最终根因"); that file explicitly lists
+        //      "activation cp.async（已删）" as a probable false conviction. So the
+        //      verdict here is UNVERIFIED, not disproven -- treat a fresh err 700
+        //      on this arm as a real signal and re-read that section.
+        //   2. the async issue now happens in the PROLOGUE, before the weight
+        //      prefetch, precisely so `wait_group 1` can retire it alone.
+        // When `act_async` is set the copy below is not executed here at all; the
+        // bytes were already issued in the prologue above.
+        if (!act_async) {
+            for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                *reinterpret_cast<uint4*>(s_a + (i << 4)) =
+                    *reinterpret_cast<const uint4*>(a + (i << 4));
+            }
         }
         for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
     }
@@ -3482,6 +3611,13 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
         // Build the e4m3 decode table once per block (256 entries, two iterations
         // per thread at the default block size).
         for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+        // P4: collect the async activation transfer HERE -- after the scale copy
+        // and the LUT build (which is the cover), and before the barrier that
+        // publishes `s_a` to the block, which is the first point the stage is
+        // consumed (the decode below). `wait_group 1` retires the activation
+        // group ONLY: the P3 weight group is the NEWER group and stays in flight
+        // for the row loop's own wait_all. See g_gemv_act_cpasync.
+        if (act_async) dsv41_cp_wait_group1();
         __syncthreads();
         // a32: materialise the scaled activation (block-level, so the decode
         // latency is paid once instead of once per row). With DSV41_GEMV_A32=0
@@ -3829,6 +3965,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
         gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
         gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+        gc.act_cpasync = (g_gemv_act_cpasync ? 1 : 0);
         gc.n1 = n;                     // single family: every row is family 1
         GemvEpi ge{};
         ge.staging_tbl = staging_tbl; ge.epoch = epoch;
@@ -3915,6 +4052,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
     gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
     gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+    gc.act_cpasync = (g_gemv_act_cpasync ? 1 : 0);
     gc.n1 = n;                     // single family
     GemvRope gr{};
     gr.rope_cos = rope_cos; gr.rope_sin = rope_sin; gr.rope_base = rope_base;
@@ -4071,6 +4209,7 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
     gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
     gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+    gc.act_cpasync = (g_gemv_act_cpasync ? 1 : 0);
     gc.w2 = w2; gc.w2_scale = w2_scale;
     gc.bias2 = bias2; gc.out2 = out2;
     gc.n1 = n1;
@@ -4137,6 +4276,7 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
     gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
     gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+    gc.act_cpasync = (g_gemv_act_cpasync ? 1 : 0);
     gc.n1 = n;                     // single family
     GemvEpi ge{};
     ge.epi_add = 1;                // A5: out[row] += acc + bias
@@ -4221,6 +4361,7 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
     gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
     gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+    gc.act_cpasync = (g_gemv_act_cpasync ? 1 : 0);
     gc.n1 = n;                     // single family
     GemvFusion gf{};
     gf.a_f32 = a_f32;              // raw f32 activation, no fp8 round trip
@@ -5139,6 +5280,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
     gc.a32_staged = (g_gemv_a32_staged ? 1 : 0);
     gc.cpasync = (g_gemv_cpasync ? 1 : 0);
+    gc.act_cpasync = (g_gemv_act_cpasync ? 1 : 0);
     gc.w2 = w2; gc.w2_scale = w2_scale;
     gc.bias2 = bias2; gc.out2 = out2;
     gc.n1 = n1;
@@ -6250,6 +6392,13 @@ __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem) {
 }
 __device__ __forceinline__ void dsv41_cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 __device__ __forceinline__ void dsv41_cp_wait_all() { asm volatile("cp.async.wait_all;\n"); }
+// P4 (gemm-act-cpasync): retire every cp.async group except the newest one.
+// `cp.async.wait_group N` completes all but the N most recent commit groups, so
+// `wait_group 1` completes the OLDER group and lets the newer one stay in
+// flight. The fp8 gemv commits the activation group before the weight group on
+// purpose (see g_gemv_act_cpasync), which is what makes this the "wait for the
+// activation, keep the weight row streaming" primitive.
+__device__ __forceinline__ void dsv41_cp_wait_group1() { asm volatile("cp.async.wait_group 1;\n"); }
 
 // Phase A: one warp per (token, projection row). Both operands are staged with
 // cp.async; the raw dot lands in g_hc_part[r][m][0] for the tail to scale.

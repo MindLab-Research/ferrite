@@ -90,6 +90,11 @@
 // ============================================================================
 #include <cuda_runtime.h>
 #include <cstdint>
+// P4 (DSV41_GATEUP_CPASYNC): __pipeline_memcpy_async / __pipeline_commit /
+// __pipeline_wait_prior for the weight-first prologue of the batched expert
+// gate/up kernel. 16-byte copies lower to cp.async.cg (the same instruction
+// dsv41_kernels.cu's dsv41_cp_async16 emits by hand for the gemv P3 window).
+#include <cuda_pipeline.h>
 
 namespace {
 
@@ -872,6 +877,79 @@ static int dsv41_gateup_ksplit(void) {
     return cached;
 }
 
+// P4 (DSV41_GATEUP_CPASYNC, default ON, `=0` restores the old issue order):
+// cp.async WEIGHT-FIRST prologue for the FUSED batched gate/up body. Same idea
+// as the gemv P3 window in dsv41_kernels.cu (see g_gemv_cpasync there): the
+// row's weight bytes are model constants, so their transfer can START under the
+// block prologue (activation staging + LUT) instead of after its barrier, where
+// it used to sit in front of the first group's dot on the critical path.
+//
+// WHAT IS PREFETCHED. The gateup row is NOT staged wholesale: one warp owns ONE
+// inter row and walks it in `nv2f = k>>9` groups (512 values = 512 B of
+// interleaved w1/w3 bytes). The prefetch covers exactly the FIRST group the warp
+// consumes (`g_begin = half*nv2f/ksplit`), i.e. 512 B per warp: for ILV one
+// contiguous 512-byte chunk, for the plain layout the 256-byte gate head and the
+// 256-byte up head. That is the only part of the transfer the prologue barrier
+// can cover; staging the WHOLE row (5 KB/warp -> 80 KB/CTA at rows=8/ksplit=2)
+// would trade the overlap for residency, the trap the gemm-prologue-overlap
+// analysis flagged for the double-buffered gemv variant.
+//
+// SMEM COST: 512 B x nwarps (8 KB at rows=8/ksplit=2) added to the existing
+// dim*4 + 256*float2 [+ nwarps*float2 when ksplit>1] pool. The CTA is
+// thread-limited (512 threads, 4 CTAs/SM) at the default shape, so 8 KB costs
+// nothing there; the buffer sits between s_lut2 and s_ks, so the launcher's
+// formula and the kernel's pointer must move together (the s_ks coupling hazard,
+// documentation §0.55).
+//
+// BIT-EXACTNESS: same bytes, same slot, same consume order; only the moment of
+// the copy moves. The smem slot is read by the same lane offsets the gmem load
+// used, and cp.async completion is published by the existing pre-loop
+// __syncthreads() (the plain-layout chunks are wider than one lane's read, so
+// the barrier - not just per-lane ordering - is required).
+//
+// SCOPE: only the fused gate/up branch implements the substitution. The
+// unfused vec/vec2 bodies and the downdirection (fuse_swiglu==0) keep their
+// direct gmem reads and are launched with pf=0 (no buffer reserved).
+static int dsv41_gateup_cpasync(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("DSV41_GATEUP_CPASYNC");
+        cached = (e != nullptr && e[0] == '0') ? 0 : 1;   // default ON
+    }
+    return cached;
+}
+
+// Number of bytes the weight-first prologue stages per warp (fixed 512: one
+// k-group of gate+up). Shared by the kernel's pointer arithmetic and the
+// launcher's dynamic-smem formula - keep them on this constant.
+constexpr int kGateUpPfBytes = 512;
+
+// cp.async.cg 16-byte global -> shared copy and the commit/wait pair.
+// __pipeline_memcpy_async(16) is the documented spelling of cp.async.cg (4/8
+// bytes would lower to cp.async.ca). The pre-sm_80 arm keeps the TU compilable
+// for any arch with identical data movement (this TU is only built for
+// sm_100a/sm_103a, so it is never taken in production).
+__device__ __forceinline__ void dsv41_gateup_pf16(void* smem, const void* gmem) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    __pipeline_memcpy_async(smem, gmem, 16);
+#else
+    *reinterpret_cast<uint4*>(smem) = *reinterpret_cast<const uint4*>(gmem);
+#endif
+}
+__device__ __forceinline__ void dsv41_gateup_pf_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    __pipeline_commit();
+#endif
+}
+// Waits for EVERY outstanding group of THIS thread. Called with no outstanding
+// group when the prefetch did not arm, which is a documented no-op. The
+// completion is published block-wide by the __syncthreads() that follows it.
+__device__ __forceinline__ void dsv41_gateup_pf_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    __pipeline_wait_prior(0);
+#endif
+}
+
 // NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
 // through cudaLaunchKernelEx (its variadic template applies the kernel's
 // declared parameter types to the arguments, exactly like `<<<>>>` would).
@@ -929,7 +1007,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bs_stride, const uint8_t* __restrict__ bh_base,
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
                                                long bhs_stride, const int* __restrict__ ids,
-                                               int vec, int fuse_swiglu, int ksplit) {
+                                               int vec, int fuse_swiglu, int ksplit, int pf) {
     const int slot = (int)blockIdx.y;
     const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
     const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
@@ -952,13 +1030,30 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // 256-entry byte->float2 table: one LDS.64 yields both nibbles' e2m1 values
     // (the old 16-entry scalar table needed two LDS.32 plus a shift per value).
     float2* s_lut2 = reinterpret_cast<float2*>(s_act + k);
+    // Warp/lane ids are needed HERE (before the prologue) because the P4
+    // weight-first staging below is per-warp; they were previously derived after
+    // the barrier. Pure arithmetic on threadIdx - no dependency on any staging.
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    // P4 (DSV41_GATEUP_CPASYNC) weight-first staging: kGateUpPfBytes per warp =
+    // the warp's FIRST k-group of gate+up weight bytes (see
+    // dsv41_gateup_cpasync). Placed right after the 256-entry LUT: the dynamic
+    // smem base is 16-byte aligned and k*4 + 256*8 is a multiple of 16, so every
+    // per-warp slot starts 16-byte aligned for cp.async.cg. `pf` is non-zero only
+    // for the FUSED gate/up launch, and that launcher reserves exactly
+    // `nwarps*kGateUpPfBytes` when it sets it - moving this pointer without the
+    // matching change in dsv41_expert_gate_up_fp4_batched's smem formula would
+    // shift s_ks (and read/write past the allocation).
+    uint8_t* s_pf = reinterpret_cast<uint8_t*>(s_lut2 + 256);
     // K-split partials (DSV41_GATEUP_KSPLIT>1, fused gate/up only): ONE (gate,up)
     // float2 per warp, indexed by the CTA-local warp id. The ksplit halves of a
     // row are consecutive warps (warp = row_local*ksplit + half), so half 0 reads
-    // s_ks[warp+1 .. warp+ksplit-1] to fold its partners. Laid out right after the
-    // 256-entry LUT and allocated by the launcher ONLY when ksplit>1, so the
-    // ksplit==1 launch keeps the original dynamic-smem size (and occupancy).
-    float2* s_ks = reinterpret_cast<float2*>(s_lut2 + 256);
+    // s_ks[warp+1 .. warp+ksplit-1] to fold its partners. Laid out after the LUT
+    // (and, when pf != 0, after the per-warp prefetch buffer) and allocated by
+    // the launcher ONLY when ksplit>1, so the ksplit==1 launch keeps the original
+    // dynamic-smem size (and occupancy).
+    float2* s_ks = reinterpret_cast<float2*>(s_pf + (size_t)nwarps * kGateUpPfBytes);
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
     // PDL (DSV41_PDL, see dsv41_experts_pdl_or_plain above): the launcher may
@@ -991,6 +1086,69 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
 #if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
 #endif
+    // ---- P4 (DSV41_GATEUP_CPASYNC): cp.async WEIGHT-FIRST prologue ---------
+    // See dsv41_gateup_cpasync above for the reasoning. Short version: this
+    // warp's row is `row_base` and the FUSED body walks it in `k>>9` groups of
+    // 512 B, starting at group `g_begin`. The first group's weight bytes depend
+    // on NOTHING the prologue computes, so they are issued into shared memory
+    // HERE - before the activation staging - and the staging + the pre-loop
+    // barrier become their cover. Without this the first group's LDG sat after
+    // the barrier, in front of its own dot, with nothing to hide it.
+    //
+    // It sits AFTER cudaGridDependencySynchronize() on purpose: `w` can be
+    // written by the previous node on the stream, and under PDL that producer
+    // may still be running - an early issue would be a race (same rule as the
+    // gemv P3 window).
+    //
+    // The row mapping is computed here (it is pure `blockIdx`/`threadIdx`
+    // arithmetic) because the prefetch needs it; the row loop below reuses these
+    // exact values, so there is ONE mapping definition.
+    const int rows_per_cta = (ksplit > 0) ? (nwarps / ksplit) : nwarps;
+    const int row_local = (ksplit > 0) ? (warp / ksplit) : warp;
+    const int half = (ksplit > 0) ? (warp % ksplit) : 0;
+    const int row_base = blockIdx.x * rows_per_cta + row_local;
+    const int nv2f = k >> 9;                    // 512-value groups per row
+    const int g_begin = (half * nv2f) / ksplit; // this warp's first group
+    // Armed only for the fused gate/up body (the one body that implements the
+    // substitution) and only for a warp that owns a real row. `pf` is set by the
+    // launcher together with the matching smem reservation.
+    bool pf_ok = (pf != 0) && (fuse_swiglu != 0) && (b_split > 0) && ((k & 511) == 0) &&
+                 (row_base < n_total);
+    uint8_t* pf_slot = s_pf + (size_t)warp * kGateUpPfBytes;
+    if (pf_ok) {
+        // Family/pitch select copied from the row loop verbatim: drifting from
+        // it here would silently stage the WRONG row (no crash, wrong dot).
+        const uint8_t* g_row = b_use + (size_t)row_base * (ILV ? (kbytes << 1) : kbytes);
+        const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row_base * kbytes);
+        // Group `g_begin` of the gate row is at byte offset g_begin*256 (plain)
+        // / g_begin*512 (interleaved; gate and up share one region).
+        const size_t gb = (size_t)g_begin * (size_t)(ILV ? 512 : 256);
+        const uint8_t* src_g = g_row + gb;
+        const uint8_t* src_u = u_row + gb;
+        // 16-byte alignment is a cp.async.cg REQUIREMENT on both sides. The pool
+        // base is 256-byte aligned and every per-expert stride / row pitch here
+        // is a multiple of 16 (dim % 512 == 0), so this always holds today; the
+        // guard keeps a future odd stride from faulting (err 716) instead of
+        // falling back silently - same lesson as the gemv scale row.
+        const bool al_ok = (((uintptr_t)src_g & 15u) == 0) &&
+                           (ILV || (((uintptr_t)src_u & 15u) == 0));
+        if (al_ok) {
+            if (ILV) {
+                dsv41_gateup_pf16(pf_slot + (lane << 4), src_g + (lane << 4));
+            } else if (lane < 16) {
+                dsv41_gateup_pf16(pf_slot + (lane << 4), src_g + (lane << 4));
+            } else {
+                // Lanes 16..31 carry the up row's 16 chunks into the second half
+                // of the slot (dst + 16*16 = +256), so the consumer's fixed
+                // offsets (gate at lane*8, up at 256 + lane*8) hold for every
+                // lane while the copies stay 16 B wide.
+                dsv41_gateup_pf16(pf_slot + (lane << 4), src_u + ((size_t)(lane - 16) << 4));
+            }
+            dsv41_gateup_pf_commit();
+        } else {
+            pf_ok = false;
+        }
+    }
     // Vectorized staging (audit #2): one uint4 = 16 bytes = 32 fp4 values =
     // exactly one scale block, so each thread-iteration is 1 LDG.128 + 1 scale
     // load instead of 20 serial LDG.8s. BIT-EXACT: the nibble order (low ->
@@ -1030,24 +1188,26 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         }
     }
     }
+    // P4: drain the weight-first cp.async group here, BEFORE the barrier, so the
+    // barrier publishes the staged group block-wide to every reader lane (the
+    // plain-layout chunks are 16 B wide while a lane consumes 8 B, so the
+    // consumer lane is not always the copying lane). No-op when nothing was
+    // committed. This is the "commit + wait before the dot" point of the scheme:
+    // the actual dot runs right after the row loop's first iteration starts.
+    dsv41_gateup_pf_wait();
     __syncthreads();
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int nwarps = (blockDim.x + 31) >> 5;
 
-    // K-SPLIT row mapping (DSV41_GATEUP_KSPLIT, default 1 = original).
-    // With ksplit warps per row, nwarps = rows*ksplit, so the CTA's ROW count is
-    // nwarps/ksplit and warp `w` owns row_local `w/ksplit`, half `w%ksplit`.
-    // ksplit==1 => rows_per_cta == nwarps, row_local == warp: the exact original
-    // mapping. grid.x is still ceil(n_total/rows) (the launcher sizes it by the
-    // ROW count), i.e. ONE pass; ksplit>1 therefore stops the window loop after
-    // its single iteration and lets the warps whose row is past n_total reach the
-    // fused branch's cross-half __syncthreads() as well (guard by `active`, not
-    // by the loop bound, or that barrier would deadlock the CTA).
-    const int rows_per_cta = (ksplit > 0) ? (nwarps / ksplit) : nwarps;
-    const int row_local = (ksplit > 0) ? (warp / ksplit) : warp;
-    const int half = (ksplit > 0) ? (warp % ksplit) : 0;
-    const int row_base = blockIdx.x * rows_per_cta + row_local;
+    // K-SPLIT row mapping (DSV41_GATEUP_KSPLIT, default 1 = original):
+    // rows_per_cta / row_local / half / row_base are computed in the P4 prologue
+    // above (the prefetch needs them). With ksplit warps per row, nwarps =
+    // rows*ksplit, so the CTA's ROW count is nwarps/ksplit and warp `w` owns
+    // row_local `w/ksplit`, half `w%ksplit`; ksplit==1 => rows_per_cta == nwarps,
+    // row_local == warp: the exact original mapping. grid.x is still
+    // ceil(n_total/rows) (the launcher sizes it by the ROW count), i.e. ONE pass;
+    // ksplit>1 therefore stops the window loop after its single iteration and
+    // lets the warps whose row is past n_total reach the fused branch's
+    // cross-half __syncthreads() as well (guard by `active`, not by the loop
+    // bound, or that barrier would deadlock the CTA).
     const int row_stop = (ksplit > 1) ? (row_base + 1) : n_total;   // ksplit>1: one trip
     for (int row = row_base; row < row_stop; row += gridDim.x * rows_per_cta) {
         // gate_up + swiglu fusion (fuse_swiglu && b_split > 0, gate/up direction).
@@ -1088,13 +1248,14 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             const uint8_t* u_row = ILV ? g_row : (bhi_use + (size_t)row_c * kbytes);
             const uint8_t* g_srow = bsc_use + (size_t)row_c * ksc;
             const uint8_t* u_srow = bhs_use + (size_t)row_c * ksc;
-            const int nv2f = k >> 9;   // 16 values per lane per group; no tail (k % 512 == 0)
+            // nv2f (k>>9 groups per row, no tail because k % 512 == 0) and
+            // g_begin are the PROLOGUE's copies - the P4 prefetch needs them
+            // there, so they are defined once, above, and reused here.
             // K-split group slice: this half walks the CONTIGUOUS groups
             // [half*nv2f/ksplit, (half+1)*nv2f/ksplit). ksplit==1 => [0, nv2f), the
             // original bounds. j and q below are unchanged because the cut always
             // lands on a 512-value group boundary (never inside a 32-value scale
             // block). half 0 owns the LOW half, half 1 the HIGH half.
-            const int g_begin = (half * nv2f) / ksplit;
             const int g_end = ((half + 1) * nv2f) / ksplit;
             float g = 0.f, u = 0.f;
             // unroll 4 (was 2): the audit measured this branch at ~6% issue with
@@ -1135,12 +1296,23 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // the same reason q is 8-byte aligned. Same decode, same fma
                 // chains, half the load instructions.
                 const int q = (g2 << 8) + (lane << 3);
+                // P4 (DSV41_GATEUP_CPASYNC): this warp's FIRST group was staged
+                // into s_pf before the prologue barrier, so the first iteration's
+                // bytes come from smem. Same bytes, same slot, same consume
+                // order -> BIT-EXACT; the only difference is which memory the
+                // LDG/LDS reads. `from_pf` is constant false when the launch has
+                // pf == 0, so the non-prefetching shapes keep their codegen.
+                const bool from_pf = pf_ok && (row == row_base) && (g2 == g_begin);
                 uint32_t gw0, gw1, uw0 = 0u, uw1 = 0u;
                 if (ILV) {
-                    const uint4 v4 = *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
+                    const uint4 v4 = from_pf
+                        ? *reinterpret_cast<const uint4*>(pf_slot + (size_t)(lane << 4))
+                        : *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
                     gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
                 } else {
-                    const uint2 gw = *reinterpret_cast<const uint2*>(g_row + q);
+                    const uint2 gw = from_pf
+                        ? *reinterpret_cast<const uint2*>(pf_slot + (size_t)(lane << 3))
+                        : *reinterpret_cast<const uint2*>(g_row + q);
                     gw0 = gw.x; gw1 = gw.y;
                 }
                 float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
@@ -1175,7 +1347,12 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // (uw0/uw1). PLAIN: the second LDG.64 of the row, identical
                 // 8-byte alignment argument; uw.x/uw.y == the old uw0/uw1.
                 if (!ILV) {
-                    const uint2 uw = *reinterpret_cast<const uint2*>(u_row + q);
+                    // P4: the staged slot keeps the up row's chunks in its second
+                    // half (dst + 256), so the plain layout reads both rows out of
+                    // s_pf with the same +256 separation the two pools have.
+                    const uint2 uw = from_pf
+                        ? *reinterpret_cast<const uint2*>(pf_slot + 256 + (size_t)(lane << 3))
+                        : *reinterpret_cast<const uint2*>(u_row + q);
                     uw0 = uw.x; uw1 = uw.y;
                 }
                 float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
@@ -1963,7 +2140,15 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // flight vs 1920) - the recommended shape, which does NOT double the per-CTA
     // s_act+LUT prologue. rows=4 / ksplit=2 additionally gives the 480-CTA shape.
     const int ctas_x = (n_total + warps - 1) / warps;
+    // P4 (DSV41_GATEUP_CPASYNC): the weight-first prologue stages one k-group of
+    // gate+up per warp, so the FUSED launch reserves kGateUpPfBytes per warp on
+    // top of the s_act + LUT [+ s_ks] pool. The kernel's s_pf/s_ks pointers are
+    // derived from this same expression (in the same order) - a mismatch reads or
+    // writes past the allocation. The unfused arm and the down direction launch
+    // with pf=0 and are sized exactly as before.
+    const int pf = (fuse && dsv41_gateup_cpasync()) ? 1 : 0;
     const size_t smem = (size_t)dim * sizeof(float) + 256 * sizeof(float2) +
+                        (pf ? (size_t)(warps * ksplit) * kGateUpPfBytes : (size_t)0) +
                         ((ksplit > 1) ? (size_t)(warps * ksplit) * sizeof(float2) : (size_t)0);
     dim3 grid((unsigned)ctas_x, (unsigned)slots);
     const unsigned block_threads = (unsigned)(warps * ksplit * 32);
@@ -1978,7 +2163,7 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
             expert_gemv_fp4_batched_kernel<true>, grid, dim3(block_threads), smem, stream, nullptr,
             0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
             w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride,
-            ids, g_expert_fp4_mode, fuse, ksplit);
+            ids, g_expert_fp4_mode, fuse, ksplit, pf);
     else
         le = dsv41_experts_pdl_or_plain(
             expert_gemv_fp4_batched_kernel<false>, grid, dim3(block_threads), smem, stream, nullptr,
@@ -2010,7 +2195,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
         (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
         nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
         w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
-        g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1);
+        g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1, /*pf=*/0);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
