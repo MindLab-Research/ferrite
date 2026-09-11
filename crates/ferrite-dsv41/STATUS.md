@@ -6458,3 +6458,24 @@ mode3+a32off = 22912 B。工具：`scripts/dsv41_a32_bench.sh`（隔离基准，
 5. hc_post fold ↔ tail split 互斥已解（join 位置问题非数据依赖）
 
 **阻塞**：b300-4 驱动 wedge（同 09-09 事故模式；CLEAN b875509 重建也失败；需用户重启）
+
+### 最终投影分解（final-breakdown 的计算，2026-09-11 深夜）
+
+**三档预期**：
+| 档 | 计算 | 结果 | tok/s |
+|---|---|---|---|
+| 保守（全下界） | 8.23 − 2.33 | **5.90ms** | 139 |
+| 中间（含 a32） | 8.23 − 3.63 | **4.60ms** | 174 |
+| **乐观（全上界 + a32）** | 8.23 − 4.18 | **4.05ms** | **203 ✓ 超 200！** |
+
+**投影分解（中间值）**：gemm 1.35（a32 −0.74）· hc 1.40 · MoE 1.47 · gate+route 0.39 · AR 0.37 · sparse 0.26 · quant 0.07 · rmsnorm 0.10 · misc 0.84
+
+**三点风险**（final-breakdown 的警告）：
+① 朴素求和可能重复计账（PDL/fp4-pack/sparse-o-rope/hc_post 同属 launch 消除）
+② 四个侧流并行（dual-chain/MoE-dual/compress/tail-late）共享同一侧流预算，不可线性叠加
+③ **a32 是二元项（4.6 vs 5.34）——恢复后先做单变量验证再谈其余**
+
+**下一波 top-3**（若验证落在 4.5-5.5ms）：
+1. gemm 246 launches → grouped/persistent GEMM（压到 ~40 次）
+2. hc dots 0.56ms → 融进 attention epilogue
+3. MoE 1.47ms → 权重 FP4 下沉 + gateup/down 单核融合
