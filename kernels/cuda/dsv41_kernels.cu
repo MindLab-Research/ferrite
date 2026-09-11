@@ -1673,6 +1673,15 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     // host+device comparison; the earlier "branchless exact" rewrite was NOT -
     // 14/256 mismatched on the implicit-1-bit derivation - do not retry that).
     float* s_lut = s_as + nb_k;
+    // a32: the activation pre-decoded to its SCALED f32 form, once per block.
+    // The consume loop's per-element chain was LDS.8(ap byte) -> LDS.32(LUT) ->
+    // FMUL(sa); folding the decode+scale here leaves LDS.32(s_af) -> FMUL, and
+    // the isolated graph bench measured the family -6/-8/-13 percent at
+    // n=256/1024/1664 (7.71/8.59/10.39us against the plain LUT's
+    // 8.23/9.35/11.96). s_af[j] is the SAME product the loop used to compute
+    // (s_lut[ap[j]] * sa with sa = s_as[j>>5]), so the rounding sequence is
+    // unchanged and the output is bit-identical (fingerprint-verified).
+    float* s_af = s_lut + 256;
     if (vec == 4) {
         const int n16a = k >> 4;
         // NOTE: this staging was tried as cp.async and faulted with err 700
@@ -1694,6 +1703,12 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         // Build the e4m3 decode table once per block (256 entries, two iterations
         // per thread at the default block size).
         for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+        __syncthreads();
+        // a32: materialise the scaled activation (block-level, so the decode
+        // latency is paid once instead of once per row).
+        const uint8_t* ap0 = (vec == 4) ? s_a : a;
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+            s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
         __syncthreads();
     } else if (vec == 4) {
         __syncthreads();
@@ -1770,9 +1785,11 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
 #pragma unroll 4
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(row_sc[kb]);
-                const float sa = s_as[kb];       // m == 1
                 const int j = kb * 32 + lane;
-                acc += s_lut[ap[j]] * sa * (s_lut[row_s[j]] * sb);
+                // a32: s_af[j] already folds s_lut[ap[j]] * s_as[j>>5], so the
+                // per-element chain is one LDS.32 -> FMUL instead of
+                // LDS.8 -> LDS.32 -> FMUL -> FMUL.
+                acc += s_af[j] * (s_lut[row_s[j]] * sb);
             }
             __syncwarp();
         } else if (vec) {
@@ -1987,7 +2004,8 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     const int nb_k = k >> 5;
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
-        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float);
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        (size_t)k * sizeof(float);   // a32: the pre-decoded activation row
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;
