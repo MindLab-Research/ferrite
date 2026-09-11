@@ -46,6 +46,13 @@ prof() { # $1 = max_tokens, $2 = output tag
     -o "$OUT/$2" --force-overwrite=true \
     env CUDA_VISIBLE_DEVICES="$GPUS" DSV41_MODEL_DIR="$MODEL_DIR" DSV41_KERNELS="$KERNELS" \
     DSV41_AR_V5=0 DSV41_GRAPH_STEP=0 \
+    # Both pins are load-bearing and must stay: with the graph on, ar_v5 is forced on
+    # (a host barrier is not a CUDA call and cannot be captured), and the v5 publish
+    # spin under nsys's per-node graph tracing is a documented 300x pathology - 240 s
+    # for 69 steps. The per-kernel costs are identical in both modes, so this is the
+    # only usable attribution configuration; subtract ~1500-2000 launches x
+    # (3.05 us standalone - 0.2 us in-graph) to read the graph-on step. \
+
     "$BIN" --prompt "$PROMPT" --max-tokens "$1" --tp 8 >"$OUT/$2.log" 2>&1 || true
   grep -E "DECODE|\[dsv41\] step" "$OUT/$2.log" | tail -3 || true
   # CSV, never the table (kernel names contain spaces)

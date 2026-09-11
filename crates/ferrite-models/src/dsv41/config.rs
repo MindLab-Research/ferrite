@@ -475,7 +475,7 @@ impl Dsv41Config {
     /// The released config, used by tests and by the weights loader when it
     /// needs the production geometry without a checkpoint present.
     pub fn production() -> Self {
-        let json = include_str!("../configs/dsv41_flash.json");
+        let json = include_str!("../../configs/dsv41_flash.json");
         Self::from_json_str(json).expect("bundled production config must parse")
     }
 }
@@ -580,7 +580,7 @@ mod tests {
     #[test]
     fn flat_reference_config_parses() {
         // the layout shipped in inference/config.json (no nesting)
-        let json = include_str!("../configs/dsv41_reference_flat.json");
+        let json = include_str!("../../configs/dsv41_reference_flat.json");
         let c = Dsv41Config::from_json_str(json).unwrap();
         assert_eq!(c.dim, 5120);
         assert_eq!(c.n_layers, 40);

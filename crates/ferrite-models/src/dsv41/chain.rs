@@ -444,6 +444,9 @@ pub struct LayerHostWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Pre-existing latent gap: the module scope only imports `Dsv41Config`,
+    // this test also needs the `KvMode` enum.
+    use crate::dsv41::KvMode;
 
     #[test]
     fn msd_layers_partition_correctly() {

@@ -81,8 +81,12 @@ fn no_bf16_widening_of_quantised_weights() {
 fn experts_are_never_computed_in_fp8() {
     // User directive: the routed experts are fp4 in the checkpoint and must run
     // on fp4 tensor cores (NVFP4 / MXFP4). No fp8 expert path may exist.
-    let abi = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels.rs"))
-        .expect("kernels.rs");
+    // The model sources moved to the shared `ferrite-models` crate; the ABI
+    // text check follows them there (phase 5a of the engine consolidation).
+    let abi = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferrite-models/src/dsv41/kernels.rs"),
+    )
+    .expect("kernels.rs");
     for forbidden in [
         "dsv41_expert_gate_up_fp8",
         "dsv41_expert_down_fp8",
@@ -93,8 +97,10 @@ fn experts_are_never_computed_in_fp8() {
             "the fp8 expert path is forbidden (found {forbidden} in the ABI)"
         );
     }
-    let w = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/weights.rs"))
-        .expect("weights.rs");
+    let w = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferrite-models/src/dsv41/weights.rs"),
+    )
+    .expect("weights.rs");
     assert!(
         !w.contains("convert_expert_fp4_to_e4m3"),
         "the fp4 -> e4m3 re-encode (the fp8 path's enabler) must not come back"
@@ -156,7 +162,7 @@ fn native_formats_are_the_abi_types() {
     // for the weights themselves (which is how a dequantising interface would
     // look).
     let abi = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("src/kernels.rs"),
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../ferrite-models/src/dsv41/kernels.rs"),
     )
     .expect("kernels.rs");
     for fn_name in [
