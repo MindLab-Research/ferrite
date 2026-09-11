@@ -477,6 +477,21 @@ accept/commit 按「一个 seq 的 n 个 token」索引）。批量场景下多 
 `cp.async.cg.shared.global` → `cp.async.cg.shared.global.L2::128B`（对顺序流的专家权重提高
 L2 预取粒度）：per-seq 59.3-59.8 → **59.2-60.3**（略优），replay 989.5-991.1，文本正确。保留。
 
+### 待实测：expert gateup 的 cp.async 权重先行（`DSV41_GATEUP_CPASYNC`，默认 ON，2026-09-11）
+
+gemv P3（`DSV41_GEMV_CPASYNC`，见 inventory-v3 §0.6）的 expert 侧复制：`expert_gemv_fp4_batched_kernel`
+的 FUSED gate/up body 每 warp 一行、按 512 B 的 k-group 走，**第一组权重的 LDG 原本在 prologue
+barrier 之后**，无遮盖。现改为：prologue 里每 lane 发 1 条 `cp.async.cg` 16 B（把 warp 的
+group 0 = gate 256 B + up 256 B 拷进新增 per-warp 槽），激活 staging 与其重叠，
+`wait_prior(0)` 落在既有 `__syncthreads()` 之前 ⇒ dot 前完成。
+
+- 成本：+512 B/warp（rows=8/ksplit=2 ⇒ 8 KB/CTA）；默认形状线程受限 ⇒ **占用率不变**。
+- **只买得起第一组**：整行 5 KB/warp = 80 KB/CTA 会把占用率换掉（自付费，勿做）。
+- 位一致：同字节/同偏移/同顺序。⚠️ plain 布局 16 B 块 > 单 lane 8 B 读 ⇒ 消费者 lane ≠
+  拷贝 lane，必须靠 barrier 发布（不能只 `__syncwarp`）。
+- ⚠️ `.cu` 改动后必须 `build.sh 103a` 重编 `.so`（build-id 门禁）。
+- A/B：`DSV41_GATEUP_CPASYNC=1`（默认）vs `=0`，同窗口，人眼文本 + nsys 该核每步 ms。
+
 ### 有效：sparse_attn TG 8→4 重做成功（配 4 车道 gmask，+0.4%）
 
 之前 TG=4 挂起的**真正原因**是 `gmask = 0xffu << ((tid & 31) & ~7u)`（8 车道掩码）没同步改成

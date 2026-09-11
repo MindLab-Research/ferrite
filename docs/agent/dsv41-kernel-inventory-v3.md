@@ -621,6 +621,37 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
      ⚠️ `.cu` 改动后必须 `.so` 重编，否则运行期 build-id 门禁拒启。
    - 预期（分析口径）：~2-3µs/call × 246 call ⇒ −0.5~0.7ms。**待 user 亲自单轮 A/B**：
      `DSV41_GEMV_CPASYNC=1`（默认）vs `=0`，同窗口，文本 + nsys `gemm_fp8_gemv` 每步 ms。
+0.58 **P4 cp.async 权重先行 —— expert gateup 版（2026-09-11 已落地代码，待实测）**：
+   同一个 prologue 串行问题的 expert 侧复制。`expert_gemv_fp4_batched_kernel<ILV>` 的
+   prologue = LUT(256 项) → `cudaGridDependencySynchronize()` → 激活 staging（uint4 解码）
+   → `__syncthreads()` → row loop；**FUSED gate/up body 每 warp 一行、按 `k>>9` 个 512 B
+   group 走**，group 0 的权重 LDG 就落在 barrier 之后、自己的 dot 之前，没有任何东西遮盖它。
+   - **实现**：env **`DSV41_GATEUP_CPASYNC`**（默认 ON，`=0` 回退）→ host gate
+     `dsv41_gateup_cpasync()` → **新增末位 kernel 参数 `pf`**（3 个 launch 点全部接线：
+     gateup 的 ILV/非 ILV 传 `fuse && gate`，down batched 传 0）→ 内核 prologue 在
+     `cudaGridDependencySynchronize()` 之后、激活 staging 之前，每 lane 发 **1 条
+     `__pipeline_memcpy_async(...,16)`（cp.async.cg）**，把该 warp 的 group 0（512 B =
+     gate 256 B + up 256 B，ILV 时是一整块 512 B）拷进新增 per-warp 槽 `s_pf`；
+     循环内 `from_pf = pf_ok && (row == row_base) && (g2 == g_begin)` 时改从 smem 读
+     （plain：gate 在 `+lane*8`、up 在 `+256 + lane*8`；ILV：`uint4` 在 `+lane*16`）。
+   - **smem 布局耦合（新）**：`s_pf` 夹在 `s_lut2` 与 `s_ks` 之间，大小 `nwarps*512 B`
+     （rows=8/ksplit=2 时 8 KB）。launcher 的 `smem` 公式与内核的
+     `s_pf/s_ks` 指针**必须同时改** —— 同 §0.55 的布局耦合教训，错一边就整体平移越界。
+   - **不整行 staging**：整行 5 KB/warp（rows=8/ksplit=2 ⇒ 80 KB/CTA）会把占用率换掉，
+     正是 gemm-prologue-overlap 分析里判定为"自付费"的那条路；这里只买得起 prologue
+     能覆盖的那 512 B。默认形状 CTA 是**线程受限**（512 线程、4 CTA/SM），8 KB 不损占用。
+   - **逐位等价**：同字节、同 lane 偏移、同消费顺序，只有"从哪块内存读"变了。⚠️ plain
+     布局下 16 B 的拷贝块宽于单 lane 的 8 B 读 ⇒ 消费者 lane ≠ 拷贝 lane，故 `wait` 必须是
+     每线程 `wait_prior(0)` 且**紧跟既有的 pre-loop `__syncthreads()`**（由 barrier 发布），
+     不能只依赖 lane 内顺序。
+   - ⚠️ 风险：① 16 B 对齐是 cp.async.cg 的硬要求，代码里带运行时守卫（与 gemv scale 行的
+     err-716 教训同源），未对齐就不发（自动退回 gmem 读）；② `pf_ok/pf_slot/row_base/g_begin`
+     跨整个 prologue 存活（+1~2 寄存器），`__launch_bounds__(1024)` 的 64 regs 上限只会
+     spill 不会 701，需 cuobjdump 复看；③ 收益上界 = 激活 staging 的时长（~1-3µs 量级），
+     **不是** task 里的 −0.16ms 那种量级——那只在"整行先行"下才成立，而整行会被占用率吃回去。
+   - 验证：本机无 nvcc（`cargo check -p ferrite-models` 通过；`.cu` 需远端 `build.sh 103a`
+     重编，⚠️ 不重编 `.so` 会被 build-id 门禁拒启）。A/B：`DSV41_GATEUP_CPASYNC=1`（默认）
+     vs `=0`，同窗口，人眼文本 + nsys `expert_gemv_fp4_batched_kernel` 每步 ms。
 0.55 **P1 staged gate 的落地修正（2026-09-12）**：`6fc9a1a` 引入的 `DSV41_GEMV_A32_STAGED`
    当时只写了**调用**（`a32_direct = ... && !dsv41_gemv_a32_staged();`），该函数在全仓库
    **没有任何定义**（内核里也不能读 env）⇒ HEAD 的 `.cu` 实际**编不过**，且即便编过，

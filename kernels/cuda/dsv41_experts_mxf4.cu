@@ -2169,7 +2169,7 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
             expert_gemv_fp4_batched_kernel<false>, grid, dim3(block_threads), smem, stream, nullptr,
             0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
             w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride,
-            ids, g_expert_fp4_mode, fuse, ksplit);
+            ids, g_expert_fp4_mode, fuse, ksplit, pf);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
