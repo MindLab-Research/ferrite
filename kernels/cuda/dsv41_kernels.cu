@@ -1235,7 +1235,18 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const uint8_t* __restrict__ w,
                                      const uint8_t* __restrict__ w_scale,
                                      const float* __restrict__ bias,
-                                     float* __restrict__ out, int n, int k, int vec) {
+                                     float* __restrict__ out, int n, int k, int vec,
+                                     // Second family: rows [n1, n1+n2) of the same input.
+                                     // A single-family launch passes n1 == n and leaves
+                                     // the family-2 pointers untouched, so every row maps
+                                     // to family 1 and the behaviour is exactly the old
+                                     // kernel's. Both families share the staged activation,
+                                     // which is the point: two projections that read the
+                                     // same vector become one launch and one staging.
+                                     const uint8_t* __restrict__ w2 = nullptr,
+                                     const uint8_t* __restrict__ w2_scale = nullptr,
+                                     const float* __restrict__ bias2 = nullptr,
+                                     float* __restrict__ out2 = nullptr, int n1 = 0) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -1270,9 +1281,27 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         __syncthreads();
     }
     for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
-        const uint8_t* wr = w + (size_t)row * k;
-        const int srow = row >> 5;               // 32x32 block scale row
-        const uint8_t* wsr = w_scale + (size_t)srow * nb_k;
+        // Family dispatch: rows below n1 belong to the first projection, the rest
+        // to the second. Each row is still one warp walking the same lane order,
+        // so both dots are bit-identical to two separate launches.
+        int rrow;
+        const uint8_t* wr;
+        const uint8_t* wsr;
+        const float* bias_;
+        float* out_;
+        if (row < n1) {
+            rrow = row;
+            wr = w + (size_t)rrow * k;
+            wsr = w_scale + (size_t)(rrow >> 5) * nb_k;
+            bias_ = bias;
+            out_ = out;
+        } else {
+            rrow = row - n1;
+            wr = w2 + (size_t)rrow * k;
+            wsr = w2_scale + (size_t)(rrow >> 5) * nb_k;
+            bias_ = bias2;
+            out_ = out2;
+        }
         float acc = 0.f;
         if (vec >= 3) {
             // Order-preserving staging. The row is fetched with sixteen-byte loads
@@ -1334,7 +1363,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-        if (lane == 0) out[row] = acc + (bias ? bias[row] : 0.f);
+        if (lane == 0) out_[rrow] = acc + (bias_ ? bias_[rrow] : 0.f);
     }
 }
 
@@ -1378,7 +1407,8 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
             if (e != cudaSuccess) return (int)e;
         }
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
-                                                              k, g_gemv_fp8_mode);
+                                                              k, g_gemv_fp8_mode, nullptr, nullptr,
+                                                              nullptr, nullptr, n);
         return (int)cudaGetLastError();
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
