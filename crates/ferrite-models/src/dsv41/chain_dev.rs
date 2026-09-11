@@ -2297,7 +2297,12 @@ fn hc_tail_split() -> bool {
             q_roped = norm_fused;
         }
         self.s.qr_raw.set(norm_fused);
-        if !norm_fused {
+        if norm_fused {
+            // No `rmsnorm_q` ran on this path, so there is no fused fp8 emission
+            // to consume - and a stale `true` left by an earlier layer would make
+            // some later `quant1(qr)` silently skip its launch.
+            self.s.xq_of_qr_valid.set(false);
+        } else {
             // T2 (attention side): the rmsnorm epilogue can emit the fp8 of its OWN
             // normalised output (`ferrite_rmsnorm_q`), which is exactly what the
             // wq_b projection's quant1(qr) - the very next qr consumer - would

@@ -6261,3 +6261,16 @@ swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
 
 **在飞三项**（dots→pubred −0.12 + rmsnorm 融合 −0.13 + o-rope→attn −0.10）→ 全落地
 ~7.9ms ≈ 127 tok/s。
+
+### 下一个 spawn 候选：注意力双链并行（fork/join 模式的延伸，−0.42ms 预期）
+
+**发现（2026-09-11 深夜）**：lin2（wq_a+wkv mx2）之后有两条**相互独立**的链，在 sparse_attn 汇合：
+- **链 A（q 侧）**：rmsnorm_q(qr) → wq_b(qr) → q_rope（已融合）→ q 就绪 ≈ 13.5µs
+- **链 B（kv 侧）**：rmsnorm_rope(kv) → kvb(kv) → kv 就绪 ≈ 10.6µs
+- 当前串行：24.1µs → 并行（fork/join 同 tail split 模式）：max(13.5, 10.6) = 13.5µs
+- **预期：−10.6µs × 40 层 = −0.42ms**
+
+实施：lin2 之后 fork（event）→ 链 B 走 side stream → sparse_attn 前 join。
+与 tail split 的 fork/join 基建（devrt.rs 的 side_stream/fork_ev/join_ev）同款——可能需要
+第二个 side stream 或复用（tail_late 与 kv 链的时间窗不重叠：tail_late 在投影期间，
+kv 链在投影的开头——需确认时序）。

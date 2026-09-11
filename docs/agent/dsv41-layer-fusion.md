@@ -197,6 +197,40 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     **教训**：`Option<unsafe extern "C" fn(...)>` 的参数顺序是手写转录，编译器不会对着 `.cu` 校验；
     新符号的 FFI 类型必须逐参对照 C 原型（本仓库主流约定是 stream 放最后，只有带 C++ 默认尾参的
     `dsv41_gemm_fp8_mx` 例外）。修复：device.rs 两处 fn 类型与两处调用把 `self.stream` 移到末尾。
+- **✅ rmsnorm_q + wq_b gemv 的生产者/消费者融合（DSV41_NORM_FUSE，默认 ON）** ✓（2026-09-11，待上机 parity）：
+  新的 C 符号 `dsv41_gemm_fp8_mx_rope_norm`（`dsv41_kernels.cu`，紧跟 `dsv41_gemm_fp8_mx_rope` 之后）
+  把 `rmsnorm_q_kernel` 的 **norm + fp8 encode** 搬进 `gemm_fp8_gemv_kernel` 的 **prologue**
+  （`if (qr_raw != nullptr)` 分支），消费点自己做生产：每 block 用
+  `blockDim` 跨步循环 + `__shfl_down_sync` 树 + thread0 汇总算出 `inv`，再逐元素
+  `v = qr_raw[i]*inv*qr_w[i]` → warp 内 `__shfl_xor_sync` 求 32-block amax →
+  `fmaxf(fast_round_scale(am,1/448),1e-30)` → clamp ±448 → `__nv_fp8_e4m3`，直接写进 smem 的
+  `s_a`(字节) / `s_as`(scale)。之后原有的 a32 物化（`s_af[i] = s_lut[s_a[i]] * s_as[i>>5]`）与
+  GEMV 主循环一字不改 ⇒ wq_b 输出 = `rmsnorm_q + gemm_fp8_mx_rope` 的输出。
+  - **为什么改 grid 形态为 0**：融合点只是 prologue，`blocks = n/32`、32 warps/block 与 rope
+    launcher 完全相同，行循环与 epilogue 未动。
+  - **两块开销**：每 block 多读 k=1280 个 f32 + 一次 1280 元素归约；wq_b 的 grid 是 64 block
+    （n=2048/32），共 ~82K 元素读取 + 归约，GPU 上 <1µs，可忽略（**不是**原分析里的
+    "2048 blocks × 1280"——请以此处 Grid 数为准）。
+  - **两条强约束**（launcher 强制，违反则返回 1 → Rust 回退旧双 launch 对）：
+    ① block 必须 32 warps，因为归约树要跟 1024-thread 的 `rmsnorm_q_kernel` 逐位对齐；
+    ② mode 强制为 4（唯一把 activation 留在 smem 的模式），**`DSV41_GEMV_FP8_MODE` 对该符号无效**。
+  - Rust：`device.rs` 的 `supports_gemm_fp8_norm()` + `gemm_fp8_mx_rope_norm()`；
+    `chain_dev.rs` 的 `lin_rope_norm()`，`attention()` 的 wq_b 调用点（`norm_fused`/`q_roped`）
+    与 `indexer()` 的 idx_wq_b 调用点。收益 = 每步省 40 次 `rmsnorm_q` launch（nsys v5: 0.13ms）
+    + 40 个图节点。
+  - ⚠️ **`qr` 在该路径上保持 RAW**：融合是把 norm 推迟到消费者，所以 `qr` 不再被原地归一化。
+    凡在 wq_b 之后读 `qr` 的地方都必须走同一个融合 launch —— 目前只有 `indexer()` 的 idx_wq_b
+    （`DSV41_IDX_FUSE` 默认为 **OFF**：`idx_fuse()` 是 `.unwrap_or(false)`，旧注释与 STATUS 里
+    "默认 ON" 是**过期**描述；只有 IDX_FUSE=ON 时两族 launch 共用一个 `xq`，才不可能让 `qr` 变 raw）。
+    协调用的 one-shot Cell 是 `Scratch::qr_raw`：`attention()` 每条路径都写它，`indexer()` 消费并清零；
+    idx_wq_b 侧若融合 launch 意外 decline，会先补一次 `rmsnorm(qr)` 再走旧 `quant1` 路径（防御）。
+    另：融合路径下 `xq_of_qr_valid` 显式清 0，避免残留 `true` 让后续某个 `quant1(qr)` 静默跳过。
+  - 回退：`DSV41_NORM_FUSE=0`，或老 `.so`（`ko!` 符号探测自动回退）。
+  - ⚠️ **唯一未在无 GPU 环境验证的点**：`--use_fast_math` 下 prologue 的 `ss += t*t` 归约链
+    与 `rmsnorm_q_kernel` 是否仍逐位一致（同 TU、同表达式、同 blockDim ⇒ 预期一致；但
+    build.sh 已明确警告 fast-math 可重结合，长内核的 unroll/双累加器可能改变顺序）。
+    上机时先做一次 parity（`DSV41_NORM_FUSE=1` vs `=0` 的 text/fingerprint 对比），不一致立即
+    以 `=0` 回退。**改动只落在 gemv 段与 rmsnorm_q 相关区域，未碰 hc（:3700+）/sparse（:2839+）段。**
 - **`gateup_fused` 曾与 `.cu` 融合条件不一致（已修复 2026-09-11）** ✗→✓：Rust 侧原来只判
   `DSV41_GATEUP_FUSE` + `supports_gateup_fuse()`，漏了 `.cu:1367` 的 `g_expert_fp4_mode == 2`。
   当 `DSV41_EXPERT_FP4_MODE=0/1` 时 kernel 写满 `2*inter` 不融合，而 host 仍按融合推进
