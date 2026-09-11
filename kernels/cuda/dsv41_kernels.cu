@@ -1773,7 +1773,30 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      //     still being staged by blocks that start late, so the
                                      //     fp8 output needs its own buffer.
                                      uint8_t* __restrict__ xq = nullptr,
-                                     float* __restrict__ xsc = nullptr) {
+                                     float* __restrict__ xsc = nullptr,
+                                     // RoPE fusion (q rope / idx_q rope of the DSV4.1
+                                     // attention): a non-null `rope_cos` makes the
+                                     // epilogue rotate the trailing `rope_rd` lanes of
+                                     // every head in THIS launch's rows, replacing the
+                                     // standalone apply_rope. The pair (2i, 2i+1) of one
+                                     // head always lands on two ADJACENT warps - the head
+                                     // width is a multiple of 32 and the pair start is
+                                     // even - so the pair head reads the tail warp's
+                                     // staged row from the B1 `s_rows` slot after a
+                                     // barrier. `rope_hd1`/`rope_hd2` are the head widths
+                                     // of the two families (0 = do not rotate that family);
+                                     // `rope_base` is the DEVICE position counter, the
+                                     // same `*base * mul + off + h * step` the rope kernel
+                                     // evaluates. The rotated value is the very same
+                                     // `v = acc + bias` f32 the rope kernel would have
+                                     // read back, and the arithmetic is its expression
+                                     // verbatim, so the result is bit-identical.
+                                     const float* __restrict__ rope_cos = nullptr,
+                                     const float* __restrict__ rope_sin = nullptr,
+                                     const int* __restrict__ rope_base = nullptr,
+                                     int rope_mul = 0, int rope_off = 0, int rope_step = 0,
+                                     int rope_inverse = 0, int rope_rd = 0, int rope_hd1 = 0,
+                                     int rope_hd2 = 0) {
     // Read the round ONCE, like p2p_ar_store_v5_kernel (ferrite_kernels.cu). When
     // the table is null this is a no-op (epoch is null too) and the kernel is the
     // old one bit for bit.
@@ -1998,8 +2021,48 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // B1: hand this row to the block-level quant epilogue below. `v` is
             // the same register value the f32 store just wrote, so the byte the
             // epilogue encodes is exactly what quant_kernel would have read back
-            // from `out` (no second global round trip, no re-read).
-            if (xq != nullptr) s_rows[warp] = v;
+            // from `out` (no second global round trip, no re-read). The rope
+            // fusion reads it the same way: `v` IS the value apply_rope would have
+            // loaded back from `out`, so `s_rows` doubles as the rope exchange slot
+            // (the two consumers are mutually exclusive - see the launcher).
+            if (xq != nullptr || rope_cos != nullptr) s_rows[warp] = v;
+        }
+    }
+    // RoPE fusion epilogue: the block's 32 warps produced 32 CONSECUTIVE rows
+    // (`row == blockIdx.x * nwarps + warp`, guaranteed by grid*nwarps == n), and a
+    // rope pair (2i, 2i+1) of one head always sits on two ADJACENT warps: the head
+    // width is a multiple of 32 and the pair start is even, so a pair never
+    // straddles a block. The pair-head warp (even lane offset) reads the tail
+    // warp's staged row from `s_rows` and rotates both elements in its lane-0
+    // epilogue. `v = acc + bias` is exactly the f32 apply_rope_kernel read back
+    // from `out`, and the expression below is its rotation verbatim, so the result
+    // is bit-identical to the standalone launch it replaces.
+    if (rope_cos != nullptr) {
+        __syncthreads();   // every warp has staged its v into s_rows
+        const int e = blockIdx.x * nwarps + warp;
+        const int roff = (e < n1) ? 0 : n1;
+        const int rhd = (e < n1) ? rope_hd1 : rope_hd2;
+        if (rhd > 0) {
+            const int re = e - roff;
+            const int h = re / rhd;
+            const int lane_in = re % rhd;
+            const int sect = rhd - rope_rd;
+            // warp + 1 < nwarps: the launcher forces nwarps == 32 (the pair never
+            // straddles a block, so warp 31 is never a pair head); the guard only
+            // protects the slot against a mis-shaped launch.
+            if (warp + 1 < nwarps && lane_in >= sect && ((lane_in - sect) & 1) == 0) {
+                const float x0 = s_rows[warp], x1 = s_rows[warp + 1];
+                const int i = (lane_in - sect) >> 1;
+                const int t = (*rope_base) * rope_mul + rope_off + h * rope_step;
+                const float c = rope_cos[(size_t)t * (rope_rd >> 1) + i];
+                const float s =
+                    rope_sin[(size_t)t * (rope_rd >> 1) + i] * (rope_inverse ? -1.f : 1.f);
+                if (lane == 0) {
+                    float* rout = (e < n1) ? out : out2;
+                    rout[re] = x0 * c - x1 * s;
+                    rout[re + 1] = x0 * s + x1 * c;
+                }
+            }
         }
     }
     // B1 epilogue: the block's 32 warps produced the 32 CONSECUTIVE rows that
@@ -2107,6 +2170,100 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     if (staging_tbl != nullptr) return (int)cudaErrorInvalidValue;
     dim3 grid((n + 63) / 64, (m + 15) / 16);
     gemm_fp8_kernel<<<grid, 128, smem, s>>>(a, a_scale, w, w_scale, bias, out, m, n, k);
+    return (int)cudaGetLastError();
+}
+
+// RoPE fusion of the M=1 GEMV (see gemm_fp8_gemv_kernel's rope args). A SEPARATE
+// entry point, not a new parameter on dsv41_gemm_fp8_mx: that symbol has one
+// fixed ABI and six call sites, so the rope form gets its own name and the
+// stale-.so fallback stays a plain symbol probe (supports_rope_fuse on the Rust
+// side). The whole q/idx_q rope shape is M=1 decode, so this declines (returns 1)
+// for anything the fused epilogue cannot do, and the caller keeps the
+// (gemm_fp8_mx, apply_rope) pair.
+//
+// Shape requirements, all checked here: n % 32 == 0 (one block per 32 rows, the
+// pair never straddles a block), rope_hd % 32 == 0, rope_rd positive and even,
+// rope_rd <= rope_hd, and g_gemv_fp8_mode >= 3 (the s_rows staging needs dynamic
+// shared memory, which modes 0/1 do not allocate). The block is raised to 32
+// warps and the grid becomes n/32, exactly like B1 - that is what makes
+// `e = blockIdx.x * nwarps + warp` the row index for every warp.
+extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, const uint8_t* w,
+                                      const uint8_t* w_scale, const float* bias, float* out, int n,
+                                      int k, const float* rope_cos, const float* rope_sin,
+                                      const int* rope_base, int rope_mul, int rope_off,
+                                      int rope_step, int rope_inverse, int rope_rd, int rope_hd,
+                                      cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 1;
+    if (g_gemv_fp8_mode < 3) return 1;
+    if ((n & 31) || rope_rd <= 0 || (rope_rd & 1) || rope_hd <= 0 || (rope_hd & 31) ||
+        rope_rd > rope_hd)
+        return 1;
+    const int warps = 32;
+    const int blocks = n / 32;
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+    const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                                                  : (size_t)0;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
+        nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
+        rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd, 0);
+    return (int)cudaGetLastError();
+}
+
+// RoPE fusion of the TWO-family M=1 GEMV (dsv41_gemm_fp8_mx2's rope form). Both
+// families carry their own head width (`rope_hd1` for family 1, `rope_hd2` for
+// family 2) because the wq_b / idx_wq_b pair has different head widths (512 and
+// 128) but the SAME rope length, cos/sin table and position counter. Everything
+// else is shared with dsv41_gemm_fp8_mx_rope; the pair never straddles the family
+// boundary because n1 and the head width are multiples of 32 and a pair start is
+// even. Returns 1 (decline) on any shape the fused epilogue cannot do.
+extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, const uint8_t* w1,
+                                       const uint8_t* w1_scale, const float* bias1, float* out1,
+                                       int n1, const uint8_t* w2, const uint8_t* w2_scale,
+                                       const float* bias2, float* out2, int n2, int k,
+                                       const float* rope_cos, const float* rope_sin,
+                                       const int* rope_base, int rope_mul, int rope_off,
+                                       int rope_step, int rope_inverse, int rope_rd, int rope_hd1,
+                                       int rope_hd2, cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv || n1 <= 0 || n2 <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    if (rope_cos == nullptr || rope_sin == nullptr || rope_base == nullptr) return 1;
+    if (g_gemv_fp8_mode < 3) return 1;
+    if (((n1 | n2) & 31) || rope_rd <= 0 || (rope_rd & 1)) return 1;
+    if (!(rope_hd1 > 0 && (rope_hd1 & 31) == 0 && rope_rd <= rope_hd1)) return 1;
+    if (!(rope_hd2 > 0 && (rope_hd2 & 31) == 0 && rope_rd <= rope_hd2)) return 1;
+    const int n = n1 + n2;
+    const int warps = 32;
+    const int blocks = n / 32;
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+    const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                                                  : (size_t)0;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
+        n1, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base,
+        rope_mul, rope_off, rope_step, rope_inverse, rope_rd, rope_hd1, rope_hd2);
     return (int)cudaGetLastError();
 }
 
@@ -3990,5 +4147,298 @@ extern "C" int dsv41_hc_front_persist(const float* x, const float* hc_fn, const 
     hc_pre_persist_kernel<<<(unsigned)rows, 1024u, smem, s>>>(
         x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32,
         w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, hc_dim, mix);
+    return (int)cudaGetLastError();
+}
+
+// ============================================================================
+// Stage C persistent, MULTI-BLOCK form (docs/agent/dsv41-persistent-arch.md §1):
+// the whole hc front end in ONE launch, with the dots SPREAD instead of pinned
+// to a single SM. This is the shape the segment kernels (P2) will scale up; the
+// single-block prototype above proved the phase-machine mechanism, not the
+// performance.
+//
+// WHY THE SINGLE BLOCK WAS THE WRONG SHAPE (measured, not assumed). The
+// two-launch dots run grid = (mix=24, 1) blocks, each staging x + one weight row
+// = 160 KiB through cp.async, and measure 3.93 MiB / 7.4 us = 531 GB/s, i.e.
+// 22 GB/s per ACTIVE SM. DRAM is not the ceiling - the 1.92 MB of weights is
+// 0.6 us at 3 TB/s - the ceiling is the per-SM in-flight window: an SM keeps
+// only ~20 KiB of cp.async outstanding, so ONE 160 KiB block costs ~8 serial
+// DRAM latencies (~7 us), and 24 such blocks give 24 x 20 KiB / ~0.7 us ~
+// 690 GB/s. Bytes per block is what must shrink, and only a K-split shrinks it:
+// at split = 8 every block stages hc_dim/8 x 2 x 4 B = 20 KiB (one window) and
+// `mix * split` blocks across 148 SMs reach ~4 TB/s, so the staging drops to
+// ~1 us. Splitting M is already maxed out (mix = 24 rows, one block each) and
+// splitting the dimension-wise ops does nothing for a reduction, so K is the
+// only axis left.
+//
+// ROLES, one grid, NO ticket and NO spin (the hc-merge lesson):
+//   bid in [0, mix*split)          dot block: one (projection row, K chunk)
+//   bid == mix*split               collapse block: collapse + rmsnorm + fp8
+//   the LAST dot block to publish  tail block: ss + mixes + sigmoid + sinkhorn
+// The tail is not polled for. Each dot block publishes g_hc_part, fences, and
+// bumps the per-row counter; the block that sees the final count runs the tail.
+// Every other block falls off the end. Nobody holds an SM hostage waiting, which
+// is what made hc_front_kernel's ticket spin cost +3.2 ms/step.
+//
+// The collapse is a SEPARATE block because it does not depend on the dots: it
+// reads x and `pre_collapse` (deliberately NOT the slot the mixes write), so it
+// runs in parallel with the staging instead of after the tail.
+//
+// NUMERICS. This shape is BIT-EXACT at split = 1 only: the chunk is then the
+// whole row and the dot is hc_mix_dots_kernel's lane chain, statement for
+// statement. split = 1 exists so the machinery has a parity target against the
+// two-launch path. Any split > 1 splits the reduction, and the partials are
+// recombined in ck-ascending order, which is NOT the single warp's tree sum: it
+// is deterministic but not bit-identical, and needs a tolerance test plus the
+// same-binary A/B token gate. §1 states the same constraint: "split must be 1".
+// ============================================================================
+#define DSV41_HC_MB_MAXS 8          // g_hc_part's ck dimension is the ceiling
+
+// Per-row publication counter for the tail election. Same .bss lifetime as
+// g_hc_part (zero-initialised at module load); the elected tail block RESETS it
+// to 0 after its last g_hc_part read, so the next launch (or graph replay)
+// starts clean - the same discipline g_hc_ticket uses.
+__device__ unsigned g_hc_mb_done[DSV41_HC_SPREAD_MAXR];
+
+__global__ void hc_pre_persist_mb_kernel(const float* __restrict__ x,
+                                         const float* __restrict__ hc_fn,
+                                         const float* __restrict__ hc_scale,
+                                         const float* __restrict__ hc_base,
+                                         float* __restrict__ pre, float* __restrict__ post,
+                                         float* __restrict__ comb, int hc, int dim,
+                                         int sinkhorn_iters, float eps,
+                                         const float* __restrict__ w_norm,
+                                         const float* __restrict__ pre_collapse,
+                                         float* __restrict__ out, float eps_norm,
+                                         uint8_t* __restrict__ xq, float* __restrict__ xsc,
+                                         int hc_dim, int mix, int split) {
+    const int r = blockIdx.y;
+    const int bid = blockIdx.x;
+    const int ndot = mix * split;
+    const int ss_stride = mix * 32;
+    const int nwarp = ss_stride >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const float* xrow = x + (size_t)r * hc_dim;
+    extern __shared__ float mb_sm[];
+    __shared__ unsigned s_elected;
+    __shared__ float wpart[32];
+    __shared__ float sss;
+    __shared__ float p_mixes[64];
+    __shared__ float p_cm[64];
+    __shared__ float p_red[32];
+
+    if (bid < ndot) {
+        // ---------------- dot: one projection row over one K chunk ----------
+        const int m = bid % mix;        // m varies fastest so the `mix` blocks
+        const int ck = bid / mix;       // of a chunk share one x read (L2)
+        const int chunk = hc_dim / split;
+        const int lo = ck * chunk;
+        float* s_x = mb_sm;             // chunk floats, staged
+        float* s_w = mb_sm + chunk;     // chunk floats, this projection row
+        const int n4 = chunk >> 2;
+        const float4* xg = reinterpret_cast<const float4*>(xrow + lo);
+        const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim + lo);
+        float4* sx = reinterpret_cast<float4*>(s_x);
+        float4* sw = reinterpret_cast<float4*>(s_w);
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sx[i], &xg[i]);
+        dsv41_cp_commit();
+        for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sw[i], &wg[i]);
+        dsv41_cp_commit();
+        dsv41_cp_wait_all();
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            // hc_mix_dots_kernel's float4 three-accumulator lane chain, restricted
+            // to [lo, lo + chunk). At split == 1 this is that kernel's dot exactly.
+            float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+            int c = lane;
+            for (; c + 64 < n4; c += 96) {
+                const float4 w0 = sw[c], w1 = sw[c + 32], w2 = sw[c + 64];
+                const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
+                a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+                a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+                a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+            }
+            for (; c < n4; c += 32) {
+                const float4 w = sw[c], v = sx[c];
+                a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+            }
+            for (int k = (n4 << 2) + lane; k < chunk; k += 32) a0 += s_w[k] * s_x[k];
+            float acc = (a0 + a1) + a2;
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) g_hc_part[r][m][ck] = acc;
+        }
+        // Publish and elect. The writer of g_hc_part is threadIdx.x == 0 (warp 0,
+        // lane 0), so the release fence before the atomicAdd orders exactly that
+        // store; s_elected is block-uniform, so the branch below is uniform too.
+        if (threadIdx.x == 0) {
+            __threadfence();
+            s_elected = (atomicAdd(&g_hc_mb_done[r], 1u) == (unsigned)(ndot - 1)) ? 1u : 0u;
+        }
+        __syncthreads();
+        if (s_elected == 0u) return;    // no barrier follows on this path - safe
+    } else {
+        // ---------------- collapse: collapse + rmsnorm + fp8, one block ------
+        // dsv41_hc_collapse_norm_kernel's body at blockDim 1024 (the same tree and
+        // the same #pragma unroll 4 as the folded tail version), run in parallel
+        // with the dots because it does not read their output.
+        float* o_r = out + (size_t)r * dim;
+        float s2 = 0.f;
+#pragma unroll 4
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            float acc = 0.f;
+            for (int i = 0; i < hc; ++i)
+                acc = fmaf(pre_collapse[(size_t)r * hc + i], xrow[(size_t)i * dim + c], acc);
+            o_r[c] = acc;
+            s2 += acc * acc;
+        }
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);
+        if ((threadIdx.x & 31) == 0) p_red[threadIdx.x >> 5] = s2;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += p_red[i];
+            p_red[0] = rsqrtf(t / dim + eps_norm);
+        }
+        __syncthreads();
+        const float inv2 = p_red[0];
+        const int lane31 = threadIdx.x & 31;
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+            const float v = o_r[c] * inv2 * w_norm[c];
+            o_r[c] = v;
+            if (xq != nullptr) {
+                float a = fabsf(v);
+                for (int off = 16; off > 0; off >>= 1)
+                    a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+                const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+                if (lane31 == 0) xsc[c >> 5] = sc;
+                const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+                xq[c] = *(const uint8_t*)&f8;
+            }
+        }
+        return;                         // collapse path never reaches the tail
+    }
+
+    // ---------------- tail: run by the elected (last) dot block -------------
+    // Acquire: every other dot block stored g_hc_part BEFORE its release fence +
+    // atomicAdd, and this block observed the final count.
+    __threadfence();
+    {
+        // ss, hc_mixes_tail_kernel's ss_in == 0 branch. The per-warp partials
+        // group exactly as the dots kernel's replay did (residue m*32 + lane,
+        // stride mix*32), and warps >= nwarp are discarded, so the sum does not
+        // move when blockDim is 1024 instead of 768. That is what lets the K-split
+        // dots skip the ss replay entirely and still land on the same bits.
+        float ss = 0.f;
+        for (int c = threadIdx.x; c < hc_dim; c += ss_stride) ss += xrow[c] * xrow[c];
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+        if ((threadIdx.x & 31) == 0 && warp < nwarp) wpart[warp] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < (unsigned)nwarp) ? wpart[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sss / (float)hc_dim + eps);
+    for (int m2 = threadIdx.x; m2 < mix; m2 += blockDim.x) {
+        // The K partials in a FIXED ascending ck order: deterministic, but not
+        // the single warp's tree sum, hence not bit-exact for split > 1. The
+        // g_hc_part layout (and this order) is the spread path's, reused verbatim.
+        float a = 0.f;
+        for (int ck = 0; ck < split; ++ck) a += g_hc_part[r][m2][ck];
+        p_mixes[m2] = a * inv;
+    }
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(p_mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(p_mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        p_cm[jk] = p_mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int hh = hc * hc;
+        float c = (lane < hh) ? p_cm[lane] : 0.f;
+        float mx = c;
+        for (int off = 1; off < hc; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+        c = expf(c - mx);
+        float rs = c;
+        for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+        c = c / rs + eps;
+        for (int it = 0; it < sinkhorn_iters; ++it) {
+            if (it > 0) {
+                float st = c;
+                for (int off = 1; off < hc; off <<= 1)
+                    st += __shfl_xor_sync(0xFFFFFFFFu, st, off);
+                c = c / (st + eps);
+            }
+            float t = c;
+            for (int off = hc; off < hh; off <<= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+            c = c / (t + eps);
+        }
+        if (lane < hh) p_cm[lane] = c;
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
+        comb[(size_t)r * hc * hc + jk] = p_cm[jk];
+    // Reset LAST: the loop above was the final g_hc_part read of this row.
+    if (threadIdx.x == 0) atomicExch(&g_hc_mb_done[r], 0u);
+}
+
+// Multi-block entry (DSV41_HC_PERSIST_MB=1, Rust-gated). Same contract as
+// dsv41_hc_front_persist; a SEPARATE symbol so the two-launch path and the
+// single-block prototype stay byte-for-byte untouched and a stale .so simply
+// resolves it to None (the Rust side then keeps the older path).
+extern "C" int dsv41_hc_front_persist_mb(const float* x, const float* hc_fn,
+                                         const float* hc_scale, const float* hc_base,
+                                         const float* w_norm, const float* pre_collapse,
+                                         float* pre, float* post, float* comb, float* out,
+                                         int rows, int hc, int dim, int sinkhorn_iters,
+                                         float eps, float eps_norm, uint8_t* xq, float* xsc,
+                                         cudaStream_t s) {
+    if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
+        pre == nullptr || post == nullptr || comb == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    if (rows > DSV41_HC_SPREAD_MAXR) return (int)cudaErrorInvalidValue;
+    if ((w_norm == nullptr) != (pre_collapse == nullptr)) return (int)cudaErrorInvalidValue;
+    if (w_norm != nullptr && out == nullptr) return (int)cudaErrorInvalidValue;
+    const int mix = hc * (2 + hc);
+    if (mix > 64) return (int)cudaErrorInvalidValue;
+    const int hc_dim = hc * dim;
+    // K chunks: one dot block per (projection row, chunk). Default 8 - the widest
+    // g_hc_part carries - and the split must keep the chunk float4-aligned so the
+    // staged copy and the lane chain stay aligned. Read once: this launcher runs
+    // twice a layer.
+    static const int split = [] {
+        const char* e = getenv("DSV41_HC_PERSIST_MB_S");
+        if (e == nullptr) return DSV41_HC_MB_MAXS;
+        const int v = atoi(e);
+        return (v >= 1 && v <= DSV41_HC_MB_MAXS) ? v : DSV41_HC_MB_MAXS;
+    }();
+    if (hc_dim % (4 * split) != 0) return (int)cudaErrorInvalidValue;
+    const int chunk = hc_dim / split;
+    const size_t smem = (size_t)2 * (size_t)chunk * sizeof(float);
+    // The attribute is per-context, and a TP8 process has one context per rank,
+    // so set it EVERY call - the existing launchers carry the same warning.
+    cudaError_t e = cudaFuncSetAttribute(hc_pre_persist_mb_kernel,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();
+        return (int)e;
+    }
+    dim3 grid((unsigned)(mix * split + 1), (unsigned)rows);
+    hc_pre_persist_mb_kernel<<<grid, 1024u, smem, s>>>(
+        x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, w_norm,
+        pre_collapse, out, eps_norm, xq, xsc, hc_dim, mix, split);
     return (int)cudaGetLastError();
 }

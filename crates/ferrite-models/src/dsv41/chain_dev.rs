@@ -784,7 +784,9 @@ impl<'a> DevChain<'a> {
         })
     }
 
-    /// B1 (DSV41_WO_QUANT_FUSE, default on): let the wo_a gemv's epilogue emit
+    /// B1 (DSV41_WO_QUANT_FUSE, default OFF since round 35: the fused form's
+/// 32-warp/32-block launch shape loses 148->32 active SMs and measured +0.24ms
+/// in serve, outweighing the 40 saved quant1 launches; =1 re-enables).
     /// the fp8 row compression of its own output, so the `quant1(s.wo)` launch
     /// between the two projections disappears. The emitted (byte, scale) pair is
     /// `quant_kernel<0>`'s, term for term, so the model output is unchanged; "0"
@@ -792,7 +794,7 @@ impl<'a> DevChain<'a> {
     fn wo_quant_fuse() -> bool {
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *F.get_or_init(|| {
-            std::env::var("DSV41_WO_QUANT_FUSE").map(|v| v != "0").unwrap_or(true)
+            std::env::var("DSV41_WO_QUANT_FUSE").map(|v| v == "1").unwrap_or(false)
         })
     }
 
@@ -1424,11 +1426,36 @@ impl<'a> DevChain<'a> {
         xq: *mut u8,
         xsc: *mut f32,
     ) -> Result<bool> {
-        // Stage-C persistent prototype (DSV41_HC_PERSIST=1, default OFF): the
-        // whole front end as ONE phase-machine block instead of the two-launch
-        // dots+tail pair. Selected only when the .so carries the symbol; the
-        // fallback chain (persist -> two-launch -> hc_mixes) is unchanged.
-        let fused = if Self::hc_persist() && self.dev.supports_hc_persist() {
+        // Stage-C persistent forms, both default OFF and both selected only when
+        // the .so carries the symbol. `_MB` (multi-block) is tried first: same
+        // one-launch phase structure, but the dots are spread instead of pinned
+        // to one SM. The fallback chain is
+        // (persist_mb -> persist -> two-launch -> hc_mixes), each step silent.
+        let fused = if Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
+            self.dev.hc_front_persist_mb(
+                self.s.h.ptr as *const f32,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                norm_w,
+                pre_collapse,
+                self.premix_slot(pre_slot).ptr as *mut f32,
+                self.s.post.ptr as *mut f32,
+                self.s.comb.ptr as *mut f32,
+                out,
+                1,
+                hc as i32,
+                dim as i32,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+            )?
+        } else if Self::hc_persist() && self.dev.supports_hc_persist() {
+            // Stage-C persistent prototype (DSV41_HC_PERSIST=1, default OFF): the
+            // whole front end as ONE phase-machine block instead of the two-launch
+            // dots+tail pair.
             self.dev.hc_front_persist(
                 self.s.h.ptr as *const f32,
                 hc_fn,
@@ -1554,6 +1581,22 @@ fn hcpost_epi() -> bool {
 fn hc_persist() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_HC_PERSIST").map(|v| v != "0").unwrap_or(false))
+}
+
+/// Stage-C persistent MULTI-BLOCK gate (`DSV41_HC_PERSIST_MB=1`, default OFF):
+/// the same one-launch front end, but the dots spread over `mix * split` blocks
+/// (one per projection row and K chunk) with the collapse on a parallel block
+/// and the tail elected to the last-finishing dot block. This is the shape that
+/// fixes the single-block prototype's parallelism loss — see
+/// `docs/agent/dsv41-persistent-arch.md` §1. TAKES PRECEDENCE over
+/// `DSV41_HC_PERSIST`. DEFAULT OFF because split > 1 is deterministic but NOT
+/// bit-exact (the K partials recombine in ck order, not the single warp's tree),
+/// so it needs a tolerance gate plus the same-binary A/B token gate before it
+/// may be considered; split = 1 is bit-exact and exists as the parity target.
+/// A `.so` without the symbol silently keeps the older path.
+fn hc_persist_mb() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HC_PERSIST_MB").map(|v| v != "0").unwrap_or(false))
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {

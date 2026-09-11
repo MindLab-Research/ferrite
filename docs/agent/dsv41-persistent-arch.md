@@ -36,7 +36,7 @@
 
 | 阶段族 | 映射 | 依据 |
 |---|---|---|
-| hc 族（mixes/collapse/post） | 沿 hc_dim 分 tile，**T=64 → 320 blocks** | smem 给上界、并行度给下界，取 T=64（`dsv41-layer-fusion.md §3`：148 SM × 2 波） |
+| hc 族（mixes/collapse/post） | 逐元素算子沿 hc_dim 分 tile，**T=64 → 320 blocks**；**归约型 dots 只能沿 K(=hc_dim) 切 chunk** | smem 给上界、并行度给下界，取 T=64（`dsv41-layer-fusion.md §3`：148 SM × 2 波）。⚠️ **勘误（P1d 实测推导）**：tile 只对**逐元素**输出有效（collapse/post 的每个输出互相独立，切 tile 不改任何单个输出的归约顺序 ⇒ 逐位保持）；**dots 是 24 个标量、每个都是整条 hc_dim 的归约**，切 tile 只会把部分和打碎成 320×24 份，真正需要的是 **K-split**（每块做 K/split 的部分点积 + ck 升序合并）。24 个输出 ⇒ M 方向已用满（24 块），**K 是唯一剩下的轴** |
 | GEMM/GEMV 族 | 沿输出行 grid-stride | M=1 退化为 GEMV，复用 `gemv_fp8`/`gemv_bf16` 的 warp-per-row 范式（`dsv41_glue.cu:329`） |
 | sparse_attn | 沿 heads（nlh=8） | 复用 `sparse_attn_warp` 的 3 深预取 |
 | MoE | 沿 inter_local / 专家 slot | batched gate_up/down + **升序 slot** reduce（数值契约） |
@@ -88,6 +88,7 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 | **P1** | 段 C 融合：`hc_post` + `copy_h_back` → `hc_post_inplace`（省 80KB D2D ×2/层） | −0.15~0.25ms | 低（parity 既有） |
 | **P1b（已实施，env 默认关）** | `hc_post_inplace` 再折进**产生它 `x` 的那个 AR** 的 pubred epilogue（`DSV41_HCPOST_EPI=1`，核 `ferrite_p2p_ar_v5_hcpost`）：2 个 site/层 = 80~90 节点。这是"相邻两核合一"的第一步，也是段核的第一个可运行原型 | −0.15ms | 中（跨 CU 位级：epilogue 用显式 `__fmul_rn`/`__fmaf_rn`，须过 `ar_hcpost_parity.rs` + 同二进制 token 逐字 A/B） |
 | **P1c（已实施，env 默认关）** | **段核「相位机」机制原型**：`hc_pre` 的 dots+tail+collapse 合成**单块相位机**（核 `hc_pre_persist_kernel`，grid=(rows,)、block=1024、`DSV41_HC_PERSIST=1`，导出 `dsv41_hc_front_persist`）。无 ticket、无自旋——块内 4 个 phase 各一个 `__syncthreads`；点的 lane 分配/归约分组逐句照抄 ⇒ **逐位等价**（`hc_persist_parity.rs` 门禁）。**这是"段核 = 相位机"的第一个可运行证据，机制可复用** | 待测（**预期非收益**，见右） | ⚠️ **smem 放得下，并行度放不下**：两 launch 版把 x+1 个权重行(160KB)放进 24 个 block ⇒ 24-SM 并行（531GB/s，7.4µs）；单块装不下 24 个权重行(1.9MiB) ⇒ 24 行点积挤在 **1 个 SM**、权重走 global。**合并省 1 次 launch，但牺牲点积的块并行度 ⇒ 大概率持平或更慢，纯属机制+parity 原型**。真正的段核须用 §1 的「沿 hc_dim 分 tile，T=64 → 320 blocks」多块形态，不是 grid=(1,) |
+| **P1d（已实施，env 默认关）** | **段核多块形态**：`hc_pre` 仍为**一次 launch**，但 dots 沿 **K(=hc_dim) 切成 `split` 块**（核 `hc_pre_persist_mb_kernel`，grid=`(mix*split+1, rows)`、block=1024、`DSV41_HC_PERSIST_MB=1`，导出 `dsv41_hc_front_persist_mb`）。角色三合一：`bid<mix*split` 为一个 (投影行, K chunk) 做部分点积写 `g_hc_part[r][m][ck]`；`bid==mix*split` 是**并行** collapse 块（不依赖 dots）；**最后一个 publish 的 dot 块**被选举跑 tail（`atomicAdd` 计数，**无 ticket、无自旋**）。`split=8` ⇒ 192 个 dot 块。⚠️ **`split>1` 非逐位**（K 部分和按 ck 升序合并 ≠ 单 warp 树和），**`split=1` 逐位等价**于两 launch ⇒ 作为 parity 目标 | 待测（**预期收益**，见右） | ⚠️ 需容差门禁 + 同二进制 token A/B；`hc_dim % (4*split) != 0` 时返回 InvalidValue 静默回退 |
 | **P2** | 段 A 融合：hc 链 + attention 投影链一核，中间量留 smem；−6~8 launch/层 | −0.6~1.0ms | 中（hc 归约 / split=1） |
 | **P3** | 段 B 融合：MoE cooperative（gate→route→quant→gate_up→swiglu→down→reduce 一核，中间量留 smem） | −0.4~0.7ms | 中（slot 定序） |
 | **P4** | 跨层流水：ffn mixes 挪到 L+1 的 attn 段内下发，hc 的 ⟨B⟩ 半藏进 AR poll 窗口（PDL） | −0.3~0.5ms | 中 |

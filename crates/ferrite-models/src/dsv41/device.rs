@@ -58,6 +58,29 @@ struct Kernels {
         *const u8, *const u8, *const f32, *mut f32, c_int,
         c_int, CuStream,
     ) -> c_int,
+    /// RoPE fusion: the M=1 GEMV whose epilogue also rotates the trailing
+    /// `rope_rd` lanes of each head (`dsv41_apply_rope`'s rotation, term for
+    /// term). Optional: a stale `.so` has no entry and the caller keeps the
+    /// (gemm_fp8_mx, apply_rope) pair. Returns 1 when the shape cannot take it.
+    gemm_fp8_mx_rope: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, CuStream,
+            *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+        ) -> c_int,
+    >,
+    /// RoPE fusion for the two-family GEMV: family 1 rotates with `rope_hd1`,
+    /// family 2 with `rope_hd2` (the wq_b / idx_wq_b pair). Optional, like
+    /// `gemm_fp8_mx_rope`.
+    gemm_fp8_mx2_rope: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32,
+            *const u8, *const u8, *const f32, *mut f32, c_int,
+            *const u8, *const u8, *const f32, *mut f32, c_int,
+            c_int, CuStream,
+            *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+        ) -> c_int,
+    >,
     /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
     /// epilogue (`out += w @ a`). A separate symbol, so a stale `.so` simply has
     /// no entry and the caller keeps the gemm_fp8_mx + add_inplace pair. Returns
@@ -328,6 +351,21 @@ struct Kernels {
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
         ) -> c_int,
     >,
+    /// Stage-C persistent MULTI-BLOCK form: the same front end as
+    /// `hc_front_persist`, but the dots spread over `mix * split` blocks (one per
+    /// projection row and K chunk), the collapse on its own parallel block, and
+    /// the tail elected to whichever dot block finishes last — no ticket, no
+    /// spin. Same ABI and fallback contract. Bit-exact at split = 1; a tolerance
+    /// gate is required for split > 1 (see the kernel comment). Gated behind
+    /// `DSV41_HC_PERSIST_MB=1` (default OFF).
+    hc_front_persist_mb: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, *const f32, *const f32,
+            *const f32, *const f32,
+            *mut f32, *mut f32, *mut f32, *mut f32,
+            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
+        ) -> c_int,
+    >,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -422,6 +460,8 @@ impl Device {
         let kernels = Kernels {
             gemm_fp8_mx: km!(rt, "dsv41_gemm_fp8_mx"),
             gemm_fp8_mx2: km!(rt, "dsv41_gemm_fp8_mx2"),
+            gemm_fp8_mx_rope: ko!(rt, "dsv41_gemm_fp8_mx_rope"),
+            gemm_fp8_mx2_rope: ko!(rt, "dsv41_gemm_fp8_mx2_rope"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
@@ -481,6 +521,7 @@ impl Device {
             hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
             hc_front: km!(rt, "dsv41_hc_front"),
             hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
+            hc_front_persist_mb: ko!(rt, "dsv41_hc_front_persist_mb"),
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
@@ -839,6 +880,138 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx2")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries BOTH rope-fused GEMV entry points. A
+    /// stale .so leaves DSV41_ROPE_FUSE inert and the standalone apply_rope runs.
+    pub fn supports_rope_fuse(&self) -> bool {
+        self.kernels.gemm_fp8_mx_rope.is_some() && self.kernels.gemm_fp8_mx2_rope.is_some()
+    }
+
+    /// RoPE fusion (q rope): the M=1 GEMV whose epilogue also rotates the trailing
+    /// `rope_rd` lanes of each of `rope_hd`-wide head, with `apply_rope_kernel`'s
+    /// rotation expression verbatim, so the result is bit-identical to the
+    /// standalone launch. Ok(false) => the caller runs `gemm_fp8_mx` + apply_rope.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_rope(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        rope_base: *const c_int,
+        rope_mul: i32,
+        rope_off: i32,
+        rope_step: i32,
+        rope_inverse: bool,
+        rope_rd: i32,
+        rope_hd: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mx_rope else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                a,
+                a_scale,
+                w,
+                w_scale,
+                bias,
+                out,
+                n,
+                k,
+                self.stream,
+                rope_cos,
+                rope_sin,
+                rope_base,
+                rope_mul,
+                rope_off,
+                rope_step,
+                rope_inverse as i32,
+                rope_rd,
+                rope_hd,
+            )
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx_rope")?;
+        Ok(true)
+    }
+
+    /// RoPE fusion for the two-family GEMV (wq_b / idx_wq_b): family 1's head
+    /// width is `rope_hd1`, family 2's is `rope_hd2`; both rotate the same
+    /// `rope_rd` trailing lanes with the same cos/sin and position counter.
+    /// Ok(false) => the caller runs `gemm_fp8_mx2` + both apply_rope launches.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx2_rope(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w1: *const u8,
+        w1_scale: *const u8,
+        bias1: *const f32,
+        out1: *mut f32,
+        n1: i32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        bias2: *const f32,
+        out2: *mut f32,
+        n2: i32,
+        k: i32,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        rope_base: *const c_int,
+        rope_mul: i32,
+        rope_off: i32,
+        rope_step: i32,
+        rope_inverse: bool,
+        rope_rd: i32,
+        rope_hd1: i32,
+        rope_hd2: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mx2_rope else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                a,
+                a_scale,
+                w1,
+                w1_scale,
+                bias1,
+                out1,
+                n1,
+                w2,
+                w2_scale,
+                bias2,
+                out2,
+                n2,
+                k,
+                self.stream,
+                rope_cos,
+                rope_sin,
+                rope_base,
+                rope_mul,
+                rope_off,
+                rope_step,
+                rope_inverse as i32,
+                rope_rd,
+                rope_hd1,
+                rope_hd2,
+            )
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx2_rope")?;
         Ok(true)
     }
 
@@ -2292,6 +2465,76 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_hc_front_persist")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the multi-block Stage-C prototype
+    /// (`dsv41_hc_front_persist_mb`). A stale `.so` reports false and the caller
+    /// keeps the single-block / two-launch path.
+    pub fn supports_hc_persist_mb(&self) -> bool {
+        self.kernels.hc_front_persist_mb.is_some()
+    }
+
+    /// Stage-C persistent MULTI-BLOCK form: the hc front end still in ONE launch,
+    /// but the dots spread over `mix * split` blocks (one per projection row and
+    /// K chunk) with the collapse on its own parallel block and the tail elected
+    /// to the last-finishing dot block — no ticket, no spin. Same arguments and
+    /// same fallback contract as [`Self::hc_front`].
+    ///
+    /// ⚠️ Bit-exact with the two-launch path at split = 1 only; split > 1 splits
+    /// the dot reduction and is deterministic but not bit-identical, so it needs
+    /// a tolerance gate. Gated behind `DSV41_HC_PERSIST_MB=1` (default OFF).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_front_persist_mb(
+        &self,
+        x: *const f32,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        w_norm: *const f32,
+        pre_collapse: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        eps_norm: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.hc_front_persist_mb, "dsv41_hc_front_persist_mb")?;
+        let rc = unsafe {
+            f(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                w_norm,
+                pre_collapse,
+                pre,
+                post,
+                comb,
+                out,
+                rows,
+                hc,
+                dim,
+                sinkhorn_iters,
+                eps,
+                eps_norm,
+                xq,
+                xsc,
+                self.stream,
+            )
+        };
+        // Same contract as hc_front: InvalidValue means "use hc_mixes instead".
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_hc_front_persist_mb")?;
         Ok(true)
     }
 
