@@ -79,3 +79,35 @@ kernels/cuda/              两套 .cu（各自 host wrapper 同目录）
 
 **顺带确认的边界**：`cargo check -p X` 的输出**含 X 的依赖 crate 的告警** ✗ ⇒ 统计某 crate 自身告警时必须
 按 `grep "<crate>/src"` 过滤 ✓（本会话一开始把依赖的 63 条误算到 ferrite-serve 头上 ✓）。
+
+## Phase 2 的精确输入（已读双方代码，可直接执行 ✓）
+
+**共享侧（GLM）已有的 AR —— 单入口、融合式**：
+```c
+// crates/ferrite-kernel/src/cuda.rs:262 绑定的 extern "C"
+ferrite_p2p_ar_v5(partial, staging_tbl /*f32**/, ready_tbl /*u32**/, epoch /*u32*/,
+                  staging_local, ready_local, out, n, world, my_rank, stride, s)
+```
+表以 **`T*[]`**（“我这份 + 每个对端那份”的本地视图数组 ✓）传入；一次调用内含 store → publish → reduce ✓。
+
+**DSV4 侧现状（三个 kernel + Rust 三次发射 ✗）**：
+`ar_v5_store_kernel` / `ar_v5_publish_kernel` / `ar_v5_reduce_kernel`
+（`kernels/cuda/dsv41_glue.cu:257/272/292` ✓），表以 **`u64[]`**（对端地址数组 ✓）传入，
+epoch 放在 staging 尾部（`ctr_at` ✓），reduce 直写调用方缓冲 ✓，最后一块推进 epoch ✓。
+
+**合并方案**：
+1. **保留一份实现**：`ferrite_p2p_ar_v5`（共享侧 ✓）。若 DSV4 需要额外参数，只做**通用**扩展
+   （例如 `out != partial` 的直写形态 ✓ —— DSV4 的 reduce 直写调用方缓冲，需要 `out` 语义 ✓，GLM 已有该参数 ✓）。
+2. **DSV4 侧**：`Collective::{all_reduce_inplace, end_round}` 改成薄调用（传自己的 staging 表 + epoch ✓），
+   删除 `dsv41_ar_v5_*` launcher 与那三个 kernel ✓。
+3. **布局映射**（两者的协议同源，只是表的形式不同 ✓）：
+   `peer_slots[u64[]]` ↔ `staging_tbl[f32*[]]`；`peer_stamps[u64[]]` ↔ `ready_tbl[u32*[]]`；
+   DSV4 的 `epoch@ctr_at` ↔ GLM 的 `epoch` 参数；奇偶半区 `epoch & 1` ✓ 一致。
+   DSV4 每层的 slot 字节（`bytes` ✓）↔ `stride`；AR 长度 ↔ `n` ✓。
+4. **验收**：`cargo test -p ferrite-dsv41 --test ar_micro`（world=4/8 ✓ 与主机参考逐轮比对 ✓）
+   + 四段文本 ✓（**求和顺序必须一致**：两者都是按 rank 升序 ✓ ⇒ 应逐位一致 ✓）。
+
+⚠ 执行时注意（本会话实测的坑）：
+- **AR 的 publish 会自旋** ⇒ 剖析时必须用 NCCL 模式（去掉 P2P/AR v5 的 env ✓）。
+- **图捕获期**：epoch 由 **reduce 的最后一块**推进 ✓ ⇒ 只被 replay 推进 ✓（不能有 dry-run 参与 ✓）。
+- **测试旋钮必须 static 缓存** ✗（每次 AR 调用都 `getenv` 是热路径罪 ✓）。
