@@ -366,6 +366,24 @@ fn compress_side() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_COMPRESS_SIDE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// COMPRESS_FUSE (DSV41_COMPRESS_FUSE, default ON): the decode compressor's
+/// three 1-block launches — the state carry (`compressor_state`), the gated pool
+/// + RMSNorm (`compressor_pool`) and the rope/ring commit (`compress_commit`) —
+/// collapse into ONE `dsv41_compressor_fused`. They are a strict chain on this
+/// layer's own private buffers (state_kv/state_score -> latent/out_rows ->
+/// ring/clen), each already a single block in decode, so the fusion changes
+/// neither the decomposition nor a single byte: it only removes two launch
+/// boundaries and two graph nodes per kv-source layer (3 of them at ratio 2).
+/// `=0` reverts to the three-launch sequence, which is bit-identical.
+///
+/// DECODE ONLY: the fused kernel carries the `start_pos > 0` state mapping and
+/// the `mode 2` pool, so `ratio == 1` and `pos == 0` keep the old path (see the
+/// shape gate in `compress_on`).
+fn compress_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_COMPRESS_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
 /// MOE_DUAL (DSV41_MOE_DUAL, default ON): the MoE's SHARED expert half is issued
 /// on the runtime's second side stream so it overlaps the ROUTED experts' fp4
 /// chain on the main stream. The two halves of `moe()` read `xn` through
@@ -3814,42 +3832,74 @@ fn quant_fold() -> bool {
             // ratio == 1: no gate; the pooling reduces to the plain projection
             self.dev.zero_on(&cache.scp, s)?;
         }
-        self.dev.compressor_pool_on(
-            cache.kvp.as_f32(),
-            cache.scp.as_f32(),
-            norm.as_f32(),
-            cache.state_kv.ptr as *mut f32,
-            cache.state_score.ptr as *mut f32,
-            cache.latent.ptr as *mut f32,
-            cache.out_rows.ptr as *mut i32,
-            1,
-            1,
-            hd as i32,
-            ratio as i32,
-            pos as i32,
-            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
-            cfg.norm_eps,
-            s,
-        )?;
-        // FUSED COMMIT (device-side): reads out_rows on the device, ropes the
-        // latent, stores it into the ring and advances this layer's device
-        // counter. The old form downloaded out_rows (a sync D2H per layer per
-        // step), branched on the host, roped, copied and bumped a host counter -
-        // all impossible to capture in a graph.
-        self.dev.compress_commit_on(
-            cache.latent.as_f32(),
-            self.cos_comp.as_f32(),
-            self.sin_comp.as_f32(),
-            cache.ring.ptr as *mut f32,
-            cache.out_rows.ptr as *const std::os::raw::c_int,
-            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
-            hd as i32,
-            cfg.rope_head_dim as i32,
-            (cfg.rope_head_dim / 2) as i32,
-            cfg.window_size as i32,
-            ratio as i32,
-            s,
-        )?;
+        // COMPRESS_FUSE (default ON): state carry + pool + commit as ONE launch.
+        // Decode-shape gate only: the fused kernel carries the `start_pos > 0`
+        // state mapping and the `mode 2` pool, so `ratio == 1` (no gate, no
+        // state) and the first step (`pos == 0`) keep the three-launch sequence
+        // below — which is bit-identical, so the gate costs nothing but a branch
+        // that the captured graph bakes in.
+        if compress_fuse() && ratio > 1 && pos > 0 && self.dev.supports_compress_fuse() {
+            self.dev.compressor_fused_on(
+                cache.kvp.as_f32(),
+                cache.scp.as_f32(),
+                norm.as_f32(),
+                cache.state_kv.ptr as *mut f32,
+                cache.state_score.ptr as *mut f32,
+                cache.latent.ptr as *mut f32,
+                cache.out_rows.ptr as *mut i32,
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
+                cache.ring.ptr as *mut f32,
+                (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+                1,
+                1,
+                hd as i32,
+                ratio as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                cfg.window_size as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                cfg.norm_eps,
+                s,
+            )?;
+        } else {
+            self.dev.compressor_pool_on(
+                cache.kvp.as_f32(),
+                cache.scp.as_f32(),
+                norm.as_f32(),
+                cache.state_kv.ptr as *mut f32,
+                cache.state_score.ptr as *mut f32,
+                cache.latent.ptr as *mut f32,
+                cache.out_rows.ptr as *mut i32,
+                1,
+                1,
+                hd as i32,
+                ratio as i32,
+                pos as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                cfg.norm_eps,
+                s,
+            )?;
+            // FUSED COMMIT (device-side): reads out_rows on the device, ropes the
+            // latent, stores it into the ring and advances this layer's device
+            // counter. The old form downloaded out_rows (a sync D2H per layer per
+            // step), branched on the host, roped, copied and bumped a host counter -
+            // all impossible to capture in a graph.
+            self.dev.compress_commit_on(
+                cache.latent.as_f32(),
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
+                cache.ring.ptr as *mut f32,
+                cache.out_rows.ptr as *const std::os::raw::c_int,
+                (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                cfg.window_size as i32,
+                ratio as i32,
+                s,
+            )?;
+        }
         // The host keeps a MIRROR of the device counter using the SAME deterministic
         // rule the kernel applies ((pos + 1) % ratio == 0 commits one latent). The
         // host branches on this (whether to run the indexer, how many compressed

@@ -286,6 +286,38 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// COMPRESS_FUSE: `dsv41_compressor_pool` + `dsv41_compress_commit` (and the
+    /// state carry) as ONE 1-block launch, for the DECODE shape only
+    /// (`b == seqlen == 1`, `ratio > 1`, `start_pos > 0`). The caller
+    /// (`chain_dev::compress_on`) enforces that shape gate plus
+    /// `DSV41_COMPRESS_FUSE`; a non-decode shape returns `cudaErrorInvalidValue`.
+    /// `out_rows` is a DEVICE pointer, and the `start_pos == 0` / `ratio == 1`
+    /// cases keep the three-launch path (their state mapping differs).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_compressor_fused(
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latent: *mut f32,
+        out_rows: *mut i32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        clen: *mut i32,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        pos_ctr: *const i32,
+        eps: f32,
+        stream: CuStream,
+    ) -> i32;
+
     /// YaRN frequency table (dual theta: the compressed path rotates at its own
     /// theta because one latent stands for `ratio` tokens).
     pub fn dsv41_rope_precompute(

@@ -2601,6 +2601,143 @@ __global__ void compressor_pool_kernel(const float* __restrict__ kvp,
     (void)pos_ctr;
 }
 
+// COMPRESS_FUSE (env gate `DSV41_COMPRESS_FUSE`, default ON): the decode
+// compressor's three 1-block launches collapse into ONE.
+//
+// On a decode step (`b == seqlen == 1`, `ratio > 1`, `start_pos > 0`) the three
+// stages are a STRICT chain on this layer's own private buffers:
+//   state carry  (compressor_state_kernel, start_pos > 0 branch)
+//     -> state_kv/state_score
+//   gated pool + RMSNorm (compressor_pool_kernel, mode 2)
+//     -> latent + *out_rows
+//   rope + ring store + counter bump (compress_commit_kernel)
+//     -> ring + *clen
+// Every stage is one block (`state` used 2 blocks only because `b*hd = 512` at
+// 256 threads), so a single 128-thread block runs them back to back with
+// `__syncthreads()` between the stages: the parallel decomposition is unchanged
+// and only the two extra launch boundaries disappear (-2 launches per kv-source
+// layer, -2 graph nodes).
+//
+// BIT-IDENTITY (the whole point of the exercise):
+//  * state: element-wise stores; the destination set is identical (`{slot*hd+c}
+//    for c < hd`), and store order is irrelevant - the carry is order-free.
+//  * pool: `nthr == 128` and the SAME `for (c = tid; c < hd; c += nthr)` channel
+//    ownership, the same per-channel softmax over the `ratio` slots, the same
+//    `s_red[32]` warp + sequential cross-warp RMSNorm tree, and the same
+//    `out_row == 0` (`bb` is 0 in decode) row. A different block size would
+//    re-group the reduction and change the bytes - hence 128.
+//  * commit: the `for (c = threadIdx.x; c < hd; c += blockDim.x)` rope/store loop
+//    and the thread-0 `*clen = len + 1` bump are a VERBATIM copy of
+//    `compress_commit_kernel` (dsv41_glue.cu) - keep the two bodies in sync.
+//
+// The originals' early exits cannot be reproduced with `return` here (that is UB
+// for a later `__syncthreads()`), so each stage is guarded by the uniform
+// `out_rows_val` instead: an unfinished decode group (`(start_pos+1) % ratio !=
+// 0`) does the state carry, skips the pool rows AND the commit - exactly what
+// the two kernels' early returns did.
+__global__ void compressor_fused_kernel(const float* __restrict__ kvp,
+                                        const float* __restrict__ scp,
+                                        const float* __restrict__ norm_w,
+                                        float* __restrict__ state_kv,
+                                        float* __restrict__ state_score,
+                                        float* __restrict__ latent,
+                                        int32_t* __restrict__ out_rows,
+                                        const float* __restrict__ cos_t,
+                                        const float* __restrict__ sin_t,
+                                        float* __restrict__ ring, int* __restrict__ clen,
+                                        int hd, int ratio, int rope_dim, int half, int window,
+                                        const int* __restrict__ pos_ctr, float eps) {
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    __shared__ float s_red[32];
+    const int start_pos = *pos_ctr;  // device-side: graph-capturable
+    const int slot = start_pos % ratio;
+
+    // ---- stage 1: state carry (state_kernel's start_pos > 0 branch, b == 1) ----
+    for (int c = tid; c < hd; c += nthr) {
+        const size_t dst = (size_t)slot * hd + c;
+        state_kv[dst] = kvp[c];
+        state_score[dst] = scp[c];
+    }
+    __syncthreads();
+
+    // ---- stage 2: pool + RMSNorm (pool_kernel's mode 2, bb = 0) ----
+    // out_rows is derived from the DEVICE position counter, not passed in (the
+    // decision changes per step and a captured graph freezes launch arguments).
+    const int out_rows_val = ((start_pos + 1) % ratio == 0) ? 1 : 0;
+    if (tid == 0) *out_rows = out_rows_val;
+
+    float yv[16];
+    int cn[16];
+    int nown = 0;
+    for (int c = tid; c < hd; c += nthr) {
+        if (nown >= 16) break;
+        cn[nown++] = c;
+    }
+    if (out_rows_val) {  // the originals' `mode == 2 && out_rows_val == 0` return
+        for (int i = 0; i < nown; ++i) {
+            const int c = cn[i];
+            float mx = -INFINITY;
+            float sv[32];
+            float vv[32];
+            const int rr = ratio < 32 ? ratio : 32;
+            for (int r = 0; r < rr; ++r) {
+                sv[r] = state_score[(size_t)r * hd + c];
+                vv[r] = state_kv[(size_t)r * hd + c];
+                mx = fmaxf(mx, sv[r]);
+            }
+            float den = 0.f, acc = 0.f;
+            for (int r = 0; r < rr; ++r) {
+                const float e = expf(sv[r] - mx);
+                den += e;
+                acc += e * vv[r];
+            }
+            yv[i] = den > 0.f ? acc / den : 0.f;
+        }
+        // RMSNorm over the pooled row (weights + eps, exactly as the golden)
+        float ss = 0.f;
+        for (int i = 0; i < nown; ++i) ss += yv[i] * yv[i];
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            ss += __shfl_xor_sync(0xffffffffu, ss, off);
+        const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
+        if (lane == 0) s_red[warp] = ss;
+        __syncthreads();
+        float total = 0.f;
+        for (int widx = 0; widx < nw; ++widx) total += s_red[widx];
+        const float inv = rsqrtf(total / (float)hd + eps);
+        for (int i = 0; i < nown; ++i) {
+            const int c = cn[i];
+            latent[c] = yv[i] * inv * norm_w[c];  // out_row == bb == 0
+        }
+    }
+    __syncthreads();
+
+    // ---- stage 3: commit (VERBATIM copy of compress_commit_kernel) ----
+    if (out_rows_val > 0) {  // the original kernel's `*out_rows <= 0` return
+        const int len = *clen;
+        const int group_first = len * ratio;
+        const int i0 = hd - rope_dim;
+        const float* cs_row = cos_t + (size_t)group_first * half;
+        const float* sn_row = sin_t + (size_t)group_first * half;
+        float* dst = ring + (size_t)(window + len) * hd;
+        for (int c = tid; c < hd; c += nthr) {
+            float v = latent[c];
+            if (c >= i0) {
+                const int j = (c - i0) >> 1;
+                const int base = i0 + (j << 1);
+                const float x0 = latent[base];
+                const float x1 = latent[base + 1];
+                const float cv = cs_row[j];
+                const float sv = sn_row[j];
+                v = (c == base) ? (x0 * cv - x1 * sv) : (x0 * sv + x1 * cv);
+            }
+            dst[c] = v;
+        }
+        __syncthreads();  // every latent read is done before the bump
+        if (tid == 0) *clen = len + 1;
+    }
+}
+
 }  // namespace
 
 #define DSV41_LAUNCH_CHECK()                     \
@@ -6136,6 +6273,25 @@ extern "C" int dsv41_compressor_pool(const float* kvp, const float* scp, const f
     compressor_pool_kernel<<<launch, 128, 0, s>>>(kvp, scp, norm_w, state_kv, state_score, latents,
                                                   out_rows, mode, grid_n, b, seqlen, head_dim, ratio,
                                                   pos_ctr, eps);
+    return (int)cudaGetLastError();
+}
+
+// COMPRESS_FUSE: state carry + pool + commit in ONE 1-block launch. DECODE-ONLY
+// by contract (`b == seqlen == 1`, `ratio > 1`, `start_pos > 0`): the prefill /
+// ratio == 1 shapes keep the three-launch path, whose state carry has a
+// different (multi-row) mapping. The caller (`chain_dev.rs::compress_on`) checks
+// the same shape gate plus the `DSV41_COMPRESS_FUSE` env flag, so a violation
+// here is a programming error, not a runtime decline.
+extern "C" int dsv41_compressor_fused(const float* kvp, const float* scp, const float* norm_w,
+                                      float* state_kv, float* state_score, float* latent,
+                                      int32_t* out_rows, const float* cos_t, const float* sin_t,
+                                      float* ring, int* clen, int b, int seqlen, int hd, int ratio,
+                                      int rope_dim, int half, int window, const int* pos_ctr,
+                                      float eps, cudaStream_t s) {
+    if (b != 1 || seqlen != 1 || hd <= 0 || ratio <= 1) return (int)cudaErrorInvalidValue;
+    compressor_fused_kernel<<<1, 128, 0, s>>>(kvp, scp, norm_w, state_kv, state_score, latent,
+                                              out_rows, cos_t, sin_t, ring, clen, hd, ratio,
+                                              rope_dim, half, window, pos_ctr, eps);
     return (int)cudaGetLastError();
 }
 

@@ -560,8 +560,32 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     early-return 同谓词）。
   - **收益预期** ⚠️：compress ≈30µs > 窗口 ~14µs（q 链 13.5µs + `ring_win_fuse`/`window_idxs` ~1µs），
     只能藏住窗口那部分 ⇒ 预期 **−0.05~0.06ms/步**（4 层 × ~14µs），不是 30µs×4。
+  - **gate 分析（2026-09-11）**：join 不能后移——`indexer` 的 key 发布是本层 `latent` + `clen` 的
+    首个消费者，而后续的 `sparse_attn` 读 ring 的压缩行；两者都在 join 之后，故 join 已是
+    "最晚的合法点"。三条 2/8/14（ratio=2，kv+index source）各暴露 `30 − 13.5 ≈ 16.5µs`。
+    真正可行的只有**缩短 compress 关键路径**：(a) `COMPRESS_FUSE` 省 2 个 1-block launch；
+    (b) 把 `join` 拆成"latent 就绪"与"ring 行就绪"两条边（当前实现里 commit 紧跟 pool，
+    拆了也只省一条边）；(c) 让 sparse_attn 用**上一步**的压缩行（滞后一步，非位级一致，需慎重）；
+    (d) fork 提前——不可行，`s.xn`（pre-attention rmsnorm）就是 compress 的输入，fork 点已在它之后。
   - 开关：`DSV41_COMPRESS_SIDE=0` 回退串行（同二进制 A/B）。上机须同会话背靠背单轮实测，并
     同时验证 `opcheck`/faults 与文本。
+- **compress 3-launch 合一 `DSV41_COMPRESS_FUSE`（默认 ON，2026-09-11）** ✓：
+  decode 下（`b == seqlen == 1`、`ratio > 1`、`pos > 0`）`compressor_state`（decode 分支）+ 
+  `compressor_pool`（mode 2）+ `compress_commit` 是**同一条严格串行链**（写 state → 读 state 写
+  latent/out_rows → 读 latent/out_rows 写 ring/clen），且**每级本来就只有一个 block**
+  （state 用 2 block 只因 512 元素 / 256 线程），因此合成**单 kernel `compressor_fused_kernel`
+  （`dsv41_kernels.cu:2638`，`<<<1,128>>>`）**、级间用 `__syncthreads()`。
+  - **位级一致的三条理由**：① state 是逐元素 store，目标集合相同、顺序无关；② pool 保持
+    `nthr == 128` + 同一 `for (c = tid; c < hd; c += nthr)` 通道归属 ⇒ 同一 `s_red[32]`
+    warp + 顺序跨 warp 的 RMSNorm 树（**换 block 大小会重分组求和、字节就变了**，故锁 128）；
+    ③ commit 的 rope/store 循环与 thread-0 `*clen++` 是 `compress_commit_kernel`
+    （`dsv41_glue.cu:658`）的**逐字拷贝**——两处必须同步改。
+  - ⚠️ 原三核的**早退不能照搬成 `return`**（后面还有 `__syncthreads()` ⇒ UB）：改为用统一的
+    `out_rows_val` 守卫（未完成一组时：只做 state 搬运，跳过 pool 写与整个 commit，语义同原早退）。
+  - 回退：`DSV41_COMPRESS_FUSE=0`，或旧 `.so` 无 `dsv41_compressor_fused`（`supports_compress_fuse()`
+    为假）⇒ 走原 3-launch；`ratio == 1` / `pos == 0` 也走原路径（state 映射不同）。
+  - 收益：每 kv-source 层省 2 次 1-block launch（≈2–4µs）×3 层（2/8/14）；注意**它同时缩短
+    compress 的 30µs 关键路径**，这正是 §compress join 暴露窗口的直接缓解（见下）。
 - **三条侧流的优先级分配（`devrt.rs::create_side_stream`，每流独立 env gate）** ✓：
   优先级只在**图回放**且节点 READY 时决定谁先拿 SM（`cudaGraphInstantiateFlagUseNodePriority`，
   全局一个标志），因此只有"最长且最晚被消费 = 真正卡窗口"的链才值得 greatest。

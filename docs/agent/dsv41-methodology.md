@@ -51,7 +51,7 @@ grid 失衡导致的空转 SM）。架构级评估（`STATUS.md:6547`）的结�
 | 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before；`join_ev` 交给模型侧 `hc_tail_join` | `806ec7a`，关键路径 −0.256ms。回滚 B 之后的发射序列：`main: record(fork_ev) -> wait(fork_ev)`；`side: wait(fork_ev) -> EARLY -> record(fork_ev) -> dots -> LATE -> record(join_ev)` |
 | 4 | **attention dual-chain** | q 链（norm/lin_rope+wq_b+rope ≈13.5µs，关键路径）vs kv 链（rmsnorm_rope ≈10.6µs，填充） | `lin2` 之后 | kv 链之后、`ring_win_fuse` **之前** | `DSV41_DUAL_CHAIN`（`chain_dev.rs:312`）；`2d7eead` |
 | 5 | **MoE dual** | routed experts（≈42µs）vs shared expert（≈22µs） | `moe()` 顶部（`sh_w` 后、gate 前） | routed 之后 join，再 `add_inplace(&s.o,&s.ex_out)` | `DSV41_MOE_DUAL`（`chain_dev.rs:365`）；`2d7eead` |
-| 6 | **compress side** | kv-source 层（2/8/14/20）的 4 个 compress launch（≈30µs） | `lin2` 之后（与 dual_chain 同点） | `window_idxs` 之后、**indexer 之前** | `DSV41_COMPRESS_SIDE`（`chain_dev.rs:338`）；`ec439e3`，需**新开 `side_stream3`** |
+| 6 | **compress side** | kv-source 层（2/8/14/20）的 4 个 compress launch（≈30µs）→ **3 个**（COMPRESS_FUSE 把 `state`+`pool`+`commit` 合一） | `lin2` 之后（与 dual_chain 同点） | `window_idxs` 之后、**indexer 之前** | `DSV41_COMPRESS_SIDE`（`chain_dev.rs:364`）；`ec439e3`，需**新开 `side_stream3`**；`DSV41_COMPRESS_FUSE`（`chain_dev.rs:382`，默认 ON）|
 
 ### 基础设施（共享，已在 `ferrite-kernel`，GLM 可直接用）
 

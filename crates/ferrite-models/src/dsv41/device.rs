@@ -474,6 +474,35 @@ struct Kernels {
     compressor_pool: Option<
         unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut c_int, c_int, c_int, c_int, c_int, c_int, *const c_int, f32, CuStream) -> c_int,
     >,
+    /// COMPRESS_FUSE: the decode compressor's three 1-block stages (state carry,
+    /// gated pool + RMSNorm, rope + ring commit) as ONE launch. Declines the
+    /// non-decode shapes; optional, so an older .so without the symbol keeps the
+    /// three-launch path.
+    compressor_fused: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut c_int,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *mut c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *const c_int,
+            f32,
+            CuStream,
+        ) -> c_int,
+    >,
     route_topk: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream) -> c_int,
     >,
@@ -785,6 +814,7 @@ impl Device {
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
             compressor_pool: ko!(rt, "dsv41_compressor_pool"),
+            compressor_fused: ko!(rt, "dsv41_compressor_fused"),
             engram_apply: ko!(rt, "dsv41_engram_apply"),
             swiglu_limit: ko!(rt, "dsv41_swiglu_limit"),
             swiglu_limit_q: ko!(rt, "dsv41_swiglu_limit_q"),
@@ -869,6 +899,13 @@ impl Device {
     /// when [`Self::supports_compress_side`] is true.
     pub fn side_stream3(&self) -> CuStream {
         self.rt.side_stream3()
+    }
+
+    /// True when the loaded .so carries COMPRESS_FUSE (`dsv41_compressor_fused`).
+    /// Optional: a stale .so reports false and the compressor keeps the three
+    /// separate launches (state + pool + commit), which are bit-identical.
+    pub fn supports_compress_fuse(&self) -> bool {
+        self.kernels.compressor_fused.is_some()
     }
 
     /// Compressor side stream — fork. Record the fork event on the MAIN stream
@@ -2473,6 +2510,49 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_compressor_pool")
+    }
+
+    /// COMPRESS_FUSE: the decode compressor's state carry + gated pool/RMSNorm +
+    /// rope/ring commit as ONE 1-block launch, issued on `s` (the third side
+    /// stream under `DSV41_COMPRESS_SIDE`, like the pair it replaces). DECODE
+    /// ONLY — `b == seqlen == 1` and `ratio > 1`; the caller gates the shape and
+    /// the `DSV41_COMPRESS_FUSE` flag, and an older .so without the symbol falls
+    /// back to `compressor_pool_on` + `compress_commit_on` (see
+    /// [`Self::supports_compress_fuse`]). Kernel and operands are unchanged, so
+    /// the bytes are bit-identical - only two launch boundaries disappear.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_fused_on(
+        &self,
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latent: *mut f32,
+        out_rows: *mut i32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        clen: *mut std::os::raw::c_int,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        pos_ctr: *const c_int,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.compressor_fused, "dsv41_compressor_fused")?;
+        let rc = unsafe {
+            f(
+                kvp, scp, norm_w, state_kv, state_score, latent, out_rows, cos, sin, ring, clen, b,
+                seqlen, head_dim, ratio, rope_dim, half, window, pos_ctr, eps, s,
+            )
+        };
+        self.kerr(rc, "dsv41_compressor_fused")
     }
 
     pub fn gather_rows(

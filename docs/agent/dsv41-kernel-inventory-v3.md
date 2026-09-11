@@ -425,7 +425,7 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | `swiglu_limit_kernel` 40× | ✅ **已无独立 launch**：routed batched 路径由 gate/up 融合的 epilogue 承担（`gateup_fused` 默认 ON ⇒ `swiglu_limit_batched` 被跳过）；共享专家由 A4 `swiglu_limit_q`（默认 ON）直出 fp8 | `chain_dev.rs:3838 / 4027-4047` |
 | `fp4_pack_kernel` 40× †† | ✅ **已融合**：`g_q4_fuse` 默认 1 ⇒ 单核 `quant_fp4_fused_kernel`；本表 tree（16:48）早于落地它的 `2d7eead`（18:39）⇒ 该行是**融合前**数据 | `dsv41_kernels.cu:2310-2332` |
 | `ring_append_kernel` + `window_idxs_kernel` | ✅ **已合并为一个** `dsv41_ring_win_fuse`（`DSV41_RING_WIN_FUSE` 默认 ON，每层 1 次、非 owner 层仍写 idxs）；本表 tree 早于落地它的 `710c107`（17:54）⇒ 两行都是**合并前**数据 | `chain_dev.rs:2802` |
-| `compressor_pool_kernel`/`compress_commit_kernel`（4×/步）| ✅ **已移出关键路径**（`DSV41_COMPRESS_SIDE` 默认 ON，`ec439e3` 19:42）：kv-source 层的 4 个 compress launch 在 `lin2` 后 fork 到 `side_stream3`，join 延到本层尾部（`window_idxs` 之前），与 q 链（主流 ~13.5µs）+ kv 链（side2）重叠。本表 tree（16:48）**早于**该 commit ⇒ 表里这两行是**串行时代**数据 | `chain_dev.rs:2581-2593 / 2985-2987 / 3508-3575`；`device.rs:759-790` |
+| `compressor_pool_kernel`/`compress_commit_kernel`（4×/步）| ✅ **已移出关键路径**（`DSV41_COMPRESS_SIDE` 默认 ON，`ec439e3` 19:42）：kv-source 层的 4 个 compress launch 在 `lin2` 后 fork 到 `side_stream3`，join 延到本层尾部（`window_idxs` 之前），与 q 链（主流 ~13.5µs）+ kv 链（side2）重叠。本表 tree（16:48）**早于**该 commit ⇒ 表里这两行是**串行时代**数据。🔁 2026-09-11 起 `DSV41_COMPRESS_FUSE`（默认 ON）再把 decode 的 `state`+`pool`+`commit` 合一为 `compressor_fused_kernel`（`dsv41_kernels.cu:2638`）⇒ 每层 4→3 launch、`compress_commit_kernel` 仍是 `dsv41_glue.cu:658`（fused kernel 内是它的逐字拷贝，两处须同步） | `chain_dev.rs:364/382/3801-3880`；`device.rs:826-880/2450-2560/3150-3200` |
 
 ### indexer_score v2（Step A，✅ 2026-09-11 已实施，**待 A/B**）
 
