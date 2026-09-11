@@ -6367,3 +6367,15 @@ sparse 0.34 · v2(gate+route) 0.39 · quant 0.13 · 其它 ~0.9
 - expert-interleave（−0.09，ilv-correctness 验证中）+ tail-late priority（−0.3~0.6）
 - NORM_FUSE（−0.13）+ wob-f32（−0.06）+ event-sticky-fix（robustness）
 - 全部落地预期：**~6.5-7.0ms ≈ 143-154 tok/s**
+
+### 环境阻塞期的代码研究结论（2026-09-11 深夜）
+
+**gemv-246-revisit**：dual-chain 重构后无新合并机会——kv 链上根本没有 gemv（lin2 一次 mx2 就算完 wq_a+wkv，fork 在其后）。剩余路径：IDX_FUSE 默认 ON（+0.013ms，已实现只需翻默认）+ Stage C persistent（0.34ms×2 上限）。**"异激活 mx2"即使有对也不划算**（与 dual-chain 冲突，合并反而串行化）。
+
+**quant-final-sweep**：三项 quant 消除（wob-f32/swiglu_q/o-rope）的条件链全部验证生效 ✓。剩余：engram 2 次（可用 gemm_fp8_mx_f32 直读省掉）+ 4 次未知（候选：idx-source 层的 fallback）。总收益 <0.01ms——尾巴清扫级。
+
+**当前待验证工作的预期分解**（环境恢复后一轮验证）：
+- Round 41 基线：8.23ms
+- + tail-late priority（−0.3~0.6）+ NORM_FUSE（−0.13）+ wob-f32（−0.06）≈ 7.5-7.7ms
+- + dual-chain attn（−0.42）+ MoE dual（−0.5~0.88）+ fp4-pack（−0.06）≈ 6.5-7.2ms
+- + PDL 链（−0.3~0.6）+ sparse-o-rope（−0.06~0.10）+ AR pubred（−0.1~0.2）≈ **5.9-6.7ms ≈ 149-169 tok/s**

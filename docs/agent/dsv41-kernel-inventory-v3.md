@@ -88,12 +88,14 @@ tie-break、同一 renorm）。真正省下的只有 launch/节点开销（route
 
 ### `gemm_fp8_gemv` 246 次的代码级分解（2026-09-11 只读代码审计，`chain_dev.rs`）
 
-单层 attention 侧 4 次：`lin2(wq_a,wkv)`（`xn`, k=5120, n=1280+512, **mx2 已融合**）:1795；
-`wq_b`（`qr`, k=1280, n=nlh·hd=4096；8 个 index-source 层用 IDX_FUSE mx2 带上 idx_wq_b）:1865/1882；
-`wo_a` 循环 :2135（`o`, k=hpg·hd=4096, n=olg=1024，`nlg=o_groups/world=8/8=`**1**）；
-`wo_b` :2184（`wo`, k=ol_local=1024, n=dim=5120）。
-单层 MoE 侧 2 次（共享专家，SHARED_TP=1 全 rank）：`w1/w3` mx2 :2849（k=5120, n=2·sh_il=512）；
-`w2` :2933（k=sh_il=256, n=dim=5120；`MOE_EPI_ADD` 默认 OFF 故走末行而非 mx_add :2921）。
+单层 attention 侧 4 次（**2026-09-11 dual-chain 重构后复核，行号已更新**）：
+`lin2(wq_a,wkv)`（`xn`, k=5120, n=1280+512, **mx2 已融合**）:2331；
+`wq_b`（`qr`, k=1280, n=nlh·hd=4096；8 个 index-source 层用 IDX_FUSE mx2 带上 idx_wq_b）:2410/2507；
+`wo_a` 循环 :2884/2922（`o`, k=hpg·hd=4096, n=olg=1024，`nlg=o_groups/world=8/8=`**1**）；
+`wo_b` :2955/2990（`wo`, k=ol_local=1024, n=dim=5120）。
+单层 MoE 侧 2 次（共享专家，SHARED_TP=1 全 rank）：`w1/w3` mx2 :3804（k=5120, n=2·sh_il=512）；
+`w2` :3903（k=sh_il=256, n=dim=5120；`MOE_EPI_ADD` 默认 OFF 且 `MOE_DUAL` 下被强制关闭，
+故走末行写 `s.ex_out` 而非 mx_add :3891）。
 
 ⇒ 6 × 40层 = 240，再加 engram 的 fp8 gemv :899 在 L1/L14 = **2** ⇒ **代码推导 242**。
 与下表 246 差 4，且 `gemv_bf16` 反向差 −4（代码推 40 gate + 4 idx_wk + 8 idx_w + 1 HEAD_SLICE = 53 vs 表 49）：
@@ -104,6 +106,14 @@ tie-break、同一 renorm）。真正省下的只有 launch/节点开销（route
 wq_a→wq_b / w1w3→w2 同构但需 grid 级同步，不可行），② 异激活融合需先加第二 fp8 激活缓冲
 （`s.xq/xsc` 是**单缓冲**，T1/T2 一次性旗标建立在"只存最近一次量化"之上），且 mx2 只有单一 k。
 ⇒ 单层 6 次 → 1 次只能走 Stage C persistent 段核。
+
+**dual-chain 重构后的复核（2026-09-11，结论：旧结论仍成立，但理由变了）**：`DSV41_DUAL_CHAIN`
+在 `lin2(wq_a,wkv)`（:2331）**之后**才 fork（:2365-2368），因为 `lin2` 已把 wkv 与 wq_a 一起算完
+（`kv_early`），所以 **kv 侧链上根本没有 gemv** —— 只有 `rmsnorm_rope`（:2585）一个非 gemv 的小核。
+⇒ "wq_b ∥ kvb 异激活合并"的候选**前提不成立**（kvb 早已并入 fork 前的 mx2）。MoE 侧同理：
+routed 链上是 fp4 expert 核（`expert_gemv_fp4_*`），shared 链上是 w1/w3 mx2 + w2，
+**没有任何一条跨流 gemv 对**可供合并；两条链各自的 gemv 都是"链内依赖"（w1w3→swiglu→w2）。
+⇒ 每层 5 次的唯一路径仍是 Stage C 段核（或把 wo_a→wo_b / w1w3→w2 做成 grid-sync 两段核）。
 
 ### 家族汇总（生产口径 9.64ms 为分母）
 
