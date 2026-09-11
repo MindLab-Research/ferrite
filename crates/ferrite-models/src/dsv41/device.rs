@@ -211,6 +211,17 @@ struct Kernels {
             *const u8, i64, *const u8, i64, *const c_int, CuStream,
         ) -> c_int,
     >,
+    /// Fused down + reduce (DSV41_DOWN_FUSE, default ON): ONE launch computes
+    /// every slot's fp4 down GEMV and sums the per-slot contributions in
+    /// ascending slot order, writing straight into `out` (overwrite). Replaces
+    /// the (expert_down_fp4_batched, moe_down_reduce) pair; both of those stay
+    /// for the DSV41_DOWN_FUSE=0 fallback.
+    expert_down_reduce_fp4_batched: Option<
+        unsafe extern "C" fn(
+            *const f32, i64, *mut f32, c_int, c_int, c_int, *const f32, i64, c_int,
+            *const u8, i64, *const u8, i64, *const c_int, CuStream,
+        ) -> c_int,
+    >,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     swiglu_limit_batched:
         Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, i64, c_int, CuStream) -> c_int>,
@@ -352,6 +363,7 @@ impl Device {
             expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
+            expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
@@ -574,6 +586,13 @@ impl Device {
             && self.kernels.expert_down_fp4_batched.is_some()
             && self.kernels.moe_down_reduce.is_some()
             && self.kernels.swiglu_limit_batched.is_some()
+    }
+
+    /// True when the loaded .so carries the fused down+reduce entry point
+    /// (`dsv41_expert_down_reduce_fp4_batched`). A stale .so leaves
+    /// DSV41_DOWN_FUSE inert and the (batched down, moe_down_reduce) pair runs.
+    pub fn supports_down_fuse(&self) -> bool {
+        self.kernels.expert_down_reduce_fp4_batched.is_some()
     }
 
     pub fn gemm_fp8_mx(
@@ -1589,6 +1608,43 @@ impl Device {
         let f = self.need(self.kernels.moe_down_reduce, "dsv41_moe_down_reduce")?;
         let rc = unsafe { f(part, out, n, slots, self.stream) };
         self.kerr(rc, "dsv41_moe_down_reduce")
+    }
+
+    /// Fused down + reduce (DSV41_DOWN_FUSE, default ON): ONE launch computes
+    /// every slot's fp4 down GEMV and sums the per-slot contributions in
+    /// ASCENDING slot order straight into `out` (overwrite). Bit-identical to
+    /// `expert_down_fp4_batched` + `moe_down_reduce`; `act_base` holds `slots`
+    /// slices `act_stride` floats apart and only the swiglu half (the first
+    /// `inter` floats) of each is read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_down_reduce_fp4_batched(
+        &self,
+        act_base: *const f32,
+        act_stride: i64,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        row_weight: *const f32,
+        rw_stride: i64,
+        slots: i32,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.expert_down_reduce_fp4_batched,
+            "dsv41_expert_down_reduce_fp4_batched",
+        )?;
+        let rc = unsafe {
+            f(
+                act_base, act_stride, out, rows, dim, inter, row_weight, rw_stride, slots, w2_base,
+                w2_stride, w2s_base, w2s_stride, ids, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_expert_down_reduce_fp4_batched")
     }
 
     /// Batched swiglu: grid.y = slot over `slots` consecutive [2*inter] blocks.

@@ -5402,3 +5402,18 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 - 升序 slot 累加 = reduce 的数值契约（零同步、零 cooperative）
 - ex_down_b 全程留寄存器 → 写+读两遍 global 消失
 - act staging：一次 stage 全部 slot（6×320×4B=7.7KB + LUT 2KB ≈ 10KB/块）
+
+### gate_up+swiglu 融合（第 17 轮验证中）
+
+- kernel：每 warp 产一对 (gate_i, up_i)，对 W1/W3 各跑 K 循环（逐字照抄 vec==2 的 LUT+fmaf 结构），g/u 两条**独立**归约链，epilogue 做 clamp+silu，只写 inter 行（原 2·inter）
+- launcher：`DSV41_GATEUP_FUSE` 默认 ON，gated to mode 2 && dim%512==0
+- 调用方：`act_slot` 从 2·inter 变 inter；swiglu_limit_batched 条件化
+- 数值：K 循环逐指令照抄、双独立链、clamp 幂等、silu 同式（7 条论证见 gate-swiglu-fuse 报告）
+- 预期：省 40 次 swiglu launch + ex_act_b 写出量减半 ≈ −0.06~0.10ms
+
+### swiglu+quant 融合（swiglu-quant-fuse 的关键纠正）
+
+审计写的"swiglu_limit_batched 之后紧跟 quant1"**不成立**——MoE 路径里 quant 的对象是 `s.xn`（T1 已免），
+而 swiglu 的输出 ex_act_b 直接作为 f32 被 down 消费（`act!=nullptr` 分支）——**没有 quant 需要融合**。
+报告改为：swiglu_limit_kernel 的 `swiglu_limit_q_kernel` 变体（可选 fp8 输出），供未来需要 fp8 down 时用。
+当前**不适用**——T1 已覆盖唯一的 quant 场景。
