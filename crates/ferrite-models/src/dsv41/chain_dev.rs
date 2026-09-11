@@ -95,6 +95,10 @@ struct Scratch {
     wo: DevBuf,    // [o_lora]
     logits: DevBuf,
     ids: DevBuf,   // [1] i32
+    /// DSV41_HEAD_SLICE only: the raw u64 comparison key from this rank's
+    /// vocabulary-slice reduce, published to the peers for the cross-rank
+    /// final pick.
+    argmax_packed: DevBuf, // [1] u64
     /// The device position counter: the argmax (the step's last kernel)
     /// advances it, so every kernel during the step reads a stable current pos.
     pos_ctr: DevBuf, // [1] i32
@@ -195,6 +199,13 @@ fn sh_exp_mx2() -> bool {
 fn mix_gate_shared() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// DSV41_HEAD_SLICE=0 keeps the lm_head reading the full replicated vocabulary on
+/// every rank (the sliced path drops that read by `world`).
+fn head_slice() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(false))
 }
 
 fn build_eng_dev(
@@ -378,6 +389,7 @@ impl<'a> DevChain<'a> {
             wo: dev.alloc(fb(cfg.n_groups_o_lora()))?,
             logits: dev.alloc(fb(cfg.vocab_size))?,
             ids: dev.alloc(4)?,
+            argmax_packed: dev.alloc(8)?,
             pos_ctr: dev.alloc(4)?,
             clen: dev.alloc(cfg.n_layers * 4)?,
             scores: dev.alloc(fb(n_exp))?,
@@ -983,14 +995,41 @@ impl<'a> DevChain<'a> {
         // bit-identical while the step's largest single weight read - the
         // full-vocab head, replicated on every rank - halves.
         let head = self.w.head.as_ref().unwrap();
+        // Vocabulary slicing (DSV41_HEAD_SLICE): the head is REPLICATED on every
+        // rank, so each rank can reduce just its own 1/world slice and the ranks
+        // pick the global winner from one published u64 each. The step's largest
+        // single weight read (1262 MB bf16 at 129280x5120) drops to 158 MB/rank.
+        // The tie rule (lowest index) is preserved exactly: the packed key is
+        // monotone in (value, -index), and the final takes the max in ascending
+        // rank order, which is the same order the single-rank argmax walked.
+        let world = self.world();
+        let rank = self.rank();
+        let seg = if world > 1 { cfg.vocab_size / world } else { 0 };
+        let sliced = head_slice()
+            && head.dtype == "BF16"
+            && world > 1
+            && cfg.vocab_size % world == 0
+            && self.comm.is_some();
         if head.dtype == "BF16" {
-            self.dev.gemv_bf16(
-                head.ptr(),
-                self.s.xn.ptr as *const f32,
-                self.s.logits.ptr as *mut f32,
-                cfg.vocab_size as i32,
-                dim as i32,
-            )?;
+            if sliced {
+                let head_ptr =
+                    (head.ptr() as *const u8).wrapping_add(rank * seg * dim as usize * 2);
+                self.dev.gemv_bf16(
+                    head_ptr as *const c_void,
+                    self.s.xn.ptr as *const f32,
+                    self.s.logits.ptr as *mut f32,
+                    seg as i32,
+                    dim as i32,
+                )?;
+            } else {
+                self.dev.gemv_bf16(
+                    head.ptr(),
+                    self.s.xn.ptr as *const f32,
+                    self.s.logits.ptr as *mut f32,
+                    cfg.vocab_size as i32,
+                    dim as i32,
+                )?;
+            }
         } else {
             self.lin_f32(
                 self.s.xn.ptr as *const f32,
@@ -1000,17 +1039,47 @@ impl<'a> DevChain<'a> {
                 self.s.logits.ptr as *mut f32,
             )?;
         }
-        self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
+        if sliced {
+            self.stats("final logits (slice)", &self.s.logits, seg)?;
+        } else {
+            self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
+        }
         // Device-side argmax (the GLM HEAD_DEV pattern): the next token lands
         // straight in s.ids, which the next step's embedding reads — no 517 KB
         // full-vocab download, no O(vocab) host scan, and the token itself never
         // crosses to the host and back.
-        self.dev.argmax(
-            self.s.logits.ptr as *const f32,
-            self.s.ids.ptr as *mut std::ffi::c_int,
-            cfg.vocab_size as i32,
-            self.s.pos_ctr.ptr as *mut std::ffi::c_int,
-        )?;
+        if sliced {
+            let c = self.comm.as_ref().unwrap();
+            let ok = self.dev.argmax_sliced(
+                self.s.logits.ptr as *const f32,
+                seg as i32,
+                (rank * seg) as i32,
+                self.s.ids.ptr as *mut std::ffi::c_int,
+                self.s.argmax_packed.ptr as *mut u64,
+                self.s.pos_ctr.ptr as *mut std::ffi::c_int,
+                c.peer_slots_dev() as *const u64,
+                world as i32,
+                rank as i32,
+                c.staging_dev() as *const f32,
+                c.bytes as i64,
+                (c.bytes - 8) as i64,
+            )?;
+            if !ok {
+                self.dev.argmax(
+                    self.s.logits.ptr as *const f32,
+                    self.s.ids.ptr as *mut std::ffi::c_int,
+                    seg as i32,
+                    self.s.pos_ctr.ptr as *mut std::ffi::c_int,
+                )?;
+            }
+        } else {
+            self.dev.argmax(
+                self.s.logits.ptr as *const f32,
+                self.s.ids.ptr as *mut std::ffi::c_int,
+                cfg.vocab_size as i32,
+                self.s.pos_ctr.ptr as *mut std::ffi::c_int,
+            )?;
+        }
         Ok(())
     }
 

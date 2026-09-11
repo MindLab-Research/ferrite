@@ -195,6 +195,18 @@ impl Collective {
         self.staging.ptr as u64
     }
 
+    /// Device copy of the peers' staging bases (one u64 per rank) — what a
+    /// cross-rank publish kernel walks to land a payload in every rank's slot.
+    pub fn peer_slots_dev(&self) -> *const std::ffi::c_void {
+        self.peer_slots.ptr as *const std::ffi::c_void
+    }
+
+    /// This rank's own staging base, for a kernel that has to read the slots
+    /// peers published into.
+    pub fn staging_dev(&self) -> *const std::ffi::c_void {
+        self.staging.ptr as *const std::ffi::c_void
+    }
+
     /// Publish `len` bytes from `src` into slot `rank` of every rank. `len`
     /// must not exceed the slot size: a site with a shorter payload than the
     /// staging would otherwise publish unrelated memory.

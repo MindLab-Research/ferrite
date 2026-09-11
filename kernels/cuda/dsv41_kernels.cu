@@ -1987,7 +1987,8 @@ extern "C" int dsv41_engram_gather(const uint8_t* table, const uint8_t* table_sc
 // GLM HEAD_DEV pattern - the sampled token never leaves the device except as the
 // single 4-byte read the host needs for EOS and printing.
 __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out, int n,
-                              int* __restrict__ pos_ctr) {
+                              int* __restrict__ pos_ctr, int idx_off,
+                              unsigned long long* __restrict__ packed) {
     unsigned long long my = 0ull;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const unsigned int bits = __float_as_uint(v[i]);
@@ -2008,7 +2009,11 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
         unsigned long long m = 0ull;
         for (int w = 0; w < nw; ++w)
             if (wb[w] > m) m = wb[w];
-        *out = (int)(0xFFFFFFFFu - (unsigned)(m & 0xFFFFFFFFu));
+        // For a vocabulary slice the caller passes idx_off = the slice's first
+        // global index; `packed` (optional) hands the raw comparison key on so a
+        // cross-rank final can pick between slices with this same tie rule.
+        if (packed != nullptr) *packed = m;
+        *out = idx_off + (int)(0xFFFFFFFFu - (unsigned)(m & 0xFFFFFFFFu));
         // the argmax is the LAST kernel of the step: this is where the
         // device position counter advances, so every kernel of the NEXT
         // step (the engram hash, the window indices, the compressor) sees
@@ -2017,9 +2022,62 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
     }
 }
 
+// Cross-rank argmax over a vocabulary-sliced lm_head. Each rank reduces its own
+// slice with argmax_kernel's packing (comparable value key | ~index, so ties go
+// to the LOWEST index) and publishes that u64 into every peer's staging slot;
+// the final kernel takes the max across ranks in ascending rank order. The
+// packed key is monotone in (value, -index), so the winner and its tie rule are
+// exactly the full-vocabulary argmax's.
+__global__ void argmax_pub_kernel(const unsigned long long* __restrict__ peer_slots, int world,
+                                  int rank, const unsigned long long* __restrict__ packed,
+                                  long slot_f, long off) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const unsigned long long pk = packed[0];
+    for (int p = 0; p < world; ++p) {
+        unsigned long long* dst = reinterpret_cast<unsigned long long*>(
+            reinterpret_cast<char*>(peer_slots[p]) + (size_t)rank * (size_t)slot_f + off);
+        *dst = pk;
+    }
+}
+
+__global__ void argmax_final_kernel(const float* __restrict__ staging, int world, long slot_f,
+                                    long off, int* __restrict__ out, int* __restrict__ pos_ctr) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    unsigned long long best = 0ull;
+    for (int p = 0; p < world; ++p) {
+        const unsigned long long pk = *reinterpret_cast<const unsigned long long*>(
+            reinterpret_cast<const char*>(staging) + (size_t)p * (size_t)slot_f + off);
+        if (pk > best) best = pk;
+    }
+    *out = (int)(0xFFFFFFFFu - (unsigned)(best & 0xFFFFFFFFu));
+    if (pos_ctr != nullptr) *pos_ctr = *pos_ctr + 1;
+}
+
 extern "C" int dsv41_argmax(const float* v, int* out, int n, int* pos_ctr, cudaStream_t s) {
     if (n <= 0) return (int)cudaErrorInvalidValue;
-    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, pos_ctr);
+    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, pos_ctr, 0, nullptr);
+    return (int)cudaGetLastError();
+}
+
+// Vocabulary-sliced argmax (lm_head split across ranks): rank-local reduce over
+// the slice, publish the packed comparison key into every peer's staging slot,
+// then a one-thread final picks the winner across ranks. `off` must sit where
+// the all-reduce payload never lands (the caller passes slot_bytes - 8), so the
+// argmax key and the collective staging do not collide. pos_ctr advances here,
+// once per step, exactly as the single-rank argmax did.
+extern "C" int dsv41_argmax_sliced(const float* v, int n, int idx_off, int* out,
+                                   unsigned long long* packed, int* pos_ctr,
+                                   const unsigned long long* peer_slots, int world, int rank,
+                                   const float* staging, long slot_bytes, long off,
+                                   cudaStream_t s) {
+    if (n <= 0 || world <= 0 || off + 8 > slot_bytes) return (int)cudaErrorInvalidValue;
+    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, nullptr, idx_off, packed);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    argmax_pub_kernel<<<1, 1, 0, s>>>(peer_slots, world, rank, packed, slot_bytes, off);
+    e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    argmax_final_kernel<<<1, 1, 0, s>>>(staging, world, slot_bytes, off, out, pos_ctr);
     return (int)cudaGetLastError();
 }
 

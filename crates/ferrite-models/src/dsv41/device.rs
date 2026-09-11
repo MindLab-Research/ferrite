@@ -106,6 +106,11 @@ struct Kernels {
         *const c_void, *const f32, *mut f32, c_int, *const u8, *const f32, *const u8, *const u8,
         *mut f32, c_int, *const u8, *const u8, *mut f32, *const f32, c_int, CuStream,
     ) -> c_int>,
+    // Cross-rank argmax over a vocabulary-sliced lm_head (DSV41_HEAD_SLICE).
+    argmax_sliced: Option<unsafe extern "C" fn(
+        *const f32, c_int, c_int, *mut c_int, *mut u64, *mut c_int, *const u64, c_int, c_int,
+        *const f32, i64, i64, CuStream,
+    ) -> c_int>,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
         c_int, c_int, c_int, c_int, f32, CuStream,
@@ -323,6 +328,7 @@ impl Device {
             apply_rope: km!(rt, "dsv41_apply_rope"),
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
+            argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
             moe_route: km!(rt, "dsv41_moe_route"),
             add_inplace: ko!(rt, "ferrite_add"),
@@ -995,6 +1001,40 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_bf16_fp8x2")?;
+        Ok(true)
+    }
+
+    /// Cross-rank argmax over a vocabulary-sliced lm_head: local reduce, one
+    /// published u64 per rank, a final cross-rank pick. `Ok(false)` when the
+    /// loaded .so predates the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn argmax_sliced(
+        &self,
+        v: *const f32,
+        n: i32,
+        idx_off: i32,
+        out: *mut c_int,
+        packed: *mut u64,
+        pos_ctr: *mut c_int,
+        peer_slots: *const u64,
+        world: i32,
+        rank: i32,
+        staging: *const f32,
+        slot_bytes: i64,
+        off: i64,
+    ) -> Result<bool> {
+        let f = match self.kernels.argmax_sliced {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(v, n, idx_off, out, packed, pos_ctr, peer_slots, world, rank, staging, slot_bytes, off,
+              self.stream)
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_argmax_sliced")?;
         Ok(true)
     }
 
