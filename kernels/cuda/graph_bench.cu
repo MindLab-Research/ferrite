@@ -149,8 +149,8 @@ int main(int argc, char** argv) {
 
     cudaDeviceProp prop{};
     CK(cudaGetDeviceProperties(&prop, 0));
-    printf("device: %s  sm_%d%d  SMs=%d  clock=%d kHz\n", prop.name, prop.major, prop.minor,
-           prop.multiProcessorCount, prop.clockRate);
+    printf("device: %s  sm_%d%d  SMs=%d\n", prop.name, prop.major, prop.minor,
+           prop.multiProcessorCount);
     printf("config: N=%d nodes, iters=%d, vecadd elems=%d blocks=%d threads=%d reps=%d\n\n",
            N, iters, elems, blocks, threads, reps);
 
