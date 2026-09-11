@@ -2114,10 +2114,10 @@ fn fuse_b1() -> bool {
                     w1.as_u8(),
                     w1s.as_u8(),
                     self.s.ex_act.ptr as *mut f32,
-                    inter as i32,
+                    sh_il as i32,
                     w3.as_u8(),
                     w3s.as_u8(),
-                    (self.s.ex_act.ptr as *mut f32).wrapping_add(inter),
+                    (self.s.ex_act.ptr as *mut f32).wrapping_add(sh_il),
                     self.s.xn.ptr as *const f32,
                     dim as i32,
                 )?;
