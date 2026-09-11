@@ -1292,6 +1292,18 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
     const size_t smem =
         (size_t)n_pos * (sizeof(float) + 1) + (size_t)cols * 2 * sizeof(int) + 64;
     if (smem > 200 * 1024) return (int)cudaErrorInvalidValue;  // one CTA holds all scores
+    // The bound is a CONSTANT per layer (idx_cap in chain_dev.rs), so this shared
+    // memory is larger than the 48 KiB default even though the live candidate count
+    // is small - the kernel scans up to the device counter and masks the rest to
+    // -inf, and a graph freezes launch arguments, so the size must not depend on the
+    // current step. That means the opt-in attribute is required (same pattern as
+    // gemm_fp8_mx below); setting it per call is cheap and avoids the per-device
+    // pitfall (the attribute is per-context and a TP8 process has one per rank).
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            indexer_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
     dim3 grid((unsigned)m, (unsigned)b);
     indexer_topk_kernel<<<grid, 256, smem, s>>>(q, index_k, weights, candidates, compress_lens,
                                                 out, m, nh, hd, n_pos, topk, offset, softmax_scale,
