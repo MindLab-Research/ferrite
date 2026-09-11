@@ -5921,3 +5921,25 @@ lm_head（n=16160）已在带宽地板（165MB/7.6TB/s = 21.8µs），不受此�
 1. gateup MLP unroll（#pragma unroll 2→4 + uint2 宽加载，−0.10~0.25ms）——subagent 实施中
 2. down-vec-320 revert（+0.31ms 回收，nsys-v3 发现的回归）——subagent 验证中
 3. AR pubred 优化（自旋退避/PDL）——subagent 设计中
+
+### gemm_fp8_gemv 246 次的完整分解与合并潜力（gemv-246-call-reduction）
+
+**每层 6 次 = attention 4 + MoE 2**：
+| 调用点 | 行号 | 类型 | 行数 | k |
+|---|---|---|---|---|
+| wq_a+wkv | :1808 | mx2 | 1280+512 | dim=5120 |
+| wq_b | :1882 | mx | nlh*hd | ql=1280 |
+| kvb | :1918 | mx | nlh*(128+512) | kv_lora=512 |
+| wo_a | :2135 | mx | olg | nlh*hd |
+| wo_b | :2169/:2184 | mx | dim | ol_local |
+| sh w1/w3 | :2849 | mx2 | 2×sh_il | dim=5120 |
+| sh w2 | :2933 | mx | dim | sh_il=288 |
+
+**已有的 mx2 融合已榨干**（wq_a+wkv 同激活、sh w1/w3 同激活）。
+**剩余可合并对只有 wo_a→wo_b**（异 k 链式两段核，−40 次 ≈ −0.38ms）——subagent 设计中。
+
+**attention 侧 4 次已全部被 mx2 覆盖**——不存在更多可合并对（各投影的激活各不相同）。
+**整层 6→1 只能走 Stage C persistent 段核**（理论 −200 ≈ −1.9ms）。
+
+**⚠️ 遗留待核**：246（nsys 实测）vs 242（代码推导）的 4 次差——可能是镜像差（gemv_bf16 的 −4），
+不要按 242 改文档/做预算，先跑逐符号 CSV 对齐。
