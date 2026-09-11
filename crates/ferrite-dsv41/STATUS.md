@@ -7142,3 +7142,12 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 - AR 164 → 已优化
 - quant 残余 42 → act-cpasync 直出
 - **可省 ~200-300 节点 ≈ 0.3-0.6ms（按 1.5µs）或 0.04-0.06ms（按 0.2µs）**
+
+### gemm P5 warp 专业化否决（gemm-prologue-final，2026-09-12 03:45）
+
+**P5 不可行，P4（act-cpasync）完胜**：
+1. **一 warp 一行的 M=1 GEMV**：每个 compute warp 的 dot 要读**整条** s_af（j=kb*32+lane 走满 nb_k）——不是"每 warp 只读自己列"。staging warps 无法帮忙，所有 warps 都需要全量 s_af。
+2. **同步开销**：s_af 的 k=5120 元素是全 block 共享的——compute warps 需要等 staging warps 完成**整条** s_af，本质上是 __syncthreads。volatile poll 的开销比 barrier 更差（每 warp 各自 spin）。
+3. **结论**：P5 在本 kernel 结构下是死路。P4（重开 s_a 槽 + cp.async）是唯一可行的激活路径优化。
+
+**下一步**：P4 的 A/B 正在验证中（v6p4 臂）。
