@@ -1652,6 +1652,10 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
 - **数值论证**：gate/up 逐位一致（同专家、同行内点积序 ✓）；down 的归约按 **slot 0..topk 升序**
   求和，与顺序路径"从清零的 `o` 起逐个 `o[row] += x`"**同序** ⇒ 逐位一致 ✓（fp 加法不满足结合律，
   定点序是必须的 ✓）。
+- ✅ **scratch 边界已审**（同类"两端"风险 ✗）：`ex_act_b: alloc(fb(topk*2*inter))` /
+  `ex_down_b: alloc(fb(topk*dim))` —— **按全部 topk slot 分配** ✓，与批化路径的
+  `slot*(2*inter_local)` / `slot*dim` 步长吻合 ⇒ **不越界** ✓（顺序路径复用单个 `ex_act`，
+  批化必须相离，分配端已同步跟上 ✓）。
 - **待办**：e2e 验收（`DSV41_MOE_BATCH=1`：四段文本亲自读 + 逐步计时预期降 ~2.5ms）。
 - ✅ **寄存器审计已做**（远程 `-Xptxas -v -gencode arch=compute_103a,code=sm_103a`）：
   `expert_gemv_fp4_batched_kernel` **48 regs / 0 spill / 32B stack** —— 与老
