@@ -8415,8 +8415,18 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     unsigned* const* ready_tbl, unsigned* epoch,
     const float* staging_local, const unsigned* ready_local,
     float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
-    const int threads = 1024;
-    int blocks = (n + threads - 1) / threads;
+    // Grid on the FLOAT4 count (n4), not on n: both kernels map one float4 per
+    // thread (`i4 = blockIdx*blockDim.x + tid`, grid-stride), so `ceil(n/1024)`
+    // handed block 0 the first 1024 of 1280 float4 (80%) and left the tail
+    // blocks idle for the whole kernel (one doing 256, three doing nothing) --
+    // the reduce was a single SM's serial 8192-load problem, not an NVLink one.
+    // 256 threads x ceil(n4/256) = 5 fully-populated blocks at n=5120 (one
+    // float4 x world ranks per thread, spread over 5 SMs). Bit-identical: every
+    // i4 keeps exactly one owner and the same ascending-rank accumulation order
+    // (no cross-thread reduction). `blockDim.x >= world` is required by the
+    // stamp/poll arm of the pubred kernel.
+    const int threads = (world > 256) ? 1024 : 256;
+    int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     // The store kernel's completion makes its staging writes peer-visible
     // (kernel boundary), so publish needs no fence against the store.
@@ -8446,8 +8456,9 @@ extern "C" cudaError_t ferrite_p2p_ar_pubred_v5(
     unsigned* const* ready_tbl, unsigned* epoch,
     const float* staging_local, const unsigned* ready_local,
     float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
-    const int threads = 1024;
-    int blocks = (n + threads - 1) / threads;
+    // Grid on n4, 256 threads — see the launcher note in `ferrite_p2p_ar_v5`.
+    const int threads = (world > 256) ? 1024 : 256;
+    int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride);
@@ -8608,8 +8619,10 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
     if (hc_res == nullptr || hc_post == nullptr || hc_comb == nullptr ||
         hc_n <= 0 || hc_n > 8 || (hc_h & 3) != 0 || n != hc_h)
         return cudaErrorInvalidValue;
-    const int threads = 1024;
-    int blocks = (n + threads - 1) / threads;
+    // Grid on n4, 256 threads — see the launcher note in `ferrite_p2p_ar_v5`.
+    // Both the (unchanged) store kernel and the hcpost pubred run on this grid.
+    const int threads = (world > 256) ? 1024 : 256;
+    int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
         partial, staging_tbl, epoch, world, my_rank, n, stride);

@@ -14,6 +14,26 @@
 前提：① ring/index_k 页化（1M 单序列 ≈8.4GB，×8 rank 全复制 ~67GB）；② 抬三个上限——
 `DSV41_MAX_POS`（默认 64k，`chain_dev.rs:496`）、`kIdxMaxPos=65538`、`kIdxMaxRows=8`（后两者必须锁步）。
 
+## 0.1 2026-09-11 复核（读码，未改代码）
+
+- ✅ **§0 的现状描述确认**：`prefill_chain`（`dsv41-run.rs:890`）= `for (i,&t) in ids { chain.step(t,i) }`，
+  每 token 走完整 40 层 decode 形状链。**`chain_dev.rs` 的 `step_body` 没有 `prefill_tokens>0` 分支**——
+  prefill 与 decode 共用 `step_body`，唯一差别是 `decode_steps` 门控 CUDA graph（prefill 路径不 capture，
+  `chain_dev.rs:1524-1560`）与 compressor 在 pos=0 的 mode 1。**不要去找一个不存在的 prefill 分支。**
+- ✅ **§0 前提②的上限行号已变**：`DSV41_MAX_POS` 默认 64k 现在在 `chain_dev.rs:746-753`（读 `max_seq_len.min(env)`）。
+- ⚠️ **§0 前提①的 8.4GB 是"唯一 store 的下界"，不是代码当前分配量**。`DevChain::new`
+  （`chain_dev.rs:754-781`）**对全部 43 层逐层分配** `ring=(window+max_pos/ratio+2)*head_dim(512)` f32 +
+  `index_k=(max_pos/ratio+2)*index_head_dim(128)` f32。1M 时每 rank：ratio-1 层 ≈2.5 GiB/层（20 层）、
+  ratio-2 ≈1.25 GiB/层（18 层）、ratio-0 因 `compress_ratio(l).max(1)` 仍按 1M 分（5 层 ≈2.5 GiB）
+  ⇒ **≈85 GiB/rank**（单序列、TP 下全复制），是 8.4GB 唯一 store 的 ~10×。页化/共享（consumer 不分配 ring）
+  才能回到 8.4GB。B300 实测可用 ≈275GB/rank（`perf-roadmap.md:759` 的 213GB/275GB OOM），不是 180GB；
+  85 GiB KV + 39 GiB 权重已吃紧，若再挂 189 GiB engram 表必 OOM（当前 `load.rs::skip_prefixes` 跳过）。
+- ✅ **config 实测值**（`/tmp/dsv41/config.json`）：`index_n_heads=32`、`index_head_dim=128`、`index_topk=512`、
+  `candidate_topk_blocks=2048`、`candidate_block_size=8`、`window_size=128`、`head_dim=512`、
+  `compress_ratios=[0,0,2×18,1×20,0,0,0]`、`kv_source=[2,8,14,20]`、`index_source=[2,8,14,20,24,28,32,36]`。
+- ⚠️ **indexer 上限必须锁步抬**：`kIdxMaxPos=65538`（`dsv41_kernels.cu:1886`）在 1M 下会静默截断候选
+  （`indexer_score_kernel` 的 `if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos`，`:1901`），与 `DSV41_MAX_POS` 必须同步。
+
 ## 1 三问核对（读码，非推断）
 
 | 问题 | 结论 | 证据 |

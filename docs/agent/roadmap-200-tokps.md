@@ -25,7 +25,7 @@
 | expert_gemv_fp4_batched (dsv41_experts_mxf4.cu:701) | 1.78 | **L1TEX 管道地板**，内层杠杆全阴性 |
 | hc 链（hc_mix_dots :3048 + hc_mixes_tail :3109）| 1.59 | sinkhorn 可藏 |
 | gemv_bf16_kernel (dsv41_glue.cu:317) | 0.74 | lm_head 切分后 |
-| AR v5（store ferrite_kernels.cu:8317 + pubred :8340）| 0.66 | **NVLink 协议地板**；pubred 的 stamp 已改**并行写**（thread r → peer r，barrier 后再 fence/推进 epoch）+ poll 首轮 32ns 自适应退避（2026-09-11，待重编实测）|
+| AR v5（store ferrite_kernels.cu:8317 + pubred :8340）| 0.66 | **NVLink 协议地板**（store 的 160KB 远程写 + stamp 传播）；stamp 已改**并行写**（thread r → peer r，barrier 后再 fence/推进 epoch）+ poll 首轮 32ns 自适应退避（2026-09-11）。**但 reduce 不是 NVLink 项**：`staging_local` 是本 rank 自己的 buffer，8 个 peer 的 partial 在 store 阶段已被写进来 ⇒ reduce 是**本地读**（40KB/rank 级），其 1.5-2µs 主要是 **grid 失衡**——n=5120 ⇒ n4=1280 float4，旧 launch 是 `ceil(5120/1024)=5` block × 1024 线程、映射 `i4 = blockIdx*1024+tid, step=5120` ⇒ block0 干 80%、block1 干 20%、block2-4 全空，8192 次 load 压在单 SM。**2026-09-11 已修**：三个 launcher（`ferrite_p2p_ar_v5` / `ferrite_p2p_ar_pubred_v5` / `ferrite_p2p_ar_v5_hcpost`）改成 `threads = 256`（`world > 256` 时回退 1024，stamp/poll 要求 `blockDim.x >= world`）+ `blocks = ceil(n4/threads)` ⇒ n=5120 得 5 个满块 × 256 线程 = 1280 线程、每线程恰好 1 float4 × world rank，摊在 5 个 SM。**逐位等价**：i4 的所有权与升序 rank 求和序都没变（无跨线程归约）。预期 −0.12~0.16ms。store kernel 同一映射（同 n4=1280，见 `:8418`）同改。|
 | sparse_attn | 0.32 | 3 深后 |
 | 残差（节点尾延迟）| ~1.15 | 700 节点 × ~1.5µs ramp-down，**只能靠减少节点数消** |
 

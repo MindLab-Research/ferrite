@@ -103,6 +103,81 @@ const CUDA_STREAM_NON_BLOCKING: c_int = 0x01;
 /// "priorities ... are copied from stream priority during stream capture".
 const CUDA_GRAPH_INSTANTIATE_USE_NODE_PRIORITY: u64 = 8;
 
+/// How much scheduling priority a side stream asks for. Lower CUDA value =
+/// scheduled first; the device reports the range (`greatest < least`), so
+/// `Greatest` is the `greatest` end and `Mid` sits between the two ends.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SidePrio {
+    /// Device default (0 on every device seen so far): the stream competes on
+    /// EQUAL terms with the main stream and never preempts it.
+    Default,
+    /// Halfway between `least` and `greatest`. Enough to beat the main stream
+    /// when a side chain has slack of its own, not enough to outrank a
+    /// `Greatest` sibling.
+    Mid,
+    /// The device's greatest priority: at replay, a READY node of this stream is
+    /// handed an SM before any lower-priority node in the same window.
+    Greatest,
+}
+
+/// Parse one per-stream priority knob. Unset = that stream's default policy;
+/// `"0"` pins the stream back to the device default (a pure A/B arm — priority
+/// is the only thing it changes); `"mid"` / `"greatest"` (`"1"`) name a level.
+fn parse_side_prio(var: &str, unset: SidePrio) -> SidePrio {
+    match std::env::var(var) {
+        Err(_) => unset,
+        Ok(v) => match v.as_str() {
+            "0" => SidePrio::Default,
+            "mid" => SidePrio::Mid,
+            "greatest" | "1" => SidePrio::Greatest,
+            _ => unset,
+        },
+    }
+}
+
+/// Create a side stream, best effort, at the priority `want` asks for. Returns
+/// `(stream, prio)`: `prio == 0` means the device default was in effect (the
+/// capture then stamps this stream's nodes with 0), a null stream means
+/// "unavailable" and every caller keeps its serial path. Silent — the caller
+/// owns the `[tag]` log line, which is the only evidence in a log that the hint
+/// reached the capture.
+unsafe fn create_side_stream(cudart: &Cudart, want: SidePrio) -> (CuStream, c_int) {
+    let mut s: CuStream = std::ptr::null_mut();
+    let mut prio: c_int = 0;
+    if want != SidePrio::Default {
+        if let (Some(create_prio), Some(prio_range)) =
+            (cudart.stream_create_priority, cudart.stream_priority_range)
+        {
+            // greatest < least: the API returns a NEGATIVE number for the
+            // greatest priority and, on a device without priority support, both
+            // are 0 — in which case there is nothing to gain.
+            let (mut least, mut greatest) = (0 as c_int, 0 as c_int);
+            if prio_range(&mut least, &mut greatest) == 0 && greatest < least {
+                let p = match want {
+                    SidePrio::Greatest => greatest,
+                    SidePrio::Mid => (least + greatest) / 2,
+                    SidePrio::Default => 0,
+                };
+                if p != 0 && create_prio(&mut s, CUDA_STREAM_NON_BLOCKING, p) == 0 {
+                    prio = p;
+                } else {
+                    let _ = (cudart.last_error)();
+                    s = std::ptr::null_mut();
+                }
+            }
+        }
+    }
+    if s.is_null() {
+        // clear any sticky error from the priority attempt before retrying
+        let _ = (cudart.last_error)();
+        if (cudart.stream_create)(&mut s) != 0 {
+            let _ = (cudart.last_error)();   // clear the sticky flag
+            s = std::ptr::null_mut();
+        }
+    }
+    (s, prio)
+}
+
 struct Cublas {
     create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
     set_stream: unsafe extern "C" fn(*mut c_void, CuStream) -> c_int,
@@ -324,6 +399,11 @@ pub struct DevRuntime {
     /// the graph instantiation can decide whether the node-priority flag is
     /// worth passing, and so a log can state what was actually in effect.
     side_prio: c_int,
+    /// Priority `side_stream2` was created with (0 = device default). Logged /
+    /// probeable for the same reason as [`DevRuntime::side_prio`].
+    side2_prio: c_int,
+    /// Priority `side_stream3` was created with (0 = device default).
+    side3_prio: c_int,
     /// SECOND side stream — the attention dual chain (`DSV41_DUAL_CHAIN`): the
     /// kv half of `attention()` (kv norm + rope) is issued here so it overlaps
     /// the whole q chain (rmsnorm_q/NORM_FUSE + wq_b + rope) on `stream`.
@@ -331,8 +411,9 @@ pub struct DevRuntime {
     /// LATE half is still live when it is issued (the tail fork happens in
     /// `hc_mixes_auto`, i.e. *before* attention's `lin2`), so sharing one stream
     /// would serialise the two instead of overlapping them.
-    /// Created WITHOUT a priority hint: the kv chain is filler, the q chain is
-    /// the critical path, so it must never preempt it.
+    /// Created at the device DEFAULT priority: the kv chain is filler and the q
+    /// chain on the main stream is the critical path, so it must not preempt it.
+    /// `DSV41_DUAL_PRIO=mid|greatest` moves it (measure before believing it).
     /// Null when uncreatable → the model keeps the serial kv chain.
     side_stream2: CuStream,
     /// THIRD side stream — the compressor (`DSV41_COMPRESS_SIDE`): the four
@@ -346,11 +427,16 @@ pub struct DevRuntime {
     /// buffers are disjoint from both chains (layer-private kvp/scp/state/latent
     /// + the ring's COMPRESSED rows, never `s.kv`/`s.qr`/`s.xq`), so the three
     /// streams never touch the same bytes.
-    /// Created WITHOUT a priority hint for the same reason as `side_stream2`.
+    /// Created at the device's GREATEST priority by default
+    /// (`DSV41_COMPRESS_PRIO=0` reverts): of the three side chains this is the
+    /// LONGEST and the last to be consumed, so it is the one that gates a
+    /// saturated attention window.
     /// Null when uncreatable → the model keeps the serial compressor.
     side_stream3: CuStream,
-    /// Flags for `cudaGraphInstantiate`. Non-zero only when the side stream is a
-    /// priority stream AND `DSV41_GRAPH_NODE_PRIORITY` is not 0.
+    /// Flags for `cudaGraphInstantiate`. Non-zero only when AT LEAST ONE side
+    /// stream is a priority stream AND `DSV41_GRAPH_NODE_PRIORITY` is not 0. The
+    /// flag is global to the graph: it makes the replay honour every node's
+    /// captured priority, so it must not be keyed on a single stream.
     graph_instantiate_flags: u64,
     /// Fork/join events for the tail split, created with `cudaEventDisableTiming`
     /// so they are legal inside a stream capture. Recorded by the kernel launcher,
@@ -479,77 +565,59 @@ impl DevRuntime {
             // other consumer are unaffected. The events MUST be disable-timing:
             // a timing event makes cudaStreamEndCapture fail once the fork/join
             // lands inside the whole-step graph.
-            let mut side_stream: CuStream = std::ptr::null_mut();
-            // Priority of the side stream (0 = default). Non-zero means the graph
-            // capture stamped its kernel nodes with this priority, and the graph
-            // MUST be instantiated with the node-priority flag for that to mean
-            // anything at replay time.
-            let mut side_prio: c_int = 0;
-            // `DSV41_HC_TAIL_PRIO=0` pins the side stream back to the default
-            // priority (A/B knob: the scheduling hint is the only thing it changes).
-            let prio_wanted = std::env::var("DSV41_HC_TAIL_PRIO")
-                .map(|v| v != "0")
-                .unwrap_or(true);
-            if prio_wanted {
-                if let (Some(create_prio), Some(prio_range)) =
-                    (cudart.stream_create_priority, cudart.stream_priority_range)
-                {
-                    // greatest < least: the API returns a NEGATIVE number for the
-                    // greatest priority and, on a device without priority support,
-                    // both are 0 - in which case there is nothing to gain.
-                    let (mut least, mut greatest) = (0 as c_int, 0 as c_int);
-                    if prio_range(&mut least, &mut greatest) == 0 && greatest < least {
-                        if create_prio(&mut side_stream, CUDA_STREAM_NON_BLOCKING, greatest) != 0 {
-                            let _ = (cudart.last_error)();
-                            side_stream = std::ptr::null_mut();
-                        } else {
-                            side_prio = greatest;
-                        }
-                    }
-                }
-            }
-            if side_stream.is_null() {
-                // clear any sticky error from the priority attempt before retrying
-                let _ = (cudart.last_error)();
-                if (cudart.stream_create)(&mut side_stream) != 0 {
-                    let _ = (cudart.last_error)();   // clear the sticky flag
-                    side_stream = std::ptr::null_mut();
-                }
-            }
+            // --- the three side streams, each with its OWN priority policy. The
+            // knobs are deliberately independent (an A/B must be able to move one
+            // stream without touching the others):
+            //   `DSV41_HC_TAIL_PRIO`  (default greatest) tail_late  ~10.7us
+            //   `DSV41_DUAL_PRIO`     (default default)  kv chain ~10.6us / MoE shared ~22us
+            //   `DSV41_COMPRESS_PRIO` (default greatest) compressor ~30us
+            // Values: "0" = device default, "mid" = midpoint of the range,
+            // "greatest"/"1" = the device's greatest priority.
+            // A non-zero priority is only half the story: the graph capture copies
+            // each stream's priority onto ITS nodes, and the replay honours them
+            // only when `cudaGraphInstantiate` gets the node-priority flag below.
+            let tail_prio = parse_side_prio("DSV41_HC_TAIL_PRIO", SidePrio::Greatest);
+            let dual_prio = parse_side_prio("DSV41_DUAL_PRIO", SidePrio::Default);
+            let compress_prio = parse_side_prio("DSV41_COMPRESS_PRIO", SidePrio::Greatest);
+            let (side_stream, side_prio) = create_side_stream(&cudart, tail_prio);
             if side_stream.is_null() {
                 eprintln!("[hc_tail] side stream unavailable — tail split stays single-launch");
             } else if side_prio != 0 {
                 // (this line matters: it is the only evidence in a log that the
                 // priority actually reached the capture)
-                eprintln!("[hc_tail] side stream priority = {side_prio} (greatest)");
+                eprintln!("[hc_tail] side stream priority = {side_prio}");
             }
-            // Second side stream: the attention dual chain's kv half. Plain
-            // create (default priority) — see the field comment for why it is
-            // separate from `side_stream` and why it must NOT take the
-            // greatest-priority hint.
-            let mut side_stream2: CuStream = std::ptr::null_mut();
-            if (cudart.stream_create)(&mut side_stream2) != 0 {
-                let _ = (cudart.last_error)();   // clear the sticky flag
-                side_stream2 = std::ptr::null_mut();
-            }
+            // Second side stream: the attention dual chain's kv half — and, in the
+            // MoE phase, the shared-expert half. Default priority unless
+            // `DSV41_DUAL_PRIO` moves it: both of its chains live in a window that
+            // the MAIN stream's own chain must also cross, so outranking the main
+            // stream is not obviously a win.
+            let (side_stream2, side2_prio) = create_side_stream(&cudart, dual_prio);
             if side_stream2.is_null() {
                 eprintln!("[dual_chain] second side stream unavailable — kv chain stays serial");
+            } else if side2_prio != 0 {
+                eprintln!("[dual_chain] second side stream priority = {side2_prio}");
             }
             // Third side stream: the compressor half (`DSV41_COMPRESS_SIDE`).
-            // Plain create (default priority) — see the field comment for why it
-            // must be a THIRD stream (the kv chain already owns side_stream2 in
-            // the same window) and why it must not take the priority hint.
-            let mut side_stream3: CuStream = std::ptr::null_mut();
-            if (cudart.stream_create)(&mut side_stream3) != 0 {
-                let _ = (cudart.last_error)();   // clear the sticky flag
-                side_stream3 = std::ptr::null_mut();
-            }
+            // GREATEST by default: it is the longest of the three side chains
+            // (~30us, vs ~13.5us for the q chain and ~10.6us for the kv chain) and
+            // the last to be consumed (its join sits before the indexer /
+            // `sparse_attn`) — i.e. the one that gates the attention window
+            // whenever SM is saturated. It must be a THIRD stream (the kv chain
+            // already owns side_stream2 in the same window).
+            let (side_stream3, side3_prio) = create_side_stream(&cudart, compress_prio);
             if side_stream3.is_null() {
                 eprintln!("[compress_side] third side stream unavailable — compressor stays serial");
+            } else if side3_prio != 0 {
+                eprintln!("[compress_side] third side stream priority = {side3_prio}");
             }
             // Node-priority instantiation is what makes the captured priority
             // effective at replay. `DSV41_GRAPH_NODE_PRIORITY=0` pins it off.
-            let node_prio = side_prio != 0
+            // Gated on ANY stream carrying a non-default priority — not on the
+            // tail's alone — so pinning one stream back to 0 (or a device that
+            // refuses one create) does not silently disable the flag for the
+            // others.
+            let node_prio = (side_prio != 0 || side2_prio != 0 || side3_prio != 0)
                 && std::env::var("DSV41_GRAPH_NODE_PRIORITY")
                     .map(|v| v != "0")
                     .unwrap_or(true);
@@ -625,6 +693,8 @@ impl DevRuntime {
                 stream,
                 side_stream,
                 side_prio,
+                side2_prio,
+                side3_prio,
                 side_stream2,
                 side_stream3,
                 graph_instantiate_flags,
@@ -664,6 +734,16 @@ impl DevRuntime {
     /// ignored it".
     pub fn side_stream_priority(&self) -> c_int {
         self.side_prio
+    }
+
+    /// Priority `side_stream2` was created with (0 = device default).
+    pub fn side_stream2_priority(&self) -> c_int {
+        self.side2_prio
+    }
+
+    /// Priority `side_stream3` was created with (0 = device default).
+    pub fn side_stream3_priority(&self) -> c_int {
+        self.side3_prio
     }
 
     /// Second side stream — the attention dual chain's kv half

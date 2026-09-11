@@ -114,7 +114,7 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 
 1. **`p2p_ar_pubred_v5_hcpost` 现在在默认路径上**（2026-09-11 起）：`DSV41_HCPOST_EPI` **默认 ON**（`chain_dev.rs:2033`）。它此前与**默认 ON** 的 tail split（第 41 轮实测 −0.20ms）**互斥**——`hc_mixes_auto` 的 split 分支要求 `!Self::hcpost_epi()`；该互斥已解除：根因是 fold 在 AR 内消费 `post`/`comb`（早于 `layer` 中位于 AR **之后**的 join），修复方式是让 `ar_hc_post_fold` 在 fused AR 之前自行 `hc_tail_join()`（`chain_dev.rs:1383-1391`），即把 join 挪到「LATE 输出的第一个消费者」之前。默认配置现在同时跑 split 与 fold。
 2. **跨 TU 设备符号**：`g_hc_part` 是 `dsv41_kernels.cu:3632` 的 `__device__` 全局，而 `p2p_ar_pubred_v5_hcpost_kernel` 在 `ferrite_kernels.cu:8523`；`build.sh` **无 `-rdc=true`** ⇒ 跨 TU 设备符号不可见（hc_post 数学当初正为此在 `ferrite_kernels.cu:8467` **逐句复制**而非共享）。要在 pubred 里写 `g_hc_part`，只能额外把 partial 缓冲当 kernel 参数从 Rust 传指针进来，并让读端（tail）也改走该指针。
-3. **grid 并行度**：pubred grid = `ceil(n/1024)=5` block，但活跃线程只有 `n4 = 1280`（≈**1.25 block**），其余 3840 线程在 reduce/epilogue 全程空转。24 行点积的权重流是 **1.92MB**，现在由 **24 block/24 SM** 拉（531GB/s、7.4µs）。融进 pubred 等于把同样字节压到 ~2 个 SM ⇒ 正是 P1c/P1d 记录过的「单块/少块装不下 24 个权重行」形态，回归风险高。
+3. **grid 并行度**：pubred grid = `ceil(n/1024)=5` block，但活跃线程只有 `n4 = 1280`（≈**1.25 block**），其余 3840 线程在 reduce/epilogue 全程空转。24 行点积的权重流是 **1.92MB**，现在由 **24 block/24 SM** 拉（531GB/s、7.4µs）。融进 pubred 等于把同样字节压到 ~2 个 SM ⇒ 正是 P1c/P1d 记录过的「单块/少块装不下 24 个权重行」形态，回归风险高。（**2026-09-11 部分消解**：三个 AR v5 launcher 已改成 `threads=256, blocks=ceil(n4/256)`，n=5120 时是 5 个满块 × 256 线程摊在 5 个 SM，不再有 3840 空转线程。但 5 个 SM 对 24 行点积的 1.92MB 权重流仍不够 —— 本条阻塞的**结论不变**：dots 不该折进 pubred。）
 
 **默认路径下的正确载体是 `dsv41_hc_post_inplace`**（`dsv41_kernels.cu:3838`，launcher `:3875`）：与 `g_hc_part`/`hc_mixes_tail_kernel` **同 TU**（无跨 TU 问题）；线程所有权与 pubred epilogue 同构（一线程 4 列 × 全部 hc 行）；**默认 ON**（`fuse_c()` 默认 true，`chain_dev.rs:1312` 在 `!hcpost_epi()` 时走它），且与 tail split 兼容。
 

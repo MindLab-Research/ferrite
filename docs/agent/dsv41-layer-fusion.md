@@ -428,6 +428,19 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     只能藏住窗口那部分 ⇒ 预期 **−0.05~0.06ms/步**（4 层 × ~14µs），不是 30µs×4。
   - 开关：`DSV41_COMPRESS_SIDE=0` 回退串行（同二进制 A/B）。上机须同会话背靠背单轮实测，并
     同时验证 `opcheck`/faults 与文本。
+- **三条侧流的优先级分配（`devrt.rs::create_side_stream`，每流独立 env gate）** ✓：
+  优先级只在**图回放**且节点 READY 时决定谁先拿 SM（`cudaGraphInstantiateFlagUseNodePriority`，
+  全局一个标志），因此只有"最长且最晚被消费 = 真正卡窗口"的链才值得 greatest。
+  - `DSV41_HC_TAIL_PRIO`（tail_late ~10.7µs，hc 投影窗口 ~50µs）：默认 greatest。**疑似过度分配**
+    ——39µs 的余量下优先级不带来收益，反而可能抢走投影 wave 的 SM。A/B：`=0`。
+  - `DSV41_DUAL_PRIO`（kv 链 ~10.6µs vs q 链 13.5µs；MoE shared ~22µs vs routed ~42µs）：默认
+    **default(0)**。它两条链都在主流自己的串行路径上，压主流不划算；需要时可 `=mid`/`=greatest`。
+  - `DSV41_COMPRESS_PRIO`（compress ~30µs，是三条侧流里最长的，且汇合点最晚——在 indexer/
+    `sparse_attn` 之前）：默认 **greatest**。它是窗口被 SM 打满时唯一真正 gate 住 attention 的链。
+  - ⚠️ 节点优先级标志的开启条件已从"tail 流有优先级"改为"**任一**侧流有非默认优先级"，否则
+    把 `HC_TAIL_PRIO=0` 会连带静默关掉 side_stream2/3 的优先级。
+  - 判据：nsys `--cuda-graph-trace=node` 看三条侧链的 span 是否落在各自窗口内；stderr 的
+    `[hc_tail]/[dual_chain]/[compress_side] side stream priority = N` 是优先级真的进了 capture 的唯一证据。
 
 ---
 
