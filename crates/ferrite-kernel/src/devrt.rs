@@ -439,17 +439,19 @@ pub struct DevRuntime {
     /// captured priority, so it must not be keyed on a single stream.
     graph_instantiate_flags: u64,
     /// Fork/join events for the tail split, created with `cudaEventDisableTiming`
-    /// so they are legal inside a stream capture. Recorded by the kernel launcher
-    /// (`fork_ev` on main right after the EARLY half, waited on the side stream;
-    /// `join_ev` on the side stream after the LATE half, waited on main by the
-    /// model), so the pair is the split's ONLY main<->side edge. Reused for every
-    /// tail call — the SAME event object is re-recorded 80x per step (40 tail
-    /// calls x record/wait), so the capture relies on PROGRAM ORDER to
-    /// disambiguate the records: each fork is immediately followed by its
-    /// matching join, and a new path that re-records an event but waits it later
-    /// would silently bind earlier nodes. Any new side-chain must therefore keep
-    /// the fork-then-join ADJACENT in program order, or allocate a separate event
-    /// pool.
+    /// so they are legal inside a stream capture. `fork_ev` carries BOTH split
+    /// edges (the launcher records it on main before the side chain and waits it
+    /// on the side stream — the input-ready edge; then records it on the side
+    /// stream right after the EARLY half and waits it on main — the EARLY-done
+    /// edge); `join_ev` is recorded on the side stream after the LATE half and
+    /// waited on main by the model. Reused for every tail call — the SAME event
+    /// objects are re-recorded ~40-80x per step, so the capture relies on PROGRAM
+    /// ORDER to disambiguate the records: every record is immediately followed by
+    /// its matching wait (fork record/wait at both edges, join record then the
+    /// model's hc_tail_join wait), and a path that re-records an event but waits
+    /// it later would silently bind earlier nodes. Any new side-chain must
+    /// therefore keep each record-then-wait ADJACENT in program order, or
+    /// allocate a separate event pool.
     fork_ev: *mut c_void,
     join_ev: *mut c_void,
     /// Fork/join events for the attention dual chain — same contract as

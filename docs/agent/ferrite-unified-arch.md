@@ -100,8 +100,8 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 | # | 名称 | 拆出的两条链 | fork 点 | join 点 | gate / 状态 |
 |---|---|---|---|---|---|
 | 1 | **hc tail split** | EARLY（collapse+rmsnorm+fp8，~1.7µs）vs LATE（ss+mixes+sinkhorn+comb，~10.7µs） | `hc_front_split` 内（C 侧） | 主流 hc_post 前 | `DSV41_HC_TAIL_SPLIT`（`chain_dev.rs:2238`）；第 41 轮实测仅 −0.20ms（理论 −0.86） |
-| 2 | **EARLY-on-side**（hc-early-opt） | EARLY 移到侧流头部与 dots 并发（dots 4.9µs > EARLY 1.7µs） | side 链头（`in_ev` 之后） | `early_ev`（`hc_front_split` 内 wait） | 复用 `DSV41_HC_TAIL_SPLIT`；**新增 `in_ev`/`early_ev` 两条边**（EARLY 读 `s.h`，必须排在上一段 hc_post 之后） |
-| 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before ⇒ **删掉 `fork_ev` 的 record/wait** | 复用 `DSV41_HC_TAIL_SPLIT`；main 的 front 代价从 dots(4.9µs) 降到 EARLY(1.7µs)，上界 −0.5ms |
+| 2 | **EARLY-on-side**（hc-early-opt） | EARLY 落到侧流头部，后面的 dots/LATE 与投影链重叠 | side 链头（`fork_ev` 输入就绪边之后） | `fork_ev` 的第二次 record（`hc_front_split` 内等） | 复用 `DSV41_HC_TAIL_SPLIT`；B（EARLY 回主流）A/B 实测 +0.27ms ⇒ **2026-09-11 已回滚**（B 删掉的 `in_ev`/`early_ev` 不再恢复，两条边改由 `fork_ev` 承担） |
+| 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before；`join_ev` 交模型侧 `hc_tail_join` | 复用 `DSV41_HC_TAIL_SPLIT`；main 的 front 代价从 dots(4.9µs) 降到 EARLY(1.7µs) |
 | 4 | **attention dual-chain** | q 链（norm/lin_rope+wq_b+rope，~13.5µs，关键路径）vs kv 链（rmsnorm_rope，~10.6µs，填充） | `lin2` 之后 | kv 链之后、`ring_win_fuse` **之前**（不是 sparse_attn——ring append 立即读 `s.kv`） | `DSV41_DUAL_CHAIN`（`chain_dev.rs:312`）；收益 ≈ −0.10ms（v3 实测 rmsnorm_rope 2.5µs×40） |
 | 5 | **MoE dual** | routed experts 链（~42µs）vs shared expert 链（~22µs） | `moe()` 顶部（`sh_w` 后、gate 前） | routed 之后 join，再 `add_inplace(&s.o,&s.ex_out)` | `DSV41_MOE_DUAL`（`chain_dev.rs:365`）；⚠️ 强约束见下 |
 | 6 | **compress side** | kv-source 层（2/8/14/20）的 4 个 compress launch（~30µs） | `lin2` 之后（与 dual_chain fork 同点） | `window_idxs` 之后、**indexer 之前**（indexer 读本层 `latent` 与 `clen`） | `DSV41_COMPRESS_SIDE`（`chain_dev.rs:338`）；需**新开 `side_stream3`**（与 kv 链时间窗完全重叠） |

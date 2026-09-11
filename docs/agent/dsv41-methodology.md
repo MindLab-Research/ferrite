@@ -47,8 +47,8 @@ grid 失衡导致的空转 SM）。架构级评估（`STATUS.md:6547`）的结�
 | # | 名称 | 拆出的两条链 | fork 点 | join 点 | gate / 案例 |
 |---|---|---|---|---|---|
 | 1 | **hc tail split** | EARLY（collapse+rmsnorm+fp8 ≈1.7µs）vs LATE（ss+mixes+sinkhorn+comb ≈10.7µs） | `hc_front_split` 内（C 侧） | 主流 hc_post 前 | `DSV41_HC_TAIL_SPLIT`（`chain_dev.rs:2238`）；round 41 实测仅 −0.20ms（理论 −0.86，缺口见 §2.2 的调度坑） |
-| 2 | **EARLY-on-side**（已**回退**，见 #3 与 B） | EARLY 移到侧流头部与 dots 并发（dots 4.9µs > EARLY 1.7µs） | side 链头（`in_ev` 之后） | `early_ev` | `e152f47` 引入、`806ec7a` 后成为净负担：main 仍付 1.7µs（改付 `early_ev` 的跨流往返），却每 front 多 4 个图节点 ⇒ **B 回退**（EARLY 回主流，零 event） |
-| 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before ⇒ 只需**一对** `fork_ev`/`join_ev` | `806ec7a`，关键路径 −0.256ms（确定性值，非区间）。B 之后的发射序列：`main: EARLY -> record(fork_ev)`；`side: wait(fork_ev) -> dots -> LATE -> record(join_ev)` |
+| 2 | **EARLY-on-side**（**已恢复**，2026-09-11 回滚 B） | EARLY 移到侧流头部，与 dots/LATE 同链顺序执行 | side 链头（`fork_ev` 输入就绪边之后） | `fork_ev` 的第二次 record（EARLY 完成） | `e152f47` 引入；B（`a6c4ed3`，EARLY 回主流）A/B 实测 +0.27ms 主力 ⇒ 已回滚：EARLY 重新落到 `side` 头部，main 只等 EARLY 的 1.7µs |
+| 3 | **dots-on-side** | dots 也上侧流（只写 `g_hc_part`，唯一读者是 LATE） | side（EARLY 之后） | 流内顺序即 happens-before；`join_ev` 交给模型侧 `hc_tail_join` | `806ec7a`，关键路径 −0.256ms。回滚 B 之后的发射序列：`main: record(fork_ev) -> wait(fork_ev)`；`side: wait(fork_ev) -> EARLY -> record(fork_ev) -> dots -> LATE -> record(join_ev)` |
 | 4 | **attention dual-chain** | q 链（norm/lin_rope+wq_b+rope ≈13.5µs，关键路径）vs kv 链（rmsnorm_rope ≈10.6µs，填充） | `lin2` 之后 | kv 链之后、`ring_win_fuse` **之前** | `DSV41_DUAL_CHAIN`（`chain_dev.rs:312`）；`2d7eead` |
 | 5 | **MoE dual** | routed experts（≈42µs）vs shared expert（≈22µs） | `moe()` 顶部（`sh_w` 后、gate 前） | routed 之后 join，再 `add_inplace(&s.o,&s.ex_out)` | `DSV41_MOE_DUAL`（`chain_dev.rs:365`）；`2d7eead` |
 | 6 | **compress side** | kv-source 层（2/8/14/20）的 4 个 compress launch（≈30µs） | `lin2` 之后（与 dual_chain 同点） | `window_idxs` 之后、**indexer 之前** | `DSV41_COMPRESS_SIDE`（`chain_dev.rs:338`）；`ec439e3`，需**新开 `side_stream3`** |
@@ -60,7 +60,9 @@ grid 失衡导致的空转 SM）。架构级评估（`STATUS.md:6547`）的结�
 `record_event`（`:862`）、`stream_wait_event`（`:873`）、事件对 `fork/join`（`:796`/`:803`）、
 `fork2/join2`（`:826`/`:833`）、`fork3/join3`（`:847`/`:855`）、
 `SidePrio` 解析（`parse_side_prio`，`:126`）。
-（`in_ev`/`early_ev` 已随 B 删除：EARLY 回主流后不需要它们，`.cu` 侧只保留同名死参数位。）
+（`in_ev`/`early_ev` 已随 B 删除且**不再恢复**：两条边（main→side 输入就绪、side→main EARLY 完成）
+改由 `fork_ev` 每 front 记录两次承担——每次 record 后都紧邻它自己的 wait，满足整步 capture 的
+program-order 消歧规则；`join_ev` 仍每 front 只记录一次，`hc_tail_join` 语义不变。）
 
 ### 必须遵守的三条规则（从 6 个实现里提炼）
 
