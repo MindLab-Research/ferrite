@@ -1219,12 +1219,15 @@ static const int g_gemv_fp8_mode = [] {
     if (e != nullptr) return atoi(e);              // 0 scalar, 1 vectorised, 3 staged+ordered
     const char* v = getenv("DSV41_GEMV_FP8_VEC");
     if (v != nullptr && v[0] == '0') return 0;     // the earlier opt-out still honoured
-    // The staged mode is the default because it won on both axes at once: 20.04 ms
-    // against the vectorised 21.52 ms in one session, same binary, and it is
-    // bit-identical to the scalar path so the stray token the reordering used to
-    // flip is gone. The wide loads are what made the vectorised branch fast, and
-    // staging keeps them without paying its order change.
-    return 3;
+    // The staged modes are the default because they won on both axes at once:
+    // mode 3 measured 20.04 against the vectorised 21.52 ms in one session, same
+    // binary, and it is bit-identical to the scalar path so the stray token the
+    // reordering used to flip is gone; mode 4 additionally stages the activation
+    // once per block instead of letting all eight warps re-read it, which
+    // measured 19.24 against mode 3's 19.96 ms with the same clean text. The wide
+    // loads are what made the vectorised branch fast, and staging keeps them
+    // without paying its order change.
+    return 4;
 }();
 
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
@@ -2200,7 +2203,10 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
 
 static const bool g_hc_front = [] {
     const char* e = getenv("DSV41_HC_FRONT");
-    return e != nullptr && e[0] != '0';
+    // Default on: 16.85 ms against 19.96 ms in one session, same binary, with the
+    // four prompts character-for-character correct. "0" still opts out.
+    if (e == nullptr) return true;
+    return e[0] != '0';
 }();
 
 extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
