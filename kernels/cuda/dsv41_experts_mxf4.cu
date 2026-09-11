@@ -795,26 +795,26 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float2 t1 = s_lut2[(w0 >> 8) & 0xFFu];
                 const float2 t2 = s_lut2[(w0 >> 16) & 0xFFu];
                 const float2 t3 = s_lut2[(w0 >> 24) & 0xFFu];
-                p0 = fmaf(s_act(j + 0), t0.x, p0);
-                p1 = fmaf(s_act(j + 1), t0.y, p1);
-                p2 = fmaf(s_act(j + 2), t1.x, p2);
-                p3 = fmaf(s_act(j + 3), t1.y, p3);
-                p0 = fmaf(s_act(j + 4), t2.x, p0);
-                p1 = fmaf(s_act(j + 5), t2.y, p1);
-                p2 = fmaf(s_act(j + 6), t3.x, p2);
-                p3 = fmaf(s_act(j + 7), t3.y, p3);
+                p0 = fmaf(s_act[j + 0], t0.x, p0);
+                p1 = fmaf(s_act[j + 1], t0.y, p1);
+                p2 = fmaf(s_act[j + 2], t1.x, p2);
+                p3 = fmaf(s_act[j + 3], t1.y, p3);
+                p0 = fmaf(s_act[j + 4], t2.x, p0);
+                p1 = fmaf(s_act[j + 5], t2.y, p1);
+                p2 = fmaf(s_act[j + 6], t3.x, p2);
+                p3 = fmaf(s_act[j + 7], t3.y, p3);
                 const float2 u0 = s_lut2[w1 & 0xFFu];
                 const float2 u1 = s_lut2[(w1 >> 8) & 0xFFu];
                 const float2 u2 = s_lut2[(w1 >> 16) & 0xFFu];
                 const float2 u3 = s_lut2[(w1 >> 24) & 0xFFu];
-                p0 = fmaf(s_act(j + 8), u0.x, p0);
-                p1 = fmaf(s_act(j + 9), u0.y, p1);
-                p2 = fmaf(s_act(j + 10), u1.x, p2);
-                p3 = fmaf(s_act(j + 11), u1.y, p3);
-                p0 = fmaf(s_act(j + 12), u2.x, p0);
-                p1 = fmaf(s_act(j + 13), u2.y, p1);
-                p2 = fmaf(s_act(j + 14), u3.x, p2);
-                p3 = fmaf(s_act(j + 15), u3.y, p3);
+                p0 = fmaf(s_act[j + 8], u0.x, p0);
+                p1 = fmaf(s_act[j + 9], u0.y, p1);
+                p2 = fmaf(s_act[j + 10], u1.x, p2);
+                p3 = fmaf(s_act[j + 11], u1.y, p3);
+                p0 = fmaf(s_act[j + 12], u2.x, p0);
+                p1 = fmaf(s_act[j + 13], u2.y, p1);
+                p2 = fmaf(s_act[j + 14], u3.x, p2);
+                p3 = fmaf(s_act[j + 15], u3.y, p3);
                 a0 = fmaf(sc, p0, a0);
                 a1 = fmaf(sc, p1, a1);
                 a2 = fmaf(sc, p2, a2);
@@ -825,8 +825,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const uint8_t byte = brow[j >> 1];
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const float2 t = s_lut2[byte];
-                acc += s_act(j) * (t.x * sc);
-                acc += s_act(j + 1) * (t.y * sc);
+                acc += s_act[j] * (t.x * sc);
+                acc += s_act[j + 1] * (t.y * sc);
             }
         } else if (vec) {
             // 32 lanes * 8 values = 256 values per iteration, four scale blocks.
@@ -837,20 +837,20 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 // 256 packed values are 128 bytes, so group g starts at g*128, not g*64.
             const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 7) + off);
-                acc += s_act(j + 0) * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
-                acc += s_act(j + 1) * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
-                acc += s_act(j + 2) * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
-                acc += s_act(j + 3) * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
-                acc += s_act(j + 4) * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
-                acc += s_act(j + 5) * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
-                acc += s_act(j + 6) * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
-                acc += s_act(j + 7) * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
+                acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
+                acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
+                acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
+                acc += s_act[j + 3] * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
+                acc += s_act[j + 4] * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
+                acc += s_act[j + 5] * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
+                acc += s_act[j + 6] * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
+                acc += s_act[j + 7] * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
             }
             for (int j = (nv << 8) + lane * 2; j < k; j += 64) {
                 const uint8_t byte = brow[j >> 1];
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-                acc += s_act(j) * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
-                acc += s_act(j + 1) * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
+                acc += s_act[j] * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
+                acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
             }
         } else {
             for (int j = lane * 2; j < k; j += 64) {
@@ -858,8 +858,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
                 const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-                acc += s_act(j) * w0;
-                acc += s_act(j + 1) * w1;
+                acc += s_act[j] * w0;
+                acc += s_act[j + 1] * w1;
             }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);

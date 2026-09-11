@@ -1217,6 +1217,73 @@ __device__ __forceinline__ bool idx_key_worse(float av, int ap, float bv, int bp
     return (av < bv) || (av == bv && ap > bp);
 }
 
+// ------------------------------------------------------- indexer score (stage A)
+// The scoring pass of `indexer_topk_kernel`, split into its own kernel so the
+// per-candidate work (nh-lane 128-deep FMA chain + 32-shuffle reduce) is spread
+// over the whole machine instead of being swept by 32 warps in 64 serial waves.
+// It writes the SAME per-(row, candidate) value the fused kernel used to build in
+// its chunk loop: identical lane<nh map, ascending-h shuffle sum,
+// `fmaxf(dot,0) * w[..]` product, `acc * softmax_scale * head_scale` order, and
+// identical cl / candidate masks - so stage B's sort/merge/output see the same bits.
+//
+// Fixed dims, exactly like g_attn_part: the second extent is a STRIDE and never
+// the live candidate count. n_pos is a PER-STEP value and a CUDA graph freezes
+// both the launch arguments and the grid, so the grid below is a constant and the
+// live bound is read from `*lens` inside the kernel. kIdxMaxPos covers the largest
+// count the config can reach (max_comp = max_pos / ratio + 2, ratio >= 1,
+// DSV41_MAX_POS default 64k -> 65538 for a ratio-1 layer). RAISE kIdxMaxPos IN
+// LOCKSTEP WITH DSV41_MAX_POS or both stages clamp together and silently drop
+// candidates.
+#define kIdxMaxRows 8            // b*m rows (one indexer row per (b,m) pair)
+#define kIdxMaxPos  (65536 + 2)  // compressed latents per row, this run's ceiling
+__device__ float g_idx_score[kIdxMaxRows][kIdxMaxPos];
+
+// Grid (kIdxScoreBlocks, m, b): one warp per candidate, grid-strided over the live
+// range, so the LAUNCH SHAPE never depends on n_pos.
+constexpr int kIdxScoreBlocks = 256;   // 256 blocks x 8 warps = 2048 warps in flight
+
+__global__ void indexer_score_kernel(const float* __restrict__ q, const float* __restrict__ ik,
+                                     const float* __restrict__ w, const uint8_t* __restrict__ cand,
+                                     const int32_t* __restrict__ lens, int m, int nh, int hd,
+                                     int n_pos, float softmax_scale, float head_scale,
+                                     int uses_cand) {
+    // `n_pos` is the host fallback; the live device counter wins (same rule as the
+    // fused kernel), and the declared bound is a defensive ceiling.
+    if (lens != nullptr && *lens > 0) n_pos = *lens;
+    if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos;
+    const int mm = blockIdx.y, bb = blockIdx.z;
+    const size_t row = (size_t)bb * m + mm;
+    if (row >= kIdxMaxRows) return;
+    int cl = n_pos;
+    if (lens != nullptr) cl = lens[mm];
+    if (cl > n_pos) cl = n_pos;
+    const float* qrow = q + row * (size_t)nh * hd;
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    const int nwarp = (int)(blockDim.x >> 5);
+    // Per-ROW warp id and per-row stride: blocks on other (y,z) handle other rows.
+    const int gw = (int)blockIdx.x * nwarp + wid;
+    const int ntot = (int)(gridDim.x * nwarp);
+    for (int p = gw; p < n_pos; p += ntot) {
+        const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
+        float dot = 0.f;
+        if (lane < nh) {
+            const float* qh = qrow + (size_t)lane * hd;
+            for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
+            dot = fmaxf(dot, 0.f) * w[row * (size_t)nh + lane];
+        }
+        float acc = 0.f;
+        for (int h = 0; h < nh; ++h) {
+            const float dv = __shfl_sync(0xFFFFFFFFu, dot, h);
+            if (lane == 0) acc += dv;
+        }
+        acc = __shfl_sync(0xFFFFFFFFu, acc, 0);
+        float sv = acc * softmax_scale * head_scale;
+        if (p >= cl) sv = -INFINITY;
+        if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
+        if (lane == 0) g_idx_score[row][p] = sv;
+    }
+}
+
 __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __restrict__ ik,
                                     const float* __restrict__ w, const uint8_t* __restrict__ cand,
                                     const int32_t* __restrict__ lens, int32_t* __restrict__ out,
@@ -1252,7 +1319,6 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     int cl = n_pos;
     if (lens != nullptr) cl = lens[mm];
     if (cl > n_pos) cl = n_pos;
-    const float* qrow = q + row * (size_t)nh * hd;
     if (tid == 0) s_nr = 0;
 
     for (int base = 0; base < n_pos; base += kIndexerChunk) {
@@ -1270,41 +1336,14 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
         __syncthreads();
 
         // ---- scores for this chunk
-        // One warp per candidate: lane h computes head h's dot (its c-ascending
-        // order is untouched), then lane 0 gathers the per-head products with a
-        // lane-indexed shuffle and sums them in ascending h - exactly the
-        // sequence `acc += fmaxf(dot,0) * w[..h]` walked, so the score is
-        // bit-identical. The old shape ran one thread per candidate with
-        // nh * hd serial multiply-adds (32*128 = 16k cycles on a single lane,
-        // and only `len` of a thousand threads busy), which is why a 32-candidate
-        // call measured 188 us in isolation.
+        // Now a plain LOAD: indexer_score_kernel (stage A) already computed the
+        // same value - same lane<nh map, ascending-h shuffle sum, `fmaxf(dot,0)*w`
+        // product, `acc * softmax_scale * head_scale` order, same cl/cand masks -
+        // into g_idx_score, so the sort below sees bit-identical entries.
         {
-            const int nwarp = nthr >> 5;
-            const int wid = tid >> 5, lane = tid & 31;
-            for (int i = wid; i < len; i += nwarp) {
-                const int p = base + i;
-                const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
-                float dot = 0.f;
-                if (lane < nh) {
-                    const float* qh = qrow + (size_t)lane * hd;
-                    for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
-                    dot = fmaxf(dot, 0.f) * w[row * (size_t)nh + lane];
-                }
-                float acc = 0.f;
-                // The shuffle must run on every lane (the mask demands it), so
-                // the gather is uniform and only the sum is lane-0's.
-                for (int h = 0; h < nh; ++h) {
-                    const float dv = __shfl_sync(0xFFFFFFFFu, dot, h);
-                    if (lane == 0) acc += dv;
-                }
-                acc = __shfl_sync(0xFFFFFFFFu, acc, 0);
-                float sv = acc * softmax_scale * head_scale;
-                if (p >= cl) sv = -INFINITY;
-                if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
-                if (lane == 0) {
-                    s_pair[2 * i] = sv;
-                    s_pair[2 * i + 1] = __int_as_float(p);
-                }
+            for (int i = tid; i < len; i += nthr) {
+                s_pair[2 * i] = g_idx_score[row][base + i];
+                s_pair[2 * i + 1] = __int_as_float(base + i);
             }
         }
         __syncthreads();
@@ -2297,6 +2336,21 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
                                   int uses_candidates, cudaStream_t s) {
     if (b <= 0 || m <= 0 || nh <= 0 || hd <= 0 || topk <= 0) return (int)cudaErrorInvalidValue;
     if (n_pos <= 0) return (int)cudaSuccess;  // nothing to select from
+    // Stage A's scratch (g_idx_score) has COMPILE-TIME dims: reject a shape that
+    // cannot fit, LOUDLY. b*m is host-known; the n_pos test covers the host
+    // fallback only - the kernels read the live counter, whose reachable maximum
+    // is the index_k allocation (max_pos/ratio + 2) that kIdxMaxPos is sized for.
+    if (b * m > kIdxMaxRows) return (int)cudaErrorInvalidValue;
+    if (n_pos > kIdxMaxPos) return (int)cudaErrorInvalidValue;
+    // ---- Stage A: the scoring pass, in parallel, into g_idx_score.
+    // Same stream as stage B => program order makes A's writes visible to B:
+    // no fence, no sync, no extra stream.
+    dim3 sgrid((unsigned)kIdxScoreBlocks, (unsigned)m, (unsigned)b);
+    indexer_score_kernel<<<sgrid, 256, 0, s>>>(q, index_k, weights, candidates, compress_lens,
+                                               m, nh, hd, n_pos, softmax_scale, head_scale,
+                                               uses_candidates);
+    cudaError_t es = cudaGetLastError();
+    if (es != cudaSuccess) return (int)es;
     // Dynamic shared memory from COMPILE-TIME constants only: the sort's
     // (score, position) pairs - two floats per candidate - plus the running
     // top-`cols` set (a value and a position per slot). n_pos is deliberately
