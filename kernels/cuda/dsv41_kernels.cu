@@ -2939,7 +2939,7 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
         // Four columns in flight: the row loads of c+3*blockDim issue while c's
         // fmas run. The per-column work is `fmaf` (explicitly rounded) and the s2
         // accumulation order is untouched, so only the timing changes.
-#pragma unroll 4
+#pragma unroll 1
         for (int c = threadIdx.x; c < dim; c += blockDim.x) {
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
