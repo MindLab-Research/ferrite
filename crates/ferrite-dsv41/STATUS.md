@@ -4994,3 +4994,19 @@ lm_head（129280 行 × 5120，298µs）**，而 1/8 切片只要 48µs（6.2x�
 2. **删除重复保存/检索**：多层共享全局 KV、indexer K、Top-K 结果；SWA 状态用有限窗口重放恢复。
 3. **Single-Pass mHC**：把输入混合系数**错位交给下一子层**使用 → 消除 mHC 的多余访存往返，
    为算子融合创造条件（对应当前 `hc_mix_dots`+`hc_mixes_tail` 1.56ms/步）。
+
+### A/B 结果（2026-09-11 下午，全部同会话背靠背，四段文本 + faults 为判据）
+
+| 臂 | 步时 p50 | tok/s | 文本 | 结论 |
+|---|---|---|---|---|
+| **ss2**：scale 行 staging（gemm_fp8_gemv） | **13.14ms** | **76.1** | 四段全对 | ✅ 采纳（−0.14ms） |
+| b2：+ expert fp4 `sc` 一次性缩放 + gemv_bf16 activation staging | 13.19ms | 75.8 | 四段全对 | 中性（噪声内），保留（数值正确） |
+| sp8：`DSV41_ATTN_SPLIT=8` | 13.51ms | 74.0 | 四段全对（末尾 IM 略异） | ❌ 更差，拒绝（默认保持 0） |
+| slice：`DSV41_HEAD_SLICE=1` | **挂死** | — | — | ❌ `argmax_pub_kernel` 写 peer staging 的 `off=bytes-16` 与 AR 暂存区冲突 → 破坏 AR 握手 → 死锁（step pos=9 后日志停滞）。默认 OFF，内核与缓冲保留待重新设计 off |
+
+### 诊断方法（本次新增，值得复用）
+
+**常量注入诊断**：把可疑的输入换成编译期常量，在隔离微基准里跑——
+`const float sa = 1.f; const float sb = 1.f;` 让 wq_b 快 21%、sharedexp 快 34%，
+一次性定位到"两个 per-kb 全局标量加载"是停顿源，比逐条改代码猜快 10 倍。
+（用完立即回退，注释写明。）
