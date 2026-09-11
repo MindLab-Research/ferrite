@@ -15,11 +15,16 @@
 #                      default  = DSV41_GEMV_FP8_MODE=4 DSV41_GEMV_A32=1
 #                      noa32    = DSV41_GEMV_A32=0
 #                    plus the staging-only arm (MODE=3, a32 kept) for contrast.
-#   3b. PDL A/B    : DSV41_PDL=1 (DEFAULT ON) vs DSV41_PDL=0, one variable only,
+#   3b. PDL A/B    : DSV41_PDL=1 vs DSV41_PDL=0, one variable only,
 #                    both arms pinned to the a32 config phase 3 picked as the
 #                    winner (see PDL_BASE_MODE / PDL_BASE_A32 below).
-#                    WHY this is a recovery gate: DSV41_PDL defaults ON, so
-#                    EVERY serve after this rebuild runs the PDL path --
+#                    ⚠️ DEFAULT IS SPLIT ACROSS TUs (verified 2026-09-11):
+#                      dsv41_kernels.cu:2671   unset -> OFF (explicit "1" enables)
+#                      dsv41_experts_mxf4.cu:781 unset -> ON  (explicit "0" rolls back)
+#                    So an env-less serve runs PDL ON for the expert chain and
+#                    OFF for the attention chain; the pdl_on/pdl_off arms flip
+#                    BOTH. Verdict is TEXT IDENTITY first (a value drift means a
+#                    consumer read the producer early), p50 second.
 #                    cudaLaunchKernelEx + cudaLaunchAttributeProgrammatic-
 #                    StreamSerialization + a consumer-side
 #                    cudaGridDependencySynchronize() gating the first read of

@@ -778,7 +778,13 @@ static int dsv41_experts_pdl_enabled(void) {
     static int cached = -1;
     if (cached < 0) {
         const char* e = getenv("DSV41_PDL");
-        cached = (e != nullptr && e[0] == '0') ? 0 : 1;   // explicit "0" rolls back
+        // Default OFF, matching dsv41_pdl_enabled() in dsv41_kernels.cu: PDL was
+        // introduced default-ON but never production-verified, and the two TUs
+        // must not disagree on the unset case (a split default is a silent
+        // behaviour change depending on which launcher a call site happens to
+        // bind to). The other TU is the source of truth; keep them identical:
+        // unset = OFF, only "1" enables.
+        cached = (e != nullptr && e[0] == '1') ? 1 : 0;   // explicit "1" enables
     }
     return cached;
 }

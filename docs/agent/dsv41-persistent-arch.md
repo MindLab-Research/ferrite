@@ -176,7 +176,7 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 且必然破坏 parity 逐位契约）；③ wo_a 的 `nlg=1`、wo_b 的 k=`ol_local`=1024 都极小，中间量只有
 4KB，不存在可回收的「中间流量」。**结论：不可行，勿试。**
 
-**真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 ON**；PDL 臂走 `cudaLaunchKernelEx` + attribute，`=0` 回退臂走 **`cudaLaunchKernel` + 显式 `void*[]` 参数数组**，即 `<<<>>>` 本身编译出的那条运行时 API），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
+**真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 OFF**（`dsv41_kernels.cu:2684`，unset ⇒ OFF，仅显式 `=1` 打开）；PDL 臂走 `cudaLaunchKernelEx` + attribute，`=1` 反向的 `=0`/unset 回退臂走 **`cudaLaunchKernel` + 显式 `void*[]` 参数数组**，即 `<<<>>>` 本身编译出的那条运行时 API），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
 
 > ⚠️ **2026-09-11 round-45 修复**：回退臂**不得**走 `cudaLaunchKernelEx`。Extended Launch 会把参数包多转发一层模板，gemv 家族 36+ 参数时实测会返回 `cudaErrorInvalidValue`（"cuda error 1"），而同一份参数列表用 `cudaLaunchKernel` 数组形式则正常。**不要**把两条臂合并回单个 `cudaLaunchKernelEx` 调用。同理待查：`dsv41_experts_pdl_or_plain`（`dsv41_experts_mxf4.cu:873`）仍是「两条臂都走 Ex」的旧写法。
 >
@@ -199,9 +199,9 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 
 **关键修正（与本节早期假设不同）**：「把 prologue 藏进 producer ramp-down」对这两个 kernel **headroom 很小**——它们的 prologue 主体（gemv 的 activation staging、sparse 的 q-row staging / `*clen`）**本身就读 producer 的输出**，必须在 sync 之后；真正不依赖 producer 的只有 gemv 的 256 项 e4m3 LUT（每线程 1 次迭代）和指针设置，hoist 收益 < 结构化改写的风险（gemv 的权重行 cp.async 在 row loop 内，其 commit/wait 配对承载比特一致性）。因此 sync 放在 kernel 入口（与 `gemv_bf16_v2_kernel:2887` 既有先例一致），**回收的是节点过渡/launch 开销，不是 prologue 的算术**。真正的收益量级必须在图上 A/B。
 
-**风险线**：`DSV41_PDL` 默认 ON ⇒ rebuild 后所有 DSV41 运行即生效。GLM 路径上 PDL 曾测为**中性**（且当时只覆盖 4 个 launcher），所以**上线前必须先做 `DSV41_PDL=0/1` 的图 A/B**；`=0` 是回退臂。host 侧 gate 不做 arch 判断、device 侧 sync 有 `__CUDA_ARCH__ >= 900` 守卫，故本文件必须按 sm_90+ 编译（build.sh 默认 100a）；不支持的设备上 attribute 会让 launch 显式报错，不会静默。
+**风险线**：`DSV41_PDL` 默认 OFF ⇒ rebuild 后所有 DSV41 运行仍走 plain launch；只有显式 `=1` 才启用。GLM 路径上 PDL 曾测为**中性**（且当时只覆盖 4 个 launcher），所以**上线前必须先做 `DSV41_PDL=0/1` 的图 A/B**；`=0` 是回退臂。host 侧 gate 不做 arch 判断、device 侧 sync 有 `__CUDA_ARCH__ >= 900` 守卫，故本文件必须按 sm_90+ 编译（build.sh 默认 100a）；不支持的设备上 attribute 会让 launch 显式报错，不会静默。
 
-**expert 链的 PDL 扩展（已实施 2026-09-11，未上机验证）**：同一模式延伸到 `quant_fp4 → gateup → down_reduce`。`dsv41_experts_mxf4.cu` 是独立 TU，因此带**自己的副本 `dsv41_experts_pdl_or_plain`**（gate 判定 `dsv41_experts_pdl_enabled` 在 `dsv41_experts_mxf4.cu:775`，helper 在 `:873`），gate 复用 `DSV41_PDL`（默认 ON、`=0` 回退），语义与另两个副本逐条相同。覆盖的 consumer 是 **3 个 launch 点 / 2 个 kernel**（helper 有 5 个调用点：gateup 的 ilv/unilv 分支 + down + down_reduce）：
+**expert 链的 PDL 扩展（已实施 2026-09-11，未上机验证）**：同一模式延伸到 `quant_fp4 → gateup → down_reduce`。`dsv41_experts_mxf4.cu` 是独立 TU，因此带**自己的副本 `dsv41_experts_pdl_or_plain`**（gate 判定 `dsv41_experts_pdl_enabled` 在 `dsv41_experts_mxf4.cu:775`，helper 在 `:873`），gate 复用 `DSV41_PDL`（**默认 OFF**，unset ⇒ OFF、仅显式 `=1` 启用，与 `dsv41_kernels.cu:2684` 逐字一致；2026-09-11 修复了此前这里 unset=ON 的默认值分裂），语义与另两个副本逐条相同。覆盖的 consumer 是 **3 个 launch 点 / 2 个 kernel**（helper 有 5 个调用点：gateup 的 ilv/unilv 分支 + down + down_reduce）：
 
 | consumer kernel | launcher | 入口 sync |
 |---|---|---|

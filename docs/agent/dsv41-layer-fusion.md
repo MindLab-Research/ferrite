@@ -349,6 +349,19 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   ⇒ 定位退化**不要**再看这里，看 launch 次数（见上一条）。
   注意 smem 只剩 768 B 余量（49152 − 48384），任何给 mode 4 加 smem 的改动都会
   越过 48 KB 门槛而触发 `cudaFuncSetAttribute`，需一并复核 launcher。
+  - ⚠️ **`gemm_fp8_gemv_kernel` 的 SetAttribute 上限在同一文件里自相矛盾（2026-09-11 代码复核发现）**：
+    7 个 launcher（如 `dsv41_kernels.cu:3580` rope_norm、`:3651` mx_rope、`:3713` mx2_rope）请求
+    **232320 = 232448 − 128**（假设静态 smem = `s_norm_red[32]` = 128 B），但同一个 kernel 在
+    `dsv41_gemv_occupancy`（`:4036-4039`，由 `4c995f2` struct-pack 提交从 232448 改成）请求
+    **231676 = 232448 − 772**（假设静态 smem = 772 B）。两者只能有一个成立；若 772 是实测值，
+    则所有 232320 请求都超过该 kernel 的动态上限 → `cudaFuncSetAttribute` 返回
+    `cudaErrorInvalidValue`(=1) → launcher 在 launch **之前** `return (int)e` →
+    `dsv41_gemm_fp8_mx_rope_norm: cuda error 1`。这也解释了为何 marshal 层修复
+    （cudaLaunchKernel / PDL 关 / struct pack）全部无效：它们与根因无关。
+    **正确做法**：不要硬编码，按 device+kernel 运行时推导
+    `cudaDeviceGetAttribute(cudaDevAttrMaxSharedMemoryPerBlockOptin)` −
+    `cudaFuncGetAttributes().sharedSizeBytes`，失败时降级为 decline(2)；用
+    `cuobjdump -res-usage libferrite_kernels.so | grep -A2 gemm_fp8_gemv_kernel` 直接读出静态 smem 核对。
 - **`DSV41_GRAPH_MOE` 是死路径** ✗（`moe_graph_armed` 全仓无赋值点 ✓）⇒ 其注释/字段应清理 ✓；
   我先前把它当作"段 B 边界定义"是错的 ✗（已在本文件更正 ✓）。
 - **`s.o` 在段 A 内有双重生命周期** ✗：sparse_attn 的输出（`nlh*hd`=4096）与 wo_b 的输出（`dim`=5120）
