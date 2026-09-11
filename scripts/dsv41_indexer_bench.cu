@@ -1,4 +1,5 @@
 // Isolated timing for dsv41_indexer_topk at the shapes the decode step uses
+#include <cstdint>
 // (index_n_heads=32, index_head_dim=128, index_topk=512) across the plausible
 // live-latent counts. The profiler's 160 us per call fits none of these on
 // paper, so this measures instead of guessing.
