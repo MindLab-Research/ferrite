@@ -3961,3 +3961,56 @@ DSV4.1: ferrite-models/dsv41/device.rs 自己的 DevChain/FFI/整步图）；**k
 终态 = 用户指令 #5：一个 engine、模型即数据（`ferrite-serve --model dsv41` 单二进制）。
 三步：① 二进制合一（router 已支持）② device 抽象合一（FFI 表并进 trait）③ kernel 族去重（同序累加为前提 + parity 测试）。
 **顺序建议**：先打完 200 tok/s（性能结论会减少要统一的代码量），再统一化。
+
+---
+
+# 2026-09-11 ⑥：新剖析（14.66ms/步）+ sparse_attn 预取落地 + 三项中性/待测
+
+## 剖析：1-token 差分的 decode-only 逐核分解（`scripts/dsv41_profile.sh 40`）
+
+`decode-only net GPU time = 14.66 ms/步/rank`（与实测 14.42-14.46ms 吻合，账闭合 ✓）。
+
+| kernel | calls/步 | µs/次 | ms/步 | % |
+|---|---|---|---|---|
+| `gemm_fp8_gemv_kernel` | 181 | 18.7 | **3.38** | 23.1 |
+| `ar_reduce_kernel`（**V5=0 剖析口径**） | 82 | 39.6 | 3.24 | 22.1 |
+| `expert_gemv_fp4_batched` | 80 | 22.5 | 1.80 | 12.3 |
+| `gemv_bf16_kernel` | 49 | 21.8 | 1.07 | 7.3 |
+| `hc_mixes_tail` | 80 | 12.1 | 0.97 | 6.6 |
+| `indexer_topk` | 4 | 160.1 | 0.64 | 4.4 |
+| `hc_mix_dots` | 80 | 7.4 | 0.59 | 4.0 |
+| `ar_store` 5.6 / `ar_stamp` 4.3（同 82 次） | 82 | — | 0.81 | 5.5 |
+| `sparse_attn_pf`（预取版 ✓） | 40 | 10.5 | 0.42 | 2.9 |
+| `quant_kernel<0>` 176×1.6 / `route_topk` 40×5.2 / `rmsnorm` 84×2.5 / `apply_rope` 128×1.2 / `hc_post_inplace` 80×1.9 | — | — | ~0.9 | ~6 |
+
+**口径陷阱**：剖析 pin `DSV41_AR_V5=0`（v5 自旋被 nsys 节点追踪放大 300×），所以 AR 一栏
+按 `ar_store+ar_stamp+ar_reduce` 三核算 **4.05ms**，**这不是 v5 默认路径的数字** —— v5 是 2 核
+（store+pubred）≈8µs/AR ⇒ ~0.66ms。**AR 的真实占比待一轮 `DSV41_AR_V5=0` A/B 量化**。
+其余 kernel 的中位数对两条路径同样有效（代码路径相同）。
+
+**`gemv_bf16` 的 49 次构成**（读代码）：`lin_bf16` 的调用点 = MoE gate（40 层 ×1，384 行）、
+压缩器 wk/wp（index 层 ×2）、**lm_head**（1 次，**vocab 129280 行 = 1.32GB/rank/步，注释自陈
+replicated on every rank**）。
+
+## 本段改动判决（同会话背靠背 A/B + 四段文本逐字）
+
+| 改动 | 结果 | 处置 |
+|---|---|---|
+| **sparse_attn 保序软件流水预取**（kr 双缓冲深度 2 + q 行寄存器化；每 warp 处理 2 槽/轮，`for(t; t+nwarp<topk; t+=2*nwarp)`；数学序逐句不变） | **15.43→14.42ms（−1.01ms ✓✓，超预期 −0.55）**；`sparse_attn_pf` 剖析 10.5µs/次（原 26.4） | ✅ 默认 ON（`DSV41_ATTN_PF=0` 回退） |
+| **hc ss 移入 dots 核**（smem 中已暂存的行重放同一 warp-m 部分和 ⇒ 逐位等价） | 14.46 vs 14.51 **中性** | 保留（结构更优） |
+| **kv rmsnorm+rope 融合**（同归约树 blockDim 1024 + 逐元素 rope ⇒ 逐位等价） | 14.44 vs 14.45 **中性** | 保留（少一次发射） |
+| **indexer_topk blockDim 256→1024**（单 block 形状；sort/merge/rank 全部与线程数无关 ⇒ 结果不变） | 待测 | `DSV41_IDX_THREADS` |
+| **fp8 gemv 权重行 cp.async staging**（global→smem 直通，省每 lane 10 个在飞 uint4 寄存器） | 待测 | 已提交 |
+
+## 结论/知识点（本段）
+
+1. **`indexer_topk` 是单 block 形状**（grid=(m,b)=(1,1)），40-token bench 下 n_pos≈clen（小）
+   ⇒ 160µs **不能由 score 工作量解释**（20 候选 × 32 头 × 128 维 = 82K MAC）⇒ **必须实测**
+   （`/tmp/idx_bench.cu` 扫描 n_pos ∈ {32,128,512,2048,4096}）。**这是"先量后改"的又一次应用**。
+2. **`hc_mixes_tail` 的 collapse 段无保序并行空间**：读 `xr[i*dim+c]`（4 行 × 5120）与 s2 归约树
+   （每线程列集 {tid, tid+1024, …} → warp shfl_down → red[warp] → thread0 顺序求和）在任何
+   分块/向量化下都会改变**列分组** ⇒ ULP ⇒ 关项（不做）。
+3. **单 block 核的两重病**（重申 3867 行）：①单 SM 上限 ②每 warp 在飞字节不足。
+   `indexer_topk` 属第①类且**只有 blockDim 一条不牺牲正确性的杠杆**。
+4. **`kIndexerChunk=4096`**、smem 由编译期常量推出（36KB，单 block，永不需 smem 属性opt-in）——
+   所以 blockDim 与 smem 无关，可安全放大到 1024。
