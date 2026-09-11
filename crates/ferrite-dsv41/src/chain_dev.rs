@@ -640,13 +640,15 @@ impl<'a> DevChain<'a> {
             // ar_v5() therefore also turns on with the graph (see tp.rs).
             let host_hash = std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false);
             let probes = std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false);
-            // OPT-IN for now (DSV41_GRAPH_STEP=1): capture works and replays without
-            // error, but a replay produces wrong output, and correctness is the red
-            // line - the device-ification alone is verified correct (graph off gives
-            // ' Paris' / '2'), so only the graph needs the bisection.
+            // VERIFIED CORRECT since the ring-append fix (the KV row's destination
+            // was a host-computed address frozen by the capture - every replay
+            // wrote the same ring slot and the window went stale). Five prompts
+            // now answer correctly with the graph on, including a recited poem and
+            // a coherent essay, so it is the DEFAULT; DSV41_GRAPH_STEP=0 restores
+            // the per-kernel path for A/B.
             !host_hash
                 && !probes
-                && std::env::var("DSV41_GRAPH_STEP").map(|v| v == "1").unwrap_or(false)
+                && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true)
         });
         // ONLY on the decode path: capturing during prefill froze the prefill
         // branches into the graph, so the decode replays took the wrong ones (the
