@@ -3389,13 +3389,18 @@ impl Device {
     }
 
     /// True when the loaded `.so` carries the tail-split entry
-    /// (`dsv41_hc_front_split`) AND the runtime owns a side stream + the two
-    /// fork/join events. A stale `.so`, or a cudart without the event primitives,
-    /// reports false and the caller keeps the single-launch `hc_front`.
+    /// (`dsv41_hc_front_split`) AND the runtime owns a side stream + the events
+    /// the split actually records/waits. A stale `.so`, or a cudart without the
+    /// event primitives, reports false and the caller keeps the single-launch
+    /// `hc_front`.
+    ///
+    /// `fork_event` is deliberately NOT gated on: the dots-on-side change left it
+    /// a dead parameter (same-stream order publishes `g_hc_part`), so requiring it
+    /// to be non-null would needlessly disable the split when only that one event
+    /// failed to create. It is still passed for ABI compatibility.
     pub fn supports_hc_tail_split(&self) -> bool {
         self.kernels.hc_front_split.is_some()
             && !self.rt.side_stream().is_null()
-            && !self.rt.fork_event().is_null()
             && !self.rt.join_event().is_null()
             && !self.rt.in_event().is_null()
             && !self.rt.early_event().is_null()

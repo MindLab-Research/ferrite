@@ -440,8 +440,13 @@ pub struct DevRuntime {
     graph_instantiate_flags: u64,
     /// Fork/join events for the tail split, created with `cudaEventDisableTiming`
     /// so they are legal inside a stream capture. Recorded by the kernel launcher,
-    /// waited by the model. Reused for every tail call: each record/wait pair is
-    /// fully ordered within the capture, so program order disambiguates them.
+    /// waited by the model. Reused for every tail call — the SAME event object is
+    /// re-recorded 80x per step (40 tail calls x record/wait), so the capture
+    /// relies on PROGRAM ORDER to disambiguate the records: each fork is
+    /// immediately followed by its matching join, and a new path that re-records
+    /// an event but waits it later would silently bind earlier nodes. Any new
+    /// side-chain must therefore keep the fork-then-join ADJACENT in program
+    /// order, or allocate a separate event pool.
     fork_ev: *mut c_void,
     join_ev: *mut c_void,
     /// "hc input ready" event for the tail split: recorded on the MAIN stream

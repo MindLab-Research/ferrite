@@ -5650,8 +5650,9 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 // The `fork_ev` record/wait pair is GONE: with the dots and the LATE half on one
 // stream, stream order already publishes `g_hc_part` before the LATE reads, so
 // an explicit fork would only add a graph node. `fork_ev` stays in the ABI
-// (ferrite-kernel still creates it and `supports_hc_tail_split` still requires
-// it) so a stale .so keeps resolving the same symbol.
+// (ferrite-kernel still creates and passes it) so a stale .so keeps resolving
+// the same symbol, but it is NOT required to be non-null any more: a runtime
+// that failed to create only that event still gets the split.
 //
 // WHY EARLY NEEDS `in_ev` AND NOT JUST "no dependency on dots". EARLY reads `x`
 // (= s.h) and `pre_collapse` (a premix slot); both are written by MAIN-stream
@@ -5683,8 +5684,10 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
-    if (side == nullptr || in_ev == nullptr || fork_ev == nullptr || early_ev == nullptr ||
-        join_ev == nullptr)
+    // `fork_ev` is deliberately NOT required to be non-null: it is a dead
+    // parameter since dots-on-side (stream order publishes `g_hc_part`), so a
+    // runtime that failed to create ONLY that event must still get the split.
+    if (side == nullptr || in_ev == nullptr || early_ev == nullptr || join_ev == nullptr)
         return (int)cudaErrorInvalidValue;
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     if (!g_hc_front) return (int)cudaErrorInvalidValue;   // caller keeps the old path
@@ -5772,8 +5775,10 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // `fork_ev` is still validated above (non-null) for ABI compatibility but is
-    // deliberately never recorded or waited: see the header comment.
+    // `fork_ev` is kept in the signature for ABI compatibility but is
+    // deliberately neither validated nor recorded/waited: it is a dead parameter
+    // since dots-on-side (same-stream order publishes `g_hc_part`). See the
+    // header comment.
     (void)fork_ev;
     return (int)cudaGetLastError();
 }

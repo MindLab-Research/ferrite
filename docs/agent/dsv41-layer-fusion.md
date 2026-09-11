@@ -381,8 +381,8 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     时的 `xq`/`xsc`），而 dots 只写 `g_hc_part`——它唯一的读者是 `hc_mixes_tail_kernel` 的
     LATE 分支（`dsv41_kernels.cu` 的 `HC_TAIL_LATE`）。二者在同一条 side stream 上，
     **流内顺序**即保证 `g_hc_part` 的 publish happens-before LATE 的读 ⇒ `fork_ev` 的
-    record/wait 对整体删除（ABI 保留该参数与事件，`supports_hc_tail_split` 仍要求非空，旧 `.so`
-    照常解析符号）。新发射序列：
+    record/wait 对整体删除（ABI 保留该参数与事件以便旧 `.so` 照常解析符号；`fork_ev` 已不再被
+    要求非空——2026-09-11 清理：`.cu` 的非空检查与 `supports_hc_tail_split` 都去掉了它）。新发射序列：
     `main: record(in_ev) -> wait(early_ev)`；`side: wait(in_ev) -> EARLY -> record(early_ev) -> dots -> LATE -> record(join_ev)`。
     ⇒ **main 的 front 代价从 dots（4.9µs）降到 EARLY（1.7µs）**，saving ≈ 3.2µs/front × 2 front/layer
     × 80 层 ≈ **−0.5ms 上界**（注意：题面给的 "dots 7.4µs / EARLY 4.9µs" 与文档记录相反——实测
