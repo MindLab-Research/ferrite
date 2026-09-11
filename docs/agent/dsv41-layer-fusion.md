@@ -395,7 +395,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     它挪到 side stream 头部与 dots 并发。**但主流的 wins 是 0**：main 仍要等 side 的
     `early_ev`（即仍付 EARLY 的 1.7µs，只是从"本地 launch"变成"跨流往返"），代价却是
     **每个 front 多 4 个图节点**（record/wait `in_ev` + record/wait `early_ev`）。
-    **B（2026-09-11，已实施）**：EARLY 回到主流——主流自己的程序序就同时钉住了它的生产
+    **B（2026-09-11 22:00 曾实施，同日 22:23 由 `9558491` 回退 —— 见块末 ⚠️）**：EARLY 回到主流——主流自己的程序序就同时钉住了它的生产
     （上一段 hc_post / AR fold）与消费（紧随的投影链），**零 event**；dots+LATE 仍在 side。
     发射序列回到**单一 fork/join 对**：`main: EARLY -> record(fork_ev) [-> 投影链 …]`；
     `side: wait(fork_ev) -> dots -> LATE -> record(join_ev)` ⇒ 每 front **净 −2 图节点**
@@ -404,6 +404,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     `fork_ev` 恢复为**必需**（它现在是唯一的 main→side 边：dots 与 LATE 都读 `x`=`s.h`，
     必须钉在主流写之后）。side 链变为 dots(4.9)+LATE(10.7) ≈ **15.6µs**（EARLY 不再在它里面），
     仍远小于 ~50µs 的 hc 投影窗口 ⇒ join 依旧"到达即满足"。
+    - ⚠️ **复核更正（HEAD `0c6fa1a`）**：上面 B 块（EARLY 回主流）**已被回退**——`9558491`「EARLY 恢复」后 **EARLY 在侧流头部**发射（`dsv41_kernels.cu:7500` 用 `side`），同一个 `fork_ev` 承载 main→side 输入边与 side→main EARLY-done 边**两条边**（`:7486/7491/7511/7516`），`join_ev` 在 `:7577`；STATUS 实测 B 使 p50 **回退 +0.14ms**（`STATUS.md:6859`）。故每 front 的 event 节点比 B 多 2 个。下方 dots-on-side / DL-merge 两块的表述才是现行状态。
     - **2026-09-11（同日）dots 也搬上 side stream（dots-on-side，保留）**：投影链的第一步
     `lin2`（`chain_dev.rs:2430`）**只读 EARLY 的输出**（`s.xn` = `out`，以及 `xq_of_xn_valid`
     时的 `xq`/`xsc`），而 dots 只写 `g_hc_part`——它唯一的读者是 `hc_mixes_tail_kernel` 的
