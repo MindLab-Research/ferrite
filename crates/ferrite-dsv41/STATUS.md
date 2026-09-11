@@ -3054,3 +3054,50 @@ self.dev.indexer_topk(
 | 2 | index_k 发布：`memcpy_d2d(index_k + (compress_len-1)*idx_hd, …)` | 同上 ✗ | **已修 + 隔离验证 OK ✓** |
 | 3 | `indexer_topk(..., comp_len, offset)` | `comp_len` 每步值作**参数** ✗ · **`offset` 实参是 `win`（静态 ✓，不冻结 ✓）** | **`comp_len` 已修 ✓**（kernel 改读设备 `lens` ✓，仅 `.cu` ⇒ 零 Rust 冲突 ✓）；~~offset 待修~~ **更正：offset 无需修** ✓ |
 | — | `pre_a` 16B D2D · `h→h2` · `for g in 0..nlg`（静态模型维度 ✓）· `eng_ids+li*n_cols` · `clen+owner` | 常量/每层静态 ✓ | 无需改 ✓ |
+
+## 2026-09-11 迁移 Phase 0/1 + 单图跨请求故障的完整排除集（诚实交接）
+
+### 迁移 Phase 0/1（已落地 ✓，全树编译链接绿 ✓）
+- 新增 `crates/ferrite-kernel/src/devrt.rs`（841 行）：字节级不池化分配、原始 H2D/D2H/D2D/2D/peer
+  拷贝与 memset、**显式 graph 捕获原语（可指定模式 ✓）**、通用 kernel 符号解析、裸指针 cuBLAS。
+- `crates/ferrite-dsv41/src/device.rs` **2037 → 1416 行**：只留 Kernels 表 + 启动封装，其余转发。
+- 映射表与 Phase 4-6 清单见 `docs/agent/dsv41-onto-shared-engine.md`。
+
+### ⛔ 单图（整步 CUDA graph）的现状：**默认关闭** ✓，`DSV41_GRAPH_STEP=1` 可开
+**单请求下开图与关图逐 token 完全一致 ✓**（用代码里为此设计的 `DSV41_TOKTRACE=1` 逐步比对 ✓，
+"首个分叉步：无"）⇒ **捕获的算子集合是对的 ✗**。
+**但多请求不可靠 ✗**：前 3 个（短、1 步、够不到捕获 ✓）正确 ✓；**第一个长请求即崩 ✗**
+（`rank N: sync: an illegal memory access was encountered` ✓，**rank 号每次不同**（3 ✓ → 4 ✗）
+= 竞态特征 ✓），且 CUDA 的 sticky error 让**其后所有请求全空** ✓。
+
+**已逐一排除（全部实测，勿重复）**：
+| 假设 | 检验 | 结果 |
+|---|---|---|
+| 陈旧 `.so`（漏跑 build.sh）| 双产物重编 + build_id 比对 | 仍崩 ✗（且我的 sha 对比方法本身有误：build.sh 是对**全部 SRCS 串联**取哈希 ✗）|
+| 捕获模式被改 | 读 `capture_begin` | `2 /* Relaxed */` 重构前后**逐字节一致** ✗ |
+| 流被改（设备/cuBLAS）| diff `stream`/`set_stream` | 完全一致 ✗ |
+| 图三件套体被改 | diff `graph_instantiate/launch/free` 体 | 逐字节一致 ✗ |
+| 52 个启动封装被改 | 按函数名逐个比对**函数体哈希** | 51 个未变 ✓，31 个"变"只是转发原语（语义一致 ✓），**52 个封装体完全未动** ✗ |
+| `DevBuf` 指针访问器语义变了 | 比对被删的 `as_f32/as_f32_at/as_u8_at/...` | 与 devrt 新实现**逐字节相同** ✗ |
+| 跨请求复用陈旧图（图烤地址）| `reset()` 丢弃 graph exec | **无效** ✗（但保留：见下"地址契约"）|
+| 捕获前后缺跨 rank rendezvous | 新增 `Collective::host_barrier()` 并在捕获/重放前后调用 | **无效** ✗（保留：与 v5 之外的既有行为同形，无害）|
+| 设备侧 AR 是元凶 | 关图 + `DSV41_AR_V5=1` 显式开 | **完全正确** ✓ ⇒ AR 本身无罪 ✗ |
+
+**最尖锐的复现（下会话从这里接）**：**"短请求 ×3 后接一个长请求"必崩 ✗**；
+而**"单独一个长请求"必过 ✓**（toktrace 证实逐 token 一致 ✓）。⇒ 差别在**前序请求留下的状态** ✗，
+且**只有"捕获"这个动作会把它引爆** ✗（关图时任意请求序列全对 ✓）。
+
+**已入档的机制性线索**：`end_round()` 在 `ar_v5()` 为真时**直接 return**（注释："v5 needs no
+host barrier: the publish chain already guarantees…"）⇒ **图路径下 AR 里没有任何宿主级 rendezvous**
+⇒ 捕获（"只记录不执行"）期间各 rank 的推进完全自由。
+
+### 当前默认（已验证 ✓）
+- **关图**（`DSV41_GRAPH_STEP` 默认 false）+ **AR v5 默认开**（`DSV41_AR_V5` 默认 true，已与图解耦 ✓）
+- 实测 12 连发**全部正确 ✓、0 fault** ✓；稳态 **22.29-22.31**（短）/ **45.66-45.69**（长）/ **7.99**（1 步）ms/step
+- `DSV41_AR_V5=0` 回退 host barrier ✓
+
+### 构建链的教训（本会话踩到 ✗）
+- `build.sh` 的 `CU_HASH` 是 **`sha256sum "${SRCS[@]}" | sha256sum`**（全部源文件串联 ✗）——
+  **不能**拿单个 `.cu` 的 sha 去比对 `.so` 里的 build_id ✗（我就这么错比过一次 ✗）。
+- 远端 `.so` 的 id 带有 `-dirty` ✓ ⇒ 判断"是否同源"要用 **`git show <rev>:…` 重建对照** ✓，
+  而不是猜 ✓。
