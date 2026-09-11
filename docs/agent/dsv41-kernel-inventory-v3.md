@@ -70,6 +70,13 @@
 \* **`gemv_bf16` 的 22.4µs 是两个 population 的混合**：40 次共享专家 gate（≈17.3µs）+ 9 次 lm_head/engram（≈45µs）。
 只报均值会把 45µs 那一族藏起来——这是 §6 的新陷阱。
 
+† **`route_topk_kernel` 已被融合（`DSV41_ROUTE_FUSE`，默认 ON）**：route 由 gate GEMV
+（`gemv_bf16_v2_kernel`，n=384 → **WPR=8 / rpb=1 / 384 blocks**，不是 WPR=4/192）的 **last-block
+epilogue** 顺带完成，40 次独立 launch 与 40 个图节点消失。语义 bit-exact（同一份 f32 scores、同一
+tie-break、同一 renorm）。真正省下的只有 launch/节点开销（route 的 ~3µs 执行时间仍在 gemv 末尾的
+关键路径上）⇒ 预期 **−0.06~0.10ms/step**，而非表列的 0.21ms。仅 bf16-gate 路径可融（`DSV41_MIX_GATE=1`
+的 fp8x2 gate 与 `DSV41_CUBLAS_M1=1` 保持两段式）。
+
 ### `gemm_fp8_gemv` 246 次的代码级分解（2026-09-11 只读代码审计，`chain_dev.rs`）
 
 单层 attention 侧 4 次：`lin2(wq_a,wkv)`（`xn`, k=5120, n=1280+512, **mx2 已融合**）:1795；

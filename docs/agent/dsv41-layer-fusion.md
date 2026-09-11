@@ -73,7 +73,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 25 | `hc_collapse`（用 premix_slot(1)）| :1053 | 同 #2 |
 | 26 | `rmsnorm`（ffn_norm）| :1061 | `[1,dim]` |
 | 27 | `lin_bf16 gate` | moe :1693 | k=5120 → n=384 |
-| 28 | `route_topk` | :1700 | score_func=2；smem **3096 B** |
+| 28 | `route_topk` | :1700 | score_func=2；smem **3096 B**。**已融合**：`DSV41_ROUTE_FUSE`（默认 ON）时由 #27 的 gate GEMV（`ferrite_gemv_bf16_v2_route`）last-block epilogue 顺带完成，本行消失（老 `.so` / MIX_GATE / CUBLAS_M1 自动回退到本行）|
 | 29 | `zero` ×2 | :1728/:1729 | memset |
 | 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32 |
 | 31 | **batched 路径（`moe_batch()` 代码默认 OFF**，:190 `unwrap_or(false)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`gateup_fused` 开时**跳过** `swiglu_limit_batched`；`gateup_fused = DSV41_GATEUP_FUSE!=0 && supports_gateup_fuse() && expert_fp4_mode()==2`，:2344/:2383 —— 必须与 `.cu:1367` 的 `g_fuse && g_expert_fp4_mode==2 && dim%512==0` 逐字镜像）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 OFF）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|

@@ -6076,3 +6076,38 @@ epoch 化 or 两阶段 kernel 而非选举）。
   margin 大则说明数值回归。待 GPU 空闲时做。
 
 **会话累计：13.28 → 8.60ms（+54.4%），75.3 → 116.3 tok/s（验证基线 8.61/116.1）。**
+
+### 会话战略快照（2026-09-11 深夜，8.60ms 基线）
+
+**修正后的当前分解**（nsys-v3 + 各轮验证推算）：
+| 项 | ms | 地板状态 |
+|---|---|---|
+| gemm_fp8_gemv（246 次） | ~2.0 | 指令级；launch 数只能靠 persistent 减 |
+| expert fp4（gateup+down） | ~1.75 | L1TEX；8 理论失败 |
+| hc 链（dots+tail） | ~1.55 | dots 访存窗口限制；persistent 两形态均失败 |
+| AR v5（82 次 × 2 kernel） | ~0.66 | NVLink 协议 |
+| sparse_attn | ~0.32 | **issue 饱和（1 warp/scheduler）——key-split + prefetch 可 −0.20** |
+| gemv_bf16 残余（lm_head+indexer） | ~0.20 | lm_head 带宽地板 |
+| gemv_bf16_v2（gate） | ~0.15 | 已优化 |
+| quant（165 次） | ~0.20 | 部分可消除 |
+| route_topk | ~0.21 | route fusion 验证中 |
+| 其它（norm/rope/ring/window/add） | ~0.5 | 部分融合中 |
+| **launch/gap 固定开销（~1355 节点）** | **~1.0-1.5** | **persistent 才能根治** |
+
+**失败模式档案**（Stage C 设计的约束）：
+1. B1 (+0.24ms)：32-warp 块 → SM 148→32
+2. hcpm (+3.3ms)：192 块选举 → fence/atomic 爆炸
+3. hc-merge (+3.2ms)：ticket 自旋 → SM 人质
+→ **教训：不能改变已调优的 grid 形态；不能引入跨块同步原语**
+
+**成功模式档案**：
+1. gate v2 (−0.46)：向量化 + K-split（保持行归属）
+2. MLP unroll (−0.15)：指令级并行
+3. hc_post fold (中性)：单点 epilogue
+→ **教训：在现有 grid 形态内增加在飞负载/指令并行**
+
+**通往 200 tok/s（5ms）的剩余路径**：
+- 在飞：sparse key-split (−0.20) + route fusion (−0.06~0.10) + AR opt (−0.3?) ≈ −0.6ms → ~8.0ms
+- Producer/Consumer 链式融合（不改变 grid 形态）：dots→pubred epilogue、tail→lin2 prologue ≈ −0.3ms → ~7.7ms
+- 剩余 ~2.7ms 需要：全层 persistent（研究级）或 expert 结构突破（研究级）
+- **诚实评估：200 tok/s 在当前架构上需要 Stage C 完整落地 + expert 突破，工作量 1-2 周+**

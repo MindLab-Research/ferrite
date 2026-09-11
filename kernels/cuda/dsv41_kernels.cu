@@ -720,16 +720,42 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 }
 
 // ---------------------------------------------------------------------------
-// Split sparse attention (DSV41_ATTN_SPLIT). The warp version runs one block per
-// (token, head) - eight blocks on this model's decode - which leaves 95 percent
-// of the machine idle and pays for it in latency: 26 us per layer, forty layers,
-// one millisecond a step. This shape splits the KEY range across `C` blocks per
-// head, each computing an online-softmax partial (max, sum, d-wide PV
-// accumulator) into a fixed device scratch, and a second kernel merges the
-// partials in ascending chunk order - a deterministic combine, so the result
-// differs from the single-block version only in the last bits of the summation
-// grouping. The sink fold and the normalisation live in the merge, exactly where
-// the warp version had them.
+// Split sparse attention (DSV41_ATTN_PF_SPLIT, DEFAULT ON; DSV41_ATTN_SPLIT=C
+// is the older explicit knob for the same kernel and still wins when set).
+// The warp version runs one block per (token, head) - eight blocks on this
+// model's decode - which leaves 95 percent of the machine idle and pays for it
+// in latency: 26 us per layer, forty layers, one millisecond a step. This shape
+// splits the KEY range across `C` blocks per head, each computing an
+// online-softmax partial (max, sum, d-wide PV accumulator) into a fixed device
+// scratch, and a second kernel merges the partials in ascending chunk order - a
+// deterministic combine, so the result differs from the single-block version
+// only in the last bits of the summation grouping. The sink fold and the
+// normalisation live in the merge, exactly where the warp version had them.
+//
+// WHY THE SPLIT ALONE WAS NOT ENOUGH (measured, then fixed here): the first
+// version of this kernel had no prefetch, and DSV41_ATTN_SPLIT=8 came out
+// 0.37 ms/step WORSE than the single-block pf kernel - the slot chain
+// (idx load -> kv-row load -> dot -> softmax) re-serialised at one slot in
+// flight, so cutting the slot count per block did not cut the latency-bound
+// chain. The chunk loop below therefore carries the SAME three-deep pipeline as
+// `sparse_attn_pf_kernel`: three rotating kv-row buffers, each row's next load
+// fired right after that buffer's compute (two compute phases of distance), and
+// the q row staged once in registers. The single block per head was issue
+// saturated (one warp per scheduler, ~12k cycles for the full walk), so dividing
+// the instructions per block by C - the blocks run concurrently, and the whole
+// kv row set is shared by every head and chunk (kBase has no head term), so they
+// all hit the same 1.3 MB in L2 - is what turns the walk into ~1/C of the
+// latency plus the merge.
+//
+// CORRECTNESS GATE: the chunk's slot order, the per-dot reduce tree and the
+// softmax update chain are byte-for-byte the pf kernel's, so a chunk partial is
+// exactly what the pf kernel would have produced for that slot range, and C=1
+// is therefore BIT-IDENTICAL to `sparse_attn_pf_kernel` (one chunk, and the
+// merge of a single partial reproduces its epilogue: expf(P[0]-smax) == 1).
+// Anything that touches the pipeline must keep C=1 bit-exact.
+// DSV41_ATTN_PF_SPLIT=1 is the cheap equivalence check; C>1 differs only in the
+// final summation grouping (tolerance, not bit-equality).
+#define kAttnPfSplitDefault 8
 #define kAttnMaxC 16
 #define kAttnMaxBM 8
 #define kAttnMaxH 64
@@ -742,6 +768,7 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          const int32_t* __restrict__ idxs, int b, int m, int h,
                                          int d, const int* __restrict__ clen, int window,
                                          int index_topk, float scale, int C) {
+    const int n = window + *clen;
     const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int ck = blockIdx.x;
     const int row = blockIdx.y;
@@ -755,19 +782,162 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
     const int lo = (int)((long long)topk * ck / C);
     const int hi = (int)((long long)topk * (ck + 1) / C);
     const int32_t* row_idx = idxs + (size_t)(bb * m + mm) * topk;
+    // Stage the q row once: kills the per-slot re-read of qr (16 floats/lane).
+    float qv[kMaxPerW];
+#pragma unroll
+    for (int i = 0; i < kMaxPerW; ++i) qv[i] = 0.f;
+#pragma unroll
+    for (int i = 0; i < kMaxPerW; ++i) {
+        const int c = lane + i * 32;
+        if (c < d) qv[i] = qr[c];
+    }
     float my_acc[kMaxPerW];
 #pragma unroll
     for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
     float my_smax = -1e30f, my_se = 0.f;
-    for (int t = lo + wid; t < hi; t += nwarp) {
-        const int idx = row_idx[t];
-        if (idx < 0) continue;
-        const float* kr = kv + ((size_t)bb * (window + *clen) + idx) * d;
+    // Three kv-row buffers, rotating by slot; kBase is the row base (shared by
+    // every head - the kv is one MLA latent per position). Same pipeline as the
+    // pf kernel, walked over this chunk's [lo, hi) instead of [0, topk).
+    float kb0[kMaxPerW], kb1[kMaxPerW], kb2[kMaxPerW];
+    const size_t kBase = (size_t)bb * n * d;
+    // Prologue: fire the idx loads for the first three slots, then their rows.
+    int t = lo + wid;
+    int ia = (t < hi) ? row_idx[t] : -1;
+    int ib = (t + nwarp < hi) ? row_idx[t + nwarp] : -1;
+    int ic = (t + 2 * nwarp < hi) ? row_idx[t + 2 * nwarp] : -1;
+    if (ia >= 0) {
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) kb0[i] = kv[kBase + (size_t)ia * d + c];
+        }
+    }
+    if (ib >= 0) {
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) kb1[i] = kv[kBase + (size_t)ib * d + c];
+        }
+    }
+    if (ic >= 0) {
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) kb2[i] = kv[kBase + (size_t)ic * d + c];
+        }
+    }
+    // Main loop: three slots per pass. Slot t lives in kb0, t+nwarp in kb1,
+    // t+2*nwarp in kb2; each buffer's next row load is fired right after that
+    // buffer's compute, so every row has two compute phases of distance. The
+    // three next-slot indices are hoisted to the loop top (loads have no side
+    // effects - pure earlier issue). An idx of -1 keeps the pf kernel's skip
+    // semantics: no load and no state update for that slot.
+    for (; t + 2 * nwarp < hi; t += 3 * nwarp) {
+        const int td = t + 3 * nwarp;   // next slot destined for kb0
+        const int te = td + nwarp;      // next slot destined for kb1
+        const int tf = te + nwarp;      // next slot destined for kb2
+        const int id = (td < hi) ? row_idx[td] : -1;
+        const int ie = (te < hi) ? row_idx[te] : -1;
+        const int iff = (tf < hi) ? row_idx[tf] : -1;
+        if (ia >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb0[i];
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        // kb0 is dead now: fire the row load for slot td into it.
+        if (id >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb0[i] = kv[kBase + (size_t)id * d + c];
+            }
+        }
+        if (ib >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb1[i];
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        // kb1 is dead now: fire the row load for slot te into it.
+        if (ie >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb1[i] = kv[kBase + (size_t)ie * d + c];
+            }
+        }
+        if (ic >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb2[i];
+            }
+            for (int off = 16; off > 0; off >>= 1)
+                dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        // kb2 is dead now: fire the row load for slot tf into it.
+        if (iff >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb2[i] = kv[kBase + (size_t)iff * d + c];
+            }
+        }
+        ia = id;
+        ib = ie;
+        ic = iff;
+    }
+    // Tail: at most two slots left (rows for t and t+nwarp in kb0/kb1; the kb2
+    // slot is necessarily past hi or the loop would have continued).
+    if (t < hi && ia >= 0) {
         float dot = 0.f;
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
             const int c = lane + i * 32;
-            if (c < d) dot += qr[c] * kr[c];
+            if (c < d) dot += qv[i] * kb0[i];
         }
         for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
         dot *= scale;
@@ -777,7 +947,27 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 #pragma unroll
         for (int i = 0; i < kMaxPerW; ++i) {
             const int c = lane + i * 32;
-            if (c < d) my_acc[i] = my_acc[i] * corr + e * kr[c];
+            if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+        }
+        my_se = my_se * corr + e;
+        my_smax = nm;
+    }
+    if (t + nwarp < hi && ib >= 0) {
+        float dot = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) dot += qv[i] * kb1[i];
+        }
+        for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+        dot *= scale;
+        const float nm = fmaxf(my_smax, dot);
+        const float corr = expf(my_smax - nm);
+        const float e = expf(dot - nm);
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
         }
         my_se = my_se * corr + e;
         my_smax = nm;
