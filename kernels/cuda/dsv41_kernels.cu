@@ -372,9 +372,13 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
         }
         se += expf(sink[hh] - smax);
         float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
-        for (int c = threadIdx.x; c < d; c += blockDim.x)
-            const int i = c / (int)blockDim.x;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+            // c == threadIdx.x + i * blockDim.x, so the accumulator slot is
+            // (c - threadIdx.x) / blockDim.x (NOT c / blockDim.x: that is only
+            // correct for thread 0).
+            const int i = (c - (int)threadIdx.x) / (int)blockDim.x;
             orow[c] = (se > 0.f) ? acc[i] / se : 0.f;
+        }
     }
 }
 
