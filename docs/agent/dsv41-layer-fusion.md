@@ -158,8 +158,16 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   未设默认 2、非法值按 atoi 语义取 0）。
   残留：`.cu` 还有 `(dim % 512) == 0` 这一项未镜像——`dim` 恒为 5120（`%512==0` 恒真），
   故当前为惰性；若未来支持非 512 对齐的 dim，需一并镜像。
-- **`DSV41_MOE_BATCH` 默认值的注释与实现矛盾** ✗（注释 :173 写 DEFAULT OFF，实现 :179 是 `unwrap_or(true)` ✓）
-  ⇒ 融合核按 **batched 路径为准**（代码为准 ✓），并顺手修正注释 ✓。
+- **⚠️ safe3 的 +8.7ms 退化根因 = `f3b1be1` 误翻 7 个既有门默认值（2026-09-11 定案）** ✗：
+  该提交的本意只是「关掉 gateup/down 两组新融合」，但其 diff 同时把 7 个**与 A4A5 无关的既有已验证门**
+  从 `unwrap_or(true)` 改成 `unwrap_or(false)`（`chain_dev.rs`）：
+  `moe_batch`(:190)、`nr_fuse`(:231)、`sh_exp_mx2`(:237)、`mix_gate_shared`(:261)、
+  `head_slice`(:274)、`fuse_c`(:1305)、`fuse_b1`(:1311)。
+  对照 10.16ms 基线（`314f5df`，round-16）这 7 个全是 `unwrap_or(true)` ⇒ 以 **ON 为准**。
+  主因是 `moe_batch=false`：批化 4 launch/层 → 顺序 topk(=6) × 3 launch/层，
+  40 层共多 ~560 次 launch/步（本 workload 是 per-call-fixed-cost bound，~10-15µs/次）⇒ 就是那 ~8.7ms。
+  修复：把这 7 个默认值还原 `true`，只保留新融合门（GATEUP/DOWN/AR_STORE/SWIGLU_Q/MOE_EPI_ADD）默认 OFF。
+  注意 `DSV41_MOE_BATCH` 的 doc 注释仍写 "DEFAULT OFF"，与 round-16 基线以及 -3.2ms 的实测收益矛盾，应一并订正。
 - **`DSV41_GRAPH_MOE` 是死路径** ✗（`moe_graph_armed` 全仓无赋值点 ✓）⇒ 其注释/字段应清理 ✓；
   我先前把它当作"段 B 边界定义"是错的 ✗（已在本文件更正 ✓）。
 - **`s.o` 在段 A 内有双重生命周期** ✗：sparse_attn 的输出（`nlh*hd`=4096）与 wo_b 的输出（`dim`=5120）

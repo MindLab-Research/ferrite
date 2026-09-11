@@ -187,7 +187,7 @@ fn eng_host() -> bool {
 /// hot-path slip), and `"0"` means OFF even though it is "set".
 fn moe_batch() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
@@ -228,13 +228,13 @@ fn expert_fp4_mode() -> i32 {
 /// DSV41_NR_FUSE=0 reverts the kv chain to the two-launch rmsnorm + rope pair.
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_SH_EXP_MX2=0 reverts the shared expert's gate/up to two launches.
 fn sh_exp_mx2() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(true))
 }
 
 /// A5: DSV41_MOE_EPI_ADD=0 reverts the shared expert's w2 to the
@@ -243,7 +243,7 @@ fn sh_exp_mx2() -> bool {
 /// avoid (this branch runs 40x/step, inside graph capture).
 fn moe_epi_add() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MOE_EPI_ADD").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_MOE_EPI_ADD").map(|v| v != "0").unwrap_or(false))
 }
 
 /// A4: DSV41_SWIGLU_Q=0 reverts the shared expert's swiglu to the
@@ -258,7 +258,7 @@ fn swiglu_q() -> bool {
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
 fn mix_gate_shared() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_HEAD_SLICE enables the vocabulary-sliced lm_head: each rank projects
@@ -271,7 +271,7 @@ fn mix_gate_shared() -> bool {
 /// verbatim-correct, zero faults). DSV41_HEAD_SLICE=0 restores the full head.
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
 }
 
 fn build_eng_dev(
@@ -1302,13 +1302,13 @@ impl<'a> DevChain<'a> {
 /// the hot path must never touch the environment per call.
 fn fuse_c() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(true))
 }
 
 /// Segment B cluster 1 fusion: hc_collapse + rmsnorm(ffn_norm) in one kernel.
 fn fuse_b1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(true))
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
