@@ -475,7 +475,9 @@ fn swiglu_q() -> bool {
 /// this fold is the SHARED expert's alone.
 fn swiglu_fold() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_FOLD").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_FOLD").map(|v| v == "1").unwrap_or(false))
+    // default OFF (serve A/B v12: quant+swiglu folds together +0.39ms regression;
+    // the w2 prologue's swiglu work costs more in the GEMV context than the saved launch)
 }
 
 /// chain-pair-batch 链2 (DSV41_SH_PAIR, default OFF): the shared expert's
@@ -2382,7 +2384,12 @@ fn hc_tail_split() -> bool {
 /// never touch the environment per call.
 fn quant_fold() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_QUANT_FOLD").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_QUANT_FOLD").map(|v| v == "1").unwrap_or(false))
+    // default OFF (serve A/B v12: +0.39ms regression with swiglu fold. STRUCTURAL:
+    // fork_ev records when the WHOLE EARLY kernel completes, so the fp4 direct-out
+    // work extends main's fork_ev wait by ~1.8us x 80 fronts = +0.14ms, while the
+    // saved quant launch is only -0.072ms. Events are kernel-level, not block-level
+    // - any work added to a gating kernel is on the critical path. Unfixable.)
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
