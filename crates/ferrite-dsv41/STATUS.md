@@ -4041,3 +4041,22 @@ replicated on every rank**）。
 
 **`argmax_kernel` 的关键语义**（lm_head 切分时必须保持）：`pos_ctr` 在**这个核里**每步 +1，
 且用 u64 打包 `(value_key, ~index)` 保证**并列取最小 index** —— 跨 rank 归约必须复刻这条规则。
+
+## 本轮落地（同会话背靠背 A/B，每臂四段文本逐字 ✓、faults=0）
+
+| 改动 | 步时 | 增量 | 机制 |
+|---|---|---|---|
+| （进入本轮基线） | 14.44 ms | — | sparse_attn 预取后的状态 |
+| **fp8 gemv 权重行 cp.async staging** | **14.12 ms** | **−0.32** | global→smem 直通，省每 lane 10 个在飞 uint4 寄存器；微基准同步验证 22.66→20.00µs（−12%）|
+| **共享专家 gate+up mx2 单次发射** | **13.92 ms** | **−0.20** | 同激活同 k，省一次 ~20µs 固定开销/层 |
+| **MoE gate(bf16) + 共享专家 w1/w3(fp8) 混合核** | 部署中 | 预期 −0.8 | 三族一发射（同 xn），`DSV41_MIX_GATE=0` 回退 |
+
+**本轮方法学收获**：
+1. **隔离微基准（生产 .so + 生产 shape）是 kernel 改动的秒级判定器**——cp.async 在微基准上
+   立刻显示 −2.7µs（12%），serve A/B 随后证实 −0.32ms；比每次改都跑两轮 serve（~6min）快两个数量级。
+   路径：`nvcc -O2 -std=c++17 -o /tmp/b <bench>.cu -L kernels/cuda -lferrite_kernels`
+   + `LD_LIBRARY_PATH=<kernels/cuda> /tmp/b`（**注意 nvcc 不认 `-Wl,-rpath`**；**`uint8_t` 需 `<cstdint>`**）。
+2. **"与行数无关的耗时"是固定开销的铁证**：fp8 gemv 256 行 18.1µs ≈ 1664 行 22.1µs ⇒
+   唯一杠杆是**减少调用数**（合并同输入投影），而不是继续调 kernel 内部。
+3. **合并清单必须验输入依赖**：gate 与共享专家都以 `xn` 为输入且 `xn` 在 MoE 段内不被覆写
+   （`ex_act` 只在默认 batched 路径外被专家循环复用），才允许把一个融合核插到 gate 的位置。
