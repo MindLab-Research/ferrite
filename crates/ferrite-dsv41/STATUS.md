@@ -3190,3 +3190,12 @@ if (lens != nullptr && *lens > 0) n_pos = *lens;   // 扫描上界跟设备 clen
 图会继续按②的烤死值分配，越界从"必然错值"变成"随机崩"。**同类值必须两端一起迁移** ✓。
 本次三个冻结点（ring 槽、index_k 组号、indexer 计数）里，前两个是 memcpy 目的地址（天然只有一端 ✓），
 只有第三个有"两端"结构 ✗ ⇒ 也是它唯一漏了。
+
+**类级复核（grep 全部 DSV4 启动点的 `<<<grid, block, smem>>>` ✓）**：其余动态 smem/grid 全部由
+**常量**导出 —— `expert_gemv_fp4[_batched]_kernel` 的 smem = `k * sizeof(float)`（k 是每层固定维 ✓）、
+`gemm_fp8_kernel` 的 smem = `16*k`（同上 ✓）、`hc_mixes`/`moe_route`/`route_topk` 的 smem 由
+`mix/hc/n_experts/topk` 常数导出 ✓、`comp_placeholder`/`window_idxs` 的 grid 由 `index_topk/window`
+常数导出 ✓、AR 三件套的 grid 由每次调用的 `len/4` 导出（同调用点恒定 ✓）。
+⇒ **indexer 是唯一的"两端"结构** ✓，类级审计无其它同类隐患 ✓。
+（另：`indexer_topk` 的常量 smem ≈200KiB 超 48KiB 默认 ⇒ 必须 `cudaFuncSetAttribute(...232448)` ✓
+—— 已在启动器内按调用设置，理由同 `gemm_fp8_mx` 的注释：该属性是 per-context，TP8 每 rank 一个 context ✗。）
