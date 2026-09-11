@@ -1714,6 +1714,11 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
+            // Compiler-directed unroll (NOT manual: the manual 4-way unroll
+            // changed the compiled kernel and degenerated the model — see
+            // STATUS.md). #pragma unroll lets nvcc choose its own register
+            // allocation while keeping the single-chain source semantics.
+#pragma unroll 4
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
                 const float sa = a_scale[kb];    // m == 1
