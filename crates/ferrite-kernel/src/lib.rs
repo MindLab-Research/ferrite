@@ -20,6 +20,10 @@ pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod dcp;
+/// Runtime-dlopen CUDA device runtime shared by every model crate
+/// (stream, byte-granular allocation, copies, peer access, CUDA-graph
+/// capture). No link-time CUDA dependency — symbols resolve at first use.
+pub mod devrt;
 pub mod graph;
 #[cfg(feature = "cuda")]
 pub mod nccl;

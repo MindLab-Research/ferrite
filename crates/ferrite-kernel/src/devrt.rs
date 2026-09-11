@@ -13,7 +13,7 @@
 //! `KernelBackend` (GLM); this module is the pointer-level runtime underneath
 //! both the GLM chain and the DeepSeek chain.
 
-use std::ffi::{c_char, c_int, c_long, c_uint, c_void, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 
 use ferrite_types::{FerriteError, Result};
 
