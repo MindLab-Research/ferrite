@@ -5351,3 +5351,21 @@ sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
 ⚠️ 最大陷阱：AR 核的 `step = gridDim.x*blockDim.x` 会因新增 block 而错位——必须按 `blockIdx.x < ar_blocks` 分区。
 ⚠️ post/comb 是单份共享缓冲，需双缓冲；单层流水安全（3 槽 i%3），双层需扩 4 槽。
 预期 −0.3~0.5ms（80 个 ⟨B⟩ 各 ~8-12µs 藏进 AR poll）。
+
+### ✅ 第 15 轮：P1+P2 快赢验证通过（10.27ms / 97.4 tok/s）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| p12（P1 hist-null + P2 zero-skip） | **10.27ms** | **97.4** | 四段全对 | 0 |
+
+**P1+P2 = −0.27ms**（10.54 → 10.27）。P1 消掉 route_topk 的 hist 死代码（80 个多余 device op/步）；
+P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）。
+
+**会话累计：13.28 → 10.27ms（+29.5%），75.3 → 97.4 tok/s。**
+
+### 下一批（设计中/待验证）
+- **gate_up+swiglu 融合**（moe-coop 1(a)：每 warp 产一对 (gate_i, up_i)，swiglu 做 epilogue，ex_act_b 写出减半）——subagent 设计中
+- **down+reduce 合一**（moe-coop 1(b)：删 grid.y 的 slot 维，每 warp 升序 slot 循环，零同步，ex_down_b 全程留寄存器）
+- **AR store 融合**（ar-fuse 补丁已产出，80 节点/步）
+- **跨层流水**（cross-layer-pipe：AR poll 窗口藏 hc mixes 的 ⟨B⟩ 半）
+- **swiglu+quant 融合**（T1 同款）
