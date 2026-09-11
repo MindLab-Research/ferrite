@@ -208,17 +208,17 @@ fn mix_gate_shared() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
 }
 
-/// DSV41_HEAD_SLICE=1 enables the vocabulary-sliced lm_head: each rank projects
+/// DSV41_HEAD_SLICE enables the vocabulary-sliced lm_head: each rank projects
 /// only its 1/world slice (8x less head weight traffic per step — the full
-/// 129280-row head measured 298us against 48us for one rank's slice) and one
-/// published u64 per rank picks the winner with the same lowest-index tie rule.
+/// 129280-row head measured 298us against 48us for one rank's slice) and a
+/// cross-rank argmax exchange - ONE round of the shared v5 epoch sequence -
+/// picks the winner with the same lowest-index tie rule.
 ///
-/// DEFAULT OFF for now: the cross-rank kernel chain is restored and the packed
-/// buffer is allocated, but the default only flips once an A/B confirms the text
-/// (DSV41_HEAD_SLICE=1 runs the sliced path today).
+/// DEFAULT ON (verified 2026-09-11: 10.86 -> 10.51ms, all four prompts
+/// verbatim-correct, zero faults). DSV41_HEAD_SLICE=0 restores the full head.
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v == "1").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
 }
 
 fn build_eng_dev(
