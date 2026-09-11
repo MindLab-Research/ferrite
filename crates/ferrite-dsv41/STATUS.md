@@ -6670,3 +6670,19 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 3. a32 A/B（DSV41_GEMV_A32=0/1）
 4. PDL A/B（DSV41_PDL=0/1）
 5. K-split 文本 A/B（DSV41_GATEUP_KSPLIT=0/2）
+
+### 终极修复链总结（2026-09-11 22:50，远端验证中）
+
+**r42-45 的完整根因链（四层，每层修复暴露下一层）**：
+| 层 | 错误 | 根因 | 修复 | Commit |
+|---|---|---|---|---|
+| 0 | error 1 (ABI) | 旧 .so 残留（gitignored, clean 不删） | recovery script 加删除步骤 | 0ad77ee |
+| 1 | error 1 (InvalidValue) | 128B static smem + 232448 > device max | runtime smem ceiling（15 处） | e764bf7+ |
+| 2 | error 1 (InvalidValue) | cudaLaunchKernelEx 36+ 参数模板转发 | struct pack 4 参数 + cudaLaunchKernel | 4c995f2 |
+| 3 | error 701 (OutOfResources) | 72 regs × 1024 threads > 65536 | __launch_bounds__(1024) → 56 regs | 0ad77ee |
+| 4 | FATAL (serve gate) | grep -q 的 SIGPIPE 误判 | grep -cF >/dev/null | serve-ab-fixer |
+
+**用户要求"保证以后不再出现 so 问题"**：
+- so-version-guarantee subagent 正在实施多层防线
+- 已有：build_id + ABI version + serve_ab 前置检查 + recovery script 构建顺序
+- 待加：cargo build.rs 编译期防陈旧 + dsv41-run 启动时 /proc/self/maps 唯一性检查
