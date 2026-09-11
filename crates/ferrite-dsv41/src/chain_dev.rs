@@ -173,23 +173,6 @@ fn eng_host() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false))
 }
 
-/// DSV41_GRAPH_CAP_LAYERS=N stops the layer loop after N layers (DEBUG ONLY). It
-/// exists to bisect the whole-step graph's illegal access: the capture records
-/// whatever the loop executes, so a capped capture produces a graph containing only
-/// layers 0..N - if that graph replays clean for a few hundred steps while an
-/// uncapped one faults, the culprit is in the layers at or past the cap, and the
-/// range narrows on each run. Unset means usize::MAX and no behavior change. Read
-/// ONCE (the house pattern - a per-step getenv would be a hot-path slip).
-fn graph_cap_layers() -> usize {
-    static CAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CAP.get_or_init(|| {
-        std::env::var("DSV41_GRAPH_CAP_LAYERS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(usize::MAX)
-    })
-}
-
 /// DSV41_MOE_BATCH=1 collapses the routed-expert fp4 GEMV family from one
 /// launch per (layer, top-k slot) to one launch per (layer, direction), which
 /// is the MoE family's real lever (the per-call launch floor is ~3.05 us and
@@ -885,11 +868,6 @@ impl<'a> DevChain<'a> {
         let mut t_attn = std::time::Duration::ZERO;
         let mut t_moe = std::time::Duration::ZERO;
         for layer in 0..cfg.n_layers {
-            // DSV41_GRAPH_CAP_LAYERS (debug): see graph_cap_layers. Only the capture
-            // is affected in practice - a graph replay never re-enters step_body.
-            if layer >= graph_cap_layers() {
-                break;
-            }
             // the engram writes into the residual stream BEFORE the block runs
             if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
                 self.engram_apply(layer, li)?;
