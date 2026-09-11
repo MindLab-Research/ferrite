@@ -1353,11 +1353,27 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     // M=1 (decode): skip the 16-row tile entirely - it wastes 15/16 of itself and
     // its 16*k bytes of shared memory cap the occupancy. One warp per output row.
     if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
-        const int warps = 8;
+        // Eight rows per block was the first shape. With k = 1536 that is 12 KB of
+        // weights per block and 2048 short-lived blocks for the q_b projection, so
+        // the per-block setup is a real share of the call. The count is adjustable
+        // to test that against the opposite risk (fewer, larger blocks and less
+        // occupancy); the per-row accumulation does not depend on it.
+        static const int g_warps = [] {
+            const char* e = getenv("DSV41_GEMV_FP8_WARPS");
+            if (e == nullptr) return 8;
+            const int v = atoi(e);
+            return (v >= 1 && v <= 32) ? v : 8;
+        }();
+        const int warps = g_warps;
         const int blocks = (n + warps - 1) / warps;
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k
                              : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k
                                                       : (size_t)0;
+        if (gsmem > 48 * 1024) {
+            cudaError_t e = cudaFuncSetAttribute(
+                gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            if (e != cudaSuccess) return (int)e;
+        }
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
                                                               k, g_gemv_fp8_mode);
         return (int)cudaGetLastError();
