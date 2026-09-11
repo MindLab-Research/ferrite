@@ -141,6 +141,75 @@ fn dlopen_or_err(path: &str) -> Result<*mut c_void> {
 
 // ------------------------------------------------------------------- DevBuf
 
+/// VERSION GATE for the dlopen-only paths (DSV41 and any other `devrt`
+/// consumer). `CudaBackend::verify_kernel_build` guards the GLM serve path;
+/// this mirrors it for the paths that never construct a `CudaBackend`.
+///
+/// User rule (2026-09-11, after a session of invalid measurements): the .so and
+/// the binary MUST come from the same build. `kernels/cuda/build.sh` stamps the
+/// .so with `git HEAD + sha256(.cu)` through `ferrite_kernel_build_id()`, and
+/// `build.rs` bakes the same string into this binary as `FERRITE_BUILD_ID`.
+/// Any mismatch — or a .so predating the stamp — is a hard error: a mismatched
+/// pair produces numbers that mean nothing.
+///
+/// Unlike the GLM path this cannot require a LINKED image: a `devrt` consumer
+/// deliberately does not link `libferrite_kernels.so` (that is the point of the
+/// dlopen design). So the linked-image belt-and-braces is skipped here and the
+/// stamp + ABI + same-source comparisons do the work.
+unsafe fn verify_kernel_build(handle: *mut c_void, so_path: &str) -> Result<()> {
+    const EXPECTED_ABI: u32 = 1;
+    let get_id = sym(handle, "ferrite_kernel_build_id").ok();
+    let get_abi = sym(handle, "ferrite_kernel_abi_version").ok();
+    let (get_id, get_abi) = match (get_id, get_abi) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            return Err(FerriteError::Config(format!(
+                "kernel version gate: {so_path} carries NO build stamp (it predates the gate). \
+                 Rebuild both artifacts from one checkout: \
+                 `cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release`."
+            )))
+        }
+    };
+    let id_fn: extern "C" fn() -> *const c_char = std::mem::transmute(get_id);
+    let abi_fn: extern "C" fn() -> u32 = std::mem::transmute(get_abi);
+    let so_abi = abi_fn();
+    let so_id = std::ffi::CStr::from_ptr(id_fn()).to_string_lossy().to_string();
+    let bin_id = env!("FERRITE_BUILD_ID");
+    if so_abi != EXPECTED_ABI {
+        return Err(FerriteError::Config(format!(
+            "kernel ABI mismatch: {so_path} abi={so_abi}, this binary expects {EXPECTED_ABI}. \
+             Rebuild both artifacts."
+        )));
+    }
+    if so_id != bin_id {
+        return Err(FerriteError::Config(format!(
+            "kernel build-id mismatch — REFUSING TO START (so and binary must be the same build): \
+             .so {so_path} build_id={so_id} vs binary build_id={bin_id}. \
+             Rebuild both from the same checkout: \
+             `cd kernels/cuda && bash build.sh 103a && cd ../.. && cargo build --release`."
+        )));
+    }
+    // Belt and braces: more than one mapped copy of the kernel .so means symbol
+    // resolution could bind to a different image than the one just checked.
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let mut seen: Vec<&str> = Vec::new();
+    for line in maps.lines() {
+        if let Some(p) = line.split_whitespace().last() {
+            if p.contains("libferrite_kernels.so") && !seen.contains(&p) {
+                seen.push(p);
+            }
+        }
+    }
+    if seen.len() > 1 {
+        return Err(FerriteError::Config(format!(
+            "more than one libferrite_kernels.so is mapped into this process ({seen:?}) — \
+             symbol resolution may bind to a different image than --lib/DSV41_KERNELS. \
+             Use one tree only."
+        )));
+    }
+    Ok(())
+}
+
 /// A plain device allocation. No pooling: the load-and-run path is
 /// latency-tolerant, and skipping the pool keeps this layer free of any
 /// interaction with the capture-sensitive activation allocator.
@@ -227,6 +296,13 @@ impl DevRuntime {
         let h_cublas = dlopen_or_err("libcublas.so")?;
         let h_k = dlopen_or_err(kernel_so)
             .map_err(|e| FerriteError::Config(format!("{e} — run kernels/cuda/build.sh first")))?;
+        // VERSION GATE (user rule 2026-09-11: so and binary MUST be the same
+        // build). The DSV41 path dlopens its kernels through THIS function, not
+        // through CudaBackend, so without this check a stale .so silently runs
+        // beside a fresh binary (or vice versa) and every measurement is
+        // meaningless. build.sh stamps the .so with `git HEAD + .cu hash` and
+        // build.rs embeds the same string in this binary.
+        unsafe { verify_kernel_build(h_k, kernel_so)? };
         unsafe {
             let cudart = Cudart {
                 malloc: f!(h_cudart, "cudaMalloc"),
