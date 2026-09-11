@@ -1219,7 +1219,12 @@ static const int g_gemv_fp8_mode = [] {
     if (e != nullptr) return atoi(e);              // 0 scalar, 1 vectorised, 3 staged+ordered
     const char* v = getenv("DSV41_GEMV_FP8_VEC");
     if (v != nullptr && v[0] == '0') return 0;     // the earlier opt-out still honoured
-    return 1;                                      // -5.34 ms/step, text verified
+    // The staged mode is the default because it won on both axes at once: 20.04 ms
+    // against the vectorised 21.52 ms in one session, same binary, and it is
+    // bit-identical to the scalar path so the stray token the reordering used to
+    // flip is gone. The wide loads are what made the vectorised branch fast, and
+    // staging keeps them without paying its order change.
+    return 3;
 }();
 
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
