@@ -142,6 +142,13 @@ struct Scratch {
     scores: DevBuf,    // [n_experts] f32
     route_idx: DevBuf, // [topk] i32
     route_w: DevBuf,   // [topk] f32
+    /// [1] u32 — the fused gate GEMV's last-block election counter
+    /// (`ferrite_gemv_bf16_v2_route`, DSV41_ROUTE_FUSE). Zeroed ONCE at build:
+    /// the elected block resets it in place before its grid ends, so a
+    /// captured-graph replay never needs a host memset here. A run that dies
+    /// mid-grid leaves it non-zero, which would silently disable the election —
+    /// DSV41_ROUTE_FUSE=0 is the recovery.
+    route_ctr: DevBuf,
     ex_in: DevBuf,     // [dim]
     ex_act: DevBuf,    // [2*inter]
     ex_out: DevBuf,    // [dim]
@@ -307,6 +314,17 @@ fn swiglu_q() -> bool {
 fn mix_gate_shared() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// DSV41_ROUTE_FUSE=0 reverts the gate GEMV + route_topk pair to two launches.
+/// DEFAULT ON: `ferrite_gemv_bf16_v2_route` runs the route in the gate GEMV's
+/// last block (40 launches/step and 40 graph nodes saved, and the route is
+/// bit-exact — see the kernel's epilogue note). Only the plain bf16 gate path
+/// can fuse; the MIX_GATE (fp8x2) and cuBLAS-M1 gate paths keep the separate
+/// route_topk, and so does an .so without the symbol (checked per call, cheap).
+fn route_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ROUTE_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_IDX_FUSE=0 reverts the wq_b + idx_wq_b pair to two launches.
@@ -611,6 +629,7 @@ impl<'a> DevChain<'a> {
             scores: dev.alloc(fb(n_exp))?,
             route_idx: dev.alloc(fb(topk).max(4))?,
             route_w: dev.alloc(fb(topk).max(4))?,
+            route_ctr: dev.alloc(4)?,
             ex_in: dev.alloc(fb(dim))?,
             ex_act: dev.alloc(fb(2 * inter.max(dim)))?,
             ex_out: dev.alloc(fb(dim))?,
@@ -638,6 +657,10 @@ impl<'a> DevChain<'a> {
             wo_q: dev.alloc(cfg.n_groups_o_lora().max(8))?,
             wo_qsc: dev.alloc(fb(cfg.n_groups_o_lora() / 32 + 8))?,
         };
+
+        // The fused route's election counter must start at 0 (cudaMalloc does
+        // not zero). From here on the kernel self-resets it every call.
+        dev.zero(&s.route_ctr)?;
 
         // RoPE tables covering the whole context.
         let table = max_pos;
@@ -2858,32 +2881,62 @@ fn hc_persist_mb() -> bool {
                     dim as i32,
                 )?;
         }
+        let mut routed = false;
         if !sh_via_mixed {
-            self.lin_bf16(
-                self.s.xn.ptr as *const f32,
-                dim as i32,
-                ld.gate_w.as_ref().unwrap(),
+            // Fused gate GEMV + route: the gate's LAST block runs the top-6
+            // selection over the 384 finished scores (DSV41_ROUTE_FUSE, default
+            // ON) — one launch where gate + route_topk used to be two, and
+            // bit-exact (device.rs::gemv_bf16_route). `routed == false` means
+            // "not fused" (symbol absent / shape mismatch / gate not a bf16
+            // GEMV), and the two-launch pair below still runs.
+            // cuBLAS-M1 is excluded: the fusion is a GEMV-v2 launch, and an A/B
+            // with DSV41_CUBLAS_M1=1 must keep its cuBLAS gate.
+            if route_fuse() && !cublas_m1() {
+                routed = self.dev.gemv_bf16_route(
+                    ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
+                    self.s.xn.ptr as *const f32,
+                    self.s.scores.ptr as *mut f32,
+                    n_routed as i32,
+                    dim as i32,
+                    self.s.route_w.ptr as *mut f32,
+                    self.s.route_idx.ptr as *mut i32,
+                    ld.gate_bias.as_ref().map(|b| b.as_f32()).unwrap_or(std::ptr::null()),
+                    topk as i32,
+                    cfg.norm_topk_prob,
+                    cfg.route_scale,
+                    2, // sqrtsoftplus, per the checkpoint's routing
+                    self.s.route_ctr.ptr as *mut std::ffi::c_uint,
+                )?;
+            }
+            if !routed {
+                self.lin_bf16(
+                    self.s.xn.ptr as *const f32,
+                    dim as i32,
+                    ld.gate_w.as_ref().unwrap(),
+                    n_routed as i32,
+                    self.s.scores.ptr as *mut f32,
+                )?;
+            }
+        }
+        if !routed {
+            self.dev.route_topk(
+                self.s.scores.as_f32(),
+                ld.gate_bias.as_ref().map(|b| b.as_f32()).unwrap_or(std::ptr::null()),
+                self.s.route_w.ptr as *mut f32,
+                self.s.route_idx.ptr as *mut i32,
+                // P1: `hist` is dead code - the kernel only checks it for non-null to
+                // issue an extra memset + route_hist_kernel per call, and no reader
+                // anywhere consumes the histogram. Passing null drops 2 device ops
+                // per layer (80/step) with zero numerical impact.
+                std::ptr::null_mut(),
+                1,
                 n_routed as i32,
-                self.s.scores.ptr as *mut f32,
+                topk as i32,
+                cfg.norm_topk_prob,
+                cfg.route_scale,
+                2, // sqrtsoftplus, per the checkpoint's routing
             )?;
         }
-        self.dev.route_topk(
-            self.s.scores.as_f32(),
-            ld.gate_bias.as_ref().map(|b| b.as_f32()).unwrap_or(std::ptr::null()),
-            self.s.route_w.ptr as *mut f32,
-            self.s.route_idx.ptr as *mut i32,
-            // P1: `hist` is dead code - the kernel only checks it for non-null to
-            // issue an extra memset + route_hist_kernel per call, and no reader
-            // anywhere consumes the histogram. Passing null drops 2 device ops
-            // per layer (80/step) with zero numerical impact.
-            std::ptr::null_mut(),
-            1,
-            n_routed as i32,
-            topk as i32,
-            cfg.norm_topk_prob,
-            cfg.route_scale,
-            2, // sqrtsoftplus, per the checkpoint's routing
-        )?;
         // DEVICE-side dispatch: the routing stays on the device and the expert
         // kernels read `ids[slot]` themselves. Both downloads here were blocking
         // cudaMemcpy calls (download_f32 uses the synchronous memcpy), i.e. a

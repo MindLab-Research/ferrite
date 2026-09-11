@@ -5927,13 +5927,23 @@ lm_head（n=16160）已在带宽地板（165MB/7.6TB/s = 21.8µs），不受此�
 **每层 6 次 = attention 4 + MoE 2**：
 | 调用点 | 行号 | 类型 | 行数 | k |
 |---|---|---|---|---|
-| wq_a+wkv | :1808 | mx2 | 1280+512 | dim=5120 |
-| wq_b | :1882 | mx | nlh*hd | ql=1280 |
-| kvb | :1918 | mx | nlh*(128+512) | kv_lora=512 |
-| wo_a | :2135 | mx | olg | nlh*hd |
-| wo_b | :2169/:2184 | mx | dim | ol_local |
-| sh w1/w3 | :2849 | mx2 | 2×sh_il | dim=5120 |
-| sh w2 | :2933 | mx | dim | sh_il=288 |
+| wq_a+wkv | :1808 → **:2015** | mx2 | 1280+512 | dim=5120 |
+| wq_b (+idx_wq_b) | :1882 → **:2093/:2112** | mx2_rope / mx2 | nlh*hd (+idx_nh*idx_hd) | ql=1280 |
+| ~~kvb~~ | ~~:1918~~ | — | **该行不存在（误记）** | — |
+| wo_a | :2135 → **:2439/:2457** | mx_q / mx | olg | nlh*hd=4096 |
+| wo_b | :2169/:2184 → **:2489/:2504** | mx_ar / mx | dim | ol_local=1024 |
+| sh w1/w3 | :2849 → **:2866/:3220** | mixed / mx2 | 2×sh_il | dim=5120 |
+| sh w2 | :2933 → **:3236/:3247** | mx | dim | sh_il=288 |
+
+> ⚠️ **修正（explore，2026-09-11）**：上表原有 `| kvb | :1918 | mx | nlh*(128+512) | kv_lora=512 |`
+> 一行是**误记**。`kvb` 在 `chain_dev.rs` 的**全部 git 历史与所有分支**中都不曾出现
+> （`git log --all -S kvb -- '*chain*.rs'` 为空；当前文件 `grep -c kvb` = 0），dsv41 走的是
+> **吸收式 latent 注意力**：`lin2` 的 wkv 半边产出 `s.kv`(512 f32) → `rmsnorm_rope`（就地）
+> → `ring_append`（ring 为 f32）→ `sparse_attn`，**全程没有任何 fp8 消费者、没有 `quant1(s.kv)`**。
+> 该行 `n=nlh*(128+512)` / `k=kv_lora=512` 的形状来自 **DeepSeek-MLA 的 `kv_b_proj`**
+> （只存在于 `ferrite-kernel`/`ferrite-exec` 的 DSA 路径与 `docs/agent/perf-roadmap.md`），
+> 属于跨模型串味的幻觉行。删掉它后 "attention 4" 恰好 = wq_a+wkv、wq_b(+idx_wq_b)、
+> wo_a、wo_b ✓（原表 7 行 vs "6 次"的自相矛盾也随之消失）。行号列已按 HEAD 更新。
 
 **已有的 mx2 融合已榨干**（wq_a+wkv 同激活、sh w1/w3 同激活）。
 **剩余可合并对只有 wo_a→wo_b**（异 k 链式两段核，−40 次 ≈ −0.38ms）——subagent 设计中。
@@ -6032,3 +6042,37 @@ wo-b1-impl subagent 正在实施。
 - 当前 8.60ms = 计算 ~6.6ms + 固定开销 ~2.0ms
 - Stage C persistent 落地 → 6.6 + 0.25 = **~6.85ms ≈ 146 tok/s**
 - 再加段内流水化 + expert/hc 突破 → 5.0ms ≈ **200 tok/s**（需再砍 1.85ms 计算）
+
+### 第 37 轮：f32v2 中性 + hcpm 大回归 + IMPLEMENT 定位（2026-09-11 深夜）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| f32v2（gemv_f32_v2 + rope_fuse 默认 ON） | 8.66ms | 115.5 | 四段全对 | 0 |
+| hcpm（hc_pre persistent 多块，DSV41_HC_PERSIST_MB=1） | **11.89ms** | **84.1** | 四段全对 | 0 |
+
+**f32v2 = 中性**（8.66 vs 8.61 控制，噪声内）——gemv_f32_v2（compressor 投影 v2 化）+
+rope_fuse（q/idx_q rope 折进 gemv epilogue）合计无收益也无回归。两者默认保留 ON（位级/
+近位级安全，消除 47 次 rope launch + 7 次 f32 gemv 的延迟受限）。
+
+**hcpm = +3.3ms 大回归**——hc_pre 的多块 persistent 形态（K-split + last-block 选举）
+比两 launch 版慢 41µs/次 × 80 次。**根因分析（待深查）**：
+1. 192 dot 块每块 publish 后 `__threadfence()` + `atomicAdd` 选举——fence 的 device 范围
+   序列化在 80 次/步 × 192 块的规模下开销爆炸
+2. 被选举的 tail 块在其它 192 块退出后独占 SM 做 sinkhorn（串行 20 轮）——但这个串行
+   部分与两 launch 版相同（12.4µs），不解释 +41µs
+3. 最可疑：**图捕获中的 atomicAdd 计数器跨 replay 不重置**——如果 g_hc_mb_done 累积，
+   选举条件（old == expected-1）在后续 replay 中可能走错路径（比如退化成全块等满）
+**处置**：DSV41_HC_PERSIST_MB 保持默认 OFF。多块 persistent 需要重新设计（计数器
+epoch 化 or 两阶段 kernel 而非选举）。
+
+**IMPLEMENT 排查结论（用户关注的正确性问题）**：
+- **在 CONTENT 字段**（message keys = ['role', 'content']，无 reasoning 字段）
+- 位置固定：pos 40，"举头望明月，" 之后、"低头思故乡" 之前
+- **base 臂 = "IMPLEMENTATION"**（不同 token！）vs 其它臂 = "IMPLEMENT" → 同一位置的
+  logit 决策边界行为（这两个 code token 与正确 token "低" 在该位置近并列）
+- 出现臂：base/all/svec/gv2/cse/wqf0（6/8）；**不出现：f32v2/hcpm**（最新两臂）
+- **按用户标准（content 出现 = 正确性问题）**：需要 logit probe 定位该位置 top-2 的
+  边界距离——如果 margin < 1e-3 则是模型本征边界（greedy 采样的固有风险），如果
+  margin 大则说明数值回归。待 GPU 空闲时做。
+
+**会话累计：13.28 → 8.60ms（+54.4%），75.3 → 116.3 tok/s（验证基线 8.61/116.1）。**

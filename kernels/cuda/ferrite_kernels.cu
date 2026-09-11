@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cmath>
+#include <cstdint>
 #include <cuda_fp8.h>
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -2728,12 +2729,157 @@ extern "C" cudaError_t ferrite_gemv_bf16(const float* x, const void* w,
 // Correctness note: v1/v2 summation orders differ (K-slice partials +
 // smem fold vs single-warp shuffle tree) → f32 rounding diffs ~1e-6.
 // ============================================================
+
+// ------------------------------------------------------------
+// Fused route epilogue for the M=1 gate GEMV (the "last block" pattern,
+// cf. router_gemm_route_fused_kernel above and hc_pre_persist_mb_kernel in
+// dsv41_kernels.cu). The gate GEMV's gridDim.x blocks each compute rpb rows
+// of `y` (the n_experts logits); the block that observes the FINAL count of
+// the per-launch counter runs route_topk_kernel's body over the whole
+// [n_experts] row. This drops the separate route_topk launch — 40/step,
+// 5.2us each = 0.21ms + 40 graph nodes (docs/agent/dsv41-kernel-inventory-v3.md
+// row 9).
+//
+// BIT-EXACT vs the two-launch path: the epilogue re-derives dsv41_act() on
+// the SAME f32 scores the standalone kernel reads, and copies the selection
+// loop, the tie-break (`v > bv || (v == bv && e < bi)` — a MAX with a
+// deterministic index tie-break, so the reduce tree's shape cannot move the
+// result, unlike a sum) and the renorm statement for statement.
+//
+// COUNTER DISCIPLINE (graph-safe). `ctr` is a device u32 read-modify-written
+// by every block and RESET TO 0 by the elected block before it exits — the
+// same self-resetting discipline as router_gemm_route_fused_kernel's `*ctr =
+// 0u` and hc_pre_persist_mb_kernel's g_hc_mb_done. Because the reset happens
+// inside the grid (after `prev == gridDim.x - 1`, i.e. every other block has
+// already incremented) and the next launch on the stream cannot start before
+// this grid completes, a captured CUDA graph replays correctly without any
+// per-call host memset. NOTE the failure mode if a run dies mid-grid: the
+// counter stays non-zero, the election never fires again and route_w/idx go
+// stale — the DSV41_ROUTE_FUSE=0 escape hatch is the recovery.
+// ------------------------------------------------------------
+struct Gv2RouteEpi {
+    float* weights;      // [topk] out
+    int32_t* indices;    // [topk] out
+    const float* bias;   // [n_experts] or null
+    float route_scale;
+    int topk, n_experts, norm_topk_prob, score_func;
+    unsigned* ctr;       // [1] device counter (null => epilogue disabled)
+};
+
+// The null epilogue handed to the plain ferrite_gemv_bf16_v2 launches: the
+// aggregate-init leaves ctr == nullptr, which is the "disabled" test below.
+static const Gv2RouteEpi GV2_ROUTE_NONE = {nullptr, nullptr, nullptr, 0.f, 0, 0, 0, 0, nullptr};
+
+// Mirrors dsv41_act() in dsv41_route.cu (that one lives in an anonymous
+// namespace and cannot be shared). KEEP THE TWO IN SYNC — the fused route is
+// only bit-exact while they agree.
+__device__ __forceinline__ float gv2_route_act(float v, int score_func) {
+    if (score_func == 0) return 1.f / (1.f + expf(-v));   // sigmoid
+    if (score_func == 2) {                                // sqrtsoftplus
+        const float sp = log1pf(expf(-fabsf(v))) + fmaxf(v, 0.f);  // stable
+        return sqrtf(fmaxf(sp, 0.f));
+    }
+    return v;                                             // identity
+}
+
+__device__ void gv2_route_epilogue(const Gv2RouteEpi epi, const float* __restrict__ y) {
+    // Publish: every writer of y[] must be done before this block counts.
+    // (rpb > 1 writes from warp%WPR==0 warps, not only thread 0.)
+    __syncthreads();
+    __shared__ int s_last;
+    if (threadIdx.x == 0) {
+        __threadfence();   // release: this block's y[] stores precede the count
+        const unsigned prev = atomicAdd(epi.ctr, 1u);
+        s_last = (prev == (unsigned)(gridDim.x - 1)) ? 1 : 0;
+    }
+    __syncthreads();
+    if (s_last == 0) return;   // no barrier follows on this path — safe
+    __threadfence();           // acquire: every other block's y[] store
+
+    // ---- route_topk_kernel's body, rows == 1 (scores = y) ----
+    const int n = epi.n_experts;
+    const int topk = epi.topk;
+    extern __shared__ float sh[];
+    float* s_act = sh;
+    float* s_sel = s_act + n;
+    int* s_pick = (int*)(s_sel + n);
+
+    const float* sr = y;
+    for (int e = threadIdx.x; e < n; e += blockDim.x) {
+        const float a = gv2_route_act(sr[e], epi.score_func);
+        s_act[e] = a;
+        s_sel[e] = a + (epi.bias ? epi.bias[e] : 0.f);
+    }
+    __syncthreads();
+
+    __shared__ float s_bv[32];
+    __shared__ int s_bi[32];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+    for (int it = 0; it < topk; ++it) {
+        float bv = -INFINITY;
+        int bi = n;
+        for (int e = threadIdx.x; e < n; e += blockDim.x) {
+            const float v = s_sel[e];
+            if (v > bv || (v == bv && e < bi)) {
+                bv = v;
+                bi = e;
+            }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+        if (lane == 0) {
+            s_bv[warp] = bv;
+            s_bi[warp] = bi;
+        }
+        __syncthreads();
+        if (warp == 0) {
+            float v = (lane < nw) ? s_bv[lane] : -INFINITY;
+            int i = (lane < nw) ? s_bi[lane] : n;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, v, off);
+                const int oi = __shfl_xor_sync(0xffffffffu, i, off);
+                if (ov > v || (ov == v && oi < i)) {
+                    v = ov;
+                    i = oi;
+                }
+            }
+            if (lane == 0) s_pick[it] = i;
+        }
+        __syncthreads();
+        if (threadIdx.x == 0 && s_pick[it] < n) s_sel[s_pick[it]] = -INFINITY;  // consume
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        float sum = 0.f;
+        for (int t = 0; t < topk; ++t) {
+            const int e = s_pick[t];
+            sum += (e < n) ? s_act[e] : 0.f;
+        }
+        for (int t = 0; t < topk; ++t) {
+            const int e = s_pick[t];
+            const float base = (e < n) ? s_act[e] : 0.f;
+            const float w = (epi.norm_topk_prob && sum > 0.f) ? base / sum : base;
+            epi.indices[t] = e;
+            epi.weights[t] = w * epi.route_scale;
+        }
+        *epi.ctr = 0u;   // reset for the next launch / graph replay
+    }
+}
+
 template <int WPR>
 __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
                                    const __nv_bfloat16* __restrict__ w,
                                    const float* __restrict__ bias,
                                    float* __restrict__ y,
-                                   int in_f, int out_f, int nrows) {
+                                   int in_f, int out_f, int nrows,
+                                   const Gv2RouteEpi rte) {
 #if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize(); // PDL v5: launch overlaps predecessor tail
 #endif
@@ -2788,6 +2934,19 @@ __global__ void gemv_bf16_v2_kernel(const float* __restrict__ x,
             if (rowg < nrows * out_f) y[rowg] = (bias ? bias[row] : 0.f) + sum;
         }
     }
+    // Fused route epilogue: null counter => the plain GEMV behaviour, bit for
+    // bit as before (no barrier, no atomic, no extra smem is touched).
+    if (rte.ctr != nullptr) gv2_route_epilogue(rte, y);
+}
+
+// The v2 launch shape (WPR + rows/block) — shared by the plain and the
+// route-fused entry points so the election's gridDim.x can never diverge
+// between them.
+static inline int gv2_wpr(int out_f) {
+    // WPR heuristic by row count: enough warps to cover HBM latency
+    // (out_f*WPR/8 warps total; target >= 64 warps/SM on 148 SMs).
+    // n = 384 (the MoE gate) -> WPR = 8, rpb = 1 -> 384 blocks.
+    return out_f >= 16384 ? 1 : (out_f >= 4096 ? 2 : (out_f >= 1024 ? 4 : 8));
 }
 
 extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
@@ -2797,9 +2956,7 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
     if (out_f <= 0 || nrows <= 0) return cudaSuccess;
     if (in_f <= 0) return cudaSuccess;
     if (in_f & 7) return ferrite_gemv_bf16(x, w, bias, out, in_f, out_f, s);
-    // WPR heuristic by row count: enough warps to cover HBM latency
-    // (out_f*WPR/8 warps total; target >= 64 warps/SM on 148 SMs).
-    int wpr = out_f >= 16384 ? 1 : (out_f >= 4096 ? 2 : (out_f >= 1024 ? 4 : 8));
+    int wpr = gv2_wpr(out_f);
     int rpb = 8 / wpr;                        // 256 threads = 8 warps
     long total = (long)nrows * out_f;
     dim3 grid((total + rpb - 1) / rpb);
@@ -2809,10 +2966,50 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
     // projections on DSA — ~200 nodes/step) launches with programmatic
     // stream serialization under FERRITE_PDL=1 (kernel-entry gridDepSync).
     switch (wpr) {
-        case 1: return pdl_or_plain(gemv_bf16_v2_kernel<1>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
-        case 2: return pdl_or_plain(gemv_bf16_v2_kernel<2>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
-        case 4: return pdl_or_plain(gemv_bf16_v2_kernel<4>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
-        default: return pdl_or_plain(gemv_bf16_v2_kernel<8>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows);
+        case 1: return pdl_or_plain(gemv_bf16_v2_kernel<1>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows, GV2_ROUTE_NONE);
+        case 2: return pdl_or_plain(gemv_bf16_v2_kernel<2>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows, GV2_ROUTE_NONE);
+        case 4: return pdl_or_plain(gemv_bf16_v2_kernel<4>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows, GV2_ROUTE_NONE);
+        default: return pdl_or_plain(gemv_bf16_v2_kernel<8>, grid, block, 0, s, x, wb, bias, out, in_f, out_f, nrows, GV2_ROUTE_NONE);
+    }
+}
+
+// Route-fused twin of ferrite_gemv_bf16_v2: the SAME GEMV launch, with the
+// MoE route run by its last block (gv2_route_epilogue). ABI adds the route
+// outputs + the bias/scale/score_func the standalone dsv41_route_topk takes,
+// plus the per-call counter `ctr` (4B device memory, zeroed ONCE at
+// allocation — the kernel self-resets it, see the counter-discipline note
+// above). Preconditions are checked here so a wrong call is a loud
+// cudaErrorInvalidValue rather than a wrong route:
+//   nrows == 1        — the epilogue reads ONE score row (`out`);
+//   in_f % 8 == 0     — else ferrite_gemv_bf16_v2 would take the v1 path,
+//                       which has no epilogue (the Rust side checks this too);
+//   topk in [1, out_f] and smem <= 48KB (384*8 + 6*4 = 3096B here).
+extern "C" cudaError_t ferrite_gemv_bf16_v2_route(
+    const float* x, const void* w, const float* bias, float* out,
+    int in_f, int out_f, int nrows,
+    float* weights, int32_t* indices, const float* route_bias,
+    int topk, int norm_topk_prob, float route_scale, int score_func,
+    unsigned* ctr, cudaStream_t s) {
+    if (out_f <= 0 || nrows <= 0) return cudaSuccess;
+    if (in_f <= 0) return cudaSuccess;
+    if (nrows != 1 || (in_f & 7) != 0 || topk <= 0 || topk > out_f
+        || weights == nullptr || indices == nullptr || ctr == nullptr) {
+        return (cudaError_t)cudaErrorInvalidValue;
+    }
+    const size_t smem = (size_t)out_f * 2 * sizeof(float) + (size_t)topk * sizeof(int);
+    if (smem > 48 * 1024) return (cudaError_t)cudaErrorInvalidValue;
+    const Gv2RouteEpi epi = {weights, indices, route_bias, route_scale,
+                             topk, out_f, norm_topk_prob, score_func, ctr};
+    int wpr = gv2_wpr(out_f);                 // MUST match the plain entry
+    int rpb = 8 / wpr;
+    dim3 grid((out_f + rpb - 1) / rpb);       // nrows == 1 => out_f rows total
+    dim3 block(256);
+    const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    switch (wpr) {
+        case 1: return pdl_or_plain(gemv_bf16_v2_kernel<1>, grid, block, smem, s, x, wb, bias, out, in_f, out_f, nrows, epi);
+        case 2: return pdl_or_plain(gemv_bf16_v2_kernel<2>, grid, block, smem, s, x, wb, bias, out, in_f, out_f, nrows, epi);
+        case 4: return pdl_or_plain(gemv_bf16_v2_kernel<4>, grid, block, smem, s, x, wb, bias, out, in_f, out_f, nrows, epi);
+        default: return pdl_or_plain(gemv_bf16_v2_kernel<8>, grid, block, smem, s, x, wb, bias, out, in_f, out_f, nrows, epi);
     }
 }
 

@@ -197,6 +197,18 @@ struct Kernels {
             *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // The route-fused twin of the above: the same GEMV launch with the MoE
+    // route (`dsv41_route_topk`'s body) run by its LAST block. ABI adds the
+    // route outputs + bias/scale/score_func and the per-call counter `ctr`
+    // (4B device memory, zeroed once at allocation — the kernel self-resets it
+    // in place, so a captured graph replays correctly). Optional: an older .so
+    // without the symbol keeps the two-launch gate + route_topk pair.
+    gemv_bf16_v2_route: Option<
+        unsafe extern "C" fn(
+            *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, *mut f32,
+            *mut c_int, *const f32, c_int, c_int, f32, c_int, *mut c_uint, CuStream,
+        ) -> c_int,
+    >,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
@@ -494,6 +506,7 @@ impl Device {
             ar_mark: ko!(rt, "dsv41_ar_mark"),
             gemv_bf16: ko!(rt, "dsv41_gemv_bf16"),
             gemv_bf16_v2: ko!(rt, "ferrite_gemv_bf16_v2"),
+            gemv_bf16_v2_route: ko!(rt, "ferrite_gemv_bf16_v2_route"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             argmax: ko!(rt, "dsv41_argmax"),
@@ -1740,6 +1753,70 @@ impl Device {
         let f = self.need(self.kernels.gemv_bf16, "dsv41_gemv_bf16")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_gemv_bf16")
+    }
+
+    /// Fused M=1 gate GEMV + MoE route: ONE launch where `gemv_bf16_command` +
+    /// `route_topk` used to be two. `ferrite_gemv_bf16_v2_route` runs the same
+    /// GEMV (same WPR shape, same accumulation -> the scores are bit-identical
+    /// to `gemv_bf16`) and its LAST block — the "last block" election on
+    /// `ctr`, cf. `router_gemm_route_fused_kernel` — then runs
+    /// `dsv41_route_topk`'s body over the finished score row, bit-exactly.
+    ///
+    /// Removes 40 launches/step (the audit's 5.2us x 40 = 0.21ms + 40 graph
+    /// nodes). `ctr` must be 4B of device memory zeroed ONCE at allocation:
+    /// the kernel resets it in place before returning, which is what makes a
+    /// captured graph replay correct without a per-call memset.
+    ///
+    /// Returns Ok(false) when the fused symbol or shape is unavailable — the
+    /// CALLER must then run the gate and `route_topk` as two launches. The
+    /// preconditions mirror `ferrite_gemv_bf16_v2`'s v1 fallback: `nrows == 1`
+    /// and `k % 8 == 0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_route(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        weights: *mut f32,
+        indices: *mut i32,
+        route_bias: *const f32,
+        topk: i32,
+        norm_topk_prob: bool,
+        route_scale: f32,
+        score_func: i32,
+        ctr: *mut c_uint,
+    ) -> Result<bool> {
+        if !gemv_bf16_v2_wanted(n) || (k & 7) != 0 || n <= 0 || topk <= 0 || topk > n {
+            return Ok(false);
+        }
+        let Some(f) = self.kernels.gemv_bf16_v2_route else {
+            return Ok(false); // older .so: keep the two-launch pair
+        };
+        // ABI: (x, w, bias, out, in_f=k, out_f=n, nrows=1, route out/bias/params, ctr, s).
+        let rc = unsafe {
+            f(
+                x,
+                w,
+                std::ptr::null(),
+                out,
+                k,
+                n,
+                1,
+                weights,
+                indices,
+                route_bias,
+                topk,
+                norm_topk_prob as i32,
+                route_scale,
+                score_func,
+                ctr,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "ferrite_gemv_bf16_v2_route")?;
+        Ok(true)
     }
 
     /// Same, f32 weights.
