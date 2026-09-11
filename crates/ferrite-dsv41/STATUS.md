@@ -5318,3 +5318,28 @@ sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
 **重要勘误（gap-analysis 发现）**：
 - 旧 nsys 表的 AR 行（3.46ms）是 host-barrier 路径，默认 v5 是 0.66ms——推演必须先换
 - `head_slice()` 默认已 ON（10.51→10.54 确认）；STATUS.md 早前"死锁 OFF"的记载已过时
+
+### 第 14 轮：hc-merge 回归（负结果，gate OFF）
+
+| 臂 | p50 | tok/s | 结论 |
+|---|---|---|---|
+| hcm（hc-merge ON） | 13.75ms | 72.7 | ❌ **+3.2ms 回归**（文本正确、faults=0） |
+| hcm0（OFF，对照） | 10.54ms | 94.9 | ✓ 基线确认 |
+
+**机制**：单核的 tail 块（m==mix）自旋等 ticket 期间**扣住一个 SM 当人质**；且 1024 线程/块下 dot 计算期 31/32 warp 空转（两 launch 版 dots 用 128 线程，只有 3 warp 空转）。gate 已翻 OFF（`DSV41_HC_MERGE=1` 可再开）；未来若重试，tail 分支应给独立小块而不是全 1024 线程。
+
+### AR store 融合（ar-store-fuse 报告，补丁已产出）
+
+- v5 store 是**纯逐元素拷贝**（无 ctr/ticket），"每 block 独立融进 producer epilogue"成立 ✓
+- 两个调用点的真身：attn 侧载体是 `gemm_fp8_gemv_kernel`（不是 gemv_bf16）；moe 侧有两个最后写者（rank0 是 add_inplace、其他是 moe_down_reduce）——补丁用 `shared_here` 判据路由
+- 预期 −80 图节点（engram 的 2 次走老路）
+- ⚠️ 第一优先 A/B：GEMV 加参数触发重编译 → fast_math 下 ptxas 可能改结合 → 新 .so + AR_ST=0 vs 旧 .so 的 token 必须逐位一致
+- 补丁在 `~/.xbot/users/web-4/workspace/ar-fuse-store/ar-v5-store-epilogue.patch`
+
+### xn-megafuse 前提修正（xn-megafuse 报告）
+
+- **5 族不可能一次 launch**：`s.xn` 是复用缓冲（attn 尾和 ffn 尾各写一次同址覆写），两簇消费者被 AR#1 + 整段 attention 隔开
+- 现实目标 = **2 个 launch**（A 簇 = wq_a+wkv+idx_wp 1824 行；B 簇 = gate+sh w1/w3 960 行）
+- 真正省的 = idx_wp 那个 8-block 小 slot ≈ **−0.25~0.5ms**（不是 −1.0ms）
+- `gemv_bf16_fp8x2` 不建 LUT/a32（用 e4m3_to_f 位运算）——"每族各做一遍"的假设不成立，可省的只有 fp8 激活 staging 一遍
+- 设计文档在 `~/.xbot/users/web-4/workspace/dsv41-xn-megakernel-design.md`
