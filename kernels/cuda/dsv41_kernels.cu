@@ -1665,13 +1665,23 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     if (vec == 4) {
         const int n16a = k >> 4;
-        // cp.async instead of a dependent LDG.128 -> STS.128 pair: the copies are
-        // issued as one burst and retired by the wait below, so the barrier no
-        // longer serialises 2.5 load-use round trips per thread. `a` is a
-        // cudaMalloc'd DevBuf (256-byte aligned) and every offset here is a
-        // multiple of 16, which is what cp.async16 requires.
-        for (int i = threadIdx.x; i < n16a; i += blockDim.x)
-            dsv41_cp_async16(s_a + (i << 4), a + (i << 4));
+        // GATED (default OFF): issuing this as cp.async faulted with err 700
+        // (illegal access, surfacing as a sticky error on dsv41_route_topk) on its
+        // first A/B while the identical synchronous form passed moments earlier.
+        // The addresses look legal (`a` is a cudaMalloc'd DevBuf and every offset
+        // is a multiple of 16), so the cause is not yet identified - keep the
+        // known-good dependent-copy form as the default and leave the async
+        // variant behind DSV41_GEMV_ACT_ASYNC for a bisect.
+        static const bool act_async = getenv("DSV41_GEMV_ACT_ASYNC") != nullptr;
+        if (act_async) {
+            for (int i = threadIdx.x; i < n16a; i += blockDim.x)
+                dsv41_cp_async16(s_a + (i << 4), a + (i << 4));
+        } else {
+            for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                *reinterpret_cast<uint4*>(s_a + (i << 4)) =
+                    *reinterpret_cast<const uint4*>(a + (i << 4));
+            }
+        }
         for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
     }
     if (vec >= 3) {
