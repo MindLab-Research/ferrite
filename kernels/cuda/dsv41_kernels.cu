@@ -50,19 +50,15 @@ __device__ __forceinline__ float ue8m0_to_f(uint8_t b) {
 
 __device__ __forceinline__ float e4m3_to_f(uint8_t b) {
     // sign(1) exp(4) mantissa(3), bias 7; subnormals (exp 0) are m * 2^-9.
-    // Bit-composed for the normal range: the fp8 gemv calls this twice per
-    // element and the fp8 path spends most of its instructions here, so the
-    // exp2f formula was worth replacing with three integer ops. Verbatim-equal
-    // to it on all 256 codes (checked exhaustively on the host; subnormals keep
-    // the multiply because a shift cannot express a missing implicit one).
-    const uint32_t s = ((uint32_t)b & 0x80u) << 24;
-    const uint32_t e = ((uint32_t)b >> 3) & 0x0Fu;
-    const uint32_t m = (uint32_t)b & 0x07u;
-    if (e == 0u) {
+    const uint32_t s = (b & 0x80u) ? 0x80000000u : 0u;
+    const uint32_t e = (b >> 3) & 0x0Fu;
+    const uint32_t m = b & 0x07u;
+    if (e == 0) {
         const float v = (float)m * (1.0f / 512.0f);
-        return (b & 0x80u) ? -v : v;
+        return s ? -v : v;
     }
-    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+    const float v = (1.0f + (float)m * 0.125f) * exp2f((float)((int)e - 7));
+    return s ? -v : v;
 }
 
 // The e2m1 code table (convert.py FP4_TABLE).
@@ -1611,18 +1607,6 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
-// Four-step ILP in the fp8 gemv's kb loop: 20.0 -> 8.35 us in isolation (2.4x).
-// DEFAULT ON: the round-trip through a degenerate serve was NOT the ILP itself
-// but two bugs around it - a missing shared-memory size on gemv_bf16's staging
-// (faults, empty outputs) and, here, `--use_fast_math` reassociating the widened
-// body. Pinning every add/mul with rn intrinsics fixed the latter, so the speed
-// stays. DSV41_GEMV_ILP=0 opts out.
-static const int g_gemv_ilp = [] {
-    const char* e = getenv("DSV41_GEMV_ILP");
-    if (e == nullptr) return 1;
-    return atoi(e) != 0 ? 1 : 0;
-}();
-
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
@@ -1645,8 +1629,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const uint8_t* __restrict__ w2 = nullptr,
                                      const uint8_t* __restrict__ w2_scale = nullptr,
                                      const float* __restrict__ bias2 = nullptr,
-                                     float* __restrict__ out2 = nullptr, int n1 = 0,
-                                     int ilp = 0) {
+                                     float* __restrict__ out2 = nullptr, int n1 = 0) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -1732,48 +1715,11 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
-            float acc = 0.f;
-            if (ilp) {
-            int kb = 0;
-            // Four steps in flight: the eight byte loads are independent, so the
-            // shared-memory latency is covered instead of exposed per step. The
-            // accumulation order (and the (A*sa)*(B*sb) association) is untouched,
-            // so the sum is bit-identical.
-            for (; kb + 3 < nb_k; kb += 4) {
-                const int j0 = (kb + 0) * 32 + lane, j1 = (kb + 1) * 32 + lane;
-                const int j2 = (kb + 2) * 32 + lane, j3 = (kb + 3) * 32 + lane;
-                const float sb0 = ue8m0_to_f(wsr[kb + 0]), sb1 = ue8m0_to_f(wsr[kb + 1]);
-                const float sb2 = ue8m0_to_f(wsr[kb + 2]), sb3 = ue8m0_to_f(wsr[kb + 3]);
-                const float sa0 = a_scale[kb + 0], sa1 = a_scale[kb + 1];
-                const float sa2 = a_scale[kb + 2], sa3 = a_scale[kb + 3];
-                const uint8_t av0 = ap[j0], av1 = ap[j1], av2 = ap[j2], av3 = ap[j3];
-                const uint8_t rv0 = row_s[j0], rv1 = row_s[j1], rv2 = row_s[j2], rv3 = row_s[j3];
-                // __fmaf_rn on the two scaled products: the baseline
-                // `acc += (A*sa)*(B*sb)` fuses into one FFMA under
-                // --use_fast_math, so a separate add of a separately-rounded
-                // product is a different number.
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av0), sa0), __fmul_rn(e4m3_to_f(rv0), sb0),
-                                acc);
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av1), sa1), __fmul_rn(e4m3_to_f(rv1), sb1),
-                                acc);
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av2), sa2), __fmul_rn(e4m3_to_f(rv2), sb2),
-                                acc);
-                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av3), sa3), __fmul_rn(e4m3_to_f(rv3), sb3),
-                                acc);
-            }
-            for (; kb < nb_k; ++kb) {
-                const float sb = ue8m0_to_f(wsr[kb]);
-                const float sa = a_scale[kb];    // m == 1
-                const int j = kb * 32 + lane;
-                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
-            }
-            } else {
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
                 const float sa = a_scale[kb];    // m == 1
                 const int j = kb * 32 + lane;
                 acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
-            }
             }
             __syncwarp();
         } else if (vec) {
@@ -1838,7 +1784,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         }
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
                                                               k, g_gemv_fp8_mode, nullptr, nullptr,
-                                                              nullptr, nullptr, n, g_gemv_ilp);
+                                                              nullptr, nullptr, n);
         return (int)cudaGetLastError();
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
@@ -1898,7 +1844,6 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             for (; c + 96 < k; c += 128) {
                 const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
                 const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
-                // DIAGNOSTIC: baseline expression form (compiler fuses to FFMA).
                 acc += __bfloat162float(w0) * x0;
                 acc += __bfloat162float(w1) * x1;
                 acc += __bfloat162float(w2) * x2;
@@ -1986,7 +1931,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
-        n1, g_gemv_ilp);
+        n1);
     return (int)cudaGetLastError();
 }
 
@@ -2022,17 +1967,13 @@ extern "C" int dsv41_engram_gather(const uint8_t* table, const uint8_t* table_sc
 // GLM HEAD_DEV pattern - the sampled token never leaves the device except as the
 // single 4-byte read the host needs for EOS and printing.
 __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out, int n,
-                              int* __restrict__ pos_ctr, int idx_off,
-                              unsigned long long* __restrict__ packed) {
+                              int* __restrict__ pos_ctr) {
     unsigned long long my = 0ull;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const unsigned int bits = __float_as_uint(v[i]);
         const unsigned int key = (bits >> 31) ? ~bits : (bits | 0x80000000u);
-        // The tie key must be the GLOBAL index (idx_off + i): a vocabulary slice
-        // that packed its local index would win or lose ties by the wrong rule,
-        // since the cross-rank final compares these keys directly.
         const unsigned long long pk =
-            ((unsigned long long)key << 32) | (0xFFFFFFFFu - (unsigned)(idx_off + i));
+            ((unsigned long long)key << 32) | (0xFFFFFFFFu - (unsigned)i);
         if (pk > my) my = pk;
     }
     for (int off = 16; off > 0; off >>= 1) {
@@ -2047,11 +1988,7 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
         unsigned long long m = 0ull;
         for (int w = 0; w < nw; ++w)
             if (wb[w] > m) m = wb[w];
-        // For a vocabulary slice the caller passes idx_off = the slice's first
-        // global index; `packed` (optional) hands the raw comparison key on so a
-        // cross-rank final can pick between slices with this same tie rule.
-        if (packed != nullptr) *packed = m;
-        *out = idx_off + (int)(0xFFFFFFFFu - (unsigned)(m & 0xFFFFFFFFu));
+        *out = (int)(0xFFFFFFFFu - (unsigned)(m & 0xFFFFFFFFu));
         // the argmax is the LAST kernel of the step: this is where the
         // device position counter advances, so every kernel of the NEXT
         // step (the engram hash, the window indices, the compressor) sees
@@ -2060,81 +1997,9 @@ __global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out
     }
 }
 
-// Cross-rank argmax over a vocabulary-sliced lm_head. Each rank reduces its own
-// slice with argmax_kernel's packing (comparable value key | ~index, so ties go
-// to the LOWEST index) and publishes that u64 into every peer's staging slot;
-// the final kernel takes the max across ranks in ascending rank order. The
-// packed key is monotone in (value, -index), so the winner and its tie rule are
-// exactly the full-vocabulary argmax's.
-__global__ void argmax_pub_kernel(const unsigned long long* __restrict__ peer_slots, int world,
-                                  int rank, const unsigned long long* __restrict__ packed,
-                                  long slot_f, long off, const int* __restrict__ pos_ctr) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    const unsigned long long pk = packed[0];
-    // The step counter is the round: every rank is at the same pos (lockstep),
-    // and pos_ctr is only advanced by the final kernel, so both sides read the
-    // same value.
-    const unsigned round = (pos_ctr != nullptr) ? (unsigned)*pos_ctr : 0u;
-    for (int p = 0; p < world; ++p) {
-        char* base =
-            reinterpret_cast<char*>(peer_slots[p]) + (size_t)rank * (size_t)slot_f + off;
-        *reinterpret_cast<unsigned long long*>(base) = pk;
-        __threadfence_system();
-        *reinterpret_cast<volatile unsigned*>(base + 8) = round;   // flag written LAST
-        __threadfence_system();
-    }
-}
-
-__global__ void argmax_final_kernel(const float* __restrict__ staging, int world, long slot_f,
-                                    long off, int* __restrict__ out,
-                                    int* __restrict__ pos_ctr) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    // Wait for every peer's publish before reading: without this the final can
-    // read a slot the peer has not written yet (they are independent kernels on
-    // independent streams of different contexts).
-    const unsigned round = (pos_ctr != nullptr) ? (unsigned)*pos_ctr : 0u;
-    unsigned long long best = 0ull;
-    for (int p = 0; p < world; ++p) {
-        const char* base =
-            reinterpret_cast<const char*>(staging) + (size_t)p * (size_t)slot_f + off;
-        const volatile unsigned* fl = reinterpret_cast<const volatile unsigned*>(base + 8);
-        while (*fl < round) {
-        }
-        __threadfence_system();
-        const unsigned long long pk = *reinterpret_cast<const unsigned long long*>(base);
-        if (pk > best) best = pk;
-    }
-    *out = (int)(0xFFFFFFFFu - (unsigned)(best & 0xFFFFFFFFu));
-    if (pos_ctr != nullptr) *pos_ctr = *pos_ctr + 1;
-}
-
 extern "C" int dsv41_argmax(const float* v, int* out, int n, int* pos_ctr, cudaStream_t s) {
     if (n <= 0) return (int)cudaErrorInvalidValue;
-    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, pos_ctr, 0, nullptr);
-    return (int)cudaGetLastError();
-}
-
-// Vocabulary-sliced argmax (lm_head split across ranks): rank-local reduce over
-// the slice, publish the packed comparison key into every peer's staging slot,
-// then a one-thread final picks the winner across ranks. `off` must sit where
-// the all-reduce payload never lands (the caller passes slot_bytes - 8), so the
-// argmax key and the collective staging do not collide. pos_ctr advances here,
-// once per step, exactly as the single-rank argmax did.
-extern "C" int dsv41_argmax_sliced(const float* v, int n, int idx_off, int* out,
-                                   unsigned long long* packed, int* pos_ctr,
-                                   const unsigned long long* peer_slots, int world, int rank,
-                                   const float* staging, long slot_bytes, long off,
-                                   cudaStream_t s) {
-    // off must leave room for the 8-byte packed key plus the 4-byte publish flag,
-    // and sit clear of the all-reduce payload.
-    if (n <= 0 || world <= 0 || off + 12 > slot_bytes) return (int)cudaErrorInvalidValue;
-    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, nullptr, idx_off, packed);
-    cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) return (int)e;
-    argmax_pub_kernel<<<1, 1, 0, s>>>(peer_slots, world, rank, packed, slot_bytes, off, pos_ctr);
-    e = cudaGetLastError();
-    if (e != cudaSuccess) return (int)e;
-    argmax_final_kernel<<<1, 1, 0, s>>>(staging, world, slot_bytes, off, out, pos_ctr);
+    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, pos_ctr);
     return (int)cudaGetLastError();
 }
 
@@ -2936,20 +2801,12 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
         __syncthreads();
         float* o_r = out + (size_t)r * dim;
         float s2 = 0.f;
-        // Four columns in flight: the row loads of c+3*blockDim issue while c's
-        // fmas run. The per-column work is `fmaf` (explicitly rounded) and the s2
-        // accumulation order is untouched, so only the timing changes.
-#pragma unroll 1
         for (int c = threadIdx.x; c < dim; c += blockDim.x) {
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
                 acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
             o_r[c] = acc;
-            // __fmaf_rn, not `s2 += acc * acc`: with the 4x unroll the four s2
-            // chains become independent and --use_fast_math may reassociate them
-            // (the baseline's single chain could not be), which moves the
-            // rmsnorm denominator and therefore every output of the layer.
-            s2 = __fmaf_rn(acc, acc, s2);
+            s2 += acc * acc;
         }
         // the same reduction tree rmsnorm_kernel uses
         for (int off = 16; off > 0; off >>= 1) s2 += __shfl_down_sync(0xffffffffu, s2, off);

@@ -764,12 +764,6 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             const int nv2 = k >> 9;
             const int off2 = lane << 3;                  // 16 values = 8 bytes per lane
             float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
-            // Four groups in flight (the fp8 gemv gained 2.4x from the same
-            // treatment): the weight/scale/activation loads of g+1..g+3 issue
-            // while g's fmas run. The accumulation is `fmaf` (explicitly rounded),
-            // so unrolling cannot reassociate it - only re-time the loads - and
-            // each accumulator still visits its own elements in ascending g.
-#pragma unroll 1
             for (int g = 0; g < nv2; ++g) {
                 const int j = (g << 9) + (lane << 4);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);

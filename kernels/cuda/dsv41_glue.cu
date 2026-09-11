@@ -260,13 +260,6 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // Baseline single-chain loop: the four-way manual unroll that lived here
-    // since a4053cd turned out to be the second-round regression. With
-    // --use_fast_math, four INDEPENDENT `acc += w*x` expressions are
-    // reassociable (the single dependency chain is not), and the drift
-    // accumulates over 40 layers into a degenerate model. The isolation
-    // comparison had missed it because it compared single-chain vs fmaf,
-    // not unrolled vs single-chain.
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
@@ -283,7 +276,6 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // Baseline single-chain loop (same as gemv_bf16 - see the note there).
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const float* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
@@ -739,17 +731,7 @@ extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n,
     if (n <= 0 || k <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
-    // The kernel stages the (shared) activation row in shared memory: k floats.
-    // The size is the caller's to pass - launching with 0, as the first cut of
-    // this staging did, points s_x at an empty allocation and the staging writes
-    // walk off the end (faults=4 with empty outputs on the first deployment).
-    const size_t smem = (size_t)k * sizeof(float);
-    if (smem > 48 * 1024) {
-        cudaError_t e = cudaFuncSetAttribute(gemv_bf16_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
-    }
-    gemv_bf16_kernel<<<blocks, 256, smem, s>>>((const __nv_bfloat16*)w, x, out, n, k);
+    gemv_bf16_kernel<<<blocks, 256, 0, s>>>((const __nv_bfloat16*)w, x, out, n, k);
     return (int)cudaGetLastError();
 }
 
@@ -758,16 +740,7 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
     if (n <= 0 || k <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
-    // Same as gemv_bf16: the kernel stages the activation row in shared memory,
-    // so the size is the caller's to pass. Launching with 0 made that staging
-    // walk off an empty allocation on the sibling kernel.
-    const size_t smem = (size_t)k * sizeof(float);
-    if (smem > 48 * 1024) {
-        cudaError_t e = cudaFuncSetAttribute(gemv_f32_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
-    }
-    gemv_f32_kernel<<<blocks, 256, smem, s>>>(w, x, out, n, k);
+    gemv_f32_kernel<<<blocks, 256, 0, s>>>(w, x, out, n, k);
     return (int)cudaGetLastError();
 }
 
