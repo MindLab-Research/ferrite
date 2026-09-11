@@ -6899,3 +6899,29 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 **会话累计：13.28 → 6.66ms（+99.7%），75.3 → 150.2 tok/s（+99.5%）——突破 150 tok/s！**
 
 **距离 200 tok/s（5.0ms）还差 1.66ms**——wo-pair（−0.13ms）+ warps sweep + sparse fp8 KV + 链式对。
+
+### nsys v8（6.66ms 基线）的精确分解（2026-09-12 01:45）
+
+| kernel | 次/步 | med µs | ms/步 | vs v7 |
+|---|---|---|---|---|
+| gemm_fp8_gemv (struct pack + cp.async) | 246 | **10.0** | **2.46** | **−2.3µs/call（cp.async ✓）** |
+| hc_mixes_tail (side) | 160 | 7.1 | 1.13 | 不变 |
+| expert_gateup (K-split ON) | 40 | 24.4 | 0.98 | 不变 |
+| expert_down_reduce | 40 | 23.8 | 0.95 | 不变 |
+| AR (NCCL mode) | 246 | — | 1.42 | NCCL 模式（生产 v5 ~0.66ms） |
+| hc_mix_dots (side) | 80 | 7.0 | 0.56 | 不变 |
+| sparse_attn_orope | 40 | **7.7** | 0.31 | **−2.1µs** |
+| gemv_bf16_v2 (gate+route) | 48 | 9.2 | 0.44 | +1.0µs（route epilogue） |
+| hc_post_inplace | 80 | 1.9 | 0.15 | 已 fold |
+| rmsnorm_rope | 40 | 2.6 | 0.10 | |
+| quant_fp4_fused | 40 | 1.8 | 0.07 | |
+| argmax | 1 | 59.0 | 0.06 | |
+
+**cp.async 效果确认**：gemm med 12.3→10.0µs（−2.3µs/call × 246 = −0.57ms 理论值，实际 6.84→6.66 = −0.18ms，部分被其它抵消）
+
+**gemm 2.46ms 仍是最大项（37%）**——prologue 剩余 ~5µs 中的进一步优化需要：
+- wo-pair 链式对（−0.13ms，wo-pair-impl 实施中）
+- warps sweep（DSV41_GEMV_WARPS_BIG=4/6/8/16）
+- 更激进的 prologue 流水线
+
+**距离 200 tok/s（5.0ms）**：gap 1.66ms。

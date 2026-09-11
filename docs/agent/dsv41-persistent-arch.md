@@ -243,10 +243,10 @@ __global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const 
 
 | 位置 | 内容 |
 |------|------|
-| `dsv41_kernels.cu:1282` | `sparse_attn_orope_kernel`：phase 1 逐句照抄 `sparse_attn_pf_kernel`；phase 2 = `apply_rope_kernel:1218-1224`；phase 3 = `:1230-1246` |
-| `dsv41_kernels.cu:3702` | `dsv41_sparse_attn_orope` launcher（新函数，未改 `dsv41_sparse_attn`）。**decline 哨兵 = 1/2/3**：1=形状不可用；2=plain 调用不会选 pf（`DSV41_ATTN_SEQ` / key-split / `DSV41_ATTN_PF=0`）；3=发射形状不精确。**刻意避开哨兵 1**（与 `cudaErrorInvalidValue` 冲突，见 `dsv41_apply_rope_q` 的 legacy 陷阱） |
-| `device.rs:172/590/1594` | `sparse_attn_orope` 可选符号（`ko!`）+ struct `Option` 字段 + wrapper（`Ok(false)` = 回退） |
-| `chain_dev.rs:565/2766` | `sparse_orope()` env gate（`DSV41_SPARSE_OROPE`，默认 ON）；调用点先试融合，`!s_orope` 才跑 `sparse_attn` + `apply_rope_q` + `quant1` |
+| `dsv41_kernels.cu:1314` | `sparse_attn_orope_kernel`：phase 1 逐句照抄 `sparse_attn_pf_kernel`；phase 2 = `apply_rope_kernel:1218-1224`；phase 3 = `:1230-1246`（2026-09-11 HEAD 复核，行号随文件增长右移；本节其余行号同批复核） |
+| `dsv41_kernels.cu:4627` | `dsv41_sparse_attn_orope` launcher（新函数，未改 `dsv41_sparse_attn`）。**decline 哨兵 = 1/2/3**：1=形状不可用；2=plain 调用不会选 pf（`DSV41_ATTN_SEQ` / key-split / `DSV41_ATTN_PF=0`）；3=发射形状不精确。**刻意避开哨兵 1**（与 `cudaErrorInvalidValue` 冲突，见 `dsv41_apply_rope_q` 的 legacy 陷阱） |
+| `device.rs:172/647/1718` | `sparse_attn_orope` 可选符号（`ko!`）+ struct `Option` 字段 + wrapper（`Ok(false)` = 回退） |
+| `chain_dev.rs:623/3093` | `sparse_orope()` env gate（`DSV41_SPARSE_OROPE`，默认 ON）；调用点先试融合，`!s_orope` 才跑 `sparse_attn` + `apply_rope_q` + `quant1` |
 
 **两处对骨架的修正**：
 
@@ -256,5 +256,32 @@ __global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const 
 **bit-identical 的关键等价**：per-head 发射的 flat block 索引 = `((row*h+hh)*d)/32 + blk`；因 `d % 32 == 0`，head 起点必落在 32-block 边界，故它 == flat 版 `xsc` 的同一下标。**若 `hd % 32 != 0` 此等价失效** —— launcher 的 `(d & 31) != 0 → return 1` 为此硬门。
 
 **phase 3 直接写 roped 值到 global**（而非写未 rope 的中间值再原地旋转）：旧双 launch 的净效果同样是 `s.o` 最终 = roped；`sparse_attn` 与 `apply_rope` 之间无人读 `s.o`，中间态不可观测。
+
+### 10.2 上机后核账（2026-09-11，nsys v7）：0.39ms / 3.9%，**不是带宽受限，不能靠 fp8 KV 再降**
+
+实测 40 次 × 9.8µs = 0.39ms（占 6.84ms 的 3.9%），与融合前的 `sparse_attn_pf`（40×8.5 = 0.34ms）同量级：
+融合省下的两个 launch 节点已被吃进，余下的是 pf 主体本身。
+
+**为什么"地板 = 2MB×40 / 7.6TB/s ≈ 10.5µs/层"这个估算是错的**（三处）：
+1. **没有独立的 K/V 两个张量**。本模型是 MLA 吸收式：`n_heads=64, head_dim=512, **1 个 KV head**`（`config.rs:11`），
+   `ring` 每个位置只有 **1 条 512 维 latent**（`chain_dev.rs:822`），同一份 `kb` 既算 score（`dsv41_kernels.cu:1394`）
+   又算加权和（`:1405`）。所以 per-head 唯一数据是 `512×512×4B = 1MB/层`，不是 2MB。
+2. **per-rank 只有 8 个 head**：`nlh = nh/world`（`chain_dev.rs:2539`），grid = `(b*m, h) = (1, 8)`（`dsv41_kernels.cu:4662`）
+   ⇒ 8 blocks × 128 线程 = 1024 线程，占用 **8/148 SM ≈ 5%**、4096/303K 线程槽（≈1.3%）。
+3. **8 个 head 读同一份 latent**（`kBase` 无 head 项，`dsv41_kernels.cu:1350`），第一块 miss 后其余全在 L2 命中。
+   真实 DRAM 需求 = **1MB/层 ≈ 0.13µs @8TB/s**，比实测低 ~75x。
+
+⇒ **该 kernel 是延迟/占用受限，不是带宽受限**：每个 warp 串行走 `topk/4 = 128` 个 slot，
+每 slot = 16 FMA + 5 shfl + 2 `expf` + 16 FMA；8 个 block 摊不满机器。
+**结论：fp8 KV（f32→e4m3 减半读取）在此路径上收益 ≈ 0 —— 本项目已实测过同类改动为回归**
+（fp16 k 缓存 + half2 score：`perf-roadmap.md:362-375`，两窗口都更慢，已 `git reset`）；
+且 `dsv41` 侧**没有任何 fp8 KV 通路**（`kv` 形参就是 `const float*`，fp8 KV 只存在于
+另一模型的 `ferrite_kernels.cu:5955/6209`）。**本项应关闭。**
+
+**真顺位（若继续投入）**：① key-split（`DSV41_ATTN_PF_SPLIT=C`，隔离台架实测 per-slot 成本降 ~7x，
+`dsv41_kernels.cu:845-857`）——但 `C>0` 会让本融合 decline 回退到 3 launch（`:4660`），
+前置条件是**把 phase 2/3 折进 `sparse_attn_merge_kernel`**（`:1133`，其 grid `(b*m,h)` 与 pf 完全相同，
+`chain_dev.rs:2875-2881` 已写明）；② 单块内提并行（加 warp 数）——**但 merge epilogue 只折 4 个 warp**
+（`sh_acc[4][512]`、`w < nwarp && w < 4`，`:1524/1537-1540`），改 blockDim 必须先改这个静默截断。
 
 **未验证项（上机前必做）**：① 本机无 nvcc/GPU，`.cu` **未编译**（仅括号平衡自检 + 逐行静态复核）；② `--use_fast_math` 下 rope 的 `x0*cc - x1*ss` 收缩需 parity 逐位确认；③ 建议 `DSV41_SPARSE_OROPE=0` 与 ON 各跑一次逐步 RMS 对照。

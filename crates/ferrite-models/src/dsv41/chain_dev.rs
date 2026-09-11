@@ -204,6 +204,15 @@ struct Scratch {
     /// input late would read bytes the epilogue had already overwritten.
     wo_q: DevBuf,   // [n_groups*o_lora] fp8 bytes
     wo_qsc: DevBuf, // [n_groups*o_lora/32 + 8] f32
+    // ---- chain-pair-grid-sync: wo_a -> wo_b grid-sync barrier state ----
+    /// `[arrive, sense]` u32 pair for `gemm_fp8_wo_pair_kernel`'s device-wide
+    /// barrier. Persistent and zeroed ONCE at init: the kernel resets `arrive` and
+    /// flips `sense` on every launch, so a captured graph replays correctly and
+    /// nothing re-initialises it per step. Must NOT be shared with any other
+    /// barrier — two concurrent grids on one pair corrupt each other's arrive
+    /// count (the wo pair runs on the main stream, serialised, which is what makes
+    /// one pair sufficient).
+    wo_bar: DevBuf, // [2] u32
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -893,6 +902,9 @@ impl<'a> DevChain<'a> {
             // largest `ol_local` any rank produces.
             wo_q: dev.alloc(cfg.n_groups_o_lora().max(8))?,
             wo_qsc: dev.alloc(fb(cfg.n_groups_o_lora() / 32 + 8))?,
+            // chain-pair-grid-sync: the [arrive, sense] barrier pair. 8 bytes; the
+            // kernel self-resets it, so it only has to START at zero (see below).
+            wo_bar: dev.alloc(8)?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does
@@ -1108,6 +1120,24 @@ impl<'a> DevChain<'a> {
         *F.get_or_init(|| {
             std::env::var("DSV41_WOB_F32").map(|v| v != "0").unwrap_or(true)
         })
+    }
+
+    /// chain-pair-grid-sync (DSV41_WO_PAIR, default OFF): the wo_a -> wo_b pair as
+    /// ONE grid-sync launch (`dsv41_gemm_fp8_wo_pair`) instead of two, with a
+    /// sense-reversing device-wide barrier between the phases. Each row is still
+    /// one warp in the same lane order, so both outputs are bit-identical to the
+    /// two launches this replaces; what disappears is one launch + one graph node
+    /// per layer (40/step).
+    ///
+    /// Default OFF because it is a NEW kernel whose only verified property so far
+    /// is the decline/fallback path: "=1" is the bring-up arm and the text check
+    /// (`cargo test` + a serve A/B) is what flips it, like every other gate here.
+    /// The fused path ALSO needs wob_f32 ON (the pair kernel's phase 2 IS the f32
+    /// activation form), one wo_a group on this rank, and no B1/AR-store fusion —
+    /// see the call site.
+    fn wo_pair_fuse() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| std::env::var("DSV41_WO_PAIR").map(|v| v == "1").unwrap_or(false))
     }
 
     /// Two projections over the same activation: quantise once, then one gemv
@@ -3206,7 +3236,68 @@ fn hc_tail_split() -> bool {
         // and we then run the plain call for every group; the emitted bytes are
         // bit-identical either way, which is what makes the fallback safe.
         let wo_fuse = Self::wo_quant_fuse() && (olg % 32) == 0;
+        // wo_b is RowParallel: the input (groups*o_lora) is split, so this rank
+        // reduces over its own slice and the ranks' partial sums are added.
+        let ol_total = groups * cfg.o_lora_rank;
+        let ol_local = ol_total / world;
+        // this rank wrote its groups at local offsets [0, nlg*olg) = [0, ol_local)
+        // == lin()'s quant1 half, hoisted so the fp8 activation exists before the
+        // direct gemm_fp8_mx below (lin() would re-quantise, and cannot pass the AR
+        // staging args). Under AR v5 the epilogue ALSO stores the row partial into
+        // every peer's slot, so the following all_reduce becomes publish+reduce
+        // only -- the standalone store kernel disappears for this site.
+        // (Hoisted above the wo_a loop by chain-pair-grid-sync: the fused pair call
+        // replaces BOTH projections, so it must be able to run before the loop.)
+        let comm = self.comm.clone();
+        // AR store fusion: gated OFF by default (round 19 showed the fused path
+        // breaks the four texts even with GATEUP/DOWN_FUSE off, because this
+        // changes wo_b's all_reduce to pubred-only which depends on the gemv
+        // epilogue having stored the partials - a coupling that must be debugged
+        // together with the GATEUP_FUSE numerical bug). DSV41_AR_STORE_FUSE=1
+        // re-enables.
+        let ar_store_fused = ar_store_fuse()
+            && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
+        // ---- chain-pair-grid-sync (DSV41_WO_PAIR, default OFF) ---------------
+        // The (wo_a, wo_b) pair as ONE grid-sync launch. Its two phases run the
+        // same GEMV bodies in the same lane order, so every row of `s.wo` and
+        // `s.o` is bit-identical to what the two calls below produce; what is saved
+        // is one launch + one graph node per layer (40/step).
+        //
+        // The kernel implements ONE arm -- wo_a as the fp8 GEMV (mode 4 + a32,
+        // which is the default mode) and wo_b as the f32-activation GEMV -- and
+        // one group per rank (its phase 1 stages a single block-wide activation
+        // row). Every other combination is declined, so these guards mirror the
+        // kernel's specialisation exactly.
+        let mut wo_paired = false;
+        if Self::wo_pair_fuse()
+            && !wo_fuse                    // B1 epilogue is not wired into the pair
+            && !ar_store_fused             // AR-store epilogue is not either
+            && nlg == 1                    // one group: one staged activation row
+            && (k % 16) == 0               // cp.async weight staging + LUT decode
+            && (ol_local % 32) == 0        // phase-1 weight scale rows in 32-row blocks
+            && Self::wob_f32()             // the pair's phase 2 IS the f32 form
+            && self.dev.supports_wo_pair()
+        {
+            wo_paired = self.dev.gemm_fp8_wo_pair(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                ld.wo_a.as_ref().unwrap().as_u8(),
+                ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                olg as i32,
+                k as i32,
+                ld.wo_b.as_ref().unwrap().as_u8(),
+                ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                dim as i32,
+                ol_local as i32,
+                self.s.wo.ptr as *mut f32,
+                self.s.o.ptr as *mut f32,
+                self.s.wo_bar.ptr as *mut u32,
+            )?;
+        }
         let mut wo_fused = false;
+        if !wo_paired {
         for g in 0..nlg {
             // The weight tensor is ALREADY the rank's local slice (Shard::Groups
             // cut it at load time), so every offset must be LOCAL: group g of
@@ -3247,25 +3338,7 @@ fn hc_tail_split() -> bool {
             }
             self.dev.gemm_fp8_mx(a, asc, wp, wsp, std::ptr::null(), out, 1, olg as i32, k as i32)?;
         }
-        // wo_b is RowParallel: the input (groups*o_lora) is split, so this rank
-        // reduces over its own slice and the ranks' partial sums are added.
-        let ol_total = groups * cfg.o_lora_rank;
-        let ol_local = ol_total / world;
-        // this rank wrote its groups at local offsets [0, nlg*olg) = [0, ol_local)
-        // == lin()'s quant1 half, hoisted so the fp8 activation exists before the
-        // direct gemm_fp8_mx below (lin() would re-quantise, and cannot pass the AR
-        // staging args). Under AR v5 the epilogue ALSO stores the row partial into
-        // every peer's slot, so the following all_reduce becomes publish+reduce
-        // only -- the standalone store kernel disappears for this site.
-        let comm = self.comm.clone();
-        // AR store fusion: gated OFF by default (round 19 showed the fused path
-        // breaks the four texts even with GATEUP/DOWN_FUSE off, because this
-        // changes wo_b's all_reduce to pubred-only which depends on the gemv
-        // epilogue having stored the partials - a coupling that must be debugged
-        // together with the GATEUP_FUSE numerical bug). DSV41_AR_STORE_FUSE=1
-        // re-enables.
-        let ar_store_fused = ar_store_fuse()
-            && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
+        }
         // wo_b's activation, in priority order:
         //  1. B1 (wo_fused): the wo_a epilogue already emitted `wo_q`/`wo_qsc`, so
         //     the quant1 that used to run here is skipped.
@@ -3278,7 +3351,7 @@ fn hc_tail_split() -> bool {
         // The f32 path cannot carry the AR store fusion (that lives on the fp8
         // launcher's epilogue), so it is only taken when `ar_store_fused` is off.
         let mut wb_f32 = false;
-        if !wo_fused && !ar_store_fused && Self::wob_f32() && self.dev.supports_gemm_fp8_f32() {
+        if !wo_paired && !wo_fused && !ar_store_fused && Self::wob_f32() && self.dev.supports_gemm_fp8_f32() {
             wb_f32 = self.dev.gemm_fp8_mx_f32(
                 self.s.wo.ptr as *const f32,
                 ld.wo_b.as_ref().unwrap().as_u8(),
@@ -3289,7 +3362,7 @@ fn hc_tail_split() -> bool {
                 ol_local as i32,
             )?;
         }
-        if !wb_f32 {
+        if !wo_paired && !wb_f32 {
             let (wb_q, wb_sc) = if wo_fused {
                 (self.s.wo_q.as_u8(), self.s.wo_qsc.as_f32())
             } else {

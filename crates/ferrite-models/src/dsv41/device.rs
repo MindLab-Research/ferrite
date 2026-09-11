@@ -135,6 +135,29 @@ struct Kernels {
             *const f32, *const u8, *const u8, *const f32, *mut f32, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// chain-pair-grid-sync: the wo_a -> wo_b pair as ONE grid-sync launch
+    /// (`dsv41_gemm_fp8_wo_pair`). Phase 1 is the wo_a fp8 GEMV (mode 4 + a32),
+    /// phase 2 the wo_b f32-activation GEMV, joined by a sense-reversing
+    /// device-wide barrier instead of a stream edge -- so the two GEMVs of every
+    /// layer's output projection become one launch (40 saved per step).
+    ///
+    /// `bar` is a persistent 2 x u32 device buffer, `[arrive, sense]`, zeroed
+    /// once at init; the kernel self-resets it every launch, so a captured graph
+    /// replays correctly. A separate symbol, so a stale `.so` simply has no entry
+    /// and the caller keeps the two launches. Returns 2 when the shape/arm cannot
+    /// use it (never 1 — cudaErrorInvalidValue, the round-42 collision).
+    /// ABI: stream LAST, like `dsv41_gemm_fp8_mx_f32`.
+    gemm_fp8_wo_pair: Option<
+        unsafe extern "C" fn(
+            // phase 1: fp8 activation, wo_a weights, k-blocks
+            *const u8, *const f32, *const u8, *const u8, *const f32, c_int, c_int,
+            // phase 2: wo_b weights, shape
+            *const u8, *const u8, *const f32, c_int, c_int,
+            // intermediate f32 row / final f32 row / barrier [arrive, sense]
+            *mut f32, *mut f32, *mut c_uint,
+            CuStream,
+        ) -> c_int,
+    >,
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -637,6 +660,7 @@ impl Device {
             gemm_fp8_mx_rope_norm: ko!(rt, "dsv41_gemm_fp8_mx_rope_norm"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             gemm_fp8_mx_f32: ko!(rt, "dsv41_gemm_fp8_mx_f32"),
+            gemm_fp8_wo_pair: ko!(rt, "dsv41_gemm_fp8_wo_pair"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
@@ -1494,6 +1518,55 @@ impl Device {
     /// (quant1, gemm_fp8_mx) pair runs.
     pub fn supports_gemm_fp8_f32(&self) -> bool {
         self.kernels.gemm_fp8_mx_f32.is_some()
+    }
+
+    /// chain-pair-grid-sync: true when the loaded .so carries the fused
+    /// wo_a -> wo_b grid-sync pair kernel (`dsv41_gemm_fp8_wo_pair`). A stale
+    /// .so leaves DSV41_WO_PAIR inert and the (wo_a, wo_b) two-launch path runs.
+    pub fn supports_wo_pair(&self) -> bool {
+        self.kernels.gemm_fp8_wo_pair.is_some()
+    }
+
+    /// chain-pair-grid-sync: the wo_a -> wo_b pair as ONE launch, joined by a
+    /// device-wide sense-reversing barrier instead of a stream edge. `bar` is the
+    /// caller's persistent `[arrive, sense]` u32 pair (zeroed once); the kernel
+    /// self-resets it every launch, so a captured graph replays correctly.
+    /// Ok(false) => the shape/arm cannot use it and the caller keeps the two
+    /// calls. Nothing about the numerics changes: each row is still one warp in
+    /// the same lane order, so both outputs are bit-identical.
+    /// ABI: stream LAST (this symbol has no C++ default tail args).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_wo_pair(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        wa: *const u8,
+        wa_scale: *const u8,
+        wa_bias: *const f32,
+        na: i32,
+        ka: i32,
+        wb: *const u8,
+        wb_scale: *const u8,
+        wb_bias: *const f32,
+        nb: i32,
+        kb: i32,
+        mid: *mut f32,
+        out: *mut f32,
+        bar: *mut u32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.gemm_fp8_wo_pair, "dsv41_gemm_fp8_wo_pair")?;
+        let rc = unsafe {
+            f(
+                a, a_scale, wa, wa_scale, wa_bias, na, ka, wb, wb_scale, wb_bias, nb, kb, mid,
+                out, bar as *mut c_uint, self.stream,
+            )
+        };
+        // A shape/arm decline is 2 (1 collides with cudaErrorInvalidValue).
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_wo_pair")?;
+        Ok(true)
     }
 
     /// wo_b: the M=1 GEMV that reads the RAW f32 activation, so the consumer's

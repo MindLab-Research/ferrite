@@ -872,19 +872,56 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 // `clen` is per-LAYER, so one step's forty attention calls span forty topk values;
 // multi-graph capture is both too coarse and x3 memory.
 //
-// The other half of the round-39 regression is NOT topk-dependent: any split_c > 0
-// makes dsv41_sparse_attn_orope return 2 (decline), which forfeits the o-rope and
-// o-quant epilogue fusions (chain_dev.rs ~2910-2969) at EVERY context. A static
-// C=4 therefore pays the same fixed penalty C=8 does - a bare 0->4 flip is not the
-// fix. Moving that epilogue into the merge kernel (whose (b*m, h) x 128 grid is
-// exactly the pf kernel's) is the precondition for any static-C default, and it is
-// orthogonal to C_eff.
-#define kAttnPfSplitDefault 0
+// The other half of the round-39 regression was NOT topk-dependent: any split_c > 0
+// made dsv41_sparse_attn_orope return 2 (decline), which forfeited the o-rope and
+// o-quant epilogue fusions (chain_dev.rs ~3085-3196) at EVERY context. A static
+// C=4 therefore paid the same fixed penalty C=8 did - a bare 0->4 flip was not the
+// fix. FIXED (sparse-attn-v8, 2026-09-11): that epilogue now lives in the MERGE
+// kernel (`sparse_attn_merge_kernel`), whose (b*m, h) x 128 grid is exactly the
+// single-block fused kernel's. The split arm of `dsv41_sparse_attn_orope` therefore
+// keeps BOTH fusions (two launches per layer instead of the three-launch fallback),
+// so a static-C default now costs only the key-split. Why C=4: the single-block pf
+// shape is latency-, not bandwidth-, bound (8 blocks x 128 threads on ~148 SMs =
+// ~5% occupancy), and the isolated harness shows C=4 wins for topk <= ~240 with a
+// ~7x lower per-slot cost; 4 chunks x (b*m, h) = 32 blocks is the 22%-occupancy
+// point. C=8 still wins in the long-context steady state, so DSV41_SPARSE_SPLIT=C
+// remains the explicit knob.
+#define kSparseSplitDefault 4   // DSV41_SPARSE_SPLIT default (0 restores the pf kernel)
+#define kAttnPfSplitDefault 0   // DSV41_ATTN_PF_SPLIT default (unset -> DSV41_SPARSE_SPLIT)
 #define kAttnMaxC 16
 #define kAttnMaxBM 8
 #define kAttnMaxH 64
 #define kAttnStride (2 + 512)
 __device__ float g_attn_part[kAttnMaxBM][kAttnMaxH][kAttnMaxC][kAttnStride];
+
+// Resolve the sparse-attention key-split chunk count, ONCE per process (a per-call
+// getenv is exactly the hot-path slip every other gate in this file avoids; the
+// callers cache this in a function-local static). Precedence:
+//   DSV41_ATTN_SPLIT     legacy explicit knob (> 0 wins; arms that pass it predate
+//                        the prefetch port and must keep selecting a split kernel)
+//   DSV41_ATTN_PF_SPLIT  harness A/B knob - ANY explicit value wins, including 0
+//                        (that is the "restore the single-block pf kernel" arm)
+//   DSV41_SPARSE_SPLIT   the gate this round adds; default kSparseSplitDefault = 4
+// A malformed value falls back to the default rather than silently disabling the
+// split. The plain `dsv41_sparse_attn` and the fused `dsv41_sparse_attn_orope`
+// share this resolver on purpose: they must agree on the selected shape, or the
+// fallback fires for shapes that could have taken the fused path.
+static int dsv41_resolve_sparse_split_c() {
+    const char* e;
+    if ((e = getenv("DSV41_ATTN_SPLIT")) != nullptr) {
+        const int v = atoi(e);
+        if (v > 0 && v <= kAttnMaxC) return v;
+    }
+    if ((e = getenv("DSV41_ATTN_PF_SPLIT")) != nullptr) {
+        const int v = atoi(e);
+        if (v >= 0 && v <= kAttnMaxC) return v;
+    }
+    if ((e = getenv("DSV41_SPARSE_SPLIT")) != nullptr) {
+        const int v = atoi(e);
+        if (v >= 0 && v <= kAttnMaxC) return v;
+    }
+    return kSparseSplitDefault;
+}
 
 // grid (C, b*m, h): block (ck, row, hh) owns keys [topk*ck/C, topk*(ck+1)/C).
 __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
@@ -1130,8 +1167,29 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
 
 // grid (b*m, h): combine the C chunk partials in ascending chunk order, fold the
 // sink into se (not into smax, as the warp version does) and normalise.
-__global__ void sparse_attn_merge_kernel(const float* __restrict__ sink, float* __restrict__ out,
-                                         int b, int m, int h, int d, int C) {
+//
+// FUSED EPILOGUE (sparse-attn-v8, 2026-09-11): when `cos` is non-null this block
+// ALSO runs the inverse o-rope (the orope kernel's phase 2) and the fp8 emission
+// (its phase 3) - ported verbatim - so the split arm of `dsv41_sparse_attn_orope`
+// keeps BOTH fusions instead of declining them. The geometry is already right for
+// it: one (row, head) block of 128 threads owns the head's full d-wide row, the
+// same shape `sparse_attn_orope_kernel` runs, and `d <= 512` is launcher-guarded
+// (the plain launcher rejects d > 512, the fused one declines), so `sh_row` is the
+// same 2 KB the single-block kernel stages.
+//
+// WHY THE SMEM HAND-OFF: the rope pass pairs columns (2i, 2i+1), which no
+// thread-stride walk over c can own, so the normalised row must meet in shared
+// memory: normalise -> sh_row -> rope -> store/quant. The `cos == nullptr &&
+// xq == nullptr` arm (the plain split path of `dsv41_sparse_attn`) keeps the
+// ORIGINAL direct-store body byte-for-byte, so the un-fused arm does not move.
+//
+// ⚠️ `sh_acc[4][512]`-style warp truncation is NOT an issue here: this kernel has
+// no per-warp partials, every thread walks `c` over the whole d row.
+__global__ void sparse_attn_merge_kernel(
+    const float* __restrict__ sink, float* __restrict__ out, int b, int m, int h, int d, int C,
+    const float* __restrict__ cos, const float* __restrict__ sin, const int* __restrict__ base,
+    int rope_rd, int half, int mul, int off, int step, int inverse, uint8_t* __restrict__ xq,
+    float* __restrict__ xsc) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int hh = blockIdx.y;
@@ -1144,11 +1202,64 @@ __global__ void sparse_attn_merge_kernel(const float* __restrict__ sink, float* 
         se += P[(size_t)ck * kAttnStride + 1] * expf(P[(size_t)ck * kAttnStride] - smax);
     se += expf(sink[hh] - smax);
     float* orow = out + ((size_t)row * h + hh) * d;
+    if (cos == nullptr && xq == nullptr) {
+        // Plain split arm: unchanged (no smem, no barrier, same bytes).
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+            float a = 0.f;
+            for (int ck = 0; ck < C; ++ck)
+                a += P[(size_t)ck * kAttnStride + 2 + c] *
+                     expf(P[(size_t)ck * kAttnStride] - smax);
+            orow[c] = (se > 0.f) ? a / se : 0.f;
+        }
+        return;
+    }
+    __shared__ float sh_row[512];
     for (int c = threadIdx.x; c < d; c += blockDim.x) {
         float a = 0.f;
         for (int ck = 0; ck < C; ++ck)
             a += P[(size_t)ck * kAttnStride + 2 + c] * expf(P[(size_t)ck * kAttnStride] - smax);
-        orow[c] = (se > 0.f) ? a / se : 0.f;
+        sh_row[c] = (se > 0.f) ? a / se : 0.f;
+    }
+    __syncthreads();   // sh_row complete before the rope reads it (and the quant below)
+    if (cos != nullptr) {
+        // PHASE 2 (`sparse_attn_orope_kernel` :1557-1567 verbatim): inverse rope on
+        // the trailing `rope_rd` columns; `hh` is this block's head, so the position
+        // argument matches the single-block path's per-head loop index.
+        const int tt = (*base) * mul + off + hh * step;
+        float* rrow = sh_row + (d - rope_rd);
+        for (int i = threadIdx.x; i < half; i += blockDim.x) {
+            const float cc = cos[(size_t)tt * half + i];
+            const float ss = sin[(size_t)tt * half + i] * (inverse ? -1.f : 1.f);
+            const float x0 = rrow[2 * i], x1 = rrow[2 * i + 1];
+            rrow[2 * i] = x0 * cc - x1 * ss;
+            rrow[2 * i + 1] = x0 * ss + x1 * cc;
+        }
+        __syncthreads();   // rope writes visible before the store + quant
+    }
+    // PHASE 3 (`sparse_attn_orope_kernel` :1569-1595 verbatim): store the roped row,
+    // then the fp8 emission of it. `d % 32 == 0` (launcher-guarded) so the flat
+    // per-32-block index is exactly the head-local one and a warp's 32 lanes cover
+    // one block - bit-identical to the standalone `dsv41_quant_fp8`.
+    for (int c = threadIdx.x; c < d; c += blockDim.x) orow[c] = sh_row[c];
+    if (xq != nullptr) {
+        const int lane = threadIdx.x & 31;
+        const size_t xbase = ((size_t)row * h + hh) * (size_t)d;
+        const size_t sbase = xbase >> 5;   // d % 32 == 0
+        const int nb = d >> 5;
+        const int gwarp = threadIdx.x >> 5;
+        const int nw = (int)blockDim.x >> 5;
+        for (int blk = gwarp; blk < nb; blk += nw) {
+            const int c = blk * 32 + lane;
+            const float v = sh_row[c];
+            float a = fabsf(v);
+            for (int off2 = 16; off2 > 0; off2 >>= 1)
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off2));
+            const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+            if (lane == 0) xsc[sbase + blk] = sc;
+            const float qv8 = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+            const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qv8);
+            xq[xbase + c] = *(const uint8_t*)&f8;
+        }
     }
 }
 
@@ -4120,6 +4231,324 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// chain-pair-grid-sync (2026-09-12): wo_a -> wo_b as ONE launch.
+//
+// WHY. The attention output projection is two chain-ADJACENT M=1 GEMVs:
+//
+//     wo_a : [1, ka] fp8 -> [1, na] f32   (na = o_lora_rank, ka = hpg*head_dim)
+//     wo_b : [1, na] f32 -> [1, nb] f32   (nb = dim,          kb = o_lora_rank)
+//
+// wo_b's ENTIRE activation IS wo_a's output, so two launches per layer (80 per
+// step) pay two launch/node gaps and two prologue floors for a strictly serial
+// dependency. This kernel keeps both GEMV bodies and connects them with a
+// DEVICE-WIDE BARRIER instead of a stream edge (the design note
+// `chain-pair-grid-sync`, STATUS.md).
+//
+// STRUCTURE
+//   phase 1  the wo_a body in its mode-4 + a32 form (staged weights, the
+//            block-wide pre-decoded activation `s_af`), rows [0, na), fp8
+//            activation in, f32 out into `mid` (= the Rust side's `s.wo`).
+//   barrier  sense-reversing, arrived once per block by thread 0.
+//   phase 2  the wo_b body in its f32-activation form (what
+//            dsv41_gemm_fp8_mx_f32 already does), rows [0, nb), re-stages `mid`
+//            into `s_af` and writes `out` (= `s.o`).
+//
+// BIT-IDENTITY vs the two standalone launches. Each output row is still ONE
+// warp walking the identical lane order over the identical staged bytes (same
+// e4m3 LUT, same ue8m0 scale row, same `kb*32 + lane` k-block accumulation
+// order, same shuffle-down reduction), so every row is bit-identical to the row
+// its standalone launch produces. The grid/rows-per-block split MAY differ (the
+// fused grid is capped by residency) and that is allowed precisely BECAUSE a
+// row's dot does not depend on which block owns it.
+//
+// DEADLOCK SAFETY -- the one hard constraint. The barrier completes only when
+// ALL gridDim.x blocks are resident on the SMs at the same time. The launcher
+// therefore caps the grid at `co_res` = (blocks/SM from
+// cudaOccupancyMaxActiveBlocksPerMultiprocessor at THIS block size and THIS
+// dynamic smem) x SMs. NEVER raise the grid past co_res: a block that never
+// becomes resident never reaches the barrier, the resident ones spin forever,
+// and the device hangs (the watchdog cannot see it inside a captured graph).
+//
+// MEMORY ORDERING. Producer side: `__syncthreads()` (this block's `mid[]`
+// stores are done) -> `__threadfence()` -> the arrive atomicAdd. Consumer side:
+// the spin observes the sense flip -> `__threadfence()` -> `__syncthreads()` ->
+// the `mid[]` reads. Without the fences a block can observe the flip before the
+// producer's stores have drained to L2 and read a stale row.
+//
+// NOT COVERED (the launcher returns 2 and the caller keeps the two launches):
+//   * B1 (`xq`/`xsc` row compression) and the AR-v5 store epilogue -- both are
+//     epilogue variants of the standalone launchers and neither is wired in;
+//   * any fp8 mode other than 4, or a32 off (the two bodies are specialised);
+//   * wo_a split over more than one group (nlg != 1): phase 1 stages ONE
+//     block-wide activation row, which only exists when this rank owns exactly
+//     one `o_groups` slice (the TP8 production shape).
+// 2, never 1 -- 1 is cudaErrorInvalidValue and the caller would swallow a real
+// launch failure (the r42/r43 decline-code collision).
+__global__ void __launch_bounds__(1024)
+gemm_fp8_wo_pair_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                        const uint8_t* __restrict__ wa, const uint8_t* __restrict__ wa_scale,
+                        const float* __restrict__ wa_bias, int na, int ka,
+                        const uint8_t* __restrict__ wb, const uint8_t* __restrict__ wb_scale,
+                        const float* __restrict__ wb_bias, int nb, int kb,
+                        float* __restrict__ mid, float* __restrict__ out,
+                        unsigned* __restrict__ bar, int nwarps, int cpasync) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nb_ka = ka >> 5;                              // phase-1 k-blocks
+    const int nb_kb = kb >> 5;                              // phase-2 k-blocks
+    const int kmax = (ka > kb) ? ka : kb;
+    const int nb_kmax = (nb_ka > nb_kb) ? nb_ka : nb_kb;
+    const int nb_kmax_al = (nb_kmax + 15) & ~15;            // 16B units (cp.async)
+
+    // ---- ONE shared-memory pool for BOTH phases (the design's `smem = max`) --
+    // The two phases never overlap in time -- the grid barrier plus the
+    // __syncthreads() after it separate them -- so every slot is sized by the
+    // WIDER phase and re-used by the narrower one. The kernel has NO static
+    // shared memory, so the launcher's dynamic request is exactly this sum.
+    extern __shared__ uint8_t s_pool[];
+    uint8_t* s_w = s_pool;                                        // [nwarps][kmax]
+    uint8_t* s_ws = s_w + (size_t)nwarps * (size_t)kmax;          // [nwarps][nb_kmax_al]
+    float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_kmax_al);
+    float* s_lut = s_as + nb_kmax;                                // 256 f32
+    float* s_af = s_lut + 256;                                    // [kmax] f32
+
+    // The e4m3 decode table is phase-independent and is never overwritten, so it
+    // is built once, before either phase's barrier.
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+
+    // ===================== phase 1: wo_a (fp8 -> f32) ========================
+    {
+        uint8_t* row_s = s_w + (size_t)warp * (size_t)kmax;
+        uint8_t* row_sc = s_ws + (size_t)warp * (size_t)nb_kmax_al;
+        // P3 (cp.async weights-first, DSV41_GEMV_CPASYNC): the first row this
+        // warp will consume depends on none of the activation work below, so
+        // issue it BEFORE the block-wide staging and let the two overlap. Same
+        // bytes, same slot as the loop's own staging -- only the issue point
+        // moves. The unsigned cast keeps the ternary's -1 from promoting to
+        // 0xFFFFFFFF.
+        int pf_row = (cpasync != 0) ? ((int)blockIdx.x * nwarps + warp) : -1;
+        if (pf_row >= na) pf_row = -1;
+        if (pf_row >= 0) {
+            const uint8_t* pf_w = wa + (size_t)pf_row * ka;
+            const int n16p = ka >> 4;
+            for (int i = lane; i < n16p; i += 32) dsv41_cp_async16(row_s + (i << 4), pf_w + (i << 4));
+            dsv41_cp_commit();
+            for (int i = (n16p << 4) + lane; i < ka; i += 32) row_s[i] = pf_w[i];
+        }
+        // The activation scales are the same for every output row, so they are
+        // staged once per block (the standalone kernel's `s_as` loop verbatim).
+        for (int i = threadIdx.x; i < nb_ka; i += blockDim.x) s_as[i] = a_scale[i];
+        __syncthreads();               // s_lut + s_as published
+        // a32_direct (P1): one pass global uint4 -> LUT -> s_af. This is the
+        // SAME `s_lut[b] * s_as[idx>>5]` product the staged form computed, so
+        // the emitted f32 is bit-identical -- only the k-byte `s_a` round trip
+        // (and its slot) is gone.
+        const int n16a = ka >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+            const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int idx = (i << 4) + j;
+                s_af[idx] = s_lut[b[j]] * s_as[idx >> 5];
+            }
+        }
+        for (int i = (n16a << 4) + threadIdx.x; i < ka; i += blockDim.x)
+            s_af[i] = s_lut[a[i]] * s_as[i >> 5];
+        __syncthreads();               // s_af published for every warp
+
+        for (int row = blockIdx.x * nwarps + warp; row < na; row += gridDim.x * nwarps) {
+            const uint8_t* wr = wa + (size_t)row * ka;
+            const uint8_t* wsr = wa_scale + (size_t)(row >> 5) * nb_ka;
+            float acc = 0.f;
+            const bool prefetched = (row == pf_row);
+            if (!prefetched) {
+                const int n16 = ka >> 4;
+                for (int i = (n16 << 4) + lane; i < ka; i += 32) row_s[i] = wr[i];
+                for (int i = lane; i < n16; i += 32)
+                    dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            }
+            for (int i = lane; i < nb_ka; i += 32) row_sc[i] = wsr[i];
+            // Unconditional: on the prefetched iteration this commits an EMPTY
+            // group after the prologue's, and wait_all retires both.
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
+            __syncwarp();
+#pragma unroll 4
+            for (int kbi = 0; kbi < nb_ka; ++kbi) {
+                const float sb = ue8m0_to_f(row_sc[kbi]);
+                const int j = kbi * 32 + lane;
+                const float av = s_af[j];
+                acc += av * (s_lut[row_s[j]] * sb);
+            }
+            __syncwarp();
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) mid[row] = acc + (wa_bias ? wa_bias[row] : 0.f);
+        }
+    }
+
+    // ============================= grid barrier ==============================
+    // sense-reversing, arrived once per block by thread 0. Safe ONLY because the
+    // launcher caps gridDim.x at the residency number (see co_res in
+    // dsv41_gemm_fp8_wo_pair).
+    //
+    // WHY SENSE-REVERSING AND NOT A PLAIN COUNTER: a captured graph REPLAYS this
+    // launch dozens of times, so the barrier state must be self-resetting. The
+    // last arriver zeroes `bar[0]` for the next launch and flips `bar[1]`, which
+    // is what releases this launch's waiters. A waiter reads the sense BEFORE it
+    // arrives, and the flip can only happen after every block has arrived, so
+    // no waiter can miss the flip (or observe the previous launch's).
+    __syncthreads();                   // this block's mid[] stores are complete
+    if (threadIdx.x == 0) {
+        __threadfence();                               // release: mid[] visible
+        const unsigned s0 = atomicAdd(bar + 1, 0u);    // current sense
+        if (atomicAdd(bar, 1u) == (unsigned)gridDim.x - 1u) {
+            atomicExch(bar, 0u);                       // reset for the next launch
+            __threadfence();
+            atomicXor(bar + 1, 1u);                    // flip -> release waiters
+        } else {
+            while (atomicAdd(bar + 1, 0u) == s0) __nanosleep(32);
+            __threadfence();                           // acquire
+        }
+    }
+    __syncthreads();
+
+    // ===================== phase 2: wo_b (f32 -> f32) ========================
+    {
+        uint8_t* row_s = s_w + (size_t)warp * (size_t)kmax;
+        uint8_t* row_sc = s_ws + (size_t)warp * (size_t)nb_kmax_al;
+        int pf_row = (cpasync != 0) ? ((int)blockIdx.x * nwarps + warp) : -1;
+        if (pf_row >= nb) pf_row = -1;
+        if (pf_row >= 0) {
+            const uint8_t* pf_w = wb + (size_t)pf_row * kb;
+            const int n16p = kb >> 4;
+            for (int i = lane; i < n16p; i += 32) dsv41_cp_async16(row_s + (i << 4), pf_w + (i << 4));
+            dsv41_cp_commit();
+            for (int i = (n16p << 4) + lane; i < kb; i += 32) row_s[i] = pf_w[i];
+        }
+        // Re-stage the f32 activation (wo_a's f32 output) into the a32 slot --
+        // the same block-wide copy dsv41_gemm_fp8_mx_f32 performs, so the
+        // consume loop reads the identical value. `s_af` is [kmax] and this only
+        // fills [0, kb), which is all the phase-2 loop indexes.
+        for (int i = threadIdx.x; i < kb; i += blockDim.x) s_af[i] = mid[i];
+        __syncthreads();               // s_af published
+
+        for (int row = blockIdx.x * nwarps + warp; row < nb; row += gridDim.x * nwarps) {
+            const uint8_t* wr = wb + (size_t)row * kb;
+            const uint8_t* wsr = wb_scale + (size_t)(row >> 5) * nb_kb;
+            float acc = 0.f;
+            const bool prefetched = (row == pf_row);
+            if (!prefetched) {
+                const int n16 = kb >> 4;
+                for (int i = (n16 << 4) + lane; i < kb; i += 32) row_s[i] = wr[i];
+                for (int i = lane; i < n16; i += 32)
+                    dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            }
+            for (int i = lane; i < nb_kb; i += 32) row_sc[i] = wsr[i];
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
+            __syncwarp();
+#pragma unroll 4
+            for (int kbi = 0; kbi < nb_kb; ++kbi) {
+                const float sb = ue8m0_to_f(row_sc[kbi]);
+                const int j = kbi * 32 + lane;
+                const float av = s_af[j];
+                acc += av * (s_lut[row_s[j]] * sb);
+            }
+            __syncwarp();
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            if (lane == 0) out[row] = acc + (wb_bias ? wb_bias[row] : 0.f);
+        }
+    }
+}
+
+// The chain-pair launcher. TWO deliberate differences from every other launcher
+// in this family:
+//   * the launch is PLAIN (`<<<>>>`), NOT via dsv41_pdl_or_plain. A grid-wide
+//     barrier and PDL are a bad pair: PDL lets this grid start while the
+//     producer is still resident, and the barrier needs the WHOLE grid resident
+//     before any block may pass it. (The node after this one, the AR / hc_post
+//     family, is not PDL-covered either, so nothing is lost.)
+//   * the grid is CAPPED by residency (co_res). That cap is a correctness
+//     requirement, not tuning -- see the kernel's DEADLOCK SAFETY note.
+//
+// Returns 2 (decline, never 1) for any shape or arm the fused kernel does not
+// implement, so the Rust caller keeps the (wo_a, wo_b) two-launch path bit for
+// bit.
+extern "C" int dsv41_gemm_fp8_wo_pair(const uint8_t* a, const float* a_scale,
+                                      const uint8_t* wa, const uint8_t* wa_scale,
+                                      const float* wa_bias, int na, int ka,
+                                      const uint8_t* wb, const uint8_t* wb_scale,
+                                      const float* wb_bias, int nb, int kb,
+                                      float* mid, float* out, unsigned* bar,
+                                      cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    if (a == nullptr || a_scale == nullptr || wa == nullptr || wa_scale == nullptr ||
+        wb == nullptr || wb_scale == nullptr || mid == nullptr || out == nullptr || bar == nullptr)
+        return 2;
+    if (na <= 0 || nb <= 0 || ka <= 0 || kb <= 0) return 2;
+    // Both bodies index their weight rows in 16-byte units (cp.async) and their
+    // k-blocks in 32-element units, so both k's must be multiples of 32.
+    if ((ka & 31) || (kb & 31)) return 2;
+    // Specialised bodies: only the production arm (mode 4 = staged weights +
+    // block-wide activation copy; a32 = the pre-decoded `s_af`) is implemented.
+    // `cpasync` IS honoured (it moves WHEN the weight row is issued).
+    if (g_gemv_fp8_mode != 4 || !g_gemv_a32 || g_gemv_a32_staged) return 2;
+
+    // The pair kernel has its OWN smem layout (two phases share one pool), so its
+    // residency -- and therefore the barrier's grid cap -- is its own number. Use
+    // the fixed small-n width: the large-n adaptive arm would double the per-warp
+    // weight-row slot and cut co_res for no benefit here (the row loop already
+    // strides).
+    const int warps = g_gemv_warps;
+    const int kmax = (ka > kb) ? ka : kb;
+    const int nb_kmax = kmax >> 5;
+    const int nb_kmax_al = (nb_kmax + 15) & ~15;
+    const size_t gsmem = (size_t)warps * (size_t)kmax          // weight rows
+                       + (size_t)warps * (size_t)nb_kmax_al    // ue8m0 scale rows
+                       + (size_t)nb_kmax * sizeof(float)       // activation scales
+                       + 256 * sizeof(float)                   // e4m3 LUT
+                       + (size_t)kmax * sizeof(float);         // s_af
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_wo_pair_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_wo_pair_kernel));
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    // ---- co_res: the residency cap. Cached because the model's shape is fixed
+    // and this launcher runs 80 times per step (a per-call occupancy query is a
+    // driver round trip). Keyed on the parameters that define the answer.
+    static int co_res_cached = 0;
+    static size_t co_res_gsmem = 0;
+    static int co_res_warps = 0;
+    if (co_res_cached == 0 || co_res_gsmem != gsmem || co_res_warps != warps) {
+        int per_sm = 0;
+        cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+            &per_sm, gemm_fp8_wo_pair_kernel, warps * 32, gsmem);
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+        int dev = 0, sms = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        co_res_cached = per_sm * sms;
+        co_res_gsmem = gsmem;
+        co_res_warps = warps;
+    }
+    if (co_res_cached <= 0) return 2;   // no resident configuration -> decline
+
+    const int rows = (na > nb) ? na : nb;
+    int blocks = (rows + warps - 1) / warps;
+    if (blocks > co_res_cached) blocks = co_res_cached;   // HARD deadlock guard
+    if (blocks <= 0) return 2;
+
+    gemm_fp8_wo_pair_kernel<<<dim3(blocks), dim3(warps * 32), gsmem, s>>>(
+        a, a_scale, wa, wa_scale, wa_bias, na, ka,
+        wb, wb_scale, wb_bias, nb, kb,
+        mid, out, bar, warps, g_gemv_cpasync ? 1 : 0);
+    return (int)cudaGetLastError();
+}
+
 // Two projections over the SAME activation in one gemv launch: the kernel maps
 // rows below n1 to the first family and the rest to the second, both sharing the
 // block-wide staged activation. wq_a and wkv in the attention are the pair - two
@@ -4545,24 +4974,14 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     // version for A/B. Cached in a static: this runs per attention call, and a
     // per-call getenv is exactly the hot-path slip this project has been bitten by.
     static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
-    // Chunked key split with the three-deep prefetch pipeline: DEFAULT ON
-    // (DSV41_ATTN_PF_SPLIT=0 restores the single-block pf kernel, =C picks the
-    // chunk count, default kAttnPfSplitDefault). DSV41_ATTN_SPLIT=C is the older
-    // explicit knob for the same kernel and still wins when set - arms that pass
-    // it predate the prefetch port and must keep selecting this kernel rather
-    // than silently fall through to the single-block shape they A/B against.
-    static const int g_attn_pf_split = [] {
-        const char* e = getenv("DSV41_ATTN_PF_SPLIT");
-        if (e == nullptr) return kAttnPfSplitDefault;  // default ON
-        const int v = atoi(e);
-        if (v == 0) return 0;                          // explicit opt-out -> pf
-        return (v >= 1 && v <= kAttnMaxC) ? v : kAttnPfSplitDefault;
-    }();
-    static const int g_attn_split = [] {
-        const char* e = getenv("DSV41_ATTN_SPLIT");
-        if (e == nullptr) return 0;
-        return atoi(e);
-    }();
+    // Chunked key split with the three-deep prefetch pipeline. The chunk count
+    // comes from `dsv41_resolve_sparse_split_c()` (DSV41_ATTN_SPLIT >
+    // DSV41_ATTN_PF_SPLIT > DSV41_SPARSE_SPLIT > kSparseSplitDefault = 4), read
+    // ONCE here: this runs per attention call and a per-call getenv is exactly the
+    // hot-path slip this project has been bitten by. DSV41_ATTN_PF_SPLIT=0 - the
+    // harness's "restore the single-block pf kernel" arm - still wins when set, and
+    // DSV41_SPARSE_SPLIT=0 is the new opt-out.
+    static const int g_sparse_split_c = dsv41_resolve_sparse_split_c();
     // Order-preserving prefetch pipeline (default on); DSV41_ATTN_PF=0 restores
     // the plain warp version for A/B.
     static const bool pf_off = [] {
@@ -4571,20 +4990,22 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     }();
     dim3 grid(b * m, h);
     if (!seq) {
-        const int split_c = (g_attn_split > 0) ? g_attn_split : g_attn_pf_split;
+        const int split_c = g_sparse_split_c;
         if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
             h <= kAttnMaxH) {
             // One block per (chunk, row, head); the split writes the partials,
-            // the merge folds the sink and normalises. Both launches stay on the
-            // SAME stream: program order makes the partials visible to the merge
-            // with no fence and no sync.
+            // the merge folds the sink and normalises (rope/xq are null here, so
+            // the merge's fused epilogue is skipped and this arm is unchanged).
+            // Both launches stay on the SAME stream: program order makes the
+            // partials visible to the merge with no fence and no sync.
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
                 q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
-                sink, out, b, m, h, d, split_c);
+                sink, out, b, m, h, d, split_c, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
+                nullptr, nullptr);
             return (int)cudaGetLastError();
         }
         if (!pf_off) {
@@ -4607,17 +5028,28 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
 }
 
 // P1 (DSV41_SPARSE_OROPE): sparse_attn + inverse o-rope + fp8 emission, one
-// launch. Returns 0 on success. Returns 1 - the DECLINE sentinel - when the
-// fused shape cannot carry this call, and the caller runs the old
-// `dsv41_sparse_attn` + `dsv41_apply_rope_q` (+ `quant1`) sequence, which this
-// is bit-identical to. (Sentinels 2/3 are also declInes, distinguished only for
-// logs: 2 = the plain call would not have picked `sparse_attn_pf_kernel` at all,
-// 3 = the emission shape is not exact. All three mean "fall back".)
+// launch (two when the key-split arm is selected - see below). Returns 0 on
+// success. Returns 1 - the DECLINE sentinel - when the fused shape cannot carry
+// this call, and the caller runs the old `dsv41_sparse_attn` +
+// `dsv41_apply_rope_q` (+ `quant1`) sequence, which this is bit-identical to.
+// (Sentinel 2 is also a decline, distinguished only for logs: the plain call
+// would not have picked a shape this launcher can mirror. Anything else is a
+// real launch error.)
 //
-// WHY DECLINE ON 2: the fused body IS `sparse_attn_pf_kernel`'s body. If the
-// plain launcher would have taken the key-split or the sequential path, the
-// fused shape does not apply - falling back keeps the two paths' outputs
-// identical by construction rather than by argument.
+// WHY DECLINE ON 2: the single-block fused body IS `sparse_attn_pf_kernel`'s
+// body, so it applies only when the plain launcher would have picked
+// `sparse_attn_pf_kernel` itself. Two shapes are unmirrorable and fall back:
+//   * `DSV41_ATTN_SEQ` (the sequential kernel), and
+//   * `DSV41_ATTN_PF=0` (the warp A/B kernel).
+//
+// KEY-SPLIT ARM (sparse-attn-v8, 2026-09-11): a split_c > 0 used to decline here
+// too, which forfeited the o-rope / o-quant epilogue at EVERY context and was
+// the round-39 regression. It no longer does: the epilogue moved into
+// `sparse_attn_merge_kernel`, whose (b*m, h) x 128 grid is exactly the
+// single-block kernel's, so the fused split path is just the same two launches
+// `dsv41_sparse_attn` makes, with the merge's epilogue enabled. The emitted
+// bytes and the `out` row are the phase-2/phase-3 outputs of the single-block
+// kernel up to the final summation grouping (all that a C > 1 merge changes).
 //
 // ⚠️ Declines are > 1 on purpose: 1 collides with cudaErrorInvalidValue, and the
 // trailing cudaGetLastError() can also yield 1 (the legacy `apply_rope_q`
@@ -4636,28 +5068,32 @@ extern "C" int dsv41_sparse_attn_orope(
     if (half != rope_rd / 2) return 1;
     if (cos == nullptr || sin == nullptr || base == nullptr) return 1;
     if (xq == nullptr || xsc == nullptr) return 1;
-    // Same selection the plain launcher makes (mirrored statics: the env is read
-    // once per process either way, and they must agree or the fallback fires).
+    // Same selection the plain launcher makes, through the SAME resolver (the env
+    // is read once per process either way, and the two must agree or the fused
+    // path declines shapes it could have carried).
     static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
-    static const int g_attn_pf_split = [] {
-        const char* e = getenv("DSV41_ATTN_PF_SPLIT");
-        if (e == nullptr) return kAttnPfSplitDefault;
-        const int v = atoi(e);
-        if (v == 0) return 0;
-        return (v >= 1 && v <= kAttnMaxC) ? v : kAttnPfSplitDefault;
-    }();
-    static const int g_attn_split = [] {
-        const char* e = getenv("DSV41_ATTN_SPLIT");
-        if (e == nullptr) return 0;
-        return atoi(e);
-    }();
+    static const int g_sparse_split_c = dsv41_resolve_sparse_split_c();
     static const bool pf_off = [] {
         const char* e = getenv("DSV41_ATTN_PF");
         return e != nullptr && atoi(e) == 0;
     }();
-    const int split_c = (g_attn_split > 0) ? g_attn_split : g_attn_pf_split;
+    const int split_c = g_sparse_split_c;
     if (seq) return 2;
-    if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM && h <= kAttnMaxH) return 2;
+    if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM && h <= kAttnMaxH) {
+        // The key-split arm, mirroring `dsv41_sparse_attn`'s split arm exactly;
+        // the ONLY difference is that the merge gets the rope/fp8 epilogue
+        // arguments, so both fusions survive instead of declining. Same stream:
+        // program order makes the partials visible to the merge with no fence.
+        sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
+                                        (unsigned)h), 128, 0, s>>>(
+            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+        cudaError_t e2 = cudaGetLastError();
+        if (e2 != cudaSuccess) return (int)e2;
+        sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
+            sink, out, b, m, h, d, split_c, cos, sin, base, rope_rd, half, mul, off, step,
+            inverse, xq, xsc);
+        return (int)cudaGetLastError();
+    }
     if (pf_off) return 2;
     sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
         q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
