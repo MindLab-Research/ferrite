@@ -1203,21 +1203,39 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
         __syncthreads();
 
         // ---- scores for this chunk
-        for (int i = tid; i < len; i += nthr) {
-            const int p = base + i;
-            const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
-            float acc = 0.f;
-            for (int h = 0; h < nh; ++h) {
-                const float* qh = qrow + (size_t)h * hd;
+        // One warp per candidate: lane h computes head h's dot (its c-ascending
+        // order is untouched), then lane 0 gathers the per-head products with a
+        // lane-indexed shuffle and sums them in ascending h - exactly the
+        // sequence `acc += fmaxf(dot,0) * w[..h]` walked, so the score is
+        // bit-identical. The old shape ran one thread per candidate with
+        // nh * hd serial multiply-adds (32*128 = 16k cycles on a single lane,
+        // and only `len` of a thousand threads busy), which is why a 32-candidate
+        // call measured 188 us in isolation.
+        {
+            const int nwarp = nthr >> 5;
+            const int wid = tid >> 5, lane = tid & 31;
+            for (int i = wid; i < len; i += nwarp) {
+                const int p = base + i;
+                const float* krow = ik + ((size_t)bb * n_pos + p) * hd;
                 float dot = 0.f;
-                for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
-                acc += fmaxf(dot, 0.f) * w[row * (size_t)nh + h];
+                if (lane < nh) {
+                    const float* qh = qrow + (size_t)lane * hd;
+                    for (int c = 0; c < hd; ++c) dot += qh[c] * krow[c];
+                    dot = fmaxf(dot, 0.f) * w[row * (size_t)nh + lane];
+                }
+                float acc = 0.f;
+                if (lane == 0) {
+                    for (int h = 0; h < nh; ++h) acc += __shfl_sync(0xFFFFFFFFu, dot, h);
+                }
+                acc = __shfl_sync(0xFFFFFFFFu, acc, 0);
+                float sv = acc * softmax_scale * head_scale;
+                if (p >= cl) sv = -INFINITY;
+                if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
+                if (lane == 0) {
+                    s_pair[2 * i] = sv;
+                    s_pair[2 * i + 1] = __int_as_float(p);
+                }
             }
-            float sv = acc * softmax_scale * head_scale;
-            if (p >= cl) sv = -INFINITY;
-            if (uses_cand && cand != nullptr && !cand[row * (size_t)n_pos + p]) sv = -INFINITY;
-            s_pair[2 * i] = sv;
-            s_pair[2 * i + 1] = __int_as_float(p);
         }
         __syncthreads();
 
