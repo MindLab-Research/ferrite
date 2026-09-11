@@ -170,6 +170,34 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   - 回退：`DSV41_OROPE_Q=0` / `DSV41_RING_WIN_FUSE=0`，或老 `.so`（`ko!` 符号探测自动回退）。
   - ⚠️ 与 sparse 段的并行改动无关：apply_rope 在 `dsv41_kernels.cu:1131`，sparse 段在 `:2839+`。
 
+- **✅ wo_b 直读 f32 激活（DSV41_WOB_F32，默认 ON）** ✓（2026-09-11，待上机 parity）：
+  `gemm_fp8_gemv_kernel` 新增**可选尾参** `const float* a_f32 = nullptr`（追加在 `qr_eps` **之后**，
+  与 NORM_FUSE 的 `qr_raw` 相邻但独立参数位）。非 null 时 staging 直接
+  `s_af[i] = a_f32[i]`，**跳过** `s_lut[a[i]] * s_as[i>>5]` 的 fp8 解码 + scale 乘；consume 循环
+  （`acc += s_af[j] * (s_lut[row_s[j]] * sb)`）一字未动，**权重侧仍走 fp8 解码**，所以 `s_lut` 照建。
+  新 C 符号 `dsv41_gemm_fp8_mx_f32(a_f32, w, w_scale, bias, out, n, k, s)`（stream **在最后**，
+  该符号无 C++ 默认尾参，**不照抄** `gemm_fp8_mx` 的「stream 在 shape 后」ABI）。Rust：
+  `device.rs` 的 `supports_gemm_fp8_f32()` + `gemm_fp8_mx_f32()`；`chain_dev.rs` 的 `wob_f32()`
+  与 wo_b 调用点。
+  - **为什么不会重蹈 B1**：B1 把融合做进 wo_a 的 epilogue，被迫 32 warps/block（32 连续行 = 一个
+    quant block）⇒ grid = n/32、32 warps，**148→32 活跃 SM**，实测 +0.24ms。本方案**只改数据路径，
+    不改 grid 形态**：block = 常规 `g_gemv_warps`(默认 4) / `ceil(n/warps)`，与普通 `gemm_fp8_mx`
+    GEMV 同形，无 SM 利用率损失。
+  - **⚠️ 非逐位**：直读 f32 跳过了 quantize→dequantize 往返，**没有 4-bit 尾数损失，精度更高**，
+    与 fp8 路径**不逐位一致**。下游是 wo_b 行 partial → AR 求和 → hc_post，精度提升方向正确，
+    但**上机必须做一次 parity**（`DSV41_WOB_F32=1` vs `=0` 的 text/fingerprint 对比）。
+  - **限制**：`vec >= 3`（`s_af` 物化只在该分支）；无法与 AR store 融合共存（该融合在 fp8 launcher
+    的 epilogue，故 f32 路径仅在 `ar_store_fused == false` 时启用）；`wo_fused`(B1) 优先。任一不满足
+    或 `.so` 无符号 → 回退 `(quant1(s.wo), gemm_fp8_mx)`。收益 = 每步省 40 次 `quant1` launch
+    （~0.06ms + 40 图节点）**尚未上机实测**。
+  - 回退：`DSV41_WOB_F32=0`，或老 `.so`（`ko!` 符号探测自动回退）。
+  - **验证**：`cargo check -p ferrite-models` ✓；远端 `nvcc -gencode arch=compute_103a,code=sm_103a
+    -O3 -std=c++17 --use_fast_math -Xptxas -v -c dsv41_kernels.cu` **EXIT=0、无 error** ✓（仅既有的
+    `ap`/`per`/`e2m1_to_f` 未引用 warning，非本次引入）。
+  - ⚠️ 改动落在 gemv 段 `dsv41_kernels.cu:1965-2760`（含 NORM_FUSE 的 `qr_raw` prologue 区域），
+    未碰 hc（:3700+）/sparse（:2839+）段；并行 agent 的 `xq_of_qr_valid` 修复在 `chain_dev.rs` 另一处，
+    与本改动共存无冲突。
+
 - **✅ q rope / idx_q rope 已折进 GEMV epilogue（DSV41_ROPE_FUSE，默认 ON）** ✓（2026-09-11）：
   新的两个 C 符号 `dsv41_gemm_fp8_mx_rope`（单族，q rope）与 `dsv41_gemm_fp8_mx2_rope`
   （两族，wq_b 的 q rope + idx_wq_b 的 idx_q rope 各用各自 head 宽度 `rope_hd1/hd2`）把
@@ -272,3 +300,25 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   （`kernels.cu:1174-1194` 的 per-device 预热 scratch 是既有正确范式 ✓）。
 - **MoE 的 TP 切分轴是 `inter` 而非 expert-parallel** ✓（`moe()` 正文 :1685-1688 ✓；
   `moe_reduce()` 注释 :641 写 expert-parallel ✗ 与实现矛盾 ⇒ 以正文为准 ✓）。
+- **hc tail split 的 side stream 在图回放里"有边无并发"（2026-09-11 修复，待上机实测）** ✗→?：
+  `DSV41_HC_TAIL_SPLIT` 把 tail 拆成 EARLY（collapse+rmsnorm+fp8，1.7µs，主流）与 LATE
+  （ss+mixes+sigmoid+sinkhorn+comb，10.7µs，side stream），fork/join 用 `cudaEventRecord` +
+  `cudaStreamWaitEvent`（`dsv41_kernels.cu` 的 `dsv41_hc_front_split`；Rust 侧 `devrt.rs` 建
+  side stream、`device.rs::hc_tail_join` 在主流的 hc_post 前 wait）。第 41 轮实测只兑现 −0.20ms
+  （理论 −0.86ms）。**根因（两条并存，均与"图回放不继承流优先级"有关）**：
+  ① **`cudaStreamCreate` 建的 side stream 是默认优先级** ⇒ LATE 的 1-block 节点与主流上千个投影
+     块同优先级竞争 SM，排在队尾；
+  ② **`cudaGraphInstantiate` 第三参传 0** ⇒ 即使 side stream 有优先级，图回放仍让**所有节点跑
+     在 launch stream 的优先级**上（CUDA 头文件原文：node priority "copied from stream priority
+     during stream capture"，只有 `cudaGraphInstantiateFlagUseNodePriority`(=8) 才会用 per-node 优先级）。
+  修复：`devrt.rs` 用 `cudaStreamCreateWithPriority(..., cudaStreamNonBlocking, greatest)` 建 side
+  stream（greatest 由 `cudaDeviceGetStreamPriorityRange` 查得），并在 `graph_instantiate` 传
+  `cudaGraphInstantiateFlagUseNodePriority`（被拒则清错回退 flags=0，只是提示，不影响正确性）；
+  另把 LATE 半的 block 从 1024 降到 128（`DSV41_HC_LATE_T`）——LATE 只有 1 个 warp 有活干，
+  1024 线程意味着 6 次 32-warp barrier + 向满负荷的 SM 要一个 1024 线程 slot；**逐位不变**
+  （全是 elementwise + warp0 sinkhorn），唯一例外是 `DSV41_HC_SS=0` 的自算 ss 路径（读
+  `wpart[threadIdx.x>>5]`，需要 warps 0..mix-1）⇒ launcher 在该路径上仍用 1024。
+  开关：`DSV41_HC_TAIL_PRIO=0` / `DSV41_GRAPH_NODE_PRIORITY=0` / `DSV41_HC_LATE_T=1024`。
+  ⚠️ 若上机后仍只有 −0.2ms，下一个怀疑对象是**图节点开销本身**（审计：1355 节点 ≈ 2.0ms，
+  ~1.5µs/节点；split 每次多 1 个 kernel 节点 + 2 个 event 节点 ⇒ 约 0.3-0.5ms/步），
+  而不是调度——判据：nsys 看 tail_late 的 span 是否与投影时间轴重叠。

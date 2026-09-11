@@ -44,6 +44,16 @@ struct Cudart {
     memset: unsafe extern "C" fn(*mut c_void, c_int, usize) -> c_int,
     memset_async: Option<unsafe extern "C" fn(*mut c_void, c_int, usize, CuStream) -> c_int>,
     stream_create: unsafe extern "C" fn(*mut CuStream) -> c_int,
+    /// `cudaStreamCreateWithPriority` — the hc tail split's side stream is created
+    /// at the device's GREATEST priority, so the graph replay prefers its 1-block
+    /// LATE half over a full projection wave (see [`DevRuntime::side_stream`]).
+    /// Optional: absent → the plain create is used and the split keeps its old
+    /// (default-priority) scheduling.
+    stream_create_priority:
+        Option<unsafe extern "C" fn(*mut CuStream, c_int, c_int) -> c_int>,
+    /// `cudaDeviceGetStreamPriorityRange` — "greatest" is a device property
+    /// (usually -5, but never hardcode it), queried once at open.
+    stream_priority_range: Option<unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int>,
     stream_sync: unsafe extern "C" fn(CuStream) -> c_int,
     dev_sync: unsafe extern "C" fn() -> c_int,
     last_error: unsafe extern "C" fn() -> c_int,
@@ -79,6 +89,19 @@ struct Cudart {
 /// `cudaEventDisableTiming` — required for any event recorded inside a stream
 /// capture (a timing event makes `cudaStreamEndCapture` fail).
 pub const CUDA_EVENT_DISABLE_TIMING: c_uint = 0x02;
+
+/// `cudaStreamNonBlocking`: the side stream must not implicitly synchronise with
+/// the legacy default stream (it never did — both streams here are explicit — but
+/// the flag also documents the intent).
+const CUDA_STREAM_NON_BLOCKING: c_int = 0x01;
+
+/// `cudaGraphInstantiateFlagUseNodePriority` (CUDA 12.0+, driver_types.h).
+/// Without it a replay runs every node at the LAUNCH stream's priority, and the
+/// per-node priority captured from the side stream is silently ignored — which
+/// is precisely the hole the hc tail split fell into (round 41: −0.20ms realised
+/// of −0.86ms). Verified against CUDA 13.2's header: the flag is 8, and
+/// "priorities ... are copied from stream priority during stream capture".
+const CUDA_GRAPH_INSTANTIATE_USE_NODE_PRIORITY: u64 = 8;
 
 struct Cublas {
     create: unsafe extern "C" fn(*mut *mut c_void) -> c_int,
@@ -297,6 +320,13 @@ pub struct DevRuntime {
     /// Null when `cudaStreamCreate` is unavailable, in which case the model keeps
     /// the single-launch path (`side_stream()` returns null).
     side_stream: CuStream,
+    /// Priority the side stream was created with (0 = device default). Kept so
+    /// the graph instantiation can decide whether the node-priority flag is
+    /// worth passing, and so a log can state what was actually in effect.
+    side_prio: c_int,
+    /// Flags for `cudaGraphInstantiate`. Non-zero only when the side stream is a
+    /// priority stream AND `DSV41_GRAPH_NODE_PRIORITY` is not 0.
+    graph_instantiate_flags: u64,
     /// Fork/join events for the tail split, created with `cudaEventDisableTiming`
     /// so they are legal inside a stream capture. Recorded by the kernel launcher,
     /// waited by the model. Reused for every tail call: each record/wait pair is
@@ -339,6 +369,12 @@ impl DevRuntime {
                     .ok()
                     .map(|p| std::mem::transmute_copy(&p)),
                 stream_create: f!(h_cudart, "cudaStreamCreate"),
+                stream_create_priority: sym(h_cudart, "cudaStreamCreateWithPriority")
+                    .ok()
+                    .map(|p| std::mem::transmute_copy(&p)),
+                stream_priority_range: sym(h_cudart, "cudaDeviceGetStreamPriorityRange")
+                    .ok()
+                    .map(|p| std::mem::transmute_copy(&p)),
                 stream_sync: f!(h_cudart, "cudaStreamSynchronize"),
                 dev_sync: f!(h_cudart, "cudaDeviceSynchronize"),
                 last_error: f!(h_cudart, "cudaGetLastError"),
@@ -407,10 +443,60 @@ impl DevRuntime {
             // a timing event makes cudaStreamEndCapture fail once the fork/join
             // lands inside the whole-step graph.
             let mut side_stream: CuStream = std::ptr::null_mut();
-            if (cudart.stream_create)(&mut side_stream) != 0 {
-                let _ = (cudart.last_error)();   // clear the sticky flag
-                side_stream = std::ptr::null_mut();
+            // Priority of the side stream (0 = default). Non-zero means the graph
+            // capture stamped its kernel nodes with this priority, and the graph
+            // MUST be instantiated with the node-priority flag for that to mean
+            // anything at replay time.
+            let mut side_prio: c_int = 0;
+            // `DSV41_HC_TAIL_PRIO=0` pins the side stream back to the default
+            // priority (A/B knob: the scheduling hint is the only thing it changes).
+            let prio_wanted = std::env::var("DSV41_HC_TAIL_PRIO")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+            if prio_wanted {
+                if let (Some(create_prio), Some(prio_range)) =
+                    (cudart.stream_create_priority, cudart.stream_priority_range)
+                {
+                    // greatest < least: the API returns a NEGATIVE number for the
+                    // greatest priority and, on a device without priority support,
+                    // both are 0 - in which case there is nothing to gain.
+                    let (mut least, mut greatest) = (0 as c_int, 0 as c_int);
+                    if prio_range(&mut least, &mut greatest) == 0 && greatest < least {
+                        if create_prio(&mut side_stream, CUDA_STREAM_NON_BLOCKING, greatest) != 0 {
+                            let _ = (cudart.last_error)();
+                            side_stream = std::ptr::null_mut();
+                        } else {
+                            side_prio = greatest;
+                        }
+                    }
+                }
             }
+            if side_stream.is_null() {
+                // clear any sticky error from the priority attempt before retrying
+                let _ = (cudart.last_error)();
+                if (cudart.stream_create)(&mut side_stream) != 0 {
+                    let _ = (cudart.last_error)();   // clear the sticky flag
+                    side_stream = std::ptr::null_mut();
+                }
+            }
+            if side_stream.is_null() {
+                eprintln!("[hc_tail] side stream unavailable — tail split stays single-launch");
+            } else if side_prio != 0 {
+                // (this line matters: it is the only evidence in a log that the
+                // priority actually reached the capture)
+                eprintln!("[hc_tail] side stream priority = {side_prio} (greatest)");
+            }
+            // Node-priority instantiation is what makes the captured priority
+            // effective at replay. `DSV41_GRAPH_NODE_PRIORITY=0` pins it off.
+            let node_prio = side_prio != 0
+                && std::env::var("DSV41_GRAPH_NODE_PRIORITY")
+                    .map(|v| v != "0")
+                    .unwrap_or(true);
+            let graph_instantiate_flags: u64 = if node_prio {
+                CUDA_GRAPH_INSTANTIATE_USE_NODE_PRIORITY
+            } else {
+                0
+            };
             let mut fork_ev: *mut c_void = std::ptr::null_mut();
             let mut join_ev: *mut c_void = std::ptr::null_mut();
             if let Some(make_ev) = cudart.event_create_flags {
@@ -434,6 +520,8 @@ impl DevRuntime {
                 cublas,
                 stream,
                 side_stream,
+                side_prio,
+                graph_instantiate_flags,
                 fork_ev,
                 join_ev,
                 handle,
@@ -458,6 +546,14 @@ impl DevRuntime {
     /// runtime could not create one). Callers must gate on `is_null`.
     pub fn side_stream(&self) -> CuStream {
         self.side_stream
+    }
+
+    /// The priority the side stream was created with (0 = device default).
+    /// Informational: the model does not branch on it, but a run log / a probe
+    /// needs it to tell "the hint was never installed" apart from "the driver
+    /// ignored it".
+    pub fn side_stream_priority(&self) -> c_int {
+        self.side_prio
     }
 
     /// Fork event for the hc tail split: recorded on the main stream by the
@@ -541,6 +637,8 @@ impl DevRuntime {
                 memset: f!(h, "cudaMemset"),
                 memset_async: None,
                 stream_create: f!(h, "cudaStreamCreate"),
+                stream_create_priority: None,
+                stream_priority_range: None,
                 stream_sync: f!(h, "cudaStreamSynchronize"),
                 dev_sync: f!(h, "cudaDeviceSynchronize"),
                 last_error: f!(h, "cudaGetLastError"),
@@ -965,13 +1063,30 @@ impl DevRuntime {
     }
 
     /// Instantiate a captured graph into an executable.
+    ///
+    /// Passes [`CUDA_GRAPH_INSTANTIATE_USE_NODE_PRIORITY`] when the runtime owns a
+    /// priority side stream: stream capture copies each stream's priority onto its
+    /// kernel nodes, but a replay only honours those per-node priorities when the
+    /// graph is instantiated with this flag — otherwise every node runs at the
+    /// LAUNCH stream's priority and the hc tail split's scheduling hint is inert.
+    /// Any rejection (an older cudart, a flag the driver does not know) falls back
+    /// to the plain instantiation: the flag is a hint, never a correctness input.
     pub fn graph_instantiate(&self, g: *mut c_void) -> Result<*mut c_void> {
         let f = self
             .cudart
             .graph_instantiate
             .ok_or_else(|| FerriteError::Config("cudaGraphInstantiate missing".into()))?;
         let mut e: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe { f(&mut e, g, 0) };
+        let mut rc = unsafe { f(&mut e, g, self.graph_instantiate_flags) };
+        if rc != 0 && self.graph_instantiate_flags != 0 {
+            let _ = unsafe { (self.cudart.last_error)() };   // clear, do not report
+            e = std::ptr::null_mut();
+            eprintln!(
+                "[hc_tail] cudaGraphInstantiate rejected the node-priority flag \
+                 (rc={rc}) — replaying at the launch stream's priority"
+            );
+            rc = unsafe { f(&mut e, g, 0) };
+        }
         self.kerr(rc, "cudaGraphInstantiate")?;
         Ok(e)
     }

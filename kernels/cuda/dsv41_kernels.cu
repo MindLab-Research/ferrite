@@ -2052,7 +2052,22 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      // tree only matches the reference at blockDim 1024, so
                                      // the launcher forces 32 warps.
                                      const float* qr_raw = nullptr,
-                                     const float* qr_w = nullptr, float qr_eps = 0.f) {
+                                     const float* qr_w = nullptr, float qr_eps = 0.f,
+                                     // f32 direct read (see dsv41_gemm_fp8_mx_f32): when
+                                     // `a_f32` is non-null the block stages the RAW f32
+                                     // activation straight into `s_af` instead of decoding
+                                     // the fp8 `a` through `s_lut` and multiplying by the
+                                     // per-block scale. The consume loop below is unchanged
+                                     // (it already reads `s_af`), so the WEIGHT side keeps
+                                     // its fp8 decode -- `s_lut` is still built. `a`/`a_scale`
+                                     // are then never read (the launcher passes null). NOT
+                                     // bit-identical to the fp8 path: it skips the
+                                     // quantise->dequantise round trip and is strictly MORE
+                                     // accurate, so it is only wired where the consumer
+                                     // tolerates the tighter value (wo_b -> AR sum -> hc_post).
+                                     // Requires `vec >= 3` (the s_af materialisation lives
+                                     // there); the launcher enforces it.
+                                     const float* a_f32 = nullptr) {
     // Read the round ONCE, like p2p_ar_store_v5_kernel (ferrite_kernels.cu). When
     // the table is null this is a no-op (epoch is null too) and the kernel is the
     // old one bit for bit.
@@ -2160,7 +2175,10 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
             s_a[i] = *(const uint8_t*)&f8;
         }
-    } else if (vec == 4) {
+    } else if (vec == 4 && a_f32 == nullptr) {
+        // On the f32 path `a` is null and the block-wide copy is not read (the
+        // consume loop reads `s_af`, which the a32 block below fills from a_f32),
+        // so the copy is skipped to avoid dereferencing null.
         const int n16a = k >> 4;
         // NOTE: this staging was tried as cp.async and faulted with err 700
         // (illegal access, surfacing as a sticky error on dsv41_route_topk) while
@@ -2179,7 +2197,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         // read once per block instead of once per row per k-block. On the
         // NORM_FUSE path (`qr_raw` non-null) the prologue above already wrote
         // them, and `a_scale` is null.
-        if (qr_raw == nullptr)
+        if (qr_raw == nullptr && a_f32 == nullptr)
             for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
         // Build the e4m3 decode table once per block (256 entries, two iterations
         // per thread at the default block size).
@@ -2187,9 +2205,17 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         __syncthreads();
         // a32: materialise the scaled activation (block-level, so the decode
         // latency is paid once instead of once per row).
-        const uint8_t* ap0 = (vec == 4) ? s_a : a;
-        for (int i = threadIdx.x; i < k; i += blockDim.x)
-            s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+        if (a_f32 != nullptr) {
+            // f32 direct read: the activation is already f32, so there is no LUT
+            // lookup and no per-block scale -- s_af IS the value. `s_lut` is still
+            // built above because the WEIGHT side of the consume loop decodes
+            // through it.
+            for (int i = threadIdx.x; i < k; i += blockDim.x) s_af[i] = a_f32[i];
+        } else {
+            const uint8_t* ap0 = (vec == 4) ? s_a : a;
+            for (int i = threadIdx.x; i < k; i += blockDim.x)
+                s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+        }
         __syncthreads();
     } else if (vec == 4) {
         __syncthreads();
@@ -2663,6 +2689,63 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode,
         nullptr, nullptr, nullptr, nullptr, n, /*epi_add=*/1);
+    return (int)cudaGetLastError();
+}
+
+// wo_b's f32-activation GEMV: the M=1 GEMV that reads the RAW f32 activation
+// instead of an fp8 (`a`, `a_scale`) pair, so the `quant1(s.wo)` launch between
+// wo_a and wo_b disappears (one launch + one graph node per layer, 40 per step)
+// and the activation staging loses its per-block LUT decode + scale multiply.
+//
+// Why this does NOT repeat B1's mistake: B1 moved the fusion into the wo_a
+// epilogue, which forced 32 warps/block so that 32 consecutive rows formed one
+// quant block -- and that shape (grid = n/32, 32 warps) lost 148->32 active SMs
+// and measured +0.24ms. Here only the DATA PATH changes, not the grid shape: the
+// block is the normal `g_gemv_warps` / ceil(n/warps) shape, exactly the one the
+// plain `gemm_fp8_mx` GEMV uses, so there is no SM-utilisation penalty.
+//
+// A SEPARATE symbol (not a new parameter on dsv41_gemm_fp8_mx) for the usual
+// reason: that symbol has one fixed ABI and six call sites, so the f32 form gets
+// its own name and a stale .so stays a plain symbol probe
+// (supports_gemm_fp8_f32 on the Rust side).
+//
+// NOT bit-identical to the (quant1, gemm_fp8_mx) pair it replaces: it skips the
+// fp8 quantise->dequantise round trip, so the activation carries no 4-bit
+// mantissa loss and the row partial is slightly MORE accurate. The downstream is
+// the wo_b row partial -> the AR sum -> hc_post, where the tighter value is the
+// correct direction. Returns 1 (decline) when the shape/mode cannot take it, so
+// the caller keeps the (quant1, gemm_fp8_mx) pair.
+extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
+                                     const uint8_t* w_scale, const float* bias, float* out,
+                                     int n, int k, cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv || a_f32 == nullptr || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    // The s_af materialisation (where the f32 lands) is the vec>=3 branch only.
+    if (g_gemv_fp8_mode < 3) return 1;
+    const int warps = g_gemv_warps;
+    const int blocks = (n + warps - 1) / warps;
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    // Same layout as dsv41_gemm_fp8_mx: weight rows [warps][k] + per-warp ue8m0
+    // scale rows [warps][nb_k_al] + block activation scales [nb_k] f32 (unused on
+    // this path, reserved) + 256-entry LUT + the a32/f32 row [k] + the B1 row
+    // slot [32]. The kernel never dereferences `a`/`a_scale` here.
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + B1 row stage
+    // Mode 4 allocates the (unused) block-wide activation copy; keep the caller's
+    // mode so gsmem matches the branch the kernel's `vec` takes.
+    const size_t gsmem = (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                                                : (size_t)warps * (size_t)k + scale_bytes;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        nullptr, nullptr, w, w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr,
+        nullptr, n, 0, nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0,
+        0, 0, 0, 0, 0, nullptr, nullptr, 0.f, a_f32);
     return (int)cudaGetLastError();
 }
 
@@ -4447,6 +4530,35 @@ static const int g_hc_dots_t = [] {
     return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 128;
 }();
 
+// Block size of the split tail's LATE half (DSV41_HC_LATE_T, default 128).
+//
+// WHY IT IS NOT 1024. The LATE half is ~30 scalars of elementwise work plus a
+// warp-0-only sinkhorn chain: ONE warp does all of it. Launched at 1024 threads
+// (the shape the single-kernel form needs, because ITS ss walk strides by mix*32
+// and reads its partials out of wpart[threadIdx.x>>5], i.e. warps 0..mix-1), the
+// block (a) makes every one of its ~6 __syncthreads() a 32-warp convergence with
+// 31 warps carrying nothing, and (b) demands a 1024-thread SM slot from a machine
+// whose SMs are full of 128/256-thread projection blocks. Round 41's tail split
+// realised -0.20ms of its -0.86ms: the LATE half did not overlap the projection
+// chain. A 128-thread block fits beside a running projection block instead of
+// queueing behind a wave, which is the scheduling half of that gap.
+//
+// BIT-IDENTICAL by construction: every LATE statement is elementwise over
+// `mixes`/`pre`/`post`/`cm`/`comb` or a warp-0 sinkhorn, so which thread executes
+// which iteration cannot move a value, and lanes 0..31 of warp 0 - the only lanes
+// the ss combine and the sinkhorn ever touch - are unchanged.
+//
+// The ONE exception is the self-computed ss path (DSV41_HC_SS=0, an A/B knob):
+// its partials live in wpart[threadIdx.x>>5] and the cross-warp tree reads
+// warp 0..nwarp-1, so that path MUST keep 1024 threads - hence the gate in the
+// launcher rather than a blanket block-size change.
+static const int g_hc_late_t = [] {
+    const char* e = getenv("DSV41_HC_LATE_T");
+    if (e == nullptr) return 128;
+    const int v = atoi(e);
+    return (v >= 32 && v <= 1024 && (v & 31) == 0 && v % 32 == 0) ? v : 128;
+}();
+
 extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
@@ -4581,8 +4693,13 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     if (e != cudaSuccess) return (int)e;
     e = cudaStreamWaitEvent(side, fork_ev, 0);
     if (e != cudaSuccess) return (int)e;
-    // LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb)
-    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
+    // LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
+    // Block size from g_hc_late_t when the ss partials come from the dots kernel
+    // (the default): one warp does all the LATE work, so a 1024-thread block only
+    // buys 31 idle warps and a 1024-thread SM slot to queue for. The self-computed
+    // ss path reads wpart[threadIdx.x>>5] for warps 0..mix-1, so it keeps 1024.
+    const unsigned late_t = (g_hc_ss ? (unsigned)g_hc_late_t : 1024u);
+    hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
         nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
     e = cudaGetLastError();

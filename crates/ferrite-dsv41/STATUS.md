@@ -6262,6 +6262,51 @@ swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
 **在飞三项**（dots→pubred −0.12 + rmsnorm 融合 −0.13 + o-rope→attn −0.10）→ 全落地
 ~7.9ms ≈ 127 tok/s。
 
+### 🔧 第 42 轮（进行中）：tail split 侧流调度修复——side stream 优先级 + 图节点优先级 + LATE 半缩块（待上机 A/B）
+
+**问题**：round-41 的 tail split 只兑现 −0.20ms（理论 −0.86ms），缺口 0.66ms。
+
+**根因（代码层已确认，两条并存）**：
+1. `devrt.rs` 用 `cudaStreamCreate` 建 side stream ⇒ **默认优先级**，tail_late 的 1-block 节点
+   与主流上千个投影块同优先级抢 SM（fork/join 的图边只保证依赖顺序，不保证并发）。
+2. **更关键**：`graph_instantiate` 调 `cudaGraphInstantiate(..., 0)` —— 第三参 flags=0 时图回放
+   让**所有节点跑在 launch stream 的优先级**上，per-node 优先级被静默忽略。CUDA 头文件原文：
+   node priority 是 "copied from stream priority during stream capture"，只有
+   `cudaGraphInstantiateFlagUseNodePriority`(=8) 才启用它（已在 CUDA 13.2 头文件逐字核对）。
+   ⇒ 即使给 side stream 设了优先级，**不传这个 flag 等于没设**（这解释了为什么 round-41 连
+   "部分并发"都很勉强）。
+
+**改动（代码已在树，未上机）**：
+- `crates/ferrite-kernel/src/devrt.rs`：新增可选符号 `cudaStreamCreateWithPriority` +
+  `cudaDeviceGetStreamPriorityRange`（dlopen，缺席则回退 `cudaStreamCreate`，best-effort 语义不变）；
+  side stream 以 **greatest priority** + `cudaStreamNonBlocking` 创建；`graph_instantiate` 传
+  `cudaGraphInstantiateFlagUseNodePriority`（被驱动拒绝 → 清错重试 flags=0，只丢提示不丢正确性）；
+  新增 `side_stream_priority()` 供探针/日志；`[hc_tail] side stream priority = N` 一行 stderr
+  是"优先级真的进了 capture"的唯一证据。
+- `kernels/cuda/dsv41_kernels.cu`：LATE 半 block 1024 → **128**（`DSV41_HC_LATE_T`）。LATE 只有
+  1 个 warp 有活（24 个 mix + 16 个 cm + warp0 sinkhorn），1024 线程只买到 31 个空转 warp、
+  6 次 32-warp barrier，以及"向满负荷的 SM 要 1024 线程 slot"；128 线程可与投影块共处一个 SM。
+  **逐位不变**（elementwise + warp0 sinkhorn，谁跑哪个迭代都不改值）；唯一例外是
+  `DSV41_HC_SS=0` 的自算 ss 路径（partials 在 `wpart[threadIdx.x>>5]`，需 warps 0..mix-1）
+  ⇒ launcher 在该路径保持 1024。**注意**：sinkhorn 是 warp0 串行 butterfly（20 轮），
+  拆多块（任务书"修法 B"）不可行，故用"缩块"取得同一效果（更小的 SM 占用 + 更少的 barrier）。
+
+**开关（A/B 三臂）**：`DSV41_HC_TAIL_PRIO=0`（关流优先级）/ `DSV41_GRAPH_NODE_PRIORITY=0`
+（关节点优先级）/ `DSV41_HC_LATE_T=1024`（回旧 block 形态）。三者独立，可定位是哪一条在起作用。
+
+**验证状态**：`cargo check -p ferrite-models` / `--workspace` ✓；远端
+`nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 --use_fast_math -c dsv41_kernels.cu`
+**EXIT=0、无 error** ✓（仅既有 `e2m1_to_f` 未引用 warning）。`cargo test -p ferrite-dsv41` 唯一
+失败项 `ar_hcpost_parity` 是 GPU parity 测试（本机无 libcudart），非本次引入。
+
+**上机验证配方（两件事，缺一不可）**：
+1. 位级 parity：`DSV41_HC_TAIL_PRIO=1` vs `=0` vs `DSV41_HC_TAIL_SPLIT=0` 三臂文本一致
+   （split 与 LATE 缩块都声称逐位等价，必须验）；
+2. nsys（`--cuda-graph-trace=node`）看 `hc_mixes_tail_kernel` 的**两个实例**（EARLY/LATE）：
+   LATE 的 span 是否与 `gemm_fp8_gemv` 时间轴重叠。**若 LATE 确实重叠而收益仍 ≈ −0.2ms，
+   则缺口不在调度而在图节点开销本身**（审计：1355 节点 ≈ 2.0ms，~1.5µs/节点；split 每次多发
+   1 个 kernel 节点 + 2 个 event 节点 ≈ 0.3-0.5ms/步）——那时应该讨论减少节点数而不是继续调优先级。
+
 ### 下一个 spawn 候选：注意力双链并行（fork/join 模式的延伸，−0.42ms 预期）
 
 **发现（2026-09-11 深夜）**：lin2（wq_a+wkv mx2）之后有两条**相互独立**的链，在 sparse_attn 汇合：
@@ -6274,3 +6319,19 @@ swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
 与 tail split 的 fork/join 基建（devrt.rs 的 side_stream/fork_ev/join_ev）同款——可能需要
 第二个 side stream 或复用（tail_late 与 kv 链的时间窗不重叠：tail_late 在投影期间，
 kv 链在投影的开头——需确认时序）。
+
+### nsys v6 剖析（round 41 后 = 8.23ms 状态，2026-09-11 深夜）
+
+**tail split 的实际行为**：
+- hc_mixes_tail：80 → **160 次/步**（80 early + 80 late），med 7.1µs（混合中位）
+- 总 GPU 时间 0.99 → 1.14ms（split 的 launch/staging 开销 +0.15ms）
+- **但关键路径贡献下降**（late 半部分藏进投影）——serve 实测 −0.20ms ✓
+- tail-late-priority subagent 正在修 cudaGraphInstantiateFlagUseNodePriority（回收剩余）
+
+**注意**：profile 的 .so 是 round 41 的旧版——rmsnorm 融合（NORM_FUSE）的新符号
+（dsv41_gemm_fp8_mx_rope_norm）不在里面，所以 rmsnorm_q 仍显示 40 次/步。
+下一次完整重编后的验证轮会体现 norm 融合的效果。
+
+**分解（profile 模式 9.69ms 含开销；生产 8.23ms）**：
+gemm 2.51 · tail 1.14（split 后）· gateup 0.95 · down 0.69 · dots 0.56 ·
+sparse 0.34 · v2(gate+route) 0.39 · quant 0.13 · 其它 ~0.9

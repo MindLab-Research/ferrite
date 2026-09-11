@@ -922,6 +922,22 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// wo_b f32-activation direct read (DSV41_WOB_F32, default ON). The wo_b GEMV
+    /// takes the RAW f32 `s.wo` (via `dsv41_gemm_fp8_mx_f32`) instead of the fp8
+    /// `quant1(s.wo)` pair, removing that launch (40/step) and the activation's
+    /// per-block LUT decode + scale. Unlike B1 it keeps the NORMAL gemv grid shape
+    /// (`g_gemv_warps` / ceil(n/warps)), so it does not pay B1's 32-warp
+    /// SM-utilisation loss — only the data path changes. NOT bit-identical: it
+    /// skips the fp8 round trip and is strictly more accurate (wo_b -> AR sum ->
+    /// hc_post tolerates the tighter value). "0" restores the (quant1, gemm_fp8_mx)
+    /// pair; a stale `.so` (no symbol) falls back the same way.
+    fn wob_f32() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_WOB_F32").map(|v| v != "0").unwrap_or(true)
+        })
+    }
+
     /// Two projections over the same activation: quantise once, then one gemv
     /// whose rows below n1 map to the first family and the rest to the second.
     /// Each row is still one warp in the same lane order, so both outputs are
@@ -2759,43 +2775,65 @@ fn hc_tail_split() -> bool {
         // re-enables.
         let ar_store_fused = ar_store_fuse()
             && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
-        // wo_b's activation: the fused wo_a epilogue already produced the fp8 of
-        // `s.wo`, so the quant1 that used to run here is skipped and the two
-        // launches below read `wo_q`/`wo_qsc` instead of `xq`/`xsc`.
-        let (wb_q, wb_sc) = if wo_fused {
-            (self.s.wo_q.as_u8(), self.s.wo_qsc.as_f32())
-        } else {
-            self.quant1(self.s.wo.ptr as *const f32, ol_local as i32)?;
-            (self.s.xq.as_u8(), self.s.xsc.as_f32())
-        };
-        if ar_store_fused {
-            let c = comm.as_ref().unwrap();
-            self.dev.gemm_fp8_mx_ar(
-                wb_q,
-                wb_sc,
-                ld.wo_b.as_ref().unwrap().as_u8(),
-                ld.wo_b_scale.as_ref().unwrap().as_u8(),
-                self.s.o.ptr as *mut f32,
-                dim as i32,
-                ol_local as i32,
-                c.peer_slots_f32(),
-                c.epoch_u32(),
-                c.world as i32,
-                c.rank as i32,
-                c.slot_stride_elems(),
-            )?;
-        } else {
-            self.dev.gemm_fp8_mx(
-                wb_q,
-                wb_sc,
+        // wo_b's activation, in priority order:
+        //  1. B1 (wo_fused): the wo_a epilogue already emitted `wo_q`/`wo_qsc`, so
+        //     the quant1 that used to run here is skipped.
+        //  2. DSV41_WOB_F32 (default ON): the wo_b gemv reads the RAW f32 `s.wo`
+        //     directly, so the `quant1(s.wo)` launch disappears. It keeps the
+        //     normal gemv grid shape (g_gemv_warps / ceil(n/warps)), which is why
+        //     it avoids B1's +0.24ms 32-warp SM-utilisation loss — only the data
+        //     path changes.
+        //  3. fallback: `quant1(s.wo)` into `xq`/`xsc`, then the fp8 gemv.
+        // The f32 path cannot carry the AR store fusion (that lives on the fp8
+        // launcher's epilogue), so it is only taken when `ar_store_fused` is off.
+        let mut wb_f32 = false;
+        if !wo_fused && !ar_store_fused && Self::wob_f32() && self.dev.supports_gemm_fp8_f32() {
+            wb_f32 = self.dev.gemm_fp8_mx_f32(
+                self.s.wo.ptr as *const f32,
                 ld.wo_b.as_ref().unwrap().as_u8(),
                 ld.wo_b_scale.as_ref().unwrap().as_u8(),
                 std::ptr::null(),
                 self.s.o.ptr as *mut f32,
-                1,
                 dim as i32,
                 ol_local as i32,
             )?;
+        }
+        if !wb_f32 {
+            let (wb_q, wb_sc) = if wo_fused {
+                (self.s.wo_q.as_u8(), self.s.wo_qsc.as_f32())
+            } else {
+                self.quant1(self.s.wo.ptr as *const f32, ol_local as i32)?;
+                (self.s.xq.as_u8(), self.s.xsc.as_f32())
+            };
+            if ar_store_fused {
+                let c = comm.as_ref().unwrap();
+                self.dev.gemm_fp8_mx_ar(
+                    wb_q,
+                    wb_sc,
+                    ld.wo_b.as_ref().unwrap().as_u8(),
+                    ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                    self.s.o.ptr as *mut f32,
+                    dim as i32,
+                    ol_local as i32,
+                    c.peer_slots_f32(),
+                    c.epoch_u32(),
+                    c.world as i32,
+                    c.rank as i32,
+                    c.slot_stride_elems(),
+                )?;
+            } else {
+                self.dev.gemm_fp8_mx(
+                    wb_q,
+                    wb_sc,
+                    ld.wo_b.as_ref().unwrap().as_u8(),
+                    ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                    std::ptr::null(),
+                    self.s.o.ptr as *mut f32,
+                    1,
+                    dim as i32,
+                    ol_local as i32,
+                )?;
+            }
         }
         let mut hc_folded = false;
         if let Some(c) = comm {

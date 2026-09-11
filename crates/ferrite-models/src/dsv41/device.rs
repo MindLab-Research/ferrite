@@ -120,6 +120,19 @@ struct Kernels {
             c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// wo_b f32-activation GEMV: the M=1 GEMV that reads the RAW f32 activation
+    /// (`dsv41_gemm_fp8_mx_f32`) instead of an fp8 (`a`, `a_scale`) pair, so the
+    /// `quant1(s.wo)` launch between wo_a and wo_b disappears. A separate symbol,
+    /// so a stale `.so` simply has no entry and the caller keeps the
+    /// (quant1, gemm_fp8_mx) pair. Returns 1 when the shape/mode cannot use it.
+    /// ABI: stream LAST — `dsv41_gemm_fp8_mx_f32(a_f32, w, w_scale, bias, out, n,
+    /// k, s)` (this symbol has no C++ default tail args, so it does NOT follow
+    /// `gemm_fp8_mx`'s "stream after the shape" layout).
+    gemm_fp8_mx_f32: Option<
+        unsafe extern "C" fn(
+            *const f32, *const u8, *const u8, *const f32, *mut f32, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -543,6 +556,7 @@ impl Device {
             gemm_fp8_mx2_rope: ko!(rt, "dsv41_gemm_fp8_mx2_rope"),
             gemm_fp8_mx_rope_norm: ko!(rt, "dsv41_gemm_fp8_mx_rope_norm"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
+            gemm_fp8_mx_f32: ko!(rt, "dsv41_gemm_fp8_mx_f32"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
@@ -1206,6 +1220,37 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_add")?;
+        Ok(true)
+    }
+
+    /// wo_b: true when the loaded .so carries the f32-activation GEMV
+    /// (`dsv41_gemm_fp8_mx_f32`). A stale .so leaves DSV41_WOB_F32 inert and the
+    /// (quant1, gemm_fp8_mx) pair runs.
+    pub fn supports_gemm_fp8_f32(&self) -> bool {
+        self.kernels.gemm_fp8_mx_f32.is_some()
+    }
+
+    /// wo_b: the M=1 GEMV that reads the RAW f32 activation, so the consumer's
+    /// `quant1(wo)` launch disappears. NOT bit-identical to the fp8 path — it
+    /// skips the quantise->dequantise round trip and is strictly more accurate.
+    /// Ok(false) => the caller runs `quant1(wo)` + the plain `gemm_fp8_mx`.
+    /// ABI: stream LAST (this symbol has no C++ default tail args).
+    pub fn gemm_fp8_mx_f32(
+        &self,
+        a_f32: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.gemm_fp8_mx_f32, "dsv41_gemm_fp8_mx_f32")?;
+        let rc = unsafe { f(a_f32, w, w_scale, bias, out, n, k, self.stream) };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx_f32")?;
         Ok(true)
     }
 
