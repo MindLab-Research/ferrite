@@ -322,6 +322,19 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
   `__fadd_rn`/`__fmul_rn` 或 `fmaf` 钉住（2026-09-11 的 4-路展开漂 1ULP 事故）。
 - 结构优势：CTA 仍是 240 → **per-row 的 s_act prologue 不翻倍**（行拆分做不到这点）；代价是每 warp 的
   in-flight 字节减半且 warp 数翻倍 ⇒ 净效果取决于上面那个 regs 结论（0.81 波 → 1.62 波时 ≈ −19% 而非 −50%）。
+- **形状修正（2026-09-11 核对代码，比上面的 4-行/8-warp 方案更优）**：`blockDim=8 warps + rows_per_cta=4`
+  会把 CTA 数从 240 翻到 480，per-CTA 的 `s_act`（20KB）+ LUT prologue **随之翻倍**。更优形状 =
+  **保持 rows=8/CTA、blockDim 加到 16 warps（512 线程）**：warp `w` → `row_local = w >> 1`、`half = w & 1`，
+  grid 仍 `(40, 6) = 240 CTA` ⇒ warp 数 1920 → 3840（**26/SM**）而 prologue 不翻倍。每 warp 仍
+  `#pragma unroll 4`（可升 5）× 1 LDG.128（ILV）⇒ **每行 in-flight 字节 64 → 128B**，这才是 MLP 增益的来源
+  （不是"每 warp 更深"——每 warp 只有 5 组，比原来浅）。
+- **切点/合并实现**：half A = `g2 ∈ [0,5)`、half B = `[5,10)`（沿 **512 值 group 边界**连续切；每 warp 覆盖
+  2560 个连续激活，scale block 不跨界）。ILV 地址 `g_row + 2*q`（`q=(g2<<8)+(lane<<3)`）对任意 g2 都是 16B 对齐，
+  **两半的地址算术无需改**，只改循环上下界。两半各跑**同形 5 步 shfl 树** → lane0 写 `s_p[row_local][half]`，
+  **加一次 `__syncthreads`**（因此必须把 `:966` 那个 grid-stride 窗口循环改成单趟；launcher 已按
+  `ceil(n_total/rows)` 定 grid，且 grid.x 现在要按 **rows（8）** 而非 warps(16) 算），
+  最后由 `half==0` 的 lane0 做 `g = __fadd_rn(p0.x, p1.x)`、`u = __fadd_rn(p0.y, p1.y)`，**再** clamp + silu 写 `out[row]`。
+- `DSV41_GATEUP_KSPLIT=4` 不可取：`nv2f = k>>9 = 10` 不被 4 整除（只能 3/3/2/2 不均衡）⇒ 取 **2**（或 5）。
 
 ---
 
