@@ -1398,3 +1398,23 @@ GDN dv 分块（+37%）、bf16/fp8 KV cache 单独（延迟非带宽）、HC_MIX
 
 **排查工具（本次证明有效）**：`LD_PRELOAD=<各版本.so> /tmp/sparse_bench` + 逐位 diff + 逐 hunk 叠加，
 秒级定位；`mega graph ... missing` 是 sticky CUDA error 的误报，真因在更早 kernel。
+
+## SSE 流式路径：**不要为多流批帧牺牲单流延迟**（2026-09-11，共享栈）
+
+**现象**：DSV4 单并发生成，**rank 侧** `[dsv41] decode` 显示 22-45 ms/step ✓，而**客户端**
+端到端只有 7.75-8.3 tok/s（129 ms/token ✗✗）—— **多出 ~85 ms/token**。
+
+**根因**（`crates/ferrite-http/src/api.rs`）：SSE 帧的批处理窗口
+```rust
+if batch.len() < 8 && opened.elapsed().as_millis() < 50 { return None; }   // 攒 8 token 或 50ms
+```
+单流下每帧都要**空等到 50ms** ✗ ⇒ 实测延迟 ≈ 50-70 + (22-45) ≈ **80-115ms/token** ✓ 与观测吻合 ✓。
+该策略是为**多并发**降低 SSE 帧数（省 syscall）而设 ✓，对单流是**纯延迟** ✗。
+
+**修法（已落地）**：帧在**尾部字节完整**时立即发出 ✓ —— 去掉人为窗口 ✓，**只保留 UTF-8
+tail-holdback**（byte-BPE 把一个多字节字符切在 token 边界时才 hold ✓）。
+**通用性**：GLM 的流式响应走同一路径 ⇒ 同样受益 ✓（已确认**无文档/测试依赖**该批帧行为 ✓）。
+
+**判据（可复用）**：**服务端自报的 step 时间**与**客户端观测的端到端时间**必须分别记录 ✓——
+两者之间的差额就是 serve/驱动/流式栈的开销 ✓。GLM 侧的 `[megab] replay` 行就是这个作用 ✓；
+DSV4 侧本会话新增了同口径的 `[dsv41] decode: N steps in Ts = X steps/s (Y ms/step)` ✓。

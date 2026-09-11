@@ -149,9 +149,9 @@ async fn chat_completions(
             let chat_id2 = chat_id.clone();
             let body = UnboundedReceiverStream::new(events);
             // SSE batch state (moved into the stream closure — per request):
-            // pending content ids + the batch's open time.
+            // pending content ids. (The open-time bookkeeping went with the frame
+            // window: nothing holds a frame any more except a partial UTF-8 tail.)
             let mut batch: Vec<u32> = Vec::new();
-            let mut batch_open: Option<std::time::Instant> = None;
             let stream = body.filter_map(move |ev: ReqEvent| -> Option<Result<Event, std::convert::Infallible>> {
                 match ev {
                     ReqEvent::Admitted { prefix_hit, prompt_tokens } => Some(Ok(Event::default()
@@ -174,15 +174,11 @@ async fn chat_completions(
                         // ~129 ms/token while the rank needed 22-45. The UTF-8
                         // tail-holdback below is the only real reason to hold
                         // anything, so the artificial window is gone.
-                        batch_open = None;
                         // Tail-holdback decode: trailing tokens whose bytes
                         // form an incomplete UTF-8 char stay in the batch.
                         let (text, held) = tok.decode_batch(&batch);
                         let keep = batch.len() - held;
                         batch.drain(..keep);
-                        if held > 0 {
-                            batch_open = Some(std::time::Instant::now());
-                        }
                         if text.is_empty() {
                             return None;
                         }
