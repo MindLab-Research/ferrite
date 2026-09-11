@@ -1974,3 +1974,190 @@ extern "C" int dsv41_hc_collapse_norm(float* x, const float* pre, const float* w
     dsv41_hc_collapse_norm_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, pre, w, out, hc, dim, eps);
     return (int)cudaGetLastError();
 }
+
+// ============================================================================
+// Hyper-connection front end, fused and spread (DSV41_HC_FRONT).
+//
+// hc_mixes ran as one block per token, which at rows == 1 pins the whole step's
+// 1.5 MB of hyper-connection weights to a single SM and therefore to that SM's
+// L1 bandwidth - about 39 us per call, 122 calls a step, a quarter of the decode.
+// The bytes are not the problem: 1.5 MB is 0.2 us of DRAM. The one-SM ceiling is.
+// Worse, one warp per projection row leaves only three float4 loads per lane in
+// flight, so each warp sits on DRAM latency instead of on bandwidth.
+//
+// This shape gives every projection row its own block and stages both the token
+// vector and the row in shared memory with cp.async, which needs no registers and
+// keeps the whole row in flight, so the block streams at L2/DRAM speed rather
+// than at latency. The dot product is the single-block kernel's float4
+// three-accumulator chain, reproduced statement for statement, so the
+// accumulation order - and therefore the sum - does not move. That matters here:
+// an earlier spread shape changed the order and turned the 1+1 prompt from a
+// clean '2' into an off-topic sentence.
+//
+// The tail merges what used to be hc_mixes_ss_kernel and hc_mixes_post_kernel:
+// the sum of squares is walked with the same 768-element stride that
+// hc_mixes_kernel used (blockDim here is 1024, so warps 24..31 contribute exact
+// zeros and the cross-warp sum is unchanged), and the sigmoid/sinkhorn/comb tail
+// is the single-block kernel's, verbatim. The whole front end is therefore
+// bit-identical to the pair it replaces.
+// ============================================================================
+__device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem) {
+    unsigned sp = (unsigned)__cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sp), "l"(gmem));
+}
+__device__ __forceinline__ void dsv41_cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+__device__ __forceinline__ void dsv41_cp_wait_all() { asm volatile("cp.async.wait_all;\n"); }
+
+// Phase A: one warp per (token, projection row). Both operands are staged with
+// cp.async; the raw dot lands in g_hc_part[r][m][0] for the tail to scale.
+__global__ void hc_mix_dots_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
+                                   int rows, int hc_dim, int mix) {
+    const int m = blockIdx.x;
+    const int r = blockIdx.y;
+    if (m >= mix || r >= rows) return;
+    extern __shared__ float hc_sm[];
+    float* s_x = hc_sm;                 // hc_dim floats
+    float* s_w = hc_sm + hc_dim;        // hc_dim floats, this projection row
+    const int lane = threadIdx.x & 31;
+    const int n4 = hc_dim >> 2;
+    const float4* xg = reinterpret_cast<const float4*>(x + (size_t)r * hc_dim);
+    const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim);
+    float4* sx = reinterpret_cast<float4*>(s_x);
+    float4* sw = reinterpret_cast<float4*>(s_w);
+    for (int i = lane; i < n4; i += 32) dsv41_cp_async16(&sx[i], &xg[i]);
+    dsv41_cp_commit();
+    for (int i = lane; i < n4; i += 32) dsv41_cp_async16(&sw[i], &wg[i]);
+    dsv41_cp_commit();
+    dsv41_cp_wait_all();
+    __syncwarp();
+    // hc_mixes_kernel's float4 three-accumulator chain, verbatim
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+    int c = lane;
+    for (; c + 64 < n4; c += 96) {
+        const float4 w0 = sw[c], w1 = sw[c + 32], w2 = sw[c + 64];
+        const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
+        a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+        a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+        a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+    }
+    for (; c < n4; c += 32) {
+        const float4 w = sw[c], v = sx[c];
+        a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+    }
+    for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += s_w[k] * s_x[k];
+    float acc = (a0 + a1) + a2;
+    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+    if (lane == 0) g_hc_part[r][m][0] = acc;
+}
+
+// Phase B: one block per token, 1024 threads. The sum of squares, the scale, the
+// sigmoid split, the sinkhorn and the comb write - all as hc_mixes_kernel does
+// them, with the walk over hc_dim striding by ss_stride (= mix*32) so the
+// per-lane partial sums group exactly as they did at blockDim 768.
+__global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
+                                     const float* __restrict__ hc_scale,
+                                     const float* __restrict__ hc_base, float* __restrict__ pre,
+                                     float* __restrict__ post, float* __restrict__ comb, int hc,
+                                     int dim, int sinkhorn_iters, float eps, int ss_stride) {
+    const int r = blockIdx.x;
+    const int mix = hc * (2 + hc);
+    const int hc_dim = hc * dim;
+    extern __shared__ float t_sm[];
+    float* mixes = t_sm;                // mix
+    float* cm = t_sm + 64;              // hc*hc
+    __shared__ float sss;
+    __shared__ float wpart[32];
+    const float* xr = x + (size_t)r * hc_dim;
+    float ss = 0.f;
+    for (int c = threadIdx.x; c < hc_dim; c += ss_stride) ss += xr[c] * xr[c];
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+    const int nwarp = ss_stride >> 5;
+    if ((threadIdx.x & 31) == 0 && (int)(threadIdx.x >> 5) < nwarp)
+        wpart[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        float v = (threadIdx.x < nwarp) ? wpart[threadIdx.x] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+        if (threadIdx.x == 0) sss = v;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sss / (float)hc_dim + eps);
+    for (int m = threadIdx.x; m < mix; m += blockDim.x) mixes[m] = g_hc_part[r][m][0] * inv;
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        cm[jk] = mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    {
+        const int hh = hc * hc;
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        if (warp == 0) {
+            float c = (lane < hh) ? cm[lane] : 0.f;
+            float mx = c;
+            for (int off = 1; off < hc; off <<= 1)
+                mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+            c = expf(c - mx);
+            float rs = c;
+            for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+            c = c / rs + eps;
+            for (int it = 0; it < sinkhorn_iters; ++it) {
+                if (it > 0) {
+                    float s = c;
+                    for (int off = 1; off < hc; off <<= 1)
+                        s += __shfl_xor_sync(0xFFFFFFFFu, s, off);
+                    c = c / (s + eps);
+                }
+                float t = c;
+                for (int off = hc; off < hh; off <<= 1)
+                    t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+                c = c / (t + eps);
+            }
+            if (lane < hh) cm[lane] = c;
+        }
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
+        comb[(size_t)r * hc * hc + jk] = cm[jk];
+}
+
+static const bool g_hc_front = [] {
+    const char* e = getenv("DSV41_HC_FRONT");
+    return e != nullptr && e[0] != '0';
+}();
+
+extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
+                              const float* hc_base, float* pre, float* post, float* comb, int rows,
+                              int hc, int dim, int sinkhorn_iters, float eps, cudaStream_t s) {
+    if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
+        pre == nullptr || post == nullptr || comb == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    if (!g_hc_front) return (int)cudaErrorInvalidValue;   // caller keeps the old path
+    if (rows > DSV41_HC_SPREAD_MAXR) return (int)cudaErrorInvalidValue;
+    const int mix = hc * (2 + hc);
+    const int hc_dim = hc * dim;
+    const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
+    static bool hc_attr = false;
+    if (!hc_attr) {
+        cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+        hc_attr = true;
+    }
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), 32, smem, s>>>(x, hc_fn, rows, hc_dim,
+                                                                             mix);
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
+        x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32);
+    return (int)cudaGetLastError();
+}

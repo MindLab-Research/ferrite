@@ -949,6 +949,56 @@ impl<'a> DevChain<'a> {
         }
     }
 
+    /// hc_mixes, with the fused spread front end in front of it. The fused kernel
+    /// answers InvalidValue when its gate is off or the row count is past the
+    /// spread tables, which is reported here as Ok(false) and the single-block
+    /// kernel then runs exactly as before, so both shapes are bit-identical and
+    /// the switch is free to make.
+    #[allow(clippy::too_many_arguments)]
+    fn hc_mixes_auto(
+        &mut self,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        pre_slot: usize,
+        hc: usize,
+        dim: usize,
+        sinkhorn_iters: i32,
+        eps: f32,
+    ) -> Result<()> {
+        let fused = self.dev.hc_front(
+            self.s.h.ptr as *const f32,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.premix_slot(pre_slot).ptr as *mut f32,
+            self.s.post.ptr as *mut f32,
+            self.s.comb.ptr as *mut f32,
+            1,
+            hc as i32,
+            dim as i32,
+            sinkhorn_iters,
+            eps,
+        )?;
+        if fused {
+            return Ok(());
+        }
+        self.dev.hc_mixes(
+            self.s.h.ptr as *const f32,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            self.premix_slot(pre_slot).ptr as *mut f32,
+            self.s.post.ptr as *mut f32,
+            self.s.comb.ptr as *mut f32,
+            1,
+            (hc * dim) as i32,
+            hc as i32,
+            sinkhorn_iters,
+            eps,
+        )
+    }
+
 
     fn dl(&self, src: *const f32, n: usize) -> Result<Vec<f32>> {
         let mut v = vec![0f32; n];
@@ -997,17 +1047,13 @@ fn fuse_b1() -> bool {
         let ld = &self.w.layers[layer];
 
         // ---------------- attention block ----------------
-        self.dev.hc_mixes(
-            self.s.h.ptr as *const f32,
+        self.hc_mixes_auto(
             ld.hc_attn_fn.as_ref().unwrap().as_f32(),
             ld.hc_attn_scale.as_ref().unwrap().as_f32(),
             ld.hc_attn_base.as_ref().unwrap().as_f32(),
-            self.premix_slot(1).ptr as *mut f32, // attn_pre
-            self.s.post.ptr as *mut f32,
-            self.s.comb.ptr as *mut f32,
-            1,
-            (hc * dim) as i32,
-            hc as i32,
+            1, // attn_pre
+            hc,
+            dim,
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
         )?;
@@ -1082,17 +1128,13 @@ fn fuse_b1() -> bool {
         }
         let _t_moe = std::time::Instant::now();
         // ---------------- FFN block ----------------
-        self.dev.hc_mixes(
-            self.s.h.ptr as *const f32,
+        self.hc_mixes_auto(
             ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
             ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
             ld.hc_ffn_base.as_ref().unwrap().as_f32(),
-            self.premix_slot(2).ptr as *mut f32, // ffn_pre -> next layer
-            self.s.post.ptr as *mut f32,
-            self.s.comb.ptr as *mut f32,
-            1,
-            (hc * dim) as i32,
-            hc as i32,
+            2, // ffn_pre -> next layer
+            hc,
+            dim,
             cfg.hc_sinkhorn_iters as i32,
             cfg.hc_eps,
         )?;

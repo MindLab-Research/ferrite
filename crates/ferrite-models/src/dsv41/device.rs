@@ -229,6 +229,14 @@ struct Kernels {
         *mut f32, *const f32, *const f32, *mut f32,
         c_int, c_int, c_int, f32, CuStream,
     ) -> c_int,
+    /// hc_mixes spread over one block per projection row with cp.async staging,
+    /// plus the sum-of-squares/sigmoid/sinkhorn tail in one trailing kernel.
+    /// Returns an error when DSV41_HC_FRONT is off, so the caller keeps hc_mixes.
+    hc_front: unsafe extern "C" fn(
+        *const f32, *const f32, *const f32, *const f32,
+        *mut f32, *mut f32, *mut f32,
+        c_int, c_int, c_int, c_int, f32, CuStream,
+    ) -> c_int,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -326,6 +334,7 @@ impl Device {
             hc_post: km!(rt, "ferrite_hc_post"),
             hc_post_inplace: km!(rt, "dsv41_hc_post_inplace"),
             hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
+            hc_front: km!(rt, "dsv41_hc_front"),
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
@@ -1551,6 +1560,52 @@ impl Device {
             (self.kernels.hc_collapse_norm)(x, pre, w, out, rows, hc, dim, eps, self.stream)
         };
         self.kerr(rc, "dsv41_hc_collapse_norm")
+    }
+
+    /// Fused, spread hc front end: the mixes dot products on one block per
+    /// projection row (cp.async staged) and the sum-of-squares / sigmoid /
+    /// sinkhorn tail in one trailing kernel. Returns Ok(false) and does nothing
+    /// when the gate is off, so the caller falls back to hc_mixes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_front(
+        &self,
+        x: *const f32,
+        hc_fn: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        pre: *mut f32,
+        post: *mut f32,
+        comb: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+    ) -> Result<bool> {
+        let rc = unsafe {
+            (self.kernels.hc_front)(
+                x,
+                hc_fn,
+                hc_scale,
+                hc_base,
+                pre,
+                post,
+                comb,
+                rows,
+                hc,
+                dim,
+                sinkhorn_iters,
+                eps,
+                self.stream,
+            )
+        };
+        // The kernel reports InvalidValue when the gate is off or the row count is
+        // beyond the spread tables; both mean "use hc_mixes instead", not an error.
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_hc_front")?;
+        Ok(true)
     }
 
     /// Embedding gather + hc expansion, straight onto the residual stream.
