@@ -5342,6 +5342,7 @@ sparse 侧；若确认 sparse 3 深是回归则 gate 回 2 深。
 - 现实目标 = **2 个 launch**（A 簇 = wq_a+wkv+idx_wp 1824 行；B 簇 = gate+sh w1/w3 960 行）
 - 真正省的 = idx_wp 那个 8-block 小 slot ≈ **−0.25~0.5ms**（不是 −1.0ms）
 - `gemv_bf16_fp8x2` 不建 LUT/a32（用 e4m3_to_f 位运算）——"每族各做一遍"的假设不成立，可省的只有 fp8 激活 staging 一遍
+  （**已修正 2026-09-11**：混合核的 fp8 族已补齐 LUT+a32，见文末"混合核 fp8 族补齐 LUT+a32"；此处结论仅对当时 tree 有效）
 - 设计文档在 `~/.xbot/users/web-4/workspace/dsv41-xn-megakernel-design.md`
 
 ### cross-layer-pipe 设计（报告已取回）
@@ -5613,3 +5614,34 @@ xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合�
 **两个行动项**（按优先级）：
 1. **零代码 A/B：DSV41_MIX_GATE=0**——回退路径里 gate 走 gemv_bf16 + shared 走 gemm_fp8_mx2（已带 LUT+a32）。预估 25µs vs 33µs = **关掉混合核可能反而更快**。
 2. **代码修复**：给混合核 fp8 分支补齐 LUT+a32+scale-staging+unroll（shared-mixed-lut 正在实施）→ 33→27-28µs = −0.2ms/步。
+
+### 混合核 fp8 族补齐 LUT+a32（2026-09-11，代码已改，**待编译+实测**）
+
+`gemv_bf16_fp8x2_kernel` 的 fp8 行路径从"e4m3_to_f 位运算 + 循环内 global scale 读"改为
+"LUT 解码 + a32 预解码"，与单族 `gemm_fp8_gemv_kernel` 的已验证形态对齐。
+
+**改动点**（`kernels/cuda/dsv41_kernels.cu`）：
+- kernel `:2107-2142`：在 `s_a` 之后新增 `s_lut[256]`（f32，一次/block）与 `s_af[k]`（f32，a32）；
+  LUT 构建 + a32 物化放在**两个族分支之外**，中间用 `__syncthreads()` 分隔——
+  barrier 必须被 block 内所有线程走到（原代码的 barrier 在 `if (vec==4)` 内，已提出）。
+- 消费循环 `:2176-2182`：`e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb)`
+  → `s_af[j] * (s_lut[row_s[j]] * sb)`；删掉了已无用的 `ap`。bf16 族未动。
+- launcher `:2207-2214`：`gsmem += 256*sizeof(float) + k*sizeof(float)`。
+
+**布局**（关键，混合核与单族不同）：`s_w[nwarps*k]` → `s_a[k]`（仅 mode 4）→ `s_lut[256]` → `s_af[k]`。
+新增表放在 `s_a` 之后，**完全不动** s_w 的 warp slice 偏移；`k` 是 16 的倍数（launcher 已断言）
+⇒ `s_lut` 基址天然 4 字节对齐。已用等价的 host 侧指针算术交叉核对：kernel 端所需总字节
+== launcher gsmem（k∈{1024,2304,4096,5120,7168} 全通过）。
+
+⚠️ **smem 余量**：默认形状（k=5120, warps=4, mode 4）gsmem = **47104 B < 49152 B（48KB）**，
+刚好仍在默认上限内（改前是 25600 B）。`DSV41_MIX_WARPS=8` 或 k 变大即越过 48KB →
+走已存在的 `cudaFuncSetAttribute(..., 232448)` 分支（sm_100 上限 227KB，安全）。
+
+⚠️ **数值一致性**：LUT 由**同一个** `e4m3_to_f` 生成；`s_af[j]` 就是循环里原先算的那个乘积
+（`s_lut[ap[j]] * a_scale[j>>5]`），只是提前算并落 smem —— f32 乘积单次舍入，存回再读逐位不变；
+外层 `acc += t*u` 仍是 fma(t,u,acc)，t/u 的位模式未变 ⇒ **逐位一致**（与单族的论证同源）。
+
+**验证状态**：`cargo check -p ferrite-models` ✓（Rust 侧无签名变化）；本机无 nvcc / 无 GPU
+⇒ `.cu` 未编译、未实测。落地前必须 `kernels/cuda/build.sh` 重建 `.so`（build_id 会变化，
+Rust 侧强制同源）并在 b300 上跑真实权重一致性 + nsys 差值。
+
