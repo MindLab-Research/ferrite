@@ -132,8 +132,8 @@ pub fn dspark_attention(
 pub fn forward_embed(
     cfg: &Dsv41Config,
     main_hidden: &[f32], // [1, target_layers * dim]
-    input_ids: u32,
-    embed_row: &[f32],  // [dim] the embedding of `input_ids`
+    _input_ids: u32,
+    embed_row: &[f32],  // [dim] the embedding of the drafted token
     w: &DraftHostWeights,
 ) -> (Vec<f32>, Vec<f32>) {
     let bs = cfg.dspark_block_size;

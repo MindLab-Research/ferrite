@@ -29,7 +29,7 @@
 //! the matmuls on tensor cores over that native format — see
 //! [`crate::kernels`] for the ABI and the performance contract.
 
-use crate::config::{Dsv41Config, KvMode};
+use crate::config::Dsv41Config;
 use crate::ops;
 
 /// Where a per-layer tensor lives. The device buffers are opaque here so the

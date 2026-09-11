@@ -29,7 +29,7 @@
 
 use std::ffi::c_void;
 
-use ferrite_types::{FerriteError, Result};
+use ferrite_types::Result;
 
 use std::sync::Arc;
 
@@ -37,7 +37,6 @@ use crate::config::{Dsv41Config, KvMode};
 use crate::tp::Collective;
 use crate::device::{DevBuf, Device};
 use crate::load::{Dsv41DevWeights, LayerDev};
-use crate::ops;
 
 /// Runtime switches for isolating a stage during bring-up.
 #[derive(Debug, Clone, Default)]
@@ -83,6 +82,9 @@ struct Scratch {
     xn: DevBuf,    // [dim]
     xq: DevBuf,    // [dim] fp8 e4m3
     xsc: DevBuf,   // [dim/32 + 8] f32 scales
+    /// MoE scatter destination (written by the dispatch kernels; the host never
+    /// reads it back, which is why rustc flags it).
+    #[allow(dead_code)]
     pre: DevBuf,   // [hc]
     post: DevBuf,  // [hc]
     comb: DevBuf,  // [hc*hc]
@@ -111,7 +113,6 @@ struct Scratch {
     idx_q: DevBuf,     // [index_n_heads * index_head_dim]
     idx_k: DevBuf,     // [index_head_dim]
     idx_w: DevBuf,     // [index_n_heads]
-    idx_lens: DevBuf,  // [1] i32
     // bf16 staging for the cuBLAS path
     bf16: DevBuf,
     // hc premix coefficients, kept DEVICE-resident and rotated between layers.
@@ -344,7 +345,6 @@ impl<'a> DevChain<'a> {
             idx_q: dev.alloc(fb(cfg.index_n_heads.max(1) * cfg.index_head_dim.max(1)))?,
             idx_k: dev.alloc(fb(cfg.index_head_dim.max(1)))?,
             idx_w: dev.alloc(fb(cfg.index_n_heads.max(1)))?,
-            idx_lens: dev.alloc(4)?,
             bf16,
             pre_a: dev.alloc(fb(hc).max(8))?,
             pre_b: dev.alloc(fb(hc).max(8))?,
@@ -511,6 +511,7 @@ impl<'a> DevChain<'a> {
     /// against the key, and add it to every copy.
     fn engram_apply(&mut self, layer: usize, li: usize) -> Result<()> {
         let cfg = self.cfg;
+        let rank = self.rank();
         let (dim, hc, ehd) = (cfg.dim, cfg.hc_mult, cfg.engram_head_dim);
         let n_cols = cfg.engram_max_ngram_size.saturating_sub(1) * cfg.engram_n_heads;
         let (table, tsc, wkv, wsc, qw, kw) = {
@@ -532,7 +533,6 @@ impl<'a> DevChain<'a> {
         // This rank's slice of the row-parallel table: convert.py shards
         // `ceil(rows / world)` rows and zero-pads the tail.
         let world = self.world().max(1);
-        let rank = self.rank();
         let global_rows = cfg.engram_num_embeddings.get(li).copied().unwrap_or(0) as usize;
         let per = global_rows.div_ceil(world);
         let ids = (self.s.eng_ids.ptr as *const i64).wrapping_add(li * n_cols);
@@ -779,7 +779,6 @@ impl<'a> DevChain<'a> {
                 }
             }
         }
-        let t_step = std::time::Instant::now();
         let mut t_attn = std::time::Duration::ZERO;
         let mut t_moe = std::time::Duration::ZERO;
         for layer in 0..cfg.n_layers {
@@ -872,12 +871,15 @@ impl<'a> DevChain<'a> {
         Ok(v)
     }
 
+    /// Host-upload helper (kept: the prefill and probe paths use this family).
+    #[allow(dead_code)]
     fn ul_i32(&self, dst: *mut c_void, v: &[i32]) -> Result<()> {
         self.dev.upload_f32_at(dst, 0, unsafe {
             std::slice::from_raw_parts(v.as_ptr() as *const f32, v.len())
         })
     }
 
+    #[allow(dead_code)]
     fn ul_f32(&self, dst: *mut c_void, v: &[f32]) -> Result<()> {
         self.dev.upload_f32_at(dst, 0, v)
     }
@@ -1083,7 +1085,6 @@ impl<'a> DevChain<'a> {
         let nh = cfg.n_heads;
         let ql = cfg.q_lora_rank;
         let world = self.world();
-        let rank = self.rank();
         // wq_b is ColumnParallel: this rank owns a contiguous block of heads
         let nlh = nh / world;
         let ld = &self.w.layers[layer];
@@ -1173,7 +1174,6 @@ impl<'a> DevChain<'a> {
             eprintln!("[mine] L0 kv[0..4]={:?} kv_rms={}", &kv[..4], r);
         }
         let win = cfg.window_size;
-        let slot = pos % win;
         // raw pointers rather than a live borrow: `compress` below needs
         // &mut self (it updates this layer's published count and buffers)
         // The release shares one KV store across a group of layers: the kv
@@ -1251,7 +1251,6 @@ impl<'a> DevChain<'a> {
         // access in sparse_attn.
         self.dev
             .window_idxs(idxs_ptr as *mut i32, self.s.pos_ctr.ptr as *const i32, win as i32)?;
-        let mut take_comp = comp_len.min(cfg.index_topk);
         if comp_len > 0 && cfg.is_index_source(layer) {
             // EVERY index-source layer runs its own indexer (into its own
             // buffer) — the reference creates one for each, and non-source
@@ -1259,15 +1258,12 @@ impl<'a> DevChain<'a> {
             // kv-source published. Only the KEY PUBLISHING is the source's job.
             if self.indexer(layer, pos, win, comp_len)? {
             // the kernel wrote `comp_len.min(index_topk)` entries at [win, ..)
-            take_comp = comp_len.min(cfg.index_topk);
             }
         } else if !owns_kv && comp_len > 0 {
             // a non-index consumer reads the owner's selection, which the owner
             // (an index-source) filled earlier this step — do nothing
         } else if comp_len > 0 {
             // the owner has no indexer: recency placeholder (safety net)
-            let placeholder = comp_len.min(cfg.index_topk);
-            take_comp = placeholder;
             self.dev.comp_placeholder(
                 idxs_ptr as *mut i32,
                 (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
@@ -1275,7 +1271,6 @@ impl<'a> DevChain<'a> {
                 cfg.index_topk as i32,
             )?;
         }
-        let n_idx_cols = win + take_comp;
 
         self.dev.sparse_attn(
             self.s.q.as_f32(),
@@ -1375,7 +1370,7 @@ impl<'a> DevChain<'a> {
     /// let the kernel write the top-k straight into the selection buffer at
     /// `offset` (`window`, so it lands after the window block).
     /// Returns false when there was nothing to select from.
-    fn indexer(&mut self, layer: usize, pos: usize, offset: usize, comp_len: usize) -> Result<bool> {
+    fn indexer(&mut self, layer: usize, _pos: usize, offset: usize, comp_len: usize) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let ql = cfg.q_lora_rank;
@@ -1488,7 +1483,7 @@ impl<'a> DevChain<'a> {
             self.layers[key_owner].index_k.as_f32(),
             self.s.idx_w.as_f32(),
             std::ptr::null(),
-            self.s.idx_lens.as_i32(),
+            idx_lens_ptr,
             // the kernel writes `picked + offset` into out[row*cols + i], so
             // `out` points at the first compressed slot of the row
             (self.layers[layer].idxs.ptr as *mut i32).wrapping_add(offset),
@@ -1638,7 +1633,7 @@ impl<'a> DevChain<'a> {
         // cudaMemcpy calls (download_f32 uses the synchronous memcpy), i.e. a
         // per-layer host stall; they are gone, and the launch arguments no longer
         // depend on the routing (which is what a CUDA graph needs).
-        let (mut idx, mut wgt) = (Vec::<i32>::new(), Vec::<f32>::new());
+        let (idx, wgt) = (Vec::<i32>::new(), Vec::<f32>::new());
 
         // One token: every assignment shares the input row, so expert e's total
         // contribution is expert_e(x) * sum of its routing weights. Accumulating
@@ -1654,7 +1649,7 @@ impl<'a> DevChain<'a> {
         // routing id indexes it directly (with the EP scheme it had to be
         // rebased by rank*ne).
         let ne = ld.experts.len();
-        let mut wsum = vec![0f32; ne.max(1)];
+        let wsum = vec![0f32; ne.max(1)];
         if std::env::var("DSV41_MOEDBG").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[mine] route idx={:?} wgt={:?}", &idx, &wgt);
         }

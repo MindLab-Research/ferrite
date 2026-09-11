@@ -328,7 +328,6 @@ impl Collective {
 
     fn all_reduce_inplace_inner(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
         self.publish(buf as *const std::ffi::c_void, len)?;
-        let slot0 = (self.staging.ptr as *mut u8);
         let n = (len / 4) as i64;
         let slot_f = (self.bytes / 4) as i64;
         let round = self.round.load(AtOrd::Acquire);
@@ -340,7 +339,7 @@ impl Collective {
             self.staging.ptr as *const u8
         };
         let stamps = (self.staging.ptr as *const u8).wrapping_add(self.stamps_at) as *const c_uint;
-        let ctr2 = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
+        let _ctr2_unused = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
         // In the device-side path the reduce writes STRAIGHT into the caller's
         // buffer: keeping dst inside the staging half meant the copy-back below
         // read the half the reduce had just been writing, and any ordering slip

@@ -306,7 +306,7 @@ pub fn direct_preload_shard(
                     .chunks_exact(4)
                     .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
                     .collect();
-                let scols_full = cols.div_ceil(128);
+                let _scols_full = cols.div_ceil(128);
                 // fp8 weights: register the SHARD-CORRECT fp8 bypass (same
                 // numerical path as the legacy loader: fp8 GEMV W8A16) AND
                 // dequant to bf16 (dev_weight_bf16 fallback). The legacy path

@@ -516,7 +516,9 @@ enum RankCmd {
     /// (the KV ring is per-sequence); the reply is the first generated token.
     Prefill(Vec<u32>),
     /// One steady-state decode step (zero H2D — the token already sits in the
-    /// device's `ids` buffer).
+    /// device's `ids` buffer). Kept as the un-batched fallback; the pool uses the
+    /// batched `DecodeRun` below.
+    #[allow(dead_code)]
     Decode { token: u32, pos: usize },
     /// `n` steady-state decode steps in ONE command. The rank threads are already
     /// lockstep by construction (they run the same loop), so the per-token
@@ -646,11 +648,6 @@ impl TpRankPool {
     /// Broadcast one command, then collect EVERY rank's reply. Rank 0's token is
     /// the answer; any rank's error fails the step (a broken rank means a broken
     /// lockstep engine — the adapter poisons the pool on Err).
-    /// One round trip for `n` decode steps (see `RankCmd::DecodeRun`).
-    fn decode_run(&mut self, token: u32, pos: usize, n: usize) -> Result<Vec<u32>> {
-        self.broadcast(RankCmd::DecodeRun { token, pos, n })
-    }
-
     fn broadcast(&mut self, cmd: RankCmd) -> Result<Vec<u32>> {
         for (r, tx) in self.cmd.iter().enumerate() {
             tx.send(cmd.clone()).map_err(|_| {

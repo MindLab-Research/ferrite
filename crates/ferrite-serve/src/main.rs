@@ -418,7 +418,7 @@ fn run_cuda(
                 if let Some(&last_new) = new_tokens.last() {
                     if stop.contains(&last_new) {
                         out.extend_from_slice(&new_tokens[..new_tokens.len() - 1]);
-                        prev_rt_len = rt.tokens.len();
+                        // (the loop breaks here, so advancing prev_rt_len would be dead)
                         break;
                     }
                 }

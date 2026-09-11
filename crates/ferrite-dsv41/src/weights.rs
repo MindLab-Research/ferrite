@@ -385,7 +385,7 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
 
 /// Whether a spec's first dimension is the one that shrinks under sharding,
 /// and by how much (rows/experts/vocab/engram).
-pub fn shard_factor(cfg: &Dsv41Config, spec: &TensorSpec, world: usize) -> (usize, usize) {
+pub fn shard_factor(_cfg: &Dsv41Config, spec: &TensorSpec, world: usize) -> (usize, usize) {
     match spec.shard {
         Shard::Replicated => (1, 1),
         Shard::Rows => {

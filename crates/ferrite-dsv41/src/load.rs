@@ -20,7 +20,7 @@ use ferrite_types::{FerriteError, Result};
 
 use crate::config::Dsv41Config;
 use crate::device::{DevBuf, Device};
-use crate::weights::{local_shape, padded_inter, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
+use crate::weights::{local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
 
 /// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
 /// Everything else that arrives as bf16 is widened to f32 on the way in —
@@ -36,6 +36,8 @@ const KEEP_BF16: &[&str] = &[
     "attn.indexer.weights_proj.weight",
 ];
 
+/// Byte-level bf16 widening (the loader's other call paths use it).
+#[allow(dead_code)]
 fn bf16_to_f32_bytes(b: &[u8]) -> Vec<u8> {
     let n = b.len() / 2;
     let mut out = Vec::with_capacity(n * 4);
@@ -640,7 +642,7 @@ impl<'a> Loader<'a> {
     pub fn load(&mut self, cfg: &Dsv41Config, world: usize, rank: usize) -> Result<Dsv41DevWeights> {
         let specs = tensor_specs(cfg, world);
         // expert ownership: the rank keeps n_routed/world consecutive experts
-        let expert_lo = |n: usize| (rank * (n / world), n / world);
+        let _expert_lo = |n: usize| (rank * (n / world), n / world);
         let mut w = Dsv41DevWeights {
             layers: (0..cfg.n_layers).map(|_| LayerDev::default()).collect(),
             mtp: (0..cfg.n_mtp_layers).map(|_| LayerDev::default()).collect(),
@@ -667,7 +669,7 @@ impl<'a> Loader<'a> {
             let p = format!("layers.{l}");
             let p = p.as_str();
             let mut ld = LayerDev::default();
-            let mut take = |ld: &mut LayerDev, key: &str, dst: fn(&mut LayerDev) -> &mut Option<DevTensor>| -> Result<()> {
+            let take = |ld: &mut LayerDev, key: &str, dst: fn(&mut LayerDev) -> &mut Option<DevTensor>| -> Result<()> {
                 if let Some(s) = want(&format!("{p}.{key}")) {
                     *dst(ld) = Some(self.load_tensor(&s, world, rank)?);
                 }
