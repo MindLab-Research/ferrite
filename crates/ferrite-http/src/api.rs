@@ -36,7 +36,7 @@ use tokio_stream::StreamExt;
 use crate::driver::EngineHandle;
 use crate::engine::{FinishReason, ReqEvent, Usage};
 use crate::sse::{ChatChunk, ChatCompletionResponse, UsageDto};
-use crate::tokenizer::{render_chat_template, ChatMessage, ChatTokenizer};
+use crate::tokenizer::{ChatFrame, ChatMessage, ChatTokenizer, GlmFrame};
 
 /// Shared handler state (cheap clones: Arc + channel sender).
 #[derive(Clone)]
@@ -53,6 +53,16 @@ impl AppState {
         let n = self.req_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         format!("chatcmpl-{:016x}", n)
     }
+}
+
+/// Router state: the engine handle/tokenizer (shared by every model) PLUS the
+/// checkpoint's chat frame — the one piece of the OpenAI surface that is
+/// model-specific (see `router_with`). Kept out of `AppState` so the shared
+/// engine wiring stays model-agnostic.
+#[derive(Clone)]
+struct RouterState {
+    state: AppState,
+    frame: Arc<dyn ChatFrame>,
 }
 
 /// OpenAI-compatible request (the subset we honor; unknown fields are
@@ -89,22 +99,22 @@ fn default_max_tokens() -> Option<usize> {
 
 /// `POST /v1/chat/completions`.
 pub async fn chat_completions(
-    State(state): State<AppState>,
+    State(st): State<RouterState>,
     Json(req): Json<ChatRequest>,
 ) -> axum::response::Response {
+    let RouterState { state, frame } = st;
     if req.messages.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "messages must be non-empty");
     }
-    // Render + encode (chat template → token ids — the radix-visible form:
-    // shared system prompts across requests are exactly what the prefix
-    // cache is for).
+    // Render + encode (the checkpoint's chat frame → token ids — the
+    // radix-visible form: shared system prompts across requests are exactly
+    // what the prefix cache is for).
     let messages: Vec<ChatMessage> = req
         .messages
         .iter()
         .map(|m| ChatMessage { role: m.role.clone(), content: m.content.clone() })
         .collect();
-    let rendered = render_chat_template(&messages);
-    let prompt_ids = match state.tok.encode(&rendered) {
+    let prompt_ids = match frame.encode_chat(&messages, &state.tok) {
         Ok(ids) => ids,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
@@ -259,11 +269,11 @@ pub async fn chat_completions(
 /// the closure is the API).
 
 /// GET /v1/models — the single served model (OpenAI list shape).
-async fn models(State(state): State<AppState>) -> impl IntoResponse {
+async fn models(State(st): State<RouterState>) -> impl IntoResponse {
     Json(serde_json::json!({
         "object": "list",
         "data": [{
-            "id": state.model_name,
+            "id": st.state.model_name,
             "object": "model",
             "created": 0,
             "owned_by": "ferrite",
@@ -272,8 +282,8 @@ async fn models(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /health — liveness + a stats snapshot.
-async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let s = state.handle.stats();
+async fn health(State(st): State<RouterState>) -> impl IntoResponse {
+    let s = st.state.handle.stats();
     Json(serde_json::json!({
         "status": "ok",
         "engine": { "ticks": s.ticks, "tokens_committed": s.tokens_committed },
@@ -281,8 +291,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// GET /v1/stats — the full telemetry (radix + hicache census).
-async fn stats(State(state): State<AppState>) -> impl IntoResponse {
-    let s = state.handle.stats();
+async fn stats(State(st): State<RouterState>) -> impl IntoResponse {
+    let s = st.state.handle.stats();
     Json(serde_json::json!({
         "engine": {
             "ticks": s.ticks,
@@ -332,15 +342,23 @@ async fn shutdown() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "shutting_down" }))
 }
 
-/// Build the router (main.rs binds the listener).
+/// Build the router (main.rs binds the listener) — the GLM frame, the shared
+/// stack's default.
 pub fn router(state: AppState) -> Router {
+    router_with(state, Arc::new(GlmFrame))
+}
+
+/// Build the router with a model-specific chat frame: identical endpoints,
+/// driver, SSE and stats; only the prompt layout differs. A non-GLM checkpoint
+/// supplies its frame here instead of forking the HTTP layer (see `ChatFrame`).
+pub fn router_with(state: AppState, frame: Arc<dyn ChatFrame>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/models", get(models))
         .route("/health", get(health))
         .route("/v1/stats", get(stats))
         .route("/shutdown", post(shutdown))
-        .with_state(state)
+        .with_state(RouterState { state, frame })
 }
 
 // ---------------------------------------------------------------------------

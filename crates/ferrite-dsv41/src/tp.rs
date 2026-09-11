@@ -421,7 +421,13 @@ pub static AR_BAR_CALLS: AtomicU64 = AtomicU64::new(0);
 /// per-call hot path, and a per-call getenv is a hot-path slip.
 static AR_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 fn ar_v5() -> bool {
-    *AR_V5.get_or_init(|| std::env::var("DSV41_AR_V5").map(|v| v != "0").unwrap_or(false))
+    *AR_V5.get_or_init(|| {
+        // the whole-step CUDA graph REQUIRES the device-side AR: a host barrier is
+        // not a CUDA call, so it would not be recorded and the replayed graph
+        // would silently lose the inter-rank synchronisation.
+        let graph = std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true);
+        graph || std::env::var("DSV41_AR_V5").map(|v| v != "0").unwrap_or(false)
+    })
 }
 
 /// Shared state a rank thread needs from its siblings.

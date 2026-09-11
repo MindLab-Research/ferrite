@@ -96,6 +96,10 @@ struct Scratch {
     /// The device position counter: the argmax (the step's last kernel)
     /// advances it, so every kernel during the step reads a stable current pos.
     pos_ctr: DevBuf, // [1] i32
+    /// Per-layer compressed-KV counters, advanced by the compressor's commit
+    /// kernel on the device (the host used to track compress_len and download
+    /// `out_rows` to decide). Consumers read this instead of a launch argument.
+    clen: DevBuf, // [n_layers] i32
     // MoE
     scores: DevBuf,    // [n_experts] f32
     route_idx: DevBuf, // [topk] i32
@@ -228,6 +232,8 @@ pub struct DevChain<'a> {
     moe_graph_captures: u32,
     moe_graph_replays: u32,
     /// n-gram hash state (host side; the token cache spans prefill + decode)
+    /// The whole-step CUDA graph (built on the second step; see step_impl).
+    step_graph: Option<*mut std::ffi::c_void>,
     /// Device-side engram hash state (built lazily on the first step).
     eng_dev: Option<EngDev>,
     ngram: Option<crate::engram::NgramHashState>,
@@ -323,6 +329,7 @@ impl<'a> DevChain<'a> {
             logits: dev.alloc(fb(cfg.vocab_size))?,
             ids: dev.alloc(4)?,
             pos_ctr: dev.alloc(4)?,
+            clen: dev.alloc(cfg.n_layers * 4)?,
             scores: dev.alloc(fb(n_exp))?,
             route_idx: dev.alloc(fb(topk).max(4))?,
             route_w: dev.alloc(fb(topk).max(4))?,
@@ -398,6 +405,7 @@ impl<'a> DevChain<'a> {
             step_count: 0,
             moe_graph_captures: 0,
             moe_graph_replays: 0,
+            step_graph: None,
             eng_dev: None,
             ngram,
             eng_layout,
@@ -414,6 +422,7 @@ impl<'a> DevChain<'a> {
             self.dev.upload_f32_at(self.s.premix_const.ptr, 0, &pm)?;
         }
         self.dev.zero_at(self.s.pos_ctr.ptr, 4)?;
+        self.dev.zero_at(self.s.clen.ptr, self.cfg.n_layers * 4)?;
         if let Some(e) = self.eng_dev.as_ref() {
             self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?;
         }
@@ -594,7 +603,64 @@ impl<'a> DevChain<'a> {
         self.step_impl(token, pos)
     }
 
+    /// The whole decode step as ONE CUDA graph (DSV41_GRAPH_STEP=1, the default):
+    /// every per-step value now lives on the DEVICE - the position counter, the
+    /// per-layer latent counters, the all-reduce epoch - so no launch argument
+    /// changes from token to token and the capture is legal. The capture happens
+    /// on the second step: the first warms every kernel, builds the lazy device
+    /// state and sizes cublas' workspaces, all of which are illegal inside a
+    /// capture. Capturing records WITHOUT executing, so the graph is launched
+    /// straight afterwards to do this step's real work.
     fn step_impl(&mut self, token: u32, pos: usize) -> Result<u32> {
+        let cfg = self.cfg;
+        static GRAPH_STEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let want = *GRAPH_STEP.get_or_init(|| {
+            // Things that must be OFF for a whole-step capture, each because it
+            // makes a host round trip inside the recorded region:
+            //   DSV41_ENG_HOST  - the host n-gram hash uploads the ids per step
+            //   DSV41_STATS     - the per-layer probes download tensors
+            // And one thing that must be ON: the all-reduce has to be the DEVICE
+            // side AR v5, because a host barrier is not a CUDA call - it would not
+            // be recorded, and the replayed graph would lose the inter-rank sync.
+            // ar_v5() therefore also turns on with the graph (see tp.rs).
+            let host_hash = std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false);
+            let probes = std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false);
+            !host_hash && !probes && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true)
+        });
+        if want && self.step_count >= 1 {
+            if let Some(e) = self.step_graph {
+                self.dev.graph_launch(e)?;
+            } else {
+                self.dev.capture_begin()?;
+                self.step_body(token, pos)?;
+                let g = self.dev.capture_end()?;
+                let e = self.dev.graph_instantiate(g)?;
+                self.dev.graph_free(g, std::ptr::null_mut())?;
+                self.dev.graph_launch(e)?; // the capture did not execute
+                self.step_graph = Some(e);
+            }
+        } else {
+            self.step_body(token, pos)?;
+        }
+        self.step_count = self.step_count.wrapping_add(1);
+        // the ONLY host read on the decode path: 4 bytes for EOS and printing
+        self.dev.sync()?;
+        let tok = self.dev.download_u32(self.s.ids.ptr)?;
+        if std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false) {
+            let mut lg = vec![0f32; cfg.vocab_size];
+            let b = Device::view(self.s.logits.ptr, cfg.vocab_size * 4);
+            self.dev.download_f32(&b, &mut lg)?;
+            let mut top: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[top5] n={} top={:?}", lg.len(), &top[..5.min(top.len())]);
+        }
+        Ok(tok)
+    }
+
+    /// The step's kernels with NO host round trip in between: embedding through
+    /// the argmax (which is also what advances the position counter). This is the
+    /// region a graph captures; everything host-side lives in step_impl.
+    fn step_body(&mut self, token: u32, pos: usize) -> Result<()> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
@@ -676,13 +742,6 @@ impl<'a> DevChain<'a> {
                 }
             }
         }
-        // Arm the MoE-segment graphs from the second step: the first one warms
-        // every kernel, and only then is capture safe.
-        self.moe_graph_armed = std::env::var("DSV41_GRAPH_MOE")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-            && self.step_count >= 1;
-        self.step_count = self.step_count.wrapping_add(1);
         let t_step = std::time::Instant::now();
         let mut t_attn = std::time::Duration::ZERO;
         let mut t_moe = std::time::Duration::ZERO;
@@ -746,17 +805,7 @@ impl<'a> DevChain<'a> {
             cfg.vocab_size as i32,
             self.s.pos_ctr.ptr as *mut std::ffi::c_int,
         )?;
-        if std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false) {
-            let mut lg = vec![0f32; cfg.vocab_size];
-            let b = Device::view(self.s.logits.ptr, cfg.vocab_size * 4);
-            self.dev.download_f32(&b, &mut lg)?;
-            let mut top: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
-            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!("[top5] n={} top={:?}", lg.len(), &top[..5.min(top.len())]);
-        }
-        // the ONLY host read on the decode path: 4 bytes for EOS and printing
-        self.dev.sync()?;
-        Ok(self.dev.download_u32(self.s.ids.ptr)?)
+        Ok(())
     }
 
     /// Tensor-parallel degree / this rank's index (1 / 0 without a collective).
@@ -1064,7 +1113,7 @@ impl<'a> DevChain<'a> {
             hd as i32,
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
-            pos as i32,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
             0,
             false,
         )?;
@@ -1099,7 +1148,7 @@ impl<'a> DevChain<'a> {
             hd as i32,
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
-            pos as i32,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
             1,
             false,
         )?;
@@ -1202,9 +1251,9 @@ impl<'a> DevChain<'a> {
             take_comp = placeholder;
             self.dev.comp_placeholder(
                 idxs_ptr as *mut i32,
-                comp_len as i32,
+                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
                 win as i32,
-                placeholder as i32,
+                cfg.index_topk as i32,
             )?;
         }
         let n_idx_cols = win + take_comp;
@@ -1219,8 +1268,9 @@ impl<'a> DevChain<'a> {
             1,
             nlh as i32,
             hd as i32,
-            (win + comp_len) as i32,
-            n_idx_cols.max(1) as i32,
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+            win as i32,
+            cfg.index_topk as i32,
             1.0 / (hd as f32).sqrt(),
         )?;
         self.dev.apply_rope(
@@ -1231,7 +1281,7 @@ impl<'a> DevChain<'a> {
             hd as i32,
             cfg.rope_head_dim as i32,
             (cfg.rope_head_dim / 2) as i32,
-            pos as i32,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
             0,
             true,
         )?;
@@ -1357,7 +1407,9 @@ impl<'a> DevChain<'a> {
             idx_hd as i32,
             rd as i32,
             (rd / 2) as i32,
-            (group * ratio) as i32,
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer),
+            ratio as i32,
+            -(ratio as i32),
             1,
             false,
         )?;
@@ -1384,7 +1436,7 @@ impl<'a> DevChain<'a> {
             idx_hd as i32,
             rd as i32,
             (rd / 2) as i32,
-            pos as i32,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
             0,
             false,
         )?;
@@ -1398,10 +1450,9 @@ impl<'a> DevChain<'a> {
             idx_nh as i32,
             self.s.idx_w.ptr as *mut f32,
         )?;
-        let lens = [comp_len as i32];
-        self.dev.upload_f32_at(self.s.idx_lens.ptr, 0, unsafe {
-            std::slice::from_raw_parts(lens.as_ptr() as *const f32, 1)
-        })?;
+        // No upload: the indexer reads the length straight from the device
+        // counter the compressor's commit kernel maintains (this was the last
+        // per-step H2D inside the attention path).
         // The INDEXER's scale uses index_head_dim (128), not the attention head_dim
         // (512): the reference sets `self.softmax_scale = index_head_dim**-0.5`
         // for the Indexer and folds `n_heads**-0.5` in with the per-head weights.
@@ -1411,6 +1462,8 @@ impl<'a> DevChain<'a> {
         // keys live on the KV OWNER's buffer (the source layer that published
         // them); a non-source index layer's own index_k is empty
         let key_owner = self.kv_owner(layer);
+        let idx_lens_ptr =
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(key_owner);
         self.dev.indexer_topk(
             self.s.idx_q.as_f32(),
             self.layers[key_owner].index_k.as_f32(),
@@ -1467,45 +1520,29 @@ impl<'a> DevChain<'a> {
             hd as i32,
             ratio as i32,
             pos as i32,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
             cfg.norm_eps,
         )?;
-        // the kernel reports on the device whether a latent came out this step
-        let mut n = [0i32; 1];
-        let b = Device::view(cache.out_rows.ptr, 4);
-        self.dev.download_f32(&b, unsafe {
-            std::slice::from_raw_parts_mut(n.as_mut_ptr() as *mut f32, 1)
-        })?;
-        let mut len = self.layers[layer].compress_len;
-        if n[0] > 0 {
-            // RoPE the latent at the group's FIRST token position, using the
-            // COMPRESSOR's rope table (compress_rope_theta, not the main one).
-            // The reference (model.py:755-758) does exactly this before storing
-            // into the compress_kv_cache — without it the compressed rows carry
-            // no positional encoding and the attention dot products are wrong.
-            let group_first = len * ratio;
-            self.dev.apply_rope(
-                self.layers[layer].latent.ptr as *mut f32,
-                self.cos_comp.as_f32(),
-                self.sin_comp.as_f32(),
-                1,
-                hd as i32,
-                cfg.rope_head_dim as i32,
-                (cfg.rope_head_dim / 2) as i32,
-                group_first as i32,
-                0,
-                false,
-            )?;
-            let dst = (self.layers[layer].ring.ptr as *mut u8)
-                .wrapping_add((self.cfg.window_size + len) * hd * 4);
-            self.dev.memcpy_d2d(
-                dst as *mut c_void,
-                self.layers[layer].latent.ptr as *const c_void,
-                hd * 4,
-            )?;
-            len += 1;
-            self.layers[layer].compress_len = len;
-        }
-        Ok(len)
+        // FUSED COMMIT (device-side): reads out_rows on the device, ropes the
+        // latent, stores it into the ring and advances this layer's device
+        // counter. The old form downloaded out_rows (a sync D2H per layer per
+        // step), branched on the host, roped, copied and bumped a host counter -
+        // all impossible to capture in a graph.
+        self.dev.compress_commit(
+            cache.latent.as_f32(),
+            self.cos_comp.as_f32(),
+            self.sin_comp.as_f32(),
+            cache.ring.ptr as *mut f32,
+            cache.out_rows.ptr as *const std::os::raw::c_int,
+            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+            hd as i32,
+            cfg.rope_head_dim as i32,
+            (cfg.rope_head_dim / 2) as i32,
+            cfg.window_size as i32,
+            ratio as i32,
+        )?;
+        // the host no longer tracks the count; consumers read the device counter
+        Ok(0)
     }
 
     /// The layer whose KV store `layer` reads: itself, unless it is a consumer

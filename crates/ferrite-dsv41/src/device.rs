@@ -115,7 +115,7 @@ struct Kernels {
     ) -> c_int,
     sparse_attn: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const i32, *mut f32,
-        c_int, c_int, c_int, c_int, c_int, c_int, f32, CuStream,
+        c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32, CuStream,
     ) -> c_int,
     indexer_topk: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
@@ -133,8 +133,8 @@ struct Kernels {
         *mut f32, *mut f32, c_int, c_int, c_int, f32, f32, f32, f32, CuStream,
     ) -> c_int,
     apply_rope: unsafe extern "C" fn(
-        *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int, c_int, c_int, c_int,
-        CuStream,
+        *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int, *const c_int, c_int, c_int,
+        c_int, c_int, CuStream,
     ) -> c_int,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
@@ -177,7 +177,23 @@ struct Kernels {
     >,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     comp_placeholder:
-        Option<unsafe extern "C" fn(*mut i32, c_int, c_int, c_int, CuStream) -> c_int>,
+        Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
+    compress_commit: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *const c_int,
+            *mut c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     engram_hash_step: Option<
         unsafe extern "C" fn(
             *const i64,
@@ -213,7 +229,7 @@ struct Kernels {
         unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *const c_uint, c_uint, CuStream) -> c_int,
     >,
     compressor_pool: Option<
-        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut c_int, c_int, c_int, c_int, c_int, c_int, f32, CuStream) -> c_int,
+        unsafe extern "C" fn(*const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32, *mut c_int, c_int, c_int, c_int, c_int, c_int, *const c_int, f32, CuStream) -> c_int,
     >,
     route_topk: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream) -> c_int,
@@ -439,6 +455,7 @@ impl Device {
                 engram_hash_step: sym(h_k, "dsv41_engram_hash_step").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 window_idxs: sym(h_k, "dsv41_window_idxs").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 comp_placeholder: sym(h_k, "dsv41_comp_placeholder").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                compress_commit: sym(h_k, "dsv41_compress_commit").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1053,12 +1070,15 @@ impl Device {
         m: i32,
         h: i32,
         d: i32,
-        n: i32,
-        topk: i32,
+        clen: *const c_int,
+        window: i32,
+        index_topk: i32,
         scale: f32,
     ) -> Result<()> {
         let rc = unsafe {
-            (self.kernels.sparse_attn)(q, kv, sink, idxs, out, b, m, h, d, n, topk, scale, self.stream)
+            (self.kernels.sparse_attn)(
+                q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, self.stream,
+            )
         };
         self.kerr(rc, "dsv41_sparse_attn")
     }
@@ -1173,13 +1193,16 @@ impl Device {
         row_len: i32,
         dim: i32,
         half: i32,
-        pos0: i32,
+        base: *const c_int,
+        mul: i32,
+        off: i32,
         step: i32,
         inverse: bool,
     ) -> Result<()> {
         let rc = unsafe {
             (self.kernels.apply_rope)(
-                x, cos, sin, rows, row_len, dim, half, pos0, step, inverse as i32, self.stream,
+                x, cos, sin, rows, row_len, dim, half, base, mul, off, step, inverse as i32,
+                self.stream,
             )
         };
         self.kerr(rc, "dsv41_apply_rope")
@@ -1296,13 +1319,14 @@ impl Device {
         head_dim: i32,
         ratio: i32,
         start_pos: i32,
+        pos_ctr: *const c_int,
         eps: f32,
     ) -> Result<()> {
         let f = self.need(self.kernels.compressor_pool, "dsv41_compressor_pool")?;
         let rc = unsafe {
             f(
                 kvp, scp, norm_w, state_kv, state_score, latents, out_rows, b, seqlen, head_dim,
-                ratio, start_pos, eps, self.stream,
+                ratio, start_pos, pos_ctr, eps, self.stream,
             )
         };
         self.kerr(rc, "dsv41_compressor_pool")
@@ -1578,11 +1602,44 @@ impl Device {
         self.kerr(rc, "dsv41_window_idxs")
     }
 
+    /// The fused compressor commit: reads `out_rows` on the device, ropes the
+    /// latent at (*clen) * ratio, stores it into the ring at row window + *clen
+    /// and advances the counter. Replaces the host's download + branch + rope +
+    /// copy, which was a sync D2H per layer per step and uncapturable.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compress_commit(
+        &self,
+        latent: *const f32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        out_rows: *const c_int,
+        clen: *mut c_int,
+        hd: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        ratio: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.compress_commit, "dsv41_compress_commit")?;
+        let rc = unsafe {
+            f(latent, cos, sin, ring, out_rows, clen, hd, rope_dim, half, window, ratio,
+              self.stream)
+        };
+        self.kerr(rc, "dsv41_compress_commit")
+    }
+
     /// The recency placeholder for the compressed rows (the no-indexer safety
     /// net): idxs[win + j] = win + clen - take + j - replaces an upload.
-    pub fn comp_placeholder(&self, idxs: *mut i32, clen: i32, window: i32, take: i32) -> Result<()> {
+    pub fn comp_placeholder(
+        &self,
+        idxs: *mut i32,
+        clen: *const c_int,
+        window: i32,
+        index_topk: i32,
+    ) -> Result<()> {
         let f = self.need(self.kernels.comp_placeholder, "dsv41_comp_placeholder")?;
-        let rc = unsafe { f(idxs, clen, window, take, self.stream) };
+        let rc = unsafe { f(idxs, clen, window, index_topk, self.stream) };
         self.kerr(rc, "dsv41_comp_placeholder")
     }
 

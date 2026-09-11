@@ -59,8 +59,22 @@ pub mod api;
 pub mod driver;
 pub mod engine;
 pub mod host_engine;
+pub mod serve;
+pub mod single_flight;
 pub mod sse;
 pub mod tokenizer;
 
 /// Crate version (workspace-aligned).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// -- wiring ergonomics ------------------------------------------------------
+//
+// Everything a model needs to serve its OpenAI-compatible API: the seam
+// (`ServeEngine` for scheduler engines, `StepEngine` for single-flight ones),
+// the model-specific chat frame, and the launcher. One import per concern.
+pub use api::{router, router_with, AppState};
+pub use engine::{FinishReason, ReqEvent, RequestSpec, ServeEngine, Usage};
+pub use serve::{launch, ServeOptions};
+pub use single_flight::{SingleFlight, StepEngine};
+pub use tokenizer::{ChatFrame, ChatMessage, ChatTokenizer, Seg, StopSpec};
+

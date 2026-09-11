@@ -70,17 +70,48 @@ pub enum ChatTokenizer {
     Byte,
 }
 
+/// The stop set of a checkpoint: literal ids (its config's EOS — some
+/// checkpoints ship no name for it) PLUS special-token names resolved from the
+/// tokenizer at load (misses skipped, ids deduped).
+///
+/// The stop set is a property of the CHECKPOINT, not of the HTTP layer, so it
+/// is data: `GLM_STOPS` is the shared stack's default (ferrite-serve parity);
+/// another model supplies its own (`from_file_with`). Resolved-at-load is
+/// truth: a guessed static silently mislabels finish reasons.
+#[derive(Debug, Clone, Copy)]
+pub struct StopSpec<'a> {
+    /// Literal stop ids (the checkpoint's EOS from its own config).
+    pub ids: &'a [u32],
+    /// Special-token names resolved from the tokenizer at load.
+    pub specials: &'a [&'a str],
+}
+
+impl<'a> StopSpec<'a> {
+    pub fn new(ids: &'a [u32], specials: &'a [&'a str]) -> Self {
+        StopSpec { ids, specials }
+    }
+}
+
+/// GLM-5.3-Flash stops — ferrite-serve CLI parity, byte-for-byte the same list
+/// (the shared stack's default; the CLI and the HTTP path must retire on the
+/// same ids or the two diverge on the wire).
+pub const GLM_STOPS: StopSpec<'static> = StopSpec {
+    ids: &[154_820], // <|end|> (eos)
+    specials: &["<|user|>", "<|endoftext|>", "<|observation|>"],
+};
+
 impl ChatTokenizer {
+    /// GLM preset (ferrite-serve parity — the shared stack's default frame).
     pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        Self::from_file_with(path, GLM_STOPS)
+    }
+
+    /// Any checkpoint: load ITS tokenizer and resolve ITS stop set.
+    pub fn from_file_with(path: &std::path::Path, spec: StopSpec<'_>) -> Result<Self> {
         let tok = Tokenizer::from_file(path)
             .map_err(|e| FerriteError::InvalidArg(format!("load tokenizer: {e}")))?;
-        // Stop set — ferrite-serve CLI parity (byte-for-byte the same stop
-        // list): primary <|end|> 154820 PLUS the turn-boundary specials
-        // resolved from the tokenizer (misses skipped; dedup). The peer's
-        // original literals here were U+FFFD corruption (dead resolution —
-        // stop_ids fell back to a guessed static); resolved-at-load is truth.
-        let mut stop: Vec<u32> = vec![154_820]; // <|end|> (eos)
-        for special in ["<|user|>", "<|endoftext|>", "<|observation|>"] {
+        let mut stop: Vec<u32> = spec.ids.to_vec();
+        for special in spec.specials {
             if let Some(id) = tok.token_to_id(special) {
                 if !stop.contains(&id) {
                     stop.push(id);
@@ -153,6 +184,82 @@ impl ChatTokenizer {
     pub fn is_stop(&self, id: u32) -> bool {
         self.stop_ids().contains(&id)
     }
+
+    /// Single-token lookup for a chat frame's markers: a special resolves to
+    /// ITS id in this checkpoint's vocab (never a hardcoded number). The byte
+    /// codec has no specials.
+    pub fn special_id(&self, name: &str) -> Option<u32> {
+        match self {
+            ChatTokenizer::Real(tok, _) => tok.token_to_id(name),
+            ChatTokenizer::Byte => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat frame: the model-specific prompt layout
+// ---------------------------------------------------------------------------
+
+/// How an OpenAI message list becomes the checkpoint's prompt token ids.
+///
+/// Text ⇄ token is shared (the `ChatTokenizer`), but the FRAME — which markers
+/// open a turn, what closes it, whether the assistant starts inside a thinking
+/// block — is a property of the checkpoint. So the HTTP layer never hardcodes
+/// markers: whoever owns the model (ferrite-serve for GLM, the DSV41 runner)
+/// supplies a frame at wiring time (`api::router_with`). Everything downstream
+/// — request/event protocol, SSE framing, usage, cancel-on-drop, stats — is
+/// shared, which is what makes "add a model" a wiring change instead of a fork
+/// of the HTTP stack.
+pub trait ChatFrame: Send + Sync {
+    fn encode_chat(&self, messages: &[ChatMessage], tok: &ChatTokenizer) -> Result<Vec<u32>>;
+}
+
+/// The GLM frame — ferrite-serve CLI parity, the shared stack's default.
+pub struct GlmFrame;
+
+impl ChatFrame for GlmFrame {
+    fn encode_chat(&self, messages: &[ChatMessage], tok: &ChatTokenizer) -> Result<Vec<u32>> {
+        tok.encode(&render_chat_template(messages))
+    }
+}
+
+/// One element of an id-level frame.
+#[derive(Debug, Clone, Copy)]
+pub enum Seg<'a> {
+    /// A tokenizer special emitted as a SINGLE token (resolved by name: the id
+    /// comes from the checkpoint's own vocab). A name the tokenizer does not
+    /// know falls back to literal text encode — loudly, because a mis-resolved
+    /// marker means a mistemplated prompt.
+    Special(&'a str),
+    /// Literal text (encoded).
+    Text(&'a str),
+    /// The turn's message content, encoded at this position in the frame.
+    Content,
+}
+
+/// Resolve + encode one segment list (`content` fills `Seg::Content`).
+///
+/// The shared half of an id-level frame (the DSV41/DeepSeek-style families):
+/// the LAYOUT stays with the model, the marker resolution + tokenization is
+/// here — one place for every model.
+pub fn encode_segments(tok: &ChatTokenizer, segs: &[Seg<'_>], content: &str) -> Result<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::new();
+    for seg in segs {
+        match seg {
+            Seg::Special(name) => match tok.special_id(name) {
+                Some(id) => out.push(id),
+                None => {
+                    eprintln!(
+                        "[http] frame marker {name:?} is not a special of this tokenizer — literal encode"
+                    );
+                    out.extend_from_slice(&tok.encode(name)?);
+                }
+            },
+            Seg::Text(t) => out.extend_from_slice(&tok.encode(t)?),
+            Seg::Content => out.extend_from_slice(&tok.encode(content)?),
+        }
+    }
+    Ok(out)
 }
 
 /// Byte codec has no specials; the mock engine emits `STOP_ID` (154820)

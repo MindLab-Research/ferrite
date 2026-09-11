@@ -308,8 +308,14 @@ __global__ void engram_gather_kernel(const uint8_t* __restrict__ table,
 #define kMaxPer 8   // d <= 512 with blockDim >= 64; the launcher uses 128 (per = 4)
 __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __restrict__ kv,
                                    const float* __restrict__ sink, const int32_t* __restrict__ idxs,
-                                   float* __restrict__ out, int b, int m, int h, int d, int n,
-                                   int topk, float scale) {
+                                   float* __restrict__ out, int b, int m, int h, int d,
+                                   const int* __restrict__ clen, int window, int index_topk,
+                                   float scale) {
+    // n and topk used to be host arguments derived from this layer's compress_len;
+    // they change per step, so a captured graph would freeze them. The counter now
+    // lives on the device (the compressor's commit kernel advances it).
+    const int n = window + *clen;
+    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
@@ -394,7 +400,11 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
 __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float* __restrict__ kv,
                                         const float* __restrict__ sink,
                                         const int32_t* __restrict__ idxs, float* __restrict__ out,
-                                        int b, int m, int h, int d, int n, int topk, float scale) {
+                                        int b, int m, int h, int d,
+                                        const int* __restrict__ clen, int window, int index_topk,
+                                        float scale) {
+    const int n = window + *clen;
+    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
@@ -529,12 +539,19 @@ __global__ void rope_precompute_kernel(float* __restrict__ cos, float* __restric
     }
 }
 
+// The position is now read from DEVICE memory: (*base) * mul + off. That covers
+// both call shapes without a host value - the plain rope (base = the position
+// counter, mul = 1, off = 0) and the compressor-group rope (base = this layer's
+// latent count, mul = ratio, off = -ratio, i.e. (clen - 1) * ratio). This is what
+// makes the call capturable in a graph: the counter advances on the device (the
+// argmax does it) and nothing about the launch arguments changes per step.
 __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict__ cos,
                                   const float* __restrict__ sin, int rows, int row_len, int dim,
-                                  int half, int pos0, int step, int inverse) {
+                                  int half, const int* __restrict__ base, int mul, int off,
+                                  int step, int inverse) {
     const int r = blockIdx.x;
     if (r >= rows) return;
-    const int t = pos0 + r * step;
+    const int t = (*base) * mul + off + r * step;
     float* row = x + (size_t)r * row_len + (row_len - dim);
     for (int i = threadIdx.x; i < half; i += blockDim.x) {
         const float c = cos[(size_t)t * half + i];
@@ -874,7 +891,8 @@ __global__ void compressor_state_kernel(const float* __restrict__ kvp,
                                         const float* __restrict__ scp,
                                         float* __restrict__ state_kv,
                                         float* __restrict__ state_score, int b, int seqlen,
-                                        int hd, int ratio, int start_pos) {
+                                        int hd, int ratio, const int* __restrict__ pos_ctr) {
+    const int start_pos = *pos_ctr;  // device-side: graph-capturable
     const size_t stride = (size_t)gridDim.x * blockDim.x;
     if (start_pos == 0) {
         const int rem = seqlen % ratio;
@@ -918,8 +936,12 @@ __global__ void compressor_pool_kernel(const float* __restrict__ kvp,
                                        const float* __restrict__ state_kv,
                                        const float* __restrict__ state_score,
                                        float* __restrict__ latents, int32_t* __restrict__ out_rows,
-                                       int mode, int grid_n, int out_rows_val, int b, int seqlen,
-                                       int hd, int ratio, int start_pos, float eps) {
+                                       int mode, int grid_n, int b, int seqlen, int hd, int ratio,
+                                       const int* __restrict__ pos_ctr, float eps) {
+    // out_rows is derived from the DEVICE position counter, not passed in: it
+    // changes per step (one latent per `ratio` positions) and a captured graph
+    // freezes launch arguments, so the decision has to live on the device.
+    const int out_rows_val = ((*pos_ctr + 1) % ratio == 0) ? 1 : 0;
     if (blockIdx.x == 0 && threadIdx.x == 0) *out_rows = out_rows_val;
     if ((int)blockIdx.x >= grid_n) return;
     // an unfinished decode group updates the state but writes no latent
@@ -1204,7 +1226,8 @@ extern "C" int dsv41_argmax(const float* v, int* out, int n, int* pos_ctr, cudaS
 
 extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* sink,
                                  const int32_t* idxs, float* out, int b, int m, int h, int d,
-                                 int n, int topk, float scale, cudaStream_t s) {
+                                 const int* clen, int window, int index_topk, float scale,
+                                 cudaStream_t s) {
     if (d > 512) return (int)cudaErrorInvalidValue;  // the accumulator is d-wide per thread group
     // Flash-decode split by default; DSV41_ATTN_SEQ=1 restores the sequential
     // version for A/B. Cached in a static: this runs per attention call, and a
@@ -1212,10 +1235,10 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
     dim3 grid(b * m, h);
     if (!seq) {
-        sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, n, topk,
+        sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
                                                      scale);
     } else {
-        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, n, topk, scale);
+        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale);
     }
     return (int)cudaGetLastError();
 }
@@ -1278,7 +1301,7 @@ static void compressor_free(void* p, cudaStream_t s) {
 extern "C" int dsv41_compressor_pool(const float* kvp, const float* scp, const float* norm_w,
                                      float* state_kv, float* state_score, float* latents,
                                      int* out_rows, int b, int seqlen, int head_dim, int ratio,
-                                     int start_pos, float eps, cudaStream_t s) {
+                                     int start_pos, const int* pos_ctr, float eps, cudaStream_t s) {
     if (b <= 0 || seqlen <= 0 || head_dim <= 0 || ratio <= 0) return (int)cudaErrorInvalidValue;
     if (ratio > 1) {
         const size_t work = start_pos == 0 ? (size_t)b * (seqlen % ratio) * head_dim
@@ -1286,26 +1309,27 @@ extern "C" int dsv41_compressor_pool(const float* kvp, const float* scp, const f
         const int blocks = (int)((work + 255) / 256);
         if (work > 0)
             compressor_state_kernel<<<(blocks > 0 ? blocks : 1), 256, 0, s>>>(
-                kvp, scp, state_kv, state_score, b, seqlen, head_dim, ratio, start_pos);
+                kvp, scp, state_kv, state_score, b, seqlen, head_dim, ratio, pos_ctr);
     }
-    int mode, grid_n, out_rows_val;
+    // mode/grid_n come from the HOST's knowledge of prefill vs decode: they are
+    // CONSTANT across every decode step (2 / b), which is what lets a graph bake
+    // them in. out_rows_val is deliberately NOT passed - it flips once per `ratio`
+    // steps and the kernel derives it from the device position counter.
+    int mode, grid_n;
     if (ratio == 1) {
         mode = 0;
         grid_n = seqlen;
-        out_rows_val = seqlen;
     } else if (start_pos == 0) {
         mode = 1;
         grid_n = b * (seqlen / ratio);
-        out_rows_val = seqlen / ratio;
     } else {
         mode = 2;
         grid_n = b;
-        out_rows_val = ((start_pos + 1) % ratio == 0) ? 1 : 0;
     }
     const unsigned launch = (unsigned)(grid_n > 0 ? grid_n : 1);
     compressor_pool_kernel<<<launch, 128, 0, s>>>(kvp, scp, norm_w, state_kv, state_score, latents,
-                                                  out_rows, mode, grid_n, out_rows_val, b, seqlen,
-                                                  head_dim, ratio, start_pos, eps);
+                                                  out_rows, mode, grid_n, b, seqlen, head_dim, ratio,
+                                                  pos_ctr, eps);
     return (int)cudaGetLastError();
 }
 
@@ -1416,9 +1440,9 @@ extern "C" int dsv41_rope_precompute(float* cos, float* sin, int dim, int seqlen
 }
 
 extern "C" int dsv41_apply_rope(float* x, const float* cos, const float* sin, int rows, int row_len,
-                                int dim, int half, int pos0, int step, int inverse,
+                                int dim, int half, const int* base, int mul, int off, int step, int inverse,
                                 cudaStream_t s) {
-    apply_rope_kernel<<<rows, 128, 0, s>>>(x, cos, sin, rows, row_len, dim, half, pos0, step,
+    apply_rope_kernel<<<rows, 128, 0, s>>>(x, cos, sin, rows, row_len, dim, half, base, mul, off, step,
                                            inverse);
     return (int)cudaGetLastError();
 }

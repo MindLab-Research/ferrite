@@ -558,10 +558,15 @@ __global__ void window_idxs_kernel(int32_t* __restrict__ idxs, const int* __rest
 // The recency placeholder for the compressed rows (the safety net when the
 // group's owner has no indexer): idxs[win + j] = win + clen - take + j. Also
 // removes a per-layer upload; clen is still a host value this round.
-__global__ void comp_placeholder_kernel(int32_t* __restrict__ idxs, int clen, int window, int take) {
+__global__ void comp_placeholder_kernel(int32_t* __restrict__ idxs,
+                                        const int* __restrict__ clen, int window, int index_topk) {
+    // `take` is derived on the DEVICE now (it changes per step and a captured graph
+    // freezes launch arguments); the block count uses the cap and the guard is here.
+    const int c = *clen;
+    const int take = (c < index_topk) ? c : index_topk;
     const int j = threadIdx.x + (int)blockIdx.x * blockDim.x;
     if (j >= take) return;
-    idxs[window + j] = window + clen - take + j;
+    idxs[window + j] = window + c - take + j;
 }
 
 extern "C" int dsv41_window_idxs(int32_t* idxs, const int* pos_ctr, int window, cudaStream_t s) {
@@ -570,10 +575,57 @@ extern "C" int dsv41_window_idxs(int32_t* idxs, const int* pos_ctr, int window, 
     return (int)cudaGetLastError();
 }
 
-extern "C" int dsv41_comp_placeholder(int32_t* idxs, int clen, int window, int take,
+extern "C" int dsv41_comp_placeholder(int32_t* idxs, const int* clen, int window, int index_topk,
                                       cudaStream_t s) {
-    if (take <= 0) return (int)cudaSuccess;
-    comp_placeholder_kernel<<<(unsigned)((take + 127) / 128), 128, 0, s>>>(idxs, clen, window, take);
+    comp_placeholder_kernel<<<(unsigned)((index_topk + 127) / 128), 128, 0, s>>>(idxs, clen, window,
+                                                                                 index_topk);
+    return (int)cudaGetLastError();
+}
+
+// The compressor commit, fused: reads out_rows ON THE DEVICE (the host used to
+// download it, branch on it, run apply_rope, then cudaMemcpyD2D - a sync D2H per
+// layer per step, and a host branch a CUDA graph cannot record), ropes the latent
+// at the group's first token position, stores it into the ring at row
+// window + *clen, and advances the DEVICE counter. No __syncthreads anywhere: the
+// early-exit branch would make one UB (the failure mode of the older multi-token
+// engram kernel), and each thread reads its own source pair and writes the
+// destination, so no cross-thread ordering is needed at all.
+// The rope math mirrors apply_rope_kernel exactly: the rotated region starts at
+// hd - rope_dim, pairs (2i, 2i+1), the tables indexed as cos[t*half + i].
+__global__ void compress_commit_kernel(const float* __restrict__ latent,
+                                       const float* __restrict__ cos_t,
+                                       const float* __restrict__ sin_t, float* __restrict__ ring,
+                                       const int* __restrict__ out_rows, int* __restrict__ clen,
+                                       int hd, int rope_dim, int half, int window, int ratio) {
+    if (*out_rows <= 0) return;  // the device-side branch that replaces the download
+    const int len = *clen;
+    const int group_first = len * ratio;
+    const int i0 = hd - rope_dim;
+    const float* cs_row = cos_t + (size_t)group_first * half;
+    const float* sn_row = sin_t + (size_t)group_first * half;
+    float* dst = ring + (size_t)(window + len) * hd;
+    for (int c = threadIdx.x; c < hd; c += blockDim.x) {
+        float v = latent[c];
+        if (c >= i0) {
+            const int j = (c - i0) >> 1;
+            const int base = i0 + (j << 1);
+            const float x0 = latent[base];
+            const float x1 = latent[base + 1];
+            const float cv = cs_row[j];
+            const float sv = sn_row[j];
+            v = (c == base) ? (x0 * cv - x1 * sv) : (x0 * sv + x1 * cv);
+        }
+        dst[c] = v;
+    }
+    if (threadIdx.x == 0) *clen = len + 1;
+}
+
+extern "C" int dsv41_compress_commit(const float* latent, const float* cos_t, const float* sin_t,
+                                     float* ring, const int* out_rows, int* clen, int hd,
+                                     int rope_dim, int half, int window, int ratio,
+                                     cudaStream_t s) {
+    compress_commit_kernel<<<1, 128, 0, s>>>(latent, cos_t, sin_t, ring, out_rows, clen, hd,
+                                             rope_dim, half, window, ratio);
     return (int)cudaGetLastError();
 }
 
