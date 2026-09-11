@@ -21,6 +21,11 @@ use ferrite_dsv41::tp::{self, Collective};
 use ferrite_dsv41::config::Dsv41Config;
 use ferrite_dsv41::device::Device;
 use ferrite_dsv41::load::Loader;
+use ferrite_http::single_flight::{SingleFlight, StepEngine};
+use ferrite_http::tokenizer::{
+    encode_segments, ChatFrame, ChatMessage, ChatTokenizer, Seg, StopSpec,
+};
+use ferrite_http::ServeOptions;
 use ferrite_types::Result;
 
 fn arg(name: &str, default: Option<&str>) -> Option<String> {
@@ -104,7 +109,8 @@ fn main() -> Result<()> {
             eprintln!("[dsv41] --serve needs --tp >= 2 (the ranks each hold a shard)");
             return Ok(());
         }
-        return run_tp_serve(&dir, &so, &cfg, tp, eos, port);
+        let model_name = arg("--model-name", Some("deepseek-v4.1-flash")).unwrap();
+        return run_serve(&dir, &so, &cfg, tp, eos, port, model_name);
     }
 let dev = Device::open(&so)?;
     eprintln!("[dsv41] device ready (kernels: {so})");
@@ -427,307 +433,412 @@ fn rank_body(
 }
 
 // ============================================================================
-// HTTP serve mode (verification grade): the model loads ONCE and every
-// verification round is a curl, instead of a ~80 s cold start per prompt.
-//   POST /generate?max_tokens=32   body = the prompt text  -> the generated text
-//   GET  /health                                            -> "ok"
-//   POST /shutdown                                          -> clean exit
-// Deliberately std::net only: no tokio dependency for a localhost verifier.
+// HTTP serve mode: the SHARED ferrite-http stack (axum routes + SSE + the
+// engine driver thread + the tokenizer boundary — the same code GLM serves
+// through; see crates/ferrite-http).
+//
+// The model loads ONCE and every verification round is a curl against the
+// OpenAI API instead of a ~80 s cold start per prompt. The only DSV41-specific
+// pieces are:
+//
+//   * `TpRankPool` — the TP rank threads behind `StepEngine`: ONE request at a
+//     time, every rank running the same step (the collective is the loop).
+//     ferrite-http's `SingleFlight` adapter turns that into a full
+//     `ServeEngine` (FIFO admission, retirement, cancel, telemetry), so the
+//     driver/HTTP/SSE layer is identical to GLM's;
+//   * `Dsv41Frame` — this checkpoint's chat frame + stop set.
+//
+// Everything else (request/event protocol, SSE framing, usage, cancel-on-drop,
+// /v1/models, /health, /v1/stats, /shutdown) is shared.
+//
+// The hand-rolled std::net server this replaces is gone. It also could not have
+// worked as written: it built the spin barrier INSIDE each rank's closure (so
+// every rank waited alone on its own barrier — an immediate hang) and skipped
+// the peer handshake (`enable_peer_access` + staging exchange + `set_peers`)
+// that the all-reduce's peer stores require. The prologue below is the one-shot
+// path's (verified) verbatim.
 // ============================================================================
 
-struct ServeShared {
-    /// BROADCAST, not a work queue: every rank must execute the same request in
-    /// lockstep (the all-reduce makes them one collective), so the job stays in
-    /// the slot and each rank picks it up when the GENERATION advances past what
-    /// it has seen. Taking it (the first cut) left the other ranks waiting and
-    /// deadlocked the running rank inside its first all-reduce.
-    job: std::sync::Mutex<Option<ServeJob>>,
-    /// rank 0 takes this when the flow finishes and sends the tokens back.
-    resp: std::sync::Mutex<Option<std::sync::mpsc::Sender<Vec<u32>>>>,
-    cv: std::sync::Condvar,
-    shutdown: std::sync::atomic::AtomicBool,
-}
+/// This checkpoint's chat frame — the reference's
+/// `encode_messages(messages, thinking_mode="chat")`:
+/// `<|begin_of_sentence|><|User|>{prompt}<|Assistant|></think>`
+/// (ids [0, 128803] + content + [128804, 128822]).
+///
+/// Markers are resolved from the checkpoint's own tokenizer by name (never
+/// hardcoded ids — `encode_segments` resolves them and warns when a marker is
+/// not a special). A completed assistant turn closes with the checkpoint's
+/// end-of-sentence marker, which reproduces the verified single-turn frame
+/// exactly.
+struct Dsv41Frame;
 
-struct ServeJob {
-    generation: u64,
-    ids: Vec<u32>,
-    max_tokens: usize,
-}
-
-fn read_request(stream: &mut std::net::TcpStream) -> std::io::Result<(String, Vec<u8>)> {
-    use std::io::Read;
-    let mut buf: Vec<u8> = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            break;
+impl ChatFrame for Dsv41Frame {
+    fn encode_chat(&self, messages: &[ChatMessage], tok: &ChatTokenizer) -> Result<Vec<u32>> {
+        let mut ids: Vec<u32> = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            if i == 0 {
+                ids.extend(encode_segments(
+                    tok,
+                    &[Seg::Special("<|begin_of_sentence|>")],
+                    "",
+                )?);
+            }
+            let asst = m.role == "assistant";
+            let marker = if asst { "<|Assistant|>" } else { "<|User|>" };
+            let mut segs = vec![Seg::Special(marker), Seg::Content];
+            if asst {
+                segs.push(Seg::Special("<|end_of_sentence|>"));
+            }
+            ids.extend(encode_segments(tok, &segs, &m.content)?);
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
-            break;
-        }
-        if buf.len() > (1 << 22) {
-            break;
-        }
+        // generation opens at the assistant position in chat mode (thinking
+        // off): without the trailing </think> the model drifts into a thinking
+        // block instead of answering (the raw-text runs' failure mode).
+        ids.extend(encode_segments(
+            tok,
+            &[Seg::Special("<|Assistant|>"), Seg::Special("</think>")],
+            "",
+        )?);
+        Ok(ids)
     }
-    let split = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| i + 4)
-        .unwrap_or(buf.len());
-    let head = String::from_utf8_lossy(&buf[..split]).to_string();
-    let mut body = buf[split..].to_vec();
-    let clen = head
-        .to_ascii_lowercase()
-        .lines()
-        .find(|l| l.starts_with("content-length:"))
-        .and_then(|l| l.split(':').nth(1))
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    while body.len() < clen {
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            break;
+}
+
+// ---- the rank pool ---------------------------------------------------------
+
+/// One lockstep command, broadcast to every rank: the ranks are ONE engine (the
+/// collectives make them so), so they must run the same sequence — a rank that
+/// skips a step deadlocks inside the next all-reduce.
+#[derive(Clone)]
+enum RankCmd {
+    /// Reset the chain and consume the prompt, one forward per prompt token
+    /// (the KV ring is per-sequence); the reply is the first generated token.
+    Prefill(Vec<u32>),
+    /// One steady-state decode step (zero H2D — the token already sits in the
+    /// device's `ids` buffer).
+    Decode { token: u32, pos: usize },
+}
+
+/// The model is ~80 s of mmap + upload; the first request waits for it.
+const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+/// Watchdog on one lockstep step: a rank wedged inside a collective can be
+/// reported but never unstuck (the adapter poisons the pool), so the timeout
+/// keeps the HTTP layer answering instead of hanging the driver thread forever.
+const STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// The TP rank pool: `world` threads, each bound to its own device and holding
+/// its own weight shard, all executing the same request in lockstep.
+///
+/// The rank threads are a `tp::run_ranks` scope parked on its own thread (they
+/// outlive any single request); the pool talks to them with plain commands and
+/// collects EVERY rank's reply before returning — that wait IS the lockstep
+/// invariant. Rank 0's token is the result: the shared reductions make every
+/// rank's logits identical, so no broadcast is needed.
+struct TpRankPool {
+    world: usize,
+    /// One command channel per rank (the broadcast fan-out).
+    cmd: Vec<std::sync::mpsc::Sender<RankCmd>>,
+    /// Rank replies: (rank, token-or-error).
+    res: std::sync::mpsc::Receiver<(usize, Result<u32>)>,
+    /// One-shot load reports — a failed load arrives as `Err` from its rank.
+    ready: std::sync::mpsc::Receiver<Result<usize>>,
+    /// The scope-owner thread, held (never joined) so the pool owns the ranks'
+    /// lifetime: dropping the pool drops the command senders and each rank's
+    /// `recv` then ends its loop.
+    _owner: Option<std::thread::JoinHandle<Result<()>>>,
+    loaded: bool,
+    /// Prompt + generation bound (each prompt token is one forward into a
+    /// per-sequence KV ring, so the whole sequence must fit).
+    max_ctx: usize,
+    /// The checkpoint's stop set (the engine retires on these ids; the wire
+    /// layer strips the same ones).
+    stops: Vec<u32>,
+}
+
+impl TpRankPool {
+    fn new(dir: &str, so: &str, cfg: &Dsv41Config, world: usize, stops: Vec<u32>) -> Result<Self> {
+        let mut cmd = Vec::with_capacity(world);
+        let mut rxs = Vec::with_capacity(world);
+        for _ in 0..world {
+            let (tx, rx) = std::sync::mpsc::channel::<RankCmd>();
+            cmd.push(tx);
+            // each rank only ever touches its own slot (no contention: the lock
+            // is what makes the per-rank receivers shareable with the scope)
+            rxs.push(Mutex::new(rx));
         }
-        body.extend_from_slice(&tmp[..n]);
+        let (res_tx, res) = std::sync::mpsc::channel();
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let barrier = Arc::new(tp::SpinBarrier::new(world));
+        let staging = Arc::new(Mutex::new(vec![0u64; world]));
+        let rxs = Arc::new(rxs);
+        let dir = dir.to_string();
+        let so = so.to_string();
+        let cfg = cfg.clone();
+        let max_ctx = cfg.max_seq_len;
+        // the ranks must outlive this call, so the run_ranks scope parks here
+        let owner = std::thread::Builder::new()
+            .name("dsv41-tp-pool".into())
+            .spawn(move || {
+                tp::run_ranks(world, move |rank| {
+                    rank_loop(
+                        rank, world, &cfg, &dir, &so, &rxs, &res_tx, &ready_tx, &barrier, &staging,
+                    )
+                })
+            })
+            .map_err(|e| ferrite_types::FerriteError::Config(format!("spawn tp pool: {e}")))?;
+        Ok(TpRankPool {
+            world,
+            cmd,
+            res,
+            ready,
+            _owner: Some(owner),
+            loaded: false,
+            max_ctx,
+            stops,
+        })
     }
-    Ok((head, body))
+
+    /// Wait for every rank's load (the first request pays it; the listener is
+    /// already bound, so requests queue in `SingleFlight` meanwhile).
+    fn ensure_loaded(&mut self) -> Result<()> {
+        if self.loaded {
+            return Ok(());
+        }
+        let mut loaded = 0usize;
+        for _ in 0..self.world {
+            match self.ready.recv_timeout(LOAD_TIMEOUT) {
+                Ok(Ok(_rank)) => loaded += 1,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
+                    return Err(ferrite_types::FerriteError::Config(format!(
+                        "tp pool: only {loaded}/{} ranks loaded (a rank died or timed out)",
+                        self.world
+                    )))
+                }
+            }
+        }
+        self.loaded = true;
+        eprintln!("[dsv41] tp pool ready: {} ranks loaded", self.world);
+        Ok(())
+    }
+
+    /// Broadcast one command, then collect EVERY rank's reply. Rank 0's token is
+    /// the answer; any rank's error fails the step (a broken rank means a broken
+    /// lockstep engine — the adapter poisons the pool on Err).
+    fn broadcast(&mut self, cmd: RankCmd) -> Result<u32> {
+        for (r, tx) in self.cmd.iter().enumerate() {
+            tx.send(cmd.clone()).map_err(|_| {
+                ferrite_types::FerriteError::Config(format!("tp pool: rank {r} is gone"))
+            })?;
+        }
+        let mut token: Option<u32> = None;
+        let mut fault: Option<ferrite_types::FerriteError> = None;
+        for _ in 0..self.world {
+            match self.res.recv_timeout(STEP_TIMEOUT) {
+                Ok((rank, Ok(t))) => {
+                    if rank == 0 {
+                        token = Some(t);
+                    }
+                }
+                Ok((rank, Err(e))) => {
+                    if fault.is_none() {
+                        fault = Some(ferrite_types::FerriteError::Config(format!("rank {rank}: {e}")));
+                    }
+                }
+                Err(_) => {
+                    return Err(ferrite_types::FerriteError::Config(
+                        "tp pool: a rank did not answer (wedged in a collective?)".into(),
+                    ))
+                }
+            }
+        }
+        if let Some(e) = fault {
+            return Err(e);
+        }
+        token.ok_or_else(|| {
+            ferrite_types::FerriteError::Config("tp pool: rank 0 produced no token".into())
+        })
+    }
 }
 
-fn write_response(
-    stream: &mut std::net::TcpStream,
-    status: &str,
-    body: &str,
-    extra: &[(&str, String)],
-) {
-    use std::io::Write;
-    let mut head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n",
-        body.len()
-    );
-    for (k, v) in extra {
-        head.push_str(&format!("{k}: {v}\r\n"));
+impl StepEngine for TpRankPool {
+    fn prefill(&mut self, prompt: &[u32]) -> Result<u32> {
+        self.ensure_loaded()?;
+        self.broadcast(RankCmd::Prefill(prompt.to_vec()))
     }
-    head.push_str("\r\n");
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
-    let _ = stream.flush();
+
+    fn decode(&mut self, token: u32, pos: usize) -> Result<u32> {
+        self.broadcast(RankCmd::Decode { token, pos })
+    }
+
+    fn is_stop(&self, token: u32) -> bool {
+        self.stops.contains(&token)
+    }
+
+    fn stop_id(&self) -> u32 {
+        self.stops.first().copied().unwrap_or(0)
+    }
+
+    fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
 }
 
-/// The chat-template encoding used by the one-shot path: [bos, <|User|>] +
-/// prompt + [<|Assistant|>, </think>] (the reference's
-/// encode_messages(thinking_mode="chat") for this checkpoint).
-fn encode_prompt_ids(tok: &tokenizers::Tokenizer, prompt: &str) -> Result<Vec<u32>> {
-    let body = tok
-        .encode(prompt.to_string(), false)
-        .map_err(|e| ferrite_types::FerriteError::Config(format!("encode: {e}")))?
-        .get_ids()
-        .to_vec();
-    let mut v = Vec::with_capacity(body.len() + 4);
-    v.push(0u32);
-    v.push(128803u32);
-    v.extend_from_slice(&body);
-    v.push(128804u32);
-    v.push(128822u32);
-    Ok(v)
+/// One rank's life: load its shard, join the peer handshake, then execute
+/// lockstep commands until the pool is dropped.
+///
+/// A failed load is reported on the ready channel — its siblings are already
+/// inside the shared load barrier, which cannot be left without them (the
+/// documented bring-up hazard: a rank that dies during load wedges the pool).
+#[allow(clippy::too_many_arguments)]
+fn rank_loop(
+    rank: usize,
+    world: usize,
+    cfg: &Dsv41Config,
+    dir: &str,
+    so: &str,
+    rxs: &Arc<Vec<Mutex<std::sync::mpsc::Receiver<RankCmd>>>>,
+    res_tx: &std::sync::mpsc::Sender<(usize, Result<u32>)>,
+    ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
+    barrier: &Arc<tp::SpinBarrier>,
+    staging: &Arc<Mutex<Vec<u64>>>,
+) -> Result<()> {
+    let r = pool_rank_body(rank, world, cfg, dir, so, rxs, res_tx, ready_tx, barrier, staging);
+    if let Err(e) = &r {
+        let _ = ready_tx.send(Err(ferrite_types::FerriteError::Config(e.to_string())));
+    }
+    r
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_tp_serve(
+fn pool_rank_body(
+    rank: usize,
+    world: usize,
+    cfg: &Dsv41Config,
+    dir: &str,
+    so: &str,
+    rxs: &Arc<Vec<Mutex<std::sync::mpsc::Receiver<RankCmd>>>>,
+    res_tx: &std::sync::mpsc::Sender<(usize, Result<u32>)>,
+    ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
+    barrier: &Arc<tp::SpinBarrier>,
+    staging: &Arc<Mutex<Vec<u64>>>,
+) -> Result<()> {
+    // ---- bring-up: the one-shot path's prologue (rank_body) verbatim ----
+    Device::bind_to(rank as i32)?;
+    let dev = Arc::new(Device::open(so)?);
+    let mut loader = Loader::new(std::path::Path::new(dir), &dev)?;
+    if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
+        loader.skip_prefixes.push("engram.embed.".into());
+    }
+    let w = loader.load(cfg, world, rank)?;
+    dev.sync()?;
+    let eng_map = load_eng_map(dir, cfg);
+    // every rank must be loaded (and holding its CUDA context) before the peer
+    // handshake: the running ranks spin inside the all-reduce until the last
+    // one joins
+    barrier.wait();
+    let peers = dev.enable_peer_access()?;
+    if rank == 0 {
+        eprintln!("[dsv41] rank0: peer access to {peers} devices; entering lockstep");
+    }
+    barrier.wait();
+    let hc_dim = cfg.hc_mult * cfg.dim;
+    let mut comm = Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
+    {
+        staging.lock().unwrap()[rank] = comm.staging_base();
+    }
+    barrier.wait();
+    let peers = staging.lock().unwrap().clone();
+    barrier.wait();
+    comm.set_peers(peers)?;
+    let mut chain = DevChain::new(&dev, cfg, &w, RunOpts::from_env(), eng_map)?;
+    chain.comm = Some(Arc::new(comm));
+    if rank == 0 {
+        eprintln!("[dsv41] rank0: chain ready, serving");
+    }
+    ready_tx.send(Ok(rank)).map_err(|_| {
+        ferrite_types::FerriteError::Config("tp pool: coordinator gone".into())
+    })?;
+
+    // ---- the lockstep command loop ----
+    let rx = rxs[rank].lock().unwrap();
+    loop {
+        match rx.recv() {
+            Ok(RankCmd::Prefill(ids)) => {
+                let r = prefill_chain(&mut chain, &ids);
+                if res_tx.send((rank, r)).is_err() {
+                    return Ok(()); // the pool is gone
+                }
+            }
+            Ok(RankCmd::Decode { token, pos }) => {
+                let r = chain.step_dev(token, pos);
+                if res_tx.send((rank, r)).is_err() {
+                    return Ok(());
+                }
+            }
+            // the pool dropped its senders (process shutdown)
+            Err(_) => return Ok(()),
+        }
+    }
+}
+
+/// Feed the prompt one token per forward (the KV ring is per-sequence) and
+/// return the first generated token — `StepEngine::prefill`'s contract.
+fn prefill_chain(chain: &mut DevChain<'_>, ids: &[u32]) -> Result<u32> {
+    chain.reset()?;
+    let mut next = 0u32;
+    for (i, &t) in ids.iter().enumerate() {
+        next = chain.step(t, i)?;
+    }
+    Ok(next)
+}
+
+/// The engram's token map (a pure function of the tokenizer, precomputed into
+/// the checkpoint dir): absent means the engram is disabled for this run.
+fn load_eng_map(dir: &str, cfg: &Dsv41Config) -> Option<ferrite_dsv41::engram::TokenMap> {
+    std::fs::read(format!("{dir}/engram_token_map.bin"))
+        .ok()
+        .filter(|b| b.len() % 8 == 0 && !b.is_empty())
+        .map(|b| {
+            let v: Vec<i64> = b
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            ferrite_dsv41::engram::TokenMap::from_table(v, cfg.engram_compressed_vocab_size)
+        })
+}
+
+/// `--serve`: the shared ferrite-http stack over the TP rank pool. Binds
+/// immediately; the ranks finish loading behind the first request.
+fn run_serve(
     dir: &str,
     so: &str,
     cfg: &Dsv41Config,
     tp: usize,
     eos: Option<u32>,
     port: u16,
+    model_name: String,
 ) -> Result<()> {
-    let world = tp;
-    let tok = std::sync::Arc::new(
-        tokenizers::Tokenizer::from_file(format!("{dir}/tokenizer.json"))
-            .map_err(|e| ferrite_types::FerriteError::Config(format!("tokenizer: {e}")))?,
+    // The stop set is the CHECKPOINT's: the resolved EOS from main PLUS the
+    // checkpoint's own end-of-sentence special (its config ships eos_token_id
+    // null, so the name-resolved id is the honest fallback). Engine retirement
+    // and wire stripping both come from this one set.
+    let eos_ids: Vec<u32> = eos.into_iter().collect();
+    let spec = StopSpec::new(&eos_ids, &["<|end_of_sentence|>"]);
+    let tok =
+        ChatTokenizer::from_file_with(&std::path::Path::new(dir).join("tokenizer.json"), spec)?;
+    let stops = tok.stop_ids().to_vec();
+    let pool = TpRankPool::new(dir, so, cfg, tp, stops)?;
+    let engine = SingleFlight::new(pool);
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    eprintln!(
+        "[dsv41] serving TP{tp} {model_name} on http://{addr}/v1/chat/completions (ranks loading)"
     );
-    let shared = std::sync::Arc::new(ServeShared {
-        job: std::sync::Mutex::new(None),
-        resp: std::sync::Mutex::new(None),
-        cv: std::sync::Condvar::new(),
-        shutdown: std::sync::atomic::AtomicBool::new(false),
-    });
-    // the listener: binds immediately, serves while the ranks load (~80 s)
-    {
-        let shared = shared.clone();
-        let tok = tok.clone();
-        let listener = std::net::TcpListener::bind(("0.0.0.0", port)).map_err(|e|
-            ferrite_types::FerriteError::Config(format!("bind {port}: {e}")))?;
-        eprintln!("[dsv41] serving on 0.0.0.0:{port} (loading in background)");
-        std::thread::spawn(move || {
-            use std::sync::atomic::Ordering;
-            for stream in listener.incoming() {
-                let Ok(mut stream) = stream else { break };
-                let (head, body) = match read_request(&mut stream) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
-                let first = head.lines().next().unwrap_or("").to_string();
-                let mut parts = first.split_whitespace();
-                let method = parts.next().unwrap_or("");
-                let target = parts.next().unwrap_or("");
-                let (path, query) = match target.split_once('?') {
-                    Some((p, q)) => (p, q),
-                    None => (target, ""),
-                };
-                let qmax = query
-                    .split('&')
-                    .find_map(|kv| kv.strip_prefix("max_tokens="))
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(32);
-                if method == "GET" && path == "/health" {
-                    write_response(&mut stream, "200 OK", "ok", &[]);
-                    continue;
-                }
-                if method == "POST" && path == "/shutdown" {
-                    shared.shutdown.store(true, Ordering::SeqCst);
-                    shared.cv.notify_all();
-                    write_response(&mut stream, "200 OK", "shutting down", &[]);
-                    break;
-                }
-                if method == "POST" && path == "/generate" {
-                    let prompt = String::from_utf8_lossy(&body).to_string();
-                    let ids = match encode_prompt_ids(&tok, &prompt) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            write_response(&mut stream, "400 Bad Request", &format!("{e}"), &[]);
-                            continue;
-                        }
-                    };
-                    if ids.is_empty() {
-                        write_response(&mut stream, "400 Bad Request", "empty prompt", &[]);
-                        continue;
-                    }
-                    let (tx, rx) = std::sync::mpsc::channel::<Vec<u32>>();
-                    // publish resp BEFORE the job: rank 0 can only reach its
-                    // take() after running the flow, which requires the job.
-                    *shared.resp.lock().unwrap() = Some(tx);
-                    {
-                        let mut g = shared.job.lock().unwrap();
-                        let generation = g.as_ref().map(|j| j.generation).unwrap_or(0) + 1;
-                        *g = Some(ServeJob { generation, ids, max_tokens: qmax });
-                    }
-                    let t_gen = std::time::Instant::now();
-                    shared.cv.notify_all();
-                    let produced = match rx.recv_timeout(std::time::Duration::from_secs(1800)) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            write_response(&mut stream, "504 Gateway Timeout", "rank timeout", &[]);
-                            continue;
-                        }
-                    };
-                    let dt = t_gen.elapsed().as_secs_f64();
-                    let text = tok.decode(&produced, true).unwrap_or_default();
-                    let extra = [
-                        ("X-Tokens", format!("{}", produced.len())),
-                        ("X-Seconds", format!("{dt:.3}")),
-                        (
-                            "X-Tok-S",
-                            format!("{:.2}", produced.len() as f64 / dt.max(1e-9)),
-                        ),
-                    ];
-                    write_response(&mut stream, "200 OK", &text, &extra);
-                    if shared.shutdown.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    continue;
-                }
-                write_response(&mut stream, "404 Not Found", "unknown path", &[]);
-            }
-        });
-    }
-    let dir = dir.to_string();
-    let so = so.to_string();
-    let cfg = cfg.clone();
-    let t0 = std::time::Instant::now();
-    tp::run_ranks(world, move |rank| {
-        use std::sync::atomic::Ordering;
-        // ---- build ONCE (the same prologue as rank_body) ----
-        ferrite_dsv41::device::Device::bind_to(rank as i32)?;
-        let dev = std::sync::Arc::new(ferrite_dsv41::device::Device::open(&so)?);
-        let mut loader = ferrite_dsv41::load::Loader::new(std::path::Path::new(&dir), &dev)?;
-        if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS").is_ok() {
-            loader.skip_prefixes.push("engram.embed.".into());
-        }
-        let w = loader.load(&cfg, world, rank)?;
-        let hc_dim = cfg.hc_mult * cfg.dim;
-        let barrier = std::sync::Arc::new(ferrite_dsv41::tp::SpinBarrier::new(world));
-        let c_small =
-            ferrite_dsv41::tp::Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
-        let eng_map = std::fs::read(format!("{dir}/engram_token_map.bin"))
-            .ok()
-            .filter(|b| b.len() % 8 == 0 && !b.is_empty())
-            .map(|b| {
-                let v: Vec<i64> = b
-                    .chunks_exact(8)
-                    .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
-                    .collect();
-                ferrite_dsv41::engram::TokenMap::from_table(v, cfg.engram_compressed_vocab_size)
-            });
-        let mut chain = DevChain::new(&dev, &cfg, &w, RunOpts::from_env(), eng_map)?;
-        chain.comm = Some(std::sync::Arc::new(c_small));
-        // every rank must be loaded before the first request: the running ranks
-        // spin inside the all-reduce until the last one joins
-        barrier.wait();
-        if rank == 0 {
-            eprintln!("[dsv41] rank0: chain ready in {:.1}s, serving", t0.elapsed().as_secs_f64());
-        }
-        // ---- the request loop: one prefill+decode per GENERATION ----
-        let mut seen: u64 = 0;
-        loop {
-            let job = {
-                let mut g = shared.job.lock().unwrap();
-                loop {
-                    let cur = g.as_ref().map(|j| j.generation).unwrap_or(0);
-                    if cur > seen {
-                        seen = cur;
-                        let j = g.as_ref().unwrap();
-                        break Some((j.ids.clone(), j.max_tokens));
-                    }
-                    if shared.shutdown.load(Ordering::SeqCst) {
-                        break None;
-                    }
-                    g = shared.cv.wait(g).unwrap();
-                }
-            };
-            let Some((ids, max_tokens)) = job else { break };
-            chain.reset()?;
-            let mut next_tok = 0u32;
-            for (i, &tk) in ids.iter().enumerate() {
-                next_tok = chain.step(tk, i)?;
-            }
-            let mut produced: Vec<u32> = Vec::new();
-            let pos0 = ids.len();
-            let t_dec = std::time::Instant::now();
-            for step in 0..max_tokens {
-                produced.push(next_tok);
-                if Some(next_tok) == eos {
-                    break;
-                }
-                next_tok = chain.step_dev(next_tok, pos0 + step)?;
-            }
-            if rank == 0 {
-                let dt = t_dec.elapsed().as_secs_f64();
-                let n = produced.len().max(1);
-                eprintln!(
-                    "[dsv41] DECODE {} tokens in {:.2}s = {:.2} tok/s ({:.1} ms/token)",
-                    produced.len(),
-                    dt,
-                    produced.len() as f64 / dt,
-                    dt * 1e3 / n as f64
-                );
-                if let Some(tx) = shared.resp.lock().unwrap().take() {
-                    let _ = tx.send(produced);
-                }
-            }
-        }
-        Ok(())
-    })?;
-    Ok(())
+    ferrite_http::serve::launch(
+        engine,
+        tok,
+        Arc::new(Dsv41Frame),
+        ServeOptions::new(addr, model_name),
+    )
 }

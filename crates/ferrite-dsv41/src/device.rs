@@ -127,7 +127,7 @@ struct Kernels {
     compressor: unsafe extern "C" fn(
         *const f32, *const u8, *const u8, *const u8, *const u8, *const f32,
         *mut f32, *mut f32, *mut f32, *mut i32,
-        c_int, c_int, c_int, c_int, c_int, c_int, f32, CuStream,
+        c_int, c_int, c_int, c_int, c_int, c_int, *const c_int, f32, CuStream,
     ) -> c_int,
     rope_precompute: unsafe extern "C" fn(
         *mut f32, *mut f32, c_int, c_int, c_int, f32, f32, f32, f32, CuStream,
@@ -1150,12 +1150,13 @@ impl Device {
         head_dim: i32,
         ratio: i32,
         start_pos: i32,
+        pos_ctr: *const c_int,
         eps: f32,
     ) -> Result<()> {
         let rc = unsafe {
             (self.kernels.compressor)(
                 x, wkv, wkv_scale, wgate, wgate_scale, norm_w, state_kv, state_score, latents,
-                out_rows, b, seqlen, dim, head_dim, ratio, start_pos, eps, self.stream,
+                out_rows, b, seqlen, dim, head_dim, ratio, start_pos, pos_ctr, eps, self.stream,
             )
         };
         self.kerr(rc, "dsv41_compressor")

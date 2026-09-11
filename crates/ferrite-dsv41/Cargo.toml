@@ -17,3 +17,8 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 serde.workspace = true
 serde_json.workspace = true
 ferrite-types = { path = "../ferrite-types" }
+# The shared HTTP/SSE serving stack (axum routes, the engine driver thread, the
+# chat-tokenizer/stop-set boundary, the single-flight engine adapter). The
+# DSV41 serve mode uses the SAME code GLM serves through — no std::net server,
+# no forked HTTP layer here.
+ferrite-http = { path = "../ferrite-http" }

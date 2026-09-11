@@ -97,8 +97,8 @@ fn default_max_tokens() -> Option<usize> {
     Some(256)
 }
 
-/// `POST /v1/chat/completions`.
-pub async fn chat_completions(
+/// `POST /v1/chat/completions` (routed by `router` / `router_with`).
+async fn chat_completions(
     State(st): State<RouterState>,
     Json(req): Json<ChatRequest>,
 ) -> axum::response::Response {

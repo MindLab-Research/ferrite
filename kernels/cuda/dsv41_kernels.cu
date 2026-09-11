@@ -1031,7 +1031,7 @@ __global__ void compressor_pool_kernel(const float* __restrict__ kvp,
             latents[(size_t)out_row * hd + c] = yv[i] * inv * norm_w[c];
         }
     }
-    (void)start_pos;
+    (void)pos_ctr;
 }
 
 }  // namespace
@@ -1337,7 +1337,8 @@ extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_
                                 const uint8_t* wgate, const uint8_t* wgate_scale,
                                 const float* norm_w, float* state_kv, float* state_score,
                                 float* latents, int32_t* out_rows, int b, int seqlen, int dim,
-                                int head_dim, int ratio, int start_pos, float eps, cudaStream_t s) {
+                                int head_dim, int ratio, int start_pos, const int* pos_ctr,
+                                float eps, cudaStream_t s) {
     if (b <= 0 || seqlen <= 0 || dim <= 0 || head_dim <= 0 || ratio <= 0)
         return (int)cudaErrorInvalidValue;
     if ((dim & 31) || (head_dim & 63)) return (int)cudaErrorInvalidValue;
@@ -1401,10 +1402,12 @@ extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_
         if (work > 0)
             compressor_state_kernel<<<(blocks > 0 ? blocks : 1), 256, 0, s>>>(
                 (const float*)kvp, (const float*)scp, state_kv, state_score, b, seqlen, head_dim,
-                ratio, start_pos);
+                ratio, pos_ctr);
     }
     // 4. pooling + RMSNorm + the out_rows decision
-    int mode, grid_n, out_rows_val;
+    // mode/grid_n are host-known (constant per phase, so a graph can bake them);
+    // out_rows_val is NOT passed - the kernel derives it from the device counter
+    int mode, grid_n;
     if (ratio == 1) {
         mode = 0;
         grid_n = rows;
@@ -1416,13 +1419,12 @@ extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_
     } else {
         mode = 2;
         grid_n = b;
-        out_rows_val = ((start_pos + 1) % ratio == 0) ? 1 : 0;
     }
     {
         const unsigned launch = (unsigned)(grid_n > 0 ? grid_n : 1);
         compressor_pool_kernel<<<launch, 128, 0, s>>>(
             (const float*)kvp, (const float*)scp, norm_w, state_kv, state_score, latents, out_rows,
-            mode, grid_n, out_rows_val, b, seqlen, head_dim, ratio, start_pos, eps);
+            mode, grid_n, b, seqlen, head_dim, ratio, pos_ctr, eps);
     }
     compressor_free(xq, s);
     compressor_free(xs, s);

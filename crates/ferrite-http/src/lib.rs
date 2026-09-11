@@ -27,15 +27,23 @@
 //!   keeps the hicache race-free), tokio mpsc both directions, stats
 //!   snapshot per tick.
 //! - **`engine`** — the request/event contract (`RequestSpec` in, token
-//!   deltas + finish + usage out; the async↔engine seam is plain data).
+//!   deltas + finish + usage out; the async↔engine seam is plain data) and
+//!   the `ServeEngine` trait every backend implements.
+//! - **`single_flight`** — the batch-1 adapter: any engine whose runtime is a
+//!   `feed(token, pos) -> next` chain (a lockstep multi-rank pool, a
+//!   single-stream decoder) implements `StepEngine` and gets FIFO admission,
+//!   retirement and cancel behind the same `ServeEngine` seam — the shared
+//!   path for non-scheduler models.
+//! - **`serve`** — the launcher: driver + router + bind + graceful shutdown,
+//!   in one place (`launch`); engines supply a backend and a chat frame.
 //! - **`host_engine`** — the deterministic backend over the REAL
 //!   scheduler (admission, radix resume, page budgets, MTP accept
 //!   folding, retirement — everything but the transformer compute):
 //!   the full HTTP→SSE stack runs on a laptop (mock mode), and the CUDA
 //!   backend later slots in behind the same `ExecBackend` seam.
-//! - **`tokenizer`** — GLM chat frame (ferrite-serve parity: shared
-//!   system prompts radix-match across CLI and HTTP clients) + HF
-//!   tokenizer or the byte codec (mock mode).
+//! - **`tokenizer`** — the text ⇄ token boundary: the checkpoint's stop set
+//!   (`StopSpec`) and chat frame (`ChatFrame` — GLM's default, any other
+//!   model's supplied at wiring time) plus HF tokenizer / byte codec.
 //!
 //! # Serving semantics
 //!

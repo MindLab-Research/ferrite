@@ -122,8 +122,7 @@ impl<E: StepEngine> SingleFlight<E> {
         };
         let prompt = l.prompt.clone();
         let first = self.engine.prefill(&prompt)?;
-        let mut retired = false;
-        {
+        let retired = {
             let Some(l) = self.arena.get_mut(seq) else {
                 return Ok(());
             };
@@ -131,11 +130,12 @@ impl<E: StepEngine> SingleFlight<E> {
             l.prompt = Vec::new(); // the KV holds it now
             l.out.push(first);
             l.next = first;
-            retired = stopped || l.out.len() >= l.max_new;
+            let retired = stopped || l.out.len() >= l.max_new;
             if retired {
                 l.retired = true;
             }
-        }
+            retired
+        };
         self.tokens += 1;
         self.live = if retired { None } else { Some(seq) };
         Ok(())
@@ -151,19 +151,19 @@ impl<E: StepEngine> SingleFlight<E> {
             None => return Ok(()),
         };
         let next = self.engine.decode(token, pos)?;
-        let mut retired = false;
-        {
+        let retired = {
             let Some(l) = self.arena.get_mut(seq) else {
                 return Ok(());
             };
             let stopped = self.engine.is_stop(next);
             l.out.push(next);
             l.next = next;
-            retired = stopped || l.out.len() >= max_new;
+            let retired = stopped || l.out.len() >= max_new;
             if retired {
                 l.retired = true;
             }
-        }
+            retired
+        };
         self.tokens += 1;
         if retired {
             self.live = None;

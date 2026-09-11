@@ -383,6 +383,7 @@ dependencies = [
 name = "ferrite-dsv41"
 version = "0.1.0"
 dependencies = [
+ "ferrite-http",
  "ferrite-types",
  "libc",
  "serde",
