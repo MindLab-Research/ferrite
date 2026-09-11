@@ -502,7 +502,8 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const f32,
         *const f32, *const f32,
         *mut f32, *mut f32, *mut f32, *mut f32,
-        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
+        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
+        *mut u8, *mut f32, CuStream,
     ) -> c_int,
     /// Stage-C persistent prototype: the whole hc front end in ONE block as a
     /// `__syncthreads` phase machine (no ticket, no spin). Same ABI as
@@ -548,6 +549,7 @@ struct Kernels {
             *const f32, *const f32,
             *mut f32, *mut f32, *mut f32, *mut f32,
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
+            *mut u8, *mut f32,
             CuStream, CuStream, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
         ) -> c_int,
     >,
@@ -3588,6 +3590,8 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        xq4: *mut u8,
+        xsc4: *mut f32,
     ) -> Result<bool> {
         let rc = unsafe {
             (self.kernels.hc_front)(
@@ -3609,6 +3613,8 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
+                xq4,
+                xsc4,
                 self.stream,
             )
         };
@@ -3669,6 +3675,8 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        xq4: *mut u8,
+        xsc4: *mut f32,
     ) -> Result<bool> {
         let f = self.need(self.kernels.hc_front_split, "dsv41_hc_front_split")?;
         let rc = unsafe {
@@ -3691,6 +3699,8 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
+                xq4,
+                xsc4,
                 self.stream,
                 self.rt.side_stream(),
                 // Dead ABI slots (EARLY-on-main): the launcher neither validates

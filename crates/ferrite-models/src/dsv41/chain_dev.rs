@@ -95,6 +95,15 @@ struct Scratch {
     /// quant1 (qr, o, ex_act, engram rows) is untouched - different source.
     /// Cell because quant1 takes &self (the whole lin/lin2 chain does).
     xq_of_xn_valid: std::cell::Cell<bool>,
+    /// QUANT_FOLD (DSV41_QUANT_FOLD, default ON): set when the hc tail's EARLY
+    /// collapse epilogue emitted the fp4 packing of `xn` into `xq4`/`xsc4`
+    /// alongside its f32 write-back and its fp8 (T1). The MoE's `quant_fp4(xn)`
+    /// is then redundant and skips its launch (and the `xn` read-back), clearing
+    /// the flag - consume-once, source-gated exactly like `xq_of_xn_valid`.
+    /// Only the FFN front sets it: the attention front's collapse output is
+    /// consumed by the fp8 projections, and the FFN front overwrites `s.xn`
+    /// (which is what the MoE actually quantises) before `moe()` runs.
+    xq4_of_xn_valid: std::cell::Cell<bool>,
     /// T2 (attention side): set when `rmsnorm(qr)` emitted the fp8 of its own
     /// normalised output through `ferrite_rmsnorm_q`; the NEXT quant1(qr) - the
     /// wq_b (and, under IDX_FUSE, idx_wq_b) projection's - skips its launch and

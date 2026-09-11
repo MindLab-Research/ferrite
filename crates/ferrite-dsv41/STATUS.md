@@ -7327,3 +7327,23 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 3. **bf16-cpasync 的无条件 commit** 添加固定开销
 
 **bisect 进行中**：v10np1（pipeline OFF）/ v10np2（浅 pipeline）/ v10nw（warm OFF）
+
+### bisect 定案：三项优化的 serve 真相（2026-09-12 07:30）
+
+| 臂 | p50 | tok/s | 判定 |
+|---|---|---|---|
+| v10（全开：PDEPTH=5 + w2warm + bf16） | 6.31ms | 158.5 | +0.08 回归 |
+| v10np1（pipeline OFF） | 6.27ms | 159.5 | pipeline 贡献 +0.04 |
+| v10np2（PDEPTH=2） | 6.30ms | 158.7 | 浅 pipeline 也 +0.03 |
+| v10nw（w2warm OFF） | 6.27ms | 159.5 | warm 贡献 +0.04 |
+| （bf16cpasync） | — | — | 中性（两臂一致推出） |
+
+**处置**：PDEPTH 默认 → 1（OFF）、W2_PREWARM 默认 → 0（OFF）、bf16 保持 ON（中性无害）。
+
+**第三次隔离→生产失效的根因**（a32-vec4 → AR grid → PDEPTH pipeline）：
+1. **隔离探针无法模拟 serve 的三个条件**：SM 争抢（侧流并行）、L2 竞争、占用率敏感
+2. **PDEPTH 的占用率损失**（42.8KB smem → 2 blocks/SM）超过延迟隐藏收益——隔离时单 kernel 时间长掩盖占用率，serve 时 block 供给不足暴露
+3. **w2warm 的 SM 争抢**：warmer kernel 与 gateup 尾部 CTA 同 SM——PDL 重叠变成争抢
+4. **gateup 的 80% issue 停等不是权重读取延迟**——cp.async 修复不了；真正瓶颈可能是 LUT 的 smem 随机 gather 延迟（与"LUT 放 constant 慢 6.6x"发现一致）
+
+**方法论铁律（第三次确认）**：隔离探针只用于淘汰明显差的方案；正向收益必须 serve A/B 确认。
