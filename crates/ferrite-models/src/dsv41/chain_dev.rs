@@ -98,6 +98,11 @@ struct Scratch {
     /// The device position counter: the argmax (the step's last kernel)
     /// advances it, so every kernel during the step reads a stable current pos.
     pos_ctr: DevBuf, // [1] i32
+    /// Vocabulary-sliced lm_head only: the rank-local argmax publishes its
+    /// packed (key | ~global index) comparison key here, and `argmax_pub_kernel`
+    /// copies it into every peer's staging slot. Without it the sliced path
+    /// would hand a NULL pointer to a kernel that dereferences it.
+    argmax_packed: DevBuf, // [1] u64
     /// Per-layer compressed-KV counters, advanced by the compressor's commit
     /// kernel on the device (the host used to track compress_len and download
     /// `out_rows` to decide). Consumers read this instead of a launch argument.
@@ -198,14 +203,13 @@ fn mix_gate_shared() -> bool {
 }
 
 /// DSV41_HEAD_SLICE=1 enables the vocabulary-sliced lm_head: each rank projects
-/// only its 1/world slice and one published u64 per rank picks the winner.
+/// only its 1/world slice (8x less head weight traffic per step — the full
+/// 129280-row head measured 298us against 48us for one rank's slice) and one
+/// published u64 per rank picks the winner with the same lowest-index tie rule.
 ///
-/// DEFAULT OFF (2026-09-11): the sliced cross-rank argmax kernel
-/// (`dsv41_argmax_sliced` / `argmax_pub_kernel`) was deleted by the nuclear
-/// diagnostic (6be01ea) and never reinstated, so the sliced path would run a
-/// wasted 1/world gemv and then fall back to the full head anyway. Turning the
-/// flag on would also hand a NULL packed buffer to a kernel that dereferences
-/// it — re-enable only after the kernel is restored.
+/// DEFAULT OFF for now: the cross-rank kernel chain is restored and the packed
+/// buffer is allocated, but the default only flips once an A/B confirms the text
+/// (DSV41_HEAD_SLICE=1 runs the sliced path today).
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v == "1").unwrap_or(false))
@@ -393,6 +397,7 @@ impl<'a> DevChain<'a> {
             logits: dev.alloc(fb(cfg.vocab_size))?,
             ids: dev.alloc(4)?,
             pos_ctr: dev.alloc(4)?,
+            argmax_packed: dev.alloc(8)?,
             clen: dev.alloc(cfg.n_layers * 4)?,
             scores: dev.alloc(fb(n_exp))?,
             route_idx: dev.alloc(fb(topk).max(4))?,
@@ -1057,11 +1062,7 @@ impl<'a> DevChain<'a> {
                 seg as i32,
                 (rank * seg) as i32,
                 self.s.ids.ptr as *mut std::ffi::c_int,
-                // packed key buffer: DIAGNOSTIC - temporarily absent (the
-                // unconditional 8-byte pool allocation it needed is itself a
-                // suspect for the degeneration, being wedged between ids and
-                // pos_ctr in the Scratch ordering).
-                std::ptr::null_mut(),
+                self.s.argmax_packed.ptr as *mut u64,
                 self.s.pos_ctr.ptr as *mut std::ffi::c_int,
                 c.peer_slots_dev() as *const u64,
                 world as i32,

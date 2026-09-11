@@ -4920,3 +4920,77 @@ fixA   steps= 98 p10=13.07 p50=13.28 p90=13.48 -> 75.3 tok/s  faults: 0
 现在 `=1` 才启用）：sliced 跨 rank argmax kernel（`dsv41_argmax_sliced`/`argmax_pub_kernel`）
 在 nuclear diagnostic（6be01ea）中删除后从未恢复，旧默认 `true` 会①白算一次 1/world 词表
 gemv 再 fallback 全量②把一个 NULL packed 缓冲传给会解引用它的 kernel。
+
+## 2026-09-11 下午（正确性修复后）：剖析驱动的 kernel 优化
+
+### 当前正确基线（commit f477ca8 起，双产物同源）
+
+`fixA steps=98 p50=13.28ms -> 75.3 tok/s, faults=0, 四段全对`。
+
+### nsys 分解（B=1 decode 稳态，per step per rank；profile 用 AR_V5=0/GRAPH_STEP=0 以免 v5 自旋放大）
+
+| kernel | 次/步 | µs/次 | ms/步 | 占比 |
+|---|---|---|---|---|
+| `gemm_fp8_gemv_kernel` | 171 | 17.0 | **2.90** | 21.8% |
+| `ar_reduce_kernel`（旧 host-barrier 路径，默认走 v5） | 82 | 32.1 | 2.63 | 19.8% |
+| `expert_gemv_fp4_batched_kernel` | 80 | 22.2 | **1.78** | 13.4% |
+| `gemv_bf16_kernel` | 44 | 22.3 | 0.98 | 7.4% |
+| `hc_mixes_tail_kernel` | 80 | 12.2 | 0.97 | 7.3% |
+| `hc_mix_dots_kernel` | 80 | 7.4 | 0.59 | 4.4% |
+| `ar_store_kernel` / `ar_stamp_kernel` | 82 | 5.9 / 4.2 | 0.48 / 0.35 | 6.2% |
+| `sparse_attn_pf_kernel` | 40 | 10.5 | 0.42 | 3.1% |
+| `quant_kernel<0>` | 176 | 1.6 | 0.28 | 2.1% |
+| `gemv_bf16_fp8x2_kernel` | 5 | 55.0 | 0.27 | 2.1% |
+| `route_topk_kernel` | 40 | 5.2 | 0.21 | 1.6% |
+| `indexer_topk_kernel` | 4 | 50.1 | 0.20 | 1.5% |
+| `dsv41_hc_post_inplace_kernel` | 80 | 1.9 | 0.15 | 1.1% |
+| `rmsnorm_kernel` | 44 | 2.9 | 0.13 | 0.9% |
+
+### 隔离微基准（生产 shape，k=5120，mode=4 默认）
+
+| shape | 权重 | 中位 | 有效带宽 |
+|---|---|---|---|
+| `fp8 wq_b n=1024` | 5.0MB | 19.7µs | 254 GB/s |
+| `fp8 wq_a+wkv n=1664` | 8.1MB | 23.1µs | 351 GB/s |
+| `fp8 sharedexp n=256` | 1.25MB | 17.3µs | **72 GB/s** |
+| `bf16 gate n=384` | 3.75MB | 11.7µs | 319 GB/s |
+| `bf16 lm_head/8 n=16160` | 157MB | 48.3µs | 3.27 TB/s |
+| `bf16 lm_head FULL n=129280` | 1262MB | **298.0µs** | 4.24 TB/s |
+
+**结论**：m=1 的 GEMV 族（fp8 与 bf16 gate）与 hc 小核**全部是延迟/占用率受限**，
+不是带宽受限——带宽随行数单调上升（72 GB/s @256 行 → 4.2 TB/s @129280 行），
+即 `n×32 线程 / (148 SM × 2048)` 的占用率决定一切。
+
+### 已实测的杠杆结论（勿重复）
+
+| 尝试 | 结果 |
+|---|---|
+| `#pragma unroll` 4 → 8 | **中性**（wq_b 19.74 vs 19.68）→ 不是展开深度问题 |
+| `DSV41_GEMV_FP8_WARPS` 1/2/4/8 | **中性**（wq_b 19.5-19.8；sharedexp 16.8-19.5）→ 不是每 block 行数 |
+| `DSV41_GEMV_FP8_MODE=3`（不 staging 整块激活） | wq_b 更差 21.8，sharedexp 19.9 |
+| **常量 scale 诊断**（把两个 per-kb 全局标量加载换成 1.0） | wq_b **−21%**、sharedexp **−34%** → **这两个全局加载是主要停顿源** |
+
+### ✅ 已落地：`gemm_fp8_gemv` 的 scale 行 staging（commit 见 git log）
+
+把每行的 ue8m0 scale 行（nb_k 字节）用 cp.async 与权重行一起 staging，并把 block 级共享的
+`a_scale`（nb_k 个 f32）在行循环外读入 smem 一次。**数值逐位不变**（值与使用顺序未动）。
+微基准：wq_b **19.7 → 18.6µs（−5%）**、sharedexp **17.3 → 15.5µs（−11%）**、
+wq_a+wkv 23.1 → 22.4（−3%）。
+**同时修掉一个隐藏越界**：`dsv41_gemm_fp8_mx2`（融合双族 launcher）仍用旧 smem 公式，
+新布局会写越过 dynamic smem 分配。
+
+### ✅ 已落地：恢复 lm_head 词表切分 + 跨 rank argmax
+
+`dsv41_argmax_sliced` / `argmax_pub_kernel` / `argmax_final_kernel` 在 nuclear diagnostic
+（6be01ea）中被删后从未恢复，导致 `head_slice()` 只能默认关 → **每步每个 rank 都算全词表
+lm_head（129280 行 × 5120，298µs）**，而 1/8 切片只要 48µs（6.2x）。本次恢复三个内核
+（`argmax_kernel` 增加 `idx_off`/`packed` 参数，packed 键含**全局**索引以便跨 rank 取 max，
+并列规则与全词表 argmax 逐位一致），并恢复 `argmax_packed` 缓冲（当初把它当"退化嫌疑人"
+删掉，实为遮蔽 bug 的误判）。`DSV41_HEAD_SLICE=1` 启用，A/B 通过后翻默认。
+
+### 用户提供的架构方向（下一阶段）
+
+1. **HCA 独立重压缩路线删除**：V4 的 CSA/HCA 混合同收敛为 SWA + CSA2，跨层共享 + 稀疏检索。
+2. **删除重复保存/检索**：多层共享全局 KV、indexer K、Top-K 结果；SWA 状态用有限窗口重放恢复。
+3. **Single-Pass mHC**：把输入混合系数**错位交给下一子层**使用 → 消除 mHC 的多余访存往返，
+   为算子融合创造条件（对应当前 `hc_mix_dots`+`hc_mixes_tail` 1.56ms/步）。
