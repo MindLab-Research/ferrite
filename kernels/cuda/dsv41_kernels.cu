@@ -1856,10 +1856,10 @@ __global__ void dsv41_hc_post_inplace_kernel(float* __restrict__ res,
         for (int k = 0; k < 8; ++k) {
             if (k >= n) break;
             const float c = comb[(size_t)k * n + i];
-            acc.x += c * r[k].x;
-            acc.y += c * r[k].y;
-            acc.z += c * r[k].z;
-            acc.w += c * r[k].w;
+            acc.x = __fmaf_rn(c, r[k].x, acc.x);
+            acc.y = __fmaf_rn(c, r[k].y, acc.y);
+            acc.z = __fmaf_rn(c, r[k].z, acc.z);
+            acc.w = __fmaf_rn(c, r[k].w, acc.w);
         }
         *reinterpret_cast<float4*>(res + (size_t)i * h + j) = acc;
     }
