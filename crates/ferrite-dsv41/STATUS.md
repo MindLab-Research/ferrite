@@ -6037,6 +6037,13 @@ wo-b1-impl subagent 正在实施。
 ⇒ 默认配置里这个 fold **根本不跑**，`dsv41_hc_post_inplace` 仍是 2 site/层 = **80 节点/步**。
 再叠加 tail split 把 tail 核拆成 LATE(side)+EARLY(main) 两半（80 → **160**），默认配置的
 hc 家族 = dots 80 + tail 160 + post_inplace 80 = **320/步**（不是 240−80=160）。
+✅ **2026-09-11 稍后：互斥已解除**。根因是**纯实现/时序**（非数据依赖）：fold 在 AR 内核里消费
+`post`/`comb`（并原位改写 `s.h` —— 而侧流 LATE 半仍在读 `s.h`），但唯一的 join 挂在 `layer` 里
+AR **之后**的 `hc_tail_join()`（`chain_dev.rs:2167/2298`），对 fold 而言永远排在消费之后 ⇒ 图里
+side-LATE 节点与 fused-AR 节点之间**没有任何依赖边**（真实 race，不是理论问题）。修复：`ar_hc_post_fold`
+在发起 fused AR 之前自己 wait `join_ev`（`chain_dev.rs:1383-1391`），`hcpost_epi()` 默认翻 ON
+（`:2033`），split 分支去掉 `!Self::hcpost_epi()`（`:1853`）。`layer` 里那两个 join 保留给未 fold 路径
+（armed 标志已被提前消费时是 no-op）。下面是**修复前**默认配置的节点账（供对照）。
 按当前代码逐核重数（默认 env、40 层 + compress/indexer/engram + head/tail）：**≈1156 kernel 节点/步**
 （主流 ≈916，侧流 ≈240；另计 fork/join event 节点 ≈320）。逐 family：gemm_fp8 250 · gemv_bf16 53 ·
 hc 320 · AR(store+pubred) 164 · quant(quant_fp4 40+quant_fp8 2) 42 · routed(gateup+down) 80 ·
