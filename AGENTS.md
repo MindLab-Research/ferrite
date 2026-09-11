@@ -245,11 +245,14 @@ Local (no GPU needed): `cargo check` (hard gate — every commit).
 Remote: b300-4 `ssh ubuntu@43.202.208.136`, repo `~/ferrite`, model `/opt/dlami/nvme/models/GLM-5.3-Flash`, GPUs 4–7.
 
 ```bash
-# local → remote (the remote has TWO remotes; origin's fetch refspec only tracks main):
-git push origin main:perf-b1
+# local → remote (the remote has TWO remotes; its origin refspec is
+# +refs/heads/main:refs/remotes/origin/main ONLY, and `main` tracks origin/main.
+# `perf-b1` is a STALE ancestor (8e55123) — do NOT use it as the deploy pointer):
+git push origin main
 # remote:
-ssh ubuntu@43.202.208.136 'cd ~/ferrite && git fetch origin refs/heads/perf-b1 && git reset --hard FETCH_HEAD && \
-  cd kernels/cuda && bash build.sh 103a && cd ~/ferrite && source ~/.cargo/env && cargo build --release'
+ssh ubuntu@43.202.208.136 'cd ~/ferrite && git fetch origin && git reset --hard origin/main && \
+  cd kernels/cuda && bash build.sh 103a && cd ~/ferrite && source ~/.cargo/env && \
+  touch crates/ferrite-kernel/build.rs && cargo build --release'
 ```
 
 `bash build.sh 103a` = sm_103a (B300). `103a` is required; the README's `100a` is stale.
