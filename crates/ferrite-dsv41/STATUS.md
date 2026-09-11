@@ -2735,3 +2735,44 @@ A/B 中性（21.2 vs 21.3 tok/s —— 哈希本身极小，收益是**消 H2D +
 
 **用户三项指令进度**：① 无 H2D ✓✅ ② tile 对齐 ✓✅ ③ 单图 —— **所有硬阻塞已除**
 （AR v5 ✓ HEAD_DEV ✓ premix D2D ✓ engram 设备化 ✓），剩 **pos/compress_len 设备化 + 捕获**。
+
+## ⚠️ 审计修正：attention 路径还有**每层每步的 H2D + 宿主分支**（此前遗漏 ✗）
+
+深挖 compress/attention 后发现（"无 H2D"的结论**过早**了 ✗，予以更正 ✓）：
+| # | 位置 | 内容 | 频率 |
+|---|---|---|---|
+| 1 | `attention()` 里 `ops::window_topk_idxs(win,1,1,pos)` + `ul_i32(idxs_ptr, ..)` | **宿主算窗口索引 + 每层上传 win×4B** ✗ | 每层每步 |
+| 2 | `compress()` 里 `download_f32(out_rows)` → `if n[0] > 0 {rope + memcpy_d2d + len+=1}` | **每层同步 D2H + 宿主数据分支** ✗（图不可捕获）| 每 KV 源层每步 |
+| 3 | `compress_len`（`LayerCache` 宿主状态）| 作为 kernel 参数传入注意力/索引 ⇒ 图会冻结 ✗ | 每层 |
+| 4 | `pos`（attention 两处 `pos as i32` 作 kernel 参数）| 同上 ✗ | 每层 |
+
+### 剩余执行计划（attention 设备化 → 单图，全部已设计好）
+1. **窗口索引设备化**（消 H2D #1）：小 kernel 读设备 pos 计数器填 `idxs[0..win]`
+   （decode 分支的语义：尾部 window 个位置，越界补 -1 —— 照 `window_topk_idxs` 的 else 分支逐位移植 ✓）。
+2. **compress commit kernel**（消 D2H #2 + 分支）：读设备 `out_rows`，若 >0 则
+   **rope the latent**（照 `apply_rope_kernel` 的数学：`row = x + (hd - rope_dim)` 偏移、
+   `cos[t*half+i]` 表索引、成对旋转 ✓）→ 存 ring 第 `window + *clen` 行 → **推进设备 clen**。
+3. **compress_len → 设备计数器数组 `[n_layers]`**，注意力的 kvb/indexer kernel 改读设备值。
+4. **pos → 单一设备计数器**：把推进从 engram kernel 移到 **argmax**（步内最后一个 kernel ⇒ 步内 *pos 稳定 ✓）。
+5. **审计 indexer 路径**（"indexer 在设备上覆写压缩块"——可能还有宿主工作）。
+6. **捕获**（复用 DSV41_GRAPH_MOE 框架 + 其 4 个已修坑 ✓），图 = [engram → embed → 45×(layer+2×AR v5) → head → argmax]。
+
+**验证纪律（用户最新指令 ✓）**：隔离复现器秒级迭代；**只在落结论时跑一次模型**（四段文本**亲自读** ✓）。
+
+## 本会话最终总结（2026-09-11）
+**2.6 → 21.4 tok/s（8.2x）**，九项改动全部验证（前八项 A/B + engram 中性）：
+| # | 改动 | 收益 |
+|---|---|---|
+| 1 | hc_mixes 块形状（mix*32）| 7.2 → 12.5（**+74%**）|
+| 2 | M=1 fp4 GEMV（专家 gate/up）| → 15.2（+21%）|
+| 3 | M=1 fp8 GEMV（dense）| → 17.6（+16%）|
+| 4 | warp 寄存器 sinkhorn | → 18.5（+5%）|
+| 5 | 专家 down 并入 GEMV（修 row_weight 轴错误）| → 19.8（+7%）|
+| 6 | sparse_attn flash 分槽 | → 21.1（+6%）|
+| 7 | HEAD_DEV 设备 argmax | → 21.2 |
+| 8 | **AR v5**（第 6 次尝试成功）| → 21.4（+1%，**结构解锁**）|
+| 9 | engram 设备哈希 | 中性（**消 H2D** ✓）|
+**三项结构性资产**：AR v5（图可捕获集合通信）· HEAD_DEV（token 不过宿主）· 差分法+隔离复现器测量体系。
+**方法论沉淀**：全运行 nsys 平均 ≠ decode（差分法 ✓）；多卡 nsys 单次耗时不可信（复现器 ✓）；
+L2 常驻工作集上"流量大"≠瓶颈；一次只改一个变量；同二进制背靠背；构建后必查 error 数与 nm；
+匿名 namespace = dlsym 盲区；"输出列 n"≠"M 行"。
