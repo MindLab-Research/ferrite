@@ -122,10 +122,6 @@ fn persist_matches_two_launch_bit_for_bit() {
                 cfg.norm_eps,
                 xq.ptr as *mut u8,
                 xsc.ptr as *mut f32,
-                // QUANT_FOLD destinations: null here, so this arm takes the
-                // standalone-quant_fp4 behaviour.
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
             )
             .unwrap()
         };

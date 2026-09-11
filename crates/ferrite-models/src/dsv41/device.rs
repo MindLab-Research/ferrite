@@ -111,26 +111,6 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
-    /// SWIGLU_FOLD: the M=1 w2 GEMV whose PROLOGUE produces the fp8 activation
-    /// it consumes, so the shared expert's `swiglu_limit_q` launch disappears.
-    /// Instead of reading a pre-quantised (`a`, `a_scale`) pair it takes the RAW
-    /// f32 gate|up row `gu` (`ex_act`, [2k]) plus the swiglu `limit`, applies
-    /// `swiglu_limit_q_kernel`'s clamps + silu and encodes the result into
-    /// shared memory with that kernel's amax tree / scale / e4m3 byte, term for
-    /// term. `epi_add` folds the A5 `out += acc` merge into the same launch.
-    /// Optional: a stale `.so` has no entry and the caller keeps the
-    /// (swiglu_limit_q, gemm_fp8_mx) pair. Returns 2 when the shape/mode cannot
-    /// use it (never 1 — cudaErrorInvalidValue, the round-42 collision).
-    /// ABI: stream LAST.
-    gemm_fp8_mx_swiglu: Option<
-        unsafe extern "C" fn(
-            // gu (f32 [2k] gate|up row), swiglu limit
-            *const f32, f32,
-            // w, w_scale, bias, out, n, k, epi_add
-            *const u8, *const u8, *const f32, *mut f32, c_int, c_int, c_int,
-            CuStream,
-        ) -> c_int,
-    >,
     /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
     /// epilogue (`out += w @ a`). A separate symbol, so a stale `.so` simply has
     /// no entry and the caller keeps the gemm_fp8_mx + add_inplace pair. Returns
@@ -551,8 +531,7 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const f32,
         *const f32, *const f32,
         *mut f32, *mut f32, *mut f32, *mut f32,
-        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
-        *mut u8, *mut f32, CuStream,
+        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
     ) -> c_int,
     /// Stage-C persistent prototype: the whole hc front end in ONE block as a
     /// `__syncthreads` phase machine (no ticket, no spin). Same ABI as
@@ -598,7 +577,6 @@ struct Kernels {
             *const f32, *const f32,
             *mut f32, *mut f32, *mut f32, *mut f32,
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
-            *mut u8, *mut f32,
             CuStream, CuStream, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
         ) -> c_int,
     >,
@@ -617,7 +595,6 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
-            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -625,7 +602,6 @@ struct Kernels {
             c_int,
             c_int,
             c_int,
-            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -633,7 +609,7 @@ struct Kernels {
     /// producer kernel's epilogue (`dsv41_gemm_fp8_mx`'s staging args), so this
     /// entry skips `p2p_ar_store_v5_kernel` and only polls/reduces. Same shapes as
     /// `ferrite_p2p_ar_v5` minus `partial` and `staging_tbl` (the caller is not
-    /// storing from here). It ALWAYS stamps: the fused producer store never does.
+    /// storing from here).
     p2p_ar_pubred_v5: Option<
         unsafe extern "C" fn(
             *const *mut u32,
@@ -659,7 +635,6 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
-            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -672,7 +647,6 @@ struct Kernels {
             *const f32,
             c_int,
             c_int,
-            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -687,7 +661,6 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
-            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -695,7 +668,6 @@ struct Kernels {
             c_int,
             c_int,
             c_int,
-            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -708,7 +680,6 @@ struct Kernels {
             *const *mut f32,
             *const *mut u32,
             *mut c_uint,
-            *mut c_uint, // STAMP FOLD arrival state (null = fold off)
             *const f32,
             *const c_uint,
             *mut f32,
@@ -721,7 +692,6 @@ struct Kernels {
             *const f32,
             c_int,
             c_int,
-            c_int, // stamp_in_store
             CuStream,
         ) -> c_int,
     >,
@@ -756,7 +726,6 @@ impl Device {
             gemm_fp8_mx_rope: ko!(rt, "dsv41_gemm_fp8_mx_rope"),
             gemm_fp8_mx2_rope: ko!(rt, "dsv41_gemm_fp8_mx2_rope"),
             gemm_fp8_mx_rope_norm: ko!(rt, "dsv41_gemm_fp8_mx_rope_norm"),
-            gemm_fp8_mx_swiglu: ko!(rt, "dsv41_gemm_fp8_mx_swiglu"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             gemm_fp8_mx_f32: ko!(rt, "dsv41_gemm_fp8_mx_f32"),
             gemm_fp8_wo_pair: ko!(rt, "dsv41_gemm_fp8_wo_pair"),
@@ -1572,71 +1541,6 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_rope_norm")?;
-        Ok(true)
-    }
-
-    /// SWIGLU_FOLD: true when the loaded .so carries the swiglu-fused w2 GEMV
-    /// (`dsv41_gemm_fp8_mx_swiglu`). A stale .so leaves DSV41_SWIGLU_FOLD inert
-    /// and the (swiglu_limit_q, gemm_fp8_mx) pair runs.
-    pub fn supports_swiglu_fold(&self) -> bool {
-        self.kernels.gemm_fp8_mx_swiglu.is_some()
-    }
-
-    /// SWIGLU_FOLD: the shared expert's w2 M=1 GEMV whose PROLOGUE produces the
-    /// fp8 activation it consumes. `gu` is the f32 gate|up row the caller would
-    /// have handed to `swiglu_limit_q` (`ex_act`, [2k]: gate first, up second);
-    /// the prologue applies that kernel's clamps + silu and encodes the result
-    /// into shared memory with its amax tree / `fast_round_scale` / e4m3 byte,
-    /// term for term. The standalone `swiglu_limit_q` launch and the `xq`/`xsc`
-    /// hand-off disappear; the gemv's own dot is untouched, so `out` is
-    /// bit-identical to (`swiglu_limit_q`, `gemm_fp8_mx`).
-    ///
-    /// `epi_add` folds the A5 `out += acc + bias` merge into the same launch
-    /// (bit-identical to gemm_fp8_mx_add + the caller's merge: same operands,
-    /// commutative add); pass `false` to overwrite `out` and let the caller do
-    /// its own merge (the MOE_DUAL / non-A5 shape).
-    ///
-    /// `gu` must NOT alias `out`. Ok(false) on any decline (wrong mode, shape
-    /// not a multiple of 32, null pointer, or a stale `.so`), so the caller
-    /// keeps the old pair.
-    /// ABI: stream LAST.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemm_fp8_mx_swiglu_on(
-        &self,
-        gu: *const f32,
-        limit: f32,
-        w: *const u8,
-        w_scale: *const u8,
-        bias: *const f32,
-        out: *mut f32,
-        n: i32,
-        k: i32,
-        epi_add: bool,
-        s: CuStream,
-    ) -> Result<bool> {
-        let Some(f) = self.kernels.gemm_fp8_mx_swiglu else {
-            return Ok(false);
-        };
-        let rc = unsafe {
-            f(
-                gu,
-                limit,
-                w,
-                w_scale,
-                bias,
-                out,
-                n,
-                k,
-                epi_add as i32,
-                s,
-            )
-        };
-        // Round-42 fix: the C side's shape-decline is 2 (never 1, which collides
-        // with cudaErrorInvalidValue).
-        if rc == 2 {
-            return Ok(false);
-        }
-        self.kerr(rc, "dsv41_gemm_fp8_mx_swiglu")?;
         Ok(true)
     }
 
@@ -2855,7 +2759,6 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
-        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2863,12 +2766,11 @@ impl Device {
         world: c_int,
         my_rank: c_int,
         stride: c_int,
-        stamp_in_store: c_int,
     ) -> Result<()> {
         let f = self.need(self.kernels.p2p_ar_v5, "ferrite_p2p_ar_v5")?;
         let rc = unsafe {
-            f(partial, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out, n,
-              world, my_rank, stride, stamp_in_store, self.stream)
+            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
+              world, my_rank, stride, self.stream)
         };
         self.kerr(rc, "ferrite_p2p_ar_v5")
     }
@@ -2915,7 +2817,6 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
-        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2928,15 +2829,14 @@ impl Device {
         hc_comb: *const f32,
         hc_n: c_int,
         hc_h: c_int,
-        stamp_in_store: c_int,
     ) -> Result<bool> {
         let f = match self.kernels.p2p_ar_v5_hcpost {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(partial, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out, n,
-              world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, stamp_in_store,
+            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
+              world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h,
               self.stream)
         };
         // 1 == the launcher declined the shape (see `ferrite_p2p_ar_v5_hcpost`);
@@ -2961,7 +2861,6 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
-        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -2969,15 +2868,14 @@ impl Device {
         world: c_int,
         my_rank: c_int,
         stride: c_int,
-        stamp_in_store: c_int,
     ) -> Result<bool> {
         let f = match self.kernels.p2p_ar_v5_add {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(partial, bias, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out,
-              n, world, my_rank, stride, stamp_in_store, self.stream)
+            f(partial, bias, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out,
+              n, world, my_rank, stride, self.stream)
         };
         if rc == 1 {
             return Ok(false);
@@ -2997,7 +2895,6 @@ impl Device {
         staging_tbl: *const *mut f32,
         ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
-        arrive: *mut c_uint,
         staging_local: *const f32,
         ready_local: *const c_uint,
         out: *mut f32,
@@ -3010,15 +2907,14 @@ impl Device {
         hc_comb: *const f32,
         hc_n: c_int,
         hc_h: c_int,
-        stamp_in_store: c_int,
     ) -> Result<bool> {
         let f = match self.kernels.p2p_ar_v5_hcpost_add {
             Some(f) => f,
             None => return Ok(false),
         };
         let rc = unsafe {
-            f(partial, bias, staging_tbl, ready_tbl, epoch, arrive, staging_local, ready_local, out,
-              n, world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, stamp_in_store,
+            f(partial, bias, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out,
+              n, world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h,
               self.stream)
         };
         if rc == 1 {
@@ -3756,8 +3652,6 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
-        xq4: *mut u8,
-        xsc4: *mut f32,
     ) -> Result<bool> {
         let rc = unsafe {
             (self.kernels.hc_front)(
@@ -3779,8 +3673,6 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
-                xq4,
-                xsc4,
                 self.stream,
             )
         };
@@ -3841,8 +3733,6 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
-        xq4: *mut u8,
-        xsc4: *mut f32,
     ) -> Result<bool> {
         let f = self.need(self.kernels.hc_front_split, "dsv41_hc_front_split")?;
         let rc = unsafe {
@@ -3865,8 +3755,6 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
-                xq4,
-                xsc4,
                 self.stream,
                 self.rt.side_stream(),
                 // Dead ABI slots (EARLY-on-main): the launcher neither validates

@@ -768,16 +768,15 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
 
 > ⚠️ **2026-09-11 explore 逐点复核（读码）——"126 / ~3 次每层"是 `db2917501`（16:48）快照，已被后续 5 个 producer-fp8 commit 清掉。**
 > `db2917501` 树里 **没有** `DSV41_OROPE_Q`（17:49）/`DSV41_NORM_FUSE`（18:12）/`DSV41_SPARSE_OROPE`（19:14）/`DSV41_WOB_F32`（19:22）/engram-f32（f102b21，19:22）/`DSV41_HC_TAIL_SPLIT`（18:06）——正是它们把 §1 的 126 打下去。
-> HEAD 逐 site 核对（`chain_dev.rs`）：`xn`(wq_a/wkv + moe shared w1/w3)→T1（`hc_front_split` EARLY，:5730）；`qr`(wq_b + idx_wq_b)→`NORM_FUSE`（`lin_rope_norm`，:1273）或 rmsnorm_q T2（:2682）；`o`(wo_a)→`sparse_attn_orope`（:3094）/`apply_rope_q`（:3146）；`wo`(wo_b)→`gemm_fp8_mx_f32`（:3282）；`ex_act`(shared w2)→`swiglu_limit_q`（:4209）/**`DSV41_SWIGLU_FOLD`**（默认 ON：shared w2 的 gemv prologue 现算，该 launch 整体消失）；`eng_rows`→`gemm_fp8_mx_f32`（:1409）。**六个生产者全部直出 fp8，默认 ON，符号在树内**（`dsv41_kernels.cu:5730/3347/4033/3520`、`dsv41_glue.cu:877`）。
+> HEAD 逐 site 核对（`chain_dev.rs`）：`xn`(wq_a/wkv + moe shared w1/w3)→T1（`hc_front_split` EARLY，:5730）；`qr`(wq_b + idx_wq_b)→`NORM_FUSE`（`lin_rope_norm`，:1273）或 rmsnorm_q T2（:2682）；`o`(wo_a)→`sparse_attn_orope`（:3094）/`apply_rope_q`（:3146）；`wo`(wo_b)→`gemm_fp8_mx_f32`（:3282）；`ex_act`(shared w2)→`swiglu_limit_q`（:4209）；`eng_rows`→`gemm_fp8_mx_f32`（:1409）。**六个生产者全部直出 fp8，默认 ON，符号在树内**（`dsv41_kernels.cu:5730/3347/4033/3520`、`dsv41_glue.cu:877`）。
 
-### SWIGLU_FOLD（2026-09-12，small-kernel-merge #2）
-- **对象**：共享专家的 `swiglu_limit_q`（`dsv41_glue.cu:217`，1.7µs × 40/步）——读 `ex_act` f32 [2·`sh_il`] → silu+clamp → fp8 `(xq,xsc)`，其唯一消费者是共享 w2 的 M=1 GEMV。
-- **做法**（NORM_FUSE 同构）：新 launcher `dsv41_gemm_fp8_mx_swiglu`（`dsv41_kernels.cu`，紧随 `dsv41_gemm_fp8_wo_pair`）+ `GemvFusion.gu`/`swiglu_limit` 两个字段；`gemm_fp8_gemv_kernel` 里 `gu != nullptr` 的 prologue 分支把 swiglu+量化写进 `s_a`/`s_as`。`a32_direct`/`act_async`/`s_as` 拷贝/`s_a` staging 四处 guard 都加了 `gu == nullptr`（与 `qr_raw` 并列）。
-- **block 宽度**：**不**强制 32 warps（参考 amax 是 per-warp 的 32-lane 树，无跨 warp 归约）⇒ 保留 `dsv41_gemv_warps_for(n)`，与调用方原本的 standalone `gemm_fp8_mx` 同 grid/同 warps ⇒ `out` 逐位。smem 用 `dsv41_gemv_sa_bytes(k, true)`（NORM_FUSE 的 norm_fuse 语义：`s_a` 槽常驻）。
-- **ABI**：`(gu, limit, w, w_scale, bias, out, n, k, epi_add, stream)`，stream 末位；decline 返回 2（stale .so / mode≠4 / `k%32` / null）。
-- **接线**（`chain_dev.rs`）：`DSV41_SWIGLU_FOLD`（默认 ON，`=0` 回退）⇒ `gemm_fp8_mx_swiglu_on(ex_act, cfg.swiglu_limit, w2, w2s, null, dst, dim, sh_il, epi_add, sh_st)`；`dst`/`epi_add` 复刻 A5 决策（`!dual && moe_epi_add()` ⇒ 直接进 `s.o`，否则写 `s.ex_out` 再合并）。它**同时顶替 A4 与 A5**：`act_q`/`fused` 都被 `sw_folded` 短路。只覆盖共享专家（routed 由 `DSV41_GATEUP_FUSE` 负责，且 routed down 读 `ex_act_b`，与本路径无关）。
-- **注意**：**未**回写 `ex_act` 的 f32（参考 kernel 会 `row[i]=v`）——`ex_act` 在该 kernel 之后无读者（已验证 `chain_dev.rs` 全文件），是死值。
-- **与 sh_pair 的关系**：`dsv41_gemm_fp8_sh_pair`（chain-pair-batch 链2，`DSV41_SH_PAIR` 默认 OFF）把 `w1w3+swiglu+w2` 三合一；本折叠只合 `swiglu+w2`（保留已优化的 `gemm_fp8_mx2` 出 w1w3）。两者互斥于同一 launch，sh_pair 需 grid-sync 驻留、尚未接线（`sh_pair()` 无调用点）。
+### SWIGLU_FOLD / QUANT_FOLD（2026-09-12 实现 → 同日 **已删除**）
+- **结论**：serve A/B 实测两项 fold 合计 **+0.39ms 回归**（`STATUS.md` v12/v12sf）；且**代码存在本身**又带来 +0.33ms 未归因回归。⇒ 已从 `dsv41_kernels.cu` / `device.rs` / `chain_dev.rs` **整体移除**：
+  - kernel：`dsv41_gemm_fp8_mx_swiglu` launcher、`GemvFusion.gu`/`swiglu_limit` 字段、`gemm_fp8_gemv_kernel` 的 `gu != nullptr` prologue 分支、四处 `gu == nullptr` guard（`a32_direct` / `act_async` / `s_as` 拷贝 / `s_a` staging）；
+  - quant-fold：`hc_mixes_tail_kernel` 去掉 `xq4`/`xsc4` 形参及其 fp4 epilogue，`dsv41_hc_front` / `dsv41_hc_front_split` 的形参与调用、`device.rs` 的函数指针类型 + wrapper、`chain_dev.rs` 的 `quant_fold()`/`xq4_of_xn_valid`/`moe()` 的 skip 分支全部移除。
+- **ABI 回到 pre-fold**（`006bd0c^`）：`hc_mixes_tail_kernel` 末尾恢复 `... uint8_t* xq, float* xsc, int mode`；`dsv41_hc_front` / `dsv41_hc_front_split` 在 `xsc` 之后直接是 `cudaStream_t`。三个 fold 区域与 `/tmp/pre_fold_ref.cu` 逐字节相同（sparse-merge / compress-fuse 区域不受影响）。
+- **保留**：`DSV41_SWIGLU_Q`（A4，默认 ON）与 `DSV41_MOE_EPI_ADD`（A5），即 `swiglu_limit_q` + `gemm_fp8_mx` 独立 launch（清理后的行为与 pre-fold 逐位一致）。
+- ⚠️ **勿再实现**：机制是结构性的——`fork_ev` 是 kernel 级事件，加进 EARLY 的任何工作都直接落在主流关键路径（详见 `dsv41-layer-fusion.md`）。
 > `STATUS.md:6393` 的 quant-final-sweep（同为读码口径）独立得出同一结论：**剩余 = engram 2（已由 f102b21 消）+ 4 次未知（候选 idx-source fallback）≈ 尾巴清扫级，总收益 <0.01ms**。⇒ 本项**无可摘的 >20 次**，不实施；要收尾只剩一次 HEAD 上的 nsys 复核（旧 126 已失效）。
 | `comp_placeholder_kernel` | §5 列 30 次 / 1.0µs = **0.030ms**，无决策。它写的是 `idxs[win+j]`，与 `ring_win_fused_kernel` 写的 `idxs[0,win)` **同一缓冲、同一 win**（`chain_dev.rs:3001`）⇒ **可折进 ring_win_fuse 的 epilogue**，30 个 launch/节点消失 | **✅ 已落地（B3，`DSV41_COMP_PLACEHOLDER_FUSE` 默认 ON）**：新符号 `dsv41_ring_win_fuse_ph`（`dsv41_glue.cu:794/825`）+ `device.rs::ring_win_fuse_ph` + `chain_dev.rs` 的 `ph_ok`/`ph_fused`（:2935/:3075）。本表数据 tree 早于落地它的 `2a16b48` ⇒ §5 的 30 行已消失。⚠️ 需重建 `.so` 才生效（旧 `.so` 无该符号 ⇒ 自动回退，行为不变） |
 

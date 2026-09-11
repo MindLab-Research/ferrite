@@ -7385,6 +7385,8 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 
 **处置**：QUANT_FOLD / SWIGLU_FOLD / AR_STAMP_FOLD 全部默认 OFF。基线保持 6.23ms（160.5 tok/s）。
 
+**后续清理（2026-09-11）**：AR 侧 stamp-fold 代码**已物理删除**（不是仅 gate OFF）——v13nq 全 gate OFF 仍 6.60ms（+0.33ms），证明 launcher 多出的 `arrive`/`stamp_in_store` 参数本身即回归。`p2p_ar_store_v5_kernel` / `p2p_ar_pubred_v5_kernel` / `p2p_ar_pubred_v5_hcpost_kernel` + 5 个 launcher 恢复 pre-fold 签名，Rust（`cuda.rs`/`device.rs`/`tp.rs` 的 `ar_epoch_args`+`DSV41_AR_STAMP_FOLD`）同步回退。
+
 **方法论（第 4/5 次隔离→生产失效）**：小 kernel 合并的收益分析必须考虑 **gate 语义**——省 launch 的收益 < 加到 gate kernel 的代价时是净负。
 
 ## 会话总结（2026-09-12，13.28 → 6.23ms = +113.3%，75.3 → 160.5 tok/s）

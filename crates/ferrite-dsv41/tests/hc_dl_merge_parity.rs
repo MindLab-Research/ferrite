@@ -36,10 +36,6 @@ struct FrontOut {
     out: Vec<f32>,
     xq: Vec<u8>,
     xsc: Vec<f32>,
-    /// QUANT_FOLD: the fp4 packing of `out` emitted by the EARLY collapse
-    /// epilogue (dim/2 bytes used) and its per-32-block scales (dim/32).
-    xq4: Vec<u8>,
-    xsc4: Vec<f32>,
 }
 
 #[test]
@@ -105,9 +101,6 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
         let out = dev.alloc(dim * 4).unwrap();
         let xq = dev.alloc(dim).unwrap();
         let xsc = dev.alloc((dim / 32) * 4).unwrap();
-        // QUANT_FOLD destinations: the EARLY epilogue writes the fp4 pair here.
-        let xq4 = dev.alloc(dim).unwrap();
-        let xsc4 = dev.alloc((dim / 32) * 4).unwrap();
         let ok = if split {
             // The side-stream entry: EARLY + (dots+LATE merged) + record(join).
             let ok = dev
@@ -130,8 +123,6 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
                     cfg.norm_eps,
                     xq.ptr as *mut u8,
                     xsc.ptr as *mut f32,
-                    xq4.ptr as *mut u8,
-                    xsc4.ptr as *mut f32,
                 )
                 .unwrap();
             // The caller's contract: wait `join_ev` before the hc_post that
@@ -158,8 +149,6 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
                 cfg.norm_eps,
                 xq.ptr as *mut u8,
                 xsc.ptr as *mut f32,
-                xq4.ptr as *mut u8,
-                xsc4.ptr as *mut f32,
             )
             .unwrap()
         };
@@ -171,45 +160,12 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
         let mut o = vec![0f32; dim];
         let mut q8 = vec![0u8; dim];
         let mut sc = vec![0f32; dim / 32];
-        let mut q4 = vec![0u8; dim];
-        let mut sc4 = vec![0f32; dim / 32];
         dev.download_f32(&pre, &mut p).unwrap();
         dev.download_f32(&post, &mut q).unwrap();
         dev.download_f32(&comb, &mut c).unwrap();
         dev.download_f32(&out, &mut o).unwrap();
         dev.download_u8(&xq, &mut q8).unwrap();
         dev.download_f32(&xsc, &mut sc).unwrap();
-        dev.download_u8(&xq4, &mut q4).unwrap();
-        dev.download_f32(&xsc4, &mut sc4).unwrap();
-        // QUANT_FOLD must be BIT-IDENTICAL to the launch it replaces: run the
-        // standalone `quant_fp4` over the SAME `out` value and compare the pair.
-        // This is the contract `chain_dev::moe` relies on when it skips that
-        // launch, so it is checked here rather than left to the serve text A/B.
-        let rq4 = dev.alloc(dim).unwrap();
-        let rsc4 = dev.alloc((dim / 32) * 4).unwrap();
-        dev.quant_fp4(
-            out.ptr as *const f32,
-            rq4.ptr as *mut u8,
-            rsc4.ptr as *mut f32,
-            1,
-            dim as i32,
-            32,
-            true,
-        )
-        .unwrap();
-        dev.sync().unwrap();
-        let mut rq = vec![0u8; dim];
-        let mut rs = vec![0f32; dim / 32];
-        dev.download_u8(&rq4, &mut rq).unwrap();
-        dev.download_f32(&rsc4, &mut rs).unwrap();
-        // Only the first dim/2 bytes of the fp4 row are written (two values per
-        // byte); the tail of the allocation is never touched by either path.
-        assert_eq!(
-            q4[..dim / 2],
-            rq[..dim / 2],
-            "QUANT_FOLD fp4 bytes differ from a standalone quant_fp4"
-        );
-        assert_eq!(sc4, rs, "QUANT_FOLD fp4 scales differ from a standalone quant_fp4");
         FrontOut {
             pre: p,
             post: q,
@@ -217,8 +173,6 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
             out: o,
             xq: q8,
             xsc: sc,
-            xq4: q4,
-            xsc4: sc4,
         }
     };
 

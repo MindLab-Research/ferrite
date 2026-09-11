@@ -95,15 +95,6 @@ struct Scratch {
     /// quant1 (qr, o, ex_act, engram rows) is untouched - different source.
     /// Cell because quant1 takes &self (the whole lin/lin2 chain does).
     xq_of_xn_valid: std::cell::Cell<bool>,
-    /// QUANT_FOLD (DSV41_QUANT_FOLD, default ON): set when the hc tail's EARLY
-    /// collapse epilogue emitted the fp4 packing of `xn` into `xq4`/`xsc4`
-    /// alongside its f32 write-back and its fp8 (T1). The MoE's `quant_fp4(xn)`
-    /// is then redundant and skips its launch (and the `xn` read-back), clearing
-    /// the flag - consume-once, source-gated exactly like `xq_of_xn_valid`.
-    /// Only the FFN front sets it: the attention front's collapse output is
-    /// consumed by the fp8 projections, and the FFN front overwrites `s.xn`
-    /// (which is what the MoE actually quantises) before `moe()` runs.
-    xq4_of_xn_valid: std::cell::Cell<bool>,
     /// T2 (attention side): set when `rmsnorm(qr)` emitted the fp8 of its own
     /// normalised output through `ferrite_rmsnorm_q`; the NEXT quant1(qr) - the
     /// wq_b (and, under IDX_FUSE, idx_wq_b) projection's - skips its launch and
@@ -470,32 +461,6 @@ fn moe_epi_add() -> bool {
 fn swiglu_q() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(true))
-}
-
-/// SWIGLU_FOLD (DSV41_SWIGLU_FOLD, default ON): the shared expert's
-/// `swiglu_limit_q` launch folds into the PROLOGUE of the w2 M=1 GEMV
-/// (`dsv41_gemm_fp8_mx_swiglu`), deleting one launch + one graph node per layer
-/// (40/step). NORM_FUSE's isomorph: the gemv owns the production of the fp8
-/// activation it consumes, computing swiglu + the fp8 pair in shared memory with
-/// `swiglu_limit_q_kernel`'s arithmetic term for term -- so `s.ex_out`/`s.o` is
-/// bit-identical to the (swiglu_limit_q, gemm_fp8_mx) pair it replaces.
-///
-/// Subsumes A4 (`swiglu_q`) AND A5 (`moe_epi_add`): the fused launch carries the
-/// A5 merge as its `epi_add` flag, so the same call covers both. It reads
-/// `ex_act` -- written by the shared w1w3 mx2 (or the MIX_GATE fp8x2) -- which
-/// is the ONLY consumer of that fp32 row; `xq`/`xsc` are then never written by
-/// the shared half.
-///
-/// Falls back to the A4/A5 path when: the gate is off, the loaded `.so` has no
-/// `dsv41_gemm_fp8_mx_swiglu` (stale build), or the shape declines (mode 4 only;
-/// `sh_il % 32 != 0`). THE ROUTED EXPERT IS NOT TOUCHED: its down GEMV already
-/// consumes `ex_act_b` as f32 through the fp4 path (gateup_fuse's territory), so
-/// this fold is the SHARED expert's alone.
-fn swiglu_fold() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_FOLD").map(|v| v == "1").unwrap_or(false))
-    // default OFF (serve A/B v12: quant+swiglu folds together +0.39ms regression;
-    // the w2 prologue's swiglu work costs more in the GEMV context than the saved launch)
 }
 
 /// chain-pair-batch 链2 (DSV41_SH_PAIR, default OFF): the shared expert's
@@ -945,7 +910,6 @@ impl<'a> DevChain<'a> {
             xq4: dev.alloc(dim.max(8))?,
             xsc4: dev.alloc(fb(dim / 32 + 8))?,
             xq_of_xn_valid: std::cell::Cell::new(false),
-            xq4_of_xn_valid: std::cell::Cell::new(false),
             xq_of_qr_valid: std::cell::Cell::new(false),
             qr_raw: std::cell::Cell::new(false),
             idx_q_ready: std::cell::Cell::new(false),
@@ -2134,15 +2098,7 @@ impl<'a> DevChain<'a> {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
-        xq4: *mut u8,
-        xsc4: *mut f32,
     ) -> Result<bool> {
-        // QUANT_FOLD bookkeeping. Only the split and the single-launch `hc_front`
-        // emit the fp4 direct-out (the persistent forms have their own collapse
-        // and no fp4 epilogue), so `fp4_out` records whether THIS call produced
-        // the pair the MoE would otherwise quantise.
-        let fp4_armed = Self::quant_fold() && !xq4.is_null() && (dim % 32 == 0);
-        let mut fp4_out = false;
         // Stage-C persistent forms, both default OFF and both selected only when
         // the .so carries the symbol. `_MB` (multi-block) is tried first: same
         // one-launch phase structure, but the dots are spread instead of pinned
@@ -2172,7 +2128,7 @@ impl<'a> DevChain<'a> {
             // and the fold's `hc_res` write clobbers) stop being safe to touch.
             // The post-AR join in `layer` stays for the un-folded path (a no-op
             // once the early join has consumed the armed flag).
-            let r = self.dev.hc_front_split(
+            self.dev.hc_front_split(
                 self.s.h.ptr as *const f32,
                 hc_fn,
                 hc_scale,
@@ -2191,14 +2147,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
-                xq4,
-                xsc4,
-            )?;
-            // fp4 direct-out rides the EARLY half (on `side`); the launcher's
-            // edge (2) already orders ALL of EARLY's writes — out/xq/xsc and now
-            // xq4/xsc4 — to main before the projection group and the MoE.
-            fp4_out = fp4_armed && r;
-            r
+            )?
         } else if Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
             self.dev.hc_front_persist_mb(
                 self.s.h.ptr as *const f32,
@@ -2245,7 +2194,7 @@ impl<'a> DevChain<'a> {
                 xsc,
             )?
         } else {
-            let r = self.dev.hc_front(
+            self.dev.hc_front(
                 self.s.h.ptr as *const f32,
                 hc_fn,
                 hc_scale,
@@ -2264,18 +2213,8 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
-                xq4,
-                xsc4,
-            )?;
-            // The single-launch form runs the EARLY half on this (main) stream, so
-            // the fp4 direct-out is ordered by stream order alone.
-            fp4_out = fp4_armed && r;
-            r
+            )?
         };
-        // Publish the QUANT_FOLD flag for this call. The attention front passes
-        // null destinations (fp4_armed false) and so clears it; only the FFN
-        // front - whose collapse writes the `s.xn` the MoE quantises - arms it.
-        self.s.xq4_of_xn_valid.set(fp4_out);
         if fused {
             return Ok(true);
         }
@@ -2394,22 +2333,6 @@ fn hc_tail_split() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_HC_TAIL_SPLIT").map(|v| v != "0").unwrap_or(true))
 }
 
-/// QUANT_FOLD (DSV41_QUANT_FOLD, default ON): the hc tail's EARLY collapse
-/// epilogue emits the fp4 packing of the value it just normalised into
-/// `s.xq4`/`s.xsc4`, so the MoE's `quant_fp4(s.xn)` — whose input is exactly
-/// that value — skips its launch and its `xn` read-back. `"0"` opts out (null
-/// destinations ⇒ the standalone launch runs). Read once: the hot path must
-/// never touch the environment per call.
-fn quant_fold() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_QUANT_FOLD").map(|v| v == "1").unwrap_or(false))
-    // default OFF (serve A/B v12: +0.39ms regression with swiglu fold. STRUCTURAL:
-    // fork_ev records when the WHOLE EARLY kernel completes, so the fp4 direct-out
-    // work extends main's fork_ev wait by ~1.8us x 80 fronts = +0.14ms, while the
-    // saved quant launch is only -0.072ms. Events are kernel-level, not block-level
-    // - any work added to a gating kernel is on the critical path. Unfixable.)
-}
-
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -2444,11 +2367,6 @@ fn quant_fold() -> bool {
             cfg.norm_eps,
             self.s.xq.ptr as *mut u8,
             self.s.xsc.ptr as *mut f32,
-            // QUANT_FOLD: the attention front's collapse output is consumed by the
-            // fp8 projections (T1), never by the MoE's fp4 path, so it does not
-            // emit the fp4 pair. `layer`'s FFN front below passes it instead.
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
         )?;
         // T1: when the fused front ran the collapse, it also emitted the fp8
         // quantisation of `xn` (s.xq/s.xsc), so the next quant1(xn) - lin2's, in
@@ -2560,19 +2478,10 @@ fn quant_fold() -> bool {
             cfg.norm_eps,
             self.s.xq.ptr as *mut u8,
             self.s.xsc.ptr as *mut f32,
-            // QUANT_FOLD: this collapse writes the `s.xn` the MoE below feeds to
-            // quant_fp4, so the same value is quantised to fp4 here and that
-            // launch (and its `xn` read-back) is skipped. Null ⇒ the standalone
-            // launch runs, so the old path is a pure A/B arm.
-            self.s.xq4.ptr as *mut u8,
-            self.s.xsc4.ptr as *mut f32,
         )?;
         // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
         // MoE's quant1(xn) - its first xq consumer - is redundant and skips.
         self.s.xq_of_xn_valid.set(ffn_done && !ffn_nw.is_null());
-        // QUANT_FOLD: `hc_mixes_auto` set `xq4_of_xn_valid` from the branch it
-        // took (only the split and the single-launch form emit the fp4 pair).
-        // Nothing else to publish here.
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn={:?}", _t_moe.elapsed());
         }
@@ -4201,24 +4110,15 @@ fn quant_fold() -> bool {
             // re-packing the same 5120-element row for each of the ~6 selected
             // experts, i.e. 6x the quant_fp4 + fp4_pack launches (two of the
             // per-expert small kernels nsys counts ~850 times).
-            //
-            // QUANT_FOLD (DSV41_QUANT_FOLD, default ON): the FFN half's EARLY
-            // collapse epilogue already emitted this exact packing into
-            // `s.xq4`/`s.xsc4` from the same value (`s.xn` is its `out`), so the
-            // launch and the `xn` global read-back are redundant. Consume-once,
-            // like T1: a path that did not fold (persistent front end, gate off,
-            // shape declined) leaves the flag false and this runs unchanged.
-            if !self.s.xq4_of_xn_valid.replace(false) {
-                self.dev.quant_fp4(
-                    self.s.xn.ptr as *const f32,
-                    self.s.xq4.ptr as *mut u8,
-                    self.s.xsc4.ptr as *mut f32,
-                    1,
-                    dim as i32,
-                    32,
-                    true,
-                )?;
-            }
+            self.dev.quant_fp4(
+                self.s.xn.ptr as *const f32,
+                self.s.xq4.ptr as *mut u8,
+                self.s.xsc4.ptr as *mut f32,
+                1,
+                dim as i32,
+                32,
+                true,
+            )?;
             // Fixed 6-slot device-driven loop: the expert id comes from
             // route_idx on the device and the weights from route_w, so there is
             // no host round trip and the launch arguments are static.
@@ -4509,47 +4409,11 @@ fn quant_fold() -> bool {
                         )?;
                     }
                 }
-                // SWIGLU_FOLD (DSV41_SWIGLU_FOLD, default ON): the w2 GEMV's
-                // PROLOGUE computes swiglu + the fp8 pair straight into shared
-                // memory, so the standalone `swiglu_limit_q` launch disappears
-                // (one launch + one graph node per layer, 40/step). This SUBSUMES
-                // A4 and A5 -- the same launch carries the A5 merge as `epi_add`.
-                // It reads `ex_act` (the shared w1w3 mx2 / MIX_GATE fp8x2 output),
-                // the only consumer of that f32 row; `xq`/`xsc` are never written
-                // by the shared half on this path.
-                //
-                // The destination mirrors the old A5 decision exactly: fold into
-                // the MoE accumulator `s.o` when the serial chain may (not DUAL,
-                // MOE_EPI_ADD on), else write the DISJOINT `s.ex_out` and keep the
-                // standalone merge below -- bit-identical either way (`o + acc`
-                // is the same commutative pair). A decline (`Ok(false)`: stale
-                // .so, mode != 4, `sh_il % 32 != 0`) falls through to the A4/A5
-                // path unchanged.
-                let fold_into_o = !dual && moe_epi_add();
-                let sw_folded = swiglu_fold()
-                    && self.dev.supports_swiglu_fold()
-                    && self.dev.gemm_fp8_mx_swiglu_on(
-                        self.s.ex_act.ptr as *const f32,
-                        cfg.swiglu_limit,
-                        w2.as_u8(),
-                        w2s.as_u8(),
-                        std::ptr::null(),
-                        if fold_into_o {
-                            self.s.o.ptr as *mut f32
-                        } else {
-                            self.s.ex_out.ptr as *mut f32
-                        },
-                        dim as i32,
-                        sh_il as i32,
-                        fold_into_o,
-                        sh_st,
-                    )?;
                 // A4: the swiglu epilogue emits the fp8 pair the w2 GEMV reads, so
                 // quant1(ex_act) disappears (40 launches/step). Only the SHARED
                 // expert's down needs it: the routed experts' down consumes
                 // ex_act_b as f32 directly (no quant to fold).
-                let act_q = !sw_folded
-                    && swiglu_q()
+                let act_q = swiglu_q()
                     && self.dev.supports_swiglu_q()
                     && self.dev.swiglu_limit_q_on(
                         self.s.ex_act.ptr as *mut f32,
@@ -4560,7 +4424,7 @@ fn quant_fold() -> bool {
                         self.s.xsc.ptr as *mut f32,
                         sh_st,
                     )?;
-                if !act_q && !sw_folded {
+                if !act_q {
                     self.dev.swiglu_limit_on(
                         self.s.ex_act.ptr as *mut f32,
                         1,
@@ -4586,25 +4450,20 @@ fn quant_fold() -> bool {
                 // (the MoE accumulator AR#2 reduces), dropping the standalone
                 // ferrite_add launch (40/step). Association is unchanged --
                 // o + (acc + bias) either way -- so the result is bit-identical.
-                // SWIGLU_FOLD already produced the w2 output (into `s.o` when
-                // `fold_into_o`, else into `s.ex_out`), so short-circuit `fused`
-                // true: the A5 add fold must not run a second time. When it wrote
-                // `s.ex_out` the merge below (or the dual join) still finishes it.
-                let fused = sw_folded
-                    || (!dual
-                        && moe_epi_add()
-                        && self.dev.supports_gemm_fp8_add()
-                        && self.dev.gemm_fp8_mx_add(
-                            self.s.xq.as_u8(),
-                            self.s.xsc.as_f32(),
-                            w2.as_u8(),
-                            w2s.as_u8(),
-                            std::ptr::null(),
-                            self.s.o.ptr as *mut f32,
-                            1,
-                            dim as i32,
-                            sh_il as i32,
-                        )?);
+                let fused = !dual
+                    && moe_epi_add()
+                    && self.dev.supports_gemm_fp8_add()
+                    && self.dev.gemm_fp8_mx_add(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        w2.as_u8(),
+                        w2s.as_u8(),
+                        std::ptr::null(),
+                        self.s.o.ptr as *mut f32,
+                        1,
+                        dim as i32,
+                        sh_il as i32,
+                    )?;
                 if !fused {
                     self.dev.gemm_fp8_mx_on(
                         self.s.xq.as_u8(),
@@ -4627,16 +4486,6 @@ fn quant_fold() -> bool {
                         } else {
                             self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
                         }
-                    }
-                }
-                // SWIGLU_FOLD wrote `s.ex_out` (not `fold_into_o`) and the A5
-                // block above did not run: merge exactly as the standalone path
-                // did. `dual` is excluded (the join below owns it).
-                if sw_folded && !fold_into_o && !dual {
-                    if self.add_epi_ready() {
-                        self.moe_add_in[layer] = Some(self.s.ex_out.ptr as *const f32);
-                    } else {
-                        self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
                     }
                 }
             }

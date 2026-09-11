@@ -151,7 +151,6 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 | `DSV41_ROPE_FUSE` | q/idx_q rope 折进 GEMV epilogue（`dsv41_gemm_fp8_mx_rope` / `_mx2_rope`） | 40(q) + ~7(idx_q) | 强制 32 warps/block、grid=n/32；launcher 校验形状，不过返回 decline |
 | `DSV41_WOB_F32` | wo_b 直读 f32 激活（`dsv41_gemm_fp8_mx_f32`） | 每步 40 次 `quant1` | **只改数据路径、不改 grid 形态**（block 仍是常规 g_gemv_warps）；非逐位（跳过量化往返、精度更高）⇒ 必须 parity |
 | `DSV41_SWIGLU_Q` | swiglu 直出 `(xq,xsc)` | `quant_kernel` 40 次 | 逐位（`tests_dsv41_glue.cu` 的 swiglu_q 用例） |
-| `DSV41_SWIGLU_FOLD` | **共享专家** swiglu + fp8 encode 搬进 w2 GEMV 的 **prologue**（`dsv41_gemm_fp8_mx_swiglu`）| 40 次 `swiglu_limit_q`（1.7µs/次）+ 一个图节点 | NORM_FUSE 同构；**不强制 32 warps**（参考 amax 是 per-warp 的 32-lane 树，无跨 warp 归约），保留 `dsv41_gemv_warps_for(n)` ⇒ 整个 launch 逐位等价于 `(swiglu_limit_q, gemm_fp8_mx)`；mode 强制 4；`ex_act` 是唯一输入（不再回写 f32）；`epi_add` 同时承载 A5 合并。只覆盖**共享专家**，routed 侧由 `DSV41_GATEUP_FUSE` 负责 |
 | `DSV41_GATEUP_FUSE` / `DSV41_DOWN_FUSE` | expert 出口 2·inter→inter + swiglu epilogue；down+reduce 合一 | `swiglu_limit_batched` / `moe_down_reduce` | 逐位（K 循环照抄 / `__fadd_rn`/`__fmul_rn` 显式分开 / slot 升序累加） |
 | `DSV41_MOE_EPI_ADD` | `add_inplace` 折进 lane-0 epilogue | 80 节点 | 结合律不变 ⇒ 逐位 |
 | `DSV41_COMP_PLACEHOLDER_FUSE` | placeholder 折进 `ring_win_fuse` epilogue | 30 次 launch/节点 | `clen==nullptr` 时与基础版逐字节相同 |

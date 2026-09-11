@@ -104,7 +104,7 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 | **P2** | 段 A 融合：hc 链 + attention 投影链一核，中间量留 smem；−6~8 launch/层 | −0.6~1.0ms | 中（hc 归约 / split=1） |
 | **P3** | 段 B 融合：MoE cooperative（gate→route→quant→gate_up→swiglu→down→reduce 一核，中间量留 smem） | −0.4~0.7ms | 中（slot 定序） |
 | **P4** | 跨层流水：ffn mixes 挪到 L+1 的 attn 段内下发，hc 的 ⟨B⟩ 半藏进 AR poll 窗口（PDL） | −0.3~0.5ms | 中 |
-| **P5** | 零 AR 节点：store+stamp 折进段末、pubred 折进下段首（v5 协议改动） | −0.15ms + 40 节点 | **高** — **第一步（store+stamp 合并）已实施**：`DSV41_AR_STAMP_FOLD=1`（默认 OFF），见 `roadmap-200-tokps.md` 的 AR v5 条 |
+| **P5** | 零 AR 节点：store+stamp 折进段末、pubred 折进下段首（v5 协议改动） | −0.15ms + 40 节点 | **已否决（2026-09-11）** — 第一步（store+stamp 合并，`DSV41_AR_STAMP_FOLD=1`）serve 实测 **29.5s/step 灾难**（图 replay 下单调 arrival 机制坏掉，poll 等永不到来的 stamp），且代码存在性本身即 +0.33ms 回归（gate 全 OFF 仍 6.60 vs 6.27ms）。AR 侧 fold 代码已物理删除，见 `roadmap-200-tokps.md` 的 AR v5 条 |
 | **P6（Stage D，开放）** | model-persistent：权重分片驻留 smem + cooperative grid sync | 不确定 | 极高，不承诺 |
 
 每阶段独立 env gate、默认 OFF；验收 = 同二进制背靠背 A/B + 人眼四段文本 + parity 测试。

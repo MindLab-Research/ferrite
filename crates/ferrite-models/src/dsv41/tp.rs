@@ -258,31 +258,6 @@ impl Collective {
         (self.bytes / 4) as i32
     }
 
-    /// The three AR v5 epoch/protocol args every store-bearing launcher takes:
-    /// `(epoch, arrive, stamp_in_store)`.
-    ///
-    /// `epoch` is this rank's device round counter (`staging + ctr_at`). With
-    /// the STAMP FOLD armed, `arrive` points at the two words the alloc
-    /// reserves right after it (`staging + ctr_at + 4`): `[0]` = the arrival
-    /// count at the start of the current round, `[1]` = the monotonic arrival
-    /// counter the store kernel's last block detects itself with. Both are
-    /// zeroed by the alloc (`zero_at(staging.ptr, ctr_at + 64)`) and are only
-    /// ever written by the store kernel, so no reset — and no host traffic —
-    /// is needed per round. `stamp_in_store` must equal whether the fold is
-    /// armed, or the stamp would either be skipped twice or emitted twice.
-    ///
-    /// With the fold OFF the callers get `(epoch, null, 0)`, i.e. the exact
-    /// pre-fold protocol (the store kernel never touches `arrive`, pubred
-    /// stamps).
-    fn ar_epoch_args(&self) -> (*mut c_uint, *mut c_uint, c_int) {
-        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
-        if ar_stamp_fold() {
-            (epoch, epoch.wrapping_add(1), 1)
-        } else {
-            (epoch, std::ptr::null_mut(), 0)
-        }
-    }
-
     /// AR v5 publish + reduce ONLY: the store half already ran inside the producer
     /// kernel's epilogue (see `Device::gemm_fp8_mx_ar`), so this skips
     /// `p2p_ar_store_v5_kernel` and goes straight to the pubred kernel. `len` must
@@ -356,13 +331,12 @@ impl Collective {
         let base8 = self.staging.ptr as *const u8;
         let staging_local = self.staging.ptr as *const f32;
         let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
-        let (epoch, arrive, stamp_in_store) = self.ar_epoch_args();
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
         if !self.dev.p2p_ar_v5_hcpost(
             buf as *const f32,
             self.peer_slots.ptr as *const *mut f32,
             self.peer_stamps.ptr as *const *mut u32,
             epoch,
-            arrive,
             staging_local,
             ready_local,
             buf as *mut f32,
@@ -375,7 +349,6 @@ impl Collective {
             comb,
             hc_n as c_int,
             hc_h as c_int,
-            stamp_in_store,
         )? {
             return Ok(false);
         }
@@ -407,14 +380,13 @@ impl Collective {
         let base8 = self.staging.ptr as *const u8;
         let staging_local = self.staging.ptr as *const f32;
         let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
-        let (epoch, arrive, stamp_in_store) = self.ar_epoch_args();
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
         self.dev.p2p_ar_v5_add(
             buf as *const f32,
             add_in,
             self.peer_slots.ptr as *const *mut f32,
             self.peer_stamps.ptr as *const *mut u32,
             epoch,
-            arrive,
             staging_local,
             ready_local,
             buf as *mut f32,
@@ -422,7 +394,6 @@ impl Collective {
             self.world as c_int,
             self.rank as c_int,
             stride,
-            stamp_in_store,
         )
     }
 
@@ -457,14 +428,13 @@ impl Collective {
         let base8 = self.staging.ptr as *const u8;
         let staging_local = self.staging.ptr as *const f32;
         let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
-        let (epoch, arrive, stamp_in_store) = self.ar_epoch_args();
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
         if !self.dev.p2p_ar_v5_hcpost_add(
             buf as *const f32,
             add_in,
             self.peer_slots.ptr as *const *mut f32,
             self.peer_stamps.ptr as *const *mut u32,
             epoch,
-            arrive,
             staging_local,
             ready_local,
             buf as *mut f32,
@@ -477,7 +447,6 @@ impl Collective {
             comb,
             hc_n as c_int,
             hc_h as c_int,
-            stamp_in_store,
         )? {
             return Ok(false);
         }
@@ -573,13 +542,12 @@ impl Collective {
             let base8 = self.staging.ptr as *const u8;
             let staging_local = self.staging.ptr as *const f32;
             let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
-            let (epoch, arrive, stamp_in_store) = self.ar_epoch_args();
+            let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
             self.dev.p2p_ar_v5(
                 buf as *const f32,
                 self.peer_slots.ptr as *const *mut f32,
                 self.peer_stamps.ptr as *const *mut u32,
                 epoch,
-                arrive,
                 staging_local,
                 ready_local,
                 buf as *mut f32,
@@ -587,7 +555,6 @@ impl Collective {
                 self.world as c_int,
                 self.rank as c_int,
                 stride,
-                stamp_in_store,
             )?;
             return Ok(());
         }
@@ -733,25 +700,6 @@ fn ar_v5() -> bool {
         // DSV41_AR_V5=0 restores the host barrier for A/B.
         let graph = std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true);
         graph || std::env::var("DSV41_AR_V5").map(|v| v != "0").unwrap_or(true)
-    })
-}
-
-/// AR STAMP FOLD (`DSV41_AR_STAMP_FOLD=1`, default OFF — A/B arm).
-///
-/// The store kernel publishes this round's ready stamps itself, from its
-/// last-finishing block (`arrive[1]`/`arrive[0]`, see
-/// `p2p_ar_store_v5_kernel`), instead of leaving the stamp to the pubred
-/// kernel that starts only after the store's kernel BOUNDARY. That boundary
-/// plus the stamp was the AR's SECOND cross-rank round trip: the data is
-/// already peer-visible when the store ends, so the stamp was a re-announcement
-/// one launch later. With the fold, `p2p_ar_pubred_v5_kernel` degenerates to
-/// poll + reduce (`stamp_in_store == 1`).
-static AR_STAMP_FOLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-pub fn ar_stamp_fold() -> bool {
-    *AR_STAMP_FOLD.get_or_init(|| {
-        std::env::var("DSV41_AR_STAMP_FOLD")
-            .map(|v| v == "1")
-            .unwrap_or(false)
     })
 }
 

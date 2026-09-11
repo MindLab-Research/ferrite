@@ -8324,23 +8324,10 @@ extern "C" cudaError_t ferrite_p2p_ar_oneshot_v2(
 __global__ void p2p_ar_store_v5_kernel(
     const float* __restrict__ partial,
     float* const* __restrict__ staging_tbl,  // [world] peers' staging bases
-    unsigned* const* __restrict__ ready_tbl, // [world] peers' flag rows (STAMP FOLD only)
     const unsigned* __restrict__ epoch,      // this rank's round counter
     int world, int my_rank, int n, int stride,
-    const float* __restrict__ bias,          // optional residual (nullptr = none)
-    unsigned* __restrict__ arrive) {         // STAMP FOLD state (nullptr = fold OFF)
+    const float* __restrict__ bias) {        // optional residual (nullptr = none)
     const unsigned e = *epoch;
-    // STAMP FOLD: read this round's arrival BASE here, at the very top — before
-    // the store loops, the fence and the barrier that precede this block's
-    // atomicAdd. That placement is what makes the base race-free (see the fold
-    // note below): a block can only read the base the previous round's last
-    // block wrote if ALL of this round's blocks already incremented the
-    // counter, which cannot include THIS block before its own read; and the
-    // barrier + fence between this read and the atomicAdd stop the compiler or
-    // the memory system from reordering the increment before the read.
-    unsigned fold_base = 0u;
-    if (arrive != nullptr && threadIdx.x == 0)
-        fold_base = *(volatile unsigned*)&arrive[0];
     // Peer-parallel store (2026-09-11): gridDim.y == world, one peer per block row.
     // Before, ONE thread wrote all `world` peer slots serially (`world` remote
     // float4 stores back to back), so the kernel ran on ceil(n4/blockDim.x) = 5
@@ -8374,67 +8361,6 @@ __global__ void p2p_ar_store_v5_kernel(
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
         staging_tbl[rr][base] = v;
     }
-
-    // ---------------------------------------------------------------------
-    // STAMP FOLD (`DSV41_AR_STAMP_FOLD`, `arrive != nullptr`).
-    //
-    // The store's own kernel BOUNDARY used to be the publication point: the
-    // pubred kernel's stamp ran only after this kernel COMPLETED, which put a
-    // SECOND cross-rank round trip on the AR critical path
-    //   data lands -> kernel boundary -> stamp -> peer poll -> peer reduce
-    // The data is already in the peer's L2 by the time this kernel ends, so the
-    // stamp was a pure re-announcement one launch later. Here the last-finishing
-    // block stamps as soon as every block's peer stores are system-visible, so a
-    // peer can observe this round while the rank is still inside the store
-    // kernel (and pubred degenerates to poll + reduce).
-    //
-    // LAST-BLOCK DETECTION — MONOTONIC, NEVER RESET. `arrive[1]` counts block
-    // arrivals since process start (`atomicAdd`, never written back to 0);
-    // `arrive[0]` holds that count at the START of this round, written by the
-    // PREVIOUS round's last block. A block is last iff its atomicAdd returns
-    // `base + total - 1`, where `total = gridDim.x * gridDim.y`.
-    //   * monotonic compare, NOT `prev == total - 1` (v2's form): a counter that
-    //     is reset inside the kernel is the exact race that killed the v2/v3
-    //     protocol (`:8077` — the reset raced the capture, no block ever saw
-    //     "last", `*epoch` never advanced, every rank deadlocked on the flags);
-    //   * the comparison is against THIS round's `total`, so a grid-size change
-    //     between rounds (the per-size b1/b2/b4/b16 graphs, or the engram AR at
-    //     a different n) cannot stall it — only the current round's base/total
-    //     are compared;
-    //   * `base` is stable for the whole round: only the last block writes it,
-    //     and it writes `arrive[0]` (the NEXT round's base) only AFTER every
-    //     block of this round has already done its read-then-atomicAdd, so no
-    //     block can observe a partially advanced base.
-    //
-    // Visibility: each thread fences its OWN remote store at system scope before
-    // its block signals arrival (`p2p_ar_down_kernel`'s proven pattern); the
-    // kernel boundary used to do this implicitly, and a stamp that overtook a
-    // peer store would let the peer reduce a half-written slot.
-    extern __shared__ unsigned s_fold[];       // [0]=is_last, [1]=new base
-    if (arrive != nullptr) {
-        __threadfence_system();
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            const unsigned total = (unsigned)(gridDim.x * gridDim.y);
-            const unsigned prev = atomicAdd(&arrive[1], 1u);
-            s_fold[1] = prev + 1u;
-            s_fold[0] = (prev == fold_base + total - 1u) ? 1u : 0u;
-        }
-        __syncthreads();
-        if (s_fold[0]) {
-            // Parallel stamp: thread r publishes into peer r's ready row (the
-            // same shape `p2p_ar_pubred_v5_kernel` uses — disjoint remote
-            // addresses, so the cross-slot order is irrelevant; each stamper
-            // fences its own system-scope store).
-            if (threadIdx.x < (unsigned)world) {
-                atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
-                __threadfence_system();
-            }
-            // Base for the NEXT round. Only read by a later kernel (stream
-            // order), so no fence is needed for it.
-            if (threadIdx.x == 0) arrive[0] = s_fold[1];
-        }
-    }
 }
 
 __global__ void p2p_ar_pubred_v5_kernel(
@@ -8443,35 +8369,26 @@ __global__ void p2p_ar_pubred_v5_kernel(
     const float* __restrict__ staging_local,  // my [2][world][stride]
     const unsigned* __restrict__ ready_local, // my [world] flag row
     float* __restrict__ out,
-    int world, int my_rank, int n, int stride,
-    int stamp_in_store) {                     // 1 = the store kernel already stamped
+    int world, int my_rank, int n, int stride) {
     // publish + reduce fused (2026-09-10): the publish used to be its own
     // 1-block kernel and the reduce another launch — 3 kernels per AR. v5's
     // ABSOLUTE-epoch stamps make multi-block polling safe (no per-block
     // seen[] state: every block waits for the same e+1 on all peers), so one
     // multi-block kernel can stamp (block 0), poll (all blocks, all peers)
     // and reduce its slice. Saves one graph node + launch per AR (90/step).
-    //
-    // STAMP FOLD (`stamp_in_store == 1`): the store kernel already published
-    // this round's stamps (see `p2p_ar_store_v5_kernel`), so this kernel keeps
-    // only the poll + reduce half and the round's sole remaining job for the
-    // epoch is to advance it. The stamps are peers-visible by the store
-    // kernel's completion (stream order), so `*epoch` may advance immediately.
     const unsigned e = *epoch;
-    if (!stamp_in_store) {
-        // Stamp the peers in parallel: thread r publishes round e+1 into peer r's
-        // ready row. Thread 0 used to loop over `world` slots serially (8
-        // atomicExch_system = 0.4-0.8us, the bulk of the stamp stage). The slots
-        // are disjoint remote addresses and each peer only watches its own slot,
-        // so the cross-slot write ORDER is irrelevant — the fence/epoch ordering is
-        // what matters and is joined by the barrier below. (world <= blockDim.x.)
-        if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
-            atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
-            __threadfence_system();
-        }
-        // AFTER all of this rank's stamps are out: the next round's store reads e+1.
-        __syncthreads();
+    // Stamp the peers in parallel: thread r publishes round e+1 into peer r's
+    // ready row. Thread 0 used to loop over `world` slots serially (8
+    // atomicExch_system = 0.4-0.8us, the bulk of the stamp stage). The slots
+    // are disjoint remote addresses and each peer only watches its own slot,
+    // so the cross-slot write ORDER is irrelevant — the fence/epoch ordering is
+    // what matters and is joined by the barrier below. (world <= blockDim.x.)
+    if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
+        atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
+        __threadfence_system();
     }
+    __syncthreads();
+    // AFTER all of this rank's stamps are out: the next round's store reads e+1.
     if (blockIdx.x == 0 && threadIdx.x == 0)
         *epoch = e + 1u;
     // every block polls ALL peers' stamps for this round (e+1). Monotonic
@@ -8540,10 +8457,9 @@ static inline int ferrite_ar_v5_grid_blocks(int n, int threads) {
 
 extern "C" cudaError_t ferrite_p2p_ar_v5(
     const float* partial, float* const* staging_tbl,
-    unsigned* const* ready_tbl, unsigned* epoch, unsigned* arrive,
+    unsigned* const* ready_tbl, unsigned* epoch,
     const float* staging_local, const unsigned* ready_local,
-    float* out, int n, int world, int my_rank, int stride,
-    int stamp_in_store, cudaStream_t s) {
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
     // Grid on the FLOAT4 count (n4), not on n: both kernels map one float4 per
     // thread (`i4 = blockIdx*blockDim.x + tid`, grid-stride), so `ceil(n/1024)`
     // handed block 0 the first 1024 of 1280 float4 (80%) and left the tail
@@ -8560,11 +8476,9 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     const int threads = ferrite_ar_v5_block_threads(world);
     int blocks = ferrite_ar_v5_grid_blocks(n, threads);
     // The store kernel's completion makes its staging writes peer-visible
-    // (kernel boundary) — and with the STAMP FOLD (`arrive != nullptr`) the
-    // store kernel itself publishes this round's stamps, so the pubred below
-    // only polls and reduces (`stamp_in_store == 1`).
-    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 2 * sizeof(unsigned), s>>>(
-        partial, staging_tbl, ready_tbl, epoch, world, my_rank, n, stride, nullptr, arrive);
+    // (kernel boundary), so publish needs no fence against the store.
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     // publish + reduce in ONE multi-block launch (see the kernel note) —
@@ -8572,7 +8486,7 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     // writes before this kernel's polls/reduce reads.
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out,
-        world, my_rank, n, stride, stamp_in_store);
+        world, my_rank, n, stride);
     return cudaGetLastError();
 }
 
@@ -8586,19 +8500,18 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
 // already guarantees it in `moe()`).
 extern "C" cudaError_t ferrite_p2p_ar_v5_add(
     const float* partial, const float* bias, float* const* staging_tbl,
-    unsigned* const* ready_tbl, unsigned* epoch, unsigned* arrive,
+    unsigned* const* ready_tbl, unsigned* epoch,
     const float* staging_local, const unsigned* ready_local,
-    float* out, int n, int world, int my_rank, int stride,
-    int stamp_in_store, cudaStream_t s) {
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
     const int threads = ferrite_ar_v5_block_threads(world);
     int blocks = ferrite_ar_v5_grid_blocks(n, threads);
-    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 2 * sizeof(unsigned), s>>>(
-        partial, staging_tbl, ready_tbl, epoch, world, my_rank, n, stride, bias, arrive);
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out,
-        world, my_rank, n, stride, stamp_in_store);
+        world, my_rank, n, stride);
     return cudaGetLastError();
 }
 
@@ -8618,11 +8531,8 @@ extern "C" cudaError_t ferrite_p2p_ar_pubred_v5(
     // Grid on n4 — see the launcher note in `ferrite_p2p_ar_v5`.
     const int threads = ferrite_ar_v5_block_threads(world);
     int blocks = ferrite_ar_v5_grid_blocks(n, threads);
-    // stamp_in_store = 0: this entry exists precisely because the store was
-    // fused into a PRODUCER kernel's epilogue, which never stamps — so the
-    // stamp must still happen here.
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
-        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride, 0);
+        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride);
     return cudaGetLastError();
 }
 
@@ -8717,21 +8627,16 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
     float* __restrict__ out,
     int world, int my_rank, int n, int stride,
     float* __restrict__ hc_res, const float* __restrict__ hc_post,
-    const float* __restrict__ hc_comb, int hc_n, int hc_h,
-    int stamp_in_store) {                    // 1 = the store kernel already stamped
+    const float* __restrict__ hc_comb, int hc_n, int hc_h) {
     const unsigned e = *epoch;
-    // STAMP FOLD (`stamp_in_store == 1`): the store kernel already published
-    // this round's stamps, so only the epoch advance is left here.
-    if (!stamp_in_store) {
-        // Parallel stamp — same protocol/transformation as
-        // `p2p_ar_pubred_v5_kernel` (thread r stamps peer r; the barrier joins the
-        // stamps before e+1 is published to the next round's store).
-        if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
-            atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
-            __threadfence_system();
-        }
-        __syncthreads();
+    // Parallel stamp — same protocol/transformation as
+    // `p2p_ar_pubred_v5_kernel` (thread r stamps peer r; the barrier joins the
+    // stamps before e+1 is published to the next round's store).
+    if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
+        atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
+        __threadfence_system();
     }
+    __syncthreads();
     if (blockIdx.x == 0 && threadIdx.x == 0)
         *epoch = e + 1u;
     if (threadIdx.x < (unsigned)world) {
@@ -8777,11 +8682,11 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
 // back to the caller's plain path instead of corrupting the residual stream.
 extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
     const float* partial, float* const* staging_tbl,
-    unsigned* const* ready_tbl, unsigned* epoch, unsigned* arrive,
+    unsigned* const* ready_tbl, unsigned* epoch,
     const float* staging_local, const unsigned* ready_local,
     float* out, int n, int world, int my_rank, int stride,
     float* hc_res, const float* hc_post, const float* hc_comb,
-    int hc_n, int hc_h, int stamp_in_store, cudaStream_t s) {
+    int hc_n, int hc_h, cudaStream_t s) {
     if (hc_res == nullptr || hc_post == nullptr || hc_comb == nullptr ||
         hc_n <= 0 || hc_n > 8 || (hc_h & 3) != 0 || n != hc_h)
         return cudaErrorInvalidValue;
@@ -8790,13 +8695,13 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
     // hcpost pubred keeps the 1-D `blocks` grid.
     const int threads = ferrite_ar_v5_block_threads(world);
     int blocks = ferrite_ar_v5_grid_blocks(n, threads);
-    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 2 * sizeof(unsigned), s>>>(
-        partial, staging_tbl, ready_tbl, epoch, world, my_rank, n, stride, nullptr, arrive);
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
-        hc_res, hc_post, hc_comb, hc_n, hc_h, stamp_in_store);
+        hc_res, hc_post, hc_comb, hc_n, hc_h);
     return cudaGetLastError();
 }
 
@@ -8806,23 +8711,23 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
 // replaces the standalone `ferrite_add` + this AR.
 extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_add(
     const float* partial, const float* bias, float* const* staging_tbl,
-    unsigned* const* ready_tbl, unsigned* epoch, unsigned* arrive,
+    unsigned* const* ready_tbl, unsigned* epoch,
     const float* staging_local, const unsigned* ready_local,
     float* out, int n, int world, int my_rank, int stride,
     float* hc_res, const float* hc_post, const float* hc_comb,
-    int hc_n, int hc_h, int stamp_in_store, cudaStream_t s) {
+    int hc_n, int hc_h, cudaStream_t s) {
     if (hc_res == nullptr || hc_post == nullptr || hc_comb == nullptr ||
         hc_n <= 0 || hc_n > 8 || (hc_h & 3) != 0 || n != hc_h)
         return cudaErrorInvalidValue;
     const int threads = ferrite_ar_v5_block_threads(world);
     int blocks = ferrite_ar_v5_grid_blocks(n, threads);
-    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 2 * sizeof(unsigned), s>>>(
-        partial, staging_tbl, ready_tbl, epoch, world, my_rank, n, stride, bias, arrive);
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
     p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
-        hc_res, hc_post, hc_comb, hc_n, hc_h, stamp_in_store);
+        hc_res, hc_post, hc_comb, hc_n, hc_h);
     return cudaGetLastError();
 }
 
