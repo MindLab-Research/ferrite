@@ -1576,14 +1576,24 @@ fn fuse_b1() -> bool {
             ql as i32,
             cfg.norm_eps,
         )?;
-        self.lin(
-            self.s.qr.ptr as *const f32,
-            ql as i32,
-            ld.wq_b.as_ref().unwrap(),
-            ld.wq_b_scale.as_ref().unwrap(),
-            (nlh * hd) as i32,
-            self.s.q.ptr as *mut f32,
-        )?;
+        // L2+L3 fusion (verified by p1p2-zero-hist): `wq_b` and the indexer's
+        // `idx_wq_b` read the SAME `qr` buffer (rmsnorm writes it in place at
+        // :1572, neither touches it between :1580 and :1937), both k=ql=1280,
+        // and the mx2 contract is bit-identical to the two singles. Only the 8
+        // index-source layers carry idx_wq_b; the other 32 fall through to the
+        // single. The indexer() below skips its own lin when idx_q is already
+        // computed (self.s.idx_q_ready flag).
+        let idx_fused = false;
+        if !idx_fused {
+            self.lin(
+                self.s.qr.ptr as *const f32,
+                ql as i32,
+                ld.wq_b.as_ref().unwrap(),
+                ld.wq_b_scale.as_ref().unwrap(),
+                (nlh * hd) as i32,
+                self.s.q.ptr as *mut f32,
+            )?;
+        }
         // RoPE over the trailing `rope_head_dim` lanes of each head
         // ALL heads of this token are at the SAME position — step=0. The
         // earlier step=1 gave head i position pos+i (8 different positions for
