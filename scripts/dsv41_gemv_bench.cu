@@ -1,5 +1,6 @@
 // Isolated timing for the two GEMV families the DSV4.1 decode step spends most
 #include <cstdint>
+#include <cstring>
 // of its time in: the bf16 GEMV (MoE gate at 384 rows, the full-vocab lm_head at
 // 129280 rows) and the fp8 GEMV (wq_b-shaped 1024 rows, wq_a+wkv-shaped 1664).
 // Linked against the production .so, medians after warmup, one shape per line.
