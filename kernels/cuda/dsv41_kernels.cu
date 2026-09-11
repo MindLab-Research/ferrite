@@ -1653,6 +1653,16 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     // barrier inside it would be reached a different number of times per warp.
     extern __shared__ uint8_t s_w[];
     uint8_t* s_a = s_w + (size_t)nwarps * (size_t)k;
+    // Staged scale rows. The consume loop needs one ue8m0 byte and one f32 per
+    // 32-element block, and BOTH used to be plain global loads issued inside the
+    // loop - 2 x nb_k serial round trips per row that the weight-row staging did
+    // not cover. Replacing them with constants measured 21 percent faster on the
+    // wq_b shape, 34 percent on sharedexp (the latency-bound end), so the bytes
+    // are now staged the same way the weights are. Values and their use order are
+    // untouched, so the result is bit-identical.
+    const int nb_k_al = (nb_k + 15) & ~15;          // 16-byte units for cp.async
+    uint8_t* s_ws = s_a + (size_t)((vec == 4) ? k : 0);
+    float* s_as = reinterpret_cast<float*>(s_ws + (size_t)nwarps * (size_t)nb_k_al);
     if (vec == 4) {
         const int n16a = k >> 4;
         for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
@@ -1660,6 +1670,13 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                 *reinterpret_cast<const uint4*>(a + (i << 4));
         }
         for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
+    }
+    if (vec >= 3) {
+        // The activation scales are the same for every output row, so they are
+        // read once per block instead of once per row per k-block.
+        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[i] = a_scale[i];
+        __syncthreads();
+    } else if (vec == 4) {
         __syncthreads();
     }
     for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
@@ -1697,6 +1714,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // staged above rather than from global memory.
             const uint8_t* ap = (vec == 4) ? s_a : a;
             uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
+            uint8_t* row_sc = s_ws + (size_t)warp * (size_t)nb_k_al;
             // Sixteen bytes per lane per iteration. The first cut counted
             // thirty-two-byte k-blocks while copying one uint4 each, so only the
             // first half of every block was staged, the odd halves stayed
@@ -1708,6 +1726,12 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
             for (int i = lane; i < n16; i += 32)
                 dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            // Stage this row's ue8m0 scale bytes too: they are one global load per
+            // kb in the consume loop, and that load is exactly the latency the loop
+            // stalls on (constant-scales measured 21-34 percent faster).
+            for (int i = ((nb_k >> 4) << 4) + lane; i < nb_k; i += 32) row_sc[i] = wsr[i];
+            for (int i = lane; i < (nb_k >> 4); i += 32)
+                dsv41_cp_async16(row_sc + (i << 4), wsr + (i << 4));
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
@@ -1718,17 +1742,10 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // garbage. This shadowing was the root cause of the "3ms speedup
             // + degeneration" mystery (the speedup was the compiler dead-coding
             // the warp reduction on a known-zero value).
-            //
-            // Unroll depth is the gemv's real ILP knob: the loop's loads
-            // (a_scale[kb], wsr[kb] and the two staged bytes) are independent
-            // across kb, and this family is memory-latency bound — the isolated
-            // bench shows bandwidth rising with the row count (72 GB/s at 256
-            // rows against 3.3 TB/s at 16160) purely because more warps keep
-            // more loads in flight.
 #pragma unroll 4
             for (int kb = 0; kb < nb_k; ++kb) {
-                const float sb = ue8m0_to_f(wsr[kb]);
-                const float sa = a_scale[kb];    // m == 1
+                const float sb = ue8m0_to_f(row_sc[kb]);
+                const float sa = s_as[kb];       // m == 1
                 const int j = kb * 32 + lane;
                 acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
             }
@@ -1785,8 +1802,14 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
         const int warps = g_gemv_warps;
         const int blocks = (n + warps - 1) / warps;
-        const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k
-                             : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k
+        const int nb_k = k >> 5;
+        const int nb_k_al = (nb_k + 15) & ~15;
+        // weights [nwarps][k] + (mode 4) block activation [k] + per-warp ue8m0
+        // scale rows [nwarps][nb_k_al] + block activation scales [nb_k] f32.
+        const size_t scale_bytes =
+            (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float);
+        const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
+                             : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                       : (size_t)0;
         if (gsmem > 48 * 1024) {
             cudaError_t e = cudaFuncSetAttribute(
