@@ -2183,7 +2183,11 @@ fn fuse_b1() -> bool {
             ld.gate_bias.as_ref().map(|b| b.as_f32()).unwrap_or(std::ptr::null()),
             self.s.route_w.ptr as *mut f32,
             self.s.route_idx.ptr as *mut i32,
-            self.s.hist.ptr as *mut i32,
+            // P1: `hist` is dead code - the kernel only checks it for non-null to
+            // issue an extra memset + route_hist_kernel per call, and no reader
+            // anywhere consumes the histogram. Passing null drops 2 device ops
+            // per layer (80/step) with zero numerical impact.
+            std::ptr::null_mut(),
             1,
             n_routed as i32,
             topk as i32,
