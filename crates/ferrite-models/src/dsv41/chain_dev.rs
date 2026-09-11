@@ -246,11 +246,12 @@ fn moe_epi_add() -> bool {
 }
 
 /// A4: DSV41_SWIGLU_Q=0 reverts the shared expert's swiglu to the
-/// (swiglu_limit, quant1) pair. DEFAULT ON for the A/B. Read ONCE and cached
-/// like the other gates (see moe_epi_add above).
+/// (swiglu_limit, quant1) pair. DEFAULT OFF (the A4A5 fused path is
+/// part of the round-18 numerical-bug family; keep the safe unfused path
+/// until the bug is fixed). DSV41_SWIGLU_Q=1 re-enables.
 fn swiglu_q() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(false))
 }
 
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
@@ -1953,7 +1954,7 @@ fn fuse_b1() -> bool {
             )?;
         }
         if let Some(c) = comm {
-            if fused {
+            if ar_store_fused {
                 // store already done by the fused epilogue; publish+reduce only.
                 // Must stay adjacent to the gemv above (same *epoch).
                 c.all_reduce_inplace_pubred_only(self.s.o.ptr as *mut std::ffi::c_void, fb(dim))?;
