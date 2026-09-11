@@ -260,6 +260,13 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
+    // The activation row is the same for every output row: stage it once per
+    // block instead of letting all `nwarp` warps re-read it from L1 for every
+    // row (the head reduces 129280 rows against a single x row). Values are
+    // unchanged, so every dot keeps its exact order and sum.
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
@@ -270,13 +277,13 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
         int c = lane;
         for (; c + 96 < k; c += 128) {
             const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
-            const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
+            const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
             acc += __bfloat162float(w0) * x0;
             acc += __bfloat162float(w1) * x1;
             acc += __bfloat162float(w2) * x2;
             acc += __bfloat162float(w3) * x3;
         }
-        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
+        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * s_x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
