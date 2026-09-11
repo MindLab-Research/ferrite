@@ -3869,3 +3869,49 @@ per-context, and a TP8 process has one context per rank"）—— 没读到位 �
    实测 ~3.6ms = **50× 地板** ⇒ **指令吞吐受限**（~4-5 条/值 × 3.9M 值/专家 × 240 ≈ 4.7G 条 ≈ 4ms ✓）；
    mode 2 的 LUT 已把每值指令压到 ~2.5-3 条，接近 SIMT 地板 ⇒ **专家侧继续压指令的边际收益有限，
    下一主攻 = fp8 gemv（5.5ms vs 0.04ms 地板 = 100× ✗）与段 A 融合** ✓。
+
+---
+
+# 2026-09-11 ④：会话终态 16.13ms / 62.0 tok/s + 段 A 融合执行计划
+
+**会话累计**（同会话背靠背、每步四段文本人眼验证 ✓）：
+`26.55ms / 37.7 tok/s` → **`16.13ms / 62.0 tok/s`（步时 −39%，吞吐 +65%）**，faults=0，文本逐字 ✓。
+
+**本轮落地（全部已翻默认）**：
+1. `epen` 根治 = fp8 gemv **mode 3 保序分段**（16B 宽载入 warp 专属 smem + 原序消费 ⇒ 逐位等价 ✓）
+2. **mode 4** 激活块级暂存（消 8× 重读 ⇒ −0.72ms ✓）
+3. **hc 前段融合**（dots 核 cp.async 整行在飞 + 尾核折入 collapse/rmsnorm ⇒ −3.1ms ✓）
+4. 两次卡死/乱码根因修复（per-context smem 属性 ×8 rank ✓；staging 16B/32B 计数错 ✓）
+5. 否决：warps=16（+0.97ms ✗）
+
+## 段 A 融合执行计划（已侦察完，下会话按序做）
+
+**attention 内的算子序（chain_dev.rs `fn attention`，行号≈1330-1420）**：
+```
+wq_a(xn) → rmsnorm(qr) → wq_b(qr) → apply_rope(q)     ← q 链
+wkv(xn) → rmsnorm(kv) → apply_rope(kv)                 ← kv 链（与 q 链独立 ✓）
+（后续：ring_append / comp_placeholder / sparse_attn / apply_rope / quant1(o) → wo_b）
+```
+
+**三个可落地的融合（按价值排序）**：
+1. **wq_a + wkv 合一**（两者同输入 `xn`、同 k=dim ✓，仅 n/权重不同 ⇒ 新 `gemv2` 核：
+   grid=(n1+n2)/warps，block 按 `blockIdx.x < blocks1` 分属两族 ✓；每行累加不变 ⇒ 逐位等价 ✓；
+   **必须把 wkv 调用上移到 wq_a 旁**（二者独立 ✓，`xn` 在此区间不被覆写 ✓）⇒ 省 40×1 launch + 共享激活暂存 ✓
+2. **rmsnorm(kv) + apply_rope(kv) 相邻对**（hd=128 小向量 ⇒ 融合省 40×1 launch ✓）
+3. **wq_b + apply_rope(q)**（rope 只读 q 的尾部 `rope_head_dim` lanes ⇒ 融合省 40×1 launch ✓）
+   ⚠️ 注意 `rmsnorm(qr)` 在 wq_b **之前**（不是相邻对 ✗ 勿融错位置 ✓）
+
+**硬约束（勿违反）**：每层 2 处 AR（wo_b 后、moe down 后）是跨 rank 集合通信 ⇒ **不可进任何 tile 核**
+⇒ 每层天然分 3 段（attn 前段 / attn 后段+moe / 收尾），融合以段为界 ✓。
+
+**剩余预算的算账（16.13ms 分解推断，需新 profile 校准）**：
+| 项 | ms | 地板 | 倍数 |
+|---|---|---|---|
+| fp8 gemv 投影族 | ~4.8 | ~0.04（DRAM） | **120× ✗✗ 主攻** |
+| 专家（6/384 激活） | ~3.6 | ~0.07 | 50×（指令地板，LUT 已近 ✗） |
+| hc 前段+后段 | ~1.8 | — | 已融合 ✓ |
+| attention/AR/小核/launch | ~5.9 | — | 段 A+B 融合目标 ✓ |
+
+**结论**：fp8 gemv 的 120× 是最大单项 —— 每调用实测 ~17µs vs 计算（指令 0.66µs + DRAM 3.3µs）≈ 4µs
+⇒ **~13µs/调用是 launch+块调度+staging 的固定开销** × 290 调用/步 ≈ 3.8ms ✗ ⇒ **合批（gemv2/每层一发射）
+与段 A 融合正是打这里** ✓。
