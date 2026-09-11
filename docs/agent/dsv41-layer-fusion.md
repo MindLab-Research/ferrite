@@ -150,6 +150,21 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 
 ## 6. 已知风险 / 待确认
 
+- **✅ q rope / idx_q rope 已折进 GEMV epilogue（DSV41_ROPE_FUSE，默认 ON）** ✓（2026-09-11）：
+  新的两个 C 符号 `dsv41_gemm_fp8_mx_rope`（单族，q rope）与 `dsv41_gemm_fp8_mx2_rope`
+  （两族，wq_b 的 q rope + idx_wq_b 的 idx_q rope 各用各自 head 宽度 `rope_hd1/hd2`）把
+  `apply_rope_kernel` 的旋转表达式逐字搬进 `gemm_fp8_gemv_kernel` 的行循环之后的 epilogue
+  （`dsv41_kernels.cu` 的 rope 段）。**不复用 `dsv41_gemm_fp8_mx` 的 ABI**（该符号有固定 ABI +
+  6 个调用点，融合形态另立符号，老 `.so` 由 `supports_rope_fuse()` 符号探测回退 ✓）。
+  关键结构：rope 的对 (2i, 2i+1) 必落在同一 block 的**相邻 warp**（head 宽是 32 倍数、对起点偶数），
+  launcher 强制 32 warps/block、grid=n/32（同 B1），pair-head warp 读 B1 的 `s_rows[warp+1]` 后
+  在 lane 0 写回；`v = acc + bias` 即 rope kernel 会读回的同一 f32。launcher 校验
+  `n%32==0`、`rope_hd%32==0`、`rope_rd` 偶且 `<=rope_hd`、`g_gemv_fp8_mode>=3`，任一不过返回 1 →
+  Rust 侧回退 `lin`/`lin2` + 独立 `apply_rope`（逐位等价）。Rust：`chain_dev.rs` 的 `lin_rope`/
+  `lin2_rope`，`attention()` 用 `q_roped`/`idx_q_roped` 记录合并的旋转，`idx_q_rope` 这个
+  one-shot Cell 让 `indexer()` 跳过它自己的 `apply_rope(s.idx_q)`。收益 = 每步省 40（q）+ ~7
+  （idx_q）次 launch。**唯一未在无 GPU 环境验证的点**：fast-math 下两处的 `x0*c - x1*s` 收缩
+  是否逐位一致（同 TU 同表达式，按 rmsnorm_rope 的同款论证）——需一次 parity 测试确认 ✓。
 - **`gateup_fused` 曾与 `.cu` 融合条件不一致（已修复 2026-09-11）** ✗→✓：Rust 侧原来只判
   `DSV41_GATEUP_FUSE` + `supports_gateup_fuse()`，漏了 `.cu:1367` 的 `g_expert_fp4_mode == 2`。
   当 `DSV41_EXPERT_FP4_MODE=0/1` 时 kernel 写满 `2*inter` 不融合，而 host 仍按融合推进

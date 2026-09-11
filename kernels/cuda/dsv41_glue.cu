@@ -839,6 +839,103 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
     return (int)cudaGetLastError();
 }
 
+// ============================================================
+// gemv_f32 v2 (vectorized float4 + K-split) — the f32 twin of
+// gemv_bf16_v2_kernel (ferrite_kernels.cu:2731). The compressor's kvp/scp
+// projections (n = head_dim = 128 rows, k = dim = 5120) are the only
+// f32-weight M=1 GEMVs in the decode step (chain_dev.rs::lin_f32). v1 above
+// launches ceil(128/8)=16 blocks x 8 warps = 128 warps = 11% of the 148 SMs
+// with 160 SERIAL 4B loads per warp → 16.4us for a 2.6MB weight read
+// (0.34us HBM floor at 7.6TB/s) = 48x off. Two diagnosed bottlenecks, the
+// same pair the bf16 gate had before gemv_bf16_v2:
+//   (a) scalar 4B loads   → float4 (16B) per lane-step (4x fewer LDG, 4x
+//       fewer loop iterations). NOTE: unlike bf16 (uint4 = 8 values) an
+//       f32 float4 carries only 4 values, so the loop is 2x longer per
+//       byte — K-split is what actually buys the latency hiding, and the
+//       two combine to ~4x the in-flight bytes of v1.
+//   (b) latency-bound medium matrices → K-split WPR warps per row, folded
+//       in smem (no atomics, no second kernel): n=128, WPR=8 → 1024 warps
+//       (~7/SM) vs v1's 128 (~0.9/SM).
+// Numerics: each multiply-accumulate is pinned to the fused rounding of v1
+// (v1's `acc += w*x` contracts to a single FFMA under fmad=on) via
+// __fmaf_rn — never let --use_fast_math reassociate this chain (build.sh
+// documents a 1-ULP/layer drift from an unpinned plain-operator rewrite).
+// The only difference vs v1 is the cross-K-slice fold order (~1e-6 f32),
+// far below the compressor's tolerance (see gemv_bf16_v2's note).
+// Grid: ceil(n/rpb) blocks, 256 threads = 8 warps; WPR ∈ {1,2,4,8}.
+// ============================================================
+template <int WPR>
+__global__ void gemv_f32_v2_kernel(const float* __restrict__ w,
+                                   const float* __restrict__ x,
+                                   float* __restrict__ out,
+                                   int n, int k) {
+    const int warps = blockDim.x >> 5;
+    const int rpb = warps / WPR;               // rows per block
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int row = blockIdx.x * rpb + warp / WPR;
+    const int kw = warp % WPR;                 // K-slice id
+    float acc = 0.f;
+    if (row < n) {
+        const float* wr = w + (size_t)row * k;
+        // Slice size rounded to 4: float4 loads need 16B alignment.
+        // k % 4 == 0 is guaranteed by the host fallback to v1, so k1-k0 is
+        // 4-aligned and the per-lane `c + 3 < k1` guard covers every element
+        // of [k0, k1) (lanes sweep the slice in 128-element blocks).
+        int kper = ((k + WPR - 1) / WPR + 3) & ~3;
+        int k0 = kw * kper;
+        int k1 = min(k0 + kper, k);
+#pragma unroll 2
+        for (int c = k0 + lane * 4; c + 3 < k1; c += 32 * 4) {
+            float4 wv = *reinterpret_cast<const float4*>(wr + c);
+            float4 xv = *reinterpret_cast<const float4*>(x + c);
+            acc = __fmaf_rn(wv.x, xv.x, acc);
+            acc = __fmaf_rn(wv.y, xv.y, acc);
+            acc = __fmaf_rn(wv.z, xv.z, acc);
+            acc = __fmaf_rn(wv.w, xv.w, acc);
+        }
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, off);
+    }
+    if (WPR == 1) {
+        if (lane == 0 && row < n) out[row] = acc;
+    } else {
+        __shared__ float part[16];
+        if (lane == 0) part[warp] = acc;
+        __syncthreads();
+        if (kw == 0 && lane == 0 && row < n) {
+            float sum = 0.f;
+#pragma unroll
+            for (int j = 0; j < WPR; j++) sum += part[(warp / WPR) * WPR + j];
+            out[row] = sum;
+        }
+    }
+}
+
+extern "C" int dsv41_gemv_f32_v2(const float* w, const float* x, float* out, int n, int k,
+                                 cudaStream_t s) {
+    if (n <= 0 || k <= 0) return (int)cudaSuccess;
+    // float4 needs k % 4 == 0; the compressor k=5120 qualifies. Anything else
+    // (no such f32 shape exists today) keeps v1 rather than taking a slow
+    // scalar tail.
+    if (k & 3) return dsv41_gemv_f32(w, x, out, n, k, s);
+    // WPR heuristic mirrored from ferrite_gemv_bf16_v2: enough warps to cover
+    // HBM latency (n*WPR/8 warps total; the compressor's n=128 → WPR=8 →
+    // 1024 warps ≈ 7/SM).
+    int wpr = n >= 16384 ? 1 : (n >= 4096 ? 2 : (n >= 1024 ? 4 : 8));
+    int rpb = 8 / wpr;
+    dim3 grid((n + rpb - 1) / rpb);
+    dim3 block(256);
+    switch (wpr) {
+        case 1: gemv_f32_v2_kernel<1><<<grid, block, 0, s>>>(w, x, out, n, k); break;
+        case 2: gemv_f32_v2_kernel<2><<<grid, block, 0, s>>>(w, x, out, n, k); break;
+        case 4: gemv_f32_v2_kernel<4><<<grid, block, 0, s>>>(w, x, out, n, k); break;
+        default: gemv_f32_v2_kernel<8><<<grid, block, 0, s>>>(w, x, out, n, k); break;
+    }
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_ar_store2(const unsigned long long* peer_slots, int world, int rank,
                                const float* src, long n, long slot_f, long parity_off,
                                const unsigned* reduced, unsigned round,

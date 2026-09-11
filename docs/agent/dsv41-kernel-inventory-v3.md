@@ -181,6 +181,7 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | **3** | **hc 链**：tail 0.99（warp0 串行链，**探针已否决**体内重叠：可藏窗口 0.46µs ≪ sinkhorn 6.5µs）；`hc_post_inplace` 0.15 | 1.70ms | **−0.15~0.25** | 只剩跨层流水 / Stage C 段核 |
 | **4** | **AR 节点数**（不是 AR 时间）：246 节点/步，生产 0.66ms 是协议地板 | 节点尾延迟 | **−0.3~0.5** | Stage C persistent 把 3 核/层 → 1 核/段；**建议先用图节点数直接量残余**（v2 遗留待办）|
 | **5** | **FMA-side 打 gate_up**：CSE 已证明 smem 不是瓶颈 | 1.01ms | **−0.1~0.2** | 风险：数值契约（4 累计器→2 改变求和顺序 ⇒ 需 parity 测试）|
+| **6** | **`gemv_f32` 的 v2 化**（compressor 的 kvp/scp，n=128×k=5120 / 7 次/步）| 0.12ms | **−0.08~0.10** | ✅ **已落地**（2026-09-11）：v1 只有 16 blocks / 128 warps（148 SM 的 11%）+ 160 次串行 4B load ⇒ 16.4µs = 48x 内存地板（0.34µs），与 gate 修前同病。新增 `gemv_f32_v2_kernel`（`dsv41_glue.cu`，模板 WPR：float4 16B/load + K-split + smem fold，`__fmaf_rn` 钉住 FFMA 舍入）→ n=128 走 WPR=8 = 1024 warps。`device.rs::gemv_f32` 按 `n < GEMV_F32_V2_MAX_N=2048` 分派，`DSV41_GEMV_F32_V2=0` 回退 v1。**待实测**：16.4µs 的改善幅度（预期对齐 bf16 gate v2 的 3-5µs 档）|
 
 ---
 

@@ -108,6 +108,11 @@ struct Scratch {
     /// fused launch declines the shape). Cell because the lin/lin2 chain takes
     /// &self while the indexer takes &mut self.
     idx_q_ready: std::cell::Cell<bool>,
+    /// DSV41_ROPE_FUSE, attention side: set alongside `idx_q_ready` when the
+    /// wq_b + idx_wq_b mx2 launch ALSO rotated `s.idx_q` in its epilogue, so the
+    /// indexer skips its standalone `apply_rope(s.idx_q)`. Meaningful only while
+    /// `idx_q_ready` is set (the two are written together on every path).
+    idx_q_rope: std::cell::Cell<bool>,
     /// MoE scatter destination (written by the dispatch kernels; the host never
     /// reads it back, which is why rustc flags it).
     #[allow(dead_code)]
@@ -257,6 +262,18 @@ fn expert_fp4_mode() -> i32 {
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// DSV41_ROPE_FUSE=0 reverts the q rope (and, under IDX_FUSE, the idx_q rope) to
+/// the standalone `apply_rope` launch. DEFAULT ON. The fused epilogue performs
+/// `apply_rope_kernel`'s rotation expression verbatim on the same `v = acc + bias`
+/// f32 the rope kernel would have read back, so the result is bit-identical; the
+/// kernel declines (and the caller falls back) on any shape it cannot take. Read
+/// ONCE and cached like the other gates - a per-call getenv is the hot-path slip
+/// they all avoid (this branch runs 40x/step, inside graph capture).
+fn rope_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ROPE_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_SH_EXP_MX2=0 reverts the shared expert's gate/up to two launches.
@@ -577,6 +594,7 @@ impl<'a> DevChain<'a> {
             xq_of_xn_valid: std::cell::Cell::new(false),
             xq_of_qr_valid: std::cell::Cell::new(false),
             idx_q_ready: std::cell::Cell::new(false),
+            idx_q_rope: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
             post: dev.alloc(fb(hc))?,
             comb: dev.alloc(fb(hc * hc))?,
@@ -835,6 +853,102 @@ impl<'a> DevChain<'a> {
             out2,
             n2,
             k,
+        )
+    }
+
+    /// RoPE fusion (DSV41_ROPE_FUSE, default on): quantise once, run the
+    /// single-family GEMV, and let its epilogue rotate the trailing `rope_rd`
+    /// lanes of each `rope_hd`-wide head - the standalone `apply_rope` launch
+    /// disappears. Ok(false) means the .so lacks the symbol or the shape cannot
+    /// take it, so the caller runs `lin` + the standalone rope (bit-identical
+    /// either way). The rotation uses the device position counter with mul=1,
+    /// off=0, step=0, which is exactly the q / idx_q call shape.
+    #[allow(clippy::too_many_arguments)]
+    fn lin_rope(
+        &self,
+        a: *const f32,
+        k: i32,
+        w: &crate::dsv41::load::DevTensor,
+        ws: &crate::dsv41::load::DevTensor,
+        n_out: i32,
+        out: *mut f32,
+        rope_rd: i32,
+        rope_hd: i32,
+    ) -> Result<bool> {
+        if !rope_fuse() || !self.dev.supports_rope_fuse() {
+            return Ok(false);
+        }
+        self.quant1(a, k)?;
+        self.dev.gemm_fp8_mx_rope(
+            self.s.xq.as_u8(),
+            self.s.xsc.as_f32(),
+            w.as_u8(),
+            ws.as_u8(),
+            std::ptr::null(),
+            out,
+            n_out,
+            k,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+            1,
+            0,
+            0,
+            false,
+            rope_rd,
+            rope_hd,
+        )
+    }
+
+    /// RoPE fusion for the two same-activation projections (wq_b + idx_wq_b):
+    /// one launch computes both and rotates both, each family with its own head
+    /// width but the same rope length / cos-sin table / position counter.
+    /// Ok(false) => the caller runs `lin2` + both standalone ropes.
+    #[allow(clippy::too_many_arguments)]
+    fn lin2_rope(
+        &self,
+        a: *const f32,
+        k: i32,
+        w1: &crate::dsv41::load::DevTensor,
+        ws1: &crate::dsv41::load::DevTensor,
+        n1: i32,
+        out1: *mut f32,
+        w2: &crate::dsv41::load::DevTensor,
+        ws2: &crate::dsv41::load::DevTensor,
+        n2: i32,
+        out2: *mut f32,
+        rope_rd: i32,
+        rope_hd1: i32,
+        rope_hd2: i32,
+    ) -> Result<bool> {
+        if !rope_fuse() || !self.dev.supports_rope_fuse() {
+            return Ok(false);
+        }
+        self.quant1(a, k)?;
+        self.dev.gemm_fp8_mx2_rope(
+            self.s.xq.as_u8(),
+            self.s.xsc.as_f32(),
+            w1.as_u8(),
+            ws1.as_u8(),
+            std::ptr::null(),
+            out1,
+            n1,
+            w2.as_u8(),
+            ws2.as_u8(),
+            std::ptr::null(),
+            out2,
+            n2,
+            k,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+            1,
+            0,
+            0,
+            false,
+            rope_rd,
+            rope_hd1,
+            rope_hd2,
         )
     }
 
@@ -1966,9 +2080,17 @@ fn hc_persist_mb() -> bool {
             && cfg.is_index_source(layer)
             && ld.idx_wq_b.is_some()
             && ld.idx_wq_b_scale.is_some();
+        // DSV41_ROPE_FUSE: the same launch can ALSO rotate s.q (family 1) and
+        // s.idx_q (family 2) in its epilogue, so neither gets a standalone
+        // apply_rope. `q_roped`/`idx_q_roped` record which ropes the fused
+        // epilogue actually performed; every path sets them, so a layer that
+        // never reaches the indexer cannot leave a stale flag behind.
+        let mut q_roped = false;
+        let mut idx_q_roped = false;
         if idx_fused {
-            // ONE launch for both: wq_b -> s.q, idx_wq_b -> s.idx_q.
-            let fused = self.lin2(
+            // ONE launch for both: wq_b -> s.q, idx_wq_b -> s.idx_q (and, under
+            // rope fuse, both rotations).
+            idx_q_roped = self.lin2_rope(
                 self.s.qr.ptr as *const f32,
                 ql as i32,
                 ld.wq_b.as_ref().unwrap(),
@@ -1979,39 +2101,75 @@ fn hc_persist_mb() -> bool {
                 ld.idx_wq_b_scale.as_ref().unwrap(),
                 (cfg.index_n_heads * cfg.index_head_dim) as i32,
                 self.s.idx_q.ptr as *mut f32,
+                cfg.rope_head_dim as i32,
+                hd as i32,
+                cfg.index_head_dim as i32,
             )?;
-            self.s.idx_q_ready.set(fused);
+            q_roped = idx_q_roped;
+            if idx_q_roped {
+                self.s.idx_q_ready.set(true);
+            } else {
+                let fused = self.lin2(
+                    self.s.qr.ptr as *const f32,
+                    ql as i32,
+                    ld.wq_b.as_ref().unwrap(),
+                    ld.wq_b_scale.as_ref().unwrap(),
+                    (nlh * hd) as i32,
+                    self.s.q.ptr as *mut f32,
+                    ld.idx_wq_b.as_ref().unwrap(),
+                    ld.idx_wq_b_scale.as_ref().unwrap(),
+                    (cfg.index_n_heads * cfg.index_head_dim) as i32,
+                    self.s.idx_q.ptr as *mut f32,
+                )?;
+                self.s.idx_q_ready.set(fused);
+            }
         } else {
             self.s.idx_q_ready.set(false);
         }
         if !self.s.idx_q_ready.get() {
-            self.lin(
+            q_roped = self.lin_rope(
                 self.s.qr.ptr as *const f32,
                 ql as i32,
                 ld.wq_b.as_ref().unwrap(),
                 ld.wq_b_scale.as_ref().unwrap(),
                 (nlh * hd) as i32,
                 self.s.q.ptr as *mut f32,
+                cfg.rope_head_dim as i32,
+                hd as i32,
             )?;
+            if !q_roped {
+                self.lin(
+                    self.s.qr.ptr as *const f32,
+                    ql as i32,
+                    ld.wq_b.as_ref().unwrap(),
+                    ld.wq_b_scale.as_ref().unwrap(),
+                    (nlh * hd) as i32,
+                    self.s.q.ptr as *mut f32,
+                )?;
+            }
         }
+        self.s.idx_q_rope.set(idx_q_roped);
         // RoPE over the trailing `rope_head_dim` lanes of each head
         // ALL heads of this token are at the SAME position — step=0. The
         // earlier step=1 gave head i position pos+i (8 different positions for
         // 8 local heads), scrambling the positional encoding: every head's
         // RoPE rotated differently, so the attention scores were positionally
         // wrong. (The KV rope uses rows=1 so step is irrelevant there.)
-        self.dev.apply_rope(
-            self.s.q.ptr as *mut f32,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
-            nlh as i32,
-            hd as i32,
-            cfg.rope_head_dim as i32,
-            (cfg.rope_head_dim / 2) as i32,
-            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
-            0,
-            false,
-        )?;
+        // Skipped when the wq_b launch's epilogue already rotated s.q.
+        if !q_roped {
+            self.dev.apply_rope(
+                self.s.q.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                nlh as i32,
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
+                0,
+                false,
+            )?;
+        }
 
         if layer == 0 && hc_dbg() {
             let q = self.dl(self.s.q.as_f32(), nlh * hd)?;
@@ -2431,29 +2589,50 @@ fn hc_persist_mb() -> bool {
         // already produced s.idx_q in the SAME mx2 launch as wq_b
         // (DSV41_IDX_FUSE); the one-shot flag is consumed here either way, so a
         // non-index-source layer's stale value can never leak into the next step.
-        if !self.s.idx_q_ready.get() {
-            self.lin(
+        // DSV41_ROPE_FUSE: whichever launch produced s.idx_q can also have rotated
+        // it - `lin_rope` here, the attention mx2's family-2 epilogue there - so
+        // the standalone rope below runs only when neither did.
+        let idx_q_roped = if !self.s.idx_q_ready.get() {
+            let roped = self.lin_rope(
                 self.s.qr.ptr as *const f32,
                 ql as i32,
                 wq_b,
                 wq_b_s,
                 (idx_nh * idx_hd) as i32,
                 self.s.idx_q.ptr as *mut f32,
+                rd as i32,
+                idx_hd as i32,
+            )?;
+            if !roped {
+                self.lin(
+                    self.s.qr.ptr as *const f32,
+                    ql as i32,
+                    wq_b,
+                    wq_b_s,
+                    (idx_nh * idx_hd) as i32,
+                    self.s.idx_q.ptr as *mut f32,
+                )?;
+            }
+            roped
+        } else {
+            self.s.idx_q_rope.get()
+        };
+        self.s.idx_q_ready.set(false);
+        self.s.idx_q_rope.set(false);
+        if !idx_q_roped {
+            self.dev.apply_rope(
+                self.s.idx_q.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                idx_nh as i32,
+                idx_hd as i32,
+                rd as i32,
+                (rd / 2) as i32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
+                0,
+                false,
             )?;
         }
-        self.s.idx_q_ready.set(false);
-        self.dev.apply_rope(
-            self.s.idx_q.ptr as *mut f32,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
-            idx_nh as i32,
-            idx_hd as i32,
-            rd as i32,
-            (rd / 2) as i32,
-            self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
-            0,
-            false,
-        )?;
         // per-head weights; the reference folds softmax_scale * n_heads^-0.5 into
         // them, and our kernel applies softmax_scale * head_scale to the sum, so
         // the same factor can be passed there instead

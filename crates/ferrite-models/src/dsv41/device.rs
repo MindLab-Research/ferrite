@@ -198,6 +198,10 @@ struct Kernels {
         ) -> c_int,
     >,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
+    // Optional: an older .so without the symbol keeps the v1 kernel above.
+    // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
+    gemv_f32_v2: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     comp_placeholder:
@@ -491,6 +495,7 @@ impl Device {
             gemv_bf16: ko!(rt, "dsv41_gemv_bf16"),
             gemv_bf16_v2: ko!(rt, "ferrite_gemv_bf16_v2"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
+            gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -1959,9 +1964,25 @@ impl Device {
         self.kerr(rc, "dsv41_comp_placeholder")
     }
 
-    /// The single 4-byte host read per decode step (EOS check + printing). The
-    /// token itself stays on the device; only this value crosses back.
+    /// f32-weight M=1 GEMV. Only user: the compressor's kvp/scp projections
+    /// (`chain_dev.rs::lin_f32`, n = head_dim = 128, k = dim = 5120).
+    ///
+    /// Small-n shapes dispatch to the vectorized + K-split v2 kernel (see
+    /// `dsv41_gemv_f32_v2` in dsv41_glue.cu): v1 launches 16 blocks / 128
+    /// warps (11% of the SMs) with 160 serial 4B loads per warp, i.e. 48x
+    /// above the 0.34us HBM floor for this 2.6MB weight. v2 splits K across
+    /// WPR warps per row (smem fold) and uses float4 loads → 1024 warps.
+    /// Per-element rounding is pinned to v1's fused FFMA via __fmaf_rn, so
+    /// only the K-slice fold order changes (~1e-6 f32). Larger f32 GEMVs
+    /// (none exist today) keep v1's bit-exact path. `DSV41_GEMV_F32_V2=0`
+    /// pins v1 (A/B escape hatch).
     pub fn gemv_f32(&self, w: *const f32, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
+        if gemv_f32_v2_wanted(n) {
+            if let Some(f) = self.kernels.gemv_f32_v2 {
+                let rc = unsafe { f(w, x, out, n, k, self.stream) };
+                return self.kerr(rc, "dsv41_gemv_f32_v2");
+            }
+        }
         let f = self.need(self.kernels.gemv_f32, "dsv41_gemv_f32")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };
         self.kerr(rc, "dsv41_gemv_f32")
@@ -2600,4 +2621,19 @@ fn gemv_bf16_v2_wanted(n: i32) -> bool {
     n > 0
         && n < GEMV_V2_MAX_N
         && *F.get_or_init(|| std::env::var("DSV41_GEMV_V2").map(|v| v != "0").unwrap_or(true))
+}
+
+/// Row count below which the M=1 f32 GEMV diverts to the vectorized + K-split
+/// v2 kernel. The only f32 GEMV user is the compressor's kvp/scp projection
+/// (n = head_dim = 128) — the bound is generous so any future small f32 shape
+/// benefits, while large ones keep v1's bit-exact order.
+const GEMV_F32_V2_MAX_N: i32 = 2048;
+
+/// `DSV41_GEMV_F32_V2=0` pins every M=1 f32 GEMV to v1 (A/B escape hatch).
+/// Default ON: the .so exposes `dsv41_gemv_f32_v2`.
+fn gemv_f32_v2_wanted(n: i32) -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    n > 0
+        && n < GEMV_F32_V2_MAX_N
+        && *F.get_or_init(|| std::env::var("DSV41_GEMV_F32_V2").map(|v| v != "0").unwrap_or(true))
 }
