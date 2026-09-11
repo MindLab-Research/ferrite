@@ -2610,3 +2610,32 @@ GEMV 的 n_total/k 均 2 的幂 ✓ —— **基本无问题** ✓。
 2. **premix 常量设备化**：初始化上传一次到专用 buffer，每步 D2D 拷 16B（图可捕获 ✓）。
 3. **engram 哈希设备化**（较大工程，host `forward_row` → kernel）。
 4. **设备侧 AR**（修 DSV41_AR_DEV 的"reduce 写回"）→ 之后整步单图。
+
+## ★★★ 落地：设备侧 argmax（GLM HEAD_DEV）—— token 不再过主机 + premix D2D
+
+**实现**（`0b56eea`）：
+- `argmax_kernel`（单 block 1024 线程、packed u64 蝶形归约、**平局取最小下标** = 与 host
+  严格大于扫描完全一致 ✓）+ `dsv41_argmax` launcher；token 直接写进 `s.ids`，
+  下一步的 embed 直读 ⇒ **消 517KB 全词表 D2H + O(vocab) host 扫描**；host 每步只读 4B（EOS/打印）。
+- premix [1,0,0,0]（**每步常量**）在 reset 上传一次，每步 16B **D2D** 刷新（图可捕获 ✓）。
+- `step(token,pos)`=喂数路径（prefill）；`step_dev(token,pos)`=**解码稳态零 H2D**（token 值仅喂
+  host 侧 engram 哈希，不上传 ✓）。top5 调试移进 chain（DSV41_TOP5）。
+
+**验证**：四段文本逐段人工读过 ✓（Paris/Tokyo/2/《静夜思》——李白，与 flash 版一致）；
+性能 **21.2 tok/s（47.16/47.26ms）** vs 改前 21.1（47.46ms）—— 省的 ~0.26ms 与
+517KB D2H + 扫描的量级吻合 ✓。**会话累计 2.6 → 21.2 tok/s（8.2x）**。
+
+### 用户三项指令的进度
+| 指令 | 状态 |
+|---|---|
+| 无任何 H2D | **解码稳态 = 0**（engram 哈希仍在 host 算但只上传一次/步 —— ⚠ 这是最后一处 H2D，需设备化）|
+| tile 对齐 | ✓（mxf4 K 已补 64 倍数；其余维度全 2 的幂）|
+| 单 CUDA graph | **阻塞 = AR 的主机 barrier** ✗（+ eng_ids 的每步上传 ✗）|
+
+### 下一步（按依赖序）
+1. **设备侧 AR**（单图的唯一硬阻塞）：DSV41_AR_DEV 已有骨架（5 次尝试未成，最后卡在
+   "reduce 没把和写回"）；GLM AR v5 的结论直接适用：**epoch 只由图回放推进（TP 天然 lockstep）⇒
+   结构上不可能漂移** —— 把 v5 的 3-kernel（store/publish/pubred）协议移植到 DSV41 的
+   cudaMemcpyPeerAsync staging 上。
+2. engram 哈希设备化（消最后一处 H2D；读 s.ids 的设备 token ⇒ 可进图）。
+3. 整步单图捕获（embed → 45 层 → head → argmax 全进一张图；4B 读在图外）。
