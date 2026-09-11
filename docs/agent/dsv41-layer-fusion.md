@@ -413,7 +413,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | `dsv41_gemm_bf16_fp8x2`（shape） | `cudaErrorInvalidValue` | `gemm_bf16_fp8x2: rc==1` | ⚠️ 旧符号；3015 的 SetAttribute 失败路径不清 sticky → 已注释 |
 | `dsv41_argmax_sliced`（shape） | `cudaErrorInvalidValue` | `argmax_sliced: rc==1` | ⚠️ 旧符号 |
 | `ferrite_p2p_ar_v5_hcpost`（shape） | `cudaErrorInvalidValue` | `p2p_ar_v5_hcpost: rc==1` | ⚠️ 旧符号 |
-| `dsv41_hc_front{,_split,_persist,_persist_mb}` | `cudaErrorInvalidValue`（gate off / 形状） | `rc==1` | ⚠️ 旧符号（gate-off 就是靠 InvalidValue 表意） |
+| `dsv41_hc_front{,_split,_persist,_persist_mb}` | `cudaErrorInvalidValue`（gate off / 形状） | `rc==1` | ⚠️ 旧符号（gate-off 就是靠 InvalidValue 表意）；但 `_split` 的 3 处事件失败路径已在 r44 加 sticky clear（见 §7.2） |
 | `dsv41_interleave_gateup_fp4`（r43 新增） | 无 decline（坏形状直接 `cudaErrorInvalidValue`） | `kerr`，无 rc 检查 | ✅ 硬报错语义，安全 |
 | `dsv41_quant_fp4_fused`（r42 新增） | 无 decline（不满足条件就走 legacy 两 launch） | — | ✅ 安全 |
 
@@ -428,3 +428,30 @@ Rust 的 `rc==1` 读成回退。按"rounds 37-41 已冻结、改动有回归风�
 - 若某旧符号要重新启用（如 `DSV41_WO_QUANT_FUSE=1` 重新打开 `gemm_fp8_mx_q`），先把它迁到 2，
   否则 r42 的 sticky-leak 崩溃会复现。
 - `dsv41_kernels.cu` gemv 段（约 :2500-2900）有其它 agent 在飞改动时，只动 `return 1→2` 的行。
+
+### 7.2 event-sticky-fix（r44，2026-09-11）
+
+**背景**：b300-4 驱动 wedge 事故的 first-forward-trace 追到 `dsv41_hc_front_split`：3 处事件调用
+（`cudaEventRecord(fork_ev,s)` / `cudaStreamWaitEvent(side,fork_ev,0)` / `cudaEventRecord(join_ev,side)`）
+的失败路径都写 `if (e != cudaSuccess) return (int)e;`，**不调用 `cudaGetLastError()`**。驱动状态
+异常时这些调用失败 → sticky 存留 → 被下一个 launcher（`quant_fp8`）的 `kerr` 读到 → **归因错位**
+（与 r42 的 SetAttribute sticky-leak 同类）。
+
+**修复**：这 3 处改为
+```c
+if (e != cudaSuccess) {
+    (void)cudaGetLastError();   // clear the sticky flag before reporting
+    return (int)e;
+}
+```
+同文件 r42 已给 `cudaFuncSetAttribute` 的失败路径加过同款 clear（`hc_front` / `hc_front_split` /
+`hc_front_persist` / `hc_front_persist_mb`），本次只补齐事件调用这一类。
+
+**审计**：`dsv41_kernels.cu` 内**只有** `dsv41_hc_front_split` 一个 launcher 直接调 `cudaEventRecord` /
+`cudaStreamWaitEvent`；attention/moe 双链的 `fork2/join2` 事件由 **Rust** 侧发起
+（`device.rs::dual_chain_fork/join` → `devrt.rs::record_event/stream_wait_event` → `kerr`），
+没有 C 侧 `return (int)e` 形态，无需同款修改（Rust 侧返回 `Result`，由调用链传播）。
+
+**纪律**：任何**非 `cudaGetLastError()` 来源**的 CUDA 调用（`cudaEventRecord`、`cudaStreamWaitEvent`、
+`cudaFuncSetAttribute`、`cudaMalloc` …）在返回错误码前都必须先 `(void)cudaGetLastError()` 清 sticky，
+否则错误会泄漏给下一个 launcher 造成归因错位。

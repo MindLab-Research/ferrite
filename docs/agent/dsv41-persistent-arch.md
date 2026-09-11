@@ -143,3 +143,37 @@ persistent 核是 `ferrite-kernel` 的「**模型描述 → 图节点**」编译
 
 ---
 _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/8117/8140`（AR 与 PDL）；`dsv41_kernels.cu:1002/1991/2709`（hc 归约 / smem opt-in）；`configs/dsv41_flash.json`（40 层）；`STATUS.md`（gap-analysis、第 14/18-21 轮）；`dsv41-layer-fusion.md`（段设计、T=64）。_
+
+## 10. 注意力投影链的下一段（explore 2026-09-11，纯代码分析，未上机）
+
+**关键几何发现（本节基石）**：`sparse_attn_pf_kernel`（`dsv41_kernels.cu:558`，launcher `:3271`，grid=(b*m, h)、block=128）与 `apply_rope_kernel`（`:1209`，o-rope 经 `dsv41_apply_rope_q:3537`，rows=nlh、block=128）的 **block 归属逐位相同**：一个 block 吃一个 head 的完整 d 行。head 宽（hd=512）是 32 的倍数 ⇒ fp8 发射的 per-32-block 索引在 head 边界对齐，head-local 计算 == 全局 flat 计算（逐位）。
+
+⇒ **sparse_attn + o-rope(inverse) + fp8 发射 三合一 = 几何零变化的融合**，唯一新增的是 sparse 写 out 后的一次 `__syncthreads()`。省 40 launch/步（o-rope 40 次）。是「fork/join 不改 grid 形态 + 单点 epilogue」两条成功模式的直接继续。
+
+**为什么「sparse 的 o 直接进 wo_a 的 dot」不行**：wo_a 的 k = hpg*hd = 4096 = nlh*hd = 8 个 head = **8 个不同 block**（`chain_dev.rs:2798-2808`）⇒ 跨 block 依赖 ⇒ 触犯 hcpm/hc-merge 铁律（`cudaLaunchCooperativeKernel` 与图捕获不兼容，`STATUS.md:4114`）。
+
+**为什么 wo_a→wo_b 链式核不行**（复核 gemv-call-pair-wo，`STATUS.md:5973`）：wo_b 的 k = ol_local = 1024 **恰是 wo_a 的完整 n** ⇒ consumer 必须等 producer 全部 drain，链式核内部即跨块栅栏（选举已被证伪 +3.3ms）。异 k（4096 vs 1024）也不能共享 mx2 的同一份 staging。**只有 B1 epilogue 落地**（`gemm_fp8_gemv_kernel:2113` 的 xq/xsc 尾参 + 跨 warp amax epilogue）。
+
+**推荐的真正「persistent」杠杆 = PDL 串链**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。给注意力投影链的 consumer 端（wq_b / sparse / wo_a / wo_b）加 `cudaGridDependencySynchronize()` 入口，让 prologue（smem staging、LUT 构建、idx 加载、q staging）在 producer 的 ramp-down 期间执行——**不减节点、不改 grid、无跨块同步**，回收的是节点过渡固定成本而非带宽。
+
+**骨架（三合一核）**：
+
+```cpp
+// grid=(b*m, h), block=128 —— 与 sparse_attn_pf / apply_rope 逐位同几何
+__global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const float* sink,
+                                         const int32_t* idxs, float* out, int b, int m, int h, int d,
+                                         const int* clen, int win, int index_topk, float scale,
+                                         const float* cos, const float* sin, const int* base,
+                                         int rope_rd, int half, int mul, int off,
+                                         uint8_t* xq, float* xsc) {
+  // phase 1: sparse_attn_pf 主体逐句照抄（qv staging / 三深预取 / online softmax）
+  //          唯一改动：out 行留在 smem（512 f32 = 2KB/block，128 线程 x 4 lane）
+  __syncthreads();                       // 新增的唯一栅栏
+  // phase 2: inverse rope，仅本 head 的 [d-rope_rd, d)，pair(2i,2i+1)
+  //          表达式取自 apply_rope_kernel:1218-1224（inverse=true）
+  // phase 3: fp8 发射，per-32 block；索引 = (row*h+hh)*d + c，512%32==0 ⇒ 与 flat 版逐位同
+  //          公式取自 apply_rope_kernel:1230-1246（fast_round_scale + clamp + e4m3）
+}
+```
+
+**验收**：`DSV41_SPARSE_OROPE=0` 回退旧双 launch；`sparse_orope_parity.rs` 逐位比（同设备、确定性输入）。
