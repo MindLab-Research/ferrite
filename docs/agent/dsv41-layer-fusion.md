@@ -185,6 +185,18 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   one-shot Cell 让 `indexer()` 跳过它自己的 `apply_rope(s.idx_q)`。收益 = 每步省 40（q）+ ~7
   （idx_q）次 launch。**唯一未在无 GPU 环境验证的点**：fast-math 下两处的 `x0*c - x1*s` 收缩
   是否逐位一致（同 TU 同表达式，按 rmsnorm_rope 的同款论证）——需一次 parity 测试确认 ✓。
+  - ⚠️ **ABI 参数错位曾让 rope fusion 完全静默失效（2026-09-11 修复）** ✗→✓：`device.rs` 的两个
+    FFI 函数指针类型把 `CuStream` 放在了第 9 个参数位（紧跟 `n, k`），照抄了 `gemm_fp8_mx` 的
+    「stream 在 shape 之后、可选尾参之前」写法；但 `dsv41_gemm_fp8_mx_rope` / `..._mx2_rope` 没有
+    可选尾参，C 侧 stream 是**最后一个**参数。于是 C 读到的形参整体错位一格：
+    `rope_cos <- 真 stream`、…、`rope_rd <- 真 rope_inverse(0)` ⇒ launcher 的
+    `rope_rd <= 0` 判定成立 → 返回 1（decline）→ Rust `gemm_fp8_mx_rope` 返回 `Ok(false)` →
+    调用点静默回退到 `lin`/`lin2` + 独立 `apply_rope`。表现为「DSV41_ROPE_FUSE 默认 ON、
+    `supports_rope_fuse()` 符号探测为真、kernel 侧实现正确，但 nsys 里 apply_rope 仍是 88/步」，
+    且 round-37 的 f32v2 臂「中性」（既没省 launch 也没加 epilogue 开销）——正是静默回退的特征。
+    **教训**：`Option<unsafe extern "C" fn(...)>` 的参数顺序是手写转录，编译器不会对着 `.cu` 校验；
+    新符号的 FFI 类型必须逐参对照 C 原型（本仓库主流约定是 stream 放最后，只有带 C++ 默认尾参的
+    `dsv41_gemm_fp8_mx` 例外）。修复：device.rs 两处 fn 类型与两处调用把 `self.stream` 移到末尾。
 - **`gateup_fused` 曾与 `.cu` 融合条件不一致（已修复 2026-09-11）** ✗→✓：Rust 侧原来只判
   `DSV41_GATEUP_FUSE` + `supports_gateup_fuse()`，漏了 `.cu:1367` 的 `g_expert_fp4_mode == 2`。
   当 `DSV41_EXPERT_FP4_MODE=0/1` 时 kernel 写满 `2*inter` 不融合，而 host 仍按融合推进

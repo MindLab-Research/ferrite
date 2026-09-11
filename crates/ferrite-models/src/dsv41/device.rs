@@ -63,22 +63,32 @@ struct Kernels {
     /// term). Optional: a stale `.so` has no entry and the caller keeps the
     /// (gemm_fp8_mx, apply_rope) pair. Returns 1 when the shape cannot take it.
     gemm_fp8_mx_rope: Option<
+        // ABI: the stream is the LAST parameter, matching the kernel's
+        // `dsv41_gemm_fp8_mx_rope(..., cudaStream_t s)` exactly. It must NOT sit
+        // after (n, k) the way `gemm_fp8_mx` does - that symbol has optional
+        // trailing args, this one does not, and a wrong position silently
+        // shifted every rope arg so the kernel read `rope_rd == 0`, declined,
+        // and the caller fell back to the standalone apply_rope.
         unsafe extern "C" fn(
             *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
-            c_int, c_int, CuStream,
+            c_int, c_int,
             *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+            CuStream,
         ) -> c_int,
     >,
     /// RoPE fusion for the two-family GEMV: family 1 rotates with `rope_hd1`,
     /// family 2 with `rope_hd2` (the wq_b / idx_wq_b pair). Optional, like
     /// `gemm_fp8_mx_rope`.
     gemm_fp8_mx2_rope: Option<
+        // ABI: stream LAST, as in `dsv41_gemm_fp8_mx2_rope(..., cudaStream_t s)`
+        // (see the note on gemm_fp8_mx_rope - same mis-ordered-stream bug).
         unsafe extern "C" fn(
             *const u8, *const f32,
             *const u8, *const u8, *const f32, *mut f32, c_int,
             *const u8, *const u8, *const f32, *mut f32, c_int,
-            c_int, CuStream,
+            c_int,
             *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int, c_int,
+            CuStream,
         ) -> c_int,
     >,
     /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
@@ -962,7 +972,6 @@ impl Device {
                 out,
                 n,
                 k,
-                self.stream,
                 rope_cos,
                 rope_sin,
                 rope_base,
@@ -972,6 +981,7 @@ impl Device {
                 rope_inverse as i32,
                 rope_rd,
                 rope_hd,
+                self.stream,
             )
         };
         if rc == 1 {
@@ -1030,7 +1040,6 @@ impl Device {
                 out2,
                 n2,
                 k,
-                self.stream,
                 rope_cos,
                 rope_sin,
                 rope_base,
@@ -1041,6 +1050,7 @@ impl Device {
                 rope_rd,
                 rope_hd1,
                 rope_hd2,
+                self.stream,
             )
         };
         if rc == 1 {

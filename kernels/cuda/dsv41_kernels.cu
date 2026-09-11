@@ -769,7 +769,11 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 // fixed merge/launch cost. 8 is the default because the long-context steady
 // state (clen at the compress cap) is where the sparse path dominates the step;
 // DSV41_ATTN_PF_SPLIT=4 is the short-context arm.
-#define kAttnPfSplitDefault 8
+// Round 39 verdict: at the bench's short context (topk ~178) C=8 measured
+// +0.1ms in serve - the isolated win only materialises at topk >= ~300
+// (long-context steady state). Default OFF until an adaptive C (graph-capture
+// friendly) exists; DSV41_ATTN_PF_SPLIT=C opts in explicitly.
+#define kAttnPfSplitDefault 0
 #define kAttnMaxC 16
 #define kAttnMaxBM 8
 #define kAttnMaxH 64
