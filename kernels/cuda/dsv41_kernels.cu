@@ -2971,6 +2971,31 @@ static const bool g_gemv_act_cpasync = [] {
     return atoi(e) != 0;
 }();
 
+// P3 for the FUSED gate + shared-expert gemv (gemv_bf16_fp8x2_kernel), env
+// `DSV41_BF16_CPASYNC`, default ON (`=0` restores the old issue order).
+//
+// Same transform as g_gemv_cpasync above -- move a warp's FIRST weight-row
+// transfer from the row loop's prologue-list into the block prologue, so the
+// DRAM round trip is overlapped instead of exposed -- with the added advantage
+// that this kernel's prologue is longer than the plain gemv's: on top of the
+// e4m3 LUT build there is the P1 fused `s_af` materialisation (k/16 16B loads
+// from global + 16 LUT lookups each), and the row loop cannot start until the
+// barrier after it. Issuing the cp.async group before ALL of that gives the
+// staged row the LUT + a32 pass + barrier to land under.
+//
+// SCOPE. fp8 rows only: a bf16 gate row (`row < nb`) stages nothing -- it reads
+// `wb` through the 4-deep ILP LDG loop and has no shared-memory copy to overlap,
+// and its weight row is 2*k bytes so it would not fit in the k-byte fp8 slot
+// even if it wanted to. The commit stays UNCONDITIONAL (bf16-first warps and the
+// gate-off arm commit an EMPTY group) so every thread of the block carries the
+// same cp.async group count into the row loop's `wait_all`. Same bytes into the
+// same slot, only the issue point moves -> bit-identical output.
+static const bool g_bf16fp8x2_cpasync = [] {
+    const char* e = getenv("DSV41_BF16_CPASYNC");
+    if (e == nullptr) return true;
+    return atoi(e) != 0;
+}();
+
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
@@ -5192,7 +5217,8 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
                                        const uint8_t* __restrict__ wf2,
                                        const uint8_t* __restrict__ ws2,
                                        float* __restrict__ outf2,
-                                       const float* __restrict__ x, int k, int vec) {
+                                       const float* __restrict__ x, int k, int vec,
+                                       int cpasync) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -5221,6 +5247,43 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
     // rounding sequence is unchanged: the output stays bit-identical.
     float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
     float* s_af = s_lut + 256;
+    const int total = nb + 2 * nf;
+    // ---- P3 (DSV41_BF16_CPASYNC, see g_bf16fp8x2_cpasync) ------------------
+    // cp.async WEIGHT-FIRST prologue. The row loop's fp8 staging used to start
+    // only after the barrier below, with nothing left to hide it: the LUT build
+    // and the whole P1 `s_af` materialisation had already finished, so every
+    // warp that owns an fp8 row paid the full DRAM latency of its k-byte row
+    // before it could compute. The row depends on none of that work, so issue it
+    // here -- the earliest point in the block -- and let the LUT + a32 pass +
+    // barrier run underneath it. Loop iteration 0 recognises it by
+    // `row == pf_row` and only WAITS.
+    //
+    // NOTE the explicit (int) cast: `blockIdx.x * nwarps + warp` is UNSIGNED
+    // (blockIdx.x is uint3), so the bare ternary would promote -1 to 0xFFFFFFFF.
+    int pf_row = (cpasync != 0) ? ((int)blockIdx.x * nwarps + warp) : -1;
+    if (pf_row >= total) pf_row = -1;            // the last block's tail warps
+    if (pf_row >= 0 && pf_row >= nb) {           // fp8 rows stage; bf16 rows never do
+        // Family/pointer select copied from the row loop verbatim: a second-half
+        // row reads wf2, the first half wf1. Drifting from the loop here would
+        // silently stage the WRONG row (no crash, wrong dot product).
+        const int rr = pf_row - nb;
+        const bool second = rr >= nf;
+        const int rrow = rr - (second ? nf : 0);
+        const uint8_t* pf_w = (second ? wf2 : wf1) + (size_t)rrow * (size_t)k;
+        uint8_t* pf_s = s_w + (size_t)warp * (size_t)k;
+        const int n16p = k >> 4;
+        for (int i = lane; i < n16p; i += 32) dsv41_cp_async16(pf_s + (i << 4), pf_w + (i << 4));
+        // k % 16 tail: unreachable for every caller (the launcher rejects
+        // `k & 15`), kept so the prefetched row is staged by exactly the rule the
+        // loop uses. A hole here would be a partially-staged row, not a crash.
+        for (int i = (n16p << 4) + lane; i < k; i += 32) pf_s[i] = pf_w[i];
+    }
+    // Committed UNCONDITIONALLY -- also for the bf16-first warps and when the
+    // gate is off (they commit an EMPTY group, a no-op). That keeps the per-thread
+    // commit-group count identical across the block. The row loop's own
+    // `cp.async.wait_all` retires this group on the prefetched iteration, so the
+    // fp8 path never sees it.
+    dsv41_cp_commit();
     // Build the e4m3 decode table once per block (256 entries, two iterations per
     // thread at the default block size) and, after the barrier, materialise the
     // scaled activation straight from global. Both live outside the two family
@@ -5248,7 +5311,6 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             s_af[i] = s_lut[a[i]] * a_scale[i >> 5];
     }
     __syncthreads();
-    const int total = nb + 2 * nf;
     for (int row = blockIdx.x * nwarps + warp; row < total; row += gridDim.x * nwarps) {
         if (row < nb) {
             // ---- bf16 family: gemv_bf16_kernel's loop, four iterations in flight
@@ -5273,10 +5335,17 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             const uint8_t* wrow = ((second ? wf2 : wf1) + (size_t)rrow * (size_t)k);
             const uint8_t* wsc = (second ? ws2 : ws1) + (size_t)(rrow >> 5) * nb_k;
             uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
-            const int n16 = k >> 4;
-            for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wrow[i];
-            for (int i = lane; i < n16; i += 32)
-                dsv41_cp_async16(row_s + (i << 4), wrow + (i << 4));
+            // P3: the prologue already staged this row (same bytes, same slot).
+            // Skip the redundant transfer and let the wait below collect it.
+            const bool prefetched = (row == pf_row);
+            if (!prefetched) {
+                const int n16 = k >> 4;
+                for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wrow[i];
+                for (int i = lane; i < n16; i += 32)
+                    dsv41_cp_async16(row_s + (i << 4), wrow + (i << 4));
+            }
+            // Unconditional: on the prefetched iteration this commits an EMPTY
+            // group after the prologue's, and wait_all retires both.
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
@@ -5328,7 +5397,7 @@ extern "C" int dsv41_gemm_bf16_fp8x2(const void* wb, const float* biasb, float* 
     }
     gemv_bf16_fp8x2_kernel<<<blocks, warps * 32, gsmem, s>>>(
         (const __nv_bfloat16*)wb, biasb, outb, nb, a, a_scale, wf1, ws1, outf1, nf, wf2, ws2, outf2,
-        x, k, vec);
+        x, k, vec, g_bf16fp8x2_cpasync ? 1 : 0);
     return (int)cudaGetLastError();
 }
 

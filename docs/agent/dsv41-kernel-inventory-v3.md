@@ -621,6 +621,34 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
      ⚠️ `.cu` 改动后必须 `.so` 重编，否则运行期 build-id 门禁拒启。
    - 预期（分析口径）：~2-3µs/call × 246 call ⇒ −0.5~0.7ms。**待 user 亲自单轮 A/B**：
      `DSV41_GEMV_CPASYNC=1`（默认）vs `=0`，同窗口，文本 + nsys `gemm_fp8_gemv` 每步 ms。
+0.6b **P3 → 混合核 `gemv_bf16_fp8x2_kernel` 的复制（2026-09-11 已落地代码，待实测）**：
+   nsys v9 口径下该核（MIX_GATE=ON 时的 gate+共享专家三合一 launch）med **9.1µs × ~38/step
+   = 0.35ms**，是 0.6/0.58 之外唯一还带"fp8 权重行在 barrier 之后才发射"的 gemv 族内核。
+   - **实现**：新增 host gate `g_bf16fp8x2_cpasync`（env **`DSV41_BF16_CPASYNC`**，默认 ON，
+     `=0` 回退），launcher 以**新增末位 kernel 参数 `cpasync`** 传入（该核原末参 `vec` 在
+     kernel 内**未被引用**，仅作 mode 标记保留）。kernel prologue 在 `s_af` 基址算出后、**LUT
+     构建之前**插入预取块，loop 内 `const bool prefetched = (row == pf_row)` 跳过本轮发射。
+   - **比单族 gemv 的 P3 覆盖窗口更长**：单族的 prologue 只有 LUT + 激活 staging；本核还有
+     **P1 的 `s_af` 物化**（k/16 次 global uint4 + 每次 16 个 LUT 查表）⇒ 预取早了整个 a32
+     段 + 两道 barrier，隐藏窗口更大。
+   - **fp8-only**：`row < nb` 的 bf16 gate 行**不 staging**（4-deep ILP 的直读 LDG，没有可
+     重叠的 smem 拷贝；且它一行是 2k 字节，塞不进 k 字节的 fp8 槽）。所以条件是
+     `pf_row >= 0 && pf_row >= nb`；`nb == 0` 时全 fp8，无影响。
+   - **commit 无条件**（bf16 首行 warp / 门关时提交空 group），保证全 block 的 per-thread
+     commit-group 计数一致；loop 的 `wait_all` 在预取那次迭代回收它。**无新增 smem 槽**，
+     gsmem 公式不变。
+   - **不需要 `cudaGridDependencySynchronize()`**：本核 launcher 是 plain `<<<>>>`（非 PDL），
+     与 `gemm_fp8_gemv_kernel` 的 PDL 前提不同。
+   - 验证（2026-09-11）：远端 `nvcc 13.2 -gencode arch=compute_100a,code=sm_100a -Xptxas -v`
+     **编译通过、无 error**（仅 3 条既有 warning）；`gemv_bf16_fp8x2_kernel` 寄存器
+     **44 → 46（+2）**、**0 spill / 0 stack**，占用率不受影响（reg 远非瓶颈，smem 才是）。
+     本机无 nvcc ⇒ `cargo check -p ferrite-models` 通过（本改动**无 Rust 改动**，`extern "C"`
+     签名不变）。
+     ⚠️ `.cu` 改动后必须重编 `.so`（`kernels/cuda/build.sh 100a`），否则运行期 build-id 门禁拒启。
+   - 预期（分析口径）：−0.09ms（0.35ms × 20~25%）。**待实测 A/B**：`DSV41_BF16_CPASYNC=1`
+     （默认）vs `=0`，同窗口，文本 + nsys `gemv_bf16_v2` 每步 ms。
+     ⚠️ 注意 `MIX_GATE` 默认值：本核只在 MIX_GATE=ON 时被调用（见 §0.2 (A)），
+     **若同窗口 MIX_GATE 是 OFF，本门完全不生效**——A/B 前先确认该核仍在 profile 里出现。
 0.58 **P4 cp.async 权重先行 —— expert gateup 版（2026-09-11 已落地代码，待实测）**：
    同一个 prologue 串行问题的 expert 侧复制。`expert_gemv_fp4_batched_kernel<ILV>` 的
    prologue = LUT(256 项) → `cudaGridDependencySynchronize()` → 激活 staging（uint4 解码）
@@ -652,6 +680,61 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    - 验证：本机无 nvcc（`cargo check -p ferrite-models` 通过；`.cu` 需远端 `build.sh 103a`
      重编，⚠️ 不重编 `.so` 会被 build-id 门禁拒启）。A/B：`DSV41_GATEUP_CPASYNC=1`（默认）
      vs `=0`，同窗口，人眼文本 + nsys `expert_gemv_fp4_batched_kernel` 每步 ms。
+0.57 **P4.2 完整 cp.async 流水线 —— expert gateup 多组在飞（2026-09-11 已落地代码，待实测）**：
+   §0.58（P4）只预取 group 0；主循环第 2..nv2f 组仍是串行 LDG，而 gateup 的实测症状是
+   **22.2µs/call、443 GB/s、IPC 0.8/4（80% issue 槽停等）**，地板 1.3µs ⇒ 19-26x 差距，
+   根因是操作数供给（每 warp 一个 group 只有 ~120 条指令的工作量，却要等 ~600 cycle 的 HBM
+   载入）。寄存器型 unroll 救不了：LDG 目的寄存器挂在消费者 scoreboard 上，且
+   `__launch_bounds__(1024)` 把 regs 钉在 64/thread。**cp.async 把载入从寄存器 scoreboard
+   上摘下来**，等待变成 `cp.async.wait_group N` 的组计数器。
+   - **实现**：env **`DSV41_GATEUP_PIPELINE`**（1 = P4 现状 / 2..5，**默认 2**，clamp 到
+     `kGateUpPfDepthMax=5`）→ host `dsv41_gateup_pipeline()` → **新增内核模板参数
+     `PDEPTH`**（`cp.async.wait_group N` 的 N 是立即数 → 编译期常量；launcher 按 clamp 后
+     的深度选实例化，共 `ILV × PDEPTH(1..5)` 10 个）→ 每 warp 的 `s_pf` 变成 **PDEPTH 个
+     512 B 槽的 ring**，`s_ks` 顺延 `nwarps*512*PDEPTH`。
+   - **流水线语义**：prologue 发 PDEPTH 组（每组一次 commit，越界也 commit）；循环第 i 组
+     `wait_prior(PDEPTH-1)` → 读 slot `i%PDEPTH` → **立刻**把第 i+PDEPTH 组发进刚空出的
+     槽 → commit。尾部用**空 commit 补位**，保证"消费第 i 组前已 commit 恰好 PDEPTH+i 组"
+     这一等式成立（否则 `wait_prior(PDEPTH-1)` 在尾部覆盖不到第 i 组）。循环尾 `wait_prior(0)`
+     收掉空 commit（立即返回）。
+   - **lane-local 拷贝（关键设计）**：`dsv41_gateup_pf_group<ILV>` 让**每个 lane 只拷自己
+     要读的字节**——ILV：lane L 拷 `src + gi*512 + L*16` 的 16 B（一条 cp.async.cg）；plain：
+     lane L 拷 gate `gi*256 + L*8` 与 up `gi*256 + L*8` 各 8 B（两条 cp.async.**ca**，因为
+     cp.async.cg 只有 16 B 一种）。⇒ **不需要每个 group 的 `__syncthreads()`/`__syncwarp()`**，
+     拷贝完成即对消费者可见。这也是把 P4 的 plain 路径从"跨 lane 16 B 拷贝 + barrier 发布"
+     换成 8 B lane-local 的原因（smem 内容逐字节相同）。
+   - **原始 PTX 而非 `__pipeline_*`**：CUDA header 的三个原语**没有 "memory" clobber**，
+     编译器可以把 smem 读挪到 copy 发射之前——而 ring 的 copy 目标正是刚读过的那个槽，
+     顺序反了会静默读错组（不崩、不报错）。故 `pf16/pf8/commit/wait_prior<N>` 全部自写
+     asm 并带 `: "memory"`。
+   - **smem 与占用率（本次复核推翻了旧结论）**：`smem = dim*4 + 256*8 [+ nwarps*8] +
+     nwarps*512*PDEPTH`。生产形状（dim=5120、rows=8、ksplit=2 ⇒ nwarps=16、nv2f=10、
+     每 warp 切片 5 组）：D=1 **30848 B（与 P4 完全一致）**、D=2 39040、D=3 47232（<48 KB
+     默认上限）、D=4 55424、D=5 63616（>48 KB，需 opt-in）。⚠️ **占用率不是约束**：生产
+     grid = (inter/rows, slots) = (40, 6) = **240 CTA / 148 SM ≈ 1.6 CTA/SM**——是 **grid
+     受限**，不是资源受限，所以 ring 长出来的是没人用的余量。§0.58 里"整行 staging 会把占用率
+     换掉"那句写在满 grid 的形状上，**在这个形状不成立**，这正是 D 可以开到 5（= 整个切片在飞，
+     warp 级 MLP 上限）的原因。
+   - **D=4/5 的 opt-in**：`dsv41_gateup_pf_smem_cap(ilv)` 按 **(device, ilv)** 缓存
+     `cudaDevAttrMaxSharedMemoryPerBlockOptin` 并 `cudaFuncSetAttribute(<ILV,4|5>)`——照抄
+     `expert_gemv_fp4_down_reduce_kernel` 的 per-device carve-out 修法（`cudaFuncSetAttribute`
+     是 **per-context**，只设当前 device 会让其余 7 个 rank 停在默认值）。opt-in 失败 ⇒
+     cap = 48 KB，launcher 把 pd clamp 回去，**launch 永不失败**。深度还会被"本 warp 切片组数
+     `ceil(nv2f/ksplit)`"再 clamp 一次（超过切片的深度纯浪费）。
+   - **逐位等价**：同字节、同 lane 偏移、同消费顺序、同 fma 链顺序，只有"从哪块内存读 / 何时
+     发射拷贝"变了。PDEPTH=1 的代码路径与 §0.58 **逐字保持**（含 plain 的延迟 uw 载入），
+     供 A/B 基线。
+   - 验证（本次）：远端 nvcc 13.2 `-gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math`
+     **10 个实例化全部编过**；寄存器：`<ILV,1>` 64/0 spill（= P4）、`<ILV,2..5>` 64 regs +
+     8-12 B spill（2-3 寄存器，`__launch_bounds__(1024)` 的 64 上限所致，与 §0.58 同源）、
+     `<plain,*>` 63-64/0 spill。PTX 复核：`<ILV,1>` 只有 1×`wait_group 0` + 1 条
+     `cp.async.cg`；`<ILV,2>` `{wait 0 + wait 1×5}` + 7 条 cg16 + 7 commit；`<ILV,5>`
+     `{wait 0 + wait 4×5}` + 10 条 cg16；`<plain,5>` 20 条 `cp.async.ca` 8 B。
+     ⚠️ 本机无 GPU/nvcc、远端无 cuobjdump ⇒ **没有实跑、没有 SASS spill 定位**。
+   - 待 user 实测：`DSV41_GATEUP_PIPELINE=1|2|3|5`（`=4` 可省）同窗口 A/B，看
+     nsys `expert_gemv_fp4_batched_kernel` 每步 ms + `ncu --set full` 的 issue/停等分解。
+     ⚠️ **必须重编 `.so`**（`bash kernels/cuda/build.sh 103a`，`.cu` 改了不重编会被 build-id
+     门禁拒启）。
 0.55 **P1 staged gate 的落地修正（2026-09-12）**：`6fc9a1a` 引入的 `DSV41_GEMV_A32_STAGED`
    当时只写了**调用**（`a32_direct = ... && !dsv41_gemv_a32_staged();`），该函数在全仓库
    **没有任何定义**（内核里也不能读 env）⇒ HEAD 的 `.cu` 实际**编不过**，且即便编过，
