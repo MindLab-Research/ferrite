@@ -39,15 +39,42 @@ static void bench(const char* tag, int n, int k, int fp8, int reps) {
     cudaMemset(w, 0x3c, wbytes);
     void* x = nullptr;
     cudaMalloc(&x, (size_t)k * 4 + 256);
-    // Deterministic but VARYING patterns (a constant memset makes every
-    // summation order produce the same value, which hides exactly the
-    // differences this printout is meant to expose).
+    // Deterministic but VARYING and LEGAL inputs: random bytes make bf16
+    // exponent-all-ones (NaN) and ue8m0 scale bytes of 0, which turns every dot
+    // into NaN/0 and hides exactly the differences this fingerprint exists to
+    // show. bf16 gets finite exponents, fp8 gets e4m3 finite codes, and the
+    // scales are pinned to 1.0.
     {
         std::vector<uint8_t> hw(wbytes);
-        for (size_t i = 0; i < wbytes; ++i) hw[i] = (uint8_t)((i * 37 + 11) & 0x7Fu);
+        if (fp8) {
+            const size_t wq_bytes = (size_t)n * (size_t)k;
+            for (size_t i = 0; i < wq_bytes; ++i) hw[i] = (uint8_t)((i * 37 + 11) & 0x7Eu);
+            for (size_t i = wq_bytes; i < wbytes; ++i) hw[i] = 0x7F;   // ue8m0 = 1.0
+        } else {
+            std::vector<uint16_t> h16(wbytes / 2);
+            for (size_t i = 0; i < h16.size(); ++i) {
+                const uint16_t e = (uint16_t)(0x70 + (i % 14));        // 0x70..0x7D: finite
+                const uint16_t m = (uint16_t)((i * 37) & 0x7Fu);
+                h16[i] = (uint16_t)((e << 7) | m);
+            }
+            for (size_t i = 0; i < h16.size(); ++i) {
+                hw[2 * i] = (uint8_t)(h16[i] & 0xFFu);
+                hw[2 * i + 1] = (uint8_t)(h16[i] >> 8);
+            }
+        }
         cudaMemcpy(w, hw.data(), wbytes, cudaMemcpyHostToDevice);
         std::vector<uint8_t> hx((size_t)k * 4 + 256);
-        for (size_t i = 0; i < hx.size(); ++i) hx[i] = (uint8_t)((i * 53 + 7) & 0xFFu);
+        if (fp8) {
+            for (size_t i = 0; i < (size_t)k; ++i) hx[i] = (uint8_t)((i * 53 + 7) & 0x7Eu);
+            for (size_t i = 0; i < (size_t)(k / 32); ++i) {
+                const float one = 1.0f;
+                std::memcpy(&hx[k + i * 4], &one, 4);
+            }
+        } else {
+            std::vector<float> hf((size_t)k + 64);
+            for (size_t i = 0; i < hf.size(); ++i) hf[i] = (float)((int)(i % 97) - 48) * 0.01f;
+            std::memcpy(hx.data(), hf.data(), hf.size() * sizeof(float));
+        }
         cudaMemcpy(x, hx.data(), hx.size(), cudaMemcpyHostToDevice);
     }
     void* out = nullptr;

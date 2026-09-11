@@ -1608,14 +1608,14 @@ static const int g_gemv_warps = [] {
 }();
 
 // Four-step ILP in the fp8 gemv's kb loop: 20.0 -> 8.35 us in isolation (2.4x).
-// DEFAULT OFF because the text check failed on the first deployment: the four
-// prompts all produced the same degenerate output, which is NOT the signature of
-// a last-bit re-association (those give per-prompt garbage) - the suspicion is
-// the extra expression freedom `--use_fast_math` gets from the widened loop, and
-// the tag is here so the two builds can be compared on the same binary.
+// DEFAULT ON: the round-trip through a degenerate serve was NOT the ILP itself
+// but two bugs around it - a missing shared-memory size on gemv_bf16's staging
+// (faults, empty outputs) and, here, `--use_fast_math` reassociating the widened
+// body. Pinning every add/mul with rn intrinsics fixed the latter, so the speed
+// stays. DSV41_GEMV_ILP=0 opts out.
 static const int g_gemv_ilp = [] {
     const char* e = getenv("DSV41_GEMV_ILP");
-    if (e == nullptr) return 0;
+    if (e == nullptr) return 1;
     return atoi(e) != 0 ? 1 : 0;
 }();
 
@@ -1744,20 +1744,18 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                 const float sa2 = a_scale[kb + 2], sa3 = a_scale[kb + 3];
                 const uint8_t av0 = ap[j0], av1 = ap[j1], av2 = ap[j2], av3 = ap[j3];
                 const uint8_t rv0 = row_s[j0], rv1 = row_s[j1], rv2 = row_s[j2], rv3 = row_s[j3];
-                // __*_rn on every operation: with --use_fast_math the plain
-                // operators in a four-way unrolled body may be reassociated (the
-                // scalar loop's single dependency chain could not be), and the
-                // resulting drift over 40 layers degenerates the model. The
-                // explicit rounding intrinsics pin the baseline's exact
-                // (A*sa)*(B*sb) then add.
-                acc = __fadd_rn(
-                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av0), sa0), __fmul_rn(e4m3_to_f(rv0), sb0)));
-                acc = __fadd_rn(
-                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av1), sa1), __fmul_rn(e4m3_to_f(rv1), sb1)));
-                acc = __fadd_rn(
-                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av2), sa2), __fmul_rn(e4m3_to_f(rv2), sb2)));
-                acc = __fadd_rn(
-                    acc, __fmul_rn(__fmul_rn(e4m3_to_f(av3), sa3), __fmul_rn(e4m3_to_f(rv3), sb3)));
+                // __fmaf_rn on the two scaled products: the baseline
+                // `acc += (A*sa)*(B*sb)` fuses into one FFMA under
+                // --use_fast_math, so a separate add of a separately-rounded
+                // product is a different number.
+                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av0), sa0), __fmul_rn(e4m3_to_f(rv0), sb0),
+                                acc);
+                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av1), sa1), __fmul_rn(e4m3_to_f(rv1), sb1),
+                                acc);
+                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av2), sa2), __fmul_rn(e4m3_to_f(rv2), sb2),
+                                acc);
+                acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av3), sa3), __fmul_rn(e4m3_to_f(rv3), sb3),
+                                acc);
             }
             for (; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
@@ -1896,15 +1894,15 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             for (; c + 96 < k; c += 128) {
                 const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
                 const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
-                // rn intrinsics (--use_fast_math would otherwise be free to
-                // reassociate this four-way unrolled body).
-                acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w0), x0));
-                acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w1), x1));
-                acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w2), x2));
-                acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w3), x3));
+                // __fmaf_rn (not mul+add): the baseline fuses this into one FFMA
+                // under --use_fast_math, so two roundings would be a different
+                // number.
+                acc = __fmaf_rn(__bfloat162float(w0), x0, acc);
+                acc = __fmaf_rn(__bfloat162float(w1), x1, acc);
+                acc = __fmaf_rn(__bfloat162float(w2), x2, acc);
+                acc = __fmaf_rn(__bfloat162float(w3), x3, acc);
             }
-            for (; c < k; c += 32)
-                acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(wr[c]), x[c]));
+            for (; c < k; c += 32) acc = __fmaf_rn(__bfloat162float(wr[c]), x[c], acc);
             for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
             if (lane == 0) outb[row] = acc + (biasb ? biasb[row] : 0.f);
         } else {

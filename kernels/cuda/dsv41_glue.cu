@@ -278,15 +278,16 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
         for (; c + 96 < k; c += 128) {
             const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
             const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
-            // rn intrinsics: with --use_fast_math a four-way unrolled body is
-            // reassociable (the scalar chain was not) and that drift degenerates
-            // the model over 40 layers.
-            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w0), x0));
-            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w1), x1));
-            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w2), x2));
-            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w3), x3));
+            // __fmaf_rn, NOT __fmul_rn+__fadd_rn: the baseline `acc += w*x`
+            // compiles to a fused multiply-add under --use_fast_math (one
+            // rounding), so a separate mul then add (two roundings) is a
+            // DIFFERENT number even though the order looks identical.
+            acc = __fmaf_rn(__bfloat162float(w0), x0, acc);
+            acc = __fmaf_rn(__bfloat162float(w1), x1, acc);
+            acc = __fmaf_rn(__bfloat162float(w2), x2, acc);
+            acc = __fmaf_rn(__bfloat162float(w3), x3, acc);
         }
-        for (; c < k; c += 32) acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(wr[c]), s_x[c]));
+        for (; c < k; c += 32) acc = __fmaf_rn(__bfloat162float(wr[c]), s_x[c], acc);
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
@@ -299,10 +300,28 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
+    // Same treatment as gemv_bf16: stage the shared activation row in shared
+    // memory (the caller passes k*sizeof(float) as the THIRD launch argument)
+    // and run four steps in flight. Adds/muls pinned with rn intrinsics because
+    // --use_fast_math is on.
+    extern __shared__ float s_x[];
+    for (int i = threadIdx.x; i < k; i += blockDim.x) s_x[i] = x[i];
+    __syncthreads();
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const float* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
-        for (int c = lane; c < k; c += 32) acc += wr[c] * x[c];
+        int c = lane;
+        for (; c + 96 < k; c += 128) {
+            const float w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
+            const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
+            // __fmaf_rn matches the baseline's fused multiply-add under
+            // --use_fast_math (one rounding, not two).
+            acc = __fmaf_rn(w0, x0, acc);
+            acc = __fmaf_rn(w1, x1, acc);
+            acc = __fmaf_rn(w2, x2, acc);
+            acc = __fmaf_rn(w3, x3, acc);
+        }
+        for (; c < k; c += 32) acc = __fmaf_rn(wr[c], s_x[c], acc);
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }

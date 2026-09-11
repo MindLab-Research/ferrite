@@ -29,6 +29,16 @@ NVCC="${NVCC:-nvcc}"
 # the .so built WITHOUT it CRASHES the batched capture (faults=2, err 900) —
 # fast-math shifts kernel durations and thereby the in-capture pool size-class
 # requests (the known pool-size sensitivity). Keep it ON unless investigating.
+#
+# CONSEQUENCE (2026-09-11, cost a full debug cycle): because it stays ON, the
+# compiler MAY REASSOCIATE floating-point expressions. Any rewrite that gives it
+# more expression freedom — multi-way unrolling, split accumulators — must pin
+# every add/mul with __fadd_rn/__fmul_rn. A four-way unrolled gemv body written
+# with plain operators drifted ~1 ULP per layer and degenerated the model after
+# 40 layers (all four prompts collapsed to the same output). `fmaf(...)` chains
+# are inherently safe (fmaf is explicitly rounded). Same for `extern __shared__`:
+# the launcher's THIRD argument must carry the size (a zero made a staging buffer
+# point at nothing and faulted: 4 faults, empty outputs).
 FAST_MATH_FLAG="--use_fast_math"
 if [ -n "${FERRITE_NO_FAST_MATH:-}" ]; then FAST_MATH_FLAG=""; fi
 # Build stamp: the Rust side refuses to load a .so built from another
