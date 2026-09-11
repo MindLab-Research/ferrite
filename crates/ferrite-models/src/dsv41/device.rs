@@ -293,6 +293,13 @@ struct Kernels {
     ring_win_fuse: Option<unsafe extern "C" fn(
         *mut f32, *const f32, *const c_int, c_int, c_int, *mut i32, CuStream,
     ) -> c_int>,
+    // B3: the same launch with the `comp_placeholder` recency block folded in
+    // (`idxs[window, window + take)`). `clen == null` disables that half and is
+    // then byte-identical to `ring_win_fuse`. Optional: an older .so without the
+    // symbol keeps the `ring_win_fuse` + `comp_placeholder` pair.
+    ring_win_fuse_ph: Option<unsafe extern "C" fn(
+        *mut f32, *const f32, *const c_int, c_int, c_int, *mut i32, *const c_int, c_int, CuStream,
+    ) -> c_int>,
     index_k_publish:
         Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, CuStream) -> c_int>,
     compress_commit: Option<
@@ -669,6 +676,7 @@ impl Device {
             ring_append: ko!(rt, "dsv41_ring_append"),
             apply_rope_q: ko!(rt, "dsv41_apply_rope_q"),
             ring_win_fuse: ko!(rt, "dsv41_ring_win_fuse"),
+            ring_win_fuse_ph: ko!(rt, "dsv41_ring_win_fuse_ph"),
             index_k_publish: ko!(rt, "dsv41_index_k_publish"),
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
@@ -2768,6 +2776,43 @@ impl Device {
         };
         let rc = unsafe { f(ring, kv, pos_ctr, window, hd, idxs, self.stream) };
         self.kerr(rc, "dsv41_ring_win_fuse")?;
+        Ok(true)
+    }
+
+    /// B3: [`Self::ring_win_fuse`] whose epilogue ALSO writes the
+    /// `comp_placeholder` recency block (`idxs[window + j] = window + *clen -
+    /// take + j`, `take = min(*clen, index_topk)`) for `j < take` - one launch
+    /// and one graph node fewer per layer. The two `idxs` blocks are disjoint
+    /// and the bound is read from the DEVICE counter by both kernels, so the
+    /// fused launch is bit-identical to the pair it replaces.
+    ///
+    /// `clen == null` (with `index_topk == 0`) keeps the placeholder half off,
+    /// which reproduces `ring_win_fuse` byte for byte - the caller uses that for
+    /// a layer whose [window, ..) block belongs to someone else (an index-source
+    /// layer's indexer, or a compress source whose counter this step's
+    /// compressor is still advancing). `Ok(false)` means the .so lacks
+    /// `dsv41_ring_win_fuse_ph`; the caller then runs the `ring_win_fuse` +
+    /// `comp_placeholder` pair as before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ring_win_fuse_ph(
+        &self,
+        ring: *mut f32,
+        kv: *const f32,
+        pos_ctr: *const c_int,
+        window: i32,
+        hd: i32,
+        idxs: *mut i32,
+        clen: *const c_int,
+        index_topk: i32,
+    ) -> Result<bool> {
+        let f = match self.kernels.ring_win_fuse_ph {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(ring, kv, pos_ctr, window, hd, idxs, clen, index_topk, self.stream)
+        };
+        self.kerr(rc, "dsv41_ring_win_fuse_ph")?;
         Ok(true)
     }
 

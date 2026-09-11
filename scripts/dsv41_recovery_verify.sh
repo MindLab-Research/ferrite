@@ -29,7 +29,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 K="$ROOT/kernels/cuda"
 PHASES="${PHASES:-0 1 2 3}"
-ARCH="${ARCH:-100a}"
+ARCH="${ARCH:-103a}"   # B300 = sm_103a. 100a is the stale README value (AGENTS.md)
 PORT="${DSV41_PORT:-8090}"
 MODEL_DIR="${DSV41_MODEL_DIR:-/opt/dlami/nvme/models/DeepSeek-V4.1-Flash}"
 BIN="$ROOT/target/release/dsv41-run"
@@ -42,6 +42,24 @@ have() { command -v "$1" >/dev/null 2>&1; }
 kill_serves() {
     for p in $(pgrep -x dsv41-run); do kill -9 "$p"; done
     sleep 8
+}
+
+# Post-arm gate: an arm is only usable if (a) every prompt returned a body and
+# (b) the serve logged no fault lines. serve_ab.sh always exits 0, so the exit
+# status alone cannot tell a healthy arm from a wedged one.
+ab_gate() {
+    local tag="$1" logf="/tmp/ab_${tag}.log" outf="/tmp/ab_${tag}_out.txt"
+    local f
+    [ -s "$outf" ] || { log "  ab_gate[$tag]: no output file $outf"; return 1; }
+    if grep -q "(failed)" "$outf" 2>/dev/null; then
+        log "  ab_gate[$tag]: at least one prompt FAILED (empty body / timeout)"; return 1
+    fi
+    f="$(grep -cE 'illegal|fault' "$logf" 2>/dev/null || echo 0)"
+    if [ "${f:-0}" != "0" ]; then
+        log "  ab_gate[$tag]: WARNING $f fault-looking lines in $logf - inspect before trusting the numbers"
+        return 1
+    fi
+    return 0
 }
 
 for phase in $PHASES; do
@@ -71,7 +89,8 @@ for phase in $PHASES; do
         log "== phase 1: sentinel (one-shot, exit 0 = environment alive) =="
         kill_serves
         set +e
-        env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+        timeout "${SENTINEL_TIMEOUT:-300}" \
+            env CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
             DSV41_MODEL_DIR="$MODEL_DIR" \
             DSV41_KERNELS="$K/libferrite_kernels.so" \
             DSV41_TIMING=1 \
@@ -81,7 +100,8 @@ for phase in $PHASES; do
         log "sentinel exit=$rc (tail)"
         tail -5 /tmp/recovery_sentinel.log | sed 's/^/    /' | tee -a "$LOG"
         if [ "$rc" != "0" ]; then
-            log "SENTINEL FAILED - the node is not recovered; do NOT continue to serve A/B."
+            log "SENTINEL FAILED (exit=$rc) - the node is not recovered; do NOT continue to serve A/B."
+            log "  rc=124 => hung, not crashed (GPU wedge / driver stall). Other rc => see the log."
             log "  see /tmp/recovery_sentinel.log and dmesg | tail for Xid / refcnt refs"
             exit 1
         fi
@@ -90,18 +110,26 @@ for phase in $PHASES; do
 
     2)
         log "== phase 2: base serve (round-42 regression gate) =="
+        log "   expected p50: ~8.2ms = no regression vs round-42; ~7ms = all landings work"
         bash "$ROOT/scripts/dsv41_serve_ab.sh" base 2>&1 | tee -a "$LOG"
+        ab_gate base || { log "FATAL: base arm failed. Next: run the round-41-equivalent gate set"
+            log "  (POST_RECOVERY_COMMANDS.md step 2) to confirm the tree, then bisect by risk group."
+            exit 1; }
         ;;
 
     3)
         log "== phase 3: a32/occupancy serve A/B (p50) =="
-        log "   arm m4_a32 (DEFAULT: MODE=4 A32=1)  vs  arm m4_noa32 (A32=0)"
-        DSV41_PORT="$PORT" bash "$ROOT/scripts/dsv41_serve_ab.sh" m4_a32 2>&1 | tee -a "$LOG"
-        DSV41_PORT="$PORT" bash "$ROOT/scripts/dsv41_serve_ab.sh" m4_noa32 DSV41_GEMV_A32=0 2>&1 | tee -a "$LOG"
+        log "   arm m4_a32 (MODE=4 A32=1, explicit) vs arm m4_noa32 (MODE=4 A32=0)"
+        DSV41_PORT="$PORT" bash "$ROOT/scripts/dsv41_serve_ab.sh" m4_a32 DSV41_GEMV_FP8_MODE=4 DSV41_GEMV_A32=1 2>&1 | tee -a "$LOG"
+        ab_gate m4_a32 || { log "FATAL: default arm failed - stop, the tree is not healthy"; exit 1; }
+        DSV41_PORT="$PORT" bash "$ROOT/scripts/dsv41_serve_ab.sh" m4_noa32 DSV41_GEMV_FP8_MODE=4 DSV41_GEMV_A32=0 2>&1 | tee -a "$LOG"
+        ab_gate m4_noa32 || { log "FATAL: noa32 arm failed - not a valid A/B, do NOT change the default"; exit 1; }
         log "   contrast arm: mode 3 (activation staging off, a32 kept)"
         DSV41_PORT="$PORT" bash "$ROOT/scripts/dsv41_serve_ab.sh" m3_a32 DSV41_GEMV_FP8_MODE=3 2>&1 | tee -a "$LOG"
+        ab_gate m3_a32 || log "WARN: contrast arm m3_a32 failed (non-fatal, A/B verdict still valid)"
         log "   => compare the p50 lines; the four-prompt texts must be identical"
-        log "      (a32=0 is bit-identical to a32=1 by construction)."
+        log "      (a32=0 is bit-identical to a32=1 by construction). Any text drift"
+        log "      INVALIDATES the arm - do not flip DSV41_GEMV_A32 on a drifted run."
         ;;
 
     *)

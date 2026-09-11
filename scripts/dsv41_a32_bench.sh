@@ -40,7 +40,7 @@ K="$ROOT/kernels/cuda"
 BIN="/tmp/dsv41_a32_bench"
 export LD_LIBRARY_PATH="$K${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-ARCH="${ARCH:-100a}"
+ARCH="${ARCH:-103a}"   # B300 = sm_103a; 100a (README) does not run on this device
 NS="${NS:-}"                       # e.g. NS="256 1024 4096"
 REPS="${DSV41_A32_REPS:-400}"
 

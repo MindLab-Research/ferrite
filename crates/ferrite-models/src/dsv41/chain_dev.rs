@@ -634,6 +634,24 @@ fn ring_win_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
+/// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
+/// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
+/// is the only reader of both. Nothing writes between the two points except the
+/// indexer (which owns [win, ..) itself and therefore takes the fused launch
+/// WITHOUT the placeholder half), so the placeholder folds into the ring_win
+/// launch and its launch + graph node disappear. The bound stays derived from the
+/// DEVICE counter, so a captured graph replays correctly. "0" reverts; an .so
+/// without `dsv41_ring_win_fuse_ph` falls back on its own.
+fn comp_ph_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_COMP_PLACEHOLDER_FUSE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// DSV41_CUBLAS_M1=1 routes the M=1 f32/bf16 linears through cuBLAS.
 fn cublas_m1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2896,19 +2914,70 @@ fn hc_tail_split() -> bool {
         // (it does not own its store) still performs the indices half, so the
         // later standalone `window_idxs` disappears for EVERY layer. Falls back
         // to the two launches on an .so without the symbol.
-        let rw_fused = ring_win_fuse()
-            && self.dev.ring_win_fuse(
-                if owns_kv {
-                    cache.ring.ptr as *mut f32
-                } else {
-                    std::ptr::null_mut()
-                },
+        //
+        // B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the `comp_placeholder`
+        // launch below (30/step) writes `idxs[win, win+take)` - the SAME buffer
+        // this launch already fills `idxs[0, win)` in, with `sparse_attn` the
+        // only reader of either block, so the two fuse. It can be hoisted here
+        // because the ONLY writer that could interleave is the indexer, and an
+        // index-source layer writes [win, ..) itself: that layer takes this
+        // launch with the placeholder half OFF (`ph_ok` false), so nothing is
+        // reordered for it. The bound stays DEVICE-derived (`*clen`), which is
+        // what keeps the fused launch graph-capture safe.
+        //
+        // `ph_ok` also excludes a compress SOURCE: `clen[layer]` is advanced by
+        // THIS step's `compress_commit`, which is issued after this point (and,
+        // under COMPRESS_SIDE, concurrently on the third stream) - reading it
+        // here would race. No production layer needs that combination: every
+        // `kv_source` (2/8/14/20) is also an `index_source`, so those layers are
+        // already excluded. A config where a compress source is NOT an index
+        // source keeps the standalone launch below, unchanged.
+        let ph_ok = comp_ph_fuse()
+            && owns_kv
+            && !cfg.is_index_source(layer)
+            && !cfg.is_kv_source(layer)
+            && cfg.compress_ratio(layer) > 0;
+        let mut ph_fused = false;
+        let rw_fused = ring_win_fuse() && {
+            let ring = if owns_kv {
+                cache.ring.ptr as *mut f32
+            } else {
+                std::ptr::null_mut()
+            };
+            // clen == null is the switch that turns the placeholder half off, so
+            // an excluded layer reproduces `ring_win_fuse` byte for byte.
+            let (clen_p, topk) = if ph_ok {
+                (
+                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                    cfg.index_topk as i32,
+                )
+            } else {
+                (std::ptr::null(), 0)
+            };
+            if self.dev.ring_win_fuse_ph(
+                ring,
                 self.s.kv.ptr as *const f32,
                 self.s.pos_ctr.ptr as *const std::os::raw::c_int,
                 win as i32,
                 hd as i32,
                 idxs_ptr as *mut i32,
-            )?;
+                clen_p,
+                topk,
+            )? {
+                ph_fused = ph_ok;
+                true
+            } else {
+                // .so predates `dsv41_ring_win_fuse_ph`
+                self.dev.ring_win_fuse(
+                    ring,
+                    self.s.kv.ptr as *const f32,
+                    self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                    win as i32,
+                    hd as i32,
+                    idxs_ptr as *mut i32,
+                )?
+            }
+        };
         if !rw_fused && owns_kv {
             // DEVICE-side slot: a host-computed destination address would be frozen
             // by the graph capture (slot = pos % win at capture time), so every

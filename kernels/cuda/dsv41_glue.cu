@@ -770,6 +770,71 @@ extern "C" int dsv41_ring_win_fuse(float* ring, const float* kv, const int* pos_
     return (int)cudaGetLastError();
 }
 
+// B3 (comp-placeholder fusion, `DSV41_COMP_PLACEHOLDER_FUSE`): the same launch
+// ALSO writes `comp_placeholder_kernel`'s recency block
+// (`idxs[window + j] = window + *clen - take + j`, `take = min(*clen,
+// index_topk)`) into the SAME `idxs` buffer, one block past the window block
+// `ring_win_fused_kernel` fills. That removes the standalone
+// `dsv41_comp_placeholder` launch (30/step) and its graph node.
+//
+// Bit-identical by construction: the two blocks are disjoint
+// ([0, window) vs [window, window + take)), the kernel writes the placeholder
+// entries with the very expressions `comp_placeholder_kernel` uses (including
+// the DEVICE-derived `take` - a captured graph freezes launch arguments, so it
+// must not be a host value), and the `idxs` allocation is
+// `window + index_topk + 8` (`chain_dev.rs`), which is why the launcher's grid
+// is `max(window, hd, index_topk)` - the standalone launch used
+// `ceil(index_topk / 128)` blocks, so every entry it could write is covered.
+//
+// `clen == nullptr` disables the placeholder half and reproduces
+// `ring_win_fused_kernel` byte for byte, so a caller can route layers that must
+// NOT take it (an index-source layer overwrites [window, ..) with its indexer
+// afterwards; a compress-source layer's `*clen` is being advanced by this
+// step's own compressor) through the same entry point.
+__global__ void ring_win_fuse_ph_kernel(float* __restrict__ ring, const float* __restrict__ kv,
+                                        const int* __restrict__ pos_ctr, int window, int hd,
+                                        int32_t* __restrict__ idxs, const int* __restrict__ clen,
+                                        int index_topk) {
+    const int gid = threadIdx.x + (int)blockIdx.x * blockDim.x;
+    // ---- half 3: the comp_placeholder recency entries ----
+    if (clen != nullptr && gid < index_topk) {
+        const int c = *clen;
+        const int take = (c < index_topk) ? c : index_topk;
+        if (gid < take) idxs[window + gid] = window + c - take + gid;
+    }
+    if (window <= 0) return;  // the two window halves are no-ops at window <= 0
+    const int start_pos = *pos_ctr;
+    if (ring != nullptr && gid < hd) {
+        const int slot = start_pos % window;
+        ring[(size_t)slot * (size_t)hd + gid] = kv[gid];
+    }
+    if (gid >= window) return;
+    const int c = gid;
+    if (start_pos == 0) {
+        idxs[c] = (c == 0) ? 0 : -1;
+        return;
+    }
+    const int oldest = (start_pos % window) + 1;
+    long long idx = ((long long)c < (long long)window - oldest)
+                        ? (long long)oldest + c
+                        : (long long)c - ((long long)window - oldest);
+    if (idx > (long long)start_pos) idx = -1;
+    idxs[c] = (int)idx;
+}
+
+extern "C" int dsv41_ring_win_fuse_ph(float* ring, const float* kv, const int* pos_ctr, int window,
+                                      int hd, int32_t* idxs, const int* clen, int index_topk,
+                                      cudaStream_t s) {
+    // NOT `window <= 0 -> return`: the placeholder half does not depend on
+    // `window` and the standalone kernel it replaces ran unconditionally.
+    int n = (window > hd) ? window : hd;
+    if (clen != nullptr && index_topk > n) n = index_topk;
+    if (n <= 0) return (int)cudaSuccess;
+    ring_win_fuse_ph_kernel<<<(unsigned)((n + 127) / 128), 128, 0, s>>>(ring, kv, pos_ctr, window,
+                                                                       hd, idxs, clen, index_topk);
+    return (int)cudaGetLastError();
+}
+
 
 // AR v5 launchers removed: DSV41 now calls the shared ferrite_p2p_ar_v5
 // (ferrite_kernels.cu). The three DSV41 entry points (dsv41_ar_v5_store /
