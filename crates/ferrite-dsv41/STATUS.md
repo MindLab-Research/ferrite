@@ -6143,3 +6143,35 @@ route fusion（gate gemv 的 last-block epilogue 做 top-k）= 中性。384 块�
 
 **当前基线 8.65ms / 115.6 tok/s（rtf0 控制臂）**。在飞三项（sparse key-split −0.20 +
 attn-tail 融合 −0.12 + dots→pubred −0.12）≈ 全落地 ~8.2ms ≈ 122 tok/s。
+
+### 🎉 第 39-40 轮：sparse split 回归翻 OFF + rope FFI 修复生效（8.49ms / 117.8 tok/s，新纪录）
+
+| 轮 | 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|---|
+| 39 | ssp（sparse C=8 + attn-tail） | 8.73ms | 114.5 | 四段全对（IMPLEMENT 换位置） | 0 |
+| 40 | **base40（sparse OFF + attn-tail + rope FFI fix）** | **8.49ms** | **117.8** | 四段全对 | 0 |
+
+**第 39 轮判定**：sparse key-split C=8 在 bench 短上下文（topk~178）+0.1ms 回归——隔离 3.2x
+的收益只在 topk≥300（长上下文稳态）兑现。kAttnPfSplitDefault 8→0（代码保留，
+DSV41_ATTN_PF_SPLIT=C 显式开启）。
+
+**第 40 轮 = 新纪录 8.49ms（−0.12ms）**，三个成分：
+1. **rope fusion FFI 修复生效**：rope-fuse-audit 发现 device.rs 的
+   `gemm_fp8_mx_rope`/`gemm_fp8_mx2_rope` 函数指针把 `CuStream` 放在第 9 位而 C 侧要求
+   最后——参数整体错位一格 → C 侧读到 rope_rd=0 → 恒 decline → 静默回退。
+   修复后：47 次 apply_rope launch 消失 + **qr 双重量化消除**（lin_rope 先 quant1 再
+   decline 回退又 quant 一次的隐藏 bug 也修了）。
+2. **attn-tail 融合**：o-rope fp8 epilogue（40 次 quant1 消失）+ window/ring 合并。
+3. sparse split 回 OFF（回退第 39 轮的回归）。
+
+**会话累计：13.28 → 8.49ms（+56.4%），75.3 → 117.8 tok/s。**
+
+**quant-170-audit 的关键归因**（170 次 quant 的分解）：
+- wo_b quant1 = 40（B1 OFF，已知）
+- **ex_act quant1 = 40——A4 swiglu_q 实际默认 OFF**（round-18 数值 bug 暂缓）——swiglu-q-fix 正在修
+- s.o quant1 = 40——o-rope fp8 生效后应消失（第 40 轮已含）
+- qr 双重量化 ≈ 40-48——FFI 修复后消失（第 40 轮已含）
+- engram = 2
+
+**在飞三项**：dots→pubred（−0.12）+ hc tail 分裂 side stream（−0.86，最大单项）+
+swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
