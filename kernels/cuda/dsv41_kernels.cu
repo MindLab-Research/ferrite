@@ -1718,9 +1718,14 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
     if (g_hc_spread && rows <= DSV41_HC_SPREAD_MAXR && mix <= 64) {
         const int split = DSV41_HC_SPREAD_S;
         // Spread variant: one block per (row, projection row), so each of the `mix`
-        // 64 KB weight rows is read on its own SM instead of all 1.5 MB on one. The
-        // arithmetic order is identical in every phase, so the outputs are
-        // bit-identical to the single-block kernel (verified against it directly).
+        // 64 KB weight rows is read on its own SM instead of all 1.5 MB on one.
+        // The arithmetic order was believed identical in every phase, but a
+        // same-session, same-binary A/B does NOT reproduce bit-identical outputs:
+        // 31.44 ms against 32.07 ms, yet the answers diverge - the 1+1 prompt turns
+        // from a clean '2' into an off-topic sentence. The sinkhorn moving out of
+        // the single warp's registers into hc_mixes_post is the likely cause. This
+        // path therefore needs element-wise parity evidence (tests/hc_parity.rs)
+        // before it may be defaulted; it stays opt-in.
         hc_mixes_ss_kernel<<<rows, 256, 0, s>>>(x, rows, hc_dim, eps);
         hc_mixes_rows_kernel<<<dim3(mix, rows, split), 64, 0, s>>>(x, hc_fn, rows, hc_dim, mix, split);
         hc_mixes_post_kernel<<<rows, 32, 0, s>>>(hc_scale, hc_base, pre, post, comb, rows, hc,
