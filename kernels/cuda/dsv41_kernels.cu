@@ -1612,7 +1612,7 @@ __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
 __device__ __forceinline__ void dsv41_cp_commit();
 __device__ __forceinline__ void dsv41_cp_wait_all();
 
-__global__ void __launch_bounds__(128, 8) gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
+__global__ void __launch_bounds__(128, 7) gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const float* __restrict__ a_scale,
                                      const uint8_t* __restrict__ w,
                                      const uint8_t* __restrict__ w_scale,
@@ -1716,7 +1716,7 @@ __global__ void __launch_bounds__(128, 8) gemm_fp8_gemv_kernel(const uint8_t* __
             __syncwarp();
             float acc = 0.f;
             // EXPERIMENT: manual 4-way unroll (which alone degenerated the
-            // model) combined with __launch_bounds__(128, 8) capping the
+            // model) combined with __launch_bounds__(128, 7) capping the
             // register budget. Hypothesis: the manual unroll's extra ~20 live
             // registers dropped occupancy and shifted the cp.async timing;
             // capping registers should restore correctness while keeping the
