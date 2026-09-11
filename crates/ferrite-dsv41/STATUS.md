@@ -6216,7 +6216,7 @@ swiglu_q 修复（−0.06）→ 全落地 ~7.5ms ≈ 133 tok/s。
 | ar_store+stamp（profile） | 164 | 5.3+4.2 | 0.77 | 生产已并入 pubred |
 | gemv_bf16_v2 (gate+route) | 48 | 8.2 | 0.39 | route fusion ✓ 已生效 |
 | sparse_attn_pf | 40 | 8.5 | 0.34 | split OFF（短上下文回归） |
-| gemv_bf16 (lm_head) | 1 | 325.9 | 0.33 | profile artifact（生产切片 ~40µs） |
+| gemv_bf16 (lm_head) | 1 | 325.9 | 0.33 | **profile artifact**：脚本 pin `AR_V5=0 GRAPH_STEP=0` ⇒ `ar_v5()=false` ⇒ `head_slice()` 的第 5 个条件 `uses_v5()` 为假 ⇒ **切片被禁用，跑完整 129280 行**（`chain_dev.rs:1858-1866`，doc 注释实测 full 298µs vs slice 48µs）。生产走 16160 行切片 ≈ 22-48µs |
 | hc_post_inplace | 80 | 1.9 | 0.15 | profile artifact（生产已 fold 进 pubred） |
 | quant<0> | 86 | 1.5 | 0.13 | **swiglu_q（−40）修复中** |
 | rmsnorm_q | 40 | 3.1 | 0.13 | 未来：+wq_b gemv 融合 |
@@ -6723,3 +6723,19 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 
 **下一步**：gateup K-split 翻 ON（−0.19ms parity 风险）+ down vec 回归修复（−0.31ms）
 + nsys 精确分解 → 找新的优化目标。
+
+### 🎉 gateup K-split 翻 ON：6.57ms / 152.2 tok/s（2026-09-12 00:10）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| ksplit2（DSV41_GATEUP_KSPLIT=2） | **6.57ms** | **152.2** | 四段全对 | 0 |
+| 基线（K-split=1 OFF） | 6.90ms | 144.9 | 四段全对 | 0 |
+
+**K-split 兑现 −0.33ms**（超预期的 −0.19）——warp 翻倍（240 CTA × 512 threads）
+正对 94% LDG 停等。四段全对 + faults=0 + 固定序合并（__fadd_rn 不可重排）。
+
+**会话累计：13.28 → 6.57ms（+102.1%），75.3 → 152.2 tok/s（+102.1%）**
+
+**当前最优配置**：a32 ON + PDL OFF + K-split ON + 全部融合/侧流/AR 优化
+
+**距离 200 tok/s（5.0ms）还差 1.57ms**——gemm 3.02ms 仍是最大项（44%）。

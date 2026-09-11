@@ -692,7 +692,8 @@ fn ar_v5() -> bool {
         // The whole-step CUDA graph REQUIRES the device-side AR: a host barrier is
         // not a CUDA call, so it would not be recorded and the replayed graph
         // would silently lose the inter-rank synchronisation. The graph is
-        // DSV41_GRAPH_STEP (default off, see chain_dev.rs), while the device-side
+        // DSV41_GRAPH_STEP (default ON since 2026-09-11, see chain_dev.rs
+        // step_impl), while the device-side
         // AR is DEFAULT ON in its own right: it is verified correct with the graph
         // both off and on (a full 32-step generation is bit-identical to the host
         // barrier path) and it removes ~21 of the ~29 us each all-reduce costs.
