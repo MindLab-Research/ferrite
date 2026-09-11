@@ -382,6 +382,85 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
     }
 }
 
+// Flash-decode split of sparse attention: each WARP owns a subset of the topk
+// slots (t = wid, wid + nwarp, ...), covers the whole head dim with its 32 lanes,
+// and runs its own online softmax. The per-slot dot is therefore a pure warp
+// shuffle - ZERO barriers inside the loop, where the sequential version paid two
+// __syncthreads per slot (~1000 over topk=512) at an occupancy of eight blocks,
+// which the isolated repro measured at 330 us, flat in n. The block's partials are
+// merged once at the end (the only barriers). Sizing: the launcher pins blockDim
+// to 128 (4 warps), so sh_acc is [4][512] = 8 KB.
+#define kMaxPerW 16   // d <= 512 over 32 lanes
+__global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float* __restrict__ kv,
+                                        const float* __restrict__ sink,
+                                        const int32_t* __restrict__ idxs, float* __restrict__ out,
+                                        int b, int m, int h, int d, int n, int topk, float scale) {
+    const int row = blockIdx.x;  // flattened (b, m)
+    if (row >= b * m) return;
+    const int bb = row / m, mm = row % m;
+    for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
+        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        const int nwarp = (int)blockDim.x >> 5;
+        float my_acc[kMaxPerW];
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
+        float my_smax = -1e30f, my_se = 0.f;
+        for (int t = wid; t < topk; t += nwarp) {
+            const int idx = idxs[(size_t)(bb * m + mm) * topk + t];
+            if (idx < 0) continue;
+            const float* kr = kv + ((size_t)bb * n + idx) * d;
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qr[c] * kr[c];
+            }
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kr[c];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        // ---- the ONLY barriers in this kernel: merge the warps' partials ----
+        __shared__ float sh_smax[32], sh_se[32];
+        __shared__ float sh_acc[4][512];
+        if (lane == 0) {
+            sh_smax[wid] = my_smax;
+            sh_se[wid] = my_se;
+        }
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) sh_acc[wid][c] = my_acc[i];
+        }
+        __syncthreads();
+        // smax over slots only (the sink is folded into se below, not into smax,
+        // matching the sequential version's post-loop `se += expf(sink - smax)`).
+        float smax = -1e30f;
+        for (int w = 0; w < nwarp; ++w) smax = fmaxf(smax, sh_smax[w]);
+        float wsc[4];
+        for (int w = 0; w < nwarp && w < 4; ++w) wsc[w] = expf(sh_smax[w] - smax);
+        float se = 0.f;
+        for (int w = 0; w < nwarp; ++w) se += sh_se[w] * wsc[w < 4 ? w : 0];
+        se += expf(sink[hh] - smax);
+        float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+            float a = 0.f;
+            for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
+            orow[c] = (se > 0.f) ? a / se : 0.f;
+        }
+        __syncthreads();  // sh_* reuse safety across the hh loop
+    }
+}
+
 // ------------------------------------------------------------ indexer / rope
 
 __global__ void candidate_blocks_kernel(const float* __restrict__ logits,
@@ -1081,8 +1160,17 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                                  const int32_t* idxs, float* out, int b, int m, int h, int d,
                                  int n, int topk, float scale, cudaStream_t s) {
     if (d > 512) return (int)cudaErrorInvalidValue;  // the accumulator is d-wide per thread group
+    // Flash-decode split by default; DSV41_ATTN_SEQ=1 restores the sequential
+    // version for A/B. Cached in a static: this runs per attention call, and a
+    // per-call getenv is exactly the hot-path slip this project has been bitten by.
+    static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
     dim3 grid(b * m, h);
-    sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, n, topk, scale);
+    if (!seq) {
+        sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, n, topk,
+                                                     scale);
+    } else {
+        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, n, topk, scale);
+    }
     return (int)cudaGetLastError();
 }
 
