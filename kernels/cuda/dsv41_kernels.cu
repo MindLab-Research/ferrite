@@ -1212,6 +1212,13 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
 //   w       [n, k]        e4m3, one byte per value
 //   w_scale [n/32, k/32]  e8m0  (block 32x32)
 //   out     [1, n]        = a @ w^T + bias
+// Read once: this launcher runs ~290 times per step, and a per-call getenv on
+// the hot path is the same slip the other gates avoid.
+static const bool g_gemv_fp8_vec = [] {
+    const char* e = getenv("DSV41_GEMV_FP8_VEC");
+    return e != nullptr && e[0] != '0';
+}();
+
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const float* __restrict__ a_scale,
                                      const uint8_t* __restrict__ w,
@@ -1222,15 +1229,50 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
     const int nb_k = k >> 5;   // k-blocks of 32
+    // Four fp8 per lane per iteration instead of one, behind DSV41_GEMV_FP8_VEC
+    // until the text check passes. The warp still covers the row, but 32 lanes *
+    // 4 bytes = 128 elements = four 32-element scale blocks, so one uint32 load
+    // and one scale pair replace four byte loads and four scale lookups. Because
+    // 4*lane is 4-aligned inside a 32-byte scale block each lane's four bytes
+    // always sit inside ONE block: lanes 0-7 cover block 0, lanes 8-15 block 1,
+    // which is what (lane >> 3) selects. The per-element product keeps the old
+    // shape; only the order in which a lane visits its elements changes, so the
+    // sum differs in the last bits and the text must be re-checked.
+    const int n_vec = nb_k >> 2;            // full 128-element iterations
+    const int tail0 = n_vec << 2;           // first block of the scalar tail
+    const int blk_off = lane >> 3;          // which of the four blocks this lane owns
+    const int byte_off = lane << 2;         // byte offset inside the 128-element group
     for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
         const uint8_t* wr = w + (size_t)row * k;
         const int srow = row >> 5;               // 32x32 block scale row
+        const float* wsr = w_scale + (size_t)srow * nb_k;
         float acc = 0.f;
-        for (int kb = 0; kb < nb_k; ++kb) {
-            const float sb = ue8m0_to_f(w_scale[(size_t)srow * nb_k + kb]);
-            const float sa = a_scale[kb];        // m == 1
-            const int j = kb * 32 + lane;
-            acc += e4m3_to_f(a[j]) * sa * (e4m3_to_f(wr[j]) * sb);
+        if (g_gemv_fp8_vec) {
+            for (int g = 0; g < n_vec; ++g) {
+                const int kb = (g << 2) + blk_off;
+                const float sa = a_scale[kb];    // m == 1
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = (g << 7) + byte_off;
+                const uint32_t av = *reinterpret_cast<const uint32_t*>(a + j);
+                const uint32_t wv = *reinterpret_cast<const uint32_t*>(wr + j);
+                acc += e4m3_to_f((uint8_t)(av & 0xFFu)) * sa * (e4m3_to_f((uint8_t)(wv & 0xFFu)) * sb);
+                acc += e4m3_to_f((uint8_t)((av >> 8) & 0xFFu)) * sa * (e4m3_to_f((uint8_t)((wv >> 8) & 0xFFu)) * sb);
+                acc += e4m3_to_f((uint8_t)((av >> 16) & 0xFFu)) * sa * (e4m3_to_f((uint8_t)((wv >> 16) & 0xFFu)) * sb);
+                acc += e4m3_to_f((uint8_t)(av >> 24)) * sa * (e4m3_to_f((uint8_t)(wv >> 24)) * sb);
+            }
+            for (int kb = tail0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const float sa = a_scale[kb];    // m == 1
+                const int j = kb * 32 + lane;
+                acc += e4m3_to_f(a[j]) * sa * (e4m3_to_f(wr[j]) * sb);
+            }
+        } else {
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const float sa = a_scale[kb];    // m == 1
+                const int j = kb * 32 + lane;
+                acc += e4m3_to_f(a[j]) * sa * (e4m3_to_f(wr[j]) * sb);
+            }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         if (lane == 0) out[row] = acc + (bias ? bias[row] : 0.f);
