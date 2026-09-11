@@ -2951,9 +2951,12 @@ self.dev.memcpy_d2d(ring + slot*fb(hd), self.s.kv, fb(hd));   // ← 目的地�
 
 | 口径 | 改前 | 改后 |
 |---|---|---|
-| **端到端**（客户端 curl wall）| 7.75 tok/s（129 ms/token）| **19.50 tok/s（51.3 ms/token）** ✓✓ |
-| rank 侧（新计时行 `[dsv41] decode`）| — | 21.76 / 21.75 / 44.23 ms/step |
+| **稳态 step time（权威 ✓）** | 逐 token 往返把 rank 拖在水面下（serve 侧 ~85ms/token 开销 ✗）| **21.76 / 21.75 ms/step（短）· 44.23（长）** ✓✓ |
+| 端到端（客户端 curl wall；**仅交叉验证** ✗）| 7.75 tok/s（129 ms/token）| 19.50 tok/s（51.3 ms/token）|
 | 正确性 | ✓ | `Paris` ✓ / `2` ✓ / 《静夜思》✓ |
+
+⚠ **口径提醒（用户纠正 ✓）**：评价性能**必须用中间稳态的 step time** ✓（GLM 侧 `[megab] replay`
+中位数的规矩 ✓）；端到端/wall 含 prefill、爬坡与 flush ⇒ **只作交叉验证** ✗。
 
 **修的两件事（都在共享栈内 ✓，GLM 同样受益 ✓）**：
 1. **每 token 一次「命令 + 8 rank ack」往返** ✗ ⇒ rank 线程内**前瞻批命令**（`LookaheadRun`，一次 16 步 ✓），

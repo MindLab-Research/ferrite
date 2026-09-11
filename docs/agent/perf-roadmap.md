@@ -1421,9 +1421,11 @@ DSV4 侧本会话新增了同口径的 `[dsv41] decode: N steps in Ts = X steps/
 
 ## 下一批 kernel 优化的取证顺序（2026-09-11 定，迁移完成后执行）
 
-**当前已知（同二进制实测）**：rank 侧 `[dsv41] decode` = **21.76 / 21.75 / 44.23 ms/step**
-（短上下文 ~46 steps/s；长上下文 ~22.6 steps/s，DSA decay 1.39x ✓ 与历史一致 ✓）；
-端到端 19.50 tok/s（51.3 ms/token ✓，serve 开销已压到 ~5-25ms ✓）。
+**当前已知（同二进制实测；权威口径 = 中间稳态的 step time ✓）**：
+`[dsv41] decode` 的稳态窗口 = **21.76 / 21.75 ms/step（短上下文，46.0 steps/s）** 与
+**44.23 ms/step（长上下文，22.6 steps/s，DSA decay 1.39x ✓ 与历史一致 ✓）**。
+⚠ **端到端（3.28s/64 = 19.50 tok/s）只作交叉验证** ✗ —— 它含 prefill、admissions 爬坡与收尾 flush ✓
+（GLM 侧的 `[megab] replay` 中位数就是这个规矩 ✓；`total/wall` 口径在历史文档里已被定为仅交叉验证 ✓）。
 **目标**：单并发 200 tok/s ⇒ **5 ms/step（每层 0.11ms）** ⇒ 差距 **~4.4x**（短上下文口径）。
 
 **第 0 步（必做，否则又是推测 ✗）**：**重新取一份 decode-only 的逐 kernel 分解** ✓
