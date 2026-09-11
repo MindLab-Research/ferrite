@@ -999,15 +999,6 @@ impl<'a> DevChain<'a> {
         if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
-        if std::env::var("DSV41_PHASE").map(|v| v != "0").unwrap_or(false) {
-            eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
-        }
-        if layer == 0 {
-            self.stats("L0 moe_out(o)", &self.s.o, dim)?;
-            self.stats("L0 ffn_in", &self.s.xn, dim)?;
-            let mb = self.dl(self.s.o.as_f32(), dim)?;
-            eprintln!("[mine] L0 moe_out[0..4]={:?}", &mb[..4]);
-        }
         self.dev.hc_post(
             self.s.o.ptr as *const f32,
             self.s.h.ptr as *const f32,
