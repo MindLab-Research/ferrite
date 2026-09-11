@@ -536,73 +536,52 @@ __global__ void hc_mixes_kernel(const float* __restrict__ x, const float* __rest
     // the h stream grows exponentially — rms 0.5 at L0, 3e11 at L5, inf/NaN by L20.
     // Matches hc_split_sinkhorn in the reference (kernel.py:407).
     // step 1: row softmax + eps
-    __shared__ float row_max[16], row_sum[16], col_sum[16];
-    for (int j = 0; j < hc; j++) {
-        if (threadIdx.x == 0) {
+    // The sinkhorn runs on ONE thread. hc is 4 here, so comb is a 4x4 matrix - 16
+    // values - and the original form paid a block-wide __syncthreads around every
+    // sub-step of every one of sinkhorn_iters (20) passes. Decode calls this
+    // kernel with rows == 1, i.e. grid = one block = ONE SM, where a barrier costs
+    // microseconds of exposed latency: measured 185 us per call, 49 percent of the
+    // whole step, on a 384 KB weight set that is entirely L2-resident (2.1 GB/s
+    // effective - 3000x below L2, so it was never a bandwidth problem). Doing the
+    // same arithmetic in one thread changes NOTHING numerically - the operations and
+    // their order are identical, so the output is bit-identical - and removes every
+    // barrier inside the normalisation.
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float* rmax = row_max;
+        float* rsum = row_sum;
+        float* csum = col_sum;
+        const int hh = hc * hc;
+        for (int j = 0; j < hc; j++) {
             float mx = -INFINITY;
             for (int k = 0; k < hc; k++) mx = fmaxf(mx, cm[j * hc + k]);
-            row_max[j] = mx;
+            rmax[j] = mx;
         }
-    }
-    __syncthreads();
-    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
-        const int j = jk / hc;
-        cm[jk] = expf(cm[jk] - row_max[j]);
-    }
-    __syncthreads();
-    for (int j = 0; j < hc; j++) {
-        if (threadIdx.x == 0) {
+        for (int jk = 0; jk < hh; jk++) cm[jk] = expf(cm[jk] - rmax[jk / hc]);
+        for (int j = 0; j < hc; j++) {
             float s = 0.f;
             for (int k = 0; k < hc; k++) s += cm[j * hc + k];
-            row_sum[j] = s;
+            rsum[j] = s;
         }
-    }
-    __syncthreads();
-    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
-        const int j = jk / hc;
-        cm[jk] = cm[jk] / row_sum[j] + eps;
-    }
-    __syncthreads();
-    // Reference sequence (kernel.py hc_split_sinkhorn):
-    //   comb = softmax(comb, -1) + eps      (rows)
-    //   comb = comb / (colsum + eps)        (columns)
-    //   for _ in range(iters-1): row-normalise, then col-normalise
-    // It ENDS with a column normalisation; ending with a row one (as the first
-    // version did) leaves the rows summing to 1 instead of the columns, so the
-    // mixing weights are off by that factor.
-    for (int it = 0; it < sinkhorn_iters; it++) {
-        if (it > 0) {
-            // row normalise (skipped on the first pass: softmax already did it)
-            for (int j = 0; j < hc; j++) {
-                if (threadIdx.x == 0) {
+        for (int jk = 0; jk < hh; jk++) cm[jk] = cm[jk] / rsum[jk / hc] + eps;
+        for (int it = 0; it < sinkhorn_iters; it++) {
+            if (it > 0) {
+                for (int j = 0; j < hc; j++) {
                     float s = 0.f;
                     for (int k = 0; k < hc; k++) s += cm[j * hc + k];
-                    row_sum[j] = s;
+                    rsum[j] = s;
                 }
+                for (int jk = 0; jk < hh; jk++) cm[jk] = cm[jk] / (rsum[jk / hc] + eps);
             }
-            __syncthreads();
-            for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
-                const int j = jk / hc;
-                cm[jk] = cm[jk] / (row_sum[j] + eps);
-            }
-            __syncthreads();
-        }
-        // column normalise
-        for (int k = 0; k < hc; k++) {
-            if (threadIdx.x == 0) {
+            for (int k = 0; k < hc; k++) {
                 float s = 0.f;
                 for (int j = 0; j < hc; j++) s += cm[j * hc + k];
-                col_sum[k] = s;
+                csum[k] = s;
             }
+            for (int jk = 0; jk < hh; jk++) cm[jk] = cm[jk] / (csum[jk % hc] + eps);
         }
-        __syncthreads();
-        for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
-            const int k = jk % hc;
-            cm[jk] = cm[jk] / (col_sum[k] + eps);
-        }
-        __syncthreads();
+        for (int jk = 0; jk < hh; jk++) comb[(size_t)r * hh + jk] = cm[jk];
     }
-    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) comb[(size_t)r * hc * hc + jk] = cm[jk];
 }
 
 __global__ void moe_route_kernel(const float* __restrict__ x, const uint8_t* __restrict__ gate_w,
