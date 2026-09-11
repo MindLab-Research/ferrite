@@ -5599,3 +5599,17 @@ xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合�
 - Stage B（当前 9.62 → ~7.2ms）：共享专家混合核加 LUT+a32（−0.3）→ xn-megafuse（−0.25~0.5）→ 跨层流水（−0.3~0.5）→ AR store 融合（−0.08）
 - Stage C（7.2 → ~5.3ms）：persistent 段核（40×3=120 节点 vs 700，残差 1.15→0.18ms）
 - Stage D（5ms 突破）：真实工作地板 ~5.3ms，需另攻 expert L1TEX 地板 + hc 段融合
+
+### shared-expert-cost 的发现（2026-09-11 深夜，关键新知识）
+
+**混合核 `gemv_bf16_fp8x2_kernel` 的 fp8 分支是 PRE-optimization 形态**：
+- 用 `e4m3_to_f` 位运算解码（~10 ALU/操作数）——单族 gemv 早已换 LUT（−21~36%）
+- scale 在循环内做 global load——单族早已 staging 进 smem（−21~34%）
+- 无 `#pragma unroll`
+- 无 a32 预解码（−6~13%）
+
+**根因**：LUT/a32/scale-staging 只加到了 `gemm_fp8_gemv_kernel`（:1722），从未同步到混合核（:2091）——它们是**独立的 kernel**。
+
+**两个行动项**（按优先级）：
+1. **零代码 A/B：DSV41_MIX_GATE=0**——回退路径里 gate 走 gemv_bf16 + shared 走 gemm_fp8_mx2（已带 LUT+a32）。预估 25µs vs 33µs = **关掉混合核可能反而更快**。
+2. **代码修复**：给混合核 fp8 分支补齐 LUT+a32+scale-staging+unroll（shared-mixed-lut 正在实施）→ 33→27-28µs = −0.2ms/步。

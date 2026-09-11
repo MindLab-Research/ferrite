@@ -2106,14 +2106,40 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
     const int nb_k = k >> 5;
     extern __shared__ uint8_t s_w[];
     uint8_t* s_a = s_w + (size_t)nwarps * (size_t)k;   // block-level fp8 activation
+    // The fp8 family's per-block scratch, laid out AFTER the activation staging so
+    // the warp slices of s_w (rows) and s_a (mode 4) keep their offsets untouched.
+    // k is a multiple of 16 (launcher-checked), so this base stays 4-byte aligned
+    // for the f32 tables in both modes.
+    //
+    // LUT + a32 are the SAME two optimisations the single-family gemv carries
+    // (gemm_fp8_gemv_kernel); this fused kernel was never brought along, so its
+    // fp8 rows still paid LDS.8 -> ~10 ALU -> FMUL per operand and re-decoded the
+    // activation once per row. The table is built from the SAME e4m3_to_f, so
+    // every decoded value is bit-identical, and s_af[j] is exactly the product
+    // the loop used to form inline (s_lut[ap[j]] * a_scale[j>>5]), so the
+    // rounding sequence is unchanged: the output stays bit-identical.
+    float* s_lut = reinterpret_cast<float*>(s_a + (size_t)((vec == 4) ? k : 0));
+    float* s_af = s_lut + 256;
     if (vec == 4) {
         const int n16a = k >> 4;
         for (int i = threadIdx.x; i < n16a; i += blockDim.x)
             *reinterpret_cast<uint4*>(s_a + (i << 4)) =
                 *reinterpret_cast<const uint4*>(a + (i << 4));
         for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
-        __syncthreads();
     }
+    // Build the e4m3 decode table once per block (256 entries, two iterations per
+    // thread at the default block size) and, after the barrier, materialise the
+    // scaled activation. Both live outside the two family branches: the barrier
+    // must be reached by every thread of the block, and the bf16 rows simply
+    // never read either table.
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    __syncthreads();
+    {
+        const uint8_t* ap0 = (vec == 4) ? s_a : a;
+        for (int i = threadIdx.x; i < k; i += blockDim.x)
+            s_af[i] = s_lut[ap0[i]] * a_scale[i >> 5];
+    }
+    __syncthreads();
     const int total = nb + 2 * nf;
     for (int row = blockIdx.x * nwarps + warp; row < total; row += gridDim.x * nwarps) {
         if (row < nb) {
@@ -2138,7 +2164,6 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             const int rrow = (row - nb) - (second ? nf : 0);
             const uint8_t* wrow = ((second ? wf2 : wf1) + (size_t)rrow * (size_t)k);
             const uint8_t* wsc = (second ? ws2 : ws1) + (size_t)(rrow >> 5) * nb_k;
-            const uint8_t* ap = (vec == 4) ? s_a : a;
             uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
             const int n16 = k >> 4;
             for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wrow[i];
@@ -2150,9 +2175,11 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
             float acc = 0.f;
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsc[kb]);
-                const float sa = a_scale[kb];
                 const int j = kb * 32 + lane;
-                acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
+                // a32: s_af[j] already folds s_lut[ap[j]] * a_scale[j>>5], so the
+                // per-element chain is one LDS.32 -> FMUL instead of
+                // LDS.8 -> LDS.32 -> FMUL -> FMUL.
+                acc += s_af[j] * (s_lut[row_s[j]] * sb);
             }
             for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
             if (lane == 0) (second ? outf2 : outf1)[rrow] = acc;
@@ -2177,7 +2204,14 @@ extern "C" int dsv41_gemm_bf16_fp8x2(const void* wb, const float* biasb, float* 
         return (int)cudaErrorInvalidValue;
     const int total = nb + 2 * nf;
     const int blocks = (total + warps - 1) / warps;
-    const size_t gsmem = (vec == 4) ? (size_t)(warps + 1) * (size_t)k : (size_t)warps * (size_t)k;
+    // weights [nwarps][k] + (mode 4) block activation [k] + the e4m3 decode table
+    // [256] f32 + the a32 pre-decoded activation [k] f32. The tables sit right
+    // after s_a, matching the kernel's pointer arithmetic above; without them
+    // here the kernel's s_lut base would fall outside the dynamic allocation.
+    const size_t scale_bytes = 256 * sizeof(float) + (size_t)k * sizeof(float);
+    const size_t gsmem = ((vec == 4) ? (size_t)(warps + 1) * (size_t)k
+                                     : (size_t)warps * (size_t)k) +
+                         scale_bytes;
     if (gsmem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gemv_bf16_fp8x2_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
