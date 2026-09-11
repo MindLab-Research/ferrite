@@ -439,7 +439,7 @@ fn ar_v5() -> bool {
         // both off and on (a full 32-step generation is bit-identical to the host
         // barrier path) and it removes ~21 of the ~29 us each all-reduce costs.
         // DSV41_AR_V5=0 restores the host barrier for A/B.
-        let graph = std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(false);
+        let graph = std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true);
         graph || std::env::var("DSV41_AR_V5").map(|v| v != "0").unwrap_or(true)
     })
 }

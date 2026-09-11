@@ -176,7 +176,7 @@ fn eng_host() -> bool {
 /// hot-path slip), and `"0"` means OFF even though it is "set".
 fn moe_batch() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
 }
 
 fn build_eng_dev(
@@ -697,11 +697,13 @@ impl<'a> DevChain<'a> {
             // wrappers, buffer accessors, the 52 launch wrappers - all byte-equal to
             // the pre-refactor file), through a per-request graph drop, and through a
             // rank rendezvous around the capture; none of them changed the outcome,
-            // so the default is the per-kernel path until the cause is located.
-            // DSV41_GRAPH_STEP=1 turns the whole-step graph back on.
+            // SO THE DEFAULT IS NOW THE GRAPH (2026-09-11): the cause WAS located - the indexer
+            // sized its dynamic shared memory from a capture-frozen per-step value while
+            // scanning the live counter - and fixed by decoupling the size from the count,
+            // then verified with 12/12 answers and zero faults. DSV41_GRAPH_STEP=0 opts out.
             !host_hash
                 && !probes
-                && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(false)
+                && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true)
         });
         // ONLY on the decode path: capturing during prefill froze the prefill
         // branches into the graph, so the decode replays took the wrong ones (the
