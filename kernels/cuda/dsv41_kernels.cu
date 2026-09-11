@@ -1735,7 +1735,32 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const uint8_t* __restrict__ w2 = nullptr,
                                      const uint8_t* __restrict__ w2_scale = nullptr,
                                      const float* __restrict__ bias2 = nullptr,
-                                     float* __restrict__ out2 = nullptr, int n1 = 0) {
+                                     float* __restrict__ out2 = nullptr, int n1 = 0,
+                                     // A5: non-zero folds a trailing elementwise add
+                                     // into the row write -- `out[row] += acc + bias`
+                                     // instead of overwriting -- so the separate
+                                     // add_inplace launch disappears. Association is
+                                     // unchanged: `o + (acc + bias)` either way, so
+                                     // the result is bit-identical. 0 keeps the old
+                                     // overwrite behaviour for every existing caller.
+                                     int epi_add = 0,
+                                     // AR v5 store fusion (attn wo_b, M=1 only). A non-null
+                                     // `staging_tbl` turns the lane-0 epilogue into store_v5: the
+                                     // row's `acc + bias` goes BOTH to `out_[rrow]` (unchanged) and
+                                     // to every peer's staging slot, replacing the standalone store
+                                     // kernel with this one write. `epoch` is the DEVICE round
+                                     // counter, read at runtime exactly like p2p_ar_store_v5_kernel,
+                                     // so a captured graph replays with the right parity. `stride`
+                                     // counts FLOAT ELEMENTS per slot (bytes/4), NOT bytes.
+                                     float* const* __restrict__ staging_tbl = nullptr,
+                                     const unsigned* __restrict__ epoch = nullptr,
+                                     int world = 0, int my_rank = 0, int stride = 0) {
+    // Read the round ONCE, like p2p_ar_store_v5_kernel (ferrite_kernels.cu). When
+    // the table is null this is a no-op (epoch is null too) and the kernel is the
+    // old one bit for bit.
+    const unsigned ar_e = (epoch != nullptr) ? *epoch : 0u;
+    const size_t ar_base =
+        (size_t)((ar_e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride;
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -1927,13 +1952,39 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-        if (lane == 0) out_[rrow] = acc + (bias_ ? bias_[rrow] : 0.f);
+        if (lane == 0) {
+            const float v = acc + (bias_ ? bias_[rrow] : 0.f);
+            // A5: fold the caller's trailing add_inplace(o, out) into this row
+            // write. The standalone kernel computed `o += (acc + bias)`, i.e.
+            // `o + (acc + bias)` -- the same association this read-modify-write
+            // performs, so the fused result is bit-identical. Every other
+            // caller leaves epi_add at 0 and keeps the plain overwrite.
+            out_[rrow] = epi_add ? (out_[rrow] + v) : v;
+            // AR v5 store fusion: the SAME `v` the row write just produced (the
+            // partial, before any epi_add fold -- epi_add is 0 for wo_b) lands in
+            // every peer's slot for this round. One 4B store per warp instead of
+            // store_v5's coalesced float4 sweep; the byte count is identical.
+            // `row < n1` restricts this to family 1, whose element index IS `rrow`;
+            // a family-2 row must never land in family-1's slots.
+            if (staging_tbl != nullptr && row < n1) {
+                #pragma unroll 2
+                for (int rr = 0; rr < world; rr++)
+                    staging_tbl[rr][ar_base + (size_t)rrow] = v;
+            }
+        }
     }
 }
 
 extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const uint8_t* w,
                                  const uint8_t* w_scale, const float* bias, float* out, int m,
-                                 int n, int k, cudaStream_t s) {
+                                 int n, int k, cudaStream_t s,
+                                 // AR v5 store fusion (see gemm_fp8_gemv_kernel): M=1 only, the
+                                 // epilogue additionally stores the row partial into every peer's
+                                 // staging slot. Default null/0 keeps every existing caller (and
+                                 // the C++ tests) on the old path, bit for bit.
+                                 float* const* staging_tbl = nullptr,
+                                 const unsigned* epoch = nullptr, int world = 0,
+                                 int my_rank = 0, int stride = 0) {
     if (m <= 0 || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return (int)cudaErrorInvalidValue;
     // The A tile lives in shared memory: 16 rows x k bytes. At the model's real
     // k (5120) that is 80 KB, well past the 48 KB static limit, so the kernel
@@ -1972,11 +2023,52 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         }
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
                                                               k, g_gemv_fp8_mode, nullptr, nullptr,
-                                                              nullptr, nullptr, n);
+                                                              nullptr, nullptr, n, 0, staging_tbl,
+                                                              epoch, world, my_rank, stride);
         return (int)cudaGetLastError();
     }
+    // Store fusion is an M=1 epilogue only: the tile path (prefill / m>1) has no
+    // lane-0 row epilogue, so refusing loudly beats silently dropping the AR.
+    if (staging_tbl != nullptr) return (int)cudaErrorInvalidValue;
     dim3 grid((n + 63) / 64, (m + 15) / 16);
     gemm_fp8_kernel<<<grid, 128, smem, s>>>(a, a_scale, w, w_scale, bias, out, m, n, k);
+    return (int)cudaGetLastError();
+}
+
+// A5: the M=1 w2 GEMV with the caller's trailing add_inplace folded into the
+// epilogue (`out += w @ a`). A SEPARATE entry point, not a new parameter on
+// dsv41_gemm_fp8_mx: that symbol has one fixed ABI and six call sites, none of
+// which accumulate, so the fused form gets its own name and the stale-.so
+// fallback is a plain symbol probe (supports_gemm_fp8_add on the Rust side).
+// M=1 only -- that is the shared expert's down projection, the one place in the
+// chain that added a standalone `ferrite_add` after the GEMV (40 launches/step).
+// Returns 1 when the shape cannot use the GEMV, so the caller keeps the
+// two-launch (gemm_fp8_mx + add_inplace) pair; any other value is the usual
+// cudaError_t status.
+extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
+                                     const uint8_t* w, const uint8_t* w_scale,
+                                     const float* bias, float* out, int m, int n, int k,
+                                     cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (m != 1 || no_gemv || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return 1;
+    const int warps = g_gemv_warps;
+    const int blocks = (n + warps - 1) / warps;
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    const size_t scale_bytes =
+        (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
+        (size_t)k * sizeof(float);
+    const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
+                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
+                                                  : (size_t)0;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        a, a_scale, w, w_scale, bias, out, n, k, g_gemv_fp8_mode,
+        nullptr, nullptr, nullptr, nullptr, n, /*epi_add=*/1);
     return (int)cudaGetLastError();
 }
 
@@ -2124,7 +2216,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     }
     gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
         a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
-        n1);
+        n1, 0, nullptr, nullptr, 0, 0, 0);
     return (int)cudaGetLastError();
 }
 

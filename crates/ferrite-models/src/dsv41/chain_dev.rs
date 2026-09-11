@@ -187,7 +187,7 @@ fn eng_host() -> bool {
 /// hot-path slip), and `"0"` means OFF even though it is "set".
 fn moe_batch() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_MOE_BATCH").map(|v| v != "0").unwrap_or(false))
 }
 
 /// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
@@ -199,7 +199,7 @@ fn moe_batch() -> bool {
 /// though it is "set".
 fn down_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_DOWN_FUSE").map(|v| v != "0").unwrap_or(false))
 }
 
 /// Mirrors the CUDA launcher's `g_expert_fp4_mode` (dsv41_experts_mxf4.cu:694):
@@ -227,19 +227,36 @@ fn expert_fp4_mode() -> i32 {
 /// DSV41_NR_FUSE=0 reverts the kv chain to the two-launch rmsnorm + rope pair.
 fn nr_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_NR_FUSE").map(|v| v != "0").unwrap_or(false))
 }
 
 /// DSV41_SH_EXP_MX2=0 reverts the shared expert's gate/up to two launches.
 fn sh_exp_mx2() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(false))
+}
+
+/// A5: DSV41_MOE_EPI_ADD=0 reverts the shared expert's w2 to the
+/// (gemm_fp8_mx, ferrite_add) pair. DEFAULT ON for the A/B. Read ONCE and cached
+/// like the other gates — a per-call getenv is exactly the hot-path slip they
+/// avoid (this branch runs 40x/step, inside graph capture).
+fn moe_epi_add() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MOE_EPI_ADD").map(|v| v != "0").unwrap_or(true))
+}
+
+/// A4: DSV41_SWIGLU_Q=0 reverts the shared expert's swiglu to the
+/// (swiglu_limit, quant1) pair. DEFAULT ON for the A/B. Read ONCE and cached
+/// like the other gates (see moe_epi_add above).
+fn swiglu_q() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SWIGLU_Q").map(|v| v != "0").unwrap_or(true))
 }
 
 /// DSV41_MIX_GATE=0 keeps the MoE gate and the shared expert as two launches.
 fn mix_gate_shared() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_MIX_GATE").map(|v| v != "0").unwrap_or(false))
 }
 
 /// DSV41_HEAD_SLICE enables the vocabulary-sliced lm_head: each rank projects
@@ -252,7 +269,7 @@ fn mix_gate_shared() -> bool {
 /// verbatim-correct, zero faults). DSV41_HEAD_SLICE=0 restores the full head.
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(false))
 }
 
 fn build_eng_dev(
@@ -1283,13 +1300,13 @@ impl<'a> DevChain<'a> {
 /// the hot path must never touch the environment per call.
 fn fuse_c() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(false))
 }
 
 /// Segment B cluster 1 fusion: hc_collapse + rmsnorm(ffn_norm) in one kernel.
 fn fuse_b1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(false))
 }
 
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
@@ -2343,7 +2360,7 @@ fn fuse_b1() -> bool {
                 // `ex_down_b` [topk][dim]; both disjoint.
                 let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
                     .map(|v| v != "0")
-                    .unwrap_or(true)
+                    .unwrap_or(false)
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 let act_slot = if gateup_fused {
@@ -2382,7 +2399,7 @@ fn fuse_b1() -> bool {
                 // here, so we mirror the same condition.
                 let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
                     .map(|v| v != "0")
-                    .unwrap_or(true)
+                    .unwrap_or(false)
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 if !gateup_fused {
@@ -2563,28 +2580,63 @@ fn fuse_b1() -> bool {
                         )?;
                     }
                 }
-                self.dev.swiglu_limit(
-                    self.s.ex_act.ptr as *mut f32,
-                    1,
-                    sh_il as i32,
-                    cfg.swiglu_limit,
-                )?;
-                self.quant1(self.s.ex_act.ptr as *const f32, sh_il as i32)?;
+                // A4: the swiglu epilogue emits the fp8 pair the w2 GEMV reads, so
+                // quant1(ex_act) disappears (40 launches/step). Only the SHARED
+                // expert's down needs it: the routed experts' down consumes
+                // ex_act_b as f32 directly (no quant to fold).
+                let act_q = swiglu_q()
+                    && self.dev.supports_swiglu_q()
+                    && self.dev.swiglu_limit_q(
+                        self.s.ex_act.ptr as *mut f32,
+                        1,
+                        sh_il as i32,
+                        cfg.swiglu_limit,
+                        self.s.xq.ptr as *mut u8,
+                        self.s.xsc.ptr as *mut f32,
+                    )?;
+                if !act_q {
+                    self.dev.swiglu_limit(
+                        self.s.ex_act.ptr as *mut f32,
+                        1,
+                        sh_il as i32,
+                        cfg.swiglu_limit,
+                    )?;
+                    self.quant1(self.s.ex_act.ptr as *const f32, sh_il as i32)?;
+                }
                 // w2 is Cols-sharded: [dim, sh_il] locally, so the reduction is over
                 // this rank's slice and the output is a PARTIAL [dim] that the MoE
                 // all-reduce sums with the other ranks'.
-                self.dev.gemm_fp8_mx(
-                    self.s.xq.as_u8(),
-                    self.s.xsc.as_f32(),
-                    w2.as_u8(),
-                    w2s.as_u8(),
-                    std::ptr::null(),
-                    self.s.ex_out.ptr as *mut f32,
-                    1,
-                    dim as i32,
-                    sh_il as i32,
-                )?;
-                self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                // A5: the w2 GEMV's epilogue adds straight into `s.o` (the MoE
+                // accumulator AR#2 reduces), dropping the standalone ferrite_add
+                // launch (40/step). Association is unchanged -- o + (acc + bias)
+                // either way -- so the result is bit-identical.
+                let fused = moe_epi_add()
+                    && self.dev.supports_gemm_fp8_add()
+                    && self.dev.gemm_fp8_mx_add(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        w2.as_u8(),
+                        w2s.as_u8(),
+                        std::ptr::null(),
+                        self.s.o.ptr as *mut f32,
+                        1,
+                        dim as i32,
+                        sh_il as i32,
+                    )?;
+                if !fused {
+                    self.dev.gemm_fp8_mx(
+                        self.s.xq.as_u8(),
+                        self.s.xsc.as_f32(),
+                        w2.as_u8(),
+                        w2s.as_u8(),
+                        std::ptr::null(),
+                        self.s.ex_out.ptr as *mut f32,
+                        1,
+                        dim as i32,
+                        sh_il as i32,
+                    )?;
+                    self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                }
             }
         }
         // the block output is the attention-branch accumulator `o`

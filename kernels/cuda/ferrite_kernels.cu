@@ -8219,6 +8219,27 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     return cudaGetLastError();
 }
 
+// AR v5, PUBLISH + REDUCE ONLY. The store half of v5 was fused into the producer
+// kernel's epilogue (attn wo_b's gemm_fp8_gemv_kernel, dsv41_kernels.cu), so this
+// entry skips p2p_ar_store_v5_kernel and runs straight to the pubred kernel. It
+// is a SEPARATE launch for the same reason the standalone one is: the polls and
+// the reduce read every rank's staging slot, which requires all ranks' stores to
+// have completed -- guaranteed by same-stream ordering after the fused producer
+// kernel's boundary. The caller MUST therefore launch its fused producer, and no
+// other all-reduce, between this and the epoch it expects: pubred advances
+// `*epoch`, and the fused store read that same value.
+extern "C" cudaError_t ferrite_p2p_ar_pubred_v5(
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    const int threads = 1024;
+    int blocks = (n + threads - 1) / threads;
+    if (blocks < 1) blocks = 1;
+    p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride);
+    return cudaGetLastError();
+}
+
 
 // ============================================================
 // Knife 1b: qkv GEMV + conv FIR/silu/window-slide epilogue (decode n==1).

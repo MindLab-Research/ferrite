@@ -38,6 +38,10 @@ struct Kernels {
     gemm_fp8_mx: unsafe extern "C" fn(
         *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
         c_int, c_int, c_int, CuStream,
+        // AR v5 store fusion (attn wo_b, M=1 only): a non-null staging table makes
+        // the epilogue also store the row partial into every peer's slot. Null/0
+        // keeps the old behaviour.
+        *const *mut f32, *const c_uint, c_int, c_int, c_int,
     ) -> c_int,
     /// Two same-activation fp8 projections in ONE gemv launch: rows below n1 map
     /// to the first family, the rest to the second, both sharing the staged
@@ -49,6 +53,16 @@ struct Kernels {
         *const u8, *const u8, *const f32, *mut f32, c_int,
         c_int, CuStream,
     ) -> c_int,
+    /// A5: the same M=1 w2 GEMV with the trailing `ferrite_add` folded into its
+    /// epilogue (`out += w @ a`). A separate symbol, so a stale `.so` simply has
+    /// no entry and the caller keeps the gemm_fp8_mx + add_inplace pair. Returns
+    /// 1 when the shape cannot use the GEMV.
+    gemm_fp8_mx_add: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -238,6 +252,11 @@ struct Kernels {
         unsafe extern "C" fn(*mut f32, *const f32, *const f32, *const f32, *const u8, c_int, c_int, c_int, f32, CuStream) -> c_int,
     >,
     swiglu_limit: Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, CuStream) -> c_int>,
+    /// A4: swiglu + the fp8 pair the following GEMV consumes, in one launch.
+    /// Returns 1 when the inter % 32 warp alignment cannot be met, so the caller
+    /// keeps the swiglu_limit + quant1 pair.
+    swiglu_limit_q:
+        Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, *mut u8, *mut f32, CuStream) -> c_int>,
     gather_rows: Option<unsafe extern "C" fn(*const f32, *const i32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     scatter_add_rows: Option<
         unsafe extern "C" fn(*const f32, *const i32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int,
@@ -301,6 +320,25 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// AR v5 publish+reduce WITHOUT the store: the store half was fused into the
+    /// producer kernel's epilogue (`dsv41_gemm_fp8_mx`'s staging args), so this
+    /// entry skips `p2p_ar_store_v5_kernel` and only polls/reduces. Same shapes as
+    /// `ferrite_p2p_ar_v5` minus `partial` and `staging_tbl` (the caller is not
+    /// storing from here).
+    p2p_ar_pubred_v5: Option<
+        unsafe extern "C" fn(
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
 }
 
 // ------------------------------------------------------------------- Device
@@ -325,6 +363,7 @@ impl Device {
         let kernels = Kernels {
             gemm_fp8_mx: km!(rt, "dsv41_gemm_fp8_mx"),
             gemm_fp8_mx2: km!(rt, "dsv41_gemm_fp8_mx2"),
+            gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
@@ -370,6 +409,7 @@ impl Device {
             compressor_pool: ko!(rt, "dsv41_compressor_pool"),
             engram_apply: ko!(rt, "dsv41_engram_apply"),
             swiglu_limit: ko!(rt, "dsv41_swiglu_limit"),
+            swiglu_limit_q: ko!(rt, "dsv41_swiglu_limit_q"),
             gather_rows: ko!(rt, "dsv41_gather_rows"),
             scatter_add_rows: ko!(rt, "dsv41_scatter_add_rows"),
             window_append: ko!(rt, "dsv41_window_append"),
@@ -383,6 +423,7 @@ impl Device {
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
             p2p_ar_v5: ko!(rt, "ferrite_p2p_ar_v5"),
+            p2p_ar_pubred_v5: ko!(rt, "ferrite_p2p_ar_pubred_v5"),
         };
         Ok(Device { rt, kernels, stream })
     }
@@ -608,7 +649,41 @@ impl Device {
         k: i32,
     ) -> Result<()> {
         let rc = unsafe {
-            (self.kernels.gemm_fp8_mx)(a, a_scale, w, w_scale, bias, out, m, n, k, self.stream)
+            (self.kernels.gemm_fp8_mx)(
+                a, a_scale, w, w_scale, bias, out, m, n, k, self.stream,
+                std::ptr::null(), std::ptr::null(), 0, 0, 0,
+            )
+        };
+        self.kerr(rc, "dsv41_gemm_fp8_mx")
+    }
+
+    /// `wo_b` GEMV with the AR v5 store FUSED into the epilogue: the row partial
+    /// goes both to `out` and (for every peer) to the staging slot of this round,
+    /// so the following AR is publish+reduce only (`p2p_ar_pubred_v5`). M=1 only;
+    /// `stride` is the per-slot FLOAT element count (`bytes/4`), the same unit the
+    /// store kernel uses. The AR must follow on the same stream with no other
+    /// all-reduce in between (both this store and the pubred read `*epoch`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_ar(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+        staging_tbl: *const *mut f32,
+        epoch: *const c_uint,
+        world: i32,
+        my_rank: i32,
+        stride: i32,
+    ) -> Result<()> {
+        let rc = unsafe {
+            (self.kernels.gemm_fp8_mx)(
+                a, a_scale, w, w_scale, std::ptr::null(), out, 1, n, k, self.stream,
+                staging_tbl, epoch, world, my_rank, stride,
+            )
         };
         self.kerr(rc, "dsv41_gemm_fp8_mx")
     }
@@ -656,6 +731,39 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx2")?;
+        Ok(true)
+    }
+
+    /// A5: true when the loaded .so carries the fused-epilogue w2 GEMV
+    /// (`dsv41_gemm_fp8_mx_add`). A stale .so leaves DSV41_MOE_EPI_ADD inert and
+    /// the (gemm_fp8_mx, add_inplace) pair runs.
+    pub fn supports_gemm_fp8_add(&self) -> bool {
+        self.kernels.gemm_fp8_mx_add.is_some()
+    }
+
+    /// A5: the M=1 w2 GEMV with the trailing add_inplace folded in
+    /// (`out += w @ a`). Ok(false) => the caller runs gemm_fp8_mx into a scratch
+    /// row and then add_inplace, exactly as before.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_add(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.gemm_fp8_mx_add, "dsv41_gemm_fp8_mx_add")?;
+        let rc =
+            unsafe { f(a, a_scale, w, w_scale, bias, out, m, n, k, self.stream) };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx_add")?;
         Ok(true)
     }
 
@@ -1217,6 +1325,33 @@ impl Device {
         self.kerr(rc, "dsv41_swiglu_limit")
     }
 
+    /// A4: true when the loaded .so carries the swiglu+fp8 fused epilogue. A
+    /// stale .so leaves DSV41_SWIGLU_Q inert and the (swiglu_limit, quant1) pair
+    /// runs.
+    pub fn supports_swiglu_q(&self) -> bool {
+        self.kernels.swiglu_limit_q.is_some()
+    }
+
+    /// A4: swiglu + clamp + the fp8 pair the next GEMV reads, in one launch.
+    /// Ok(false) => the caller runs swiglu_limit and then quant1, as before.
+    pub fn swiglu_limit_q(
+        &self,
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = self.need(self.kernels.swiglu_limit_q, "dsv41_swiglu_limit_q")?;
+        let rc = unsafe { f(gate_up, rows, inter, limit, xq, xsc, self.stream) };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_swiglu_limit_q")?;
+        Ok(true)
+    }
+
     pub fn hc_collapse(
         &self,
         x: *const f32,
@@ -1360,6 +1495,31 @@ impl Device {
               my_rank, stride, self.stream)
         };
         self.kerr(rc, "ferrite_p2p_ar_v5")
+    }
+
+    /// The publish+reduce half of AR v5, with NO store (`ferrite_p2p_ar_pubred_v5`).
+    /// Used after a producer kernel fused the staging store into its epilogue (see
+    /// `gemm_fp8_mx_ar`). The caller must have launched that producer on the same
+    /// stream with no intervening all-reduce.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_pubred_v5(
+        &self,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.p2p_ar_pubred_v5, "ferrite_p2p_ar_pubred_v5")?;
+        let rc = unsafe {
+            f(ready_tbl, epoch, staging_local, ready_local, out, n, world, my_rank, stride,
+              self.stream)
+        };
+        self.kerr(rc, "ferrite_p2p_ar_pubred_v5")
     }
 
     /// Stable argmax (ties -> lowest index); writes the winning index as i32 and

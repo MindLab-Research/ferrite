@@ -72,6 +72,22 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// A5: the M=1 w2 GEMV with the caller's trailing `add_inplace` folded into
+    /// the epilogue (`out += a @ w^T`). Returns 1 when the shape cannot use the
+    /// GEMV, so the caller keeps the gemm_fp8_mx + add_inplace pair.
+    pub fn dsv41_gemm_fp8_mx_add(
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CuStream,
+    ) -> i32;
+
     /// Activation quantisation, fp8 e4m3, `block` elements per scale.
     /// `round_scale` selects the power-of-two (ue8m0) scale.
     pub fn dsv41_quant_fp8(
@@ -400,6 +416,19 @@ extern "C" {
         rows: i32,
         inter: i32,
         limit: f32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// A4: the same SwiGLU+clamp, plus the fp8 e4m3 pair the following GEMV
+    /// consumes (one ue8m0-equivalent f32 scale per 32-wide block). Returns 1
+    /// when `inter % 32 != 0`, so the caller keeps dsv41_swiglu_limit + quant.
+    pub fn dsv41_swiglu_limit_q(
+        gate_up: *mut f32,
+        rows: i32,
+        inter: i32,
+        limit: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
         stream: CuStream,
     ) -> i32;
 

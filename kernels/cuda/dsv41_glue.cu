@@ -20,6 +20,7 @@
 //   nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -c dsv41_glue.cu
 
 #include <cuda_runtime.h>
+#include <cuda_fp8.h>
 #include <cuda_bf16.h>
 #include <cstdint>
 
@@ -143,6 +144,64 @@ __global__ void swiglu_limit_kernel(float* __restrict__ gate_up, int rows, int i
             u = fminf(fmaxf(u, -limit), limit);
         }
         row[i] = (g / (1.f + expf(-g))) * u;
+    }
+}
+
+// A4: swiglu_limit_kernel + the T1 fp8 epilogue. The f32 this kernel writes back
+// is exactly what the caller's next quant1(ex_act) would quantise, so emit the
+// e4m3 byte and its per-32-block scale here and the consumer drops that launch
+// (40 launches/step for the shared expert). This is hc_front's collapse technique
+// (dsv41_kernels.cu, the xq != nullptr epilogue) applied to the swiglu write-back.
+//
+// One WARP per 32-element scale block: with inter % 32 == 0 and a 32-multiple
+// blockDim, a warp's lanes stay inside ONE block, so the amax is a single shuffle
+// tree - no barrier, no second pass over global memory. The scale and the byte are
+// quant_kernel's arithmetic term for term (fast_round_scale(amax, 1/448), clamp
+// +-448, __nv_fp8_e4m3), and `v` is the SAME value the f32 store writes (one
+// register path, not a global re-read), so the emitted (xq, xsc) pair is
+// bit-identical to the quant1 launch it replaces.
+//
+// This file's own copy of the scale helper: dsv41_glue.cu is a separate
+// translation unit from dsv41_kernels.cu (build.sh compiles each .cu on its own
+// and links the objects), so the __device__ helper there is not visible here.
+// Same arithmetic as dsv41_kernels.cu's fast_round_scale, term for term.
+__device__ __forceinline__ float glue_fast_round_scale(float amax, float max_inv) {
+    const uint32_t bits = __float_as_uint(amax * max_inv);
+    const int exp = (int)((bits >> 23) & 0xFFu);
+    const uint32_t man = bits & 0x7FFFFFu;
+    const int e = exp - 127 + (man != 0 ? 1 : 0);
+    return __int_as_float((e + 127) << 23);
+}
+
+__global__ void swiglu_limit_q_kernel(float* __restrict__ gate_up, int rows, int inter,
+                                      float limit, uint8_t* __restrict__ xq,
+                                      float* __restrict__ xsc) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int wpb = (blockDim.x + 31) >> 5;
+    const int nb = inter >> 5;
+    const size_t total = (size_t)rows * (size_t)nb;
+    for (size_t t = (size_t)blockIdx.x * wpb + warp; t < total; t += (size_t)gridDim.x * wpb) {
+        const int r = (int)(t / (size_t)nb);
+        const int b = (int)(t % (size_t)nb);
+        float* row = gate_up + (size_t)r * 2 * inter;
+        const int i = (b << 5) + lane;
+        float g = row[i];
+        float u = row[inter + i];
+        if (limit > 0.f) {
+            g = fminf(g, limit);
+            u = fminf(fmaxf(u, -limit), limit);
+        }
+        const float v = (g / (1.f + expf(-g))) * u;   // identical to swiglu_limit_kernel
+        row[i] = v;                                   // f32 write-back, unchanged
+        float a = fabsf(v);
+        for (int off = 16; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xFFFFFFFFu, a, off));
+        const float sc = fmaxf(glue_fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+        if (lane == 0) xsc[(size_t)r * nb + b] = sc;
+        const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+        const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+        xq[(size_t)r * inter + i] = *(const uint8_t*)&f8;
     }
 }
 
@@ -642,6 +701,20 @@ extern "C" int dsv41_swiglu_limit(float* gate_up, int rows, int inter, float lim
     const size_t total = (size_t)rows * inter;
     const unsigned blocks = (unsigned)((total + 255) / 256);
     swiglu_limit_kernel<<<blocks, 256, 0, s>>>(gate_up, rows, inter, limit);
+    return (int)cudaGetLastError();
+}
+
+// A4: swiglu + the fp8 pair the following GEMV consumes, in one launch. Returns
+// 1 when the shape cannot use it (a caller that cannot meet the inter % 32 warp
+// alignment keeps the swiglu_limit + quant1 pair), any other value is the usual
+// cudaError_t status. M=1 row is the shared expert's down path.
+extern "C" int dsv41_swiglu_limit_q(float* gate_up, int rows, int inter, float limit,
+                                    uint8_t* xq, float* xsc, cudaStream_t s) {
+    if (rows <= 0 || inter <= 0 || (inter & 31) || xq == nullptr || xsc == nullptr) return 1;
+    const int wpb = 8;   // 256 threads = 8 warps, one 32-element scale block each
+    const unsigned blocks =
+        (unsigned)(((size_t)rows * (size_t)(inter >> 5) + wpb - 1) / wpb);
+    swiglu_limit_q_kernel<<<blocks, wpb * 32, 0, s>>>(gate_up, rows, inter, limit, xq, xsc);
     return (int)cudaGetLastError();
 }
 
