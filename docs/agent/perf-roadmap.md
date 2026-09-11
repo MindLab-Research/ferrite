@@ -1640,3 +1640,17 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
 **验证状态**：`cargo check --workspace` = 0 errors（本地）。**CUDA 侧未编译**（本地无 nvcc）：
 `dsv41_experts_mxf4.cu` / `dsv41_glue.cu` 的改动需要在远端 `bash kernels/cuda/build.sh 103a` 重建，
 并核对新 kernel 的寄存器数（house rule：寄存器上涨会静默腰斩占用率）。
+
+### MoE gemv 批化已落地（`DSV41_MOE_BATCH=1`，默认关，待 e2e 验收）
+
+- **新 kernel（老 kernel 一行未动 ⇒ 默认路径字节级不变 ✓）**：
+  `expert_gemv_fp4_batched_kernel`（`dsv41_experts_mxf4.cu:689`，逐行拷贝 + `blockIdx.y = slot`
+  + per-slot stride 的 `act_stride/out_slot_stride/rw_stride`）+ `moe_down_reduce_kernel`（`:769`）。
+- **调用侧关键发现**：逐 slot 输出**并非 disjoint** —— gate/up 每 slot 覆盖写同一个 `ex_act` ✗、
+  down 每 slot 累加进同一个 `o`（epi_mode 3）✗ ⇒ 批化必须走 **per-slot scratch**（`ex_act_b`/
+  `ex_down_b` 以 `slot*stride` 相离 ✓ 已实现 ✓）。
+- **数值论证**：gate/up 逐位一致（同专家、同行内点积序 ✓）；down 的归约按 **slot 0..topk 升序**
+  求和，与顺序路径"从清零的 `o` 起逐个 `o[row] += x`"**同序** ⇒ 逐位一致 ✓（fp 加法不满足结合律，
+  定点序是必须的 ✓）。
+- **待办**：e2e 验收（`DSV41_MOE_BATCH=1`：四段文本亲自读 + 逐步计时预期降 ~2.5ms；同时是
+  新 kernel 的寄存器数审计点 —— 远程 `-Xptxas -v` 看是否踩 80 regs → 2 blocks/SM 的陷阱）。
