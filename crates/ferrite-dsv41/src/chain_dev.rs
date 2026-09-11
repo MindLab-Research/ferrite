@@ -428,6 +428,15 @@ impl<'a> DevChain<'a> {
         }
         self.dev.zero_at(self.s.pos_ctr.ptr, 4)?;
         self.dev.zero_at(self.s.clen.ptr, self.cfg.n_layers * 4)?;
+        // The capture must be re-armed PER REQUEST: with decode_steps carried over,
+        // the next request's PREFILL would satisfy `decode_steps >= 1` and run
+        // through the decode graph, which was captured with the decode-time host
+        // branch choices (measured: the first request answered ' Paris' correctly
+        // and the second came back as garbage, because its prefill took the graph's
+        // decode path - e.g. the compressor's mode=2 instead of mode=1 at pos 0).
+        // The graph ITSELF stays: every launch argument is device-side, so it is
+        // state-agnostic and safe to reuse across requests.
+        self.decode_steps = 0;
         if let Some(e) = self.eng_dev.as_ref() {
             self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?;
         }
