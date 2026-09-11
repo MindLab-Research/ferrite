@@ -260,33 +260,22 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // The activation row is the same for every output row: stage it once per
-    // block instead of letting all `nwarp` warps re-read it from L1 for every
-    // row (the head reduces 129280 rows against a single x row). Values are
-    // unchanged, so every dot keeps its exact order and sum.
-    extern __shared__ float s_x[];
-    for (int i = threadIdx.x; i < k; i += blockDim.x) s_x[i] = x[i];
-    __syncthreads();
+    // DIAGNOSTIC: s_x removed as well (the last unverified piece). The
+    // activation is read straight from global memory exactly as the baseline did,
+    // and the accumulation uses the baseline expression form.
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const __nv_bfloat16* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
-        // Four iterations in flight: the four weight/x pairs are independent
-        // loads, so the memory latency is covered instead of exposed once per
-        // thirty-two-element step. The accumulation order is untouched
-        // (c, c+32, c+64, c+96, ...), so the sum is bit-identical.
         int c = lane;
         for (; c + 96 < k; c += 128) {
             const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
-            const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
-            // DIAGNOSTIC: baseline expression form (the compiler fuses each into
-            // an FFMA), keeping the shared-memory staging. If the text recovers,
-            // the __fmaf_rn pinning is the culprit rather than s_x.
+            const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
             acc += __bfloat162float(w0) * x0;
             acc += __bfloat162float(w1) * x1;
             acc += __bfloat162float(w2) * x2;
             acc += __bfloat162float(w3) * x3;
         }
-        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * s_x[c];
+        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
@@ -299,28 +288,20 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
     const int lane = threadIdx.x & 31;
     const int wid = threadIdx.x >> 5;
     const int nwarp = (blockDim.x + 31) >> 5;
-    // Same treatment as gemv_bf16: stage the shared activation row in shared
-    // memory (the caller passes k*sizeof(float) as the THIRD launch argument)
-    // and run four steps in flight. Adds/muls pinned with rn intrinsics because
-    // --use_fast_math is on.
-    extern __shared__ float s_x[];
-    for (int i = threadIdx.x; i < k; i += blockDim.x) s_x[i] = x[i];
-    __syncthreads();
+    // DIAGNOSTIC: s_x removed as well (matching gemv_bf16).
     for (int row = blockIdx.x * nwarp + wid; row < n; row += gridDim.x * nwarp) {
         const float* wr = w + (size_t)row * (size_t)k;
         float acc = 0.f;
         int c = lane;
         for (; c + 96 < k; c += 128) {
             const float w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
-            const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
-            // DIAGNOSTIC: baseline expression form (compiler fuses to FFMA),
-            // shared-memory staging kept - same experiment as gemv_bf16.
+            const float x0 = x[c], x1 = x[c + 32], x2 = x[c + 64], x3 = x[c + 96];
             acc += w0 * x0;
             acc += w1 * x1;
             acc += w2 * x2;
             acc += w3 * x3;
         }
-        for (; c < k; c += 32) acc += wr[c] * s_x[c];
+        for (; c < k; c += 32) acc += wr[c] * x[c];
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
