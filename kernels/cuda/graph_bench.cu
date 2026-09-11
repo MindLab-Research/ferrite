@@ -217,7 +217,7 @@ int main(int argc, char** argv) {
     // Query with a real buffer (not the NULL-count form) so this compiles and runs
     // identically across CUDA versions.
     std::vector<cudaGraphNode_t> nodes(N + 1);
-    size_t n_nodes = 0;
+    size_t n_nodes = nodes.size();
     CK(cudaGraphGetNodes(g_real, nodes.data(), &n_nodes));
     double graph_real_ms = bench_replay(ge_real, s, iters);
 
@@ -230,7 +230,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < N; i++) nop_kernel<<<1, 32, 0, s>>>();
     CK(cudaStreamEndCapture(s, &g_nop));
     CK(cudaGraphInstantiate(&ge_nop, g_nop, 0));
-    size_t n_nop_nodes = 0;
+    size_t n_nop_nodes = nodes.size();
     CK(cudaGraphGetNodes(g_nop, nodes.data(), &n_nop_nodes));
     double graph_nop_ms = bench_replay(ge_nop, s, iters);
 
