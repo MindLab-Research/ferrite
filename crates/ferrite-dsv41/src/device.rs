@@ -165,6 +165,7 @@ struct Kernels {
     ar_mark: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, CuStream) -> c_int>,
     expert_gate_up_fp4_indirect: Option<
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
@@ -401,6 +402,7 @@ impl Device {
                 ar_mark: sym(h_k, "dsv41_ar_mark").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_bf16: sym(h_k, "dsv41_gemv_bf16").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 gemv_f32: sym(h_k, "dsv41_gemv_f32").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                argmax: sym(h_k, "dsv41_argmax").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1445,6 +1447,23 @@ impl Device {
     }
 
     /// Same, f32 weights.
+    /// Stable argmax (ties -> lowest index); writes the winning index as i32.
+    pub fn argmax(&self, v: *const f32, out: *mut c_int, n: i32) -> Result<()> {
+        let f = self.need(self.kernels.argmax, "dsv41_argmax")?;
+        let rc = unsafe { f(v, out, n, self.stream) };
+        self.kerr(rc, "dsv41_argmax")
+    }
+
+    /// The single 4-byte host read per decode step (EOS check + printing). The
+    /// token itself stays on the device; only this value crosses back.
+    pub fn download_u32(&self, ptr: *const c_void) -> Result<u32> {
+        let mut b = [0u8; 4];
+        let st =
+            unsafe { (self.cudart.memcpy)(b.as_mut_ptr() as *mut c_void, ptr, 4, CUDA_MEMCPY_D2H) };
+        check_cudart(st, &self.cudart, "cudaMemcpy D2H token")?;
+        Ok(u32::from_le_bytes(b))
+    }
+
     pub fn gemv_f32(&self, w: *const f32, x: *const f32, out: *mut f32, n: i32, k: i32) -> Result<()> {
         let f = self.need(self.kernels.gemv_f32, "dsv41_gemv_f32")?;
         let rc = unsafe { f(w, x, out, n, k, self.stream) };

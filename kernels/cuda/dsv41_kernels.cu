@@ -1156,6 +1156,46 @@ extern "C" int dsv41_engram_gather(const uint8_t* table, const uint8_t* table_sc
     return (int)cudaGetLastError();
 }
 
+// Stable argmax over f32 logits: ties resolve to the LOWEST index, matching the
+// host loop's strictly-greater scan. f32 becomes a sortable u32 key (negatives
+// inverted, positives get the sign bit), packed as (key << 32) | (0xFFFFFFFF - idx)
+// so among equal keys the SMALLER index has the LARGER packed value; one block of
+// 1024 threads reduces with shuffles and thread 0 writes the winner. No atomics, no
+// scratch, fully deterministic. One block is deliberate: 129280 elements is ~127
+// per thread, all coalesced, and it removes any cross-block combine. This is the
+// GLM HEAD_DEV pattern - the sampled token never leaves the device except as the
+// single 4-byte read the host needs for EOS and printing.
+__global__ void argmax_kernel(const float* __restrict__ v, int* __restrict__ out, int n) {
+    unsigned long long my = 0ull;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const unsigned int bits = __float_as_uint(v[i]);
+        const unsigned int key = (bits >> 31) ? ~bits : (bits | 0x80000000u);
+        const unsigned long long pk =
+            ((unsigned long long)key << 32) | (0xFFFFFFFFu - (unsigned)i);
+        if (pk > my) my = pk;
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const unsigned long long o = __shfl_down_sync(0xFFFFFFFFu, my, off);
+        if (o > my) my = o;
+    }
+    __shared__ unsigned long long wb[32];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = (int)blockDim.x >> 5;
+    if (lane == 0) wb[wid] = my;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        unsigned long long m = 0ull;
+        for (int w = 0; w < nw; ++w)
+            if (wb[w] > m) m = wb[w];
+        *out = (int)(0xFFFFFFFFu - (unsigned)(m & 0xFFFFFFFFu));
+    }
+}
+
+extern "C" int dsv41_argmax(const float* v, int* out, int n, cudaStream_t s) {
+    if (n <= 0) return (int)cudaErrorInvalidValue;
+    argmax_kernel<<<1, 1024, 0, s>>>(v, out, n);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* sink,
                                  const int32_t* idxs, float* out, int b, int m, int h, int d,
                                  int n, int topk, float scale, cudaStream_t s) {

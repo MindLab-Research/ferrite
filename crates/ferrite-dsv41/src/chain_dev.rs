@@ -113,6 +113,9 @@ struct Scratch {
     // sync — 45 layers x 2 syncs per step, each one draining the CPU/GPU
     // pipeline, which is where the ~7.5ms/layer went. Three slots, no aliasing.
     pre_a: DevBuf,
+    /// The constant incoming premix [1,0,0,0], uploaded ONCE at reset; each step
+    /// copies it into slot 0 with a 16-byte D2D (graph-capturable) instead of an H2D.
+    premix_const: DevBuf,
     pre_b: DevBuf,
     pre_c: DevBuf,
     // ---- engram (n-gram memory write-back into the hc residual stream) ----
@@ -263,6 +266,7 @@ impl<'a> DevChain<'a> {
             pre_a: dev.alloc(fb(hc).max(8))?,
             pre_b: dev.alloc(fb(hc).max(8))?,
             pre_c: dev.alloc(fb(hc).max(8))?,
+            premix_const: dev.alloc(fb(hc).max(8))?,
             eng_ids: dev.alloc(fb(eng_cols * n_eng_layers).max(8) * 2)?, // i64
             eng_rows: dev.alloc(fb(eng_cols * ehd).max(8))?,
             eng_kv: dev.alloc(fb((hc + 1) * dim))?,
@@ -329,6 +333,13 @@ impl<'a> DevChain<'a> {
     }
 
     pub fn reset(&mut self) -> Result<()> {
+        // the incoming premix is the CONSTANT [1,0,0,0] every step; upload it once
+        // here so the per-step refresh is a device-to-device copy (no H2D)
+        {
+            let mut pm = vec![0f32; self.cfg.hc_mult];
+            pm[0] = 1.0;
+            self.dev.upload_f32_at(self.s.premix_const.ptr, 0, &pm)?;
+        }
         for c in self.layers.iter_mut() {
             self.dev.zero(&c.ring)?;
             self.dev.zero(&c.state_kv)?;
@@ -490,14 +501,26 @@ impl<'a> DevChain<'a> {
     }
 
     /// One decode step. Returns the logits for the fed token.
-    pub fn step(&mut self, token: u32, pos: usize) -> Result<Vec<f32>> {
-        let cfg = self.cfg;
-        let dim = cfg.dim;
-        let hc = cfg.hc_mult;
+    pub fn step(&mut self, token: u32, pos: usize) -> Result<u32> {
         let ids = [token as i32];
         self.dev.upload_f32_at(self.s.ids.ptr, 0, unsafe {
             std::slice::from_raw_parts(ids.as_ptr() as *const f32, 1)
         })?;
+        self.step_impl(token, pos)
+    }
+
+    /// Decode steady state: the token is ALREADY in s.ids on the device (the
+    /// previous step's argmax wrote it), and the caller knows its value because
+    /// that step returned it — the host value feeds only the n-gram hash, so this
+    /// path does ZERO host-to-device traffic.
+    pub fn step_dev(&mut self, token: u32, pos: usize) -> Result<u32> {
+        self.step_impl(token, pos)
+    }
+
+    fn step_impl(&mut self, token: u32, pos: usize) -> Result<u32> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
         // embedding + hyper-connection expansion lands directly in `h`
         self.dev.embed_expand_dev(
             self.w.embed.as_ref().unwrap().ptr(),
@@ -516,11 +539,14 @@ impl<'a> DevChain<'a> {
             eprintln!("[mine] xin_rms={}", (r * 1e6).round() / 1e6);
         }
 
-        // the initial collapse takes copy 0 of the stream; it is uploaded ONCE
-        // into slot 0 and every later layer keeps its coefficients on the device
-        let mut premix = vec![0f32; hc];
-        premix[0] = 1.0;
-        self.upload_pre(&premix)?;
+        // the initial collapse takes copy 0 of the stream: the constant [1,0,0,0]
+        // lives in a device buffer uploaded once at reset; this 16-byte D2D is
+        // graph-capturable where the old per-step H2D upload was not.
+        self.dev.memcpy_d2d(
+            self.s.pre_a.ptr,
+            self.s.premix_const.ptr,
+            hc * std::mem::size_of::<f32>(),
+        )?;
         let mut premix_slot_idx = 0usize;
         // engram hashes for this token (all engram layers at once; the reference
         // computes them in one shot and indexes per layer). The state's token
@@ -573,7 +599,11 @@ impl<'a> DevChain<'a> {
                 self.stats(&format!("L{layer} h"), &self.s.h, hc * dim)?;
             }
         }
-        self.upload_pre(&premix)?;
+        self.dev.memcpy_d2d(
+            self.s.pre_a.ptr,
+            self.s.premix_const.ptr,
+            hc * std::mem::size_of::<f32>(),
+        )?;
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
             self.premix_slot(1).as_f32(), // attn_pre stays on the device
@@ -601,10 +631,26 @@ impl<'a> DevChain<'a> {
             self.s.logits.ptr as *mut f32,
         )?;
         self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
+        // Device-side argmax (the GLM HEAD_DEV pattern): the next token lands
+        // straight in s.ids, which the next step's embedding reads — no 517 KB
+        // full-vocab download, no O(vocab) host scan, and the token itself never
+        // crosses to the host and back.
+        self.dev.argmax(
+            self.s.logits.ptr as *const f32,
+            self.s.ids.ptr as *mut std::ffi::c_int,
+            cfg.vocab_size as i32,
+        )?;
+        if std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false) {
+            let mut lg = vec![0f32; cfg.vocab_size];
+            let b = Device::view(self.s.logits.ptr, cfg.vocab_size * 4);
+            self.dev.download_f32(&b, &mut lg)?;
+            let mut top: Vec<(usize, f32)> = lg.iter().copied().enumerate().collect();
+            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            eprintln!("[top5] n={} top={:?}", lg.len(), &top[..5.min(top.len())]);
+        }
+        // the ONLY host read on the decode path: 4 bytes for EOS and printing
         self.dev.sync()?;
-        let mut out = vec![0f32; cfg.vocab_size];
-        self.dev.download_f32(&self.s.logits, &mut out)?;
-        Ok(out)
+        Ok(self.dev.download_u32(self.s.ids.ptr)?)
     }
 
     /// Tensor-parallel degree / this rank's index (1 / 0 without a collective).
@@ -626,11 +672,6 @@ impl<'a> DevChain<'a> {
         }
     }
 
-    fn upload_pre(&self, v: &[f32]) -> Result<()> {
-        // slot 0 is the premix the first layer's attention collapses with; the
-        // layers rotate their own coefficients on the device afterwards
-        self.dev.upload_f32_at(self.s.pre_a.ptr, 0, v)
-    }
 
     fn dl(&self, src: *const f32, n: usize) -> Result<Vec<f32>> {
         let mut v = vec![0f32; n];

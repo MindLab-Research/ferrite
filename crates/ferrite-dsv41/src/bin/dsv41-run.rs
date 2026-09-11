@@ -186,9 +186,9 @@ fn main() -> Result<()> {
 
     // ---- prefill (one token per step: the KV ring is per-sequence) ----
     let t1 = std::time::Instant::now();
-    let mut logits = Vec::new();
+    let mut next_tok: u32 = 0;
     for (i, &t) in ids.iter().enumerate() {
-        logits = chain.step(t, i)?;
+        next_tok = chain.step(t, i)?;
     }
     eprintln!(
         "[dsv41] prefill {} tokens in {:.2}s ({:.1} tok/s)",
@@ -203,25 +203,13 @@ fn main() -> Result<()> {
     let t2 = std::time::Instant::now();
     let t_dec = std::time::Instant::now();
     for step in 0..max_tokens {
-        let mut best = 0usize;
-        for (i, &v) in logits.iter().enumerate() {
-            if v > logits[best] {
-                best = i;
-            }
-        }
-        let next = best as u32;
-        if step < 3 {
-            let mut top: Vec<(usize, f32)> =
-                logits.iter().copied().enumerate().collect::<Vec<_>>().iter().map(|&(i, v)| (i, v)).collect();
-            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!("[top5] step {step} n={} : {:?}", logits.len(),
-                &top[..5.min(top.len())].iter().map(|(i, v)| (*i, *v)).collect::<Vec<_>>());
-        }
-        produced.push(next);
-        if Some(next) == eos {
+        // the token comes from the previous step's DEVICE argmax (the chain prints
+        // top5 under DSV41_TOP5 itself); no host scan, no full-logits download
+        produced.push(next_tok);
+        if Some(next_tok) == eos {
             break;
         }
-        logits = chain.step(next, pos0 + step)?;
+        next_tok = chain.step_dev(next_tok, pos0 + step)?;
     }
     let dt = t2.elapsed().as_secs_f64();
     eprintln!(
@@ -395,9 +383,9 @@ fn rank_body(
         eprintln!("[dsv41] rank0: chain ready, entering prefill");
     }
     let t1 = std::time::Instant::now();
-    let mut logits = Vec::new();
+    let mut next_tok: u32 = 0;
     for (i, &tk) in ids.iter().enumerate() {
-        logits = chain.step(tk, i)?;
+        next_tok = chain.step(tk, i)?;
     }
     if rank == 0 {
         println!(
@@ -409,33 +397,11 @@ fn rank_body(
     let mut out: Vec<u32> = Vec::new();
     let t_dec = std::time::Instant::now();
     for step in 0..max_tokens {
-        let mut best = 0usize;
-        for (i, &v) in logits.iter().enumerate() {
-            if v > logits[best] {
-                best = i;
-            }
-        }
-        let next = best as u32;
-        if rank == 0
-            && step < 3
-            && std::env::var("DSV41_TOP5").map(|v| v != "0").unwrap_or(false)
-        {
-            let mut top: Vec<(usize, f32)> =
-                logits.iter().copied().enumerate().collect::<Vec<_>>();
-            top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            eprintln!(
-                "[top5] step {step} n={} top={:?} span={:?}",
-                logits.len(),
-                &top[..4.min(top.len())],
-                (logits.iter().cloned().fold(f32::MIN, f32::max),
-                 logits.iter().cloned().fold(f32::MAX, f32::min))
-            );
-        }
-        out.push(next);
-        if Some(next) == eos {
+        out.push(next_tok);
+        if Some(next_tok) == eos {
             break;
         }
-        logits = chain.step(next, ids.len() + step)?;
+        next_tok = chain.step_dev(next_tok, ids.len() + step)?;
     }
     if rank == 0 {
         let el = t_dec.elapsed();
