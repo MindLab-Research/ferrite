@@ -2446,7 +2446,7 @@ __device__ __forceinline__ void dsv41_cp_wait_all() { asm volatile("cp.async.wai
 // Phase A: one warp per (token, projection row). Both operands are staged with
 // cp.async; the raw dot lands in g_hc_part[r][m][0] for the tail to scale.
 __global__ void hc_mix_dots_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
-                                   int rows, int hc_dim, int mix) {
+                                   int rows, int hc_dim, int mix, int ss_out) {
     const int m = blockIdx.x;
     const int r = blockIdx.y;
     if (m >= mix || r >= rows) return;
@@ -2483,6 +2483,15 @@ __global__ void hc_mix_dots_kernel(const float* __restrict__ x, const float* __r
     float acc = (a0 + a1) + a2;
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
     if (lane == 0) g_hc_part[r][m][0] = acc;
+    // Fold the tail's sum-of-squares in: the row is already staged in shared
+    // memory, so block m replays the tail's warp-m partial exactly (c = lane +
+    // m*32, stride mix*32) - bit-identical grouping, zero extra global reads.
+    if (ss_out != 0) {
+        float s2 = 0.f;
+        for (int c = lane + m * 32; c < hc_dim; c += mix * 32) s2 += s_x[c] * s_x[c];
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_xor_sync(0xFFFFFFFFu, s2, off);
+        if (lane == 0) g_hc_part[r][m][1] = s2;
+    }
 }
 
 // Phase B: one block per token, 1024 threads. The sum of squares, the scale, the
@@ -2496,7 +2505,7 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      int dim, int sinkhorn_iters, float eps, int ss_stride,
                                      const float* __restrict__ w_norm,
                                      const float* __restrict__ pre_collapse,
-                                     float* __restrict__ out, float eps_norm) {
+                                     float* __restrict__ out, float eps_norm, int ss_in) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -2506,17 +2515,28 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
     __shared__ float sss;
     __shared__ float wpart[32];
     const float* xr = x + (size_t)r * hc_dim;
-    float ss = 0.f;
-    for (int c = threadIdx.x; c < hc_dim; c += ss_stride) ss += xr[c] * xr[c];
-    for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
     const int nwarp = ss_stride >> 5;
-    if ((threadIdx.x & 31) == 0 && (int)(threadIdx.x >> 5) < nwarp)
-        wpart[threadIdx.x >> 5] = ss;
-    __syncthreads();
-    if (threadIdx.x < 32) {
-        float v = (threadIdx.x < nwarp) ? wpart[threadIdx.x] : 0.f;
-        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
-        if (threadIdx.x == 0) sss = v;
+    if (ss_in != 0) {
+        // The ss partials came from the dots kernel, computed from the same
+        // staged row with the identical per-warp grouping - only the
+        // cross-warp combine (the 32-lane tree over 24 partials) remains.
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < nwarp) ? g_hc_part[r][threadIdx.x][1] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
+    } else {
+        float ss = 0.f;
+        for (int c = threadIdx.x; c < hc_dim; c += ss_stride) ss += xr[c] * xr[c];
+        for (int off = 16; off > 0; off >>= 1) ss += __shfl_xor_sync(0xFFFFFFFFu, ss, off);
+        if ((threadIdx.x & 31) == 0 && (int)(threadIdx.x >> 5) < nwarp)
+            wpart[threadIdx.x >> 5] = ss;
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            float v = (threadIdx.x < nwarp) ? wpart[threadIdx.x] : 0.f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+            if (threadIdx.x == 0) sss = v;
+        }
     }
     __syncthreads();
     const float inv = rsqrtf(sss / (float)hc_dim + eps);
@@ -2605,6 +2625,14 @@ static const bool g_hc_front = [] {
     return e[0] != '0';
 }();
 
+// ss computed in the dots kernel from the staged row (default on); "0" restores
+// the in-tail scan for A/B. Bit-identical by construction either way.
+static const bool g_hc_ss = [] {
+    const char* e = getenv("DSV41_HC_SS");
+    if (e == nullptr) return true;
+    return e[0] != '0';
+}();
+
 extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
@@ -2637,11 +2665,11 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
         }
     }
     hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), 32, smem, s>>>(x, hc_fn, rows, hc_dim,
-                                                                             mix);
+                                                                             mix, g_hc_ss ? 1 : 0);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
-        pre_collapse, out, eps_norm);
+        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0);
     return (int)cudaGetLastError();
 }
