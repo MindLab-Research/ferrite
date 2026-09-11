@@ -1459,9 +1459,10 @@ static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
 // ---------------------------------------------------------------------------
 // SPREAD variant of hc_mixes (DSV41_HC_MIXES_SPREAD), see the note by the kernels.
 // ---------------------------------------------------------------------------
-#define DSV41_HC_SPREAD_MAXR 8192
+#define DSV41_HC_SPREAD_MAXR 2048
+#define DSV41_HC_SPREAD_S 8          // K chunks; one block per (row, projection row, chunk)
 __device__ float g_hc_inv[DSV41_HC_SPREAD_MAXR];
-__device__ float g_hc_mix[DSV41_HC_SPREAD_MAXR][64];
+__device__ float g_hc_part[DSV41_HC_SPREAD_MAXR][64][DSV41_HC_SPREAD_S];
 
 // Phase A: one block per token, the sum of squares -> g_hc_inv[r]. The two-stage
 // reduction is copied verbatim from hc_mixes_kernel so the sum lands in the same order.
@@ -1488,16 +1489,23 @@ __global__ void hc_mixes_ss_kernel(const float* __restrict__ x, int rows, int hc
 // instead of one. The accumulation is the same lane-strided single chain as the
 // single-block kernel, so the dot product is bit-identical.
 __global__ void hc_mixes_rows_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
-                                     int rows, int hc_dim, int mix) {
+                                     int rows, int hc_dim, int mix, int split) {
     const int m = blockIdx.x;
     const int r = blockIdx.y;
-    if (m >= mix || r >= rows) return;
+    const int ck = blockIdx.z;
+    if (m >= mix || r >= rows || ck >= split) return;
     const float* xr = x + (size_t)r * hc_dim;
     const float* wr = hc_fn + (size_t)m * hc_dim;
+    // Contiguous K range per block, so the 64 KB of one row's weights is read by
+    // `split` blocks on `split` different SMs. The per-chunk accumulation is the
+    // same lane-strided single chain; the cross-chunk sum happens in phase C in a
+    // fixed ascending order, so the result is deterministic.
+    int lo = (int)((long long)hc_dim * ck / split);
+    int hi = (int)((long long)hc_dim * (ck + 1) / split);
     float acc = 0.f;
-    for (int c = threadIdx.x; c < hc_dim; c += blockDim.x) acc += wr[c] * xr[c];
+    for (int c = lo + threadIdx.x; c < hi; c += blockDim.x) acc += wr[c] * xr[c];
     for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-    if (threadIdx.x == 0) g_hc_mix[r][m] = acc * g_hc_inv[r];
+    if (threadIdx.x == 0) g_hc_part[r][m][ck] = acc;
 }
 
 // Phase C: one block per token, the sigmoid/cm/sinkhorn/comb tail moved over verbatim
@@ -1505,14 +1513,18 @@ __global__ void hc_mixes_rows_kernel(const float* __restrict__ x, const float* _
 __global__ void hc_mixes_post_kernel(const float* __restrict__ hc_scale,
                                      const float* __restrict__ hc_base, float* __restrict__ pre,
                                      float* __restrict__ post, float* __restrict__ comb, int rows,
-                                     int hc, int sinkhorn_iters, float eps) {
+                                     int hc, int sinkhorn_iters, float eps, int split) {
     const int r = blockIdx.x;
     if (r >= rows) return;
     const int mix = hc * (2 + hc);
     __shared__ float sm[64];
     __shared__ float cm[64];
     float* mixes = sm;
-    for (int m = threadIdx.x; m < mix; m += blockDim.x) mixes[m] = g_hc_mix[r][m];
+    for (int m = threadIdx.x; m < mix; m += blockDim.x) {
+        float a = 0.f;
+        for (int ck = 0; ck < split; ++ck) a += g_hc_part[r][m][ck];   // fixed order
+        mixes[m] = a * g_hc_inv[r];
+    }
     __syncthreads();
     if (threadIdx.x < (unsigned)hc) {
         const int j = threadIdx.x;
@@ -1559,7 +1571,10 @@ __global__ void hc_mixes_post_kernel(const float* __restrict__ hc_scale,
 }
 
 // Read ONCE: a per-call getenv is a hot-path slip, and this launcher runs ~90 times a step.
-static const bool g_hc_spread = getenv("DSV41_HC_MIXES_SPREAD") != nullptr;
+static const bool g_hc_spread = [] {
+    const char* e = getenv("DSV41_HC_MIXES_SPREAD");
+    return e != nullptr && e[0] != '0';      // "0" must mean OFF, not "set"
+}();
 
 extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* hc_scale,
                               const float* hc_base, float* pre, float* post, float* comb, int rows,
@@ -1588,14 +1603,15 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
         if (v >= 32 && v <= 1024) nthreads = v;
     }
     if (g_hc_spread && rows <= DSV41_HC_SPREAD_MAXR && mix <= 64) {
+        const int split = DSV41_HC_SPREAD_S;
         // Spread variant: one block per (row, projection row), so each of the `mix`
         // 64 KB weight rows is read on its own SM instead of all 1.5 MB on one. The
         // arithmetic order is identical in every phase, so the outputs are
         // bit-identical to the single-block kernel (verified against it directly).
         hc_mixes_ss_kernel<<<rows, 256, 0, s>>>(x, rows, hc_dim, eps);
-        hc_mixes_rows_kernel<<<dim3(mix, rows), 32, 0, s>>>(x, hc_fn, rows, hc_dim, mix);
+        hc_mixes_rows_kernel<<<dim3(mix, rows, split), 64, 0, s>>>(x, hc_fn, rows, hc_dim, mix, split);
         hc_mixes_post_kernel<<<rows, 32, 0, s>>>(hc_scale, hc_base, pre, post, comb, rows, hc,
-                                                 sinkhorn_iters, eps);
+                                                 sinkhorn_iters, eps, split);
         return (int)cudaGetLastError();
     }
     hc_mixes_kernel<<<rows, nthreads, smem, s>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, rows,
