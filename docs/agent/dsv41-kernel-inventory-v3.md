@@ -558,9 +558,19 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    延迟敏感的**小 shape**（`wq_a+wkv` 合并 n=1280+512=1792、`sh_w13` n=640）反之需要更多 block
    （更多在飞 warp）⇒ 用 n 分档。
    - **实现**：`dsv41_kernels.cu` 新增 `g_gemv_warps_adaptive`（env **`DSV41_GEMV_WARPS_ADAPTIVE`**，
-     默认 ON，`=0` 回退固定 `DSV41_GEMV_FP8_WARPS`）+ 常量 `kGemvWarpsBigN=2048` /
-     `kGemvWarpsBig=8` + 内联 `dsv41_gemv_warps_for(n)`。**只改 launcher 的 warps 选择，kernel
+     默认 ON，`=0` 回退固定 `DSV41_GEMV_FP8_WARPS`）+ 常量 `kGemvWarpsBigN=2048` + 内联
+     `dsv41_gemv_warps_for(n)`。**只改 launcher 的 warps 选择，kernel
      不变**（`gemm_fp8_gemv_kernel` 早已按 `blockDim` 参数化）。
+   - **P2b（2026-09-12 已落地，待实测）大 n 专用旋钮**：大 n 臂的 warps 从常量 `kGemvWarpsBig=8`
+     改为 `g_gemv_warps_big`（env **`DSV41_GEMV_WARPS_BIG`**，默认 8、合法 4..32、缺失/越界回退 8）。
+     **动机 = 去混淆**：`DSV41_GEMV_FP8_WARPS` 只喂小 n 臂（n<2048），拿它扫大 n 根本扫不动；而
+     `DSV41_GEMV_WARPS_ADAPTIVE=0` 会把**两个臂一起**塌到 `g_gemv_warps`，小 shape 跟着变 ⇒ 要么扫不到、
+     要么混淆。新变量是**大 n 臂唯一读取源**，serve 可固定小 shape、单独扫 4..32。
+     ⚠️ 自适应门仍然守在前：`DSV41_GEMV_WARPS_ADAPTIVE=0` 时大 n shape 回退 `g_gemv_warps`，
+     `DSV41_GEMV_WARPS_BIG` **失效**（那是回退路径，不是 A/B 臂）。未设 env 时逐字节等价旧行为。
+     ⚠️ warps 越大 gsmem 越大（mode4：`warps*(k+nb_k_al) + …`；k=5120 时 warps=8→64512B、
+     32→191232B，仍低于 232448 天花板且 32 warps=1024 线程=块上限），但 **k 更大 + warps=32** 有撞
+     `dsv41_smem_ceiling` 的风险——越界值 launcher 返回非 0，调用方需确认有 fallback。
    - **覆盖面 = 4 个原本选 `g_gemv_warps` 的 launcher**：`dsv41_gemm_fp8_mx` /
      `_mx_add` / `_mx_f32` / `_mx2`（mx2 用 **n1+n2 总行数**，两族共享同一 block grid）。
      B1（`xq != nullptr`）仍在其后**强制 32**，不受影响。

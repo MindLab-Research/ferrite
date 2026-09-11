@@ -2673,10 +2673,30 @@ static const bool g_gemv_warps_adaptive = [] {
 }();
 // The large-n arm. Kept as named constants rather than literals so the crossover
 // is auditable (and tweakable) in one place.
-static const int kGemvWarpsBigN = 2048;   // n at/above which 8 rows/block wins
-static const int kGemvWarpsBig = 8;       // rows/block once n is large
+static const int kGemvWarpsBigN = 2048;   // n at/above which the large-n arm applies
+// P2b (gemm-warps-sweep, 2026-09-12): the large-n rows/block is its OWN knob.
+//
+// DSV41_GEMV_FP8_WARPS only feeds the small-n arm (n < 2048), so sweeping it can
+// never move the large shapes; driving the large-n arm through it (or through
+// DSV41_GEMV_WARPS_ADAPTIVE=0, which collapses BOTH arms onto g_gemv_warps) would
+// confound the A/B by also moving wq_a/wkv/sh_w13. This variable is therefore the
+// only thing the large-n arm reads: serve can scan 4..32 while the small shapes
+// stay pinned at g_gemv_warps.
+//
+// Default 8 == the constant this replaces, so an unset env is byte-identical to
+// the previous behaviour. Valid 4..32; a missing / unparsable / out-of-range
+// value falls back to 8. The adaptive gate still guards the arm: with
+// DSV41_GEMV_WARPS_ADAPTIVE=0 the large-n shapes revert to g_gemv_warps and this
+// variable is inert (that is the rollback path, not an A/B arm).
+// Read once (static): these launchers run a few hundred times per step.
+static const int g_gemv_warps_big = [] {
+    const char* e = getenv("DSV41_GEMV_WARPS_BIG");
+    if (e == nullptr) return 8;
+    const int v = atoi(e);
+    return (v >= 4 && v <= 32) ? v : 8;
+}();
 static inline int dsv41_gemv_warps_for(int n) {
-    if (g_gemv_warps_adaptive && n >= kGemvWarpsBigN) return kGemvWarpsBig;
+    if (g_gemv_warps_adaptive && n >= kGemvWarpsBigN) return g_gemv_warps_big;
     return g_gemv_warps;
 }
 
