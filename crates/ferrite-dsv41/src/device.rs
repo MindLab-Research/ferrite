@@ -114,15 +114,6 @@ struct Kernels {
     gemv_bf16: Option<unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     gemv_f32: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     argmax: Option<unsafe extern "C" fn(*const f32, *mut c_int, c_int, *mut c_int, CuStream) -> c_int>,
-    ar_v5_store: Option<
-        unsafe extern "C" fn(*const u64, c_int, c_int, *const f32, i64, i64, *const c_uint, CuStream) -> c_int,
-    >,
-    ar_v5_publish: Option<
-        unsafe extern "C" fn(*const u64, *const c_uint, c_int, c_int, *const c_uint, CuStream) -> c_int,
-    >,
-    ar_v5_reduce: Option<
-        unsafe extern "C" fn(*mut f32, *const f32, i64, i64, c_int, *mut c_uint, *mut c_uint, CuStream) -> c_int,
-    >,
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
@@ -212,6 +203,26 @@ struct Kernels {
     ) -> c_int,
     f32_to_bf16: unsafe extern "C" fn(*const f32, *mut c_void, c_long, CuStream) -> c_int,
     bf16_to_f32: unsafe extern "C" fn(*const c_void, *mut c_void, c_long, CuStream) -> c_int,
+    /// The SHARED all-reduce v5 entry (ferrite_kernels.cu) — one protocol for
+    /// both models. DSV41's staging already IS the shared layout (parity
+    /// halves `[2][world][stride]`, a `[world]` ready row, a device epoch),
+    /// so this is a straight symbol reuse with its own tables passed in.
+    p2p_ar_v5: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
 }
 
 // ------------------------------------------------------------------- Device
@@ -259,9 +270,6 @@ impl Device {
             gemv_bf16: ko!(rt, "dsv41_gemv_bf16"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             argmax: ko!(rt, "dsv41_argmax"),
-            ar_v5_store: ko!(rt, "dsv41_ar_v5_store"),
-            ar_v5_publish: ko!(rt, "dsv41_ar_v5_publish"),
-            ar_v5_reduce: ko!(rt, "dsv41_ar_v5_reduce"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
             comp_placeholder: ko!(rt, "dsv41_comp_placeholder"),
@@ -284,6 +292,7 @@ impl Device {
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
+            p2p_ar_v5: ko!(rt, "ferrite_p2p_ar_v5"),
         };
         Ok(Device { rt, kernels, stream })
     }
@@ -1062,53 +1071,35 @@ impl Device {
         self.kerr(rc, "dsv41_engram_hash_step")
     }
 
-    /// AR v5 (graph-capturable): store(e) - write my buffer to every peer's
-    /// staging half e&1. The epoch is read from DEVICE memory at runtime.
-    pub fn ar_v5_store(
+    /// The SHARED all-reduce v5 entry (`ferrite_p2p_ar_v5`, ferrite_kernels.cu):
+    /// one call = store + publish/fused-reduce. DSV41 passes exactly the shapes
+    /// GLM does — pointer tables of the peers' staging bases (`staging_tbl`) and
+    /// ready rows (`ready_tbl`), this rank's own `staging_local` base and
+    /// `ready_local` row, and a DEVICE `epoch` the kernels read at runtime (which
+    /// is what makes a captured graph replay). `stride` is the per-slot element
+    /// count; `out` may alias `partial` (the store kernel has fully consumed it
+    /// at the kernel boundary).
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_v5(
         &self,
-        peer_slots: *const u64,
-        world: c_int,
-        rank: c_int,
-        src: *const f32,
-        n: i64,
-        slot_f: i64,
-        epoch: *const c_uint,
-    ) -> Result<()> {
-        let f = self.need(self.kernels.ar_v5_store, "dsv41_ar_v5_store")?;
-        let rc = unsafe { f(peer_slots, world, rank, src, n, slot_f, epoch, self.stream) };
-        self.kerr(rc, "dsv41_ar_v5_store")
-    }
-
-    /// AR v5: publish(e) - stamp e+1 to every peer (system scope), then poll my
-    /// own stamps until every peer has published; replaces the host barrier.
-    pub fn ar_v5_publish(
-        &self,
-        peer_stamps: *const u64,
-        stamps: *const c_uint,
-        world: c_int,
-        rank: c_int,
-        epoch: *const c_uint,
-    ) -> Result<()> {
-        let f = self.need(self.kernels.ar_v5_publish, "dsv41_ar_v5_publish")?;
-        let rc = unsafe { f(peer_stamps, stamps, world, rank, epoch, self.stream) };
-        self.kerr(rc, "dsv41_ar_v5_publish")
-    }
-
-    /// AR v5: reduce(e) - sum the peers' staging half e&1 straight into the
-    /// caller's buffer; the last block advances the device epoch.
-    pub fn ar_v5_reduce(
-        &self,
-        dst: *mut f32,
-        staging: *const f32,
-        n: i64,
-        slot_f: i64,
-        world: c_int,
+        partial: *const f32,
+        staging_tbl: *const *mut f32,
+        ready_tbl: *const *mut u32,
         epoch: *mut c_uint,
-        ctr: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
     ) -> Result<()> {
-        let f = self.need(self.kernels.ar_v5_reduce, "dsv41_ar_v5_reduce")?;
-        let rc = unsafe { f(dst, staging, n, slot_f, world, epoch, ctr, self.stream) };
-        self.kerr(rc, "dsv41_ar_v5_reduce")
+        let f = self.need(self.kernels.p2p_ar_v5, "ferrite_p2p_ar_v5")?;
+        let rc = unsafe {
+            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n, world,
+              my_rank, stride, self.stream)
+        };
+        self.kerr(rc, "ferrite_p2p_ar_v5")
     }
 
     /// Stable argmax (ties -> lowest index); writes the winning index as i32 and

@@ -63,7 +63,7 @@ impl SpinBarrier {
     }
 }
 
-use std::ffi::c_uint;
+use std::ffi::{c_int, c_uint};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtOrd};
 
 use ferrite_types::{FerriteError, Result};
@@ -268,41 +268,35 @@ impl Collective {
     /// sum over ranks, written back to `dst` (which may be the same address as
     /// `src`).
     pub fn all_reduce_inplace(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
-        // AR v5: fully device-side (store -> publish -> reduce), NO host barrier,
+        // AR v5: fully device-side (store -> publish/reduce), NO host barrier,
         // NO copy-back, and the epoch lives in device memory so a captured graph
         // replays correctly. The protection is the publish chain, not a credit.
+        // ONE protocol, ONE kernel set: this now calls the SHARED
+        // ferrite_p2p_ar_v5 (ferrite_kernels.cu). DSV41's staging is already the
+        // shared layout — parity halves [2][world][bytes] at offset 0, the
+        // [world] ready row at `stamps_at`, the device epoch at `ctr_at` — and
+        // its `peer_slots` / `peer_stamps` u64 tables are bit-compatible with the
+        // shared float*/u32* pointer tables (both are 8-byte device addresses),
+        // so no buffer change and no kernel parameterization were needed.
         if ar_v5() {
-            let n = (len / 4) as i64;
-            let slot_f = (self.bytes / 4) as i64;
+            let n = (len / 4) as c_int;
+            let stride = (self.bytes / 4) as c_int;
             let base8 = self.staging.ptr as *const u8;
-            let epoch_r = base8.wrapping_add(self.ctr_at) as *const c_uint;
-            let epoch_w = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
-            let ctr2 = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at + 4) as *mut c_uint;
-            let stamps = base8.wrapping_add(self.stamps_at) as *const c_uint;
-            self.dev.ar_v5_store(
-                self.peer_slots.ptr as *const u64,
-                self.world as i32,
-                self.rank as i32,
+            let staging_local = self.staging.ptr as *const f32;
+            let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+            let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+            self.dev.p2p_ar_v5(
                 buf as *const f32,
-                n,
-                slot_f,
-                epoch_r,
-            )?;
-            self.dev.ar_v5_publish(
-                self.peer_stamps.ptr as *const u64,
-                stamps,
-                self.world as i32,
-                self.rank as i32,
-                epoch_r,
-            )?;
-            self.dev.ar_v5_reduce(
+                self.peer_slots.ptr as *const *mut f32,
+                self.peer_stamps.ptr as *const *mut u32,
+                epoch,
+                staging_local,
+                ready_local,
                 buf as *mut f32,
-                self.staging.ptr as *const f32,
                 n,
-                slot_f,
-                self.world as i32,
-                epoch_w,
-                ctr2,
+                self.world as c_int,
+                self.rank as c_int,
+                stride,
             )?;
             return Ok(());
         }

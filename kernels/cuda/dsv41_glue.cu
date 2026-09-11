@@ -242,79 +242,10 @@ __global__ void ar_stamp_kernel(const unsigned long long* __restrict__ peer_stam
     }
 }
 
-// ==== AR v5: the fully device-side, graph-capturable all-reduce ====
-// (the GLM AR-v5 protocol, ported). The round counter ("epoch") lives in DEVICE
-// memory and is read at RUNTIME by every kernel, so a captured graph replays
-// correctly: each replay performs exactly one round and advances the epoch once,
-// on the device. Sequence per round e: store(e) -> publish(e) -> reduce(e).
-//
-// Why there is NO credit wait (the old design spun on `reduced[p] >= round-2`):
-// publish(k) polls every peer's stamp >= k+1, which implies that peer's store(k)
-// completed; and this rank's store(k+2) is preceded (same stream) by its
-// publish(k+1), which implies every peer completed store(k+1) and hence - by
-// stream order on the peer - reduce(k), the last reader of the parity half that
-// store(k+2) is about to overwrite. The publish chain replaces the credit.
-__global__ void ar_v5_store_kernel(const unsigned long long* __restrict__ peer_slots,
-                                   int world, int rank, const float* __restrict__ src, long n,
-                                   long slot_f, const unsigned* __restrict__ epoch) {
-    const unsigned e = *epoch;  // runtime read: this is what makes graphs replay
-    const long parity = (long)(e & 1u) * world * slot_f;
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        const float v = src[i];
-        for (int p = 0; p < world; ++p) {
-            float* dst = (float*)(peer_slots[p]) + parity + (long)rank * slot_f + i;
-            dst[0] = v;
-        }
-    }
-}
-
-__global__ void ar_v5_publish_kernel(const unsigned long long* __restrict__ peer_stamps,
-                                     const unsigned* __restrict__ stamps, int world, int rank,
-                                     const unsigned* __restrict__ epoch) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    const unsigned e = *epoch;
-    __threadfence_system();
-    for (int p = 0; p < world; ++p) {
-        unsigned* d = (unsigned*)(peer_stamps[p] + (size_t)rank * sizeof(unsigned));
-        *d = e + 1u;
-    }
-    __threadfence_system();
-    // poll MY stamps (each slot written by that peer's publish): once all reach
-    // e+1, every peer's store(e) has completed and the reduce may read safely
-    for (int p = 0; p < world; ++p) {
-        const volatile unsigned* m = stamps + p;
-        while (*m < e + 1u) {
-        }
-    }
-}
-
-__global__ void ar_v5_reduce_kernel(float* __restrict__ dst, const float* __restrict__ staging,
-                                    long n, long slot_f, int world,
-                                    unsigned* __restrict__ epoch,
-                                    unsigned* __restrict__ ctr) {
-    const unsigned e = *epoch;
-    const long parity = (long)(e & 1u) * world * slot_f;
-    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        float acc = 0.f;
-        for (int p = 0; p < world; ++p) acc += staging[parity + (long)p * slot_f + i];
-        dst[i] = acc;  // straight into the caller's buffer: no copy-back pass
-    }
-    // the LAST block advances the epoch: exactly one increment per round, on the
-    // device. ctr is reset here, so it is zero at the start of every round.
-    __threadfence();
-    __shared__ bool is_last;
-    if (threadIdx.x == 0) {
-        const unsigned prev = atomicAdd(ctr, 1u);
-        is_last = (prev == gridDim.x - 1);
-    }
-    __syncthreads();
-    if (is_last && threadIdx.x == 0) {
-        *epoch = e + 1u;
-        *ctr = 0u;
-    }
-}
+// AR v5 lives in the SHARED kernel set now: DSV41 calls ferrite_p2p_ar_v5
+// (ferrite_kernels.cu) with its own staging tables. The three DSV41-specific
+// kernels (ar_v5_store/publish/reduce) and their extern "C" launchers were
+// deleted — one protocol, one implementation.
 
 // ===========================================================================
 // Lean M=1 GEMV (single-token projections)
@@ -675,35 +606,9 @@ extern "C" int dsv41_ring_append(float* ring, const float* kv, const int* pos_ct
     return (int)cudaGetLastError();
 }
 
-// ---- AR v5 launchers (outside the anonymous namespace: extern "C" entries
-// must have external linkage or dlsym cannot find them - the same trap the
-// gemv entry points hit earlier) ----
-extern "C" int dsv41_ar_v5_store(const unsigned long long* peer_slots, int world, int rank,
-                                 const float* src, long n, long slot_f, const unsigned* epoch,
-                                 cudaStream_t s) {
-    if (n <= 0 || world <= 0) return (int)cudaSuccess;
-    unsigned blocks = (unsigned)((n + 255) / 256);
-    if (blocks > 512) blocks = 512;
-    ar_v5_store_kernel<<<blocks, 256, 0, s>>>(peer_slots, world, rank, src, n, slot_f, epoch);
-    return (int)cudaGetLastError();
-}
-
-extern "C" int dsv41_ar_v5_publish(const unsigned long long* peer_stamps, const unsigned* stamps,
-                                   int world, int rank, const unsigned* epoch, cudaStream_t s) {
-    if (world <= 0) return (int)cudaSuccess;
-    ar_v5_publish_kernel<<<1, 32, 0, s>>>(peer_stamps, stamps, world, rank, epoch);
-    return (int)cudaGetLastError();
-}
-
-extern "C" int dsv41_ar_v5_reduce(float* dst, const float* staging, long n, long slot_f, int world,
-                                  unsigned* epoch, unsigned* ctr, cudaStream_t s) {
-    if (n <= 0 || world <= 0) return (int)cudaSuccess;
-    unsigned blocks = (unsigned)((n + 255) / 256);
-    if (blocks > 512) blocks = 512;
-    ar_v5_reduce_kernel<<<blocks, 256, 0, s>>>(dst, staging, n, slot_f, world, epoch, ctr);
-    return (int)cudaGetLastError();
-}
-
+// AR v5 launchers removed: DSV41 now calls the shared ferrite_p2p_ar_v5
+// (ferrite_kernels.cu). The three DSV41 entry points (dsv41_ar_v5_store /
+// _publish / _reduce) and their kernels lived here.
 
 // ============================================================================
 // extern "C" entry points -- the ABI in crates/ferrite-dsv41/src/kernels.rs

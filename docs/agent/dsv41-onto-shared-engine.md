@@ -11,7 +11,7 @@
 | 算子 | `kernels/cuda/ferrite_kernels.cu` | `kernels/cuda/dsv41_*.cu` | **保留两套** ✓（模型 ops 不同，用户认可）|
 | HTTP/serve | `ferrite-http` | 已并入 `ferrite-http` ✓（本会话完成）| ✓ 已收敛 |
 | Device/FFI/流/分配/图捕获 | `ferrite-kernel/src/cuda.rs`（已有 `cuStreamBeginCapture` 等全套）| `ferrite-dsv41/src/device.rs` **又写了一套** ✗ | 换共享 ✗ |
-| 集合通信 AR | `ferrite_p2p_ar_v5`（ferrite_kernels.cu）| `dsv41_ar_v5_*`（dsv41_glue.cu）**协议同源、实现两遍** ✗ | 换共享 + 参数化 staging ✗ |
+| 集合通信 AR | `ferrite_p2p_ar_v5`（ferrite_kernels.cu）| `dsv41_ar_v5_*`（dsv41_glue.cu）**协议同源、实现两遍** ✗ | **已换共享 ✓**（Phase 2：DSV41 调共享 entry，删自家三 kernel；`ferrite_kernels.cu` **零改动** ✓）|
 | engine 契约 | `ferrite-exec`（tp.rs 的 mega-graph 链、StepEngine）| `dsv41-run.rs` 里的 `TpRankPool` 自己实现 StepEngine ✓ | 保留形状、挪进共享 |
 | 模型定义 | 散布在 `ferrite-exec` | `dsv41/src/{config,load,chain_dev,weights,engram,quant}.rs` | 移入 `ferrite-models/src/dsv41/` |
 
@@ -70,7 +70,7 @@ kernels/cuda/              两套 .cu（各自 host wrapper 同目录）
 | 模块（`dsv41/src`） | 行数 | 归属 | 依据 / 缺什么 |
 |---|---|---|---|
 | `device.rs` | 2037 → **1416** | **共享化 ✓（本阶段完成）** | 通用设备操作已转发到共享 `ferrite-kernel::devrt`；只留 `Kernels` 表 + 52 个 kernel 启动封装 |
-| `tp.rs` | 506 | **共享化（Phase 2）** | `SpinBarrier`/`Collective` 换共享 AR；共享侧缺：**参数化 staging 布局**（world/slot 字节）+ `out != partial` 直写（GLM 已有 `out` 参数 ✓）；kernel 只留一份 `ferrite_p2p_ar_v5` |
+| `tp.rs` | 506 | **共享化 ✓（Phase 2 完成）** | `Collective::all_reduce_inplace` 调共享 `ferrite_p2p_ar_v5`；DSV41 staging 本已是共享布局 ⇒ **零参数化**；kernel 只留一份 ✓ |
 | `chain_dev.rs` | 1819 | **拆分** | 设备编排设备态（位置计数器/图分支/premix D2D → 共享）+ **层链逻辑** ✓（→ 模型）|
 | `kernels.rs` | 434 | **模型保留** | DSV4 kernel ABI 声明（随模型走）|
 | `chain.rs` / `ops.rs` | 684 / 1060 | **模型保留** | 模型层链 / CPU golden 基准 |
@@ -86,7 +86,7 @@ kernels/cuda/              两套 .cu（各自 host wrapper 同目录）
 | 显式 CUDA-graph 捕获/实例化/回放的**原语**（返回裸句柄、可指定捕获模式）| **已补** → `devrt` ✓（默认 **Relaxed(2)**，见 Phase 3 差异）|
 | 通用 kernel 符号解析（在已加载 `.so` 上 `dlsym` 任意名字）| **已补** → `kernel_sym` / `kernel_sym_opt` ✓ |
 | 通用 cuBLAS f32/bf16 GEMM（裸指针，不涉及 Tensor）| **已补** → `gemm_f32` / `gemm_bf16` ✓ |
-| AR v5 的**多形态参数化**（staging 表形态、slot/stride、epoch 位置、`out` 直写）| **待补（Phase 2）** |
+| AR v5 的**多形态参数化**（staging 表形态、slot/stride、epoch 位置、`out` 直写）| **已解 ✓**（Phase 2：四个 gap **全在 DSV41 侧**收敛 ⇒ 共享 entry **零参数化**、`ferrite_kernels.cu` **零改动**）|
 | engine 契约（`StepEngine`/批命令/look-ahead）的统一入口 | **待补（Phase 5）** |
 | `cuda::CudaBackend`（GLM）与 `devrt` 两个设备层**收敛成一个** | **待办（Phase 4）** |
 
@@ -178,6 +178,42 @@ epoch 放在 staging 尾部（`ctr_at` ✓），reduce 直写调用方缓冲 ✓
 - **AR 的 publish 会自旋** ⇒ 剖析时必须用 NCCL 模式（去掉 P2P/AR v5 的 env ✓）。
 - **图捕获期**：epoch 由 **reduce 的最后一块**推进 ✓ ⇒ 只被 replay 推进 ✓（不能有 dry-run 参与 ✓）。
 - **测试旋钮必须 static 缓存** ✗（每次 AR 调用都 `getenv` 是热路径罪 ✓）。
+
+## Phase 2 执行结果（AR 换共享，已完成 ✓）
+
+**方向**：DSV41 采用共享布局、调共享 `ferrite_p2p_ar_v5`（PREFERRED），**`ferrite_kernels.cu` 零改动** ✓
+（GLM 路径因此天然逐位不变 ✓ —— 没有新增参数，也没有动 GLM 的调用点/launcher 签名）。
+
+**为什么零参数化就能通**：DSV41 的 staging 本就已经是共享布局 ✓ ——
+`[2][world][bytes]` 奇偶半区在偏移 0、`[world]` ready 行在 `stamps_at`、设备 epoch 在 `ctr_at`；
+共享 entry 收的就是 `staging_local`（本 rank 半区基址）+ `ready_local`（本 rank 行）
++ 两个指针表（对端 staging 基址 / 对端 ready 行基址）+ 一个**设备** epoch。⇒ 四个 gap 全在 **DSV41 侧**闭合：
+
+| 签名的 gap | 处置方向 | 怎么合的 |
+|---|---|---|
+| staging 表形态（GLM `float*[]` vs DSV41 `u64[]`）| **DSV41 侧** ✓ | 64 位下二者都是「8 字节设备地址」，DSV41 直接把 `peer_slots`/`peer_stamps` 以 `*const *mut f32` / `*const *mut u32` 传入（`tp.rs:290-291`）|
+| slot·stride | **DSV41 侧** ✓ | DSV41 的 `bytes/4`（每槽 f32 数）就是共享的 `stride`；奇偶偏移公式两者一致（`((e&1)*world + rank)*stride`）|
+| epoch 位置 | **DSV41 侧** ✓ | DSV41 把 `staging + ctr_at` 当共享的 `epoch` 入参（`tp.rs:287`）；仍在**设备内存**、内核运行时读 ⇒ 图可回放 ✓ |
+| `out` 直写 | **已存在** ✓ | GLM 的 v5 本就有 `out` 参数；DSV41 传 `out = partial = buf`（内核边界保证 store 已读完 partial）|
+
+**改动**（file-by-file）：
+- `crates/ferrite-dsv41/src/tp.rs`：`all_reduce_inplace` 的 ar_v5 分支由「三次发射（store/publish/reduce）」改为**一次** `self.dev.p2p_ar_v5(...)`；`use std::ffi::{c_int, c_uint}`。
+- `crates/ferrite-dsv41/src/device.rs`：`Kernels` 增 `p2p_ar_v5`（`ko!(rt, "ferrite_p2p_ar_v5")`，GLM 复用区）；新增转发方法 `Device::p2p_ar_v5`；**删除** `ar_v5_store/ar_v5_publish/ar_v5_reduce` 三个字段、解析与 wrapper。
+- `kernels/cuda/dsv41_glue.cu`：**删除** `ar_v5_store_kernel`/`ar_v5_publish_kernel`/`ar_v5_reduce_kernel` 与 `dsv41_ar_v5_{store,publish,reduce}` 三个 extern "C" launcher。
+- `crates/ferrite-dsv41/src/kernels.rs`：**无改动**（AR launcher 的 ABI 原本就内联在 `device.rs` 的 fn 指针类型里，不在 kernels.rs）。
+
+**保留的语义**（未变 ✓）：`DSV41_AR_V5=0` → 仍旧走 `all_reduce_inplace_inner` 的 host-barrier（`end_round` 的 `SpinBarrier`）；
+epoch 仍在设备内存（图可回放）；归约仍按 **rank 升序**（逐位一致）。
+
+**⚠ 关键差异（换共享后引入，需 GPU 复验）**：共享 `p2p_ar_store_v5_kernel` 用 **float4** 写 staging
+（`reinterpret_cast<float4*>`）⇒ 要求 `stride % 4 == 0` **且** `partial`/`out` 16 字节对齐；DSV41 旧 kernel 是
+标量、无此约束。DSV41 的 `bytes` 均为 `hc_dim*4` / `vocab*4` / `n*4`（16 的倍数），理论满足，但**必须** e2e 复验。
+另：共享 pubred 由 **block 0** 推进 epoch（DSV41 旧实现由 reduce 最后一块推进）——同为「每次调用恰好 +1、设备侧」✓。
+
+**验证状态**：`cargo check --workspace` **0 error** ✓；`ar_micro` **编译通过** ✓（`cargo test --no-run`）。
+⚠ **本机无 GPU、无 nvcc** ⇒ `ar_micro` **未实跑**、`.cu` **未重编**：需在远端 `bash kernels/cuda/build.sh 103a`
+重编 `.so`（改了 `dsv41_glue.cu` ⇒ BUILD_ID/CU_HASH 变化，Rust 侧会拒绝加载旧 `.so`），再跑
+`DSV41_KERNELS=... cargo test --release -p ferrite-dsv41 --test ar_micro -- --nocapture`。
 
 ## Phase 3 的精确输入（图原语合并，已读双方 ✓）
 

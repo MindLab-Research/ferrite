@@ -2934,8 +2934,8 @@ self.dev.memcpy_d2d(ring + slot*fb(hd), self.s.kv, fb(hd));   // ← 目的地�
 
 **新增**（GLM 口径 ✓，打在 **rank 线程** ⇒ 纯 decode 时间，无 HTTP/SSE/driver 开销 ✓）：
 ```
-[dsv41] decode: 32 steps in 0.70s = 46.0 steps/s (21.76 ms/step)    ← 短上下文
-[dsv41] decode: 32 steps in 1.42s = 22.6 steps/s (44.23 ms/step)    ← 长上下文（DSA decay 1.39x 一致）
+[dsv41] decode: 32 steps in 0.70s = 46.0 steps/s (21.76 ms/step)    ← ⚠️ 作废（bug#1：÷2 低报）
+[dsv41] decode: 32 steps in 1.42s = 22.6 steps/s (44.23 ms/step)    ← ⚠️ 作废（bug#2：掺入下请求间隙）
 ```
 `DSV41_TIMING=0` 可关。**lookahead 批命令**（一次命令跑 16 步 ✓）也已验证：四段 + 整首《静夜思》+ 长篇
 散文全对 ✓、**0 fault** ✓。
@@ -3101,3 +3101,28 @@ host barrier: the publish chain already guarantees…"）⇒ **图路径下 AR �
   **不能**拿单个 `.cu` 的 sha 去比对 `.so` 里的 build_id ✗（我就这么错比过一次 ✗）。
 - 远端 `.so` 的 id 带有 `-dirty` ✓ ⇒ 判断"是否同源"要用 **`git show <rev>:…` 重建对照** ✓，
   而不是猜 ✓。
+
+## 2026-09-11 计时修正（用户两次命中）：所有历史"步时"读数作废，真实基线 36.7 ms/step = 27.3 tok/s
+
+用户两次质疑测量（"没道理 1000 token 内前 20ms 后 40ms" / "你是总时间除以 step 数吗？怎么能这样计时"）——
+读 `dsv41-run.rs` 的计时代码证实了**两个 bug**，段平均把它们整整藏了一个会话：
+
+1. **÷2 低报**：`dec_t0` 在第一个 DecodeRun 批（LOOKAHEAD=16）**跑完之后**才起点，但该批 16 步照数
+   ⇒ 每个请求的第一条 "32 steps in Xs" 实际只计了**后 16 步**的墙钟 ÷ 32 ⇒ 每步低报整整 2 倍。
+2. **尾段掺假**：尾段计时终点是**下一请求的 Prefill 到达** ⇒ curl/HTTP/接纳的间隙被摊进尾段步数。
+
+两条线互洽（"32 步 0.59s" = 真实 16 步 ⇒ 36.9ms/步；"尾部 16 步 0.61s" = 16×36.9ms + ~20ms 间隙 ✓）。
+
+**修法（6193f60）**：删掉段累计（−60 行），端口 GLM 房式（`ferrite-exec/tp.rs` 的 `[megab] replay`
+同款语义）：每步一个 Instant，逐步直打 `[dsv41] step pos=N: X.XXms`。`DSV41_TIMING=0` 关闭。
+
+**修正后的真实基线（单并发 · 无 MTP · 48-token 输出 · 341 步实测）**：
+| 版本 | 真实步时 | 吞吐 |
+|---|---|---|
+| hc_mixes float4 之前 | ~44.4 ms/step | ~22.5 tok/s |
+| hc_mixes float4 之后 | **p50 36.66 / p90 37.35 ms/step** | **27.3 tok/s** |
+
+逐步分布极紧（min 35.67 / max 64.88），**位置无关**（pos<40 → 36.34ms；pos≥40 → 37.21ms，+2.4%）——
+旧的"短/长上下文两分法"完全是测量假象，DSA decay 在这个长度下根本不可测。
+**教训**：段平均会藏住计时边界的 bug；每步直打（GLM 房式）是唯一可信口径。本文件所有早于
+本节的 ms/step 数字一律按 ×2（"短"读数）或含间隙（"尾部"读数）折算理解。
