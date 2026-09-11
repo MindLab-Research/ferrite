@@ -2585,3 +2585,28 @@ knob 用 static 缓存 ✓）。每 warp 独占 slot 子集（`t = wid, wid+nwar
 **会话累计：2.6 → 21.1 tok/s（8.1x）**，六项 kernel 级收益 ✓。
 **⚠ 过程坑（已入档）**：第一次验证的数字与旧版**两位小数都相同** ⇒ 是我**没 commit/push**，
 远端跑的旧 `.so` ✗。**判据：不同 kernel 的数字完全相同 = 构建没变，先查 git 状态** ✓。
+
+## 审计（用户指令：无 H2D / tile 对齐 / 单图）—— 发现比预期更严重的问题
+
+**① 每步 H2D（4 处）+ 一个巨大的 D2H**：
+| # | 位置 | 内容 | 频率 |
+|---|---|---|---|
+| 1 | `step()` 开头 `upload_f32_at(s.ids, [token])` | token id（4B）| 每步 |
+| 2 | `upload_pre(&premix)`（[1,0,0,0] **常量**）| 16B → pre_a | 每步 |
+| 3 | **`upload_bytes_at(s.eng_ids, …)`** | host 侧 n-gram 哈希结果（`ng.forward_row` 在 **host** 算 ✗）| 每步 |
+| 4 | 末尾 `upload_pre(&premix)`（同一常量）| 16B | 每步 |
+| ⚠ | **`download_f32(&s.logits, &mut out)`** | **全词表 129280×4B ≈ 517KB D2H 每步** ✗✗ + host 线性 argmax + `dev.sync()` 强制全同步 | 每步 |
+
+**② 单图阻塞点**：AR 的主机 barrier（`all_reduce_inplace`→`end_round`→`barrier.wait()`）为主要阻塞 ✓；
+其余为上述 H2D/D2H/host-argmax/host-engram ✗。
+
+**③ tile 对齐**：mxf4 的 K 加载时已补齐 64 倍数（288→320 ✓）；d=512、dim/hc_dim=4096 ✓；
+GEMV 的 n_total/k 均 2 的幂 ✓ —— **基本无问题** ✓。
+
+### 实施计划（GLM 方法，按价值排序）
+1. **设备侧 argmax + token 留设备**（GLM 的 HEAD_DEV ✓）：argmax kernel 把 token 写进 `s.ids`，
+   嵌入直读 ⇒ 消 **517KB D2H + 4B H2D + O(vocab) host 扫描 + 强制 sync**；host 只下载 4B 做 EOS/打印。
+   prefill 期 token 来自 prompt（H2D 仅 prefill，非热路径 ✓）。
+2. **premix 常量设备化**：初始化上传一次到专用 buffer，每步 D2D 拷 16B（图可捕获 ✓）。
+3. **engram 哈希设备化**（较大工程，host `forward_row` → kernel）。
+4. **设备侧 AR**（修 DSV41_AR_DEV 的"reduce 写回"）→ 之后整步单图。
