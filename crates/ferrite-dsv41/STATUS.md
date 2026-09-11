@@ -6739,3 +6739,30 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 **当前最优配置**：a32 ON + PDL OFF + K-split ON + 全部融合/侧流/AR 优化
 
 **距离 200 tok/s（5.0ms）还差 1.57ms**——gemm 3.02ms 仍是最大项（44%）。
+
+### nsys v7 精确分解 + K-split 翻 ON（2026-09-12 00:15）
+
+**nsys v7（6.90ms 基线，NCCL 模式）的 top-10**：
+| kernel | 次/步 | µs/次 | ms/步 | % |
+|---|---|---|---|---|
+| gemm_fp8_gemv (struct pack) | 246 | 12.3 | 3.02 | 30.3% |
+| interleave_gateup_fp4 (NEW!) | ~15744 | 2.2 | 2.91 | 22.2% |
+| hc_mixes_tail (side stream) | 160 | 7.1 | 1.13 | 11.4% |
+| expert_gemv_fp4_batched | 40 | 24.6 | 0.98 | 9.9% |
+| expert_gemv_fp4_down_reduce | 40 | 23.8 | 0.95 | 9.5% |
+| AR (reduce+store+stamp) | 246 | — | 1.45 | 14.6% |
+| hc_mix_dots (side stream) | 80 | 7.1 | 0.57 | 5.7% |
+
+**新发现**：
+1. **interleave_gateup_fp4 = 2.91ms（22.2%）**——nsys v5 完全没有这个 kernel，是本会话新引入的最大成本
+2. **down_reduce 回归 +38%**（17.2→23.8µs）——可能是 ILV/launch_bounds 的间接影响
+3. **lm_head 325µs 是 nsys artifact**（profile 脚本 pin 了 AR_V5=0 导致切片禁用；生产 ~40µs）
+4. **侧流 gap 的根因**：图节点/跨流边开销 0.3-0.5ms（非串行 bug）——所有 record/wait 都正确
+
+**K-split ON 后的预期**：gateup 0.98→~0.79ms → 总计 ~6.57ms
+**gap 到 200 tok/s（5.0ms）：1.57ms**
+
+**下一步目标**：
+1. interleave_gateup_fp4 2.91ms 的身份调查（subagent 进行中）
+2. gemm 3.02ms 的进一步优化（subagent 进行中）
+3. down_reduce +38% 回归的根因（subagent 进行中）
