@@ -5369,3 +5369,14 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 - **AR store 融合**（ar-fuse 补丁已产出，80 节点/步）
 - **跨层流水**（cross-layer-pipe：AR poll 窗口藏 hc mixes 的 ⟨B⟩ 半）
 - **swiglu+quant 融合**（T1 同款）
+
+### ✅ 第 16 轮：L2+L3 脚手架（10.16ms / 98.4 tok/s）
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| l23（默认 + L2L3 脚手架） | **10.16ms** | **98.4** | 四段全对 | 0 |
+
+脚手架 = `idx_fused` 标志位（当前 false，真正的 lin2 接线待 subagent 补丁到达后开启）。
+本轮的 −0.11ms 可能是噪声，也可能是代码重组的副效应。真正收益待接线后量化。
+
+**会话累计：13.28 → 10.16ms（+30.7%），75.3 → 98.4 tok/s。**
