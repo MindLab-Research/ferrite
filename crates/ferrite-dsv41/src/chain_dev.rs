@@ -1203,10 +1203,15 @@ impl<'a> DevChain<'a> {
         let cache = &self.layers[owner];
         let owns_kv = owner == layer;
         if owns_kv {
-            self.dev.memcpy_d2d(
-                (cache.ring.ptr as *mut u8).wrapping_add(slot * fb(hd)) as *mut c_void,
-                self.s.kv.ptr as *const c_void,
-                fb(hd),
+            // DEVICE-side slot: a host-computed destination address would be frozen
+            // by the graph capture (slot = pos % win at capture time), so every
+            // replay wrote the same ring row and the window went stale.
+            self.dev.ring_append(
+                cache.ring.ptr as *mut f32,
+                self.s.kv.ptr as *const f32,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                win as i32,
+                hd as i32,
             )?;
         }
 

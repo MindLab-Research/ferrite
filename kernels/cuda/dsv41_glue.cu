@@ -629,6 +629,28 @@ extern "C" int dsv41_compress_commit(const float* latent, const float* cos_t, co
     return (int)cudaGetLastError();
 }
 
+// Append this step's KV row into the window ring. The destination USED to be a
+// host-computed address (slot = pos % window) baked into a captured cudaMemcpy
+// node, so every replay of the graph wrote to the SAME slot - the classic
+// "captured but not updated" bug, and exactly the cumulative degradation
+// observed: the first tokens are right because they read the prefill's
+// correctly written rows, and everything after the capture goes stale. The slot
+// is derived from the DEVICE position counter inside the kernel now.
+__global__ void ring_append_kernel(float* __restrict__ ring, const float* __restrict__ kv,
+                                  const int* __restrict__ pos_ctr, int window, int hd) {
+    const int slot = (*pos_ctr) % window;
+    float* dst = ring + (size_t)slot * (size_t)hd;
+    for (int i = threadIdx.x + blockIdx.x * blockDim.x; i < hd; i += gridDim.x * blockDim.x)
+        dst[i] = kv[i];
+}
+
+extern "C" int dsv41_ring_append(float* ring, const float* kv, const int* pos_ctr, int window,
+                                 int hd, cudaStream_t s) {
+    if (hd <= 0 || window <= 0) return (int)cudaSuccess;
+    ring_append_kernel<<<(unsigned)((hd + 127) / 128), 128, 0, s>>>(ring, kv, pos_ctr, window, hd);
+    return (int)cudaGetLastError();
+}
+
 // ---- AR v5 launchers (outside the anonymous namespace: extern "C" entries
 // must have external linkage or dlsym cannot find them - the same trap the
 // gemv entry points hit earlier) ----

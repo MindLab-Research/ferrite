@@ -178,6 +178,8 @@ struct Kernels {
     window_idxs: Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, CuStream) -> c_int>,
     comp_placeholder:
         Option<unsafe extern "C" fn(*mut i32, *const c_int, c_int, c_int, CuStream) -> c_int>,
+    ring_append:
+        Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, c_int, CuStream) -> c_int>,
     compress_commit: Option<
         unsafe extern "C" fn(
             *const f32,
@@ -456,6 +458,7 @@ impl Device {
                 window_idxs: sym(h_k, "dsv41_window_idxs").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 comp_placeholder: sym(h_k, "dsv41_comp_placeholder").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 compress_commit: sym(h_k, "dsv41_compress_commit").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
+                ring_append: sym(h_k, "dsv41_ring_append").ok().map(|p| unsafe { std::mem::transmute_copy(&p) }),
                 expert_gate_up_fp4_indirect: sym(h_k, "dsv41_expert_gate_up_fp4_indirect")
                     .ok()
                     .map(|p| unsafe { std::mem::transmute_copy(&p) }),
@@ -1601,6 +1604,22 @@ impl Device {
         let f = self.need(self.kernels.window_idxs, "dsv41_window_idxs")?;
         let rc = unsafe { f(idxs, pos_ctr, window, self.stream) };
         self.kerr(rc, "dsv41_window_idxs")
+    }
+
+    /// Append the KV row into the window ring at the DEVICE-derived slot. This
+    /// replaces a cudaMemcpy whose destination address was host-computed and
+    /// therefore frozen by a graph capture (every replay wrote the same slot).
+    pub fn ring_append(
+        &self,
+        ring: *mut f32,
+        kv: *const f32,
+        pos_ctr: *const c_int,
+        window: i32,
+        hd: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.ring_append, "dsv41_ring_append")?;
+        let rc = unsafe { f(ring, kv, pos_ctr, window, hd, self.stream) };
+        self.kerr(rc, "dsv41_ring_append")
     }
 
     /// The fused compressor commit: reads `out_rows` on the device, ropes the
