@@ -5010,3 +5010,36 @@ lm_head（129280 行 × 5120，298µs）**，而 1/8 切片只要 48µs（6.2x�
 `const float sa = 1.f; const float sb = 1.f;` 让 wq_b 快 21%、sharedexp 快 34%，
 一次性定位到"两个 per-kb 全局标量加载"是停顿源，比逐条改代码猜快 10 倍。
 （用完立即回退，注释写明。）
+
+### 算子深度调研结论（2026-09-11 下午，6 个并行 explore agent，全部只读）
+
+**统一诊断**：本 workload 在 B=1 下**几乎所有 kernel 都是"每调用固定成本主导"**，
+而不是带宽或 occupancy 主导。最有力的证据是 `gemm_fp8_gemv` 的三点线性拟合
+`T ≈ 15.5µs + bytes/(1.2–1.6TB/s)`：171 次 × 15.5µs = **2.65ms / 2.90ms 全部是固定项**，
+纯发射下限只有 ~0.9µs（发射效率 ~5%）。**因此提高并行度的旋钮全部无效**
+（`GEMV_FP8_WARPS` 1/2/4/8 中性、`#pragma unroll` 4→8 中性、`MODE=3` 更差），
+与实测完全吻合。**唯一有效方向 = 减少调用次数或减少每次调用的固定项。**
+
+| 算子 | 次/步 | µs/次 | 主导项（已量化） | 结论 |
+|---|---|---|---|---|
+| `gemm_fp8_gemv` | 171 | 17.0 | 每调用固定成本（见上）；两个 per-kb 全局 scale 加载是最大可摘项 | ✅ scale staging 已落地 |
+| `expert_gemv_fp4_batched` | 80 | 22.2 | 低占用率下的发射/端口停顿：480 块/148SM = 3.24 块/SM、IPC≈0.8(of 4)、~80% issue 槽在停等；9.83MB/22.2µs = 443GB/s（≤4% HBM） | ✅ `s_lut*sc` 每次累加器一次（−18% 内层指令，数值近似等价，文本已验证） |
+| `hc_mixes_tail` | 80 | 12.2 | **单 block 串行**：1 块/1024 线程（0.68% 占用）、20 轮 sinkhorn 串行链（~2.6µs，31/32 warp 空转）+ 7 个 barrier 各门住一次 L2 往返 | 待做：collapse 与 sinkhorn 重叠 |
+| `hc_mix_dots` | 80 | 7.4 | **在飞字节不足**：24 块 × 32 线程、160KiB smem → 1 块/SM；3.93MiB/7.4µs = 531GB/s（每活跃 SM 仅 21.6GB/s） | ✅ 4 warp 协同 staging（本次落地） |
+| `gemv_bf16` | 44 | 22.3 | 每行都从 global 重读同一 activation 行 | ✅ activation staging（本次落地） |
+| `sparse_attn_pf` | 40 | 10.5 | **并行度**：grid=(1,8) = 8 块 × 128 线程 = 1024 线程（**0.34% 占用**）；10.5MB/次全 L2 命中=1.0TB/s；算术 31 GMAC/s/SM（满峰 ~3%） | `DSV41_ATTN_SPLIT=8` 实测**更差**（13.51ms）→ 拒绝 |
+| `indexer_topk` | 4 | 50.1 | 单 block：128 级标量 FMA 依赖链 × ⌈len/32⌉ 波次 + 66 个 barrier 排序 pass + thread0 串行归并；1.07MB/50µs = 21GB/s | 待做：候选分块+归并（每候选求分顺序不变 ⇒ 不改数值） |
+| `quant_kernel<0>` | 176 | 1.6 | 纯固定成本 | 待做：生产者直出 fp8 |
+| `route_topk` | 40 | 5.2 | 固定成本 | — |
+
+**已明确否决的方向**（有实测或机制级依据）：
+- 给 `sparse_attn` / `quant_kernel` 加 blockDim：前者 `sh_acc[4]` 越界 + softmax 错项，后者 lane 实为 `threadIdx.y`，**都会出错结果**。
+- 改 hc 的 ss 归约分组、改激活量化 block 32→128：**动数值**（实测换答案）。
+- tcgen05 `kind::mxf4` 专家路径：M 硬定 128，M=1 下 128 倍冗余，实测 97.8µs/1.64MB（16.8GB/s），远慢于 SIMT。
+- K-split / 更多 block 提高占用率：实测 15.0 vs 15.2 tok/s，证明**非占用率受限**。
+- AR 的 P2P fused/oneshot 变体：图捕获下 epoch desync 死锁（历史 3 次）。
+
+**Single-Pass mHC（用户提示方向）的核实结论**：**当前实现里不存在可省的重复计算**。
+每层两次 hc_front 的输入 h 不同（attention 后 / MoE 后各变一次），系数必须重算；
+跨层的"下载-上传往返"早已消除（`chain_dev.rs:1208-1213`，全 device-resident）；
+"错位复用"其实已经实现——collapse 用的正是上一层 slot（`1238-1246` / `1360-1361`）。
