@@ -1715,76 +1715,30 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             dsv41_cp_wait_all();
             __syncwarp();
             float acc = 0.f;
-            // 4-deep prefetch pipeline: 8 loads in flight (the 3ms speedup),
-            // with each FFMA pinned by __fmaf_rn (prevents fast_math from
-            // reassociating the sequential additions — the degeneration root
-            // cause). The loads are decoupled from the arithmetic: av0-3/rv0-3
-            // are already in registers when the FFMA chain runs.
-            //
-            // Why __fmaf_rn prevents reassociation: it specifies EXACTLY one
-            // fused multiply-add with ONE rounding. Two sequential __fmaf_rn
-            // operations cannot be combined without changing the number of
-            // roundings, which violates the intrinsic's contract. nvcc must
-            // respect this regardless of --use_fast_math or register budget.
-            // (The earlier failure was from the if/else GATE changing the
-            // compilation context, not from the intrinsics themselves.)
+            // 1-deep prefetch pipeline: 4 loads in flight (2 current + 2 next),
+            // arithmetic uses the EXACT baseline expression form (single
+            // acc += A * sa * (B * sb) per iteration). This is the minimal
+            // change from the baseline — if this works, extend to 2/4-deep.
             {
+                uint8_t av_cur = ap[0 * 32 + lane];
+                uint8_t rv_cur = row_s[0 * 32 + lane];
                 int kb = 0;
-                // Prime: load the first 4 iterations
-                uint8_t av0 = ap[0 * 32 + lane], rv0 = row_s[0 * 32 + lane];
-                uint8_t av1 = ap[1 * 32 + lane], rv1 = row_s[1 * 32 + lane];
-                uint8_t av2 = ap[2 * 32 + lane], rv2 = row_s[2 * 32 + lane];
-                uint8_t av3 = ap[3 * 32 + lane], rv3 = row_s[3 * 32 + lane];
-
-                for (; kb + 3 < nb_k; kb += 4) {
-                    // Fire the next 4 pairs of loads (independent of the
-                    // computation below — the memory pipeline stays full)
-                    uint8_t av4 = ap[(kb + 4) * 32 + lane];
-                    uint8_t rv4 = row_s[(kb + 4) * 32 + lane];
-                    uint8_t av5 = ap[(kb + 5) * 32 + lane];
-                    uint8_t rv5 = row_s[(kb + 5) * 32 + lane];
-                    uint8_t av6 = ap[(kb + 6) * 32 + lane];
-                    uint8_t rv6 = row_s[(kb + 6) * 32 + lane];
-                    uint8_t av7 = ap[(kb + 7) * 32 + lane];
-                    uint8_t rv7 = row_s[(kb + 7) * 32 + lane];
-
-                    // Sequential FFMA chain: each __fmaf_rn depends on the
-                    // previous acc. The __fmul_rn pairs are independent of
-                    // each other (ILP within each step) but the chain of
-                    // __fmaf_rn calls is strictly serial.
-                    {
-                        float sa = a_scale[kb], sb = ue8m0_to_f(wsr[kb]);
-                        acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av0), sa),
-                                        __fmul_rn(e4m3_to_f(rv0), sb), acc);
-                    }
-                    {
-                        float sa = a_scale[kb + 1], sb = ue8m0_to_f(wsr[kb + 1]);
-                        acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av1), sa),
-                                        __fmul_rn(e4m3_to_f(rv1), sb), acc);
-                    }
-                    {
-                        float sa = a_scale[kb + 2], sb = ue8m0_to_f(wsr[kb + 2]);
-                        acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av2), sa),
-                                        __fmul_rn(e4m3_to_f(rv2), sb), acc);
-                    }
-                    {
-                        float sa = a_scale[kb + 3], sb = ue8m0_to_f(wsr[kb + 3]);
-                        acc = __fmaf_rn(__fmul_rn(e4m3_to_f(av3), sa),
-                                        __fmul_rn(e4m3_to_f(rv3), sb), acc);
-                    }
-
-                    // Rotate the pipeline
-                    av0 = av4; rv0 = rv4;
-                    av1 = av5; rv1 = rv5;
-                    av2 = av6; rv2 = rv6;
-                    av3 = av7; rv3 = rv7;
+                for (; kb + 1 < nb_k; ++kb) {
+                    // Prefetch next iteration (loads in flight while computing)
+                    uint8_t av_next = ap[(kb + 1) * 32 + lane];
+                    uint8_t rv_next = row_s[(kb + 1) * 32 + lane];
+                    // Compute current — EXACT baseline form, no intrinsics
+                    float sb = ue8m0_to_f(wsr[kb]);
+                    float sa = a_scale[kb];
+                    acc += e4m3_to_f(av_cur) * sa * (e4m3_to_f(rv_cur) * sb);
+                    av_cur = av_next;
+                    rv_cur = rv_next;
                 }
-                // Tail: remaining iterations (same form as the baseline)
-                for (; kb < nb_k; ++kb) {
-                    const float sb = ue8m0_to_f(wsr[kb]);
-                    const float sa = a_scale[kb];
-                    const int j = kb * 32 + lane;
-                    acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
+                // Last iteration (no prefetch needed)
+                if (kb < nb_k) {
+                    float sb = ue8m0_to_f(wsr[kb]);
+                    float sa = a_scale[kb];
+                    acc += e4m3_to_f(av_cur) * sa * (e4m3_to_f(rv_cur) * sb);
                 }
             }
             __syncwarp();
