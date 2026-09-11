@@ -193,6 +193,12 @@ python3 /tmp/kdiff.py /tmp/dsv41-prof-v2-mixgate/one.csv /tmp/dsv41-prof-v2-mixg
   另注：本次只在**融合核**里改，`expert_gemv_fp4_batched_kernel` 的 down 侧（`k=inter` 同样 320）另有 doc 的
   "逐位与 batched 一致"契约——两条路径现在**不再逐位相同**（都是合法浮点、差值仅末位）。
 
+  ⚠️ **修正（2026-09-11 复核，读码确认）**：上面描述的 256 值/组 `nv8` 宽加载循环**已回退**——nsys-v3 实测
+  `down_reduce` 17.2→24.9µs（+0.31ms），是寄存器/占用率回归，不是"宽加载"本身。当前 HEAD 的
+  `expert_gemv_fp4_down_reduce_kernel` **不含 `nv8`**：`vec==2` 分支尾循环已恢复 `(nv2 << 9)`，默认走的是
+  `vec==3` 的 **4 值**（uint16 + float4，1/4 scale 块）形式（`DSV41_DOWN_VEC4` 默认 ON，`g_down_fp4_mode==3`）。
+  不要把 nv8 当现行代码改分组。
+
 ---
 
 _事实来源：`/tmp/dsv41-prof-v3`（one/many nsys，2026-09-11 16:1x）+ `/tmp/dsv41-prof2`（13.28 基线，逐项与 `STATUS.md:4932-4948` 吻合）；

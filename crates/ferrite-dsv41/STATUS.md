@@ -6705,3 +6705,21 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 + ABI 不匹配 + SIGPIPE 门禁误判——最终全部解决，serve 恢复运行且进一步加速。
 
 **距离 200 tok/s（5.0ms）还差 1.90ms**——a32 A/B 正在验证中。
+
+### A/B 验证结果（2026-09-11 23:50）
+
+| 臂 | p50 | tok/s | 文本 | faults | 判定 |
+|---|---|---|---|---|---|
+| **fixed（默认 = a32 ON + PDL OFF）** | **6.90ms** | **144.9** | 四段全对 | 0 | **基线** |
+| a32off | 8.73ms | 114.5 | 四段全对 | 0 | **a32 ON 远好于 OFF（+1.83ms）** |
+| pdlon | 6.97ms | 143.5 | 四段全对 | 0 | **PDL 无收益（0.07ms 噪声内）** |
+
+**a32 结论**：LUT 预解码的收益 >> smem 占用率损失。占用率赌注未兑现——20KB s_af 表
+虽然把 blocks/SM 从 8 压到 4，但 LUT 消除的内层解码开销远超并行度损失。保持默认 ON。
+
+**PDL 结论**：cudaLaunchKernelEx + ProgrammaticStreamSerialization 在生产图捕获路径
+无收益。可能原因：struct pack 后 launch 开销已足够小，PDL 的 prologue 提前量不显著。
+保持默认 OFF（避免 cudaLaunchKernelEx 路径的风险）。
+
+**下一步**：gateup K-split 翻 ON（−0.19ms parity 风险）+ down vec 回归修复（−0.31ms）
++ nsys 精确分解 → 找新的优化目标。
