@@ -7157,3 +7157,27 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 3. **结论**：P5 在本 kernel 结构下是死路。P4（重开 s_a 槽 + cp.async）是唯一可行的激活路径优化。
 
 **下一步**：P4 的 A/B 正在验证中（v6p4 臂）。
+
+### gemm 5µs 可行性判定：不可达，现实最低 ~7.5-8µs（2026-09-12 04:15）
+
+**5µs 不可达**（生产 shape mix）。三条硬约束：
+1. **consume 地板 4.45µs**（含 s_af/权重的 LDS，延迟受限）+ launch 0.71µs ≈ 5.2µs 已是地板
+2. **staging 无法归零**：warp 专业化已否决（每个 compute warp 需读整条 s_af）
+3. **consume 受位一致锁**：向量化 LDS 会改求和顺序 → 禁（翻转近边界 logits）
+
+**实测口径修正**（vs 之前的估计）：
+| 组件 | 之前估计 | 隔离探针实测 |
+|---|---|---|
+| launch | 1.5µs | **0.71µs**（nop416 空核标定） |
+| 激活处理 | 3.5µs | **2.85µs**（a32 1.55 + uint4 0.8 + LUT 0.3 + scale 0.1） |
+| compute | 1.5µs | **4.45µs**（LDS 延迟受限——之前低估 3µs） |
+| 合计 | 7.7µs | **9.19µs** |
+
+**现实最低值**：rf_u32_ilp 变体 = 5.02/6.67/8.58µs @ n=256/1024/1664。生产 mean ~7.5-8µs → 246 次 = **1.85-2.0ms**（vs 当前 2.46ms）→ **−0.35~−0.5ms 现实可期**。
+
+**行动项**：
+1. **a32 物化 4 元素向量化**（实测 −13%，a32-vec4-impl 实施中）——最低风险
+2. ROW_FIRST（−1.8%）——把行 cp.async 提到 block staging 前
+3. Stage C persistent/grouped GEMM——把 per-block prologue 摊到多层/多投影（246→~40 次）——唯一量级够的路径
+
+**⛔ 勿再试**：a32 挪出 smem（慢 81%）、LUT 放 constant/global（慢 6.6×/15%）、nsys 的"profiling 开销 2.3µs"（实核就是 9.3µs）
