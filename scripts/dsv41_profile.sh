@@ -7,11 +7,16 @@
 # us: hc_mixes "49% of the step" was an artifact). Subtracting a 1-token run from
 # an N-token run leaves the decode-only net cost.
 #
-# Why NCCL mode: the P2P all-reduce's publish kernel SPINS waiting for the peers'
-# stamps. Under nsys's per-node graph tracing that spin is amplified hundreds of
-# times (measured: 240 s of wall clock for 69 steps), so profile with the AR in
-# NCCL mode (do NOT pass FERRITE_P2P=1 / DSV41_AR_V5=1) and attribute the AR
-# separately.
+# Why the host-barrier AR (DSV41_AR_V5=0): the device-side all-reduce's publish
+# kernel SPINS waiting for the peers' stamps. Under nsys's per-node graph tracing
+# that spin is amplified hundreds of times (measured: 240 s of wall clock for 69
+# steps), so this script pins DSV41_AR_V5=0 - which it must do EXPLICITLY now that
+# the device-side AR is the default - and attributes the AR separately (90 calls x
+# ~8 us with v5 against the barrier's measured per-call time).
+# DSV41_GRAPH_STEP=0 for the same reason: a whole-step capture records ~400 nodes,
+# which is exactly what makes the node tracing expensive, and every kernel's cost is
+# identical between the two paths (verified by DSV41_TOKTRACE: one request is
+# bit-identical), so the per-kernel table is valid for both.
 #
 # Also: never parse the default table output with awk - kernel names contain
 # spaces and the columns shift. Use --format csv.
@@ -40,6 +45,7 @@ prof() { # $1 = max_tokens, $2 = output tag
   timeout -s KILL 900 "$NSYS" profile --trace=cuda --cuda-graph-trace=node --sample=none \
     -o "$OUT/$2" --force-overwrite=true \
     env CUDA_VISIBLE_DEVICES="$GPUS" DSV41_MODEL_DIR="$MODEL_DIR" DSV41_KERNELS="$KERNELS" \
+    DSV41_AR_V5=0 DSV41_GRAPH_STEP=0 \
     "$BIN" --prompt "$PROMPT" --max-tokens "$1" --tp 8 >"$OUT/$2.log" 2>&1 || true
   grep -E "DECODE|\[dsv41\] decode" "$OUT/$2.log" | tail -3 || true
   # CSV, never the table (kernel names contain spaces)
