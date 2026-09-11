@@ -4568,3 +4568,26 @@ fp8 gemv 受益（消费循环长、每元素 2 次 smem 读），gemv_bf16（�
 **唯一的大杠杆是结构性改动**（核内 tile 化 + 流水），而本会话已三次证明**源码结构改动会
 改变编译产物**（手写展开 / gate / launch_bounds 待验证）—— 所以结构性工作必须配
 "物理增删 + A/B 文本验证"的流程。
+
+### cublasLt 迁移设计（2026-09-11 12:15）
+
+**问题**：`gemm_cublas`（`ferrite-kernel/src/cuda.rs:2113`）用 `cublasGemmEx` + algo 99（heuristic），
+对 M=16 的形状选了 splitK 变体 ⇒ `nvjet_splitK` 3.8µs×57/步 + `splitKreduce` 2.8µs×67/步
+= **0.41ms/步** 的纯 K-split + 归约开销。`FERRITE_CUBLAS_ALGO=-1`（CUBLAS_GEMM_DEFAULT）
+**已实测中性**（经典 API 无 splitK 变体反而更慢，或它并不受该旋钮影响）。
+
+**方案**：迁移到 `cublasLtMatmul` + **显式过滤 splitK 变体**：
+1. `cublasLtCreate`（每 device 一次，缓存到 OnceLock/state）
+2. `cublasLtMatmulDescCreate(desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)`
+3. `cublasLtMatrixLayoutCreate`（A/B/C/D，CUDA_R_16BF，列主序）
+4. `cublasLtMatmulPreferenceCreate` + `cublasLtMatmulAlgoGetHeuristic(..., 8, algos, &n)`
+5. 遍历候选，用 `cublasLtMatmulAlgoConfigGet(algo, CUBLASLT_MATMUL_ALGO_CONFIG_SPLITK_NUM, ...)`
+   **选 SPLITK_NUM == 1 的第一个**（无 K 切分）
+6. `cublasLtMatmul(..., algo, workspace, ws_size, stream)`
+
+**风险控制**：这是 **GLM 共享代码**（`ferrite-kernel` crate）—— 应按 **m 分支**：
+m ≤ 32（decode 的 DSV4.1 形状）用无 splitK 的 algo，否则保持原 heuristic（GLM 的 m 更大，
+splitK 可能是对的）。
+
+**预期**：−0.2~0.3ms。**注意**：该项收益远小于 launch_bounds 实验的潜在 3.1ms，
+所以排在它之后。
