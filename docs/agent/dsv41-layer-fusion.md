@@ -76,8 +76,8 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 28 | `route_topk` | :1700 | score_func=2；smem **3096 B** |
 | 29 | `zero` ×2 | :1728/:1729 | memset |
 | 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32 |
-| 31 | **batched 路径（`moe_batch()` 代码默认 ON**，:179 `unwrap_or(true)`）| :1806-1870 | `expert_gate_up_fp4_batched`（smem **20480 B**）→ `swiglu_limit_batched` → `expert_down_fp4_batched`（smem `inter_local*4`）→ `moe_down_reduce`（定序求和 ✓）|
-| 31' | sequential 回退（逐 slot ×topk）| :1872-1914 | `expert_gate_up_fp4_indirect` / `swiglu_limit` / `expert_down_fp4_indirect` |
+| 31 | **batched 路径（`moe_batch()` 代码默认 ON**，:188 `unwrap_or(true)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`DSV41_GATEUP_FUSE` 开时**跳过** `swiglu_limit_batched`）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 ON）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）|
+| 31' | sequential 回退（逐 slot ×topk）| :2433-2477 | `expert_gate_up_fp4_indirect` / `swiglu_limit` / `expert_down_fp4_indirect` |
 | 32 | 共享专家（**仅 rank 0**）| :1918-1970 | `quant1` + `gemm_fp8_mx`(w1) + `gemm_fp8_mx`(w3) + `swiglu_limit` + `quant1` + `gemm_fp8_mx`(w2) + `add_inplace` |
 | 33 | **AR#2** | `moe_reduce()` :638 | `s.o`, 20480 B |
 

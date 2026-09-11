@@ -616,7 +616,6 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     const int nwarps = (blockDim.x + 31) >> 5;
 
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
-        }
         // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
         const bool hi = (b_split > 0) && (row >= b_split);
         const int r = hi ? (row - b_split) : row;
