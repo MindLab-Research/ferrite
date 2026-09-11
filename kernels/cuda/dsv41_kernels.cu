@@ -1245,7 +1245,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     for (int row = blockIdx.x * nwarps + warp; row < n; row += gridDim.x * nwarps) {
         const uint8_t* wr = w + (size_t)row * k;
         const int srow = row >> 5;               // 32x32 block scale row
-        const float* wsr = w_scale + (size_t)srow * nb_k;
+        const uint8_t* wsr = w_scale + (size_t)srow * nb_k;
         float acc = 0.f;
         if (g_gemv_fp8_vec) {
             for (int g = 0; g < n_vec; ++g) {
