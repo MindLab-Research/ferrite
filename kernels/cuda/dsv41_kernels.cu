@@ -1350,6 +1350,18 @@ static const int g_gemv_fp8_mode = [] {
     return 4;
 }();
 
+// Rows per gemv block, shared by the single-family and the two-family launchers.
+// Four rows per block measured 15.91 against 16.14 ms for eight, same session,
+// same binary, text unchanged: halving the rows doubles the block count and the
+// warps in flight, which is what this latency-bound family actually needs. Two
+// was no better than four and stages the activation twice as often, so four.
+static const int g_gemv_warps = [] {
+    const char* e = getenv("DSV41_GEMV_FP8_WARPS");
+    if (e == nullptr) return 4;
+    const int v = atoi(e);
+    return (v >= 1 && v <= 32) ? v : 4;
+}();
+
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const float* __restrict__ a_scale,
                                      const uint8_t* __restrict__ w,
@@ -1505,23 +1517,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     // M=1 (decode): skip the 16-row tile entirely - it wastes 15/16 of itself and
     // its 16*k bytes of shared memory cap the occupancy. One warp per output row.
     if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
-        // Eight rows per block was the first shape. With k = 1536 that is 12 KB of
-        // weights per block and 2048 short-lived blocks for the q_b projection, so
-        // the per-block setup is a real share of the call. The count is adjustable
-        // to test that against the opposite risk (fewer, larger blocks and less
-        // occupancy); the per-row accumulation does not depend on it.
-        static const int g_warps = [] {
-            const char* e = getenv("DSV41_GEMV_FP8_WARPS");
-            // Four rows per block measured 15.91 against 16.14 ms for eight, same
-            // session, same binary, text unchanged: halving the rows doubles the
-            // block count and the warps in flight, which is what this
-            // latency-bound family actually needs. Two was no better than four and
-            // stages the activation twice as often, so four it is.
-            if (e == nullptr) return 4;
-            const int v = atoi(e);
-            return (v >= 1 && v <= 32) ? v : 4;
-        }();
-        const int warps = g_warps;
+        const int warps = g_gemv_warps;
         const int blocks = (n + warps - 1) / warps;
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k
                              : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k
@@ -1538,6 +1534,41 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
     gemm_fp8_kernel<<<grid, 128, smem, s>>>(a, a_scale, w, w_scale, bias, out, m, n, k);
+    return (int)cudaGetLastError();
+}
+
+// Two projections over the SAME activation in one gemv launch: the kernel maps
+// rows below n1 to the first family and the rest to the second, both sharing the
+// block-wide staged activation. wq_a and wkv in the attention are the pair - two
+// latency-floor launches become one, and the small family's blocks (wkv is 128
+// rows) ride beside the big family's instead of paying their own serial slot
+// after wq_b and the rope. Each row is still one warp in the same lane order, so
+// both outputs are bit-identical to two separate launches. M=1 only: a caller
+// that cannot use it gets cudaErrorInvalidValue back and runs the two
+// single-family calls instead.
+extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
+                                  const uint8_t* w1, const uint8_t* w1_scale,
+                                  const float* bias1, float* out1, int n1,
+                                  const uint8_t* w2, const uint8_t* w2_scale,
+                                  const float* bias2, float* out2, int n2, int k,
+                                  cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv || n1 <= 0 || n2 <= 0 || k <= 0 || (k & 31) || (k & 3))
+        return (int)cudaErrorInvalidValue;
+    const int n = n1 + n2;
+    const int warps = g_gemv_warps;
+    const int blocks = (n + warps - 1) / warps;
+    const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k
+                         : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k
+                                                   : (size_t)0;
+    if (gsmem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(
+        a, a_scale, w1, w1_scale, bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2,
+        n1);
     return (int)cudaGetLastError();
 }
 

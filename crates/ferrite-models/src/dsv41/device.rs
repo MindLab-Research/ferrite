@@ -39,6 +39,16 @@ struct Kernels {
         *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
         c_int, c_int, c_int, CuStream,
     ) -> c_int,
+    /// Two same-activation fp8 projections in ONE gemv launch: rows below n1 map
+    /// to the first family, the rest to the second, both sharing the staged
+    /// activation. Returns cudaErrorInvalidValue when the shape does not fit, so
+    /// the caller falls back to two gemm_fp8_mx calls.
+    gemm_fp8_mx2: unsafe extern "C" fn(
+        *const u8, *const f32,
+        *const u8, *const u8, *const f32, *mut f32, c_int,
+        *const u8, *const u8, *const f32, *mut f32, c_int,
+        c_int, CuStream,
+    ) -> c_int,
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -286,6 +296,7 @@ impl Device {
         let stream = rt.stream();
         let kernels = Kernels {
             gemm_fp8_mx: km!(rt, "dsv41_gemm_fp8_mx"),
+            gemm_fp8_mx2: km!(rt, "dsv41_gemm_fp8_mx2"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
@@ -561,6 +572,52 @@ impl Device {
             (self.kernels.gemm_fp8_mx)(a, a_scale, w, w_scale, bias, out, m, n, k, self.stream)
         };
         self.kerr(rc, "dsv41_gemm_fp8_mx")
+    }
+
+    /// Two same-activation fp8 projections in one gemv launch (rows below n1 map
+    /// to the first family). Returns Ok(false) when the fused kernel declines
+    /// the shape, so the caller runs the two separate calls; any other error
+    /// propagates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx2(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w1: *const u8,
+        w1_scale: *const u8,
+        bias1: *const f32,
+        out1: *mut f32,
+        n1: i32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        bias2: *const f32,
+        out2: *mut f32,
+        n2: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let rc = unsafe {
+            (self.kernels.gemm_fp8_mx2)(
+                a,
+                a_scale,
+                w1,
+                w1_scale,
+                bias1,
+                out1,
+                n1,
+                w2,
+                w2_scale,
+                bias2,
+                out2,
+                n2,
+                k,
+                self.stream,
+            )
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx2")?;
+        Ok(true)
     }
 
     pub fn quant_fp8(

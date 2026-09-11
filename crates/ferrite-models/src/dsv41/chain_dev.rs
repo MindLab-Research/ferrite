@@ -522,6 +522,55 @@ impl<'a> DevChain<'a> {
         )
     }
 
+    /// Two projections over the SAME activation in one launch (DSV41_PROJ_FUSE).
+    /// Reads ONCE and cached: this runs per attention call.
+    fn proj_fuse() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_PROJ_FUSE").map(|v| v != "0").unwrap_or(false)
+        })
+    }
+
+    /// Two projections over the same activation: quantise once, then one gemv
+    /// whose rows below n1 map to the first family and the rest to the second.
+    /// Each row is still one warp in the same lane order, so both outputs are
+    /// bit-identical to two `lin` calls. Ok(false) means the fused kernel
+    /// declined the shape and the caller runs the two lins.
+    #[allow(clippy::too_many_arguments)]
+    fn lin2(
+        &self,
+        a: *const f32,
+        k: i32,
+        w1: &crate::dsv41::load::DevTensor,
+        ws1: &crate::dsv41::load::DevTensor,
+        n1: i32,
+        out1: *mut f32,
+        w2: &crate::dsv41::load::DevTensor,
+        ws2: &crate::dsv41::load::DevTensor,
+        n2: i32,
+        out2: *mut f32,
+    ) -> Result<bool> {
+        if !Self::proj_fuse() {
+            return Ok(false);
+        }
+        self.quant1(a, k)?;
+        self.dev.gemm_fp8_mx2(
+            self.s.xq.as_u8(),
+            self.s.xsc.as_f32(),
+            w1.as_u8(),
+            ws1.as_u8(),
+            std::ptr::null(),
+            out1,
+            n1,
+            w2.as_u8(),
+            ws2.as_u8(),
+            std::ptr::null(),
+            out2,
+            n2,
+            k,
+        )
+    }
+
     /// f32 linear for one row. M=1 goes through our own GEMV: cuBLAS's GemmEx
     /// picked gemv2T at ~40 GFLOP/s for a single row (396us/call, 72 per step)
     /// while the weight read floors at ~112us.
@@ -1341,15 +1390,33 @@ fn fuse_b1() -> bool {
         let nlh = nh / world;
         let ld = &self.w.layers[layer];
 
-        // queries: wq_a -> q_norm -> wq_b
-        self.lin(
+        // queries + window KV both read xn: one quantise and one gemv launch for
+        // the pair (wkv's 128 rows ride beside wq_a's blocks instead of paying
+        // their own latency-floor slot after wq_b and the rope). Both outputs
+        // are bit-identical to two separate lins - each row is still one warp in
+        // the same lane order.
+        let kv_early = self.lin2(
             self.s.xn.ptr as *const f32,
             dim as i32,
             ld.wq_a.as_ref().unwrap(),
             ld.wq_a_scale.as_ref().unwrap(),
             ql as i32,
             self.s.qr.ptr as *mut f32,
+            ld.wkv.as_ref().unwrap(),
+            ld.wkv_scale.as_ref().unwrap(),
+            hd as i32,
+            self.s.kv.ptr as *mut f32,
         )?;
+        if !kv_early {
+            self.lin(
+                self.s.xn.ptr as *const f32,
+                dim as i32,
+                ld.wq_a.as_ref().unwrap(),
+                ld.wq_a_scale.as_ref().unwrap(),
+                ql as i32,
+                self.s.qr.ptr as *mut f32,
+            )?;
+        }
         self.dev.rmsnorm(
             self.s.qr.ptr as *const f32,
             ld.q_norm.as_ref().unwrap().as_f32(),
@@ -1390,15 +1457,18 @@ fn fuse_b1() -> bool {
             let r = (q.iter().map(|v| v * v).sum::<f32>() / q.len() as f32).sqrt();
             eprintln!("[mine] L0 q[0..4]={:?} q_full_rms={}", &q[..4], r);
         }
-        // window KV (single shared head)
-        self.lin(
-            self.s.xn.ptr as *const f32,
-            dim as i32,
-            ld.wkv.as_ref().unwrap(),
-            ld.wkv_scale.as_ref().unwrap(),
-            hd as i32,
-            self.s.kv.ptr as *mut f32,
-        )?;
+        // window KV (single shared head): already computed beside wq_a when the
+        // fused launch ran; only the separate fallback computes it here.
+        if !kv_early {
+            self.lin(
+                self.s.xn.ptr as *const f32,
+                dim as i32,
+                ld.wkv.as_ref().unwrap(),
+                ld.wkv_scale.as_ref().unwrap(),
+                hd as i32,
+                self.s.kv.ptr as *mut f32,
+            )?;
+        }
         self.dev.rmsnorm(
             self.s.kv.ptr as *const f32,
             ld.kv_norm.as_ref().unwrap().as_f32(),
