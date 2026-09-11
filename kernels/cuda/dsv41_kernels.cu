@@ -2770,38 +2770,46 @@ __global__ void hc_mix_dots_kernel(const float* __restrict__ x, const float* __r
     const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim);
     float4* sx = reinterpret_cast<float4*>(s_x);
     float4* sw = reinterpret_cast<float4*>(s_w);
-    for (int i = lane; i < n4; i += 32) dsv41_cp_async16(&sx[i], &xg[i]);
+    // ALL warps stage. The row pair is 2 x hc_dim x 4 bytes = 160 KiB at the real
+    // hc_dim (20480), and a single warp could only keep ~20 KiB of cp.async in
+    // flight, so the staging alone was ~6 us of exposed DRAM latency (measured
+    // 3.93 MiB / 7.4 us = 531 GB/s, i.e. ~21 GB/s per active SM against 100+).
+    // The compute below is unchanged and still runs in warp 0 with the same lane
+    // assignment, so every partial sum is bit-identical.
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sx[i], &xg[i]);
     dsv41_cp_commit();
-    for (int i = lane; i < n4; i += 32) dsv41_cp_async16(&sw[i], &wg[i]);
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) dsv41_cp_async16(&sw[i], &wg[i]);
     dsv41_cp_commit();
     dsv41_cp_wait_all();
-    __syncwarp();
-    // hc_mixes_kernel's float4 three-accumulator chain, verbatim
-    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
-    int c = lane;
-    for (; c + 64 < n4; c += 96) {
-        const float4 w0 = sw[c], w1 = sw[c + 32], w2 = sw[c + 64];
-        const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
-        a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
-        a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
-        a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
-    }
-    for (; c < n4; c += 32) {
-        const float4 w = sw[c], v = sx[c];
-        a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
-    }
-    for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += s_w[k] * s_x[k];
-    float acc = (a0 + a1) + a2;
-    for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
-    if (lane == 0) g_hc_part[r][m][0] = acc;
-    // Fold the tail's sum-of-squares in: the row is already staged in shared
-    // memory, so block m replays the tail's warp-m partial exactly (c = lane +
-    // m*32, stride mix*32) - bit-identical grouping, zero extra global reads.
-    if (ss_out != 0) {
-        float s2 = 0.f;
-        for (int c = lane + m * 32; c < hc_dim; c += mix * 32) s2 += s_x[c] * s_x[c];
-        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_xor_sync(0xFFFFFFFFu, s2, off);
-        if (lane == 0) g_hc_part[r][m][1] = s2;
+    __syncthreads();   // the staging spans warps now
+    if (threadIdx.x < 32) {
+        // hc_mixes_kernel's float4 three-accumulator chain, verbatim
+        float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+        int c = lane;
+        for (; c + 64 < n4; c += 96) {
+            const float4 w0 = sw[c], w1 = sw[c + 32], w2 = sw[c + 64];
+            const float4 v0 = sx[c], v1 = sx[c + 32], v2 = sx[c + 64];
+            a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+            a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+            a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+        }
+        for (; c < n4; c += 32) {
+            const float4 w = sw[c], v = sx[c];
+            a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+        }
+        for (int k = (n4 << 2) + lane; k < hc_dim; k += 32) a0 += s_w[k] * s_x[k];
+        float acc = (a0 + a1) + a2;
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) g_hc_part[r][m][0] = acc;
+        // Fold the tail's sum-of-squares in: the row is already staged in shared
+        // memory, so block m replays the tail's warp-m partial exactly (c = lane +
+        // m*32, stride mix*32) - bit-identical grouping, zero extra global reads.
+        if (ss_out != 0) {
+            float s2 = 0.f;
+            for (int c2 = lane + m * 32; c2 < hc_dim; c2 += mix * 32) s2 += s_x[c2] * s_x[c2];
+            for (int off = 16; off > 0; off >>= 1) s2 += __shfl_xor_sync(0xFFFFFFFFu, s2, off);
+            if (lane == 0) g_hc_part[r][m][1] = s2;
+        }
     }
 }
 
@@ -2979,8 +2987,12 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
             return (int)e;
         }
     }
-    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), 32, smem, s>>>(x, hc_fn, rows, hc_dim,
-                                                                             mix, g_hc_ss ? 1 : 0);
+    // 128 threads = 4 warps staging cooperatively; the dot itself still runs in
+    // warp 0 with the same lane assignment (the staging used to be one warp's
+    // ~20 KiB of cp.async against a 160 KiB row pair).
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), 128, smem, s>>>(x, hc_fn, rows,
+                                                                              hc_dim, mix,
+                                                                              g_hc_ss ? 1 : 0);
     cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
