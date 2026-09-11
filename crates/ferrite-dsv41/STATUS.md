@@ -2719,3 +2719,19 @@ lookback（blocked 规则→pad_id）；rolling = tokens[0]×mult[0]，逐 i：r
 **2.6 → 21.4 tok/s（8.2x）**，八项收益全部同二进制 A/B：hc_mixes 块形状 +74% · fp4 GEMV +21% ·
 fp8 GEMV +16% · warp sinkhorn +5% · down 并入 GEMV +7% · sparse_attn flash 分槽 +6% · HEAD_DEV ~+1% ·
 AR v5 +1%（结构解锁）。**三项结构性资产**：AR v5（第 6 次尝试成功）· HEAD_DEV · 差分法+复现器测量体系。
+
+## ★★★ 落地：engram 哈希设备化 —— **解码路径 H2D = 0**（用户指令①完成）
+
+**实现**（`d788df7`）：`dsv41_engram_hash_step`（单线程 kernel，**与 host `forward_row` 的
+serial 算术逐位一致** ✓）：读 `s.ids` 的设备 token + 设备 pos_ctr → 更新 cache → blocked 规则 →
+rolling XOR → 写 eng_ids。map/mults/primes/offsets **一次性上传**（首步懒建）；reset 清零。
+`DSV41_ENG_HOST=1` 回退 host 路径做 A/B。
+**注意**：`dsv41_kernels.cu` 里已有同名多 token 版（从未被调用 ✗）——它 seqlen=1 时
+threads 1..127 提前 return 后**单线程到达 `__syncthreads`**（文档化 UB ✗）且 start_pos 是宿主参数
+（图不安全 ✗）；新 kernel 规避两者并改名避免 extern "C" 链接冲突 ✓。
+
+**验证**：四段文本与 host 路径**逐字相同** ✓（Paris/Tokyo/"2"/《静夜思》——李白，亲自读）；
+A/B 中性（21.2 vs 21.3 tok/s —— 哈希本身极小，收益是**消 H2D + 图可捕获** ✓）。
+
+**用户三项指令进度**：① 无 H2D ✓✅ ② tile 对齐 ✓✅ ③ 单图 —— **所有硬阻塞已除**
+（AR v5 ✓ HEAD_DEV ✓ premix D2D ✓ engram 设备化 ✓），剩 **pos/compress_len 设备化 + 捕获**。
