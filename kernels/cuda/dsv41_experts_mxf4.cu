@@ -759,10 +759,14 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         // into out[row]. The caller then never materialises the 2*inter gate/up
         // buffer nor runs the separate swiglu pass.
         // NUMERIC CONTRACT: each K walk below is the vec==2 shape of the unfused
-        // body (same group order j = (g<<9) + (lane<<4), same `#pragma unroll 2`,
-        // same single scale multiply per accumulator), so gate/up accumulate to
-        // the same floats the unfused rows do; only the epilogue differs (swiglu
-        // instead of the plain write). k = dim and the launcher only sets
+        // body (same group order j = (g<<9) + (lane<<4), same single scale
+        // multiply per accumulator), so gate/up accumulate to the same floats the
+        // unfused rows do; only the epilogue differs (swiglu instead of the plain
+        // write). The fused loop below is `#pragma unroll 4` while the unfused
+        // body stays at 2: unroll DEPTH is not part of the contract - the per-group
+        // fma chains still run in ascending g2 order with one `g`/`u` update each,
+        // so the float sequence (and therefore the bit pattern) is unchanged.
+        // k = dim and the launcher only sets
         // fuse_swiglu when (dim % 512) == 0, so the two-chunk-per-scale tail loop
         // of the unfused body has no work here.
         if (fuse_swiglu && b_split > 0) {
@@ -772,7 +776,13 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             const uint8_t* u_srow = bhs_use + (size_t)row * ksc;
             const int nv2f = k >> 9;   // 16 values per lane per group; no tail (k % 512 == 0)
             float g = 0.f, u = 0.f;
-#pragma unroll 2
+            // unroll 4 (was 2): the audit measured this branch at ~6% issue with
+            // ~94% of cycles stalled on the K loads, i.e. too few in-flight load
+            // slots per warp. Four groups in flight keep more LDG.64s outstanding
+            // per warp without touching the accumulation ORDER (see the numeric
+            // contract above): each group's fma chain is independent except for the
+            // single `g`/`u` update per group, which still happens in g2 order.
+#pragma unroll 4
             for (int g2 = 0; g2 < nv2f; ++g2) {
                 const int j = (g2 << 9) + (lane << 4);
                 // Hoist the lane's 16 activation floats into registers ONCE per
@@ -788,8 +798,15 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // ---- gate chain: row `row` of the `b`/`bsc` pair ----
                 const float gsc = __uint_as_float(((uint32_t)g_srow[j >> 5]) << 23);
                 const uint8_t* gp = g_row + (g2 << 8) + (lane << 3);
-                const uint32_t gw0 = *reinterpret_cast<const uint32_t*>(gp);
-                const uint32_t gw1 = *reinterpret_cast<const uint32_t*>(gp + 4);
+                // One LDG.64 instead of two LDG.32. gp = g_row + (g2<<8) + (lane<<3)
+                // is 8-byte aligned: the pool base is a 256-byte-aligned device
+                // allocation, every per-expert stride is a multiple of 8 (all six
+                // per-expert tensor sizes here are multiples of 8 because
+                // dim % 512 == 0 gives dim/2 = 256k and dim/32 = 16k bytes per row),
+                // and lane<<3 / g2<<8 are multiples of 8. BIT-EXACT: the 8 bytes at
+                // gp are identical to gw0 at gp and gw1 at gp+4; only the number of
+                // load instructions changes.
+                const uint2 gw = *reinterpret_cast<const uint2*>(gp);
                 float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
                 const float2 gt0 = s_lut2[gw0 & 0xFFu];
                 const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
