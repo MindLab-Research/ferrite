@@ -1606,6 +1606,10 @@ static const int g_gemv_warps = [] {
     return (v >= 1 && v <= 32) ? v : 4;
 }();
 
+static const bool g_gemv_act_async = [] {
+    return getenv("DSV41_GEMV_ACT_ASYNC") != nullptr;
+}();
+
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
 // them here so the fp8 gemv can stage its weight row asynchronously too.
 __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
@@ -1672,8 +1676,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         // is a multiple of 16), so the cause is not yet identified - keep the
         // known-good dependent-copy form as the default and leave the async
         // variant behind DSV41_GEMV_ACT_ASYNC for a bisect.
-        static const bool act_async = getenv("DSV41_GEMV_ACT_ASYNC") != nullptr;
-        if (act_async) {
+        if (g_gemv_act_async) {
             for (int i = threadIdx.x; i < n16a; i += blockDim.x)
                 dsv41_cp_async16(s_a + (i << 4), a + (i << 4));
         } else {
