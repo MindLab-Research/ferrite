@@ -445,7 +445,7 @@ fn orope_q() -> bool {
 /// kernels), saving 40 launches/step. "0" reverts; an .so without
 /// `dsv41_ring_win_fuse` falls back on its own.
 fn ring_win_fuse() -> bool {
-    static F: std::sync::OnceLock<bool>::new();
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 

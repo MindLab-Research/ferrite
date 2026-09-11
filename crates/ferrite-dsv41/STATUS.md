@@ -5001,7 +5001,7 @@ lm_head（129280 行 × 5120，298µs）**，而 1/8 切片只要 48µs（6.2x�
 |---|---|---|---|---|
 | **ss2**：scale 行 staging（gemm_fp8_gemv） | **13.14ms** | **76.1** | 四段全对 | ✅ 采纳（−0.14ms） |
 | b2：+ expert fp4 `sc` 一次性缩放 + gemv_bf16 activation staging | 13.19ms | 75.8 | 四段全对 | 中性（噪声内），保留（数值正确） |
-| sp8：`DSV41_ATTN_SPLIT=8` | 13.51ms | 74.0 | 四段全对（末尾 IM 略异） | ❌ 更差，拒绝（默认保持 0） |
+| sp8：`DSV41_ATTN_SPLIT=8` | 13.51ms | 74.0 | 四段全对（末尾 IM 略异） | ❌ 更差，拒绝（默认保持 0）——**2026-09-11 晚修正**：更差的原因是这一版 split **没有 3 深预取**（slot 链退化成单槽在飞），不是 key-split 无效。split 版已补上 pf 的 3 深流水，成为默认路径（`DSV41_ATTN_PF_SPLIT`，见 `kernels/cuda/dsv41_kernels.cu:722` 头注释 + 隔离 harness `kernels/cuda/tests_dsv41_sparse_pfsplit.cu`；步时收益待同会话 serve A/B 定案），`DSV41_ATTN_SPLIT=C` 仍可显式选同一 kernel |
 | slice：`DSV41_HEAD_SLICE=1` | **挂死** | — | — | ❌ `argmax_pub_kernel` 写 peer staging 的 `off=bytes-16` 与 AR 暂存区冲突 → 破坏 AR 握手 → 死锁（step pos=9 后日志停滞）。默认 OFF，内核与缓冲保留待重新设计 off |
 
 ### 诊断方法（本次新增，值得复用）
@@ -5027,7 +5027,7 @@ lm_head（129280 行 × 5120，298µs）**，而 1/8 切片只要 48µs（6.2x�
 | `hc_mixes_tail` | 80 | 12.2 | **单 block 串行**：1 块/1024 线程（0.68% 占用）、20 轮 sinkhorn 串行链（~2.6µs，31/32 warp 空转）+ 7 个 barrier 各门住一次 L2 往返 | 待做：collapse 与 sinkhorn 重叠 |
 | `hc_mix_dots` | 80 | 7.4 | **在飞字节不足**：24 块 × 32 线程、160KiB smem → 1 块/SM；3.93MiB/7.4µs = 531GB/s（每活跃 SM 仅 21.6GB/s） | ✅ 4 warp 协同 staging（本次落地） |
 | `gemv_bf16` | 44 | 22.3 | 每行都从 global 重读同一 activation 行 | ✅ activation staging（本次落地） |
-| `sparse_attn_pf` | 40 | 10.5 | **并行度**：grid=(1,8) = 8 块 × 128 线程 = 1024 线程（**0.34% 占用**）；10.5MB/次全 L2 命中=1.0TB/s；算术 31 GMAC/s/SM（满峰 ~3%） | `DSV41_ATTN_SPLIT=8` 实测**更差**（13.51ms）→ 拒绝 |
+| `sparse_attn_pf` | 40 | 10.5 | **并行度**：grid=(1,8) = 8 块 × 128 线程 = 1024 线程（**0.34% 占用**）；10.5MB/次全 L2 命中=1.0TB/s；算术 31 GMAC/s/SM（满峰 ~3%） | `DSV41_ATTN_SPLIT=8` 实测**更差**（13.51ms）→ 拒绝 ⚠️**已修正（2026-09-11 晚）**：那一版 split 无预取才更差；补上 3 深流水后成为默认（`DSV41_ATTN_PF_SPLIT`），per-slot 78→10.7ns |
 | `indexer_topk` | 4 | 50.1 | 单 block：128 级标量 FMA 依赖链 × ⌈len/32⌉ 波次 + 66 个 barrier 排序 pass + thread0 串行归并；1.07MB/50µs = 21GB/s | 待做：候选分块+归并（每候选求分顺序不变 ⇒ 不改数值） |
 | `quant_kernel<0>` | 176 | 1.6 | 纯固定成本 | 待做：生产者直出 fp8 |
 | `route_topk` | 40 | 5.2 | 固定成本 | — |
@@ -5082,7 +5082,7 @@ nsys 的计数口径是"8 个 rank 求和后再除以步数"，所以 `gemv_bf16
 | lm_head 全词表**未切分** | 1 | 298 | 0.30 | 8 个 rank 各算全词表（8× 冗余权重读）。**曾实现切分**（`argmax_sliced`），但 `argmax_pub` 写 peer staging 的 `off=bytes-16` 与 AR 暂存冲突 → **死锁** | 需专用交换缓冲 + 一次 barrier |
 | `indexer_topk` 单 block | 4 | 50.1 | 0.20 | 128 级标量 FMA 依赖链 × ⌈len/32⌉ 波次 + 66 个 barrier 排序 pass + thread0 串行归并；`n_pos = compress_len = 2048` | 待做：候选分块+归并（不改数值） |
 | `quant_kernel` | 176 | 1.6 | 0.28 | 纯固定成本 | 待做：生产者直出 fp8 |
-| `sparse_attn_pf` 8 block | 40 | 10.5 | 0.42 | 0.34% 占用率；`DSV41_ATTN_SPLIT=8` **实测更差**（13.51ms） | 需新的切分维度 |
+| `sparse_attn_pf` 8 block | 40 | 10.5 | 0.42 | 0.34% 占用率；`DSV41_ATTN_SPLIT=8` **实测更差**（13.51ms） | 需新的切分维度 → **已做（2026-09-11 晚）**：key-split × 3 深预取，默认 ON |
 | `hc_mixes_tail` 单 block | 80 | 12.2 | 0.97 | 20 轮 sinkhorn 串行（~2.6µs，31/32 warp 空转）+ 7 barrier | 待做（重叠 sinkhorn 与 collapse） |
 
 ### shared expert TP 切分的 err 700：根因与修复（2026-09-11 晚）

@@ -755,6 +755,20 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 // Anything that touches the pipeline must keep C=1 bit-exact.
 // DSV41_ATTN_PF_SPLIT=1 is the cheap equivalence check; C>1 differs only in the
 // final summation grouping (tolerance, not bit-equality).
+//
+// MEASURED (isolated harness tests_dsv41_sparse_pfsplit.cu, h=8, d=512, window
+// 128, 300 iters, us/call; the harness runs a non-graph back-to-back loop so it
+// carries ~4 us of launch-gap floor per extra kernel that a captured step does
+// not - read the SHAPE, not the absolute):
+//   topk   128    155    203    328    640      (topk = window + min(clen, idx_topk))
+//   pf    13.7   16.2   20.0   29.8   53.9
+//   C=4    9.6   10.5   11.5   14.4   20.8
+//   C=8   11.6   11.8   12.6   13.9   17.1
+// C=4 wins for topk <= ~240, C=8 from ~300 up; the per-slot cost drops ~7x in
+// both (pf 78 ns/slot vs 10.7 at C=8), so what is left at small topk is the
+// fixed merge/launch cost. 8 is the default because the long-context steady
+// state (clen at the compress cap) is where the sparse path dominates the step;
+// DSV41_ATTN_PF_SPLIT=4 is the short-context arm.
 #define kAttnPfSplitDefault 8
 #define kAttnMaxC 16
 #define kAttnMaxBM 8

@@ -13,6 +13,7 @@
 | shared expert TP 切分（`DSV41_SHARED_TP`）| chain_dev.rs:2210 `moe`；−1.43ms |
 | lm_head 词表切分 + 跨 rank argmax（`DSV41_HEAD_SLICE`）| −0.35ms |
 | sparse 3 深预取（`DSV41_ATTN_PF`）| sparse_attn_pf_kernel dsv41_kernels.cu:484；−1.09ms |
+| **sparse 3 深预取 × key-split（`DSV41_ATTN_PF_SPLIT=8`，默认 ON）** | 同一 kernel 加了 key 分块：grid=(C,b·m,h) + merge kernel；C=1 与 pf **位级一致**，微基准 per-slot 78→10.7ns |
 | P1 route_topk hist 死码 + P2 zero 冗余 | −0.27ms |
 | MoE 批化 / NR / SH_EXP_MX2 / MIX_GATE / FUSE_C / FUSE_B1 | 均为默认 ON（勿再误关）|
 
@@ -74,6 +75,6 @@ persistent 单独到不了 5ms——**真实工作地板 ≈ 5.3ms**（expert_ge
 ## 6. 每阶段"不做"清单
 
 - **Stage A**：不做 xn-megafuse / 段融合（先拿满增量收益）；不批量 sed 翻默认（`f3b1be1` 误关 7 门 = +8.7ms）；不给 kernel 加 blockDim（sparse/quant 会错结果）。
-- **Stage B**：不做字面跨层搬运（会读错 s.h）；不给 sparse_attn 加 `DSV41_ATTN_SPLIT`（实测更差）；不共用 `s.o` 的双重生命周期。
+- **Stage B**：不做字面跨层搬运（会读错 s.h）；~~不给 sparse_attn 加 `DSV41_ATTN_SPLIT`（实测更差）~~ → **2026-09-11 修正**：当年更差是**丢了 3 深预取**，不是 key-split 无效——split 版已补上预取并成为默认（`DSV41_ATTN_PF_SPLIT`，见 §1）；不共用 `s.o` 的双重生命周期。
 - **Stage C**：不做整模型单核；不把跨 rank 同步塞进单核；不拆 split=8（改部分和顺序）；不捕获含 `cudaMalloc`/host 交互的核。
 - **Stage D**：不做 MTP（用户明令禁止）；不重试 k-split/uint4/T=4（均阴性）；不"变快=少算"（必逐位/text 验证）。

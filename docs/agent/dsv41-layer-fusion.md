@@ -51,14 +51,14 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 8 | `lin wkv` | :1215 | k=5120 → n=hd=512 |
 | 9 | `rmsnorm`（kv_norm，原地）| :1223 | `[1,512]` |
 | 10 | `apply_rope` | :1231 | rows=1 |
-| 11 | `ring_append`（仅 owner 层）| :1284 | `[hd]` → ring |
-| 12 | `window_idxs`（每步无条件）| :1325 | `idxs[win+index_topk+8]i32` |
+| 11 | `ring_append`（仅 owner 层）| :1284 | `[hd]` → ring。**B2 已与 #12 融合**（见 §6）|
+| 12 | `window_idxs`（每步无条件）| :1325 | `idxs[win+index_topk+8]i32`。**B2**：`ring_win_fuse` 一次启动同时做 #11+#12，`ring==null` 时仍写 idxs（非 owner 层的独立 `window_idxs` 也消失）|
 | 13 | `compress()`（kv-source 层）| :1308-1314 → :1589-1649 | pool + commit 两核 |
 | 14 | `indexer()`（仅 8 个 source 层）| :1332 → :1446-1584 | idx_k（512→128）+ norm + rope + publish + idx_wq_b（1280→4096）+ rope + idx_weights（5120→32）+ `indexer_topk`（smem **26688 B**，与 per-step `n_pos` 解耦 ✓）|
 | 15 | `comp_placeholder`（无 indexer 时）| :1340 | 写 `idxs[win..]` |
 | 16 | `sparse_attn` | :1348 | b=1,m=1,h=nlh,d=512, window=128, index_topk=512 → `s.o` |
-| 17 | `apply_rope`（**反向**）| :1363 | rows=nlh, inverse=true |
-| 18 | `quant1`（o 量化）| :1392 | 长度 `nlh*hd`=4096 |
+| 17 | `apply_rope`（**反向**）| :1363 | rows=nlh, inverse=true。**B2**：`apply_rope_q` 在 epilogue 直出 #18 的 fp8（见 §6）|
+| 18 | `quant1`（o 量化）| :1392 | 长度 `nlh*hd`=4096。**B2**：由 #17 的 epilogue 承担，本行在融合路径消失 |
 | 19 | `gemm_fp8_mx` ×`nlg`（分组 o 投影）| :1409 | k=`hpg*hd`=4096, n=`olg`=1024 |
 | 20 | `lin wo_b` | :1426 | k=`ol_local`=128 → n=5120 |
 | 21 | **AR#1** | :1434 | `s.o`, 20480 B |
@@ -149,6 +149,26 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
    记录在案并以文本判定 ✓。**不做**"看着差不多"的推断 ✓。
 
 ## 6. 已知风险 / 待确认
+
+- **✅ B2：attention 尾部的两个小 kernel 融合（2026-09-11，DSV41_OROPE_Q / DSV41_RING_WIN_FUSE 默认 ON）**：
+  - **① o-rope fp8 epilogue** —— `apply_rope_kernel`（`dsv41_kernels.cu`）新增 `xq`/`xsc` 两个可选尾参
+    （null = 跳过，原 `dsv41_apply_rope` 行为逐位不变）；新符号 `dsv41_apply_rope_q` 在旋转后**再走一趟
+    全行量化**（`[0, rows*row_len)`），用 `quant_kernel<0>` 的算术逐字（amax 一次 full-warp shuffle /
+    `fast_round_scale(·,1/448)` / clamp±448 / `__nv_fp8_e4m3`），因此与它替代的 `quant1(s.o)` 逐位相同，
+    `wo_a` 直读同一 `s.xq`/`s.xsc`。⚠️ **纠正一个直觉误区**：rope 循环是 `i<half`（half=32）且每 lane 处理
+    **一对** (2i,2i+1)，32 lane 覆盖 64 列 = **2 个量化块**，**不能**让 rope 循环自己充当量化块；而且它只碰
+    每 head 尾部 `rope_head_dim` 列，而 `quant1(s.o)` 量化的是**整行** `nlh*hd`。所以 epilogue 必须是
+    **barrier 之后的第二趟**（一个 warp 一个 32-block）；这不是 T1 的"写回趟顺带"。launcher 在
+    `rows*row_len % 32 != 0` 时返回 1 → Rust 回退 `(apply_rope, quant1)`。每步省 40 次 launch。
+  - **② `ring_append` + `window_idxs` 合并** —— 两者相邻、都只依赖 `*pos_ctr`、互不消费对方输出
+    （append 写 ring，idxs 只读计数器），故可合成一个 `dsv41_ring_win_fuse`（grid = `max(window,hd)/128`）。
+    `ring==null` 表示非 owner 层（不拥有自己的 store）仍执行 idxs 半边 ⇒ **每个** layer 的独立
+    `window_idxs` 都消失。调用点从原 `window_idxs` 位置（compress **之后**）上移到 `ring_append` 位置
+    （compress **之前**）——安全，因为二者之间没有代码写 `idxs[0,win)`，唯一读者是 `sparse_attn`。
+    每步省 40 次 launch。
+  - 收益：合计 −80 个图节点（若每次 launch ~1.5-2µs，则 −0.10~0.15ms 量级）；**尚未上机实测**。
+  - 回退：`DSV41_OROPE_Q=0` / `DSV41_RING_WIN_FUSE=0`，或老 `.so`（`ko!` 符号探测自动回退）。
+  - ⚠️ 与 sparse 段的并行改动无关：apply_rope 在 `dsv41_kernels.cu:1131`，sparse 段在 `:2839+`。
 
 - **✅ q rope / idx_q rope 已折进 GEMV epilogue（DSV41_ROPE_FUSE，默认 ON）** ✓（2026-09-11）：
   新的两个 C 符号 `dsv41_gemm_fp8_mx_rope`（单族，q rope）与 `dsv41_gemm_fp8_mx2_rope`
