@@ -3013,3 +3013,12 @@ memcpy_d2d(index_k.ptr + group * idx_hd * 4, self.s.idx_k.ptr, idx_hd*4);   // �
 **其余审计结论**（无问题 ✓）：`pre_a` 的 16B D2D（常量 ✓）、`h→h2` 拷贝（定址 ✓）、
 indexer 的 `for g in 0..nlg`（`nlg = cfg.o_groups/world` **静态模型维度** ✓，非每步值 ✓）、
 `eng_ids + li*n_cols`（静态 ✓）、`clen + owner`（每层静态 ✓）。
+
+### 该修复的隔离验证 ✓（不依赖模型、不受迁移 subagent 影响 ✓）
+`/tmp/ikp_repro.cu`（新模板 ✓）：把 `clen` 从 1 到 8 逐个上传 ✓，每次调 `dsv41_index_k_publish`
+并**从缓冲区里把对应组槽位拷回来逐元素比对** ✓ ⇒ **`[ikp] clen=1..8 -> group slot OK (0 bad)`** ✓✓
+—— 证明**目的槽位确实来自设备计数器** ✓（宿主算地址会全部落到同一组 ✗，正是被修复的行为 ✓）。
+
+**可复用模式（本会话第 4 个隔离复现器）**：`/tmp/{hc,sa,ikp}_repro.cu`
+= 直接链 `libferrite_kernels.so` ✓ + 预热 ✓ + 循环断言 ✓ + **空 kernel 地板对照**（hc/sa 版 ✓）。
+⚠ 模板坑（已踩两次 ✗）：返回 `int` 的 FFI **不能**用 `cudaError_t` 包装宏 ✓ ⇒ 单独定义 `HCM`/`IKP` 宏 ✓。
