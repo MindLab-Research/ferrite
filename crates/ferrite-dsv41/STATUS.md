@@ -7365,3 +7365,24 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 3. **预防措施**：以后 docs 提交用 `git add <specific-files>` 而非 -A；或者等 subagent 完成后再统一提交
 
 **这已是第 4 次类似事故**（前 3 次：a32-vec4 被 docs 扫入、ar-reduce-grid 被 docs 扫入、expert-pipeline 被 docs 扫入）——前 3 次幸运地自包含（kernel 侧改动不涉及 FFI 签名），这次终于踩雷。
+
+### v12/v12sf 验证定案：folds 全部失败（2026-09-12 08:30）
+
+| 臂 | p50 | 判定 |
+|---|---|---|
+| v12（quant fold + swiglu fold ON） | **6.62ms** | **+0.39ms 回归** |
+| v12sf（+ stamp fold ON） | **29.5s/step** | **灾难性失败（4700x 慢）** |
+
+**quant fold 的结构性缺陷（不可修复）**：
+- fork_ev 在 EARLY kernel **完成时**记录——kernel 内的任何额外工作都推迟事件
+- fp4 直出 +1.8µs → main 的 fork_ev 等待 +1.8µs × 80 fronts = +0.14ms
+- 省的 quant launch 只有 −0.072ms → 结构性净负
+- **教训：事件是 kernel 级不是 block 级——给 gate kernel 加工作 = 加到关键路径**
+
+**swiglu fold**：w2 prologue 的 swiglu 在 GEMV 上下文中比独立 kernel 贵（寄存器/布局差异）
+
+**stamp fold 的灾难**：单调 counter 在图 replay 下机制坏掉（29.5s/step = poll 自旋等永远不来的 stamp）——第 4 次 AR 协议改动失败（v2 capture race → v3 last-block → oneshot ×2 → stamp fold）
+
+**处置**：QUANT_FOLD / SWIGLU_FOLD / AR_STAMP_FOLD 全部默认 OFF。基线保持 6.23ms（160.5 tok/s）。
+
+**方法论（第 4/5 次隔离→生产失效）**：小 kernel 合并的收益分析必须考虑 **gate 语义**——省 launch 的收益 < 加到 gate kernel 的代价时是净负。
