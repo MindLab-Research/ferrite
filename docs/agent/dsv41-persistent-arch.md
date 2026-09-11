@@ -280,10 +280,19 @@ __global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const 
 另一模型的 `ferrite_kernels.cu:5955/6209`）。**本项应关闭。**
 
 **真顺位（若继续投入）**：① key-split —— ✅ **已实施（2026-09-11，sparse-attn-v8）**：
-`sparse_attn_merge_kernel`（`dsv41_kernels.cu:1189`）现在带可选 rope+fp8 epilogue，`dsv41_sparse_attn_orope`
+`sparse_attn_merge_kernel`（`dsv41_kernels.cu:1382`）现在带可选 rope+fp8 epilogue，`dsv41_sparse_attn_orope`
 的 `split_c>0` 分支不再 decline，直接跑 split + merge 两 launch 且保留两个融合；gate `DSV41_SPARSE_SPLIT`
 默认 C=4（`kSparseSplitDefault`，`dsv41_resolve_sparse_split_c()` 统一解析，plain 与 orope 共用以免选择不一致）。
 隔离台架 per-slot 成本降 ~7x（`dsv41_kernels.cu:845-857`）。
+**①b merge 选举折叠（2026-09-11，sparse-attn-v9）：`DSV41_SPARSE_MERGE_FOLD` 默认 ON**——merge 的
+(b·m,h)=8 blocks 只占 148 SM 的 ~5%，5.1µs 大半是固定开销；`sparse_attn_split_kernel`（`:1085`）在每组
+(b·m,h) 的 C 个 chunk 之上用 **per-group ticket** `g_attn_ticket[row][hh]`（`:943`）选举最后完成者
+（atomicAdd 返回 C-1 者），由它就地调 `sparse_attn_merge_body`（`:956`，与 merge kernel 共用同一份体）
+跑 merge；每层 launch 从 2 降到 1。有序性：`__syncthreads()` → 发布线程 `__threadfence()`(release) →
+atomicAdd → winner `__threadfence()`(acquire) 后才读 `g_attn_part`，与 `g_sh_arrive`（`:5320`）/、
+`hc_dots_late` 同一 idiom；winner 读完最后一块后 `atomicExch` 清零，graph replay 可复用。=0 回退两 kernel。
+位级一致的判据是两道：**同 C 下 fold ON vs OFF 逐位相同**（都跑同一个 `sparse_attn_merge_body`），
+以及 C=1 对 pf 的原有位级一致。台架新增 `REF=<label>` 臂支持这个对拍（`tests_dsv41_sparse_pfsplit.cu`）。
 ② 单块内提并行（加 warp 数）——**但 merge epilogue 只折 4 个 warp**
 （`sh_acc[4][512]`、`w < nwarp && w < 4`，`:1631/1644-1647`），改 blockDim 必须先改这个静默截断；
 key-split C=4 恰好 4 warp，所以走的是 split 维度而不是这条。

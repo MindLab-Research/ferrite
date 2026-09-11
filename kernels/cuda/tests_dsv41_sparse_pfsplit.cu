@@ -25,7 +25,15 @@
 //   DSV41_ATTN_PF_SPLIT=1 ./t_sparse_pfsplit c1   50   # must be bit-identical to pf
 //   DSV41_ATTN_PF_SPLIT=8 ./t_sparse_pfsplit c8   50   # tolerance vs pf
 //
-// ⚠️ The DEFAULT chunk count now comes from `DSV41_SPARSE_SPLIT`
+// MERGE FOLD A/B (sparse-attn-v9, DSV41_SPARSE_MERGE_FOLD, default ON): one
+// process per arm again, but now the REFERENCE label is selectable through
+// REF=<label> so fold-ON can be compared BIT-EXACTLY against fold-OFF at the
+// same C (they run the same `sparse_attn_merge_body`, so the acceptance test is
+// nbits == 0):
+//   DSV41_SPARSE_MERGE_FOLD=0 ./t_sparse_pfsplit c4nf 50            # writes out_c4nf.bin
+//   DSV41_SPARSE_MERGE_FOLD=1 REF=c4nf ./t_sparse_pfsplit c4f 50    # must be BIT-IDENTICAL
+//
+// ⚠️ The DEFAULT chunk count comes from `DSV41_SPARSE_SPLIT`
 // (kSparseSplitDefault = 4, sparse-attn-v8); `DSV41_ATTN_PF_SPLIT` still wins
 // when set EXPLICITLY, so the three lines above are unaffected. An arm that
 // forgets to set it runs C=4, not pf.
@@ -160,6 +168,11 @@ int main(int argc, char** argv) {
            (double)ms * 1000.0 / iters, sum, amax, fnv);
 
     // ---- cross-run comparison ---------------------------------------------
+    // The reference label defaults to "pf" but can be overridden with REF=<label>
+    // so the merge fold can be A/B'd BIT-EXACTLY: run the fold-OFF arm first
+    // (DSV41_SPARSE_MERGE_FOLD=0 ... nf), then the fold-ON arm with REF=nf ->
+    // "BIT-IDENTICAL" is the acceptance test. The launcher caches its gates in
+    // process-local statics, hence one process per arm.
     char path[64];
     snprintf(path, sizeof(path), "out_%s.bin", label);
     FILE* f = fopen(path, "wb");
@@ -167,8 +180,12 @@ int main(int argc, char** argv) {
         fwrite(out.data(), sizeof(float), out.size(), f);
         fclose(f);
     }
-    if (strcmp(label, "pf") != 0) {
-        FILE* r = fopen("out_pf.bin", "rb");
+    const char* ref_label = getenv("REF");
+    if (ref_label == nullptr || ref_label[0] == '\0') ref_label = "pf";
+    if (strcmp(label, ref_label) != 0) {
+        char rpath[64];
+        snprintf(rpath, sizeof(rpath), "out_%s.bin", ref_label);
+        FILE* r = fopen(rpath, "rb");
         if (r) {
             std::vector<float> ref(out.size());
             size_t got = fread(ref.data(), sizeof(float), ref.size(), r);
@@ -186,11 +203,12 @@ int main(int argc, char** argv) {
                     memcpy(&c, &ref[i], 4);
                     if (a != c) ++nbits;
                 }
-                printf("      vs pf: max|d|=%.3e  max rel=%.3e  differing lanes=%d/%zu  %s\n", md,
-                       mr, nbits, out.size(), nbits == 0 ? "BIT-IDENTICAL" : "tolerance");
+                printf("      vs %s: max|d|=%.3e  max rel=%.3e  differing lanes=%d/%zu  %s\n",
+                       ref_label, md, mr, nbits, out.size(),
+                       nbits == 0 ? "BIT-IDENTICAL" : "tolerance");
             }
         } else {
-            printf("      (out_pf.bin missing - run the pf arm first)\n");
+            printf("      (out_%s.bin missing - run the %s arm first)\n", ref_label, ref_label);
         }
     }
     return 0;

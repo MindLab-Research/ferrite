@@ -75,7 +75,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
 | 27 | `lin_bf16 gate` | moe :1693 | k=5120 → n=384 |
 | 28 | `route_topk` | :1700 | score_func=2；smem **3096 B**。**已融合**：`DSV41_ROUTE_FUSE`（默认 ON）时由 #27 的 gate GEMV（`ferrite_gemv_bf16_v2_route`）last-block epilogue 顺带完成，本行消失（老 `.so` / MIX_GATE / CUBLAS_M1 自动回退到本行）|
 | 29 | `zero` ×2 | :1728/:1729 | memset |
-| 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32。**已融合**：`DSV41_QUANT_FP4_FUSE`（默认 ON）时 `dsv41_quant_fp4` 发射单核 `quant_fp4_fused_kernel`（量化+打包一步，bit-exact），旧 `quant_kernel<1>` + `fp4_pack_kernel` 两段路径保留为回退（env=0，或 block 奇数/>256）。**再融合（`DSV41_QUANT_FOLD`，默认 ON）**：FFN 半的 hc EARLY collapse epilogue 在写 `s.xn` 的同一趟里直出 fp4 到 `s.xq4`/`s.xsc4`（`hc_mixes_tail_kernel` 的 `xq4`/`xsc4` 形参），本行的 launch 被跳过；同 32-block 算式，bit-exact（见下文） |
+| 30 | `quant_fp4`（激活）| :1783 | rows=1, cols=5120, block=32。**已融合**：`DSV41_QUANT_FP4_FUSE`（默认 ON）时 `dsv41_quant_fp4` 发射单核 `quant_fp4_fused_kernel`（量化+打包一步，bit-exact），旧 `quant_kernel<1>` + `fp4_pack_kernel` 两段路径保留为回退（env=0，或 block 奇数/>256）。**再融合（`DSV41_QUANT_FOLD`，**默认 OFF**——v12 serve A/B 实测 +0.39ms 回归，2026-09-11 结论见下）**：FFN 半的 hc EARLY collapse epilogue 在写 `s.xn` 的同一趟里直出 fp4 到 `s.xq4`/`s.xsc4`（`hc_mixes_tail_kernel` 的 `xq4`/`xsc4` 形参），本行的 launch 被跳过；同 32-block 算式，bit-exact（见下文） |
 | 31 | **batched 路径（`moe_batch()` 代码默认 OFF**，:190 `unwrap_or(false)`）| :2317-2432 | `expert_gate_up_fp4_batched`（smem **20480 B**）→（`gateup_fused` 开时**跳过** `swiglu_limit_batched`；`gateup_fused = DSV41_GATEUP_FUSE!=0 && supports_gateup_fuse() && expert_fp4_mode()==2`，:2344/:2383 —— 必须与 `.cu:1367` 的 `g_fuse && g_expert_fp4_mode==2 && dim%512==0` 逐字镜像）→ **down 方向二选一**：`DSV41_DOWN_FUSE`（:200，默认 OFF）⇒ `expert_down_reduce_fp4_batched` **一次启动**（grid `⌈dim/8⌉`、串行升序 slot、`out` 覆盖写，替代下两行）；否则 `expert_down_fp4_batched`（smem `inter_local*4`）+ `moe_down_reduce`（定序求和 ✓）。**W2 L2 预热（`DSV41_W2_PREWARM`，默认 ON）**：gate/up 启动之后、down 启动**之前**插一次 `dsv41_w2_l2_prewarm`（`device.rs::w2_l2_prewarm`，`supports_w2_prewarm()` 探测符号，老 `.so` 直接跳过），对 `slots` 个专家的 w2（`dim*(inter/2)`）与 scale 行（`dim*(inter/32)`）发射 `cp.async.bulk.prefetch.L2.global`；fire-and-forget、不写任何字节、恒返回 0，故逐位不变。动机：down 是**延迟受限**（286-385 GB/s vs ~7 TB/s），w2 在本步之前从未被触碰，把它提前放进 L2 等于把延迟从 ~600 ns 降到 ~200 ns（同层 9.17+0.57 MB < L2 的 10%；跨层 367 MB/step 不行）。**不要**把这套预热塞进 down kernel 内部做软件流水：每个 warp 每 slot 的算术只有 ~30 周期（~20 ns），对 ~600 ns 的 HBM 延迟差两个数量级，预热必须发生在消费者之外的空闲窗口 |
 | 31' | sequential 回退（逐 slot ×topk）| :2433-2477 | `expert_gate_up_fp4_indirect` / `swiglu_limit` / `expert_down_fp4_indirect` |
 | 32 | 共享专家（`shared_rank`：`DSV41_SHARED_TP` 时 = **所有 rank**，各自 `inter/world` 切片；否则仅 rank 0）| :2504-2588 | gate/up 二选一：`DSV41_SH_EXP_MX2`（默认 ON）⇒ **一次 `gemm_fp8_mx2`**(w1,w3)；否则两次 `gemm_fp8_mx`。前置 `quant1(xn)`（`sh_via_mixed` 时由 `gemm_bf16_fp8x2` 顺带完成）。swiglu 二选一（A4）：`DSV41_SWIGLU_Q`（**默认 ON**，`chain_dev.rs:301-331`）⇒ `swiglu_limit_q` 一次启动直出 `(xq,xsc)`（warp=1 个 32-block，amax 一次 shuffle；`inter%32` 不满足则返回 1 回退）；否则 `swiglu_limit` + `quant1(ex_act)`。⚠️ 它曾被记为 "round-18 数值 bug 暂缓"，实为**误归因**：A4 代码首次出现在 `f3b1be1`（其 commit message 报告的正是 round-18 那次跑分），而 `f3b1be1^` 里根本没有 `swiglu_limit_q`/`act_q`——round-18 的乱码与 A4 无关（根因是 gateup/down 融合的 `.cu`/Rust 默认值分裂，见下文），A4/A5 只是被 `f6a1c08` 连带批量 gate OFF。逐项核对：f32 写回同一个寄存器 `v`（无 global 回读）、amax 是同一组 32 值的 fmaxf 树（warp 恰好覆盖一个量化块，无需跨 warp 归约）、scale/字节算式与 `quant_kernel<0>`(block=32, round_scale=1) 逐项同式 ⇒ 逐位相同；证据 = `kernels/cuda/tests_dsv41_glue.cu` 的 `swiglu_q` 用例（对真实 `dsv41_quant_fp8` 比 xq/xsc/f32 逐位）。w2 二选一（A5）：`DSV41_MOE_EPI_ADD`（**默认 OFF**，`chain_dev.rs:292-299`；与 A4 一起被 `f6a1c08` 批量 gate OFF，`=1` 可重开）⇒ `gemm_fp8_mx_add` 把 `add_inplace` 折进 GEMV 的 lane-0 epilogue，**直写 `s.o`**（结合律 `o+(acc+bias)` 不变 ⇒ 逐位相同）；否则 `gemm_fp8_mx`(w2→`ex_out`) + `add_inplace(o, ex_out)`。两处 gate 均 OnceLock 缓存、`supports_*()` 探测 `.so` 符号（老 `.so` 自动回退） |
@@ -497,7 +497,18 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   - ⚠️ **收益预期须修正** ✗：题面 `−0.88ms(40×22µs)` 假设共享链 22µs 可完全隐藏；实际可隐藏
     部分 ≤ min(routed, shared) 且受 SM/带宽争抢影响。上机后须用 `DSV41_MOE_DUAL=0/1` 同会话背靠背
     单轮实测（`scripts/dsv41_serve_ab.sh`），并同时验证 `opcheck`/faults 与文本。
-- **QUANT_FOLD `DSV41_QUANT_FOLD`（默认 ON，2026-09-11 实现，待上机实测）** ✓：
+- **QUANT_FOLD `DSV41_QUANT_FOLD`（实现 2026-09-11；**默认 OFF** —— v12/v13 serve A/B 实测回归，`chain_dev.rs:2403` 读作 `v == "1"`，只能 opt-in）** ✗：
+  **回归机制（已定案，勿再归因于占用率）**：`fork_ev` 是 **kernel 级**事件——EARLY 整核跑完才 record，
+  而主流的投影组就 wait 在这个 event 上 ⇒ 加进 EARLY 的**任何**工作都直接落在关键路径上
+  （fp4 直出 ≈1.8µs × 80 front = +0.14ms，换回的 quant launch 只有 −0.072ms）。
+  ⚠️ **占用率不是机制**：`hc_mixes_tail_kernel` 在 decode 是 **grid = rows = 1**（`chain_dev.rs:2186`
+  传字面量 1；launcher `dsv41_kernels.cu:8143/8210` 用 `<<<rows, 1024>>>`），整个 grid 只有 **1 个 block**
+  ⇒ 「blocks/SM」不是变量（1 个 SM 忙、147 空）。即便多块，1024 线程/块下寄存器阈值只有
+  32（2 块）/64（1 块）/超 64=**launch 失败 701**（本文件 `:3570-3590` 记录的 gemv 72-reg 事故），
+  而本核带着 LATE sinkhorn + collapse 不可能 ≤32 ⇒ 已钉在 1 块的下界，**没有更小的正整数**。
+  次要点：`mags[8]` 是 `const` + `#pragma unroll`，会被折成立即数，**不占 8 个寄存器**。
+  实测复核命令（本地无 nvcc 时必须上机）：`nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 --use_fast_math -Xptxas -v -c kernels/cuda/dsv41_kernels.cu`。**
+
   MoE 的 `quant_fp4(s.xn)`（#30）唯一的输入就是 hc tail **EARLY** collapse 写出的 `s.xn`，
   而 EARLY 已经在同一趟 epilogue 里直出 fp8（T1）。⇒ 在 `hc_mixes_tail_kernel` 的 EARLY
   epilogue 再加一路 **fp4 直出**：`xq4`/`xsc4` 形参非空时，写完 `o_r[c]` 后同址算出该 32-block

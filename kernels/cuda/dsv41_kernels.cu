@@ -932,6 +932,110 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 #define kAttnStride (2 + 512)
 __device__ float g_attn_part[kAttnMaxBM][kAttnMaxH][kAttnMaxC][kAttnStride];
 
+// Per-(row, head) election ticket for the merge fold (DSV41_SPARSE_MERGE_FOLD).
+// Each split block bumps its GROUP's counter AFTER its chunk partial is due;
+// the block that observes the pre-bump value C-1 is the last of the group and
+// runs the merge tail itself. Grid.x == C exactly, so C is uniform over a group;
+// the counter index is (blockIdx.y, blockIdx.z), never a global one - a single
+// global counter would let one group's winner serve another group's merge.
+// The winner resets its slot after its last g_attn_part read, so a graph replay
+// starts clean - the same discipline `g_hc_ticket` / `g_sh_arrive` use.
+__device__ unsigned g_attn_ticket[kAttnMaxBM][kAttnMaxH];
+
+// ---------------------------------------------------------------------------
+// The merge body, shared VERBATIM by the standalone `sparse_attn_merge_kernel`
+// and the elected last chunk block of `sparse_attn_split_kernel`
+// (DSV41_SPARSE_MERGE_FOLD, sparse-attn-v9). Bit-exactness against the two-launch
+// form is by construction: identical chunk order, identical expf/fma chain,
+// identical 128-thread `c` walk.
+//
+// `P` points at g_attn_part[row][hh][0][0]; `sh_row` is a caller-owned 512-float
+// shared buffer (only the fused arm touches it). For e.g. sh_row[512], this
+// function is called once per (row, hh) group.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void sparse_attn_merge_body(
+    const float* __restrict__ P, const float* __restrict__ sink, float* __restrict__ out, int row,
+    int hh, int h, int d, int C, const float* __restrict__ cos, const float* __restrict__ sin,
+    const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step, int inverse,
+    uint8_t* __restrict__ xq, float* __restrict__ xsc, float* sh_row) {
+    float smax = -1e30f;
+    for (int ck = 0; ck < C; ++ck) smax = fmaxf(smax, P[(size_t)ck * kAttnStride]);
+    float se = 0.f;
+    for (int ck = 0; ck < C; ++ck)
+        se += P[(size_t)ck * kAttnStride + 1] * expf(P[(size_t)ck * kAttnStride] - smax);
+    se += expf(sink[hh] - smax);
+    float* orow = out + ((size_t)row * h + hh) * d;
+    if (cos == nullptr && xq == nullptr) {
+        // Plain split arm: unchanged (no smem, no barrier, same bytes).
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+            float a = 0.f;
+            for (int ck = 0; ck < C; ++ck)
+                a += P[(size_t)ck * kAttnStride + 2 + c] *
+                     expf(P[(size_t)ck * kAttnStride] - smax);
+            orow[c] = (se > 0.f) ? a / se : 0.f;
+        }
+        return;
+    }
+    for (int c = threadIdx.x; c < d; c += blockDim.x) {
+        float a = 0.f;
+        for (int ck = 0; ck < C; ++ck)
+            a += P[(size_t)ck * kAttnStride + 2 + c] * expf(P[(size_t)ck * kAttnStride] - smax);
+        sh_row[c] = (se > 0.f) ? a / se : 0.f;
+    }
+    __syncthreads();   // sh_row complete before the rope reads it (and the quant below)
+    if (cos != nullptr) {
+        // PHASE 2 (`sparse_attn_orope_kernel` :1557-1567 verbatim): inverse rope on
+        // the trailing `rope_rd` columns; `hh` is this block's head, so the position
+        // argument matches the single-block path's per-head loop index.
+        const int tt = (*base) * mul + off + hh * step;
+        float* rrow = sh_row + (d - rope_rd);
+        for (int i = threadIdx.x; i < half; i += blockDim.x) {
+            const float cc = cos[(size_t)tt * half + i];
+            const float ss = sin[(size_t)tt * half + i] * (inverse ? -1.f : 1.f);
+            const float x0 = rrow[2 * i], x1 = rrow[2 * i + 1];
+            rrow[2 * i] = x0 * cc - x1 * ss;
+            rrow[2 * i + 1] = x0 * ss + x1 * cc;
+        }
+        __syncthreads();   // rope writes visible before the store + quant
+    }
+    // PHASE 3 (`sparse_attn_orope_kernel` :1569-1595 verbatim): store the roped row,
+    // then the fp8 emission of it. `d % 32 == 0` (launcher-guarded) so the flat
+    // per-32-block index is exactly the head-local one and a warp's 32 lanes cover
+    // one block - bit-identical to the standalone `dsv41_quant_fp8`.
+    for (int c = threadIdx.x; c < d; c += blockDim.x) orow[c] = sh_row[c];
+    if (xq != nullptr) {
+        const int lane = threadIdx.x & 31;
+        const size_t xbase = ((size_t)row * h + hh) * (size_t)d;
+        const size_t sbase = xbase >> 5;   // d % 32 == 0
+        const int nb = d >> 5;
+        const int gwarp = threadIdx.x >> 5;
+        const int nw = (int)blockDim.x >> 5;
+        for (int blk = gwarp; blk < nb; blk += nw) {
+            const int c = blk * 32 + lane;
+            const float v = sh_row[c];
+            float a = fabsf(v);
+            for (int off2 = 16; off2 > 0; off2 >>= 1)
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off2));
+            const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+            if (lane == 0) xsc[sbase + blk] = sc;
+            const float qv8 = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+            const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qv8);
+            xq[xbase + c] = *(const uint8_t*)&f8;
+        }
+    }
+}
+
+// DSV41_SPARSE_MERGE_FOLD (default ON, sparse-attn-v9): run the (b*m, h) merge
+// inside the LAST split block of each (row, head) group instead of a second
+// launch. The merge's 8-block grid is ~5% of 148 SMs and its ~5.1us is almost
+// all launch/tail latency, so folding it removes 40 launch nodes per step (one
+// per layer) at zero added work. =0 restores the two-launch form, which stays
+// bit-identical (both paths run `sparse_attn_merge_body`).
+static bool dsv41_resolve_sparse_merge_fold() {
+    const char* e = getenv("DSV41_SPARSE_MERGE_FOLD");
+    return e == nullptr || atoi(e) != 0;
+}
+
 // Resolve the sparse-attention key-split chunk count, ONCE per process (a per-call
 // getenv is exactly the hot-path slip every other gate in this file avoids; the
 // callers cache this in a function-local static). Precedence:
@@ -964,11 +1068,27 @@ static int dsv41_resolve_sparse_split_c() {
 }
 
 // grid (C, b*m, h): block (ck, row, hh) owns keys [topk*ck/C, topk*(ck+1)/C).
-__global__ void sparse_attn_split_kernel(const float* __restrict__ q,
-                                         const float* __restrict__ kv,
-                                         const int32_t* __restrict__ idxs, int b, int m, int h,
-                                         int d, const int* __restrict__ clen, int window,
-                                         int index_topk, float scale, int C) {
+//
+// MERGE FOLD (DSV41_SPARSE_MERGE_FOLD, sparse-attn-v9, default ON): when `fold`
+// is set, the LAST chunk block of each (row, hh) group - elected by an
+// atomicAdd ticket on `g_attn_ticket[row][hh]` - runs the merge body itself
+// instead of a second launch. The merge's 8-block grid is ~5% of 148 SMs and
+// its ~5.1us is almost all launch/tail latency, so folding it removes one launch
+// node per layer. `fold == 0` restores the two-launch form; both paths run the
+// same `sparse_attn_merge_body`, so the bytes cannot move.
+//
+// ⚠️ NOTHING may return early before the ticket is bumped while `fold` is set:
+// grid is exactly (C, b*m, h) and the launcher guards b*m<=kAttnMaxBM, h<=kAttnMaxH,
+// so the `>=` checks below never fire - do NOT relax the launcher guard without
+// revisiting the election (a group whose ticket never reaches C-1 has no winner
+// and its output row stays stale).
+__global__ void sparse_attn_split_kernel(
+    const float* __restrict__ q, const float* __restrict__ kv, const int32_t* __restrict__ idxs,
+    int b, int m, int h, int d, const int* __restrict__ clen, int window, int index_topk,
+    float scale, int C, int fold, const float* __restrict__ sink, float* __restrict__ out,
+    const float* __restrict__ cos, const float* __restrict__ sin, const int* __restrict__ base,
+    int rope_rd, int half, int mul, int off, int step, int inverse, uint8_t* __restrict__ xq,
+    float* __restrict__ xsc) {
     const int n = window + *clen;
     const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int ck = blockIdx.x;
@@ -1203,6 +1323,40 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
         for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
         P[2 + c] = a;
     }
+
+    // ---- merge fold election (DSV41_SPARSE_MERGE_FOLD) -----------------------
+    // Publish this chunk's partial, then elect the LAST block of the group. The
+    // pairing is the hc_dots_late / g_sh_arrive idiom, with the counter keyed on
+    // THIS group (row, hh) - a single global counter would let one group's
+    // winner merge another group's partials, and grid.x == C so the counter is
+    // group-local by construction.
+    //
+    // Ordering: the P[] stores above are plain global writes by all 128 threads.
+    // __syncthreads() completes them within the block, then THREAD 0's
+    // __threadfence() (release) publishes them device-wide and its atomicAdd is
+    // the publish point - the documented multi-writer pattern, and exactly the
+    // g_sh_arrive sequence (:5320-5324). The winner reads the other chunks' P[]
+    // only after its own atomicAdd returned C-1; the __threadfence() below
+    // (acquire) keeps those reads from hoisting above the ticket observation
+    // (hc_dots_late's acquire, :7299).
+    if (fold) {
+        __syncthreads();                     // every thread's P[...] store complete
+        __shared__ int sh_winner;
+        if (threadIdx.x == 0) {
+            __threadfence();                 // release: this block's partials visible
+            sh_winner = (atomicAdd(&g_attn_ticket[row][hh], 1u) == (unsigned)(C - 1));
+        }
+        __syncthreads();                     // sh_winner visible to the whole block
+        if (!sh_winner) return;
+        __threadfence();                     // acquire: the other chunks' P[] visible
+        __shared__ float sh_row[512];
+        sparse_attn_merge_body(&g_attn_part[row][hh][0][0], sink, out, row, hh, h, d, C, cos, sin,
+                               base, rope_rd, half, mul, off, step, inverse, xq, xsc, sh_row);
+        // reset AFTER the last g_attn_part read, so the next launch (or graph
+        // replay) starts clean - the g_hc_ticket discipline (:7371).
+        __syncthreads();
+        if (threadIdx.x == 0) atomicExch(&g_attn_ticket[row][hh], 0u);
+    }
 }
 
 // grid (b*m, h): combine the C chunk partials in ascending chunk order, fold the
@@ -1234,73 +1388,9 @@ __global__ void sparse_attn_merge_kernel(
     if (row >= b * m) return;
     const int hh = blockIdx.y;
     if (hh >= h) return;
-    const float* P = &g_attn_part[row][hh][0][0];
-    float smax = -1e30f;
-    for (int ck = 0; ck < C; ++ck) smax = fmaxf(smax, P[(size_t)ck * kAttnStride]);
-    float se = 0.f;
-    for (int ck = 0; ck < C; ++ck)
-        se += P[(size_t)ck * kAttnStride + 1] * expf(P[(size_t)ck * kAttnStride] - smax);
-    se += expf(sink[hh] - smax);
-    float* orow = out + ((size_t)row * h + hh) * d;
-    if (cos == nullptr && xq == nullptr) {
-        // Plain split arm: unchanged (no smem, no barrier, same bytes).
-        for (int c = threadIdx.x; c < d; c += blockDim.x) {
-            float a = 0.f;
-            for (int ck = 0; ck < C; ++ck)
-                a += P[(size_t)ck * kAttnStride + 2 + c] *
-                     expf(P[(size_t)ck * kAttnStride] - smax);
-            orow[c] = (se > 0.f) ? a / se : 0.f;
-        }
-        return;
-    }
     __shared__ float sh_row[512];
-    for (int c = threadIdx.x; c < d; c += blockDim.x) {
-        float a = 0.f;
-        for (int ck = 0; ck < C; ++ck)
-            a += P[(size_t)ck * kAttnStride + 2 + c] * expf(P[(size_t)ck * kAttnStride] - smax);
-        sh_row[c] = (se > 0.f) ? a / se : 0.f;
-    }
-    __syncthreads();   // sh_row complete before the rope reads it (and the quant below)
-    if (cos != nullptr) {
-        // PHASE 2 (`sparse_attn_orope_kernel` :1557-1567 verbatim): inverse rope on
-        // the trailing `rope_rd` columns; `hh` is this block's head, so the position
-        // argument matches the single-block path's per-head loop index.
-        const int tt = (*base) * mul + off + hh * step;
-        float* rrow = sh_row + (d - rope_rd);
-        for (int i = threadIdx.x; i < half; i += blockDim.x) {
-            const float cc = cos[(size_t)tt * half + i];
-            const float ss = sin[(size_t)tt * half + i] * (inverse ? -1.f : 1.f);
-            const float x0 = rrow[2 * i], x1 = rrow[2 * i + 1];
-            rrow[2 * i] = x0 * cc - x1 * ss;
-            rrow[2 * i + 1] = x0 * ss + x1 * cc;
-        }
-        __syncthreads();   // rope writes visible before the store + quant
-    }
-    // PHASE 3 (`sparse_attn_orope_kernel` :1569-1595 verbatim): store the roped row,
-    // then the fp8 emission of it. `d % 32 == 0` (launcher-guarded) so the flat
-    // per-32-block index is exactly the head-local one and a warp's 32 lanes cover
-    // one block - bit-identical to the standalone `dsv41_quant_fp8`.
-    for (int c = threadIdx.x; c < d; c += blockDim.x) orow[c] = sh_row[c];
-    if (xq != nullptr) {
-        const int lane = threadIdx.x & 31;
-        const size_t xbase = ((size_t)row * h + hh) * (size_t)d;
-        const size_t sbase = xbase >> 5;   // d % 32 == 0
-        const int nb = d >> 5;
-        const int gwarp = threadIdx.x >> 5;
-        const int nw = (int)blockDim.x >> 5;
-        for (int blk = gwarp; blk < nb; blk += nw) {
-            const int c = blk * 32 + lane;
-            const float v = sh_row[c];
-            float a = fabsf(v);
-            for (int off2 = 16; off2 > 0; off2 >>= 1)
-                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off2));
-            const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
-            if (lane == 0) xsc[sbase + blk] = sc;
-            const float qv8 = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
-            const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qv8);
-            xq[xbase + c] = *(const uint8_t*)&f8;
-        }
-    }
+    sparse_attn_merge_body(&g_attn_part[row][hh][0][0], sink, out, row, hh, h, d, C, cos, sin, base,
+                           rope_rd, half, mul, off, step, inverse, xq, xsc, sh_row);
 }
 
 // ------------------------------------------------------------ indexer / rope
@@ -5970,6 +6060,10 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     // harness's "restore the single-block pf kernel" arm - still wins when set, and
     // DSV41_SPARSE_SPLIT=0 is the new opt-out.
     static const int g_sparse_split_c = dsv41_resolve_sparse_split_c();
+    // Merge fold (DSV41_SPARSE_MERGE_FOLD, default ON): the split kernel's last
+    // block per group runs the merge itself, so the second launch below is
+    // skipped. Read ONCE, like every other gate in this file.
+    static const bool g_merge_fold = dsv41_resolve_sparse_merge_fold();
     // Order-preserving prefetch pipeline (default on); DSV41_ATTN_PF=0 restores
     // the plain warp version for A/B.
     static const bool pf_off = [] {
@@ -5987,16 +6081,18 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                                                          window, index_topk, scale);
         } else if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
                    h <= kAttnMaxH) {
-            // One block per (chunk, row, head); the split writes the partials,
-            // the merge folds the sink and normalises (rope/xq are null here, so
-            // the merge's fused epilogue is skipped and this arm is unchanged).
-            // Both launches stay on the SAME stream: program order makes the
-            // partials visible to the merge with no fence and no sync.
+            // One block per (chunk, row, head); the split writes the partials and
+            // (with the fold) the elected last block folds the sink and normalises
+            // - rope/xq are null here, so the merge's fused epilogue is skipped and
+            // this arm's bytes do not move. Both paths stay on the SAME stream.
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
-                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c,
+                g_merge_fold ? 1 : 0, sink, out, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
+                nullptr, nullptr);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
+            if (g_merge_fold) return (int)cudaGetLastError();
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
                 sink, out, b, m, h, d, split_c, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
                 nullptr, nullptr);
@@ -6064,6 +6160,7 @@ extern "C" int dsv41_sparse_attn_orope(
     // path declines shapes it could have carried).
     static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
     static const int g_sparse_split_c = dsv41_resolve_sparse_split_c();
+    static const bool g_merge_fold = dsv41_resolve_sparse_merge_fold();
     static const bool pf_off = [] {
         const char* e = getenv("DSV41_ATTN_PF");
         return e != nullptr && atoi(e) == 0;
@@ -6076,15 +6173,17 @@ extern "C" int dsv41_sparse_attn_orope(
     // different kernels for the same env.
     if (pf_off) return 2;
     if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM && h <= kAttnMaxH) {
-        // The key-split arm, mirroring `dsv41_sparse_attn`'s split arm exactly;
-        // the ONLY difference is that the merge gets the rope/fp8 epilogue
-        // arguments, so both fusions survive instead of declining. Same stream:
-        // program order makes the partials visible to the merge with no fence.
+        // The key-split arm, mirroring `dsv41_sparse_attn`'s split arm exactly.
+        // With the merge fold on, this is ONE launch; the elected last block runs
+        // the merge body below, epilogue included, so both fusions survive.
         sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                         (unsigned)h), 128, 0, s>>>(
-            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c,
+            g_merge_fold ? 1 : 0, sink, out, cos, sin, base, rope_rd, half, mul, off, step,
+            inverse, xq, xsc);
         cudaError_t e2 = cudaGetLastError();
         if (e2 != cudaSuccess) return (int)e2;
+        if (g_merge_fold) return (int)cudaGetLastError();
         sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
             sink, out, b, m, h, d, split_c, cos, sin, base, rope_rd, half, mul, off, step,
             inverse, xq, xsc);
