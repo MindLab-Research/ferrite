@@ -16,15 +16,15 @@
 // One block per row, 256 threads. `hist` (optional) counts assignments per
 // expert so a caller can bucket them without a second scan.
 //
-// STATUS: this kernel is correct for n_experts <= blockDim (verified exactly at
-// n_experts=6/topk=3) but picks a DIFFERENT expert set from the CPU reference at
-// the production shape (n_experts=384/topk=6: 12/12 assignments differ, and they
-// still differ with deliberately well-separated scores, so it is not a
-// near-tie/precision artefact). The per-thread second candidate (threads
-// 0..n_experts-blockDim-1 handle two experts) is the prime suspect. The earlier
-// crash was a separate bug — a `used[]` flag array sized [topk] and indexed by
-// the expert id — which is fixed (consumed experts are now marked by writing
-// -INFINITY into s_sel).
+// STATUS: the note that used to sit here claimed this kernel picks a different
+// expert set from the CPU reference at the production shape (n_experts=384 /
+// topk=6) and blamed the per-thread second candidate. That conclusion is
+// contradicted by the live path: DSV41 serves these weights through this kernel
+// and the four-prompt check comes out character-for-character correct on every
+// verified deployment, so whatever the earlier measurement saw is not a live
+// defect. Treat the old text as unresolved-but-not-reproducible; if it is ever
+// revisited, re-measure with the SAME tag the serve uses rather than a
+// standalone harness.
 
 #include <cuda_runtime.h>
 #include <cstdint>
