@@ -7386,3 +7386,49 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **处置**：QUANT_FOLD / SWIGLU_FOLD / AR_STAMP_FOLD 全部默认 OFF。基线保持 6.23ms（160.5 tok/s）。
 
 **方法论（第 4/5 次隔离→生产失效）**：小 kernel 合并的收益分析必须考虑 **gate 语义**——省 launch 的收益 < 加到 gate kernel 的代价时是净负。
+
+## 会话总结（2026-09-12，13.28 → 6.23ms = +113.3%，75.3 → 160.5 tok/s）
+
+### 落地的优化（按时间序）
+| # | 优化 | 增量 | 累计 |
+|---|---|---|---|
+| 1 | shared expert TP 切分 | 13.28→11.85 | 11.85 |
+| 2 | sparse 3-deep + e4m3 LUT + 融合系列 | →9.38 | 9.38 |
+| 3 | gate v2 + gateup unroll + down revert | →8.60 | 8.60 |
+| 4 | hc tail split + swiglu_q | →8.23 | 8.23 |
+| 5 | allv2（全部优化验证） | →6.84 | 6.84 |
+| 6 | cp.async 权重先行 + warps8 + EARLY 侧流 | →6.66 | 6.66 |
+| 7 | down 回归修复 + dots-late merge | →6.48 | 6.48 |
+| 8 | AR store 并行化 | →6.47 | 6.47 |
+| 9 | P4 act-cpasync（默认 ON） | →6.24 | **6.24 = 160.5 tok/s** |
+
+### 验证失败关停的（5 项，全部有机制级解释）
+| 优化 | 预期 | 实际 | 根因 |
+|---|---|---|---|
+| PDEPTH pipeline (2/5) | −0.48ms | **+0.04ms** | 占用率损失 > 延迟隐藏（42.8KB smem → 2 blocks/SM）|
+| w2 L2 prewarm | −0.25ms | **+0.04ms** | warmer 与 gateup 尾部争 SM |
+| quant fold | −0.072ms | **+0.39ms**（与 swiglu 合计）| fork_ev 是 kernel 级——EARLY 加工作 = 加到 main 的关键路径 |
+| swiglu fold | −0.068ms | ↑同上 | w2 prologue 的 swiglu 在 GEMV 上下文更贵 |
+| AR stamp fold | −0.15ms | **29.5s/step** | 单调 counter 在图 replay 下机制坏掉（第 4 次 AR 协议失败）|
+
+### 隔离→生产失效的系统性根因（5 次确认）
+**隔离探针无法模拟 serve 的三个条件**：SM 争抢（侧流并行）、L2 竞争、占用率敏感。
+**方法论铁律**：隔离探针只用于淘汰明显差的方案；正向收益必须 serve A/B 确认。
+**小 kernel 合并的新铁律**：省 launch 的收益 < 加到 gate kernel 的代价时是净负（fork_ev 语义）。
+
+### 关键地板（当前架构不可逾越）
+- gemm a32 物化 1.55µs/call（LUT smem 随机 gather）× 246 = 0.38ms
+- expert gateup LUT-gather 地板（cp.async 无效已证 5 次）
+- expert down L1TEX 地板（8 理论失败）
+- AR NVLink 协议地板 29.5µs/call
+- CUDA graph node dispatch 0.411µs/node（graph_bench 实测）
+
+### 剩余在飞
+- bf16-lut（−0.1ms 预期，实施中）
+- sparse-merge 选举折叠（−0.05~0.1ms，实施中）
+- compress-fuse 3→1（−0.02ms，已提交待验证）
+- 全部兑现 → ~6.05ms ≈ 165 tok/s
+
+### 200 tok/s 的判定
+当前 6.23ms 距 5.0ms 差 1.23ms。全部已识别路径（含在飞）兑现后 ~6.05ms。
+剩余 1.05ms 需要突破 LUT gather 地板 = 研究级（无 smem 的 fp4/fp8 解码或完全不同的 GEMV 设计）。
