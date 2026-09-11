@@ -224,6 +224,11 @@ struct Kernels {
         *mut f32, *const f32, *const f32, *const f32,
         c_int, c_int, CuStream,
     ) -> c_int,
+    /// Segment B cluster 1: hc_collapse + rmsnorm(ffn_norm) in one kernel.
+    hc_collapse_norm: unsafe extern "C" fn(
+        *mut f32, *const f32, *const f32, *mut f32,
+        c_int, c_int, c_int, f32, CuStream,
+    ) -> c_int,
     embed_expand_dev: unsafe extern "C" fn(
         *const c_void, *const c_int, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -320,6 +325,7 @@ impl Device {
             hc_pre: km!(rt, "ferrite_hc_pre"),
             hc_post: km!(rt, "ferrite_hc_post"),
             hc_post_inplace: km!(rt, "dsv41_hc_post_inplace"),
+            hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
             embed_expand_dev: km!(rt, "ferrite_embed_expand_dev"),
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
@@ -1525,6 +1531,26 @@ impl Device {
     ) -> Result<()> {
         let rc = unsafe { (self.kernels.hc_post_inplace)(res, x, post, comb, n, h, self.stream) };
         self.kerr(rc, "dsv41_hc_post_inplace")
+    }
+
+    /// Fused segment B cluster 1: collapse the hyper-connection rows and
+    /// normalise, writing `out` directly (the intermediate `x` is not needed).
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_collapse_norm(
+        &self,
+        x: *mut f32,
+        pre: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: i32,
+        hc: i32,
+        dim: i32,
+        eps: f32,
+    ) -> Result<()> {
+        let rc = unsafe {
+            (self.kernels.hc_collapse_norm)(x, pre, w, out, rows, hc, dim, eps, self.stream)
+        };
+        self.kerr(rc, "dsv41_hc_collapse_norm")
     }
 
     /// Embedding gather + hc expansion, straight onto the residual stream.

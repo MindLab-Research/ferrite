@@ -877,6 +877,18 @@ impl<'a> DevChain<'a> {
             self.s.premix_const.ptr,
             hc * std::mem::size_of::<f32>(),
         )?;
+        if Self::fuse_b1() {
+            self.dev.hc_collapse_norm(
+                self.s.h.ptr as *mut f32,
+                self.premix_slot(1).as_f32(),
+                self.w.norm.as_ref().unwrap().as_f32(),
+                self.s.xn.ptr as *mut f32,
+                1,
+                hc as i32,
+                dim as i32,
+                cfg.norm_eps,
+            )?;
+        } else {
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
             self.premix_slot(1).as_f32(), // attn_pre stays on the device
@@ -893,6 +905,7 @@ impl<'a> DevChain<'a> {
             dim as i32,
             cfg.norm_eps,
         )?;
+        }
         // The head keeps f32 activations × f32 weights (the checkpoint stores BF16;
         // it is widened losslessly at load). Casting the activation to bf16 here cost
         // ~3 bits on a 129280-way near-tie argmax — the reference keeps it in f32.
@@ -971,6 +984,12 @@ fn fuse_c() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_FUSE_C").map(|v| v != "0").unwrap_or(false))
 }
 
+/// Segment B cluster 1 fusion: hc_collapse + rmsnorm(ffn_norm) in one kernel.
+fn fuse_b1() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(false))
+}
+
     fn layer(&mut self, layer: usize, pos: usize, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -1005,6 +1024,18 @@ fn fuse_c() -> bool {
                 .collect();
             eprintln!("[mine] L0 comb_rowsum={rs:?}");
         }
+        if Self::fuse_b1() {
+            self.dev.hc_collapse_norm(
+                self.s.h.ptr as *mut f32,
+                self.premix_slot(pa).as_f32(),
+                ld.attn_norm.as_ref().unwrap().as_f32(),
+                self.s.xn.ptr as *mut f32,
+                1,
+                hc as i32,
+                dim as i32,
+                cfg.norm_eps,
+            )?;
+        } else {
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
             self.premix_slot(pa).as_f32(),
@@ -1021,6 +1052,7 @@ fn fuse_c() -> bool {
             dim as i32,
             cfg.norm_eps,
         )?;
+        }
         self.attention(layer, pos)?;
         if Self::fuse_c() {
             self.dev.hc_post_inplace(
@@ -1069,6 +1101,18 @@ fn fuse_c() -> bool {
         }
         // the FFN collapses with THIS layer's attn_pre (slot 1), which stayed on
         // the device; the FFN's own pre (slot 2) is what the NEXT layer uses.
+        if Self::fuse_b1() {
+            self.dev.hc_collapse_norm(
+                self.s.h.ptr as *mut f32,
+                self.premix_slot(1).as_f32(),
+                ld.ffn_norm.as_ref().unwrap().as_f32(),
+                self.s.xn.ptr as *mut f32,
+                1,
+                hc as i32,
+                dim as i32,
+                cfg.norm_eps,
+            )?;
+        } else {
         self.dev.hc_collapse(
             self.s.h.ptr as *const f32,
             self.premix_slot(1).as_f32(),
@@ -1085,6 +1129,7 @@ fn fuse_c() -> bool {
             dim as i32,
             cfg.norm_eps,
         )?;
+        }
         let _t_moeonly = std::time::Instant::now();
         // DSV41_GRAPH_MOE=1 captures the host-free part of the MoE (everything up
         // to the all-reduce) into one per-layer graph. The first step warms every

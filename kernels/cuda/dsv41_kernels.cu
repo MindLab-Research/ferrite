@@ -1875,3 +1875,64 @@ extern "C" int dsv41_hc_post_inplace(float* res, const float* x, const float* po
     dsv41_hc_post_inplace_kernel<<<(unsigned)((h4 + 255) / 256), 256, 0, s>>>(res, x, post, comb, n, h);
     return (int)cudaGetLastError();
 }
+
+// ---------------------------------------------------------------------------
+// Segment B, cluster 1: hc_collapse + rmsnorm(ffn_norm) as ONE kernel.
+//
+// The two are inherently a pair: the collapse produces the row the norm
+// normalises, and at batch size one the norm's row-reduction already runs as a
+// single block, so fusing costs no parallelism while removing one launch and one
+// round trip of the collapsed row through global memory.
+//
+//   collapsed[c] = sum_i pre[i] * x[i*dim + c]          (i ascending, fmaf)
+//   out[c]       = collapsed[c] * inv * w[c],  inv = rsqrt(mean(collapsed^2) + eps)
+//
+// The reduction tree and the summation orders are copied from the two kernels it
+// replaces - hc_collapse_kernel's explicit fmaf, and rmsnorm_kernel's
+// shfl_down tree plus its in-order cross-warp sum - because two kernels in
+// different translation units already disagreed about contraction once and the
+// result was a one-ulp shift that flipped preambles. Everything that can be
+// pinned is pinned; anything left to the compiler must be settled by the parity
+// test, not by reading the source.
+__global__ void dsv41_hc_collapse_norm_kernel(const float* __restrict__ x,
+                                              const float* __restrict__ pre,
+                                              const float* __restrict__ w,
+                                              float* __restrict__ out, int hc, int dim, float eps) {
+    const int row = blockIdx.x;
+    const float* pre_r = pre + (size_t)row * hc;
+    const float* x_r = x + (size_t)row * hc * dim;
+    float* o_r = out + (size_t)row * dim;
+
+    // phase 1: collapse into the output buffer and accumulate the sum of squares
+    float ss = 0.f;
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < hc; ++i) acc = fmaf(pre_r[i], x_r[(size_t)i * dim + c], acc);
+        o_r[c] = acc;
+        ss += acc * acc;
+    }
+
+    // the same reduction tree rmsnorm_kernel uses
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+        red[0] = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+
+    // phase 2: normalise in place
+    for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * inv * w[c];
+}
+
+extern "C" int dsv41_hc_collapse_norm(float* x, const float* pre, const float* w, float* out, int rows,
+                                      int hc, int dim, float eps, cudaStream_t s) {
+    if (x == nullptr || pre == nullptr || w == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    dsv41_hc_collapse_norm_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, pre, w, out, hc, dim, eps);
+    return (int)cudaGetLastError();
+}
