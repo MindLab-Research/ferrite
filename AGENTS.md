@@ -32,6 +32,17 @@ Read `README.md` for the design contract; this file is the operational guide: bu
    **实际生效**的那份（DT_NEEDED 加载的），与 `--lib` 那份比对；再与二进制自身的 id 比对。
 3. **`/proc/self/maps` 中 `libferrite_kernels.so` 的不同路径镜像数 >1 → 拒**。
 
+**残余洞（2026-09-11 核查）**：
+- 防线 3 靠**路径字符串** `contains("libferrite_kernels.so")` 匹配 → 改名的手编 nvcc 产物
+  （`/tmp/libt.so`、`/tmp/probe*.so`、`/tmp/libdsv41_all.so` … 实测均**无 build stamp**）
+  经 dlopen/LD_PRELOAD 进来时对防线 3 **隐身**；只有防线 2（id 比对）能抓，若两份 id 恰好相同则全过。
+- `build_id = git HEAD + sha256(.cu)` **不含构建指纹**（nvcc 版本 / `-gencode arch` / `-O` / `--use_fast_math`）
+  → 同 id 可能是不同 SASS。
+- 防线 1–3 全在 `CudaBackend::with_device/with_library` 内，**首次 kernel 调用必须晚于 gate** 是隐式契约；
+  且 `devrt.rs::verify_kernel_build` **故意跳过防线 2**（见 `devrt.rs:266-268`），只对"不 link"的 consumer 成立。
+- 远端 `LD_LIBRARY_PATH` 默认**不含** kernels 目录 → 不显式前缀时 `ldd` 报 `libferrite_kernels.so => not found`
+  （即链接镜像加载**只由脚本的 LD_LIBRARY_PATH 决定**，脚本写错路径就会静默换镜像）。
+
 **正确用法（唯一允许）**：`--lib <tree>/kernels/cuda/libferrite_kernels.so` 且
 `LD_LIBRARY_PATH=<tree>/kernels/cuda`（同一棵树）；跨版本比较必须**整树切 commit 后双产物重编**，
 禁止拿 A 树的 .so 配 B 树的二进制。

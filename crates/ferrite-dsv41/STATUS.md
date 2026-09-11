@@ -6630,3 +6630,13 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 **乐观（全上界 + a32 + indexer + 融合）**：3.45 − 0.19 − 0.17 = **3.09ms ≈ 254 tok/s**
 
 **恢复步骤**：POST_RECOVERY_COMMANDS.md（哨兵 → recovery_verify.sh → a32 A/B → K-split 文本 A/B）
+
+### 2026-09-11 终局：r42-45 的 "cuda error 1/701" 三层根因链（全解）
+
+| 层 | 错误码 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | error 1 (InvalidValue) | NORM_FUSE 加了 s_norm_red[32]=128B static smem → 128+232448>设备 max 232448 → SetAttribute 失败 | 232448→232320（13处）commit 775dadb |
+| 2 | error 1 (InvalidValue) | pdl_or_plain 即使 PDL=0 也用 cudaLaunchKernelEx → 36+ 参数变参模板转发失败 | PDL=0 改用 cudaLaunchKernel + struct pack 4 参数 commit f400fca/4c995f2 |
+| 3 | error 701 (LaunchOutOfResources) | struct pack 后无 __launch_bounds__ → ptxas 出 72 regs → 72×1024 threads=73728>65536 | __launch_bounds__(1024) + __grid_constant__ → 56 regs commit 0ad77ee |
+
+**教训**：三层问题同时存在，逐层修复时前一层暴露后一层。正确做法：任何 "cuda error N" 先做 cuobjdump --dump-resource-usage 查寄存器/smem，再查 launch API 路径，再查 static smem 与 SetAttribute 的交互。

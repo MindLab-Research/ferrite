@@ -2899,10 +2899,24 @@ struct GemvEpi {
 //     register pressure to the 37-parameter version.
 //
 //     Why this matters: at 72 registers a 1024-thread launch needs 73728
-//     registers, more than the SM has, so it FAILS -- cudaErrorInvalidValue,
-//     i.e. exactly the "cuda error 1" (drifting between mx / rope_norm /
-//     mx_rope / quant_fp8 across ranks) that this refactor exists to remove.
+//     registers (72 * 32 warps, warp allocation granularity 256 => no rounding
+//     down), more than the 65536-register file one SM has, so the block cannot
+//     be resident and the launch FAILS with cudaErrorLaunchOutOfResources
+//     ("cuda error 701"), drifting between mx / rope_norm / mx_rope / quant_fp8
+//     across ranks (whichever 32-warp launcher runs first on that rank).
 //     Removing __launch_bounds__ re-opens that failure silently.
+//
+//     Do NOT confuse this 701 with the r42-45 "cuda error 1" (InvalidValue):
+//     those were THREE different mechanisms in the same symptom, and this one
+//     was masked by the other two until they were fixed --
+//       (a) cudaLaunchKernelEx's variadic marshaling of the 36+ GEMV scalars
+//           -> InvalidValue -> fixed by gemv-struct-pack (4c995f2);
+//       (b) NORM_FUSE's 128B static s_norm_red made the 232448 dynamic opt-in
+//           exceed the device total -> cudaFuncSetAttribute returned
+//           InvalidValue and the launcher bailed BEFORE launching -> fixed by
+//           232320 (775dadb). Only after (b) landed did the SetAttribute path
+//           clear and the launch actually run, which is when this register
+//           over-commit surfaced as 701.
 //
 // A/B command used for the numbers above:
 //     nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
