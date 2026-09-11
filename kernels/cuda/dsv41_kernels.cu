@@ -1612,7 +1612,7 @@ __device__ __forceinline__ void dsv41_cp_async16(void* smem, const void* gmem);
 __device__ __forceinline__ void dsv41_cp_commit();
 __device__ __forceinline__ void dsv41_cp_wait_all();
 
-__global__ void __launch_bounds__(128, 7) gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
+__global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const float* __restrict__ a_scale,
                                      const uint8_t* __restrict__ w,
                                      const uint8_t* __restrict__ w_scale,
@@ -1714,31 +1714,16 @@ __global__ void __launch_bounds__(128, 7) gemm_fp8_gemv_kernel(const uint8_t* __
             dsv41_cp_commit();
             dsv41_cp_wait_all();
             __syncwarp();
-            float acc = 0.f;
-            // EXPERIMENT: manual 4-way unroll (which alone degenerated the
-            // model) combined with __launch_bounds__(128, 7) capping the
-            // register budget. Hypothesis: the manual unroll's extra ~20 live
-            // registers dropped occupancy and shifted the cp.async timing;
-            // capping registers should restore correctness while keeping the
-            // 3.1ms speedup the unroll bought (10.2ms vs 13.3ms).
-            int kb = 0;
-            for (; kb + 3 < nb_k; kb += 4) {
-                const int j0 = (kb + 0) * 32 + lane, j1 = (kb + 1) * 32 + lane;
-                const int j2 = (kb + 2) * 32 + lane, j3 = (kb + 3) * 32 + lane;
-                const float sb0 = ue8m0_to_f(wsr[kb + 0]), sb1 = ue8m0_to_f(wsr[kb + 1]);
-                const float sb2 = ue8m0_to_f(wsr[kb + 2]), sb3 = ue8m0_to_f(wsr[kb + 3]);
-                const float sa0 = a_scale[kb + 0], sa1 = a_scale[kb + 1];
-                const float sa2 = a_scale[kb + 2], sa3 = a_scale[kb + 3];
-                const uint8_t av0 = ap[j0], av1 = ap[j1], av2 = ap[j2], av3 = ap[j3];
-                const uint8_t rv0 = row_s[j0], rv1 = row_s[j1], rv2 = row_s[j2], rv3 = row_s[j3];
-                acc += e4m3_to_f(av0) * sa0 * (e4m3_to_f(rv0) * sb0);
-                acc += e4m3_to_f(av1) * sa1 * (e4m3_to_f(rv1) * sb1);
-                acc += e4m3_to_f(av2) * sa2 * (e4m3_to_f(rv2) * sb2);
-                acc += e4m3_to_f(av3) * sa3 * (e4m3_to_f(rv3) * sb3);
-            }
-            for (; kb < nb_k; ++kb) {
+            // #pragma unroll 4 (NOT the manual 4-way unroll): the manual version
+            // buys 10.21ms but needs >64 registers, and any configuration above
+            // 64 (i.e. below 8 blocks/SM) degenerates the model — verified with
+            // __launch_bounds__ 8 (correct, 64 regs) vs 7 (degenerate, 73 regs).
+            // The compiler-directed pragma keeps the register budget the
+            // compiler chooses and stays correct.
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
-                const float sa = a_scale[kb];
+                const float sa = a_scale[kb];    // m == 1
                 const int j = kb * 32 + lane;
                 acc += e4m3_to_f(ap[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
             }
