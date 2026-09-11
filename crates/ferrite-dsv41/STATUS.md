@@ -6640,3 +6640,33 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 | 3 | error 701 (LaunchOutOfResources) | struct pack 后无 __launch_bounds__ → ptxas 出 72 regs → 72×1024 threads=73728>65536 | __launch_bounds__(1024) + __grid_constant__ → 56 regs commit 0ad77ee |
 
 **教训**：三层问题同时存在，逐层修复时前一层暴露后一层。正确做法：任何 "cuda error N" 先做 cuobjdump --dump-resource-usage 查寄存器/smem，再查 launch API 路径，再查 static smem 与 SetAttribute 的交互。
+
+### 会话终极总结（2026-09-11 22:30，等待最终验证）
+
+**验证基线**：13.28 → 8.23ms（+61.4%），75.3 → 121.5 tok/s（round 41，四段全对，faults=0）
+
+**累积待验证**（~25 项优化，全部已提交）：
+- 6 个 fork/join 侧流（tail/dual-chain/MoE-dual/compress/EARLY/dots-to-side）
+- 2 个 PDL 串链（attention + expert）
+- 9 个融合（sparse-o-rope + fp4-pack + hc_post + NORM_FUSE + wob-f32 + elementwise + comp_placeholder + add→AR store + quant 消除）
+- 3 个 AR 优化（grid 失衡修复 + pubred 优化 + 多流优先级）
+- 5 个占用率修复（gateup K-split + indexer 修复 + engram apply/hash + a32 开关 + down 4-value）
+- 1 个 struct pack（37 参数 → 4 struct + __launch_bounds__ + __grid_constant__）
+- 3 个构建修复（static smem 232320 + PDL OFF 默认 + cudaLaunchKernel 路径）
+
+**投影**：保守 ~5.1ms=160 / 中间 ~3.56ms=220 / 乐观 ~3.0ms=254
+**200 tok/s 悬于**：a32 实验（−0.74ms 二元变量）+ K-split（−0.19ms parity 风险）
+
+**验证阻塞史**（r42-45 的三层根因链）：
+| 层 | 错误 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | error 1 | 128B static smem + 232448 > 设备 max | →232320 |
+| 2 | error 1 | cudaLaunchKernelEx 36+ 参数模板转发 | →cudaLaunchKernel + struct pack |
+| 3 | error 701 | 72 regs × 1024 threads > 65536 | →__launch_bounds__(1024) → 56 regs |
+
+**恢复序列**（a2fa9908 验证中）：
+1. one-shot（哨兵）
+2. serve 全量（recovery_verify.sh 或 serve_ab.sh fixed）
+3. a32 A/B（DSV41_GEMV_A32=0/1）
+4. PDL A/B（DSV41_PDL=0/1）
+5. K-split 文本 A/B（DSV41_GATEUP_KSPLIT=0/2）
