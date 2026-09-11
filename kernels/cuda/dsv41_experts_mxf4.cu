@@ -769,7 +769,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             // while g's fmas run. The accumulation is `fmaf` (explicitly rounded),
             // so unrolling cannot reassociate it - only re-time the loads - and
             // each accumulator still visits its own elements in ascending g.
-#pragma unroll 4
+#pragma unroll 1
             for (int g = 0; g < nv2; ++g) {
                 const int j = (g << 9) + (lane << 4);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
