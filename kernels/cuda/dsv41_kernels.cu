@@ -1718,7 +1718,14 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             // garbage. This shadowing was the root cause of the "3ms speedup
             // + degeneration" mystery (the speedup was the compiler dead-coding
             // the warp reduction on a known-zero value).
-#pragma unroll 4
+            //
+            // Unroll depth is the gemv's real ILP knob: the loop's loads
+            // (a_scale[kb], wsr[kb] and the two staged bytes) are independent
+            // across kb, and this family is memory-latency bound — the isolated
+            // bench shows bandwidth rising with the row count (72 GB/s at 256
+            // rows against 3.3 TB/s at 16160) purely because more warps keep
+            // more loads in flight.
+#pragma unroll 8
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(wsr[kb]);
                 const float sa = a_scale[kb];    // m == 1
