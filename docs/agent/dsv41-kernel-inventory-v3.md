@@ -41,7 +41,7 @@
 | 1 | `gemm_fp8_gemv_kernel` | **246** | 9.5 | **2.33** | 24.2% | 206 / 9.6 / 1.98 | **+0.35** |
 | 2 | `gemv_bf16_kernel`（共享专家 gate + lm_head + engram）| **49** | 22.4* | **1.10** | 11.4% | 9 / 45.0 / 0.41 | **+0.69** |
 | 3 | `expert_gemv_fp4_batched_kernel`（gate_up+swiglu 融合）| 40 | 25.3 | **1.01** | 10.5% | 40 / 25.7 / 1.03 | −0.02 |
-| 4 | `expert_gemv_fp4_down_reduce_kernel<true>` | 40 | **24.9** | **1.00** | 10.3% | 40 / **17.2** / 0.69 | **+0.31** ⚠️ |
+| 4 | `expert_gemv_fp4_down_reduce_kernel<true>` | 40 | **24.9** | **1.00** | 10.3% | 40 / **17.2** / 0.69 | **+0.31** ⚠️✅ |
 | 5 | `hc_mixes_tail_kernel` | 80 | 12.4 | **0.99** | 10.3% | 同 | 0 |
 | 6 | **AR v5**（store + pubred）| — | — | **0.66** | 6.8% | 0.66 | 0 |
 | 7 | `hc_mix_dots_kernel` | 80 | 7.0 | **0.56** | 5.8% | 同 | 0 |
@@ -120,7 +120,7 @@ routed 链上是 fp4 expert 核（`expert_gemv_fp4_*`），shared 链上是 w1/w
 | 家族 | ms/步 | % | 备注 |
 |---|---|---|---|
 | **GEMV 族**（gemm_fp8 + gemv_bf16 + gemv_f32）| **3.54** | **36.7%** | 见 §5：91% 是固定成本 |
-| expert fp4 家族（gate_up + down_reduce）| **2.01** | 20.8% | 其中 0.31 待回收（§3B） |
+| expert fp4 家族（gate_up + down_reduce）| **2.01** | 20.8% | ⚠️ 此为 **db2917501 profile 口径**（早于 667c6f6 的回退）⇒ 含 0.31 回归；代码已回退，实际应 ≈ **1.70**（待重采确认，§3B/§4 rank1） |
 | hc 链（tail + dots + hc_post_inplace + collapse_norm）| **1.70** | 17.7% | tail 0.99 是 warp0 串行链 |
 | attention/norm/quant 杂项（sparse/quant/rope/rmsnorm*/indexer）| **~1.15** | 11.9% | |
 | AR v5 | 0.66 | 6.8% | 协议地板（口径分歧见 §4）|
@@ -237,12 +237,12 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 
 ### 4.2 gateup 的 FMA 累加器结构（2026-09-11 分析）：**4 累加器→2 否决**
 
-**当前结构**（`dsv41_experts_mxf4.cu:984-1113`，`ILV=true` 且 fuse 默认 ON ⇒ 这是生产路径；
+**当前结构**（`dsv41_experts_mxf4.cu:1060-1232`，`ILV=true` 且 fuse 默认 ON ⇒ 这是生产路径；
 `k = dim = 5120` → `nv2f = k>>9 = 10` 组/lane；`n_total = inter`，TP8 下 320 行/slot，6 slot）：
 
-- **组内 4 个临时累加器**，不是跨组累加器：gate 链 `gp0..gp3`（`:1040`），每个串 **4 个 `fmaf`**（链深 4），
-  再 `(gp0+gp1)+(gp2+gp3)` 两两树（3 个 FADD），最后 `g = fmaf(gsc, ·, g)`（`:1065`）折进**唯一的**跨组累加器 `g`。
-  up 链 `up0..up3` 同构（`:1075-1100`）。⇒ 每组每链 ~20 条 FMA 类指令、组链深 ≈ 4+2+1 = 7；10 组串行 ⇒ `g` 链 ≈70。
+- **组内 4 个临时累加器**，不是跨组累加器：gate 链 `gp0..gp3`（`:1131`），每个串 **4 个 `fmaf`**（链深 4），
+  再 `(gp0+gp1)+(gp2+gp3)` 两两树（3 个 FADD），最后 `g = fmaf(gsc, ·, g)`（`:1156`）折进**唯一的**跨组累加器 `g`。
+  up 链 `up0..up3` 同构（`:1166-1191`）。⇒ 每组每链 ~20 条 FMA 类指令、组链深 ≈ 4+2+1 = 7；10 组串行 ⇒ `g` 链 ≈70。
   每 lane 每组还有 16×`LDS`(sa) + 16×`LDS.64`(LUT) + 1×`LDG.128`(ILV) ⇒ ~105 条指令/组/lane。
 
 **为什么 4→2 是死路（三条独立证据）**：

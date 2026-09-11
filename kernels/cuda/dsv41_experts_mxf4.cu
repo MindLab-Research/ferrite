@@ -902,7 +902,22 @@ static inline cudaError_t dsv41_experts_pdl_or_plain(K kern, dim3 grid, dim3 blo
 // exact codegen it had. The launcher picks the instantiation from its explicit
 // `ilv` argument; nothing here guesses, and the Rust side refuses to combine an
 // interleaved pool with anything but the fused batched gate/up call.
+//
+// __launch_bounds__(1024): pins the register ceiling that the launch geometry
+// depends on. The block size is NOT fixed here - the launcher derives it as
+// warps*ksplit*32 (`dsv41_expert_gateup_fp4_batched`), where DSV41_GATEUP_ROWS
+// (1..32) x DSV41_GATEUP_KSPLIT (1..8, clamped to warps*ksplit <= 32) can take
+// it all the way to 1024. 1024 is therefore the widest block this kernel is
+// EVER launched with, and declaring it makes ptxas cap registers at
+// 65536/1024 = 64/thread: the production 256-thread shape then keeps its 4
+// blocks/SM (the same ceiling the microbench's fastest 56-reg arm needs on the
+// mirrored down kernel) and the widest shape stays launchable.
+// A literal __launch_bounds__(256, N) would be WRONG - it is a hard launch
+// check, so every DSV41_GATEUP_KSPLIT=2 (512 threads) / DSV41_GATEUP_ROWS=16+
+// launch would fail with "too many resources requested". Measured usage was
+// 48 regs / 0 spill, so the 64 cap is headroom, not a spill risk.
 template <bool ILV>
+__launch_bounds__(1024)
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
                                                const uint8_t* __restrict__ a,
                                                const float* __restrict__ a_scale,
@@ -1404,7 +1419,20 @@ __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __
 // it replaces. STAGED selects the activation staging (see the launcher): true
 // puts every slot's [0,k) slice in smem once per block, false reads each slot's
 // slice from global.
+//
+// __launch_bounds__(256, 4): the launcher hardcodes warps=8 => blockDim is
+// ALWAYS 256 (`dsv41_expert_down_reduce_fp4_batched`), so unlike the gate/up
+// kernel this can be the literal block size. The (256, 4) pair caps registers
+// at 65536/(256*4) = 64/thread, which is exactly the ceiling the /tmp/dv320
+// microbench's FASTEST arm needs: "4-value uint16 (mode 3), no launch_bounds"
+// ran 56 regs / 4 blocks/SM / 0.87x (fastest), while the forced
+// `__launch_bounds__(256,6)` arm (40 regs, 6 blocks/SM) was SLOWER at 0.90x.
+// Pinning 4 blocks/SM therefore freezes the winning configuration instead of
+// the higher-occupancy loser, and 56 <= 64 means ptxas has nothing to spill.
+// This is the 01291b2 guard: that regression was 40 -> 54 regs, i.e. 6 -> 4
+// blocks/SM and a 1.01 -> 1.51 wave cliff at this exact shape.
 template <bool STAGED>
+__launch_bounds__(256, 4)
 __global__ void expert_gemv_fp4_down_reduce_kernel(
     const float* __restrict__ act_base, long act_stride, float* __restrict__ out, int n_total,
     int k, int slots, const float* __restrict__ row_weight, long rw_stride,
