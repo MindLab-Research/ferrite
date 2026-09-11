@@ -1065,12 +1065,24 @@ impl<'a> DevChain<'a> {
                 (c.bytes - 8) as i64,
             )?;
             if !ok {
+                // The loaded .so has no cross-rank argmax. A slice-local argmax
+                // would silently return the wrong token, so redo the head over the
+                // full vocabulary and take the ordinary argmax - correct, just
+                // slower.
+                self.dev.gemv_bf16(
+                    head.ptr(),
+                    self.s.xn.ptr as *const f32,
+                    self.s.logits.ptr as *mut f32,
+                    cfg.vocab_size as i32,
+                    dim as i32,
+                )?;
                 self.dev.argmax(
                     self.s.logits.ptr as *const f32,
                     self.s.ids.ptr as *mut std::ffi::c_int,
-                    seg as i32,
+                    cfg.vocab_size as i32,
                     self.s.pos_ctr.ptr as *mut std::ffi::c_int,
                 )?;
+                return Ok(());
             }
         } else {
             self.dev.argmax(
