@@ -214,6 +214,25 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   - **验证**：`cargo check -p ferrite-models` ✓（尚未上机 parity；`DSV41_WOB_F32` 的 A/B 轮次可顺带
     覆盖 engram 四段文本）。
 
+- **✅ engram_apply 向量化 + 256 线程；engram_hash_step 按列并行** ✓（2026-09-11，已验证）：
+  两个 kernel 都是「小 grid + 单线程/长串行扫描」的病（同 `gated_rmsnorm` 那类），实测不是带宽而是延迟：
+  - `engram_apply_kernel`：grid 只有 `(rows=1, hc=4)` = **4 个 block**，每 block `dim=5120` 的 40 轮
+    标量扫描 + `block_sum3`。改成 **float4 体（5 轮）+ blockDim 128→256**（256 = 8 warps，
+    `block_sum3` 的 `red[3][8]` 硬上限，不可再宽）。保持标量回退分支（`dim % 4 != 0` 或四个基址
+    任一非 16B 对齐）。
+  - `engram_hash_step_kernel`：原本 **1 线程** 串行走完 `n_layers*n_cols = 48` 列，每列一次
+    **64-bit 取模**（emulated，数百 cycle）→ 改成一列一线程（`<<<1,128>>>` + grid-stride），
+    token gather 每 lane 重算（≤ max_ngram 次 L1 读）。整数 + 每元素单写者 ⇒ **bit-identical**。
+  - **实测**（B300，event-timed，isolated）：`engram_apply` 16.36 → **4.72µs**（空 kernel 地板 3.09µs），
+    `engram_hash_step` 15.64 → **3.37µs**。⇒ 每步省 ≈ **0.023 + 0.012 = 0.035ms**。
+    （新加 `bench_floor.cu`/`parity.cu` 的注意：`#include "dsv41_glue.cu"` 会被同目录的旧副本劫持，
+    比较 old/new 必须把两份分别放进独立目录。）
+  - **正确性**：`parity.cu` 对 5 个形状（含生产 1×4×5120）与 f64 参考的 relmax 与改动前**逐位相同**；
+    48 列 hash id `mismatch=0`；仓库自测 `tests_dsv41_glue.cu` 结果与基线一致（唯一 FAIL 是既有的
+    `swiglu_q rows=3`，与本改动无关，old/new 同样 FAIL）。
+  - ⚠️ `engram_apply` 的规约次序变了（float4 分组 + 256 线程 stride），**非 bit-identical**；
+    与 engram f32 直读同一个取舍，文本级验证仍需一次 `dsv41-run` A/B。
+
 - **✅ q rope / idx_q rope 已折进 GEMV epilogue（DSV41_ROPE_FUSE，默认 ON）** ✓（2026-09-11）：
   新的两个 C 符号 `dsv41_gemm_fp8_mx_rope`（单族，q rope）与 `dsv41_gemm_fp8_mx2_rope`
   （两族，wq_b 的 q rope + idx_wq_b 的 idx_q rope 各用各自 head 宽度 `rope_hd1/hd2`）把
