@@ -3636,3 +3636,46 @@ n=  4095 → 40000（4095/4096/4097/8191/8192/8193/20000/40000） 512/512  ok
 
 **收益**：−5.34ms/步（−16.8%）✓。**机制**：每 lane 每迭代 1 字节 → 4 字节 ⇒ 指令数 ÷1.39（每元素 ~8 → ~5.75 条）✓
 ＋ **在飞字节 ×4** ⇒ 实测 1.85x，差额来自访存侧 ✓（与 GLM 侧 float4 两度奏效同源 ✓）。
+
+## 🚧 2026-09-11 新方向（用户裁定）：**每层一套 tile 对齐融合算子**
+
+**用户原话**："做算子融合，我要每层一个 tile 对齐的融合算子"；追问后裁定：
+**① 三段一起做（不分段交付）② tile 由 smem 容量反推（如 256 列）**。
+
+**动机（实测，非估计）**：更正后的分解显示每步每卡 **~700 次 kernel 启动 ≈ 17.5 次/层** ✗，其中三大件
+就占 **12.5 次/层 与 26.1ms / 32ms**：
+
+| 每层调用次数 | kernel | ms/步/卡 |
+|---|---|---|
+| **7.2** | `gemm_fp8_gemv` | 11.62 |
+| 2.6 | `expert_gemv_fp4_batched` | 8.98 |
+| 2.6 | `hc_mixes` | 5.50 |
+| 1.6 | `gemv_bf16` | 1.01 |
+| 1.6 | `route_topk` | ~0.3 |
+| 1.3 | `sparse_attn_warp` | 1.43 |
+
+单核实测 40µs 里绝大部分是**核固定成本 + 中间量落回 global 再读回** ✗，而非算术 ✓
+⇒ 这正是融合要回收的部分 ✓。
+
+**硬约束（物理，不是取舍）**：DSV4.1 每层有 **2 处 all-reduce**（`o_proj` 的 row-parallel ✓ 与 MoE
+`eng_rows` ✓，见 `chain_dev.rs:597/642/1435`），**跨 rank 集合通信无法放进 tile 对齐的核内** ✗
+⇒ 严格"每层 1 个算子"不存在 ✓，可行形态是**每层 3 段**：
+```
+段A: hc_mixes → hc_collapse → rmsnorm → q_a/q_norm/q_b, kv_a/norm/kv_b, rope, indexer/QK
+  ── AR ──
+段B: sparse_attn PV → o_proj → hc_post → hc_mixes → collapse → rmsnorm → MoE(route+gate/up+act)
+  ── AR ──
+段C: MoE down → hc_post
+```
+
+**既有可复用资产**：
+- `DSV41_GRAPH_MOE=1` 已把 **MoE 的 host-free 部分（直到 all-reduce）** 单独图捕获 ✓
+  ⇒ **段 B 的边界定义已存在** ✓（可直接作为融合核的边界 ✓）。
+- 既有 tile 约定：`gemm_fp8_kernel` 用 **16 行 × (4 warp × 16) 列**、`smem = 16*k` 字节 ✓
+  （M=1 时退化为 GEMV 的由来见 `dsv41_kernels.cu:1203-1213` 的注释 ✓）⇒ 融合核应与它同一种 tile ✓。
+- 数据格式（`dsv41_kernels.cu:1209-1213` 逐字）：`a [1,k] e4m3` / `a_scale [1,k/32] f32` /
+  `w [n,k] e4m3` / `w_scale [n/32,k/32] e8m0` ✓；专家侧 `w1/w2/w3 = I8 [moe_inter, dim/2]`（fp4 打包 ✓）。
+
+**下一步（已在推进）**：事实梳理（每段精确 `dev.*` 序列 + 形状/dtype + 每个 launcher 的
+grid/block/dynamic-smem 字节数 + AR 位置与 reduce 字节数）⇒ 据此写设计文档 ⇒ 实现（每段单独可开关 ✓）
+⇒ 逐步直打 + 四段文本验证 ✓。
