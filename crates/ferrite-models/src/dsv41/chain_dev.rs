@@ -525,9 +525,11 @@ impl<'a> DevChain<'a> {
     /// Two projections over the SAME activation in one launch (DSV41_PROJ_FUSE).
     /// Reads ONCE and cached: this runs per attention call.
     fn proj_fuse() -> bool {
+        // Default on: 15.44 against 15.99 ms in one session, same binary, with
+        // the four prompts character-for-character identical. "0" still opts out.
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *F.get_or_init(|| {
-            std::env::var("DSV41_PROJ_FUSE").map(|v| v != "0").unwrap_or(false)
+            std::env::var("DSV41_PROJ_FUSE").map(|v| v != "0").unwrap_or(true)
         })
     }
 

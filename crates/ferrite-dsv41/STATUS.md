@@ -3915,3 +3915,49 @@ wkv(xn) → rmsnorm(kv) → apply_rope(kv)                 ← kv 链（与 q �
 **结论**：fp8 gemv 的 120× 是最大单项 —— 每调用实测 ~17µs vs 计算（指令 0.66µs + DRAM 3.3µs）≈ 4µs
 ⇒ **~13µs/调用是 launch+块调度+staging 的固定开销** × 290 调用/步 ≈ 3.8ms ✗ ⇒ **合批（gemv2/每层一发射）
 与段 A 融合正是打这里** ✓。
+
+---
+
+# 2026-09-11 ⑤：会话末段 —— lm_head bf16 化、wq_a+wkv 合一、sparse_attn 预取设计
+
+## 已判决/已落地
+
+| 改动 | 判决 | 状态 |
+|---|---|---|
+| **lm_head 保留 bf16**（checkpoint 即 bf16，`gemv_bf16` 核内精确拓宽 + 与 f32 核**逐句同序累加** ⇒ 逐位等价） | **15.96ms / 62.7（−0.13ms）文本逐字相同 ✓**，另省 1.3GB/rank 显存 | ✅ 默认（load.rs 精确名匹配 `head.weight`，避开 `markov_head.head.weight` 后缀碰撞；调用点按 `dtype` 分派） |
+| **wq_a + wkv 合一发射**（`dsv41_gemm_fp8_mx2`：行 < n1 属族1、其余属族2，共享块级激活暂存；每行仍单 warp 同序 ⇒ 逐位等价；wkv 128 行=32 block 从"串行延迟地板槽"变为与 wq_a 的 block 并行） | **15.44ms / 64.8 tok/s（−0.55ms ✓✓）两臂文本逐字相同** ⇒ 已翻默认 | `DSV41_PROJ_FUSE` 默认关，A/B 后翻 |
+| indexer_topk bitonic | 逐位等价（文本逐字相同 ✓）但性能中性 | 保留（屏障 2k→log²P） |
+
+**陷阱记录**：gemv2 接线时我把调用点条件写反过一次（`if kv_ready` 会在融合成功时重算 wq_a、
+回退路径**漏算** ✗）—— 正确结构 = `kv_early = lin2(...)`；`if !kv_early { lin(wq_a) }`；
+后面的 wkv 调用点 `if !kv_early { lin(wkv) }`。**新接线先自查两条路径都算且只算一次** ✓。
+
+## sparse_attn 保序软件流水预取（设计定稿，未实施）
+
+**诊断**（已实测定位）：`sparse_attn_warp_kernel` grid=(b*m,h)=**8 blocks**、每 block 4 warp，
+每 warp 串行走 ~160 个 key；每 key 的链 = `idx load → kr 地址 → 4×kv load → dot → shfl×5 → exp/fma`
+全串行 ⇒ ~400 cycle/key × 160 ≈ 26.4µs/层 × 40 层 = **1.06ms/步**（9%）。分块方案（−0.75ms）因 ULP
+注入杂 token 被否 ⇒ **保序预取**是正解（数学顺序不变 = 逐位等价 ✓✓）。
+
+**设计**（两级流水 + 双缓冲 + 深度 2）：
+```
+每 warp 的 key 序列 k_j (t = wid + j*nwarp)，buf[2] ping-pong，qreg[16] 预载查询行：
+prologue: idx(k_0)→kv(k_0)→buf[0]; idx(k_1)→kv(k_1)→buf[1]   （两次填充停顿，160 key 摊薄 ✓）
+loop j:
+  (a) 发 idx(k_{j+2}) 加载
+  (b) 用 buf[j&1] 做 k_j 的数学（与原核逐句同形：dot 链 + shfl + 在线 softmax 更新）
+  (c) idx(k_{j+2}) 已在 (b) 期间到达 ⇒ 发 kv(k_{j+2}) → buf[j&1]（(b) 已消费完，WAR 安全 ✓）
+      —— (c) 的延迟由下一轮的 (a)+(b) 覆盖 ⇒ 深度 2 ✓
+```
+- **必须 `#pragma unroll 2`**（buf[j&1] 的运行时下标会把数组打进 local memory ✗；unroll-2 后每体固定缓冲 ✓）
+- 寄存器预算：buf 32 + qreg 16 + my_acc 16 + 杂项 ≈ 70-80 ✓（128 线程 block 可容纳）
+- 预期：26.4 → ~12µs ⇒ **−0.55ms**；验证 = 与关臂文本逐字相同（逐位等价构造 ✓）
+
+## 统一化（用户 2026-09-11 指出，性能战后执行）
+
+现状：HTTP/serve 层已统一（ferrite-http 共享 ✓）；**执行层两套**（GLM: ferrite-exec/tp.rs + CudaBackend vs
+DSV4.1: ferrite-models/dsv41/device.rs 自己的 DevChain/FFI/整步图）；**kernel 层重复**（`gemv_bf16_kernel`
+两份不同签名：ferrite_kernels.cu:2674 带 bias vs dsv41_glue.cu:258 不带）。
+终态 = 用户指令 #5：一个 engine、模型即数据（`ferrite-serve --model dsv41` 单二进制）。
+三步：① 二进制合一（router 已支持）② device 抽象合一（FFI 表并进 trait）③ kernel 族去重（同序累加为前提 + parity 测试）。
+**顺序建议**：先打完 200 tok/s（性能结论会减少要统一的代码量），再统一化。
