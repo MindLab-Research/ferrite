@@ -745,7 +745,17 @@ extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n,
     if (n <= 0 || k <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
-    gemv_bf16_kernel<<<blocks, 256, 0, s>>>((const __nv_bfloat16*)w, x, out, n, k);
+    // The kernel stages the activation row (k floats) in DYNAMIC shared memory;
+    // passing 0 here makes that staging write past the allocation, which is what
+    // the err 700 (illegal access) on this entry point was.
+    const size_t smem = (size_t)k * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gemv_bf16_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemv_bf16_kernel<<<blocks, 256, smem, s>>>((const __nv_bfloat16*)w, x, out, n, k);
     return (int)cudaGetLastError();
 }
 
