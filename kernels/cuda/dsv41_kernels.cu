@@ -1224,7 +1224,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const uint8_t* __restrict__ w,
                                      const uint8_t* __restrict__ w_scale,
                                      const float* __restrict__ bias,
-                                     float* __restrict__ out, int n, int k) {
+                                     float* __restrict__ out, int n, int k, int vec) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -1247,7 +1247,7 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         const int srow = row >> 5;               // 32x32 block scale row
         const uint8_t* wsr = w_scale + (size_t)srow * nb_k;
         float acc = 0.f;
-        if (g_gemv_fp8_vec) {
+        if (vec) {
             for (int g = 0; g < n_vec; ++g) {
                 const int kb = (g << 2) + blk_off;
                 const float sa = a_scale[kb];    // m == 1
@@ -1299,7 +1299,8 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
         const int warps = 8;
         const int blocks = (n + warps - 1) / warps;
-        gemm_fp8_gemv_kernel<<<blocks, warps * 32, 0, s>>>(a, a_scale, w, w_scale, bias, out, n, k);
+        gemm_fp8_gemv_kernel<<<blocks, warps * 32, 0, s>>>(a, a_scale, w, w_scale, bias, out, n,
+                                                           k, g_gemv_fp8_vec ? 1 : 0);
         return (int)cudaGetLastError();
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
