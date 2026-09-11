@@ -278,12 +278,15 @@ __global__ void gemv_bf16_kernel(const __nv_bfloat16* __restrict__ w, const floa
         for (; c + 96 < k; c += 128) {
             const __nv_bfloat16 w0 = wr[c], w1 = wr[c + 32], w2 = wr[c + 64], w3 = wr[c + 96];
             const float x0 = s_x[c], x1 = s_x[c + 32], x2 = s_x[c + 64], x3 = s_x[c + 96];
-            acc += __bfloat162float(w0) * x0;
-            acc += __bfloat162float(w1) * x1;
-            acc += __bfloat162float(w2) * x2;
-            acc += __bfloat162float(w3) * x3;
+            // rn intrinsics: with --use_fast_math a four-way unrolled body is
+            // reassociable (the scalar chain was not) and that drift degenerates
+            // the model over 40 layers.
+            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w0), x0));
+            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w1), x1));
+            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w2), x2));
+            acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(w3), x3));
         }
-        for (; c < k; c += 32) acc += __bfloat162float(wr[c]) * s_x[c];
+        for (; c < k; c += 32) acc = __fadd_rn(acc, __fmul_rn(__bfloat162float(wr[c]), s_x[c]));
         for (int off = 16; off > 0; off >>= 1) {
             acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
         }
@@ -751,7 +754,17 @@ extern "C" int dsv41_gemv_bf16(const void* w, const float* x, float* out, int n,
     if (n <= 0 || k <= 0) return (int)cudaSuccess;
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
-    gemv_bf16_kernel<<<blocks, 256, 0, s>>>((const __nv_bfloat16*)w, x, out, n, k);
+    // The kernel stages the (shared) activation row in shared memory: k floats.
+    // The size is the caller's to pass - launching with 0, as the first cut of
+    // this staging did, points s_x at an empty allocation and the staging writes
+    // walk off the end (faults=4 with empty outputs on the first deployment).
+    const size_t smem = (size_t)k * sizeof(float);
+    if (smem > 48 * 1024) {
+        cudaError_t e = cudaFuncSetAttribute(gemv_bf16_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+        if (e != cudaSuccess) return (int)e;
+    }
+    gemv_bf16_kernel<<<blocks, 256, smem, s>>>((const __nv_bfloat16*)w, x, out, n, k);
     return (int)cudaGetLastError();
 }
 
