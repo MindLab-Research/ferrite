@@ -233,6 +233,14 @@ pub enum Seg<'a> {
     Special(&'a str),
     /// Literal text (encoded).
     Text(&'a str),
+    /// An EXPLICIT token id. Some checkpoints' template markers are not
+    /// registered as tokenizer specials at all (DeepSeek-style
+    /// <|begin_of_sentence|>/<|User|>/<|Assistant|>/</think> in this repo's
+    /// DeepSeek-V4.1-Flash tokenizer), so resolving them BY NAME would fall back
+    /// to literal text encode and silently mistemplate the prompt. A frame may
+    /// pin the id instead — generic, and it keeps every model's frame in the
+    /// same shared vocabulary.
+    Id(u32),
     /// The turn's message content, encoded at this position in the frame.
     Content,
 }
@@ -255,6 +263,7 @@ pub fn encode_segments(tok: &ChatTokenizer, segs: &[Seg<'_>], content: &str) -> 
                     out.extend_from_slice(&tok.encode(name)?);
                 }
             },
+            Seg::Id(id) => out.push(*id),
             Seg::Text(t) => out.extend_from_slice(&tok.encode(t)?),
             Seg::Content => out.extend_from_slice(&tok.encode(content)?),
         }

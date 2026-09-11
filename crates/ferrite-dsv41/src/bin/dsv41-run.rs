@@ -476,17 +476,18 @@ impl ChatFrame for Dsv41Frame {
         let mut ids: Vec<u32> = Vec::new();
         for (i, m) in messages.iter().enumerate() {
             if i == 0 {
-                ids.extend(encode_segments(
-                    tok,
-                    &[Seg::Special("<|begin_of_sentence|>")],
-                    "",
-                )?);
+                // Pinned ids: this checkpoint's marker names are NOT tokenizer
+                // specials, so a by-name lookup would literal-encode them and
+                // change the prompt (measured earlier: the one-shot path only
+                // answers correctly with the raw ids [0, 128803] + body +
+                // [128804, 128822]).
+                ids.extend(encode_segments(tok, &[Seg::Id(0)], "")?);
             }
             let asst = m.role == "assistant";
-            let marker = if asst { "<|Assistant|>" } else { "<|User|>" };
-            let mut segs = vec![Seg::Special(marker), Seg::Content];
+            let marker = if asst { 128804u32 } else { 128803u32 }; // <|Assistant|> / <|User|>
+            let mut segs = vec![Seg::Id(marker), Seg::Content];
             if asst {
-                segs.push(Seg::Special("<|end_of_sentence|>"));
+                segs.push(Seg::Id(1)); // <|end_of_sentence|> == eos
             }
             ids.extend(encode_segments(tok, &segs, &m.content)?);
         }
@@ -495,7 +496,9 @@ impl ChatFrame for Dsv41Frame {
         // block instead of answering (the raw-text runs' failure mode).
         ids.extend(encode_segments(
             tok,
-            &[Seg::Special("<|Assistant|>"), Seg::Special("</think>")],
+            // the generation opener: <|Assistant|> then </think>, both PINNED as
+            // ids for the same reason as the markers above
+            &[Seg::Id(128804), Seg::Id(128822)],
             "",
         )?);
         Ok(ids)
