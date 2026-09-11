@@ -21,22 +21,6 @@ use ferrite_types::{DType, FerriteError, Result, Shape, Tensor};
 /// Opaque stream handle (cudaStream_t == void* at the ABI level).
 pub type CuStream = *mut std::ffi::c_void;
 
-// cuBLASLt opaque types (see cublasLt.h for the C definitions these mirror).
-// The algorithm struct is 64 bytes of opaque data; the heuristic result embeds
-// it plus the workspace size, a status, a waves count, and 4 reserved ints.
-#[repr(C)]
-pub(crate) struct LtAlgo {
-    pub data: [u64; 8],
-}
-#[repr(C)]
-pub(crate) struct LtHeuristicResult {
-    pub algo: LtAlgo,
-    pub workspace_size: usize,
-    pub state: i32,
-    pub waves_count: f32,
-    pub reserved: [i32; 4],
-}
-
 extern "C" {
     // cudart (linked into libferrite_kernels.so's dependency closure)
     fn cudaSetDevice(dev: i32) -> i32;
@@ -87,37 +71,6 @@ extern "C" {
         compute: i32,
         algo: i32,
     ) -> i32;
-
-    // cuBLASLt: explicit algorithm selection. The cublasGemmEx heuristic picks
-    // a splitK variant for m<=32 decode shapes, and the splitK reduce pass is
-    // pure overhead at that size. With cublasLt we can request heuristic
-    // candidates and pick one with SPLITK_NUM == 1.
-    fn cublasLtCreate(handle: *mut *mut std::ffi::c_void) -> i32;
-    fn cublasLtMatmulDescCreate(
-        desc: *mut *mut std::ffi::c_void, compute: i32, scale_type: i32) -> i32;
-    fn cublasLtMatmulDescSetAttribute(
-        desc: *mut std::ffi::c_void, attr: i32,
-        buf: *const std::ffi::c_void, size: usize) -> i32;
-    fn cublasLtMatrixLayoutCreate(
-        layout: *mut *mut std::ffi::c_void, dtype: i32,
-        rows: u64, cols: u64, ld: i64) -> i32;
-    fn cublasLtMatmulPreferenceCreate(pref: *mut *mut std::ffi::c_void) -> i32;
-    fn cublasLtMatmulAlgoGetHeuristic(
-        h: *mut std::ffi::c_void, desc: *mut std::ffi::c_void,
-        ad: *mut std::ffi::c_void, bd: *mut std::ffi::c_void,
-        cd: *mut std::ffi::c_void, dd: *mut std::ffi::c_void,
-        pref: *mut std::ffi::c_void, requested: i32,
-        results: *mut LtHeuristicResult, returned: *mut i32) -> i32;
-    fn cublasLtMatmulAlgoConfigGet(
-        algo: *const LtAlgo, attr: i32, buf: *mut std::ffi::c_void,
-        size: usize, written: *mut usize) -> i32;
-    fn cublasLtMatmul(
-        h: *mut std::ffi::c_void, desc: *mut std::ffi::c_void,
-        alpha: *const std::ffi::c_void, a: *const std::ffi::c_void, ad: *mut std::ffi::c_void,
-        b: *const std::ffi::c_void, bd: *mut std::ffi::c_void,
-        beta: *const std::ffi::c_void, c: *const std::ffi::c_void, cd: *mut std::ffi::c_void,
-        d: *mut std::ffi::c_void, dd: *mut std::ffi::c_void, algo: *const LtAlgo,
-        ws: *mut std::ffi::c_void, ws_size: usize, stream: CuStream) -> i32;
 
     // ferrite kernels (ferrite_kernels.cu bridge)
     fn ferrite_matmul(x: *const f32, w: *const f32, bias: *const f32, out: *mut f32,
@@ -2272,86 +2225,6 @@ unsafe fn verify_kernel_build(
             std::env::var("FERRITE_CUBLAS_ALGO").ok()
                 .and_then(|v| v.parse::<i32>().ok()).unwrap_or(99)
         });
-        // cuBLASLt path for m<=32 decode shapes: pick an algorithm WITHOUT
-        // splitK (the cublasGemmEx heuristic picks splitK for these shapes,
-        // and the splitKreduce pass is 0.41ms/step of pure overhead at this
-        // size). For larger m (prefill / GLM), keep cublasGemmEx — splitK
-        // may be the right choice there.
-        if n <= 32 {
-            use std::sync::OnceLock;
-            static LT_H: OnceLock<*mut std::ffi::c_void> = OnceLock::new();
-            static mut LT_ALGO_CACHE: Option<(i32, i32, i32, LtAlgo)> = None; // (m, n, k, algo)
-            let lt_h = *LT_H.get_or_init(|| {
-                let mut g: *mut std::ffi::c_void = std::ptr::null_mut();
-                unsafe { cublasLtCreate(&mut g) };
-                g
-            });
-            if !lt_h.is_null() {
-                unsafe {
-                    // Reuse the cached algo if the shape matches (same m/n/k).
-                    let cached = &*std::ptr::addr_of!(LT_ALGO_CACHE);
-                    if let Some((cm, cn, ck, algo)) = cached {
-                        if *cm == out_f && *cn == n && *ck == in_f {
-                            let st = cublasLtMatmul(
-                                lt_h, lt_desc, &alpha,
-                                w, ad, xbp as *const _, bd,
-                                &beta, do_.as_f32() as *const _, cd,
-                                do_.as_f32() as *mut _, cd,
-                                algo, std::ptr::null_mut(), 0, self.stream,
-                            );
-                            if st == 0 { return Ok(do_); }
-                        }
-                    }
-                    // Create descriptors for this shape
-                    let mut lt_desc: *mut std::ffi::c_void = std::ptr::null_mut();
-                    let mut ad: *mut std::ffi::c_void = std::ptr::null_mut();
-                    let mut bd: *mut std::ffi::c_void = std::ptr::null_mut();
-                    let mut cd: *mut std::ffi::c_void = std::ptr::null_mut();
-                    // compute=0 (CUBLAS_COMPUTE_32F), scale=CUDA_R_32F(0)
-                    cublasLtMatmulDescCreate(&mut lt_desc, 0, 0);
-                    // transa = CUBLAS_OP_T (=1)
-                    let op_t: i32 = 1;
-                    cublasLtMatmulDescSetAttribute(lt_desc, 3 /*TRANSA*/, &op_t as *const _ as *const _, 4);
-                    // layouts: A = w (bf16=14), [in_f, out_f], ld=in_f
-                    cublasLtMatrixLayoutCreate(&mut ad, 14, in_f as u64, out_f as u64, in_f as i64);
-                    // B = x (bf16=14), [in_f, n], ld=in_f
-                    cublasLtMatrixLayoutCreate(&mut bd, 14, in_f as u64, n as u64, in_f as i64);
-                    // C = D = out (f32=0), [out_f, n], ld=out_f
-                    cublasLtMatrixLayoutCreate(&mut cd, 0, out_f as u64, n as u64, out_f as i64);
-                    // Heuristic: request 8 candidates, pick the first with SPLITK_NUM==1
-                    let mut pref: *mut std::ffi::c_void = std::ptr::null_mut();
-                    cublasLtMatmulPreferenceCreate(&mut pref);
-                    let mut results: [LtHeuristicResult; 8] = std::mem::zeroed();
-                    let mut n_results: i32 = 0;
-                    cublasLtMatmulAlgoGetHeuristic(
-                        lt_h, lt_desc, ad, bd, cd, cd, pref, 8,
-                        results.as_mut_ptr(), &mut n_results,
-                    );
-                    for i in 0..n_results as usize {
-                        let mut splitk: i32 = -1;
-                        let mut written: usize = 0;
-                        cublasLtMatmulAlgoConfigGet(
-                            &results[i].algo, 2 /*SPLITK_NUM*/,
-                            &mut splitk as *mut i32 as *mut _, 4, &mut written,
-                        );
-                        if splitk == 1 {
-                            let st = cublasLtMatmul(
-                                lt_h, lt_desc, &alpha,
-                                w, ad, xbp as *const _, bd,
-                                &beta, do_.as_f32() as *const _, cd,
-                                do_.as_f32() as *mut _, cd,
-                                &results[i].algo, std::ptr::null_mut(), 0, self.stream,
-                            );
-                            if st == 0 {
-                                LT_ALGO_CACHE = Some((out_f, n, in_f, results[i].algo));
-                                return Ok(do_);
-                            }
-                        }
-                    }
-                    // fall through to cublasGemmEx if no non-splitK algo found
-                }
-            }
-        }
         let st = unsafe {
             cublasGemmEx(
                 h, 1, 0, out_f, n, in_f,
