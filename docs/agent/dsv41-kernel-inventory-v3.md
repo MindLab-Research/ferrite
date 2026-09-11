@@ -509,17 +509,41 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    `dsv41_a32_bench.cu` 经 `dsv41_gemv_gsmem` / `dsv41_gemv_occupancy` 两个 host 探针把
    "20KB⇒4→8 blocks/SM" 从估算变成实测。
 
-   **新增可砍项（2026-09-11 explore 读码，未实测）——a32 ON 时 `s_a` 是死槽**：mode 4 的
-   k 字节激活 staging（`s_a`，`dsv41_kernels.cu:3129-3145`）在 `a32==1` 时**只被读一次**——
-   就是 `s_af` 的物化循环（`:3171` 的 `s_lut[ap0[i]] * s_as[i>>5]`，`ap0 = s_a`）；消费循环在
-   a32 分支只碰 `s_af`（`:3257`），`ap`（`:3211`）在该分支是死代码。⇒ 可把"uint4 跨步拷贝 →
-   第二趟逐字节解码"合成**一趟**（global uint4 → LUT 查表 → ×`s_as` → 直接写 `s_af`），
-   并让 `s_a` 槽仅在 `a32==0` 时分配（与 `dsv41_gemv_a32_bytes` 同构的按需尺寸函数）。
+   **P1 a32 死槽消除（2026-09-11 已落地代码，待实测）——a32 ON 时 `s_a` 是死槽**：mode 4 的
+   k 字节激活 staging（`s_a`）在 `a32==1` 时**只被读一次**——就是 `s_af` 的物化循环
+   （`s_lut[ap0[i]] * s_as[i>>5]`，`ap0 = s_a`）；消费循环在 a32 分支只碰 `s_af`，`ap` 在该
+   分支是死代码。**已实施**：把"uint4 跨步拷贝 → 第二趟逐字节解码"合成**一趟**
+   （global uint4 宽读 → LUT 查表 → ×`s_as` → 直写 `s_af`），`s_a` 槽仅在需要时分配。
    收益：k=5120/warps=4 时 gsmem **48512 → 43392B**（blocks/SM 4 → 5，+25% 驻留）+ 少一趟 k
-   遍历；`s_af[j]` 仍是同一乘积 ⇒ **逐位等价**（`s_a` 只是 `a` 的副本）。⚠️ 反证风险：
-   `MODE=3` 已等价于"不 staging、从 global 读"且实测更慢（19.96 vs 19.24）——但那是把 global
-   读留在**物化循环里逐字节**；本方案保留 uint4 宽读，只是把两趟并成一趟，属于 mode 3/4 之间的
-   第三点，需实测。
+   遍历；`s_af[j]` 仍是同一乘积 ⇒ **逐位等价**（`s_a` 只是 `a` 的副本）。
+
+   实现要点（改动都在 `dsv41_kernels.cu`，无 Rust 侧改动）：
+   - 内核 `gemm_fp8_gemv_kernel`：新增 `const bool a32_direct = (a32 != 0) && (vec == 4) &&
+     (qr_raw == nullptr);`（~`:3080`）；`s_ws = s_a + (vec == 4 && !a32_direct ? k : 0)`，
+     即清掉 `s_a` 槽后整段尾部（`s_ws/s_as/s_lut/s_af/s_rows`）一起下移 k，**尾部内部相对
+     偏移不变**（`s_rows` 的 `a32 ? s_af + k : s_lut + 256` 无需改）。
+   - staging 循环（`:3153`）guard 加 `&& !a32_direct`；物化循环（`:3195`）新增
+     `else if (a32_direct)` 分支做 global→`s_af` 的单趟融合；`s_af` 之后的
+     `__syncthreads()` 位置不变（barrier 语义与旧路径一致）。
+   - launcher 侧新增 `dsv41_gemv_sa_bytes(k, norm_fuse)`（~`:2613`），与内核的 `a32_direct`
+     **必须保持同步**。除 `dsv41_gemm_fp8_mx_rope_norm`（`qr_raw` 非空：prologue 写 `s_a`、
+     物化仍读它 ⇒ 保留 `(warps+1)*k`）外，其余 6 个 launcher（mx / rope / mx2_rope /
+     mx_add / mx_f32 / mx2）都 `qr_raw == nullptr`，mode 4 改为
+     `warps*k + dsv41_gemv_sa_bytes(k, false) + scale_bytes`；host 探针
+     `dsv41_gemv_gsmem`（mode 4）同步。
+   - `a32=0` 路径**不受影响**：`dsv41_gemv_sa_bytes` 返回 k ⇒ gsmem 与旧式 `(warps+1)*k`
+     逐位一致，且消费循环仍读 `s_a`（`fuse_a32` 为假，staging 与物化循环原样执行）。
+   - `mode 3` **未改**（无 `s_a` 可言，仍逐字节从 global 读），保持 A/B 基线可比。
+
+   验证：远端 `nvcc -arch=sm_103a -Xptxas -v` 编译通过，`gemm_fp8_gemv_kernel` 的
+   `32 regs / 32B spill / 128B static smem` 与 HEAD **完全一致**（未引入新 spill）。
+   ⚠️ 反证风险：`MODE=3` 已等价于"不 staging、从 global 读"且实测更慢（19.96 vs 19.24）——
+   但那是把 global 读留在**物化循环里逐字节**；本方案保留 uint4 宽读，只是把两趟并成一趟，
+   属于 mode 3/4 之间的第三点，**仍需实测**（`scripts/dsv41_a32_bench.sh` 的 smem/blocks-per-SM
+   一栏现在应打印 43392B / 5）。
+   ⚠️ 同类机会（**未改**）：`gemv_bf16_fp8x2_kernel`（`dsv41_gemm_bf16_fp8x2`）有完全相同的
+   死槽（其 `s_a` 也只被物化循环读，`dsv41_kernels.cu` 内核定义与 launcher gsmem 的
+   `(vec == 4) ? (warps + 1) * k`）——同法可再省 k 字节，本次按范围未动。
 1. **`down_reduce` +0.31ms 的定案**：隔离微基准（同一 kernel，HEAD vs `01291b2^`），或 revert 后重采 profile。**这是唯一挡住 0.31ms 回收的事。**
 2. **AR v5 的隔离绝对值**：0.66（v2 约定，被 §3 反证支持）vs 1.49（`86af349`，host-barrier 口径）。需要 device-side v5 的隔离测量。
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。

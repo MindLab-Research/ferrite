@@ -185,7 +185,9 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 
 ### 4.6 a32 / 占用率审计方法论 —— 把「估算」变「实测」
 
-**对象**：`gemm_fp8_gemv_kernel` 的 M=1 路径带一张 block 级预解码激活表 `s_af`（"a32"，`k×f32` = 20KB @ k=5120），把 smem 从 ~27.4KB 抬到 ~47.4KB（mode 4 的 `gsmem` = 48384B），即 **blocks/SM 4 → 8**。独立门 `DSV41_GEMV_A32`（`dsv41_kernels.cu:2581`，默认保留；`=0` 丢弃 a32、把 decode+scale 内联回消费循环，**逐位等价**，smem 少 20KB）。
+**对象**：`gemm_fp8_gemv_kernel` 的 M=1 路径带一张 block 级预解码激活表 `s_af`（"a32"，`k×f32` = 20KB @ k=5120），把 smem 从 ~28KB 抬到 ~47.4KB（mode 4 的 `gsmem` = 48512B @ warps=4/k=5120），即 **blocks/SM 4 → 8**。独立门 `DSV41_GEMV_A32`（`dsv41_kernels.cu:2597` 的 `g_gemv_a32`，`:2602` 的 `dsv41_gemv_a32_bytes`），默认保留；`=0` 丢弃 a32、把 decode+scale 内联回消费循环，**逐位等价**，smem 少 20KB。
+
+**P1 a32 死槽消除（2026-09-11 已落地）**：a32=1 时 mode 4 的 k 字节激活 staging `s_a` 只剩一个读者（`s_af` 的物化循环）⇒ 把 uint4 拷贝 + 逐字节解码合成一趟直写 `s_af`，`s_a` 槽仅在需要时分配（内核 `a32_direct` + launcher `dsv41_gemv_sa_bytes`）。k=5120/warps=4 时 mode 4 的 gsmem **48512 → 43392B**，blocks/SM 4 → 5。详见 `dsv41-kernel-inventory-v3.md` §待实测清单 0。
 
 **方法论（可复用）**：
 

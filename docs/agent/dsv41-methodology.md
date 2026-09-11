@@ -138,9 +138,14 @@ tail split 理论上限 −0.86ms，实测只兑现 −0.20ms。根因两条并�
 ### 案例：a32 的 20KB smem → blocks/SM 从 8 掉到 4
 
 **对象**：`gemm_fp8_gemv_kernel` 的 M=1 路径带一张 block 级预解码激活表 `s_af`（"a32"，`k×f32` = 20KB @ k=5120），
-把 smem 从 ~28KB 抬到 ~47.4KB（mode 4 的 `gsmem` ≈ 48384B）⇒ **blocks/SM 4 → 8**。
-独立门 `DSV41_GEMV_A32`（`dsv41_kernels.cu:2580` 的 `g_gemv_a32`，`:2585` 的 `dsv41_gemv_a32_bytes`），
+把 smem 从 ~28KB 抬到 ~47.4KB（mode 4 的 `gsmem` = 48512B @ warps=4/k=5120）⇒ **blocks/SM 4 → 8**。
+独立门 `DSV41_GEMV_A32`（`dsv41_kernels.cu:2597` 的 `g_gemv_a32`，`:2602` 的 `dsv41_gemv_a32_bytes`），
 `=0` 时丢弃 a32、把 decode+scale 内联回消费循环（**逐位等价**，smem 少 20KB）。
+
+**P1 死槽消除（2026-09-11 已落地，未实测）**：a32=1 时 mode 4 的 `s_a` 只有一个读者（`s_af` 的
+物化循环），故 stagin+物化合并为一趟、`s_a` 不分配 ⇒ gsmem **48512 → 43392B**（4 → 5 blocks/SM）。
+内核 `a32_direct`（`dsv41_kernels.cu:~3080`）与 launcher `dsv41_gemv_sa_bytes`（`:~2613`）必须同步；
+`_rope_norm` 例外（prologue 写 `s_a`）。见 `dsv41-kernel-inventory-v3.md` §待实测清单 0。
 
 **命名陷阱**：`DSV41_GEMV_FP8_MODE=3` **不是** a32 开关（mode 3 也物化 `s_af`）。
 mode 3 vs 4 隔离的是 **k 字节的激活 staging**，不是 **4k 字节的 a32 表**（`STATUS.md:6408`）。
