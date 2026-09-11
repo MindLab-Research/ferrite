@@ -1609,8 +1609,8 @@ static const int g_gemv_warps = [] {
 // Four-step ILP in the fp8 gemv kb loop, isolated on top of nuclear+e4m3.
 static const int g_gemv_ilp = [] {
     const char* e = getenv("DSV41_GEMV_ILP");
-    if (e == nullptr) return 1;
-    return atoi(e) != 0 ? 1 : 0;
+    if (e == nullptr) return 0;    // DEFAULT OFF: the 4-way unroll degenerates the
+    return atoi(e) != 0 ? 1 : 0;   // model even with fmaf pinning (see STATUS.md)
 }();
 
 // cp.async helpers are defined further down (hc_mix_dots uses them); declare
