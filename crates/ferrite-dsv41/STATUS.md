@@ -6335,3 +6335,35 @@ kv 链在投影的开头——需确认时序）。
 **分解（profile 模式 9.69ms 含开销；生产 8.23ms）**：
 gemm 2.51 · tail 1.14（split 后）· gateup 0.95 · down 0.69 · dots 0.56 ·
 sparse 0.34 · v2(gate+route) 0.39 · quant 0.13 · 其它 ~0.9
+
+### 驱动 wedge 事故与恢复（2026-09-11 深夜，会话末段）
+
+**事故时间线**：
+| 时间 | 事件 |
+|---|---|
+| 18:12 | Round 41 验证通过（8.23ms / 121.5 tok/s）✓ |
+| 18:15-18:18 | nsys v6 剖析（含 tail split 的 side stream） |
+| 18:18 | dmesg：全 8 卡 `refcntRequestReference_IMPL: Failed to enter state 1` |
+| 18:23+ | Round 42/43/43b/43c 全部失败（含 CLEAN b875509 重建） |
+
+**诊断证据链**：
+1. **CLEAN b875509（git clean + 纯 checkout + 重建，0 脏文件）也失败**——同代码不同结果
+2. 失败 rank/kernel 每次漂移（42=rank3/quant_fp8, 43=rank5/mx, 43b=rank7/rope_norm, 43c=rank3/mx）——非确定性
+3. dmesg：14:34 Xid43 + 16:11/18:18 全 8 卡 refcntRequestReference（**与 09-09 事故同形**）
+4. 停 DCGM（nv-hostengine）无效
+5. first-forward-trace：sticky 源 = hc_front_split 的 3 处事件调用失败不清 sticky（机制：驱动异常 → 事件调用失败 → sticky 传播到 quant_fp8 → 归因错位）
+
+**结论**：b300-4 驱动状态 wedge（同 09-09 事故模式），修复需重启节点。
+
+**恢复计划**（reboot-recovery-plan 制定，最少 2-3 轮）：
+1. 哨兵：one-shot `--tp 8 --prompt "1+1=" --max-tokens 3`（exit=0 = 环境恢复）
+2. 基线：`dsv41_serve_ab.sh base`（~8.2ms = round-42+ 改动无回归；~7ms = 全部 OK）
+3. 如失败：8 个 gate 全关（round-41 等效）→ 半量二分
+4. ILV 验证：`DSV41_EXPERT_ILV=1/0` 背靠背
+
+**累积待验证工作**（本地已提交 dcd2e46）：
+- r42 fix（decline=2 + SetAttribute 232448 + sticky clear）+ 6+ return 1→2
+- dual-chain attention（−0.42）+ MoE dual-chain（−0.5~0.88）+ fp4-pack（−0.06）
+- expert-interleave（−0.09，ilv-correctness 验证中）+ tail-late priority（−0.3~0.6）
+- NORM_FUSE（−0.13）+ wob-f32（−0.06）+ event-sticky-fix（robustness）
+- 全部落地预期：**~6.5-7.0ms ≈ 143-154 tok/s**

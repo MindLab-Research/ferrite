@@ -4832,9 +4832,15 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     if (e != cudaSuccess) return (int)e;
     // fork: the side stream may not start before g_hc_part is published
     e = cudaEventRecord(fork_ev, s);
-    if (e != cudaSuccess) return (int)e;
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
     e = cudaStreamWaitEvent(side, fork_ev, 0);
-    if (e != cudaSuccess) return (int)e;
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
     // LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
     // Block size from g_hc_late_t when the ss partials come from the dots kernel
     // (the default): one warp does all the LATE work, so a 1024-thread block only
@@ -4847,7 +4853,10 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     e = cudaEventRecord(join_ev, side);
-    if (e != cudaSuccess) return (int)e;
+    if (e != cudaSuccess) {
+        (void)cudaGetLastError();   // clear the sticky flag before reporting
+        return (int)e;
+    }
     // EARLY half on the main stream (collapse + rmsnorm + T1 fp8)
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
