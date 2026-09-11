@@ -5434,3 +5434,21 @@ P2 跳过 batched 路径的 ex_out/o 冗余清零（moe_down_reduce 是全写）
 | down-reduce-impl | running | down+reduce 合一的完整 kernel 实现 |
 | kv-page-design | running | DSA/KV 页化 + 前缀命中设计 |
 | gemv-fixed-cost3 | running | gemv 家族最后一轮微基准（launch_bounds、cp.async、2行/warp、const LUT） |
+
+### KV 页化设计定案（kv-page-design 报告，三处前提修正）
+
+**修正**：
+1. `latent` 是单行 scratch `[hd]`（不是 [max_comp, hd]）——持久缓存是 `ring[window..window+clen]` + `index_k[0..clen]`
+2. 压缩组粒度 = ratio ∈ {1,2} token→latent（比 vLLM 16-token block 更细）
+3. DSV41 无 GDN——不需要线性态 snapshot
+
+**方案**：P=128 token/page（= window_size，ratio 倍数对齐），每 page 存每个 kv-source 层（2/8/14/20）的 latent 行 + index_k 行。链式哈希 `h_p = H(h_{p-1} ‖ tokens[p] ‖ model_salt)`。TP8 全复制无协商（wkv/indexer.wk 全是 Replicated）。命中后 D2D 拷贝 + 跳到 [L·P, n)。
+**1M prefill 关系**：当前逐 token step O(n²)；命中 L 后 O(m·L + m²)，多轮 agent 场景 m 小 → 接近 O(m)。
+
+### 当前 subagent 矩阵（3 并行 ✓）
+
+| subagent | 状态 | 任务 |
+|---|---|---|
+| arch-blueprint | running | ferrite 统一架构蓝图（写入 docs/agent/ferrite-unified-arch.md） |
+| down-reduce-wire | running | down+reduce 的 Rust 侧接线（device.rs FFI + chain_dev 替换） |
+| gemv-fixed-cost3 | running | gemv 最后一轮微基准（launch_bounds、cp.async、2行/warp、const LUT） |
