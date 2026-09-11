@@ -57,6 +57,12 @@ extern "C" {
     /// `out[m, n] = a[m, k] @ w[n, k]^T`, a fp8 e4m3 with per-(row, k/32) ue8m0
     /// scales and `w` fp8 e4m3 with per-(n/32, k/32) ue8m0 scales.
     /// `bias` may be null. Uses m16n8k32 fp8 MMA with the epilogue scheme above.
+    ///
+    /// The trailing group is the AR v5 store fusion (`staging_tbl`/`epoch`/`world`/
+    /// `my_rank`/`stride`, M=1 only) followed by B1's fp8 row compression
+    /// (`xq`/`xsc`, M=1 only, `n % 32 == 0`, `xq` must not alias `a`). All of them
+    /// default to null/0, i.e. the plain GEMM, and `Device` (device.rs) is the
+    /// binding the engine actually calls.
     pub fn dsv41_gemm_fp8_mx(
         a: *const u8,
         // a_scale: f32 power-of-two activation scales, one per (row, k/32) --

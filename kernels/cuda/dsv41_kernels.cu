@@ -1754,7 +1754,26 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      // counts FLOAT ELEMENTS per slot (bytes/4), NOT bytes.
                                      float* const* __restrict__ staging_tbl = nullptr,
                                      const unsigned* __restrict__ epoch = nullptr,
-                                     int world = 0, int my_rank = 0, int stride = 0) {
+                                     int world = 0, int my_rank = 0, int stride = 0,
+                                     // B1 (quantised row compression): when non-null the epilogue
+                                     // ALSO emits this row's fp8 e4m3 byte and the per-32-block
+                                     // scale of the vector it is writing, with quant_kernel's own
+                                     // arithmetic, so the consumer's `quant1` launch disappears.
+                                     //
+                                     // TWO constraints, both of them structural - read before use:
+                                     //  1. A gemv warp produces ONE row (= one element of `out`),
+                                     //     so a warp CANNOT own a quant block: `quant1`'s block is
+                                     //     32 CONSECUTIVE elements, i.e. 32 rows, i.e. 32 WARPS.
+                                     //     This is exactly the opposite of the hc-tail / swiglu
+                                     //     producers, where a warp's 32 LANES are 32 consecutive
+                                     //     elements of the quantised vector and the amax is one
+                                     //     shuffle. Here the amax spans the block (see the epilogue
+                                     //     below), so the launcher must give the block 32 warps.
+                                     //  2. `xq` must not alias `a`/`a_scale`: the quantised input is
+                                     //     still being staged by blocks that start late, so the
+                                     //     fp8 output needs its own buffer.
+                                     uint8_t* __restrict__ xq = nullptr,
+                                     float* __restrict__ xsc = nullptr) {
     // Read the round ONCE, like p2p_ar_store_v5_kernel (ferrite_kernels.cu). When
     // the table is null this is a no-op (epoch is null too) and the kernel is the
     // old one bit for bit.
@@ -1814,6 +1833,11 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     // (s_lut[ap[j]] * sa with sa = s_as[j>>5]), so the rounding sequence is
     // unchanged and the output is bit-identical (fingerprint-verified).
     float* s_af = s_lut + 256;
+    // B1: this block's 32 row values (one per warp), staged so the epilogue can
+    // take the amax of the quant block they form. The 32-float slot is reserved
+    // in every launcher's `scale_bytes` (see dsv41_gemm_fp8_mx); it is only
+    // dereferenced when `xq` is non-null, which requires nwarps == 32.
+    float* s_rows = s_af + k;
     if (vec == 4) {
         const int n16a = k >> 4;
         // NOTE: this staging was tried as cp.async and faulted with err 700
@@ -1971,6 +1995,32 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                 for (int rr = 0; rr < world; rr++)
                     staging_tbl[rr][ar_base + (size_t)rrow] = v;
             }
+            // B1: hand this row to the block-level quant epilogue below. `v` is
+            // the same register value the f32 store just wrote, so the byte the
+            // epilogue encodes is exactly what quant_kernel would have read back
+            // from `out` (no second global round trip, no re-read).
+            if (xq != nullptr) s_rows[warp] = v;
+        }
+    }
+    // B1 epilogue: the block's 32 warps produced the 32 CONSECUTIVE rows that
+    // form one quant_kernel block, so the block itself can emit both the byte
+    // and the scale. The launcher only enables this with nwarps == 32 and
+    // grid*nwarps == n, which is what makes `row == blockIdx.x * nwarps + warp`
+    // and `quant block == blockIdx.x` hold for every warp.
+    if (xq != nullptr) {
+        __syncthreads();
+        float amax = (lane < nwarps) ? fabsf(s_rows[lane]) : 0.f;
+        for (int off = 16; off > 0; off >>= 1)
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, off));
+        // quant_kernel's arithmetic, term for term (quant_kernel<0>, block 32,
+        // round_scale = true).
+        const float sc = fmaxf(fast_round_scale(amax, 1.0f / 448.0f), 1e-30f);
+        if (lane == 0) {
+            const float inv = 1.0f / sc;
+            const float q = fminf(fmaxf(s_rows[warp] * inv, -448.0f), 448.0f);
+            const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+            xq[(size_t)blockIdx.x * (size_t)nwarps + (size_t)warp] = *(const uint8_t*)&f8;
+            if (warp == 0) xsc[blockIdx.x] = sc;
         }
     }
 }
@@ -1984,7 +2034,15 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
                                  // the C++ tests) on the old path, bit for bit.
                                  float* const* staging_tbl = nullptr,
                                  const unsigned* epoch = nullptr, int world = 0,
-                                 int my_rank = 0, int stride = 0) {
+                                 int my_rank = 0, int stride = 0,
+                                 // B1: emit the fp8 row compression of `out` (see
+                                 // gemm_fp8_gemv_kernel). M=1 only, and the shape must allow
+                                 // one block per quant block (n % 32 == 0); the launcher then
+                                 // raises the block to 32 warps and shrinks the grid to n/32.
+                                 // `xq` must NOT alias `a`. Null keeps the old path bit for bit;
+                                 // a shape that cannot take it returns cudaErrorInvalidValue so
+                                 // the caller keeps the (gemv, quant) pair.
+                                 uint8_t* xq = nullptr, float* xsc = nullptr) {
     if (m <= 0 || n <= 0 || k <= 0 || (k & 31) || (k & 3)) return (int)cudaErrorInvalidValue;
     // The A tile lives in shared memory: 16 rows x k bytes. At the model's real
     // k (5120) that is 80 KB, well past the 48 KB static limit, so the kernel
@@ -2004,15 +2062,29 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     // in this file already avoid.
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
     if (m == 1 && !no_gemv) {
-        const int warps = g_gemv_warps;
-        const int blocks = (n + warps - 1) / warps;
+        // B1: the fused fp8-row emit needs ONE BLOCK PER QUANT BLOCK (32 rows).
+        // `row = blockIdx.x * nwarps + warp`, so 32 warps per block is what makes
+        // the block's rows the 32 consecutive elements of a quant block; the grid
+        // becomes exactly n/32, which also guarantees the single row-loop
+        // iteration the epilogue's `blockIdx.x * nwarps + warp` index assumes.
+        // Modes 0/1 allocate no dynamic shared memory, so they cannot stage the
+        // row values - decline and let the caller keep the two-launch path.
+        int warps = g_gemv_warps;
+        int blocks = (n + warps - 1) / warps;
+        if (xq != nullptr) {
+            if (xsc == nullptr || (n & 31) || g_gemv_fp8_mode < 3)
+                return (int)cudaErrorInvalidValue;
+            warps = 32;
+            blocks = n / 32;
+        }
         const int nb_k = k >> 5;
         const int nb_k_al = (nb_k + 15) & ~15;
         // weights [nwarps][k] + (mode 4) block activation [k] + per-warp ue8m0
-        // scale rows [nwarps][nb_k_al] + block activation scales [nb_k] f32.
+        // scale rows [nwarps][nb_k_al] + block activation scales [nb_k] f32
+        // + (B1) the block's 32 staged row values.
         const size_t scale_bytes =
             (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-            (size_t)k * sizeof(float);   // a32: the pre-decoded activation row
+            (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + B1 row stage
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                              : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                       : (size_t)0;
@@ -2024,9 +2096,12 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
                                                               k, g_gemv_fp8_mode, nullptr, nullptr,
                                                               nullptr, nullptr, n, 0, staging_tbl,
-                                                              epoch, world, my_rank, stride);
+                                                              epoch, world, my_rank, stride, xq, xsc);
         return (int)cudaGetLastError();
     }
+    // B1 is an M=1 epilogue only: the tile path has no lane-0 row epilogue and
+    // its `out` is an m x n tile, so it cannot emit the row-compressed bytes.
+    if (xq != nullptr) return (int)cudaErrorInvalidValue;
     // Store fusion is an M=1 epilogue only: the tile path (prefill / m>1) has no
     // lane-0 row epilogue, so refusing loudly beats silently dropping the AR.
     if (staging_tbl != nullptr) return (int)cudaErrorInvalidValue;
@@ -2057,7 +2132,7 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float);
+        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the B1 row stage slot
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
@@ -2239,7 +2314,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float);   // a32: the pre-decoded activation row
+        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the B1 row stage slot
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;

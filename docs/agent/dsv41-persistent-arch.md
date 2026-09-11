@@ -87,6 +87,7 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 | **P0（前置）** | 统一融合 env 两侧默认（`.cu` `g_fuse` return 0 + Rust `unwrap_or(false)`）；`DSV41_AR_STORE_FUSE` 逐位验后翻 ON | −0.08ms + 铺路 | 低 |
 | **P1** | 段 C 融合：`hc_post` + `copy_h_back` → `hc_post_inplace`（省 80KB D2D ×2/层） | −0.15~0.25ms | 低（parity 既有） |
 | **P1b（已实施，env 默认关）** | `hc_post_inplace` 再折进**产生它 `x` 的那个 AR** 的 pubred epilogue（`DSV41_HCPOST_EPI=1`，核 `ferrite_p2p_ar_v5_hcpost`）：2 个 site/层 = 80~90 节点。这是"相邻两核合一"的第一步，也是段核的第一个可运行原型 | −0.15ms | 中（跨 CU 位级：epilogue 用显式 `__fmul_rn`/`__fmaf_rn`，须过 `ar_hcpost_parity.rs` + 同二进制 token 逐字 A/B） |
+| **P1c（已实施，env 默认关）** | **段核「相位机」机制原型**：`hc_pre` 的 dots+tail+collapse 合成**单块相位机**（核 `hc_pre_persist_kernel`，grid=(rows,)、block=1024、`DSV41_HC_PERSIST=1`，导出 `dsv41_hc_front_persist`）。无 ticket、无自旋——块内 4 个 phase 各一个 `__syncthreads`；点的 lane 分配/归约分组逐句照抄 ⇒ **逐位等价**（`hc_persist_parity.rs` 门禁）。**这是"段核 = 相位机"的第一个可运行证据，机制可复用** | 待测（**预期非收益**，见右） | ⚠️ **smem 放得下，并行度放不下**：两 launch 版把 x+1 个权重行(160KB)放进 24 个 block ⇒ 24-SM 并行（531GB/s，7.4µs）；单块装不下 24 个权重行(1.9MiB) ⇒ 24 行点积挤在 **1 个 SM**、权重走 global。**合并省 1 次 launch，但牺牲点积的块并行度 ⇒ 大概率持平或更慢，纯属机制+parity 原型**。真正的段核须用 §1 的「沿 hc_dim 分 tile，T=64 → 320 blocks」多块形态，不是 grid=(1,) |
 | **P2** | 段 A 融合：hc 链 + attention 投影链一核，中间量留 smem；−6~8 launch/层 | −0.6~1.0ms | 中（hc 归约 / split=1） |
 | **P3** | 段 B 融合：MoE cooperative（gate→route→quant→gate_up→swiglu→down→reduce 一核，中间量留 smem） | −0.4~0.7ms | 中（slot 定序） |
 | **P4** | 跨层流水：ffn mixes 挪到 L+1 的 attn 段内下发，hc 的 ⟨B⟩ 半藏进 AR poll 窗口（PDL） | −0.3~0.5ms | 中 |

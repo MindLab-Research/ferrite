@@ -5963,6 +5963,29 @@ lm_head（n=16160）已在带宽地板（165MB/7.6TB/s = 21.8µs），不受此�
 **B1（wo_a epilogue 直出 fp8）是可落地方案**——与 T1 同款模式，消掉 40 次 quant1。
 wo-b1-impl subagent 正在实施。
 
+**B1 实施修正（wo-b1-impl，同日）——"与 T1 同款"这句话有两处是错的，已按正确形态落地**：
+
+1. **一个 warp 产不出一个量化块**。T1（hc tail / swiglu）之所以能"warp 内一次 shuffle 出 amax"，是因为那些核里
+   **warp 的 32 个 lane 就是被量化向量的 32 个连续元素**。gemv 不是：`gemm_fp8_gemv_kernel` 的 lane 走的是 **k 维**
+   （`j = kb*32 + lane`），一个 warp 只产 **一个输出元素**（`acc` 在 warp 内 shuffle 归约后 lane 0 持有）。
+   而 quant1 的 block=32 是输出向量的 **32 个连续元素 = 32 行 = 32 个 warp**。所以 amax 必须跨 warp。
+   → 落地方式：launcher 在 `xq != nullptr` 时把**每块抬到 32 个 warp、grid = n/32**，于是
+   `row = blockIdx.x*nwarps + warp` 让一个 block 的行正好是一个量化块；epilogue 用 smem 汇聚 32 行做跨 warp amax。
+   ⚠️ 代价：wo_a 的 grid 从 `ceil(n/4)=256` 缩到 `n/32=32`（n=olg=1024）。内核是固定成本主导、
+   `GEMV_FP8_WARPS` 1/2/4/8 实测中性，但 **32 未实测过 → 必须 A/B**（`DSV41_WO_QUANT_FUSE=0` 回退老路）。
+2. **不能写回 `s.xq`**。wo_a 这个 gemv **读的就是 `s.xq`/`s.xsc`**（`quant1(s.o)` 的产物），而 fp8 输出与它重叠；
+   块的 `a` staging 在核内开头、写在第尾，late block 会读到被覆盖的输入 → 竞态。→ 新增独立 scratch
+   `wo_q`/`wo_qsc`（`n_groups*o_lora` 大小），wo_b 从中读。
+
+数值：emit 的 (byte, scale) 与 `quant_kernel<0>`(block=32, round_scale=1) **逐条同式**
+（`fmaxf(fast_round_scale(amax,1/448),1e-30)` → `inv=1/sc` → clamp ±448 → `__nv_fp8_e4m3`），
+`v` 用的是写 `out` 的同一个寄存器值 → 逐位相同。
+
+代码落点：`dsv41_kernels.cu:gemm_fp8_gemv_kernel`（新尾参 `xq`/`xsc` + 跨 warp epilogue）、
+`dsv41_gemm_fp8_mx`（xq 时 warps=32/grid=n/32，shape 不合退回 `cudaErrorInvalidValue`）、
+`device.rs:gemm_fp8_mx_q`（rc==1 → Ok(false) 走回退）、`chain_dev.rs:attention()`（`wo_q`/`wo_qsc`，
+门控 `DSV41_WO_QUANT_FUSE`，默认开）。**未跑 GPU/未跑 nvcc（本机无工具链）→ 待 GPU 上验文本 + A/B。**
+
 **当前 8.60ms 的推演分解**：
 | 项 | ms | 状态 |
 |---|---|---|

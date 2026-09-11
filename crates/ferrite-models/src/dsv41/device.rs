@@ -42,6 +42,11 @@ struct Kernels {
         // the epilogue also store the row partial into every peer's slot. Null/0
         // keeps the old behaviour.
         *const *mut f32, *const c_uint, c_int, c_int, c_int,
+        // B1 (quantised row compression, M=1 only): non-null `xq`/`xsc` make the
+        // epilogue ALSO emit the fp8 e4m3 bytes of `out` and their per-32-block
+        // scales. The launcher then needs n % 32 == 0 and raises the block to 32
+        // warps; `xq` must not alias `a`. Null keeps the old path bit for bit.
+        *mut u8, *mut f32,
     ) -> c_int,
     /// Two same-activation fp8 projections in ONE gemv launch: rows below n1 map
     /// to the first family, the rest to the second, both sharing the staged
@@ -710,9 +715,53 @@ impl Device {
             (self.kernels.gemm_fp8_mx)(
                 a, a_scale, w, w_scale, bias, out, m, n, k, self.stream,
                 std::ptr::null(), std::ptr::null(), 0, 0, 0,
+                std::ptr::null_mut(), std::ptr::null_mut(),
             )
         };
         self.kerr(rc, "dsv41_gemm_fp8_mx")
+    }
+
+    /// B1: the M=1 GEMV whose epilogue ALSO emits the fp8 row compression of
+    /// `out` — the e4m3 bytes plus the per-32-block f32 scales, with
+    /// `quant_kernel<0>`'s arithmetic term for term, so the consumer's
+    /// `quant1(out)` launch disappears. The byte pair is bit-identical to that
+    /// launch, but `xq` must NOT alias `a`/`a_scale`: the quantised input is
+    /// still being staged by blocks that start late.
+    ///
+    /// Requires `n % 32 == 0`: the kernel gives the block 32 warps so that its
+    /// 32 consecutive rows ARE one quant block (a gemv warp produces one row, so
+    /// the amax of a block spans 32 warps — unlike the hc-tail/swiglu producers
+    /// where a warp's 32 lanes are the 32 elements).
+    ///
+    /// Ok(false) means the shape/`mode` cannot take the fused path (the kernel
+    /// returns `cudaErrorInvalidValue`); the caller then runs the plain
+    /// `gemm_fp8_mx` followed by its own `quant1`, which is bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mx_q(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        m: i32,
+        n: i32,
+        k: i32,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let rc = unsafe {
+            (self.kernels.gemm_fp8_mx)(
+                a, a_scale, w, w_scale, bias, out, m, n, k, self.stream,
+                std::ptr::null(), std::ptr::null(), 0, 0, 0, xq, xsc,
+            )
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mx")?;
+        Ok(true)
     }
 
     /// `wo_b` GEMV with the AR v5 store FUSED into the epilogue: the row partial
@@ -741,6 +790,7 @@ impl Device {
             (self.kernels.gemm_fp8_mx)(
                 a, a_scale, w, w_scale, std::ptr::null(), out, 1, n, k, self.stream,
                 staging_tbl, epoch, world, my_rank, stride,
+                std::ptr::null_mut(), std::ptr::null_mut(),
             )
         };
         self.kerr(rc, "dsv41_gemm_fp8_mx")

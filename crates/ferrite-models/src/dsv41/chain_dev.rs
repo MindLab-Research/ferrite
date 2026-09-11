@@ -176,6 +176,14 @@ struct Scratch {
     /// fp8 activation + per-32 scale for the wkv GEMM over `eng_rows`
     eng_xq: DevBuf,
     eng_xsc: DevBuf,
+    // ---- B1: wo_a's quantised row compression ----
+    /// The fp8 e4m3 bytes the wo_a gemv epilogue emits for `s.wo` (gated by
+    /// DSV41_WO_QUANT_FUSE), which is what wo_b then consumes. It needs its OWN
+    /// buffer rather than sharing `xq`/`xsc`: the wo_a gemv READS `xq` (the
+    /// quantised attention output) as its input, and the blocks that stage that
+    /// input late would read bytes the epilogue had already overwritten.
+    wo_q: DevBuf,   // [n_groups*o_lora] fp8 bytes
+    wo_qsc: DevBuf, // [n_groups*o_lora/32 + 8] f32
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -607,6 +615,10 @@ impl<'a> DevChain<'a> {
             eng_kv: dev.alloc(fb((hc + 1) * dim))?,
             eng_xq: dev.alloc((eng_cols * ehd).max(8))?, // fp8 bytes
             eng_xsc: dev.alloc(fb((eng_cols * ehd).max(8) / 32 + 8))?,
+            // B1: sized by the FULL (unsharded) wo_a output, which is also the
+            // largest `ol_local` any rank produces.
+            wo_q: dev.alloc(cfg.n_groups_o_lora().max(8))?,
+            wo_qsc: dev.alloc(fb(cfg.n_groups_o_lora() / 32 + 8))?,
         };
 
         // RoPE tables covering the whole context.
@@ -769,6 +781,18 @@ impl<'a> DevChain<'a> {
         static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *F.get_or_init(|| {
             std::env::var("DSV41_PROJ_FUSE").map(|v| v != "0").unwrap_or(true)
+        })
+    }
+
+    /// B1 (DSV41_WO_QUANT_FUSE, default on): let the wo_a gemv's epilogue emit
+    /// the fp8 row compression of its own output, so the `quant1(s.wo)` launch
+    /// between the two projections disappears. The emitted (byte, scale) pair is
+    /// `quant_kernel<0>`'s, term for term, so the model output is unchanged; "0"
+    /// keeps the old (gemv, quant1) pair.
+    fn wo_quant_fuse() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_WO_QUANT_FUSE").map(|v| v != "0").unwrap_or(true)
         })
     }
 
@@ -2155,6 +2179,19 @@ fn hc_persist() -> bool {
         let nlg = groups / world; // wo_a is ColumnParallel: a block of groups each
         let k = hpg * hd;
         self.quant1(self.s.o.ptr as *const f32, (nlh * hd) as i32)?;
+        // B1 (DSV41_WO_QUANT_FUSE): the wo_a gemv's epilogue emits the fp8 of its
+        // own output into `wo_q`/`wo_qsc` with quant_kernel's arithmetic, so the
+        // `quant1(s.wo)` launch that used to sit between the two projections (one
+        // per layer, 40 per step) disappears and wo_b reads `wo_q` instead of
+        // `xq`. A separate buffer is REQUIRED, not a convenience: this gemv is
+        // READING `xq` (the quantised attention output) as its input, so writing
+        // the output fp8 back into it would race with the blocks that stage that
+        // input late. `gemm_fp8_mx_q` returns false when the shape cannot take the
+        // fused path (n % 32 != 0, or `mode` < 3 with no dynamic shared memory),
+        // and we then run the plain call for every group; the emitted bytes are
+        // bit-identical either way, which is what makes the fallback safe.
+        let wo_fuse = Self::wo_quant_fuse() && (olg % 32) == 0;
+        let mut wo_fused = false;
         for g in 0..nlg {
             // The weight tensor is ALREADY the rank's local slice (Shard::Groups
             // cut it at load time), so every offset must be LOCAL: group g of
@@ -2171,17 +2208,29 @@ fn hc_persist() -> bool {
                 .unwrap()
                 .as_u8()
                 .wrapping_add((g * olg / 32) * (k / 32));
-            self.dev.gemm_fp8_mx(
-                a,
-                asc,
-                wp,
-                wsp,
-                std::ptr::null(),
-                (self.s.wo.ptr as *mut f32).wrapping_add(g * olg),
-                1,
-                olg as i32,
-                k as i32,
-            )?;
+            let out = (self.s.wo.ptr as *mut f32).wrapping_add(g * olg);
+            // The decline is a shape/`mode` property, so group 0 decides for the
+            // whole loop; a later group rides on the decision it produced.
+            if wo_fuse && (g == 0 || wo_fused) {
+                let ok = self.dev.gemm_fp8_mx_q(
+                    a,
+                    asc,
+                    wp,
+                    wsp,
+                    std::ptr::null(),
+                    out,
+                    1,
+                    olg as i32,
+                    k as i32,
+                    (self.s.wo_q.ptr as *mut u8).wrapping_add(g * olg),
+                    (self.s.wo_qsc.ptr as *mut f32).wrapping_add(g * olg / 32),
+                )?;
+                if ok {
+                    wo_fused = true;
+                    continue;
+                }
+            }
+            self.dev.gemm_fp8_mx(a, asc, wp, wsp, std::ptr::null(), out, 1, olg as i32, k as i32)?;
         }
         // wo_b is RowParallel: the input (groups*o_lora) is split, so this rank
         // reduces over its own slice and the ranks' partial sums are added.
@@ -2202,12 +2251,20 @@ fn hc_persist() -> bool {
         // re-enables.
         let ar_store_fused = ar_store_fuse()
             && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
-        self.quant1(self.s.wo.ptr as *const f32, ol_local as i32)?;
+        // wo_b's activation: the fused wo_a epilogue already produced the fp8 of
+        // `s.wo`, so the quant1 that used to run here is skipped and the two
+        // launches below read `wo_q`/`wo_qsc` instead of `xq`/`xsc`.
+        let (wb_q, wb_sc) = if wo_fused {
+            (self.s.wo_q.as_u8(), self.s.wo_qsc.as_f32())
+        } else {
+            self.quant1(self.s.wo.ptr as *const f32, ol_local as i32)?;
+            (self.s.xq.as_u8(), self.s.xsc.as_f32())
+        };
         if ar_store_fused {
             let c = comm.as_ref().unwrap();
             self.dev.gemm_fp8_mx_ar(
-                self.s.xq.as_u8(),
-                self.s.xsc.as_f32(),
+                wb_q,
+                wb_sc,
                 ld.wo_b.as_ref().unwrap().as_u8(),
                 ld.wo_b_scale.as_ref().unwrap().as_u8(),
                 self.s.o.ptr as *mut f32,
@@ -2221,8 +2278,8 @@ fn hc_persist() -> bool {
             )?;
         } else {
             self.dev.gemm_fp8_mx(
-                self.s.xq.as_u8(),
-                self.s.xsc.as_f32(),
+                wb_q,
+                wb_sc,
                 ld.wo_b.as_ref().unwrap().as_u8(),
                 ld.wo_b_scale.as_ref().unwrap().as_u8(),
                 std::ptr::null(),
