@@ -463,13 +463,15 @@ struct Kernels {
         ) -> c_int,
     >,
     /// hc TAIL SPLIT (`DSV41_HC_TAIL_SPLIT`, default ON): same front end as
-    /// `hc_front`, but BOTH tail halves leave the dots' critical path — the LATE
-    /// half (ss/sigmoid/sinkhorn/comb) on a side stream, and the EARLY half
-    /// (collapse/rmsnorm/fp8) on that same side stream *before* it, concurrent
-    /// with the dots. The C launcher records the `in_ev` (main, pre-dots) /
-    /// `fork_ev` (main, post-dots) / `early_ev` (side, post-EARLY) / `join_ev`
-    /// (side) edges itself; the caller waits the join event before the hc_post
-    /// that consumes `comb`. Optional: a stale `.so` falls back to the
+    /// `hc_front`, but the WHOLE tail chain leaves `main` — the EARLY half
+    /// (collapse/rmsnorm/fp8), the dots and the LATE half (ss/sigmoid/sinkhorn/
+    /// comb) all run in that order on the side stream, inside the `in_ev` /
+    /// `early_ev` / `join_ev` edges. `main` waits ONLY `early_ev` here (the
+    /// projection group that follows reads just the EARLY outputs; the dots are
+    /// read only by the LATE branch, on the same side stream), and the caller
+    /// waits `join_ev` before the hc_post that consumes `comb`. `fork_ev` stays
+    /// in the ABI but is no longer recorded — the dots/LATE pair needs no fork
+    /// now that they share a stream. Optional: a stale `.so` falls back to the
     /// single-launch `hc_front`.
     hc_front_split: Option<
         unsafe extern "C" fn(
@@ -3221,13 +3223,13 @@ impl Device {
             && !self.rt.early_event().is_null()
     }
 
-    /// hc tail split front end (`DSV41_HC_TAIL_SPLIT`): the dots and the EARLY
-    /// tail half (collapse + rmsnorm + T1 fp8, writing `out`/`xq`/`xsc`) stay on
-    /// the main stream, while the LATE half (ss + sigmoid + sinkhorn + comb,
-    /// writing `pre`/`post`/`comb`) runs on the side stream so it overlaps the
-    /// projection group that consumes `out`. Returns Ok(true) when it ran — the
-    /// caller MUST then call [`Self::hc_tail_join`] before the hc_post that reads
-    /// `comb`. Ok(false) means "fall back to hc_front / hc_mixes".
+    /// hc tail split front end (`DSV41_HC_TAIL_SPLIT`): the EARLY tail half
+    /// (collapse + rmsnorm + T1 fp8, writing `out`/`xq`/`xsc`), the dots, and the
+    /// LATE half (ss + sigmoid + sinkhorn + comb, writing `pre`/`post`/`comb`) all
+    /// run on the side stream; `main` waits only the EARLY half. Returns Ok(true)
+    /// when it ran — the caller MUST then call [`Self::hc_tail_join`] before the
+    /// hc_post that reads `comb`. Ok(false) means "fall back to hc_front /
+    /// hc_mixes".
     ///
     /// Same ABI as `hc_front` plus (side stream, fork event, join event), which
     /// the C++ launcher records/waits internally. The split is bit-identical to

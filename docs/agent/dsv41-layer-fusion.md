@@ -348,6 +348,25 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     `cudaEventDisableTiming`，`supports_hc_tail_split` 也要求它们非空。位级不变（EARLY/LATE 的
     语句与操作数不动，两半内存不交——EARLY 写 out/xq/xsc，LATE 写 pre/post/comb——顺序互换无
     副作用）。
+  - **2026-09-11（同日）dots 也搬上 side stream（dots-on-side）**：投影链的第一步
+    `lin2`（`chain_dev.rs:2430`）**只读 EARLY 的输出**（`s.xn` = `out`，以及 `xq_of_xn_valid`
+    时的 `xq`/`xsc`），而 dots 只写 `g_hc_part`——它唯一的读者是 `hc_mixes_tail_kernel` 的
+    LATE 分支（`dsv41_kernels.cu` 的 `HC_TAIL_LATE`）。二者在同一条 side stream 上，
+    **流内顺序**即保证 `g_hc_part` 的 publish happens-before LATE 的读 ⇒ `fork_ev` 的
+    record/wait 对整体删除（ABI 保留该参数与事件，`supports_hc_tail_split` 仍要求非空，旧 `.so`
+    照常解析符号）。新发射序列：
+    `main: record(in_ev) -> wait(early_ev)`；`side: wait(in_ev) -> EARLY -> record(early_ev) -> dots -> LATE -> record(join_ev)`。
+    ⇒ **main 的 front 代价从 dots（4.9µs）降到 EARLY（1.7µs）**，saving ≈ 3.2µs/front × 2 front/layer
+    × 80 层 ≈ **−0.5ms 上界**（注意：题面给的 "dots 7.4µs / EARLY 4.9µs" 与文档记录相反——实测
+    dots **4.9µs**、EARLY **1.7µs**、LATE **10.7µs**）。side 链变成
+    EARLY(1.7)+dots(4.9)+LATE(10.7) ≈ **17.3µs**，仍远小于 `join_ev` 必须被满足的
+    hc 投影窗口（~50µs，见 `DSV41_HC_TAIL_PRIO` 条目）⇒ join 依旧"到达即满足"。
+    ⚠️ **正确性依赖两点**：(a) main 上没有任何 kernel 读 `g_hc_part`；(b) side 对 `s.h` 的读
+    （dots 与 LATE 都读 `x`=`s.h`）必须早于 main 对 `s.h` 的写（AR fold 的 `hc_res` / 下一段
+    `hc_post`）—— 后者由 `ar_hc_post_fold`/`layer` 里的 `hc_tail_join()`（wait `join_ev`）保证，
+    未改动。(c) 每个 front 的 `in_ev` 边仍是必须的：ffn front 的 side 链要排在 attn 段的
+    `hc_post` 之后，否则读到陈旧 `s.h`。
+    env gate **复用 `DSV41_HC_TAIL_SPLIT`**（未新增开关；A/B = tail-split on/off）。
   ⚠️ 若上机后仍只有 −0.2ms，下一个怀疑对象是**图节点开销本身**（审计：1355 节点 ≈ 2.0ms，
   ~1.5µs/节点；split 每次多 1 个 kernel 节点 + 2 个 event 节点 ⇒ 约 0.3-0.5ms/步），
   而不是调度——判据：nsys 看 tail_late 的 span 是否与投影时间轴重叠。

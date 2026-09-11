@@ -5406,17 +5406,35 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
 }
 
 // hc tail split entry (DSV41_HC_TAIL_SPLIT, Rust-gated). Same front end as
-// dsv41_hc_front, but BOTH tail halves are pulled off the dots' critical path:
-// the EARLY half (collapse + rmsnorm + T1 fp8) runs on `side` CONCURRENT with the
-// dots, and the LATE half (ss + sigmoid + sinkhorn + comb) runs after it on the
-// same side stream, overlapping the projection group that consumes the EARLY
-// output. Issued sequence (dependency view, not host order):
-//   main: record(in_ev) -> dots -> record(fork_ev) -> wait(early_ev)
+// dsv41_hc_front, but the ENTIRE tail chain — and the dots — leave the main
+// stream: the EARLY half (collapse + rmsnorm + T1 fp8), the dots, and the LATE
+// half (ss + sigmoid + sinkhorn + comb) all run in that order on `side`, while
+// main blocks only on the EARLY half. Issued sequence (dependency view, not host
+// order):
+//   main: record(in_ev) -> wait(early_ev)
 //   side: wait(in_ev) -> tail_early(HC_TAIL_EARLY) -> record(early_ev)
-//         -> wait(fork_ev) -> tail_late(HC_TAIL_LATE) -> record(join_ev)
+//         -> dots -> tail_late(HC_TAIL_LATE) -> record(join_ev)
 // The caller MUST then wait(join_ev) on the main stream before the hc_post that
 // consumes `comb` (the main-stream `wait(early_ev)` is issued here, before the
 // projection chain that reads `out`/`xq`/`xsc`).
+//
+// WHY THE DOTS CAN LEAVE MAIN (dots-on-side, 2026-09-11). The projection group
+// that follows this call reads ONLY the EARLY outputs — lin2 reads `xn` (= `out`)
+// and, when `xq_of_xn_valid` is armed, `xq`/`xsc`; `chain_dev.rs:2430`. The dots
+// write ONLY `g_hc_part`, whose sole reader is the LATE branch of
+// hc_mixes_tail_kernel (also on `side`, after the dots in stream order). So main
+// never has a data dependence on the dots, and the main-stream front cost drops
+// from the dots (4.9 us) to the EARLY half (1.7 us) — the fork/join events no
+// longer appear on main's path at all. The side chain becomes
+// EARLY(1.7) + dots(4.9) + LATE(10.7) = ~17 us, still far inside the ~50 us
+// projection window that must elapse before hc_post consumes `comb`
+// (dsv41-layer-fusion.md, DSV41_HC_TAIL_PRIO note), so `join_ev` is still
+// already satisfied when main reaches hc_tail_join.
+// The `fork_ev` record/wait pair is GONE: with the dots and the LATE half on one
+// stream, stream order already publishes `g_hc_part` before the LATE reads, so
+// an explicit fork would only add a graph node. `fork_ev` stays in the ABI
+// (ferrite-kernel still creates it and `supports_hc_tail_split` still requires
+// it) so a stale .so keeps resolving the same symbol.
 //
 // WHY EARLY NEEDS `in_ev` AND NOT JUST "no dependency on dots". EARLY reads `x`
 // (= s.h) and `pre_collapse` (a premix slot); both are written by MAIN-stream
@@ -5470,10 +5488,10 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
             return (int)e;
         }
     }
-    // (0) hc-input-ready edge: record on MAIN before the dots, wait on the side
-    // stream before EARLY. See the header comment — EARLY has no dependence on the
-    // dots, but it must stay ordered after the MAIN-stream work that produces
-    // `x`/`s.h` and `pre_collapse`.
+    // (0) hc-input-ready edge: record on MAIN before the side chain, wait on the
+    // side stream before EARLY. See the header comment — EARLY and the dots are
+    // mutually independent, but both must stay ordered after the MAIN-stream work
+    // that produces `x`/`s.h` and `pre_collapse`.
     cudaError_t e = cudaEventRecord(in_ev, s);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
@@ -5484,10 +5502,11 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // (1) EARLY half on the SIDE stream (collapse + rmsnorm + T1 fp8), concurrent
-    // with the dots below (4.9us > 1.7us, so it is fully hidden). Same statement
-    // sequence, same operands and same 1024-thread block as the old main-stream
-    // EARLY, so the emitted bytes are bit-identical.
+    // (1) EARLY half FIRST on the SIDE stream (collapse + rmsnorm + T1 fp8). It is
+    // what main blocks on, so it heads the side chain; the dots behind it are off
+    // main's path entirely. Same statement sequence, same operands and same
+    // 1024-thread block as the old main-stream EARLY, so the emitted bytes are
+    // bit-identical.
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
         w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
@@ -5498,27 +5517,23 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
-    // (2) dots on MAIN (the only inner producer of g_hc_part).
-    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, s>>>(
+    // (2) dots on the SIDE stream, right behind EARLY. `g_hc_part` is written here
+    // and read only by the LATE branch below, which is on the same stream, so no
+    // fork event is needed to publish it (the old record(fork_ev)/wait pair is
+    // gone — see the header comment). Main does NOT wait this kernel: the
+    // projection group that follows consumes only the EARLY outputs.
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, side>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    // fork: the side stream may not start the LATE half before g_hc_part is published
-    e = cudaEventRecord(fork_ev, s);
-    if (e != cudaSuccess) {
-        (void)cudaGetLastError();   // clear the sticky flag before reporting
-        return (int)e;
-    }
-    e = cudaStreamWaitEvent(side, fork_ev, 0);
-    if (e != cudaSuccess) {
-        (void)cudaGetLastError();   // clear the sticky flag before reporting
-        return (int)e;
-    }
     // (3) LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
-    // Block size from g_hc_late_t when the ss partials come from the dots kernel
-    // (the default): one warp does all the LATE work, so a 1024-thread block only
-    // buys 31 idle warps and a 1024-thread SM slot to queue for. The self-computed
-    // ss path reads wpart[threadIdx.x>>5] for warps 0..mix-1, so it keeps 1024.
+    // Stream order after the dots is the whole synchronisation: same-stream ops
+    // cannot overtake one another, so every `g_hc_part[r][m][ck]` read below sees
+    // the dots' write. Block size from g_hc_late_t when the ss partials come from
+    // the dots kernel (the default): one warp does all the LATE work, so a
+    // 1024-thread block only buys 31 idle warps and a 1024-thread SM slot to queue
+    // for. The self-computed ss path reads wpart[threadIdx.x>>5] for warps
+    // 0..mix-1, so it keeps 1024.
     const unsigned late_t = (g_hc_ss ? (unsigned)g_hc_late_t : 1024u);
     hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
@@ -5531,13 +5546,18 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         return (int)e;
     }
     // (4) join the EARLY half back onto MAIN: the projection chain right after this
-    // call consumes `out`/`xq`/`xsc`. EARLY started before the dots and is shorter,
-    // so this wait is already satisfied when main reaches it.
+    // call consumes `out`/`xq`/`xsc`. This is now the ONLY thing main waits on
+    // (EARLY = 1.7 us), so the front's main-stream cost is the EARLY half, not the
+    // dots. The wait is satisfied as soon as side finishes EARLY — the dots and
+    // LATE behind it keep running concurrently with the projections.
     e = cudaStreamWaitEvent(s, early_ev, 0);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
+    // `fork_ev` is still validated above (non-null) for ABI compatibility but is
+    // deliberately never recorded or waited: see the header comment.
+    (void)fork_ev;
     return (int)cudaGetLastError();
 }
 

@@ -1898,12 +1898,14 @@ impl<'a> DevChain<'a> {
             && self.dev.supports_hc_tail_split()
             && !norm_w.is_null()
         {
-            // Tail split (`DSV41_HC_TAIL_SPLIT`, default ON). The collapse +
-            // rmsnorm + fp8 (EARLY) stays on the main stream — its consumer is the
-            // projection group immediately below — while ss + sigmoid + sinkhorn +
-            // comb (LATE) runs on the side stream, joined just before the first
-            // consumer of `comb`. `norm_w` non-null is required: with no collapse
-            // half there is nothing to keep on the critical path.
+            // Tail split (`DSV41_HC_TAIL_SPLIT`, default ON). The whole tail chain
+            // — collapse + rmsnorm + fp8 (EARLY), the dots, and ss + sigmoid +
+            // sinkhorn + comb (LATE) — runs on the side stream in that order; main
+            // waits only the EARLY half, whose consumer is the projection group
+            // immediately below. The dots are read only by the LATE branch (same
+            // side stream, stream order publishes `g_hc_part`), so they no longer
+            // cost main anything. `norm_w` non-null is required: with no collapse
+            // half there is nothing to hand main early.
             //
             // (2026-09-11) The `!hcpost_epi()` exclusion is GONE. It existed only
             // because the AR fold consumes `comb`/`post` inside

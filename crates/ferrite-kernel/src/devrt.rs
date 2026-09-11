@@ -390,10 +390,10 @@ pub struct DevRuntime {
     cudart: Cudart,
     cublas: Cublas,
     stream: CuStream,
-    /// Side stream for the hc tail split (DSV41_HC_TAIL_SPLIT). Created once, only
-    /// ever fed the LATE tail half, and joined back onto `stream` before hc_post.
-    /// Null when `cudaStreamCreate` is unavailable, in which case the model keeps
-    /// the single-launch path (`side_stream()` returns null).
+    /// Side stream for the hc tail split (DSV41_HC_TAIL_SPLIT). Created once, fed
+    /// the whole tail chain (EARLY -> dots -> LATE) and joined back onto `stream`
+    /// before hc_post. Null when `cudaStreamCreate` is unavailable, in which case
+    /// the model keeps the single-launch path (`side_stream()` returns null).
     side_stream: CuStream,
     /// Priority the side stream was created with (0 = device default). Kept so
     /// the graph instantiation can decide whether the node-priority flag is
@@ -661,11 +661,14 @@ impl DevRuntime {
                         fork_ev = std::ptr::null_mut();
                     }
                 }
-                // Tail-split EARLY concurrency (DSV41_HC_TAIL_SPLIT): the pre-dots
-                // `in_ev` and the post-EARLY `early_ev`. Same disable-timing
-                // requirement — both land inside the whole-step capture. If they
-                // cannot be created the launcher is never entered (see
-                // `Device::supports_hc_tail_split`) and the model keeps hc_front.
+                // Tail-split EARLY concurrency (DSV41_HC_TAIL_SPLIT): `in_ev`
+                // (recorded on main at the start of the split, waited on side
+                // before the whole side chain) and `early_ev` (recorded on side
+                // after the EARLY half, waited on main before the projection).
+                // Same disable-timing requirement — both land inside the
+                // whole-step capture. If they cannot be created the launcher is
+                // never entered (see `Device::supports_hc_tail_split`) and the
+                // model keeps hc_front.
                 if make_ev(&mut in_ev, CUDA_EVENT_DISABLE_TIMING) != 0 {
                     let _ = (cudart.last_error)();
                     in_ev = std::ptr::null_mut();
