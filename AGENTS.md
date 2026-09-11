@@ -108,7 +108,7 @@ token-pair split2）**保留在 perf-b1 的 git 历史里**，不再进入默认
 每次改动**必须人眼看生成的文本**（乱码=数值回归，token 计数看不出来）。
 
 **nsys 落盘纪律**（2026-09-09 更新：现在有两种验证成功的方法，优先用 capture-range）：
-nsys 只在**目标进程退出时**写报告。HTTP serve 靠 SIGINT 优雅退出（`kill -INT <pid>` → tokio ctrl_c → `profiler_stop` → `exit(0)`；**POST /shutdown 端点存在且是正确的收尾方式**（ferrite-http/src/api.rs:342：respond 后 300ms 由 detached thread `process::exit(0)`——跳过 1.17TB 权重 drop，profiler 报告可靠落盘。⚠️ 2026-09-10 实测教训：`kill -INT` 走 ctrl_c 路径，退出时权重 drop 曾把 nsys 注入拖死（serve 已消失但 nsys 永不写报告，只能 kill -9 清理）。**一切 serve 收尾（尤其带 nsys/ncu 时）必须用 `curl -X POST http://localhost:PORT/shutdown`，不要 kill -INT**）。
+nsys 只在**目标进程退出时**写报告。HTTP serve 靠 SIGINT 优雅退出（`kill -INT <pid>` → tokio ctrl_c → `profiler_stop` → `exit(0)`；**POST /shutdown 端点存在且是正确的收尾方式**（ferrite-http/src/api.rs:336 `shutdown()`：respond 后 300ms 由 detached thread `process::exit(0)`——跳过 1.17TB 权重 drop，profiler 报告可靠落盘。⚠️ 2026-09-10 实测教训：`kill -INT` 走 ctrl_c 路径，退出时权重 drop 曾把 nsys 注入拖死（serve 已消失但 nsys 永不写报告，只能 kill -9 清理）。**一切 serve 收尾（尤其带 nsys/ncu 时）必须用 `curl -X POST http://localhost:PORT/shutdown`，不要 kill -INT**）。
 **首选：FERRITE_NCU 窗口 + capture-range（99f0a0e 起内置）**——只抓饱和稳态，报告里**没有** 80s 权重加载和 admissions 爬坡/图捕获的内核，`cuda_gpu_kern_sum` 直接就是稳态分解：
 ```bash
 timeout -s INT 300 nsys profile --trace=cuda --cuda-graph-trace=node --sample=none \
@@ -192,8 +192,21 @@ nsys stats --report cuda_gpu_kern_sum /tmp/nsys_b16.nsys-rep | head -50
 crates/ferrite-exec/src/tp.rs        TP cluster + mega-graph chain + MTP step (mtp_step, mega_chain_dev)
 crates/ferrite-kernel/src/cuda.rs    CudaBackend: FFI, graphs, GDN/DSA/MoE device chains, MtpState
 crates/ferrite-serve/src/main.rs     binary: load checkpoint → prefill → decode loop (one-shot)
+crates/ferrite-http/src/             THE shared serve stack: api.rs (axum routes /v1/chat/completions + SSE),
+                                     driver.rs (engine thread), engine.rs (ServeEngine seam), single_flight.rs
+                                     (batch-1 StepEngine adapter for lockstep/chain engines), serve.rs (launch),
+                                     tokenizer.rs (StopSpec + ChatFrame: per-checkpoint stops/frame)
+crates/ferrite-dsv41/src/bin/dsv41-run.rs  DSV41 runner: one-shot, + --serve = TP rank pool behind StepEngine
 kernels/cuda/ferrite_kernels.cu       ALL device kernels (sm_103a), build.sh → libferrite_kernels.so
 ```
+
+**Serve 架构（2026-09-11）**：GLM (`ferrite-serve --serve`) 与 DSV41 (`dsv41-run --serve --tp 8`) 共用
+`ferrite-http`：同一 axum router、同一 driver 线程、同一 SSE/usage/cancel-on-drop、同一套 `/v1/stats`+`/shutdown`。
+唯一按模型分叉的是两处**数据**：`StopSpec`（checkpoint 的停词集）与 `ChatFrame`（chat 模板，GLM 默认 /
+DSV41 自带；用 `api::router_with` 注入）。DSV41 的 TP 8-rank 锁步引擎实现 `StepEngine`（prefill/decode/
+is_stop），由 `SingleFlight` 包成 `ServeEngine`——**batch=1 的单请求语义在共享抽象里**，不在 DSV41 侧。
+⛔ 不要再往 `ferrite-dsv41` 里写 HTTP/解析/SSE 代码（旧的手写 std::net server 已删除：它还会死锁——
+barrier 建在 rank 闭包内部、且从未做 peer handshake）。
 
 ## Build / deploy / test loop
 

@@ -1411,11 +1411,9 @@ extern "C" int dsv41_compressor(const float* x, const uint8_t* wkv, const uint8_
     if (ratio == 1) {
         mode = 0;
         grid_n = rows;
-        out_rows_val = seqlen;
     } else if (start_pos == 0) {
         mode = 1;
         grid_n = b * (seqlen / ratio);
-        out_rows_val = seqlen / ratio;
     } else {
         mode = 2;
         grid_n = b;
