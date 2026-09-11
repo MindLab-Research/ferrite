@@ -282,7 +282,7 @@ fn mix_gate_shared() -> bool {
 /// already avoid.
 fn idx_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_IDX_FUSE").map(|v| v != "0").unwrap_or(true))
+    *F.get_or_init(|| std::env::var("DSV41_IDX_FUSE").map(|v| v != "0").unwrap_or(false))
 }
 
 /// DSV41_HEAD_SLICE enables the vocabulary-sliced lm_head: each rank projects

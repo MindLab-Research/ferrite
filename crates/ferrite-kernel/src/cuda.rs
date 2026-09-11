@@ -2240,6 +2240,64 @@ unsafe fn verify_kernel_build(
         Ok(do_)
     }
 
+    /// Cast-free single-weight bf16 GEMM for the n<=16 batched decode, built on
+    /// the gemm3 kernel (m16n8k16 MMA + block-level K-split x8 + deterministic
+    /// reduce). The point is what it does NOT do: `gemm_cublas` launches a
+    /// STANDALONE `ferrite_f32_to_bf16` before every `cublasGemmEx` (the x
+    /// operand must match the bf16 weights — the mixed A=f32 x B=bf16 form is
+    /// not supported by cuBLAS), and nsys counted 209 such cast kernels/step
+    /// (~0.21ms) — plus the nvjet splitK + splitKreduce pair (~0.41ms) that the
+    /// M=16 shape should never pay. This kernel stages the f32 activation into
+    /// smem and converts it in-kernel (exactly like the DSA/GDN gemm3 fusions
+    /// at their call sites), so the cast disappears.
+    ///
+    /// Writes into `out` (already allocated by the caller, [n, out_f] f32).
+    /// Returns Ok(false) when FERRITE_GEMM3=0, the shape is outside the
+    /// kernel's contract (in_f%16, in_f below the K-split floor, n>16), the
+    /// KS=8 partial buffer would be unmanageably large (>33MB: the huge-output
+    /// GEMMs such as lm_head's ~150k rows), or the kernel errors — the caller
+    /// keeps `gemm_cublas` as the fallback.
+    fn gemm1_fused_into(&self, x: &DevBuf, dw: *const std::ffi::c_void,
+                        n: usize, in_f: usize, out_f: usize, out: &DevBuf) -> Result<bool> {
+        if n == 0 || n > 16 || in_f == 0 || out_f == 0 {
+            return Ok(false);
+        }
+        if !std::env::var("FERRITE_GEMM3").map(|v| v != "0").unwrap_or(true) {
+            return Ok(false);
+        }
+        // KS=8 -> the partial is 8*n*out_f floats. Cap it so a giant output
+        // row count cannot turn a 1-cast saving into a 75MB scratch alloc.
+        if out_f > 65536 {
+            return Ok(false);
+        }
+        let partial = DevBuf::alloc(self.dev, self.stream, 8 * n * out_f)?;
+        let r = unsafe {
+            ferrite_gemm3_bf16_mma(
+                x.as_const_f32(),
+                std::ptr::null(),
+                std::ptr::null(),
+                dw,
+                std::ptr::null(),
+                std::ptr::null(),
+                partial.as_f32(),
+                out.as_f32(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                n as i32,
+                in_f as i32,
+                out_f as i32,
+                0,
+                0,
+                self.stream,
+            )
+        };
+        if r != 0 {
+            eprintln!("[opcheck] gemm1_fused({in_f}->{out_f}) err {r} — falling back to gemm_cublas");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Invalidate the per-x quant cache at a layer boundary (x is rewritten
     /// every layer). Buffers are kept (captured graphs hold the addresses).
     pub fn clear_xq_cache(&self) {
@@ -2400,6 +2458,16 @@ unsafe fn verify_kernel_build(
         let do_ = DevBuf::alloc(self.dev, self.stream, n as usize * out_f as usize)?;
         let dbias: *const f32 = std::ptr::null();
         if n == 16 && dbias.is_null() {
+            // Cast-free FIRST (FERRITE_GEMM3, default ON): the single-weight
+            // gemm3 path consumes the f32 activation DIRECTLY, so the
+            // standalone f32→bf16 cast kernel that gemm_cublas must launch per
+            // call disappears (209/step ≈ 0.21ms), along with the nvjet
+            // splitK + splitKreduce pair (≈0.41ms — M=16 must not K-split).
+            // Same kernel family the DSA/GDN groups already use.
+            if self.gemm1_fused_into(x_dev, dw.ptr as *const _, n as usize,
+                                     in_f as usize, out_f as usize, &do_)? {
+                return Ok(do_);
+            }
             // ONE-launch bf16 MMA (m16n8k16, gemm_bf16_mma_kernel), opt-in
             // only (FERRITE_GEMM_BF16_MMA=1): measured 2026-09-09 at B=16 the
             // kernel is 6x WORSE than cuBLAS (replay 15.42 → 99.17ms/step) —
