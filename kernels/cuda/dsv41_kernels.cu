@@ -2934,10 +2934,10 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
         __syncthreads();
         float* o_r = out + (size_t)r * dim;
         float s2 = 0.f;
-        // Two columns in flight: the four row loads of c+blockDim issue while
-        // c's fmas run. The per-column work and the s2 accumulation order are
-        // untouched (the same lesson as the fp8 gemv's 2.5x).
-#pragma unroll 2
+        // Four columns in flight: the row loads of c+3*blockDim issue while c's
+        // fmas run. The per-column work is `fmaf` (explicitly rounded) and the s2
+        // accumulation order is untouched, so only the timing changes.
+#pragma unroll 4
         for (int c = threadIdx.x; c < dim; c += blockDim.x) {
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
