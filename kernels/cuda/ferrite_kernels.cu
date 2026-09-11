@@ -8328,7 +8328,21 @@ __global__ void p2p_ar_store_v5_kernel(
     int world, int my_rank, int n, int stride,
     const float* __restrict__ bias) {        // optional residual (nullptr = none)
     const unsigned e = *epoch;
+    // Peer-parallel store (2026-09-11): gridDim.y == world, one peer per block row.
+    // Before, ONE thread wrote all `world` peer slots serially (`world` remote
+    // float4 stores back to back), so the kernel ran on ceil(n4/blockDim.x) = 5
+    // blocks at n=5120 (~3% SM occupancy) and was pure remote-store latency
+    // (5.9us measured, x82 ARs/step = the largest non-gemm cost of the step).
+    // Moving the peer loop to blockIdx.y multiplies the grid by `world`
+    // (5 -> 40 blocks) and leaves exactly ONE remote store per thread, so the
+    // `world` peer writes issue concurrently instead of in series.
+    // Bit-identical by construction: `step` still spans ONLY gridDim.x (y is the
+    // peer index, not a work axis), so for a fixed blockIdx.x every peer block
+    // covers the same i4 set, and every (i4, rr) pair keeps its address and its
+    // value — only the issuing thread changes. No cross-block communication, so
+    // the store keeps relying on the kernel boundary for peer visibility.
     const int step = gridDim.x * blockDim.x;
+    const int rr = blockIdx.y;               // this block's peer (gridDim.y == world)
     const int n4 = n >> 2;
     const float4* p4 = reinterpret_cast<const float4*>(partial);
     const float4* b4 = reinterpret_cast<const float4*>(bias);
@@ -8339,15 +8353,13 @@ __global__ void p2p_ar_store_v5_kernel(
             v.x += b.x; v.y += b.y; v.z += b.z; v.w += b.w;
         }
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (size_t)i4 * 4;
-        #pragma unroll 4
-        for (int rr = 0; rr < world; rr++)
-            *reinterpret_cast<float4*>(staging_tbl[rr] + base) = v;
+        *reinterpret_cast<float4*>(staging_tbl[rr] + base) = v;
     }
     for (int ii = n4 * 4 + blockIdx.x * blockDim.x + threadIdx.x; ii < n; ii += step) {
         float v = partial[ii];
         if (bias != nullptr) v += bias[ii];
         const size_t base = (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride + (unsigned)ii;
-        for (int rr = 0; rr < world; rr++) staging_tbl[rr][base] = v;
+        staging_tbl[rr][base] = v;
     }
 }
 
@@ -8439,12 +8451,16 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     // i4 keeps exactly one owner and the same ascending-rank accumulation order
     // (no cross-thread reduction). `blockDim.x >= world` is required by the
     // stamp/poll arm of the pubred kernel.
+    // The STORE launch is 3-D (blocks, world, 1): gridDim.y is the peer index
+    // (see the store kernel note), which lifts 5 -> 40 blocks and parallelizes
+    // the peer writes. `blocks` itself stays the x-extent / pubred grid, so the
+    // pubred launch below is unchanged.
     const int threads = (world > 256) ? 1024 : 256;
     int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
     // The store kernel's completion makes its staging writes peer-visible
     // (kernel boundary), so publish needs no fence against the store.
-    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
         partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
@@ -8473,7 +8489,7 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_add(
     const int threads = (world > 256) ? 1024 : 256;
     int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
         partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
@@ -8660,11 +8676,12 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
         hc_n <= 0 || hc_n > 8 || (hc_h & 3) != 0 || n != hc_h)
         return cudaErrorInvalidValue;
     // Grid on n4, 256 threads — see the launcher note in `ferrite_p2p_ar_v5`.
-    // Both the (unchanged) store kernel and the hcpost pubred run on this grid.
+    // The store runs on the 3-D (blocks, world, 1) grid (peer index in y); the
+    // hcpost pubred keeps the 1-D `blocks` grid.
     const int threads = (world > 256) ? 1024 : 256;
     int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
         partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
@@ -8691,7 +8708,7 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_add(
     const int threads = (world > 256) ? 1024 : 256;
     int blocks = ((n >> 2) + threads - 1) / threads;
     if (blocks < 1) blocks = 1;
-    p2p_ar_store_v5_kernel<<<blocks, threads, 0, s>>>(
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
         partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;

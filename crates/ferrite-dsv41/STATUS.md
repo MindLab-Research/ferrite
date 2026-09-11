@@ -7053,3 +7053,19 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 
 **v3 中性的原因**：wo-pair 和 sparse key-split 都是默认 OFF gate——需要显式开启。
 allon 臂正在跑，预期 wo-pair(−0.13) + sparse key-split(−0.2) = 6.66−0.33 = ~6.33ms。
+
+### allon 验证回退分析（2026-09-12 02:30）
+
+| 臂 | p50 | tok/s | 判定 |
+|---|---|---|---|
+| v3（默认 = wo_pair OFF + sparse_split ON） | 6.68ms | 149.7 | 基线 |
+| allon（+ WO_PAIR=1） | **7.14ms** | **140.1** | **+0.46ms 回退！** |
+
+**wo_pair 是回退源**（v3 和 allon 的唯一差异是 WO_PAIR）。四段全对但性能变差。
+**sparse_split 不贡献回退**（v3 已含 sparse_split ON = 6.68ms）。
+
+wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF**。
+
+**已提交待验证**（远端 90c20a3e 正在跑）：
+- down 回归修复（launch_bounds 移除 + ILV 不再全局禁用）
+- dots-late merge（DSV41_HC_DL_MERGE，默认 OFF，=1 开启）
