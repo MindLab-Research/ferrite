@@ -3180,10 +3180,16 @@ if (lens != nullptr && *lens > 0) n_pos = *lens;   // 扫描上界跟设备 clen
 （越界落点取决于 block/SM 布局 ✓）、**rank 漂移** ✓、**token 到死都对** ✓（越界的是 scores 槽，
 不在输出路径上）。
 
-**修法（64968e0）**：调用点改传**每层常量** `idx_cap = min(pool 容量, 200KiB 预算能装下的上限)`
-⇒ 分配量不再依赖被捕获的值 ✓；kernel 仍用 `*lens` 实时定界 ✓，越过实时计数的位置被 **-inf 掩码**
-⇒ 结果与原来**完全等价** ✓（只是多跑几次被掩码的迭代）。包络与直连路径一致：压缩计数超过 idx_cap
-（~4 万行）在 serve 的真实上下文下不可达 ✓，且启动器的 200KiB 守卫仍在 ✓。
+**修法（最终定案，两次迭代）**：
+① 调用点改传**每层常量** `idx_cap = min(pool 容量, **48KiB 预算**能装下的上限)`（≈9000 行，smem ≈49150B
+= 恰在 48KiB 默认线内 ✓）⇒ 分配量不再依赖被捕获的值 ✓；
+② **kernel 侧钳位** `if (lens && *lens > 0 && *lens < n_pos) n_pos = *lens;` ⇒ 共享内存**结构上不可能被越界**
+✓（参数是图里冻结的每层常量，实时计数只会把它**调低** ✓）。越过实时计数的位置本就被 **-inf 掩码** ✓
+⇒ 结果等价 ✓。
+**⚠️ 中间那次走错了**：第一版把常量放大到 ~200KiB 并用 `cudaFuncSetAttribute(..., 232448)` 开权限 ✗
+—— 那个值抄自 `gemm_fp8` 的路径，**而那段代码在本机从未被执行过** ✗（DSV4.1 连 prefill 都是一次一 token
+⇒ 永远走 gemv 分支 ✓）⇒ 属性调用返回 `cuda error 1`，**关图直连路径同样失败** ✓（0 步）⇒ 证明是启动器
+改动本身 ✗。**教训：抄来的魔数若来源路径从未执行过，就等于没有验证过 ✗。**
 
 **⚠️ 教训（"半修"模式，值得单独记）**：当一个**每步变化的值同时**决定 ① kernel 的运行期边界
 和 ② **启动器计算的资源（dynamic smem / grid）** 时，只把 ①改到设备侧 = **半修** ✗ ——
@@ -3197,9 +3203,9 @@ if (lens != nullptr && *lens > 0) n_pos = *lens;   // 扫描上界跟设备 clen
 `mix/hc/n_experts/topk` 常数导出 ✓、`comp_placeholder`/`window_idxs` 的 grid 由 `index_topk/window`
 常数导出 ✓、AR 三件套的 grid 由每次调用的 `len/4` 导出（同调用点恒定 ✓）。
 ⇒ **indexer 是唯一的"两端"结构** ✓，类级审计无其它同类隐患 ✓。
-（另：`indexer_topk` 的常量 smem ≈200KiB 超 48KiB 默认 ⇒ 必须 `cudaFuncSetAttribute(...232448)` ✓
-—— 已在启动器内按调用设置，理由同 `gemm_fp8_mx` 的注释：该属性是 per-context，TP8 每 rank 一个 context ✗。）
-**副作用已审计（无回退 ✓）**：常量 smem 增至 ~200KiB ⇒ 每 SM 至多 1 个 block —— 但
+（另：最终方案把常量 smem **压在 48KiB 默认线内** ✓ ⇒ **不需要任何属性** ✓ —— 这也是绕开上面那个
+"从未被执行过的魔数"的根治办法 ✓。）
+**副作用已审计（无回退 ✓）**：常量 smem 增到 48KiB 量级（仍是每 SM 单 block 的规模）—— 但
 `dsv41_indexer_topk` 的 grid 恒为 `(m, b) = (1, 1)`（DSV4.1 的 serve 连 prefill 也是
 **一次一 token 前向** ✓，且全树只有一个调用点 ✓）⇒ **本来就只有 1 个 block** ✓，
 占用率不受影响、prefill 无回退 ✓。
