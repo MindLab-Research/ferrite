@@ -91,7 +91,11 @@ def load(p):
             total, inst = float(r[1]), int(r[2])
         except ValueError:
             continue
-        d[" ".join(r[4:]).strip()] = (inst, total)
+        # The Name is the LAST csv field. Joining from field 4 instead swept the
+        # Med/Min/Max/StdDev columns into the key, so the one- and many-run keys
+        # could never match (46560.0 vs 46592.0) and the "difference" silently
+        # degenerated into the many-run totals.
+        d[r[-1].strip()] = (inst, total)
     return d
 
 a, b = load(one), load(many)
@@ -112,9 +116,14 @@ print(f"decode-only net GPU time = {tot/1e6:.1f} ms over {steps} steps / 8 ranks
 # Note the instances and the durations are both summed over the ranks (one process
 # hosts all eight here), so "calls/step" counts all ranks together and the per-call
 # mean is each rank's own cost.
-print(f"{'share':>7} {'calls/step':>10} {'us/call':>9}  kernel")
+# nsys sums the instances and the durations over ALL EIGHT ranks (one process
+# hosts every rank), so calls/step must be divided by the world size before it
+# means anything per rank; the earlier output printed the all-rank number and
+# that is an eightfold overstatement.
+world = 8
+print(f"{'share':>7} {'calls/stp':>9} {'us/call':>8} {'ms/step':>8}  kernel")
 for dt, di, k, avg in rows[:15]:
-    print(f"{dt/tot*100:6.1f}% {di/steps:10.0f} {avg/1000:9.1f}  {k[:52]}")
+    print(f"{dt/tot*100:6.1f}% {di/steps/world:9.1f} {avg/1000:8.1f} {dt/1e6/steps/world:8.2f}  {k[:44]}")
 PY
 echo
 echo "note: attribute the all-reduce separately (NCCL mode here); for absolute per-call"
