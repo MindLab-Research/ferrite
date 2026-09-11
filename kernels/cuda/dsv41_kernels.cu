@@ -2627,9 +2627,13 @@ __device__ __forceinline__ void dsv41_cp_wait_all();
 //     records the identical node in a stream capture. This is the A/B arm and
 //     the rollback. It MUST NOT go through cudaLaunchKernelEx: the Extended
 //     Launch path marshals the same arguments through its variadic template, and
-//     for the 36+ parameter GEMV family that forwarding has been observed to
-//     return cudaErrorInvalidValue ("cuda error 1") on a launch whose plain
-//     argument list is well formed.
+//     for the GEMV family's then-37 scalar parameters that forwarding was
+//     observed to return cudaErrorInvalidValue ("cuda error 1") on a launch
+//     whose plain argument list was well formed. That specific hazard is gone
+//     now -- gemv-struct-pack below collapsed those 37 slots into the four
+//     by-value Gemv* structs, so the Ex path forwards 4 arguments -- but
+//     cudaLaunchKernel stays the non-PDL arm precisely because it is
+//     byte-for-byte what `<<<>>>` emits.
 //
 // CONTRACT (must be preserved by every future caller): a kernel routed through
 // this helper MUST call cudaGridDependencySynchronize() before reading ANY
@@ -2638,8 +2642,9 @@ __device__ __forceinline__ void dsv41_cp_wait_all();
 // no-op on a plain launch, so it stays in place when DSV41_PDL=0.
 //
 // COVERED HERE: gemm_fp8_gemv_kernel (all SEVEN M=1 launchers: mx, rope,
-// rope_norm, mx2_rope, add, f32, mx2) and sparse_attn_pf_kernel -- i.e. the
-// consumer side of lin2 -> wq_b/rope -> sparse -> wo_a -> wo_b.
+// rope_norm, mx2_rope, add, f32, mx2 -- every one of them now passing the four
+// Gemv* structs, see gemv-struct-pack above the kernel) and sparse_attn_pf_kernel
+// -- i.e. the consumer side of lin2 -> wq_b/rope -> sparse -> wo_a -> wo_b.
 // DELIBERATELY NOT COVERED: the M>1 gemm_fp8_kernel tile path, and the
 // split/merge/warp attention variants (A/B arms nobody should silently start
 // running under PDL).
@@ -2670,6 +2675,12 @@ static int dsv41_pdl_enabled(void) {
         // (InvalidValue) that blocked rounds 42-45. The non-PDL path now uses
         // cudaLaunchKernel (identical to <<<>>> marshaling). Flip to default
         // OFF until a clean serve A/B proves the PDL path safe.
+        //
+        // UPDATE (gemv-struct-pack): the 37 GEMV scalars are now four by-value
+        // structs, so the Ex path no longer forwards a 37-wide argument pack and
+        // that particular failure mode cannot recur. The default stays OFF
+        // anyway -- re-enabling PDL is its own A/B (DSV41_PDL=1), not a
+        // consequence of this refactor.
         cached = (e != nullptr && e[0] == '1') ? 1 : 0;   // explicit "1" enables
     }
     return cached;
@@ -2694,129 +2705,229 @@ static inline cudaError_t dsv41_pdl_or_plain(K kern, dim3 grid, dim3 block, size
     // Round-45 fix: cudaLaunchKernelEx even WITHOUT the attribute is a DIFFERENT
     // launch path than `<<<>>>`. Its variadic two-pack template must forward the
     // deduced argument pack through an extra function layer, and for the GEMV
-    // family that means 36+ parameters; the resulting marshaling can fail with
+    // family that meant 36+ parameters; the resulting marshaling could fail with
     // cudaErrorInvalidValue (a.k.a. "cuda error 1") even though the plain-launch
-    // argument list is well formed. cudaLaunchKernel takes an explicit void*
+    // argument list was well formed. cudaLaunchKernel takes an explicit void*
     // array, so the argument marshaling is byte-for-byte the one `<<<>>>` emits.
-    // The caller still spells out every trailing default (see the call sites):
-    // the array form applies no default arguments either.
+    // The callers used to spell out every trailing default because the array form
+    // applies no default arguments either; gemv-struct-pack moved those defaults
+    // into the Gemv* structs, so each caller now passes 4 by-value structs and
+    // `arg_ptrs` has four entries.
     void* arg_ptrs[] = { (void*)&args... };
     return cudaLaunchKernel(kern, grid, block, (void**)arg_ptrs, smem, stream);
 }
 
-__global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
-                                     const float* __restrict__ a_scale,
-                                     const uint8_t* __restrict__ w,
-                                     const uint8_t* __restrict__ w_scale,
-                                     const float* __restrict__ bias,
-                                     float* __restrict__ out, int n, int k, int vec,
-                                     // a32 gate (DSV41_GEMV_A32, see g_gemv_a32): 1
-                                     // materialises the block-wide pre-decoded activation
-                                     // `s_af` (k f32); 0 skips it and folds the
-                                     // decode+scale into the consume loop. The launcher's
-                                     // `scale_bytes` MUST reserve dsv41_gemv_a32_bytes(k)
-                                     // to match, and `s_rows` follows it (see below).
-                                     int a32,
-                                     // Second family: rows [n1, n1+n2) of the same input.
-                                     // A single-family launch passes n1 == n and leaves
-                                     // the family-2 pointers untouched, so every row maps
-                                     // to family 1 and the behaviour is exactly the old
-                                     // kernel's. Both families share the staged activation,
-                                     // which is the point: two projections that read the
-                                     // same vector become one launch and one staging.
-                                     const uint8_t* __restrict__ w2 = nullptr,
-                                     const uint8_t* __restrict__ w2_scale = nullptr,
-                                     const float* __restrict__ bias2 = nullptr,
-                                     float* __restrict__ out2 = nullptr, int n1 = 0,
-                                     // A5: non-zero folds a trailing elementwise add
-                                     // into the row write -- `out[row] += acc + bias`
-                                     // instead of overwriting -- so the separate
-                                     // add_inplace launch disappears. Association is
-                                     // unchanged: `o + (acc + bias)` either way, so
-                                     // the result is bit-identical. 0 keeps the old
-                                     // overwrite behaviour for every existing caller.
-                                     int epi_add = 0,
-                                     // AR v5 store fusion (attn wo_b, M=1 only). A non-null
-                                     // `staging_tbl` turns the lane-0 epilogue into store_v5: the
-                                     // row's `acc + bias` goes BOTH to `out_[rrow]` (unchanged) and
-                                     // to every peer's staging slot, replacing the standalone store
-                                     // kernel with this one write. `epoch` is the DEVICE round
-                                     // counter, read at runtime exactly like p2p_ar_store_v5_kernel,
-                                     // so a captured graph replays with the right parity. `stride`
-                                     // counts FLOAT ELEMENTS per slot (bytes/4), NOT bytes.
-                                     float* const* __restrict__ staging_tbl = nullptr,
-                                     const unsigned* __restrict__ epoch = nullptr,
-                                     int world = 0, int my_rank = 0, int stride = 0,
-                                     // B1 (quantised row compression): when non-null the epilogue
-                                     // ALSO emits this row's fp8 e4m3 byte and the per-32-block
-                                     // scale of the vector it is writing, with quant_kernel's own
-                                     // arithmetic, so the consumer's `quant1` launch disappears.
-                                     //
-                                     // TWO constraints, both of them structural - read before use:
-                                     //  1. A gemv warp produces ONE row (= one element of `out`),
-                                     //     so a warp CANNOT own a quant block: `quant1`'s block is
-                                     //     32 CONSECUTIVE elements, i.e. 32 rows, i.e. 32 WARPS.
-                                     //     This is exactly the opposite of the hc-tail / swiglu
-                                     //     producers, where a warp's 32 LANES are 32 consecutive
-                                     //     elements of the quantised vector and the amax is one
-                                     //     shuffle. Here the amax spans the block (see the epilogue
-                                     //     below), so the launcher must give the block 32 warps.
-                                     //  2. `xq` must not alias `a`/`a_scale`: the quantised input is
-                                     //     still being staged by blocks that start late, so the
-                                     //     fp8 output needs its own buffer.
-                                     uint8_t* __restrict__ xq = nullptr,
-                                     float* __restrict__ xsc = nullptr,
-                                     // RoPE fusion (q rope / idx_q rope of the DSV4.1
-                                     // attention): a non-null `rope_cos` makes the
-                                     // epilogue rotate the trailing `rope_rd` lanes of
-                                     // every head in THIS launch's rows, replacing the
-                                     // standalone apply_rope. The pair (2i, 2i+1) of one
-                                     // head always lands on two ADJACENT warps - the head
-                                     // width is a multiple of 32 and the pair start is
-                                     // even - so the pair head reads the tail warp's
-                                     // staged row from the B1 `s_rows` slot after a
-                                     // barrier. `rope_hd1`/`rope_hd2` are the head widths
-                                     // of the two families (0 = do not rotate that family);
-                                     // `rope_base` is the DEVICE position counter, the
-                                     // same `*base * mul + off + h * step` the rope kernel
-                                     // evaluates. The rotated value is the very same
-                                     // `v = acc + bias` f32 the rope kernel would have
-                                     // read back, and the arithmetic is its expression
-                                     // verbatim, so the result is bit-identical.
-                                     const float* __restrict__ rope_cos = nullptr,
-                                     const float* __restrict__ rope_sin = nullptr,
-                                     const int* __restrict__ rope_base = nullptr,
-                                     int rope_mul = 0, int rope_off = 0, int rope_step = 0,
-                                     int rope_inverse = 0, int rope_rd = 0, int rope_hd1 = 0,
-                                     int rope_hd2 = 0,
-                                     // NORM_FUSE (see dsv41_gemm_fp8_mx_rope_norm): when
-                                     // `qr_raw` is non-null the gemv OWNS the production of
-                                     // the fp8 activation it consumes. The prologue computes
-                                     // the RMSNorm of the f32 row `qr_raw` (k elements) with
-                                     // `qr_w` / `qr_eps` and encodes it into `s_a` / `s_as`
-                                     // with rmsnorm_q_kernel's arithmetic, term for term, so
-                                     // the standalone rmsnorm_q launch between qr's producer
-                                     // and this gemv disappears. `a` / `a_scale` are then
-                                     // never read (the launcher passes null). The reduction
-                                     // tree only matches the reference at blockDim 1024, so
-                                     // the launcher forces 32 warps.
-                                     const float* qr_raw = nullptr,
-                                     const float* qr_w = nullptr, float qr_eps = 0.f,
-                                     // f32 direct read (see dsv41_gemm_fp8_mx_f32): when
-                                     // `a_f32` is non-null the block stages the RAW f32
-                                     // activation straight into `s_af` instead of decoding
-                                     // the fp8 `a` through `s_lut` and multiplying by the
-                                     // per-block scale. The consume loop below is unchanged
-                                     // (it already reads `s_af`), so the WEIGHT side keeps
-                                     // its fp8 decode -- `s_lut` is still built. `a`/`a_scale`
-                                     // are then never read (the launcher passes null). NOT
-                                     // bit-identical to the fp8 path: it skips the
-                                     // quantise->dequantise round trip and is strictly MORE
-                                     // accurate, so it is only wired where the consumer
-                                     // tolerates the tighter value (wo_b -> AR sum -> hc_post).
-                                     // Requires `vec >= 3` (the s_af materialisation lives
-                                     // there); the launcher enforces it.
-                                     const float* a_f32 = nullptr) {
+// ---------------------------------------------------------------------------
+// gemv-struct-pack: the GEMV family's kernel-parameter groups.
+//
+// WHY THIS EXISTS. gemm_fp8_gemv_kernel had grown to 37 positional parameters.
+// cudaLaunchKernelEx's variadic template failed to marshal that list -- it
+// returned cudaErrorInvalidValue ("cuda error 1", drifting between
+// mx / rope_norm / mx_rope / quant_fp8 across ranks) on a launch whose plain
+// `<<<>>>` argument list was well formed -- and a 37-slot positional argument
+// list is unmaintainable even when it does work. The launch now carries FOUR
+// by-value structs: CUDA copies a by-value struct into the kernel parameter
+// space exactly like a scalar, and four arguments are far inside every launch
+// API's forwarding depth (dsv41_pdl_or_plain forwards all four verbatim on both
+// of its paths, so the Extended-Launch variadic template now handles 4 slots
+// instead of 37).
+//
+// GROUPING IS BY ROLE, NOT BY ORIGINAL POSITION:
+//   GemvCore   -- operands, output and shape of the GEMM (activation, weights,
+//                 bias, output, n/k/vec/a32) plus the SECOND family's operands
+//                 (w2/w2_scale/bias2/out2/n1), which share the activation.
+//   GemvRope   -- the RoPE fusion epilogue: cos/sin table, the device position
+//                 counter `*rope_base` and the per-family head widths.
+//   GemvFusion -- the fused producer/consumer side buffers: B1's fp8 row emit
+//                 (xq/xsc), NORM_FUSE's in-kernel rmsnorm input (qr_*) and the
+//                 f32 direct read (a_f32).
+//   GemvEpi    -- epilogue behaviour: A5's trailing add fold (epi_add) and the
+//                 AR v5 store fusion (staging_tbl + epoch + rank geometry).
+//
+// EVERY FIELD DEFAULTS TO null / 0 -- exactly the value every launcher used to
+// spell out by hand for an unused trailing slot -- so a launcher only assigns
+// the fields its own form uses, and `GemvCore gc{};` reproduces the old "all
+// defaults spelled out" argument list with far less ceremony. The old
+// per-parameter comments now live on the fields they describe.
+//
+// KERNEL PARAMETER ORDER IS (core, rope, fusion, epi). The field order inside a
+// struct only matters for aggregate initialization, which no launcher uses; do
+// not encode the launch's argument order in it.
+//
+// NOTE: these four names are unique in the whole .so (no other translation unit
+// declares a Gemv* type), so the by-value ABI stays unambiguous.
+struct GemvCore {
+    // --- first family -------------------------------------------------------
+    const uint8_t* a = nullptr;          // fp8 activation row (m == 1)
+    const float* a_scale = nullptr;      // per-32-block activation scales
+    const uint8_t* w = nullptr;          // fp8 weight rows [n][k]
+    const uint8_t* w_scale = nullptr;    // per-row ue8m0 scale rows [n/32][k/32]
+    const float* bias = nullptr;         // optional per-row bias [n]
+    float* out = nullptr;                // f32 output rows [n]
+    int n = 0;
+    int k = 0;
+    int vec = 0;     // fp8 GEMV mode: 3 = staged weights, 4 = staged activation
+    // a32 gate (DSV41_GEMV_A32, see g_gemv_a32): 1 materialises the block-wide
+    // pre-decoded activation `s_af` (k f32); 0 skips it and folds the
+    // decode+scale into the consume loop. The launcher's `scale_bytes` MUST
+    // reserve dsv41_gemv_a32_bytes(k) to match, and `s_rows` follows it.
+    int a32 = 0;
+    // --- second family: rows [n1, n1+n2) of the SAME activation -------------
+    // A single-family launch passes n1 == n and leaves the family-2 pointers
+    // untouched (null), so every row maps to family 1 and the behaviour is
+    // exactly the old single-family kernel's. Both families share the staged
+    // activation, which is the point: two projections that read the same vector
+    // become one launch and one staging.
+    const uint8_t* w2 = nullptr;
+    const uint8_t* w2_scale = nullptr;
+    const float* bias2 = nullptr;
+    float* out2 = nullptr;
+    int n1 = 0;
+};
+
+struct GemvRope {
+    // RoPE fusion (q rope / idx_q rope of the DSV4.1 attention): a non-null
+    // `rope_cos` makes the epilogue rotate the trailing `rope_rd` lanes of every
+    // head in THIS launch's rows, replacing the standalone apply_rope. The pair
+    // (2i, 2i+1) of one head always lands on two ADJACENT warps - the head width
+    // is a multiple of 32 and the pair start is even - so the pair-head warp
+    // reads the tail warp's staged row from the B1 `s_rows` slot after a
+    // barrier. `rope_hd1`/`rope_hd2` are the head widths of the two families
+    // (0 = do not rotate that family); `rope_base` is the DEVICE position
+    // counter, the same `*base * mul + off + h * step` the rope kernel
+    // evaluates. The rotated value is the very same `v = acc + bias` f32 the
+    // rope kernel would have read back, and the arithmetic is its expression
+    // verbatim, so the result is bit-identical to the standalone launch.
+    const float* rope_cos = nullptr;
+    const float* rope_sin = nullptr;
+    const int* rope_base = nullptr;
+    int rope_mul = 0;
+    int rope_off = 0;
+    int rope_step = 0;
+    int rope_inverse = 0;
+    int rope_rd = 0;
+    int rope_hd1 = 0;
+    int rope_hd2 = 0;
+};
+
+struct GemvFusion {
+    // B1 (quantised row compression): when non-null the epilogue ALSO emits this
+    // row's fp8 e4m3 byte and the per-32-block scale of the vector it is
+    // writing, with quant_kernel's own arithmetic, so the consumer's `quant1`
+    // launch disappears.
+    //
+    // TWO constraints, both of them structural - read before use:
+    //  1. A gemv warp produces ONE row (= one element of `out`), so a warp
+    //     CANNOT own a quant block: `quant1`'s block is 32 CONSECUTIVE elements,
+    //     i.e. 32 rows, i.e. 32 WARPS. This is exactly the opposite of the
+    //     hc-tail / swiglu producers, where a warp's 32 LANES are 32 consecutive
+    //     elements of the quantised vector and the amax is one shuffle. Here the
+    //     amax spans the block (see the epilogue), so the launcher must give the
+    //     block 32 warps.
+    //  2. `xq` must not alias `a`/`a_scale`: the quantised input is still being
+    //     staged by blocks that start late, so the fp8 output needs its own
+    //     buffer.
+    uint8_t* xq = nullptr;
+    float* xsc = nullptr;
+    // NORM_FUSE (see dsv41_gemm_fp8_mx_rope_norm): when `qr_raw` is non-null the
+    // gemv OWNS the production of the fp8 activation it consumes. The prologue
+    // computes the RMSNorm of the f32 row `qr_raw` (k elements) with `qr_w` /
+    // `qr_eps` and encodes it into `s_a` / `s_as` with rmsnorm_q_kernel's
+    // arithmetic, term for term, so the standalone rmsnorm_q launch between qr's
+    // producer and this gemv disappears. `a` / `a_scale` are then never read
+    // (the launcher passes null). The reduction tree only matches the reference
+    // at blockDim 1024, so the launcher forces 32 warps.
+    const float* qr_raw = nullptr;
+    const float* qr_w = nullptr;
+    float qr_eps = 0.f;
+    // f32 direct read (see dsv41_gemm_fp8_mx_f32): when `a_f32` is non-null the
+    // block stages the RAW f32 activation straight into `s_af` instead of
+    // decoding the fp8 `a` through `s_lut` and multiplying by the per-block
+    // scale. The consume loop is unchanged (it already reads `s_af`), so the
+    // WEIGHT side keeps its fp8 decode -- `s_lut` is still built. `a`/`a_scale`
+    // are then never read (the launcher passes null). NOT bit-identical to the
+    // fp8 path: it skips the quantise->dequantise round trip and is strictly
+    // MORE accurate, so it is only wired where the consumer tolerates the
+    // tighter value (wo_b -> AR sum -> hc_post). Requires `vec >= 3` (the s_af
+    // materialisation lives there); the launcher enforces it.
+    const float* a_f32 = nullptr;
+};
+
+struct GemvEpi {
+    // A5: non-zero folds a trailing elementwise add into the row write --
+    // `out[row] += acc + bias` instead of overwriting -- so the separate
+    // add_inplace launch disappears. Association is unchanged:
+    // `o + (acc + bias)` either way, so the result is bit-identical. 0 keeps the
+    // old overwrite behaviour for every existing caller.
+    int epi_add = 0;
+    // AR v5 store fusion (attn wo_b, M=1 only). A non-null `staging_tbl` turns
+    // the lane-0 epilogue into store_v5: the row's `acc + bias` goes BOTH to
+    // `out[rrow]` (unchanged) and to every peer's staging slot, replacing the
+    // standalone store kernel with this one write. `epoch` is the DEVICE round
+    // counter, read at runtime exactly like p2p_ar_store_v5_kernel, so a
+    // captured graph replays with the right parity. `stride` counts FLOAT
+    // ELEMENTS per slot (bytes/4), NOT bytes.
+    float* const* staging_tbl = nullptr;
+    const unsigned* epoch = nullptr;
+    int world = 0;
+    int my_rank = 0;
+    int stride = 0;
+};
+
+
+__global__ void gemm_fp8_gemv_kernel(GemvCore gc, GemvRope gr, GemvFusion gf, GemvEpi ge) {
+    // -----------------------------------------------------------------------
+    // gemv-struct-pack: re-bind the parameter names from the four by-value
+    // structs defined above. Everything from here to the kernel's closing brace
+    // is the pre-pack body, byte for byte -- the bindings below carry the same
+    // names AND the same `__restrict__` qualification the individual parameters
+    // used to carry, so no expression inside the body had to be touched (the
+    // aliases are pure parameter-space loads and are not a read of any producer
+    // output, which is why they may precede cudaGridDependencySynchronise).
+    //
+    // CONTRACT for future edits: a new field goes into a struct AND gets a
+    // binding here -- never a direct `gc.`/`gr.`/`gf.`/`ge.` use in the middle
+    // of the body. Keeping the body textually unchanged is what makes this
+    // refactor reviewable, and `__restrict__` on the binding is what keeps the
+    // consume loop's codegen identical (dropping it invites the compiler to
+    // assume `a` and `w` may alias).
+    const uint8_t* __restrict__ a = gc.a;
+    const float* __restrict__ a_scale = gc.a_scale;
+    const uint8_t* __restrict__ w = gc.w;
+    const uint8_t* __restrict__ w_scale = gc.w_scale;
+    const float* __restrict__ bias = gc.bias;
+    float* __restrict__ out = gc.out;
+    int n = gc.n;
+    int k = gc.k;
+    int vec = gc.vec;
+    int a32 = gc.a32;
+    const uint8_t* __restrict__ w2 = gc.w2;
+    const uint8_t* __restrict__ w2_scale = gc.w2_scale;
+    const float* __restrict__ bias2 = gc.bias2;
+    float* __restrict__ out2 = gc.out2;
+    int n1 = gc.n1;
+    int epi_add = ge.epi_add;
+    float* const* __restrict__ staging_tbl = ge.staging_tbl;
+    const unsigned* __restrict__ epoch = ge.epoch;
+    int world = ge.world;
+    int my_rank = ge.my_rank;
+    int stride = ge.stride;
+    uint8_t* __restrict__ xq = gf.xq;
+    float* __restrict__ xsc = gf.xsc;
+    const float* __restrict__ rope_cos = gr.rope_cos;
+    const float* __restrict__ rope_sin = gr.rope_sin;
+    const int* __restrict__ rope_base = gr.rope_base;
+    int rope_mul = gr.rope_mul;
+    int rope_off = gr.rope_off;
+    int rope_step = gr.rope_step;
+    int rope_inverse = gr.rope_inverse;
+    int rope_rd = gr.rope_rd;
+    int rope_hd1 = gr.rope_hd1;
+    int rope_hd2 = gr.rope_hd2;
+    const float* qr_raw = gf.qr_raw;
+    const float* qr_w = gf.qr_w;
+    float qr_eps = gf.qr_eps;
+    const float* a_f32 = gf.a_f32;
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain above): the launcher may have
     // launched this grid with programmatic stream serialization, so the grid is
@@ -3223,7 +3334,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     const int smem = 16 * k;
     if (smem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) return (int)e;
     }
     // M=1 (decode): skip the 16-row tile entirely - it wastes 15/16 of itself and
@@ -3261,20 +3372,33 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
                                                       : (size_t)0;
         if (gsmem > 48 * 1024) {
             cudaError_t e = cudaFuncSetAttribute(
-                gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+                gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
             if (e != cudaSuccess) return (int)e;
         }
         // PDL (see dsv41_pdl_or_plain): the GEMV is a consumer of the previous
         // chain node (lin2's producer, wq_b after the norm/rope, wo_a, wo_b), so
         // its grid may start during the producer's tail and the kernel's entry
-        // cudaGridDependencySynchronize() gates the activation reads. NOTE the
-        // full 36-argument list: the cudaLaunchKernelEx path does not apply the
-        // kernel's default arguments, so every trailing slot is spelled out.
+        // cudaGridDependencySynchronize() gates the activation reads.
+        //
+        // gemv-struct-pack: the launch carries four by-value structs (see the
+        // Gemv* definitions above the kernel). Every field left unassigned keeps
+        // its struct default (null / 0) -- exactly the value the old 37-slot
+        // argument list used to spell out by hand for that slot.
+        GemvCore gc{};
+        gc.a = a; gc.a_scale = a_scale;
+        gc.w = w; gc.w_scale = w_scale;
+        gc.bias = bias; gc.out = out;
+        gc.n = n; gc.k = k;
+        gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+        gc.n1 = n;                     // single family: every row is family 1
+        GemvEpi ge{};
+        ge.staging_tbl = staging_tbl; ge.epoch = epoch;
+        ge.world = world; ge.my_rank = my_rank; ge.stride = stride;
+        GemvFusion gf{};
+        gf.xq = xq; gf.xsc = xsc;      // B1 fp8 row emit
+        GemvRope gr{};
         cudaError_t le = dsv41_pdl_or_plain(
-            gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w,
-            w_scale, bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n, 0,
-            staging_tbl, epoch, world, my_rank, stride, xq, xsc, nullptr, nullptr, nullptr, 0, 0,
-            0, 0, 0, 0, 0, nullptr, nullptr, 0.f, nullptr);
+            gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
         if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
         return (int)cudaGetLastError();
     }
@@ -3337,15 +3461,27 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    // gemv-struct-pack: four by-value structs; unassigned fields keep the old
+    // explicit defaults (null / 0).
+    GemvCore gc{};
+    gc.a = a; gc.a_scale = a_scale;
+    gc.w = w; gc.w_scale = w_scale;
+    gc.bias = bias; gc.out = out;
+    gc.n = n; gc.k = k;
+    gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.n1 = n;                     // single family
+    GemvRope gr{};
+    gr.rope_cos = rope_cos; gr.rope_sin = rope_sin; gr.rope_base = rope_base;
+    gr.rope_mul = rope_mul; gr.rope_off = rope_off; gr.rope_step = rope_step;
+    gr.rope_inverse = rope_inverse; gr.rope_rd = rope_rd;
+    gr.rope_hd1 = rope_hd;         // family 1 only
+    GemvFusion gf{};
+    GemvEpi ge{};
     cudaError_t le = dsv41_pdl_or_plain(
-        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w, w_scale,
-        bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n, 0, nullptr,
-        nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off,
-        rope_step, rope_inverse, rope_rd, rope_hd, 0, nullptr, nullptr, 0.f, nullptr);
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -3402,19 +3538,32 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // `a`/`a_scale` are null: the prologue produces the activation and the
     // kernel never dereferences them on this path (the `qr_raw` guard skips both
     // staging sites; mode 4 takes `s_a`).
-    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    // gemv-struct-pack: four by-value structs; `a`/`a_scale` stay null (the
+    // NORM_FUSE prologue produces the activation) and unassigned fields keep the
+    // old explicit defaults (null / 0).
+    GemvCore gc{};
+    gc.w = w; gc.w_scale = w_scale;
+    gc.bias = bias; gc.out = out;
+    gc.n = n; gc.k = k;
+    gc.vec = 4;                    // mode 4 is forced: s_a holds the activation
+    gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.n1 = n;                     // single family
+    GemvRope gr{};
+    gr.rope_cos = rope_cos; gr.rope_sin = rope_sin; gr.rope_base = rope_base;
+    gr.rope_mul = rope_mul; gr.rope_off = rope_off; gr.rope_step = rope_step;
+    gr.rope_inverse = rope_inverse; gr.rope_rd = rope_rd;
+    gr.rope_hd1 = rope_hd;         // family 1 only
+    GemvFusion gf{};
+    gf.qr_raw = qr_raw; gf.qr_w = qr_w; gf.qr_eps = qr_eps;
+    GemvEpi ge{};
     cudaError_t le = dsv41_pdl_or_plain(
-        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, nullptr, nullptr, w,
-        w_scale, bias, out, n, k, /*vec=*/4, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr,
-        n, 0, nullptr,
-        nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off,
-        rope_step, rope_inverse, rope_rd, rope_hd, 0, qr_raw, qr_w, qr_eps, nullptr);
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -3460,16 +3609,30 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    // gemv-struct-pack: four by-value structs; both families (and their two head
+    // widths) travel in GemvCore / GemvRope, unassigned fields keep the old
+    // explicit defaults (null / 0).
+    GemvCore gc{};
+    gc.a = a; gc.a_scale = a_scale;
+    gc.w = w1; gc.w_scale = w1_scale;
+    gc.bias = bias1; gc.out = out1;
+    gc.n = n; gc.k = k;
+    gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.w2 = w2; gc.w2_scale = w2_scale;
+    gc.bias2 = bias2; gc.out2 = out2;
+    gc.n1 = n1;
+    GemvRope gr{};
+    gr.rope_cos = rope_cos; gr.rope_sin = rope_sin; gr.rope_base = rope_base;
+    gr.rope_mul = rope_mul; gr.rope_off = rope_off; gr.rope_step = rope_step;
+    gr.rope_inverse = rope_inverse; gr.rope_rd = rope_rd;
+    gr.rope_hd1 = rope_hd1; gr.rope_hd2 = rope_hd2;
+    GemvFusion gf{};
+    GemvEpi ge{};
     cudaError_t le = dsv41_pdl_or_plain(
-        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w1, w1_scale,
-        bias1, out1, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), w2, w2_scale, bias2, out2, n1, 0,
-        nullptr, nullptr, 0,
-        0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off, rope_step,
-        rope_inverse, rope_rd, rope_hd1, rope_hd2, nullptr, nullptr, 0.f, nullptr);
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -3508,16 +3671,24 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    // gemv-struct-pack: four by-value structs; `epi_add` is the only non-default
+    // epilogue field (the A5 add fold), everything else keeps null / 0.
+    GemvCore gc{};
+    gc.a = a; gc.a_scale = a_scale;
+    gc.w = w; gc.w_scale = w_scale;
+    gc.bias = bias; gc.out = out;
+    gc.n = n; gc.k = k;
+    gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.n1 = n;                     // single family
+    GemvEpi ge{};
+    ge.epi_add = 1;                // A5: out[row] += acc + bias
+    GemvFusion gf{};
+    GemvRope gr{};
     cudaError_t le = dsv41_pdl_or_plain(
-        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w, w_scale,
-        bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n,
-        /*epi_add=*/1,
-        nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
-        0, nullptr, nullptr, 0.f, nullptr);
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -3574,17 +3745,27 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     // PDL (see dsv41_pdl_or_plain): the wo_b GEMV reads wo_a's fp32 output, so it
     // is the second consumer in the tail of the chain, exactly where the
     // node-gap matters.
+    //
+    // gemv-struct-pack: four by-value structs; `a_f32` is the only set input
+    // (`a`/`a_scale` stay null on this path), everything else keeps null / 0.
+    GemvCore gc{};
+    gc.w = w; gc.w_scale = w_scale;
+    gc.bias = bias; gc.out = out;
+    gc.n = n; gc.k = k;
+    gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.n1 = n;                     // single family
+    GemvFusion gf{};
+    gf.a_f32 = a_f32;              // raw f32 activation, no fp8 round trip
+    GemvEpi ge{};
+    GemvRope gr{};
     cudaError_t le = dsv41_pdl_or_plain(
-        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, nullptr, nullptr, w,
-        w_scale, bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n, 0,
-        nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
-        0, nullptr, nullptr, 0.f, a_f32);
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -3731,7 +3912,7 @@ extern "C" int dsv41_gemm_bf16_fp8x2(const void* wb, const float* biasb, float* 
                          scale_bytes;
     if (gsmem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gemv_bf16_fp8x2_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) return (int)e;
     }
     gemv_bf16_fp8x2_kernel<<<blocks, warps * 32, gsmem, s>>>(
@@ -3767,16 +3948,25 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
         // verified working rounds 37-41) is the correct semantic. Keep the
         // sticky clear on failure (the round-42 decline-collision fix stays).
         cudaError_t e = cudaFuncSetAttribute(
-            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+            gemm_fp8_gemv_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
+    // gemv-struct-pack: four by-value structs; both families travel in GemvCore
+    // and no rope/fusion field is set on this path, so the rest keeps null / 0.
+    GemvCore gc{};
+    gc.a = a; gc.a_scale = a_scale;
+    gc.w = w1; gc.w_scale = w1_scale;
+    gc.bias = bias1; gc.out = out1;
+    gc.n = n; gc.k = k;
+    gc.vec = g_gemv_fp8_mode; gc.a32 = (g_gemv_a32 ? 1 : 0);
+    gc.w2 = w2; gc.w2_scale = w2_scale;
+    gc.bias2 = bias2; gc.out2 = out2;
+    gc.n1 = n1;
+    GemvRope gr{};
+    GemvFusion gf{};
+    GemvEpi ge{};
     cudaError_t le = dsv41_pdl_or_plain(
-        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w1, w1_scale,
-        bias1, out1, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), w2, w2_scale, bias2, out2, n1, 0,
-        nullptr, nullptr, 0,
-        0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr,
-        0.f, nullptr);
+        gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, gc, gr, gf, ge);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -5625,7 +5815,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     // ---- the two-launch path (kept for A/B) ----
     {
         cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) {
             (void)cudaGetLastError();   // clear the sticky flag before reporting
             return (int)e;
@@ -5730,7 +5920,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     const size_t smem = (size_t)2 * (size_t)hc_dim * sizeof(float);
     {
         cudaError_t e = cudaFuncSetAttribute(hc_mix_dots_kernel,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
         if (e != cudaSuccess) {
             (void)cudaGetLastError();
             return (int)e;
@@ -5838,7 +6028,7 @@ extern "C" int dsv41_hc_front_persist(const float* x, const float* hc_fn, const 
     // set it on EVERY call exactly like the two-launch launcher does.
     const size_t smem = (size_t)hc_dim * sizeof(float);
     cudaError_t e = cudaFuncSetAttribute(hc_pre_persist_kernel,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();
         return (int)e;
@@ -6130,7 +6320,7 @@ extern "C" int dsv41_hc_front_persist_mb(const float* x, const float* hc_fn,
     // The attribute is per-context, and a TP8 process has one context per rank,
     // so set it EVERY call - the existing launchers carry the same warning.
     cudaError_t e = cudaFuncSetAttribute(hc_pre_persist_mb_kernel,
-                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize, 232320);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();
         return (int)e;
