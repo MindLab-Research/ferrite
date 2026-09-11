@@ -1827,3 +1827,25 @@ smem）→ 屏障降到 2 个。**实测 11.75 vs base 10.52（+1.23ms，更差�
 `replay p50 = 10.49-10.52ms` = **1520-1525 tok/s**；距 1600（10.0ms）还差 ~0.5ms。
 剩下的大项都已在各自地板或需要结构性改动（MoE act 71% DRAM 地板 / AR v5 NVLink 地板 /
 down 8 理论失败 / 小 kernel 桶 0.5ms 需生产者双输出或融合）。
+
+## 2026-09-11 cast 消除落地（+ 归属勘误）
+
+**勘误（防止下一次再走错文件）**：209 次/步 `f32_to_bf16` 的唯一来源是
+**`crates/ferrite-kernel/src/cuda.rs` 的 `gemm_cublas`（:2113，私有）**，不是 dsv41。
+- `crates/ferrite-models/src/dsv41/device.rs` **没有** `gemm_cublas`（只有裸指针的
+  `gemm_f32`/`gemm_bf16` 包装，:545/:557）；`dsv41/chain_dev.rs` 也**不调用**它。
+- dsv41 的同类点是 `chain_dev.rs:791 lin_bf16`（`f32_to_bf16` + `gemm_bf16`），但被
+  `cublas_m1()` 门控，**默认 false** → 默认走 `gemv_bf16`（无 cast）；dvs41 nsys 里根本没有
+  `f32_to_bf16`（profile: gemv_bf16 49 次/步）。所以 dsv41 侧无需改动。
+- `gemm_cublas` 的唯一调用点是 `matmul_dev` 的 `n == 16` 分支（cuda.rs:2480）——
+  是 **m=16 批量解码**，不是 m=1；m=1 早就走 `gemv_bf16_v2`/`gemv_tri`（kernel 内转换，无 cast）。
+
+**落地**：新增 `CudaBackend::gemm1_fused_into`（cuda.rs:2260），在 `n==16` 分支于
+`gemm_cublas` **之前**尝试——复用已验证的 `ferrite_gemm3_bf16_mma`（单权重、per-group-x 的
+退化调用：w2/w3=null、o2=o3=0），f32 激活**直接吃**（smem 内转换），同时消掉
+nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全回到 cuBLAS 便于 A/B），
+形状不受支持（in_f%16 / 低于 K-split 地板 / n>16 / out_f>65536 的巨型输出如 lm_head）
+或 kernel 报错时回落 `gemm_cublas`。`cargo check --workspace` ✓、`cargo test -p ferrite-kernel --lib`
+8 passed ✓。**待办**：`.cu` 未改（无需重编 .so），但需在 b300 上跑真实权重 A/B
+（`FERRITE_GEMM3=0` 对照）确认 tok/s 与四段文本——bf16-MMA vs cuBLAS 的 1e-3 重结合
+是已知的 leading-token flip 类，且 out_f>65536 的路径仍带 cast。

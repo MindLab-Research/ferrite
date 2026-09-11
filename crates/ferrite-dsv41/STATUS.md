@@ -5665,3 +5665,35 @@ vs 混合核 27-28µs + 16µs 固定成本）。已翻默认 OFF。
 40×4（attention）+ 40（shared w2）+ 4（idx_wq_b）+ 2（engram）= 206。
 +35 vs 旧口径 171 = **SHARED_TP 切分效应**（w2 从 rank0 独占 5 次均值变为 8 rank 全跑 40 次），
 非冗余——同一份工作重分布，关键路径反而 −1.43ms。
+
+### ✅ 第 27 轮确认：9.38ms / 106.6 tok/s（正确基线恢复）
+
+idx_fuse OFF 后恢复第 25 轮的最优。全部默认配置：
+MIX_GATE=OFF + GATEUP_FUSE=ON + DOWN_FUSE=ON + HEAD_SLICE=ON + sparse 3-deep + indexer 两步 + T1 + a32 + LUT + P1/P2 + env 缓存
+
+**会话最终成果：13.28 → 9.38ms（+41.6%），75.3 → 106.6 tok/s。**
+
+### expert-fp4-floor 的关键新发现
+
+**down 的 K=320 全在标量尾循环**：`nv2 = k>>9 = 0` → vec==2 的主循环（10 组 512 值）是死代码，
+整个 dot 落在 `brow[j>>1]` 字节粒度 LDG.U8 + 标量 e2m1_to_f（~2.5 op/值 vs 向量路径 1.63 op/值）。
+**这是 down 吃亏 34% 的根因**（0.69ms vs 预期的 0.5×1.03=0.52ms）。
+
+**修法**：把分组推广到 k<512（uint32 宽加载 = 4 值/组）。down-vec-320 subagent 正在实施。
+预期 −0.15~0.2ms/步。
+
+**gateup 的另一个机会**：融合后两条链读同一 `s_act[j..j+15]`（gate 和 up 的地址完全相同）——
+显式 load 进寄存器一次供两链复用，可把该 group 的 L1TEX op 从 42 降到 26（−38%）。
+前提：nvcc 未做 CSE（需 cuobjdump -sass 确认）。
+
+### stage-b-priority 的排序（把握×收益）
+
+1. **hc-sinkhorn-hide**（−0.2ms，高把握）——subagent 实施中
+2. **f32→bf16 cast 消除**（−0.21ms，中把握）——audit 报告待取
+3. **AR store 融合**（−0.08~0.16ms，中高把握）——补丁已产出
+4. down-vec-320（−0.15~0.2ms，新发现）——subagent 实施中
+5. 4-deep sparse（−0.03~0.05ms，低优先）
+6. 跨层流水（−0.3~0.5ms，低把握高风险）——放最后
+
+**隐藏的最大项**：~700 launch × ~1.5µs ≈ **0.9ms 节点尾延迟**（在"间隙"里，不在 kernel 行里）——
+Stage C persistent 架构（700→120 节点）是根治。
