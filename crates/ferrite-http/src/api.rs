@@ -167,10 +167,13 @@ async fn chat_completions(
                         if batch.is_empty() {
                             return None; // stop-only window — no frame
                         }
-                        let opened = *batch_open.get_or_insert_with(std::time::Instant::now);
-                        if batch.len() < 8 && opened.elapsed().as_millis() < 50 {
-                            return None; // keep accumulating (batching)
-                        }
+                        // Flush as soon as the tail is SAFE. The previous policy
+                        // ("wait for 8 tokens or 50 ms") is a multi-stream frame-
+                        // count optimisation, but on a single stream it adds up to
+                        // 50 ms of latency per frame: measured, the client saw
+                        // ~129 ms/token while the rank needed 22-45. The UTF-8
+                        // tail-holdback below is the only real reason to hold
+                        // anything, so the artificial window is gone.
                         batch_open = None;
                         // Tail-holdback decode: trailing tokens whose bytes
                         // form an incomplete UTF-8 char stay in the batch.
