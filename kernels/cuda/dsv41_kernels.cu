@@ -1214,10 +1214,12 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
 //   out     [1, n]        = a @ w^T + bias
 // Read once: this launcher runs ~290 times per step, and a per-call getenv on
 // the hot path is the same slip the other gates avoid.
-static const bool g_gemv_fp8_vec = [] {
-    const char* e = getenv("DSV41_GEMV_FP8_VEC");
-    if (e == nullptr) return true;   // default on: -5.34 ms/step, bodies verified
-    return e[0] != '0';              // DSV41_GEMV_FP8_VEC=0 opts back out
+static const int g_gemv_fp8_mode = [] {
+    const char* e = getenv("DSV41_GEMV_FP8_MODE");
+    if (e != nullptr) return atoi(e);              // 0 scalar, 1 vectorised, 3 staged+ordered
+    const char* v = getenv("DSV41_GEMV_FP8_VEC");
+    if (v != nullptr && v[0] == '0') return 0;     // the earlier opt-out still honoured
+    return 1;                                      // -5.34 ms/step, text verified
 }();
 
 __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
@@ -1248,7 +1250,29 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         const int srow = row >> 5;               // 32x32 block scale row
         const uint8_t* wsr = w_scale + (size_t)srow * nb_k;
         float acc = 0.f;
-        if (vec) {
+        if (vec == 3) {
+            // Order-preserving staging. The row is fetched with sixteen-byte loads
+            // into this warp's slice of shared memory and then consumed exactly the
+            // way the scalar loop consumes it - element kb*32 + lane, kb ascending -
+            // so the summation order, and therefore the sum, is bit-identical to the
+            // scalar path. That is the whole point: the vectorised branch reorders a
+            // lane's elements from a thirty-two stride to four consecutive values,
+            // correct arithmetic that nonetheless flips near-boundary logits.
+            extern __shared__ uint8_t s_w[];
+            uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
+            for (int i = lane; i < (k >> 5); i += 32) {
+                *reinterpret_cast<uint4*>(row_s + (i << 5)) =
+                    *reinterpret_cast<const uint4*>(wr + (i << 5));
+            }
+            __syncwarp();
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const float sa = a_scale[kb];    // m == 1
+                const int j = kb * 32 + lane;
+                acc += e4m3_to_f(a[j]) * sa * (e4m3_to_f(row_s[j]) * sb);
+            }
+            __syncwarp();
+        } else if (vec) {
             for (int g = 0; g < n_vec; ++g) {
                 const int kb = (g << 2) + blk_off;
                 const float sa = a_scale[kb];    // m == 1
@@ -1300,8 +1324,9 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     if (m == 1 && getenv("DSV41_NO_GEMV_FP8") == nullptr) {
         const int warps = 8;
         const int blocks = (n + warps - 1) / warps;
-        gemm_fp8_gemv_kernel<<<blocks, warps * 32, 0, s>>>(a, a_scale, w, w_scale, bias, out, n,
-                                                           k, g_gemv_fp8_vec ? 1 : 0);
+        const size_t gsmem = (g_gemv_fp8_mode == 3) ? (size_t)warps * (size_t)k : (size_t)0;
+        gemm_fp8_gemv_kernel<<<blocks, warps * 32, gsmem, s>>>(a, a_scale, w, w_scale, bias, out, n,
+                                                              k, g_gemv_fp8_mode);
         return (int)cudaGetLastError();
     }
     dim3 grid((n + 63) / 64, (m + 15) / 16);
