@@ -4659,3 +4659,32 @@ splitK 可能是对的）。
 压到 8 blocks/SM 以下** —— 如果能，就必须用 `__launch_bounds__` 设上限（牺牲性能换正确性），
 或用 pragma 让编译器自行保持预算。**这解释了为什么 `#pragma unroll 4`（编译器选择展开因子、
 不越过预算）是安全而手写展开不安全。**
+
+### cublasLt 的 transpose 映射推导（2026-09-11 12:50，可直接实施）
+
+**现有调用**（`cuda.rs:2229`，cuBLAS 是 column-major）：
+```c
+cublasGemmEx(h, /*transa=*/1, /*transb=*/0, /*m=*/out_f, /*n=*/n, /*k=*/in_f,
+             &alpha, /*A=*/w,   /*Atype=*/14, /*lda=*/in_f,
+                     /*B=*/xbp, /*Btype=*/14, /*ldb=*/in_f,
+             &beta,  /*C=*/do_, /*Ctype=*/0,  /*ldc=*/out_f,
+             /*compute=*/0, /*algo=*/99)
+```
+⇒ 语义：**C[out_f × n] = Aᵀ(in_f × out_f 的转置) × B(in_f × n)**，
+即 `do_[i, j] = Σ_k w[k, i] · x[j, k]` ✓（dtype 14 = CUDA_R_16BF，compute 0 = CUBLAS_COMPUTE_32F）
+
+**cublasLt 等价映射**（照抄推理，实施时可直接用）：
+| 对象 | cublasLtMatrixLayout | op |
+|---|---|---|
+| A = w | `cublasLtMatrixLayoutCreate(&Ad, CUDA_R_16BF, /*rows=*/in_f, /*cols=*/out_f, /*ld=*/in_f)` | `CUBLAS_OP_T` |
+| B = xbp | `cublasLtMatrixLayoutCreate(&Bd, CUDA_R_16BF, in_f, n, in_f)` | `CUBLAS_OP_N` |
+| C = D = do_ | `cublasLtMatrixLayoutCreate(&Cd, CUDA_R_32F, out_f, n, out_f)` | — |
+
+- `cublasLtMatmulDescCreate(&desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)`
+- `cublasLtMatmulDescSetAttribute(desc, CUBLASLT_MATMUL_DESC_TRANSA, &op_t, sizeof(op_t))`（B 保持 N）
+- `cublasLtMatmulAlgoGetHeuristic(h, desc, Ad, Bd, Cd, Cd, pref, /*requestedAlgoCount=*/8, algos, &ret)`
+- 遍历 `algos[0..ret]`，用 `cublasLtMatmulAlgoConfigGet(&algos[i].algo, CUBLASLT_MATMUL_ALGO_CONFIG_SPLITK_NUM, &k, sizeof(k), &sz)`
+  **选 k == 1 的第一个**（无 K 切分）
+- `cublasLtMatmul(h, desc, &alpha, w, Ad, xbp, Bd, &beta, do_, Cd, do_, Cd, &algo, ws, ws_sz, stream)`
+
+**按 m 分支**（保护 GLM）：`m ≤ 32` 用无 splitK 的 algo；否则保持现有 `cublasGemmEx` 路径。
