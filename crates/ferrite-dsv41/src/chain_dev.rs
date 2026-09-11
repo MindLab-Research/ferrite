@@ -428,14 +428,27 @@ impl<'a> DevChain<'a> {
         }
         self.dev.zero_at(self.s.pos_ctr.ptr, 4)?;
         self.dev.zero_at(self.s.clen.ptr, self.cfg.n_layers * 4)?;
-        // The capture must be re-armed PER REQUEST: with decode_steps carried over,
-        // the next request's PREFILL would satisfy `decode_steps >= 1` and run
-        // through the decode graph, which was captured with the decode-time host
-        // branch choices (measured: the first request answered ' Paris' correctly
-        // and the second came back as garbage, because its prefill took the graph's
-        // decode path - e.g. the compressor's mode=2 instead of mode=1 at pos 0).
-        // The graph ITSELF stays: every launch argument is device-side, so it is
-        // state-agnostic and safe to reuse across requests.
+        // The capture must be re-armed PER REQUEST, and the captured graph must be
+        // DROPPED per request. Two separate reasons, both measured:
+        //  1. decode_steps carried over let the next request's PREFILL satisfy
+        //     `decode_steps >= 1` and run through the decode graph (captured with
+        //     decode-time host branch choices - the compressor's mode 2 instead of
+        //     mode 1 at pos 0), which garbled the output.
+        //  2. A graph bakes the DEVICE ADDRESSES of the buffers it recorded. That
+        //     was safe while allocations came from the pool, whose whole contract
+        //     is that a given size class returns the same address; the shared
+        //     devrt allocator is byte-level and does not promise that, so reusing a
+        //     graph from a previous request replays against addresses that may
+        //     belong to something else now (measured: requests 1-3 fine, then
+        //     one-step/empty outputs and faults). Dropping it costs a re-capture
+        //     per request (a few ms) and makes the graph always match the state it
+        //     was recorded from.
+        if let Some(e) = self.step_graph.take() {
+            // e is the graph EXEC (graph_instantiate's result); the captured
+            // graph handle itself was already released right after instantiate.
+            // graph_free destroys the exec when the second argument is non-null.
+            self.dev.graph_free(std::ptr::null_mut(), e)?;
+        }
         self.decode_steps = 0;
         if let Some(e) = self.eng_dev.as_ref() {
             self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?;
