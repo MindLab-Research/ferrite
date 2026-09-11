@@ -232,8 +232,42 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 | **2** | **GEMV 族 launch 数**：`gemm_fp8_gemv` **246 次/步 × 9.5µs = 2.33ms（24.2%）**，约 **91% 是固定成本**（per-call 已到 9.5µs）。**v2 的 "206 次" 基线已作废** | 2.33ms | **−0.25~0.5** | xn-megafuse 只能按 246 计；`s.xn` 复用缓冲让"5 族一 launch"不可能（v2 已驳回）|
 | **3** | **hc 链**：tail 0.99（warp0 串行链，**探针已否决**体内重叠：可藏窗口 0.46µs ≪ sinkhorn 6.5µs）；`hc_post_inplace` 0.15 | 1.70ms | **−0.15~0.25** | 只剩跨层流水 / Stage C 段核 |
 | **4** | **AR 节点数**（不是 AR 时间）：246 节点/步，生产 0.66ms 是协议地板 | 节点尾延迟 | **−0.3~0.5** | Stage C persistent 把 3 核/层 → 1 核/段；**建议先用图节点数直接量残余**（v2 遗留待办）|
-| **5** | **FMA-side 打 gate_up**：CSE 已证明 smem 不是瓶颈 | 1.01ms | **−0.1~0.2** | 风险：数值契约（4 累计器→2 改变求和顺序 ⇒ 需 parity 测试）|
+| **5** | **FMA-side 打 gate_up**：CSE 已证明 smem 不是瓶颈 | 1.01ms | **❌ 否决：预期 ≈0**（2026-09-11 复核，见 §4.2）| 原估 −0.1~0.2 不成立：issue 利用率仅 ~8%、warp 数受 grid 限制 ⇒ 减指令/减寄存器都换不到时间；且 4→2 改求和顺序 = 纯 parity 风险 |
 | **6** | **`gemv_f32` 的 v2 化**（compressor 的 kvp/scp，n=128×k=5120 / 7 次/步）| 0.12ms | **−0.08~0.10** | ✅ **已落地**（2026-09-11）：v1 只有 16 blocks / 128 warps（148 SM 的 11%）+ 160 次串行 4B load ⇒ 16.4µs = 48x 内存地板（0.34µs），与 gate 修前同病。新增 `gemv_f32_v2_kernel`（`dsv41_glue.cu`，模板 WPR：float4 16B/load + K-split + smem fold，`__fmaf_rn` 钉住 FFMA 舍入）→ n=128 走 WPR=8 = 1024 warps。`device.rs::gemv_f32` 按 `n < GEMV_F32_V2_MAX_N=2048` 分派，`DSV41_GEMV_F32_V2=0` 回退 v1。**待实测**：16.4µs 的改善幅度（预期对齐 bf16 gate v2 的 3-5µs 档）|
+
+### 4.2 gateup 的 FMA 累加器结构（2026-09-11 分析）：**4 累加器→2 否决**
+
+**当前结构**（`dsv41_experts_mxf4.cu:984-1113`，`ILV=true` 且 fuse 默认 ON ⇒ 这是生产路径；
+`k = dim = 5120` → `nv2f = k>>9 = 10` 组/lane；`n_total = inter`，TP8 下 320 行/slot，6 slot）：
+
+- **组内 4 个临时累加器**，不是跨组累加器：gate 链 `gp0..gp3`（`:1040`），每个串 **4 个 `fmaf`**（链深 4），
+  再 `(gp0+gp1)+(gp2+gp3)` 两两树（3 个 FADD），最后 `g = fmaf(gsc, ·, g)`（`:1065`）折进**唯一的**跨组累加器 `g`。
+  up 链 `up0..up3` 同构（`:1075-1100`）。⇒ 每组每链 ~20 条 FMA 类指令、组链深 ≈ 4+2+1 = 7；10 组串行 ⇒ `g` 链 ≈70。
+  每 lane 每组还有 16×`LDS`(sa) + 16×`LDS.64`(LUT) + 1×`LDG.128`(ILV) ⇒ ~105 条指令/组/lane。
+
+**为什么 4→2 是死路（三条独立证据）**：
+
+1. **核不是 FMA/issue 绑定**：~1050 条指令/lane-row × 1920 warp = 2.0M warp-instr ÷ 148 SM ÷ 4 issue/cycle
+   ≈ **3.4K cycle ≈ 1.9µs**，实测 **25µs** ⇒ issue 利用率 **~8%**，与源码注释里的"issue ~6%、
+   94% 周期停在 K 的 LDG"（`:994-999`）完全一致。4→2 只省 4 个寄存器 + 每链每组 2 个 FADD（**~4% 指令**），
+   在 8% 的 issue 占用下**不可能量出来**。
+2. **寄存器也换不到占用率**：1920 warp / 148 SM = **13 warp/SM**，是 **grid 造成的 warp 饥饿**
+   （240 CTA / 148 SM = 1.62），不是寄存器上限 —— 这正是 §4.1 已经论证过的同一件事。
+   减寄存器/加 unroll 都无法凭空多出 warp。
+3. **反向（4→8）也不成立**：缩链深只对 latency 链敏感的核有用；这里的停等是 LDG 延迟而非 FMA 相关链。
+
+**结论**：4→2（以及任何"FMA-side 减指令/减寄存器"）**预期收益 ≈0** ⇒ 不值得用 parity 风险去换。
+唯一能**同时**加 warp 数与 MLP 的杠杆是 **K-split**（把一行的 K 切给 2 个 warp），它才是正对着
+"94% 停 LDG"的那把刀 —— 但注意 K-split **天然改求和顺序**（partial_A + partial_B ≠ 原 10 组链序），
+所以它不是"先看累加器"能顺带解决的，需要独立的逐位对拍设计（或接受 tolerance A/B）。
+
+⚠️ **顺带发现：源码契约注释已失效**（`:973-980`）说"each K walk below is the vec==2 shape of the unfused body
+… same **single scale multiply per accumulator**, so gate/up accumulate to the **same floats** the unfused rows do"。
+**这句与现在的代码不符**：unfused vec==2 体（`:1134-1183`）是 `a0..a3` **跨组持久**、每组各做 4 次 scale-FMA，
+最后 `acc = (a0+a1)+(a2+a3)`；fused 体是**每组 1 次** scale-FMA 作用在 4 元树上。
+`7100ebfe` 写下该注释，`667c6f66` 重写了 fused 体却留着注释（`git blame :974-980` = 667c6f66）。
+⇒ 任何"改 accumulated 顺序仍逐位一致"的推理**不能引用这段注释**，两边本来就不逐位。
+（`tests_tcgen05_mxf4.cu::run_ilv_case` 只对 ILV vs plain 逐位，不覆盖 fused vs unfused。）
 
 ### 4.1 `DSV41_GATEUP_ROWS`（2026-09-11 已落地）：行拆分**不是**占用率修复——它是该假说的证伪探针
 

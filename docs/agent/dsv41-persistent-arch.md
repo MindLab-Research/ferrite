@@ -116,11 +116,18 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 2. **跨 TU 设备符号**：`g_hc_part` 是 `dsv41_kernels.cu:3632` 的 `__device__` 全局，而 `p2p_ar_pubred_v5_hcpost_kernel` 在 `ferrite_kernels.cu:8523`；`build.sh` **无 `-rdc=true`** ⇒ 跨 TU 设备符号不可见（hc_post 数学当初正为此在 `ferrite_kernels.cu:8467` **逐句复制**而非共享）。要在 pubred 里写 `g_hc_part`，只能额外把 partial 缓冲当 kernel 参数从 Rust 传指针进来，并让读端（tail）也改走该指针。
 3. **grid 并行度**：pubred grid = `ceil(n/1024)=5` block，但活跃线程只有 `n4 = 1280`（≈**1.25 block**），其余 3840 线程在 reduce/epilogue 全程空转。24 行点积的权重流是 **1.92MB**，现在由 **24 block/24 SM** 拉（531GB/s、7.4µs）。融进 pubred 等于把同样字节压到 ~2 个 SM ⇒ 正是 P1c/P1d 记录过的「单块/少块装不下 24 个权重行」形态，回归风险高。（**2026-09-11 部分消解**：三个 AR v5 launcher 已改成 `threads=256, blocks=ceil(n4/256)`，n=5120 时是 5 个满块 × 256 线程摊在 5 个 SM，不再有 3840 空转线程。但 5 个 SM 对 24 行点积的 1.92MB 权重流仍不够 —— 本条阻塞的**结论不变**：dots 不该折进 pubred。）
 
-**默认路径下的正确载体是 `dsv41_hc_post_inplace`**（`dsv41_kernels.cu:3838`，launcher `:3875`）：与 `g_hc_part`/`hc_mixes_tail_kernel` **同 TU**（无跨 TU 问题）；线程所有权与 pubred epilogue 同构（一线程 4 列 × 全部 hc 行）；**默认 ON**（`fuse_c()` 默认 true，`chain_dev.rs:1312` 在 `!hcpost_epi()` 时走它），且与 tail split 兼容。
+**非默认路径下的次优载体是 `dsv41_hc_post_inplace`**（kernel `dsv41_kernels.cu:4459`，launcher `:4496`）：与 `g_hc_part`/`hc_mixes_tail_kernel` **同 TU**（无跨 TU 问题）；线程所有权与 pubred epilogue 同构（一线程 4 列 × 全部 hc 行），且与 tail split 兼容。⚠️ 它**不在默认路径上**：`DSV41_HCPOST_EPI` 默认 ON（`hcpost_epi()`，`chain_dev.rs:2077`）时 `layer` 在 `chain_dev.rs:2216`（attn 侧）/ `:2345`（MoE 侧）**跳过**它，只有 `DSV41_HCPOST_EPI=0` 才回到它（`fuse_c()` 默认 true，`chain_dev.rs:2056` 是选择 in-place / h2-staging 的闸）。
 
 **若要做，需一并解决（按序）**：① `hc_mixes_tail_kernel` 的 `mixes` 只读 `g_hc_part[r][m][0]`（`:4100`）——**不 sum ck**，K-split 必须给它加 split-sum（或新变体）；② 前端要 **tail-only 入口**（跳过 dots launch：`hc_front:4687` / `hc_front_split:4781` 各一个）；③ **ss 非逐位**：`ss_in=1` 的 partial 由 `hc_mix_dots_kernel:3982` 按 `m*32+lane` 残差类生成、tail 读 `[r][tid][1]`（`:4081`），该分组在列所有权下无法逐位复现 ⇒ 须容差门禁 + 同二进制 A/B；④ **engram 层（1、14）必须排除 MoE 侧融合**：`engram_apply`（`chain_dev.rs:1230`，调用点 `:1572`）在 block 前**原位改写 `s.h`**，切断了「上一层 MoE hc_post → 本层 attn hc_pre」的直连。
 
 **收益口径修正**：`hc_mix_dots` 是 **80 次/步**（2/层 × 40 层，`STATUS.md:3981`），不是 40 次。融合只省**图节点**（~1.5µs/节点 × 80 ≈ **0.12ms**），点积计算本身（7.0µs × 80 = 0.56ms）仍要付 ⇒ **融合后点积计算绝不能变慢**，否则收益被吞掉。
+
+**新方向复核（dots 融进「前一段最后一个 kernel」的 epilogue，2026-09-11，纯代码分析）：结论不变 —— 结构性可行但净负，不值得做。**
+
+- **段序列：新方向落回同一个载体。** 默认路径（hcpost fold ON）下 attention 段的最后一个 kernel **就是** `p2p_ar_pubred_v5_hcpost`（`chain_dev.rs:2207` 调用 `attention()`，其 `:3154-3174` 的 AR 即收尾）。到 FFN 侧 dots 之间**只有一次 `hc_tail_join` 事件等待、无其它 kernel**（`:2211`；fold 命中时 `:2216` 的 `hc_post_inplace` 被跳过）。唯一例外是 engram 层（1、14）：`engram_apply`（调用点 `chain_dev.rs:1677`）在段前**原位改写 `s.h`**，必须排除。
+- **grid 不匹配其实可以精确解决**：残差布局是 `res[i*dim + j]`（`dsv41_kernels.cu:4471`，行距 = `dim`），dots 的 K 空间 = 拉平的 `hc*dim = 20480`（**不是 5120**）。pubred epilogue 每线程恰好拥有 4 列 × 全部 hc 行 = **16 个 K 元素**，`1280 线程 × 16 = 20480` ⇒ **逐元素精确划分**；且 `ar5_hc_post_col4`（`ferrite_kernels.cu:8495`）已在寄存器里走完全部 hc 行 ⇒ x 零额外读取。
+- **归约有正解**：24 行 × ck 个块 partial。**原子加会破坏逐位与复现性**；正解是让 LATE 的 `mixes` 按 ck 升序合并（`hc_front_kernel:4320` 已有先例，`g_hc_part[r][m][ck]` 的 ck 维是 8，`dsv41_kernels.cu:4241/4253`）。但这改变部分和顺序 ⇒ 容差门禁 + 同二进制 A/B（与 §1「split 必须 = 1」冲突）。跨 TU（`g_hc_part` 在 `dsv41_kernels.cu`、pubred 在 `ferrite_kernels.cu`，无 `-rdc`）须把 partial 缓冲当参数传指针。
+- **真正的硬阻塞仍是并行度**：pubred grid = `ceil(n4/256) = 5` block × 256 线程（`ferrite_kernels.cu:8625`）压在 **5 个 SM**；dots 现在 **24 block/24 SM、7.4µs**（3.93MB/7.4µs = 531GB/s ≈ **22GB/s/SM**，是**延迟地板**而非 DRAM 地板）。把 1.92MB 权重流压到 5 个 SM ⇒ 估算 ~17µs，而 dots 在关键路径上（LATE 等它）⇒ **≈ +10µs/层 × 80 = +0.8ms**，只换回 0.12ms 节点 ⇒ **净亏**。放宽 grid 也救不了：ck 维上限 8 ⇒ K-split 最多 8 块，8 × 22GB/s 也只有 176GB/s（≈11µs），仍慢于 7.4µs。
 
 ## 7. 关键风险与回退
 
