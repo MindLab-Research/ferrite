@@ -2875,7 +2875,46 @@ struct GemvEpi {
 };
 
 
-__global__ void gemm_fp8_gemv_kernel(GemvCore gc, GemvRope gr, GemvFusion gf, GemvEpi ge) {
+// ---------------------------------------------------------------------------
+// gemv-struct-pack: the kernel now takes four by-value parameter groups instead
+// of the 37 scalars this family had grown to (see the Gemv* definitions below).
+//
+// TWO QUALIFIERS HERE ARE LOAD-BEARING -- do not "clean them up":
+//
+//   * `__grid_constant__ const` keeps each struct in the kernel parameter space
+//     instead of letting the compiler keep its members live in registers across
+//     the row loop. MEASURED (sm_103a, CUDA 13.2, -O3 --use_fast_math):
+//     plain by-value structs need 72 registers, __grid_constant__ needs 64.
+//     Adding __restrict__ to the struct members, dropping the default member
+//     initialisers, or marking the parameters `const` alone all made no
+//     difference -- __restrict__ is NOT the mechanism (HEAD with every
+//     __restrict__ stripped still compiles to 56 registers).
+//
+//   * `__launch_bounds__(1024)` is what actually pins the register count. It
+//     states the widest block this kernel is ever launched with -- 32 warps,
+//     the five forced-32-warp launchers (mx_rope, mx_rope_norm, mx2_rope, and
+//     the B1/norm-fuse paths) -- so ptxas must fit the 64-register-per-thread
+//     ceiling that 1024 threads impose (65536 registers / 1024 threads). With
+//     BOTH qualifiers ptxas emits 56 registers and ZERO spills: byte-identical
+//     register pressure to the 37-parameter version.
+//
+//     Why this matters: at 72 registers a 1024-thread launch needs 73728
+//     registers, more than the SM has, so it FAILS -- cudaErrorInvalidValue,
+//     i.e. exactly the "cuda error 1" (drifting between mx / rope_norm /
+//     mx_rope / quant_fp8 across ranks) that this refactor exists to remove.
+//     Removing __launch_bounds__ re-opens that failure silently.
+//
+// A/B command used for the numbers above:
+//     nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
+//          --use_fast_math -Xptxas -v -c kernels/cuda/dsv41_kernels.cu
+//
+// The three-argument `<<<>>>` form, cudaLaunchKernel's void* array and
+// cudaLaunchKernelEx's variadic template all marshal a by-value struct the same
+// way they marshal a scalar, so the launchers pass `gc, gr, gf, ge` unchanged on
+// both arms of dsv41_pdl_or_plain.
+__global__ void __launch_bounds__(1024)
+gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ const GemvRope gr,
+                     __grid_constant__ const GemvFusion gf, __grid_constant__ const GemvEpi ge) {
     // -----------------------------------------------------------------------
     // gemv-struct-pack: re-bind the parameter names from the four by-value
     // structs defined above. Everything from here to the kernel's closing brace
@@ -3996,7 +4035,7 @@ extern "C" int dsv41_gemv_occupancy(int warps, size_t gsmem) {
     if (gsmem > 48 * 1024) {
         if (cudaFuncSetAttribute(gemm_fp8_gemv_kernel,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 232448) != cudaSuccess)
+                                 231676) != cudaSuccess)
             (void)cudaGetLastError();
     }
     int blocks = 0;
@@ -5801,7 +5840,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if (g_hc_merge) {
         cudaError_t e2 = cudaFuncSetAttribute(hc_front_kernel,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                              232448);
+                                              232188);  // 232448-260 static
         if (e2 != cudaSuccess) {
             (void)cudaGetLastError();
             return (int)e2;

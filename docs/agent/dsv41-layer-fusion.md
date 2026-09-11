@@ -322,9 +322,22 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
   修复：把这 7 个默认值还原 `true`，只保留新融合门（GATEUP/DOWN/AR_STORE/SWIGLU_Q/MOE_EPI_ADD）默认 OFF。
   注意 `DSV41_MOE_BATCH` 的 doc 注释仍写 "DEFAULT OFF"，与 round-16 基线以及 -3.2ms 的实测收益矛盾，应一并订正。
 - **✅ gemv kernel 签名 +6 参数（epi_add + AR 5 个）已排除，与 +8.7ms 无关（2026-09-11 ptxas 实测）** ✓：
-  `gemm_fp8_gemv_kernel` 14 → 22 参数（当次实验值；该签名现位于 `dsv41_kernels.cu:2701`，
-  已增至 **37 个参数**：epi_add + AR 5 个 + B1 的 `xq`/`xsc` + rope 7 个 + NORM_FUSE 3 个 +
-  f32 的 `a_f32`），但以生产 flag
+  `gemm_fp8_gemv_kernel` 14 → 22 参数（当次实验值），最终长到 **37 个位置参数**：
+  epi_add + AR 5 个 + B1 的 `xq`/`xsc` + rope 7 个 + NORM_FUSE 3 个 + f32 的 `a_f32`。
+  **2026-09-11 `gemv-struct-pack` 已取代该签名**：kernel 现在只收 4 个按值 struct
+  （`GemvCore`/`GemvRope`/`GemvFusion`/`GemvEpi`，定义在 `dsv41_kernels.cu:2759-2886`，
+  kernel 在 `:2915`），原参数名由 kernel 顶部一段 re-binding 块从 struct 取回，kernel body 逐字节未动；
+  launcher 侧只构造 struct 再交给 `dsv41_pdl_or_plain` ⇒ 「Ex 转发 36+ 参数」这一失败模式从根上消失。
+  位置参数个数的可维护性讨论到此结束。
+  ⚠️ **该打包必须同时保留 `__grid_constant__ const` 与 `__launch_bounds__(1024)`**，
+  两者都是承重限定符（实测 sm_103a / CUDA 13.2 / `-O3 --use_fast_math -Xptxas -v`）：
+  37 标量 = **56** regs；纯 by-value struct = **72** regs；+`__grid_constant__` = **64** regs；
+  +`__grid_constant__`+`__launch_bounds__(1024)` = **56 regs / 0 spill**（与标量版完全相同）。
+  72 regs 时 1024 线程/块（5 条强制 32 warps 的 launcher：mx_rope / mx_rope_norm / mx2_rope /
+  B1 epilogue / norm-fuse）需要 73728 > 65536 寄存器 ⇒ **launch 直接失败 `cudaErrorInvalidValue`**，
+  即本文件追踪的 "cuda error 1"。另外 `__restrict__` **不是**机制：把 HEAD 的 17 处 restrict
+  全部删掉仍是 56 regs（struct 成员加 restrict 也仍是 72）。
+  以下为标量签名时代的对照。标量签名时代以生产 flag
   （`-O3 --use_fast_math -gencode arch=compute_103a,code=sm_103a -Xptxas -v`）对比 `314f5df` 与 HEAD：
   **寄存器 48 → 40（不升反降），两版均 0 spill，34 个 kernel 中只有这一个的寄存器数变了**。
   occupancy 也不是寄存器约束：mode 4 的 `gsmem` = 5·5120+22784 = **48384 B**（mode 3 = 43264 B），

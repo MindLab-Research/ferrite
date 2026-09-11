@@ -179,11 +179,14 @@ _事实来源：`chain_dev.rs:794/1013/1314/1961`；`ferrite_kernels.cu:748/590/
 **真正「persistent」杠杆 = PDL 串链（已实施 2026-09-11，未上机验证）**：`pdl_or_plain`（`ferrite_kernels.cu:725-765`，`cudaLaunchAttributeProgrammaticStreamSerialization`）已存在且在 GDN/DSA 投影族验证过 capture。现在 `dsv41_kernels.cu` 里有了自己的副本 **`dsv41_pdl_or_plain`**（gate `DSV41_PDL`，**默认 ON**；PDL 臂走 `cudaLaunchKernelEx` + attribute，`=0` 回退臂走 **`cudaLaunchKernel` + 显式 `void*[]` 参数数组**，即 `<<<>>>` 本身编译出的那条运行时 API），覆盖注意力投影链 consumer 端的 **8 个 launch 点**：
 
 > ⚠️ **2026-09-11 round-45 修复**：回退臂**不得**走 `cudaLaunchKernelEx`。Extended Launch 会把参数包多转发一层模板，gemv 家族 36+ 参数时实测会返回 `cudaErrorInvalidValue`（"cuda error 1"），而同一份参数列表用 `cudaLaunchKernel` 数组形式则正常。**不要**把两条臂合并回单个 `cudaLaunchKernelEx` 调用。同理待查：`dsv41_experts_pdl_or_plain`（`dsv41_experts_mxf4.cu:873`）仍是「两条臂都走 Ex」的旧写法。
+>
+> ✅ **2026-09-11 `gemv-struct-pack`（后续提交）**：gemv 家族不再传 37 个标量，改为 4 个按值 struct（`GemvCore`/`GemvRope`/`GemvFusion`/`GemvEpi`，定义在 `dsv41_kernels.cu:2759-2886`，kernel 在 `:2915`），两条臂都只转发 4 个实参 ⇒ 上面那个「Ex 转发 36+ 参数」的失败模式从根上消失（`cudaLaunchKernel` 仍是 `DSV41_PDL=0` 的臂，因为它是 `<<<>>>` 的逐字节等价物）。**`DSV41_PDL` 默认仍为 OFF**，重新打开属于独立的 A/B。
+> ⚠️ **承重限定符**：kernel 签名上的 `__grid_constant__ const` 与 `__launch_bounds__(1024)` 都不能删。实测（sm_103a / CUDA 13.2）：37 标量 56 regs → 纯 struct 72 regs → +`__grid_constant__` 64 regs → +`__launch_bounds__(1024)` **56 regs / 0 spill**。72 regs 时 1024 线程/块需要 73728 > 65536 寄存器，launch 直接 `cudaErrorInvalidValue`。`__restrict__` 与 NSDMI 都不是机制（已 A/B 排除）。
 
 
 | consumer kernel | launcher | 入口 sync |
 |---|---|---|
-| `gemm_fp8_gemv_kernel` | `dsv41_gemm_fp8_mx`（M=1 分支） | `dsv41_kernels.cu:2830` |
+| `gemm_fp8_gemv_kernel` | `dsv41_gemm_fp8_mx`（M=1 分支） | `dsv41_kernels.cu:2986` |
 | 同上 | `dsv41_gemm_fp8_mx_rope` | 同上 |
 | 同上 | `dsv41_gemm_fp8_mx_rope_norm` | 同上 |
 | 同上 | `dsv41_gemm_fp8_mx2_rope` | 同上 |
