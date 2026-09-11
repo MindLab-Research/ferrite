@@ -5103,3 +5103,18 @@ nsys 的计数口径是"8 个 rank 求和后再除以步数"，所以 `gemv_bf16
 
 **教训**：改一处"尺寸来源"必须**全量 grep 该尺寸的所有传递点**（`grep -n "inter as i32"`），
 不能只改肉眼看到的第一处；融合 launch 的参数列表比单族 launch 长，最容易被漏。
+
+### shared expert TP 切分：两个真因（2026-09-11 晚，第二个是行为偏差）
+
+1. **混合 launch 的 fp8 行数传错**：`dsv41_gemm_bf16_fp8x2(..., nf)` 仍传 `inter`(2304)，
+   而权重已按 `Shard::Rows` 切成 **288 行** → family-1/2 对行号 288..2303 做 `wf + rrow*k`
+   越界读 → `err 700`。修复：传 `sh_il`。
+   **教训**：改一处"尺寸来源"必须 `grep` 该尺寸的**全部**传递点；融合 launch 的参数表更长，最易漏。
+2. **`sh_w` 漏了 `shared_rank` 条件**：我一度写成 `if !skip_shared_expert { ... }`，
+   于是**两种布局下 8 个 rank 都会跑融合 launch**（结果正确但 7/8 是纯浪费）。
+   恢复为 `!skip_shared_expert && shared_rank`：切分时 `shared_rank = true`（每个 rank 拥有自己的
+   `inter/world` 切片），复制布局时回落 `rank == 0`（原语义）。
+
+**验证协议**：同一次 checkout 双产物重编 → `dfl`（默认，复制+rank0）与
+`stp`（`DSV41_SHARED_TP=1`）**同会话背靠背**两轮，判据仍是四段文本 + faults + p50。
+通过后 `shared_expert_tp()` 默认翻 ON（这是唯一真正的"rank0 串行 2.2ms"来源）。
