@@ -472,6 +472,187 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
 }
 
 // ---------------------------------------------------------------------------
+// Order-preserving software-pipelined variant of sparse_attn_warp_kernel.
+// The t-loop's chain is  idx load -> kv-row load -> dot -> online-softmax,
+// ~800 cycles of pure latency per key with one slot in flight, which is why the
+// warp version sits ~2x off its bandwidth floor. This variant keeps TWO slots
+// in flight: while the dot for slot j runs on the registers already staged in
+// kb[0]/kb[1], the kv-row loads for slots j+1/j+2 are on their way, and the q
+// row is staged once instead of being re-read every slot. The iteration order,
+// the dot's column order and the online-softmax update order are untouched,
+// so the math is bit-identical (idx<0 slots keep the skip semantics: no load,
+// no state update). DSV41_ATTN_PF=0 restores the plain warp version for A/B.
+__global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* __restrict__ kv,
+                                      const float* __restrict__ sink,
+                                      const int32_t* __restrict__ idxs, float* __restrict__ out,
+                                      int b, int m, int h, int d,
+                                      const int* __restrict__ clen, int window, int index_topk,
+                                      float scale) {
+    const int n = window + *clen;
+    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+    const int row = blockIdx.x;
+    if (row >= b * m) return;
+    const int bb = row / m, mm = row % m;
+    const int32_t* irow = idxs + (size_t)(bb * m + mm) * topk;
+    for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
+        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        const int nwarp = (int)blockDim.x >> 5;
+        // Stage the q row once: kills the per-slot re-read of qr (16 floats/lane).
+        float qv[kMaxPerW];
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) qv[i] = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) qv[i] = qr[c];
+        }
+        float my_acc[kMaxPerW];
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
+        float my_smax = -1e30f, my_se = 0.f;
+        // Two kv-row buffers, alternating by slot parity; kBase is the row base.
+        float kb0[kMaxPerW], kb1[kMaxPerW];
+        const size_t kBase = (size_t)bb * n * d;
+        // Prologue: fire the idx loads for the first two slots, then their rows.
+        int t = wid;
+        int ia = (t < topk) ? irow[t] : -1;
+        int ib = (t + nwarp < topk) ? irow[t + nwarp] : -1;
+        if (ia >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb0[i] = kv[kBase + (size_t)ia * d + c];
+            }
+        }
+        if (ib >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb1[i] = kv[kBase + (size_t)ib * d + c];
+            }
+        }
+        // Main loop: two slots per pass. Slot t lives in kb0, t+nwarp in kb1.
+        // The load for the NEXT kb0 slot is fired right after kb0's compute,
+        // giving the row load a full compute phase of distance.
+        for (; t + nwarp < topk; t += 2 * nwarp) {
+            const int te = t + 2 * nwarp;   // next slot destined for kb0
+            const int tf = te + nwarp;      // next slot destined for kb1
+            int ie = (te < topk) ? irow[te] : -1;
+            if (ia >= 0) {
+                float dot = 0.f;
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) dot += qv[i] * kb0[i];
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+                dot *= scale;
+                const float nm = fmaxf(my_smax, dot);
+                const float corr = expf(my_smax - nm);
+                const float e = expf(dot - nm);
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                }
+                my_se = my_se * corr + e;
+                my_smax = nm;
+            }
+            // kb0 is dead now: fire the row load for slot te into it.
+            if (ie >= 0) {
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) kb0[i] = kv[kBase + (size_t)ie * d + c];
+                }
+            }
+            if (ib >= 0) {
+                float dot = 0.f;
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) dot += qv[i] * kb1[i];
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+                dot *= scale;
+                const float nm = fmaxf(my_smax, dot);
+                const float corr = expf(my_smax - nm);
+                const float e = expf(dot - nm);
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                }
+                my_se = my_se * corr + e;
+                my_smax = nm;
+            }
+            // kb1 is dead now: fire the row load for slot tf into it.
+            int iff = (tf < topk) ? irow[tf] : -1;
+            if (iff >= 0) {
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) kb1[i] = kv[kBase + (size_t)iff * d + c];
+                }
+            }
+            ia = ie;
+            ib = iff;
+        }
+        // Tail: at most one slot left (t < topk here means its row is in kb0).
+        if (t < topk && ia >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb0[i];
+            }
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        // ---- same warp-merge epilogue as the plain warp version ----
+        __shared__ float sh_smax[32], sh_se[32];
+        __shared__ float sh_acc[4][512];
+        if (lane == 0) {
+            sh_smax[wid] = my_smax;
+            sh_se[wid] = my_se;
+        }
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) sh_acc[wid][c] = my_acc[i];
+        }
+        __syncthreads();
+        float smax = -1e30f;
+        for (int w = 0; w < nwarp; ++w) smax = fmaxf(smax, sh_smax[w]);
+        float wsc[4];
+        for (int w = 0; w < nwarp && w < 4; ++w) wsc[w] = expf(sh_smax[w] - smax);
+        float se = 0.f;
+        for (int w = 0; w < nwarp; ++w) se += sh_se[w] * wsc[w < 4 ? w : 0];
+        se += expf(sink[hh] - smax);
+        float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+            float a = 0.f;
+            for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
+            orow[c] = (se > 0.f) ? a / se : 0.f;
+        }
+        __syncthreads();  // sh_* reuse safety across the hh loop
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Split sparse attention (DSV41_ATTN_SPLIT). The warp version runs one block per
 // (token, head) - eight blocks on this model's decode - which leaves 95 percent
 // of the machine idle and pays for it in latency: 26 us per layer, forty layers,
@@ -1656,6 +1837,12 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
         if (e == nullptr) return 0;
         return atoi(e);
     }();
+    // Order-preserving prefetch pipeline (default on); DSV41_ATTN_PF=0 restores
+    // the plain warp version for A/B.
+    static const bool pf_off = [] {
+        const char* e = getenv("DSV41_ATTN_PF");
+        return e != nullptr && atoi(e) == 0;
+    }();
     dim3 grid(b * m, h);
     if (!seq) {
         if (g_attn_split > 0 && g_attn_split <= kAttnMaxC && b * m <= kAttnMaxBM &&
@@ -1669,7 +1856,11 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
                 sink, out, b, m, h, d, g_attn_split);
             return (int)cudaGetLastError();
         }
-        sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
+        if (!pf_off)
+            sparse_attn_pf_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d,
+                                                       clen, window, index_topk, scale);
+        else
+            sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk,
                                                      scale);
     } else {
         sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale);
