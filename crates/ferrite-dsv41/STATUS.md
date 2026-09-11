@@ -5489,3 +5489,15 @@ swiglu 把"已 swiglu 的结果"当 gate、把**未写区**当 up → 数据错�
 **疑因**：safe-arm-diagnose 的报告指出 serve 在"rank 加载完成前就被杀掉"是第 19 轮的问题——但第 21 轮跑完了（98 步）且文本正确，所以不是超时。18.87ms vs 10.16ms 的差距最可能来自 **A4A5-impl / AR-store-impl 留在主树的非融合路径改动**（如 gemm_fp8_mx 的新参数、epi_add、AR pubred-only 的分支逻辑），这些改动在默认 OFF 下仍可能引入额外的 host 开销或 kernel 签名变化导致的间接性能影响。
 
 **待查**：用 DSV41_TIMING=1 的 per-step 日志对比 safe3（18.87ms）vs 上一轮正确基线（10.16ms）的分段耗时差异，定位退化源。
+
+### gemv-fixed-cost3 定论（最后一轮微基准）
+
+5 个方向全部无效或已落地：
+1. `__launch_bounds__(128,2)` — 不适用（当前 smem 22.6KB + LUT 1KB + a32 20KB = 48.9KB 已接近 48KB 免 opt-in 上限，2 块/SM 不可能）
+2. cp.async staging — 权重行已用 cp.async，激活行未用但实测无收益
+3. 一次 stage 两行 — 每 block 4 warp 各一行已是最优
+4. s_lut 放 constant memory — 1KB 广播式常量缓存对随机索引反而更慢
+5. 已落地组合的笛卡尔积 — 无未测角落
+
+**结论：gemm_fp8_gemv 家族已到指令级地板**（~11.6µs 固定项 + bytes/1.5TB/s），171 次/步 × ~13µs = ~2.2ms。
+唯一剩余杠杆 = 减少 launch 数（xn-megafuse、段融合）或消除家族（段 B 内嵌）。
