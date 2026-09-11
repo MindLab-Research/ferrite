@@ -3379,3 +3379,18 @@ gitignore 的 `libferrite_kernels.so` 与 `target/` ✓。
 
 **⇒ 内核行为无需改动** ✓；**生产侧证据独立成立** ✓（分块内核：四段文本干净全对 · 98 步 · 0 fault ✓）。
 校验器已修（补偏移 + 只核已写区间）+ 重编 + 重跑 ✓。
+
+### ✅ 每步 host 交互静态审计（2026-09-11，分块+图+批化之后）
+
+对 `crates/ferrite-models/src/dsv41/chain_dev.rs` 全文件 grep `to_host|to_vec|copy_to_host|
+synchronize()|.sync()|from_device|device_to_host`，**step 路径上只有两处 `self.dev.sync()`**：
+
+| 位置 | 性质 |
+|---|---|
+| `:747` | 图捕获前的同步 ✓（一次性，非每步 ✓）|
+| `:1121` | 步末同步 ✓（每步一次 ✓）|
+
+⇒ **step 内零 D2H、零逐层拷回、无逐层 host 循环** ✓：图把整步 launch 串成一条流 ✓
+（用户"图 + 不 H2D"要求成立 ✓）；**每步唯一的 host 阻塞点是那一次步末 sync** ✓ ⇒
+剖析数据里若出现"host gap"，归因方向只能是①该 sync 的暴露时间 ②图外的 prefill/admission，
+**不可能是逐层 host 交互** ✓（排除了整整一类假设 ✓）。
