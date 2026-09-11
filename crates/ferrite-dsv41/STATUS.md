@@ -4266,3 +4266,16 @@ mg1check steps=98 p10=13.07 p50=13.30 p90=13.47 -> 75.2 tok/s     faults: 0
 **退化的真因必须在 mg1 之后的其他改动里找**（fp8 的 ILP 已被 fix0 排除、expert unroll 已被
 eu1 排除），剩 gemv_bf16 / gemv_f32 / 混合核的 `__fmaf_rn` 写法、s_x 本身、hc 的 unroll。
 诊断部署（三处回基线写法 + 保留 s_x）正在给出第一刀。
+
+### 诊断进展（连续四刀，2026-09-11 深夜）
+
+| 实验 | 配置 | 结果 |
+|---|---|---|
+| mg1check | 远端 checkout `5cddf22` 重编 | **正确**（13.30ms、四段全对、98 步）|
+| diag1 | 三处 bf16/f32 gemv 回**基线写法** + 保留 s_x | **仍退化** ⇒ `__fmaf_rn` 被排除 |
+| noilp | diag1 + `DSV41_GEMV_ILP=0` | 见下 |
+| hcun1 | diag1 + hc collapse `unroll 1` | 已备（若上面两刀都没定位）|
+
+**修正一个此前的错误推理**：fix0（`DSV41_GEMV_ILP=0`）当时确实退化，但它同时带着 gemv_bf16 的
+**s_x 越界**（launcher 未传 smem，直到 6aa9678 才修）⇒ **它并不能排除 fp8 的 ILP**。
+这正是本轮把它单独拿出来重测的原因（用现成 env，零代码改动、零部署成本）。
