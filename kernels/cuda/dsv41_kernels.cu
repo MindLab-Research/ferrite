@@ -1617,6 +1617,16 @@ static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
 // ---------------------------------------------------------------------------
 #define DSV41_HC_SPREAD_MAXR 2048
 #define DSV41_HC_SPREAD_S 8          // K chunks; one block per (row, projection row, chunk)
+// The split is configurable so the spread path can be tested at split=1, where a
+// dot is one block's verbatim copy of the fused kernel's reduction and the result
+// should be bit-identical; the shipped default stays at 8, where the partials are
+// summed in a different order and the outputs no longer match bit for bit.
+static const int g_hc_spread_s = [] {
+    const char* e = getenv("DSV41_HC_SPREAD_S");
+    if (e == nullptr) return DSV41_HC_SPREAD_S;
+    const int v = atoi(e);
+    return (v >= 1 && v <= DSV41_HC_SPREAD_S) ? v : DSV41_HC_SPREAD_S;
+}();
 __device__ float g_hc_inv[DSV41_HC_SPREAD_MAXR];
 __device__ float g_hc_part[DSV41_HC_SPREAD_MAXR][64][DSV41_HC_SPREAD_S];
 
@@ -1759,7 +1769,7 @@ extern "C" int dsv41_hc_mixes(const float* x, const float* hc_fn, const float* h
         if (v >= 32 && v <= 1024) nthreads = v;
     }
     if (g_hc_spread && rows <= DSV41_HC_SPREAD_MAXR && mix <= 64) {
-        const int split = DSV41_HC_SPREAD_S;
+        const int split = g_hc_spread_s;
         // Spread variant: one block per (row, projection row), so each of the `mix`
         // 64 KB weight rows is read on its own SM instead of all 1.5 MB on one.
         // The arithmetic order was believed identical in every phase, but a
