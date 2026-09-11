@@ -5133,3 +5133,29 @@ UB 运气（越界写恰好落在未用区域）。因此 **hcd/r3 两个"err 70
 **教训**：① 给 kernel 加 `extern __shared__` 时，launcher 的第三参必须同步改
 （这类 bug 是 UB，可能"通过"好几轮才爆）；② "某改动 err 700"的归因必须先
 `CUDA_LAUNCH_BLOCKING=1` 拿到真凶内核名，再结合"该内核近期是否被改过"判断。
+
+### shared expert TP 切分：验证通过（2026-09-11 晚，第三轮）
+
+修复 gemv_bf16 的 smem 越界后，切分首次完整通过：
+
+| 臂 | p50 | tok/s | 文本 | faults |
+|---|---|---|---|---|
+| dfl（默认：复制权重，仅 rank0 算） | 30.07ms | 33.3 | 四段全对 | 0 |
+| **stp（DSV41_SHARED_TP=1：每 rank 算 inter/8 切片）** | **26.16ms** | **38.2** | 四段全对 | 0 |
+
+**切分收益 = −3.9ms/步**（在同一基线上的差分测量，与 nsys 推算的 rank0 串行 ~2.2ms+
+混合 launch 差异一致量级）。
+
+**⚠️ 但两臂都比 13.14ms 基线慢 ~13-17ms**：默认路径当时还带着两个"从未通过任何测量"的改动
+——gemv_bf16 activation staging（smem 修复后真正生效，反而暴露其代价）和 gemm_fp8 prologue
+里的空 `cp.async commit/wait`。两者均已回退到 ss2 已知正确形式；回退后的基线 + 切分在下一轮重测
+（预期 ~9.2ms ≈ **109 tok/s**）。
+
+**方法论教训（本轮最贵的一课）**：
+1. **给 kernel 加 `extern __shared__` 时 launcher 的第三参必须同步改**——这类越界是 UB，
+   可能"侥幸通过"好几轮（b2 臂 13.19ms 就是带着这个 bug 通过的），然后在毫不相关的改动
+   （hc dots 128、切分）上爆 err 700，导致连续 6 轮误归因。
+2. **sticky error 的内核名是"第一个检查返回值的 launch"，不是"第一个出错的 kernel"**——
+   必须 `CUDA_LAUNCH_BLOCKING=1` 拿真凶。
+3. **一个改动的"中性"测量如果在它引入 bug 的状态下取得，这个测量本身无效**——b2 的 13.19ms
+   既是 gemv_bf16 staging 的"中性证明"，又是后来一切混乱的源头。
