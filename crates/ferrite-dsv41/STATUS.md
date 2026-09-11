@@ -4210,3 +4210,23 @@ DSV41_GEMV_ILP=1: bf16 gate out[0..3] = -0.645200491 -0.472896397 0.224169061 -0
 **仍待实测**：expert fp4 的 `#pragma unroll 4`（诊断部署中）、hc collapse 的 `#pragma unroll 4`。
 **二分策略**：从当前版本逐项把 unroll 降回 1，直到文本恢复，再针对该项做 rn 级修复
 （用户要求"修复而不是回退"，所以降回 1 只用于**定位**，定位后必须修好并恢复）。
+
+### 探索性排除（本轮补充，重要）
+
+**症状有两种形态**：
+- **fix0**（ILP=0，gemv_bf16 当时用 `mul_rn+add_rn`）：**192 步**、输出 40 字符垃圾
+  `'verse fatalRec08 bin串P+b5AA incl bind ma'`
+- **v2 / fix3 / eu1**（gemv_bf16 用 `__fmaf_rn`）：**12 步**、输出 13 字符垃圾 `'Vers Donearic'`
+
+⇒ **两轮不同的 bug**：
+1. 第一轮 = gemv_bf16 的 `mul_rn+add_rn`。device 对比证明基线 `acc += w*x` **确实是 FFMA**
+   （baseline vs fmaf 0/64 不同；baseline vs mul+add **37/64 不同**）—— **已修**。
+2. 第二轮 = 仍未知。**已排除**：fp8 的 `__fmaf_rn`（device 对比 **64/64 逐位相同**）、
+   `e4m3_to_f` 位操作（host+device 各穷举 254 码 0 差异）、**expert fp4 的 unroll**
+   （降回 `#pragma unroll 1` 后**完全不变**：仍 12 步、仍 10.14ms —— 连带证明它对性能也无贡献）、
+   hc collapse 的 s2（已钉 fmaf）、argmax 的 `idx_off`（语义等价）、lm_head 切分（默认关）。
+
+**当前诊断实验**：把 gemv_bf16 换回**基线写法**（`acc += bf16(w)*x`，让编译器自行融合成 FFMA）
+但**保留 s_x 共享内存 staging** ⇒ 一次区分 "`__fmaf_rn` 钉法" 与 "共享内存 staging"。
+**基线对照**：远端 `git checkout 5cddf22`（mg1，混合核那次已验证正确）重编并跑同一 A/B，
+确认"基线本身仍好"这一前提。
