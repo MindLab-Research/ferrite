@@ -4169,3 +4169,23 @@ DSV41_GEMV_ILP=1: bf16 gate out[0..3] = -0.645200491 -0.472896397 0.224169061 -0
 表达式 —— 那是**改变数值**而不是固定数值。要么整体用 `__fmaf_rn`（匹配基线），要么先用
 `cuobjdump`/PTX 确认基线实际生成的指令形式。**`extern __shared__` 的核：launcher 第三参数
 必须带尺寸**（本会话在 gemv_bf16 与 gemv_f32 上各踩一次）。
+
+## 本轮的数值安全审计（2026-09-11 深夜）—— 把重排风险当可验证的工程问题
+
+`--use_fast_math` 是**必须开**的（关掉会 2x 回归并崩 batched capture，见 build.sh 注释），
+所以"任何多路化都会引入重排风险"是常态。本轮的处置是给每个多路化改动配一个**可执行的等价性证据**：
+
+| 改动 | 验证方式 | 结论 |
+|---|---|---|
+| fp8 gemv 的 4 路 ILP（`__fmaf_rn`） | device 侧同核对比：基线写法 vs fmaf 写法，64 行 | **64/64 逐位相同** ✓ |
+| gemv_bf16 的 4 路 ILP（`__fmaf_rn`） | 微基准输出指纹，`DSV41_GEMV_ILP=0/1` 同二进制切开关 | **逐位相同** ✓ |
+| `e4m3_to_f` 位操作重写 | host 穷举 254 码 **+** device（fast_math）穷举 254 码 | **0/254 不同** ✓ |
+| hc collapse 的 4 路 unroll | 分析：`s2 += acc*acc` 变成四条独立链 ⇒ 可重排 ⇒ 改 `__fmaf_rn(acc, acc, s2)` | 修复 |
+| expert fp4 的 4 路 unroll | 分析：累加是 `fmaf` 链（不可重排），`s_lut*sc` 是单次乘法（无结合问题） | 安全 |
+
+**工具**：`scripts/dsv41_gemv_bench.cu`（形状计时 + 输出指纹 + launcher 返回码）、
+`scripts/dsv41_indexer_bench.cu`（n_pos 扫描 + 选择指纹）、`scripts/dsv41_fp8_decode_check.c`
+（fp8 解码穷举）、`/tmp/fp8_acc_test.cu` 与 `/tmp/e4m3_gpu_cmp.cu`（device 侧同核对比模板）。
+
+**工程习惯**：多路化改动必须配 (a) 指纹/穷举证据，或 (b) 明确写出它保持的加法顺序并用 rn 内建钉住。
+"看起来顺序一样"不构成证据 —— 本轮为此付出了三次退化 + 一轮完整诊断的代价。
