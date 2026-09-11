@@ -6562,3 +6562,40 @@ expert 1.78 + hc 1.59 + gemv_bf16 0.74 + AR 0.66 + sparse 0.32）——继续消
 
 **结论**：开销量已近极限（8.23→~5ms 是回收上界）。真正的第二个 2x 只剩「专家核 GEMM 化」
 与「M>1 batching」（serve 级）两条架构路径；其余方向确认已接近架构极限。
+
+### ⚠️ grouped-GEMM 设计复核（explore，2026-09-11 深夜）：上面「①」的三个前提不可实施
+
+代码级复核 `kernels/cuda/dsv41_experts_mxf4.cu` + nsys-v3 表：
+
+1. **fp4 没有 `m16n8k16`**（`:12-19` 实测）：ptxas 在 sm_103a 拒绝**所有** `mma.sync` fp4 拼写
+   （只在 sm_120a 汇编）。B300 上唯一 fp4 tensor-core 是 `tcgen05…kind::mxf4`，**M 硬件固定 128**
+   （`:20-24`、`kMTile :98`）。⇒「M=6 pad 到 16」不存在；且 6 个专家权重不同、不能共享 B，
+   要放进同一 GEMM 的 M 只能走 batch/group 语义（每组仍是 M=1，仍付 128 倍 M 冗余）。
+2. **「246→~40」归属错误**：nsys-v3 里 246 是 `gemm_fp8_gemv`（dense attention/shared，另一族）；
+   expert 家族**本就已是** 40(gateup)+40(down)/步 = 80 次（`DSV41_MOE_BATCH` 默认 ON，
+   `chain_dev.rs:240` 已把 6 个 slot 合成 1 launch）。⇒ grouped 对 launch **无收益**，
+   收益只可能来自 SM 利用率 / 每 warp MLP。
+3. **ILV 不是前置条件，反而是障碍**：ILV 是 8 字节粒度 gate/up 交替、服务 SIMT 融合体的
+   `LDG.128`；UMMA smem 操作数要的是 16 字节 canonical K-major interleave（`:24-55`），
+   现 `mxf4_gemm_kernel` 是从 plain 布局在 staging 时现做 swizzle（`:346-358`）。
+   走 MMA 必须旁路 / 关闭 ILV（`w1`/`w3` 合并会破坏"两池可独立寻址"的假设）。
+
+**唯一可实施的重构（与上面原文不同）＝「权重放 M、激活放 N」**：
+现 `mxf4_gemm_kernel` 把**激活**当 A（`a: [rows, k/2]`，M=rows=1）⇒ 128 倍 M 冗余 +
+`grid=(5,1)`，这正是 `STATUS:5038` 的 97.8µs / 16.8 GB/s（0.2% 峰值）的根因。换向后：
+- gate_up：M = 权重行 = 6×640 = **3840**（30 个 M-tile，128 整除），N = 1 token（pad 到 8），K=5120
+- down：M = 5120 = **40 tile/专家 × 6 = 240 CTA**，N = 1（pad 8），K=320
+- 每层权重字节不变（9.83MB / 4.92MB），但**瓶颈不是算力而是每 warp 的 in-flight 字节**：
+  现有 kernel **全程无 `cp.async`**（`:341-358` 是 LDG→STS）。⇒ 换向本身救不了，
+  **必须补多级异步流水**——这才是缺失件，也解释了 0.2% 带宽。
+
+**地板 vs 实测**：gate_up 1.3µs、down 0.65µs / 层 vs 25.3µs / 17.2µs（19-26x）。
+加 cp.async 后**乐观** 4-5x ⇒ MoE 1.47 → ~0.4ms（−1.0ms）。不确定度极高（tcgen05 已负过一次）。
+
+**工作量**：研究级（1-3 周 GPU 迭代）：换向 layout/descriptor、激活侧 e8m0 量化
+（`a_scale` 现为 f32，需 `f_pow2_to_ue8m0` 化）、epilogue（swiglu / 按专家加权累加）、
+ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 求和序仍影响舍入）。
+
+**做法**：先跑单层 microbench（复用 `tests_tcgen05_mxf4.cu` 脚手架 + `gemv_bench.cu` 模式，
+2 分钟），**打不过 25.3µs 就不进集成**——这是本仓库"in-serve 试错每次烧 ~1h"的教训。
+前置：b300-4 驱动解楔 + a32/EARLY/dots→side 等在飞项先验证（a32 若成，"SM 饥饿"前提会变）。
