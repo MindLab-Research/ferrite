@@ -545,6 +545,28 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// w2 L2 PREWARM (DSV41_W2_PREWARM, default ON): pull every slot's w2 rows
+    /// (`dim * (inter/2)` bytes) plus their e8m0 scale rows (`dim * (inter/32)`)
+    /// into L2 with `cp.async.bulk.prefetch.L2.global`, so the down GEMV that
+    /// follows answers from L2 instead of HBM. FIRE-AND-FORGET: writes nothing,
+    /// reads only `ids` (a router output, not the gate/up launch's output) and
+    /// the weight pools, and ALWAYS returns 0 - the bytes it warms are exactly
+    /// the bytes the down launch reads, so it is bit-exact by construction.
+    /// Launch on the same stream, immediately after the gate/up launch: its
+    /// grid rides the gate/up ramp-down under PDL.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_w2_l2_prewarm(
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+        slots: i32,
+        sel_bytes: i64,
+        sc_bytes: i64,
+        stream: CuStream,
+    ) -> i32;
+
     /// Batched SwiGLU: grid.y = slot over `slots` consecutive [2*inter] blocks.
     pub fn dsv41_swiglu_limit_batched(
         gate_up: *mut f32,

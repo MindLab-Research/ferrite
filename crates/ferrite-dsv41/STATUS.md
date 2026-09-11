@@ -7296,3 +7296,19 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **落点：6.23 − 1.31~1.41 = 4.82~4.92ms ≈ 204-208 tok/s ✓ 可达 200！**
 
 **关键依赖**：expert-cpasync-full 的 2x 假设必须兑现（当前 80% issue 停等 → 流水线化后理论大幅改善，但 GLM 侧的 cp.async 中性教训提示隔离/生产差异）
+
+### epilogue-folding 定案：全部候选已完成或否决（2026-09-12 06:30）
+
+**逐条判定**：
+| 候选 | 判定 | 原因 |
+|---|---|---|
+| AR#1 pubred → hc_post | **已完成**（DSV41_HCPOST_EPI 默认 ON） | 列并行折叠，实测中性 |
+| AR#2 pubred → quant | **不成立** | 无 AR→quant 数据边（quant 的输入是 collapse 输出） |
+| hc_post → gemm prologue | **已否决（P1e）** | pubred 仅 20 block，24 行点积压上去 +0.8ms |
+| sparse_attn → wo_a | **净负** | sparse grid=(1,8) 太小，B1 式崩塌（+0.24ms 先例） |
+| rmsnorm_rope → wq_a | **已覆盖** | NR_FUSE + NORM_FUSE + T1 全部已融合 |
+| hc EARLY → 侧流 | **已实现** | EARLY 已在 side stream 头部 |
+
+**唯一现存未启用的 fold**：`DSV41_AR_STORE_FUSE`（默认 OFF，round 19 因数值耦合关闭）——ar-stamp-fold subagent 正在分析其修复可行性。
+
+**结论**：epilogue folding 路径贡献 0 新 ms。剩余路径 = expert cpasync(−0.48) + w2 warm(−0.25) + ar stamp fold(−0.1~0.25) + gemv_bf16(−0.09)。

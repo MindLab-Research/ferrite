@@ -4124,6 +4124,45 @@ fn hc_tail_split() -> bool {
                     // view alias w1's), they are simply not read.
                     ilv as i32,
                 )?;
+                // W2 L2 PREWARM (DSV41_W2_PREWARM, default ON; `=0` disables).
+                //
+                // The down GEMV that follows streams w2 from HBM (286-385 GB/s
+                // against a ~7 TB/s part => LATENCY-bound, not bandwidth-bound)
+                // and nothing earlier in the step touches w2 - the pass just
+                // finished read w1/w3. So we pull every slot's w2 rows into L2
+                // NOW, in the gate/up ramp-down, and the down answers from L2
+                // (~200 ns) instead of HBM (~600 ns). Same-layer only: 8 slots
+                // x dim x (inter/2) = 9.17 MB + 0.57 MB of scale rows is under
+                // 10% of a Blackwell-class L2, while a step's worth (40 x 9.17
+                // MB = 367 MB) obviously is not.
+                //
+                // Placement is the whole trick: AFTER the gate/up launch (so the
+                // gate/up pass's own 18 MB w1/w3 stream cannot evict what we
+                // warmed) and BEFORE the down launch (so the burst lands under
+                // its first microseconds). The entry point is fire-and-forget -
+                // it writes nothing, reads only `ids` (the router's output, not
+                // the gate/up launch's) and the weight pools, and always returns
+                // 0 - so it is bit-identical by construction and can never break
+                // a step. `sel_bytes`/`sc_bytes` are exactly the spans the down
+                // launch below reads (rows = dim, k = inter_local): row `r` sits
+                // at `w2_base + e*w2_stride + r*(inter/2)` and the rows are
+                // contiguous, so the warmed union has no holes and no excess.
+                if ne >= 2 && self.dev.supports_w2_prewarm() {
+                    let kbytes = (inter_local as i64) >> 1;   // packed fp4 bytes per row
+                    let ksc = (inter_local as i64) >> 5;      // e8m0 scales per row
+                    if kbytes > 0 {
+                        self.dev.w2_l2_prewarm(
+                            w2_base,
+                            w2_stride,
+                            w2s_base,
+                            w2s_stride,
+                            self.s.route_idx.ptr as *const i32,
+                            topk as i32,
+                            dim as i64 * kbytes,
+                            dim as i64 * ksc,
+                        )?;
+                    }
+                }
                 // gate_up+swiglu fusion: when the fused path ran (kernel wrote
                 // the swiglu'd inter-width result directly), skip the separate
                 // swiglu launch. The launcher's env-gated `fuse` mirrors this:

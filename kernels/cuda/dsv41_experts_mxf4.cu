@@ -1526,6 +1526,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 // load only exists on the P4 arm - keeping its exact emission
                 // order for the DSV41_GATEUP_PIPELINE=1 A/B.
                 if constexpr (PDEPTH == 1) {
+                    // Recomputed here (not carried from the read block above):
+                    // on the P4 arm it is the same constant-folded predicate, and
+                    // it is `false` for every shape the launcher gives pf == 0.
+                    const bool from_pf = pf_ok && (row == row_base) && (g2 == g_begin);
                     if (!ILV) {
                         const uint2 uw = from_pf
                             ? *reinterpret_cast<const uint2*>(pf_ring + 256 + (size_t)(lane << 3))
@@ -2324,36 +2328,59 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // flight vs 1920) - the recommended shape, which does NOT double the per-CTA
     // s_act+LUT prologue. rows=4 / ksplit=2 additionally gives the 480-CTA shape.
     const int ctas_x = (n_total + warps - 1) / warps;
-    // P4 (DSV41_GATEUP_CPASYNC): the weight-first prologue stages one k-group of
-    // gate+up per warp, so the FUSED launch reserves kGateUpPfBytes per warp on
-    // top of the s_act + LUT [+ s_ks] pool. The kernel's s_pf/s_ks pointers are
-    // derived from this same expression (in the same order) - a mismatch reads or
-    // writes past the allocation. The unfused arm and the down direction launch
-    // with pf=0 and are sized exactly as before.
+    // P4 / P4.2 (DSV41_GATEUP_CPASYNC + DSV41_GATEUP_PIPELINE): the weight
+    // pipeline stages PDEPTH k-groups of gate+up per warp, so the FUSED launch
+    // reserves kGateUpPfBytes*PDEPTH per warp on top of the s_act + LUT [+ s_ks]
+    // pool. The kernel's s_pf/s_ks pointers are derived from this same
+    // expression (in the same order) - a mismatch reads or writes past the
+    // allocation. The unfused arm and the down direction launch with pf=0 and
+    // are sized exactly as before.
     const int pf = (fuse && dsv41_gateup_cpasync()) ? 1 : 0;
-    const size_t smem = (size_t)dim * sizeof(float) + 256 * sizeof(float2) +
-                        (pf ? (size_t)(warps * ksplit) * kGateUpPfBytes : (size_t)0) +
-                        ((ksplit > 1) ? (size_t)(warps * ksplit) * sizeof(float2) : (size_t)0);
+    const int nwarps = warps * ksplit;
+    // PDEPTH is a COMPILE-TIME kernel parameter (cp.async.wait_group takes an
+    // immediate), so the depth is selected here and the matching instantiation
+    // launched below. Clamped down until the request fits the 48 KB DEFAULT
+    // dynamic-smem ceiling: above that a launch fails unless the caller opts in
+    // with cudaFuncSetAttribute, which this launcher deliberately does not do
+    // (the production shape needs 47.2 KB at depth 3; a wider CTA shape falls
+    // back to a smaller depth instead of failing).
+    int pd = pf ? dsv41_gateup_pipeline() : 1;
+    const size_t smem_fixed =
+        (size_t)dim * sizeof(float) + 256 * sizeof(float2) +
+        ((ksplit > 1) ? (size_t)nwarps * sizeof(float2) : (size_t)0);
+    const size_t smem_pf_stride = (size_t)nwarps * kGateUpPfBytes;
+    while (pd > 1 && smem_fixed + smem_pf_stride * (size_t)pd > (size_t)48 * 1024) --pd;
+    const size_t smem = smem_fixed + (pf ? smem_pf_stride * (size_t)pd : (size_t)0);
     dim3 grid((unsigned)ctas_x, (unsigned)slots);
-    const unsigned block_threads = (unsigned)(warps * ksplit * 32);
+    const unsigned block_threads = (unsigned)(nwarps * 32);
     // PDL (see dsv41_experts_pdl_or_plain): the consumer's grid may start during
     // quant_fp4's tail; the kernel's entry cudaGridDependencySynchronize() gates
     // the activation staging. NOTE the full argument list: the cudaLaunchKernelEx
     // path does not apply the kernel's default arguments, so every trailing slot
     // is spelled out.
+    auto gateup_launch = [&](auto kern) -> cudaError_t {
+        return dsv41_experts_pdl_or_plain(kern, grid, dim3(block_threads), smem, stream, nullptr, 0,
+                                          a, a_scale, out, out_slot_stride, n_total, dim, inter, 1,
+                                          limit, nullptr, 0, w1_base, w1_stride, w1s_base, w1s_stride,
+                                          w3_base, w3_stride, w3s_base, w3s_stride, ids,
+                                          g_expert_fp4_mode, fuse, ksplit, pf);
+    };
     cudaError_t le;
-    if (ilv)
-        le = dsv41_experts_pdl_or_plain(
-            expert_gemv_fp4_batched_kernel<true>, grid, dim3(block_threads), smem, stream, nullptr,
-            0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
-            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride,
-            ids, g_expert_fp4_mode, fuse, ksplit, pf);
-    else
-        le = dsv41_experts_pdl_or_plain(
-            expert_gemv_fp4_batched_kernel<false>, grid, dim3(block_threads), smem, stream, nullptr,
-            0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
-            w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride,
-            ids, g_expert_fp4_mode, fuse, ksplit, pf);
+    if (ilv) {
+        if (pd >= 3)
+            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 3>);
+        else if (pd == 2)
+            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 2>);
+        else
+            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 1>);
+    } else {
+        if (pd >= 3)
+            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 3>);
+        else if (pd == 2)
+            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 2>);
+        else
+            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 1>);
+    }
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
@@ -2375,7 +2402,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
     // gate/up call above -- the producer is the gate/up launch that wrote the
     // swiglu'd `act_base`, and the kernel's entry sync gates the staging.
     cudaError_t le = dsv41_experts_pdl_or_plain(
-        expert_gemv_fp4_batched_kernel<false>, grid, dim3(warps * 32),
+        expert_gemv_fp4_batched_kernel<false, 1>, grid, dim3(warps * 32),
         (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
         nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
         w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
@@ -2453,4 +2480,155 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
     }
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
+}
+
+// ============================================================================
+// w2 L2 PREWARM (DSV41_W2_PREWARM, default ON, `=0` disables)
+// ============================================================================
+// WHY. The down GEMV (`expert_gemv_fp4_down_reduce_kernel`) streams w2 straight
+// from HBM: w2 is never touched earlier in the step (the gate/up pass reads
+// w1/w3, not w2), and the down kernel measures 286-385 GB/s against a ~7 TB/s
+// part, i.e. it is LATENCY-bound, not bandwidth-bound. Same argument as the
+// "isolation microbench missed it" note on that kernel: a cache-warm run is a
+// different machine. The fix is therefore not more ILP but a shorter LATENCY,
+// and the only way to shorten it is to have the bytes in L2 before the down
+// kernel asks for them.
+//
+// WHY HERE AND NOT INSIDE THE DOWN KERNEL. An in-kernel `prefetch.global.L2`
+// one slot ahead cannot work: each warp's per-slot arithmetic is ~30 cycles
+// (~20 ns) against a ~600 ns HBM latency, so the "lead" a software pipeline can
+// buy is two orders of magnitude short of the latency it is trying to hide. The
+// fetch has to start OUTSIDE the consumer, in a window where the memory system
+// is otherwise idle: the gate/up tail.
+//
+// WHY NOT INSIDE THE GATEUP KERNEL (the "epilogue prefetch" variant). It would
+// work (the gate/up grid is ONE wave of 320 CTAs at the default shape - 8 rows x
+// 2 ksplit = 512 threads, 4 CTAs/SM x 148 SM = 592 slots - so all of its CTAs do
+// reach their epilogue at roughly the same time) but it means adding five
+// parameters to - and perturbing the schedule of - the most fragile kernel in
+// the tree (it is register-pinned at 48/64 regs and its launch geometry depends
+// on __launch_bounds__; the +38% wave-cliff regression in its history came from
+// exactly this kind of change). A separate entry point costs one launch per
+// layer and keeps the hot kernel's codegen bit-for-bit untouched.
+//
+// WHEN IT RUNS. The grid is launched on the SAME stream right after the gate/up
+// launch, with the same PDL attribute as every other kernel in this file, so its
+// CTAs begin launching as the gate/up CTAs retire - i.e. the prefetch burst is
+// issued in the gate/up ramp-down, which is dead time for the memory system, and
+// completes under the down kernel's first microseconds. The kernel deliberately
+// does NOT call cudaGridDependencySynchronize(): it reads only `ids` (a router
+// output several kernels upstream) and the w2 pools (weights), never anything
+// the gate/up launch wrote, so it is legal for it to race the producer.
+//
+// HOW MUCH. One layer's down reads w2 for `slots` experts: `slots` x dim x
+// (inter/2) bytes (8 x 7168 x 160 = 9.17 MB at the production shape) plus the
+// e8m0 scale rows (8 x 7168 x 10 = 0.57 MB). Against a Blackwell-class L2
+// (~120 MB) that is under 10%, so the burst survives until the down consumes
+// it; against the fp4 model's per-STEP w2 traffic (40 layers x 9.17 MB = 367 MB)
+// it obviously does not, which is why this is strictly a same-layer trick.
+//
+// BIT-EXACTNESS. The kernel issues L2 prefetch hints and writes nothing. It
+// changes no pointer, no order, no arithmetic - only which level of the memory
+// hierarchy answers the down kernel's subsequent loads. The prefetch region is
+// EXACTLY the region the down kernel reads: the down GEMV's row `r` lives at
+// `w2_base + e*w2_stride + r*kbytes`, rows are walked contiguously 0..dim-1, so
+// the union over r is [e*w2_stride, e*w2_stride + dim*kbytes) with no holes.
+//
+// COST. One launch per layer (a 32-thread CTA per 16 KB chunk) issuing one
+// `cp.async.bulk.prefetch.L2.global` each; no shared memory, no registers to
+// speak of, no completion wait. It adds no HBM traffic at all - it moves bytes
+// that the down kernel would fetch anyway.
+constexpr int kW2PfChunk = 16384;   // bytes per cp.async.bulk.prefetch
+
+// cp.async.bulk.prefetch.L2.global [srcMem], size;  (PTX, sm_90+)
+// `size` must be a multiple of 16 and `srcMem` 16-byte aligned - both hold by
+// construction for these pools (per-expert strides are 512-byte-aligned tensor
+// allocations and every span used here is a multiple of 16), and the callers
+// round defensively anyway. Pre-sm_90 (never built in production: this TU is
+// sm_100a/sm_103a only) it compiles to nothing.
+__device__ __forceinline__ void dsv41_w2_pf_bulk(const void* gmem, unsigned bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(gmem), "r"(bytes));
+#else
+    (void)gmem; (void)bytes;
+#endif
+}
+
+// Line fallback for a chunk whose base is not 16-byte aligned (never taken for
+// the fp4 expert pools; exists so a future misaligned pool degrades to hints
+// instead of a fault - the same defensive rule the P4 cp.async prologue uses).
+__device__ __forceinline__ void dsv41_w2_pf_line(const void* gmem) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(gmem));
+#else
+    (void)gmem;
+#endif
+}
+
+// grid = (slots, nchunks); ONE 32-thread CTA per (slot, 16 KB chunk). Only
+// threadIdx.x == 0 issues - the prefetch is a memory-system operation on a
+// region, not a per-thread load, and 32 identical issues would be 32x the TMA
+// work for the same bytes.
+__global__ void w2_l2_prewarm_kernel(const uint8_t* __restrict__ w2_base, long w2_stride,
+                                     const uint8_t* __restrict__ w2s_base, long w2s_stride,
+                                     const int* __restrict__ ids, long sel_bytes, long sc_bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    if (threadIdx.x != 0) return;
+    const int nsel = (int)((sel_bytes + kW2PfChunk - 1) / kW2PfChunk);
+    const int nsc = (sc_bytes > 0) ? (int)((sc_bytes + kW2PfChunk - 1) / kW2PfChunk) : 0;
+    const int j = (int)blockIdx.y;
+    if (j >= nsel + nsc) return;
+    // ids[slot] is the SAME value the down kernel resolves (`blockIdx.y` there is
+    // the slot as well), so the warm set and the consumed set are identical.
+    const size_t e = (size_t)ids[blockIdx.x];
+    const uint8_t* p;
+    long span;
+    if (j < nsel) {
+        p = w2_base + e * (size_t)w2_stride + (size_t)j * kW2PfChunk;
+        span = sel_bytes - (long)j * kW2PfChunk;
+    } else {
+        p = w2s_base + e * (size_t)w2s_stride + (size_t)(j - nsel) * kW2PfChunk;
+        span = sc_bytes - (long)(j - nsel) * kW2PfChunk;
+    }
+    unsigned n = (unsigned)(span < (long)kW2PfChunk ? span : (long)kW2PfChunk);
+    if ((((uintptr_t)p) & 15u) == 0) {
+        n &= ~15u;                 // documented size rule: a multiple of 16
+        if (n != 0) dsv41_w2_pf_bulk(p, n);
+    } else {
+        for (unsigned o = 0; o < n; o += 128) dsv41_w2_pf_line(p + o);
+    }
+#endif
+}
+
+// Fire-and-forget. NEVER fails the step: a launch error is swallowed (the down
+// kernel that follows is the correctness path, this is a hint).
+//
+// `sel_bytes` = dim * (inter / 2), `sc_bytes` = dim * (inter / 32) -- the exact
+// spans the caller's down launch reads (rows = dim, k = inter). Both are plain
+// byte counts so this entry point does not have to know the direction's
+// (rows, k) convention.
+extern "C" int dsv41_w2_l2_prewarm(const uint8_t* w2_base, long w2_stride,
+                                   const uint8_t* w2s_base, long w2s_stride,
+                                   const int* ids, int slots, long sel_bytes, long sc_bytes,
+                                   cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* e = getenv("DSV41_W2_PREWARM");
+        return (e != nullptr && e[0] == '0') ? 0 : 1;   // default ON, `=0` disables
+    }();
+    if (!enabled || w2_base == nullptr || w2s_base == nullptr || ids == nullptr) return 0;
+    if (slots <= 0 || sel_bytes <= 0) return 0;
+    const int nsel = (int)((sel_bytes + kW2PfChunk - 1) / kW2PfChunk);
+    const int nsc = (sc_bytes > 0) ? (int)((sc_bytes + kW2PfChunk - 1) / kW2PfChunk) : 0;
+    dim3 grid((unsigned)slots, (unsigned)(nsel + nsc));
+    cudaError_t le = dsv41_experts_pdl_or_plain(w2_l2_prewarm_kernel, grid, dim3(32), 0, stream,
+                                                w2_base, w2_stride, w2s_base, w2s_stride, ids,
+                                                sel_bytes, sc_bytes);
+    if (le != cudaSuccess) {
+        // Best effort. A stale driver / an unsupported arch keeps the old timing,
+        // and the sticky error is cleared so the next real launch is not poisoned.
+        (void)cudaGetLastError();
+        return 0;
+    }
+    (void)cudaGetLastError();
+    return 0;
 }

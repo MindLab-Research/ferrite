@@ -439,6 +439,13 @@ struct Kernels {
         ) -> c_int,
     >,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    /// w2 L2 prewarm (DSV41_W2_PREWARM): `cp.async.bulk.prefetch.L2.global` over
+    /// every slot's w2 + scale rows, launched between the gate/up and the down
+    /// launch. Writes nothing; returns 0 always (best effort).
+    w2_l2_prewarm: Option<
+        unsafe extern "C" fn(*const u8, i64, *const u8, i64, *const c_int, c_int, i64, i64, CuStream)
+            -> c_int,
+    >,
     swiglu_limit_batched:
         Option<unsafe extern "C" fn(*mut f32, c_int, c_int, f32, i64, c_int, CuStream) -> c_int>,
     ar_reduce: Option<
@@ -742,6 +749,7 @@ impl Device {
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
             expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
+            w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
@@ -1065,6 +1073,13 @@ impl Device {
     /// DSV41_DOWN_FUSE inert and the (batched down, moe_down_reduce) pair runs.
     pub fn supports_down_fuse(&self) -> bool {
         self.kernels.expert_down_reduce_fp4_batched.is_some()
+    }
+
+    /// True when the loaded .so carries the w2 L2 prewarm entry point
+    /// (`dsv41_w2_l2_prewarm`). A stale .so keeps DSV41_W2_PREWARM inert and the
+    /// down GEMV streams w2 from HBM exactly as before.
+    pub fn supports_w2_prewarm(&self) -> bool {
+        self.kernels.w2_l2_prewarm.is_some()
     }
 
     /// True when the loaded .so carries the ADD_EPI (residual-in-store) all-reduce
@@ -3284,6 +3299,47 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_expert_down_reduce_fp4_batched")
+    }
+
+    /// w2 L2 PREWARM (DSV41_W2_PREWARM, default ON): warm every slot's w2 rows
+    /// (`sel_bytes` = dim * (inter/2)) plus their e8m0 scale rows
+    /// (`sc_bytes` = dim * (inter/32)) into L2 so the down GEMV that follows is
+    /// an L2 hit instead of a ~600 ns HBM round trip. The kernel is
+    /// fire-and-forget (writes nothing, returns 0), so this never fails a step
+    /// and the caller can issue it unconditionally.
+    ///
+    /// MUST be issued on the same stream immediately AFTER the batched gate/up
+    /// launch and BEFORE the down launch: the region it warms is exactly what
+    /// the down launch reads (`w2_base + ids[slot]*w2_stride + row*(inter/2)`,
+    /// rows 0..dim-1 contiguous), and the gate/up tail is the window where the
+    /// memory system is otherwise idle. Issue it earlier and the gate/up pass's
+    /// own w1/w3 stream evicts what it warmed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn w2_l2_prewarm(
+        &self,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+        slots: i32,
+        sel_bytes: i64,
+        sc_bytes: i64,
+    ) -> Result<()> {
+        let Some(f) = self.kernels.w2_l2_prewarm else {
+            return Ok(());   // stale .so: no prewarm, old timing
+        };
+        // Return value is always 0 and the entry point swallows its own launch
+        // error (best effort: the down launch that follows is the correctness
+        // path). Not routed through `kerr` on purpose - a hint must never fail
+        // the step.
+        let _ = unsafe {
+            f(
+                w2_base, w2_stride, w2s_base, w2s_stride, ids, slots, sel_bytes, sc_bytes,
+                self.stream,
+            )
+        };
+        Ok(())
     }
 
     /// Batched swiglu: grid.y = slot over `slots` consecutive [2*inter] blocks.
