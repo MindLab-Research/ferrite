@@ -1513,11 +1513,16 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // where the fused K-loop is the verbatim copy of the single-row one.
     static const int g_fuse = [] {
         const char* e = getenv("DSV41_GATEUP_FUSE");
-        // DEFAULT OFF, mirroring the Rust side (chain_dev.rs:
-        // `DSV41_GATEUP_FUSE` .map(|v| v != "0").unwrap_or(false)). Both sides
-        // MUST agree: the kernel's `fuse` decision changes the act slot layout
-        // (inter vs 2*inter) and whether the host runs a separate swiglu pass.
-        // A mismatch silently corrupts the activations (round-18 bug).
+        // DEFAULT ON on BOTH sides: chain_dev.rs `gateup_fuse()` is
+        // `DSV41_GATEUP_FUSE` .map(|v| v != "0").unwrap_or(true), i.e. unset or
+        // any value other than "0" fuses. (This comment said "DEFAULT OFF /
+        // .unwrap_or(false)" until 2026-09-11, which did not match the Rust
+        // code.) Both sides MUST agree: the kernel's `fuse` decision changes the
+        // act slot layout (inter vs 2*inter) and whether the host runs a
+        // separate swiglu pass. A mismatch silently corrupts the activations
+        // (round-18 bug), and an interleaved pool (DSV41_EXPERT_ILV) makes the
+        // mismatch a hard cudaErrorInvalidValue instead - see the `ilv && !fuse`
+        // guard below.
         if (e == nullptr) return 1;
         return atoi(e) != 0 ? 1 : 0;
     }();

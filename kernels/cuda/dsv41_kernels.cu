@@ -1247,6 +1247,325 @@ __global__ void apply_rope_kernel(float* __restrict__ x, const float* __restrict
     }
 }
 
+// ---------------------------------------------------------------------------
+// P1 (DSV41_SPARSE_OROPE, DEFAULT ON): sparse attention + the inverse o-rope +
+// the fp8 emission of the roped attention output, in ONE launch.
+//
+// WHY THIS IS A GEOMETRY-PRESERVING FUSION (and not a new shape): the two
+// kernels it replaces own EXACTLY the same block. `sparse_attn_pf_kernel`
+// (grid=(b*m,h), block=128) and the o-rope call shape of `apply_rope_kernel`
+// (`dsv41_apply_rope_q`, rows=nlh, row_len=hd, block=128) both give one block
+// per (row, head) covering the whole d-wide head row. `d` (== hd) is a multiple
+// of 32, so the fp8 emission's per-32-block index is aligned at every head
+// boundary and the head-local pass emits the SAME bytes as the flat
+// `dsv41_quant_fp8` pass it replaces. Nothing about the arithmetic moves.
+//
+// Phase 1 is `sparse_attn_pf_kernel`'s body verbatim; the ONLY change is that
+// the normalised o row lands in shared memory instead of global (no global
+// store + reload round trip). Phase 2 is `apply_rope_kernel:1218-1224` verbatim
+// on the trailing `rope_rd` columns of that shared row. Phase 3 is the fp8
+// epilogue at `apply_rope_kernel:1230-1246` verbatim, indexed
+// `(row*h+hh)*d + c` for the byte and `((row*h+hh)*d)/32 + b` for the scale.
+// Two extra block barriers make the two shared-memory hand-offs visible; both
+// are intra-block, on a kernel that is latency-, not launch-, bound.
+//
+// SHARED-MEMORY BUDGET: the o row is ONE head (d f32 = 2 KB at d=512), not the
+// whole (nlh x hd) region - a block owns a single head. Total static smem is
+// 8448 B (sh_smax/sh_se/sh_acc, unchanged) + 2048 B (sh_row) ~= 10.5 KB, well
+// inside the 48 KB default. No cudaFuncSetAttribute opt-in is required.
+//
+// The caller skips BOTH the standalone `apply_rope_q` and the `quant1` launch
+// when this takes. `dsv41_sparse_attn_orope` DECLINES (returns 1) unless the
+// plain call would have selected `sparse_attn_pf_kernel` and the emission shape
+// is exact (d <= 512, d % 32 == 0, 0 < rope_rd <= d, rope_rd even); the caller
+// then runs the old three-launch sequence, bit-identical by construction.
+__global__ void sparse_attn_orope_kernel(
+    const float* __restrict__ q, const float* __restrict__ kv,
+    const float* __restrict__ sink, const int32_t* __restrict__ idxs,
+    float* __restrict__ out, int b, int m, int h, int d,
+    const int* __restrict__ clen, int window, int index_topk, float scale,
+    const float* __restrict__ cos, const float* __restrict__ sin,
+    const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step,
+    int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc) {
+    const int n = window + *clen;
+    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+    const int row = blockIdx.x;
+    if (row >= b * m) return;
+    const int bb = row / m, mm = row % m;
+    const int32_t* irow = idxs + (size_t)(bb * m + mm) * topk;
+    // ---- the one addition to the phase-1 footprint: the o row, in smem ----
+    // d <= 512 (kMaxPerW * 32) is guaranteed by the launcher.
+    __shared__ float sh_row[512];
+    for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
+        const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
+        const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+        const int nwarp = (int)blockDim.x >> 5;
+        // Stage the q row once: kills the per-slot re-read of qr (16 floats/lane).
+        float qv[kMaxPerW];
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) qv[i] = 0.f;
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) qv[i] = qr[c];
+        }
+        float my_acc[kMaxPerW];
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
+        float my_smax = -1e30f, my_se = 0.f;
+        // Three kv-row buffers, rotating by slot; kBase is the row base.
+        float kb0[kMaxPerW], kb1[kMaxPerW], kb2[kMaxPerW];
+        const size_t kBase = (size_t)bb * n * d;
+        // Prologue: fire the idx loads for the first three slots, then their rows.
+        int t = wid;
+        int ia = (t < topk) ? irow[t] : -1;
+        int ib = (t + nwarp < topk) ? irow[t + nwarp] : -1;
+        int ic = (t + 2 * nwarp < topk) ? irow[t + 2 * nwarp] : -1;
+        if (ia >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb0[i] = kv[kBase + (size_t)ia * d + c];
+            }
+        }
+        if (ib >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb1[i] = kv[kBase + (size_t)ib * d + c];
+            }
+        }
+        if (ic >= 0) {
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) kb2[i] = kv[kBase + (size_t)ic * d + c];
+            }
+        }
+        // Main loop: three slots per pass. Slot t lives in kb0, t+nwarp in kb1,
+        // t+2*nwarp in kb2; each buffer's next row load is fired right after
+        // that buffer's compute, so every row has two compute phases of
+        // distance. The three next-slot indices are hoisted to the loop top
+        // (loads have no side effects - pure earlier issue).
+        for (; t + 2 * nwarp < topk; t += 3 * nwarp) {
+            const int td = t + 3 * nwarp;   // next slot destined for kb0
+            const int te = td + nwarp;      // next slot destined for kb1
+            const int tf = te + nwarp;      // next slot destined for kb2
+            const int id = (td < topk) ? irow[td] : -1;
+            const int ie = (te < topk) ? irow[te] : -1;
+            const int iff = (tf < topk) ? irow[tf] : -1;
+            if (ia >= 0) {
+                float dot = 0.f;
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) dot += qv[i] * kb0[i];
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+                dot *= scale;
+                const float nm = fmaxf(my_smax, dot);
+                const float corr = expf(my_smax - nm);
+                const float e = expf(dot - nm);
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+                }
+                my_se = my_se * corr + e;
+                my_smax = nm;
+            }
+            // kb0 is dead now: fire the row load for slot td into it.
+            if (id >= 0) {
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) kb0[i] = kv[kBase + (size_t)id * d + c];
+                }
+            }
+            if (ib >= 0) {
+                float dot = 0.f;
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) dot += qv[i] * kb1[i];
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+                dot *= scale;
+                const float nm = fmaxf(my_smax, dot);
+                const float corr = expf(my_smax - nm);
+                const float e = expf(dot - nm);
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+                }
+                my_se = my_se * corr + e;
+                my_smax = nm;
+            }
+            // kb1 is dead now: fire the row load for slot te into it.
+            if (ie >= 0) {
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) kb1[i] = kv[kBase + (size_t)ie * d + c];
+                }
+            }
+            if (ic >= 0) {
+                float dot = 0.f;
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) dot += qv[i] * kb2[i];
+                }
+                for (int off = 16; off > 0; off >>= 1)
+                    dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+                dot *= scale;
+                const float nm = fmaxf(my_smax, dot);
+                const float corr = expf(my_smax - nm);
+                const float e = expf(dot - nm);
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) my_acc[i] = my_acc[i] * corr + e * kb2[i];
+                }
+                my_se = my_se * corr + e;
+                my_smax = nm;
+            }
+            // kb2 is dead now: fire the row load for slot tf into it.
+            if (iff >= 0) {
+#pragma unroll
+                for (int i = 0; i < kMaxPerW; ++i) {
+                    const int c = lane + i * 32;
+                    if (c < d) kb2[i] = kv[kBase + (size_t)iff * d + c];
+                }
+            }
+            ia = id;
+            ib = ie;
+            ic = iff;
+        }
+        // Tail: at most two slots left (rows for t and t+nwarp in kb0/kb1; the
+        // kb2 slot is necessarily past topk or the loop would have continued).
+        if (t < topk && ia >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb0[i];
+            }
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb0[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        if (t + nwarp < topk && ib >= 0) {
+            float dot = 0.f;
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) dot += qv[i] * kb1[i];
+            }
+            for (int off = 16; off > 0; off >>= 1) dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+            dot *= scale;
+            const float nm = fmaxf(my_smax, dot);
+            const float corr = expf(my_smax - nm);
+            const float e = expf(dot - nm);
+#pragma unroll
+            for (int i = 0; i < kMaxPerW; ++i) {
+                const int c = lane + i * 32;
+                if (c < d) my_acc[i] = my_acc[i] * corr + e * kb1[i];
+            }
+            my_se = my_se * corr + e;
+            my_smax = nm;
+        }
+        // ---- same warp-merge epilogue as the plain warp version ----
+        __shared__ float sh_smax[32], sh_se[32];
+        __shared__ float sh_acc[4][512];
+        if (lane == 0) {
+            sh_smax[wid] = my_smax;
+            sh_se[wid] = my_se;
+        }
+#pragma unroll
+        for (int i = 0; i < kMaxPerW; ++i) {
+            const int c = lane + i * 32;
+            if (c < d) sh_acc[wid][c] = my_acc[i];
+        }
+        __syncthreads();
+        float smax = -1e30f;
+        for (int w = 0; w < nwarp; ++w) smax = fmaxf(smax, sh_smax[w]);
+        float wsc[4];
+        for (int w = 0; w < nwarp && w < 4; ++w) wsc[w] = expf(sh_smax[w] - smax);
+        float se = 0.f;
+        for (int w = 0; w < nwarp; ++w) se += sh_se[w] * wsc[w < 4 ? w : 0];
+        se += expf(sink[hh] - smax);
+        // PHASE 1 OUTPUT: the normalised o row goes to smem, NOT to global.
+        // The value written here is `sparse_attn_pf_kernel`'s `orow[c]` value
+        // verbatim; the global store is deferred to phase 3 so that it carries
+        // the ROTATED value directly (the two-launch path rotated `s.o` in
+        // place right after this store, so the final global state is identical
+        // and no intermediate un-roped value is ever observable).
+        for (int c = threadIdx.x; c < d; c += blockDim.x) {
+            float a = 0.f;
+            for (int w = 0; w < nwarp && w < 4; ++w) a += sh_acc[w][c] * wsc[w];
+            sh_row[c] = (se > 0.f) ? a / se : 0.f;
+        }
+        __syncthreads();   // NEW #1: sh_row complete before the rope reads it
+        // PHASE 2: inverse rope on the trailing `rope_rd` columns of this head's
+        // row - `apply_rope_kernel:1218-1224` verbatim, with `row` = the head
+        // row's rope base inside sh_row and `t` the per-call position.
+        {
+            const int tt = (*base) * mul + off + hh * step;
+            float* rrow = sh_row + (d - rope_rd);
+            for (int i = threadIdx.x; i < half; i += blockDim.x) {
+                const float cc = cos[(size_t)tt * half + i];
+                const float ss = sin[(size_t)tt * half + i] * (inverse ? -1.f : 1.f);
+                const float x0 = rrow[2 * i], x1 = rrow[2 * i + 1];
+                rrow[2 * i] = x0 * cc - x1 * ss;
+                rrow[2 * i + 1] = x0 * ss + x1 * cc;
+            }
+        }
+        __syncthreads();   // NEW #2: rope writes visible before the store + quant
+        // PHASE 3: global store of the roped row, then the fp8 emission over
+        // this head's d columns - `apply_rope_kernel:1230-1246` verbatim. `d`
+        // is a multiple of 32 (launcher-guarded) so a warp's 32 lanes cover
+        // exactly one 32-element block and the flat block index is
+        // `((row*h+hh)*d)/32 + b`.
+        {
+            float* orow = out + ((size_t)(bb * m + mm) * h + hh) * d;
+            for (int c = threadIdx.x; c < d; c += blockDim.x) orow[c] = sh_row[c];
+            if (xq != nullptr) {
+                const size_t xbase = ((size_t)(bb * m + mm) * h + hh) * (size_t)d;
+                const size_t sbase = xbase >> 5;   // d % 32 == 0
+                const int nb = d >> 5;
+                const int gwarp = threadIdx.x >> 5;
+                const int nw = (int)blockDim.x >> 5;
+                for (int blk = gwarp; blk < nb; blk += nw) {
+                    const int c = blk * 32 + lane;
+                    const float v = sh_row[c];
+                    float a = fabsf(v);
+                    for (int off2 = 16; off2 > 0; off2 >>= 1)
+                        a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off2));
+                    const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+                    if (lane == 0) xsc[sbase + blk] = sc;
+                    const float qv8 = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+                    const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qv8);
+                    xq[xbase + c] = *(const uint8_t*)&f8;
+                }
+            }
+        }
+        __syncthreads();   // sh_* (and sh_row) reuse safety across the hh loop
+    }
+}
+
 // the norm writes the trailing rope section, the rope rotates it in place).
 // The reduction tree is rmsnorm_kernel's verbatim at the same blockDim, and the
 // rope half is elementwise - both are bit-identical to the two-launch sequence,
@@ -3276,6 +3595,65 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
     } else {
         sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale);
     }
+    return (int)cudaGetLastError();
+}
+
+// P1 (DSV41_SPARSE_OROPE): sparse_attn + inverse o-rope + fp8 emission, one
+// launch. Returns 0 on success. Returns 1 - the DECLINE sentinel - when the
+// fused shape cannot carry this call, and the caller runs the old
+// `dsv41_sparse_attn` + `dsv41_apply_rope_q` (+ `quant1`) sequence, which this
+// is bit-identical to. (Sentinels 2/3 are also declInes, distinguished only for
+// logs: 2 = the plain call would not have picked `sparse_attn_pf_kernel` at all,
+// 3 = the emission shape is not exact. All three mean "fall back".)
+//
+// WHY DECLINE ON 2: the fused body IS `sparse_attn_pf_kernel`'s body. If the
+// plain launcher would have taken the key-split or the sequential path, the
+// fused shape does not apply - falling back keeps the two paths' outputs
+// identical by construction rather than by argument.
+//
+// ⚠️ Declines are > 1 on purpose: 1 collides with cudaErrorInvalidValue, and the
+// trailing cudaGetLastError() can also yield 1 (the legacy `apply_rope_q`
+// sentinel-1 trap documented at `dsv41_apply_rope_q`). The Rust side reads
+// rc <= 3 as "decline, fall back" only for the sentinels it knows; anything
+// else is a real launch error.
+extern "C" int dsv41_sparse_attn_orope(
+    const float* q, const float* kv, const float* sink, const int32_t* idxs, float* out, int b,
+    int m, int h, int d, const int* clen, int window, int index_topk, float scale,
+    const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
+    int step, int inverse, uint8_t* xq, float* xsc, cudaStream_t s) {
+    if (b <= 0 || m <= 0 || h <= 0 || d <= 0) return 1;
+    if (d > 512) return 1;              // accumulator is d-wide per thread group
+    if ((d & 31) != 0) return 1;        // fp8 per-32-block index must stay head-local
+    if (rope_rd <= 0 || rope_rd > d || (rope_rd & 1) != 0) return 1;
+    if (half != rope_rd / 2) return 1;
+    if (cos == nullptr || sin == nullptr || base == nullptr) return 1;
+    if (xq == nullptr || xsc == nullptr) return 1;
+    // Same selection the plain launcher makes (mirrored statics: the env is read
+    // once per process either way, and they must agree or the fallback fires).
+    static const bool seq = [] { return getenv("DSV41_ATTN_SEQ") != nullptr; }();
+    static const int g_attn_pf_split = [] {
+        const char* e = getenv("DSV41_ATTN_PF_SPLIT");
+        if (e == nullptr) return kAttnPfSplitDefault;
+        const int v = atoi(e);
+        if (v == 0) return 0;
+        return (v >= 1 && v <= kAttnMaxC) ? v : kAttnPfSplitDefault;
+    }();
+    static const int g_attn_split = [] {
+        const char* e = getenv("DSV41_ATTN_SPLIT");
+        if (e == nullptr) return 0;
+        return atoi(e);
+    }();
+    static const bool pf_off = [] {
+        const char* e = getenv("DSV41_ATTN_PF");
+        return e != nullptr && atoi(e) == 0;
+    }();
+    const int split_c = (g_attn_split > 0) ? g_attn_split : g_attn_pf_split;
+    if (seq) return 2;
+    if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM && h <= kAttnMaxH) return 2;
+    if (pf_off) return 2;
+    sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
+        q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
+        rope_rd, half, mul, off, step, inverse, xq, xsc);
     return (int)cudaGetLastError();
 }
 

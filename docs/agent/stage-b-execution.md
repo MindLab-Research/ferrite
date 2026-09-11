@@ -45,6 +45,11 @@
 
 交错规则：`dst[16i..16i+8) = gate[8i..8i+8)`，`dst[16i+8..16i+16) = up[8i..8i+8)`。scale 保持分离（kernel 本来就分开读 gate/up scale）。kernel 侧 gate 字节在 `row*2*kbytes + 2*q`，up 在 `+8`（`q = (g2<<8)+(lane<<3)`，`2*q` 天然 16B 对齐 ⇒ LDG.128 合法）。**纯置换**：同样的字节、同样的 e2m1 解码、同样的 g/u 双 fma 链 ⇒ 位级安全，变的只是 load 指令数。
 
+**布局契约（2026-09-11 逐位核对通过，改任何一侧前先看这里）**：
+- 置换核是**整张量扁平**置换（`n8 = bytes>>3` 个 8B granule），kernel 却按**行内** `2q` 寻址——两者等价的**充要条件是 `kbytes % 8 == 0`**（每行占整数个 granule）。loader 用 `local[1]*dtype_size % 8 == 0` + `w1b % 8 == 0` 保证它，`dim%512==0` 使它自动成立；不满足则 `ilv=false` 退回平面布局。
+- LDG.128 需要 `pool_base + e*block + row*2*kbytes + 2q` **16B 对齐**：`2*kbytes = dim`、`2q` 都是 16 的倍数，剩下靠 `block % 16 == 0`（`2*w1b=rows*dim`、`w1s=rows*dim/32`、`w2=dim*cols`、`w2s=dim*cols` 在 `dim%512==0` 下都是 16 的倍数）。旧注释只声称 8B，**实际要求是 16B**。
+- 交错前的两端源都是从 `tmp` scratch 拷入的 8B 对齐指针（`w1b%8==0` 保证 `tmp+w1b` 对齐）；`dst`=池基址+`e*block` 同理。
+
 **改动点**：
 - `kernels/cuda/dsv41_experts_mxf4.cu`：`expert_gemv_fp4_batched_kernel` 变 `template <bool ILV>`（融合分支一次 uint4 取 4 word；`ILV=false` 实例代码与原来同源）；新增 `dsv41_interleave_gateup_fp4`（加载期置换核，device-to-device）；`dsv41_expert_gate_up_fp4_batched` 增尾参 `int ilv`，`ilv && !fuse` 直接返回错误。
 - `crates/ferrite-models/src/dsv41/load.rs`：`load_expert_pool(..., ilv)` 重排偏移 + 临时 scratch（一次 zero，padding 行保持 0）+ 逐 expert 调置换核；`ilv_ok()` 汇总所有加载期前提（MOE_BATCH/GATEUP_FUSE 未关、`DSV41_NO_GEMV_FP4` 未设、mode==2、`dim%512==0`、.so 三个符号齐备）；`LayerDev.experts_ilv` 记录实际布局。
