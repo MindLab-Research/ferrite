@@ -697,9 +697,6 @@ static const int g_expert_fp4_mode = [] {
     return atoi(e);                   // 0 scalar, 1 vectorised (both kept for bisection)
 }();
 
-// smem float count for the padded activation; rounded up to even so the
-// float2 LUT that follows stays 8-byte aligned.
-#define SACT_SLOTS(k) ((((size_t)(k) + ((size_t)(k) >> 4) + 1) + 1) & ~(size_t)1)
 
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
                                                const uint8_t* __restrict__ a,
@@ -725,23 +722,25 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     const uint8_t* bhs_use = bhs_base + e * (size_t)bhs_stride;
     // Same activation staging as the sequential kernel: the ONE shared quantised
     // row for gate/up, the slot's own f32 swiglu slice for down.
-    // Padded activation: index x -> x + (x>>4), one hole per 16 floats. The vec==2
-    // lane stride is (lane<<4), so its word address was 16*lane+c and only ever hit
-    // banks {0,16} (16-way conflict). Now it is 17*lane+c, and 17 is coprime with 32.
-    extern __shared__ float s_act_raw[];   // SACT_SLOTS(k) floats
-#define SACT(x) (s_act_raw[(x) + ((x) >> 4)])
+    // NOTE: the padded layout (one hole per 16 floats) was tried and REVERTED -
+    // it removed a 16-way s_act bank conflict, but the conflicts were worth only
+    // ~1 percent of the kernel (the same measurement the gemv LUT work made:
+    // distinct-banks already at the uniform-random ceiling) while the extra
+    // address ALU (x + (x>>4)) sat on the consume chain's critical path and cost
+    // +0.24ms/step in serve. Plain linear staging is the correct form.
+    extern __shared__ float s_act[];   // k floats
     // 256-entry byte->float2 table: one LDS.64 yields both nibbles' e2m1 values
     // (the old 16-entry scalar table needed two LDS.32 plus a shift per value).
-    float2* s_lut2 = reinterpret_cast<float2*>(s_act_raw + SACT_SLOTS(k));
+    float2* s_lut2 = reinterpret_cast<float2*>(s_act + k);
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
     for (int j = threadIdx.x; j < k; j += blockDim.x) {
         if (act != nullptr) {
-            SACT(j) = act[j];
+            s_act[j] = act[j];
         } else {
             const uint8_t ab = a[j >> 1];
             const float asc = a_scale[j >> 5];
-            SACT(j) = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
+            s_act[j] = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
         }
     }
     if (threadIdx.x < 256)
@@ -796,26 +795,26 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float2 t1 = s_lut2[(w0 >> 8) & 0xFFu];
                 const float2 t2 = s_lut2[(w0 >> 16) & 0xFFu];
                 const float2 t3 = s_lut2[(w0 >> 24) & 0xFFu];
-                p0 = fmaf(SACT(j + 0), t0.x, p0);
-                p1 = fmaf(SACT(j + 1), t0.y, p1);
-                p2 = fmaf(SACT(j + 2), t1.x, p2);
-                p3 = fmaf(SACT(j + 3), t1.y, p3);
-                p0 = fmaf(SACT(j + 4), t2.x, p0);
-                p1 = fmaf(SACT(j + 5), t2.y, p1);
-                p2 = fmaf(SACT(j + 6), t3.x, p2);
-                p3 = fmaf(SACT(j + 7), t3.y, p3);
+                p0 = fmaf(s_act(j + 0), t0.x, p0);
+                p1 = fmaf(s_act(j + 1), t0.y, p1);
+                p2 = fmaf(s_act(j + 2), t1.x, p2);
+                p3 = fmaf(s_act(j + 3), t1.y, p3);
+                p0 = fmaf(s_act(j + 4), t2.x, p0);
+                p1 = fmaf(s_act(j + 5), t2.y, p1);
+                p2 = fmaf(s_act(j + 6), t3.x, p2);
+                p3 = fmaf(s_act(j + 7), t3.y, p3);
                 const float2 u0 = s_lut2[w1 & 0xFFu];
                 const float2 u1 = s_lut2[(w1 >> 8) & 0xFFu];
                 const float2 u2 = s_lut2[(w1 >> 16) & 0xFFu];
                 const float2 u3 = s_lut2[(w1 >> 24) & 0xFFu];
-                p0 = fmaf(SACT(j + 8), u0.x, p0);
-                p1 = fmaf(SACT(j + 9), u0.y, p1);
-                p2 = fmaf(SACT(j + 10), u1.x, p2);
-                p3 = fmaf(SACT(j + 11), u1.y, p3);
-                p0 = fmaf(SACT(j + 12), u2.x, p0);
-                p1 = fmaf(SACT(j + 13), u2.y, p1);
-                p2 = fmaf(SACT(j + 14), u3.x, p2);
-                p3 = fmaf(SACT(j + 15), u3.y, p3);
+                p0 = fmaf(s_act(j + 8), u0.x, p0);
+                p1 = fmaf(s_act(j + 9), u0.y, p1);
+                p2 = fmaf(s_act(j + 10), u1.x, p2);
+                p3 = fmaf(s_act(j + 11), u1.y, p3);
+                p0 = fmaf(s_act(j + 12), u2.x, p0);
+                p1 = fmaf(s_act(j + 13), u2.y, p1);
+                p2 = fmaf(s_act(j + 14), u3.x, p2);
+                p3 = fmaf(s_act(j + 15), u3.y, p3);
                 a0 = fmaf(sc, p0, a0);
                 a1 = fmaf(sc, p1, a1);
                 a2 = fmaf(sc, p2, a2);
@@ -826,8 +825,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const uint8_t byte = brow[j >> 1];
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const float2 t = s_lut2[byte];
-                acc += SACT(j) * (t.x * sc);
-                acc += SACT(j + 1) * (t.y * sc);
+                acc += s_act(j) * (t.x * sc);
+                acc += s_act(j + 1) * (t.y * sc);
             }
         } else if (vec) {
             // 32 lanes * 8 values = 256 values per iteration, four scale blocks.
@@ -838,20 +837,20 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 // 256 packed values are 128 bytes, so group g starts at g*128, not g*64.
             const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 7) + off);
-                acc += SACT(j + 0) * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
-                acc += SACT(j + 1) * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
-                acc += SACT(j + 2) * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
-                acc += SACT(j + 3) * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
-                acc += SACT(j + 4) * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
-                acc += SACT(j + 5) * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
-                acc += SACT(j + 6) * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
-                acc += SACT(j + 7) * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
+                acc += s_act(j + 0) * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
+                acc += s_act(j + 1) * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
+                acc += s_act(j + 2) * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
+                acc += s_act(j + 3) * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
+                acc += s_act(j + 4) * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
+                acc += s_act(j + 5) * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
+                acc += s_act(j + 6) * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
+                acc += s_act(j + 7) * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
             }
             for (int j = (nv << 8) + lane * 2; j < k; j += 64) {
                 const uint8_t byte = brow[j >> 1];
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
-                acc += SACT(j) * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
-                acc += SACT(j + 1) * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
+                acc += s_act(j) * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
+                acc += s_act(j + 1) * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
             }
         } else {
             for (int j = lane * 2; j < k; j += 64) {
@@ -859,8 +858,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
                 const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
-                acc += SACT(j) * w0;
-                acc += SACT(j + 1) * w1;
+                acc += s_act(j) * w0;
+                acc += s_act(j + 1) * w1;
             }
         }
         for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
@@ -1066,7 +1065,7 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     const int n_total = 2 * inter;
     dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
     expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
-                                         SACT_SLOTS(dim) * sizeof(float) + 256 * sizeof(float2),
+                                         (size_t)dim * sizeof(float) + 256 * sizeof(float2),
                                          stream>>>(
         nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
         w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
@@ -1088,7 +1087,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
     const int warps = 8;
     dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots);
     expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
-                                         SACT_SLOTS(inter) * sizeof(float) + 256 * sizeof(float2),
+                                         (size_t)inter * sizeof(float) + 256 * sizeof(float2),
                                          stream>>>(
         act_base, act_stride, nullptr, nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f,
         row_weight, rw_stride, w2_base, w2_stride, w2s_base, w2s_stride, w2_base, w2_stride,
