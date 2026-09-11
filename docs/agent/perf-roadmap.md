@@ -1652,5 +1652,10 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
 - **数值论证**：gate/up 逐位一致（同专家、同行内点积序 ✓）；down 的归约按 **slot 0..topk 升序**
   求和，与顺序路径"从清零的 `o` 起逐个 `o[row] += x`"**同序** ⇒ 逐位一致 ✓（fp 加法不满足结合律，
   定点序是必须的 ✓）。
-- **待办**：e2e 验收（`DSV41_MOE_BATCH=1`：四段文本亲自读 + 逐步计时预期降 ~2.5ms；同时是
-  新 kernel 的寄存器数审计点 —— 远程 `-Xptxas -v` 看是否踩 80 regs → 2 blocks/SM 的陷阱）。
+- **待办**：e2e 验收（`DSV41_MOE_BATCH=1`：四段文本亲自读 + 逐步计时预期降 ~2.5ms）。
+- ✅ **寄存器审计已做**（远程 `-Xptxas -v -gencode arch=compute_103a,code=sm_103a`）：
+  `expert_gemv_fp4_batched_kernel` **48 regs / 0 spill / 32B stack** —— 与老
+  `expert_gemv_fp4_kernel`（48 regs / 32B stack）**完全相同** ⇒ **没有踩 GLM 那条
+  80 regs → 2 blocks/SM 的占用率陷阱** ✓；`moe_down_reduce_kernel` 32 regs / 0 barrier ✓。
+  （审计命令的坑：必须用 `-gencode arch=compute_103a,code=sm_103a` ✗ —— 只给 `-arch=sm_103a`
+  会生成 compute_103 PTX 而 mxf4/tcgen05 全部报 "not supported on sm_103" ✗，那是标志问题不是代码问题 ✓。）
