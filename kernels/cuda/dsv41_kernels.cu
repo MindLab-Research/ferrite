@@ -2805,6 +2805,10 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
         __syncthreads();
         float* o_r = out + (size_t)r * dim;
         float s2 = 0.f;
+        // Compiler-directed unroll (the same treatment that worked on the fp8
+        // gemv: the fmaf accumulation is explicitly rounded, so letting nvcc
+        // widen the loop body keeps the arithmetic).
+#pragma unroll 4
         for (int c = threadIdx.x; c < dim; c += blockDim.x) {
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
