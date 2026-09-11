@@ -1484,6 +1484,7 @@ warmup 后 `cudaProfilerStart/Stop` 窗口，`ncu --profile-from-start off --lau
 - Rust 分发器只在 `is_capturing()` 为真时发射 v5 kernel；dry-run 和所有 host 路径回退 NCCL。
 - 于是 epoch 计数器**只被 replay 的图节点推进**，而 replay 是全局 lockstep（TP decode 不可能跑在对端 all-reduce 前面）→ 计数器在任何时刻跨 rank 相等，结构性不可能漂移。
 - 3 kernel：store（e=\*epoch 运行时读，float4 合并写全部对端 staging[e&1]）→ publish（system-scope 盖章 e+1，轮询每个对端 stamp≥e+1，然后推进 \*epoch）→ reduce（按 rank 升序求和 = NCCL ring 顺序，1-ulp 一致）。
+- **stamp 折进 store（`DSV41_AR_STAMP_FOLD=1`，默认 OFF，A/B 臂，2026-09-11 实施待验）**：publish 的盖章从 pubred 的 block 0 移到 **store kernel 的最后一个 block**，pubred 退化为 poll+reduce（省 store→pubred 的 kernel 边界 + 一次 stamp 往返）。末块判定 = **永不 reset 的单调 arrival 计数**（`arrive[1]` 原子递增、`arrive[0]` 存本轮起点，末块 = `prev == base + total - 1`，`total=gridDim.x*gridDim.y`）——**单调比较而非清零**（v2 `ferrite_kernels.cu:8077` 的 in-kernel reset 竞态正是三次死锁根因），且按本轮自己的 total 比较 ⇒ 不同 batch 尺寸图 / engram AR 的不同 n 都可跨轮切换。`arrive` 落在 staging 预留的 `ctr_at+4/+8`，只在 store kernel 内写，无 host 流量、无需 reset。GLM 共享路径（`ferrite-kernel/src/cuda.rs`）传 `nullptr`/0，保持旧协议。
 - 奇偶双缓冲恰好足够：任何 rank 的 store(k+2) 跨 rank 晚于所有 rank 的 reduce(k)（publish(k+1) 等所有对端的 k+1 盖章 ⇒ 对端 store(k+1) ⇒ 流序 ⇒ 对端 reduce(k)）。
 - **图切换正确性**（旧图不重捕获直接切回）：kernel 运行时读 epoch，任意图在任意时刻 replay 都用当前值 → b16→b2 切换已实测验证。
 - p2p_ar_reset（tp.rs:1087，dry-run→capture 屏障）对 v5 是一致的清零（epoch+flags 全 rank 同时归零），无害。

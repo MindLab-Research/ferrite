@@ -6649,7 +6649,8 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ w_norm,
                                      const float* __restrict__ pre_collapse,
                                      float* __restrict__ out, float eps_norm, int ss_in,
-                                     uint8_t* __restrict__ xq, float* __restrict__ xsc, int mode) {
+                                     uint8_t* __restrict__ xq, float* __restrict__ xsc,
+                                     uint8_t* __restrict__ xq4, float* __restrict__ xsc4, int mode) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -6787,6 +6788,45 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                 const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
                 const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
                 xq[c] = *(const uint8_t*)&f8;
+            }
+            // QUANT_FOLD (DSV41_QUANT_FOLD): the SAME normalised value `v` the fp8
+            // path above quantises is exactly what the MoE's quant_fp4_fused
+            // kernel would read back from `out` (`s.xn`), so emit the e2m1 nibble
+            // and the per-32-block scale here too and the caller skips that launch
+            // (1 launch + the xn write->read round trip per layer, 40/step).
+            // BIT-IDENTICAL by construction: the amax loop, the fast_round_scale
+            // form (`maxv` + `1.0f / maxv`), the clamp and the nearest-e2m1 loop
+            // are quant_fp4_fused_kernel's, term for term, and the byte assembly
+            // is `(lo & 0xF) | (hi << 4)` with lo = element 2t (even lane),
+            // hi = 2t+1. Each warp's 32 lanes cover exactly one 32-element block
+            // per pass (block index = warp + 32*pass, the SAME mapping the fp8
+            // scale above uses), so the amax is one warp shuffle and no barrier.
+            // The pair (2t, 2t+1) never straddles a warp, so the odd nibble comes
+            // from a `shfl_down` by one lane and only even lanes store.
+            if (xq4 != nullptr) {
+                float a4 = fabsf(v);
+                for (int off = 16; off > 0; off >>= 1)
+                    a4 = fmaxf(a4, __shfl_xor_sync(0xffffffffu, a4, off));
+                const float maxv4 = 6.0f;
+                const float sc4 = fmaxf(fast_round_scale(a4, 1.0f / maxv4), 1e-30f);
+                if (lane31 == 0) xsc4[c >> 5] = sc4;
+                const float inv4 = 1.0f / sc4;
+                const float v4 = fminf(fmaxf(v * inv4, -6.0f), 6.0f);
+                uint8_t best = 0;
+                float bd = 1e30f;
+                const float aa = fabsf(v4);
+                const float mags[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+                #pragma unroll
+                for (int c2 = 0; c2 < 8; c2++) {
+                    const float d = fabsf(aa - mags[c2]);
+                    if (d < bd) { bd = d; best = (uint8_t)c2; }
+                }
+                best |= (v4 < 0.f) ? 0x8u : 0u;
+                const unsigned code = (unsigned)best;
+                const unsigned hi = __shfl_down_sync(0xffffffffu, code, 1);
+                if ((lane31 & 1) == 0)
+                    xq4[(size_t)r * (size_t)(dim >> 1) + (size_t)(c >> 1)] =
+                        (uint8_t)((best & 0x0Fu) | (uint8_t)((hi & 0x0Fu) << 4));
             }
         }
     }
@@ -7450,7 +7490,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
                               int dim, int sinkhorn_iters, float eps, float eps_norm,
-                              uint8_t* xq, float* xsc, cudaStream_t s) {
+                              uint8_t* xq, float* xsc, uint8_t* xq4, float* xsc4, cudaStream_t s) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
@@ -7461,6 +7501,13 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     // for it must have somewhere to read and write.
     if ((w_norm == nullptr) != (pre_collapse == nullptr)) return (int)cudaErrorInvalidValue;
     if (w_norm != nullptr && out == nullptr) return (int)cudaErrorInvalidValue;
+    // QUANT_FOLD (fp4 direct-out from the EARLY collapse epilogue): requires the
+    // pair and a 32-aligned `dim` (a 32-wide block must never straddle a warp, or
+    // the packing shuffle reads an inactive lane). Decline silently otherwise —
+    // the caller's fp4 flag stays false (it gates the same condition) and the
+    // standalone quant_fp4 launch still runs.
+    if ((xq4 == nullptr) != (xsc4 == nullptr)) return (int)cudaErrorInvalidValue;
+    if (xq4 != nullptr && (dim & 31) != 0) { xq4 = nullptr; xsc4 = nullptr; }
     const int mix = hc * (2 + hc);
     // g_hc_part[r][m][ck]'s second dimension is a hard 64: a config with a larger
     // hc would walk off the array, so refuse it here rather than corrupt memory.
@@ -7484,7 +7531,10 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
         if (e == nullptr) return false;
         return e[0] == '1';
     }();
-    if (g_hc_merge) {
+    // QUANT_FOLD: the merged single-kernel form has no fp4 epilogue (its collapse
+    // is hc_front_kernel's, not hc_mixes_tail_kernel's EARLY half), so when the
+    // caller asks for the fp4 direct-out take the two-launch path, which does.
+    if (g_hc_merge && xq4 == nullptr) {
         cudaError_t e2 = cudaFuncSetAttribute(hc_front_kernel,
                                               cudaFuncAttributeMaxDynamicSharedMemorySize,
                                               dsv41_smem_ceiling(hc_front_kernel));  // 232448-260 static
@@ -7522,7 +7572,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
-        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_FULL);
+        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, xq4, xsc4, HC_TAIL_FULL);
     return (int)cudaGetLastError();
 }
 
@@ -7605,8 +7655,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
                                     const float* pre_collapse, float* pre, float* post,
                                     float* comb, float* out, int rows, int hc, int dim,
                                     int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
-                                    float* xsc, cudaStream_t s, cudaStream_t side,
-                                    cudaEvent_t in_ev, cudaEvent_t fork_ev,
+                                    float* xsc, uint8_t* xq4, float* xsc4, cudaStream_t s,
+                                    cudaStream_t side, cudaEvent_t in_ev, cudaEvent_t fork_ev,
                                     cudaEvent_t early_ev, cudaEvent_t join_ev) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
@@ -7625,6 +7675,13 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // The split only pays when there IS an EARLY half to leave on the critical
     // path; without a collapse the caller uses dsv41_hc_front.
     if (w_norm == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
+    // QUANT_FOLD (fp4 direct-out from the EARLY collapse epilogue, see
+    // hc_mixes_tail_kernel): the pair must be either both present or both null,
+    // and the packing shuffle needs a 32-aligned `dim`. Decline silently when the
+    // shape is not ours: the caller's fp4 flag gates the same condition, so the
+    // standalone quant_fp4 launch still runs.
+    if ((xq4 == nullptr) != (xsc4 == nullptr)) return (int)cudaErrorInvalidValue;
+    if (xq4 != nullptr && (dim & 31) != 0) { xq4 = nullptr; xsc4 = nullptr; }
     const int mix = hc * (2 + hc);
     if (mix > 64) return (int)cudaErrorInvalidValue;
     const int hc_dim = hc * dim;
@@ -7665,7 +7722,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // 1024-thread block as dsv41_hc_front's EARLY ⇒ bit-identical bytes.
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
-        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, xq4, xsc4, HC_TAIL_EARLY);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     // (2) EARLY-done edge, side -> main: record `fork_ev` on `side` right after
@@ -7732,7 +7789,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     const unsigned late_t = (g_hc_ss ? (unsigned)g_hc_late_t : 1024u);
     hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
-        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
+        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, nullptr, nullptr,
+        HC_TAIL_LATE);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     }   // end of the `if (!dl_merged)` two-launch fallback / A/B arm

@@ -104,7 +104,7 @@ hc-merge 教训的推广：**融合不是拼装，是精确的相位重排**。�
 | **P2** | 段 A 融合：hc 链 + attention 投影链一核，中间量留 smem；−6~8 launch/层 | −0.6~1.0ms | 中（hc 归约 / split=1） |
 | **P3** | 段 B 融合：MoE cooperative（gate→route→quant→gate_up→swiglu→down→reduce 一核，中间量留 smem） | −0.4~0.7ms | 中（slot 定序） |
 | **P4** | 跨层流水：ffn mixes 挪到 L+1 的 attn 段内下发，hc 的 ⟨B⟩ 半藏进 AR poll 窗口（PDL） | −0.3~0.5ms | 中 |
-| **P5** | 零 AR 节点：store+stamp 折进段末、pubred 折进下段首（v5 协议改动） | −0.15ms + 40 节点 | **高** |
+| **P5** | 零 AR 节点：store+stamp 折进段末、pubred 折进下段首（v5 协议改动） | −0.15ms + 40 节点 | **高** — **第一步（store+stamp 合并）已实施**：`DSV41_AR_STAMP_FOLD=1`（默认 OFF），见 `roadmap-200-tokps.md` 的 AR v5 条 |
 | **P6（Stage D，开放）** | model-persistent：权重分片驻留 smem + cooperative grid sync | 不确定 | 极高，不承诺 |
 
 每阶段独立 env gate、默认 OFF；验收 = 同二进制背靠背 A/B + 人眼四段文本 + parity 测试。

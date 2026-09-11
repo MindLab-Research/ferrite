@@ -12,7 +12,11 @@
 //!     --test ar_micro -- --nocapture
 //!
 //! Env: AR_MICRO_WORLD (default 8), AR_MICRO_ROUNDS (default 32), AR_MICRO_N
-//! (floats per rank, default 1024).
+//! (floats per rank, default 1024). AR_MICRO_ALT_N (default 0 = off): odd
+//! rounds reduce that many floats instead of AR_MICRO_N, i.e. a DIFFERENT
+//! store-grid `total` every other round — the gate for the AR stamp fold's
+//! monotonic arrival base (a fold that reset its counter, or hard-coded the
+//! grid size, stalls or mis-stamps on the first alternating round).
 
 use ferrite_dsv41::device::Device;
 use ferrite_dsv41::tp::{Collective, SpinBarrier};
@@ -33,6 +37,10 @@ fn collective_all_reduce_matches_host_reference() {
     let world = env_usize("AR_MICRO_WORLD", 4);
     let rounds = env_usize("AR_MICRO_ROUNDS", 8);
     let n = env_usize("AR_MICRO_N", 1024);
+    // 0 = every round uses `n`. Otherwise odd rounds use this (<= n) length, so
+    // the store grid — and therefore the stamp-fold arrival `total` — changes
+    // every other round.
+    let alt_n = env_usize("AR_MICRO_ALT_N", 0).min(n);
     if world < 2 {
         eprintln!("[ar_micro] world={world} < 2: nothing to reduce, skipping");
         return;
@@ -71,12 +79,18 @@ fn collective_all_reduce_matches_host_reference() {
                 let mut got = vec![0f32; n];
 
                 for r in 0..rounds {
+                    // AR_MICRO_ALT_N: odd rounds reduce a SHORTER payload, i.e. a
+                    // different store-grid `total` every other round. This is the
+                    // STAMP FOLD's monotonic-base gate — a fold that hard-coded the
+                    // grid size (or reset its arrival counter) stalls or mis-stamps
+                    // on the first alternating round.
+                    let rn = if alt_n > 0 && (r & 1) == 1 { alt_n } else { n };
                     let v = r as f32 + rank as f32 * 1000.0;
-                    for x in host.iter_mut() {
+                    for x in host[..rn].iter_mut() {
                         *x = v;
                     }
-                    dev.upload_f32_at(buf.ptr, 0, &host).expect("upload");
-                    if let Err(e) = c.all_reduce_inplace(buf.ptr as *mut std::ffi::c_void, n * 4) {
+                    dev.upload_f32_at(buf.ptr, 0, &host[..rn]).expect("upload");
+                    if let Err(e) = c.all_reduce_inplace(buf.ptr as *mut std::ffi::c_void, rn * 4) {
                         failures
                             .lock()
                             .unwrap()
@@ -87,8 +101,8 @@ fn collective_all_reduce_matches_host_reference() {
                         barrier.wait();
                         continue;
                     }
-                    let d = ferrite_dsv41::device::Device::view(buf.ptr, n * 4);
-                    dev.download_f32(&d, &mut got).expect("download");
+                    let d = ferrite_dsv41::device::Device::view(buf.ptr, rn * 4);
+                    dev.download_f32(&d, &mut got[..rn]).expect("download");
                     if rank == 0 && r < 2 && std::env::var("AR_MICRO_DUMP").is_ok() {
                         // Dump the raw staging halves: seeing which bytes the store
                         // actually wrote beats reasoning about the offsets.
@@ -111,10 +125,10 @@ fn collective_all_reduce_matches_host_reference() {
                     // is that value summed over the ranks — no `n` factor.
                     let expect = r as f32 * world as f32
                         + 1000.0 * (world * (world - 1) / 2) as f32;
-                    if got[0] != expect || got[n - 1] != expect {
+                    if got[0] != expect || got[rn - 1] != expect {
                         failures.lock().unwrap().push(format!(
                             "rank {rank} round {r}: got {:.1} (first) / {:.1} (last), expected {:.1}",
-                            got[0], got[n - 1], expect
+                            got[0], got[rn - 1], expect
                         ));
                         barrier.wait();
                         continue;

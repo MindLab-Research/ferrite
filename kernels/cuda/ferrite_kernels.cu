@@ -8330,6 +8330,17 @@ __global__ void p2p_ar_store_v5_kernel(
     const float* __restrict__ bias,          // optional residual (nullptr = none)
     unsigned* __restrict__ arrive) {         // STAMP FOLD state (nullptr = fold OFF)
     const unsigned e = *epoch;
+    // STAMP FOLD: read this round's arrival BASE here, at the very top — before
+    // the store loops, the fence and the barrier that precede this block's
+    // atomicAdd. That placement is what makes the base race-free (see the fold
+    // note below): a block can only read the base the previous round's last
+    // block wrote if ALL of this round's blocks already incremented the
+    // counter, which cannot include THIS block before its own read; and the
+    // barrier + fence between this read and the atomicAdd stop the compiler or
+    // the memory system from reordering the increment before the read.
+    unsigned fold_base = 0u;
+    if (arrive != nullptr && threadIdx.x == 0)
+        fold_base = *(volatile unsigned*)&arrive[0];
     // Peer-parallel store (2026-09-11): gridDim.y == world, one peer per block row.
     // Before, ONE thread wrote all `world` peer slots serially (`world` remote
     // float4 stores back to back), so the kernel ran on ceil(n4/blockDim.x) = 5
@@ -8405,10 +8416,9 @@ __global__ void p2p_ar_store_v5_kernel(
         __syncthreads();
         if (threadIdx.x == 0) {
             const unsigned total = (unsigned)(gridDim.x * gridDim.y);
-            const unsigned base = *(volatile unsigned*)&arrive[0];
             const unsigned prev = atomicAdd(&arrive[1], 1u);
             s_fold[1] = prev + 1u;
-            s_fold[0] = (prev == base + total - 1u) ? 1u : 0u;
+            s_fold[0] = (prev == fold_base + total - 1u) ? 1u : 0u;
         }
         __syncthreads();
         if (s_fold[0]) {

@@ -866,7 +866,8 @@ constexpr int kGateUpKsplitMax = 8;
 static int dsv41_gateup_ksplit(void) {
     static int cached = -1;
     if (cached < 0) {
-        int v = 2;  // K-split default ON (A/B verified: 6.90->6.57ms, -0.33ms)
+        int v = 1;  // PDEPTH default OFF: serve A/B showed depth 2 and 5 are each +0.04ms regression
+                    // (occupancy loss > latency hiding in serve; isolated IPC gain doesn't translate)  // K-split default ON (A/B verified: 6.90->6.57ms, -0.33ms)
         if (const char* e = getenv("DSV41_GATEUP_KSPLIT")) {
             v = atoi(e);
             if (v < 1) v = 1;
@@ -2693,7 +2694,8 @@ extern "C" int dsv41_w2_l2_prewarm(const uint8_t* w2_base, long w2_stride,
                                    cudaStream_t stream) {
     static const int enabled = [] {
         const char* e = getenv("DSV41_W2_PREWARM");
-        return (e != nullptr && e[0] == '0') ? 0 : 1;   // default ON, `=0` disables
+        return (e != nullptr && e[0] == '1') ? 1 : 0;   // default OFF (serve A/B: +0.04ms regression,
+                                                          // warmer's SM contention > L2 hit benefit)
     }();
     if (!enabled || w2_base == nullptr || w2s_base == nullptr || ids == nullptr) return 0;
     if (slots <= 0 || sel_bytes <= 0) return 0;
