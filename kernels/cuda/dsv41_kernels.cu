@@ -859,6 +859,26 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
 // +0.1ms in serve - the isolated win only materialises at topk >= ~300
 // (long-context steady state). Default OFF until an adaptive C (graph-capture
 // friendly) exists; DSV41_ATTN_PF_SPLIT=C opts in explicitly.
+//
+// ADAPTIVE C (design, 2026-09-11; NOT implemented): the graph is NOT the blocker.
+// split_c, b*m and h are all HOST constants and topk lives on the DEVICE (`*clen`),
+// so the captured grid (split_c, b*m, h) is already valid at every topk - the step
+// graph is captured once at decode_steps==1 and only replayed after that (reset()
+// drops it per request, never per topk), so no re-capture is needed as the context
+// grows. Move the decision onto the device instead: launch C_max chunks always and
+// compute C_eff = f(topk) inside BOTH kernels from *clen - `if (ck >= C_eff) return;`
+// in the split, `for (ck < C_eff)` in the merge (which must then also take
+// clen/window/index_topk, it does not today). A per-STEP host choice cannot work:
+// `clen` is per-LAYER, so one step's forty attention calls span forty topk values;
+// multi-graph capture is both too coarse and x3 memory.
+//
+// The other half of the round-39 regression is NOT topk-dependent: any split_c > 0
+// makes dsv41_sparse_attn_orope return 2 (decline), which forfeits the o-rope and
+// o-quant epilogue fusions (chain_dev.rs ~2910-2969) at EVERY context. A static
+// C=4 therefore pays the same fixed penalty C=8 does - a bare 0->4 flip is not the
+// fix. Moving that epilogue into the merge kernel (whose (b*m, h) x 128 grid is
+// exactly the pf kernel's) is the precondition for any static-C default, and it is
+// orthogonal to C_eff.
 #define kAttnPfSplitDefault 0
 #define kAttnMaxC 16
 #define kAttnMaxBM 8
