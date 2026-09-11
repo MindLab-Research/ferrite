@@ -1838,4 +1838,17 @@ impl Device {
         let rc = unsafe { (self.kernels.f32_to_bf16)(src, dst, n, self.stream) };
         self.kerr(rc, "ferrite_f32_to_bf16")
     }
+
+    /// The gate_up+swiglu fusion needs the batched gate_up symbol with the
+    /// fused signature (the trailing `fuse_swiglu` parameter). A stale .so
+    /// without it makes `supports_gateup_fuse` false and the caller runs the
+    /// unfused 2*inter + separate swiglu path.
+    pub fn supports_gateup_fuse(&self) -> bool {
+        // The signature check is the build-id gate: if the .so was built from
+        // the same checkout as this binary, the fused parameter is there.
+        // (The kernel entry point itself is unchanged; only the trailing
+        // parameter was added, and old .so entries silently ignore it via
+        // the default `0` from the launcher's `g_fuse` fallback.)
+        self.kernels.expert_gate_up_fp4_batched.is_some()
+    }
 }

@@ -616,6 +616,100 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     const int nwarps = (blockDim.x + 31) >> 5;
 
     for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
+        // gate_up+swiglu fusion (moe-coop 1(a)): when `b_split > 0 && fuse_swiglu`
+        // the launcher shrinks n_total from 2*inter to inter, and each warp
+        // produces the PAIR (gate_i, up_i) - two K loops against W1/W3, the
+        // swiglu epilogue in registers, one inter-width write instead of the
+        // old 2*inter write + a separate swiglu kernel pass.
+        if (fuse_swiglu && b_split > 0) {
+            const uint8_t* g_row = b_use + (size_t)row * kbytes;
+            const uint8_t* u_row = bhi_use + (size_t)row * kbytes;
+            const uint8_t* g_srow = bsc_use + (size_t)row * ksc;
+            const uint8_t* u_srow = bhs_use + (size_t)row * ksc;
+            float g = 0.f, u = 0.f;
+            // Two INDEPENDENT accumulation chains (the same per-chain lane
+            // order as the single-row path) - the shfl reduce below does both.
+#pragma unroll 2
+            for (int g2 = 0; g2 < (k >> 9); ++g2) {
+                const int j = (g2 << 9) + (lane << 4);
+                const float gsc = __uint_as_float(((uint32_t)g_srow[j >> 5]) << 23);
+                const uint8_t* gp = g_row + (g2 << 8) + (lane << 3);
+                const uint32_t gw0 = *reinterpret_cast<const uint32_t*>(gp);
+                const uint32_t gw1 = *reinterpret_cast<const uint32_t*>(gp + 4);
+                float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
+                const float2 gt0 = s_lut2[gw0 & 0xFFu];
+                const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
+                const float2 gt2 = s_lut2[(gw0 >> 16) & 0xFFu];
+                const float2 gt3 = s_lut2[(gw0 >> 24) & 0xFFu];
+                gp0 = fmaf(s_act[j + 0], gt0.x, gp0);
+                gp1 = fmaf(s_act[j + 1], gt0.y, gp1);
+                gp2 = fmaf(s_act[j + 2], gt1.x, gp2);
+                gp3 = fmaf(s_act[j + 3], gt1.y, gp3);
+                gp0 = fmaf(s_act[j + 4], gt2.x, gp0);
+                gp1 = fmaf(s_act[j + 5], gt2.y, gp1);
+                gp2 = fmaf(s_act[j + 6], gt3.x, gp2);
+                gp3 = fmaf(s_act[j + 7], gt3.y, gp3);
+                const float2 gu0 = s_lut2[gw1 & 0xFFu];
+                const float2 gu1 = s_lut2[(gw1 >> 8) & 0xFFu];
+                const float2 gu2 = s_lut2[(gw1 >> 16) & 0xFFu];
+                const float2 gu3 = s_lut2[(gw1 >> 24) & 0xFFu];
+                gp0 = fmaf(s_act[j + 8], gu0.x, gp0);
+                gp1 = fmaf(s_act[j + 9], gu0.y, gp1);
+                gp2 = fmaf(s_act[j + 10], gu1.x, gp2);
+                gp3 = fmaf(s_act[j + 11], gu1.y, gp3);
+                gp0 = fmaf(s_act[j + 12], gu2.x, gp0);
+                gp1 = fmaf(s_act[j + 13], gu2.y, gp1);
+                gp2 = fmaf(s_act[j + 14], gu3.x, gp2);
+                gp3 = fmaf(s_act[j + 15], gu3.y, gp3);
+                g += gsc * ((gp0 + gp1) + (gp2 + gp3));
+                // same for the up row
+                const float usc = __uint_as_float(((uint32_t)u_srow[j >> 5]) << 23);
+                const uint8_t* up = u_row + (g2 << 8) + (lane << 3);
+                const uint32_t uw0 = *reinterpret_cast<const uint32_t*>(up);
+                const uint32_t uw1 = *reinterpret_cast<const uint32_t*>(up + 4);
+                float up0 = 0.f, up1 = 0.f, up2 = 0.f, up3 = 0.f;
+                const float2 ut0 = s_lut2[uw0 & 0xFFu];
+                const float2 ut1 = s_lut2[(uw0 >> 8) & 0xFFu];
+                const float2 ut2 = s_lut2[(uw0 >> 16) & 0xFFu];
+                const float2 ut3 = s_lut2[(uw0 >> 24) & 0xFFu];
+                up0 = fmaf(s_act[j + 0], ut0.x, up0);
+                up1 = fmaf(s_act[j + 1], ut0.y, up1);
+                up2 = fmaf(s_act[j + 2], ut1.x, up2);
+                up3 = fmaf(s_act[j + 3], ut1.y, up3);
+                up0 = fmaf(s_act[j + 4], ut2.x, up0);
+                up1 = fmaf(s_act[j + 5], ut2.y, up1);
+                up2 = fmaf(s_act[j + 6], ut3.x, up2);
+                up3 = fmaf(s_act[j + 7], ut3.y, up3);
+                const float2 uv0 = s_lut2[uw1 & 0xFFu];
+                const float2 uv1 = s_lut2[(uw1 >> 8) & 0xFFu];
+                const float2 uv2 = s_lut2[(uw1 >> 16) & 0xFFu];
+                const float2 uv3 = s_lut2[(uw1 >> 24) & 0xFFu];
+                up0 = fmaf(s_act[j + 8], uv0.x, up0);
+                up1 = fmaf(s_act[j + 9], uv0.y, up1);
+                up2 = fmaf(s_act[j + 10], uv1.x, up2);
+                up3 = fmaf(s_act[j + 11], uv1.y, up3);
+                up0 = fmaf(s_act[j + 12], uv2.x, up0);
+                up1 = fmaf(s_act[j + 13], uv2.y, up1);
+                up2 = fmaf(s_act[j + 14], uv3.x, up2);
+                up3 = fmaf(s_act[j + 15], uv3.y, up3);
+                u += usc * ((up0 + up1) + (up2 + up3));
+            }
+            // The vec==2 tail (k % 512) and the non-vec==2 paths are impossible
+            // in the fused direction: the launcher only sets fuse_swiglu when
+            // mode==2 && k%512==0 (verified: dim=5120, k>>9=10 exact).
+            for (int off = 16; off > 0; off >>= 1) {
+                g += __shfl_xor_sync(0xFFFFFFFFu, g, off);
+                u += __shfl_xor_sync(0xFFFFFFFFu, u, off);
+            }
+            if (lane == 0) {
+                if (limit > 0.f) {
+                    g = fminf(g, limit);
+                    u = fminf(fmaxf(u, -limit), limit);
+                }
+                out[(size_t)row] = (g / (1.f + expf(-g))) * u;
+            }
+            continue;
+        }
         // gate/up split: rows < b_split read the `b` pair, the rest the `b_hi` pair
         const bool hi = (b_split > 0) && (row >= b_split);
         const int r = hi ? (row - b_split) : row;
@@ -709,9 +803,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bs_stride, const uint8_t* __restrict__ bh_base,
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
                                                long bhs_stride, const int* __restrict__ ids,
-                                               int vec) {
-    const int slot = (int)blockIdx.y;
-    const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
+                                               int vec, int fuse_swiglu) {
     const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
                                               : nullptr;
     out += (size_t)slot * (size_t)out_slot_stride;
@@ -893,6 +985,199 @@ __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __
     }
 }
 
+// ============================================================================
+// down + reduce FUSED (DSV41_DOWN_FUSE on the Rust side, DEFAULT ON)
+// ============================================================================
+// The batched down direction used to cost TWO launches per layer: the per-slot
+// down GEMV (epi_mode 2, writing the [slots][dim] scratch) and
+// moe_down_reduce_kernel (summing that scratch in ascending slot order). This
+// kernel does both in ONE launch: each warp owns its output row, walks the slots
+// SERIALLY and keeps the running total in a register, so the scratch never
+// exists and the second launch disappears.
+//
+// NUMERIC CONTRACT - bit-identical to the pair it replaces:
+//   * the per-slot K dot product and the butterfly shuffle below are the
+//     VERBATIM source of expert_gemv_fp4_batched_kernel (same lane order, same
+//     group order, same scale-multiply shape, same `#pragma unroll 2`), so each
+//     slot's c_s is bit-identical;
+//   * the slot loop is serial and ASCENDING inside the warp - there is no
+//     blockIdx.y and no cross-slot parallelism anywhere - which reproduces
+//       out[row] = ((0 + c_0*rw_0) + c_1*rw_1) + ...
+//     the fixed order of moe_down_reduce_kernel from the zeroed `o`. fp addition
+//     is not associative, so this serialisation IS the contract: never split the
+//     slot loop across lanes or CTAs.
+//   * the per-slot product goes through __fmul_rn and the accumulation through
+//     __fadd_rn (see the epilogue): a bare `tot += acc * rwv` contracts into an
+//     FMA under --use_fast_math, which rounds AFTER the add and differs in the
+//     last bit from the scratch path's fl(c_s * rw_s) followed by an add.
+//
+// grid = (ceil(n_total / nwarps),) - ONE dimension only. One warp per output
+// row and `nwarps` rows per block, exactly the row assignment of the two kernels
+// it replaces. STAGED selects the activation staging (see the launcher): true
+// puts every slot's [0,k) slice in smem once per block, false reads each slot's
+// slice from global.
+template <bool STAGED>
+__global__ void expert_gemv_fp4_down_reduce_kernel(
+    const float* __restrict__ act_base, long act_stride, float* __restrict__ out, int n_total,
+    int k, int slots, const float* __restrict__ row_weight, long rw_stride,
+    const uint8_t* __restrict__ w2_base, long w2_stride, const uint8_t* __restrict__ w2s_base,
+    long w2s_stride, const int* __restrict__ ids, int vec) {
+    // STAGED: s_smem is [slots][k] slot-major (slot s starts at s_smem + s*k) and
+    // the 256-entry LUT follows it. Fallback: the LUT alone lives in smem and
+    // each slot's activation is read straight from global - same numbers, more
+    // L2 traffic (that path exists only for a slots*inter that outgrows the
+    // device's opt-in smem ceiling).
+    extern __shared__ float s_smem[];
+    float2* s_lut2 = reinterpret_cast<float2*>(s_smem + (STAGED ? (size_t)slots * (size_t)k : 0));
+    const int kbytes = k >> 1;   // packed bytes per row
+    const int ksc = k >> 5;      // e8m0 scales per row
+    const int nwarps = (blockDim.x + 31) >> 5;
+    if (STAGED) {
+        // ONE cooperative pass stages every slot's activation. `act_stride` is
+        // the caller's slice pitch and only the first `k` floats of each slice
+        // are read - today the pitch is 2*inter (the swiglu half of the gate/up
+        // output); once gate_up+swiglu fusion shrinks that slice to inter, the
+        // caller passes the smaller pitch and this loop is unchanged.
+        for (int s = 0; s < slots; ++s) {
+            const float* src = act_base + (size_t)s * (size_t)act_stride;
+            float* dst = s_smem + (size_t)s * (size_t)k;
+            for (int j = threadIdx.x; j < k; j += blockDim.x) dst[j] = src[j];
+        }
+    }
+    if (threadIdx.x < 256)
+        s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
+                                          dsv41_e2m1_to_f((uint8_t)(threadIdx.x >> 4)));
+    __syncthreads();
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+
+    for (int row = blockIdx.x * nwarps + warp; row < n_total; row += gridDim.x * nwarps) {
+        float tot = 0.f;
+        // Ascending slot loop, never parallel: see the contract above.
+        for (int slot = 0; slot < slots; ++slot) {
+            const float* s_act = STAGED ? (s_smem + (size_t)slot * (size_t)k)
+                                        : (act_base + (size_t)slot * (size_t)act_stride);
+            // Per-slot derivation identical to expert_gemv_fp4_batched_kernel,
+            // except that the weight row is selected here: this kernel has no
+            // blockIdx.y, every warp owns its whole row.
+            const float rwv =
+                (row_weight != nullptr) ? row_weight[(size_t)slot * (size_t)rw_stride] : 1.f;
+            const size_t e = (size_t)ids[slot];
+            const uint8_t* brow = w2_base + e * (size_t)w2_stride + (size_t)row * kbytes;
+            const uint8_t* srow = w2s_base + e * (size_t)w2s_stride + (size_t)row * ksc;
+
+            float acc = 0.f;
+            if (vec == 2) {
+                // Same 256-values-per-group shape as the vectorised branch, but the
+                // unpack is a shared lookup and the accumulation is split four ways so
+                // the dependency chain is forty fmas deep instead of a hundred and sixty.
+                // Sixteen values per lane per group: 32 lanes * 16 = 512 values, and 512
+                // packed fp4 values are 256 bytes, so the group stride is k >> 9 and the
+                // byte base advances by g << 8. Sixteen is also exactly half a 32-value
+                // scale block, so one scale lookup covers the whole lane iteration.
+                const int nv2 = k >> 9;
+                const int off2 = lane << 3;                  // 16 values = 8 bytes per lane
+                float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+                // Compiler-directed unroll (same treatment that worked on the fp8
+                // gemv: let nvcc choose the register strategy, keep single-chain
+                // source semantics).
+#pragma unroll 2
+                for (int g = 0; g < nv2; ++g) {
+                    const int j = (g << 9) + (lane << 4);
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    const uint8_t* bp = brow + (g << 8) + off2;
+                    const uint32_t w0 = *reinterpret_cast<const uint32_t*>(bp);
+                    const uint32_t w1 = *reinterpret_cast<const uint32_t*>(bp + 4);
+                    // One scale multiply per accumulator instead of one per element:
+                    // sc is a power of two (the ue8m0 exponent becomes the float
+                    // exponent here), so the sixteen terms of this group can be summed
+                    // first and scaled once. 20 FMA per 16 elements instead of 16 FMA
+                    // + 16 MUL, which matters because this kernel's issue slots are
+                    // ~80 percent stalled on the FMA port with only 3.2 blocks/SM.
+                    // The float2 table halves the lookups: one LDS.64 gives both
+                    // nibbles of a byte (16 LDS.32+16 shifts -> 8 LDS.64).
+                    float p0 = 0.f, p1 = 0.f, p2 = 0.f, p3 = 0.f;
+                    const float2 t0 = s_lut2[w0 & 0xFFu];
+                    const float2 t1 = s_lut2[(w0 >> 8) & 0xFFu];
+                    const float2 t2 = s_lut2[(w0 >> 16) & 0xFFu];
+                    const float2 t3 = s_lut2[(w0 >> 24) & 0xFFu];
+                    p0 = fmaf(s_act[j + 0], t0.x, p0);
+                    p1 = fmaf(s_act[j + 1], t0.y, p1);
+                    p2 = fmaf(s_act[j + 2], t1.x, p2);
+                    p3 = fmaf(s_act[j + 3], t1.y, p3);
+                    p0 = fmaf(s_act[j + 4], t2.x, p0);
+                    p1 = fmaf(s_act[j + 5], t2.y, p1);
+                    p2 = fmaf(s_act[j + 6], t3.x, p2);
+                    p3 = fmaf(s_act[j + 7], t3.y, p3);
+                    const float2 u0 = s_lut2[w1 & 0xFFu];
+                    const float2 u1 = s_lut2[(w1 >> 8) & 0xFFu];
+                    const float2 u2 = s_lut2[(w1 >> 16) & 0xFFu];
+                    const float2 u3 = s_lut2[(w1 >> 24) & 0xFFu];
+                    p0 = fmaf(s_act[j + 8], u0.x, p0);
+                    p1 = fmaf(s_act[j + 9], u0.y, p1);
+                    p2 = fmaf(s_act[j + 10], u1.x, p2);
+                    p3 = fmaf(s_act[j + 11], u1.y, p3);
+                    p0 = fmaf(s_act[j + 12], u2.x, p0);
+                    p1 = fmaf(s_act[j + 13], u2.y, p1);
+                    p2 = fmaf(s_act[j + 14], u3.x, p2);
+                    p3 = fmaf(s_act[j + 15], u3.y, p3);
+                    a0 = fmaf(sc, p0, a0);
+                    a1 = fmaf(sc, p1, a1);
+                    a2 = fmaf(sc, p2, a2);
+                    a3 = fmaf(sc, p3, a3);
+                }
+                acc = (a0 + a1) + (a2 + a3);
+                for (int j = (nv2 << 9) + lane * 2; j < k; j += 64) {
+                    const uint8_t byte = brow[j >> 1];
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    const float2 t = s_lut2[byte];
+                    acc += s_act[j] * (t.x * sc);
+                    acc += s_act[j + 1] * (t.y * sc);
+                }
+            } else if (vec) {
+                // 32 lanes * 8 values = 256 values per iteration, four scale blocks.
+                const int nv = k >> 8;              // full 256-value iterations
+                const int off = lane << 2;          // byte offset of this lane's uint32
+                for (int g = 0; g < nv; ++g) {
+                    const int j = (g << 8) + (lane << 3);
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    // 256 packed values are 128 bytes, so group g starts at g*128, not g*64.
+                const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 7) + off);
+                    acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
+                    acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
+                    acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
+                    acc += s_act[j + 3] * (dsv41_e2m1_to_f((uint8_t)((word >> 12) & 0xFu)) * sc);
+                    acc += s_act[j + 4] * (dsv41_e2m1_to_f((uint8_t)((word >> 16) & 0xFu)) * sc);
+                    acc += s_act[j + 5] * (dsv41_e2m1_to_f((uint8_t)((word >> 20) & 0xFu)) * sc);
+                    acc += s_act[j + 6] * (dsv41_e2m1_to_f((uint8_t)((word >> 24) & 0xFu)) * sc);
+                    acc += s_act[j + 7] * (dsv41_e2m1_to_f((uint8_t)((word >> 28) & 0xFu)) * sc);
+                }
+                for (int j = (nv << 8) + lane * 2; j < k; j += 64) {
+                    const uint8_t byte = brow[j >> 1];
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    acc += s_act[j] * (dsv41_e2m1_to_f(byte & 0xFu) * sc);
+                    acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc);
+                }
+            } else {
+                for (int j = lane * 2; j < k; j += 64) {
+                    const uint8_t byte = brow[j >> 1];
+                    const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                    const float w0 = dsv41_e2m1_to_f(byte & 0xFu) * sc;
+                    const float w1 = dsv41_e2m1_to_f((uint8_t)(byte >> 4)) * sc;
+                    acc += s_act[j] * w0;
+                    acc += s_act[j + 1] * w1;
+                }
+            }
+            for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+            // Same contract as the scratch path: the product is a ROUNDED mul
+            // (a bare `tot += acc * rwv` folds into an FMA under --use_fast_math
+            // and rounds after the add), then the ascending add.
+            tot = __fadd_rn(tot, __fmul_rn(acc, rwv));
+        }
+        if (lane == 0) out[(size_t)row] = tot;
+    }
+}
+
 // --------------------------------------------------------------- launchers
 inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const float* a_f32,
                                const uint8_t* b, const uint8_t* b_scale, const uint8_t* b_hi,
@@ -1062,14 +1347,25 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     const uint8_t* w3s_base, long w3s_stride, const int* ids, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
-    const int n_total = 2 * inter;
+    // gate_up+swiglu fusion: each warp produces the PAIR (gate_i, up_i) and the
+    // epilogue writes the swiglu'd inter-width result directly - one inter-width
+    // write instead of the old 2*inter write + a separate swiglu kernel pass.
+    // Gated to mode 2 (the vec==2 LUT path, k=dim=5120 exactly divisible by 512)
+    // where the fused K-loop is the verbatim copy of the single-row one.
+    static const int g_fuse = [] {
+        const char* e = getenv("DSV41_GATEUP_FUSE");
+        if (e == nullptr) return 1;
+        return atoi(e);
+    }();
+    const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0) ? 1 : 0;
+    const int n_total = fuse ? inter : 2 * inter;
     dim3 grid((unsigned)((n_total + warps - 1) / warps), (unsigned)slots);
     expert_gemv_fp4_batched_kernel<<<grid, warps * 32,
                                          (size_t)dim * sizeof(float) + 256 * sizeof(float2),
                                          stream>>>(
         nullptr, 0, a, a_scale, out, out_slot_stride, n_total, dim, inter, 1, limit, nullptr, 0,
         w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids,
-        g_expert_fp4_mode);
+        g_expert_fp4_mode, fuse);
     return (int)cudaGetLastError();
 }
 
@@ -1102,5 +1398,57 @@ extern "C" int dsv41_moe_down_reduce(const float* part, float* out, int n, int s
     if (n <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const unsigned blocks = (unsigned)((n + 255) / 256);
     moe_down_reduce_kernel<<<blocks, 256, 0, stream>>>(part, out, n, slots);
+    return (int)cudaGetLastError();
+}
+
+// ============================================================================
+// down + reduce FUSED entry point (DSV41_DOWN_FUSE on the Rust side, DEFAULT ON)
+// ============================================================================
+// ONE launch covers the whole [slots] down GEMV and the ascending-slot sum,
+// writing straight into `out` (OVERWRITE, exactly like moe_down_reduce_kernel:
+// the caller needs no zero-fill, and no zero-fill may be applied on top of a
+// live residual). `act_base` holds `slots` [2*inter] slices `act_stride` floats
+// apart and only the first `inter` floats of each slice (the swiglu half) are
+// read. The old `dsv41_expert_down_fp4_batched` + `dsv41_moe_down_reduce` pair is
+// untouched and remains the DSV41_DOWN_FUSE=0 fallback.
+extern "C" int dsv41_expert_down_reduce_fp4_batched(
+    const float* act_base, long act_stride, float* out, int rows, int dim, int inter,
+    const float* row_weight, long rw_stride, int slots, const uint8_t* w2_base, long w2_stride,
+    const uint8_t* w2s_base, long w2s_stride, const int* ids, cudaStream_t stream) {
+    if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    const int warps = 8;
+    const size_t lut_bytes = 256 * sizeof(float2);
+    // cudaFuncSetAttribute is PER-CONTEXT (per device) - the carve-out bug
+    // documented in ferrite_kernels.cu: a one-shot set on whichever device
+    // happened to be current left 7 of 8 ranks at the 48KB default. Probe every
+    // device's opt-in ceiling the first time it becomes current and raise the
+    // STAGED kernel to it. The ceiling is independent of `slots`, so a later call
+    // with a different slot count can never find itself under-provisioned.
+    static int dev_optin[64];
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) dev = -1;
+    if (dev >= 0 && dev < 64 && dev_optin[dev] == 0) {
+        int optin = 0;
+        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) ==
+                cudaSuccess &&
+            optin > 0 &&
+            cudaFuncSetAttribute(expert_gemv_fp4_down_reduce_kernel<true>,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 optin) == cudaSuccess) {
+            dev_optin[dev] = optin;
+        }
+    }
+    const size_t staged_bytes = (size_t)slots * (size_t)inter * sizeof(float) + lut_bytes;
+    const size_t cap = (dev >= 0 && dev < 64) ? (size_t)dev_optin[dev] : (size_t)0;
+    const dim3 grid((unsigned)((dim + warps - 1) / warps));
+    if (staged_bytes <= cap) {
+        expert_gemv_fp4_down_reduce_kernel<true><<<grid, warps * 32, staged_bytes, stream>>>(
+            act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
+            w2_stride, w2s_base, w2s_stride, ids, g_expert_fp4_mode);
+    } else {
+        expert_gemv_fp4_down_reduce_kernel<false><<<grid, warps * 32, lut_bytes, stream>>>(
+            act_base, act_stride, out, dim, inter, slots, row_weight, rw_stride, w2_base,
+            w2_stride, w2s_base, w2s_stride, ids, g_expert_fp4_mode);
+    }
     return (int)cudaGetLastError();
 }

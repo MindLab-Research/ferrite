@@ -1644,8 +1644,8 @@ kernel 的 `ids/slot` 参数就是逐专家调用的痕迹）。若每次启动+
 ### MoE gemv 批化已落地（`DSV41_MOE_BATCH=1`，默认关，待 e2e 验收）
 
 - **新 kernel（老 kernel 一行未动 ⇒ 默认路径字节级不变 ✓）**：
-  `expert_gemv_fp4_batched_kernel`（`dsv41_experts_mxf4.cu:689`，逐行拷贝 + `blockIdx.y = slot`
-  + per-slot stride 的 `act_stride/out_slot_stride/rw_stride`）+ `moe_down_reduce_kernel`（`:769`）。
+  `expert_gemv_fp4_batched_kernel`（`dsv41_experts_mxf4.cu:701`，逐行拷贝 + `blockIdx.y = slot`
+  + per-slot stride 的 `act_stride/out_slot_stride/rw_stride`）+ `moe_down_reduce_kernel`（`:887`）。
 - **调用侧关键发现**：逐 slot 输出**并非 disjoint** —— gate/up 每 slot 覆盖写同一个 `ex_act` ✗、
   down 每 slot 累加进同一个 `o`（epi_mode 3）✗ ⇒ 批化必须走 **per-slot scratch**（`ex_act_b`/
   `ex_down_b` 以 `slot*stride` 相离 ✓ 已实现 ✓）。

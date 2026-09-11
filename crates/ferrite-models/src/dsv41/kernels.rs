@@ -467,6 +467,32 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// down + reduce FUSED (DSV41_DOWN_FUSE, default ON): ONE launch computes
+    /// every slot's fp4 down GEMV and sums the per-slot contributions in
+    /// ASCENDING slot order into `out` (OVERWRITE). Bit-identical to
+    /// `dsv41_expert_down_fp4_batched` + `dsv41_moe_down_reduce`, which stay as
+    /// the DSV41_DOWN_FUSE=0 fallback. `act_base` holds `slots` slices
+    /// `act_stride` floats apart and only the first `inter` floats of each (the
+    /// swiglu half) are read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_expert_down_reduce_fp4_batched(
+        act_base: *const f32,
+        act_stride: i64,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        inter: i32,
+        row_weight: *const f32,
+        rw_stride: i64,
+        slots: i32,
+        w2_base: *const u8,
+        w2_stride: i64,
+        w2s_base: *const u8,
+        w2s_stride: i64,
+        ids: *const i32,
+        stream: CuStream,
+    ) -> i32;
+
     /// Batched SwiGLU: grid.y = slot over `slots` consecutive [2*inter] blocks.
     pub fn dsv41_swiglu_limit_batched(
         gate_up: *mut f32,

@@ -2303,11 +2303,19 @@ fn fuse_b1() -> bool {
                 && ne >= 2
                 && self.dev.supports_moe_batch();
             if batched {
-                // Per-slot strides. `ex_act_b` holds [topk][2*inter_local] and
-                // `ex_down_b` [topk][dim]; both slices are disjoint, which is
-                // what the batched gate/up and down require (the sequential
-                // loop instead reused one ex_act and accumulated into `o`).
-                let act_slot = (2 * inter_local) as i64;
+                // Per-slot strides. `ex_act_b` holds [topk][?] where ? is
+                // 2*inter_local (unfused: gate|up) or inter_local (fused: the
+                // swiglu'd result written by the kernel's epilogue).
+                // `ex_down_b` [topk][dim]; both disjoint.
+                let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+                    && self.dev.supports_gateup_fuse();
+                let act_slot = if gateup_fused {
+                    inter_local as i64
+                } else {
+                    (2 * inter_local) as i64
+                };
                 let down_slot = dim as i64;
                 let ids = self.s.route_idx.ptr as *const i32;
                 self.dev.expert_gate_up_fp4_batched(
@@ -2330,14 +2338,27 @@ fn fuse_b1() -> bool {
                     w3s_stride,
                     ids,
                 )?;
-                self.dev.swiglu_limit_batched(
-                    self.s.ex_act_b.ptr as *mut f32,
-                    1,
-                    inter_local as i32,
-                    cfg.swiglu_limit,
-                    act_slot,
-                    topk as i32,
-                )?;
+                // gate_up+swiglu fusion: when the fused path ran (kernel wrote
+                // the swiglu'd inter-width result directly), skip the separate
+                // swiglu launch. The launcher's env-gated `fuse` mirrors this:
+                // both must agree. The simplest correct wiring: try the fused
+                // path (the kernel sets it when mode==2 && dim%512==0), and skip
+                // swiglu when it did. We can't read the kernel's decision from
+                // here, so we mirror the same condition.
+                let gateup_fused = std::env::var("DSV41_GATEUP_FUSE")
+                    .map(|v| v != "0")
+                    .unwrap_or(true)
+                    && self.dev.supports_gateup_fuse();
+                if !gateup_fused {
+                    self.dev.swiglu_limit_batched(
+                        self.s.ex_act_b.ptr as *mut f32,
+                        1,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                        act_slot,
+                        topk as i32,
+                    )?;
+                }
                 // row_weight is PER SLOT here: route_w is [topk] and contiguous,
                 // so the kernel reads route_w[slot] (rw_stride = 1) — the exact
                 // scalar the sequential call passed as `route_w + slot`.
