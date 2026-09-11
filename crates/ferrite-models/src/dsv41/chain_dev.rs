@@ -95,10 +95,6 @@ struct Scratch {
     wo: DevBuf,    // [o_lora]
     logits: DevBuf,
     ids: DevBuf,   // [1] i32
-    /// DSV41_HEAD_SLICE only: the raw u64 comparison key from this rank's
-    /// vocabulary-slice reduce, published to the peers for the cross-rank
-    /// final pick.
-    argmax_packed: DevBuf, // [1] u64
     /// The device position counter: the argmax (the step's last kernel)
     /// advances it, so every kernel during the step reads a stable current pos.
     pos_ctr: DevBuf, // [1] i32
@@ -389,7 +385,6 @@ impl<'a> DevChain<'a> {
             wo: dev.alloc(fb(cfg.n_groups_o_lora()))?,
             logits: dev.alloc(fb(cfg.vocab_size))?,
             ids: dev.alloc(4)?,
-            argmax_packed: dev.alloc(8)?,
             pos_ctr: dev.alloc(4)?,
             clen: dev.alloc(cfg.n_layers * 4)?,
             scores: dev.alloc(fb(n_exp))?,
@@ -1055,7 +1050,11 @@ impl<'a> DevChain<'a> {
                 seg as i32,
                 (rank * seg) as i32,
                 self.s.ids.ptr as *mut std::ffi::c_int,
-                self.s.argmax_packed.ptr as *mut u64,
+                // packed key buffer: DIAGNOSTIC - temporarily absent (the
+                // unconditional 8-byte pool allocation it needed is itself a
+                // suspect for the degeneration, being wedged between ids and
+                // pos_ctr in the Scratch ordering).
+                std::ptr::null_mut(),
                 self.s.pos_ctr.ptr as *mut std::ffi::c_int,
                 c.peer_slots_dev() as *const u64,
                 world as i32,
