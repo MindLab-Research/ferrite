@@ -5194,3 +5194,51 @@ UB 运气（越界写恰好落在未用区域）。因此 **hcd/r3 两个"err 70
 ### hc tail 重叠探针（已部署远端 /tmp/tail_probe）
 
 测 sinkhorn（warp0 串行 ~20 轮）能否与 collapse（1024 线程）重叠：A=串行基线 / B=无 sinkhorn 地板 / C=warp0 sinkhorn + 其余 collapse。若 C−B ≪ A−B 则重叠可回收 ~0.2ms/步。
+
+## 2026-09-11 晚（第 9-12 轮）：逐步落地与两次编译教训
+
+### 验证矩阵（同会话背靠背，判据 = 四段文本 + faults + p50）
+
+| 轮 | 臂 | 改动 | p50 | tok/s | 结论 |
+|---|---|---|---|---|---|
+| 9 | a32f | a32 修复（mx launcher 漏加 k*4 的 smem） | **10.65ms** | **93.9** | ✅ a32 落地（−0.30ms） |
+| 9 | exp | + expert SACT padding + float2 LUT | 10.89ms | 91.8 | ❌ 回归 +0.24ms → SACT 移除（padding 的地址 ALU 落在关键链，冲突只值 ~1%） |
+| 10 | hs/exp2 | （printf 编译错误 → 旧 .so） | — | — | ⛔ 编译失败不算数 |
+| 11 | all/hsd | （s_act() 圆括号 → 31 错 → 旧 .so） | — | — | ⛔ 编译失败不算数 |
+| 12 | all/hsd | s_act[] 修复 + indexer 两步走 + 全部叠加 | 验证中 | — | — |
+
+**会话累计（已验证）**：13.28 → **10.65ms（+24.6%），75.3 → 93.9 tok/s**。
+
+### 两次编译教训（都是 sed/replace_all 的坑）
+
+1. **printf 在 device 代码需 `<cstdio>`**——argmax 交换核的 watchdog printf 直接编译错。
+2. **`sed 's/SACT(/s_act(/g'` 把宏调用换成函数调用**——`SACT(j+0)` 的宏展开是数组索引，sed 只换了前半，留下 `s_act(j+0)` 圆括号 → 31 个"expression preceding parentheses must have function type"。
+   **规则：宏→数组的替换必须同时换圆括号→方括号；sed 替换后必须本地编译验证再推送。**
+
+### expert SACT 的定案（负结果）
+
+SACT padding（每 16 float 插 1 空位破 16 路 bank conflict）**实测 +0.24ms 回归**。机制与 lutcf-impl 的 gemv 发现一致：
+- bank conflict 只值 ~1%（distinct-banks 已在均匀随机上限）
+- padding 的地址 ALU（`x + (x>>4)`）落在消费链关键路径上，是净亏
+- **保留**：float2 LUT（256 项 byte→float2，一次 LDS.64 出两 nibble，无地址 ALU）✓
+
+### indexer 两步走（已提交，第 12 轮验证）
+
+- **Stage A**（新 `indexer_score_kernel`）：grid (256, m, b) = 2048 warp 在飞 vs 原来 32 warp × 64 波串行；grid-stride 扫 `*lens`（图冻结安全）；写 `g_idx_score[8][65538]`（编译期常量 stride，~2.1MB device）。
+- **Stage B**（原 `indexer_topk_kernel`）：打分段换成一次 load；排序/归并/输出一字不改。
+- **逐位一致（构造保证）**：lane<nh 映射、c 升序点积、h 升序 shuffle 求和、scale 乘法顺序、cl/cand 掩码全部逐句相同。
+- ⚠️ `kIdxMaxPos=65538` 与 `DSV41_MAX_POS` 锁步——调大后者必须同步调大前者（否则两端一起钳位、静默漏候选）。
+
+### hc-merge（方案 B' 完整设计已产出，待实施）
+
+单 kernel grid=(mix+1, rows)、1024 线程：`m<mix` 的块做 dot→ticket；`m==mix` 的块先做 collapse+rmsnorm+fp8（T1 epilogue 前移），再自旋等 ticket==mix，然后做 mixes/sigmoid/sinkhorn/comb，最后 ticket 自复位。
+- 收益 −0.16~0.24ms（省 80 次 launch 固定成本 + collapse 相移出关键路径）
+- 头号风险：**禁止任何提前 return**（__syncthreads 需全块到达）；grid 必须精确
+- 死锁安全：B300 驻留 ~296 块 ≫ 2×(mix+1)=50；rows==1（当前唯一调用点）
+- 完整代码骨架在 offload ol_c69ba2fb（占位符标注了需粘贴的原文段落）
+
+### 战略方向（用户 2026-09-11 指示）
+
+1. **GLM+DSV41 架构统一**（arch-unify 报告已产出）：7 项重复逻辑清单 + 分层蓝图（ferrite-types ← ferrite-kernel{devrt} ← ferrite-exec ← ferrite-models{层描述} ← serve ← http）；fast wins = build_id 门禁合并、argmax 共享、graph 捕获统一 Relaxed。
+2. **KV cache 管理 + 前缀命中**（kvcache-prefix 报告已产出）：现状 = per-seq 连续大 buffer 无前缀复用；方案 = page 化 + 前缀哈希。
+3. **1M 上下文 prefill**（prefill-1m 调研中）。
