@@ -5652,8 +5652,9 @@ xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合�
 ⇒ `s_lut` 基址天然 4 字节对齐。已用等价的 host 侧指针算术交叉核对：kernel 端所需总字节
 == launcher gsmem（k∈{1024,2304,4096,5120,7168} 全通过）。
 
-⚠️ **smem 余量**：默认形状（k=5120, warps=4, mode 4）gsmem = **47104 B < 49152 B（48KB）**，
-刚好仍在默认上限内（改前是 25600 B）。`DSV41_MIX_WARPS=8` 或 k 变大即越过 48KB →
+⚠️ **smem 余量**：默认形状（k=5120, warps=4, mode 4）在 LUT+a32 落地时是 **47104 B < 49152 B
+（48KB）**；**P1 a32 死槽消除（2026-09-11 追加，见下）后降至 41984 B**（= 4×5120 + 1024 +
+4×5120，去掉 mode 4 的 k 字节 `s_a` staging）。`DSV41_MIX_WARPS=8` 或 k 变大仍可能越过 48KB →
 走已存在的 `cudaFuncSetAttribute(..., 232448)` 分支（sm_100 上限 227KB，安全）。
 
 ⚠️ **数值一致性**：LUT 由**同一个** `e4m3_to_f` 生成；`s_af[j]` 就是循环里原先算的那个乘积
@@ -5663,6 +5664,20 @@ xn-megafuse 预测 −1.0 高估 2-4 倍（5 族不可能一 launch）；融合�
 **验证状态**：`cargo check -p ferrite-models` ✓（Rust 侧无签名变化）；本机无 nvcc / 无 GPU
 ⇒ `.cu` 未编译、未实测。落地前必须 `kernels/cuda/build.sh` 重建 `.so`（build_id 会变化，
 Rust 侧强制同源）并在 b300 上跑真实权重一致性 + nsys 差值。
+
+**P1 a32 死槽消除（2026-09-11 追加，代码已改，待编译+实测）**：`gemv_bf16_fp8x2_kernel`
+**没有** a32 门/参数——消费循环无条件读 `s_af`（等价 a32 恒 ON），因此 mode 4 的 k 字节
+`s_a` staging 的**唯一**读者就是物化循环（`ap0 = (vec == 4) ? s_a : a`）。把它与物化合并为
+"global uint4 宽读 → LUT → ×`a_scale` → 直写 `s_af`"一趟后，`s_a` 槽不再分配：
+- kernel：`s_lut` 基址由 `s_a + (vec == 4 ? k : 0)` 改为 `s_w + nwarps*k`（mode 3 本就 offset 0，
+  布局字节级不变）；删除 staging 循环；物化循环改为单趟 uint4 直写（含 `k>>4` 尾部标量路径）。
+- launcher `dsv41_gemm_bf16_fp8x2`：`gsmem` 去掉 `(vec == 4) ? (warps + 1) * k` 的额外行，
+  两种 mode 统一为 `warps*k + 256*4 + k*4`。默认形状 gsmem **47104 → 41984 B**。
+- `s_af[j]` 仍是同一乘积（同一 LUT 项、同一 scale），`s_a` 只是 `a` 的副本 ⇒ **逐位一致**。
+- ⚠️ 该核**没有** a32=0 回退臂（不像单族 `gemm_fp8_gemv_kernel` 有 `DSV41_GEMV_A32`），
+  回归只能 revert。`a` 的 uint4 宽读复用原 staging 的同一地址/对齐假设（k 为 16 的倍数，
+  launcher 已断言），无新风险。
+- 验证：`cargo check -p ferrite-models` ✓；本机无 nvcc ⇒ 同上门槛（rebuild `.so` + b300 一致性）。
 
 
 ### ✅ 第 25 轮定案：MIX_GATE 翻 OFF（9.38ms / 106.6 tok/s）
@@ -6787,3 +6802,15 @@ ILV 旁路、K 序变化后的 parity 复验（`fp4×fp4` 乘积精确但 f32 �
 | 其它 | ~0.4 | 6% |
 
 **⚠️ nsys 读数陷阱**：加载期 kernel 按步数归因会误导优先级——所有从 nsys 表推导的分解必须先剔除加载期 launch。
+
+### 2026-09-12 00:30：P1 + B+C 优化提交（远端验证中）
+
+**本轮优化**（在 K-split ON 的 6.57ms 基础上）：
+1. **gemm P1 a32 死槽消除**：s_a staging + 物化两趟合并为一趟直写 s_af → smem 48512→43392B → 4→5 blocks/SM。预期 −0.1~0.3ms
+2. **hc tail B**：EARLY 回主流（图操作 4→2/front × 80 front）→ dots+LATE 留侧流（15.6µs << 50µs 窗口）。预期 −0.2ms
+3. **hc tail C**：HC_TAIL_PRIO Greatest→Default（LATE 是 1-block 核，greatest 反而抢 SM）
+4. **expert launch_bounds**：gateup `(1024)` + down `(256,4)` 固化寄存器（防 01291b2 型悬崖）
+5. **gemv_bf16_fp8x2 的 a32 死槽**：gemv-bf16-fp8x2-dead 实施中
+
+**全部落地预期**：6.57 − 0.3~0.5 = ~6.07~6.27ms ≈ **160-165 tok/s**
+**距离 200（5.0ms）**：还需 ~1.07ms

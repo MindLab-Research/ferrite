@@ -3935,11 +3935,19 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
     const int nwarps = (blockDim.x + 31) >> 5;
     const int nb_k = k >> 5;
     extern __shared__ uint8_t s_w[];
-    uint8_t* s_a = s_w + (size_t)nwarps * (size_t)k;   // block-level fp8 activation
-    // The fp8 family's per-block scratch, laid out AFTER the activation staging so
-    // the warp slices of s_w (rows) and s_a (mode 4) keep their offsets untouched.
-    // k is a multiple of 16 (launcher-checked), so this base stays 4-byte aligned
-    // for the f32 tables in both modes.
+    // P1 (a32 dead-slot; same fix as gemm_fp8_gemv_kernel): the k-byte fp8
+    // activation staging row used to sit at `s_w + nwarps*k` and had exactly ONE
+    // reader -- the materialisation loop below. Fusing the staging copy and that
+    // decode into a single global uint4 load -> LUT -> straight-to-`s_af` pass
+    // removes the last reader, so the k-byte slot is never allocated. `a` is a
+    // read-only input, so the same bytes go through the same LUT entry and the
+    // same scale => bit-identical output. This kernel has no a32 gate/parameter
+    // (every fp8 row consumes `s_af`), so no mode keeps the slot alive: mode 3
+    // already read `a` directly, mode 4 now does too.
+    //
+    // The fp8 family's per-block scratch starts right after the warp slices of
+    // s_w. k is a multiple of 16 (launcher-checked), so this base stays 4-byte
+    // aligned for the f32 tables.
     //
     // LUT + a32 are the SAME two optimisations the single-family gemv carries
     // (gemm_fp8_gemv_kernel); this fused kernel was never brought along, so its
@@ -3948,26 +3956,33 @@ __global__ void gemv_bf16_fp8x2_kernel(const __nv_bfloat16* __restrict__ wb,
     // every decoded value is bit-identical, and s_af[j] is exactly the product
     // the loop used to form inline (s_lut[ap[j]] * a_scale[j>>5]), so the
     // rounding sequence is unchanged: the output stays bit-identical.
-    float* s_lut = reinterpret_cast<float*>(s_a + (size_t)((vec == 4) ? k : 0));
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
     float* s_af = s_lut + 256;
-    if (vec == 4) {
-        const int n16a = k >> 4;
-        for (int i = threadIdx.x; i < n16a; i += blockDim.x)
-            *reinterpret_cast<uint4*>(s_a + (i << 4)) =
-                *reinterpret_cast<const uint4*>(a + (i << 4));
-        for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) s_a[i] = a[i];
-    }
     // Build the e4m3 decode table once per block (256 entries, two iterations per
     // thread at the default block size) and, after the barrier, materialise the
-    // scaled activation. Both live outside the two family branches: the barrier
-    // must be reached by every thread of the block, and the bf16 rows simply
-    // never read either table.
+    // scaled activation straight from global. Both live outside the two family
+    // branches: the barrier must be reached by every thread of the block, and the
+    // bf16 rows simply never read either table.
     for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
     __syncthreads();
     {
-        const uint8_t* ap0 = (vec == 4) ? s_a : a;
-        for (int i = threadIdx.x; i < k; i += blockDim.x)
-            s_af[i] = s_lut[ap0[i]] * a_scale[i >> 5];
+        // P1: one pass global -> LUT -> s_af. The uint4 read is the SAME wide read
+        // the removed staging loop performed into `s_a`, and the decode is the SAME
+        // `s_lut[b] * a_scale[i>>5]` product the materialisation applied to the
+        // bytes it read back from shared memory, so the emitted f32 is
+        // bit-identical -- only the smem round trip disappears.
+        const int n16a = k >> 4;
+        for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+            const uint4 v = *reinterpret_cast<const uint4*>(a + (i << 4));
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int idx = (i << 4) + j;
+                s_af[idx] = s_lut[b[j]] * a_scale[idx >> 5];
+            }
+        }
+        for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x)
+            s_af[i] = s_lut[a[i]] * a_scale[i >> 5];
     }
     __syncthreads();
     const int total = nb + 2 * nf;
@@ -4034,14 +4049,15 @@ extern "C" int dsv41_gemm_bf16_fp8x2(const void* wb, const float* biasb, float* 
         return (int)cudaErrorInvalidValue;
     const int total = nb + 2 * nf;
     const int blocks = (total + warps - 1) / warps;
-    // weights [nwarps][k] + (mode 4) block activation [k] + the e4m3 decode table
-    // [256] f32 + the a32 pre-decoded activation [k] f32. The tables sit right
-    // after s_a, matching the kernel's pointer arithmetic above; without them
-    // here the kernel's s_lut base would fall outside the dynamic allocation.
+    // weights [nwarps][k] + the e4m3 decode table [256] f32 + the a32 pre-decoded
+    // activation [k] f32. P1: the k-byte activation staging row that mode 4 used
+    // to add on top is gone -- the kernel reads `a` straight from global into
+    // `s_af` now, so both modes ask for `warps * k` weight rows. The tables sit
+    // right after those rows, matching the kernel's pointer arithmetic above;
+    // without them here the kernel's s_lut base would fall outside the dynamic
+    // allocation.
     const size_t scale_bytes = 256 * sizeof(float) + (size_t)k * sizeof(float);
-    const size_t gsmem = ((vec == 4) ? (size_t)(warps + 1) * (size_t)k
-                                     : (size_t)warps * (size_t)k) +
-                         scale_bytes;
+    const size_t gsmem = (size_t)warps * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
         cudaError_t e = cudaFuncSetAttribute(gemv_bf16_fp8x2_kernel,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, dsv41_smem_ceiling(gemv_bf16_fp8x2_kernel));

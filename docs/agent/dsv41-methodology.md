@@ -147,6 +147,12 @@ tail split 理论上限 −0.86ms，实测只兑现 −0.20ms。根因两条并�
 内核 `a32_direct`（`dsv41_kernels.cu:~3080`）与 launcher `dsv41_gemv_sa_bytes`（`:~2613`）必须同步；
 `_rope_norm` 例外（prologue 写 `s_a`）。见 `dsv41-kernel-inventory-v3.md` §待实测清单 0。
 
+**P1 第二处（2026-09-11 已落地，未实测）**：同法施加到 `gemv_bf16_fp8x2_kernel`
+（`dsv41_gemm_bf16_fp8x2`）。该核**没有** a32 门/参数——消费循环无条件读 `s_af`（等价 a32 恒 ON）
+⇒ mode 4 的 `s_a` staging 确为死槽，合并无需条件判断。kernel `s_lut` 基址改 `s_w + nwarps*k`、
+删 staging 循环、物化改 global uint4 → LUT → 直写 `s_af`；launcher gsmem 去掉 `(vec==4) ? (warps+1)*k`
+的额外行 ⇒ 默认形状 gsmem **47104 → 41984B**。**该核无 a32=0 回退臂**，回归只能 revert。
+
 **命名陷阱**：`DSV41_GEMV_FP8_MODE=3` **不是** a32 开关（mode 3 也物化 `s_af`）。
 mode 3 vs 4 隔离的是 **k 字节的激活 staging**，不是 **4k 字节的 a32 表**（`STATUS.md:6408`）。
 

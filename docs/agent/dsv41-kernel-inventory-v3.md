@@ -541,9 +541,14 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    但那是把 global 读留在**物化循环里逐字节**；本方案保留 uint4 宽读，只是把两趟并成一趟，
    属于 mode 3/4 之间的第三点，**仍需实测**（`scripts/dsv41_a32_bench.sh` 的 smem/blocks-per-SM
    一栏现在应打印 43392B / 5）。
-   ⚠️ 同类机会（**未改**）：`gemv_bf16_fp8x2_kernel`（`dsv41_gemm_bf16_fp8x2`）有完全相同的
-   死槽（其 `s_a` 也只被物化循环读，`dsv41_kernels.cu` 内核定义与 launcher gsmem 的
-   `(vec == 4) ? (warps + 1) * k`）——同法可再省 k 字节，本次按范围未动。
+   ✅ 同类机会（**2026-09-11 已同法落地**）：`gemv_bf16_fp8x2_kernel`
+   （`dsv41_gemm_bf16_fp8x2`）有完全相同的死槽——其 `s_a` 也只被物化循环读，且该核**没有**
+   a32 门/参数（消费循环无条件读 `s_af`，等价 a32 恒 ON），所以合并是**无条件**的。kernel
+   `s_lut` 基址改 `s_w + nwarps*k`（原 `s_a + (vec == 4 ? k : 0)`；mode 3 本就 offset 0，
+   布局不变）、删 staging 循环、物化循环改 global uint4 → LUT → 直写 `s_af`；launcher gsmem
+   去掉 `(vec == 4) ? (warps + 1) * k` 的额外行 ⇒ 默认形状（k=5120/warps=4/mode 4）gsmem
+   **47104 → 41984 B**。签名/门不变，无 Rust 改动。⚠️ 该核**没有** a32=0 回退臂，因此一旦
+   回归只能 revert（不同于单族 `gemm_fp8_gemv_kernel` 有 `DSV41_GEMV_A32=0` 对照臂）。
 1. **`down_reduce` +0.31ms 的定案**：隔离微基准（同一 kernel，HEAD vs `01291b2^`），或 revert 后重采 profile。**这是唯一挡住 0.31ms 回收的事。**
 2. **AR v5 的隔离绝对值**：0.66（v2 约定，被 §3 反证支持）vs 1.49（`86af349`，host-barrier 口径）。需要 device-side v5 的隔离测量。
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。

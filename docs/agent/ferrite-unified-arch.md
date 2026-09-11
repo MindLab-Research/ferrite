@@ -189,6 +189,8 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 
 **P1 a32 死槽消除（2026-09-11 已落地）**：a32=1 时 mode 4 的 k 字节激活 staging `s_a` 只剩一个读者（`s_af` 的物化循环）⇒ 把 uint4 拷贝 + 逐字节解码合成一趟直写 `s_af`，`s_a` 槽仅在需要时分配（内核 `a32_direct` + launcher `dsv41_gemv_sa_bytes`）。k=5120/warps=4 时 mode 4 的 gsmem **48512 → 43392B**，blocks/SM 4 → 5。详见 `dsv41-kernel-inventory-v3.md` §待实测清单 0。
 
+**P1 第二处（2026-09-11 已落地）**：`gemv_bf16_fp8x2_kernel`（`dsv41_gemm_bf16_fp8x2`）同法处理。该核无 a32 门/参数（消费循环无条件读 `s_af` ⇒ a32 恒 ON），合并无条件：kernel `s_lut` 基址改 `s_w + nwarps*k`、删 staging、物化改 global uint4 → LUT → 直写 `s_af`；launcher gsmem 去掉 `(vec==4) ? (warps+1)*k` 的额外行 ⇒ 默认形状 **47104 → 41984B**。
+
 **方法论（可复用）**：
 
 - 用 `cudaOccupancyMaxActiveBlocksPerMultiprocessor` + `ptxas -v` 把「smem 预算 → blocks/SM → wave」从**估算**变成**实测**。工程里已有探针：`dsv41_a32_bench.cu`（经 `dsv41_gemv_gsmem`/`dsv41_gemv_occupancy` 两个 host 探针打印每 shape 的 smem/blocks-per-SM/µs）+ `scripts/dsv41_a32_bench.sh` + `scripts/dsv41_recovery_verify.sh`。
