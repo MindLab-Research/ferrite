@@ -734,6 +734,35 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     float2* s_lut2 = reinterpret_cast<float2*>(s_act + k);
     const int kbytes = k >> 1;   // packed bytes per row
     const int ksc = k >> 5;      // e8m0 scales per row
+    // Vectorized staging (audit #2): one uint4 = 16 bytes = 32 fp4 values =
+    // exactly one scale block, so each thread-iteration is 1 LDG.128 + 1 scale
+    // load instead of 20 serial LDG.8s. BIT-EXACT: the nibble order (low ->
+    // even j, high -> odd j), the e2m1 decode and the per-32 scale multiply are
+    // identical to the byte loop below; only the number of load instructions
+    // changes. The f32 path gets the same treatment via float4.
+    if ((k & 31) == 0 && a != nullptr && act == nullptr &&
+        (((uintptr_t)a & 15) == 0)) {
+        const int nb32 = k >> 5;
+        for (int b32 = threadIdx.x; b32 < nb32; b32 += blockDim.x) {
+            const uint4 packed =
+                *reinterpret_cast<const uint4*>(a + (size_t)b32 * 16);
+            const float asc = a_scale[b32];
+            float* dst = s_act + (size_t)b32 * 32;
+            const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
+#pragma unroll
+            for (int q = 0; q < 16; ++q) {
+                dst[2 * q] = dsv41_e2m1_to_f((uint8_t)(pb[q] & 0xFu)) * asc;
+                dst[2 * q + 1] = dsv41_e2m1_to_f((uint8_t)(pb[q] >> 4)) * asc;
+            }
+        }
+    } else if ((k & 3) == 0 && act != nullptr && (((uintptr_t)act & 15) == 0)) {
+        const int nf4 = k >> 2;
+        for (int f4 = threadIdx.x; f4 < nf4; f4 += blockDim.x) {
+            const float4 v = *reinterpret_cast<const float4*>(act + (size_t)f4 * 4);
+            float* dst = s_act + (size_t)f4 * 4;
+            dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
+        }
+    } else {
     for (int j = threadIdx.x; j < k; j += blockDim.x) {
         if (act != nullptr) {
             s_act[j] = act[j];
@@ -742,6 +771,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             const float asc = a_scale[j >> 5];
             s_act[j] = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
         }
+    }
     }
     if (threadIdx.x < 256)
         s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
