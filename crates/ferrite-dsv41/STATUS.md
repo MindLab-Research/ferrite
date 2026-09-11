@@ -3489,3 +3489,29 @@ hc_mixes(self.s.h, hc_ffn_*)   -> premix_slot(2)=ffn_pre
 
 **顺带发现的可用旋钮**：`DSV41_PHASE=1` 打出 `[phs] L{layer} attn=...` 的**逐层分相计时** ✓
 （可直接区分 attn 段 / ffn 段的墙钟 ✓，比整步中位数更细 ✓，与"逐步直打"口径互补 ✓）。
+
+### ⚠️ hc_mixes spread 变体：−0.63ms 但**输出不同** ✗ ⇒ 不采用（2026-09-11 实测）
+
+同二进制、同会话、背靠背 A/B（四段文本 + 逐步直打 p50）：
+
+| 轮 | p50 | p10 | p90 | tok/s | faults | 文本 |
+|---|---|---|---|---|---|---|
+| base（默认，单块核 ✓）| **32.07ms** | 31.36 | 32.73 | 31.2 | 0 | Paris / **直诵**《静夜思》/ **`'2'`** / 《出师表》✓ |
+| `DSV41_HC_MIXES_SPREAD=1` | **31.44ms** | 30.72 | 32.16 | 31.8 | 0 | Paris / 静夜思（加了前言）/ **`'看起来你可能是想问"1+ Morgens"…'`** ✗✗ / 出师表 |
+
+**收益真实但极小**（−0.63ms / −2.0%，145 步 vs 98 步：spread 的回答更长 ⇒ p50 仍是同口径 ✓）。
+
+**但输出不同** ✗ ⇒ 与 `dsv41_kernels.cu:1722-1723` 的注释
+"arithmetic order is identical in every phase, so the outputs are bit-identical to the single-block
+kernel (verified against it directly)" **不相符** ✗。机制上可解释：spread 把 sinkhorn 移到独立的
+`hc_mixes_post_kernel`（fused 版里它在单个 warp 的寄存器内 ✓）⇒ **求和/归一化顺序改变** ✗；
+且 spread 是 **3 个 kernel**（ss / rows / post ✓）而 fused 是 1 个 ⇒ **多 2 个 hop** ✗，
+与"减少 kernel 数"的方向相悖 ✓。
+
+**处置**：**不翻默认** ✗（保持 env-gated 默认关 ✓）。**该注释的"逐位等同"表述需修正** ✗
+（待办：改成"数值接近但非逐位"或明确其已验证的范围 ✓）。**要采纳必须先拿到逐位等价证据**
+（用 `crates/ferrite-dsv41/tests/hc_parity.rs` 对两路径做元素级比对 ✓），而不是只靠步时 ✓。
+
+**方法论收获**：这正是"提速数字漂亮时必须先验语义不变式"的又一实例 ✓ ——
+−2% 的收益不值得一条未经验证的数值路径 ✓；**逐步直打的分位数（p10/p90）与文本人眼检查缺一不可** ✓
+（本次 p10/p90 都更好 ✗ 但文本退化了 ✗ ⇒ 纯看数字会误判为纯赚 ✓）。
