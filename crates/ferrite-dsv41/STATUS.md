@@ -3199,3 +3199,7 @@ if (lens != nullptr && *lens > 0) n_pos = *lens;   // 扫描上界跟设备 clen
 ⇒ **indexer 是唯一的"两端"结构** ✓，类级审计无其它同类隐患 ✓。
 （另：`indexer_topk` 的常量 smem ≈200KiB 超 48KiB 默认 ⇒ 必须 `cudaFuncSetAttribute(...232448)` ✓
 —— 已在启动器内按调用设置，理由同 `gemm_fp8_mx` 的注释：该属性是 per-context，TP8 每 rank 一个 context ✗。）
+**副作用已审计（无回退 ✓）**：常量 smem 增至 ~200KiB ⇒ 每 SM 至多 1 个 block —— 但
+`dsv41_indexer_topk` 的 grid 恒为 `(m, b) = (1, 1)`（DSV4.1 的 serve 连 prefill 也是
+**一次一 token 前向** ✓，且全树只有一个调用点 ✓）⇒ **本来就只有 1 个 block** ✓，
+占用率不受影响、prefill 无回退 ✓。
