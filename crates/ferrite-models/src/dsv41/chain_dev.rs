@@ -82,12 +82,26 @@ struct Scratch {
     xn: DevBuf,    // [dim]
     xq: DevBuf,    // [dim] fp8 e4m3
     xsc: DevBuf,   // [dim/32 + 8] f32 scales
+    /// T2 (MoE side): the ROUTED experts' fp4 packing of `xn`. Deliberately
+    /// DISJOINT from `xq`/`xsc`: when it shared those buffers the pack clobbered
+    /// the fp8 the hc tail had just emitted for `xn` (T1), so the shared expert
+    /// below paid a second `quant1(xn)`. With its own scratch that fp8 survives
+    /// and the shared expert's quant1 hits the still-set flag.
+    xq4: DevBuf,   // [dim] fp4 nibbles (dim/2 bytes used)
+    xsc4: DevBuf,  // [dim/32 + 8] f32 scales
     /// T1: set right after the hc tail emitted the fp8 quantisation of `xn`
     /// alongside its f32 write-back; the NEXT quant1 whose source is `xn` skips
     /// its launch (pointer-gated in quant1) and clears the flag. Any other
     /// quant1 (qr, o, ex_act, engram rows) is untouched - different source.
     /// Cell because quant1 takes &self (the whole lin/lin2 chain does).
     xq_of_xn_valid: std::cell::Cell<bool>,
+    /// T2 (attention side): set when `rmsnorm(qr)` emitted the fp8 of its own
+    /// normalised output through `ferrite_rmsnorm_q`; the NEXT quant1(qr) - the
+    /// wq_b (and, under IDX_FUSE, idx_wq_b) projection's - skips its launch and
+    /// clears the flag, exactly like `xq_of_xn_valid`. Consume-once is required
+    /// here: `s.xq` is rewritten by the o/wo quantisations between the wq_b and
+    /// the indexer's idx_wq_b, so only the FIRST qr consumer can be spared.
+    xq_of_qr_valid: std::cell::Cell<bool>,
     /// L2+L3: set by `attention()` when the wq_b + idx_wq_b pair was computed
     /// in ONE mx2 launch (`DSV41_IDX_FUSE`), so `indexer()` skips its own
     /// `lin(idx_wq_b)`. Cleared after the indexer consumes it (and whenever the
@@ -360,6 +374,18 @@ fn gateup_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_GATEUP_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// T2: DSV41_QR_EPI=0 reverts the qr rmsnorm's fused fp8 emission (the wq_b
+/// projection then quantises `qr` with its own dsv41_quant_fp8 launch, as
+/// before). DEFAULT ON - the emitted pair is bit-identical to that launch by
+/// construction (same absmax over the same 32-element block, same
+/// fast_round_scale, same clamp + __nv_fp8_e4m3 round), and an .so without
+/// `dsv41_rmsnorm_q` falls back on its own. Cached like the other gates: this
+/// site is inside the 40x/step layer loop.
+fn qr_epi() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_QR_EPI").map(|v| v != "0").unwrap_or(true))
+}
+
 /// DSV41_CUBLAS_M1=1 routes the M=1 f32/bf16 linears through cuBLAS.
 fn cublas_m1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -537,7 +563,11 @@ impl<'a> DevChain<'a> {
             // `dim` — sizing these by `dim` overflowed on the output projection)
             xq: dev.alloc(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter))?,
             xsc: dev.alloc(fb(dim.max(nh * hd).max(cfg.o_lora_rank).max(inter) / 32 + 8))?,
+            // fp4 packs 2 values per byte, so one row needs dim/2 bytes at most
+            xq4: dev.alloc(dim.max(8))?,
+            xsc4: dev.alloc(fb(dim / 32 + 8))?,
             xq_of_xn_valid: std::cell::Cell::new(false),
+            xq_of_qr_valid: std::cell::Cell::new(false),
             idx_q_ready: std::cell::Cell::new(false),
             pre: dev.alloc(fb(hc))?,
             post: dev.alloc(fb(hc))?,
@@ -699,6 +729,16 @@ impl<'a> DevChain<'a> {
         // kv-early fallback path) re-quantises identical bytes, harmlessly.
         if src == self.s.xn.ptr as *const f32 && self.s.xq_of_xn_valid.get() {
             self.s.xq_of_xn_valid.set(false);
+            return Ok(());
+        }
+        // T2: the qr rmsnorm emitted the fp8 of its own normalised output
+        // through ferrite_rmsnorm_q, so the wq_b projection's quant1(qr) (and,
+        // under IDX_FUSE, idx_wq_b's, which shares that one quantisation) is
+        // redundant. Consume-once: s.xq is rewritten by the o/wo quantisations
+        // before the indexer's separate idx_wq_b lin, so only the first qr
+        // consumer may skip.
+        if src == self.s.qr.ptr as *const f32 && self.s.xq_of_qr_valid.get() {
+            self.s.xq_of_qr_valid.set(false);
             return Ok(());
         }
         self.dev
@@ -1712,14 +1752,35 @@ fn fuse_b1() -> bool {
                 self.s.qr.ptr as *mut f32,
             )?;
         }
-        self.dev.rmsnorm(
-            self.s.qr.ptr as *const f32,
-            ld.q_norm.as_ref().unwrap().as_f32(),
-            self.s.qr.ptr as *mut f32,
-            1,
-            ql as i32,
-            cfg.norm_eps,
-        )?;
+        // T2 (attention side): the rmsnorm epilogue can emit the fp8 of its OWN
+        // normalised output (`ferrite_rmsnorm_q`), which is exactly what the
+        // wq_b projection's quant1(qr) - the very next qr consumer - would
+        // compute. Same absmax, same fast_round_scale, same clamp/e4m3 round
+        // sequence (T1's, term for term), so the emitted pair is bit-identical
+        // to the launch it replaces. Falls back to the plain rmsnorm (and a
+        // cleared flag) on an .so without the symbol.
+        let qr_q = qr_epi()
+            && self.dev.rmsnorm_q(
+                self.s.qr.ptr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                self.s.qr.ptr as *mut f32,
+                1,
+                ql as i32,
+                cfg.norm_eps,
+                self.s.xq.ptr as *mut u8,
+                self.s.xsc.ptr as *mut f32,
+            )?;
+        self.s.xq_of_qr_valid.set(qr_q);
+        if !qr_q {
+            self.dev.rmsnorm(
+                self.s.qr.ptr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                self.s.qr.ptr as *mut f32,
+                1,
+                ql as i32,
+                cfg.norm_eps,
+            )?;
+        }
         // L2+L3 fusion (verified by p1p2-zero-hist): `wq_b` and the indexer's
         // `idx_wq_b` read the SAME `qr` buffer (rmsnorm writes it in place at
         // :1572, neither touches it between :1580 and :1937), both k=ql=1280,
@@ -2378,7 +2439,16 @@ fn fuse_b1() -> bool {
         };
         let mut sh_via_mixed = false;
         if let Some((w1, w1s, w3, w3s)) = sh_w {
-            self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
+            // T2: only the MIX_GATE path reads the fp8 of `xn` here. With
+            // MIX_GATE off this quantisation has no consumer at all (the mixed
+            // launch below is skipped), yet it still CONSUMED the T1 flag - which
+            // is exactly why the shared expert's own quant1(xn) below (`if
+            // !sh_via_mixed`) had to re-quantise. Gating it on the same cached
+            // predicate the launch uses
+            // keeps the flag alive for the shared expert.
+            if mix_gate_shared() {
+                self.quant1(self.s.xn.ptr as *const f32, dim as i32)?;
+            }
             sh_via_mixed = mix_gate_shared()
                 && self.dev.gemm_bf16_fp8x2(
                     ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
@@ -2500,8 +2570,8 @@ fn fuse_b1() -> bool {
             // per-expert small kernels nsys counts ~850 times).
             self.dev.quant_fp4(
                 self.s.xn.ptr as *const f32,
-                self.s.xq.ptr as *mut u8,
-                self.s.xsc.ptr as *mut f32,
+                self.s.xq4.ptr as *mut u8,
+                self.s.xsc4.ptr as *mut f32,
                 1,
                 dim as i32,
                 32,
@@ -2537,8 +2607,8 @@ fn fuse_b1() -> bool {
                 let down_slot = dim as i64;
                 let ids = self.s.route_idx.ptr as *const i32;
                 self.dev.expert_gate_up_fp4_batched(
-                    self.s.xq.as_u8(),
-                    self.s.xsc.as_f32(),
+                    self.s.xq4.as_u8(),
+                    self.s.xsc4.as_f32(),
                     self.s.ex_act_b.ptr as *mut f32,
                     act_slot,
                     1,
@@ -2640,8 +2710,8 @@ fn fuse_b1() -> bool {
                     let w = (self.s.route_w.ptr as *const f32).wrapping_add(slot);
                     let ids = self.s.route_idx.ptr as *const i32;
                     self.dev.expert_gate_up_fp4_indirect(
-                        self.s.xq.as_u8(),
-                        self.s.xsc.as_f32(),
+                        self.s.xq4.as_u8(),
+                        self.s.xsc4.as_f32(),
                         self.s.ex_act.ptr as *mut f32,
                         1,
                         dim as i32,

@@ -5698,9 +5698,25 @@ MIX_GATE=OFF + GATEUP_FUSE=ON + DOWN_FUSE=ON + HEAD_SLICE=ON + sparse 3-deep + i
 **修法**：把分组推广到 k<512（uint32 宽加载 = 4 值/组）。down-vec-320 subagent 正在实施。
 预期 −0.15~0.2ms/步。
 
-**gateup 的另一个机会**：融合后两条链读同一 `s_act[j..j+15]`（gate 和 up 的地址完全相同）——
-显式 load 进寄存器一次供两链复用，可把该 group 的 L1TEX op 从 42 降到 26（−38%）。
-前提：nvcc 未做 CSE（需 cuobjdump -sass 确认）。
+**gateup 的另一个机会（2026-09-11 已用 SASS 证伪 ✗）**：融合后两条链读同一 `s_act[j..j+15]`
+（gate 和 up 的地址完全相同），当时推测「显式 load 一次供两链复用，可把该 group 的 L1TEX op
+从 42 降到 26（−38%）」，前提是「nvcc 未做 CSE」。
+
+**审计结果（nvdisasm -g + lineinfo，sm_103a，第 25/27 轮同源 tree）：nvcc 已经做了 CSE，此杠杆不存在。**
+证据（`expert_gemv_fp4_batched_kernel`，源码 768–853 = 融合分支）：
+- `LDS.128` 只出现在 **gate 链**的源码行（`788/792/800/804`），每 group 恰好 4 条 = 16 floats；
+- **up 链的 `s_act[j+0..15]` 读取（源码 819–838）产生的 LDS 数为 0** —— 直接复用 gate 链的寄存器；
+- 若未 CSE，up 链会再出 4 条 `LDS.128`（8 条/group）。
+- 融合区共 12 条 `LDS.128` = 4 × 3 份拷贝（主循环 2×unroll 两份 + peel 一份），每份都是 4 条。
+
+**实测每 group 的 L1TEX op = 26**：4 `LDS.128`（s_act）+ 16 `LDS.64`（LUT：gate 8 + up 8）
++ 6 `LDG`（4×32-bit 权重字 + 2×8-bit 尺度）。恰好等于上面「CSE 后」的预测值 26，
+说明**当前 SASS 已处于该预测的最优态**。所谓「42」是「26 + 16 条未复用的 s_act 标量 load」的
+假设值，与实测不符。**结论：不要实施显式复用（零收益，且会破坏 `#pragma unroll 2` 的寄存器策略）。**
+
+残留的唯一小杠杆（如仍要压 L1TEX）：权重字是 4 条 `LDG.E.CONSTANT`（32-bit）可合成 2 条
+`LDG.64`，2 条尺度字节可合成 1 条 `LDG.16` ⇒ 6→3，约 −11% L1TEX op/group。但本核已定案为
+**L1TEX 管道地板**，收益在噪声内，不建议动。
 
 ### stage-b-priority 的排序（把握×收益）
 

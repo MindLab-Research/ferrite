@@ -114,6 +114,14 @@ struct Kernels {
         *const f32, *const f32, *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int,
         *const c_int, c_int, c_int, c_int, c_int, f32, CuStream,
     ) -> c_int>,
+    // T2: rmsnorm that ALSO emits the fp8 (byte + per-32-block scale) of its own
+    // normalised output, so the next fp8 activation consumer of that row (the
+    // qr -> wq_b projection) skips its quant launch. Optional: an older .so
+    // without it falls back to (rmsnorm, quant_fp8). Returns 0 on success, 1
+    // when the shape cannot use the fused emission (caller then runs rmsnorm).
+    rmsnorm_q: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *mut f32, c_int, c_int, f32, *mut u8, *mut f32, CuStream,
+    ) -> c_int>,
     // bf16 gate + fp8 shared expert in ONE launch (same activation). Optional:
     // falls back to the separate launches.
     gemm_bf16_fp8x2: Option<unsafe extern "C" fn(
@@ -377,6 +385,7 @@ impl Device {
             rope_precompute: km!(rt, "dsv41_rope_precompute"),
             apply_rope: km!(rt, "dsv41_apply_rope"),
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
+            rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
@@ -1881,6 +1890,36 @@ impl Device {
     ) -> Result<()> {
         let rc = unsafe { (self.kernels.rmsnorm)(x, w, out, n, dim, eps, self.stream) };
         self.kerr(rc, "ferrite_rmsnorm")
+    }
+
+    /// T2: `rmsnorm` + the fp8 quantisation of its OWN normalised output in one
+    /// launch. The caller then skips the `quant_fp8` it would have run on the
+    /// same row. `Ok(false)` when the loaded .so predates the kernel, so the
+    /// caller runs the two launches instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_q(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        n: i32,
+        dim: i32,
+        eps: f32,
+        xq: *mut u8,
+        xsc: *mut f32,
+    ) -> Result<bool> {
+        let f = match self.kernels.rmsnorm_q {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe { f(x, w, out, n, dim, eps, xq, xsc, self.stream) };
+        // 1 == the launcher declined the shape (the warp-shuffle amax needs
+        // whole warps); the caller then runs rmsnorm + quant_fp8 as before.
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_rmsnorm_q")?;
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]

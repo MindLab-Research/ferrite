@@ -775,6 +775,16 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
 #pragma unroll 2
             for (int g2 = 0; g2 < nv2f; ++g2) {
                 const int j = (g2 << 9) + (lane << 4);
+                // Hoist the lane's 16 activation floats into registers ONCE per
+                // group: the gate chain and the up chain read the SAME 16 slots of
+                // s_act (identical addresses), but the SASS showed nvcc emitting
+                // every LDS.32 twice (no cross-chain CSE) - 32 shared loads per lane
+                // per group. Loading once and feeding both chains halves that to 16.
+                // BIT-EXACT: same addresses, same values, only fewer loads; s_act is
+                // read-only after the __syncthreads() above.
+                float sa[16];
+#pragma unroll
+                for (int i = 0; i < 16; ++i) sa[i] = s_act[j + i];
                 // ---- gate chain: row `row` of the `b`/`bsc` pair ----
                 const float gsc = __uint_as_float(((uint32_t)g_srow[j >> 5]) << 23);
                 const uint8_t* gp = g_row + (g2 << 8) + (lane << 3);
@@ -785,26 +795,26 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float2 gt1 = s_lut2[(gw0 >> 8) & 0xFFu];
                 const float2 gt2 = s_lut2[(gw0 >> 16) & 0xFFu];
                 const float2 gt3 = s_lut2[(gw0 >> 24) & 0xFFu];
-                gp0 = fmaf(s_act[j + 0], gt0.x, gp0);
-                gp1 = fmaf(s_act[j + 1], gt0.y, gp1);
-                gp2 = fmaf(s_act[j + 2], gt1.x, gp2);
-                gp3 = fmaf(s_act[j + 3], gt1.y, gp3);
-                gp0 = fmaf(s_act[j + 4], gt2.x, gp0);
-                gp1 = fmaf(s_act[j + 5], gt2.y, gp1);
-                gp2 = fmaf(s_act[j + 6], gt3.x, gp2);
-                gp3 = fmaf(s_act[j + 7], gt3.y, gp3);
+                gp0 = fmaf(sa[0], gt0.x, gp0);
+                gp1 = fmaf(sa[1], gt0.y, gp1);
+                gp2 = fmaf(sa[2], gt1.x, gp2);
+                gp3 = fmaf(sa[3], gt1.y, gp3);
+                gp0 = fmaf(sa[4], gt2.x, gp0);
+                gp1 = fmaf(sa[5], gt2.y, gp1);
+                gp2 = fmaf(sa[6], gt3.x, gp2);
+                gp3 = fmaf(sa[7], gt3.y, gp3);
                 const float2 gu0 = s_lut2[gw1 & 0xFFu];
                 const float2 gu1 = s_lut2[(gw1 >> 8) & 0xFFu];
                 const float2 gu2 = s_lut2[(gw1 >> 16) & 0xFFu];
                 const float2 gu3 = s_lut2[(gw1 >> 24) & 0xFFu];
-                gp0 = fmaf(s_act[j + 8], gu0.x, gp0);
-                gp1 = fmaf(s_act[j + 9], gu0.y, gp1);
-                gp2 = fmaf(s_act[j + 10], gu1.x, gp2);
-                gp3 = fmaf(s_act[j + 11], gu1.y, gp3);
-                gp0 = fmaf(s_act[j + 12], gu2.x, gp0);
-                gp1 = fmaf(s_act[j + 13], gu2.y, gp1);
-                gp2 = fmaf(s_act[j + 14], gu3.x, gp2);
-                gp3 = fmaf(s_act[j + 15], gu3.y, gp3);
+                gp0 = fmaf(sa[8], gu0.x, gp0);
+                gp1 = fmaf(sa[9], gu0.y, gp1);
+                gp2 = fmaf(sa[10], gu1.x, gp2);
+                gp3 = fmaf(sa[11], gu1.y, gp3);
+                gp0 = fmaf(sa[12], gu2.x, gp0);
+                gp1 = fmaf(sa[13], gu2.y, gp1);
+                gp2 = fmaf(sa[14], gu3.x, gp2);
+                gp3 = fmaf(sa[15], gu3.y, gp3);
                 g = fmaf(gsc, (gp0 + gp1) + (gp2 + gp3), g);
                 // ---- up chain: row `row` of the `b_hi`/`bhs` pair ----
                 const float usc = __uint_as_float(((uint32_t)u_srow[j >> 5]) << 23);
@@ -816,26 +826,26 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const float2 ut1 = s_lut2[(uw0 >> 8) & 0xFFu];
                 const float2 ut2 = s_lut2[(uw0 >> 16) & 0xFFu];
                 const float2 ut3 = s_lut2[(uw0 >> 24) & 0xFFu];
-                up0 = fmaf(s_act[j + 0], ut0.x, up0);
-                up1 = fmaf(s_act[j + 1], ut0.y, up1);
-                up2 = fmaf(s_act[j + 2], ut1.x, up2);
-                up3 = fmaf(s_act[j + 3], ut1.y, up3);
-                up0 = fmaf(s_act[j + 4], ut2.x, up0);
-                up1 = fmaf(s_act[j + 5], ut2.y, up1);
-                up2 = fmaf(s_act[j + 6], ut3.x, up2);
-                up3 = fmaf(s_act[j + 7], ut3.y, up3);
+                up0 = fmaf(sa[0], ut0.x, up0);
+                up1 = fmaf(sa[1], ut0.y, up1);
+                up2 = fmaf(sa[2], ut1.x, up2);
+                up3 = fmaf(sa[3], ut1.y, up3);
+                up0 = fmaf(sa[4], ut2.x, up0);
+                up1 = fmaf(sa[5], ut2.y, up1);
+                up2 = fmaf(sa[6], ut3.x, up2);
+                up3 = fmaf(sa[7], ut3.y, up3);
                 const float2 uu0 = s_lut2[uw1 & 0xFFu];
                 const float2 uu1 = s_lut2[(uw1 >> 8) & 0xFFu];
                 const float2 uu2 = s_lut2[(uw1 >> 16) & 0xFFu];
                 const float2 uu3 = s_lut2[(uw1 >> 24) & 0xFFu];
-                up0 = fmaf(s_act[j + 8], uu0.x, up0);
-                up1 = fmaf(s_act[j + 9], uu0.y, up1);
-                up2 = fmaf(s_act[j + 10], uu1.x, up2);
-                up3 = fmaf(s_act[j + 11], uu1.y, up3);
-                up0 = fmaf(s_act[j + 12], uu2.x, up0);
-                up1 = fmaf(s_act[j + 13], uu2.y, up1);
-                up2 = fmaf(s_act[j + 14], uu3.x, up2);
-                up3 = fmaf(s_act[j + 15], uu3.y, up3);
+                up0 = fmaf(sa[8], uu0.x, up0);
+                up1 = fmaf(sa[9], uu0.y, up1);
+                up2 = fmaf(sa[10], uu1.x, up2);
+                up3 = fmaf(sa[11], uu1.y, up3);
+                up0 = fmaf(sa[12], uu2.x, up0);
+                up1 = fmaf(sa[13], uu2.y, up1);
+                up2 = fmaf(sa[14], uu3.x, up2);
+                up3 = fmaf(sa[15], uu3.y, up3);
                 u = fmaf(usc, (up0 + up1) + (up2 + up3), u);
             }
             for (int off = 16; off > 0; off >>= 1) {

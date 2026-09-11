@@ -2711,6 +2711,73 @@ extern "C" int dsv41_rmsnorm_rope(const float* x, const float* w, float* out, co
     return (int)cudaGetLastError();
 }
 
+// T2: rmsnorm whose epilogue ALSO emits the fp8 activation pair (byte + scale)
+// of its OWN normalised output, in the rmsnorm write-back's pass. This is T1's
+// trick applied one level up: the value the norm loop writes as f32 is exactly
+// what quant_fp8 would read back, so the consumer's quant launch (the qr ->
+// wq_b projection, chain_dev.rs) is redundant and skipped.
+//
+// Warp/block alignment (the reason the amax is one shuffle): the write loop
+// strides by blockDim, which is a multiple of 32 and starts at column 0, so a
+// warp's 32 lanes cover EXACTLY one 32-element block per pass and the block
+// index is `i >> 5`. No barrier, no second global pass.
+//
+// The scale/quant arithmetic is quant_kernel's and hc_mixes_tail's T1 emission,
+// term for term: fast_round_scale(amax, 1/448), clamp +-448, __nv_fp8_e4m3. The
+// emitted pair is therefore bit-identical to the dsv41_quant_fp8 launch it
+// replaces. Requires every warp to be fully active inside the loop, which holds
+// only when dim and the final partial pass are multiples of 32 - the launcher
+// declines otherwise (returns 1) and the caller runs rmsnorm + quant_fp8.
+__global__ void rmsnorm_q_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                 float* __restrict__ out, int n, int dim, float eps,
+                                 uint8_t* __restrict__ xq, float* __restrict__ xsc) {
+    const int row = blockIdx.x;
+    if (row >= n) return;
+    const float* xr = x + (size_t)row * dim;
+    float* or_ = out + (size_t)row * dim;
+    // identical reduction tree to rmsnorm_kernel (blockDim-sized cross-warp)
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
+    float lane = ss;
+    for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffffu, lane, off);
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = lane;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+        red[0] = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    const int lane31 = threadIdx.x & 31;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        const float v = xr[i] * inv * w[i];
+        or_[i] = v;
+        float a = fabsf(v);
+        for (int off = 16; off > 0; off >>= 1)
+            a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+        const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+        if (lane31 == 0) xsc[i >> 5] = sc;
+        const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
+        const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
+        xq[i] = *(const uint8_t*)&f8;
+    }
+}
+
+extern "C" int dsv41_rmsnorm_q(const float* x, const float* w, float* out, int n, int dim, float eps,
+                               uint8_t* xq, float* xsc, cudaStream_t s) {
+    if (n <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    // The warp-shuffle amax needs all 32 lanes of a warp inside one 32-element
+    // block, i.e. no partially-active warp: dim must be a multiple of 32 and the
+    // last partial pass (dim % 1024) must be one too. Decline -> caller falls
+    // back to the two launches.
+    const int tail = dim % 1024;
+    if (dim % 32 != 0 || (tail != 0 && tail % 32 != 0)) return 1;
+    rmsnorm_q_kernel<<<n, 1024, 0, s>>>(x, w, out, n, dim, eps, xq, xsc);
+    return (int)cudaGetLastError();
+}
+
 static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
 
 // ---------------------------------------------------------------------------
