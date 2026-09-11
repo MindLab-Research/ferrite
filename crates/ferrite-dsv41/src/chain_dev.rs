@@ -325,13 +325,17 @@ impl<'a> DevChain<'a> {
             let max_comp = max_pos / ratio + 2;
             // The indexer's launcher sizes its dynamic shared memory from the n_pos
             // launch argument, which a graph capture freezes; the kernel scans up to
-            // the live device counter instead. That value must therefore be the
-            // CONSTANT bound this layer can ever reach - min(pool capacity, what the
-            // 200 KiB shared-memory budget can hold for the score array plus the
-            // per-pick scratch). Passing the per-step host count here is what let a
+            // the live device counter instead and clamps it to this same argument. That
+            // value must therefore be the CONSTANT bound this layer can ever reach -
+            // min(pool capacity, what the shared-memory budget can hold for the score
+            // array plus the per-pick scratch). The budget is the 48 KiB DEFAULT rather
+            // than the device maximum on purpose: staying under it needs no
+            // cudaFuncSetAttribute opt-in, which keeps this path identical in shape to
+            // the rest of the serve (and the earlier attempt at a ~200 KiB constant did
+            // fail at the attribute). Passing the per-step host count here is what let a
             // replayed graph index past the allocation once the device count grew.
             let idx_cap = {
-                let budget = 200 * 1024usize - 64 - cfg.index_topk * 2 * std::mem::size_of::<i32>();
+                let budget = 48 * 1024usize - 64 - cfg.index_topk * 2 * std::mem::size_of::<i32>();
                 max_comp.min(budget / (std::mem::size_of::<f32>() + 1)).max(1)
             };
             // The KV buffer holds the window ring FOLLOWED by the compressed

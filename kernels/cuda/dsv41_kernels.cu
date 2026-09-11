@@ -801,7 +801,12 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     // retrieval would silently degrade as the generation grows. The device counter
     // is already passed in as `lens`; prefer it whenever it is available and
     // non-zero (falling back keeps the pre-prefill / uninitialised case working).
-    if (lens != nullptr && *lens > 0) n_pos = *lens;
+    // It is CLAMPED to the argument: the launcher sizes its dynamic shared memory
+    // from that same argument, which is a per-layer CONSTANT (idx_cap in chain_dev.rs)
+    // precisely because a capture freezes it. Without the clamp a replay would index
+    // past that allocation as the device count grew - which is exactly what faulted
+    // before this pair of changes.
+    if (lens != nullptr && *lens > 0 && *lens < n_pos) n_pos = *lens;
     extern __shared__ float smem[];
     const int cols = topk < n_pos ? topk : n_pos;
     float* s_score = smem;                  // [n_pos]
@@ -1292,18 +1297,13 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
     const size_t smem =
         (size_t)n_pos * (sizeof(float) + 1) + (size_t)cols * 2 * sizeof(int) + 64;
     if (smem > 200 * 1024) return (int)cudaErrorInvalidValue;  // one CTA holds all scores
-    // The bound is a CONSTANT per layer (idx_cap in chain_dev.rs), so this shared
-    // memory is larger than the 48 KiB default even though the live candidate count
-    // is small - the kernel scans up to the device counter and masks the rest to
-    // -inf, and a graph freezes launch arguments, so the size must not depend on the
-    // current step. That means the opt-in attribute is required (same pattern as
-    // gemm_fp8_mx below); setting it per call is cheap and avoids the per-device
-    // pitfall (the attribute is per-context and a TP8 process has one per rank).
-    if (smem > 48 * 1024) {
-        cudaError_t e = cudaFuncSetAttribute(
-            indexer_topk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448);
-        if (e != cudaSuccess) return (int)e;
-    }
+    // The bound arrives as a CONSTANT per layer (idx_cap in chain_dev.rs), so this
+    // shared memory does not depend on the current step - a capture freezes launch
+    // arguments, and sizing it from the per-step count once left every replay indexing
+    // past the allocation as the device count grew. It is kept inside the 48 KiB
+    // default so no opt-in attribute is needed; the kernel clamps the live device
+    // counter to this same bound, and the launcher's guard above covers any shape that
+    // could not fit at all.
     dim3 grid((unsigned)m, (unsigned)b);
     indexer_topk_kernel<<<grid, 256, smem, s>>>(q, index_k, weights, candidates, compress_lens,
                                                 out, m, nh, hd, n_pos, topk, offset, softmax_scale,
