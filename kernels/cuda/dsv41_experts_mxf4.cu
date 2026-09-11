@@ -861,7 +861,7 @@ constexpr int kGateUpKsplitMax = 8;
 static int dsv41_gateup_ksplit(void) {
     static int cached = -1;
     if (cached < 0) {
-        int v = 1;
+        int v = 2;  // K-split default ON (A/B verified: 6.90->6.57ms, -0.33ms)
         if (const char* e = getenv("DSV41_GATEUP_KSPLIT")) {
             v = atoi(e);
             if (v < 1) v = 1;
