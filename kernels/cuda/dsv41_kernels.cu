@@ -2370,6 +2370,34 @@ static const int g_gemv_fp8_mode = [] {
     return 4;
 }();
 
+// a32 gate (DSV41_GEMV_A32), orthogonal to DSV41_GEMV_FP8_MODE. a32 is the
+// BLOCK-WIDE pre-decoded activation `s_af` (k f32 = 20 KB at the model's k=5120)
+// that turns the consume loop's per-element chain (LDS.8 -> LDS.32 -> FMUL) into
+// a single LDS.32. IMPORTANT: this buffer exists in BOTH staged modes - mode 3
+// merely reads the fp8 activation from global memory instead of the staged `s_a`
+// copy (see the `ap0` / `ap` selects below) - the mode-3-vs-4 difference is the
+// k-byte activation STAGING, not the 4k-byte a32 table. So the occupancy question
+// ("does dropping the 20 KB table pay at production n?") has NO switch in the
+// mode knob and needs this one.
+//
+// 1 (default) = materialise s_af block-wide, read it in the loop.
+// 0           = skip the materialisation and fold the decode+scale back into the
+//               loop's operand. The two forms compute the SAME product
+//               (s_lut[ap[j]] * s_as[j>>5]) so the result is bit-identical, which
+//               is the whole point of a fair occupancy A/B.
+//
+// The launchers MUST reserve dsv41_gemv_a32_bytes(k) in `scale_bytes` when this is
+// 0 (the kernel's `s_rows` slot then sits where `s_af` used to start), otherwise
+// kernel and launcher disagree on the layout.
+static const bool g_gemv_a32 = [] {
+    const char* e = getenv("DSV41_GEMV_A32");
+    if (e == nullptr) return true;
+    return atoi(e) != 0;
+}();
+static inline size_t dsv41_gemv_a32_bytes(int k) {
+    return g_gemv_a32 ? (size_t)k * sizeof(float) : (size_t)0;
+}
+
 // Rows per gemv block, shared by the single-family and the two-family launchers.
 // Four rows per block measured 15.91 against 16.14 ms for eight, same session,
 // same binary, text unchanged: halving the rows doubles the block count and the
@@ -2466,6 +2494,13 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
                                      const uint8_t* __restrict__ w_scale,
                                      const float* __restrict__ bias,
                                      float* __restrict__ out, int n, int k, int vec,
+                                     // a32 gate (DSV41_GEMV_A32, see g_gemv_a32): 1
+                                     // materialises the block-wide pre-decoded activation
+                                     // `s_af` (k f32); 0 skips it and folds the
+                                     // decode+scale into the consume loop. The launcher's
+                                     // `scale_bytes` MUST reserve dsv41_gemv_a32_bytes(k)
+                                     // to match, and `s_rows` follows it (see below).
+                                     int a32,
                                      // Second family: rows [n1, n1+n2) of the same input.
                                      // A single-family launch passes n1 == n and leaves
                                      // the family-2 pointers untouched, so every row maps
@@ -2642,12 +2677,15 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
     // 8.23/9.35/11.96). s_af[j] is the SAME product the loop used to compute
     // (s_lut[ap[j]] * sa with sa = s_as[j>>5]), so the rounding sequence is
     // unchanged and the output is bit-identical (fingerprint-verified).
-    float* s_af = s_lut + 256;
+    float* s_af = s_lut + 256;   // valid only when `a32` is set
     // B1: this block's 32 row values (one per warp), staged so the epilogue can
     // take the amax of the quant block they form. The 32-float slot is reserved
     // in every launcher's `scale_bytes` (see dsv41_gemm_fp8_mx); it is only
     // dereferenced when `xq` is non-null, which requires nwarps == 32.
-    float* s_rows = s_af + k;
+    // a32 off: the k-float `s_af` slot is not reserved, so that slot takes the
+    // B1 row stage's place instead (launchers drop the same k floats - see
+    // dsv41_gemv_a32_bytes).
+    float* s_rows = a32 ? (s_af + k) : (s_lut + 256);
     // NORM_FUSE prologue (see dsv41_gemm_fp8_mx_rope_norm). With `qr_raw`
     // non-null this block owns the activation's fp8 production: it reduces the
     // f32 row, applies the norm weight and encodes the scaled values into
@@ -2720,17 +2758,21 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
         for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
         __syncthreads();
         // a32: materialise the scaled activation (block-level, so the decode
-        // latency is paid once instead of once per row).
-        if (a_f32 != nullptr) {
-            // f32 direct read: the activation is already f32, so there is no LUT
-            // lookup and no per-block scale -- s_af IS the value. `s_lut` is still
-            // built above because the WEIGHT side of the consume loop decodes
-            // through it.
-            for (int i = threadIdx.x; i < k; i += blockDim.x) s_af[i] = a_f32[i];
-        } else {
-            const uint8_t* ap0 = (vec == 4) ? s_a : a;
-            for (int i = threadIdx.x; i < k; i += blockDim.x)
-                s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+        // latency is paid once instead of once per row). With DSV41_GEMV_A32=0
+        // the slot is not allocated and the consume loop folds the same product
+        // inline, so this whole block is skipped (barriers stay unconditional).
+        if (a32) {
+            if (a_f32 != nullptr) {
+                // f32 direct read: the activation is already f32, so there is no LUT
+                // lookup and no per-block scale -- s_af IS the value. `s_lut` is still
+                // built above because the WEIGHT side of the consume loop decodes
+                // through it.
+                for (int i = threadIdx.x; i < k; i += blockDim.x) s_af[i] = a_f32[i];
+            } else {
+                const uint8_t* ap0 = (vec == 4) ? s_a : a;
+                for (int i = threadIdx.x; i < k; i += blockDim.x)
+                    s_af[i] = s_lut[ap0[i]] * s_as[i >> 5];
+            }
         }
         __syncthreads();
     } else if (vec == 4) {
@@ -2809,10 +2851,16 @@ __global__ void gemm_fp8_gemv_kernel(const uint8_t* __restrict__ a,
             for (int kb = 0; kb < nb_k; ++kb) {
                 const float sb = ue8m0_to_f(row_sc[kb]);
                 const int j = kb * 32 + lane;
-                // a32: s_af[j] already folds s_lut[ap[j]] * s_as[j>>5], so the
+                // a32 on: s_af[j] already folds s_lut[ap[j]] * s_as[j>>5], so the
                 // per-element chain is one LDS.32 -> FMUL instead of
-                // LDS.8 -> LDS.32 -> FMUL -> FMUL.
-                acc += s_af[j] * (s_lut[row_s[j]] * sb);
+                // LDS.8 -> LDS.32 -> FMUL -> FMUL. a32 off (DSV41_GEMV_A32=0): the
+                // SAME product is folded inline (the f32 path reads a_f32 directly,
+                // exactly what the skipped materialisation would have copied into
+                // s_af). Both forms are bit-identical by construction.
+                const float av = a32 ? s_af[j]
+                                     : (a_f32 != nullptr ? a_f32[j]
+                                                         : s_lut[ap[j]] * s_as[j >> 5]);
+                acc += av * (s_lut[row_s[j]] * sb);
             }
             __syncwarp();
         } else if (vec) {
@@ -2991,7 +3039,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         // + (B1) the block's 32 staged row values.
         const size_t scale_bytes =
             (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-            (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + B1 row stage
+            dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + B1 row stage
         const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                              : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                       : (size_t)0;
@@ -3008,7 +3056,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
         // kernel's default arguments, so every trailing slot is spelled out.
         cudaError_t le = dsv41_pdl_or_plain(
             gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w,
-            w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, 0,
+            w_scale, bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n, 0,
             staging_tbl, epoch, world, my_rank, stride, xq, xsc, nullptr, nullptr, nullptr, 0, 0,
             0, 0, 0, 0, 0, nullptr, nullptr, 0.f, nullptr);
         if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
@@ -3062,7 +3110,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
@@ -3079,7 +3127,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope(const uint8_t* a, const float* a_scale, co
     // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
     cudaError_t le = dsv41_pdl_or_plain(
         gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w, w_scale,
-        bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, 0, nullptr,
+        bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n, 0, nullptr,
         nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off,
         rope_step, rope_inverse, rope_rd, rope_hd, 0, nullptr, nullptr, 0.f, nullptr);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
@@ -3128,7 +3176,7 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
     // mode 4 only: `warps` weight rows + the block-wide activation row.
     const size_t gsmem = (size_t)(warps + 1) * (size_t)k + scale_bytes;
     if (gsmem > 48 * 1024) {
@@ -3147,7 +3195,8 @@ extern "C" int dsv41_gemm_fp8_mx_rope_norm(const float* qr_raw, const float* qr_
     // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
     cudaError_t le = dsv41_pdl_or_plain(
         gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, nullptr, nullptr, w,
-        w_scale, bias, out, n, k, /*vec=*/4, nullptr, nullptr, nullptr, nullptr, n, 0, nullptr,
+        w_scale, bias, out, n, k, /*vec=*/4, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr,
+        n, 0, nullptr,
         nullptr, 0, 0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off,
         rope_step, rope_inverse, rope_rd, rope_hd, 0, qr_raw, qr_w, qr_eps, nullptr);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
@@ -3184,7 +3233,7 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the rope/B1 row stage
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
@@ -3201,7 +3250,8 @@ extern "C" int dsv41_gemm_fp8_mx2_rope(const uint8_t* a, const float* a_scale, c
     // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
     cudaError_t le = dsv41_pdl_or_plain(
         gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w1, w1_scale,
-        bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2, n1, 0, nullptr, nullptr, 0,
+        bias1, out1, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), w2, w2_scale, bias2, out2, n1, 0,
+        nullptr, nullptr, 0,
         0, 0, nullptr, nullptr, rope_cos, rope_sin, rope_base, rope_mul, rope_off, rope_step,
         rope_inverse, rope_rd, rope_hd1, rope_hd2, nullptr, nullptr, 0.f, nullptr);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
@@ -3231,7 +3281,7 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the B1 row stage slot
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the B1 row stage slot
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                   : (size_t)0;
@@ -3248,7 +3298,8 @@ extern "C" int dsv41_gemm_fp8_mx_add(const uint8_t* a, const float* a_scale,
     // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
     cudaError_t le = dsv41_pdl_or_plain(
         gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w, w_scale,
-        bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, /*epi_add=*/1,
+        bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n,
+        /*epi_add=*/1,
         nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
         0, nullptr, nullptr, 0.f, nullptr);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
@@ -3295,7 +3346,7 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     // slot [32]. The kernel never dereferences `a`/`a_scale` here.
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + B1 row stage
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + B1 row stage
     // Mode 4 allocates the (unused) block-wide activation copy; keep the caller's
     // mode so gsmem matches the branch the kernel's `vec` takes.
     const size_t gsmem = (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
@@ -3315,7 +3366,7 @@ extern "C" int dsv41_gemm_fp8_mx_f32(const float* a_f32, const uint8_t* w,
     // node-gap matters.
     cudaError_t le = dsv41_pdl_or_plain(
         gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, nullptr, nullptr, w,
-        w_scale, bias, out, n, k, g_gemv_fp8_mode, nullptr, nullptr, nullptr, nullptr, n, 0,
+        w_scale, bias, out, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), nullptr, nullptr, nullptr, nullptr, n, 0,
         nullptr, nullptr, 0, 0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0,
         0, nullptr, nullptr, 0.f, a_f32);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
@@ -3489,7 +3540,7 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     const int nb_k_al = (nb_k + 15) & ~15;
     const size_t scale_bytes =
         (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) + 256 * sizeof(float) +
-        (size_t)k * sizeof(float) + 32 * sizeof(float);   // a32 + the B1 row stage slot
+        dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);   // a32 + the B1 row stage slot
     const size_t gsmem = (g_gemv_fp8_mode == 3)   ? (size_t)warps * (size_t)k + scale_bytes
                          : (g_gemv_fp8_mode == 4) ? (size_t)(warps + 1) * (size_t)k + scale_bytes
                                                    : (size_t)0;
@@ -3506,11 +3557,47 @@ extern "C" int dsv41_gemm_fp8_mx2(const uint8_t* a, const float* a_scale,
     // PDL (see dsv41_pdl_or_plain): full argument list, defaults spelled out.
     cudaError_t le = dsv41_pdl_or_plain(
         gemm_fp8_gemv_kernel, dim3(blocks), dim3(warps * 32), gsmem, s, a, a_scale, w1, w1_scale,
-        bias1, out1, n, k, g_gemv_fp8_mode, w2, w2_scale, bias2, out2, n1, 0, nullptr, nullptr, 0,
+        bias1, out1, n, k, g_gemv_fp8_mode, (g_gemv_a32 ? 1 : 0), w2, w2_scale, bias2, out2, n1, 0,
+        nullptr, nullptr, 0,
         0, 0, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, 0, 0, nullptr, nullptr,
         0.f, nullptr);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// a32 / occupancy experiment probes (host only, no kernel change).
+//
+// dsv41_gemv_gsmem mirrors the launchers' `gsmem` arithmetic for the single-
+// family M=1 form, so a bench can print the smem the kernel will actually ask
+// for. dsv41_gemv_occupancy asks the driver for the blocks-per-SM that request
+// buys. Together they are what turns "a32 costs 20KB" into a measured
+// 4-vs-8 blocks/SM claim instead of an estimate.
+//
+// Both read the process's static gates (g_gemv_fp8_mode / g_gemv_a32), so run
+// one arm per process, like every other gate in this file.
+extern "C" size_t dsv41_gemv_gsmem(int mode, int warps, int k) {
+    const int nb_k = k >> 5;
+    const int nb_k_al = (nb_k + 15) & ~15;
+    const size_t scale_bytes = (size_t)warps * (size_t)nb_k_al + (size_t)nb_k * sizeof(float) +
+                               256 * sizeof(float) + dsv41_gemv_a32_bytes(k) + 32 * sizeof(float);
+    if (mode == 3) return (size_t)warps * (size_t)k + scale_bytes;
+    if (mode == 4) return (size_t)(warps + 1) * (size_t)k + scale_bytes;
+    return 0;   // scalar / vectorised allocate no dynamic smem
+}
+
+extern "C" int dsv41_gemv_occupancy(int warps, size_t gsmem) {
+    if (gsmem > 48 * 1024) {
+        if (cudaFuncSetAttribute(gemm_fp8_gemv_kernel,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 232448) != cudaSuccess)
+            (void)cudaGetLastError();
+    }
+    int blocks = 0;
+    cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks, gemm_fp8_gemv_kernel, warps * 32, gsmem);
+    if (e != cudaSuccess) { (void)cudaGetLastError(); return -1; }
+    return blocks;
 }
 
 extern "C" int dsv41_engram_hash(const int32_t* token_map, int64_t* cache, const int64_t* primes,

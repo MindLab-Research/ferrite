@@ -278,6 +278,20 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
 ```
 
 **待实测清单**（本次未能定案的，按优先级）：
+
+0. **a32 / 占用率（−0.74ms 的赌注）**：`gemm_fp8_gemv_kernel` 的 M=1 路径带一张 block 级
+   预解码激活表 `s_af`（"a32"，k×f32 = 20KB @ k=5120），它把 smem 从 ~27.4KB 抬到 ~47.4KB
+   （k=5120/warps=4：mode4 48512B，去掉 a32 28032B），即 blocks/SM 4 → 8。a32 的
+   −6/−8/−13% 只在 n=256/1024/1664 探针上测过，从未在生产 k=5120 复测。
+   **开关语义（易错，已核码）**：`DSV41_GEMV_FP8_MODE` 0=标量 / 1=向量化 / 3=保序分段 /
+   4=保序分段+块级**激活** staging（`s_a`，k 字节）。**a32（`s_af`，4k 字节）在 mode 3 也物化**
+   （mode 3 只是把 fp8 激活从 global 读而非读 `s_a`）⇒ `MODE=3` **不是** a32 开关。
+   a32 的独立门是 **`DSV41_GEMV_A32`**（1=默认保留；0=丢弃，逐位等价——同一乘积
+   `s_lut[ap[j]] * s_as[j>>5]`，只是内联回消费循环；smem 少 20KB）。
+   工具：`scripts/dsv41_a32_bench.sh`（隔离基准，打印每 shape 的 smem/blocks-per-SM/µs +
+   跨 arm 指纹校验）+ `scripts/dsv41_recovery_verify.sh`（哨兵→base→A/B 一键）。
+   `dsv41_a32_bench.cu` 经 `dsv41_gemv_gsmem` / `dsv41_gemv_occupancy` 两个 host 探针把
+   "20KB⇒4→8 blocks/SM" 从估算变成实测。
 1. **`down_reduce` +0.31ms 的定案**：隔离微基准（同一 kernel，HEAD vs `01291b2^`），或 revert 后重采 profile。**这是唯一挡住 0.31ms 回收的事。**
 2. **AR v5 的隔离绝对值**：0.66（v2 约定，被 §3 反证支持）vs 1.49（`86af349`，host-barrier 口径）。需要 device-side v5 的隔离测量。
 3. **每步图节点数**：`hex/window` 类小核 + AR 246 节点 + 节点尾延迟（≈0.9ms，v2 遗留）——用 `cuda_gpu_trace` 或图节点数直接量。

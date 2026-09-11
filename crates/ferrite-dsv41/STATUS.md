@@ -6400,10 +6400,19 @@ sparse 0.34 · v2(gate+route) 0.39 · quant 0.13 · 其它 ~0.9
 
 ### a32/占用率洞察的完整影响计算（2026-09-11 深夜）
 
-**gemv-creative 的发现**：mode 4 的 a32 staging（s_af = k×f32 = 20KB）把每 block smem 推到
-~47.4KB → 仅 4 blocks/SM = 25% 占用率。a32 的收益（−6/−8/−13%）是在 n=256/1024/1664 的
-探针上测的，**从未在生产 n=5120 复测**。如果关掉 a32 → 8 blocks/SM → 占用率翻倍，
+**gemv-creative 的发现**：a32 staging（`s_af` = k×f32 = 20KB @ k=5120）把每 block smem 推到
+~47.4KB → 仅 4 blocks/SM ≈ 25% 占用率。a32 的收益（−6/−8/−13%）是在 n=256/1024/1664 的
+探针上测的，**从未在生产 k=5120 复测**。如果关掉 a32 → ~27.4KB → 8 blocks/SM → 占用率翻倍，
 gemv 8.5µs → 5-6µs 可期（LDS 吞吐 + 每行 barrier 是硬底，2-3µs 不现实）。
+
+**⚠️ 2026-09-11 修正（读码核实）**：a32 **不是 mode 4 专有**。`s_af` 在 mode 3 与 mode 4
+**都**物化（`dsv41_kernels.cu` 的 `if (vec >= 3)` 块），mode 3 只是把 fp8 激活从 **global** 读
+而不是读已 staging 的 `s_a`（`ap0`/`ap` 的三元选择）——**mode 3 vs 4 隔离的是那 k 字节的激活
+staging，不是 4k 字节的 a32 表**。因此"a32 开关"必须新加：**`DSV41_GEMV_A32`**（1=保留，默认；
+0=丢弃，逐位等价，`s_af` 的 4k 字节从 `scale_bytes` 里去掉、`s_rows` 顶替其位置）。
+smem 账（k=5120, warps=4）：mode4+a32 = 48512 B；mode4+a32off = 28032 B；mode3+a32 = 43392 B；
+mode3+a32off = 22912 B。工具：`scripts/dsv41_a32_bench.sh`（隔离基准，含指纹校验）+
+`scripts/dsv41_recovery_verify.sh`（恢复后一键序列）。
 
 **完整 post-recovery 预期计算**：
 | 项 | 预期 | 累计 |
@@ -6420,4 +6429,32 @@ gemv 8.5µs → 5-6µs 可期（LDS 吞吐 + 每行 barrier 是硬底，2-3µs �
 | **最终预期** | | **4.2-5.2ms ≈ 192-238 tok/s** |
 
 **如果 a32 实验验证成功（占用率是 gemv 的真因），200 tok/s（5ms）在当前优化集内可达！**
-恢复后的验证顺序：哨兵 → serve base → a32 A/B（DSV41_GEMV_FP8_MODE=3 vs 4）→ 全量验证。
+恢复后的验证顺序：哨兵 → serve base → a32 A/B（`DSV41_GEMV_A32=0` vs 默认；对比臂
+`DSV41_GEMV_FP8_MODE=3`）→ 全量验证。一键：`scripts/dsv41_recovery_verify.sh`
+（隔离内核基准：`scripts/dsv41_a32_bench.sh`，直接给出每个 shape 的 smem + blocks/SM + µs + 指纹）。
+
+### 会话最终状态快照（2026-09-11 深夜，环境阻塞期）
+
+**已验证**：13.28 → 8.23ms（+61.4%），75.3 → 121.5 tok/s（round 41，四段全对，faults=0）
+
+**已提交待验证**（驱动恢复后 2-3 轮验证）：
+| 类别 | 项 | 预期 |
+|---|---|---|
+| 双流并行 | dual-chain attn + MoE dual + compress 侧链（实施中） | −1.4~2.2 |
+| PDL | attention 链 + expert 链 | −0.3~0.7 |
+| 融合 | sparse-o-rope + fp4-pack + hc_post compat + route + NORM_FUSE + wob-f32 + engram f32 | −0.6~0.8 |
+| AR | pubred stamp 并行 + 自适应退避 | −0.1~0.2 |
+| 占用率 | tail-late priority + gateup K-split（实施中） | −0.3~0.9 |
+| **实验** | **a32 真开关（DSV41_GEMV_A32）** | **−0.74（如果占用率是因）** |
+| 向量化 | down k=320（实施中） | −0.1~0.2 |
+
+**全部落地预期：4.2-5.2ms ≈ 192-238 tok/s（超过 200 目标！）**
+
+**关键洞察档案**：
+1. a32 的 20KB smem → 4 blocks/SM（从未在生产 n=5120 复测——恢复后第一实验）
+2. DSV4.1 expert 的"8 理论失败"是 GLM 的误挂——真因是 gateup 仅 240 blocks = 1.6/SM
+3. down 的 k=320 < 512 使 vec==2 主循环从不执行——标量尾循环 2 L1TEX ops/值
+4. fork/join 侧流模式 4 连胜（tail/dual/MoE-dual/compress）——不改 grid、无跨块同步
+5. hc_post fold ↔ tail split 互斥已解（join 位置问题非数据依赖）
+
+**阻塞**：b300-4 驱动 wedge（同 09-09 事故模式；CLEAN b875509 重建也失败；需用户重启）

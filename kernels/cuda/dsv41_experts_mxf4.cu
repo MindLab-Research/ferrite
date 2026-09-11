@@ -755,6 +755,45 @@ static int dsv41_experts_pdl_enabled(void) {
     return cached;
 }
 
+// Rows per CTA for the BATCHED gate/up launch (DSV41_GATEUP_ROWS, default 8 =
+// today's shape). ONE warp owns ONE row here, so blockDim = rows*32 and
+// grid.x = ceil(n_total/rows) with n_total = inter (fused) or 2*inter.
+//
+// ⚠️ THIS KNOB DOES NOT CHANGE THE WARP COUNT. rows x slots is the whole work
+// split (320 x 6 = 1920 row-dots at DSV4.1 shapes, one warp each), so re-packing
+// those warps into 240 / 480 / 960 SMALLER CTAs leaves the resident warps per SM
+// untouched (1920/148 = 13 either way) AND leaves the per-warp MLP untouched.
+// It is a CTA-GRANULARITY experiment, not an occupancy fix - see the
+// "expert-floor-revisit" note in docs/agent/dsv41-kernel-inventory-v3.md.
+// Its value is as a FALSIFICATION test of the "240 blocks = 1.6/SM is the
+// bottleneck" reading: if the per-call time is flat across 8 / 4 / 2, the CTA
+// count was never the lever and only a K-split (which multiplies the warp count)
+// can move the latency-hiding number.
+// Two secondary effects are real and both NEGATIVE:
+//  * s_act (k floats) + the 256-entry LUT are staged PER CTA and shared by that
+//    CTA's rows, so halving the rows per CTA DOUBLES the prologue per row;
+//  * a smaller CTA has fewer warps with which to overlap that prologue against
+//    the K loads.
+// The window loop is closed over the whole grid, so any value works; 8/4/2/1 are
+// the meaningful ones (a non-divisor only wastes tail CTAs).
+constexpr int kGateUpRowsMin = 1;
+constexpr int kGateUpRowsMax = 32;
+
+static int dsv41_gateup_rows(void) {
+    // Read once: this launcher runs 40x/step (same rule as the PDL gate above).
+    static int cached = -1;
+    if (cached < 0) {
+        int v = 8;
+        if (const char* e = getenv("DSV41_GATEUP_ROWS")) {
+            v = atoi(e);
+            if (v < kGateUpRowsMin) v = kGateUpRowsMin;
+            if (v > kGateUpRowsMax) v = kGateUpRowsMax;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
 // NOTE: the `<<<>>>` launch syntax takes no launch attribute, so both arms go
 // through cudaLaunchKernelEx (its variadic template applies the kernel's
 // declared parameter types to the arguments, exactly like `<<<>>>` would).
@@ -841,9 +880,14 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // and the existing __syncthreads() still publishes it.
     //
     // No-op on a plain launch (DSV41_PDL=0).
-    if (threadIdx.x < 256)
-        s_lut2[threadIdx.x] = make_float2(dsv41_e2m1_to_f((uint8_t)(threadIdx.x & 0xF)),
-                                          dsv41_e2m1_to_f((uint8_t)(threadIdx.x >> 4)));
+    // NOT a bare `if (threadIdx.x < 256)`: the block is only 256 threads at the
+    // default rows=8 (DSV41_GATEUP_ROWS); at a smaller CTA the guard would leave
+    // entries blockDim.x..255 of the table untouched (stale/garbage LUT). The
+    // stride loop is BIT-IDENTICAL at >= 256 threads (one iteration per thread,
+    // same index, same value).
+    for (int t = threadIdx.x; t < 256; t += blockDim.x)
+        s_lut2[t] = make_float2(dsv41_e2m1_to_f((uint8_t)(t & 0xF)),
+                                dsv41_e2m1_to_f((uint8_t)(t >> 4)));
 #if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
 #endif
@@ -1182,7 +1226,9 @@ __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __
 }
 
 // ============================================================================
-// down + reduce FUSED (DSV41_DOWN_FUSE on the Rust side, DEFAULT OFF since f3b1be1)
+// down + reduce FUSED (DSV41_DOWN_FUSE on the Rust side, DEFAULT ON: chain_dev.rs `down_fuse()` is
+// `.unwrap_or(true)` and the nsys v3 profile sees the fused kernel 40x/step.
+// f3b1be1's OFF default was later flipped back; this comment was stale.)
 // ============================================================================
 // The batched down direction used to cost TWO launches per layer: the per-slot
 // down GEMV (epi_mode 2, writing the [slots][dim] scratch) and
@@ -1622,7 +1668,12 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
     const uint8_t* w3s_base, long w3s_stride, const int* ids, int ilv, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
-    const int warps = 8;
+    // rows per CTA == warps per CTA (one warp owns one row). 8 = today's shape;
+    // DSV41_GATEUP_ROWS=4/2/1 re-packs the SAME warps into more, smaller CTAs -
+    // see the long note above dsv41_gateup_rows() for what that does and does
+    // not buy. Everything below (grid.x, blockDim, the kernel's nwarps) derives
+    // from this one value, so the window loop stays closed at any setting.
+    const int warps = dsv41_gateup_rows();
     // gate_up+swiglu fusion: each warp produces the PAIR (gate_i, up_i) and the
     // epilogue writes the swiglu'd inter-width result directly - one inter-width
     // write instead of the old 2*inter write + a separate swiglu kernel pass.
@@ -1709,7 +1760,9 @@ extern "C" int dsv41_moe_down_reduce(const float* part, float* out, int n, int s
 }
 
 // ============================================================================
-// down + reduce FUSED entry point (DSV41_DOWN_FUSE on the Rust side, DEFAULT OFF since f3b1be1)
+// down + reduce FUSED entry point (DSV41_DOWN_FUSE on the Rust side, DEFAULT ON: chain_dev.rs `down_fuse()` is
+// `.unwrap_or(true)` and the nsys v3 profile sees the fused kernel 40x/step.
+// f3b1be1's OFF default was later flipped back; this comment was stale.)
 // ============================================================================
 // ONE launch covers the whole [slots] down GEMV and the ascending-slot sum,
 // writing straight into `out` (OVERWRITE, exactly like moe_down_reduce_kernel:
