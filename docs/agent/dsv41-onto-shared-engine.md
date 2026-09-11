@@ -63,6 +63,73 @@ kernels/cuda/              两套 .cu（各自 host wrapper 同目录）
   **图重放的坑**（宿主算地址被烤进图 ✗）已定位并修复 ✓ —— 迁移时必须原样保留这个修法 ✓。
 - AR v5 协议（GLM 版为蓝本）已实现并验证 ✓；DSV4 的 staging 布局参数（world/slot 字节）已知 ✓。
 
+## Phase 0/1 执行结果（映射 + Device 换共享，本次）
+
+### 交付 1：模块映射表（13 个模块 → 共享化 / 保留 + 共享侧缺什么）
+
+| 模块（`dsv41/src`） | 行数 | 归属 | 依据 / 缺什么 |
+|---|---|---|---|
+| `device.rs` | 2037 → **1416** | **共享化 ✓（本阶段完成）** | 通用设备操作已转发到共享 `ferrite-kernel::devrt`；只留 `Kernels` 表 + 52 个 kernel 启动封装 |
+| `tp.rs` | 506 | **共享化（Phase 2）** | `SpinBarrier`/`Collective` 换共享 AR；共享侧缺：**参数化 staging 布局**（world/slot 字节）+ `out != partial` 直写（GLM 已有 `out` 参数 ✓）；kernel 只留一份 `ferrite_p2p_ar_v5` |
+| `chain_dev.rs` | 1819 | **拆分** | 设备编排设备态（位置计数器/图分支/premix D2D → 共享）+ **层链逻辑** ✓（→ 模型）|
+| `kernels.rs` | 434 | **模型保留** | DSV4 kernel ABI 声明（随模型走）|
+| `chain.rs` / `ops.rs` | 684 / 1060 | **模型保留** | 模型层链 / CPU golden 基准 |
+| `config.rs` / `weights.rs` / `load.rs` | 596 / 841 / 883 | **模型保留** | DSV4 checkpoint 布局、TP 分片、engram 表 |
+| `quant.rs` / `engram.rs` / `dspark.rs` / `vision.rs` | 528 / 451 / 335 / 1402 | **模型保留** | 量化辅助 / n-gram / draft / 视觉塔 |
+| `bin/dsv41-run.rs` | 975 | **拆除（Phase 5/6）** | `TpRankPool` engine 适配（含 look-ahead 批命令）→ 共享 engine，再收敛单一二进制 |
+
+**共享侧缺的能力（→ 已补 / 待补）**：
+
+| 缺什么 | 状态 |
+|---|---|
+| 字节级、**不池化**的设备分配 + 原始 H2D/D2H/D2D/2D/peer 拷贝 + memset | **已补** → `devrt::DevRuntime` ✓ |
+| 显式 CUDA-graph 捕获/实例化/回放的**原语**（返回裸句柄、可指定捕获模式）| **已补** → `devrt` ✓（默认 **Relaxed(2)**，见 Phase 3 差异）|
+| 通用 kernel 符号解析（在已加载 `.so` 上 `dlsym` 任意名字）| **已补** → `kernel_sym` / `kernel_sym_opt` ✓ |
+| 通用 cuBLAS f32/bf16 GEMM（裸指针，不涉及 Tensor）| **已补** → `gemm_f32` / `gemm_bf16` ✓ |
+| AR v5 的**多形态参数化**（staging 表形态、slot/stride、epoch 位置、`out` 直写）| **待补（Phase 2）** |
+| engine 契约（`StepEngine`/批命令/look-ahead）的统一入口 | **待补（Phase 5）** |
+| `cuda::CudaBackend`（GLM）与 `devrt` 两个设备层**收敛成一个** | **待办（Phase 4）** |
+
+### 交付 2：Device 的签名级对照（dsv41 → 共享）
+
+| dsv41 `Device::` | 共享等价物（`ferrite_kernel::devrt`） | 处置 |
+|---|---|---|
+| `open(so)` | `DevRuntime::open(so)` + `kernel_sym*` 建表 | 转发（建表留模型侧 ✓）|
+| `stream` / `device_id` / `device_count` / `bind_to` | `DevRuntime::{stream,device_id,device_count,bind_to}` | 转发 |
+| `alloc` / `free` / `mem_free` / `view` | `DevRuntime::{alloc,free,mem_free}` + `DevBuf::view` | 转发 |
+| `upload` / `upload_f32` / `upload_f32_at` / `upload_bytes_at` / `upload_from` / `upload_from_2d` | 同名 `DevRuntime::*` | 转发 |
+| `download_f32` / `download_u8` / `download_u32` | 同名 | 转发 |
+| `zero` / `zero_at` / `memcpy_d2d` / `memcpy_peer` / `sync` / `dev_sync` / `enable_peer_access` | 同名 | 转发 |
+| `gemm_f32` / `gemm_bf16` | `gemm_f32` / `gemm_bf16` | 转发（原 cuBLAS 代码移入 ✓）|
+| `capture_begin` / `capture_end` / `graph_instantiate` / `graph_launch` / `graph_free` | 同名（**捕获原语已在共享侧 ✓**）| 转发 |
+| `kerr` | `DevRuntime::kerr` | 转发 |
+| `add_inplace` / `add_inplace_raw` | — | **模型保留**（绑定 `ferrite_add` 符号）|
+| 其余 52 个 kernel 启动封装 | — | **模型保留**（逐字未改 ✓）|
+
+### 交付 3：验证结果与下一步
+
+- 全绿：`cargo check -p ferrite-kernel`、`-p ferrite-kernel --features cuda`（GLM 路径不受影响）、
+  `-p ferrite-dsv41`、`cargo build -p ferrite-dsv41`（**链接通过** ⇒ dlopen 符号可解析）、`cargo check --workspace`。
+- `-p ferrite-dsv41 --all-targets` 有一个**既有**错误：`chain.rs` 测试模块用了 `KvMode` 未 import
+  （aed0785 起即存在，非本次引入 ✗）。
+- **未做 e2e**（用户硬约束：只允许 `cargo check`/`cargo build`）⇒ 行为等价由「保留方法逐字对比 + 签名一致」
+  保证，待 GPU 侧四段文本复验。
+- 校验脚本确认：保留的 52 个 kernel 封装 + `Kernels` 结构体**逐字一致**；唯一 body 变化是 `free`
+  的日志前缀（`[dsv41]` → `[ferrite]`）。
+
+**Phase 2（AR）的坑（本次新发现）**：
+- DSV4 是 **三次发射**（store/publish/reduce ✗），GLM 是**单入口融合**（`ferrite_p2p_ar_v5` ✓）⇒ DSV4 的
+  `Collective` 必须改成**一次调用**，否则 epoch 推进语义不同（DSV4 在 reduce 末块推进 ✓）。
+- DSV4 的 epoch 放在 **staging 尾部 `ctr_at`** ✓，GLM 是**独立参数** ✓ ⇒ 参数化时必须保留其一并换算偏移。
+- `publish` 自旋 ⇒ 剖析时用 NCCL 模式（去掉 P2P/AR v5 的 env ✓）。
+
+**Phase 3（图）的坑（本次新发现）**：
+- `devrt::capture_begin` 现用 **Relaxed(2)**（= DSV4 现有行为 ✓）；GLM 的 `ferrite_graph_begin` 用
+  **ThreadLocal(1)** ⇒ 两套捕获入口**模式不同**，Phase 4 收敛时**必须二选一**（Relaxed 是超集、对 GLM 无害
+  ⇒ 建议统一到 Relaxed ✓）。
+- `devrt`（dlopen、指针级）与 `cuda.rs`（link-time、Tensor 级）是**两个设备层** ⇒ Phase 4 应把 `CudaBackend`
+  的裸指针部分下沉到 `devrt`，避免长期双份。
+
 ## 附：清告警的流程教训（本会话自伤 5 次，务必避免）
 
 **现象**：按 `cargo check` 的告警**批量套用**建议（`replace(..., 1)` / 简单正则 ✗），连续 5 次改错位置：
