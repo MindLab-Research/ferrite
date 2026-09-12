@@ -355,13 +355,20 @@ int sh_case(const char* tag, int m, int fold_r, int n1, int k1, int n2, float li
         const bool act_same = sh_bits_equal(am, arr, &at);
         SH_CHECK(act_same, "[%s] by-product act differs (at %zu)", tag, at);
     } else {
+        // `act` was passed as nullptr: the kernel must not write it AT ALL, so
+        // the NaN sentinel has to survive in EVERY slot. The old assertion here
+        // was INVERTED (`sent == 0`), which demands the buffer look WRITTEN --
+        // unsatisfiable without a pointer -- so every `act=null` case in the
+        // suite failed with "512 slot(s) look unwritten" (512 = m*n1 = the whole
+        // buffer: nothing was written, which is exactly the contract).
         size_t sent = 0;
         for (size_t i = 0; i < am.size(); ++i) {
             uint32_t b;
             std::memcpy(&b, &am[i], 4);
             if ((b & 0x7FFFFFFFu) > 0x7F800000u) ++sent;   // still the NaN sentinel
         }
-        SH_CHECK(sent == 0, "[%s] act == nullptr but %zu slot(s) look unwritten", tag, sent);
+        SH_CHECK(sent == am.size(), "[%s] act == nullptr but only %zu/%zu slot(s) still sentinel",
+                 tag, sent, am.size());
     }
 
     // (e) coverage: every phase-1 byte and every phase-2 element of every row

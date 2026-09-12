@@ -2713,3 +2713,27 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 3. **LAZY_VERIFY 是可靠的路径**（已蕴含 SWALLOW——lazy 的 row 0 = 被吞的主链步）
 
 **结论**：放弃 batched SWALLOW_STEP（ar5-hang 顽固），专注 LAZY_VERIFY 优化。
+
+---
+
+## ✅ Plan B 已实施（unanimity-or-direct）——臂决策的 rank 一致投票
+
+**代码位置**
+- `crates/ferrite-models/src/dsv41/tp.rs`：新增 `RankVote`（一次会合的一致性投票原语），挂在共享的 `SpinBarrier` 上；`Collective::unanimous_i32` 暴露给 chain。
+- `crates/ferrite-models/src/dsv41/chain_dev.rs`：新增 `enum VerifyArm {Direct=0, Dry=1, Capture=2, Replay=3}`；`verify_graph_gate` 拆成 `verify_arm_local`（纯、per-rank 决策）+ 投票门；新增 `note_arm_dissent` 诊断。
+
+**语义**：每个 rank 独立算出自己的臂 → 用**一次** `unanimous_i32` 广播（i32 臂码）→ 全一致才按该臂走，**任何分歧 → 全部 direct**（保守，direct 是每个状态下都存在的臂）。
+
+**为什么投「臂」而不是投 Some/None**：`Dry`/`Capture`/`Replay` 都返回 slot index，Some/None 投票会让「DRY 新 shape 的 rank」与「REPLAY 它的 rank」被判为一致，而两者会合数不同（`Capture` 单独是 2 次 `host_barrier`，其余 1 次）——`SpinBarrier` 按到达数计世代，这正是 misphase 的来源。
+
+**关键隔离**：投票用的是**独立的世代**（`RankVote` 自带 `arrived`/`gen` + 双缓冲 parity），不碰 `SpinBarrier` 的 `count`/`gen`——否则投票本身会改变 `host_barrier` 的世代序列（即修改了「臂会合数」这条承重不变量）。协议可证明只可能被「超车一轮」，而 parity 双缓冲正好覆盖。
+
+**开销/范围**：每次 gate 调用一次会合（同一进程内几个原子操作，量级为 ns～µs，比它守护的设备工作量低几个数量级），仅 `DSV41_VERIFY_GRAPH` 打开时发生——开关关闭时函数在投票前就返回，**默认路径零影响**；单 rank（`comm=None`）不投票。
+
+**验证**：`cargo check --workspace` EXIT=0；`RankVote` 单元测试 4/4（`cargo test -p ferrite-models --lib vote_tests`）：等值→各 rank 都得到一致值、单票异议→各 rank 都得到 `None`、逐轮不串味（parity）、world=1 直接一致。
+
+**诊断**：分歧回退会打印 `[verify_graph] arm vote DISAGREED at verify block N (this rank wanted Capture) …`（rank0、每进程前 4 条）——因为「一直一致」和「一直分歧所以图从未生效」在外部不可区分，A/B 会误报「无变化」。
+
+**已知性质**：投票是每次 gate 调用一次的会合，所以它要求「各 rank 的 `step_rows_sync` 调用次数相同」——这与既有 `host_barrier` 的暴露面同类（某个 rank 在臂体内报错时，其余 rank 会在会合点等待）。
+
+**下一步验收**：SWALLOW_STEP=1 + VERIFY_GRAPH=1 跑出师表/计数任务，期望 0 ar5-hang；若出现 `arm vote DISAGREED` 行，说明同一次请求内 rank 状态持续分歧（图退化为 direct，功能正确但无加速），需进一步定位是 `compress_branch_steady` 镜像还是 capture 失败 latch 的分歧。

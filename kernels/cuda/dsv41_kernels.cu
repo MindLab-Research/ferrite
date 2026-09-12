@@ -7064,7 +7064,15 @@ gemm_fp8_sh_exp_pair_kernel(const uint8_t* __restrict__ a, const float* __restri
                 const uint8_t wgv = g_row[j], wuv = u_row[j];   // one LDG.8 each
 #pragma unroll
                 for (int q = 0; q < M; ++q) {
-                    if (q < fold_r) {
+                    // `q < rn`, NOT `q < fold_r`: `rn` is the number of rows THIS
+                    // block actually staged (the design's own definition above).
+                    // The tail group (fold_r ∤ M) stages only rn < fold_r rows, so
+                    // `q < fold_r` there read unstaged s_pa/s_pas and -- worse --
+                    // the epilogue below wrote rows r0+q >= M straight past the
+                    // end of `aq`/`aqsc`/`act` (the parity suite's clobbered
+                    // reference buffers: the "sign-bit-only" aq diff). Every loop
+                    // over the activation rows is bounded by rn.
+                    if (q < rn) {
                         const float av = s_lut[s_pa[(size_t)q * k1 + j]] *
                                          s_pas[(size_t)q * nb_k1 + (j >> 5)];
                         g[q] += av * (s_lut[wgv] * sbg);
@@ -7079,7 +7087,7 @@ gemm_fp8_sh_exp_pair_kernel(const uint8_t* __restrict__ a, const float* __restri
         // across rows here or anywhere else (C5).
 #pragma unroll
         for (int q = 0; q < M; ++q) {
-            if (q < fold_r) {
+            if (q < rn) {
                 for (int off = 16; off > 0; off >>= 1) {
                     g[q] += __shfl_xor_sync(0xFFFFFFFFu, g[q], off);
                     u[q] += __shfl_xor_sync(0xFFFFFFFFu, u[q], off);
@@ -7105,10 +7113,13 @@ gemm_fp8_sh_exp_pair_kernel(const uint8_t* __restrict__ a, const float* __restri
 
 #pragma unroll
         for (int q = 0; q < M; ++q) {
-            if (q < fold_r) {
+            if (q < rn) {
                 // swiglu_limit_q_kernel's emit, term for term. `fmaxf` is exact
                 // and associative, so this tree is bit-identical to the kernel's
                 // per-lane shfl tree over the same 32 values.
+                // `q < rn` (not `q < fold_r`): the tail group must NOT emit rows
+                // r0+rn .. r0+fold_r-1 -- those rows are >= M in the caller's
+                // layout, so the store would run past the end of `aq`/`aqsc`.
                 float am = (lane < nwarps) ? fabsf(s_rows[(size_t)q * 32 + lane]) : 0.f;
                 for (int off = 16; off > 0; off >>= 1)
                     am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));

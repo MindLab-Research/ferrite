@@ -963,3 +963,67 @@ pub fn exchange(
     let _ = world;
     (s, b)
 }
+
+/// The arm vote's protocol is concurrency code, so it is pinned here rather than
+/// only through the engine: the ranks are threads of one process, which makes the
+/// real thing reproducible as plain host threads.
+#[cfg(test)]
+mod vote_tests {
+    use super::RankVote;
+    use std::sync::Arc;
+
+    /// `rounds` of `world` threads, each voting `f(rank, round)`; returns every
+    /// rank's per-round answer.
+    fn run(world: usize, rounds: usize, f: impl Fn(usize, usize) -> i32 + Send + Sync + 'static) -> Vec<Vec<Option<i32>>> {
+        let vote = Arc::new(RankVote::new(world));
+        let f = Arc::new(f);
+        let hs: Vec<_> = (0..world)
+            .map(|r| {
+                let vote = vote.clone();
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    (0..rounds).map(|i| vote.unanimous_i32(r, f(r, i))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    #[test]
+    fn equal_votes_are_unanimous_on_every_rank() {
+        let all = run(8, 512, |_, _| 3);
+        for rank in &all {
+            assert!(rank.iter().all(|v| *v == Some(3)));
+        }
+    }
+
+    /// One dissenting rank must reach EVERY rank as a disagreement — never a
+    /// mixed answer, which is what the fallback depends on.
+    #[test]
+    fn a_single_dissent_returns_none_everywhere() {
+        let all = run(8, 512, |r, _| if r == 3 { 1 } else { 2 });
+        for rank in &all {
+            assert!(rank.iter().all(|v| v.is_none()));
+        }
+    }
+
+    /// The votes are per-ROUND: a rank whose vote alternates must not bleed into
+    /// a neighbour's round (the buffer parity is what guarantees this).
+    #[test]
+    fn rounds_do_not_bleed_into_each_other() {
+        let all = run(4, 512, |r, i| if r == 0 && i % 2 == 1 { 1 } else { 0 });
+        for (i, want) in (0..512).map(|i| if i % 2 == 0 { Some(0) } else { None }).enumerate() {
+            for (r, rank) in all.iter().enumerate() {
+                assert_eq!(rank[i], want, "round {i}, rank {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_one_rank_world_is_unanimous_without_a_rendezvous() {
+        let vote = RankVote::new(1);
+        for i in 0..8 {
+            assert_eq!(vote.unanimous_i32(0, i), Some(i));
+        }
+    }
+}

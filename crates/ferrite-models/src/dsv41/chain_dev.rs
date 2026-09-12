@@ -5585,22 +5585,31 @@ impl<'a> DevChain<'a> {
         // Outside `SWALLOW` nothing changes: the gate is `swallow_step()`-only,
         // and with the switch off every verify already runs one shape.
         if swallow_step() && self.verify_blocks < SWALLOW_GRAPH_WARMUP_BLOCKS {
-            return None;
+            return (VerifyArm::Direct, None);
         }
         // The shape pool first: without a slot there is nothing to check.
-        let idx = self.verify_slot(m)?;
+        let Some(idx) = self.verify_slot(m) else {
+            return (VerifyArm::Direct, None);
+        };
         if self.verify_graph_failed[idx] {
             // A capture already failed for THIS shape this request. Re-attempting
             // it every step would burn the failure on the hot path for nothing.
             // The other slot is independent and still usable.
-            return None;
+            return (VerifyArm::Direct, None);
         }
-        if self.verify_graphs[idx].is_some() || self.verify_dry_done[idx] {
-            // The stored graph (or the pending capture) is already committed to
-            // this slot's shape and its environment was checked when it was
-            // armed; the shape matches by construction, so only the hazards
-            // below could still disqualify the call.
-            return Some(idx);
+        if self.verify_graphs[idx].is_some() {
+            // The stored graph is already committed to this slot's shape and its
+            // environment was checked when it was armed; the shape matches by
+            // construction, so only the hazards below could still disqualify the
+            // call.
+            return (VerifyArm::Replay, Some(idx));
+        }
+        if self.verify_dry_done[idx] {
+            // The DRY execution has happened and no graph is stored yet: this
+            // block is the CAPTURE. Split from REPLAY on purpose — the two return
+            // the same slot but take a different number of rendezvous, which is
+            // exactly what the vote in [`Self::verify_graph_gate`] is about.
+            return (VerifyArm::Capture, Some(idx));
         }
         let armed = !eng_host()
             && !stats_dbg()
@@ -5609,7 +5618,102 @@ impl<'a> DevChain<'a> {
             && self.dev.supports_dspark_snapshot()
             && self.dev.supports_memset_async()
             && (self.comm.is_none() || crate::dsv41::tp::ar_v5());
-        armed.then_some(idx)
+        if armed {
+            (VerifyArm::Dry, Some(idx))
+        } else {
+            (VerifyArm::Direct, None)
+        }
+    }
+
+    /// The gate [`Self::step_rows_sync`] calls: this rank's arm made UNANIMOUS
+    /// across the ranks, or the direct launches when they disagree (Plan B,
+    /// "unanimity-or-direct").
+    ///
+    /// # Why a vote and not just a barrier
+    ///
+    /// Every input of the arm decision is per-RANK — `verify_graph_failed`,
+    /// `verify_dry_done`, the shape pool, `compress_branch_steady`'s host mirror,
+    /// a `pos_base` read off this rank's own counter — while the arms cost
+    /// DIFFERENT numbers of `host_barrier` arrivals per block ([`VerifyArm`]).
+    /// `SpinBarrier` counts arrivals per generation, so two ranks in different
+    /// arms close an epoch their peers never entered and every later barrier in
+    /// the request is one generation out. That is `ar5-hang`, and its signature
+    /// is exactly what the A/B showed: `DSV41_SWALLOW_STEP` + the verify graph
+    /// reproduces it (those rounds are the only place a request drives the shape
+    /// pool through DRY → CAPTURE → REPLAY), while `DSV41_VERIFY_GRAPH=0` removes
+    /// it for the trivial reason that every rank then walks the same arm.
+    ///
+    /// So the decision is broadcast, not taken: each rank votes its own arm (one
+    /// `i32` code) and the ranks proceed only on UNANIMITY. A single dissent sends
+    /// the whole world to the direct launches — the conservative direction, since
+    /// that arm exists in every state and is a real execution of the same block,
+    /// and since a majority rule would leave a minority walking an arm whose
+    /// rendezvous count the majority does not share.
+    ///
+    /// The rendezvous this adds is a HOST atomic exchange
+    /// ([`Collective::unanimous_i32`], on the shared `SpinBarrier`'s own
+    /// [`crate::dsv41::tp::RankVote`] — an independent generation, so it cannot
+    /// perturb the arrival epochs `host_barrier` hands out). It is NOT a CUDA call
+    /// and NOT inside any capture region: the gate runs before the arm, while
+    /// every launch of the block still lives on the caller's stream, which is why
+    /// the vote can never be recorded into a graph.
+    ///
+    /// # Cost and scope
+    ///
+    /// One vote per gate call, taken by EVERY rank (whether or not that rank has a
+    /// graph), whenever `DSV41_VERIFY_GRAPH` is configured: ~a handful of atomics
+    /// on one shared line, orders below the device work it guards. With the switch
+    /// off the function returns before the vote, so the default path is untouched
+    /// — as it is without peers (`comm` is `None` off TP8, and there is nobody to
+    /// agree with).
+    fn verify_graph_gate(&self, m: usize, pos_base: i32) -> Option<usize> {
+        let (arm, idx) = self.verify_arm_local(m, pos_base);
+        // The env switch is process-wide, so with it off every rank is in the
+        // Direct arm already and there is nothing to agree about — and no
+        // rendezvous is taken, which is what keeps the default path bit-for-bit
+        // what it was.
+        if !verify_graph_want() {
+            return idx;
+        }
+        let Some(c) = self.comm.as_ref() else {
+            return idx;
+        };
+        // Unanimity includes our own vote, so on `Some(_)` the agreed code IS this
+        // rank's arm and `idx` is the slot for it. `None` (any disagreement) sends
+        // everyone to the direct launches.
+        match c.unanimous_i32(arm as i32) {
+            Some(code) if code == arm as i32 => idx,
+            _ => {
+                self.note_arm_dissent(arm);
+                None
+            }
+        }
+    }
+
+    /// ★ PRINT, DO NOT SILENTLY DEGRADE.
+    ///
+    /// A failed vote falls back to the direct launches and the request still runs,
+    /// which makes "the ranks agreed all along" and "the ranks kept disagreeing,
+    /// so the graph never engaged" indistinguishable from the outside. An A/B that
+    /// cannot see that difference reports "no change" for a feature that never
+    /// ran (the trap the capture diagnostics exist for), so the first few dissents
+    /// cross to the console, with the arm that was given up. Once per process,
+    /// rank 0 only — the ranks are threads of ONE process and would otherwise
+    /// print the same line `world` times.
+    fn note_arm_dissent(&self, arm: VerifyArm) {
+        static PRINTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        if self.rank() != 0 {
+            return;
+        }
+        let n = PRINTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 4 {
+            eprintln!(
+                "[verify_graph] arm vote DISAGREED at verify block {} (this rank wanted {arm:?}) \
+                 — every rank runs the direct launches for this block \
+                 (Plan B unanimity-or-direct)",
+                self.verify_blocks
+            );
+        }
     }
 
     /// Record one [`Self::step_rows_inner`] into a fresh graph.
