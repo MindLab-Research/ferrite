@@ -548,3 +548,26 @@ pub fn prefill_chunk(&mut self, seq: u64, chunk_tokens: &[u32]) -> Result<()> {
 3. **"latent + 按需展开"**（展开口径只在 attention 的当前 chunk 上物化）——省内存但**流量翻倍**（每步展开/回写）——除非与 DCP 结合否则不解决 1M。
 
 **因此 Wave 4 的 1M 目标与 Wave 3/5 的 KV 工作强耦合**：`ferrite-kv` 的页池（latent 口径）是**正确的基线**——P0-C 的实施 = 让 DSA 的 kernel 侧也吃 latent（去掉 `DsaCacheState` 的展开），再在其上做 P0-A（抬界）与 DCP（如果 1M 是硬指标）。
+
+---
+
+## 7. P0-D — indexer 的 1M 时间复杂度（确认 + 方案，2026-09-12）
+
+**代码确认**（`kernels/cuda/ferrite_kernels.cu:1539` `indexer_topk_kernel`）:
+```cuda
+int select_k = min(topk_max, t);      // live
+int row = blockIdx.x;                 // 每行一个 block
+if (select_k >= jmax) {               // FAST PATH：候选全选（decode: t~250 << topk_max=2048）
+    ...按序填 idx...                  // O(topk_max)
+} else { /* 慢路径：for r in 0..select_k { 全块归约求 max } = O(select_k × t) */ }
+```
+
+**1M 的代价**：`t`（DSA 层的 pool 数）≈ 1e6/ratio（ratio∈{1,2}）→ **250K-500K ≫ topk_max(2048)** → **走慢路径** → 每行 `2048 × 500K ≈ 1e9` 次比较，**× 1M 行** ⇒ 不可行。**这就是"1M 的时间可用性"的核心**（内存问题见 P0-C，两者独立）。
+
+**方案（按实现代价）**:
+1. **单遍 top-k（堆/radix select）**：一次扫描 t 个分数维护 k=2048 的堆 → **O(t log k)**（比 O(k·t) 快 2048×）——**最小改动**（重写慢路径）
+2. **分块 + 层次归约**：把 t 切 B 块，每块出 local top-k，host/device merge（k 个全局）——**O(t + k·B)**，适合多 block 并行
+3. **kpool 压缩率**：把 `ratio` 拉大（压缩更狠）——**但会改数值**（index key 的粒度）——**需要与 checkpoint 语义对齐**（ratio 是模型的一部分）
+4. **对照 SGLang**：他们的 `index_topk=2048` 同样是固定上限——**他们的 1M 走 DCP（每 rank 的 t 变小 8×）+ 分块**——**与 P0-C 的结论一致**（DCP 同时解决内存**和** indexer 的 t）
+
+**⇒ P0-D 与 P0-C 统一在 DCP**：KV 分片后每 rank 的 t ≈ 250K/8 = 31K（仍 ≫2048 → **慢路径仍在**，但 1e9 → 1.3e8/行 × 每 rank 的 1/8 行 = 可接受）；**根上仍建议做方案 1（单遍堆选）**——它是纯 kernel 优化，与 DCP 正交。
