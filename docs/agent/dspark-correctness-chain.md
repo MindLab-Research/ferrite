@@ -5294,3 +5294,20 @@ pos=23 步前: epoch=54（确认降级）
 **需要调查**：什么操作会把 epoch 从 1497 重置到 54？
 - 54 ≈ 0.5 × 81 + 13.5？或者 54 = 2 × 27（gap=27 的两倍）？
 - epoch 的写入点：AR kernel（advance）+ 可能的 reset 点
+
+## epoch_dev 的定义发现（亲自验证）
+
+```rust
+pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
+    (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut std::ffi::c_uint
+}
+```
+
+**epoch = staging 缓冲区 + ctr_at 偏移**——不是独立的计数器！
+
+**含义**：
+1. 如果 `ctr_at` 是固定偏移——epoch 是 staging 内的一个 u32
+2. 如果 staging 被重置（新请求/rollback）——epoch 会重置！
+3. **"1497→54 的降级"可能是读到了 staging 的不同位置或重置后的值！**
+
+**待 epoch-decrease-rootcause 的完整分析**（ctr_at 是否 arm-dependent？staging 何时重置？）
