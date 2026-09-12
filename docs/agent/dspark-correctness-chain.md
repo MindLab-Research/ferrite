@@ -1797,3 +1797,22 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 1. draft-verify-program-audit（运行中）——找更多 program 不匹配
 2. S4: paired alignment（draft KV act_quant ↔ backbone ring 同步）——最大剩余杠杆
 3. S3: unit_dump 探针——精确诊断 draft 偏移层
+
+## 当前吞吐与 400 缺口的最终分析
+
+**当前实测**（lazy verify + 截断 + P0-3+P1-5）：
+- accept 1.214（τ=2.214 tok/step）
+- 步时 ~33ms
+- **吞吐 ~67 tok/s**
+
+**400 缺口 = 6×**，需要双轴并进：
+| 轴 | 当前 | 400 需要 | 路径 |
+|---|---|---|---|
+| accept | 1.214 | 2.5-3.0 | S4（paired ring alignment）+ S5（全链 bf16）|
+| 步时 | 33ms | 8-10ms | tcgen05 + 融合 + swallow（ar5-hang 修复后）|
+
+**最现实的 400 路径**：
+- accept 3.0 × step 10ms = 400 ✓（两个都在极限）
+- accept 5.0 × step 12.5ms = 400（sglang 的 accept 水平）
+
+**当前战役的可达预期**：150-250 tok/s（accept 1.5-2.0 + step 15-20ms）
