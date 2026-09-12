@@ -7675,3 +7675,26 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **修正**：NORM_FUSE 在 Q 路径（qr→wq_b/idx_wq_b）；kv 的 norm+rope 是独立 rmsnorm_rope_kernel（NR_FUSE），不在 fuse 族内。
 
 **rope pair 的 swapAB 优势**：一 warp 16 行，pair (2i,2i+1) 同 warp 相邻 lane——__shfl_xor_sync(mask,v,4) 即可，无 smem 无 barrier！
+
+### v17/v18 定案：swapAB 的 serve 真相（2026-09-12 16:00）
+
+| 臂 | p50 | tok/s | 配置 |
+|---|---|---|---|
+| v17a（基线） | 6.17ms | 162.1 | SIMT |
+| v17s（全 swapAB） | 6.63ms | 150.8 | 所有 n 走 swapAB——小 n 回归吃掉大 n 收益 |
+| **v18s（形状分发 n≥1664）** | **6.20ms** | **161.3** | 大 n 走 swapAB，小 n 回退 SIMT——**中性** |
+
+**第 7 次隔离→生产失效**：隔离口径的 6.0-6.6µs（1.76-1.94x SIMT）在 serve 完全不兑现。可能根因：
+1. serve 的 L2 竞争使 cp.async staging 比隔离慢
+2. 大 n 调用的 SIMT 在 serve 中比隔离的 10.98µs 更快（nsys 中位数是分布的 50%，实际混合负载下可能更低）
+3. memset/atomicAdd 的图节点成本抵消 kernel 收益
+
+**处置**：DSV41_SWAPAB 保持默认 OFF（中性无收益）。代码保留供 TMA 升级后重测。
+
+**small-n-overhead 的发现**：memset 已被 last-block reduction 消除（图节点 0）；mx2 变体（wq_a+wkv 合计 n=1856 过阈值）可省 ~7µs/层 × 40 = 0.28ms——但基于同样的隔离→serve 失效模式，预期需打折扣。
+
+**200 tok/s 的诚实判定**：swapAB（唯一 2x 路径）在 serve 中性。剩余路径：
+- TMA（tma-path-analysis 分析中）——若突破 staging 1.3TB/s 硬墙
+- mx2 swapAB 变体（+0.28ms 理论）——同失效风险
+- expert tcgen05（4-5 人日 → 300 tok/s 路径）
+**当前验证最优：6.17ms = 162.1 tok/s（+115.4%）**
