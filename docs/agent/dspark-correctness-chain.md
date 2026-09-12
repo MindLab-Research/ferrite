@@ -1397,3 +1397,15 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 ## AR v5 kernel 数确认（代码级验证）
 
 `ferrite_p2p_ar_v5` = `p2p_ar_store_v5` + `p2p_ar_pubred_v5` 两发（ferrite_kernels.cu :8853/:8895）——**已是 2-kernel**（step-time-remaining 的修正确认）。文档的"3 核/240 发"是旧口径。实际 80 次 × 2 = **160 发/步**。
+
+## Batched 400 v2 测试前的最终状态
+
+**远端健康**：ferrite-serve 运行中，binary/.so 同源（14:48/14:49）✓
+**工作树**：干净（6f5de2b——A2 truncate 修复已提交）
+**3 subagent 运行**：accept-gap-analysis + hc-full-optimization + post-batched-analysis
+
+**本次测试的解读框架**：
+- verify_head_mrows_note 的新日志会显示 HEAD gate 的状态（sliced/unsliced/STRUCTURALLY DEAD）
+- SWALLOW_STEP 的 verify_graph_m6 capture（新形状池）
+- mrows gates 的 decline 状态（新可观测性）
+- k_acc 保持 legacy 语义（与 lazy 可比）
