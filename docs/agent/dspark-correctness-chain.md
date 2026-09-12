@@ -2414,3 +2414,14 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **为什么 arm 崩**：arm 把 `pair_body` 打成 false → 守卫整个绕过
 
 **修复**：给 :1676/:1678 的直接读加对齐守卫（与 `al_ok` 同模式），不对齐时降级到安全路径
+
+## 双产物重编 + parity + tcgen05 冒烟测试进行中（34cf4c74）
+
+**测试内容**（一次性验证两个修复）：
+1. **双产物重编**（build.sh + cargo build）——.cu 变了（tcgen05 守卫 + SH_PAIR 死变量清理）
+2. **SH_PAIR parity 硬门**（GPU 上的 bit-identity 测试）
+3. **tcgen05 冒烟**（对齐守卫修复后——"你好" 20 tok）
+
+**预期**：
+- parity 通过 → SH_PAIR template<M> 可以放心上生产
+- tcgen05 冒烟通过（不 misaligned）→ tcgen05 路径解锁
