@@ -9295,6 +9295,18 @@ static inline int ferrite_ar_probe(void) {
     }
     return cached;
 }
+// A2b's failure mode for a timed-out round (see `ar5_timeout`): default PARK
+// (the kernel wedges, nothing is ever reduced from an incomplete round), opt in
+// to TRAP ("a hard CUDA error now") with `DSV41_AR_TIMEOUT_TRAP=1`. Read once
+// per process like the two above, for the same reason: it is a kernel arm.
+static inline int ferrite_ar_timeout_trap(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char* e = getenv("DSV41_AR_TIMEOUT_TRAP");
+        cached = (e != nullptr && e[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
 
 extern "C" cudaError_t ferrite_p2p_ar_v5(
     const float* partial, float* const* staging_tbl,
@@ -9736,7 +9748,8 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_rows(
     p2p_ar_pubred_v5_hcpost_rows_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
         hc_res, hc_post, hc_comb, hc_n, hc_h,
-        ferrite_ar_single_poll(), ferrite_ar_probe());
+        ferrite_ar_single_poll(), ferrite_ar_probe(), AR5_SITE_VERIFY,
+        ferrite_ar_timeout_trap());
     return cudaGetLastError();
 }
 
