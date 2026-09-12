@@ -837,3 +837,14 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 1. w1|w3 融合：72→144 blocks（97% SM）+ launch 减半
 2. 小 n 的 nwarps 自适应：n=288 时 nwarps=2 → 144 blocks
 3. 两者叠加效果：shared expert 从 10.4ms → 预期 2-3ms
+
+## Barrier-batch 验证（b018101f）——无改善（22.59ms ≈ 22.56ms）
+
+**结果**：步时 22.59ms（44.3 tok/s）与无 barrier-batch 的 22.56ms**完全相同**。host_barrier（TP8 跨 rank 同步）不是 lazy per-row 开销的瓶颈——它可能已经与 kernel 执行重叠。
+
+**修正后的 per-row 开销分析**：
+- 不是 barrier（已排除）
+- 剩余嫌疑：①D2H argmax 的 stream sync（~0.5ms/行）②m=1 verify 图与 EAGER 图的 kernel 差异（compressor/spec 路径不同）③m=1 裸链→图化的 DRY 开销
+- **22.6ms 步时的分解**：draft 4.28 + verify ~18 + commit 0.17；verify ~18ms / 2.08 行 = ~8.65ms/行（vs EAGER 6.15ms）
+
+**结论**：lazy verify 的架构上限（每行付 EAGER 成本）已确认。400 的路径回到 **batched verify + kernel 融合**。
