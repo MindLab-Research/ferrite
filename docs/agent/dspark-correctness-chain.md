@@ -74,3 +74,12 @@
 | 3 | `DSV41_NORM_FUSE=0` | EAGER 的 rmsnorm 折进 GEMV prologue vs verify 的独立 rmsnorm | 低 |
 | 4 | `DSV41_COMPRESS_FUSE=0` | compressor fused vs pool+commit——主链已逐句核对一致，stage-1 state carry 未核 | 低 |
 | 5 | `DSV41_HC_TAIL_SPLIT=0 DSV41_HC_FRONT=0` | hc 的 tail split（ss/dots 已证位级一致；collapse/norm 融合未实测）——**注意要同时关两个** | 低 |
+
+## opa 尾部乱码的定位（实验 A 已执行）
+
+**"opa" 是词表里的合法 token（id=41291）**——`encode("opa")=[41291]` 单 token 往返一致；"anao" 同样（id=83514 单 token）。⇒ **模型真的输出了这些 token**，不是显示层/切分问题。
+
+**根因（H1/H2 组合，与历史案例完全同构）**：
+- `serve.rs:1069-1076` 已记载同构现象：**该 checkpoint 没有 generation_config.json（已验证：文件不存在）且 eos_token_id 为 null**——模型答完后输出 EOS（token 1），但 stop 未生效 ⇒ 越过结束点继续生成退化尾段（"opa**" + 重启《出师表》第一句——"重启"是退化尾段的教科书形态）。
+- 数字任务的 "anao"、崩坏态的 "nofollow" 同族（拉丁碎片出现在回答边界）——系统性模式。
+- **修复方向**：① stop/EOS 的解析（tokenizer_config.json 存在——查 resolve_eos 为什么没取到 eos）；② 或硬编码 stop token 1（tokenizer stops: [1] 已经在 serve 日志里出现——查为什么没拦住）；③ 实验对照：官方 ref_inference 跑同 prompt 确认模型固有 vs ferrite 侧 stop 缺陷。
