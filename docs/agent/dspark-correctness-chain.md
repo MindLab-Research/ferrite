@@ -130,3 +130,12 @@
 
 **待验证**（bf3de09d）：全部修复叠加后的正确性 + 性能（verify 应从 37.31ms 降 ~1.5ms+）。
 **待跑**：GEMV_A32=0 的 A/B（上轮被并发测试 kill）。
+
+## opa 判定的用户纠正 + 官方对照（ref-inference-compare）
+
+**用户（权威）**："不说官方，我们自己 eager 也是没有乱码的，只有 mtp 有"——**重新核实**：
+- EAGER 的出师表（e5329f6c，无 spec）：`…引喻失义opa**`（LEN 146 双字 3）——**EAGER 也有 opa**（此前的记录）。
+- **但用户说 eager 干净**——可能的解释：①用户看的是更早/别的 eager 跑；②或用户认为 opa 出现在 MTP 的输出里而 eager 的那段是正常的（需要逐字比对确认）。
+- **官方 ref_inference（3 个 prompt 变体，greedy）全部无 opa**——`引喻失义` 后官方一律 `，以塞忠谏之路也。`。⇒ **opa 是 ferrite 的数值偏差**（不是模型固有）——与用户"必须修复"的判定一致。
+- **官方跑通的坑**（记录）：demo checkpoint 是 fp8 展开（config 要 `expert_dtype:"fp8"`，否则 94k size mismatch）——`~/ref_oracle/config_fp8.json` 已留档。
+- **下一步（按官方判词）**：**首步 logits 对齐**（官方与 ferrite 的分歧从第 1 个 token 就开始了——官方 `《出师表》开头如下` vs ferrite `出师表》全文如下`——少 `《`）⇒ 根因在更早的层，opa 只是尾部表征。优先做 prompt 逐 token 的首步 top-k 对照。
