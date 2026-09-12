@@ -780,7 +780,7 @@ impl<'a> DsparkDev<'a> {
             bs as i32,
             hd as i32,
             1,
-            pos as i32 + 1,
+            pos as i32,
             1,
             false,
         )?;
@@ -1332,7 +1332,7 @@ impl<'a> DsparkDev<'a> {
                 nh as i32,
                 self.hd as i32,
                 0,
-                pos as i32 + 1 + r as i32,
+                pos as i32 + r as i32,
                 1,
                 false,
             )?;
@@ -1350,7 +1350,7 @@ impl<'a> DsparkDev<'a> {
                 nh as i32,
                 self.hd as i32,
                 0,
-                pos as i32 + 1 + r as i32,
+                pos as i32 + r as i32,
                 1,
                 true,
             )?;
