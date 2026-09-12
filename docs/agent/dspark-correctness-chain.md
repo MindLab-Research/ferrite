@@ -468,3 +468,14 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 | off-by-one | for i in 1..=DRAFTS + judge i<DRAFTS，rows_run==k_emit 恒成立 | ✓ |
 
 **⚠️ CRITICAL 新发现**：`dspark_spec_lazy` 的错误路径调 `dspark_rollback(pos, m, &host_mirrors)`（:6910），其中 `host_mirrors` 来自 `dspark_snapshot(pos, m)`（:6861）——**但 lazy 没有 rollback_keep**（成功时零回滚 ✓），错误时回滚整块也是对的（keep=0）。**但 `dspark_rollback` 的 `pos` 参数**在 swallowed 语义下应为块行 0 的位置（= `pos`）——与 snapshot 的 `pos` 一致 ✓。**审计判定：无 bug**。
+
+## "acs" 判定定案（acs-model-inherent，官方参考 1000 tok 两臂）——ferrite 残留
+
+**官方参考实现**（`inference/generate.py`，TP8 + demo ckpt + config_fp8，greedy，1000 tok）在 `以塞忠谏之路也` 后**全部干净且完全正确**：
+- ARM A（同 prompt）：`以塞忠谏之路也。**宫中府中，俱为一体，陟罚臧否，不宜异同。...`
+- ARM B（变体 prompt）：`以塞忠谏之路也。宫中府中，俱为一体，陟罚臧否，不宜异同。...`
+- **全篇拉丁碎片：0**（两臂均 897/769 字完整背诵+收尾总结）
+
+⇒ **"acs"/"ibu" 是 ferrite backbone 的数值路径偏差**，不是模型固有歧义。官方也是 fp8（dtype: fp8, expert_dtype: fp8）——**不能归因于 fp8 格式本身**。差异在 ferrite 的实现。
+
+**下一步**：首步 top-k logits 对齐（官方 vs ferrite 的 prompt 逐 token 对照）——分歧从很早的位置就开始（首 token 官方 `《出师表》` vs ferrite `《前出师表》`——prompt 措辞差导致，但 acs 位点的分歧是数值）。
