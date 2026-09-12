@@ -6489,3 +6489,23 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 4. **1b (MROWS_ACT_CPASYNC)**：激活 cp.async16——不太可能（只是装载方式变化）
 
 **下一步**：bisect（单独测 fold_r、B5、B4、1b 各自的增量——找到 6× 慢的来源）
+
+## 🎯 Bisect 测试结果（6d36693b）——fold_r 是 6× 退化源！
+
+**结果**：
+- **b2+b3+B5+B4+1b（无 fold_r）= 62.3 tok/s**（vs 基线 63.8——中性，-1.5 噪声内！）
+- **b2+b3+B5+B4+1b+fold_r = 10.3 tok/s**（6× 退化）
+- **fold_r = 6× 退化源确认！**（6× 权重 re-staging 假设成立）
+
+**mrows 家族的最终判定**：
+| 优化 | 吞吐 | 增量 | 判定 |
+|---|---|---|---|
+| 全 gate 基线 | 58.3 tok/s | — | — |
+| + mrows b2 | 60.4 tok/s | +3.6% | ✓ 有效 |
+| **+ mrows b2+b3** | **63.8 tok/s** | **+9.4%** | **✓ THE BEST!** |
+| + B5+B4+1b | 62.3 tok/s | -2.3% | ✗ 中性（不带来收益）|
+| + fold_r | 10.3 tok/s | -84% | ✗✗ 灾难性退化（6× 权重读！）|
+
+**SWALLOW 的 mrows 最优配置 = b2+b3（63.8 tok/s）**
+
+**mrows Phase B 的教训**：B5/B4/1b 在 batched 路径不带来可测量的收益（-0.13ms 每项的预期没有兑现）——**batched m=6 的 kernel 已经接近最优**（mrows b2+b3 抓住了大部分收益）
