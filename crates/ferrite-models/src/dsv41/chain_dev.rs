@@ -2118,9 +2118,57 @@ fn norm_fuse() -> bool {
 /// (an .so without the symbol, a shape the launcher rejects, `PROJ_FUSE=0`)
 /// falls straight through to today's mrows sequence, so OFF and ON-but-declined
 /// are the same code path.
-fn attn_lin_fuse() -> bool {
-    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_ATTN_LIN_FUSE").map(|v| v == "1").unwrap_or(false))
+///
+/// **BISECT SPLIT.** The two fusions are independent kernels with independent
+/// decline codes, and the "bit-identical" argument for each is constructive (the
+/// mrows kernel is *claimed* to be `gemm_fp8_mx`'s `m == 1` program) — never
+/// measured on the real shapes. So the top suspect for a corruption under `=1`
+/// is one SPECIFIC half, not the pair:
+///   - `2` = `lin2` only  (wq_a + wkv fused; wq_b on `norm_rows + quant_rows +
+///     proj_mrows + apply_rope`, 4 launches)
+///   - `3` = `lin_rope_norm` only (wq_a/wkv on `quant_rows + proj_mrows ×2`;
+///     wq_b on ONE `gemm_fp8_mx_rope_norm`)
+/// `1` (both) is byte-for-byte the R2 that shipped; unset / `0` / anything else
+/// is OFF. `2` and `3` are bisect arms, not production settings.
+fn attn_lin_fuse() -> AttnLinFuse {
+    static F: std::sync::OnceLock<AttnLinFuse> = std::sync::OnceLock::new();
+    *F.get_or_init(|| match std::env::var("DSV41_ATTN_LIN_FUSE").as_deref() {
+        Ok("1") => AttnLinFuse::Both,
+        Ok("2") => AttnLinFuse::Lin2,
+        Ok("3") => AttnLinFuse::RopeNorm,
+        _ => AttnLinFuse::Off,
+    })
+}
+
+/// R2's two halves, selected by `DSV41_ATTN_LIN_FUSE` (see [`attn_lin_fuse`]).
+///
+/// R2 shipped as one on/off gate over TWO independent fusions, and a corruption
+/// under it cannot say which half is at fault — so the gate is split into the
+/// two sub-switches that make that a one-shot bisect.
+#[derive(Clone, Copy)]
+enum AttnLinFuse {
+    /// Neither half (unset, `"0"`, or any unrecognised value).
+    Off,
+    /// R2's first half only: [`Self::lin2`] (wq_a + wkv over one shared `xq`);
+    /// wq_b keeps its `mrows` sequence.
+    Lin2,
+    /// R2's second half only: [`Self::rope_norm`] (norm + wq_b + rope in one
+    /// launch); wq_a/wkv keep their `mrows` sequence.
+    RopeNorm,
+    /// Both halves — the `=1` behaviour R2 shipped.
+    Both,
+}
+
+impl AttnLinFuse {
+    /// May `attention_rows` take EAGER's `lin2` (wq_a + wkv)?
+    fn lin2(self) -> bool {
+        matches!(self, Self::Lin2 | Self::Both)
+    }
+
+    /// May `attention_rows` take EAGER's `lin_rope_norm` (norm + wq_b + rope)?
+    fn rope_norm(self) -> bool {
+        matches!(self, Self::RopeNorm | Self::Both)
+    }
 }
 
 /// R2b (DSV41_INDEXER_QR_RAW, **default ON, only reachable under R2**): the
@@ -9607,9 +9655,16 @@ impl<'a> DevChain<'a> {
         // below, `lin_rope_norm` (norm + wq_b + rope in one launch). Both
         // kernels are already in the .so; the mrows化 never called them at
         // one row, which is 7 projection-family launches where EAGER pays 2.
-        // See [`attn_lin_fuse`]. `m > 1` keeps the mrows path verbatim.
-        let lin_fuse = attn_lin_fuse() && m == 1 && !Self::swapab();
-        let took_akv = if lin_fuse {
+        // See [`attn_lin_fuse`]. `m > 1` keeps the mrows path verbatim. The gate
+        // is split (see [`AttnLinFuse`]): `lin2_gate` is R2's first half, the
+        // wq_b half is `rope_norm_gate` below. Either one off simply leaves that
+        // projection on the mrows sequence, so every combination of the two
+        // degrades to a path that already existed. (Named `_gate` to stay clear
+        // of the unrelated `rope_fuse()` gate above.)
+        let lin_gate = attn_lin_fuse();
+        let lin2_gate = lin_gate.lin2() && m == 1 && !Self::swapab();
+        let rope_norm_gate = lin_gate.rope_norm() && m == 1 && !Self::swapab();
+        let took_akv = if lin2_gate {
             // The EAGER call verbatim, with this path's `_r` buffers as the
             // destinations: `quant1` + `gemm_fp8_mx2` write row 0 of `qr_r` /
             // `kv_r`, i.e. the bytes `proj_mrows` wrote for row 0. The GEMV
@@ -9740,7 +9795,7 @@ impl<'a> DevChain<'a> {
         // own gemv prologue and the `norm_rows` is skipped — same bytes into the
         // GEMV's dot either way. The rope is then already on `q_r` and the
         // standalone rope below skips the row.
-        let q_norm_fused = lin_fuse
+        let q_norm_fused = rope_norm_gate
             && self.lin_rope_norm(
                 self.s.qr_r.ptr as *const f32,
                 ld.q_norm.as_ref().unwrap().as_f32(),
