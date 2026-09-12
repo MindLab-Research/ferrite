@@ -1012,3 +1012,18 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 3. **全 draft 内部截断**：每层 residual 都 round-trip（最彻底但最贵）
 
 **推荐**：先做 #1（最简，一次试验即可判定方向）。
+
+## 截断代价的隔离测量（b4cd9607 vs a54bd0cc）
+
+| 配置 | 步时 | 拉丁 | k_acc |
+|---|---|---|---|
+| lazy 无截断（新 binary，mrows staging 修复）| **18.82ms**（53.1 tok/s/步）| [acs,Bristol,burdens,oqua] | ~64% k0 |
+| lazy 双截断 | **33.10ms**（30.2 tok/s/步）| **[]**（零拉丁 ✓）| 43% k0 |
+
+**发现**：
+1. **mrows staging 修复生效**：无截断 lazy 从 22.56→18.82ms（-3.7ms）
+2. **截断代价 14.3ms/步**——远超预期（round-trip 2 指令/元素 × 40 层 ≈ 0.8ms/行）
+3. **疑点**：verify 路径（layer_rows）用**分离的** hc_collapse（无 truncate 参数）——截断根本不在 verify 路径上！14.3ms 的来源不是 verify 的截断计算
+4. **可能机制**：截断改变 argmax → 改变 accept 模式 → 改变每步行数（2.02 vs 1.72 行/步）——但即使如此 per-row 成本也差 5.5ms（16.4 vs 10.9）
+
+**待查**：tap 截断（import_tap 的 round-trip）是否在图外导致同步开销，或 hc_front 的 truncate 分支阻碍了某个编译器优化。
