@@ -3947,3 +3947,23 @@ self.dev.gemm_fp8_mx_rope_norm(
 3. 或者 K1/K2 的其他性能问题
 
 **注意**：本次测试的 .so 不含 K1 decline 路径修复（刚提交）——但 decline 只影响回退路径（正常路径不变），测试结果仍有效。
+
+## SH_PAIR "M 进 grid" 模式的推广前景（400 的架构钥匙）
+
+**SH_PAIR 的验证机制**：phase-1 用 M×9=54 blocks（M 进 grid 维度）——每个 block 加载一份权重，为 M 行激活做计算。**权重读 1 次，M 行复用**——这是唯一已验证的真权重共享。
+
+**推广到其他 kernel 的蓝图**：
+| kernel 族 | 当前（warp-per-row）| 推广后（M-into-grid）| 效果 |
+|---|---|---|---|
+| gemm_fp8_mrows（投影）| warp 拥有一行，M 行 = 每 warp 多干活 | block 拥有一行 × M 激活在 smem | 权重读 1/M |
+| hc_dots/mixes | grid=5 blocks（mix 维度）| grid=(mix × rows)——L4-7 已设计 | 天然 M 进 grid |
+| expert_gemv_fp4 | per-expert per-row | grouped + M 进 grid | MoE 的真共享 |
+| collapse_norm/rmsnorm | grid=rows（m=1 时 1 CTA）| grid=(rows, chunks)——L4-9 已设计 | SM 利用率 |
+
+**实施路径（L4/L5 的 25-35 人日）**：
+1. 投影族的 M-into-grid 化（gemm_fp8_mrows 的改造）——最大收益
+2. hc 链的 L4-7（dots grid）+ L4-9（collapse grid）
+3. MoE 的 grouped + M-into-grid
+4. tcgen05（tensor cores 根治 instruction-bound）
+
+**关键约束**：改造后的 kernel 必须过 parity 逐字节 diff（R2 的教训）——同程序原则在这里同样适用。
