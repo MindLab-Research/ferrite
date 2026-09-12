@@ -49,6 +49,37 @@
 //                        invariant under them — rows are independent; the
 //                        geometry only decides how many rows share a block's
 //                        staging). Worth running under a couple of settings.
+//
+// THE TWO L4/L5 GATES THIS SUITE NOW COVERS (2026-09-12, plan
+// docs/agent/l4l5-next-batch-implementation-plan.md §6 N1 "parity 扩轴"):
+//
+//   DSV41_MROWS_ACT_CPASYNC (1b) — SWEPT IN-PROCESS. The activation staging
+//     loop is a pure copy (`s_a[r*k+i] = ar[i]`), so its cp.async16 form must be
+//     BIT-IDENTICAL to the scalar form at every shape — including a shape where
+//     the runtime `dsv41_f4_ok` guard declines it and the kernel keeps the scalar
+//     loop anyway. `mrows_act_cpasync_host()` reads `getenv` on EVERY launch (NOT
+//     at load time, unlike fold_r), so `mr_case_cp16_axis` runs both arms inside
+//     one process and checks each against the SAME m single-row references:
+//       arm "<tag>/cp16=0"  DSV41_MROWS_ACT_CPASYNC unset (the shipped default)
+//       arm "<tag>/cp16=1"  DSV41_MROWS_ACT_CPASYNC=1
+//     arm-on == arm-off then follows from both == reference, which is the
+//     stronger form.
+//
+//   DSV41_MROWS_FOLD_R (1a) — ONE PROCESS PER ARM. `g_mrows_fold_r` is a
+//     FILE-SCOPE const initialised from `getenv` at LOAD time, so an in-process
+//     sweep is impossible by construction. The axis is therefore exercised by
+//     re-running the WHOLE suite once per value (the mr_case arms then run on the
+//     folded grid — same expected output, since `acc[q]` is an independent chain
+//     and nothing is ever combined across activation rows):
+//       bash: for fr in 1 2 3 6; do DSV41_MROWS_FOLD_R=$fr /tmp/t_gemm_mrows; done
+//     `mr_fold_r_contract` prints the resolved (fold_r, ng) per production shape
+//     and pins the 2026-09-12 fix — with the gate unset/`0`/`auto` the resolution
+//     MUST be the identity (`fold_r = m`, `ng = 1`), the program that keeps the
+//     6x weight-re-staging regression from coming back unnoticed.
+//     NOTE FOR THE LAZY PATH: at m = 1 the identity is also the ONLY reachable
+//     program (`fold_r` clamps into [1, m] = {1} => ng = 1 => grid = nt), i.e.
+//     1a is a PROVABLE no-op on the lazy/per-row verify — see the L4/L5 design's
+//     m=1 row in `docs/agent/lazy-l45-next-ab-design.md`.
 #include "dsv41_kernels.cu"
 
 #include <cmath>
@@ -213,24 +244,120 @@ int mr_case(const char* tag, int m, int n, int k, int out_stride, bool use_bias)
         ++g_fails;
     }
     // Coverage: every element of [0, n) of every row must have been written by
-    // BOTH sides (the sentinel is NaN, so "still sentinel" = never written).
-    size_t unwritten = 0;
+    // BOTH sides (the sentinel is NaN, so "still sentinel" = never written), and
+    // every element of [n, out_stride) — the GAP a narrowed projection
+    // (`out_stride > n`, the wq_b shape) deliberately leaves alone — must STILL be
+    // the sentinel on both sides.
+    //
+    // The two regions are counted APART. A single `c < out_stride` sweep counts
+    // the intentional gap as "unwritten by both arms": m * (out_stride - n) false
+    // positives, and the wq_b arm reported exactly that (12288 = 6 * 2048), so the
+    // suite exited 1 on a healthy binary — which would have masked a REAL coverage
+    // loss behind a known-red arm. The gap's sentinel-ness is asserted HERE rather
+    // than left to the whole-buffer `mr_bits_equal` above: that comparison only
+    // proves the two arms agree, not that neither wrote into the gap.
+    size_t unwritten = 0, gap_written = 0;
     for (int r = 0; r < m; ++r)
         for (int c = 0; c < out_stride; ++c) {
             uint32_t bm, br;
             std::memcpy(&bm, &om[(size_t)r * out_stride + c], 4);
             std::memcpy(&br, &orr[(size_t)r * out_stride + c], 4);
-            if (bm == br && (bm & 0x7FFFFFFFu) > 0x7F800000u) ++unwritten;   // NaN both sides
+            const bool nan_m = (bm & 0x7FFFFFFFu) > 0x7F800000u;
+            const bool nan_r = (br & 0x7FFFFFFFu) > 0x7F800000u;
+            if (c < n)
+                unwritten += (bm == br && nan_m) ? 1u : 0u;   // NaN both sides, write region
+            else
+                gap_written += (nan_m && nan_r) ? 0u : 1u;    // the gap must stay sentinel
         }
-    MR_CHECK(unwritten == 0, "[%s] %zu element(s) left unwritten by both arms", tag, unwritten);
+    MR_CHECK(unwritten == 0, "[%s] %zu element(s) of [0,n) left unwritten by both arms", tag, unwritten);
+    MR_CHECK(gap_written == 0, "[%s] %zu element(s) of [n,out_stride) written into the sentinel gap",
+             tag, gap_written);
 
-    if (same && unwritten == 0)
+    if (same && unwritten == 0 && gap_written == 0)
         printf("  [%s] OK  m=%d n=%d k=%d out_stride=%d bias=%d  (%zu elems bit-identical)\n", tag, m, n,
                k, out_stride, (int)use_bias, om.size());
 
     cudaFree(da); cudaFree(dw); cudaFree(dws); cudaFree(dasc); cudaFree(db);
     cudaFree(dout_m); cudaFree(dout_r);
     return same ? 0 : 1;
+}
+
+// ------------------------------------------- 1b: the act cp.async16 parity axis
+// Both arms IN ONE PROCESS. `mrows_act_cpasync_host()` reads `getenv` on every
+// launch, so the switch is live for the second arm without a re-exec — unlike
+// `DSV41_MROWS_FOLD_R`, whose file-scope const is frozen at load time.
+//
+// The two arms are checked against the SAME m single-row references (`mr_case`'s
+// contract), so "arm on == arm off" follows from "each == the reference", which
+// is the stronger statement (it also catches an arm that is self-consistently
+// wrong). Each arm prints its own `[<tag>/cp16=N] OK|FAIL` line, so a run's log
+// names the arm that failed.
+int mr_case_cp16_axis(const char* tag, int m, int n, int k, int out_stride, bool use_bias) {
+    int fails = 0;
+    char t[160];
+    unsetenv("DSV41_MROWS_ACT_CPASYNC");
+    std::snprintf(t, sizeof t, "%s/cp16=0", tag);
+    fails += mr_case(t, m, n, k, out_stride, use_bias);
+    // `overwrite = 1`: a caller's pre-set value is replaced, never inherited —
+    // the axis must be exactly {unset, "1"} or the log lies about the arm.
+    setenv("DSV41_MROWS_ACT_CPASYNC", "1", 1);
+    std::snprintf(t, sizeof t, "%s/cp16=1", tag);
+    fails += mr_case(t, m, n, k, out_stride, use_bias);
+    unsetenv("DSV41_MROWS_ACT_CPASYNC");
+    return fails;
+}
+
+// ---------------------------------------------- 1a: the fold_r contract pin
+// The resolution table for the production shapes, printed so a run's log is
+// self-describing, plus the two invariants the kernel relies on:
+//   * `fold_r` clamps into [1, m] at EVERY setting (never 1-as-decline, never
+//     > m), so `ng = ceil(m / fold_r)` is the only grid the launcher ever hands
+//     the kernel;
+//   * with the gate unset / `0` / `auto` the resolution IS the identity
+//     (`fold_r = m`, `ng = 1`) — the 2026-09-12 fix. The first rule of this knob
+//     folded `n <= 1024` to 1, which made the batched verify re-stage the same
+//     weight row `ng = m` times (measured 63.8 -> 10.3 tok/s); pinning the
+//     identity here keeps that regression from returning unseen.
+//
+// The SWEEP itself is one process per value (see the file header): the mr_case
+// arms above then run on the folded grid and their bit-identity claim — which is
+// exactly the claim 1a's wiring rests on — is re-checked at that fold_r.
+int mr_fold_r_contract() {
+    struct { const char* what; int n, m; } sh[] = {
+        {"wkv", 512, 5},
+        {"wq_a", 1280, 5},
+        {"wq_a", 1280, 6},
+        {"wq_b", 2048, 6},
+        {"wo_b", 5120, 5},
+        {"sh_w1/w3", 288, 6},
+        // m = 1 is the lazy/per-row verify block: `fold_r` clamps into [1, 1],
+        // i.e. the identity is the ONLY reachable program there, so 1a cannot
+        // move anything on the lazy path at any setting of the knob.
+        {"lazy/m=1", 512, 1},
+        {"lazy/m=1/wq_a", 1280, 1},
+    };
+    const char* e = getenv("DSV41_MROWS_FOLD_R");
+    const bool want_off = (e == nullptr) || (e[0] == '0' && e[1] == '\0') || e[0] == 'a' ||
+                          e[0] == 'A';
+    printf("  [fold_r] DSV41_MROWS_FOLD_R=%s -> resolved (fold_r, ng) per production shape:\n",
+           e == nullptr ? "<unset>" : e);
+    int fails = 0;
+    for (const auto& s : sh) {
+        const int fr = dsv41_mrows_fold_r_for(s.n, s.m);
+        const int ng = (s.m + fr - 1) / fr;
+        printf("           %-14s n=%-5d m=%d -> fold_r=%d ng=%d\n", s.what, s.n, s.m, fr, ng);
+        MR_CHECK(fr >= 1 && fr <= s.m, "[fold_r] %s: fold_r=%d outside [1,%d]", s.what, fr, s.m);
+        MR_CHECK(ng >= 1 && ng <= s.m, "[fold_r] %s: ng=%d outside [1,%d]", s.what, ng, s.m);
+        if (want_off)
+            MR_CHECK(fr == s.m && ng == 1,
+                     "[fold_r] %s: gate OFF/auto must be the identity (fold_r=m, ng=1), got "
+                     "fold_r=%d ng=%d",
+                     s.what, fr, ng);
+    }
+    if (fails == 0)
+        printf("  [fold_r] OK  (resolution inside [1,m]; %s)\n",
+               want_off ? "identity held for OFF/auto/0" : "positive arm: identity NOT asserted");
+    return fails;
 }
 
 // ------------------------------------------------------------- the declines
@@ -299,6 +426,22 @@ int main(int argc, char** argv) {
     g_fails += mr_case("wo_b/m=5", 5, 5120, 1024, 5120, false);
     g_fails += mr_case("m=1", 1, 64, 512, 64, false);
     g_fails += mr_case_declines();
+    // ---- L4/L5 N1 axes (see the file header). The OFF arms are the six
+    //      production runs above (the shipped default); these are the ON arms
+    //      for 1b and the resolution pin for 1a.
+    // 1b: both arms in-process over the shapes the lazy verify actually runs —
+    //     the m=1 block included, because that IS the lazy/per-row block and the
+    //     mrows kernel is the one it dispatches to at m=1.
+    g_fails += mr_case_cp16_axis("wq_a/m=6+bias", 6, 1280, 5120, 1280, true);
+    g_fails += mr_case_cp16_axis("wkv/m=5", 5, 512, 5120, 512, false);
+    g_fails += mr_case_cp16_axis("wo_b/m=5", 5, 5120, 1024, 5120, false);
+    g_fails += mr_case_cp16_axis("m=1", 1, 64, 512, 64, false);
+    g_fails += mr_case_cp16_axis("lazy/m=1/wkv", 1, 512, 5120, 512, false);
+    // 1a: the resolution table + the [1, m] clamp, plus the identity pin when the
+    //     knob is OFF/auto/0. The fold sweep itself is one process per value
+    //     (`for fr in 1 2 3 6; do DSV41_MROWS_FOLD_R=$fr ...; done`) — the arms
+    //     above then re-check bit-identity on the folded grid.
+    g_fails += mr_fold_r_contract();
     if (!quick) {
         // Every dispatch case the launcher's switch can take.
         for (int m = 1; m <= 8; ++m)
