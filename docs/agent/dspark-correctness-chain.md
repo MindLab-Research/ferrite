@@ -873,3 +873,17 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 ## Draft 链结构确认（P3c 图化的可行性）
 
 `draft_forward`（dspark_dev.rs:860）的块循环：`for s in 0..cfg.n_mtp_layers`（3 块 MTP），每块 = hc_mixes + attn（sparse/window）+ hc_post + MoE（draft_moe）+ hc_mixes(ffn) + P3a 折叠。块间串行依赖（premix ping-pong a3 已把 D2D 消除）。**结构上可图化**：固定 kernel 序列 + 设备端输入输出（ids/pos 都在 device）+ 无宿主侧分支（除 unit_dump 的调试臂）。P3c = 捕获 3 块序列为一张图，launch 从 ~120 → 1。
+
+## 段错误隔离记录（2026-09-12，commit 8521d6f 后）
+
+| 隔离 | 配置 | 结果 |
+|---|---|---|
+| a8020426 | spec + SH_EXP_MROWS + SMALL_N_ADAPTIVE | **CRASH** |
+| 355045b3 | spec + SH_EXP_MROWS（无 adaptive） | **CRASH** |
+| 2c2efaf2 | spec（无 SH_EXP_MROWS） | **CRASH** |
+| 6bee8c72 | **纯 EAGER**（无 spec） | **CRASH** |
+
+**关键事实**：纯 EAGER 也崩 → 段错误在**主路径**（step_body 一侧），不是 verify/mrows。8521d6f 只改了 gemm_fp8_mrows_kernel 的 staging——EAGER 不调用它，但 .so 重编可能改变了**整个文件的寄存器分配/符号布局**（相邻 kernel 的代码生成变化）。
+**ABI 检查**：ferrite_kernels.cu=3u，cuda.rs/devrt.rs=3 ✓（一致）
+**FFI 检查**：hc_collapse_norm 的 truncate 参数位置正确（truncate as c_int 在 stream 前）✓
+**正在跑**：远端手动回退 cp.async staging → 重建 → 测试（37073a37）
