@@ -7745,7 +7745,7 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 | # | 机会 | 预期 | 状态 |
 |---|---|---|---|
 | 1 | DSV41_HC_DOTS_T=256/512（env 已存在） | −1~1.5µs/launch | 零成本先跑 |
-| 2 | K-chunk cp.async（smem 160→≤64KiB，4 blk/SM） | 14.9→8-9µs | dl-kchunk-design 设计中 |
+| 2 | K-chunk cp.async（smem 160→48KiB，4 blk/SM） | 14.9→8-9µs | **已实现**（`hc_dots_late_kchunk_kernel`，`DSV41_HC_DL_KCHUNK` 默认 OFF） |
 | 3 | sinkhorn 单 lane 16 寄存器 | ~1µs | 低优先 |
 | 4 | 减 sinkhorn 轮数 | — | **不做**（语义变更） |
 
@@ -7759,6 +7759,23 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 可行切分：**768 f4/chunk（12 KiB/行，双缓冲 48 KiB → 4 blk/SM）** 或 **576 f4/chunk（9 KiB/行，36 KiB → 6 blk/SM）**；
 两种都是 **6/8 个满 chunk 覆盖 4608 f4 + 末段 512 f4**（起点 4608 f4 = 96×48 = 192×24，恰好复现全局尾部），
 **a0/a1/a2 跨 chunk 不重置**即可逐操作数复现单链顺序。
+
+**实施（dl-kchunk-impl，2026-09-12）**：新增 `hc_dots_late_kchunk_kernel`（`dsv41_kernels.cu:8242`），
+与 `hc_dots_late_kernel` 同 grid/block/election/tail，只替换 staging+dot+ss 部分：
+- 双缓冲窗口：每 chunk 段 b∈{0,1} 持 x 行 `[b*2L, b*2L+L)` 与 hc_fn 行 `[b*2L+L, b*2L+2L)`（float4），
+  `smem = 16·chunk·4 bytes`（chunk=768 → 48 KiB）；
+- 流水：prologue stage chunk 0 → 循环内**先发射 chunk k+1**（2 个 commit group）再 `cp.async.wait_group 2`
+  退掉 chunk k 的 2 个 group（末 chunk `wait_all`）；两次 `__syncthreads()` 保护缓冲区复用；
+- 消费仅 warp0：三累加器主循环 `c = C+lane`，条件 `c+64 < C+len`；ragged 循环 `c < C+len`；
+  ss replay 按 chunk 切 stride（`spc = L/(mix*8)`），chunk 内 `i∈[k·spc,(k+1)·spc)` 升序累加。
+- Launcher（`dsv41_hc_front_split`，:8707）仅在 `hc_dim%4==0` 且 `chunk % lcm(96, mix*8)==0`
+  且 smem 不过 ceiling 时走该臂，否则回落原 `hc_dots_late_kernel`（再回落两 launch）。
+- 门控 **`DSV41_HC_DL_KCHUNK`**（默认 OFF，`=1` 启用）；chunk 长度 **`DSV41_HC_DL_KCHUNK_F4`**（默认 768，可选 576）。
+
+**位一致证据（本机 nvcc 13.3 / sm_103a 编译核验，无 GPU）**：主循环 PTX 三累加器链结构逐条一致
+（旧 `BB16_18`：r889/r880/r879 三链、`mul+3×fma+add`、`c+=96`；新 `BB17_117`：r547/r549/r550 三链、同指令序列、`c+=96`）；
+ss replay 两边都是**严格线性 fma 链**（旧 unroll 5×、新单步，但链序均为升序，无树形重组）；新内核 34 reg、0 spill。
+真机 parity 待跑：`DSV41_HC_DL_KCHUNK=1 cargo test --release -p ferrite-dsv41 --test hc_dl_merge_parity`（对两-launch 逐位比较）。
 
 ### v20 DOTS_T 扫描定案：中性（2026-09-12 19:00）
 

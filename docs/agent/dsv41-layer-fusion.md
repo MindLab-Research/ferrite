@@ -599,6 +599,14 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     —— 与 `e152f47`（EARLY 挪侧流）同量级；**不是**把 30µs 砍成 15µs。真收益靠上机 A/B 定。
   - 回退：`DSV41_HC_DL_SIDE=0`（纯 A/B 臂，bit-identical，DL 排回 `side` 的 EARLY 之后）；
     或运行时建不出第四条流（`side_stream4` 为 null，stderr 打 `[dl_side]`）。
+  - **DL 的 K-chunk 化（`DSV41_HC_DL_KCHUNK`，默认 OFF，2026-09-12）**：`hc_dots_late_kernel`
+    把整行对（x 行 + hc_fn 行）stage 进 `2·hc_dim` floats = 160 KiB（`hc_dim=20480`），因此
+    1 blk/SM、每 launch 搬 3.84 MiB 且其中 1.92 MiB 是「`mix` 个块各搬一遍同一 x 行」的纯冗余。
+    新内核 `hc_dots_late_kchunk_kernel`（同 grid/block/election/tail）改用 chunk 粒度双缓冲
+    （chunk=768 f4 → 48 KiB → 4 blk/SM），处理 chunk c 前先发射 c+1 的 cp.async。
+    ⚠️ **位一致硬约束**：chunk 起点必须同时落在 dot 链的 96-f4 网格与 ss replay 的
+    `mix*8`-f4 网格上 ⇒ `chunk % lcm(96, mix*8) == 0`（生产 mix=24 → 192），且 `hc_dim % 4 == 0`；
+    不满足则 launcher 自动回落原内核。详见 `STATUS.md`（hc_dots_late 优化 → 实施）。
 
 ---
 

@@ -7278,6 +7278,10 @@ __device__ __forceinline__ void dsv41_cp_wait_all() { asm volatile("cp.async.wai
 // purpose (see g_gemv_act_cpasync), which is what makes this the "wait for the
 // activation, keep the weight row streaming" primitive.
 __device__ __forceinline__ void dsv41_cp_wait_group1() { asm volatile("cp.async.wait_group 1;\n"); }
+// Two-group variant, for the K-chunk pipeline (DSV41_HC_DL_KCHUNK): each chunk
+// commits ONE x group + ONE hc_fn group, so "leave the newest 2 groups in
+// flight" is exactly "chunk c is staged, chunk c+1 is still moving".
+__device__ __forceinline__ void dsv41_cp_wait_group2() { asm volatile("cp.async.wait_group 2;\n"); }
 
 // Phase A: one warp per (token, projection row). Both operands are staged with
 // cp.async; the raw dot lands in g_hc_part[r][m][0] for the tail to scale.
@@ -8034,6 +8038,59 @@ static const bool g_hc_dl_merge = [] {
 
 __device__ unsigned g_hc_dl_done[DSV41_HC_SPREAD_MAXR];
 
+// K-chunk cp.async pipeline for the dots+LATE merged node (DSV41_HC_DL_KCHUNK,
+// default OFF — a memory-shape change, so it is A/B'd, not flipped blindly; the
+// arm is bit-identical by construction, see hc_dots_late_kchunk_kernel).
+//
+// WHY. hc_dots_late_kernel stages the WHOLE row pair (activation row + this
+// projection row) into 2*hc_dim floats = 160 KiB at hc_dim = 20480. That is
+// ONE block per SM (the opt-in ceiling), so the launch runs 4 warps per SM and
+// the staging is exposed DRAM latency. The 160 KiB buys nothing the dot needs
+// beyond one pass over the two rows — and every one of the `mix` blocks drags
+// the SAME activation row across the bus, so 1.92 MiB of the 3.84 MiB moved per
+// launch is pure redundancy. K-chunking turns the pair into a double-buffered
+// window of `chunk` float4 (12 KiB/row at chunk = 768 → 48 KiB total ⇒ 4
+// blocks/SM) and issues chunk c+1's cp.async before consuming chunk c, so the
+// DRAM latency hides behind the dot.
+//
+// The chunk length must satisfy the BIT-EXACTNESS constraint, which is stronger
+// than "start ≡ 0 (mod 96)": the fp32 accumulator operand SEQUENCE of each lane
+// must be untouched. Two grids have to line up at every chunk start C:
+//   * the dot chain's 96-float4 accumulator grid (`c += 96`; index j lands in
+//     accumulator a_{(j>>5)%3}, so C/32 must be a multiple of 3 ⇒ 96 | C);
+//   * the ss replay's stride, mix*32 floats = mix*8 float4 (`c2 = lane + m*32,
+//     step mix*32`), so mix*8 | C so that whole strides fall inside one chunk.
+// Hence chunk % lcm(96, mix*8) == 0 (192 float4 at the production mix = 24). The
+// launcher rejects any other length — and any hc_dim that is not a multiple of 4
+// (the dot's scalar residue tail would then read floats the float4 staging never
+// covered) — and takes the un-chunked kernel instead.
+static const bool g_hc_dl_kchunk = [] {
+    const char* e = getenv("DSV41_HC_DL_KCHUNK");
+    if (e == nullptr) return false;
+    return e[0] != '0';
+}();
+
+// Chunk length in float4 (DSV41_HC_DL_KCHUNK_F4, default 768 = 12 KiB/row ⇒
+// 48 KiB double-buffered ⇒ 4 blocks/SM). 576 (9 KiB/row, 36 KiB ⇒ 6 blocks/SM)
+// is the other legal value at mix = 24; both are multiples of 192 and cover the
+// production n4 = 5120 as 6 (resp. 8) full chunks + a 512-float4 residue.
+static const int g_hc_dl_chunk = [] {
+    const char* e = getenv("DSV41_HC_DL_KCHUNK_F4");
+    if (e == nullptr) return 768;
+    const int v = atoi(e);
+    return (v > 0) ? v : 768;
+}();
+
+static inline int dsv41_gcd_i(int a, int b) {
+    while (b != 0) { const int t = a % b; a = b; b = t; }
+    return (a < 0) ? -a : a;
+}
+// The chunk-start alignment the bit-exactness argument requires.
+static inline int dsv41_hc_kchunk_align(int mix) {
+    const int k = dsv41_gcd_i(96, mix * 8);
+    return (96 / k) * (mix * 8);
+}
+
 __global__ void hc_dots_late_kernel(const float* __restrict__ x, const float* __restrict__ hc_fn,
                                     const float* __restrict__ hc_scale,
                                     const float* __restrict__ hc_base, float* __restrict__ pre,
@@ -8108,6 +8165,211 @@ __global__ void hc_dots_late_kernel(const float* __restrict__ x, const float* __
     __threadfence();
     if (threadIdx.x < 32) {
         // ss_in == 1: the dots' ss partials, only the cross-warp tree remains.
+        float v = (threadIdx.x < nwarp) ? g_hc_part[r][threadIdx.x][1] : 0.f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
+        if (threadIdx.x == 0) sss = v;
+    }
+    __syncthreads();
+    const float inv = rsqrtf(sss / (float)hc_dim + eps);
+    for (int m2 = threadIdx.x; m2 < mix; m2 += blockDim.x)
+        p_mixes[m2] = g_hc_part[r][m2][0] * inv;
+    __syncthreads();
+    if (threadIdx.x < (unsigned)hc) {
+        const int j = threadIdx.x;
+        pre[(size_t)r * hc + j] =
+            (1.f / (1.f + expf(-(p_mixes[j] * hc_scale[0] + hc_base[j])))) + eps;
+        post[(size_t)r * hc + j] =
+            2.f / (1.f + expf(-(p_mixes[hc + j] * hc_scale[1] + hc_base[hc + j])));
+    }
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x) {
+        const int j = jk / hc, k = jk % hc;
+        p_cm[jk] = p_mixes[2 * hc + j * hc + k] * hc_scale[2] + hc_base[2 * hc + j * hc + k];
+    }
+    __syncthreads();
+    if (warp == 0) {
+        const int hh = hc * hc;
+        float c = (lane < hh) ? p_cm[lane] : 0.f;
+        float mx = c;
+        for (int off = 1; off < hc; off <<= 1)
+            mx = fmaxf(mx, __shfl_xor_sync(0xFFFFFFFFu, mx, off));
+        c = expf(c - mx);
+        float rs = c;
+        for (int off = 1; off < hc; off <<= 1) rs += __shfl_xor_sync(0xFFFFFFFFu, rs, off);
+        c = c / rs + eps;
+        for (int it = 0; it < sinkhorn_iters; ++it) {
+            if (it > 0) {
+                float st = c;
+                for (int off = 1; off < hc; off <<= 1)
+                    st += __shfl_xor_sync(0xFFFFFFFFu, st, off);
+                c = c / (st + eps);
+            }
+            float t = c;
+            for (int off = hc; off < hh; off <<= 1) t += __shfl_xor_sync(0xFFFFFFFFu, t, off);
+            c = c / (t + eps);
+        }
+        if (lane < hh) p_cm[lane] = c;
+    }
+    __syncthreads();
+    for (int jk = threadIdx.x; jk < hc * hc; jk += blockDim.x)
+        comb[(size_t)r * hc * hc + jk] = p_cm[jk];
+    // Reset LAST: the loops above were the final g_hc_part reads of this row.
+    if (threadIdx.x == 0) atomicExch(&g_hc_dl_done[r], 0u);
+}
+
+// ============================================================================
+// hc_dots_late_kchunk_kernel — the K-chunk cp.async pipeline of
+// hc_dots_late_kernel (`DSV41_HC_DL_KCHUNK`, default OFF).
+//
+// Same grid (mix, rows), same block size, same election discipline and the same
+// LATE half, statement for statement, as hc_dots_late_kernel. The ONLY thing
+// that changes is the staging + the dot/ss residue: instead of one 2*hc_dim-float
+// window, the row pair is walked in chunks of `chunk` float4 with a double
+// buffer, and chunk c+1's cp.async is issued before chunk c is consumed.
+//
+// BIT-EXACTNESS. The dot is hc_dots_late_kernel's warp-0 float4
+// three-accumulator chain, and the ss is its warp-m replay; only WHERE each
+// float4/float is read from changes (a chunk-local buffer instead of the whole
+// row). The per-lane operand sequence is preserved because, per the launcher's
+// constraint, `chunk` is a multiple of lcm(96, mix*8) — so a chunk start C is a
+// multiple of 96 float4 (lane l's chunk-k iterations are exactly the monolithic
+// chain's i = k*chunk/96…, and the index→{a0,a1,a2} assignment (j>>5)%3 is
+// unchanged, with a0/a1/a2 carried ACROSS chunks, never reset) and a multiple of
+// the ss stride mix*8 float4 (each chunk owns whole ss strides, and the chunks
+// run in ascending order, so the sum-of-squares accumulation order is the
+// monolithic loop's). The scalar residue of the dot is empty whenever
+// hc_dim % 4 == 0, which the launcher requires for this arm.
+// ============================================================================
+__global__ void hc_dots_late_kchunk_kernel(const float* __restrict__ x,
+                                           const float* __restrict__ hc_fn,
+                                           const float* __restrict__ hc_scale,
+                                           const float* __restrict__ hc_base,
+                                           float* __restrict__ pre, float* __restrict__ post,
+                                           float* __restrict__ comb, int hc, int dim,
+                                           int sinkhorn_iters, float eps, int mix, int chunk) {
+    const int m = blockIdx.x;
+    const int r = blockIdx.y;
+    const int hc_dim = hc * dim;
+    const int nwarp = (mix * 32) >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    extern __shared__ float hc_sm[];
+    __shared__ unsigned s_elected;
+    __shared__ float sss;
+    __shared__ float p_mixes[64];
+    __shared__ float p_cm[64];
+
+    const int n4 = hc_dim >> 2;
+    const int L = chunk;                    // float4 per full chunk (multiple of the align)
+    const int nfull = n4 / L;               // chunks of length L
+    const int rem = n4 - nfull * L;         // residue chunk (start nfull*L, aligned)
+    const int nchunk = nfull + ((rem > 0) ? 1 : 0);
+    const int ss_stride_f = mix * 32;       // the ss replay stride, in floats
+    const int spc = L / (ss_stride_f >> 2);// whole ss strides covered by one full chunk
+    // Double buffer, all float4: stage b holds this chunk's x row at
+    // [b*2L, b*2L+L) and this projection's hc_fn row at [b*2L+L, b*2L+2L).
+    float4* buf = reinterpret_cast<float4*>(hc_sm);
+    const float4* xg = reinterpret_cast<const float4*>(x + (size_t)r * hc_dim);
+    const float4* wg = reinterpret_cast<const float4*>(hc_fn + (size_t)m * hc_dim);
+
+    // a0/a1/a2 and s2 live across chunks: the accumulator assignment and the
+    // addition order are the monolithic chain's, only the reads are chunk-local.
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f;
+    float s2 = 0.f;
+    // Prologue: chunk 0 into buffer 0.
+    {
+        const int len = (nfull > 0) ? L : rem;
+        float4* sx = buf;
+        float4* sw = buf + L;
+        for (int i = threadIdx.x; i < len; i += blockDim.x) dsv41_cp_async16(&sx[i], &xg[i]);
+        dsv41_cp_commit();
+        for (int i = threadIdx.x; i < len; i += blockDim.x) dsv41_cp_async16(&sw[i], &wg[i]);
+        dsv41_cp_commit();
+    }
+    for (int k = 0; k < nchunk; ++k) {
+        const int C = k * L;
+        const int len = (k < nfull) ? L : rem;
+        // Issue chunk k+1 into the other half BEFORE waiting on chunk k, so its
+        // DMA runs under this chunk's dot. commit_group costs ~nothing, so the
+        // issue is spread over all warps even though only warp 0 consumes.
+        if (k + 1 < nchunk) {
+            const int Cn = C + L;
+            const int lenn = (k + 1 < nfull) ? L : rem;
+            float4* sx = buf + (size_t)((k + 1) & 1) * (2 * L);
+            float4* sw = sx + L;
+            const float4* xs = xg + Cn;
+            const float4* ws = wg + Cn;
+            for (int i = threadIdx.x; i < lenn; i += blockDim.x) dsv41_cp_async16(&sx[i], &xs[i]);
+            dsv41_cp_commit();
+            for (int i = threadIdx.x; i < lenn; i += blockDim.x) dsv41_cp_async16(&sw[i], &ws[i]);
+            dsv41_cp_commit();
+            // Chunk k committed the OLDEST two of the four groups now pending.
+            dsv41_cp_wait_group2();
+        } else {
+            dsv41_cp_wait_all();
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const float4* sx = buf + (size_t)(k & 1) * (2 * L);
+            const float4* sw = sx + L;
+            const float* s_xf = reinterpret_cast<const float*>(sx);
+            const float* s_wf = reinterpret_cast<const float*>(sw);
+            const int cEnd = C + len;       // exclusive float4 bound of this chunk
+            // hc_dots_late_kernel's float4 three-accumulator lane chain with c
+            // rebased to the chunk. cEnd replaces n4: for a full chunk that is
+            // exactly L/96 iterations per lane and the ragged single-accumulator
+            // loop below never runs; for the residue chunk it is n4, i.e. the
+            // monolithic chain's own termination.
+            int c = C + lane;
+            for (; c + 64 < cEnd; c += 96) {
+                const int o = c - C;
+                const float4 w0 = sw[o], w1 = sw[o + 32], w2 = sw[o + 64];
+                const float4 v0 = sx[o], v1 = sx[o + 32], v2 = sx[o + 64];
+                a0 += w0.x * v0.x + w0.y * v0.y + w0.z * v0.z + w0.w * v0.w;
+                a1 += w1.x * v1.x + w1.y * v1.y + w1.z * v1.z + w1.w * v1.w;
+                a2 += w2.x * v2.x + w2.y * v2.y + w2.z * v2.z + w2.w * v2.w;
+            }
+            for (; c < cEnd; c += 32) {
+                const int o = c - C;
+                const float4 w = sw[o], v = sx[o];
+                a0 += w.x * v.x + w.y * v.y + w.z * v.z + w.w * v.w;
+            }
+            if (k + 1 == nchunk) {
+                // The dot's scalar residue, read chunk-locally (global float kk =
+                // buffer float kk - C*4). Empty whenever hc_dim % 4 == 0, which
+                // is the launcher's condition for taking this arm at all.
+                for (int kk = (n4 << 2) + lane; kk < hc_dim; kk += 32)
+                    a0 += s_wf[kk - (C << 2)] * s_xf[kk - (C << 2)];
+            }
+            // The tail's warp-m ss replay, chunk by chunk: chunk k owns strides
+            // [k*spc, (k+1)*spc) of `c2 = lane + m*32, step mix*32`, and chunks
+            // run in ascending k, so the accumulating order is unchanged.
+            for (int i = k * spc; i < (k + 1) * spc; ++i) {
+                const int c2 = lane + m * 32 + ss_stride_f * i;
+                if (c2 >= hc_dim) break;
+                s2 += s_xf[c2 - (C << 2)] * s_xf[c2 - (C << 2)];
+            }
+        }
+        __syncthreads();   // chunk k consumed before its half is restaged at k+2
+    }
+    if (threadIdx.x < 32) {
+        float acc = (a0 + a1) + a2;
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) g_hc_part[r][m][0] = acc;
+        // The tail's warp-m ss partial (c = lane + m*32, stride mix*32).
+        for (int off = 16; off > 0; off >>= 1) s2 += __shfl_xor_sync(0xFFFFFFFFu, s2, off);
+        if (lane == 0) g_hc_part[r][m][1] = s2;
+    }
+    // Publish and elect — identical to hc_dots_late_kernel.
+    if (threadIdx.x == 0) {
+        __threadfence();
+        s_elected = (atomicAdd(&g_hc_dl_done[r], 1u) == (unsigned)(mix - 1)) ? 1u : 0u;
+    }
+    __syncthreads();
+    if (s_elected == 0u) return;    // no barrier follows on this path - safe
+
+    // ---------------- tail: the LATE half, by the elected dot block ----------
+    __threadfence();
+    if (threadIdx.x < 32) {
         float v = (threadIdx.x < nwarp) ? g_hc_part[r][threadIdx.x][1] : 0.f;
         for (int off = 16; off > 0; off >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, off);
         if (threadIdx.x == 0) sss = v;
@@ -8436,7 +8698,34 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // runtime created one, `side` otherwise). Nothing on `side` reads its output
     // and nothing here reads EARLY's, so the two halves overlap freely.
     bool dl_merged = false;
-    if (g_hc_dl_merge && g_hc_ss) {
+    // K-chunk arm FIRST (DSV41_HC_DL_KCHUNK, default OFF). It is only taken when
+    // the chunk length keeps the dot's accumulator sequence intact — a multiple
+    // of lcm(96, mix*8) (the 96-float4 dot grid AND the mix*8-float4 ss stride) —
+    // and when hc_dim % 4 == 0, so the dot's scalar residue tail is empty and
+    // every float4 the dot reads was actually staged. Anything else falls
+    // through to the un-chunked merged node (or the two-launch pair).
+    if (g_hc_dl_merge && g_hc_ss && g_hc_dl_kchunk) {
+        const int align = dsv41_hc_kchunk_align(mix);
+        const size_t smem_k = (size_t)16 * (size_t)g_hc_dl_chunk * sizeof(float);  // 2 buffers x (x+w)
+        if (hc_dim % 4 == 0 && g_hc_dl_chunk % align == 0 &&
+            smem_k <= (size_t)dsv41_smem_ceiling(hc_dots_late_kchunk_kernel)) {
+            cudaError_t e4 = cudaFuncSetAttribute(
+                hc_dots_late_kchunk_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                dsv41_smem_ceiling(hc_dots_late_kchunk_kernel));
+            if (e4 == cudaSuccess) {
+                hc_dots_late_kchunk_kernel<<<dim3((unsigned)mix, (unsigned)rows),
+                                             (unsigned)g_hc_dots_t, smem_k, dl>>>(
+                    x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps,
+                    mix, g_hc_dl_chunk);
+                e = cudaGetLastError();
+                if (e != cudaSuccess) return (int)e;
+                dl_merged = true;
+            } else {
+                (void)cudaGetLastError();   // clear the sticky flag, then take the pair
+            }
+        }
+    }
+    if (g_hc_dl_merge && g_hc_ss && !dl_merged) {
         cudaError_t e3 = cudaFuncSetAttribute(
             hc_dots_late_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
             dsv41_smem_ceiling(hc_dots_late_kernel));
