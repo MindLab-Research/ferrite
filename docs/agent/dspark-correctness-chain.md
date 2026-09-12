@@ -726,3 +726,7 @@ def hc_pre(self, x, pre_mix):
 **差异**：ferrite 在 hc_pre 后保持 f32 精度，官方截断回 bf16。这意味着 ferrite 的下游（attn_norm、attention）吃的是 f32（更高精度），而官方吃 bf16。**这是一个数值域分歧**——ferrite 更精确，但与官方的参考实现不同。在对齐实验中会表现为逐层 norm 的微小偏差。
 
 **是否需要修**：取决于对齐实验的结果——如果 acs/ibu 的根因不在 hc_pre 的截断（偏差小于量化噪声），可以不修（ferrite 的做法更精确）。如果对齐数据显示从 hc_pre 截断处开始 norm 偏差显著，则需要加截断。
+
+## rmsnorm eps 对照——一致 ✓（1e-20）
+
+ferrite config.rs:210 `norm_eps: f(t, "norm_eps").or(f(t, "rms_norm_eps")).unwrap_or(1e-20)` — checkpoint 的 `rms_norm_eps: 1e-20` → ferrite 读到 1e-20 ✓，与官方一致。
