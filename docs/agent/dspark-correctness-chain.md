@@ -5810,3 +5810,44 @@ collective payload 147456 > slot 122880
 1. **OOB 修复的 check_payload 工作正常**——它抓住了真正的越界！
 2. **这就是之前静默损坏 staging 的载荷**——epoch 54 的直接来源！
 3. **下一步**：找到传递 147,456 的调用点（哪个 v5 AR 入口）并修复
+
+## ✅ 判决落地：147456 来自 **engram 的多行 gather**，修复 = 增大 slot
+
+**上面的猜测（MoE/hc、非 m×dim 模式）被推翻。** 精确分解：
+
+```
+147456 B = 36864 f32 = 6 × 24 × 256
+                     = VERIFY_ROWS × n_cols × engram_head_dim
+```
+
+- config（`dsv41_flash.json` / `dsv41_reference_flat.json`）：`engram_max_ngram_size=4`,
+  `engram_n_heads=8`, `engram_head_dim=256` → `n_cols = (4-1)*8 = 24`。
+- 调用点**不是** `chain_dev.rs:5160` 的单行 `engram_apply`（那里载荷只有
+  `n_cols*ehd = 6144 f32 = 24576 B`，远小于 slot），而是**多行孪生**
+  `engram_apply_rows`（`chain_dev.rs:12397-12400`）：
+
+  ```rust
+  c.all_reduce_inplace(self.s.eng_rows_r.ptr, fb(m * n_cols * ehd))?;   // m = VERIFY_ROWS = 6
+  ```
+
+  它把 verify 块 **m 行**的 gather 结果**一次** collective 归约（每行一份
+  `n_cols*ehd`，行级 owner 零填充，求和重建），载荷 = `m * n_cols * ehd`
+  = 36864 f32 = 147456 B。
+
+**是合法需求，不是 gather 宽度 bug**：verify 块就是 m=6 行，每行有自己的 n-gram
+hash → 每行都必须参与归约；多行打包成一次 AR 是刻意的优化（比 m 次单行 AR 少
+m-1 个 round）。因此**修复方向 = 增大 slot**，与 `serve.rs` 既有的
+"slot must cover the LARGEST AR payload" 不变式一致。
+
+**修复**（`ar_bytes` 的 max 里补上 engram 项）：
+
+- `crates/ferrite-dsv41/src/serve.rs:394-414`：补 `eng_cols`/`eng_rows` 两项，
+  `ar_bytes = (hc_dim.max(VERIFY_ROWS*dim).max(eng_rows)) * 4`。
+- `crates/ferrite-dsv41/src/bin/dsv41-run.rs:354-367`：同款补丁（另一个
+  `Collective::new` 生产构造点）。
+
+新 slot = `max(20480, 30720, 36864) * 4` = **147456 B**（原 122880）——engram AR 的
+`n = 36864 ≤ 36864` 恰好贴合，`check_payload` 不再触发。`n_cols` 的推导与
+`engram_apply_rows` 自身一致（无 `.max(1)`，engram 关闭时为 0 不影响 max）。
+
+**验证**：`cargo check --workspace` EXIT=0。
