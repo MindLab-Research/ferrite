@@ -2737,3 +2737,19 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **已知性质**：投票是每次 gate 调用一次的会合，所以它要求「各 rank 的 `step_rows_sync` 调用次数相同」——这与既有 `host_barrier` 的暴露面同类（某个 rank 在臂体内报错时，其余 rank 会在会合点等待）。
 
 **下一步验收**：SWALLOW_STEP=1 + VERIFY_GRAPH=1 跑出师表/计数任务，期望 0 ar5-hang；若出现 `arm vote DISAGREED` 行，说明同一次请求内 rank 状态持续分歧（图退化为 direct，功能正确但无加速），需进一步定位是 `compress_branch_steady` 镜像还是 capture 失败 latch 的分歧。
+
+## LAZY 最优配置 + 计数任务的实际吞吐（123a3865）
+
+**结果**：
+- **实际吞吐 = 78.8 tok/s**（144 tokens / 1827ms 端到端）
+- **k_acc = 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 1 5**——几乎全 5！（mean ~4.8）
+- 零拉丁 ✓，0 ar5-hang ✓
+- 步时 25-65ms（serve 侧，不稳定）
+
+**分析**：
+- 144 tokens / 5.8 tok/step ≈ 25 步
+- 1827ms 总时间（含 prefill ~1000ms?）
+- 生成阶段 ~827ms / 25 步 ≈ **33ms/步**
+- **33ms → 15ms 需要 -18ms**（SH_PAIR -5 + tcgen05 -2 + B类 -3 + L4 -5 + L5 -3 = -18ms 恰好够！）
+
+**400 的每一毫秒都是必要的**——所有优化缺一不可。
