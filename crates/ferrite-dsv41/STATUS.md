@@ -8005,3 +8005,19 @@ TP4 路径**关闭**。AR 的理论节省（0.66→0.33ms）远小于计算翻�
 | 可验证投机 | **需用户仲裁** | 200+（如果允许） |
 | Batch B=4 | 改变任务定义 | 聚合 ~4x |
 | ~~TP4~~ | **关闭** | −23% |
+
+### mxf4-fast-path 定案：骨架已在，剩余 1.5-2 人日（2026-09-12 29:00）
+
+**发现**：mxf4 swapAB 骨架已存在于 `dsv41_experts_mxf4.cu:3711`（`expert_tcgen05_gateup_mxf4_kernel` + launcher `:4003`，gate `DSV41_EXPERT_TCGEN05_MXF4`）。**"从 tests 提取组装"的捷径是伪命题**（tests 只是 harness，无 device 代码；被验证的 kernel 是 M=128 的 GEMM，M=1 时 6.5x 慢）。
+
+**正确的快速路径**（骨架 → 可测 serve）：
+1. 编译骨架（定义 gate 宏）+ 用 tests 补 EXACT 用例
+2. Rust FFI（device.rs:771 旁 + kernels.rs:127 旁）
+3. chain_dev.rs 派发（OnceLock gate）
+4. DSV41_EXPERT_TCGEN05_MXF4 A/B
+**增量 ≈ 1.5-2 人日**（非 4-5）。
+
+**⚠️ 关键 pitfall**：
+- env gate 必须进程级 OnceLock（per-call getenv 破坏 graph capture）
+- `launch_mxf4_indirect` 的 down 接 GEMV 曾导致全零输出 + illegal access——M=1 派发要严格限定 `!aq`
+- 骨架 launcher 契约：dim%128==0、rows%kMTile==0
