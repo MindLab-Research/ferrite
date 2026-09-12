@@ -714,3 +714,19 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 4. P1-5 head/gate 截断（DRAFT_BF16_DOMAIN，测试中）
 
 如果四个杠杆全部兑现，accept 从 1.02 → 3-5 是合理预期（sglang 的 5 证明 MTP head 有这个能力）。
+
+## 400 的最终路径：batched verify 的权重共享地板（用户校准 accept~3 后的重新计算）
+
+**用户校准**：accept ~3 已是优秀（>3 平均基本不可能）→ 400 需要 accept 3 + **步时 ≤10ms**。
+
+**lazy verify 的死穴**：每行 m=1 独立 forward——**mrows 的权重共享完全帮不上**（mrows 需要 m>1 才能摊薄权重读）。lazy 的 per-row ~7ms × 4 行 = 28ms verify，不可能到 10ms。
+
+**batched verify 的理论地板**（全部 mrows 真正兑现权重共享）：
+- 权重流量：~14GB/步读一次（不是 6×）→ @7TB/s = **2ms**
+- launch：~1300 发 × 3μs = **3.9ms**
+- 计算：6 行的 attention/MoE 独立计算 ≈ **2-3ms**
+- **地板 ≈ 8-9ms verify + 1ms draft + 0.2ms commit = 9.2-10.2ms/步**
+
+**@ accept 3：4 tok/step → 4/0.010 = 400 tok/s ✓（刚好）**
+
+**关键**：lazy→batched 的反转——当 mrows 让 batched 的 6 行共享权重时，batched(6 rows) 一次 ~9ms 可能比 lazy(2-4 rows × 7ms) 快。**全栈测试应该跑 batched（不开 LAZY_VERIFY）**。
