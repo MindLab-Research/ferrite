@@ -2069,3 +2069,19 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **修复**：`draft_forward(token, pos)`（spec + shadow 两处）——**draft/verify/accept/emit/commit/oracle 六者同一布局**。
 
 **方法论教训（重要）**：我基于 `drafts[0]==next 60%` 的**实测**做了"旧链正确"的回退推理（并回退了 accept 链实验）——**方向对（旧链确实正确）但理由错**（60% 的真实成因是重复attern 而不是 draft 的位置）。**真正的定位来自 audit 的代码级语义分析**（把六个环节的"位置约定"列成表）——**"实测数据 + 代码级语义表"缺一不可**：单看数据会把 60% 误读为质量证据，单看代码会漏掉"60% 与 16% 同源"的量化闭环。**同时**：`quant1`（rows=1）与 `dsv41_rmsnorm_q`（n=m）的对比也证明——**"行偏移缺失"只在多行内核里可能出现**（rows=1 结构上不可能犯）。
+
+## 2026-09-12 Wave 2：B1 修复后的实测（accept 结构改善 + 剩余的 33% parity 破坏）
+
+**修复**：`draft_forward(token, pos)`（spec+shadow）——draft 块回到 anchor 自己的位置。
+
+**实测**（36 步的 DBG trace，出师表 300 tok）:
+| 量 | 值 | 解读 |
+|---|---|---|
+| `drafts[0] == next` | **33%**（12/36） | **draft 的真实质量**——之前测到的 60% 是"模型重复模式"的副产品（重复时 pos+1==pos+2 使"pos+2 的提案"等于 next）。修复后 33% 是干净的读数 |
+| `k_acc` 直方图 | `{0:24, 1:6, 2:4, 3:1, 4:1}` | **12 步 ≥1**（与 33% 一致）且**出现 2/3/4**——后续 draft 也能匹配 ⇒ accept 链工作正常 |
+| mean-k | **0.58** | 略高于 MoE ILV 修复后的 0.52 |
+| `drafts[j+1] == verify[j]` | 32/144 (22%) | 后续位置的匹配率（低于首检，符合预期） |
+
+**剩余缺陷（文本重复的 33%）**：`verify_out[0] == next` **33%**（与 `drafts[0]==next` 同值）——**emit = [next] + verify_out[..k_acc]** 在 verify 行 0 复述 next 时把 next 写两遍 → "先帝创业先帝创业"。**eager 在同一位置（pos+1、同一输入 next）不重复** ⇒ **verify 的多行链与 eager 的单行图之间存在 parity 破坏**。
+
+**最强候选（待 vrow0 探针判定）**：**head 的两条路径**——`DSV41_HEAD_SLICE` **默认 ON**（`chain_dev.rs:861-863` 的 `unwrap_or(true)`）⇒ **eager 走"每 rank 切片 + 跨 rank argmax"**，而 **verify 的 head 走 `head_gemv_bf16_mrows`（全词表 Replicated）**——两条不同程序的 K 序/累加序可能不同（~1e-3 级）→ 近 tie 翻转。探针（`DSV41_VROW0_PROBE=1` + shadow）输出 `verify_top`/`eager_top`/`eager_sliced` 与 `delta_at_eager`：**|delta| ≤ 1e-2 → 边界翻转（用 confidence 门控/统一 head 路径解决）；大 → 结构性**（multi-row 调度没复现单行路径）。
