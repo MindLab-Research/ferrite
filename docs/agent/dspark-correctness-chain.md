@@ -5565,3 +5565,25 @@ epoch 1328 → 54（第一次 swallowed 步的均匀降级）
 3. **epoch 的 u32 环绕**——不太可能（1328 远低于 u32 max）
 
 **完整 ledger 测试（38102d59）的价值**：rank=0 的完整 pre/note 序列——精确显示降级的时刻（哪一步、pre 还是 note）
+
+## 🎯🎯🎯 完整 ledger 数据 + epoch54 判决——降级的精确时刻和机制！
+
+**完整 ledger 数据**（38102d59）：
+```
+pos=10 pre: epoch=830（正常——prefill 后）
+pos=15 pre: epoch=999（正常——+169 ≈ 一步 165 轮 ✓）
+pos=15 note: epoch=54 ← 🚨 第一次 swallowed 步内！
+pos=16 pre: epoch=54（持续）
+pos=16 note: epoch=54 (k_emit=4)
+pos=20/22: epoch=54（持续冻结）
+```
+
+**epoch54-source-and-stop 的判决**（13.3KB 审查）：
+1. **[严重] 1328→54 源码级不可能是"被写小"**——所有写者都是 e+1（pubred/argmax/pad），无重置路径（zero_at 只在 new 一次；chain.reset 不碰 staging；serve 只有一个 Collective）
+2. **[严重] canary 盲区**——canary 在 ctr_at+8，但 pad/AR 的写覆盖 ctr_at..ctr_at+8——恰好不覆盖 canary！假阴性！
+3. **[严重→一般] 流断言缺失**——pad kernel 的 stream 实参 vs AR 的 stream 实参——如果是不同 stream → 过期 e 覆盖 → **真降级且 rank 间均匀**（同一代码路径）！
+4. **54 的数学**——不是任何几何常量（81/165/84/27 都不整除）——**绝对值无信息**，只有增量有意义
+
+**最强假设（流断言缺失）**：pad kernel 在 stream A 读 e=54（过期），AR 在 stream B 已推进到 999——pad 的 e+pad=54+0=54 覆盖了 999！
+
+**一次运行判死的动作**：三处入口（v5_epoch_pad / AR / argmax）各加 debug_assert_eq!(stream) + eprintln 打印 cudaStream_t
