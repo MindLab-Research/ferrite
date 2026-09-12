@@ -109,3 +109,42 @@ lazy 数学上限 ~145（k_emit × c_row）。400 需要：
 - lazy 上限 ~145（accept 5）/ ~97（accept 3）——**不够 400**
 - **batched（SWALLOW）是唯一路径**——10 次修复失败（epoch 冻结是根本问题）
 - **L4/L5 kernel 重写**（"M 进 grid" 化 + tcgen05 + 流水）= 25-35 人日
+
+---
+
+## Session 末尾的终极发现：SWALLOW 的完整修复链（知识固化）
+
+### SWALLOW 11 次修复到最终解锁的完整链
+```
+1-8: 各种修复尝试（barrier/vote/poison/pad）→ 全失败
+9: epoch pad → 幻影（零调用点/kernel/gate——从未实施！）
+10: 真 epoch pad → epoch 冻结 54（所有 rank 均匀 999→54）
+   ↓ D1 观测（步前打印修复）
+   → 完整 ledger：pos=15 步内 999→54（第一次 swallowed 步！）
+   ↓ P1 witness（设备侧证词）
+   → CANARY 触发！（0xdeadbeef→0x00000000——staging 被越界清零！）
+   ↓ OOB 源头调查
+   → 3 严重缺陷（v5 无守卫 + 无 guard band + S1 stride 滑移）
+   ↓ OOB 修复（guard band + payload bounds + multi-slot canary）
+   → 验证成功！CANARY=0 ✓ GUARD=0 ✓ RESET=0 ✓ ar5-hang=0 ✓
+   ↓ check_payload 抓到了真正的越界！
+   → payload 147456 > slot 122880（engram 多行 gather！）
+   ↓ payload 源头追踪
+   → engram_apply_rows 的合法载荷（m=6 × n_cols=24 × ehd=256 = 36864 f32）
+   ↓ slot 增大修复
+   → slot = max(20480, 30720, 36864) × 4 = 147456 B ≥ payload ✓
+   ↓ 决定性测试（c900216e）
+   → [运行中——batched 解锁的最终验证！]
+```
+
+### 修复链的核心洞察
+1. **check_payload 是关键武器**——把静默损坏变成响亮失败
+2. **engram 多行 gather 是合法需求**（刻意优化——省 m-1 个 AR round）
+3. **slot 计算必须包含所有合法载荷的最大值**（不只 hidden states）
+4. **canary + guard + witness 的观测体系**是定位 OOB 的决定性工具
+
+### 下一步（如果 c900216e 成功）
+1. SWALLOW 正常生成 → batched 解锁
+2. SH_PAIR M=6 验证（-4.9~7.9ms）
+3. mrows 族验证
+4. 400 冲刺！
