@@ -6217,3 +6217,20 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 | + hc/B6 (S3) | 15.7ms | 382 | +74 |
 | + tcgen05 (S4) | 13.7ms | **438** | +56 |
 | + L4 | 12.0ms | **500** ✓ | +62 |
+
+## 🚨 AR Step 2 (AR_STORE_FUSE=1) SWALLOW 测试——严重退化！
+
+**结果**（e9a760ca）：
+- **吞吐 = 7.1 tok/s**（vs 58.3 基线——**8× 退化！**）
+- **数字正确=64/79 前61行=False**（输出退化——之前是 True！）
+- LEN=228 拉丁=[] 零拉丁 ✓ finish_reason=stop
+- 0 panic 0 ar5-hang ✓
+
+**判定**：
+1. **AR Step 2 (A1a MoE store fold) 在 SWALLOW batched 路径有 bug**
+2. **性能大幅退化**（7.1 vs 58.3——不是优化而是灾难性回归）
+3. **正确性退化**（前 61 行不再全对——数值不中性！）
+4. **AR_STORE_FUSE 必须保持 OFF**（gate 默认是 OFF——安全）
+5. AR Step 2 的 3 项 GPU 验证中的第 2 项（gate ON vs OFF 一致）**未通过**
+
+**下一步**：AR Step 2 需要 root cause 分析（batched 路径的 store fold 为什么破坏性能和正确性）
