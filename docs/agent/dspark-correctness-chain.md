@@ -826,3 +826,14 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 2. **tcgen05**：routed experts 从 SIMT 到 tensor core（-6.8ms）
 3. **共享专家的 kernel 优化**：不是 mrows，是更好的 tiling/占用率
 4. **图化**：只提供 launch 消除（已确认 ~1.5ms 收益）
+
+## Shared expert 占用率根因（代码级）——grid=72 blocks（49% SM），w1|w3 融合可到 97%
+
+**维度确认**（config）：`moe_intermediate_size: 2304`，TP8 → sh_il = 288/rank。
+**当前**：`shared_expert_mrows` 调 `gemm_fp8_mrows` 两次（w1 n=288 + w3 n=288），每次 grid = ceil(288/4) = **72 blocks**（148 SM 上 49% 利用率）。
+**融合机会**：w1 和 w3 输出已写 `[row][2*sh_il]` 布局——若合为一次 n=576 调用（w1|w3 交错或两个权重指针），grid = ceil(576/4) = **144 blocks（97% SM）**——**2× 占用率 + 一半 launch**。
+
+**组合修复**：
+1. w1|w3 融合：72→144 blocks（97% SM）+ launch 减半
+2. 小 n 的 nwarps 自适应：n=288 时 nwarps=2 → 144 blocks
+3. 两者叠加效果：shared expert 从 10.4ms → 预期 2-3ms
