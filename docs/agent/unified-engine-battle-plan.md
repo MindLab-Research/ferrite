@@ -100,8 +100,45 @@ P0 清单执行（见 prefill-research §D）：多行链（与 Wave 2 共享）
 
 | 风险 | 影响 | 缓解 |
 |---|---|---|
-| DSV41 sparse attn 不支持 n=6 | verify 无法一次 6 行 | Wave 2 最先 POC；退路 = 逐行 verify（慢但可跑，先验证 accept 再优化） |
+| ~~DSV41 sparse attn 不支持 n=6~~ | ~~verify 无法一次 6 行~~ | **✅ 已排除（2026-09-12 侦察）**：kernel 层全支持多行——`dsv41_sparse_attn` 的 `dim3 grid(b*m, h)`、`hc_mixes(rows)`、`moe_route(rows)`、`compressor(b, seqlen)`、`gemm_fp8_mx(m,n,k)`、`embed_expand_dev(n)`。改造集中在 chain 层（step_body 单 token 假设） |
 | accept < 4 | 400 不可达 | M1 后立即离线测 accept 分布（host 参考在真实文本上）；confidence 头给出预期 |
 | 多行链重构破坏 6.15ms 基线 | 回归 | env gate（DSV41_SPEC=1 才走新路径）；单行路径逐位不变 |
 | 架构统一破坏两模型 | 回归 | 每步单一文本验收；tag 保护（dsv41-6.15ms-162toks） |
 | 图捕获池 miss（TP=4 教训） | 崩溃 | DRY 预热纪律 + FERRITE_POOL_MISS 诊断 |
+
+## 5. Wave 2 详细设计（2026-09-12 补充，M0 核对后）
+
+### 5.1 关键架构事实（侦察定案）
+
+1. **M0 ✅**：远端 checkpoint `mtp.*` 2401 key 全在（mtp.{0,1,2} 各 attn 13 + ffn 777 + hc 6 + norm，mtp.0 有 main_proj/main_norm，mtp.2 有 markov_head.{embed,head} + confidence_head + norm）；config：block_size=5、target_layers=[37,38,39]、markov_rank=256、noise_token_id=128799、128 experts topk3。
+2. **kernel 层多行全支持**（见风险表第 1 行）——verify(n=6) 无 kernel 障碍。
+3. **dspark draft block 与主链 block 算子同构**（权重命名对称：attn.{wq_a,q_norm,wq_b,wkv,kv_norm,wo_a,wo_b,attn_sink} / ffn.{gate,experts,shared_experts} / hc_* / *_norm）→ **draft device 化 = 复用 Device 现有 kernel 方法**，仅 Markov 循环头 + confidence 头需新 kernel。
+4. **DSV41 状态回退比 GLM GDN 快照更轻**：compressor state（state_kv/state_score，固定 ratio*hd floats）快照便宜；ring/index_k 写入位置是 device counter → 回退 = counter 减法 + 覆写。
+5. **sglang 语义**（复刻基准）：gamma=5 draft tokens，verify = gamma+1 = 6 行（anchor + 5），线性链因果（行 i 看 t0..d_{i-1}），贪心 accept 最长前缀，num_steps 强制 1。
+
+### 5.2 三大实施件
+
+**① 多行链 `step_body_rows`（我亲自做，最高风险）**
+- chain_dev.rs 新增：`step_body_rows(&mut self, toks: &[u32], pos: usize) -> Result<Vec<u32>>`
+- embed_expand_dev(n=len) → 每层 hc_mixes(rows=n) / attention（sparse_attn b=1,m=n，idxs 含块内因果）/ compressor(b=1, seqlen=n) / MoE(rows=n, moe_batch) → head n 行 argmax
+- **与 prefill chunk 共享**（Wave 4 直接受益）；单 token 路径 `step_body` 保持不动（env gate DSV41_SPEC 控制 verify 走新路径）
+
+**② dspark draft device 前向（subagent 写草案，我审）**
+- `chain_dev.rs` 新增 `dspark_draft(&mut self, t0: u32, pos: usize) -> Result<([u32;5], [f32;5])>`：forward_embed（main_proj 投影 + noise embed 混排）→ 3× dspark block（窗口 attention 用 sparse_attn + dspark_topk_idxs 索引矩阵；MoE 复用）→ Markov 循环头（新 kernel：顺序 5 步，读已采样 token 的 markov_embed bias logits，gumbel/argmax 采样）→ confidence
+- 关键缓冲：main stream 层 37/38/39 的 attention 输入导出（chain 里在 layer() 加 hook 缓存 h_mean），draft 窗口 ring（window_size=128）
+- 新 CUDA kernel 仅 2 个：`dsv41_dspark_markov_head`（Markov 循环，单 block 顺序 5 步）+ confidence 可并入
+
+**③ spec 编排 + accept + commit（我做）**
+- `dspark_spec_step`：draft(1 次) → step_body_rows([t0,d1..d5], n=6) → device argmax[6] → accept 最长前缀 k → commit（compressor state 快照恢复 + ring/index_k counter 回退 6-k）→ 下一 token = argmax[k]
+- 图策略：draft 图 + verify 图分开捕获（DRY→rollback→CAPTURE 纪律）；accept 前一次 D2H 24B（argmax 数组）
+- env gate：`DSV41_DSPARK=1`
+
+### 5.3 里程碑（细化）
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| M1a | step_body_rows 多行链 + 单测（n=6 vs 6 次单 token，argmax 一致） | cargo test + 远端文本 |
+| M1b | dspark draft device 前向 + 与 host 参考对齐（argmax 级） | 新 tests_dsv41_dspark.cu |
+| M2 | spec_step 端到端（贪心 accept + 回退）+ 图捕获 | 四段文本逐字 + accept 打印 |
+| M3 | 性能：accept 实测 → 步时分解 → 调优 | ≥400 tok/s |
+
