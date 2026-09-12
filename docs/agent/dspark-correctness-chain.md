@@ -683,3 +683,23 @@ l=0: 172.42  l=1: 1282.35  ... l=38: 500.89  l=39: 496.47
 每层 8 行（每 rank 一行，数值相同——hidden 是 Replicated ✓）。
 
 **下一步**：官方 ref_inference 同 prompt 同 token 序列的首步 top-10 + 逐层 norm 对照。差异的层 = 偏差源。
+
+## hc 数学对照（ferrite vs 官方 model.py）——逐段核验
+
+**官方** `model.py:948-985`：
+1. `hc_mixes`: x.flatten(2).float() → rsqrt(mean+eps) → F.linear(x, hc_fn) * rsqrt → hc_split_sinkhorn(mixes, scale, base, hc_mult, iters, eps)
+2. `hc_pre`: sum(pre_mix.unsqueeze(-1) * x.float(), dim=2) → to(x.dtype)
+3. `hc_post`: post.unsqueeze(-1) * x.unsqueeze(-2) + sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+4. `layer.forward`: attn_pre/attn_post/attn_comb = hc_mixes(x, ...) → x = hc_pre(x, pre_mix) → attn_norm → attn → x = hc_post(x, residual, attn_post, attn_comb) → ... ffn 同构
+
+**ferrite**（`chain_dev.rs:9372+` 的 hc_mixes_auto + `dsv41_kernels.cu:2483` 的 sinkhorn kernel）：
+- sinkhorn 在一个 warp 的寄存器里（hc=4 → comb 16 值，lane l = j*hc+k，xor butterfly 归约）
+- 注释明确 "Matches hc_split_sinkhorn in the reference (kernel.py:407)"
+
+**需对照的数值点**：
+1. **norm 的 eps**：官方 `self.norm_eps`（config 的 rms_norm_eps）vs ferrite 的 `cfg.norm_eps`——值是否一致？
+2. **hc_pre 的 dtype**：官方在 f32 域做加权求和后 `to(x.dtype)`（截断回 bf16）——ferrite 是否也截断？
+3. **hc_post 的求和序**：官方 `post * x + sum(comb * residual, dim=2)`——comb 的 dim=2 求和序 vs ferrite 的 warp butterfly 序
+4. **sinkhorn 的迭代次数和 eps**：`hc_sinkhorn_iters` 和 `hc_eps` 的 config 值是否一致
+
+这些点在对齐实验的逐层 norm 数据中会显现——如果某层的 norm 偏差，就能定位到该层的 hc 数学。
