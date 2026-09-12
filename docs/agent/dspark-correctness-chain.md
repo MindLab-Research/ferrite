@@ -1135,3 +1135,16 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 **用户提示**：".so 和 Rust 必须匹配——成功的 base 不可能失败除非 so 变了"——.so 在 1ddff9c 之后变了（bf16_roundtrip、route_group、e4m3_grouped 等新 kernel 加入），**新 kernel 的编译改变了同文件中相邻 kernel 的 codegen**（与之前段错误的机制相同）。
 
 **正在跑**：1ddff9c 的对照测试（48da474d）——如果零拉丁恢复，确认是 1ddff9c 之后的 .so 变化导致。
+
+## Draft 不变性原则（p03-degradation-analysis 的核心洞察）
+
+**原则**：committed 文本流与 draft 无关——draft 只影响 accept（哪些 token 被跳过 vs 修正），不影响 committed token 的**内容**（内容来自 verify/backbone 的 argmax）。
+
+**推论**："改 draft gate 后文本变了"这件事**本身就是报警信号**——意味着 commit/rollback/compressor 状态机把 accept 模式泄漏进了 backbone。
+
+**对当前调查的含义**：
+- P0-3/P1-5 测试与基线（gate OFF）产生**相同**的拉丁 → 拉丁不是来自 P0-3/P1-5，而是来自基线本身的破坏
+- 基线破坏 = backbone 侧的变化（1ddff9c 之后的某个提交改了 backbone 的数值路径）
+- **HC_VERIFY_FUSE=0 诊断测试（9b55ea04）正在跑**——如果修复，verify 融合与后续改动的交互是根因
+
+**修复建议**（来自审计）：draft-invariance 作为回归闸——任何 draft gate A/B 后文本变化 = 立即停止并查 commit/rollback 机制。
