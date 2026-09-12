@@ -5631,3 +5631,23 @@ pos=16+ 全部 54（冻结）
 7. **剩余**：观测错位（D2H 读错位置）或 reduced 的向上溢出（ctr_at-4 踩 epoch 而 canary 完好）
 
 **P1 witness（实施中）将一锤定音**——kernel 自己记录它读/写的值！
+
+## RESET 断言的 bug 发现（亲自验证）
+
+**v5_ledger_note 的实现**（:9684+）：
+```rust
+let prev = self.v5_ledger_epoch.replace(Some(epoch));  // ← Cell，不是 seen HashMap！
+let delta = prev.map(|p| epoch.wrapping_sub(p)).unwrap_or(0);
+```
+- **note 用 `v5_ledger_epoch`（Cell）追踪**——delta 只在连续 NOTE 之间！
+- **pre 用 `v5_ledger_seen`（HashMap）+ RESET 检查**（:9661-9665）
+- **两个不同的追踪机制！**
+
+**预期行为**（如果 seen 只被 pre 更新）：
+- pos=15 pre: seen[0]=999（无 prev → 无 RESET）
+- pos=15 note: epoch Cell = 54（**不影响 seen！**）
+- pos=16 pre: seen[0] 插入 54，prev=999 → **RESET 该触发！**
+
+**实际**：pos=16 pre 无 RESET！→ **某处更新了 seen 表**（note 的 probe？或其他路径？）
+
+**P1 witness（实施中）将绕过 host 侧的所有歧义**——kernel 自己记录读/写的值！
