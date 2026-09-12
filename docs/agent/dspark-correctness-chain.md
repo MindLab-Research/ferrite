@@ -2493,3 +2493,26 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **验证**：零拉丁 + 0 ar5-hang + k_acc + 步时（准确值）+ nsys per-kernel
 
 **这是 400 冲刺的最终测试**——如果所有优化兑现，步时应达到 ~13-18ms。
+
+## nsys 分析框架的重要修正——Wave 1 后的实际步时预期
+
+**关键事实**（nsys-analysis-framework 的核实）：
+1. Wave 1 的 gates 不含 SH_PAIR（默认 OFF）——shared expert ~10.4ms **未被动过**
+2. Wave 1 只碰了 hc 链 + mrows 族 + 图化/AR 折叠
+3. **routed experts (~8.3ms) 和 attention (~2.8ms) 也未动**
+
+**修正后的步时预期**：
+| 阶段 | 预期步时 | 依据 |
+|---|---|---|
+| Wave 1 后（当前） | **~31-33ms** | 37.31 - hc/mrows/graph 节省 ≈ -5ms |
+| + SH_PAIR template&lt;M&gt; | ~24-28ms | shared expert 10.4→5.4ms |
+| + tcgen05 | ~22-26ms | routed experts 8.3→6.3ms |
+| + SWALLOW_STEP | ~17-21ms | -4.55ms（主链吞进）|
+| + B 类核 | ~12-18ms | -2.8~4.9ms |
+| + L4 占用 | **~4-13ms** | -5~8ms |
+
+**400 判定**（accept 5 = 6 tok/step）：
+- 15ms 需要 SH_PAIR + tcgen05 + SWALLOW + B 类全部兑现
+- **nsys 的实际测量**是唯一的真实答案
+
+**之前报告的 "Wave 1 = 25ms" 来自 serve 侧计时——不准确**（用户已纠正）
