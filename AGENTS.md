@@ -2227,3 +2227,9 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **性能与 accept**：`steps=50 mean-k=0.820 tok/step=1.820 draft=4.21ms verify=37.15ms commit=0.29ms`——**verify 37.15ms（多行化后没降，带宽瓶颈）**、**k_acc={0:24,1:18,2:12,3:1}**（**k_acc=3 出现、accept 0.82——持续提升** ✓）。
 
 **解读**：s.ids 修复让"喂入的 token"更正确（k_acc 分布上移），但**暴露了下一层**——修复前喂的是"落后 1"的 token（模型凑合能跑），修复后喂的是 emitted.last()（如果 verify_out 的值本身错，则喂的错 token 位置更远 → 崩得更快）。**下一个候选**：① verify_out 的值错（verify 的 KV/上下文——emit-chain-audit 的"值错 ⇒ 主链 KV"）；② **prefill 后的 s.ids 初值**（prefill 不写 s.ids？第一步读垃圾）。
+
+## 2026-09-12 用户判断（关键）：乱码是一个回归——"只重复的版本 + s.ids 修复"应该就是对的
+
+**用户（权威）**："乱码其实是一个回归，之前那个只重复的版本加上修复应该就是对的。"
+
+**分析（同意）**：s.ids 回写修复提交（`emitted.last()` 写回）与"只重复的版本"之间，工作树上还落了**三个同伴的提交**（mtp_batch.rs 的设计骨架、indexer 的单遍堆选、glue 的 mrows K 序改动）——**其中任何一个都可能在 spec 路径上引入数值回归**。最直接的判别：**用 `git log` 找到 s.ids 修复的父提交（只含重复修复、不含同伴改动），在远端 checkout 那个点重编**——如果数字/出师表都干净 ⇒ 回归来自同伴的某个提交，二分定位。
