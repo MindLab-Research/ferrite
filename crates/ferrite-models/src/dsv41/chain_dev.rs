@@ -723,6 +723,23 @@ fn tcgen05_e4m3_skipped_note(reason: &str, so_has_symbol: bool) {
     });
 }
 
+/// One-shot notice for an ARMED-but-undispatchable `tc5::e4x` (the dense M=128
+/// tile e4m3 arm, `dsv41_expert_gemm_e4m3_ext`). Separate from
+/// [`tcgen05_e4m3_skipped_note`] because the two arms ship under ONE runtime
+/// gate (`DSV41_EXPERT_TCGEN05_E4M3`) and ONE `.so`: an operator who exports
+/// the gate for the swapAB arm would otherwise be told nothing when the dense
+/// tile arm declines (no symbol, or a tile that is not its shape).
+fn tcgen05_e4m3_ext_skipped_note(reason: &str, so_has_symbol: bool) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_EXPERT_TCGEN05_E4M3 is set, but the routed gate/up stays on the \
+             batched SIMT launch: the dense-tile tc5::e4x arm declined ({reason}). Any A/B run \
+             expecting that arm measures the OLD path. (symbol present in .so: {so_has_symbol})"
+        );
+    });
+}
+
 /// One-shot notice for an ARMED-but-undispatchable mxf4 gate. The `.so` reads the
 /// same env var itself, so an operator who exports `DSV41_EXPERT_TCGEN05_MXF4=1`
 /// believes the step now runs the tcgen05 gate/up — while `moe()` keeps issuing
@@ -9636,6 +9653,70 @@ impl<'a> DevChain<'a> {
                     true,
                 )?;
             }
+            // ---- tcgen05 e4m3 DENSE-TILE gate/up (tc5::e4x) ----------------------
+            // `dsv41_expert_gemm_e4m3_ext` is the e4m3 twin of the masked M=128
+            // tile GEMM (`mxf4_gemm_kernel`): the M = ACTIVATION ROWS form, i.e.
+            // ONE launch carries a DENSE `[rows, k]` e4m3 activation (one byte per
+            // value — exactly what the `quant_fp8` branch above wrote into
+            // `xq4_r`) plus its `[rows, k/32]` f32 per-row scales, and ONE expert
+            // (`ids[slot]`), with `b_split = inter_local` expressing gate|up the
+            // same way the batched GEMV's `b`/`b_hi` pair does. It needs the e4m3
+            // activation (`DSV41_EXPERT_ACT_E4M3`, the `e4m3` term above) because
+            // `kind::f8f6f4` eats e4m3 bytes, and it shares the swapAB e4m3 arm's
+            // runtime gate (`DSV41_EXPERT_TCGEN05_E4M3`): which of the two a step
+            // runs is a LAUNCH-SHAPE decision (dense M=128 activation tile vs the
+            // single-token swapAB form), not a numeric-format one.
+            //
+            // ⚠️ TWO LAYOUT PRECONDITIONS THIS CALL SITE DOES NOT MEET, which is
+            // why the arm declines and the batched SIMT launch below stays in
+            // force. Both are shape/layout, not numerics, so neither can be
+            // tolerated silently — an armed gate must never mean "the OLD path
+            // measured as the new one" (this repo's #1 measurement-bias trap),
+            // hence the one-shot notice:
+            //  1. EXPERT HOMOGENEITY. The kernel derives its whole B side from
+            //     `base + ids[slot] * stride`, so ONE expert covers every row of
+            //     the launch, while `moe_rows`' routing is per-(row, slot)
+            //     (`route_idx_r[m][topk]`). A per-slot dense launch would apply
+            //     slot s's expert to rows that route to a different one, i.e. a
+            //     SILENT WRONG ANSWER. A uniform tile needs the GROUPED (permuted)
+            //     routed form — the permutation plus per-expert row blocks — which
+            //     this engine does not build yet, and checking `route_idx_r` on the
+            //     host would be a D2H read (a CUDA-graph capture hazard).
+            //  2. DENSE OUTPUT PITCH. The kernel writes `out[row * n_total + col]`
+            //     (row pitch `n_total`), while the routed gate/up output here is
+            //     `ex_act_r[row][slot][act_slot]` (row pitch `topk * act_slot`).
+            //     The two pitches coincide only for `topk == 1`.
+            // When the grouped tile lands, the call belongs HERE: one launch per
+            // slot, `b = w1_base` / `b_hi = w3_base` with `b_split = inter_local`,
+            // `c = route_idx_r` with `slot = s`, `epi_mode = 1` with
+            // `limit = cfg.swiglu_limit`, and the separate `swiglu_limit_batched`
+            // below kept ON (the e4x epilogue only clamps — it never fuses).
+            let e4x_armed = e4m3
+                && expert_tcgen05_e4m3()
+                && self.dev.supports_expert_gemm_e4m3_ext()
+                && !ld.experts_ilv;
+            // The launcher's own contract (`e4x_launch_gemm` refuses anything
+            // else), plus 16-byte aligment of the operand bases and strides —
+            // which the loader guarantees for the weight planes and the
+            // quantiser's row-major buffers.
+            let e4x_shape = (m % 128) == 0 && (dim % 64) == 0 && ((2 * inter_local) % 64) == 0;
+            // Precondition (1)/(2) above: the tile must be one expert's dense row
+            // block. No grouped routed path exists, so this is false for every
+            // call this function currently makes.
+            let e4x_tile = false;
+            if e4x_armed && !(e4x_tile && e4x_shape) {
+                tcgen05_e4m3_ext_skipped_note(
+                    if !e4x_shape {
+                        "the routed tile is not the dense shape the launcher accepts \
+                         (m % 128 == 0, dim % 64 == 0 and 2*inter % 64 == 0 are all required)"
+                    } else {
+                        "the routed tile is per-(row, slot): the kernel carries ONE ids[slot] \
+                         expert per launch and writes a dense [rows, n_total] out, so it needs \
+                         the grouped (permuted) routed form, which is not built"
+                    },
+                    true,
+                );
+            }
             let ids_base = self.s.route_idx_r.ptr as *const i32;
             let rw_base = self.s.route_w_r.ptr as *const f32;
             // ---- ONE rows = m launch per stage, for all m activation rows --------
@@ -10137,13 +10218,29 @@ impl<'a> DevChain<'a> {
     /// `hc_collapse_norm`, reading `pre_collapse` (the premix slot the caller
     /// collapses with, which is deliberately not the one the mixes write) and
     /// writing `out`; the returned bool then tells the caller to skip that call.
+    ///
+    /// The buffers are PASSED IN rather than read off the single-row scratch:
+    /// `layer()` hands the single-row slots (`s.h` / `premix_slot` / `s.post` /
+    /// `s.comb`) and `layer_rows()` the m-row ones (`s.h_r` / `premix_row_slot` /
+    /// `s.post_r` / `s.comb_r`). Every kernel below indexes both with the same
+    /// per-row strides — `x` at `r*hc*dim`, `pre_out`/`post_out` at `r*hc`,
+    /// `comb_out` at `r*hc*hc` — so `rows` is the only other difference between
+    /// the two callers.
+    ///
+    /// `xq`/`xsc` are the T1 fp8 staging. The tail kernel emits it in a
+    /// SINGLE-ROW layout (`xq[c]`, no row base), so a multi-row caller passes
+    /// null and quantises its own rows with `quant_rows` instead (`layer_rows`
+    /// into `s.xq_r`/`s.xsc_r`).
     #[allow(clippy::too_many_arguments)]
     fn hc_mixes_auto(
         &mut self,
+        x: *const f32,
         hc_fn: *const f32,
         hc_scale: *const f32,
         hc_base: *const f32,
-        pre_slot: usize,
+        pre_out: *mut f32,
+        post_out: *mut f32,
+        comb_out: *mut f32,
         hc: usize,
         dim: usize,
         sinkhorn_iters: i32,
@@ -10154,6 +10251,7 @@ impl<'a> DevChain<'a> {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        rows: usize,
     ) -> Result<bool> {
         // Stage-C persistent forms, both default OFF and both selected only when
         // the .so carries the symbol. `_MB` (multi-block) is tried first: same
@@ -10185,17 +10283,17 @@ impl<'a> DevChain<'a> {
             // The post-AR join in `layer` stays for the un-folded path (a no-op
             // once the early join has consumed the armed flag).
             self.dev.hc_front_split(
-                self.s.h.ptr as *const f32,
+                x,
                 hc_fn,
                 hc_scale,
                 hc_base,
                 norm_w,
                 pre_collapse,
-                self.premix_slot(pre_slot).ptr as *mut f32,
-                self.s.post.ptr as *mut f32,
-                self.s.comb.ptr as *mut f32,
+                pre_out,
+                post_out,
+                comb_out,
                 out,
-                1,
+                rows as i32,
                 hc as i32,
                 dim as i32,
                 sinkhorn_iters,
@@ -10205,19 +10303,19 @@ impl<'a> DevChain<'a> {
                 xsc,
                 bf16_truncate(),
             )?
-        } else if Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
+        } else if rows == 1 && Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
             self.dev.hc_front_persist_mb(
-                self.s.h.ptr as *const f32,
+                x,
                 hc_fn,
                 hc_scale,
                 hc_base,
                 norm_w,
                 pre_collapse,
-                self.premix_slot(pre_slot).ptr as *mut f32,
-                self.s.post.ptr as *mut f32,
-                self.s.comb.ptr as *mut f32,
+                pre_out,
+                post_out,
+                comb_out,
                 out,
-                1,
+                rows as i32,
                 hc as i32,
                 dim as i32,
                 sinkhorn_iters,
@@ -10227,22 +10325,22 @@ impl<'a> DevChain<'a> {
                 xsc,
                 bf16_truncate(),
             )?
-        } else if Self::hc_persist() && self.dev.supports_hc_persist() {
+        } else if rows == 1 && Self::hc_persist() && self.dev.supports_hc_persist() {
             // Stage-C persistent prototype (DSV41_HC_PERSIST=1, default OFF): the
             // whole front end as ONE phase-machine block instead of the two-launch
             // dots+tail pair.
             self.dev.hc_front_persist(
-                self.s.h.ptr as *const f32,
+                x,
                 hc_fn,
                 hc_scale,
                 hc_base,
                 norm_w,
                 pre_collapse,
-                self.premix_slot(pre_slot).ptr as *mut f32,
-                self.s.post.ptr as *mut f32,
-                self.s.comb.ptr as *mut f32,
+                pre_out,
+                post_out,
+                comb_out,
                 out,
-                1,
+                rows as i32,
                 hc as i32,
                 dim as i32,
                 sinkhorn_iters,
@@ -10254,17 +10352,17 @@ impl<'a> DevChain<'a> {
             )?
         } else {
             self.dev.hc_front(
-                self.s.h.ptr as *const f32,
+                x,
                 hc_fn,
                 hc_scale,
                 hc_base,
                 norm_w,
                 pre_collapse,
-                self.premix_slot(pre_slot).ptr as *mut f32,
-                self.s.post.ptr as *mut f32,
-                self.s.comb.ptr as *mut f32,
+                pre_out,
+                post_out,
+                comb_out,
                 out,
-                1,
+                rows as i32,
                 hc as i32,
                 dim as i32,
                 sinkhorn_iters,
@@ -10279,14 +10377,14 @@ impl<'a> DevChain<'a> {
             return Ok(true);
         }
         self.dev.hc_mixes(
-            self.s.h.ptr as *const f32,
+            x,
             hc_fn,
             hc_scale,
             hc_base,
-            self.premix_slot(pre_slot).ptr as *mut f32,
-            self.s.post.ptr as *mut f32,
-            self.s.comb.ptr as *mut f32,
-            1,
+            pre_out,
+            post_out,
+            comb_out,
+            rows as i32,
             (hc * dim) as i32,
             hc as i32,
             sinkhorn_iters,
@@ -10334,6 +10432,52 @@ fn fuse_c() -> bool {
 fn fuse_b1() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_FUSE_B1").map(|v| v != "0").unwrap_or(true))
+}
+
+/// The verify (m-row) hc chain's A1 wiring gate (`DSV41_HC_VERIFY_FUSE`,
+/// default ON; "0" is the A/B arm). The m-row path (`layer_rows`) used to run the
+/// RAW ten-launch chain — `hc_mixes` / `hc_collapse` / `norm_rows` / `hc_post` +
+/// the `h2_r` copy, twice per layer — even though all three decode fusions
+/// (`FUSE_B1`'s `hc_collapse_norm`, `FUSE_C`'s `hc_post_inplace`, and
+/// `hc_mixes_auto`'s front end) were already in the tree and already ON for the
+/// single-row `layer()`. This arms the two that need no new shape:
+///
+///  * A1-a: the collapse + norm pair becomes `hc_collapse_norm(rows = m)` — an
+///    existing kernel with a native `rows` grid, bit-exact for the same reason
+///    `FUSE_B1` is (`layer()`'s A/B), and the only path that applies
+///    `DSV41_BF16_TRUNCATE` on the verify chain.
+///  * A1-b: `hc_post` + the `h2_r` copy become `hc_post_inplace_rows(rows = m)`
+///    — the m-row entry of the segment-C kernel. Also *additionally* gated on
+///    the symbol being present, so a `.so` built before this change silently
+///    keeps the staging pair (see `Device::supports_hc_post_inplace_rows`).
+///
+/// Both halves also honor the decode gates they belong to (`DSV41_FUSE_B1=0` /
+/// `DSV41_FUSE_C=0` turn off their respective half), so the four independent A/B
+/// arms of `layer()` exist here too. `DSV41_HC_VERIFY_FUSE=0` restores the raw
+/// chain bit for bit — the safe arm if a same-binary A/B is wanted.
+fn hc_verify_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HC_VERIFY_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// A2 (`DSV41_HC_FRONT_ROWS`, default OFF): route `layer_rows`'s two per-layer
+/// `hc_mixes` calls through [`ChainDev::hc_mixes_auto`] at `rows = m`, i.e. give
+/// the verify chain the fused spread front end (EARLY collapse/rmsnorm on main,
+/// dots + LATE ss/sigmoid/sinkhorn/comb on the side stream) that `layer()` has.
+/// DEFAULT OFF: this is the larger change of the pair — it needs the side-stream
+/// event pairing to hold under the m-row block (it does: `hc_front_split` is
+/// rows-agnostic and keeps record/wait adjacent), and it changes which kernel
+/// produces `post`/`comb` on a path with no GPU-side A/B available here.
+///
+/// The fused front end also absorbs the collapse half, so when it runs the
+/// caller skips its `hc_collapse_norm`; when it declines (no `DSV41_HC_FRONT`,
+/// no `dsv41_hc_front_split` in the `.so`, `FUSE_B1=0`) `hc_mixes_auto` falls
+/// back to the same `hc_mixes(rows = m)` the raw chain issues, so every
+/// intermediate step of the gate is either today's chain or a bit-exact subset
+/// of it.
+fn hc_front_rows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_HC_FRONT_ROWS").map(|v| v != "0").unwrap_or(false))
 }
 
 /// Segment-C AR fold (P1 of the persistent roadmap): `hc_post_inplace` moved
@@ -10413,10 +10557,13 @@ fn hc_tail_split() -> bool {
             (std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
         };
         let hc_done = self.hc_mixes_auto(
+            self.s.h.ptr as *const f32,
             ld.hc_attn_fn.as_ref().unwrap().as_f32(),
             ld.hc_attn_scale.as_ref().unwrap().as_f32(),
             ld.hc_attn_base.as_ref().unwrap().as_f32(),
-            1, // attn_pre
+            self.premix_slot(1).ptr as *mut f32, // attn_pre
+            self.s.post.ptr as *mut f32,
+            self.s.comb.ptr as *mut f32,
             hc,
             dim,
             cfg.hc_sinkhorn_iters as i32,
@@ -10427,6 +10574,7 @@ fn hc_tail_split() -> bool {
             cfg.norm_eps,
             self.s.xq.ptr as *mut u8,
             self.s.xsc.ptr as *mut f32,
+            1,
         )?;
         // T1: when the fused front ran the collapse, it also emitted the fp8
         // quantisation of `xn` (s.xq/s.xsc), so the next quant1(xn) - lin2's, in
@@ -10525,10 +10673,13 @@ fn hc_tail_split() -> bool {
             (std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
         };
         let ffn_done = self.hc_mixes_auto(
+            self.s.h.ptr as *const f32,
             ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
             ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
             ld.hc_ffn_base.as_ref().unwrap().as_f32(),
-            2, // ffn_pre -> next layer
+            self.premix_slot(2).ptr as *mut f32, // ffn_pre -> next layer
+            self.s.post.ptr as *mut f32,
+            self.s.comb.ptr as *mut f32,
             hc,
             dim,
             cfg.hc_sinkhorn_iters as i32,
@@ -10539,6 +10690,7 @@ fn hc_tail_split() -> bool {
             cfg.norm_eps,
             self.s.xq.ptr as *mut u8,
             self.s.xsc.ptr as *mut f32,
+            1,
         )?;
         // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
         // MoE's quant1(xn) - its first xq consumer - is redundant and skips.

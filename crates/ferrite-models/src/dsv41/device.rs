@@ -681,6 +681,43 @@ struct Kernels {
             *const u8, i64, *const u8, i64, *const u8, i64, *const c_int, CuStream,
         ) -> c_int,
     >,
+    /// tcgen05 **e4m3-activation dense-tile** gate/up/down (`tc5::e4x`,
+    /// `DSV41_EXPERT_TCGEN05_E4M3` — the SAME runtime gate as the swapAB e4m3
+    /// arm above, because the two share one activation FORMAT and differ only
+    /// in launch shape). OPTIONAL on exactly the same terms (`build.sh`
+    /// compiles it in with the same skeleton flag, opt out with
+    /// `DSV41_BUILD_TCGEN05_E4M3=0`).
+    ///
+    /// The `kind::f8f6f4` MMA cannot carry a block-scale operand (`ptxas`
+    /// rejects `.kind::f8f6f4` + `.block_scale`), so this arm runs the MMA
+    /// RAW and applies the per-32-block scales in the accumulation step
+    /// (`C_local_accum += C_local * sa * sb`) — the official tilelang inner
+    /// loop's "scale 外提" form. It is the e4m3 twin of `mxf4_gemm_kernel`:
+    /// **M = the activation rows** masked to 128 (grid.y tiles them), N = the
+    /// output columns, instead of the swapAB arm's M = 2*inter / N = 8.
+    ///
+    /// ABI (25 params). Shapes are DENSE: `a` is `[rows, k]` e4m3 (**one byte
+    /// per value**), `a_scale` is `[rows, k/32]` **f32** (the same per-row
+    /// layout `dsv41_quant_fp8` writes — the kernel converts to e8m0), `b` is
+    /// the PACKED fp4 weight `[b_rows, k/2]` with its e8m0 `[b_rows, k/32]`
+    /// scales, and `out` is `[rows, n_total]` (row pitch `n_total`). `b_hi`/
+    /// `b_hi_scale` is the SECOND pool with `b_split` = the FIRST pool's row
+    /// count (`n < b_split` reads `b`, the rest `b_hi` at `row = n - b_split`)
+    /// — the launcher's way of expressing gate|up. `epi_mode` 1 clamps with
+    /// `limit` (gate/up), 2 multiplies by `row_weight[row]` (down), 3 adds
+    /// into `out`. `ids != nullptr` derives every weight plane from
+    /// `base + ids[slot] * stride`: **ONE expert per launch**.
+    ///
+    /// ⚠️ The launcher refuses (nonzero rc) unless `k % 64 == 0`,
+    /// `rows % 128 == 0`, `n_total % 64 == 0` and `a`/`b`/`b_hi` are 16-byte
+    /// aligned — a caller must pre-check the contract.
+    expert_gemm_e4m3_ext: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const u8, *const u8, *mut f32, c_int,
+            c_int, c_int, c_int, c_int, f32, *const f32, *const u8, i64, *const u8, i64,
+            *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     /// Load-time gate/up interleave (DSV41_EXPERT_ILV): rewrites an expert's
     /// w1/w3 blocks into one 8-byte-granule-interleaved region so the fused
     /// gate/up GEMV fetches both with one LDG.128. Optional: an .so without it
@@ -818,6 +855,20 @@ struct Kernels {
         *mut f32, *const f32, *const f32, *const f32,
         c_int, c_int, CuStream,
     ) -> c_int,
+    /// The MULTI-ROW form of `hc_post_inplace`: the same fold, but every row
+    /// reads its own `post`/`comb` slice (`+ r*hc`, `+ r*hc*hc`) and writes its
+    /// own `hc*dim` residual block. That is the shape `layer_rows()` (verify)
+    /// needs; the single-row entry above indexes row 0 of all three and so
+    /// cannot serve a block. Kept as a SEPARATE symbol so the single-row decode
+    /// path's codegen stays byte-for-byte untouched and a stale `.so` simply
+    /// resolves it to None — the caller then keeps the `hc_post` + copy pair.
+    /// Optional; bit-identical to that pair for any `rows`.
+    hc_post_inplace_rows: Option<
+        unsafe extern "C" fn(
+            *mut f32, *const f32, *const f32, *const f32,
+            c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     /// Segment B cluster 1: hc_collapse + rmsnorm(ffn_norm) in one kernel.
     /// `truncate` is trailing (before the stream): round the collapsed row to
     /// bf16, `DSV41_BF16_TRUNCATE`, default OFF.
@@ -1100,6 +1151,7 @@ impl Device {
             expert_act_e4m3_cap: ko!(rt, "dsv41_expert_act_e4m3_cap"),
             expert_tcgen05_gate_up_mxf4: ko!(rt, "dsv41_expert_tcgen05_gate_up_mxf4"),
             expert_tcgen05_gate_up_e4m3: ko!(rt, "dsv41_expert_tcgen05_gate_up_e4m3"),
+            expert_gemm_e4m3_ext: ko!(rt, "dsv41_expert_gemm_e4m3_ext"),
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
@@ -1123,6 +1175,7 @@ impl Device {
             hc_pre: km!(rt, "ferrite_hc_pre"),
             hc_post: km!(rt, "ferrite_hc_post"),
             hc_post_inplace: km!(rt, "dsv41_hc_post_inplace"),
+            hc_post_inplace_rows: ko!(rt, "dsv41_hc_post_inplace_rows"),
             hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
             hc_front: km!(rt, "dsv41_hc_front"),
             hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
@@ -4557,6 +4610,94 @@ impl Device {
         self.kernels.expert_tcgen05_gate_up_e4m3.is_some()
     }
 
+    /// tcgen05 **e4m3-activation dense M=128 tile** expert GEMM — the
+    /// `tc5::e4x` arm (`DSV41_EXPERT_TCGEN05_E4M3`, default OFF, read once
+    /// inside the `.so`; the SAME variable the swapAB e4m3 arm above reads,
+    /// since the two differ only in launch shape).
+    ///
+    /// Unlike the swapAB arm this one is a plain dense tile GEMM, so the
+    /// arguments are shapes and pointers rather than a slot pitch:
+    ///   `a`/`a_scale` : the DENSE activation `[rows, k]` **e4m3, one byte per
+    ///                   value** (exactly what `quant_fp8` writes) and its
+    ///                   `[rows, k/32]` **f32** per-row power-of-two scales;
+    ///   `b`/`b_scale` : the PACKED fp4 weight `[b_rows, k/2]` + e8m0
+    ///                   `[b_rows, k/32]` (the loader's planes verbatim);
+    ///   `b_hi`/`b_hi_scale` + `b_split` : the SECOND pool (up for gate/up,
+    ///                   `b_split = inter`; pass `null` and a negative
+    ///                   `b_split` for the single-pool down form). The kernel
+    ///                   reads `b` for `n < b_split` and `b_hi` at
+    ///                   `row = n - b_split` otherwise;
+    ///   `out` : `[rows, n_total]`, row pitch `n_total` (DENSE — not the
+    ///                   `[row][slot][act_slot]` pitch the batched GEMV writes);
+    ///   `epi_mode`/`limit`/`row_weight` : 1 = gate/up clamp, 2 = down times
+    ///                   `row_weight[row]`, 3 = accumulate into `out`.
+    /// `ids != nullptr` derives every weight plane from `base + ids[slot] *
+    /// stride`, i.e. **ONE expert for the whole launch**.
+    ///
+    /// Returns `Ok(false)` when the `.so` gate is OFF (rc == 0, nothing ran) so
+    /// a caller can keep the proven path. ⚠️ A REJECTED shape/alignment returns
+    /// a nonzero code and IS an error: the caller must pre-check the contract
+    /// (`k % 64 == 0`, `rows % 128 == 0`, `n_total % 64 == 0`, 16-byte aligned
+    /// `a`/`b`/`b_hi` and strides) or the step fails instead of falling back.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_gemm_e4m3_ext(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        b: *const u8,
+        b_scale: *const u8,
+        b_hi: *const u8,
+        b_hi_scale: *const u8,
+        out: *mut f32,
+        rows: i32,
+        n_total: i32,
+        k: i32,
+        b_split: i32,
+        epi_mode: i32,
+        limit: f32,
+        row_weight: *const f32,
+        b_base: *const u8,
+        b_stride: i64,
+        bs_base: *const u8,
+        bs_stride: i64,
+        bh_base: *const u8,
+        bh_stride: i64,
+        bhs_base: *const u8,
+        bhs_stride: i64,
+        ids: *const i32,
+        slot: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.expert_gemm_e4m3_ext,
+            "dsv41_expert_gemm_e4m3_ext",
+        )?;
+        let rc = unsafe {
+            f(
+                a, a_scale, b, b_scale, b_hi, b_hi_scale, out, rows, n_total, k, b_split, epi_mode,
+                limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
+                bhs_base, bhs_stride, ids, slot, self.stream,
+            )
+        };
+        if rc == 0 {
+            return Ok(false); // gate OFF: nothing ran, the caller falls back
+        }
+        self.kerr(rc, "dsv41_expert_gemm_e4m3_ext")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the tcgen05 e4m3-activation
+    /// DENSE-TILE expert GEMM (`dsv41_expert_gemm_e4m3_ext`, `tc5::e4x`,
+    /// compiled in by `build.sh` unless `DSV41_BUILD_TCGEN05_E4M3=0`). A
+    /// separate probe from [`Self::supports_expert_tcgen05_e4m3`] on purpose:
+    /// the two arms ship under one skeleton flag but are independent symbols,
+    /// so a `.so` carrying only the swapAB entry point must leave this arm on
+    /// the fallback instead of failing the step. Its runtime gate
+    /// (`DSV41_EXPERT_TCGEN05_E4M3`) is still default OFF, so a present symbol
+    /// changes no behaviour on its own.
+    pub fn supports_expert_gemm_e4m3_ext(&self) -> bool {
+        self.kernels.expert_gemm_e4m3_ext.is_some()
+    }
+
     /// True when the loaded `.so` carries the tcgen05 MXFP4 gate/up entry point
     /// (`dsv41_expert_tcgen05_gate_up_mxf4`). The stock `build.sh` defines no
     /// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`, so this is false there and the
@@ -4916,6 +5057,39 @@ impl Device {
     ) -> Result<()> {
         let rc = unsafe { (self.kernels.hc_post_inplace)(res, x, post, comb, n, h, self.stream) };
         self.kerr(rc, "dsv41_hc_post_inplace")
+    }
+
+    /// True when the loaded `.so` carries the MULTI-ROW `hc_post_inplace`
+    /// (`dsv41_hc_post_inplace_rows`). A stale `.so` reports false and the caller
+    /// keeps the `hc_post` + copy pair, so the switch is free to make.
+    pub fn supports_hc_post_inplace_rows(&self) -> bool {
+        self.kernels.hc_post_inplace_rows.is_some()
+    }
+
+    /// The multi-row form of [`Self::hc_post_inplace`]: `res` is `[rows, n, h]`,
+    /// `x` is `[rows, h]` and the coefficients are the m-row slices `post` =
+    /// `[rows, n]`, `comb` = `[rows, n*n]`. Bit-identical to `hc_post` (with the
+    /// same per-row strides) + the copy back — see the kernel header.
+    ///
+    /// `Ok(false)` when the `.so` has no such entry: the caller must keep the
+    /// staging pair rather than launch a kernel that is not there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn hc_post_inplace_rows(
+        &self,
+        res: *mut f32,
+        x: *const f32,
+        post: *const f32,
+        comb: *const f32,
+        rows: i32,
+        n: i32,
+        h: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.hc_post_inplace_rows else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(res, x, post, comb, rows, n, h, self.stream) };
+        self.kerr(rc, "dsv41_hc_post_inplace_rows")?;
+        Ok(true)
     }
 
     /// Fused segment B cluster 1: collapse the hyper-connection rows and

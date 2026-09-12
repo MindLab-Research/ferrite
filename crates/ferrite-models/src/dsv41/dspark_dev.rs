@@ -472,8 +472,9 @@ pub struct DsparkDev<'a> {
     /// the `int` every rope kernel reads as `*base`, slots `1..=bs` are
     /// `pos + r` — the `pos_rows` array the multi-row form
     /// ([`Self::rope_queries`] / [`Self::rope_queries_inv`], `DSV41_DRAFT_P3A`'s
-    /// a4) reads. Both halves are a pure function of the ANCHOR position, so the
-    /// draft step still pays exactly ONE upload (see
+    /// a4) reads, and slot `bs + 1` is the **window ring's seed position**
+    /// (`pos - 1`, see [`Self::seed_slot_ptr`]). All three are a pure function of
+    /// the ANCHOR position, so the draft step still pays exactly ONE upload (see
     /// [`Self::ensure_pos_dev`]).
     pos_base: DevBuf,
     /// Host shadow of what `pos_base` currently holds on the device, i.e. the
@@ -521,6 +522,21 @@ pub struct DsparkDev<'a> {
     /// `draft_forward` with `pos > 0` on rank 0 — and `None` on every other
     /// call, so the per-dump check is one `Option` branch when the gate is off.
     unit: Option<UnitDump>,
+
+    // ---- device-level CUDA graph (`DSV41_DRAFT_GRAPH`, see `draft_graph_want`) ----
+    /// The instantiated draft graph (`cudaGraphExec_t`), once a capture has
+    /// committed. `None` until then and forever after a capture failure.
+    graph: Option<*mut c_void>,
+    /// The DRY run has happened: every lazy first-use cost (kernel module load,
+    /// stream-ordered resource setup) is behind us, so the capture that follows
+    /// records a WARM sequence. Mirrors `DevChain::verify_dry_done`.
+    graph_dry_done: bool,
+    /// A capture failed: latch, so a capture is never retried and every later
+    /// draft step takes the direct launches. Mirrors `verify_graph_failed`.
+    graph_failed: bool,
+    /// Diagnostics: how many captures / replays this instance has done.
+    graph_captures: u64,
+    graph_replays: u64,
 }
 
 fn need<'t>(t: &'t Option<DevTensor>, what: &str) -> Result<&'t DevTensor> {
@@ -656,8 +672,9 @@ impl<'a> DsparkDev<'a> {
             idxs: dev.alloc(fb(bs * (win + bs)).max(4))?,
             ids: dev.alloc(fb(bs + 1).max(4))?,
             clen: dev.alloc(4)?,
-            // base slot + the `bs` per-row positions (see `pos_base`'s doc)
-            pos_base: dev.alloc(4 * (bs + 1))?,
+            // base slot + the `bs` per-row positions + the ring seed position
+            // (see `pos_base`'s doc)
+            pos_base: dev.alloc(4 * (bs + 2))?,
             pos_dev: None,
             collapse: dev.alloc(fb(bs * dim))?,
             normed: dev.alloc(fb(bs * dim))?,

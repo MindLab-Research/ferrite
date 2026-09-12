@@ -8215,6 +8215,85 @@ extern "C" int dsv41_hc_post_inplace(float* res, const float* x, const float* po
 }
 
 // ---------------------------------------------------------------------------
+// The m-ROW form of the segment-C in-place hc_post above.
+//
+// `layer_rows()` (the verify forward) runs the SAME `hc_post` the single-row
+// `layer()` does, but over a whole block of m rows whose coefficients live at
+// per-row strides: `post + r*n`, `comb + r*n*n` (both `[m, *]`, the layout the
+// m-row `hc_mixes` writes) and the residual at `res + r*n*h`. The kernel above
+// indexes row 0 of all three — it was written for the single-row decode path,
+// where the coefficient buffers hold exactly one row — so the multi-row verify
+// had to keep the staging pair (`hc_post` + the `h2_r` copy back) instead.
+//
+// The body is the single-row kernel's, statement for statement, with the row
+// base folded in. One thread still owns one four-float column OF ONE ROW and
+// walks all n hyper-connection rows of that row itself, so its read set and its
+// write set are the same columns it alone touches and `res == out` (res is read
+// for the residual and written for all n output rows) stays safe by
+// construction, per row. At `rows == 1` every derived address reduces to the
+// single-row kernel's, so the two agree bit for bit; the single-row entry is
+// nevertheless kept as its own kernel so the decode path's codegen is
+// untouched byte for byte.
+//
+// Bit-identical to `hc_post` + the copy back for any `rows`: same
+// ascending-k `__fmaf_rn` chain on the same operands, same `post[i]*x[j]` seed.
+// (The `hc_post` kernel distributes the k-sum over the same ascending order and
+// the copy is a pure move; see the header above for the single-row argument.)
+__global__ void dsv41_hc_post_inplace_rows_kernel(float* __restrict__ res,
+                                                  const float* __restrict__ x,
+                                                  const float* __restrict__ post,
+                                                  const float* __restrict__ comb, int n, int h) {
+    const int h4 = h >> 2;
+    const int row = blockIdx.y;
+    const int j4 = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j4 >= h4) return;
+    const int j = j4 << 2;
+    const float* x_r = x + (size_t)row * h;
+    float* res_r = res + (size_t)row * n * h;
+    const float* post_r = post + (size_t)row * n;
+    const float* comb_r = comb + (size_t)row * n * n;
+    float4 r[8];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        if (k >= n) break;
+        r[k] = *reinterpret_cast<const float4*>(res_r + (size_t)k * h + j);
+    }
+    const float4 xv = *reinterpret_cast<const float4*>(x_r + j);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (i >= n) break;
+        const float pv = post_r[i];
+        float4 acc = xv;
+        acc.x *= pv;
+        acc.y *= pv;
+        acc.z *= pv;
+        acc.w *= pv;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= n) break;
+            const float c = comb_r[(size_t)k * n + i];
+            acc.x = __fmaf_rn(c, r[k].x, acc.x);
+            acc.y = __fmaf_rn(c, r[k].y, acc.y);
+            acc.z = __fmaf_rn(c, r[k].z, acc.z);
+            acc.w = __fmaf_rn(c, r[k].w, acc.w);
+        }
+        *reinterpret_cast<float4*>(res_r + (size_t)i * h + j) = acc;
+    }
+}
+
+extern "C" int dsv41_hc_post_inplace_rows(float* res, const float* x, const float* post,
+                                          const float* comb, int rows, int n, int h,
+                                          cudaStream_t s) {
+    // Same shape contract as the single-row entry, plus `rows >= 1`.
+    if (res == nullptr || x == nullptr || post == nullptr || comb == nullptr) return (int)cudaErrorInvalidValue;
+    if ((h & 3) != 0 || n <= 0 || n > 8 || rows <= 0) return (int)cudaErrorInvalidValue;
+    const int h4 = h >> 2;
+    dim3 grid((unsigned)((h4 + 255) / 256), (unsigned)rows);
+    dsv41_hc_post_inplace_rows_kernel<<<grid, 256, 0, s>>>(res, x, post, comb, n, h);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
 // Segment B, cluster 1: hc_collapse + rmsnorm(ffn_norm) as ONE kernel.
 //
 // The two are inherently a pair: the collapse produces the row the norm
