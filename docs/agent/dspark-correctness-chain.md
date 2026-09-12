@@ -1125,3 +1125,13 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 - P0-3/P1-5 的退化根因分析（subagent）
 - compressor multi-row（subagent）
 - winrows co-fix（subagent）
+
+## 基线破坏调查（694793e4）
+
+**现象**：基线（所有新 gate OFF）也产生拉丁——与 P0-3+P1-5 测试完全相同的结果。零拉丁状态在 1ddff9c 之后的提交中被破坏。
+
+**Gate 验证**（我逐个检查）：所有 bf16_roundtrip 调用都有正确的 gate 包裹（draft_bf16_domain 或 draft_attn_bf16，全部默认 OFF）。P0-3 的 tap_input 也正确 gated。**不是 gate 泄漏**。
+
+**用户提示**：".so 和 Rust 必须匹配——成功的 base 不可能失败除非 so 变了"——.so 在 1ddff9c 之后变了（bf16_roundtrip、route_group、e4m3_grouped 等新 kernel 加入），**新 kernel 的编译改变了同文件中相邻 kernel 的 codegen**（与之前段错误的机制相同）。
+
+**正在跑**：1ddff9c 的对照测试（48da474d）——如果零拉丁恢复，确认是 1ddff9c 之后的 .so 变化导致。
