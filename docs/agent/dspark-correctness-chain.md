@@ -5149,3 +5149,18 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 **预期收益**：~5-8ms（从 91.1 的 ~33ms 步时降到 ~25-28ms）→ ~110-120 tok/s
 **到 145**：还需要 tcgen05 + 更多 L4 项
 **到 400**：batched + L5 流水（25-35 人日的完整路径）
+
+## tcgen05 对齐修复重测结果（4bb86ea5）——仍失败（1 misaligned）
+
+**结果**：
+- SURVIVED 但 **LEN=0**（空输出），completion=0
+- **1 misaligned**（仍有！——byte-fallback helpers 没覆盖所有读点）
+- ELAPSED=18826ms（vs 之前 208ms 快崩——修复改变了行为：长跑后失败而非立即崩）
+- 0 ar5-hang ✓
+
+**判定**：
+1. 对齐修复（6 个读点的 byte-fallback）**不够**——还有别的 misaligned 来源
+2. 18.8s 的长跑说明修复生效了一部分（之前 208ms 就崩）——**部分修复**
+3. 剩余的 misaligned：可能是 bh_base/bhs_base（tcgen05-split-align-fix 的报告提到的"漏了 bh_base/bhs_base 的 al16 检查"）或其他读点
+
+**tcgen05 的状态**：仍被阻塞——需要找到并修复剩余的 misaligned 读点
