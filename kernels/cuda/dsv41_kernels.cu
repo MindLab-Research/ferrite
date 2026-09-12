@@ -457,8 +457,8 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 // (see stage()) -- and is the point: depth >= nk + 1 covers the whole slice.
 // Do NOT "tidy" KStep back to 128 or NSTAGE down to 8 without redoing this
 // arithmetic for the (k, ks) the launcher actually picks (k=5120, ks=8).
-// smem for WARPS=1: 1*16*16*(64+16) = 20480B ring + 128B barriers + kc + scales
-// = 21308B, under the 48KB default ceiling.
+// smem for WARPS=1: 1*16*16*(64+16) = 20480B ring + 128B barriers + kc 640 + the
+// (4+1)B scale staging = 21348B, under the 48KB default ceiling (no opt-in).
 #ifndef DSV41_SWAPAB_KSTEP
 #define DSV41_SWAPAB_KSTEP 64
 #endif
@@ -514,8 +514,11 @@ __device__ __forceinline__ void swapab_cp_wait() {
 // by the probe described at kSwapabRow).
 //
 // Alignment: 16B on both sides and size % 16 == 0 (PTX). The row stride is a
-// multiple of 16 and the global side is (m0+r)*k + k0 with k % 32 == 0 and
-// k0 % 128 == 0, so every operand is over-aligned.
+// multiple of 16 and the global side is (m0+r)*k + k0 with k % 32 == 0 and k0 a
+// multiple of kSwapabKStep, so every operand is over-aligned. (With KStep=64 the
+// k0 % 128 == 0 property the v19 geometry happened to have is GONE -- k0 is now
+// a multiple of 64 only. That is still fine: the 1D bulk form wants 16B, not the
+// 128B the TENSOR form wants -- see the kSwapabRow note and the probe it cites.)
 //
 // The mbarrier completes one phase per ring revolution; the consumer rotates
 // the parity it passes to swapab_mbar_wait (see the main loop).
