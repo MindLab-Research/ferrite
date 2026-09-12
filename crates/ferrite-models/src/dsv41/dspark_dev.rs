@@ -832,6 +832,9 @@ impl<'a> DsparkDev<'a> {
                 dim as i32,
                 eps,
             )?;
+            // the MoE's input (post ffn-norm) — the same semantic as the golden
+            // harness's `stage{s}.ffn.in`, for the MoE-segment diff.
+            self.dump_unit_idx("ffn_in", s, self.xn.ptr as *const f32, &[bs, dim]);
 
             self.draft_moe(s, ld)?;
             // the MoE block's output, AFTER its all-reduce (full block on every
@@ -1232,6 +1235,10 @@ impl<'a> DsparkDev<'a> {
             cfg.route_scale,
             2, // sqrtsoftplus, per the checkpoint's routing
         )?;
+        // the routing decision — the golden harness's `stage{s}.ffn.gate.indices/
+        // weights` counterparts, for the MoE-segment diff.
+        self.dump_unit_idx("route_idx", s, self.route_idx.ptr as *const f32 as *const f32, &[bs, topk]);
+        self.dump_unit_idx("route_w", s, self.route_w.ptr, &[bs, topk]);
 
         // The expert weights are fp4; the input row is quantised once for all
         // slots (the reference re-quantises it per expert, which is pure waste).
