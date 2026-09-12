@@ -2516,3 +2516,26 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - **nsys 的实际测量**是唯一的真实答案
 
 **之前报告的 "Wave 1 = 25ms" 来自 serve 侧计时——不准确**（用户已纠正）
+
+## SH_PAIR template&lt;M&gt; parity 结果（34cf4c74）——36 checks FAILED
+
+**通过的测试**：
+- [tiny/m=2] OK m=2 fold_r=2 n1=32 k1=64 n2=32 limit=3 epi_add=1 act=buf
+- [fold/range] OK m=8 fold_r=8 n1=64 k1=256 n2=128 limit=3 epi_add=0 act=null
+
+**失败的测试**（36 项）：
+- [fold/range] phase-1 aq byte diff at r=0 c=0: m-row 0xf9 m=1 0x79
+- [fold/range] act == nullptr but 512 slot(s) look unwritten
+- [n2%32/m=5] phase-1 aq byte diff at r=0 c=0: m-row 0x00 m=1 0x80
+- [n2%32/m=5] act == nullptr but 480 slot(s) look unwritten
+
+**失败模式**：
+1. **phase-1 aq 差异**：m-row 版的 fp8 量化激活与 m=1 参考版不同（byte 级）
+2. **act buffer 未写**：某些情况下 act buffer 有未写入的 slot
+3. **n2%32（n2 不是 32 的倍数）+ m=5**：边界情况失败
+
+**判定**：template&lt;M&gt; 的 phase-1 有数值问题——不能上生产（尽管冒烟测试零拉丁+k_acc 相同，可能是量化差异在 argmax 阈值以下）。需要修复 phase-1 的数值等价性。
+
+**修复方向**：
+- phase-1 的 aq 量化差异可能来自 amax 树的归约顺序（m-row 版的多行 amax 与 m=1 版不同）
+- act buffer 未写可能是 fold_r > 1 时的行分布问题
