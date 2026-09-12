@@ -452,3 +452,35 @@ let kg  = self.dsa_alloc(max_tokens * idm)?;      // 4096    (kpool gate)
 - 同上 `:15` 的 `DSV41_MAX_POS` 位置（文档写 `chain_dev.rs:496`，实际 `:1180-1187`）——该文档 §0.1 已自我修正过，但 §0 未改。
 - prefill 研究报告 §E-3（`dist.rs`/`distributed.rs` 双份）**已过期**，见陷阱 #10。
 - 本文件新增的两个事实（研究报报告漏项）：**`ferrite_kernels.cu:1669` 的 `max_t=2048` 第三个 GLM 上限**；**`ensure_seq` 不 append tokens**。
+
+---
+
+## 3. P0-F — 显存预算表（读码建表，2026-09-12）
+
+**分配的来源**（chain_dev.rs:1228-1262）:
+```rust
+let max_pos  = cfg.max_seq_len.min(DSV41_MAX_POS.unwrap_or(65536));   // :1228-1234
+let max_comp = max_pos / ratio + 2;                                    // :1239
+ring:    fb((window_size + max_comp) * hd)          // window+压缩latents 连续
+index_k: fb(max_comp * index_head_dim)             // pre-RoPE keys
+state_kv/state_score: fb(ratio * hd)               // compressor carry
+latent:  fb(hd)
+```
+**关键**：`max_pos` 默认 **65536**（不是 8100——8100 是 GLM 侧的 MAX_CTX；DSV41 的 KV 缓冲按 64k 预分配）。**1M 需要 `DSV41_MAX_POS=1048576` + `cfg.max_seq_len` 的界抬升**（P0-A）。
+
+### DSV41 @ 1M（ratio=2 的 DSA 层，hd=512，index_head_dim=128，window=128）
+
+| 项 | 每层 | 层数 | 合计 |
+|---|---|---|---|
+| ring（window+压缩 latents，f32） | (128+524288)×512×4B = **1.024 GB** | 11（DSA） | **11.3 GB** |
+| index_k（f32） | 524288×128×4B = **256 MB** | 11 | **2.8 GB** |
+| state_kv+state_score（compressor carry） | 2×2×512×4B = 8 KB | 11 | 88 KB |
+| GDN 层（ring 256KB + state 4KB） | ~0.3 MB | 34 | **10 MB** |
+| **合计/卡** | | | **≈14.1 GB** |
+
+**@ 当前默认 64k**：ring 11×64MB + index_k 11×16MB ≈ **0.9 GB/卡**。
+**结论**：1M 的 KV 内存 **~14 GB/卡**（8 卡各存全量 latent——DSA 的 KV 不是 TP 切分的），**180 GB 卡完全可行**。**内存不是 1M 的瓶颈**——时间（indexer 的 O(n²)）与 KV 口径（P0-C）才是。
+
+### GLM @ 1M（读码待补——MAX_CTX=8100 是 DSA cache 的 per-family max_tokens 界）
+
+GLM 的 DSA cache 分配在 `ferrite-kernel`（gpu_engine.rs:33 的注释："DSA cache allocation bound (ferrite-kernel's max_tokens per family)"）。**P0-A 的前置**：把该界抬到 1M 时，cache 的 per-family max_tokens 与显存的换算（`src/cuda.rs` 的 pool 布局）——本表的 GLM 列待补（P0-C 的口径统一后一起做）。
