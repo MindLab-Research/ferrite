@@ -3302,3 +3302,31 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 - tcgen05：5-8 天（对齐守卫已修，需要正确重测）
 
 **结论**：400 在当前 session 的时间窗口内不可达。现实的近期目标：lazy 100-120 tok/s（R2b+A4+L4-6 验证后）或 batched 修复后的 150-200 tok/s。
+
+## 🎯 Aligned 模式测试结果（6cef9b4d）——0 ar5-hang！SWALLOW 特有 hang 确认！
+
+**结果**：
+- **SURVIVED ✓，零拉丁 ✓，0 ar5-hang ✓✓✓**
+- 吞吐 64.0 tok/s（142 tokens / 2218ms）
+- k_acc: 5 5 1 5 5 5 5 1 5 1 5 5 1 1 1 1 5 1 5 1（mixed，mean ~3.1）
+
+**完整的 hang 矩阵**：
+| 测试 | SWALLOW | VERIFY_GRAPH | 任务 | hang |
+|---|---|---|---|---|
+| Plan A+C | ON | ON | 出师表 | gap 23 ❌ |
+| 无图 | ON | OFF | 出师表 | 0 ✓ |
+| 无图 | ON | OFF | 计数 | 937 ❌ |
+| Plan B | ON | ON | 计数 | 10,099 ❌ |
+| **Aligned（不吞）** | **OFF** | **ON** | **计数** | **0 ✓** |
+
+**关键推论**：
+1. **batched verify (m=6) + 图不 hang**——排除 H2（batched argmax 交换）
+2. **hang 是 SWALLOW_STEP 特有的**（吞主链步的 epoch 管理）
+3. **吞吐对比**：aligned 64 < lazy 83——batched verify (~41ms) ≈ lazy 6×per-row (~37ms)——**权重共享不生效**（确认 batched-path 分析）
+
+**路径总结**：
+| 路径 | 吞吐 | hang | 400 |
+|---|---|---|---|
+| lazy | **83**（最佳）| 无 | ❌ 数学上限 145 |
+| aligned | 64 | 无 | ❌ 需要 SH_PAIR M=6 + kernel 优化 |
+| SWALLOW | ? | **是** | ❌ 需要修 hang |
