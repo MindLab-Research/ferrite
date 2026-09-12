@@ -2158,7 +2158,11 @@ fn attn_lin_fuse() -> AttnLinFuse {
 ///
 /// Default OFF: unset is byte-identical to the previous behaviour. A stale .so
 /// without the symbol, a declined shape, or this gate off falls straight through
-/// to the two `proj_mrows` launches, which are K1's bit-exact reference.
+/// to the two `proj_mrows` launches, which are K1's bit-exact reference — the
+/// `mrows` branch, NOT the per-row `lin` loop (the declined call re-enters the
+/// projection chain exactly as `mrows2 == false` would, sharing the one
+/// `quant_rows` staging launch with it). See the `took_akv` chain in
+/// [`Self::attention_rows`].
 ///
 /// PRECEDENCE: when K1 and R2's `lin2` half are BOTH enabled, K1 runs (it is the
 /// verified-safe program) and R2's half is not reached. Both gates default OFF,
@@ -4496,10 +4500,11 @@ impl<'a> DevChain<'a> {
     /// carries C1-C6 and the warp-level family split argument).
     ///
     /// `Ok(false)` = NOT performed — the caller keeps its two `proj_mrows`
-    /// launches. It declines when the loaded .so lacks the symbol, the C entry
-    /// declines the shape, or the swapAB opt-in is on (that arm is explicitly
-    /// NOT bit-identical to the SIMT gemv and keeps its own kernel — the same
-    /// exclusion [`Self::proj_mrows`] applies).
+    /// launches (the `mrows` branch of `attention_rows`'s projection chain, not
+    /// the per-row `lin` loop). It declines when the loaded .so lacks the symbol,
+    /// the C entry declines the shape, or the swapAB opt-in is on (that arm is
+    /// explicitly NOT bit-identical to the SIMT gemv and keeps its own kernel —
+    /// the same exclusion [`Self::proj_mrows`] applies).
     ///
     /// `out_stride_q`/`out_stride_kv` are separate because the wq_a output row
     /// strides by `ql` and the wkv row by `hd`. They equal `n_q`/`n_kv` at this
@@ -9877,15 +9882,27 @@ impl<'a> DevChain<'a> {
         let lin_gate = attn_lin_fuse();
         let lin2_gate = lin_gate.lin2() && m == 1 && !Self::swapab();
         let rope_norm_gate = lin_gate.rope_norm() && m == 1 && !Self::swapab();
-        let took_akv = if mrows2 {
-            // K1: ONE two-family launch for wq_a + wkv. The activation is the
-            // same single `quant_rows` the mrows branch below issues, so the fp8
-            // bytes the fused GEMV consumes are exactly the ones two separate
-            // `proj_mrows` launches would have consumed. On a decline
-            // (`proj_mrows2` -> `Ok(false)`) the whole `took_akv` is false and the
-            // per-row loop below runs — the same fallback the mrows branch has,
-            // and bit-identical by construction.
+        // K1's arm and the `mrows` branch share ONE staging launch: both consume
+        // the same `quant_rows` output (`s.xq_r`/`s.xsc_r`), so hoisting it here
+        // makes "ON-but-declined" the OFF launch sequence verbatim, not merely
+        // bit-identical — the decline below re-enters the chain exactly as if
+        // `mrows2` were false. `lin2` is NOT covered (it quantises its own row
+        // into the single-row `s.xq`); `quant_rows` is a pure staging write, so
+        // the extra launch in the config where K1 and R2's `lin2` are both on is
+        // harmless, and the OFF path issues it in the same place it always did.
+        if mrows2 || mrows {
             self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+        }
+        let m2_ok = if mrows2 {
+            // K1: ONE two-family launch for wq_a + wkv. The activation is the
+            // `quant_rows` just above, so the fp8 bytes the fused GEMV consumes
+            // are exactly the ones two separate `proj_mrows` launches would have
+            // consumed. On a decline (`proj_mrows2` -> `Ok(false)`) the chain
+            // below continues as if `mrows2` were false: the documented fallback
+            // is the `mrows` branch's TWO `proj_mrows` launches (see
+            // [`attn_mrows2`]), never the per-row `lin` loop — that loop would
+            // re-quantise every row and pay `2m` launches where the declined path
+            // promises 2.
             self.proj_mrows2(
                 ld.wq_a.as_ref().unwrap().as_u8(),
                 ld.wq_a_scale.as_ref().unwrap().as_u8(),
@@ -9900,6 +9917,11 @@ impl<'a> DevChain<'a> {
                 m,
                 dim as i32,
             )?
+        } else {
+            false
+        };
+        let took_akv = if m2_ok {
+            true
         } else if lin2_gate {
             // The EAGER call verbatim, with this path's `_r` buffers as the
             // destinations: `quant1` + `gemm_fp8_mx2` write row 0 of `qr_r` /
@@ -9920,11 +9942,13 @@ impl<'a> DevChain<'a> {
                 self.s.kv_r.ptr as *mut f32,
             )?
         } else if mrows {
-            // the block's fp8 activation: `quant_kernel` is one thread-group per
-            // (row, block), so row `r` here is the byte-for-byte `quant1(xr)`
-            // the per-row loop issues. wq_a and wkv share it (they read the same
-            // `xn_r` row), which alone removes `m` quant launches.
-            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            // the block's fp8 activation was staged by the `quant_rows` above
+            // (`quant_kernel` is one thread-group per (row, block), so row `r`
+            // there is the byte-for-byte `quant1(xr)` the per-row loop issues).
+            // wq_a and wkv share it (they read the same `xn_r` row), which alone
+            // removes `m` quant launches. This is K1's and the per-row loop's
+            // documented fallback, so it is reached either by `mrows2 == false`
+            // or by `proj_mrows2` declining — identical launches both ways.
             let ok_a = self.proj_mrows(
                 ld.wq_a.as_ref().unwrap().as_u8(),
                 ld.wq_a_scale.as_ref().unwrap().as_u8(),
