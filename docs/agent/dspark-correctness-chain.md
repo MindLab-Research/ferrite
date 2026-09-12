@@ -5369,3 +5369,22 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 **根本问题**：不是轮次差（pad 补偿无效）——是 **epoch 推进机制本身在 SWALLOW 臂下卡死**！
 
 **下一步**：epoch-decrease-rootcause 的判决（为什么 epoch 冻结？）
+
+## tcgen05 第 2 轮重测结果（08e35a2e）——仍失败（1 misaligned 残留）
+
+**结果**：
+- SURVIVED 但 **LEN=0**（空输出）
+- **1 misaligned**（主嫌疑 :5009 的修复没完全解决！）
+- ELAPSED=191ms（快速失败——prefill 就挂）
+
+**判定**：
+- 第 2 轮修复（4 个新读点）**仍然不够**——还有别的 misaligned 来源
+- 需要第 3 轮或 **compute-sanitizer 定位**（拿到出错 kernel 名 + 指令 + 地址）
+
+**tcgen05 的修复历史**：
+| 轮 | 修复 | 结果 |
+|---|---|---|
+| 1 | 6 个 split body 读点（byte-fallback）| 18.8s 长跑但 LEN=0 |
+| **2** | **4 个新读点（含主嫌疑 :5009）** | **191ms 快速失败——仍 1 misaligned** |
+
+**下一步**：compute-sanitizer（唯一能枚举未知写者的手段）——`compute-sanitizer --tool memcheck --launch-timeout 120` + `CUDA_LAUNCH_BLOCKING=1`
