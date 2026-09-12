@@ -2163,3 +2163,21 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 - **最可能的 bug 类**：**host 的 `pos`（步前的值）与 device 的 `pos_ctr`（步后的值）混用**——一处用错就把行 0 落回 `pos` ⇒ 行 0 复述 next ⇒ 每步 emit 两个相同 token ⇒ **100% 重复**。
 
 **处置**：起 `verify-row0-systematic`（vanguard，钉死 pos_base/pos_rows/行 0 的 KV）与 `emit-chain-audit`（消费链 + stream true/false 的责任判定）并行彻查。
+
+## 2026-09-12 【铁证定案】EAGER 对照 + 消费链排除 ⇒ 根因在 spec 路径的状态污染
+
+**EAGER（无 spec，单行 decode）对照**（同一 serve、同一模型、数字任务"从 1 数到 100"）：
+```
+'我会按 1 到 100 逐行输出。\n\n```text\n1\n2\n3\n4\n5\n…\n27\nanao\n29\n…\n49\n51\n…\n95\n100\n'
+```
+**完美数数**（仅 "anao"、跳过 50 等个别瑕疵）；出师表也正确（146 字、3 个双字）。**而 SPEC 的同一任务每步崩**（"1\n2u3\n4i4\n55\n6外面的6…"）。
+
+**⇒ 三重排除**：① 模型无罪（EAGER 对）；② tokenizer/帧无罪（EAGER 对）；③ 消费链无罪（`emit-chain-audit` 逐项排除：serve 的 out 每 token 一次 push、`p += emitted.len()` 与 commit 的 Δpos_ctr 是**构造性恒等**（两臂都对上）、pool/driver 的水位 diff 每段只发一次、api 的两条装配臂喂同一 id 流、SSE 的 drain 语义正确、无重试/重放）。**stream true/false 也不能判别**（两臂互斥但 id 同源，重复与否必然同步）。
+
+**emit-chain-audit 的结构性收窄（最有价值的一条）**：**`emitted` 的值来自 `verify_out`（主链的 argmax），永远不来自 draft** ⇒ **draft 侧的任何污染（窗口 ring/seed 差一位/tap/stride）只能压低 `k_acc`，不可能改错 `emitted` 的值**。**⇒ 值错了 ⇒ 主链 KV / `s.ids_r` / `pos_rows` 被 verify 的执行污染；值没错而 k_acc 低 ⇒ draft 侧。** 这条把搜索空间砍一半。
+
+**形态**：前 ~10 字符正确（DBG 前 12 步的 emitted 逐字正确），之后崩 ⇒ **累积型**（每步泄漏一点状态，几步后压垮）——与"verify 的 append 写了但 rollback 没恢复"完美吻合（`spec-state-pollution` 在列"写 vs 恢复"清单）。
+
+**seed-tap-align-impl 的交付**（gate `DSV41_SEED_ALIGN`，默认 OFF）：路线 A（`draft_forward(next, pos+1)`——seed 落 pos 与 tap 同位）+ ring 回绕按位置序展开 + **顺带发现的独立 bug：`note_ctx_rows` 的行 stride**（`dspark_dev.rs:534` 用 `slot*m+j` 而生产者 `chain_dev.rs:5823` 写 `slot*VERIFY_ROWS+r`——**slot≥1 的 target 层读错行**；6 行 arm 传 m=6 自愈，旧 5 行 arm 带病）。
+
+**已知待核**（`spec-state-pollution` 的清单）：verify 写了槽 `pos+1..pos+5` + compressor 的 pool/commit + clen + `s.ids_r` + `xq` 量化缓存 + indexer 候选——**rollback 恢复了哪些**？`dspark_commit` 的 `compress_replay` 与下一步 `step_dev` 的 append 是否双写？`s.ids` 与 `s.ids_r` 是否共享？
