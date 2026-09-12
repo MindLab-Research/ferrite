@@ -6272,8 +6272,8 @@ extern "C" int dsv41_rmsnorm_rope(const float* x, const float* w, float* out, co
                                   const int* base, int mul, int off, int step, int inverse,
                                   float eps, cudaStream_t s) {
     if (n <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    rmsnorm_rope_kernel<<<n, 1024, 0, s>>>(x, w, out, cos, sin, n, dim, rope_len, half, base, mul,
                                           off, step, inverse, eps);
-    return (int)cudaGetLastError();
     return (int)cudaGetLastError();
 }
 
