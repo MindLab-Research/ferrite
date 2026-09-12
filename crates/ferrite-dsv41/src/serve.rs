@@ -332,6 +332,25 @@ fn pool_rank_body(
     comm.set_peers(peers)?;
     let mut chain = DevChain::new(&dev, cfg, &w, RunOpts::from_env(), eng_map)?;
     chain.comm = Some(Arc::new(comm));
+    // The DSpark draft (shadow mode, DSV41_DSPARK=1): the mtp.* weights are
+    // already loaded (`w`); the draft reuses the chain's rope tables — its
+    // positions are a subset of the main chain's.
+    let mut dspark = if cfg.dspark_armed() {
+        let mut d = crate::dspark_dev::DsparkDev::new(&dev, &w, cfg)?;
+        let (cos, sin) = chain.rope_tables();
+        d.set_rope_tables(cos, sin);
+        if rank == 0 {
+            eprintln!("[dspark] shadow mode armed: draft+verify run per step, all effects rolled back");
+        }
+        Some(d)
+    } else {
+        None
+    };
+    // accept-length accumulator for the periodic shadow report
+    let mut dspark_acc_sum: u64 = 0;
+    let mut dspark_steps: u64 = 0;
+    let mut dspark_draft_ms: f64 = 0.0;
+    let mut dspark_verify_ms: f64 = 0.0;
     if rank == 0 {
         eprintln!("[dsv41] rank0: chain ready, serving");
     }
@@ -391,19 +410,32 @@ fn pool_rank_body(
                 let mut r = Ok(());
                 for i in 0..n {
                     let st = std::time::Instant::now();
-                    match chain.step_dev(t, pos + i) {
-                        Ok(next) => {
-                            step_time(pos + i, st.elapsed());
-                            out.push(next);
-                            t = next;
-                            if stop_set.contains(&next) {
-                                break;
-                            }
+                    let next = if let Some(d) = dspark.as_mut() {
+                        // shadow mode: the single-row step stays the engine's
+                        // real output; draft+verify run beside it and roll back
+                        let rep = chain.dspark_shadow_step(d, t, pos + i)?;
+                        dspark_acc_sum += rep.accepted as u64;
+                        dspark_steps += 1;
+                        dspark_draft_ms += rep.draft_ms as f64;
+                        dspark_verify_ms += rep.verify_ms as f64;
+                        if timing && rank == 0 && dspark_steps % 50 == 0 {
+                            eprintln!(
+                                "[dspark] steps={} mean-accept={:.3} draft={:.2}ms verify={:.2}ms (per step)",
+                                dspark_steps,
+                                dspark_acc_sum as f64 / dspark_steps as f64,
+                                dspark_draft_ms / dspark_steps as f64,
+                                dspark_verify_ms / dspark_steps as f64,
+                            );
                         }
-                        Err(e) => {
-                            r = Err(e);
-                            break;
-                        }
+                        rep.next
+                    } else {
+                        chain.step_dev(t, pos + i)?
+                    };
+                    step_time(pos + i, st.elapsed());
+                    out.push(next);
+                    t = next;
+                    if stop_set.contains(&next) {
+                        break;
                     }
                 }
                 if res_tx.send((rank, r.map(|_| out))).is_err() {

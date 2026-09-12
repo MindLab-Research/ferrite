@@ -1334,6 +1334,13 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// The precomputed RoPE tables, for a DsparkDev built alongside this chain
+    /// (`set_rope_tables`): the draft's positions are a subset of the main
+    /// chain's, so it reuses the same cos/sin instead of building its own.
+    pub fn rope_tables(&self) -> (*const f32, *const f32) {
+        (self.cos.as_f32(), self.sin.as_f32())
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         // the incoming premix is the CONSTANT [1,0,0,0] every step; upload it once
         // here so the per-step refresh is a device-to-device copy (no H2D)
