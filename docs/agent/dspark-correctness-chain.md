@@ -703,3 +703,9 @@ l=0: 172.42  l=1: 1282.35  ... l=38: 500.89  l=39: 496.47
 4. **sinkhorn 的迭代次数和 eps**：`hc_sinkhorn_iters` 和 `hc_eps` 的 config 值是否一致
 
 这些点在对齐实验的逐层 norm 数据中会显现——如果某层的 norm 偏差，就能定位到该层的 hc 数学。
+
+## tcgen05 f8f6f4 判词（tcgen05-e4m3-variant）——**kind::f8f6f4 不能做 block scale（硬冲突），e8m0 无法应用**
+
+**致命冲突**：`kind::f8f6f4` 的 MMA 没有 block-scale 操作数——checkpoint 的 e8m0 per-32 scale 无法在 f8f6f4 路径中应用（mxf4 kind 有 scale 操作数但只吃 e2m1）。这意味着 **e4m3 激活 × fp4 权重的 tcgen05 路径无法直接对齐官方 fp4_gemm 的数值**（官方用 tilelang 的 `T.Cast(FP32, scales_b[...])` 在 kernel 外部应用 scale）。
+
+**可行方案**（subagent 推荐）：**scale 外提**——kernel 只做 raw FP8×FP4 MMA，block scale 在 kernel 外的 epilogue 中应用（与官方 tilelang 的做法一致——官方的 fp4_gemm_kernel 也是 `C_local_accum += C_local * scale_a * scale_b`，scale 在 inner loop 的 epilogue 应用）。这需要重写 gateup kernel 的 scale 应用位置。
