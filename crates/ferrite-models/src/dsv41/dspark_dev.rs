@@ -189,6 +189,82 @@ fn draft_p3a() -> DraftP3a {
     })
 }
 
+/// The four `DSV41_DRAFT_P3B` folds, resolved once (see [`draft_p3b`]).
+#[derive(Clone, Copy)]
+struct DraftP3b {
+    /// b1: the shared expert's `(w1 | w3) -> swiglu+quant -> w2` chain as ONE
+    /// multi-row pass ([`DsparkDev::shared_expert_mrows`]).
+    sh_exp_mrows: bool,
+    /// b2: the routed experts' three stages as ONE `rows = bs` launch each. This
+    /// is the historical `DSV41_DRAFT_MOE_MROWS` arm; the P3B master ORs it in so
+    /// one env turns the whole P3b shape on, and the old name keeps working.
+    moe_mrows: bool,
+    /// b3: the MoE gate's `bs` rows in ONE `ferrite_gemv_bf16_v2_mrows`.
+    gate_mrows: bool,
+    /// b4: the shared expert's merge folded into the w2 GEMV's epilogue
+    /// (`dsv41_gemm_fp8_mx_add`). Only taken on the PER-ROW shared arm (the
+    /// `gemm_fp8_mrows` w2 has no additive twin) and therefore inert whenever b1
+    /// engages — see [`DsparkDev::shared_expert_epi_add`].
+    sh_epi_add: bool,
+}
+
+/// `DSV41_DRAFT_P3B=1` (**DEFAULT OFF**) — the draft chain's **P3b** folds from
+/// `docs/agent/draft-p3-fusion.md` §5: the multi-row passes and epilogue folds
+/// that shrink each MTP block's MoE half to the size the segment kernels will
+/// later eat in one bite (that document's "形态 I").
+///
+/// | item | override | fold | launches saved |
+/// |---|---|---|---|
+/// | b1 | `DSV41_P3B_SH_EXP_MROWS` | shared expert `w1/w3` + `swiglu_limit_q` + `w2` for all `bs` rows: the per-row loop's `5 x bs` launches become 4 (and the `swiglu_limit` + `quant1` pair becomes the fused `_q` epilogue) | 20/block |
+/// | b2 | `DSV41_P3B_MOE_MROWS` | routed experts: one `rows = bs` launch per stage (`DSV41_DRAFT_MOE_MROWS`'s arm, kept under its own name too) | 12/block |
+/// | b3 | `DSV41_P3B_GATE_MROWS` | MoE gate: `bs` `gemv_bf16` launches -> ONE `gemv_bf16_v2_mrows` | 4/block |
+/// | b4 | `DSV41_P3B_SH_EPI_ADD` | shared expert merge folded into the w2 epilogue (per-row arm only) | 1/block |
+///
+/// A per-item override, when SET, wins over the master (`=0` turns that one fold
+/// off for an A/B that isolates it; any other value turns it on). An unset
+/// override follows the master, so `DSV41_DRAFT_P3B=1` is the whole arm and the
+/// per-item names exist to take ONE fold back.
+///
+/// **WHAT IS NOT HERE, and why** (so the next reader does not re-derive it):
+/// * **attention projections** (`wq_a`/`wq_b`/`wkv`/`wo_b`) are ALREADY
+///   multi-row: each is one `gemm_fp8_mx` at `m = bs`. Note they take that
+///   symbol's **16-row tile MMA** program, which is why they are not routed
+///   through `gemm_fp8_mrows` here — the pair is not bit-identical and the
+///   swap would be a numerical change, not a launch saving (the plan's P3b table
+///   does not ask for it).
+/// * **the hc chain** (`hc_mixes` / `hc_collapse[_norm]` / `hc_post`) is ALREADY
+///   multi-row: every draft call passes `rows = bs` (the kernel's native row
+///   dimension, the same one `chain_dev`'s verify side drives with `rows = m`).
+/// * **rope** and the **head** are P3a a4 (`apply_rope_mrows`) and
+///   `head_gemv_bf16_mrows` respectively — both already in place.
+/// * **b4 does not pair with b1**: `dsv41_gemm_fp8_mrows` has no additive
+///   epilogue, and folding the add into the shared `w2` would leave the
+///   `shared_out` unit dump unwritten, breaking the golden comparison chain
+///   (`dspark-correctness-chain.md`). It stays available for the per-row arm.
+///
+/// **WHY IT SHIPS OFF.** Every fold here is a bit-identity CLAIM taken from the
+/// kernel headers the verify side already relies on, and each one still has to
+/// be confirmed on the real draft shape (bs = 5) by the `dspark` parity tests
+/// plus a same-binary serve A/B — the house rule for a new path. Read once and
+/// cached: `draft_moe` runs `n_mtp` times per step and every field is read inside
+/// its per-block body.
+fn draft_p3b() -> DraftP3b {
+    static F: std::sync::OnceLock<DraftP3b> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let master = std::env::var("DSV41_DRAFT_P3B").map(|v| v != "0").unwrap_or(false);
+        let item = |name: &str| match std::env::var(name) {
+            Ok(v) => v != "0",
+            Err(_) => master,
+        };
+        DraftP3b {
+            sh_exp_mrows: item("DSV41_P3B_SH_EXP_MROWS"),
+            moe_mrows: draft_moe_mrows() || item("DSV41_P3B_MOE_MROWS"),
+            gate_mrows: item("DSV41_P3B_GATE_MROWS"),
+            sh_epi_add: item("DSV41_P3B_SH_EPI_ADD"),
+        }
+    })
+}
+
 /// `DSV41_MARKOV_SLICED=1` (DEFAULT OFF — the house rule: a new path ships as an
 /// A/B arm) cuts the draft's Markov head across the ranks the same way
 /// `DSV41_VERIFY_HEAD_SLICED` cuts the verify's head: rank `r` walks only its
@@ -1548,17 +1624,41 @@ impl<'a> DsparkDev<'a> {
         let shared_rank = if stp { true } else { rank == 0 };
 
         // ---- gate + route ----
-        // The gate is bf16 and the GEMV is M=1, so `bs` rows are `bs` launches —
-        // the same call the backbone's MoE makes.
+        // The gate is bf16 and the per-row GEMV is M=1, so the historical shape is
+        // `bs` launches — the same call the backbone's MoE makes.
+        //
+        // P3b b3 (`DSV41_DRAFT_P3B`, see [`draft_p3b`]): ONE multi-row GEMV
+        // (`ferrite_gemv_bf16_v2_mrows`) where the loop below issues `bs`
+        // single-row `gemv_bf16` launches. The entry runs the v2 program with a
+        // row dimension — same WPR heuristic (`gv2_wpr(n_routed)`), same K-slice
+        // walk, same uint4/8-element FMA groups, same smem partial fold, one
+        // independent accumulator per row — so row r is bit-identical to the
+        // per-row call it replaces, PROVIDED the per-row path would take v2; the
+        // wrapper enforces that (`gemv_bf16_v2_wanted(n_routed)` + the symbol) and
+        // returns Ok(false) otherwise, keeping the loop. This is the draft-side
+        // mirror of `DevChain::moe_rows`'s `row_fold_gate` arm
+        // (`chain_dev.rs`, DSV41_ROW_FOLD_GATE / DSV41_GATE_MROWS).
         let gate_w = need(&ld.gate_w, "mtp.*.ffn.gate.weight")?;
-        for r in 0..bs {
-            self.dev.gemv_bf16(
+        let p3b = draft_p3b();
+        let gate_folded = p3b.gate_mrows
+            && self.dev.gemv_bf16_v2_mrows(
                 gate_w.ptr() as *const c_void,
-                (self.xn.ptr as *const f32).wrapping_add(r * dim),
-                (self.scores.ptr as *mut f32).wrapping_add(r * n_routed),
+                self.xn.ptr as *const f32,
+                self.scores.ptr as *mut f32,
+                bs as i32,
                 n_routed as i32,
                 dim as i32,
             )?;
+        if !gate_folded {
+            for r in 0..bs {
+                self.dev.gemv_bf16(
+                    gate_w.ptr() as *const c_void,
+                    (self.xn.ptr as *const f32).wrapping_add(r * dim),
+                    (self.scores.ptr as *mut f32).wrapping_add(r * n_routed),
+                    n_routed as i32,
+                    dim as i32,
+                )?;
+            }
         }
         let gate_bias = ld.gate_bias.as_ref().map(|b| b.as_f32());
         self.dev.route_topk(
@@ -1743,7 +1843,7 @@ impl<'a> DsparkDev<'a> {
                 // multi-row arm is armed, and the kernel then walks the
                 // remaining rows itself from `gridDim.y` (= slots = topk).
                 let row_pitch = (topk as usize) * (act_slot as usize);
-                let mrows = draft_moe_mrows();
+                let mrows = p3b.moe_mrows;
                 let rows = if mrows { bs as i32 } else { 1 };
                 let n_launches = if mrows { 1 } else { bs };
                 for r in 0..n_launches {
@@ -1895,8 +1995,7 @@ impl<'a> DsparkDev<'a> {
             self.dev.zero(&self.moe_out)?;
         }
 
-        // ---- shared expert (one row at a time: its w1/w3 pair shares the fp8
-        // activation, and the swiglu output is a per-row [sh_il] block) ----
+        // ---- shared expert (one row at a time, unless P3b's b1 folds it) ----
         // Only the rank(s) that actually contribute it run this half: all of them
         // under DSV41_SHARED_TP (each computing its own `inter / world` slice of
         // the Rows-sharded w1/w3), rank 0 alone under the replicated layout
@@ -1919,64 +2018,142 @@ impl<'a> DsparkDev<'a> {
             None
         };
         if let Some((w1, w1s, w3, w3s, w2, w2s)) = sh_w {
+            // ONE fp8 activation for the whole block, whichever arm runs: the
+            // per-row loop addresses row r at `+r*dim` bytes / `+r*dim/32`
+            // scales, which IS `quant_fp8(rows = bs, cols = dim, block = 32)`'s
+            // layout, so this single call is also what the multi-row pass below
+            // consumes. It must stay OUTSIDE the two arms so an arm switch cannot
+            // change the staged bytes.
             self.quant1(self.xn.ptr as *const f32, bs * dim)?;
-            for r in 0..bs {
-                let a = self.xq.as_u8().wrapping_add(r * dim);
-                let asc = self.xsc.as_f32().wrapping_add(r * dim / 32);
-                // `sh_il` (inter/world under SHARED_TP, inter otherwise) is the
-                // width THIS rank's w1/w3 actually have — asking for `inter_local`
-                // here is what walked 8x past the local slice (`inter_local` is
-                // 320 under TP8, the tensors hold 288 rows).
-                self.dev.gemm_fp8_mx(
-                    a,
-                    asc,
-                    w1.as_u8(),
-                    w1s.as_u8(),
-                    std::ptr::null(),
-                    self.ex_act.ptr as *mut f32,
-                    1,
-                    sh_il as i32,
-                    dim as i32,
-                )?;
-                self.dev.gemm_fp8_mx(
-                    a,
-                    asc,
-                    w3.as_u8(),
-                    w3s.as_u8(),
-                    std::ptr::null(),
-                    (self.ex_act.ptr as *mut f32).wrapping_add(sh_il),
-                    1,
-                    sh_il as i32,
-                    dim as i32,
-                )?;
-                self.dev.swiglu_limit(
-                    self.ex_act.ptr as *mut f32,
-                    1,
-                    sh_il as i32,
-                    cfg.swiglu_limit,
-                )?;
-                self.quant1(self.ex_act.ptr as *const f32, sh_il)?;
-                // w2 is Cols-sharded: [dim, sh_il] locally, so its reduction runs
-                // over this rank's slice and the OUTPUT is a partial [dim].
-                self.dev.gemm_fp8_mx(
-                    self.xq.as_u8(),
-                    self.xsc.as_f32(),
-                    w2.as_u8(),
-                    w2s.as_u8(),
-                    std::ptr::null(),
-                    (self.shared_out.ptr as *mut f32).wrapping_add(r * dim),
-                    1,
-                    dim as i32,
-                    sh_il as i32,
-                )?;
+            // P3b b1 (`DSV41_DRAFT_P3B`): the whole `(w1 | w3) -> swiglu+quant ->
+            // w2` chain as ONE multi-row pass. Ok(false) = gate off, a shape the
+            // kernels decline, or a stale `.so` — the per-row loop follows and
+            // rewrites every buffer this attempt touched, so a partial attempt is
+            // harmless by construction (only `moe_out` is not scratch, and it is
+            // written by the merge `add_inplace` alone).
+            if !(p3b.sh_exp_mrows
+                && self.shared_expert_mrows(w1, w1s, w3, w3s, w2, w2s)?)
+            {
+                // P3b b4 (per-row arm only): fold the merge into w2's epilogue
+                // (`out += w @ a`, straight into `moe_out`) instead of writing a
+                // disjoint `shared_out` row and folding it in afterwards.
+                //
+                // ALL-OR-NOTHING, and that is why the decision is re-taken inside
+                // the loop: the C entry's shape test is a function of (n, k, m)
+                // alone, so it is row-INDEPENDENT — but if it ever declined on a
+                // later row, row 0 would already sit in `moe_out` and the trailing
+                // merge would either double-add it (from a stale `shared_out`
+                // row) or skip the remaining rows. A decline on row 0 is clean
+                // instead: the entry returns BEFORE its launch, so nothing is
+                // written and the plain per-row arm below is the untouched
+                // fallback.
+                let mut epi_add = p3b.sh_epi_add && self.dev.supports_gemm_fp8_add();
+                for r in 0..bs {
+                    let a = self.xq.as_u8().wrapping_add(r * dim);
+                    let asc = self.xsc.as_f32().wrapping_add(r * dim / 32);
+                    // `sh_il` (inter/world under SHARED_TP, inter otherwise) is the
+                    // width THIS rank's w1/w3 actually have — asking for `inter_local`
+                    // here is what walked 8x past the local slice (`inter_local` is
+                    // 320 under TP8, the tensors hold 288 rows).
+                    self.dev.gemm_fp8_mx(
+                        a,
+                        asc,
+                        w1.as_u8(),
+                        w1s.as_u8(),
+                        std::ptr::null(),
+                        self.ex_act.ptr as *mut f32,
+                        1,
+                        sh_il as i32,
+                        dim as i32,
+                    )?;
+                    self.dev.gemm_fp8_mx(
+                        a,
+                        asc,
+                        w3.as_u8(),
+                        w3s.as_u8(),
+                        std::ptr::null(),
+                        (self.ex_act.ptr as *mut f32).wrapping_add(sh_il),
+                        1,
+                        sh_il as i32,
+                        dim as i32,
+                    )?;
+                    self.dev.swiglu_limit(
+                        self.ex_act.ptr as *mut f32,
+                        1,
+                        sh_il as i32,
+                        cfg.swiglu_limit,
+                    )?;
+                    self.quant1(self.ex_act.ptr as *const f32, sh_il)?;
+                    // w2 is Cols-sharded: [dim, sh_il] locally, so its reduction runs
+                    // over this rank's slice and the OUTPUT is a partial [dim].
+                    if epi_add {
+                        if self.dev.gemm_fp8_mx_add(
+                            self.xq.as_u8(),
+                            self.xsc.as_f32(),
+                            w2.as_u8(),
+                            w2s.as_u8(),
+                            std::ptr::null(),
+                            (self.moe_out.ptr as *mut f32).wrapping_add(r * dim),
+                            1,
+                            dim as i32,
+                            sh_il as i32,
+                        )? {
+                            // Folded into `moe_out[r*dim .. +dim]`. The shared
+                            // output is then NOT materialised, so the
+                            // `shared_out` unit dump below cannot be taken (see
+                            // the note there).
+                            continue;
+                        }
+                        if r > 0 {
+                            // Unreachable: the shape is row-independent and row 0
+                            // already folded. Fail LOUDLY — a silent fallback here
+                            // would merge a stale `shared_out` row on top of an
+                            // already-folded one, i.e. a plausible wrong block.
+                            return Err(FerriteError::Config(format!(
+                                "draft_moe: the shared expert's epilogue fold \
+                                 (DSV41_P3B_SH_EPI_ADD) took row 0 and then declined row \
+                                 {r} of {bs}: the shape test is row-independent, so the \
+                                 launcher/.so is inconsistent — re-run without \
+                                 DSV41_P3B_SH_EPI_ADD"
+                            )));
+                        }
+                        // Row 0 declined and wrote nothing: the plain arm below is
+                        // still a clean fallback, merge included.
+                        epi_add = false;
+                    }
+                    // `out_row` is `shared_out`'s row: the dump target.
+                    self.dev.gemm_fp8_mx(
+                        self.xq.as_u8(),
+                        self.xsc.as_f32(),
+                        w2.as_u8(),
+                        w2s.as_u8(),
+                        std::ptr::null(),
+                        (self.shared_out.ptr as *mut f32).wrapping_add(r * dim),
+                        1,
+                        dim as i32,
+                        sh_il as i32,
+                    )?;
+                }
+                // `moe_out += shared_out` — the merge. Skipped exactly when every
+                // row took the epilogue fold above (`epi_add`), where the sum is
+                // already in `moe_out`; the per-row arm writes disjoint `dim`-wide
+                // ranges, so the element-wise add is bit-identical to the `dim`
+                // calls the pre-P3b code issued.
+                if !epi_add {
+                    self.dev.add_inplace(
+                        &self.moe_out,
+                        &self.shared_out,
+                        (bs * dim) as i64,
+                    )?;
+                }
             }
-            self.dev.add_inplace(
-                &self.moe_out,
-                &self.shared_out,
-                (bs * dim) as i64,
-            )?;
             // the shared expert's output BEFORE the routed sum — the golden
-            // harness's `stage{s}.ffn.shared.out`.
+            // harness's `stage{s}.ffn.shared.out`. ⚠️ Only the two non-folded
+            // arms materialise `shared_out` into its own buffer: the b1 pass
+            // writes it (as `[bs, dim]`, same layout) and the per-row arm writes
+            // it per row, so the dump keeps its meaning on both. The b4 epilogue
+            // fold has no `shared_out` to record, which is one of the reasons it
+            // is not the default (see [`draft_p3b`]).
             self.dump_unit_idx("shared_out", s, self.shared_out.ptr as *const f32, &[bs, dim]);
         }
 
@@ -2004,6 +2181,149 @@ impl<'a> DsparkDev<'a> {
             c.end_round();
         }
         Ok(())
+    }
+
+    /// P3b b1 (`DSV41_DRAFT_P3B`, DEFAULT OFF): the draft's shared expert as ONE
+    /// multi-row pass — the draft-side mirror of `DevChain::shared_expert_mrows`
+    /// (`chain_dev.rs`, `DSV41_SH_EXP_MROWS`), applied to the draft's own scratch.
+    ///
+    /// # What it removes
+    ///
+    /// The shared expert is a SINGLE expert applied to every row, so its weights
+    /// are identical across the block — yet the per-row loop reads them once per
+    /// row. At the production shape (`bs` = 5, `sh_il` = 288, dim = 5120) that is
+    /// `5 x bs` launches and `5 x bs` weight passes per MTP block, i.e.
+    /// **20 launches/block of pure repeat traffic**. Unlike the routed half —
+    /// whose rows select DIFFERENT experts, so only its launch count can shrink —
+    /// this one's bytes really do divide by `bs`.
+    ///
+    /// # The four steps, each ONE launch
+    ///
+    /// The caller has already staged the block's fp8 activation with
+    /// `quant1(xn, bs*dim)`; that call IS `quant_fp8(rows = bs, cols = dim,
+    /// block = 32)` — the per-row loop addresses row `r` at `+r*dim` bytes and
+    /// `+r*dim/32` scales, which is exactly that call's layout — so the
+    /// multi-row pass consumes it unchanged. Then:
+    ///
+    /// 1. two `gemm_fp8_mrows` (w1 at `+0`, w3 at `+sh_il`) into a `[bs,
+    ///    2*sh_il]` block in `ex_act`. `gemm_fp8_mrows` is the weight-stationary
+    ///    form of `gemm_fp8_mx`'s **m == 1** program (the kernel header carries
+    ///    the C1-C6 argument), so row `r` is bit-identical to the `m = 1` GEMV
+    ///    the loop issues for row `r`.
+    /// 2. `swiglu_limit_q(rows = bs)` — ONE launch replacing the `swiglu_limit` +
+    ///    `quant1` pair. The kernel indexes `gate_up + r*2*inter`, which IS the
+    ///    layout step 1 wrote (`inter` here is `sh_il`), and its per-(row, block)
+    ///    arithmetic is the fused epilogue `tests_dsv41_glue.cu`'s `swiglu_q` case
+    ///    asserts bit-exact against (`swiglu_limit` + `quant1`). Its fp8 output
+    ///    lands in the SAME `xq`/`xsc` at pitch `sh_il` / `sh_il/32`, which is the
+    ///    activation step 3 reads. `sh_il % 32 == 0` is what lets every 32-element
+    ///    scale block stay inside one warp's tile, and it is checked here.
+    /// 3. `gemm_fp8_mrows(w2)` into `shared_out` at pitch `dim` — the same
+    ///    `[bs, dim]` layout the per-row loop's `shared_out + r*dim` writes, so
+    ///    the `shared_out` unit dump keeps its meaning.
+    ///
+    /// The merge (`add_inplace`) is left to the caller: it is the one element-wise
+    /// step whose operand (`moe_out`) is not scratch, and keeping it outside means
+    /// a decline at any step above is recoverable by the per-row fallback.
+    ///
+    /// # Fallback (the reference this was verified against)
+    ///
+    /// `Ok(false)` — leaving the per-row loop to run — when `bs` is outside the
+    /// kernels' 1..=8 dispatch, `sh_il % 32` / `dim % 32` is non-zero, the `.so`
+    /// predates `dsv41_gemm_fp8_mrows` / `dsv41_swiglu_limit_q`, or any launcher
+    /// declines. A PARTIAL attempt is harmless by construction: `moe_out` is
+    /// untouched by everything above (the caller's `add_inplace` is what writes
+    /// it) and every buffer this pass writes (`ex_act`, `xq`/`xsc`,
+    /// `shared_out`) is either re-quantised or rewritten by the per-row loop.
+    fn shared_expert_mrows(
+        &self,
+        w1: &DevTensor,
+        w1s: &DevTensor,
+        w3: &DevTensor,
+        w3s: &DevTensor,
+        w2: &DevTensor,
+        w2s: &DevTensor,
+    ) -> Result<bool> {
+        let cfg = self.cfg;
+        let (bs, dim, sh_il) = (self.bs, self.dim, self.sh_il);
+        if bs == 0
+            || bs > 8
+            || (sh_il % 32) != 0
+            || (dim % 32) != 0
+            || !self.dev.supports_gemm_fp8_mrows()
+            || !self.dev.supports_swiglu_q()
+        {
+            return Ok(false);
+        }
+        // `ex_act` is `bs * 2 * max(inter_local, sh_il)` f32, so the `[bs,
+        // 2*sh_il]` block this pass stages always fits — unlike the routed
+        // indirect arm, whose stride is `2*inter_local`. It is DEAD by this point
+        // on every arm (the batched one stages in `ex_act_b`, the indirect one
+        // consumed its rows into `moe_out`), which is what makes the reuse safe.
+        debug_assert!(
+            (1..=8).contains(&bs),
+            "shared_expert_mrows: {bs} rows exceed the mrows dispatch"
+        );
+        // 1) w1 | w3 over the SAME staged activation, one weight-stationary GEMV
+        //    each, all `bs` rows folded against it.
+        let stride = (2 * sh_il) as i32;
+        let act = self.ex_act.ptr as *mut f32;
+        let ok1 = self.dev.gemm_fp8_mrows(
+            self.xq.as_u8(),
+            self.xsc.as_f32(),
+            w1.as_u8(),
+            w1s.as_u8(),
+            std::ptr::null(),
+            act,
+            bs as i32,
+            sh_il as i32,
+            dim as i32,
+            stride,
+        )?;
+        let ok3 = self.dev.gemm_fp8_mrows(
+            self.xq.as_u8(),
+            self.xsc.as_f32(),
+            w3.as_u8(),
+            w3s.as_u8(),
+            std::ptr::null(),
+            act.wrapping_add(sh_il),
+            bs as i32,
+            sh_il as i32,
+            dim as i32,
+            stride,
+        )?;
+        if !(ok1 && ok3) {
+            return Ok(false);
+        }
+        // 2) swiglu + the fp8 pair the w2 GEMV reads, all `bs` rows in one launch.
+        if !self.dev.swiglu_limit_q(
+            act,
+            bs as i32,
+            sh_il as i32,
+            cfg.swiglu_limit,
+            self.xq.ptr as *mut u8,
+            self.xsc.ptr as *mut f32,
+        )? {
+            return Ok(false);
+        }
+        // 3) w2 for all rows — w2 is Cols-sharded ([dim, sh_il] locally), so its
+        //    reduction runs over this rank's slice and the OUTPUT stays a partial
+        //    [bs, dim] block, exactly as the per-row arm's rows are.
+        if !self.dev.gemm_fp8_mrows(
+            self.xq.as_u8(),
+            self.xsc.as_f32(),
+            w2.as_u8(),
+            w2s.as_u8(),
+            std::ptr::null(),
+            self.shared_out.ptr as *mut f32,
+            bs as i32,
+            dim as i32,
+            sh_il as i32,
+            dim as i32,
+        )? {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// The vocabulary slice the Markov head walks, or `None` for the
