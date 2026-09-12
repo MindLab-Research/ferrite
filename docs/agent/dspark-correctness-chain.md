@@ -1259,3 +1259,15 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 1. GATE_MROWS 的 −2.75ms 验证（应生效——需确认）
 2. VERIFY_HEAD_MROWS 死门修复（head-mrows-deadgate-fix subagent 正在做）
 3. tcgen05 grouped 路径的真 A/B（三件套 gate 链）
+
+## Mrows 完整判词（续）——INDEXER/NORM/COMPRESSOR
+
+| gate | 判定 | 详情 |
+|---|---|---|
+| INDEXER_MROWS | 大概率生效 | 需 3 个符号（gemm_fp8_mrows/apply_rope_mrows/gemv_bf16_v2_mrows）；收益是 launch 数（m=5 每源层省 16 发）|
+| NORM_MROWS | **结构性零收益** | 代码自注："launch count is the same either way"——同几何同字节，只换 kernel 所有权。被误列进"省 ms"清单 |
+| COMPRESSOR_MROWS | 符号时序风险 | dsv41_compressor_fused_mrows 在 46de662 才进 .so——上次测试的 .so 若未在该 commit 后重建则为静默 no-op |
+
+**Mrows 总收益的现实评估**：~3-4ms（GATE −2.75 + INDEXER −1 + COMPRESSOR −0.3），不是原projection的 10+ ms。
+
+**400 的剩余路径**：mrows 3-4ms + tcgen05 6.8ms + draft P3c 3.3ms + SWALLOW_STEP 6.15ms + HC_VERIFY_FUSE 1.3ms ≈ 21ms 总节省 → verify ~16ms + draft 1ms = 17ms 步时。@ accept 3 → 235 tok/s。**仍差 40%**——需要 tcgen05 真正兑现 + accept 达 3+。
