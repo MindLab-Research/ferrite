@@ -1237,8 +1237,8 @@ impl<'a> DsparkDev<'a> {
         )?;
         // the routing decision — the golden harness's `stage{s}.ffn.gate.indices/
         // weights` counterparts, for the MoE-segment diff.
-        self.dump_unit_idx("route_idx", s, self.route_idx.ptr as *const f32 as *const f32, &[bs, topk]);
-        self.dump_unit_idx("route_w", s, self.route_w.ptr, &[bs, topk]);
+        self.dump_unit_idx("route_idx", s, self.route_idx.ptr as *const f32, &[bs, topk]);
+        self.dump_unit_idx("route_w", s, self.route_w.ptr as *const f32, &[bs, topk]);
 
         // The expert weights are fp4; the input row is quantised once for all
         // slots (the reference re-quantises it per expert, which is pure waste).
