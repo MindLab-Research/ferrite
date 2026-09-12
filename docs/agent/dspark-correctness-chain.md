@@ -2988,3 +2988,13 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - hc = 12% × 22.56 = ~2.7ms
 - SH_PAIR = 9.7% × 22.56 = ~2.2ms
 - 总计 ≈ 17.4ms（+ draft 4.3 + commit 0.2 = ~22ms ✓）
+
+## MARKOV_SLICED 的机制（首次 GPU 测试——65326f93 中）
+
+**原理**：Markov head 是 REPLICATED 的 [vocab, mr] f32 矩阵（126 MiB）——每步全量扫描 × 5 步 = 630 MiB/block × 3 blocks = **1890 MiB/draft_forward**。
+
+**MARKOV_SLICED 的切分**：rank r 只扫 [r*seg, (r+1)*seg) 的 16160 行 = **15.8 MiB（L2 可容纳！）** → 5 扫中 4 次是 L2 命中 → HBM 流量从 1890 MiB 降到 ~47 MiB（**40× 减少**）。
+
+**代价**：每步一次 dsv41_argmax_key_pub（v5 轮）= 3 blocks × 5 = 15 额外 v5 轮/draft_forward。但这是对称的（每 rank 同样发 15 轮）——无死锁风险。
+
+**预期**：draft 4.28ms → ~3.5ms（-0.7~0.8ms）
