@@ -70,6 +70,11 @@ pub fn dspark_attention(
     let rd = cfg.rope_head_dim;
     let bs = cfg.dspark_block_size;
     let win = cfg.window_size;
+    // The reference's `seqlen` is `main_x.size(1)`: the backbone hands the draft
+    // a single anchor row, so drafts only ever run with `seqlen == 1`. Keep it
+    // named because every rotary position below is `start_pos + seqlen + r` —
+    // reading it as the block size is the bug this spells out.
+    let seqlen = 1;
 
     if start_pos == 0 {
         // prefill only seeds the ring from the main stream
@@ -89,22 +94,26 @@ pub fn dspark_attention(
         cfg.norm_eps,
     );
     let mut q = matmul(&qr, &w.wq_b, bs, cfg.q_lora_rank, nh * hd);
-    // the reference rotates the queries at [start_pos + seqlen, + block_size):
-    // token r's row sits at position start_pos + bs + r and ALL its nh heads
-    // share that position (per-token rotary, the sglang DSparkAttention
-    // production semantics - fused_q_norm_rope over a per-token `positions`
-    // tensor). The historical call passed (rows=bs, row_len=hd), which only
-    // covered the first bs*hd elements of the [bs, nh*hd] row-major layout -
-    // a transcription bug; each token's head block must be rotated with its
-    // own position.
+    // the reference rotates the draft at
+    // `freqs_cis[start_pos + seqlen : start_pos + seqlen + block_size]`: token
+    // r's row sits at position start_pos + seqlen + r (== start_pos + 1 + r,
+    // `seqlen == 1`) and ALL its nh heads share that position (per-token rotary,
+    // the sglang DSparkAttention production semantics - fused_q_norm_rope over a
+    // per-token `positions` tensor). Two historical transcription bugs live
+    // here: the phase was written `start_pos + bs + r` (reading `seqlen` as the
+    // block size - the device side has always used `pos + 1 + r`), and the call
+    // passed `(rows=bs, row_len=hd)`, which only covered the first bs*hd
+    // elements of the [bs, nh*hd] row-major layout. Each token's head block must
+    // be rotated with its own position.
     for r in 0..bs {
-        let pos_r = start_pos + bs + r;
+        let pos_r = start_pos + seqlen + r;
         let row = &mut q[r * nh * hd..(r + 1) * nh * hd];
         ops::apply_rope(row, nh, hd, rd, &w.freqs, pos_r, 0, false);
     }
     let mut kv = matmul(x, &w.wkv, bs, cfg.dim, hd);
     ops::rmsnorm_rows_pub(&mut kv, &w.kv_norm, hd, cfg.norm_eps);
-    ops::apply_rope(&mut kv, bs, hd, rd, &w.freqs, start_pos + bs, 1, false);
+    // the SAME `freqs_cis` as the queries: row r at start_pos + seqlen + r
+    ops::apply_rope(&mut kv, bs, hd, rd, &w.freqs, start_pos + seqlen, 1, false);
 
     // main KV goes into the ring; the draft block is appended after it
     let mut mk = matmul(main_x, &w.wkv, 1, cfg.dim, hd);
@@ -119,12 +128,13 @@ pub fn dspark_attention(
     let cols = win.min(start_pos + 1) + bs;
     let scale = (hd as f32).powf(-0.5);
     let mut o = ops::sparse_attn(&q, &all_kv, &w.attn_sink, &idxs, 1, bs, nh, hd, win + bs, cols, scale);
-    // inverse rotary, same per-token positions as the queries above: token r's
-    // nh output heads share position start_pos + bs + r. The historical call
-    // stepped the position per HEAD row (step=1 over bs*nh rows), which gave
-    // every head of a token a different position - a transcription bug.
+    // inverse rotary, the same `freqs_cis` as the queries above: token r's nh
+    // output heads share position start_pos + seqlen + r (the reference passes
+    // the very same `freqs_cis` block, inverted). The historical call stepped
+    // the position per HEAD row (step=1 over bs*nh rows), which gave every head
+    // of a token a different position - a transcription bug.
     for r in 0..bs {
-        let pos_r = start_pos + bs + r;
+        let pos_r = start_pos + seqlen + r;
         let row = &mut o[r * nh * hd..(r + 1) * nh * hd];
         ops::apply_rope(row, nh, hd, rd, &w.freqs, pos_r, 0, true);
     }

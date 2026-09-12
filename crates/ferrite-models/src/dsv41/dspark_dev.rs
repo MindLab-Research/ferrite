@@ -279,13 +279,16 @@ fn draft_attn_bf16() -> bool {
 }
 
 /// DRAFT BF16 ACTIVATION DOMAIN gate (`DSV41_DRAFT_BF16_DOMAIN`, DEFAULT OFF):
-/// rounds the draft's two f32 activations whose official counterparts are bf16
-/// tensors — the head's `normed` input (draft-numerical-audit C#8) and the MoE
+/// rounds the draft's f32 activations whose official counterparts are bf16
+/// tensors — the head's `normed` input (draft-numerical-audit C#8), the MoE
 /// block's `xn` input (C#9: the gate's `F.linear`, and the act_quant that feeds
-/// the routed experts, both read the SAME bf16 ffn input). ONE flag covers the
-/// pair on purpose: the two sites are the same defect (an f32 activation handed
-/// to weights calibrated for a bf16 one) and a half-on state would just add
-/// noise to the A/B. Read once and cached (the house rule — never per-call).
+/// the routed experts, both read the SAME bf16 ffn input), the attention's `o`
+/// before the wo_a quantiser (p04-woa-format: the official einsum consumes a
+/// bf16 `o` with no act_quant), and the attention's `wo` (the official
+/// `o_lora`) before the wo_b quantiser. ONE flag covers them on purpose: they
+/// are all the same defect (an f32 activation handed to weights calibrated for
+/// a bf16 one) and a half-on state would just add noise to the A/B. Read once
+/// and cached (the house rule — never per-call).
 fn draft_bf16_domain() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -1921,6 +1924,28 @@ impl<'a> DsparkDev<'a> {
         //
         // Ok(false) = stale .so or a declined shape/mode: the per-(group, row)
         // loop below produces the same numbers by construction.
+        //
+        // ATTN-OUT BF16 DOMAIN (p04-woa-format; `DSV41_DRAFT_BF16_DOMAIN`, default
+        // OFF): the official DSparkBlock's `sparse_attn` writes `o` in the MODEL
+        // dtype — `torch.empty_like(qk_out)`/bf16 (model.py:1102-1120) — and the
+        // grouped low-rank projection consumes that bf16 tensor through
+        // `einsum(o, wo_a)` with NO `act_quant` on the activation. ferrite's `o` is
+        // f32 and `quant1` below casts it straight to e4m3, an activation-domain
+        // error the official path never takes: ~2-3.6% RMS for e4m3 vs ~0.06% for
+        // bf16. THIS is the real source of the wo_a projection's 2-4% error — the
+        // audit's "bf16 weights" claim was disproved (the checkpoint's wo_a IS fp8
+        // and `wo_a_grouped_fp8` below stays exactly as it was). The in-place RN
+        // round-trip puts `o` in the domain the official einsum reads, so the
+        // quantiser's input is the bf16 value rather than the un-rounded f32 one.
+        // `o`'s lifecycle: its last f32-precision reader is `rope_queries_inv`
+        // above and `quant1` here; after this point the buffer is only WRITTEN
+        // (the wo_b gemm's output at the tail), so no reader needs the f32 bits.
+        // Idempotent with `DSV41_BF16_TRUNCATE` (a re-round of an already-bf16
+        // value is exact).
+        if draft_bf16_domain() {
+            let n = (bs * nh * hd) as i64;
+            self.dev.bf16_roundtrip(self.o.ptr as *mut f32, n)?;
+        }
         self.quant1(self.o.ptr as *const f32, bs * nh * hd)?;
         let wo_a = need(&ld.wo_a, "mtp.*.attn.wo_a.weight")?;
         let wo_a_s = need(&ld.wo_a_scale, "mtp.*.attn.wo_a.scale")?;
@@ -1972,6 +1997,20 @@ impl<'a> DsparkDev<'a> {
         }
         let wo_b = need(&ld.wo_b, "mtp.*.attn.wo_b.weight")?;
         let wo_b_s = need(&ld.wo_b_scale, "mtp.*.attn.wo_b.scale")?;
+        // O-LORA BF16 DOMAIN (p04-woa-format; same `DSV41_DRAFT_BF16_DOMAIN` gate):
+        // the official's `o_lora` — the grouped einsum's output — carries the model
+        // dtype (bf16) and is only `act_quant`ed at the wo_b boundary
+        // (model.py:1121-1135: `o_lora = einsum(...)` then the wo_b matmul's
+        // activation quantiser). ferrite's `wo` is the raw f32 GEMV product, so
+        // `quant1` below quantises a value that never took the official's bf16
+        // rounding (~0.1-0.2% of the activation domain). One in-place round-trip
+        // covers it: `wo`'s ONLY reader after the projection is this `quant1` (the
+        // wo_b gemm consumes the `xq`/`xsc` pair it writes), so nothing wants the
+        // un-rounded f32 bits.
+        if draft_bf16_domain() {
+            let n = (bs * ol_total) as i64;
+            self.dev.bf16_roundtrip(self.wo.ptr as *mut f32, n)?;
+        }
         self.quant1(self.wo.ptr as *const f32, bs * ol_total)?;
         self.dev.gemm_fp8_mx(
             self.xq.as_u8(),
