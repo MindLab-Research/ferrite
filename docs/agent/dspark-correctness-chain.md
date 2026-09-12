@@ -848,3 +848,20 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 - **22.6ms 步时的分解**：draft 4.28 + verify ~18 + commit 0.17；verify ~18ms / 2.08 行 = ~8.65ms/行（vs EAGER 6.15ms）
 
 **结论**：lazy verify 的架构上限（每行付 EAGER 成本）已确认。400 的路径回到 **batched verify + kernel 融合**。
+
+## Draft 链 P3a 折叠分析（当前 4.29ms → 目标 1ms）
+
+**P3a 已实现的 4 项**（默认 OFF，`DSV41_DRAFT_P3A=1`）：
+- a1: hc_collapse+rmsnorm 融合（-1 launch/block）
+- a2: hc_post 双向写（-2/block）
+- a3: premix ping-pong（-1/block）
+- a4: rope mrows（-8/block）
+
+**P3a 未实现的 2 项**（生产 bs=5 不可行）：
+- a5 sparse_attn_orope：o-rope 的位置公式不能给行 r 位置 pos+r
+- a6 WOB_F32：gemm_fp8_mx_f32 是 M=1 无行批
+
+**draft 4.29ms 的剩余结构**（P3a 后）：draft 链跑 5 个 MTP 块（n_mtp=5），每块是完整 3 层 forward（hc+attn+MoE+compressor）。每块 ~0.86ms。要压到 1ms 总：
+- 需要 P3c（draft 链的 CUDA 图化 + 块级 mrows——5 块的 forward 共享权重读）
+- 或 draft 链的深度削减（3 层 MTP 是固定的，不能减）
+- draft 图化：5 块 × ~40 kernel/块 = 200 launch → 图化后 1 launch——预期 -2ms
