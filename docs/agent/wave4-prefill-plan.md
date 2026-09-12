@@ -522,3 +522,29 @@ pub fn prefill_chunk(&mut self, seq: u64, chunk_tokens: &[u32]) -> Result<()> {
 | 6 | **锁步的位置一致性** | 各 rank 的 pos_ctr 独立推进（device 侧）| 同 | **P0-A 的隐藏风险**：1M 下任何一处"按 host 的 pos 分支"（如 indexer 的 host 镜像）在 chunk 边界漏一拍 = **静默截断**——**chunked prefill（P0-B）必须与 pos 的推进严格同流** |
 
 **验证顺序**（P0-A 的准入）: P0-F（内存表 ✓）→ P0-C（KV 口径统一）→ **P0-A**（抬 #1+#2+#3+#4 后跑 32k/128k/512k/1M 的逐步长验证 + `DSV41_PREFILL_BUDGET=512` 的整段-vs-分块 parity）。
+
+---
+
+## 6. P0-C — DSA KV 口径与 1M 的内存可行性（结论：**1M 必须 DCP 式的 KV 分片**，2026-09-12）
+
+**两套口径**（prefill_research_report.md §4 的核实）:
+| 口径 | 每 token 每 DSA 层 | 实现 |
+|---|---|---|
+| **latent**（`ferrite-kv` 页池） | `kv_lora_rank(512) + index_n_heads*index_head_dim(32*128=4096) = 4608` floats | `ferrite-kv/src/lib.rs:212-254` |
+| **kernel 展开**（`DsaCacheState`） | `h*dk + h*dv + 2*h + idm + idm = 64*256+64*256+128+4096+4096 = 41088` floats | `ferrite-kernel/src/cuda.rs:4144-4162` |
+
+**差 8.9×**——展开口径把 MLA 的 latent 按 head 展开成 `h×256`。`MAX_CTX=8100` 的注释自认"每序列 DSA cache ~0.5GB"就是这个口径。
+
+**1M 的账（单序列，TP 下 KV 全复制到每 rank）**:
+| 口径 | 1M | 判定 |
+|---|---|---|
+| latent f32 | `4608×4B×11层×1e6` = **202.8 GB/rank** | ✗ **> 180GB** |
+| latent fp8 | **~101 GB/rank** | ⚠️ 加上权重 76GB/rank = **177GB——180GB 卡的极限**，无 KV 余量给多并发 |
+| kernel 展开 f32 | **~1.8 TB** | ✗ 显然不可行 |
+
+⇒ **结论（P0-A/P0-C 的核心）**：**1M 单序列在当前"KV 全复制 + 展开口径"架构下不可行**。可行的三条路（按代价排序）:
+1. **DCP 式的 KV rank 分片**（**SGLang 的 `--dcp-size 8` 正是这个**——decode context parallel：KV 按 rank 切，attention 跨 rank 做 ring）——每 rank `11×1e6/8×4608×1B ≈ 6.3GB`（fp8）✓ 舒适。**代价**：attention 变成跨 rank 的（额外的通信 kernel）——**研究级**。
+2. **latent fp8 + 极限内存**（101GB KV + 76GB 权重 = 177GB）——**但多并发就没余量了**，与 Wave 5 冲突。
+3. **"latent + 按需展开"**（展开口径只在 attention 的当前 chunk 上物化）——省内存但**流量翻倍**（每步展开/回写）——除非与 DCP 结合否则不解决 1M。
+
+**因此 Wave 4 的 1M 目标与 Wave 3/5 的 KV 工作强耦合**：`ferrite-kv` 的页池（latent 口径）是**正确的基线**——P0-C 的实施 = 让 DSA 的 kernel 侧也吃 latent（去掉 `DsaCacheState` 的展开），再在其上做 P0-A（抬界）与 DCP（如果 1M 是硬指标）。
