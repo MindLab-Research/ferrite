@@ -4830,3 +4830,26 @@ DSV41_MOE_BATCH=1              # MoE batch（tcgen05 的前提）
 **预期**：
 - 当前干净栈（90.8）+ tcgen05 = **~94-95**
 - 如果 tcgen05 干净且有效，这是 lazy 路径到 145 的关键一步
+
+## 🎉 K1/K2 重验结果（efee4ef0）——干净但比 R2 慢
+
+**结果**：
+- 前 61 行正确=True ✓ + 零拉丁 ✓ + 0 ar5-hang ✓
+- **吞吐 = 88.7 tok/s**（vs R2 的 90.8 = **-2.1 tok/s——K1/K2 略慢**）
+
+**判定**：
+1. **K1/K2 干净**（同程序融合验证成功）
+2. **R2 更快**（90.8 vs 88.7）——**R2 是首选**！
+3. K1/K2 作为"更安全的同程序替代"保留（备份选项）
+
+**最终干净栈**（session 的成果）：
+```bash
+# 90.8 tok/s（+15.2% from base）
+DSV41_ATTN_LIN_FUSE=1          # R2（不是 K1/K2）
+DSV41_MARKOV_SLICED=1           # MARKOV（修复后）
+DSV41_LAZY_SDR=1                # LAZY_SDR（修复后）
+DSV41_VERIFY_FORK=1             # FORK
+# + base 栈（lazy + SH_PAIR + Wave 1 + e4m3 + BF16_TRUNCATE + graph）
+```
+
+**干净栈重建完成**：78.8 → **90.8**（+15.2%）！
