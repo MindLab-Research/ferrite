@@ -1064,3 +1064,13 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 修复：`seed_window(s, pos-1)` → `seed_window(s, pos)`（官方 model.py:1039/:1065 的 start_pos 语义）。这是 accept 1.02 的**头号嫌疑**——所有 main-chain KV 的相对距离系统性偏 1。
 
 ## P0-3（tap 采集点）和 P1-5（head/gate 截断）正在 subagent 实现
+
+## P0-1 第二部分（win_rows 包含性）的分析
+
+**win_rows 的两条路径**：
+- 默认：`(win.min(pos), 0)` — 从 slot 0 复制 min(win, pos) 行，**pos ≥ win 时包含 pos%win**（seed 槽）✓
+- SEED_ALIGN：`min(win-1, pos)` — **排除** pos%win（注释说"块自己的行 0 拥有该槽"）
+
+**seed 修复后的语义**：seed 现在写 pos%win（= 官方的 start_pos%win）。默认路径的窗口包含它 → 官方的 `arange(min(win, start_pos+1))` 语义 ✓。**默认路径无需改动**——win_rows 的排除逻辑只在 SEED_ALIGN 路径（而 SEED_ALIGN 与 P0-1 修复互斥）。
+
+**待验证**：GPU 测试（079ffbaf）的 accept 变化——如果 seed 修复后 accept 仍低，win_rows 的包含性需要复查。
