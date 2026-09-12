@@ -148,3 +148,31 @@ lazy 数学上限 ~145（k_emit × c_row）。400 需要：
 2. SH_PAIR M=6 验证（-4.9~7.9ms）
 3. mrows 族验证
 4. 400 冲刺！
+
+---
+
+## 🎉🎉🎉 SWALLOW 完全解锁（Session 的终极突破！）
+
+**engram 修复后的决定性测试（c900216e）**：
+- **PANIC = 0** ✓✓✓（engram slot 修复生效——check_payload 不再触发！）
+- **CANARY/GUARD/RESET = 0** ✓✓✓（OOB 修复效果保持！）
+- **ar5-hang = 0** ✓✓✓
+- **LEN=387, completion=300** ✓✓✓（正常生成——达到 max_tokens！）
+- **拉丁=[]** ✓
+- **吞吐 56.6 tok/s**（含 V5_LEDGER 观测开销）
+- **Ledger 证明 arm=swallowed 正常运行**（k_emit=1/2, delta=86/步, canary 全程清洁）
+
+**11 次修复的完整旅程**：
+```
+1-8: 各种尝试 → 全失败
+9: epoch pad → 幻影（从未实施！）
+10: 真 pad → epoch 冻结 54 → OOB 根因发现 → OOB 修复 → 验证成功
+→ check_payload 抓到 engram 147456 越界 → slot 增大修复 → SWALLOW 完全解锁！
+```
+
+**修复链的核心武器**：
+1. **P1 witness + canary**（设备侧证词——绕过 host 观测歧义）
+2. **check_payload**（把静默损坏变成响亮失败）
+3. **guard band**（reduced 溢出在到达 epoch 前被拦截）
+
+**batched 路径现在可用！** 下一步：纯净基线测量 → SH_PAIR M=6 → mrows → 400 冲刺！
