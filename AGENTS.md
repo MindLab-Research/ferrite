@@ -2036,3 +2036,15 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **剩余**：文本**重复加剧**（"全文全文"、"先帝创业帝创业"）——这是 **verify 的 interleave 缺陷**的直接后果（verify-parity-audit 判词：`sparse_attn`/`indexer_rows` 在全部 append 之后统一跑，读"块末 clen"→ 行 0 的候选含本块未来 latent → argmax 退化为重复刚看到的 token）。interleave-rows-fix 正在把 attention 的读侧逐行化（sparse_attn 改 b=1,m=1 单行调用——与 eager 同形状 = parity 保障）。
 
 **性能状态**：verify 38.85ms（5 行 = 7.77ms/行 > 单行图化 6.15ms/行——batch 收益未兑现）。400 路径的完整账本在 `docs/agent/dspark-perf-400-plan.md`（3 阶段：多行化+图化 → ≤8ms；吞主链步 −4.5ms；confidence-gated verify）。
+
+## 2026-09-12 Wave 2：accept 链错位（第十修的半成品）——33% 匹配率的真因
+
+**发现路径**（3434a9ad 的 DBG 数据分析）：`verify_out[0]==next` 仅 16%、`drafts[0]` vs `next` 匹配 ~33%——**33% ≈ 相邻位置的预测相关水平**，是"比较对象错位一位"的指纹。
+
+**根因**：**第十修**（fix #10）把 draft 的块改成"下一位置视角"——块行 j 位于 `pos+1+j`，所以 **`drafts[j]` 预测 `pos+2+j`**——**但 accept 链还留在旧设计**（`drafts[0] == next` 是拿一个 pos+2 的预测去比 pos+1 的 token）。
+
+**正确链**（与 verify 的行位置自洽）：verify 行 j 被喂 `drafts[j]` @ `pos+1+j`（step_rows 的 pos_base+row），它的 argmax 就在同一个 `pos+2+j`——**逐索引比较 `drafts[j] == verify_out[j]`**（j=0..4）。`next`（单行步的 argmax = pos+1 的 token）是确定值，**永远 emit**，排在 verify 各行的前面。
+
+**修复**（spec + shadow 两条路径同步）：`if drafts[0]==next { … drafts[j]==verify_out[j-1] }` → `while drafts[k] == verify_out[k] { k += 1 }`。
+
+**教训（bug 模式）**：**语义重构（"块从 t0@pos 视角改成 @pos+1 视角"）必须把整条消费者链一起改**——生产者（draft 块）、验证者（verify 行位置）、判定者（accept 比较）、提交者（commit 的行基址）四者的"位置约定"必须同一次改完并在注释里写成一个不变量。第十修只动了生产者与验证者。
