@@ -866,8 +866,7 @@ constexpr int kGateUpKsplitMax = 8;
 static int dsv41_gateup_ksplit(void) {
     static int cached = -1;
     if (cached < 0) {
-        int v = 1;  // PDEPTH default OFF: serve A/B showed depth 2 and 5 are each +0.04ms regression
-                    // (occupancy loss > latency hiding in serve; isolated IPC gain doesn't translate)  // K-split default ON (A/B verified: 6.90->6.57ms, -0.33ms)
+        int v = 2;  // K-split default ON (A/B verified: 6.90->6.57ms, -0.33ms)
         if (const char* e = getenv("DSV41_GATEUP_KSPLIT")) {
             v = atoi(e);
             if (v < 1) v = 1;
@@ -963,7 +962,8 @@ constexpr int kGateUpPfDepthMax = 5;
 static int dsv41_gateup_pipeline(void) {
     static int cached = -1;
     if (cached < 0) {
-        int v = 2;
+        int v = 1;  // PDEPTH default OFF: serve A/B showed depth 2 and 5 are each +0.04ms regression
+                    // (occupancy loss > latency hiding; isolated IPC gain doesn't translate)
         if (const char* e = getenv("DSV41_GATEUP_PIPELINE")) v = atoi(e);
         if (v < 1) v = 1;
         if (v > kGateUpPfDepthMax) v = kGateUpPfDepthMax;
