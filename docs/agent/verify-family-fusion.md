@@ -508,3 +508,29 @@ submit，而是 GPU 侧那一段（~3.3µs）。**融合的收益主要来自把
 2. Rust 侧 `attention_rows` 构造 `clen_rows: [i32; VERIFY_ROWS]`（每行的 compressor len 快照）
 3. **r 绝不进 grid.y**（因果序——audit defect #2 的教训）：grid = (b, m×h)，行维度在 blockIdx.y 的低段
 4. ring/window 合核：`ring_append` 与 `window_idxs` 的 m 行批版
+
+## 全景修正：37.31ms 的完整分解（verify-ms-breakdown 的账本）——"其他 7.7ms"的谜底
+
+之前我只看了族清单的 ~29.6ms，漏掉的 7.7ms 是：
+- **投影族（wq_a/wkv/wq_b/wo）：3.70ms**（2000 launch，launch 主导）——verify 的每层 4 投影 × 5 行 × 40 层 = 2000 发。mrows 版已存在（`proj_mrows`）但 launch 数没减（还是逐投影逐层发）。**W6 候选：投影的层内 m 合并**（每层 4 发 mrows 而不是 20 发单行）。
+- **all-reduce v5：1.40ms**（240 次 × 17.3µs）——TP8 的 3 核/层 × 40 层 × 2（投影后 + MoE 后）。协议地板。
+- **hc 链：2.96ms**（400 launch，53GB/s 全表最低带宽）——hc_mixes 的 dots+sigmoid+sinkhorn 链。已有 HC_FRONT 融合（tail split）但主链还有 10 发/层。**W7 候选**。
+- engrave 0.42ms、compressor 0.55ms、norm 0.20ms——小项。
+
+**修正后的完整落点**（全部融合兑现后）：
+| 族 | 现在 | 融合后 |
+|---|---|---|
+| routed experts | 8.30 | 8.30（tcgen05 阻塞）|
+| shared expert | 10.40 | ~3.0（staging 修复 + sh_pair + occupancy）|
+| 投影族 | 3.70 | ~1.2（W6 层内 m 合并）|
+| attention | 2.80 | ~1.5（W2 clen_rows）|
+| hc 链 | 2.96 | ~2.0（HC_FRONT 已有 + W7）|
+| gate | 3.44 | ~1.5（GATE_MROWS 已有）|
+| indexer | 2.50 | ~1.5（W1 front 已提交）|
+| head | 1.12 | ~0.4（v1 mrows 进行中）|
+| AR v5 | 1.40 | 1.40（协议地板）|
+| 其他 | 1.17 | 1.17 |
+| **合计** | **37.79** | **~22.0** |
+
+→ 22ms + draft 1ms（P3c）+ commit 0.2 = ~23ms/步 → accept 3 时 **130 tok/s**。
+**400 的缺口**：routed experts 的 8.3ms 是最大单项——tcgen05 是唯一路径（−6.8ms → 15.2ms/步 → 197 tok/s @ accept 3）。**accept ≥4 或 batched verify 的真正 weight-stationary（5 行共享 routed 权重读）才能到 400**。
