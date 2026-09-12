@@ -3021,7 +3021,7 @@ impl<'a> DsparkDev<'a> {
         let head_ptr = (head.ptr() as *const u8).wrapping_add(head_off) as *const c_void;
         let head_rows = draft_head_fold()
             && if head.dtype.as_str() == "BF16" {
-                self.dev.head_gemv_bf16_mrows(
+                self.dev.head_gemv_bf16_v1_mrows(
                     head_ptr,
                     self.normed.ptr as *const f32,
                     self.logits.ptr as *mut f32,
