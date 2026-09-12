@@ -1457,6 +1457,18 @@ impl Device {
         self.rt.has_async_memset()
     }
 
+    /// True when the loaded .so carries the DEVICE-derived window-ring append
+    /// (`dsv41_ring_append`, `dsv41_glue.cu`). The draft's graph gate needs it:
+    /// `seed_window`'s destination used to be the HOST-computed
+    /// `window + (pos % win)*hd`, and a captured `cudaMemcpyAsync` bakes that
+    /// address, so every replay would have appended to the SAME slot. The kernel
+    /// derives the slot from a device counter instead, which is what makes the
+    /// append replay-safe. A stale .so therefore keeps the draft on its direct
+    /// launches (gate refuses).
+    pub fn supports_ring_append(&self) -> bool {
+        self.kernels.ring_append.is_some()
+    }
+
     /// True when the loaded .so carries the load-time gate/up interleave entry
     /// point (`dsv41_interleave_gateup_fp4`, ABI 2). Without it DSV41_EXPERT_ILV
     /// stays inert and the pools keep the plain w1/w3 layout.
