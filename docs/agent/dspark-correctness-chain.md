@@ -1755,3 +1755,25 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 
 **预期**（accept-first-strategy）：每个 +0.1-0.2 → 组合 1.3-1.5
 **之前的组合退化**（0.898）是 SEED_POS 的 off-by-one 问题——现在没有 SEED_POS。
+
+## 当前状态的 400 可达性快照
+
+**accept 战役的结果汇总**：
+| 配置 | accept | 变化 |
+|---|---|---|
+| 基线 | 1.022 | — |
+| P0-3+P1-5 | **1.214** | **+19%（最佳）**|
+| + SEED_POS（q/o 修复）| 1.067 | -12% |
+| + DRAFT_HEAD_FOLD v1 | 1.214 | 不变 |
+| + TAP_BF16+DRAFT_ATTN（S2）| 测试中 | ？ |
+
+**400 乘积约束**：τ/step ≥ 0.4 tok/ms
+- accept 1.214（τ=2.214）→ 需步时 ≤5.54ms（不可达——低于 L5 地板 8-9ms）
+- accept 2.0（τ=3.0）→ 需步时 ≤7.5ms（= sglang verify 水平）
+- accept 3.0（τ=4.0）→ 需步时 ≤10ms
+
+**步时现状**：lazy ~33ms（含截断）→ 需要压缩 3-4×
+**关键阻塞**：
+1. SWALLOW_STEP 的 ar5-hang（m=6 死锁）——正在调查
+2. tcgen05 从未上过 GPU——冒烟脚本就绪
+3. mrows 实测仅 -1.21ms（不是预期的 10+ms）
