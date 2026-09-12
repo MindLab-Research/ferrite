@@ -4100,3 +4100,29 @@ self.dev.gemm_fp8_mx_rope_norm(
 - 如果仍损坏 → 引擎确实退化（wo_a 或 A4 嫌疑恢复）
 
 **同样**：干净 .so 测试（7bf3dfed）也没设 e4m3——**结果也不可靠**！
+
+## BASE 数字损坏的历史引入点分析
+
+**关键问题**：损坏从什么时候开始存在？
+
+**历史测试的数字验证状态**：
+| 测试 | 时间 | 数字验证 | 结果 |
+|---|---|---|---|
+| 早期"EAGER 对照完美 1..100" | session 早期 | ✓（记录了"完美"）| **EAGER 干净** |
+| Wave 1 长文本（数字）| session 中期 | ✗（只查 k_acc）| k_acc=5 5 5 5——**数字未验证** |
+| lazy best config (123a3865) | session 后期 | ✗（只查拉丁+k_acc）| 61/72 损坏（现在确认）|
+| 所有 R2/K1/K2 测试 | session 后期 | ✓ | 61/N 损坏（继承自 base）|
+
+**推论**：
+1. **早期 EAGER 干净** → 引擎本身（模型加载、kernel、TP8）没问题
+2. **Wave 1 数字测试的 k_acc=5** → 可能已经是"一致地错"（draft-verify 同意错误值）
+3. **损坏在 spec 路径**（EAGER 干净 + spec 损坏）——spec 特有的部分：
+   - LAZY_VERIFY 的 per-row 循环
+   - draft 链（draft_forward）
+   - commit（sids_writeback）
+   - verify graph
+
+**下一步的 bisect**（spec-minimal-bisect-design 的输出 + 我的测试计划）：
+1. spec 最小 + e4m3（SPEC+DSPARK+SIDS+e4m3，无其他 gate）——计数数字
+2. 如果干净 → + LAZY_VERIFY → 如果损坏 → lazy 是罪魁
+3. 如果最小 spec 也损坏 → spec 核心路径（draft/commit）有问题
