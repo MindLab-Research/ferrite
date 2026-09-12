@@ -7915,3 +7915,22 @@ ss replay 两边都是**严格线性 fma 链**（旧 unroll 5×、新单步，�
 **会话终态（最终）**：13.28 → **6.15-6.17ms（+115.4%）**，75.3 → **162.1-162.6 tok/s**
 - 9 项优化落地（v8 前）+ **10 项 serve 验证失败/中性**（v8 后，含 swapAB 5 变体）
 - 200 tok/s 的唯一路径 = expert tcgen05 fp4 swapAB（Phase 0 已完成，4-5 人日，下会话执行）
+
+### 会话终态 nsys 分解（6.15ms 基线，2026-09-12 26:00）
+
+| kernel | med µs | 占比* | 备注 |
+|---|---|---|---|
+| gemm_fp8_gemv | 11.0 | 22.6% | 最大项——所有路径已关闭（SIMT compute-bound，swapAB 5 变体中性）|
+| interleave_gateup_fp4 | 2.2 | 22.3% | 加载期一次性（非每步）|
+| hc_dots_late | 15.0 | 9.2% | 侧流（DL_SIDE 有益 +0.06ms）|
+| expert_gateup | 24.1 | 7.4% | tcgen05 目标 |
+| expert_down | 17.4 | 5.3% | tcgen05 目标 |
+| ar_reduce+store+stamp | 7.5+5.6+4.2 | 11.0% | NVLink 协议地板 |
+| hc_mixes_tail | 7.8 | 4.8% | |
+| gemv_bf16_v2 | 9.1 | 3.0% | bf16 无 MMA |
+| misc | — | ~5% | |
+
+*占比为 profile 总时间（含加载）；每步实际占比更高。
+
+**每步口径**：gemv 2.7ms（44%）· expert 2.0ms（32%）· hc/AR/misc 1.45ms（24%）
+**tcgen05 预期**：expert 2.0→0.5-1.0ms → 步 4.65-5.15ms ≈ **194-215 tok/s**
