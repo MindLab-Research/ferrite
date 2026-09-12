@@ -194,6 +194,10 @@ struct Acc {
 };
 std::vector<Acc> g_acc;
 bool g_verbose = false;   // print every EQUAL case (default: only DIFF + a count)
+#ifdef PARITY_FERRITE_RMSNORM
+bool use_ferrite_norm = true;   // --no-ferrite-norm opts out
+float* g_ferrite_scratch = nullptr;
+#endif
 
 Acc& acc(const char* tag) {
     for (auto& a : g_acc)
@@ -438,10 +442,104 @@ void fill_activation(std::vector<float>& v, Pattern p) {
 }
 
 // ===========================================================================
+// THE AMPLIFIER (host-only, bit-exact mirror of fast_round_scale)
+//
+// The root-cause analysis names the mechanism: the fused norm prologue reduces
+// `ss += t * t`, which with --use_fast_math the compiler MAY contract to a
+// single fma.rn (1 rounding) while a different translation unit's plain loop
+// emits FMUL + FADD (2 roundings). That 1-ULP difference in `ss` reaches every
+// normalised element through `inv = rsqrtf(ss/dim + eps)` -- and then
+// `fast_round_scale` AMPLIFIES it: the scale is `2^ceil(log2(amax/448))`, so a
+// block whose amax sits within 1 ULP of a 2^k boundary gets a scale that is
+// TWICE as large, and all 32 fp8 bytes of the block re-quantise at that other
+// scale.
+//
+// `fast_round_scale` is pure integer exponent arithmetic (dsv41_kernels.cu:113),
+// so it mirrors EXACTLY on the host -- no transcendental is involved:
+//
+//     bits = amax * max_inv;  e = exp(bits) - 127 + (mantissa != 0);  -> 2^e
+//
+// What the host CANNOT reproduce is the device's rsqrtf (MUFU.RSQ). So this
+// measurement is a SENSITIVITY probe, not a value prediction: it answers "does
+// a 1-ULP change in the reduction actually flip scales and bytes, and in how
+// many of the k/32 blocks?", which is precisely the multiplier between "one
+// ULP" and "corrupted output".
+// ===========================================================================
+inline float host_fast_round_scale(float amax, float max_inv) {
+    const float p = amax * max_inv;
+    uint32_t b;
+    std::memcpy(&b, &p, 4);
+    const int exp = (int)((b >> 23) & 0xFFu);
+    const uint32_t man = b & 0x7FFFFFu;
+    const int e = exp - 127 + (man != 0 ? 1 : 0);
+    const uint32_t out = (uint32_t)((e + 127) << 23);
+    float r;
+    std::memcpy(&r, &out, 4);
+    return r;
+}
+
+struct Amp {
+    int blocks = 0;         // k / 32
+    int inv_ulp = 0;        // |inv_fma - inv_two| in ULP
+    int fragile = 0;        // blocks with amax/448 within 2 ULP of a 2^k boundary
+    int flips = 0;          // blocks whose 2^k scale differs between the candidates
+    int bytes = 0;          // 32 * flips: the fp8 bytes that re-quantise
+};
+
+Amp measure_amplifier(const std::vector<float>& qr, const std::vector<float>& qw, float eps,
+                      int dim) {
+    Amp a;
+    a.blocks = dim / 32;
+    // The two candidate reductions over the same input.
+    float acc_fma = 0.f, acc_two = 0.f;
+    for (int i = 0; i < dim; ++i) {
+        acc_fma = std::fma(qr[i], qr[i], acc_fma);   // 1 rounding per step
+        acc_two += qr[i] * qr[i];                    // 2 roundings per step
+    }
+    // The host has no MUFU.RSQ; use the same libm form for both candidates so
+    // the comparison is internally consistent.
+    const float inv_fma = std::sqrt(1.0f / (acc_fma / (float)dim + eps));
+    const float inv_two = std::sqrt(1.0f / (acc_two / (float)dim + eps));
+    const uint32_t o1 = f2o(inv_fma), o2 = f2o(inv_two);
+    a.inv_ulp = (int)(o1 > o2 ? o1 - o2 : o2 - o1);
+
+    for (int b = 0; b < a.blocks; ++b) {
+        float m1 = 0.f, m2 = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            const int i = b * 32 + j;
+            m1 = fmaxf(m1, fabsf(qr[i] * inv_fma * qw[i]));
+            m2 = fmaxf(m2, fabsf(qr[i] * inv_two * qw[i]));
+        }
+        const float s1 = host_fast_round_scale(m1, 1.0f / 448.0f);
+        const float s2 = host_fast_round_scale(m2, 1.0f / 448.0f);
+        if (bits(s1) != bits(s2) ||
+            bits(fmaxf(s1, 1e-30f)) != bits(fmaxf(s2, 1e-30f))) {
+            ++a.flips;
+            a.bytes += 32;
+        }
+        // The exact fragile test: scale = 2^ceil(log2(r)) so it flips on a
+        // 1-ULP change in r iff r is exactly a power of two (a decrease drops
+        // it) or just above one within 2 ULP (an increase raises it).
+        const float r = m1 * (1.0f / 448.0f);
+        if (r > 0.0f && std::isfinite(r)) {
+            int e2 = 0;
+            const float f = frexpf(r, &e2);   // r = f * 2^e2, f in [0.5, 1)
+            const float p_half = 0.5f;
+            const float u1 = std::nextafterf(p_half, 1.0f);
+            const float u2 = std::nextafterf(u1, 1.0f);
+            if (f == p_half || f == u1 || f == u2) ++a.fragile;
+        }
+    }
+    return a;
+}
+
+// ===========================================================================
 // device buffers
 // ===========================================================================
 constexpr uint32_t kSentinelBits = 0x7FC0DEADu;   // a quiet NaN, so "untouched"
                                                   // is never a plausible value
+// The host copy of the q_norm weight (the amplifier probe runs on the host).
+std::vector<float> hqn_host;
 void fill_sentinel(std::vector<float>& v) {
     const uint32_t s = kSentinelBits;
     for (size_t i = 0; i < v.size(); ++i) std::memcpy(&v[i], &s, 4);
@@ -548,6 +646,9 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--quick") == 0) quick = true;
         else if (std::strcmp(argv[i], "--verbose") == 0) g_verbose = true;
+#ifdef PARITY_FERRITE_RMSNORM
+        else if (std::strcmp(argv[i], "--no-ferrite-norm") == 0) use_ferrite_norm = false;
+#endif
         else if (std::strcmp(argv[i], "--help") == 0) {
             printf("usage: %s [--quick] [--verbose]\n", argv[0]);
             return 0;
@@ -643,6 +744,7 @@ int main(int argc, char** argv) {
 
         std::vector<float> hqn(kQl);
         for (int i = 0; i < kQl; ++i) hqn[i] = 0.5f + xf() * 1.5f;   // positive, o(1)
+        hqn_host = hqn;
         h2d(d.qnorm, hqn.data(), kQl * 4, "qnorm");
     }
 
@@ -739,6 +841,21 @@ int main(int argc, char** argv) {
             fill_activation(hqr, pat);
             for (int e = 0; e < n_eps; ++e) {
                 const float eps = eps_list[e];
+                // The amplifier probe (host-only, bit-exact fast_round_scale
+                // mirror): how many of the k/32 blocks would re-quantise all
+                // their 32 bytes if the reduction differed by one rounding.
+                {
+                    const Amp am = measure_amplifier(hqr, hqn_host, eps, kQl);
+                    acc("T7.amplifier").cases++;
+                    acc("T7.amplifier").elems += (size_t)am.blocks;
+                    acc("T7.amplifier").bad_elems += (size_t)am.flips;
+                    if (am.flips || am.fragile)
+                        printf("  [T7.amplifier] wseed=%d pattern=%s eps=%.0e: inv differs by %d ULP "
+                               "-> %d/%d blocks change their 2^k scale (%d fp8 bytes re-quantise); "
+                               "%d block(s) sit within 2 ULP of a scale boundary\n",
+                               ws, pattern_name(pat), (double)eps, am.inv_ulp, am.flips, am.blocks,
+                               am.bytes, am.fragile);
+                }
                 for (int pb = 0; pb < n_pos; ++pb) {
                     const int pos = pos_bases[pb];
                     // arm A and arm B must start from the SAME raw bytes.
@@ -789,17 +906,31 @@ int main(int argc, char** argv) {
                         compare("T4.norm", "rmsnorm_q out vs rmsnorm_rows out", read_f32(d.normOut, kQl),
                                 read_f32(d.qrRawB, kQl), kQl);
 #ifdef PARITY_FERRITE_RMSNORM
-                        // and the kernel the verify block uses when
-                        // DSV41_NORM_MROWS is unset.
-                        {
-                            static float* scratch = nullptr;
-                            if (!scratch) cudaMalloc((void**)&scratch, kQl * 4);
+                        // The kernel the verify block ACTUALLY uses when
+                        // DSV41_NORM_MROWS is unset (its default) -- the
+                        // root-cause analysis found the NORM_FUSE prologue's
+                        // equivalence argument was written against the SAME-TU
+                        // `dsv41_rmsnorm_rows` while production runs the
+                        // cross-TU `ferrite_rmsnorm`, which is exactly the hole
+                        // a cross-TU codegen difference (FMA contraction of
+                        // `ss += t*t`) slips through. So this is its own arm.
+                        if (use_ferrite_norm) {
+                            if (!g_ferrite_scratch)
+                                ALLOC(g_ferrite_scratch, kQl * 4, "ferrite_scratch");
                             h2d(d.qrRawA, hqr.data(), hqr.size() * 4, "qrRawA(reload)");
                             const cudaError_t fe =
-                                ferrite_rmsnorm(d.qrRawA, d.qnorm, scratch, 1, kQl, eps, nullptr);
-                            P_CHECK(fe == cudaSuccess, "ferrite_rmsnorm: %s", cudaGetErrorString(fe));
-                            compare("T4.norm", "ferrite_rmsnorm vs rmsnorm_rows", read_f32(scratch, kQl),
+                                ferrite_rmsnorm(d.qrRawA, d.qnorm, g_ferrite_scratch, 1, kQl, eps,
+                                                nullptr);
+                            P_CHECK(fe == cudaSuccess, "ferrite_rmsnorm: %s",
+                                    cudaGetErrorString(fe));
+                            const std::vector<float> hf = read_f32(g_ferrite_scratch, kQl);
+                            compare("T4.norm-ferrite", "ferrite_rmsnorm vs rmsnorm_rows", hf,
                                     read_f32(d.qrRawB, kQl), kQl);
+                            // And the other direction: ferrite_rmsnorm vs
+                            // rmsnorm_q's elementwise output (what the fused
+                            // prologue claims to reproduce).
+                            compare("T4.norm-ferrite", "ferrite_rmsnorm vs rmsnorm_q",
+                                    hf, read_f32(d.normOut, kQl), kQl);
                         }
 #endif
                     }

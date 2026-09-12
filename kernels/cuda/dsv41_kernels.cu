@@ -5819,8 +5819,22 @@ gemm_fp8_mrows_rope_norm_kernel(const float* __restrict__ qr_raw,
         // walk is the same `i += blockDim.x` because the block is the same 1024
         // threads (`<M, 1024>` is the launch), which is the whole point of the
         // header's blockDim note.
+        //
+        // `__fmaf_rn`, NOT the reference's plain `ss += xr[i] * xr[i]`: nvcc
+        // contracts a multiply-add by default (`-fmad=true`), so the standalone
+        // `rmsnorm` kernel -- compiled in its own context -- emits `fma.rn`
+        // (ONE rounding). Here, inlined into a much larger fused kernel, the
+        // compiler is free to DECLINE the contraction and emit `mul.rn` +
+        // `add.rn` (TWO roundings). One ULP on `ss` shifts `inv`, shifts `v`,
+        // shifts the 32-lane `amax`, and `fast_round_scale` is a power-of-two
+        // quantiser: an `amax` that lands within 1 ULP of a 2^k boundary flips
+        // `sc` to the next power of two and re-quantises the whole 32-byte
+        // group. Pinning the intrinsic makes segment 1a independent of the
+        // inlining context and matches what nvcc emits for the reference (see
+        // the header's cross-TU note). The walk, the term order and the reduce
+        // tree are untouched -- only the rounding of each term is fixed.
         float ss = 0.f;
-        for (int i = threadIdx.x; i < k; i += blockDim.x) ss += xr[i] * xr[i];
+        for (int i = threadIdx.x; i < k; i += blockDim.x) ss = __fmaf_rn(xr[i], xr[i], ss);
         // warp reduce - the single-row kernel's tree, verbatim
         float part = ss;
         for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
