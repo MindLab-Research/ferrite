@@ -23,6 +23,10 @@ pub mod device;
 /// Golden-comparison dump of the DSpark path (`DSV41_DSPARK_DUMP=1`): one JSON
 /// line per speculative step with the target tap / drafts / verify argmax.
 pub mod dump_dev;
+/// Per-UNIT golden dump of one DSpark draft forward
+/// (`DSV41_DSPARK_UNIT_DUMP=1`): every intermediate of `draft_forward` in one
+/// JSON object, keyed to match the official `unit_golden.pt`.
+pub mod unit_dump;
 pub mod dspark;
 pub mod dspark_dev;
 pub mod dspark_parity;

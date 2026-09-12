@@ -72,6 +72,13 @@ fn main() {
     // SAME shared ferrite-http launcher. Branch here — nothing below (the GLM
     // config/weights load) applies to this checkpoint.
     if model == "dsv41" {
+        // DSV41_SPEC implies DSV41_DSPARK: without the tap hook there is no
+        // draft and the spec gate silently falls through to the plain
+        // single-row step (observed as "identical numbers to non-MTP").
+        // Arm it here, single-threaded, before anything reads the cached gate.
+        if std::env::var("DSV41_SPEC").map(|v| v != "0").unwrap_or(false) {
+            std::env::set_var("DSV41_DSPARK", "1");
+        }
         let kernels = {
             let k = get_arg("--kernels", "");
             if k.is_empty() { lib.clone() } else { k }

@@ -41,6 +41,7 @@ use crate::dsv41::config::Dsv41Config;
 use crate::dsv41::device::{DevBuf, Device};
 use crate::dsv41::load::{Dsv41DevWeights, DevTensor, LayerDev};
 use crate::dsv41::tp::Collective;
+use crate::dsv41::unit_dump::{self, UnitDump};
 
 /// Grid cap of `dsv41_dspark_markov_head`'s per-block partial scratch; must
 /// match `DSPARK_MARKOV_MAX_BLOCKS` in `kernels/cuda/dsv41_glue.cu`.
@@ -187,6 +188,12 @@ pub struct DsparkDev<'a> {
     n_win_cached: usize,
     /// layer -> its slot in `main_h` (`None` for a layer that is not a target)
     target_slot: Vec<Option<usize>>,
+
+    /// Golden per-unit capture (`DSV41_DSPARK_UNIT_DUMP=1`, see
+    /// [`crate::dsv41::unit_dump`]). `Some` for exactly ONE forward — the first
+    /// `draft_forward` with `pos > 0` on rank 0 — and `None` on every other
+    /// call, so the per-dump check is one `Option` branch when the gate is off.
+    unit: Option<UnitDump>,
 }
 
 fn need<'t>(t: &'t Option<DevTensor>, what: &str) -> Result<&'t DevTensor> {
@@ -333,6 +340,7 @@ impl<'a> DsparkDev<'a> {
             target_slot: (0..cfg.n_layers + cfg.n_mtp_layers)
                 .map(|l| cfg.dspark_target_layer_ids.iter().position(|&t| t == l))
                 .collect(),
+            unit: None,
         };
 
         // `clen` is the compressor-length stand-in `sparse_attn` reads; for the
@@ -586,6 +594,19 @@ impl<'a> DsparkDev<'a> {
         let bs = self.bs;
         let hc = self.hc;
 
+        // ---- golden per-unit capture: arm ONCE, on the first decoded forward ----
+        // `pos == 0` is the prefill window seed (it returns before the blocks), so
+        // it is not a capturable forward; rank != 0 never writes (each TP rank is
+        // its own process, all pointed at the same path).
+        if self.unit.is_none()
+            && self.rank == 0
+            && pos > 0
+            && unit_dump::enabled()
+            && unit_dump::arm_once()
+        {
+            self.unit = Some(UnitDump::new());
+        }
+
         // ---- ids: the backbone's token first, the noise token for the rest ----
         // (dspark.rs::forward_embed; the noise row IS embed[noise_token_id])
         let noise = cfg.dspark_noise_token_id as i32;
@@ -596,6 +617,7 @@ impl<'a> DsparkDev<'a> {
         // ---- forward_embed ----
         // main_x = main_norm(main_proj(concat(target hiddens)))
         self.project_main_x()?;
+        self.dump_unit("main_x", self.main_x.ptr as *const f32, &[dim]);
 
         // h = hc_expand(embed[ids]) — the draft's residual stream starts as the
         // token embedding alone; the main stream enters through the window KV.
@@ -609,6 +631,7 @@ impl<'a> DsparkDev<'a> {
             hc as i32,
             self.vocab as i32,
         )?;
+        self.dump_unit("embed", self.h.ptr as *const f32, &[bs, hc, dim]);
 
         // The window only seeds itself before the first decode step, exactly as
         // the reference does (`dspark_attention` with start_pos == 0).
@@ -651,6 +674,9 @@ impl<'a> DsparkDev<'a> {
                 hc as i32,
                 dim as i32,
             )?;
+            // `h = hc_pre(x, pre_mix)`, the reference's `h(pre_mix)` — taken
+            // BEFORE the in-place rmsnorm below, which is why it is recorded here.
+            self.dump_unit_idx("h_premix_block", s, self.xn.ptr as *const f32, &[bs, dim]);
             self.dev.rmsnorm(
                 self.xn.ptr as *const f32,
                 attn_norm.as_f32(),
@@ -661,6 +687,11 @@ impl<'a> DsparkDev<'a> {
             )?;
 
             self.draft_attention(s, pos)?;
+            // the attention block's own units: q/kv are the post-RoPE projections,
+            // o is the module's output (after wo_b), all still live here.
+            self.dump_unit_idx("q_block", s, self.q.ptr as *const f32, &[bs, self.nh, self.hd]);
+            self.dump_unit_idx("kv_block", s, self.kv.ptr as *const f32, &[bs, self.hd]);
+            self.dump_unit_idx("o_block", s, self.o.ptr as *const f32, &[bs, dim]);
 
             // residual: h = hc_post(o, post, comb)
             self.dev.hc_post(
@@ -701,6 +732,9 @@ impl<'a> DsparkDev<'a> {
             )?;
 
             self.draft_moe(s, ld)?;
+            // the MoE block's output, AFTER its all-reduce (full block on every
+            // rank, not the rank's partial sum).
+            self.dump_unit_idx("moe_out_block", s, self.moe_out.ptr as *const f32, &[bs, dim]);
 
             self.dev.hc_post(
                 self.moe_out.ptr as *const f32,
@@ -717,6 +751,9 @@ impl<'a> DsparkDev<'a> {
                 self.h_out.ptr,
                 (bs * hc * dim * 4) as usize,
             )?;
+            // the block's residual stream once both sub-blocks are in, i.e. the
+            // `h` the NEXT block (or `forward_head`) reads.
+            self.dump_unit_idx("h_block", s, self.h.ptr as *const f32, &[bs, hc, dim]);
 
             // the NEXT block's incoming premix is this block's ffn pre
             self.dev
@@ -725,6 +762,27 @@ impl<'a> DsparkDev<'a> {
 
         // ---- forward_head: collapse, norm, head, then the Markov sampler ----
         self.draft_head()?;
+
+        // ---- serialise the capture (one file per armed forward) ----
+        if let Some(u) = self.unit.take() {
+            let meta = format!(
+                "{{\"pos\":{pos},\"t0\":{t0},\"bs\":{bs},\"hc\":{hc},\"dim\":{dim},\"nh\":{},\
+                 \"hd\":{},\"vocab\":{},\"mr\":{},\"n_target\":{},\"n_mtp\":{},\"world\":{},\
+                 \"rank\":{},\"pid\":{}}}",
+                self.nh,
+                self.hd,
+                self.vocab,
+                self.mr,
+                self.n_target,
+                cfg.n_mtp_layers,
+                self.world,
+                self.rank,
+                std::process::id(),
+            );
+            if let Err(e) = u.write(&meta) {
+                eprintln!("[dspark] unit dump write failed: {e}");
+            }
+        }
         Ok(())
     }
 
@@ -1550,5 +1608,45 @@ impl<'a> DsparkDev<'a> {
     fn upload_i32(&self, dst: &DevBuf, v: &[i32]) -> Result<()> {
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         self.dev.upload_bytes_at(dst, &bytes)
+    }
+
+    // ---- golden per-unit dump (`DSV41_DSPARK_UNIT_DUMP=1`) ----------------
+    //
+    // Every call below is a no-op unless a capture is live, i.e. one branch on
+    // `self.unit` — the gate itself is resolved once, at `draft_forward`'s top.
+    // A failing D2H is LOGGED, never propagated: a debug dump must not answer an
+    // error for a forward whose numbers are otherwise fine.
+
+    /// Record one `f32` unit, `dims` naming its shape.
+    #[inline]
+    fn dump_unit(&mut self, name: &str, ptr: *const f32, dims: &[usize]) {
+        if let Some(u) = self.unit.as_mut() {
+            if let Err(e) = u.push_f32(self.dev, name, ptr, dims) {
+                eprintln!("[dspark] unit dump {name}: {e}");
+            }
+        }
+    }
+
+    /// [`Self::dump_unit`] for a per-block unit: `{prefix}{idx}`. The name is
+    /// only formatted when a capture is live, so the gate-off path allocates
+    /// nothing.
+    #[inline]
+    fn dump_unit_idx(&mut self, prefix: &str, idx: usize, ptr: *const f32, dims: &[usize]) {
+        if let Some(u) = self.unit.as_mut() {
+            let name = format!("{prefix}{idx}");
+            if let Err(e) = u.push_f32(self.dev, &name, ptr, dims) {
+                eprintln!("[dspark] unit dump {name}: {e}");
+            }
+        }
+    }
+
+    /// Record one `i32` unit (the Markov sampler's `ids`).
+    #[inline]
+    fn dump_unit_i32(&mut self, name: &str, ptr: *const i32, dims: &[usize]) {
+        if let Some(u) = self.unit.as_mut() {
+            if let Err(e) = u.push_i32(self.dev, name, ptr, dims) {
+                eprintln!("[dspark] unit dump {name}: {e}");
+            }
+        }
     }
 }
