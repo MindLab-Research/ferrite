@@ -32,6 +32,21 @@
 //   3. ROW INDEPENDENCE + FULL COVERAGE: the buffers are pre-filled with a NaN
 //      sentinel and compared WHOLE, so a kernel that only did row 0 — or that
 //      left a phase-1 tile unwritten — cannot pass.
+//
+//      ⚠️ A SENTINEL MUST BE A VALUE THE KERNEL CANNOT PRODUCE. The phase-1
+//      sentinel is `0x7F`, an e4m3 NaN code: the emit is
+//      `fminf(fmaxf(v/sc, -448), 448)` + a saturating cvt, so 0x7F/0xFF are
+//      unreachable by construction and "still 0x7F" can only mean "never
+//      written". The sentinel used to be `0x5A`, which is an ORDINARY e4m3
+//      value (20.0) sitting in the middle of the emitted distribution — an
+//      unwritten byte and a byte that HAPPENS to quantise to 0x5A were
+//      indistinguishable. [prod/m=6/nolimit] tripped exactly that: its data
+//      quantises 8 of its 1728 elements to 0x5A (histogram neighbours:
+//      0x58=6 0x59=10 0x5A=8 0x5B=9 0x5C=4), so the suite reported "8
+//      phase-1 byte(s) left unwritten" while every byte WAS written and
+//      bit-identical to the M=1 reference. Reproduced on the host with no GPU
+//      (the RNG stream + the phase-1 math alone give the same 8), and the
+//      seven limit=3.0 arms give 0 — which is why only the nolimit arm failed.
 //   4. THE DECLINE PATH: m outside 1..=8, fold_r outside 1..=m, k1/n1 not a
 //      multiple of 32, `aq_stride` not 16-byte aligned, `out_stride < n2` and a
 //      null operand must return 2 (the caller's "keep the per-row chain"
@@ -240,7 +255,12 @@ int sh_case(const char* tag, int m, int fold_r, int n1, int k1, int n2, float li
     ok &= cudaMemcpy(dwus, hwus.data(), bytes_wgs, cudaMemcpyHostToDevice) == cudaSuccess;
     ok &= cudaMemcpy(dw2, hw2.data(), bytes_w2, cudaMemcpyHostToDevice) == cudaSuccess;
     ok &= cudaMemcpy(dw2s, hw2s.data(), bytes_w2s, cudaMemcpyHostToDevice) == cudaSuccess;
-    const std::vector<uint8_t> sentinel_b(bytes_aq, 0x5Au);   // phase-1 sentinel
+    // `0x7F` (an e4m3 NaN code) is the sentinel BECAUSE the kernel cannot emit it:
+    // the emit is a +-448 clamp + a saturating cvt, whose result is never a NaN
+    // code. An ORDINARY byte value (the old `0x5A` = 20.0) is not a usable
+    // sentinel -- a written byte can equal it, and the coverage check below then
+    // counts a real value as "never written" (see the header note).
+    const std::vector<uint8_t> sentinel_b(bytes_aq, 0x7Fu);   // phase-1 sentinel
     ok &= cudaMemcpy(daq_m, sentinel_b.data(), bytes_aq, cudaMemcpyHostToDevice) == cudaSuccess;
     ok &= cudaMemcpy(daq_r, sentinel_b.data(), bytes_aq, cudaMemcpyHostToDevice) == cudaSuccess;
     std::vector<float> sentinel_s((size_t)m * (size_t)nb_k2);
@@ -372,19 +392,36 @@ int sh_case(const char* tag, int m, int fold_r, int n1, int k1, int n2, float li
     }
 
     // (e) coverage: every phase-1 byte and every phase-2 element of every row
-    // must have been written by BOTH sides (NaN sentinel = never written).
+    // must have been written by BOTH sides (sentinel intact = never written).
+    // Phase 1's sentinel is the unreachable e4m3 code 0x7F, so a hit is
+    // unambiguous; phase 2's is the NaN prefill, and a written value is a real
+    // number here (nothing on this path can compute a NaN).
     size_t unwritten_out = 0;
     if (epi_add == 0)
         for (size_t i = 0; i < om.size(); ++i) {
             uint32_t bm, br;
             std::memcpy(&bm, &om[i], 4);
             std::memcpy(&br, &expected[i], 4);
-            if (bm == br && (bm & 0x7FFFFFFFu) > 0x7F800000u) ++unwritten_out;
+            if (bm == br && (bm & 0x7FFFFFFFu) > 0x7F800000u) {
+                if (unwritten_out == 0)
+                    printf("    FAIL [%s] first unwritten out element at r=%zu c=%zu\n", tag,
+                           i / (size_t)n2, i % (size_t)n2);
+                ++unwritten_out;
+            }
         }
     SH_CHECK(unwritten_out == 0, "[%s] %zu phase-2 element(s) left unwritten", tag, unwritten_out);
-    size_t unwritten_aq = 0;
+    size_t unwritten_aq = 0, first_unwritten_aq = 0;
     for (size_t i = 0; i < aqm.size(); ++i)
-        if (aqm[i] == 0x5Au && aqr[i] == 0x5Au) ++unwritten_aq;
+        if (aqm[i] == 0x7Fu && aqr[i] == 0x7Fu) {
+            if (unwritten_aq == 0) first_unwritten_aq = i;
+            ++unwritten_aq;
+        }
+    if (unwritten_aq)
+        // The position makes a REAL gap self-describing: an unwritten byte is a
+        // hole in the (i-tile, row) grid, never scattered.
+        printf("    FAIL [%s] first unwritten aq byte at r=%zu c=%d (m-row 0x%02x m=1 0x%02x)\n", tag,
+               first_unwritten_aq / (size_t)n1, (int)(first_unwritten_aq % (size_t)n1),
+               aqm[first_unwritten_aq], aqr[first_unwritten_aq]);
     SH_CHECK(unwritten_aq == 0, "[%s] %zu phase-1 byte(s) left unwritten", tag, unwritten_aq);
 
     const bool pass = aq_same && aqs_same && out_same && unwritten_out == 0 && unwritten_aq == 0;
