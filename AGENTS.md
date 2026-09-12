@@ -2148,3 +2148,18 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 - 投影 5 个 gemm × 40 层 × 4 = 800；MoE ~1800 → ~360（省 1440）⇒ **共省 ~2200 launch**，按 3.3µs/launch 应省 7.3ms —— **实测只省 2ms**。
 **⇒ `verify-perf-impl` 的 `6232 × (2.9µs submit + 3.3µs exec)` 归因高估了 launch 的权重**。多行化的**真实收益是"权重读一次"**（投影/MoE 的权重流从 m× 降到 1×：投影 ~1.1→0.2ms、MoE ~2.6→0.5ms ≈ **省 3ms**）——**与实测 2ms 吻合** ✓。
 **⇒ 400 的路径必须攻"计算/带宽"**（MoE 的 act/down 权重流、投影的权重流、attention 的 KV 流量），**不是继续砍 launch**。注意这与"融合"并不矛盾：融合（kernel 内 m 行循环）仍能省 launch，但**它的上限就是那几个 launch 的 μs 级开销**——**真正的大头在带宽**。
+
+## 2026-09-12 【铁证】数字序列任务下的 100% 系统性重复 —— 用户判断正确：是编排/位置错，不是算子
+
+**实验**（`DSV41_SPEC=1`，"请从 1 数到 400，每个数字单独一行"）输出：
+```
+1 / 2u3 / 4i4 / 55 / 6外面的6 / 7_rawBy / 7 / 8m8 / 9e9 / 10R10 / 1111 / 1212 / 13,14 / 15P15 / 16+16 / 1717 / 18\18 / 19还是19 / 1920 / 20BJ…
+```
+**每个数字都出现两次**（"55"、"1111"、"1212"、"1717"）——**100% 系统性**。
+
+**用户（权威）判断**："如果真的是乱码不可能表现为这样的重复，你这样的重复必定不是算子层面的错误，而是你的处理/编排逻辑的错误"——**完全正确**：
+- **算子层面的错**（K 序/量化）只会给**近 tie 的偶发翻转**（本会话 verify 的 head 实测 33%→9%）——**不可能 100%**。
+- **100% 的结构性重复** ⇒ **位置/编排错**：`emitted = [next] + verify_out[..k_acc]`，数字任务下 `k_acc=0` ⇒ `emitted = [next, verify_out[0]]`；输出 "11" ⇔ **`verify_out[0] == next`（行 0 的 argmax == 主链在 pos 的 argmax）** ⇒ **verify 的行 0 实际在 `pos`（或其 KV 只到 pos）**，而它**应当**在 `pos+1`（`step_dev` 把 pos_ctr 推到 pos+1 之后，`step_rows` 的 `pos_base = pos_ctr`）。
+- **最可能的 bug 类**：**host 的 `pos`（步前的值）与 device 的 `pos_ctr`（步后的值）混用**——一处用错就把行 0 落回 `pos` ⇒ 行 0 复述 next ⇒ 每步 emit 两个相同 token ⇒ **100% 重复**。
+
+**处置**：起 `verify-row0-systematic`（vanguard，钉死 pos_base/pos_rows/行 0 的 KV）与 `emit-chain-audit`（消费链 + stream true/false 的责任判定）并行彻查。
