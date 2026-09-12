@@ -1905,3 +1905,28 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 6. **发现**：三个 batched expert launcher 的 rows 参数**只做校验不进 grid**（每次调用只算 1 个 activation 行）——draft_moe 曾传 rows=bs 静默只算行 0，已修（逐行调用模式 = moe_rows 的写法）。
 7. **影子模式**（shadow_step，subagent 实现中）：draft+verify 的副作用全回退（ring 槽快照 + compressor 状态 + clen），主链输出与非 spec 逐位一致——先验证 accept 分布（预期 4-5）再上真 commit。
 8. **遗留**：compressor 多行组形成（6 行跨多组未建模）、indexer 块内候选排除（TODO）、verify ~800 launch/步（M2 收）、多行 sliced argmax。
+
+## 2026-09-12 Wave 2 dspark 影子模式：6 个根因的完整修复链（调试方法论实录）
+
+影子模式（draft+verify+全回退，主链输出与非 spec 逐位一致）端到端跑通前的全部根因，按发现顺序：
+
+| # | 根因 | 症状 | 定位手段 |
+|---|---|---|---|
+| 1 | **DecodeRun 用 `?` 吞 rank 错误**（RC0） | 任何 Err 都变 "a rank did not answer"（无日志盲区） | wedge-audit 纠察 |
+| 2 | **snapshot 早于 step_dev**（RC1） | rollback 把真实步的 compressor 提交也回退 → clen 落后 1 → 第二步起污染（"step 1 fine, step 2 dead"） | 同上 |
+| 3 | **rollback 空镜像不早退**（bisect 模式） | 未初始化快照覆盖主链状态 | 二分实验 |
+| 4 | **mtp 权重 shard vs 全局几何**（attn 5 个 tensor + markov） | cuda-700：wq_b 读 4096 行本地切片按 32768 行（+36.7MB OOB）——**微基准通过但 serve 崩的典型**（微基准自建权重无 shard） | 三个 justice 并行审计 |
+| 5 | **MoE 的 TP 几何缺失**（inter_local 没除以 world + shared stp + 无 AR） | cuda-700 续命：shared expert n=2304 读 288 行本地切片 | 同上 |
+| 6 | **all_kv 布局/stride 错位**（满 win 行布局 vs kernel 的 n_win+bs stride 公式） | drafts 完全随机样（[1503, 12235, ...]） | 用户提示 + 手读 kernel |
+| 7 | **draft rope 位置**（pos+bs+r → 最终 pos+r） | drafts 部分变化仍 acc=1 | sglang 证据链仲裁（positions_2d = prefix_lens + arange；我们的 t0 是"已消费"约定 → pos+r） |
+| 8 | **verify 因果窗口失效**（verify_ring_win 的槽号过滤在 base+r≥window 时永不触发 → 行 r 读块内未来行 KV + 丢最旧 m-1-r 历史） | verify 输出垃圾/EOS（除最后一行外全错） | audit-step-rows 纠察 |
+| 9 | **compressor 只吃行 0**（pool 的 state 分支和 commit 的完成规则是 per-POSITION，seqlen=m 只消费行 0） | **用户观察的"latent 没更新"** | 同上 |
+
+**修复后的结构**：attn 全 Replicated（draft 冗余 ~540MB/rank）；MoE 走主链本地几何 + AR；all_kv 紧凑布局（只拷 n_win 活行，块行在 [n_win, n_win+bs)）；rope per-token（行 r = pos+r，所有 head 共享）；verify 窗口逐行交错 append(r)→window_idxs(r)（单行内核保持环不变式，行 r 的窗口在行 r+1 覆盖旧槽前算好）；compressor 逐行单 token 三元组（pos_rows[r] 指针）。
+
+**方法论教训**：
+1. **sticky error 的第一检查点认领一切**——`dsv41_gemm_fp8_mx` 报 700 时真实源可能在前面的任何 kernel；CUDA_LAUNCH_BLOCKING + RC0（错误显形）是定位组合拳。
+2. **微基准无法复现 shard 类 bug**（自建权重无 shard）——serve 环境的越界要在 serve 排。
+3. **kernel 的派生参数公式（n=window+clen）必须与调用侧的缓冲布局自洽**——"凑巧相等"的参数（clen=bs stand-in）掩盖语义错位。
+4. **host 参考的注释是转录者的解读**（"start_pos+seqlen" 的 seqlen 被误读为 bs）——仲裁要找生产实现（sglang）的证据链。
+5. **多行化的正确姿势 = 逐行复用单行内核**（环不变式逐步保持）——"一次多行 + 自定义派生"两处（窗口/压缩器）都出了因果 bug。
