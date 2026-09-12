@@ -1526,6 +1526,167 @@ fn swallow_step() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SWALLOW_STEP").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_LAZY_VERIFY=1` arms the ROW-BY-ROW lazy verify and the lazy ⇄ batched
+/// route ([`DevChain::dspark_spec_lazy`], [`DevChain::lazy_route_decide`]).
+/// Default OFF, so every existing path stays bit-identical.
+///
+/// # What it changes
+///
+/// The swallowed arm runs the whole `[anchor, d1..d5]` block as ONE 6-row
+/// forward (~37 ms) and then rolls the rejected tail back. The lazy arm runs
+/// rows `0, 1, 2, ...` one at a time (`m = 1`, ~6.15 ms each) and STOPS at the
+/// first draft that misses, so a round costs `k_emit` single-row steps instead
+/// of one 6-row block. Because every row it ran is inside the commit's keep
+/// range, the lazy arm needs neither a rollback nor a compressor replay.
+///
+/// # lazy IMPLIES swallow
+///
+/// The block layout is the swallowed one (`[anchor, d1..d5]` at `pos .. pos+5`)
+/// — the lazy arm's row 0 IS the swallowed main-chain step — so this gate also
+/// routes the second-and-later rounds past the legacy arm, exactly like
+/// [`swallow_step`]. The two differ only in the branch they take inside that
+/// block: [`DevChain::lazy_route_decide`] picks between them per round.
+///
+/// The FIRST round of a request always runs the legacy path: it is what supplies
+/// the very first tap (see [`DevChain::spec_primed`]).
+fn lazy_verify() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_LAZY_VERIFY").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_LAZY_THRESHOLD`: the mean-k threshold of the lazy ⇄ batched route.
+/// `auto` (or unset) derives it from the two calibrated step costs
+/// ([`lazy_tau`]); an explicit float overrides it (`0` ⇒ always batched, a
+/// value above `DSPARK_DRAFTS` ⇒ always lazy). Read once per process, like every
+/// other gate here.
+fn lazy_threshold_override() -> Option<f32> {
+    static F: std::sync::OnceLock<Option<f32>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_LAZY_THRESHOLD")
+            .ok()
+            .filter(|s| s != "auto")
+            .and_then(|s| s.parse::<f32>().ok())
+    })
+}
+
+/// The Schmitt hysteresis of the route, in mean-k units (`lazy-batched-gate.md`
+/// §2.3): the arm is STICKY, and only flips when the window's mean-k crosses the
+/// threshold by this much. Without it a window sitting exactly on `τ` would
+/// flip the arm every round and churn the verify graph / AR footprint.
+const LAZY_HYST: f32 = 0.25;
+
+/// The batched arm's verify cost `B` (ms), the numerator of the route rule
+/// `lazy <==> (1 + mean_k) * c < B`. A PROCESS-level quantity: the row
+/// parallelisation the .so does or does not get is a property of the kernel
+/// image, not of a request, and every rank is a thread of the same process — so
+/// one shared cell keeps all ranks on the same `τ` (`lazy-batched-gate.md` §2.2).
+///
+/// It starts at the measured batched verify of the status quo and is refreshed
+/// by every round that RUNS the batched arm. `AtomicU32` holding an `f32`'s bits
+/// because there is no `AtomicF32`; relaxed ordering is enough — the value is a
+/// cost estimate, not a synchronisation token.
+static LAZY_B_MS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x4214_0000); // 37.0f32
+
+/// The frozen default of [`LAZY_B_MS`]: the batched verify measured at HEAD
+/// (`lazy-batched-gate.md` §0-7: `B = 37 ms` ⇒ `τ ≈ 5.0`, i.e. lazy always
+/// wins today, because `mrows` is not dispatching).
+fn lazy_b_ms() -> f32 {
+    f32::from_bits(LAZY_B_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Refresh [`LAZY_B_MS`] from a round that actually ran the batched arm.
+fn lazy_b_ms_note(ms: f32) {
+    if ms.is_finite() && ms > 0.0 {
+        LAZY_B_MS.store(ms.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The EAGER single-row step cost `c` (ms) — the denominator of the route rule.
+/// A constant rather than a measurement: `lazy-batched-gate.md` §2.2 pins it to
+/// the STATUS baseline, and it is the same number the row loop's own cost model
+/// uses (one row = one `step_rows(m = 1)`).
+const LAZY_C_MS: f32 = 6.15;
+
+/// `τ = B / c − 1`: the mean-k at which a lazy round (`(1 + mean_k)` rows) and a
+/// batched round (one `m = 6` block) cost the same. `DSV41_LAZY_THRESHOLD`
+/// overrides it outright.
+fn lazy_tau() -> f32 {
+    if let Some(t) = lazy_threshold_override() {
+        return t;
+    }
+    if LAZY_C_MS > 0.0 {
+        lazy_b_ms() / LAZY_C_MS - 1.0
+    } else {
+        0.0
+    }
+}
+
+/// Which verify arm the sticky route currently sits on. `None` before the first
+/// decision of a request (see [`DevChain::lazy_route_decide`]'s cold start).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    Lazy,
+    Batched,
+}
+
+/// The route's decision window: the last `N` rounds' `k_acc` as a ring of `u8`,
+/// plus the running sum, so `mean_k` is an INTEGER average and every rank
+/// computes the same value from the same window.
+///
+/// # Why integer, and why per-request
+///
+/// The decision must be bit-identical on every rank: AR v5 has no host-side
+/// rendezvous, so ranks that disagreed on the arm would issue different numbers
+/// of collectives in the same epoch and wedge. `k_acc` is the cross-rank
+/// reduction's own output (`dsv41_argmax_sliced_rows`), so a window over it is
+/// identical on every rank BY CONSTRUCTION — no float ever enters the judgement
+/// (`lazy-batched-gate.md` §2.2). The window is per-request state (it resets with
+/// `spec_primed`), while `B`/`c` are process-level, which is what makes `τ` a
+/// rank-invariant too.
+#[derive(Debug, Clone)]
+struct LazyHist {
+    buf: [u8; LAZY_HIST],
+    head: usize,
+    len: usize,
+    sum: u32,
+}
+
+/// How many rounds the window averages over (`lazy-batched-gate.md` §2.2).
+const LAZY_HIST: usize = 32;
+
+impl Default for LazyHist {
+    fn default() -> Self {
+        Self { buf: [0; LAZY_HIST], head: 0, len: 0, sum: 0 }
+    }
+}
+
+impl LazyHist {
+    fn push(&mut self, k_acc: usize) {
+        // `k_acc` is `k_emit - 1 <= DSPARK_DRAFTS`, so the `u8` ring never
+        // saturates in practice; the clamp is here so a caller that ever hands
+        // over something larger degrades to a conservative window instead of
+        // wrapping the mean around.
+        let k = k_acc.min(u8::MAX as usize) as u8;
+        if self.len == self.buf.len() {
+            self.sum -= self.buf[self.head] as u32;
+        } else {
+            self.len += 1;
+        }
+        self.buf[self.head] = k;
+        self.sum += k as u32;
+        self.head = (self.head + 1) % self.buf.len();
+    }
+
+    fn mean_k(&self) -> f32 {
+        if self.len == 0 {
+            0.0
+        } else {
+            self.sum as f32 / self.len as f32
+        }
+    }
+}
+
 /// `DSV41_SEED_ALIGN=1` arms the SEED↔TAP alignment (route A of the draft-quality
 /// arbitration): [`DevChain::dspark_spec_step`] moves the draft block onto the
 /// anchor the tap actually belongs to, and the verify block becomes the 6-row
@@ -1900,6 +2061,34 @@ pub struct DevChain<'a> {
     /// and the dspark spec path is explicitly mutually exclusive with the KV
     /// prefix cache (see `serve.rs`'s gate).
     spec_primed: bool,
+    /// `DSV41_LAZY_VERIFY` only: which verify arm the sticky route is on
+    /// ([`Self::lazy_route_decide`]). `None` until this request's first routed
+    /// round — the cold start decides on the bare threshold, and from then on the
+    /// arm only flips when the window crosses `τ ± LAZY_HYST` (Schmitt).
+    ///
+    /// Reset with `spec_primed`: both describe THIS request's spec sequence.
+    lazy_mode: Option<Arm>,
+    /// `DSV41_LAZY_VERIFY` only: the route's integer mean-k window. Fed from the
+    /// report at the arms' COMMON exit (`dspark_spec_step`), so it averages over
+    /// whatever the live arm produced — that is what lets the route see accept
+    /// drift and switch.
+    lazy_hist: LazyHist,
+    /// `DSV41_LAZY_VERIFY` only: the "deferred tap" mode of the verify's tap hook
+    /// (`layer_rows`).
+    ///
+    /// The tap is written INSIDE the verify's forward, once per target layer, so
+    /// the row it lands on is a host-side launch argument — and the m=1 lazy block
+    /// is always row 0 of its slot. With this set, `layer_rows` writes the row to
+    /// the SINGLE-row tap buffer (`s.dspark_tap`) instead, and the lazy arm copies
+    /// it to row `i` of `s.dspark_tap_r` after each row's forward. Two reasons the
+    /// staging copy beats baking the row into the graph: the destination pointer
+    /// stays IDENTICAL across rows (so one captured `m = 1` graph serves every row
+    /// — the whole point of the lazy arm's graph reuse), and no `k_emit`-many
+    /// graphs are needed.
+    ///
+    /// Cleared in [`Self::reset`]; always `false` on every non-lazy path, so the
+    /// hook's behaviour there is bit-identical.
+    spec_tap_deferred: bool,
     // ---- the DSpark verify's own CUDA graph (`DSV41_VERIFY_GRAPH=1`) ----
     //
     // `step_rows` is ~7000 launches per verify (40 layers x ~170 nodes), and
@@ -2288,6 +2477,9 @@ impl<'a> DevChain<'a> {
             spec_capture: false,
             verify_recording: false,
             spec_primed: false,
+            lazy_mode: None,
+            lazy_hist: LazyHist::default(),
+            spec_tap_deferred: false,
             verify_graphs: [None; VERIFY_GRAPH_SLOTS],
             verify_shapes: [0; VERIFY_GRAPH_SLOTS],
             verify_graph_failed: [false; VERIFY_GRAPH_SLOTS],
@@ -2762,6 +2954,13 @@ impl<'a> DevChain<'a> {
         // The next request's first spec step bootstraps again (its standalone
         // `step_dev` is what supplies the very first tap).
         self.spec_primed = false;
+        // The lazy route is per-request too: the window must not carry the
+        // PREVIOUS request's accept rate into this one's first routed round, and
+        // the sticky arm must not survive a request boundary (`lazy-batched-gate.md`
+        // §2.4). `B`/`c` are deliberately NOT reset — they are process-level.
+        self.lazy_mode = None;
+        self.lazy_hist = LazyHist::default();
+        self.spec_tap_deferred = false;
         // `reset` runs at the START of a request, so this reports the PREVIOUS
         // one: the only place the capture/replay counts of a finished request can
         // be read (the alternative diagnostic is the per-request capture line in
@@ -5796,7 +5995,30 @@ impl<'a> DevChain<'a> {
         // writes the very first tap) and every later round swallows the
         // main-chain step into the verify's anchor row.
         if swallow_step() && self.spec_primed {
-            return self.dspark_spec_swallowed(dspark, token, pos);
+            let rep = self.dspark_spec_swallowed(dspark, token, pos)?;
+            lazy_b_ms_note(rep.verify_ms);
+            return Ok(rep);
+        }
+        // ---- `DSV41_LAZY_VERIFY`: the same block, one ROW at a time ----
+        //
+        // The gate IMPLIES swallow (see [`lazy_verify`]): the lazy arm's row 0 is
+        // the swallowed main-chain step, so a lazy round still pays no `step_dev`.
+        // Inside that block the route picks per round between the row loop and the
+        // single 6-row verify — the SAME choice on every rank, because it is a
+        // function of the integer mean-k window and the process-level `τ`
+        // (`lazy-batched-route.md` §4.3). The window is fed at this common exit,
+        // so both arms update it and the route can see accept drift.
+        if lazy_verify() && self.spec_primed {
+            let use_lazy = self.lazy_route_decide();
+            let rep = if use_lazy {
+                self.dspark_spec_lazy(dspark, token, pos)?
+            } else {
+                let rep = self.dspark_spec_swallowed(dspark, token, pos)?;
+                lazy_b_ms_note(rep.verify_ms);
+                rep
+            };
+            self.lazy_hist.push(rep.k_acc);
+            return Ok(rep);
         }
         // The seed↔tap alignment (`DSV41_SEED_ALIGN`) moves this arm's draft
         // block onto `pos + 1` and widens the verify to 6 rows — a different
@@ -6429,6 +6651,344 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    // =========================================================================
+    // `DSV41_LAZY_VERIFY` — the row-by-row verify arm and its route
+    //
+    // Design: `docs/agent/lazy-batched-gate.md` (route, deferred tap, commit
+    // semantics) and `docs/agent/verify-fusion-arch.md` §3 (row semantics, the
+    // zero-rollback argument). Default OFF: every method here is only reachable
+    // through [`lazy_verify`], so the existing arms are untouched.
+    // =========================================================================
+
+    /// Which arm THIS round takes, given the sticky [`Self::lazy_mode`] and the
+    /// integer mean-k window — the Schmitt trigger of `lazy-batched-gate.md` §2.3.
+    ///
+    /// The verdict is a pure function of (the integer window, the process-level
+    /// `τ`, the sticky arm), so every rank reaches the same one and issues the
+    /// same number of collectives within the round: cross-round mismatches are
+    /// what wedges AR v5, and same-round synchronised switches cannot produce one
+    /// (`lazy-batched-gate.md` §4.3). The two arms claim one verify-graph slot
+    /// each (`m = 1` / `m = 6`), so switching costs no re-capture once both have
+    /// been visited.
+    fn lazy_route_decide(&mut self) -> bool {
+        let tau = lazy_tau();
+        let mk = self.lazy_hist.mean_k();
+        // Two thresholds, one arm: a window sitting on `τ` must not flip the arm
+        // every round, so the arm only moves once the mean crosses the boundary
+        // `LAZY_HYST` away from the threshold.
+        let (lo, hi) = (tau - LAZY_HYST, tau + LAZY_HYST);
+        let use_lazy = match self.lazy_mode {
+            None => mk < tau,
+            Some(Arm::Lazy) => mk < hi,
+            Some(Arm::Batched) => mk < lo,
+        };
+        self.lazy_mode = Some(if use_lazy { Arm::Lazy } else { Arm::Batched });
+        use_lazy
+    }
+
+    /// The lazy arm's commit: move the counter to `pos + k_emit` and do nothing
+    /// else.
+    ///
+    /// [`Self::dspark_commit`] is the BATCHED arm's three-stage commit — roll the
+    /// block's rejected tail back, replay the kept rows through every compressor,
+    /// then move the counter. None of the three applies here, and calling it would
+    /// be WRONG rather than merely slow:
+    ///
+    /// * **no rollback.** Rows run one at a time and the loop STOPS at the first
+    ///   draft that misses, so the rows it ran are exactly the commit's keep range
+    ///   `0..k_emit` (`lazy-batched-gate.md` §3.4) — there is no rejected tail to
+    ///   undo. (The snapshot is still taken per round, but only for the ERROR
+    ///   path: a `step_rows` that fails part-way leaves rows the loop cannot
+    ///   account for, and those DO have to go.)
+    /// * **no replay.** Each row's `step_rows` already committed that row's
+    ///   compressor state, in position order, through the same single-row
+    ///   pool+commit pair `compress_replay` uses — so the compressor after
+    ///   `k_emit` single-row forwards already IS the state `k_emit` sequential
+    ///   decode steps would leave. Replaying the rows would advance
+    ///   `state_kv`/`state_score`/`clen` a SECOND time per row: the double commit
+    ///   `lazy-batched-gate.md` §0-4 calls out as the reason the design's own
+    ///   pseudo-code had to be corrected.
+    /// * **the counter.** `step_rows`' per-row argmax takes a NULL counter, so a
+    ///   block never advances `pos_ctr`; this arm moves it row by row as it goes
+    ///   and this call lands it on `pos + k_emit` — the position of the last
+    ///   emitted token, which is the token the next round embeds.
+    fn dspark_commit_lazy(&mut self, pos: usize, k_emit: usize) -> Result<()> {
+        debug_assert!(
+            (1..=VERIFY_ROWS).contains(&k_emit),
+            "dspark_commit_lazy: k_emit {k_emit} is outside 1..=VERIFY_ROWS"
+        );
+        self.set_pos_ctr(pos + k_emit)?;
+        // The invariant the batched commit also ends on: the host mirror and the
+        // device counter describe ONE committed prefix. Here both advanced through
+        // the same `compress_row` calls, so they agree by construction — which is
+        // exactly what this (free unless `DSV41_INV_CHECK=1`) check is here to
+        // notice if a later edit ever splits them.
+        self.inv_compress_len()?;
+        Ok(())
+    }
+
+    /// Copy the deferred tap of the row just forwarded into that row's own slot of
+    /// the per-row tap block (`dspark_tap_r`), one D2D per target slot.
+    ///
+    /// The staging buffer is `[DSPARK_TAP_SLOTS, dim]`, so slot `s` sits at
+    /// `s * dim` there and at `(s * VERIFY_ROWS + i) * dim` in the block. Those are
+    /// the same two strides the hook and its consumers
+    /// ([`DsparkDev::note_ctx_rows`], [`Self::carry_kept_tap`]) already use, so
+    /// this copy is the ONLY place the row index enters — the consumers need no
+    /// change at all.
+    fn lazy_tap_commit(&self, i: usize) -> Result<()> {
+        debug_assert!(i < VERIFY_ROWS, "lazy_tap_commit: row {i} past the tap block");
+        let row_bytes = self.cfg.dim * std::mem::size_of::<f32>();
+        for slot in 0..DSPARK_TAP_SLOTS {
+            let src = (self.s.dspark_tap.ptr as *const u8).wrapping_add(slot * row_bytes);
+            let dst = (self.s.dspark_tap_r.ptr as *mut u8)
+                .wrapping_add((slot * VERIFY_ROWS + i) * row_bytes);
+            self.dev
+                .memcpy_d2d(dst as *mut c_void, src as *const c_void, row_bytes)?;
+        }
+        Ok(())
+    }
+
+    /// ONE row of the lazy verify: forward `rows_in[i]` at `pos + i`, return that
+    /// row's argmax.
+    ///
+    /// Two host-side corrections are what make a loop of `step_rows(m = 1)` calls
+    /// equivalent to the batched block (`lazy-batched-gate.md` §3.2):
+    ///
+    /// * **the position counter.** `step_rows` reads `pos_base` off the DEVICE
+    ///   counter and builds its block at `pos_base .. pos_base + m - 1`, so a
+    ///   one-row block would forward every row at whatever position the counter
+    ///   last held. Pushing `pos + i` first (a 4-byte H2D) is what puts row `i` at
+    ///   `pos + i`; the graph only READS the counter, so one captured `m = 1` graph
+    ///   serves every row.
+    /// * **the tap.** `layer_rows` writes each target layer's tap at its slot's
+    ///   row 0 for a one-row block, so every row would overwrite row 0 and the
+    ///   commit would read row 0's hidden for all `k_emit` rows. In deferred mode
+    ///   the hook stages the row in the single-row buffer and
+    ///   [`Self::lazy_tap_commit`] copies it to row `i` afterwards.
+    ///
+    /// `spec_capture` stays CLEAR, deliberately: this arm never replays the
+    /// compressor (so the `kvp`/`scp` snapshot would be pure waste) and its tap
+    /// write is handled by the deferred path above.
+    fn lazy_run_row(&mut self, rows_in: &[u32], i: usize, pos: usize) -> Result<u32> {
+        self.set_pos_ctr(pos + i)?;
+        self.spec_capture = false;
+        self.spec_tap_deferred = true;
+        let res = self.step_rows(&rows_in[i..=i]);
+        // Cleared BEFORE the `?`, so a failed row does not leave the hook in
+        // deferred mode for whatever runs next.
+        self.spec_tap_deferred = false;
+        let rows = res?;
+        if rows.len() != 1 {
+            return Err(FerriteError::Config(format!(
+                "dspark_spec_step (lazy): step_rows returned {} rows for a 1-row block",
+                rows.len()
+            )));
+        }
+        self.lazy_tap_commit(i)?;
+        Ok(rows[0])
+    }
+
+    /// The row-by-row ("lazy") arm of [`Self::dspark_spec_step`]
+    /// (`DSV41_LAZY_VERIFY=1`, when [`Self::lazy_route_decide`] selects it).
+    ///
+    /// # What it is
+    ///
+    /// The SAME `[anchor, d1..d5]` block as [`Self::dspark_spec_swallowed`], run
+    /// as one-row forwards in order and stopped at the first draft that misses:
+    ///
+    /// ```text
+    ///   row 0   token       @ pos       -> rows[0], judged against drafts[0]
+    ///   row 1   drafts[0]   @ pos + 1   -> rows[1], judged against drafts[1]
+    ///   ...
+    ///   row i   drafts[i-1] @ pos + i   -> rows[i], judged against drafts[i]
+    /// ```
+    ///
+    /// Row `i`'s argmax predicts `pos + 1 + i` and `drafts[i]` proposes exactly
+    /// `pos + 1 + i`, so the chain is index-aligned and the SHARED
+    /// [`spec_accept`] judges it with `anchor_is_in_block = true` — the same call
+    /// the batched arm makes, which is what keeps the two arms' `k_emit`
+    /// comparable.
+    ///
+    /// # Why the order alone is enough
+    ///
+    /// `step_rows` documents that row `r` sees `[pos_base + r - window + 1,
+    /// pos_base + r]`: row `i`'s attention depends only on rows already in the
+    /// ring. The loop runs `0, 1, 2, ...`, so row `i - 1`'s KV is in the ring
+    /// before row `i` reads it — the causal chain holds with no extra
+    /// synchronisation and no cross-row state to carry.
+    ///
+    /// # Cost shape
+    ///
+    /// `k_emit` single-row forwards. The best case (`drafts[0] != rows[0]`) is ONE
+    /// row — the swallowed main-chain step alone — and the worst (all five drafts
+    /// right) is six, i.e. the batched arm's block. The arm therefore cannot be
+    /// slower than what it replaces, and on a low-accept workload it is far
+    /// cheaper.
+    ///
+    /// # Report
+    ///
+    /// Same shape as the batched arm's, so the driver's mean-k / tok-per-step
+    /// statistics stay comparable. ONE difference to know about:
+    /// `verify_out[j]` for `j >= k_acc` is UNDEFINED here (left at 0) — the
+    /// batched arm fills it with the argmax of the rejected drafts' rows, which
+    /// this arm never forwards. The golden diff must compare `0..k_acc` only.
+    ///
+    /// # Failure
+    ///
+    /// Same contract as the other arms: the block is rolled back before any error
+    /// is returned and `spec_primed` is left alone, so the next round re-runs the
+    /// bootstrapping legacy path. The rollback is the ONLY consumer of the
+    /// snapshot here (see [`Self::dspark_commit_lazy`]), and it is what puts
+    /// `pos_ctr` back as well: a failed loop has already advanced the counter past
+    /// the rows it ran, and the next round must restart from `pos`.
+    fn dspark_spec_lazy(
+        &mut self,
+        dspark: &mut DsparkDev,
+        token: u32,
+        pos: usize,
+    ) -> Result<DsparkSpecReport> {
+        let cfg = self.cfg;
+        // The block's UPPER bound is the swallowed one; how many of its rows
+        // actually run is what the early exit decides.
+        let m = DSPARK_DRAFTS + 1;
+        debug_assert_eq!(m, VERIFY_ROWS, "the swallowed block must fill VERIFY_ROWS");
+
+        // ---- 1. the snapshot: the ERROR PATH's only input. The loop below keeps
+        // every row it runs, so a successful round has nothing to roll back
+        // (`lazy-batched-gate.md` §3.4) — this exists for a round whose
+        // `step_rows` fails part-way.
+        let host_mirrors = self.dspark_snapshot(pos, m)?;
+
+        // ---- 2. the draft, from the tap the PREVIOUS round carried over: this
+        // round's anchor forward is row 0 below, so it has not happened yet.
+        // Identical to the batched arm — same block geometry, same draft geometry.
+        let t = std::time::Instant::now();
+        dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
+        dspark.draft_forward(token, pos)?;
+        let drafts = dspark.drafts()?;
+        let draft_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 3. the row loop: forward, judge, stop at the first miss.
+        let mut rows_in: Vec<u32> = Vec::with_capacity(m);
+        rows_in.push(token);
+        rows_in.extend_from_slice(&drafts);
+
+        let t = std::time::Instant::now();
+        let mut rows: Vec<u32> = Vec::with_capacity(m);
+        let mut fail: Option<FerriteError> = None;
+        match self.lazy_run_row(&rows_in, 0, pos) {
+            Ok(a) => rows.push(a),
+            Err(e) => fail = Some(e),
+        }
+        // The anchor row's argmax is the judge of `drafts[0]`: a miss here emits
+        // the anchor alone (k_emit = 1) and NO other row is forwarded at all.
+        if fail.is_none() && drafts[0] == rows[0] {
+            for i in 1..=DSPARK_DRAFTS {
+                match self.lazy_run_row(&rows_in, i, pos) {
+                    Ok(a) => rows.push(a),
+                    Err(e) => {
+                        fail = Some(e);
+                        break;
+                    }
+                }
+                // Row `i` is judged by `drafts[i]` while `i < DSPARK_DRAFTS`. The
+                // block's LAST row (i = DSPARK_DRAFTS) has no draft left to judge
+                // — but it still has to be forwarded, because when every draft
+                // matched its argmax IS the sixth emitted token. (The pseudo-code
+                // in `lazy-batched-gate.md` §3.1 stops at i = 4, which is one row
+                // short of its own `rows_run == k_emit` invariant: the full accept
+                // needs both row 4's judgement of `drafts[4]` AND row 5's argmax.
+                // The `debug_assert_eq!` below pins the corrected count.)
+                if i < DSPARK_DRAFTS && drafts[i] != rows[i] {
+                    break;
+                }
+            }
+        }
+        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 3b. the error path: the rows the loop ran WERE forwarded and the
+        // ones after the failing row never were, so the block goes back whole
+        // (keep = 0) — and because the loop advances the counter row by row, the
+        // counter goes back to `pos` with it.
+        if let Some(e) = fail {
+            let _ = self.dspark_rollback(pos, m, &host_mirrors);
+            let _ = self.set_pos_ctr(pos);
+            return Err(e);
+        }
+
+        // ---- 4. the accept, through the SAME shared chain as every other arm:
+        // the rows this loop ran are exactly the prefix the comparison needed, so
+        // the result is the EMITTED token count (the anchor plus the surviving
+        // drafts), 1..=m.
+        let k_emit = spec_accept::<u32, u32>(&drafts, &rows, true);
+        debug_assert_eq!(
+            rows.len(),
+            k_emit,
+            "lazy: the rows forwarded must equal the emitted count (rows_run == k_emit)"
+        );
+        let k_acc = k_emit - 1;
+        let next = rows[0];
+        // The legacy report shape: the rows AFTER the anchor, row `j` at
+        // `pos + 1 + j` — the same shift the batched arm applies. Only `0..k_acc`
+        // has a defined value here (see the doc comment).
+        let mut verify_out = [0u32; DSPARK_DRAFTS];
+        verify_out[..k_acc].copy_from_slice(&rows[1..k_emit]);
+
+        // ---- 5. the commit: no rollback, no replay — the rows already committed
+        // their own compressor state, in order (`lazy-batched-gate.md` §0-4).
+        let t = std::time::Instant::now();
+        self.dspark_commit_lazy(pos, k_emit)?;
+        dspark.note_ctx_rows(self.s.dspark_tap_r.ptr as *const f32, m, k_emit, pos)?;
+        // ---- 5b. hand the NEXT round's draft its tap, by the same rule as the
+        // batched arm: the LAST KEPT row is the hidden of the last committed
+        // position.
+        Self::carry_kept_tap(
+            self.dev,
+            self.s.dspark_tap.ptr,
+            self.s.dspark_tap_r.ptr as *const c_void,
+            cfg.dim,
+            k_emit,
+        )?;
+        let commit_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 6. what this step emits: the anchor's argmax plus the argmax of
+        // every accepted row, i.e. `rows[0..k_emit]` — spelled the SAME way as the
+        // batched arm so the arms share one construction and one invariant
+        // (`emitted[i]` is the token at `pos + 1 + i` and `emitted.last()` the
+        // token at `pos + k_emit`, which is the counter the commit just wrote).
+        let mut emitted = Vec::with_capacity(k_acc + 1);
+        emitted.push(next);
+        emitted.extend_from_slice(&verify_out[..k_acc]);
+        // ★ THE s.ids WRITE-BACK — the same invariant every spec arm leaves
+        // behind: at the end of a round `s.ids` holds `emitted.last()`, the token
+        // at the new `pos_ctr`. See the batched arm for why a missing write-back
+        // is only *immediately* fatal for the arms that READ `s.ids`.
+        if sids_writeback() {
+            if let Some(&last) = emitted.last() {
+                self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+            }
+        }
+
+        self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
+        self.inv_ids(pos, &emitted)?;
+        // Set LAST, so a round that failed above leaves the flag alone and the
+        // next round re-runs the legacy bootstrap. ONE flag primes both arms of
+        // the swallow family — the lazy route picks between them per round.
+        self.spec_primed = true;
+
+        Ok(DsparkSpecReport {
+            next,
+            drafts,
+            verify_out,
+            k_acc,
+            emitted,
+            draft_ms,
+            verify_ms,
+            commit_ms,
+        })
+    }
+
     /// Carry the tap the NEXT spec round's draft reads out of the block that just
     /// committed: row `keep - 1` of `dspark_tap_r` — the LAST KEPT row — is copied
     /// into `dspark_tap` (the single-row tap buffer [`DsparkDev::import_tap`]
@@ -6924,7 +7484,15 @@ impl<'a> DevChain<'a> {
         //
         // Gated on `spec_capture`: the shadow step's verify is rolled back whole,
         // so its rows are never committed and the extra launches would buy nothing.
-        if self.spec_capture {
+        // `DSV41_LAZY_VERIFY` adds the DEFERRED variant: the lazy arm runs its
+        // rows one at a time, so this block is always a SINGLE row that must land
+        // at the row index the LAZY ARM knows (the `m = 1` block's own row is
+        // index 0 of its slot, which would overwrite row 0 every time). In
+        // deferred mode the row goes to the single-row staging buffer instead and
+        // the arm copies it to row `i` outside the forward — which keeps this
+        // launch's destination POINTER identical from row to row, so the one
+        // captured `m = 1` graph serves them all (see `spec_tap_deferred`).
+        if self.spec_capture || self.spec_tap_deferred {
             if let Some(slot) = cfg.dspark_target_slot(layer) {
                 // (#7) The tap's row stride. The compile-time `assert!` at
                 // `VERIFY_ROWS` pins `VERIFY_ROWS == DSPARK_DRAFTS + 1`; this is
@@ -6936,11 +7504,27 @@ impl<'a> DevChain<'a> {
                     m <= VERIFY_ROWS,
                     "dspark tap_r: {m}-row block overruns the {VERIFY_ROWS}-row tap slot"
                 );
+                let (dst, rows) = if self.spec_tap_deferred {
+                    // The staging buffer is `[DSPARK_TAP_SLOTS, dim]` — the same
+                    // layout this hook writes for a single-row step, so `slot`
+                    // indexes it identically. ONE row by construction (the lazy
+                    // arm calls `step_rows` with a one-token block).
+                    (
+                        (self.s.dspark_tap.ptr as *mut f32).wrapping_add(slot * dim),
+                        1,
+                    )
+                } else {
+                    (
+                        (self.s.dspark_tap_r.ptr as *mut f32)
+                            .wrapping_add(slot * VERIFY_ROWS * dim),
+                        m,
+                    )
+                };
                 self.dev.hc_collapse(
                     self.s.h_r.ptr as *const f32,
                     self.s.dspark_pre_mean.as_f32(),
-                    (self.s.dspark_tap_r.ptr as *mut f32).wrapping_add(slot * VERIFY_ROWS * dim),
-                    m as i32,
+                    dst,
+                    rows as i32,
                     hc as i32,
                     dim as i32,
                 )?;
