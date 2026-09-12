@@ -10900,7 +10900,8 @@ fn hc_tail_split() -> bool {
                 // the separate swiglu launch.
                 let gateup_fused = !ran_tc && !two && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
-                    && expert_fp4_mode() == 2;
+                    && expert_fp4_mode() == 2
+                    && (dim as i32) % 512 == 0;
                 if !gateup_fused {
                     self.dev.swiglu_limit_batched(
                         self.s.ex_act_b.ptr as *mut f32,
