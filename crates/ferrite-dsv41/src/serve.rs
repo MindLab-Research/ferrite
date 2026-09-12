@@ -342,12 +342,24 @@ fn pool_rank_body(
     // The DSpark draft (shadow mode, DSV41_DSPARK=1): the mtp.* weights are
     // already loaded (`w`); the draft reuses the chain's rope tables — its
     // positions are a subset of the main chain's.
+    //
+    // The draft is TP-aware: its attention tensors are replicated (global
+    // geometry on every rank, no collective), but its MoE is split exactly like
+    // the backbone's, so it needs `world`/`rank` for the local expert slices and
+    // the chain's collective for the MoE all-reduce. `comm` has already been
+    // moved into `chain.comm`, so the Arc is cloned from there.
     let mut dspark = if cfg.dspark_armed() {
-        let mut d = crate::dspark_dev::DsparkDev::new(&dev, &w, cfg)?;
+        let mut d = crate::dspark_dev::DsparkDev::new(&dev, &w, cfg, world, rank)?;
+        if let Some(c) = chain.comm.clone() {
+            d.set_comm(c);
+        }
         let (cos, sin) = chain.rope_tables();
         d.set_rope_tables(cos, sin);
         if rank == 0 {
-            eprintln!("[dspark] shadow mode armed: draft+verify run per step, all effects rolled back");
+            eprintln!(
+                "[dspark] shadow mode armed: draft+verify run per step, all effects \
+                 rolled back (world={world})"
+            );
         }
         Some(d)
     } else {

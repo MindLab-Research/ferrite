@@ -33,12 +33,14 @@
 //!   row — see [`DsparkDev::draft_head`].
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use ferrite_types::{FerriteError, Result};
 
 use crate::dsv41::config::Dsv41Config;
 use crate::dsv41::device::{DevBuf, Device};
 use crate::dsv41::load::{Dsv41DevWeights, DevTensor, LayerDev};
+use crate::dsv41::tp::Collective;
 
 /// Grid cap of `dsv41_dspark_markov_head`'s per-block partial scratch; must
 /// match `DSPARK_MARKOV_MAX_BLOCKS` in `kernels/cuda/dsv41_glue.cu`.
@@ -74,6 +76,18 @@ pub struct DsparkDev<'a> {
     cfg: &'a Dsv41Config,
     w: &'a Dsv41DevWeights,
 
+    // ---- tensor parallelism ----
+    /// TP degree / this rank's index (1 / 0 without a collective). The draft's
+    /// ATTENTION tensors are replicated (every rank maps the GLOBAL head/group/
+    /// vocab geometry), but its MoE is TP-split exactly like the backbone's, so
+    /// the expert and shared-expert slices below are LOCAL and need an
+    /// all-reduce to become the full block.
+    world: usize,
+    rank: usize,
+    /// The collective the MoE's all-reduce runs on; `None` on a single device
+    /// (and the reason a `world > 1` instance refuses to run without one).
+    comm: Option<Arc<Collective>>,
+
     // ---- geometry ----
     dim: usize,
     hd: usize,
@@ -91,8 +105,14 @@ pub struct DsparkDev<'a> {
     vocab: usize,
     mr: usize,
     n_target: usize,
-    /// `inter` padded to the expert MMA K atom (the expert kernels are sized by it)
+    /// `inter / world` padded to the expert MMA K atom (the routed expert
+    /// kernels are sized by it)
     inter_local: usize,
+    /// The SHARED expert's local width: `inter / world` under DSV41_SHARED_TP
+    /// (w1/w3 are `Shard::Rows`), the whole `inter` under the replicated
+    /// rank-0-only layout. NOT padded — the loader slices the rows exactly, and
+    /// the shared GEMM's `n` is a row count, not an MMA K.
+    sh_il: usize,
 
     // ---- draft window rings, one per MTP block (`w.mtp[s]` has its own wkv) ----
     window: Vec<DevBuf>,
@@ -175,7 +195,20 @@ fn need<'t>(t: &'t Option<DevTensor>, what: &str) -> Result<&'t DevTensor> {
 }
 
 impl<'a> DsparkDev<'a> {
-    pub fn new(dev: &'a Device, w: &'a Dsv41DevWeights, cfg: &'a Dsv41Config) -> Result<Self> {
+    /// `world`/`rank` are the tensor-parallel degree and this rank's index. The
+    /// draft's attention runs on the GLOBAL geometry on every rank (its attention
+    /// tensors are `Shard::Replicated`), but its MoE is TP-split like the
+    /// backbone's, so `world` decides the LOCAL expert slices here — under TP8
+    /// the checkpoint's `inter` (2304) is the global number and each rank holds
+    /// `inter / world` (288, padded to 320 by the loader).
+    pub fn new(
+        dev: &'a Device,
+        w: &'a Dsv41DevWeights,
+        cfg: &'a Dsv41Config,
+        world: usize,
+        rank: usize,
+    ) -> Result<Self> {
+        let world = world.max(1);
         let dim = cfg.dim;
         let hd = cfg.head_dim;
         let nh = cfg.n_heads;
@@ -191,7 +224,15 @@ impl<'a> DsparkDev<'a> {
         let mr = cfg.dspark_markov_rank;
         let n_target = cfg.dspark_target_layer_ids.len();
         let inter = cfg.moe_inter_dim;
-        let inter_local = crate::dsv41::weights::padded_inter(inter);
+        // The routed experts are TP-split along `inter` (the loader cuts w1/w3's
+        // rows and w2's columns by world, see weights.rs::load_expert_pool), so
+        // every expert kernel below is sized by the PADDED LOCAL width.
+        let inter_local = crate::dsv41::weights::padded_inter(inter / world);
+        // The shared expert's w1/w3 are `Shard::Rows` only under
+        // DSV41_SHARED_TP; otherwise they are replicated and rank 0 alone
+        // computes them (weights.rs::shared_expert_tp).
+        let stp = crate::dsv41::weights::shared_expert_tp();
+        let sh_il = if stp { inter / world } else { inter };
         if bs == 0 || n_target == 0 || cfg.n_mtp_layers == 0 {
             return Err(FerriteError::Config(
                 "dspark: the config has no draft (dspark_block_size / \
@@ -222,6 +263,9 @@ impl<'a> DsparkDev<'a> {
             dev,
             cfg,
             w,
+            world,
+            rank,
+            comm: None,
             dim,
             hd,
             nh,
@@ -237,6 +281,7 @@ impl<'a> DsparkDev<'a> {
             mr,
             n_target,
             inter_local,
+            sh_il,
             window,
             main_h,
             main_x: dev.alloc(fb(dim))?,
@@ -272,7 +317,11 @@ impl<'a> DsparkDev<'a> {
             scores: dev.alloc(fb(bs * cfg.n_routed_experts.max(1)))?,
             route_w: dev.alloc(fb(bs * cfg.n_activated_experts.max(1)).max(4))?,
             route_idx: dev.alloc(fb(bs * cfg.n_activated_experts.max(1)).max(4))?,
-            ex_act: dev.alloc(fb(bs * 2 * inter_local))?,
+            // Shared by the routed SEQUENTIAL fallback ([bs][2*inter_local]) and
+            // the shared expert ([2*sh_il]); under the replicated shared layout
+            // (DSV41_SHARED_TP=0) `sh_il == inter` is the LARGER of the two, so
+            // the size has to clear both.
+            ex_act: dev.alloc(fb(bs * 2 * inter_local.max(sh_il)))?,
             ex_act_b: dev.alloc(fb(cfg.n_activated_experts.max(1) * bs * 2 * inter_local))?,
             moe_out: dev.alloc(fb(bs * dim))?,
             shared_out: dev.alloc(fb(bs * dim))?,
@@ -309,11 +358,20 @@ impl<'a> DsparkDev<'a> {
             eprintln!(
                 "[dspark] device draft: bs={bs} win={win} hc={hc} dim={dim} hd={hd} nh={nh} \
                  ql={ql} groups={groups} olg={olg} vocab={vocab} mr={mr} targets={n_target} \
-                 inter={inter}/{inter_local} mtp={}",
+                 world={world} rank={rank} inter={inter}/local={inter_local}/shared={sh_il} \
+                 mtp={}",
                 cfg.n_mtp_layers
             );
         }
         Ok(s)
+    }
+
+    /// Hand the draft the rank collective its MoE all-reduce runs on. Must be
+    /// called before the first [`Self::draft_forward`] whenever `world > 1`;
+    /// without it a multi-rank draft refuses to run rather than produce each
+    /// rank's partial sum as if it were the whole block.
+    pub fn set_comm(&mut self, c: Arc<Collective>) {
+        self.comm = Some(c);
     }
 
     /// The main chain's RoPE tables (`cos`/`sin`, `[max_pos][rope_head_dim/2]`),
@@ -821,13 +879,33 @@ impl<'a> DsparkDev<'a> {
     /// The MoE half of a draft block: the gate, the routed experts and the
     /// shared expert. `bs` rows at a time (the host runs `bs` rows through the
     /// same `moe_forward`).
+    ///
+    /// # TP geometry (this is a TP-split MoE, not a replicated one)
+    ///
+    /// The draft's ATTENTION is replicated (every rank holds the whole wq_b /
+    /// wo_a / head and maps the GLOBAL head/group/vocab geometry), but its MoE is
+    /// split exactly like the backbone's — the loader cuts each routed expert's
+    /// `inter` axis by `world` and the shared expert's w1/w3 rows / w2 columns
+    /// when `DSV41_SHARED_TP` is on. So the expert kernels here are sized by the
+    /// LOCAL `inter_local` and the shared pair by `sh_il`, and every rank's
+    /// `moe_out` is only a PARTIAL sum: the all-reduce at the tail (with
+    /// `end_round`, the same pair `DevChain::moe_reduce` issues) is what makes
+    /// the block identical on every rank. Without it each rank would carry
+    /// `1/world` of the MoE — silently, which is worse than a fault.
     fn draft_moe(&mut self, s: usize, ld: &LayerDev) -> Result<()> {
         let cfg = self.cfg;
-        let (dim, bs, inter_local) = (self.dim, self.bs, self.inter_local);
+        let (dim, bs, world, rank) = (self.dim, self.bs, self.world, self.rank);
+        let (inter_local, sh_il) = (self.inter_local, self.sh_il);
         let layer = cfg.n_layers + s;
         let (n_routed, topk) = cfg.moe_config(layer);
         let topk = topk.max(1);
         let n_routed = n_routed.max(1);
+        // Which ranks contribute the shared expert (the backbone's rule verbatim):
+        // all of them under DSV41_SHARED_TP, where each holds its own
+        // `inter / world` slice; rank 0 alone under the replicated layout, where
+        // a second contributor would make the all-reduce sum it `world` times.
+        let stp = crate::dsv41::weights::shared_expert_tp();
+        let shared_rank = if stp { true } else { rank == 0 };
 
         // ---- gate + route ----
         // The gate is bf16 and the GEMV is M=1, so `bs` rows are `bs` launches —
@@ -1000,19 +1078,37 @@ impl<'a> DsparkDev<'a> {
         }
 
         // ---- shared expert (one row at a time: its w1/w3 pair shares the fp8
-        // activation, and the swiglu output is a per-row [inter] block) ----
-        if let (Some(w1), Some(w1s), Some(w3), Some(w3s), Some(w2), Some(w2s)) = (
-            ld.shared_w1.as_ref(),
-            ld.shared_w1_scale.as_ref(),
-            ld.shared_w3.as_ref(),
-            ld.shared_w3_scale.as_ref(),
-            ld.shared_w2.as_ref(),
-            ld.shared_w2_scale.as_ref(),
-        ) {
+        // activation, and the swiglu output is a per-row [sh_il] block) ----
+        // Only the rank(s) that actually contribute it run this half: all of them
+        // under DSV41_SHARED_TP (each computing its own `inter / world` slice of
+        // the Rows-sharded w1/w3), rank 0 alone under the replicated layout
+        // (weights.rs::shared_expert_tp). `shared_rank == false` means the whole
+        // block — including the merge — is skipped, so no stale `shared_out` can
+        // leak into the all-reduce.
+        let sh_w = if shared_rank {
+            match (
+                ld.shared_w1.as_ref(),
+                ld.shared_w1_scale.as_ref(),
+                ld.shared_w3.as_ref(),
+                ld.shared_w3_scale.as_ref(),
+                ld.shared_w2.as_ref(),
+                ld.shared_w2_scale.as_ref(),
+            ) {
+                (Some(a), Some(b), Some(c), Some(d), Some(e), Some(f)) => Some((a, b, c, d, e, f)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some((w1, w1s, w3, w3s, w2, w2s)) = sh_w {
             self.quant1(self.xn.ptr as *const f32, bs * dim)?;
             for r in 0..bs {
                 let a = self.xq.as_u8().wrapping_add(r * dim);
                 let asc = self.xsc.as_f32().wrapping_add(r * dim / 32);
+                // `sh_il` (inter/world under SHARED_TP, inter otherwise) is the
+                // width THIS rank's w1/w3 actually have — asking for `inter_local`
+                // here is what walked 8x past the local slice (`inter_local` is
+                // 320 under TP8, the tensors hold 288 rows).
                 self.dev.gemm_fp8_mx(
                     a,
                     asc,
@@ -1021,7 +1117,7 @@ impl<'a> DsparkDev<'a> {
                     std::ptr::null(),
                     self.ex_act.ptr as *mut f32,
                     1,
-                    inter_local as i32,
+                    sh_il as i32,
                     dim as i32,
                 )?;
                 self.dev.gemm_fp8_mx(
@@ -1030,18 +1126,20 @@ impl<'a> DsparkDev<'a> {
                     w3.as_u8(),
                     w3s.as_u8(),
                     std::ptr::null(),
-                    (self.ex_act.ptr as *mut f32).wrapping_add(inter_local),
+                    (self.ex_act.ptr as *mut f32).wrapping_add(sh_il),
                     1,
-                    inter_local as i32,
+                    sh_il as i32,
                     dim as i32,
                 )?;
                 self.dev.swiglu_limit(
                     self.ex_act.ptr as *mut f32,
                     1,
-                    inter_local as i32,
+                    sh_il as i32,
                     cfg.swiglu_limit,
                 )?;
-                self.quant1(self.ex_act.ptr as *const f32, inter_local)?;
+                self.quant1(self.ex_act.ptr as *const f32, sh_il)?;
+                // w2 is Cols-sharded: [dim, sh_il] locally, so its reduction runs
+                // over this rank's slice and the OUTPUT is a partial [dim].
                 self.dev.gemm_fp8_mx(
                     self.xq.as_u8(),
                     self.xsc.as_f32(),
@@ -1051,7 +1149,7 @@ impl<'a> DsparkDev<'a> {
                     (self.shared_out.ptr as *mut f32).wrapping_add(r * dim),
                     1,
                     dim as i32,
-                    inter_local as i32,
+                    sh_il as i32,
                 )?;
             }
             self.dev.add_inplace(
@@ -1059,6 +1157,30 @@ impl<'a> DsparkDev<'a> {
                 &self.shared_out,
                 (bs * dim) as i64,
             )?;
+        }
+
+        // ---- the MoE all-reduce ----
+        // Both halves above are TP-split, so `moe_out` is a PARTIAL sum and the
+        // full block is its sum over the ranks. The draft must produce the SAME
+        // block on every rank (the verify path re-runs it under each rank's own
+        // chain), so this is not optional — and `end_round` pairs with it exactly
+        // as `DevChain::moe_reduce` does, releasing the round before the next
+        // block's reduce reuses the staging slots.
+        if world > 1 {
+            let Some(c) = self.comm.as_ref() else {
+                // Fail loudly: skipping the AR would look like a working draft
+                // whose MoE is `1/world` of the truth, and the accept-length
+                // statistics would silently collapse.
+                return Err(FerriteError::Config(format!(
+                    "dspark: world={world} but no collective is attached — the draft's MoE \
+                     all-reduce cannot run (call DsparkDev::set_comm before draft_forward)"
+                )));
+            };
+            c.all_reduce_inplace(
+                self.moe_out.ptr as *mut c_void,
+                bs * dim * std::mem::size_of::<f32>(),
+            )?;
+            c.end_round();
         }
         Ok(())
     }
