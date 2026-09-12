@@ -1942,3 +1942,11 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 | 7 | **撤销 mk 替换**：官方块行 0 的 KV 是 **embedding 派生版**（DeepSpec 的 draft 块投影自己的输入）——audit 的"席位规则"（mk 替换）是推断非官方语义，回退；窗口的 pos 槽排除保留（双计修复的真正部分） | DeepSpec 块结构 |
 
 **V4.1 head collapse 的约定事实**：checkpoint 无任何 hc_head key（主链+mtp 都没有）→ pre_mix 是唯一约定 → 主链（attn_pre/slot 1）与 draft 必须同 slot。
+
+## 2026-09-12 Wave 2 修复 #8：时序对齐（anchor=bonus 官方结构）——结构里程碑
+
+**修复**（6 处）：anchor 从"刚消费的 t0"改为**刚采样的 next/bonus**（官方 draft_input_ids[:,0]=bonus，未 forward）——draft 块 [next, noise×4] 从 pos+1 起算（每个 γ 预测覆盖未知 token）；verify 6 行 [next, d1..d5]（anchor 行的 forward 提供 KV）；accept 链 drafts[j] vs verify_out[j]；seed_window 移到 pos-1（main_x 源=anchor 前驱=t0）。
+
+**实测验证**：时序结构生效——verify 的 anchor 行（verify_out[0]）正确预测下一 token（pos=11 的 verify[0]=1767==pos12 的 next=1767 ✓、pos=20 的 verify[0]=26433==pos21 的 next ✓ 多处）。**verify 链 + 时序已正确**。
+
+**剩余瓶颈**：drafts 部分匹配（pos=20 的 drafts[4]==verify[4]=25653、pos=22 的 drafts[1]==verify[1]=1572——部分位置匹配暗示中等数值 bug 而非结构崩坏）。mean-accept 仍 1.02。audit-draft-residual 在查。
