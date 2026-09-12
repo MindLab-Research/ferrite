@@ -403,9 +403,28 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 //                 16-row tile per warp caps the grid at n/16 = 104 warps (0.7 per
 //                 SM on 148 SMs), so nothing on the SM can cover a DRAM round
 //                 trip. Splitting K is the ONLY dimension left that adds warps
-//                 without touching the MMA's M=16. Partial sums are combined with
-//                 atomicAdd (the launcher zeroes `out` first), applied by the
-//                 tg==0 lanes exactly like the plain epilogue.
+//                 without touching the MMA's M=16. Partial sums are combined by
+//                 LAST-BLOCK REDUCTION, applied by the tg==0 lanes exactly like
+//                 the plain epilogue.
+//
+// LAST-BLOCK REDUCTION (ks > 1). The first version zeroed `out` with a
+// cudaMemsetAsync ahead of the kernel and combined the partitions with
+// atomicAdd(&out[r], v). That costs a whole extra GRAPH NODE per call (~0.5 us
+// in graph replay x 246 calls/step = 0.12 ms/step) AND it is non-deterministic:
+// the fp32 add order of the `ks` atomics is whatever the scheduler produced.
+// Now each partition writes its own SLOT (`partial[kp * n + r]`, no contention)
+// and then bumps a per-16-row-tile ticket; the LAST partition of a tile (the one
+// whose atomicAdd returns ks-1) sums the ks slots itself, in a FIXED kp order,
+// adds the bias and stores `out`. Consequences:
+//   * no memset, no graph node, `out` need not be pre-zeroed;
+//   * the reduction order is fixed (kp ascending) => BIT-DETERMINISTIC across
+//     runs, strictly better than the atomicAdd it replaces;
+//   * the bias rides on the reduction instead of on partition 0, so it is added
+//     exactly once and in the same place for every shape.
+// The ticket is caller-supplied memory (one u32 per 16-row tile) and is RESET to
+// 0 by the elected block after its last slot read, so a captured graph replays
+// clean -- the discipline g_hc_ticket / g_hc_mb_done use (see dsv41_glue.cu).
+// It must simply START at zero (cudaMalloc does not zero).
 #ifndef DSV41_SWAPAB_KSTEP
 #define DSV41_SWAPAB_KSTEP 128
 #endif
@@ -438,7 +457,7 @@ __global__ void __launch_bounds__(kSwapabWarps * 32)
 gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                        const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                        const float* __restrict__ bias, float* __restrict__ out, int n, int k,
-                       int ks) {
+                       int ks, float* __restrict__ partial, unsigned* __restrict__ ctr) {
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have started this
     // grid during the producer's tail, so gate the activation reads on the
@@ -587,20 +606,49 @@ gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ 
     // only by tg == 0 (2*tg == 0), so those 8 lanes emit all 16 rows.
     if (tg == 0) {
         const int r0 = m0 + gid, r1 = m0 + gid + 8;
-        // ks == 1 is an ordinary store (deterministic, and `out` is not zeroed);
-        // ks > 1 needs the launcher's memset and atomicAdd for the reduction.
-        // The bias rides on partition 0 so it is added exactly once.
-        float v0 = acc[0], v1 = acc[2];
-        if (kp == 0) {
-            v0 += (bias != nullptr) ? bias[r0] : 0.f;
-            v1 += (bias != nullptr) ? bias[r1] : 0.f;
-        }
+        const float v0 = acc[0], v1 = acc[2];
         if (ks == 1) {
-            out[r0] = v0;
-            out[r1] = v1;
+            // One K partition: an ordinary store (deterministic, no scratch, and
+            // `out` is not pre-zeroed). The bias rides on it directly.
+            out[r0] = v0 + ((bias != nullptr) ? bias[r0] : 0.f);
+            out[r1] = v1 + ((bias != nullptr) ? bias[r1] : 0.f);
         } else {
-            atomicAdd(&out[r0], v0);
-            atomicAdd(&out[r1], v1);
+            // Publish this partition into its OWN slot: no atomic read-modify-
+            // write, so no pre-zeroed `out` and no contention between the ks
+            // partitions of a tile. NO bias here -- the elected reducer adds it.
+            partial[(size_t)kp * n + r0] = v0;
+            partial[(size_t)kp * n + r1] = v1;
+            // Device-scope release: this partition's slots are visible before the
+            // ticket below can be observed. Executed by the publishing lanes; the
+            // __syncwarp() then orders every lane's fence ahead of lane 0's
+            // ticket (the PTX model is cumulative, so that chain is a release).
+            __threadfence();
+        }
+    }
+    if (ks > 1) {
+        __syncwarp();
+        unsigned ticket = 0u;
+        if (lane == 0) ticket = atomicAdd(&ctr[m0 >> 4], 1u);
+        ticket = __shfl_sync(0xffffffffu, ticket, 0);   // 1 warp per tile partition
+        if (ticket == (unsigned)(ks - 1)) {
+            // Last arrival of this 16-row tile: acquire the other partitions'
+            // slots, reduce them in a FIXED order (kp ascending -- that is what
+            // makes the result bit-deterministic), add the bias and store.
+            __threadfence();
+            if (tg == 0) {
+                const int r0 = m0 + gid, r1 = m0 + gid + 8;
+                float s0 = 0.f, s1 = 0.f;
+                for (int q = 0; q < ks; q++) {
+                    s0 += partial[(size_t)q * n + r0];
+                    s1 += partial[(size_t)q * n + r1];
+                }
+                out[r0] = s0 + ((bias != nullptr) ? bias[r0] : 0.f);
+                out[r1] = s1 + ((bias != nullptr) ? bias[r1] : 0.f);
+            }
+            // Self-reset so the next launch / graph replay starts at zero. Safe:
+            // all ks arrivals of THIS tile already happened (the ticket proved it)
+            // and no other block touches this entry before the grid ends.
+            if (lane == 0) atomicExch(&ctr[m0 >> 4], 0u);
         }
     }
 }
@@ -4516,23 +4564,45 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 // Shape requirement: n % 16 == 0 (each warp's whole MMA M tile) and k % 32 == 0
 // (the MMA's K and the scale block). NOT bit-identical to the SIMT gemv (see the
 // kernel's note) -- the caller judges it by text/fingerprint parity.
+//
+// ABI (changed 2026-09-12 for the last-block reduction): `partial` is `ks * n`
+// f32 of scratch and `ctr` is `n / 16` u32 of per-tile tickets, both supplied by
+// the caller (the chain's persistent device buffers). `ctr` must be ZERO before
+// the first call; the kernel self-resets it, so a captured graph replays clean.
+// They are only touched when ks > 1 (the ks == 1 path is a plain store); a null
+// `partial`/`ctr` with ks > 1 declines with 2 so the caller keeps the SIMT gemv.
+// ⚠ the .so MUST be rebuilt with the Rust side: this symbol kept its name but
+// changed its parameter list, so an old .so would read `s` from the wrong slot.
 extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, const uint8_t* w,
                                      const uint8_t* w_scale, const float* bias, float* out,
-                                     int n, int k, cudaStream_t s) {
+                                     int n, int k, float* partial, unsigned* ctr, cudaStream_t s) {
     // Same shape of env probe as the other gates: read ONCE (this runs ~246
     // times per step, so a per-call getenv would be the hot-path slip).
     static const bool no_swapab = getenv("DSV41_NO_SWAPAB") != nullptr;
     if (no_swapab) return 2;
     if (a == nullptr || a_scale == nullptr || w == nullptr || w_scale == nullptr || out == nullptr)
         return 2;
+    // Shape-based dispatch: the isolated sweep showed swapAB wins at n>=1664
+    // (1.76-1.94x SIMT) but LOSES at n<=576 (0.73-0.97x, fixed overhead dominates).
+    // The 246 calls/step mix both; serving the small ones with SIMT is the fix.
+    if (n < 1664) return 2;
     if (n <= 0 || k <= 0 || (n & 15) || (k & 31)) return 2;
 
     // K split: the largest {kSwapabKSplit, .../2, 1} that divides K into slices
     // that are still whole 32-wide scale blocks. K = 5120 gives 4; a K the
-    // macro's value cannot carve falls back through halving to 1 (no atomics, no
-    // memset, deterministic store).
+    // macro's value cannot carve falls back through halving to 1 (no scratch, no
+    // reduction, deterministic store).
     int ks = kSwapabKSplit;
     while (ks > 1 && (k % (32 * ks)) != 0) ks >>= 1;
+    // ks > 1 elects one block per tile, so every warp of a launched block MUST
+    // publish -- a warp that dropped out of the grid would leave its tile's
+    // ticket short of ks and hang the grid on the elected block's arrival. The
+    // grid is exact at kSwapabWarps == 1 (total blocks); this guards a future
+    // WARPS > 1 where total % WARPS != 0.
+    if ((n >> 4) * ks % kSwapabWarps) return 2;
+    // The reduction needs the caller's scratch. Absent it, decline so the caller
+    // runs the SIMT gemv rather than faulting on a null slot store.
+    if (ks > 1 && (partial == nullptr || ctr == nullptr)) return 2;
 
     const int total = (n >> 4) * ks;
     const int blocks = (total + kSwapabWarps - 1) / kSwapabWarps;
@@ -4549,17 +4619,17 @@ extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, con
                                              dsv41_smem_ceiling(gemm_fp8_swapab_kernel));
         if (e != cudaSuccess) return (int)e;
     }
-    // The ks>1 reduction is atomicAdd, so `out` must start at zero. Ordered on
-    // the same stream, so it is captured into the graph ahead of the kernel.
-    if (ks > 1) {
-        cudaError_t me = cudaMemsetAsync(out, 0, (size_t)n * sizeof(float), s);
-        if (me != cudaSuccess) return (int)me;
-    }
+    // NO memset of `out`: the ks > 1 path now writes it through the elected
+    // block's last-block reduction, so the graph node this launcher used to add
+    // is gone (that node was ~0.5 us x 246 calls = 0.12 ms/step in replay).
     // PDL like the rest of the GEMV family: the consumer's setup overlaps the
     // producer's (quant1) tail; cudaGridDependencySynchronize() at the kernel
-    // entry gates the activation reads.
+    // entry gates the activation reads. It also keeps the shared `partial`/`ctr`
+    // scratch safe to reuse across calls: a successor grid's writes only start
+    // after cudaGridDependencySynchronize() returns, i.e. after this grid ended.
     cudaError_t le = dsv41_pdl_or_plain(gemm_fp8_swapab_kernel, dim3(blocks), dim3(kSwapabWarps * 32),
-                                        smem, s, a, a_scale, w, w_scale, bias, out, n, k, ks);
+                                        smem, s, a, a_scale, w, w_scale, bias, out, n, k, ks,
+                                        partial, ctr);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
