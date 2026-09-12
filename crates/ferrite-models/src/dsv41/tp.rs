@@ -206,6 +206,19 @@ impl std::fmt::Debug for Collective {
 }
 
 impl Collective {
+    /// The `DSV41_V5_LEDGER` canary: a magic word parked in the epoch's 64-byte
+    /// tail (`staging + ctr_at + 8`) and written by **no kernel in the tree**.
+    /// The ledger reads it on every epoch read; ANY change is proof that
+    /// something outside the epoch path wrote into its neighborhood — an
+    /// out-of-bounds payload write clobbering the counter (the fix-11 design's
+    /// world A/A3), taken for free on a read the ledger already pays.
+    pub const V5_LEDGER_CANARY: u32 = 0xDEAD_BEEF;
+
+    /// Byte offset of the canary from `ctr_at`. The epoch is at `ctr_at` and
+    /// `A4`'s broadcast flag (`DSV41_AR_SINGLE_POLL`) at `ctr_at + 4`, so the
+    /// canary starts the still-`0`-and-unused tail at `ctr_at + 8`.
+    pub const V5_LEDGER_CANARY_OFF: usize = 8;
+
     /// `staging` is `world * bytes`. The peer addresses are not known until
     /// every rank has allocated theirs, so this starts empty and `set_peers`
     /// fills it after the handshake.
@@ -241,6 +254,19 @@ impl Collective {
         // garbage counter means the stamp is never published and the reduce
         // spins forever — exactly the dev-path hang the micro-benchmark found.
         dev.zero_at(staging.ptr, ctr_at + 64)?;
+        // The v5 ledger's canary: a magic word in the epoch's 64-byte tail that NO
+        // kernel writes, so the ledger can tell "read the epoch" from "read a word
+        // some out-of-bounds payload write clobbered" — the world A/A3 evidence the
+        // fix-11 design's D1 is built to take. See [`Self::V5_LEDGER_CANARY`] and
+        // [`Self::canary_dev`]. Written once, synchronously (cudaMemcpy), so the
+        // stack buffer's lifetime is not an issue.
+        let canary = Self::V5_LEDGER_CANARY.to_le_bytes();
+        dev.upload_from(
+            (staging.ptr as *mut u8).wrapping_add(ctr_at + Self::V5_LEDGER_CANARY_OFF)
+                as *mut std::ffi::c_void,
+            canary.as_ptr() as *const std::ffi::c_void,
+            canary.len(),
+        )?;
         let peer_stamps = dev.alloc(world * 8)?;
         let peer_slots = dev.alloc(world * 8)?;
         let peer_reduced = dev.alloc(world * 8)?;
@@ -330,6 +356,16 @@ impl Collective {
     /// argmax exchange reads and advances.
     pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
         (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut std::ffi::c_uint
+    }
+
+    /// The v5 round LEDGER's canary word (`staging + ctr_at + 8`) — see
+    /// [`Self::V5_LEDGER_CANARY`]. Read-only by design: no kernel writes it, so a
+    /// read that does not match the magic is proof that something outside the
+    /// epoch path wrote into its 64-byte tail.
+    pub fn canary_dev(&self) -> *const std::ffi::c_uint {
+        (self.staging.ptr as *const u8)
+            .wrapping_add(self.ctr_at + Self::V5_LEDGER_CANARY_OFF)
+            as *const std::ffi::c_uint
     }
 
     /// This rank's own ready row (`staging + stamps_at`).

@@ -3399,6 +3399,20 @@ pub struct DevChain<'a> {
     /// [`Self::v5_ledger_note`] is an observation that must not need `&mut self`
     /// at the arms' exits, and lives only while the gate is on.
     v5_ledger_epoch: std::cell::Cell<Option<u32>>,
+    /// `DSV41_V5_LEDGER=1` only: the last epoch seen **per rank**, for the
+    /// monotonic assertion the fix-11 design's §4.0(a) asks for. The rift's own
+    /// signature is "one rank's epoch went backwards", which only a per-rank line
+    /// can name — `rank=` is the key whose loss from the D1 summary made the
+    /// 1497→54 jump unattributable (`swallow-fix11-design.md` §0.1). A
+    /// `RefCell<HashMap>` because the ledger is an OBSERVATION (`&self`) taken
+    /// where the arms already hold `self` immutably, and a process may host more
+    /// than one rank (`dsv41-run.rs`).
+    v5_ledger_seen: std::cell::RefCell<std::collections::HashMap<usize, u32>>,
+    /// `DSV41_V5_LEDGER=1` only: whether the one-time stream line has been
+    /// emitted. World A2's cheap falsifier — the ledger's reader and the v5
+    /// kernels must share ONE stream, otherwise a stale epoch can be staged and
+    /// overwrite a newer one. See [`Self::v5_ledger_probe`].
+    v5_ledger_stream_done: std::cell::Cell<bool>,
 }
 
 fn fb(n: usize) -> usize {
@@ -3814,6 +3828,8 @@ impl<'a> DevChain<'a> {
             verify_replays: 0,
             verify_geom: std::cell::Cell::new(None),
             v5_ledger_epoch: std::cell::Cell::new(None),
+            v5_ledger_seen: std::cell::RefCell::new(std::collections::HashMap::new()),
+            v5_ledger_stream_done: std::cell::Cell::new(false),
         })
     }
 
@@ -9489,46 +9505,108 @@ impl<'a> DevChain<'a> {
     /// and the step proceeds (the discipline [`Self::v5_ledger_note`] follows).
     /// Gated on [`v5_ledger`], which is a cached `OnceLock` read — with the gate off
     /// this is one predictable branch and no device traffic.
-    fn v5_ledger_pre(&self, pos: usize) {
+    /// The D1 hardening's ONE read (`DSV41_V5_LEDGER=1`) — see [`v5_ledger`] and
+    /// `docs/agent/swallow-fix11-design.md` §4.0. Returns `(epoch, canary)` and,
+    /// as a side effect, emits the three hardened lines the design asks for:
+    ///
+    /// * `[v5-ledger-stream]` — ONCE per process, on the first line, carrying the
+    ///   reader's stream id. World A2 (a stale `e` overwriting a newer one) can
+    ///   only exist if the ledger and the v5 kernels are on DIFFERENT streams, so
+    ///   one line falsifies it.
+    /// * `[v5-ledger-CANARY]` — whenever the canary word at `ctr_at + 8` is not
+    ///   the magic init (see [`Collective::V5_LEDGER_CANARY`]). It is written by
+    ///   no kernel, so a change is an out-of-bounds write into the epoch's tail —
+    ///   the world A3 evidence, taken for free on a read already paid.
+    /// * `[v5-ledger-RESET]` — whenever THIS rank's epoch went BACKWARDS since its
+    ///   own last line. The 1497→54 rift's own signature, made a log line instead
+    ///   of an after-the-fact inference, and keyed PER RANK because `rank=` is the
+    ///   column whose loss from the D1 summary (§0.1) made the jump unreadable.
+    ///
+    /// `None` when the gate is off, there is no collective, or a read failed (a
+    /// failed read is logged, never answered as an error: this is an OBSERVATION
+    /// on a step whose block is already committed). With the gate off this is one
+    /// cached `OnceLock` branch and no device traffic, so the OFF path is free.
+    fn v5_ledger_probe(&self, pos: usize, arm: &str) -> Option<(u32, u32)> {
         if !v5_ledger() {
-            return;
+            return None;
         }
         let Some(c) = self.comm.as_ref() else {
-            return;
+            return None;
         };
-        match self.dev.download_u32(c.epoch_dev() as *const c_void) {
-            Ok(epoch) => eprintln!(
-                "[v5-ledger-pre] pos={pos} rank={} epoch={epoch} arm=pre",
-                self.rank()
-            ),
-            Err(e) => eprintln!(
-                "[v5-ledger-pre] pos={pos} rank={} epoch read failed: {e}",
-                self.rank()
-            ),
+        let rank = self.rank();
+        // (c) the stream line, ONCE per process.
+        if !self.v5_ledger_stream_done.get() {
+            self.v5_ledger_stream_done.set(true);
+            eprintln!(
+                "[v5-ledger-stream] rank={rank} stream={:?} world={}",
+                self.dev.stream(),
+                self.world()
+            );
         }
-    }
-
-    fn v5_ledger_note(&self, pos: usize, arm: &str, k_emit: usize) {
-        if !v5_ledger() {
-            return;
-        }
-        let Some(c) = self.comm.as_ref() else {
-            return;
+        // (b) canary before epoch: a write landing between the two reads still
+        // shows on the (canary, epoch) pair rather than hiding behind the epoch
+        // read itself.
+        let canary = match self.dev.download_u32(c.canary_dev() as *const c_void) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[v5-ledger] pos={pos} rank={rank} arm={arm} canary read failed: {e}");
+                return None;
+            }
         };
+        if canary != Collective::V5_LEDGER_CANARY {
+            eprintln!(
+                "[v5-ledger-CANARY] pos={pos} rank={rank} arm={arm} canary={canary:#010x} \
+                 expected={:#010x}",
+                Collective::V5_LEDGER_CANARY
+            );
+        }
         // `epoch` is the device-side authority on rounds issued (`tp.rs`): the AR
         // pubred and the argmax exchange advance this one word, so it counts BOTH
         // of them — which is exactly what the round ledger needs.
         let epoch = match self.dev.download_u32(c.epoch_dev() as *const c_void) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[v5-ledger] pos={pos} rank={} epoch read failed: {e}", self.rank());
-                return;
+                eprintln!("[v5-ledger] pos={pos} rank={rank} arm={arm} epoch read failed: {e}");
+                return None;
             }
         };
+        // (a) per-rank monotonic assertion. The merged (pre, note) sequence for
+        // one rank can only rise (the epoch is never reset at runtime), so any
+        // drop is the defect. Per RANK, not a single process-wide line.
+        let prev = self.v5_ledger_seen.borrow_mut().insert(rank, epoch);
+        if let Some(p) = prev {
+            if epoch < p {
+                eprintln!(
+                    "[v5-ledger-RESET] pos={pos} rank={rank} arm={arm} prev={p} cur={epoch} \
+                     drop={}",
+                    p - epoch
+                );
+            }
+        }
+        Some((epoch, canary))
+    }
+
+    fn v5_ledger_pre(&self, pos: usize) {
+        if let Some((epoch, canary)) = self.v5_ledger_probe(pos, "pre") {
+            eprintln!(
+                "[v5-ledger-pre] pos={pos} rank={} epoch={epoch} canary={canary:#010x} arm=pre",
+                self.rank()
+            );
+        }
+    }
+
+    fn v5_ledger_note(&self, pos: usize, arm: &str, k_emit: usize) {
+        let Some((epoch, canary)) = self.v5_ledger_probe(pos, arm) else {
+            return;
+        };
+        // The POST delta differences two consecutive POST epochs (the pre line
+        // deliberately does NOT feed this: it would make the delta straddle a
+        // step). `wrapping_sub` matches the device's `e + 1u` arithmetic.
         let prev = self.v5_ledger_epoch.replace(Some(epoch));
         let delta = prev.map(|p| epoch.wrapping_sub(p)).unwrap_or(0);
         eprintln!(
-            "[v5-ledger] pos={pos} rank={} epoch={epoch} arm={arm} k_emit={k_emit} delta={delta}",
+            "[v5-ledger] pos={pos} rank={} epoch={epoch} canary={canary:#010x} arm={arm} \
+             k_emit={k_emit} delta={delta}",
             self.rank()
         );
     }
