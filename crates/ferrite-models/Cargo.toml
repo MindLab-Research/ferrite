@@ -15,3 +15,7 @@ ferrite-types = { path = "../ferrite-types" }
 # WITHOUT the `cuda` feature: `devrt` resolves every symbol through dlopen at
 # first use, so this crate still builds and unit-tests on a box with no CUDA.
 ferrite-kernel = { path = "../ferrite-kernel" }
+# The chat-frame boundary (`ChatFrame` / `ChatTokenizer` / `Seg`): a model's
+# prompt layout is model data, so the frames live with the model. ferrite-http
+# depends on ferrite-types + ferrite-dispatch only, so this is not a cycle.
+ferrite-http = { path = "../ferrite-http" }

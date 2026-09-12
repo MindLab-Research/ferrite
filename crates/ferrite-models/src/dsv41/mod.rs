@@ -22,6 +22,7 @@ pub mod config;
 pub mod device;
 pub mod dspark;
 pub mod engram;
+pub mod frame;
 pub mod kernels;
 pub mod load;
 pub mod ops;

@@ -20,6 +20,8 @@
 //!   * [`weights`] — checkpoint tensor names -> the engine's TP-sharded layout
 
 pub use ferrite_models::dsv41::{
-    chain, chain_dev, config, device, dspark, engram, kernels, load, ops, quant, tp, vision, weights,
+    chain, chain_dev, config, device, dspark, engram, frame, kernels, load, ops, quant, tp, vision,
+    weights,
 };
+pub use ferrite_models::dsv41::frame::Dsv41Frame;
 pub use ferrite_models::dsv41::{Dsv41Config, KvMode};
