@@ -2400,3 +2400,17 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 4. **需要 parity 测试**（编译修复中——subagent）确认 template<M> 真的被使用（vs 静默 declined）
 
 **下一步**：parity 编译修复（sh-pair-parity-fix subagent）→ parity 硬门 → 四臂 A/B（性能验证）
+
+## 🎯 tcgen05 misaligned 的精确根因（tcgen05-misaligned-deep）
+
+**根因**：`expert_gemv_fp4_batched_kernel` :1673-1679/:1724——**arm（ILV=0, GATEUP_FUSE=0）结构性绕过了对齐守卫**：
+- `pair_body = ((fuse_swiglu != 0) || ILV) && (b_split > 0)` → arm 下 `pair_body=false`
+- `pf_ok = (pf != 0) && pair_body && ...` → `pf_ok=false`
+- `al_ok` 守卫**只在 prefetch 前导**里（:1396-1397）——`pf_ok=false` 时直接读分支 :1676/:1678 **零守卫**
+- `uint2` 读需要 8B 对齐——B 侧间接寻址（`b_base + e*b_stride`）用 DevBuf::view 不继承 16B 对齐
+- TP 分片让部分 rank 的 w3 view 落在非 8B 对齐处 → rank 5/6 的 misaligned
+
+**为什么基线不崩**：基线（GATEUP_FUSE=1 + ILV=1）→ `pair_body=true` → `pf_ok=true` → `al_ok` 守卫生效
+**为什么 arm 崩**：arm 把 `pair_body` 打成 false → 守卫整个绕过
+
+**修复**：给 :1676/:1678 的直接读加对齐守卫（与 `al_ok` 同模式），不对齐时降级到安全路径
