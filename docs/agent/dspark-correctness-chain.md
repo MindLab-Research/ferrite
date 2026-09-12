@@ -1487,3 +1487,19 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 4. 这比盲改 gate 更精确——直接定位哪一层的哪个值偏了
 
 **与 accept-first-strategy 的关系**：subagent 正在分析 accept 1.214 → 2-3 的路径。DIFF_EAGER 是精确诊断的首选工具。
+
+## S1 修复验证测试的准备（batched 400 v2 完成后立即跑）
+
+**S1 修复内容**：SEED_POS 臂的 q/o rope 基址与 kv 对齐（rope_pos = pos+1 在 gate ON 时；pos 在 gate OFF 时——逐位不变）
+
+**测试配置**：
+```
+DSV41_BF16_TRUNCATE=1       # 零拉丁
+DSV41_TAP_INPUT=1           # P0-3（accept 杠杆）
+DSV41_DRAFT_BF16_DOMAIN=1   # P1-5（accept 杠杆）
+DSV41_SEED_POS=1            # P0-1 + S1 修复（q/o 对齐！）
+DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+```
+
+**预期**：accept 1.214 → **1.4-1.8**（S1 修复的效果）
+**判定**：如果 accept 显著提升且零拉丁保持 → S1 修复成功，P0-1 可以安全启用
