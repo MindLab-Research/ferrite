@@ -2160,3 +2160,18 @@ DSV41_BF16_TRUNCATE=1
 **⚠️ VERIFY_HEAD_MROWS 与 SWALLOW m=6 的冲突**：之前的 ar5-hang 是在 SWALLOW + VERIFY_HEAD_MROWS 组合下发生的。回退修复了 epoch 问题，但 m=6 的 head mrows 可能仍有问题。**第一波先不开 VERIFY_HEAD_MROWS**（单独验证 SWALLOW + 其他 mrows）。
 
 **预期步时**：SWALLOW(-4.55) + GATE(-2.75) + INDEXER(-1.0~1.5) + COMPRESSOR(-0.2~0.3) ≈ 33 - 8.5-9.6 = **~24-25ms**（如果全部兑现）
+
+## SWALLOW_STEP 回退重测最终结果（24c95232）——仍 ar5-hang（gap 3）
+
+**结果**：CRASH-OR-EMPTY（curl timeout rc=28），ar5-hang 存在（gap 3 vs 修复1 的 22 vs 原始的 1-2）
+
+**三次尝试的模式**：
+| 尝试 | gap | 修复内容 |
+|---|---|---|
+| 原始 | 1-2 | 无 |
+| 修复 1（错误方向）| 22 | argmax capturing 守卫 + DRY barrier |
+| 回退 | 3 | 移除守卫和 barrier（恢复 81=81）|
+
+**判定**：回退改善了 gap（22→3）但没修复。**ar5-hang 有更深的根因**——不只是 epoch 推进规则的问题。ar5-final-fix subagent 正在做架构级分析。
+
+**SWALLOW_STEP 继续禁用**。当前 400 路径的性能依赖 LAZY_VERIFY（~33ms 步时）。
