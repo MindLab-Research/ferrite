@@ -944,3 +944,19 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 | 其他（rope/quant）| ❌ f32 | 影响待评估 |
 
 **三个主导项已对齐**（输入+hc+MoE）——如果 accept 仍不提升，剩余的 attention 内部对齐是下一步。
+
+## 🎯 用户红线达成：零拉丁字符（a8b578cb，干净重建 + ABI5 + 双截断）
+
+**结果**：
+- **拉丁=[]（零拉丁字符！）** — bf16 截断彻底消除 acs/ibu/Bristol/burdens/oqua ✓✓✓
+- **段错误修复** — SURVIVED（干净重建 + ABI 5 一致性）
+- LEN=164，双字=4（内容错误如"泄"代"义"——中文字错，非拉丁碎片）
+- verify=33.96ms（vs 之前 38.34ms，**-4.4ms**——mrows staging 修复生效）
+- k_acc {0:64, 1:13, 2:4, 3:4, 4:3} mean-k=0.820——**accept 反而降了**（1.080→0.820）
+
+**分析**：
+1. **零拉丁字符**：backbone 的 hc_pre bf16 截断让 backbone 对齐官方 → 累积漂移消除 → 不再翻转出拉丁 token
+2. **accept 下降**：backbone 截断让 verify 更严（同 e4m3 的效应）——backbone 的 argmax 变了（更准），draft 的预测没跟上（tap 截断不足以对齐 draft）
+3. **性能**：verify 33.96ms 是 batched——lazy verify 会 ~20ms
+
+**下一步**：lazy verify + 双截断的组合测试（性能 + 正确性）。
