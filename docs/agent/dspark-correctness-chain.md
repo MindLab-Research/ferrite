@@ -2852,3 +2852,14 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - gate：DSV41_DRAFT_GRAPH=1（默认 OFF）
 
 **下一步**：在 lazy verify 配置中加 DSV41_DRAFT_GRAPH=1 测试！
+
+## 🎯 LAZY + SH_PAIR_M=1 验证成功（57090747）——SH_PAIR 在 lazy m=1 下正确！
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）
+- **k_acc 完全相同**：4 0 0 0 3 0 1 1 0 0 0 1 2 0 0 5 0 0 0 1
+- **0 ar5-hang** ✓
+
+**判定**：SH_PAIR template<M=1> 在 lazy verify 下正确工作！parity 的 2 个剩余 failure（prod/m=6）不影响 lazy（m=1）。**SH_PAIR_M=1 可以立即启用！**
+
+**下一步**：lazy + SH_PAIR_M=1 + DRAFT_GRAPH=1（L6——400 的最后一块拼图）
