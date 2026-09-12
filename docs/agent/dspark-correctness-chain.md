@@ -1289,3 +1289,20 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 **400 的完整预算**（swallow + 全优化）：
 - verify(m=6, 权重共享) ~9ms + draft 0.8 + commit 0.2 = **10ms**
 - @ accept 3 → 4 tok/step → **400 tok/s ✓**
+
+## Accept 杠杆测试结果（6dd0075e，修复后基线 + P0-3+P1-5）
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）——修复后基线在 P0-3+P1-5 下保持
+- **accept mean-k=1.214**（vs 基线 1.022——**+19% 提升**！）
+- 步时 33-61ms（变量，取决于 accept 模式）
+
+**分析**：
+- P0-3（tap 采集点）+ P1-5（bf16 域）在修复后基线上**有效**——之前的"失败"确实是基线问题
+- accept 1.214 仍远低于 3（400 目标）——需要更多杠杆或更好的 draft 对齐
+- 每次 accept 提升都直接乘以吞吐：1.022 → 1.214 → 目标 3.0
+
+**剩余 accept 杠杆**：
+1. DSV41_SEED_POS=1 + winrows 配套（P0-1 完整修复——之前因基线问题无法评估）
+2. DSV41_DRAFT_ATTN_BF16=1（draft attention 截断——独立 gate）
+3. DSV41_TAP_BF16=1（draft 输入截断——独立 gate）
