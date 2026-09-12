@@ -106,7 +106,7 @@ DSV41_ATTN_MROWS_ROPE_NORM=1        # mrows b2
 |---|---|---|---:|---|
 | ~~R2~~ | ~~attn + MoE 两次 AR 合并为每层 1 轮~~ | ~~−3.3ms~~ | — | ❌ **拓扑不可能**（ar-r2-merge-impl-prep：轮 B payload 在轮 A 结果传播前不存在——attn AR→hc_post→ffn 前端→MoE→MoE AR 依赖链上相邻 AR 无任何独立对，跨层也不行；两轮复用同一 `s.o` 撞别名；`ar-l4l5:150/157`+`ar-further-optimization:159` 三处独立背书）。且 **−3.3ms 预算未验证**：78.3µs/轮是 nsys 读数（v5 自旋 ~300× 放大嫌疑），账本 17.3µs ⇒ 砍 40 轮实际仅 0.69ms |
 | ~~R1~~ | ~~`DSV41_AR_SINGLE_POLL`~~ | ~~−1~3ms~~ | — | ❌ **已 GPU 验证判死**：SWALLOW **7× 退化**（58.3→10.7）+ lazy 中性（91.1→90.0）。batched-fragility 判词：代码等待差上界仅 ≤0.2ms/步 ⇒ 7× 落在 **accept 崩塌 regime**（单字广播+两跳发布在 6× 宽 grid 上时序脆弱）；再议前提 = A0 探针 `avg_spin` 位移 + gate ON/OFF 逐字节一致 |
-| **A0** | **AR device 探针**（`clock64()`，capture-safe，禁与 nsys 同跑；需先补 SWALLOW site 分流小件——稳态两条 AR 都落 site=OTHER 混桶，两个新 `extern "C"` 符号只改 site 标签） | **归因前提** | 0.5 人日 | **AR 任何后续工作的第一步**（`swallow-ar-first-step-design.md:81`："在这个差被切开之前，任何『AR 优化能省 X ms』都是猜"） |
+| **A0** | **AR device 探针**（`clock64()`，capture-safe，禁与 nsys 同跑；需先补 SWALLOW site 分流小件——稳态两条 AR 都落 site=OTHER 混桶，两个新 `extern "C"` 符号只改 site 标签） | **归因前提** | 0.5 人日 | **✅已执行判决（2026-09-12）**：site 分流落地（95d7083）+ SWALLOW 63.8 栈实测——**稳态 avg_spin = 6179 cyc ≈ 3.4µs/轮 ≪ 31k ⇒ T4 分支成立：AR 已无肉**。nsys 账本（78.3µs/轮、6.58ms/步、36%）是自旋放大假象；真值 AR ≈ 0.3-0.6ms/步 ≈ 28ms 步时的 ~2%。**AR 方向全关**（T1-T3 失去靶子）；肉在 MoE(17.4%)/投影(15.1%)/hc_dots = L4/L5 对象。详见 `swallow-ar-first-step-design.md §7` |
 | R3 | PDL（launch 级合并：AR 自身两发 node-gap + PTLC spin 窗口） | **0.17~0.4ms/步（≤1.5%）** | 中（1.5~3 人日） | **唯一合法的"合并"**（合 launch ≠ 合轮）；低优先级；红线：禁止 AR→AR 的 PDL 边 |
 
 > **判词**：R3 只把「AR 的尾巴 + 邻居的头部」对折，**吃不掉 spin 主体**（§2.2 三条不可行证明）。

@@ -286,8 +286,31 @@ AR 的真实票面 = 账本 1.45ms/步（5%）⇒ **AR 的天花板（工作地�
 5. **纪律**：AR 改动**不得改轮数**（84 真 + 81 pad = 165）；探针轮**禁 nsys**；吞吐轮**禁 V5_LEDGER**；
    每次 A/B 必须逐 token 一致 + 计数红线 + `ar5-hang=0`。
 
+## 7. A0 探针执行结果（2026-09-12 22:30 执行，✅已判决）
+
+**配置**：site 分流（95d7083）双产物重编后；SWALLOW 63.8 生产栈（SWALLOW_STEP+EPOCH_PAD+VERIFY_GRAPH+b2+b3+Wave1 全开+HC_VERIFY_FUSE/FRONT_ROWS/AR_FOLD 三开门）+ `DSV41_AR_PROBE=1 AR_TIMEOUT_TRAP=1`；计数 200 tok（198 生成，50 步，mean-k=1.340，verify=28.17ms/步）；证据 `~/ar0_probe_EVIDENCE.log`（55 行探针，多 rank 并发打印有交错——用正则级提取解析 30 条完整记录）。
+
+**稳态判读（site 分桶，取每 rank 最大 n——冷启动已摊薄）**：
+
+| site | 是谁 | n 范围 | 8-rank avg_spin | 判读 |
+|---|---|---|---|---|
+| **2 VERIFY** | `_hcpost_rows` attn fold AR（63.8 栈三开门 ⇒ attn verify AR 走此桶） | 4096-7168 | **6179 cyc ≈ 3.4µs/轮** | **稳态真值** |
+| 1 ATTN | 图捕获阶段 layer()（捕获完成后 n 不再增长） | 512 | 40874 cyc | 冷启动污染，排除 |
+| 3 OTHER | engram 等 | 512 | 12102 cyc | 小样本 |
+| 0 MOE | moe_rows verify AR（新标签） | 交错丢失 | （n=512 批约 4-12k cyc） | 量级同 site=2 |
+
+**判决：`avg_spin ≪ 31k cyc（17.3µs）` ⇒ §6-4 的 T4 分支成立——AR 已无肉。**
+- nsys 账本（78.3µs/轮、6.58ms/步、36% kernel-sum）被 device 侧真值否定：**真实 AR 等待 ≈ 3-7µs/轮，84 轮 ≈ 0.3-0.6ms/步 ≈ 28ms 步时的 ~2%**
+- nsys 的 36% 是自旋放大假象（pubred 等 peer 的时间在 nsys 注入开销下级联放大 ~20×；探针 max 的 32M cyc 离群证实捕获期冷启动轮的存在）
+- **AR 四分支 T1-T4 的终局 = T4**：T1（A2c 负载均衡）/T2（协议）/T3（fold 向量化）全部失去靶子——它们都建立在"等待是真"上
+- **§6-2/§6-3 的零代码项（SINGLE_POLL/STORE_FUSE）正式失去先验**（R1 已 GPU 判死 7×，A1a 已判死 8×，现在连"理论收益"也不存在）
+- **SWALLOW 28ms 步时的真实构成**：AR ≈ 0.5ms；肉在真实计算 kernel——MoE（17.4%）/投影（15.1%）/hc_dots 等 = **L4/L5 的对象**。L4/L5 是 400 唯一路径的判断被 A0 数据反向确认
+
+**后续纪律**：AR 方向**全关**（R1/R2/R3/A1a/A2c/T1-T3）；任何新优化提案若引用 nsys 的 AR µs 数，必须先过 A0 探针复测；探针轮禁 nsys、吞吐轮禁 V5_LEDGER、AR 改动不得改轮数（165）的纪律不变。
+
 ---
 
 *工部 · 只读勘察 + 本文件（唯一产出）；未执行 GPU 命令、未改动任何源码。*
 *每条 μs/ms 已标来源（实测／账本／设计／代数／nsys）；与任务前提冲突处给出 file:line 依据（§0-1~§0-4）。*
 *代码基线 HEAD `ba88df1`；行号漂移处以函数名 + gate 名为准。*
+*§7 为 2026-09-12 深夜主 agent 执行 A0 后追加（基线已推进到 95d7083）。*

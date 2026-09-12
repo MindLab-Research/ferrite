@@ -90,8 +90,8 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - **lazy 干净栈：91.1 tok/s（+15.6%）**：R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)
 - **🎉 SWALLOW 完全解锁！**（11 次修复：OOB 根因（staging 被越界清零→canary 抓到！）→ OOB 修复（guard band + bounds check）→ engram slot 修复（147456 ≥ payload）→ **300 token 正常生成 + 出师表红线通过（零拉丁 ✓）+ 全 gate 58.3 tok/s**）
 - **AR Step 2 (A1a) 教训**：+665 行 store fold 在两条路径破坏数值（lazy 90.9/输出退化 + SWALLOW 7.1/8× 退化）——**AR_STORE_FUSE 永久 OFF**
-- **修正后的 400 路线（再订正 2026-09-12 深夜）**：AR R2 **拓扑不可能**（依赖链+s.o 别名）+ R1 **GPU 验证 7× 退化判死** + -3.3ms 预算未验证（78.3µs/轮=nsys 读数，账本 17.3µs）⇒ ~~400 ladder 28→21.6→…~~ 作废；**400 缺口回到纯 L4/L5 口径**（−7~13ms，25-40 人日）；AR 剩余 = A0 探针（第一步，0.5 人日）→ A2c rank 负载均衡；**batched 正确性门禁 = gate ON/OFF 逐字节一致**（`tok/s=k_emit/C(6)`，吞吐正是 accept 读数）
-- **tcgen05 "rank 7" 叙事作废**（`docs/agent/tcgen05-rank7-verdict.md`）：均匀分片数学上产生不出 {7} 不对齐集合；`serve.rs:250` 只留首个 Err ⇒ 上报竞态；第一嫌疑 = **w2 SF 行 pitch 10 字节**（rank 对称）。观测修复中（serve.rs 全量 Err + ALIGN_STRICT + SF pitch 检查），先修观测再谈修复
+- **修正后的 400 路线（终局版 2026-09-12 深夜）**：AR R2 拓扑不可能 + R1 GPU 判死 + **A0 探针实测 AR 已无肉**（稳态 avg_spin 3.4µs/轮 ≪ 17.3µs 判读线；nsys 的 78.3µs/轮、36% kernel-sum 是自旋放大假象；真值 AR ≈ 0.5ms/步 ≈ 28ms 步时 ~2%）⇒ **400 缺口全部在真实计算 kernel（MoE 17.4%/投影 15.1%/hc_dots）= 纯 L4/L5 口径**（25-40 人日）；**任何提案引用 nsys 的 AR µs 数必须先过 A0 探针复测**
+- **tcgen05 根因已定谳（第 5 轮判定实验）**（`docs/agent/tcgen05-rank7-verdict.md §10`）：**8/8 ranks 同文本 cuda error 716**（"只有 rank 7"= serve.rs 上报竞态，正式作废）+ ALIGN_AUDIT 唯一 violation = **w2 SF 行 pitch 10B**（rank 对称）⇒ 根修 = SF 行 stride 与逻辑 k/32 解耦（行间 padding + 内核索引参数化，inter/world 需被 512 整除），属 L4-3/L4-4 收尾
 
 **400 的诚实判定**：lazy 上限 ~145；SWALLOW 需要全部优化兑现（mrows + hc/B6 + tcgen05 + AR 重设计 + L4/L5）；60% 兑现 → ~300 tok/s；**先钉死 S0 步时（28ms）是 G2 的全部意义**。
 

@@ -33,9 +33,10 @@ lazy 增量分解：R2(+10.2%) + MARKOV_SLICED(+3.2%) + VERIFY_FORK(+1.5%) + RIN
 
 AR 是 SWALLOW #1 开销（36.0%，6.58ms/步 = 84 轮）和 lazy #1（27.1%）——但四条优化路全被判死。**400 的 AR 缺口需 L4/L5 级别的重写，不是 knob。**
 
-## 六、双判词（本 session 收官的两份结构性判决）
+## 六、三份判决（本 session 收官的结构性判决，前两份判词 + 两项 GPU 实验定谳）
 1. **batched 脆弱性结构分析**（`docs/agent/batched-fragility-structural-analysis.md`）：batched m=6 把 accept 变成吞吐乘数（`tok/s = k_emit/C(6)`）⇒ 任何打坏 accept 的 knob 都是 6-8× 灾难；lazy 坐在每个 knob 的"零"角上所以扛造。**量级判据：观测倍数 ≈k_emit/≈m → 先查 accept；倍数 1.x → 才查协议。** 对 batched 有效的只有"一阶折叠"（mrows b2+b3 已兑现）；二阶 knob 全部 FORBIDDEN。
-2. **tcgen05 "rank 7" 叙事作废**（`docs/agent/tcgen05-rank7-verdict.md`）：均匀分片在数学上产生不出 {7} 不对齐集合；`serve.rs:250` 只保留第一个 Err ⇒ "总是 rank 7"是上报竞态产物（历史 5/6/7 都出现过）。第一嫌疑 = `check_bulk_geometry` 漏查的 **w2 SF 行 pitch 10 字节**（rank 对称，8 rank 全错情形）。**观测修复实施中**（serve.rs 全量 Err + ALIGN_STRICT + SF pitch 检查 + launcher 门补齐）。
+2. **tcgen05 "rank 7" 叙事作废 + 根因定谳**（`docs/agent/tcgen05-rank7-verdict.md` §10）：均匀分片在数学上产生不出 {7} 不对齐集合；`serve.rs:250` 只保留第一个 Err ⇒ "总是 rank 7"是上报竞态产物（历史 5/6/7 都出现过）。**第 5 轮判定实验（观测修复合入后）确凿定谳**：`[tp] step failed on 8/8 ranks` 全部同文本 cuda error 716 + ALIGN_AUDIT 唯一 violation = **w2 SF 行 pitch 10 字节**（rank 对称布局缺陷，row1&15=10 ⇒ 每行偏离 16B 网格）。根修 = SF 行 stride 与逻辑 k/32 解耦（行间 padding + 内核索引参数化），属 L4-3/L4-4 收尾。
+3. **A0 探针判决：AR 已无肉**（`docs/agent/swallow-ar-first-step-design.md` §7）：site 分流落地后 SWALLOW 63.8 栈实测——**稳态 avg_spin = 6179 cyc ≈ 3.4µs/轮 ≪ 17.3µs 判读线**。nsys 账本（78.3µs/轮、6.58ms/步、36% kernel-sum）是**自旋放大假象**；真值 AR ≈ 0.3-0.6ms/步 ≈ 28ms 步时的 **~2%**。AR 四分支 T1-T3（负载均衡/协议/向量化）全部失去靶子——**SWALLOW 28ms 的肉在真实计算 kernel（MoE 17.4%/投影 15.1%/hc_dots）= L4/L5 的对象**。
 
 ## 七、400 的诚实评估
 - 400 ladder（需全部优化兑现）：AR 28→21.6→18.6→17.1→14.7ms = **441 tok/s @ accept 5**（AR 每步实际 6.58ms 不是 10.1ms）

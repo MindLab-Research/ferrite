@@ -87,3 +87,28 @@ CUDA_VISIBLE_DEVICES=0..7, LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda, --tp 8 --
 - `≫31k` ⇒ nsys 自旋放大为主，AR 方向预算重估；`≪31k(≈9k)` ⇒ AR 无肉，转 MoE(17.4%)/投影(15.1%)/hc_dots
 - 辅助：`avg_stamp`~0.2-0.5µs（大 ⇒ store 路径贵=A1a 靶）；`avg_epi` lazy 4-6µs / SWALLOW 设计 8-15µs（>15 ⇒ T3 fold/reduce 向量化）
 - 收尾一律 `POST /shutdown`
+
+## 10. 第 5 轮判定实验结果（2026-09-12 22:15 执行，✅已定谳）
+
+**配置**：观测修复（3cd7258）+ A0 site 分流（95d7083）双产物重编后；gate 链 = §9 前提链 + `DSV41_ALIGN_AUDIT=1 CUDA_LAUNCH_BLOCKING=1 VERIFY_GRAPH=0 GRAPH_MOE=0`；证据 `~/tc5_round5_EVIDENCE.log`（2443 行）。
+
+**步骤 0（装载审计）**：
+- `bulk-geometry WARN` ×8——**8 rank 逐字相同**（rank 对称确认）
+- 2416 行 `[align]` 审计中**唯一 violation = w2.scale**：`L42 r0 e0 w2.scale base&15=0 worst_base&15=0 stride%16=0 pitch=10 pitch%16=10 row1&15=10`，其余 plane（w1/w1.scale/w3/w3.scale，pitch=2560/160）全部 %16=0
+- 汇总行：`1 16B violation(s) in the expert pool — the tcgen05/bulk operands CANNOT be addressed: w2.scale: row pitch 10 B is not a multiple of 16 (row 1 starts 10 B off the grid) — every row past the first of this plane is unaddressable by the bulk/uint4 paths`
+
+**步骤 1（"你好" 20 tok 触发）**：
+```
+[tp] rank 0 (device 0) err: config error: dsv41_expert_tcgen05_gate_up_e4m3: cuda error 716
+[tp] rank 3 / 1 / 5 / 6 / 7 / 4 / 2 (device 同号) err: （逐字相同）
+[tp] step failed on 8/8 ranks
+```
+
+**判决：路径 A 确凿。**
+1. **8/8 ranks 全部 cuda error 716，文本逐字相同** ⇒ 破坏 rank 无关；"只有 rank 7"正式作废（`serve.rs` 只留首个 Err 的上报竞态，如 §1 所判）。
+2. **唯一 violation = w2 SF 平面行 pitch 10 字节**（`padded_inter(288)/32=10`；row1&15=10 ⇒ 每行都偏离 16B 网格）⇒ §3 第一嫌疑证实。
+3. **根因定谳**：tcgen05 misaligned = w2 scale 平面行 pitch 10B 的 rank 对称布局缺陷；4 轮修复全部打在"rank 7 分片边界"上 = 方向完全错误。
+
+**根修口径**（未实施，属 L4-3/L4-4 收尾）：使 SF 行 pitch 满足 16B ⇒ `padded_inter(inter/world) % 512 == 0`（即 inter/world 需被 512 整除；当前 288 → padded 320 → 10B）。需要 scale 平面物理行 stride 与逻辑 `k/32` 解耦（行间 padding + 内核 scale 索引 stride 参数化），数值不变（pad 区不读）。TMA bulk 的 16B 硬对齐使 byte-fallback 不可行（§1.2 已证）。
+
+**修复后复验口径**：`DSV41_ALIGN_AUDIT=1` 装载期 `pool geometry OK`（0 violation）→ `DSV41_ALIGN_STRICT=1` 装载通过 → tcgen05 臂 8/8 → 0/8 Err → 计数前 61 行 + 零拉丁红线。
