@@ -3122,3 +3122,22 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 1. ar5-hang（Plan A+C 失败 gap 23；无图时出师表 OK 但计数 937 hang）
 2. Plan B 是最后的希望（unanimity-or-direct 的 rank 投票）
 3. 如果 Plan B 也不行 → 需要分析为什么无图模式在计数任务也 hang（这不是臂分歧问题！）
+
+## 🎉 R2 ATTN_LIN_FUSE 验证成功（ee0b9f74）——第一个不退化 accept 的真正优化！
+
+**结果**：
+- **零拉丁 ✓**（LEN=186，拉丁=[]）
+- **k_acc: 5 5 5 5 3 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5**（几乎全 5——没有退化！）
+- **吞吐 82.9 tok/s**（vs 基线 78.1——**+6%**！）
+- **0 ar5-hang** ✓
+- completion=130 / 1568ms
+
+**对比所有优化的验证结果**：
+| 优化 | k_acc | 吞吐 | 判定 |
+|---|---|---|---|
+| SH_PAIR_M=1 | ~5.0 不变 | 78.1 | ✓ 中性 |
+| MARKOV_SLICED | 5.0→1.4 | 73.3 | ✗ 退化 |
+| LAZY_SDR | 5.0→2.4 | 71.7 | ✗ 退化 |
+| **R2 ATTN_LIN_FUSE** | **~5.0 不变** | **82.9（+6%）** | **✓✓ 真正的优化！** |
+
+**R2 的贡献**：verify m=1 从 7 发降到 ~4 发（lin2 替代 proj_mrows×2，lin_rope_norm 替代 norm+quant+proj+rope 的 4 发）——**EAGER 复用策略有效**！
