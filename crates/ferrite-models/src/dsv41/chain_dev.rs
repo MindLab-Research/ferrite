@@ -911,20 +911,31 @@ fn verify_rope_mrows() -> bool {
     })
 }
 
-/// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, DEFAULT OFF): `moe_rows` runs the bf16 gate
-/// `gemv_bf16` once per activation row. `gemv_bf16` dispatches to
-/// `ferrite_gemv_bf16_v2(..., nrows = 1)` for the gate's shape (n = the routed
-/// expert count < `GEMV_V2_MAX_N`), and `ferrite_gemv_bf16_nt(..., nrows = m)`
-/// is that program's m-token form — same WPR heuristic, same K-slice walk, same
-/// uint4/8-element FMA groups, same smem fold order, one independent accumulator
-/// per token (`gemv_bf16_nt_kernel`; the `tests_dsv41_head_mrows` suite asserts
-/// this bit-identity). DEFAULT OFF so the fold is an explicit A/B arm; the fold
-/// itself only engages when the per-row path would take v2
+/// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, or the plan-named alias DSV41_GATE_MROWS=1;
+/// both DEFAULT OFF): `moe_rows` runs the bf16 gate `gemv_bf16` once per
+/// activation row. `gemv_bf16` dispatches to `ferrite_gemv_bf16_v2(...,
+/// nrows = 1)` for the gate's shape (n = the routed expert count <
+/// `GEMV_V2_MAX_N`), and the multi-row entry (`ferrite_gemv_bf16_v2_mrows` — the
+/// same program as `ferrite_gemv_bf16_nt`, one definition in the .so) is that
+/// program's m-row form: same WPR heuristic (`gv2_wpr(384) = 8`), same K-slice
+/// walk, same uint4/8-element FMA groups, same smem fold order, one independent
+/// accumulator per row (`gemv_bf16_nt_kernel`; `tests_gate_mrows.cu` asserts the
+/// bit-identity at the gate's own WPR > 1 shape, which `tests_dsv41_head_mrows`
+/// deliberately does not cover). DEFAULT OFF so the fold is an explicit A/B arm;
+/// the fold itself only engages when the per-row path would take v2
 /// (`gemv_bf16_v2_wanted` + the symbol present), which is what makes the parity
-/// claim transfer. See `Device::gemv_bf16_mrows`.
+/// claim transfer. See `Device::gemv_bf16_v2_mrows`.
+///
+/// The two env names select the SAME program — `DSV41_GATE_MROWS` is the alias
+/// `final-400-config` §5-P2 item 10 names the gate by, OR'd in rather than
+/// replacing `DSV41_ROW_FOLD_GATE` so the arm that was already measured keeps
+/// its name (the `DSV41_VERIFY_ROPE_MROWS`/`DSV41_ROW_FOLD_ROPE` precedent).
 fn row_fold_gate() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_ROW_FOLD_GATE").map(|v| v != "0").unwrap_or(false))
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ROW_FOLD_GATE").map(|v| v != "0").unwrap_or(false)
+            || std::env::var("DSV41_GATE_MROWS").map(|v| v != "0").unwrap_or(false)
+    })
 }
 
 /// DSV41_SH_EXP_MX2=0 reverts the shared expert's gate/up to two launches.
@@ -8098,17 +8109,18 @@ impl<'a> DevChain<'a> {
             .as_ref()
             .map(|b| b.as_f32())
             .unwrap_or(std::ptr::null());
-        // ROW-FOLD (DSV41_ROW_FOLD_GATE=1, DEFAULT OFF): ONE multi-row GEMV
-        // (`ferrite_gemv_bf16_nt`, nrows = m) where the loop below issues `m`
-        // single-row `gemv_bf16` launches. The nt kernel is the v2 program with a
-        // token dimension — same WPR heuristic, same K-slice walk, same
-        // uint4/8-element FMA groups, same smem partial fold, one independent
-        // accumulator per token — so row r is bit-identical to the per-row call
-        // it replaces, PROVIDED the per-row path would take v2; the wrapper
-        // enforces that (`gemv_bf16_v2_wanted(n_routed)` + the symbol) and
-        // returns Ok(false) otherwise, keeping the loop.
+        // ROW-FOLD (DSV41_ROW_FOLD_GATE=1 or DSV41_GATE_MROWS=1, DEFAULT OFF):
+        // ONE multi-row GEMV (`ferrite_gemv_bf16_v2_mrows`, m <= 8) where the
+        // loop below issues `m` single-row `gemv_bf16` launches. The entry runs
+        // the v2 program with a row dimension — same WPR heuristic
+        // (`gv2_wpr(384) = 8`), same K-slice walk, same uint4/8-element FMA
+        // groups, same smem partial fold, one independent accumulator per row —
+        // so row r is bit-identical to the per-row call it replaces, PROVIDED
+        // the per-row path would take v2; the wrapper enforces that
+        // (`gemv_bf16_v2_wanted(n_routed)` + the symbol) and returns Ok(false)
+        // otherwise, keeping the loop.
         let gate_folded = row_fold_gate()
-            && self.dev.gemv_bf16_mrows(
+            && self.dev.gemv_bf16_v2_mrows(
                 ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
                 self.s.xn_r.ptr as *const f32,
                 self.s.scores_r.ptr as *mut f32,
@@ -8157,25 +8169,21 @@ impl<'a> DevChain<'a> {
                      per-slot weight scheme needs at least 2"
                 )));
             }
-            // The interleaved layout is only addressable by the FUSED batched
-            // gate/up body, so refuse loudly instead of reading the wrong bytes
-            // (the same contract `moe()` enforces). The two-pass e4m3 arm forces
-            // the UNFUSED [2*inter] layout (act_slot), which the fused body
-            // cannot write — so ILV + E4M3 is a hard conflict (the kernel's
-            // `ilv && !fuse` guard fires as cudaErrorInvalidValue, but catching
-            // it here gives a actionable message instead).
-            let two_pass_armed = expert_act_e4m3() && self.dev.supports_sub_dequant_fp4();
-            if ld.experts_ilv
-                && (two_pass_armed
-                    || !(gateup_fuse()
-                        && self.dev.supports_gateup_fuse()
-                        && expert_fp4_mode() == 2))
-            {
+            // The interleaved layout (DSV41_EXPERT_ILV) is readable by the batched
+            // gate/up call with EITHER epilogue: the kernel's gate/up PAIR body
+            // reads both halves of a row from one region with ONE LDG.128, and its
+            // epilogue is selected by the caller's slot pitch (`fuse`, bound to
+            // `out_slot_stride == inter`). So the two-pass e4m3 arm - which passes
+            // the RAW [2*inter] pitch - no longer conflicts with ILV; it gets
+            // exactly the raw gate|up pair it accumulates in. What is still
+            // required is the batched gate/up entry point itself and the pair
+            // body's K contract, dim % 512 == 0 (it walks whole 512-value groups
+            // and has no tail; the launcher refuses that combination loudly).
+            if ld.experts_ilv && !(self.dev.supports_moe_batch() && (dim % 512) == 0) {
                 return Err(FerriteError::Config(
                     "routed expert gate/up weights are interleaved (DSV41_EXPERT_ILV) but the \
-                     fused batched gate/up path is unavailable — run with DSV41_EXPERT_ILV=0, \
-                     or restore DSV41_GATEUP_FUSE / DSV41_EXPERT_FP4_MODE=2 so the fused \
-                     batched call is used"
+                     batched gate/up path is unavailable or dim % 512 != 0 — run with \
+                     DSV41_EXPERT_ILV=0, or restore DSV41_MOE_BATCH with a dim divisible by 512"
                         .into(),
                 ));
             }

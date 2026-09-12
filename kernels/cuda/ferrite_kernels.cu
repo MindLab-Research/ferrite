@@ -3296,6 +3296,65 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2(const float* x, const void* w,
     }
 }
 
+// Forward: the multi-row v2 program's entry (defined below, next to the kernel
+// it launches — `gemv_bf16_nt_kernel<NT, WPR>`).
+extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
+                                            const float* bias, float* out,
+                                            int in_f, int out_f, int nrows,
+                                            cudaStream_t s);
+
+// ============================================================
+// The MoE gate's multi-row GEMV in v2's K order (`DSV41_GATE_MROWS`):
+// ONE launch computes `nrows` (<= 8) activation rows against the SAME
+// `[out_f, in_f]` bf16 weight. `moe_rows` (chain_dev.rs) otherwise issues one
+// `ferrite_gemv_bf16_v2` per row, so the gate weight (40 layers x
+// 384 x 5120 x 2B = 3.93MB/layer) is streamed once per row — 5x the bytes and
+// 5x the launches of a kernel measured at ~229GB/s (launch/latency-bound:
+// 384 tiny blocks per launch), i.e. 786MB/step of avoidable traffic.
+//
+// THE PROGRAM IS THE MULTI-ROW v2 PROGRAM, and it is defined ONCE in this file
+// (`gemv_bf16_nt_kernel<NT, WPR>`, below): the same `gv2_wpr` heuristic
+// (out_f = 384 -> WPR = 8, rpb = 1: one weight row per 8-warp block), the same
+// `kper`/`k0`/`k1` K-slice per warp, the same lane-strided uint4 weight load +
+// four `__bfloat1622float2` decodes + two 4-term FMA groups, the same
+// `__shfl_down_sync` tree, the same smem partial fold
+// (`sum += part[t][(warp/WPR)*WPR + j]`, j ascending) — with one independent
+// accumulator per activation row and no cross-row recombination. Row r is
+// therefore the single-row `ferrite_gemv_bf16_v2` of row r, instruction for
+// instruction. `tests_gate_mrows.cu` asserts it (bit for bit, whole buffer,
+// qNaN-sentinel coverage) at the gate's own WPR > 1 shape, where the smem fold
+// — not `head_gemv_bf16_mrows`' WPR == 1 path — is what has to match.
+//
+// ⚠️ NO SECOND TRANSCRIPTION LIVES HERE. A `gemv_bf16_v2_mrows_kernel` written
+// as a re-typed copy of v2's body would be a second definition of the K order —
+// exactly the FOLD failure (`head_gemv_bf16_mrows`, dsv41_glue.cu / commit
+// b8b67c0: a lookalike body ~1e-3 off, which flipped near-tie verify argmaxes
+// into 33% echo). The fold's contract is to run the program it claims parity
+// with, so this entry names the ONE multi-row v2 program instead of cloning it.
+// If the gate ever needs a DIFFERENT program (not a rename), the change belongs
+// in `gemv_bf16_nt_kernel`'s dispatch, not in a third kernel.
+// ============================================================
+extern "C" cudaError_t ferrite_gemv_bf16_v2_mrows(const float* x, const void* w,
+                                                  const float* bias, float* out,
+                                                  int in_f, int out_f, int nrows,
+                                                  cudaStream_t s) {
+    // The v2 entry's "nothing to do" conventions, verbatim.
+    if (out_f <= 0 || nrows <= 0) return cudaSuccess;
+    if (in_f <= 0) return cudaSuccess;
+    // One row IS the v2 launch (identical by definition — no fold to prove).
+    if (nrows == 1) return ferrite_gemv_bf16_v2(x, w, bias, out, in_f, out_f, 1, s);
+    // m > 8 is outside this entry's contract. `Device::gemv_bf16_v2_mrows`
+    // pre-checks 2..=8, so this is a programming-error signal, not a fallback
+    // path (a silent 9-row fold would be a shape bug, not a slow path).
+    if (nrows > 8) return (cudaError_t)cudaErrorInvalidValue;
+    // in_f % 8 != 0: v2 itself falls back to the scalar v1 kernel, whose
+    // accumulation order is a DIFFERENT program (v1 is the FOLD trap) — decline
+    // instead of pretending parity. The Rust wrapper returns Ok(false) and keeps
+    // the per-row loop.
+    if (in_f & 7) return cudaErrorNotSupported;
+    return ferrite_gemv_bf16_nt(x, w, bias, out, in_f, out_f, nrows, s);
+}
+
 // Route-fused twin of ferrite_gemv_bf16_v2: the SAME GEMV launch, with the
 // MoE route run by its last block (gv2_route_epilogue). ABI adds the route
 // outputs + the bias/scale/score_func the standalone dsv41_route_topk takes,

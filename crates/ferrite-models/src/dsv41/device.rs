@@ -375,7 +375,17 @@ struct Kernels {
             *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
-    // The route-fused twin of the above: the same GEMV launch with the MoE
+    // The MoE gate's multi-row entry (`DSV41_GATE_MROWS`,
+    // `ferrite_gemv_bf16_v2_mrows`): the SAME multi-row v2 program as
+    // `gemv_bf16_nt` above (one definition in the .so — the fold runs the
+    // program it claims parity with), under the gate's own name and its 1..=8
+    // bound. Optional: an .so without it falls back to `gemv_bf16_nt`, then to
+    // the per-row `gemv_bf16` loop. ABI is `gemv_bf16_nt`'s verbatim.
+    gemv_bf16_v2_mrows: Option<
+        unsafe extern "C" fn(
+            *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // route (`dsv41_route_topk`'s body) run by its LAST block. ABI adds the
     // route outputs + bias/scale/score_func and the per-call counter `ctr`
     // (4B device memory, zeroed once at allocation — the kernel self-resets it
@@ -1004,6 +1014,7 @@ impl Device {
             gemv_bf16: ko!(rt, "dsv41_gemv_bf16"),
             gemv_bf16_v2: ko!(rt, "ferrite_gemv_bf16_v2"),
             gemv_bf16_nt: ko!(rt, "ferrite_gemv_bf16_nt"),
+            gemv_bf16_v2_mrows: ko!(rt, "ferrite_gemv_bf16_v2_mrows"),
             gemv_bf16_v2_route: ko!(rt, "ferrite_gemv_bf16_v2_route"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
@@ -3301,6 +3312,74 @@ impl Device {
         Ok(true)
     }
 
+    /// The MoE gate's multi-row GEMV (`DSV41_GATE_MROWS`) — the plan-named entry
+    /// (`ferrite_gemv_bf16_v2_mrows`, C side: `ferrite_kernels.cu`, next to the
+    /// v2 launcher).
+    ///
+    /// It runs the SAME program [`Self::gemv_bf16_mrows`] runs, and that method's
+    /// contract applies verbatim: `n = n_routed = 384 < GEMV_V2_MAX_N`, so the
+    /// per-row call takes `ferrite_gemv_bf16_v2` (`gemv_bf16_v2_kernel<WPR>`,
+    /// `WPR = gv2_wpr(384) = 8`, `rpb = 1`), and the multi-row form is
+    /// `gemv_bf16_nt_kernel<NT, 8>` — the same `kper`/`k0`/`k1` K-slice per warp,
+    /// the same uint4 weight load + four `__bfloat1622float2` decodes + two
+    /// 4-term FMA groups, the same `__shfl_down_sync` tree, the same per-token
+    /// smem fold (`sum += part[t][(warp/WPR)*WPR + j]`, j ascending). Row r is
+    /// BIT-IDENTICAL to the single-row `gemv_bf16` of row r (`tests_gate_mrows.cu`
+    /// asserts it at the gate's own WPR = 8/4 shapes), which is what makes this a
+    /// pure byte/launch win: the gate weight is streamed ONCE for all `m` rows
+    /// instead of `m` times, and `m` launches become one.
+    ///
+    /// ⚠️ NOT `gemv_bf16_mrows`' v1 order: `head_gemv_bf16_mrows` is the
+    /// `WPR == 1` program only (the head's shape, `out_f >= 16384`). The gate at
+    /// WPR = 8 has a cross-warp K-split whose smem fold is part of the
+    /// accumulation order — using the head's kernel here would silently change it
+    /// (the FOLD regression, commit b8b67c0).
+    ///
+    /// `Ok(false)` = NOT performed, keep the per-row loop: the .so predates BOTH
+    /// multi-row symbols, the per-row path would NOT take v2 (v1 is a different
+    /// accumulation order, so there is no parity to claim), `rows` is outside
+    /// 1..=8, or `k % 8 != 0` (the same bound the C entry declines on).
+    pub fn gemv_bf16_v2_mrows(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        // Only fold when `gemv_bf16` would take v2 (see `gemv_bf16_mrows`).
+        if !gemv_bf16_v2_wanted(n) || self.kernels.gemv_bf16_v2.is_none() {
+            return Ok(false);
+        }
+        if !(1..=GEMV_V2_MROWS_MAX).contains(&rows) || (k & 7) != 0 {
+            return Ok(false);
+        }
+        // `FERRITE_GEMV_SKIP` is a timing-only ablation INSIDE the multi-row
+        // entry: treating it as "do not fold" keeps the ablation honest.
+        if gemv_bf16_nt_skip() {
+            return Ok(false);
+        }
+        // The gate's own symbol first; `ferrite_gemv_bf16_nt` — the SAME program
+        // under its historical name — is the fallback for a .so built before
+        // this entry landed. (The C entry handles `rows == 1` itself; the nt
+        // dispatch starts at 2.)
+        if let Some(f) = self.kernels.gemv_bf16_v2_mrows {
+            let rc = unsafe { f(x, w, std::ptr::null(), out, k, n, rows, self.stream) };
+            self.kerr(rc, "ferrite_gemv_bf16_v2_mrows")?;
+            return Ok(true);
+        }
+        if rows < 2 {
+            return Ok(false);
+        }
+        let Some(f) = self.kernels.gemv_bf16_nt else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(x, w, std::ptr::null(), out, k, n, rows, self.stream) };
+        self.kerr(rc, "ferrite_gemv_bf16_nt")?;
+        Ok(true)
+    }
+
     /// Multi-row twin of `gemv_bf16` for the DSpark verify's head: ONE launch
     /// streams the `[n, k]` bf16 weight ONCE and folds all `rows` activation
     /// rows against it (`x` = `[rows, k]` f32, `out` = `[rows, n]` f32), where
@@ -5013,6 +5092,14 @@ impl Device {
 /// bit-exact path. The small-n users are the MoE gate (384), the indexer's
 /// wk (index_head_dim) and wp (index_n_heads) projections.
 const GEMV_V2_MAX_N: i32 = 2048;
+
+/// Activation-row bound of the multi-row v2 GEMV (`DSV41_GATE_MROWS` /
+/// `ferrite_gemv_bf16_v2_mrows`). The C entry declines above it
+/// (`cudaErrorInvalidValue`), so the Rust wrapper refuses the fold first and
+/// keeps the per-row loop — a 9-row fold would be a shape bug, not a slow path.
+/// The gate's production shapes (m = 5/6 verify rows) are well inside it, and
+/// `VERIFY_ROWS` is the buffer bound the fold reads `s.xn_r` within.
+const GEMV_V2_MROWS_MAX: i32 = 8;
 
 /// `FERRITE_GEMV_SKIP=1` is a timing-only ablation INSIDE `ferrite_gemv_bf16_nt`
 /// (its entry returns `cudaSuccess` without launching). The row fold routes the

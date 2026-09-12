@@ -94,7 +94,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 **性能（400 tok/s 口径：accept 3 ⇒ 步时 ≤7.5ms）**：
 - 基线 48ms/步（verify 37.31 + draft 4.37 + 主链 6.15 + commit 0.33）@ accept 0.83
 - **accept 是真正的乘数**（0.83→3 = 3.6× 缺口 vs 性能 1.6× 缺口）
-- 已实现的 gate（全部默认 OFF，等 A/B）：SH_EXP_MROWS(−8.3ms)、VERIFY_GRAPH(−15ms submit)、DRAFT_P3A(−37 launch)、MARKOV_SLICED(−1ms draft)、VERIFY_ROPE_MROWS(−0.6ms)、SWALLOW_STEP(−6.15ms 主链)、tcgen05 mxf4(−6.8ms routed experts)
+- 已实现的 gate（全部默认 OFF，等 A/B）：SH_EXP_MROWS(−8.3ms)、VERIFY_GRAPH(−15ms submit)、DRAFT_P3A(−37 launch)、MARKOV_SLICED(−1ms draft)、VERIFY_ROPE_MROWS(−0.6ms)、SWALLOW_STEP(−6.15ms 主链)、tcgen05 mxf4(−6.8ms routed experts)、**GATE_MROWS**(−2.75ms gate 行折叠；`DSV41_GATE_MROWS` 与 `DSV41_ROW_FOLD_GATE` 同程序双名，入口 `ferrite_gemv_bf16_v2_mrows` → 复用 `gemv_bf16_nt_kernel<NT,8>` 单一定义；逐位见证 `tests_gate_mrows.cu` 三臂对比)
 - **最终判定**（`docs/agent/final-400-config.md`）：全部落地后步时 ~12ms，accept 3 → 250 tok/s；**7.5ms 触架构地板**（weight-stationary 下限 7.4-9.2ms）——400 需要 accept ≥4 或 verify ≤5.5ms（需 tcgen05 + 融合全部兑现）
 - verify 的 ms 分解（`docs/agent/verify-ms-breakdown.md`）：50% launch submit + 49% in-kernel 残差 + 5% 带宽——先 A（合并/mrows）后 B（图化）
 - routed experts 残差分析（`docs/agent/routed-expert-residual.md`）：377GB/s 的成因 = 每 fp4 值 2.5 条 L1TEX 解码指令 → tcgen05 是唯一根治路径（−6.8ms）
