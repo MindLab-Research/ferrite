@@ -7642,3 +7642,17 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 2. expert ncu 重测后再考虑 cp.async（5 次阴性后需要新数据）
 
 **300 tok/s 路径**：expert tcgen05 fp4 swapAB（2.0ms→1.0ms → 3.0ms ≈ 333 tok/s）——研究级（kind::f8f6f4 本仓库未用过）。
+
+### expert tcgen05 fp4 swapAB 预研定案（2026-09-12 14:00）
+
+**可行性：成立**（指令可用性三处离线证实）：
+1. `tcgen05.mma.cta_group::1.kind::f8f6f4` 在 **sm_103a 可用**（CCCL arch guard 显式含 1030；CUTLASS SM100_MMA_MXF8F6F4_SS；DeepGEMM 已实写 e4m3.e2m1 配对）
+2. scale：`kind::mxf8f6f4.block_scale.scale_vec::1X`（K=32 粒度，与 checkpoint per-32 e8m0 零转换；SFA/SFB 落 TMEM）
+3. 布局：A=fp4 权重走 smem descriptor（4-bit canonical swizzle）；B=e4m3 激活 smem/tmem；D 累加器 TMEM
+4. swapAB 解决 M=128 钉死：gateup 3840/128=30 tile ✓、down 5120/128=40 tile ✓
+
+**真缺口**：现 mxf4 kernel **无 cp.async/TMA**（LDG→STS）——16.8 GB/s 的根因。不补异步流水，换 f8f6f4 仍是 0.2% 带宽地板。
+
+**工作量**：ptxas 探针 0.5d + 新 kernel（A/B 对调 + K=32 + 1X scale + cp.async/TMA）2-3d + launcher/parity 1d ≈ **4-5 人日**。
+
+**300 tok/s 路径**：expert 2.0ms → 1.0ms（tcgen05）→ 步 3.0ms ≈ 333 tok/s。
