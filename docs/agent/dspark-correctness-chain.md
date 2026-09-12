@@ -194,3 +194,11 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 ⇒ **e2m1 vs e4m3 = backbone 里量级最大的已知数值分歧**（e2m1 尾数 1 位 vs e4m3 尾数 3 位——每层每 token 的 routed expert 输出都有系统性偏差，44 层累积）。这完美解释：首 token 近 tie 翻转（`《` vs `出`）、长链尾部的 opa 退化、EAGER 与 spec 双双中招（backbone 共性）。
 **修复方向**：routed expert 的激活切 e4m3（`DSV41_EXPERT_ACT_FP8` A/B 先验证）。
 **注意**：这**不是** 8a5a952..HEAD 的回归——它是**一直存在的架构级偏差**（官方 fp4_gemm 是混合精度 MMA：fp8 激活 × fp4 权重；ferrite 的 fp4 kernel 假设 fp4 激活）。用户说"162tok/s 版没乱码"可能因为那个版本的其它路径掩盖了它，或 opa 的出现需要特定上下文长度（阈值效应）。锚点版复测（anchor-dsv41run-retest）会给出判定。
+
+## 头号根因的 kernel 侧证据（官方 kernel.py 的混合精度语义）
+
+- `kernel.py:14-15`：`FP8="float8_e4m3"` / `FP4="float4_e2m1fn"`——两种 dtype 都存在。
+- `kernel.py:478+` 的 `fp4_gemm_kernel`：**A（激活）是 fp8 e4m3、B（权重）是 packed e2m1**——`B is stored as [N, K//2] in float4_e2m1fn_x2`（:493）——即官方的 fp4 GEMM 是**fp8 激活 × fp4 权重的混合精度 MMA**（"for fp4 the kernel handles the mixed precision" 的确切含义）。
+- **ferrite**：`quant_fp4`（device.rs:2062）把激活打成 **e2m1 packed**（`xq4`——`chain_dev.rs:180-186` 的注释自证："the ROUTED experts' fp4 packing of xn"）→ expert kernel 假设激活也是 fp4。
+- **量化误差量级**：e2m1 尾数 1 位（相对误差 ~2^-1 步长）vs e4m3 尾数 3 位（~2^-3）——**4 倍的量化噪声**，每层每 token、44 层累积。这就是首 token 近 tie 翻转（`《`→`出`）与 opa 尾部的机制。
+- **修复**：激活切 `quant_fp8`（现成 kernel device.rs:2021）+ expert kernel 接受 fp8 激活（读 `dsv41_experts_mxf4.cu`——mxf4 的 tcgen05 路线可能已经是 fp8 激活的（`act_scale` f32→e8m0 转换暗示了 fp8 激活的 block scale）——`expert-act-fp8-ab` 在实施）。
