@@ -354,3 +354,21 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 **为什么 replay 不需要 kernel 从 device 侧读 `committed`**：多余的那次 publish 是**逐字节幂等**的——kernel 的目的槽是设备 `*clen - 1`，而「未完成一个 group」的行既不推进 `*clen`（`compress_commit_kernel` 的 `if (*out_rows <= 0) return;`），也不改写 `latent`（`compressor_pool_kernel` 的 `if (mode == 2 && out_rows_val == 0) return;`），于是它重写的正是上一次已经写过的同一 group、同一字节。这正是**单行参考路径**每步都在做的事（`indexer()` 只要 `owns_k` 就无条件 publish），所以「无条件发射」不是新语义，而是 verify 向 reference 对齐。代价：图内每次 verify 多 3 层 × 未完成行数 个极小 launch（幂等写），图外 0 成本。
 
 **不要走 kernel 加 `do_publish` 参数的路线**：那会改 `dsv41_index_k_publish` 的 ABI，而按仓库的双产物纪律（`crates/ferrite-kernel/build.rs` 的 .so/.cu 同源门禁），部署侧已有的 .so 必须重建，否则 eager 路径直接崩（参数错位：旧符号会把 `do_publish` 当 `idx_hd`、`idx_hd` 当 stream）。
+
+## 决定性全 gate 测试（ad5d9703，2026-09-12 下午）——正确性达标 ✓
+
+**配置**：SPEC + DSPARK + WRITEBACK + E4M3 + ILV=0 + SH_EXP + GRAPH + ROPE_MROWS + P3A
+
+| 指标 | 结果 |
+|---|---|
+| **文本** | **LEN 132、opa: False ✓✓✓、双字 4**——首次全 spec 栈达到 EAGER 级质量 |
+| **图化** | captured verify_graph_m5 at pos=20 ✓ |
+| **accept** | k_acc={0:35, 1:12, 2:6, 3:3, **4:3**}——k_acc=4 首次出现，mean-k 0.840 |
+| **verify** | 43.85ms（**比基线 37.31 慢 6.54ms**）|
+
+**性能回归分析**：
+- ILV=0（E4M3 的必要条件）：非交错权重布局使 gate/up 读取更慢 + 不能用融合 swiglu epilogue → **主因**（估计 +5-7ms）
+- E4M3 双趟：+1.37ms（预期内的第二趟 GEMM 开销）
+- 图捕获步的摊销：capture at pos=20 → 前 20 步走裸链 → 50 步平均被拉高
+
+**修复方向**：让 E4M3 双趟与 ILV 兼容（fused kernel 写 [inter] 后 add → 需要 fused epilogue 的双趟变体）
