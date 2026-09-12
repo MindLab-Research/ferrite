@@ -734,14 +734,22 @@ impl<'a> DsparkDev<'a> {
             // `h = hc_pre(x, pre_mix)`, the reference's `h(pre_mix)` — taken
             // BEFORE the in-place rmsnorm below, which is why it is recorded here.
             self.dump_unit_idx("h_premix_block", s, self.xn.ptr as *const f32, &[bs, dim]);
-            self.dev.rmsnorm(
-                self.xn.ptr as *const f32,
-                attn_norm.as_f32(),
-                self.xn.ptr as *mut f32,
-                bs as i32,
-                dim as i32,
-                eps,
-            )?;
+            // Per-row rmsnorm (n=1), the SAME call shape the backbone uses.
+            // The unit diff caught the m=bs call producing 1e27 garbage: the
+            // kernel's n>1 handling is broken (hand-computing rmsnorm on the
+            // same collapse row and the checkpoint's attn_norm weights gives
+            // normal values; the m=5 call alone explodes). Every row gets its
+            // own n=1 launch — bit-identical to the backbone's per-row calls.
+            for r in 0..bs {
+                self.dev.rmsnorm(
+                    (self.xn.ptr as *const f32).wrapping_add(r * dim),
+                    attn_norm.as_f32(),
+                    (self.xn.ptr as *mut f32).wrapping_add(r * dim),
+                    1,
+                    dim as i32,
+                    eps,
+                )?;
+            }
             // post-norm xn — the SAME semantic as the golden harness's
             // `stage{s}.attn.in` (attn_norm's output), for direct diffing.
             self.dump_unit_idx("h_norm_block", s, self.xn.ptr as *const f32, &[bs, dim]);
