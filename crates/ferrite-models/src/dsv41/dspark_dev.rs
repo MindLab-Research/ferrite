@@ -1090,6 +1090,84 @@ impl<'a> DsparkDev<'a> {
         ids[0] = t0 as i32;
         self.upload_i32(&self.ids, &ids)?;
 
+        // ---- D4: the window index table (an H2D, so OUTSIDE any capture) ----
+        // It settles at `n_win == win` the moment `pos >= win` (`win_rows` then
+        // returns `(win, 0)` for good, see the graph gate) and is never
+        // re-uploaded, so from then on every replay reads the SAME `idxs` bytes
+        // the recording saw. Skipped at `pos == 0` exactly as before: that
+        // forward returns before the block loop and has no window to index.
+        if pos > 0 {
+            self.ensure_idxs(pos)?;
+        }
+
+        // ---- the draft's kernel sequence: direct, or the graph arm ---------
+        // Everything below is ONE kernel sequence with no host effect left in
+        // it, which is what lets `DSV41_DRAFT_GRAPH` RECORD it and rePLAY it as
+        // a single launch. All four arms drive the SAME `draft_body`: the graph
+        // must contain the sequence a normal forward would have issued, never a
+        // variant of it.
+        if !self.draft_graph_arm(pos) {
+            self.draft_body(pos, false)?;
+        } else if !self.graph_dry_done {
+            // DRY: a REAL execution, so every lazy first-use cost (module load,
+            // stream-ordered setup) happens OUTSIDE the recording. Its device
+            // effects are the caller's to keep, exactly like any other draft.
+            self.draft_body(pos, true)?;
+            self.graph_dry_done = true;
+        } else if let Some(e) = self.graph {
+            // REPLAY. Rendezvous first: a capture only RECORDS the MoE
+            // all-reduce while a peer may already be EXECUTING its own — the
+            // same host-barrier pair `DevChain::step_impl` keeps around its
+            // capture. A no-op without peers (`comm` is None off TP8).
+            if let Some(c) = self.comm.as_ref() {
+                c.host_barrier();
+            }
+            self.dev.graph_launch(e)?;
+            self.graph_replays += 1;
+        } else {
+            self.draft_capture(pos)?;
+        }
+
+        // ---- serialise the capture (one file per armed forward) ----
+        if let Some(u) = self.unit.take() {
+            let meta = format!(
+                "{{\"pos\":{pos},\"t0\":{t0},\"bs\":{bs},\"hc\":{hc},\"dim\":{dim},\"nh\":{},\
+                 \"hd\":{},\"vocab\":{},\"mr\":{},\"n_target\":{},\"n_mtp\":{},\"world\":{},\
+                 \"rank\":{},\"pid\":{},\"inject\":{injected}}}",
+                self.nh,
+                self.hd,
+                self.vocab,
+                self.mr,
+                self.n_target,
+                cfg.n_mtp_layers,
+                self.world,
+                self.rank,
+                std::process::id(),
+            );
+            if let Err(e) = u.write(&meta) {
+                eprintln!("[dspark] unit dump write failed: {e}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The draft's kernel sequence — the region `DSV41_DRAFT_GRAPH` records.
+    ///
+    /// Split out of [`Self::draft_forward`] so the recording, the DRY run and
+    /// the direct path all drive EXACTLY the same launches: a capture is sound
+    /// only if the recorded sequence is the one a normal forward would have
+    /// issued, so there is ONE body and not two.
+    ///
+    /// Nothing that touches the host may live here — no `upload_*`/`download_*`
+    /// (those are the caller's prologue), no allocation, no probe. The one
+    /// host-side branch is `pos == 0`, which the gate excludes, and the one
+    /// behavioural switch is `slot_dev` (see [`Self::seed_window`]).
+    fn draft_body(&mut self, pos: usize, slot_dev: bool) -> Result<()> {
+        let cfg = self.cfg;
+        let dim = self.dim;
+        let bs = self.bs;
+        let hc = self.hc;
+
         // ---- forward_embed ----
         // main_x = main_norm(main_proj(concat(target hiddens)))
         self.project_main_x()?;
@@ -1118,7 +1196,6 @@ impl<'a> DsparkDev<'a> {
             return Ok(());
         }
 
-        self.ensure_idxs(pos)?;
         // pos_base is uploaded per RoPE call below; make the value that never
         // changes explicit.
         let eps = cfg.norm_eps;
