@@ -2239,3 +2239,15 @@ DSV41_BF16_TRUNCATE=1
 **判定**：ld_uint4_a16 对齐修复**没有解决** misaligned 问题——根因不在 uint4 加载的对齐检查（gathered buffer 本来就对齐，subagent 的修正正确）。**真正的根因在别处**——可能是 B 侧间接寻址（base + e*stride）或 swapAB 路径的 uint4 读。
 
 **Wave 1 的成功不受影响**——tcgen05 关掉后 Wave 1 仍然工作（25.17ms，零拉丁 ✓）。
+
+## Wave 1 长文本测试结果（f9e42b20）——数字任务零拉丁 ✓
+
+**结果**：LEN=207，拉丁=[]（零拉丁 ✓），completion=144 tokens
+**commit 时间稳定**：0.82, 0.49, 0.49, 0.45, 0.45ms——**commit 是稳定的**（与用户的"真的 step time 极其稳定"一致）
+**[dspark] steps 行未出现**——144 tokens / ~5 tok/step（数字任务 accept 高）≈ 29 步 < 50 步的打印阈值
+
+**判定**：
+1. Wave 1 的 HC 融合 + mrows 在数字任务上零拉丁 ✓（跨 prompt 验证）
+2. commit 时间稳定（0.45-0.82ms）——真实的模型内部计时确实稳定
+3. 需要更多步数才能触发 [dspark] steps 行（>50 步）
+4. **nsys per-kernel 计时**是最终的准确计时方案（nsys-timing-prep subagent 准备中）
