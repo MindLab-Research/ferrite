@@ -6422,3 +6422,27 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 | S4 | + AR fix (设计中) | ? | ? |
 
 **SWALLOW 与 lazy 的差距缩小**：91.1 / 63.8 = 1.43×（从 1.56× 缩小）
+
+## ⚠️ tcgen05 TMA 修复 + mrows b2+b3 组合测试——仍失败！（3fc6db76）
+
+**结果**：
+- LEN=0（空输出）completion=0
+- **1 misaligned**：`rank 7: sync: misaligned address`（与修复前相同的错误！）
+- 0 panic（engine fault 杀了请求但 serve 存活）
+
+**判定**：
+1. **tcgen05 TMA 修复（+775/-69 行）没有解决 misaligned**！
+2. **rank 7 的对齐问题仍然存在**——TMA bulk 的 16B 对齐修复不完整
+3. **SWALLOW 保持 63.8 tok/s**（mrows b2+b3——不含 tcgen05）
+
+**tcgen05 的修复历史**：
+| 轮 | 修复 | 结果 |
+|---|---|---|
+| 0 | 原始 | 208ms 快崩 |
+| 1 | 6 个 split body 读点 byte-fallback | 18.8s 长跑但 LEN=0 |
+| 2 | 4 个新读点（含 :5009）| 191ms 快崩 |
+| **3** | **TMA 修复（+775/-69：布局不变量+视图约束+bulk guard）** | **rank 7 misaligned——仍未修复！** |
+
+**结论**：tcgen05 的 misaligned 根因可能不在 TMA bulk 或已知的读点——**可能有更深的结构性问题**（rank 7 的分片边界天然不 16B 对齐？）
+
+**SWALLOW 的当前最佳：63.8 tok/s（mrows b2+b3）——不含 tcgen05**
