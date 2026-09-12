@@ -41,6 +41,37 @@ NVCC="${NVCC:-nvcc}"
 # point at nothing and faulted: 4 faults, empty outputs).
 FAST_MATH_FLAG="--use_fast_math"
 if [ -n "${FERRITE_NO_FAST_MATH:-}" ]; then FAST_MATH_FLAG=""; fi
+
+# ---------------------------------------------------------------------------
+# OPT-IN in-tree kernel blocks (2026-09-12). Both tcgen05 gate/up arms live in
+# dsv41_experts_mxf4.cu behind a COMPILE-TIME #ifdef, so the .so either carries
+# their extern "C" entry point or it does not — the Rust side probes the SYMBOL
+# (`Device::supports_expert_tcgen05_mxf4`, device.rs:3438), never a version
+# string. Default OFF: the stock .so has neither symbol and the proven GEMV/GEMM
+# path stays in force.
+#   DSV41_BUILD_TCGEN05_MXF4=1      -> -DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1
+#   DSV41_BUILD_TCGEN05_MXF8F6F4=1  -> -DDSV41_TCGEN05_GATEUP_SKELETON=1
+# The two macros are independent by design (dsv41_experts_mxf4.cu:3427 — nested
+# namespaces), so enabling one can never change the other block.
+#
+# ⚠️ The flag set is folded into BUILD_ID below. Without that, a flag-less
+# rebuild of the same source would rewrite .build_id with the SAME string while
+# the .so silently lost the symbol — the same-source gate would call a
+# symbol-less .so "matching" and the serve A/B would measure the OLD path on
+# both arms (the project's #1 measurement-bias trap). Consequence: ANY build
+# after this change gets a new id, so rebuild BOTH products (see
+# scripts/dsv41_serve_ab.sh for the one working order).
+# ⚠️ scripts/dsv41_serve_ab.sh SELF-HEALS a stale pair by re-running this script,
+# so an A/B that needs the skeleton must EXPORT DSV41_BUILD_TCGEN05_MXF4=1 —
+# the env is inherited by that rebuild and the symbol survives it.
+# ---------------------------------------------------------------------------
+SKELETON_FLAGS=()
+if [ -n "${DSV41_BUILD_TCGEN05_MXF4:-}" ]; then
+    SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1)
+fi
+if [ -n "${DSV41_BUILD_TCGEN05_MXF8F6F4:-}" ]; then
+    SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_SKELETON=1)
+fi
 # Build stamp: the Rust side refuses to load a .so built from another
 # revision (user rule: 严禁组合不同版本). Use the git revision of THIS tree.
 BUILD_ID="$(git -C "$(dirname "$0")" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -50,7 +81,8 @@ fi
 # Same-source enforcement: fold the .cu content hash in. The Rust side embeds
 # whatever this script last wrote to .build_id, so rebuilding only ONE of the
 # two artifacts produces a mismatch and the process REFUSES TO START.
-CU_HASH="$(sha256sum "${SRCS[@]}" | sha256sum | cut -c1-16)"
+CU_HASH="$( { sha256sum "${SRCS[@]}"; echo "flags ${SKELETON_FLAGS[*]-<none>}"; } \
+            | sha256sum | cut -c1-16)"
 BUILD_ID="${BUILD_ID}+cu${CU_HASH}"
 echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
 
@@ -58,6 +90,9 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
     -std=c++17 \
     -gencode "arch=compute_${ARCH},code=sm_${ARCH}" \
     -DFERRITE_KERNEL_BUILD_ID="\"${BUILD_ID}\"" \
+    "${SKELETON_FLAGS[@]+"${SKELETON_FLAGS[@]}"}" \
     -o "$OUT" "${SRCS[@]}"
 
 echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]} (build_id ${BUILD_ID})"
+[ ${#SKELETON_FLAGS[@]} -gt 0 ] && \
+    echo "  skeleton flags: ${SKELETON_FLAGS[*]} (gated blocks are COMPILED IN; each still needs its runtime env gate)"
