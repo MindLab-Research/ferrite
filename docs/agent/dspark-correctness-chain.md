@@ -4628,3 +4628,21 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 - **400 需要 batched（SWALLOW 修复）**——lazy 的 145 上限不够
 
 **现实的 lazy 路径**：89.6 → 95（重验完成）→ 105-118（tcgen05+L4 项）→ 145 需要 L4/L5 全面化
+
+## 批量重验的准备（LAZY_SDR 完成后）
+
+**批量测试设计**（省 serve 启动时间）：
+```
+臂 1：base + R2 + MARKOV + LAZY_SDR（如果干净）+ VERIFY_FORK=1
+臂 2：臂 1 + ATTN_MROWS2=1 + ATTN_MROWS_ROPE_NORM=1（K1+K2）
+```
+每臂：计数前 61 行 + 吞吐 + k_acc
+
+**预期**：
+| 臂 | 预期吞吐 |
+|---|---|
+| LAZY_SDR（跑中）| ~90-91 |
+| + VERIFY_FORK | ~91-93 |
+| + K1/K2 | ~93-95 |
+
+**注意**：K1/K2 与 R2 的关系——K1 优先于 R2 的 lin2（同程序融合更安全）但如果 R2 已经干净，K1/K2 的增量可能小（R2 已拿了大部分收益）
