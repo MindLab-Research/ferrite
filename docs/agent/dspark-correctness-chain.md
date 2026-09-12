@@ -2655,3 +2655,23 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - **数字/模板（accept 5）**：需要步时 ≤15ms——**可达**（SH_PAIR+SWALLOW+tcgen05）
 - **出师表（accept 1.2）**：需要步时 ≤5.5ms——**不可达**（低于 L5 地板）
 - **对话（accept 0.96）**：需要步时 ≤5ms——**不可达**（模型行为限制）
+
+## SWALLOW ar5-hang 修复的第三次失败（bd36ae77——Plan A+C 无效）
+
+**三次修复尝试的结果**：
+| 尝试 | gap | 修复内容 | 结果 |
+|---|---|---|---|
+| 原始 | 1-2 | 无 | hang |
+| 修复 1 | 22 | argmax capturing 守卫 + DRY barrier | ❌ 更差（epoch 错位）|
+| 回退 | 3 | 移除守卫和 barrier | ❌ 改善但未修复 |
+| Plan A+C | **23** | barrier 对称化 + SWALLOW warmup 3 blocks | ❌ 类似修复 1 |
+
+**判定**：Plan A+C 的 barrier 对称化可能引入了与修复 1 类似的问题。ar5-hang 的根因可能不是 barrier 数量不对称——**而是更根本的时序竞态**。
+
+**Plan B**（unanimity-or-direct）：臂决策的 rank 同步——所有 rank 投票选同一臂。这是最后的设计方案。
+
+**替代方案**（如果 Plan B 也失败）：
+- **SWALLOW 不用图**（VERIFY_GRAPH=0 + SWALLOW_STEP=1）——所有步走 direct，臂选择统一，barrier 计数一致
+- 或者：**放弃 SWALLOW**，专注 LAZY_VERIFY 的优化路径
+
+**下一步**：先试 SWALLOW 不用图（最简单的验证——如果不用图就不 hang，说明图的臂分歧是根因）
