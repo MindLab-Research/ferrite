@@ -742,6 +742,9 @@ impl<'a> DsparkDev<'a> {
                 dim as i32,
                 eps,
             )?;
+            // post-norm xn — the SAME semantic as the golden harness's
+            // `stage{s}.attn.in` (attn_norm's output), for direct diffing.
+            self.dump_unit_idx("h_norm_block", s, self.xn.ptr as *const f32, &[bs, dim]);
 
             self.draft_attention(s, pos)?;
             // the attention block's own units: q/kv are the post-RoPE projections,
@@ -939,26 +942,18 @@ impl<'a> DsparkDev<'a> {
             cfg.norm_eps,
         )?;
         self.quant1(self.qr.ptr as *const f32, bs * ql)?;
-        self.dump_unit_idx("qr", s, self.qr.ptr as *const f32, &[bs, ql]);
-        // wq_b is [nh * hd, ql]. DIAGNOSTIC: the multi-row (m=bs) gemm path is
-        // the prime suspect for the 100% q divergence (main_x on the SAME gemm
-        // call's m=1 path matches golden to quantisation noise, q_pre_rope on
-        // the m=5 path diverges 100%). Run per-row m=1 GEMVs to bisect the
-        // multi-row tile path — if this fixes q_pre_rope, the bug is in
-        // gemm_fp8_kernel's multi-row assumptions, not in the weights/quant.
-        for r in 0..bs {
-            self.dev.gemm_fp8_mx(
-                self.xq.as_u8().wrapping_add(r * ((ql + 31) / 32 * 32 / 8 * 8).max(ql)),
-                self.xsc.as_f32().wrapping_add(r * (ql / 32 + 1)),
-                wq_b.as_u8(),
-                wq_b_s.as_u8(),
-                std::ptr::null(),
-                (self.q.ptr as *mut f32).wrapping_add(r * nh * hd),
-                1,
-                (nh * hd) as i32,
-                ql as i32,
-            )?;
-        }
+        // wq_b is [nh * hd, ql]; one fp8 GEMM covers all bs draft rows.
+        self.dev.gemm_fp8_mx(
+            self.xq.as_u8(),
+            self.xsc.as_f32(),
+            wq_b.as_u8(),
+            wq_b_s.as_u8(),
+            std::ptr::null(),
+            self.q.ptr as *mut f32,
+            bs as i32,
+            (nh * hd) as i32,
+            ql as i32,
+        )?;
         // the pre-RoPE projection — the unit-diff isolator between the
         // projection chain (wq_a/q_norm/wq_b) and the RoPE.
         self.dump_unit_idx("q_pre_rope", s, self.q.ptr as *const f32, &[bs, nh, hd]);
