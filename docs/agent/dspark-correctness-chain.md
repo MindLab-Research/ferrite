@@ -2466,3 +2466,30 @@ DSV41_VERIFY_GRAPH=1 DSV41_BF16_TRUNCATE=1
 2. **0 ar5-hang**（ar5 修复验证——之前 gap 3）
 3. k_acc 与 lazy 可比
 4. 步时（准确值——nsys 或 [dspark] steps）
+
+## 全栈组合测试的配置（所有修复验证后的最终性能测试）
+
+**前提**：parity 通过 + tcgen05 冒烟通过 + SWALLOW ar5 修复验证通过
+
+**配置**：
+```bash
+DSV41_SWALLOW_STEP=1              # 主链折进 verify（-4.55ms）
+DSV41_SH_PAIR_M=1                 # SH_PAIR template<M>（-4.9~7.9ms ms 账）
+DSV41_EXPERT_TCGEN05_E4M3=1      # tcgen05（-1~3.8ms）
+DSV41_EXPERT_GROUPED=1
+DSV41_GATEUP_FUSE=0 DSV41_EXPERT_ILV=0  # tcgen05 前置
+DSV41_HC_VERIFY_FUSE=1            # A1
+DSV41_HC_FRONT_ROWS=1             # A2
+DSV41_VERIFY_AR_FOLD=1            # AR fold
+DSV41_GATE_MROWS=1                # gate m-rows
+DSV41_INDEXER_MROWS=1             # indexer front
+DSV41_COMPRESSOR_MROWS=1          # compressor
+DSV41_VERIFY_GRAPH=1              # 图化
+DSV41_BF16_TRUNCATE=1             # 零拉丁
+DSV41_EXPERT_ACT_E4M3=1           # e4m3
+# NOT: DSV41_LAZY_VERIFY（SWALLOW 是 batched）
+```
+
+**验证**：零拉丁 + 0 ar5-hang + k_acc + 步时（准确值）+ nsys per-kernel
+
+**这是 400 冲刺的最终测试**——如果所有优化兑现，步时应达到 ~13-18ms。
