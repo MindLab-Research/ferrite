@@ -4424,24 +4424,6 @@ fn hc_tail_split() -> bool {
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
 
-        // DSpark target-hidden tap: the draft consumes the per-copy mean of the
-        // target layers' ATTENTION INPUT — h here, before this layer's mixes
-        // run (hc_mixes only READS h). The tap buffers are fixed allocations,
-        // so this one-block collapse is graph-capturable with the rest of the
-        // step; it costs ~3 tiny launches per step and only when armed.
-        if cfg.dspark_armed() {
-            if let Some(slot) = cfg.dspark_target_slot(layer) {
-                self.dev.hc_collapse(
-                    self.s.h.ptr as *const f32,
-                    self.s.dspark_pre_mean.as_f32(),
-                    (self.s.dspark_tap.ptr as *mut f32).wrapping_add(slot * dim),
-                    1,
-                    hc as i32,
-                    dim as i32,
-                )?;
-            }
-        }
-
         // ---------------- attention block ----------------
         // The fused front end, when it runs, also collapses and normalises; the
         // collapse reads `premix_slot(pa)` rather than the slot the mixes write,
@@ -4682,6 +4664,25 @@ fn hc_tail_split() -> bool {
         }
         if phase_dbg() {
             eprintln!("[phs] L{layer} ffn_total={:?}", _t_moe.elapsed());
+        }
+        if cfg.dspark_armed() {
+            if let Some(slot) = cfg.dspark_target_slot(layer) {
+                // sglang's capture point (deepseek_v4.py:3132-3141): the mean
+                // over the hc copies of the layer's COMPLETED output
+                // (`completed.mean(dim=1)` — after this layer's whole forward,
+                // attention AND ffn). The historical tap ran at the layer's
+                // START, capturing the PREVIOUS layer's output — one full
+                // layer off, enough to systematically skew main_x and every
+                // draft token after it.
+                self.dev.hc_collapse(
+                    self.s.h.ptr as *const f32,
+                    self.s.dspark_pre_mean.as_f32(),
+                    (self.s.dspark_tap.ptr as *mut f32).wrapping_add(slot * dim),
+                    1,
+                    hc as i32,
+                    dim as i32,
+                )?;
+            }
         }
         Ok(2) // slot 2 holds this layer's ffn_pre = the next layer's premix
     }
