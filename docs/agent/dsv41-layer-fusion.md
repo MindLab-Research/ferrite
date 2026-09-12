@@ -573,6 +573,32 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
     把 `HC_TAIL_PRIO=0` 会连带静默关掉 side_stream2/3 的优先级。
   - 判据：nsys `--cuda-graph-trace=node` 看三条侧链的 span 是否落在各自窗口内；stderr 的
     `[hc_tail]/[dual_chain]/[compress_side] side stream priority = N` 是优先级真的进了 capture 的唯一证据。
+  - `DSV41_DL_PRIO`（**第四条侧流** `side_stream4`，2026-09-12 实现，待上机实测）：默认
+    **default(0)**——DL 今天跑的那条流就是默认优先级，拆流只改"发到哪条流"一个变量，A/B 才可归因。
+    `=mid|greatest` 是"顺带调优先级"的臂（测了再信：DL 的 grid 只有 `mix x rows` 个块、
+    1 块/SM，`DSV41_HC_TAIL_PRIO` 的降级史正警告不要给它用不满的 SM）。
+- **第四条侧流：DL（dots+LATE）离开 EARLY 的流（`DSV41_HC_DL_SIDE`，默认 ON，2026-09-12）** ✓：
+  背景是 post-swapab-landscape 的 top-1——swapAB 把主流 gemv 压短后，tail split 的侧链
+  `EARLY(1.7µs) → DL(dots+LATE, 14.94µs)` 变成每 front 共 16.6µs、每层 2 次 ≈ 33µs，
+  开始逼近 ~35µs/层的主流窗口，`join_ev` 的余量被吃掉。
+  - **关键事实（本次核对）**：DL **只**依赖 main→side 的输入边（`x`=`s.h`、`pre_collapse`），
+    **不读任何 EARLY 输出**；两半在语句与内存上都互斥（EARLY 写 `out`/`xq`/`xsc`，
+    DL 写 `g_hc_part`/`pre`/`post`/`comb`，见 `dsv41_kernels.cu::dsv41_hc_front_split` 头部）。
+    因此把 DL 排在 EARLY 之后的**唯一理由是流序**——这正好是拆流要拿掉的东西。
+  - ⚠️ **`STATUS.md` 里"6 条 fork/join 共享同一条 side stream"的表述不准确**：实际有 3 条
+    （tail=`side_stream` / kv 双链=2 / compress=3），dual-chain 与 compress **不在** DL 的流上。
+    它们共享的是 **SM/带宽预算**（STATUS 早期的措辞"共享同一侧流预算"才是对的），
+    所以"DL+EARLY+LATE+dual-chain 线性叠加 30µs"是把两条流的工作相加，只能当上界看。
+  - 实现：`devrt.rs` 加 `side_stream4`（+`side4_prio`，接入 node-priority 判定）；
+    `dsv41_hc_front_split` 末尾加一个 **`cudaStream_t side_dl`** 形参（null ⇒ 塌回原路径，
+    `dl = side_dl ?: side`），`(0b)` 处对**同一条 `fork_ev` 记录**加第二个相邻 wait，
+    DL 两类发射（`hc_dots_late_kernel` 合并版 / `hc_mix_dots`+`HC_TAIL_LATE` 两发版）
+    与 `join_ev` 的记录全部改到 `dl`；`device.rs` 传 `rt.side_stream4()`（`supports_hc_dl_side()`）。
+    ABI 多一个尾参 ⇒ 必须与 `.so` 同构建（`verify_kernel_build` 已挡住错配）。
+  - 预期收益上界 = EARLY 那 1.7µs/front（DL 不再排在它后面）× 2 front/层 × 层数 ≈ **0.14ms/步**
+    —— 与 `e152f47`（EARLY 挪侧流）同量级；**不是**把 30µs 砍成 15µs。真收益靠上机 A/B 定。
+  - 回退：`DSV41_HC_DL_SIDE=0`（纯 A/B 臂，bit-identical，DL 排回 `side` 的 EARLY 之后）；
+    或运行时建不出第四条流（`side_stream4` 为 null，stderr 打 `[dl_side]`）。
 
 ---
 

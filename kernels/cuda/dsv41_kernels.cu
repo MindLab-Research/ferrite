@@ -346,6 +346,265 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
     }
 }
 
+// ---------------------------------------------------------------------------
+// swapAB fp8 GEMV (M=1 decode on the tensor core) -- see
+// docs/agent/perf-roadmap.md, "swapAB（M=1 落 MMA 的 N 维）可行性分析".
+//
+// `gemm_fp8_kernel` above puts the ACTIVATION on M and the WEIGHT on N, which at
+// M=1 wastes 15/16 of the MMA (one useful M row out of 16). This kernel swaps
+// the roles back: the WEIGHT is A (M = 16 output rows) and the ACTIVATION is B
+// (N = 8 columns, only column 0 carries the token). One warp owns 16 output rows
+// and walks the whole K, so there is no k_split, no cross-warp reduction and no
+// cross-warp sync at all.
+//
+// WHY IT IS WORTH IT. `gemm_fp8_gemv_kernel` measures ~9.5 us/call (246
+// calls/step = 2.33 ms) at n=1664/k=5120, while its 8.5 MB of weights move at
+// ~895 GB/s -- 11% of the B300's HBM. It is NOT memory bound: the block-level
+// staging (a32 materialisation 1.55 us + activation staging 0.8 us + LUT 0.3 us,
+// repeated in all 416 blocks) plus the FFMA consume loop are the cost. Feeding
+// raw fp8 to the tensor core deletes ALL of it -- the activation is never
+// decoded and the accumulate is the MMA's.
+//
+// LAYOUT (all pre-existing, zero transposes -- that is what makes this cheap):
+//   w  [n, k]  e4m3 row-major     == A row-major [M, K]
+//   a  [k]     e4m3               == B col-major [K, N] column 0
+//   w_scale [(n/32), nb_k] ue8m0  == per-(32-row, 32-col) weight scale
+//   a_scale [nb_k]         f32    == per-32-block activation scale
+//   out [n] f32, bias [n] f32 or null
+//
+// SCALE SCHEME -- identical to `gemm_fp8_kernel` (:320-329): the raw MMA result
+// of one 32-wide k block is scaled by (activation scale * weight scale) before
+// it joins the running fp32 accumulator. Mixing the two scale TYPES up silently
+// zeroes the output (see the dense kernel's note at :261-265).
+//
+// BIT-EXACTNESS: NOT bit-identical to `gemm_fp8_gemv_kernel`. The SIMT gemv is a
+// per-element `(a*sa)*(w*sb)` FFMA chain reduced by shuffles; this one sums raw
+// fp8 products inside the tensor core and scales per k block. Mathematically
+// equivalent, different rounding order -- the same scheme the existing m>1 dense
+// MMA path already uses. Parity is judged by text/fingerprint, not bit equality.
+//
+// Each 8-wide B column beyond 0 is ZERO (its lanes write nothing to bf), so
+// 7/8 of the N dimension is wasted -- 2x better than the dense tile's 15/16, and
+// the reason the design targets batched decode filling N with real tokens later.
+
+// Ring geometry for gemm_fp8_swapab_kernel.
+//   kSwapabKStep: k width of one stage. A multiple of 32 (one scale block == the
+//                 MMA's K) and of 16 (the cp.async granule).
+//   kSwapabNStage: ring depth.
+//   kSwapabRow: bytes per staged row. PADDED by 16: with an unpadded stride every
+//                 one of the 8 gid rows of the A fragment lands on banks 0..3
+//                 (stride/4 % 32 == 0) and each LDS.32 is an 8-way conflict; +16B
+//                 staggers row r by 4 banks, making the four fragment loads
+//                 conflict-free.
+//   kSwapabWarps: warps per block.
+//   kSwapabKSplit: K partitions per 16-row tile. THIS IS THE PARALLELISM KNOB.
+//                 MEASURED 2026-09-12: with ks=1 the kernel ran 28.4 us/call at
+//                 n=1664/k=5120 -- 16x WORSE than the SIMT gemv -- because a
+//                 16-row tile per warp caps the grid at n/16 = 104 warps (0.7 per
+//                 SM on 148 SMs), so nothing on the SM can cover a DRAM round
+//                 trip. Splitting K is the ONLY dimension left that adds warps
+//                 without touching the MMA's M=16. Partial sums are combined with
+//                 atomicAdd (the launcher zeroes `out` first), applied by the
+//                 tg==0 lanes exactly like the plain epilogue.
+#ifndef DSV41_SWAPAB_KSTEP
+#define DSV41_SWAPAB_KSTEP 256
+#endif
+#ifndef DSV41_SWAPAB_NSTAGE
+#define DSV41_SWAPAB_NSTAGE 4
+#endif
+#ifndef DSV41_SWAPAB_WARPS
+#define DSV41_SWAPAB_WARPS 1
+#endif
+#ifndef DSV41_SWAPAB_KSPLIT
+#define DSV41_SWAPAB_KSPLIT 8
+#endif
+constexpr int kSwapabKStep = DSV41_SWAPAB_KSTEP;
+constexpr int kSwapabNStage = DSV41_SWAPAB_NSTAGE;
+constexpr int kSwapabRow = kSwapabKStep + 16;
+constexpr int kSwapabWarps = DSV41_SWAPAB_WARPS;
+constexpr int kSwapabKSplit = DSV41_SWAPAB_KSPLIT;
+
+__device__ __forceinline__ void swapab_cp_async16(void* smem_dst, const void* gmem_src) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s), "l"(gmem_src));
+}
+__device__ __forceinline__ void swapab_cp_commit() { asm volatile("cp.async.commit_group;\n"); }
+template <int N>
+__device__ __forceinline__ void swapab_cp_wait() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+}
+
+__global__ void __launch_bounds__(kSwapabWarps * 32)
+gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                       const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
+                       const float* __restrict__ bias, float* __restrict__ out, int n, int k,
+                       int ks) {
+#if __CUDA_ARCH__ >= 900
+    // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have started this
+    // grid during the producer's tail, so gate the activation reads on the
+    // producer's completion. Must precede the first read of `a`/`a_scale`.
+    cudaGridDependencySynchronize();
+#endif
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int gid = lane >> 2;   // A rows gid / gid+8; B column gid
+    const int tg = lane & 3;     // A cols tg*4 (+16); C cols 2*tg
+
+    // ---- K-split warp mapping ----------------------------------------------
+    // Global warp id -> (16-row tile, K partition). `ks` is the fast index so the
+    // ks warps of one row tile read adjacent K ranges of the SAME weight rows
+    // (their staging streams are contiguous, which keeps the DRAM pages hot).
+    const int gw = blockIdx.x * kSwapabWarps + warp;
+    if (gw >= (n >> 4) * ks) return;
+    const int m0 = (gw / ks) * 16;   // first of this warp's 16 output rows
+    const int kp = gw % ks;          // this warp's K partition
+    const int kc = k / ks;           // k per partition; a multiple of 32
+    const int k0p = kp * kc;         // first global k of the partition
+    const int nb = kc >> 5;          // k-blocks (== scale entries) in the partition
+    const int nb_k = k >> 5;         // k-blocks of the whole row
+
+    // NOTE: `extern __shared__` names are aliases of the SAME dynamic smem
+    // symbol, so a second declaration of the same name with a different type is
+    // a compile error (the file already has `extern __shared__ float smem[]`).
+    extern __shared__ uint8_t sab_smem[];
+    uint8_t* sw = sab_smem + (size_t)warp * kSwapabNStage * 16 * kSwapabRow;
+
+    // ---- per-warp A/B staging (this warp's K slice only) -------------------
+    // Staged only for THIS warp's slice, so the ks partitions do not each re-read
+    // the whole activation. Vectorised 16B: a byte-wise copy of k bytes cost a
+    // fixed ~3.3 us/call on its own.
+    const size_t wbytes = (size_t)kSwapabWarps * kSwapabNStage * 16 * kSwapabRow;
+    uint8_t* s_a = sab_smem + wbytes + (size_t)warp * kc;                 // [kc] fp8
+    float* s_as = (float*)(sab_smem + wbytes + (size_t)kSwapabWarps * kc) + (size_t)warp * nb;
+    uint8_t* s_ws = (uint8_t*)(s_as + (size_t)kSwapabWarps * nb) + (size_t)warp * nb;
+    {
+        const uint4* src4 = (const uint4*)(a + k0p);
+        uint4* dst4 = (uint4*)s_a;
+        for (int i = lane; i < (kc >> 4); i += 32) dst4[i] = src4[i];
+        const int kb0 = k0p >> 5;
+        const int ws0 = (m0 >> 5) * nb_k;  // 16 rows always sit in one 32-row block
+        for (int i = lane; i < nb; i += 32) {
+            s_as[i] = a_scale[kb0 + i];
+            s_ws[i] = w_scale[(size_t)ws0 + kb0 + i];
+        }
+    }
+    __syncwarp();
+
+    const int nk = (kc + kSwapabKStep - 1) / kSwapabKStep;  // stages in the slice
+
+    // Stage `st`: 16 rows x [k0, k0+KSTEP) of THIS warp's slice, one cp.async
+    // group of 16B chunks. An out-of-range `st` STILL commits (an empty group):
+    // the depth invariant wait_group relies on is "NSTAGE-1 groups outstanding
+    // before the wait", and near the end of K the real issues run out. Without
+    // the empty groups the count drops to NSTAGE-2, wait_group(NSTAGE-2) returns
+    // immediately and the LAST TWO stages get read before their cp.asyncs land.
+    auto stage = [&](int st) {
+        if (st < nk) {
+            const int k0 = k0p + st * kSwapabKStep;
+            const int rb = min(kSwapabKStep, kc - st * kSwapabKStep);  // % 16 == 0
+            const int nchunk = rb >> 4;                                // 16B chunks/row
+            uint8_t* dst = sw + (size_t)(st % kSwapabNStage) * 16 * kSwapabRow;
+            if (nchunk == (kSwapabKStep >> 4)) {
+                // Full stage: 16B chunks per row is the compile-time power of two
+                // P, so the chunk->(row, offset) map is a shift and a mask. The
+                // generic `c / nchunk` form costs a full integer division per
+                // chunk per lane, which on a kernel whose ring already dominates
+                // is pure waste.
+                constexpr int P = kSwapabKStep >> 4;
+                constexpr int L = (P == 1) ? 0 : (P == 2) ? 1 : (P == 4)   ? 2
+                                  : (P == 8) ? 3 : (P == 16) ? 4 : (P == 32) ? 5 : 6;
+#pragma unroll
+                for (int i = 0; i < (16 * P) / 32; i++) {
+                    const int c = lane + 32 * i;
+                    const int r = c >> L;
+                    const int off = (c & (P - 1)) << 4;
+                    swapab_cp_async16(dst + (size_t)r * kSwapabRow + off,
+                                      w + (size_t)(m0 + r) * k + k0 + off);
+                }
+            } else {
+                // Partial tail stage (only the last one).
+                for (int c = lane; c < 16 * nchunk; c += 32) {
+                    const int r = c / nchunk;
+                    const int off = (c - r * nchunk) << 4;
+                    swapab_cp_async16(dst + (size_t)r * kSwapabRow + off,
+                                      w + (size_t)(m0 + r) * k + k0 + off);
+                }
+            }
+        }
+        swapab_cp_commit();
+    };
+
+    // Prologue: exactly NSTAGE-1 groups (empty when K is shorter than the ring).
+    for (int st = 0; st < kSwapabNStage - 1; st++) stage(st);
+
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int st = 0; st < nk; st++) {
+        // Exactly ONE group per iteration keeps NSTAGE-1 outstanding, so
+        // wait_group(NSTAGE-2) always retires the oldest one (== stage st).
+        stage(st + kSwapabNStage - 1);
+        swapab_cp_wait<kSwapabNStage - 2>();
+        __syncwarp();  // every lane's own group is retired -> the tile is complete
+
+        const uint8_t* s = sw + (size_t)(st % kSwapabNStage) * 16 * kSwapabRow;
+        const int lk0 = st * kSwapabKStep;
+        const int nkb = min(kSwapabKStep, kc - lk0) >> 5;  // 32-wide k blocks here
+        for (int kb = 0; kb < nkb; kb++) {
+            const int lk = kb * 32;
+            // A fragment: rows gid / gid+8, cols tg*4 (+16) -- same shape as the
+            // dense kernel's af, but now read from the WEIGHT rows.
+            uint32_t af[4];
+            af[0] = *(const uint32_t*)&s[(size_t)gid * kSwapabRow + lk + tg * 4];
+            af[1] = *(const uint32_t*)&s[(size_t)(gid + 8) * kSwapabRow + lk + tg * 4];
+            af[2] = *(const uint32_t*)&s[(size_t)gid * kSwapabRow + lk + tg * 4 + 16];
+            af[3] = *(const uint32_t*)&s[(size_t)(gid + 8) * kSwapabRow + lk + tg * 4 + 16];
+            // B fragment: K x N col-major, column n = gid. Only column 0 (the
+            // token) is real; the other columns are zero so their C columns come
+            // out exactly 0 (never read in the epilogue).
+            uint32_t bf[2] = {0u, 0u};
+            if (gid == 0) {
+                bf[0] = *(const uint32_t*)&s_a[lk0 + lk + tg * 4];
+                bf[1] = *(const uint32_t*)&s_a[lk0 + lk + tg * 4 + 16];
+            }
+            float d[4] = {0.f, 0.f, 0.f, 0.f};
+            asm volatile(
+                "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                : "r"(af[0]), "r"(af[1]), "r"(af[2]), "r"(af[3]), "r"(bf[0]), "r"(bf[1]));
+            // Scale of this k block: activation per k block (the single token
+            // row), weight per (32-row, 32-col) -- d[] is the raw fp8 sum, so the
+            // product lands on the accumulator exactly like the dense kernel.
+            const int kbg = (lk0 >> 5) + kb;
+            const float sc = s_as[kbg] * ue8m0_to_f(s_ws[kbg]);
+            acc[0] += d[0] * sc;
+            acc[1] += d[1] * sc;
+            acc[2] += d[2] * sc;
+            acc[3] += d[3] * sc;
+        }
+    }
+    // C fragment: d[0]=C[gid][2*tg], d[1]=C[gid][2*tg+1], d[2]=C[gid+8][2*tg],
+    // d[3]=C[gid+8][2*tg+1]. Column 0 is the only live column and it is reached
+    // only by tg == 0 (2*tg == 0), so those 8 lanes emit all 16 rows.
+    if (tg == 0) {
+        const int r0 = m0 + gid, r1 = m0 + gid + 8;
+        // ks == 1 is an ordinary store (deterministic, and `out` is not zeroed);
+        // ks > 1 needs the launcher's memset and atomicAdd for the reduction.
+        // The bias rides on partition 0 so it is added exactly once.
+        float v0 = acc[0], v1 = acc[2];
+        if (kp == 0) {
+            v0 += (bias != nullptr) ? bias[r0] : 0.f;
+            v1 += (bias != nullptr) ? bias[r1] : 0.f;
+        }
+        if (ks == 1) {
+            out[r0] = v0;
+            out[r1] = v1;
+        } else {
+            atomicAdd(&out[r0], v0);
+            atomicAdd(&out[r1], v1);
+        }
+    }
+}
+
 // ------------------------------------------------------------------ engram
 
 __global__ void engram_hash_kernel(const int32_t* __restrict__ token_map,
@@ -4248,6 +4507,63 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
     return (int)cudaGetLastError();
 }
 
+// swapAB M=1 GEMV (see gemm_fp8_swapab_kernel above). A SEPARATE symbol, so the
+// SIMT gemm_fp8_gemv_kernel stays the fallback and a stale .so simply has no
+// entry: a shape this cannot take returns 2 (the caller keeps the SIMT gemv).
+// Never returns 1 for a graceful decline -- 1 is cudaErrorInvalidValue and would
+// be indistinguishable from a real launch failure (the round-42 collision).
+//
+// Shape requirement: n % 16 == 0 (each warp's whole MMA M tile) and k % 32 == 0
+// (the MMA's K and the scale block). NOT bit-identical to the SIMT gemv (see the
+// kernel's note) -- the caller judges it by text/fingerprint parity.
+extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, const uint8_t* w,
+                                     const uint8_t* w_scale, const float* bias, float* out,
+                                     int n, int k, cudaStream_t s) {
+    // Same shape of env probe as the other gates: read ONCE (this runs ~246
+    // times per step, so a per-call getenv would be the hot-path slip).
+    static const bool no_swapab = getenv("DSV41_NO_SWAPAB") != nullptr;
+    if (no_swapab) return 2;
+    if (a == nullptr || a_scale == nullptr || w == nullptr || w_scale == nullptr || out == nullptr)
+        return 2;
+    if (n <= 0 || k <= 0 || (n & 15) || (k & 31)) return 2;
+
+    // K split: the largest {kSwapabKSplit, .../2, 1} that divides K into slices
+    // that are still whole 32-wide scale blocks. K = 5120 gives 4; a K the
+    // macro's value cannot carve falls back through halving to 1 (no atomics, no
+    // memset, deterministic store).
+    int ks = kSwapabKSplit;
+    while (ks > 1 && (k % (32 * ks)) != 0) ks >>= 1;
+
+    const int total = (n >> 4) * ks;
+    const int blocks = (total + kSwapabWarps - 1) / kSwapabWarps;
+    // weight ring + the per-warp activation / scale staging (see the kernel's
+    // staging note). The staging is sized for the SLICE (kc, nb), not full k.
+    const int kc = k / ks, nb = kc >> 5;
+    const size_t smem = (size_t)kSwapabWarps * kSwapabNStage * 16 * kSwapabRow +
+                        (size_t)kSwapabWarps * kc + (size_t)kSwapabWarps * nb * (sizeof(float) + 1);
+    if (smem > 48 * 1024) {
+        // Per-kernel ceiling, not this call's need: a sticky attribute set to a
+        // smaller value would silently cap later launches (round-43 revert).
+        cudaError_t e = cudaFuncSetAttribute(gemm_fp8_swapab_kernel,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             dsv41_smem_ceiling(gemm_fp8_swapab_kernel));
+        if (e != cudaSuccess) return (int)e;
+    }
+    // The ks>1 reduction is atomicAdd, so `out` must start at zero. Ordered on
+    // the same stream, so it is captured into the graph ahead of the kernel.
+    if (ks > 1) {
+        cudaError_t me = cudaMemsetAsync(out, 0, (size_t)n * sizeof(float), s);
+        if (me != cudaSuccess) return (int)me;
+    }
+    // PDL like the rest of the GEMV family: the consumer's setup overlaps the
+    // producer's (quant1) tail; cudaGridDependencySynchronize() at the kernel
+    // entry gates the activation reads.
+    cudaError_t le = dsv41_pdl_or_plain(gemm_fp8_swapab_kernel, dim3(blocks), dim3(kSwapabWarps * 32),
+                                        smem, s, a, a_scale, w, w_scale, bias, out, n, k, ks);
+    if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
+    return (int)cudaGetLastError();
+}
+
 // RoPE fusion of the M=1 GEMV (see gemm_fp8_gemv_kernel's rope args). A SEPARATE
 // entry point, not a new parameter on dsv41_gemm_fp8_mx: that symbol has one
 // fixed ABI and six call sites, so the rope form gets its own name and the
@@ -7763,7 +8079,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
                                     int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
                                     float* xsc, cudaStream_t s, cudaStream_t side,
                                     cudaEvent_t in_ev, cudaEvent_t fork_ev,
-                                    cudaEvent_t early_ev, cudaEvent_t join_ev) {
+                                    cudaEvent_t early_ev, cudaEvent_t join_ev,
+                                    cudaStream_t side_dl) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
@@ -7815,6 +8132,24 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
     }
+    // (0b) `DSV41_HC_DL_SIDE`: the SECOND waiter of the SAME input-ready record —
+    // the dots+LATE half leaves for its own stream. It needs exactly this one
+    // edge and nothing else: the tail's two halves are disjoint in statements AND
+    // in memory (EARLY writes out/xq/xsc, DL writes g_hc_part/pre/post/comb) and
+    // DL reads no EARLY output — both only want `x` (= s.h) and the collapse
+    // weights, which the main-stream hc_post before this call already wrote. This
+    // wait is ADJACENT to the record above (second matching wait of the same
+    // record), so the whole-step capture's program-order disambiguation holds.
+    // A null `side_dl` (runtime created no fourth stream) collapses DL back onto
+    // `side`, i.e. exactly the pre-split order.
+    cudaStream_t dl = (side_dl != nullptr) ? side_dl : side;
+    if (dl != side) {
+        e = cudaStreamWaitEvent(dl, fork_ev, 0);
+        if (e != cudaSuccess) {
+            (void)cudaGetLastError();   // clear the sticky flag before reporting
+            return (int)e;
+        }
+    }
     // (1) EARLY half FIRST on the SIDE stream (collapse + rmsnorm + T1 fp8). It is
     // what main blocks on, so it heads the side chain; the dots and LATE behind
     // it are off main's path entirely. Same statements, same operands and same
@@ -7856,6 +8191,9 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // two-launch pair below stays as the A/B arm (`DSV41_HC_DL_MERGE=0`) and as
     // the fallback when the merge cannot run (the self-ss arm has no ss partials
     // to hand the elected block, and the 160 KiB opt-in can be refused).
+    // The whole DL branch below is issued on `dl` (the fourth stream when the
+    // runtime created one, `side` otherwise). Nothing on `side` reads its output
+    // and nothing here reads EARLY's, so the two halves overlap freely.
     bool dl_merged = false;
     if (g_hc_dl_merge && g_hc_ss) {
         cudaError_t e3 = cudaFuncSetAttribute(
@@ -7863,8 +8201,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
             dsv41_smem_ceiling(hc_dots_late_kernel));
         if (e3 == cudaSuccess) {
             hc_dots_late_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t,
-                                  smem, side>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, hc,
-                                                dim, sinkhorn_iters, eps, mix);
+                                  smem, dl>>>(x, hc_fn, hc_scale, hc_base, pre, post, comb, hc,
+                                              dim, sinkhorn_iters, eps, mix);
             e = cudaGetLastError();
             if (e != cudaSuccess) return (int)e;
             dl_merged = true;
@@ -7873,11 +8211,11 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
         }
     }
     if (!dl_merged) {
-    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, side>>>(
+    hc_mix_dots_kernel<<<dim3((unsigned)mix, (unsigned)rows), (unsigned)g_hc_dots_t, smem, dl>>>(
         x, hc_fn, rows, hc_dim, mix, g_hc_ss ? 1 : 0);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
-    // (4) LATE half on the side stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
+    // (4) LATE half on the DL stream (ss -> mixes -> sigmoid -> sinkhorn -> comb).
     // Stream order after the dots is the whole synchronisation: same-stream ops
     // cannot overtake one another, so every `g_hc_part[r][m][ck]` read below sees
     // the dots' write. Block size from g_hc_late_t when the ss partials come from
@@ -7886,17 +8224,20 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // for. The self-computed ss path reads wpart[threadIdx.x>>5] for warps
     // 0..mix-1, so it keeps 1024.
     const unsigned late_t = (g_hc_ss ? (unsigned)g_hc_late_t : 1024u);
-    hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), side>>>(
+    hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), dl>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
         nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     }   // end of the `if (!dl_merged)` two-launch fallback / A/B arm
-    // (5) join: record on the side stream; the MODEL waits it on main
-    // (`hc_tail_join`) before the earliest consumer of `post`/`comb` — the
-    // fused AR epilogue when the hc-post fold is on, the standalone hc_post
-    // otherwise. Nothing to wait here: main has no consumer before that point.
-    e = cudaEventRecord(join_ev, side);
+    // (5) join: record on the DL stream (`side` when no fourth stream exists — a
+    // stream wait on an event recorded on ANOTHER stream is legal either way, and
+    // the record must sit on the stream that actually ran the tail); the MODEL
+    // waits it on main (`hc_tail_join`) before the earliest consumer of
+    // `post`/`comb` — the fused AR epilogue when the hc-post fold is on, the
+    // standalone hc_post otherwise. Nothing to wait here: main has no consumer
+    // before that point.
+    e = cudaEventRecord(join_ev, dl);
     if (e != cudaSuccess) {
         (void)cudaGetLastError();   // clear the sticky flag before reporting
         return (int)e;
@@ -7907,6 +8248,9 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // carried by `fork_ev`. See the header comment.
     (void)in_ev;
     (void)early_ev;
+    // `side_dl` is consumed above through `dl`; `(void)` is for the case where
+    // the compiler cannot see that the ternary already read it.
+    (void)side_dl;
     return (int)cudaGetLastError();
 }
 

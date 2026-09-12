@@ -135,6 +135,26 @@ struct Kernels {
             *const f32, *const u8, *const u8, *const f32, *mut f32, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// swapAB M=1 GEMV (`dsv41_gemm_fp8_swapab`): the M=1 decode as a tensor-core
+    /// GEMM with the WEIGHT on M (16 output rows) and the ACTIVATION on B's
+    /// column 0. It replaces the SIMT `gemm_fp8_gemv_kernel` for the plain fp8
+    /// path -- no a32 materialisation, no LUT decode, no FFMA consume chain.
+    ///
+    /// NOT bit-identical to the SIMT gemv (the tensor core sums raw fp8 products
+    /// and scales per k block, where the SIMT kernel does per-element
+    /// `(a*sa)*(w*sb)` and reduces by shuffles). Same scheme as the m>1 dense MMA
+    /// path; parity is judged by text/fingerprint, not bit equality.
+    ///
+    /// Optional: a stale `.so` has no entry and the caller keeps the SIMT gemv.
+    /// Returns 2 when the shape cannot take it (n % 16 != 0 or k % 32 != 0; never
+    /// 1 -- cudaErrorInvalidValue, the round-42 collision).
+    /// ABI: stream LAST, like `dsv41_gemm_fp8_mx_f32`.
+    gemm_fp8_swapab: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32, c_int, c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// chain-pair-grid-sync: the wo_a -> wo_b pair as ONE grid-sync launch
     /// (`dsv41_gemm_fp8_wo_pair`). Phase 1 is the wo_a fp8 GEMV (mode 4 + a32),
     /// phase 2 the wo_b f32-activation GEMV, joined by a sense-reversing
@@ -571,6 +591,11 @@ struct Kernels {
     /// caller waits `join_ev` before the hc_post that consumes `comb`.
     /// `in_ev`/`early_ev` remain in the ABI as dead slots (the caller passes
     /// null). Optional: a stale `.so` falls back to the single-launch `hc_front`.
+    ///
+    /// LAST parameter (`side_dl`) is the `DSV41_HC_DL_SIDE` stream: the
+    /// dots+LATE half is issued there, beside EARLY on `side`, instead of behind
+    /// it. `null` = collapse onto `side` (the pre-split scheduling, and the
+    /// degrade path when the runtime could not create a fourth stream).
     hc_front_split: Option<
         unsafe extern "C" fn(
             *const f32, *const f32, *const f32, *const f32,
@@ -578,6 +603,7 @@ struct Kernels {
             *mut f32, *mut f32, *mut f32, *mut f32,
             c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
             CuStream, CuStream, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
+            CuStream,
         ) -> c_int,
     >,
     embed_expand_dev: unsafe extern "C" fn(
@@ -728,6 +754,7 @@ impl Device {
             gemm_fp8_mx_rope_norm: ko!(rt, "dsv41_gemm_fp8_mx_rope_norm"),
             gemm_fp8_mx_add: ko!(rt, "dsv41_gemm_fp8_mx_add"),
             gemm_fp8_mx_f32: ko!(rt, "dsv41_gemm_fp8_mx_f32"),
+            gemm_fp8_swapab: ko!(rt, "dsv41_gemm_fp8_swapab"),
             gemm_fp8_wo_pair: ko!(rt, "dsv41_gemm_fp8_wo_pair"),
             gemm_fp8_sh_pair: ko!(rt, "dsv41_gemm_fp8_sh_pair"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
@@ -1730,6 +1757,44 @@ impl Device {
         }
         self.kerr(rc, "dsv41_gemm_fp8_mx_f32")?;
         Ok(true)
+    }
+
+    /// swapAB M=1 GEMV: `out[n] = a[1,k] @ w[n,k]^T` with the weight as the MMA's
+    /// M (16 output rows) and the activation as B's column 0. The tensor-core
+    /// replacement for the SIMT `gemm_fp8_gemv_kernel` on the plain fp8 path.
+    ///
+    /// `Ok(true)` = it ran; `Ok(false)` = the shape declined (n % 16 != 0 or
+    /// k % 32 != 0) or the .so has no `dsv41_gemm_fp8_swapab`, in which case the
+    /// caller keeps `gemm_fp8_mx`. NOT bit-identical to the SIMT gemv.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_swapab(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_swapab else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(a, a_scale, w, w_scale, bias, out, n, k, self.stream) };
+        // 2 is the graceful shape decline (1 collides with cudaErrorInvalidValue).
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_swapab")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries the swapAB M=1 GEMV
+    /// (`dsv41_gemm_fp8_swapab`). A stale .so leaves DSV41_SWAPAB inert and the
+    /// SIMT gemv runs.
+    pub fn supports_gemm_fp8_swapab(&self) -> bool {
+        self.kernels.gemm_fp8_swapab.is_some()
     }
 
     pub fn quant_fp8(
@@ -3701,6 +3766,24 @@ impl Device {
             && !self.rt.join_event().is_null()
     }
 
+    /// True when the runtime owns a FOURTH side stream, so the tail split's
+    /// dots+LATE half can be issued BESIDE EARLY instead of queued behind it
+    /// (`DSV41_HC_DL_SIDE`, default ON). Purely additive: when false the
+    /// launcher receives a null `side_dl` and keeps the pre-split order, which is
+    /// bit-identical (same statements, same operands, same stream as before).
+    ///
+    /// No `.so` gate: the split's ABI grew one trailing stream parameter, and the
+    /// build's version stamp (`verify_kernel_build`) already refuses a mismatched
+    /// pair, so the symbol's presence is not evidence about its arity.
+    pub fn supports_hc_dl_side(&self) -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_HC_DL_SIDE")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        }) && !self.rt.side_stream4().is_null()
+    }
+
     /// hc tail split front end (`DSV41_HC_TAIL_SPLIT`): the EARLY tail half
     /// (collapse + rmsnorm + T1 fp8, writing `out`/`xq`/`xsc`), the dots, and the
     /// LATE half (ss + sigmoid + sinkhorn + comb, writing `pre`/`post`/`comb`) all
@@ -3763,6 +3846,13 @@ impl Device {
                 self.rt.fork_event(),
                 std::ptr::null_mut(),
                 self.rt.join_event(),
+                // `DSV41_HC_DL_SIDE`: the dots+LATE half goes on its own stream
+                // (null = it stays behind EARLY on `side`, the pre-split order).
+                if self.supports_hc_dl_side() {
+                    self.rt.side_stream4()
+                } else {
+                    std::ptr::null_mut()
+                },
             )
         };
         // InvalidValue (1) = gate off / no collapse half / shape outside the

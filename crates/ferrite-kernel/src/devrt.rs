@@ -433,6 +433,30 @@ pub struct DevRuntime {
     /// saturated attention window.
     /// Null when uncreatable → the model keeps the serial compressor.
     side_stream3: CuStream,
+    /// Priority `side_stream4` was created with (0 = device default).
+    side4_prio: c_int,
+    /// FOURTH side stream — the hc tail split's dots+LATE half
+    /// (`DSV41_HC_DL_SIDE`): the DL node (`hc_dots_late_kernel`, dots + LATE in
+    /// ONE launch) runs HERE, beside EARLY on `side_stream`, instead of queued
+    /// BEHIND it.
+    ///
+    /// Why a fourth stream is legal: the tail split's two halves are disjoint in
+    /// statements AND in memory — EARLY writes `out`/`xq`/`xsc`, DL writes
+    /// `g_hc_part`/`pre`/`post`/`comb` — and both only need the SAME main→side
+    /// input edge (`x` = `s.h`, `pre_collapse`). DL never reads an EARLY output,
+    /// so nothing but stream order tied it to EARLY; that order cost EARLY's
+    /// whole duration (1.7 us/front) before DL could start, and it is the piece
+    /// the post-swapAB window shrink makes expensive.
+    ///
+    /// Created at the device DEFAULT priority, exactly like the stream DL runs on
+    /// today: the split then changes ONE variable (which stream DL is issued on)
+    /// and the A/B stays attributable. `DSV41_DL_PRIO=mid|greatest` is the arm
+    /// that also moves the priority — DL's grid is only `mix x rows` blocks at
+    /// one block/SM, so the tail's existing demotion history warns against
+    /// granting it an SM it cannot use (see the `DSV41_HC_TAIL_PRIO` note).
+    /// Null when uncreatable → the launcher keeps DL behind EARLY on `side_stream`
+    /// (bit-identical, just serial).
+    side_stream4: CuStream,
     /// Flags for `cudaGraphInstantiate`. Non-zero only when AT LEAST ONE side
     /// stream is a priority stream AND `DSV41_GRAPH_NODE_PRIORITY` is not 0. The
     /// flag is global to the graph: it makes the replay honour every node's
@@ -628,13 +652,27 @@ impl DevRuntime {
             } else if side3_prio != 0 {
                 eprintln!("[compress_side] third side stream priority = {side3_prio}");
             }
+            // Fourth side stream: the hc tail split's dots+LATE half
+            // (`DSV41_HC_DL_SIDE`). DEFAULT priority on purpose: the stream DL
+            // runs on today is a default-priority stream, so the split moves ONE
+            // variable (the stream, hence the ordering) and the A/B stays
+            // attributable. `DSV41_DL_PRIO=mid|greatest` is the arm that also
+            // moves priority (measure before believing it — DL's grid is
+            // mix x rows blocks at one block/SM).
+            let dl_prio = parse_side_prio("DSV41_DL_PRIO", SidePrio::Default);
+            let (side_stream4, side4_prio) = create_side_stream(&cudart, dl_prio);
+            if side_stream4.is_null() {
+                eprintln!("[dl_side] fourth side stream unavailable — DL stays behind EARLY on side");
+            } else if side4_prio != 0 {
+                eprintln!("[dl_side] fourth side stream priority = {side4_prio}");
+            }
             // Node-priority instantiation is what makes the captured priority
             // effective at replay. `DSV41_GRAPH_NODE_PRIORITY=0` pins it off.
             // Gated on ANY stream carrying a non-default priority — not on the
             // tail's alone — so pinning one stream back to 0 (or a device that
             // refuses one create) does not silently disable the flag for the
             // others.
-            let node_prio = (side_prio != 0 || side2_prio != 0 || side3_prio != 0)
+            let node_prio = (side_prio != 0 || side2_prio != 0 || side3_prio != 0 || side4_prio != 0)
                 && std::env::var("DSV41_GRAPH_NODE_PRIORITY")
                     .map(|v| v != "0")
                     .unwrap_or(true);
@@ -722,6 +760,8 @@ impl DevRuntime {
                 side3_prio,
                 side_stream2,
                 side_stream3,
+                side4_prio,
+                side_stream4,
                 graph_instantiate_flags,
                 fork_ev,
                 join_ev,
@@ -811,6 +851,19 @@ impl DevRuntime {
     /// `Device::supports_compress_side`).
     pub fn side_stream3(&self) -> CuStream {
         self.side_stream3
+    }
+
+    /// Priority `side_stream4` was created with (0 = device default).
+    pub fn side_stream4_priority(&self) -> c_int {
+        self.side4_prio
+    }
+
+    /// Fourth side stream — the hc tail split's dots+LATE half
+    /// (`DSV41_HC_DL_SIDE`). Null when the runtime could not create one;
+    /// callers gate on `is_null` (see `Device::supports_hc_dl_side`) and the
+    /// launcher then keeps DL behind EARLY on the first side stream.
+    pub fn side_stream4(&self) -> CuStream {
+        self.side_stream4
     }
 
     /// Fork event for the compressor side stream (`DSV41_COMPRESS_SIDE`):

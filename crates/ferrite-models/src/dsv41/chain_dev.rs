@@ -1133,17 +1133,57 @@ impl<'a> DevChain<'a> {
     /// fp8 dense linear for one row: `out[1, n_out] = a[1, k] @ w[n_out, k]^T`.
     fn lin(&self, a: *const f32, k: i32, w: &crate::dsv41::load::DevTensor, ws: &crate::dsv41::load::DevTensor, n_out: i32, out: *mut f32) -> Result<()> {
         self.quant1(a, k)?;
-        self.dev.gemm_fp8_mx(
+        self.gemm_fp8_mx_or_swap(
             self.s.xq.as_u8(),
             self.s.xsc.as_f32(),
             w.as_u8(),
             ws.as_u8(),
             std::ptr::null(),
             out,
-            1,
             n_out,
             k,
         )
+    }
+
+    /// swapAB (DSV41_SWAPAB, default OFF). Routes the plain M=1 fp8 GEMV through
+    /// the tensor-core `dsv41_gemm_fp8_swapab` kernel (weight on the MMA's M,
+    /// activation on column 0 of B) instead of the SIMT `gemm_fp8_gemv_kernel`.
+    /// NOT bit-identical to the SIMT gemv -- the tensor core sums raw fp8
+    /// products and scales per k block, while the SIMT kernel does per-element
+    /// `(a*sa)*(w*sb)` and reduces by shuffles -- so it is opt-in until text
+    /// parity is confirmed on the machine. Read ONCE and cached.
+    fn swapab() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| std::env::var("DSV41_SWAPAB").map(|v| v == "1").unwrap_or(false))
+    }
+
+    /// The plain M=1 fp8 GEMV with the swapAB dispatch in front of it: when the
+    /// gate is on AND the loaded .so carries the kernel AND the shape can take it
+    /// (n % 16 == 0, k % 32 == 0), the tensor-core form runs; otherwise the SIMT
+    /// `gemm_fp8_mx` runs exactly as before. The decline is per-call and free, so
+    /// no shape bookkeeping is needed on this side.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_fp8_mx_or_swap(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        n: i32,
+        k: i32,
+    ) -> Result<()> {
+        if Self::swapab() {
+            let ok = self
+                .dev
+                .gemm_fp8_swapab(a, a_scale, w, w_scale, bias, out, n, k)?;
+            if ok {
+                return Ok(());
+            }
+        }
+        self.dev
+            .gemm_fp8_mx(a, a_scale, w, w_scale, bias, out, 1, n, k)
     }
 
     /// Two projections over the SAME activation in one launch (DSV41_PROJ_FUSE).
@@ -1521,14 +1561,13 @@ impl<'a> DevChain<'a> {
                 32,
                 true,
             )?;
-            self.dev.gemm_fp8_mx(
+            self.gemm_fp8_mx_or_swap(
                 self.s.eng_xq.ptr as *const u8,
                 self.s.eng_xsc.ptr as *const f32,
                 wkv.ptr() as *const u8,
                 wsc.ptr() as *const u8,
                 std::ptr::null(),
                 self.s.eng_kv.ptr as *mut f32,
-                1,
                 ((hc + 1) * dim) as i32,
                 (n_cols * ehd) as i32,
             )?;
@@ -3401,7 +3440,7 @@ fn hc_tail_split() -> bool {
                     continue;
                 }
             }
-            self.dev.gemm_fp8_mx(a, asc, wp, wsp, std::ptr::null(), out, 1, olg as i32, k as i32)?;
+            self.gemm_fp8_mx_or_swap(a, asc, wp, wsp, std::ptr::null(), out, olg as i32, k as i32)?;
         }
         }
         // wo_b's activation, in priority order:
@@ -3451,14 +3490,13 @@ fn hc_tail_split() -> bool {
                     c.slot_stride_elems(),
                 )?;
             } else {
-                self.dev.gemm_fp8_mx(
+                self.gemm_fp8_mx_or_swap(
                     wb_q,
                     wb_sc,
                     ld.wo_b.as_ref().unwrap().as_u8(),
                     ld.wo_b_scale.as_ref().unwrap().as_u8(),
                     std::ptr::null(),
                     self.s.o.ptr as *mut f32,
-                    1,
                     dim as i32,
                     ol_local as i32,
                 )?;

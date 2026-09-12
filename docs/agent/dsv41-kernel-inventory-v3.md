@@ -298,9 +298,13 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 （shfl 树 + lane 0 写 `out[row]`），行间无归约，输出布局与 pitch 都不变 ⇒ down_reduce 的输入假设不受影响。
 顺带修掉一个隐形地雷：LUT 构建原写作 `if (threadIdx.x < 256)`，rows<8（blockDim<256）时会漏建
 表项 128..255 → 改成 256 步长的 stride 循环（≥256 线程时逐位相同）。
-⚠️ down 方向（`dsv41_expert_down_fp4_batched` / `dsv41_expert_down_reduce_fp4_batched`）**保持 8 warp 不变**：
-它的 grid 是 (⌈5120/8⌉,6) = 3840 CTA，本来不欠填充，且 `expert_gemv_fp4_down_reduce_kernel` 里
-同样留着 `threadIdx.x < 256` 的写法（其 launcher 恒定 256 线程，故目前安全——改它的 blockDim 前必须先改那一行）。
+⚠️ down 方向**保持 8 warp 不变**（`expert_down_fp4_down_reduce` 的 launcher 恒定 `dim3(warps*32)=256` 线程）。
+**2026-09-12 核对代码后修正**：DEFAULT 路径是 fused 的
+`dsv41_expert_down_reduce_fp4_batched`（`DSV41_DOWN_FUSE`, 默认 ON），它的 grid 是 **一维
+`(⌈5120/8⌉) = 640 CTA`**（`dsv41_experts_mxf4.cu:2530` 附近），**slot 循环在 kernel 内部升序串行**
+（没有 `blockIdx.y`）⇒ **640 CTA / 5120 warp**，不是 3840 CTA。旧文写作
+`(⌈5120/8⌉,6) = 3840 CTA / 30720 warp` 描述的是 `DSV41_DOWN_FUSE=0` 的回退对
+（`dsv41_expert_down_fp4_batched` + `dsv41_moe_down_reduce`），已不是默认形状。
 
 **为什么预期 ≈0（别把它当 −0.5ms 的刀）**：
 `rows × slots` 就是全部工作切分（DSV4.1：320 行 × 6 slot = **1920 个 row-dot，一 warp 一个**），
@@ -313,8 +317,8 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
   行数减半 ⇒ **每行的 prologue 翻倍**（另有 smem store 量翻倍）；CTA 越小，能遮盖该 prologue 的
   warp 越少。⇒ rows=2/1 很可能是**净负**。
 
-**该假说其实已被现成数据部分否证**：down 方向的 CTA 有 **3840 个**（gateup 的 16x）、warp **30720 个**
-（16x），搬的字节只有 gateup 的一半 —— 若"CTA/warp 数 → 有效带宽"成立，down 应碾压 gateup；
+**该假说其实已被现成数据部分否证**（数字按 2026-09-12 的默认 fused 路径修正）：down 方向 **640 CTA**
+（gateup 240 的 2.7x）、**5120 warp**（gateup ksplit=2 的 3840 warp 的 1.3x），搬的字节只有 gateup 的一半 —— 若"CTA/warp 数 → 有效带宽"成立，down 应碾压 gateup；
 实测 down v2 = 17.2µs / 4.92MB = **286 GB/s**，gateup 25.3µs / 9.83MB = **389 GB/s**：
 **down 每字节效率更低**。⇒ 这个家族的限制量是**每 warp 的 in-flight 字节（MLP）与每 warp 的固定开销**，
 不是 CTA 数。（388 GB/s vs 7.6TB/s 峰值 = 5%，DRAM 地板 1.3µs/层 vs 25.3µs = 19x ⇒ 不是带宽墙。）

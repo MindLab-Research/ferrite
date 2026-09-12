@@ -88,6 +88,60 @@ Table 4 "Throughput of Native Arithmetic Instructions"，12.9 版；非实测。
 估计工作量：新 kernel（改 `gemm_fp8_kernel` 的 A/B 角色 + N 补零）~150 行 + launcher +
 Rust dispatch + parity test，约 1-2 天；fuse 族迁移另计。
 
+### swapAB parity 判据（落点：单测 + serve A/B）— 2026-09-12
+
+跑批前先跑 `crates/ferrite-dsv41/tests/swapab_parity.rs`（无需 checkpoint，随机输入按运行时语义量化；
+stale .so / 无 `DSV41_KERNELS` 时 skip，不 fail）；serve 阶段跑
+`scripts/dsv41_swapab_text_parity.sh`（`DSV41_SWAPAB=0` vs `=1` 背靠背两臂，四段文本逐字对比 + p50）。
+
+| 判据 | 阈值 | 依据 |
+|---|---|---|
+| 单测：swapAB vs SIMT gemv `max\|diff\|/max\|ref\|` | **< 5e-2** | fp8 e4m3 量化噪声量级（累加序差异实际 ~1e-6，阈值留足余量：合法的新 scheme 能过、真 bug 过不了） |
+| 单测：每元素相对误差（分母下限 1e-3·max\|ref\|）p50/p90/p99/max | max **< 5e-2** | 同上；下限避免近零输出把比值放大 |
+| 单测：CPU golden（同 fp8 字节的等价块缩放和） | 两条 GPU 路径都 **< 5e-2** | 防止 swapAB 与 SIMT 共享同一布局/scale bug 时二者一起错 |
+| 单测：argmax(swapAB) == argmax(SIMT)，且报 `max\|diff\|` vs `top1−top2` margin | 相等；`max\|diff\| < margin` 则 argmax **可证明**不翻转 | leading-token flip 的定量判据 |
+| serve：四段文本（Paris / 静夜思 / 1+1=2 / 出师表）逐字 | 正文**逐字相同** | W8A16 先例：0.05% 差异也会偶发翻转首 token；正文正确是硬线 |
+| serve：首 token 差异 | **可接受**（仅当正文逐字相同） | MMA/SIMT 累加序不同 ⇒ ~1e-3 近边界 logit 可翻首 token |
+| serve：`faults` | **0** | 崩溃/illegal 立即回退 |
+| serve：步 p50 | 下降（预期 6.26 → ~4.2ms，~238 tok/s） | 优化是否真正生效 |
+
+> ⚠️ 形状前提：launcher 只校验 `n % 16 == 0 && k % 32 == 0`，但权重 scale 按
+> `w_scale[(m0>>5) * nb_k + kb]` 索引 —— **`n % 32 != 0` 时越界**（tile 跨 32 行边界
+> 而无对应 scale 行）。真实 checkpoint dense 权重 n 均为 32 倍数，故未触发；单测与本地
+> 量化器都按 `n % 32 == 0` 构造。若要支持 `n % 16 == 0` 的杂形状，须让 launcher 检查
+> `n & 31`（或让 scale 行块数取 `ceil(n/32)`）。
+
+> ⚠️ 环境要求：单测运行前 `DSV41_NO_SWAPAB` / `DSV41_NO_GEMV_FP8` 必须未设，否则两臂
+> 退化成同一条路径（测试会 assert 拒绝）。gate 每进程只读一次，serve A/B 必须是
+> **两次独立启动**，不能在同一进程内发两次请求。
+
+### expert 侧 tcgen05 fp4 swapAB 预研（2026-09-12，纯分析、未上机）
+
+上面第 7 条说"混精需 `kind::f8f6f4`"过粗。**离线核实的精确结论**（本机无 nvcc，
+证据来自 CUDA 13.x/CCCL 头 + CUTLASS + DeepGEMM，仍需 ptxas + 数值自测兜底）：
+
+- **可用性 ✓**：`tcgen05.mma.cta_group::1.kind::f8f6f4` 与
+  `...kind::mxf8f6f4.block_scale.scale_vec::1X` 在 **sm_103a 都可用** ——
+  `nvidia/cu13/include/cccl/.../generated/tcgen05_mma.h` 的 arch guard 显式含
+  `_LIBCUDA_PTX_ARCH_SPECIFIC() == 1030`（报错串也写 `SM_100a_100f_103a_103f_110a`）。
+  注意 `r3_tcgen05_f8f6f4.ptx` 那批 probe 只覆盖了 `mma.sync` 与 `kind::mxf4`，**没覆盖** tcgen05 f8f6f4。
+- **要带 scale 就必须用 `mxf8f6f4`，不是裸 `f8f6f4`**：裸 `kind::f8f6f4` 的操作数是
+  `{%4,%5,%6,%7}`（disable_output_lane 掩码），**没有 block-scale 描述符**；per-32 e8m0
+  scale 只能走 `kind::mxf8f6f4.block_scale.scale_vec::1X`（`mxf8f6f4` **只有 1X**，没有 2X/4X）。
+- **混精映射**：CUTLASS `SM100_MMA_MXF8F6F4_SS<a,b,...>` 的 a/b_type 独立、只需
+  `sizeof<=8bit`；idesc 的 a_format/b_format 是**分开的 3 bit**（E4M3=0 … E2M1=5）。
+  DeepGEMM `deep_gemm/mma/sm120.cuh:69/89` 直接写了
+  `mxf8f6f4...scale_vec::1X.m16n8k32.f32.e4m3.e2m1.f32.ue8m0` 与其 swapAB 版
+  `e2m1.e4m3`（notes 标注 RTX PRO 验证）；`impls/sm100_fp8_fp4_gemm_1d1d.cuh` /
+  `sm100_fp8_fp4_mega_moe.cuh` 是 sm100 的 fp8×fp4 GEMM 与 **MoE** 现成先例（含 `kSwapAB`）。
+- **K/scale 粒度**：`mxf8f6f4` 的 UMMA K = **32**（对 fp8 侧），scale_vec::1X ⇒ 每 atom 一个
+  32 元素 scale 块；`kind::mxf4` 是 K=64/2X。所以 swapAB 后 **每 atom 的 K 深度减半、MMA 条数翻倍**，
+  但 scale 块大小仍是 32 ⇒ 与 checkpoint 的 per-(row,k/32) e8m0 **零转换**复用。
+- **真正的缺口不是 MMA 而是喂数**：现 `mxf4_gemm_kernel` 全程 LDG→STS、**无 cp.async/TMA**
+  （`:341-358`），STATUS:5038 的 97.8µs/16.8GB/s 根因在此；swapAB 只解决 M=128 钉死（gateup
+  30 个 M-tile、down 40 个满 tile），换成 f8f6f4 前**必须先补多级异步 staging**，否则仍是
+  0.2% 带宽地板。
+
 ## gemm_fp8_gemv 微基准（2026-09-11 最后一轮，隔离探针 /tmp/gp6/gprobe6..10.cu）
 
 > 底座复刻 = `kernels/cuda/dsv41_kernels.cu` 的 `gemm_fp8_gemv_kernel`（mode 4 / warps=4 / LUT /
