@@ -2246,3 +2246,46 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 | HEAD | 65d6b5a + docs | c7ad988b/40d4e5d3 已测（双字 1 ✓ 但出师表崩到 12 字符）|
 
 **注意**：65d6b5a 之后**只有 docs 提交**——若 65d6b5a 也乱码，则"回归"不是来自它之后的提交，而是 **s.ids 修复与之前同伴优化的交互**（例如 glue 的 mrows K 序改动在 FOLD=1 路径上、或 route A 的 6 行布局与 FOLD=0 的 head 组合）——届时按同伴提交逐个 `git checkout 65d6b5a -- <file>` 回退二分。
+
+## 2026-09-12 Wave 5 step 3（工部）：dsa_append_batched 的行→seq 映射骨架（无调用点，gate 未动）
+
+**交付**：`mtp_batch::SeqRowMap` / `AppendPlan`（纯宿主算术）+ `CudaBackend::dsa_append_batched_mapped` +
+kernel `dsa_append_batched_mapped_kernel`（`ferrite_kernels.cu`）。**没有任何调用点**——`gpu_engine.rs:492` 的
+`FERRITE_MTP ⇒ max_seqs=1` gate 保持关闭（五件事未全就位）。
+
+**两种布局的行号公式**（都是 seq-major，`row` 升序 = 同一 seq 内 token 升序）：
+
+| 布局 | 行数 | row → (seq, tok) | kernel 参数 | 可进图？ |
+|---|---|---|---|---|
+| **padded** `B×n_v` | `padded_seqs(live)*n_v`（B=16,n_v=3 → 48） | `seq = row/n_v`, `tok = row%n_v` | `ntok = n_v`，两张表都 NULL | ✅ 固定形状（图名 `mega_v_b{padded}_n{n_v}`，注意不能只按行数 key：24 行可同时是 (4,6) 与 (8,3)，表宽与除数都不同） |
+| **ragged** `Σ(1+k_r)` | 各 seq 块长之和（逐 tick 变） | `[rows][2]` 表查表（host 侧 `prefix` 前缀和 + partition_point） | `ntok = 0` + `row_map` + `block_len` | ❌ 非图（行数逐 tick 变） |
+
+**向后兼容不变量（关键）**：`rows == B, ntok == 1, 两张表 NULL` 时，新 kernel 与 `dsa_append_batched_kernel`
+**逐位相同**——`seq == row`、`tok == 0`、尾部读 `ki[seq*idm+c] == ki[row*idm+c]`、advance 在
+`tok == ntok-1 == 0` 触发（即旧 kernel 的 `tok==0` 条件）。⇒ 现有 decode-batched 调用点（`cuda.rs` 的
+`ferrite_dsa_append_batched(... ni, 1, ...)`）**可以原地换成新入口**做 A/B，不需要数值验证以外的额外工作。
+
+**旧 kernel 在 `ntok = n_v` 下不可用的两个硬伤**（新 kernel 的两处修正，也是"行→seq 映射"的实质内容）：
+1. idx/gate 尾部读的是 `ki[seq*idm + c]`（**per-seq**）→ `ntok>1` 会把 anchor 行的 idx 写 `n_v` 遍；
+   行形式必须读 `ki[row*idm + c]`；
+2. device advance 硬编码 `t0+1` → 一个 seq 的 `n_v` 行只推进 1 格，**每步漏 `n_v-1` 个 cache 槽**（下一步读到垃圾 KV）。
+   行形式推进 `block_len[seq]`（= `ntok`，或 ragged 表的每 seq 块长），且由该 seq 的**最后一行**（`tok == blen-1`）单写者完成。
+
+**远端下一步的注意事项**：
+- 新 kernel 是**新符号**——任何调用点落地前必须先重编 kernel 库（`kernels/cuda/build.sh`），否则 Rust 侧会
+  在加载/链接时报 undefined symbol；本轮**没有调用点**，所以当前工作树是安全的。
+- 行映射的**其余下游**也吃同一张表（本轮的 `SeqRowMap` 是共用 abstraction）：`kpool_compress_batched` /
+  `indexer_topk_batched` / `pool_expand_batched` 在 verify 里应拿**行数**（每行一次 query），而 per-seq 指针表
+  与 commit plan 拿 **B（seq 数）**，两者的除数就是 `row / n_v`。
+- 单测口径：映射是纯函数，`mtp_batch.rs` 的 16 个测试在**默认 feature 下就能跑**（但 `ferrite-exec` 的 lib-test
+  目标在无 `cuda` feature 时**本就编不过**——`tp.rs` 的 test mod 里有未 gate 的 `ferrite_kernel::cuda` 引用，
+  属既有问题；带 `cuda` feature 又需 nvcc 链接。故本轮用隔离 crate 跑同文件验证：16 passed / 0 failed）。
+
+## 2026-09-12 二分第一点（31c6c95c）：5f774c7 = "只重复的版本"确认
+
+| 任务 | 5f774c7（无 s.ids 修复）| HEAD（含修复+打印）| EAGER |
+|---|---|---|---|
+| 出师表 | **LEN 54、双字 4**（无乱码崩） | LEN 12、双字 1（崩） | LEN 146、双字 3 |
+| 数字任务 | **LEN 56、双字 10**（无乱码崩） | LEN 42-137、双字 1-5 | LEN 216、完美 |
+
+⇒ **用户判断的基线确认**：5f774c7 只有重复、没有乱码崩。**第二点（65d6b5a = 基线+s.ids 修复）在测**——若它也崩（HEAD 与 65d6b5a 之间只有 docs+无调用的 mtp_batch.rs+无行为的打印，行为应等价）⇒ **s.ids 修复与 verify 值错的组合放大**：修复前喂"落后 1"的 token（模型凑合），修复后喂 emitted.last()（若 verify_out 的值本身错，喂的错 token 位置更远 → 崩得更快）。**根治 = verify_out 的值**（prefill-sids-init / spec-eager-diff-tool 在查）。
