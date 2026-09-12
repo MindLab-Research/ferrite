@@ -4126,3 +4126,18 @@ self.dev.gemm_fp8_mx_rope_norm(
 1. spec 最小 + e4m3（SPEC+DSPARK+SIDS+e4m3，无其他 gate）——计数数字
 2. 如果干净 → + LAZY_VERIFY → 如果损坏 → lazy 是罪魁
 3. 如果最小 spec 也损坏 → spec 核心路径（draft/commit）有问题
+
+## "重置到 12" 的 window 假设验证——window=128 不是 50！
+
+**config.rs:13**: "window 128, 384 routed + 1 shared experts, top-k 6"
+- **KV window = 128**（不是 50！）
+- 62 % 128 = 62 ≠ 12——**ring 冲突假设不成立**（62 和 12 不在同一 slot）
+- 损坏在 position 62 < 128——**在第一次 ring wrap 之前**！
+
+**修正后的嫌疑**：
+1. **compressor 的 pool**：压缩层的 pooled KV——如果 pool 的 slot 计算有 off-by-N，position 62 的池读到了 position ~12 的数据
+   - compress_ratio r:1 的池——位置 62 在池里的 slot 与位置 12 的关系？
+2. **indexer 的选点**：indexer 的 top-k 选点——如果选了早期的位置（12 附近），attention 读到早期 KV
+3. **lazy verify 的行间状态泄漏**：row i 的某个状态（tap/compressor）影响了 row i+1
+
+**等 subagent 的判决**（lazy-verify-position-bughunt 分析中）
