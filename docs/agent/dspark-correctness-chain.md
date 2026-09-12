@@ -108,3 +108,10 @@
 
 **决定性**：`DSV41_SPARSE_OROPE=0` 把 mismatch 从 18 降到 **1**——**o-rope 融合（sparse_attn_orope）是剩余 row-0 mismatch 的根因**（EAGER 走融合、verify 走三连——"verbatim" 声称不成立，与 FOLD 同类）。文本不变（LEN 140 双字 3）说明那 1 个残余 mismatch 不影响本 prompt 的输出。
 **修法**：把 verify 也走 `sparse_attn_orope`（对齐 EAGER），或 EAGER 关融合（性能损失小——但 o-rope 融合本身是优化）。**下一步**：重跑 GEMV_A32=0 臂（这轮被并发测试 kill 了），确认 a32 是否解释最后 1 个 mismatch。
+
+## AR v5 死锁（SEED_ALIGN=1）的判词（ar5-deadlock-audit）
+
+**证伪**：6 行块多发了 AR——aligned 与 legacy 的每轮 AR/epoch 足迹**逐位相同（164）**。
+**真根因（H1，签名精确吻合）**：`draft_forward` 的 `pos == 0` 早退——legacy 的首轮 `draft_forward(token, 0)` 命中早退（0 次 draft AR），而 aligned 的 `draft_forward(next, pos+1)` 恒 ≥1（**3 次 draft AR**）⇒ **`need−cur = 3` 恰好 = 3 个 mtp block 的 MoE AR**。v5 的协议契约：落后方静默通过（读错值）、领先方永久自旋——无 host rendezvous 能吸收次数差。
+**修法（F1，判词推荐）**：aligned 臂的首轮也走 legacy（`spec_primed` 的同款引导——route A 只在 primed 后接管），或把 draft 的 `pos==0` 早退的 AR 足迹对齐（假发 3 次）。
+**附带发现**：H4（pubred 的 `e` 每 block 各读一次、block 0 中途写 `*epoch`——晚启动的 block 读到 e+1、stamp e+2、等错半区）是全 arm 共有的设备级隐患（route A 的 6 行块把窗口加宽 20%）；H3（argmax_sliced 的尾部 rank decline——与 peer=5/6/7 吻合）待查。
