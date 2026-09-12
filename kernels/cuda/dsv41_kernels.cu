@@ -2880,11 +2880,25 @@ __global__ void indexer_topk_kernel(const float* __restrict__ q, const float* __
     // committed latents). A CUDA graph capture freezes launch arguments, so every
     // replay would apply the capture step's bound and the compressed-slot
     // retrieval would silently degrade as the generation grows. The device counter
-    // is already passed in as `lens`; prefer it whenever it is available and
-    // non-zero (falling back keeps the pre-prefill / uninitialised case working).
-    // This is safe for ANY bound only because the shared memory below is a function
-    // of the chunk constant alone - it does not grow with the candidate count.
-    if (lens != nullptr && *lens > 0) n_pos = *lens;
+    // is already passed in as `lens`, and it is the AUTHORITY whenever it is
+    // present - INCLUDING when it says "nothing": a replay after a rollback
+    // restore sets `*lens` back to 0, and the baked argument is then pure STALE
+    // state, not a bound. Falling back to it (the previous `*lens > 0` test) made
+    // the capture-time count the scan ceiling and read the slots the reserved-away
+    // group wrote - "the KV of an earlier position". So the baked argument is only
+    // (a) the bound when NO counter exists (pre-prefill / uninitialised) and (b) a
+    // defensive ceiling, never a floor.
+    // The ceiling is safe for ANY bound only because the shared memory below is a
+    // function of the chunk constant alone - it does not grow with the count.
+    if (lens != nullptr) n_pos = *lens;
+    if (n_pos > kIdxMaxPos) n_pos = kIdxMaxPos;  // defensive: g_idx_score's extent
+    // Nothing committed (a rolled-back replay, or the host's own n_pos <= 0): scan
+    // NO slot. The loop below would not run anyway with a bound of 0, but the
+    // output stride `cols` would then be 0 too, and exiting before the shared
+    // memory walk keeps the "no slot" case explicit and free. The consumer derives
+    // its read count from the SAME live counter (`topk = window + min(cl, topk)`),
+    // so an untouched `out` is never read past the window half when cl == 0.
+    if (n_pos <= 0) return;
     extern __shared__ float smem[];
     const int cols = topk < n_pos ? topk : n_pos;  // out slots (sparse_attn's stride)
     const int cap = topk;                          // array capacity: cols <= topk
@@ -8813,11 +8827,19 @@ extern "C" int dsv41_indexer_topk(const float* q, const float* index_k, const fl
                                   int offset, float softmax_scale, float head_scale,
                                   int uses_candidates, cudaStream_t s) {
     if (b <= 0 || m <= 0 || nh <= 0 || hd <= 0 || topk <= 0) return (int)cudaErrorInvalidValue;
-    if (n_pos <= 0) return (int)cudaSuccess;  // nothing to select from
+    // NO `n_pos <= 0` early-out here any more. `n_pos` is the BAKED (capture-time)
+    // count, and the kernels now treat the device counter as the authority -
+    // INCLUDING the 0 a rollback restore leaves behind. A host guard on a frozen
+    // value did the wrong thing on both sides of the test: with a baked value > 0
+    // it authorised a scan of slots the reserved-away group had written, and with
+    // a baked value <= 0 it skipped a launch the kernels must still see to write
+    // their "no slot" state. The kernel's own guard now decides from the LIVE
+    // value; this launcher only enforces the SHAPE.
     // Stage A's scratch (g_idx_score) has COMPILE-TIME dims: reject a shape that
-    // cannot fit, LOUDLY. b*m is host-known; the n_pos test covers the host
-    // fallback only - the kernels read the live counter, whose reachable maximum
-    // is the index_k allocation (max_pos/ratio + 2) that kIdxMaxPos is sized for.
+    // cannot fit, LOUDLY. b*m is host-known; the n_pos test below is the
+    // defensive CEILING on the host argument (the kernels clamp the live counter
+    // to the same kIdxMaxPos - the index_k allocation max_pos/ratio + 2 that it is
+    // sized for).
     if (b * m > kIdxMaxRows) return (int)cudaErrorInvalidValue;
     if (n_pos > kIdxMaxPos) return (int)cudaErrorInvalidValue;
     // ---- Stage A: the scoring pass, in parallel, into g_idx_score.
