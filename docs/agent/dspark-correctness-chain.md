@@ -1614,3 +1614,20 @@ s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-iden
 3. **accept 的最佳组合仍是 P0-3+P1-5（无 SEED_POS）= 1.214**
 
 **下一步**：S2（TAP_BF16/DRAFT_ATTN 单变量 A/B，无 SEED_POS）——这两个 gate 在修好的基线上从未被单独测试
+
+## SWALLOW_STEP 性能测试的预期框架（等 8e78e3d6）
+
+**测试配置**：SWALLOW_STEP=1 + 全 mrows + VERIFY_GRAPH + BF16_TRUNCATE + batched（非 lazy）
+
+**步时预期**（基于 post-batched-analysis 的校准）：
+| 步时 | 判定 | 含义 |
+|---|---|---|
+| ≤15ms | SWALLOW+mrows 兑现 ✓ | 400 路径打开（@accept 2-3 = 267-400 tok/s）|
+| 15-25ms | 部分改善 | 某些 gate declined——查 decline 日志 |
+| 25-35ms | 与 batched 相当 | SWALLOW 未生效或 mrows 未兑现 |
+| >35ms | 无改善 | SWALLOW 或图化失败 |
+
+**关键检查**：
+- verify_graph_m6 的 capture（SWALLOW 需要 m=6 的形状）
+- mean-k（SWALLOW 的 k_acc 语义与 lazy 可比）
+- 零拉丁（红线）
