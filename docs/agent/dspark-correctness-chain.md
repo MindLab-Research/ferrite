@@ -1674,3 +1674,20 @@ let head_rows = draft_head_fold()  // 默认 ON！
 **修复**：`DSV41_DRAFT_HEAD_FOLD=0`（draft head 回 v1 per-row，与 verify 一致）
 
 **预期**：accept 显著提升（消除 draft↔verify 的 program 级不一致——这正是 accept-first-strategy 说的"consistency"原则的又一例证）
+
+## DRAFT_HEAD_FOLD=0 测试计划（SWALLOW 完成后立即跑）
+
+**根因**：draft head（v2 fold）vs verify head（v1 per-row）的 program 不匹配——ulp 级舍入差异在 argmax 近 tie 位置翻转 → 链式失败
+
+**测试配置**：
+```
+DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1
+DSV41_DRAFT_HEAD_FOLD=0    # ← 关键：draft head 回 v1（与 verify 一致）
+DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+```
+
+**预期**：accept 从 1.214 → **1.5-2.0+**（消除 draft↔verify 的 program 级不一致）
+
+**判定**：
+- accept 显著提升 + 零拉丁 → v2/v1 不匹配是链式失败的主要根因
+- accept 不变 → v2/v1 的 ulp 差异不是主要因素
