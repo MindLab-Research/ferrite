@@ -323,3 +323,8 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 
 nibble 解包（偶列=LOW）✓ / e2m1 dequant 表（同一张，含负零的恒等）✓ / scale 索引（r*nb+b 一致）✓ / round_scale 语义（读同一份 f32，结构上保证 residual = x − pass0 真正喂进点积的项）✓ / grid 覆盖 ✓。
 **唯一一般缺陷**：moe_rows 的 ILV 守卫漏了 `!two`——armed + ILV 组合会 fail-loud（不是静默）但应在 Rust 侧提前拒绝。已顺手修（fuse 绑 pitch 的同一提交）。
+
+## moe_rows 双趟接线审计（verify-batch-6row-check）——**五项全过**
+
+out_slot_stride ✓ / add_inplace 长度（m*topk*act_slot）✓ / ex_act_r_lo 同尺寸 ✓ / armed 时一次 swiglu ✓ / down 的行距 ✓。**双趟在 moe_rows 的接线没有被 moe() 的修复漏掉。**
+**一般缺陷（已由 fuse 绑 pitch 的提交覆盖）**：ILV + E4M3 组合会 fail-loud（cudaErrorInvalidValue）——在默认 ILV 布局下 armed 特性不可用，需 Rust 侧提前拒绝（已修）。
