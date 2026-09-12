@@ -596,6 +596,37 @@ fn pool_rank_body(
                                     dspark_commit_ms / dspark_steps as f64,
                                 );
                             }
+                            // `DSV41_DIFF_EAGER=1`: re-decode this step's emitted
+                            // positions one row at a time and report the first one
+                            // the two paths disagree on. Runs on EVERY rank (the
+                            // eager forward's argmax is a HEAD_SLICE collective)
+                            // and is logged, never propagated — a probe must not
+                            // answer an error for a step whose tokens are already
+                            // committed.
+                            if diff_eager() {
+                                match chain.diff_eager_probe(p, &rep.emitted) {
+                                    Ok(d) => {
+                                        if rank == 0 {
+                                            let mm = match d.first_mismatch {
+                                                Some(i) => format!(
+                                                    "first_mismatch={i} mismatch_pos={}",
+                                                    p + 1 + i
+                                                ),
+                                                None => "first_mismatch=none".to_string(),
+                                            };
+                                            eprintln!(
+                                                "[diff] pos={} spec_emitted={:?} eager={:?} {}",
+                                                p, d.spec_emitted, d.eager, mm
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[dsv41] rank {rank} diff probe err at pos {p}: {e}"
+                                        );
+                                    }
+                                }
+                            }
                             rep.emitted
                         } else {
                             // shadow mode: the single-row step stays the engine's
@@ -694,6 +725,32 @@ fn pool_rank_body(
 fn spec_mode() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SPEC").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_DIFF_EAGER=1` arms the SPEC-vs-EAGER per-position diff probe: after
+/// every real-commit spec round, [`DevChain::diff_eager_probe`] re-decodes the
+/// positions that round emitted one row at a time and serve prints
+///
+/// ```text
+/// [diff] pos=… spec_emitted=[…] eager=[…] first_mismatch=<i mismatch_pos=… | none>
+/// ```
+///
+/// `first_mismatch` is the first emitted token the m-row verify disagrees with
+/// the plain single-row engine about, i.e. the first position at which a
+/// spec-only defect becomes observable in the stream (see the probe's doc
+/// comment for what is compared and what is undone). Greedy speculative
+/// decoding promises `none` on every round.
+///
+/// Read ONCE and cached (the house rule for every hot-path gate), `"0"` means
+/// OFF. Costs `emitted.len() - 1` extra single-row forwards per round, so it is
+/// a LOCALISATION tool, never a perf mode: do not leave it on under an A/B.
+///
+/// It needs `DSV41_SPEC=1` — the probe compares a COMMITTED step's tokens with
+/// the single-row replay of their positions, and only the spec path commits
+/// multi-token blocks.
+fn diff_eager() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_DIFF_EAGER").map(|v| v != "0").unwrap_or(false))
 }
 
 /// Feed the prompt one token per forward (the KV ring is per-sequence) and
