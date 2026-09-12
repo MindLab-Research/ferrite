@@ -3685,3 +3685,27 @@ self.dev.gemm_fp8_mx_rope_norm(
 **待验证**：RING_WIN_FUSE 需要在干净 base 上单独测试（base + RING_WIN_FUSE only）——之前从未隔离测试过
 
 **K1/K2 的设计原则**（verify-specific-fusion-kernel-design）：**不换程序只搬代码**——每一融合段都以 verify 自己今日在用的 kernel 为逐位参照。这是 R2 教训的直接应用。
+
+## 干净栈重建计划（bisect4 后的系统性验证）
+
+**背景**：R2 损坏污染了之前的全栈测试（84.0 tok/s 无效）。需要在干净的 base（78.8 tok/s）上逐个验证每个优化。
+
+**验证顺序**（每个优化单独 A/B，计数任务验证数字顺序 + 出师表验证零拉丁）：
+| # | 优化 | gate | 状态 | 预期 |
+|---|---|---|---|---|
+| 1 | bisect4 的干净半边 | ATTN_LIN_FUSE=2 或 =3 | 🔄 定位中 | +3% |
+| 2 | wo_a cp.async16 | （.so 已含）| 已提交未测 | +1% |
+| 3 | RING_WIN_FUSE | DSV41_RING_WIN_FUSE=1 | 已实施未隔离测 | +0.5% |
+| 4 | VERIFY_FORK | DSV41_VERIFY_FORK=1 | 已实施（只在损坏栈测过）| +1-2% |
+| 5 | MARKOV_SLICED（修复后）| DSV41_MARKOV_SLICED=1 | 修复后未单独测 | +1% |
+| 6 | LAZY_SDR（修复后）| DSV41_LAZY_SDR=1 | 修复后未单独测 | +0.5% |
+| 7 | K1（mrows2）| DSV41_ATTN_MROWS2=1 | 实施中 | +2-3% |
+| 8 | K2（mrows_rope_norm）| DSV41_ATTN_MROWS_ROPE_NORM=1 | 实施中 | +2-3% |
+
+**验证纪律**（R2 的教训）：
+1. **计数任务必须验证数字顺序**（1-200 递增）——不只查拉丁
+2. **出师表必须 1000 token + 完整内容查看**
+3. **每个优化单独 A/B**——不和未验证的优化混在一起
+4. **parity 测试先行**——K1/K2 必须先过逐字节 diff 再上 e2e
+
+**预期最终干净栈**：78.8 × 1.10-1.15 ≈ **87-91 tok/s**
