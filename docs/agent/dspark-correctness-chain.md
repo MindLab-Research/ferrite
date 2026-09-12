@@ -2950,3 +2950,41 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **⚠️ 注意**：nsys 的 kern_sum 只显示非图 kernel。图 replay 的 kernel（verify 的主要部分）不在统计中。完整图需要用 cuda_gpu_trace 或关闭图重测。
 
 **tcgen05 的潜在收益**：替换 38.1% 的可见 kernel 时间（三件套）→ 如果可见部分代表 ~50% 的总时间，tcgen05 节省 ~19% 总时间。
+
+## 🎯 nsys 无图完整 per-kernel 数据（781feec7——所有 kernel 可见！）
+
+**配置**：Wave 1 + SH_PAIR_M=1 + lazy verify（无 VERIFY_GRAPH）+ AR_V5=0 + 计数任务
+
+| 排名 | Time% | 总时间(ms) | 实例数 | 平均(μs) | Kernel | 族 |
+|---|---|---|---|---|---|---|
+| 1 | **13.2%** | 204.4 | 7,136 | 28.6 | p2p_ar_pubred_v5_hcpost_rows | **AR（TP8 通信）** |
+| 2 | 12.6% | 196.1 | 14,820 | 13.2 | gemm_fp8_mrows_kernel<1> | 投影（mrows）|
+| 3 | **9.7%** | 150.9 | 3,528 | 42.8 | **gemm_fp8_sh_exp_pair_kernel<1>** | **SH_PAIR（工作！）** |
+| 4 | 8.1% | 125.1 | 8,417 | 14.9 | hc_dots_late_kernel | hc 链 |
+| 5 | 6.8% | 105.1 | 3,528 | 29.8 | wo_a_grouped_gemv_kernel<1> | 投影（wo_a）|
+| 6 | 5.9% | 91.6 | 4,508 | 20.3 | expert_gemv_fp4_batched<1,1> | MoE 路由专家 |
+| 7 | 5.3% | 81.6 | 5,448 | ~15.0 | (截断) | ? |
+| 8 | 4.1% | 57.3 | 933 | 6.1 | p2p_ar_pubred_v5_hcpost | AR |
+| 9 | 3.5% | 49.2 | 957 | 5.1 | p2p_ar_store_v5 | AR |
+| 10 | 3.3% | 46.3 | 557 | 8.3 | gemv_bf16_v2_kernel<8> | head/gate |
+
+**关键发现**：
+1. **AR 三件套（#1+#8+#9）= 20.8%**——TP8 通信是最大类别！
+2. **SH_PAIR template<M=1> 可见且工作**（9.7%，3,528 实例 × 42.8μs）
+3. **MoE 路由专家（#6 + #7截断 + interleave）** ≈ 15-20%
+4. **hc 链（#4 + mixes）** ≈ 12%
+5. **投影（#2 + #5）= 19.4%**
+
+**tcgen05-proper-retest 的关键发现**：
+- **ld_uint2_a8 守卫保护的路径与冒烟臂不是同一条代码**——守卫修的是 "pair body"（uint2 读），冒烟臂跑的是 "split body"（uint32 读）
+- 正确的重测需要 nsys 确认 `e4m3_gemm_grouped_kernel` 实例 > 0（正证据）
+- ILV=0 完全可用（checkpoint 原生布局）
+
+**修正后的 400 路径**：
+- 实际步时 22.56ms（不是 33ms——之前是端到端反推的口径错误）
+- AR = 20.8% × 22.56 = ~4.7ms（TP8 通信——协议地板）
+- MoE = ~15-20% × 22.56 = ~3.4-4.5ms（tcgen05 可省 ~2ms）
+- 投影 = 19.4% × 22.56 = ~4.4ms
+- hc = 12% × 22.56 = ~2.7ms
+- SH_PAIR = 9.7% × 22.56 = ~2.2ms
+- 总计 ≈ 17.4ms（+ draft 4.3 + commit 0.2 = ~22ms ✓）

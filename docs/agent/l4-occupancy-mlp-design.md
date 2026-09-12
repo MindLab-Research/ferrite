@@ -178,6 +178,16 @@ per-step 族（hc/AR，发数与 m 无关）：同样 ×k_emit（lazy-verify §2
    ⇒ §5 的节省表**按 batched 口径（m=6）给**，lazy 的折算另列。
 3. **L4 与 L3（SH_PAIR_M）互斥的点只有一个**：shared expert 的 n=288。L4-1 的原靶子被 L3 接管后，
    L4-1 只剩 wkv（且需要调 crossover）。**顺序上 L4-1 应排在 L3 之后做，或与 L3 同一次 A/B 测量。**
+4. **§3.2 的 ×k_emit 倍数按「族」计，不按「kernel 计」**，且各族的上界不同：
+   - **per-step 族（hc 链 / AR）**：发数与 m 无关（`hc_mixes(..., m as i32, ...)` 把行数当 kernel 内的
+     rows 维；`layer_rows` 每层调一次）⇒ **严格 ×k_emit**（`lazy-verify §2.1` 已论证）。
+   - **per-row 族（shared / proj / gate / indexer / attention）**：lazy 逐行 `step_rows(m=1)` ⇒
+     每层每行各调一次 ⇒ **×k_emit**，但每行的 active 侧工作量最小（§3.4-2 的缩水项）。
+   - **routed experts 的 tcgen05 臂**：`moe_rows` 的 routed 段**没有逐行外层循环**（读码：14200-15200
+     内唯一的 `for` 是 `for slot in 0..topk`），但它消费的 `ex_act_b` 是 `[topk][...]` 布局、
+     `act` 是「ONE shared quantised activation row」——**「m 行如何进入这一发」这一点静态读码未能完全钉死**
+     （可能由 kernel 内的 rows 维或上游 pool 承担）。⇒ **L4-3/L4-4 的 lazy 倍数必须由上机（U1 的
+     launch 计数）确定，不得按 2.214 直接乘。**
 
 ---
 
