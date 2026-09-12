@@ -9308,14 +9308,25 @@ __global__ void p2p_ar_pubred_v5_kernel(
         __threadfence_system();
     }
     __syncthreads();
-    // AFTER all of this rank's stamps are out: the next round's store reads e+1.
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-        *epoch = e + 1u;
     // The round's wait. OFF arm = every block polls all peers (today's path);
     // ON arm = block 0 polls + a broadcast flag. A4/A0/A2b, see `ar5_wait_round`.
     ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, site,
                    trap, s_probe, t_entry);
     __syncthreads();
+    // R1 (A4) bug 2 fix: the epoch advance is AFTER the wait, not before it.
+    // Every block reads `const unsigned e = *epoch` at its entry, and this is the
+    // ONLY writer of that word in the launch, so advancing it before the wait let
+    // a block that reached its own entry read after the advance take `e + 1` as
+    // its round: it then waited for `e + 2` -- a stamp no peer sends this round
+    // (the A4 arm waits on the broadcast word, the OFF arm on the peer stamps) --
+    // and, had it been let through, would have reduced the WRONG parity half.
+    // After the wait every block of this grid has long since read its own `e`,
+    // and the advance is still before the next round's store: that store is a
+    // separate launch, ordered after this kernel by the stream, so it reads e+1
+    // exactly as before. This is also the order `dsv41_v5_epoch_pad_kernel` uses
+    // (broadcast word first, then `*epoch`).
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *epoch = e + 1u;
     unsigned long long t_wait_done = 0ull;   // A0: block 0 / thread 0 only
     if (probe && blockIdx.x == 0 && threadIdx.x == 0)
         t_wait_done = clock64();
