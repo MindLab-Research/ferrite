@@ -247,3 +247,15 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 1. **`verify_graph_m` 的形状锁**（:3988 `m != self.verify_graph_m` → gate false）——legacy（m=5）与 aligned/swallow（m=6）**混用时图永远不命中**（第一次捕获锁定 m，另一种 m 静默回裸链——性能损失但无错）。**修法**：`verify_graph_m` 改成 `Option<(usize, graph)>` 的形状池（或按 m 分桶存图）——性能项，不阻塞正确性。
 2. **`compress_branch_steady`**（:4050）要求每个 compress source 的 `compress_len > 0`——prefill 后第一个 verify 时可能不满足（组形成需要 ratio 个 token）——**首 1-2 轮走裸链后自动 steady** ✓。
 3. **`spec_capture` 标志**（:1701）在 `step_rows_inner` 内有 host 分支（图捕获时 host 代码照跑、kernel 只记录）——**compress_len 的 host mirror 推进（advance_compress_lens）在 capture 时也执行**，回滚靠 `restore_compress_lens`（:4063）——已闭合 ✓。
+
+## verify 图化兼容性审计判词（verify-graph-capture2，完整）
+
+| 改动 | 判定 |
+|---|---|
+| head 词表切分（argmax_sliced_rows） | ✅ 可捕获——epoch 是 device 指针自增（与 AR v5 pubred 同族），launch 参数全固定 |
+| orope 融合 | ✅ 可捕获——decline 只依赖进程级 read-once env + 固定 shape，capture 烘死的分支 == replay |
+| a32 gate | ✅ 可捕获——static 早退，无漂移；但默认 a32=1 使 mrows 在 verify 里**死掉**（图录的是逐行 lin，节点更多——既有行为非图化引入） |
+| **verify_graph_m 形状闩** | ❌ **SEED_ALIGN/SWALLOW 下图永不命中**——请求内 m 序列 5,6,6,…，首个 DRY 写死 m=5，此后 m=6 全 gate false（静默回裸链，无错但零收益）。**默认（两 gate OFF）单形状 m=5 时图可捕获** |
+| spec_capture host 分支 | ✅ 一致 |
+
+**结论**：**默认配置下图化现在就能开**（m 恒 5、argmax/orope/a32 全合法、epoch 是图内计数器）——预期收益 = 裸链的 ~3000 launch×2.9µs submit 半 → 图内 0.4µs/node。**SEED_ALIGN/SWALLow 开启时需形状池**（性能项）。
