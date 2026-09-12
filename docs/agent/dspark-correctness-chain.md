@@ -1450,3 +1450,28 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 - accept 2-3（上限 ~3）
 - 400 需要 accept 近上限 + 步时 ≤10ms
 - 当前 accept 1.214 + 步时 ~35ms = 最大的差距在步时
+
+## 🎯 战略级发现：accept 优先于 verify（arch-floor-insights）
+
+**架构地板层级**：
+| 层级 | 内容 | verify ms |
+|---|---|---|
+| L0 | 今天（实测）| 37.31 |
+| L1 | 只翻 flag（全 mrows + hc + graph）| 31-33 |
+| L2 | + tcgen05（routed 换核）| 25-26 |
+| L3 | + 族级融合（6224→1300 发）| **20-22（真地板）** |
+| L4 | + 占用/MLP 修复 | 11-14 |
+| L5 | + kernel 内流水 + 满 wave | **8-9（400 的算术地板）** |
+
+**400 的数学**：
+- accept 1.214 → 需 5.54ms ❌ **低于 L5 地板 8-9ms → 物理不可达**
+- accept 3.0 → 需 10.0ms ⚠️ L5 刚好、零余量
+- accept 5.0（sglang）→ 需 15.0ms ✅ L3/L4 可达
+
+**判决**：`accept 停 1.2，任何 verify 优化都改变不了量级。第一优先级是 accept，不是 verify。`
+
+**sglang 的对比**：他们 ~15-20 kernel/层（我们 ~156 = 10×），tensor-core MFU 30-50%（我们 SIMT 0.7-4.9% = 10×），每行边际 1.8ms（我们 7.5ms = 4×）。**这是设计点的差异，不是调参。**
+
+**lazy 比 batched 快**（22.56 vs ~39ms）——instruction-bound 下 batched 的激活×6 反而更贵。
+
+**行动**：accept-first-strategy subagent 正在分析 accept 1.214 → 2-3 的路径。
