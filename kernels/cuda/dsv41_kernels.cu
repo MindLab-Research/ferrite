@@ -3922,11 +3922,67 @@ static inline int dsv41_mrows_warps_for(int n) {
 // is checked at RUNTIME (`dsv41_f4_ok`) rather than assumed, so an exotic shape
 // (e.g. k = 96, where M*(k/8) is not a 16B multiple) keeps the scalar loop
 // instead of trapping err 716.
-static const bool g_mrows_act_cpasync = [] {
+//
+// FIX (main agent): the previous `static const bool g_mrows_act_cpasync = ...`
+// was a HOST-scope lambda-initialized variable — nvcc rejects it from device
+// code ("identifier is undefined in device code", 8 errors at the :5298 call
+// site). The gate is now a plain function evaluated in HOST code and passed
+// to the kernel as the `act_cpasync` bool parameter (same pattern as the
+// existing `fold_r` / `nwarps` parameters on the same launcher).
+static bool mrows_act_cpasync_host() {
     const char* e = getenv("DSV41_MROWS_ACT_CPASYNC");
     if (e == nullptr) return false;
     return atoi(e) != 0;
+}
+
+// MROWS-FOLD-R (DSV41_MROWS_FOLD_R, 2026-09-12): the runtime "activation rows
+// per block" knob that folds the M dimension of `gemm_fp8_mrows_kernel<M>` into
+// the GRID instead of the per-warp register file. Design:
+// docs/agent/l4-mgrid-first-step-design.md §3 (design step "1a").
+//
+// WHY. The kernel's parallelism is `ceil(n / nwarps)` BLOCKS -- n, not M -- and
+// M only enters `float acc[M]` / the staged activation rows, so a bigger m buys
+// per-warp work, never more warps in flight. At the verify's wkv shape
+// (n = 512, k = 5120, m = 6, nwarps = 4) that is 128 blocks; worse, the block's
+// dynamic smem is 56064 B (the m*k = 30720 B of staged activation rows is 55% of
+// it), which caps the launch at 4 blocks/SM x 4 warps = 16 warps/SM (25% of a
+// 64-warp machine). `fold_r` gives each block only `fold_r` activation rows and
+// the grid an extra `ceil(m/fold_r)` dimension, so smem falls to 27264 B and the
+// same launch reaches 8 blocks/SM = 32 warps/SM. The M-into-warp fold is NOT
+// replaced -- `fold_r = m` (the default) is exactly today's program and
+// `fold_r = 1` is the pure M-into-grid endpoint; the knob moves between them
+// with no recompile.
+//
+// NUMERICS -- bit-identical at every fold_r. `acc[q]` is an independent chain and
+// nothing is ever combined across activation rows (C4/C5 in the kernel header),
+// so the row PARTITION is unobservable: `fold_r = m` gives one block all m rows
+// (r0 = 0, rn = m, the `q >= rn` break never fires) and `fold_r < m` gives each
+// block its own r0 slice, staged from the same global rows into the same
+// per-block slots and folded by the same expression, the same ascending K walk
+// and the same `shfl_xor` tree.
+//
+// A/B arm, DEFAULT OFF. Unset / `0` = today's behaviour (`fold_r = m`, byte-for-
+// byte the previous launcher); a positive value N is clamped to [1, m]; `auto`
+// (or a negative value) applies the shape rule below.
+static const int g_mrows_fold_r = [] {
+    const char* e = getenv("DSV41_MROWS_FOLD_R");
+    if (e == nullptr) return 0;
+    if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto" -> shape rule
+    return atoi(e);
 }();
+// Shape rule for `DSV41_MROWS_FOLD_R=auto` (design §3.4). The applicability test
+// is "does the n-driven block count already cover the 148-SM chip, and is smem
+// not the thing capping warps/SM": wq_b/wo_b (n >= 4096) are 346%/432% and must
+// keep `fold_r = m` (re-reading their weights buys no parallelism); wkv (512) /
+// wq_a (1280) are the fold_r targets. `n <= 1024 -> 1`, else `m`.
+static inline int dsv41_mrows_fold_r_for(int n, int m) {
+    int fold_r = g_mrows_fold_r;
+    if (fold_r == 0) return m;                      // OFF: today's program
+    if (fold_r < 0) fold_r = (n <= 1024) ? 1 : m;   // auto: shape rule
+    if (fold_r > m) fold_r = m;
+    if (fold_r < 1) fold_r = 1;                     // never 1-as-decline
+    return fold_r;
+}
 
 // P1 staged gate (DSV41_GEMV_A32_STAGED), default OFF = the P1 direct form.
 //
@@ -5262,18 +5318,33 @@ __global__ void __launch_bounds__(256)
 gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                       const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                       const float* __restrict__ bias, float* __restrict__ out, int n, int k,
-                      int out_stride, int a32) {
+                      int out_stride, int a32, int fold_r, int act_cp16) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int nwarps = (blockDim.x + 31) >> 5;
     const int nb_k = k >> 5;
-    // smem layout: the block's weight rows | the 256-entry e4m3 table | the M
-    // activation scale rows (f32) | the M staged activation rows (fp8 bytes).
+    // FOLD_R (DSV41_MROWS_FOLD_R, design step 1a): the M dimension is a GRID axis
+    // here. `nt` output-row tiles still come from n; `ng = ceil(M/fold_r)`
+    // activation-row groups come from the knob. Block b owns tile `it = b % nt`
+    // and the activation rows [r0, r0 + rn), staging only those `rn` rows. With
+    // `fold_r = M` (the default, gate OFF) ng = 1, r0 = 0, rn = M and this is the
+    // previous program line-for-line; the ONLY output-side line the fold touches
+    // is `row`, whose upper level becomes `it` (was `blockIdx.x`).
+    const int nt = (n + nwarps - 1) / nwarps;
+    const int it = blockIdx.x % nt;
+    const int r0 = (blockIdx.x / nt) * fold_r;
+    const int rn = min(fold_r, M - r0);
+    // smem layout: the block's weight rows | the 256-entry e4m3 table | the
+    // `fold_r` activation scale rows (f32) | the `fold_r` staged activation rows
+    // (fp8 bytes). The activation regions are sized by `fold_r` (the block stages
+    // only its `rn <= fold_r` rows), NOT by M; the launcher allocates the same
+    // fold_r-sized dynamic smem, and `fold_r <= M` keeps it under the per-M
+    // ceiling `FERRITE_SET_MROWS_SMEM` already set -- no new attribute.
     extern __shared__ uint8_t smem[];
     uint8_t* s_w = smem;
     float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
     float* s_as = s_lut + 256;
-    uint8_t* s_a = reinterpret_cast<uint8_t*>(s_as + (size_t)M * (size_t)nb_k);
+    uint8_t* s_a = reinterpret_cast<uint8_t*>(s_as + (size_t)fold_r * (size_t)nb_k);
     for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
     // The M activation rows are the same for every output row of the block, so
     // they are staged once per block instead of re-read by each of the `nwarps`
@@ -5295,14 +5366,15 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     // warp-private WEIGHT row waits) would be a data race on this slot. The
     // weight group is issued after this wait, so it still stays in flight across
     // the barrier for the active warps' own wait.
-    const bool a16 = g_mrows_act_cpasync && dsv41_f4_ok(a) && dsv41_f4_ok(s_a);
+    const bool a16 = (act_cp16 != 0) && dsv41_f4_ok(a) && dsv41_f4_ok(s_a);
     #pragma unroll
-    for (int r = 0; r < M; ++r) {
-        const uint8_t* __restrict__ ar = a + (size_t)r * (size_t)k;
-        const float* __restrict__ asr = a_scale + (size_t)r * (size_t)nb_k;
-        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[(size_t)r * nb_k + i] = asr[i];
+    for (int q = 0; q < M; ++q) {
+        if (q >= rn) break;  // rename of the row loop's index: only THIS block's activation rows
+        const uint8_t* __restrict__ ar = a + (size_t)(r0 + q) * (size_t)k;
+        const float* __restrict__ asr = a_scale + (size_t)(r0 + q) * (size_t)nb_k;
+        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[(size_t)q * nb_k + i] = asr[i];
         if (a16) {
-            uint8_t* __restrict__ sar = s_a + (size_t)r * (size_t)k;
+            uint8_t* __restrict__ sar = s_a + (size_t)q * (size_t)k;
             const int n16a = k >> 4;
             for (int i = threadIdx.x; i < n16a; i += blockDim.x)
                 dsv41_cp_async16(sar + (i << 4), ar + (i << 4));
@@ -5310,7 +5382,7 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
             // kept so the row is staged by exactly the rule the weight row uses.
             for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) sar[i] = ar[i];
         } else {
-            for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[(size_t)r * (size_t)k + i] = ar[i];
+            for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[(size_t)q * (size_t)k + i] = ar[i];
         }
     }
     // Retire the activation group here (see SYNC above). `a16` is uniform across
@@ -5322,7 +5394,10 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     // reached by every thread of the block (the strided-walk shape the m=1
     // kernel uses collapses to this single-shot form at grid*nwarps >= n, which
     // is what the launcher guarantees).
-    const int row = blockIdx.x * nwarps + warp;
+    // FOLD_R: this is the ONLY output-side line the fold changes -- the upper
+    // level is the block's i-tile `it` (was `blockIdx.x`), because the grid also
+    // carries the activation-row group now. With fold_r = M, it == blockIdx.x.
+    const int row = it * nwarps + warp;
     const bool active = row < n;
     // cp.async 16B weight staging (2026-09-12, verify-family-fusion finding #1).
     //
@@ -5411,11 +5486,16 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
                 // to `s_af`.
                 float af[M];
                 #pragma unroll
-                for (int r = 0; r < M; ++r)
-                    af[r] = s_lut[s_a[(size_t)r * (size_t)k + j]] *
-                            s_as[(size_t)r * nb_k + (j >> 5)];
+                for (int q = 0; q < M; ++q) {
+                    if (q >= rn) break;  // only this block's rows (acc[M] stays compile-time sized)
+                    af[q] = s_lut[s_a[(size_t)q * (size_t)k + j]] *
+                            s_as[(size_t)q * nb_k + (j >> 5)];
+                }
                 #pragma unroll
-                for (int r = 0; r < M; ++r) acc[r] += af[r] * wv;
+                for (int q = 0; q < M; ++q) {
+                    if (q >= rn) break;
+                    acc[q] += af[q] * wv;
+                }
             }
         } else {
             // A32-OFF ARM (DSV41_GEMV_A32=0, the rollback / A-B arm). The gemv's
@@ -5431,20 +5511,22 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
                 // the m=1 loop would recompute, reused.
                 const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
                 #pragma unroll
-                for (int r = 0; r < M; ++r) {
+                for (int q = 0; q < M; ++q) {
+                    if (q >= rn) break;
                     const float av =
-                        s_lut[s_a[(size_t)r * (size_t)k + j]] * s_as[(size_t)r * nb_k + (j >> 5)];
-                    acc[r] += av * wv;
+                        s_lut[s_a[(size_t)q * (size_t)k + j]] * s_as[(size_t)q * nb_k + (j >> 5)];
+                    acc[q] += av * wv;
                 }
             }
         }
         #pragma unroll
-        for (int r = 0; r < M; ++r) {
-            float a_r = acc[r];
-            for (int off = 16; off > 0; off >>= 1) a_r += __shfl_xor_sync(0xFFFFFFFFu, a_r, off);
+        for (int q = 0; q < M; ++q) {
+            if (q >= rn) break;
+            float a_q = acc[q];
+            for (int off = 16; off > 0; off >>= 1) a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
             if (lane == 0) {
-                const float v = a_r + (bias != nullptr ? bias[row] : 0.f);
-                out[(size_t)r * (size_t)out_stride + row] = v;
+                const float v = a_q + (bias != nullptr ? bias[row] : 0.f);
+                out[(size_t)(r0 + q) * (size_t)out_stride + row] = v;
             }
         }
     }
@@ -5499,12 +5581,25 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // geometry still does not enter the parity argument -- rows are independent,
     // it only decides how many rows share one block's staging.
     const int nwarps = dsv41_mrows_warps_for(n);
-    const int blocks = (n + nwarps - 1) / nwarps;
+    const int nt = (n + nwarps - 1) / nwarps;
     const int nb_k = k >> 5;
-    // weight rows (nwarps*k) + the e4m3 table + the M activation scale rows + the
-    // M staged activation rows.
+    // FOLD_R (DSV41_MROWS_FOLD_R, design step 1a): `fold_r` activation rows per
+    // block and `ng = ceil(m/fold_r)` extra grid dimension. Gate OFF (unset / 0)
+    // returns `m`, i.e. ng = 1 and the grid is the previous `nt` blocks exactly.
+    // The weights are re-read `ng` times (L2-resident at these shapes), which is
+    // the accepted cost of the extra parallelism; see g_mrows_fold_r above.
+    const int fold_r = dsv41_mrows_fold_r_for(n, m);
+    const int ng = (m + fold_r - 1) / fold_r;
+    // ACT_CP16 (DSV41_MROWS_ACT_CPASYNC, design step 1b): read on HOST here
+    // (the previous device-side `g_mrows_act_cpasync` global was a host-scope
+    // variable that nvcc rejected from device code — 8 compile errors) and
+    // passed to the kernel as a plain int parameter.
+    const int act_cp16 = mrows_act_cpasync_host() ? 1 : 0;
+    // weight rows (nwarps*k) + the e4m3 table + the fold_r activation scale rows
+    // + the fold_r staged activation rows. Sized by `fold_r` (<= m), so it never
+    // exceeds the per-M ceiling FERRITE_SET_MROWS_SMEM sets below.
     const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
-                        (size_t)m * (size_t)nb_k * sizeof(float) + (size_t)m * (size_t)k;
+                        (size_t)fold_r * (size_t)nb_k * sizeof(float) + (size_t)fold_r * (size_t)k;
     if (smem > 48 * 1024) {
         // Per-kernel ceiling, not this call's need: a sticky attribute set to a
         // smaller value would silently cap later launches (round-43 revert).
@@ -5533,16 +5628,16 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 #undef FERRITE_SET_MROWS_SMEM
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
-    const dim3 grid(blocks);
+    const dim3 grid(nt * ng);
     switch (m) {
-        case 1: gemm_fp8_mrows_kernel<1><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 2: gemm_fp8_mrows_kernel<2><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 3: gemm_fp8_mrows_kernel<3><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 4: gemm_fp8_mrows_kernel<4><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 5: gemm_fp8_mrows_kernel<5><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 6: gemm_fp8_mrows_kernel<6><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 7: gemm_fp8_mrows_kernel<7><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
-        case 8: gemm_fp8_mrows_kernel<8><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 1: gemm_fp8_mrows_kernel<1><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 2: gemm_fp8_mrows_kernel<2><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 3: gemm_fp8_mrows_kernel<3><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 4: gemm_fp8_mrows_kernel<4><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 5: gemm_fp8_mrows_kernel<5><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 6: gemm_fp8_mrows_kernel<6><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 7: gemm_fp8_mrows_kernel<7><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
+        case 8: gemm_fp8_mrows_kernel<8><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32, fold_r, act_cp16); break;
         default: return 2;
     }
     return (int)cudaGetLastError();
