@@ -178,3 +178,19 @@
 
 **锚点版起不来**：`parse config.json: missing field layer_types at line 156`——8a5a952 的 `--model dsv41` 入口还不认识当前模型目录的 config（`--model` 单二进制路由是 Wave 1 的 T3 改动，在锚点之后）。⇒ **锚点版必须用旧入口**（`dsv41-run --serve`）跑。下一轮复测用 `./target/release/dsv41-run --serve ...`。
 **远端已恢复 origin/main**（46e07eb）。
+
+## 头号根因确认（代码级证据）：MoE routed expert 的激活量化格式分歧
+
+**官方 `model.py:181-195`**（直接读原文核实）：
+```python
+if weight.dtype == torch.float4_e2m1fn_x2:
+    x, s = act_quant(x, fp8_block_size, scale_fmt, scale_dtype)  # ← fp8 e4m3 激活
+    return fp4_gemm(x, s, weight, weight.scale, ..., act_block_size=fp8_block_size)
+```
+注释原文："both fp4 and fp8 weights take an **fp8** one -- for fp4 the kernel handles the mixed precision."
+
+**ferrite**：`chain_dev.rs:10199` 的 `quant_fp4(xn → xq4/xsc4)`——**e2m1（1 位尾数）激活**。
+
+⇒ **e2m1 vs e4m3 = backbone 里量级最大的已知数值分歧**（e2m1 尾数 1 位 vs e4m3 尾数 3 位——每层每 token 的 routed expert 输出都有系统性偏差，44 层累积）。这完美解释：首 token 近 tie 翻转（`《` vs `出`）、长链尾部的 opa 退化、EAGER 与 spec 双双中招（backbone 共性）。
+**修复方向**：routed expert 的激活切 e4m3（`DSV41_EXPERT_ACT_FP8` A/B 先验证）。
+**注意**：这**不是** 8a5a952..HEAD 的回归——它是**一直存在的架构级偏差**（官方 fp4_gemm 是混合精度 MMA：fp8 激活 × fp4 权重；ferrite 的 fp4 kernel 假设 fp4 激活）。用户说"162tok/s 版没乱码"可能因为那个版本的其它路径掩盖了它，或 opa 的出现需要特定上下文长度（阈值效应）。锚点版复测（anchor-dsv41run-retest）会给出判定。
