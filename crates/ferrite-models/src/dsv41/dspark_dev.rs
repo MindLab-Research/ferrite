@@ -70,6 +70,36 @@ fn trace() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DSPARK_TRACE").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_DRAFT_HEAD_FOLD=0` swaps the draft's head GEMV to the PER-ROW
+/// `gemv_bf16` (the v1 program) instead of the folded multi-row
+/// `head_gemv_bf16_mrows`. **Default ON (the folded path): this gate exists as
+/// an A/B, not as a fallback.**
+///
+/// The folded kernel's header claims bit-identity with the single-row launch it
+/// replaces (C1-C6); the verify's head measured it as false — see
+/// [`crate::dsv41::chain_dev::verify_head_fold`]'s doc, where folded gives
+/// `verify_out[0] == next` on 33% of rows vs 9% for the per-row `gemv_bf16`.
+/// The production single-row head is `gemv_bf16_kernel` in `dsv41_glue.cu:368`
+/// (the scalar `c += 32` chain) because `gemv_bf16_v2_wanted(n)` needs
+/// `n < 2048` and the head's `n = vocab_size = 129280` (device.rs). So folding
+/// the head is a NUMERICAL change, not a free scheduling one: the folded kernel
+/// pairs the fma/decode differently ⇒ ~1e-3 on the logits ⇒ a near-tie argmax
+/// can flip.
+///
+/// That matters here because the draft's top-1 IS `drafts[0]` (`ids[1]` in the
+/// Markov loop below): if the fold lowers it, the accept chain loses its first
+/// link. The A/B tests exactly that — same step, `drafts[0] == next` rate and
+/// the `k_acc` histogram, folded vs per-row. Read once and cached (the house
+/// rule for hot-path gates).
+fn draft_head_fold() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_DRAFT_HEAD_FOLD")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// The device draft. Holds the window rings (one per MTP block), every scratch
 /// buffer the forward needs, and references to the shared weights/config.
 pub struct DsparkDev<'a> {
@@ -1672,17 +1702,23 @@ impl<'a> DsparkDev<'a> {
         // dispatch: keep the per-row loop, which computes the same values by the
         // same argument. The f32-activation dtype keeps it too (the multi-row
         // kernel is bf16-only).
-        let mut head_rows = false;
-        if head.dtype.as_str() == "BF16" {
-            head_rows = self.dev.head_gemv_bf16_mrows(
-                head.ptr(),
-                self.normed.ptr as *const f32,
-                self.logits.ptr as *mut f32,
-                bs as i32,
-                vocab as i32,
-                dim as i32,
-            )?;
-        }
+        //
+        // `DSV41_DRAFT_HEAD_FOLD=0` forces the per-row loop even when the folded
+        // launch is available: the A/B for "does the folded kernel's K-order
+        // difference cost the draft its top-1" (see `draft_head_fold`).
+        let head_rows = draft_head_fold()
+            && if head.dtype.as_str() == "BF16" {
+                self.dev.head_gemv_bf16_mrows(
+                    head.ptr(),
+                    self.normed.ptr as *const f32,
+                    self.logits.ptr as *mut f32,
+                    bs as i32,
+                    vocab as i32,
+                    dim as i32,
+                )?
+            } else {
+                false
+            };
         if !head_rows {
             for r in 0..bs {
                 match head.dtype.as_str() {
