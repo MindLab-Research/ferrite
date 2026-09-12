@@ -5675,3 +5675,31 @@ DSV41_V5_WITNESS=1                 # P1 设备侧证词（kernel 自己记录！
 - witness 的 e_wrote 如果显示某个写点写了 54——**找到根因**（哪个 kernel 写的！）
 - witness 的所有 e_wrote 都 > 999——**host 读错位置**（观测错位确认！）
 - RESET 触发——降级检测工作（为下一轮调查提供准确数据）
+
+## 🎯🎯🎯 决定性 witness 测试——EPOCH 54 的根因找到了：OOB 写清零 staging！
+
+**测试结果**（2e42ebb7——决定性！）：
+```
+[v5-ledger-pre] pos=15 rank=0 epoch=999 canary=0xdeadbeef arm=pre  ← 正常
+[v5-ledger-CANARY] pos=15 rank=0 arm=swallowed canary=0x00000000 expected=0xdeadbeef  ← 🚨 CANARY 被清零！
+[v5-ledger-RESET] pos=15 rank=0 arm=swallowed prev=999 cur=54 drop=945  ← RESET 触发 ✓
+[v5-ledger] pos=15 rank=0 epoch=54 canary=0x00000000 arm=swallowed  ← epoch 也被清零后重数
+```
+
+**所有 rank 都显示相同模式**：canary 0xdeadbeef → 0x00000000（**OOB 写清零了 staging！**）
+
+**根因判定**：
+1. **第一次 swallowed 步中，某个 kernel 越界写（OOB）清零了 staging 缓冲区**
+2. **staging 包含**：AR 结果 + ready stamps + **epoch（ctr_at）** + **canary（ctr_at+8）**
+3. **epoch 999 → 54 的机制**：OOB 清零 → epoch 从 0 重新计数 → 54 轮 AR 后 = 54
+4. **canary 0xdeadbeef → 0x00000000**：同样的清零（OOB 写的覆盖范围包含 ctr_at..ctr_at+8+）
+
+**这解释了一切**：
+- 均匀降级（所有 rank——同一 OOB 在每个 rank 上执行）
+- epoch = 54（清零后重新计数）
+- EOS 提前（损坏的 AR 结果 → 错误 attention → 错误 logits）
+- 为什么不是"写入小值"（是清零 + 重新计数！）
+
+**下一步**：找到 OOB 写的源头（哪个 kernel 在 swallowed 臂中越界写）
+- 候选：batched verify (m=6) 的某个 kernel / SWALLOW 的 snapshot-rollback / 某个 m=6 特有的 kernel
+- 工具：compute-sanitizer memcheck（枚举所有 OOB 写）
