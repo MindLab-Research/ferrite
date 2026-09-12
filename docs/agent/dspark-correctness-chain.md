@@ -259,3 +259,7 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 | spec_capture host 分支 | ✅ 一致 |
 
 **结论**：**默认配置下图化现在就能开**（m 恒 5、argmax/orope/a32 全合法、epoch 是图内计数器）——预期收益 = 裸链的 ~3000 launch×2.9µs submit 半 → 图内 0.4µs/node。**SEED_ALIGN/SWALLow 开启时需形状池**（性能项）。
+
+## expert down 路径的数值状态（代码级核实）
+
+`expert_down_fp4`（device.rs:2147）的激活参数 `act: *const f32`——**down 吃 f32（不量化）**。官方对 swiglu 输出也做 e4m3 量化（model.py:194-197 的 fp8 分支）——**down 方向 ferrite 反而更精确**（f32 > e4m3）。⇒ **激活量化分歧集中在 gate/up**（quant_fp4 的 e2m1），down 无需改。
