@@ -641,3 +641,18 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 - 目标：步时 ≤16ms → accept 3+ 时 187+ tok/s；accept 5 时 312+
 
 **AR v5 的 1.40ms 是协议地板**（TP8 3-kernel × 40 层 × 2 = 240 launch × 17.3μs）——不可再压。
+
+## W2 attention m-rows 的因果序根本约束（attn-clen-rows 的发现深化）
+
+**问题**：verify 块内行间有因果链——`read(r) → append(r) → read(r+1) → append(r+1) → ...`。行 r+1 的 read 依赖行 r 的 append。ring buffer 只有 `window` 个 slot，行 r+1 的 append 会覆盖行 r 的 read 窗口中最老的 slot。
+
+**何时安全**：`pos + m - 1 < window`（环未回绕）——此时 `window_idxs_kernel` 的 `idx > start_pos` 过滤把未写过的 slot 置 -1（此刻 slot == position），画像与逐行一致。**长上下文的常态是环已回绕**——过滤永不触发，行 0..m-2 读到块自己的"未来"。
+
+**为什么不能"先全部 read 再全部 append"**：行 1 的 read 需要行 0 的 append（因果依赖）。批化 read 会破坏这个依赖。
+
+**可能的解法**（按复杂度）：
+1. **scratch ring 快照**：每行 read 前把 ring 复制到 scratch（行 r 的视图 = scratch + 行 0..r-1 的 append 应用）——copy 成本 ~window×dim×2 bytes × m 行，可能得不偿失
+2. **append 延迟 + 窗口偏移**：块内所有行共享同一个"旧" ring（不含本块的 append），每行的窗口起点偏移 r——但这不等价（行 r 应该看到行 0..r-1 的 KV）
+3. **接受损失**：在某些场景（短上下文）安全，长上下文关闭 gate——动态选路
+
+**结论**：attention 的 m-rows 在当前 ring 架构下**根本上受限**。1.3ms 的收益需要架构改动（scratch ring 或 KV 布局重构），ROI 低于 tcgen05（-6.8ms）和 draft P3c（-3.3ms）。**优先做 tcgen05 和 P3c**。
