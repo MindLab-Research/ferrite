@@ -121,6 +121,30 @@ __device__ __forceinline__ uint32_t smem_addr(const void* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
+// 16-byte operand chunk out of GLOBAL memory, alignment-SAFE.
+//
+// Every tensor-core arm in this file addresses an operand row in uint4s, and a
+// `uint4` load REQUIRES a 16-byte-aligned address: anything else is err 716
+// ("misaligned address"), which does not even surface at the offending kernel -
+// it poisons the context and the NEXT synchronisation reports it, detached from
+// the cause (rank-local, e.g. "rank 6: sync: misaligned address"). The bases are
+// 16-byte aligned by contract (cudaMalloc, see DevRuntime::alloc, returns
+// 256-byte-aligned pointers, and every weight-plane stride is a multiple of 16),
+// but a gathered/scattered activation buffer or a future offset view can break
+// that silently, and a silent break here is a crash, not a wrong number.
+//
+// So every global uint4 operand load goes through this helper: the fast path is
+// the plain uint4, and a misaligned base degrades to a byte-wise copy. The bytes
+// are IDENTICAL either way, so the numeric domain of every arm using it is
+// untouched - it only removes the fault.
+__device__ __forceinline__ uint4 ld_uint4_a16(const uint8_t* __restrict__ p) {
+    if ((reinterpret_cast<uintptr_t>(p) & 15u) == 0)
+        return *reinterpret_cast<const uint4*>(p);
+    uint4 v;
+    __builtin_memcpy(&v, p, 16);
+    return v;
+}
+
 // e8m0 -> f32 (2^(b-127); 0xFF is NaN, mirroring quant.rs).
 [[maybe_unused]] __device__ __forceinline__ float ue8m0_to_f(uint8_t b) {
     return __uint_as_float(((uint32_t)b) << 23);
@@ -358,9 +382,8 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
                 const int row = m_base + m;
                 uint4 val = make_uint4(0, 0, 0, 0);
                 if (row < rows)
-                    val = *reinterpret_cast<const uint4*>(a + (size_t)row * (k >> 1) +
-                                                          (k0 >> 1) + atom * kAtomBytes +
-                                                          kb * 16);
+                    val = ld_uint4_a16(a + (size_t)row * (k >> 1) + (k0 >> 1) +
+                                       atom * kAtomBytes + kb * 16);
                 *reinterpret_cast<uint4*>(s_a + atom * kATileBytes +
                                           ((m & 7) + 8 * kb + 16 * (m >> 3)) * 16) = val;
             }
@@ -412,9 +435,8 @@ __global__ void __launch_bounds__(kThreads) mxf4_gemm_kernel(
                     row = n_glob - b_split;
                 }
                 if (row >= 0)
-                    val = *reinterpret_cast<const uint4*>(src_base + (size_t)row * (k >> 1) +
-                                                          (k0 >> 1) + atom * kAtomBytes +
-                                                          kb * 16);
+                    val = ld_uint4_a16(src_base + (size_t)row * (k >> 1) + (k0 >> 1) +
+                                       atom * kAtomBytes + kb * 16);
             }
             *reinterpret_cast<uint4*>(s_b + atom * kBTileBytes +
                                       ((n & 7) + 8 * kb + 16 * (n >> 3)) * 16) = val;
@@ -5471,7 +5493,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_kernel(
             const size_t kk = (size_t)k0 + (size_t)atom * kAtomK + sub * kSubK + kb * 16;
             uint4 val = make_uint4(0, 0, 0, 0);
             if (row < rows && kk + 16 <= (size_t)k)
-                val = *reinterpret_cast<const uint4*>(a + (size_t)row * k + kk);
+                val = ld_uint4_a16(a + (size_t)row * k + kk);
             *reinterpret_cast<uint4*>(s.a + (atom * kSubs + sub) * kASubBytes +
                                       e4x_off(m, kb)) = val;
         }
@@ -5498,8 +5520,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_kernel(
                     row = n_glob - b_split;
                 }
                 if (row >= 0) {
-                    const uint4 p = *reinterpret_cast<const uint4*>(src_base +
-                                                                    (size_t)row * kbytes + ko);
+                    const uint4 p = ld_uint4_a16(src_base + (size_t)row * kbytes + ko);
                     uint32_t ev[4], od[4];
                     e4x_expand(p.x, ev[0], od[0]);
                     e4x_expand(p.y, ev[1], od[1]);
@@ -5855,7 +5876,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_grouped_kernel(
             const size_t kk = (size_t)k0 + (size_t)atom * kAtomK + sub * kSubK + kb * 16;
             uint4 val = make_uint4(0, 0, 0, 0);
             if (m < m_valid && kk + 16 <= (size_t)k)
-                val = *reinterpret_cast<const uint4*>(a + (size_t)(row_base + m) * k + kk);
+                val = ld_uint4_a16(a + (size_t)(row_base + m) * k + kk);
             *reinterpret_cast<uint4*>(s.a + (atom * kSubs + sub) * kASubBytes +
                                       e4x_off(m, kb)) = val;
         }
@@ -5879,8 +5900,7 @@ __global__ void __launch_bounds__(kThreads) e4m3_gemm_grouped_kernel(
                     row = n_glob - b_split;
                 }
                 if (row >= 0) {
-                    const uint4 p = *reinterpret_cast<const uint4*>(src_base +
-                                                                    (size_t)row * kbytes + ko);
+                    const uint4 p = ld_uint4_a16(src_base + (size_t)row * kbytes + ko);
                     uint32_t ev[4], od[4];
                     e4x_expand(p.x, ev[0], od[0]);
                     e4x_expand(p.y, ev[1], od[1]);

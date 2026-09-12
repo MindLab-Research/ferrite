@@ -1059,6 +1059,19 @@ impl DevRuntime {
         check_cudart(unsafe { (self.cudart.dev_sync)() }, &self.cudart, "cudaDeviceSynchronize")
     }
 
+    /// A fresh device allocation.
+    ///
+    /// ALIGNMENT CONTRACT (relied on by every tcgen05 expert arm): those kernels
+    /// address their operand rows in `uint4`s, i.e. they need EVERY operand base
+    /// 16-byte aligned — a misaligned one is err 716 ("misaligned address"),
+    /// which poisons the context and only surfaces at the next synchronisation
+    /// (rank-local, e.g. "rank 6: sync: misaligned address"). `cudaMalloc`
+    /// returns 256-byte-aligned pointers, so this allocator satisfies that
+    /// contract for every buffer it hands out; the assert below pins the
+    /// guarantee instead of leaving it implicit in cudaMalloc's documentation.
+    /// ⚠️ A [`DevBuf::view`] into a bigger allocation does NOT inherit the
+    /// guarantee (the caller owns that offset) — that is the one way a 16-byte
+    /// base can be lost, and the kernels' `ld_uint4_a16` fallback covers it.
     pub fn alloc(&self, bytes: usize) -> Result<DevBuf> {
         let mut p: *mut c_void = std::ptr::null_mut();
         let st = unsafe { (self.cudart.malloc)(&mut p, bytes.max(1)) };
@@ -1075,6 +1088,12 @@ impl DevRuntime {
                 self.allocated.get() as f64 / (1u64 << 30) as f64
             )));
         }
+        debug_assert_eq!(
+            p as usize & 0xF,
+            0,
+            "cudaMalloc must return 16-byte aligned pointers: the tcgen05 expert \
+             operands are addressed in uint4s"
+        );
         self.allocated.set(self.allocated.get() + bytes);
         Ok(DevBuf { ptr: p, bytes, owned: true })
     }
