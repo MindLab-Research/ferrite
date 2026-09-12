@@ -1340,3 +1340,11 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 | P0-3+P1-5+SEED_POS+DRAFT_ATTN+TAP_BF16 | 0.898 | **退化**（-26%）|
 
 **结论**：P0-3（tap 采集点）+ P1-5（bf16 域）是 accept 的最优组合。SEED_POS（即使有 winrows 配套）、DRAFT_ATTN、TAP_BF16 的追加会降低 accept——**应保持 OFF**。
+
+## Batched 400 v2 测试的配置说明
+
+**脚本（batched_400_v2.sh）不含 P0-3+P1-5 accept 杠杆**（TAP_INPUT/DRAFT_BF16_DOMAIN 未在矩阵中）——这是纯性能测试。测试结果的意义：
+- 步时 ≤10ms = 400 路径的性能侧确认（配合 accept 杠杆可达更高吞吐）
+- accept 会是基线 ~1.022（不含 P0-3+P1-5 的提升）
+
+**最终 400 组合测试**（性能 + accept）需要加：DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1（最佳 accept 1.214）。
