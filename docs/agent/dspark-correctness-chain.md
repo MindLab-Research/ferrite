@@ -115,3 +115,18 @@
 **真根因（H1，签名精确吻合）**：`draft_forward` 的 `pos == 0` 早退——legacy 的首轮 `draft_forward(token, 0)` 命中早退（0 次 draft AR），而 aligned 的 `draft_forward(next, pos+1)` 恒 ≥1（**3 次 draft AR**）⇒ **`need−cur = 3` 恰好 = 3 个 mtp block 的 MoE AR**。v5 的协议契约：落后方静默通过（读错值）、领先方永久自旋——无 host rendezvous 能吸收次数差。
 **修法（F1，判词推荐）**：aligned 臂的首轮也走 legacy（`spec_primed` 的同款引导——route A 只在 primed 后接管），或把 draft 的 `pos==0` 早退的 AR 足迹对齐（假发 3 次）。
 **附带发现**：H4（pubred 的 `e` 每 block 各读一次、block 0 中途写 `*epoch`——晚启动的 block 读到 e+1、stamp e+2、等错半区）是全 arm 共有的设备级隐患（route A 的 6 行块把窗口加宽 20%）；H3（argmax_sliced 的尾部 rank decline——与 peer=5/6/7 吻合）待查。
+
+## 本轮修复汇总（2026-09-12 上午，全部已提交推送）
+
+| 修复 | 内容 | 状态 |
+|---|---|---|
+| quant_rows 源行距 | o_r 的 nh*hd（8x）与 wo_r 的 ol_total（8x）逐行打包 | ✅ 验证通过（出师表 140/3≈EAGER） |
+| note_ctx_rows tap_r 行距 | slot*m → slot*VERIFY_ROWS | ✅ 已提交 |
+| s.ids 回写（gate） | DSV41_SIDS_WRITEBACK（默认 OFF，量化修复验证通过后这轮全开跑了） | ✅ |
+| o-rope 融合对齐 | DSV41_VERIFY_OROPE 默认 ON——verify 走 EAGER 同一 sparse_attn_orope（mismatch 18→1 的 A/B 依据） | ✅ 已提交（bf3de09d 决定性验证跑中） |
+| SEED_ALIGN 死锁 | spec_primed 引导首轮走 legacy（AR 足迹 0/3 对齐） | ✅ 已提交 |
+| head 词表切分 | DSV41_VERIFY_HEAD_SLICED 默认 ON + 新 kernel dsv41_argmax_sliced_rows（1 个 v5 round 批 m 行）——6619→992MB | ✅ 已提交 |
+| a32 gate | gemm_fp8_mrows 在 a32=1 时 decline（FOLD 同类防线） | ✅ 已提交 |
+
+**待验证**（bf3de09d）：全部修复叠加后的正确性 + 性能（verify 应从 37.31ms 降 ~1.5ms+）。
+**待跑**：GEMV_A32=0 的 A/B（上轮被并发测试 kill）。
