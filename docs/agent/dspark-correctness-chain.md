@@ -1306,3 +1306,27 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 1. DSV41_SEED_POS=1 + winrows 配套（P0-1 完整修复——之前因基线问题无法评估）
 2. DSV41_DRAFT_ATTN_BF16=1（draft attention 截断——独立 gate）
 3. DSV41_TAP_BF16=1（draft 输入截断——独立 gate）
+
+## Session 最终状态（上下文耗尽前的最后记录）
+
+### 今日全部成就（2026-09-12 全天）
+1. **零拉丁字符** ✓ — DSV41_BF16_TRUNCATE=1，多次 GPU 验证
+2. **段错误修复** ✓ — ABI 5 + 干净重建（并发编辑的 ABI 不一致根因）
+3. **基线破坏修复** ✓ — HC_VERIFY_FUSE 默认 OFF（fused 路径把 BF16_TRUNCATE 带进 verify 的交互根因）+ 安全重启用（truncate=false）
+4. **全 P0 审计完成** ✓ — seed 相位（回退+gate）、tap 采集点（gated）、激活域（gated）、head/gate 截断（gated）、temperature（非阻塞）、wo_a 格式（证伪）
+5. **Accept 提升 +19%** ✓ — P0-3+P1-5 在修复后基线上：1.022 → 1.214
+6. **大量优化提交** — mrows staging、sh_pair、head v1、indexer front、norm rows、compressor multi-row、hc verify 接线、AR 折叠、tcgen05 masked kernel、grouped routing、draft P3c 图化、oracle 修复
+
+### 400 路径的现状
+- **accept**：1.214（从 1.022 +19%）——目标是 ~3（用户校准的上限）
+- **步时**：33-61ms（lazy）——需要 ≤10ms（batched + SWALLOW_STEP + 全 mrows + tcgen05）
+- **关键发现**：
+  - mrows 权重共享对 instruction-bound kernel 无效（SH_EXP 零收益）
+  - SWALLOW_STEP 是必要条件（没有它 264 tok/s 出局）
+  - 400 路径必须 batched（lazy 的 per-row m=1 无法受益 mrows）
+  - tcgen05 是 verify 优化的真路径（−6.8ms，但三件套 gate 需要正确测试）
+
+### 下一步（最重要的 3 件事）
+1. **batched 400 v2 测试**（SWALLOW_STEP + 全 mrows + tcgen05 + BF16_TRUNCATE）——步时目标 ≤10ms
+2. **追加 accept 杠杆**（SEED_POS + DRAFT_ATTN + TAP_BF16）——测试在跑（10ba0e73）
+3. **tcgen05 的正确 A/B**（三件套 gate 链 + ILV 冲突检查）
