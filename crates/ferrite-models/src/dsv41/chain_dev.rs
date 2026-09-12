@@ -12123,8 +12123,15 @@ impl<'a> DevChain<'a> {
                 // every row's shared contribution is already in `moe_out_r`, so
                 // the loop has nothing left to do — see `shared_expert_mrows`
                 // for the bit-identity argument and the fallback contract.
-                let sh_mrows_done =
-                    self.shared_expert_mrows(w1, w1s, w3, w3s, w2, w2s, m, sh_il, dim)?;
+                // VERIFY_FORK: skipped under the dual arm, which issues the
+                // per-row loop on the side stream itself (the mrows passes are
+                // main-stream launches the arm does not re-issue, which is why
+                // `sh_exp_mrows`/`sh_pair_m`/`sh_exp_fused` decline the arm).
+                let sh_mrows_done = if dual {
+                    false
+                } else {
+                    self.shared_expert_mrows(w1, w1s, w3, w3s, w2, w2s, m, sh_il, dim)?
+                };
                 for r in 0..m {
                     // The multi-row pass already added this layer's shared
                     // expert; running the loop would add it a second time.
@@ -12133,9 +12140,18 @@ impl<'a> DevChain<'a> {
                     }
                     // The T1/T2 fast paths are single-row gates around this very
                     // pair, so the rows path runs the (quant1, gemm) pair.
-                    self.quant1((self.s.xn_r.ptr as *const f32).wrapping_add(r * dim), dim as i32)?;
+                    // VERIFY_FORK: every launch of this half takes `sh_st` (the
+                    // second side stream under the dual arm, the main stream
+                    // otherwise). `quant1_on(.., main)` IS `quant1(..)` — the
+                    // plain entry forwards to the `_on` one — so the serial arm
+                    // stays byte-for-byte the old chain.
+                    self.quant1_on(
+                        (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
+                        dim as i32,
+                        sh_st,
+                    )?;
                     let sh_fused = sh_exp_mx2()
-                        && self.dev.gemm_fp8_mx2(
+                        && self.dev.gemm_fp8_mx2_on(
                             self.s.xq.as_u8(),
                             self.s.xsc.as_f32(),
                             w1.as_u8(),
@@ -12149,9 +12165,10 @@ impl<'a> DevChain<'a> {
                             (self.s.sh_act_r.ptr as *mut f32).wrapping_add(sh_il),
                             sh_il as i32,
                             dim as i32,
+                            sh_st,
                         )?;
                     if !sh_fused {
-                        self.dev.gemm_fp8_mx(
+                        self.dev.gemm_fp8_mx_on(
                             self.s.xq.as_u8(),
                             self.s.xsc.as_f32(),
                             w1.as_u8(),
@@ -12161,8 +12178,9 @@ impl<'a> DevChain<'a> {
                             1,
                             sh_il as i32,
                             dim as i32,
+                            sh_st,
                         )?;
-                        self.dev.gemm_fp8_mx(
+                        self.dev.gemm_fp8_mx_on(
                             self.s.xq.as_u8(),
                             self.s.xsc.as_f32(),
                             w3.as_u8(),
@@ -12172,15 +12190,37 @@ impl<'a> DevChain<'a> {
                             1,
                             sh_il as i32,
                             dim as i32,
+                            sh_st,
                         )?;
                     }
-                    self.dev.swiglu_limit(
+                    self.dev.swiglu_limit_on(
                         self.s.sh_act_r.ptr as *mut f32,
                         1,
                         sh_il as i32,
                         cfg.swiglu_limit,
+                        sh_st,
                     )?;
-                    self.quant1(self.s.sh_act_r.ptr as *const f32, sh_il as i32)?;
+                    self.quant1_on(self.s.sh_act_r.ptr as *const f32, sh_il as i32, sh_st)?;
+                    if dual {
+                        // VERIFY_FORK: the DISJOINT scratch, never `moe_out_r`
+                        // — the routed half's down-reduce is writing that buffer
+                        // on the main stream right now. Same single-row GEMV,
+                        // same operands: only the destination differs, and the
+                        // join below adds the block in one element-wise pass.
+                        self.dev.gemm_fp8_mx_on(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w2.as_u8(),
+                            w2s.as_u8(),
+                            std::ptr::null(),
+                            (self.s.sh_out_r.ptr as *mut f32).wrapping_add(r * dim),
+                            1,
+                            dim as i32,
+                            sh_il as i32,
+                            sh_st,
+                        )?;
+                        continue;
+                    }
                     // w2 folds straight into this row's accumulator (the A5
                     // epilogue); a decline falls back to a scratch + the standalone
                     // add, which is the same pair with the same association.
@@ -12218,6 +12258,23 @@ impl<'a> DevChain<'a> {
                     }
                 }
             }
+        }
+        // VERIFY_FORK join: the shared half is fully issued. Wait the side stream
+        // back on the main stream, then merge exactly as the serial path did —
+        // the routed down-reduce wrote `moe_out_r` on the main stream, so this add
+        // sees the same two operands in the same order. One element-wise launch
+        // over `m*dim` is bit-identical to the `m` per-row adds it replaces (the
+        // add is range-disjoint per row, which is the same argument
+        // `shared_expert_mrows`' own merge uses). A no-op when the fork did not
+        // take. `dual` implies `shared_rank && sh_w6 && !skip_shared_expert`, so
+        // the shared half always ran when this branch is reached.
+        if dual {
+            self.dev.dual_chain_join()?;
+            self.dev.add_inplace_raw(
+                self.s.moe_out_r.ptr as *mut std::ffi::c_void,
+                self.s.sh_out_r.ptr as *const c_void,
+                (m * dim) as i64,
+            )?;
         }
 
         // ---- the MoE all-reduce ----
