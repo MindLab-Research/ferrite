@@ -411,6 +411,75 @@ impl<'a> DsparkDev<'a> {
         )
     }
 
+    /// Append a COMMITTED verify block's target hiddens to the window rings:
+    /// rows `0..keep` of the block, written at the positions `pos_base + j`.
+    ///
+    /// This is the official `_update`'s `target_hidden_states[:, :accepted + 1]`
+    /// append, and it is what keeps the draft's context WHOLE across a
+    /// multi-token commit. The per-step path ([`Self::draft_forward`]) seeds
+    /// exactly ONE row — the position it consumes — so before this existed every
+    /// position a `k > 1` commit SKIPPED stayed a hole in the ring, and the
+    /// draft's attention read across it (accept degrading with the number of
+    /// multi-token steps).
+    ///
+    /// # Layout and row range (must stay in step with `dspark_commit`'s `keep`)
+    ///
+    /// `tap_r` is the chain's per-row tap, `[DSPARK_TAP_SLOTS][m][dim]` with slot
+    /// `slot` (`Dsv41Config::dspark_target_slot`, 0/1/2 = the target layers in
+    /// config order) and row `r` at `(slot * m + r) * dim`. Verify row `r` was
+    /// forwarded at position `pos + 1 + r`, so row `j`'s hidden is the one for
+    /// position `pos_base + j` with `pos_base = pos + 1`.
+    ///
+    /// `keep` is the accepted prefix length `k_acc` — the SAME value
+    /// `dspark_commit` keeps in the ring, so the two cannot disagree: rows
+    /// `0..keep` sit at `pos+1 ..= pos+keep`, which is exactly the ring prefix
+    /// the commit preserved. Row `keep` (position `pos+keep+1` = the new
+    /// `pos_ctr`) is deliberately NOT written: the verify fed it a REJECTED
+    /// draft token, so its hidden is not the true one — that position's KV comes
+    /// from the next step's `step_dev` and is seeded by the next
+    /// [`Self::draft_forward`], exactly as for a plain decode step. Rows past
+    /// `keep` are rejected and dropped.
+    ///
+    /// The rows are projected ONE at a time through the same
+    /// [`Self::project_main_x`] + [`Self::seed_window`] pair the per-step seed
+    /// uses, so a committed row and a per-step row are the same numbers.
+    pub fn note_ctx_rows(
+        &mut self,
+        tap_r: *const f32,
+        m: usize,
+        keep: usize,
+        pos_base: usize,
+    ) -> Result<()> {
+        if keep > m {
+            return Err(FerriteError::Config(format!(
+                "dspark: note_ctx_rows asked for {keep} ctx rows out of a {m}-row verify block"
+            )));
+        }
+        if keep == 0 {
+            return Ok(());
+        }
+        let dim = self.dim;
+        let n_target = self.n_target;
+        let row_bytes = dim * std::mem::size_of::<f32>();
+        for j in 0..keep {
+            // Row j's `forward_embed` input is the CONCATENATION of the target
+            // layers' hidden[j]; the tap interleaves the layers (`m` rows apart),
+            // so the `n_target * dim` block is rebuilt one `dim`-wide slice at a
+            // time into the same `main_h` the per-step path fills.
+            for slot in 0..n_target {
+                let src = (tap_r as *const u8).wrapping_add((slot * m + j) * row_bytes);
+                let dst = (self.main_h.ptr as *mut u8).wrapping_add(slot * row_bytes);
+                self.dev
+                    .memcpy_d2d(dst as *mut c_void, src as *const c_void, row_bytes)?;
+            }
+            self.project_main_x()?;
+            for s in 0..self.cfg.n_mtp_layers {
+                self.seed_window(s, pos_base + j)?;
+            }
+        }
+        Ok(())
+    }
+
     /// D2H of the drafted block: `draft_forward` samples into `ids[1..=bs]`
     /// (`ids[0]` is the backbone's token), and one speculative step consumes the
     /// first [`DSPARK_DRAFTS`] of those samples.
@@ -466,29 +535,16 @@ impl<'a> DsparkDev<'a> {
         )
     }
 
-    /// Run the whole draft: `t0` is the token the backbone just sampled, `pos`
-    /// is its position. Fills `ids[1..=bs]` (the drafted block) and
-    /// `confidence[0..bs]`; both stay on the device.
-    pub fn draft_forward(&mut self, t0: u32, pos: usize) -> Result<()> {
-        let (Some(_), Some(_)) = (self.cos, self.sin) else {
-            return Err(FerriteError::Config(
-                "dspark: set_rope_tables() must be called before draft_forward()".into(),
-            ));
-        };
+    /// `main_x = main_norm(main_proj(main_h))` — the `forward_embed` projection
+    /// that turns the recorded target hiddens into the row the window KV is
+    /// projected from.
+    ///
+    /// ONE path for both callers — [`Self::draft_forward`]'s per-step seed and
+    /// [`Self::note_ctx_rows`]'s committed rows — so the two kinds of window row
+    /// cannot drift apart numerically.
+    fn project_main_x(&mut self) -> Result<()> {
         let cfg = self.cfg;
         let dim = self.dim;
-        let bs = self.bs;
-        let hc = self.hc;
-
-        // ---- ids: the backbone's token first, the noise token for the rest ----
-        // (dspark.rs::forward_embed; the noise row IS embed[noise_token_id])
-        let noise = cfg.dspark_noise_token_id as i32;
-        let mut ids = vec![noise; bs + 1];
-        ids[0] = t0 as i32;
-        self.upload_i32(&self.ids, &ids)?;
-
-        // ---- forward_embed ----
-        // main_x = main_norm(main_proj(concat(target hiddens)))
         let k_main = self.n_target * self.dim;
         let main_proj = need(&self.w.main_proj, "mtp.0.main_proj.weight")?;
         let main_proj_scale = need(&self.w.main_proj_scale, "mtp.0.main_proj.scale")?;
@@ -513,6 +569,33 @@ impl<'a> DsparkDev<'a> {
             dim as i32,
             cfg.norm_eps,
         )?;
+        Ok(())
+    }
+
+    /// Run the whole draft: `t0` is the token the backbone just sampled, `pos`
+    /// is its position. Fills `ids[1..=bs]` (the drafted block) and
+    /// `confidence[0..bs]`; both stay on the device.
+    pub fn draft_forward(&mut self, t0: u32, pos: usize) -> Result<()> {
+        let (Some(_), Some(_)) = (self.cos, self.sin) else {
+            return Err(FerriteError::Config(
+                "dspark: set_rope_tables() must be called before draft_forward()".into(),
+            ));
+        };
+        let cfg = self.cfg;
+        let dim = self.dim;
+        let bs = self.bs;
+        let hc = self.hc;
+
+        // ---- ids: the backbone's token first, the noise token for the rest ----
+        // (dspark.rs::forward_embed; the noise row IS embed[noise_token_id])
+        let noise = cfg.dspark_noise_token_id as i32;
+        let mut ids = vec![noise; bs + 1];
+        ids[0] = t0 as i32;
+        self.upload_i32(&self.ids, &ids)?;
+
+        // ---- forward_embed ----
+        // main_x = main_norm(main_proj(concat(target hiddens)))
+        self.project_main_x()?;
 
         // h = hc_expand(embed[ids]) — the draft's residual stream starts as the
         // token embedding alone; the main stream enters through the window KV.

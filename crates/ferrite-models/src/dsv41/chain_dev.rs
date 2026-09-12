@@ -136,7 +136,9 @@ pub struct DsparkSpecReport {
     /// The verify phase (`step_rows`, one 6-row forward).
     pub verify_ms: f32,
     /// The commit phase: partial rollback + compressor replay + the position
-    /// counter's H2D (the price the shadow path never pays).
+    /// counter's H2D + the draft's ctx rows ([`DsparkDev::note_ctx_rows`], the
+    /// multi-token commit's window back-fill) — the price the shadow path never
+    /// pays.
     pub commit_ms: f32,
 }
 
@@ -256,6 +258,18 @@ struct Scratch {
     dspark_tap: DevBuf,
     /// `[hc]` of `1/hc` — the mean weights for the tap's collapse.
     dspark_pre_mean: DevBuf,
+    /// Per-ROW twin of `dspark_tap`, for the REAL-COMMIT path
+    /// ([`Self::dspark_spec_step`]): the verify forwards `m` rows in ONE pass and
+    /// the target hidden of EVERY accepted row has to reach the draft's window
+    /// ([`DsparkDev::note_ctx_rows`]) — the single-row tap only ever holds the
+    /// position the step consumed, so a `k > 1` commit would leave the positions
+    /// it skipped as holes in that window. Layout `[DSPARK_TAP_SLOTS][m][dim]`:
+    /// slot `slot` (`Dsv41Config::dspark_target_slot`), row `r` at
+    /// `(slot * m + r) * dim` — the same `[hc, dim]` mean, one `hc_collapse` per
+    /// row, captured by the `layer_rows` hook at the same point `layer()`'s hook
+    /// uses. Written only while `spec_capture` is set, so the shadow path (whose
+    /// verify is rolled back) pays nothing for it.
+    dspark_tap_r: DevBuf,
     pre_b: DevBuf,
     pre_c: DevBuf,
     // ---- engram (n-gram memory write-back into the hc residual stream) ----
@@ -1229,6 +1243,9 @@ impl<'a> DevChain<'a> {
             premix_const: dev.alloc(fb(hc).max(8))?,
             dspark_tap: dev.alloc(fb(DSPARK_TAP_SLOTS * dim).max(8))?,
             dspark_pre_mean: dev.alloc(fb(hc).max(8))?,
+            // the per-row twin the real commit's verify fills (see the field's
+            // comment): 6 rows x 3 layers x dim f32 = 368 KB at the prod shape
+            dspark_tap_r: dev.alloc(fb(DSPARK_TAP_SLOTS * VERIFY_ROWS * dim).max(8))?,
             eng_ids: dev.alloc(fb(eng_cols * n_eng_layers).max(8) * 2)?, // i64
             eng_rows: dev.alloc(fb(eng_cols * ehd).max(8))?,
             eng_kv: dev.alloc(fb((hc + 1) * dim))?,
@@ -3306,6 +3323,25 @@ impl<'a> DevChain<'a> {
         // ---- 6. the commit.
         let t = std::time::Instant::now();
         self.dspark_commit(pos_ctr, m, k_acc, &host_mirrors)?;
+        // ---- 6b. the draft's ctx rows: the SAME accepted prefix the commit just
+        // kept in the ring (`keep = k_acc`, positions pos+1 ..= pos+k_acc), now
+        // written into the draft's window from the verify block's per-row tap.
+        // Without it the window would only ever receive the single row the next
+        // `draft_forward` seeds, leaving one hole per position this multi-token
+        // step skipped — and the draft's attention would read across it, so the
+        // accept rate would decay with the number of `k > 1` steps.
+        //
+        // Row `k_acc` (the new `pos_ctr`) is deliberately excluded: the verify fed
+        // it a REJECTED draft, so its hidden is not the true one; that position's
+        // KV is appended by the next step's `step_dev` and seeded by the next
+        // `draft_forward`, exactly as for a plain decode step. The ring and the
+        // window therefore cover the same positions — see `dspark_commit`'s doc.
+        //
+        // Runs AFTER the commit: the two touch disjoint device state (the draft's
+        // window vs the chain's ring/compressor), so the order is only about the
+        // `keep` argument being the committed prefix length. Counted in
+        // `commit_ms` so its cost is visible instead of hidden in the step.
+        dspark.note_ctx_rows(self.s.dspark_tap_r.ptr as *const f32, m, k_acc, pos + 1)?;
         let commit_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // ---- 7. what this step emits: the anchor plus the verify's argmax for
@@ -3587,6 +3623,36 @@ impl<'a> DevChain<'a> {
         )?;
         self.dev
             .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
+
+        // ---- the per-row DSpark tap: `layer()`'s hook, once per row ----
+        // The real-commit path (`dspark_spec_step`) hands the ACCEPTED PREFIX of
+        // this block's target hiddens to the draft (`DsparkDev::note_ctx_rows`),
+        // and unlike the single-row step it needs every row, not just the one the
+        // step consumed. Same capture point as `layer()` (the layer's COMPLETED
+        // output, after this layer's whole forward — attention AND ffn — hence
+        // here, after the FFN's `hc_post` has landed back in `h_r`), same `1/hc`
+        // mean (`hc_collapse` IS the weighted sum over the hc copies), one call
+        // per row so the single-row and m-row taps cannot drift apart: the kernel
+        // addresses rows by `blockIdx.x`, so m single-row calls are exactly the
+        // m-block form.
+        //
+        // Gated on `spec_capture`: the shadow step's verify is rolled back whole,
+        // so its rows are never committed and 3m extra launches would buy nothing.
+        if self.spec_capture {
+            if let Some(slot) = cfg.dspark_target_slot(layer) {
+                for r in 0..m {
+                    self.dev.hc_collapse(
+                        (self.s.h_r.ptr as *const f32).wrapping_add(r * hc * dim),
+                        self.s.dspark_pre_mean.as_f32(),
+                        (self.s.dspark_tap_r.ptr as *mut f32)
+                            .wrapping_add((slot * VERIFY_ROWS + r) * dim),
+                        1,
+                        hc as i32,
+                        dim as i32,
+                    )?;
+                }
+            }
+        }
         Ok(2)
     }
 
