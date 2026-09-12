@@ -5533,8 +5533,18 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 // `bias` is ALWAYS null for this site (wo_a has none); it is a parameter only so
 // the epilogue's `acc + (bias ? bias[row] : 0.f)` is the very same expression --
 // including its `-0.0 + 0.f` corner -- the m=1 launcher writes.
+// `__launch_bounds__(256)` states the one block shape the launcher below can
+// build: `nwarps = (n >= 8) ? 8 : n`, so `block = nwarps * 32` is NEVER more
+// than 256. Without the pin the compiler has no reason to assume anything
+// smaller than the architectural maximum, which is a strictly harder register
+// budget than this kernel's real occupancy needs. (R1, 2026-09-12: the pin was
+// missing here while the `gemm_fp8_mrows_kernel` sibling -- same one-warp-per-
+// output-row structure, same 256-thread ceiling, line ~5209 -- already carried
+// it. The two staging routines are now identical too; see the cp.async block
+// below.)
 template <int M>
-__global__ void wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
+__global__ void __launch_bounds__(256)
+wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
                                          const float* __restrict__ a_scale,
                                          const uint8_t* __restrict__ w,
                                          const uint8_t* __restrict__ w_scale,
@@ -5566,8 +5576,53 @@ __global__ void wo_a_grouped_gemv_kernel(const uint8_t* __restrict__ a,
     uint8_t* row_s = s_w + (size_t)warp * (size_t)k;
     const uint8_t* __restrict__ wr = wg + (size_t)row * (size_t)k;
     const uint8_t* __restrict__ wsr = wsg + (size_t)(row >> 5) * (size_t)nb_k;
-    for (int i = lane; i < k; i += 32) row_s[i] = wr[i];
+    // cp.async 16B weight staging (R1, 2026-09-12 -- projection-family review).
+    //
+    // WHAT IT REPLACES. The row used to be staged by the byte-per-lane walk
+    //     for (i = lane; i < k; i += 32) row_s[i] = wr[i];
+    // i.e. 32 B moved per warp-issue, 128 iterations at k=4096 -- while the
+    // `gemm_fp8_mrows_kernel` sibling two hundred lines up stages the identical
+    // bytes in k/16/32 = 8 issues (32 lanes x 16 B = 512 B per issue). SIXTEEN
+    // times the instructions for the same transfer, and that is exactly the
+    // staging cost the weight-stationary structure was supposed to amortise
+    // (the mrows header records the same finding for its own fold). The
+    // mechanism here is the mrows staging, verbatim (`dsv41_cp_async16` issue,
+    // `dsv41_cp_commit`, barrier, `dsv41_cp_wait_all`), so both kernels stage a
+    // row by the same rule -- and the same rule the m=1 gemv prologue uses.
+    //
+    // NUMERICS -- staging does not touch a value. The staged slot is filled with
+    // the same bytes from the same global address as the scalar loop wrote (the
+    // loop it replaces was a pure copy: `row_s[i] = wr[i]`, no arithmetic), and
+    // the consume loop below reads only that slot. cp.async is a copy-engine
+    // detail; the K walk (`kb` ascending, `j = kb*32 + lane`), the `acc += av *
+    // (s_lut[row_s[j]] * sb)` chain and the `shfl_xor` tree are untouched, so
+    // every output bit is identical to the scalar-staged launch -- and to the
+    // m=1 decode of the same (group, row, r) the kernel header's C1-C6 pin.
+    //
+    // ALIGNMENT (cp.async.cg needs a 16B-aligned global+smem pair). The launcher
+    // below rejects `k & 31`, so `k` is a multiple of 32 and every row offset
+    // `row * k` is 16B-aligned in global memory (`wg = w + g*n*k` with `n & 31`
+    // also rejected, so the group base is aligned too); `row_s = s_w + warp * k`
+    // is likewise 16B-aligned off the dynamic-smem base, exactly as the mrows
+    // sibling's `row_s` relies on. The k=4096 shape (4 KB row) is a whole number
+    // of 16 B lines with no remainder.
+    {
+        const int n16 = k >> 4;
+        for (int i = lane; i < n16; i += 32) dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+        // k % 16 tail: unreachable for every launcher (all reject `k & 31`),
+        // kept so the row is staged by exactly the rule the m=1 prologue uses.
+        for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+        dsv41_cp_commit();
+    }
+    // Every warp is active here (the launcher guarantees `n % nwarps == 0`, so
+    // `row < n` always), so the barrier is reached by the whole block and the
+    // transfer can overlap the wait of whichever warps arrive first. Only after
+    // the wait is the staged row readable -- `__syncthreads()` alone does NOT
+    // retire a cp.async group -- and `__syncwarp()` orders the copy against the
+    // cross-lane reads of `row_s[j]` in the kb loop below.
     __syncthreads();
+    dsv41_cp_wait_all();
+    __syncwarp();
     for (int r = 0; r < M; ++r) {
         // Row r's activation: the group's k-element segment `a_stride` bytes
         // after the previous row's, with its own f32 scale row.
@@ -9106,6 +9161,232 @@ extern "C" int dsv41_hc_collapse_norm(float* x, const float* pre, const float* w
     if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     dsv41_hc_collapse_norm_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, pre, w, out, hc, dim, eps,
                                                                   truncate);
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
+// L4-9 (W-L4a): the dim-split (K-split) forms of the two `grid = rows` norm
+// entries — `dsv41_hc_collapse_norm` above and `dsv41_rmsnorm_rows` further up.
+//
+// THE PROBLEM. Both launch `grid = rows` blocks of 1024 threads. At m = 1 (the
+// lazy decode step) that is ONE block on ONE SM out of ~148: the row's
+// 5120-element walk (and, for the collapse, its `hc * dim` = 160 KB of reads)
+// runs on one SM's slice of L1/L2 while the rest of the device idles. Both are
+// `×k_emit` — they fire once per layer per step — so this is a permanent
+// per-step tax, and m = 1 is its worst case (there is no row left to fold).
+//
+// THE SHAPE. Cut the `dim` axis into `nchunks` CONTIGUOUS segments and give
+// every (row, chunk) pair its own block — `grid = (nchunks, rows)` — so the
+// m = 1 call spreads over `nchunks` SMs. The row reduction then needs two
+// stages, because the mean is a whole-row quantity:
+//
+//   phase 1  every (row, chunk) block does its OWN segment's work (the
+//            collapse / the sum of squares), publishes its block partial into
+//            `g_nsplit_*_ss[row][chunk]` and arrives on `g_nsplit_*_ticket[row]`.
+//   phase 2  the block whose `atomicAdd` returns `nchunks - 1` — the LAST
+//            arrival of that row, which is what proves every other phase-1 block
+//            has already published AND left — reduces the `nchunks` partials in
+//            ascending chunk order, turns the total into `inv`, and applies the
+//            affine tail (`o * inv * w`, resp. `x * inv * w`) to the whole row.
+//
+// ELECTED LAST BLOCK, NOT A SPIN. No block ever waits on another: the winner is
+// decided by arrival order and the losers simply exit. That is the same
+// mechanism `hc_dots_late_kernel`'s ksplit uses (the
+// `__threadfence()` -> `atomicAdd` -> `__threadfence()` chain, see the comment
+// block above that kernel) and it is exactly what keeps a grid larger than the
+// device from deadlocking — which a `while (ticket != ...)` spin would not.
+//
+// NUMERICS — equivalent, NOT bit-identical (hence the default-OFF gates).
+//   * The collapsed row is bit-identical: `acc = fmaf(pre[i], x[i*dim+c], acc)`
+//     with `i` ascending is per-`c` and completely independent of how the `c`
+//     axis is cut, so every `o_r[c]` phase 1 writes is the single-block kernel's
+//     value to the last bit. `DSV41_BF16_TRUNCATE`'s bf16 round trip is applied
+//     at the same point (before the `ss` accumulate) with the same intrinsics.
+//   * What moves is the ASSOCIATION of the f32 sum of squares. The single-block
+//     kernels sum per-thread partials over a stride-1024 walk, fold them through
+//     one `shfl_down` tree and one ascending cross-warp fold (blockDim/32
+//     slots); the split folds each chunk through the SAME tree — the helper
+//     below is that tree verbatim — and then adds the `nchunks` block partials
+//     in ascending chunk order. Same terms, two different fp32 parenthesations:
+//     the mean (and hence `inv`) can differ in the last-ulp class only. Nothing
+//     in the pipeline is amax-quantised here, so there is no scale to flip; the
+//     resulting row moves by ~1 ulp at most.
+//   * Determinism: phase 2's fold order is FIXED (chunk ascending), so the same
+//     launch geometry always produces the same bits — the property the ksplit
+//     reducer also buys with its fixed `kp` order.
+// The gates (`DSV41_CNORM_SPLIT` / `DSV41_NORM_SPLIT`, both default OFF, Rust
+// side) mean the OFF arm issues the original launch unchanged, i.e. OFF is
+// bit-for-bit today's path.
+//
+// PRECONDITION (the reason these are device globals rather than scratch): the
+// `[row]` slots are shared by every launch of the entry, so two IN-FLIGHT split
+// launches that touch the same row index would cross-talk. Both call paths are
+// main-stream-only (there is no `_on` twin of `dsv41_hc_collapse_norm`, and the
+// `rmsnorm_rows_on` side-stream entry is deliberately NOT routed here), and a
+// Device owns one main stream — so the Rust dispatcher issues at most one split
+// launch at a time per Device. Same discipline (and the same exposure) as the
+// pre-existing `g_hc_part` / `g_hc_ticket` pair.
+// ===========================================================================
+#define DSV41_NORM_SPLIT_MAXR 256   // rows cap; a larger `rows` declines
+#define DSV41_NORM_SPLIT_MAXC 16    // dim-chunk cap; a larger `nchunks` declines
+#define DSV41_NORM_SPLIT_BLOCK 1024 // the blockDim BOTH originals launch with
+
+// The sentinel is DELIBERATELY outside the cudaError_t range: the legacy
+// `return 1` decline (rmsnorm_q's, documented above) collides with
+// cudaErrorInvalidValue, and the caller cannot tell a decline from a real
+// failure. A new ABI can afford a distinct code, so 0x7FFF it is — the Rust
+// dispatcher (`DSV41_NORM_SPLIT_DECLINE`) treats ONLY this as "keep the old
+// kernel" and every other non-zero as an error.
+#define DSV41_NORM_SPLIT_DECLINE 0x7FFF
+
+__device__ float g_nsplit_cn_ss[DSV41_NORM_SPLIT_MAXR][DSV41_NORM_SPLIT_MAXC];
+__device__ float g_nsplit_rn_ss[DSV41_NORM_SPLIT_MAXR][DSV41_NORM_SPLIT_MAXC];
+__device__ unsigned g_nsplit_cn_ticket[DSV41_NORM_SPLIT_MAXR];
+__device__ unsigned g_nsplit_rn_ticket[DSV41_NORM_SPLIT_MAXR];
+
+// One block's sum of squares through the tree the single-block kernels use:
+// `shfl_down` 16..1 within each warp, then thread 0 folds the blockDim/32 warp
+// partials in ascending warp order. The trailing `__syncthreads()` is also the
+// ordering point phase 1 relies on (see the arrival below), so it is not
+// optional. Template-shaped on the block size so the tree is the blockDim-sized
+// one `rmsnorm_kernel` / `dsv41_hc_collapse_norm_kernel` build at 1024.
+template <int BLOCK>
+__device__ __forceinline__ float nsplit_ss_fold(float ss, float* red) {
+    for (int off = 16; off > 0; off >>= 1) ss += __shfl_down_sync(0xffffffffu, ss, off);
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (BLOCK >> 5); i++) t += red[i];
+        red[0] = t;
+    }
+    __syncthreads();
+    return red[0];
+}
+
+// `dsv41_hc_collapse_norm_kernel` cut along `dim`, one block per (row, chunk).
+__global__ void dsv41_hc_collapse_norm_split_kernel(const float* __restrict__ x,
+                                                    const float* __restrict__ pre,
+                                                    const float* __restrict__ w,
+                                                    float* __restrict__ out, int hc, int dim,
+                                                    float eps, int truncate, int nchunks) {
+    const int row = blockIdx.y;
+    const int ck = blockIdx.x;
+    // Contiguous segments, sized so the chunks differ by at most one element
+    // (`dim * (ck+1) / nchunks` floor) — the same partition rule the launcher's
+    // `dim >= nchunks` guard makes non-empty.
+    const int lo = (int)(((long long)dim * ck) / nchunks);
+    const int hi = (int)(((long long)dim * (ck + 1)) / nchunks);
+
+    const float* pre_r = pre + (size_t)row * hc;
+    const float* x_r = x + (size_t)row * hc * dim;
+    float* o_r = out + (size_t)row * dim;
+
+    // phase 1: this segment's collapse + its share of the sum of squares. The
+    // per-`c` fmaf chain over `i` (ascending) is the single-block kernel's
+    // statement for statement, so `o_r[c]` is bit-identical to its value.
+    float ss = 0.f;
+    for (int c = lo + threadIdx.x; c < hi; c += blockDim.x) {
+        float acc = 0.f;
+        for (int i = 0; i < hc; ++i) acc = fmaf(pre_r[i], x_r[(size_t)i * dim + c], acc);
+        if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
+        o_r[c] = acc;
+        ss += acc * acc;
+    }
+
+    __shared__ float red[32];
+    const float part = nsplit_ss_fold<DSV41_NORM_SPLIT_BLOCK>(ss, red);
+
+    // One arrival per block. Order is: this block's `o_r` stores -> the fold's
+    // closing `__syncthreads()` -> t0's `__threadfence()` (device-scope release)
+    // -> the atomicAdd. The last arrival therefore observes every earlier
+    // block's published partial (its own `__threadfence()` after the atomic is
+    // the acquire), and every earlier block has already EXITED phase 1.
+    if (threadIdx.x == 0) {
+        g_nsplit_cn_ss[row][ck] = part;
+        __threadfence();
+        const unsigned arrived = atomicAdd(&g_nsplit_cn_ticket[row], 1u);
+        if (arrived == (unsigned)(nchunks - 1)) {
+            __threadfence();   // acquire: the other chunks' partials
+            float tot = 0.f;
+            for (int q = 0; q < nchunks; ++q) tot += g_nsplit_cn_ss[row][q];   // fixed order
+            const float inv = rsqrtf(tot / (float)dim + eps);
+            // Phase 2 for the WHOLE row: the collapsed row is only complete now,
+            // and `inv` is a row scalar. The reads of the chunks this block did
+            // not write are ordered by the fence chain above.
+            for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * inv * w[c];
+            // Self-reset so the next launch / graph replay starts at zero. Safe:
+            // all `nchunks` arrivals of this row already happened (the ticket
+            // proved it) and no other block touches the slot before the grid ends.
+            g_nsplit_cn_ticket[row] = 0u;
+        }
+    }
+}
+
+extern "C" int dsv41_hc_collapse_norm_split(float* x, const float* pre, const float* w, float* out,
+                                            int rows, int hc, int dim, float eps, int truncate,
+                                            int nchunks, cudaStream_t s) {
+    if (x == nullptr || pre == nullptr || w == nullptr || out == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || hc <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    // `nchunks < 2` is the original geometry plus the arrival cost, i.e. strictly
+    // worse than what it replaces -> decline so the caller keeps the old launch.
+    if (nchunks < 2 || nchunks > DSV41_NORM_SPLIT_MAXC) return DSV41_NORM_SPLIT_DECLINE;
+    if (rows > DSV41_NORM_SPLIT_MAXR) return DSV41_NORM_SPLIT_DECLINE;
+    if (dim < nchunks) return DSV41_NORM_SPLIT_DECLINE;   // every chunk non-empty
+    dim3 grid((unsigned)nchunks, (unsigned)rows);
+    dsv41_hc_collapse_norm_split_kernel<<<grid, DSV41_NORM_SPLIT_BLOCK, 0, s>>>(
+        x, pre, w, out, hc, dim, eps, truncate, nchunks);
+    return (int)cudaGetLastError();
+}
+
+// `dsv41_rmsnorm_rows_kernel` cut along `dim`, one block per (row, chunk). Same
+// two-stage shape; `out` may alias `x` (the q / kv norms normalise in place) —
+// the winner reads `x_r[c]` before it writes `o_r[c]` for the same `c`, and the
+// chunks it reads but did not write are untouched by phase 1.
+__global__ void dsv41_rmsnorm_rows_split_kernel(const float* __restrict__ x,
+                                                const float* __restrict__ w,
+                                                float* __restrict__ out, int dim, float eps,
+                                                int nchunks) {
+    const int row = blockIdx.y;
+    const int ck = blockIdx.x;
+    const int lo = (int)(((long long)dim * ck) / nchunks);
+    const int hi = (int)(((long long)dim * (ck + 1)) / nchunks);
+
+    const float* x_r = x + (size_t)row * dim;
+    float* o_r = out + (size_t)row * dim;
+
+    float ss = 0.f;
+    for (int c = lo + threadIdx.x; c < hi; c += blockDim.x) ss += x_r[c] * x_r[c];
+
+    __shared__ float red[32];
+    const float part = nsplit_ss_fold<DSV41_NORM_SPLIT_BLOCK>(ss, red);
+
+    if (threadIdx.x == 0) {
+        g_nsplit_rn_ss[row][ck] = part;
+        __threadfence();
+        const unsigned arrived = atomicAdd(&g_nsplit_rn_ticket[row], 1u);
+        if (arrived == (unsigned)(nchunks - 1)) {
+            __threadfence();
+            float tot = 0.f;
+            for (int q = 0; q < nchunks; ++q) tot += g_nsplit_rn_ss[row][q];
+            const float inv = rsqrtf(tot / (float)dim + eps);
+            for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = x_r[c] * inv * w[c];
+            g_nsplit_rn_ticket[row] = 0u;
+        }
+    }
+}
+
+extern "C" int dsv41_rmsnorm_rows_split(const float* x, const float* w, float* out, int rows,
+                                        int dim, float eps, int nchunks, cudaStream_t s) {
+    if (x == nullptr || w == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    if (nchunks < 2 || nchunks > DSV41_NORM_SPLIT_MAXC) return DSV41_NORM_SPLIT_DECLINE;
+    if (rows > DSV41_NORM_SPLIT_MAXR) return DSV41_NORM_SPLIT_DECLINE;
+    if (dim < nchunks) return DSV41_NORM_SPLIT_DECLINE;
+    dim3 grid((unsigned)nchunks, (unsigned)rows);
+    dsv41_rmsnorm_rows_split_kernel<<<grid, DSV41_NORM_SPLIT_BLOCK, 0, s>>>(x, w, out, dim, eps,
+                                                                            nchunks);
     return (int)cudaGetLastError();
 }
 
