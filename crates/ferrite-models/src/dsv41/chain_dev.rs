@@ -4316,9 +4316,14 @@ impl<'a> DevChain<'a> {
         keep: usize,
         host: &[(usize, usize)],
     ) -> Result<()> {
+        // keep == m is a LEGAL full-accept (all 5 drafts right): rollback_keep
+        // then restores nothing (every slot it would touch is the committed
+        // prefix's), compress_replay replays all 5 rows, and the counter lands
+        // at pos+6. The old `keep < m` assert would have panicked the debug
+        // build on the best possible step.
         debug_assert!(
-            keep < m,
-            "dspark_commit: keep {keep} of {m} rows leaves nothing to roll back"
+            keep <= m,
+            "dspark_commit: keep {keep} exceeds the {m}-row block"
         );
         self.dspark_rollback_keep(pos, m, keep, host)?;
         if keep > 0 {
