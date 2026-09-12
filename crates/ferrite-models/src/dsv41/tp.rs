@@ -687,7 +687,7 @@ pub static AR_BAR_CALLS: AtomicU64 = AtomicU64::new(0);
 /// AR v5 (the graph-capturable all-reduce) switch, read ONCE: this is on the
 /// per-call hot path, and a per-call getenv is a hot-path slip.
 static AR_V5: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-fn ar_v5() -> bool {
+pub(crate) fn ar_v5() -> bool {
     *AR_V5.get_or_init(|| {
         // The whole-step CUDA graph REQUIRES the device-side AR: a host barrier is
         // not a CUDA call, so it would not be recorded and the replayed graph

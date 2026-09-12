@@ -83,7 +83,7 @@ kernels/cuda/              两套 .cu（各自 host wrapper 同目录）
 | 缺什么 | 状态 |
 |---|---|
 | 字节级、**不池化**的设备分配 + 原始 H2D/D2H/D2D/2D/peer 拷贝 + memset | **已补** → `devrt::DevRuntime` ✓ |
-| 显式 CUDA-graph 捕获/实例化/回放的**原语**（返回裸句柄、可指定捕获模式）| **已补** → `devrt` ✓（默认 **Relaxed(2)**，见 Phase 3 差异）|
+| 显式 CUDA-graph 捕获/实例化/回放的**原语**（返回裸句柄）| **已补** → `devrt` ✓ ⚠️ **模式不可选**：`capture_begin(&self)` 无 mode 参数，硬编码 **Relaxed(2)**（`devrt.rs:1380-1387`；其 doc comment 提到的 `mode` 并未出现在签名里），见 Phase 3 差异 |
 | 通用 kernel 符号解析（在已加载 `.so` 上 `dlsym` 任意名字）| **已补** → `kernel_sym` / `kernel_sym_opt` ✓ |
 | 通用 cuBLAS f32/bf16 GEMM（裸指针，不涉及 Tensor）| **已补** → `gemm_f32` / `gemm_bf16` ✓ |
 | AR v5 的**多形态参数化**（staging 表形态、slot/stride、epoch 位置、`out` 直写）| **已解 ✓**（Phase 2：四个 gap **全在 DSV41 侧**收敛 ⇒ 共享 entry **零参数化**、`ferrite_kernels.cu` **零改动**）|

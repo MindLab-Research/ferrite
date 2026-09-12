@@ -1193,6 +1193,16 @@ impl DevRuntime {
         self.zero_at(b.ptr, b.bytes)
     }
 
+    /// True when the async zero entry point is available, i.e. [`Self::zero_at`]
+    /// and [`Self::zero_at_on`] will NOT fall back to the SYNCHRONOUS
+    /// `cudaMemset` on the legacy stream. A capture that contains such a
+    /// fallback is invalid (the legacy-stream dependency is exactly the
+    /// `cudaErrorStreamCaptureUnjoined` class of failure), so the graph gates
+    /// (see `DevChain::step_impl` / `verify_graph`) require this to be true.
+    pub fn has_async_memset(&self) -> bool {
+        self.cudart.memset_async.is_some()
+    }
+
     /// [`Self::zero_at`] issued on `s` instead of the main stream. Only the
     /// compressor's `ratio == 1` no-gate path uses it (the scp projection is
     /// zeroed on the compressor's side stream, `DSV41_COMPRESS_SIDE`).

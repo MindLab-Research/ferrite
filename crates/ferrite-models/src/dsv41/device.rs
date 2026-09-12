@@ -1271,6 +1271,13 @@ impl Device {
             && self.kernels.dspark_comp_restore.is_some()
     }
 
+    /// True when `zero_at`/`zero_at_on` will NOT fall back to the synchronous
+    /// `cudaMemset` on the legacy stream. The verify graph's `compress_rows`
+    /// zeroes `scp_r` on the `ratio == 1` no-gate path, so a capture needs this.
+    pub fn supports_memset_async(&self) -> bool {
+        self.rt.has_async_memset()
+    }
+
     /// True when the loaded .so carries the load-time gate/up interleave entry
     /// point (`dsv41_interleave_gateup_fp4`, ABI 2). Without it DSV41_EXPERT_ILV
     /// stays inert and the pools keep the plain w1/w3 layout.

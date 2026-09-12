@@ -904,6 +904,23 @@ fn ring_owner_shared() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_OWNER").map(|v| v != "0").unwrap_or(false))
 }
 
+/// DSV41_VERIFY_GRAPH=1 captures the DSpark verify block (`step_rows`) into its
+/// OWN CUDA graph, alongside the whole-step `step_graph`.
+///
+/// DEFAULT OFF (A/B): the whole-step graph had to be flipped on only after a
+/// measurement campaign, and this one is bigger (≈7000 nodes/verify), so the
+/// opt-in is deliberate — `DSV41_VERIFY_GRAPH=1` vs unset is the A/B pair and
+/// the acceptance criterion is `verify_ms` (see the perf plan §3.3/§4).
+///
+/// Only the env switch lives here; the per-chain conditions that must ALSO hold
+/// (no `DSV41_ENG_HOST`, the P0 snapshot kernels, the device-side AR, an async
+/// memset, no probe modes) are checked in [`DevChain::verify_graph_gate`],
+/// because two of them are properties of the loaded `.so`.
+fn verify_graph_want() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_VERIFY_GRAPH").map(|v| v != "0").unwrap_or(false))
+}
+
 /// DSV41_AR_STORE_FUSE=1 re-enables the wo_b all-reduce store epilogue.
 fn ar_store_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1126,6 +1143,32 @@ pub struct DevChain<'a> {
     /// layer walk. Armed only around the spec step's `step_rows` call, so the
     /// shadow path pays nothing.
     spec_capture: bool,
+    // ---- the DSpark verify's own CUDA graph (`DSV41_VERIFY_GRAPH=1`) ----
+    //
+    // `step_rows` is ~7000 launches per verify (40 layers x ~170 nodes), and
+    // each streaming launch costs its ~2.9us of submit time on top of the
+    // graph's ~0.4us/node dispatch floor. The whole block is ONE graph: the
+    // per-step inputs it reads (the token ids, the row positions) are refreshed
+    // on the DEVICE buffers OUTSIDE the capture, so no launch argument changes
+    // from verify to verify and the replay is exact.
+    //
+    // A SEPARATE exec from `step_graph` on purpose: the two are captured at
+    // different times (the step graph on the first decode step, this one on the
+    // second verify) and cover different kernel sets. The precedent for two
+    // coexisting execs is `moe_graph` above.
+    verify_graph: Option<*mut std::ffi::c_void>,
+    /// The row count the stored graph was captured at. The capture bakes the
+    /// launch geometry, so a verify block of a DIFFERENT length must not replay
+    /// it (`DSPARK_DRAFTS` = 5 for the shadow step, 6 for the spec step, and the
+    /// parity self-test varies it) — those calls fall back to the direct path.
+    verify_graph_m: usize,
+    /// False until the first `step_rows` call has executed for real: that call
+    /// is the DRY run (it warms every kernel, builds the lazy engram state and
+    /// sizes the cuBLAS workspaces), and only the SECOND one captures.
+    verify_dry_done: bool,
+    /// Diagnostics: captures and replays since the last `reset`.
+    verify_captures: u32,
+    verify_replays: u32,
 }
 
 fn fb(n: usize) -> usize {
@@ -1445,6 +1488,11 @@ impl<'a> DevChain<'a> {
             eng_map,
             moe_add_in: vec![None; cfg.n_layers],
             spec_capture: false,
+            verify_graph: None,
+            verify_graph_m: 0,
+            verify_dry_done: false,
+            verify_captures: 0,
+            verify_replays: 0,
         })
     }
 
@@ -1528,6 +1576,20 @@ impl<'a> DevChain<'a> {
             let mean_w = vec![1.0 / self.cfg.hc_mult as f32; self.cfg.hc_mult];
             self.dev.upload_f32_at(self.s.dspark_pre_mean.ptr, 0, &mean_w)?;
         }
+        // The verify block's incoming premix: row r's is the CONSTANT one-hot
+        // [1,0,0,0] (the m-row twin of the `premix_const` copy `step_body` makes
+        // before its loop), and it does not depend on the row count or the step.
+        // Written ONCE per request here — `step_rows` used to re-upload it every
+        // verify, which was both a per-verify blocking H2D and the third illegal
+        // op inside a capture.
+        {
+            let hc = self.cfg.hc_mult;
+            let mut pm = vec![0f32; VERIFY_ROWS * hc];
+            for r in 0..VERIFY_ROWS {
+                pm[r * hc] = 1.0;
+            }
+            self.dev.upload_f32_at(self.s.premix_r.ptr, 0, &pm)?;
+        }
         self.dev.zero_at(self.s.pos_ctr.ptr, 4)?;
         self.dev.zero_at(self.s.clen.ptr, self.cfg.n_layers * 4)?;
         // The capture must be re-armed PER REQUEST, and the captured graph must be
@@ -1551,6 +1613,20 @@ impl<'a> DevChain<'a> {
             // graph_free destroys the exec when the second argument is non-null.
             self.dev.graph_free(std::ptr::null_mut(), e)?;
         }
+        // Same two reasons as `step_graph` above, and one more for the verify
+        // graph specifically: its `pos_base`-derived launch arguments (the
+        // compressor's mode/grid) and `spec_capture`'s host branch were frozen at
+        // capture time, and a verify at a position past `window` takes a
+        // different `pos_rows` residue. A stale exec would therefore replay
+        // against addresses that may now belong to something else at positions it
+        // was not recorded for. Drop it; the next request re-DRYs and re-captures.
+        if let Some(e) = self.verify_graph.take() {
+            self.dev.graph_free(std::ptr::null_mut(), e)?;
+        }
+        self.verify_graph_m = 0;
+        self.verify_dry_done = false;
+        self.verify_captures = 0;
+        self.verify_replays = 0;
         self.decode_steps = 0;
         if let Some(e) = self.eng_dev.as_ref() {
             self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?;
@@ -2668,10 +2744,36 @@ impl<'a> DevChain<'a> {
     ///
     /// See the section comment above for the numerical-domain rule, the position
     /// discipline and the known modelling gaps.
+    ///
+    /// # The CUDA graph (`DSV41_VERIFY_GRAPH=1`)
+    ///
+    /// ```text
+    ///   [outside]  D2H pos_ctr, H2D ids_r, H2D pos_rows, H2D premix_r (reset)
+    ///   [INSIDE ]  embed -> engram -> 40 x layer -> head -> per-row argmax
+    ///              (writes argmax_r; no host round trip anywhere in between)
+    ///   [outside]  D2H argmax_r, then the caller's snapshot/rollback/commit
+    /// ```
+    ///
+    /// Everything the recorded region reads is a `Scratch` buffer whose ADDRESS and
+    /// CONTENT are stable per verify: the ids and the row positions are refreshed
+    /// OUTSIDE the capture (a blocking copy is legal there — the requirement is
+    /// only that it is not inside the recording), the premix is a constant written
+    /// by `reset`, and the position counter / layer latent counters / AR epoch are
+    /// device-resident, so no launch argument changes from verify to verify.
+    ///
+    /// Order of first use (the DRY -> CAPTURE discipline `step_impl` uses, with one
+    /// extra pass): the FIRST `step_rows` of a request runs direct — it warms every
+    /// kernel, builds the lazy engram device state and sizes cublas' workspaces, all
+    /// of which are illegal inside a capture; the SECOND captures (recording does
+    /// not execute, so the graph is launched immediately after instantiation to do
+    /// this verify's real work); every later one replays. The graph is dropped by
+    /// [`Self::reset`].
+    ///
+    /// The verify's snapshot/rollback/commit are OUTSIDE the graph on purpose (they
+    /// are the caller's orchestration, and their host slot arithmetic has no device
+    /// twin): the snapshot is taken before the replay and the rollback/commit after
+    /// the D2H, so nothing about the accept logic changes.
     pub fn step_rows(&mut self, toks: &[u32]) -> Result<Vec<u32>> {
-        let cfg = self.cfg;
-        let dim = cfg.dim;
-        let hc = cfg.hc_mult;
         let m = toks.len();
         if m == 0 {
             return Ok(Vec::new());
@@ -2684,22 +2786,205 @@ impl<'a> DevChain<'a> {
         // The row positions. One D2H: the counter is device-resident (the argmax
         // advances it), and EVERY row's position has to be materialised somewhere
         // because the kernels that take a position take a POINTER. This runs
-        // between steps, so the read cannot stall anything that matters; the value
-        // itself never crosses back to the device afterwards (pos_rows is an H2D of
-        // m ints and is then read on-device).
+        // between steps, so the read cannot stall anything that matters; the values
+        // are then written to `pos_rows`, which the graph only ever READS.
         let pos_base = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as i32;
         let pos_rows: Vec<i32> = (0..m).map(|r| pos_base + r as i32).collect();
 
+        // The graph's per-verify inputs, refreshed before every replay: both land
+        // in the SAME device buffers the capture recorded (`Scratch` members live
+        // as long as the chain does), so the recorded addresses stay valid.
         let ids: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
         self.ul_i32(self.s.ids_r.ptr, &ids)?;
         self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
-        // every row's incoming premix is the one-hot [1,0,0,0] (the m-row twin of
-        // the `premix_const` copy `step_body` does before its loop)
-        let mut pm = vec![0f32; m * hc];
-        for r in 0..m {
-            pm[r * hc] = 1.0;
+
+        if self.verify_graph_gate(m, pos_base) {
+            if !self.verify_dry_done {
+                // DRY: a REAL execution, so every lazy first-use cost happens
+                // outside the capture. Its device effects are the caller's to
+                // keep or roll back, exactly like any other verify.
+                self.step_rows_inner(toks, m, pos_base)?;
+                self.verify_dry_done = true;
+                self.verify_graph_m = m;
+            } else if let Some(e) = self.verify_graph {
+                // Rendezvous before the replay: a capture only RECORDS the AR
+                // kernels while a peer may already be EXECUTING its own — the same
+                // pair `step_impl` keeps around its capture.
+                if let Some(c) = self.comm.as_ref() {
+                    c.host_barrier();
+                }
+                self.dev.graph_launch(e)?;
+                self.verify_replays += 1;
+                self.advance_compress_lens(pos_base, m);
+            } else {
+                if let Some(c) = self.comm.as_ref() {
+                    c.host_barrier();
+                }
+                // The capture records WITHOUT executing, so the device state stays
+                // where the caller's snapshot was taken ...
+                let saved = self.compress_lens();
+                self.dev.capture_begin()?;
+                self.step_rows_inner(toks, m, pos_base)?;
+                let g = self.dev.capture_end()?;
+                // ... but the HOST code inside it ran for real: `compress_rows`
+                // advances its `compress_len` mirror by the rule the commit kernel
+                // applies on the device, and no kernel ran. Leaving the mirror one
+                // group ahead would make the NEXT step's `comp_len` branch take a
+                // path the device counter does not agree with, so it is put back.
+                self.restore_compress_lens(&saved);
+                if let Some(c) = self.comm.as_ref() {
+                    c.host_barrier();
+                }
+                let e = self.dev.graph_instantiate(g)?;
+                self.dev.graph_free(g, std::ptr::null_mut())?;
+                self.dev.graph_launch(e)?; // the capture did not execute
+                self.verify_graph = Some(e);
+                self.verify_captures += 1;
+                self.advance_compress_lens(pos_base, m);
+            }
+        } else {
+            self.step_rows_inner(toks, m, pos_base)?;
         }
-        self.ul_f32(self.s.premix_r.ptr, &pm)?;
+
+        // D2H of the m argmaxes, always OUTSIDE the graph (a device read is illegal
+        // inside a capture). `download_u8` keeps this a plain byte copy, so no f32
+        // reinterpretation is involved.
+        let mut bytes = vec![0u8; m * 4];
+        let b = Device::view(self.s.argmax_r.ptr, m * 4);
+        self.dev.download_u8(&b, &mut bytes)?;
+        Ok((0..m)
+            .map(|r| {
+                u32::from_le_bytes([
+                    bytes[4 * r],
+                    bytes[4 * r + 1],
+                    bytes[4 * r + 2],
+                    bytes[4 * r + 3],
+                ])
+            })
+            .collect())
+    }
+
+    /// Can THIS verify of THIS shape go through the graph right now?
+    ///
+    /// Every condition is either a concrete capture hazard or a shape mismatch:
+    ///
+    /// * `DSV41_VERIFY_GRAPH` on (default OFF — the A/B);
+    /// * `pos_base >= 1`: the compressor's launcher picks its mode and grid from
+    ///   the HOST `start_pos` it is handed (`dsv41_compressor_pool`,
+    ///   dsv41_kernels.cu:6880-6890) and a capture freezes them. Mode 2 (decode)
+    ///   is what a multi-row verify is; mode 1 (`start_pos == 0`, prefill) is a
+    ///   different program with a different grid, so position 0 must never be the
+    ///   recording. The verify always runs after its anchor step, i.e. at
+    ///   `pos + 1 >= 1`, so this is a guard rather than a case. NOTE the per-step
+    ///   decision (`out_rows_val`) is NOT affected: the kernel already derives it
+    ///   from the DEVICE counter pointer it is given (`pos_rows[r]`, dereferenced
+    ///   in-kernel at dsv41_kernels.cu:3029).
+    /// * `m` equal to the row count the DRY pass warmed / the stored graph was
+    ///   recorded at — the capture bakes the per-row launch geometry.
+    /// * `!eng_host()`: the `DSV41_ENG_HOST` fallback hashes on the HOST and
+    ///   uploads per row (`upload_bytes_at` = blocking H2D).
+    /// * `ar_v5()` whenever there are peers: a host barrier is not a CUDA call, so
+    ///   it would not be recorded and the replayed graph would silently lose the
+    ///   inter-rank synchronisation.
+    /// * `supports_memset_async()`: `compress_rows` zeroes `scp_r` on the
+    ///   `ratio == 1` no-gate path, and `zero_at_on` would fall back to the
+    ///   SYNCHRONOUS `cudaMemset` on the legacy stream without the symbol.
+    /// * `supports_dspark_snapshot()`: not a capture requirement of THIS graph
+    ///   (the P0 pair runs outside it, so a stale `.so` would merely be slower),
+    ///   but a deliberate conservative gate: the audit that cleared this capture
+    ///   was run against the kernel set that carries them.
+    /// * neither `DSV41_STATS` nor `DSV41_PHASE`: both probe from the host inside
+    ///   the recorded region (`step_impl` excludes them for the same reason).
+    /// * the host `comp_len > 0` branch must already be in its steady state — see
+    ///   [`Self::compress_branch_steady`], which is the guard for the audit's S7.
+    fn verify_graph_gate(&self, m: usize, pos_base: i32) -> bool {
+        if !verify_graph_want() || pos_base < 1 {
+            return false;
+        }
+        if self.verify_graph_m != 0 && m != self.verify_graph_m {
+            return false;
+        }
+        if self.verify_graph.is_some() || self.verify_dry_done {
+            // The stored graph (or the pending capture) is already committed to a
+            // shape and its environment was checked when it was armed; only the
+            // row count can still disqualify this call.
+            return true;
+        }
+        !eng_host()
+            && !stats_dbg()
+            && !phase_dbg()
+            && self.compress_branch_steady()
+            && self.dev.supports_dspark_snapshot()
+            && self.dev.supports_memset_async()
+            && (self.comm.is_none() || crate::dsv41::tp::ar_v5())
+    }
+
+    /// The guard for the audit's S7 (`comp_len` frozen into the captured branch).
+    ///
+    /// `attention_rows` branches on the HOST mirror `comp_len > 0` to pick one of
+    /// three compressed-half behaviours ([`Self::indexer_rows`], nothing for a
+    /// consumer, or the per-row [`Device::comp_placeholder`]), and a capture
+    /// freezes that choice. The mirror is CUMULATIVE and monotonically
+    /// non-decreasing across a run (this block's commits add to it, and
+    /// `dspark_rollback[_keep]` puts back exactly the prefix it kept), so
+    /// "every compress source has already committed something" is a steady state:
+    /// from then on every verify — recorded or direct — takes the `comp_len > 0`
+    /// arm for that layer. Waiting for it costs a couple of positions (with
+    /// `ratio == 2` and m == 6 the first verify already commits three groups) and
+    /// removes the one host value in the recorded region that would otherwise
+    /// differ between the capture and a later replay.
+    fn compress_branch_steady(&self) -> bool {
+        self.compress_sources()
+            .iter()
+            .all(|&l| self.layers[l].compress_len > 0)
+    }
+
+    /// The host MIRROR of every layer's device committed-row counter — the state
+    /// [`Self::compress_rows`] advances from HOST code while the commit kernel
+    /// advances the device counter. A capture runs the host code but no kernel, so
+    /// the mirror has to be put back afterwards (see [`Self::step_rows`]).
+    fn compress_lens(&self) -> Vec<usize> {
+        self.layers.iter().map(|c| c.compress_len).collect()
+    }
+
+    fn restore_compress_lens(&mut self, saved: &[usize]) {
+        for (c, &n) in self.layers.iter_mut().zip(saved) {
+            c.compress_len = n;
+        }
+    }
+
+    /// Advance the host mirrors for a verify block the DEVICE has just executed
+    /// (a replayed graph runs no host code at all), by the same per-row rule
+    /// [`Self::compress_rows`] applies: row `r` at `pos_base + r` commits one
+    /// latent when `(pos_base + r + 1) % ratio == 0`. Only the layers that OWN a
+    /// compressor are counted — a consumer layer inherits the count
+    /// ([`Self::source_compress_len`]) and writes no state of its own.
+    ///
+    /// The caller's rollback restores these from its own snapshot, so an
+    /// unaccepted block is undone exactly as in the direct path.
+    fn advance_compress_lens(&mut self, pos_base: i32, m: usize) {
+        for l in self.compress_sources() {
+            let ratio = self.cfg.compress_ratio(l).max(1) as i32;
+            let mut add = 0usize;
+            for r in 0..m {
+                if (pos_base + r as i32 + 1) % ratio == 0 {
+                    add += 1;
+                }
+            }
+            self.layers[l].compress_len += add;
+        }
+    }
+
+    /// The verify forward as it is RECORDED: everything from the embedding to the
+    /// per-row argmax, with no host round trip anywhere inside (the ids, the row
+    /// positions and the premix are all on the device before this runs, and the
+    /// `argmax_r` D2H is the caller's). `pos_base` is the host value the block's
+    /// ROW 0 sits at — it is only read where the compressor's launcher needs a
+    /// scalar, and it IS frozen by a capture (see [`Self::verify_graph_gate`]).
+    fn step_rows_inner(&mut self, toks: &[u32], m: usize, pos_base: i32) -> Result<()> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
 
         // embedding + hyper-connection expansion, all m rows in one launch
         self.dev.embed_expand_dev(
@@ -2861,21 +3146,10 @@ impl<'a> DevChain<'a> {
                 std::ptr::null_mut(),
             )?;
         }
-        // D2H of the m argmaxes. `download_u8` keeps this a plain byte copy, so no
-        // f32 reinterpretation is involved.
-        let mut bytes = vec![0u8; m * 4];
-        let b = Device::view(self.s.argmax_r.ptr, m * 4);
-        self.dev.download_u8(&b, &mut bytes)?;
-        Ok((0..m)
-            .map(|r| {
-                u32::from_le_bytes([
-                    bytes[4 * r],
-                    bytes[4 * r + 1],
-                    bytes[4 * r + 2],
-                    bytes[4 * r + 3],
-                ])
-            })
-            .collect())
+        // The `argmax_r` D2H is deliberately NOT here: it is a device read, which a
+        // capture forbids, so the caller ([`Self::step_rows`]) issues it after the
+        // replay for every arm of the graph decision.
+        Ok(())
     }
 
     /// The layers whose window ring the verify block appends to: the `owns_kv`
