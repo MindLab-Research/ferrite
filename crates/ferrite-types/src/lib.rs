@@ -8,6 +8,10 @@
 use std::fmt;
 use std::sync::Arc;
 
+/// The speculative-decoding seam shared by the GLM MTP and DSV41 DSpark chains
+/// (one accept chain, each chain's block layout bound to it once).
+pub mod spec_step;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     /// 32-bit float (reference backend native).
@@ -153,6 +157,8 @@ pub enum FerriteError {
 }
 
 pub type Result<T> = std::result::Result<T, FerriteError>;
+
+pub use spec_step::{spec_accept, SpecStep, SpecToken};
 
 #[cfg(test)]
 mod tests {

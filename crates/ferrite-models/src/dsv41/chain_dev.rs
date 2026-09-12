@@ -9102,7 +9102,10 @@ impl<'c> SpecStep for DevChain<'c> {
     type Report = DsparkSpecReport;
     const ANCHOR_IS_IN_BLOCK: bool = false;
 
-    fn spec_step(&mut self, step: Self::Step<'_, '_>) -> Result<Self::Report> {
+    fn spec_step<'a, 'b>(&mut self, step: Self::Step<'a, 'b>) -> Result<Self::Report>
+    where
+        'b: 'a,
+    {
         let (dspark, token, pos) = step;
         self.dspark_spec_step(dspark, token, pos)
     }
