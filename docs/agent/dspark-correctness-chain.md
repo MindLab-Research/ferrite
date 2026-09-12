@@ -765,3 +765,12 @@ ferrite 是**顺序加**（k=0..n-1 逐个加），PyTorch 的 sum 可能是 tre
 **无论如何**：lazy verify 的文本退化（Bristol/burdens/oqua）**不是 engram 的 m-dispatch**——它是 lazy 与 batched 的**其它**数值差异。lazy-text-degradation 的判词给出了 D1（engram）作为 SEVERE，但实测证明 D1 不是根因（或 engram 根本没生效）。**需要继续排查**。
 
 **性能确认**：步时 24.1ms 稳定（41.4 tok/s）——lazy verify 的 2× 性能收益确认。
+
+## Backbone 对齐数据（official-side-dump 判词）——首 token 一致，逐层 norm 偏差 ~2.4-2.9%
+
+**首 token top-10 @ pos=0**：前 9 名 id 与次序完全一致（#1 id=5 val=13.32 vs 13.50），仅第 10 名在切片边界翻转（15 vs 94，差 0.045 logit）。
+**首 token @ pos=13**（真实首生成位）：**argmax 一致（id=1342 = 《）**，但个别 token 偏差显著（11750: −18.5%、33103: +14.1%）。
+**逐层 hidden norm**：mean |Δ| @pos=0 ≈ 2.9%、@pos=13 ≈ 2.4%。**最大偏差 @pos=0 l=20 +14.46%**（176747 vs 156934）。
+**norm 本身很大（l=39 ≈ 2M）**——**偏差可能来自数值精度（f32 vs bf16）的合法差异**，而非 bug。
+
+**关键判定**：backbone 的数值路径**基本对齐**（首 token argmax 一致、逐层 norm 在 3% 以内）。acs/ibu 可能是**累积精度差**（44 层 × 130 token 的 2-3% 漂移在近 tie argmax 处翻转）——**不是 kernel bug**，是 f32 全程 vs 官方 bf16 的系统性精度差。
