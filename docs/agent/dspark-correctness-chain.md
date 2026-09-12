@@ -1981,3 +1981,18 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 | <1.1 | 退化 | mrows 程序在 draft 的布局上有问题 |
 
 **与 draft-verify audit 的关联**：audit 发现 #2（投影族）与 head 同级严重——head 的 ulp 级测试中性，但投影是**结构性差异**（不同的 K-walk + 归约树），影响更大。
+
+## 🔴 Build 失败的教训（ATTN_PROJ_ALIGN 第一次测试无效）
+
+**问题**：remote 的 cargo build 失败（ferrite-kernel 的 custom build command）——`error: failed to run custom build command for ferrite-kernel`
+
+**根因**：.so 的 build-id 与新源码的 git commit 不匹配（build.rs 门禁拒绝编译）。**.so 是旧 commit 构建的，源码是新 commit**——build.rs 检查不一致就拒绝。
+
+**后果**：ATTN_PROJ_ALIGN 第一次测试（f6062ba4）用的是**旧 binary**——"accept 1.214 不变"的结果**无效**！
+
+**修复**：必须**先 build.sh**（重建 .so with 新 commit hash）**然后 cargo build**——双产物纪律！
+
+**教训**（用户强调的"so和rust版本一致"）：
+1. 每次测试前确认 .so 和 binary 的时间戳一致
+2. cargo build 的 "warning: build failed" 不能被 `tail -1` 掩盖——必须检查 EXIT CODE
+3. 测试结果如果与预期完全相同（histogram 逐项一致），要怀疑是否用了旧 binary
