@@ -2300,3 +2300,9 @@ kernel `dsa_append_batched_mapped_kernel`（`ferrite_kernels.cu`）。**没有�
 - ✅ prefill **确实写** s.ids = first_token（最后一步 prompt 的 argmax）⇒ 第一轮 anchor 与 EAGER **bit-identical**——"prefill 不写 s.ids"被证伪。
 - ⚠️ ratio=2 的 compressor 在**奇数位置**提交组 ⇒ **第一轮 verify 的行 0（pos+1）就落在组边界**，`compress_replay(pos_base, keep)` 的语义在第一轮就被执行——若 pos_base/keep 差 1，第一轮就污染压缩 carry（被 4 个 source 层 + indexer 读）。
 - ⚠️ engram 的 token cache 不在 rollback 清单（若 lookback 只向后则无害——需读 engram.rs 的方向确认）。
+
+## 2026-09-12 用户红线（权威，全权重）：重复与乱码同级——都是正确性问题，不可二选一
+
+**用户（原话）**："重复也是正确性问题和乱码一样严重"。
+
+**⇒ 目标状态不是"回到只重复的 LEN 54"，而是：verify 多行 forward 的值修复到与 EAGER 逐位一致（重复与乱码同源于此——喂错 token 会同时制造两者）。验收 = 出师表/数字任务与 EAGER 同水平（EAGER：数数 1..100 ✓、出师表 LEN 146 双字 3）。
