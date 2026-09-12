@@ -153,8 +153,11 @@ rsh() { # run a shell command on the GPU box (stdin is forwarded: the request
         bash -c "$1"
     fi
 }
-SO="$HOME/$RROOT/kernels/cuda/libferrite_kernels.so"
-BIN="$HOME/$RROOT/target/release/ferrite-serve"
+# Paths as evaluated ON THE NODE (the leading \$HOME defers to the remote's
+# shell — the local machine's $HOME is /home/smith but the node's is
+# /home/ubuntu, and the .so only exists on the node).
+SO="\$HOME/$RROOT/kernels/cuda/libferrite_kernels.so"
+BIN="\$HOME/$RROOT/target/release/ferrite-serve"
 
 mkdir -p "$LOGDIR"
 pass=0; fail=0; warn_n=0
