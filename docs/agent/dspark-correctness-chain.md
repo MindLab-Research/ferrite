@@ -2140,3 +2140,23 @@ Step 40-41: 3 1                     (mean 2.0)
 - accept 模式应该与 lazy 相似（k_acc 序列可比）
 
 **下一步**：如果 SWALLOW_STEP 工作，立即跑第一波 mrows A/B（GATE -2.75ms + INDEXER -1.0~1.5ms + 其他 mrows）。
+
+## 第一波 mrows + SWALLOW 综合测试准备（SWALLOW 重测确认后跑）
+
+**Gate 组合**（第一波：全 mrows + SWALLOW + 图化）：
+```bash
+DSV41_SWALLOW_STEP=1          # 主链折进 verify（-4.55ms）——0 ar5-hang 确认后
+DSV41_GATE_MROWS=1            # #1 ROI（-2.75ms 设计口径）
+DSV41_INDEXER_MROWS=1         # #3 ROI（-1.0~1.5ms）
+DSV41_VERIFY_HEAD_MROWS=1     # #4 ROI（-0.7~0.9ms，但与 SWALLOW m=6 有冲突风险！）
+DSV41_NORM_MROWS=1            # 结构性零收益（对照）
+DSV41_COMPRESSOR_MROWS=1      # #5 ROI（-0.2~0.3ms）
+DSV41_VERIFY_GRAPH=1
+DSV41_BF16_TRUNCATE=1
+# NOT: DSV41_LAZY_VERIFY（SWALLOW 是 batched）
+# NOT: DSV41_SH_EXP_MROWS（已实测零收益——对照）
+```
+
+**⚠️ VERIFY_HEAD_MROWS 与 SWALLOW m=6 的冲突**：之前的 ar5-hang 是在 SWALLOW + VERIFY_HEAD_MROWS 组合下发生的。回退修复了 epoch 问题，但 m=6 的 head mrows 可能仍有问题。**第一波先不开 VERIFY_HEAD_MROWS**（单独验证 SWALLOW + 其他 mrows）。
+
+**预期步时**：SWALLOW(-4.55) + GATE(-2.75) + INDEXER(-1.0~1.5) + COMPRESSOR(-0.2~0.3) ≈ 33 - 8.5-9.6 = **~24-25ms**（如果全部兑现）
