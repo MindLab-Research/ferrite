@@ -4073,3 +4073,18 @@ self.dev.gemm_fp8_mx_rope_norm(
 2. R2/K1/K2 的"损坏"——继承自退化后的引擎（不是它们自己的 bug！）
 3. 早期"零拉丁"通过——BF16_TRUNCATE 掩盖了拉丁（但没修复数字）
 4. **session 的所有"优化损坏"判定都需要重新评估**！
+
+## A4 single-poll 的亲自分析修正
+
+**广播机制确认**（读 ar5_wait_round 的代码）：
+- 设计：block 0 轮询所有 peers（thread r ↔ peer r）然后通过"设备 epoch 后面的 spare word"广播完成
+- **不是 __shared__**（我之前的假设错了）——是设备内存全局可见
+- 其他 blocks 轮询这个广播 flag
+
+**剩余的嫌疑**（等 a4-singlepoll-bughunt 的判决）：
+1. 广播 flag 的写入/读取时序（memory fence？）
+2. 其他 blocks 的轮询条件（超时？错误的边界？）
+3. `__syncthreads()` 在 ar5_wait_round 之后——如果 block 0 先到这里而其他 blocks 还在轮询——不匹配？
+4. **单 block 轮询与多 block 归约的竞态**：block 0 完成轮询后开始归约自己的 slice，但其他 blocks 可能还在等广播 flag——如果归约读取的数据还没全部到达——**损坏的 AR 结果**！
+
+**如果 A4 是引擎退化的来源**：最简单的修复 = **禁用 A4**（gate OFF——它是默认 OFF 的！之前测试显式开了 DSV41_AR_SINGLE_POLL=1）
