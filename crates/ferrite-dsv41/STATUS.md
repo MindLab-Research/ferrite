@@ -7625,3 +7625,20 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 | ar_reduce + ar_store | 7.49 + 5.70 | 7872×2 | 8.1% | |
 
 **确认**：gemm 10.98µs × 246/步 = 2.70ms 是最大项——swapAB 后 →0.3-0.4ms（省 2.3ms）→ 步 ~4.0ms ≈ **250 tok/s**。
+
+### post-swapab-landscape 定案：侧流会吃 swapAB 收益（2026-09-12 13:00）
+
+**swapAB 后的瓶颈排序（~4.0ms ≈ 250 tok/s）**：
+| # | 项 | ms | 性质 |
+|---|---|---|---|
+| 1 | expert gateup+down | 2.00 | 50%——LUT gather 延迟 + L1TEX 地板 |
+| 2 | **hc_dots_late（侧流）** | 1.43 | **36%——主流窗口缩短后浮出** |
+| 3 | hc_mixes_tail + 节点间隙 + AR | 1.98 | |
+
+**关键风险：侧流临界**——6 条 fork/join 共享一条 side stream（DL 14.94µs + EARLY + LATE + dual-chain 串行叠加 ≈ 30µs/层）逼近主流窗口。swapAB 的收益可能被侧流串行化吃掉。
+
+**Top-2 行动项**：
+1. **侧流拆分**（DL → 第二条 side stream）——最便宜，保护 swapAB 收益（side-stream-split 分析中）
+2. expert ncu 重测后再考虑 cp.async（5 次阴性后需要新数据）
+
+**300 tok/s 路径**：expert tcgen05 fp4 swapAB（2.0ms→1.0ms → 3.0ms ≈ 333 tok/s）——研究级（kind::f8f6f4 本仓库未用过）。
