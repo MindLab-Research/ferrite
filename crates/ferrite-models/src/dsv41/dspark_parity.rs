@@ -391,15 +391,15 @@ pub fn dspark_parity_run(model_dir: &str, so: &str) -> Result<ParityReport> {
         slots += k;
 
         // 4. contrast 2: verify parity. The SAME rows, fed the TRUE tokens, must
-        //    reproduce the single-row argmax. `pos` is the counter's value BEFORE
-        //    the real step — what `dspark_snapshot`'s slot arithmetic keys off —
-        //    while `step_rows` reads the counter itself (now `pos + 1`) as its
-        //    row base, so the block lands exactly on positions pos+1 .. pos+k.
-        let host = chain.dspark_snapshot(pos, k)?;
+        //    reproduce the single-row argmax. The real step above already ran, so
+        //    the block's row 0 is at `pos + 1` — the position `step_rows` itself
+        //    reads off the (now advanced) device counter, which is what
+        //    `dspark_snapshot`/`dspark_rollback` take as their base.
+        let host = chain.dspark_snapshot(pos + 1, k)?;
         let rows = chain.step_rows(&truth[..k]);
         // Roll back unconditionally: a dirty ring/compressor would silently
         // change every later step's numbers, which is worse than the error.
-        chain.dspark_rollback(pos, k, &host)?;
+        chain.dspark_rollback(pos + 1, k, &host)?;
         let rows = rows?;
         if rows.len() != k {
             return Err(FerriteError::Config(format!(

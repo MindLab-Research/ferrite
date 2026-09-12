@@ -1941,7 +1941,9 @@ impl<'a> DevChain<'a> {
     ///   measurement.
     fn vrow0_eager(&mut self, token: u32, pos: usize) -> Result<Vrow0Eager> {
         let cfg = self.cfg;
-        let host = self.dspark_snapshot(pos, 1)?;
+        // The eager row lands at `pos + 1` (`step_dev` below), so the block's row
+        // 0 position is `pos + 1`.
+        let host = self.dspark_snapshot(pos + 1, 1)?;
         let ids_saved = self.dev.download_u32(self.s.ids.ptr as *const c_void)?;
 
         let argmax = self.step_dev(token, pos + 1)?;
@@ -1983,7 +1985,7 @@ impl<'a> DevChain<'a> {
 
         // Undo, in the reverse order of the writes: the ring + the compressor
         // carry, then the counter, then `s.ids`.
-        self.dspark_rollback(pos, 1, &host)?;
+        self.dspark_rollback(pos + 1, 1, &host)?;
         self.set_pos_ctr(pos + 1)?;
         self.ul_i32(self.s.ids.ptr, &[ids_saved as i32])?;
 
@@ -4031,7 +4033,7 @@ impl<'a> DevChain<'a> {
                 self.dev.dspark_ring_restore(
                     ring,
                     snap,
-                    pos_base as i32,
+                    base,
                     win as i32,
                     hd as i32,
                     m as i32,
@@ -4671,7 +4673,9 @@ impl<'a> DevChain<'a> {
         let host_mirrors = if bisect == 1 || bisect == 3 {
             Vec::new()
         } else {
-            self.dspark_snapshot(pos_ctr, m)?
+            // The block is `[d1..d5]` and the step just advanced the counter to
+            // `pos + 1`, so the block's row 0 sits there.
+            self.dspark_snapshot(pos_ctr + 1, m)?
         };
 
         // 3./4./5. the draft, from the tap of the step that just ran. `pos` is
@@ -4717,8 +4721,8 @@ impl<'a> DevChain<'a> {
 
         // 7. rollback, immediately after the verify and BEFORE the host-only
         //    arithmetic below: the chain must not stay dirty on a report-building
-        //    error path.
-        self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
+        //    error path. (`pos_ctr + 1`: the block's row 0 — see the snapshot.)
+        self.dspark_rollback(pos_ctr + 1, m, &host_mirrors)?;
 
         let mut verify_out = [0u32; DSPARK_DRAFTS];
         if bisect == 0 && rows.len() != DSPARK_DRAFTS {
@@ -4863,13 +4867,9 @@ impl<'a> DevChain<'a> {
         // primed by the round that ran the legacy path (its `step_dev` is what
         // writes the very first tap) and every later round swallows the
         // main-chain step into the verify's anchor row.
-        // TODO(swallow-step-impl): re-enable when `dspark_spec_swallowed` lands.
-        // (Commented out by the main agent to keep `main` compiling while the
-        // implementation is in flight — `swallow_step()` defaults OFF, so this
-        // is a no-op at runtime.)
-        // if swallow_step() && self.spec_primed {
-        //     return self.dspark_spec_swallowed(dspark, token, pos);
-        // }
+        if swallow_step() && self.spec_primed {
+            return self.dspark_spec_swallowed(dspark, token, pos);
+        }
 
         // ---- 1. the real step: the whole-step graph (tap hook included), the
         // argmax, and the position counter + 1.
@@ -4969,10 +4969,15 @@ impl<'a> DevChain<'a> {
         // (`DSV41_SWALLOW_STEP` only): the swallow drops `step_dev`, so this
         // round's tap in `dspark_tap` is the last one a single-row forward will
         // write. See `carry_kept_tap` for which row of the block that is.
-        // TODO(swallow-step-impl): re-enable with `carry_kept_tap`.
-        // if swallow_step() {
-        //     Self::carry_kept_tap(self.dev, self.s.dspark_tap.ptr, self.s.dspark_tap_r.ptr, cfg.dim, k_acc)?;
-        // }
+        if swallow_step() {
+            Self::carry_kept_tap(
+                self.dev,
+                self.s.dspark_tap.ptr,
+                self.s.dspark_tap_r.ptr as *const c_void,
+                cfg.dim,
+                k_acc,
+            )?;
+        }
         let commit_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // ---- 7. what this step emits: the anchor plus the verify's argmax for
