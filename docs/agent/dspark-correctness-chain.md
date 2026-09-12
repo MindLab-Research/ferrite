@@ -1042,3 +1042,11 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 **修正后的截断代价 ≈ 14%**（78.8 vs 91.3 tok/s），不是 76%（33.10 vs 18.82ms 的错误对比）。这是 accept 改善（更少步数）与 per-row 开销的净效应。
 
 **对 400 的影响**：截断的 ~14% 吞吐代价可以接受（零拉丁是红线）。真正的瓶颈仍是 accept（1.02 vs sglang 的 5）。
+
+## BF16_TRUNCATE 单独隔离确认（72dc2ba1）
+
+- **零拉丁 ✓**（BF16_TRUNCATE=1 单独就够，TAP_BF16 非必需）
+- **步时高度可变**：18.82ms / 33.10ms / 47.39ms（同一测试内）——**取决于每步的 accept 行数**（k_acc=0 → 1 行 → 19ms；k_acc=3 → 4 行 → 47ms）
+- **确认**：截断本身不是性能问题——性能变化来自 accept 模式改变每步行数
+
+**结论**：`DSV41_BF16_TRUNCATE=1` 是零拉丁的充分条件，性能代价 ~0（只是改变了 accept 分布）。
