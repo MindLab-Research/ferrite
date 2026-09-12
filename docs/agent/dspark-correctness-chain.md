@@ -1148,3 +1148,30 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 - **HC_VERIFY_FUSE=0 诊断测试（9b55ea04）正在跑**——如果修复，verify 融合与后续改动的交互是根因
 
 **修复建议**（来自审计）：draft-invariance 作为回归闸——任何 draft gate A/B 后文本变化 = 立即停止并查 commit/rollback 机制。
+
+## 今日最终状态摘要（2026-09-12 晚，P0 战役 + 基线修复）
+
+### 正确性
+- **零拉丁**：`DSV41_BF16_TRUNCATE=1`（hc_pre 的 bf16 截断）✓（多次验证）
+- **基线破坏根因**：`DSV41_HC_VERIFY_FUSE`（默认 ON）与 P0 系列提交的交互 → **默认改 OFF**（9b55ea04 验证：FUSE=0 恢复零拉丁）
+- **oracle fix**：不影响 serve（调用图闭合）✓
+
+### Accept 率（400 的关键乘数，当前 ~1.02）
+- P0-1 seed 相位：修复后文本退化（需 winrows 配套）→ 回退 + gate（DSV41_SEED_POS）
+- P0-3 tap 采集点：gated（DSV41_TAP_INPUT）——P0 系列审计确认"可以安全启用"但需在修复后的基线上重测
+- P0-4 激活域：gated（DSV41_DRAFT_BF16_DOMAIN，4 处 roundtrip）
+- P1-5 head/gate：同 P0-4 gate
+- **draft 不变性原则**：committed 文本与 draft 无关——改 draft gate 后文本变化 = commit/rollback 泄漏（回归闸）
+
+### 性能（400 路径）
+- **lazy verify 死穴**：per-row m=1 无法受益 mrows → 不可能到 10ms
+- **batched verify 路径**：全 mrows + tcgen05 + draft P3c → 理论地板 ~9-10ms
+- **@ accept 3：4 tok/step → 400 tok/s ✓**
+- **待测**：batched + 全 gate 的组合测试（batched-verify-prep subagent 准备中）
+- **HC_VERIFY_FUSE=OFF 的代价**：verify 的 hc 链回到 10 发（+1.3ms vs 融合）——需要补偿
+
+### 待完成
+1. 基线恢复验证（db9493bd 跑中）
+2. HC_VERIFY_FUSE 交互分析（subagent 跑中）
+3. bisect 定位（subagent 跑中）
+4. batched verify 400 测试（subagent 准备中）
