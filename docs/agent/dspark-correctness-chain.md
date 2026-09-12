@@ -5444,3 +5444,26 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 - **可能是 staging 的 rollback/恢复**——SWALLOW 的 snapshot 恢复了早期状态？
 
 **判定**：动态 pad 解决了 hang（0 ar5-hang！）但没解决 epoch 降级。下一步：找 epoch 54 的来源。
+
+## 第 11 次测试的关键发现——EOS 被提前触发！
+
+**finish_reason 分析**：
+- `finish_reason: "stop"`（正常停止——不是错误）
+- `usage: completion_tokens=12`（6 行 × 2 token 含换行）
+- **`[http] tokenizer stops: [1]`**——**token id 1（EOS）被生成！**
+
+**判定**：
+1. 生成 "1\n2\n3\n4\n5\n6\n" 正确后，模型生成了 **EOS token（id=1）**——提前停止
+2. "数到 200" 的 prompt 不应该 6 个数就停——**EOS 是错误生成的**
+3. **与 epoch 54 的关联**：AR 的结果被破坏（epoch 错误）→ attention 输出错误 → logits 错误 → EOS 被意外激活
+
+**SWALLOW 的完整问题链**：
+```
+epoch 1328 → 54（第一次 swallowed 步的均匀降级）
+  → AR 的结果可能不完整/错误（即使不 hang）
+    → attention 读到错误上下文
+      → logits 错误（EOS 意外高）
+        → 提前停止 + 可能其他静默错误
+```
+
+**结论**：动态 pad 修了 hang 但没修计算。SWALLOW 路径的 epoch 降级导致计算被破坏——需要找到 epoch 54 的真正来源。
