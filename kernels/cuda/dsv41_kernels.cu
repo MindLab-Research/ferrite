@@ -5466,6 +5466,607 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 }
 
 // ===========================================================================
+// K1 (`dsv41_gemm_fp8_mrows2`): TWO projection families in ONE launch.
+// The verify block's wq_a + wkv pair -- SAME activation, SAME k, two different
+// weight matrices and two different output widths.
+// ===========================================================================
+// WHAT THIS IS. `docs/agent/verify-specific-fusion-kernel-design.md` §3. The
+// verify's `attention_rows` projects wq_a (n = ql = 1280) and wkv (n = hd = 512)
+// from the SAME quantised activation row with two separate
+// `dsv41_gemm_fp8_mrows` launches. This kernel fuses those two launches into
+// one: the warp's OUTPUT ROW selects which family it belongs to, so the two
+// projections share one grid, one block prologue (the LUT + the M staged
+// activation rows) and one graph node -- at HALF the launch slots, at zero
+// numerical cost.
+//
+// WHY IT IS SAFE TO FUSE. This is NOT a reuse of EAGER's `lin2` (the R2 arm that
+// was found corrupt): the code below is `gemm_fp8_mrows_kernel<M>` (line ~5208)
+// with the family folded in as FOUR base-pointer selections, and the parts that
+// decide a result are copied verbatim:
+//   * the K walk (`kb` ascending 0..nb_k-1, `j = kb*32 + lane`) -- C1;
+//   * the ONE serial `acc[r] += av * wv` chain with the same `#pragma unroll 32`
+//     source form -- C6; and the a32 / a32-off arms verbatim;
+//   * the `shfl_xor` reduction tree, emitted once per (warp, r) -- C3;
+//   * `acc[r]` remains an independent chain with nothing combined across r -- C4;
+//   * the staged bytes are the SAME global bytes (the weight row `w_f + rrow*k`,
+//     the activation row at `+r*k`) copied by the SAME cp.async16 rule -- C2.
+// The only additions are `fam1` (row < n1), `rrow` (the family-internal row) and
+// the four `fam1 ? x1 : x2` selects: weight base, scale base, bias base, output
+// base. The warp-level selection means a family boundary that lands INSIDE a
+// block is still correct (each warp computes its own row), so `n1` need not be a
+// multiple of 32.
+// ⇒ row `row` of this launch is BIT-IDENTICAL to row `row` of the two separate
+//   `dsv41_gemm_fp8_mrows` launches it replaces, per the kernel header's C1-C6.
+//
+// ABI. (a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1,
+//       w2, w2_scale, bias2, out2, n2, out_stride2, m, k, stream)
+//       -> 0 launched, 2 DECLINED (never 1).
+//   a          [m, k]        fp8 e4m3, row r at +r*k        (SHARED, both families)
+//   a_scale    [m, k/32]     f32, row r at +r*(k/32)        (SHARED)
+//   w_f        [n_f, k]      fp8 e4m3, family f
+//   w_f_scale  [n_f/32,k/32] ue8m0 (block 32x32), family f
+//   out_f      f32, row r's element `rrow` at +r*out_stride_f + rrow
+//   n_f        the family's output width; `out_stride_f >= n_f`. TWO strides and
+//              not one: the call site's wq_a row strides by `ql` while wkv's
+//              strides by `hd`, and `ql != hd` (1280 vs 512) -- a single
+//              `out_stride` cannot address both buffers (design doc §3.2/§3.3
+//              carries one; that is the one ABI deviation, reported to 尚书省).
+// "2" and not cudaErrorInvalidValue: 1 would be indistinguishable from a real
+// launch failure (the r42-45 collision the swapAB entry documents), and every
+// decline here is a shape / mode property the caller can fall back on -- the
+// caller then runs its two `proj_mrows` launches, whose numerics are the same by
+// construction.
+template <int M>
+__global__ void __launch_bounds__(256)
+gemm_fp8_mrows2_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                       const uint8_t* __restrict__ w1, const uint8_t* __restrict__ w1_scale,
+                       const float* __restrict__ bias1, float* __restrict__ out1, int n1,
+                       int out_stride1, const uint8_t* __restrict__ w2,
+                       const uint8_t* __restrict__ w2_scale, const float* __restrict__ bias2,
+                       float* __restrict__ out2, int n2, int out_stride2, int k, int a32) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int nb_k = k >> 5;
+    // smem layout: the block's weight rows | the 256-entry e4m3 table | the M
+    // activation scale rows (f32) | the M staged activation rows (fp8 bytes) --
+    // byte-for-byte the `gemm_fp8_mrows_kernel` layout (the activation slot is
+    // shared by both families, which is exactly why the fuse is free).
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
+    float* s_as = s_lut + 256;
+    uint8_t* s_a = reinterpret_cast<uint8_t*>(s_as + (size_t)M * (size_t)nb_k);
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // The M staged activation rows are family-INDEPENDENT and identical to what
+    // the two separate launches would each have staged (same global rows, same
+    // rule) -- so both below read the very bytes their own launch staged.
+    #pragma unroll
+    for (int r = 0; r < M; ++r) {
+        const uint8_t* __restrict__ ar = a + (size_t)r * (size_t)k;
+        const float* __restrict__ asr = a_scale + (size_t)r * (size_t)nb_k;
+        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[(size_t)r * nb_k + i] = asr[i];
+        for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[(size_t)r * (size_t)k + i] = ar[i];
+    }
+    // This warp's output row, and the FAMILY it belongs to. Both are UNIFORM
+    // within a warp, so every `active`/`fam1` branch is taken whole-warp and both
+    // barriers below are reached by every thread of the block. `row < n1` keeps
+    // the selection at WARP granularity, so the family boundary may fall inside a
+    // block (no `n1 % 32 == 0` requirement -- there is no rope pair here).
+    const int row = blockIdx.x * nwarps + warp;
+    const bool fam1 = row < n1;
+    const bool active = row < n1 + n2;
+    const int rrow = fam1 ? row : row - n1;
+    const uint8_t* __restrict__ wf = fam1 ? w1 : w2;
+    const uint8_t* __restrict__ wsf = fam1 ? w1_scale : w2_scale;
+    const float* __restrict__ bs = fam1 ? bias1 : bias2;
+    float* __restrict__ of = fam1 ? out1 : out2;
+    const int os = fam1 ? out_stride1 : out_stride2;
+    // cp.async 16B weight staging -- the `gemm_fp8_mrows_kernel` block verbatim,
+    // with the family's own weight row. NUMERICS: staging fills the slot with the
+    // same bytes from the same global address the scalar loop wrote (a pure
+    // copy), and the consume loop reads only that slot, so no output bit moves.
+    if (active) {
+        const uint8_t* __restrict__ wr = wf + (size_t)rrow * (size_t)k;
+        uint8_t* __restrict__ row_s = s_w + (size_t)warp * (size_t)k;
+        const int n16 = k >> 4;
+        for (int i = lane; i < n16; i += 32) dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+        // k % 16 tail: unreachable for the launcher (it rejects `k & 31`), kept so
+        // the row is staged by exactly the rule the mrows sibling uses.
+        for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+        dsv41_cp_commit();
+    }
+    __syncthreads();
+    if (active) {
+        dsv41_cp_wait_all();
+        __syncwarp();
+        const uint8_t* __restrict__ wsr = wsf + (size_t)(rrow >> 5) * (size_t)nb_k;
+        float acc[M];
+        #pragma unroll
+        for (int r = 0; r < M; ++r) acc[r] = 0.f;
+        if (a32) {
+            // A32 ARM -- `gemm_fp8_mrows_kernel`'s a32 body verbatim: the
+            // materialised `s_lut[byte] * sa` operand in registers, folded into
+            // the same serial chain.
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = kb * 32 + lane;
+                const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+                float af[M];
+                #pragma unroll
+                for (int r = 0; r < M; ++r)
+                    af[r] = s_lut[s_a[(size_t)r * (size_t)k + j]] *
+                            s_as[(size_t)r * nb_k + (j >> 5)];
+                #pragma unroll
+                for (int r = 0; r < M; ++r) acc[r] += af[r] * wv;
+            }
+        } else {
+            // A32-OFF ARM -- the same product folded inline at the point of use
+            // (the gemv's own `s_lut[ap[j]] * s_as[j>>5]` form).
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = kb * 32 + lane;
+                const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+                #pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    const float av =
+                        s_lut[s_a[(size_t)r * (size_t)k + j]] * s_as[(size_t)r * nb_k + (j >> 5)];
+                    acc[r] += av * wv;
+                }
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float a_r = acc[r];
+            for (int off = 16; off > 0; off >>= 1) a_r += __shfl_xor_sync(0xFFFFFFFFu, a_r, off);
+            if (lane == 0) {
+                // The family's OWN bias row and output column: `rrow`, not `row`.
+                const float v = a_r + (bs != nullptr ? bs[rrow] : 0.f);
+                of[(size_t)r * (size_t)os + rrow] = v;
+            }
+        }
+    }
+}
+
+// See the kernel header above for the layout, the two-family selection and the
+// bit-identity argument (C1-C6 + the warp-level family split).
+// Returns 0 (launched) or 2 (declined: the caller runs its two `proj_mrows`).
+extern "C" int dsv41_gemm_fp8_mrows2(
+    const uint8_t* a, const float* a_scale, const uint8_t* w1, const uint8_t* w1_scale,
+    const float* bias1, float* out1, int n1, int out_stride1, const uint8_t* w2,
+    const uint8_t* w2_scale, const float* bias2, float* out2, int n2, int out_stride2, int m,
+    int k, cudaStream_t s) {
+    if (m <= 0 || m > 8) return 2;
+    if (n1 <= 0 || n2 <= 0 || k <= 0 || (k & 31)) return 2;
+    if (out_stride1 < n1 || out_stride2 < n2) return 2;
+    if (a == nullptr || a_scale == nullptr) return 2;
+    if (w1 == nullptr || w1_scale == nullptr || out1 == nullptr) return 2;
+    if (w2 == nullptr || w2_scale == nullptr || out2 == nullptr) return 2;
+    // Same two mode gates as the single-family launcher: the C1-C6 parity
+    // argument is the ORDER-PRESERVING consume form, and with the M=1 GEMV
+    // disabled the m=1 fallback is the tile-MMA program instead.
+    if (g_gemv_fp8_mode < 3) return 2;
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    // One warp per output row, over the CONCATENATED family (n1 + n2 rows); the
+    // warp-level family split makes the boundary free. The block geometry does
+    // not enter the parity argument -- rows are independent, it only decides how
+    // many rows share one block's staging (the mrows launcher's own statement).
+    const int nrooms = n1 + n2;
+    const int nwarps = dsv41_mrows_warps_for(nrooms);
+    const int blocks = (nrooms + nwarps - 1) / nwarps;
+    const int nb_k = k >> 5;
+    // weight rows (nwarps*k) + the e4m3 table + the M activation scale rows + the
+    // M staged activation rows -- the single-family budget, unchanged (the
+    // activation slot is shared by both families).
+    const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
+                        (size_t)m * (size_t)nb_k * sizeof(float) + (size_t)m * (size_t)k;
+    if (smem > 48 * 1024) {
+        // Per-kernel ceiling, not this call's need (round-43 revert). ⚠️ EVERY M
+        // specialisation needs its OWN attribute, or the launch below picks
+        // `gemm_fp8_mrows2_kernel<m>` still at the 48KB default -> the m=5
+        // "cuda error 1" the mrows launcher observed.
+        cudaError_t e = cudaSuccess;
+#define FERRITE_SET_MROWS2_SMEM(k)                                                  \
+    do {                                                                            \
+        cudaError_t r = cudaFuncSetAttribute(                                       \
+            gemm_fp8_mrows2_kernel<k>, cudaFuncAttributeMaxDynamicSharedMemorySize,  \
+            dsv41_smem_ceiling(gemm_fp8_mrows2_kernel<k>));                         \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                            \
+    } while (0)
+        FERRITE_SET_MROWS2_SMEM(1);
+        FERRITE_SET_MROWS2_SMEM(2);
+        FERRITE_SET_MROWS2_SMEM(3);
+        FERRITE_SET_MROWS2_SMEM(4);
+        FERRITE_SET_MROWS2_SMEM(5);
+        FERRITE_SET_MROWS2_SMEM(6);
+        FERRITE_SET_MROWS2_SMEM(7);
+        FERRITE_SET_MROWS2_SMEM(8);
+#undef FERRITE_SET_MROWS2_SMEM
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    const dim3 grid(blocks);
+    const int blk = nwarps * 32;
+    const int a32 = (int)g_gemv_a32;
+    switch (m) {
+        case 1: gemm_fp8_mrows2_kernel<1><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 2: gemm_fp8_mrows2_kernel<2><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 3: gemm_fp8_mrows2_kernel<3><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 4: gemm_fp8_mrows2_kernel<4><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 5: gemm_fp8_mrows2_kernel<5><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 6: gemm_fp8_mrows2_kernel<6><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 7: gemm_fp8_mrows2_kernel<7><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        case 8: gemm_fp8_mrows2_kernel<8><<<grid, blk, smem, s>>>(a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1, w2, w2_scale, bias2, out2, n2, out_stride2, k, a32); break;
+        default: return 2;
+    }
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
+// K2 -- verify-specific fusion: rmsnorm + fp8 quantisation + the wq_b GEMV +
+// RoPE, ONE launch (`dsv41_gemm_fp8_mrows_rope_norm` below).
+// ===========================================================================
+// WHAT IT REPLACES. `attention_rows` (chain_dev.rs, the verify block) spends
+// FOUR projection-family launches on the q chain's tail:
+//     norm_rows(qr_r)         -> dsv41_rmsnorm_rows_kernel
+//     quant_rows(qr_r)        -> quant_kernel<0>          (block = 32)
+//     proj_mrows(wq_b)        -> gemm_fp8_mrows_kernel<M>
+//     apply_rope_mrows(q_r)   -> apply_rope_mrows_kernel
+// This kernel emits those four bodies back to back, each COPIED from its
+// reference, so the fused launch is the same program as the four-launch
+// sequence, per element (the per-segment arguments are below and in the
+// launcher). It is NOT `lin_rope_norm` / `gemm_fp8_mx_rope_norm` -- the EAGER
+// `m = 1` `gemm_fp8_gemv_kernel` family -- and shares no code with it.
+//
+// WHY NOT THAT ONE (the R2 post-mortem). `DSV41_ATTN_LIN_FUSE` re-pointed the
+// verify's `m == 1` path at EAGER's `gemm_fp8_mx2` + `gemm_fp8_mx_rope_norm`:
+// two programs from a DIFFERENT family than the `mrows` chain every other
+// verify row runs, "claimed but never measured" to be equivalent, and read from
+// a position source (`*pos_ctr` with mul/off/step) different from the per-row
+// `pos_rows[r]` this path uses everywhere else. It corrupted (61/65 counts,
+// ~100 characters then a "sequence reset"). This kernel removes both properties
+// STRUCTURALLY rather than by fixing a point: no EAGER kernel program takes
+// part, and the ONLY position source is `pos_rows[r]` -- there is no `pos_ctr`,
+// no `mul`, no `off` and no `step` anywhere in it.
+//
+// SEGMENTS, EACH WITH ITS REFERENCE:
+//   1a NORM   dsv41_rmsnorm_rows_kernel (the verify's `norm_rows`): identical
+//             blockDim-sized strided walk, `__shfl_down_sync` tree, thread-0
+//             cross-warp sequential sum, `rsqrtf(t/k + eps)`.
+//   1b WRITE  `norm_rows`'s in-place store, same `v`, same address, once each.
+//   1c QUANT  quant_kernel<0> (the verify's `quant_rows`, block = 32): same
+//             32-lane `__shfl_xor` amax, same `fast_round_scale(a, 1/448)`,
+//             same `max(..., 1e-30)`, same +-448 clamp, same `__nv_fp8_e4m3`.
+//   2  GEMM   gemm_fp8_mrows_kernel<M> (the verify's `proj_mrows`): staging
+//             layout, ascending-`kb` / `j = kb*32 + lane` walk, serial
+//             `acc[r] += av * wv` chain, `shfl_xor` tree -- verbatim (C1-C6).
+//   3  ROPE   apply_rope_mrows_kernel (the verify's `apply_rope_mrows`): same
+//             `t = pos_rows[r]`, same `cos[t*(rope_rd>>1) + i]` table index,
+//             same `(x0, x1)` pair, same rotation formula, same head region
+//             `[h*rope_hd + rope_hd - rope_rd, h*rope_hd + rope_hd)`.
+//
+// BLOCK = 1024 THREADS / 32 WARPS, AND THAT IS LOAD-BEARING. Segment 1a's
+// reduction tree is sized by `blockDim` (`i += blockDim.x` walk, `blockDim.x >> 5`
+// partial sums summed in warp order by thread 0). At the mrows block (256
+// threads) the partials would be combined in a DIFFERENT order -- k = 1280 gives
+// 5 elements/thread and 8 partials instead of 1-2 elements/thread and 32 -- and
+// float addition is not associative, so segment 1 would land ~1 ULP off per row.
+// `gemm_fp8_mx_rope_norm` pins 32 warps for exactly this reason (the NORM_FUSE
+// comment above). The consume geometry does NOT enter the parity argument (rows
+// are independent -- each warp owns its row's whole k-walk and its own shuffle
+// tree; the C1-C6 note above), so taking 32 warps costs nothing numerically.
+// It DOES cost occupancy: `ceil(n/32)` blocks (128 for wq_b's n = 4096) against
+// 148 SMs. Correctness first, and this is the same geometry `lin_rope_norm`
+// chose.
+//
+// SEGMENT 3's SHARED-MEMORY EXCHANGE -- WHY THE PAIR CANNOT STRADDLE A BLOCK.
+// A block owns 32 CONSECUTIVE output rows (`row = blockIdx.x*32 + warp`), and
+// segment 3 writes the pair (row, row+1) from the even one's warp. With
+// `rope_hd % 32 == 0` (a launcher decline) and `rope_rd` even, head h's last
+// pair sits at output row `h*rope_hd + rope_hd - 2`, whose warp offset is
+// `(rope_hd - 2) % 32 = 30`, so its partner is warp 31 of the same block. The
+// odd-offset warps are exactly the ones the `((lane_in - sect) & 1) == 0` test
+// rejects, so no pair is ever split across two blocks.
+//
+// THE SECOND `__syncthreads()` IS ALSO LOAD-BEARING: segment 2 writes all `n`
+// columns of `out[r]` (warp w+1 owns `row+1`) and segment 3 then OVERWRITES that
+// row's trailing `rope_rd` columns from warp w. Without the barrier the two
+// stores to the same address would be unordered and the result non-deterministic
+// (not "usually right" -- genuinely undefined). With it, every segment-2 write
+// happens-before every segment-3 write.
+//
+// `qr_norm_out` (the caller passes `s.qr_r`). Writing the normalised row back is
+// what keeps this fusion from owing any hidden state: `qr_r` leaves the launch
+// NORMALISED, exactly as `norm_rows(qr_r, q_norm, qr_r)` left it, so the
+// indexer's q half (the only other `qr_r` reader) needs no flag, no RAW branch
+// and no compensating launch -- the whole `s.qr_raw` / `s.qr_raw_r` /
+// `DSV41_INDEXER_QR_RAW` chain R2 needed disappears. `nullptr` is also legal
+// (then `qr_r` stays raw and the caller owes the normalisation), which is the
+// hook for a future mrows-shaped indexer entry; the shipped caller writes back.
+template <int M>
+__global__ void __launch_bounds__(1024)
+gemm_fp8_mrows_rope_norm_kernel(const float* __restrict__ qr_raw,
+                                const float* __restrict__ qr_w, float qr_eps,
+                                float* __restrict__ qr_norm_out, const uint8_t* __restrict__ w,
+                                const uint8_t* __restrict__ w_scale,
+                                const float* __restrict__ bias, float* __restrict__ out, int n,
+                                int k, int out_stride, const float* __restrict__ cos,
+                                const float* __restrict__ sin, const int* __restrict__ pos_rows,
+                                int rope_rd, int rope_hd, int rope_inverse, int a32) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (blockDim.x + 31) >> 5;  // 32, see the header
+    const int nb_k = k >> 5;
+    // smem: the block's weight rows | the 256-entry e4m3 table | the M activation
+    // scale rows (f32) | the M staged activation rows (fp8 bytes) -- the mrows
+    // layout, byte for byte, so the consume below reads exactly what `proj_mrows`
+    // read there -- | the norm reduction slots | the rope pair exchange.
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
+    float* s_as = s_lut + 256;
+    uint8_t* s_a = reinterpret_cast<uint8_t*>(s_as + (size_t)M * (size_t)nb_k);
+    float* s_red = reinterpret_cast<float*>(s_a + (size_t)M * (size_t)k);
+    float* s_rows = s_red + 32;
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // ---- segment 1: NORM (1a) + write-back (1b) + fp8 emission (1c), per row
+    #pragma unroll
+    for (int r = 0; r < M; ++r) {
+        const float* __restrict__ xr = qr_raw + (size_t)r * (size_t)k;
+        // 1a: `dsv41_rmsnorm_rows_kernel`'s sum of squares, term for term. The
+        // walk is the same `i += blockDim.x` because the block is the same 1024
+        // threads (`<M, 1024>` is the launch), which is the whole point of the
+        // header's blockDim note.
+        float ss = 0.f;
+        for (int i = threadIdx.x; i < k; i += blockDim.x) ss += xr[i] * xr[i];
+        // warp reduce - the single-row kernel's tree, verbatim
+        float part = ss;
+        for (int off = 16; off > 0; off >>= 1) part += __shfl_down_sync(0xffffffffu, part, off);
+        // Cross-warp reduce sized by blockDim: blockDim/32 partial sums, summed in
+        // warp order by thread 0 -- `rmsnorm_kernel`'s form, not a reassociation.
+        if (lane == 0) s_red[warp] = part;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float t = 0.f;
+            for (int i = 0; i < nwarps; i++) t += s_red[i];
+            s_red[0] = rsqrtf(t / k + qr_eps);
+        }
+        __syncthreads();
+        const float inv = s_red[0];
+        // 1b + 1c in ONE pass. SAFE BECAUSE THE TWO REFERENCES TOUCH EXACTLY THIS
+        // THREAD'S ELEMENTS: `norm_rows` stores `xr[i]*inv*w[i]` and
+        // `quant_rows` then re-reads that store; both walks are `i += blockDim.x`
+        // over the same 1024 threads, so element i is read and written by one
+        // thread only (`out` may alias `x`, the same aliasing `rmsnorm_rows`
+        // documents). And `quant_kernel<0>`'s `block = 32` group is exactly one
+        // warp's 32 lanes here -- `i >> 5` is the group index `b` and this warp's
+        // butterfly max covers precisely the elements `[32b, 32b+32)`, so `sc` is
+        // the group's own scale written by its lane 0, as there.
+        for (int i = threadIdx.x; i < k; i += blockDim.x) {
+            const float v = xr[i] * inv * qr_w[i];
+            if (qr_norm_out != nullptr) qr_norm_out[(size_t)r * (size_t)k + i] = v;
+            float a = fabsf(v);
+            for (int off = 16; off > 0; off >>= 1)
+                a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
+            const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
+            if (lane == 0) s_as[(size_t)r * nb_k + (i >> 5)] = sc;
+            const float sc_inv = 1.0f / sc;
+            const __nv_fp8_e4m3 q = __nv_fp8_e4m3(fminf(fmaxf(v * sc_inv, -448.0f), 448.0f));
+            s_a[(size_t)r * (size_t)k + i] = *(const uint8_t*)&q;
+        }
+        // This barrier is for BOTH the next row's `s_red` reuse (row r+1 writes
+        // `s_red[warp]` before its own read of `s_red[0]`) and `s_a`/`s_as`
+        // completeness (the explicit barrier below the weight staging covers that
+        // too, but every row's staging must be done before the consume either
+        // way).
+        __syncthreads();
+    }
+    // ---- segment 2: the staged fp8 GEMV, verbatim from `gemm_fp8_mrows_kernel`
+    const int row = blockIdx.x * nwarps + warp;
+    const bool active = row < n;
+    if (active) {
+        const uint8_t* __restrict__ wr = w + (size_t)row * (size_t)k;
+        uint8_t* __restrict__ row_s = s_w + (size_t)warp * (size_t)k;
+        const int n16 = k >> 4;
+        for (int i = lane; i < n16; i += 32) dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+        for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+        dsv41_cp_commit();
+    }
+    // The transfer overlaps the tail warps' barrier wait; only the warps that
+    // issued a copy need to retire it, and `active` is uniform within a warp.
+    __syncthreads();
+    if (active) {
+        dsv41_cp_wait_all();
+        __syncwarp();
+        const uint8_t* __restrict__ wsr = w_scale + (size_t)(row >> 5) * (size_t)nb_k;
+        float acc[M];
+        #pragma unroll
+        for (int r = 0; r < M; ++r) acc[r] = 0.f;
+        if (a32) {
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = kb * 32 + lane;
+                const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+                float af[M];
+                #pragma unroll
+                for (int r = 0; r < M; ++r)
+                    af[r] = s_lut[s_a[(size_t)r * (size_t)k + j]] *
+                            s_as[(size_t)r * nb_k + (j >> 5)];
+                #pragma unroll
+                for (int r = 0; r < M; ++r) acc[r] += af[r] * wv;
+            }
+        } else {
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = kb * 32 + lane;
+                const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+                #pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    const float av =
+                        s_lut[s_a[(size_t)r * (size_t)k + j]] * s_as[(size_t)r * nb_k + (j >> 5)];
+                    acc[r] += av * wv;
+                }
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float a_r = acc[r];
+            for (int off = 16; off > 0; off >>= 1) a_r += __shfl_xor_sync(0xFFFFFFFFu, a_r, off);
+            if (lane == 0) {
+                const float v = a_r + (bias != nullptr ? bias[row] : 0.f);
+                // The mrows write, verbatim -- and the same value into `s_rows`,
+                // because segment 3 needs the pair `(row, row+1)` and those two
+                // output rows live in two different warps of this block.
+                out[(size_t)r * (size_t)out_stride + row] = v;
+                s_rows[(size_t)r * 32 + warp] = v;
+            }
+        }
+    }
+    // Every segment-2 store happens before every segment-3 store (see the header
+    // note): without this the pair's odd element would have two unordered writers.
+    __syncthreads();
+    // ---- segment 3: the RoPE epilogue, `apply_rope_mrows_kernel`'s body
+    if (active) {
+        const int lane_in = row % rope_hd;
+        const int sect = rope_hd - rope_rd;
+        if (lane_in >= sect && ((lane_in - sect) & 1) == 0 && warp + 1 < nwarps && row + 1 < n) {
+            const int i = (lane_in - sect) >> 1;
+            if (lane == 0) {
+                #pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    // The row's position, READ FROM THE DEVICE ARRAY -- never from
+                    // `pos_ctr`, and no mul/off/step exists here (`apply_rope_mrows`
+                    // :2012 is this line).
+                    const int t = pos_rows[r];
+                    const float c = cos[(size_t)t * (rope_rd >> 1) + i];
+                    const float sn =
+                        sin[(size_t)t * (rope_rd >> 1) + i] * (rope_inverse ? -1.f : 1.f);
+                    const float x0 = s_rows[(size_t)r * 32 + warp];
+                    const float x1 = s_rows[(size_t)r * 32 + warp + 1];
+                    float* p = out + (size_t)r * (size_t)out_stride + row;
+                    p[0] = x0 * c - x1 * sn;
+                    p[1] = x0 * sn + x1 * c;
+                }
+            }
+        }
+    }
+}
+
+// See the kernel header above for the four-segment parity argument.
+// Returns 0 (launched) or 2 (declined). NEVER 1 -- 1 collides with
+// cudaErrorInvalidValue (the r42-45 argument the mrows entry records), and every
+// decline here is a shape / mode property the caller can fall back on: it keeps
+// its `norm_rows + quant_rows + proj_mrows + apply_rope_mrows` sequence, whose
+// numerics this kernel reproduces by construction.
+//
+// ABI: (qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, m, n, k,
+//       out_stride, rope_cos, rope_sin, pos_rows, rope_rd, rope_hd,
+//       rope_inverse, stream)  -- stream LAST, as in `dsv41_gemm_fp8_mrows`.
+//   qr_raw      [m, k] f32, the wq_a RAW output (row r at +r*k)
+//   qr_w        [k] f32, the q norm's weight row
+//   qr_norm_out [m, k] f32, the normalised rows; MAY be `qr_raw` (in place) and
+//               MAY be nullptr (then the caller owes the normalisation)
+//   w/w_scale   the wq_b fp8 weight, as in `dsv41_gemm_fp8_mrows`
+//   out         f32, row r's element `row` at +r*out_stride + row
+//   pos_rows    [m] i32, THE position of row r -- the only position source
+//   rope_rd / rope_hd  the rotation width and the head stride; the rotated
+//               region of a head is `[h*rope_hd + rope_hd - rope_rd, ..., +rope_rd)`
+extern "C" int dsv41_gemm_fp8_mrows_rope_norm(
+    const float* qr_raw, const float* qr_w, float qr_eps, float* qr_norm_out, const uint8_t* w,
+    const uint8_t* w_scale, const float* bias, float* out, int m, int n, int k, int out_stride,
+    const float* rope_cos, const float* rope_sin, const int* pos_rows, int rope_rd, int rope_hd,
+    int rope_inverse, cudaStream_t s) {
+    if (m <= 0 || m > 8) return 2;
+    if (n <= 0 || k <= 0 || (k & 31) || (n & 31)) return 2;
+    if (out_stride < n) return 2;
+    if (rope_rd <= 0 || (rope_rd & 1) || rope_rd > rope_hd) return 2;
+    // The 32-warp pair exchange's no-straddle argument needs `rope_hd` to be a
+    // multiple of the warp count (see the kernel header). Shape-carrying, so it
+    // is a decline, not an assertion.
+    if (rope_hd & 31) return 2;
+    if (qr_raw == nullptr || qr_w == nullptr || w == nullptr || w_scale == nullptr ||
+        out == nullptr || rope_cos == nullptr || rope_sin == nullptr || pos_rows == nullptr)
+        return 2;
+    // The segments' parity argument is the ORDER-PRESERVING consume form. The
+    // vectorised/scalar gemv arms (mode 0/1) reorder a lane's elements, and with
+    // the M=1 GEMV disabled the m=1 program is the MMA tile instead -- a
+    // different expression entirely. Either way the caller keeps its sequence.
+    if (g_gemv_fp8_mode < 3) return 2;
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    const int nwarps = 32;  // the prologue's reduction tree, see the header
+    const int nb_k = k >> 5;
+    const int blocks = (n + nwarps - 1) / nwarps;
+    const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
+                        (size_t)m * (size_t)nb_k * sizeof(float) + (size_t)m * (size_t)k +
+                        (size_t)32 * sizeof(float) + (size_t)m * 32 * sizeof(float);
+    if ((int)smem > dsv41_smem_ceiling(gemm_fp8_mrows_rope_norm_kernel<1>)) return 2;
+    if (smem > 48 * 1024) {
+        // Per-kernel ceiling, not this call's need: a sticky attribute set to a
+        // smaller value would silently cap later launches (round-43 revert).
+        // EVERY M specialisation needs its own attribute: the launch below picks
+        // `gemm_fp8_mrows_rope_norm_kernel<m>`, and setting only <1> left <m> at
+        // the 48KB default -> cudaErrorInvalidValue (the m=5 case the mrows
+        // launcher documents).
+        cudaError_t e = cudaSuccess;
+        // `cudaError_t` is an enum - no `|=`. Each specialisation gets its own
+        // call; the first failure is what the caller sees.
+#define FERRITE_SET_K2_SMEM(k)                                                        \
+    do {                                                                              \
+        cudaError_t r = cudaFuncSetAttribute(                                         \
+            gemm_fp8_mrows_rope_norm_kernel<k>,                                       \
+            cudaFuncAttributeMaxDynamicSharedMemorySize,                              \
+            dsv41_smem_ceiling(gemm_fp8_mrows_rope_norm_kernel<k>));                   \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                              \
+    } while (0)
+        FERRITE_SET_K2_SMEM(1);
+        FERRITE_SET_K2_SMEM(2);
+        FERRITE_SET_K2_SMEM(3);
+        FERRITE_SET_K2_SMEM(4);
+        FERRITE_SET_K2_SMEM(5);
+        FERRITE_SET_K2_SMEM(6);
+        FERRITE_SET_K2_SMEM(7);
+        FERRITE_SET_K2_SMEM(8);
+#undef FERRITE_SET_K2_SMEM
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    const dim3 grid(blocks);
+    const int a32 = (int)g_gemv_a32;
+    switch (m) {
+        case 1: gemm_fp8_mrows_rope_norm_kernel<1><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 2: gemm_fp8_mrows_rope_norm_kernel<2><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 3: gemm_fp8_mrows_rope_norm_kernel<3><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 4: gemm_fp8_mrows_rope_norm_kernel<4><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 5: gemm_fp8_mrows_rope_norm_kernel<5><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 6: gemm_fp8_mrows_rope_norm_kernel<6><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 7: gemm_fp8_mrows_rope_norm_kernel<7><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        case 8: gemm_fp8_mrows_rope_norm_kernel<8><<<grid, nwarps * 32, smem, s>>>(
+                    qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, n, k, out_stride,
+                    rope_cos, rope_sin, pos_rows, rope_rd, rope_hd, rope_inverse, a32); break;
+        default: return 2;
+    }
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
 // Grouped low-rank OUTPUT projection, weight-stationary over the row batch
 // (`dsv41_wo_a_grouped_fp8` below). The DSpark draft's attention tail.
 // ===========================================================================

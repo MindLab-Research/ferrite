@@ -530,6 +530,35 @@ struct Kernels {
             c_int, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // K1 (`dsv41_gemm_fp8_mrows2`, from dsv41_kernels.cu): the TWO-FAMILY form of
+    // the multi-row fp8 GEMV above -- the verify's wq_a + wkv pair in ONE launch,
+    // since both project the SAME quantised activation row with the same `k`.
+    // The warp's output row selects its family (`row < n1`), so the two
+    // projections share one grid, one block prologue and one graph node; the
+    // code is `gemm_fp8_mrows_kernel<M>` with four `fam1 ? x1 : x2` base
+    // selections, so row `row` is bit-identical to the same row of the two
+    // separate `dsv41_gemm_fp8_mrows` launches it replaces (the kernel header
+    // carries C1-C6 and the fuse argument).
+    //
+    // TWO output strides (one per family), not one: the wq_a row strides by `ql`
+    // while the wkv row strides by `hd`, and those differ (1280 vs 512). That is
+    // the single ABI deviation from the design doc's §3.2 signature, which
+    // carries one `out_stride`.
+    //
+    // Optional: a stale .so without the symbol keeps the two `gemm_fp8_mrows`
+    // launches, and the C entry returns 2 (declined, never
+    // cudaErrorInvalidValue) for `m` outside 1..=8, `k` not a multiple of 32,
+    // `out_stride_f < n_f`, a null pointer, or a run configured for the
+    // reordering `DSV41_GEMV_FP8_MODE` 0/1 arms / `DSV41_NO_GEMV_FP8`.
+    // ABI: (a, a_scale, w1, w1_scale, bias1, out1, n1, out_stride1,
+    //       w2, w2_scale, bias2, out2, n2, out_stride2, m, k, s).
+    gemm_fp8_mrows2: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, *const u8, *const u8, *const f32, *mut f32, c_int, c_int,
+            c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
@@ -1282,6 +1311,7 @@ impl Device {
             bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
+            gemm_fp8_mrows2: ko!(rt, "dsv41_gemm_fp8_mrows2"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -4161,6 +4191,84 @@ impl Device {
     /// per-row loop, which is the bit-exact reference they were verified against.
     pub fn supports_gemm_fp8_mrows(&self) -> bool {
         self.kernels.gemm_fp8_mrows.is_some()
+    }
+
+    /// K1: the two-family form of [`Self::gemm_fp8_mrows`] — two projections of
+    /// the SAME activation row (the verify's wq_a + wkv) in ONE launch. Row `row`
+    /// of family `f` is bit-identical to row `row` of the separate
+    /// `gemm_fp8_mrows` launch for that family (the kernel header carries the
+    /// C1-C6 argument and the warp-level family split).
+    ///
+    /// TWO output strides: the wq_a output row strides by `ql`, the wkv row by
+    /// `hd`, and those differ — a single stride cannot address both buffers (the
+    /// one ABI deviation from the design doc's §3.2 signature).
+    ///
+    /// `Ok(false)` means NOT performed — the caller runs its two
+    /// `gemm_fp8_mrows` launches: either the loaded .so predates the symbol, or
+    /// the C entry declined (it returns 2, never cudaErrorInvalidValue, so a
+    /// decline can never read as a launch failure). `rows` outside 1..=8 is
+    /// refused here as well, the same bound the template dispatch covers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mrows2(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w1: *const u8,
+        w1_scale: *const u8,
+        out1: *mut f32,
+        n1: i32,
+        out_stride1: i32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        out2: *mut f32,
+        n2: i32,
+        out_stride2: i32,
+        rows: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mrows2 else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        // `bias` is null for both families (the projection sites have none); it is
+        // a parameter only so the epilogue's `acc + (bias ? bias[rrow] : 0.f)` is
+        // the very same expression the single-family kernel emits.
+        let rc = unsafe {
+            f(
+                a,
+                a_scale,
+                w1,
+                w1_scale,
+                std::ptr::null(),
+                out1,
+                n1,
+                out_stride1,
+                w2,
+                w2_scale,
+                std::ptr::null(),
+                out2,
+                n2,
+                out_stride2,
+                rows,
+                k,
+                self.stream,
+            )
+        };
+        // 2 = the kernel's "declined" (shape/mode), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mrows2")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries K1 (`dsv41_gemm_fp8_mrows2`). A stale
+    /// .so leaves the wq_a / wkv pair on its two `proj_mrows` launches, which are
+    /// the bit-exact reference K1 is verified against.
+    pub fn supports_gemm_fp8_mrows2(&self) -> bool {
+        self.kernels.gemm_fp8_mrows2.is_some()
     }
 
     /// Fused M=1 gate GEMV + MoE route: ONE launch where `gemv_bf16_command` +

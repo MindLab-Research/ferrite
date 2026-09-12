@@ -2140,6 +2140,34 @@ fn attn_lin_fuse() -> AttnLinFuse {
     })
 }
 
+/// K1 (DSV41_ATTN_MROWS2, **DEFAULT OFF** — A/B first): `attention_rows` runs
+/// the verify's wq_a + wkv pair as ONE two-family `gemm_fp8_mrows2` launch
+/// instead of two `proj_mrows` launches. This is the R2 replacement's first half
+/// (`docs/agent/verify-specific-fusion-kernel-design.md` §3).
+///
+/// WHY IT IS NOT R2. R2 reused EAGER's `lin2` (`gemm_fp8_mx2`), a DIFFERENT
+/// program from the mrows family the verify path uses, and it touched the
+/// single-row scratch `s.xq`/`s.xsc`; both classes of risk are excluded here by
+/// construction. K1's kernel is `gemm_fp8_mrows_kernel<M>` with the family folded
+/// in as four base-pointer selections (weight / scale / output base / row index),
+/// so the K walk, the `acc[r] += av * wv` chain, the `shfl_xor` tree and the
+/// staged bytes are the mrows kernel's, verbatim: row `row` of family `f` is
+/// bit-identical to row `row` of the `gemm_fp8_mrows` launch it replaces. The
+/// activation source stays `s.xq_r`/`s.xsc_r` (the caller's own `quant_rows`),
+/// never `s.xq`/`s.xsc`, and no `quant1` consume-once flag is involved.
+///
+/// Default OFF: unset is byte-identical to the previous behaviour. A stale .so
+/// without the symbol, a declined shape, or this gate off falls straight through
+/// to the two `proj_mrows` launches, which are K1's bit-exact reference.
+///
+/// PRECEDENCE: when K1 and R2's `lin2` half are BOTH enabled, K1 runs (it is the
+/// verified-safe program) and R2's half is not reached. Both gates default OFF,
+/// so this only decides the meaning of a configuration nobody ships.
+fn attn_mrows2() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ATTN_MROWS2").map(|v| v == "1").unwrap_or(false))
+}
+
 /// R2's two halves, selected by `DSV41_ATTN_LIN_FUSE` (see [`attn_lin_fuse`]).
 ///
 /// R2 shipped as one on/off gate over TWO independent fusions, and a corruption
@@ -4335,6 +4363,63 @@ impl<'a> DevChain<'a> {
             n,
             k,
             out_stride,
+        )
+    }
+
+    /// K1 (DSV41_ATTN_MROWS2, default OFF): the two-family form of
+    /// [`Self::proj_mrows`] — the verify's wq_a + wkv pair in ONE launch, since
+    /// both project the SAME quantised activation row (`s.xq_r`/`s.xsc_r`,
+    /// written once by the caller's `quant_rows`) with the same `k`. The code is
+    /// `gemm_fp8_mrows_kernel<M>` with the family folded in as four base-pointer
+    /// selections, so row `row` of family `f` is bit-identical to row `row` of
+    /// the separate `gemm_fp8_mrows` launch it replaces (the kernel header
+    /// carries C1-C6 and the warp-level family split argument).
+    ///
+    /// `Ok(false)` = NOT performed — the caller keeps its two `proj_mrows`
+    /// launches. It declines when the loaded .so lacks the symbol, the C entry
+    /// declines the shape, or the swapAB opt-in is on (that arm is explicitly
+    /// NOT bit-identical to the SIMT gemv and keeps its own kernel — the same
+    /// exclusion [`Self::proj_mrows`] applies).
+    ///
+    /// `out_stride_q`/`out_stride_kv` are separate because the wq_a output row
+    /// strides by `ql` and the wkv row by `hd`. They equal `n_q`/`n_kv` at this
+    /// call site (both output blocks are dense `[m, n]` rows) and are passed
+    /// explicitly anyway, mirroring [`Self::proj_mrows`]'s own `out_stride`
+    /// parameter rather than assuming a layout.
+    #[allow(clippy::too_many_arguments)]
+    fn proj_mrows2(
+        &self,
+        w_q: *const u8,
+        ws_q: *const u8,
+        out_q: *mut f32,
+        n_q: i32,
+        out_stride_q: i32,
+        w_kv: *const u8,
+        ws_kv: *const u8,
+        out_kv: *mut f32,
+        n_kv: i32,
+        out_stride_kv: i32,
+        rows: usize,
+        k: i32,
+    ) -> Result<bool> {
+        if Self::swapab() {
+            return Ok(false);
+        }
+        self.dev.gemm_fp8_mrows2(
+            self.s.xq_r.ptr as *const u8,
+            self.s.xsc_r.ptr as *const f32,
+            w_q,
+            ws_q,
+            out_q,
+            n_q,
+            out_stride_q,
+            w_kv,
+            ws_kv,
+            out_kv,
+            n_kv,
+            out_stride_kv,
+            rows as i32,
+            k,
         )
     }
 
@@ -9650,6 +9735,14 @@ impl<'a> DevChain<'a> {
         // contiguous [m, ql] block, and row `r`'s output is bit-identical to the
         // per-row `n = 1` call it replaces.
         let mrows = self.dev.supports_gemm_fp8_mrows() && !Self::swapab() && m <= VERIFY_ROWS;
+        // K1 (DSV41_ATTN_MROWS2, default OFF): the wq_a + wkv pair as ONE
+        // two-family `gemm_fp8_mrows2` launch (see [`attn_mrows2`] and
+        // [`Self::proj_mrows2`]) — the R2 replacement's first half. Checked
+        // BEFORE R2's `lin2_gate` below: when both gates are on K1 runs (it is the
+        // same-program fusion; R2's is the EAGER-program one that was found
+        // corrupt). Both default OFF, so an unset environment is unchanged.
+        let mrows2 =
+            attn_mrows2() && self.dev.supports_gemm_fp8_mrows2() && !Self::swapab() && m <= VERIFY_ROWS;
         // R2 (DSV41_ATTN_LIN_FUSE, default OFF): at `m == 1` reuse EAGER's
         // single-row fusions — `lin2` (wq_a + wkv over ONE shared `xq`) and,
         // below, `lin_rope_norm` (norm + wq_b + rope in one launch). Both
@@ -9664,7 +9757,30 @@ impl<'a> DevChain<'a> {
         let lin_gate = attn_lin_fuse();
         let lin2_gate = lin_gate.lin2() && m == 1 && !Self::swapab();
         let rope_norm_gate = lin_gate.rope_norm() && m == 1 && !Self::swapab();
-        let took_akv = if lin2_gate {
+        let took_akv = if mrows2 {
+            // K1: ONE two-family launch for wq_a + wkv. The activation is the
+            // same single `quant_rows` the mrows branch below issues, so the fp8
+            // bytes the fused GEMV consumes are exactly the ones two separate
+            // `proj_mrows` launches would have consumed. On a decline
+            // (`proj_mrows2` -> `Ok(false)`) the whole `took_akv` is false and the
+            // per-row loop below runs — the same fallback the mrows branch has,
+            // and bit-identical by construction.
+            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            self.proj_mrows2(
+                ld.wq_a.as_ref().unwrap().as_u8(),
+                ld.wq_a_scale.as_ref().unwrap().as_u8(),
+                self.s.qr_r.ptr as *mut f32,
+                ql as i32,
+                ql as i32,
+                ld.wkv.as_ref().unwrap().as_u8(),
+                ld.wkv_scale.as_ref().unwrap().as_u8(),
+                self.s.kv_r.ptr as *mut f32,
+                hd as i32,
+                hd as i32,
+                m,
+                dim as i32,
+            )?
+        } else if lin2_gate {
             // The EAGER call verbatim, with this path's `_r` buffers as the
             // destinations: `quant1` + `gemm_fp8_mx2` write row 0 of `qr_r` /
             // `kv_r`, i.e. the bytes `proj_mrows` wrote for row 0. The GEMV
