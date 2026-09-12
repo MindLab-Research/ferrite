@@ -4921,3 +4921,31 @@ DSV41_VERIFY_FORK=1             # FORK
 **引擎的性能成果**（技术层面完全有效）：
 - 干净栈：90.8 tok/s（+15.2%）——计数前 61 行验证正确
 - R2 +10.2% + MARKOV +3.2% + VERIFY_FORK +1.5%
+
+## SWALLOW epoch pad 测试的准备（实施完成后的验证）
+
+**测试配置**（epoch pad 实施后）：
+```bash
+# 干净栈 + SWALLOW + epoch pad
+DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1
+DSV41_SWALLOW_EPOCH_PAD=1    # 第 9 次修复的 gate（默认 OFF）
+DSV41_V5_LEDGER=1             # D1 观测（每步打印 epoch 增量）
+# + 干净栈（base + R2 + MARKOV + LAZY_SDR + VERIFY_FORK）
+```
+
+**验证矩阵**（swallow-9th-fix-design 的建议）：
+| 测试 | 配置 | 目的 | 判据 |
+|---|---|---|---|
+| T0 | D1 only（LEDGER=1，无 pad）| **先定位**——每 rank epoch 增量 | 增量相同=非轮次差；不同=定位到 rank/步 |
+| T1 | D1+D2（LEDGER + PAD）| 计数 1-200 | 0 ar5-hang + epoch 增量=165 |
+| T2 | 同 T1 + 出师表 | 红线 | 与 EAGER 退化一致 |
+| T3 | 长跑 | 防假解锁（跨 pos>128 的 draft_graph 激活点）| 全程 0 hang |
+
+**关键指标**：
+1. `[v5-ledger]` 的每 rank epoch 增量逐 step 相等（D2 的直接验收）
+2. `[ar5-hang]` 行数 = 0（分开计 argmax_rows 与 pubred！）
+3. 吞吐：batched 的 weight-sharing（如果 hang 修复）
+
+**预期**（如果 epoch pad 成功）：
+- batched 路径解锁 → 理论 ~480（accept 5）/ ~320（accept 3）
+- **400 的唯一路径打开！**
