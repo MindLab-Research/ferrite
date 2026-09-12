@@ -2211,3 +2211,23 @@ DSV41_BF16_TRUNCATE=1
 **Wave 1 的准确数据**（日志值）：
 - `[dsv41] step pos=105: 25.17ms` ← 这是准确的步时
 - 之前报告的 "87 tok/s" 是从步时+accept 估算的——需要用日志的实际生成时间来验证
+
+## 🔴🔴 用户的 step 计时纠正（第二次强调——之前理解不完整）
+
+**用户说**："你看你日志里波动那么大明显倒推，倒推的一定是错的。真的step time极其稳定，你要写文档记录一定不能用假的指标"
+
+**代码确认**（serve.rs:450-455 的自述注释）：
+```
+// the tail segment ended when the NEXT request's prefill arrived, so
+// curl/HTTP/admission latency was spread over the tail steps.
+// Together they made a uniform ~37 ms/step read as "18 ms early, 38 ms late"
+```
+
+**判定**：
+1. `[dsv41] step pos=X: Y ms` 行**不是准确计时**——受 tail/curl/HTTP/admission 延迟影响
+2. **准确计时在 `[dspark] steps=N ... verify=X ms draft=Y ms commit=Z ms` 行**——模型内部测量
+3. **真的 step time 极其稳定**——波动 25-45ms 是测量伪影，不是真实变化
+
+**Wave 1 的"25.17ms"需要重新验证**——用 [dspark] steps 行的 verify_ms + draft_ms + commit_ms 而不是 [dsv41] step 行。
+
+**所有历史步时报告需要用准确指标重写**。
