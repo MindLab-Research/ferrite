@@ -3730,3 +3730,34 @@ self.dev.gemm_fp8_mx_rope_norm(
 1. ATTN_LIN_FUSE=2 + 计数任务（验证数字顺序 + 测吞吐）
 2. K2 实施完成后替代 lin_rope_norm
 3. 全栈 = base + lin2 + K2 + 其他验证过的优化
+
+## 📋 Session 的核心教训（指导未来工作）
+
+### 教训 1：EAGER 复用必须"同程序或 bust"
+- **R2 的 lin_rope_norm 损坏**：EAGER 的 kernel 与 verify 的 kernel 是不同程序（不同 warp helpers、vec modes、decline 码）——构造性"逐位等价"论证在真实形状下不成立
+- **K1/K2 的原则**：不换程序只搬代码——每一融合段都以 verify 自己今日在用的 kernel 为逐位参照
+- **例外**：lin2 的 gemm_fp8_mx2 意外干净（bisect4 验证）——但不能推广（lin_rope_norm 就坏）
+
+### 教训 2：验证纪律（三重检查缺一不可）
+1. **拉丁检查不够**——R2 的计数测试"干净"但数字错了（61-65 → 12-15）！必须验证数字顺序
+2. **短测试不够**——数值差异在 ~60 token 后级联——1000 token 预算的出师表才能暴露
+3. **构造性论证不够**——必须真实形状的逐字节 diff（kernel parity 测试）
+
+### 教训 3：测试口径的陷阱（两次掉坑）
+1. **端到端吞吐反推步时**（含 prefill）→ 第一次口径错误（33ms）
+2. **accept-1.1 的步时配 accept-5 的 tok/step** → 第二次口径错误（"266 tok/s"）
+- **规则**：步时必须用 [dspark] steps 行或 nsys；吞吐必须 end-to-end；两者不可混算
+
+### 教训 4："数值中性"优化可能不是中性的
+- **MARKOV_SLICED**：logits 行偏移双重计算（host +step*seg + kernel +step*n）→ step s 读 row 2s
+- **LAZY_SDR**：set_pos_ctr 是承重构件（per-row rope 读它）不是 readback
+- **规则**：任何优化的 accept 前后必须一致；k_acc 序列逐位比较
+
+### 教训 5：SWALLOW 的 ar5-hang 是多根因的
+- 8 次修复尝试全失败（臂足迹 + argmax 轮次 + 更多）
+- **教训**：修一个暴露另一个——需要系统性分析全部轮次源而不是逐个修
+
+### 教训 6：kernel 的物理特性
+- **instruction-bound 不是 bandwidth-bound**（0.7-4.9% 峰值带宽）——省字节≈0
+- **warp-per-row 决定 M 只加每 warp 工作量**——batched 的权重共享不生效
+- **SH_PAIR 是唯一"M 进 grid"的折法**——真共享的唯一机制
