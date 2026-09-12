@@ -104,7 +104,7 @@ const _: () = assert!(
 /// (`SEED_ALIGN`/`SWALLOW`). A third shape (the parity self-test varies `m`)
 /// takes the direct launches. Each slot is an independent graph (its own
 /// DRY→capture schedule, its own failure latch).
-const VERIFY_GRAPH_SLOTS: usize = 2;
+const VERIFY_GRAPH_SLOTS: usize = 3;
 
 /// What one shadow-mode DSpark step observed. See
 /// [`DevChain::dspark_shadow_step`] for the orchestration: the step runs the
