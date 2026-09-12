@@ -920,3 +920,12 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 - 第 3 步（待做）：draft 内部的截断——draft 链的 hc_collapse/hc_front 也传 bf16_truncate()（dspark_dev.rs 的 2 处已传——eager-bf16-truncate subagent 已做 ✓）
 
 **预期**：如果 64% 拒绝主要来自数值错位（而非 MTP head 能力），对齐后 accept 应显著提升。sglang 的 accept 5 是同一 head 的上限证明。
+
+## Tap 截断的数值域精确分析（不是位等价，是"更近"）
+
+**官方的 tap 精度链**：44 层的残差流全程 bf16（每层边界截断）→ tap 在层 37/38/39 捕获时已是"44 次 bf16 截断后的值"。
+**ferrite + tap 截断**：44 层的残差流全程 f32（无中间截断）→ tap 捕获后做**一次** bf16 round-trip。
+
+**结论**：ferrite 的 tap 值 = f32 精确计算后截断一次；官方的 = bf16 逐步截断的累积。两者**不是位等价**——ferrite 更精确（中间无损失），但最终 dtype 对齐。~2.4% 的 norm 偏差会保留（来自中间层的精度差）。
+
+**对 accept 的影响**：draft 的输入 dtype 对齐（bf16）可能改善 MTP head 的预测（head 在 bf16 输入上训练），但中间值的精度差仍在。**效果只能实测**——如果 accept 提升显著，说明 MTP head 对输入 dtype 敏感；如果不变，说明 head 对中间精度差不敏感。
