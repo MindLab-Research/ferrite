@@ -36,3 +36,8 @@
 - 数字任务（1 数到 100）：EAGER 完美（LEN 216，仅 "anao"、跳 50 等个别瑕疵）。
 - 出师表：EAGER LEN 146、双字 3。
 - spec 的验收 = 两个任务与 EAGER 同水平（mismatch=0、无双字、无乱码）。
+
+## 会话教训（新增）
+
+1. **单一 GPU 测试驱动**：同一台远端上**同时只能有一个测试驱动**（主 agent 或一个 subagent，不可两者并发）——2026-09-12 的 build-id mismatch 事故（.so HEAD 7da4bef7 vs 二进制 HEAD cee7cffd）就是两个驱动并发 `git reset + build.sh + cargo build` 交错产出的不同源组合（门禁正确拒绝，但浪费了整轮测试）。**subagent 一律只做代码/分析，GPU 测试由主 agent 串行执行**。
+2. **不轮询远端状态**：后台任务的输出会自动注入；反复跑同一条 `stat/grep` 查询既浪费轮次又违反"持续工作"的要求。启动测试后做本地实事（代码/审计/提交），等通知。
