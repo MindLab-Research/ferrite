@@ -3411,3 +3411,17 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 4. **全栈共存 ✓**——所有优化安全叠加
 
 **下一步**：+ ring+window（刚提交的 DSV41_RING_WIN_FUSE）→ 预期 84.5-85？
+
+## 🚨 红线违规：全栈+RING_WIN_FUSE 的出师表出现拉丁碎片（3d86b1c5）
+
+**结果**：
+- LEN=218，**拉丁=['opa', 'eba', 'denominaci', 'Poundshenyasc']**——红线违规！
+- 前 ~100 字正确（"先帝创业未半而中道崩殂...诚宜开张圣听"），然后 "opa" 出现，之后退化
+- 0 ar5-hang ✓（不 hang 但输出损坏）
+
+**嫌疑分析**：
+- **RING_WIN_FUSE 是本测试唯一的新增**（前一个 c65e9269 不含它且干净）
+- 损坏出现在特定位置（~token 100）——与 ring/window 的位置依赖（slot = pos % window）一致
+- ring+window 融合版可能在这个位置处理错误
+
+**立即行动**：二分验证——不带 RING_WIN_FUSE 重跑出师表（确认之前的栈仍然干净）
