@@ -1105,3 +1105,23 @@ draft-numerical-audit 找到 5 个严重缺陷（当前 accept 1.02 vs sglang ~5
 ## Oracle 修复完成（P3-9）——host 的 rope 相位对齐官方
 
 dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转从 `start_pos+bs+r` 改为 `start_pos+seqlen+r` = `start_pos+1+r`），显式引入 `seqlen=1` 变量对齐官方公式。10 个 CPU 测试通过（含 chain_smoke 的真实 host decode 路径）。**parity 测试不受影响**（dspark_parity 用 device 自身做 draft，不用 host oracle）。修正暴露的是 device/host 的真实分歧（此前 host 把相位整体后移 bs-1 个位置）。
+
+## P0 战役的中期发现（重要修正）
+
+### P0-3+P1-5 组合测试也产生拉丁（fe0346de）
+- TAP_INPUT=1 + DRAFT_BF16_DOMAIN=1 → **与 P0-1 seed 修复完全相同的拉丁**（ellantdot 等，LEN=249，双字=15）
+- seed 回退确认在 binary 中（ecac8c5 已推送）——拉丁来自 P0-3 或 P1-5
+- **疑点**：不同机制（tap 内容 vs seed 位置）产生相同退化——暗示共同路径
+- **p03-degradation-analysis subagent 正在分析**：为什么改 draft 输入会导致 committed tokens 变垃圾
+
+### step-time-squeeze 的性能判定
+- 剩余 5 个候选总共只能凑 **~0.55ms**（不是 1.2ms）
+- attention m-rows：TP8 + 长上下文双 decline → **收益 = 0**
+- compressor multi-row：**最佳候选**（−0.3ms）→ subagent 实现中
+- 400 @ accept 3 需要步时 ≤10ms——**batched verify + 全 mrows 是唯一路径**
+
+### 行动
+- 基线诊断测试（694793e4）确认零拉丁恢复
+- P0-3/P1-5 的退化根因分析（subagent）
+- compressor multi-row（subagent）
+- winrows co-fix（subagent）
