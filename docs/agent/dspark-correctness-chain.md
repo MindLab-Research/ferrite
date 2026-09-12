@@ -2863,3 +2863,24 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **判定**：SH_PAIR template<M=1> 在 lazy verify 下正确工作！parity 的 2 个剩余 failure（prod/m=6）不影响 lazy（m=1）。**SH_PAIR_M=1 可以立即启用！**
 
 **下一步**：lazy + SH_PAIR_M=1 + DRAFT_GRAPH=1（L6——400 的最后一块拼图）
+
+## L1-L6 完整优化栈（400 的全部路径）
+
+| 层 | 项 | 预期节省 | 状态 | 实施方式 |
+|---|---|---|---|---|
+| L1 | hc 融合（A1+A2+AR fold） | -2.9~4.2ms | ✅ Wave 1 已含 | 3 个 env flag |
+| L2 | per-row sync 收敛 | -0.7ms | 🔄 subagent 实施中 | ~50 行代码 |
+| L3 | SH_PAIR M=1 | -1.1~1.3ms | ✅ **GPU 验证成功** | 1 个 env flag |
+| L4 | tcgen05 routed gate/up | -1.9~2.1ms | 🔄 对齐修复待重测 | 5-gate 链 |
+| L5 | draft P3A+MARKOV_SLICED | -0.7~0.8ms | 🔄 MARKOV 准备中 | 1 个 env flag |
+| **L6** | **draft P3c 图化** | **-3.3ms** | **🔄 GPU 测试中（a9b38124）** | **1 个 env flag** |
+
+**全部兑现后的步时**：22.56 - 3.5(L1) - 0.7(L2) - 1.2(L3) - 2.0(L4) - 0.8(L5) - 3.3(L6) = **~11.1ms**
+**@ accept 5（数字任务）**：6/0.0111 = **541 tok/s** ✓✓✓（远超 400！）
+
+**@ accept 3（用户校准）**：4/0.0111 = **360 tok/s**（接近 400）
+**@ accept 1.2（出师表）**：2.2/0.0111 = **198 tok/s**
+
+**诚实折算**（60% 兑现率）：22.56 - 0.6×11.5 = ~15.7ms → accept 5 = **382 tok/s**（接近 400）
+
+**判定**：L1-L6 全部兑现 + 60% 折算 → **~382 tok/s**。加上 L4 占用优化（-5ms）→ 10.7ms → **560 tok/s**。**400 在高 accept 任务上可达，但需要大部分优化兑现。**
