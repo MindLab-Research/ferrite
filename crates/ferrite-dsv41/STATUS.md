@@ -7717,3 +7717,16 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 4. L2 污染（每轮换缓冲，禁驻留红利）
 5. 关键路径计费（gate/fork kernel 按 fork_ev 语义）
 6. 判据分层（隔离只做淘汰；正向收益一律 serve A/B + 四段文本 + faults=0）
+
+### v19 定案：memset 消除不改变 swapAB 的 serve 中性（2026-09-12 18:00）
+
+| 臂 | p50 | tok/s | 判定 |
+|---|---|---|---|
+| v19a（基线） | 6.17ms | 162.1 | 基准 |
+| v19s（memset 消除 + 形状分发 swapAB） | 6.18ms | 161.8 | **中性**（Δ=0.01ms） |
+
+**结论**：swapAB 的 serve 中性与 memset 无关（v19 排除）、与形状分发无关（v18 排除）、与全量覆盖无关（v17 排除）。**根因是系统差异**（隔离→生产失效的第 7 类）：serve 的 SM 争抢（4 条流并行）+ L2 竞争使 cp.async staging 的 1.3TB/s 硬墙在 serve 中更严重。
+
+**TMA Phase 1（tma-phase1-impl 实施中）是 swapAB 路径的最后希望**：bulk DMA 不占 SM 的 LSU，理论上能突破 staging 瓶颈。但同样面临隔离→serve 翻译风险。
+
+**会话验证最优：6.17ms = 162.1 tok/s（+115.4%）**
