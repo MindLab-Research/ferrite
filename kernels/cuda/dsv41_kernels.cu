@@ -40,6 +40,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp8.h>
 #include <cstdint>
+#include <cstdio>
 
 namespace {
 
@@ -3396,6 +3397,59 @@ extern "C" int dsv41_quant_fp4(const float* x, uint8_t* y, float* scale, int row
     dim3 blk(1, (block < 256 ? block : 256));
     quant_kernel<1><<<dim3(rows * nb), blk, 0, s>>>(x, nib, scale, rows, cols, block, round_scale);
     fp4_pack_kernel<<<(unsigned)((n / 2 + 255) / 256), 256, 0, s>>>(nib, y, n);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// sub_dequant_fp4: `out = x - dequant_fp4(q, scale)` -- the RESIDUAL half of the
+// e2m1x2 two-pass activation decomposition (`DSV41_EXPERT_ACT_E4M3` on the Rust
+// side; default OFF).
+//
+// WHY it exists. The routed experts' activation is quantised to e2m1 (1 mantissa
+// bit) because the expert MMA is `kind::mxf4` (e2m1 x e2m1) and there is no fp8
+// expert entry point. The official `linear()` feeds a **fp4 weight** an e4m3
+// activation (3 mantissa bits), so ferrite carries ~4-5x the activation noise on
+// every routed-expert output of all 44 expert layers. The fix here is a two-term
+// e2m1 expansion -- q(a) ~= q_hi(a) + q_lo(a - dequant(q_hi(a))) -- run as TWO
+// GEMM passes against the SAME fp4 weight bytes, so no weight is duplicated and
+// no fp8 expert path is touched. It needs exactly this one primitive: the
+// f32 residual to feed the second `dsv41_quant_fp4`.
+//
+// LAYOUT CONTRACT (must match dsv41_quant_fp4's output):
+//   q     : [rows][cols/2] bytes, 2 nibbles per byte, LOW nibble = even column
+//   scale : [rows][cols/block] f32, one per (row, block) -- the power-of-two
+//           value dsv41_quant_fp4 wrote for round_scale != 0
+//   out   : [rows][cols] f32, out[i] = x[i] - e2m1(nibble) * scale
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ float dsv41_sd_e2m1_to_f(uint8_t c) {
+    // e2m1: 1 sign, 2 exponent, 1 mantissa -> the non-uniform magnitude table.
+    const float mag[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    const float v = mag[c & 7u];
+    return (c & 8u) ? -v : v;
+}
+
+__global__ void sub_dequant_fp4_kernel(const float* __restrict__ x, const uint8_t* __restrict__ q,
+                                       const float* __restrict__ scale, float* __restrict__ out,
+                                       long n, int cols, int block) {
+    const long nb = (long)(cols / block);
+    for (long i = (long)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (long)gridDim.x * blockDim.x) {
+        const long row = i / cols;
+        const int col = (int)(i - row * cols);
+        const uint8_t byte = q[i >> 1];
+        const uint8_t nib = (col & 1) ? (uint8_t)(byte >> 4) : (uint8_t)(byte & 0xF);
+        const float s = scale[row * nb + (long)(col / block)];
+        out[i] = x[i] - dsv41_sd_e2m1_to_f(nib) * s;
+    }
+}
+
+extern "C" int dsv41_sub_dequant_fp4(const float* x, const uint8_t* q, const float* scale,
+                                     float* out, int rows, int cols, int block, cudaStream_t s) {
+    if (rows <= 0 || cols <= 0 || block <= 0 || cols % block != 0 || (cols & 1) != 0)
+        return (int)cudaErrorInvalidValue;
+    const long n = (long)rows * (long)cols;
+    const unsigned blocks = (unsigned)((n + 255) / 256);
+    sub_dequant_fp4_kernel<<<blocks, 256, 0, s>>>(x, q, scale, out, n, cols, block);
     return (int)cudaGetLastError();
 }
 

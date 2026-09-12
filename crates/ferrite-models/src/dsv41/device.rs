@@ -225,6 +225,14 @@ struct Kernels {
     quant_fp4: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
+    /// `out = x - dequant_fp4(q, scale)` — the residual half of the e2m1x2
+    /// two-pass activation decomposition (`DSV41_EXPERT_ACT_E4M3`, default OFF).
+    /// OPTIONAL: a stock .so has no such symbol, and the armed gate must then
+    /// stay OFF (reported once) rather than fail the load.
+    sub_dequant_fp4: Option<
+        unsafe extern "C" fn(*const f32, *const u8, *const f32, *mut f32, c_int, c_int, c_int, CuStream)
+            -> c_int,
+    >,
     expert_gate_up_fp4: unsafe extern "C" fn(
         *const u8, *const f32, *const u8, *const u8, *const u8, *const u8, *mut f32,
         c_int, c_int, c_int, f32, CuStream,
@@ -941,6 +949,7 @@ impl Device {
             gemm_fp8_sh_pair: ko!(rt, "dsv41_gemm_fp8_sh_pair"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
+            sub_dequant_fp4: ko!(rt, "dsv41_sub_dequant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
             expert_down_fp4: km!(rt, "dsv41_expert_down_fp4"),
             engram_hash: km!(rt, "dsv41_engram_hash"),
@@ -2082,6 +2091,32 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_quant_fp4")
+    }
+
+    /// True when the loaded .so carries `dsv41_sub_dequant_fp4` (the residual
+    /// primitive of the `DSV41_EXPERT_ACT_E4M3` two-pass decomposition). A stock
+    /// .so leaves the gate OFF with a one-shot notice rather than a load failure.
+    pub fn supports_sub_dequant_fp4(&self) -> bool {
+        self.kernels.sub_dequant_fp4.is_some()
+    }
+
+    /// `out[i] = x[i] - dequant_fp4(q, scale)[i]` — the f32 RESIDUAL of the first
+    /// e2m1 pass, i.e. the input of the second one. Same layout contract as
+    /// [`Self::quant_fp4`]'s output: `q` packs 2 nibbles/byte (LOW = even column)
+    /// and `scale` holds one f32 per (row, `block`-column) block.
+    pub fn sub_dequant_fp4(
+        &self,
+        x: *const f32,
+        q: *const u8,
+        scale: *const f32,
+        out: *mut f32,
+        rows: i32,
+        cols: i32,
+        block: i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.sub_dequant_fp4, "dsv41_sub_dequant_fp4")?;
+        let rc = unsafe { f(x, q, scale, out, rows, cols, block, self.stream) };
+        self.kerr(rc, "dsv41_sub_dequant_fp4")
     }
 
     /// Native fp4 experts (tcgen05 MXFP4): gate and up in one pass.

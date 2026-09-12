@@ -720,6 +720,92 @@ mod tests {
         assert!(rel[2] < rel[0], "e2m1x2 ({:.3e}) must beat e2m1 ({:.3e})", rel[2], rel[0]);
     }
 
+    /// e2m1x2 (`DSV41_EXPERT_ACT_E4M3`) — PIN the measured reconstruction error.
+    ///
+    /// Stage 2 runs the two-term expansion above as TWO expert gate/up GEMM
+    /// passes against the SAME fp4 weight bytes (no weight duplication, no fp8
+    /// expert entry point), so the device path must reproduce THIS arithmetic.
+    /// The probe above only asserts `x2 < e2m1`; this test pins the measured
+    /// values, so a change that silently drops the residual pass (or folds the
+    /// clamp/swiglu between the two passes) fails here — with a number — instead
+    /// of degrading the model.
+    ///
+    /// Measured (docs/agent/dspark-correctness-chain.md, "e2m1 vs e4m3 的隔离测量"):
+    ///   e2m1   pointwise 0.115 | expert-out 1.215e-1
+    ///   e4m3   pointwise 0.027 | expert-out 2.715e-2
+    ///   e2m1x2 pointwise 0.014 | expert-out 1.447e-2   (= 0.53x e4m3, BETTER)
+    #[test]
+    fn activation_two_pass_pins_measured_error() {
+        const DIM: usize = 5120;
+        const ROWS: usize = 32;
+        let mut rng = Rng::new(0x4453_5634_3141_4354); // same stream as the probe
+        let mut gauss = Vec::with_capacity(ROWS * DIM);
+        for _ in 0..ROWS * DIM {
+            gauss.push(rng.normal());
+        }
+        let mut acc = [(0f64, 0f64); 3];
+        for r in 0..ROWS {
+            let row = &gauss[r * DIM..(r + 1) * DIM];
+            for (i, arm) in [deq_fp4_blocks, deq_fp8_blocks, deq_fp4x2_blocks].iter().enumerate() {
+                let (num, den) = row_err(row, *arm);
+                acc[i].0 += num;
+                acc[i].1 += den;
+            }
+        }
+        let e: Vec<f64> = acc.iter().map(|(n, d)| (n / d).sqrt()).collect();
+        println!(
+            "[act-format-pinned] e2m1 {:.5}  e4m3 {:.5}  e2m1x2 {:.5}  e2m1x2/e4m3 = {:.2}x",
+            e[0],
+            e[1],
+            e[2],
+            e[2] / e[1]
+        );
+        // The measurement, to 1e-3: a different number means the two-term
+        // expansion (or the quantiser under it) changed.
+        assert!((e[0] - 0.11546).abs() < 1e-3, "e2m1 pointwise {:.5} != 0.11546", e[0]);
+        assert!((e[1] - 0.02656).abs() < 1e-3, "e4m3 pointwise {:.5} != 0.02656", e[1]);
+        assert!((e[2] - 0.01395).abs() < 1e-3, "e2m1x2 pointwise {:.5} != 0.01395", e[2]);
+        // The whole reason Stage 2 exists: the fp4 two-pass must BEAT official
+        // e4m3 rather than merely improve on e2m1.
+        assert!(e[2] < e[1], "e2m1x2 ({:.5}) must beat official e4m3 ({:.5})", e[2], e[1]);
+        assert!((e[2] / e[1] - 0.53).abs() < 0.02, "e2m1x2/e4m3 {:.3}x != 0.53x", e[2] / e[1]);
+    }
+
+    /// The `sub_dequant_fp4` KERNEL's index contract, mirrored in Rust.
+    ///
+    /// `dsv41_sub_dequant_fp4` (kernels/cuda/dsv41_kernels.cu) forms the residual
+    /// `out[i] = x[i] - dequant(q, scale)[i]` with
+    ///   byte = q[i >> 1]                                  (2 nibbles/byte, LOW = even col)
+    ///   nib  = (col & 1) ? byte >> 4 : byte & 0xF
+    ///   s    = scale[row * (cols/block) + col / block]
+    /// — i.e. exactly the packing `act_quant_fp4` writes. This test re-derives
+    /// that walk in Rust and compares it against the golden decoder, so a
+    /// mismatch between the assumed layout and the quantiser is caught here
+    /// instead of on the GPU (the second pass would otherwise quantise a
+    /// wrong-signed residual and look "slightly worse", not broken).
+    #[test]
+    fn sub_dequant_fp4_index_contract() {
+        const DIM: usize = 128;
+        const BLOCK: usize = 32;
+        let x: Vec<f32> = (0..DIM).map(|i| ((i as f32) * 0.37).sin() * 3.0).collect();
+        let (packed, scales) = act_quant_fp4(&x, BLOCK, true);
+        let mut deq = vec![0f32; DIM];
+        fp4_decode_packed(&packed, &mut deq);
+        for c in 0..DIM {
+            deq[c] *= scales[c / BLOCK];
+        }
+        let nb = DIM / BLOCK;
+        for i in 0..DIM {
+            let row = i / DIM;
+            let col = i - row * DIM;
+            let byte = packed[i >> 1];
+            let nib = if col & 1 == 1 { byte >> 4 } else { byte & 0x0F };
+            let s = scales[row * nb + col / BLOCK];
+            let got = x[i] - e2m1_decode(nib) * s;
+            assert_eq!(got, x[i] - deq[i], "i={i} col={col}");
+        }
+    }
+
     #[test]
     fn cast_fp4_to_e4m3_is_lossless_per_tile() {
         // 32x32 tile, one segment; per-row segment scales differ by powers of two
