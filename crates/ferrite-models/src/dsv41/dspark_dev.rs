@@ -1219,18 +1219,16 @@ impl<'a> DsparkDev<'a> {
         let confidence_proj = need(&self.w.confidence_proj, "mtp.last.confidence_head.proj.weight")?;
 
         // h = hc_pre(x, premix) then rmsnorm(dspark_norm)
-        // The premix here must match the BACKBONE's final-collapse convention:
-        // step_body collapses the last layer's output with premix_slot(1) —
-        // the last layer's ATTN-pre mix (production-verified by the correct
-        // text). The historical call used `pre_in`, which the block loop
-        // leaves holding the last block's FFN-pre — a DIFFERENT mix vector,
-        // putting the draft's head on a different collapse convention than
-        // the backbone it is trying to predict (audit-hc-head's blocking
-        // finding; the checkpoint has NO hc_head_* weights, so pre_mix IS the
-        // V4.1 convention and the two paths must agree on WHICH pre).
+        // The premix is the LAST BLOCK's returned pre_mix — its ffn_pre mix,
+        // exactly what the official forward_head receives
+        // (`h, pre_mix = layer(...); forward_head(h, pre_mix, ...)` — the same
+        // convention the backbone's own final collapse uses, `h = layer.hc_pre(h,
+        // pre_mix)`). The block loop leaves it in `pre_in`. (The intermediate
+        // attn_pre variant was a misreading of the backbone's premix_slot(1);
+        // the official source settles it.)
         self.dev.hc_collapse(
             self.h.ptr as *const f32,
-            self.pre_attn.ptr as *const f32,
+            self.pre_in.ptr as *const f32,
             self.collapse.ptr as *mut f32,
             bs as i32,
             hc as i32,

@@ -107,6 +107,39 @@ pub struct DsparkShadowReport {
     pub verify_ms: f32,
 }
 
+/// What one REAL-COMMIT DSpark step produced. See
+/// [`DevChain::dspark_spec_step`]: the anchor row plus the accepted draft prefix
+/// are COMMITTED (the ring keeps their KV, the compressor is replayed up to the
+/// last of them and the position counter jumps by `k_acc + 1`), so this report
+/// describes engine state that has MOVED — unlike [`DsparkShadowReport`], whose
+/// block is always undone.
+#[derive(Debug, Clone)]
+pub struct DsparkSpecReport {
+    /// The anchor: `step_dev`'s argmax, i.e. the token at `pos + 1`. Its forward
+    /// is verify row 0.
+    pub next: u32,
+    /// What the draft proposed: `drafts[j]` is the draft's guess for `pos + 2 + j`.
+    pub drafts: [u32; DSPARK_DRAFTS],
+    /// The verify block's per-row argmax — row `j` sits at `pos + 1 + j` (row 0
+    /// is the anchor) and predicts `pos + 2 + j`.
+    pub verify_out: [u32; DSPARK_DRAFTS + 1],
+    /// The accepted draft-prefix length (0..=DSPARK_DRAFTS): `drafts[0..k_acc]`
+    /// all matched the verify row that predicts them.
+    pub k_acc: usize,
+    /// What this step EMITS, in order: `[next] ++ verify_out[0..k_acc]`, i.e.
+    /// `k_acc + 1` tokens at positions `pos + 1 ..= pos + 1 + k_acc`. The last of
+    /// them is the next step's input (`pos_ctr` has already been advanced to its
+    /// position, and its KV is NOT yet in the ring — the next step appends it).
+    pub emitted: Vec<u32>,
+    /// The draft phase (`import_tap` + `draft_forward` + the drafts D2H).
+    pub draft_ms: f32,
+    /// The verify phase (`step_rows`, one 6-row forward).
+    pub verify_ms: f32,
+    /// The commit phase: partial rollback + compressor replay + the position
+    /// counter's H2D (the price the shadow path never pays).
+    pub commit_ms: f32,
+}
+
 struct Scratch {
     h: DevBuf,     // [hc*dim]
     h2: DevBuf,    // [hc*dim] (hc_post lands here, then copies back)
@@ -395,6 +428,23 @@ struct Scratch {
     dspark_snap_clen: DevBuf,
     /// `[n_layers]` i32 — the compressor's `out_rows` decision.
     dspark_snap_out_rows: DevBuf,
+    // ==================== DSpark spec commit (DSV41_SPEC) ====================
+    //
+    // `dspark_spec_step` keeps the ACCEPTED PREFIX of a verify block instead of
+    // rolling the whole block back. The compressor cannot be rewound row by row
+    // (its `state_kv`/`state_score` slots are overwritten in position order), so
+    // the commit restores the pre-verify snapshot and REPLAYS the kept rows
+    // through the same per-row pool+commit triple the verify used.
+    //
+    // Playing a row back needs that row's `kvp`/`scp`, and those live in the
+    // SHARED m-row scratch (`s.kvp_r`/`s.scp_r`), which every compress-source
+    // layer overwrites in turn — so the verify has to save them per layer while
+    // it still can. Layout indexed BY LAYER with a `VERIFY_ROWS` row stride,
+    // exactly like the shadow snapshot above.
+    /// `[n_layers][VERIFY_ROWS][head_dim]` f32 — the verify's `kvp` rows.
+    spec_snap_kvp: DevBuf,
+    /// `[n_layers][VERIFY_ROWS][head_dim]` f32 — the verify's `scp` rows.
+    spec_snap_scp: DevBuf,
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -1030,6 +1080,13 @@ pub struct DevChain<'a> {
     /// would let one layer's capture clobber another's under a per-layer MoE
     /// graph (`DSV41_GRAPH_MOE`).
     moe_add_in: Vec<Option<*const f32>>,
+    /// DSV41_SPEC only: while this is set, [`Self::compress_rows`] also saves the
+    /// verify's per-layer `kvp`/`scp` rows (see `Scratch::spec_snap_kvp`), because
+    /// [`Self::dspark_spec_step`]'s commit has to REPLAY the accepted prefix
+    /// through the compressor and the shared m-row scratch does not survive the
+    /// layer walk. Armed only around the spec step's `step_rows` call, so the
+    /// shadow path pays nothing.
+    spec_capture: bool,
 }
 
 fn fb(n: usize) -> usize {
@@ -1256,6 +1313,8 @@ impl<'a> DevChain<'a> {
             dspark_snap_latent: dev.alloc(fb(cfg.n_layers * hd).max(8))?,
             dspark_snap_clen: dev.alloc((cfg.n_layers * 4).max(4))?,
             dspark_snap_out_rows: dev.alloc((cfg.n_layers * 4).max(4))?,
+            spec_snap_kvp: dev.alloc(fb(cfg.n_layers * VERIFY_ROWS * hd).max(8))?,
+            spec_snap_scp: dev.alloc(fb(cfg.n_layers * VERIFY_ROWS * hd).max(8))?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does
@@ -1331,6 +1390,7 @@ impl<'a> DevChain<'a> {
             eng_layout,
             eng_map,
             moe_add_in: vec![None; cfg.n_layers],
+            spec_capture: false,
         })
     }
 
@@ -2838,6 +2898,29 @@ impl<'a> DevChain<'a> {
         m: usize,
         host: &[(usize, usize)],
     ) -> Result<()> {
+        self.dspark_rollback_keep(pos, m, 0, host)
+    }
+
+    /// [`Self::dspark_rollback`] with a KEEP prefix: the first `keep` rows of the
+    /// verify block STAY in the ring (they are the accepted prefix's KV — see
+    /// [`Self::dspark_spec_step`]), only rows `keep..m` are restored to their
+    /// pre-verify value.
+    ///
+    /// The compressor side is restored WHOLE regardless of `keep`: its `state_kv`
+    /// / `state_score` slots are written in position order and later rows
+    /// overwrite earlier ones, so there is no per-row undo — the only exact way
+    /// to land on "the state after `keep` rows" is to go back to the snapshot and
+    /// play those rows forward again ([`Self::compress_replay`]).
+    ///
+    /// `keep == 0` is exactly the shadow path's full rollback.
+    pub(crate) fn dspark_rollback_keep(
+        &mut self,
+        pos: usize,
+        m: usize,
+        keep: usize,
+        host: &[(usize, usize)],
+    ) -> Result<()> {
+        debug_assert!(keep <= m, "dspark_rollback_keep: keep {keep} > block {m}");
         // An empty mirror list means the caller skipped the snapshot (the
         // bisect modes that never run the verify): there is NOTHING to roll
         // back, and the snapshot buffers below were never written — restoring
@@ -2856,7 +2939,9 @@ impl<'a> DevChain<'a> {
             let ring = self.layers[l].ring.ptr as *mut f32;
             let snap = (self.s.dspark_snap_ring.ptr as *const f32)
                 .wrapping_add(l * VERIFY_ROWS * hd);
-            for j in 0..m {
+            // Only the rows BEYOND the kept prefix go back: rows `0..keep` are
+            // the accepted prefix's KV and must survive this call.
+            for j in keep..m {
                 let slot = (pos + 1 + j) % win;
                 self.dev.memcpy_d2d(
                     ring.wrapping_add(slot * hd) as *mut c_void,
@@ -3087,6 +3172,297 @@ impl<'a> DevChain<'a> {
             draft_ms,
             verify_ms,
         })
+    }
+
+    /// REAL-COMMIT DSpark step (`DSV41_SPEC=1`): the same draft + verify block as
+    /// [`Self::dspark_shadow_step`], but the accepted prefix is KEPT instead of
+    /// rolled back — the engine's state moves forward by `k_acc + 1` positions.
+    ///
+    /// # Timeline
+    ///
+    /// ```text
+    ///   1. next       = step_dev(token, pos)   the anchor's producer (the ONLY
+    ///                                          main-chain forward this step runs)
+    ///   2. snapshot    = dspark_snapshot(pos, 6)   the verify's write set, taken
+    ///                                          AFTER the step (see the shadow
+    ///                                          step's note on the ordering)
+    ///   3. draft        dspark.draft_forward(next, pos + 1) -> d1..d5
+    ///   4. verify_out = step_rows([next, d1..d5])   six rows at pos+1 .. pos+6
+    ///   5. accept       k_acc = longest prefix with drafts[i] == verify_out[i]
+    ///   6. commit       dspark_commit(pos, 6, k_acc, snapshot): rows 0..k_acc of
+    ///                   the block survive, the rest is rolled back, the
+    ///                   compressor is replayed for the survivors, and the
+    ///                   position counter jumps to pos + k_acc + 1
+    ///   7. emit         [next] ++ verify_out[0..k_acc]   (k_acc + 1 tokens)
+    /// ```
+    ///
+    /// # Why the emitted tokens are the VERIFY's argmax
+    ///
+    /// `verify_out[j]` is the target's argmax at position `pos + 2 + j` computed
+    /// from a context whose rows 0..j are the accepted tokens — i.e. exactly what
+    /// a greedy single-row decode would emit there. `drafts[j]` agrees with it
+    /// whenever it was accepted, so emitting `verify_out` rather than the raw
+    /// drafts keeps the token stream bit-identical to the non-speculative one
+    /// even at the boundary (`j == k_acc`, where the draft disagreed).
+    ///
+    /// # What the caller must do with `emitted`
+    ///
+    /// Feed every token to the driver (stop tokens included), advance its own
+    /// position by `emitted.len()`, and use the LAST one as the next step's
+    /// input. The engine's `pos_ctr` is already at that token's position and its
+    /// KV is deliberately absent — the next step's `step_dev` appends it, exactly
+    /// as it would for a plain decode step.
+    ///
+    /// # Failure
+    ///
+    /// The block is rolled back before ANY error is returned, so a failed step
+    /// leaves the chain exactly where the real step left it (the caller may then
+    /// fall back to `step_dev`, or answer the error).
+    pub fn dspark_spec_step(
+        &mut self,
+        dspark: &mut DsparkDev,
+        token: u32,
+        pos: usize,
+    ) -> Result<DsparkSpecReport> {
+        let cfg = self.cfg;
+        // The verify block is [anchor(next), d1..d5] — 6 rows, the same shape the
+        // shadow step runs: the anchor's forward is row 0 and its KV is what rows
+        // 1.. attend.
+        let m = DSPARK_DRAFTS + 1;
+        if !cfg.dspark_armed() {
+            return Err(FerriteError::Config(
+                "dspark_spec_step: the chain's tap hook is off (set DSV41_DSPARK and make sure \
+                 it is set before the first decoded step captures the step graph); without it the \
+                 draft would read a stale target hidden"
+                    .into(),
+            ));
+        }
+
+        let pos_ctr = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as usize;
+        debug_assert_eq!(
+            pos_ctr, pos,
+            "dspark_spec_step: `pos` must be the device position counter's current value"
+        );
+
+        // ---- 1. the real step: the whole-step graph (tap hook included), the
+        // argmax, and the position counter + 1. It is also the only place the
+        // anchor's producer runs — unlike the old shape, the anchor's own forward
+        // happens inside the verify block below.
+        let next = self.step_dev(token, pos)?;
+
+        // ---- 2. the snapshot, AFTER the step and BEFORE the verify (the shadow
+        // step's ordering rule): the rollback must restore the state the REAL
+        // step left, not the state from before it.
+        let host_mirrors = self.dspark_snapshot(pos_ctr, m)?;
+
+        // ---- 3. the draft, from the tap of the step that just ran. The anchor
+        // is `next` — the JUST-SAMPLED token, not yet forwarded — at pos + 1.
+        let t = std::time::Instant::now();
+        dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
+        dspark.draft_forward(next, pos + 1)?;
+        let drafts = dspark.drafts()?;
+        let draft_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 4. the verify: [anchor, d1..d5] at pos+1..pos+6, per-row argmax.
+        let t = std::time::Instant::now();
+        let mut six = [next; DSPARK_DRAFTS + 1];
+        six[1..].copy_from_slice(&drafts);
+        // Arm the per-layer kvp/scp capture the commit's replay needs. It is
+        // cleared BEFORE the `?` so a failed verify cannot leave every later step
+        // paying for copies nobody reads.
+        self.spec_capture = true;
+        let rows_res = self.step_rows(&six);
+        self.spec_capture = false;
+        let rows = match rows_res {
+            Ok(r) => r,
+            Err(e) => {
+                // never hand back a dirty chain: the block had already written
+                // ring slots and compressor state before it failed.
+                let _ = self.dspark_rollback(pos_ctr, m, &host_mirrors);
+                return Err(e);
+            }
+        };
+        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
+        if rows.len() != DSPARK_DRAFTS + 1 {
+            self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
+            return Err(FerriteError::Config(format!(
+                "dspark_spec_step: step_rows returned {} rows for a {}-row verify block",
+                rows.len(),
+                DSPARK_DRAFTS + 1
+            )));
+        }
+        let mut verify_out = [0u32; DSPARK_DRAFTS + 1];
+        verify_out.copy_from_slice(&rows);
+
+        // ---- 5. the accept arithmetic (host, no device traffic). Row j sits at
+        // pos + 1 + j and was fed `six[j]` (the anchor for j == 0, d_j after), so
+        // `verify_out[j]` is the target's prediction for pos + 2 + j — the exact
+        // position `drafts[j]` guesses.
+        let mut k_acc = 0usize;
+        while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc] {
+            k_acc += 1;
+        }
+
+        // ---- 6. the commit.
+        let t = std::time::Instant::now();
+        self.dspark_commit(pos_ctr, m, k_acc, &host_mirrors)?;
+        let commit_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 7. what this step emits: the anchor plus the verify's argmax for
+        // every position the draft got right.
+        let mut emitted = Vec::with_capacity(k_acc + 1);
+        emitted.push(next);
+        emitted.extend_from_slice(&verify_out[..k_acc]);
+
+        Ok(DsparkSpecReport {
+            next,
+            drafts,
+            verify_out,
+            k_acc,
+            emitted,
+            draft_ms,
+            verify_ms,
+            commit_ms,
+        })
+    }
+
+    /// Commit the accepted prefix of a verify block: undo everything the block
+    /// wrote past row `keep`, then move the engine forward by `keep + 1`.
+    ///
+    /// `keep` is the accepted draft-prefix length (`k_acc`). The block is
+    /// `[anchor, d1..d5]` at `pos+1 .. pos+6`; row 0 (the anchor) is ALWAYS valid
+    /// — its token is what the engine emits next — and row `j >= 1` is valid iff
+    /// `d_j` was accepted, i.e. iff `j <= k_acc`. Row `k_acc` is nevertheless NOT
+    /// kept: its position is the NEW `pos_ctr`, so that token has not been
+    /// consumed yet and the next step's `step_dev` appends its KV. Hence
+    /// `keep = k_acc` rows, at positions `pos+1 .. pos+k_acc`, and
+    /// `pos_ctr = pos + k_acc + 1`.
+    ///
+    /// What the block left behind, and what happens to it:
+    ///
+    /// * ring rows `0..keep` — the accepted prefix's KV, kept as they are;
+    /// * ring rows `keep..m` — restored from the snapshot;
+    /// * the compressor carry/latent/`out_rows` and BOTH compressed-row counters
+    ///   (`s.clen` and the host mirror) — restored from the snapshot, after which
+    ///   the kept rows are replayed ([`Self::compress_replay`]);
+    /// * `index_k` — never snapshotted: the replay re-publishes a key for every
+    ///   group it commits, and slots the verify wrote past the new `clen` are
+    ///   unreachable (`indexer_topk` reads only `< clen`);
+    /// * the ring's COMPRESSED rows (`window + clen`) — the replay rewrites the
+    ///   kept ones; the rest are unreachable for the same reason;
+    /// * `pos_ctr` — the one thing the verify deliberately does NOT advance
+    ///   (`step_rows`' per-row argmax takes a NULL counter), so it is set here.
+    fn dspark_commit(
+        &mut self,
+        pos: usize,
+        m: usize,
+        keep: usize,
+        host: &[(usize, usize)],
+    ) -> Result<()> {
+        debug_assert!(
+            keep < m,
+            "dspark_commit: keep {keep} of {m} rows leaves nothing to roll back"
+        );
+        self.dspark_rollback_keep(pos, m, keep, host)?;
+        if keep > 0 {
+            self.compress_replay(pos as i32 + 1, keep)?;
+        }
+        self.set_pos_ctr(pos + keep + 1)?;
+        Ok(())
+    }
+
+    /// Play the KEPT rows of a verify block back through every compressor.
+    ///
+    /// [`Self::dspark_rollback_keep`] has just restored each compress source to
+    /// its pre-verify state; this walks rows `0..rows` forward again with the
+    /// `kvp`/`scp` the verify computed for them (`Scratch::spec_snap_kvp`/`_scp`),
+    /// through the SAME single-row pool+commit pair the verify used, at the same
+    /// positions. The carry, the pooled latent, the compressed row in the ring
+    /// and this layer's device counter therefore end up exactly where `rows`
+    /// sequential single-row decode steps would have left them.
+    ///
+    /// `pos_base` is the block's ROW 0 position (`pos + 1` — what `step_rows`
+    /// read off the device counter after the real step).
+    ///
+    /// The index key is re-published for every row that COMPLETES a group, which
+    /// is what the single-row path does (its `indexer` republishes slot
+    /// `*clen - 1` every step). The m-row verify publishes only the block's LAST
+    /// group, so without this the intermediate groups it committed would leave
+    /// `index_k` rows that `indexer_topk` reads and never got written.
+    fn compress_replay(&mut self, pos_base: i32, rows: usize) -> Result<()> {
+        if rows == 0 {
+            return Ok(());
+        }
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let st = self.dev.stream();
+        // Re-upload the row positions so the replay does not depend on
+        // `s.pos_rows` still holding what `step_rows` put there.
+        let pos_rows: Vec<i32> = (0..rows).map(|r| pos_base + r as i32).collect();
+        self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
+        for layer in self.compress_sources() {
+            let ld = &self.w.layers[layer];
+            let (Some(_), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+                continue;
+            };
+            let ratio = cfg.compress_ratio(layer).max(1);
+            let kvp_base =
+                (self.s.spec_snap_kvp.ptr as *const f32).wrapping_add(layer * VERIFY_ROWS * hd);
+            let scp_base =
+                (self.s.spec_snap_scp.ptr as *const f32).wrapping_add(layer * VERIFY_ROWS * hd);
+            for r in 0..rows {
+                self.dev.compressor_pool_on(
+                    kvp_base.wrapping_add(r * hd),
+                    scp_base.wrapping_add(r * hd),
+                    norm.as_f32(),
+                    self.layers[layer].state_kv.ptr as *mut f32,
+                    self.layers[layer].state_score.ptr as *mut f32,
+                    self.layers[layer].latent.ptr as *mut f32,
+                    self.layers[layer].out_rows.ptr as *mut i32,
+                    1,
+                    1,
+                    hd as i32,
+                    ratio as i32,
+                    pos_base + r as i32,
+                    (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                    cfg.norm_eps,
+                    st,
+                )?;
+                self.dev.compress_commit_on(
+                    self.layers[layer].latent.as_f32(),
+                    self.cos_comp.as_f32(),
+                    self.sin_comp.as_f32(),
+                    self.layers[layer].ring.ptr as *mut f32,
+                    self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+                    (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+                    hd as i32,
+                    cfg.rope_head_dim as i32,
+                    (cfg.rope_head_dim / 2) as i32,
+                    cfg.window_size as i32,
+                    ratio as i32,
+                    st,
+                )?;
+                // The host MIRROR of the device counter, by the SAME rule the
+                // commit kernel applies ((*pos + 1) % ratio == 0).
+                if (pos_base + r as i32 + 1) % (ratio as i32) == 0 {
+                    self.layers[layer].compress_len += 1;
+                    // A group just completed, so its index key has to exist —
+                    // `*clen - 1` is the slot the commit kernel just named.
+                    if cfg.is_index_source(layer) && cfg.indexer_owns_k(layer) {
+                        self.publish_index_key(layer)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Set the device position counter (a 4-byte H2D). The verify never writes
+    /// it — `step_rows` passes a NULL counter to its per-row argmax precisely so a
+    /// block of rows cannot advance the sequence — so a committed block has to
+    /// move it here, once, for the whole accepted prefix.
+    fn set_pos_ctr(&self, pos: usize) -> Result<()> {
+        self.ul_i32(self.s.pos_ctr.ptr, &[pos as i32])
     }
 
     /// The m-row premix slots, mirroring [`Self::premix_slot`]'s convention: 0 is
@@ -3498,6 +3874,69 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    /// Publish ONE index key: the roped `wk` projection of `layer`'s pooled
+    /// compressor latent, rms-normed, written into the owner's `index_k` at the
+    /// slot its DEVICE compressed-row counter names.
+    ///
+    /// Extracted from the two callers that used to inline it — the single-row
+    /// [`Self::indexer`] and [`Self::indexer_rows`] — because the DSpark spec
+    /// commit's replay ([`Self::compress_replay`]) needs the SAME key for every
+    /// group it re-commits. Publishing only the block's LAST group (what
+    /// `indexer_rows` does) leaves the earlier groups' keys stale, and
+    /// `indexer_topk` reads every row `< clen` — so a partially committed block
+    /// would select against keys that were never written.
+    ///
+    /// Returns `false` when the layer carries no index-key weights, so a caller
+    /// can skip it without duplicating the weight lookup. `&self`: every launch
+    /// is read-only on the chain (the destination slots are the device buffers).
+    fn publish_index_key(&self, layer: usize) -> Result<bool> {
+        let cfg = self.cfg;
+        let ld = &self.w.layers[layer];
+        let (Some(wk), Some(kn)) = (ld.idx_wk.as_ref(), ld.idx_k_norm.as_ref()) else {
+            return Ok(false);
+        };
+        let idx_hd = cfg.index_head_dim.max(1);
+        let rd = cfg.rope_head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let clen_layer = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer);
+        self.lin_bf16(
+            self.layers[layer].latent.ptr as *const f32,
+            cfg.head_dim as i32,
+            wk,
+            idx_hd as i32,
+            self.s.idx_k.ptr as *mut f32,
+        )?;
+        self.dev.rmsnorm(
+            self.s.idx_k.ptr as *const f32,
+            kn.as_f32(),
+            self.s.idx_k.ptr as *mut f32,
+            1,
+            idx_hd as i32,
+            cfg.norm_eps,
+        )?;
+        self.dev.apply_rope(
+            self.s.idx_k.ptr as *mut f32,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            1,
+            idx_hd as i32,
+            rd as i32,
+            (rd / 2) as i32,
+            clen_layer,
+            ratio as i32,
+            -(ratio as i32),
+            1,
+            false,
+        )?;
+        self.dev.index_k_publish(
+            self.layers[layer].index_k.ptr as *mut f32,
+            self.s.idx_k.ptr as *const f32,
+            clen_layer,
+            idx_hd as i32,
+        )?;
+        Ok(true)
+    }
+
     /// Multi-row indexer: the m-row twin of [`Self::indexer`].
     ///
     /// The key PUBLISHING stays once per layer (it is a function of the compressor's
@@ -3524,9 +3963,11 @@ impl<'a> DevChain<'a> {
         let idx_hd = cfg.index_head_dim.max(1);
         let rd = cfg.rope_head_dim;
         let half = (cfg.rope_head_dim / 2) as i32;
-        let ratio = cfg.compress_ratio(layer).max(1);
         let ld = &self.w.layers[layer];
-        let (Some(idx_wq_b), Some(idx_wq_b_s), Some(wk), Some(kn), Some(wp)) = (
+        // `idx_wk`/`idx_k_norm` are consumed by `publish_index_key` — the key
+        // publishing below AND the spec commit's replay — but an indexer without
+        // them must still decline here, hence the presence check.
+        let (Some(idx_wq_b), Some(idx_wq_b_s), Some(_), Some(_), Some(wp)) = (
             ld.idx_wq_b.as_ref(),
             ld.idx_wq_b_scale.as_ref(),
             ld.idx_wk.as_ref(),
@@ -3540,42 +3981,7 @@ impl<'a> DevChain<'a> {
         // the group the compressor produced; the roped key lands in the owner's
         // `index_k` at the slot its DEVICE counter names.
         if cfg.indexer_owns_k(layer) {
-            let clen_layer = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer);
-            self.lin_bf16(
-                self.layers[layer].latent.ptr as *const f32,
-                cfg.head_dim as i32,
-                wk,
-                idx_hd as i32,
-                self.s.idx_k.ptr as *mut f32,
-            )?;
-            self.dev.rmsnorm(
-                self.s.idx_k.ptr as *const f32,
-                kn.as_f32(),
-                self.s.idx_k.ptr as *mut f32,
-                1,
-                idx_hd as i32,
-                cfg.norm_eps,
-            )?;
-            self.dev.apply_rope(
-                self.s.idx_k.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
-                1,
-                idx_hd as i32,
-                rd as i32,
-                (rd / 2) as i32,
-                clen_layer,
-                ratio as i32,
-                -(ratio as i32),
-                1,
-                false,
-            )?;
-            self.dev.index_k_publish(
-                self.layers[layer].index_k.ptr as *mut f32,
-                self.s.idx_k.ptr as *const f32,
-                clen_layer,
-                idx_hd as i32,
-            )?;
+            self.publish_index_key(layer)?;
         }
         // ---- per-row queries, weights and selection ----
         // The q_lora stream is already normed (attention_rows ran the plain
@@ -3689,6 +4095,27 @@ impl<'a> DevChain<'a> {
             // single-row path zeroes `scp` here; in that mode every row is pooled
             // independently, so all m rows are zeroed.
             self.dev.zero_on(&self.s.scp_r, st)?;
+        }
+        // DSV41_SPEC: the commit replays the ACCEPTED PREFIX of this block
+        // through the compressor, and the only way to play a row back is with the
+        // projections that row consumed. `s.kvp_r`/`s.scp_r` are SHARED m-row
+        // scratch, overwritten by every compress-source layer in turn — so save
+        // this layer's rows now, while they are still this layer's. Armed only
+        // around the spec step's verify, so the shadow path pays nothing.
+        if self.spec_capture {
+            let n = m * hd * std::mem::size_of::<f32>();
+            self.dev.memcpy_d2d(
+                (self.s.spec_snap_kvp.ptr as *mut f32)
+                    .wrapping_add(layer * VERIFY_ROWS * hd) as *mut c_void,
+                self.s.kvp_r.ptr as *const c_void,
+                n,
+            )?;
+            self.dev.memcpy_d2d(
+                (self.s.spec_snap_scp.ptr as *mut f32)
+                    .wrapping_add(layer * VERIFY_ROWS * hd) as *mut c_void,
+                self.s.scp_r.ptr as *const c_void,
+                n,
+            )?;
         }
         // PER-ROW single-token pool+commit: the pool's state decode branch and
         // the commit's completion rule are per-POSITION. Running them once with

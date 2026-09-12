@@ -370,6 +370,7 @@ fn pool_rank_body(
     let mut dspark_steps: u64 = 0;
     let mut dspark_draft_ms: f64 = 0.0;
     let mut dspark_verify_ms: f64 = 0.0;
+    let mut dspark_commit_ms: f64 = 0.0;
     if rank == 0 {
         eprintln!("[dsv41] rank0: chain ready, serving");
     }
@@ -423,71 +424,145 @@ fn pool_rank_body(
             }
             Ok(RankCmd::DecodeRun { token, pos, n }) => {
                 // n steps in one command; stops early on a stop token so the pool's
-                // buffer never runs past the driver's stop decision
+                // buffer never runs past the driver's stop decision.
+                //
+                // DSV41_SPEC makes a step's YIELD variable: a committed DSpark
+                // block advances the engine by `k_acc + 1` positions and hands
+                // back that many tokens, so the loop strides by what the step
+                // returned — NOT by `i`. The old `pos + i` arithmetic is the
+                // single biggest pitfall here: one multi-token step with a fixed
+                // +1 stride desyncs the driver's position from the engine's
+                // counter and the very next step writes the wrong slot.
                 let mut out: Vec<u32> = Vec::with_capacity(n);
                 let mut t = token;
+                let mut p = pos;
                 let mut r = Ok(());
-                for i in 0..n {
+                while out.len() < n {
                     let st = std::time::Instant::now();
-                    let next = if let Some(d) = dspark.as_mut() {
-                        // shadow mode: the single-row step stays the engine's
-                        // real output; draft+verify run beside it and roll back
-                        let rep = match chain.dspark_shadow_step(d, t, pos + i) {
-                            Ok(rep) => rep,
+                    let emitted: Vec<u32> = if let Some(d) = dspark.as_mut() {
+                        if spec_mode() {
+                            // REAL COMMIT: the draft+verify block is kept for the
+                            // accepted prefix, so this step is the ONLY forward
+                            // this step runs.
+                            let rep = match chain.dspark_spec_step(d, t, p) {
+                                Ok(rep) => rep,
+                                Err(e) => {
+                                    // NEVER `?` here: a swallowed error makes this
+                                    // rank exit without answering, its siblings spin
+                                    // in the next barrier forever, and the operator
+                                    // sees "a rank did not answer" with NO cause —
+                                    // the exact blind spot the wedge bisect hit.
+                                    eprintln!(
+                                        "[dsv41] rank {rank} spec step err at pos {p}: {e}"
+                                    );
+                                    let _ = res_tx.send((rank, Err(e)));
+                                    return Ok(());
+                                }
+                            };
+                            dspark_acc_sum += rep.k_acc as u64;
+                            dspark_steps += 1;
+                            dspark_draft_ms += rep.draft_ms as f64;
+                            dspark_verify_ms += rep.verify_ms as f64;
+                            dspark_commit_ms += rep.commit_ms as f64;
+                            if std::env::var_os("DSV41_DSPARK_DEBUG").is_some() && rank == 0 {
+                                eprintln!(
+                                    "[dspark-dbg] pos={} next={} drafts={:?} verify={:?} \
+                                     k_acc={} emitted={:?} commit={:.2}ms",
+                                    p,
+                                    rep.next,
+                                    rep.drafts,
+                                    rep.verify_out,
+                                    rep.k_acc,
+                                    rep.emitted,
+                                    rep.commit_ms
+                                );
+                            }
+                            if timing && rank == 0 && dspark_steps % 50 == 0 {
+                                eprintln!(
+                                    "[dspark] steps={} mean-k={:.3} tok/step={:.3} draft={:.2}ms \
+                                     verify={:.2}ms commit={:.2}ms (per step)",
+                                    dspark_steps,
+                                    dspark_acc_sum as f64 / dspark_steps as f64,
+                                    (dspark_acc_sum + dspark_steps) as f64 / dspark_steps as f64,
+                                    dspark_draft_ms / dspark_steps as f64,
+                                    dspark_verify_ms / dspark_steps as f64,
+                                    dspark_commit_ms / dspark_steps as f64,
+                                );
+                            }
+                            rep.emitted
+                        } else {
+                            // shadow mode: the single-row step stays the engine's
+                            // real output; draft+verify run beside it and roll back
+                            let rep = match chain.dspark_shadow_step(d, t, p) {
+                                Ok(rep) => rep,
+                                Err(e) => {
+                                    eprintln!(
+                                        "[dsv41] rank {rank} shadow step err at pos {p}: {e}"
+                                    );
+                                    let _ = res_tx.send((rank, Err(e)));
+                                    return Ok(());
+                                }
+                            };
+                            dspark_acc_sum += rep.accepted as u64;
+                            dspark_steps += 1;
+                            dspark_draft_ms += rep.draft_ms as f64;
+                            dspark_verify_ms += rep.verify_ms as f64;
+                            // per-step token-level trace (DSV41_DSPARK_DEBUG): the
+                            // draft block vs the real next token and the verify's
+                            // argmax row — the fastest way to see whether a low
+                            // accept is a structural break (unrelated tokens) or
+                            // precision noise (neighbouring tokens).
+                            if std::env::var_os("DSV41_DSPARK_DEBUG").is_some() && rank == 0 {
+                                eprintln!(
+                                    "[dspark-dbg] pos={} next={} drafts={:?} verify={:?} acc={}",
+                                    p,
+                                    rep.next,
+                                    rep.drafts,
+                                    rep.verify_out,
+                                    rep.accepted
+                                );
+                            }
+                            if timing && rank == 0 && dspark_steps % 50 == 0 {
+                                eprintln!(
+                                    "[dspark] steps={} mean-accept={:.3} draft={:.2}ms verify={:.2}ms (per step)",
+                                    dspark_steps,
+                                    dspark_acc_sum as f64 / dspark_steps as f64,
+                                    dspark_draft_ms / dspark_steps as f64,
+                                    dspark_verify_ms / dspark_steps as f64,
+                                );
+                            }
+                            vec![rep.next]
+                        }
+                    } else {
+                        let tok = match chain.step_dev(t, p) {
+                            Ok(tok) => tok,
                             Err(e) => {
-                                // NEVER `?` here: a swallowed error makes this
-                                // rank exit without answering, its siblings spin
-                                // in the next barrier forever, and the operator
-                                // sees "a rank did not answer" with NO cause —
-                                // the exact blind spot the wedge bisect hit.
-                                eprintln!("[dsv41] rank {rank} shadow step err at pos {}: {e}", pos + i);
+                                eprintln!("[dsv41] rank {rank} step err at pos {p}: {e}");
                                 let _ = res_tx.send((rank, Err(e)));
                                 return Ok(());
                             }
                         };
-                        dspark_acc_sum += rep.accepted as u64;
-                        dspark_steps += 1;
-                        dspark_draft_ms += rep.draft_ms as f64;
-                        dspark_verify_ms += rep.verify_ms as f64;
-                        // per-step token-level trace (DSV41_DSPARK_DEBUG): the
-                        // draft block vs the real next token and the verify's
-                        // argmax row — the fastest way to see whether a low
-                        // accept is a structural break (unrelated tokens) or
-                        // precision noise (neighbouring tokens).
-                        if std::env::var_os("DSV41_DSPARK_DEBUG").is_some() && rank == 0 {
-                            eprintln!(
-                                "[dspark-dbg] pos={} next={} drafts={:?} verify={:?} acc={}",
-                                pos + i,
-                                rep.next,
-                                rep.drafts,
-                                rep.verify_out,
-                                rep.accepted
-                            );
-                        }
-                        if timing && rank == 0 && dspark_steps % 50 == 0 {
-                            eprintln!(
-                                "[dspark] steps={} mean-accept={:.3} draft={:.2}ms verify={:.2}ms (per step)",
-                                dspark_steps,
-                                dspark_acc_sum as f64 / dspark_steps as f64,
-                                dspark_draft_ms / dspark_steps as f64,
-                                dspark_verify_ms / dspark_steps as f64,
-                            );
-                        }
-                        rep.next
-                    } else {
-                        match chain.step_dev(t, pos + i) {
-                            Ok(n) => n,
-                            Err(e) => {
-                                eprintln!("[dsv41] rank {rank} step err at pos {}: {e}", pos + i);
-                                let _ = res_tx.send((rank, Err(e)));
-                                return Ok(());
-                            }
-                        }
+                        vec![tok]
                     };
-                    step_time(pos + i, st.elapsed());
-                    out.push(next);
-                    t = next;
-                    if stop_set.contains(&next) {
+                    step_time(p, st.elapsed());
+                    let step_len = emitted.len();
+                    let mut hit_stop = false;
+                    for &tok in &emitted {
+                        out.push(tok);
+                        if stop_set.contains(&tok) {
+                            hit_stop = true;
+                            break;
+                        }
+                    }
+                    // The engine has already advanced by the WHOLE block, so the
+                    // driver's position follows it even when a stop token cut the
+                    // emission short (the pool resets the chain on the next
+                    // prefill, so the unreported tail is harmless).
+                    if let Some(&last) = emitted.last() {
+                        t = last;
+                    }
+                    p += step_len;
+                    if hit_stop {
                         break;
                     }
                 }
@@ -499,6 +574,19 @@ fn pool_rank_body(
             Err(_) => return Ok(()),
         }
     }
+}
+
+/// `DSV41_SPEC=1` switches the DSpark step from SHADOW to REAL COMMIT: the draft
+/// + verify block is kept for its accepted prefix and the engine advances by the
+/// block's yield instead of by one. Read ONCE and cached (the house rule for
+/// every hot-path gate: a per-step getenv is exactly the slip this project has
+/// been bitten by), and `"0"` means OFF even though it is "set".
+///
+/// It still requires `DSV41_DSPARK=1`: without the tap hook there is no draft and
+/// the chain falls through to the plain single-row step.
+fn spec_mode() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SPEC").map(|v| v != "0").unwrap_or(false))
 }
 
 /// Feed the prompt one token per forward (the KV ring is per-sequence) and
