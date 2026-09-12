@@ -530,6 +530,38 @@ struct Kernels {
             c_int, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // K2, from dsv41_kernels.cu (`dsv41_gemm_fp8_mrows_rope_norm`): the verify's
+    // q-chain tail folded into ONE launch — rmsnorm + fp8 quantisation + the
+    // wq_b multi-row fp8 GEMV + RoPE, each segment reproduced from the kernel the
+    // verify path runs TODAY (`dsv41_rmsnorm_rows_kernel`, `quant_kernel<0>`,
+    // `gemm_fp8_mrows_kernel<M>`, `apply_rope_mrows_kernel`), so the fused launch
+    // is the same program as the four-launch sequence it replaces.
+    //
+    // It is the K2 replacement for R2's `lin_rope_norm`: NO EAGER kernel program
+    // is involved (R2 reused the `gemm_fp8_gemv_kernel` family, a different
+    // program than the `mrows` chain) and the rope position is an explicit
+    // `pos_rows[r]` DEVICE ARRAY — the kernel contains no `pos_ctr`, no
+    // `mul`/`off`/`step` (R2's second difference).
+    //
+    // `qr_norm_out` is where the normalised rows land; the shipped caller passes
+    // `s.qr_r` (in place), which is what keeps the indexer's q half reading the
+    // same bytes it reads today with no RAW flag and no compensating launch.
+    // `nullptr` is legal (the row stays raw and the caller owes the norm).
+    //
+    // Optional: a stale `.so` without the symbol keeps the four-launch sequence,
+    // and the C entry returns 2 (declined, never cudaErrorInvalidValue) for `m`
+    // outside 1..=8, a `k`/`n`/`rope_hd` that is not a multiple of 32, an odd or
+    // out-of-range `rope_rd`, `out_stride < n`, or a run configured for the
+    // reordering `DSV41_GEMV_FP8_MODE` 0/1 arms.
+    // ABI: (qr_raw, qr_w, qr_eps, qr_norm_out, w, w_scale, bias, out, m, n, k,
+    //       out_stride, cos, sin, pos_rows, rope_rd, rope_hd, inverse, s).
+    gemm_fp8_mrows_rope_norm: Option<
+        unsafe extern "C" fn(
+            *const f32, *const f32, f32, *mut f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, *const f32, *const f32, *const c_int, c_int, c_int,
+            c_int, CuStream,
+        ) -> c_int,
+    >,
     // K1 (`dsv41_gemm_fp8_mrows2`, from dsv41_kernels.cu): the TWO-FAMILY form of
     // the multi-row fp8 GEMV above -- the verify's wq_a + wkv pair in ONE launch,
     // since both project the SAME quantised activation row with the same `k`.
@@ -1311,6 +1343,7 @@ impl Device {
             bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
+            gemm_fp8_mrows_rope_norm: ko!(rt, "dsv41_gemm_fp8_mrows_rope_norm"),
             gemm_fp8_mrows2: ko!(rt, "dsv41_gemm_fp8_mrows2"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
@@ -4191,6 +4224,98 @@ impl Device {
     /// per-row loop, which is the bit-exact reference they were verified against.
     pub fn supports_gemm_fp8_mrows(&self) -> bool {
         self.kernels.gemm_fp8_mrows.is_some()
+    }
+
+    /// K2: the verify's q-chain tail in ONE launch — rmsnorm(`qr_raw`) + its fp8
+    /// quantisation + the wq_b multi-row fp8 GEMV + the RoPE of the result.
+    ///
+    /// Each of the four segments is reproduced from the kernel the verify path
+    /// runs TODAY there (`dsv41_rmsnorm_rows_kernel`, `quant_kernel<0>`,
+    /// `gemm_fp8_mrows_kernel<M>`, `apply_rope_mrows_kernel`), so the fused
+    /// launch is the same program as the four-launch sequence, per element (the
+    /// kernel header in `dsv41_kernels.cu` carries the per-segment argument).
+    /// This is deliberately NOT `lin_rope_norm`'s family: R2's corruption came
+    /// from re-pointing the `mrows` chain at EAGER `m = 1` programs and from
+    /// reading the position out of `*pos_ctr`; here no EAGER program takes part
+    /// and `pos_rows` is an explicit device array (no `pos_ctr`/`mul`/`off`/`step`
+    /// exists in the kernel).
+    ///
+    /// `qr_norm_out` receives the normalised rows and is where the caller decides
+    /// the coupling: `Some(qr_r)` (the shipped call) leaves `qr_r` normalised —
+    /// byte for byte what `norm_rows` left there — so the indexer's q half needs
+    /// no RAW flag; `None` leaves `qr_raw` untouched and the caller owes the norm.
+    ///
+    /// `Ok(false)` means NOT performed — keep `norm_rows + quant_rows +
+    /// proj_mrows + apply_rope_mrows`: either the loaded .so predates the symbol,
+    /// or the C entry declined (it returns 2, never cudaErrorInvalidValue, so a
+    /// decline can never read as a launch failure). The `1..=8` bound and the
+    /// `m <= VERIFY_ROWS` staging bound are re-checked here, exactly as in
+    /// [`Self::gemm_fp8_mrows`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mrows_rope_norm(
+        &self,
+        qr_raw: *const f32,
+        qr_w: *const f32,
+        qr_eps: f32,
+        qr_norm_out: *mut f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+        rope_cos: *const f32,
+        rope_sin: *const f32,
+        pos_rows: *const c_int,
+        rope_rd: i32,
+        rope_hd: i32,
+        rope_inverse: bool,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mrows_rope_norm else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                qr_raw,
+                qr_w,
+                qr_eps,
+                qr_norm_out,
+                w,
+                w_scale,
+                bias,
+                out,
+                rows,
+                n,
+                k,
+                out_stride,
+                rope_cos,
+                rope_sin,
+                pos_rows,
+                rope_rd,
+                rope_hd,
+                rope_inverse as i32,
+                self.stream,
+            )
+        };
+        // 2 = the kernel's "declined" (shape/mode), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mrows_rope_norm")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries K2
+    /// (`dsv41_gemm_fp8_mrows_rope_norm`). A stale .so leaves
+    /// `DSV41_ATTN_MROWS_ROPE_NORM` inert and the four-launch sequence runs,
+    /// which is the bit-exact reference K2 was written against.
+    pub fn supports_gemm_fp8_mrows_rope_norm(&self) -> bool {
+        self.kernels.gemm_fp8_mrows_rope_norm.is_some()
     }
 
     /// K1: the two-family form of [`Self::gemm_fp8_mrows`] — two projections of

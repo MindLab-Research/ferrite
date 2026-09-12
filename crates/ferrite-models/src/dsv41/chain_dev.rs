@@ -2199,6 +2199,45 @@ impl AttnLinFuse {
     }
 }
 
+/// K2 (DSV41_ATTN_MROWS_ROPE_NORM, **DEFAULT OFF** — A/B first): the verify's
+/// q-chain tail in ONE launch — `norm_rows + quant_rows + proj_mrows +
+/// apply_rope_mrows` (4 launches) → `gemm_fp8_mrows_rope_norm`.
+///
+/// This is the K2 replacement for R2's `lin_rope_norm` half (see
+/// [`attn_lin_fuse`]). The design rule it follows is "do not swap the program,
+/// only move the code": every segment of the fused kernel is copied from the
+/// kernel THIS path already runs there today —
+/// `dsv41_rmsnorm_rows_kernel` (the norm), `quant_kernel<0>` (the fp8 emission),
+/// `gemm_fp8_mrows_kernel<M>` (the wq_b GEMV) and `apply_rope_mrows_kernel` (the
+/// rope) — so the fused launch is the same program as the four it replaces.
+/// R2 failed on the opposite property: it re-pointed the same site at EAGER's
+/// `m = 1` `gemm_fp8_gemv_kernel` family (a different program, "claimed but
+/// never measured" to be equivalent) and read the position out of `*pos_ctr`.
+///
+/// Two consequences of that choice, both structural rather than point fixes:
+///   * the position is `pos_rows[r]`, an explicit device array — the kernel has
+///     no `pos_ctr`, no `mul`/`off`/`step`;
+///   * nothing touches `s.xq`/`s.xsc`/`s.xn`/`s.qr` and `quant1` is never called,
+///     so neither the single-row scratch sharing nor the `xq_of_*` consume-once
+///     flags R2's `lin2` half stirred are reachable.
+///
+/// The fused launch WRITES the normalised rows back into `qr_r`, which is why
+/// the indexer's q half needs no change at all: it reads the same bytes
+/// `norm_rows` used to leave there, and the whole
+/// `s.qr_raw`/`s.qr_raw_r`/`DSV41_INDEXER_QR_RAW` chain R2 needed does not exist
+/// on this path. `m` stays inside the `mrows` bound (`m <= VERIFY_ROWS`), and
+/// every decline (`swapab`, a stale `.so`, a shape the C entry rejects) falls
+/// straight through to the four-launch sequence, whose numerics it reproduces by
+/// construction — so OFF and ON-but-declined are the same code path.
+fn attn_mrows_rope_norm() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ATTN_MROWS_ROPE_NORM")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// R2b (DSV41_INDEXER_QR_RAW, **default ON, only reachable under R2**): the
 /// indexer's q half consumes the RAW `qr_r` that R2's fused wq_b launch left
 /// behind, normalising it inside its own gemv prologue, instead of the copy R2
@@ -4363,6 +4402,80 @@ impl<'a> DevChain<'a> {
             n,
             k,
             out_stride,
+        )
+    }
+
+    /// K2: the q-chain tail — norm + fp8 quant + the wq_b GEMV + rope — in ONE
+    /// launch, the m-row twin of `norm_rows(qr_r) + quant_rows(qr_r) +
+    /// proj_mrows(wq_b) + apply_rope_mrows(q_r)`.
+    ///
+    /// Every segment of the kernel is the verify's own program, copied: the norm
+    /// is `dsv41_rmsnorm_rows_kernel`'s arithmetic at its own blockDim (1024 —
+    /// the fused kernel pins 32 warps for exactly that reason, see its header),
+    /// the fp8 emission is `quant_kernel<0>`'s 32-element block, the GEMV is
+    /// `gemm_fp8_mrows_kernel<M>`'s staging/walk/reduction (the C1-C6 contract
+    /// [`Self::proj_mrows`] documents) and the rope epilogue is
+    /// `apply_rope_mrows_kernel`'s pair rotation at `pos_rows[r]`.
+    ///
+    /// Two properties make it the K2 answer to R2 rather than a re-run of it:
+    /// the position is `pos_rows` (a device array; the kernel has no `pos_ctr`,
+    /// no `mul`/`off`/`step`), and NOTHING here touches `s.xq`/`s.xsc`/`s.xn`/
+    /// `s.qr` or `quant1` — the fused kernel runs its whole prologue in its own
+    /// shared memory and never reads the single-row staging.
+    ///
+    /// `a_raw` is BOTH the norm's input and (in place) its output: the kernel
+    /// writes the normalised rows back to the address it read, which is what
+    /// `norm_rows(qr_r, q_norm, qr_r, ...)` did. That is the design choice
+    /// ("write back, no flag"): sending `s.qr_r` as `a_raw` leaves `qr_r`
+    /// NORMALISED when the launch returns, so the indexer's q half — the only
+    /// other `qr_r` reader — needs no RAW branch and no compensating launch.
+    ///
+    /// `Ok(false)` = NOT performed, the caller keeps the four-launch sequence:
+    /// the `.so` lacks the symbol, or the C entry declined the shape (it returns
+    /// 2, never `cudaErrorInvalidValue`). `rows` outside 1..=8 is refused here
+    /// too, the bound the C entry enforces and the template dispatch covers.
+    #[allow(clippy::too_many_arguments)]
+    fn mrows_rope_norm(
+        &self,
+        a_raw: *const f32,
+        qw: *const f32,
+        eps: f32,
+        k: i32,
+        w: &crate::dsv41::load::DevTensor,
+        ws: &crate::dsv41::load::DevTensor,
+        n_out: i32,
+        out: *mut f32,
+        rows: usize,
+        out_stride: i32,
+        pos_rows: *const std::os::raw::c_int,
+        rope_rd: i32,
+        rope_hd: i32,
+    ) -> Result<bool> {
+        if Self::swapab() {
+            return Ok(false);
+        }
+        self.dev.gemm_fp8_mrows_rope_norm(
+            a_raw,
+            qw,
+            eps,
+            // In place: the same address `norm_rows(qr_r, q_norm, qr_r, ...)`
+            // wrote. `a_raw`'s buffer is a `DevBuf` (mutable device memory); the
+            // const/mut split is only the caller's read-side view of it.
+            a_raw as *mut f32,
+            w.as_u8(),
+            ws.as_u8(),
+            std::ptr::null(),
+            out,
+            rows as i32,
+            n_out,
+            k,
+            out_stride,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            pos_rows,
+            rope_rd,
+            rope_hd,
+            false,
         )
     }
 
@@ -9911,8 +10024,15 @@ impl<'a> DevChain<'a> {
         // own gemv prologue and the `norm_rows` is skipped — same bytes into the
         // GEMV's dot either way. The rope is then already on `q_r` and the
         // standalone rope below skips the row.
-        let q_norm_fused = rope_norm_gate
-            && self.lin_rope_norm(
+        //
+        // K2 (DSV41_ATTN_MROWS_ROPE_NORM, default OFF): the same four launches
+        // folded into ONE using ONLY this path's own kernels (norm + quant +
+        // wq_b + rope — see [`attn_mrows_rope_norm`]). Unlike R2's fused launch
+        // it WRITES THE NORMALISED ROWS BACK, so `qr_r` comes out normalised and
+        // every later reader (the indexer's q half included) is untouched.
+        let k2_took = if attn_mrows_rope_norm() && mrows && self.dev.supports_gemm_fp8_mrows_rope_norm()
+        {
+            self.mrows_rope_norm(
                 self.s.qr_r.ptr as *const f32,
                 ld.q_norm.as_ref().unwrap().as_f32(),
                 cfg.norm_eps,
@@ -9921,23 +10041,52 @@ impl<'a> DevChain<'a> {
                 ld.wq_b_scale.as_ref().unwrap(),
                 (nlh * hd) as i32,
                 self.s.q_r.ptr as *mut f32,
+                m,
+                (nh * hd) as i32,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
                 rd as i32,
                 hd as i32,
-            )?;
+            )?
+        } else {
+            false
+        };
+        let q_norm_fused = k2_took
+            || (rope_norm_gate
+                && self.lin_rope_norm(
+                    self.s.qr_r.ptr as *const f32,
+                    ld.q_norm.as_ref().unwrap().as_f32(),
+                    cfg.norm_eps,
+                    ql as i32,
+                    ld.wq_b.as_ref().unwrap(),
+                    ld.wq_b_scale.as_ref().unwrap(),
+                    (nlh * hd) as i32,
+                    self.s.q_r.ptr as *mut f32,
+                    rd as i32,
+                    hd as i32,
+                )?);
         // R2b (DSV41_INDEXER_QR_RAW, default ON under R2): when the fused wq_b
         // launch above took (only ever at `m == 1`), `qr_r` is RAW and the
         // indexer's q half is the one reader that has to be told. Handing it the
         // flag lets it normalise inside its own gemv prologue — the `norm_rows`
         // below then has nothing left to do for it, which is the launch R2b
         // removes. `=0` keeps R2's compensating normalisation verbatim.
-        let qr_raw_r = q_norm_fused && indexer_qr_raw();
+        // K2 leaves `qr_r` NORMALISED (the fused kernel writes the norm back), so
+        // it must not raise the RAW flag and must skip the `norm_rows` below —
+        // otherwise the row would be normalised twice. `k2_took` is the only
+        // thing that distinguishes the two fused launches here: R2's
+        // `lin_rope_norm` normalises into shared memory and leaves the row raw,
+        // K2's `mrows_rope_norm` writes it back.
+        let qr_raw_r = q_norm_fused && !k2_took && indexer_qr_raw();
         self.s.qr_raw_r.set(qr_raw_r);
         // q norm, in place: ALL m rows in ONE launch (the T2 epilogue's own
         // fallback pair — a plain rmsnorm into `qr`). Was m launches.
         // R2b: skipped when the fused wq_b left `qr_r` raw and the indexer
         // consumes it that way (see `qr_raw_r` above); `m == 1` on that arm, so
         // there is no second row whose normalisation anything could need.
-        if !qr_raw_r {
+        // K2: also skipped — its fused launch already wrote the normalised rows
+        // back into `qr_r`, so normalising again would be a second pass over an
+        // already-normalised row (see `k2_took`).
+        if !qr_raw_r && !k2_took {
             self.norm_rows(
                 self.s.qr_r.ptr as *const f32,
                 ld.q_norm.as_ref().unwrap().as_f32(),
