@@ -176,3 +176,31 @@ lazy 数学上限 ~145（k_emit × c_row）。400 需要：
 3. **guard band**（reduced 溢出在到达 epoch 前被拦截）
 
 **batched 路径现在可用！** 下一步：纯净基线测量 → SH_PAIR M=6 → mrows → 400 冲刺！
+
+---
+
+## Session 末尾的 AR Step 2 教训（知识固化）
+
+### AR Step 2 (A1a MoE store fold) 的失败
+**实施**：+665 行——MoE all-reduce 的 staging 拷贝从独立 p2p_ar_store_v5 挪进 payload 最后写者的 epilogue
+**实测**：
+| 路径 | AR_FUSE=0 | AR_FUSE=1 | 判定 |
+|---|---|---|---|
+| lazy | 91.1 tok/s / 前 61 行 ✓ | 90.9 tok/s / **前 61 行 ✗** | 性能中性但数值破坏！ |
+| SWALLOW | 58.3 tok/s / 前 61 行 ✓ | **7.1 tok/s** / **前 61 行 ✗** | **8× 性能 + 数值双破坏！** |
+
+**结论**：A1a 有根本性数值 bug——两条路径的正确性都被破坏。AR_STORE_FUSE 保持 OFF（默认）。
+**教训**：store fold 的优化必须以逐字节一致为前提（gate ON vs OFF）才能上生产。
+
+### 修正后的 SWALLOW 400 路线
+**口径校准**（SWALLOW 优化执行计划的判决）：
+- AR 每步实际 = 84 轮 × 78.3μs = **6.58ms**（36% 是 kernel-sum 占比不是步时占比！）
+- mrows S2 现实收益 = **-3.0ms**（不是 -4.5ms——B1 ⊂ B2 不可加）
+- 400 ladder: 28.0 → +SH_PAIR 21.6 → +mrows 18.6 → +hc 17.1 → +tcgen05 **14.7ms = 441 tok/s**
+- 三轨道并行：GPU 轨 + 写码轨（B6/B5/B4 不占 GPU！）+ 诊断轨
+
+### 下一 session 的前 30 分钟
+1. 读 session-final-handover.md 的 SWALLOW 部分 + 400 final path
+2. 检查 mrows Phase A 的实施状态（本轮 mrows-batched-impl-p1 正在实施）
+3. 起一臂 SWALLOW + mrows 测试 → mrows 的增量
+4. 5 个决策点：A1a 修或弃（建议硬止损）· hc 破 FORBIDDEN · SWALLOW 常开 vs 路由 · tcgen05 go/no-go · 400 口径锁定 counting
