@@ -3020,3 +3020,31 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - L2 LAZY_SDR: 待测试
 
 **下一步**：L3+L2（SH_PAIR + LAZY_SDR，不含 MARKOV_SLICED）
+
+## ⚠️ L3+L2 测试结果（88481fcd）——LAZY_SDR 也退化 accept！
+
+**结果**：
+- 零拉丁 ✓，0 ar5-hang ✓
+- **k_acc: 5 3 1 1 1 1 1 1 1 1 1 1 5 3 5 5 5 3 3 1**（mean ~2.4——从 5.0 退化！）
+- **吞吐 71.7 tok/s**（vs 基线 78.8——净负）
+- completion=108（vs 144——生成更短）
+
+**与 MARKOV_SLICED 的对比**：
+| 优化 | k_acc | 吞吐 | 判定 |
+|---|---|---|---|
+| 基线（无优化）| ~5.0 | 78.8 | — |
+| SH_PAIR_M=1 | ~5.0 | 78.1 | ✓ 中性 |
+| + MARKOV_SLICED | ~1.4 | 73.3 | ✗ 退化 |
+| + LAZY_SDR | ~2.4 | 71.7 | ✗ 退化 |
+
+**⚠️ 两个"优化"都退化 accept**——它们应该数值中性（不改计算结果只改 kernel 排布）但实际改变了数值输出。**可能有 bug**。
+
+## 400 路线图的第二个关键口径纠正（implementation-priority-roadmap）
+
+**22.56ms 是 accept=1.214 的步时（k_emit=2.2）不是 accept=5 的（k_emit=6→~53.5ms 理论/~35ms 实测）！**
+
+"6/0.02256=266 tok/s" 混用了 accept-1.1 步时和 accept-5 tok/step——与之前"33ms"是同类口径错误但方向相反！
+
+**实际 @ accept 5**：
+- 步时 ~35ms → 6/0.035 = **171 tok/s**（不是 266！）
+- **400 需要步时 ≤15ms——从 35ms 差距 20ms！**
