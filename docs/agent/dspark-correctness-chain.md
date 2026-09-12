@@ -1050,3 +1050,17 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 - **确认**：截断本身不是性能问题——性能变化来自 accept 模式改变每步行数
 
 **结论**：`DSV41_BF16_TRUNCATE=1` 是零拉丁的充分条件，性能代价 ~0（只是改变了 accept 分布）。
+
+## P0-2 temperature 查证结果——非阻塞 ✓
+
+- checkpoint config: `temperature: NOT-SET`（没有设置）
+- ferrite config.rs:191: `unwrap_or(1.0)`（默认 1.0——**是个雷**）
+- 官方 model.py: `temperature == 0 → argmax; 否则 gumbel-max 采样`
+- **判定**：官方参考的 generate.py 在贪心生成下传 temperature=0 → argmax。ferrite 的 draft 也是 argmax。**贪心测试下等价** ✓
+- **风险**：如果未来启用采样（temperature>0），ferrite 的 argmax 与官方的 gumbel 会分歧。建议把默认改为 0.0 或加断言。
+
+## P0-1 seed 相位修复已提交（等 GPU 验证 079ffbaf）
+
+修复：`seed_window(s, pos-1)` → `seed_window(s, pos)`（官方 model.py:1039/:1065 的 start_pos 语义）。这是 accept 1.02 的**头号嫌疑**——所有 main-chain KV 的相对距离系统性偏 1。
+
+## P0-3（tap 采集点）和 P1-5（head/gate 截断）正在 subagent 实现
