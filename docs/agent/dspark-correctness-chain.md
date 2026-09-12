@@ -1330,3 +1330,13 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 1. **batched 400 v2 测试**（SWALLOW_STEP + 全 mrows + tcgen05 + BF16_TRUNCATE）——步时目标 ≤10ms
 2. **追加 accept 杠杆**（SEED_POS + DRAFT_ATTN + TAP_BF16）——测试在跑（10ba0e73）
 3. **tcgen05 的正确 A/B**（三件套 gate 链 + ILV 冲突检查）
+
+## Accept 杠杆的最终判定（10ba0e73）
+
+| 组合 | accept | 判定 |
+|---|---|---|
+| 基线（无杠杆）| 1.022 | 基准 |
+| P0-3+P1-5 | **1.214** | **最佳**（+19%）|
+| P0-3+P1-5+SEED_POS+DRAFT_ATTN+TAP_BF16 | 0.898 | **退化**（-26%）|
+
+**结论**：P0-3（tap 采集点）+ P1-5（bf16 域）是 accept 的最优组合。SEED_POS（即使有 winrows 配套）、DRAFT_ATTN、TAP_BF16 的追加会降低 accept——**应保持 OFF**。
