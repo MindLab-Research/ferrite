@@ -124,6 +124,14 @@ pub struct Inject {
     pub token: i32,
     /// replaces the `pos` this forward is anchored at
     pub pos: Option<usize>,
+    /// per-block window-ring overrides (`[block][win][hd]`, the golden
+    /// harness's `stage{s}.ring_before`): when present, each draft block's
+    /// window ring is overwritten BEFORE the attention runs, so the unit diff
+    /// can compare the attention against the golden's exact window (the
+    /// per-step `seed_window` still runs after and overwrites ONE slot — the
+    /// golden's `ring_before` was taken before ITS seed, so injecting it and
+    /// re-seeding reproduces the golden's `ring_after` exactly).
+    pub rings: Option<Vec<Vec<Vec<f32>>>>,
 }
 
 /// The parsed injection, or `None` when the gate is off. A malformed file is
@@ -173,10 +181,29 @@ fn parse_inject(path: &str) -> std::result::Result<Inject, String> {
         .get("pos")
         .and_then(|p| p.as_i64())
         .map(|p| p.max(0) as usize);
+    // rings: [block][win][hd] — the golden harness's stage{s}.ring_before
+    let mut rings = None;
+    if let Some(blocks) = v.get("rings").and_then(|a| a.as_array()) {
+        let mut parsed = Vec::with_capacity(blocks.len());
+        for b in blocks {
+            let rows = b.as_array().ok_or("\"rings\" block is not an array")?;
+            let mut block = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut r = Vec::with_capacity(row.as_array().map(|a| a.len()).unwrap_or(0));
+                for x in row.as_array().into_iter().flatten() {
+                    r.push(x.as_f64().ok_or("\"rings\" has a non-number")? as f32);
+                }
+                block.push(r);
+            }
+            parsed.push(block);
+        }
+        rings = Some(parsed);
+    }
     Ok(Inject {
         main_hidden,
         token,
         pos,
+        rings,
     })
 }
 

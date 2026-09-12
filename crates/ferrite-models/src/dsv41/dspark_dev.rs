@@ -624,8 +624,35 @@ impl<'a> DsparkDev<'a> {
         // live capture so only the ONE dumped forward is touched — the rest of the
         // serve is untouched. `main_h` stays a device buffer: the override is one
         // H2D, not a host round trip.
-        // The window RING is deliberately NOT injected: it is seeded by earlier
-        // forwards, exactly like the reference's seed pass.
+        // The window RING inject: the golden harness's `stage{s}.ring_before`,
+        // uploaded per block so the attention diff runs against the EXACT same
+        // window the reference saw (the per-step `seed_window` still runs after
+        // and overwrites one slot — reproducing the golden's `ring_after`).
+        if self.unit.is_some() {
+            if let Some(inj) = unit_dump::inject() {
+                if let Some(rings) = &inj.rings {
+                    for (s, block) in rings.iter().enumerate() {
+                        if s >= self.cfg.n_mtp_layers || block.len() != self.win {
+                            eprintln!(
+                                "[dspark] unit inject rings: block {s} has {} rows, expected {} \
+                                 — rings ignored",
+                                block.len(),
+                                self.win
+                            );
+                            break;
+                        }
+                        let flat: Vec<f32> = block.iter().flatten().copied().collect();
+                        if flat.len() != self.win * self.hd {
+                            eprintln!(
+                                "[dspark] unit inject rings: block {s} row width != hd — ignored"
+                            );
+                            break;
+                        }
+                        self.dev.upload_f32_at(self.window[s].ptr, 0, &flat)?;
+                    }
+                }
+            }
+        }
         let mut pos = pos;
         let mut t0 = t0;
         let mut injected = false;
