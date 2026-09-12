@@ -1368,6 +1368,53 @@ fn sh_exp_fused() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SH_EXP_FUSED").map(|v| v == "1").unwrap_or(false))
 }
 
+/// M-ROW shared-expert chain (`DSV41_SH_PAIR_M=1`, DEFAULT OFF): the `template<M>`
+/// form of the fused chain above — ONE launch for the whole verify block instead
+/// of one per row.
+///
+///     5 launches/row  : quant1 -> gemm_fp8_mx2(w1|w3) -> swiglu_limit
+///                       -> quant1 -> gemm_fp8_mx_add(w2)
+///     1 launch/row    : gemm_fp8_sh_pair            (the M=1 arm above)
+///     1 launch/layer  : gemm_fp8_sh_exp_fused<M>    (THIS) + `quant_rows`
+///
+/// Phase 1 maps the grid over (i-tile, activation row group) so the block count
+/// is `ceil(sh_il/32) * ceil(m/fold_r)` instead of `ceil(sh_il/32)`, which is
+/// what makes one launch cover the whole block; phase 2 carries `m` accumulators
+/// over the same w2 row (the parallel axis there is `ceil(dim/32)`, so folding
+/// costs nothing) and can fold the trailing `add_inplace_raw` into its store.
+/// Every output is bit-identical to the per-row chain by the kernel's C1-C8
+/// contract (`kernels/cuda/dsv41_kernels.cu`).
+///
+/// Default OFF, exactly like the other new-kernel arms here: the decline path and
+/// the parity cases are what bring it up, and the four-text check is what flips
+/// it. Requires the two SH_EXP envs off the critical path — this arm is tried
+/// BEFORE the M=1 fused arm in `shared_expert_mrows`.
+fn sh_pair_m() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SH_PAIR_M").map(|v| v == "1").unwrap_or(false))
+}
+
+/// The phase-1 fold knob for `DSV41_SH_PAIR_M` (`DSV41_SH_PAIR_M_FOLD`, default
+/// 1): how many activation rows one block owns in phase 1.
+///
+/// 1 (default) is the design's §3.3 winner — it keeps the M=1 kernel's exact
+/// consume path (`s_af[j]`, the block-wide predecoded activation) AND its
+/// parallel axis, `ceil(sh_il/32) * m` chains. >1 folds the rows into the warp's
+/// registers (the mrows form) and shrinks the grid: fewer instructions, less SM
+/// coverage. It is a RUNTIME kernel argument, so the sweep does not recompile.
+///
+/// Read ONCE and cached (hot-path rule).
+fn sh_pair_m_fold() -> i32 {
+    static F: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_SH_PAIR_M_FOLD")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .filter(|v| (1..=VERIFY_ROWS as i32).contains(v))
+            .unwrap_or(1)
+    })
+}
+
 /// ADD_EPI (DSV41_ADD_EPI, default ON): fold the shared expert's merge
 /// `s.o += s.ex_out` into the MoE all-reduce's STORE epilogue instead of running
 /// the standalone `ferrite_add` kernel between them.
@@ -11432,6 +11479,75 @@ impl<'a> DevChain<'a> {
         dim: usize,
     ) -> Result<bool> {
         let cfg = self.cfg;
+        // ---- the M-row arm (`DSV41_SH_PAIR_M`) ------------------------------
+        // Tried FIRST: ONE `dsv41_gemm_fp8_sh_exp_fused<m>` for the whole block,
+        // replacing all m rows' (w1w3 -> swiglu -> fp8 emit | barrier | w2) with a
+        // single launch that can also fold the trailing add into phase 2's store.
+        // The shape gates are the kernel's own specialisation mirrored here, so a
+        // shape it would decline never costs a launch: `dim % 32` is phase 1's
+        // k-block count and `sh_il % 32` is both phases' 32-element scale rows
+        // (and phase 2's cp.async16 row alignment). Deadlock safety is the
+        // LAUNCHER's, not this caller's: it caps the grid at the residency number
+        // (co_res) and declines outright when phase 1's block count does not fit
+        // -- never raise the grid here.
+        //
+        // A decline is free by construction: the kernel is ONE launch, so either
+        // the whole arm runs or `moe_out_r` is untouched (the launcher returns 2
+        // before any block starts) and the arms below run exactly as before.
+        if sh_pair_m()
+            && self.dev.supports_sh_exp_fused()
+            && m != 0
+            && m <= VERIFY_ROWS
+            && m <= 8
+            && (sh_il % 32) == 0
+            && (dim % 32) == 0
+        {
+            // 1) ONE fp8 quantisation of the block -- the same launch the arms
+            //    below start with, so the activation is staged once either way.
+            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            // The row pitch of that staging is the `cols` it was quantised with
+            // (`dim` bytes / `dim/32` f32, see `quant_rows`), NOT the wider
+            // `xq_r` allocation.
+            let sc_pitch = dim / 32;
+            let ok = self.dev.gemm_fp8_sh_exp_fused(
+                self.s.xq_r.ptr as *const u8,
+                self.s.xsc_r.ptr as *const f32,
+                w1.as_u8(),
+                w1s.as_u8(),
+                w3.as_u8(),
+                w3s.as_u8(),
+                cfg.swiglu_limit,
+                sh_il as i32,
+                dim as i32,
+                m as i32,
+                sh_pair_m_fold(),
+                // `act` is a by-product in this arm (only the fp8 pair is consumed
+                // downstream) -> null drops the stores; the fallback arms below
+                // rewrite the slot anyway.
+                std::ptr::null_mut(),
+                0,
+                self.s.sh_aq_r.ptr as *mut u8,
+                self.s.sh_aqsc_r.ptr as *mut f32,
+                // Row pitches: the fp8 pair is `[m, sh_il]` and its scales
+                // `[m, sh_il/32]` -- the same slots the M=1 arm uses.
+                sh_il as i32,
+                (sh_il / 32) as i32,
+                w2.as_u8(),
+                w2s.as_u8(),
+                dim as i32,
+                // out = the MoE block accumulator, `m` rows at pitch `dim`, and
+                // epi_add = 1 folds `add_inplace_raw(moe_out_r, sh_out_r)` into
+                // phase 2's read-modify-write (the same operand pair, so the same
+                // sum).
+                dim as i32,
+                1,
+                self.s.moe_out_r.ptr as *mut f32,
+                self.dev.stream(),
+            )?;
+            if ok {
+                return Ok(true);
+            }
+        }
         // ---- the fused arm (`DSV41_SH_EXP_FUSED`) ---------------------------
         // The shape gates are the kernel's own specialisation, mirrored here so a
         // shape it would decline never costs a launch: `dim % 32` is phase 1's

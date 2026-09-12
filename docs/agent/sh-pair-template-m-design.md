@@ -543,3 +543,99 @@ M=6：  quant_rows(1)  →  gemm_fp8_sh_exp_fused<6>(1)        = 2 发/层  ⇒ 
 *工部 · 只读分析 + 本文件（唯一产出）；未执行任何 GPU 命令、未改动任何源码。*
 *所有代码行号以 HEAD `51235f6` 为准，读码时以函数名为准。*
 *设计口径的 ms 均标注来源；§3.3/§4 的周期数是模型值，真值由 §7 步骤 5 的 A/B 给出。*
+
+---
+
+## 11. 实施状态（工部 · 2026-09-12 · 实施轮）
+
+> 本节由**实施轮**追加。§1–§10 是设计（未改动）；本节记录落地了什么、与设计的两处偏差、
+> 以及主 agent 必须跑的东西。**未执行任何 GPU 命令**（本机无 nvcc / 无 GPU）。
+
+### 11.1 落地的文件
+
+| 文件 | 改动 |
+|---|---|
+| `kernels/cuda/dsv41_kernels.cu` | `ShPairMSmem` + `sh_pair_m_smem()`（**host/device 共用**的布局函数）、`template<int M> gemm_fp8_sh_exp_pair_kernel`、`extern "C" dsv41_gemm_fp8_sh_exp_fused`（decline / per-M SMEM 属性 / per-M `co_res` 缓存 / grid 计算）。紧跟 M=1 的 launcher 之后（原 `:6808`） |
+| `crates/ferrite-models/src/dsv41/device.rs` | `Kernels::gemm_fp8_sh_exp_fused`（`ko!`）、`supports_sh_exp_fused()`、FFI 方法 `gemm_fp8_sh_exp_fused(...)` |
+| `crates/ferrite-models/src/dsv41/chain_dev.rs` | `sh_pair_m()` / `sh_pair_m_fold()` 两个 gate；`shared_expert_mrows` 的 **first-try arm**（在 M=1 fused arm 之前） |
+| `kernels/cuda/tests_dsv41_sh_exp_mrows.cu` | **新增** parity 套件（见 §11.4） |
+| 本文件 | §11 |
+
+### 11.2 与 §3.1 的两处 SMEM 偏差（都是"安全侧"，已写进 kernel 注释）
+
+1. **`s_pas` 在 `fold_r == 1` 时保留 1 行**（设计的字节表算它 0）。生产形状 640 B；换来的是
+   `fold_r == 1` 分支能**逐字照抄** M=1 kernel 的 `s_af` 填充（那段代码读的是 staged 的
+   `s_as[i>>5]`，不保留就得改成裸读 global `a_scale`）。
+2. **`s_af2` 是独立 slot（`M*n1` f32）**，不与 `s_af` 复用。换来 phase 2 对**每一行**都用
+   M=1 kernel 的**同一条读路径**（`s_af[j]`，一个 LDS 一个操作数）。生产形状 M=6 多 6 912 B：
+   总 smem 41 112 B < 48 KB（**不到 opt-in 阈值**），而 occupancy 由线程数决定（2 CTA/SM，§4），
+   所以不移动。
+
+生产形状（`n1=288, k1=5120, n2=5120, M=6, fold_r=1`）的 `gsmem = 41 112 B`。
+`fold_r > 1` 时 `s_pa`+`s_pas` 替代 `s_af`：RF=6 时为 `6*5120 + 6*160*4 = 34 560` B（与 §3.2 一致），
+总 54 824 B **> 48 KB** ⇒ 走 `FERRITE_SET_SHP_M_SMEM`（那里已经为每个 M 各设一次，R4）。
+
+### 11.3 落地的关键实现选择（设计未钉死的几处）
+
+| 项 | 选择 | 理由 |
+|---|---|---|
+| `fold_r > 1` 的寄存器数组 | `float g[M], u[M]` + `#pragma unroll` 全展开 + `if (q < fold_r)` 谓词 | `fold_r` 是**运行期**参，`g[fold_r]` 会掉 local memory；`M ≤ 8` 常量下标才能留住寄存器 |
+| phase 2 的 M-fold | `acc[M]` + `wv` 提到 r 循环外 | C4（同一个 `(row,kb)` 值复用，不碰结合律） |
+| P3 预取（`cpasync`） | **不做**，行内 `cp.async16` staging | 纯 staging 重排、无数值含量；M=1 的 `!prefetched` 分支就是这段。少一个旋钮 |
+| `s_lut` 的构建 | **所有 block**（`if (p1)` 之外） | 只做 phase 2 的 block（`blockIdx.x >= p1b`）也要解码表 —— 这是 M=1 kernel 没有的分支，漏了就是错值 |
+| LUT 之后 | 追加一个 `__syncthreads()` | 非 `p1` block 在 grid barrier 之前唯一的发布点 |
+
+### 11.4 parity 套件（§7 步骤 4）
+
+**`tests_dsv41_sh_exp_mrows.cu`**（新文件，不是扩 `tests_dsv41_glue.cu` —— 那份里**并没有** sh_pair
+case，§10 的假设不成立）。**参照系是 `dsv41_gemm_fp8_sh_pair`（M=1）**，不是五发链：M=1 kernel 的
+header 已经论证了它就是五发链的逐位等价值，所以套件把两个claim 串起来。
+
+覆盖：
+
+| 维度 | 取值 |
+|---|---|
+| M | 1, 2, 3, 5, 6, 8（+ 全 dispatch 1..8） |
+| `fold_r` | 1, 2, 3, 6, m（+ 在 M=8 上扫 1..8 全范围） |
+| `epi_add` | 0, 1（1 的期望值由 host 的 `pre[i] + ref[i]` 给出，同一对操作数同一顺序） |
+| `act` | `nullptr`（不写）与真 buffer（逐位等于 M=1 的 act 行） |
+| 形状 | 生产形状（288/5120/5120）+ 小形状 + `n2 % 32 != 0` 的 grid-stride 尾巴 |
+| decline | `m∉[1,8]`、`fold_r∉[1,m]`、`k1%32`、`n1%32`、`aq_stride%16`、`out_stride<n2`、null 操作数 |
+| 覆盖性 | phase-1 每个字节 + phase-2 每个元素都必须被写（NaN / 0x5A 哨兵） |
+
+判定是 **raw f32 bits 的 memcmp**（不是容差），与 `tests_dsv41_gemm_mrows.cu` 同口径。
+
+### 11.5 主 agent 必须跑的东西（按顺序）
+
+```bash
+# (0) 双产物重编 —— .cu 改了，build.sh 必须先于 cargo build（AGENTS.md 硬纪律）
+ssh ubuntu@43.202.208.136 'cd ~/ferrite && git fetch -q origin && git reset -q --hard origin/main && \
+  cd kernels/cuda && bash build.sh 103a && cd ~/ferrite && source ~/.cargo/env && cargo build --release'
+
+# (1) parity 套件（编译 + 跑，需要一块空闲 GPU）—— 这是硬门
+ssh ubuntu@43.202.208.136 'cd ~/ferrite && nvcc -gencode arch=compute_103a,code=sm_103a -O3 \
+  --use_fast_math -std=c++17 -o /tmp/t_sh_exp_mrows kernels/cuda/tests_dsv41_sh_exp_mrows.cu && \
+  CUDA_VISIBLE_DEVICES=<free> /tmp/t_sh_exp_mrows'
+
+# (2) A/B（同会话背靠背，单变量）
+#     ARM base : 什么都不设（per-row 25 发/层）
+#     ARM M    : DSV41_SH_PAIR_M=1（2 发/层）
+#     ARM M/f2 : DSV41_SH_PAIR_M=1 DSV41_SH_PAIR_M_FOLD=2
+#     ARM M/f6 : DSV41_SH_PAIR_M=1 DSV41_SH_PAIR_M_FOLD=6
+# 读 [dsv41] step 行（verify_ms）+ 四段文本逐字 + faults=0
+```
+
+`fold_r` 是**运行期**参（kernel + launcher 双确认），所以 (2) 的 fold 扫描**不需要重编译**。
+
+**nsys 聚合口径**：新 kernel 是 `gemm_fp8_sh_exp_pair_kernel<M>` 模板实例，与 M=1 的
+`gemm_fp8_sh_pair_kernel` **名字不同**，可直接按 kernel 名分组数 launch / 每发 µs（§7 步骤 5 要的就是
+这个）。两个 kernel 共享 `g_sh_arrive`/`g_sh_sense`，**不能并发**（同流串行是前提，R9）。
+
+### 11.6 未做（明确留在设计里）
+
+- §7 步骤 6（折 `quant_rows` 进 phase 0、去掉 `act`）**未做**：入口保留，仍是"2 发/层"。
+- 未做 k-split、tcgen05、PDL（§9 的划界不变）。
+- `fold_r > 1` 的 kb 循环同样用 `#pragma unroll 4`（与 M=1 一致）。⚠️ fast-math 下多路展开 +
+  分裂累加器是 R2 的已知风险面 —— **fold_r > 1 的三个 arm 必须由 §11.5(1) 的 parity 先过**才可上机。
+
+*实施轮 · 只写代码 + `cargo check --workspace`（EXIT=0）+ 静态审读；未跑 GPU、未跑 nvcc、未改设计正文。*

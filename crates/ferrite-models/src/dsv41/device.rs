@@ -219,6 +219,41 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// M-ROW SH_PAIR: the M=1 symbol above with the verify block's `m` activation
+    /// rows folded into ONE launch (`gemm_fp8_sh_exp_pair_kernel<M>`). Phase 1
+    /// walks the (i-tile, activation-row) split of the grid -- `fold_r` activation
+    /// rows per block, 1 by default -- and phase 2 carries `M` accumulators over
+    /// the same w2 row, so the whole block costs 2 launches per layer instead of
+    /// `m`+2.
+    ///
+    /// Bit-identity to the per-row chain is the kernel's C1-C8 contract; the
+    /// bodies are the M=1 kernel's, transcribed term for term.
+    ///
+    /// `aq`/`aqsc` is phase 1's fp8 output and MUST be disjoint from `a`/`a_scale`
+    /// (same cross-block race as the M=1 symbol). `act` may be NULL (it is a
+    /// by-product in this arm; a null pointer drops the stores). `epi_add != 0`
+    /// folds `ferrite_add(out, phase-2)` into phase 2's store as a
+    /// read-modify-write of `out`.
+    ///
+    /// A separate symbol, so a stale `.so` simply has no entry and the caller
+    /// keeps its per-row loop. Returns 2 when the shape/arm cannot use it (never
+    /// 1 -- cudaErrorInvalidValue, the round-42 collision).
+    /// ABI: stream LAST.
+    gemm_fp8_sh_exp_fused: Option<
+        unsafe extern "C" fn(
+            // phase 1: fp8 activation (k = dim) + scale, w1/w3 weights + scales,
+            // limit, n1/k1, the activation-row count and the fold knob
+            *const u8, *const f32, *const u8, *const u8, *const u8, *const u8, f32, c_int, c_int,
+            c_int, c_int,
+            // phase-1 by-product f32 rows (nullable) + stride
+            *mut f32, c_int,
+            // phase 1 output: fp8 pair + per-32-block scales + their strides
+            *mut u8, *mut f32, c_int, c_int,
+            // phase 2: w2 weights + scale, row count, out stride, epi_add, out
+            *const u8, *const u8, c_int, c_int, c_int, *mut f32,
+            CuStream,
+        ) -> c_int,
+    >,
     quant_fp8: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
@@ -1185,6 +1220,7 @@ impl Device {
             gemm_fp8_swapab: ko!(rt, "dsv41_gemm_fp8_swapab"),
             gemm_fp8_wo_pair: ko!(rt, "dsv41_gemm_fp8_wo_pair"),
             gemm_fp8_sh_pair: ko!(rt, "dsv41_gemm_fp8_sh_pair"),
+            gemm_fp8_sh_exp_fused: ko!(rt, "dsv41_gemm_fp8_sh_exp_fused"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
@@ -2254,6 +2290,80 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "dsv41_gemm_fp8_sh_pair")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries the M-ROW shared-expert chain
+    /// (`dsv41_gemm_fp8_sh_exp_fused`, the `template<M>` form of
+    /// `dsv41_gemm_fp8_sh_pair`). A stale .so leaves `DSV41_SH_PAIR_M` inert and
+    /// the caller keeps its per-row chain (the M=1 arm, then SH_EXP_MROWS, then
+    /// the per-row loop).
+    pub fn supports_sh_exp_fused(&self) -> bool {
+        self.kernels.gemm_fp8_sh_exp_fused.is_some()
+    }
+
+    /// The M-row shared expert (`w1w3 -> swiglu -> fp8 emit | barrier | w2`) as
+    /// ONE launch for the whole verify block, with the optional `epi_add`.
+    ///
+    /// `fold_r` (1..=rows) is the A/B knob: how many activation rows one block
+    /// owns in phase 1. 1 keeps the M=1 kernel's exact consume path (`s_af[j]`)
+    /// and the design's §3.3 parallel axis; >1 trades SM coverage for fewer
+    /// instructions. It is a RUNTIME argument, so the A/B does not recompile.
+    ///
+    /// `act` may be null (a by-product in this arm). `aq`/`aqsc` must be
+    /// DISJOINT from `a`/`a_scale`, and their strides are the caller's layout
+    /// (`aq_stride` must be a multiple of 16 -- phase 2 reads the rows as
+    /// uint4). `epi_add != 0` makes phase 2 read-modify-write `out`, folding the
+    /// caller's separate `ferrite_add(out, sh_out)` away.
+    ///
+    /// Ok(false) => the shape/arm cannot use it and the caller keeps its chain.
+    /// ABI: stream LAST (this symbol has no C++ default tail args).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_sh_exp_fused(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        wg: *const u8,
+        wg_scale: *const u8,
+        wu: *const u8,
+        wu_scale: *const u8,
+        limit: f32,
+        n1: i32,
+        k1: i32,
+        rows: i32,
+        fold_r: i32,
+        act: *mut f32,
+        act_stride: i32,
+        aq: *mut u8,
+        aqsc: *mut f32,
+        aq_stride: i32,
+        aqsc_stride: i32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        n2: i32,
+        out_stride: i32,
+        epi_add: i32,
+        out: *mut f32,
+        s: CuStream,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_sh_exp_fused else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                a, a_scale, wg, wg_scale, wu, wu_scale, limit, n1, k1, rows, fold_r, act,
+                act_stride, aq, aqsc, aq_stride, aqsc_stride, w2, w2_scale, n2, out_stride,
+                epi_add, out, s,
+            )
+        };
+        // A shape/arm decline is 2 (1 collides with cudaErrorInvalidValue).
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_sh_exp_fused")?;
         Ok(true)
     }
 

@@ -6807,6 +6807,555 @@ extern "C" int dsv41_gemm_fp8_sh_pair(const uint8_t* a, const float* a_scale,
     return (int)cudaGetLastError();
 }
 
+// ===========================================================================
+// SH_PAIR over M ACTIVATION ROWS
+//   gemm_fp8_sh_exp_pair_kernel<M> / dsv41_gemm_fp8_sh_exp_fused
+// ===========================================================================
+// The M-row form of gemm_fp8_sh_pair_kernel above: ONE launch covers a whole
+// verify block (M = 1..8 activation rows) instead of M launches of the M=1
+// kernel.
+//
+//      per-row :  quant1 -> gemm_fp8_mx2(w1|w3) -> swiglu_limit
+//                 -> quant1 -> gemm_fp8_mx_add(w2)                  (5 x M /layer)
+//      M=1 arm :  quant_rows -> (m x dsv41_gemm_fp8_sh_pair) -> add  (m+2 /layer)
+//      THIS    :  quant_rows -> dsv41_gemm_fp8_sh_exp_fused<M>       (2 /layer)
+//
+// Design + full argument: docs/agent/sh-pair-template-m-design.md. The three
+// bodies are the M=1 kernel's own (phase 1 = the w1|w3 PAIR walked by one warp
+// with swiglu_limit_q's epilogue; phase 2 = the standalone w2 GEMV), transcribed
+// term for term and run once per activation row; the grid barrier that joins
+// them re-uses the M=1 kernel's module-level [arrive, sense] pair.
+//
+// WHY PHASE 1 GOES INTO THE GRID, NOT INTO THE WARP (design §3.3). The
+// bit-identical parallel axis of phase 1 is `ceil(n1/32) x M`. At the production
+// shape n1 = 288 (the TP8 shared inter) that is 9 i-tiles, so folding all M rows
+// into one warp would leave 9 blocks on a 148-SM part while saving 48% of the
+// instructions -- a 2.7x net loss in the model. `fold_r` therefore selects how
+// many ACTIVATION ROWS the warps of one block share (1 = one row per block, the
+// DEFAULT), and the grid carries the rest: p1b = ceil(n1/32)*ceil(M/fold_r).
+//
+// SMEM. One pool, both phases (the grid barrier separates them in time). The
+// layout comes from `sh_pair_m_smem` below, which the LAUNCHER calls too: the
+// launcher's dynamic-smem request and this kernel's pointer arithmetic are the
+// same expression by construction (design R3 -- a drift here is a silent pointer
+// shift, which is what the M=1 launcher's note warns about).
+//
+// NUMERICS: bit-identical to the per-row chain, per the design's C1-C8.
+//   C1 the fp8 activation is `quant_rows`' output byte for byte -- this kernel
+//      never quantises an activation (`aq`/`aqsc` is the swiglu pair it EMITS);
+//   C2 phase 1 consumes the SAME `s_lut[byte] * scale` product the M=1 kernel
+//      materialises into `s_af`. fold_r == 1: literally that slot, filled by
+//      that code; fold_r > 1: the same product materialised in registers, the
+//      form gemm_fp8_mrows_kernel's a32 arm already carries;
+//   C3 `kb` ascending, `j = kb*32 + lane`, ONE serial accumulator per chain;
+//   C4 the `shfl_xor` reduction tree, verbatim;
+//   C5 one chain per (activation row, projection); nothing is summed across rows;
+//   C6 the clamp + silu epilogue, term for term (swiglu_limit_kernel);
+//   C7 the fp8 emit: one block owns exactly one 32-row scale block (n1 % 32 == 0
+//      and nwarps == 32), the amax is the same exact `fmaxf` tree (`fmaxf` is
+//      exact and associative), then `fast_round_scale` /
+//      `fminf(fmaxf(...,-448),448)` / `__nv_fp8_e4m3` verbatim;
+//   C8 phase 2's decode + tree verbatim, and `epi_add`'s `out[...] + acc`, the
+//      same operand pair `ferrite_add(moe_out_r, sh_out_r)` sums.
+// build.sh keeps `--use_fast_math`, so every expression below is copied from the
+// kernel it must match INCLUDING the `#pragma unroll` strength (build.sh's
+// warning: more expression freedom = reassociation drift).
+//
+// NOT in this version (design §9): no k-split (breaks the f32 association
+// order), no tcgen05, no phase-0 activation quantisation fold, and no PDL -- a
+// grid barrier and PDL are mutually exclusive (the M=1 kernel's header).
+//
+// DEADLOCK SAFETY, same hard constraint as the M=1 kernel: the launcher caps the
+// grid at co_res and declines (`return 2`) when phase 1's block count does not
+// fit. NEVER raise the grid past co_res, and NEVER truncate phase 1: a block
+// that never becomes resident never arrives and the resident ones spin forever.
+//
+// Returns 2 (decline, never 1 -- 1 is cudaErrorInvalidValue, the round-42
+// collision) for any shape or arm this does not implement.
+
+// One description of the pool, so the kernel's pointer arithmetic and the
+// launcher's dynamic-smem request can never drift apart.
+struct ShPairMSmem {
+    size_t lut_off;    // [256] f32            e4m3 decode table (BOTH phases)
+    size_t pa_off;     // [fold_r][k1]    fp8  activation rows   (fold_r > 1 only)
+    size_t pas_off;    // [fold_r][nb_k1] f32  their scales (1 row when fold_r == 1)
+    size_t af_off;     // [k1] f32             predecoded activation (fold_r == 1)
+    size_t rows_off;   // [fold_r][32] f32     swiglu row stage (one amax tree/row)
+    size_t w_off;      // [32][n1]        fp8  phase-2 w2 rows (cp.async16 target)
+    size_t ws_off;     // [32][nb_k2_al]       phase-2 ue8m0 scale rows
+    size_t aq_off;     // [M][n1]         fp8  phase-1 output == phase-2 input
+    size_t aqs_off;    // [M][nb_k2]      f32  its per-32-block scales
+    size_t af2_off;    // [M][n1]         f32  phase-2 predecoded activation rows
+    size_t total;
+};
+
+// `__host__ __device__` on purpose: the launcher uses `.total` and the kernel
+// uses the offsets -- one definition, two call sites.
+//
+// ⚠️ TWO DELIBERATE DEVIATIONS from the design's §3.1 sketch, both safe-side:
+//   * `s_pas` keeps ONE scale row when fold_r == 1 (the design's byte table
+//     counts it as 0 there). 640 B at the production shape, and it lets the
+//     fold_r == 1 arm fill `s_af` with the M=1 kernel's code VERBATIM (that code
+//     reads the staged scale row `s_as[i>>5]`).
+//   * `s_af2` is a slot of its own (M*n1 f32) instead of aliasing `s_af`. It
+//     buys phase 2 the M=1 kernel's exact read path (`s_af[j]`, one LDS per
+//     operand) for every row; at the production shape M=6 costs 6 912 B, and the
+//     block is still far below the 48 KB opt-in threshold, so occupancy (which
+//     is thread-limited at 2 CTA/SM, design §4) does not move.
+__host__ __device__ inline ShPairMSmem sh_pair_m_smem(int M, int fold_r, int n1, int k1,
+                                                      int nb_k1, int nb_k2, int nb_k2_al) {
+    ShPairMSmem o;
+    size_t off = 0;
+    o.lut_off = off; off += (size_t)256 * sizeof(float);
+    o.pa_off = off;
+    off += (fold_r == 1) ? 0 : (size_t)fold_r * (size_t)k1;
+    o.pas_off = off;
+    off += (size_t)((fold_r == 1) ? 1 : fold_r) * (size_t)nb_k1 * sizeof(float);
+    o.af_off = off;
+    off += (fold_r == 1) ? (size_t)k1 * sizeof(float) : 0;
+    o.rows_off = off; off += (size_t)fold_r * 32 * sizeof(float);
+    off = (off + 15) & ~(size_t)15;          // cp.async16 needs a 16B destination
+    o.w_off = off; off += (size_t)32 * (size_t)n1;
+    o.ws_off = off; off += (size_t)32 * (size_t)nb_k2_al;
+    off = (off + 15) & ~(size_t)15;          // phase 2 reads aq as uint4
+    o.aq_off = off; off += (size_t)M * (size_t)n1;
+    off = (off + 3) & ~(size_t)3;
+    o.aqs_off = off; off += (size_t)M * (size_t)nb_k2 * sizeof(float);
+    off = (off + 15) & ~(size_t)15;
+    o.af2_off = off; off += (size_t)M * (size_t)n1 * sizeof(float);
+    o.total = off;
+    return o;
+}
+
+template <int M>
+__global__ void __launch_bounds__(1024)
+gemm_fp8_sh_exp_pair_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                            const uint8_t* __restrict__ wg, const uint8_t* __restrict__ wg_scale,
+                            const uint8_t* __restrict__ wu, const uint8_t* __restrict__ wu_scale,
+                            float limit, int n1, int k1,
+                            float* __restrict__ act, int act_stride,
+                            uint8_t* __restrict__ aq, float* __restrict__ aqsc,
+                            int aq_stride, int aqsc_stride,
+                            const uint8_t* __restrict__ w2, const uint8_t* __restrict__ w2_scale,
+                            int n2, int out_stride, int epi_add, float* __restrict__ out,
+                            int fold_r) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int nwarps = (blockDim.x + 31) >> 5;              // 32 (the fp8 emit requires it)
+    const int nb_k1 = k1 >> 5;                              // phase-1 k-blocks
+    const int nb_k2 = n1 >> 5;                              // phase-2 k-blocks (k2 = n1)
+    const int nb_k2_al = (nb_k2 + 15) & ~15;                // 16B units
+    const ShPairMSmem sm = sh_pair_m_smem(M, fold_r, n1, k1, nb_k1, nb_k2, nb_k2_al);
+
+    extern __shared__ uint8_t s_pool[];
+    float*   s_lut  = reinterpret_cast<float*>(s_pool + sm.lut_off);
+    uint8_t* s_pa   = s_pool + sm.pa_off;                   // fold_r > 1 only
+    float*   s_pas  = reinterpret_cast<float*>(s_pool + sm.pas_off);
+    float*   s_af   = reinterpret_cast<float*>(s_pool + sm.af_off);   // fold_r == 1 only
+    float*   s_rows = reinterpret_cast<float*>(s_pool + sm.rows_off);
+    uint8_t* s_w    = s_pool + sm.w_off;
+    uint8_t* s_ws   = s_pool + sm.ws_off;
+    uint8_t* s_aq   = s_pool + sm.aq_off;
+    float*   s_aqs  = reinterpret_cast<float*>(s_pool + sm.aqs_off);
+    float*   s_af2  = reinterpret_cast<float*>(s_pool + sm.af2_off);
+
+    // The e4m3 decode table is phase-INDEPENDENT and never overwritten, so it is
+    // built once by EVERY block -- phase-2-only blocks (blockIdx.x >= p1b) need
+    // it too, which is why this is outside the `if (p1)` below.
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    __syncthreads();               // s_lut published
+
+    // The grid splits into two roles, both decided for the WHOLE block:
+    //   blockIdx.x <  p1b : phase 1 for (i-tile `it`, activation rows [r0, r0+fold_r))
+    //   blockIdx.x >= p1b : phase 2 only (it contributes no phase-1 tile)
+    // `p1` is block-uniform, so every `__syncthreads()` inside it is legal.
+    const int n1t = (n1 + 31) >> 5;
+    const int nsr = (M + fold_r - 1) / fold_r;              // activation row groups
+    const int p1b = n1t * nsr;
+    const bool p1 = ((int)blockIdx.x < p1b);
+    const int it = p1 ? ((int)blockIdx.x % n1t) : -1;
+    const int rg = p1 ? ((int)blockIdx.x / n1t) : -1;
+
+    // ============= phase 1: w1w3 + swiglu -> aq fp8 (per row) =================
+    if (p1) {
+        const int r0 = rg * fold_r;
+        const int rn = (fold_r < (M - r0)) ? fold_r : (M - r0);
+        if (fold_r == 1) {
+            // a32 (the SAME predecoded activation the standalone GEMV
+            // materialises): one pass global uint4 -> LUT -> s_af. The emitted
+            // f32 is bit-identical to the staged `s_lut[s_a[i]] * s_as[i>>5]`
+            // product -- same bytes, same LUT entry, same scale. This is the M=1
+            // kernel's fill verbatim, for THIS row.
+            const uint8_t* ar = a + (size_t)r0 * (size_t)k1;
+            const float* asr = a_scale + (size_t)r0 * (size_t)nb_k1;
+            for (int i = threadIdx.x; i < nb_k1; i += blockDim.x) s_pas[i] = asr[i];
+            __syncthreads();           // s_pas published
+            const int n16a = k1 >> 4;
+            for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                const uint4 v = *reinterpret_cast<const uint4*>(ar + (i << 4));
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int idx = (i << 4) + j;
+                    s_af[idx] = s_lut[b[j]] * s_pas[idx >> 5];
+                }
+            }
+            for (int i = (n16a << 4) + threadIdx.x; i < k1; i += blockDim.x)
+                s_af[i] = s_lut[ar[i]] * s_pas[i >> 5];
+        } else {
+            // fold_r > 1: the block's fold_r activation rows staged as fp8 bytes
+            // + their scale rows. The consume loop below materialises
+            // `s_lut[byte] * scale` in registers -- the same product, so the same
+            // bits (C2), and no `fold_r * k1 * 4` f32 slot.
+            for (int q = 0; q < rn; ++q) {
+                const uint8_t* ar = a + (size_t)(r0 + q) * (size_t)k1;
+                const float* asr = a_scale + (size_t)(r0 + q) * (size_t)nb_k1;
+                for (int i = threadIdx.x; i < nb_k1; i += blockDim.x)
+                    s_pas[(size_t)q * nb_k1 + i] = asr[i];
+                const int n16a = k1 >> 4;
+                for (int i = threadIdx.x; i < n16a; i += blockDim.x)
+                    *reinterpret_cast<uint4*>(s_pa + (size_t)q * k1 + (i << 4)) =
+                        *reinterpret_cast<const uint4*>(ar + (i << 4));
+                for (int i = (n16a << 4) + threadIdx.x; i < k1; i += blockDim.x)
+                    s_pa[(size_t)q * k1 + i] = ar[i];
+            }
+        }
+        __syncthreads();               // activation operand published
+
+        // This warp's inter row for the whole block (`n1 % 32 == 0` and
+        // n1t = n1/32, so the row is always inside n1 -- no guard, which is what
+        // keeps every warp of the block on the amax tree below).
+        const int i = it * 32 + warp;
+        const uint8_t* g_row = wg + (size_t)i * (size_t)k1;
+        const uint8_t* u_row = wu + (size_t)i * (size_t)k1;
+        const uint8_t* gsc = wg_scale + (size_t)(i >> 5) * (size_t)nb_k1;
+        const uint8_t* usc = wu_scale + (size_t)(i >> 5) * (size_t)nb_k1;
+        float g[M], u[M];
+#pragma unroll
+        for (int q = 0; q < M; ++q) { g[q] = 0.f; u[q] = 0.f; }
+        if (fold_r == 1) {
+            // The gemm_fp8_gemv_kernel consume loop, twice (gate chain + up
+            // chain), sharing every `av` -- the M=1 kernel's body verbatim, so
+            // its codegen (and therefore its rounding) is the same expression.
+            float gg = 0.f, uu = 0.f;
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k1; ++kb) {
+                const float sbg = ue8m0_to_f(gsc[kb]);
+                const float sbu = ue8m0_to_f(usc[kb]);
+                const int j = (kb << 5) + lane;
+                const float av = s_af[j];
+                gg += av * (s_lut[g_row[j]] * sbg);
+                uu += av * (s_lut[u_row[j]] * sbu);
+            }
+            g[0] = gg;
+            u[0] = uu;
+        } else {
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k1; ++kb) {
+                const float sbg = ue8m0_to_f(gsc[kb]);
+                const float sbu = ue8m0_to_f(usc[kb]);
+                const int j = (kb << 5) + lane;
+                const uint8_t wgv = g_row[j], wuv = u_row[j];   // one LDG.8 each
+#pragma unroll
+                for (int q = 0; q < M; ++q) {
+                    if (q < fold_r) {
+                        const float av = s_lut[s_pa[(size_t)q * k1 + j]] *
+                                         s_pas[(size_t)q * nb_k1 + (j >> 5)];
+                        g[q] += av * (s_lut[wgv] * sbg);
+                        u[q] += av * (s_lut[wuv] * sbu);
+                    }
+                }
+            }
+        }
+
+        // ---- the per-row epilogue (C4-C7), one independent chain per row ------
+        // Every (chain, row) gets its own shfl_xor tree. Nothing is combined
+        // across rows here or anywhere else (C5).
+#pragma unroll
+        for (int q = 0; q < M; ++q) {
+            if (q < fold_r) {
+                for (int off = 16; off > 0; off >>= 1) {
+                    g[q] += __shfl_xor_sync(0xFFFFFFFFu, g[q], off);
+                    u[q] += __shfl_xor_sync(0xFFFFFFFFu, u[q], off);
+                }
+                if (lane == 0) {
+                    // swiglu_limit_kernel's clamp + silu, term for term. `v` is
+                    // the SAME register value both consumers below use.
+                    float gg = g[q], uu = u[q];
+                    if (limit > 0.f) {
+                        gg = fminf(gg, limit);                  // gate clamp
+                        uu = fminf(fmaxf(uu, -limit), limit);    // up clamp
+                    }
+                    const float v = (gg / (1.f + expf(-gg))) * uu;
+                    // `act` is a by-product (nothing downstream reads it in this
+                    // arm), so the launcher passes nullptr and the 32 f32 stores
+                    // per (block, row) disappear.
+                    if (act != nullptr) act[(size_t)(r0 + q) * act_stride + i] = v;
+                    s_rows[(size_t)q * 32 + warp] = v;
+                }
+            }
+        }
+        __syncthreads();   // every row's v staged; block == one 32-row scale block
+
+#pragma unroll
+        for (int q = 0; q < M; ++q) {
+            if (q < fold_r) {
+                // swiglu_limit_q_kernel's emit, term for term. `fmaxf` is exact
+                // and associative, so this tree is bit-identical to the kernel's
+                // per-lane shfl tree over the same 32 values.
+                float am = (lane < nwarps) ? fabsf(s_rows[(size_t)q * 32 + lane]) : 0.f;
+                for (int off = 16; off > 0; off >>= 1)
+                    am = fmaxf(am, __shfl_xor_sync(0xFFFFFFFFu, am, off));
+                const float sc = fmaxf(fast_round_scale(am, 1.0f / 448.0f), 1e-30f);
+                if (lane == 0) {
+                    aqsc[(size_t)(r0 + q) * aqsc_stride + it] = sc;
+                    const float qv =
+                        fminf(fmaxf(s_rows[(size_t)q * 32 + warp] * (1.0f / sc), -448.0f), 448.0f);
+                    const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(qv);
+                    aq[(size_t)(r0 + q) * aq_stride + i] = *(const uint8_t*)&f8;
+                }
+            }
+        }
+    }
+
+    // ============================= grid barrier ==============================
+    // The M=1 kernel's barrier, unchanged (same module-level pair, same
+    // sense-reversing protocol, same residency requirement). The two kernels
+    // therefore must not run CONCURRENTLY on that pair -- they are on one stream,
+    // so they are serial by construction (design R9).
+    __syncthreads();                   // this block's aq[]/aqsc[] stores are complete
+    if (threadIdx.x == 0) {
+        __threadfence();                               // release: aq[]/aqsc[] visible
+        const unsigned s0 = atomicAdd(&g_sh_sense, 0u);    // current sense
+        if (atomicAdd(&g_sh_arrive, 1u) == (unsigned)gridDim.x - 1u) {
+            atomicExch(&g_sh_arrive, 0u);              // reset for the next launch
+            __threadfence();
+            atomicXor(&g_sh_sense, 1u);                // flip -> release waiters
+        } else {
+            while (atomicAdd(&g_sh_sense, 0u) == s0) __nanosleep(32);
+            __threadfence();                           // acquire
+        }
+    }
+    __syncthreads();
+
+    // ============ phase 2: w2 (fp8 -> f32), k = n1, M rows folded =============
+    {
+        // Re-stage the two inputs of the standalone w2 launch: its per-32-block
+        // scale rows and the block-wide a32-predecoded activation, for EVERY
+        // activation row. Same product (`s_lut[aq[i]] * s_aqs[i>>5]`), same
+        // bytes -> same s_af2, and phase 2 then reads it with the M=1 kernel's
+        // exact expression.
+        for (int q = 0; q < M; ++q)
+            for (int i = threadIdx.x; i < nb_k2; i += blockDim.x)
+                s_aqs[(size_t)q * nb_k2 + i] = aqsc[(size_t)q * aqsc_stride + i];
+        __syncthreads();               // s_aqs published (s_lut is already built)
+        const int n16a = n1 >> 4;
+        for (int q = 0; q < M; ++q) {
+            const uint8_t* aqr = aq + (size_t)q * (size_t)aq_stride;
+            float* afr = s_af2 + (size_t)q * (size_t)n1;
+            for (int i = threadIdx.x; i < n16a; i += blockDim.x) {
+                const uint4 v = *reinterpret_cast<const uint4*>(aqr + (i << 4));
+                const uint8_t* b = reinterpret_cast<const uint8_t*>(&v);
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    const int idx = (i << 4) + j;
+                    afr[idx] = s_lut[b[j]] * s_aqs[(size_t)q * nb_k2 + (idx >> 5)];
+                }
+            }
+            for (int i = (n16a << 4) + threadIdx.x; i < n1; i += blockDim.x)
+                afr[i] = s_lut[aqr[i]] * s_aqs[(size_t)q * nb_k2 + (i >> 5)];
+        }
+        __syncthreads();               // s_af2 published
+
+        // M-fold pay-off: the parallel axis is ceil(n2/32) = 160 output rows, so
+        // carrying M accumulators costs NO parallelism (design §2.5), and the
+        // decoded w2 value `wv` is hoisted out of the row loop (the M=1 kernel's
+        // per-(row, kb) value, reused -- C4's argument, it touches no
+        // association).
+        for (int row = blockIdx.x * nwarps + warp; row < n2; row += gridDim.x * nwarps) {
+            const uint8_t* wr = w2 + (size_t)row * (size_t)n1;
+            const uint8_t* wsr = w2_scale + (size_t)(row >> 5) * (size_t)nb_k2;
+            uint8_t* row_s = s_w + (size_t)warp * (size_t)n1;
+            uint8_t* row_sc = s_ws + (size_t)warp * (size_t)nb_k2_al;
+            float acc[M];
+#pragma unroll
+            for (int q = 0; q < M; ++q) acc[q] = 0.f;
+            // cp.async16 staging, the M=1 kernel's `!prefetched` arm verbatim
+            // (its row prologue moves 512 B per warp-issue instead of 32 B; the
+            // separate P3 prefetch is deliberately not carried: it is a pure
+            // staging reorder with no numerical content).
+            const int n16 = n1 >> 4;
+            for (int i = (n16 << 4) + lane; i < n1; i += 32) row_s[i] = wr[i];
+            for (int i = lane; i < n16; i += 32)
+                dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+            // PLAIN byte loads, NOT cp.async: cp.async16 needs a 16-byte-aligned
+            // global address and `wsr` only has that when nb_k2 is a multiple of
+            // 16 (the M=1 kernel's note, same err 716).
+            for (int i = lane; i < nb_k2; i += 32) row_sc[i] = wsr[i];
+            dsv41_cp_commit();
+            dsv41_cp_wait_all();
+            __syncwarp();
+#pragma unroll 4
+            for (int kb = 0; kb < nb_k2; ++kb) {
+                const float sb = ue8m0_to_f(row_sc[kb]);
+                const int j = (kb << 5) + lane;
+                // ONE decode for all M rows (C4): the identical per-(row, kb)
+                // value the M=1 loop would recompute.
+                const float wv = s_lut[row_s[j]] * sb;
+#pragma unroll
+                for (int q = 0; q < M; ++q) acc[q] += s_af2[(size_t)q * (size_t)n1 + j] * wv;
+            }
+            __syncwarp();
+#pragma unroll
+            for (int q = 0; q < M; ++q) {
+                float a_q = acc[q];
+                for (int off = 16; off > 0; off >>= 1)
+                    a_q += __shfl_xor_sync(0xFFFFFFFFu, a_q, off);
+                if (lane == 0) {
+                    float* op = out + (size_t)q * (size_t)out_stride + row;
+                    // epi_add folds the separate `ferrite_add(moe_out_r, sh_out_r)`
+                    // launch: the same operand pair, read-modify-write (C8).
+                    // `o + acc`, i.e. exactly what `add_inplace_raw` computes.
+                    op[0] = epi_add ? (op[0] + a_q) : a_q;
+                }
+            }
+        }
+    }
+}
+
+// The M-row SH_PAIR launcher. Same two deliberate differences from the rest of
+// the family that the M=1 launcher documents, for the same reasons:
+//   * PLAIN `<<<>>>`, never dsv41_pdl_or_plain -- PDL lets this grid start while
+//     the producer is still resident, and the barrier needs the WHOLE grid
+//     resident before any block may pass it;
+//   * the grid is CAPPED by residency (co_res) -- a correctness requirement, not
+//     tuning.
+// `warps` is pinned to 32 for the M=1 kernel's reason: the fp8 emit needs one
+// block to own exactly one 32-row scale block (nwarps == 32 and n1 % 32 == 0).
+//
+// Grid: max(phase-1 blocks, phase-2 row tiles), capped at co_res. Phase 1 needs
+// ceil(n1/32)*ceil(m/fold_r) blocks that are ALL resident (a truncated phase 1
+// would split a 32-row scale block across launches and the amax would be wrong),
+// so if that number does not fit the cap this declines rather than truncating.
+//
+// Returns 2 (decline, never 1) for any shape or arm it does not implement, so
+// the Rust caller keeps the per-row chain bit for bit.
+extern "C" int dsv41_gemm_fp8_sh_exp_fused(const uint8_t* a, const float* a_scale,
+                                           const uint8_t* wg, const uint8_t* wg_scale,
+                                           const uint8_t* wu, const uint8_t* wu_scale,
+                                           float limit, int n1, int k1, int m,
+                                           int fold_r, float* act, int act_stride,
+                                           uint8_t* aq, float* aqsc, int aq_stride,
+                                           int aqsc_stride,
+                                           const uint8_t* w2, const uint8_t* w2_scale,
+                                           int n2, int out_stride, int epi_add, float* out,
+                                           cudaStream_t s) {
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    if (m < 1 || m > 8) return 2;
+    if (fold_r < 1 || fold_r > m) return 2;
+    if (a == nullptr || a_scale == nullptr || wg == nullptr || wg_scale == nullptr ||
+        wu == nullptr || wu_scale == nullptr || aq == nullptr || aqsc == nullptr ||
+        w2 == nullptr || w2_scale == nullptr || out == nullptr)
+        return 2;
+    if (n1 <= 0 || k1 <= 0 || n2 <= 0) return 2;
+    // Phase-1 k-blocks and BOTH phases' 32-element scale rows. n1 % 32 also
+    // guarantees one block owns whole scale blocks (nwarps == 32) and n1 % 16 the
+    // cp.async16 alignment of phase 2's weight rows.
+    if ((k1 & 31) || (n1 & 31)) return 2;
+    // `aq` is read as uint4 by phase 2's fill: its row pitch must stay 16-byte
+    // aligned, and the row must be at least n1 wide. `aqsc`'s row holds n1/32
+    // f32 -- both are the caller's layout, NOT implied by n1 (design R8).
+    if ((aq_stride & 15) || aq_stride < n1) return 2;
+    if (aqsc_stride < (n1 >> 5)) return 2;
+    if (out_stride < n2) return 2;
+    if (act != nullptr && act_stride < n1) return 2;
+    // Only the production arm (mode 4 = staged weights + block-wide activation;
+    // a32 = the predecoded slot) is implemented.
+    if (g_gemv_fp8_mode != 4 || !g_gemv_a32 || g_gemv_a32_staged) return 2;
+
+    const int warps = 32;
+    const int nb_k1 = k1 >> 5;
+    const int nb_k2 = n1 >> 5;
+    const int nb_k2_al = (nb_k2 + 15) & ~15;
+    const int n1t = (n1 + 31) >> 5;
+    const int nsr = (m + fold_r - 1) / fold_r;
+    const int p1b = n1t * nsr;                    // phase-1 blocks (all must fit)
+    const int g2t = (n2 + 31) >> 5;               // phase-2 row tiles
+    // MUST match `sh_pair_m_smem` -- it IS `sh_pair_m_smem` (design R3).
+    const size_t gsmem = sh_pair_m_smem(m, fold_r, n1, k1, nb_k1, nb_k2, nb_k2_al).total;
+    if (gsmem <= 0) return 2;
+
+    if (gsmem > 48 * 1024) {
+        // Per-kernel ceiling, not this call's need (a sticky attribute set to a
+        // smaller value would silently cap later launches -- round-43 revert).
+        // ⚠️ EVERY M specialisation needs its own attribute: the launch below
+        // picks `gemm_fp8_sh_exp_pair_kernel<m>`, and setting only <1> would
+        // leave <m> at the 48KB default -> cudaErrorInvalidValue (the exact trap
+        // dsv41_gemm_fp8_mrows:5430 records).
+        cudaError_t e = cudaSuccess;
+#define FERRITE_SET_SHP_M_SMEM(k)                                                  \
+    do {                                                                           \
+        cudaError_t r = cudaFuncSetAttribute(                                      \
+            gemm_fp8_sh_exp_pair_kernel<k>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+            dsv41_smem_ceiling(gemm_fp8_sh_exp_pair_kernel<k>));                   \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                           \
+    } while (0)
+        FERRITE_SET_SHP_M_SMEM(1);
+        FERRITE_SET_SHP_M_SMEM(2);
+        FERRITE_SET_SHP_M_SMEM(3);
+        FERRITE_SET_SHP_M_SMEM(4);
+        FERRITE_SET_SHP_M_SMEM(5);
+        FERRITE_SET_SHP_M_SMEM(6);
+        FERRITE_SET_SHP_M_SMEM(7);
+        FERRITE_SET_SHP_M_SMEM(8);
+#undef FERRITE_SET_SHP_M_SMEM
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+
+    // ---- co_res: the residency cap. Cached per M specialisation because the
+    // model's shape is fixed and this launcher runs 40 times per step (a per-call
+    // occupancy query is a driver round trip), and because each M has its own
+    // answer (its smem and code differ).
+#define FERRITE_SHP_LAUNCH(k)                                                      \
+    do {                                                                           \
+        if (co_res_m[k - 1] == 0 || co_res_gsmem[k - 1] != gsmem) {                 \
+            int per_sm = 0;                                                        \
+            cudaError_t e = cudaOccupancyMaxActiveBlocksPerMultiprocessor(          \
+                &per_sm, gemm_fp8_sh_exp_pair_kernel<k>, warps * 32, gsmem);        \
+            if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }      \
+            int dev = 0, sms = 0;                                                  \
+            cudaGetDevice(&dev);                                                   \
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);      \
+            co_res_m[k - 1] = per_sm * sms;                                        \
+            co_res_gsmem[k - 1] = gsmem;                                           \
+        }                                                                          \
+        if (co_res_m[k - 1] <= 0) return 2;   /* no resident config -> decline */   \
+        int G = (p1b > g2t) ? p1b : g2t;                                           \
+        if (G > co_res_m[k - 1]) G = co_res_m[k - 1];   /* HARD deadlock guard */   \
+        if (p1b > G) return 2;   /* phase 1 does not fit: decline, NEVER truncate */\
+        gemm_fp8_sh_exp_pair_kernel<k><<<dim3(G), dim3(warps * 32), gsmem, s>>>(    \
+            a, a_scale, wg, wg_scale, wu, wu_scale, limit, n1, k1,                  \
+            act, act_stride, aq, aqsc, aq_stride, aqsc_stride,                      \
+            w2, w2_scale, n2, out_stride, epi_add, out, fold_r);                    \
+    } while (0)
+    static int co_res_m[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    static size_t co_res_gsmem[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    switch (m) {
+        case 1: FERRITE_SHP_LAUNCH(1); break;
+        case 2: FERRITE_SHP_LAUNCH(2); break;
+        case 3: FERRITE_SHP_LAUNCH(3); break;
+        case 4: FERRITE_SHP_LAUNCH(4); break;
+        case 5: FERRITE_SHP_LAUNCH(5); break;
+        case 6: FERRITE_SHP_LAUNCH(6); break;
+        case 7: FERRITE_SHP_LAUNCH(7); break;
+        case 8: FERRITE_SHP_LAUNCH(8); break;
+        default: return 2;
+    }
+#undef FERRITE_SHP_LAUNCH
+    return (int)cudaGetLastError();
+}
+
 // Two projections over the SAME activation in one gemv launch: the kernel maps
 // rows below n1 to the first family and the rest to the second, both sharing the
 // block-wide staged activation. wq_a and wkv in the attention are the pair - two
