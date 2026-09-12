@@ -126,6 +126,69 @@ fn draft_moe_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DRAFT_MOE_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// The four `DSV41_DRAFT_P3A` folds, resolved once (see [`draft_p3a`]).
+#[derive(Clone, Copy)]
+struct DraftP3a {
+    /// a1: attn `hc_collapse` + `rmsnorm(attn_norm)` → `dsv41_hc_collapse_norm`.
+    collapse_norm: bool,
+    /// a2: the two `hc_post` destination swaps that retire both
+    /// `memcpy_d2d(h <- h_out)`.
+    hcpost_swap: bool,
+    /// a3: premix ping-pong (retires `memcpy_d2d(pre_in <- pre_ffn)` and the
+    /// pre-loop `premix_init` copy).
+    premix_pp: bool,
+    /// a4: `apply_rope_mrows` for the `bs` query / inverse-query rows.
+    rope_mrows: bool,
+}
+
+/// `DSV41_DRAFT_P3A=1` (**DEFAULT OFF**) — the draft chain's **P3a** folds from
+/// `docs/agent/draft-p3-fusion.md` §5: the zero-risk adjacent-kernel merges that
+/// reuse EXISTING kernels only (no new `.cu`, nothing moves across a translation
+/// unit, no instruction sequence changes).
+///
+/// | item | override | fold | launches saved |
+/// |---|---|---|---|
+/// | a1 | `DSV41_P3A_COLLAPSE_NORM` | `hc_collapse` + `rmsnorm(attn_norm)` → `dsv41_hc_collapse_norm` (the kernel the FFN half already runs) | 1/block |
+/// | a2 | `DSV41_P3A_HCPOST_SWAP` | the two `hc_post`s write into each other's buffer instead of `h_out` + `memcpy_d2d` back (see `draft_forward`; the `dsv41_hc_post_inplace` variant has NO batch-row dimension and cannot carry `bs` rows) | 2/block |
+/// | a3 | `DSV41_P3A_PREMIX_PP` | premix ping-pong: `pre_in`/`pre_ffn` alternate and the incoming premix is read from the previous block's own slot | 1/block + 1/step |
+/// | a4 | `DSV41_P3A_ROPE_MROWS` | `bs` query rows (and `bs` inverse-query rows) → ONE `dsv41_apply_rope_mrows` | 8/block |
+///
+/// A per-item override, when SET, wins over the master (`=0` turns that one fold
+/// off for an A/B that isolates it; any other value turns it on). An unset
+/// override follows the master, so `DSV41_DRAFT_P3A=1` is the whole arm and the
+/// per-item names exist to take ONE fold back.
+///
+/// **WHY IT SHIPS OFF.** Every fold here is meant to be bit-identical by
+/// construction (same kernel, same instruction sequence) and the a1/a4 items
+/// reuse kernels whose bit-identity argument is already written down in their
+/// headers (`dsv41_hc_collapse_norm_kernel`:7942-7947,
+/// `apply_rope_mrows_kernel`:1967-1973). That argument still has to be confirmed
+/// on the real draft shape by the parity tests plus a same-binary serve A/B — the
+/// house rule for a new path. Two of the six §5 items are NOT implementable with
+/// the existing kernels at the production `bs = 5` and are therefore absent
+/// (a5 `sparse_attn_orope`: its o-rope epilogue takes the position
+/// `base*mul + off + head*step` and cannot give row `r` the position `pos + r`;
+/// a6 `WOB_F32`: `dsv41_gemm_fp8_mx_f32` is an M=1 GEMV with no row batch).
+///
+/// Read once and cached (the house rule for hot-path gates): this branch runs
+/// `bs x n_mtp` times per draft step.
+fn draft_p3a() -> DraftP3a {
+    static F: std::sync::OnceLock<DraftP3a> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        let master = std::env::var("DSV41_DRAFT_P3A").map(|v| v != "0").unwrap_or(false);
+        let item = |name: &str| match std::env::var(name) {
+            Ok(v) => v != "0",
+            Err(_) => master,
+        };
+        DraftP3a {
+            collapse_norm: item("DSV41_P3A_COLLAPSE_NORM"),
+            hcpost_swap: item("DSV41_P3A_HCPOST_SWAP"),
+            premix_pp: item("DSV41_P3A_PREMIX_PP"),
+            rope_mrows: item("DSV41_P3A_ROPE_MROWS"),
+        }
+    })
+}
+
 /// `DSV41_MARKOV_SLICED=1` (DEFAULT OFF — the house rule: a new path ships as an
 /// A/B arm) cuts the draft's Markov head across the ranks the same way
 /// `DSV41_VERIFY_HEAD_SLICED` cuts the verify's head: rank `r` walks only its
@@ -250,7 +313,13 @@ pub struct DsparkDev<'a> {
     ids: DevBuf,
     /// the compressor-length stand-in `sparse_attn` reads: constant `bs`
     clen: DevBuf,
-    /// one i32 the RoPE base is uploaded into (see [`Self::ensure_pos_dev`])
+    /// The draft's RoPE base AND its per-row positions, in ONE buffer: slot 0 is
+    /// the `int` every rope kernel reads as `*base`, slots `1..=bs` are
+    /// `pos + r` — the `pos_rows` array the multi-row form
+    /// ([`Self::rope_queries`] / [`Self::rope_queries_inv`], `DSV41_DRAFT_P3A`'s
+    /// a4) reads. Both halves are a pure function of the ANCHOR position, so the
+    /// draft step still pays exactly ONE upload (see
+    /// [`Self::ensure_pos_dev`]).
     pos_base: DevBuf,
     /// Host shadow of what `pos_base` currently holds on the device, i.e. the
     /// base every `rope_at` call's `off` is measured from. `None` = unknown
@@ -430,7 +499,8 @@ impl<'a> DsparkDev<'a> {
             idxs: dev.alloc(fb(bs * (win + bs)).max(4))?,
             ids: dev.alloc(fb(bs + 1).max(4))?,
             clen: dev.alloc(4)?,
-            pos_base: dev.alloc(4)?,
+            // base slot + the `bs` per-row positions (see `pos_base`'s doc)
+            pos_base: dev.alloc(4 * (bs + 1))?,
             pos_dev: None,
             collapse: dev.alloc(fb(bs * dim))?,
             normed: dev.alloc(fb(bs * dim))?,
@@ -848,16 +918,40 @@ impl<'a> DsparkDev<'a> {
         let eps = cfg.norm_eps;
 
         // ---- three draft blocks ----
-        self.dev.memcpy_d2d(
-            self.pre_in.ptr,
-            self.premix_init.ptr,
-            (bs * hc * 4) as usize,
-        )?;
+        let p3a = draft_p3a();
+        // P3a a3 (premix ping-pong): a block's incoming premix IS the previous
+        // block's `pre_ffn`, so instead of copying it into `pre_in` every block
+        // the two scratch slots alternate and the reader follows the pointer.
+        // Block 0 reads `premix_init` directly, which also retires that one
+        // copy. Off the gate the copy below runs and every block still reads
+        // `pre_in`, i.e. exactly the historical buffers.
+        if !p3a.premix_pp {
+            self.dev.memcpy_d2d(
+                self.pre_in.ptr,
+                self.premix_init.ptr,
+                (bs * hc * 4) as usize,
+            )?;
+        }
+        let mut premix_cur: *const f32 = if p3a.premix_pp {
+            self.premix_init.ptr as *const f32
+        } else {
+            self.pre_in.ptr as *const f32
+        };
         for s in 0..cfg.n_mtp_layers {
             let ld = &self.w.mtp[s];
+            // The slot this block's `hc_mixes(ffn)` writes: the one NOT holding
+            // the incoming premix. Equal to `pre_ffn` on the un-gated path (and
+            // so is the dump below, which therefore keeps its exact meaning: the
+            // PREVIOUS block's ffn pre).
+            let ffn_out: *mut f32 = if p3a.premix_pp && s % 2 == 0 {
+                self.pre_in.ptr as *mut f32
+            } else {
+                self.pre_ffn.ptr as *mut f32
+            };
             // hc_mixes for the attention sub-block: writes THIS block's attn_pre
             // (slot 1), post and comb.
             self.hc_mixes(
+                self.h.ptr as *const f32,
                 ld,
                 false,
                 self.pre_attn.ptr as *mut f32,
@@ -873,8 +967,10 @@ impl<'a> DsparkDev<'a> {
             self.dump_unit_idx("mixes_attn_post", s, self.post.ptr as *const f32, &[bs, hc]);
             self.dump_unit_idx("mixes_attn_comb", s, self.comb.ptr as *const f32, &[bs, hc, hc]);
             // the FFN-side mixes coefficients — the golden's `stage{s}.ffn.hc_pre/
-            // hc_post/hc_comb`.
-            self.dump_unit_idx("mixes_ffn_pre", s, self.pre_ffn.ptr as *const f32, &[bs, hc]);
+            // hc_post/hc_comb`. `ffn_out` is this block's `pre_ffn` slot: on the
+            // un-gated path it IS `pre_ffn` (byte-identical dump), on the ping-pong
+            // arm it follows the alternating slot.
+            self.dump_unit_idx("mixes_ffn_pre", s, ffn_out as *const f32, &[bs, hc]);
             self.dump_unit_idx("mixes_ffn_post", s, self.post.ptr as *const f32, &[bs, hc]);
             self.dump_unit_idx("mixes_ffn_comb", s, self.comb.ptr as *const f32, &[bs, hc, hc]);
             // collapse with the INCOMING premix, then the attn norm
@@ -886,40 +982,73 @@ impl<'a> DsparkDev<'a> {
         // would explain rmsnorm exploding while hand-computation with the
         // checkpoint's values stays normal.
         self.dump_unit_idx("attn_norm_w", s, attn_norm.as_f32(), &[16]);
-            self.dev.hc_collapse(
-                self.h.ptr as *const f32,
-                self.pre_in.ptr as *const f32,
-                self.xn.ptr as *mut f32,
-                bs as i32,
-                hc as i32,
-                dim as i32,
-            )?;
-            // `h = hc_pre(x, pre_mix)`, the reference's `h(pre_mix)` — taken
-            // BEFORE the in-place rmsnorm below, which is why it is recorded here.
-            self.dump_unit_idx("h_premix_block", s, self.xn.ptr as *const f32, &[bs, dim]);
-            // ONE multi-row rmsnorm (n = bs), in place, exactly the call
-            // `chain_dev.rs`'s kv norm makes (`attention_rows` hands n = m to
-            // the same launcher).
+            // The premix this block collapses with: `pre_in` historically, the
+            // alternating slot under a3 (see the loop head).
+            let collapse_pre: *const f32 = if p3a.premix_pp {
+                premix_cur
+            } else {
+                self.pre_in.ptr as *const f32
+            };
+            // P3a a1 (`DSV41_DRAFT_P3A`): the FFN half's own fused kernel,
+            // `dsv41_hc_collapse_norm`, is exactly this pair — its header
+            // (`dsv41_kernels.cu`:7942-7947) pins the collapse's `fmaf` chain and
+            // the rmsnorm's `shfl_down` tree plus in-order cross-warp sum
+            // statement for statement, which is why the FFN side may use it.
+            // Same kernel, same instruction sequence, one launch instead of two.
             //
-            // HISTORY — this was briefly written as a per-row n=1 loop under
-            // the belief that the kernel's n>1 path was broken (an m=bs call
-            // appeared to produce 1e27). Reading the kernel settled it the
-            // other way (`ferrite_kernels.cu:278-321`, `ferrite_rmsnorm`):
-            // `grid(n)` gives one block per row, each block addresses its row
-            // at `x + row*dim` / `out + row*dim`, and the cross-warp reduce is
-            // sized by `blockDim`. Rows are therefore completely independent —
-            // n=bs is bit-identical to bs n=1 launches. The 1e27 came from the
-            // attn_norm WEIGHT POINTER being garbage (the `load.rs:925`
-            // placeholder bug, since fixed), not from the kernel. The per-row
-            // loop was a pure launch-count loss and is reverted here.
-            self.dev.rmsnorm(
-                self.xn.ptr as *const f32,
-                attn_norm.as_f32(),
-                self.xn.ptr as *mut f32,
-                bs as i32,
-                dim as i32,
-                eps,
-            )?;
+            // ⚠️ The `h_premix_block` dump exists only on the two-launch arm: the
+            // fused kernel keeps the collapsed row in the OUTPUT buffer and
+            // normalises it in place in its phase 2, so the un-normed intermediate
+            // is never in global memory. A `DSV41_DSPARK_UNIT_DUMP` capture taken
+            // with this gate ON therefore has one unit fewer (and `h_norm_block`
+            // unchanged) — capture goldens with the gates OFF, as always.
+            if p3a.collapse_norm {
+                self.dev.hc_collapse_norm(
+                    self.h.ptr as *mut f32,
+                    collapse_pre,
+                    attn_norm.as_f32(),
+                    self.xn.ptr as *mut f32,
+                    bs as i32,
+                    hc as i32,
+                    dim as i32,
+                    eps,
+                )?;
+            } else {
+                self.dev.hc_collapse(
+                    self.h.ptr as *const f32,
+                    collapse_pre,
+                    self.xn.ptr as *mut f32,
+                    bs as i32,
+                    hc as i32,
+                    dim as i32,
+                )?;
+                // `h = hc_pre(x, pre_mix)`, the reference's `h(pre_mix)` — taken
+                // BEFORE the in-place rmsnorm below, which is why it is recorded here.
+                self.dump_unit_idx("h_premix_block", s, self.xn.ptr as *const f32, &[bs, dim]);
+                // ONE multi-row rmsnorm (n = bs), in place, exactly the call
+                // `chain_dev.rs`'s kv norm makes (`attention_rows` hands n = m to
+                // the same launcher).
+                //
+                // HISTORY — this was briefly written as a per-row n=1 loop under
+                // the belief that the kernel's n>1 path was broken (an m=bs call
+                // appeared to produce 1e27). Reading the kernel settled it the
+                // other way (`ferrite_kernels.cu:278-321`, `ferrite_rmsnorm`):
+                // `grid(n)` gives one block per row, each block addresses its row
+                // at `x + row*dim` / `out + row*dim`, and the cross-warp reduce is
+                // sized by `blockDim`. Rows are therefore completely independent —
+                // n=bs is bit-identical to bs n=1 launches. The 1e27 came from the
+                // attn_norm WEIGHT POINTER being garbage (the `load.rs:925`
+                // placeholder bug, since fixed), not from the kernel. The per-row
+                // loop was a pure launch-count loss and is reverted here.
+                self.dev.rmsnorm(
+                    self.xn.ptr as *const f32,
+                    attn_norm.as_f32(),
+                    self.xn.ptr as *mut f32,
+                    bs as i32,
+                    dim as i32,
+                    eps,
+                )?;
+            }
             // post-norm xn — the SAME semantic as the golden harness's
             // `stage{s}.attn.in` (attn_norm's output), for direct diffing.
             self.dump_unit_idx("h_norm_block", s, self.xn.ptr as *const f32, &[bs, dim]);
@@ -932,6 +1061,21 @@ impl<'a> DsparkDev<'a> {
             self.dump_unit_idx("o_block", s, self.o.ptr as *const f32, &[bs, dim]);
 
             // residual: h = hc_post(o, post, comb)
+            //
+            // P3a a2 (`DSV41_DRAFT_P3A`): the two `hc_post` + `memcpy_d2d` pairs
+            // per block are retired by letting the two calls write into each
+            // other's buffer instead of staging in `h_out` and copying back. The
+            // attention's writes `h_out` (unchanged), the FFN's then reads `h_out`
+            // and writes `h` — so `h` holds the block's final residual again and
+            // the next block / `draft_head` are untouched. Same kernel, same
+            // arguments but for the destination pointer, so both outputs are
+            // bit-identical and the copy was a pure launch.
+            //
+            // WHY NOT `dsv41_hc_post_inplace`: that kernel has NO batch-row
+            // dimension (`(res, x, post, comb, n, h)` — one `[n, h]` residual and
+            // one `[h]` row), so a `bs = 5` draft would need `bs` launches where
+            // this needs one. Its bit-exactness argument is per single row and
+            // does not scale to the blocked layout.
             self.dev.hc_post(
                 self.o.ptr as *const f32,
                 self.h.ptr as *const f32,
@@ -942,24 +1086,34 @@ impl<'a> DsparkDev<'a> {
                 hc as i32,
                 dim as i32,
             )?;
-            self.dev.memcpy_d2d(
-                self.h.ptr,
-                self.h_out.ptr,
-                (bs * hc * dim * 4) as usize,
-            )?;
+            if !p3a.hcpost_swap {
+                self.dev.memcpy_d2d(
+                    self.h.ptr,
+                    self.h_out.ptr,
+                    (bs * hc * dim * 4) as usize,
+                )?;
+            }
+            // The residual the FFN half reads: the post-attention row, which a2
+            // leaves in `h_out` (the copy above is what used to move it into `h`).
+            let res_cur: *const f32 = if p3a.hcpost_swap {
+                self.h_out.ptr as *const f32
+            } else {
+                self.h.ptr as *const f32
+            };
 
             // ---- FFN sub-block ----
             self.hc_mixes(
+                res_cur,
                 ld,
                 true,
-                self.pre_ffn.ptr as *mut f32,
+                ffn_out,
                 self.post.ptr as *mut f32,
                 self.comb.ptr as *mut f32,
             )?;
             // the FFN collapses with THIS block's attn_pre, not the incoming one
             let ffn_norm = need(&ld.ffn_norm, "mtp.*.ffn_norm.weight")?;
             self.dev.hc_collapse_norm(
-                self.h.ptr as *mut f32,
+                res_cur as *mut f32,
                 self.pre_attn.ptr as *const f32,
                 ffn_norm.as_f32(),
                 self.xn.ptr as *mut f32,
@@ -977,28 +1131,44 @@ impl<'a> DsparkDev<'a> {
             // rank, not the rank's partial sum).
             self.dump_unit_idx("moe_out_block", s, self.moe_out.ptr as *const f32, &[bs, dim]);
 
+            // P3a a2, FFN half: `res_cur` (= `h_out` under the gate) is read and
+            // `h` is written, so no copy-back is needed and `h` carries the block's
+            // final residual again (the `h_block` dump below stays on `h`).
+            let (moe_res, moe_out): (*const f32, *mut f32) = if p3a.hcpost_swap {
+                (res_cur, self.h.ptr as *mut f32)
+            } else {
+                (self.h.ptr as *const f32, self.h_out.ptr as *mut f32)
+            };
             self.dev.hc_post(
                 self.moe_out.ptr as *const f32,
-                self.h.ptr as *const f32,
+                moe_res,
                 self.post.as_f32(),
                 self.comb.as_f32(),
-                self.h_out.ptr as *mut f32,
+                moe_out,
                 bs as i32,
                 hc as i32,
                 dim as i32,
             )?;
-            self.dev.memcpy_d2d(
-                self.h.ptr,
-                self.h_out.ptr,
-                (bs * hc * dim * 4) as usize,
-            )?;
+            if !p3a.hcpost_swap {
+                self.dev.memcpy_d2d(
+                    self.h.ptr,
+                    self.h_out.ptr,
+                    (bs * hc * dim * 4) as usize,
+                )?;
+            }
             // the block's residual stream once both sub-blocks are in, i.e. the
             // `h` the NEXT block (or `forward_head`) reads.
             self.dump_unit_idx("h_block", s, self.h.ptr as *const f32, &[bs, hc, dim]);
 
-            // the NEXT block's incoming premix is this block's ffn pre
-            self.dev
-                .memcpy_d2d(self.pre_in.ptr, self.pre_ffn.ptr, (bs * hc * 4) as usize)?;
+            // the NEXT block's incoming premix is this block's ffn pre — P3a a3
+            // makes that a pointer (`premix_cur` = the slot just written) instead
+            // of this copy.
+            if p3a.premix_pp {
+                premix_cur = ffn_out as *const f32;
+            } else {
+                self.dev
+                    .memcpy_d2d(self.pre_in.ptr, self.pre_ffn.ptr, (bs * hc * 4) as usize)?;
+            }
         }
 
         // ---- forward_head: collapse, norm, head, then the Markov sampler ----
@@ -1029,8 +1199,12 @@ impl<'a> DsparkDev<'a> {
 
     /// `hc_mixes` for one sub-block of one draft block. `ffn` selects the
     /// FFN's trio; `pre_out` receives the pre the NEXT sub-block collapses with.
+    /// `x` is the residual stream the dots read: `h` on the attention half, and
+    /// under P3a's a2 the post-attention `h_out` on the FFN half (the residual
+    /// destination swap — see `draft_forward`).
     fn hc_mixes(
         &self,
+        x: *const f32,
         ld: &LayerDev,
         ffn: bool,
         pre_out: *mut f32,
@@ -1051,7 +1225,7 @@ impl<'a> DsparkDev<'a> {
             )
         };
         self.dev.hc_mixes(
-            self.h.ptr as *const f32,
+            x,
             f.as_f32(),
             sc.as_f32(),
             base.as_f32(),
@@ -2090,6 +2264,11 @@ impl<'a> DsparkDev<'a> {
     /// Every head of a query shares that position (the main chain's `step = 0`
     /// convention).
     fn rope_queries(&mut self, x: *mut f32, pos: usize) -> Result<()> {
+        // P3a a4: one launch for all bs rows when the gate is on (see
+        // [`Self::rope_mrows`] — bit-identical to the loop below).
+        if self.rope_mrows(x, pos, false)? {
+            return Ok(());
+        }
         let (bs, nh) = (self.bs, self.nh);
         for r in 0..bs {
             self.rope_at(
@@ -2104,9 +2283,55 @@ impl<'a> DsparkDev<'a> {
         Ok(())
     }
 
+    /// P3a a4 (`DSV41_DRAFT_P3A`): the `bs` query rows (or inverse-query rows) of
+    /// `x` as ONE `dsv41_apply_rope_mrows` launch — `x` is row 0's base, the rows
+    /// sit `nh*hd` apart, each holding `nh` head rows of `hd`, row `r` roped at
+    /// `pos + r`.
+    ///
+    /// Bit-identical to the per-row loop it replaces: the kernel body is
+    /// `apply_rope_kernel`'s with the `r` loop moved inside
+    /// (`dsv41_kernels.cu`:1980-1998), row `r` indexes the tables at
+    /// `pos_rows[r]`, and that array holds `pos + r` — the identical integer the
+    /// loop passed through `off` (see [`Self::ensure_pos_dev`]). Row `r` touches
+    /// only `[r*row_stride + h*row_len, +row_len)`, so nothing is re-associated
+    /// and no cross-row reduction exists. The `pos_rows` half lives in the base
+    /// counter's own buffer, which is why the arm requires `pos_dev == pos`: the
+    /// array is `pos + r` only while the uploaded base IS `pos`.
+    ///
+    /// `Ok(false)` = NOT performed (gate off / stale `.so` without the symbol /
+    /// the device base is not this row block's anchor): the caller runs the
+    /// per-row loop, which is what the parity target is.
+    fn rope_mrows(&mut self, x: *mut f32, pos: usize, inverse: bool) -> Result<bool> {
+        if !draft_p3a().rope_mrows || self.pos_dev != Some(pos as i32) {
+            return Ok(false);
+        }
+        let (Some(cos), Some(sin)) = (self.cos, self.sin) else {
+            return Ok(false);
+        };
+        let (bs, nh, hd) = (self.bs, self.nh, self.hd);
+        let rd = self.cfg.rope_head_dim;
+        self.dev.apply_rope_mrows(
+            x,
+            cos,
+            sin,
+            bs as i32,
+            nh as i32,
+            (nh * hd) as i32,
+            hd as i32,
+            rd as i32,
+            (rd / 2) as i32,
+            self.pos_rows_ptr(),
+            inverse,
+        )
+    }
+
     /// The inverse RoPE over the attention output, same positions as
     /// [`Self::rope_queries`].
     fn rope_queries_inv(&mut self, x: *mut f32, pos: usize) -> Result<()> {
+        // P3a a4: same fold on the inverse rope over the attention output.
+        if self.rope_mrows(x, pos, true)? {
+            return Ok(());
+        }
         let (bs, nh) = (self.bs, self.nh);
         for r in 0..bs {
             self.rope_at(
@@ -2150,11 +2375,28 @@ impl<'a> DsparkDev<'a> {
         if self.pos_dev == Some(pos) {
             return Ok(());
         }
-        // The kernel reads `*base` as an `int`; upload the INTEGER's four bytes.
-        self.dev
-            .upload_bytes_at(&self.pos_base, &pos.to_le_bytes())?;
+        // The kernel reads `*base` as an `int`, so slot 0 holds the INTEGER's
+        // four bytes. Slots `1..=bs` hold `pos + r`: the `pos_rows` array the
+        // multi-row rope reads (`DSV41_DRAFT_P3A`'s a4 — see
+        // [`Self::rope_queries`]). Both halves are a function of the same
+        // `pos`, so widening the upload from 4B to `4*(bs+1)` B removes the
+        // launches without adding an upload (the array is never uploaded twice,
+        // and the `rope_mrows` arm refuses any position whose base is not `pos`).
+        let mut buf = Vec::with_capacity((self.bs + 1) * 4);
+        buf.extend_from_slice(&pos.to_le_bytes());
+        for r in 0..self.bs {
+            buf.extend_from_slice(&(pos + r as i32).to_le_bytes());
+        }
+        self.dev.upload_bytes_at(&self.pos_base, &buf)?;
         self.pos_dev = Some(pos);
         Ok(())
+    }
+
+    /// The `pos_rows` array [`Self::rope_queries`]'s multi-row form reads: slot
+    /// `r` of the half of `pos_base` that follows the base integer. Valid only
+    /// while `pos_dev == pos` (the values are `pos_dev + r`).
+    fn pos_rows_ptr(&self) -> *const std::os::raw::c_int {
+        (self.pos_base.ptr as *const std::os::raw::c_int).wrapping_add(1)
     }
 
     /// `apply_rope` for the draft: `pos` is the ABSOLUTE position of row 0 (the
