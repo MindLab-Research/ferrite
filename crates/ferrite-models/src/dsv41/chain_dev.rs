@@ -986,6 +986,25 @@ fn verify_head_fold() -> bool {
 /// (two independent verdicts verified it); the blocker is verify's values.
 /// Re-enable once the verify-value fault is fixed (spec-eager-diff-tool is
 /// building the locator). Read once and cached (the house rule).
+///
+/// # The invariant (ALL three spec arms)
+///
+/// A round leaves `s.ids` == `emitted.last()`, the token at the NEW `pos_ctr`:
+///
+/// | arm | block (row 0 at) | `emitted` | `emitted.last()` at | commit |
+/// |---|---|---|---|---|
+/// | legacy | `[d1..d5]` @ `pos+1` | `[next] ++ verify_out[..k_acc]` | `pos+1+k_acc` | `commit(pos+1, 5, k_acc)` |
+/// | aligned | `[next, d1..d5]` @ `pos+1` | same (index-aligned) | `pos+1+k_acc` | `commit(pos+1, 6, k_acc)` |
+/// | swallowed | `[token, d1..d5]` @ `pos` | same (== `rows[..k_emit]`) | `pos+k_emit` | `commit(pos, 6, k_emit)` |
+///
+/// One construction, three layouts: every arm's `verify_out[j]` is the argmax of
+/// the block row fed `drafts[j]`, so `emitted[i]` is the token at `pos + 1 + i` in
+/// all three — only row 0's position differs, which is what the last two columns
+/// record (`k_emit = k_acc + 1`, so the swallowed arm's `pos + k_emit` is the same
+/// counter the other two reach from `pos + 1`; there row 0 is the anchor itself).
+/// All three must write back: the swallowed arm reads nothing from `s.ids`, but
+/// the round after it may be the legacy bootstrap one (un-primed chain, or after a
+/// failure), and THAT `step_dev` embeds `s.ids`.
 fn sids_writeback() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -5360,6 +5379,13 @@ impl<'a> DevChain<'a> {
         let mut emitted = Vec::with_capacity(k_acc + 1);
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
+        // `emitted[i]` is the token at `pos + 1 + i`: `next` = `step_dev`'s argmax
+        // at `pos + 1`, `verify_out[j]` = block row `j`'s argmax, and row `j` was
+        // fed `drafts[j]` at `pos + 1 + j`, so it is the token at `pos + 2 + j`.
+        // `emitted.last()` is therefore the token at `pos + k_acc + 1` — exactly
+        // the counter the commit above just wrote (`pos_base = pos_ctr + 1`,
+        // `keep = k_acc`) and exactly the token the NEXT round embeds. See
+        // [`Self::sids_writeback`] for this invariant across the three arms.
         // ★ THE s.ids WRITE-BACK (verify-row0-systematic's root cause).
         // step_body's embedding reads `s.ids` (the `token` arg is only the
         // engram fallback), and NOTHING in the spec path updates it: the main
@@ -5573,6 +5599,15 @@ impl<'a> DevChain<'a> {
         let mut emitted = Vec::with_capacity(k_acc + 1);
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
+        // `emitted[i]` is the token at `pos + 1 + i`: `next` = `step_dev`'s argmax
+        // at `pos + 1`, `verify_out[j]` = block row `j`'s argmax, and row `j` was
+        // fed `rows_in[j]` at `pos + 1 + j`, so it is the token at `pos + 2 + j`.
+        // `emitted.last()` is therefore the token at `pos + k_acc + 1` — exactly
+        // the counter the commit above just wrote (`pos_base = pos_ctr + 1`,
+        // `keep = k_acc`) and exactly the token the NEXT round embeds. The SAME
+        // mapping as the legacy arm's 5-row block, which is why the two share one
+        // construction; only the swallowed arm's row 0 differs (see there). See
+        // [`Self::sids_writeback`] for this invariant across the three arms.
         // ★ THE s.ids WRITE-BACK — same root cause as the legacy arm above:
         // step_body embeds `s.ids`, and without this the next round would embed
         // a token k_acc positions stale (the digit task's self-locking
@@ -5766,9 +5801,38 @@ impl<'a> DevChain<'a> {
         // ---- 6. what this step emits: every emitted token is the verify's own
         // argmax — rows[0] is `next` and the last one sits at `pos + k_emit`, the
         // new `pos_ctr`, whose KV is deliberately absent (the next round's block
-        // row 0 appends it).
-        let mut emitted = Vec::with_capacity(k_emit);
-        emitted.extend_from_slice(&rows[..k_emit]);
+        // row 0 appends it). Spelled the SAME way as the other two arms (the
+        // anchor, then the accepted prefix of `verify_out`) — `rows[..k_emit]` IS
+        // `[next] ++ verify_out[..k_acc]`, because `next = rows[0]` and
+        // `verify_out[j] = rows[1 + j]` above — so the three arms share one
+        // construction AND one invariant.
+        //
+        // The position mapping: `emitted[i]` is the token at `pos + 1 + i`
+        // (`next` = the anchor row's argmax at `pos + 1`; `verify_out[j]` = row
+        // `1 + j`'s argmax, fed `drafts[j]` at `pos + 1 + j`, so `pos + 2 + j`).
+        // `emitted.last()` is therefore the token at `pos + k_emit` — exactly the
+        // counter the commit above just wrote (`pos_base = pos`, `keep = k_emit`)
+        // and exactly the token the NEXT round embeds. The legacy/aligned arms'
+        // `pos + k_acc + 1` and this arm's `pos + k_emit` are the same number:
+        // `k_emit = k_acc + 1` here, and their block's row 0 is one position
+        // later. See [`Self::sids_writeback`] for the invariant.
+        let mut emitted = Vec::with_capacity(k_acc + 1);
+        emitted.push(next);
+        emitted.extend_from_slice(&verify_out[..k_acc]);
+        // ★ THE s.ids WRITE-BACK — the INVARIANT every spec arm must leave
+        // behind: at the end of a round `s.ids` holds `emitted.last()`, the token
+        // at the new `pos_ctr`. THIS arm does not read `s.ids` (it takes the
+        // `token` arg for the draft and for the block's anchor row), so a missing
+        // write-back is not immediately fatal here — but it IS a broken invariant
+        // for the arms that DO read it: the bootstrap round re-enters the legacy
+        // arm whenever the chain is not primed (and after every failure), and that
+        // `step_dev` embeds `s.ids`, so it would embed a token `k_emit - 1`
+        // positions stale. Same gate, same 4 bytes per round.
+        if sids_writeback() {
+            if let Some(&last) = emitted.last() {
+                self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+            }
+        }
 
         // The same dump shape as the legacy branch, so the golden diff compares
         // like for like. The vrow0 parity probe is deliberately NOT run here: its
