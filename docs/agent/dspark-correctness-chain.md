@@ -212,3 +212,9 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 - **ferrite 的 `quant_fp8`（device.rs:2021）**：**需要对照它的 block/scale 语义**（如果也是 e4m3+block32 vs 官方 block128，block 尺寸不一致仍是数值差）。
 
 ⇒ 修复的精确对齐 = `quant_fp8` 的 block_size/scale 格式与官方 `fp8_block_size`/`scale_fmt` 完全一致 + expert kernel 吃 e4m3 激活。
+
+## 官方量化参数定案（代码级完整证据）
+
+`model.py:27-28`：`fp8_block_size = 32`（激活）/ `fp4_block_size = 32`（权重 K 维）。
+⇒ **官方的 routed expert 语义 = e4m3 激活（block 32 的 f32 scale）× e2m1 权重（block 32 的 scale）**。
+⇒ ferrite 的对齐目标：`quant_fp8(xn → e4m3, block=32, f32 scale)` + expert kernel 吃 e4m3 激活（不是 e2m1 packed）。
