@@ -55,6 +55,39 @@ Table 4 "Throughput of Native Arithmetic Instructions"，12.9 版；非实测。
 （tensor-core W8A8，见 SGLang 的 M<32 swapAB 路径）或把解码改成 row-stationary 复用寄存器。
 **结论：不实施 cvt 路线。**
 
+## swapAB（M=1 落 MMA 的 N 维）可行性分析 — 2026-09-12（纯分析，未落地）
+
+提案（lut-floor-research 定案）：M=1 decode 改走 FlashInfer/DeepGEMM 的 swapAB——
+权重做 A（M 维 = 输出行），激活做 B（N 维 = token），MMA 直接吃 fp8×fp8，零解码。
+**结论：可行，布局天然匹配，是本 kernel 唯一的数量级路径；工作量中等偏大（fuse 族迁移）。**
+
+1. **MMA 形状**。`mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32` 本仓库已在用
+   （`dsv41_kernels.cu:316`，dense `gemm_fp8_kernel`）。swapAB 就是把它现在的 A/B 对调：
+   现 A = 激活 `[m=token, k]`、B = 权重 `[n=输出行, k]`；对调后 A = 权重 `[M=输出行, k]`、
+   B = 激活 `[k, N=token]`。**利用率从 1/16（16 行 M 只 1 token 有效）提到 1/8（8 列 N 只 1 token
+   有效）——即 2x 的来源**。N=8 列补零/复制，结果取列 0。
+2. **布局零转置**。权重已是 `w[n,k]` **row-major**（`dsv41_kernels.cu:36-38`，即 MMA 的 A row-major
+   `[M,K]`）；激活 `a[1,k]` **k 连续**，正好是 col-major B 的列 0。两者都无需重排。
+3. **scale 方案已存在**。per-32-block scale 在 accumulator 施加，dense kernel 已实现
+   （`:326-329` `acc += d*sar0*sb0`，激活 f32 power-of-two per-row、权重 ue8m0 per-(32,32)）。
+   swapAB 直接复用，无需新机制；a32 物化层（1.55µs/call）与 LUT 解码**整体删除**。
+4. **位一致判定：不逐位**。现 gemv 是逐元素 `acc += (a*sa)*(w*sb)` 再 shuffle 归约；MMA 是
+   raw fp8×fp8 累加后按 k-block 乘 scale。数学等价、舍入次序不同 ⇒ 与现 SIMT gemv 不位一致，
+   但与**已有 m>1 dense MMA 路径同 scheme**。判据按 text/fingerprint parity（先例 `DSV41_WOB_F32`
+   亦非逐位），风险是 leading-token flip，须上机同窗口 A/B。
+5. **收益上限**。gemv 实测 9.5µs/call（246 次/步 = 2.33ms），权重 8.5MB 对应 895 GB/s ≈ 11%
+   带宽 ⇒ **不是内存 bound，是 LUT+FFMA bound**。swapAB 后计算不再是瓶颈（104 m-tile × 160
+   k-step 的 MMA 计算量 ≪ 内存地板），目标逼近 ~1.1-1.5µs/call。
+6. **阻力**。(a) 单 token 下 N 维 7/8 浪费，除非 batched decode 把 8 个 token 填满 N（当前
+   chain_dev 是 1-token/step）；(b) `gemm_fp8_gemv_kernel` 是巨型 fuse 族（mx2 / rope / norm /
+   AR-v5 / B1 xq 发射），7 个 launcher 变体都要迁到新 A/B 角色。建议先做无 fuse 主路径 + parity。
+7. **expert 关系**。fp4 无 mma.sync，只能 tcgen05（M=128 钉死）。swapAB 恰好解决钉死——
+   M 承载输出行可填满 128，N=token 落小维；但激活 e4m3 × 权重 fp4 混精需 `kind::f8f6f4`
+   （tcgen05 支持、本仓库未用）。属另一条线，不属本 gemv 任务。
+
+估计工作量：新 kernel（改 `gemm_fp8_kernel` 的 A/B 角色 + N 补零）~150 行 + launcher +
+Rust dispatch + parity test，约 1-2 天；fuse 族迁移另计。
+
 ## gemm_fp8_gemv 微基准（2026-09-11 最后一轮，隔离探针 /tmp/gp6/gprobe6..10.cu）
 
 > 底座复刻 = `kernels/cuda/dsv41_kernels.cu` 的 `gemm_fp8_gemv_kernel`（mode 4 / warps=4 / LUT /
