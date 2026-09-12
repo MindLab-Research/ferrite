@@ -304,6 +304,8 @@ async fn stats(State(st): State<RouterState>) -> impl IntoResponse {
             "tree_blocks": s.tree_blocks,
             "evictable_tokens": s.evictable_tokens,
             "protected_tokens": s.protected_tokens,
+            "hits": s.hits,
+            "misses": s.misses,
         },
         "hicache": {
             "tiers": { "device": s.tier_census.0, "host": s.tier_census.1, "disk": s.tier_census.2 },

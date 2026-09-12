@@ -4769,6 +4769,208 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 }
 
 // ===========================================================================
+// Multi-row dense fp8 GEMV, weight-stationary over the row batch
+// (`dsv41_gemm_fp8_mrows` below). The verify block's q/kv/o projection family.
+// ===========================================================================
+// WHY THIS EXISTS. `dsv41_gemm_fp8_mx` at m == 1 runs the SIMT
+// `gemm_fp8_gemv_kernel` (one warp per output row, warp-shuffle reduction tree)
+// while m > 1 runs `gemm_fp8_kernel`'s 16-ROW TILE -- two DIFFERENT programs.
+// The verify's iron rule is "row r of an m-row launch == the m=1 decode of row
+// r", so `m = m` on the existing symbol is not an option: it would silently swap
+// the summation program. `attention_rows` therefore called the m=1 form once per
+// row: wq_a / wkv / wq_b / wo_a / wo_b x m rows = ~2000 launches per verify step
+// (docs/agent/dspark-perf-400-plan.md §2), and each of those calls re-streamed
+// the SAME weight matrix (wq_a alone is 1280 x 5120 B = 6.6 MB per call).
+//
+// This kernel is the weight-stationary form of the m=1 program, i.e.
+// `dsv41_head_gemv_bf16_mrows`'s structure applied to the fp8 GEMV family -- the
+// same structure `dsv41_wo_a_grouped_fp8` (above) already uses for the draft's
+// block-diagonal wo_a. One block owns `nwarps` output rows; those weight rows are
+// staged into shared memory ONCE and every activation row folds against them.
+//
+// NUMERICS -- for every (output row `row`, activation row `r`), BIT-IDENTICAL to
+// the m=1 `dsv41_gemm_fp8_mx` call of the same (row, r). The m=1 (mode >= 3)
+// consume loop is
+//     acc += av * (s_lut[row_s[j]] * sb);          av = s_af[j]
+// with `s_af[j] = s_lut[ap[j]] * s_as[j>>5]` materialised block-wide (a32=1,
+// the production default), `sb = ue8m0_to_f(wsr[kb])` and `j = kb*32 + lane`.
+// This kernel emits, for each (r, kb), the SAME expression:
+//     const float wv = s_lut[row_s[j]] * sb;
+//     const float av = s_lut[s_a[r*k + j]] * s_as[r*nb_k + (j>>5)];
+//     acc[r] += av * wv;
+// C1 (same K walk): `kb` ascends 0..nb_k-1 and `j = kb*32 + lane` -- the staged,
+//     order-preserving form, NOT the vectorised/scalar arms which reorder a
+//     lane's elements. The launcher declines `g_gemv_fp8_mode < 3`.
+// C2 (same operands, same bytes): `row_s`/`wsr` are the weight row's fp8 bytes
+//     and ue8m0 scale row, `s_a`/`s_as` the activation row's fp8 bytes and f32
+//     scale row -- the very same global memory the gemv stages, so the copy
+//     width is not observable. `e4m3_to_f` / `ue8m0_to_f` are the gemv's own
+//     device helpers.
+//     The ONE deliberate difference from the m=1 launcher is HOW the activation
+//     operand is formed: `s_lut[s_a[...]] * s_as[...]` inline (the gemv's a32=0
+//     form) instead of reading a materialised `s_af` (a32=1). The gemv header
+//     records that pair as bit-identical BY CONSTRUCTION ("Both forms are
+//     bit-identical by construction" -- the same LUT entry times the same scale,
+//     one FMUL each), and `dsv41_a32_mat4`'s header repeats it. The inline form
+//     is what makes the weight-stationary structure fit: M staged activation
+//     rows of k BYTES (not k floats) serve all `nwarps` output rows.
+// C3 (same reduction tree): the `shfl_xor` tree off = 16,8,4,2,1 is emitted
+//     verbatim and run ONCE PER (warp, r).
+// C4 (no cross-row recombination): `acc[r]` is an independent chain; nothing is
+//     ever added across r. `wv` is hoisted out of the r loop because it is a
+//     per-(row, kb) value -- the identical decode on the identical value,
+//     reused, which is exactly what removes the m-fold weight traffic and does
+//     NOT touch the association (the same argument `dsv41_head_gemv_bf16_mrows`
+//     records for its `wv`).
+// C5: no K-split and no smem fold exists here, so nothing can reorder.
+// C6 (codegen pin): the accumulate stays a SINGLE serial `acc[r] +=` chain with
+//     the m=1 loop's `#pragma unroll 32` source form. Unrolling cannot
+//     reassociate a serial chain; split accumulators WOULD -- do not "optimise"
+//     this into per-r partials or a multi-way unrolled body with plain operators
+//     (build.sh records a ~1 ULP/layer fast-math drift from exactly that).
+//
+// ABI: (a, a_scale, w, w_scale, bias, out, m, n, k, out_stride, stream)
+//      -> 0 launched, 2 DECLINED (never 1).
+//   a          [m, k]        fp8 e4m3, row r at +r*k
+//   a_scale    [m, k/32]     f32, row r at +r*(k/32)
+//   w          [n, k]        fp8 e4m3
+//   w_scale    [n/32, k/32]  ue8m0 (block 32x32)
+//   out        f32, row r's element `row` at +r*out_stride + row
+//   n / k      the output / contraction width; `out_stride >= n` (the wq_b call
+//              site writes nlh*head_dim of an nh*head_dim row, so the stride is
+//              NOT implied by `n`).
+// "2" and not cudaErrorInvalidValue: 1 would be indistinguishable from a real
+// launch failure (the r42-45 collision the swapAB entry documents), and every
+// decline here is a shape / mode property the caller can fall back on -- the
+// caller keeps its per-row loop, whose numerics are the same by construction.
+template <int M>
+__global__ void __launch_bounds__(256)
+gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
+                      const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
+                      const float* __restrict__ bias, float* __restrict__ out, int n, int k,
+                      int out_stride) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int nb_k = k >> 5;
+    // smem layout: the block's weight rows | the 256-entry e4m3 table | the M
+    // activation scale rows (f32) | the M staged activation rows (fp8 bytes).
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
+    float* s_as = s_lut + 256;
+    uint8_t* s_a = reinterpret_cast<uint8_t*>(s_as + (size_t)M * (size_t)nb_k);
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // The M activation rows are the same for every output row of the block, so
+    // they are staged once per block instead of re-read by each of the `nwarps`
+    // warps (the mode-3-vs-4 argument the gemv carries). Row r's bytes and scale
+    // row land exactly where the m=1 kernel would have staged its single row.
+    #pragma unroll
+    for (int r = 0; r < M; ++r) {
+        const uint8_t* __restrict__ ar = a + (size_t)r * (size_t)k;
+        const float* __restrict__ asr = a_scale + (size_t)r * (size_t)nb_k;
+        for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[(size_t)r * nb_k + i] = asr[i];
+        for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[(size_t)r * (size_t)k + i] = ar[i];
+    }
+    // This warp's output row. `row` is UNIFORM within a warp, so the whole warp
+    // takes the same side of every `active` branch and both barriers below are
+    // reached by every thread of the block (the strided-walk shape the m=1
+    // kernel uses collapses to this single-shot form at grid*nwarps >= n, which
+    // is what the launcher guarantees).
+    const int row = blockIdx.x * nwarps + warp;
+    const bool active = row < n;
+    if (active) {
+        const uint8_t* __restrict__ wr = w + (size_t)row * (size_t)k;
+        uint8_t* __restrict__ row_s = s_w + (size_t)warp * (size_t)k;
+        for (int i = lane; i < k; i += 32) row_s[i] = wr[i];
+    }
+    __syncthreads();
+    if (active) {
+        const uint8_t* __restrict__ wsr = w_scale + (size_t)(row >> 5) * (size_t)nb_k;
+        float acc[M];
+        #pragma unroll
+        for (int r = 0; r < M; ++r) acc[r] = 0.f;
+        #pragma unroll 32
+        for (int kb = 0; kb < nb_k; ++kb) {
+            const float sb = ue8m0_to_f(wsr[kb]);
+            const int j = kb * 32 + lane;
+            // ONE decode for all M rows (C4): the identical per-(row, kb) value
+            // the m=1 loop would recompute, reused.
+            const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+            #pragma unroll
+            for (int r = 0; r < M; ++r) {
+                const float av =
+                    s_lut[s_a[(size_t)r * (size_t)k + j]] * s_as[(size_t)r * nb_k + (j >> 5)];
+                acc[r] += av * wv;
+            }
+        }
+        #pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float a_r = acc[r];
+            for (int off = 16; off > 0; off >>= 1) a_r += __shfl_xor_sync(0xFFFFFFFFu, a_r, off);
+            if (lane == 0) {
+                const float v = a_r + (bias != nullptr ? bias[row] : 0.f);
+                out[(size_t)r * (size_t)out_stride + row] = v;
+            }
+        }
+    }
+}
+
+// See the kernel header above for the layout and the bit-identity argument (C1-C6).
+// Returns 0 (launched) or 2 (declined: the caller keeps its per-row loop, whose
+// numerics are the same by construction).
+extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
+                                    const uint8_t* w, const uint8_t* w_scale,
+                                    const float* bias, float* out, int m, int n, int k,
+                                    int out_stride, cudaStream_t s) {
+    if (m <= 0 || m > 8) return 2;
+    if (n <= 0 || k <= 0 || (k & 31)) return 2;
+    if (out_stride < n) return 2;
+    if (a == nullptr || a_scale == nullptr || w == nullptr || w_scale == nullptr || out == nullptr)
+        return 2;
+    // The C1-C6 parity argument above is the ORDER-PRESERVING consume form. The
+    // vectorised/scalar arms (mode 0/1) reorder a lane's elements, so a run
+    // configured for them keeps the per-row loop.
+    if (g_gemv_fp8_mode < 3) return 2;
+    // Same for DSV41_NO_GEMV_FP8: with the M=1 GEMV disabled the m=1
+    // gemm_fp8_mx call runs the M-tile MMA path instead, whose accumulation is a
+    // different expression entirely.
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    // One warp per output row, the same adaptive block the m=1 launcher picks for
+    // this `n` (the block geometry does not enter the parity argument -- rows are
+    // independent -- it only decides how many rows share one block's staging).
+    const int nwarps = dsv41_gemv_warps_for(n);
+    const int blocks = (n + nwarps - 1) / nwarps;
+    const int nb_k = k >> 5;
+    // weight rows (nwarps*k) + the e4m3 table + the M activation scale rows + the
+    // M staged activation rows.
+    const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float) +
+                        (size_t)m * (size_t)nb_k * sizeof(float) + (size_t)m * (size_t)k;
+    if (smem > 48 * 1024) {
+        // Per-kernel ceiling, not this call's need: a sticky attribute set to a
+        // smaller value would silently cap later launches (round-43 revert).
+        cudaError_t e = cudaFuncSetAttribute(gemm_fp8_mrows_kernel<1>,
+                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                             dsv41_smem_ceiling(gemm_fp8_mrows_kernel<1>));
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    const dim3 grid(blocks);
+    switch (m) {
+        case 1: gemm_fp8_mrows_kernel<1><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 2: gemm_fp8_mrows_kernel<2><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 3: gemm_fp8_mrows_kernel<3><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 4: gemm_fp8_mrows_kernel<4><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 5: gemm_fp8_mrows_kernel<5><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 6: gemm_fp8_mrows_kernel<6><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 7: gemm_fp8_mrows_kernel<7><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 8: gemm_fp8_mrows_kernel<8><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        default: return 2;
+    }
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
 // Grouped low-rank OUTPUT projection, weight-stationary over the row batch
 // (`dsv41_wo_a_grouped_fp8` below). The DSpark draft's attention tail.
 // ===========================================================================

@@ -360,6 +360,15 @@ struct Scratch {
     o_r: DevBuf,       // [m, nh*hd] sparse attention output (after the inverse o-rope)
     wo_r: DevBuf,      // [m, n_groups*o_lora] wo_a output
     wo_out_r: DevBuf,  // [m, dim] attention block output (wo_b + the wo AR)
+    /// [VERIFY_ROWS, xq_row] fp8 e4m3 + [VERIFY_ROWS, xq_row/32] f32: the
+    /// multi-row activation staging for `attention_rows`'s projections. The
+    /// per-row loop quantised ONE row into `s.xq`/`s.xsc` and then called the m=1
+    /// GEMV; the multi-row form (`gemm_fp8_mrows` / `wo_a_grouped_fp8`) takes the
+    /// whole `[m, k]` block, so the block is quantised here ONCE per projection
+    /// (`quant_rows`) and each projection becomes a single launch. Row `r` of
+    /// this buffer is bit-identical to what the per-row `quant1` wrote there.
+    xq_r: DevBuf,
+    xsc_r: DevBuf,
     moe_out_r: DevBuf, // [m, dim] MoE block output (routed + shared expert)
     ids_r: DevBuf,     // [m] i32 token ids
     argmax_r: DevBuf,  // [m] i32 per-row argmax (the head's output)
@@ -1616,6 +1625,14 @@ impl<'a> DevChain<'a> {
             o_r: dev.alloc(fb(VERIFY_ROWS * nh * hd))?,
             wo_r: dev.alloc(fb(VERIFY_ROWS * cfg.n_groups_o_lora()))?,
             wo_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
+            // The multi-row activation staging (see the field comment): one row
+            // per verify row, each sized for the LARGEST activation the block
+            // quantises -- `dim` for wq_a/wkv, the full attention-output row
+            // `nh*hd` for wo_a (its `a_stride` is the this-rank `nlh*hd`, which
+            // is <= that). Sized unconditionally: a few hundred KB, and a static
+            // allocation graph is worth more than the bytes.
+            xq_r: dev.alloc((VERIFY_ROWS * dim.max(nh * hd)).max(8))?,
+            xsc_r: dev.alloc(fb(VERIFY_ROWS * dim.max(nh * hd) / 32 + 8))?,
             moe_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
             ids_r: dev.alloc(VERIFY_ROWS * 4)?,
             argmax_r: dev.alloc(VERIFY_ROWS * 4)?,
@@ -2112,6 +2129,78 @@ impl<'a> DevChain<'a> {
             out,
             n_out,
             k,
+        )
+    }
+
+    /// Quantise `rows` FP32 rows of `cols` values each into the block scratch
+    /// `s.xq_r` / `s.xsc_r` — the multi-row form of [`Self::quant1`].
+    ///
+    /// `quant_kernel` dispatches one thread-group per (row, 32-element block) and
+    /// derives the row index from it (`r = idx / nb`), so a `rows = m` launch
+    /// emits byte-for-byte what `m` separate `rows = 1` launches emit: the row
+    /// index only picks the base pointers, and each row's block amax is its own
+    /// shuffle reduction over its own 32 values. This is the activation staging
+    /// the multi-row projections consume — [`Self::proj_mrows`] reads it as the
+    /// contiguous `[m, k]` / `[m, k/32]` blocks, and `wo_a_grouped_fp8` with
+    /// `a_stride` set to the row pitch.
+    ///
+    /// It deliberately bypasses `quant1`'s T1/T2 launch-elision flags: both are
+    /// keyed on `s.xn` / `s.qr`, and no caller here ever passes those (the
+    /// multi-row pass feeds `s.xn_r` / `s.qr_r`), so the elision never fired for
+    /// this path and the flags' state is unchanged by using this instead.
+    fn quant_rows(&self, src: *const f32, rows: usize, cols: i32) -> Result<()> {
+        self.dev.quant_fp8(
+            src,
+            self.s.xq_r.ptr as *mut u8,
+            self.s.xsc_r.ptr as *mut f32,
+            rows as i32,
+            cols,
+            32,
+            true,
+        )
+    }
+
+    /// ONE `gemm_fp8_mrows` launch for a projection whose activation is already
+    /// staged in `s.xq_r` / `s.xsc_r` by [`Self::quant_rows`]: the m-row form of
+    /// [`Self::lin`], weight-stationary over the block's rows.
+    ///
+    /// This is NOT `gemm_fp8_mx` at `m = rows`. That symbol dispatches on `m`
+    /// between two different programs — the SIMT warp-per-row GEMV at `m == 1`
+    /// and a 16-row tile MMA at `m > 1` — so raising `m` on it would silently
+    /// change the summation. `gemm_fp8_mrows` reproduces the `m == 1` consume
+    /// expression, its ascending-kb walk and its `shfl_xor` tree per row, which
+    /// is what keeps "row r of an m-row launch == the m=1 decode of row r" true.
+    ///
+    /// `Ok(false)` = NOT performed — the caller keeps its per-row loop (the
+    /// bit-exact reference it was verified against). It declines when the loaded
+    /// .so lacks the symbol, the C entry declines the shape or the process's
+    /// `DSV41_GEMV_FP8_MODE` / `DSV41_NO_GEMV_FP8` gates refuse it, or the swapAB
+    /// opt-in is on (that arm is explicitly NOT bit-identical to the SIMT gemv
+    /// and keeps its own kernel).
+    fn proj_mrows(
+        &self,
+        w: *const u8,
+        ws: *const u8,
+        out: *mut f32,
+        rows: usize,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        if Self::swapab() {
+            return Ok(false);
+        }
+        self.dev.gemm_fp8_mrows(
+            self.s.xq_r.ptr as *const u8,
+            self.s.xsc_r.ptr as *const f32,
+            w,
+            ws,
+            std::ptr::null(),
+            out,
+            rows as i32,
+            n,
+            k,
+            out_stride,
         )
     }
 
@@ -5139,36 +5228,76 @@ impl<'a> DevChain<'a> {
         let ld = &self.w.layers[layer];
         let pos_ctr = self.s.pos_ctr.ptr as *const std::os::raw::c_int;
 
-        // ---- q / kv projections, one row per call ----
-        // `lin()` is the (quant1, gemm_fp8_mx_or_swap) pair: the plain shape the
-        // fused `lin2`/`lin_rope*` launches are bit-identical to.
+        // ---- q / kv projections: ONE launch per projection over the whole block
+        // `lin()` is the per-row (quant1, gemm_fp8_mx) pair: `2m` quant launches
+        // + `2m` GEMV launches, each GEMV re-streaming the same weight matrix.
+        // The multi-row form (`quant_rows` + `proj_mrows`) quantises the
+        // activation block ONCE and runs ONE `gemm_fp8_mrows` per projection —
+        // that kernel is the weight-stationary form of `gemm_fp8_mx`'s **m == 1**
+        // program, NOT its m > 1 tile path (a different summation), so row `r`
+        // stays bit-identical to the per-row call. See the kernel header's C1-C6
+        // in dsv41_kernels.cu; `proj_mrows` refuses when the .so/mode/gate cannot
+        // take it, and the per-row loop below is the fallback.
         //
         // The loop is split into (wq_a, wkv) -> q norm -> wq_b so the q norm can
         // be ONE `n = m` launch. It is row-INDEPENDENT (the kernel gives every row
         // its own block and its own blockDim-sized reduction), `qr_r` is the
         // contiguous [m, ql] block, and row `r`'s output is bit-identical to the
-        // per-row `n = 1` call it replaces. Only the norm moves; the projections
-        // stay per row (the numerical-domain rule).
-        for r in 0..m {
-            let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
-            let qrr = (self.s.qr_r.ptr as *mut f32).wrapping_add(r * ql);
-            let kvr = (self.s.kv_r.ptr as *mut f32).wrapping_add(r * hd);
-            self.lin(
-                xr,
-                dim as i32,
-                ld.wq_a.as_ref().unwrap(),
-                ld.wq_a_scale.as_ref().unwrap(),
+        // per-row `n = 1` call it replaces.
+        let mrows = self.dev.supports_gemm_fp8_mrows() && !Self::swapab() && m <= VERIFY_ROWS;
+        let took_akv = if mrows {
+            // the block's fp8 activation: `quant_kernel` is one thread-group per
+            // (row, block), so row `r` here is the byte-for-byte `quant1(xr)`
+            // the per-row loop issues. wq_a and wkv share it (they read the same
+            // `xn_r` row), which alone removes `m` quant launches.
+            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            let ok_a = self.proj_mrows(
+                ld.wq_a.as_ref().unwrap().as_u8(),
+                ld.wq_a_scale.as_ref().unwrap().as_u8(),
+                self.s.qr_r.ptr as *mut f32,
+                m,
                 ql as i32,
-                qrr,
-            )?;
-            self.lin(
-                xr,
                 dim as i32,
-                ld.wkv.as_ref().unwrap(),
-                ld.wkv_scale.as_ref().unwrap(),
-                hd as i32,
-                kvr,
+                ql as i32,
             )?;
+            let ok_kv = self.proj_mrows(
+                ld.wkv.as_ref().unwrap().as_u8(),
+                ld.wkv_scale.as_ref().unwrap().as_u8(),
+                self.s.kv_r.ptr as *mut f32,
+                m,
+                hd as i32,
+                dim as i32,
+                hd as i32,
+            )?;
+            // Both are evaluated (no short-circuit) so a decline cannot leave one
+            // projection on the multi-row path and the other on the per-row one;
+            // re-running either form is idempotent (same values, same layout).
+            ok_a && ok_kv
+        } else {
+            false
+        };
+        if !took_akv {
+            for r in 0..m {
+                let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+                let qrr = (self.s.qr_r.ptr as *mut f32).wrapping_add(r * ql);
+                let kvr = (self.s.kv_r.ptr as *mut f32).wrapping_add(r * hd);
+                self.lin(
+                    xr,
+                    dim as i32,
+                    ld.wq_a.as_ref().unwrap(),
+                    ld.wq_a_scale.as_ref().unwrap(),
+                    ql as i32,
+                    qrr,
+                )?;
+                self.lin(
+                    xr,
+                    dim as i32,
+                    ld.wkv.as_ref().unwrap(),
+                    ld.wkv_scale.as_ref().unwrap(),
+                    hd as i32,
+                    kvr,
+                )?;
+            }
         }
         // q norm, in place: ALL m rows in ONE launch (the T2 epilogue's own
         // fallback pair — a plain rmsnorm into `qr`). Was m launches.
@@ -5180,16 +5309,36 @@ impl<'a> DevChain<'a> {
             ql as i32,
             cfg.norm_eps,
         )?;
-        for r in 0..m {
-            // wq_b: this rank's `nlh` heads, written at the row's base
-            self.lin(
-                (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
-                ql as i32,
-                ld.wq_b.as_ref().unwrap(),
-                ld.wq_b_scale.as_ref().unwrap(),
+        // wq_b: ONE launch for the whole block (see `proj_mrows`). The activation
+        // is the normalised `qr_r` block; the output row is `nh*hd` wide but this
+        // rank only writes its leading `nlh*hd`, which is why `out_stride` is a
+        // separate kernel parameter rather than `n`.
+        let took_b = if mrows {
+            self.quant_rows(self.s.qr_r.ptr as *const f32, m, ql as i32)?;
+            self.proj_mrows(
+                ld.wq_b.as_ref().unwrap().as_u8(),
+                ld.wq_b_scale.as_ref().unwrap().as_u8(),
+                self.s.q_r.ptr as *mut f32,
+                m,
                 (nlh * hd) as i32,
-                (self.s.q_r.ptr as *mut f32).wrapping_add(r * nh * hd),
-            )?;
+                ql as i32,
+                (nh * hd) as i32,
+            )?
+        } else {
+            false
+        };
+        if !took_b {
+            for r in 0..m {
+                // wq_b: this rank's `nlh` heads, written at the row's base
+                self.lin(
+                    (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+                    ql as i32,
+                    ld.wq_b.as_ref().unwrap(),
+                    ld.wq_b_scale.as_ref().unwrap(),
+                    (nlh * hd) as i32,
+                    (self.s.q_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                )?;
+            }
         }
         // ---- RoPE ----
         // The kernel computes `pos = *base * mul + off + row * step` for row `row`.
@@ -5404,7 +5553,7 @@ impl<'a> DevChain<'a> {
             )?;
         }
 
-        // ---- grouped output projection + wo_b, one row per call ----
+        // ---- grouped output projection + wo_b: ONE launch per phase ----
         let groups = cfg.o_groups;
         let hpg = nh / groups;
         let olg = cfg.o_lora_rank;
@@ -5412,53 +5561,108 @@ impl<'a> DevChain<'a> {
         let k = hpg * hd;
         let ol_total = groups * cfg.o_lora_rank;
         let ol_local = ol_total / world;
-        for r in 0..m {
-            // the fp8 of this row's attention output (the OROPE_Q epilogue's own
-            // fallback), shared by all of the row's group blocks
-            self.quant1(
-                (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
+        // The grouped wo_a as ONE launch (`dsv41_wo_a_grouped_fp8`, the draft's
+        // kernel): weight-stationary over the block's rows AND over the groups
+        // (`groups` rides grid.y), so the per-(row, group) loop below becomes one
+        // call. `a_stride = nlh*hd` is this rank's attention-output row pitch --
+        // the group's k-element segment is `k` bytes into the row, and the rows
+        // are NOT `k` apart (that difference is exactly why the plain mrows kernel
+        // cannot express this call site). Bit-identical per (row, group) to the
+        // `gemm_fp8_mx_or_swap` pair it replaces (its kernel header carries the
+        // same C1-C6 argument).
+        let took_o = if mrows {
+            // the fp8 of EVERY row's attention output (the OROPE_Q epilogue's own
+            // fallback), quantised with the row pitch `nlh*hd` -- the per-row
+            // `quant1` wrote these same bytes into `s.xq` one row at a time,
+            // shared by all of the row's group blocks.
+            self.quant_rows(self.s.o_r.ptr as *const f32, m, (nlh * hd) as i32)?;
+            self.dev.wo_a_grouped_fp8(
+                self.s.xq_r.ptr as *const u8,
+                self.s.xsc_r.ptr as *const f32,
+                ld.wo_a.as_ref().unwrap().as_u8(),
+                ld.wo_a_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                self.s.wo_r.ptr as *mut f32,
+                nlg as i32,
+                m as i32,
+                olg as i32,
+                k as i32,
                 (nlh * hd) as i32,
-            )?;
-            for g in 0..nlg {
-                // The weight tensor is ALREADY this rank's local slice, so every
-                // offset is local (see `attention`'s comment on the tp=8 bug).
-                let a = self.s.xq.as_u8().wrapping_add(g * k);
-                let asc = self.s.xsc.as_f32().wrapping_add((g * k / 32) as usize);
-                let wp = ld.wo_a.as_ref().unwrap().as_u8().wrapping_add(g * olg * k);
-                let wsp = ld
-                    .wo_a_scale
-                    .as_ref()
-                    .unwrap()
-                    .as_u8()
-                    .wrapping_add((g * olg / 32) * (k / 32));
-                let out = (self.s.wo_r.ptr as *mut f32).wrapping_add(r * ol_total + g * olg);
-                self.gemm_fp8_mx_or_swap(
-                    a,
-                    asc,
-                    wp,
-                    wsp,
-                    std::ptr::null(),
-                    out,
-                    olg as i32,
-                    k as i32,
+                ol_total as i32,
+            )?
+        } else {
+            false
+        };
+        if !took_o {
+            for r in 0..m {
+                // the fp8 of this row's attention output (the OROPE_Q epilogue's own
+                // fallback), shared by all of the row's group blocks
+                self.quant1(
+                    (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                    (nlh * hd) as i32,
                 )?;
+                for g in 0..nlg {
+                    // The weight tensor is ALREADY this rank's local slice, so every
+                    // offset is local (see `attention`'s comment on the tp=8 bug).
+                    let a = self.s.xq.as_u8().wrapping_add(g * k);
+                    let asc = self.s.xsc.as_f32().wrapping_add((g * k / 32) as usize);
+                    let wp = ld.wo_a.as_ref().unwrap().as_u8().wrapping_add(g * olg * k);
+                    let wsp = ld
+                        .wo_a_scale
+                        .as_ref()
+                        .unwrap()
+                        .as_u8()
+                        .wrapping_add((g * olg / 32) * (k / 32));
+                    let out = (self.s.wo_r.ptr as *mut f32).wrapping_add(r * ol_total + g * olg);
+                    self.gemm_fp8_mx_or_swap(
+                        a,
+                        asc,
+                        wp,
+                        wsp,
+                        std::ptr::null(),
+                        out,
+                        olg as i32,
+                        k as i32,
+                    )?;
+                }
             }
-            // wo_b is RowParallel: the input is split over the ranks, so this rank
-            // writes its own partial and the AR below sums them.
-            self.quant1(
-                (self.s.wo_r.ptr as *const f32).wrapping_add(r * ol_total),
-                ol_local as i32,
-            )?;
-            self.gemm_fp8_mx_or_swap(
-                self.s.xq.as_u8(),
-                self.s.xsc.as_f32(),
+        }
+        // wo_b is RowParallel: the input is split over the ranks, so this rank
+        // writes its own partial and the AR below sums them. ONE launch for the
+        // block (`proj_mrows`); the activation is this rank's `ol_local`-wide
+        // slice of each `wo_r` row. It reads `wo_r`, which the wo_a phase above
+        // fully wrote — both forms of that phase finish before this launches.
+        let took_wob = if mrows {
+            self.quant_rows(self.s.wo_r.ptr as *const f32, m, ol_local as i32)?;
+            self.proj_mrows(
                 ld.wo_b.as_ref().unwrap().as_u8(),
                 ld.wo_b_scale.as_ref().unwrap().as_u8(),
-                std::ptr::null(),
-                (self.s.wo_out_r.ptr as *mut f32).wrapping_add(r * dim),
+                self.s.wo_out_r.ptr as *mut f32,
+                m,
                 dim as i32,
                 ol_local as i32,
-            )?;
+                dim as i32,
+            )?
+        } else {
+            false
+        };
+        if !took_wob {
+            for r in 0..m {
+                self.quant1(
+                    (self.s.wo_r.ptr as *const f32).wrapping_add(r * ol_total),
+                    ol_local as i32,
+                )?;
+                self.gemm_fp8_mx_or_swap(
+                    self.s.xq.as_u8(),
+                    self.s.xsc.as_f32(),
+                    ld.wo_b.as_ref().unwrap().as_u8(),
+                    ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                    std::ptr::null(),
+                    (self.s.wo_out_r.ptr as *mut f32).wrapping_add(r * dim),
+                    dim as i32,
+                    ol_local as i32,
+                )?;
+            }
         }
         // ---- the attention all-reduce ----
         // The payload is the m rows of `wo_out_r` instead of one: the AR is a

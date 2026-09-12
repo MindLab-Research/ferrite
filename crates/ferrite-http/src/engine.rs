@@ -126,6 +126,9 @@ pub struct DriverStats {
     pub pages_free: usize,
     pub ticks: u64,
     pub tokens_committed: u64,
+    /// Prefix-cache outcomes (one sample per admission; see CacheStats).
+    pub hits: u64,
+    pub misses: u64,
 }
 
 impl DriverStats {
@@ -143,6 +146,8 @@ impl DriverStats {
             pages_free: c.pages_free,
             ticks,
             tokens_committed: tokens,
+            hits: c.hits,
+            misses: c.misses,
         }
     }
 }

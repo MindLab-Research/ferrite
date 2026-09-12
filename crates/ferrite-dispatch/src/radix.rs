@@ -609,3 +609,20 @@ impl NodeId {
         Self::new_unchecked(idx)
     }
 }
+
+impl StateId {
+    /// Mint an **opaque** state handle for an engine that owns its physical
+    /// state outside `StateRegistry`.
+    ///
+    /// The tree only *carries* the handle (it never dereferences it — `state`
+    /// is what the scheduler's physical layer later promotes/demotes/releases).
+    /// An engine whose per-seq state is not a registry snapshot (the CUDA
+    /// `GpuEngine`'s parked sequences, whose KV lives in the seq's own device
+    /// buffers) stamps one of these per block so the node is matchable, and
+    /// keeps its own `NodeId → seq` map for the physical side. The registry is
+    /// never consulted for such ids — mixing them into a real `StateRegistry`
+    /// would be a lookup miss, not a bogus hit.
+    pub fn opaque(raw: u32) -> Self {
+        Self::new_unchecked(raw)
+    }
+}

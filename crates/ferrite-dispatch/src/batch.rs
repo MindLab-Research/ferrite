@@ -262,6 +262,11 @@ pub struct BatchScheduler<S: PhysStateStore> {
     /// Dense live-row bookkeeping: row r ↔ seq (compacted on retire —
     /// module doc "row identity recap").
     rows: Vec<Option<crate::arena::SeqId>>,
+    /// Admission-time prefix-cache outcomes (the `CacheStats.hits`/
+    /// `misses` counters): one sample per admission, incremented after
+    /// the authoritative post-reclaim match.
+    hits: u64,
+    misses: u64,
 }
 
 impl<S: PhysStateStore> BatchScheduler<S> {
@@ -285,6 +290,8 @@ impl<S: PhysStateStore> BatchScheduler<S> {
             registry,
             graphs: GraphPool::new(),
             rows,
+            hits: 0,
+            misses: 0,
         })
     }
 
@@ -409,6 +416,13 @@ impl<S: PhysStateStore> BatchScheduler<S> {
             Some(m) => (m.matched_tokens, Some(m.node)),
             None => (0, None),
         };
+        // Prefix-cache outcome (one sample per admission — the /v1/stats
+        // hits/misses counters).
+        if matched_tokens > 0 {
+            self.hits += 1;
+        } else {
+            self.misses += 1;
+        }
         self.registry.acquire_row(free_row)?;
         let pinned = if matched_tokens > 0 {
             let anchor = anchor.expect("match without node");
@@ -818,7 +832,7 @@ impl<S: PhysStateStore> BatchScheduler<S> {
     }
 
     /// Radix + hicache census (diagnostics: tree nodes/blocks, tier
-    /// occupancy, page budget headroom).
+    /// occupancy, page budget headroom, prefix-cache hit/miss counters).
     pub fn cache_stats(&self) -> CacheStats {
         CacheStats {
             tree_nodes: self.radix.live_nodes(),
@@ -828,6 +842,8 @@ impl<S: PhysStateStore> BatchScheduler<S> {
             tier_census: self.registry.tier_census(),
             pages_in_use: self.registry.pages_in_use(),
             pages_free: self.registry.pages_free(),
+            hits: self.hits,
+            misses: self.misses,
         }
     }
 }
@@ -843,6 +859,11 @@ pub struct CacheStats {
     pub tier_census: (usize, usize, usize),
     pub pages_in_use: usize,
     pub pages_free: usize,
+    /// Prefix-cache hit/miss counters (one sample per ADMISSION — a hit is
+    /// an admission whose prompt matched ≥1 cached token, not a per-lookup
+    /// tally). Engines without a prefix cache report 0/0.
+    pub hits: u64,
+    pub misses: u64,
 }
 
 // Constant-parity guards (compile-time protocol facts the scheduler

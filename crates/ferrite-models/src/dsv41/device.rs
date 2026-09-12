@@ -380,6 +380,34 @@ struct Kernels {
             c_int, c_int, c_int, c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // Dense multi-row fp8 GEMV, from dsv41_kernels.cu (`dsv41_gemm_fp8_mrows`).
+    // The weight-stationary form of `dsv41_gemm_fp8_mx`'s **m == 1** program: one
+    // block owns `nwarps` output rows, stages those weight rows ONCE, and folds
+    // all `m` activation rows against them. This is what lets the verify's
+    // `attention_rows` project wq_a / wkv / wq_b / wo_b (and, via
+    // `wo_a_grouped_fp8`, wo_a) with ONE launch per projection instead of one per
+    // row, without touching the numerical domain: `dsv41_gemm_fp8_mx` at m > 1
+    // runs `gemm_fp8_kernel`'s 16-row TILE, a DIFFERENT program, so passing
+    // `m = m` to the existing symbol would silently swap the summation — this
+    // kernel reproduces the m == 1 consume expression, k-walk and shuffle tree
+    // per row (the kernel header carries the C1-C6 argument).
+    //
+    // `a` is [m, k] fp8 (row r at +r*k), `a_scale` [m, k/32] f32, `w`/`w_scale`
+    // as in `gemm_fp8_mx`, `out` f32 with row r's element `row` at
+    // `+r*out_stride + row` — `out_stride` is a SEPARATE parameter because the
+    // wq_b call site writes `nlh*head_dim` of an `nh*head_dim` row.
+    //
+    // Optional: a stale .so without the symbol keeps the per-row loop, and the C
+    // entry returns 2 (declined, never cudaErrorInvalidValue) for `m` outside
+    // 1..=8, a `k` that is not a multiple of 32, `out_stride < n`, or a run
+    // configured for the reordering `DSV41_GEMV_FP8_MODE` 0/1 arms.
+    // ABI: (a, a_scale, w, w_scale, bias, out, m, n, k, out_stride, s).
+    gemm_fp8_mrows: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
@@ -916,6 +944,7 @@ impl Device {
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
+            gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -3009,6 +3038,67 @@ impl Device {
         }
         self.kerr(rc, "dsv41_wo_a_grouped_fp8")?;
         Ok(true)
+    }
+
+    /// Dense multi-row fp8 GEMV: `out[r, :] = a[r, :] @ w^T + bias` for every
+    /// `r < rows`, with the weight rows staged ONCE for the whole batch.
+    ///
+    /// The weight-stationary form of [`Self::gemm_fp8_mx`]'s **m == 1** program.
+    /// That distinction is the whole reason this entry point exists:
+    /// `dsv41_gemm_fp8_mx` dispatches on `m` between two different programs
+    /// (SIMT warp-per-row GEMV at `m == 1`, the 16-row tile MMA at `m > 1`), so
+    /// passing `m = rows` to it would silently change the summation — the
+    /// verify's iron rule is "row r of an m-row launch == the m=1 decode of row
+    /// r", bit for bit. This kernel reproduces the `m == 1` consume expression,
+    /// its ascending-kb walk and its `shfl_xor` tree per row (the kernel header
+    /// in `dsv41_kernels.cu` carries the C1-C6 argument).
+    ///
+    /// `a` is `[rows, k]` fp8 e4m3 (row `r` at `+r*k`), `a_scale` `[rows, k/32]`
+    /// f32, `out` f32 with row `r`'s element `row` at `+r*out_stride + row`.
+    /// `out_stride` is its own parameter and NOT implied by `n`: the wq_b call
+    /// site writes `nlh*head_dim` elements of an `nh*head_dim` row.
+    ///
+    /// `Ok(false)` means NOT performed — keep the per-row loop: either the loaded
+    /// .so predates the symbol, or the C entry declined (it returns 2, never
+    /// cudaErrorInvalidValue, so a decline can never read as a launch failure).
+    /// `rows` outside 1..=8 is refused here as well, the same bound the C entry
+    /// enforces and the template dispatch covers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mrows(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mrows else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(a, a_scale, w, w_scale, bias, out, rows, n, k, out_stride, self.stream)
+        };
+        // 2 = the kernel's "declined" (shape/mode), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mrows")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries the multi-row fp8 GEMV
+    /// (`dsv41_gemm_fp8_mrows`). A stale .so leaves the projection sites on their
+    /// per-row loop, which is the bit-exact reference they were verified against.
+    pub fn supports_gemm_fp8_mrows(&self) -> bool {
+        self.kernels.gemm_fp8_mrows.is_some()
     }
 
     /// Fused M=1 gate GEMV + MoE route: ONE launch where `gemv_bf16_command` +

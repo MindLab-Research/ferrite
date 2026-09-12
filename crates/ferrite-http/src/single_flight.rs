@@ -318,6 +318,8 @@ impl<E: StepEngine + 'static> ServeEngine for SingleFlight<E> {
             tier_census: (0, 0, 0),
             pages_in_use: 0,
             pages_free: 0,
+            hits: 0,
+            misses: 0,
         }
     }
 

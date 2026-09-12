@@ -839,6 +839,24 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(())
     }
 
+    /// Re-sync a seq's host token mirror to the sequence its state covers.
+    ///
+    /// The mirror IS the position record: `seq_runtime(seq).tokens` is what
+    /// the decode output read (`gpu_engine::incremental`) indexes into. A
+    /// caller that seeds a seq from an already-processed prefix (the GLM
+    /// parked-seq prefix cache) must rewrite it to the tokens the seq's
+    /// KV/GDN state now covers — `prefill_chunk` only SEEDS the mirror
+    /// (`ensure_seq` early-returns for an existing seq), it never appends, so
+    /// the suffix fed after an adopted prefix would otherwise leave the read
+    /// offset short by that suffix.
+    pub fn set_seq_tokens(&mut self, seq: u64, tokens: &[u32]) {
+        for s in &mut self.shards {
+            if let Some(rt) = s.seq_runtime_mut(seq) {
+                rt.tokens = tokens.to_vec();
+            }
+        }
+    }
+
     /// Free a sequence's host + GPU state (multi-seq serving lifecycle —
     /// finished/aborted requests release ~GBs of per-seq caches: DSA KV,
     /// GDN states, mega graphs, or the serve OOMs after a handful of
