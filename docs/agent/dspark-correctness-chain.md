@@ -4673,3 +4673,20 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **对当前优化的启示**：
 - lazy 路径的优化（当前 89.6）在 accept 3 下只有 ~60——远不够
 - batched 路径（SWALLOW）在 accept 3 下的 weight-sharing 优势更明显（6 行一次 forward vs 2-3 行的有效利用）
+
+## LAZY_SDR（修复后）重验结果（e1bbf781）——干净但中性
+
+**结果**：
+- 前 61 行正确=True ✓ + 零拉丁 ✓
+- **吞吐 = 89.3 tok/s**（vs MARKOV-only 的 89.6——**中性**，-0.3 在噪声内）
+
+**判定**：LAZY_SDR（修复后）干净但收益≈0（修复恢复了 set_pos_ctr 的 H2D，只剩 D2D 合并的微小节省）
+
+**干净栈进展**：
+| 配置 | 吞吐 | 增量 |
+|---|---|---|
+| base | 78.8 | — |
+| + R2 | 86.8 | +10.2% |
+| + MARKOV | 89.6 | +3.2% |
+| + LAZY_SDR | 89.3 | ~0（中性）|
+| + VERIFY_FORK（下一测）| ~91? | +1-2%? |
