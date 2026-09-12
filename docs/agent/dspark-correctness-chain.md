@@ -1516,3 +1516,14 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 4. **tcgen05 测试**（解锁后的 grouped 路径）
 
 注意：batched 400 v2（1fa9a430）用的是启动时的代码（不含 S1 修复）——其结果反映 SWALLOW+mrows 但不含 S1。S1 验证需要另跑。
+
+## S1 修复的最终验证（代码级）
+
+三处 rope_pos 使用完全一致：
+- :1787 `let rope_pos = if seed_pos_fix() { pos + 1 } else { pos };` （定义）
+- :1833 `rope_queries(q, rope_pos)` （q 的 RoPE）
+- :1973 `rope_queries_inv(o, rope_pos)` （o 的逆 RoPE）
+
+与官方 model.py:1055-1068 的单一 freqs_cis 基址完全对齐。默认臂 rope_pos == pos（逐位不变），SEED_POS 臂 rope_pos == pos+1（与 kv 对齐，修复 off-by-one）。
+
+s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-identical ✓（"同整数"级别等价）、SEED_POS 臂对齐 ✓、位置认领无重叠 ✓。**0 严重 / 3 一般 / 2 建议**。
