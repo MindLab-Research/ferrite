@@ -1996,3 +1996,20 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 1. 每次测试前确认 .so 和 binary 的时间戳一致
 2. cargo build 的 "warning: build failed" 不能被 `tail -1` 掩盖——必须检查 EXIT CODE
 3. 测试结果如果与预期完全相同（histogram 逐项一致），要怀疑是否用了旧 binary
+
+## ar5-hang 回退后的预期（ar5-revert-fix 实施中）
+
+**回退内容**：argmax_sliced_rows 恢复无条件推进 + DRY 移除 host_barrier
+
+**回退后的 epoch 账**：
+| arm | AR 轮 | argmax 轮 | 合计 |
+|---|---|---|---|
+| replay | 80 | 1 | 81 |
+| DRY/direct | 80 | 1 | **81** ✓ 对齐 |
+
+**SWALLOW_STEP 的预期**：回退后 ar5-hang 应回到修复前的状态（gap 1-2——原始问题）。但原始问题（gap 1-2）是**时序竞态**不是 epoch 错位——可能需要不同的修复（如 verify_graph_failed 的锁存导致的 arm 分裂）。
+
+**原始 gap 1-2 的真正根因**（深度调查的补充）：
+- `verify_graph_failed[idx]` 是 per-rank 的捕获失败锁存——**可能只在一部分 rank 上触发**
+- 一旦有 rank 锁存失败，它永久留在 direct arm，而 peers 走 replay
+- 修复前 direct(81) vs replay(81) = 不漂移——但**时序**上 direct 慢一步可能错过 rendezvous
