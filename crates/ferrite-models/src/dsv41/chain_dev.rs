@@ -5293,7 +5293,24 @@ impl<'a> DevChain<'a> {
         // block layout, so it is its own arm (see `dspark_spec_aligned`), NOT a
         // branch inside the legacy one: the A/B must keep the legacy arm
         // bit-identical.
-        if seed_align() {
+        //
+        // The gate is armed only AFTER one legacy round has run (`spec_primed`,
+        // the same bootstrap the swallowed arm uses): the two arms must issue the
+        // SAME number of all-reduce collectives per round, because AR v5 has no
+        // host-side rendezvous — a rank that issues FEWER silently reads the
+        // previous epoch's values for the missing ones, and a rank that issues
+        // MORE spins forever. The one place the arms' AR footprints diverge is
+        // the FIRST round: the legacy arm calls `draft_forward(token, pos)`, and
+        // when that first round sits at `pos == 0` the call takes
+        // `draft_forward`'s prefill early-exit (0 draft ARs — the window is only
+        // seeded), while the aligned arm calls `draft_forward(next, pos + 1)`
+        // with `pos + 1 >= 1` and always runs all three mtp blocks (3 ARs). The
+        // gap is exactly `need - cur = 3` = one MoE all-reduce per mtp block.
+        // Priming closes it: round 1 runs this legacy path on BOTH arms (so both
+        // take the same early-exit), from round 2 on `pos >= 1` on both and the
+        // three blocks run on both. See docs/agent/dspark-correctness-chain.md
+        // ("AR v5 死锁", H1/F1).
+        if seed_align() && self.spec_primed {
             return self.dspark_spec_aligned(dspark, token, pos);
         }
 
@@ -5436,11 +5453,14 @@ impl<'a> DevChain<'a> {
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
 
-        // The chain is now bootstrapped: with the gate on, the next round's
-        // 6-row block carries the anchor's forward. Set LAST, so a round that
-        // failed above leaves this flag alone and the next round re-runs the
-        // legacy path (whose `step_dev` re-supplies a valid tap).
-        if swallow_step() {
+        // The chain is now bootstrapped: with the swallowed arm's gate on, the
+        // next round's 6-row block carries the anchor's forward; with the aligned
+        // arm's gate on, the next round may finally take the 6-row aligned block
+        // (see the gate above — the FIRST round had to run THIS path on both
+        // arms). Set LAST, so a round that failed above leaves this flag alone
+        // and the next round re-runs the legacy path (whose `step_dev`
+        // re-supplies a valid tap).
+        if seed_align() || swallow_step() {
             self.spec_primed = true;
         }
 
