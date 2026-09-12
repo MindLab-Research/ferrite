@@ -2952,14 +2952,14 @@ impl<'a> DevChain<'a> {
     /// it, or the swapAB opt-in is on (that arm is explicitly NOT bit-identical to
     /// the SIMT gemv and keeps its own kernel).
     ///
-    /// `DSV41_GEMV_A32` (Direction A): the mrows kernel implements only the inline
-    /// (a32=0) activation form, so at the gate's DEFAULT (a32=1 — the materialised
-    /// `s_af` form the per-row `gemm_fp8_mx`'s M=1 GEMV runs) it declines here and
-    /// every `proj_mrows` call site falls back to the per-row loop. That makes the
-    /// multi-row projection unavailable by default until its a32 variant lands
-    /// (Direction B) — a deliberate correctness-over-speed trade: the fallback is
-    /// the very program EAGER runs. Setting `DSV41_GEMV_A32=0` makes both arms the
-    /// same inline expression again and re-enables the multi-row path.
+    /// `DSV41_GEMV_A32` (Direction B, LANDED): the mrows kernel carries BOTH
+    /// activation forms and selects on the same process gate the M=1 GEMV reads,
+    /// so the multi-row launch is the same program at either setting —
+    /// a32=1 (the default) materialises the `s_lut[byte] * sa` operand in
+    /// registers before folding (the form the m=1 `gemm_fp8_mx`'s GEMV reads out
+    /// of its block-wide `s_af`), a32=0 folds the same product inline. The
+    /// launcher no longer declines the default, so the multi-row path is live
+    /// again; `DSV41_GEMV_A32` remains a pure occupancy knob.
     fn proj_mrows(
         &self,
         w: *const u8,

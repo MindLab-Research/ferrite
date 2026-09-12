@@ -4893,7 +4893,7 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 // NUMERICS -- for every (output row `row`, activation row `r`), BIT-IDENTICAL to
 // the m=1 `dsv41_gemm_fp8_mx` call of the same (row, r). The m=1 (mode >= 3)
 // consume loop is
-//     acc += av * (s_lut[row_s[j]] * sb);          av = s_af[j]
+//     acc += av * (s_lut[row_s[j]] * sb);          av = a32 ? s_af[j] : s_lut[ap[j]] * s_as[j>>5]
 // with `s_af[j] = s_lut[ap[j]] * s_as[j>>5]` materialised block-wide (a32=1,
 // the production default), `sb = ue8m0_to_f(wsr[kb])` and `j = kb*32 + lane`.
 // This kernel emits, for each (r, kb), the SAME expression:
@@ -4908,14 +4908,22 @@ extern "C" int dsv41_gemm_fp8_mx(const uint8_t* a, const float* a_scale, const u
 //     scale row -- the very same global memory the gemv stages, so the copy
 //     width is not observable. `e4m3_to_f` / `ue8m0_to_f` are the gemv's own
 //     device helpers.
-//     The ONE deliberate difference from the m=1 launcher is HOW the activation
-//     operand is formed: `s_lut[s_a[...]] * s_as[...]` inline (the gemv's a32=0
-//     form) instead of reading a materialised `s_af` (a32=1). The gemv header
-//     records that pair as bit-identical BY CONSTRUCTION ("Both forms are
-//     bit-identical by construction" -- the same LUT entry times the same scale,
-//     one FMUL each), and `dsv41_a32_mat4`'s header repeats it. The inline form
-//     is what makes the weight-stationary structure fit: M staged activation
-//     rows of k BYTES (not k floats) serve all `nwarps` output rows.
+//     The activation operand is formed as `s_lut[s_a[...]] * s_as[...]` -- the
+//     same LUT entry times the same scale, in the same order, as the materialised
+//     `s_af` the m=1 launcher reads at the gate's default. The gemv header records
+//     that pair as bit-identical BY CONSTRUCTION ("Both forms are bit-identical
+//     by construction"), and `dsv41_a32_mat4`'s header repeats it. The kernel now
+//     carries BOTH forms and picks on the same process gate the gemv reads
+//     (`a32`, the DSV41_GEMV_A32 snapshot the launcher passes): the a32 arm
+//     materialises this thread's M operands in REGISTERS before folding them (the
+//     materialised form, no `s_af` slot), the a32=0 arm folds the same product
+//     inline. Either arm emits one FMUL for the operand, so the two arms -- and
+//     the m=1 launch at the matching gate setting -- are the same program.
+//     The k-BYTE activation staging (not k floats) is what makes the
+//     weight-stationary structure fit: M staged activation rows of k bytes serve
+//     all `nwarps` output rows. A block-wide `s_af[m][k]` slot would add m*k*4
+//     bytes (100 KB at m=5, k=5120) and drop the block to 1/SM, which is why the
+//     a32 arm materialises in registers instead.
 // C3 (same reduction tree): the `shfl_xor` tree off = 16,8,4,2,1 is emitted
 //     verbatim and run ONCE PER (warp, r).
 // C4 (no cross-row recombination): `acc[r]` is an independent chain; nothing is
@@ -4950,7 +4958,7 @@ __global__ void __launch_bounds__(256)
 gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                       const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                       const float* __restrict__ bias, float* __restrict__ out, int n, int k,
-                      int out_stride) {
+                      int out_stride, int a32) {
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int nwarps = (blockDim.x + 31) >> 5;
@@ -4992,18 +5000,70 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
         float acc[M];
         #pragma unroll
         for (int r = 0; r < M; ++r) acc[r] = 0.f;
-        #pragma unroll 32
-        for (int kb = 0; kb < nb_k; ++kb) {
-            const float sb = ue8m0_to_f(wsr[kb]);
-            const int j = kb * 32 + lane;
-            // ONE decode for all M rows (C4): the identical per-(row, kb) value
-            // the m=1 loop would recompute, reused.
-            const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
-            #pragma unroll
-            for (int r = 0; r < M; ++r) {
-                const float av =
-                    s_lut[s_a[(size_t)r * (size_t)k + j]] * s_as[(size_t)r * nb_k + (j >> 5)];
-                acc[r] += av * wv;
+        if (a32) {
+            // A32 ARM (DSV41_GEMV_A32=1, the production default). The process's
+            // m=1 program reads a MATERIALISED activation operand: `s_af[j]`,
+            // filled -- on every one of the gemv's four fill paths -- as
+            // `s_lut[byte] * s_as[idx >> 5]` (dsv41_a32_mat4's float4 form and
+            // all three scalar loops). This arm materialises that SAME product
+            // for this thread's k-slice into REGISTERS and then folds it, so the
+            // kernel emits the a32 program itself instead of a look-alike, and
+            // does it WITHOUT the block-wide `s_af` slot (m*k f32 = 100 KB at
+            // m=5, k=5120, which would have taken the block to ~150 KB and one
+            // block per SM).
+            //
+            // WHY REGISTERS AND NOT A SMEM SLICE. `s_af` does not depend on the
+            // output row, but it DOES depend on the activation row r, and each
+            // (r, kb) operand is consumed exactly once (the inner loop shares
+            // only `wv`, per C4). So a per-warp copy amortises nothing: the
+            // decode count is M*nb_k per warp either way, and cross-warp sharing
+            // is the only amortisation there is -- that is the smem slot this
+            // arm deliberately does not take. What the arm buys is the gate
+            // parity the launcher used to decline, at zero smem and M extra
+            // registers.
+            //
+            // BIT-IDENTITY to the a32=0 arm (and to the m=1 a32 path) is by
+            // construction: each element is the same `lut[byte] * sa` in the
+            // same operand order, folded into the same serial `acc[r] += av * wv`
+            // chain in the same ascending-`kb`, `j = kb*32 + lane` walk, then the
+            // same shfl_xor tree. See the kernel header's C1-C6.
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = kb * 32 + lane;
+                // ONE decode for all M rows (C4): the identical per-(row, kb)
+                // value the m=1 loop would recompute, reused.
+                const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+                // The M materialised operands of this kb, hoisted out of the
+                // fold -- the same M products, written to registers instead of
+                // to `s_af`.
+                float af[M];
+                #pragma unroll
+                for (int r = 0; r < M; ++r)
+                    af[r] = s_lut[s_a[(size_t)r * (size_t)k + j]] *
+                            s_as[(size_t)r * nb_k + (j >> 5)];
+                #pragma unroll
+                for (int r = 0; r < M; ++r) acc[r] += af[r] * wv;
+            }
+        } else {
+            // A32-OFF ARM (DSV41_GEMV_A32=0, the rollback / A-B arm). The gemv's
+            // own a32=0 form folds the SAME product inline at the point of use:
+            // `s_lut[ap[j]] * s_as[j>>5]`, one FMUL, bit-identical to the
+            // materialised value the a32 path would have read back (the gemv
+            // header's "Both forms are bit-identical by construction").
+            #pragma unroll 32
+            for (int kb = 0; kb < nb_k; ++kb) {
+                const float sb = ue8m0_to_f(wsr[kb]);
+                const int j = kb * 32 + lane;
+                // ONE decode for all M rows (C4): the identical per-(row, kb) value
+                // the m=1 loop would recompute, reused.
+                const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+                #pragma unroll
+                for (int r = 0; r < M; ++r) {
+                    const float av =
+                        s_lut[s_a[(size_t)r * (size_t)k + j]] * s_as[(size_t)r * nb_k + (j >> 5)];
+                    acc[r] += av * wv;
+                }
             }
         }
         #pragma unroll
@@ -5034,21 +5094,24 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // vectorised/scalar arms (mode 0/1) reorder a lane's elements, so a run
     // configured for them keeps the per-row loop.
     if (g_gemv_fp8_mode < 3) return 2;
-    // Direction A (a32, DSV41_GEMV_A32): this kernel implements ONLY the inline
-    // activation form (a32=0) -- `s_lut[s_a[...]] * s_as[...]`, C2 above. It has
-    // no materialised `s_af` slot and reads no `g_gemv_a32`, so under the gate's
-    // DEFAULT (a32=1) the multi-row launch is a DIFFERENT program from the M=1
-    // GEMV its per-row fallback would have run (the gemv's `a32 ? s_af[j] : ...`
-    // consume form). Leaving that arm unserved is exactly the mismatch class the
-    // FOLD incident turned out to be -- a consumer that ignores a process-wide
-    // gate its replacement honours. Until the a32 variant lands (Direction B)
-    // this kernel is used ONLY in the run configured for the form it implements
-    // (`DSV41_GEMV_A32=0`: the per-row fallback then folds the SAME inline
-    // product, so the two arms are the same expression again); at the default it
-    // declines here and the caller's per-row loop runs the very GEMV EAGER runs,
-    // so the multi-row projection can no longer be a correctness divergence. The
-    // price is the multi-row speedup, not correctness.
-    if (g_gemv_a32) return 2;
+    // Direction A (a32, DSV41_GEMV_A32): LANDED. The kernel now carries BOTH
+    // activation forms and selects on this same gate, so the multi-row launch is
+    // the same program as the M=1 GEMV its per-row fallback would have run, at
+    // either setting of DSV41_GEMV_A32:
+    //   * a32=1 (the DEFAULT) -- the kernel's a32 arm materialises this thread's
+    //     `s_lut[a[j]] * s_as[j>>5]` operand in registers before folding it, the
+    //     identical product and operand order every gemv `s_af` fill path writes
+    //     (dsv41_a32_mat4 and the three scalar loops), so the consume expression
+    //     is `av * (s_lut[row_s[j]] * sb)` with `av` = the materialised value;
+    //   * a32=0 -- the inline arm folds the same product at the point of use,
+    //     which is that gemv arm's own `s_lut[ap[j]] * s_as[j>>5]`.
+    // Both arms are the same expression (one FMUL for the operand either way,
+    // see the kernel header's C2), which is what makes the walk, the chain and
+    // therefore every output bit identical to the m=1 launch, and why this
+    // launcher no longer declines the default. The earlier `if (g_gemv_a32)
+    // return 2;` was the placeholder until this variant existed; it cost the
+    // multi-row speedup (SH_EXP/`proj_mrows` fell back to ~m per-row launches,
+    // see docs/agent/verify-calc-floor.md) rather than correctness.
     // Same for DSV41_NO_GEMV_FP8: with the M=1 GEMV disabled the m=1
     // gemm_fp8_mx call runs the M-tile MMA path instead, whose accumulation is a
     // different expression entirely.
@@ -5094,14 +5157,14 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     }
     const dim3 grid(blocks);
     switch (m) {
-        case 1: gemm_fp8_mrows_kernel<1><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 2: gemm_fp8_mrows_kernel<2><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 3: gemm_fp8_mrows_kernel<3><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 4: gemm_fp8_mrows_kernel<4><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 5: gemm_fp8_mrows_kernel<5><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 6: gemm_fp8_mrows_kernel<6><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 7: gemm_fp8_mrows_kernel<7><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
-        case 8: gemm_fp8_mrows_kernel<8><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride); break;
+        case 1: gemm_fp8_mrows_kernel<1><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 2: gemm_fp8_mrows_kernel<2><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 3: gemm_fp8_mrows_kernel<3><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 4: gemm_fp8_mrows_kernel<4><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 5: gemm_fp8_mrows_kernel<5><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 6: gemm_fp8_mrows_kernel<6><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 7: gemm_fp8_mrows_kernel<7><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
+        case 8: gemm_fp8_mrows_kernel<8><<<grid, nwarps * 32, smem, s>>>(a, a_scale, w, w_scale, bias, out, n, k, out_stride, (int)g_gemv_a32); break;
         default: return 2;
     }
     return (int)cudaGetLastError();
