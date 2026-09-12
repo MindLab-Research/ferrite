@@ -2811,6 +2811,15 @@ impl<'a> DevChain<'a> {
     /// Undo the verify block: copy the [`Self::dspark_snapshot`] save back over
     /// every buffer it recorded, and restore the host counters it returned.
     fn dspark_rollback(&mut self, pos: usize, m: usize, host: &[(usize, usize)]) -> Result<()> {
+        // An empty mirror list means the caller skipped the snapshot (the
+        // bisect modes that never run the verify): there is NOTHING to roll
+        // back, and the snapshot buffers below were never written — restoring
+        // from them would smear UNINITIALISED memory over the live ring/state/
+        // clen and wedge the NEXT step (the exact failure the bisect run
+        // caught: step 1 fine, step 2 dead).
+        if host.is_empty() {
+            return Ok(());
+        }
         let cfg = self.cfg;
         let hd = cfg.head_dim;
         let win = cfg.window_size;
