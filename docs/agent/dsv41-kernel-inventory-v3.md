@@ -682,18 +682,33 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
    - 验证：本机无 nvcc（`cargo check -p ferrite-models` 通过；`.cu` 需远端 `build.sh 103a`
      重编，⚠️ 不重编 `.so` 会被 build-id 门禁拒启）。A/B：`DSV41_GATEUP_CPASYNC=1`（默认）
      vs `=0`，同窗口，人眼文本 + nsys `expert_gemv_fp4_batched_kernel` 每步 ms。
-0.57 **P4.2 完整 cp.async 流水线 —— expert gateup 多组在飞（2026-09-11 已落地代码，待实测）**：
+0.57 **P4.2 完整 cp.async 流水线 —— expert gateup 多组在飞（2026-09-11 落地；2026-09-12
+   钉死 PDEPTH=1 并清掉 8 个深实例化）**：
    §0.58（P4）只预取 group 0；主循环第 2..nv2f 组仍是串行 LDG，而 gateup 的实测症状是
    **22.2µs/call、443 GB/s、IPC 0.8/4（80% issue 槽停等）**，地板 1.3µs ⇒ 19-26x 差距，
    根因是操作数供给（每 warp 一个 group 只有 ~120 条指令的工作量，却要等 ~600 cycle 的 HBM
    载入）。寄存器型 unroll 救不了：LDG 目的寄存器挂在消费者 scoreboard 上，且
    `__launch_bounds__(1024)` 把 regs 钉在 64/thread。**cp.async 把载入从寄存器 scoreboard
    上摘下来**，等待变成 `cp.async.wait_group N` 的组计数器。
-   - **实现**：env **`DSV41_GATEUP_PIPELINE`**（1 = P4 现状 / 2..5，**默认 2**，clamp 到
-     `kGateUpPfDepthMax=5`）→ host `dsv41_gateup_pipeline()` → **新增内核模板参数
-     `PDEPTH`**（`cp.async.wait_group N` 的 N 是立即数 → 编译期常量；launcher 按 clamp 后
-     的深度选实例化，共 `ILV × PDEPTH(1..5)` 10 个）→ 每 warp 的 `s_pf` 变成 **PDEPTH 个
-     512 B 槽的 ring**，`s_ks` 顺延 `nwarps*512*PDEPTH`。
+   - **实现**：内核模板参数 **`PDEPTH`**（`cp.async.wait_group N` 的 N 是立即数 → 编译期
+     常量，所以 launcher 选实例化而不是传参）→ 每 warp 的 `s_pf` 变成 **PDEPTH 个 512 B 槽
+     的 ring**，`s_ks` 顺延 `nwarps*512*PDEPTH`。env **`DSV41_GATEUP_PIPELINE`** 与 host
+     `dsv41_gateup_pipeline()` 仍在，但**值被钉死为 1**（设 >1 打一行 stderr 提示后仍按 1 跑）。
+   - **⚠️ 2026-09-12 清理（gate-hygiene）**：serve A/B 已判 D=2/5 各 **+0.04ms** 回归（见
+     `dsv41-session-final-report.md`），depth>1 没有任何保留价值。launcher 原先保留**完整 5 段
+     depth cascade**，引用 `ILV × PDEPTH(1..5)` = **10 个实例化**——depth>1 的 8 个永不被调用，
+     却仍编进 `.so`（每个都是这个大内核体的完整副本，即 sparse-merge 那次"代码存在性"成本的
+     同一形态，Rule #7）。清理后**只保留 `<ILV, 1>` 2 个**：
+     - launcher 的 cascade 删掉，只剩 `ilv ? <true,1> : <false,1>`；
+     - `dsv41_gateup_pipeline()` 钳到 1（env 仍读，只为一次性警告）；
+     - **`dsv41_gateup_pf_smem_cap()` 整段删除**——它 `cudaFuncSetAttribute(<ILV,4|5>, ...)`
+       **ODR-use 了那 4 个深实例化**：只删 launcher 的 cascade **不足以**把它们从 `.so` 里拿走，
+       编译期清理必须拔掉**每一条**引用（本例的第二处，容易漏）；
+     - 随之删除 depth 的两次 clamp（对本 warp 切片组数、对 opt-in smem 上限）——1 槽 ring =
+       P4 布局，生产形状 30848 B，永远在 48 KB 默认上限内，没有东西可 clamp。
+     - 实测（b300-3，nvcc 13.2，`-gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math`）：
+       `-Xptxas -v` 的 `expert_gemv_fp4_batched_kernel` 入口 **10 → 2**；本 TU 的 `.o`
+       **1,085,096 → 426,904 B（−658 KB，−60.7%）**。运行时行为不变（默认且唯一可用的深度就是 1）。
    - **流水线语义**：prologue 发 PDEPTH 组（每组一次 commit，越界也 commit）；循环第 i 组
      `wait_prior(PDEPTH-1)` → 读 slot `i%PDEPTH` → **立刻**把第 i+PDEPTH 组发进刚空出的
      槽 → commit。尾部用**空 commit 补位**，保证"消费第 i 组前已 commit 恰好 PDEPTH+i 组"
@@ -717,26 +732,26 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
      受限**，不是资源受限，所以 ring 长出来的是没人用的余量。§0.58 里"整行 staging 会把占用率
      换掉"那句写在满 grid 的形状上，**在这个形状不成立**，这正是 D 可以开到 5（= 整个切片在飞，
      warp 级 MLP 上限）的原因。
-   - **D=4/5 的 opt-in**：`dsv41_gateup_pf_smem_cap(ilv)` 按 **(device, ilv)** 缓存
-     `cudaDevAttrMaxSharedMemoryPerBlockOptin` 并 `cudaFuncSetAttribute(<ILV,4|5>)`——照抄
-     `expert_gemv_fp4_down_reduce_kernel` 的 per-device carve-out 修法（`cudaFuncSetAttribute`
-     是 **per-context**，只设当前 device 会让其余 7 个 rank 停在默认值）。opt-in 失败 ⇒
-     cap = 48 KB，launcher 把 pd clamp 回去，**launch 永不失败**。深度还会被"本 warp 切片组数
-     `ceil(nv2f/ksplit)`"再 clamp 一次（超过切片的深度纯浪费）。
+   - **D=4/5 的 opt-in（已随深实例化一起删除）**：`dsv41_gateup_pf_smem_cap(ilv)` 曾按
+     **(device, ilv)** 缓存 `cudaDevAttrMaxSharedMemoryPerBlockOptin` 并
+     `cudaFuncSetAttribute(<ILV,4|5>)`——照抄 `expert_gemv_fp4_down_reduce_kernel` 的
+     per-device carve-out 修法（`cudaFuncSetAttribute` 是 **per-context**，只设当前 device 会
+     让其余 7 个 rank 停在默认值）。重开某个深度的成本清单：**cascade + 深实例化 + per-device
+     opt-in 三项必须一起回来**（缺 opt-in ⇒ D=4/5 的 launch 直接失败；缺其余两项 ⇒ 回到
+     "死实例化白占 `.so`"）。
    - **逐位等价**：同字节、同 lane 偏移、同消费顺序、同 fma 链顺序，只有"从哪块内存读 / 何时
      发射拷贝"变了。PDEPTH=1 的代码路径与 §0.58 **逐字保持**（含 plain 的延迟 uw 载入），
      供 A/B 基线。
-   - 验证（本次）：远端 nvcc 13.2 `-gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math`
-     **10 个实例化全部编过**；寄存器：`<ILV,1>` 64/0 spill（= P4）、`<ILV,2..5>` 64 regs +
-     8-12 B spill（2-3 寄存器，`__launch_bounds__(1024)` 的 64 上限所致，与 §0.58 同源）、
-     `<plain,*>` 63-64/0 spill。PTX 复核：`<ILV,1>` 只有 1×`wait_group 0` + 1 条
-     `cp.async.cg`；`<ILV,2>` `{wait 0 + wait 1×5}` + 7 条 cg16 + 7 commit；`<ILV,5>`
-     `{wait 0 + wait 4×5}` + 10 条 cg16；`<plain,5>` 20 条 `cp.async.ca` 8 B。
-     ⚠️ 本机无 GPU/nvcc、远端无 cuobjdump ⇒ **没有实跑、没有 SASS spill 定位**。
-   - 待 user 实测：`DSV41_GATEUP_PIPELINE=1|2|3|5`（`=4` 可省）同窗口 A/B，看
-     nsys `expert_gemv_fp4_batched_kernel` 每步 ms + `ncu --set full` 的 issue/停等分解。
-     ⚠️ **必须重编 `.so`**（`bash kernels/cuda/build.sh 103a`，`.cu` 改了不重编会被 build-id
-     门禁拒启）。
+   - 编译验证（2026-09-11，10 实例化版本）：远端 nvcc 13.2
+     `-gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math` **10 个实例化全部编过**；
+     寄存器：`<ILV,1>` 64/0 spill（= P4）、`<ILV,2..5>` 64 regs + 8-12 B spill（`__launch_bounds__(1024)`
+     的 64 上限所致）、`<plain,*>` 63-64/0 spill。PTX 复核：`<ILV,1>` 只有 1×`wait_group 0` +
+     1 条 `cp.async.cg`；`<ILV,5>` `{wait 0 + wait 4×5}` + 10 条 cg16。
+     ⚠️ 这些 `<ILV,2..5>` 数字现在只是**历史**——它们已不在产物里（清理后 `-Xptxas -v` 只剩
+     `<ILV,1>` 两条）。
+   - **A/B 已结案（2026-09-12）**：`DSV41_GATEUP_PIPELINE=2/5` 各 **+0.04ms** 回归（占用率损失 >
+     延迟隐藏），⇒ 1 是唯一保留值，代码随之只剩 1 个深度。**无需再测**。
+     ⚠️ 仍然：`bash kernels/cuda/build.sh 103a`（`.cu` 改了不重编会被 build-id 门禁拒启）。
 0.55 **P1 staged gate 的落地修正（2026-09-12）**：`6fc9a1a` 引入的 `DSV41_GEMV_A32_STAGED`
    当时只写了**调用**（`a32_direct = ... && !dsv41_gemv_a32_staged();`），该函数在全仓库
    **没有任何定义**（内核里也不能读 env）⇒ HEAD 的 `.cu` 实际**编不过**，且即便编过，

@@ -90,6 +90,8 @@
 // ============================================================================
 #include <cuda_runtime.h>
 #include <cstdint>
+// fprintf/stderr for the host-side gate warnings (the PDEPTH pin, below).
+#include <cstdio>
 // P4 (DSV41_GATEUP_CPASYNC): __pipeline_memcpy_async / __pipeline_commit /
 // __pipeline_wait_prior for the weight-first prologue of the batched expert
 // gate/up kernel. 16-byte copies lower to cp.async.cg (the same instruction
@@ -924,17 +926,17 @@ static int dsv41_gateup_cpasync(void) {
 // launcher's dynamic-smem formula - keep them on this constant.
 constexpr int kGateUpPfBytes = 512;
 
-// P4.2 (DSV41_GATEUP_PIPELINE) maximum pipeline depth. 5 is the largest depth
-// that is ever USEFUL: at the production shape a warp owns half of one row
-// (ksplit=2 of nv2f = k>>9 = 10 groups), i.e. 5 groups, so depth 5 = the whole
-// slice in flight. Depths above the 48 KB DEFAULT dynamic-smem limit need the
-// per-device cudaFuncSetAttribute opt-in (dsv41_gateup_pf_smem_cap below), and
-// the launcher clamps the requested depth down until the request fits whatever
-// ceiling that probe established - so this is a ceiling, not a promise.
+// P4.2 (DSV41_GATEUP_PIPELINE) historical maximum pipeline depth. 5 was the
+// largest depth that is ever USEFUL: at the production shape a warp owns half of
+// one row (ksplit=2 of nv2f = k>>9 = 10 groups), i.e. 5 groups, so depth 5 = the
+// whole slice in flight. Depth 2/5 both measured +0.04ms in serve, so the kernel
+// is instantiated at depth 1 ONLY (see dsv41_gateup_pipeline): this constant now
+// survives as the documented ceiling for a future re-enable, and as the number
+// quoted in the "env value ignored" warning.
 constexpr int kGateUpPfDepthMax = 5;
 
-// P4.2 (DSV41_GATEUP_PIPELINE, default 2): DEPTH of the fused gate/up weight
-// pipeline, in k-groups in flight per warp.
+// P4.2 (DSV41_GATEUP_PIPELINE): DEPTH of the fused gate/up weight pipeline, in
+// k-groups in flight per warp. CURRENTLY PINNED TO 1 (the P4 behaviour).
 //
 // WHY: the P4 prologue (above) only covers group 0. Every later group's LDG fell
 // between the barrier and its own dot, so a warp's weight stream was a chain of
@@ -958,16 +960,34 @@ constexpr int kGateUpPfDepthMax = 5;
 //
 // The value is a COMPILE-TIME kernel template parameter because
 // cp.async.wait_group takes an immediate operand - the launcher picks the
-// instantiation matching the depth it clamped to.
+// instantiation matching the depth (see the dispatch in
+// dsv41_expert_gate_up_fp4_batched).
+//
+// PINNED TO 1 (2026-09-12, gate-hygiene): serve A/B showed depth 2 and 5 are
+// each +0.04ms (occupancy loss > latency hiding; the isolated IPC gain does not
+// translate), so no depth above 1 is worth an instantiation. The launcher now
+// references ONLY <ILV, 1>, which makes every depth >1 body dead code - keeping
+// the other 8 instantiations in the .so is pure artifact bloat (the same
+// "code presence" cost sparse-merge paid for: 3570524, +0.34ms). A depth
+// request from the environment is therefore accepted but CLAMPED to 1, and the
+// caller is told once instead of being silently ignored.
+// kGateUpPfDepthMax (5) is kept as the historical ceiling: the kernel body still
+// implements the ring for any PDEPTH, so re-enabling a depth means restoring the
+// two other instantiations in that dispatch, nothing else.
 static int dsv41_gateup_pipeline(void) {
     static int cached = -1;
     if (cached < 0) {
-        int v = 1;  // PDEPTH default OFF: serve A/B showed depth 2 and 5 are each +0.04ms regression
-                    // (occupancy loss > latency hiding; isolated IPC gain doesn't translate)
+        int v = 1;
         if (const char* e = getenv("DSV41_GATEUP_PIPELINE")) v = atoi(e);
+        if (v > 1) {
+            fprintf(stderr,
+                    "dsv41: DSV41_GATEUP_PIPELINE=%d ignored - only depth 1 is instantiated "
+                    "(max useful was %d; 2/5 both measured +0.04ms)\n",
+                    v, kGateUpPfDepthMax);
+            v = 1;
+        }
         if (v < 1) v = 1;
-        if (v > kGateUpPfDepthMax) v = kGateUpPfDepthMax;
-        cached = v;
+        cached = v;   // always 1
     }
     return cached;
 }
@@ -1098,10 +1118,13 @@ static inline cudaError_t dsv41_experts_pdl_or_plain(K kern, dim3 grid, dim3 blo
 // 48 regs / 0 spill, so the 64 cap is headroom, not a spill risk.
 // A second template parameter, PDEPTH (P4.2): the fused gate/up weight
 // pipeline depth in k-groups. It must be a compile-time constant because the
-// per-group wait is `cp.async.wait_group N` with N an immediate - the launcher
-// selects the instantiation matching the depth it clamped to (see
-// dsv41_gateup_pipeline). PDEPTH == 1 is the P4 behaviour (prologue stages
-// group 0 only, every later group read straight from global).
+// per-group wait is `cp.async.wait_group N` with N an immediate - that is the
+// ONLY reason it is a template parameter, and the reason a depth costs a whole
+// kernel instantiation. Only PDEPTH == 1 is INSTANTIATED (the P4 behaviour:
+// prologue stages group 0 only, every later group read straight from global);
+// the body still implements the ring for any PDEPTH, so re-enabling a depth is a
+// matter of restoring the launcher's cascade + the smem opt-in, not of rewriting
+// this kernel (see dsv41_gateup_pipeline for why depth >1 is not worth it).
 template <bool ILV, int PDEPTH>
 __launch_bounds__(1024)
 __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, long act_stride,
@@ -1158,7 +1181,10 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // for byte, because warp*(512*1) IS warp*512). Slot (g2-g_begin)%PDEPTH
     // holds group g2 while it is in flight. `pf` is non-zero only for the FUSED
     // gate/up launch, and that launcher reserves exactly
-    // `nwarps*kGateUpPfBytes*PDEPTH` when it sets it - moving this pointer
+    // `nwarps*kGateUpPfBytes*PDEPTH` when it sets it (PDEPTH is pinned to 1 today
+    // - see dsv41_gateup_pipeline - so what is allocated is the PDEPTH == 1
+    // size; the expression still tracks PDEPTH in case a depth is re-enabled) -
+    // moving this pointer
     // without the matching change in dsv41_expert_gate_up_fp4_batched's smem
     // formula would shift s_ks (and read/write past the allocation).
     uint8_t* s_pf = reinterpret_cast<uint8_t*>(s_lut2 + 256);
@@ -2266,63 +2292,26 @@ extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
                             inter, -1, 3, 0.f, weight, true, stream);
 }
 
-// P4.2 (DSV41_GATEUP_PIPELINE): dynamic-smem ceiling available to the deep
-// pipeline instantiations on the CURRENT device.
+// P4.2 (DSV41_GATEUP_PIPELINE): REMOVED with the deep instantiations
+// (2026-09-12, gate-hygiene). This used to hold the per-(device, ilv) dynamic
+// smem ceiling for the depth 4/5 pipeline instantiations - depth 4/5 need more
+// than the 48 KB default, so they were opted in with cudaFuncSetAttribute.
 //
-// Depth 4/5 needs more than the 48 KB DEFAULT a kernel gets without
-// cudaFuncSetAttribute, so the deep instantiations are opted in here. The probe
-// is per (device, ilv) and cached, exactly like expert_gemv_fp4_down_reduce_kernel's
-// carve-out fix below: cudaFuncSetAttribute is PER-CONTEXT, so a one-shot set on
-// whichever device happened to be current leaves the other 7 ranks at the
-// default (the ferrite_kernels.cu bug this pattern exists to avoid). If the
-// opt-in fails we report the 48 KB default and the launcher clamps the depth
-// back to what that fits - so a launch can never fail because of this.
-//
-// WHY THE SMEM IS FREE HERE (the point that makes depth 4/5 worth having): the
-// production gate/up grid is (inter/rows, slots) = (40, 6) = 240 CTAs over 148
-// SMs, i.e. 1.6 CTAs/SM. Residency is limited by the GRID, not by resources, so
-// the ring grows into slack that nothing else was using; the P4 comment's
-// "staging the whole row trades overlap for residency" does not apply at this
-// shape (it was written for a shape with a full grid).
-static size_t dsv41_gateup_pf_smem_cap(int ilv) {
-    static int probed[64][2] = {};
-    static size_t cap[64][2] = {};
-    int dev = -1;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return (size_t)48 * 1024;
-    const int k = ilv ? 1 : 0;
-    if (!probed[dev][k]) {
-        int optin = 0;
-        bool ok = false;
-        if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) ==
-                cudaSuccess &&
-            optin > 0) {
-            if (ilv) {
-                ok = cudaFuncSetAttribute(expert_gemv_fp4_batched_kernel<true, 5>,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          optin) == cudaSuccess;
-                ok = cudaFuncSetAttribute(expert_gemv_fp4_batched_kernel<true, 4>,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          optin) == cudaSuccess &&
-                     ok;
-            } else {
-                ok = cudaFuncSetAttribute(expert_gemv_fp4_batched_kernel<false, 5>,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          optin) == cudaSuccess;
-                ok = cudaFuncSetAttribute(expert_gemv_fp4_batched_kernel<false, 4>,
-                                          cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                          optin) == cudaSuccess &&
-                     ok;
-            }
-        }
-        if (!ok) {
-            (void)cudaGetLastError();   // a missed opt-in must not poison the stream
-            optin = 48 * 1024;
-        }
-        cap[dev][k] = (size_t)optin;
-        probed[dev][k] = 1;
-    }
-    return cap[dev][k];
-}
+// It is gone for two reasons, and the ORDER matters:
+//   1. with the depth pinned to 1 (see dsv41_gateup_pipeline) there is nothing
+//      left to clamp - the 1-slot ring is 30848 B at the production shape;
+//   2. more importantly, `cudaFuncSetAttribute(expert_gemv_fp4_batched_kernel<
+//      ILV, 4|5>, ...)` ODR-USES those instantiations: deleting the depth
+//      cascade in the launcher alone would still have left all four deep
+//      instantiations (2 ILV x {4,5}) compiled into the .so through this probe.
+//      A compile-time-only cleanup has to take every reference out, and this was
+//      the second one.
+// If a depth is ever re-enabled, BOTH have to come back together with the
+// launcher's cascade (and so does the per-device opt-in, for the reason the old
+// comment gave: cudaFuncSetAttribute is PER-CONTEXT, so a one-shot set on
+// whichever device happened to be current would leave the other 7 ranks at the
+// default).
+
 
 // ============================================================================
 // BATCHED expert entry points (DSV41_MOE_BATCH, default OFF). The Rust chain
@@ -2390,40 +2379,34 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // flight vs 1920) - the recommended shape, which does NOT double the per-CTA
     // s_act+LUT prologue. rows=4 / ksplit=2 additionally gives the 480-CTA shape.
     const int ctas_x = (n_total + warps - 1) / warps;
-    // P4 / P4.2 (DSV41_GATEUP_CPASYNC + DSV41_GATEUP_PIPELINE): the weight
-    // pipeline stages PDEPTH k-groups of gate+up per warp, so the FUSED launch
-    // reserves kGateUpPfBytes*PDEPTH per warp on top of the s_act + LUT [+ s_ks]
-    // pool. The kernel's s_pf/s_ks pointers are derived from this same
-    // expression (in the same order) - a mismatch reads or writes past the
-    // allocation. The unfused arm and the down direction launch with pf=0 and
-    // are sized exactly as before.
+    // P4 (DSV41_GATEUP_CPASYNC + DSV41_GATEUP_PIPELINE): the weight pipeline
+    // stages PDEPTH k-groups of gate+up per warp, so the FUSED launch reserves
+    // kGateUpPfBytes*PDEPTH per warp on top of the s_act + LUT [+ s_ks] pool.
+    // The kernel's s_pf/s_ks pointers are derived from this same expression (in
+    // the same order) - a mismatch reads or writes past the allocation. The
+    // unfused arm and the down direction launch with pf=0 and are sized exactly
+    // as before.
     const int pf = (fuse && dsv41_gateup_cpasync()) ? 1 : 0;
     const int nwarps = warps * ksplit;
-    // PDEPTH is a COMPILE-TIME kernel parameter (cp.async.wait_group takes an
-    // immediate), so the depth is selected here and the matching instantiation
-    // launched below. Two clamps, both of them a correctness/safety guard, not a
-    // tuning knob:
-    //   1. depth past this warp's SLICE is pure waste - a warp owns
-    //      ceil(nv2f/ksplit) groups (5 at the production shape: nv2f = 10,
-    //      ksplit = 2), and a ring deeper than that can never have a group in
-    //      flight in every slot;
-    //   2. depth 4/5 exceeds the 48 KB DEFAULT dynamic smem a kernel gets
-    //      without cudaFuncSetAttribute, so it is clamped against whatever
-    //      ceiling the per-device opt-in probe established. If the opt-in did
-    //      not take, the clamp lands on the default limit and the launch still
-    //      succeeds at a smaller depth (never a failed launch).
-    int pd = pf ? dsv41_gateup_pipeline() : 1;
-    const int nv2f_l = (dim >> 9);   // 512-value groups per row
-    int max_groups = (ksplit > 1) ? ((nv2f_l + ksplit - 1) / ksplit) : nv2f_l;
-    if (max_groups < 1) max_groups = 1;
-    if (pd > max_groups) pd = max_groups;
+    // PDEPTH is PINNED TO 1: only the <ILV, 1> instantiations exist (see
+    // dsv41_gateup_pipeline for why - depth 2/5 both measured +0.04ms, so the
+    // other 8 instantiations were pure artifact bloat), and the depth is a
+    // COMPILE-TIME kernel parameter (cp.async.wait_group takes an immediate)
+    // that the dispatch below therefore no longer selects.
+    // The former depth clamps are gone with them: clamping against this warp's
+    // SLICE (a warp owns ceil(nv2f/ksplit) = 5 groups) and against the
+    // per-device opt-in smem ceiling (dsv41_gateup_pf_smem_cap) only existed to
+    // keep a DEEP request launchable. A 1-slot ring is the P4 layout, 30848 B at
+    // the production shape, always inside the 48 KB default - so the clamp has
+    // nothing left to clamp and the cudaFuncSetAttribute opt-in (which is itself
+    // what referenced <ILV,4|5>) is gone. The env is still read once for the
+    // warning; its value cannot change the launch.
+    dsv41_gateup_pipeline();
     const size_t smem_fixed =
         (size_t)dim * sizeof(float) + 256 * sizeof(float2) +
         ((ksplit > 1) ? (size_t)nwarps * sizeof(float2) : (size_t)0);
     const size_t smem_pf_stride = (size_t)nwarps * kGateUpPfBytes;
-    const size_t pf_cap = pf ? dsv41_gateup_pf_smem_cap(ilv) : (size_t)48 * 1024;
-    while (pd > 1 && smem_fixed + smem_pf_stride * (size_t)pd > pf_cap) --pd;
-    const size_t smem = smem_fixed + (pf ? smem_pf_stride * (size_t)pd : (size_t)0);
+    const size_t smem = smem_fixed + (pf ? smem_pf_stride : (size_t)0);
     dim3 grid((unsigned)ctas_x, (unsigned)slots);
     const unsigned block_threads = (unsigned)(nwarps * 32);
     // PDL (see dsv41_experts_pdl_or_plain): the consumer's grid may start during
@@ -2439,28 +2422,14 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
                                           g_expert_fp4_mode, fuse, ksplit, pf);
     };
     cudaError_t le;
+    // ONE depth (1) x 2 ILV instantiations. The former 5-way depth cascade
+    // existed only while dsv41_gateup_pipeline() could return 2..5; with the gate
+    // pinned at 1 the other 8 instantiations were unreachable code that still
+    // landed in the .so (each is a full copy of this kernel's body).
     if (ilv) {
-        if (pd >= 5)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 5>);
-        else if (pd == 4)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 4>);
-        else if (pd == 3)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 3>);
-        else if (pd == 2)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 2>);
-        else
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 1>);
+        le = gateup_launch(expert_gemv_fp4_batched_kernel<true, 1>);
     } else {
-        if (pd >= 5)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 5>);
-        else if (pd == 4)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 4>);
-        else if (pd == 3)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 3>);
-        else if (pd == 2)
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 2>);
-        else
-            le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 1>);
+        le = gateup_launch(expert_gemv_fp4_batched_kernel<false, 1>);
     }
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
