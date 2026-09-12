@@ -2306,3 +2306,19 @@ kernel `dsa_append_batched_mapped_kernel`（`ferrite_kernels.cu`）。**没有�
 **用户（原话）**："重复也是正确性问题和乱码一样严重"。
 
 **⇒ 目标状态不是"回到只重复的 LEN 54"，而是：verify 多行 forward 的值修复到与 EAGER 逐位一致（重复与乱码同源于此——喂错 token 会同时制造两者）。验收 = 出师表/数字任务与 EAGER 同水平（EAGER：数数 1..100 ✓、出师表 LEN 146 双字 3）。
+
+## 2026-09-12 【定位完成】diff probe 的第一轮实测：verify 的行 r≥1 在输入正确时算错
+
+`DSV41_DIFF_EAGER=1` 的 probe（serve 内、同前缀 KV、逐位置重放 eager）：
+```
+pos=14 spec=[654,1767,80]     eager=[654,1767,1146]  mismatch@2(pos17)
+pos=18 spec=[1338,28638]      eager=[1338,389]       mismatch@1(pos20)
+pos=22 spec=[8658,32186]      eager=[8658,32186]     none ✓
+pos=25 spec=[5048,61690,410]  eager=[5048,61690,666] mismatch@2(pos28)
+```
+**三个硬事实**：
+1. **emitted[0]（anchor）每轮都与 eager 一致**——anchor 无罪（与 prefill 的 bit-identical 结论闭环）。
+2. **mismatch 只在 verify 的行 1/2**（verify_out[0]/[1]）。
+3. **输入对、输出错**（pos=14 行 1 喂 1767@16，drafts[2]=1146 就是正确答案、eager 也 1146，verify 算出 80）。
+
+**"有时对有时错"的模式**（pos=22 全对、pos=14 行 1 对行 2 错、pos=18 行 1 错）⇒ **位置相关的条件**——头号嫌疑：**compressor 的组边界**（ratio=2 在奇数位提交；行 0 @ pos+1 恰好落边界）与**行 1 的 carry 读取**（`step_rows_inner` 的逐行 `compress_row` 应读行 0 提交后的**新** carry，若读到快照的旧值则行 1 错）。`verify-value-hunt`（vanguard）已收到全部数据，正聚焦于此。
