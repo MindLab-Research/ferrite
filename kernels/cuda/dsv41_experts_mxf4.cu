@@ -175,6 +175,56 @@ __device__ __forceinline__ uint2 ld_uint2_a8(const uint8_t* __restrict__ p) {
     return v;
 }
 
+// 4-byte and 2-byte siblings for the SPLIT body — the body the grouped /
+// GATEUP_FUSE=0 arm actually runs. Same contract, same reason as the two
+// helpers above, and they close the SAME err 716 for the granules those two
+// cannot express.
+//
+// WHY THEY ARE NEEDED. The helpers above serve the gate/up PAIR body (the arm
+// selected by `pair_body = ((fuse_swiglu != 0) || ILV) && (b_split > 0)`), and
+// that is NOT the body this file's grouped / DSV41_EXPERT_GROUPED smoke arm
+// runs: `DSV41_GATEUP_FUSE=0` + `DSV41_EXPERT_ILV=0` gives `pair_body == false`,
+// so the SPLIT body below walks `b_use` and `bhi_use` separately and reads its
+// weight row DIRECTLY:
+//     brow = (hi ? bhi_use : b_use) + (size_t)r * kbytes;
+//     *(const uint32_t*)(brow + (g << 8) + (lane << 3))   // vec==2
+//     *(const uint16_t*)(brow + (g << 6) + (lane << 1))   // vec==3
+//     *(const uint32_t*)(brow + (g << 7) + (lane << 2))   // vec==1 fast path
+// None of those reads is touched by ld_uint4_a16 / ld_uint2_a8, so "the guard
+// is in place" never said anything about this body — which is exactly the
+// asymmetry the tcgen05 smoke failures ran into.
+//
+// The alignment premise is `b_use`/`bhi_use` = `base + e * stride`, i.e. the
+// SAME TP-sharded `DevBuf::view` of the checkpoint that ld_uint2_a8 documents
+// (a shard boundary can leave one rank's W1/W3 view a few bytes off while every
+// other rank is fine), plus `r * kbytes` with `kbytes = k >> 1`. A `uint32_t`
+// load still REQUIRES a 4-byte-aligned address (2 bytes for uint16), and a
+// 1..3-byte slip raises the identical err 716 ("misaligned address") that the
+// 16-byte case does, reported — as the note above explains — on the NEXT
+// synchronisation rather than at the offending kernel. That is the signature in
+// `rank 7: config error: sync: misaligned address`.
+//
+// Same cure as the two helpers above: plain load on the aligned fast path,
+// byte-wise `__builtin_memcpy` otherwise. The bytes are IDENTICAL either way
+// (`v` is p[0..3] little-endian, `v` is p[0..1] for the uint16), so no numeric
+// domain changes — it only removes the fault.
+__device__ __forceinline__ uint32_t ld_uint32_a4(const uint8_t* __restrict__ p) {
+    if ((reinterpret_cast<uintptr_t>(p) & 3u) == 0)
+        return *reinterpret_cast<const uint32_t*>(p);
+    uint32_t v;
+    __builtin_memcpy(&v, p, 4);
+    return v;
+}
+
+// 2-byte sibling, same contract (the split body's vec==3 `uint16` read).
+__device__ __forceinline__ uint16_t ld_uint16_a2(const uint8_t* __restrict__ p) {
+    if ((reinterpret_cast<uintptr_t>(p) & 1u) == 0)
+        return *reinterpret_cast<const uint16_t*>(p);
+    uint16_t v;
+    __builtin_memcpy(&v, p, 2);
+    return v;
+}
+
 // e8m0 -> f32 (2^(b-127); 0xFF is NaN, mirroring quant.rs).
 [[maybe_unused]] __device__ __forceinline__ float ue8m0_to_f(uint8_t b) {
     return __uint_as_float(((uint32_t)b) << 23);
@@ -1870,8 +1920,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const int j = (g << 9) + (lane << 4);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const uint8_t* bp = brow + (g << 8) + off2;
-                const uint32_t w0 = *reinterpret_cast<const uint32_t*>(bp);
-                const uint32_t w1 = *reinterpret_cast<const uint32_t*>(bp + 4);
+                const uint32_t w0 = ld_uint32_a4(bp);
+                const uint32_t w1 = ld_uint32_a4(bp + 4);
                 // One scale multiply per accumulator instead of one per element:
                 // sc is a power of two (the ue8m0 exponent becomes the float
                 // exponent here), so the sixteen terms of this group can be summed
@@ -1942,7 +1992,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const int j = (g << 7) + (lane << 2);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const uint16_t w =
-                    *reinterpret_cast<const uint16_t*>(brow + (g << 6) + (lane << 1));
+                    ld_uint16_a2(brow + (g << 6) + (lane << 1));
                 const float4 av = *reinterpret_cast<const float4*>(s_act + j);
                 const float2 t0 = s_lut2[w & 0xFFu];
                 const float2 t1 = s_lut2[(w >> 8) & 0xFFu];
@@ -1969,7 +2019,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                 const int j = (g << 8) + (lane << 3);
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 // 256 packed values are 128 bytes, so group g starts at g*128, not g*64.
-            const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 7) + off);
+            const uint32_t word = ld_uint32_a4(brow + (g << 7) + off);
                 acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
                 acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
                 acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
@@ -2214,7 +2264,7 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                     const int j = (g << 7) + (lane << 2);
                     const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                     const uint16_t w =
-                        *reinterpret_cast<const uint16_t*>(brow + (g << 6) + (lane << 1));
+                        ld_uint16_a2(brow + (g << 6) + (lane << 1));
                     const float4 av = *reinterpret_cast<const float4*>(s_act + j);
                     const float2 t0 = s_lut2[w & 0xFFu];
                     const float2 t1 = s_lut2[(w >> 8) & 0xFFu];
@@ -2252,8 +2302,8 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                     const int j = (g << 9) + (lane << 4);
                     const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                     const uint8_t* bp = brow + (g << 8) + off2;
-                    const uint32_t w0 = *reinterpret_cast<const uint32_t*>(bp);
-                    const uint32_t w1 = *reinterpret_cast<const uint32_t*>(bp + 4);
+                    const uint32_t w0 = ld_uint32_a4(bp);
+                    const uint32_t w1 = ld_uint32_a4(bp + 4);
                     // One scale multiply per accumulator instead of one per element:
                     // sc is a power of two (the ue8m0 exponent becomes the float
                     // exponent here), so the sixteen terms of this group can be summed
@@ -2333,7 +2383,7 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
                     const int j = (g << 8) + (lane << 3);
                     const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                     // 256 packed values are 128 bytes, so group g starts at g*128, not g*64.
-                const uint32_t word = *reinterpret_cast<const uint32_t*>(brow + (g << 7) + off);
+                const uint32_t word = ld_uint32_a4(brow + (g << 7) + off);
                     acc += s_act[j + 0] * (dsv41_e2m1_to_f((uint8_t)(word & 0xFu)) * sc);
                     acc += s_act[j + 1] * (dsv41_e2m1_to_f((uint8_t)((word >> 4) & 0xFu)) * sc);
                     acc += s_act[j + 2] * (dsv41_e2m1_to_f((uint8_t)((word >> 8) & 0xFu)) * sc);
