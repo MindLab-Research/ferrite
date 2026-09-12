@@ -5164,3 +5164,25 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 3. 剩余的 misaligned：可能是 bh_base/bhs_base（tcgen05-split-align-fix 的报告提到的"漏了 bh_base/bhs_base 的 al16 检查"）或其他读点
 
 **tcgen05 的状态**：仍被阻塞——需要找到并修复剩余的 misaligned 读点
+
+## 🚨🚨🚨 重大发现——第 9 次修复从未实施（swallow-gap27 的判决）！
+
+**四层证据证明 epoch pad 从未落地**：
+1. `kernels/cuda/**` 搜 `epoch_pad`/`_pad_kernel`/`SWALLOW_MISSING` → **0 匹配**（无内核）
+2. `crates/**` 搜 `fn v5_epoch_pad` → **0 匹配**（无 Rust 绑定）
+3. `chain_dev.rs:1913` 定义 `swallow_epoch_pad()` 但**全树无调用点**（dspark_spec_swallowed 从 snapshot 直落 import_tap，没有 pad 调用）
+4. `batched_400_v2.sh` 的 GATES **不含** `DSV41_SWALLOW_EPOCH_PAD`（也不含 `DSV41_V5_LEDGER`）
+
+**判定**：第 9 次跑在行为上 = 第 8 次跑——**空实验**！gap=27 是无 pad 的天然 rift（与第 8 次的 gap=25 同源——都是"漂移 × 步数"）！
+
+**gap=27 的算术分析**：
+- 臂边界 = 81（一个完整 forward）——gap 必须是 81 的整数倍
+- **27/81 = 1/3——不是臂边界！** 是"每步 ±1 × 已跑步数"的漂移
+- gap 家族（22→3→23→25→27）随 run 长度变化不随修法变化——**9 次修复可能都在修错的东西**
+
+**need=81/cur=54 的语义**：rank 2 已发 80 轮（= 40 层 × 2 AR），peer 3 停在 54 轮（= 27 层 × 2）——**peer 3 在第 27 层的 AR 停了**！
+
+**第 10 次修复的正确方向**：
+1. **真正实施 epoch pad**（kernel + 接线 + 脚本 gate——三件都要！）
+2. **真正激活 v5_ledger**（步前打印已修复但 gate 要进脚本）
+3. **验证 gate 生效**：`/proc/PID/environ` 检查（1 秒成本）
