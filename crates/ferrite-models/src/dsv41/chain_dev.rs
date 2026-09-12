@@ -8714,17 +8714,31 @@ impl<'a> DevChain<'a> {
             32,
             true,
         )?;
-        self.dev.gemm_fp8_mx(
-            self.s.eng_xq_r.as_u8(),
-            self.s.eng_xsc_r.as_f32(),
-            wkv.ptr() as *const u8,
-            wsc.ptr() as *const u8,
-            std::ptr::null(),
-            self.s.eng_kv_r.ptr as *mut f32,
-            m as i32,
-            ((hc + 1) * dim) as i32,
-            (n_cols * ehd) as i32,
-        )?;
+        // (lazy-text-degradation's SEVERE verdict): `gemm_fp8_mx` dispatches on
+        // `m` between two different programs — SIMT warp-per-row GEMV at m==1
+        // and a 16-row tile MMA at m>1 — so the batched (m=6) and lazy (m=1)
+        // arms compute the engram projection through DIFFERENT summation
+        // orders, making the two arms' residual streams bit-incomparable (the
+        // Bristol/burdens/oqua divergence). Every other m-row projection in
+        // the verify already routes through proj_mrows/gemm_fp8_mrows to avoid
+        // this exact dispatch; engram was the one that slipped through. Fix:
+        // m individual m==1 calls (the canonical program both arms share).
+        let st = self.dev.stream();
+        let k_cols = (n_cols * ehd) as i32;
+        for r in 0..m {
+            self.dev.gemm_fp8_mx_on(
+                (self.s.eng_xq_r.ptr as *const u8).wrapping_add(r * n_cols * ehd),
+                (self.s.eng_xsc_r.ptr as *const f32).wrapping_add(r * (n_cols * ehd / 32)),
+                wkv.ptr() as *const u8,
+                wsc.ptr() as *const u8,
+                std::ptr::null(),
+                (self.s.eng_kv_r.ptr as *mut f32).wrapping_add(r * (hc + 1) * dim),
+                1,
+                ((hc + 1) * dim) as i32,
+                k_cols,
+                st,
+            )?;
+        }
         // gated write-back into the residual stream (in place), all m rows
         self.dev.engram_apply(
             self.s.h_r.ptr as *mut f32,
