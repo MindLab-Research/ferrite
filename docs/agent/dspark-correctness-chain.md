@@ -3667,3 +3667,21 @@ self.dev.gemm_fp8_mx_rope_norm(
 **测试顺序**：先 1（parity）再 2/3（正确性）再 4/5（性能）——parity 不过不上 GPU e2e。
 
 **gate**：DSV41_ATTN_MROWS2=1（K1）/ DSV41_ATTN_MROWS_ROPE_NORM=1（K2）——独立 gate 分别验证。
+
+## R2 教训的推广——其他 EAGER 复用点的风险审查
+
+**R2 的教训**：EAGER 的 kernel 与 verify 的 kernel 是不同程序（不同 warp helpers、vec modes、decline 码）——构造性"逐位等价"论证在真实形状下不成立（1 ULP 差异 × 40 层 × 60+ 步级联）
+
+**风险审查**（已实施/设计中的 EAGER 复用点）：
+| 复用点 | 状态 | 风险 | 原因 |
+|---|---|---|---|
+| lin2（gemm_fp8_mx2）| R2 的一半——bisect4 定位中 | **高**（同 R2）| 算术 kernel——不同程序 |
+| lin_rope_norm（gemm_fp8_mx_rope_norm）| R2 的另一半 | **高**（同 R2）| 算术 kernel |
+| ring_win_fuse（RING_WIN_FUSE）| 已实施，从未单独测试 | **中** | 数据搬运（非算术）——但位置处理可能有差异 |
+| fork/join 流（VERIFY_FORK）| 已实施，全栈测试中 | **低** | 流并行（不改 kernel）——只是发射顺序 |
+| compressor 侧流（COMPRESS_SIDE）| VERIFY_FORK 的一部分 | **低** | 同上 |
+| K1/K2（mrows 家族融合）| 实施中 | **低**（设计保证）| 同一程序（mrows 家族）的融合 |
+
+**待验证**：RING_WIN_FUSE 需要在干净 base 上单独测试（base + RING_WIN_FUSE only）——之前从未隔离测试过
+
+**K1/K2 的设计原则**（verify-specific-fusion-kernel-design）：**不换程序只搬代码**——每一融合段都以 verify 自己今日在用的 kernel 为逐位参照。这是 R2 教训的直接应用。
