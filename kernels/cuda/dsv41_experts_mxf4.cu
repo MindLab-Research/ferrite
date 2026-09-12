@@ -5384,11 +5384,12 @@ __device__ __forceinline__ uint32_t e4x_ilv_hi(uint32_t ev, uint32_t od) {
 //   b/b_hi  [r, k/2]     fp4, packed 2 values/byte, + [r, k/32] e8m0 scales
 //   k % 32 == 0 (the scale-block granularity), 16-byte alignment on every base
 // -----------------------------------------------------------------------------
-// The min-blocks hint pins the register budget: this kernel holds the whole
-// [1 row x 64 column] accumulator plus a 16-register tmem load in flight, and
-// without a target ptxas spends 162 registers (3 CTAs/SM) rather than 128
-// (4 CTAs/SM). Latency, not bandwidth, is this arm's risk, so occupancy wins.
-__global__ void __launch_bounds__(kThreads, 4) e4m3_gemm_kernel(
+// NOTE on the launch bounds: the plain form leaves ptxas at 162 registers
+// (0 spill) = 3 CTAs/SM; adding a `, 4` min-blocks target buys 128 registers
+// (4 CTAs/SM) at the cost of 8 bytes of spill. Latency is this arm's risk, so
+// the occupancy knob is real — but the file's arms are expected to compile with
+// 0 spill, so the hint stays off and the GPU A/B flips it if occupancy wins.
+__global__ void __launch_bounds__(kThreads) e4m3_gemm_kernel(
     const uint8_t* __restrict__ a,        // [rows, k] e4m3, one byte per value
     const float* __restrict__ a_scale,    // [rows, k/32] f32 powers of two
     const uint8_t* __restrict__ b,        // [b_rows, k/2] fp4, packed

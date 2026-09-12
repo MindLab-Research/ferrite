@@ -126,6 +126,72 @@ fn draft_moe_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DRAFT_MOE_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_DRAFT_GRAPH=1` (**DEFAULT OFF** — the A/B arm) — the draft's
+/// **device-level** CUDA graph: the whole kernel sequence from the `main_x`
+/// projection through the sampled block is RECORDED once and rePLAYed as ONE
+/// `cudaGraphLaunch` instead of ~150 launches per draft step.
+///
+/// # Why this is the draft's biggest single lever
+///
+/// `docs/agent/draft-1ms-design.md` §P1: at 4.29 ms and ~150 nodes the draft
+/// pays the per-node launch+gap cost on every one of them, and the measured
+/// per-node deltas (2.904 us plain vs 0.411 us inside a graph) put the ceiling
+/// of the mechanical folds (P3a/P3b) well above 1 ms. The graph is not a
+/// numeric change at all — the SAME launches, in the SAME order, on the same
+/// stream — so it is the one lever that cannot move a bit.
+///
+/// # What has to be moved OUT of the recorded region
+///
+/// A capture RECORDS instead of executing, so every host-side effect inside it
+/// would be frozen at capture time. The draft had four such effects; all four
+/// are now handled in [`DsparkDev::draft_forward`]'s PROLOGUE, before
+/// `capture_begin`/`graph_launch`, and every one of them writes the SAME device
+/// address the recording saw (the `chain_dev.rs` verify-graph discipline):
+///
+/// * **D1** — the per-step blocking H2D of `ids` (`upload_i32`) became a
+///   prologue upload.
+/// * **D2** — `seed_window`'s ring destination was the HOST-computed
+///   `window[s] + (pos % win)*hd`. A captured `cudaMemcpyAsync` bakes that
+///   address, so every replay would have appended to the SAME ring slot — the
+///   classic "captured but not updated" bug (`dsv41_glue.cu`'s
+///   `ring_append_kernel` header records exactly this failure). It now runs
+///   `dsv41_ring_append`, which derives the slot from a DEVICE counter.
+/// * **D3** — the `window -> all_kv` copy's size and its `s0 == 0` branch were
+///   host-computed from `win_rows(pos)`. Both settle the moment `pos >= win`
+///   (`win_rows` then returns `(win, 0)` for good), which is why the gate below
+///   refuses earlier positions — see [`draft_graph_arm`].
+/// * **D4** — `ensure_idxs`'s H2D (the index table's `n_win` re-upload) moved
+///   to the prologue, where `pos >= win` makes it a no-op anyway.
+///
+/// The RoPE positions needed no change: [`DsparkDev::ensure_pos_dev`] already
+/// puts the base in device memory that the kernels dereference, and every
+/// `rope_at` `off` is a CONSTANT relative to it (seed `-1`, query `+r`,
+/// inverse `+r`, KV `0`), so a prologue upload of `pos_base` is enough to move
+/// every replay's positions.
+///
+/// # What stays outside on purpose
+///
+/// * `drafts()` — the D2H of `ids[1..=bs]` is a device READ, illegal inside a
+///   capture; it is a separate method the orchestration calls after the step
+///   (the `step_rows` argmax-D2H pattern).
+/// * the two `host_barrier`s around the capture and the one before each replay
+///   (a host barrier is not a CUDA call and would not be recorded).
+/// * `DSV41_DSPARK_UNIT_DUMP` / the golden injection: both probe or upload from
+///   the host inside the recorded region, so the arm condition simply refuses
+///   them ([`draft_graph_arm`]).
+///
+/// # Fallback
+///
+/// A capture is an OPTIMISATION: `capture_begin`/`capture_end`/
+/// `graph_instantiate` refusing (a driver-rejected op, a stale runtime) latches
+/// `draft_graph_failed`, which makes EVERY later draft step take the direct
+/// launches — the `verify_graph_failed` pattern. Read once and cached (the
+/// house rule for hot-path gates).
+fn draft_graph_want() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_DRAFT_GRAPH").map(|v| v != "0").unwrap_or(false))
+}
+
 /// The four `DSV41_DRAFT_P3A` folds, resolved once (see [`draft_p3a`]).
 #[derive(Clone, Copy)]
 struct DraftP3a {
