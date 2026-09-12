@@ -6157,3 +6157,32 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 | panic | 0 | ✅ |
 
 **SWALLOW 的下一步**：全 gate 测试（加 R2/MARKOV/FORK/RING_WIN 优化栈）→ 真实吞吐 → 400 冲刺！
+
+## 全 gate SWALLOW 吞吐测试结果（03c9d52b）——58.3 tok/s
+
+**结果**：
+- **全 gate 吞吐 = 58.3 tok/s**（vs 无 gate 56.7——e2e gates 只 +3%！）
+- 前 61 行正确 ✓ 零拉丁 ✓ finish_reason=stop ✓ 0 hang 0 panic ✓
+
+**SWALLOW 的吞吐全景**：
+| 配置 | 吞吐 | 说明 |
+|---|---|---|
+| SWALLOW 干净（无 e2e gates）| 56.7 | 基线 |
+| SWALLOW 全 gate（MARKOV+FORK+RING_WIN）| **58.3** | +3%（batched 下收益小）|
+| **lazy 干净栈** | **91.1** | **lazy 仍快 1.6×！** |
+
+**分析**：
+1. **e2e gates 在 batched 下只 +3%**（vs lazy 的 +15.6%）——lazy 特定优化（R2, LAZY_SDR）不适用 batched
+2. **SWALLOW 的瓶颈是步时**（~28ms）不是 accept——步时与 gates 无关
+3. **SWALLOW 需要 kernel 级优化**（AR 36% + MoE 19% + mrows）才能追上 lazy
+
+**SWALLOW 的完整验证（全部通过！）**：
+| 测试 | 结果 |
+|---|---|
+| 计数 1-200 | 61/72 前 61 行 ✓ 零拉丁 ✓ |
+| accept5 (1-50) | 32/32 前 20 行 ✓ 零拉丁 ✓ |
+| **出师表 1000 tok** | **零拉丁 ✓ 前 100 字正确 ✓** |
+| ar5-hang | 0 ✓ |
+| panic | 0 ✓ |
+
+**SWALLOW 解锁后的最终判定**：SWALLOW 是可用的 batched 路径——但需要 AR/MoE/mrows 的 kernel 优化（-13ms 步时）+ accept 提升才能达到 400。
