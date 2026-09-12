@@ -510,6 +510,15 @@ fn pool_rank_body(
     loop {
         match rx.recv() {
             Ok(RankCmd::Prefill(ids)) => {
+                // ★ A NEW REQUEST CLEARS THE POISON (see `poisoned_request`): the
+                // pool is strictly synchronous (it collects EVERY rank's reply
+                // before it sends the next command), so no rank can still be
+                // walking the previous request's batch here — and the prefill
+                // itself resets the chain (`prefill_chain` → `chain.reset()`),
+                // which is what re-syncs the ranks' positions. Clearing here is
+                // therefore safe and keeps a poisoned REQUEST from poisoning the
+                // POOL.
+                poisoned.store(false, Ordering::SeqCst);
                 let r = prefill_or_resume(
                     &mut chain,
                     &ids,
@@ -554,6 +563,22 @@ fn pool_rank_body(
                 let mut p = pos;
                 let mut r = Ok(());
                 while out.len() < n {
+                    // ★ THE POISON CHECK (the `ar5-hang` amplifier's second half).
+                    // A sibling rank that failed a spec round has set the shared
+                    // flag; this rank must NOT keep walking rounds against it —
+                    // its peer's v5 epoch is frozen, so the next AR round either
+                    // spins on a stamp that will never come or silently reads the
+                    // previous epoch's values. Taken at a STEP BOUNDARY, i.e. only
+                    // between rounds: every launch of the previous round has been
+                    // issued and collected, which is the only point at which a
+                    // rank may leave the lockstep. One relaxed-ish `load` on a
+                    // shared line per round — below the noise of a ~6 ms round,
+                    // and it CANNOT change a single token (it only ever fires
+                    // after some rank has already reported an error).
+                    if poisoned.load(Ordering::Acquire) {
+                        r = Err(poisoned_request(rank));
+                        break;
+                    }
                     let st = std::time::Instant::now();
                     let emitted: Vec<u32> = if let Some(d) = dspark.as_mut() {
                         if spec_mode() {
@@ -568,11 +593,28 @@ fn pool_rank_body(
                                     // in the next barrier forever, and the operator
                                     // sees "a rank did not answer" with NO cause —
                                     // the exact blind spot the wedge bisect hit.
+                                    //
+                                    // ★ AND NEVER `return` HERE EITHER (the
+                                    // `ar5-hang` amplifier): a rank that left the
+                                    // lockstep FROZE its v5 epoch, while its peers
+                                    // stayed in the pool and kept issuing rounds
+                                    // against it — a permanent rift that ends in
+                                    // the peers' `ar5_wait_round` polling a stamp
+                                    // that will never be published. So: poison the
+                                    // REQUEST (every rank stops together, see
+                                    // `poisoned_request`), answer THIS command with
+                                    // the error — exactly one reply per command, as
+                                    // the pool's `broadcast` expects — and stay in
+                                    // the loop, so a later command (the next
+                                    // request's prefill) still finds this rank
+                                    // alive and its CUDA context valid.
                                     eprintln!(
-                                        "[dsv41] rank {rank} spec step err at pos {p}: {e}"
+                                        "[dsv41] rank {rank} spec step err at pos {p}: {e} \
+                                         — POISONING the whole request (all ranks stop together)"
                                     );
-                                    let _ = res_tx.send((rank, Err(e)));
-                                    return Ok(());
+                                    poisoned.store(true, Ordering::SeqCst);
+                                    r = Err(e);
+                                    break;
                                 }
                             };
                             dspark_acc_sum += rep.k_acc as u64;
@@ -760,6 +802,30 @@ fn spec_mode() -> bool {
 fn diff_eager() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_DIFF_EAGER").map(|v| v != "0").unwrap_or(false))
+}
+
+/// The request-level POISON error: what a rank reports (and what every sibling
+/// reports at its next step boundary) once ANY rank's spec step has failed.
+///
+/// # Why a whole-request abort rather than a rank-local one (`ar5-hang`)
+///
+/// A DSpark spec round is all-or-nothing across the ranks: the failing arm rolls
+/// its block back (`dspark_spec_swallowed`'s "Failure"), so the failed rank stays
+/// at position `p` while its peers committed and moved to `p + k`. The rank's
+/// `spec_primed` is left alone by contract, and the arm it selects has a
+/// process-wide AR round footprint (legacy/aligned call `step_dev`, swallowed/
+/// lazy do not) — so a lone rank that stays behind either spins on a peer stamp
+/// that never comes or leaves its peers spinning on its own stamps: `ar5-hang`.
+/// There is no way to bring a rewound rank back into the middle of a committed
+/// batch, so the ONLY consistent resolution is for every rank to stop at the
+/// same round boundary and let the request die. The chain itself is NOT broken:
+/// the next request's `Prefill` resets it on every rank (which is why the poison
+/// is cleared there).
+fn poisoned_request(rank: usize) -> ferrite_types::FerriteError {
+    ferrite_types::FerriteError::Config(format!(
+        "rank {rank}: a sibling rank failed a spec step — the whole request is poisoned \
+         (all ranks stop at the same round boundary; the next prefill resets the chain)"
+    ))
 }
 
 /// Feed the prompt one token per forward (the KV ring is per-sequence) and
