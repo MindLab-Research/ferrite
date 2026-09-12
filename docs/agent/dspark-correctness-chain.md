@@ -798,3 +798,15 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 - k_acc 均值 1.08 → 每步 ~2 行 → **每行 ~9.5ms**（vs EAGER 6.15ms）
 - **3.35ms/行的额外开销**——最可能的原因：m=1 裸链（无图）比 EAGER 的图化路径慢
 - **修法**：给 lazy verify 捕获 m=1 的 verify 图（或复用 EAGER 图，如果 tap 的差异可以放在图外）
+
+## Lazy m=1 图化验证（ffa840ff）——步时 24→22.56ms（+1.6ms）
+
+**图化成功**：`[verify_graph] captured verify_graph_m1 at pos=16` ✓
+**步时**：24.15→**22.56ms**（44.3 tok/s）——m=1 图化生效但收益有限（预期 3.35ms/行，实得 ~0.8ms/行）
+**每行成本**：~9ms/行（vs EAGER 6.15ms）——**剩余 ~2.85ms/行**来自：
+1. `host_barrier`（TP8 跨 rank 同步，每次 graph_launch 前调）~0.5-1ms/行
+2. `D2H argmax`（每次 step_rows 后 4B 读回，需 device sync）~0.5ms/行
+3. `set_pos_ctr` + `tap_commit` ~0.1ms/行
+
+**优化方向**：批量化 barrier/D2H（每步一次而非每行一次）或混合模式（前 2 行 batched + 后续 lazy）。
+**文本**：与之前完全相同（backbone 偏差不变，acs/Bristol/burdens/oqua）。
