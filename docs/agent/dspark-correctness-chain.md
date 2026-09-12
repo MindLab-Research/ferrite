@@ -786,3 +786,15 @@ ferrite 是**顺序加**（k=0..n-1 逐个加），PyTorch 的 sum 可能是 tre
 **Bristol/burdens/oqua 全部出现在位置 >142**——batched 在 142 就停了（EOS），**永远到不了这些位置**。lazy 接受更多 token（k_acc 直方图更宽）→ 走得更远 → **暴露了更多 backbone 偏差**。
 
 **结论**：lazy verify 没有"额外退化"——它和 batched 共享同一个 backbone 偏差（acs/ibu 族），只是 lazy 的更高 accept 率让它生成到更远的位置，暴露了更多偏差。**修复目标是 backbone 对齐（bf16 截断），不是 lazy 特有的 bug**。
+
+## Layer 20 异常分析——ratio=1 压缩层（非 KV source，滑动窗口 only）
+
+Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[20] = 1`（无压缩，纯滑动窗口）。它不是 KV source（kv_source = [2,8,14,20] 中 **没有 20**——需从 text_config 确认）。
+**l=20 的偏差更可能是累积效应**（前 20 层的 ~2% 逐层偏差在 l=20 处放大到 14%）而非 l=20 本身的 bug——逐层 norm 是残差流的累积值，单调增长。
+
+## lazy verify 的 per-row 开销分析（步时 24ms → 目标 7.5ms）
+
+步时分解：draft 4.27 + verify ~19 + commit 0.19 = 24ms。
+- k_acc 均值 1.08 → 每步 ~2 行 → **每行 ~9.5ms**（vs EAGER 6.15ms）
+- **3.35ms/行的额外开销**——最可能的原因：m=1 裸链（无图）比 EAGER 的图化路径慢
+- **修法**：给 lazy verify 捕获 m=1 的 verify 图（或复用 EAGER 图，如果 tap 的差异可以放在图外）
