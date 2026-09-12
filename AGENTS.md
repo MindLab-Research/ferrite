@@ -1930,3 +1930,15 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 3. **kernel 的派生参数公式（n=window+clen）必须与调用侧的缓冲布局自洽**——"凑巧相等"的参数（clen=bs stand-in）掩盖语义错位。
 4. **host 参考的注释是转录者的解读**（"start_pos+seqlen" 的 seqlen 被误读为 bs）——仲裁要找生产实现（sglang）的证据链。
 5. **多行化的正确姿势 = 逐行复用单行内核**（环不变式逐步保持）——"一次多行 + 自定义派生"两处（窗口/压缩器）都出了因果 bug。
+
+## 2026-09-12 Wave 2 续：修复 #5-#7 与官方参考闭环
+
+**官方参考闭环**（official-pytorch subagent）：**deepseek-ai/DeepSpec**（MIT，`deepspec/modeling/dspark/**` + `deepspec/eval/dspark/**`）+ 论文 arXiv:2607.05147 + `/tmp/official_dspark_ref.md`（6 争议点裁定）。注意：DeepSpec 是 Qwen3 研究版（无 MLA/SWA/TP）——语义 oracle，生产细节以 sglang 为准。
+
+| # | 修复 | 证据链 |
+|---|---|---|
+| 5 | **tap 口径**：收集层**输出**的 hc 均值（`completed.mean(dim=1)`，sglang deepseek_v4.py:3132-3141）——原 tap 在 layer() 开头收集=上层输出，**差一整层** | 实测：修复后 verify[0]==next 从 1/12 → 5/12 步 |
+| 6 | **draft head 的 collapse 约定**：主链最终 collapse 用 `premix_slot(1)`=最后层 **attn_pre**（文本正确=有效约定；checkpoint 无 hc_head_* key——2401 mtp key 查证），draft_head 原用 ffn_pre——改对齐 attn_pre | audit-hc-head 阻塞级发现 |
+| 7 | **撤销 mk 替换**：官方块行 0 的 KV 是 **embedding 派生版**（DeepSpec 的 draft 块投影自己的输入）——audit 的"席位规则"（mk 替换）是推断非官方语义，回退；窗口的 pos 槽排除保留（双计修复的真正部分） | DeepSpec 块结构 |
+
+**V4.1 head collapse 的约定事实**：checkpoint 无任何 hc_head key（主链+mtp 都没有）→ pre_mix 是唯一约定 → 主链（attn_pre/slot 1）与 draft 必须同 slot。
