@@ -2582,3 +2582,18 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **可能原因**：
 1. 中文 token 化的粒度更细（每个 token 携带的信息量更少）
 2. 或我们的 draft 链有系统性数值偏差（accept-23-path 的"头尾同时抬"分析）
+
+## EAGER 对照测试的预期框架（d01acdb9 跑中）
+
+**测试**：同一对话 prompt（"用中文解释什么是机器学习"）用 EAGER（无 spec）跑
+
+**判定**：
+| EAGER 结果 | 含义 | 下一步 |
+|---|---|---|
+| 干净输出（低重复率）| **spec-decode 退化** | 修复 spec 的长生成质量（累积误差）|
+| 也重复（~60%+）| **模型自然行为** | accept 0.964 是真实基线——对话任务的 400 不可达 |
+
+**spec-decode 退化的可能机制**（如果 EAGER 干净）：
+- 上下文累积误差：spec 步的 KV 与 EAGER 步的 KV 在长生成中漂移
+- BF16_TRUNCATE 在长上下文中的累积效应
+- 或 drafts 被 reject 后的 rollback 不完全（残留 KV 污染）
