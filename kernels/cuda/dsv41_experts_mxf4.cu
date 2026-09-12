@@ -2430,7 +2430,16 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
         if (e == nullptr) return 1;
         return atoi(e) != 0 ? 1 : 0;
     }();
-    const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0) ? 1 : 0;
+    // ⚠️ SINGLE SOURCE OF TRUTH for the [inter] vs [2*inter] layout: the CALLER's
+    // out_slot_stride (the twopass-degen-hunt verdict — round-18's root cause was
+    // Rust and this launcher each deriving `fuse` independently; the caller's
+    // `two` flag only existed on the Rust side, so the kernel kept fusing while
+    // the caller expected unfused, writing swiglu'd [inter] with the high half
+    // as uninitialized garbage). Binding fuse to the pitch makes the two sides
+    // structurally unable to disagree: `out_slot_stride == inter` = caller wants
+    // the fused epilogue; `2*inter` = caller wants raw gate|up.
+    const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0 &&
+                      out_slot_stride == (long)inter) ? 1 : 0;
     // Interleaved weights are only addressable by the FUSED body (see the header
     // comment): refuse the combination rather than read the wrong bytes.
     if (ilv && !fuse) return (int)cudaErrorInvalidValue;
