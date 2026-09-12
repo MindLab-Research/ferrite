@@ -3466,3 +3466,34 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 3. **VERIFY_FORK**：流并行的竞态（在 rollback 路径）
 4. ~~LAZY_SDR~~：D2D 合并已验证等价 + set_pos_ctr 已恢复
 5. ~~MARKOV_SLICED~~：draft 侧（不影响 verify 的正确性）
+
+## 🚨🚨 R2 (ATTN_LIN_FUSE) 损坏根因确认——二分3 + 计数验证
+
+**二分3 结果（c96c5b3d）**：base + R2 + 禁 R2b（INDEXER_QR_RAW=0）→ **仍然损坏**（同样的拉丁碎片）！
+**计数验证**（之前 ee0b9f74 的输出重新检查）：**61/65 行正确，62-65 行错**——期望 62-65 得到 **12-15（序列重置！）**
+
+**完整二分链**：
+| 配置 | 出师表 | 计数 |
+|---|---|---|
+| 全栈 | ❌ 损坏 | ❌ 损坏（现在确认）|
+| - RING_WIN_FUSE | ❌ 损坏 | — |
+| base + R2 (含 R2b) | ❌ 损坏 | ❌ 损坏（61-65 错）|
+| **base + R2 (禁 R2b)** | **❌ 损坏** | — |
+| **base（无 R2）** | **✓ 干净** | ✓ 干净 |
+
+**判定：R2（ATTN_LIN_FUSE）本身是罪魁！**（不是 R2b）
+
+**损坏模式分析**：
+- 计数：1-61 正确 → 62-65 变成 12-15（**序列重置到 12**）
+- 出师表：前 ~100 字正确 → "opa" → 重复开头（**序列重置**）
+- **两个任务都是"序列重置"模式**——模型的内部状态（KV 或位置）回到了某个早期点
+
+**根因假设**（rope 位置 bug 的典型特征）：
+1. **lin_rope_norm 的位置计算**：EAGER 用 `pos_ctr`，verify 需要每行 `pos + r`——如果融合 kernel 的 rope 用错位置，attention 会 attend 到错误的位置
+2. **lin2 的 gemm_fp8_mx2**：与 proj_mrows 的数值差异（scale/量化路径）在特定 token 后累积
+3. **位置重置的位置**：计数在 ~62，出师表在 ~100——不同任务不同位置，但都是"重置"
+
+**诚实基线**：
+- **干净最佳：78.8 tok/s**（base：lazy + SH_PAIR + Wave 1）——不是 84.0！
+- R2 的 +6% 无效（损坏输出）
+- 待 r2-corruption-rootcause 找到具体 bug 后修复再启用
