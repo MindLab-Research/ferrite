@@ -1669,6 +1669,10 @@ m16n8k32 × 8 tiles，C[slot][0] 取分数。**文本正确**（LEN 382，内容
 目标固定为 **16 并发不开 MTP ≥1600 tok/s**。上一条"batched MTP"方向作废（且实测
 MTP 在 B=16 下本身即坏：LEN 0 + 161 错误）。
 
+> **✅ 2026-09-12 用户已明确解除上述禁令**：新目标为 **dspark block-5 单并发
+> ≥400 tok/s**（见 `unified-engine-battle-plan.md`）。本节"MTP/投机一律不做"作废，
+> MTP / DSpark 恢复为可选手段；启用前仍应做逐位/text 验证。
+
 **非 MTP 的剩余方向（按用户提示"很可能不是单 kernel 级别的"）**：
 1. AR/compute overlap（TP all-reduce 与下一层计算重叠，1.06ms 中可隐藏大部分）；
 2. CUDA graph 节点数削减（每步 ~700 节点）；

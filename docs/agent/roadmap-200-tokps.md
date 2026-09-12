@@ -80,3 +80,4 @@ persistent 单独到不了 5ms——**真实工作地板 ≈ 5.3ms**（expert_ge
 - **Stage C**：不做整模型单核；不把跨 rank 同步塞进单核；不拆 split=8（改部分和顺序）；不捕获含 `cudaMalloc`/host 交互的核。
 - **Stage D**：不做 MTP（用户明令禁止）；不重试 k-split/uint4/T=4（均阴性）；不"变快=少算"（必逐位/text 验证）。
 - **禁令边界（待用户裁定，勿自行启用）**：用户原文是「严禁mtp…严禁投机」。① MTP = 模型自带 draft 头（DSV4.1 的 DSpark，`mtp.*` 命名空间，config `n_mtp_layers=3` / `dspark_block_size=5`）—— 明确禁止。② 可验证投机（n-gram / prompt-lookup）候选来自 prompt/历史拷贝、用同一次 forward 的 argmax 验证，输出与逐 token greedy **逐位一致**、不引入 draft 头、不改变数值域；但文献术语里它就是「投机解码」。故：字面禁令 → 一并禁止；禁令实指 MTP（目标行文为"无mtp"）→ 行为不变，可议。**默认按字面执行，启用前须用户确认。**
+- **✅ 2026-09-12 用户已明确解除上述禁令**：新目标为 **dspark block-5 单并发 ≥400 tok/s**（见 `unified-engine-battle-plan.md`）；MTP / DSpark / 投机解码恢复为**可选手段**，旧"16 并发不开 MTP ≥1600 tok/s"目标已被取代。启用前仍应做逐位/text 验证。
