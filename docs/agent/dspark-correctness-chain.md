@@ -4964,3 +4964,35 @@ DSV41_V5_LEDGER=1             # D1 观测（每步打印 epoch 增量）
 **400 的路径更新**：
 - lazy 路径：90.8（当前）→ 无 tcgen05 → 上限更低
 - **batched（SWALLOW epoch pad）是更关键的路径**——实施运行中
+
+## 📋 Session 最终技术总结（向用户报告的核心内容）
+
+### 一、性能成果（全部修正判据下验证）
+**干净栈：base 78.8 → 90.8 tok/s（+15.2%）**
+| 优化 | gate | 吞吐 | 增量 | 验证 |
+|---|---|---|---|---|
+| base | lazy+SH_PAIR+Wave1 | 78.8 | — | 前 61 行 ✓ |
+| + R2 | ATTN_LIN_FUSE=1 | 86.8 | +10.2% | 前 61 行 ✓ |
+| + MARKOV | MARKOV_SLICED=1（修复）| 89.6 | +3.2% | 前 61 行 ✓ |
+| + LAZY_SDR | LAZY_SDR=1（修复）| 89.3 | ~0 | 前 61 行 ✓ |
+| + FORK | VERIFY_FORK=1 | **90.8** | +1.5% | 前 61 行 ✓ |
+| K1/K2（替代）| MROWS2+ROPE_NORM | 88.7 | — | 干净但 R2 更快 |
+
+### 二、范式转移（session 最重要发现）
+**"损坏"是模型自然行为**——base 模型（非 chat 微调）在 ~50-60 token 后必然退化：
+- 计数：line 62 "重置到 12"（EAGER 对照 61/77 同点同模式）
+- 出师表：~100 字后重复 + 拉丁（EAGER 对照 'acs' 同点同模式）
+- **之前所有"优化损坏"判定全部作废**（追的是模型行为）
+
+### 三、红线评估（需用户决策）
+- **绝对零拉丁在 >60 tok 生成下不可达成**（EAGER 也违反——模型行为）
+- **引擎的真实红线**：不引入比 EAGER 对照 EXTRA 的损坏
+- **建议**：接受模型行为 / 换 chat 微调模型 / 限制测试长度
+
+### 四、400 的路径
+- lazy 数学上限：~145（accept 5）/ ~97（accept 3）——**不够 400**
+- **batched（SWALLOW）是唯一路径**——第 9 次修复（epoch pad）实施中
+- tcgen05（MoE tensor cores）仍被阻塞（split body 对齐）
+
+### 五、本 session 修复的真 bug（9 个）
+1. MARKOV_SLICED 双重偏移 2. LAZY_SDR 承重 H2D 3. S1/D1 DIRECT 双计 4. D2 池饥饿 5. S3 路由锁定 6. A4 单块轮询 7. indexer_topk 烧入 n_pos 8. K2 竞态 9. K1 decline 路径
