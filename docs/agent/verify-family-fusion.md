@@ -683,3 +683,7 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 3. **bf16 主链截断**（DSV41_BF16_TRUNCATE，已验证零拉丁 + accept 43%k0）
 
 **截断代价**：~14% 平均吞吐（78.8 vs 91.3 tok/s）——但换来零拉丁（红线）。净效应在 accept ≥2 时为正。
+
+## W4 compressor_fused 未启用的原因（已查明）
+
+`compressor_fused` 的 launcher **硬拒 `b != 1 || seqlen != 1`**（chain_dev.rs:4735/:9601）——它是单行单 token 的融合（pool+commit 对的 parity target），verify 的多行块不能用。pool+commit 对是 verify 的正确路径。**W4 的 0.3ms 优化需要多行版 compressor_fused（seqlen=m）**——低优先级（0.3ms）。
