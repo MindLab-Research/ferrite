@@ -3628,3 +3628,22 @@ self.dev.gemm_fp8_mx_rope_norm(
 - **如果 SWALLOW 还有别的地方做 argmax（如 tap_commit 的交换？）——轮次会不匹配**
 
 **7 次修复尝试的教训**：ar5-hang 的根因不是单一的——臂足迹（已修）+ argmax 轮次（未修）可能同时存在
+
+## ⚠️⚠️ SWALLOW 修复的最终判决（18303492）——第 8 次尝试失败！
+
+**结果**：105,469 ar5-hang（持续增长！），输出 0 字节（curl 超时）
+**hang 位置**：argmax_rows rows=6（batched 头 argmax 交换）
+**修复（spec_primed_unanimous + serve.rs 毒化）没有解决 hang**
+
+**8 次 SWALLOW 修复尝试的完整历史**：
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1 | argmax 守卫 | gap 22 ❌ |
+| 2 | 回退 | gap 3 ❌ |
+| 3 | Plan A+C（barrier 对称化）| gap 23 ❌ |
+| 4 | 无图（出师表）| 0 ✓（低 accept）|
+| 5 | 无图（计数）| 937 ❌ |
+| 6 | Plan B（臂投票）| 10,099 ❌ |
+| 7 | Plan B + spec_primed_unanimous + serve 毒化 | **105,469 ❌❌** |
+
+**判决**：SWALLOW 的 ar5-hang 有多个根因（臂足迹 + argmax 轮次），修复一个暴露另一个。**SWALLOW 暂时搁置**——专注 lazy 路径的优化。
