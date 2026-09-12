@@ -1965,3 +1965,19 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **深度调查**：ar5-deeper-investigation subagent 正在分析真正的根因。
 
 **临时策略**：SWALLOW_STEP 继续禁用（ar5-hang 未解决）。400 路径暂时依赖 LAZY_VERIFY。
+
+## ATTN_PROJ_ALIGN 验证测试的预期（f6062ba4 跑中）
+
+**修复**：draft 的 attention 投影（wq_a/wq_b/wkv/wo_b）从 gemm_fp8_mx（16-row TILE 程序）改为 gemm_fp8_mrows（m 行 GEMV 程序——与 verify 的 proj_mrows 相同）
+
+**这是结构性对齐**（不是 ulp 级）——两个程序的求和序完全不同（TILE 多行共享 K-walk vs GEMV 每行独立）
+
+**预期结果**：
+| accept | 判定 | 含义 |
+|---|---|---|
+| 1.5-2.0+ | **重大突破** | 投影的求和序差异是 accept 卡 1.214 的真根因 |
+| 1.3-1.5 | 改善 | 投影对齐有效但不完全（还有其他不匹配）|
+| ~1.2 | 不变 | 投影不是主要因素 |
+| <1.1 | 退化 | mrows 程序在 draft 的布局上有问题 |
+
+**与 draft-verify audit 的关联**：audit 发现 #2（投影族）与 head 同级严重——head 的 ulp 级测试中性，但投影是**结构性差异**（不同的 K-walk + 归约树），影响更大。
