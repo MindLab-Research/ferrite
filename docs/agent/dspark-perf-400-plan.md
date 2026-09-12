@@ -29,8 +29,11 @@
   3. **MoE expert**: `expert_gate_up_fp4_batched` 的 `rows=m`（行独立累加）+ down_reduce 的 rows=m
   4. **norm/hc 类**: `rmsnorm`/`hc_collapse`/`hc_post` 的多行版（rmsnorm-multrow subagent 正在回退逐行绕过）
 - **图化**: `DSV41_VERIFY_GRAPH=1`（已实现，默认 OFF）——DRY→capture→replay，输入缓冲（ids_r/pos_rows）在图外刷新
-  - **启用前置**（`verify_graph_gate`，chain_dev.rs:2901+）：`!eng_host()` && `!stats_dbg()` && `!phase_dbg()` && `compress_branch_steady()`（每个 compress source 都已提交过至少一组——稳态）&& `supports_dspark_snapshot()`（P0 kernel 在 .so 里）&& `supports_memset_async()` && **`(comm.is_none() || ar_v5())`**——**TP8 下必须让 AR 走 v5**（`DSV41_AR_V5`/`FERRITE_P2P_AR5` 的 opt-in）否则 gate 恒 false，图化静默不启用（"测了没变化"的陷阱）
-  - A/B 口径：`verify_ms` 的对照（plan §3.3/§4）
+  - **启用前置**（`verify_graph_gate`，chain_dev.rs:2901+）：`!eng_host()` && `!stats_dbg()` && `!phase_dbg()` && `compress_branch_steady()`（每个 compress source 都已提交过至少一组——稳态）&& `supports_dspark_snapshot()`（P0 kernel 在 .so 里）&& `supports_memset_async()` && **`(comm.is_none() || ar_v5())`**
+    - ⚠️ **勘误（021 审计，2026-09-12）**：`ar_v5()` **不是 opt-in，默认即 true**——`tp.rs:690` 的实现是 `DSV41_GRAPH_STEP != 0 || DSV41_AR_V5 != 0`，两条腿都默认 ON，而整步图自 2026-09-11 起默认 ON ⇒ TP8 下除非**同时**显式设 `DSV41_GRAPH_STEP=0` 与 `DSV41_AR_V5=0`，该条恒真。**这一条不是"静默不启用"的原因**，不要去改它（改成 opt-in 反而会让默认整步图失去设备侧 AR）。`FERRITE_P2P_AR5` 属于 `ferrite-exec` 的共享 v5 路径，dsv41 链路不读它。
+    - 真正的"测了没变化"来源是**不可观测**：捕获失败（`verify_graph_failed`）是按设计静默回退到裸链，`verify_captures`/`verify_replays` 之前只自增不打印 ⇒ "gate 关着 / 捕获失败 / 图在跑"三者对外无差别。已修：`step_rows` 现在打印 `[verify_graph] captured …` / `[verify_graph] capture FAILED (…): <reason>`，`reset()` 打印上一请求的 captures/replays 计数；A/B 脚本以此为**启用证据**（缺证据即 exit 2，不出结论）。
+    - 其余前置在默认配置下均满足：`eng_host`/`stats_dbg`/`phase_dbg` 默认 OFF；`compress_branch_steady()` 在第 1–2 个 spec 轮（每个 compress source 首次提交后）自动满足；两个 `supports_*` 取决于当前 .so（应含 P0 四符号 + `cudaMemsetAsync`）。
+  - A/B 口径：`verify_ms` 的对照（plan §3.3/§4）；脚本 `scripts/verify_graph_ab.sh`（`=0` vs `=1` × {出师表 300 tok, 数字 200 tok}，每例一次 serve——`[dspark]` 累加器是进程级，不能混在一台 serve 里），判据：启用证据 + `verify_ms` 降 ≥10ms + 双字数一致。
 
 ## 三、阶段 2：吞掉主链步（6.15ms → 0）
 
@@ -151,3 +154,52 @@
 2. **verify 的多行化 + 图化**（38.5 → 11）——已落地一半，图化待 A/B
 3. **吞主链步**（−4.5ms）——`swallow-step-impl` 在实施
 4. **parity 修复**（verify 的 head 与 eager 同 kernel）——`DSV41_VERIFY_HEAD_FOLD=0` 待 A/B；根治在 `folded-head-korder`
+
+---
+
+## 九、【用户修正 2026-09-12】400 tok/s 的正确口径
+
+**用户（权威）**："预测 5 个的情况下，能对 3 个就比较正常，官方也是这么多。这个情况下要 400 token/s。"
+
+⇒ **accept = 3**（5 个 draft 猜中 3 个）**是正常水平，不是 6.4**。**400 tok/s 必须在 accept 3 下达到**：
+```
+tok/s = accept × (1000 / 步时)  ⇒  400 = 3 × 133.3  ⇒  步时 ≤ 7.5 ms
+```
+
+**修正的账本**（对照当前 49.8ms）：
+| 项 | 现在 | 400 所需 | 倍数 | 手段 |
+|---|---|---|---|---|
+| verify（5 行） | 38.5 | **≤5.5** | **7.0x** | 多行化（已落地一半）+ 图化（−18ms submit）→ 仍差 ~10ms：**需更激进的 launch 削减/段融合**（verify 的 5 行是权重读一次的批处理，其"公平"下限 ≈ 单步的 1.2-1.5x ≈ 8-9ms；要到 5.5 必须再砍 kernel 数或单 kernel 成本）|
+| draft | 4.9 | ≤1.0 | 4.9x | head 多行 ✓ / wo_a 融合 ✓ / device pos ✓ 已做；剩：**gate 的 per-row gemv（bs 次 launch）**、hc 链、markov 的融合 |
+| 主链步 | 6.15 | **0** | — | 吞主链步（6 行 verify 内化，+1.6ms 归入 verify）|
+| commit | 0.2 | 0.2 | — | — |
+| **步时** | **49.8** | **≤7.5** | **6.6x** | |
+
+**draft 质量的目标也随之明确**：accept 3 ⇒ **`drafts[0..2]` 全部匹配**（当前 accept 0.58 ⇒ `drafts[0]` 命中率 33%，**要把它提到 ~60-70% 且后续两个也常中**）。**这仍是 draft 链的数值/语义问题**（官方同 checkpoint 能到 3）。
+
+**⇒ 两条并行主线（都不是"可选优化"）**：
+1. **性能**：verify 38.5 → 5.5（7x）、draft 4.9 → 1（5x）、吞主链步（−6.15）——**总 49.8 → 7.5**
+2. **draft 质量**：accept 0.58 → 3（**这是 400 的乘数**）
+
+---
+
+## 十、400 的可达路径：逐行项 → "kernel 内循环 m 行"（保持逐行语义的融合）
+
+**审计结论**（读码，多行化落地后）：verify 仍有 ~3000 launch 的主体是**"语义上必须逐行、但不必逐 launch"**的项。**关键洞察：把 m 次 launch 变成 1 次 launch、在 kernel 内部按 r 循环，逐位语义不变**（每行仍按 r 升序做同样的事、同样的累加序），省下的是 launch/调度开销（3.3µs×N 的执行固定项 + 2.9µs 的 submit）——**这正是 400 需要的**。
+
+| 逐行项 | 现 launch/步 | 融合后 | 语义风险 | 备注 |
+|---|---|---|---|---|
+| q-rope（`apply_rope` ×m）+ o-rope（×m） | ~800 | **40** | **无**（行 r 的 pos 是内核参数数组，行间独立） | kernel 内 `for r` 循环，pos_rows 已是 device 数组 ✓ |
+| ring_append ×m + window_idxs ×m | ~800 | **40** | **有**（interleave 的顺序：append(r) → window(r) → … 必须保持行序） | **内核内按 r 升序循环即可**——与现在的 m 次 launch **同序** ⇒ 逐位相同 |
+| sparse_attn（b=1,m=1 ×m） | ~200 | **40**（b=1,m=m 一次，内核内按行处理） | **有**（同上，保持行序 + 每行的 clen 快照） | ⚠️ idxs 的行距（`ist`）是调用侧的——**融合时给内核显式传 row stride**（audit 已提过这个隐患） |
+| MoE gate 的 per-row `gemv_bf16`（×m） | ~200 | **40** | **无** | 复用 `head_gemv_bf16_mrows` 的 mrows 结构（**但必须与 m=1 的 `gemv_bf16_v2` 同 K 序**——见 §五的教训，别重蹈覆辙） |
+| indexer/compress 的逐行（8 层×m） | ~400 | ~64 | **有**（compress 的 consume-side 顺序） | 同 ring 的处理：内核内按 r 升序 |
+| ，head/argmax（×m）、engram（×m） | ~200 | ~80 | 无 | head ✓ 已多行；argmax 可融 |
+| **合计** | **~3000** | **~300-400** | | **⇒ 图化后 ~400×(0.4+3.3) ≈ 1.5ms 的调度开销 + 真正的计算** |
+
+**⇒ 400 的完整链条**：
+1. **上述融合**（3000 → ~400 launch）+ **图化**：verify 的调度开销从 ~10ms 降到 ~1.5ms ⇒ **verify ≈ 单步计算 × 1.3 ≈ 8ms**（5 行共享权重）
+2. **吞主链步**（−6.15ms，+1.6 归入 verify）⇒ 步时 ≈ 8 + draft 1 + commit 0.2 ≈ **9.2ms** @ accept 3 ⇒ **326 tok/s**
+3. **再砍 verify 的计算**（sparse_attn/MoE 的 kernel 级优化）→ 6ms ⇒ **7.2ms** @ accept 3 ⇒ **417 tok/s** ✓
+
+**⚠️ 每条"有语义风险"的融合都必须以 `dspark_parity`（行级逐位对照）验收**——这正是它存在的理由。**融合的是 launch，不是语义**：内核内的 r 循环必须与现在的 m 次 launch **同序、同值**。

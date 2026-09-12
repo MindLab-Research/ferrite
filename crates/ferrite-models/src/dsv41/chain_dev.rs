@@ -2185,6 +2185,19 @@ impl<'a> DevChain<'a> {
         // The next request's first spec step bootstraps again (its standalone
         // `step_dev` is what supplies the very first tap).
         self.spec_primed = false;
+        // `reset` runs at the START of a request, so this reports the PREVIOUS
+        // one: the only place the capture/replay counts of a finished request can
+        // be read (the alternative diagnostic is the per-request capture line in
+        // `step_rows`). Silent while the switch is off or nothing engaged.
+        if verify_graph_want()
+            && self.rank() == 0
+            && (self.verify_captures > 0 || self.verify_replays > 0 || self.verify_graph_failed)
+        {
+            eprintln!(
+                "[verify_graph] previous request: captures={} replays={} failed={}",
+                self.verify_captures, self.verify_replays, self.verify_graph_failed
+            );
+        }
         self.verify_captures = 0;
         self.verify_replays = 0;
         self.decode_steps = 0;
@@ -3490,6 +3503,21 @@ impl<'a> DevChain<'a> {
                     c.host_barrier();
                 }
                 if cap_err.is_some() || g.is_null() {
+                    // ★ PRINT, DO NOT SILENTLY DEGRADE. The graph is an
+                    // optimisation, so a refusal is *designed* to leave the request
+                    // on the direct launches — which makes "graph on but never
+                    // engaged" and "graph engaged" indistinguishable from the
+                    // outside. That ambiguity is exactly how an A/B reports "no
+                    // change" for a feature that never ran (the trap this switch
+                    // was born from), so the cause crosses to the console here.
+                    let why = cap_err
+                        .as_ref()
+                        .map(|e| format!("{e}"))
+                        .unwrap_or_else(|| "capture_end returned a null graph".into());
+                    eprintln!(
+                        "[verify_graph] capture FAILED (m={m} pos={pos_base}): {why} — this \
+                         request finishes on the direct launches (gate re-closed)"
+                    );
                     self.verify_graph_failed = true;
                     if !g.is_null() {
                         let _ = self.dev.graph_free(g, std::ptr::null_mut());
@@ -3501,6 +3529,15 @@ impl<'a> DevChain<'a> {
                     self.dev.graph_launch(e)?; // the capture did not execute
                     self.verify_graph = Some(e);
                     self.verify_captures += 1;
+                    // The A/B's proof that `DSV41_VERIFY_GRAPH=1` took effect: one
+                    // line per request (rank 0 only — the ranks are threads of one
+                    // process and would otherwise print it `world` times).
+                    if self.rank() == 0 {
+                        eprintln!(
+                            "[verify_graph] captured m={m} at pos={pos_base} — every later \
+                             verify of this request replays (DSV41_VERIFY_GRAPH=1)"
+                        );
+                    }
                     self.advance_compress_lens(pos_base, m);
                 }
             }
@@ -3547,7 +3584,13 @@ impl<'a> DevChain<'a> {
     ///   uploads per row (`upload_bytes_at` = blocking H2D).
     /// * `ar_v5()` whenever there are peers: a host barrier is not a CUDA call, so
     ///   it would not be recorded and the replayed graph would silently lose the
-    ///   inter-rank synchronisation.
+    ///   inter-rank synchronisation. NOTE this is SATISFIED BY DEFAULT: `ar_v5()`
+    ///   is `DSV41_GRAPH_STEP != 0 || DSV41_AR_V5 != 0` with both legs defaulting
+    ///   ON (tp.rs), and the step graph is default ON since 2026-09-11 — so under
+    ///   TP8 the condition is true unless BOTH `DSV41_GRAPH_STEP=0` and
+    ///   `DSV41_AR_V5=0` are set. It is NOT an opt-in blocker, and an A/B that
+    ///   never engages the graph is not explained by this clause (read the
+    ///   `[verify_graph]` lines `step_rows` prints on capture / capture failure).
     /// * `supports_memset_async()`: `compress_proj_rows` zeroes `scp_r` on the
     ///   `ratio == 1` no-gate path, and `zero_at_on` would fall back to the
     ///   SYNCHRONOUS `cudaMemset` on the legacy stream without the symbol.
