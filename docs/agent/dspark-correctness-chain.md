@@ -2175,3 +2175,29 @@ DSV41_BF16_TRUNCATE=1
 **判定**：回退改善了 gap（22→3）但没修复。**ar5-hang 有更深的根因**——不只是 epoch 推进规则的问题。ar5-final-fix subagent 正在做架构级分析。
 
 **SWALLOW_STEP 继续禁用**。当前 400 路径的性能依赖 LAZY_VERIFY（~33ms 步时）。
+
+## 🎉 Wave 1 综合测试成功（936460d1）——EAGER 融合兑现 -8ms！
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）——所有 HC 融合 + mrows gate 保持基线！
+- **步时 25.17ms**（pos=105，39.7 tok/s）——从 ~33ms 改善 **-8ms**！
+- **k_acc 序列不变**：4 0 0 0 3 0 1 1 0 0 0 1 2 0 0 5 0 0 0 1（与之前完全相同）
+- **0 ar5-hang** ✓（LAZY_VERIFY 正常工作）
+- **图化成功**（verify_graph_m1 @ pos=20）✓
+
+**Gate 组合**（全部首次同时启用且成功）：
+- HC_VERIFY_FUSE=1（A1：collapse_norm_rows + hc_post_inplace，truncate=false 修复后）
+- HC_FRONT_ROWS=1（A2：hc_front_split for verify，truncate=false 修复后）
+- VERIFY_AR_FOLD=1（AR fold）
+- GATE_MROWS=1 + INDEXER_MROWS=1 + COMPRESSOR_MROWS=1（mrows 族）
+- LAZY_VERIFY + VERIFY_GRAPH + BF16_TRUNCATE
+
+**性能提升**：
+| 指标 | 修复前 | Wave 1 后 | 改善 |
+|---|---|---|---|
+| 步时 | ~33ms | **25.17ms** | **-8ms** |
+| 吞吐 | ~67 tok/s | **87 tok/s** | **+30%** |
+
+**EAGER 融合迁移方案的第一波兑现**！launch 账的 -8.4ms 预测准确 ✓
+
+**下一步**：加 SWALLOW_STEP（ar5-hang 修复后）+ tcgen05（对齐修复验证后）→ 步时目标 ~15-20ms
