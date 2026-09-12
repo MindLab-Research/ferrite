@@ -4088,3 +4088,15 @@ self.dev.gemm_fp8_mx_rope_norm(
 4. **单 block 轮询与多 block 归约的竞态**：block 0 完成轮询后开始归约自己的 slice，但其他 blocks 可能还在等广播 flag——如果归约读取的数据还没全部到达——**损坏的 AR 结果**！
 
 **如果 A4 是引擎退化的来源**：最简单的修复 = **禁用 A4**（gate OFF——它是默认 OFF 的！之前测试显式开了 DSV41_AR_SINGLE_POLL=1）
+
+## ⚠️ EAGER 测试设计缺陷——没有 e4m3！
+
+**发现**：EAGER 测试（158b0260）的环境没有 DSV41_EXPERT_ACT_E4M3=1！
+- 没有 e4m3 → e2m1 噪声 → 'XX' 拉丁碎片 + 计数损坏（**这是已知的根因——session 早期就修复过！**）
+- **之前的"纯 EAGER 也损坏（51/435 + XX）"可能是 e4m3 缺失——不是引擎退化！**
+
+**正确配置**：EAGER + e4m3（DSV41_EXPERT_ACT_E4M3=1）：
+- 如果干净 → 引擎没问题，损坏在 spec 路径（回到 base bisect）
+- 如果仍损坏 → 引擎确实退化（wo_a 或 A4 嫌疑恢复）
+
+**同样**：干净 .so 测试（7bf3dfed）也没设 e4m3——**结果也不可靠**！
