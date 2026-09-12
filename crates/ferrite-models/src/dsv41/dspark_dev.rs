@@ -1777,6 +1777,14 @@ impl<'a> DsparkDev<'a> {
         // it OFF nothing here changes (the last VERIFIED-CORRECT combination is
         // the seed at `pos - 1` with the default window).
         let seed_pos = if seed_pos_fix() { pos } else { pos - 1 };
+        // S1 FIX (accept-first-strategy, 2026-09-12): the official has ONE
+        // freqs_cis base driving q/kv/o alike (model.py:1055 → :1059/:1061/:1068).
+        // The SEED_POS arm moved the seed and kv bases but left q/o at `pos` —
+        // an off-by-one between the query rows and the KV rows in that arm,
+        // which is what degraded BOTH A/B runs (079ffbaf, 10ba0e73). `rope_pos`
+        // is THE shared base: `pos + 1` under the gate (aligned with kv_pos),
+        // `pos` off it (bit-identical to the historical call — zero risk).
+        let rope_pos = if seed_pos_fix() { pos + 1 } else { pos };
         self.seed_window(s, seed_pos, slot_dev)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
@@ -1820,7 +1828,9 @@ impl<'a> DsparkDev<'a> {
         // the pre-RoPE projection — the unit-diff isolator between the
         // projection chain (wq_a/q_norm/wq_b) and the RoPE.
         self.dump_unit_idx("q_pre_rope", s, self.q.ptr as *const f32, &[bs, nh, hd]);
-        self.rope_queries(self.q.ptr as *mut f32, pos)?;
+        // S1: `rope_pos` (NOT `pos`) — the shared base that keeps q/o in lockstep
+        // with kv under the SEED_POS arm (see the definition above).
+        self.rope_queries(self.q.ptr as *mut f32, rope_pos)?;
 
         // ---- kv = wkv(x), normed and roped like the backbone's window KV ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — one row left rows 1..bs-1
@@ -1958,7 +1968,9 @@ impl<'a> DsparkDev<'a> {
             0,
         )?;
         // inverse RoPE, same per-query positions
-        self.rope_queries_inv(self.o.ptr as *mut f32, pos)?;
+        // S1: `rope_pos` (NOT `pos`) — keeps o in lockstep with q and kv under
+        // the SEED_POS arm (see the definition above).
+        self.rope_queries_inv(self.o.ptr as *mut f32, rope_pos)?;
 
         // ---- grouped low-rank output projection ----
         // The reference's `grp` reshape is the IDENTITY (o is already
