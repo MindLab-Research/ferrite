@@ -311,6 +311,17 @@ struct Kernels {
         *const f32, c_int, c_int, *mut c_int, *mut u64, *mut c_int, *const *mut u64,
         *const *mut u32, *mut c_uint, *mut u64, *const c_uint, c_int, c_int, c_long, CuStream,
     ) -> c_int>,
+    // Multi-row twin of `argmax_sliced`, for the DSpark verify's vocabulary-sliced
+    // head (DSV41_VERIFY_HEAD_SLICED): every row reduces its own slice and the
+    // whole block exchanges in ONE v5 epoch round, so the verify's head pays the
+    // same cross-rank cost the single-row eager head does instead of one round
+    // per row. Optional: an .so without it keeps the verify's per-row
+    // FULL-vocabulary head (see `verify_head_geom`).
+    argmax_sliced_rows: Option<unsafe extern "C" fn(
+        *const f32, c_int, c_int, c_int, *mut c_int, *mut u64, *mut c_int, *const *mut u64,
+        *const *mut u32, *mut c_uint, *mut u64, *const c_uint, c_int, c_int, c_int, c_long,
+        CuStream,
+    ) -> c_int>,
     hc_mixes: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const f32, *mut f32, *mut f32, *mut f32,
         c_int, c_int, c_int, c_int, f32, CuStream,
@@ -946,6 +957,7 @@ impl Device {
             rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
+            argmax_sliced_rows: ko!(rt, "dsv41_argmax_sliced_rows"),
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
             moe_route: km!(rt, "dsv41_moe_route"),
             add_inplace: ko!(rt, "ferrite_add"),
@@ -2589,6 +2601,64 @@ impl Device {
         }
         self.kerr(rc, "dsv41_argmax_sliced")?;
         Ok(true)
+    }
+
+    /// Multi-row twin of [`Self::argmax_sliced`], for the DSpark verify's
+    /// vocabulary-sliced head: one local reduce per row over that row's own
+    /// `n`-wide slice, then ONE v5 epoch round for the whole block.
+    ///
+    /// `row_stride` is the logits buffer's row pitch in F32 ELEMENTS (`seg` for
+    /// the verify's sliced rows — the head writes them `seg` apart), `idx_off`
+    /// the slice's base in the GLOBAL vocabulary, so `out[i]` is a global index
+    /// either way. `pos_ctr` may be NULL: the verify must not advance it, and
+    /// only the epoch advance is unconditional.
+    ///
+    /// `Ok(false)` when the loaded .so predates the symbol, or the kernel
+    /// DECLINED (the block's keys do not fit the v5 slot). The caller gates the
+    /// layout on [`Self::supports_argmax_sliced_rows`] and on the slot bound, so
+    /// a decline here is an inconsistency it must not swallow — see
+    /// `verify_head_geom`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn argmax_sliced_rows(
+        &self,
+        v: *const f32,
+        n: i32,
+        idx_off: i32,
+        row_stride: i32,
+        out: *mut c_int,
+        packed: *mut u64,
+        pos_ctr: *mut c_int,
+        peer_staging: *const *mut u64,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *mut u64,
+        ready_local: *const c_uint,
+        world: i32,
+        rank: i32,
+        rows: i32,
+        stride_bytes: i64,
+    ) -> Result<bool> {
+        let f = match self.kernels.argmax_sliced_rows {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(v, n, idx_off, row_stride, out, packed, pos_ctr, peer_staging, ready_tbl, epoch,
+              staging_local, ready_local, world, rank, rows, stride_bytes, self.stream)
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_argmax_sliced_rows")?;
+        Ok(true)
+    }
+
+    /// Is the multi-row cross-rank argmax in this .so? The verify's head slicing
+    /// is gated on it BEFORE any layout decision is taken, so a stale .so keeps
+    /// `logits_r` at the full-vocabulary row pitch instead of leaving a
+    /// half-sliced buffer for the fallback to misread.
+    pub fn supports_argmax_sliced_rows(&self) -> bool {
+        self.kernels.argmax_sliced_rows.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]

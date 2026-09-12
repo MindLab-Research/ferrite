@@ -237,6 +237,10 @@ struct Scratch {
     /// copies it into every peer's staging slot. Without it the sliced path
     /// would hand a NULL pointer to a kernel that dereferences it.
     argmax_packed: DevBuf, // [1] u64
+    /// Vocabulary-sliced VERIFY head only (`DSV41_VERIFY_HEAD_SLICED`): one
+    /// packed comparison key per verify ROW, published TOGETHER in ONE v5 round
+    /// by `dsv41_argmax_sliced_rows` (the single-row `argmax_packed` holds one).
+    argmax_packed_r: DevBuf, // [VERIFY_ROWS] u64
     /// Per-layer compressed-KV counters, advanced by the compressor's commit
     /// kernel on the device (the host used to track compress_len and download
     /// `out_rows` to decide). Consumers read this instead of a launch argument.
@@ -399,7 +403,13 @@ struct Scratch {
     moe_out_r: DevBuf, // [m, dim] MoE block output (routed + shared expert)
     ids_r: DevBuf,     // [m] i32 token ids
     argmax_r: DevBuf,  // [m] i32 per-row argmax (the head's output)
-    logits_r: DevBuf,  // [m, vocab]
+    /// [m, vocab] — but the ROW PITCH is `seg = vocab/world` under
+    /// `DSV41_VERIFY_HEAD_SLICED` (only the first `seg` of each row is written).
+    /// `verify_head_geom` is the single place that decides which, and the head
+    /// GEMV, the argmax and the probe all index it through that decision: the
+    /// pitch is NOT in the type, so a site that assumes one of the two is a
+    /// silent misread.
+    logits_r: DevBuf,  // [m, vocab] or [m, seg] — see the doc comment
     /// [m, hc] the CONSTANT incoming premix, `[1,0,0,0]` per row (uploaded once per
     /// `step_rows`, the m-row twin of `premix_const`).
     premix_r: DevBuf,
@@ -973,6 +983,52 @@ fn verify_head_fold() -> bool {
         std::env::var("DSV41_VERIFY_HEAD_FOLD")
             .map(|v| v != "0")
             .unwrap_or(false)
+    })
+}
+
+/// `DSV41_VERIFY_HEAD_SLICED` (DEFAULT ON) gives the DSpark verify's head the
+/// same per-rank VOCABULARY SLICE the eager step takes under `DSV41_HEAD_SLICE`:
+/// each rank projects its own `seg = vocab / world` rows of `head.weight`, and
+/// the ranks pick the global winner PER ROW from one published u64 each.
+///
+/// **What it removes.** `head.weight` is `Shard::Replicated` [129280, 5120] bf16
+/// = 1262 MB on EVERY rank, and the unsliced verify's head streams all of it
+/// once PER ROW (m = 6 rows => 6 x 298us = 1.79ms; `verify-calc-floor.md`'s
+/// 6619 MB/step). With the slice one rank reads 158 MB per row for the same m
+/// launches, and the head is replicated, so the whole vocabulary is still
+/// compared — the exchange's packed key carries the GLOBAL index.
+///
+/// **Why per-row `gemv_bf16(n = seg)` and not the folded
+/// `head_gemv_bf16_mrows`.** The fold's kernel IS the v2 (`gemv_bf16_nt`)
+/// program, while the production single-row head is v1 `gemv_bf16_kernel`
+/// (`gemv_bf16_v2_wanted(n)` needs `n < 2048` and the head's `n` is the
+/// vocabulary) — so folding the head is a NUMERICAL change, and it measured as
+/// one (see [`verify_head_fold`]). The per-row call here is the SAME kernel the
+/// eager sliced head runs, so each verify row keeps the eager head's exact
+/// values. The fold is a separate, still-open correctness question and stays an
+/// opt-in A/B arm that this gate takes precedence over.
+///
+/// **Why the argmax is ONE batched exchange, not m calls of `argmax_sliced`.**
+/// Every `dsv41_argmax_sliced` call IS a full v5 epoch round — publish, stamp,
+/// advance `*epoch`, poll every peer — and only `pos_ctr` can be nulled, never
+/// the round. m rows would put m serialised cross-rank round-trips on the
+/// verify's critical path (and m device epoch advances per step); the batched
+/// `dsv41_argmax_sliced_rows` pays ONE for the whole block. `pos_ctr` is NULL
+/// throughout: the verify must not advance it (the accept logic owns that, once
+/// per accepted prefix).
+///
+/// The head is REPLICATED, so the full-vocabulary rounds stay available as the
+/// fallback: a stale .so without the batched symbol, `world == 1`, a non-BF16
+/// head or a vocabulary not divisible by the world each keep the per-row
+/// full-vocab path, and [`verify_head_geom`] is the one place that decides.
+/// `DSV41_VERIFY_HEAD_SLICED=0` restores it for the A/B. Read once and cached
+/// (the house rule for hot-path gates).
+fn verify_head_sliced() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_HEAD_SLICED")
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
@@ -1881,6 +1937,10 @@ impl<'a> DevChain<'a> {
             moe_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
             ids_r: dev.alloc(VERIFY_ROWS * 4)?,
             argmax_r: dev.alloc(VERIFY_ROWS * 4)?,
+            argmax_packed_r: dev.alloc(VERIFY_ROWS * 8)?,
+            // Sized by the FULL vocabulary whatever the head's arm: the sliced
+            // arm only uses a `seg = vocab / world` prefix of each row, and a
+            // static allocation graph is worth more than the unused 7/8.
             logits_r: dev.alloc(fb(VERIFY_ROWS * cfg.vocab_size))?,
             premix_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
             pre_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
@@ -2104,13 +2164,21 @@ impl<'a> DevChain<'a> {
     /// that buffer — the rollback restores the ring and the compressors, not the
     /// m-row scratch), reduced to `(kernel argmax, host argmax, top-k)`.
     ///
-    /// `logits_r` is a FULL-vocabulary row even under `DSV41_HEAD_SLICE`: the
-    /// verify's head is not sliced (the multi-row cross-rank argmax is still
-    /// open), which is the first thing to check when the eager row below looks
-    /// short.
+    /// The row's width and index base come from the SAME [`Self::verify_head_geom`]
+    /// the head GEMV and the argmax used, so the probe reads exactly what they
+    /// wrote: under `DSV41_VERIFY_HEAD_SLICED` row 0 is this rank's `seg`-wide
+    /// slice (the rows packed `seg` apart in `logits_r`) and the top-k's indices
+    /// are offset by the rank's slice base — the mirror of the probe's eager half
+    /// below, which does the same for the single-row `s.logits`. Getting this
+    /// wrong is a silent misread (the pitch is not in the type), which is why the
+    /// decision lives in ONE function.
     fn vrow0_verify(&self, argmax: u32) -> Result<(u32, u32, Vec<(u32, f32)>)> {
-        let lg = self.vrow0_row(self.s.logits_r.ptr as *const f32, self.cfg.vocab_size)?;
-        let top = vrow0_topk(&lg, 0, vrow0_topk_n());
+        let (n, base) = match self.verify_head_geom() {
+            Some((seg, base)) => (seg, base as u32),
+            None => (self.cfg.vocab_size, 0),
+        };
+        let lg = self.vrow0_row(self.s.logits_r.ptr as *const f32, n)?;
+        let top = vrow0_topk(&lg, base, vrow0_topk_n());
         let host = top.first().map(|t| t.0).unwrap_or(0);
         Ok((argmax, host, top))
     }
@@ -3681,11 +3749,16 @@ impl<'a> DevChain<'a> {
     //    published BEFORE that row's selection (per-row interleave), matching the
     //    single-row order, so newly created groups are still part of the candidate
     //    set. Excluding them is a modelling decision that has not been taken.
-    // 3. HEAD: the full vocabulary is used on every rank (no `HEAD_SLICE`):
-    //    `argmax_sliced` advances `pos_ctr` and consumes one v5 epoch round per
-    //    call, which a 6-row block cannot afford. The head is replicated, so the
-    //    unsliced argmax selects the same token; a multi-row sliced argmax is the
-    //    TODO.
+    // 3. HEAD: vocabulary-sliced by default (`DSV41_VERIFY_HEAD_SLICED`, ON) —
+    //    each rank projects its own 1/world of the replicated head and
+    //    `dsv41_argmax_sliced_rows` picks the global winner per row in ONE v5
+    //    epoch round for the whole block. It is NOT wired through
+    //    `argmax_sliced`: that entry consumes a full round PER CALL and only
+    //    `pos_ctr` can be nulled, never the round, so m rows would cost m
+    //    serialised cross-rank round-trips. `pos_ctr` stays NULL (the accept
+    //    logic owns it). The full-vocabulary per-row path remains the fallback
+    //    for `DSV41_VERIFY_HEAD_SLICED=0`, a stale .so, `world == 1` or a
+    //    non-BF16 head — see `verify_head_geom`.
     // 4. The tcgen05 MXFP4 gate/up arm (`DSV41_EXPERT_TCGEN05_MXF4`, default OFF)
     //    is not wired into `moe_rows`: the rows path pins the proven GEMV arm.
 
@@ -4021,6 +4094,59 @@ impl<'a> DevChain<'a> {
         }
     }
 
+    /// The verify head's SLICE geometry — `Some((row_stride, index_base))` for
+    /// `logits_r`, `None` when the verify's head is NOT sliced.
+    ///
+    /// ONE place decides this, because three call sites have to agree: the head
+    /// GEMV writes the rows `row_stride` apart, the argmax reads them at the same
+    /// pitch, and the probe ([`Self::vrow0_verify`]) reads row 0 at the same width
+    /// and index base. A second copy of the condition is exactly how the two
+    /// would drift apart — and `logits_r`'s row pitch is INVISIBLE to its type,
+    /// so a drift is a silent misread rather than a type error.
+    ///
+    /// Sliced requires ALL of:
+    ///
+    /// * `DSV41_VERIFY_HEAD_SLICED` (default ON),
+    /// * a BF16 head weight (the sliced arm is the bf16 GEMV) — the f32 arm has
+    ///   no slice,
+    /// * `world > 1` with a live v5 collective, because the exchange IS one round
+    ///   of that epoch sequence (`comm.uses_v5()`),
+    /// * a vocabulary divisible by the world (the same condition the eager
+    ///   `DSV41_HEAD_SLICE` arm takes),
+    /// * [`Device::supports_argmax_sliced_rows`] — tested HERE, before any layout
+    ///   choice, so a stale .so keeps `logits_r` at the full-vocabulary pitch
+    ///   instead of leaving a half-sliced buffer for the fallback to misread,
+    /// * room for the WHOLE verify block's keys in the v5 slot
+    ///   (`VERIFY_ROWS * 8 <= bytes`). That is the batched entry's own decline
+    ///   arm, checked here for the worst-case row count so the geometry cannot
+    ///   depend on `m` — a geometry that changed with `m` would leave the head,
+    ///   the argmax and the probe disagreeing on different verifies.
+    fn verify_head_geom(&self) -> Option<(usize, usize)> {
+        let cfg = self.cfg;
+        let world = self.world();
+        let seg = if world > 1 { cfg.vocab_size / world } else { 0 };
+        let head_bf16 = self
+            .w
+            .head
+            .as_ref()
+            .map(|h| h.dtype == "BF16")
+            .unwrap_or(false);
+        let sliced = verify_head_sliced()
+            && head_bf16
+            && world > 1
+            && cfg.vocab_size % world == 0
+            && self.dev.supports_argmax_sliced_rows()
+            && self
+                .comm
+                .as_ref()
+                .map(|c| c.uses_v5() && VERIFY_ROWS * 8 <= c.bytes)
+                .unwrap_or(false);
+        if !sliced {
+            return None;
+        }
+        Some((seg, self.rank() * seg))
+    }
+
     /// The verify forward as it is RECORDED: everything from the embedding to the
     /// per-row argmax, with no host round trip anywhere inside (the ids, the row
     /// positions and the premix are all on the device before this runs, and the
@@ -4136,23 +4262,34 @@ impl<'a> DevChain<'a> {
         )?;
 
         // ---- head + per-row argmax ----
-        // Same call `step_body` makes for its single token (f32 activation, bf16
-        // weight read in-kernel), but with the m rows FOLDED INTO ONE LAUNCH.
-        // `step_rows` used to call it once per row, and the head is the block's
-        // single largest weight: `head.weight` is Shard::Replicated
-        // [129280, 5120] bf16 = 1262 MB on every rank (weights.rs:90), i.e. the
-        // full vocabulary — NOT the per-rank slice `step_dev` takes under
-        // DSV41_HEAD_SLICE (slicing the verify's head needs the multi-row
-        // cross-rank argmax, still TODO#3; this change is the GEMV half only).
-        // Six rows therefore streamed those 1262 MB six times (6 x 298us =
-        // 1.79ms). `head_gemv_bf16_mrows` decodes one weight crop and folds all
-        // m rows against it; row r is bit-identical to the single-row launch it
-        // replaces (the kernel header carries the C1-C5 argument: same ascending
-        // K chain, per-row accumulators, same shuffle tree, __fmaf_rn-pinned so
-        // --use_fast_math cannot reassociate). A stale .so without the symbol —
-        // or m outside the kernel's 1..=8 set — falls back to the per-row loop.
+        // Same call `step_body` makes for its single token, with two differences:
+        // the m rows are one block instead of one token, and (DSV41_VERIFY_HEAD_SLICED,
+        // default ON) each rank reads only its OWN 1/world of the head.
+        //
+        // The head is the block's single largest weight: `head.weight` is
+        // Shard::Replicated [129280, 5120] bf16 = 1262 MB on every rank
+        // (weights.rs:90). The unsliced arm streams all of it ONCE PER ROW (6 x
+        // 298us = 1.79ms); the sliced one streams 158 MB/rank/row for the same m
+        // launches and reaches the same token, because the head is REPLICATED
+        // (every rank can reduce any slice) and the exchange's packed key carries
+        // the GLOBAL index with the single-row tie rule (lowest index).
+        //
+        // The GEMV stays PER ROW on purpose: `verify_head_geom`'s doc records why
+        // the folded `head_gemv_bf16_mrows` is NOT used here (it is the v2 kernel
+        // program; the eager head is v1, so folding is a numerical change — see
+        // `verify_head_fold`). Row r is therefore the SAME `gemv_bf16` launch the
+        // eager sliced head makes, i.e. the eager head's exact values.
+        //
+        // The logits row PITCH follows the arm (`seg` under the slice, the full
+        // vocabulary otherwise) and is fixed by `verify_head_geom` alone — the
+        // head, the argmax below and the probe all index `logits_r` through it.
         let head = self.w.head.as_ref().unwrap();
-        let folded = verify_head_fold()
+        let geom = self.verify_head_geom();
+        let lg_stride = geom.map(|(stride, _)| stride).unwrap_or(cfg.vocab_size);
+        // The fold is the UNSLICED arm's alternative only: it changes the K order
+        // (a numerical change), so it is never combined with the slice.
+        let folded = geom.is_none()
+            && verify_head_fold()
             && if head.dtype == "BF16" {
                 self.dev.head_gemv_bf16_mrows(
                     head.ptr(),
@@ -4165,10 +4302,27 @@ impl<'a> DevChain<'a> {
             } else {
                 false
             };
-        if !folded {
+        if let Some((seg, _)) = geom {
+            // THIS rank's vocabulary slice: `head.weight` is [vocab, dim] bf16
+            // row-major, so rank `rank`'s rows start `rank * seg * dim` elements
+            // (2 bytes each) into it — the same offset arithmetic `step_body`
+            // uses for the eager sliced head.
+            let head_ptr = (head.ptr() as *const u8).wrapping_add(self.rank() * seg * dim * 2);
             for r in 0..m {
                 let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
-                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * cfg.vocab_size);
+                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
+                self.dev.gemv_bf16(
+                    head_ptr as *const c_void,
+                    xnr,
+                    lg,
+                    seg as i32,
+                    dim as i32,
+                )?;
+            }
+        } else if !folded {
+            for r in 0..m {
+                let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
                 if head.dtype == "BF16" {
                     self.dev
                         .gemv_bf16(head.ptr(), xnr, lg, cfg.vocab_size as i32, dim as i32)?;
@@ -4177,21 +4331,60 @@ impl<'a> DevChain<'a> {
                 }
             }
         }
-        // The argmax stays PER ROW (one tiny kernel each, ~5us): its multi-row
-        // twin is only worth writing together with the cross-rank vocabulary
-        // slice, which is where the slice-local reduce and the tie rule have to
-        // be reconsidered. Nothing here depends on the row order.
-        for r in 0..m {
-            let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * cfg.vocab_size);
-            // NULL pos_ctr: this argmax must NOT advance the counter (the kernel
-            // null-checks it) — the accept logic advances it once, for the accepted
-            // prefix.
-            self.dev.argmax(
-                lg as *const f32,
-                (self.s.argmax_r.ptr as *mut std::os::raw::c_int).wrapping_add(r),
-                cfg.vocab_size as i32,
+        if let Some((seg, base)) = geom {
+            // ONE cross-rank exchange for the WHOLE block: the m local slice
+            // argmaxes are published together and the ranks max over them in
+            // ascending rank order, so row r's global winner (and its
+            // lowest-index tie rule) is the full-vocabulary argmax's.
+            let c = self.comm.as_ref().unwrap();
+            let ok = self.dev.argmax_sliced_rows(
+                self.s.logits_r.ptr as *const f32,
+                seg as i32,
+                base as i32,
+                lg_stride as i32,
+                self.s.argmax_r.ptr as *mut std::os::raw::c_int,
+                self.s.argmax_packed_r.ptr as *mut u64,
+                // NULL pos_ctr: this argmax must NOT advance the counter (the
+                // kernel null-checks it) — the accept logic advances it once, for
+                // the accepted prefix. The v5 EPOCH advance is unconditional and
+                // is exactly one round for the whole block, the same one round the
+                // single-row eager head pays.
                 std::ptr::null_mut(),
+                c.peer_slots_u64(),
+                c.peer_stamps_u32(),
+                c.epoch_dev(),
+                c.staging_dev() as *mut u64,
+                c.ready_local_dev(),
+                self.world() as i32,
+                self.rank() as i32,
+                m as i32,
+                c.bytes as i64,
             )?;
+            if !ok {
+                // Unreachable by construction: `verify_head_geom` gated on the
+                // symbol AND on `VERIFY_ROWS * 8 <= bytes` (>= `m * 8`), which are
+                // the entry's two decline arms. A decline here would mean the two
+                // sides disagree about the geometry, and the head has ALREADY
+                // written `logits_r` at the slice pitch — a silent fallback would
+                // then read full-vocabulary rows and return wrong tokens, which is
+                // the one failure this path must not have.
+                return Err(FerriteError::Config(
+                    "dsv41_argmax_sliced_rows declined a shape the host gated as legal".into(),
+                ));
+            }
+        } else {
+            for r in 0..m {
+                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
+                // NULL pos_ctr: this argmax must NOT advance the counter (the kernel
+                // null-checks it) — the accept logic advances it once, for the accepted
+                // prefix.
+                self.dev.argmax(
+                    lg as *const f32,
+                    (self.s.argmax_r.ptr as *mut std::os::raw::c_int).wrapping_add(r),
+                    cfg.vocab_size as i32,
+                    std::ptr::null_mut(),
+                )?;
+            }
         }
         // The `argmax_r` D2H is deliberately NOT here: it is a device read, which a
         // capture forbids, so the caller ([`Self::step_rows`]) issues it after the

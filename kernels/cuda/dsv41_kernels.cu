@@ -6830,6 +6830,75 @@ __global__ void argmax_xchg_v5_kernel(
     if (pos_ctr != nullptr) *pos_ctr = *pos_ctr + 1;
 }
 
+// Multi-row twin of `argmax_xchg_v5_kernel`, for the DSpark verify's head
+// (DSV41_VERIFY_HEAD_SLICED): the m rows of ONE verify block exchange in ONE v5
+// epoch round instead of m.
+//
+// WHY NOT m CALLS OF `dsv41_argmax_sliced`: every call IS a full v5 round - a
+// publish into `world` staging slots, a stamp of `world` ready rows, an
+// unconditional `*epoch` advance and a poll of every peer - and only `pos_ctr`
+// can be nulled, never the round. m rows would therefore put m serialised
+// cross-rank round-trips on the verify's critical path (and m device epoch
+// advances per step) where the single-row eager path pays one. This kernel pays
+// one for the whole block.
+//
+// LAYOUT: row i's key sits at `slot_base + i*8` inside the CURRENT parity slot
+// (`((e&1)*world + my_rank) * stride_bytes` - the same addressing
+// `argmax_xchg_v5_kernel` and the v5 AR store share), so `rows*8` must fit
+// `stride_bytes`; the C entry declines otherwise. Every key is published BEFORE
+// the single stamp and the `__threadfence_system()` between the two orders them,
+// so a peer that observes the stamp reads a COMPLETE block of keys.
+//
+// `pos_ctr` is NULL for the verify (the accept logic advances the counter, once,
+// for the accepted prefix); the argument is kept - and null-checked - so this
+// kernel has the same contract as its single-row twin.
+__global__ void argmax_xchg_v5_rows_kernel(
+    const unsigned long long* __restrict__ packed,        // [rows] my slice keys
+    unsigned long long* const* __restrict__ staging_tbl,  // [world] peers' staging BASEs
+    unsigned* const* __restrict__ ready_tbl,              // [world] peers' ready rows
+    unsigned* __restrict__ epoch,
+    unsigned long long* __restrict__ staging_local,       // my staging base
+    const unsigned* __restrict__ ready_local,             // my [world] row
+    int* __restrict__ out, int* __restrict__ pos_ctr, int world, int my_rank, int rows,
+    long stride_bytes) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    const unsigned e = *epoch;
+    const size_t slot =
+        (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (size_t)stride_bytes;
+    for (int r = 0; r < world; r++) {           // every peer, my own slot included
+        char* dst = reinterpret_cast<char*>(staging_tbl[r]) + slot;
+        for (int i = 0; i < rows; i++)
+            *reinterpret_cast<unsigned long long*>(dst + (size_t)i * 8) = packed[i];
+    }
+    __threadfence_system();                     // keys visible BEFORE the stamp
+    for (int r = 0; r < world; r++)
+        atomicExch_system((unsigned int*)&ready_tbl[r][my_rank], e + 1u);
+    __threadfence_system();
+    *epoch = e + 1u;                            // only after stamping (v5 rule)
+    for (int r = 0; r < world; r++) {
+        volatile unsigned* p = (volatile unsigned*)&ready_local[r];
+        long spins = 0;
+        while ((int)(*p - (e + 1u)) < 0) {      // absolute stamp, monotone
+            __nanosleep(200);
+            if (++spins > 25000000) break;      // ~5 s watchdog; give up
+        }
+    }
+    __threadfence_system();                     // observe peers' staged keys
+    const char* sl = reinterpret_cast<const char*>(staging_local);
+    for (int i = 0; i < rows; i++) {
+        unsigned long long best = 0ull;
+        for (int r = 0; r < world; r++) {       // ascending rank; ties -> lowest idx
+            const size_t ro = (size_t)((e & 1u) * (unsigned)world + (unsigned)r) *
+                                  (size_t)stride_bytes + (size_t)i * 8;
+            const unsigned long long k =
+                *reinterpret_cast<const unsigned long long*>(sl + ro);
+            if (k > best) best = k;
+        }
+        out[i] = (int)(0xFFFFFFFFu - (unsigned)(best & 0xFFFFFFFFu));
+    }
+    if (pos_ctr != nullptr) *pos_ctr = *pos_ctr + 1;
+}
+
 extern "C" int dsv41_argmax(const float* v, int* out, int n, int* pos_ctr, cudaStream_t s) {
     if (n <= 0) return (int)cudaErrorInvalidValue;
     argmax_kernel<<<1, 1024, 0, s>>>(v, out, n, pos_ctr, 0, nullptr);
@@ -6854,6 +6923,47 @@ extern "C" int dsv41_argmax_sliced(
     argmax_xchg_v5_kernel<<<1, 1, 0, s>>>(
         packed, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, pos_ctr, world,
         rank, stride_bytes);
+    return (int)cudaGetLastError();
+}
+
+// Multi-row vocabulary-sliced argmax (DSV41_VERIFY_HEAD_SLICED): the m-row form
+// of `dsv41_argmax_sliced`, for the DSpark verify's head. Row i is reduced over
+// its OWN `n`-wide slice (`v + i*row_stride`, the logits buffer's row pitch),
+// with its LOCAL index packed as `idx_off + j` so the key carries the GLOBAL
+// index; then ALL rows exchange in ONE v5 epoch round
+// (`argmax_xchg_v5_rows_kernel`) and each `out[i]` comes back as a global index.
+// Ties resolve to the lowest global index exactly as the single-row kernel's do:
+// the packed key is monotone in (value, -index) and the reduce walks ranks
+// ascending.
+//
+// `pos_ctr` is passed through and is NULL for the verify - only the epoch
+// advance is unconditional, and that is the property that makes this free of a
+// correctness question: no rank can observe a half-written block, because the
+// keys are published before the single stamp and fenced ahead of it.
+//
+// `row_stride` is in F32 ELEMENTS. Returns 1 - the DECLINE sentinel, the same
+// one `dsv41_argmax_sliced` uses - when the block's keys do not fit the v5 slot
+// (`rows*8 > stride_bytes`), so a caller that gated on the symbol alone still
+// falls back instead of corrupting the AR's staging.
+extern "C" int dsv41_argmax_sliced_rows(
+    const float* v, int n, int idx_off, int row_stride, int* out, unsigned long long* packed,
+    int* pos_ctr, unsigned long long* const* staging_tbl, unsigned* const* ready_tbl,
+    unsigned* epoch, unsigned long long* staging_local, const unsigned* ready_local, int world,
+    int rank, int rows, long stride_bytes, cudaStream_t s) {
+    if (n <= 0 || world <= 0 || rows <= 0) return (int)cudaErrorInvalidValue;
+    if ((long)rows * 8 > stride_bytes) return 1;  // the keys must fit the v5 slot
+    // One local reduce per row, at the single-row kernel's own geometry (grid
+    // 1 x 1024): the slice's packed key already carries the global index, so the
+    // exchange only has to take the max over the ranks.
+    for (int r = 0; r < rows; r++) {
+        argmax_kernel<<<1, 1024, 0, s>>>(v + (size_t)r * (size_t)row_stride, out + r, n, nullptr,
+                                         idx_off, packed + r);
+    }
+    cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return (int)e;
+    argmax_xchg_v5_rows_kernel<<<1, 1, 0, s>>>(packed, staging_tbl, ready_tbl, epoch,
+                                               staging_local, ready_local, out, pos_ctr, world,
+                                               rank, rows, stride_bytes);
     return (int)cudaGetLastError();
 }
 

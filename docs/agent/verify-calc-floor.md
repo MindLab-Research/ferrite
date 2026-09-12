@@ -57,7 +57,7 @@ fp4 = 0.5B/元素 + scale(o·k/32)，bf16 = 2B，f32 = 4B。
 | 4 | compressor 投影<br>(4 源层) | 3×(wkv+wgate f32 512×5120×4B=10.49MB×2) + 1×(wkv)=10.49MB = 73.4MB；`compress_proj_rows` 逐行 | 367.0 | 73.4 | 0.010 | 0.55 | 667 GB/s | 2.8× | ⚪ 小肉 |
 | 5 | **indexer 权重**<br>(8 层) | 8×(wq_b 4096×1280×2B=10.486MB + wp 32×5120×2B=0.328MB) + 4×(wk 128×512×2B=0.131MB) = 87.0MB；`indexer_rows_one` 逐行 | 435.2 | 87.0 | 0.012 | 2.50 | 174 GB/s | 6.3× | 🟠 有肉 |
 | 6 | **attention KV 读**<br>(DSA ring, f32) | 每行每层 = (win + min(clen,512)) 行 × 512 × 4B；P≥2k 后 topk 封顶 ⇒ 2L×128 + 38L×640 = 24576 行/行·全层<br>+ index_k 读 5×8×min(clen,512)×128×4B = 10.5MB | 262.1 | 262.1 | 0.037 | ~2.80 | ~94 GB/s | ~4× | 🟠 有肉 |
-| 7 | **head**<br>[vocab,dim] bf16 | 129280×5120×2B = **1323.8MB**（`Shard::Replicated`，每卡全量）<br>`VERIFY_HEAD_FOLD` 默认 **0** ⇒ 逐行 ×5 | **6619.1** | 165.5<br>(折叠+切分) | 0.024 | **1.49** | 4.44 TB/s | **30×** | 🟠 **最便宜的肉** |
+| 7 | **head**<br>[vocab,dim] bf16 | 129280×5120×2B = **1323.8MB**（`Shard::Replicated`，每卡全量）<br>`VERIFY_HEAD_FOLD` 默认 **0** ⇒ 逐行 ×5 | **6619.1** | **992**<br>(仅切分，见 §补充 ⑤) | 0.024 | ~1.12 | — | **6.7×** | 🟢 **切分已实施**；折叠（165.5MB，再 6×）待 K 序 parity |
 | 8 | engram (2 层) | 2×(wkv 25600×6144 fp8 = 157.3MB + scale) + gather 24×256B×5行 | 315.0 | 315.0 | 0.045 | 0.42 | 750 GB/s | 2.0× | ⚪ 无肉 |
 | 9 | **MoE gate**<br>(router) bf16 | 40L × 384×5120×2B = 3.93MB/L；`ROW_FOLD_GATE` 默认 **OFF** ⇒ 逐行 ×5 | 786.4 | 157.3 | 0.022 | **3.44** | 229 GB/s | **5.0×** | 🟠 **有肉** |
 | 10 | hc 权重 f32 | 40L × 2 × (24×20480×4B = 1.966MB) = 157.3MB（`hc_mixes` 已带 rows=m） | 157.3 | 157.3 | 0.022 | 2.96 | **53 GB/s** | 3.0× | 🟡 有肉 |
@@ -137,7 +137,7 @@ fp4 = 0.5B/元素 + scale(o·k/32)，bf16 = 2B，f32 = 4B。
 | **②** | **MoE gate 行折叠**（`DSV41_ROW_FOLD_GATE=1`）+ **indexer 多行**<br>`gemv_bf16_mrows(nrows=m)` 已是现成核（`ferrite_gemv_bf16_nt`，与 v2 逐位同序）；`indexer_rows_one` 的 `lin` 改 `proj_mrows` | `chain_dev.rs:7188` / `:6826` | **3.44 → 0.69ms（−2.75ms）**<br>+ indexer −0.6ms | **高**（gate，flag 已存在）/<br>中（indexer） | **2.3** |
 | **③** | **sparse_attn 的 `b·m` 单发**<br>launcher 已支持 `grid=(b*m, h)` 且 split 默认 ON；把行循环折成 `b=1, m=5` 一发（split+merge 各一）⇒ 400 核 → 80 核；**前置**：行内 `clen_rows_r` 快照（因为每行的 `*clen` 不同——这正是 AGENTS.md 里 B1 的因果修复点） | `chain_dev.rs:6482` / C launcher `dsv41_sparse_attn` | **~2.80 → 1.10ms（−1.7~2.1ms）** | 中（依赖 B1 的行本地 clen） | **2.2** |
 | 4 | 路由专家的**核效率**（cp.async/TMA/tcgen05；现状 80% issue 停等在 LUT smem gather） | `dsv41_experts_mxf4.cu` | **8.30 → 1.5~2.5ms（−5.8~6.8ms）** | **低-中**（历史 5 次尝试失败，M=128 mxf4 实测 16.8GB/s） | 2.1 |
-| 5 | **head 折叠 + 词表切分**（`VERIFY_HEAD_FOLD=1` + 多行跨卡 argmax，TODO#3） | `chain_dev.rs:4094` / `:970` | **1.49 → 0.05ms（−1.44ms）** | **最高**（两个部件都已实现/已实测 48.5µs） | 1.4 |
+| 5 | ~~**head 折叠 + 词表切分**（`VERIFY_HEAD_FOLD=1` + 多行跨卡 argmax，TODO#3）~~<br>→ **已实施：词表切分**（`DSV41_VERIFY_HEAD_SLICED=1` 默认 ON，逐行 `gemv_bf16(n=seg)` + `dsv41_argmax_sliced_rows` 一次 v5 round 批 m 行）；**折叠仍未做**（mrows 是 v2 核、与 eager 的 v1 核 K 序有差 ⇒ 数值改动，`FOLD` 保持默认 OFF） | `chain_dev.rs::verify_head_geom` / `kernels/cuda/dsv41_kernels.cu::dsv41_argmax_sliced_rows` | **1.49 → ~0.19ms（−1.3ms）**；折叠的额外 6×（→0.05ms）**未拿** | **切分：高**（每行与 eager 同一 v1 核，逐位同源；跨卡一次 round）<br>折叠：低（需先证 K 序 parity） | — |
 | 6 | hc 链融合（`hc_mixes` 尾部 / collapse / post 并核） | `dsv41_glue.cu` | **2.96 → 1.00ms** | 中 | 1.0 |
 
 **补充说明（诚实排序）**：若按「把握×收益」严格排，`⑤ head 折叠+切分` 的加权（1.4）低于 ①②③，
