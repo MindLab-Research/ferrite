@@ -2943,19 +2943,21 @@ impl<'a> DevChain<'a> {
         );
 
         // Bisect gate (DSV41_DSPARK_MODE): "draft" runs the draft only,
-        // "verify" skips the draft and feeds a constant block — for localising
-        // a wedge between the two halves. Default "full".
+        // "verify" skips the draft and feeds a constant block, "step" runs the
+        // armed step only (tap hook in-graph, no draft/verify) — for localising
+        // a wedge. Default "full".
         static BISECT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
         let bisect = *BISECT.get_or_init(|| {
             match std::env::var("DSV41_DSPARK_MODE").as_deref() {
                 Ok("draft") => 1u8,
                 Ok("verify") => 2u8,
+                Ok("step") => 3u8,
                 _ => 0u8,
             }
         });
 
         // 1. the snapshot, BEFORE the step that moves the counter
-        let host_mirrors = if bisect == 1 {
+        let host_mirrors = if bisect == 1 || bisect == 3 {
             Vec::new()
         } else {
             self.dspark_snapshot(pos_ctr, m)?
@@ -2970,7 +2972,7 @@ impl<'a> DevChain<'a> {
         // the same one the host reference's `forward_spec(.., start_pos)` uses.
         let t = std::time::Instant::now();
         dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
-        let drafts = if bisect == 2 {
+        let drafts = if bisect >= 2 {
             [token; DSPARK_DRAFTS]
         } else {
             dspark.draft_forward(token, pos)?;
@@ -2982,7 +2984,7 @@ impl<'a> DevChain<'a> {
         //    block to the ring at `pos + 1 + j` and runs the block's compressor —
         //    all of which step 8 undoes.
         let t = std::time::Instant::now();
-        let rows = if bisect == 1 {
+        let rows = if bisect == 1 || bisect == 3 {
             Vec::new()
         } else {
             self.step_rows(&drafts)?
@@ -2995,14 +2997,16 @@ impl<'a> DevChain<'a> {
         self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
 
         let mut verify_out = [0u32; DSPARK_DRAFTS];
-        if rows.len() != DSPARK_DRAFTS {
+        if bisect == 0 && rows.len() != DSPARK_DRAFTS {
             return Err(FerriteError::Config(format!(
                 "dspark_shadow_step: step_rows returned {} rows for a {DSPARK_DRAFTS}-row \
                  verify block",
                 rows.len()
             )));
         }
-        verify_out.copy_from_slice(&rows);
+        if rows.len() == DSPARK_DRAFTS {
+            verify_out.copy_from_slice(&rows);
+        }
 
         // 8. the accept arithmetic (host, no device traffic).
         let mut acc = 0usize;
