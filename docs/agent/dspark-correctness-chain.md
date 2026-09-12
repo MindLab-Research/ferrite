@@ -1816,3 +1816,17 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 - accept 5.0 × step 12.5ms = 400（sglang 的 accept 水平）
 
 **当前战役的可达预期**：150-250 tok/s（accept 1.5-2.0 + step 15-20ms）
+
+## tcgen05 冒烟测试的 Stage 0/1 结果（143ab693）
+
+**Stage 0（预检）**：✓ 全部通过（node 可达、.so/binary 存在、无 serve、GPU 空闲）
+**Stage 1（符号预检）**：✓ **全部 5 个符号存在**——tcgen05 e4m3 grouped 路径**可以派发**！
+- dsv41_expert_act_e4m3_cap ✓
+- dsv41_expert_gemm_e4m3_grouped ✓
+- dsv41_route_group ✓
+- dsv41_route_gather_rows ✓
+- dsv41_route_scatter_rows ✓
+
+**Stage 2**：脚本 bug（`tag: unbound variable`——set -u 捕获未设置变量），手动跑替代（f15ecd37）
+
+**意义**：tcgen05 kernel 已编译进 .so，5-gate 链的前置条件全部满足。首次 GPU 冒烟即将验证正确性。
