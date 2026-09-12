@@ -3245,3 +3245,30 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 | lazy（已平台）| ~71ms | ~83 tok/s | ~0（launch 常数已到底）| ❌ 数学不可能 |
 | batched（Plan B 后）| ~40ms? | ~? | -12~15ms（SH_PAIR+mrows+tcgen05）| ✅ 如果 Plan B 解锁 |
 | batched 理论 | ~12.5ms | 480 tok/s | weight-stationary | ✅ |
+
+## ⚠️ Plan B SWALLOW 测试中间结果（0dfe5bf9）——仍然 ar5-hang！
+
+**观察**（测试还在跑）：
+- **10,099 ar5-hang 行**（比 Plan A+C 的更严重）
+- k_acc: 5 1 3 1（4 步后 hang）
+- 输出文件存在（curl 可能完成了部分输出）
+
+**判定**：
+1. **Plan B（unanimity-or-direct）没有修复 ar5-hang**——臂分歧不是根因（或不是唯一原因）
+2. **无图模式也在计数任务 hang**（937）——这暗示根因与图无关
+3. **可能的根因**（planb-swallow-readiness 分析中）：
+   - SWALLOW 的 epoch 管理在高 accept（多变 committed rows）下破坏
+   - 吞并的主链步的 AR epoch 没有被正确记账
+   - 或者 Plan B 的投票本身引入了新的时序问题
+
+**SWALLOW 的 ar5-hang 修复历史**（全部失败）：
+| 尝试 | gap/行数 | 结果 |
+|---|---|---|
+| 修复 1（argmax 守卫）| 22 | ❌ |
+| 回退 | 3 | ❌ |
+| Plan A+C（对称化+warmup）| 23 | ❌ |
+| 无图（出师表）| 0 | ✓ 低 accept OK |
+| 无图（计数）| 937 | ❌ 高 accept hang |
+| **Plan B（臂投票）** | **10,099** | **❌ 更严重** |
+
+**结论**：SWALLOW 的 ar5-hang 不是臂分歧问题。高 accept 场景下的 epoch 对齐有更深的结构性 bug。
