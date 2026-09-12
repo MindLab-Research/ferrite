@@ -7730,3 +7730,23 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **TMA Phase 1（tma-phase1-impl 实施中）是 swapAB 路径的最后希望**：bulk DMA 不占 SM 的 LSU，理论上能突破 staging 瓶颈。但同样面临隔离→serve 翻译风险。
 
 **会话验证最优：6.17ms = 162.1 tok/s（+115.4%）**
+
+### hc_dots_late 优化定案（dl-kernel-optim，2026-09-12 18:30）
+
+**前提纠正**：LATE 的 10.7µs 不是 sinkhorn 算术（20 轮只有 ~2µs）——是独立 launch + 1024-thread block slot 排队 + 尾部效应（merge 版已消掉）。
+
+**真成本结构**：
+- grid=(mix=24, rows=1)，block=128，dynamic smem=160KiB → **1 blk/SM、只 4 warps**
+- 每 launch 搬 3.84MiB，其中 **x 行被 24 块各 stage 一遍 = 1.92MiB 纯冗余**
+- staging 531 GB/s（延迟受限 ~6µs）；dot smem 带宽受限 ~0.7µs
+- **SM·µs 成本**：23 个非 elected 块 dot 完即释放——LATE tail 只占 1 SM（时长问题非争抢问题）
+
+**机会排序**：
+| # | 机会 | 预期 | 状态 |
+|---|---|---|---|
+| 1 | DSV41_HC_DOTS_T=256/512（env 已存在） | −1~1.5µs/launch | 零成本先跑 |
+| 2 | K-chunk cp.async（smem 160→≤64KiB，4 blk/SM） | 14.9→8-9µs | dl-kchunk-design 设计中 |
+| 3 | sinkhorn 单 lane 16 寄存器 | ~1µs | 低优先 |
+| 4 | 减 sinkhorn 轮数 | — | **不做**（语义变更） |
+
+**打 6 折预期：0.15-0.3ms/步**（隔离→serve 铁律）。
