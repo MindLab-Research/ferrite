@@ -1552,3 +1552,12 @@ s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-iden
 
 **单轴都不够**：只提 accept（22.56ms）= 266 ❌；只降步时（2.214 tok）= 303 ❌
 **必须双轴**：accept ~2-3 + 步时 ~8-12ms → 400 ✓
+
+## 官方脚本的测试结论（official-test-prep）
+
+**官方 generate.py 是纯单步自回归 decode——没有 MTP/DSpark 投机路径**。一次 forward 只出一个 token。所以：
+- ❌ 官方脚本测不出 accept rate（不存在投机路径）
+- ✅ 官方脚本可以测纯 decode 步时（但 PyTorch 很慢——无 CUDA graph 优化）
+- **用户的"官方脚本测一下"：测的是纯 decode 速度（基线），不是 accept**
+
+**对我们的意义**：accept 的真实基线不存在于官方参考——只能在我们的实现上测。用户校准（accept 2-3，上限 ~3）是正确的工作假设。
