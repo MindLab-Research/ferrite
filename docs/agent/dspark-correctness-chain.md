@@ -5703,3 +5703,22 @@ DSV41_V5_WITNESS=1                 # P1 设备侧证词（kernel 自己记录！
 **下一步**：找到 OOB 写的源头（哪个 kernel 在 swallowed 臂中越界写）
 - 候选：batched verify (m=6) 的某个 kernel / SWALLOW 的 snapshot-rollback / 某个 m=6 特有的 kernel
 - 工具：compute-sanitizer memcheck（枚举所有 OOB 写）
+
+## m=6 AR bounds 判决——排除！OOB 来自别处！
+
+**m6-ar-bounds-verify 的判决**（7.1KB 完整审查）：
+- **m=6 越界——排除（确定，非概率）**
+- slot bytes = max(hc_dim, 6*dim)*4 = 122880 B（stride=30720 floats）
+- m=6 的 n = 30720 = stride——**恰好槽尾，零余量，不越界**
+- 到 canary 需 m≥7（越界 20480B）——**VERIFY_ROWS=6 不会发生**
+- 发现：v5 路径缺 len ≤ bytes 守卫（v2 有）——待补但不触发
+
+**新洞察——什么写零？**
+canary 从 0xdeadbeef → **0x00000000**——不是随机数据而是**写零**！
+`dev.zero_at(staging.ptr, ctr_at + 64)`（tp.rs:354）是 Collective 的初始化清零——
+**如果某处再次调用 zero_at——就是根因！**
+
+候选：
+1. **chain.reset()**（chain_dev.rs:4305）——是否碰 staging？
+2. **dspark_rollback/dspark_snapshot**——是否碰 staging？
+3. **某个 kernel 的 memset/zero 越界**
