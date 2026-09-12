@@ -5187,6 +5187,23 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 2. **真正激活 v5_ledger**（步前打印已修复但 gate 要进脚本）
 3. **验证 gate 生效**：`/proc/PID/environ` 检查（1 秒成本）
 
+### ✅ 已实施（工部 · 2026-09-12）——第 10 次修复的三件全部落地
+
+上面"从未实施"的四层证据，逐条已被消掉：
+
+| # | 位置 | 落地的内容 |
+|---|---|---|
+| 1 | `kernels/cuda/ferrite_kernels.cu:9129` | `dsv41_v5_epoch_pad_kernel`（紧跟 `p2p_ar_pubred_v5_kernel` 之后）+ C 入口 `dsv41_v5_epoch_pad`（`:9227`）。一次跳 `pad` 轮，向每个 peer 的 ready 行写 `e+pad`，并把 A4 广播字 `epoch+1` 一起推进 |
+| 2 | `device.rs:396 / :1336 / :3238` | `Kernels.v5_epoch_pad` 字段 + `ko!` 符号绑定 + `Device::v5_epoch_pad()` 薄封装（`Ok(false)` = `.so` 无该符号） |
+| 3 | `chain_dev.rs:8633` | **真正的调用点**：`dspark_spec_swallowed` 的 snapshot 之后、`import_tap` 之前，`if swallow_epoch_pad() { self.v5_epoch_pad_swallow(swallow_missing_rounds(cfg.n_layers))? }` —— pad = `2*n_layers+1` = 81 |
+| 4 | `scripts/batched_400_v2.sh:154` | GATES 含 `DSV41_SWALLOW_EPOCH_PAD=1` 与 `DSV41_V5_LEDGER=1`（`B400_V5_LEDGER=0` 仅供吞吐跑脱掉 ledger） |
+
+**两处刻意的设计决定（与设计文档的差异，已上报）**：
+- **`rc == 1` 的 "declined" 约定没有照抄**：pad 没有 decline 条件，把真实 CUDA 错误当"declined"吞掉正是"幻影修复"的失败模式。只有"符号不存在"返回 `Ok(false)`，且**一次性大声打印** `[swallow-pad] ... the swallowed arm is NOT padded`（`warn_epoch_pad_missing_symbol`）。
+- **符号绑定落在 `device.rs` 而非 `kernels.rs`**：实际加载的 ABI 是 `device.rs` 的 `Kernels` 结构（`argmax_sliced_rows` 等 v5 入口都在此），`kernels.rs` 是无人引用的 `dsv41_kernels.cu` 声明模块，且本 kernel 在 `ferrite_kernels.cu`。
+
+**尚未验证（诚实标注）**：`.cu` 未在本机编译（无 nvcc，需 GPU 机 `bash build.sh 103a`）；`cargo check --workspace` EXIT=0。pad 的正确性论证依赖设计 §3.2 的四条（绝对单调 stamp ⇒ 一次跳足够；无 staging 读者；81 为奇数保 parity；A4 广播字同步），**必须由 T1/T3 实测收口**。
+
 ## D1 观测测试的分析框架（f063279f 跑中）
 
 **测试**：SWALLOW + V5_LEDGER=1（无 pad——纯观测）+ 短 prompt（1-50，200 max tokens）
@@ -5226,3 +5243,27 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 **如果第 10 次成功**（0 hang + delta 165）：
 - batched 路径解锁！
 - SH_PAIR M=6（-4.9~7.9ms）→ mrows 族 → tcgen05 → **400 冲刺！**
+
+## D1 观测的初始数据（f063279f——观测生效！68 行 v5-ledger！）
+
+**关键观察**：
+```
+[v5-ledger-pre] pos=16 rank=1 epoch=1328 arm=pre
+[v5-ledger-pre] pos=16 rank=4 epoch=1328 arm=pre
+[v5-ledger-pre] pos=16 rank=2 epoch=1328 arm=pre
+[v5-ledger-pre] pos=16 rank=5 epoch=1328 arm=pre
+[v5-ledger-pre] pos=16 rank=3 epoch=1328 arm=pre
+```
+
+**判定**：
+1. **D1 观测生效**（68 行——不是第 9 次的 0 行！）
+2. **pos=16 时所有 rank 同步**（epoch=1328 一致）——初始状态同步！
+3. **分歧在后续步骤中发展**——"漂移 × 步数"假设的方向正确！
+4. **观测本身没有改变行为**（serve 正常运行）
+
+**待完整数据分析**：
+- 每步每 rank 的 epoch delta（步间差）
+- 分歧的起始步（哪个 pos 开始出现跨 rank 差？）
+- 分歧的速率（每步差多少？±1？±3？）
+
+**这将是第 10 次修复的数据基础**——真实的轮次足迹，不是推测！
