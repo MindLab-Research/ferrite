@@ -2828,3 +2828,27 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 
 **结果**：PLANB-CRASH（curl 超时——可能是 serve 启动慢），但 **0 ar5-hang + 0 DISAGREED** ✓
 **判定**：Plan B（unanimity-or-direct）可能工作——需要重测确认（serve 可能启动晚了）
+
+## 🎯🎯 关键发现：lazy 阶梯遗漏了 draft P3c 图化（-3.3ms——400 的最后一块拼图！）
+
+**lazy-verify-optimization 的 5 步阶梯遗漏了 L6 = DRAFT_GRAPH**：
+| 步 | 项 | 节省 | 状态 |
+|---|---|---|---|
+| L1 | hc 融合 | -2.9~4.2ms | ✓ Wave 1 已含 |
+| L2 | sync 收敛 | -0.7ms | 🔄 subagent 实施中 |
+| L3 | SH_PAIR M=1 | -1.1~1.3ms | 🔄 测试中（57090747）|
+| L4 | tcgen05 | -1.9~2.1ms | 🔄 对齐修复待重测 |
+| L5 | draft P3A+MARKOV | -0.7~0.8ms | 🔄 subagent 准备中 |
+| **L6** | **draft P3c 图化** | **-3.3ms** | **✅ 已实施！DSV41_DRAFT_GRAPH gate 存在但从未 GPU 测试** |
+
+**修正后的阶梯**：22.56 - 0.7 - 1.2 - 2.0 - 0.8 - 3.3 = **14.6ms**
+**@ accept 5**：6/0.0146 = **411 tok/s ✓✓ 过 400！**
+
+**draft P3c 图化的细节**（draft-p3c-graph subagent 的产出）：
+- draft_forward 拆为 prologue（不捕获）+ 4 臂 dispatch + draft_body（捕获的 kernel 序列）
+- D2 修复：seed_window 的 ring slot 从 host 计算改为 device 计数器
+- 120→1 launch
+- 前提：pos >= win（win=128，出师表 ~130 步刚好够）
+- gate：DSV41_DRAFT_GRAPH=1（默认 OFF）
+
+**下一步**：在 lazy verify 配置中加 DSV41_DRAFT_GRAPH=1 测试！
