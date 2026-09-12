@@ -863,26 +863,29 @@ fn head_slice() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
 }
 
-/// `DSV41_VERIFY_HEAD_FOLD=0` makes the verify's head run the SAME per-row
-/// `gemv_bf16` the single-row path uses instead of the folded multi-row
-/// `head_gemv_bf16_mrows`.
+/// `DSV41_VERIFY_HEAD_FOLD=1` re-enables the folded multi-row
+/// `head_gemv_bf16_mrows` for the verify's head. **Default OFF (the per-row
+/// `gemv_bf16`) because the folded path is measurably WRONG for this model.**
 ///
-/// The folded kernel's header argues bit-identity with "the single-row launch it
-/// replaces" (C1-C5), but the production single-row path is NOT that program:
-/// `gemv_bf16` dispatches to `ferrite_gemv_bf16_v2` (`gemv_bf16_nt_kernel`:
-/// lane-strided uint4 loads, 8-wide FMA groups, WPR split-K), while the folded
-/// kernel walks `for (c = lane; c < k; c += 32)` scalar `__fmaf_rn` pairs. Two
-/// different accumulation orders means a ~1e-3 rounding gap — enough to flip
-/// near-tie argmaxes, measured as `verify_out[0] == next` (the "echo") on 33% of
-/// verify rows, which IS the text repetition (`emitted = [next] + verify_out[..]`
-/// then writes `next` twice). Default ON (the fast path) until the folded kernel
-/// adopts v2's K order. Read once and cached — the house rule for hot-path gates.
+/// The folded kernel's header argued bit-identity with "the single-row launch
+/// it replaces" (C1-C5); the production single-row head is
+/// `dsv41_gemv_bf16` → `gemv_bf16_kernel` (`gemv_bf16_v2_wanted(n)` needs
+/// `n < 2048`, and the head's `n = vocab_size = 129280`, so the v2/nt path is
+/// NOT taken — `folded-head-korder` established this from the code). The folded
+/// kernel's own scalar `for (c = lane; c < k; c += 32)` chain differs from it in
+/// the fp8/fma pairing details, and the measured effect on serve is large:
+///   FOLD=1: `verify_out[0] == next` (the echo) on 33% of verify rows
+///   FOLD=0: 9%   (22 steps, 出师表) — and the text's adjacent repeats drop 6 → 4.
+/// The echo is what makes `emitted = [next] + verify_out[..]` write `next` twice.
+/// Cost of FOLD=0: the head's 1262 MB weight is streamed ~m times instead of once
+/// (~+0.7 ms/step) — correctness over that, until the folded kernel is proven
+/// bit-identical to v1. Read once and cached (the house rule for hot-path gates).
 fn verify_head_fold() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
         std::env::var("DSV41_VERIFY_HEAD_FOLD")
             .map(|v| v != "0")
-            .unwrap_or(true)
+            .unwrap_or(false)
     })
 }
 
@@ -1133,6 +1136,20 @@ fn cublas_m1() -> bool {
 fn vrow0_probe() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_VROW0_PROBE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_SWALLOW_STEP=1` arms the "swallowed main-chain step": from the SECOND
+/// spec round on, [`DevChain::dspark_spec_step`] drops the standalone
+/// `step_dev` (6.15 ms) and lets the verify's 6-row `[anchor, d1..d5]` block
+/// carry the anchor's forward instead — the block pays one extra row (~1.6 ms)
+/// and saves the whole step. Default OFF so the two paths can be A/B'd in one
+/// session (the switch is read once per process, like every gate here).
+///
+/// The FIRST round of a request always runs the legacy path: it is what
+/// supplies the very first tap (see [`DevChain::spec_primed`]).
+fn swallow_step() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SWALLOW_STEP").map(|v| v != "0").unwrap_or(false))
 }
 
 /// How many logits each row reports: `DSV41_VROW0_TOPK`, default 5.
@@ -1432,6 +1449,17 @@ pub struct DevChain<'a> {
     /// layer walk. Armed only around the spec step's `step_rows` call, so the
     /// shadow path pays nothing.
     spec_capture: bool,
+    /// `DSV41_SWALLOW_STEP` only: the spec step's bootstrap flag. The FIRST
+    /// round of a request runs the legacy path (the standalone `step_dev`
+    /// supplies the anchor's forward AND the tap); every later round SWALLOWS
+    /// that step and lets the verify's 6-row `[anchor, d1..d5]` block carry the
+    /// anchor's forward instead (see [`Self::dspark_spec_step`]).
+    ///
+    /// Cleared by [`Self::reset`], so a new request re-bootstraps. Deliberately
+    /// NOT part of any `KvSnapshot`: it describes THIS chain's step sequence,
+    /// and the dspark spec path is explicitly mutually exclusive with the KV
+    /// prefix cache (see `serve.rs`'s gate).
+    spec_primed: bool,
     // ---- the DSpark verify's own CUDA graph (`DSV41_VERIFY_GRAPH=1`) ----
     //
     // `step_rows` is ~7000 launches per verify (40 layers x ~170 nodes), and
@@ -1790,6 +1818,7 @@ impl<'a> DevChain<'a> {
             eng_map,
             moe_add_in: vec![None; cfg.n_layers],
             spec_capture: false,
+            spec_primed: false,
             verify_graph: None,
             verify_graph_m: 0,
             verify_graph_failed: false,
@@ -2077,6 +2106,9 @@ impl<'a> DevChain<'a> {
         self.verify_graph_m = 0;
         self.verify_graph_failed = false;
         self.verify_dry_done = false;
+        // The next request's first spec step bootstraps again (its standalone
+        // `step_dev` is what supplies the very first tap).
+        self.spec_primed = false;
         self.verify_captures = 0;
         self.verify_replays = 0;
         self.decode_steps = 0;
@@ -3832,10 +3864,15 @@ impl<'a> DevChain<'a> {
     /// * everything in `s.*_r`: the m-row scratch is the verify's own.
     ///
     /// `pub(crate)` for the parity self-test ([`crate::dsv41::dspark_parity`]),
-    /// which needs the same save/restore pair around its own `step_rows` call;
-    /// it passes the position the real step ran at (the counter's value BEFORE
-    /// the step, which is what the slot arithmetic below keys off).
-    pub(crate) fn dspark_snapshot(&self, pos: usize, m: usize) -> Result<Vec<(usize, usize)>> {
+    /// which needs the same save/restore pair around its own `step_rows` call.
+    ///
+    /// `pos_base` is the position of the block's ROW 0 — the row `j` of the
+    /// block sits at `pos_base + j`. The legacy 5-row block (`[d1..d5]`) starts
+    /// at one past the single-row step's own position (`pos + 1`), while the
+    /// swallowed 6-row block (`[anchor, d1..d5]`) starts AT the step's position
+    /// (the anchor's forward IS row 0) — which is the one number the two callers
+    /// pass differently.
+    pub(crate) fn dspark_snapshot(&self, pos_base: usize, m: usize) -> Result<Vec<(usize, usize)>> {
         let cfg = self.cfg;
         let hd = cfg.head_dim;
         let win = cfg.window_size;
@@ -3843,14 +3880,13 @@ impl<'a> DevChain<'a> {
         debug_assert!(m <= VERIFY_ROWS, "the snapshot is sized for a {VERIFY_ROWS}-row block");
         // P0: ONE launch per layer replaces the per-slot `cudaMemcpyAsync` loop
         // (40 owners x m slots per direction). The kernel's slot is
-        // `(pos_base + j) % win`, and `pos_base` is `(pos + 1) % win`: that is
-        // the SAME residue as `(pos + 1 + j) % win` for every `j < win`
-        // (`m <= VERIFY_ROWS` << `win`), and the reduction keeps the argument
-        // inside `c_int` for positions past 2^31. The bytes are identical
-        // either way; `fused == false` (a stale .so without the kernels) keeps
-        // the original per-slot path.
+        // `(pos_base + j) % win`: that is the SAME residue as `(pos_base + j) % win`
+        // for every `j < win` (`m <= VERIFY_ROWS` << `win`), and the reduction
+        // keeps the argument inside `c_int` for positions past 2^31. The bytes are
+        // identical either way; `fused == false` (a stale .so without the kernels)
+        // keeps the original per-slot path.
         let fused = self.dev.supports_dspark_snapshot();
-        let pos_base = ((pos + 1) % win) as i32;
+        let base = (pos_base % win) as i32;
 
         for &l in &self.ring_owners() {
             let ring = self.layers[l].ring.ptr as *const f32;
@@ -3858,10 +3894,10 @@ impl<'a> DevChain<'a> {
                 .wrapping_add(l * VERIFY_ROWS * hd);
             if fused {
                 self.dev
-                    .dspark_ring_save(snap, ring, pos_base, win as i32, hd as i32, m as i32)?;
+                    .dspark_ring_save(snap, ring, base, win as i32, hd as i32, m as i32)?;
             } else {
                 for j in 0..m {
-                    let slot = (pos + 1 + j) % win;
+                    let slot = (pos_base + j) % win;
                     self.dev.memcpy_d2d(
                         snap.wrapping_add(j * hd) as *mut c_void,
                         ring.wrapping_add(slot * hd) as *const c_void,
@@ -3936,11 +3972,11 @@ impl<'a> DevChain<'a> {
     /// [`Self::dspark_snapshot`] around its own `step_rows` call.
     pub(crate) fn dspark_rollback(
         &mut self,
-        pos: usize,
+        pos_base: usize,
         m: usize,
         host: &[(usize, usize)],
     ) -> Result<()> {
-        self.dspark_rollback_keep(pos, m, 0, host)
+        self.dspark_rollback_keep(pos_base, m, 0, host)
     }
 
     /// [`Self::dspark_rollback`] with a KEEP prefix: the first `keep` rows of the
@@ -3955,9 +3991,12 @@ impl<'a> DevChain<'a> {
     /// play those rows forward again ([`Self::compress_replay`]).
     ///
     /// `keep == 0` is exactly the shadow path's full rollback.
+    ///
+    /// `pos_base` is the block's ROW 0 position (see [`Self::dspark_snapshot`]):
+    /// row `j` lives at slot `(pos_base + j) % win`.
     pub(crate) fn dspark_rollback_keep(
         &mut self,
-        pos: usize,
+        pos_base: usize,
         m: usize,
         keep: usize,
         host: &[(usize, usize)],
@@ -4931,16 +4970,24 @@ impl<'a> DevChain<'a> {
     }
 
     /// Commit the accepted prefix of a verify block: undo everything the block
-    /// wrote past row `keep`, then move the engine forward by `keep + 1`.
+    /// wrote past row `keep`, then move the engine forward by those kept rows.
     ///
-    /// `keep` is the accepted draft-prefix length (`k_acc`). The block is
-    /// `[anchor, d1..d5]` at `pos+1 .. pos+6`; row 0 (the anchor) is ALWAYS valid
-    /// — its token is what the engine emits next — and row `j >= 1` is valid iff
-    /// `d_j` was accepted, i.e. iff `j <= k_acc`. Row `k_acc` is nevertheless NOT
-    /// kept: its position is the NEW `pos_ctr`, so that token has not been
-    /// consumed yet and the next step's `step_dev` appends its KV. Hence
-    /// `keep = k_acc` rows, at positions `pos+1 .. pos+k_acc`, and
-    /// `pos_ctr = pos + k_acc + 1`.
+    /// `keep` is the number of rows the block KEPT, counted from row 0 — and row
+    /// 0 sits at `pos_base`, so the kept rows are the positions
+    /// `pos_base .. pos_base + keep` and the new `pos_ctr` is `pos_base + keep`.
+    /// That formulation is layout-independent on purpose: the two blocks differ
+    /// only in where row 0 is and in how many rows are valid.
+    ///
+    /// * the LEGACY 5-row block `[d1..d5]` sits at `pos+1 .. pos+5` (row 0 is
+    ///   `d1`) and `keep = k_acc`: the accepted drafts' KV plus nothing else. Row
+    ///   `k_acc` (= the first REJECTED draft) is not kept — its position is the
+    ///   new `pos_ctr`, so that token has not been consumed yet and the next
+    ///   step's `step_dev` appends its KV. `pos_ctr = pos + k_acc + 1`.
+    /// * the SWALLOWED 6-row block `[anchor, d1..d5]` sits at `pos .. pos+5` (row
+    ///   0 IS the anchor, always valid) and `keep = k_emit = k_acc + 1`: the
+    ///   anchor's row plus the accepted drafts. Row `k_emit` (= the first
+    ///   rejected draft) is not kept, for the same reason above.
+    ///   `pos_ctr = pos + k_emit`.
     ///
     /// What the block left behind, and what happens to it:
     ///
@@ -4958,25 +5005,24 @@ impl<'a> DevChain<'a> {
     ///   (`step_rows`' per-row argmax takes a NULL counter), so it is set here.
     fn dspark_commit(
         &mut self,
-        pos: usize,
+        pos_base: usize,
         m: usize,
         keep: usize,
         host: &[(usize, usize)],
     ) -> Result<()> {
         // keep == m is a LEGAL full-accept (all 5 drafts right): rollback_keep
         // then restores nothing (every slot it would touch is the committed
-        // prefix's), compress_replay replays all 5 rows, and the counter lands
-        // at pos+6. The old `keep < m` assert would have panicked the debug
-        // build on the best possible step.
+        // prefix's), compress_replay replays all the rows, and the counter lands
+        // at pos_base + m.
         debug_assert!(
             keep <= m,
             "dspark_commit: keep {keep} exceeds the {m}-row block"
         );
-        self.dspark_rollback_keep(pos, m, keep, host)?;
+        self.dspark_rollback_keep(pos_base, m, keep, host)?;
         if keep > 0 {
-            self.compress_replay(pos as i32 + 1, keep)?;
+            self.compress_replay(pos_base as i32, keep)?;
         }
-        self.set_pos_ctr(pos + keep + 1)?;
+        self.set_pos_ctr(pos_base + keep)?;
         Ok(())
     }
 

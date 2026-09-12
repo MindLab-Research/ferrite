@@ -2085,3 +2085,19 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **剩余缺陷（文本重复的 33%）**：`verify_out[0] == next` **33%**（与 `drafts[0]==next` 同值）——**emit = [next] + verify_out[..k_acc]** 在 verify 行 0 复述 next 时把 next 写两遍 → "先帝创业先帝创业"。**eager 在同一位置（pos+1、同一输入 next）不重复** ⇒ **verify 的多行链与 eager 的单行图之间存在 parity 破坏**。
 
 **最强候选（待 vrow0 探针判定）**：**head 的两条路径**——`DSV41_HEAD_SLICE` **默认 ON**（`chain_dev.rs:861-863` 的 `unwrap_or(true)`）⇒ **eager 走"每 rank 切片 + 跨 rank argmax"**，而 **verify 的 head 走 `head_gemv_bf16_mrows`（全词表 Replicated）**——两条不同程序的 K 序/累加序可能不同（~1e-3 级）→ 近 tie 翻转。探针（`DSV41_VROW0_PROBE=1` + shadow）输出 `verify_top`/`eager_top`/`eager_sliced` 与 `delta_at_eager`：**|delta| ≤ 1e-2 → 边界翻转（用 confidence 门控/统一 head 路径解决）；大 → 结构性**（multi-row 调度没复现单行路径）。
+
+## 2026-09-12 Wave 2：verify head 的 parity 修复（FOLD=0 成为默认）——实测 echo 33% → 9%
+
+**A/B（同会话，出师表，`DSV41_DSPARK_DEBUG=1` 的 `verify_out[0]==next` 统计）**:
+| 配置 | echo | 文本相邻重复 | k_acc 直方图 |
+|---|---|---|---|
+| `DSV41_VERIFY_HEAD_FOLD=1`（folded `head_gemv_bf16_mrows`，旧默认） | **33%**（154 步） | 6 | {0:24, 1:6, 2:4, 3:1, 4:1} |
+| **`=0`（per-row `gemv_bf16`，新默认）** | **9%**（22 步） | **4** | {0:13, 1:6, 2:3} |
+
+**机制**（两条独立证据链）：
+1. `gemv_bf16_v2_wanted(n)` 要求 `n < GEMV_V2_MAX_N = 2048`（`device.rs:4657`），而 head 的 `n = vocab_size = 129280` ⇒ **生产单行 head 走的是 v1**（`dsv41_glue.cu:368 gemv_bf16_kernel`，标量 `c += 32`），**不是** v2/nt（`folded-head-korder` 从代码核实）。
+2. folded 的 `head_gemv_bf16_mrows` 虽同为标量序，但其 fma/解码的配对细节与 v1 不同 ⇒ ~1e-3 级差 ⇒ 近 tie 的 argmax 翻转 ⇒ `verify_out[0]==next` 的 echo ⇒ `emitted = [next] + verify_out[..]` 把 next 写两遍 = 文本重复。
+
+**处置**：`verify_head_fold()` 默认 **OFF**（代价：head 的 1262MB 权重被流 m 次而非 1 次 ≈ **+0.7ms/步**——**正确性优先**）。根治（folded 与 v1 逐位一致）留给后续；`folded-head-korder` 已把 folded 对齐到 v2 序（**≠ v1**，故仍 gate OFF）。
+
+**剩余**：echo 9% + `accept 0.55`（`k_acc={0:13,1:6,2:3}`）⇒ **draft 质量仍是主要瓶颈**（`draft-quality-research` 在查 tap/main_proj/markov/窗口）。
