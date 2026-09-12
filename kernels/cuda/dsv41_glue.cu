@@ -422,43 +422,54 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
 // ONCE and folds every row against it.
 //
 // NUMERICS — for ANY m, row r of the m-row launch is BIT-IDENTICAL to the
-// single-row `gemv_bf16_kernel` launch of row r's activation. v1 computes, per
-// output row,
-//     y(row)   = T( SUM_{c = lane, lane+32, ... < k} (float)w[row][c] * x[c]   )
-// with T the fixed shfl_xor tree (off = 16,8,4,2,1) and the lane-local sum a
-// strictly ascending chain of multiply-accumulates. This kernel computes
-//     y(row,r) = T( SUM_{c = lane, lane+32, ... < k} (float)w[row][c] * x[r][c] )
-// so for every (row, r): the SAME expression in the SAME position (C2), over
-// the SAME ascending c sequence with the SAME lane->c mapping (C1), through the
-// SAME reduction tree (C3), with NO cross-row recombination — acc[r] is an
-// independent chain, nothing is ever added across r (C4) — and no K-split or
-// smem fold exists to reorder (C5). `wv` is hoisted out of the r loop because
-// it is a per-c value: the identical decode on the identical value, reused, so
-// C2 still holds (and it is what removes the m-fold traffic).
-// The c step stays `c = lane, lane+32, ...` — one element per lane per step,
-// NOT vectorized to 8 bf16/lane: batching c per lane would reorder the chain
-// and break C1. Vectorizing K is therefore off the table for this kernel by
-// construction; the win is the weight re-read, not the load width.
+// PRODUCTION single-row head GEMV of row r's activation. That reference is
+// `gemv_bf16_nt_kernel`'s (ferrite_kernels.cu:3357) per-token body at WPR == 1
+// — the same body `gemv_bf16_v2_kernel` runs, i.e. the program the head
+// (out_f = 129280) actually gets from `gv2_wpr`/the nt launcher, which return
+// WPR = 1 for out_f >= 16384. Per (output row, token) it computes
+//     y(row,t) = T( SUM_{c = lane*8, lane*8 + 32*8, ... < k} (float)w[row][c..c+7]
+//                      * x[t][c..c+7] )
+// i.e. a lane-local ascending chain of uint4-granular 8-element groups, each
+// group folded as two 4-term FMA groups (`xa.x*f0.x + xa.y*f0.y + xa.z*f1.x +
+// xa.w*f1.y`, then the xb/f2/f3 half), through T = the fixed
+// `__shfl_down_sync(0xffffffff, acc, off)` tree (off = 16,8,4,2,1), ending in
+// `(bias ? bias[row] : 0.f) + acc` (bias is null for the head). This kernel
+// computes exactly that, per row:
+//     y(row,r) = the same expression, over the same lane->c mapping (C1), in the
+//                same position (C2), through the same tree (C3), with NO
+//                cross-row recombination — acc[r] is an independent chain and
+//                nothing is ever added across r (C4) — and no K-split or smem
+//                fold to reorder (C5, see the DOMAIN note: WPR == 1 is what
+//                makes C5 available).
+// The body below is TRANSCRIBED from that kernel, not re-derived from it: same
+// source text in the same position under the same flags is the strongest
+// guarantee that the two compile to the same FMA chain, and a re-derived
+// "equivalent" expression is exactly how the earlier v1-referenced version went
+// wrong (its scalar `__fmaf_rn(wv, x, acc)` chain is v1's program, not the
+// head's).
+// What the m-fold is allowed to change is only the WEIGHT RE-READ: `wv` and its
+// four decodes are hoisted out of the r loop because they are per-c values —
+// the identical decode of the identical bytes, reused M times, so C2 holds and
+// the head is streamed once instead of m times. The row->warp mapping and the
+// grid are not part of the contract either: rows are independent (C4), so which
+// warp computes a row cannot change its value.
 //
-// Two deliberate codegen pins (C6 — build.sh keeps --use_fast_math ON, whose
-// header note records a 4-way unrolled gemv body written with plain operators
-// drifting ~1 ULP/layer):
-//   * the accumulate is `__fmaf_rn`, not a plain `acc[r] += wv * x[...]`. An
-//     m-way independent accumulator set is exactly the extra expression freedom
-//     that invites a fast-math reassociation. __fmaf_rn is the rounding v1
-//     already has — v1's `acc += (float)wr[c] * x[c]` contracts to one FFMA
-//     under fmad=on (the same argument gemv_f32_v2's header carries below) —
-//     and it is opaque to reassociation, so each chain stays ascending.
-//   * the shfl tree keeps v1's source form verbatim: C3 rests on T being
-//     REPRODUCED, and identical source under the same flags is the strongest
-//     guarantee of that. Pinning it would only be able to diverge.
-//
-// ⚠️ DOMAIN OF C1-C5 (perf-review finding 4): the reference is v1's
-// `gemv_bf16_kernel`, and `dsv41_gemv_bf16` only selects v1 for
-// `n >= GEMV_V2_MAX_N` (gemv_bf16_v2 takes the small-n shapes and K-splits,
-// which reorders the f32 sum). Below that threshold a single-row `gemv_bf16` is
-// NOT bit-identical to this kernel's rows -- the parity holds only in the v1
-// domain, so a small-n reuse has to re-derive it rather than inherit it.
+// ⚠️ DOMAIN OF THE PARITY (read before reusing this kernel):
+//   * `out_f >= 16384` (hence WPR == 1). That is `gv2_wpr`'s first branch and
+//     the nt launcher's, and it is what the head (129280) gets. BELOW it the
+//     production GEMV K-SPLITS the row across WPR warps and folds the partials
+//     in shared memory (`sum += part[t][base + j]`, j ascending): a different
+//     program in a different order, so a small-n reuse has to re-derive it
+//     rather than inherit it. The verify head is the only caller and it is deep
+//     inside the WPR == 1 domain.
+//   * `k % 8 == 0` (guaranteed by the launcher's decline below): the uint4/
+//     float4 body needs it for the 16B alignment of `wr + c` AND for the vector
+//     loop's coverage of [0, k).
+//   * build flags: the SAME set build.sh uses for both TUs (`-O3
+//     --use_fast_math`). The 8-element groups above are plain operators, and
+//     the contraction/reassociation the compiler applies to them has to be the
+//     same on both sides — which is why they are transcribed verbatim and why
+//     the reduction tree keeps its source form too.
 //
 // `x` is [m, k] f32 (the verify's `xn_r`), `out` is [m, n] f32 (`logits_r`).
 // M is a template parameter so each row owns a register chain; the launcher
@@ -478,23 +489,53 @@ __global__ void head_gemv_bf16_mrows_kernel(const __nv_bfloat16* __restrict__ w,
         float acc[M];
         #pragma unroll
         for (int r = 0; r < M; ++r) acc[r] = 0.f;
-        // NO #pragma unroll: gemv_bf16_kernel's measured choice, and the m-way
-        // accumulator set is already the register-pressure risk here (the plan
-        // §9 flags the 64-register `__launch_bounds__(256,4)` wall).
-        for (int c = lane; c < k; c += 32) {
-            const float wv = __bfloat162float(wr[c]);   // ONE decode for all M rows
+        // THE K ORDER IS gemv_bf16_nt_kernel's WPR == 1 BODY, TRANSCRIBED (see
+        // the header): same lane -> k mapping (k0 == 0, step 32*8), same uint4
+        // weight load, same four `__bfloat1622float2` decodes, same two 4-term
+        // FMA groups in the same expression position and order. `wv`/f0..f3 sit
+        // OUTSIDE the r loop: one decode of the row's 8 weights per k-step,
+        // reused by every row — the m-fold's whole point, and identical in value
+        // to the per-row decode it replaces.
+        //
+        // The slice arithmetic is v2/nt's with WPR == 1 folded away:
+        //   kper = ((k + 1 - 1) / 1 + 7) & ~7 == k   (the launcher guarantees
+        //                                             k % 8 == 0)
+        //   k0 = kw * kper == 0,  k1 = min(k0 + kper, k) == k
+        // so the loop below is their `for (k = k0 + lane*8; k + 7 < k1; k += 32*8)`
+        // with lane*8 and 32*8 kept as literals. Nothing is added across r: each
+        // acc[r] is its own ascending chain (C4), which is also why the row's
+        // value cannot depend on the row->warp mapping.
+        #pragma unroll 2
+        for (int c = lane * 8; c + 7 < k; c += 32 * 8) {
+            uint4 wv = *reinterpret_cast<const uint4*>(wr + c);
+            const __nv_bfloat162* w2 = reinterpret_cast<const __nv_bfloat162*>(&wv);
+            float2 f0 = __bfloat1622float2(w2[0]);
+            float2 f1 = __bfloat1622float2(w2[1]);
+            float2 f2 = __bfloat1622float2(w2[2]);
+            float2 f3 = __bfloat1622float2(w2[3]);
             #pragma unroll
             for (int r = 0; r < M; ++r) {
-                acc[r] = __fmaf_rn(wv, x[(size_t)r * (size_t)k + c], acc[r]);
+                const float* xr = x + (size_t)r * (size_t)k;
+                float4 xa = *reinterpret_cast<const float4*>(xr + c);
+                float4 xb = *reinterpret_cast<const float4*>(xr + c + 4);
+                acc[r] += xa.x * f0.x + xa.y * f0.y + xa.z * f1.x + xa.w * f1.y;
+                acc[r] += xb.x * f2.x + xb.y * f2.y + xb.z * f3.x + xb.w * f3.y;
             }
         }
+        // The reduction tree keeps v2/nt's source form verbatim (shfl_down, off
+        // = 16,8,4,2,1): the lane-0 partial is the same binary tree the
+        // single-row launch produces. The epilogue is their
+        // `(bias ? bias[row] : 0.f) + acc` with the null bias the head passes —
+        // `__fadd_rn(0.f, a)`, not a bare `a`, so a -0.0 accumulator cannot
+        // cross the two paths as a sign flip.
         #pragma unroll
         for (int r = 0; r < M; ++r) {
             float a = acc[r];
+            #pragma unroll
             for (int off = 16; off > 0; off >>= 1) {
-                a += __shfl_xor_sync(0xFFFFFFFFu, a, off);
+                a += __shfl_down_sync(0xffffffff, a, off);
             }
-            if (lane == 0) out[(size_t)r * (size_t)n + row] = a;
+            if (lane == 0) out[(size_t)r * (size_t)n + row] = __fadd_rn(0.f, a);
         }
     }
 }
@@ -1121,11 +1162,16 @@ extern "C" int dsv41_gemv_f32(const float* w, const float* x, float* out, int n,
 }
 
 // Multi-row head GEMV: the verify block's head, one pass over the weight for all
-// `m` rows (kernel + the C1-C5 bit-identity argument above). `m` selects a
+// `m` rows (kernel + the bit-identity argument above). `m` selects a
 // compile-time M so every row's accumulator is a register; m > 8 is refused —
-// the caller then keeps its per-row `dsv41_gemv_bf16` loop, so an out-of-range
-// call degrades to the old path instead of reading garbage. The verify block's
-// VERIFY_ROWS is 6, so 8 leaves headroom without a general-m fallback kernel.
+// the caller then keeps its per-row loop, so an out-of-range call degrades to
+// the old path instead of reading garbage. The verify block's VERIFY_ROWS is 6,
+// so 8 leaves headroom without a general-m fallback kernel.
+// `k % 8 != 0` is refused for the same reason (`ferrite_gemv_bf16_v2`'s host
+// falls back to v1 on it): the vector body's uint4/float4 loads need 16B
+// alignment, which a row stride of k bf16 only has when k is a multiple of 8 —
+// the head's k is dim (5120), and the Rust caller declines before the launch so
+// the verify keeps its per-row path instead of erroring.
 // Launch shape copies dsv41_gemv_bf16's exactly (ceil(n/8) blocks capped at
 // 4096, 256 threads = 8 warps) EXCEPT the dynamic smem: v1's launcher still
 // reserves k*4 bytes for the activation staging that its 2026-09-11 revert
@@ -1136,6 +1182,7 @@ extern "C" int dsv41_head_gemv_bf16_mrows(const void* w, const float* x, float* 
                                           int k, cudaStream_t s) {
     if (m <= 0 || n <= 0 || k <= 0) return (int)cudaSuccess;
     if (m > 8) return (int)cudaErrorInvalidValue;
+    if (k & 7) return (int)cudaErrorInvalidValue;
     unsigned blocks = (unsigned)((n + 7) / 8);
     if (blocks > 4096) blocks = 4096;
     const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
