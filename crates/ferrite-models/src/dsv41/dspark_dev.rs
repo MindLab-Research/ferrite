@@ -3363,3 +3363,20 @@ impl<'a> DsparkDev<'a> {
         }
     }
 }
+
+/// Release the `DSV41_DRAFT_GRAPH` exec with the draft.
+///
+/// The draft's buffers are owned by this struct and live exactly as long as it
+/// does, so a captured graph is valid for the WHOLE instance — there is no
+/// per-request drop (the reason `DevChain` drops its three graph stores per
+/// request is that the chain REALLOCATES its scratch, and a graph bakes device
+/// addresses). The only thing left to do is hand the exec back on teardown.
+impl Drop for DsparkDev<'_> {
+    fn drop(&mut self) {
+        if let Some(e) = self.graph.take() {
+            // Best-effort: a failing teardown must not panic a process that is
+            // already shutting down.
+            let _ = self.dev.graph_free(std::ptr::null_mut(), e);
+        }
+    }
+}
