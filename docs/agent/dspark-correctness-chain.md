@@ -727,6 +727,10 @@ def hc_pre(self, x, pre_mix):
 
 **是否需要修**：取决于对齐实验的结果——如果 acs/ibu 的根因不在 hc_pre 的截断（偏差小于量化噪声），可以不修（ferrite 的做法更精确）。如果对齐数据显示从 hc_pre 截断处开始 norm 偏差显著，则需要加截断。
 
+**已实施（2026-09-12）**：加了 `DSV41_BF16_TRUNCATE` gate（默认 OFF）——`dsv41_hc_collapse_norm_kernel` 在 collapse 之后、**平方和累积与 phase-2 scale 之前**对 `acc` 做 bf16 round-trip（`__float2bfloat16(_rn)` → `__bfloat162float`，后者无损），对应官方 `hc_pre` 的 `y.to(x.dtype)`；round-trip 放在方差之前，因为官方 `attn_norm` 读的正是那个 bf16 行（`x.float()` 精确升位后算 var）。OFF 时逐位不变。gate 由 `chain_dev::bf16_truncate()` 下发到 `Device::hc_collapse_norm`（launcher 新增尾参 `int truncate`，ABI 2→3）。
+
+⚠️ **默认配置可达性**：默认 `DSV41_HC_FRONT=1` / `DSV41_HC_TAIL_SPLIT=1` 时 backbone 的 collapse 由**融合前段**（`hc_front` / `hc_front_split` 的 EARLY half，内联了同一段 collapse+rmsnorm）完成，独立的 `hc_collapse_norm` 只在 `DSV41_HC_FRONT=0`（且 persist 系列 OFF）时才执行——所以本 gate 在默认配置下对 44 层主链**不生效**（只覆盖 head-collapse 与 DSpark draft）。要作用于主链，需把 `truncate` 一并透进融合核，或 A/B 时设 `DSV41_HC_FRONT=0`（融合路径与两段式 bit-identical，只少一次 launch）。
+
 ## rmsnorm eps 对照——一致 ✓（1e-20）
 
 ferrite config.rs:210 `norm_eps: f(t, "norm_eps").or(f(t, "rms_norm_eps")).unwrap_or(1e-20)` — checkpoint 的 `rms_norm_eps: 1e-20` → ferrite 读到 1e-20 ✓，与官方一致。

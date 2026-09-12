@@ -485,6 +485,23 @@ struct Scratch {
     /// `[m, dim]` scratch and folds it in with ONE element-wise add, because
     /// `gemm_fp8_mrows` (unlike `gemm_fp8_mx_add`) has no accumulate epilogue.
     sh_out_r: DevBuf,
+    /// [VERIFY_ROWS, inter] fp8 e4m3 bytes + [VERIFY_ROWS, inter/32 + 8] f32: the
+    /// fused arm's (`DSV41_SH_EXP_FUSED`) phase-1 output, i.e. the `aq`/`aqsc` of
+    /// `dsv41_gemm_fp8_sh_pair`'s phase 1 — the swiglu pair in fp8, which is what
+    /// its phase 2 (`w2`) consumes. Row `r` uses `sh_aq_r + r*sh_il` and
+    /// `sh_aqsc_r + r*(sh_il/32)`; `inter >= inter/world = sh_il`, so one row
+    /// stride of `inter` covers every rank's slice.
+    ///
+    /// ⚠️ DELIBERATELY SEPARATE from `xq_r`/`xsc_r`. The fused kernel stages the
+    /// activation it was GIVEN (`a`/`a_scale`) in EVERY block, then writes the
+    /// swiglu fp8 with no barrier in between, so those two must be DISJOINT —
+    /// sharing one buffer is a cross-block race inside a single grid-sync launch
+    /// (the kernel's "WHY THE fp8 OUTPUT NEEDS ITS OWN BUFFER" note). The per-row
+    /// path reuses `s.xq` for the same bytes only because its two launches are
+    /// separated by a stream edge; that is exactly the serialisation this arm
+    /// removes, so the buffer has to be its own.
+    sh_aq_r: DevBuf,
+    sh_aqsc_r: DevBuf,
     // ---- engram, m rows ----
     eng_ids_r: DevBuf,  // [m, n_engram_layers * n_cols] i64
     eng_rows_r: DevBuf, // [m, n_cols * engram_head_dim] f32
@@ -578,6 +595,24 @@ struct EngDev {
 fn eng_host() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_BF16_TRUNCATE=1` rounds every `hc_pre` collapse back to bf16 before
+/// the hyper-connection norm, reproducing the official `model.py:957-960`
+/// (`y = sum(...); return y.to(x.dtype)`) whose whole residual stream is bf16.
+/// ferrite keeps the collapse in f32, which is ~1e-3 more precise per layer than
+/// the reference; over 44 layers that drift is the prime suspect for the
+/// near-tie argmax flips (docs/agent/dspark-correctness-chain.md, "hc_pre 的
+/// dtype 截断对照").
+///
+/// DEFAULT OFF: the f32 path is the live, verified one. Read ONCE and cached
+/// (the house rule — a per-call getenv is a hot-path slip), and `"0"` means OFF
+/// even though it is "set". A MODULE-level free function (like `eng_host`
+/// above), not an associated one: the DSpark draft calls it from
+/// `dspark_dev.rs` as `chain_dev::bf16_truncate`.
+pub(crate) fn bf16_truncate() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_BF16_TRUNCATE").map(|v| v != "0").unwrap_or(false))
 }
 
 /// DSV41_MOE_BATCH=1 collapses the routed-expert fp4 GEMV family from one
@@ -1073,6 +1108,43 @@ fn swiglu_q() -> bool {
 fn sh_pair() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SH_PAIR").map(|v| v == "1").unwrap_or(false))
+}
+
+/// SHARED-EXPERT FUSED CHAIN (`DSV41_SH_EXP_FUSED=1`, DEFAULT OFF): the arm that
+/// finally CALLS `dsv41_gemm_fp8_sh_pair` — the symbol `sh_pair()` above was
+/// written for and never reached. Same three bodies, ONE launch per row instead
+/// of that row's five:
+///
+///     5 launches/row : quant1 -> gemm_fp8_mx2(w1|w3) -> swiglu_limit
+///                      -> quant1 -> gemm_fp8_mx_add(w2)
+///     1 launch/row   : gemm_fp8_sh_pair (w1|w3 + swiglu + fp8 emit
+///                      | grid barrier | w2)
+///
+/// ⚠️ WHAT IT IS **NOT**. The kernel as written is **M = 1**: phase 1's grid maps
+/// onto the `inter` rows of ONE activation row (`a` is a single `k1 = dim`-byte
+/// row staged block-wide) and nothing indexes the verify's `m` dimension. So this
+/// arm issues `m` launches, not one — it does not reach the design's "1 launch
+/// per layer" (`docs/agent/verify-family-fusion.md` §3.1 W3), which needs the
+/// `template<M>` form and is a separate piece of work. What it does remove, at
+/// the production shape (m = 5): 25 launches/layer -> 7 (one `quant_rows`, m
+/// fused, one `add_inplace_raw`), i.e. ~720 launches/step of the audit's 3.3us
+/// class, and the two serialisation points inside each row's chain (weight
+/// staging + the swiglu round trip now live in one grid).
+///
+/// ⚠️ THE ADD IS STILL A SEPARATE LAUNCH. The kernel's phase 2 STORES
+/// (`out[row] = acc`); it has no accumulate/add epilogue, so unlike the A5
+/// `gemm_fp8_mx_add` path the w2 result cannot fold straight into `moe_out_r`.
+/// The arm writes `sh_out_r` and keeps the mrows pass's single element-wise add.
+///
+/// Both `DSV41_SH_EXP_FUSED=1` AND `DSV41_SH_PAIR=1` are required (`sh_pair()` is
+/// the A/B arm for the kernel itself, still default OFF), plus the .so actually
+/// carrying `dsv41_gemm_fp8_sh_pair` (`supports_sh_pair()`).
+///
+/// Read ONCE and cached — this branch runs 40x/step inside graph capture, the
+/// hot-path rule every gate here follows.
+fn sh_exp_fused() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_FUSED").map(|v| v == "1").unwrap_or(false))
 }
 
 /// ADD_EPI (DSV41_ADD_EPI, default ON): fold the shared expert's merge
@@ -2465,6 +2537,8 @@ impl<'a> DevChain<'a> {
             ex_down_r: dev.alloc(fb(VERIFY_ROWS * topk * dim))?,
             sh_act_r: dev.alloc(fb(VERIFY_ROWS * 2 * inter.max(dim)))?,
             sh_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
+            sh_aq_r: dev.alloc((VERIFY_ROWS * inter).max(8))?, // fp8 bytes
+            sh_aqsc_r: dev.alloc(fb(VERIFY_ROWS * inter / 32 + 8))?,
             eng_ids_r: dev.alloc(fb(eng_cols * n_eng_layers * VERIFY_ROWS).max(8) * 2)?, // i64
             eng_rows_r: dev.alloc(fb(VERIFY_ROWS * eng_cols * ehd).max(8))?,
             eng_kv_r: dev.alloc(fb(VERIFY_ROWS * (hc + 1) * dim))?,
@@ -4105,6 +4179,7 @@ impl<'a> DevChain<'a> {
                 hc as i32,
                 dim as i32,
                 cfg.norm_eps,
+                bf16_truncate(),
             )?;
         } else {
         self.dev.hc_collapse(
@@ -9351,6 +9426,19 @@ impl<'a> DevChain<'a> {
     /// launcher declines. A PARTIAL attempt is harmless by construction:
     /// `moe_out_r` is touched only by the final add, and everything else written
     /// (`xq_r`/`xsc_r`/`sh_act_r`/`sh_out_r`) is scratch the fallback rewrites.
+    /// # The fused arm in front of it (`DSV41_SH_EXP_FUSED`, default OFF)
+    ///
+    /// Tried FIRST: one `dsv41_gemm_fp8_sh_pair` per row (the symbol
+    /// `chain_dev.rs`'s `sh_pair()` gate was written for and never called),
+    /// replacing that row's `gemm_fp8_mrows(w1)` + `gemm_fp8_mrows(w3)` +
+    /// `swiglu_limit_q` + `gemm_fp8_mrows(w2)` with ONE launch — phase 1 walks
+    /// both weight rows in one warp, applies the swiglu epilogue in-register and
+    /// emits the fp8 pair, a grid barrier joins it to phase 2 (the w2 GEMV).
+    /// `quant_rows` (step 1) and the final `add_inplace_raw` (step 4's second
+    /// half) stay: the kernel consumes an fp8 activation and its phase 2 STORES
+    /// into `out` (no add epilogue), so neither is removable from this side. Both
+    /// envs (`DSV41_SH_EXP_FUSED=1`, `DSV41_SH_PAIR=1`) and the symbol must be
+    /// present; any decline falls through to the pass below.
     #[allow(clippy::too_many_arguments)]
     fn shared_expert_mrows(
         &self,
@@ -9365,6 +9453,74 @@ impl<'a> DevChain<'a> {
         dim: usize,
     ) -> Result<bool> {
         let cfg = self.cfg;
+        // ---- the fused arm (`DSV41_SH_EXP_FUSED`) ---------------------------
+        // The shape gates are the kernel's own specialisation, mirrored here so a
+        // shape it would decline never costs a launch: `dim % 32` is phase 1's
+        // k-block count and `sh_il % 32` is both phases' 32-element scale rows
+        // (and phase 2's cp.async16 row alignment). Deadlock safety is the
+        // LAUNCHER's, not this caller's: `dsv41_gemm_fp8_sh_pair` caps its grid
+        // at the residency number (co_res) for the barrier — never raise it here,
+        // and note that phase 1 needs `ceil(sh_il/32) <= co_res` (phase 2's own
+        // loop is grid-strided, so the cap can only starve phase 1).
+        if sh_exp_fused()
+            && sh_pair()
+            && self.dev.supports_sh_pair()
+            && m != 0
+            && m <= VERIFY_ROWS
+            && (sh_il % 32) == 0
+            && (dim % 32) == 0
+        {
+            // 1) ONE fp8 quantisation of the block — the same launch the pass
+            //    below starts with, so the activation is staged once either way.
+            self.quant_rows(self.s.xn_r.ptr as *const f32, m, dim as i32)?;
+            // The row pitch of that staging is the `cols` it was quantised with
+            // (`dim` bytes / `dim/32` f32, see `quant_rows` (#5)), NOT the wider
+            // `xq_r` allocation.
+            let sc_pitch = dim / 32;
+            let mut all_rows = true;
+            for r in 0..m {
+                let ok = self.dev.gemm_fp8_sh_pair(
+                    (self.s.xq_r.ptr as *const u8).wrapping_add(r * dim),
+                    (self.s.xsc_r.ptr as *const f32).wrapping_add(r * sc_pitch),
+                    w1.as_u8(),
+                    w1s.as_u8(),
+                    w3.as_u8(),
+                    w3s.as_u8(),
+                    cfg.swiglu_limit,
+                    sh_il as i32,
+                    dim as i32,
+                    // The f32 swiglu row is a by-product here (only the fp8 pair
+                    // is consumed downstream); it lands in the same `[row]
+                    // [2*sh_il]` slot the pass below writes, so the two layouts
+                    // cannot disagree.
+                    (self.s.sh_act_r.ptr as *mut f32).wrapping_add(r * 2 * sh_il),
+                    (self.s.sh_aq_r.ptr as *mut u8).wrapping_add(r * sh_il),
+                    (self.s.sh_aqsc_r.ptr as *mut f32).wrapping_add(r * (sh_il / 32)),
+                    w2.as_u8(),
+                    w2s.as_u8(),
+                    dim as i32,
+                    (self.s.sh_out_r.ptr as *mut f32).wrapping_add(r * dim),
+                    self.dev.stream(),
+                )?;
+                if !ok {
+                    // A mid-loop decline: fall through to the pass below. It is
+                    // safe by construction — `moe_out_r` has not been touched
+                    // (the add is the only write to it and it is further down)
+                    // and every other buffer this arm wrote is scratch the
+                    // fallback rewrites.
+                    all_rows = false;
+                    break;
+                }
+            }
+            if all_rows {
+                self.dev.add_inplace_raw(
+                    self.s.moe_out_r.ptr as *mut std::ffi::c_void,
+                    self.s.sh_out_r.ptr as *const c_void,
+                    (m * dim) as i64,
+                )?;
+                return Ok(true);
+            }
+        }
         if !sh_exp_mrows()
             || m == 0
             || m > VERIFY_ROWS
@@ -9787,6 +9943,7 @@ fn hc_tail_split() -> bool {
                     hc as i32,
                     dim as i32,
                     cfg.norm_eps,
+                    bf16_truncate(),
                 )?;
             }
         } else {
@@ -9889,6 +10046,7 @@ fn hc_tail_split() -> bool {
                     hc as i32,
                     dim as i32,
                     cfg.norm_eps,
+                    bf16_truncate(),
                 )?;
             }
         } else {

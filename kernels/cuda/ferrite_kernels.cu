@@ -29,7 +29,10 @@
 // ABI 2 (2026-09-11): dsv41_expert_gate_up_fp4_batched gained a trailing `int ilv`
 // (expert gate/up interleaved layout, DSV41_EXPERT_ILV). The bump makes a stale
 // .so a hard refusal instead of reading the new argument as the stream.
-#define FERRITE_KERNEL_ABI_VERSION 2u
+// ABI 3 (2026-09-12): dsv41_hc_collapse_norm gained a trailing `int truncate`
+// (DSV41_BF16_TRUNCATE — round the hc_pre collapse back to bf16 before the norm).
+// Same reason: a stale .so must be refused, not read the new int as its stream.
+#define FERRITE_KERNEL_ABI_VERSION 3u
 extern "C" const char* ferrite_kernel_build_id(void) { return FERRITE_KERNEL_BUILD_ID; }
 extern "C" unsigned ferrite_kernel_abi_version(void) { return FERRITE_KERNEL_ABI_VERSION; }
 

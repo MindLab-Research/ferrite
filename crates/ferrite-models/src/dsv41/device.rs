@@ -779,9 +779,11 @@ struct Kernels {
         c_int, c_int, CuStream,
     ) -> c_int,
     /// Segment B cluster 1: hc_collapse + rmsnorm(ffn_norm) in one kernel.
+    /// `truncate` is trailing (before the stream): round the collapsed row to
+    /// bf16, `DSV41_BF16_TRUNCATE`, default OFF.
     hc_collapse_norm: unsafe extern "C" fn(
         *mut f32, *const f32, *const f32, *mut f32,
-        c_int, c_int, c_int, f32, CuStream,
+        c_int, c_int, c_int, f32, c_int, CuStream,
     ) -> c_int,
     /// hc_mixes spread over one block per projection row with cp.async staging,
     /// plus the sum-of-squares/sigmoid/sinkhorn tail in one trailing kernel.
@@ -4762,6 +4764,11 @@ impl Device {
 
     /// Fused segment B cluster 1: collapse the hyper-connection rows and
     /// normalise, writing `out` directly (the intermediate `x` is not needed).
+    ///
+    /// `truncate` (`DSV41_BF16_TRUNCATE`, default OFF): round the collapsed row
+    /// back to bf16 before the norm, reproducing the official `hc_pre`'s
+    /// `y.to(x.dtype)` (`ref_inference/model.py:957-960`). The gate is read once
+    /// by `chain_dev::bf16_truncate`.
     #[allow(clippy::too_many_arguments)]
     pub fn hc_collapse_norm(
         &self,
@@ -4773,9 +4780,12 @@ impl Device {
         hc: i32,
         dim: i32,
         eps: f32,
+        truncate: bool,
     ) -> Result<()> {
         let rc = unsafe {
-            (self.kernels.hc_collapse_norm)(x, pre, w, out, rows, hc, dim, eps, self.stream)
+            (self.kernels.hc_collapse_norm)(
+                x, pre, w, out, rows, hc, dim, eps, truncate as c_int, self.stream,
+            )
         };
         self.kerr(rc, "dsv41_hc_collapse_norm")
     }

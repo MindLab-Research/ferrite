@@ -2062,7 +2062,7 @@ unsafe fn verify_kernel_build(
     handle: *mut std::ffi::c_void,
     so_path: &str,
 ) -> Result<()> {
-    const EXPECTED_ABI: u32 = 2;
+    const EXPECTED_ABI: u32 = 3;
     let get_id = libc_dlsym(
         handle,
         b"ferrite_kernel_build_id\0".as_ptr() as *const std::os::raw::c_char,

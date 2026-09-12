@@ -329,6 +329,10 @@ elif "[verify_graph] capture FAILED" in log:
 else:
     engaged = "no"
 captured_m1 = "yes" if "[verify_graph] captured verify_graph_m1" in log else "no"
+# Which shapes actually captured. If lazy's route stayed on the batched arm the
+# log shows m=5/m=6 instead of m=1 — the reader sees that here, not just "failed".
+found = sorted({int(x) for x in re.findall(r"\[verify_graph\] captured verify_graph_m(\d+)", log)})
+captured_shapes = ",".join("m=%d" % x for x in found) if found else ""
 prev = re.search(
     r"\[verify_graph\] previous request: captures=(\d+) replays=(\d+) failed=(\w+) shapes=\[([^\]]*)\]",
     log,
@@ -388,6 +392,7 @@ with open(out_p, "w") as fh:
         ("hist6", str(hist[6])),
         ("engaged", engaged),
         ("captured_m1", captured_m1),
+        ("captured_shapes", captured_shapes),
         ("captures", captures), ("replays", replays),
         ("failed", failed), ("shapes", shapes),
         ("chars", str(len(content))),
@@ -532,8 +537,16 @@ if M["a0"].get("engaged") != "no":
           % M["a0"].get("engaged"))
     engage_ok = False
 if engage_ok:
-    print("  ENGAGE  OK: arm1 captured verify_graph_m1 (captures=%s replays=%s shapes=[%s]); arm0 printed none"
-          % (M["a1"].get("captures"), M["a1"].get("replays"), M["a1"].get("shapes")))
+    print("  ENGAGE  OK: arm1 captured verify_graph_m1 (captured_shapes=[%s] captures=%s replays=%s); arm0 printed none"
+          % (M["a1"].get("captured_shapes"), M["a1"].get("captures"), M["a1"].get("replays")))
+else:
+    # An unengaged arm1 is NOT a measurement — it is the run's usability failure,
+    # so it dominates every other leg (rc 2, never 0/1).
+    rc = 2
+    if M["a1"].get("captured_shapes") == "m=5" or M["a1"].get("captured_shapes") == "m=6":
+        print("  ENGAGE  HINT: arm1 only captured the BATCHED shape (%s) — lazy's route stayed on the "
+              "batched arm, so the m=1 graph never ran (check DSV41_LAZY_THRESHOLD / mean-k)."
+              % M["a1"].get("captured_shapes"))
 
 # --- SPEED -----------------------------------------------------------------
 a0, a1 = num(M["a0"], "steady_mean"), num(M["a1"], "steady_mean")
@@ -570,6 +583,8 @@ elif M["a0"].get("md5") != M["a1"].get("md5"):
 else:
     print("  TEXT    OK: identical answer both arms (%s chars, %s double-chars, md5 %s)"
           % (M["a0"].get("chars"), M["a0"].get("dbl"), M["a0"].get("md5")))
+if not text_ok:
+    rc = max(rc, 1)
 
 print()
 if rc == 2:

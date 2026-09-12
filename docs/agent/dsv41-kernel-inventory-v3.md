@@ -630,6 +630,41 @@ python3 kdiff.py /tmp/dsv41-prof-v3c/one.csv /tmp/dsv41-prof-v3c/many.csv 30
      时才吃到 8 行/block。**wo_b（f32, n=5120）/ w2（add, n=5120）/ 其余 n≥2048 的 `lin`** 均已覆盖。
    - ⚠️ 待实测：`DSV41_GEMV_WARPS_ADAPTIVE=0` vs `=1` 的同窗口 A/B（文本 + nsys 的
      `gemm_fp8_gemv` 每步 ms）。无 Rust 改动，`cargo check -p ferrite-models` 通过。
+0.5c **P5 mrows 小 n 自适应（2026-09-12 已落地代码，待实测）——mrows 族自己的行/块臂**：
+   动机 = **verify 的最大单项**：shared expert 的 w1/w3 是 `n = sh_il ≈ 144`（per-rank
+   intermediate），而 `dsv41_gemm_fp8_mrows` 的并行度是 **block 数 = ceil(n / nwarps)**、
+   与 m 无关，默认 nwarps=4 ⇒ **36 个 block**；148 SM 的 B300 上另外 112 个 SM 在整个
+   launch 里拿不到 block（10.4ms / 40 层）。P2 的 `kGemvWarpsBigN=2048` 交叉点是**大 n**
+   的权衡（prologue 摊薄 vs 在飞 warp），对 n=144 方向相反 —— 这里要的是**更多 block**，
+   所以是**更少行/块**。
+   - **实现**：新增 `g_mrows_small_n_adaptive`（env **`DSV41_MROWS_SMALL_N_ADAPTIVE`**，
+     **默认 OFF**，为同窗口 A/B）+ `kMrowsSmallN1=256` / `kMrowsSmallN2=512` + 内联
+     `dsv41_mrows_warps_for(n)`：`n<256 → 1`、`n<512 → 2`、否则回落到
+     `dsv41_gemv_warps_for(n)`（P2 / P2b 两臂不动）。**只改 `dsv41_gemm_fp8_mrows` 一处
+     launcher**；M=1 的 `mx`/`mx_add`/`mx_f32`/`mx2` 族**不读本门**（其
+     `dsv41_gemv_warps_for` 调用点原样保留）。
+   - **SM 利用率算术（n=144）**：nwarps=4 ⇒ grid=36 ⇒ 36/148 = **24%**；nwarps=2 ⇒ 72/148
+     = 49%；nwarps=1 ⇒ **144/148 = 97%**。
+   - **smem 只会更松**：mrows 的 gsmem = `nwarps*k + 256*4 + m*(k/32)*4 + m*k`，对 nwarps
+     **单调不减** ⇒ 更小的 nwarps 不可能越过更大的那个没越过的 opt-in 天花板。共享专家形状
+     （k=7168、m=5）：nwarps=4 → **70016 B**（走 opt-in 路径）、nwarps=1 → **48512 B**
+     （**低于 48KB 默认值** ⇒ 该臂还会整段跳过 `cudaFuncSetAttribute`）。
+   - **数值域安全 = 逐位等价（构造性）**：`nwarps` 进内核只经两处 —— (a) warp 拥有哪一行
+     `blockIdx.x*nwarps + warp`，(b) staging 步长 `blockDim.x`。决定结果的量全是
+     **per-warp**：K 走序（`kb` 升序、`j = kb*32 + lane`，C1）、每 (输出行, 激活行) 的
+     **单条串行 `acc[r] += av * wv` 链**及其 `#pragma unroll 32` 源形式（C6）、逐字 per
+     (warp, r) 的 `shfl_xor` 树（C3）；**无 K-split、无跨行合并**（C4/C5：`acc[r]` 独立，
+     任何量都不跨 r 相加）⇒ 换 block 划分**产生不出**任何可重排的部分和。块级 prologue
+     （LUT 构建 + M 条激活行）每块复制一份，每份拷的是**同一批字节**、按**同一消费顺序**
+     读，差别只是落在多少个 SM 上。⇒ **本改动属"改 block 划分不改每行 K 序"，无数值域风险。**
+   - 验证：远端 `nvcc 13.2 -gencode arch=compute_103a,code=sm_103a -O3 -Xptxas -v -c
+     dsv41_kernels.cu` **NVCC_EXIT=0，无 error**；`cargo check --workspace` **EXIT=0**。
+     本机无 nvcc；⚠️ 与所有 `.cu` 改动一样，跑之前必须重编 `.so`（否则 build-id 门禁拒启）。
+   - 预期（分析口径）：shared expert 单项 10.4ms 的削减量待 A/B。⚠️ **聚合 warp 数不变量**：
+     `grid*nwarps ≈ n`，所以总 warp 数（144）与 nwarps **无关**，本门改变的是**分布在多少
+     个 SM 上**（代价是每块 prologue 由 32 而非 128 线程摊、激活行在 L2 上重读次数 ×4）。
+     若 A/B 无收益，真正的并行度来源是 **k 维分片（split-K，需归约 ⇒ 数值域风险）**，或把
+     w1+w3 合成一个 `n = 2*sh_il = 288` 的 launch（同时砍掉一半 launch 与一半激活 staging）。
 0.6 **P3 cp.async 权重先行（2026-09-11 已落地代码，待实测）——prologue 里唯一可动的串行段**：
    每 block 的固定成本是块级 prologue（激活 uint4 staging + LUT + a32 物化），而**权重行**的
    cp.async 原本在 `__syncthreads()` **之后**才发射 ⇒ 传输延迟（k=5120 时每 warp 5KB）完全

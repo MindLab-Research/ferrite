@@ -267,7 +267,7 @@ fn dlopen_or_err(path: &str) -> Result<*mut c_void> {
 /// dlopen design). So the linked-image belt-and-braces is skipped here and the
 /// stamp + ABI + same-source comparisons do the work.
 unsafe fn verify_kernel_build(handle: *mut c_void, so_path: &str) -> Result<()> {
-    const EXPECTED_ABI: u32 = 2;
+    const EXPECTED_ABI: u32 = 3;
     let get_id = sym(handle, "ferrite_kernel_build_id").ok();
     let get_abi = sym(handle, "ferrite_kernel_abi_version").ok();
     let (get_id, get_abi) = match (get_id, get_abi) {

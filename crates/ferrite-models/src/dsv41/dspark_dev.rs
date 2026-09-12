@@ -1090,6 +1090,7 @@ impl<'a> DsparkDev<'a> {
                     hc as i32,
                     dim as i32,
                     eps,
+                    crate::dsv41::chain_dev::bf16_truncate(),
                 )?;
             } else {
                 self.dev.hc_collapse(
@@ -1199,6 +1200,7 @@ impl<'a> DsparkDev<'a> {
                 hc as i32,
                 dim as i32,
                 eps,
+                crate::dsv41::chain_dev::bf16_truncate(),
             )?;
             // the MoE's input (post ffn-norm) — the same semantic as the golden
             // harness's `stage{s}.ffn.in`, for the MoE-segment diff.
