@@ -36,6 +36,12 @@ pub struct SpinBarrier {
     /// makes the arms' rendezvous counts load-bearing in `chain_dev`). See
     /// [`RankVote`] for the protocol.
     vote: RankVote,
+    /// The epoch-consensus reduce (`DSV41_SWALLOW_DYNAMIC_PAD`) — a SECOND
+    /// independent generation for exactly the same reason as `vote`: the
+    /// consensus is one more host rendezvous per step, and folding it into
+    /// `count`/`gen` would shift the arrival epoch of every later `wait` (the
+    /// fix-11 design's one documented risk for 11-B). See [`RankMax`].
+    max: RankMax,
 }
 
 impl SpinBarrier {
@@ -45,6 +51,7 @@ impl SpinBarrier {
             count: AtomicUsize::new(0),
             gen: AtomicUsize::new(0),
             vote: RankVote::new(n),
+            max: RankMax::new(n),
         }
     }
 
@@ -75,6 +82,13 @@ impl SpinBarrier {
     /// generation. See [`RankVote::unanimous_i32`].
     pub fn unanimous_i32(&self, rank: usize, value: i32) -> Option<i32> {
         self.vote.unanimous_i32(rank, value)
+    }
+
+    /// Publish this rank's `value` and return the MAXIMUM over all ranks. ONE
+    /// rendezvous on a generation of its own, so it does NOT perturb the arrival
+    /// epochs `wait` hands out. See [`RankMax`] — this is the 11-B consensus.
+    pub fn max_i32(&self, rank: usize, value: i32) -> i32 {
+        self.max.max_i32(rank, value)
     }
 }
 
@@ -158,6 +172,90 @@ impl RankVote {
             .iter()
             .all(|v| v.load(Ordering::Acquire) == first);
         all.then_some(first)
+    }
+}
+
+/// A one-`i32`-per-rank **maximum reduce**: every rank publishes one value and
+/// learns the MAXIMUM over the world, in a single rendezvous.
+///
+/// # Why a reduce rather than a vote
+///
+/// The 11-B dynamic epoch pad has to answer "how far behind am I?" every step,
+/// and the only quantity that answers it is the world's epoch max: a laggard
+/// pads to it, a leader stays put. A vote ([`RankVote`]) can only tell the
+/// ranks whether they agree, which is exactly the question that could not be
+/// answered for the first ten fixes — the rift is per-rank, so consensus has to
+/// carry the NUMBER, not a bit.
+///
+/// # Protocol (the vote's, verbatim)
+///
+/// Same lap-safety as [`RankVote`]: round `n` uses the parity half `n & 1`, so a
+/// rank that has already started round `n + 1` cannot be observed by a slow peer
+/// still reading round `n`. Only one round of lapping is possible (round `n + 1`
+/// needs every rank to arrive, and the slow rank has not), which the parity
+/// covers. The arrival counter is reset by the last arriver BEFORE it bumps the
+/// generation, so a lap cannot be miscounted.
+///
+/// The reduce itself is the plain maximum of the `world` published values,
+/// evaluated AFTER the arrival round completes, so it sees every rank's value
+/// for this round and nothing from the next.
+///
+/// # Cost
+///
+/// `world` releases + `world` acquires on ONE cache line, plus `world` relaxed
+/// loads — orders of magnitude below the ~6 ms step it guards.
+pub struct RankMax {
+    world: usize,
+    /// Arrivals in the CURRENT round.
+    arrived: AtomicUsize,
+    /// Completed rounds; also the buffer parity for the current round.
+    gen: AtomicUsize,
+    /// `2 * world` slots: round `n` uses `slots[(n & 1) * world .. + world]`.
+    slots: Vec<AtomicI32>,
+}
+
+impl RankMax {
+    pub fn new(world: usize) -> Self {
+        let world = world.max(1);
+        Self {
+            world,
+            arrived: AtomicUsize::new(0),
+            gen: AtomicUsize::new(0),
+            slots: (0..2 * world).map(|_| AtomicI32::new(0)).collect(),
+        }
+    }
+
+    /// Publish `value` for `rank` and return the maximum over every rank's value
+    /// this round. A world of one is its own maximum and skips the rendezvous.
+    pub fn max_i32(&self, rank: usize, value: i32) -> i32 {
+        if self.world <= 1 {
+            return value;
+        }
+        let g = self.gen.load(Ordering::Acquire);
+        let base = (g & 1) * self.world;
+        self.slots[base + rank].store(value, Ordering::Release);
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 == self.world {
+            // Last in: clear the counter for the next round FIRST (a rank that
+            // laps cannot pass the generation bump below until this store is
+            // visible), then release the others with the bump.
+            self.arrived.store(0, Ordering::Release);
+            self.gen.store(g + 1, Ordering::Release);
+        } else {
+            let mut spins = 0u32;
+            while self.gen.load(Ordering::Acquire) == g {
+                spins += 1;
+                if spins < 4096 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        self.slots[base..base + self.world]
+            .iter()
+            .map(|v| v.load(Ordering::Acquire))
+            .max()
+            .unwrap_or(value)
     }
 }
 
@@ -885,6 +983,18 @@ impl Collective {
     /// [`RankVote`] for why that separation is load-bearing.
     pub fn unanimous_i32(&self, value: i32) -> Option<i32> {
         self.barrier.unanimous_i32(self.rank, value)
+    }
+
+    /// Publish this rank's epoch and return the world's MAXIMUM (`11-B`'s dynamic
+    /// pad). ONE rendezvous on its own independent generation — the same
+    /// separation [`Self::unanimous_i32`] keeps, so the extra per-step rendezvous
+    /// does not misphase any later `host_barrier` (see [`RankMax`]).
+    ///
+    /// Every rank must call it on every step the gate is armed: the rendezvous
+    /// waits for `world` votes, so a rank that skipped it would leave its peers
+    /// spinning (the failure mode [`Self::unanimous_i32`]'s callers document).
+    pub fn epoch_max(&self, value: i32) -> i32 {
+        self.barrier.max_i32(self.rank, value)
     }
 
     /// Release a round (pairs with `publish`, to keep the next round from

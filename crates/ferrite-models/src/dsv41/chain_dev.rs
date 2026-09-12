@@ -1915,6 +1915,67 @@ fn swallow_epoch_pad() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SWALLOW_EPOCH_PAD").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_SWALLOW_DYNAMIC_PAD=1` arms **11-B**: the per-step EPOCH CONSENSUS.
+///
+/// # The problem the constant pad cannot solve
+///
+/// [`swallow_epoch_pad`] adds back a FIXED 81 rounds (`2 * n_layers + 1`), which
+/// corrects exactly ONE asymmetry: the swallowed arm's dropped `step_dev`. The
+/// fix-11 design's world B enumerates the others — a head-geometry ±1, the
+/// capture arm's two barriers, the lazy route's `k_emit`-dependent footprint —
+/// and a constant is blind to all of them by construction.
+///
+/// # The fix: measure the GAP, not the CAUSE
+///
+/// `ar5_wait_round` compares `peer_epoch >= my_epoch` per round
+/// (`ferrite_kernels.cu`, `p2p_ar_pubred_v5_kernel`), so the quantity that
+/// decides a hang is not "who issued how many rounds" but "who is BEHIND". This
+/// gate makes that literal: at the same point every step, each rank publishes its
+/// epoch, the world takes the MAX, and every laggard is padded up to it with the
+/// SAME already-landed kernel the constant pad uses (`dsv41_v5_epoch_pad_kernel`,
+/// [`Self::v5_epoch_pad_rounds`]). The padded rounds are empty by construction,
+/// so parity and the "no payload, no reader" argument hold exactly as they do for
+/// the constant pad — only the pad's SOURCE changes, from a geometry constant to
+/// a measurement.
+///
+/// Because it measures the gap rather than its cause, it covers every source in
+/// that enumeration at once, and it stays correct for a source nobody has
+/// hypothesised yet. It is also immune (in the same step) to a laggard produced
+/// by world A's zeroing, since the laggard is what gets padded.
+///
+/// # Why the rendezvous is host-side
+///
+/// A device-side consensus would need a common time reference independent of the
+/// epoch it is trying to align — i.e. a second per-step counter the host would
+/// have to advance, which is the host rendezvous again with more machinery and a
+/// race against the very AR it aligns (fix-11 §4.2, 11-B′). Host-side costs one
+/// 4-byte D2H + one [`crate::dsv41::tp::RankMax`] rendezvous + (only for a
+/// laggard) one pad launch per step — tens of µs against a ~6 ms step.
+///
+/// # DEFAULT OFF
+///
+/// The A/B arm. With the gate off the call site is one cached `OnceLock` branch
+/// and NO device traffic and NO rendezvous: [`Self::v5_epoch_consensus`] returns
+/// before it reads anything. `DSV41_SWALLOW_DYNAMIC_PAD=1` vs unset is therefore
+/// a clean pair, and a throughput run can take the ledger off without paying for
+/// either.
+///
+/// # Interaction with the constant pad
+///
+/// They are independent and BOTH may be armed: the constant pad runs inside the
+/// swallowed arm (pushing that arm's footprint up), and the consensus runs at
+/// the step's head (closing whatever gap is left, whatever its sign of origin).
+/// The consensus strictly dominates as a net, so the intended 11-B run is
+/// consensus ON and constant pad OFF — but nothing here requires that.
+fn swallow_dynamic_pad() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_SWALLOW_DYNAMIC_PAD")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// The rounds the swallowed arm is short per step: `step_dev`'s per-layer
 /// attention + MoE all-reduces (`2 * n_layers`) plus the head's argmax exchange
 /// (`1`). At the production geometry (40 layers) that is 81.
@@ -1934,12 +1995,22 @@ fn swallow_missing_rounds(n_layers: usize) -> u32 {
 /// A pad that quietly does nothing is that same failure mode, so this counts as
 /// a report rather than as a silent degradation. Printed once — the symbol
 /// either resolves for the whole process or never does.
-fn warn_epoch_pad_missing_symbol() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
+fn warn_epoch_pad_missing_symbol(gate: &str) {
+    // One report PER GATE: when both the constant pad and the 11-B consensus are
+    // armed, the second one must not be hidden behind the first — each is a
+    // separately-armed fix, and "the gate I set is the one that silently did
+    // nothing" is exactly the failure this report exists to prevent.
+    static ONCE_CONST: std::sync::Once = std::sync::Once::new();
+    static ONCE_DYN: std::sync::Once = std::sync::Once::new();
+    let once = if gate.contains("DYNAMIC") {
+        &ONCE_DYN
+    } else {
+        &ONCE_CONST
+    };
+    once.call_once(|| {
         eprintln!(
-            "[swallow-pad] DSV41_SWALLOW_EPOCH_PAD=1 but the loaded .so has no \
-             `dsv41_v5_epoch_pad` — the swallowed arm is NOT padded (rebuild kernels/cuda: \
+            "[swallow-pad] {gate}=1 but the loaded .so has no \
+             `dsv41_v5_epoch_pad` — the epoch is NOT padded (rebuild kernels/cuda: \
              bash build.sh 103a)"
         );
     });
@@ -8064,6 +8135,20 @@ impl<'a> DevChain<'a> {
         // above, so it adds no device traffic (see `inv_pos_ctr`).
         self.inv_pos_ctr(pos, pos_ctr)?;
 
+        // ★ 11-B: the per-step EPOCH CONSENSUS (`DSV41_SWALLOW_DYNAMIC_PAD=1`),
+        // at the same head-of-step point as the ledger below and therefore before
+        // ANY all-reduce of the round. Each rank publishes its epoch, the world
+        // takes the max, and every laggard is padded up to it with the landed pad
+        // kernel — so the invariant "all ranks' epochs are equal before the round's
+        // first AR" is re-established every step no matter WHY a rank fell behind
+        // (head geometry, a capture arm, the lazy route, the swallowed arm's
+        // dropped `step_dev`, or a zeroed word). Gate off: one cached branch, no
+        // device traffic and no rendezvous. Placed BEFORE the ledger read on
+        // purpose: the `[v5-ledger-pre]` lines then report the RECONCILED epoch, so
+        // the 11-B acceptance test ("每 step 跨 rank 的 epoch 逐字相等") is readable
+        // straight off the ledger instead of being an inference.
+        self.v5_epoch_consensus()?;
+
         // The v5 round ledger's PRE line: emitted BEFORE the arm is dispatched, so
         // a step that hangs in its collectives still shows the epoch it started
         // from (the post-line at the arm's COMMON exit is unreachable then — see
@@ -9632,6 +9717,16 @@ impl<'a> DevChain<'a> {
     /// `k_emit`-dependent, so a constant pad cannot equalise it. `DSV41_LAZY_VERIFY`
     /// with `DSV41_SWALLOW_STEP` stays forbidden (`scripts/batched_400_v2.sh`).
     fn v5_epoch_pad_swallow(&self, rounds: u32) -> Result<()> {
+        self.v5_epoch_pad_rounds(rounds, "DSV41_SWALLOW_EPOCH_PAD")
+    }
+
+    /// The SHARED body of the two pad arms (`DSV41_SWALLOW_EPOCH_PAD`'s constant
+    /// pad and `DSV41_SWALLOW_DYNAMIC_PAD`'s consensus): advance this rank's v5
+    /// epoch by `rounds` EMPTY rounds with the one landed kernel
+    /// ([`Device::v5_epoch_pad`]). `gate` only labels the missing-symbol report —
+    /// the launch is identical either way, which is the point: 11-B reuses the
+    /// proven pad and changes only where the number comes from.
+    fn v5_epoch_pad_rounds(&self, rounds: u32, gate: &str) -> Result<()> {
         let Some(c) = self.comm.as_ref() else {
             return Ok(());
         };
@@ -9646,7 +9741,71 @@ impl<'a> DevChain<'a> {
             rounds,
         )?;
         if !ok {
-            warn_epoch_pad_missing_symbol();
+            warn_epoch_pad_missing_symbol(gate);
+        }
+        Ok(())
+    }
+
+    /// **11-B: the per-step epoch consensus** (`DSV41_SWALLOW_DYNAMIC_PAD=1`).
+    ///
+    /// Called at the SAME point as [`Self::v5_ledger_pre`] — the head of
+    /// [`Self::dspark_spec_step`], before ANY arm is dispatched and therefore
+    /// before any all-reduce of the round. It reads this rank's epoch, takes the
+    /// world's MAX ([`Collective::epoch_max`], one rendezvous on the
+    /// [`crate::dsv41::tp::RankMax`]'s OWN generation so no later `host_barrier`
+    /// is misphased), and pads every laggard up to it with
+    /// [`Self::v5_epoch_pad_rounds`]. A rank at the max launches nothing.
+    ///
+    /// # The invariant this establishes
+    ///
+    /// **After this call, every rank's epoch is equal** (world B's invariant,
+    /// "所有 rank 的 epoch 在 AR 开始前相等"), and it is established by
+    /// CONSTRUCTION rather than by prayer: the max is a measurement of the world,
+    /// so a rank that is behind by any amount, from any cause, is brought up to
+    /// it. The pad's safety argument (`swallow-fix9-round-ledger-design.md` §3.2,
+    /// four conditions) does not depend on the pad being a constant — only on the
+    /// skipped rounds having no payload and no reader, which empty rounds satisfy
+    /// by definition, and on parity agreeing with the next real AR, which "all
+    /// ranks end at the same value" now guarantees (previously it rested on 81
+    /// being odd).
+    ///
+    /// # Cost, and the gate
+    ///
+    /// Gate OFF: this function returns on the cached `OnceLock` branch BEFORE it
+    /// touches `comm`, the device or the barrier — zero device traffic, zero
+    /// rendezvous, so the default path is unchanged launch for launch.
+    ///
+    /// Gate ON: one 4-byte D2H + one `RankMax` rendezvous per step, plus one pad
+    /// launch on the laggards only. Tens of µs against a ~6 ms step.
+    ///
+    /// # Why every rank must call it
+    ///
+    /// The rendezvous waits for `world` publishers, so the call is symmetric: it
+    /// is taken unconditionally (past the gate, which is a process-wide constant
+    /// and therefore the same on every rank) at this common entry, exactly as
+    /// [`Self::spec_primed_unanimous`] is. The `comm`/`uses_v5` early returns
+    /// below are per-rank properties that hold identically across a world —
+    /// `comm` is either present on all ranks or on none, and `uses_v5()` is one
+    /// cached env read — so they cannot desynchronise the rendezvous.
+    ///
+    /// A failed D2H is PROPAGATED rather than swallowed (unlike the ledger, which
+    /// is an observation): this read is the input to a device WRITE, and a stale
+    /// pad computed from a failed read is worse than an aborted step. The spec
+    /// path already propagates its `pos_ctr` D2H for the same reason.
+    fn v5_epoch_consensus(&self) -> Result<()> {
+        if !swallow_dynamic_pad() {
+            return Ok(());
+        }
+        let Some(c) = self.comm.as_ref() else {
+            return Ok(());
+        };
+        if !c.uses_v5() {
+            return Ok(());
+        }
+        let me = self.dev.download_u32(c.epoch_dev() as *const c_void)?;
+        let max = c.epoch_max(me as i32) as u32;
+        if me < max {
+            self.v5_epoch_pad_rounds(max - me, "DSV41_SWALLOW_DYNAMIC_PAD")?;
         }
         Ok(())
     }
