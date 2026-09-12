@@ -5267,3 +5267,30 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 - 分歧的速率（每步差多少？±1？±3？）
 
 **这将是第 10 次修复的数据基础**——真实的轮次足迹，不是推测！
+
+## 🚨🚨🚨 D1 观测的关键异常——epoch 从 1497 降到 54（非单调递减！）
+
+**D1 数据**（f063279f）：
+```
+pos=16: 所有 rank epoch=1328（同步 ✓）
+pos=22: 所有 rank epoch=1497（同步 ✓，delta=169≈28×6 位）
+pos=22 步后（swallowed 臂）: epoch=54  ← 🚨 从 1497 降到 54！
+pos=23 步前: epoch=54（确认降级）
+之后: 44,621 ar5-hang（hang）
+```
+
+**关键异常**：epoch 从 1497 **降到** 54——v5 epoch 应该单调递增！这是 ar5-hang 的 **smoking gun**！
+
+**可能的机制**：
+1. **epoch 被 reset**：某个操作（arm 切换？rollback？）重置了 epoch 计数器
+2. **不同 rank 读到不同值**：某些 rank 在 1497 继续推进，某些 rank 被重置到 54 → 分歧！
+3. **epoch 的 u32 溢出或 wrap**：不太可能（1497 远低于 u32 max）
+4. **epoch_dev 指针被覆盖**：内存 corruption？
+
+**对第 10 次修复（epoch pad）的影响**：
+- pad 是"补偿轮次差"（+81 轮）——但如果 epoch 被重置到 54，pad 的补偿完全失效！
+- **必须先找到 epoch 降级的来源**——否则第 10 次也会失败！
+
+**需要调查**：什么操作会把 epoch 从 1497 重置到 54？
+- 54 ≈ 0.5 × 81 + 13.5？或者 54 = 2 × 27（gap=27 的两倍）？
+- epoch 的写入点：AR kernel（advance）+ 可能的 reset 点
