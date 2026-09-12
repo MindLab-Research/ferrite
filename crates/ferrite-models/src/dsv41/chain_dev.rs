@@ -10490,29 +10490,69 @@ impl<'a> DevChain<'a> {
         // row r at `pos_rows[r]` — the `mul=1, off=r, step=0` the per-row call
         // evaluates off the counter).
         let mut q_done = false;
-        self.quant_rows(self.s.qr_r.ptr as *const f32, m, ql as i32)?;
-        if self.proj_mrows(
-            idx_wq_b.as_u8(),
-            idx_wq_b_s.as_u8(),
-            self.s.idx_q_r.ptr as *mut f32,
-            m,
-            (idx_nh * idx_hd) as i32,
-            ql as i32,
-            (idx_nh * idx_hd) as i32,
-        )? {
-            q_done = self.dev.apply_rope_mrows(
-                self.s.idx_q_r.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
-                m as i32,
-                idx_nh as i32,
+        // R2b (DSV41_INDEXER_QR_RAW, default ON under R2): `attention_rows`' fused
+        // wq_b launch leaves `qr_r` RAW, so the `quant_rows` below must NOT read
+        // it — staging a raw row would dot the wrong values. The fused
+        // `lin_rope_norm` launch does the whole pair AND the rope in ONE launch,
+        // and it is the `m == 1` program (the flag is only set on that arm) — the
+        // same launch EAGER's `indexer()` takes for exactly this reason. A decline
+        // normalises the row itself, so the fallback below still quantises
+        // normalised values.
+        let qr_raw = self.s.qr_raw_r.get();
+        self.s.qr_raw_r.set(false);
+        if qr_raw {
+            debug_assert!(m == 1, "qr_raw_r is only set by the m == 1 fused wq_b arm");
+            q_done = self.lin_rope_norm(
+                self.s.qr_r.ptr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                cfg.norm_eps,
+                ql as i32,
+                idx_wq_b,
+                idx_wq_b_s,
                 (idx_nh * idx_hd) as i32,
-                idx_hd as i32,
+                self.s.idx_q_r.ptr as *mut f32,
                 rd as i32,
-                half,
-                self.s.pos_rows.ptr as *const std::os::raw::c_int,
-                false,
+                idx_hd as i32,
             )?;
+            if !q_done {
+                self.norm_rows(
+                    self.s.qr_r.ptr as *const f32,
+                    ld.q_norm.as_ref().unwrap().as_f32(),
+                    self.s.qr_r.ptr as *mut f32,
+                    m,
+                    ql,
+                    cfg.norm_eps,
+                )?;
+            }
+        }
+        // The fused arm above already rotated `idx_q_r`'s row: `pos_ctr` with
+        // `off = 0` at `m == 1` is `pos_rows[0]`, the position the mrows rope
+        // below reads, so the rope goes with the rest of the pair it replaced.
+        if !q_done {
+            self.quant_rows(self.s.qr_r.ptr as *const f32, m, ql as i32)?;
+            if self.proj_mrows(
+                idx_wq_b.as_u8(),
+                idx_wq_b_s.as_u8(),
+                self.s.idx_q_r.ptr as *mut f32,
+                m,
+                (idx_nh * idx_hd) as i32,
+                ql as i32,
+                (idx_nh * idx_hd) as i32,
+            )? {
+                q_done = self.dev.apply_rope_mrows(
+                    self.s.idx_q_r.ptr as *mut f32,
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    m as i32,
+                    idx_nh as i32,
+                    (idx_nh * idx_hd) as i32,
+                    idx_hd as i32,
+                    rd as i32,
+                    half,
+                    self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                    false,
+                )?;
+            }
         }
         // ---- w half: ONE bf16 GEMV for all m rows ----
         // `lin_bf16` takes `gemv_bf16_v2` for this shape (`index_n_heads` is far
@@ -10640,28 +10680,67 @@ impl<'a> DevChain<'a> {
         let (q_done, w_done) = front;
         if !q_done {
             let idxq = (self.s.idx_q_r.ptr as *mut f32).wrapping_add(r * idx_nh * idx_hd);
-            self.lin(
-                (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
-                ql as i32,
-                idx_wq_b,
-                idx_wq_b_s,
-                (idx_nh * idx_hd) as i32,
-                idxq,
-            )?;
-            self.dev.apply_rope(
-                idxq,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
-                idx_nh as i32,
-                idx_hd as i32,
-                rd as i32,
-                half,
-                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
-                1,
-                r as i32,
-                0,
-                false,
-            )?;
+            // R2b (DSV41_INDEXER_QR_RAW, default ON under R2): `attention_rows`'
+            // fused wq_b launch left `qr_r` RAW, so `lin` below must not quantise
+            // this row as it stands — its GEMV prologue (`lin_rope_norm`) is the
+            // one that normalises + quantises the raw row and rotates the result,
+            // all in ONE launch (the launch R2's compensating `norm_rows` used to
+            // stand in for). The flag is only ever set on the `m == 1` arm, so
+            // `r == 0` and the launch's `off = 0` position is this row's own; a
+            // decline materialises the norm first, exactly like EAGER's
+            // `indexer()`, so the fallbacks still quantise normalised values.
+            let qr_raw = self.s.qr_raw_r.get();
+            self.s.qr_raw_r.set(false);
+            let mut roped = false;
+            if qr_raw {
+                debug_assert!(r == 0, "qr_raw_r is only set by the m == 1 fused wq_b arm");
+                roped = self.lin_rope_norm(
+                    (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+                    ld.q_norm.as_ref().unwrap().as_f32(),
+                    cfg.norm_eps,
+                    ql as i32,
+                    idx_wq_b,
+                    idx_wq_b_s,
+                    (idx_nh * idx_hd) as i32,
+                    idxq,
+                    rd as i32,
+                    idx_hd as i32,
+                )?;
+                if !roped {
+                    self.dev.rmsnorm(
+                        (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+                        ld.q_norm.as_ref().unwrap().as_f32(),
+                        (self.s.qr_r.ptr as *mut f32).wrapping_add(r * ql),
+                        1,
+                        ql as i32,
+                        cfg.norm_eps,
+                    )?;
+                }
+            }
+            if !roped {
+                self.lin(
+                    (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+                    ql as i32,
+                    idx_wq_b,
+                    idx_wq_b_s,
+                    (idx_nh * idx_hd) as i32,
+                    idxq,
+                )?;
+                self.dev.apply_rope(
+                    idxq,
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    idx_nh as i32,
+                    idx_hd as i32,
+                    rd as i32,
+                    half,
+                    self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                    1,
+                    r as i32,
+                    0,
+                    false,
+                )?;
+            }
         }
         if !w_done {
             self.lin_bf16(
