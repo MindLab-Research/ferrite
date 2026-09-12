@@ -374,6 +374,47 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, default OFF): the verify
+    /// block's `seqlen = m` rows of the decode compressor in ONE 1-block launch —
+    /// `dsv41_compressor_fused`'s three stages, rows ASCENDING inside the kernel
+    /// (the state carry's slot is position-derived, so rows r and r+2 share a slot
+    /// at ratio 2, and the commit's `*clen` is the cross-row shared state).
+    /// SHAPE: `b == 1`, `seqlen >= 1`, `ratio > 1`; anything else returns
+    /// `cudaErrorInvalidValue`. The caller (`chain_dev::compress_rows_fused`)
+    /// enforces the shape gate plus the env flag.
+    ///
+    /// `clen_rows` / `latent_rows` are the READ SIDE's per-row snapshot outputs and
+    /// may be NULL (see the kernel header): a caller that hoists the whole block's
+    /// compressor must give its per-row readers `clen_rows[r]` (the counter after
+    /// row r's commit) and its per-row publishes `latent_rows + r*hd` (row r's
+    /// pooled row) instead of the block-final live counter / shared `latent`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_compressor_fused_mrows(
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latent: *mut f32,
+        out_rows: *mut i32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        clen: *mut i32,
+        clen_rows: *mut i32,
+        latent_rows: *mut f32,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        pos_ctr: *const i32,
+        eps: f32,
+        stream: CuStream,
+    ) -> i32;
+
     /// YaRN frequency table (dual theta: the compressed path rotates at its own
     /// theta because one latent stands for `ratio` tokens).
     pub fn dsv41_rope_precompute(

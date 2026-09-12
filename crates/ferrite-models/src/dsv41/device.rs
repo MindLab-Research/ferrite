@@ -807,6 +807,37 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, default OFF): the verify
+    /// block's `seqlen = m` rows of the decode compressor in ONE launch, rows
+    /// ascending. Optional, so an .so without the symbol (or the gate off) keeps
+    /// the per-row path verbatim.
+    compressor_fused_mrows: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut c_int,
+            *const f32,
+            *const f32,
+            *mut f32,
+            *mut c_int,
+            *mut c_int,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *const c_int,
+            f32,
+            CuStream,
+        ) -> c_int,
+    >,
     route_topk: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream) -> c_int,
     >,
@@ -1231,6 +1262,7 @@ impl Device {
             route_group_scatter: ko!(rt, "dsv41_route_scatter_rows"),
             compressor_pool: ko!(rt, "dsv41_compressor_pool"),
             compressor_fused: ko!(rt, "dsv41_compressor_fused"),
+            compressor_fused_mrows: ko!(rt, "dsv41_compressor_fused_mrows"),
             engram_apply: ko!(rt, "dsv41_engram_apply"),
             swiglu_limit: ko!(rt, "dsv41_swiglu_limit"),
             swiglu_limit_q: ko!(rt, "dsv41_swiglu_limit_q"),
@@ -1339,6 +1371,14 @@ impl Device {
     /// separate launches (state + pool + commit), which are bit-identical.
     pub fn supports_compress_fuse(&self) -> bool {
         self.kernels.compressor_fused.is_some()
+    }
+
+    /// True when the loaded .so carries COMPRESSOR-MROWS
+    /// (`dsv41_compressor_fused_mrows`). Optional: a stale .so reports false and
+    /// the caller keeps the per-row pool+commit pair, which is the bit-identical
+    /// fallback.
+    pub fn supports_compressor_fused_mrows(&self) -> bool {
+        self.kernels.compressor_fused_mrows.is_some()
     }
 
     /// Compressor side stream — fork. Record the fork event on the MAIN stream
@@ -3240,6 +3280,59 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_compressor_fused")
+    }
+
+    /// COMPRESSOR-MROWS: the verify block's `seqlen = m` rows of the decode
+    /// compressor as ONE 1-block launch (rows ascending — see
+    /// [`Self::compressor_fused_mrows_on`]'s kernel header). `b == 1`, `seqlen >=
+    /// 1`, `ratio > 1` — the caller gates the shape and the
+    /// `DSV41_COMPRESSOR_MROWS` flag, and an older .so without the symbol falls
+    /// back to the per-row `compressor_pool_on` + `compress_commit_on` pair (see
+    /// [`Self::supports_compressor_fused_mrows`]).
+    ///
+    /// `clen_rows` / `latent_rows` are the read side's per-row snapshots and may
+    /// be NULL; a hoisting caller MUST pass them (see `chain_dev::
+    /// compress_rows_fused`), because the arms that read the live counter or the
+    /// shared `latent` after the launch would otherwise see the block's END state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_fused_mrows_on(
+        &self,
+        kvp: *const f32,
+        scp: *const f32,
+        norm_w: *const f32,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latent: *mut f32,
+        out_rows: *mut i32,
+        cos: *const f32,
+        sin: *const f32,
+        ring: *mut f32,
+        clen: *mut std::os::raw::c_int,
+        clen_rows: *mut std::os::raw::c_int,
+        latent_rows: *mut f32,
+        b: i32,
+        seqlen: i32,
+        head_dim: i32,
+        ratio: i32,
+        rope_dim: i32,
+        half: i32,
+        window: i32,
+        pos_ctr: *const c_int,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<()> {
+        let f = self.need(
+            self.kernels.compressor_fused_mrows,
+            "dsv41_compressor_fused_mrows",
+        )?;
+        let rc = unsafe {
+            f(
+                kvp, scp, norm_w, state_kv, state_score, latent, out_rows, cos, sin, ring, clen,
+                clen_rows, latent_rows, b, seqlen, head_dim, ratio, rope_dim, half, window,
+                pos_ctr, eps, s,
+            )
+        };
+        self.kerr(rc, "dsv41_compressor_fused_mrows")
     }
 
     pub fn gather_rows(

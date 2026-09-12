@@ -463,6 +463,19 @@ struct Scratch {
     // ---- compressor, m rows ----
     kvp_r: DevBuf,     // [m, hd] the compressor's kv projection
     scp_r: DevBuf,     // [m, hd] the compressor's gate/score projection
+    /// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS`): `[n_layers, VERIFY_ROWS]` i32 —
+    /// the per-row device-counter snapshots `dsv41_compressor_fused_mrows` writes
+    /// (`clen_rows_r[layer*VERIFY_ROWS + r]` = the counter AFTER layer `layer`'s
+    /// row `r` commit). Per-LAYER indexed rather than one row-block: a consumer
+    /// layer owns no compressor and reads its OWNER's snapshots, and another
+    /// source layer's hoisted launch can sit between the owner and the consumer,
+    /// so a shared block would be overwritten before the consumer read it.
+    clen_rows_r: DevBuf,
+    /// COMPRESSOR-MROWS: `[VERIFY_ROWS, hd]` f32, row r = row r's pooled+normed
+    /// latent, written by the same hoisted launch. ONE row-block, never per-layer:
+    /// only the layer that ran the launch reads it (`publish_index_key_rows`), and
+    /// only inside its own block, before any other launch can overwrite it.
+    latent_rows_r: DevBuf,
     // ---- MoE, m rows ----
     scores_r: DevBuf,   // [m, n_experts] the bf16 gate's output
     route_idx_r: DevBuf, // [m, topk] i32
@@ -1019,6 +1032,34 @@ fn compress_side() -> bool {
 fn compress_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_COMPRESS_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, DEFAULT OFF): the verify block's
+/// `m` compressor rows as ONE `dsv41_compressor_fused_mrows` launch per
+/// compress-source layer instead of `m` `compressor_pool_on` + `compress_commit_on`
+/// pairs (the pool entry itself launches the state carry + the pool, so the per-row
+/// form is 3 kernel launches per row).
+///
+/// The rows are SERIAL BY CONSTRUCTION — the state carry's destination slot is
+/// position-derived (rows r and r+2 share a slot at ratio 2) and the commit's
+/// `*clen` / ring row is per-layer state — so the fused kernel loops `r` ascending
+/// inside its single block, reproducing each row's pool/commit bytes exactly. What
+/// the block-wide form does NOT reproduce is the READ SIDE's view of the shared
+/// counters, and that is why the caller must take the per-row snapshot outputs:
+///  * `clen_rows[owner][r]` — the counter after row r's commit — replaces the LIVE
+///    `*clen` for this layer's (and its consumers') per-row readers: `sparse_attn`,
+///    `comp_placeholder` and the indexer's `idx_lens`. Reading the live counter
+///    after the hoisted launch hands every row the BLOCK-FINAL count, which is
+///    exactly audit defect #1 (row 0 selects against its own future);
+///  * `latent_rows[r]` — row r's pooled row — replaces the shared `latent` for the
+///    per-row index key publish (`publish_index_key` reads it), which after the
+///    launch only holds the block's LAST pooled row.
+/// A layer whose compress is not hoisted keeps the live pointers, so the gate
+/// being OFF (the default) is the per-row path verbatim. Declines are announced
+/// once ([`Self::compress_rows_fused`]).
+fn compressor_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_COMPRESSOR_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
 /// MOE_DUAL (DSV41_MOE_DUAL, default ON): the MoE's SHARED expert half is issued
@@ -2839,6 +2880,10 @@ impl<'a> DevChain<'a> {
             idx_w_r: dev.alloc(fb(VERIFY_ROWS * cfg.index_n_heads.max(1)))?,
             kvp_r: dev.alloc(fb(VERIFY_ROWS * hd))?,
             scp_r: dev.alloc(fb(VERIFY_ROWS * hd))?,
+            // COMPRESSOR-MROWS scratch: allocated unconditionally (a static graph
+            // is worth more than the unused bytes when the gate is off).
+            clen_rows_r: dev.alloc(4 * cfg.n_layers * VERIFY_ROWS)?,
+            latent_rows_r: dev.alloc(fb(VERIFY_ROWS * hd))?,
             scores_r: dev.alloc(fb(VERIFY_ROWS * n_exp))?,
             route_idx_r: dev.alloc(4 * VERIFY_ROWS * topk)?,
             route_w_r: dev.alloc(fb(VERIFY_ROWS * topk))?,
@@ -8758,6 +8803,32 @@ impl<'a> DevChain<'a> {
         } else {
             0
         };
+        // COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, DEFAULT OFF): this layer's
+        // `m` pool+commit pairs as ONE `dsv41_compressor_fused_mrows` launch. It
+        // has to be issued HERE — after `compress_proj_rows` (whose `m` projection
+        // rows it consumes) and before the per-row interleave, whose `compress_row`
+        // calls it replaces — and it is what makes the read side below per-row
+        // aware: the hoisted launch commits all `m` rows first, so the LIVE
+        // counters it advances are block-final at every row, and each reader is
+        // handed the per-row snapshot instead (`mrows_clen` / `clen_row`).
+        //
+        // A consumer layer owns no compressor but reads its OWNER's counters, so
+        // it has to know how the owner ran: `mrows_compress_ok` is a pure function
+        // of (layer, m, pos_base, cfg, device), so asking it about the owner is
+        // exact and needs no per-layer flag that a rollback could leave stale.
+        let mut comp_len_rows = [0usize; VERIFY_ROWS];
+        let mrows_compress = if is_comp_src && comp_proj {
+            self.compress_rows_fused(layer, m, pos_base, &mut comp_len_rows)?
+        } else {
+            false
+        };
+        // The owner's block, for a layer that reads its counters (a consumer, or a
+        // source whose own hoist declined while its owner's took).
+        let mrows_own_owner = if is_comp_src {
+            mrows_compress
+        } else {
+            owner != layer && self.mrows_compress_ok(owner, m, pos_base)
+        };
         // P1v (DSV41_VERIFY_OROPE, default ON): take the EAGER path's fused
         // sparse-attention launch per row instead of the `sparse_attn` +
         // `apply_rope` + `quant_fp8` triple. See [`verify_orope`] for why this is
@@ -8802,7 +8873,19 @@ impl<'a> DevChain<'a> {
         // ON-but-declined announces itself once (the bring-up failure mode this
         // project keeps re-hitting is a gate that is ON and changes nothing).
         let mrows_attn = if attn_mrows() && m > 1 && m <= ATT_MROWS_MAX_BM {
-            if world != 1 {
+            if mrows_own_owner {
+                // COMPRESSOR-MROWS fence: the block-wide attention call bounds every row
+                // with `clen_rows[mm]`, which THIS arm hand-builds from the host mirror
+                // and passes as a HOST pointer (a separate, pre-existing defect of the
+                // `DSV41_ATTN_MROWS` arm). Under the compressor hoist the live counter
+                // is block-final as well, so taking both would read row r's future with
+                // no snapshot that a device kernel can use — refuse rather than corrupt.
+                attn_mrows_decline(
+                    "COMPRESSOR-MROWS hoisted this block's compressor: its per-row \
+                     counter snapshots live on the device, the W2-MROWS read has none",
+                );
+                false
+            } else if world != 1 {
                 attn_mrows_decline("world != 1: the row pitch is nh*hd, the kernels index h*d");
                 false
             } else if (pos_base as i64) + (m as i64) - 1 >= win as i64 {
@@ -8857,7 +8940,13 @@ impl<'a> DevChain<'a> {
             // (audit defect #1: the compressed half — the read side below must not
             // see the block's block-final counter.)
             let committed = if is_comp_src && comp_proj {
-                self.compress_row(layer, r, pos_base)?
+                if mrows_compress {
+                    // the hoisted launch already committed every row's group; the
+                    // rule is the deterministic one the commit kernel applied.
+                    (pos_base + r as i32 + 1) % (comp_ratio as i32) == 0
+                } else {
+                    self.compress_row(layer, r, pos_base)?
+                }
             } else {
                 false
             };
@@ -8866,10 +8955,30 @@ impl<'a> DevChain<'a> {
             // is the host mirror the row's commit just advanced (the device counter
             // the kernels read is the same value, advanced on this stream by the
             // same launch), for a consumer the constant the source published.
+            //
+            // COMPRESSOR-MROWS: the hoisted launch advanced the mirror for the WHOLE
+            // block up front, so the row's own value is the `comp_len_rows` entry it
+            // filled (`compress_row` is not called at all on this arm).
             let comp_len = if is_comp_src {
-                self.layers[layer].compress_len
+                if mrows_compress {
+                    comp_len_rows[r]
+                } else {
+                    self.layers[layer].compress_len
+                }
             } else {
                 comp_len_inherited
+            };
+            // COMPRESSOR-MROWS: the per-row counter snapshot this row's readers must
+            // use instead of the live counter — the owner's, since a consumer layer
+            // reads the OWNER's counter. `None` on the default path keeps the live
+            // pointer, byte for byte.
+            let clen_row = if mrows_own_owner {
+                Some(
+                    (self.s.clen_rows_r.ptr as *const std::os::raw::c_int)
+                        .wrapping_add(owner * VERIFY_ROWS + r),
+                )
+            } else {
+                None
             };
             if comp_len > 0 && is_idx_src {
                 // The row's own top-k, plus — for a layer that OWNS the keys — the
@@ -8878,7 +8987,7 @@ impl<'a> DevChain<'a> {
                 // order). Publishing per row instead of once per block is what
                 // keeps every group of the block addressable: the key of a group is
                 // written while `latent` still holds that group's pooled row.
-                self.indexer_rows_one(layer, r, win, comp_len, committed, idx_front)?;
+                self.indexer_rows_one(layer, r, win, comp_len, committed, idx_front, clen_row)?;
             } else if !owns_kv && comp_len > 0 {
                 // a non-index consumer reads the owner's selection, which the owner
                 // (an index source, running earlier in the stack) already wrote into
@@ -8889,7 +8998,7 @@ impl<'a> DevChain<'a> {
                 // bounded by the same live counter
                 self.dev.comp_placeholder(
                     (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist + win),
-                    clen_owner,
+                    clen_row.unwrap_or(clen_owner),
                     win as i32,
                     cfg.index_topk as i32,
                 )?;
@@ -8938,7 +9047,7 @@ impl<'a> DevChain<'a> {
                         1,
                         nlh as i32,
                         hd as i32,
-                        clen_owner,
+                        clen_row.unwrap_or(clen_owner),
                         win as i32,
                         cfg.index_topk as i32,
                         scale,
@@ -8976,7 +9085,7 @@ impl<'a> DevChain<'a> {
                         1,
                         nlh as i32,
                         hd as i32,
-                        clen_owner,
+                        clen_row.unwrap_or(clen_owner),
                         win as i32,
                         cfg.index_topk as i32,
                         scale,
@@ -9322,6 +9431,40 @@ impl<'a> DevChain<'a> {
     /// can skip it without duplicating the weight lookup. `&self`: every launch
     /// is read-only on the chain (the destination slots are the device buffers).
     fn publish_index_key(&self, layer: usize) -> Result<bool> {
+        let clen_layer = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer);
+        let latent_src = self.layers[layer].latent.ptr as *const f32;
+        self.publish_index_key_from(layer, latent_src, clen_layer)
+    }
+
+    /// [`Self::publish_index_key`] for a HOISTED block (COMPRESSOR-MROWS): the
+    /// source row `r`'s POOLED latent and row `r`'s OWN counter, instead of the
+    /// shared `latent` and the live `*clen`.
+    ///
+    /// Both substitutions are forced: a block-wide compressor launch leaves
+    /// `latent` holding the block's LAST pooled row and the live counter at the
+    /// block-final value, so the per-row publishes that follow would all write the
+    /// last group's key to the last group's slot — every earlier group of the block
+    /// would keep whatever key it had. `latent_rows_r + r*hd` and
+    /// `clen_rows_r[layer][r]` are the values the per-row interleave published from
+    /// (row r's own pool output and the counter between row r's commit and row
+    /// r+1's), so the bytes and the destination slots are identical.
+    fn publish_index_key_rows(&self, layer: usize, r: usize) -> Result<bool> {
+        let hd = self.cfg.head_dim;
+        let latent_src = (self.s.latent_rows_r.ptr as *const f32).wrapping_add(r * hd);
+        let clen_layer = (self.s.clen_rows_r.ptr as *const std::os::raw::c_int)
+            .wrapping_add(layer * VERIFY_ROWS + r);
+        self.publish_index_key_from(layer, latent_src, clen_layer)
+    }
+
+    /// The shared body of the two publish entries: `latent_src` is the pooled row
+    /// to project and `clen_layer` the counter the destination slot is derived
+    /// from (`*clen_layer - 1`, the same expression both callers used inline).
+    fn publish_index_key_from(
+        &self,
+        layer: usize,
+        latent_src: *const f32,
+        clen_layer: *const std::os::raw::c_int,
+    ) -> Result<bool> {
         let cfg = self.cfg;
         let ld = &self.w.layers[layer];
         let (Some(wk), Some(kn)) = (ld.idx_wk.as_ref(), ld.idx_k_norm.as_ref()) else {
@@ -9330,9 +9473,8 @@ impl<'a> DevChain<'a> {
         let idx_hd = cfg.index_head_dim.max(1);
         let rd = cfg.rope_head_dim;
         let ratio = cfg.compress_ratio(layer).max(1);
-        let clen_layer = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer);
         self.lin_bf16(
-            self.layers[layer].latent.ptr as *const f32,
+            latent_src,
             cfg.head_dim as i32,
             wk,
             idx_hd as i32,
@@ -9521,6 +9663,12 @@ impl<'a> DevChain<'a> {
     /// already produced is skipped here, because rows `0..m` of `idx_q_r` /
     /// `idx_w_r` hold byte-for-byte what the per-row launches below would write.
     /// `(false, false)` is the historical per-row behaviour verbatim.
+    ///
+    /// `mrows_clen` (COMPRESSOR-MROWS): `Some(ptr)` when this layer's or its
+    /// owner's block compressor was HOISTED into one launch — `ptr` is then the
+    /// owner's per-row counter snapshot (`clen_rows_r[owner][r]`), which is the
+    /// value the live `*clen` carried at this row's own read point. `None` keeps
+    /// the live counter pointer, i.e. the default path verbatim.
     fn indexer_rows_one(
         &mut self,
         layer: usize,
@@ -9529,6 +9677,7 @@ impl<'a> DevChain<'a> {
         comp_len: usize,
         publish_key: bool,
         front: (bool, bool),
+        mrows_clen: Option<*const std::os::raw::c_int>,
     ) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -9578,7 +9727,14 @@ impl<'a> DevChain<'a> {
         // gates the DIRECT path, whose launch sequence — and therefore whose
         // device effects — are unchanged.
         if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) {
-            self.publish_index_key(layer)?;
+            // COMPRESSOR-MROWS: a hoisted block leaves the shared `latent` at the
+            // block's LAST pooled row, so the per-row publish has to name its own
+            // row's copy and its own counter.
+            if mrows_clen.is_some() {
+                self.publish_index_key_rows(layer, r)?;
+            } else {
+                self.publish_index_key(layer)?;
+            }
         }
         // ---- this row's query, per-head weights and selection ----
         // The q_lora stream is already normed (attention_rows ran the plain
@@ -9626,8 +9782,13 @@ impl<'a> DevChain<'a> {
         }
         let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
         let key_owner = self.kv_owner(layer);
-        let idx_lens =
-            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(key_owner);
+        // COMPRESSOR-MROWS: the owner's hoisted block left its LIVE counter at the
+        // block-final value, so the selection reads the owner's per-row snapshot
+        // instead — the count this row's own read point had.
+        let idx_lens = match mrows_clen {
+            Some(p) => p,
+            None => (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(key_owner),
+        };
         let idx_k_ptr = self.layers[key_owner].index_k.ptr as *const f32;
         self.dev.indexer_topk(
             (self.s.idx_q_r.ptr as *const f32).wrapping_add(r * idx_nh * idx_hd),
@@ -9792,6 +9953,120 @@ impl<'a> DevChain<'a> {
             self.layers[layer].compress_len += 1;
         }
         Ok(committed)
+    }
+
+    /// The STATIC precondition of [`Self::compress_rows_fused`] — a pure function
+    /// of `(layer, m, pos_base, cfg, device)`, which is what lets
+    /// [`Self::attention_rows`] ask "was my (or my owner's) block hoisted?" for any
+    /// layer WITHOUT carrying a per-layer flag that a rollback could leave stale.
+    ///
+    /// False for: the gate off / a stale `.so`, `m < 2` (a single row is the
+    /// per-row path's business and keeps its exact launch sequence), `m >
+    /// VERIFY_ROWS`, the first step (`pos_base == 0` is the prefill state mapping),
+    /// `ratio == 1` (no gate, no state), and a layer that carries no compressor.
+    fn mrows_compress_ok(&self, layer: usize, m: usize, pos_base: i32) -> bool {
+        if !compressor_mrows() || !self.dev.supports_compressor_fused_mrows() {
+            return false;
+        }
+        if m < 2 || m > VERIFY_ROWS || pos_base <= 0 {
+            return false;
+        }
+        if self.cfg.compress_ratio(layer) <= 1 {
+            return false;
+        }
+        let ld = &self.w.layers[layer];
+        ld.comp_wkv.is_some() && ld.comp_norm.is_some()
+    }
+
+    /// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, DEFAULT OFF): ONE
+    /// `dsv41_compressor_fused_mrows` launch for this layer's WHOLE block — the `m`
+    /// `compressor_pool_on` + `compress_commit_on` pairs of [`Self::compress_row`]
+    /// collapsed into a single kernel whose block loops `r` ascending. The kernel
+    /// header carries the two cross-row dependencies that forbid anything else
+    /// (the position-derived state slot, so rows r and r+2 share one at ratio 2,
+    /// and the commit's `*clen` / ring row), and the per-row argument: every row's
+    /// pool/commit arithmetic is the same program, so the block's bytes equal what
+    /// `m` sequential rows leave.
+    ///
+    /// WHAT IT CHANGES FOR THE READERS (the reason the launch also writes the two
+    /// snapshots). [`Self::compress_row`]'s interleave works because row r's
+    /// commit is issued before row r's readers, so the LIVE device counter already
+    /// carries row r's value when they read it. A block-wide launch commits every
+    /// row first, so after it the live counter is the block-FINAL one at every row
+    /// — `sparse_attn`, `comp_placeholder` and the indexer must be handed
+    /// `clen_rows_r[layer][r]` instead (audit defect #1: otherwise row 0 selects
+    /// against its own future) — and the per-row index key publish must read
+    /// `latent_rows_r + r*hd`, because the shared `latent` only holds the last
+    /// row's pooled row. Both consumers are wired in [`Self::attention_rows`].
+    ///
+    /// Returns whether the arm TOOK. `false` (gate off, a shape the kernel cannot
+    /// take, an `.so` without the symbol) leaves the caller on the per-row path
+    /// verbatim: `compress_row` is then still the only writer of the state, the
+    /// ring and the counters. `comp_len_rows` receives the per-row HOST MIRROR —
+    /// the same deterministic rule the commit kernel applies, `(pos_base + r + 1) %
+    /// ratio == 0` — which the caller's per-row `comp_len` branch needs, and the
+    /// mirror field itself is advanced to the block-final count that `m`
+    /// `compress_row` calls would have left.
+    fn compress_rows_fused(
+        &mut self,
+        layer: usize,
+        m: usize,
+        pos_base: i32,
+        comp_len_rows: &mut [usize; VERIFY_ROWS],
+    ) -> Result<bool> {
+        if !self.mrows_compress_ok(layer, m, pos_base) {
+            return Ok(false);
+        }
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ratio_i = ratio as i32;
+        let ld = &self.w.layers[layer];
+        let (Some(_), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            return Ok(false);
+        };
+        let st = self.dev.stream();
+        self.dev.compressor_fused_mrows_on(
+            self.s.kvp_r.ptr as *const f32,
+            self.s.scp_r.ptr as *const f32,
+            norm.as_f32(),
+            self.layers[layer].state_kv.ptr as *mut f32,
+            self.layers[layer].state_score.ptr as *mut f32,
+            self.layers[layer].latent.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *mut i32,
+            self.cos_comp.as_f32(),
+            self.sin_comp.as_f32(),
+            self.layers[layer].ring.ptr as *mut f32,
+            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+            (self.s.clen_rows_r.ptr as *mut std::os::raw::c_int)
+                .wrapping_add(layer * VERIFY_ROWS),
+            self.s.latent_rows_r.ptr as *mut f32,
+            1,
+            m as i32,
+            hd as i32,
+            ratio_i,
+            cfg.rope_head_dim as i32,
+            (cfg.rope_head_dim / 2) as i32,
+            cfg.window_size as i32,
+            // `pos_rows[0] == pos_base`, and the kernel derives row r's position
+            // as `start_pos + r` — the same positions the per-row calls passed
+            // explicitly (`pos_base + r` with `pos_rows + r`).
+            self.s.pos_rows.ptr as *const std::os::raw::c_int,
+            cfg.norm_eps,
+            st,
+        )?;
+        // The host MIRROR, row by row, by the SAME deterministic rule the commit
+        // kernel applies on the device. Ended at the block-final count, which is
+        // what `m` per-row `compress_row` calls leave in the field.
+        let mut lens = self.layers[layer].compress_len;
+        for r in 0..m {
+            if (pos_base + r as i32 + 1) % ratio_i == 0 {
+                lens += 1;
+            }
+            comp_len_rows[r] = lens;
+        }
+        self.layers[layer].compress_len = lens;
+        Ok(true)
     }
 
     /// Multi-row engram write-back: the m-row twin of [`Self::engram_apply`].
@@ -11282,7 +11557,20 @@ fn fuse_b1() -> bool {
 /// chain bit for bit — the safe arm if a same-binary A/B is wanted.
 fn hc_verify_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *F.get_or_init(|| std::env::var("DSV41_HC_VERIFY_FUSE").map(|v| v != "0").unwrap_or(true))
+    // DEFAULT OFF (baseline-breakage fix, 2026-09-12): the fuse routes the
+    // verify's hc chain through the fused kernels (hc_collapse_norm with the
+    // truncate param + hc_post_inplace_rows), which reaches BF16_TRUNCATE
+    // into the verify for the FIRST time. The GPU A/B (9b55ea04) showed this
+    // arm BREAKS the zero-Latin baseline when combined with the P0-series
+    // commits (the exact interaction TBD — the fusion alone was clean at
+    // 1ddff9c): HC_VERIFY_FUSE=0 restores zero Latin at HEAD. The default is
+    // now OFF (=0 semantics: the historical 10-launch chain); set
+    // DSV41_HC_VERIFY_FUSE=1 to re-arm after the interaction is understood.
+    *F.get_or_init(|| {
+        std::env::var("DSV41_HC_VERIFY_FUSE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
 }
 
 /// The verify path's AR fold (`DSV41_VERIFY_AR_FOLD`, default OFF): `layer_rows`'

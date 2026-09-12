@@ -3337,6 +3337,157 @@ __global__ void compressor_fused_kernel(const float* __restrict__ kvp,
     }
 }
 
+// COMPRESSOR-MROWS (`DSV41_COMPRESSOR_MROWS=1`, default OFF): the verify block's
+// `seqlen = m` rows of the decode compressor in ONE 1-block launch —
+// `compressor_fused_kernel`'s three stages run `m` times back to back in
+// ASCENDING ROW ORDER.
+//
+// WHY THE ROWS CANNOT BE PARALLELISED (the two cross-row dependencies):
+//  * the state carry's destination is `slot_r = (start_pos + r) % ratio`, so at
+//    ratio 2 rows r and r+2 WRITE THE SAME SLOT: row r's pooled latent has to be
+//    taken before row r+2 overwrites the slot its group lives in. A grid over the
+//    rows (or any out-of-order schedule) would pool a mixture of two groups.
+//  * the commit's `*clen` (and with it the destination row `window + len`) is
+//    per-layer state: row r stores the group it completed at `len = *clen` and
+//    bumps the counter, so row r+1's group lands at `len + 1`. The ascending
+//    order IS the content of the counter.
+// A single block looping `r` ascending satisfies both, and it is also what makes
+// every row's arithmetic IDENTICAL to the per-row launch it replaces: the same
+// 128-thread decomposition, the same channel ownership (`cn`), the same shared
+// `s_red` warp + sequential cross-warp RMSNorm tree, the same expressions and the
+// same `group_first = len * ratio` rope row. The per-row pool+commit pair's bytes
+// are therefore reproduced row for row, and the block-final `state_kv` /
+// `state_score` / `ring` / `*clen` / `*out_rows` equal what `m` sequential
+// single-row calls leave.
+//
+// The two optional outputs are the READ SIDE's prerequisites, not part of the
+// pool/commit program (NULL means "do not write", which is what the launch that
+// only wants the bytes leaves them as):
+//  * `clen_rows`: `clen_rows[r]` = the value of the device counter AFTER row r's
+//    commit — exactly what a per-row reader issued between row r's commit and row
+//    r+1's would have read. A caller that HOISTS the whole block's compressor must
+//    hand its per-row readers this bound instead of the (block-final) live counter
+//    (audit defect #1: a row that selects against a later row's commits reads its
+//    own future).
+//  * `latent_rows`: `latent_rows[r*hd + c]` = `latent[c]` after row r's pool
+//    stage (for a row that completes no group the shared `latent` still holds the
+//    previous group's pooled row, and this copies exactly that — which is what the
+//    per-row path's publish read). The index key publish consumes `latent`, so a
+//    per-row publish hoisted past row r needs row r's copy.
+__global__ void compressor_fused_mrows_kernel(const float* __restrict__ kvp,
+                                              const float* __restrict__ scp,
+                                              const float* __restrict__ norm_w,
+                                              float* __restrict__ state_kv,
+                                              float* __restrict__ state_score,
+                                              float* __restrict__ latent,
+                                              int32_t* __restrict__ out_rows,
+                                              const float* __restrict__ cos_t,
+                                              const float* __restrict__ sin_t,
+                                              float* __restrict__ ring, int* __restrict__ clen,
+                                              int32_t* __restrict__ clen_rows,
+                                              float* __restrict__ latent_rows, int hd, int ratio,
+                                              int rope_dim, int half, int window, int seqlen,
+                                              const int* __restrict__ pos_ctr, float eps) {
+    const int tid = threadIdx.x, nthr = blockDim.x;
+    __shared__ float s_red[32];
+    const int start_pos = *pos_ctr;  // device-side: graph-capturable
+    float yv[16];
+    int cn[16];
+    int nown = 0;
+    for (int c = tid; c < hd; c += nthr) {
+        if (nown >= 16) break;
+        cn[nown++] = c;
+    }
+    for (int r = 0; r < seqlen; ++r) {
+        const int pos = start_pos + r;
+        const int slot = pos % ratio;
+        // ---- stage 1: state carry, this row's slot (position-derived, so two
+        //      rows of one group can share it — the ascending order is the fix) ----
+        for (int c = tid; c < hd; c += nthr) {
+            const size_t dst = (size_t)slot * hd + c;
+            const size_t src = (size_t)r * hd + c;
+            state_kv[dst] = kvp[src];
+            state_score[dst] = scp[src];
+        }
+        __syncthreads();
+
+        // ---- stage 2: pool + RMSNorm for this row (mode 2, bb == 0) ----
+        const int out_rows_val = ((pos + 1) % ratio == 0) ? 1 : 0;
+        if (tid == 0) *out_rows = out_rows_val;
+        if (out_rows_val) {
+            for (int i = 0; i < nown; ++i) {
+                const int c = cn[i];
+                float mx = -INFINITY;
+                float sv[32];
+                float vv[32];
+                const int rr = ratio < 32 ? ratio : 32;
+                for (int k = 0; k < rr; ++k) {
+                    sv[k] = state_score[(size_t)k * hd + c];
+                    vv[k] = state_kv[(size_t)k * hd + c];
+                    mx = fmaxf(mx, sv[k]);
+                }
+                float den = 0.f, acc = 0.f;
+                for (int k = 0; k < rr; ++k) {
+                    const float e = expf(sv[k] - mx);
+                    den += e;
+                    acc += e * vv[k];
+                }
+                yv[i] = den > 0.f ? acc / den : 0.f;
+            }
+            float ss = 0.f;
+            for (int i = 0; i < nown; ++i) ss += yv[i] * yv[i];
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                ss += __shfl_xor_sync(0xffffffffu, ss, off);
+            const int warp = tid >> 5, lane = tid & 31, nw = nthr >> 5;
+            if (lane == 0) s_red[warp] = ss;
+            __syncthreads();
+            float total = 0.f;
+            for (int widx = 0; widx < nw; ++widx) total += s_red[widx];
+            const float inv = rsqrtf(total / (float)hd + eps);
+            for (int i = 0; i < nown; ++i) {
+                const int c = cn[i];
+                latent[c] = yv[i] * inv * norm_w[c];  // out_row == bb == 0
+            }
+        }
+        __syncthreads();  // the pool's latent writes are visible to this row's copy + commit
+        if (latent_rows != nullptr) {
+            for (int c = tid; c < hd; c += nthr) latent_rows[(size_t)r * hd + c] = latent[c];
+        }
+
+        // ---- stage 3: commit this row (VERBATIM copy of compress_commit_kernel,
+        //      with the row's own out_rows_val driving it and the shared counter) ----
+        if (out_rows_val > 0) {
+            const int len = *clen;
+            const int group_first = len * ratio;
+            const int i0 = hd - rope_dim;
+            const float* cs_row = cos_t + (size_t)group_first * half;
+            const float* sn_row = sin_t + (size_t)group_first * half;
+            float* dst = ring + (size_t)(window + len) * hd;
+            for (int c = tid; c < hd; c += nthr) {
+                float v = latent[c];
+                if (c >= i0) {
+                    const int j = (c - i0) >> 1;
+                    const int base = i0 + (j << 1);
+                    const float x0 = latent[base];
+                    const float x1 = latent[base + 1];
+                    const float cv = cs_row[j];
+                    const float sv = sn_row[j];
+                    v = (c == base) ? (x0 * cv - x1 * sv) : (x0 * sv + x1 * cv);
+                }
+                dst[c] = v;
+            }
+            __syncthreads();  // every latent read is done before the bump
+            if (tid == 0) *clen = len + 1;
+        }
+        // The per-row counter snapshot: the value the DEVICE counter holds after
+        // this row's commit. Thread 0 wrote `*clen` itself in stage 3 (or left it
+        // alone on a row that completes no group), so this same-thread read is
+        // ordered by construction.
+        if (clen_rows != nullptr && tid == 0) clen_rows[r] = *clen;
+    }
+}
+
 }  // namespace
 
 #define DSV41_LAUNCH_CHECK()                     \
@@ -7615,6 +7766,33 @@ extern "C" int dsv41_compressor_fused(const float* kvp, const float* scp, const 
     compressor_fused_kernel<<<1, 128, 0, s>>>(kvp, scp, norm_w, state_kv, state_score, latent,
                                               out_rows, cos_t, sin_t, ring, clen, hd, ratio,
                                               rope_dim, half, window, pos_ctr, eps);
+    return (int)cudaGetLastError();
+}
+
+// COMPRESSOR-MROWS: the same three stages for `seqlen = m` rows (the verify
+// block), rows ascending inside the ONE 1-block launch — see
+// `compressor_fused_mrows_kernel` for the two cross-row dependencies that forbid
+// a grid over rows. SHAPE CONTRACT: `b == 1`, `seqlen >= 1`, `ratio > 1` (the
+// single-row / ratio-1 / prefill shapes keep the three-launch path, whose state
+// mapping differs). The caller (`chain_dev.rs::compress_rows_fused`) checks the
+// same shape gate plus the `DSV41_COMPRESSOR_MROWS` env flag, so a violation here
+// is a programming error, not a runtime decline.
+//
+// `seqlen == 1` is legal and reproduces `dsv41_compressor_fused` byte for byte
+// (same block size, same stage bodies), which is what makes the arm's m == 1 A/B
+// meaningful. `clen_rows` / `latent_rows` may be NULL (see the kernel header).
+extern "C" int dsv41_compressor_fused_mrows(
+    const float* kvp, const float* scp, const float* norm_w, float* state_kv, float* state_score,
+    float* latent, int32_t* out_rows, const float* cos_t, const float* sin_t, float* ring,
+    int* clen, int32_t* clen_rows, float* latent_rows, int b, int seqlen, int hd, int ratio,
+    int rope_dim, int half, int window, const int* pos_ctr, float eps, cudaStream_t s) {
+    if (b != 1 || seqlen < 1 || hd <= 0 || ratio <= 1 || rope_dim <= 0 || half <= 0 ||
+        window < 0)
+        return (int)cudaErrorInvalidValue;
+    compressor_fused_mrows_kernel<<<1, 128, 0, s>>>(kvp, scp, norm_w, state_kv, state_score,
+                                                    latent, out_rows, cos_t, sin_t, ring, clen,
+                                                    clen_rows, latent_rows, hd, ratio, rope_dim,
+                                                    half, window, seqlen, pos_ctr, eps);
     return (int)cudaGetLastError();
 }
 
