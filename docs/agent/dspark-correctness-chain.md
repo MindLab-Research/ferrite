@@ -5549,3 +5549,19 @@ epoch 1328 → 54（第一次 swallowed 步的均匀降级）
 **修正假设**：epoch 的降级发生在 pos=16 到 pos=22 之间（不是 pos=22 的步中！）——pre 在 pos=22 读到的已经是 54！
 
 **这改变了调查方向**：降级发生在早期（prefill 或第一个 spec 步），不是第一次 swallowed 步！
+
+## epoch 降级的最后假设排查——图回放不烘焙值
+
+**CUDA 图的语义**：图捕获 kernel 的启动参数（包括指针），回放用相同指针——**值是活的（动态读取）**。AR kernel 的 epoch 参数是指针（unsigned int* epoch）——回放时读当前值，不是捕获时的值。
+
+**排除的假设**：
+1. ❌ 图回放烘焙 epoch 值（指针不烘焙值）
+2. ❌ canary 越界写（CANARY=0——位置没被覆盖）
+3. ❌ 直接写小值（所有写入都是 e+1）
+
+**剩余的假设**（等 subagent 判决）：
+1. **staging 的 rollback/恢复**——SWALLOW 的 snapshot→rollback 恢复了 staging（包括 epoch 位置）到早期状态
+2. **不同 Collective 实例**——SWALLOW 路径用了不同的 comm（不同 staging → 不同 epoch 计数器）
+3. **epoch 的 u32 环绕**——不太可能（1328 远低于 u32 max）
+
+**完整 ledger 测试（38102d59）的价值**：rank=0 的完整 pre/note 序列——精确显示降级的时刻（哪一步、pre 还是 note）
