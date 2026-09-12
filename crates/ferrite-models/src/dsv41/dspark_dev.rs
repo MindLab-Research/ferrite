@@ -100,6 +100,32 @@ fn draft_head_fold() -> bool {
     })
 }
 
+/// ROUTED-EXPERTS ROW-FOLD (`DSV41_DRAFT_MOE_MROWS=1`, DEFAULT OFF): the draft's
+/// routed-expert half ([`DsparkDev::draft_moe`]) runs as ONE `rows = bs` launch
+/// per stage — gate/up, the optional separate swiglu, the fused down+reduce —
+/// where the per-row arm issues `bs` `rows = 1` launches of the SAME three
+/// launchers.
+///
+/// **What it removes.** `rows` is the launchers' THIRD grid dimension
+/// (`blockIdx.z`), so the per-row form pays `bs` kernel launches per stage per
+/// MTP block exactly as the pre-`moe-mrows-impl` call site did; the single call
+/// derives every row's pointers internally (see the layout contract at the
+/// launch site). Both arms are the same kernels with the same arguments, so the
+/// A/B is a launch-shape comparison and nothing else.
+///
+/// **Why it ships OFF.** The kernels' ROW INDEPENDENCE block argues row r of a
+/// `rows = m` call is the `rows = 1` launch for that row bit for bit (rows share
+/// no output, no accumulator, no smem staging — only base pointers move). That
+/// argument has to be confirmed on the real draft shape by the A/B (`dspark`
+/// parity + `verify_ms`) before the per-row form is retired — the same rule
+/// `DSV41_SH_EXP_MROWS` and `DSV41_ROW_FOLD_GATE` follow. Read ONCE and cached:
+/// this branch runs `bs` x n_mtp times per step, so a per-call getenv would be
+/// the hot-path slip every other gate in this file avoids.
+fn draft_moe_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_DRAFT_MOE_MROWS").map(|v| v != "0").unwrap_or(false))
+}
+
 /// The device draft. Holds the window rings (one per MTP block), every scratch
 /// buffer the forward needs, and references to the shared weights/config.
 pub struct DsparkDev<'a> {
@@ -1432,61 +1458,90 @@ impl<'a> DsparkDev<'a> {
                 } else {
                     (2 * inter_local) as i64
                 };
-                self.dev.expert_gate_up_fp4_batched(
-                    self.xq4.as_u8(),
-                    self.xsc4.as_f32(),
-                    self.ex_act_b.ptr as *mut f32,
-                    act_slot,
-                    bs as i32,
-                    dim as i32,
-                    inter_local as i32,
-                    cfg.swiglu_limit,
-                    topk as i32,
-                    strides.0,
-                    strides.1,
-                    strides.2,
-                    strides.3,
-                    strides.4,
-                    strides.5,
-                    strides.6,
-                    strides.7,
-                    ids,
-                    // Defect 1: the pool layout (was a hard-wired 0, which
-                    // only ever matched a non-interleaved pool).
-                    ld.experts_ilv as i32,
-                )?;
-                // Defect 2: the fused epilogue already applied swiglu in place,
-                // so the separate pass must be skipped exactly when it ran — it
-                // would otherwise read the never-written up half of every slot.
-                // The pass is element-wise and row-local and its kernel walks the
-                // same [rows][slot][slot_stride] layout, so one rows=bs launch
-                // replaces the per-row loop with no order to preserve.
-                if !gateup_fused {
-                    self.dev.swiglu_limit_batched(
-                        self.ex_act_b.ptr as *mut f32,
-                        bs as i32,
+                // DSV41_DRAFT_MOE_MROWS (DEFAULT OFF, see `draft_moe_mrows`):
+                // ONE `rows = bs` launch per stage when armed, `bs` `rows = 1`
+                // launches (one per activation row, at that row's OWN base
+                // pointers) when not. The two arms deliberately share this
+                // single call site — `rows` and the loop bound are the ONLY
+                // difference — so the A/B cannot drift apart in their arguments.
+                //
+                // `row_pitch` is the [row][slot][...] pitch the multi-row
+                // kernels derive internally (`slots * out_slot_stride` =
+                // `topk * act_slot`, the expression quoted in their layout
+                // contract); the per-row arm applies it on the host instead, as
+                // the call site did before the launchers grew a row dimension.
+                // Both address byte-identical locations, and every base pointer
+                // below is row r's own base either way: `r == 0` when the
+                // multi-row arm is armed, and the kernel then walks the
+                // remaining rows itself from `gridDim.y` (= slots = topk).
+                let row_pitch = (topk as usize) * (act_slot as usize);
+                let mrows = draft_moe_mrows();
+                let rows = if mrows { bs as i32 } else { 1 };
+                let n_launches = if mrows { 1 } else { bs };
+                for r in 0..n_launches {
+                    let xq4_r = self.xq4.as_u8().wrapping_add(r * (dim / 2));
+                    let xsc4_r = self.xsc4.as_f32().wrapping_add(r * (dim / 32));
+                    let act_r = (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch);
+                    let ids_r = ids.wrapping_add(r * topk);
+                    let out_r = (self.moe_out.ptr as *mut f32).wrapping_add(r * dim);
+                    let rw_r = (self.route_w.ptr as *const f32).wrapping_add(r * topk);
+                    self.dev.expert_gate_up_fp4_batched(
+                        xq4_r,
+                        xsc4_r,
+                        act_r,
+                        act_slot,
+                        rows,
+                        dim as i32,
                         inter_local as i32,
                         cfg.swiglu_limit,
-                        act_slot,
                         topk as i32,
+                        strides.0,
+                        strides.1,
+                        strides.2,
+                        strides.3,
+                        strides.4,
+                        strides.5,
+                        strides.6,
+                        strides.7,
+                        ids_r,
+                        // Defect 1: the pool layout (was a hard-wired 0, which
+                        // only ever matched a non-interleaved pool).
+                        ld.experts_ilv as i32,
+                    )?;
+                    // Defect 2: the fused epilogue already applied swiglu in
+                    // place, so the separate pass must be skipped exactly when
+                    // it ran — it would otherwise read the never-written up half
+                    // of every slot. The pass is element-wise and row-local and
+                    // its kernel walks the same [rows][slot][slot_stride]
+                    // layout, so one `rows = bs` launch replaces the per-row
+                    // loop with no order to preserve.
+                    if !gateup_fused {
+                        self.dev.swiglu_limit_batched(
+                            act_r,
+                            rows,
+                            inter_local as i32,
+                            cfg.swiglu_limit,
+                            act_slot,
+                            topk as i32,
+                        )?;
+                    }
+                    self.dev.expert_down_reduce_fp4_batched(
+                        act_r as *const f32,
+                        act_slot,
+                        out_r,
+                        rows,
+                        dim as i32,
+                        inter_local as i32,
+                        rw_r,
+                        1,
+                        topk as i32,
+                        strides.8,
+                        strides.9,
+                        strides.10,
+                        strides.11,
+                        ids_r,
                     )?;
                 }
-                self.dev.expert_down_reduce_fp4_batched(
-                    self.ex_act_b.ptr as *const f32,
-                    act_slot,
-                    self.moe_out.ptr as *mut f32,
-                    bs as i32,
-                    dim as i32,
-                    inter_local as i32,
-                    self.route_w.ptr as *const f32,
-                    1,
-                    topk as i32,
-                    strides.8,
-                    strides.9,
-                    strides.10,
-                    strides.11,
-                    ids,
-                )?;
             } else {
                 // Defect 3 (audit-moe-seg): the sequential `*_indirect` readers
                 // walk the plain [w1][w3] pools; against an interleaved pool they
