@@ -1859,3 +1859,19 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 - 需要调查 b_split/gather 的指针对齐（tcgen05-test-analysis 预测的两个 [OPEN] 解码猜测之一可能就是根因）
 
 **下一步**：tcgen05 的对齐修复是 kernel 级工作（需要读 dsv41_experts_mxf4.cu 的 e4x 块）——不阻塞当前 400 路径（tcgen05 是性能优化，不是正确性）
+
+## tcgen05 misaligned address 的根因（kernel 级）
+
+**e4x kernel 的 A 操作数加载**（dsv41_experts_mxf4.cu:361/:415）：
+```cuda
+val = *reinterpret_cast<const uint4*>(a + (size_t)row * (k >> 1) + ...);
+```
+
+**uint4 需要 16 字节对齐**。k>>1（每行 e4m3 字节数 = 2304/2 = 1152）是 16 的倍数 ✓，但**基址 `a` 可能不 16B 对齐**（gathered buffer 的 DevBuf 分配可能返回非对齐指针）。
+
+**修复方向**：
+1. gathered buffer 的分配加 16B 对齐（DevBuf 的 alloc 加 align 参数）
+2. 或 A 的加载改用 `char4`（4B 对齐）× 4 次代替 uint4（1 次）
+3. 或在 gather kernel 里把基址 pad 到 16B
+
+**不阻塞 400 路径**——tcgen05 是性能优化（-1~-2.8ms 修正口径），kernel 级修复留给下一轮。
