@@ -3443,3 +3443,26 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 3. 在损坏位置（~token 100）附近检查 KV ring 的状态
 
 **临时缓解**：RING_WIN_FUSE 默认 OFF（已经是）——不开启即可
+
+## 出师表损坏的二分分析（进行中）
+
+**已确认**：
+1. 全栈（84.0 tok/s @ 计数）在出师表上损坏（拉丁 'opa','eba','denominación'）
+2. **RING_WIN_FUSE 不是罪魁**（二分1：无 RING_WIN_FUSE 同样损坏）
+3. **LAZY_SDR 的 D2D 合并已验证逐位等价**（dpitch=VERIFY_ROWS*row_bytes, spitch=row_bytes 的计算正确）
+4. **任务依赖**：计数（高 accept k_emit=6）干净 / 出师表（低 accept k_emit=2.2）损坏——rollback 路径是差异
+5. **位置依赖**：损坏在 ~token 100（前 ~100 字正确）
+
+**二分矩阵**：
+| 测试 | 配置 | 结果 |
+|---|---|---|
+| 二分1 (e2d163ac) | 全栈 - RING_WIN_FUSE | ❌ 损坏 |
+| 二分2 (7c9fadd6) | base + R2（无 FORK/MARKOV/LAZY_SDR）| 🔄 跑中 |
+| 二分3（待定） | base + R2 + INDEXER_QR_RAW=0（禁 R2b）| 待跑 |
+
+**嫌疑排序**（更新后）：
+1. **R2b（INDEXER_QR_RAW）**：indexer 消费未归一化 qr——如果 lin_rope_norm 的归一化与外部 norm_rows 不完全等价（数值域差异），indexer 的选点会错
+2. **R2（ATTN_LIN_FUSE）**：lin2/lin_rope_norm 的复用——从未在出师表上测过！
+3. **VERIFY_FORK**：流并行的竞态（在 rollback 路径）
+4. ~~LAZY_SDR~~：D2D 合并已验证等价 + set_pos_ctr 已恢复
+5. ~~MARKOV_SLICED~~：draft 侧（不影响 verify 的正确性）
