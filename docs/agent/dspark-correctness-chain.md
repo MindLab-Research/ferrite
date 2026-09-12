@@ -2926,3 +2926,27 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - **要到 400 需要步时 ≤15ms**——当前 33ms 差距 2.2×
 - 已识别的优化总计 ~-8.5ms（L2+L4+L5+L4占用）→ 24.5ms → 245 tok/s（不是 400）
 - **剩余 9.5ms 需要更深的 kernel 工作**（L5 流水 + 族级融合）
+
+## 🎯 nsys per-kernel 准确计时结果（7e1516bd——首个真实数据）
+
+**配置**：Wave 1 + SH_PAIR_M=1 + lazy verify + VERIFY_GRAPH + AR_V5=0(nccl) + 计数任务（1-100, 500 max）
+
+**结果**（cuda_gpu_kern_sum——只显示非图 replay 的 kernel）：
+| 排名 | Time% | 总时间(ms) | 实例数 | 平均(μs) | Kernel | 对应族 |
+|---|---|---|---|---|---|---|
+| 1 | 25.1% | 34.9 | 15,744 | 2.2 | interleave_gateup_fp4 | MoE 路由专家（gate/up 交错）|
+| 2 | 24.0% | 33.4 | 2,871 | 11.7 | gemm_fp8_gemv | 投影+共享专家 |
+| 3 | 10.1% | 14.1 | 934 | 15.1 | hc_dots_late | hc 链（dots 计算）|
+| 4 | 6.9% | 9.6 | 467 | 20.5 | expert_gemv_fp4_batched | MoE 路由专家 |
+| 5 | 6.1% | 8.5 | 467 | 18.2 | expert_gemv_fp4_down | MoE 路由专家（down）|
+| 6 | 5.0% | 7.0 | 934 | 7.5 | hc_mixes_tail | hc 链（mixes）|
+
+**关键发现**：
+1. **MoE 路由专家三件套（#1+#4+#5）= 38.1% 的可见 kernel 时间**——tcgen05 会替换这三项！
+2. **fp8 GEMV（#2）= 24.0%**——投影+共享专家的 GEMV
+3. **hc 链（#3+#6）= 15.1%**——已经融合（A1+A2）但 hc_dots_late 仍然显著
+4. **图 replay 的 kernel 不在此报告中**——verify graph 内的 kernel 被 nsys 的 kern_sum 遗漏
+
+**⚠️ 注意**：nsys 的 kern_sum 只显示非图 kernel。图 replay 的 kernel（verify 的主要部分）不在统计中。完整图需要用 cuda_gpu_trace 或关闭图重测。
+
+**tcgen05 的潜在收益**：替换 38.1% 的可见 kernel 时间（三件套）→ 如果可见部分代表 ~50% 的总时间，tcgen05 节省 ~19% 总时间。
