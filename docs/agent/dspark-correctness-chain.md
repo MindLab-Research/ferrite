@@ -1718,3 +1718,17 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **根因**：SWALLOW_STEP 的 m=6 形状与 VERIFY_HEAD_MROWS 的 sliced argmax 交换死锁（m=6 的 stamp 序列不匹配）
 **workaround**：SWALLOW_STEP + VERIFY_HEAD_MROWS 不同时开；或先修 argmax_rows 的 m=6 支持
 **用户指示**：timeout 应 5 分钟内
+
+## DRAFT_HEAD_FOLD v1 修复验证的结果解读（等 ab864a71）
+
+**测试**：最新代码（draft head 用 gemv_bf16_v1_mrows，位级与 verify 的 v1 per-row 一致）+ LAZY_VERIFY + BF16_TRUNCATE + TAP_INPUT + DRAFT_BF16_DOMAIN
+
+**结果→行动**：
+| accept | 判定 | 含义 | 下一步 |
+|---|---|---|---|
+| 1.5-2.0+ | **修复成功** ✓ | program 不匹配是链式失败根因 | S2（TAP_BF16/DRAFT_ATTN A/B）+ 性能组合 |
+| ~1.2（不变）| program 不匹配非主因 | 其他数值差异主导 | 回到 draft-verify program audit 的其他发现 |
+| <1.1（退化）| v1 mrows 有问题 | 检查 kernel 的位级等价 | 回退修复 |
+| 拉丁出现 | 修复破坏基线 | v1 mrows 与 v2 有未预期的差异 | 立即回退 |
+
+**关键**：这是 accept 战役的最重要测试——如果成功，从 1.214 到 1.5+ 是 +24% 的吞吐提升。
