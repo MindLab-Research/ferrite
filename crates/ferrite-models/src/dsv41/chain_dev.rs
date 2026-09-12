@@ -3287,32 +3287,39 @@ impl<'a> DevChain<'a> {
         let owner = if ring_owner_shared() { self.kv_owner(layer) } else { layer };
         let owns_kv = owner == layer;
         let ring_ptr = self.layers[owner].ring.ptr;
-        if owns_kv {
-            self.dev.verify_ring_win(
-                ring_ptr as *mut f32,
-                self.s.kv_r.ptr as *const f32,
-                pos_ctr,
-                win as i32,
-                hd as i32,
-                m as i32,
-                self.s.idxs_win_r.ptr as *mut i32,
-            )?;
-        }
-        // The kernel's index half writes `[m, window]` with a `window` row stride
-        // (it never had to fill a wider row), while `sparse_attn` reads
-        // `[m, window + index_topk]` so the indexer's picks can follow each row's
-        // window block. Copy each row's block into place. The window itself is a
-        // function of the positions and the ring only, so a consumer layer's block
-        // is the owner's, unchanged — no second `verify_ring_win` (which would
-        // append the consumer's kv rows a second time).
         let ist = win + cfg.index_topk;
-        for r in 0..m {
-            self.dev.memcpy_d2d(
-                (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist) as *mut c_void,
-                (self.s.idxs_win_r.ptr as *const i32).wrapping_add(r * win) as *const c_void,
-                win * 4,
-            )?;
+        if owns_kv {
+            // PER-ROW append + PER-ROW causal window, interleaved: row r's
+            // `window_idxs` must run after row r's append (its own KV is in the
+            // window) but BEFORE row r+1's append (which would overwrite the
+            // oldest slot that row r's window still enumerates — reading the
+            // block's future row as history instead). The fused verify_ring_win
+            // appended the whole block first and derived the indices from slot
+            // numbers, which broke exactly there: once base+r >= window the
+            // `v > start_pos` filter never fires (v is a SLOT, not a position)
+            // and every row but the last read the block's own future rows while
+            // losing the oldest m-1-r history — the "verify outputs garbage"
+            // root cause. The single-row kernels keep the ring invariant row by
+            // row, so the window is byte-identical to a single-row decode at
+            // each row's position.
+            for r in 0..m {
+                self.dev.ring_append(
+                    ring_ptr as *mut f32,
+                    (self.s.kv_r.ptr as *const f32).wrapping_add(r * hd),
+                    (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                    win as i32,
+                    hd as i32,
+                )?;
+                self.dev.window_idxs(
+                    (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist),
+                    (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                    win as i32,
+                )?;
+            }
         }
+        // A consumer layer's window block is the owner's (the indices depend
+        // only on the positions and the ring geometry, and the owner filled
+        // idxs_r interleaved with its appends) — no append, no recompute.
 
         // ---- compressor + the compressed-half selection ----
         let comp_len = if cfg.compress_ratio(layer) > 0 && cfg.is_kv_source(layer) {
@@ -3639,41 +3646,53 @@ impl<'a> DevChain<'a> {
             // independently, so all m rows are zeroed.
             self.dev.zero_on(&self.s.scp_r, st)?;
         }
-        self.dev.compressor_pool_on(
-            self.s.kvp_r.as_f32(),
-            self.s.scp_r.as_f32(),
-            norm.as_f32(),
-            self.layers[layer].state_kv.ptr as *mut f32,
-            self.layers[layer].state_score.ptr as *mut f32,
-            self.layers[layer].latent.ptr as *mut f32,
-            self.layers[layer].out_rows.ptr as *mut i32,
-            1,
-            m as i32,
-            hd as i32,
-            ratio as i32,
-            pos_base,
-            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
-            cfg.norm_eps,
-            st,
-        )?;
-        self.dev.compress_commit_on(
-            self.layers[layer].latent.as_f32(),
-            self.cos_comp.as_f32(),
-            self.sin_comp.as_f32(),
-            self.layers[layer].ring.ptr as *mut f32,
-            self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
-            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
-            hd as i32,
-            cfg.rope_head_dim as i32,
-            (cfg.rope_head_dim / 2) as i32,
-            cfg.window_size as i32,
-            ratio as i32,
-            st,
-        )?;
-        // The host MIRROR of the device counter, by the SAME deterministic rule the
-        // commit kernel applies ((*pos_ctr + 1) % ratio == 0 commits one latent).
-        if (pos_base + 1) % (ratio as i32) == 0 {
-            self.layers[layer].compress_len += 1;
+        // PER-ROW single-token pool+commit: the pool's state decode branch and
+        // the commit's completion rule are per-POSITION. Running them once with
+        // seqlen=m only consumed ROW 0 — rows 1..m-1's kvp/scp never entered
+        // the state and the groups they completed never existed (the audit's
+        // defect #2; the operator-visible symptom was "the latent the draft
+        // sees never updates"). Each row now runs the SAME triple the
+        // single-row decode runs, at its own position (pos_rows[r]), so the
+        // compressed state after the block is exactly what m sequential
+        // single-row steps would leave.
+        for r in 0..m {
+            self.dev.compressor_pool_on(
+                (self.s.kvp_r.ptr as *const f32).wrapping_add(r * hd),
+                (self.s.scp_r.ptr as *const f32).wrapping_add(r * hd),
+                norm.as_f32(),
+                self.layers[layer].state_kv.ptr as *mut f32,
+                self.layers[layer].state_score.ptr as *mut f32,
+                self.layers[layer].latent.ptr as *mut f32,
+                self.layers[layer].out_rows.ptr as *mut i32,
+                1,
+                1,
+                hd as i32,
+                ratio as i32,
+                pos_base + r as i32,
+                (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                cfg.norm_eps,
+                st,
+            )?;
+            self.dev.compress_commit_on(
+                self.layers[layer].latent.as_f32(),
+                self.cos_comp.as_f32(),
+                self.sin_comp.as_f32(),
+                self.layers[layer].ring.ptr as *mut f32,
+                self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+                (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+                hd as i32,
+                cfg.rope_head_dim as i32,
+                (cfg.rope_head_dim / 2) as i32,
+                cfg.window_size as i32,
+                ratio as i32,
+                st,
+            )?;
+            // The host MIRROR of the device counter, by the SAME deterministic
+            // rule the commit kernel applies ((*pos + 1) % ratio == 0 commits
+            // one latent) — per row.
+            if (pos_base + r as i32 + 1) % (ratio as i32) == 0 {
+                self.layers[layer].compress_len += 1;
+            }
         }
         Ok(self.layers[layer].compress_len)
     }
