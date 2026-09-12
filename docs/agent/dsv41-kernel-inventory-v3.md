@@ -280,6 +280,9 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 ### 4.2 gateup 的 FMA 累加器结构（2026-09-11 分析）：**4 累加器→2 否决**
 
 **当前结构**（`dsv41_experts_mxf4.cu:1060-1232`，`ILV=true` 且 fuse 默认 ON ⇒ 这是生产路径；
+⚠️ 2026-09-12 起这个 body 叫 **PAIR body**：`pair_body = (fuse_swiglu || ILV) && b_split > 0` —— ILV 只选**读**、
+`fuse` 只选**写**（swiglu 后 `[inter]`，或原始 gate|up 对写 `out[row]`/`out[b_split+row]`），两者独立，
+所以下面描述的结构在 E4M3 双趟的 raw 模式下逐条成立（`n_total` 仍是 `inter`）；
 `k = dim = 5120` → `nv2f = k>>9 = 10` 组/lane；`n_total = inter`，TP8 下 320 行/slot，6 slot）：
 
 - **组内 4 个临时累加器**，不是跨组累加器：gate 链 `gp0..gp3`（`:1131`），每个串 **4 个 `fmaf`**（链深 4），

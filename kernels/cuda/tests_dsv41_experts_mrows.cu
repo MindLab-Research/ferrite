@@ -44,8 +44,9 @@
 // ENV THAT CHANGES WHAT IS COVERED (all read once per process, before main):
 //   DSV41_GATEUP_FUSE=0  forces the UNFUSED layout at every shape; the "fused"
 //                        arms are then skipped and reported as SKIP (the
-//                        interleaved arms cannot run at all: the launcher
-//                        rejects ilv+unfused, which is itself checked);
+//                        interleaved arms still run: the ILV read path is
+//                        decoupled from the epilogue, and the raw-pair cases
+//                        below cover it directly);
 //   DSV41_EXPERT_ILV     is a LOADER decision on the Rust side; this test forms
 //                        the interleaved pool itself with the real
 //                        dsv41_interleave_gateup_fp4 launcher, so both layouts
@@ -221,13 +222,21 @@ double mr_dot(const uint8_t* packed, const uint8_t* sc, int row, int cols, const
 // slots*act_stride); a disagreement in either pitch breaks the bit-equality arm.
 // ---------------------------------------------------------------------------
 int mr_case_chain(const char* tag, int dim, int inter, int slots, int rows, int ne, float limit,
-                  bool ilv) {
-    const bool fused = mr_gateup_fused(dim);
+                  bool ilv, bool raw = false) {
+    // `raw` asks for the RAW gate|up pair epilogue (the caller's pitch is
+    // 2*inter) even where the fused epilogue is available - i.e. exactly what the
+    // e2m1x2 two-pass arm asks for. The launcher binds `fuse` to the pitch, so
+    // this flag only has to move act_slot.
+    const bool fused = !raw && mr_gateup_fused(dim);
     const int act_slot = fused ? inter : 2 * inter;
     printf("  [%s] dim=%d inter=%d slots=%d rows=%d ne=%d limit=%g ilv=%d fused=%d\n", tag, dim,
            inter, slots, rows, ne, (double)limit, (int)ilv, (int)fused);
-    if (ilv && !fused) {
-        printf("    SKIP: ilv needs the fused body (DSV41_GATEUP_FUSE=0)\n");
+    // ILV + raw-pair at dim % 512 == 0 IS legal (the read path and the epilogue
+    // are decoupled) - what the pair body still needs is its K contract: whole
+    // 512-value groups, no tail. dim=256 therefore stays refused (the negative
+    // control below checks it).
+    if (ilv && (dim % 512) != 0) {
+        printf("    SKIP: ilv needs the pair body's K contract (dim %% 512 == 0)\n");
         return 0;
     }
 
@@ -629,12 +638,17 @@ int mr_case_swiglu(const char* tag, int inter, int slots, int rows, float limit)
 }
 
 // ---------------------------------------------------------------------------
-// Negative control: the ilv + UNFUSED combination must still be REFUSED (the
-// unfused body walks the w3 pool separately, so an interleaved pool would be read
-// as the wrong bytes - the launcher's loud `cudaErrorInvalidValue`).
+// Negative control: ilv + a dim the pair body CANNOT walk must still be REFUSED.
+// The interleaved read path is now decoupled from the epilogue (raw pair AND
+// swiglu'd are both legal - see mr_case_chain's raw/ilv arm), so the one
+// remaining hard requirement is the pair body's K contract, dim % 512 == 0: it
+// walks whole 512-value groups (`nv2f = k >> 9`) and has no tail, so an
+// interleaved pool at dim=256 would silently skip the tail of every row. The
+// launcher refuses it with cudaErrorInvalidValue.
 // ---------------------------------------------------------------------------
 int mr_case_ilv_refused(void) {
-    printf("  [ilv-refused] dim=256 (unfused) + ilv=1 must return cudaErrorInvalidValue\n");
+    printf("  [ilv-refused] dim=256 (not a multiple of 512) + ilv=1 must return "
+           "cudaErrorInvalidValue\n");
     const int dim = 256, inter = 32, slots = 1, rows = 1, ne = 1;
     std::vector<uint8_t> w1p((size_t)inter * (dim / 2)), w1s((size_t)inter * (dim / 32));
     std::vector<uint8_t> w3p((size_t)inter * (dim / 2)), w3s((size_t)inter * (dim / 32));
@@ -701,6 +715,13 @@ int main(int argc, char** argv) {
     g_fails += mr_case_chain("fused/plain", 512, 128, 3, 5, 4, 10.f, false);
     // The INTERLEAVED pool (DSV41_EXPERT_ILV, default ON on the Rust side).
     g_fails += mr_case_chain("fused/ilv", 512, 128, 3, 5, 4, 10.f, true);
+    // THE DECOUPLED ARM (2026-09-12): the interleaved READ path with the RAW
+    // gate|up pair epilogue - the exact combination the e2m1x2 two-pass arm
+    // needs (pitch 2*inter), which used to be a hard cudaErrorInvalidValue. The
+    // plain-pool raw arm at the same shape is new coverage too: it is the only
+    // case that runs the SPLIT body at the production dim with K-split off.
+    g_fails += mr_case_chain("raw/ilv", 512, 128, 3, 5, 4, 10.f, true, true);
+    g_fails += mr_case_chain("raw/plain", 512, 128, 3, 5, 4, 10.f, false, true);
     // limit <= 0: the clamp branch is skipped in the kernel AND in the golden.
     g_fails += mr_case_chain("fused/nolimit", 512, 128, 2, 3, 3, 0.f, false);
     if (!quick) {

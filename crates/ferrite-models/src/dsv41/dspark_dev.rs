@@ -301,6 +301,17 @@ pub struct DsparkDev<'a> {
     xsc: DevBuf,
     xq4: DevBuf,
     xsc4: DevBuf,
+    /// e2m1x2 (`DSV41_EXPERT_ACT_E4M3`, default OFF): the SECOND pass of the
+    /// activation decomposition, mirroring the backbone's `Scratch` fields of
+    /// the same name. `xq4`/`xsc4` hold the first term q_hi (the existing
+    /// single-pass quantisation, unchanged); these hold
+    /// q_lo = quant_fp4(xn - dequant(q_hi)), and `xres` is the f32 residual
+    /// between them. All three are read ONLY while the gate is armed, but they
+    /// are allocated unconditionally (a few KB each: capture-legal, and sizing
+    /// needs no gate).
+    xq4_lo: DevBuf,
+    xsc4_lo: DevBuf,
+    xres: DevBuf,
     pre_in: DevBuf,
     pre_attn: DevBuf,
     pre_ffn: DevBuf,
@@ -344,6 +355,11 @@ pub struct DsparkDev<'a> {
     route_idx: DevBuf,
     ex_act: DevBuf,
     ex_act_b: DevBuf,
+    /// e2m1x2 only: the second pass's gate/up outputs, accumulated into
+    /// `ex_act_b` by `add_inplace_raw` BEFORE swiglu (swiglu is non-linear, so
+    /// the two passes must be summed in the GEMM domain). Same `[bs][topk]`
+    /// row/slot layout and pitch as `ex_act_b`.
+    ex_act_lo: DevBuf,
     moe_out: DevBuf,
     shared_out: DevBuf,
 
@@ -491,6 +507,12 @@ impl<'a> DsparkDev<'a> {
             xsc: dev.alloc(fb(max_act / 32 + 8))?,
             xq4: dev.alloc((bs * dim / 2).max(8))?,
             xsc4: dev.alloc(fb(bs * dim / 32 + 8))?,
+            // e2m1x2 scratch (DSV41_EXPERT_ACT_E4M3, default OFF): the second
+            // pass's packing/scales/residual — sized like `xq4`/`xsc4` (the
+            // quantiser's own `[bs][dim]` layout) and the f32 residual.
+            xq4_lo: dev.alloc((bs * dim / 2).max(8))?,
+            xsc4_lo: dev.alloc(fb(bs * dim / 32 + 8))?,
+            xres: dev.alloc(fb(bs * dim))?,
             pre_in: dev.alloc(fb(bs * hc))?,
             pre_attn: dev.alloc(fb(bs * hc))?,
             pre_ffn: dev.alloc(fb(bs * hc))?,
@@ -521,6 +543,11 @@ impl<'a> DsparkDev<'a> {
             // the size has to clear both.
             ex_act: dev.alloc(fb(bs * 2 * inter_local.max(sh_il)))?,
             ex_act_b: dev.alloc(fb(mo_topk * bs * 2 * inter_local))?,
+            // e2m1x2 only: the second gate/up pass's output, the same
+            // `[bs][topk][2*inter_local]` shape/pitch as `ex_act_b` it is summed
+            // into (before swiglu). Allocated unconditionally, like the
+            // backbone's `Scratch::ex_act_lo`.
+            ex_act_lo: dev.alloc(fb(mo_topk * bs * 2 * inter_local))?,
             moe_out: dev.alloc(fb(bs * dim))?,
             shared_out: dev.alloc(fb(bs * dim))?,
             pre_mean: dev.alloc(fb(hc))?,
@@ -1631,18 +1658,21 @@ impl<'a> DsparkDev<'a> {
             // MoE-segment 138% deviation. `experts_ilv` must not veto the batched
             // path; it is handed to the kernel instead.
             if self.dev.supports_moe_batch() {
-                // The interleaved layout is readable only by the FUSED body (the
-                // unfused arm walks the w3 pool separately), and the kernel
-                // rejects `ilv && !fuse` with cudaErrorInvalidValue. Refuse here,
-                // loudly, instead of launching a call that must fail — the same
-                // contract `moe_rows` enforces (`chain_dev.rs:5341-5351`).
-                if ld.experts_ilv && !gateup_fused {
+                // The interleaved layout is readable by the batched gate/up call
+                // with EITHER epilogue now (see chain_dev.rs::moe_rows): the
+                // kernel's gate/up PAIR body derives the up bytes from the gate
+                // pointer and reads ONE LDG.128 per group, and its epilogue is
+                // chosen by the caller's slot pitch. `gateup_fused == false` no
+                // longer means "unreadable pool" — it means the raw [2*inter]
+                // pair is written and the separate swiglu pass below runs on it.
+                // What still binds is the pair body's K contract, dim % 512 == 0
+                // (no tail loop; the launcher refuses the combination loudly).
+                if ld.experts_ilv && (dim % 512) != 0 {
                     return Err(FerriteError::Config(
                         "draft_moe: routed expert gate/up weights are interleaved \
-                         (DSV41_EXPERT_ILV) but the fused batched gate/up path is \
-                         unavailable — run with DSV41_EXPERT_ILV=0, or restore \
-                         DSV41_GATEUP_FUSE / DSV41_EXPERT_FP4_MODE=2 so the fused batched \
-                         call is used"
+                         (DSV41_EXPERT_ILV) but dim % 512 != 0 — the interleaved pair body \
+                         walks whole 512-value groups and has no tail; run with \
+                         DSV41_EXPERT_ILV=0 or on a dim divisible by 512"
                             .into(),
                     ));
                 }

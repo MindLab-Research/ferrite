@@ -51,7 +51,7 @@
 - 交错前的两端源都是从 `tmp` scratch 拷入的 8B 对齐指针（`w1b%8==0` 保证 `tmp+w1b` 对齐）；`dst`=池基址+`e*block` 同理。
 
 **改动点**：
-- `kernels/cuda/dsv41_experts_mxf4.cu`：`expert_gemv_fp4_batched_kernel` 变 `template <bool ILV>`（融合分支一次 uint4 取 4 word；`ILV=false` 实例代码与原来同源）；新增 `dsv41_interleave_gateup_fp4`（加载期置换核，device-to-device）；`dsv41_expert_gate_up_fp4_batched` 增尾参 `int ilv`，`ilv && !fuse` 直接返回错误。
+- `kernels/cuda/dsv41_experts_mxf4.cu`：`expert_gemv_fp4_batched_kernel` 变 `template <bool ILV>`（融合分支一次 uint4 取 4 word；`ILV=false` 实例代码与原来同源）；新增 `dsv41_interleave_gateup_fp4`（加载期置换核，device-to-device）；`dsv41_expert_gate_up_fp4_batched` 增尾参 `int ilv`。**2026-09-12 解耦**：`ilv && !fuse` 不再是错误——`ilv` 选**读**（gate/up PAIR body，一次 LDG.128 取一行的两半），`fuse` 选**写**（swiglu 后的 `[inter]` vs 原始 gate|up 对写进 `out[row]`/`out[b_split+row]`）。该组合正是 e2m1×2 双趟（pitch `2*inter`）需要的；唯一保留的硬要求是 PAIR body 的 K 契约 `dim%512==0`（整 512 值组、无尾巴），不满足仍 `cudaErrorInvalidValue`。
 - `crates/ferrite-models/src/dsv41/load.rs`：`load_expert_pool(..., ilv)` 重排偏移 + 临时 scratch（一次 zero，padding 行保持 0）+ 逐 expert 调置换核；`ilv_ok()` 汇总所有加载期前提（MOE_BATCH/GATEUP_FUSE 未关、`DSV41_NO_GEMV_FP4` 未设、mode==2、`dim%512==0`、.so 三个符号齐备）；`LayerDev.experts_ilv` 记录实际布局。
 - `chain_dev.rs`：把 `ilv` 传给 batched 调用；**交错布局下若非 batched 路径直接报错**（顺序/未融合版无法寻址交错池）。
 - `weights.rs`：`gateup_ilv()` env（`DSV41_EXPERT_ILV=0` 关闭）；无新符号的旧 .so 自动退化为原布局。

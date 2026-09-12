@@ -315,7 +315,7 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 
 **严重·确定性**：kernel 的 `fuse` 与 Rust 的 `two` 各自独立推导——Rust 侧 `two` 强制 unfused（`act_slot=2*inter`），kernel 侧 `dim=7168%512==0` 仍满足 fuse 条件（它不知道 `two` 的存在）→ 两趟都写 swiglu 后的 `[inter]`（高半 `[inter,2*inter)` 是 cudaMalloc 垃圾）→ `add_inplace` 混垃圾 → 再 swiglu 一次（对垃圾做非线性）→ 44 层全废、首 token 即崩、退化到 "6.6.6.6" 计数循环。
 
-**修复（已提交）**：kernel 的 `fuse` 绑到调用者的 `out_slot_stride`（**单一真值**：`== inter` = fused、`== 2*inter` = unfused）——两侧结构上不可能再分歧。Rust mirror 补了 `dim%512==0` 条件。ILV+E4M3 冲突现在硬失败。
+**修复（已提交）**：kernel 的 `fuse` 绑到调用者的 `out_slot_stride`（**单一真值**：`== inter` = fused、`== 2*inter` = unfused）——两侧结构上不可能再分歧。Rust mirror 补了 `dim%512==0` 条件。~~ILV+E4M3 冲突现在硬失败~~ → **2026-09-12 解耦**：ILV 读路径与 fuse 写路径独立，`ilv && !fuse` 现在合法（PAIR body 的 raw 对写），E4M3 双趟因此可配 ILV=1。
 
 **量化数学无罪**（判词确认）：sub_dequant_fp4 与 quant_fp4 严格互逆 ✓、scale 索引一致 ✓、ex_act/ex_act_lo 的 pitch 相同 ✓——**唯一坏的是布局协商**。这也解释了 opa 为什么真的消失了（激活假设成立）。
 
@@ -371,4 +371,4 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 - E4M3 双趟：+1.37ms（预期内的第二趟 GEMM 开销）
 - 图捕获步的摊销：capture at pos=20 → 前 20 步走裸链 → 50 步平均被拉高
 
-**修复方向**：让 E4M3 双趟与 ILV 兼容（fused kernel 写 [inter] 后 add → 需要 fused epilogue 的双趟变体）
+**修复方向**：让 E4M3 双趟与 ILV 兼容 → **已落地（2026-09-12，ministry-works）**：kernel 的 gate/up **PAIR body**（一 warp 一 inter 行、一次 LDG.128 取两半）原有两个 epilogue 由 `fuse_swiglu` 选：swiglu 后 `[inter]`，或**原始 gate|up 对**（`out[row]`/`out[b_split+row]`，即 `[2*inter]`）。launcher 去掉 `ilv && !fuse` 硬失败，只保留 PAIR body 的 K 契约 `dim%512==0`；`n_total`/`ksplit`/`pf` 改由同一个 `pair_body` 谓词决定（ILV+raw 因此拿到与 fused 完全相同的发射几何：ksplit=2、cp.async 预取）。Rust 侧 `moe_rows`/`draft_moe` 的 ILV 守卫同步放宽为"batched + dim%512==0"。

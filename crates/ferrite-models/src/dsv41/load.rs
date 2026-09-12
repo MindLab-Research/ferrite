@@ -749,10 +749,13 @@ impl<'a> Loader<'a> {
 
     /// Whether the routed experts' w1/w3 can be stored INTERLEAVED
     /// (DSV41_EXPERT_ILV). Every term is a LOAD-TIME guarantee that the only
-    /// consumers able to read that layout — the FUSED batched gate/up GEMV — are
-    /// the ones that will actually run. The sequential fallback and the unfused
-    /// batched body walk the gate and up pools separately and would read the
-    /// wrong bytes, so they must not be reachable:
+    /// consumers able to read that layout — the batched gate/up PAIR body, in
+    /// EITHER of its two epilogues (swiglu'd `[inter]` or the raw gate|up pair
+    /// in `[2*inter]`; ILV selects the READ path, `fuse` the WRITE, and the two
+    /// are decoupled as of 2026-09-12) — are the ones that will actually run.
+    /// The sequential fallback — and the batched body's plain-layout split arm,
+    /// which walks the gate and up pools separately — would read the wrong
+    /// bytes, so they must not be reachable:
     ///   * DSV41_MOE_BATCH not disabled and the batched symbol set present;
     ///   * DSV41_GATEUP_FUSE not disabled and the fused signature present;
     ///   * fp4 expert mode 2 (the shared-LUT body the fused loop mirrors);

@@ -1111,8 +1111,21 @@ static inline cudaError_t dsv41_experts_pdl_or_plain(K kern, dim3 grid, dim3 blo
 // A TEMPLATE parameter, not a runtime flag: the branch below folds away in the
 // non-interleaved instantiation, so the default (plain-layout) path keeps the
 // exact codegen it had. The launcher picks the instantiation from its explicit
-// `ilv` argument; nothing here guesses, and the Rust side refuses to combine an
-// interleaved pool with anything but the fused batched gate/up call.
+// `ilv` argument; nothing here guesses.
+//
+// ILV and THE EPILOGUE ARE INDEPENDENT (decoupled 2026-09-12). The interleaved
+// pool is addressable by exactly one body - the GATE/UP PAIR body, where one
+// warp owns one row of the inter-width output space and produces BOTH halves of
+// it (see the `pair_body` predicate) - and THAT body has two epilogues,
+// selected by the runtime `fuse_swiglu`:
+//   * fuse_swiglu != 0: the swiglu'd [inter] slice (the classic fused write);
+//   * fuse_swiglu == 0: the RAW gate|up pair, out[row] = gate and
+//     out[b_split + row] = up, i.e. the unfused [2*inter] layout the e2m1x2
+//     (DSV41_EXPERT_ACT_E4M3) two-pass arm accumulates in before ONE swiglu.
+// The read path and the write path share no smem or register state (the read
+// picks bytes, the epilogue picks a destination), so any combination is legal.
+// What the interleaved pool DOES require is the pair body's K contract, dim %
+// 512 == 0 - the launcher refuses the rest (see its own guard).
 //
 // __launch_bounds__(1024): pins the register ceiling that the launch geometry
 // depends on. The block size is NOT fixed here - the launcher derives it as
@@ -1298,11 +1311,26 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // them (P4 only ever needed to know where the slice STARTS). Same
     // expression, one definition.
     const int g_end = ((half + 1) * nv2f) / ksplit;
-    // Armed only for the fused gate/up body (the one body that implements the
+    // The GATE/UP PAIR BODY: one warp owns ONE row of the inter-width output
+    // space and produces BOTH halves of it - the gate row and the up row - so
+    // the two halves of one output row are one work unit. TWO INDEPENDENT
+    // properties select it:
+    //   * INTERLEAVED weights (ILV, compile-time): the gate chunk and the up
+    //     chunk of a row sit 8 bytes apart, so this body fetches both with ONE
+    //     LDG.128. It is the ONLY body that can address that pool - the
+    //     plain-layout split arm below walks the `b` base and the `b_hi` base
+    //     separately, which an interleaved pool does not have.
+    //   * the fused EPILOGUE (fuse_swiglu, runtime): swiglu'd [inter] write
+    //     instead of the raw gate|up pair (out[row] / out[b_split + row]).
+    // `b_split > 0` keeps it out of the down direction (b_split == -1) and out
+    // of that split arm. The launcher derives the SAME predicate for its
+    // n_total / ksplit / pf decisions - the two must agree (see
+    // dsv41_expert_gate_up_fp4_batched).
+    const bool pair_body = ((fuse_swiglu != 0) || ILV) && (b_split > 0);
+    // Armed only for the pair body (the one body that implements the
     // substitution) and only for a warp that owns a real row. `pf` is set by the
     // launcher together with the matching smem reservation.
-    bool pf_ok = (pf != 0) && (fuse_swiglu != 0) && (b_split > 0) && ((k & 511) == 0) &&
-                 (row_base < n_total);
+    bool pf_ok = (pf != 0) && pair_body && ((k & 511) == 0) && (row_base < n_total);
     // P4.2: this warp's ring of PDEPTH slots (512 B each). PDEPTH == 1 gives
     // back the P4 single slot: warp*(512*1) == warp*512.
     uint8_t* pf_ring = s_pf + (size_t)warp * (kGateUpPfBytes * PDEPTH);
@@ -1415,29 +1443,38 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // bound, or that barrier would deadlock the CTA).
     const int row_stop = (ksplit > 1) ? (row_base + 1) : n_total;   // ksplit>1: one trip
     for (int row = row_base; row < row_stop; row += gridDim.x * rows_per_cta) {
-        // gate_up + swiglu fusion (fuse_swiglu && b_split > 0, gate/up direction).
-        // Here n_total == inter and this warp owns ONE inter row `row`: it walks
-        // BOTH halves of that row - the gate row `row` of the `b` pair and the up
-        // row `row` of the `b_hi` pair - and writes the swiglu'd result straight
-        // into out[row]. The caller then never materialises the 2*inter gate/up
-        // buffer nor runs the separate swiglu pass.
-        // NUMERIC CONTRACT (corrected 2026-09-11): this fused body is NOT the
+        // THE GATE/UP PAIR BODY (pair_body, gate/up direction). Here n_total ==
+        // inter and this warp owns ONE inter row `row`: it walks BOTH halves of
+        // that row - the gate row `row` of the `b` pair and the up row `row` of
+        // the `b_hi` pair (or, ILV, both halves of the interleaved row) - and
+        // writes ONE of two results:
+        //   * fuse_swiglu: the swiglu'd value straight into out[row]. The caller
+        //     then never materialises the 2*inter gate/up buffer nor runs the
+        //     separate swiglu pass.
+        //   * !fuse_swiglu (raw epilogue, ILV only): the RAW pair, gate into
+        //     out[row] and up into out[b_split + row] - the unfused [2*inter]
+        //     layout of act_slot, which is what the e2m1x2 two-pass arm needs
+        //     (it sums the two passes and runs ONE swiglu on the sum, because
+        //     swiglu(x+y) != swiglu(x)+swiglu(y)). The K loop, the read path and
+        //     the reduction are IDENTICAL on both epilogues - only the final
+        //     write differs.
+        // NUMERIC CONTRACT (corrected 2026-09-11): this pair body is NOT the
         // vec==2 shape of the unfused body - the old comment claiming "same single
         // scale multiply per accumulator / same floats as the unfused rows" was
         // left over from 7100ebfe and invalidated by 667c6f66. The unfused vec==2
         // body keeps FOUR accumulators a0..a3 persistent across the groups (four
-        // scale-FMAs per group, epilogue (a0+a1)+(a2+a3)); this fused body folds
+        // scale-FMAs per group, epilogue (a0+a1)+(a2+a3)); this pair body folds
         // each group into ONE 4-element tree and does ONE scale multiply per
         // group. The two are already NOT bit-identical at ksplit==1. What IS still
         // guaranteed here: the per-group fma chains run in ascending g2 order with
         // one `g`/`u` update each (unroll DEPTH is not part of the contract), so
-        // ksplit==1 reproduces the pre-K-split fused bit pattern exactly.
+        // ksplit==1 reproduces the pre-K-split bit pattern exactly.
         // ksplit>1 changes the summation order to (g0..g4)+(g5..g9) - see
         // dsv41_gateup_ksplit().
-        // k = dim and the launcher only sets
-        // fuse_swiglu when (dim % 512) == 0, so the two-chunk-per-scale tail loop
-        // of the unfused body has no work here.
-        if (fuse_swiglu && b_split > 0) {
+        // k = dim and the launcher only admits the pair body when
+        // (dim % 512) == 0, so the two-chunk-per-scale tail loop of the unfused
+        // body has no work here (the launcher's ILV guard is the same term).
+        if (pair_body) {
             // K-split: warps whose `row` is past n_total still enter this branch
             // (they must reach the cross-half __syncthreads() below, or the CTA
             // would deadlock). `active` gates the final write; the loads of an
@@ -1685,7 +1722,21 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                     g = fminf(g, limit);                     // gate clamp
                     u = fminf(fmaxf(u, -limit), limit);      // up clamp
                 }
-                out[(size_t)row] = (g / (1.f + expf(-g))) * u;   // silu(gate) * up
+                if (fuse_swiglu) {
+                    out[(size_t)row] = (g / (1.f + expf(-g))) * u;   // silu(gate) * up
+                } else {
+                    // RAW pair epilogue (the unfused [2*inter] layout): gate in
+                    // the low half, up in the high half - the SAME convention the
+                    // split arm above writes (rows < b_split are gate, rows >=
+                    // b_split are up) and the SAME clamp each half got there
+                    // (epi_mode 1: upper-only for the gate, both-sided for the
+                    // up). `b_split` is the caller's `inter`, so this is
+                    // out[row] / out[inter + row] of the caller's slot block.
+                    // The e2m1x2 two-pass arm sums the two passes here and runs
+                    // ONE swiglu on the sum (swiglu(x+y) != swiglu(x)+swiglu(y)).
+                    out[(size_t)row] = g;
+                    out[(size_t)b_split + (size_t)row] = u;
+                }
             }
             continue;
         }
@@ -2447,10 +2498,16 @@ extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
 // nothing accumulates across slots. The activation is the ONE shared quantised row
 // `a`/`a_scale` (per activation row).
 // `ilv` (trailing, new in ABI 2): the w1/w3 pools are INTERLEAVED (DSV41_EXPERT_ILV
-// on the Rust side). It selects the kernel's ILV instantiation and REQUIRES the
-// fused read: gate and up of a row then come from one region, so the unfused
-// (b_split-split) body, which walks the `b` and `b_hi` pools separately, would
-// read the wrong bytes. Rejected loudly instead of silently.
+// on the Rust side). It selects the kernel's ILV instantiation, whose gate/up PAIR
+// body reads both halves of a row from one region with ONE LDG.128 (the split body,
+// which walks the `b` and `b_hi` bases separately, cannot address that layout and is
+// never selected for ILV - the choice is compile-time, there is no runtime flag).
+// ILV and the EPILOGUE are INDEPENDENT (decoupled 2026-09-12): `fuse` still selects
+// swiglu'd [inter] vs the raw gate|up pair, so an interleaved pool is now legal with
+// either write - which is what the e2m1x2 two-pass arm (raw [2*inter] output) needs.
+// The interleaved pool keeps ONE hard requirement, the pair body's K contract
+// (dim % 512 == 0, it walks whole 512-value groups and has no tail): rejected loudly
+// rather than silently skipping the tail of every row.
 extern "C" int dsv41_expert_gate_up_fp4_batched(
     const uint8_t* a, const float* a_scale, float* out, long out_slot_stride, int rows, int dim,
     int inter, float limit, int slots, const uint8_t* w1_base, long w1_stride,
@@ -2477,9 +2534,10 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
         // code.) Both sides MUST agree: the kernel's `fuse` decision changes the
         // act slot layout (inter vs 2*inter) and whether the host runs a
         // separate swiglu pass. A mismatch silently corrupts the activations
-        // (round-18 bug), and an interleaved pool (DSV41_EXPERT_ILV) makes the
-        // mismatch a hard cudaErrorInvalidValue instead - see the `ilv && !fuse`
-        // guard below.
+        // (round-18 bug) - which is why the CALLER's pitch is what binds the
+        // decision (see below), for the interleaved pool too: `2*inter` selects
+        // the raw pair epilogue, `inter` the swiglu'd one. The `ilv` guard below
+        // is about the pair body's K contract, NOT about the epilogue.
         if (e == nullptr) return 1;
         return atoi(e) != 0 ? 1 : 0;
     }();
@@ -2493,16 +2551,37 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // the fused epilogue; `2*inter` = caller wants raw gate|up.
     const int fuse = (g_fuse && g_expert_fp4_mode == 2 && (dim % 512) == 0 &&
                       out_slot_stride == (long)inter) ? 1 : 0;
-    // Interleaved weights are only addressable by the FUSED body (see the header
-    // comment): refuse the combination rather than read the wrong bytes.
-    if (ilv && !fuse) return (int)cudaErrorInvalidValue;
-    // K-split (DSV41_GATEUP_KSPLIT, default 1 = original). Only the FUSED body
-    // implements the cross-half merge, so the unfused arm always runs ksplit=1
+    // The interleaved pool needs the gate/up PAIR body (the only body that reads
+    // both halves of a row from one region) and that body walks whole 512-value
+    // groups (`nv2f = k >> 9`) with NO tail - so an interleaved pool is legal for
+    // BOTH epilogues, but only with dim % 512 == 0. Refuse the rest loudly instead
+    // of silently skipping the tail of every row.
+    // (The former `ilv && !fuse` refusal is gone: `fuse` selects the WRITE
+    // epilogue, `ilv` the READ layout, and the two are independent - the kernel's
+    // pair-body epilogue now implements both, see the kernel header.)
+    if (ilv && ((dim % 512) != 0)) return (int)cudaErrorInvalidValue;
+    // The SAME predicate the kernel derives for its pair-body branch (there
+    // `b_split == inter > 0`, so the two agree): everything below - n_total,
+    // ksplit, pf - is a property of the pair body, not of the fused write.
+    const bool pair_body = (fuse != 0) || (ilv != 0);
+    // K-split (DSV41_GATEUP_KSPLIT, default 2 = ON). Only the PAIR body implements
+    // the cross-half merge, so the plain-layout split arm always runs ksplit=1
     // (otherwise both halves of a row would compute the full row and race on the
-    // same out[row]). blockDim must stay <= 1024 threads: warps*ksplit <= 32.
-    int ksplit = fuse ? dsv41_gateup_ksplit() : 1;
+    // same out[row]). The interleaved arm IS the pair body (with the raw
+    // epilogue), so it keeps the K-split - and therefore the same launch geometry
+    // the fused arm uses (warps*ksplit per CTA), which is what makes an
+    // E4M3+ILV vs fused+ILV A/B a layout-only comparison. blockDim must stay
+    // <= 1024 threads: warps*ksplit <= 32.
+    int ksplit = pair_body ? dsv41_gateup_ksplit() : 1;
     while (ksplit > 1 && warps * ksplit > 32) --ksplit;
-    const int n_total = fuse ? inter : 2 * inter;
+    // n_total is the number of OUTPUT ROWS the warps own, which is a property of
+    // the body and NOT of the per-slot output pitch: the pair body owns ONE row
+    // per (gate, up) pair - inter rows, whether it writes the swiglu'd half or the
+    // raw pair - so the ILV raw launch has n_total == inter while its slot pitch
+    // (the caller's out_slot_stride) is 2*inter. Only the plain-layout split arm
+    // walks all 2*inter rows one at a time. gating on `fuse` here would make the
+    // ILV raw launch skip the up half entirely.
+    const int n_total = pair_body ? inter : 2 * inter;
     // grid.x is the ROW count (n_total/rows), NOT the warp count: with ksplit the
     // CTA carries rows*ksplit warps but still owns `rows` rows. At rows=8 /
     // ksplit=2 this stays (40, 6) = 240 CTAs with 16 warps each (3840 warps in
@@ -2510,13 +2589,15 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     // s_act+LUT prologue. rows=4 / ksplit=2 additionally gives the 480-CTA shape.
     const int ctas_x = (n_total + warps - 1) / warps;
     // P4 (DSV41_GATEUP_CPASYNC + DSV41_GATEUP_PIPELINE): the weight pipeline
-    // stages PDEPTH k-groups of gate+up per warp, so the FUSED launch reserves
+    // stages PDEPTH k-groups of gate+up per warp, so the PAIR-BODY launch reserves
     // kGateUpPfBytes*PDEPTH per warp on top of the s_act + LUT [+ s_ks] pool.
     // The kernel's s_pf/s_ks pointers are derived from this same expression (in
     // the same order) - a mismatch reads or writes past the allocation. The
-    // unfused arm and the down direction launch with pf=0 and are sized exactly
-    // as before.
-    const int pf = (fuse && dsv41_gateup_cpasync()) ? 1 : 0;
+    // prefetch substitution lives in the READ path, which the two epilogues
+    // share, so the raw-pair launch (ilv && !fuse) gets it too and the plain
+    // split arm + the down direction launch with pf=0 and are sized exactly as
+    // before.
+    const int pf = (pair_body && dsv41_gateup_cpasync()) ? 1 : 0;
     const int nwarps = warps * ksplit;
     // PDEPTH is PINNED TO 1: only the <ILV, 1> instantiations exist (see
     // dsv41_gateup_pipeline for why - depth 2/5 both measured +0.04ms, so the
