@@ -2946,6 +2946,36 @@ impl<'a> DevChain<'a> {
             && (self.comm.is_none() || crate::dsv41::tp::ar_v5())
     }
 
+    /// Record one [`Self::step_rows_inner`] into a fresh graph.
+    ///
+    /// Returns `(graph, error)`: a non-null graph with `None` on success, or a
+    /// null graph with the first failure otherwise. The stream is ALWAYS taken
+    /// out of capture mode before returning — when `capture_begin` succeeded and
+    /// the recording failed, `capture_end` is what ends it — so the caller's
+    /// fallback launch is legal. That is the whole point of this helper: the
+    /// `?` on the two capture calls would leave a failed recording open and
+    /// propagate, which is exactly what the fallback must not do.
+    fn capture_verify(
+        &mut self,
+        toks: &[u32],
+        m: usize,
+        pos_base: i32,
+    ) -> (*mut std::ffi::c_void, Option<FerriteError>) {
+        if let Err(e) = self.dev.capture_begin() {
+            // Nothing was recorded, so there is no capture to end.
+            return (std::ptr::null_mut(), Some(e));
+        }
+        let inner = self.step_rows_inner(toks, m, pos_base);
+        let end = self.dev.capture_end();
+        match (inner, end) {
+            (Ok(()), Ok(g)) => (g, None),
+            (inner, end) => {
+                let e = end.err().or_else(|| inner.err()).expect("one arm failed");
+                (std::ptr::null_mut(), Some(e))
+            }
+        }
+    }
+
     /// The guard for the audit's S7 (`comp_len` frozen into the captured branch).
     ///
     /// `attention_rows` branches on the HOST mirror `comp_len > 0` to pick one of
@@ -4577,33 +4607,37 @@ impl<'a> DevChain<'a> {
         self.dev
             .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
 
-        // ---- the per-row DSpark tap: `layer()`'s hook, once per row ----
+        // ---- the DSpark tap: `layer()`'s hook, all rows in ONE launch ----
         // The real-commit path (`dspark_spec_step`) hands the ACCEPTED PREFIX of
         // this block's target hiddens to the draft (`DsparkDev::note_ctx_rows`),
         // and unlike the single-row step it needs every row, not just the one the
         // step consumed. Same capture point as `layer()` (the layer's COMPLETED
         // output, after this layer's whole forward — attention AND ffn — hence
         // here, after the FFN's `hc_post` has landed back in `h_r`), same `1/hc`
-        // mean (`hc_collapse` IS the weighted sum over the hc copies), one call
-        // per row so the single-row and m-row taps cannot drift apart: the kernel
-        // addresses rows by `blockIdx.x`, so m single-row calls are exactly the
-        // m-block form.
+        // mean (`hc_collapse` IS the weighted sum over the hc copies).
+        //
+        // This used to be m single-row calls. `hc_collapse` is row-INDEPENDENT —
+        // `dsv41_glue.cu:301-317`: `out[t] = Σ_i pre[r*hc + i] * x[(r*hc + i)*dim
+        // + c]` with `r = t/dim`, one FMA chain per output element and no
+        // cross-row term — so the m-block form is bit-identical to m single-row
+        // calls. Both strides already match the multi-row layout: the source rows
+        // are contiguous at `r*hc*dim` in `h_r`, and the destinations are
+        // contiguous at `(slot*VERIFY_ROWS + r)*dim` in `dspark_tap_r`. Folding
+        // the loop saves m-1 launches per tap layer per verify (the same class of
+        // redundant per-row split as the rmsnorm bypass in `dspark_dev.rs`).
         //
         // Gated on `spec_capture`: the shadow step's verify is rolled back whole,
-        // so its rows are never committed and 3m extra launches would buy nothing.
+        // so its rows are never committed and the extra launches would buy nothing.
         if self.spec_capture {
             if let Some(slot) = cfg.dspark_target_slot(layer) {
-                for r in 0..m {
-                    self.dev.hc_collapse(
-                        (self.s.h_r.ptr as *const f32).wrapping_add(r * hc * dim),
-                        self.s.dspark_pre_mean.as_f32(),
-                        (self.s.dspark_tap_r.ptr as *mut f32)
-                            .wrapping_add((slot * VERIFY_ROWS + r) * dim),
-                        1,
-                        hc as i32,
-                        dim as i32,
-                    )?;
-                }
+                self.dev.hc_collapse(
+                    self.s.h_r.ptr as *const f32,
+                    self.s.dspark_pre_mean.as_f32(),
+                    (self.s.dspark_tap_r.ptr as *mut f32).wrapping_add(slot * VERIFY_ROWS * dim),
+                    m as i32,
+                    hc as i32,
+                    dim as i32,
+                )?;
             }
         }
         Ok(2)

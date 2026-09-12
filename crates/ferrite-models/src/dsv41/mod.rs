@@ -30,6 +30,9 @@ pub mod unit_dump;
 pub mod dspark;
 pub mod dspark_dev;
 pub mod dspark_parity;
+/// DSV41 spec-mode end-to-end verification (`cargo test`): parse a running
+/// serve's log + three HTTP prompts; the four text red lines + accept stats.
+pub mod dspark_verify;
 pub mod engram;
 pub mod frame;
 pub mod kernels;
