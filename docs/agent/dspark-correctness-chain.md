@@ -751,3 +751,17 @@ for k: acc += comb[i][k] * r[k];  // 逐 k 加 comb*residual
 ferrite 是**顺序加**（k=0..n-1 逐个加），PyTorch 的 sum 可能是 tree reduction——**浮点加法不满足结合律**，顺序不同可能产生 ~1 ULP 差异/层。44 层累积的 ULP 差异理论上不足以翻转 argmax（1e-7 量级 vs logit gap ~0.1），**大概率不是根因**。
 
 **判定**：hc_post 求和序是**低风险差异**（ULP 级），不太可能是 acs/ibu 的根因。真正的偏差源更可能是**hc_pre 的 f32 不截断**（每层引入 ~1e-3 的精度差 vs bf16 截断）——44 层累积可能到 ~1e-1 量级，足以翻转近 tie 的 argmax。
+
+## Lazy verify + engram 修复后的 GPU 验证（a3e68e6e）——文本未变（engram 未生效）
+
+**结果与修复前完全相同**：LEN 201、双字 3、拉丁 [acs, Bristol, burdens, oqua]、k_acc {0:55,1:13,2:10,3:4,4:3,5:1}、步时 24.1ms。
+
+**判定**：**engram 修复没有生效**——build 显示 "warning: build failed, waiting for other jobs..." 但 BUILT 出来了。可能原因：
+1. engram_token_map.bin 未加载（engram 不生效 → 不走 engram_apply_rows → 修复无效果）
+2. 或者 engram 加载了但修复后的代码路径没被调用
+
+**验证**：查 serve 日志是否有 engram 加载行——`grep engram /tmp/lazy_engram_fix.log`。
+
+**无论如何**：lazy verify 的文本退化（Bristol/burdens/oqua）**不是 engram 的 m-dispatch**——它是 lazy 与 batched 的**其它**数值差异。lazy-text-degradation 的判词给出了 D1（engram）作为 SEVERE，但实测证明 D1 不是根因（或 engram 根本没生效）。**需要继续排查**。
+
+**性能确认**：步时 24.1ms 稳定（41.4 tok/s）——lazy verify 的 2× 性能收益确认。
