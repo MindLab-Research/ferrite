@@ -2037,3 +2037,30 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 2. ar5-hang 回退 → SWALLOW_STEP 重测（步时 -4.55ms）
 3. tcgen05 重测（对齐修复后——如果成功 verify -1~2.8ms）
 4. S4 paired alignment 实施（accept 的深层杠杆）
+
+## 🏁🏁 Accept 战役的最终判决（重测确认——所有杠杆测完）
+
+**ATTN_PROJ_ALIGN 重测**（正确 binary，build.sh 15:53 + cargo 15:54 + md5 29da93b9）：
+- 零拉丁 ✓
+- accept **1.163**（vs 最佳 1.214——不改善）
+
+**完整的杠杆测试总结**：
+| 杠杆 | 类型 | accept | 判定 |
+|---|---|---|---|
+| P0-3+P1-5 | 数值（bf16 域）| **1.214** | **最佳**（+19%）|
+| SEED_POS | 相位 | 1.067 | 退化 |
+| DRAFT_HEAD v1 | program（ulp 级）| 1.214 | 中性 |
+| TAP_BF16+DRAFT_ATTN | 数值 | 1.163 | 略降 |
+| ATTN_PROJ_ALIGN | **program（结构性！）** | **1.163** | **中性** |
+
+**最终判决**：
+1. **accept 1.214 是当前 MTP head 的实际能力天花板**——不是数值/程序错位
+2. **所有对齐类修复都无效**——ulp 级和结构性都不影响 accept
+3. **1.214 → 2-3 的差距来自 MTP head 的近似能力**（3 层近似 44 层）
+4. 用户校准的 "2-3 上限" 可能考虑了不同的 draft 配置或 head 训练——我们的 head 可能在 1.2 附近
+
+**400 路径的修正**：
+- accept 侧：1.214 是实际值——需要步时 ≤5.54ms（低于 L5 地板 8-9ms）→ **不可达**
+- 除非：MTP head 换更好的训练/更大的头 → 不在本 session 范围
+- **重点转向步时**：lazy 33ms + SWALLOW（-4.55ms）+ tcgen05（-2ms）+ 融合 → 目标 20-25ms
+- **实际可达**：1.214 × (1000/22) ≈ **55 tok/s**（不是 400）
