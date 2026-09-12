@@ -2781,3 +2781,31 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 | L5 流水 | -1 | **14.8ms** ✓ |
 
 **结论**：14.8ms @ accept 5 → 6/0.0148 = **405 tok/s** — 恰好过 400！但需要全部 5 层优化兑现。
+
+## B 类核在 LAZY verify 下的收益分析（SH_PAIR + tcgen05 之后）
+
+**B 类核的 lazy verify 适用性**（从 B 类优先级分析 + lazy verify 特点）：
+| B 类 | batched 下收益 | lazy 下收益 | 原因 |
+|---|---|---|---|
+| B1 mrows_rope（wq_b） | -0.4~0.7ms | **-0**（m=1 单行=per-row）| lazy 每行 m=1 |
+| B2 mrows_norm_rope | -0.8~1.2ms | **-0** | 同上 |
+| B3 mrows2（wq_a+wkv） | -0.3~0.6ms | **-0** | 同上 |
+| B4 rmsnorm_rope_mrows | -0.2~0.4ms | **-0** | 同上 |
+| B5 mrows_route | -0.3~0.6ms | **-0** | 同上 |
+| B6 mrows_f32（wo_b） | -0.6~1.0ms | **-0** | 同上 |
+| B7 AR+merge | -0.2~0.4ms | -0.2~0.4ms | AR 是跨行的 |
+
+**关键发现**：B 类核（B1-B6）全部是 m-rows 优化——**在 lazy verify（m=1）下收益为零**！只有 B7（AR+merge）有少量收益。
+
+**lazy verify 的优化天花板**：
+- SH_PAIR（-7.4ms）：shared expert 的 kernel 替换——与 m-rows 无关，lazy 下有效 ✓
+- tcgen05（-1.8ms）：routed experts 的 kernel 替换——同上 ✓
+- B 类（-0.2~0.4ms）：几乎无效（lazy m=1）
+- L4 占用（-5ms）：kernel 级优化——有效 ✓
+- L5 流水（-1ms）：kernel 级——有效 ✓
+
+**修正后的 lazy verify 优化路径**：
+33ms → SH_PAIR -7.4 → 25.6 → tcgen05 -1.8 → 23.8 → L4 -5 → 18.8 → L5 -1 → **17.8ms**
+@ accept 5：6/0.0178 = **337 tok/s**（不是 400！）
+
+**结论**：lazy verify 的优化天花板是 ~337 tok/s（不是 400）。**400 需要 batched（SWALLOW）在 accept ≥3.55 时才可达**——Plan B 是关键！
