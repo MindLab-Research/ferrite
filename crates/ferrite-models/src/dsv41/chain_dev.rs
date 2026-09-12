@@ -29,7 +29,7 @@
 
 use std::ffi::c_void;
 
-use ferrite_types::{FerriteError, Result, SpecStep};
+use ferrite_types::{spec_accept, FerriteError, Result, SpecStep};
 
 use std::sync::Arc;
 
@@ -4016,9 +4016,9 @@ impl<'a> DevChain<'a> {
         let win = cfg.window_size;
         let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
         // P0: mirror of `dspark_snapshot` -- one launch per layer per side.
-        // `pos_base` follows the same `(pos + 1) % win` reduction.
+        // `pos_base` follows the same `pos_base % win` reduction.
         let fused = self.dev.supports_dspark_snapshot();
-        let pos_base = ((pos + 1) % win) as i32;
+        let base = (pos_base % win) as i32;
 
         for &l in &self.ring_owners() {
             let ring = self.layers[l].ring.ptr as *mut f32;
@@ -4031,7 +4031,7 @@ impl<'a> DevChain<'a> {
                 self.dev.dspark_ring_restore(
                     ring,
                     snap,
-                    pos_base,
+                    pos_base as i32,
                     win as i32,
                     hd as i32,
                     m as i32,
@@ -4039,7 +4039,7 @@ impl<'a> DevChain<'a> {
                 )?;
             } else {
                 for j in keep..m {
-                    let slot = (pos + 1 + j) % win;
+                    let slot = (pos_base + j) % win;
                     self.dev.memcpy_d2d(
                         ring.wrapping_add(slot * hd) as *mut c_void,
                         snap.wrapping_add(j * hd) as *const c_void,
@@ -4857,13 +4857,30 @@ impl<'a> DevChain<'a> {
             "dspark_spec_step: `pos` must be the device position counter's current value"
         );
 
+        // ---- 0. which block layout this round runs (`DSV41_SWALLOW_STEP`) ----
+        // A chain that has not yet bootstrapped, or a process without the gate,
+        // takes the legacy 5-row block below. With the gate on, the chain is
+        // primed by the round that ran the legacy path (its `step_dev` is what
+        // writes the very first tap) and every later round swallows the
+        // main-chain step into the verify's anchor row.
+        // TODO(swallow-step-impl): re-enable when `dspark_spec_swallowed` lands.
+        // (Commented out by the main agent to keep `main` compiling while the
+        // implementation is in flight — `swallow_step()` defaults OFF, so this
+        // is a no-op at runtime.)
+        // if swallow_step() && self.spec_primed {
+        //     return self.dspark_spec_swallowed(dspark, token, pos);
+        // }
+
         // ---- 1. the real step: the whole-step graph (tap hook included), the
         // argmax, and the position counter + 1.
         let next = self.step_dev(token, pos)?;
 
         // ---- 2. the snapshot, AFTER the step and BEFORE the verify: the
-        // rollback must restore the state the REAL step left.
-        let host_mirrors = self.dspark_snapshot(pos_ctr, m)?;
+        // rollback must restore the state the REAL step left. The block is
+        // `[d1..d5]` and `step_dev` advanced the counter to `pos_ctr + 1`, so
+        // the block's row 0 sits at `pos_ctr + 1` — one past the step's own
+        // position (the swallowed branch's block starts AT `pos` instead).
+        let host_mirrors = self.dspark_snapshot(pos_ctr + 1, m)?;
 
         // ---- 3. the draft, from the tap of the step that just ran.
         let t = std::time::Instant::now();
@@ -4944,9 +4961,18 @@ impl<'a> DevChain<'a> {
 
         // ---- 6. the commit: roll back everything past the accepted prefix,
         // replay the kept rows through the compressors, advance the counter.
+        // (The block's row 0 is at `pos_ctr + 1` — see the snapshot above.)
         let t = std::time::Instant::now();
-        self.dspark_commit(pos_ctr, m, k_acc, &host_mirrors)?;
+        self.dspark_commit(pos_ctr + 1, m, k_acc, &host_mirrors)?;
         dspark.note_ctx_rows(self.s.dspark_tap_r.ptr as *const f32, m, k_acc, pos + 1)?;
+        // ---- 6b. and hand the NEXT round's draft its tap
+        // (`DSV41_SWALLOW_STEP` only): the swallow drops `step_dev`, so this
+        // round's tap in `dspark_tap` is the last one a single-row forward will
+        // write. See `carry_kept_tap` for which row of the block that is.
+        // TODO(swallow-step-impl): re-enable with `carry_kept_tap`.
+        // if swallow_step() {
+        //     Self::carry_kept_tap(self.dev, self.s.dspark_tap.ptr, self.s.dspark_tap_r.ptr, cfg.dim, k_acc)?;
+        // }
         let commit_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // ---- 7. what this step emits: the anchor plus the verify's argmax for
@@ -4955,6 +4981,199 @@ impl<'a> DevChain<'a> {
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
 
+        self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
+
+        // The chain is now bootstrapped: with the gate on, the next round's
+        // 6-row block carries the anchor's forward. Set LAST, so a round that
+        // failed above leaves this flag alone and the next round re-runs the
+        // legacy path (whose `step_dev` re-supplies a valid tap).
+        if swallow_step() {
+            self.spec_primed = true;
+        }
+
+        Ok(DsparkSpecReport {
+            next,
+            drafts,
+            verify_out,
+            k_acc,
+            emitted,
+            draft_ms,
+            verify_ms,
+            commit_ms,
+        })
+    }
+
+    /// The "swallowed main-chain step" arm of [`Self::dspark_spec_step`]
+    /// (`DSV41_SWALLOW_STEP=1`; the second and every later round of a request).
+    ///
+    /// The round is the legacy one MINUS `step_dev`: the verify's 6-row block
+    /// `[anchor, d1..d5]` sits at `pos .. pos+5`, so its row 0 IS the anchor's
+    /// forward — the same token at the same position as `step_dev`'s, appending
+    /// the same KV row — and its argmax IS `next`. The block pays one extra row
+    /// (~1.6 ms) and saves the whole ~6.15 ms step.
+    ///
+    /// # Timeline
+    ///
+    /// ```text
+    ///   1. snapshot    dspark_snapshot(pos, 6)   the block's write set; NO step
+    ///                                          has advanced the counter, so the
+    ///                                          block's row 0 is at `pos` itself
+    ///   2. next/draft  import_tap + draft_forward(token, pos) -> d1..d5
+    ///   3. verify_out  step_rows([token, d1..d5])   6 rows at pos .. pos+5
+    ///   4. accept      k_emit = spec_accept(drafts, verify_out, true)
+    ///   5. commit      dspark_commit(pos, 6, k_emit): rows 0..k_emit survive,
+    ///                  the compressor is replayed for them, the counter jumps
+    ///                  to pos + k_emit
+    ///   6. emit        verify_out[0..k_emit]     (k_emit = k_acc + 1 tokens)
+    /// ```
+    ///
+    /// # The accept arithmetic — the SAME chain GLM's MTP runs
+    ///
+    /// Block row `i` is fed `[token, d1..d5][i]` at position `pos + i`, so its
+    /// argmax predicts `pos + 1 + i`; and `drafts[i]` is the draft's proposal for
+    /// `pos + 1 + i` too (the draft block sits at `pos`). The two are therefore
+    /// INDEX-ALIGNED, which is exactly GLM's `[t_last, d1..d_nd]` layout
+    /// (`TpCluster::mtp_step`: `while drafts[k-1] == out[k-1]`), so the shared
+    /// [`spec_accept`] runs with `anchor_is_in_block = true` and returns the
+    /// number of tokens the step EMITS (`1..=6`) — the always-accepted anchor
+    /// plus the surviving drafts. The legacy branch's 5-row block does not
+    /// contain the anchor row, which is why ITS chain (and
+    /// `SpecStep::ANCHOR_IS_IN_BLOCK`) stays the shifted one; the two layouts are
+    /// one chain apart by the anchor.
+    ///
+    /// The report's `k_acc` keeps the LEGACY meaning (the accepted draft count =
+    /// `k_emit - 1`) and `verify_out` the legacy shape (the 5 rows after the
+    /// anchor, row `j` at `pos+1+j`), so the engine's "mean-k"/"tok/step"
+    /// statistics and the golden dump stay comparable across the A/B.
+    ///
+    /// # The tap — the one approximate input of this path
+    ///
+    /// `draft_forward` needs the target hidden of the anchor's OWN position
+    /// (`pos`); the legacy path gets it from `step_dev`'s forward of the anchor.
+    /// Here the anchor's forward is row 0 of THIS round's block, i.e. it happens
+    /// AFTER the draft, so the tap has to come from the previous round — and the
+    /// previous round forwarded a different token at `pos`: its row `k_emit` is
+    /// the first REJECTED draft, the row [`DsparkDev::note_ctx_rows`] deliberately
+    /// drops ("the verify fed it a REJECTED draft token, so its hidden is not the
+    /// true one").
+    ///
+    /// What IS exact is the LAST KEPT row (row `k_emit - 1`, at `pos - 1`): it was
+    /// fed the true token of that position, and it is the same row GLM's MTP
+    /// commits as `hprev <- hf_v[k-1]` (GLM's `k` = this block's `k_emit`).
+    /// [`Self::carry_kept_tap`] hands that row over — the hidden of the last
+    /// COMMITTED position, which is the same quantity the legacy tap holds, only
+    /// evaluated at the (earlier) last committed position, because the anchor's
+    /// row is not committed until this round's verify runs.
+    ///
+    /// To A/B the alternative (row `k_emit`, positionally exact but fed the
+    /// rejected draft), add one to the `keep` argument of `carry_kept_tap` at both
+    /// call sites.
+    ///
+    /// # Failure
+    ///
+    /// Same contract as the legacy arm: the block is rolled back before any error
+    /// is returned, and `spec_primed` is left alone, so the next round re-runs the
+    /// bootstrapping legacy path.
+    fn dspark_spec_swallowed(
+        &mut self,
+        dspark: &mut DsparkDev,
+        token: u32,
+        pos: usize,
+    ) -> Result<DsparkSpecReport> {
+        let cfg = self.cfg;
+        // The block is [anchor, d1..d5] — 6 rows, ONE batched forward (the
+        // weights are read once for the whole block).
+        let m = DSPARK_DRAFTS + 1;
+        debug_assert_eq!(m, VERIFY_ROWS, "the swallowed block must fill VERIFY_ROWS");
+
+        // ---- 1. the snapshot of the 6 ring slots the block will write. Taken
+        // BEFORE the block and with NO step in between, so the block's row 0 is
+        // the counter's current value — `pos` (the legacy branch's is `pos + 1`,
+        // because its `step_dev` has already advanced the counter).
+        let host_mirrors = self.dspark_snapshot(pos, m)?;
+
+        // ---- 2. the draft, from the tap the PREVIOUS round carried over. The
+        // anchor's own forward (row 0 below) has not happened yet — it is what
+        // makes this path cheap and what forces the carry.
+        let t = std::time::Instant::now();
+        dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
+        // Draft geometry unchanged: the block is [embed(t0), noise×4] at the
+        // anchor's OWN position (RoPE pos+1+r; the seed window row goes to slot
+        // pos%win), so drafts[i] proposes `pos+1+i` — the same position block row
+        // `i`'s argmax predicts.
+        dspark.draft_forward(token, pos)?;
+        let drafts = dspark.drafts()?;
+        let draft_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 3. the verify: [anchor, d1..d5] at pos..pos+5, ONE batched
+        // forward, per-row argmax. Row 0's forward is the anchor's — the row
+        // `step_dev` would have produced — so the rows' bit-parity with the plain
+        // engine at the same positions is the whole correctness contract of this
+        // path (what `dspark_parity` measures).
+        let t = std::time::Instant::now();
+        let mut rows_in: Vec<u32> = Vec::with_capacity(m);
+        rows_in.push(token);
+        rows_in.extend_from_slice(&drafts);
+        self.spec_capture = true;
+        let rows_res = self.step_rows(&rows_in);
+        self.spec_capture = false;
+        let rows = match rows_res {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.dspark_rollback(pos, m, &host_mirrors);
+                return Err(e);
+            }
+        };
+        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
+        if rows.len() != m {
+            self.dspark_rollback(pos, m, &host_mirrors)?;
+            return Err(FerriteError::Config(format!(
+                "dspark_spec_step (swallow): step_rows returned {} rows for a {m}-row verify block",
+                rows.len()
+            )));
+        }
+
+        // ---- 4. the accept: index-aligned on the anchor-carrying block (see the
+        // doc comment), through the SHARED chain. `k_emit` counts the tokens the
+        // step emits (the anchor plus the accepted drafts), 1..=m.
+        let k_emit = spec_accept::<u32, u32>(&drafts, &rows, true);
+        let k_acc = k_emit - 1;
+        let next = rows[0];
+        // The legacy report shape: the five rows AFTER the anchor are the
+        // `[d1..d5]`-style verify block, row `j` at `pos+1+j`, argmax `pos+2+j`.
+        let mut verify_out = [0u32; DSPARK_DRAFTS];
+        verify_out.copy_from_slice(&rows[1..m]);
+
+        // ---- 5. the commit: rows 0..k_emit survive (the anchor's row is one of
+        // them — that IS the swallowed `step_dev`), the rest is rolled back, the
+        // compressor is replayed for the survivors and the counter lands on
+        // `pos + k_emit` = the position of the last emitted token.
+        let t = std::time::Instant::now();
+        self.dspark_commit(pos, m, k_emit, &host_mirrors)?;
+        dspark.note_ctx_rows(self.s.dspark_tap_r.ptr as *const f32, m, k_emit, pos)?;
+        // ---- 5b. hand the NEXT round's draft its tap (see the doc comment).
+        Self::carry_kept_tap(
+            self.dev,
+            self.s.dspark_tap.ptr,
+            self.s.dspark_tap_r.ptr as *const c_void,
+            cfg.dim,
+            k_emit,
+        )?;
+        let commit_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // ---- 6. what this step emits: every emitted token is the verify's own
+        // argmax — rows[0] is `next` and the last one sits at `pos + k_emit`, the
+        // new `pos_ctr`, whose KV is deliberately absent (the next round's block
+        // row 0 appends it).
+        let mut emitted = Vec::with_capacity(k_emit);
+        emitted.extend_from_slice(&rows[..k_emit]);
+
+        // The same dump shape as the legacy branch, so the golden diff compares
+        // like for like. The vrow0 parity probe is deliberately NOT run here: its
+        // verify half reads row 0's logits, which in this layout is the ANCHOR row
+        // at `pos`, while its eager half forwards at `pos + 1` — comparing the two
+        // would report a layout difference as a numerical one. The anchor row's
+        // parity is what `dspark_parity`'s row-level diff measures.
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
 
         Ok(DsparkSpecReport {
@@ -4967,6 +5186,53 @@ impl<'a> DevChain<'a> {
             verify_ms,
             commit_ms,
         })
+    }
+
+    /// Carry the tap the NEXT spec round's draft reads out of the block that just
+    /// committed: row `keep - 1` of `dspark_tap_r` — the LAST KEPT row — is copied
+    /// into `dspark_tap` (the single-row tap buffer [`DsparkDev::import_tap`]
+    /// consumes), one D2D per target slot.
+    ///
+    /// # Which row, and why it is `keep - 1`
+    ///
+    /// The draft of the round AFTER a commit seeds the window ring at the new
+    /// `pos_ctr` and needs the target hidden of the position just before it, i.e.
+    /// of the last position the commit KEPT. Kept rows are `0..keep` from the
+    /// block's row 0, so that is row `keep - 1`, at position
+    /// `pos_base + keep - 1 = pos_ctr_new - 1`. In the swallowed 6-row block
+    /// (`keep = k_emit`) that is index `k_acc` and in the legacy 5-row block
+    /// (`keep = k_acc`) index `k_acc - 1` — the two indices the diff doc lists,
+    /// which are one rule seen through the two layouts.
+    ///
+    /// Every kept row was fed a TRUE token (row 0 is the anchor, rows 1..=k_acc
+    /// are accepted drafts), which is what makes this the exact hidden of that
+    /// position's token — unlike row `keep` (the first rejected draft), whose
+    /// hidden [`DsparkDev::note_ctx_rows`] drops for being the wrong token's.
+    ///
+    /// `keep == 0` (the legacy branch's "no draft accepted") copies nothing: the
+    /// tap `step_dev` just wrote is already the hidden of the last committed
+    /// position, because that step committed `pos` itself.
+    fn carry_kept_tap(
+        dev: &Device,
+        tap: *mut c_void,
+        tap_r: *const c_void,
+        dim: usize,
+        keep: usize,
+    ) -> Result<()> {
+        if keep == 0 {
+            return Ok(());
+        }
+        debug_assert!(keep <= VERIFY_ROWS, "carry_kept_tap: row {keep} is past the tap block");
+        let row_bytes = dim * std::mem::size_of::<f32>();
+        let row_off = (keep - 1) * row_bytes;
+        for slot in 0..DSPARK_TAP_SLOTS {
+            let src = (tap_r as *const u8)
+                .wrapping_add(slot * VERIFY_ROWS * row_bytes)
+                .wrapping_add(row_off);
+            let dst = (tap as *mut u8).wrapping_add(slot * row_bytes);
+            dev.memcpy_d2d(dst as *mut c_void, src as *const c_void, row_bytes)?;
+        }
+        Ok(())
     }
 
     /// Commit the accepted prefix of a verify block: undo everything the block
