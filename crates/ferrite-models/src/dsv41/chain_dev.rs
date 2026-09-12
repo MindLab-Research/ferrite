@@ -4179,6 +4179,10 @@ impl<'a> DevChain<'a> {
         pos: usize,
     ) -> Result<DsparkSpecReport> {
         let cfg = self.cfg;
+        // The verify block is [d1..d5] — 5 rows, ONE batched forward (the weights
+        // are read ONCE for the whole block — that is the whole point of spec
+        // decoding; per-row eager calls would read them 5 times).
+        let m = DSPARK_DRAFTS;
         if !cfg.dspark_armed() {
             return Err(FerriteError::Config(
                 "dspark_spec_step: the chain's tap hook is off (set DSV41_DSPARK and make sure \
@@ -4198,7 +4202,11 @@ impl<'a> DevChain<'a> {
         // argmax, and the position counter + 1.
         let next = self.step_dev(token, pos)?;
 
-        // ---- 2. the draft, from the tap of the step that just ran.
+        // ---- 2. the snapshot, AFTER the step and BEFORE the verify: the
+        // rollback must restore the state the REAL step left.
+        let host_mirrors = self.dspark_snapshot(pos_ctr, m)?;
+
+        // ---- 3. the draft, from the tap of the step that just ran.
         let t = std::time::Instant::now();
         dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
         // Official model.py semantics: the block is [embed(t0), noise×4] at the
@@ -4208,62 +4216,55 @@ impl<'a> DevChain<'a> {
         let drafts = dspark.drafts()?;
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
 
-        // ---- 3. the verify: THE EAGER PATH, one accepted row at a time.
-        //
-        // The operator's principle, taken literally: "verify should run the same
-        // logic as the plain engine — just a batch of them." Each verify row IS
-        // a full `step_dev` (whole-step graph replay: embed, all layers, head,
-        // argmax, KV append, compressor) at its own position, bit-identical to
-        // the non-spec engine at the same token. The multi-row `step_rows`
-        // chain is RETIRED from the spec path — it carried causal-window and
-        // compressor divergences that per-row eager calls structurally cannot
-        // have.
-        //
-        // The loop runs ONLY the accepted rows: row j is entered iff d_{j+1}
-        // was accepted (drafts[0]==next for row 0, drafts[j]==verify_out[j-1]
-        // for the rest). An accepted row's token is BY CONSTRUCTION the
-        // target's own argmax at that position, so its KV append and compressor
-        // advance are exactly what the plain engine would have done — there is
-        // NOTHING to roll back, ever. The first rejection simply stops the
-        // loop: no row past it ever ran. The verify cost is therefore
-        // proportional to the accept length (accept 4 → 4 graph replays),
-        // instead of always paying the full block.
-        //
-        // verify_out[j] (row j's argmax) is the target's prediction for
-        // pos+2+j — the bonus token when j is the last accepted row.
+        // ---- 4. the verify: [d1..d5] at pos+1..pos+5, ONE batched forward,
+        // per-row argmax. The rows' per-row outputs must be BIT-IDENTICAL to
+        // the plain engine at the same positions — that parity is the spec
+        // path's correctness contract, and it is what the unit diff enforces.
         let t = std::time::Instant::now();
+        self.spec_capture = true;
+        let rows_res = self.step_rows(&drafts);
+        self.spec_capture = false;
+        let rows = match rows_res {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.dspark_rollback(pos_ctr, m, &host_mirrors);
+                return Err(e);
+            }
+        };
+        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
+        if rows.len() != DSPARK_DRAFTS {
+            self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
+            return Err(FerriteError::Config(format!(
+                "dspark_spec_step: step_rows returned {} rows for a {}-row verify block",
+                rows.len(),
+                DSPARK_DRAFTS
+            )));
+        }
         let mut verify_out = [0u32; DSPARK_DRAFTS];
+        verify_out.copy_from_slice(&rows);
+
+        // ---- 5. the accept arithmetic (host, no device traffic). Row j sits at
+        // pos + 1 + j and was fed `drafts[j]`, so `verify_out[j]` is the target's
+        // prediction for pos + 2 + j. The first check is FREE: drafts[0] predicts
+        // pos+1's token, which the single-row step already sampled as `next`;
+        // then drafts[j] (j>=1) is checked against verify_out[j-1].
         let mut k_acc = 0usize;
         if drafts[0] == next {
-            // d1 == the engine's own next token: accepted. Run its forward.
-            loop {
-                let row = k_acc; // row k_acc forwards drafts[k_acc] at pos+1+k_acc
-                verify_out[row] = self.step_dev(drafts[row], pos + 1 + row)?;
+            k_acc = 1;
+            while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc - 1] {
                 k_acc += 1;
-                // The next draft (drafts[k_acc]) is checked against this row's
-                // argmax; a mismatch (or running out of drafts) ends the block.
-                if k_acc >= DSPARK_DRAFTS || drafts[k_acc] != verify_out[row] {
-                    break;
-                }
             }
         }
-        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
 
-        // ---- 4. the engine is ALREADY in the committed state: the plain step
-        // advanced it to pos+1, and each accepted verify row advanced it once
-        // more (pos_ctr is now pos+1+k_acc, and the next input token is the
-        // last row's argmax). No rollback, no replay, no pos_ctr fixup.
-        //
-        // The draft's window ctx: the accepted rows' target hiddens were
-        // collected by the tap hook inside each step_dev replay (the single-row
-        // tap buffer holds the LAST one; the per-row tap lives in the graph's
-        // tap site). Seeding the window per row is unnecessary for correctness
-        // — the next `draft_forward` seeds the current position's row, and the
-        // multi-row `note_ctx_rows` from the retired path is gone with it.
-        let commit_ms = 0.0f32;
+        // ---- 6. the commit: roll back everything past the accepted prefix,
+        // replay the kept rows through the compressors, advance the counter.
+        let t = std::time::Instant::now();
+        self.dspark_commit(pos_ctr, m, k_acc, &host_mirrors)?;
+        dspark.note_ctx_rows(self.s.dspark_tap_r.ptr as *const f32, m, k_acc, pos + 1)?;
+        let commit_ms = t.elapsed().as_secs_f32() * 1e3;
 
-        // ---- 5. what this step emits: the anchor plus every accepted row's
-        // argmax (the last one is the bonus).
+        // ---- 7. what this step emits: the anchor plus the verify's argmax for
+        // every position the draft got right.
         let mut emitted = Vec::with_capacity(k_acc + 1);
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
