@@ -1074,3 +1074,30 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 **seed 修复后的语义**：seed 现在写 pos%win（= 官方的 start_pos%win）。默认路径的窗口包含它 → 官方的 `arange(min(win, start_pos+1))` 语义 ✓。**默认路径无需改动**——win_rows 的排除逻辑只在 SEED_ALIGN 路径（而 SEED_ALIGN 与 P0-1 修复互斥）。
 
 **待验证**：GPU 测试（079ffbaf）的 accept 变化——如果 seed 修复后 accept 仍低，win_rows 的包含性需要复查。
+
+## 今日成就总结（2026-09-12 下午，P0 修复战役）
+
+### 正确性（用户红线）
+1. **零拉丁字符达成** ✓ — BF16_TRUNCATE（hc_pre 的 bf16 截断）彻底消除 acs/ibu/Bristol/burdens/oqua
+2. **段错误根因**：并发编辑的 ABI 边界不一致（kernel 侧有 truncate 而 Rust 侧没有）→ 干净重建 + ABI 5 修复
+3. **P0-2 temperature**：checkpoint 无设置，贪心下双方都用 argmax ✓（非阻塞）
+
+### Accept 率（400 的关键乘数）
+draft-numerical-audit 找到 5 个严重缺陷（当前 accept 1.02 vs sglang ~5 的根因）：
+- **P0-1 seed 相位 −1**（头号嫌疑）✅ 已修复（pos-1 → pos）
+- **P0-3 tap 采集点差一层** 🔄 subagent 实现中
+- **P1-5 head/gate bf16 域** ✅ 已实现（DSV41_DRAFT_BF16_DOMAIN）
+- **P0-4 wo_a 格式** 🔄 subagent 核实中
+- **P0-2 temperature** ✅ 已查证（非阻塞）
+
+### 性能（步时压缩）
+- lazy verify: 49→22.56→18.82ms（mrows staging 修复）
+- hc verify 接线: 400→240 launches（A1+A2 融合）
+- draft P3c 图化: 120→1 launch
+- tcgen05 masked kernel: grouped routing + DeepGEMM 形态（-6.8ms 待验证）
+- 全栈综合: 步时 34.34ms（截断代价 ~14% 吞吐，可接受）
+
+### 待验证
+- **P0-1 seed 修复的 accept 提升**（GPU 测试 079ffbaf 跑中——决定性测试）
+- P0-3 tap 修复（subagent）
+- tcgen05 grouped 路径的端到端
