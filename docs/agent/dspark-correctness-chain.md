@@ -1949,3 +1949,19 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **修复方向**：draft 的 attention 投影改用与 verify 相同的程序（gemm_fp8_mrows 的 m=bs 形态），或 verify 改用 draft 的（gemm_fp8_mx）。关键是**两侧走同一个程序**。
 
 **一致的组件**（✓）：MoE gate、routed experts、hc_mixes、hc_post、norm、quant
+
+## SWALLOW_STEP ar5-hang 修复失败的记录（40c93509）
+
+**修复后死锁更严重**：gap 从 1-2 恶化到 **22**（need=80 cur=58，141,506 行 ar5-hang）
+
+**修复内容**：argmax epoch 守卫（非 capturing 不推进）+ DRY host barrier
+**结果**：更差——说明修复方向有问题
+
+**可能原因**：
+1. 修复后 DRY 不推进 epoch（0），但 replay 推进（+2/步）。如果 DRY → capture → replay 的转换不同步，gap 累积
+2. gap=22 ≈ 11 步 × 2/步——某些 rank 11 步没推进（它们可能卡在不同阶段）
+3. DRY barrier 可能让之前被掩盖的竞态暴露
+
+**深度调查**：ar5-deeper-investigation subagent 正在分析真正的根因。
+
+**临时策略**：SWALLOW_STEP 继续禁用（ar5-hang 未解决）。400 路径暂时依赖 LAZY_VERIFY。
