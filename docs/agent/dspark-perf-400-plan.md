@@ -29,6 +29,8 @@
   3. **MoE expert**: `expert_gate_up_fp4_batched` 的 `rows=m`（行独立累加）+ down_reduce 的 rows=m
   4. **norm/hc 类**: `rmsnorm`/`hc_collapse`/`hc_post` 的多行版（rmsnorm-multrow subagent 正在回退逐行绕过）
 - **图化**: `DSV41_VERIFY_GRAPH=1`（已实现，默认 OFF）——DRY→capture→replay，输入缓冲（ids_r/pos_rows）在图外刷新
+  - **启用前置**（`verify_graph_gate`，chain_dev.rs:2901+）：`!eng_host()` && `!stats_dbg()` && `!phase_dbg()` && `compress_branch_steady()`（每个 compress source 都已提交过至少一组——稳态）&& `supports_dspark_snapshot()`（P0 kernel 在 .so 里）&& `supports_memset_async()` && **`(comm.is_none() || ar_v5())`**——**TP8 下必须让 AR 走 v5**（`DSV41_AR_V5`/`FERRITE_P2P_AR5` 的 opt-in）否则 gate 恒 false，图化静默不启用（"测了没变化"的陷阱）
+  - A/B 口径：`verify_ms` 的对照（plan §3.3/§4）
 
 ## 三、阶段 2：吞掉主链步（6.15 → 0）
 

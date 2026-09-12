@@ -797,22 +797,29 @@ impl<'a> DsparkDev<'a> {
             // `h = hc_pre(x, pre_mix)`, the reference's `h(pre_mix)` — taken
             // BEFORE the in-place rmsnorm below, which is why it is recorded here.
             self.dump_unit_idx("h_premix_block", s, self.xn.ptr as *const f32, &[bs, dim]);
-            // Per-row rmsnorm (n=1), the SAME call shape the backbone uses.
-            // The unit diff caught the m=bs call producing 1e27 garbage: the
-            // kernel's n>1 handling is broken (hand-computing rmsnorm on the
-            // same collapse row and the checkpoint's attn_norm weights gives
-            // normal values; the m=5 call alone explodes). Every row gets its
-            // own n=1 launch — bit-identical to the backbone's per-row calls.
-            for r in 0..bs {
-                self.dev.rmsnorm(
-                    (self.xn.ptr as *const f32).wrapping_add(r * dim),
-                    attn_norm.as_f32(),
-                    (self.xn.ptr as *mut f32).wrapping_add(r * dim),
-                    1,
-                    dim as i32,
-                    eps,
-                )?;
-            }
+            // ONE multi-row rmsnorm (n = bs), in place, exactly the call
+            // `chain_dev.rs`'s kv norm makes (`attention_rows` hands n = m to
+            // the same launcher).
+            //
+            // HISTORY — this was briefly written as a per-row n=1 loop under
+            // the belief that the kernel's n>1 path was broken (an m=bs call
+            // appeared to produce 1e27). Reading the kernel settled it the
+            // other way (`ferrite_kernels.cu:278-321`, `ferrite_rmsnorm`):
+            // `grid(n)` gives one block per row, each block addresses its row
+            // at `x + row*dim` / `out + row*dim`, and the cross-warp reduce is
+            // sized by `blockDim`. Rows are therefore completely independent —
+            // n=bs is bit-identical to bs n=1 launches. The 1e27 came from the
+            // attn_norm WEIGHT POINTER being garbage (the `load.rs:925`
+            // placeholder bug, since fixed), not from the kernel. The per-row
+            // loop was a pure launch-count loss and is reverted here.
+            self.dev.rmsnorm(
+                self.xn.ptr as *const f32,
+                attn_norm.as_f32(),
+                self.xn.ptr as *mut f32,
+                bs as i32,
+                dim as i32,
+                eps,
+            )?;
             // post-norm xn — the SAME semantic as the golden harness's
             // `stage{s}.attn.in` (attn_norm's output), for direct diffing.
             self.dump_unit_idx("h_norm_block", s, self.xn.ptr as *const f32, &[bs, dim]);

@@ -1136,7 +1136,7 @@ pub struct DevChain<'a> {
     /// would let one layer's capture clobber another's under a per-layer MoE
     /// graph (`DSV41_GRAPH_MOE`).
     moe_add_in: Vec<Option<*const f32>>,
-    /// DSV41_SPEC only: while this is set, [`Self::compress_rows`] also saves the
+    /// DSV41_SPEC only: while this is set, [`Self::compress_proj_rows`] also saves the
     /// verify's per-layer `kvp`/`scp` rows (see `Scratch::spec_snap_kvp`), because
     /// [`Self::dspark_spec_step`]'s commit has to REPLAY the accepted prefix
     /// through the compressor and the shared m-row scratch does not survive the
@@ -1162,6 +1162,11 @@ pub struct DevChain<'a> {
     /// it (`DSPARK_DRAFTS` = 5 for the shadow step, 6 for the spec step, and the
     /// parity self-test varies it) — those calls fall back to the direct path.
     verify_graph_m: usize,
+    /// Set when a capture attempt FAILED. The graph is an optimisation, so a
+    /// refusal from the driver must not take the verify down with it: the
+    /// request finishes on the direct launches, and this flag stops the same
+    /// doomed capture from being re-attempted on every step. Cleared by `reset`.
+    verify_graph_failed: bool,
     /// False until the first `step_rows` call has executed for real: that call
     /// is the DRY run (it warms every kernel, builds the lazy engram state and
     /// sizes the cuBLAS workspaces), and only the SECOND one captures.
@@ -1490,6 +1495,7 @@ impl<'a> DevChain<'a> {
             spec_capture: false,
             verify_graph: None,
             verify_graph_m: 0,
+            verify_graph_failed: false,
             verify_dry_done: false,
             verify_captures: 0,
             verify_replays: 0,
@@ -1624,6 +1630,7 @@ impl<'a> DevChain<'a> {
             self.dev.graph_free(std::ptr::null_mut(), e)?;
         }
         self.verify_graph_m = 0;
+        self.verify_graph_failed = false;
         self.verify_dry_done = false;
         self.verify_captures = 0;
         self.verify_replays = 0;
@@ -2708,16 +2715,18 @@ impl<'a> DevChain<'a> {
     // # TODO (known modelling gaps — reported, not hidden)
     //
     // 1. COMPRESSOR: `compressor_fused` rejects `seqlen != 1` outright
-    //    (dsv41_kernels.cu) and the state/pool kernels' decode branches carry ONE
-    //    row, so `compress_rows` runs the pool+commit pair with `seqlen = m` and
-    //    only the group the single-row arithmetic knows about is formed. A block
-    //    that completes several groups (ratio 2, m = 6: up to 3) is not modelled
-    //    yet.
+    //    (dsv41_kernels.cu), so the verify runs the three-launch path with ONE
+    //    pool+commit pair per row ([`Self::compress_row`], interleaved inside
+    //    `attention_rows`) — the state/pool kernels' decode branches carry ONE row
+    //    each, which is exactly what a per-row call gives them. A block that
+    //    completes several groups (ratio 2, m = 6: up to 3) is modelled: each of
+    //    those groups is committed and its index key published at the row that
+    //    produced it.
     // 2. INDEXER: the candidate count is the live device counter, which includes
-    //    the group this block may have just committed — whose index key is
-    //    published AFTER the selection (the single-row path has the same order, it
-    //    just has one row). Newly created groups are not excluded from the
-    //    candidate set yet.
+    //    the group this row may have just committed — its index key is now
+    //    published BEFORE that row's selection (per-row interleave), matching the
+    //    single-row order, so newly created groups are still part of the candidate
+    //    set. Excluding them is a modelling decision that has not been taken.
     // 3. HEAD: the full vocabulary is used on every rank (no `HEAD_SLICE`):
     //    `argmax_sliced` advances `pos_ctr` and consumes one v5 epoch round per
     //    call, which a 6-row block cannot afford. The head is replicated, so the
@@ -2823,24 +2832,37 @@ impl<'a> DevChain<'a> {
                 // The capture records WITHOUT executing, so the device state stays
                 // where the caller's snapshot was taken ...
                 let saved = self.compress_lens();
-                self.dev.capture_begin()?;
-                self.step_rows_inner(toks, m, pos_base)?;
-                let g = self.dev.capture_end()?;
-                // ... but the HOST code inside it ran for real: `compress_rows`
-                // advances its `compress_len` mirror by the rule the commit kernel
-                // applies on the device, and no kernel ran. Leaving the mirror one
-                // group ahead would make the NEXT step's `comp_len` branch take a
-                // path the device counter does not agree with, so it is put back.
+                // The graph is an OPTIMISATION: no capture failure may take the
+                // verify down with it. A driver refusal (an op the static audit
+                // approved that the driver still rejects, an unsupported
+                // primitive on a stale `.so`, an instantiate failure) leaves this
+                // request on the DIRECT launches, and `verify_graph_failed` stops
+                // the doomed capture from being retried on every step.
+                let (g, cap_err) = self.capture_verify(toks, m, pos_base);
+                // ... but the HOST code inside the recording ran for real either
+                // way: `compress_rows` advances its `compress_len` mirror by the
+                // rule the commit kernel applies on the device, and on the failure
+                // arm no kernel ran at all. Leaving the mirror ahead would make
+                // the NEXT step's `comp_len` branch take a path the device counter
+                // does not agree with, so it is put back before either arm runs.
                 self.restore_compress_lens(&saved);
                 if let Some(c) = self.comm.as_ref() {
                     c.host_barrier();
                 }
-                let e = self.dev.graph_instantiate(g)?;
-                self.dev.graph_free(g, std::ptr::null_mut())?;
-                self.dev.graph_launch(e)?; // the capture did not execute
-                self.verify_graph = Some(e);
-                self.verify_captures += 1;
-                self.advance_compress_lens(pos_base, m);
+                if cap_err.is_some() || g.is_null() {
+                    self.verify_graph_failed = true;
+                    if !g.is_null() {
+                        let _ = self.dev.graph_free(g, std::ptr::null_mut());
+                    }
+                    self.step_rows_inner(toks, m, pos_base)?;
+                } else {
+                    let e = self.dev.graph_instantiate(g)?;
+                    self.dev.graph_free(g, std::ptr::null_mut())?;
+                    self.dev.graph_launch(e)?; // the capture did not execute
+                    self.verify_graph = Some(e);
+                    self.verify_captures += 1;
+                    self.advance_compress_lens(pos_base, m);
+                }
             }
         } else {
             self.step_rows_inner(toks, m, pos_base)?;
@@ -2886,7 +2908,7 @@ impl<'a> DevChain<'a> {
     /// * `ar_v5()` whenever there are peers: a host barrier is not a CUDA call, so
     ///   it would not be recorded and the replayed graph would silently lose the
     ///   inter-rank synchronisation.
-    /// * `supports_memset_async()`: `compress_rows` zeroes `scp_r` on the
+    /// * `supports_memset_async()`: `compress_proj_rows` zeroes `scp_r` on the
     ///   `ratio == 1` no-gate path, and `zero_at_on` would fall back to the
     ///   SYNCHRONOUS `cudaMemset` on the legacy stream without the symbol.
     /// * `supports_dspark_snapshot()`: not a capture requirement of THIS graph
@@ -2899,6 +2921,11 @@ impl<'a> DevChain<'a> {
     ///   [`Self::compress_branch_steady`], which is the guard for the audit's S7.
     fn verify_graph_gate(&self, m: usize, pos_base: i32) -> bool {
         if !verify_graph_want() || pos_base < 1 {
+            return false;
+        }
+        if self.verify_graph_failed {
+            // A capture already failed this request. Re-attempting it every step
+            // would burn the failure on the hot path for nothing.
             return false;
         }
         if self.verify_graph_m != 0 && m != self.verify_graph_m {
@@ -2922,7 +2949,7 @@ impl<'a> DevChain<'a> {
     /// The guard for the audit's S7 (`comp_len` frozen into the captured branch).
     ///
     /// `attention_rows` branches on the HOST mirror `comp_len > 0` to pick one of
-    /// three compressed-half behaviours ([`Self::indexer_rows`], nothing for a
+    /// three compressed-half behaviours ([`Self::indexer_rows_one`], nothing for a
     /// consumer, or the per-row [`Device::comp_placeholder`]), and a capture
     /// freezes that choice. The mirror is CUMULATIVE and monotonically
     /// non-decreasing across a run (this block's commits add to it, and
@@ -2940,7 +2967,7 @@ impl<'a> DevChain<'a> {
     }
 
     /// The host MIRROR of every layer's device committed-row counter — the state
-    /// [`Self::compress_rows`] advances from HOST code while the commit kernel
+    /// [`Self::compress_row`] advances from HOST code while the commit kernel
     /// advances the device counter. A capture runs the host code but no kernel, so
     /// the mirror has to be put back afterwards (see [`Self::step_rows`]).
     fn compress_lens(&self) -> Vec<usize> {
@@ -2955,9 +2982,9 @@ impl<'a> DevChain<'a> {
 
     /// Advance the host mirrors for a verify block the DEVICE has just executed
     /// (a replayed graph runs no host code at all), by the same per-row rule
-    /// [`Self::compress_rows`] applies: row `r` at `pos_base + r` commits one
+    /// [`Self::compress_row`] applies: row `r` at `pos_base + r` commits one
     /// latent when `(pos_base + r + 1) % ratio == 0`. Only the layers that OWN a
-    /// compressor are counted, and only those that [`Self::compress_rows`] does
+    /// compressor are counted, and only those that [`Self::compress_proj_rows`] does
     /// not decline (`comp_wkv`/`comp_norm` present) — a consumer layer inherits
     /// the count ([`Self::source_compress_len`]) and writes no state of its own.
     ///
@@ -2967,7 +2994,7 @@ impl<'a> DevChain<'a> {
         for l in self.compress_sources() {
             let ld = &self.w.layers[l];
             if ld.comp_wkv.is_none() || ld.comp_norm.is_none() {
-                continue; // `compress_rows` declines the layer: it commits nothing
+                continue; // `compress_row` declines the layer: it commits nothing
             }
             let ratio = self.cfg.compress_ratio(l).max(1) as i32;
             let mut add = 0usize;
@@ -3172,9 +3199,9 @@ impl<'a> DevChain<'a> {
     }
 
     /// The layers whose compressor runs inside the verify block: the
-    /// `compress_rows` gate in `attention_rows` (`compress_ratio > 0 &&
-    /// is_kv_source`). A consumer of the same group only INHERITS the count and
-    /// writes no state of its own.
+    /// `compress_proj_rows`/`compress_row` gate in `attention_rows`
+    /// (`compress_ratio > 0 && is_kv_source`). A consumer of the same group only
+    /// INHERITS the count and writes no state of its own.
     fn compress_sources(&self) -> Vec<usize> {
         (0..self.cfg.n_layers)
             .filter(|&l| self.cfg.compress_ratio(l) > 0 && self.cfg.is_kv_source(l))
@@ -3202,7 +3229,7 @@ impl<'a> DevChain<'a> {
     /// 2. `state_kv` + `state_score` — the compressor carry, the full
     ///    `ratio * head_dim` each. The buffers are max-sized and each copy uses
     ///    its own layer's byte count (`ratio` is per layer: 1 or 2 here).
-    /// 3. `latent` — **not** a per-step scratch. `indexer()`/`indexer_rows()` read
+    /// 3. `latent` — **not** a per-step scratch. `indexer()`/`indexer_rows_one()` read
     ///    it on LATER steps as well (`indexer_owns_k` -> `lin_bf16(latent, wk)`),
     ///    and the pool rewrites it only on a step that completes a group. Leaving
     ///    the verify's latent behind would make the next non-completing step
@@ -4607,6 +4634,13 @@ impl<'a> DevChain<'a> {
         // ---- q / kv projections, one row per call ----
         // `lin()` is the (quant1, gemm_fp8_mx_or_swap) pair: the plain shape the
         // fused `lin2`/`lin_rope*` launches are bit-identical to.
+        //
+        // The loop is split into (wq_a, wkv) -> q norm -> wq_b so the q norm can
+        // be ONE `n = m` launch. It is row-INDEPENDENT (the kernel gives every row
+        // its own block and its own blockDim-sized reduction), `qr_r` is the
+        // contiguous [m, ql] block, and row `r`'s output is bit-identical to the
+        // per-row `n = 1` call it replaces. Only the norm moves; the projections
+        // stay per row (the numerical-domain rule).
         for r in 0..m {
             let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
             let qrr = (self.s.qr_r.ptr as *mut f32).wrapping_add(r * ql);
@@ -4627,19 +4661,21 @@ impl<'a> DevChain<'a> {
                 hd as i32,
                 kvr,
             )?;
-            // q norm, in place (the T2 epilogue's own fallback pair: plain rmsnorm
-            // into `qr`)
-            self.dev.rmsnorm(
-                qrr as *const f32,
-                ld.q_norm.as_ref().unwrap().as_f32(),
-                qrr,
-                1,
-                ql as i32,
-                cfg.norm_eps,
-            )?;
+        }
+        // q norm, in place: ALL m rows in ONE launch (the T2 epilogue's own
+        // fallback pair — a plain rmsnorm into `qr`). Was m launches.
+        self.dev.rmsnorm(
+            self.s.qr_r.ptr as *const f32,
+            ld.q_norm.as_ref().unwrap().as_f32(),
+            self.s.qr_r.ptr as *mut f32,
+            m as i32,
+            ql as i32,
+            cfg.norm_eps,
+        )?;
+        for r in 0..m {
             // wq_b: this rank's `nlh` heads, written at the row's base
             self.lin(
-                qrr as *const f32,
+                (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
                 ql as i32,
                 ld.wq_b.as_ref().unwrap(),
                 ld.wq_b_scale.as_ref().unwrap(),
@@ -4692,29 +4728,74 @@ impl<'a> DevChain<'a> {
             false,
         )?;
 
-        // ---- window ring + the per-row causal window ----
-        // The release shares one KV store across a group of layers; a consumer then
-        // reads its owner's ring and must not append to it again (the same rule the
-        // single-row `ring_append` follows).
+        // ---- the per-row interleave: append → window → compress → select →
+        //      sparse attention, ONE ROW AT A TIME ----
+        //
+        // ⚠️ THE ORDER IS THE WHOLE POINT (verify-parity-audit, defects #1/#2).
+        // The compressor, the indexer and `sparse_attn` all bound themselves by
+        // the LIVE device counter `*clen` — dsv41_kernels.cu:947-948 derive the
+        // attention's `n`/`topk` from it, :2805/:2825 the indexer's `n_pos` — and
+        // this pass commits up to ceil(m / ratio) groups. Running the read side
+        // BLOCK-WIDE (all m appends, then the compressor's m rows, then the m
+        // indexer calls, then the m attention calls) therefore handed every row
+        // the BLOCK-FINAL counter: row 0's compressed half included the latents
+        // that rows 1..m-1 committed *after* it — its own future — while losing
+        // the oldest group it should still have seen. Its argmax then degenerated
+        // into replaying a token it had just attended to, which is exactly the
+        // observed double token and the collapse of the accept rate (≈0.02).
+        // Interleaving the four steps per row makes row r's bound its own: the
+        // commits of rows `< r` are visible, those of rows `> r` do not exist yet.
+        //
+        // `*clen` needs no per-row SNAPSHOT pointer for that: the commit kernel
+        // for row r is issued on this stream BEFORE row r's indexer/attention, so
+        // by the time they read the counter it already carries row r's value.
+        // What has to hold is only "row r's compress precedes row r's readers",
+        // which the loop below guarantees by construction.
+        //
+        // The release shares one KV store across a group of layers; a consumer
+        // then reads its owner's ring (and the owner's `idxs_r`, which the owner
+        // filled row-interleaved — it runs earlier in the stack) and must not
+        // append to it again, the same rule the single-row `ring_append` follows.
         let owner = if ring_owner_shared() { self.kv_owner(layer) } else { layer };
         let owns_kv = owner == layer;
         let ring_ptr = self.layers[owner].ring.ptr;
         let ist = win + cfg.index_topk;
-        if owns_kv {
-            // PER-ROW append + PER-ROW causal window, interleaved: row r's
-            // `window_idxs` must run after row r's append (its own KV is in the
-            // window) but BEFORE row r+1's append (which would overwrite the
-            // oldest slot that row r's window still enumerates — reading the
-            // block's future row as history instead). The fused verify_ring_win
-            // appended the whole block first and derived the indices from slot
-            // numbers, which broke exactly there: once base+r >= window the
-            // `v > start_pos` filter never fires (v is a SLOT, not a position)
-            // and every row but the last read the block's own future rows while
-            // losing the oldest m-1-r history — the "verify outputs garbage"
-            // root cause. The single-row kernels keep the ring invariant row by
-            // row, so the window is byte-identical to a single-row decode at
-            // each row's position.
-            for r in 0..m {
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let comp_ratio = cfg.compress_ratio(layer);
+        let is_comp_src = comp_ratio > 0 && cfg.is_kv_source(layer);
+        let is_idx_src = cfg.is_index_source(layer);
+        let clen_owner = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner);
+        // The compressor's PROJECTIONS (comp_wkv/comp_wgate, the ratio-1 `scp`
+        // zeroing and the DSV41_SPEC scratch snapshot) are a pure function of
+        // `s.xn_r`, which no later step of this layer writes, so they stay
+        // block-wide; only the state/pool/commit half is interleaved below.
+        let comp_proj = if is_comp_src {
+            self.compress_proj_rows(layer, m)?
+        } else {
+            false
+        };
+        // A consumer inherits the count its source published. The source owns the
+        // compressor and its whole block is finished before this layer starts, so
+        // the inherited count is constant across this block.
+        let comp_len_inherited = if comp_ratio > 0 && !is_comp_src {
+            self.source_compress_len(layer)
+        } else {
+            0
+        };
+        for r in 0..m {
+            // ---- 1) ring append + THIS row's causal window ----
+            // (audit defect #2: the window half.) `window_idxs(r)` must run after
+            // row r's append (its own KV is in the window) but BEFORE row r+1's
+            // append (which would overwrite the oldest slot row r's window still
+            // enumerates — reading the block's future row as history instead). The
+            // fused verify_ring_win appended the whole block first and derived the
+            // indices from slot numbers, which broke exactly there: once
+            // base+r >= window the `v > start_pos` filter never fires (v is a SLOT,
+            // not a position) and every row but the last read the block's own
+            // future rows while losing the oldest m-1-r history. The single-row
+            // kernels keep the ring invariant row by row, so the window is
+            // byte-identical to a single-row decode at each row's position.
+            if owns_kv {
                 self.dev.ring_append(
                     ring_ptr as *mut f32,
                     (self.s.kv_r.ptr as *const f32).wrapping_add(r * hd),
@@ -4728,41 +4809,56 @@ impl<'a> DevChain<'a> {
                     win as i32,
                 )?;
             }
-        }
-        // A consumer layer's window block is the owner's (the indices depend
-        // only on the positions and the ring geometry, and the owner filled
-        // idxs_r interleaved with its appends) — no append, no recompute.
-
-        // ---- compressor + the compressed-half selection ----
-        let comp_len = if cfg.compress_ratio(layer) > 0 && cfg.is_kv_source(layer) {
-            self.compress_rows(layer, m, pos_base)?
-        } else if cfg.compress_ratio(layer) > 0 {
-            // a consumer inherits the count published by its source layer
-            self.source_compress_len(layer)
-        } else {
-            0
-        };
-        if comp_len > 0 && cfg.is_index_source(layer) {
-            self.indexer_rows(layer, m, win, comp_len)?;
-        } else if !owns_kv && comp_len > 0 {
-            // a non-index consumer reads the owner's selection, which the owner (an
-            // index source, running earlier in the stack) already wrote into this
-            // step's `idxs_r` compressed block
-        } else if comp_len > 0 {
-            // the owner has no indexer: the recency placeholder, per row
-            for r in 0..m {
+            // A consumer layer's window block is the owner's (the indices depend
+            // only on the positions and the ring geometry, and the owner filled
+            // idxs_r interleaved with its appends) — no append, no recompute.
+            //
+            // ---- 2) THIS row's compressor: pool + commit (one group per `ratio`
+            //         positions) + the host mirror of the device counter ----
+            // (audit defect #1: the compressed half — the read side below must not
+            // see the block's block-final counter.)
+            let committed = if is_comp_src && comp_proj {
+                self.compress_row(layer, r, pos_base)?
+            } else {
+                false
+            };
+            // ---- 3) the compressed-half selection, bounded by THIS row ----
+            // (audit defect #1.) `comp_len` is the row's own count: for a source it
+            // is the host mirror the row's commit just advanced (the device counter
+            // the kernels read is the same value, advanced on this stream by the
+            // same launch), for a consumer the constant the source published.
+            let comp_len = if is_comp_src {
+                self.layers[layer].compress_len
+            } else {
+                comp_len_inherited
+            };
+            if comp_len > 0 && is_idx_src {
+                // The row's own top-k, plus — for a layer that OWNS the keys — the
+                // index key of the group this row's commit just produced, published
+                // at `*clen - 1` BEFORE the selection reads it (the single-row
+                // order). Publishing per row instead of once per block is what
+                // keeps every group of the block addressable: the key of a group is
+                // written while `latent` still holds that group's pooled row.
+                self.indexer_rows_one(layer, r, win, comp_len, committed)?;
+            } else if !owns_kv && comp_len > 0 {
+                // a non-index consumer reads the owner's selection, which the owner
+                // (an index source, running earlier in the stack) already wrote into
+                // this step's `idxs_r` compressed block — per row, interleaved with
+                // its own appends
+            } else if comp_len > 0 {
+                // the owner has no indexer: the recency placeholder, for this row,
+                // bounded by the same live counter
                 self.dev.comp_placeholder(
                     (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist + win),
-                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                    clen_owner,
                     win as i32,
                     cfg.index_topk as i32,
                 )?;
             }
-        }
-
-        // ---- sparse attention + the inverse o-rope, one row per call ----
-        let scale = 1.0f32 / (hd as f32).sqrt();
-        for r in 0..m {
+            // ---- 4) sparse attention for THIS row ----
+            // The `b = 1, m = 1` shape is exactly the single-row `attention`'s, so
+            // each row is verified against the plain engine row by row — the
+            // strongest parity guarantee available.
             self.dev.sparse_attn(
                 (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
                 ring_ptr as *const f32,
@@ -4773,12 +4869,16 @@ impl<'a> DevChain<'a> {
                 1,
                 nlh as i32,
                 hd as i32,
-                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                clen_owner,
                 win as i32,
                 cfg.index_topk as i32,
                 scale,
             )?;
         }
+
+        // ---- the inverse o-rope, one row per call (the attention loop above
+        //      interleaves this row's selection with the block's commits, so the
+        //      rope stays outside it) ----
         for r in 0..m {
             self.dev.apply_rope(
                 (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
@@ -4871,12 +4971,14 @@ impl<'a> DevChain<'a> {
     /// slot its DEVICE compressed-row counter names.
     ///
     /// Extracted from the two callers that used to inline it — the single-row
-    /// [`Self::indexer`] and [`Self::indexer_rows`] — because the DSpark spec
-    /// commit's replay ([`Self::compress_replay`]) needs the SAME key for every
-    /// group it re-commits. Publishing only the block's LAST group (what
-    /// `indexer_rows` does) leaves the earlier groups' keys stale, and
-    /// `indexer_topk` reads every row `< clen` — so a partially committed block
-    /// would select against keys that were never written.
+    /// [`Self::indexer`] and the verify's per-row [`Self::indexer_rows_one`] —
+    /// because the DSpark spec commit's replay ([`Self::compress_replay`]) needs the
+    /// SAME key for every group it re-commits. The verify now publishes one key per
+    /// COMPLETED row, from inside the per-row interleave (so every group the block
+    /// commits gets its key before the row that produced it selects); the older
+    /// block-wide form could only ever name the block's LAST group, leaving the
+    /// earlier groups' keys stale — and `indexer_topk` reads every row `< clen`, so
+    /// a partially committed block would select against keys never written.
     ///
     /// Returns `false` when the layer carries no index-key weights, so a caller
     /// can skip it without duplicating the weight lookup. `&self`: every launch
@@ -4929,24 +5031,30 @@ impl<'a> DevChain<'a> {
         Ok(true)
     }
 
-    /// Multi-row indexer: the m-row twin of [`Self::indexer`].
+    /// ONE ROW of the multi-row indexer: the per-row query/weights/top-k triple of
+    /// [`Self::indexer`], plus — when `publish_key` — the index key of the group
+    /// this row's compressor just committed.
     ///
-    /// The key PUBLISHING stays once per layer (it is a function of the compressor's
-    /// latent, of which the multi-row compressor produces one row — see the
-    /// compressor TODO); the queries, per-head weights and the top-k launch run per
-    /// row, with each row's picks landing in that row's `idxs_r` block at
-    /// `+offset`.
+    /// Called from [`Self::attention_rows`] INSIDE the per-row interleave, right
+    /// after row `r`'s [`Self::compress_row`] and before row `r`'s `sparse_attn`,
+    /// so the live device counter (`idx_lens`, and the same counter `sparse_attn`
+    /// reads) is row `r`'s own. Handing the whole block the block-FINAL counter is
+    /// precisely the defect the interleave removes: row 0 selected against the
+    /// latents rows 1..m-1 had committed after it — its own future — and lost the
+    /// oldest group it should have seen.
     ///
     /// `indexer_topk`'s output stride is `cols = min(topk, n_pos)` — a RUNTIME value
     /// derived from the live compressed count — so the kernel cannot be handed the
-    /// `window + index_topk` row stride `idxs_r` uses. It is therefore called once
-    /// per row with `m = 1`, where the stride never matters.
-    fn indexer_rows(
+    /// `window + index_topk` row stride `idxs_r` uses. It is therefore called with
+    /// `m = 1` (`b = 1`), where the stride never matters; every offset is the row's
+    /// base plus the caller's `offset`.
+    fn indexer_rows_one(
         &mut self,
         layer: usize,
-        m: usize,
+        r: usize,
         offset: usize,
         comp_len: usize,
+        publish_key: bool,
     ) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -4968,97 +5076,102 @@ impl<'a> DevChain<'a> {
         ) else {
             return Ok(false);
         };
-        // ---- key publishing (kv sources only, once per layer) ----
-        // `indexer_owns_k` decides whether this layer publishes the index key for
-        // the group the compressor produced; the roped key lands in the owner's
-        // `index_k` at the slot its DEVICE counter names.
-        if cfg.indexer_owns_k(layer) {
+        // ---- key publishing, PER ROW ----
+        // `indexer_owns_k` decides whether this layer publishes index keys for the
+        // groups its own compressor produces; the roped key lands in the owner's
+        // `index_k` at the slot its DEVICE counter names (`*clen - 1`).
+        //
+        // Only a row that COMPLETED a group has a new latent to publish: the pool's
+        // mode-2 branch writes no latent on a non-completing position, so `latent`
+        // still holds the previous group's pooled row and re-publishing would
+        // rewrite the very same bytes — skipping it is equivalent to the single-row
+        // path, which republishes unconditionally. Publishing per row (instead of
+        // once per block, which could only ever name the block's LAST group) is what
+        // makes EVERY group of the block addressable, and it now happens BEFORE this
+        // row's own selection reads `index_k[.. *clen]`.
+        if publish_key && cfg.indexer_owns_k(layer) {
             self.publish_index_key(layer)?;
         }
-        // ---- per-row queries, weights and selection ----
+        // ---- this row's query, per-head weights and selection ----
         // The q_lora stream is already normed (attention_rows ran the plain
         // rmsnorm), so `idx_wq_b` uses the plain `lin`/`lin_bf16` pair.
-        for r in 0..m {
-            let idxq = (self.s.idx_q_r.ptr as *mut f32).wrapping_add(r * idx_nh * idx_hd);
-            self.lin(
-                (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
-                ql as i32,
-                idx_wq_b,
-                idx_wq_b_s,
-                (idx_nh * idx_hd) as i32,
-                idxq,
-            )?;
-            self.dev.apply_rope(
-                idxq,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
-                idx_nh as i32,
-                idx_hd as i32,
-                rd as i32,
-                half,
-                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
-                1,
-                r as i32,
-                0,
-                false,
-            )?;
-            self.lin_bf16(
-                (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
-                dim as i32,
-                wp,
-                idx_nh as i32,
-                (self.s.idx_w_r.ptr as *mut f32).wrapping_add(r * idx_nh),
-            )?;
-        }
+        let idxq = (self.s.idx_q_r.ptr as *mut f32).wrapping_add(r * idx_nh * idx_hd);
+        self.lin(
+            (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+            ql as i32,
+            idx_wq_b,
+            idx_wq_b_s,
+            (idx_nh * idx_hd) as i32,
+            idxq,
+        )?;
+        self.dev.apply_rope(
+            idxq,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            idx_nh as i32,
+            idx_hd as i32,
+            rd as i32,
+            half,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+            1,
+            r as i32,
+            0,
+            false,
+        )?;
+        self.lin_bf16(
+            (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
+            dim as i32,
+            wp,
+            idx_nh as i32,
+            (self.s.idx_w_r.ptr as *mut f32).wrapping_add(r * idx_nh),
+        )?;
         let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
         let key_owner = self.kv_owner(layer);
         let idx_lens =
             (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(key_owner);
         let idx_k_ptr = self.layers[key_owner].index_k.ptr as *const f32;
-        for r in 0..m {
-            self.dev.indexer_topk(
-                (self.s.idx_q_r.ptr as *const f32).wrapping_add(r * idx_nh * idx_hd),
-                idx_k_ptr,
-                (self.s.idx_w_r.ptr as *const f32).wrapping_add(r * idx_nh),
-                std::ptr::null(),
-                idx_lens,
-                (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * (offset + cfg.index_topk) + offset),
-                1,
-                1,
-                idx_nh as i32,
-                idx_hd as i32,
-                comp_len as i32,
-                cfg.index_topk as i32,
-                offset as i32,
-                scale,
-                1.0,
-                false,
-            )?;
-        }
+        self.dev.indexer_topk(
+            (self.s.idx_q_r.ptr as *const f32).wrapping_add(r * idx_nh * idx_hd),
+            idx_k_ptr,
+            (self.s.idx_w_r.ptr as *const f32).wrapping_add(r * idx_nh),
+            std::ptr::null(),
+            idx_lens,
+            (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * (offset + cfg.index_topk) + offset),
+            1,
+            1,
+            idx_nh as i32,
+            idx_hd as i32,
+            comp_len as i32,
+            cfg.index_topk as i32,
+            offset as i32,
+            scale,
+            1.0,
+            false,
+        )?;
         Ok(true)
     }
 
-    /// Multi-row compressor: the m-row twin of [`Self::compress_on`].
+    /// The PROJECTION half of the multi-row compressor: this layer's per-row
+    /// `comp_wkv` (`/` `comp_wgate`) projections, the ratio-1 `scp` zeroing and the
+    /// DSV41_SPEC scratch snapshot, all m rows in one go.
     ///
-    /// The projections are per row (the same `lin_f32` call, repeated), and the
-    /// state/pool/commit trio is called with `seqlen = m`. `compressor_fused` is
-    /// NOT used: its launcher rejects `b != 1 || seqlen != 1` outright. The
-    /// pool+commit pair is the path the fused launch is bit-identical to, so this
-    /// is a parity target and not a different program.
+    /// Split out of `compress_rows` so [`Self::attention_rows`] can interleave the
+    /// state/pool/commit half PER ROW ([`Self::compress_row`]) while paying the
+    /// projections once. They are a pure function of `s.xn_r` — which no later step
+    /// of this layer writes — so their position inside the block is irrelevant, and
+    /// running them up front is what lets row r's commit see row r's own
+    /// projections without re-reading `xn_r` per row.
     ///
-    /// ⚠️ KNOWN GAP (documented in `step_rows`): the state kernel's decode branch
-    /// and the mode-2 pool carry ONE row each, so this models a single completed
-    /// group per block. The host mirror is advanced by the same rule the commit
-    /// kernel applies on the device, which keeps the two consistent for that one
-    /// group.
-    fn compress_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<usize> {
+    /// Returns `false` when the layer carries no compressor (`comp_wkv`/`comp_norm`
+    /// absent): no row runs at all then and the host mirror is left untouched, which
+    /// is the early return `compress_rows` used to take.
+    fn compress_proj_rows(&self, layer: usize, m: usize) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hd = cfg.head_dim;
-        let ratio = cfg.compress_ratio(layer).max(1);
         let ld = &self.w.layers[layer];
-        let (Some(wkv), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
-            return Ok(self.layers[layer].compress_len);
+        let (Some(wkv), Some(_)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            return Ok(false);
         };
         let st = self.dev.stream();
         for r in 0..m {
@@ -5109,55 +5222,77 @@ impl<'a> DevChain<'a> {
                 n,
             )?;
         }
-        // PER-ROW single-token pool+commit: the pool's state decode branch and
-        // the commit's completion rule are per-POSITION. Running them once with
-        // seqlen=m only consumed ROW 0 — rows 1..m-1's kvp/scp never entered
-        // the state and the groups they completed never existed (the audit's
-        // defect #2; the operator-visible symptom was "the latent the draft
-        // sees never updates"). Each row now runs the SAME triple the
-        // single-row decode runs, at its own position (pos_rows[r]), so the
-        // compressed state after the block is exactly what m sequential
-        // single-row steps would leave.
-        for r in 0..m {
-            self.dev.compressor_pool_on(
-                (self.s.kvp_r.ptr as *const f32).wrapping_add(r * hd),
-                (self.s.scp_r.ptr as *const f32).wrapping_add(r * hd),
-                norm.as_f32(),
-                self.layers[layer].state_kv.ptr as *mut f32,
-                self.layers[layer].state_score.ptr as *mut f32,
-                self.layers[layer].latent.ptr as *mut f32,
-                self.layers[layer].out_rows.ptr as *mut i32,
-                1,
-                1,
-                hd as i32,
-                ratio as i32,
-                pos_base + r as i32,
-                (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
-                cfg.norm_eps,
-                st,
-            )?;
-            self.dev.compress_commit_on(
-                self.layers[layer].latent.as_f32(),
-                self.cos_comp.as_f32(),
-                self.sin_comp.as_f32(),
-                self.layers[layer].ring.ptr as *mut f32,
-                self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
-                (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
-                hd as i32,
-                cfg.rope_head_dim as i32,
-                (cfg.rope_head_dim / 2) as i32,
-                cfg.window_size as i32,
-                ratio as i32,
-                st,
-            )?;
-            // The host MIRROR of the device counter, by the SAME deterministic
-            // rule the commit kernel applies ((*pos + 1) % ratio == 0 commits
-            // one latent) — per row.
-            if (pos_base + r as i32 + 1) % (ratio as i32) == 0 {
-                self.layers[layer].compress_len += 1;
-            }
+        Ok(true)
+    }
+
+    /// ONE ROW of the multi-row compressor: the single-token pool + commit pair
+    /// (the SAME pair the single-row decode runs, at this row's own position
+    /// `pos_base + r`), plus the host mirror of the device counter.
+    ///
+    /// The pair is per-POSITION, not per-block: the pool's mode-2 branch and the
+    /// commit's completion rule both carry ONE row. Running them once with
+    /// `seqlen = m` only consumed ROW 0 — rows 1..m-1's `kvp`/`scp` never entered
+    /// the state and the groups they completed never existed (the audit's defect #2;
+    /// the operator-visible symptom was "the latent the draft sees never updates").
+    /// Per row, the compressed state after the block is exactly what m sequential
+    /// single-row steps would leave.
+    ///
+    /// Returns `true` when the row COMPLETED a group — the same deterministic rule
+    /// the commit kernel applies on the device (`(pos + 1) % ratio == 0`), which is
+    /// the signal [`Self::attention_rows`] uses to publish that group's index key
+    /// before the row's selection runs. `compressor_fused` is NOT used: its launcher
+    /// rejects `b != 1 || seqlen != 1` outright, and the pool+commit pair below is
+    /// the path the fused launch is bit-identical to (a parity target, not a
+    /// different program).
+    fn compress_row(&mut self, layer: usize, r: usize, pos_base: i32) -> Result<bool> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ratio_i = ratio as i32;
+        let ld = &self.w.layers[layer];
+        let (Some(_), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            return Ok(false);
+        };
+        let st = self.dev.stream();
+        self.dev.compressor_pool_on(
+            (self.s.kvp_r.ptr as *const f32).wrapping_add(r * hd),
+            (self.s.scp_r.ptr as *const f32).wrapping_add(r * hd),
+            norm.as_f32(),
+            self.layers[layer].state_kv.ptr as *mut f32,
+            self.layers[layer].state_score.ptr as *mut f32,
+            self.layers[layer].latent.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *mut i32,
+            1,
+            1,
+            hd as i32,
+            ratio_i,
+            pos_base + r as i32,
+            (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+            cfg.norm_eps,
+            st,
+        )?;
+        self.dev.compress_commit_on(
+            self.layers[layer].latent.as_f32(),
+            self.cos_comp.as_f32(),
+            self.sin_comp.as_f32(),
+            self.layers[layer].ring.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+            hd as i32,
+            cfg.rope_head_dim as i32,
+            (cfg.rope_head_dim / 2) as i32,
+            cfg.window_size as i32,
+            ratio_i,
+            st,
+        )?;
+        // The host MIRROR of the device counter, by the SAME deterministic rule the
+        // commit kernel applies ((*pos + 1) % ratio == 0 commits one latent). The
+        // two agree by construction, without the download that used to be here.
+        let committed = (pos_base + r as i32 + 1) % ratio_i == 0;
+        if committed {
+            self.layers[layer].compress_len += 1;
         }
-        Ok(self.layers[layer].compress_len)
+        Ok(committed)
     }
 
     /// Multi-row engram write-back: the m-row twin of [`Self::engram_apply`].

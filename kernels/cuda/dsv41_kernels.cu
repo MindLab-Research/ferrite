@@ -7090,6 +7090,15 @@ __global__ void rmsnorm_q_kernel(const float* __restrict__ x, const float* __res
     if (row >= n) return;
     const float* xr = x + (size_t)row * dim;
     float* or_ = out + (size_t)row * dim;
+    // The fp8 pair is row-major exactly like `out`: with n > 1 every row must
+    // land on its OWN `dim` bytes and `dim/32` scales. Writing both at the
+    // row-0 base (the historical form) made rows 1..n-1 silently overwrite row
+    // 0's quantisation, so an n-row call could only be run one row per launch
+    // — the n>1 clobber this fixes. The launcher already guarantees
+    // `dim % 32 == 0` (it declines otherwise), so `dim >> 5` scales per row is
+    // exact.
+    uint8_t* xq_r = xq + (size_t)row * dim;
+    float* xsc_r = xsc + (size_t)row * (dim >> 5);
     // identical reduction tree to rmsnorm_kernel (blockDim-sized cross-warp)
     float ss = 0.f;
     for (int i = threadIdx.x; i < dim; i += blockDim.x) ss += xr[i] * xr[i];
@@ -7113,10 +7122,10 @@ __global__ void rmsnorm_q_kernel(const float* __restrict__ x, const float* __res
         for (int off = 16; off > 0; off >>= 1)
             a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
         const float sc = fmaxf(fast_round_scale(a, 1.0f / 448.0f), 1e-30f);
-        if (lane31 == 0) xsc[i >> 5] = sc;
+        if (lane31 == 0) xsc_r[i >> 5] = sc;
         const float q = fminf(fmaxf(v * (1.0f / sc), -448.0f), 448.0f);
         const __nv_fp8_e4m3 f8 = __nv_fp8_e4m3(q);
-        xq[i] = *(const uint8_t*)&f8;
+        xq_r[i] = *(const uint8_t*)&f8;
     }
 }
 

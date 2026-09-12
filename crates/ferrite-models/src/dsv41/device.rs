@@ -1272,7 +1272,7 @@ impl Device {
     }
 
     /// True when `zero_at`/`zero_at_on` will NOT fall back to the synchronous
-    /// `cudaMemset` on the legacy stream. The verify graph's `compress_rows`
+    /// `cudaMemset` on the legacy stream. The verify graph's `compress_proj_rows`
     /// zeroes `scp_r` on the `ratio == 1` no-gate path, so a capture needs this.
     pub fn supports_memset_async(&self) -> bool {
         self.rt.has_async_memset()
