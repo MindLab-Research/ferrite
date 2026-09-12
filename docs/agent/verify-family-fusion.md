@@ -687,3 +687,30 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 ## W4 compressor_fused 未启用的原因（已查明）
 
 `compressor_fused` 的 launcher **硬拒 `b != 1 || seqlen != 1`**（chain_dev.rs:4735/:9601）——它是单行单 token 的融合（pool+commit 对的 parity target），verify 的多行块不能用。pool+commit 对是 verify 的正确路径。**W4 的 0.3ms 优化需要多行版 compressor_fused（seqlen=m）**——低优先级（0.3ms）。
+
+## 400 的最终吞吐预算（全部优化落地后）
+
+**步时组成**（全部 perf 优化后）：
+| 组件 | 时间 | 来源 |
+|---|---|---|
+| draft | ~1ms | P3c 图化（120→1 launch）|
+| verify | ~10ms | 全部 mrows + tcgen05 + hc 接线 + AR 折叠 |
+| commit | ~0.2ms | |
+| **步时** | **~11.2ms** | |
+
+**吞吐 @ 不同 accept**：
+| accept | tok/step | 吞吐 | 400 达标 |
+|---|---|---|---|
+| 1.02（当前）| 2.02 | 179 tok/s | ✗ |
+| 2.0 | 3.0 | 268 tok/s | ✗ |
+| 3.0 | 4.0 | 357 tok/s | ✗（差 12%）|
+| **4.0** | **5.0** | **446 tok/s** | **✓** |
+| 5.0（sglang）| 6.0 | 536 tok/s | ✓✓ |
+
+**结论**：400 需要 accept ≥4 @ 步时 11.2ms。accept 的四个杠杆（全部已实现或进行中）：
+1. P0-1 seed 相位（winrows 配套修复中）
+2. P0-3 tap 采集点（TAP_INPUT，测试中）
+3. P0-4 激活域（bf16 roundtrip，实现中）
+4. P1-5 head/gate 截断（DRAFT_BF16_DOMAIN，测试中）
+
+如果四个杠杆全部兑现，accept 从 1.02 → 3-5 是合理预期（sglang 的 5 证明 MTP head 有这个能力）。
