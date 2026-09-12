@@ -1777,3 +1777,23 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 1. SWALLOW_STEP 的 ar5-hang（m=6 死锁）——正在调查
 2. tcgen05 从未上过 GPU——冒烟脚本就绪
 3. mrows 实测仅 -1.21ms（不是预期的 10+ms）
+
+## 🏁 Accept 战役的最终判定（简单杠杆全部测试完毕）
+
+| 配置 | accept | 判定 |
+|---|---|---|
+| 基线 | 1.022 | — |
+| P0-3+P1-5 | **1.214** | **最佳**（+19%）|
+| + SEED_POS（含 q/o 修复）| 1.067 | ❌ 退化 |
+| + DRAFT_HEAD_FOLD v1 | 1.214 | ➖ 不变 |
+| + TAP_BF16+DRAFT_ATTN | 1.163 | ❌ 略降 |
+
+**结论**：
+1. **P0-3+P1-5 是 accept 的最优组合（1.214）**——所有追加杠杆都不改善
+2. accept 的 1.022→1.214 提升（+19%）来自 tap 采集点 + bf16 域
+3. **剩余差距（1.214 → 2-3）不在简单精度对齐**——需要更深的对齐（S4: paired act_quant，S5: 全链 bf16）
+
+**下一步优先级**（accept 侧）：
+1. draft-verify-program-audit（运行中）——找更多 program 不匹配
+2. S4: paired alignment（draft KV act_quant ↔ backbone ring 同步）——最大剩余杠杆
+3. S3: unit_dump 探针——精确诊断 draft 偏移层
