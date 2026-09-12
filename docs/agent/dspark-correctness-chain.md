@@ -1600,3 +1600,17 @@ s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-iden
 | 拉丁出现 | SEED_POS 破坏基线 | 回退 SEED_POS，winrows 还有问题 |
 
 **零拉丁红线**：任何拉丁出现 = 立即处理（不是可接受的 trade-off）。
+
+## S1 修复验证结果（677f3efe）——SEED_POS 不改善 accept
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）——基线保持
+- **accept mean-k=1.067**（vs 最佳 1.214——**退化 -12%**）
+- k_acc {0:19, 1:13, 2:8, 3:2, 4:2, 5:1}——分布相似但整体偏移
+
+**判定**：
+1. **q/o rope 基址对齐（即使按官方语义正确）不改善 accept**——draft 的 KV/attention 已适应 pos-1 相位
+2. **SEED_POS 应保持 OFF**（seed@pos-1 + 默认窗口 > seed@pos + 官方语义）
+3. **accept 的最佳组合仍是 P0-3+P1-5（无 SEED_POS）= 1.214**
+
+**下一步**：S2（TAP_BF16/DRAFT_ATTN 单变量 A/B，无 SEED_POS）——这两个 gate 在修好的基线上从未被单独测试
