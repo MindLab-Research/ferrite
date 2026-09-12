@@ -4141,3 +4141,21 @@ self.dev.gemm_fp8_mx_rope_norm(
 3. **lazy verify 的行间状态泄漏**：row i 的某个状态（tap/compressor）影响了 row i+1
 
 **等 subagent 的判决**（lazy-verify-position-bughunt 分析中）
+
+## compressor clen 的分析（"重置到 12"的候选机制）
+
+**compressor 的数据结构**：
+- `clen: dev.alloc(cfg.n_layers * 4)` — 每层的压缩长度计数器
+- `clen_rows_r: dev.alloc(4 * cfg.n_layers * VERIFY_ROWS)` — rows 版本
+- 压缩层把 r:1 的 KV 池化——clen 追踪池里的位置数
+
+**候选机制**：如果 lazy verify 的某行 clen 推进错误（少推或多推）：
+- 后续行的 compress 读取会指向错误的池 slot
+- attention（在压缩层）读到早期位置的 pooled KV——"重置到早期上下文"
+- **与"重置到 12"的指纹一致**（如果 clen 在某行指向了 position ~11 的池 slot，attention 看到 position 11 的上下文 → 生成 '12'）
+
+**lazy verify 的 per-row compressor**（每行自带 compressor 提交）：
+- 每行 commit 后 clen 推进
+- **如果某行的 commit 失败或时序错位**——clen 停留在早期值——后续行读到早期池
+
+**待 lazy-verify-position-bughunt 的判决**（分析中）
