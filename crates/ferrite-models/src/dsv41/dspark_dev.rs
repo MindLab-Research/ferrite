@@ -44,6 +44,23 @@ use crate::dsv41::load::{Dsv41DevWeights, DevTensor, LayerDev};
 /// match `DSPARK_MARKOV_MAX_BLOCKS` in `kernels/cuda/dsv41_glue.cu`.
 const MARKOV_MAX_BLOCKS: usize = 2048;
 
+/// The chain's target-hidden tap is a fixed `[DSPARK_TAP_SLOTS, dim]` buffer
+/// (`DevChain`'s `dspark_tap`, filled by the `layer()` hook at the slot
+/// `dspark_target_slot` names). It is stated here as well as there because
+/// [`DsparkDev::import_tap`] copies that many slots in one go — a config
+/// listing more targets than this would already overflow the CHAIN's buffer
+/// inside `layer()`, not this one.
+pub const DSPARK_TAP_SLOTS: usize = 3;
+
+/// How many of the draft's sampled tokens one speculative step verifies.
+/// `draft_forward` samples `dspark_block_size` (6) tokens into `ids[1..=bs]`;
+/// the orchestration (`chain_dev.rs::dspark_shadow_step`) verifies the first
+/// `DSPARK_DRAFTS` of them, and the accept chain's bonus token brings the
+/// emitted block to `DSPARK_DRAFTS + 1` — exactly the configured block size.
+/// Declared here rather than at the call site so the D2H accessor below and the
+/// orchestration cannot drift apart about the width.
+pub const DSPARK_DRAFTS: usize = 5;
+
 /// `DSV41_DSPARK_TRACE=1` prints the draft's geometry once, for bring-up.
 fn trace() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -307,6 +324,65 @@ impl<'a> DsparkDev<'a> {
     pub fn set_rope_tables(&mut self, cos: *const f32, sin: *const f32) {
         self.cos = Some(cos);
         self.sin = Some(sin);
+    }
+
+    /// Copy the chain's target-hidden tap (`[3, dim]`, slot order =
+    /// `dspark_target_layer_ids`) into this draft's `main_h` — one D2D, no host
+    /// round trip.
+    ///
+    /// The device twin of [`Self::note_target_hidden`]: the main chain's
+    /// `layer()` hook already collapses each target layer's attention input with
+    /// the same `1/hc` mean (`DevChain`'s `dspark_tap`), so the orchestration
+    /// hands the whole `[n_target, dim]` block over in one copy instead of
+    /// calling back into the layer loop. `src` must span at least
+    /// `n_target * dim` f32 in the SAME slot order the chain wrote them in
+    /// (`Dsv41Config::dspark_target_slot`).
+    pub fn import_tap(&mut self, src: *const f32) -> Result<()> {
+        // The chain's tap is sized `DSPARK_TAP_SLOTS x dim`; a config with more
+        // targets than that would have overflowed it inside `layer()` first.
+        debug_assert!(
+            self.n_target <= DSPARK_TAP_SLOTS,
+            "dspark: the chain's tap holds {DSPARK_TAP_SLOTS} slots, but the config lists {} \
+             target layers",
+            self.n_target
+        );
+        self.dev.memcpy_d2d(
+            self.main_h.ptr,
+            src as *const c_void,
+            self.n_target * self.dim * std::mem::size_of::<f32>(),
+        )
+    }
+
+    /// D2H of the drafted block: `draft_forward` samples into `ids[1..=bs]`
+    /// (`ids[0]` is the backbone's token), and one speculative step consumes the
+    /// first [`DSPARK_DRAFTS`] of those samples.
+    ///
+    /// One 20-byte device read, outside any capture. `download_u8` keeps it a
+    /// plain byte copy, so no f32 reinterpretation is involved — the discipline
+    /// `step_rows` already uses for its per-row argmax.
+    pub fn drafts(&self) -> Result<[u32; DSPARK_DRAFTS]> {
+        if self.bs < DSPARK_DRAFTS {
+            return Err(FerriteError::Config(format!(
+                "dspark: the draft block samples {} tokens; the speculative step verifies \
+                 {DSPARK_DRAFTS} of them",
+                self.bs
+            )));
+        }
+        // `ids` is `[i32; bs + 1]`: skip the backbone's token at index 0.
+        let b = Device::view(
+            (self.ids.ptr as *mut i32).wrapping_add(1) as *mut c_void,
+            DSPARK_DRAFTS * 4,
+        );
+        let mut bytes = [0u8; DSPARK_DRAFTS * 4];
+        self.dev.download_u8(&b, &mut bytes)?;
+        Ok(std::array::from_fn(|i| {
+            u32::from_le_bytes([
+                bytes[4 * i],
+                bytes[4 * i + 1],
+                bytes[4 * i + 2],
+                bytes[4 * i + 3],
+            ])
+        }))
     }
 
     /// Record one target layer's attention input, `h.mean(dim=hc)` (dspark.rs's

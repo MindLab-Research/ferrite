@@ -446,6 +446,31 @@ impl Dsv41Config {
         self.dspark_block_size > 0 && self.n_mtp_layers > 0
     }
 
+    /// The DSpark draft consumes the ATTENTION INPUT of its target layers
+    /// (`dspark_target_layer_ids`, collapsed to the per-copy mean). This maps a
+    /// backbone layer index to its recording slot (0/1/2), or None for layers
+    /// the draft does not read.
+    pub fn dspark_target_slot(&self, layer: usize) -> Option<usize> {
+        if !self.dspark_enabled() {
+            return None;
+        }
+        self.dspark_target_layer_ids.iter().position(|&l| l == layer)
+    }
+
+    /// DSpark speculative decoding is armed (the shadow/spec orchestration
+    /// reads this per step, so the env lookup is cached in a OnceLock — a
+    /// bare getenv in the hot path is exactly the slip this project has been
+    /// bitten by before). Config presence alone only enables the tap.
+    pub fn dspark_armed(&self) -> bool {
+        if !self.dspark_enabled() {
+            return false;
+        }
+        static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ARMED.get_or_init(|| {
+            std::env::var("DSV41_DSPARK").map(|v| v != "0").unwrap_or(false)
+        })
+    }
+
     /// `(3 + hc_mult) * hc_mult` — a single projection produces pre (hc),
     /// post (hc) and comb (hc*hc) coefficients. The reference calls this
     /// `hc_mult3` = `hc_mult * (2 + hc_mult)`; both spellings are the same

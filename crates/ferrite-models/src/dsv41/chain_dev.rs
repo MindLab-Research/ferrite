@@ -36,6 +36,7 @@ use std::sync::Arc;
 use crate::dsv41::config::{Dsv41Config, KvMode};
 use crate::dsv41::tp::Collective;
 use crate::dsv41::device::{CuStream, DevBuf, Device};
+use crate::dsv41::dspark_dev::{DsparkDev, DSPARK_DRAFTS, DSPARK_TAP_SLOTS};
 use crate::dsv41::load::{Dsv41DevWeights, LayerDev};
 
 /// Runtime switches for isolating a stage during bring-up.
@@ -80,6 +81,31 @@ struct LayerCache {
 /// `dspark_block_size` (6); the buffers are sized once here so a smaller `m`
 /// (a short block at the end of a request) simply uses a prefix of them.
 pub const VERIFY_ROWS: usize = 6;
+
+/// What one shadow-mode DSpark step observed. See
+/// [`DevChain::dspark_shadow_step`] for the orchestration: the step runs the
+/// draft and a real verify block, then puts the main chain back exactly where
+/// the single-row path left it, so nothing here is committed — the report is a
+/// measurement of what the speculative path WOULD have emitted.
+#[derive(Debug, Clone, Copy)]
+pub struct DsparkShadowReport {
+    /// The step's real output: `step_dev`'s argmax, i.e. exactly the token the
+    /// chain emits with speculation disabled.
+    pub next: u32,
+    /// What the draft proposed for positions `pos + 1 ..= pos + DSPARK_DRAFTS`.
+    pub drafts: [u32; DSPARK_DRAFTS],
+    /// The verify block's per-row argmax: row `j` (position `pos + 1 + j`, fed
+    /// `drafts[j]`) predicted `verify_out[j]` for `pos + 2 + j`.
+    pub verify_out: [u32; DSPARK_DRAFTS],
+    /// `k` (1..=DSPARK_DRAFTS + 1): the number of tokens the speculative path
+    /// WOULD have emitted from this step — the accepted draft prefix plus one
+    /// bonus token. `1` means no draft survived, i.e. `next` alone.
+    pub accepted: usize,
+    /// The draft phase (`import_tap` + `draft_forward` + the drafts D2H).
+    pub draft_ms: f32,
+    /// The verify phase (`step_rows`, one m-row forward).
+    pub verify_ms: f32,
+}
 
 struct Scratch {
     h: DevBuf,     // [hc*dim]
@@ -189,6 +215,14 @@ struct Scratch {
     /// The constant incoming premix [1,0,0,0], uploaded ONCE at reset; each step
     /// copies it into slot 0 with a 16-byte D2D (graph-capturable) instead of an H2D.
     premix_const: DevBuf,
+    // ---- DSpark target-hidden tap (speculative decode) ----
+    /// Per-copy mean of the target layers' attention inputs, `[3, dim]`
+    /// (`dspark_target_slot(l)` = 0/1/2). Filled by a one-block `hc_collapse`
+    /// hook in `layer()` whenever dspark is armed — fixed buffers, so the hook
+    /// is graph-capturable with the rest of the step.
+    dspark_tap: DevBuf,
+    /// `[hc]` of `1/hc` — the mean weights for the tap's collapse.
+    dspark_pre_mean: DevBuf,
     pre_b: DevBuf,
     pre_c: DevBuf,
     // ---- engram (n-gram memory write-back into the hc residual stream) ----
@@ -333,6 +367,34 @@ struct Scratch {
     eng_kv_r: DevBuf,   // [m, (hc+1)*dim] f32
     eng_xq_r: DevBuf,   // [m, n_cols*ehd] fp8 bytes
     eng_xsc_r: DevBuf,  // [m, n_cols*ehd/32 + 8] f32
+    // ==================== DSpark shadow mode: the verify write-set save ======
+    //
+    // `dspark_shadow_step` runs a draft + a whole verify block once per step and
+    // then puts the MAIN chain back exactly where the single-row path would have
+    // left it (the verify's only lasting effect is the returned report). What the
+    // block is about to write is copied in here first and copied back after.
+    //
+    // Layout: indexed BY LAYER — a layer that is neither a ring owner nor a
+    // compress source never touches its slice. Both sides of the step recompute
+    // the same owner/source predicates, so one index space means the save and the
+    // restore cannot disagree about a slot. See `DevChain::dspark_snapshot` for
+    // the inventory and the reasoning behind each member.
+    /// `[n_layers][VERIFY_ROWS][head_dim]` f32 — the window-ring slots the block
+    /// appends to, `(pos + 1 + j) % window` for row `j`.
+    dspark_snap_ring: DevBuf,
+    /// `[n_layers][2][max_ratio * head_dim]` f32 — the compressor carry:
+    /// `state_kv` then `state_score`, each layer's own `ratio * head_dim` floats
+    /// at its own base (the buffers are max-sized because `ratio` is per layer).
+    dspark_snap_state: DevBuf,
+    /// `[n_layers][head_dim]` f32 — the compressor's pooled latent row. NOT a
+    /// per-step scratch: it is an index-key INPUT on later steps (see
+    /// `dspark_snapshot`), so leaving the verify's latents behind would corrupt
+    /// the main chain's published keys.
+    dspark_snap_latent: DevBuf,
+    /// `[n_layers]` i32 — the DEVICE compressed-row counters (`s.clen`).
+    dspark_snap_clen: DevBuf,
+    /// `[n_layers]` i32 — the compressor's `out_rows` decision.
+    dspark_snap_out_rows: DevBuf,
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -1108,6 +1170,8 @@ impl<'a> DevChain<'a> {
             pre_b: dev.alloc(fb(hc).max(8))?,
             pre_c: dev.alloc(fb(hc).max(8))?,
             premix_const: dev.alloc(fb(hc).max(8))?,
+            dspark_tap: dev.alloc(fb(DSPARK_TAP_SLOTS * dim).max(8))?,
+            dspark_pre_mean: dev.alloc(fb(hc).max(8))?,
             eng_ids: dev.alloc(fb(eng_cols * n_eng_layers).max(8) * 2)?, // i64
             eng_rows: dev.alloc(fb(eng_cols * ehd).max(8))?,
             eng_kv: dev.alloc(fb((hc + 1) * dim))?,
@@ -1180,6 +1244,18 @@ impl<'a> DevChain<'a> {
             eng_kv_r: dev.alloc(fb(VERIFY_ROWS * (hc + 1) * dim))?,
             eng_xq_r: dev.alloc((VERIFY_ROWS * eng_cols * ehd).max(8))?, // fp8 bytes
             eng_xsc_r: dev.alloc(fb((VERIFY_ROWS * eng_cols * ehd).max(8) / 32 + 8))?,
+            // ---- DSpark shadow mode: the verify write-set save. Allocated
+            // unconditionally (a few hundred KB) so the allocation graph stays
+            // static, exactly like the m-row set above.
+            dspark_snap_ring: dev.alloc(fb(cfg.n_layers * VERIFY_ROWS * hd).max(8))?,
+            dspark_snap_state: dev.alloc(
+                fb(cfg.n_layers * 2 * cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1)
+                    * hd)
+                .max(8),
+            )?,
+            dspark_snap_latent: dev.alloc(fb(cfg.n_layers * hd).max(8))?,
+            dspark_snap_clen: dev.alloc((cfg.n_layers * 4).max(4))?,
+            dspark_snap_out_rows: dev.alloc((cfg.n_layers * 4).max(4))?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does
@@ -1265,6 +1341,12 @@ impl<'a> DevChain<'a> {
             let mut pm = vec![0f32; self.cfg.hc_mult];
             pm[0] = 1.0;
             self.dev.upload_f32_at(self.s.premix_const.ptr, 0, &pm)?;
+        }
+        // the dspark tap's mean weights: [1/hc; hc] — hc_collapse with these is
+        // exactly the reference's `h.mean(dim=2)` over the hc copies
+        {
+            let mean_w = vec![1.0 / self.cfg.hc_mult as f32; self.cfg.hc_mult];
+            self.dev.upload_f32_at(self.s.dspark_pre_mean.ptr, 0, &mean_w)?;
         }
         self.dev.zero_at(self.s.pos_ctr.ptr, 4)?;
         self.dev.zero_at(self.s.clen.ptr, self.cfg.n_layers * 4)?;
@@ -2580,6 +2662,338 @@ impl<'a> DevChain<'a> {
                 ])
             })
             .collect())
+    }
+
+    /// The layers whose window ring the verify block appends to: the `owns_kv`
+    /// test `attention_rows` applies, verbatim. `ring_owner_shared()` chooses
+    /// between "every layer owns its own store" (the layer is its own owner, so
+    /// every layer qualifies) and the `kv_owner` group mapping, where a compress
+    /// consumer reads its source's ring and must not be appended to a second time.
+    fn ring_owners(&self) -> Vec<usize> {
+        (0..self.cfg.n_layers)
+            .filter(|&l| {
+                let owner = if ring_owner_shared() { self.kv_owner(l) } else { l };
+                owner == l
+            })
+            .collect()
+    }
+
+    /// The layers whose compressor runs inside the verify block: the
+    /// `compress_rows` gate in `attention_rows` (`compress_ratio > 0 &&
+    /// is_kv_source`). A consumer of the same group only INHERITS the count and
+    /// writes no state of its own.
+    fn compress_sources(&self) -> Vec<usize> {
+        (0..self.cfg.n_layers)
+            .filter(|&l| self.cfg.compress_ratio(l) > 0 && self.cfg.is_kv_source(l))
+            .collect()
+    }
+
+    /// Save the write set the verify block is about to touch; [`Self::dspark_rollback`]
+    /// copies it back. See [`Self::dspark_shadow_step`] for the timeline.
+    ///
+    /// # Inventory — what `step_rows` writes, and why each entry is here
+    ///
+    /// For every layer that OWNS its window ring ([`Self::ring_owners`]):
+    ///
+    /// 1. the `m` ring slots the block lands in, `(pos + 1 + j) % window`. One
+    ///    D2D per slot: the slots are `head_dim` floats each and the sequence
+    ///    wraps at the ring's end, so a single contiguous copy is not available.
+    ///    (The first cut is deliberately naive — ~15 launches for the production
+    ///    geometry; a slot-permutation kernel is the M2 optimisation.)
+    ///
+    /// For every COMPRESS SOURCE ([`Self::compress_sources`]):
+    ///
+    /// 2. `state_kv` + `state_score` — the compressor carry, the full
+    ///    `ratio * head_dim` each. The buffers are max-sized and each copy uses
+    ///    its own layer's byte count (`ratio` is per layer: 1 or 2 here).
+    /// 3. `latent` — **not** a per-step scratch. `indexer()`/`indexer_rows()` read
+    ///    it on LATER steps as well (`indexer_owns_k` -> `lin_bf16(latent, wk)`),
+    ///    and the pool rewrites it only on a step that completes a group. Leaving
+    ///    the verify's latent behind would make the next non-completing step
+    ///    re-publish a WRONG index key over the real chain's last key
+    ///    (`index_k_publish` writes at `*clen - 1`, the same slot) — the one place
+    ///    where a missed snapshot silently corrupts the main chain instead of
+    ///    merely wasting work.
+    /// 4. `out_rows` — assigned (not incremented) by every compressor call, and
+    ///    read only by the commit inside that same call, so it is not strictly
+    ///    required. It IS device state the verify mutates, it costs 4 bytes, and
+    ///    restoring it makes "the main chain is untouched" a statement about the
+    ///    whole buffer rather than an argument about read order.
+    /// 5. the DEVICE compressed-row counter (`s.clen[layer]`, 4 bytes) and its
+    ///    HOST mirror (`LayerCache::compress_len`, returned to the caller).
+    ///
+    /// # Deliberately NOT in the snapshot
+    ///
+    /// * `index_k`: the verify's indexer publishes at row `*clen - 1`; with `clen`
+    ///   restored, that is exactly the row the next real commit overwrites, and
+    ///   `indexer_topk` never reads past `*clen`, so the row is unreachable in
+    ///   between.
+    /// * the ring's COMPRESSED rows (`compress_commit` stores at row `window +
+    ///   *clen`): the same argument — once `clen` is restored, that slot is the
+    ///   next real commit's destination, and `sparse_attn` only reads rows
+    ///   `< *clen`. The commit runs before the attention inside a step, so the
+    ///   real value is in place before any read either way.
+    /// * `kvp`/`scp`: pure per-call scratch (projected from `xn` and consumed by
+    ///   the pool in the same call).
+    /// * `LayerCache::idxs`: the verify writes only `s.idxs_r`/`s.idxs_win_r`; the
+    ///   single-row path re-uploads and rewrites its own `idxs` every step.
+    /// * the host-side fusion flags (`xq_of_xn_valid`, `qr_raw`, `idx_q_ready`,
+    ///   `idx_q_rope`): they are pointer-gated to the SINGLE-ROW scratch (`s.xn`,
+    ///   `s.qr`), which the m-row path never passes, so the verify can neither
+    ///   consume nor leak one; each is cleared by the end of a real step anyway.
+    /// * `pos_ctr`: never advanced by the verify — `step_rows` passes a NULL
+    ///   counter to its per-row argmax.
+    /// * everything in `s.*_r`: the m-row scratch is the verify's own.
+    fn dspark_snapshot(&self, pos: usize, m: usize) -> Result<Vec<(usize, usize)>> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let win = cfg.window_size;
+        let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+        debug_assert!(m <= VERIFY_ROWS, "the snapshot is sized for a {VERIFY_ROWS}-row block");
+
+        for &l in &self.ring_owners() {
+            let ring = self.layers[l].ring.ptr as *const f32;
+            let snap = (self.s.dspark_snap_ring.ptr as *mut f32)
+                .wrapping_add(l * VERIFY_ROWS * hd);
+            for j in 0..m {
+                let slot = (pos + 1 + j) % win;
+                self.dev.memcpy_d2d(
+                    snap.wrapping_add(j * hd) as *mut c_void,
+                    ring.wrapping_add(slot * hd) as *const c_void,
+                    hd * std::mem::size_of::<f32>(),
+                )?;
+            }
+        }
+
+        let mut host = Vec::new();
+        for &l in &self.compress_sources() {
+            let ratio = cfg.compress_ratio(l).max(1);
+            let bytes = ratio * hd * std::mem::size_of::<f32>();
+            let cache = &self.layers[l];
+            let base = (self.s.dspark_snap_state.ptr as *mut f32)
+                .wrapping_add(l * 2 * max_ratio * hd);
+            self.dev
+                .memcpy_d2d(base as *mut c_void, cache.state_kv.ptr as *const c_void, bytes)?;
+            self.dev.memcpy_d2d(
+                base.wrapping_add(max_ratio * hd) as *mut c_void,
+                cache.state_score.ptr as *const c_void,
+                bytes,
+            )?;
+            self.dev.memcpy_d2d(
+                (self.s.dspark_snap_latent.ptr as *mut f32).wrapping_add(l * hd) as *mut c_void,
+                cache.latent.ptr as *const c_void,
+                hd * std::mem::size_of::<f32>(),
+            )?;
+            self.dev.memcpy_d2d(
+                (self.s.dspark_snap_clen.ptr as *mut i32).wrapping_add(l) as *mut c_void,
+                (self.s.clen.ptr as *const i32).wrapping_add(l) as *const c_void,
+                4,
+            )?;
+            self.dev.memcpy_d2d(
+                (self.s.dspark_snap_out_rows.ptr as *mut i32).wrapping_add(l) as *mut c_void,
+                cache.out_rows.ptr as *const c_void,
+                4,
+            )?;
+            // the host mirror of the device counter, by the SAME rule the commit
+            // kernel applies ((*pos_ctr + 1) % ratio == 0 commits one latent)
+            host.push((l, cache.compress_len));
+        }
+        Ok(host)
+    }
+
+    /// Undo the verify block: copy the [`Self::dspark_snapshot`] save back over
+    /// every buffer it recorded, and restore the host counters it returned.
+    fn dspark_rollback(&mut self, pos: usize, m: usize, host: &[(usize, usize)]) -> Result<()> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let win = cfg.window_size;
+        let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+
+        for &l in &self.ring_owners() {
+            let ring = self.layers[l].ring.ptr as *mut f32;
+            let snap = (self.s.dspark_snap_ring.ptr as *const f32)
+                .wrapping_add(l * VERIFY_ROWS * hd);
+            for j in 0..m {
+                let slot = (pos + 1 + j) % win;
+                self.dev.memcpy_d2d(
+                    ring.wrapping_add(slot * hd) as *mut c_void,
+                    snap.wrapping_add(j * hd) as *const c_void,
+                    hd * std::mem::size_of::<f32>(),
+                )?;
+            }
+        }
+
+        for &l in &self.compress_sources() {
+            let ratio = cfg.compress_ratio(l).max(1);
+            let bytes = ratio * hd * std::mem::size_of::<f32>();
+            let base = (self.s.dspark_snap_state.ptr as *const f32)
+                .wrapping_add(l * 2 * max_ratio * hd);
+            let cache = &self.layers[l];
+            self.dev
+                .memcpy_d2d(cache.state_kv.ptr, base as *const c_void, bytes)?;
+            self.dev.memcpy_d2d(
+                cache.state_score.ptr,
+                base.wrapping_add(max_ratio * hd) as *const c_void,
+                bytes,
+            )?;
+            self.dev.memcpy_d2d(
+                cache.latent.ptr,
+                (self.s.dspark_snap_latent.ptr as *const f32).wrapping_add(l * hd) as *const c_void,
+                hd * std::mem::size_of::<f32>(),
+            )?;
+            self.dev.memcpy_d2d(
+                (self.s.clen.ptr as *mut i32).wrapping_add(l) as *mut c_void,
+                (self.s.dspark_snap_clen.ptr as *const i32).wrapping_add(l) as *const c_void,
+                4,
+            )?;
+            self.dev.memcpy_d2d(
+                cache.out_rows.ptr,
+                (self.s.dspark_snap_out_rows.ptr as *const i32).wrapping_add(l) as *const c_void,
+                4,
+            )?;
+        }
+        for &(l, len) in host {
+            self.layers[l].compress_len = len;
+        }
+        Ok(())
+    }
+
+    /// Shadow-mode DSpark step: run the draft and a real verify block for this
+    /// step, then put the main chain back exactly where the single-row path would
+    /// have left it, and report what the speculative path would have emitted.
+    ///
+    /// # Timeline
+    ///
+    /// ```text
+    ///   1. snapshot     the verify's write set (`dspark_snapshot`)
+    ///   2. next       = step_dev(token, pos)   the REAL step: the whole-step graph
+    ///                                          (the tap hook is in it) + argmax
+    ///   3. tap        -> dspark.import_tap(...) the target layers' h_mean, one D2D
+    ///   4. drafts       dspark.draft_forward(token, pos), then the D2H of ids[1..=5]
+    ///   5. verify_out = step_rows(&drafts)     five rows at pos + 1 .. pos + 5
+    ///   6. rollback     the snapshot copied back
+    ///   7. accept       host arithmetic, `DsparkShadowReport::accepted`
+    /// ```
+    ///
+    /// `pos` is the step's position: the value of the device position counter
+    /// BEFORE `step_dev` runs (`step_dev`'s own argument, and what `step_rows`
+    /// reads back as `pos + 1`). The counter is read from the DEVICE here as well
+    /// (one 4-byte D2H — the discipline `step_rows` already follows) and the
+    /// ring-slot arithmetic uses that value, so the snapshot/rollback pair stays
+    /// correct even if a caller's own bookkeeping drifts; `pos` is what goes to
+    /// `step_dev`/`draft_forward`.
+    ///
+    /// # Accept arithmetic (the reference's rule, evaluated on the host)
+    ///
+    /// * `drafts[0]` is accepted iff it equals `next` — the anchor's argmax is
+    ///   free, it is what the chain emits anyway.
+    /// * `drafts[j]`, `j >= 1`, is accepted iff it equals `verify_out[j - 1]`: the
+    ///   row fed `drafts[j - 1]` predicted it, so the checks are only meaningful
+    ///   under the accepted prefix (hence the early `break`).
+    /// * `accepted = 1 + <accepted draft prefix length>` (1..=DSPARK_DRAFTS + 1):
+    ///   the accepted drafts plus the single bonus token the last surviving row
+    ///   contributes — with nothing accepted, the emitted token is `next` alone.
+    ///
+    /// # What is NOT rolled back, on purpose
+    ///
+    /// * the DRAFT's own state (its window rings and caches): a shadow run is
+    ///   meant to leave the draft where a real speculative run would, so the next
+    ///   step's draft sees the same history.
+    /// * `pos_ctr` and everything `step_dev` wrote: that is the REAL step, not the
+    ///   verify. `step_rows` never advances the counter (its argmax gets a NULL).
+    ///
+    /// The function is a pure addition: no existing path calls it, so it cannot
+    /// change today's decode. Wiring it into `serve`/`TpRankPool` is the caller's
+    /// job (and a separate change).
+    pub fn dspark_shadow_step(
+        &mut self,
+        dspark: &mut DsparkDev,
+        token: u32,
+        pos: usize,
+    ) -> Result<DsparkShadowReport> {
+        let cfg = self.cfg;
+        let m = DSPARK_DRAFTS;
+        // The tap hook only exists in the step graph when the gate was armed at
+        // capture time. `dspark_armed()` caches the env in a OnceLock, so this is
+        // the SAME decision `layer()` made — a process that armed the gate after
+        // the first captured step would silently import a stale tap, which is why
+        // the gate is a hard requirement here and not an optimisation.
+        if !cfg.dspark_armed() {
+            return Err(FerriteError::Config(
+                "dspark_shadow_step: the chain's tap hook is off (set DSV41_DSPARK and make sure \
+                 it is set before the first decoded step captures the step graph); without it the \
+                 draft would read a stale target hidden"
+                    .into(),
+            ));
+        }
+
+        // The device counter's value BEFORE the step advances it decides which
+        // ring slots the block will occupy.
+        let pos_ctr = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as usize;
+        debug_assert_eq!(
+            pos_ctr, pos,
+            "dspark_shadow_step: `pos` must be the device position counter's current value"
+        );
+
+        // 1. the snapshot, BEFORE the step that moves the counter
+        let host_mirrors = self.dspark_snapshot(pos_ctr, m)?;
+
+        // 2. the real step: the whole-step graph (tap hook included), the argmax,
+        //    and the position counter + 1
+        let next = self.step_dev(token, pos)?;
+
+        // 3./4./5. the draft, from the tap of the step that just ran. `pos` is
+        // the backbone token's position, the same convention `step_dev` uses and
+        // the same one the host reference's `forward_spec(.., start_pos)` uses.
+        let t = std::time::Instant::now();
+        dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
+        dspark.draft_forward(token, pos)?;
+        let drafts = dspark.drafts()?;
+        let draft_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // 6. the verify block: one m-row forward, per-row argmax. It appends the
+        //    block to the ring at `pos + 1 + j` and runs the block's compressor —
+        //    all of which step 8 undoes.
+        let t = std::time::Instant::now();
+        let rows = self.step_rows(&drafts)?;
+        let verify_ms = t.elapsed().as_secs_f32() * 1e3;
+
+        // 7. rollback, immediately after the verify and BEFORE the host-only
+        //    arithmetic below: the chain must not stay dirty on a report-building
+        //    error path.
+        self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
+
+        let mut verify_out = [0u32; DSPARK_DRAFTS];
+        if rows.len() != DSPARK_DRAFTS {
+            return Err(FerriteError::Config(format!(
+                "dspark_shadow_step: step_rows returned {} rows for a {DSPARK_DRAFTS}-row \
+                 verify block",
+                rows.len()
+            )));
+        }
+        verify_out.copy_from_slice(&rows);
+
+        // 8. the accept arithmetic (host, no device traffic).
+        let mut acc = 0usize;
+        if drafts[0] == next {
+            acc = 1;
+            for j in 1..DSPARK_DRAFTS {
+                if drafts[j] == verify_out[j - 1] {
+                    acc += 1;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(DsparkShadowReport {
+            next,
+            drafts,
+            verify_out,
+            accepted: acc + 1,
+            draft_ms,
+            verify_ms,
+        })
     }
 
     /// The m-row premix slots, mirroring [`Self::premix_slot`]'s convention: 0 is
@@ -3941,6 +4355,24 @@ fn hc_tail_split() -> bool {
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
+
+        // DSpark target-hidden tap: the draft consumes the per-copy mean of the
+        // target layers' ATTENTION INPUT — h here, before this layer's mixes
+        // run (hc_mixes only READS h). The tap buffers are fixed allocations,
+        // so this one-block collapse is graph-capturable with the rest of the
+        // step; it costs ~3 tiny launches per step and only when armed.
+        if cfg.dspark_armed() {
+            if let Some(slot) = cfg.dspark_target_slot(layer) {
+                self.dev.hc_collapse(
+                    self.s.h.ptr as *const f32,
+                    self.s.dspark_pre_mean.as_f32(),
+                    (self.s.dspark_tap.ptr as *mut f32).wrapping_add(slot * dim),
+                    1,
+                    hc as i32,
+                    dim as i32,
+                )?;
+            }
+        }
 
         // ---------------- attention block ----------------
         // The fused front end, when it runs, also collapses and normalises; the
