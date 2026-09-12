@@ -1507,3 +1507,12 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 ## 重要校准：sglang 的 accept ~5 和 13ms 步时是循环推导（用户挑战）
 
 **硬数据只有 383.7 tok/s**。accept 5 和 13ms 互相推导（循环论证）。实际可能是低步时+低 accept 的组合。对我们的策略影响：如果 sglang 是低步时（~8ms）+低 accept（~3），那步时优化比 accept 更重要——与 arch-floor-insights 的"accept 优先"判决可能矛盾。需要实测 sglang 或找到公开的分解数据。
+
+## 下一步测试序列（batched 400 v2 完成后）
+
+1. **S1 修复验证**（最新代码 + SEED_POS=1 + P0-3+P1-5）——预期 accept 1.4-1.8
+2. **batched 400 v2 + S1**（如果 S1 验证通过）——性能 + accept 的组合
+3. **官方脚本测试**（用户建议——真实基线数据）
+4. **tcgen05 测试**（解锁后的 grouped 路径）
+
+注意：batched 400 v2（1fa9a430）用的是启动时的代码（不含 S1 修复）——其结果反映 SWALLOW+mrows 但不含 S1。S1 验证需要另跑。
