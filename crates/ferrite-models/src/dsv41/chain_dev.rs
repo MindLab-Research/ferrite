@@ -2957,13 +2957,18 @@ impl<'a> DevChain<'a> {
     /// (a replayed graph runs no host code at all), by the same per-row rule
     /// [`Self::compress_rows`] applies: row `r` at `pos_base + r` commits one
     /// latent when `(pos_base + r + 1) % ratio == 0`. Only the layers that OWN a
-    /// compressor are counted — a consumer layer inherits the count
-    /// ([`Self::source_compress_len`]) and writes no state of its own.
+    /// compressor are counted, and only those that [`Self::compress_rows`] does
+    /// not decline (`comp_wkv`/`comp_norm` present) — a consumer layer inherits
+    /// the count ([`Self::source_compress_len`]) and writes no state of its own.
     ///
     /// The caller's rollback restores these from its own snapshot, so an
     /// unaccepted block is undone exactly as in the direct path.
     fn advance_compress_lens(&mut self, pos_base: i32, m: usize) {
         for l in self.compress_sources() {
+            let ld = &self.w.layers[l];
+            if ld.comp_wkv.is_none() || ld.comp_norm.is_none() {
+                continue; // `compress_rows` declines the layer: it commits nothing
+            }
             let ratio = self.cfg.compress_ratio(l).max(1) as i32;
             let mut add = 0usize;
             for r in 0..m {

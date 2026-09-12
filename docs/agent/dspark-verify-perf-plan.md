@@ -442,6 +442,75 @@ argmax —— 二者同属「跨 rank argmax 协议」，argmax 仍是逐行 6 �
    一行是否真到 ~0.30ms（若因 6 份 x 载入而变成 load-bound，收益会低于 5/6，
    但不会低于 2 倍）。draft 侧（P3）未动，`draft_head` 仍是逐行。
 
+### 2026-09-12 · P2 落地（verify 链的 CUDA graph，env-gated）
+
+**已实施**（`DSV41_VERIFY_GRAPH=1`，默认 OFF，先 A/B）：
+
+- **图边界**（就是 §3.1 那一行，逐字落地）：
+  `[图外] D2H pos_ctr → H2D ids_r + H2D pos_rows → [图 replay: embed…head…逐行 argmax → argmax_r] → [图外] D2H argmax_r`，
+  之后才是调用方的 `dspark_snapshot` / `rollback` / `commit`（**全在图外，一行没动**）。
+  实现上 `step_rows` 拆成了外壳（图外三项 I/O + 返回值拼装）与
+  `step_rows_inner`（从 embed 到 argmax，图内零 host 往返）。
+- **三个 H2D 的处理**（§3.1 口径 + 一处简化）：
+  `premix_r` 是常量（每行 one-hot）→ 移到 `reset()` 写一次，**彻底消除**；
+  `ids_r` / `pos_rows` → 每次 replay 前在**图外**刷新到 capture 录下的同一批地址
+  （`graph_run_ids` 的「固定地址 + 图外 H2D」形状，不是复用它——它的 D2H 里有
+  `sync()`，绝不能进捕获区）。**没有新增 `pos_rows_fill` kernel**：pos_rows 只是
+  m 个 int 的图外 H2D，与 ids 同一条纪律即可，省掉一次 .so 重建（本机无 nvcc，
+  新 kernel 无法编译验证）。
+- **首次捕获**照抄 `step_impl`：第 1 次 `step_rows` DRY（真跑，覆盖
+  `build_eng_dev` 等 lazy 分配与 cublas workspace）→ 第 2 次
+  `host_barrier → capture_begin → step_rows_inner → capture_end → host_barrier →
+  graph_instantiate → graph_free(g) → graph_launch`（录制不执行）→ 之后 replay。
+- **状态**：`verify_graph: Option<*mut c_void>` + `verify_graph_m` +
+  `verify_dry_done` + 两个诊断计数；与 `step_graph` **两个独立 exec 并存**
+  （先例是 `moe_graph`），`reset()` 里 drop + 三个标志清零（与 `step_graph`
+  的两条理由同源，另加「`pos_base` 派生的 launch 参数与 `pos_base` 残余类都
+  随请求变化」）。`verify_graph_m` 是**形状门禁**：capture 烘死了逐行发射几何，
+  行数不同（shadow 5 / spec 6 / parity 可变）一律走直接路径。
+
+**对核查报告的两处修正（据实记录，不隐藏）**：
+
+1. **S6（host mirror 的 save/restore）在「捕获后立刻 launch」这条路径上是恒等的**：
+   捕获期 host 代码自增一次（设备没跑），随后的 `graph_launch` 让设备自增一次
+   （host 没跑）—— 净效果与「不还原也不补」相同。仍然按 §3.2 落地
+   （`restore_compress_lens` 之后 `advance_compress_lens`），因为它是**显式不变量**
+   （「捕获贡献零」+「图执行后镜像必须跟上」），而不是依赖那一步抵消；并且
+   `advance_compress_lens` 逐字复用 `compress_rows` 的 `(pos+1)%ratio==0` 规则
+   与「无 comp_wkv/comp_norm 的层不计数」这一早退，二者必须一致。
+2. **S1（`start_pos` 被烘进 kernel 标量）在 verify 行路径上不是语义错误，未改 kernel**：
+   `dsv41_compressor_pool` 的 host 侧只用 `start_pos` 选 mode/grid/work
+   （dsv41_kernels.cu:6868-6890），而**每条行自己的位置判据早就 device 化了**
+   （`compressor_pool_kernel:3029` 与 `compressor_state_kernel:2980` 都解引用
+   `*pos_ctr`，而调用方传的正是 `pos_rows[r]`）。verify 恒在其 anchor step 之后
+   运行（`pos_base = pos + 1 >= 1`）⇒ mode 恒为 2、grid 恒为 1，冻结无害；
+   图门禁仍保留 `pos_base >= 1` 作为**守卫**（position 0 的 mode 1 是另一个程序）。
+   —— 若日后要支持「verify 在 pos 0」，才必须改 kernel（host 侧读 `*pos_ctr` 不可行：
+   那是 launcher 里的 D2H，捕获非法且是每步同步）。
+3. **S8 门禁**已加：`DevRuntime::has_async_memset()` → `Device::supports_memset_async()`
+   （`compress_rows` 的 `ratio==1` 无 gate 路径 `zero_on(scp_r)` 会回退同步
+   `cudaMemset`）。
+4. **S7（`comp_len` 冻结）不改 kernel，改用门禁**：核查报告说「kernel 已优先用
+   `*lens`」（`indexer_topk_kernel:2805`）——已逐行核对，`cols`/`cl`/扫描范围
+   确实全部来自 device `lens`，smem 也只由编译期常量决定（launcher:6790-6800），
+   所以 kernel 侧确实安全；真正会冻结的是 **launcher 的 `n_pos <= 0` 提前返回**
+   与 `attention_rows` 的 **host 分支 `comp_len > 0`**。对策是
+   `compress_branch_steady()`：等到每个 compress source 的 host 镜像都 > 0 才允许
+   捕获（镜像单调不减 ⇒ 此后每步都走同一分支）；等待代价是几个位置
+   （ratio 2 + m 6 时首个 verify 就提交 3 个组）。
+
+**待办（验收 / 实测）**：
+1. **A/B**：`DSV41_VERIFY_GRAPH=1` vs 不设，比较 `verify_ms`（判据 ≥ 8ms 收益）。
+2. **数值门禁**：`cargo test -p ferrite-models --lib dspark_parity -- --ignored --nocapture`
+   （本机无 GPU 跑不了）+ 端到端 `DSV41_TOKTRACE` 逐 token 一致。
+3. **捕获期非法 op 的实测确认**：本机无 GPU，只做了逐调用点的静态核对（S3/S4/S5/S8
+   均已修或门禁）。开图后若出现 err 900/901/906，按同一份清单定位；
+   `FERRITE_POOL_MISS=1` 可打印捕获期内的 `cudaMalloc`。
+4. **多流**：`DSV41_COMPRESS_SIDE` 若打开，`compress_rows` 的 `st`（`Device::stream`）
+   是主 stream 之外的流 —— 捕获是 THREAD_LOCAL，多流需在 `capture_end` 前 join
+   回主 stream。当前 verify 路径的 `st` 取 `self.dev.stream()`，`DSV41_COMPRESS_SIDE`
+   只影响单行路径，故默认配置无此问题；开该 env 时不要开 verify 图。
+
 ---
 
 *户部 · 基于 2026-09-12 仓库状态（HEAD 含 gpqa/v13 系列分支）*
