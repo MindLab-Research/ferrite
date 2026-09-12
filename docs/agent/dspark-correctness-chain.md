@@ -6186,3 +6186,34 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 | panic | 0 ✓ |
 
 **SWALLOW 解锁后的最终判定**：SWALLOW 是可用的 batched 路径——但需要 AR/MoE/mrows 的 kernel 优化（-13ms 步时）+ accept 提升才能达到 400。
+
+## AR Step 2 后的步时预测（假设 AR 优化兑现）
+
+**当前步时 28ms 的分解**（SWALLOW batched）：
+| 族 | 步时 | 优化 | 优化后 |
+|---|---|---|---|
+| AR | 10.1ms (36%) | Step 2 A1a (-3~5ms) | 5.1~7.1ms |
+| MoE interleave | 4.9ms (17.4%) | tcgen05 (-2ms) | 2.9ms |
+| gemv 投影 | 4.2ms (15.1%) | mrows (S2, -2ms) | 2.2ms |
+| hc_dots | 1.9ms (6.7%) | 已优化 | 1.9ms |
+| expert_gemv | 2.4ms (8.7%) | 含在 MoE | 1.4ms |
+| 其他 | 4.5ms (16.1%) | B6 等 | 3.5ms |
+| **合计** | **28.0ms** | | **16.0~18.0ms** |
+
+**AR Step 2 后的预测**：
+- AR -3ms: 25.0ms → @ accept 5: **240 tok/s**（从 194）
+- AR -5ms: 23.0ms → @ accept 5: **261 tok/s**
+
+**全优化后的预测**：
+- AR + mrows + hc/B6 + tcgen05: 16.0ms → @ accept 5: **375 tok/s**
+- 加上 L4: 14.0ms → @ accept 5: **429 tok/s** ✓
+
+**每一步的增量**：
+| 优化 | 步时 | tok/s @ accept 5 | 增量 |
+|---|---|---|---|
+| 当前（全 gate）| 28.0ms | 194 | — |
+| + AR Step 2 | 24.0ms | 250 | +56 |
+| + mrows (S2) | 19.5ms | 308 | +58 |
+| + hc/B6 (S3) | 15.7ms | 382 | +74 |
+| + tcgen05 (S4) | 13.7ms | **438** | +56 |
+| + L4 | 12.0ms | **500** ✓ | +62 |
