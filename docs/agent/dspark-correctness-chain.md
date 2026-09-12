@@ -1372,3 +1372,10 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 ```
 DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0
 ```
+
+## tcgen05 测试的正确配置（下一个测试）
+
+```bash
+DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0
+```
+（GATEUP_FUSE=0 解锁被默认 ON 阻塞的 grouped 路径）
