@@ -32,6 +32,21 @@ macro_rules! ko {
     };
 }
 
+/// Which A0 probe bucket a v5 all-reduce reports itself in — the Rust side of
+/// `ferrite_p2p_ar_v5{,_attn,_moe}` (ferrite_kernels.cu, see the A0 note there).
+///
+/// The label is PURELY diagnostic: it selects a counter slot inside
+/// `ar5_probe_report` for the `[ar-probe]` line. Nothing about the store, the
+/// polls, the epoch advance or the reduce depends on it, which is exactly why a
+/// caller may select a bucket without a numerical gate. `Other` is the plain
+/// entry — the lumped bucket everything the split cannot tell apart lands in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArV5Site {
+    Other,
+    Attn,
+    Moe,
+}
+
 /// The DeepSeek kernels (this crate's own) plus the read-only GLM reuse set.
 struct Kernels {
     // ---- dsv41 (this crate) ----
@@ -1270,6 +1285,45 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// `ferrite_p2p_ar_v5_attn` / `ferrite_p2p_ar_v5_moe` (A0 site split):
+    /// byte-for-byte `p2p_ar_v5` with the probe's site label set to the attention
+    /// / MoE half, so SWALLOW's two verify all-reduces (`chain_dev.rs`
+    /// `layer_rows` / `moe_rows`, which run through `all_reduce_inplace`) stop
+    /// sharing the lumped `AR5_SITE_OTHER` bucket. Optional: an `.so` predating
+    /// them falls back to `p2p_ar_v5` and the probe just reports `Other`.
+    p2p_ar_v5_attn: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// See [`Kernels::p2p_ar_v5_attn`].
+    p2p_ar_v5_moe: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// AR v5 publish+reduce WITHOUT the store: the store half was fused into the
     /// producer kernel's epilogue (`dsv41_gemm_fp8_mx`'s staging args), so this
     /// entry skips `p2p_ar_store_v5_kernel` and only polls/reduces. Same shapes as
@@ -1578,6 +1632,8 @@ impl Device {
             f32_to_bf16: km!(rt, "ferrite_f32_to_bf16"),
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
             p2p_ar_v5: ko!(rt, "ferrite_p2p_ar_v5"),
+            p2p_ar_v5_attn: ko!(rt, "ferrite_p2p_ar_v5_attn"),
+            p2p_ar_v5_moe: ko!(rt, "ferrite_p2p_ar_v5_moe"),
             p2p_ar_pubred_v5: ko!(rt, "ferrite_p2p_ar_pubred_v5"),
             p2p_ar_pubred_v5_moe: ko!(rt, "ferrite_p2p_ar_pubred_v5_moe"),
             p2p_ar_v5_hcpost: ko!(rt, "ferrite_p2p_ar_v5_hcpost"),
@@ -2046,6 +2102,17 @@ impl Device {
     /// pair, so the switch is free to make.
     pub fn supports_ar_hcpost_rows(&self) -> bool {
         self.kernels.p2p_ar_v5_hcpost_rows.is_some()
+    }
+
+    /// True when the loaded `.so` carries BOTH A0 site-labelled v5 entries
+    /// (`ferrite_p2p_ar_v5_attn` / `ferrite_p2p_ar_v5_moe`, the probe's site
+    /// split). This is the self-check the probe runbook's `nm -D` step stands for:
+    /// without them every SWALLOW verify all-reduce lands in the lumped
+    /// `AR5_SITE_OTHER` bucket and the `[ar-probe]` line cannot say which half of
+    /// the step is waiting. The call path itself falls back to the plain entry per
+    /// call ([`Self::p2p_ar_v5_site`]), so a stale `.so` never breaks the AR.
+    pub fn supports_ar_v5_site(&self) -> bool {
+        self.kernels.p2p_ar_v5_attn.is_some() && self.kernels.p2p_ar_v5_moe.is_some()
     }
 
     pub fn gemm_fp8_mx(
@@ -4965,6 +5032,49 @@ impl Device {
               world, my_rank, stride, self.stream)
         };
         self.kerr(rc, "ferrite_p2p_ar_v5")
+    }
+
+    /// [`Self::p2p_ar_v5`] with the A0 probe's site bucket selected by `site`
+    /// (`ferrite_p2p_ar_v5_attn` / `_moe`, A0 site split). Same call, same work,
+    /// same bits: the label only picks the `[ar-probe]` counter slot, which is
+    /// why a caller may select a bucket without a numerical gate.
+    ///
+    /// A `.so` that predates the labelled entry falls back to the plain one (the
+    /// all-reduce still runs; the probe just reports it under `Other`), so the
+    /// switch is free both ways.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_v5_site(
+        &self,
+        partial: *const f32,
+        staging_tbl: *const *mut f32,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+        site: ArV5Site,
+    ) -> Result<()> {
+        let (labelled, name) = match site {
+            ArV5Site::Attn => (self.kernels.p2p_ar_v5_attn, "ferrite_p2p_ar_v5_attn"),
+            ArV5Site::Moe => (self.kernels.p2p_ar_v5_moe, "ferrite_p2p_ar_v5_moe"),
+            ArV5Site::Other => (None, "ferrite_p2p_ar_v5"),
+        };
+        let (f, name) = match labelled {
+            Some(f) => (f, name),
+            None => (
+                self.need(self.kernels.p2p_ar_v5, "ferrite_p2p_ar_v5")?,
+                "ferrite_p2p_ar_v5",
+            ),
+        };
+        let rc = unsafe {
+            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
+              world, my_rank, stride, self.stream)
+        };
+        self.kerr(rc, name)
     }
 
     /// The publish+reduce half of AR v5, with NO store (`ferrite_p2p_ar_pubred_v5`).

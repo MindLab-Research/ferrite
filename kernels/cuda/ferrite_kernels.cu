@@ -9523,6 +9523,63 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     return cudaGetLastError();
 }
 
+// A0 site split for the plain v5 entry: byte-for-byte the body above, with the
+// probe's site label set to the attention / MoE half. A second SYMBOL (not a
+// `site` argument) because the label is the only difference: a `site` parameter
+// would change the `extern "C"` signature, and a stale `.so` would then receive
+// the site where it expects the stream handle (see the A0 note above).
+//
+// What it fixes: SWALLOW's steady state runs its two verify all-reduces through
+// `all_reduce_inplace` (chain_dev.rs `layer_rows` and `moe_rows`) and both landed
+// in `AR5_SITE_OTHER`, so the probe could not answer "which half is waiting"
+// (swallow-ar-first-step-design.md §0-6 / §1.5). The Rust caller is
+// `Collective::all_reduce_inplace_attn` / `_moe`; when the loaded `.so` lacks
+// these symbols the caller falls back to `ferrite_p2p_ar_v5` and the probe
+// degrades to the lumped OTHER bucket -- the all-reduce itself is never dropped.
+//
+// Zero numerical risk: the site label only selects a counter slot inside
+// `ar5_probe_report`. The store kernel, the polls, the epoch advance and the
+// reduce are the same kernels with the same launch geometry as
+// `ferrite_p2p_ar_v5`, so the two are bit-identical by construction.
+extern "C" cudaError_t ferrite_p2p_ar_v5_attn(
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    const int threads = ferrite_ar_v5_block_threads(world);
+    int blocks = ferrite_ar_v5_grid_blocks(n, threads);
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out,
+        world, my_rank, n, stride, ferrite_ar_single_poll(), ferrite_ar_probe(),
+        AR5_SITE_ATTN, ferrite_ar_timeout_trap());
+    return cudaGetLastError();
+}
+
+// The MoE half of the same split (`Collective::all_reduce_inplace_moe`, the
+// `moe_rows` verify all-reduce). Identical to `ferrite_p2p_ar_v5_attn` except for
+// the label; see its note.
+extern "C" cudaError_t ferrite_p2p_ar_v5_moe(
+    const float* partial, float* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    const int threads = ferrite_ar_v5_block_threads(world);
+    int blocks = ferrite_ar_v5_grid_blocks(n, threads);
+    p2p_ar_store_v5_kernel<<<dim3(blocks, world, 1), threads, 0, s>>>(
+        partial, staging_tbl, epoch, world, my_rank, n, stride, nullptr);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return err;
+    p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out,
+        world, my_rank, n, stride, ferrite_ar_single_poll(), ferrite_ar_probe(),
+        AR5_SITE_MOE, ferrite_ar_timeout_trap());
+    return cudaGetLastError();
+}
+
 // D2 epoch pad (see `dsv41_v5_epoch_pad_kernel` above). ONE launch per swallowed
 // step, moving the epoch to where the legacy/aligned arm's 81 extra rounds would
 // have left it, so both arms pay the same round count. No payload, no staging

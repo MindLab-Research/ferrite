@@ -11832,7 +11832,15 @@ impl<'a> DevChain<'a> {
                 m,
             )?;
             if !folded {
-                c.all_reduce_inplace(self.s.wo_out_r.ptr as *mut std::ffi::c_void, fb(m * dim))?;
+                // A0 site split: this is the ATTENTION verify all-reduce, so it is
+                // labelled (`ferrite_p2p_ar_v5_attn`) and the probe's ATTN bucket
+                // stops sharing the lumped OTHER one with the MoE half — the split
+                // `swallow-ar-first-step-design.md` §0-6 asks for. Falls back to the
+                // plain `all_reduce_inplace` on a `.so` without the labelled entry.
+                c.all_reduce_inplace_attn(
+                    self.s.wo_out_r.ptr as *mut std::ffi::c_void,
+                    fb(m * dim),
+                )?;
             }
             c.end_round();
         }
@@ -13706,7 +13714,11 @@ impl<'a> DevChain<'a> {
                 m,
             )?;
             if !folded {
-                c.all_reduce_inplace(self.s.moe_out_r.ptr as *mut std::ffi::c_void, fb(mdim))?;
+                // A0 site split: the MoE half of the verify AR, labelled
+                // (`ferrite_p2p_ar_v5_moe`) so `[ar-probe]` can read it apart from
+                // the attention half — see the note in `layer_rows`. Falls back to
+                // the plain `all_reduce_inplace` on a `.so` without the symbol.
+                c.all_reduce_inplace_moe(self.s.moe_out_r.ptr as *mut std::ffi::c_void, fb(mdim))?;
             }
             c.end_round();
         }

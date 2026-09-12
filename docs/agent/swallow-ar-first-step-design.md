@@ -165,7 +165,8 @@ SWALLOW_EPOCH_PAD/VERIFY_GRAPH/TAP_INPUT/DRAFT_BF16_DOMAIN/MARKOV/FORK/RING_WIN/
   `all_reduce_inplace_attn/_moe`），`chain_dev.rs` 的 `layer_rows`（`:11686`）传 ATTN、`moe_rows`（`:13523`）传 MOE；
 * **零协议风险**：不改 store/stamp/epoch/轮数，只改一个编译期标签；`.so` 缺符号 ⇒ 回落 `all_reduce_inplace`（老路径），
   探针退回 lumped（不静默丢 AR）。
-* 若要更省事：也可以**先不写这个**，直接用 `avg_epi + avg_spin` 的**总量**走 T1~T4 的分支（分数会略粗，但 T3/T4 的判定不受影响）。
+* **✅ 已实施（2026-09-12，ar-a0-site-split）**：`ferrite_p2p_ar_v5_attn` / `ferrite_p2p_ar_v5_moe`（`ferrite_kernels.cu:9544/9565`）+ `device.rs::ArV5Site`/`p2p_ar_v5_site`（符号缺失自动回落 plain 入口，AR 绝不丢）+ `tp.rs::all_reduce_inplace_attn/_moe` + `chain_dev.rs` 两处接线（`layer_rows` verify AR → ATTN、`moe_rows` verify AR → MOE）。`cargo check --workspace --all-targets` EXIT=0。site 判读表与 GPU 运行手册见 subagent 报告（ATTN/MOE 各 40 轮/步稳态；`avg_spin ≈31k cyc ⇒ 账本成立靶子 A2c；≫31k ⇒ nsys 放大为主；≪31k ⇒ AR 无肉`）。**动了 .cu ⇒ 远端双产物重编 + `nm -D` 符号三证后再跑探针**。
+* 若要更省事：也可以~~先不写这个~~（**已写完**），直接用 `avg_epi + avg_spin` 的**总量**走 T1~T4 的分支（分数会略粗，但 T3/T4 的判定不受影响）。
 
 > ⚠️ 该改动**不进吞吐轮**（吞吐轮用 A 臂）；它是**诊断件**，与 §1.2 的 B 臂同轮跑。
 

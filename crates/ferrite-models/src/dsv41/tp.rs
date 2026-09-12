@@ -264,7 +264,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering as AtOrd};
 
 use ferrite_types::{FerriteError, Result};
 
-use crate::dsv41::device::{DevBuf, Device};
+use crate::dsv41::device::{ArV5Site, DevBuf, Device};
 
 /// Collective with a fixed payload size.
 pub struct Collective {
@@ -1033,6 +1033,42 @@ impl Collective {
     /// sum over ranks, written back to `dst` (which may be the same address as
     /// `src`).
     pub fn all_reduce_inplace(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
+        self.all_reduce_inplace_site(buf, len, ArV5Site::Other)
+    }
+
+    /// [`Self::all_reduce_inplace`] with the A0 probe's site bucket set to the
+    /// ATTENTION half (`ferrite_p2p_ar_v5_attn`, A0 site split).
+    ///
+    /// Why this exists: SWALLOW's steady state runs BOTH of its verify
+    /// all-reduces through `all_reduce_inplace` (`chain_dev.rs` `layer_rows` and
+    /// `moe_rows`), so both used to land in the lumped `AR5_SITE_OTHER` bucket and
+    /// the probe could not answer `swallow-ar-first-step-design.md` §0-6's
+    /// question — "which half of the step is waiting". The 40 attention rounds and
+    /// the 40 MoE rounds of a step are the split the design needs to read apart.
+    ///
+    /// Zero numerical risk: the label only selects a `[ar-probe]` counter slot.
+    /// The store, the polls, the epoch advance and the reduce are unchanged, and a
+    /// `.so` without the labelled symbol falls back to `ferrite_p2p_ar_v5` — the
+    /// all-reduce is never dropped, only the bucket degrades to `Other`.
+    pub fn all_reduce_inplace_attn(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
+        self.all_reduce_inplace_site(buf, len, ArV5Site::Attn)
+    }
+
+    /// [`Self::all_reduce_inplace_attn`] for the MoE half
+    /// (`ferrite_p2p_ar_v5_moe`) — the `moe_rows` verify all-reduce.
+    pub fn all_reduce_inplace_moe(&self, buf: *mut std::ffi::c_void, len: usize) -> Result<()> {
+        self.all_reduce_inplace_site(buf, len, ArV5Site::Moe)
+    }
+
+    /// The shared body. The v5 arm picks the AR entry by `site`
+    /// ([`Device::p2p_ar_v5_site`]); the non-v5 arm is the host-barrier path,
+    /// which is site-independent (it runs no probe to label).
+    fn all_reduce_inplace_site(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        site: ArV5Site,
+    ) -> Result<()> {
         // AR v5: fully device-side (store -> publish/reduce), NO host barrier,
         // NO copy-back, and the epoch lives in device memory so a captured graph
         // replays correctly. The protection is the publish chain, not a credit.
@@ -1051,7 +1087,7 @@ impl Collective {
             let staging_local = self.staging.ptr as *const f32;
             let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
             let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
-            self.dev.p2p_ar_v5(
+            self.dev.p2p_ar_v5_site(
                 buf as *const f32,
                 self.peer_slots.ptr as *const *mut f32,
                 self.peer_stamps.ptr as *const *mut u32,
@@ -1063,6 +1099,7 @@ impl Collective {
                 self.world as c_int,
                 self.rank as c_int,
                 stride,
+                site,
             )?;
             return Ok(());
         }
