@@ -1409,3 +1409,20 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 - SWALLOW_STEP 的 verify_graph_m6 capture（新形状池）
 - mrows gates 的 decline 状态（新可观测性）
 - k_acc 保持 legacy 语义（与 lazy 可比）
+
+## post-batched-analysis 的关键修正（batched 400 v2 的预期校准）
+
+**三处前提冲突**：
+1. 脚本**不含 tcgen05**（0 个 tcgen05 gate）
+2. accept 会是**基线 ~1.022**（无 P0-3+P1-5 杠杆）
+3. mrows 实测仅 **−1.21ms**（不是 10+ ms——instruction-bound）
+
+**最关键的实测修正**：VERIFY_GRAPH 仅 **−1.5ms**（不是 −15ms）——CUDA async submit 已重叠，"60% submit"分解是错的。
+
+**步时预期**：35-42ms（远超 10ms 目标）——落在 ">25ms" 档
+- 裸链 verify(m=5) 37.31ms − mrows 1.21 − GATE 2.75 − 其他 0-2 + SWALLOW m=6 +1.6 ≈ 34-37ms
+- + draft 3.6-4.9 + commit 0.2 → **步时 35-42ms** → tok/s 50-60
+
+**mrows decline 日志**：只有 VERIFY_HEAD 和 ATTN_MROWS 有日志，其余 5 个 gate 静默。
+
+**tcgen05 的两个独立阻塞**：E4M3=1 排除 mxf4 arm；EXPERT_ILV 默认 ON 但需要 !ilv。
