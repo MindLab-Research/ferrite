@@ -714,6 +714,82 @@ extern "C" {
         ctr: *mut u32,
         stream: CuStream,
     ) -> i32;
+
+    // ------------------------------------------------ dspark snapshot/rollback
+    //
+    // The verify block's save/restore pair (dspark-verify-perf-plan P0). They
+    // replace a host loop of small `cudaMemcpyAsync` calls -- one per ring slot
+    // per layer per direction, ~520 stream submissions -- with ONE launch per
+    // layer per direction. The slot arithmetic stays exactly
+    // `(pos_base + j) % window` with `pos_base == pos + 1`; it is merely
+    // evaluated on the device now, which is what makes the pair capturable.
+    //
+    // Both halves are pure element moves (one thread per destination element),
+    // so the bytes are bit-identical to the memcpy sequence they replace.
+    //
+    /// Save `m` ring slots: `snap[j*hd + i] = ring[((pos_base+j) % win)*hd + i]`.
+    pub fn dsv41_dspark_ring_save(
+        snap: *mut f32,
+        ring: *const f32,
+        pos_base: i32,
+        window: i32,
+        hd: i32,
+        m: i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// The inverse of [`Self::dsv41_dspark_ring_save`], with a KEEP prefix:
+    /// rows `0..keep` stay in the ring, only rows `keep..m` are restored.
+    /// `keep >= m` is a successful no-op.
+    pub fn dsv41_dspark_ring_restore(
+        ring: *mut f32,
+        snap: *const f32,
+        pos_base: i32,
+        window: i32,
+        hd: i32,
+        m: i32,
+        keep: i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// Save ONE compress-source layer's carry in a single launch: `state_kv`
+    /// and `state_score` (each `ratio * hd` at their own base in the layer's
+    /// `2 * max_ratio * hd` slice) plus `latent` (`hd`) plus the 4-byte device
+    /// counters `clen` and `out_rows`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_dspark_comp_save(
+        state_kv: *const f32,
+        state_score: *const f32,
+        latent: *const f32,
+        clen: *const i32,
+        out_rows: *const i32,
+        snap_state: *mut f32,
+        snap_latent: *mut f32,
+        snap_clen: *mut i32,
+        snap_out_rows: *mut i32,
+        ratio: i32,
+        max_ratio: i32,
+        hd: i32,
+        stream: CuStream,
+    ) -> i32;
+
+    /// The inverse of [`Self::dsv41_dspark_comp_save`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_dspark_comp_restore(
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latent: *mut f32,
+        clen: *mut i32,
+        out_rows: *mut i32,
+        snap_state: *const f32,
+        snap_latent: *const f32,
+        snap_clen: *const i32,
+        snap_out_rows: *const i32,
+        ratio: i32,
+        max_ratio: i32,
+        hd: i32,
+        stream: CuStream,
+    ) -> i32;
 }
 
 /// Convenience: the reference's `score_func` selector.

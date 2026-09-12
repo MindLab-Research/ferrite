@@ -61,7 +61,6 @@
 
 use std::ffi::c_void;
 use std::fmt::Write as _;
-use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 

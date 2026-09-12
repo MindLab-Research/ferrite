@@ -398,6 +398,61 @@ struct Kernels {
         *mut i32,
         CuStream,
     ) -> c_int>,
+    // DSpark verify snapshot/rollback (P0): ONE launch per layer per direction
+    // replaces the per-slot `cudaMemcpyAsync` loop. Same bytes, device-side slot
+    // arithmetic, so the pair is CUDA-graph capturable. Optional: a stale .so
+    // has no entries and the caller keeps the memcpy path.
+    dspark_ring_save: Option<
+        unsafe extern "C" fn(*mut f32, *const f32, c_int, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
+    dspark_ring_restore: Option<
+        unsafe extern "C" fn(
+            *mut f32,
+            *const f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    #[allow(clippy::type_complexity)]
+    dspark_comp_save: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *const f32,
+            *const c_int,
+            *const c_int,
+            *mut f32,
+            *mut f32,
+            *mut c_int,
+            *mut c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    #[allow(clippy::type_complexity)]
+    dspark_comp_restore: Option<
+        unsafe extern "C" fn(
+            *mut f32,
+            *mut f32,
+            *mut f32,
+            *mut c_int,
+            *mut c_int,
+            *const f32,
+            *const f32,
+            *const c_int,
+            *const c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     index_k_publish:
         Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, CuStream) -> c_int>,
     compress_commit: Option<
@@ -841,6 +896,10 @@ impl Device {
             ring_win_fuse: ko!(rt, "dsv41_ring_win_fuse"),
             ring_win_fuse_ph: ko!(rt, "dsv41_ring_win_fuse_ph"),
             verify_ring_win: ko!(rt, "dsv41_verify_ring_win"),
+            dspark_ring_save: ko!(rt, "dsv41_dspark_ring_save"),
+            dspark_ring_restore: ko!(rt, "dsv41_dspark_ring_restore"),
+            dspark_comp_save: ko!(rt, "dsv41_dspark_comp_save"),
+            dspark_comp_restore: ko!(rt, "dsv41_dspark_comp_restore"),
             index_k_publish: ko!(rt, "dsv41_index_k_publish"),
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
@@ -1169,6 +1228,17 @@ impl Device {
             && self.kernels.expert_down_fp4_batched.is_some()
             && self.kernels.moe_down_reduce.is_some()
             && self.kernels.swiglu_limit_batched.is_some()
+    }
+
+    /// True when the loaded .so carries the P0 DSpark snapshot/rollback kernel
+    /// set. `dspark_snapshot`/`dspark_rollback_keep` fall back to their per-slot
+    /// `cudaMemcpyAsync` loop when a stale .so lacks these, so the pair is a
+    /// pure emission change (identical bytes either way).
+    pub fn supports_dspark_snapshot(&self) -> bool {
+        self.kernels.dspark_ring_save.is_some()
+            && self.kernels.dspark_ring_restore.is_some()
+            && self.kernels.dspark_comp_save.is_some()
+            && self.kernels.dspark_comp_restore.is_some()
     }
 
     /// True when the loaded .so carries the load-time gate/up interleave entry
@@ -3112,6 +3182,116 @@ impl Device {
         let f = self.need(self.kernels.verify_ring_win, "dsv41_verify_ring_win")?;
         let rc = unsafe { f(ring, kv, pos_ctr, window, hd, m, idxs, self.stream) };
         self.kerr(rc, "dsv41_verify_ring_win")
+    }
+
+    /// DSpark snapshot (P0): save ONE layer's `m` ring slots in a single launch.
+    /// `snap` is that layer's `[m][head_dim]` slice and `pos_base` is `pos + 1`
+    /// (the first row's slot base), so the kernel computes the same
+    /// `(pos_base + j) % window` the host loop used. Falls back to the memcpy
+    /// path when the loaded `.so` predates the kernel.
+    pub fn dspark_ring_save(
+        &self,
+        snap: *mut f32,
+        ring: *const f32,
+        pos_base: i32,
+        window: i32,
+        hd: i32,
+        m: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.dspark_ring_save else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(snap, ring, pos_base, window, hd, m, self.stream) };
+        self.kerr(rc, "dsv41_dspark_ring_save")?;
+        Ok(true)
+    }
+
+    /// DSpark rollback (P0): restore ONE layer's ring slots from the snapshot,
+    /// keeping rows `0..keep` (`keep >= m` is a no-op). See
+    /// [`Self::dspark_ring_save`] for the fallback contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_ring_restore(
+        &self,
+        ring: *mut f32,
+        snap: *const f32,
+        pos_base: i32,
+        window: i32,
+        hd: i32,
+        m: i32,
+        keep: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.dspark_ring_restore else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(ring, snap, pos_base, window, hd, m, keep, self.stream) };
+        self.kerr(rc, "dsv41_dspark_ring_restore")?;
+        Ok(true)
+    }
+
+    /// DSpark snapshot (P0): save ONE compress-source layer's carry -- both
+    /// `state_kv`/`state_score` segments, `latent`, and the `clen`/`out_rows`
+    /// counters -- in a single launch. `snap_state` is the layer's
+    /// `2 * max_ratio * head_dim` slice, `snap_latent` its `head_dim` slice.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_comp_save(
+        &self,
+        state_kv: *const f32,
+        state_score: *const f32,
+        latent: *const f32,
+        clen: *const c_int,
+        out_rows: *const c_int,
+        snap_state: *mut f32,
+        snap_latent: *mut f32,
+        snap_clen: *mut c_int,
+        snap_out_rows: *mut c_int,
+        ratio: i32,
+        max_ratio: i32,
+        hd: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.dspark_comp_save else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                state_kv, state_score, latent, clen, out_rows, snap_state, snap_latent, snap_clen,
+                snap_out_rows, ratio, max_ratio, hd, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_dspark_comp_save")?;
+        Ok(true)
+    }
+
+    /// DSpark rollback (P0): restore ONE compress-source layer's carry. The
+    /// whole carry is restored regardless of a keep prefix (the compressor
+    /// cannot be rewound row by row). See [`Self::dspark_ring_save`] for the
+    /// fallback contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_comp_restore(
+        &self,
+        state_kv: *mut f32,
+        state_score: *mut f32,
+        latent: *mut f32,
+        clen: *mut c_int,
+        out_rows: *mut c_int,
+        snap_state: *const f32,
+        snap_latent: *const f32,
+        snap_clen: *const c_int,
+        snap_out_rows: *const c_int,
+        ratio: i32,
+        max_ratio: i32,
+        hd: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.dspark_comp_restore else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                state_kv, state_score, latent, clen, out_rows, snap_state, snap_latent, snap_clen,
+                snap_out_rows, ratio, max_ratio, hd, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_dspark_comp_restore")?;
+        Ok(true)
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot

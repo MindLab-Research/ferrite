@@ -1375,6 +1375,7 @@ impl<'a> DsparkDev<'a> {
             hc as i32,
             dim as i32,
         )?;
+        self.dump_unit("collapse", self.collapse.ptr as *const f32, &[bs, dim]);
         self.dev.rmsnorm(
             self.collapse.ptr as *const f32,
             norm.as_f32(),
@@ -1383,6 +1384,7 @@ impl<'a> DsparkDev<'a> {
             dim as i32,
             cfg.norm_eps,
         )?;
+        self.dump_unit("normed", self.normed.ptr as *const f32, &[bs, dim]);
 
         // logits = head @ normed, one row at a time.
         //
@@ -1414,6 +1416,11 @@ impl<'a> DsparkDev<'a> {
 
         // The Markov loop. `ids[0]` is the backbone's token; each launch biases
         // `logits[step]`, samples `ids[step + 1]` and scores `confidence[step]`.
+        //
+        // The unit dump takes `logits_row0` BEFORE this loop: the Markov head
+        // biases the rows in place, so after the loop `logits[0]` is the biased
+        // row, not the head's raw output the reference records.
+        self.dump_unit("logits_row0", self.logits.ptr as *const f32, &[vocab]);
         for step in 0..bs {
             self.dev.dspark_markov_head(
                 self.logits.ptr as *mut f32,
@@ -1431,6 +1438,9 @@ impl<'a> DsparkDev<'a> {
                 self.mk_ctr.ptr as *mut u32,
             )?;
         }
+        // the drafted block the sampler produced: `[t0, d1..d_bs]`, the
+        // reference's `output_ids`.
+        self.dump_unit_i32("ids", self.ids.ptr as *const i32, &[bs + 1]);
         Ok(())
     }
 

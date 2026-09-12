@@ -1386,3 +1386,192 @@ extern "C" int dsv41_verify_ring_win(float* ring, const float* kv, const int* po
     verify_ring_win_kernel<<<blocks, 128, 0, s>>>(ring, kv, pos_ctr, window, hd, m, idxs);
     return (int)cudaGetLastError();
 }
+
+// ---------------------------------------------------------------------------
+// DSpark verify: the snapshot / rollback (save / restore) pair for the write
+// set of a speculative block.
+//
+// `DevChain::dspark_snapshot` / `dspark_rollback_keep` used to move that write
+// set one `cudaMemcpyAsync` at a time. The ring half is `m` slots per owner
+// layer, and the slots `(pos + 1 + j) % window` wrap at the ring's end, so a
+// single contiguous copy cannot serve them; the compressor half is three
+// segments (`state_kv`, `state_score`, `latent`) plus two 4-byte counters per
+// source layer. That is ~520 stream submissions for the production geometry
+// (40 owners x 6 slots, both directions), and at ~5.4us of launch overhead
+// apiece they were the bulk of the 2.7ms a DSpark step spent in save/restore
+// (dspark-verify-perf-plan P0).
+//
+// These kernels collapse the per-slot copies into ONE launch per layer per
+// direction. The slot arithmetic is still exactly `(pos + 1 + j) % window`;
+// the only change is that it is evaluated on the DEVICE. That is the P0 red
+// line: a host-computed slot is a capture-time constant, which is exactly what
+// made the old pair impossible to put inside a CUDA graph.
+//
+// Determinism: save and restore are pure element moves. Every destination
+// element is produced by exactly one thread from exactly one source element,
+// so the bytes are bit-identical to the `cudaMemcpyAsync` sequence they
+// replace -- "the snapshot is the same snapshot" is a property of the layout,
+// not of the emission order.
+//
+// `pos_base` is the caller's `pos + 1` (the first row's slot base). `keep` is
+// `dspark_rollback_keep`'s accepted prefix: rows `0..keep` STAY in the ring
+// (they are the accepted prefix's KV) and only rows `keep..m` come back.
+
+__global__ void dspark_ring_save_kernel(float* __restrict__ snap, const float* __restrict__ ring,
+                                        int pos_base, int win, int hd, int m) {
+    const int total = m * hd;
+    for (int e = (int)blockIdx.x * blockDim.x + threadIdx.x; e < total;
+         e += (int)gridDim.x * blockDim.x) {
+        const int j = e / hd;
+        const int i = e - j * hd;
+        const int slot = (pos_base + j) % win;
+        snap[(size_t)e] = ring[(size_t)slot * (size_t)hd + (size_t)i];
+    }
+}
+
+__global__ void dspark_ring_restore_kernel(float* __restrict__ ring, const float* __restrict__ snap,
+                                           int pos_base, int win, int hd, int m, int keep) {
+    const int rows = m - keep;
+    const int total = rows * hd;
+    for (int e = (int)blockIdx.x * blockDim.x + threadIdx.x; e < total;
+         e += (int)gridDim.x * blockDim.x) {
+        const int lr = e / hd;  // row within the restored `keep..m` range
+        const int i = e - lr * hd;
+        const int j = keep + lr;  // the SNAPSHOT row index (the two layouts match)
+        const int slot = (pos_base + j) % win;
+        ring[(size_t)slot * (size_t)hd + (size_t)i] = snap[(size_t)j * (size_t)hd + (size_t)i];
+    }
+}
+
+// The compressor carry of ONE source layer, all of it in one launch. Element
+// index space:
+//   [0, n)       -> state_kv            (n = ratio * hd)
+//   [n, 2n)      -> state_score
+//   [2n, 2n + hd)-> latent
+// and thread 0 of block 0 moves the two 4-byte counters, so every buffer
+// `dspark_snapshot` saves for this layer is covered. `snap_state` is this
+// layer's `2 * max_ratio * hd` slice: `state_kv` at [0, ratio * hd) and
+// `state_score` at [max_ratio * hd, max_ratio * hd + ratio * hd) -- the
+// buffers are max-sized because `ratio` is per layer (1 or 2 here).
+__global__ void dspark_comp_save_kernel(const float* __restrict__ state_kv,
+                                        const float* __restrict__ state_score,
+                                        const float* __restrict__ latent,
+                                        const int* __restrict__ clen,
+                                        const int* __restrict__ out_rows,
+                                        float* __restrict__ snap_state,
+                                        float* __restrict__ snap_latent,
+                                        int* __restrict__ snap_clen,
+                                        int* __restrict__ snap_out_rows, int ratio, int max_ratio,
+                                        int hd) {
+    const int n = ratio * hd;
+    const int total = 2 * n + hd;
+    for (int e = (int)blockIdx.x * blockDim.x + threadIdx.x; e < total;
+         e += (int)gridDim.x * blockDim.x) {
+        if (e < n) {
+            snap_state[e] = state_kv[e];
+        } else if (e < 2 * n) {
+            const int c = e - n;
+            snap_state[(size_t)max_ratio * hd + c] = state_score[c];
+        } else {
+            const int c = e - 2 * n;
+            snap_latent[c] = latent[c];
+        }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *snap_clen = *clen;
+        *snap_out_rows = *out_rows;
+    }
+}
+
+__global__ void dspark_comp_restore_kernel(float* __restrict__ state_kv,
+                                           float* __restrict__ state_score,
+                                           float* __restrict__ latent,
+                                           int* __restrict__ clen, int* __restrict__ out_rows,
+                                           const float* __restrict__ snap_state,
+                                           const float* __restrict__ snap_latent,
+                                           const int* __restrict__ snap_clen,
+                                           const int* __restrict__ snap_out_rows, int ratio,
+                                           int max_ratio, int hd) {
+    const int n = ratio * hd;
+    const int total = 2 * n + hd;
+    for (int e = (int)blockIdx.x * blockDim.x + threadIdx.x; e < total;
+         e += (int)gridDim.x * blockDim.x) {
+        if (e < n) {
+            state_kv[e] = snap_state[e];
+        } else if (e < 2 * n) {
+            const int c = e - n;
+            state_score[c] = snap_state[(size_t)max_ratio * hd + c];
+        } else {
+            const int c = e - 2 * n;
+            latent[c] = snap_latent[c];
+        }
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        *clen = *snap_clen;
+        *out_rows = *snap_out_rows;
+    }
+}
+
+// The op count is `m * hd` (ring) or `2 * ratio * hd + hd` (compressor), i.e.
+// a few thousand elements; 256 threads with one block per 256 elements is the
+// same geometry `dsv41_dspark_markov_head` uses and keeps the grid in a single
+// wave at these sizes.
+extern "C" int dsv41_dspark_ring_save(float* snap, const float* ring, int pos_base, int win, int hd,
+                                      int m, cudaStream_t s) {
+    if (snap == nullptr || ring == nullptr || win <= 0 || hd <= 0 || m <= 0)
+        return (int)cudaErrorInvalidValue;
+    const unsigned blocks = (unsigned)((m * hd + 255) / 256);
+    dspark_ring_save_kernel<<<blocks, 256, 0, s>>>(snap, ring, pos_base, win, hd, m);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_dspark_ring_restore(float* ring, const float* snap, int pos_base, int win,
+                                         int hd, int m, int keep, cudaStream_t s) {
+    if (ring == nullptr || snap == nullptr || win <= 0 || hd <= 0 || m <= 0)
+        return (int)cudaErrorInvalidValue;
+    if (keep < 0) keep = 0;
+    const int rows = m - keep;
+    // `keep == m` (the whole block was accepted) restores nothing. Returning
+    // success here -- instead of launching a 0-block grid -- matches the host
+    // loop this replaces, which simply ran no iterations.
+    if (rows <= 0) return (int)cudaSuccess;
+    const unsigned blocks = (unsigned)((rows * hd + 255) / 256);
+    dspark_ring_restore_kernel<<<blocks, 256, 0, s>>>(ring, snap, pos_base, win, hd, m, keep);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_dspark_comp_save(const float* state_kv, const float* state_score,
+                                      const float* latent, const int* clen, const int* out_rows,
+                                      float* snap_state, float* snap_latent, int* snap_clen,
+                                      int* snap_out_rows, int ratio, int max_ratio, int hd,
+                                      cudaStream_t s) {
+    if (state_kv == nullptr || state_score == nullptr || latent == nullptr || clen == nullptr ||
+        out_rows == nullptr || snap_state == nullptr || snap_latent == nullptr ||
+        snap_clen == nullptr || snap_out_rows == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (hd <= 0 || ratio <= 0 || max_ratio <= 0 || ratio > max_ratio)
+        return (int)cudaErrorInvalidValue;
+    const unsigned blocks = (unsigned)((2 * ratio * hd + hd + 255) / 256);
+    dspark_comp_save_kernel<<<blocks, 256, 0, s>>>(state_kv, state_score, latent, clen, out_rows,
+                                                   snap_state, snap_latent, snap_clen, snap_out_rows,
+                                                   ratio, max_ratio, hd);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int dsv41_dspark_comp_restore(float* state_kv, float* state_score, float* latent,
+                                         int* clen, int* out_rows, const float* snap_state,
+                                         const float* snap_latent, const int* snap_clen,
+                                         const int* snap_out_rows, int ratio, int max_ratio, int hd,
+                                         cudaStream_t s) {
+    if (state_kv == nullptr || state_score == nullptr || latent == nullptr || clen == nullptr ||
+        out_rows == nullptr || snap_state == nullptr || snap_latent == nullptr ||
+        snap_clen == nullptr || snap_out_rows == nullptr)
+        return (int)cudaErrorInvalidValue;
+    if (hd <= 0 || ratio <= 0 || max_ratio <= 0 || ratio > max_ratio)
+        return (int)cudaErrorInvalidValue;
+    const unsigned blocks = (unsigned)((2 * ratio * hd + hd + 255) / 256);
+    dspark_comp_restore_kernel<<<blocks, 256, 0, s>>>(state_kv, state_score, latent, clen, out_rows,
+                                                      snap_state, snap_latent, snap_clen,
+                                                      snap_out_rows, ratio, max_ratio, hd);
+    return (int)cudaGetLastError();
+}
