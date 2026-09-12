@@ -89,8 +89,19 @@ pub fn dspark_attention(
         cfg.norm_eps,
     );
     let mut q = matmul(&qr, &w.wq_b, bs, cfg.q_lora_rank, nh * hd);
-    // the reference rotates the queries at [start_pos + seqlen, + block_size)
-    ops::apply_rope(&mut q, bs, hd, rd, &w.freqs, start_pos + bs, 1, false);
+    // the reference rotates the queries at [start_pos + seqlen, + block_size):
+    // token r's row sits at position start_pos + bs + r and ALL its nh heads
+    // share that position (per-token rotary, the sglang DSparkAttention
+    // production semantics - fused_q_norm_rope over a per-token `positions`
+    // tensor). The historical call passed (rows=bs, row_len=hd), which only
+    // covered the first bs*hd elements of the [bs, nh*hd] row-major layout -
+    // a transcription bug; each token's head block must be rotated with its
+    // own position.
+    for r in 0..bs {
+        let pos_r = start_pos + bs + r;
+        let row = &mut q[r * nh * hd..(r + 1) * nh * hd];
+        ops::apply_rope(row, nh, hd, rd, &w.freqs, pos_r, 0, false);
+    }
     let mut kv = matmul(x, &w.wkv, bs, cfg.dim, hd);
     ops::rmsnorm_rows_pub(&mut kv, &w.kv_norm, hd, cfg.norm_eps);
     ops::apply_rope(&mut kv, bs, hd, rd, &w.freqs, start_pos + bs, 1, false);
@@ -108,7 +119,15 @@ pub fn dspark_attention(
     let cols = win.min(start_pos + 1) + bs;
     let scale = (hd as f32).powf(-0.5);
     let mut o = ops::sparse_attn(&q, &all_kv, &w.attn_sink, &idxs, 1, bs, nh, hd, win + bs, cols, scale);
-    ops::apply_rope(&mut o, bs * nh, hd, rd, &w.freqs, start_pos + bs, 1, true);
+    // inverse rotary, same per-token positions as the queries above: token r's
+    // nh output heads share position start_pos + bs + r. The historical call
+    // stepped the position per HEAD row (step=1 over bs*nh rows), which gave
+    // every head of a token a different position - a transcription bug.
+    for r in 0..bs {
+        let pos_r = start_pos + bs + r;
+        let row = &mut o[r * nh * hd..(r + 1) * nh * hd];
+        ops::apply_rope(row, nh, hd, rd, &w.freqs, pos_r, 0, true);
+    }
     // grouped low-rank output projection (identical geometry to the backbone)
     let groups = cfg.o_groups;
     let hpg = nh / groups;
