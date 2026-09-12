@@ -904,3 +904,19 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 ## MoE gate 的 mrows 现状——DSV41_GATE_MROWS 已存在（默认 OFF）
 
 `row_fold_gate()`（chain_dev.rs:1070）：`DSV41_ROW_FOLD_GATE` 或 `DSV41_GATE_MROWS` 都能开。走 `gemv_bf16_v2_mrows`（与 `gemv_bf16_nt` 同一 program 的 m 行形，`tests_gate_mrows.cu` 断言位等价 @ WPR>1 shape）。**gate 的 mrows 版本已实现**——只差 GPU A/B 验证它的 3.44→0.8-1.5ms 收益。
+
+## Accept 率提升路径（400+ 的关键乘数）——draft 的 bf16 截断
+
+**现状**：k_acc 直方图 {0:55, 1:13, 2:10, 3:4, 4:3, 5:1}——**64% 首token拒绝**。sglang 同一 MTP head 达 accept ~5 → ferrite 的 draft 数值路径在压低它。
+
+**三层对齐需求**（MTP head 在官方参考全 bf16 下训练）：
+1. **backbone 的 tap**（draft 的输入）：ferrite f32 vs 官方 bf16 → tap 有 ~1e-3 噪声
+2. **draft 内部**（MTP 3 层的 hc/attn/MoE）：ferrite f32 vs 官方 bf16 → 预测偏移
+3. **backbone 的 argmax**（verify 的基准）：bf16 截断已实现（等段错误修复后验证）
+
+**修复顺序**：
+- 第 1 步（已实现）：backbone 的 hc_pre 截断（DSV41_BF16_TRUNCATE）——让 verify 基准对齐
+- 第 2 步（待做）：tap 的 bf16 截断——`note_ctx_rows` 的 D2D 后加 round-trip（或在 `import_tap` 处）
+- 第 3 步（待做）：draft 内部的截断——draft 链的 hc_collapse/hc_front 也传 bf16_truncate()（dspark_dev.rs 的 2 处已传——eager-bf16-truncate subagent 已做 ✓）
+
+**预期**：如果 64% 拒绝主要来自数值错位（而非 MTP head 能力），对齐后 accept 应显著提升。sglang 的 accept 5 是同一 head 的上限证明。
