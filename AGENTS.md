@@ -83,15 +83,18 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-12 session 收官，详见 docs/agent/session-final-handover.md）
+## 当前状态与下一步（2026-09-12 session 收官——SWALLOW 完全解锁！）
 
-**Session 成果（743 commits，88 知识文件）**：
-- **范式转移**：所有"损坏"判定是模型行为（base 模型 ~50-60 token 后自然退化——EAGER 对照确认）——验证协议 v2（计数前 61 行 + 出师表退化与 EAGER 一致 + k_acc 对照）
-- **干净栈：91.1 tok/s（+15.6%）**：base + R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)——全部修正判据验证
-- **SWALLOW 10 次修复全失败**：第 9 次是幻影（零调用点）；第 10 次真 pad 但 **epoch 冻结在 54**（epoch_dev 是 per-rank 的——AR 的不对称失败）；第 11 次（动态 pad）实施中
-- **tcgen05 2 轮对齐修复失败**（仍 1 misaligned——需 compute-sanitizer 定位）
-- **红线报告**：出师表零拉丁在 >60 tok 生成下不可达成（模型行为）——需用户决策
+**Session 成果（769+ commits，102 知识文件）**：
+- **范式转移**：所有"损坏"判定是模型行为（base 模型 ~50-60 token 后自然退化——EAGER 对照确认）。验证协议 v2：计数只对前 61 行有效；出师表退化与 EAGER 一致 = 干净；红线 = 不引入 EXTRA 损坏。
+- **lazy 干净栈：91.1 tok/s（+15.6%）**：base + R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)——全部修正判据下验证
+- **🎉 SWALLOW 完全解锁！**（11 次修复：第 9 幻影 → 第 10 epoch 冻结 54 → OOB 根因（staging 被越界清零！）→ OOB 修复（guard band + bounds check）→ engram slot 修复（147456 ≥ payload）→ **300 token 正常生成 + canary 清洁 + 无 panic！**）
+- **SWALLOW 含观测吞吐 56.6 tok/s**（纯净基线测量中——去掉 V5_LEDGER + DYNAMIC_PAD 开销）
+- **nsys 最终数据**：AR 27.1% #1（从 13.2% 翻倍！）、MoE interleave 19%、gemv 18.5%
+- **tcgen05 仍被阻塞**（2 轮修复失败——TMA bulk 16B 硬对齐）
 
-**400 的诚实判定**：lazy 上限 ~145（accept 5）/ ~97（accept 3）——不够 400；batched（SWALLOW）是唯一路径——10 次失败；L4/L5 kernel 重写（"M 进 grid" 化 + tcgen05 + 流水）= 25-35 人日
+**400 的诚实判定**：lazy 上限 ~145（accept 5）/ ~97（accept 3）——不够 400；batched（SWALLOW 解锁！）+ 全优化（SH_PAIR M=6 + mrows + tcgen05）→ 理论 414（需 ~97% 兑现）；60% 兑现 → ~278。
+
+**修复链的核心武器**（知识固化）：P1 witness + canary（设备侧证词）+ check_payload（静默损坏→响亮失败）+ guard band（reduced 溢出拦截）
 
 **验证纪律（v2 协议）**：EAGER 对照必须；前 61 行判据；退化模式一致 = 干净；三探针（数字+拉丁+k_acc）缺一不可。
