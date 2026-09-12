@@ -4749,3 +4749,32 @@ DSV41_ATTN_MROWS2=1 DSV41_ATTN_MROWS_ROPE_NORM=1  # K1 + K2
 | **+ VERIFY_FORK** | **90.8** | **+1.5%** | **+15.2%** |
 
 **下一测**：K1/K2（R2 的同程序替代——预期干净）
+
+## 最终干净栈的完整配置（K1/K2 重验后的组合测试）
+
+**已验证的优化栈**（当前 90.8 tok/s）：
+```bash
+DSV41_SPEC=1 DSV41_TIMING=1 DSV41_EXPERT_ACT_E4M3=1
+DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+DSV41_SH_EXP_MROWS=1 DSV41_SH_PAIR_M=1
+DSV41_ATTN_LIN_FUSE=1          # R2（或 K1/K2——重验中）
+DSV41_MARKOV_SLICED=1           # MARKOV（修复后）
+DSV41_LAZY_SDR=1                # LAZY_SDR（修复后，中性）
+DSV41_VERIFY_FORK=1             # FORK
+DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1
+DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1
+DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3A=1
+```
+
+**待加**（K1/K2 重验后）：
+| # | 优化 | 预期 | 状态 |
+|---|---|---|---|
+| 1 | K1/K2（替代 R2 或共存）| ~90-92 | 🔄 重验中 |
+| 2 | RING_WIN_FUSE | +0.5% | 待测 |
+| 3 | tcgen05（重启）| +3-5% | 分析完成 |
+| 4 | L4-7 hc 侧流 | +0.5-1% | 设计完成 |
+
+**最终干净栈预期**：
+- 不含 tcgen05：~91-93
+- 含 tcgen05：~94-98
+- **lazy 上限**：~145（需要 L4/L5 全面化才能接近）
