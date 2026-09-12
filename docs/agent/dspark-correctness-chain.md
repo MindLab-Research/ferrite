@@ -6446,3 +6446,25 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 **结论**：tcgen05 的 misaligned 根因可能不在 TMA bulk 或已知的读点——**可能有更深的结构性问题**（rank 7 的分片边界天然不 16B 对齐？）
 
 **SWALLOW 的当前最佳：63.8 tok/s（mrows b2+b3）——不含 tcgen05**
+
+## 🎉🎉🎉 mrows b2+b3 SWALLOW 出师表红线——通过！（4fabf02a）
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）
+- **前 ~100 字正确**（"先帝创业未半而中道崩殂...欲报之于陛下也."）
+- completion=93（模型自然停止）
+- 0 ar5-hang ✓ 0 panic ✓
+
+**SWALLOW + mrows b2+b3 的完整验证（全部通过！）**：
+| 测试 | 结果 | 状态 |
+|---|---|---|
+| 计数 1-200 | **63.8 tok/s** 前 61 行 ✓ | ✅ |
+| **出师表 1000 tok** | **零拉丁 ✓ 前 100 字正确 ✓** | **✅ 红线通过！** |
+| panic/hang | 0/0 | ✅ |
+
+**Session 的最终性能成绩单**：
+| 路径 | 吞吐 | 提升 | 红线 |
+|---|---|---|---|
+| **lazy 干净栈** | **91.1 tok/s** | +15.6% from base 78.8 | ✓ |
+| **SWALLOW + mrows b2+b3** | **63.8 tok/s** | +9.4% from SWALLOW 58.3 | **✓** |
+| base | 78.8 tok/s | — | ✓ |
