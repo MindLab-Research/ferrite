@@ -5913,3 +5913,25 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1 DSV41_SH_PAIR_M=1
 | 对话（accept 0.96）| 91.1 | 更慢 |
 
 **混合路由**：lazy（低 accept）+ SWALLOW（高 accept）——最优策略？
+
+## 纯净 SWALLOW 基线结果（6648a81b）——56.7 tok/s
+
+**结果**：
+- **纯净吞吐 = 56.7 tok/s**（vs 含观测 56.6——观测开销可忽略！）
+- **前 61 行正确=True** ✓✓✓（全部正确！）
+- **零拉丁** ✓（LEN=207，拉丁=[]）
+- **finish_reason=stop**（正常停止——不是 fault！）
+- 0 ar5-hang ✓ 0 panic ✓
+
+**战略数据**：
+| 路径 | 吞吐 | 状态 |
+|---|---|---|
+| **lazy（干净栈）** | **91.1 tok/s** | ✅ 当前最佳 |
+| **SWALLOW（batched）** | **56.7 tok/s** | ✅ 刚解锁——但比 lazy 慢 1.6×！ |
+
+**分析**：
+1. SWALLOW 的 batched forward（m=6）没有兑现 weight-sharing 优势（instruction-bound kernel）
+2. **SH_PAIR M=6（-4.9~7.9ms）是 batched 追上 lazy 的唯一希望**
+3. 如果 SH_PAIR M=6 后 SWALLOW 仍 < lazy：batched 只在高 accept（≥4.7）下有优势
+
+**下一步**：SH_PAIR M=6 在 SWALLOW 下的 A/B 测试（batched 能否追上 lazy 的关键！）
