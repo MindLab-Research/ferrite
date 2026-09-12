@@ -2312,3 +2312,12 @@ DSV41_BF16_TRUNCATE=1
 - 所有优化后 ~13.5ms → 163 tok/s（不是 400——但出师表不是唯一测试任务）
 
 **结论**：400 在高 accept 任务（计数、代码生成）上可达——需要 SH_PAIR + SWALLOW + tcgen05 三个阻塞全部解除。当前最关键的下一步是 SH_PAIR 的 parity 测试（正在跑）。
+
+## Wave 2 的遗漏项发现（EAGER 融合文档的 A 类清单复查）
+
+**已启用**（Wave 1）：HC A1+A2、AR fold、GATE_MROWS、INDEXER_MROWS、COMPRESSOR_MROWS
+**未启用但代码就位**（可立即加到下一轮测试）：
+1. **DSV41_VERIFY_ROPE_MROWS=1**（chain_dev.rs:1116）——q rope m-rows（−160 发，−0.53ms launch 账）
+2. **DSV41_VERIFY_HEAD_MROWS=1**（chain_dev.rs:1511）——head v1 m-rows（−4 发，−0.7~0.9ms）——**LAZY_VERIFY 下无 SWALLOW 冲突！**
+
+下一轮测试加这两个 gate——合计 −1.2~1.4ms 的额外节省（零代码工作）。
