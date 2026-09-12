@@ -6509,3 +6509,20 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 **SWALLOW 的 mrows 最优配置 = b2+b3（63.8 tok/s）**
 
 **mrows Phase B 的教训**：B5/B4/1b 在 batched 路径不带来可测量的收益（-0.13ms 每项的预期没有兑现）——**batched m=6 的 kernel 已经接近最优**（mrows b2+b3 抓住了大部分收益）
+
+## ⚠️ AR R1 (SINGLE_POLL fix) 测试结果（48a90c28）——仍然 10.7 tok/s（7× 退化！）
+
+**结果**：
+- **吞吐 = 10.7 tok/s**（vs 基线 63.8——**7× 退化！**）
+- ELAPSED=13447ms（vs 2254ms 基线——6× 慢）
+- 前 61 行=True ✓ 零拉丁 ✓ 0 panic 0 hang ✓
+
+**判定**：AR R1 (AR_SINGLE_POLL=1) 在 SWALLOW batched 路径也是灾难性退化——不是修复有效！
+
+**SWALLOW 的永久 OFF 列表更新**：
+- fold_r（6× 退化）
+- AR_STORE_FUSE / A1a（8× 退化 + 数值破坏）
+- **AR_SINGLE_POLL（7× 退化）**
+- MARKOV_SLICED / LAZY_SDR（accept 退化）
+
+**核心模式**：SWALLOW batched 路径对几乎所有"优化"都是负收益！只有 mrows b2+b3 有效（+9.4%）。batched m=6 的 kernel 已接近当前架构的最优。
