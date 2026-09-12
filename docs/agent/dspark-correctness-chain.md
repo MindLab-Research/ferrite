@@ -900,3 +900,7 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 **ABI 检查**：ferrite_kernels.cu=3u，cuda.rs/devrt.rs=3 ✓（一致）
 **FFI 检查**：hc_collapse_norm 的 truncate 参数位置正确（truncate as c_int 在 stream 前）✓
 **正在跑**：远端手动回退 cp.async staging → 重建 → 测试（37073a37）
+
+## MoE gate 的 mrows 现状——DSV41_GATE_MROWS 已存在（默认 OFF）
+
+`row_fold_gate()`（chain_dev.rs:1070）：`DSV41_ROW_FOLD_GATE` 或 `DSV41_GATE_MROWS` 都能开。走 `gemv_bf16_v2_mrows`（与 `gemv_bf16_nt` 同一 program 的 m 行形，`tests_gate_mrows.cu` 断言位等价 @ WPR>1 shape）。**gate 的 mrows 版本已实现**——只差 GPU A/B 验证它的 3.44→0.8-1.5ms 收益。
