@@ -322,7 +322,14 @@ fn pool_rank_body(
     }
     barrier.wait();
     let hc_dim = cfg.hc_mult * cfg.dim;
-    let mut comm = Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
+    // The staging slot must cover the LARGEST all-reduce payload any path
+    // issues. The verify chain (`step_rows`) reduces m*dim floats (m =
+    // VERIFY_ROWS = 6 → 30720), larger than the single-row hc payload
+    // (hc_mult*dim = 20480); an undersized slot makes the AR store overrun the
+    // next peer's parity half and the protocol desyncs into a wedge (the
+    // GLM-side P2P_AR_MAX_N lesson, same failure shape).
+    let ar_bytes = (hc_dim.max(crate::chain_dev::VERIFY_ROWS * cfg.dim)) * 4;
+    let mut comm = Collective::new(dev.clone(), world, rank, ar_bytes, barrier.clone())?;
     {
         staging.lock().unwrap()[rank] = comm.staging_base();
     }

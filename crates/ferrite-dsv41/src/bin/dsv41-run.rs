@@ -353,7 +353,11 @@ fn rank_body(
 
     let hc_dim = cfg.hc_mult * cfg.dim;
     let vocab = cfg.vocab_size;
-    let mut c_small = Collective::new(dev.clone(), world, rank, hc_dim * 4, barrier.clone())?;
+    // the staging slot must cover the verify chain's m*dim AR payload too
+    // (step_rows), not just the single-row hc payload — see serve.rs for the
+    // overrun/desync failure mode
+    let ar_bytes = (hc_dim.max(ferrite_dsv41::chain_dev::VERIFY_ROWS * cfg.dim)) * 4;
+    let mut c_small = Collective::new(dev.clone(), world, rank, ar_bytes, barrier.clone())?;
     let mut c_big = Collective::new(dev.clone(), world, rank, vocab * 4, barrier.clone())?;
     {
         t_small.lock().unwrap()[rank] = c_small.staging_base();
