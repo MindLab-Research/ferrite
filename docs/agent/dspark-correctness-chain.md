@@ -202,3 +202,13 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 - **ferrite**：`quant_fp4`（device.rs:2062）把激活打成 **e2m1 packed**（`xq4`——`chain_dev.rs:180-186` 的注释自证："the ROUTED experts' fp4 packing of xn"）→ expert kernel 假设激活也是 fp4。
 - **量化误差量级**：e2m1 尾数 1 位（相对误差 ~2^-1 步长）vs e4m3 尾数 3 位（~2^-3）——**4 倍的量化噪声**，每层每 token、44 层累积。这就是首 token 近 tie 翻转（`《`→`出`）与 opa 尾部的机制。
 - **修复**：激活切 `quant_fp8`（现成 kernel device.rs:2021）+ expert kernel 接受 fp8 激活（读 `dsv41_experts_mxf4.cu`——mxf4 的 tcgen05 路线可能已经是 fp8 激活的（`act_scale` f32→e8m0 转换暗示了 fp8 激活的 block scale）——`expert-act-fp8-ab` 在实施）。
+
+## 官方激活量化的完整参数（act_quant 的语义）
+
+`kernel.py:98-115` 的 `act_quant(x, block_size, scale_fmt, scale_dtype, inplace)`：
+- **out_dtype 固定 FP8 e4m3**（`y = torch.empty_like(z, dtype=torch.float8_e4m3fn)`）
+- **block_size 默认 128**（`act_quant_kernel(N, block_size=128, ...)`——但 `model.py` 调用时传的 `fp8_block_size` 需从 config 确认）
+- **scale_dtype 默认 f32**（可 e8m0——MXFP 格式）
+- **ferrite 的 `quant_fp8`（device.rs:2021）**：**需要对照它的 block/scale 语义**（如果也是 e4m3+block32 vs 官方 block128，block 尺寸不一致仍是数值差）。
+
+⇒ 修复的精确对齐 = `quant_fp8` 的 block_size/scale 格式与官方 `fp8_block_size`/`scale_fmt` 完全一致 + expert kernel 吃 e4m3 激活。
