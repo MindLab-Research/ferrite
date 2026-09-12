@@ -131,6 +131,34 @@ fn draft_moe_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DRAFT_MOE_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// ATTENTION-PROJECTION PROGRAM ALIGNMENT (`DSV41_ATTN_PROJ_ALIGN=1`, **DEFAULT
+/// OFF** — the A/B arm). The draft's four attention projections — `wq_a`,
+/// `wq_b`, `wkv` ([`DsparkDev::draft_attention`]) and `wo_b`
+/// ([`DsparkDev::draft_attn_out`]) — leave `gemm_fp8_mx` for the same
+/// `gemm_fp8_mrows` program the verify's `proj_mrows` runs.
+///
+/// **Why this is a NUMERICAL fix, not a perf one.** `dsv41_gemm_fp8_mx`
+/// dispatches on `m`: the SIMT warp-per-row GEMV at `m == 1` and a **16-row
+/// tile MMA** for any `m > 1`. The draft runs at `m = bs = 5`, so its four
+/// attention projections were on the TILE program, whose k-walk and reduction
+/// tree are shared across the tile — a *structural* difference in the
+/// summation, not an ulp-level one. The verify's attention projections run
+/// `proj_mrows` → `dsv41_gemm_fp8_mrows`, which reproduces the `m == 1` GEMV's
+/// consume expression, ascending-kb walk and per-row `shfl_xor` tree.
+///
+/// The official `model.py` has the draft block and the verify chain call the
+/// SAME `F.linear` for these weights, so the two sides must be one program. With
+/// this gate OFF the historical `gemm_fp8_mx(m = bs)` path is bit-for-bit
+/// unchanged (zero risk); with it ON the draft's projections read the verify's
+/// program and the accept comparison stops measuring the kernel mismatch.
+///
+/// Read once and cached (the house rule for hot-path gates): this branch runs
+/// `bs` x n_mtp x 2 times per step.
+fn attn_proj_align() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ATTN_PROJ_ALIGN").map(|v| v != "0").unwrap_or(false))
+}
+
 /// `DSV41_DRAFT_GRAPH=1` (**DEFAULT OFF** — the A/B arm) — the draft's
 /// **device-level** CUDA graph: the whole kernel sequence from the `main_x`
 /// projection through the sampled block is RECORDED once and rePLAYed as ONE
@@ -1799,17 +1827,36 @@ impl<'a> DsparkDev<'a> {
         // and `bs·dim/32` scales, so rows 1..bs-1 consumed stale xq bytes and
         // the draft q/kv were silently garbage.
         self.quant1(self.xn.ptr as *const f32, bs * dim)?;
-        self.dev.gemm_fp8_mx(
-            self.xq.as_u8(),
-            self.xsc.as_f32(),
-            wq_a.as_u8(),
-            wq_a_s.as_u8(),
-            std::ptr::null(),
-            self.qr.ptr as *mut f32,
-            bs as i32,
-            ql as i32,
-            dim as i32,
-        )?;
+        // ATTN-PROJ PROGRAM ALIGNMENT (`DSV41_ATTN_PROJ_ALIGN=1`, default OFF):
+        // `gemm_fp8_mx` at `m = bs = 5` is the 16-row TILE program, while the
+        // verify's `wq_a` runs `proj_mrows` → the `m == 1` GEMV program — a
+        // DIFFERENT summation (shared tile walk vs per-row `shfl_xor` tree).
+        // The official calls the same `F.linear` on both sides, so the gate puts
+        // the draft on the verify's program. OFF = the historical launch, bit for
+        // bit. `Ok(false)` (unknown .so / refused shape) keeps that launch too.
+        if !(attn_proj_align()
+            && self.proj_attn_mrows(
+                wq_a.as_u8(),
+                wq_a_s.as_u8(),
+                self.qr.ptr as *mut f32,
+                bs,
+                ql as i32,
+                dim as i32,
+                ql as i32,
+            )?)
+        {
+            self.dev.gemm_fp8_mx(
+                self.xq.as_u8(),
+                self.xsc.as_f32(),
+                wq_a.as_u8(),
+                wq_a_s.as_u8(),
+                std::ptr::null(),
+                self.qr.ptr as *mut f32,
+                bs as i32,
+                ql as i32,
+                dim as i32,
+            )?;
+        }
         self.dev.rmsnorm(
             self.qr.ptr as *const f32,
             q_norm.as_f32(),
@@ -1820,17 +1867,32 @@ impl<'a> DsparkDev<'a> {
         )?;
         self.quant1(self.qr.ptr as *const f32, bs * ql)?;
         // wq_b is [nh * hd, ql]; one fp8 GEMM covers all bs draft rows.
-        self.dev.gemm_fp8_mx(
-            self.xq.as_u8(),
-            self.xsc.as_f32(),
-            wq_b.as_u8(),
-            wq_b_s.as_u8(),
-            std::ptr::null(),
-            self.q.ptr as *mut f32,
-            bs as i32,
-            (nh * hd) as i32,
-            ql as i32,
-        )?;
+        // Same program choice as `wq_a` above: `DSV41_ATTN_PROJ_ALIGN` puts this
+        // on the verify's `gemm_fp8_mrows` (the `m == 1` GEMV program, the
+        // verify's `proj_mrows` for wq_b), OFF keeps the `m = bs` TILE launch.
+        if !(attn_proj_align()
+            && self.proj_attn_mrows(
+                wq_b.as_u8(),
+                wq_b_s.as_u8(),
+                self.q.ptr as *mut f32,
+                bs,
+                (nh * hd) as i32,
+                ql as i32,
+                (nh * hd) as i32,
+            )?)
+        {
+            self.dev.gemm_fp8_mx(
+                self.xq.as_u8(),
+                self.xsc.as_f32(),
+                wq_b.as_u8(),
+                wq_b_s.as_u8(),
+                std::ptr::null(),
+                self.q.ptr as *mut f32,
+                bs as i32,
+                (nh * hd) as i32,
+                ql as i32,
+            )?;
+        }
         // the pre-RoPE projection — the unit-diff isolator between the
         // projection chain (wq_a/q_norm/wq_b) and the RoPE.
         self.dump_unit_idx("q_pre_rope", s, self.q.ptr as *const f32, &[bs, nh, hd]);
@@ -1842,17 +1904,32 @@ impl<'a> DsparkDev<'a> {
         // D1 fix (audit-ffi-args): quantise ALL bs rows — one row left rows 1..bs-1
         // reading stale xq bytes into the gemm below.
         self.quant1(self.xn.ptr as *const f32, bs * dim)?;
-        self.dev.gemm_fp8_mx(
-            self.xq.as_u8(),
-            self.xsc.as_f32(),
-            wkv.as_u8(),
-            wkv_s.as_u8(),
-            std::ptr::null(),
-            self.kv.ptr as *mut f32,
-            bs as i32,
-            hd as i32,
-            dim as i32,
-        )?;
+        // `DSV41_ATTN_PROJ_ALIGN` (see `wq_a` above): the verify's `wkv` runs
+        // `proj_mrows`, so the draft joins it here — OFF keeps `gemm_fp8_mx` at
+        // `m = bs` (the TILE program) bit for bit.
+        if !(attn_proj_align()
+            && self.proj_attn_mrows(
+                wkv.as_u8(),
+                wkv_s.as_u8(),
+                self.kv.ptr as *mut f32,
+                bs,
+                hd as i32,
+                dim as i32,
+                hd as i32,
+            )?)
+        {
+            self.dev.gemm_fp8_mx(
+                self.xq.as_u8(),
+                self.xsc.as_f32(),
+                wkv.as_u8(),
+                wkv_s.as_u8(),
+                std::ptr::null(),
+                self.kv.ptr as *mut f32,
+                bs as i32,
+                hd as i32,
+                dim as i32,
+            )?;
+        }
         self.dev.rmsnorm(
             self.kv.ptr as *const f32,
             kv_norm.as_f32(),
@@ -2091,17 +2168,34 @@ impl<'a> DsparkDev<'a> {
             self.dev.bf16_roundtrip(self.wo.ptr as *mut f32, n)?;
         }
         self.quant1(self.wo.ptr as *const f32, bs * ol_total)?;
-        self.dev.gemm_fp8_mx(
-            self.xq.as_u8(),
-            self.xsc.as_f32(),
-            wo_b.as_u8(),
-            wo_b_s.as_u8(),
-            std::ptr::null(),
-            self.o.ptr as *mut f32,
-            bs as i32,
-            dim as i32,
-            ol_total as i32,
-        )?;
+        // `DSV41_ATTN_PROJ_ALIGN` (see `draft_attention`'s `wq_a`): the verify's
+        // `wo` projection runs `proj_mrows`, so the draft joins it — OFF keeps the
+        // `gemm_fp8_mx` TILE launch at `m = bs` bit for bit. All four attention
+        // projections move as one arm so the draft's attention chain is never
+        // half-aligned.
+        if !(attn_proj_align()
+            && self.proj_attn_mrows(
+                wo_b.as_u8(),
+                wo_b_s.as_u8(),
+                self.o.ptr as *mut f32,
+                bs,
+                dim as i32,
+                ol_total as i32,
+                dim as i32,
+            )?)
+        {
+            self.dev.gemm_fp8_mx(
+                self.xq.as_u8(),
+                self.xsc.as_f32(),
+                wo_b.as_u8(),
+                wo_b_s.as_u8(),
+                std::ptr::null(),
+                self.o.ptr as *mut f32,
+                bs as i32,
+                dim as i32,
+                ol_total as i32,
+            )?;
+        }
         // DRAFT ATTN BF16 ROUND-TRIP (DSV41_DRAFT_ATTN_BF16, default OFF): the
         // official DSparkBlock's attention output (after wo_b) carries the model
         // dtype (bf16) — the MTP head's hc_post consumes a bf16 tensor. ferrite
@@ -3558,6 +3652,47 @@ impl<'a> DsparkDev<'a> {
             k as i32,
             32,
             true,
+        )
+    }
+
+    /// One `gemm_fp8_mrows` launch for an attention projection whose activation
+    /// is already staged in `xq` / `xsc` by [`Self::quant1`] — the draft-side
+    /// counterpart of the verify's `proj_mrows` (chain_dev.rs), and the program
+    /// `DSV41_ATTN_PROJ_ALIGN` selects for `wq_a` / `wq_b` / `wkv` / `wo_b`.
+    ///
+    /// The row PITCH of the staging is `k` (draft's `quant1` quantises the whole
+    /// `bs x k` block as one contiguous run, which is the same per-32 blocking as
+    /// `bs` rows of `k` whenever `k % 32 == 0` — the mrows precondition), so the
+    /// activation layout is already the one `gemm_fp8_mrows` reads. `out_stride`
+    /// is the caller's row pitch: every attention output here is the contiguous
+    /// `[bs, n]` block, so it equals `n` (cf. the verify's `wq_b`, whose
+    /// `out_stride` is `nh*hd` while `n` is the rank's `nlh*hd`).
+    ///
+    /// `Ok(false)` = NOT performed — the caller keeps its `gemm_fp8_mx` launch.
+    /// It declines when the loaded .so lacks the symbol, `rows` is outside the
+    /// kernel's 1..=8 dispatch, or the C entry refuses the shape/mode.
+    #[allow(clippy::too_many_arguments)]
+    fn proj_attn_mrows(
+        &self,
+        w: *const u8,
+        ws: *const u8,
+        out: *mut f32,
+        rows: usize,
+        n: i32,
+        k: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        self.dev.gemm_fp8_mrows(
+            self.xq.as_u8(),
+            self.xsc.as_f32(),
+            w,
+            ws,
+            std::ptr::null(),
+            out,
+            rows as i32,
+            n,
+            k,
+            out_stride,
         )
     }
 
