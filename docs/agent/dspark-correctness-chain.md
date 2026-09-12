@@ -6059,3 +6059,30 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 **如果 accept 不可修复**：
 - lazy 91.1（当前最佳）→ L4/L5 优化 → ~145 上限
 - 400 需要 accept≥4 且步时≤15ms——batched 的 accept 问题必须解决
+
+## SWALLOW accept 质量的数学分析
+
+**从 54.1 tok/s 和 k_emit∈{1,2} 反推**：
+- k_emit=1 → 只发锚行（0 个 draft 被接受）
+- k_emit=2 → 锚 + 1 个 draft
+- **平均 tok/step ≈ 1.5**
+- 步时 = 1.5/54.1 ≈ **27.7ms**（接近预期的 ~31ms！✓）
+
+**结论**：
+1. **SWALLOW 的步时正常**（~28ms vs 预期 ~31ms）✓
+2. **accept 质量是唯一问题**：k_emit-1 = 0-1 个 draft 被接受（vs lazy 的 4-5 个！）
+3. **SWALLOW 的 drafts 几乎全部被拒绝**——draft 的预测质量系统性低下
+
+**draft 被拒的深层原因**（等 subagent 判决）：
+- **draft 的输入错位**：SWALLOW 的 draft_forward 可能用了错误的输入（前一步的 token 而不是当前的？）
+- **verify 的 argmax 不匹配**：batched m=6 的 argmax 与 lazy m=1 的结果不同
+- **tap staging 的偏差**：batched 的 tap 数据有数值差异
+
+**修正后的 400 计算**：
+| 场景 | accept | 步时 28ms | 步时 15ms（优化后）|
+|---|---|---|---|
+| 当前（broken accept）| 0.5 | 54 tok/s | 100 tok/s |
+| **如果 accept 修复到 5** | 5.0 | **214 tok/s** | **400** ✓ |
+| 如果 accept 只到 3 | 3.0 | 143 tok/s | 286 tok/s |
+
+**accept 修复是 400 的唯一关键**——步时优化（AR 等）只有在 accept 修复后才有意义！
