@@ -1220,3 +1220,23 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 4. **verify 37.80ms ≈ 基线 37.31ms**——所有性能优化都没有兑现！
 
 **下一步**：查为什么 mrows gates 全部回退（符号缺失？形状不匹配？gate 冲突？）
+
+## 会话交接摘要（2026-09-12 深夜，上下文耗尽前）
+
+### 已达成
+1. **零拉丁** ✓ — DSV41_BF16_TRUNCATE=1（hc_pre bf16 截断），多次 GPU 验证
+2. **段错误修复** ✓ — ABI 5 + 干净重建
+3. **基线破坏根因** ✓ — HC_VERIFY_FUSE 的 fused 路径把 BF16_TRUNCATE 带进 verify（050c7fd）→ 默认 OFF + 安全重启用（truncate=false）
+4. **全 P0 审计** ✓ — seed 相位（回退+gate）、tap 采集点（gated）、激活域（gated）、head/gate（gated）
+5. **大量优化已提交** — mrows staging、sh_pair、head v1、indexer front、norm rows、compressor multi-row、hc verify 接线、AR 折叠、tcgen05 masked、grouped routing、draft P3c 图化
+
+### 当前瓶颈（400 路径）
+- **batched 400 首测**：零拉丁 ✓，图化成功（verify_graph_m5 + draft_graph），但 **verify=37.80ms ≈ 基线 37.31ms**——mrows gates 全部未兑现收益
+- **调查中**（3 subagent）：mrows 回退原因、batched 400 最终分析、accept 杠杆分析
+- **accept 0.566-1.022**（batched 更严）——400 需要 accept ~3
+
+### 下一步（按优先级）
+1. **mrows 回退修复**——符号在 .so 里（nm 确认），gate 条件可能不满足（mrows-decline-investigation 分析中）
+2. **HC_VERIFY_FUSE=1 重测**（truncate=false 安全版——−1.3ms）
+3. **accept 杠杆测试**（P0-3+P1-5 在修复后基线上）
+4. **batched verify 400 组合**（全 mrows + tcgen05 + draft graph → 步时 ≤10ms）
