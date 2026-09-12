@@ -3330,3 +3330,56 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 | lazy | **83**（最佳）| 无 | ❌ 数学上限 145 |
 | aligned | 64 | 无 | ❌ 需要 SH_PAIR M=6 + kernel 优化 |
 | SWALLOW | ? | **是** | ❌ 需要修 hang |
+
+## 📋 400 冲刺 Session 的最终知识整合（交接文档）
+
+### 一、正确性成就（红线全部保持）
+1. **零拉丁（出师表）** ✓——所有配置下多次验证
+2. **k_acc 不退化** ✓——SH_PAIR_M=1 + R2 系列验证 accept 中性
+3. **两个 accept 退化 bug 找到并修复**：
+   - MARKOV_SLICED：logits 行偏移双重计算（step s 读 row 2s）——一行修复
+   - LAZY_SDR：set_pos_ctr 是承重构件（per-row rope 读它）——恢复 H2D
+
+### 二、性能成就（lazy 路径）
+| 里程碑 | 吞吐 | 增量 | 关键发现 |
+|---|---|---|---|
+| Wave 1 基线 | 78.8 tok/s | — | HC 融合 + mrows + AR fold |
+| + SH_PAIR_M=1 | 78.1 | ~0 | accept 中性 ✓ |
+| + R2 ATTN_LIN_FUSE | **82.9** | **+6%** | EAGER 复用策略成功！ |
+| + R2b + A4 | 82.6 | ~0 | launch 常数优化到顶 |
+| **lazy 平台** | **~83 tok/s** | | k_emit × c_row 乘积主导 |
+
+### 三、架构发现（不可绕过的物理事实）
+1. **kernel 是 instruction-bound**（0.7-4.9% 峰值带宽）——省字节≈0
+2. **mrows 的 M-折叠只减权重解码指令**（0.6-0.68×）——拿不到 1/M
+3. **warp-per-row 决定 M 只加每 warp 工作量**——batched 的权重共享不生效
+4. **SH_PAIR 是唯一"M 进 grid"的折法**——真共享的唯一机制
+5. **lazy 的数学下限**：k_emit=6 × c_row(6.15 EAGER) = 41.4ms → 145 tok/s（400 不可能）
+6. **AR 的 20.8% 主要是等待**（同形状 kernel 差 22.5μs = 纯等待——rank 漂移+惊群）
+
+### 四、ar5-hang 的最终定位
+| 模式 | 结果 | 结论 |
+|---|---|---|
+| SWALLOW + 图 | 恒 hang（Plan A/B/C 全失败）| SWALLOW 特有 |
+| SWALLOW 无图 + 低 accept | 0 hang ✓ | accept 相关 |
+| SWALLOW 无图 + 高 accept | 937 hang ❌ | 高 accept 触发 |
+| **aligned（不吞）+ 图** | **0 hang ✓** | **batched verify 本身没问题！** |
+
+**结论**：hang 在 SWALLOW 的主链步吞并逻辑（epoch 管理），不在 batched verify 或图。
+
+### 五、400 的真实路径（25-35 人日）
+1. **修 SWALLOW hang**（吞并的 epoch 对齐——swallow-hang-rootcause 分析中）
+2. **SH_PAIR M=6 parity**（-4.9~7.9ms——sh-pair-m6-parity-fix 修复中）
+3. **全部 kernel "M 进 grid" 化**（SH_PAIR 化——L4 的核心）
+4. **tcgen05**（tensor cores 根治 MoE instruction-bound）
+5. **L4 占用 + L5 流水**（25-35 人日的 kernel 重写）
+
+### 六、已实施待验证的优化
+| 优化 | gate | 状态 |
+|---|---|---|
+| R2b indexer 集成 | DSV41_INDEXER_QR_RAW（默认 ON under R2）| ✅ 实施完成 |
+| A4 AR 单块轮询 | DSV41_AR_SINGLE_POLL | ✅ 实施+中性 |
+| L4-6 fork/join 流 | DSV41_VERIFY_FORK | 🔄 全栈测试中 |
+| MARKOV_SLICED 修复 | DSV41_MARKOV_SLICED | 🔄 全栈测试中 |
+| LAZY_SDR 修复 | DSV41_LAZY_SDR | 🔄 全栈测试中 |
+| ring+window 直调 | DSV41_RING_WIN_FUSE | 🔄 subagent 实施中 |
