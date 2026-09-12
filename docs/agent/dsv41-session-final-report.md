@@ -119,7 +119,7 @@
 
 ## 3.5 swapAB 路径的完整验证矩阵（正式关闭）
 
-> swapAB 曾被 §5 评为"唯一数量级路径（预估 ~238 tok/s）"，并投入 4 个迭代。
+> swapAB 曾被 §5 评为"唯一数量级路径（预估 ~238 tok/s）"，并投入 5 个迭代。
 > 这是本会话**最昂贵的一次隔离→生产失效**，其完整证据链必须留档，防止未来重启。
 
 | 变体 | 消除的变量 | p50 | tok/s | 判定 |
@@ -129,13 +129,16 @@
 | v18s（形状分发 n≥1664） | 小 n 回归 | 6.20ms | 161.3 | **中性**（Δ=+0.03） |
 | v19s（+ memset 消除，last-block reduction） | memset 图节点 | 6.18ms | 161.8 | **中性**（Δ=+0.01） |
 | v21t（+ TMA bulk staging，1D `cp.async.bulk` + mbarrier） | staging 路径 | 6.18ms | 161.8 | **中性**（Δ=+0.01） |
+| v24r（+ 环满几何 KStep=64/NSTAGE=16，8x warps 真正 in-flight） | ring 几何 | 6.17ms | 162.1 | **中性**（Δ=+0.02） |
 
 **逐项排除（排除法定位根因）**：
 - **不是小 n 回归**（v18 形状分发已隔离）
 - **不是 memset**（v19 已消除）
 - **不是 staging 方式**（v21 TMA vs cp.async 同结果）
+- **不是 ring 未填满**（v24 KStep=64/NSTAGE=16 使环真正填满、8x warps 成为真 in-flight，仍中性）
 - ⇒ **是深层系统差异**：serve 的 4 条 side stream 造成 SM 争抢 + L2 竞争，
   使隔离口径的 cp.async staging 1.3TB/s 与"混合形状下的 SIMT 实际耗时"两头失真。
+- ⇒ **5 个正交维度的修复全部无效 ⇒ swapAB 在 serve 的中性是绝对系统性的。**
 
 **结论：swapAB 路径正式关闭。** 代码保留（`DSV41_SWAPAB` 默认 OFF，`166acc5`/`9696afa`/`b7744a1`/`0f34001`），
 供未来架构变化（如去掉 side stream、增大 L2 隔离）后重测，但**不得再计入路线图收益**。
