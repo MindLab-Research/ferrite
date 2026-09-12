@@ -5741,3 +5741,24 @@ canary 从 0xdeadbeef → **0x00000000**——不是随机数据而是**写零**
 - 如果 v2 的 counter 在 canary 位置且被 reset——**canary 被清零！**
 
 **待 oob-source-investigation 的完整判决**（subagent 正在调查）
+
+## 📋 Session 的突破发现链（从"损坏"到"OOB 根因"的完整旅程）
+
+**发现链**（每一步都建立在前一步之上）：
+1. **R2 的"损坏"** → 二分（lin2/lin_rope_norm）→ 都损坏 → 疑数值差异
+2. **基线对照** → EAGER+e4m3 也损坏（61/77）→ **范式转移：模型行为！**
+3. **验证协议 v2** → 前 61 行判据 + EAGER 对照 → R2 验证干净（86.8！）
+4. **干净栈重建** → 78.8 → 91.1（+15.6%）—— R2/MARKOV/FORK/RING_WIN 全部恢复
+5. **SWALLOW 的 11 次** → 第 9 次幻影（零调用点！）→ 第 10 次真 pad → epoch 冻结 54
+6. **D1 观测** → 步前打印修复 → 完整 ledger：pos=15 的 999→54（所有 rank 均匀！）
+7. **RESET "bug"** → 假警报（旧测试跑旧代码）→ 当前代码 RESET 会触发
+8. **P1 witness 测试** → **CANARY 触发！**（0xdeadbeef→0x00000000）→ **OOB 写清零 staging！**
+9. **OOB 源头调查** → 3 严重缺陷（v5 无守卫 + 无 guard band + S1 stride 滑移）+ m=6 AR 排除
+10. **OOB 修复** → guard band + payload bounds + multi-slot canary → **决定性测试中！**
+
+**关键洞察**：
+- epoch 54 = 清零后从 0 重数到 54（不是"写小"）
+- 均匀降级 = rank world-1 的 parity=1 slot 写踩每个 peer 的 staging 尾
+- canary 0x00000000 = 一个越界写同时踩 epoch+A4+canary（它们相邻！）
+
+**修复的意义**：如果 OOB 修复生效 → SWALLOW 正常生成 → batched 解锁 → 400 冲刺！
