@@ -795,7 +795,7 @@ impl<'a> DsparkDev<'a> {
         // n_win+bs from the parameters — every kv read past row n_win landed
         // `win - n_win` rows off once pos < win-1, which is exactly the
         // "draft outputs unrelated garbage" signature.
-        let n_win = win.min(pos + 1);
+        let n_win = win.min(pos);
         let wbytes = (n_win * hd * 4) as usize;
         self.dev
             .memcpy_d2d(self.all_kv.ptr, self.window[s].ptr, wbytes)?;
@@ -803,6 +803,22 @@ impl<'a> DsparkDev<'a> {
             (self.all_kv.ptr as *mut u8).wrapping_add(wbytes) as *mut c_void,
             self.kv.ptr,
             (bs * hd * 4) as usize,
+        )?;
+        // The anchor's KV seat: the block's row 0 IS the anchor (t0) at pos,
+        // and the ring's pos%win slot holds ANOTHER copy of the same position
+        // (the target-hidden projection this step's seed_window wrote for the
+        // NEXT round). Official DeepSpec arbitration: one position, one KV —
+        // and the target-hidden version (wkv(main_x), full context) is the
+        // authoritative one, the embedding projection (wkv(embed(t0))) is
+        // context-free. The window copy above already EXCLUDES the pos slot
+        // (n_win = min(win, pos), not pos+1), so the duplicate seat is the
+        // tail's row 0 — replace its bytes with the target-hidden row (mk,
+        // roped at the same pos by seed_window) instead of the embedding row.
+        // The ring's pos slot stays written (it is the NEXT round's window).
+        self.dev.memcpy_d2d(
+            (self.all_kv.ptr as *mut u8).wrapping_add(wbytes) as *mut c_void,
+            self.mk.ptr,
+            (hd * 4) as usize,
         )?;
 
         self.dev.sparse_attn(
@@ -1408,7 +1424,7 @@ impl<'a> DsparkDev<'a> {
     /// so the steady-state decode path is H2D-free).
     fn ensure_idxs(&mut self, pos: usize) -> Result<()> {
         let (win, bs) = (self.win, self.bs);
-        let n_win = win.min(pos + 1);
+        let n_win = win.min(pos);
         if self.n_win_cached == n_win {
             return Ok(());
         }

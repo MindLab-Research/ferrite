@@ -1897,7 +1897,7 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 - 旧"MTP/投机禁令"已解除（用户 2026-09-12 指令明确要求 dspark block-5 单并发 ≥400）
 
 ### Wave 2 dspark MTP（进行中）的关键定案
-1. **dspark 语义**（host 参考 dspark.rs + sglang 仲裁）：3 个 mtp block 一次 forward 出 5-token block（block_size=5）；MQA 单 kv head；**块内非因果**（所有行共享窗口+块候选集）；行 r 位置 = start_pos+bs+r；Markov head 顺序 5 步 gumbel（u≡1 时退化为 argmax——与 sglang 语义一致）；权重 2401 key 全在（M0 核对）。
+1. **dspark 语义**（host 参考 dspark.rs + sglang 仲裁）：3 个 mtp block 一次 forward 出 5-token block（block_size=5）；MQA 单 kv head；**块内非因果**（所有行共享窗口+块候选集）；行 r 位置 = start_pos+bs+r；Markov head 顺序 5 步 gumbel（u≡1 时退化为 argmax——与 sglang 语义一致）；权重 2401 key 全在（M0 核对）。**官方实现已找到**：`deepseek-ai/DeepSpec`（论文 arXiv:2607.05147，本地 clone `/tmp/DeepSpec`）——`deepspec/modeling/dspark/**` + `deepspec/eval/dspark/**`（`draft_ops.py:32-44` 窗口 append+crop；`common.py:86-97` context 严格 `< anchor_pos`）。六点语义逐条裁定见 `/tmp/official_dspark_ref.md`。
 2. **时序**（host 语义定案，与 sglang 的 gamma+1=6 不同但更优）：主链**单行** forward(anchor) → argmax + hidden(t) → draft(hidden, t) 出 d1..d5 → **verify 5 行 [d1..d5]**（anchor 行走单行路径 = 数值域天然与非 spec 一致，k=1 时输出与非 spec 完全相同）→ accept k = 1 + 最长匹配（d1 vs argmax 免费第一个匹配）。
 3. **数值域铁律**：verify 的 argmax 必须与逐 token 单行 decode 一致——行独立算子多行调用（rmsnorm/hc/rope/sparse_attn/MoE route），**投影与 head 逐行循环**（同 kernel 路径）；M2 优化做多行 GEMV kernel（per-row 独立累加）。
 4. **RoPE 仲裁**：host 参考两处转录 bug 已修（q 的覆盖错乱 + o 的 per-head pos）——以 sglang 生产实现为准（per-token pos，token r 的所有 head 共享 start_pos+bs+r）。
