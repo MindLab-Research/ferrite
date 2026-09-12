@@ -75,3 +75,37 @@ lazy 数学上限 ~145（k_emit × c_row）。400 需要：
 
 1. legacy 臂的 line-6 双字（模型行为 or legacy 特有 bug？）
 2. diff probe 18/232 mismatch 的重新定性（近 tie vs 路径差）
+
+---
+
+## 追加更新（session 末尾的关键发现）
+
+### SWALLOW 第 10 次修复也失败——epoch 冻结在 54
+- 第 9 次 = **幻影**（函数存在但零调用点/kernel/gate——从未实施！）
+- 第 10 次 = 真正实施（kernel :9129 + 接线 :8633 + gate）但 **33,472 hang——epoch 冻结在 54**
+- D1 观测：pos=16/22 所有 rank 同步（1328/1497）→ 第一次 swallowed 步后 epoch 卡死在 54
+- **epoch_dev 是 per-rank 的**（每个 rank 的 staging + ctr_at）——"同步"是行为契约不是硬件事实
+- **ar5_wait_round 的不对称失败**：epoch 大的 rank 挂起，epoch 小的畅通但读陈旧 payload
+- **第 11 次设计**：11.0 加固观测（canary + 单调断言 + rank=）→ 11-B 动态 pad（per-step max——对所有前 10 次的根因免疫）
+
+### tcgen05 两轮对齐修复均失败
+- 第 1 轮：6 个 split body 读点 → 18.8s 长跑但 LEN=0
+- 第 2 轮：4 个新读点（含主嫌疑 :5009）→ **191ms 快速失败——仍 1 misaligned**
+- 需要 compute-sanitizer 定位（唯一能枚举未知 misaligned 的手段）
+
+### L4-9 A/B（最后一个 lazy 优化）
+- 脚本就绪（470 行 7 臂——T1-C 空臂修正 + 噪声地板 + 确定性检查）
+- CNORM_SPLIT 的快速 A/B 正在跑
+
+### 最终性能栈（全部验证）
+| 配置 | 吞吐 |
+|---|---|
+| base | 78.8 |
+| + R2 + MARKOV + LAZY_SDR + VERIFY_FORK + RING_WIN | **91.1（+15.6%）** |
+| + L4-9（如果 A/B 通过）| ~92? |
+| + tcgen05（如果修复）| ~94-95? |
+
+### 400 的最终判定
+- lazy 上限 ~145（accept 5）/ ~97（accept 3）——**不够 400**
+- **batched（SWALLOW）是唯一路径**——10 次修复失败（epoch 冻结是根本问题）
+- **L4/L5 kernel 重写**（"M 进 grid" 化 + tcgen05 + 流水）= 25-35 人日
