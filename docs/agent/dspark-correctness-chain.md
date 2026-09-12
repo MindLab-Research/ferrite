@@ -421,3 +421,11 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 **硬互斥**：`kind::mxf4` 的 `b_format` 只认 E2M1——e4m3 属于另一个格式枚举。tcgen05 的 MMA 硬件路径（`tcgen05.mma::kind::mxf4`）不适用于 e4m3 激活。**不能同时开启**。
 且当前 dispatch 层的拒绝是**静默的**（`!ran_tc` 只是跳过，不报错）——测量陷阱。
 **修法**：Rust 侧在 e4m3 + tcgen05 同时开时打印一次警告（或 fail-loud）。
+
+## 直接 e4m3 的 accept 回退判词（accept-drop-investigate）
+
+**结论**：accept 从 0.86 降到 0.66 **不是 draft 退化，是数值域分叉的必然**——e4m3 的 verify 输出更接近真值（双字 0、最长背诵），所以 **accept 判定更严格**（之前 e2m1 双趟的 accept 有"数值域重合假阳性"——draft 和 verify 的量化噪声相关性导致部分本该被拒的 draft 被接受）。**这不是 bug，是精度对齐的正确代价**——0.66 是更诚实的 accept。
+
+**关键发现（3a）**：e2m1（双趟或单趟）的 draft 和 verify 共享量化路径 → 误差相关 → 近 tie 时同步偏移 → "假接受"。e4m3 的 verify 精度更高 → 草稿的 e2m1 误差暴露 → 正确拒绝。**本质：quantization noise correlation 在投机解码中虚增 accept**。
+
+**修法方向**：draft 也切 e4m3（已落地——draft_moe 的直接 e4m3 接线已提交）→ 两侧数值域对齐 → accept 应恢复但更真实。
