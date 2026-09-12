@@ -251,6 +251,18 @@ fn tap_bf16() -> bool {
     })
 }
 
+/// DRAFT ATTN BF16 gate (`DSV41_DRAFT_ATTN_BF16`, DEFAULT OFF): rounds the
+/// draft block's attention output (after wo_b) back to bf16, matching the
+/// official DSparkBlock's dtype for the tensor hc_post consumes. Read once.
+fn draft_attn_bf16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_DRAFT_ATTN_BF16")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn draft_p3a() -> DraftP3a {
     static F: std::sync::OnceLock<DraftP3a> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -706,6 +718,11 @@ impl<'a> DsparkDev<'a> {
                 .map(|l| cfg.dspark_target_layer_ids.iter().position(|&t| t == l))
                 .collect(),
             unit: None,
+            graph: None,
+            graph_dry_done: false,
+            graph_failed: false,
+            graph_captures: 0,
+            graph_replays: 0,
         };
 
         // `clen` is the compressor-length stand-in `sparse_attn` reads; for the
@@ -863,7 +880,11 @@ impl<'a> DsparkDev<'a> {
             }
             self.project_main_x()?;
             for s in 0..self.cfg.n_mtp_layers {
-                self.seed_window(s, pos_base + j)?;
+                // `slot_dev = false`: this is the COMMIT path, not the per-step
+                // draft, so there is no device ring counter carrying row `j`'s
+                // position (the buffer's slot holds `pos_base - 1`). The host
+                // address is what the block loop always used here.
+                self.seed_window(s, pos_base + j, false)?;
             }
         }
         Ok(())
@@ -1705,6 +1726,16 @@ impl<'a> DsparkDev<'a> {
             dim as i32,
             ol_total as i32,
         )?;
+        // DRAFT ATTN BF16 ROUND-TRIP (DSV41_DRAFT_ATTN_BF16, default OFF): the
+        // official DSparkBlock's attention output (after wo_b) carries the model
+        // dtype (bf16) — the MTP head's hc_post consumes a bf16 tensor. ferrite
+        // computes in f32, so this round-trip aligns the draft's attention
+        // output precision with what the head's weights are calibrated for.
+        // The remaining known misalignment (after tap+hc+MoE); OFF keeps f32.
+        if draft_attn_bf16() {
+            let n = (bs * dim) as i64;
+            self.dev.bf16_roundtrip(self.o.ptr as *mut f32, n)?;
+        }
         Ok(())
     }
 
@@ -2719,7 +2750,21 @@ impl<'a> DsparkDev<'a> {
 
     /// Write the main stream's KV row for the draft block into its window ring
     /// at `pos % win` (dspark.rs::dspark_attention, the `mk` half).
-    fn seed_window(&mut self, s: usize, pos: usize) -> Result<()> {
+    ///
+    /// `slot_dev` selects the destination's derivation:
+    ///
+    /// * `false` — the historical HOST-computed address `window + (pos % win)*hd`
+    ///   as a `cudaMemcpyAsync` node. Fine for a plain launch; a CUDA-graph
+    ///   capture FREEZES that address, so every replay would append the row to
+    ///   the SAME ring slot ("captured but not updated" — the exact failure
+    ///   `dsv41_glue.cu`'s `ring_append_kernel` header records for the main
+    ///   chain). This arm is therefore only ever taken OUTSIDE the recording.
+    /// * `true` — `dsv41_ring_append`, which derives the slot from the DEVICE
+    ///   counter [`Self::seed_slot_ptr`] inside the kernel, so the recorded node
+    ///   is position-independent. Bit-identical to the memcpy arm: same `hd`
+    ///   floats to `window + ((*ctr % win))*hd`, and `ensure_pos_dev` has put
+    ///   exactly this call's `pos` into that counter.
+    fn seed_window(&mut self, s: usize, pos: usize, slot_dev: bool) -> Result<()> {
         let cfg = self.cfg;
         let (dim, hd) = (self.dim, self.hd);
         let rd = cfg.rope_head_dim;
@@ -2749,14 +2794,28 @@ impl<'a> DsparkDev<'a> {
             cfg.norm_eps,
         )?;
         self.rope_at(self.mk.ptr as *mut f32, 1, hd as i32, 1, pos as i32, false)?;
+        debug_assert!(rd > 0);
 
-        // ⚠️ The destination is a HOST-computed address (pos % win). That is
-        // fine for a plain launch but frozen by a CUDA-graph capture; the
-        // fix is `Device::ring_append`, which derives the slot from a device
-        // counter (the draft has no such counter of its own yet).
+        if slot_dev {
+            // The counter holds `pos_dev - 1`; every in-graph caller passes the
+            // anchor's predecessor, and the host shadow is the one that uploaded
+            // it (see `seed_slot_ptr`).
+            debug_assert_eq!(
+                self.pos_dev,
+                Some(pos as i32 + 1),
+                "seed_window(slot_dev): the device ring counter is not at this call's position"
+            );
+            return self.dev.ring_append(
+                self.window[s].ptr as *mut f32,
+                self.mk.ptr as *const f32,
+                self.seed_slot_ptr(),
+                self.win as i32,
+                hd as i32,
+            );
+        }
+
         let slot = pos % self.win;
         let dst = (self.window[s].ptr as *mut f32).wrapping_add(slot * hd);
-        debug_assert!(rd > 0);
         self.dev
             .memcpy_d2d(dst as *mut c_void, self.mk.ptr, hd * 4)
     }
@@ -2885,18 +2944,36 @@ impl<'a> DsparkDev<'a> {
         // The kernel reads `*base` as an `int`, so slot 0 holds the INTEGER's
         // four bytes. Slots `1..=bs` hold `pos + r`: the `pos_rows` array the
         // multi-row rope reads (`DSV41_DRAFT_P3A`'s a4 — see
-        // [`Self::rope_queries`]). Both halves are a function of the same
-        // `pos`, so widening the upload from 4B to `4*(bs+1)` B removes the
-        // launches without adding an upload (the array is never uploaded twice,
-        // and the `rope_mrows` arm refuses any position whose base is not `pos`).
-        let mut buf = Vec::with_capacity((self.bs + 1) * 4);
+        // [`Self::rope_queries`]). Slot `bs + 1` is the window ring's append
+        // position (`pos - 1`, see [`Self::seed_slot_ptr`]). All three are a
+        // pure function of the same `pos`, so widening the upload removes the
+        // per-call H2Ds without adding an upload (the array is never uploaded
+        // twice, and the `rope_mrows` arm refuses any position whose base is
+        // not `pos`).
+        let mut buf = Vec::with_capacity((self.bs + 2) * 4);
         buf.extend_from_slice(&pos.to_le_bytes());
         for r in 0..self.bs {
             buf.extend_from_slice(&(pos + r as i32).to_le_bytes());
         }
+        // The ring append's slot is `(anchor - 1) % win` — `draft_attention`
+        // seeds the block's PREDECESSOR row (see [`Self::seed_window`]), so the
+        // device counter has to carry `pos - 1`, not `pos`.
+        buf.extend_from_slice(&(pos - 1).to_le_bytes());
         self.dev.upload_bytes_at(&self.pos_base, &buf)?;
         self.pos_dev = Some(pos);
         Ok(())
+    }
+
+    /// The DEVICE counter `dsv41_ring_append` derives its slot from: slot
+    /// `bs + 1` of `pos_base`, holding `pos_dev - 1` (the position whose ring
+    /// slot the seed append lands in). Only ever dereferenced by that kernel,
+    /// i.e. on the [`Self::seed_window`] arm that passes `slot_dev = true`.
+    ///
+    /// Its contract is [`Self::ensure_pos_dev`]'s: the value is a pure function
+    /// of `pos_dev`, so the host shadow that skips a redundant upload cannot
+    /// desync it.
+    fn seed_slot_ptr(&self) -> *const std::os::raw::c_int {
+        (self.pos_base.ptr as *const std::os::raw::c_int).wrapping_add(self.bs + 1)
     }
 
     /// The `pos_rows` array [`Self::rope_queries`]'s multi-row form reads: slot

@@ -790,6 +790,22 @@ struct Kernels {
     route_topk: Option<
         unsafe extern "C" fn(*const f32, *const f32, *mut f32, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, f32, c_int, CuStream) -> c_int,
     >,
+    /// GROUPED (permuted) routing, `DSV41_EXPERT_GROUPED`. The expert-centric
+    /// routed GEMMs need one expert's rows contiguous; `route_idx_r[m][topk]` is
+    /// per-(row, slot). `dsv41_route_group` builds the layout (counts / starts /
+    /// per-expert row+slot lists / both directions of the permutation) and the
+    /// two movers apply it to the activation and to the expert output. All three
+    /// are OPTIONAL: a stale `.so` has no entry and the caller keeps the
+    /// per-(row, slot) path, exactly like the other staged-bring-up arms.
+    route_group: Option<
+        unsafe extern "C" fn(*const c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int, *mut c_int, c_int, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
+    route_group_gather: Option<
+        unsafe extern "C" fn(*const u8, *const f32, *mut u8, *mut f32, *const c_int, c_int, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
+    route_group_scatter: Option<
+        unsafe extern "C" fn(*const f32, *mut f32, *const c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     engram_apply: Option<
         unsafe extern "C" fn(*mut f32, *const f32, *const f32, *const f32, *const u8, c_int, c_int, c_int, f32, CuStream) -> c_int,
     >,
@@ -1160,6 +1176,9 @@ impl Device {
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
             ar_reduce: ko!(rt, "dsv41_ar_reduce"),
             route_topk: ko!(rt, "dsv41_route_topk"),
+            route_group: ko!(rt, "dsv41_route_group"),
+            route_group_gather: ko!(rt, "dsv41_route_gather_rows"),
+            route_group_scatter: ko!(rt, "dsv41_route_scatter_rows"),
             compressor_pool: ko!(rt, "dsv41_compressor_pool"),
             compressor_fused: ko!(rt, "dsv41_compressor_fused"),
             engram_apply: ko!(rt, "dsv41_engram_apply"),
@@ -2954,7 +2973,115 @@ impl Device {
         self.kerr(rc, "dsv41_route_topk")
     }
 
-    /// Compressor pooling half (bf16 projections are done by the caller).
+    // ---- GROUPED (permuted) routing (DSV41_EXPERT_GROUPED) ------------------
+    //
+    // The routed expert GEMMs are expert-CENTRIC: one launch covers ONE expert
+    // over a DENSE `[rows, k]` activation block. `route_idx_r[m][topk]` is
+    // per-(row, slot), so the grouped form has to be built before such a launch
+    // can be issued at all. `route_group` builds it; the two movers apply it.
+    // See `kernels/cuda/dsv41_route.cu` for the layout contract and
+    // docs/agent/grouped-routing-design.md for the design.
+
+    /// Build the grouped routing layout from `route_idx_r` (`ids[m][topk]`).
+    /// Outputs (all may be null when the caller wants a subset):
+    /// `counts[n_experts]`, `starts[n_experts + 1]` (exclusive prefix sum),
+    /// `expert_rows`/`expert_slots` (per expert, `m_cap` stride),
+    /// `perm_map[n_assign]` (original -> grouped), `gather_src[n_assign]`
+    /// (grouped -> original), `active[..]` + `n_active` (compact non-empty
+    /// experts). Returns `Ok(false)` when the loaded `.so` has no entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_group(
+        &self,
+        ids: *const i32,
+        counts: *mut i32,
+        starts: *mut i32,
+        expert_rows: *mut i32,
+        expert_slots: *mut i32,
+        perm_map: *mut i32,
+        gather_src: *mut i32,
+        active: *mut i32,
+        n_active: *mut i32,
+        m: i32,
+        topk: i32,
+        n_experts: i32,
+        m_cap: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.route_group else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                ids, counts, starts, expert_rows, expert_slots, perm_map, gather_src, active,
+                n_active, m, topk, n_experts, m_cap, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_route_group")?;
+        Ok(true)
+    }
+
+    /// Gather the activation rows into the grouped order. `src_q`/`src_sc` are
+    /// the dense per-row activation (`[m][row_bytes]`, `[m][sc_row_bytes]`),
+    /// `dst_q`/`dst_sc` the `[n_assign][...]` grouped twin. A grouped position
+    /// whose `gather_src` is `-1` is written as zeros. Either buffer pair may be
+    /// null. Returns `Ok(false)` when the `.so` has no entry point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn route_gather_rows(
+        &self,
+        src_q: *const u8,
+        src_sc: *const f32,
+        dst_q: *mut u8,
+        dst_sc: *mut f32,
+        gather_src: *const i32,
+        n_assign: i32,
+        topk: i32,
+        row_bytes: i32,
+        sc_row_bytes: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.route_group_gather else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                src_q, src_sc, dst_q, dst_sc, gather_src, n_assign, topk, row_bytes, sc_row_bytes,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_route_gather_rows")?;
+        Ok(true)
+    }
+
+    /// Scatter the grouped expert output (row pitch `n`) back to the
+    /// per-(row, slot) layout `[m * topk][n]`, driven by `perm_map`
+    /// (original -> grouped). `perm_map[i] < 0` writes zeros. Returns `Ok(false)`
+    /// when the `.so` has no entry point.
+    pub fn route_scatter_rows(
+        &self,
+        src: *const f32,
+        dst: *mut f32,
+        perm_map: *const i32,
+        n_assign: i32,
+        n: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.route_group_scatter else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(src, dst, perm_map, n_assign, n, self.stream) };
+        self.kerr(rc, "dsv41_route_scatter_rows")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the whole grouped-routing set
+    /// (`dsv41_route_group` + `dsv41_route_gather_rows` +
+    /// `dsv41_route_scatter_rows`). Probed as a SET on purpose: a `.so` carrying
+    /// only the layout builder could not move a single activation, and a caller
+    /// that armed `DSV41_EXPERT_GROUPED` would then measure the ungrouped path
+    /// (the project's #1 measurement-bias trap). `supports_moe_batch`'s
+    /// convention.
+    pub fn supports_route_group(&self) -> bool {
+        self.kernels.route_group.is_some()
+            && self.kernels.route_group_gather.is_some()
+            && self.kernels.route_group_scatter.is_some()
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn compressor_pool(
         &self,

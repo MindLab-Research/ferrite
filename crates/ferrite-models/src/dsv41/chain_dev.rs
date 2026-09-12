@@ -467,6 +467,42 @@ struct Scratch {
     scores_r: DevBuf,   // [m, n_experts] the bf16 gate's output
     route_idx_r: DevBuf, // [m, topk] i32
     route_w_r: DevBuf,   // [m, topk] f32
+    // ---- grouped (permuted) routing, DSV41_EXPERT_GROUPED (default OFF) ----
+    //
+    // The expert-centric routed GEMMs (`dsv41_expert_gemm_e4m3_ext`) take ONE
+    // expert per launch over a DENSE row block, while `route_idx_r` is
+    // per-(row, slot). These buffers hold the expert-major form of that table:
+    // `grp_starts[e] .. grp_starts[e] + grp_counts[e]` is expert e's contiguous
+    // block in the grouped order, `grp_rows`/`grp_slots` say which (row, slot)
+    // each grouped position came from, and `grp_perm` / `grp_src` are the two
+    // directions of the permutation the movers need. Layout contract:
+    // `kernels/cuda/dsv41_route.cu`. Allocated unconditionally so the
+    // allocation graph stays static (a few hundred KB), but written and read
+    // only when the gate is armed and the `.so` carries the symbols.
+    /// `[n_routed]` i32 — assignments (rows) per expert.
+    grp_counts: DevBuf,
+    /// `[n_routed + 1]` i32 — exclusive prefix sum of `grp_counts`;
+    /// `grp_starts[n_routed]` is the total number of routable assignments.
+    grp_starts: DevBuf,
+    /// `[n_routed * grp_cap]` i32 — expert e's j-th grouped row's SOURCE row.
+    grp_rows: DevBuf,
+    /// `[n_routed * grp_cap]` i32 — expert e's j-th grouped row's SOURCE slot.
+    grp_slots: DevBuf,
+    /// `[VERIFY_ROWS * topk]` i32 — original flat assignment -> grouped position.
+    grp_perm: DevBuf,
+    /// `[VERIFY_ROWS * topk]` i32 — grouped position -> original flat assignment.
+    grp_src: DevBuf,
+    /// `[n_routed]` i32 — the experts that own at least one assignment, ascending,
+    /// so the host iterates the ~topk*m live experts instead of all `n_routed`.
+    grp_active: DevBuf,
+    /// `[1]` i32 — the live length of `grp_active`.
+    grp_nactive: DevBuf,
+    /// `[VERIFY_ROWS * topk * dim]` u8 — the gathered e4m3 activation rows, in
+    /// grouped order (each source row appears once per slot that routes to a
+    /// different expert, which is what makes an expert's operand contiguous).
+    grp_xq: DevBuf,
+    /// `[VERIFY_ROWS * topk * dim/32 + 8]` f32 — their per-32-block scales.
+    grp_xsc: DevBuf,
     xq4_r: DevBuf,       // [m, dim] fp4 nibbles (dim/2 bytes/row) or e4m3 (dim)
     xsc4_r: DevBuf,      // [m, dim/32 + 8] f32 scales (either format)
     /// [m, topk, 2*inter] routed gate|up output. The batched expert launchers
@@ -813,6 +849,59 @@ pub(crate) fn act_e4m3_skipped_note() {
              e2m1 activation: the loaded .so has no `dsv41_expert_act_e4m3_cap` \
              (rebuild kernels/cuda: bash build.sh 103a). Any A/B run with this gate ON \
              measures the OLD path."
+        );
+    });
+}
+
+/// `DSV41_EXPERT_GROUPED=1` builds the **grouped (permuted)** routed layout:
+/// the (row, slot) table is turned into expert-major row blocks
+/// (`dsv41_route_group`), the activation rows are gathered into that order
+/// (`dsv41_route_gather_rows`) and the expert output is scattered back to
+/// `[m][topk][n]` (`dsv41_route_scatter_rows`). See
+/// `kernels/cuda/dsv41_route.cu` for the layout contract.
+///
+/// WHY IT EXISTS. The tcgen05 e4m3 expert GEMM
+/// (`dsv41_expert_gemm_e4m3_ext`, `tc5::e4x`) is expert-CENTRIC — ONE launch
+/// covers ONE expert over a DENSE `[rows, k]` activation block — while
+/// `moe_rows`' routing is per-(row, slot). Handing the per-(row, slot) table to
+/// a dense launch would apply slot s's expert to rows that route elsewhere: a
+/// SILENT WRONG ANSWER, which is why that arm declines today (`e4x_tile =
+/// false` in `moe_rows`). The grouped layout is the missing precondition.
+///
+/// DEFAULT OFF, and read ONCE per process like every other gate here (a
+/// per-call getenv is a CUDA-graph capture hazard).
+///
+/// STATUS: the layout and the two movers are implemented and wired (see
+/// `moe_route_grouped`); the per-expert GEMM call itself is NOT yet issued —
+/// see the one-shot notice and docs/agent/grouped-routing-design.md. Until that
+/// lands, this gate changes NO numerics: it builds and gathers the layout and
+/// then leaves the proven per-(row, slot) launches in force. The notice says so
+/// out loud, because an "ON" arm that measures the OLD path is this project's
+/// #1 measurement-bias trap.
+pub(crate) fn expert_grouped() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_GROUPED")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot notice for an ARMED `DSV41_EXPERT_GROUPED`. Two distinct reasons it
+/// can currently be a numeric no-op, both said out loud once:
+///   * the loaded `.so` has no `dsv41_route_*` set (a stale build), or
+///   * it HAS them and the grouped layout is built and used for every
+///     cross-check, but the per-expert dense GEMM is not issued yet, so the
+///     routed half still runs the per-(row, slot) launches.
+/// In both cases an operator who exports the gate must not believe the step now
+/// runs a grouped GEMM.
+pub(crate) fn expert_grouped_skipped_note(reason: &str, so_has_symbols: bool) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_EXPERT_GROUPED is set, but the routed MoE still runs the proven \
+             per-(row, slot) launches: {reason}. Any A/B run with this gate ON measures the OLD \
+             path. (dsv41_route_* set present in .so: {so_has_symbols})"
         );
     });
 }
@@ -2501,6 +2590,37 @@ fn fb(n: usize) -> usize {
     n * 4
 }
 
+/// Grouped-router (DSV41_EXPERT_GROUPED) capacity in EXPERTS. The backbone and
+/// the DSpark layers each carry their own routed-expert count
+/// (`Dsv41Config::moe_config`), and a `Scratch` buffer is allocated once, so the
+/// capacity has to cover whichever of the two is larger. ONE definition on
+/// purpose: the allocation in `DevChain::new` and the launch in
+/// `moe_route_grouped` would otherwise be two copies of the same expression,
+/// and a drift between them is a silent out-of-bounds write.
+fn grp_n_experts(cfg: &Dsv41Config) -> usize {
+    cfg.n_routed_experts
+        .max(1)
+        .max(cfg.dspark_n_routed_experts)
+}
+
+/// Grouped-router capacity in top-k slots per row — the `topk` axis of
+/// `grp_xq`/`grp_xsc` and (times `VERIFY_ROWS`) the per-expert row stride
+/// `m_cap`. Same one-definition rule as [`grp_n_experts`].
+fn grp_topk_max(cfg: &Dsv41Config) -> usize {
+    cfg.n_activated_experts
+        .max(1)
+        .max(cfg.dspark_n_activated_experts)
+}
+
+/// The per-expert row stride of `grp_rows`/`grp_slots`, i.e. the `m_cap`
+/// argument of `dsv41_route_group`. The worst case is every assignment landing
+/// on one expert (`VERIFY_ROWS` rows x `topk` slots); the real router cannot
+/// exceed `VERIFY_ROWS` because it consumes each expert it picks, so this is
+/// headroom against a malformed (duplicate-id) table rather than a real bound.
+fn grp_m_cap(cfg: &Dsv41Config) -> usize {
+    VERIFY_ROWS * grp_topk_max(cfg)
+}
+
 impl<'a> DevChain<'a> {
     pub fn new(
         dev: &'a Device,
@@ -2713,6 +2833,28 @@ impl<'a> DevChain<'a> {
             scores_r: dev.alloc(fb(VERIFY_ROWS * n_exp))?,
             route_idx_r: dev.alloc(4 * VERIFY_ROWS * topk)?,
             route_w_r: dev.alloc(fb(VERIFY_ROWS * topk))?,
+            // ---- grouped (permuted) routing scratch (DSV41_EXPERT_GROUPED) ----
+            // `grp_cap` is the per-expert row capacity of the `grp_rows`/
+            // `grp_slots` lists. The router consumes each expert it picks
+            // (`dsv41_route_topk` writes -INFINITY into the selection score), so
+            // an expert can appear at most once per row and the honest bound is
+            // `m`; `VERIFY_ROWS * topk` is the WORST CASE of a malformed
+            // (duplicate-id) table and costs 55 KB at n_routed = 384. Sized for
+            // the worst case so a malformed table truncates nothing — the
+            // kernel's `j < m_cap` guard is then unreachable belt-and-braces.
+            grp_counts: dev.alloc(4 * n_exp)?,
+            grp_starts: dev.alloc(4 * (n_exp + 1))?,
+            grp_rows: dev.alloc(4 * n_exp * (VERIFY_ROWS * topk))?,
+            grp_slots: dev.alloc(4 * n_exp * (VERIFY_ROWS * topk))?,
+            grp_perm: dev.alloc(4 * VERIFY_ROWS * topk)?,
+            grp_src: dev.alloc(4 * VERIFY_ROWS * topk)?,
+            grp_active: dev.alloc(4 * n_exp)?,
+            grp_nactive: dev.alloc(4)?,
+            // One gathered row per ASSIGNMENT (m * topk), not per row: an
+            // expert's operand block has to be contiguous, and a row's topk
+            // slots normally go to topk different experts.
+            grp_xq: dev.alloc((VERIFY_ROWS * topk * dim).max(8))?, // e4m3 bytes
+            grp_xsc: dev.alloc(fb(VERIFY_ROWS * topk * dim / 32 + 8))?,
             // `dim` bytes per row covers both activation formats: the packed fp4
             // arm uses `dim/2`, the DSV41_EXPERT_ACT_E4M3 arm exactly `dim`.
             xq4_r: dev.alloc((VERIFY_ROWS * dim).max(8))?,
@@ -7873,6 +8015,141 @@ impl<'a> DevChain<'a> {
         }
     }
 
+    /// The m-row collapse + norm pair of [`Self::layer_rows`], as ONE launch when
+    /// `FUSE_B1` (default ON) is armed.
+    ///
+    /// `hc_collapse_norm` has a native `rows` dimension (`grid = rows`, one block
+    /// per row, each with its own `blockDim`-wide reduction) and its phase 1/2
+    /// statements are `hc_collapse` + `rmsnorm` statement for statement, so row
+    /// `r` of the m-row launch is the m = 1 pair's output for row `r` — the same
+    /// argument `layer()`'s `FUSE_B1` fold rests on, and the same kernel decode
+    /// has been running under A/B since then. It also drops the `x_r` round trip.
+    ///
+    /// `pre` is the premix slot the collapse reads — the caller's `pa` for the
+    /// attention block, this layer's attn_pre for the FFN block, exactly as the
+    /// pre-fusion pair did — and the output lands in `s.xn_r` (the `s.x_r`
+    /// intermediate is not needed by the fused form, but the pair's fallback
+    /// still writes it, so the buffer stays live).
+    ///
+    /// `DSV41_BF16_TRUNCATE` rides along: the fused kernel is the only form that
+    /// carries it (as in `layer()`), so with the gate ON the verify chain now
+    /// honours it where the raw pair silently ignored it.
+    ///
+    /// The control flow is `layer()`'s, on purpose. `fused_done` says the fused
+    /// front end already collapsed this block (its EARLY half IS
+    /// `hc_collapse_norm`'s body), which can only be true when `FUSE_B1` armed
+    /// that collapse half — so:
+    ///
+    /// * `FUSE_B1` on + `fused_done` ⇒ nothing to do;
+    /// * `FUSE_B1` on + not done ⇒ `hc_collapse_norm` (the A1 fold);
+    /// * `FUSE_B1` **off** ⇒ the raw pair, UNCONDITIONALLY. This is the arm that
+    ///   makes the combination safe: with no collapse half in the front end it can
+    ///   still report "fused" while having written no `xn_r`, and skipping the
+    ///   pair there would leave the block's normalised input undefined.
+    fn collapse_norm_rows(
+        &mut self,
+        pre: *const f32,
+        w: *const f32,
+        m: usize,
+        fused_done: bool,
+    ) -> Result<()> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        if Self::fuse_b1() {
+            if fused_done {
+                return Ok(());
+            }
+            if Self::hc_verify_fuse() {
+                self.dev.hc_collapse_norm(
+                    self.s.h_r.ptr as *mut f32,
+                    pre,
+                    w,
+                    self.s.xn_r.ptr as *mut f32,
+                    m as i32,
+                    hc as i32,
+                    dim as i32,
+                    cfg.norm_eps,
+                    bf16_truncate(),
+                )?;
+                return Ok(());
+            }
+        }
+        self.dev.hc_collapse(
+            self.s.h_r.ptr as *const f32,
+            pre,
+            self.s.x_r.ptr as *mut f32,
+            m as i32,
+            hc as i32,
+            dim as i32,
+        )?;
+        self.norm_rows(
+            self.s.x_r.ptr as *const f32,
+            w,
+            self.s.xn_r.ptr as *mut f32,
+            m,
+            dim,
+            cfg.norm_eps,
+        )?;
+        Ok(())
+    }
+
+    /// The m-row tail of [`Self::layer_rows`]: wait the front end's LATE half and
+    /// then fold this block's `hc_post` back onto the residual stream.
+    ///
+    /// The join is `layer()`'s contract — the attention (or MoE) just consumed the
+    /// EARLY half, so the LATE half's `comb`/`post` must be visible to the post —
+    /// and is a no-op when no split was issued (A2 off, or the fused front end
+    /// fell back to `hc_mixes`).
+    ///
+    /// `FUSE_C` (default ON) + the rows entry of the segment-C kernel make the
+    /// post ONE launch that writes `h_r` in place instead of `hc_post` into the
+    /// `h2_r` staging buffer + a D2D copy back. Bit-identical for any `rows`: same
+    /// ascending-k `__fmaf_rn` chain over the same operands, and one thread owns
+    /// one four-float column of one row, so `h_r` is both read and written only
+    /// inside that thread's own columns (see `dsv41_hc_post_inplace_rows_kernel`).
+    /// The staging pair stays as the fallback: `FUSE_C=0`, `HC_VERIFY_FUSE=0`, or
+    /// a `.so` that predates the rows symbol.
+    ///
+    /// `x` is this block's producer output (`wo_out_r` for the attention block,
+    /// `moe_out_r` for the FFN block) — the `[m, dim]` rows the post mixes with the
+    /// `hc` residual copies.
+    fn hc_post_rows(&mut self, x: *const f32, m: usize) -> Result<()> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        self.dev.hc_tail_join()?;
+        if Self::fuse_c()
+            && Self::hc_verify_fuse()
+            && self.dev.supports_hc_post_inplace_rows()
+        {
+            self.dev.hc_post_inplace_rows(
+                self.s.h_r.ptr as *mut f32,
+                x,
+                self.s.post_r.as_f32(),
+                self.s.comb_r.as_f32(),
+                m as i32,
+                hc as i32,
+                dim as i32,
+            )?;
+        } else {
+            let hbytes = m * hc * dim * std::mem::size_of::<f32>();
+            self.dev.hc_post(
+                x,
+                self.s.h_r.ptr as *const f32,
+                self.s.post_r.as_f32(),
+                self.s.comb_r.as_f32(),
+                self.s.h2_r.ptr as *mut f32,
+                m as i32,
+                hc as i32,
+                dim as i32,
+            )?;
+            self.dev
+                .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
+        }
+        Ok(())
+    }
+
     /// One multi-row block: the m-row twin of [`Self::layer`].
     ///
     /// The premix threading is `layer()`'s, one step up in width: `pa` indexes the
@@ -7880,109 +8157,150 @@ impl<'a> DevChain<'a> {
     /// `pre_r` (slot 1) which the FFN collapse then consumes, and the FFN mixes
     /// land in `pre2_r` (slot 2) — the next layer's incoming premix. Returns 2.
     ///
-    /// `hc_post` is used in its staging form (`hc_post` + a copy back) rather than
-    /// the single-row `FUSE_C` in-place form: the in-place variant is a one-row
-    /// specialisation, and the staging form is the pair it was verified against.
+    /// The hc chain is `layer()`'s, one step up in width as well:
+    /// `hc_mixes_auto` (or the raw `hc_mixes` when `DSV41_HC_FRONT_ROWS` is off)
+    /// at `rows = m`, then `collapse_norm_rows` / `hc_post_rows`. The three fusions
+    /// (`FUSE_B1`'s `hc_collapse_norm`, `FUSE_C`'s in-place post, the tail split)
+    /// are the ones decode has been running, called with `rows = m`.
     fn layer_rows(&mut self, layer: usize, m: usize, pos_base: i32, pa: usize) -> Result<usize> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
         let ld = &self.w.layers[layer];
-        let hbytes = m * hc * dim * std::mem::size_of::<f32>();
 
         // ---------------- attention block ----------------
         // hc_mixes has a native `rows` dimension (`rows = m`, `hc_dim = hc*dim`),
         // with pre/post/comb row-major per row — the same shape the single-row call
         // uses with rows = 1.
-        self.dev.hc_mixes(
-            self.s.h_r.ptr as *const f32,
-            ld.hc_attn_fn.as_ref().unwrap().as_f32(),
-            ld.hc_attn_scale.as_ref().unwrap().as_f32(),
-            ld.hc_attn_base.as_ref().unwrap().as_f32(),
-            self.s.pre_r.ptr as *mut f32,  // slot 1: this layer's attn_pre
-            self.s.post_r.ptr as *mut f32,
-            self.s.comb_r.ptr as *mut f32,
-            m as i32,
-            (hc * dim) as i32,
-            hc as i32,
-            cfg.hc_sinkhorn_iters as i32,
-            cfg.hc_eps,
-        )?;
-        self.dev.hc_collapse(
-            self.s.h_r.ptr as *const f32,
+        //
+        // `DSV41_HC_FRONT_ROWS` routes this call through `hc_mixes_auto` instead,
+        // i.e. the fused spread front end `layer()` runs, at `rows = m`: the same
+        // `rows` contract plus the EARLY collapse/rmsnorm (so the collapse+norm
+        // pair below is then skipped) and the dots + LATE half on the side stream.
+        // `hc_mixes_auto` falls back to `hc_mixes(rows = m)` when the `.so` or its
+        // gates decline, so the gate is a pure A/B switch on the same maths.
+        //
+        // The T1 fp8 staging stays on `quant_rows` here even on the fused path:
+        // the tail kernel emits it in a SINGLE-ROW layout (`xq[c]`, no row base),
+        // so a multi-row block must not hand it a buffer — the two nulls below.
+        let (hc_nw, hc_pc, hc_out): (*const f32, *const f32, *mut f32) = if Self::fuse_b1() {
+            (
+                ld.attn_norm.as_ref().unwrap().as_f32(),
+                self.premix_row_slot(pa).as_f32(),
+                self.s.xn_r.ptr as *mut f32,
+            )
+        } else {
+            (std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
+        };
+        let hc_done = if Self::hc_front_rows() {
+            self.hc_mixes_auto(
+                self.s.h_r.ptr as *const f32,
+                ld.hc_attn_fn.as_ref().unwrap().as_f32(),
+                ld.hc_attn_scale.as_ref().unwrap().as_f32(),
+                ld.hc_attn_base.as_ref().unwrap().as_f32(),
+                self.s.pre_r.ptr as *mut f32, // slot 1: this layer's attn_pre
+                self.s.post_r.ptr as *mut f32,
+                self.s.comb_r.ptr as *mut f32,
+                hc,
+                dim,
+                cfg.hc_sinkhorn_iters as i32,
+                cfg.hc_eps,
+                hc_nw,
+                hc_pc,
+                hc_out,
+                cfg.norm_eps,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                m,
+            )?
+        } else {
+            self.dev.hc_mixes(
+                self.s.h_r.ptr as *const f32,
+                ld.hc_attn_fn.as_ref().unwrap().as_f32(),
+                ld.hc_attn_scale.as_ref().unwrap().as_f32(),
+                ld.hc_attn_base.as_ref().unwrap().as_f32(),
+                self.s.pre_r.ptr as *mut f32, // slot 1: this layer's attn_pre
+                self.s.post_r.ptr as *mut f32,
+                self.s.comb_r.ptr as *mut f32,
+                m as i32,
+                (hc * dim) as i32,
+                hc as i32,
+                cfg.hc_sinkhorn_iters as i32,
+                cfg.hc_eps,
+            )?;
+            false
+        };
+        // The fused front end did the collapse when it ran (`hc_done`, only
+        // possible with FUSE_B1 armed); otherwise the m-row collapse + norm pair
+        // (`hc_collapse_norm` under the A1 gate). See `collapse_norm_rows` for why
+        // the "FUSE_B1 off" arm must run the pair unconditionally.
+        self.collapse_norm_rows(
             self.premix_row_slot(pa).as_f32(),
-            self.s.x_r.ptr as *mut f32,
-            m as i32,
-            hc as i32,
-            dim as i32,
-        )?;
-        self.norm_rows(
-            self.s.x_r.ptr as *const f32,
             ld.attn_norm.as_ref().unwrap().as_f32(),
-            self.s.xn_r.ptr as *mut f32,
             m,
-            dim,
-            cfg.norm_eps,
+            hc_done,
         )?;
         self.attention_rows(layer, m, pos_base)?;
-        self.dev.hc_post(
-            self.s.wo_out_r.ptr as *const f32,
-            self.s.h_r.ptr as *const f32,
-            self.s.post_r.as_f32(),
-            self.s.comb_r.as_f32(),
-            self.s.h2_r.ptr as *mut f32,
-            m as i32,
-            hc as i32,
-            dim as i32,
-        )?;
-        self.dev
-            .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
+        self.hc_post_rows(self.s.wo_out_r.ptr as *const f32, m)?;
 
         // ---------------- FFN block ----------------
-        self.dev.hc_mixes(
-            self.s.h_r.ptr as *const f32,
-            ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
-            ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
-            ld.hc_ffn_base.as_ref().unwrap().as_f32(),
-            self.s.pre2_r.ptr as *mut f32, // slot 2: this layer's ffn_pre -> next layer
-            self.s.post_r.ptr as *mut f32,
-            self.s.comb_r.ptr as *mut f32,
-            m as i32,
-            (hc * dim) as i32,
-            hc as i32,
-            cfg.hc_sinkhorn_iters as i32,
-            cfg.hc_eps,
-        )?;
-        // the FFN collapses with THIS layer's attn_pre (slot 1), exactly as `layer()`
-        self.dev.hc_collapse(
-            self.s.h_r.ptr as *const f32,
+        let (ffn_nw, ffn_pc, ffn_out): (*const f32, *const f32, *mut f32) = if Self::fuse_b1() {
+            (
+                ld.ffn_norm.as_ref().unwrap().as_f32(),
+                // the FFN collapses with THIS layer's attn_pre (slot 1), exactly
+                // as `layer()` does
+                self.s.pre_r.as_f32(),
+                self.s.xn_r.ptr as *mut f32,
+            )
+        } else {
+            (std::ptr::null(), std::ptr::null(), std::ptr::null_mut())
+        };
+        let ffn_done = if Self::hc_front_rows() {
+            self.hc_mixes_auto(
+                self.s.h_r.ptr as *const f32,
+                ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
+                ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
+                ld.hc_ffn_base.as_ref().unwrap().as_f32(),
+                self.s.pre2_r.ptr as *mut f32, // slot 2: ffn_pre -> next layer
+                self.s.post_r.ptr as *mut f32,
+                self.s.comb_r.ptr as *mut f32,
+                hc,
+                dim,
+                cfg.hc_sinkhorn_iters as i32,
+                cfg.hc_eps,
+                ffn_nw,
+                ffn_pc,
+                ffn_out,
+                cfg.norm_eps,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                m,
+            )?
+        } else {
+            self.dev.hc_mixes(
+                self.s.h_r.ptr as *const f32,
+                ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
+                ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
+                ld.hc_ffn_base.as_ref().unwrap().as_f32(),
+                self.s.pre2_r.ptr as *mut f32, // slot 2: this layer's ffn_pre -> next layer
+                self.s.post_r.ptr as *mut f32,
+                self.s.comb_r.ptr as *mut f32,
+                m as i32,
+                (hc * dim) as i32,
+                hc as i32,
+                cfg.hc_sinkhorn_iters as i32,
+                cfg.hc_eps,
+            )?;
+            false
+        };
+        self.collapse_norm_rows(
             self.s.pre_r.as_f32(),
-            self.s.x_r.ptr as *mut f32,
-            m as i32,
-            hc as i32,
-            dim as i32,
-        )?;
-        self.norm_rows(
-            self.s.x_r.ptr as *const f32,
             ld.ffn_norm.as_ref().unwrap().as_f32(),
-            self.s.xn_r.ptr as *mut f32,
             m,
-            dim,
-            cfg.norm_eps,
+            ffn_done,
         )?;
         self.moe_rows(layer, ld, m)?;
-        self.dev.hc_post(
-            self.s.moe_out_r.ptr as *const f32,
-            self.s.h_r.ptr as *const f32,
-            self.s.post_r.as_f32(),
-            self.s.comb_r.as_f32(),
-            self.s.h2_r.ptr as *mut f32,
-            m as i32,
-            hc as i32,
-            dim as i32,
-        )?;
-        self.dev
-            .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
+        self.hc_post_rows(self.s.moe_out_r.ptr as *const f32, m)?;
 
         // ---- the DSpark tap: `layer()`'s hook, all rows in ONE launch ----
         // The real-commit path (`dspark_spec_step`) hands the ACCEPTED PREFIX of
