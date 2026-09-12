@@ -3191,3 +3191,26 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_SH_EXP_MROWS=1 DSV41_SIDS_WRITEBACK=1
 DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 ar5-hang 修复
 # + 上述所有 lazy 优化（batched 下部分适用）
 ```
+
+## R2b+A4 组合测试结果（66a65632）——lazy 路径的平台确认
+
+**结果**：
+- 零拉丁 ✓，k_acc 不退化（5 5 5 5 3 5...）✓，0 ar5-hang ✓
+- **吞吐 82.6 tok/s**（vs R2-only 82.9——持平，差在噪声内）
+- completion=130 / 1574ms
+
+**判定**：
+- **R2b + A4 的贡献 ≈ 0**（在端到端测量的噪声内）
+- combined-stack-analysis 的预测验证：lazy 优化只动 launch 常数项，不动 k_emit × c_row 乘积
+- **lazy 路径的平台：~83 tok/s**（accept 5 的计数任务）
+
+**lazy 路径的最终格局**：
+| 优化 | 吞吐 | 增量 |
+|---|---|---|
+| Wave 1 基线 | 78.8 | — |
+| + SH_PAIR_M=1 | 78.1 | ~0 |
+| + R2 ATTN_LIN_FUSE | **82.9** | **+6%** |
+| + R2b + A4 | 82.6 | ~0 |
+| **lazy 平台** | **~83** | |
+
+**结论**：lazy 路径已到平台。**400 的唯一路径是 Plan B（SWALLOW batched）**——理论 ~12.5ms → 480 tok/s。
