@@ -734,3 +734,20 @@ ferrite config.rs:210 `norm_eps: f(t, "norm_eps").or(f(t, "rms_norm_eps")).unwra
 ## sinkhorn iters/eps 对照——一致 ✓（20 / 1e-6）
 
 ferrite config.rs:278 `hc_sinkhorn_iters: 20`（默认）= checkpoint 的 `hc_sinkhorn_iters: 20` ✓。`hc_eps: 1e-6`（需确认 ferrite 的默认——:279 的 unwrap_or）。
+
+## hc_post 求和序对照——ferrite 与官方的加法顺序不同（但可能不是根因）
+
+**官方** `model.py:962-966`：
+```python
+y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+```
+PyTorch 的 `sum(dim=2)` 对 hc 维求和——内部可能用 tree reduction 或顺序求和（取决于 GPU kernel 的实现）。
+
+**ferrite** `dsv41_hc_post_inplace_kernel`（`dsv41_kernels.cu:7945+`）：
+```cuda
+float4 acc = xv; acc *= pv;  // post * x 先算
+for k: acc += comb[i][k] * r[k];  // 逐 k 加 comb*residual
+```
+ferrite 是**顺序加**（k=0..n-1 逐个加），PyTorch 的 sum 可能是 tree reduction——**浮点加法不满足结合律**，顺序不同可能产生 ~1 ULP 差异/层。44 层累积的 ULP 差异理论上不足以翻转 argmax（1e-7 量级 vs logit gap ~0.1），**大概率不是根因**。
+
+**判定**：hc_post 求和序是**低风险差异**（ULP 级），不太可能是 acs/ibu 的根因。真正的偏差源更可能是**hc_pre 的 f32 不截断**（每层引入 ~1e-3 的精度差 vs bf16 截断）——44 层累积可能到 ~1e-1 量级，足以翻转近 tie 的 argmax。
