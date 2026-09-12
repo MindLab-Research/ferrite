@@ -7656,3 +7656,22 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **工作量**：ptxas 探针 0.5d + 新 kernel（A/B 对调 + K=32 + 1X scale + cp.async/TMA）2-3d + launcher/parity 1d ≈ **4-5 人日**。
 
 **300 tok/s 路径**：expert 2.0ms → 1.0ms（tcgen05）→ 步 3.0ms ≈ 333 tok/s。
+
+### fuse-migration 定案：7 变体的迁移优先级（2026-09-12 15:00）
+
+**第一约束：ks 与 epilogue 互斥**——当前 1 block 1 warp，ks 个 K-分片跨 block（atomicAdd 部分和）→ 需要整行终值的 epilogue（rope/norm/AR-store）拿不到终值。解法：epilogue 族走 kSwapabWarps=ks（block 内 smem 归约 + 单次 epilogue）。
+
+**迁移优先级**：
+| 变体 | 判定 | 要点 |
+|---|---|---|
+| gemm_fp8_mx | P0（进行中） | 主路径 |
+| mx_rope_norm | **P1** | prologue 冗余整行归约 + intra-warp rope（pair 同 warp 相邻 lane——比 SIMT 的跨 warp 简单！）；ks 必须固定（wq_b 与 idx_wq_b 的 fp8 一致性） |
+| mx2 | **P2** | 行区间分族 + 共享 bf（激活读一次）+ 双 MMA |
+| mx_rope | P3 | 同 P1 的 rope 部分 |
+| AR-v5 store | P4 暂缓 | 需终值 → ks=1 |
+| B1 quant | P5 不迁移 | 默认 OFF + 已负收益 |
+| gemv_bf16_fp8x2 | P6 不迁移 | bf16 router gate 无 fp8 MMA；MIX_GATE 默认 OFF |
+
+**修正**：NORM_FUSE 在 Q 路径（qr→wq_b/idx_wq_b）；kv 的 norm+rope 是独立 rmsnorm_rope_kernel（NR_FUSE），不在 fuse 族内。
+
+**rope pair 的 swapAB 优势**：一 warp 16 行，pair (2i,2i+1) 同 warp 相邻 lane——__shfl_xor_sync(mask,v,4) 即可，无 smem 无 barrier！
