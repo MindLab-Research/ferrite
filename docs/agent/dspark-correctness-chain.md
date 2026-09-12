@@ -139,3 +139,9 @@
 - **官方 ref_inference（3 个 prompt 变体，greedy）全部无 opa**——`引喻失义` 后官方一律 `，以塞忠谏之路也。`。⇒ **opa 是 ferrite 的数值偏差**（不是模型固有）——与用户"必须修复"的判定一致。
 - **官方跑通的坑**（记录）：demo checkpoint 是 fp8 展开（config 要 `expert_dtype:"fp8"`，否则 94k size mismatch）——`~/ref_oracle/config_fp8.json` 已留档。
 - **下一步（按官方判词）**：**首步 logits 对齐**（官方与 ferrite 的分歧从第 1 个 token 就开始了——官方 `《出师表》开头如下` vs ferrite `出师表》全文如下`——少 `《`）⇒ 根因在更早的层，opa 只是尾部表征。优先做 prompt 逐 token 的首步 top-k 对照。
+
+## 用户的金标准锚点（2026-09-12）
+
+**用户（权威）**："之前 162 tok/s，也就是打 git tag 那个版本（`dsv41-6.15ms-162toks`，HEAD=8a5a952）没有乱码。"
+
+⇒ **正确性的判据锚定**：`dsv41-6.15ms-162toks` 的 EAGER 路径是干净的（无 opa/无乱码）。opa 是**这个 tag 之后引入的回归**——二分范围：8a5a952..HEAD 之间的 backbone 改动（不在 spec 路径——EAGER 也中招 ⇒ backbone 共性）。下一步：`git log 8a5a952..HEAD --oneline -- crates/ferrite-models/src/dsv41/chain_dev.rs kernels/cuda/dsv41_kernels.cu kernels/cuda/dsv41_glue.cu` 列出候选提交，按"触及 backbone 数值路径（量化/fp4/AR/head/attention kernel）"过滤，在远端逐个 checkout A/B 出师表（EAGER 模式）。
