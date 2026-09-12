@@ -1732,3 +1732,17 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 | 拉丁出现 | 修复破坏基线 | v1 mrows 与 v2 有未预期的差异 | 立即回退 |
 
 **关键**：这是 accept 战役的最重要测试——如果成功，从 1.214 到 1.5+ 是 +24% 的吞吐提升。
+
+## DRAFT_HEAD_FOLD v1 修复验证结果（ab864a71）——中性
+
+**结果**：零拉丁 ✓，accept mean-k=**1.214**（与修复前完全相同——**不变**）
+
+**判定**：
+- v2 fold 的 ulp 级舍入差异**不足以影响 accept**（近 tie 翻转的假设错误——head 的 logit gap >> ulp 噪声）
+- 修复本身正确（v1 mrows 与 v1 per-row 位级一致）——保留但不是 accept 杠杆
+- **链式失败的根因在别处**：draft 的 attention/MoE 数值路径或其他
+
+**剩余 accept 杠杆**（按优先级）：
+1. S2：TAP_BF16/DRAFT_ATTN 单变量 A/B（未单独测过）
+2. draft-verify program audit 的其他发现（运行中）
+3. S4：paired alignment（draft KV act_quant ↔ backbone ring act_quant 同步）
