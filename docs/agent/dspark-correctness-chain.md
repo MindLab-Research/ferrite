@@ -4996,3 +4996,31 @@ DSV41_V5_LEDGER=1             # D1 观测（每步打印 epoch 增量）
 
 ### 五、本 session 修复的真 bug（9 个）
 1. MARKOV_SLICED 双重偏移 2. LAZY_SDR 承重 H2D 3. S1/D1 DIRECT 双计 4. D2 池饥饿 5. S3 路由锁定 6. A4 单块轮询 7. indexer_topk 烧入 n_pos 8. K2 竞态 9. K1 decline 路径
+
+## 🎉🎉🎉 RING_WIN_FUSE 重验成功（03155cd8）——91.1 tok/s（最终干净栈完成！）
+
+**结果**：
+- 前 61 行正确=True ✓ + 零拉丁 ✓
+- **★ 吞吐 = 91.1 tok/s**（vs 90.8 = +0.3）
+
+**最终干净栈（session 的性能成果）**：
+| 步骤 | 配置 | 吞吐 | 增量 | 累计 |
+|---|---|---|---|---|
+| base | lazy+SH_PAIR+Wave1 | 78.8 | — | — |
+| + R2 | ATTN_LIN_FUSE=1 | 86.8 | +10.2% | +10.2% |
+| + MARKOV | MARKOV_SLICED=1 | 89.6 | +3.2% | +13.7% |
+| + LAZY_SDR | LAZY_SDR=1 | 89.3 | ~0 | +13.3% |
+| + FORK | VERIFY_FORK=1 | 90.8 | +1.5% | +15.2% |
+| **+ RING_WIN** | **RING_WIN_FUSE=1** | **91.1** | **+0.3%** | **+15.6%** |
+
+**最终干净栈的完整 gate 列表**：
+```bash
+DSV41_SPEC=1 DSV41_TIMING=1 DSV41_EXPERT_ACT_E4M3=1
+DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+DSV41_SH_EXP_MROWS=1 DSV41_SH_PAIR_M=1
+DSV41_ATTN_LIN_FUSE=1 DSV41_MARKOV_SLICED=1 DSV41_LAZY_SDR=1
+DSV41_VERIFY_FORK=1 DSV41_RING_WIN_FUSE=1
+DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1
+DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1
+DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3A=1
+```
