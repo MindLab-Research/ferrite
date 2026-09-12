@@ -8035,3 +8035,23 @@ TP4 路径**关闭**。AR 的理论节省（0.66→0.33ms）远小于计算翻�
 3. 计划（docs/agent/expert-tcgen05-plan.md，mxf4 为默认 ✓）
 4. FFI + 派发（mxf4-ffi-dispatch 实施中）
 5. 交接文档（NEXT-SESSION-HANDOVER.md ✓）
+
+### router-gate + batch-b2 定案（2026-09-12 31:00）
+
+**router-gate（gemv_bf16_v2，0.44ms）：无优化空间**
+- ⚠️ 前提纠错：`gemv_bf16_v2_kernel` 是纯 bf16 gate GEMV（非混合核）；混合核 `gemv_bf16_fp8x2` 默认 OFF（0 调用）
+- 48 次的真实构成：40 次 MoE router gate（n=384）+ 8 次 idx_weights（n=32）——两个不同 grid 挤同一符号行，9.1µs 是混合 Med
+- 4 个方向全否决：bf16 MMA（非算力受限，带宽+延迟）/ fp8→swapAB（已关闭）/ 合并调用（route 已融合）/ expert 融合（依赖挡死）
+- 唯一微杠杆：WPR 调参 ≤0.05ms（预期太小）
+
+**batch B=2：现实 1.3-1.5x（非 2x！）**
+- 驱动改动 2-4 人日（~166 调用点 + Scratch batch 维 + KV ring per-row）
+- kernel 缺口：k-row GEMV（M≤8）+ gate/up per-slot 激活（3-5 人日）
+- **关键纠正**：gemv 2.70ms 是 compute-bound → B=2 权重读摊薄但 FMA 不减 → gemv 几乎不获益
+- MoE expert：1.2-1.6x（topk dilution）；AR/调度：近 2x
+- **净聚合 ~1.3-1.5x**——"kernels are all batched-ready" 的注释不准确（dense gemv 并非 batch-ready）
+
+**200 tok/s 最终判定（更确定）**：
+- 单请求无 MTP：**结构性不可达**（tcgen05 上限 215 theoretical，现实 175-195）
+- B=2 聚合：tcgen05 + batch = 227-285 聚合（需 9-14 人日总投入）
+- 唯一单请求 200+ 路径：**可验证投机解码**（需用户仲裁）
