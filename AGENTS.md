@@ -1995,3 +1995,20 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 - qr 的 dump 必须在 quant1 **前**（quant1 原地覆盖 fp8 字节→NaN 假象）
 
 **下一步**（下会话）：①attn_norm 权重的加载验证（远端读 mtp.0.attn_norm 的 checkpoint key 名+形状+前几个值 vs golden 的权重 dump）②rmsnorm kernel 的多行调用（n=bs）复查 ③修复后 accept 应跃升（xn 正常→q/o/h 全链恢复）。
+
+## 2026-09-12 Wave 2 真根因终局：load.rs:925 的 placeholder hack（单元对照一锤定音）
+
+**铁证链**（单元对照 + 手算 + 权重 dump 三角验证）：
+1. 逐行 rmsnorm（n=1）修复后 xn 仍 5.4e37 **逐位不变** → kernel 无辜 → 权重指针指向垃圾
+2. 权重 dump：**attn_norm_w[0]（block0）= 2.25e27 天文数字**（fp8 字节流当 f32）——**block1 正常**（[0.0664,...]）
+3. **load.rs:925**：`take!(p, ld, "main_proj.weight", attn_norm); // placeholder`——**stage 0 的加载把 main_proj 的 spec 覆盖到 attn_norm 字段**（占位 hack）→ attn_norm 指向 main_proj 的 fp8 [5120,15360] → rmsnorm 读 fp8 字节当 f32 → 1e27 爆炸 → q/o/h 全垃圾 → draft 匹配率 6%
+
+**修复**：删掉 placeholder（main_proj 有自己的 w.main_proj* 字段）。修复后：
+- attn_norm_w[0] = [0.0491, 0.0457, 0.0481, ...]（与 checkpoint 逐值一致，仅符号——dump 端 bf16 解码的显示差）
+- **xn post-norm rel=1.86e-03 ✓**（量化噪声级——从 1e38 恢复！）
+- **q_pre_rope rel=1% ✓、q rel=1% ✓**（draft 投影全链恢复）
+- o/h 还差 79%/1.4——**窗口内容差异**（golden 合成 seed vs serve 真实窗口——对照方法固有差异，非 bug）
+
+**spec 首测（根因修复后）**：mean-k=0.120、tok/step=1.12、62ms/步（draft 5.85 + verify 38.68 + commit 0.19 + 主链 ~17）。**新 bug：双字**（"床床前"——**verify 缺 next 行的 KV**：d1 行的 causal window 里 pos+1 槽是空的（主链只 forward t0@pos，next@pos+1 的 KV 不存在）——sglang 的 6 行 verify [anchor(next), d1..d5] 里 anchor 行提供这个 KV。修复中。
+
+**方法论定论（用户"单元测试比较每个单元"的完全正确性）**：11 个"终局定位"里只有单元对照+手算+权重三角验证是真定位。审计推理（猜嫌疑）浪费了其中 9 次。教训：**数值问题用数值对照定位，一行手算胜过十轮审计**。
