@@ -1175,3 +1175,16 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 2. HC_VERIFY_FUSE 交互分析（subagent 跑中）
 3. bisect 定位（subagent 跑中）
 4. batched verify 400 测试（subagent 准备中）
+
+## 🎉 基线恢复成功（db9493bd，2026-09-12 晚）
+
+**结果**：LEN=120，双字=4，**拉丁=[]（零拉丁 ✓✓✓）**，accept mean-k=1.022，步时 19-34ms。
+
+**修复**：`DSV41_HC_VERIFY_FUSE` 默认 ON→OFF（bisect-baseline 确认破坏点 = 050c7fd：fused 形态把 BF16_TRUNCATE 首次带进 verify 链，与后续 P0 系列改动交互破坏基线）。
+
+**意义**：HEAD 的默认行为 = 历史路径（零拉丁）✓。P0 系列的所有 gate（TAP_INPUT/SEED_POS/DRAFT_BF16_DOMAIN/DRAFT_ATTN_BF16）保持默认 OFF。
+
+**下一步（400 路径）**：
+1. batched verify + 全 mrows + tcgen05 + draft P3c → 步时 ≤10ms
+2. accept 测试（P0-3+P1-5 with 修复后基线）
+3. 组合：4 tok/step / 0.010 = 400 tok/s
