@@ -2623,3 +2623,35 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 **用户的 400 目标的可能含义**：
 - 如果测试任务 = 数字/模板/代码（高 accept）：400 可达 ✓
 - 如果测试任务 = 对话/散文（低 accept）：400 不可达 ✗（模型限制，非工程问题）
+
+## Session 综合状态（持续更新中）
+
+### 3 个运行中的 subagent
+1. **tcgen05-result-verify**：验证对齐守卫修复是否生效（0 misaligned 的判定）
+2. **sh-pair-parity-fix-2**：修复 SH_PAIR template<M> 的 36 项 parity 失败（phase-1 aq 数值差异）
+3. **dialogue-quality-analysis**：分析对话任务的输出质量（EAGER 对照已确认是模型行为）
+
+### 已完成的关键测试（今天）
+| 测试 | 结果 | 意义 |
+|---|---|---|
+| Wave 1（HC 融合+mrows） | ✅ 零拉丁，步时改善 | EAGER 融合迁移兑现 |
+| Wave 1 长文本（数字） | ✅ 零拉丁，k_acc=5 | accept 天花板是 5 |
+| Wave 1 长文本（出师表） | ✅ 零拉丁，k_acc=1.2 | 出师表基线 |
+| 中等熵（对话） | ✅ k_acc=0.964 | 对话 accept 基线 |
+| EAGER 对照（对话） | ✅ 77% 重复率 | 质量退化 = 模型行为 |
+| SH_PAIR_M=1 冒烟 | ✅ 零拉丁，k_acc 相同 | template<M> 安全 |
+| SH_PAIR parity | ❌ 36 failed | phase-1 数值问题 |
+| tcgen05 冒烟 | ? 0 misaligned | 可能修复了 |
+| SWALLOW + ar5 修复 | ❌ gap 3 | Plan A+C 需验证 |
+
+### 关键架构发现
+- **accept 天花板 = 5**（不是 1.214）——任务依赖
+- **质量退化 = 模型行为**（不是 spec-decode）——EAGER 也退化
+- **sglang 硬锚点**：verify=7.3ms（实测），400 是乘积约束
+- **arch-floor**：L0=37.31 → L5=8-9ms
+- **ar5-hang 根因**：四臂 barrier 不对称 + per-rank 决策
+
+### 400 的可达性（任务依赖）
+- **数字/模板（accept 5）**：需要步时 ≤15ms——**可达**（SH_PAIR+SWALLOW+tcgen05）
+- **出师表（accept 1.2）**：需要步时 ≤5.5ms——**不可达**（低于 L5 地板）
+- **对话（accept 0.96）**：需要步时 ≤5ms——**不可达**（模型行为限制）
