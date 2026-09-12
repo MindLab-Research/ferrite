@@ -53,6 +53,16 @@ if [ -n "${FERRITE_NO_FAST_MATH:-}" ]; then FAST_MATH_FLAG=""; fi
 #                 opt OUT with DSV41_BUILD_TCGEN05_MXF4=0|no|false|off|<empty>
 #   mxf8f6f4 arm  opt-in    — DSV41_BUILD_TCGEN05_MXF8F6F4=<nonempty>
 #                 -> -DDSV41_TCGEN05_GATEUP_SKELETON=1
+#   e4m3 arm      DEFAULT ON — -DDSV41_TCGEN05_GATEUP_E4M3_SKELETON=1
+#                 -> symbol dsv41_expert_tcgen05_gate_up_e4m3
+#                 opt OUT with DSV41_BUILD_TCGEN05_E4M3=0|no|false|off|<empty>
+#                 The e4m3 arm is the (b) path's e4m3-activation sibling (gated
+#                 at runtime by DSV41_EXPERT_TCGEN05_E4M3, default OFF): same
+#                 build-vs-runtime split as the mxf4 arm, and for the same
+#                 reason — an opt-in macro makes `supports_expert_tcgen05_e4m3()`
+#                 false in a stock .so, so every A/B run with the gate ON would
+#                 silently measure the e4m1/GEMV path instead (the project's #1
+#                 measurement-bias trap).
 # The two macros are independent by design (dsv41_experts_mxf4.cu:3427 — nested
 # namespaces `tc5` vs `tc5::mxf4`), so enabling one can never change the other.
 #
@@ -93,6 +103,15 @@ esac
 if [ -n "${DSV41_BUILD_TCGEN05_MXF8F6F4:-}" ]; then
     SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_SKELETON=1)
 fi
+# e4m3 arm (the (b) path's e4m3-activation sibling): DEFAULT ON, same opt-out
+# rule as the mxf4 arm (0/no/false/off/empty disables).
+# ⚠️ The two arms are INDEPENDENT by design (nested namespaces `tc5::mxf4` vs
+# `tc5::e4` in the same TU), so enabling or disabling one can never change the
+# other's codegen or symbols.
+case "${DSV41_BUILD_TCGEN05_E4M3-1}" in
+    0|no|false|off|"") ;;
+    *) SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_E4M3_SKELETON=1) ;;
+esac
 # Build stamp: the Rust side refuses to load a .so built from another
 # revision (user rule: 严禁组合不同版本). Use the git revision of THIS tree.
 BUILD_ID="$(git -C "$(dirname "$0")" rev-parse HEAD 2>/dev/null || echo unknown)"
@@ -120,5 +139,5 @@ echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]} (build_id ${BUILD_ID})"
 # LAST statement of the script would make an otherwise successful build exit 1
 # (scripts/verify_graph_ab.sh:151-161 already had to work around exactly that).
 [ ${#SKELETON_FLAGS[@]} -gt 0 ] && \
-    echo "  skeleton flags: ${SKELETON_FLAGS[*]} (gated blocks are COMPILED IN; each still needs its runtime env gate: DSV41_EXPERT_TCGEN05[_MXF4], plus DSV41_MOE_BATCH on and DSV41_EXPERT_ILV=0 for the routed mxf4 arm)" \
+    echo "  skeleton flags: ${SKELETON_FLAGS[*]} (gated blocks are COMPILED IN; each still needs its runtime env gate: DSV41_EXPERT_TCGEN05[_MXF4] for the e2m1 arm, DSV41_EXPERT_TCGEN05_E4M3 for the e4m3 arm, plus DSV41_MOE_BATCH on and DSV41_EXPERT_ILV=0 for either routed mxf4 arm)" \
     || true

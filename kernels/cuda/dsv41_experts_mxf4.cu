@@ -4412,3 +4412,739 @@ extern "C" int dsv41_expert_tcgen05_gate_up_mxf4(
 }  // namespace tc5
 
 #endif  // DSV41_TCGEN05_GATEUP_MXF4_SKELETON
+
+// =============================================================================
+// PHASE 1b — tcgen05 e4m3-ACTIVATION gate/up arm (SKELETON)
+// =============================================================================
+// WHY THIS ARM (the (b) task: "give the tcgen05 skeleton an e4m3 activation")
+// -----------------------------------------------------------------------------
+// The routed experts' activation can be quantised two ways, and until now only
+// one of them could reach a tensor core on this part:
+//   * e2m1 PACKED, consumed by `kind::mxf4` (the tc5::mxf4 arm above) -- the
+//     cheap form: both operands packed, the TMA lands straight on the canonical
+//     units, kRing=8, no expansion pass anywhere;
+//   * e4m3, 1 byte per value (`DSV41_EXPERT_ACT_E4M3`) -- the OFFICIAL
+//     `fp4_gemm` activation (`act_quant(e4m3, block=32)`), 3 mantissa bits and a
+//     wide exponent instead of e2m1's single mantissa bit, i.e. exactly the
+//     numeric safety margin a 5-row verify pass is sensitive to.
+// `kind::mxf4` is e2m1 x e2m1 and cannot consume e4m3, so the Rust dispatch had
+// to REFUSE the tcgen05 arm whenever the e4m3 activation was armed
+// (`chain_dev.rs`: `let tcgen05 = !e4m3 && ...`). This arm removes that
+// refusal: the SAME swapAB gate/up mapping, with an e4m3 B operand.
+//
+// -----------------------------------------------------------------------------
+// THE KIND IS `kind::mxf8f6f4`, **NOT** `kind::f8f6f4`  (ptxas-verified)
+// -----------------------------------------------------------------------------
+// The task that asked for this arm named `tcgen05.mma ... kind::f8f6f4` (the
+// FP8 x FP4 mixed kind). That spelling exists, but it CANNOT be block-scaled:
+//     tcgen05.mma.cta_group::1.kind::f8f6f4.block_scale.scale_vec::1X
+//       -> ptxas: "Modifier '.kind::f8f6f4' cannot be combined with modifier
+//                  '.block_scale'"
+// Without `.block_scale` the MMA sees ONE global scale, so the checkpoint's
+// per-(row, k/32) UE8M0 factors cannot be fed to it -- the result would not be
+// the checkpoint's quantisation at all. The block-scaled FP8 x FP4 kind is the
+// MX variant, and it is what this arm uses:
+//     tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X   [OK]
+// Probed on this host with nvcc 13.3 `-gencode arch=compute_103a,code=sm_103a`
+// (the same form the tc5 arm above and Phase 0's tests_tcgen05_mxf8f6f4_1x.cu
+// use). Also probed, all REJECTED: `kind::mxf8f6f4` + `scale_vec::2X` ("cannot
+// be combined"), `kind::mxf4` + `scale_vec::1X`, and `kind::mxf4nvf4` +
+// `scale_vec::1X`. Consequence: for mxf8f6f4 the scale vector is FORCED to 1X,
+// i.e. K = 32 elements per MMA and one e8m0 byte per 32-element block.
+//
+// -----------------------------------------------------------------------------
+// WHAT DIFFERS FROM THE tc5::mxf4 ARM (everything else is reused verbatim)
+// -----------------------------------------------------------------------------
+//  (1) KIND / FORMATS: kind::mxf8f6f4 + scale_vec::1X, idesc a_format = 5
+//      (MXF8F6F4Format::E2M1 -- the fp4 WEIGHT) and b_format = 0
+//      (MXF8F6F4Format::E4M3 -- the activation).  ** NOT MXF4Format::E2M1 = 1 **
+//      -- the two enums number E2M1 differently (CUTLASS mma_sm100_desc.hpp:
+//      MXF4Format::E2M1 = 1, MXF8F6F4Format::E2M1 = 5). Expected idesc for this
+//      geometry (M=128, N=8, sf ids 0): 0x08820280.
+//  (2) K PER ATOM: 32 instead of 64 (1X vs 2X), so `dim=5120` is 160 MMAs
+//      instead of 80 and the SF sub-column selector is `block & 3` instead of
+//      `2 * (atom & 1)`. The SF *word* layout, the SF column density, the TMEM
+//      budget and the whole SF prologue are UNCHANGED -- one 32-bit word still
+//      holds four consecutive checkpoint e8m0 bytes and still occupies one
+//      column per 32-row group (tc5::mxf4's note: "an atom pair consumes one SF
+//      word per row group exactly like a quad does").
+//  (3) THE fp4 OPERAND IS UNPACKED -- the one real cost of this arm, and it is
+//      FORCED by the hardware, not chosen. In MXF8F6F4Format the fp4 type is the
+//      "unpacksmem" one (CUTLASS: float_e2m1_unpacksmem_t -> MXF8F6F4Format::
+//      E2M1 = 5, while the packed float_e2m1_t -> MXF4Format::E2M1 = 1), so each
+//      e2m1 element needs its own byte in smem. The TMA cannot perform that
+//      expansion (the checkpoint packs 2 fp4 per byte), so every ring slot needs
+//      BOTH the raw packed staging area the TMA fills AND the unpacked operand
+//      the MMA reads, plus one expansion pass between them.
+//      => smem per unit of K is 3x the tc5::mxf4 arm's, so kRing is 6, not 8:
+//         in-flight packed bytes (kRing-1)*kARawBytes = 5*2048 = 10 KiB per CTA
+//         against 7*4096 = 28 KiB for tc5::mxf4. THAT is the price of the e4m3
+//         margin on this part, and it is the first number to measure.
+//  (4) B (the activation) is e4m3, one byte per value, and needs NO expansion:
+//      the TMA lands its 16-byte chunks directly on the canonical units.
+//
+// INVARIANT -- `act` FOR THIS ARM IS `dim` BYTES PER ROW (one e4m3 byte per
+// value, the `dsv41_quant_fp8` / `act_quant(e4m3, block=32)` output), NOT
+// `dim/2` packed bytes. `act_scale` is `[dim/32]` f32 powers of two, exactly as
+// for tc5::mxf4 (the kernel converts them to e8m0). A caller that hands over the
+// e2m1 row instead would have half of its bytes decoded as garbage: silent wrong
+// values, never a fault. The kernel cannot detect it, which is WHY this arm has
+// its own SYMBOL and its own runtime gate (`DSV41_EXPERT_TCGEN05_E4M3`) rather
+// than a trailing `act_e4m3` argument on the tc5::mxf4 entry point: a stale .so
+// would silently ignore a trailing argument, whereas a missing symbol is loud.
+//
+// -----------------------------------------------------------------------------
+// [OPEN -- must be settled on an sm_103a GPU before this arm is trusted]
+// -----------------------------------------------------------------------------
+//  * THE BYTE ARRANGEMENT INSIDE THE 16-BYTE CORE MATRIX of the unpacked fp4
+//    operand has TWO plausible readings, and this arm follows the project's
+//    existing prior art (tc5_unpack_a / ph0_parity_kernel: "one e2m1 element per
+//    BYTE", element 2i in the low nibble of packed byte i).
+//    The other reading comes from the CUDA driver's own description of the TMA
+//    data type this format maps to (cuda.h: CU_TENSOR_MAP_DATA_TYPE_16U4_
+//    ALIGN16B copies "16 x U4 packed values ... There are 8 byte gaps between
+//    every 8 byte chunk"), i.e. the 16 nibble-packed bytes in the LOW half of the
+//    16-byte core matrix and a gap in the high half. Both readings agree on
+//    DENSITY (32 bytes per 32-element row -- so the smem budget above holds
+//    either way) but they disagree on WHERE the nibbles sit. Only a numeric check
+//    can pick one; run Phase 0 for this arm too before believing any number.
+//  * [TODO-3 analogue] the 2D TENSOR form (a TMA tensor map with
+//    CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B) writes the unpacked layout DIRECTLY:
+//    no raw staging, no expansion pass, 2/3 less a_op smem, kRing back to ~9 and
+//    16 KiB in flight. It needs a host-side tensor map per weight plane, i.e. the
+//    launch arguments would start depending on the routing -- an ARCHITECTURE
+//    decision (the current design deliberately stays on plain 1D bulk + raw
+//    pointers), so it is flagged here and NOT taken.
+// =============================================================================
+
+#ifdef DSV41_TCGEN05_GATEUP_E4M3_SKELETON
+
+#include <cstdlib>  // getenv (launcher gate)
+
+namespace tc5 {
+namespace e4 {
+
+// ------------------------------------------------------------------ geometry
+constexpr int kMTile = 128;  // MMA M, pinned by the instruction
+constexpr int kNTile = 8;    // minimum legal N (mxf8f6f4: [8,256] step 8);
+                             // only column 0 carries the token
+constexpr int kKStep = 32;   // one 1X scale block == one MMA (dense K32, k_size = 0)
+constexpr int kAtomBytes = kKStep;       // 32 UNPACKED fp4 bytes per row per atom
+constexpr int kPackK = 32;   // K elements staged per ring slot (== kKStep)
+constexpr int kNStep = kPackK / kKStep;  // MMAs issued per slot (== 1)
+constexpr int kRing = 6;     // ring depth. 3x the smem per unit of K (see (3)
+                             // above) caps this at 6 inside the 48 KiB window.
+constexpr int kThreads = 128;  // 4 warps == the 4 TMEM lane partitions
+// Descriptor strides. A K=32 atom of the UNPACKED fp4 operand is 32 bytes per
+// row = TWO 16-byte core chunks, so the canonical interleave is
+//     unit16(m, kb) = (m % 8) + 8*kb + 16*(m / 8)          kb in {0,1}
+// => LBO (K-chunk stride) = 8 units = 128 B, SBO (8-row-group stride) =
+// 16 units = 256 B. Numerically identical to both other arms: a K=64 PACKED
+// atom and a K=32 UNPACKED atom both carry 32 bytes per row.
+constexpr int kLboBytes = 128;
+constexpr int kSboBytes = 256;
+constexpr int kTmemCols = 256;  // power of two >= 8 + 160 + 40 = 208
+constexpr int kMaxDim = 5120;   // gate/up dim; sizes the SF staging chunk
+constexpr int kSfWords = kMaxDim / 32 / 4;  // 4 block scales per 32-bit word = 40
+constexpr int kSfaCols = 4 * kSfWords;      // 160 (one column per (quad, row-group))
+constexpr int kSfbCols = kSfWords;          // 40  (one column per quad, N=8 = 1 group)
+constexpr int kSfChunkRows = 32;            // one 32-row group staged at a time
+
+// Per-ring-stage operand bytes. A: 128 rows x 32 unpacked bytes. The raw staging
+// the TMA fills is the PACKED source of the same atom: 128 rows x 16 bytes.
+// B: 8 rows x 32 e4m3 bytes (only row 0 is live; rows 1..7 are zeroed once).
+constexpr int kAbBytes = kMTile * kAtomBytes * kNStep;      // 4096 (A operand smem)
+constexpr int kARawBytes = kMTile * (kPackK / 2) * kNStep;  // 2048 (packed staging)
+constexpr int kBbBytes = kNTile * kAtomBytes * kNStep;      //  256 (B operand smem)
+// TMA transaction bytes for one ring stage: the whole packed A atom + the
+// 32-byte B row (ONE activation row). Every copy is 16 B.
+constexpr unsigned kStageTxBytes =
+    (unsigned)(kMTile * (kPackK / 2) * kNStep + kPackK * kNStep);  // 2048 + 32 = 2080
+// SF staging chunk: ONE 32-row group of A scales (32 * dim/32 contiguous bytes in
+// the pool) + the whole B scale row. Same shape and same size as both other arms
+// -- the scale format and the SF column density did not change.
+constexpr int kSfAChunkBytes = kSfChunkRows * (kMaxDim / 32);  // 32 * 160 = 5120
+constexpr int kSfBChunkBytes = kNTile * (kMaxDim / 32);        //  8 * 160 = 1280
+
+struct Smem {
+    // ---- ring: raw packed staging (what the TMA lands) + the unpacked operand
+    // (what the MMA reads). The expansion pass in the ring body converts one
+    // into the other; there is no way around the second buffer (see (3)).
+    alignas(1024) uint8_t a_raw[kRing][kARawBytes];
+    alignas(1024) uint8_t a_op[kRing][kNStep][kAbBytes];
+    // b_op is written ONLY by the TMA (row 0) and the one-time zeroing (rows
+    // 1..7), so the MMA can read it the moment the tx-count retires.
+    alignas(128) uint8_t b_op[kRing][kNStep][kBbBytes];
+    alignas(1024) uint8_t sf_stage[kSfAChunkBytes > kSfBChunkBytes ? kSfAChunkBytes
+                                                                  : kSfBChunkBytes];
+    alignas(8) uint64_t tma_bar[kRing];  // TMA tx-count completion, one per slot
+    alignas(8) uint64_t mma_bar[kRing];  // tcgen05.commit retirement, one per slot
+    uint32_t tmem_base;
+};
+
+// The 48 KiB static window. Same rule as both other arms: a tuning change that
+// trips this fails the BUILD instead of failing at launch. Going deeper needs
+// dynamic smem + an INIT-TIME (never capture-time) cudaFuncSetAttribute -- a
+// different risk class, see the DEPTH note in tc5::mxf4.
+static_assert(sizeof(Smem) <= 48 * 1024, "tc5::e4 ring does not fit static smem");
+static_assert(kNTile + kSfaCols + kSfbCols <= kTmemCols, "tc5::e4 TMEM budget overflow");
+// e4_expand_a maps one (row, K_STEP) item to one thread; keep the identity
+// explicit so a kThreads change cannot silently leave rows unexpanded.
+static_assert(kMTile == kThreads, "tc5::e4 expansion assumes one A row per thread");
+// sizeof at the shipped constants: a_raw 12288 + a_op 24576 + b_op 1536 +
+// sf_stage 5120 + barriers 96 + tmem_base ~= 43620 B of the 48 KiB window.
+
+// ------------------------------------------------------------------- helpers
+// --- the permute segment, expressed as an ADDRESS -----------------------------
+// Byte offset of the canonical 16-byte unit holding (row, kb) of a K=32 atom.
+// One helper serves BOTH operands (A uses all 16 row groups, the N=8 B operand
+// has a single 8-row group so its (row >> 3) term is identically 0 -- which is
+// also why the hardware ignores SBO at N=8).
+__device__ __forceinline__ int e4_off(int row, int kb) {
+    return 16 * ((row & 7) + 8 * kb + 16 * (row >> 3));
+}
+
+// --- SMEM operand descriptor, SWIZZLE_NONE K-major, 16-byte units ------------
+// Identical in form and value to both other arms' (kLboBytes/kSboBytes above).
+// Kept local so this arm's constants cannot drift through a macro switch.
+__device__ __forceinline__ uint64_t e4_make_desc(uint32_t smem_base) {
+    const uint64_t start = (uint64_t)((smem_base >> 4) & 0x3FFFu);
+    const uint64_t lbo = (uint64_t)((kLboBytes >> 4) & 0x3FFFu);  // 8
+    const uint64_t sbo = (uint64_t)((kSboBytes >> 4) & 0x3FFFu);  // 16
+    return start | (lbo << 16) | (sbo << 32) | ((uint64_t)1 << 46);  // version = 1
+}
+
+// --- instruction descriptor, block-scaled, kind::mxf8f6f4 --------------------
+// a_format = 5 (MXF8F6F4Format::E2M1, the fp4 WEIGHT, UNPACKED smem form),
+// b_format = 0 (MXF8F6F4Format::E4M3, the activation).  ** NOT 1 ** -- 1 is
+// MXF4Format::E2M1, the value tc5::mxf4 uses for its PACKED operands; the two
+// enums are not interchangeable. Bit layout is the one the file header documents
+// at :58-67. For this geometry (M=128, N=8, sf ids 0) the value is 0x08820280:
+//   b_sf_id 0 | a_format 5<<7 | b_format 0<<10 | n_dim 1<<17 | scale_format
+//   1<<23 (UE8M0, forced) | m_dim 8<<24 | a_sf_id 0 | k_size 0.
+__device__ __forceinline__ uint32_t e4_make_idesc(uint32_t a_sf_id, uint32_t b_sf_id) {
+    uint32_t d = 0;
+    d |= (b_sf_id & 0x3u) << 4;
+    d |= 5u << 7;   // a_format = E2M1 (MXF8F6F4Format, the unpacked fp4 weight)
+    d |= 0u << 10;  // b_format = E4M3 (MXF8F6F4Format, the activation)
+    d |= (uint32_t)(kNTile >> 3) << 17;
+    d |= 1u << 23;  // scale_format = UE8M0 (forced, == the checkpoint format)
+    d |= (uint32_t)(kMTile >> 4) << 24;
+    d |= (a_sf_id & 0x3u) << 29;
+    d |= 0u << 31;  // k_size = 0 -> dense K32 for mxf8f6f4
+    return d;
+}
+
+// --- the MMA (byte-identical to the tc5 arm's tc5_mma / Phase 0's) ------------
+__device__ __forceinline__ void e4_mma(uint32_t d_tmem, uint64_t a_desc, uint64_t b_desc,
+                                       uint32_t idesc, uint32_t sfa_tmem, uint32_t sfb_tmem,
+                                       uint32_t enable_d) {
+    asm volatile(
+        "{\n\t.reg .pred p;\n\t"
+        "setp.ne.b32 p, %6, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X "
+        "[%0], %1, %2, %3, [%4], [%5], p;\n\t}" ::"r"(d_tmem),
+        "l"(a_desc), "l"(b_desc), "r"(idesc), "r"(sfa_tmem), "r"(sfb_tmem), "r"(enable_d)
+        : "memory");
+}
+
+// --- TMEM access (same spellings both other arms verified) --------------------
+__device__ __forceinline__ void e4_st_x1(uint32_t taddr, uint32_t w0) {
+    asm volatile("tcgen05.st.sync.aligned.32x32b.x1.b32 [%0], {%1};" ::"r"(taddr), "r"(w0)
+                 : "memory");
+}
+__device__ __forceinline__ void e4_ld_x8(uint32_t taddr, uint32_t* v) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {%0,%1,%2,%3,%4,%5,%6,%7}, [%8];"
+        : "=r"(v[0]), "=r"(v[1]), "=r"(v[2]), "=r"(v[3]), "=r"(v[4]), "=r"(v[5]), "=r"(v[6]),
+          "=r"(v[7])
+        : "r"(taddr)
+        : "memory");
+}
+
+// --- TMA (1D bulk), 16 bytes per copy ----------------------------------------
+// Same instruction and the same 2D-tensor [TODO-3] as both other arms; only the
+// SOURCE offsets change (16 B per weight row per atom -- a K=32 atom is 16
+// PACKED bytes -- and 32 B per activation row). Requirements: 16-byte alignment
+// on both sides, size % 16 == 0.
+__device__ __forceinline__ void e4_bulk_g2s(void* smem_dst, const void* gmem_src, unsigned bytes,
+                                            uint64_t* bar) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1], %2, [%3];" ::"r"((unsigned)__cvta_generic_to_shared(smem_dst)),
+        "l"(gmem_src), "r"(bytes), "r"((unsigned)__cvta_generic_to_shared(bar))
+        : "memory");
+#else
+    (void)smem_dst; (void)gmem_src; (void)bytes; (void)bar;
+#endif
+}
+
+// Arms the byte count one stage's copies will retire, and performs the single
+// arrival the barrier was initialised with. MUST be issued before the copies it
+// covers (the phase completes on arrivals == 1 AND tx count == 0).
+__device__ __forceinline__ void e4_mbar_expect_tx(uint64_t* bar, unsigned bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
+                     (unsigned)__cvta_generic_to_shared(bar)),
+                 "r"(bytes)
+                 : "memory");
+#else
+    (void)bar; (void)bytes;
+#endif
+}
+
+// --- the packing-free re-layout of the fp4 operand ---------------------------
+// NOTE ON SEMANTICS: this is a NIBBLE->BYTE EXPANSION, not a copy. The canonical
+// operand wants one e2m1 element per byte (the "unpacksmem" form); the checkpoint
+// stores two per byte. The widening is lane-parallel because it is only a
+// byte-level shuffle:
+//   p = [b0 b1 b2 b3]  (b = packed byte, low nibble = even element)
+//   ev = p & 0x0F0F0F0F  = [e0 e2 e4 e6]   (even elements)
+//   od = (p >> 4) & mask = [e1 e3 e5 e7]   (odd elements)
+//   out bytes [e0 e1 e2 e3] = __byte_perm(ev, od, 0x5140)
+//   out bytes [e4 e5 e6 e7] = __byte_perm(ev, od, 0x7362)
+// A 16-byte (uint4) load therefore becomes 8 u32 halves -> 32 unpacked bytes =
+// two uint4, i.e. exactly the two K=32 core chunks of one A row. Byte-identical
+// to tc5_unpack_a / tc5_expand / tc5_ilv_* above (kept local to this arm so the
+// two copies cannot drift through a macro switch).
+__device__ __forceinline__ void e4_expand(uint32_t p, uint32_t& ev, uint32_t& od) {
+    ev = p & 0x0F0F0F0Fu;
+    od = (p >> 4) & 0x0F0F0F0Fu;
+}
+__device__ __forceinline__ uint32_t e4_ilv_lo(uint32_t ev, uint32_t od) {
+    return __byte_perm(ev, od, 0x5140u);  // [e0 e1 e2 e3]
+}
+__device__ __forceinline__ uint32_t e4_ilv_hi(uint32_t ev, uint32_t od) {
+    return __byte_perm(ev, od, 0x7362u);  // [e4 e5 e6 e7]
+}
+
+// raw packed A -> the unpacked canonical operand, one (row, K_STEP) per thread.
+// kMTile*kNStep items over kThreads threads (== 1 each at the shipped constants).
+__device__ __forceinline__ void e4_expand_a(Smem& s, int slot) {
+    for (int i = threadIdx.x; i < kMTile * kNStep; i += kThreads) {
+        const int m = i / kNStep;   // weight row within this CTA's 128-row tile
+        const int st = i % kNStep;  // K_STEP index within the slot
+        const uint4 p =
+            *reinterpret_cast<const uint4*>(s.a_raw[slot] + (size_t)m * (kPackK / 2) + st * 16);
+        uint32_t ev[4], od[4];
+        e4_expand(p.x, ev[0], od[0]);
+        e4_expand(p.y, ev[1], od[1]);
+        e4_expand(p.z, ev[2], od[2]);
+        e4_expand(p.w, ev[3], od[3]);
+        uint4 o0, o1;  // elements [0,16) and [16,32) of this K_STEP
+        o0.x = e4_ilv_lo(ev[0], od[0]);
+        o0.y = e4_ilv_hi(ev[0], od[0]);
+        o0.z = e4_ilv_lo(ev[1], od[1]);
+        o0.w = e4_ilv_hi(ev[1], od[1]);
+        o1.x = e4_ilv_lo(ev[2], od[2]);
+        o1.y = e4_ilv_hi(ev[2], od[2]);
+        o1.z = e4_ilv_lo(ev[3], od[3]);
+        o1.w = e4_ilv_hi(ev[3], od[3]);
+        // kb = 0 (elements [0,16)) and kb = 1 (elements [16,32)) of the atom.
+        uint8_t* dst = s.a_op[slot][st];
+        *reinterpret_cast<uint4*>(dst + ((size_t)((m & 7) + 16 * (m >> 3))) * 16) = o0;
+        *reinterpret_cast<uint4*>(dst + ((size_t)((m & 7) + 8 + 16 * (m >> 3))) * 16) = o1;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// The kernel. SwapAB, exactly like tc5::mxf4: the WEIGHTS are the M operand
+// (A = W1W3 [2*inter, dim] -> M = 2*inter = 30 full 128-row tiles, ZERO
+// redundancy) and the activation is the N operand (B = act [dim, 8] e4m3 -> N=8,
+// only row 0 live, so the activation side is 8x redundant -- 40 KB of reads per
+// step, negligible). D = TMEM [128, 8], only column 0 kept.
+//
+// Contract (checked by the launcher, not here):
+//   dim % kPackK == 0    (the ring never stages a partial K atom)
+//   dim % 128 == 0       (1X pairing: a 32-bit SF word spans 4 blocks = 128
+//                         elements, so it can never straddle a row end)
+//   dim <= kMaxDim       (sizes the SF staging chunk)
+//   dim % 2 == 0 and act 16-byte aligned (16-byte bulk-copy contract)
+//   rows == 2 * split and split % 32 == 0  (one 32-row SF group stays in a pool)
+//   (2*inter) % kMTile == 0    -> 30 tiles at the production shape
+//   w1/w3 (+ their scales) rows are per-(row, k/32); act_scale is per-(k/32) f32
+//   act is `dim` BYTES (e4m3, 1 byte/value) -- NOT the e2m1 packed row.
+// -----------------------------------------------------------------------------
+__global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_e4_kernel(
+    const uint8_t* __restrict__ act,        // [dim] e4m3, the ONE token
+    const float* __restrict__ act_scale,    // [dim/32] f32 power-of-two scales
+    float* __restrict__ out,                // [slots][2*inter] (out_slot_stride apart)
+    long out_slot_stride,
+    int dim, int epi_mode, float limit, int split,
+    // GAP 1 (inherited): TWO weight pools. `split` is the row boundary between
+    // gate and up, NOT the row count of either pool: output row r < split is gate
+    // pool row r, r >= split is up pool row r - split. Scales follow the split.
+    const uint8_t* __restrict__ w1_base, long w1_stride,
+    const uint8_t* __restrict__ w1s_base, long w1s_stride,
+    const uint8_t* __restrict__ w3_base, long w3_stride,
+    const uint8_t* __restrict__ w3s_base, long w3s_stride,
+    // GAP 3 (inherited): per-slot expert indirection, so the routing never reaches
+    // the host and the launch arguments stay independent of it (CUDA-graph safe).
+    // ids == nullptr: the four bases ARE the direct pointers (one expert).
+    const int* __restrict__ ids) {
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int slot = (int)blockIdx.y;
+
+    // ---- expert / row-block resolution (pure argument arithmetic) -------------
+    const uint8_t* w1p = w1_base;
+    const uint8_t* w1sp = w1s_base;
+    const uint8_t* w3p = w3_base;
+    const uint8_t* w3sp = w3s_base;
+    if (ids != nullptr) {
+        const size_t e = (size_t)ids[slot];
+        w1p = w1_base + e * (size_t)w1_stride;
+        w1sp = w1s_base + e * (size_t)w1s_stride;
+        w3p = w3_base + e * (size_t)w3_stride;
+        w3sp = w3s_base + e * (size_t)w3s_stride;
+    }
+    const int m0 = (int)blockIdx.x * kMTile;  // first weight row of this CTA
+    const int kbytes = dim >> 1;              // PACKED weight bytes per row
+    const int nsf = dim >> 5;                 // e8m0 bytes per weight row
+    const int nwords = nsf >> 2;              // 32-bit SF words per row == quads
+    const int natoms = dim / kKStep;          // K=32 atoms over the whole K
+    const int ngrp = natoms / kNStep;         // ring iterations
+    float* out_s = out + (size_t)slot * (size_t)out_slot_stride;
+
+    __shared__ Smem s;
+
+    // ---- TMEM + barrier init --------------------------------------------------
+    if (warp == 0) {
+        tc_alloc(&s.tmem_base, kTmemCols);
+        tc_relinquish();
+    }
+    if (tid < kRing) {
+        mbar_init(&s.tma_bar[tid], 1u);  // 1 arrival (expect_tx) + the tx bytes
+        mbar_init(&s.mma_bar[tid], 1u);  // 1 arrival (tcgen05.commit)
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    __syncthreads();
+
+    const uint32_t tb = s.tmem_base;
+    const uint32_t d_col = tb;                     // kNTile columns
+    const uint32_t sfa_col = tb + kNTile;          // kSfaCols columns
+    const uint32_t sfb_col = sfa_col + kSfaCols;   // kSfbCols columns
+    // 8 + 160 + 40 = 208 <= kTmemCols = 256. SAME budget as both other arms: a
+    // 1X atom consumes one SF word per row group exactly like a quad does.
+
+    // =========================================================================
+    // 1. STAGING PROLOGUE -- arm + issue the first kRing-1 ring slots.
+    // =========================================================================
+    // FIRST, deliberately: the ring TMA is then in flight for the whole of the SF
+    // prologue below, so the ~6 KB of scale traffic does not sit in front of the
+    // first MMA with an idle memory system behind it.
+    //
+    // One ring stage = one K=32 atom. The A half is 128 sixteen-byte copies, one
+    // per weight row, landed in the PACKED staging area (the expansion pass in
+    // the ring body turns it into the operand). The B half is the activation's
+    // 32 bytes: 2 sixteen-byte chunks, landed DIRECTLY on their canonical units
+    // (e4m3 is already one byte per value -- no expansion for B).
+    auto issue = [&](int g) {
+        const int sslot = g % kRing;
+        const size_t pk0 = (size_t)g * (kPackK / 2);  // packed byte offset of the atom
+        if (tid < kMTile) {
+            // GAP 1: per ROW, not per CTA -- a 128-row tile may straddle the two
+            // pools (the production shape does not, but the kernel must not
+            // depend on that).
+            const int row = m0 + tid;
+            const uint8_t* wrow = (row < split)
+                                      ? (w1p + (size_t)row * kbytes)
+                                      : (w3p + (size_t)(row - split) * kbytes);
+            const uint8_t* src = wrow + pk0;
+#pragma unroll
+            for (int st = 0; st < kNStep; ++st)
+                e4_bulk_g2s(s.a_raw[sslot] + (size_t)tid * (kPackK / 2) + st * 16,
+                            src + st * (kKStep / 2), 16, &s.tma_bar[sslot]);
+        }
+        // B row 0 is the token and the only row transferred; rows 1..7 are zeroed
+        // ONCE (below) and never re-written, because their D columns are dead by
+        // construction. That is what keeps the activation a single packed-free
+        // [dim] byte row instead of an [8, dim] padded buffer.
+        if (tid < 2 * kNStep) {
+            const int st = tid >> 1, kb = tid & 1;
+            e4_bulk_g2s(s.b_op[sslot][st] + e4_off(0, kb),
+                        act + (size_t)(g * kPackK + st * kKStep) + 16 * kb, 16, &s.tma_bar[sslot]);
+        }
+    };
+    // Zero B rows 1..7, once, for every (slot, atom): never TMA'd again.
+    for (int i = tid; i < kRing * kNStep * (kNTile - 1) * 2; i += kThreads) {
+        const int kb = i & 1;
+        const int n = 1 + ((i >> 1) % (kNTile - 1));
+        const int rest = (i >> 1) / (kNTile - 1);  // which (slot, atom)
+        *reinterpret_cast<uint4*>(s.b_op[rest / kNStep][rest % kNStep] + e4_off(n, kb)) =
+            make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();  // the tx count must be armed, and the zeroed B rows in smem,
+                      // before any copy is issued / any slot is consumed
+    if (tid == 0) {
+        for (int g = 0; g < kRing - 1; ++g)
+            if (g < ngrp) e4_mbar_expect_tx(&s.tma_bar[g], kStageTxBytes);
+    }
+    __syncthreads();  // arm-before-issue
+    for (int g = 0; g < kRing - 1; ++g)
+        if (g < ngrp) issue(g);
+
+    // =========================================================================
+    // 2. SF PROLOGUE -- the WHOLE scale block into TMEM, once, before the MMAs.
+    // =========================================================================
+    // Byte-for-byte the same pass as the other two arms: neither the SF FORMAT,
+    // nor the SF column density, nor the 4-blocks-per-32-bit-word packing changes
+    // with the scale vector (1X vs 2X). Every MMA reads all four row-group
+    // columns of its word, so the full 160 SFA columns must exist before the
+    // first MMA; the scales cannot be staged lazily per ring slot.
+    //
+    // The A block for 128 CONSECUTIVE rows is 128 * 160 = 20480 contiguous bytes in
+    // the pool, so it is copied one 32-row group at a time (coalesced uint4s) into
+    // sf_stage, and the 4-blocks-per-word assembly happens out of smem.
+    for (int j = 0; j < 4; ++j) {
+        const int r0 = m0 + 32 * j;
+        const bool hi = (r0 >= split);
+        const int rr = hi ? (r0 - split) : r0;
+        const uint8_t* src = (hi ? w3sp : w1sp) + (size_t)rr * nsf;
+        for (int i = tid; i < 2 * nsf; i += kThreads)  // nsf % 4 == 0 by contract
+            reinterpret_cast<uint4*>(s.sf_stage)[i] = reinterpret_cast<const uint4*>(src)[i];
+        __syncthreads();  // the chunk is read by every warp below
+        // Word for row (32j + lane), word index w (4 blocks 4w..4w+3), column
+        // (sfa_col + 4w + j). Every warp writes its OWN 32-lane partition with
+        // identical content: PTX requires the scale factors duplicated to all four
+        // partitions, and it is what both Phase 0 harnesses validate.
+        for (int w = 0; w < nwords; ++w) {
+            const uint32_t word =
+                *reinterpret_cast<const uint32_t*>(s.sf_stage + (size_t)lane * nsf + 4 * w);
+            e4_st_x1(((uint32_t)(warp * 32) << 16) | (sfa_col + 4 * w + j), word);
+        }
+        __syncthreads();  // sf_stage is reused by the next row group
+    }
+    // B scales: one word per quad, replicated across the warps as above. Only lane
+    // 0 (activation row 0 = the token) carries a value; lanes 1..7 keep 0, which
+    // decodes to 2^-127 -- FINITE, so the zeroed B rows it scales stay exactly 0.
+    // Never write 0xFF (NaN): NaN * 0 is NaN and would poison the whole D column.
+    for (int w = 0; w < nwords; ++w) {
+        // GAP 2 (inherited): `dsv41_quant_fp4`/`quant_fp8` emit f32 powers of two;
+        // the SF word wants e8m0 BYTES. Converting here keeps the quantisers' ABI
+        // and the whole old SIMT path untouched. Lossless by construction: a
+        // fast_round_scale output IS 2^n, so `f_pow2_to_ue8m0` (:132) is an exact
+        // exponent copy, and the four bytes are packed exactly as the weight path
+        // packs its checkpoint bytes ([b0, b1, b2, b3] of the quad's four 32-K
+        // blocks).
+        uint32_t word = 0u;
+        if (lane == 0) {
+            const float* s4 = act_scale + 4 * w;
+            word = (uint32_t)f_pow2_to_ue8m0(s4[0]) | ((uint32_t)f_pow2_to_ue8m0(s4[1]) << 8) |
+                   ((uint32_t)f_pow2_to_ue8m0(s4[2]) << 16) |
+                   ((uint32_t)f_pow2_to_ue8m0(s4[3]) << 24);
+        }
+        e4_st_x1(((uint32_t)(warp * 32) << 16) | (sfb_col + w), word);
+    }
+    tc_wait_st();
+    tc_fence_before_thread_sync();
+    __syncthreads();
+    tc_fence_after_thread_sync();
+
+    // =========================================================================
+    // 3. THE RING
+    // =========================================================================
+    // Per iteration: one slot's packed atom lands (TMA completion), is EXPANDED
+    // into the operand, is consumed by its MMA, and the slot is refilled. This is
+    // the one structural difference from tc5::mxf4: the expansion pass sits
+    // between the wait and the fence, because the MMA can only read the unpacked
+    // form. Everything else -- the arm-early / issue-late order, the parity
+    // bookkeeping, the commit-protects-the-slot argument -- is unchanged.
+    //
+    // Phase bookkeeping -- slot s is used by iterations g = s (mod kRing); the
+    // k-th use has parity k & 1.
+    // =========================================================================
+#pragma unroll 1
+    for (int g = 0; g < ngrp; ++g) {
+        const int sslot = g % kRing;
+        const uint32_t ph = (uint32_t)((g / kRing) & 1);
+
+        // 1. this slot's bytes have landed. No __syncthreads: the mbarrier wait has
+        //    acquire semantics, so whoever observes the phase flip also observes the
+        //    TMA writes.
+        mbar_wait(&s.tma_bar[sslot], ph);
+
+        // 2. EXPANSION: packed staging -> the unpacked canonical operand the MMA
+        //    reads. Safe against the refill of this slot one revolution later: the
+        //    refill (issue(g_next), step 6 of iteration g + kRing - 1) is ordered
+        //    after the __syncthreads in step 3 of the NEXT iteration, hence after
+        //    every thread has finished THIS expansion.
+        e4_expand_a(s, sslot);
+
+        // 3. publish the operands to the async proxy. Both the expansion (above)
+        //    and the one-time B zeroing are generic-proxy writes of what the MMA
+        //    reads.
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+
+        // 4. the MMAs of this slot. One thread issues: tcgen05.mma is a CTA-level
+        //    async instruction, not a per-thread workload. enable_d = 0 only on the
+        //    very first atom.
+        if (tid == 0) {
+#pragma unroll
+            for (int st = 0; st < kNStep; ++st) {
+                const int b = g * kNStep + st;  // global 32-block index == the atom
+                // 1X SF: the 32-bit word holds the four block scales of a QUAD
+                // (bytes 0..3 = blocks 4q..4q+3), so the column advances once per
+                // quad and the 2-bit selector picks the block's byte within it.
+                const uint32_t sf = (uint32_t)(b & 3);
+                const uint64_t da = e4_make_desc(smem_addr(s.a_op[sslot][st]));
+                const uint64_t db = e4_make_desc(smem_addr(s.b_op[sslot][st]));
+                const uint32_t id = e4_make_idesc(sf, sf);
+                e4_mma(d_col, da, db, id, sfa_col + 4u * (uint32_t)(b >> 2),
+                       sfb_col + (uint32_t)(b >> 2), b == 0 ? 0u : 1u);
+            }
+            tc_commit(&s.mma_bar[sslot]);
+        }
+
+        // 5. arm the refill barrier of the slot we will fill at the end of this
+        //    iteration. The arm touches no memory, so arming it here (while the
+        //    slot may still be read by a retired-but-unwaited MMA) is safe.
+        const int g_next = g + kRing - 1;
+        const int slot_next = g_next % kRing;
+        if (tid == 0 && g_next < ngrp)
+            e4_mbar_expect_tx(&s.tma_bar[slot_next], kStageTxBytes);
+
+        // 6. refill the slot we are about to overwrite. Its previous use was
+        //    iteration g-1 (slot_next == g-1 mod kRing for kRing >= 2), whose commit
+        //    was issued at that iteration, so wait that use's parity. The wait also
+        //    proves that use's MMA has retired, hence that a_op[slot_next] is free
+        //    (its expansion completed BEFORE that MMA).
+        if (g_next < ngrp) {
+            if (g >= 1)
+                mbar_wait(&s.mma_bar[slot_next], (uint32_t)(((g - 1) / kRing) & 1));
+            issue(g_next);
+        }
+    }
+
+    // =========================================================================
+    // 4. EPILOGUE -- D -> out. Wait for the LAST MMA first (the only barrier the
+    // loop does not consume: each slot's commit is waited one revolution later,
+    // except the final slot's).
+    // =========================================================================
+    mbar_wait(&s.mma_bar[(ngrp - 1) % kRing], (uint32_t)(((ngrp - 1) / kRing) & 1));
+    {
+        // D[m][n] lives at lane (m % 32) of partition (m / 32), column d_col + n.
+        // Only n = 0 carries the token, so only v[0] is kept; v[1..7] are the dead
+        // columns (B rows 1..7 are zero).
+        uint32_t v[kNTile];
+        e4_ld_x8(((uint32_t)(warp * 32) << 16) | d_col, v);
+        tc_wait_ld();
+        const int row = m0 + warp * 32 + lane;  // == the output column (swapAB)
+        float x = __uint_as_float(v[0]);
+        if (epi_mode == 1) {  // gate/up clamp, same convention as mxf4_gemm_kernel
+            if (limit > 0.f) {
+                if (split < 0) {
+                    // interleaved (ILV) pool: even row = gate, odd row = up
+                    x = (row & 1) ? fminf(fmaxf(x, -limit), limit) : fminf(x, limit);
+                } else {
+                    // row < split: gate (upper clamp only); else: up (both)
+                    x = (row < split) ? fminf(x, limit) : fminf(fmaxf(x, -limit), limit);
+                }
+            }
+        }
+        // Phase 2 (down direction) adds row_weight[slot][row] here and the epi_mode
+        // 3 accumulate, per mxf4_gemm_kernel:534-548.
+        out_s[row] = x;
+    }
+
+    __syncthreads();
+    if (warp == 0) tc_dealloc(tb, kTmemCols);
+}
+
+// =============================================================================
+// LAUNCHER
+// =============================================================================
+// Same shape as tc5::mxf4's m4_launch_gateup (and the same capture rules: the
+// gate is read ONCE per process, a per-call getenv is a capture hazard).
+//
+// [K-SPLIT TODO] The occupancy argument is the one recorded in tc5::mxf4 and the
+// mxf8f6f4 block: grid = (30, slots) at slots=8 with <= 2 CTAs/SM, and kRing=6
+// supplies 10 KiB in flight per CTA. If slots=8 still lands far from the DRAM
+// floor, add the third grid dimension that splits the K range plus an ascending
+// order reduce (fp addition is not associative; the order IS the contract). The
+// kernel needs no ring change -- only the atom range and the partial write.
+// =============================================================================
+inline cudaError_t e4_launch_gateup(const uint8_t* act, const float* act_scale, float* out,
+                                    long out_slot_stride, int rows, int dim, int slots,
+                                    float limit, int epi_mode, int split,
+                                    const uint8_t* w1_base, long w1_stride,
+                                    const uint8_t* w1s_base, long w1s_stride,
+                                    const uint8_t* w3_base, long w3_stride,
+                                    const uint8_t* w3s_base, long w3s_stride,
+                                    const int* ids, cudaStream_t stream) {
+    if (dim <= 0 || rows <= 0 || slots <= 0) return cudaErrorInvalidValue;
+    // dim % 128 == 0 IS the 1X pairing contract (a 32-bit SF word spans 4 blocks =
+    // 128 K elements); dim % kPackK == 0 keeps the ring on atom boundaries.
+    if (dim % kPackK != 0 || dim % 128 != 0 || dim > kMaxDim) return cudaErrorInvalidValue;
+    if (rows % kMTile != 0) return cudaErrorInvalidValue;
+    // GAP 1 contract: `split` is the row count of EACH pool, so `rows == 2*split`
+    // is what makes the epilogue's clamp boundary and the weight row indexing
+    // agree. `split % 32 == 0` keeps one 32-row SF group inside a single pool.
+    if (split <= 0 || 2 * split != rows || split % 32 != 0) return cudaErrorInvalidValue;
+    // 16-BYTE ALIGNMENT IS A HARD CONTRACT on both sides of every bulk copy: a
+    // misaligned copy does not fault, it silently misplaces bytes. Every base and
+    // every per-expert stride must be a multiple of 16 -- INCLUDING `act`, whose
+    // 16-byte chunks are addressed directly (the activation row here is twice as
+    // long as the e2m1 one, so a 16-byte-aligned base is not implied by anything
+    // else).
+    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
+    const auto str16 = [](long s) { return s == 0 || (s & 0xF) == 0; };
+    if (!al16(act) || !al16(w1_base) || !al16(w1s_base) || !al16(w3_base) || !al16(w3s_base) ||
+        !str16(w1_stride) || !str16(w1s_stride) || !str16(w3_stride) || !str16(w3s_stride))
+        return cudaErrorInvalidValue;
+    const dim3 grid((unsigned)(rows / kMTile), (unsigned)slots, 1u);
+    return dsv41_experts_pdl_or_plain(expert_tcgen05_gateup_e4_kernel, grid, dim3(kThreads), 0,
+                                      stream, act, act_scale, out, out_slot_stride, dim, epi_mode,
+                                      limit, split, w1_base, w1_stride, w1s_base, w1s_stride,
+                                      w3_base, w3_stride, w3s_base, w3s_stride, ids);
+}
+
+// gate/up, one dispatch per (layer, top-k slot) batch, with the OFFICIAL e4m3
+// activation: `act` is the ONE shared quantised activation row (e4m3, 1 byte per
+// value, [dim]), `act_scale` its [dim/32] f32 power-of-two scales, `out` holds
+// `slots` consecutive [2*inter] blocks.
+//
+// Returns 0 (and does nothing) while disabled, so the caller can call it
+// unconditionally and keep the proven GEMV path as the fallback.
+//
+// ABI (18 params): byte-for-byte the same signature as
+// `dsv41_expert_tcgen05_gate_up_mxf4` -- deliberately, so the Rust binding is a
+// mirror and the two arms are interchangeable at the call site. The ONLY
+// difference is the activation's BYTE LAYOUT, which no argument can express,
+// which is why this arm has its own symbol: the Rust side probes
+// `dsv41_expert_tcgen05_gate_up_e4m3` and a `.so` without it keeps the e2m1 arm
+// (reported once) instead of silently decoding e4m3 bytes as fp4 nibbles.
+extern "C" int dsv41_expert_tcgen05_gate_up_e4m3(
+    const uint8_t* act, const float* act_scale, float* out, long out_slot_stride, int inter,
+    int dim, float limit, int slots, const uint8_t* w1_base, long w1_stride,
+    const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
+    const uint8_t* w3s_base, long w3s_stride, const int* ids, cudaStream_t stream) {
+    // Runtime gate, read ONCE per process (a per-call getenv is a capture hazard,
+    // plan §5). ONE name, with the same strict "first char == '1'" rule as the
+    // tc5::mxf4 arm so `=0` and the unset default are both OFF:
+    //   DSV41_EXPERT_TCGEN05_E4M3
+    // ⚠️ MUST stay byte-for-byte equivalent to the Rust mirror
+    // `chain_dev.rs::expert_tcgen05_e4m3()`. If the two disagree, the Rust side
+    // believes the step runs this arm while the `.so` keeps the paired GEMV, i.e.
+    // BOTH A/B arms measure the OLD path (the project's #1 measurement-bias trap).
+    static const int enabled = [] {
+        const char* e = getenv("DSV41_EXPERT_TCGEN05_E4M3");
+        return (e != nullptr && e[0] == '1') ? 1 : 0;
+    }();
+    if (!enabled) return 0;
+    if (inter <= 0 || dim <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    const cudaError_t e = e4_launch_gateup(act, act_scale, out, out_slot_stride, 2 * inter, dim,
+                                           slots, limit, /*epi_mode=*/1, /*split=*/inter, w1_base,
+                                           w1_stride, w1s_base, w1s_stride, w3_base, w3_stride,
+                                           w3s_base, w3s_stride, ids, stream);
+    (void)cudaGetLastError();  // never fail the step: the fallback GEMV is correctness
+    return (int)e;
+}
+
+}  // namespace e4
+}  // namespace tc5
+
+#endif  // DSV41_TCGEN05_GATEUP_E4M3_SKELETON

@@ -637,6 +637,57 @@ pub(crate) fn expert_tcgen05_mxf4() -> bool {
     })
 }
 
+/// `DSV41_EXPERT_TCGEN05_E4M3=1` arms the tcgen05 **e4m3-activation** gate/up
+/// (`tc5::e4::expert_tcgen05_gateup_e4_kernel`, `dsv41_experts_mxf4.cu`), the
+/// sibling of the arm above for the DIRECT e4m3 activation
+/// (`DSV41_EXPERT_ACT_E4M3`). It is the ONLY way the tcgen05 gate/up can run
+/// while the e4m3 activation is armed: `kind::mxf4` is e2m1 x e2m1 and the
+/// `DSV41_EXPERT_ACT_E4M3` row would be decoded as fp4 nibbles.
+///
+/// Mirror of the launcher's own gate test: ONE name, first char `'1'` — a strict
+/// "1..." prefix, NOT the usual `!= "0"`, so the default is OFF and `=0` stays
+/// OFF. Read ONCE and cached, exactly like `expert_tcgen05_mxf4()`: the `.so`
+/// reads the same variable once per process, so a per-call getenv here could
+/// only add a hot-path slip and a capture hazard (plan §5).
+///
+/// ⚠️ MUST stay byte-for-byte equivalent to the `.so`'s test
+/// (`dsv41_experts_mxf4.cu`, the `enabled` lambda of
+/// `dsv41_expert_tcgen05_gate_up_e4m3`). If the two disagree, the Rust side
+/// believes the step runs this arm while the `.so` keeps the paired GEMV — both
+/// A/B arms then measure the OLD path (the project's #1 measurement-bias trap).
+///
+/// ⚠️ The gate can only arm a `.so` that CARRIES the symbol. `build.sh` compiles
+/// `DSV41_TCGEN05_GATEUP_E4M3_SKELETON` in BY DEFAULT (opt out with
+/// `DSV41_BUILD_TCGEN05_E4M3=0`), so a stock build satisfies
+/// `Device::supports_expert_tcgen05_e4m3()`; this gate itself is still default
+/// OFF, so no behaviour changes unless an operator sets it.
+pub(crate) fn expert_tcgen05_e4m3() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_TCGEN05_E4M3")
+            .map(|v| v.starts_with('1'))
+            .unwrap_or(false)
+    })
+}
+
+/// One-shot notice for an ARMED-but-undispatchable `DSV41_EXPERT_TCGEN05_E4M3`.
+/// The `.so` reads the same env var itself, so an operator who exports it
+/// believes the step now runs the tcgen05 e4m3 gate/up — while `moe()` keeps
+/// issuing the proven GEMV (see the call site: no symbol in the `.so`, the
+/// interleaved weight layout, or no batched path). A silent no-op there is the
+/// project's #1 measurement-bias trap (an "ON" arm that measures the OLD path),
+/// so it is said out loud once.
+fn tcgen05_e4m3_skipped_note(reason: &str, so_has_symbol: bool) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_EXPERT_TCGEN05_E4M3 is set, but the routed MoE still dispatches the \
+             gate/up to the proven GEMV/GEMM: {reason}. Any A/B run with this gate ON measures \
+             the OLD path. (symbol present in .so: {so_has_symbol})"
+        );
+    });
+}
+
 /// One-shot notice for an ARMED-but-undispatchable mxf4 gate. The `.so` reads the
 /// same env var itself, so an operator who exports `DSV41_EXPERT_TCGEN05_MXF4=1`
 /// believes the step now runs the tcgen05 gate/up — while `moe()` keeps issuing
@@ -11446,6 +11497,31 @@ fn hc_tail_split() -> bool {
                     );
                 }
             }
+            // The e4m3 sibling (`DSV41_EXPERT_TCGEN05_E4M3`, default OFF) has its
+            // own gate, symbol and one-shot notice, for exactly the same reasons
+            // and with exactly the same three refusals. It is the ONLY tcgen05
+            // arm the e4m3 activation can use: `kind::mxf4` is e2m1 x e2m1.
+            if expert_tcgen05_e4m3() {
+                if !self.dev.supports_expert_tcgen05_e4m3() {
+                    tcgen05_e4m3_skipped_note(
+                        "the loaded .so has no such symbol (rebuild with \
+                         DSV41_BUILD_TCGEN05_E4M3 unset -- a stock build does define it)",
+                        false,
+                    );
+                } else if ilv {
+                    tcgen05_e4m3_skipped_note(
+                        "the routed gate/up pools are interleaved (DSV41_EXPERT_ILV) and only \
+                         the fused GEMV body can read that layout",
+                        true,
+                    );
+                } else if !batched {
+                    tcgen05_e4m3_skipped_note(
+                        "the batched MoE path is unavailable (DSV41_MOE_BATCH / the batched \
+                         kernel set)",
+                        true,
+                    );
+                }
+            }
             // The input row is identical for every expert, so quantise it ONCE
             // here instead of inside the loop: the fp4 path was re-quantising and
             // re-packing the same 5120-element row for each of the ~6 selected
@@ -11512,12 +11588,53 @@ fn hc_tail_split() -> bool {
                 // through to the GEMV with the layout THAT call would have used,
                 // i.e. byte-for-byte the pre-tcgen05 behaviour. ILV was already
                 // reported as a refusal once, above.
-                let tcgen05 = !e4m3
+                // ---- tcgen05 gate/up: TWO variants, picked by the activation ----
+                // Both write the same UNFUSED [2*inter] gate|up layout, take the
+                // same 18 arguments and read the same activation SCALES; they
+                // differ ONLY in the activation's byte layout, so the variant
+                // follows the quantisation the step already chose:
+                //   e2m1 packed (`!e4m3`) -> tc5::mxf4 (`kind::mxf4`, 2X)
+                //   e4m3 bytes  (`e4m3`)  -> tc5::e4  (`kind::mxf8f6f4`, 1X)
+                // Until `DSV41_EXPERT_TCGEN05_E4M3` existed the e4m3 arm was
+                // simply REFUSED here (`let tcgen05 = !e4m3 && ...`), i.e. arming
+                // the official e4m3 activation silently disabled the tcgen05
+                // path. Each variant keeps its OWN runtime gate and its OWN
+                // symbol, so the two are independently A/B-able and a `.so`
+                // carrying only the e2m1 entry point still works (with the
+                // one-shot refusal notice above).
+                let tc_e4m3 = e4m3
+                    && expert_tcgen05_e4m3()
+                    && self.dev.supports_expert_tcgen05_e4m3()
+                    && !ilv;
+                let tc_mxf4 = !e4m3
                     && expert_tcgen05_mxf4()
                     && self.dev.supports_expert_tcgen05_mxf4()
                     && !ilv;
                 let mut ran_tc = false;
-                if tcgen05 {
+                if tc_e4m3 {
+                    // `xq4` holds ONE e4m3 byte per value here (the `quant_fp8`
+                    // branch above), which is exactly the row this kernel wants;
+                    // `xsc4` is the same [dim/32] f32 vector either way.
+                    ran_tc = self.dev.expert_tcgen05_gate_up_e4m3(
+                        self.s.xq4.as_u8(),
+                        self.s.xsc4.as_f32(),
+                        self.s.ex_act_b.ptr as *mut f32,
+                        (2 * inter_local) as i64,  // unfused slot pitch
+                        inter_local as i32,
+                        dim as i32,
+                        cfg.swiglu_limit,
+                        topk as i32,
+                        w1_base,
+                        w1_stride,
+                        w1s_base,
+                        w1s_stride,
+                        w3_base,
+                        w3_stride,
+                        w3s_base,
+                        w3s_stride,
+                        ids,
+                    )?;
+                } else if tc_mxf4 {
                     ran_tc = self.dev.expert_tcgen05_gate_up_mxf4(
                         self.s.xq4.as_u8(),
                         self.s.xsc4.as_f32(),

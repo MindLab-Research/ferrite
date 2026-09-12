@@ -375,3 +375,51 @@ STATUS:7713 定案的 6 条，隔离评估必须全部满足，否则数据无�
 4. `crates/ferrite-models/src/dsv41/kernels.rs` / `device.rs` —— FFI + 版本探测。
 5. `crates/ferrite-models/src/dsv41/chain_dev.rs` —— `moe_batch()` 派发。
 6. `crates/ferrite-dsv41/tests/expert_tcgen05_parity.rs` —— 新增单测。
+
+---
+
+## 8. 续：e4m3 激活变体（`tc5::e4`，2026-09-12）
+
+### 8.1 结论：`kind::f8f6f4` **不可用**，正确的是 `kind::mxf8f6f4 × scale_vec::1X`
+
+需求原本写的是「给骨架加 `kind::f8f6f4` 变体（FP8×FP4）」。该 kind 确实存在，但**不能 block scale**：
+
+| 探测（nvcc 13.3 `-gencode arch=compute_103a,code=sm_103a`） | 结果 |
+|---|---|
+| `kind::mxf4.block_scale.scale_vec::2X`（现有 e2m1 臂） | ✅ |
+| `kind::mxf8f6f4.block_scale.scale_vec::1X`（e4m3 臂） | ✅ |
+| `kind::f8f6f4.block_scale...` | ❌ `'.kind::f8f6f4' cannot be combined with '.block_scale'` |
+| `kind::f8f6f4`（dense，无 block_scale） | ✅ 但**无 block scale ⇒ 吃不了 checkpoint 的 per-32 e8m0** |
+| `kind::mxf8f6f4` + `scale_vec::2X` | ❌ cannot be combined |
+| `kind::mxf4` + `scale_vec::1X` | ❌ cannot be combined |
+| `kind::mxf4nvf4` + `scale_vec::1X` | ❌ cannot be combined（2X/4X ✅） |
+
+⇒ FP8×FP4 **且有 block scale** 的唯一入口是 `mxf8f6f4`，且 scale vector 被**强制 1X**（K=32/MMA）。
+idesc 格式取自 `MXF8F6F4Format`（E4M3=0、**E2M1=5**），**不是** `MXF4Format::E2M1=1`；本几何 idesc = `0x08820280`。
+
+### 8.2 代价：fp4 权重必须**展开**，kRing 8 → 6
+
+CUTLASS 里 `MXF8F6F4Format::E2M1` 绑定的是 `float_e2m1_unpacksmem_t`（packed 的 `float_e2m1_t` 只对应 `MXF4Format::E2M1`）⇒ mxf8f6f4 的 fp4 算子在 smem 里是「一元素一字节」，**TMA 无法做这个展开**（checkpoint 2 nibble/byte）。
+每个 ring slot 因此需要 `a_raw`（TMA 落 packed）+ `a_op`（MMA 读 unpacked）+ 一趟展开：
+
+| | tc5::mxf4（e2m1） | tc5::e4（e4m3） |
+|---|---|---|
+| K/atom | 64（2X） | 32（1X） |
+| slot 占用 | 4096+256 B | 2048+4096+256 B |
+| kRing | 8 | **6** |
+| in-flight packed | 28 KiB/CTA | **10 KiB/CTA** |
+
+⇒ e4m3 边际换来的就是这 2.8× 的 in-flight 损失。**这是这个 arm 要测的第一个数**。
+
+### 8.3 已实现
+
+- `dsv41_experts_mxf4.cu` 新增 `tc5::e4` 块（`DSV41_TCGEN05_GATEUP_E4M3_SKELETON`）：swapAB 同 mxf4 臂，A=权重（展开 fp4）、B=e4m3 激活、SF/列密度/prologue/TMEM 预算**完全复用**，只在 ring body 里多一趟 `e4_expand_a`。
+- 入口 `dsv41_expert_tcgen05_gate_up_e4m3`（18 参数 ABI 与 mxf4 **逐字节一致**），运行门禁 `DSV41_EXPERT_TCGEN05_E4M3`（默认 OFF，`'1'` 前缀严格判据）。
+- `build.sh`：`DSV41_BUILD_TCGEN05_E4M3`（默认 ON，`=0` 关）。
+- Rust：`device.rs` 绑定 + `supports_expert_tcgen05_e4m3()`；`chain_dev.rs` 的 `expert_tcgen05_e4m3()` 门禁 + 一次性提示 + `moe()` 派发——**拆掉了 `let tcgen05 = !e4m3 && ...` 的互斥**，改为按激活量化格式二选一。
+- 编译验证：`nvcc ... -DDSV41_TCGEN05_GATEUP_E4M3_SKELETON=1 -DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1` **0 error / 0 warning / 0 spill**，smem 45056 B（< 48 KiB），PTX 里 `kind::mxf8f6f4...1X` 与 `kind::mxf4...2X` 共存。
+
+### 8.4 ⚠️ 上 GPU 前必须定的两件事
+
+1. **16 字节 core matrix 里 nibble 的摆法**：本 arm 沿用项目既有先例（`tc5_unpack_a` / Phase 0）「一元素一字节」。但 CUDA driver 对 TMA 类型 `CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B` 的描述是「16×U4 packed，每 8 字节块之间留 8 字节空隙」，即前 8 字节装 nibble、后 8 字节留空。两者**密度相同**（每 32 元素行 32 字节，故 §8.2 预算不受影响）、**摆法不同** ⇒ 只有数值 parity 能定。`tests_tcgen05_mxf8f6f4_1x.cu` 的 (2)(3)(4) 当年就没跑过 GPU，本 arm 同样要先跑。
+2. **[TODO-3]** 用 2D tensor map（`16U4_ALIGN16B`）让 TMA 直接写出 unpacked 布局：省掉 a_raw 与展开、kRing 回到 ~9、in-flight 16 KiB。但需要 host 侧 per-plane tensor map ⇒ 启动参数开始依赖 routing，属**架构决策**，本 arm 未取。

@@ -625,6 +625,22 @@ struct Kernels {
             *const u8, i64, *const u8, i64, *const u8, i64, *const c_int, CuStream,
         ) -> c_int,
     >,
+    /// tcgen05 **e4m3-activation** gate/up (`DSV41_EXPERT_TCGEN05_E4M3`, default
+    /// OFF). The `tc5::e4` sibling of the arm above: same swapAB mapping and the
+    /// same 18-parameter ABI, but the activation is the OFFICIAL e4m3 form
+    /// (`act_quant(e4m3, block=32)`, ONE byte per value) and the MMA is
+    /// `kind::mxf8f6f4 ... scale_vec::1X`. Its own symbol on purpose — the two
+    /// arms differ ONLY in the activation's byte layout, which no argument can
+    /// express, and a stale `.so` decoding e4m3 bytes as fp4 nibbles would be a
+    /// silent wrong answer rather than a failure. OPTIONAL on the same terms as
+    /// `expert_tcgen05_gate_up_mxf4` (`build.sh` compiles it in by default, opt
+    /// out with `DSV41_BUILD_TCGEN05_E4M3=0`).
+    expert_tcgen05_gate_up_e4m3: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *mut f32, i64, c_int, c_int, f32, c_int, *const u8, i64,
+            *const u8, i64, *const u8, i64, *const u8, i64, *const c_int, CuStream,
+        ) -> c_int,
+    >,
     /// Load-time gate/up interleave (DSV41_EXPERT_ILV): rewrites an expert's
     /// w1/w3 blocks into one 8-byte-granule-interleaved region so the fused
     /// gate/up GEMV fetches both with one LDG.128. Optional: an .so without it
@@ -1038,6 +1054,7 @@ impl Device {
             expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
             expert_act_e4m3_cap: ko!(rt, "dsv41_expert_act_e4m3_cap"),
             expert_tcgen05_gate_up_mxf4: ko!(rt, "dsv41_expert_tcgen05_gate_up_mxf4"),
+            expert_tcgen05_gate_up_e4m3: ko!(rt, "dsv41_expert_tcgen05_gate_up_e4m3"),
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
@@ -4345,6 +4362,69 @@ impl Device {
         }
         self.kerr(rc, "dsv41_expert_tcgen05_gate_up_mxf4")?;
         Ok(true)
+    }
+
+    /// tcgen05 **e4m3-activation** gate/up — the `tc5::e4` arm
+    /// (`DSV41_EXPERT_TCGEN05_E4M3`, default OFF, read once inside the `.so`).
+    ///
+    /// Byte-for-byte the same ABI and the same arguments as
+    /// [`Self::expert_tcgen05_gate_up_mxf4`]; only the MEANING of `act` changes:
+    /// here it is the OFFICIAL e4m3 activation (`act_quant(e4m3, block=32)`),
+    /// i.e. **`dim` bytes per row, one byte per value**, not `dim/2` packed
+    /// bytes. `act_scale` is the same `[dim/32]` f32 power-of-two vector (the
+    /// kernel converts to e8m0 either way). `out`/`out_slot_stride`/`limit`/
+    /// `split = inter` are identical to the e2m1 arm, including the UNFUSED
+    /// `[2*inter]` gate|up layout (the epilogue only clamps).
+    ///
+    /// ⚠️ The e4m3 shape is at least as strict as the e2m1 one: `dim % 128 == 0`,
+    /// `2*inter % 128 == 0`, 16-byte aligned bases/strides **and** a 16-byte
+    /// aligned `act` (the activation row is addressed directly in 16-byte
+    /// chunks). A rejected shape returns a nonzero code and IS an error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_tcgen05_gate_up_e4m3(
+        &self,
+        act: *const u8,
+        act_scale: *const f32,
+        out: *mut f32,
+        out_slot_stride: i64,
+        inter: i32,
+        dim: i32,
+        limit: f32,
+        slots: i32,
+        w1_base: *const u8,
+        w1_stride: i64,
+        w1s_base: *const u8,
+        w1s_stride: i64,
+        w3_base: *const u8,
+        w3_stride: i64,
+        w3s_base: *const u8,
+        w3s_stride: i64,
+        ids: *const i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.expert_tcgen05_gate_up_e4m3,
+            "dsv41_expert_tcgen05_gate_up_e4m3",
+        )?;
+        let rc = unsafe {
+            f(
+                act, act_scale, out, out_slot_stride, inter, dim, limit, slots, w1_base, w1_stride,
+                w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids, self.stream,
+            )
+        };
+        if rc == 0 {
+            return Ok(false); // gate OFF: nothing ran, the caller falls back
+        }
+        self.kerr(rc, "dsv41_expert_tcgen05_gate_up_e4m3")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the tcgen05 e4m3-activation gate/up
+    /// entry point (`dsv41_expert_tcgen05_gate_up_e4m3`, compiled in by
+    /// `build.sh` unless `DSV41_BUILD_TCGEN05_E4M3=0` is exported). The runtime
+    /// gate `DSV41_EXPERT_TCGEN05_E4M3` is still default OFF, so a present symbol
+    /// changes no behaviour on its own.
+    pub fn supports_expert_tcgen05_e4m3(&self) -> bool {
+        self.kernels.expert_tcgen05_gate_up_e4m3.is_some()
     }
 
     /// True when the loaded `.so` carries the tcgen05 MXFP4 gate/up entry point
