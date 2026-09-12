@@ -4690,3 +4690,24 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 | + MARKOV | 89.6 | +3.2% |
 | + LAZY_SDR | 89.3 | ~0（中性）|
 | + VERIFY_FORK（下一测）| ~91? | +1-2%? |
+
+## K1/K2 重验的准备（VERIFY_FORK 之后）
+
+**测试配置**：
+```bash
+# 当前干净栈 + K1 + K2
+DSV41_ATTN_MROWS2=1 DSV41_ATTN_MROWS_ROPE_NORM=1  # K1 + K2
+# 注意：K1 优先于 R2 的 lin2（同程序融合先检查）——K1/K2 开启时 R2 的对应部分被替代
+```
+
+**K1/K2 与 R2 的关系**：
+- K1（mrows2）与 R2 的 lin2 目标相同（wq_a+wkv 融合）——K1 先检查，开启时替代 lin2
+- K2（mrows_rope_norm）与 R2 的 lin_rope_norm 目标相同（norm+wq_b+rope）——同上
+- **R2 已验证干净（86.8）**——K1/K2 的价值是"更安全的同程序替代"+ 可能的性能差异
+
+**预期**：
+- K1/K2 干净（大概率——同程序设计更安全）
+- 性能与 R2 相当或略不同（mrows-based vs mx-based kernel 的特性差异）
+- 如果 K1/K2 更快 → 优先使用；如果 R2 更快 → 保持 R2
+
+**判据**：前 61 行正确 + 零拉丁 + 吞吐对比（vs 89.6 的 R2+MARKOV 栈）
