@@ -1746,3 +1746,12 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 1. S2：TAP_BF16/DRAFT_ATTN 单变量 A/B（未单独测过）
 2. draft-verify program audit 的其他发现（运行中）
 3. S4：paired alignment（draft KV act_quant ↔ backbone ring act_quant 同步）
+
+## S2 组合测试的机制（057c7f48 跑中）
+
+**新增的两个截断点**（在 P0-3+P1-5 = 1.214 基础上）：
+1. **TAP_BF16**（:877）：draft 的 main_h 输入（目标层 hidden states 的拼接）→ bf16 roundtrip
+2. **DRAFT_ATTN_BF16**（:2111）：draft 的 attention 输出（wo_b 之后）→ bf16 roundtrip
+
+**预期**（accept-first-strategy）：每个 +0.1-0.2 → 组合 1.3-1.5
+**之前的组合退化**（0.898）是 SEED_POS 的 off-by-one 问题——现在没有 SEED_POS。
