@@ -534,3 +534,19 @@ submit，而是 GPU 侧那一段（~3.3µs）。**融合的收益主要来自把
 
 → 22ms + draft 1ms（P3c）+ commit 0.2 = ~23ms/步 → accept 3 时 **130 tok/s**。
 **400 的缺口**：routed experts 的 8.3ms 是最大单项——tcgen05 是唯一路径（−6.8ms → 15.2ms/步 → 197 tok/s @ accept 3）。**accept ≥4 或 batched verify 的真正 weight-stationary（5 行共享 routed 权重读）才能到 400**。
+
+## W5 tcgen05 e4m3 的 scale 外提设计（代码级，读 dsv41_experts_mxf4.cu 骨架后）
+
+**硬件约束**（已确认）：
+- `kind::mxf4` 的 MMA 有 block-scale 操作数但 **只吃 e2m1** 激活（opa 根因，不可回退）
+- `kind::f8f6f4` 吃 e4m3 激活但 **无 block-scale 操作数**——e8m0 per-32 scale 无法进 MMA
+
+**外提方案**（官方 tilelang 同构——`C_local_accum += C_local * scale_a * scale_b` 在 inner loop 的累加步）：
+```
+for each K-atom (64 fp4 元素 = 2 个 32-块):
+    MMA(A_atom[fp8], B_atom[fp4]) → tmem 的部分积 C_local[128×64]
+    对 C_local 的每 32-K 块: C_accum += C_local × scale_a[k_blk] × scale_b[k_blk]
+```
+**代价**：每个 K-atom 需要 1 次 tmem 读 + 2 次乘 + 1 次加（vs 单次大 MMA 的 1 次终读）。K=2304/rank → 36 atoms → 36 次 tmem 往返。
+**收益模型**：SIMT 377GB/s（每 fp4 值 2.5 条 L1TEX 解码指令）→ tensor core 路径的解码消失。tcgen05 mxf4 骨架已按 masked M=128 tile 写好（kMTile=128/kNTile=64/kAtomK=64），tile 机制可直接复用。
+**关键风险**：36 次 tmem 往返的延迟 vs SIMT 的 377GB/s——需要微基准定夺（预期 tensor core + tmem 往返仍快 3-5×）。
