@@ -2138,3 +2138,13 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **另两个候选（并行在查）**：
 - **§2 tap 采集口径**：我们在 `layer()` **末尾**取 `self.s.h`（= **该层输出**），而仓库自带的官方参考 `ref_inference/model.py:1264-1266` 在 `layer(h,…)` **之前**取（= **该层 attention 输入**）——**三份文档互相矛盾**（`config.rs`/`dspark.rs` 说 "input"；`dump_dev.rs` 说 "output"）——`tap-layer-arbitration` 在仲裁（**权重形状可唯一判定**）。
 - **§3 窗口回绕**（`pos ≥ win` 后锚点槽不再被排除——修 §1 时必须一起修）。
+
+## 2026-09-12 性能纠正：多行化的收益有限——verify 的瓶颈不是 launch 数
+
+**实测**：多行化（投影 + MoE 的 mrows）落地后 **步时 47.7ms**（多行化前 49.8ms）——**仅省 ~2ms**（远低于"每省一个 launch 就省 3.3µs"的预期）。
+
+**代码级解释（读 `dsv41_gemm_fp8_mrows` 的 launcher）**：
+- 它的 **grid = ceil(n / nwarps)**（**输出行方向的分块**），**与 m 无关** ⇒ **mrows 与 per-row 的 block 数完全相同**（head 的 n=129280、nwarps=8 ⇒ 16160 块）。**多行化真正省下的只是"m 次 launch 变 1 次"**（每次 4 个 launch）。
+- 投影 5 个 gemm × 40 层 × 4 = 800；MoE ~1800 → ~360（省 1440）⇒ **共省 ~2200 launch**，按 3.3µs/launch 应省 7.3ms —— **实测只省 2ms**。
+**⇒ `verify-perf-impl` 的 `6232 × (2.9µs submit + 3.3µs exec)` 归因高估了 launch 的权重**。多行化的**真实收益是"权重读一次"**（投影/MoE 的权重流从 m× 降到 1×：投影 ~1.1→0.2ms、MoE ~2.6→0.5ms ≈ **省 3ms**）——**与实测 2ms 吻合** ✓。
+**⇒ 400 的路径必须攻"计算/带宽"**（MoE 的 act/down 权重流、投影的权重流、attention 的 KV 流量），**不是继续砍 launch**。注意这与"融合"并不矛盾：融合（kernel 内 m 行循环）仍能省 launch，但**它的上限就是那几个 launch 的 μs 级开销**——**真正的大头在带宽**。
