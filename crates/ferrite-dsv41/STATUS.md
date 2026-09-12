@@ -8055,3 +8055,17 @@ TP4 路径**关闭**。AR 的理论节省（0.66→0.33ms）远小于计算翻�
 - 单请求无 MTP：**结构性不可达**（tcgen05 上限 215 theoretical，现实 175-195）
 - B=2 聚合：tcgen05 + batch = 227-285 聚合（需 9-14 人日总投入）
 - 唯一单请求 200+ 路径：**可验证投机解码**（需用户仲裁）
+
+### Wave 3 P0：KV 前缀快照的 serve 集成（已落地，待上机验收）
+
+**链路**（门 `DSV41_KV_CACHE=1`，默认 off）
+- **MISS**：`pool_rank_body` → `prefill_or_resume` → `prefill_chain`（逐 token `chain.step`）→ `chain.kv_snapshot()` 冻结到 host → `KvCache`（FNV-1a 键 + **全 token 序列相等**判定 + LRU）。
+- **HIT**：`KvCache::get` → `chain.kv_restore(snap)` → 复用冷跑得到的 `first_token`（**一个 forward 都不跑**）→ 驱动照常发 `DecodeRun`。快照点 = prefill 完成，decode 期间从不更新。
+- **上报**：命中数经 `Arc<AtomicUsize>` → `TpRankPool::resume_hit()` → `StepEngine::resume_hit` → `Admission::prefix_hit` → `usage.prompt_tokens_details.cached_tokens`。
+
+**门/旋钮**：`DSV41_KV_CACHE`（=1 开）、`DSV41_KV_CACHE_SLOTS`（默认 8 = LRU 上限）、`DSV41_KV_TRACE`（每个 admission 一行的命中/耗时）。
+**自动关闭**：`DSV41_DSPARK` armed（draft 的 window ring 不在快照内）；`DSV41_ENG_HOST=1`（host n-gram 状态不在快照内，`kv_snapshot` 直接 Err）。两者都只告警一次并退化为普通 prefill，不给错答案。
+
+**验收（P0-4）**：同 prompt 二次请求 TTFT **秒级 → < 50 ms**（秒级 = prompt_len 次 forward，实测 ~15ms/token ⇒ 1k prompt ≈ 15s；命中期 = `kv_restore` + 一次 decode 步）。观测点三处：`DSV41_KV_TRACE=1` 的 rank 0 行（MISS xx s → HIT xx ms）、`cached_tokens == prompt_len`、SSE `admitted prefix_hit=N`。
+
+**与方案 §4.1 的偏离（定为现状）**：不引入 `RankCmd::PrefillResume` / `snap_tx`。KV 是 TP 分片的，rank 0 的快照对其他 rank 无用，MB 级载荷也不该进命令/ack 通道（K8）；改为**每 rank 本地存/恢复自己那一份，判定是对 prompt 的纯函数**（同一请求流 + 同一 LRU ⇒ 各 rank 判定一致），于是命令里不需要任何快照载荷。分歧的后果是下一个 collective 里**响亮地卡死**，不是静默的 KV 错位。

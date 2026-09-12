@@ -46,6 +46,16 @@ use crate::tp::{self, Collective};
 enum RankCmd {
     /// Reset the chain and consume the prompt, one forward per prompt token
     /// (the KV ring is per-sequence); the reply is the first generated token.
+    ///
+    /// With `DSV41_KV_CACHE=1` this is ALSO the resume command: the rank consults
+    /// its own frozen-prefix cache first and, on an exact prompt match, drops the
+    /// snapshot back in instead of running the forwards; the pool then issues the
+    /// same `DecodeRun` it would have. There is deliberately **no** `Resume`
+    /// variant — the hit decision must be uniform across ranks (a rank that
+    /// skipped a forward the others ran lands in the next collective out of
+    /// step), and the KV is TP-sharded, so no snapshot could be broadcast anyway
+    /// (a snapshot is MBs, which does not belong on the command/ack channel).
+    /// See `prefill_or_resume` for the full rationale.
     Prefill(Vec<u32>),
     /// One steady-state decode step (zero H2D — the token already sits in the
     /// device's `ids` buffer). Kept as the un-batched fallback; the pool uses the
@@ -462,6 +472,22 @@ fn pool_rank_body(
     // be: a rank that skipped a forward the others ran would land in the next
     // collective out of step. A divergence is therefore a loud wedge, never a
     // silent KV desync.)
+    //
+    // ---- 验收标准 / ACCEPTANCE (P0; the wave3-kv-mvp contract) -----------------
+    // A SECOND request with the SAME prompt must serve its TTFT in **< 50 ms**
+    // instead of the SECONDS a cold prefill costs: seconds = one forward per
+    // prompt token (measured ~15 ms/token, so a 1k prompt ≈ 15 s); < 50 ms = the
+    // hit path is `kv_restore` only (a dozen H2D/D2D + syncs, ~10 MB) plus the one
+    // decode step the driver issues anyway — NOT ONE prefill forward runs.
+    // Three observable points, all already wired:
+    //   * `DSV41_KV_TRACE=1` → rank 0 logs one line per admission:
+    //     `[kv-cache] prefill N tokens: HIT M (restored, prefill skipped) in X.Xms`
+    //     (a MISS prints the same line with `MISS (full prefill)`);
+    //   * the response's `usage.prompt_tokens_details.cached_tokens == prompt_len`;
+    //   * the SSE `admitted prefix_hit=N` comment line.
+    // With the gate unset (or `DSV41_KV_CACHE=0`) none of this engages and the
+    // prefill path is the original `prefill_chain` verbatim.
+    // ---------------------------------------------------------------------------
     let kv_enabled = kv_cache_on() && !cfg.dspark_armed();
     let mut kv_cache = KvCache::new(kv_cache_cap());
     let mut kv_warned = false;
@@ -475,7 +501,14 @@ fn pool_rank_body(
     loop {
         match rx.recv() {
             Ok(RankCmd::Prefill(ids)) => {
-                let r = prefill_or_resume(&mut chain, &ids, &mut kv_cache, kv_enabled, &mut kv_warned);
+                let r = prefill_or_resume(
+                    &mut chain,
+                    &ids,
+                    &mut kv_cache,
+                    kv_enabled,
+                    &mut kv_warned,
+                    rank,
+                );
                 if let Ok((_, hit)) = &r {
                     // every rank stores the same value; the pool reads it once the
                     // broadcast has collected all of them.
@@ -812,21 +845,26 @@ impl KvCache {
 /// decode: a prefix hit only ever needs the state a prompt leaves behind, and
 /// re-snapshotting per decode step would multiply the copy cost for a state no
 /// hit could use.
+///
+/// See the KV cache section in `pool_rank_body` for the acceptance line this
+/// function's timing feeds (same-prompt second request: seconds → < 50 ms).
 fn prefill_or_resume(
     chain: &mut DevChain<'_>,
     ids: &[u32],
     cache: &mut KvCache,
     enabled: bool,
     warned: &mut bool,
+    rank: usize,
 ) -> Result<(u32, usize)> {
+    // The ONE number the acceptance criterion is read off: the whole admission
+    // (restore+copies on a HIT, every prompt forward + the freeze on a MISS).
+    let t0 = std::time::Instant::now();
     if enabled {
         if let Some(e) = cache.get(ids) {
             let first = e.first_token;
             let hit = e.snap.tokens;
             chain.kv_restore(&e.snap)?;
-            if kv_trace() {
-                eprintln!("[kv-cache] HIT {} tokens (restored, prefill skipped)", hit);
-            }
+            kv_log(rank, ids.len(), Some(hit), cache.stats(), t0.elapsed());
             return Ok((first, hit));
         }
     }
@@ -838,14 +876,6 @@ fn prefill_or_resume(
         // prefill, not to a wrong answer.
         match chain.kv_snapshot() {
             Ok(snap) if snap.tokens == ids.len() => {
-                if kv_trace() {
-                    let (h, m) = cache.stats();
-                    eprintln!(
-                        "[kv-cache] MISS {}/{} tokens frozen (hits={h} misses={m})",
-                        ids.len(),
-                        snap.tokens
-                    );
-                }
                 cache.insert(ids, first, snap);
             }
             Ok(snap) => {
@@ -867,7 +897,35 @@ fn prefill_or_resume(
             }
         }
     }
+    kv_log(rank, ids.len(), None, cache.stats(), t0.elapsed());
     Ok((first, 0))
+}
+
+/// One line per admission, rank 0 only (`DSV41_KV_TRACE=1`): what the prefill
+/// cost and whether it was served from the frozen prefix.
+///
+/// This is the acceptance measurement, not decoration — a same-prompt second
+/// request is read straight off the two consecutive lines ("MISS (full prefill)
+/// in 15_000ms" then "HIT … in 12ms"), so the `seconds → < 50 ms` criterion needs
+/// no profiler. ⚠️ Rank-gated on purpose: EVERY rank runs the same prefill, so an
+/// ungated line would be `world`-fold duplicate log spam (the pre-existing
+/// `[kv-cache] HIT/MISS` prints had exactly that bug at TP8).
+fn kv_log(rank: usize, tokens: usize, hit: Option<usize>, stats: (u64, u64), dt: std::time::Duration) {
+    if rank != 0 || !kv_trace() {
+        return;
+    }
+    let (h, m) = stats;
+    match hit {
+        Some(n) => eprintln!(
+            "[kv-cache] prefill {tokens} tokens: HIT {n} (restored, prefill skipped) in {:.1}ms \
+             (hits={h} misses={m})",
+            dt.as_secs_f64() * 1e3
+        ),
+        None => eprintln!(
+            "[kv-cache] prefill {tokens} tokens: MISS (full prefill) in {:.1}ms (hits={h} misses={m})",
+            dt.as_secs_f64() * 1e3
+        ),
+    }
 }
 
 /// `DSV41_KV_TRACE=1` logs each hit/miss (off by default: the per-request line
