@@ -531,7 +531,7 @@ impl<'a> DsparkDev<'a> {
             // so the `n_target * dim` block is rebuilt one `dim`-wide slice at a
             // time into the same `main_h` the per-step path fills.
             for slot in 0..n_target {
-                let src = (tap_r as *const u8).wrapping_add((slot * m + j) * row_bytes);
+                let src = (tap_r as *const u8).wrapping_add((slot * crate::dsv41::chain_dev::VERIFY_ROWS + j) * row_bytes);
                 let dst = (self.main_h.ptr as *mut u8).wrapping_add(slot * row_bytes);
                 self.dev
                     .memcpy_d2d(dst as *mut c_void, src as *const c_void, row_bytes)?;
