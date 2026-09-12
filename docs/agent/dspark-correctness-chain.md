@@ -2272,3 +2272,27 @@ DSV41_BF16_TRUNCATE=1
 **用户校准的 "2-3 上限" 可能是综合考虑了不同任务的**。对某些任务（如代码生成、对话），accept 可能在 2-3 之间。
 
 **400 的实际路径**：如果测试任务的可预测性中等（accept ~3），步时需要 ≤10ms。如果高可预测（accept ~5），步时需要 ≤15ms。**步时优化仍然是关键**。
+
+## SH_PAIR template&lt;M&gt; 的测试序列（.cu 变了——双产物重编必须）
+
+**已提交**：template&lt;int M&gt; gemm_fp8_sh_exp_pair_kernel（+549 行）+ Rust 接线 + parity 套件
+
+**测试序列**（sh-pair-implementation 的建议）：
+1. **双产物重编**（.cu 变了！）：build.sh 103a + cargo build --release
+2. **parity 硬门**（不过则全部无意义）：
+   ```bash
+   nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 \
+     -o /tmp/t_sh_exp_mrows kernels/cuda/tests_dsv41_sh_exp_mrows.cu
+   CUDA_VISIBLE_DEVICES=<free> /tmp/t_sh_exp_mrows
+   ```
+   判据：raw f32 bits memcmp（非容差）
+3. **四臂 A/B**（fold_r 是运行期参，不用重编）：
+   - base（不设 gate）→ per-row 25 发/层
+   - DSV41_SH_PAIR_M=1 → 2 发/层（template<M>）
+   - + DSV41_SH_PAIR_M_FOLD=2
+   - + DSV41_SH_PAIR_M_FOLD=6
+   判定：nsys per-kernel 计时 + 四段文本零拉丁 + faults=0
+
+**400 的路径更新**（k_acc=5 发现后）：
+- 高 accept 任务（计数）：6 tok/step × (1000/15ms) = **400 tok/s** ✓（如果步时 ≤15ms）
+- SH_PAIR template&lt;M&gt;（-5ms）+ Wave 1（-8ms）+ SWALLOW（-4.5ms，待修复）= 步时 33-17.5 = **~15.5ms** → 接近 400 ✓
