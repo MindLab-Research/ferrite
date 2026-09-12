@@ -2012,6 +2012,40 @@ fn norm_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_NORM_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// R2 (DSV41_ATTN_LIN_FUSE, **DEFAULT OFF** — A/B first): `attention_rows` at
+/// `m == 1` reuses the EAGER decode path's two single-row fusions instead of the
+/// mrows-ified sequence it inherited when the verify path went multi-row.
+///
+/// The projection-family analysis found the regression: on the mrows path a
+/// single-row verify costs
+///   `quant_rows(xn) + proj_mrows(wq_a) + proj_mrows(wkv)`
+///     + `norm_rows(qr) + quant_rows(qr) + proj_mrows(wq_b) + apply_rope`
+/// = 7 projection-family launches per layer, while EAGER's `attention()` pays
+/// TWO — `lin2` (wq_a + wkv over one shared `xq`, DSV41_PROJ_FUSE default ON)
+/// and `lin_rope_norm` (the rmsnorm+fp8 prologue and the rope epilogue folded
+/// into the wq_b GEMV, DSV41_NORM_FUSE default ON). Both kernels are already in
+/// the tree and in the loaded .so; the mrows化 simply never called them at
+/// `m == 1`. This gate routes exactly those two calls.
+///
+/// It is `m == 1`-only by construction: `lin2` and `lin_rope_norm` are the
+/// `m = 1` programs (`gemm_fp8_mx2` / `gemm_fp8_mx_rope_norm`), and it is the
+/// mrows path that is the right one above one row. `swapAB` is excluded because
+/// `lin2` bypasses the `gemm_fp8_mx_or_swap` dispatch the per-row path honours,
+/// so the fused call would silently switch a live experiment knob's numerics.
+///
+/// Every consumer downstream of `qr_r` sees byte-identical input: the fused
+/// wq_b launch leaves `qr_r` RAW (its prologue normalised into shared memory),
+/// so `attention_rows` materialises that normalisation in place with the very
+/// `norm_rows` call the unfused path made, and the indexer's q half — the only
+/// other `qr_r` reader — quantises the same bytes it always did. A decline
+/// (an .so without the symbol, a shape the launcher rejects, `PROJ_FUSE=0`)
+/// falls straight through to today's mrows sequence, so OFF and ON-but-declined
+/// are the same code path.
+fn attn_lin_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ATTN_LIN_FUSE").map(|v| v == "1").unwrap_or(false))
+}
+
 /// B2 (DSV41_OROPE_Q, default ON): the inverse o-rope's epilogue emits the fp8
 /// of the whole roped region, so the `quant1(s.o)` launch right before wo_a
 /// (40/step) disappears. The emitted pair is `dsv41_quant_fp8(o)`'s, term for
@@ -9324,7 +9358,33 @@ impl<'a> DevChain<'a> {
         // contiguous [m, ql] block, and row `r`'s output is bit-identical to the
         // per-row `n = 1` call it replaces.
         let mrows = self.dev.supports_gemm_fp8_mrows() && !Self::swapab() && m <= VERIFY_ROWS;
-        let took_akv = if mrows {
+        // R2 (DSV41_ATTN_LIN_FUSE, default OFF): at `m == 1` reuse EAGER's
+        // single-row fusions — `lin2` (wq_a + wkv over ONE shared `xq`) and,
+        // below, `lin_rope_norm` (norm + wq_b + rope in one launch). Both
+        // kernels are already in the .so; the mrows化 never called them at
+        // one row, which is 7 projection-family launches where EAGER pays 2.
+        // See [`attn_lin_fuse`]. `m > 1` keeps the mrows path verbatim.
+        let lin_fuse = attn_lin_fuse() && m == 1 && !Self::swapab();
+        let took_akv = if lin_fuse {
+            // The EAGER call verbatim, with this path's `_r` buffers as the
+            // destinations: `quant1` + `gemm_fp8_mx2` write row 0 of `qr_r` /
+            // `kv_r`, i.e. the bytes `proj_mrows` wrote for row 0. The GEMV
+            // reads the device counter with `mul = 1, off = 0, step = 0`, and
+            // for the block's single row that is `pos_base` — the same position
+            // the per-row path passes as `off = r = 0`.
+            self.lin2(
+                self.s.xn_r.ptr as *const f32,
+                dim as i32,
+                ld.wq_a.as_ref().unwrap(),
+                ld.wq_a_scale.as_ref().unwrap(),
+                ql as i32,
+                self.s.qr_r.ptr as *mut f32,
+                ld.wkv.as_ref().unwrap(),
+                ld.wkv_scale.as_ref().unwrap(),
+                hd as i32,
+                self.s.kv_r.ptr as *mut f32,
+            )?
+        } else if mrows {
             // the block's fp8 activation: `quant_kernel` is one thread-group per
             // (row, block), so row `r` here is the byte-for-byte `quant1(xr)`
             // the per-row loop issues. wq_a and wkv share it (they read the same
@@ -9378,6 +9438,33 @@ impl<'a> DevChain<'a> {
                 )?;
             }
         }
+        // R2 (DSV41_ATTN_LIN_FUSE): at `m == 1` the wq_b projection IS the EAGER
+        // path's fused launch — the rmsnorm of the raw `qr_r` and the rope of
+        // its own output folded into the GEMV's prologue/epilogue (NORM_FUSE,
+        // default ON). It replaces `norm_rows + quant_rows + proj_mrows + rope`
+        // with ONE launch, the second half of the 7 -> 2 reduction at one row.
+        //
+        // ⚠️ The fused launch leaves `qr_r` RAW (it normalises into shared
+        // memory and never writes the row back), so it MUST run before the
+        // `norm_rows` below — that call is what materialises the normalised
+        // `qr_r` the indexer's q half quantises (`indexer_rows_one`'s `lin`;
+        // `indexer_front_rows`'s `quant_rows` + `proj_mrows`). Same call, same
+        // eps, same in-place destination as the unfused path, so every `qr_r`
+        // consumer sees the bytes it always saw. The rope is then already on
+        // `q_r` and the standalone rope below skips the row.
+        let q_norm_fused = lin_fuse
+            && self.lin_rope_norm(
+                self.s.qr_r.ptr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                cfg.norm_eps,
+                ql as i32,
+                ld.wq_b.as_ref().unwrap(),
+                ld.wq_b_scale.as_ref().unwrap(),
+                (nlh * hd) as i32,
+                self.s.q_r.ptr as *mut f32,
+                rd as i32,
+                hd as i32,
+            )?;
         // q norm, in place: ALL m rows in ONE launch (the T2 epilogue's own
         // fallback pair — a plain rmsnorm into `qr`). Was m launches.
         self.norm_rows(
@@ -9392,7 +9479,7 @@ impl<'a> DevChain<'a> {
         // is the normalised `qr_r` block; the output row is `nh*hd` wide but this
         // rank only writes its leading `nlh*hd`, which is why `out_stride` is a
         // separate kernel parameter rather than `n`.
-        let took_b = if mrows {
+        let took_b = if mrows && !q_norm_fused {
             self.quant_rows(self.s.qr_r.ptr as *const f32, m, ql as i32)?;
             self.proj_mrows(
                 ld.wq_b.as_ref().unwrap().as_u8(),
@@ -9406,7 +9493,7 @@ impl<'a> DevChain<'a> {
         } else {
             false
         };
-        if !took_b {
+        if !took_b && !q_norm_fused {
             for r in 0..m {
                 // wq_b: this rank's `nlh` heads, written at the row's base
                 self.lin(
@@ -9433,20 +9520,24 @@ impl<'a> DevChain<'a> {
         // the identical kernel the draft side's P3a a4 calls). Rows are
         // independent, so the result is bit-identical; `Ok(false)` keeps the loop
         // below. See [`verify_rope_mrows`] for why the q rope has its own gate.
-        let q_roped = verify_rope_mrows()
-            && self.dev.apply_rope_mrows(
-                self.s.q_r.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
-                m as i32,
-                nlh as i32,
-                (nh * hd) as i32,
-                hd as i32,
-                rd as i32,
-                half,
-                self.s.pos_rows.ptr as *const std::os::raw::c_int,
-                false,
-            )?;
+        // R2: a row whose wq_b took the fused `lin_rope_norm` launch already
+        // carries its rotation (`q_roped` = the fusion), so neither the
+        // row-folded nor the per-row rope below may touch it again.
+        let q_roped = q_norm_fused
+            || (verify_rope_mrows()
+                && self.dev.apply_rope_mrows(
+                    self.s.q_r.ptr as *mut f32,
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    m as i32,
+                    nlh as i32,
+                    (nh * hd) as i32,
+                    hd as i32,
+                    rd as i32,
+                    half,
+                    self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                    false,
+                )?);
         if !q_roped {
             for r in 0..m {
                 self.dev.apply_rope(
