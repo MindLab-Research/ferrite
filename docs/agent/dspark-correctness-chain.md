@@ -5964,3 +5964,27 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1 DSV41_SH_PAIR_M=1
 - **现实的 60% 兑现**：~242 tok/s（差 40%）
 
 **L4/L5 的关键性**：没有 L4+L5，400 不可达（S1-S4 最多 290）！
+
+## SWALLOW (batched) nsys per-kernel 完整数据（7dad1447）
+
+**配置**：SWALLOW + VERIFY_GRAPH + SH_PAIR_M=1 + Wave 1 + AR_V5=0（nccl）+ 计数 1-100
+
+| 排名 | Time% | 总时间(ms) | 实例数 | 平均(μs) | Kernel | 对比 lazy |
+|---|---|---|---|---|---|---|
+| 1 | **36.0%** | 72.3 | 924 | **78.3** | **AR (pubred_v5_hcpost)** | ↑ 27.1%→36.0% |
+| 2 | 17.4% | 34.9 | 15,744 | 2.2 | interleave_gateup_fp4 | ↓ 19.0%→17.4% |
+| 3 | 15.1% | 30.4 | 2,841 | 10.7 | gemm_fp8_gemv | ↓ 18.5%→15.1% |
+| 4 | 6.7% | 13.6 | 924 | 14.7 | hc_dots_late | ↓ 7.8%→6.7% |
+| 5+6 | 8.7% | 17.6 | 924 | 19.0 | expert_gemv_fp4 ×2 | ↓ 9.6%→8.7% |
+
+**关键发现**：
+1. **AR #1 在两条路径**（lazy 27.1% / SWALLOW 36.0%）——**AR 优化是共同最大目标！**
+2. **SWALLOW 的 AR 平均 78.3μs vs lazy 的 53.4μs**（慢 46%！）——batched 的 AR 每次 handle 更多数据
+3. **MoE/gemv/hc 在 SWALLOW 下更低**（batched 的效率稍好）
+4. **SH_PAIR 没出现在 top**（可能包含在 gemv 或 AR 的 epilogue 中）
+
+**400 冲刺的优化目标（从 SWALLOW nsys 推导）**：
+1. **AR（36.0% = ~11.2ms/步）**——最大目标！AR 优化可省 -3~5ms
+2. **MoE（17.4% = ~5.4ms）**——tcgen05 可省 -2ms
+3. **gemv（15.1% = ~4.7ms）**——投影优化
+4. **hc（6.7% = ~2.1ms）**——已优化
