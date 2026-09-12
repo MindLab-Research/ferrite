@@ -5587,3 +5587,19 @@ pos=20/22: epoch=54（持续冻结）
 **最强假设（流断言缺失）**：pad kernel 在 stream A 读 e=54（过期），AR 在 stream B 已推进到 999——pad 的 e+pad=54+0=54 覆盖了 999！
 
 **一次运行判死的动作**：三处入口（v5_epoch_pad / AR / argmax）各加 debug_assert_eq!(stream) + eprintln 打印 cudaStream_t
+
+## 🎯 流假设排除——所有组件都在 self.stream！
+
+**亲自验证**（读 device.rs + devrt.rs）：
+- `v5_epoch_pad`（device.rs:3250）：`f(..., self.stream)` ✓
+- `p2p_ar_v5`（device.rs:4567）：`f(..., self.stream)` ✓
+- `graph_launch`（devrt.rs:1534）：`f(e, self.stream)` ✓
+
+**三者全部用 self.stream——流断言假设被排除！**
+
+**且 SWALLOW 测试没有 VERIFY_FORK**（没有 fork streams）——图内也不会有 fork stream。
+
+**剩余假设**（epoch54-source-and-stop 的 R-A）：
+- **观测错位**：D2H 读到的不是 AR 写的那个字
+- 检查：AR 的调用者传的 epoch 指针是否与 `c.epoch_dev()` 一致？
+- 如果 AR 写 A 位置而 ledger 读 B 位置——"降级"是读错位置
