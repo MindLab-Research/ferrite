@@ -145,6 +145,36 @@ __device__ __forceinline__ uint4 ld_uint4_a16(const uint8_t* __restrict__ p) {
     return v;
 }
 
+// 8-byte sibling of ld_uint4_a16: same contract, same reason, HALF the granule.
+//
+// The gate/up pair body's direct (non-prefetch) weight reads are uint2 loads,
+// and a `uint2` REQUIRES an 8-byte-aligned address - 4 bytes off is the same
+// err 716 ("misaligned address") as the uint4 case, reported just as detached
+// from the cause. The prefetch PROLOGUE has its own `al_ok` gate, but that gate
+// guards ONLY the cp.async issue: the direct-read path is what nearly every
+// group of every warp walks (only the first group of the row-base warp comes
+// from the ring), and it is reached with `pf_ok == false` on every launch whose
+// `pf` is 0 and on every warp whose row is past n_total - i.e. the prologue
+// guard does not cover it.
+//
+// The pool base is 256-byte aligned and every per-expert stride here is a
+// multiple of 8 today, but the B side is addressed through a TP-sharded
+// `DevBuf::view` of the checkpoint (b_base + e*b_stride), which does not
+// inherit the 16-byte alignment of the mapped allocation - a shard boundary can
+// leave one rank's w3 view 4 bytes off while every other rank is fine.
+//
+// Same cure as the uint4 helper: plain load on the aligned fast path, byte-wise
+// copy otherwise. The 8 bytes are IDENTICAL either way (`v.x` is p[0..3]
+// little-endian, `v.y` p[4..7]), so no numeric domain changes - it only removes
+// the fault.
+__device__ __forceinline__ uint2 ld_uint2_a8(const uint8_t* __restrict__ p) {
+    if ((reinterpret_cast<uintptr_t>(p) & 7u) == 0)
+        return *reinterpret_cast<const uint2*>(p);
+    uint2 v;
+    __builtin_memcpy(&v, p, 8);
+    return v;
+}
+
 // e8m0 -> f32 (2^(b-127); 0xFF is NaN, mirroring quant.rs).
 [[maybe_unused]] __device__ __forceinline__ float ue8m0_to_f(uint8_t b) {
     return __uint_as_float(((uint32_t)b) << 23);
@@ -1639,12 +1669,12 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                     if (ILV) {
                         const uint4 v4 = from_pf
                             ? *reinterpret_cast<const uint4*>(pf_ring + (size_t)(lane << 4))
-                            : *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
+                            : ld_uint4_a16(g_row + (size_t)2 * q);
                         gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
                     } else {
                         const uint2 gw = from_pf
                             ? *reinterpret_cast<const uint2*>(pf_ring + (size_t)(lane << 3))
-                            : *reinterpret_cast<const uint2*>(g_row + q);
+                            : ld_uint2_a8(g_row + q);
                         gw0 = gw.x; gw1 = gw.y;
                     }
                 } else if (pf_ok && (row == row_base)) {
@@ -1670,12 +1700,12 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                         dsv41_gateup_pf_group<ILV>(slot, g_row, u_row, gi, lane);
                     dsv41_gateup_pf_commit();
                 } else if (ILV) {
-                    const uint4 v4 = *reinterpret_cast<const uint4*>(g_row + (size_t)2 * q);
+                    const uint4 v4 = ld_uint4_a16(g_row + (size_t)2 * q);
                     gw0 = v4.x; gw1 = v4.y; uw0 = v4.z; uw1 = v4.w;
                 } else {
-                    const uint2 gw = *reinterpret_cast<const uint2*>(g_row + q);
+                    const uint2 gw = ld_uint2_a8(g_row + q);
                     gw0 = gw.x; gw1 = gw.y;
-                    const uint2 uw = *reinterpret_cast<const uint2*>(u_row + q);
+                    const uint2 uw = ld_uint2_a8(u_row + q);
                     uw0 = uw.x; uw1 = uw.y;
                 }
                 float gp0 = 0.f, gp1 = 0.f, gp2 = 0.f, gp3 = 0.f;
@@ -1721,7 +1751,7 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                     if (!ILV) {
                         const uint2 uw = from_pf
                             ? *reinterpret_cast<const uint2*>(pf_ring + 256 + (size_t)(lane << 3))
-                            : *reinterpret_cast<const uint2*>(u_row + q);
+                            : ld_uint2_a8(u_row + q);
                         uw0 = uw.x; uw1 = uw.y;
                     }
                 }
