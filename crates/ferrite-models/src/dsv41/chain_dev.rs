@@ -2942,8 +2942,24 @@ impl<'a> DevChain<'a> {
             "dspark_shadow_step: `pos` must be the device position counter's current value"
         );
 
+        // Bisect gate (DSV41_DSPARK_MODE): "draft" runs the draft only,
+        // "verify" skips the draft and feeds a constant block — for localising
+        // a wedge between the two halves. Default "full".
+        static BISECT: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        let bisect = *BISECT.get_or_init(|| {
+            match std::env::var("DSV41_DSPARK_MODE").as_deref() {
+                Ok("draft") => 1u8,
+                Ok("verify") => 2u8,
+                _ => 0u8,
+            }
+        });
+
         // 1. the snapshot, BEFORE the step that moves the counter
-        let host_mirrors = self.dspark_snapshot(pos_ctr, m)?;
+        let host_mirrors = if bisect == 1 {
+            Vec::new()
+        } else {
+            self.dspark_snapshot(pos_ctr, m)?
+        };
 
         // 2. the real step: the whole-step graph (tap hook included), the argmax,
         //    and the position counter + 1
@@ -2954,15 +2970,23 @@ impl<'a> DevChain<'a> {
         // the same one the host reference's `forward_spec(.., start_pos)` uses.
         let t = std::time::Instant::now();
         dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
-        dspark.draft_forward(token, pos)?;
-        let drafts = dspark.drafts()?;
+        let drafts = if bisect == 2 {
+            [token; DSPARK_DRAFTS]
+        } else {
+            dspark.draft_forward(token, pos)?;
+            dspark.drafts()?
+        };
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // 6. the verify block: one m-row forward, per-row argmax. It appends the
         //    block to the ring at `pos + 1 + j` and runs the block's compressor —
         //    all of which step 8 undoes.
         let t = std::time::Instant::now();
-        let rows = self.step_rows(&drafts)?;
+        let rows = if bisect == 1 {
+            Vec::new()
+        } else {
+            self.step_rows(&drafts)?
+        };
         let verify_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // 7. rollback, immediately after the verify and BEFORE the host-only
