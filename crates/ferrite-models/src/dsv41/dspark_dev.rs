@@ -238,6 +238,21 @@ struct DraftP3a {
 ///
 /// Read once and cached (the house rule for hot-path gates): this branch runs
 /// `bs x n_mtp` times per draft step.
+/// SEED POSITION FIX gate (`DSV41_SEED_POS`, DEFAULT OFF): seeds the draft's
+/// ring at `pos` (the audit's official semantics) instead of `pos-1`. The
+/// GPU A/B (079ffbaf) showed this arm DEGRADES text (Latin fragments return)
+/// when applied WITHOUT the win_rows/ensure_idxs co-fix — the window must
+/// include the seed slot and the block rows must not double-cover position
+/// pos. Gated OFF pending that co-fix.
+fn seed_pos_fix() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_SEED_POS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// TAP BF16 ROUND-TRIP gate (`DSV41_TAP_BF16`, DEFAULT OFF): rounds the dspark
 /// draft's `main_h` input (the concatenated target-layer hidden states) back to
 /// bf16 precision, matching the official model's dtype for the tensors the MTP
@@ -1710,7 +1725,17 @@ impl<'a> DsparkDev<'a> {
         // draft_forward(next, pos+1), do NOT also apply this fix (the audit
         // warns the two would overshoot by one).
         debug_assert!(pos > 0, "draft_forward: the anchor is never at pos 0");
-        self.seed_window(s, pos, slot_dev)?;
+        // P0-1 REVERT (GPU-verified 079ffbaf): the seed at `pos` (the audit's
+        // official semantics) DEGRADED the text — Latin fragments returned
+        // (ellantdot/estrganoasc/henyasc, 15 double-chars) because the fix
+        // changed the ring layout WITHOUT the win_rows/ensure_idxs co-fix
+        // (the window must be [pos-win+1, pos] INCLUDING the seed slot, and
+        // the block's own rows must not double-cover position pos). The seed
+        // at pos-1 with the default window is the last VERIFIED-CORRECT
+        // combination (zero Latin, BF16_TRUNCATE). Gate the experimental
+        // arm for the follow-up investigation (win_rows co-fix).
+        let seed_pos = if seed_pos_fix() { pos } else { pos - 1 };
+        self.seed_window(s, seed_pos, slot_dev)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — the historical call

@@ -453,6 +453,75 @@ impl Collective {
         Ok(true)
     }
 
+    /// The MULTI-ROW form of [`Self::all_reduce_inplace_hcpost`]
+    /// (`ferrite_p2p_ar_v5_hcpost_rows`): the verify forward's `hc_post` folded
+    /// into the AR that produced its `x`. `buf` is the `rows * hc_h`-float AR
+    /// payload (`wo_out_r` / `moe_out_r`, row stride `hc_h`, reduced in place —
+    /// the result is exactly the `x` the standalone post consumes); `res` is the
+    /// residual block `[rows, hc_n, hc_h]` and `post` / `comb` are its per-row
+    /// coefficient slices `[rows, hc_n]` / `[rows, hc_n, hc_n]`, i.e. the layout
+    /// `hc_post_inplace_rows` takes.
+    ///
+    /// Returns `Ok(true)` when the fused path ran — the caller MUST then skip the
+    /// standalone `hc_post_inplace_rows`; `Ok(false)` means the protocol or the
+    /// shape declined and the caller must use the
+    /// `all_reduce_inplace` + `hc_post_inplace_rows` pair instead.
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_inplace_hcpost_rows(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        res: *mut f32,
+        post: *const f32,
+        comb: *const f32,
+        rows: i32,
+        hc_n: i32,
+        hc_h: i32,
+    ) -> Result<bool> {
+        // Same shape gate as `dsv41_hc_post_inplace_rows`: `h % 4 == 0` (the
+        // float4 path, and what keeps a payload float4 inside one row) and
+        // `1 <= n <= 8` (the register-staging bound); plus `n == rows * hc_h`
+        // (the payload is exactly the block's rows).
+        if !ar_v5()
+            || rows <= 0
+            || hc_n <= 0
+            || hc_n > 8
+            || hc_h <= 0
+            || (hc_h & 3) != 0
+            || (len / 4) as i32 != rows * hc_h
+        {
+            return Ok(false);
+        }
+        let n = (len / 4) as c_int;
+        let stride = self.slot_stride_elems();
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        if !self.dev.p2p_ar_v5_hcpost_rows(
+            buf as *const f32,
+            self.peer_slots.ptr as *const *mut f32,
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+            res,
+            post,
+            comb,
+            hc_n as c_int,
+            hc_h as c_int,
+            rows as c_int,
+        )? {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
     /// Publish `len` bytes from `src` into slot `rank` of every rank. `len`
     /// must not exceed the slot size: a site with a shorter payload than the
     /// staging would otherwise publish unrelated memory.

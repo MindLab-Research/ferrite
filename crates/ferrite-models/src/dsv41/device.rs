@@ -1089,9 +1089,38 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// The MULTI-ROW form of `p2p_ar_v5_hcpost` (`ferrite_p2p_ar_v5_hcpost_rows`):
+    /// the AR payload is `hc_rows * hc_h` floats with row stride `hc_h`, and
+    /// `hc_res` / `hc_post` / `hc_comb` are the per-row slices the m-row
+    /// `hc_mixes` writes (`res + r*hc_n*hc_h`, `post + r*hc_n`,
+    /// `comb + r*hc_n*hc_n`). One launch replaces the verify's
+    /// `all_reduce_inplace` + `hc_post_inplace_rows` pair (2 launches -> 1 at
+    /// each of the 2 AR sites per layer). A stale `.so` reports `Ok(false)` and
+    /// the caller keeps the pair.
+    p2p_ar_v5_hcpost_rows: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *mut f32,
+            *const f32,
+            *const f32,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
 }
 
-// ------------------------------------------------------------------- Device
 
 /// The DeepSeek device handle: the shared runtime plus this model's kernel
 /// table. Every primitive below forwards to [`DevRuntime`]; only the kernel
@@ -1229,6 +1258,7 @@ impl Device {
             p2p_ar_v5_hcpost: ko!(rt, "ferrite_p2p_ar_v5_hcpost"),
             p2p_ar_v5_add: ko!(rt, "ferrite_p2p_ar_v5_add"),
             p2p_ar_v5_hcpost_add: ko!(rt, "ferrite_p2p_ar_v5_hcpost_add"),
+            p2p_ar_v5_hcpost_rows: ko!(rt, "ferrite_p2p_ar_v5_hcpost_rows"),
         };
         Ok(Device { rt, kernels, stream, hc_split_armed: std::cell::Cell::new(false) })
     }
@@ -1594,6 +1624,15 @@ impl Device {
     /// (`ferrite_p2p_ar_v5_hcpost_add`) — the one the default MoE AR uses.
     pub fn supports_ar_hcpost_add(&self) -> bool {
         self.kernels.p2p_ar_v5_hcpost_add.is_some()
+    }
+
+    /// True when the loaded `.so` carries the MULTI-ROW hc-post fold
+    /// (`ferrite_p2p_ar_v5_hcpost_rows`) — the verify path's AR fold
+    /// (`chain_dev::ChainDev::ar_hc_post_fold_rows`). A stale `.so` reports false
+    /// and the caller keeps the `all_reduce_inplace` + `hc_post_inplace_rows`
+    /// pair, so the switch is free to make.
+    pub fn supports_ar_hcpost_rows(&self) -> bool {
+        self.kernels.p2p_ar_v5_hcpost_rows.is_some()
     }
 
     pub fn gemm_fp8_mx(
@@ -4132,6 +4171,54 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "ferrite_p2p_ar_v5_hcpost_add")?;
+        Ok(true)
+    }
+
+    /// The MULTI-ROW hc-post fold (`ferrite_p2p_ar_v5_hcpost_rows`): AR v5 with
+    /// `hc_post_inplace_rows` in the pubred epilogue. `hc_rows` is the number of
+    /// rows in the payload and `hc_h` their stride (the residual's column count);
+    /// `n` must be `hc_rows * hc_h`. `Ok(false)` when the `.so` predates the entry
+    /// (or the launcher rejects the shape, returns 1), so the caller runs the
+    /// plain `all_reduce_inplace` + `hc_post_inplace_rows` pair instead.
+    ///
+    /// The caller MUST NOT have issued any other all-reduce since its store/
+    /// producer (the v5 epoch contract), exactly as [`Self::p2p_ar_v5_hcpost`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_v5_hcpost_rows(
+        &self,
+        partial: *const f32,
+        staging_tbl: *const *mut f32,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+        hc_res: *mut f32,
+        hc_post: *const f32,
+        hc_comb: *const f32,
+        hc_n: c_int,
+        hc_h: c_int,
+        hc_rows: c_int,
+    ) -> Result<bool> {
+        let f = match self.kernels.p2p_ar_v5_hcpost_rows {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(partial, staging_tbl, ready_tbl, epoch, staging_local, ready_local, out, n,
+              world, my_rank, stride, hc_res, hc_post, hc_comb, hc_n, hc_h, hc_rows,
+              self.stream)
+        };
+        // 1 == the launcher declined the shape (see
+        // `ferrite_p2p_ar_v5_hcpost_rows`); the caller then runs the unfused pair.
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "ferrite_p2p_ar_v5_hcpost_rows")?;
         Ok(true)
     }
 

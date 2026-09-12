@@ -4222,6 +4222,60 @@ impl<'a> DevChain<'a> {
         )
     }
 
+    /// [`Self::ar_hc_post_fold`] for the VERIFY (m-row) chain: fold this block's
+    /// `hc_post_inplace_rows` into the AR that just produced its `x`.
+    ///
+    /// Same contract as the single-row fold — the AR is the last writer of the
+    /// payload and the hc-post reads/writes only the residual stream, so the two
+    /// can share one launch — with the two multi-row differences:
+    ///
+    ///  * the payload is `rows * dim` floats (row stride `dim`): the AR result of
+    ///    row `r` IS that row's `x`, which the standalone
+    ///    `hc_post_inplace_rows` would have re-read out of the same buffer; and
+    ///  * the residual / coefficients are the per-row slices the m-row
+    ///    `hc_mixes` wrote — `h_r + r*hc*dim`, `post_r + r*hc`,
+    ///    `comb_r + r*hc*hc` — the exact layout `hc_post_inplace_rows` takes.
+    ///
+    /// Returns `Ok(true)` when the fold ran, in which case the caller
+    /// ([`Self::layer_rows`]) MUST skip its `hc_post_rows`. Every decline — the
+    /// `DSV41_VERIFY_AR_FOLD` gate (default OFF), `fuse_c()` /
+    /// `hc_verify_fuse()` off, a shape the launcher rejects, or a `.so` without
+    /// `ferrite_p2p_ar_v5_hcpost_rows` — returns `Ok(false)` and leaves the
+    /// caller on the `all_reduce_inplace` + `hc_post_rows` pair it used before.
+    ///
+    /// The tail-split join sits HERE rather than in the caller, for the same
+    /// reason as the single-row fold: the fused epilogue is the first consumer of
+    /// the LATE half's `comb`/`post` (and its residual write clobbers memory the
+    /// LATE half is still reading), so the side stream's join event must be waited
+    /// on the main stream BEFORE this launch. No-op when no split is armed.
+    fn ar_hc_post_fold_rows(
+        &self,
+        c: &std::sync::Arc<Collective>,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        rows: usize,
+    ) -> Result<bool> {
+        if !Self::verify_ar_fold()
+            || !Self::fuse_c()
+            || !Self::hc_verify_fuse()
+            || !self.dev.supports_ar_hcpost_rows()
+        {
+            return Ok(false);
+        }
+        self.dev.hc_tail_join()?;
+        let (dim, hc) = (self.cfg.dim, self.cfg.hc_mult);
+        c.all_reduce_inplace_hcpost_rows(
+            buf,
+            len,
+            self.s.h_r.ptr as *mut f32,
+            self.s.post_r.as_f32(),
+            self.s.comb_r.as_f32(),
+            rows as i32,
+            hc as i32,
+            dim as i32,
+        )
+    }
+
     /// ADD_EPI readiness: the biased AR entry this layer's fold would actually
     /// use must exist in the loaded .so. With the default hc-post fold
     /// ([`Self::hcpost_epi`] + [`Self::fuse_c`]) the MoE AR goes through the
@@ -8297,8 +8351,15 @@ impl<'a> DevChain<'a> {
             m,
             hc_done,
         )?;
-        self.attention_rows(layer, m, pos_base)?;
-        self.hc_post_rows(self.s.wo_out_r.ptr as *const f32, m)?;
+        let attn_folded = self.attention_rows(layer, m, pos_base)?;
+        // `DSV41_VERIFY_AR_FOLD` off (default): the plain AR left `wo_out_r`
+        // holding the summed rows and this is the post that consumes it.
+        // On: the AR's pubred epilogue already wrote `h_r`, so the standalone
+        // post (and its `hc_tail_join`, which the fold did before its launch)
+        // must NOT run — otherwise the mix would be applied twice.
+        if !attn_folded {
+            self.hc_post_rows(self.s.wo_out_r.ptr as *const f32, m)?;
+        }
 
         // ---------------- FFN block ----------------
         let (ffn_nw, ffn_pc, ffn_out): (*const f32, *const f32, *mut f32) = if Self::fuse_b1() {
@@ -8356,8 +8417,11 @@ impl<'a> DevChain<'a> {
             m,
             ffn_done,
         )?;
-        self.moe_rows(layer, ld, m)?;
-        self.hc_post_rows(self.s.moe_out_r.ptr as *const f32, m)?;
+        let moe_folded = self.moe_rows(layer, ld, m)?;
+        // Same `DSV41_VERIFY_AR_FOLD` contract as the attention side.
+        if !moe_folded {
+            self.hc_post_rows(self.s.moe_out_r.ptr as *const f32, m)?;
+        }
 
         // ---- the DSpark tap: `layer()`'s hook, all rows in ONE launch ----
         // The real-commit path (`dspark_spec_step`) hands the ACCEPTED PREFIX of
@@ -8441,7 +8505,11 @@ impl<'a> DevChain<'a> {
     /// multi-row steps are `verify_ring_win` (one launch appends the whole block to
     /// the window ring and emits the per-row causal window) and the wo all-reduce,
     /// whose payload is simply m rows.
-    fn attention_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<()> {
+    ///
+    /// Returns whether the wo AR took the `DSV41_VERIFY_AR_FOLD` fold, i.e. its
+    /// pubred epilogue already wrote this block's `hc_post` onto `h_r` — in which
+    /// case `layer_rows` must NOT run the standalone `hc_post_rows`.
+    fn attention_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hd = cfg.head_dim;
@@ -9211,14 +9279,29 @@ impl<'a> DevChain<'a> {
         // The payload is the m rows of `wo_out_r` instead of one: the AR is a
         // byte-wise operation that sums the ranks in ascending order, so each row's
         // per-element sum is the same values in the same order as the single-row AR
-        // of that row would have been. The hc-post fold (`HCPOST_EPI`) is a
-        // single-row epilogue and is not taken; the standalone `hc_post` in
-        // `layer_rows` is the pair it was verified against.
+        // of that row would have been.
+        //
+        // `DSV41_VERIFY_AR_FOLD` (default OFF): the hc-post fold now HAS a
+        // multi-row epilogue (`ferrite_p2p_ar_v5_hcpost_rows`) — it consumes the
+        // AR result per row (`row = (i4<<2) / dim`, `hc_h % 4 == 0` keeps a
+        // float4 inside one row) and writes `h_r` in the same ascending-k
+        // `__fmaf_rn` order `hc_post_inplace_rows` does. When it runs the caller
+        // (`layer_rows`) skips its `hc_post_rows`; when it declines the AR is the
+        // untouched plain one and the standalone post runs as before.
+        let mut folded = false;
         if let Some(c) = self.comm.clone() {
-            c.all_reduce_inplace(self.s.wo_out_r.ptr as *mut std::ffi::c_void, fb(m * dim))?;
+            folded = self.ar_hc_post_fold_rows(
+                &c,
+                self.s.wo_out_r.ptr as *mut std::ffi::c_void,
+                fb(m * dim),
+                m,
+            )?;
+            if !folded {
+                c.all_reduce_inplace(self.s.wo_out_r.ptr as *mut std::ffi::c_void, fb(m * dim))?;
+            }
             c.end_round();
         }
-        Ok(())
+        Ok(folded)
     }
 
     /// Publish ONE index key: the roped `wk` projection of `layer`'s pooled
@@ -10161,7 +10244,12 @@ impl<'a> DevChain<'a> {
         Ok(true)
     }
 
-    fn moe_rows(&mut self, layer: usize, ld: &LayerDev, m: usize) -> Result<()> {
+    /// The multi-row MoE: the m-row twin of [`Self::moe`], ending in the MoE
+    /// all-reduce over the block's rows. Returns whether that AR took the
+    /// `DSV41_VERIFY_AR_FOLD` fold, i.e. its pubred epilogue already wrote this
+    /// block's `hc_post` onto `h_r` — in which case `layer_rows` must NOT run the
+    /// standalone `hc_post_rows`.
+    fn moe_rows(&mut self, layer: usize, ld: &LayerDev, m: usize) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let inter = cfg.moe_inter_dim;
@@ -10688,12 +10776,23 @@ impl<'a> DevChain<'a> {
 
         // ---- the MoE all-reduce ----
         // Payload = the m rows of `moe_out_r`. Byte-wise and ascending-rank, so
-        // each row's sum is the single-row AR's sum for that row.
+        // each row's sum is the single-row AR's sum for that row. Same
+        // `DSV41_VERIFY_AR_FOLD` contract as the attention side: when the fold
+        // runs, `layer_rows` skips its `hc_post_rows`.
+        let mut folded = false;
         if let Some(c) = self.comm.clone() {
-            c.all_reduce_inplace(self.s.moe_out_r.ptr as *mut std::ffi::c_void, fb(mdim))?;
+            folded = self.ar_hc_post_fold_rows(
+                &c,
+                self.s.moe_out_r.ptr as *mut std::ffi::c_void,
+                fb(mdim),
+                m,
+            )?;
+            if !folded {
+                c.all_reduce_inplace(self.s.moe_out_r.ptr as *mut std::ffi::c_void, fb(mdim))?;
+            }
             c.end_round();
         }
-        Ok(())
+        Ok(folded)
     }
 
     /// The shared expert as ONE multi-row pass (`DSV41_SH_EXP_MROWS`, DEFAULT
@@ -11184,6 +11283,27 @@ fn fuse_b1() -> bool {
 fn hc_verify_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_HC_VERIFY_FUSE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// The verify path's AR fold (`DSV41_VERIFY_AR_FOLD`, default OFF): `layer_rows`'
+/// two `hc_post_inplace_rows` launches move into the pubred epilogue of the AR
+/// that produced their `x` (see `ferrite_p2p_ar_v5_hcpost_rows`), 2 launches -> 1
+/// at each site — 80 of the A1 chain's 240 launches, ≈ −0.24ms at ~3µs/launch.
+///
+/// DEFAULT OFF: unlike `layer()`'s `HCPOST_EPI` (single-row, already A/B'd), this
+/// folds a chain the verify path has never folded, and the m-row epilogue lives in
+/// a different translation unit than `dsv41_hc_post_inplace_rows_kernel` — the
+/// same class of change as `HCPOST_EPI`, hence the same "off is the A/B arm" rule.
+///
+/// The fold only runs when the caller would otherwise have taken the IN-PLACE
+/// rows post: it is additionally gated on [`fuse_c`] (the staging `hc_post` +
+/// `h2_r` copy pair is a different data path) and on [`Self::hc_verify_fuse`]
+/// (A1) so `DSV41_HC_VERIFY_FUSE=0` keeps restoring the raw chain bit for bit,
+/// and on the `.so` carrying `ferrite_p2p_ar_v5_hcpost_rows`
+/// ([`Device::supports_ar_hcpost_rows`]).
+fn verify_ar_fold() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_VERIFY_AR_FOLD").map(|v| v != "0").unwrap_or(false))
 }
 
 /// A2 (`DSV41_HC_FRONT_ROWS`, default OFF): route `layer_rows`'s two per-layer
