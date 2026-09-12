@@ -5094,3 +5094,30 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 **测试后的决策树**：
 1. tcgen05 成功（94-95）→ 干净栈 + tcgen05 → L4-9 A/B → aligned 模式
 2. tcgen05 失败 → 保持 91.1 → L4-9 A/B → aligned 模式（绕过 SWALLOW）
+
+## aligned vs lazy 的对比分析（为什么 lazy 更快）
+
+**未优化基线的对比**：
+| 模式 | 未优化吞吐 | ar5-hang |
+|---|---|---|
+| lazy（per-row）| 78.8 | 0 ✓ |
+| aligned（batched m=6）| 64 | 0 ✓ |
+
+**lazy 比 aligned 快 23%**——batched 的理论优势（weight sharing）被 instruction-bound kernel 否定！
+
+**优化后的预测**（同比例缩放）：
+- lazy：78.8 → 91.1（+15.6%）
+- aligned：64 × (91.1/78.8) ≈ **74**（如果同比例）——仍慢于 lazy！
+
+**batched 为什么慢**（之前的分析确认）：
+1. warp-per-row：M 只加每 warp 工作量不加并行度
+2. kernel 是 instruction-bound（0.7-4.9% 峰值带宽）——省字节≈0
+3. batched 的激活侧 ×6（每行都要处理）
+4. aligned 还要付主链步分离的额外成本（+6.15ms）
+
+**结论**：aligned 模式（即使优化）不太可能超过 lazy 的 91.1。batched 的真正优势需要 "M 进 grid" 的 kernel 重写（L4/L5 的核心工作）。
+
+**400 的真正路径**：
+1. lazy 逼近 145（L4/L5 kernel 工作）——不够 400
+2. **batched 的 kernel 重写**（"M 进 grid" 化）——L4/L5 的 25-35 人日
+3. SWALLOW 修复（如果第 10 次成功）——但 SWALLOW 的 hang 修复后 batched 还是要 kernel 重写才能超 145
