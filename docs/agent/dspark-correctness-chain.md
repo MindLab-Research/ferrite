@@ -6526,3 +6526,23 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 - MARKOV_SLICED / LAZY_SDR（accept 退化）
 
 **核心模式**：SWALLOW batched 路径对几乎所有"优化"都是负收益！只有 mrows b2+b3 有效（+9.4%）。batched m=6 的 kernel 已接近当前架构的最优。
+
+## AR R1 (SINGLE_POLL) 在 LAZY 上的结果（b6b31bf2）——中性！
+
+**结果**：
+- **吞吐 = 90.0 tok/s**（vs lazy 基线 91.1——中性，-1.1 噪声内）
+- 前 61 行=True ✓ 零拉丁 ✓ 0 panic 0 hang ✓
+
+**AR R1 的完整判定**：
+| 路径 | 吞吐 | 判定 |
+|---|---|---|
+| LAZY + SINGLE_POLL | 90.0 (vs 91.1) | **中性** |
+| SWALLOW + SINGLE_POLL | 10.7 (vs 63.8) | **7× 退化** |
+
+**AR 优化的最终状态**：
+- R1 (SINGLE_POLL)：两条路径都无效果 → **永久 OFF**
+- R2 (attn+MoE merge)：拓扑不可能（依赖链 attn→MoE→AR 无法合并）
+- R3 (PDL)：只 0.17-0.4ms（低价值）
+- **AR 卡在 6.58ms/步（36%）**——当前架构下无法优化
+
+**Session 的 AR 优化判决**：AR 的所有三条路都走不通。AR 的等待是跨 rank rendezvous（77.7μs/轮的 spin），只有 R2 的合并能减轮次但拓扑不可能。**AR 优化关闭。**
