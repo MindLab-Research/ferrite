@@ -3608,3 +3608,23 @@ self.dev.gemm_fp8_mx_rope_norm(
 | 无图（计数）| 937 ❌ |
 | Plan B（臂投票）| 10,099 ❌ |
 | **Plan B + spec_primed_unanimous** | **49,583 ❌** |
+
+## SWALLOW hang 的 argmax_rows 分析（kernel 级）
+
+**argmax_xchg_v5_rows_kernel 的设计**（dsv41_kernels.cu:7865-7939）：
+- **ONE v5 round for the whole block**（m=6 行一次交换，不是 6 次）
+- pos_ctr 为 NULL（verify 的 accept 逻辑推进计数器）
+- **注释自述**（:7924-7925）：**"a hang that only ever happens at rows > 1 is the v5 round-count desync the batching exists to avoid"**——rows>1 的 hang 就是轮次去同步！
+
+**gap=25 的解释**：25 步 × 1 轮/步的差异——某个 rank 每步多做或少做 1 轮 argmax
+**可能的来源**：
+1. 某个 rank 的 verify 块走了单行 argmax（m 次轮）而其他走多行（1 次轮）→ gap = m-1 = 5/步（不对，gap 应该是 5×25=125）
+2. 某个 rank 每步多 1 轮（gap=1×25=25 ✓）——如锚行的单独 argmax？
+3. SWALLOW 的 draft 路径比 aligned 多 1 轮 argmax？
+
+**SWALLOW vs aligned 的 argmax 差异**：
+- aligned：主链步（1 次 argmax）+ verify 块 m=5（1 次 argmax_rows rows=5）= 2 轮/步
+- SWALLOW：verify 块 m=6（1 次 argmax_rows rows=6）= 1 轮/步？
+- **如果 SWALLOW 还有别的地方做 argmax（如 tap_commit 的交换？）——轮次会不匹配**
+
+**7 次修复尝试的教训**：ar5-hang 的根因不是单一的——臂足迹（已修）+ argmax 轮次（未修）可能同时存在
