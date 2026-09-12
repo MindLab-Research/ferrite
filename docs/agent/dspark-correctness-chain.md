@@ -479,3 +479,22 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 ⇒ **"acs"/"ibu" 是 ferrite backbone 的数值路径偏差**，不是模型固有歧义。官方也是 fp8（dtype: fp8, expert_dtype: fp8）——**不能归因于 fp8 格式本身**。差异在 ferrite 的实现。
 
 **下一步**：首步 top-k logits 对齐（官方 vs ferrite 的 prompt 逐 token 对照）——分歧从很早的位置就开始（首 token 官方 `《出师表》` vs ferrite `《前出师表》`——prompt 措辞差导致，但 acs 位点的分歧是数值）。
+
+## lazy verify GPU 验证（6e48fc0d）——verify 37.95ms 未降（lazy 未生效）
+
+**配置**：SPEC + E4M3 + SH_EXP + P3A + **LAZY_VERIFY=1**，1000 tok 出师表
+
+| 指标 | batched（无 lazy） | lazy |
+|---|---|---|
+| 文本 | LEN 142 双字 0 acs/ibu | **相同**（LEN 142 双字 0 acs/ibu ✓） |
+| verify | 38.34ms | **37.95ms**（几乎相同） |
+| 步时 | ~49ms | ~49ms |
+| k_acc | {0:50,1:14,2:10,3:3} | **相同** {0:50,1:14,2:10,3:3} |
+
+**判定**：lazy verify **没有生效**——verify 37.95ms 与 batched 38.34ms 几乎相同。文本一致（说明代码路径可能走了但路由选了 batched）。
+
+**根因分析**：
+1. `lazy_route_decide()` 的阈值 `τ = B/c - 1`——B 是进程级 OnceLock（首次 note 前=0），c=6.15——**首次调用时 B=0 → τ = 0/6.15 - 1 = -1 → mean_k(≥0) 永远 ≥ τ → 永远选 batched**！
+2. B 只在 `lazy_b_ms_note(rep.verify_ms)` 时更新（swallowed 臂跑完后），但**首轮 legacy（未 primed）不会调 note**——B 停留在 0 → lazy 永远不被选中。
+
+**修法**：B 的初始值不应为 0——应设为合理默认（37ms）或首轮后强制 update。
