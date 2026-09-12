@@ -5077,3 +5077,20 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 1. 检查 v5-ledger 为什么没输出（D1 观测的 bug？）
 2. 分析 gap=27 的来源（不是 81——不是 step_dev 的缺失）
 3. 可能需要第 10 次修复——基于 ledger 的实测数据（先修 D1）
+
+## tcgen05 对齐修复重测的行动方案（4bb86ea5 跑中）
+
+**修复内容**：byte-fallback helpers（ld_uint32_a4/ld_uint16_a2）修复 split body 的 6 个 misaligned 读点
+
+**三种结果**：
+| 结果 | 判定 | 下一步 |
+|---|---|---|
+| ✅ 无 misaligned + 输出干净 + 吞吐 94-95 | **tcgen05 解锁！** | 干净栈升级到 ~94-95 → 继续 L4-9 和 aligned |
+| ✅ 无 misaligned 但吞吐无提升 | 对齐修复成功但 tcgen05 收益 < 预期 | GATEUP_FUSE=0 的损失抵消了 tensor cores 的收益 → 保持 OFF |
+| ❌ 仍 misaligned | 对齐修复不完整 | 分析哪个读点还有对齐问题 |
+
+**注意**：tcgen05 需要 GATEUP_FUSE=0 + ILV=0（改变权重加载路径）——即使对齐修复成功，性能也可能不如预期（gateup fusion 的损失）
+
+**测试后的决策树**：
+1. tcgen05 成功（94-95）→ 干净栈 + tcgen05 → L4-9 A/B → aligned 模式
+2. tcgen05 失败 → 保持 91.1 → L4-9 A/B → aligned 模式（绕过 SWALLOW）
