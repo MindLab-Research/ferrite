@@ -3942,8 +3942,15 @@ impl<'a> DevChain<'a> {
     /// kernel, builds the lazy engram device state and sizes cublas' workspaces, all
     /// of which are illegal inside a capture; the SECOND captures (recording does
     /// not execute, so the graph is launched immediately after instantiation to do
-    /// this verify's real work); every later one replays. The graph is dropped by
+    /// this verify's real work); every later one replays. The graphs are dropped by
     /// [`Self::reset`].
+    ///
+    /// That schedule runs PER SHAPE, because the execs live in the shape pool
+    /// (`verify_graphs`): a request that emits `m = 5` first and `m = 6` afterwards
+    /// (SEED_ALIGN/SWALLOW) DRYs slot 0, then DRYs slot 1 on its first 6-row block,
+    /// and captures each shape on that shape's SECOND visit. Without the per-shape
+    /// slot the first DRY latched `m = 5` alone and every 6-row verify — i.e. all of
+    /// them — fell back to the direct launches, so the graph never engaged at all.
     ///
     /// The verify's snapshot/rollback/commit are OUTSIDE the graph on purpose (they
     /// are the caller's orchestration, and their host slot arithmetic has no device
