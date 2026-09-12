@@ -173,3 +173,8 @@
 1. **先仲裁 prompt**（两侧 ids 逐位 diff）
 2. **ablation 阶梯**（env 开关，每条一次 EAGER 出师表）：`DSV41_EXPERT_ILV=0`（C1 一击）→ `DSV41_SKIP_EXPERTS=1`（定位 MoE）→ 融合族逐个 `=0`（EAGER 侧从未 A/B 过的 10 个默认 ON）→ `DSV41_GRAPH_STEP=0 DSV41_AR_V5=0`（C2）
 3. checkout 二分（仅当 2 全落空）：先 `47a9bb9`（C1 直收）
+
+## 锚点版（8a5a952）的复测结果（ce055974）
+
+**锚点版起不来**：`parse config.json: missing field layer_types at line 156`——8a5a952 的 `--model dsv41` 入口还不认识当前模型目录的 config（`--model` 单二进制路由是 Wave 1 的 T3 改动，在锚点之后）。⇒ **锚点版必须用旧入口**（`dsv41-run --serve`）跑。下一轮复测用 `./target/release/dsv41-run --serve ...`。
+**远端已恢复 origin/main**（46e07eb）。
