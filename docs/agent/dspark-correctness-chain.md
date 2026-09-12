@@ -666,3 +666,20 @@ ferrite 的 mag[8] = {0, 0.5, 1, 1.5, 2, 3, 4, 6} 用 n&7（3 bits），假设�
 **ferrite 的表是正确的！** 之前 Python 脚本的位提取有误（用了 `e=(v>>2)&3; m=v&3` 即 2-bit exp + 2-bit mantissa，应该用 `e=(v>>1)&3; m=v&1` 即 2-bit exp + 1-bit mantissa）。
 
 所以 **e2m1 解码表也是一致的 ✓**。之前的"不一致"是我 Python 脚本的 bug。
+
+## Backbone 对齐 dump 首次数据（619c286a）
+
+**首步 top-10 logits**（pos=0，即 prompt 首 token 的 forward）：
+```
+#1 id=86327 val=7.834  #2 id=93614 val=7.122  #3 id=81637 val=6.514
+#4 id=81614 val=6.167  #5 id=85327 val=6.010  #6 id=89804 val=5.747
+```
+（8 个 rank 各有一条 pos=0 的 topk 行——只有 rank 0 的是全局 argmax；其它 rank 是本切片的 top）
+
+**逐层 hidden norm**（第一个 token 位置）：
+```
+l=0: 172.42  l=1: 1282.35  ... l=38: 500.89  l=39: 496.47
+```
+每层 8 行（每 rank 一行，数值相同——hidden 是 Replicated ✓）。
+
+**下一步**：官方 ref_inference 同 prompt 同 token 序列的首步 top-10 + 逐层 norm 对照。差异的层 = 偏差源。
