@@ -2321,3 +2321,23 @@ DSV41_BF16_TRUNCATE=1
 2. **DSV41_VERIFY_HEAD_MROWS=1**（chain_dev.rs:1511）——head v1 m-rows（−4 发，−0.7~0.9ms）——**LAZY_VERIFY 下无 SWALLOW 冲突！**
 
 下一轮测试加这两个 gate——合计 −1.2~1.4ms 的额外节省（零代码工作）。
+
+## 最大 A 类配置测试准备（parity 通过后跑）
+
+**Gate 组合**（A 类全开 + SH_PAIR template<M>）：
+```bash
+# Wave 1 基础
+DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1
+DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1
+# 新发现的 2 个遗漏项
+DSV41_VERIFY_ROPE_MROWS=1    # q rope m-rows（-0.53ms）
+DSV41_VERIFY_HEAD_MROWS=1    # head v1 m-rows（-0.7~0.9ms，LAZY 下无冲突）
+# SH_PAIR template<M>（parity 通过后）
+DSV41_SH_PAIR_M=1            # 三段一核（-4.9~7.9ms）
+# 标准配置
+DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+```
+
+**预期总节省**（launch 账）：Wave 1 (-8.4ms) + rope (-0.53) + head (-0.01) + SH_PAIR (-2.38 launch 账) ≈ **-11.3ms**
+**预期步时**：~33ms - 11.3 = **~22ms**（如果全部兑现）
+**@ accept 5（数字任务）**：6/0.022 = **273 tok/s**
