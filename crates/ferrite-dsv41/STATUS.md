@@ -7540,3 +7540,88 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **会话终态：13.28 → 6.23-6.26ms（+113%，160-161 tok/s）**
 
 **通往 200+ 的路径确认**：swapAB（gemv 2.33ms→0.3ms → 步 4.2ms ≈ **238 tok/s**）——swapab-impl 实施中。
+
+## 会话定案汇总（定稿，2026-09-12 00:20，HEAD `8b32bcf`）
+
+> 本节是**索引式汇总**，逐 commit 细节见上文各节；完整报告见
+> `docs/agent/dsv41-session-final-report.md`。口径：serve A/B（同二进制背靠背），
+> 判据 = 四段文本（Paris/Tokyo/1+1=/静夜思/出师表）逐字 + `faults=0` + p50。
+
+### A. 优化链（13.28 → 6.26ms）
+
+| 阶段 | 内容 | 落点 |
+|---|---|---|
+| 1–4 | shared expert TP / sparse 3-deep + e4m3 LUT / gate v2 / hc tail split | 13.28 → 8.23ms |
+| 5–9 | allv2 / cp.async 权重先行 / down 修复 / AR store 并行 / P4 act-cpasync | → 6.24ms（v9） |
+| 10–15 | *v10–v15 回归区（见 B）* | 6.31 → 6.61ms |
+| 16 | **gate 错配修复** | **6.26ms / 159.7 tok/s** ✓ |
+
+**会话终态：13.28 → 6.23–6.26ms（+113%），75.3 → 160 tok/s。**
+
+### B. v10→v16 完整侦探链（本会话最有价值的知识）
+
+| 臂 | p50 | 配置 / 判定 |
+|---|---|---|
+| v10 | 6.31ms | PDEPTH=5 + w2warm + bf16 = **+0.08 回归** |
+| v10 bisect | 6.27/6.30/6.27 | pipeline +0.04 / PDEPTH=2 +0.03 / warm +0.04 / bf16 中性 |
+| v11 | 崩溃 | 部分提交 FFI 错位（**709**），`106db01` 修复 |
+| v12 | 6.59–6.62ms | quant+swiglu fold ON = **+0.36~0.39** |
+| v12sf | **29.5s/step** | +stamp fold = 灾难（图 replay 下 counter 机制坏掉） |
+| v13 | 6.63ms | fold 代码全 OFF，**回归仍在**；v13nq=6.60 |
+| v14 | **6.60ms** | fold 代码物理清理（`175462d`）后 **清理无效** |
+| v14a/v14b | 6.61ms | sparse-merge gate =0/=1 均同 ⇒ **真中性** |
+| — | — | **residue-hunt（误诊）**：归因"热点 kernel 代码存在性" → `3570524` 回退 499 删除 |
+| v15 | 6.59ms | 错误默认：ksplit=1（**误关**）+ pipeline=2（**误开**） |
+| **v16** | **6.26ms** | `4bed9f6` 修复 gate ⇒ **恢复 0.33ms** ✓ |
+
+**真根因（gate-hygiene-audit）**：`006bd0c` 的 `FileReplace` 用 `int v = 2` 作锚点，
+**改错同名变量**——命中 `dsv41_gateup_ksplit`（`:869`，已验证 −0.33ms 收益）→ 关闭，
+而本该改的 `dsv41_gateup_pipeline`（`:965`，+0.04ms 回归）停在 `2` → 开启。
+**净 +0.37ms 隐藏回归 = v13/v14/v15 全部 6.6ms 的原因。**
+📌 **"热点 kernel 代码存在性"理论是误诊**；`3570524`（499 删除）是错诊下的过度清理，但无害、不需回滚
+（sparse-merge 确实中性、ringwin 未验证，都不值得保留）。
+
+### C. lut-floor-research 定案
+
+- **业界无"激活解码层"**：FlashInfer/DeepGEMM 对 M=1 decode 不走 LUT 解码，直接 MMA 吃 fp8/fp4。
+- **swapAB 是唯一 2× 路径**：`mma.m16n8k32` A/B 对调（权重做 M=输出行、激活做 N=token），利用率 1/16→1/8；
+  布局**零转置**、scale 方案**已存在**；a32 物化 + LUT 解码**整体删除**。预估步 **4.2ms ≈ 238 tok/s**（实施中）。
+- **a32 的 416×（实为 640×）块级冗余**：每 block 重算全部 k 元素 —— 416 blocks（n=3328）→ **640 blocks（n=5120, warps=8）**，
+  这才是 1.55µs/call 的真身。
+- **cvt 否证**：转换管 **16 results/clk/SM** < LDS **32 值/clk/SM**，且丢位一致 ⇒ 不实施。
+- **bf16-LUT 否证**：位序错配 ⇒ **49.8% 元素错**，破坏位一致。勿再提案。
+
+### D. row-stationary 定案
+
+- a32 冗余的"寄存器复用"修法：**可行，但收益 <1µs/call**（swapAB 目标 ~1.5µs/call）。
+- 阻碍：**寄存器 64 墙**（`gemm_fp8_gemv_kernel` 的 launch_bounds cap）+ **epilogue 契约**
+  （B1 fp8 行发射 / rope / AR-v5 / xq 发射要求特定行布局）。
+- **判定：性价比低于 swapAB**（同为消 a32 冗余，swapAB 收益更高且顺带删 LUT 解码）。**不做。**
+
+### E. 方法论铁律（7 条 + gate 卫生）
+
+1. **隔离探针只用于淘汰，正向收益必须 serve A/B**（隔离无法模拟 SM 争抢 / L2 竞争 / 占用率敏感；已 5 次确认隔离→生产失效）。
+2. **fork_ev 是 kernel 级，不是 block 级** —— 给 gating kernel 加工作 = 加到关键路径；小 kernel 合并的收益必须 > gate 语义的代价。
+3. **失败实验的代码立即物理删除**（不留 gated-off）；gate 必须验证"OFF 时真的回退"。
+4. **FFI 边界（.cu ↔ Rust）是原子性单位，必须同一 commit**；docs 提交用 `git add <specific-files>`（禁 `-A`）。
+5. **给热点 kernel 加运行时参数/分支 = 编译产物变重 = 回归风险（模板或独立 kernel）**
+   —— ⚠️ **修正**：v13/v14 的 +0.34ms 真因是 gate 错配（§B），此条降级为**设计偏好**，不再作该 0.34ms 的解释。
+6. **小 kernel 合并 / folding 的收益分析必须考虑 gate/fork 语义**（三条 fold 全败）。
+7. **位一致是硬约束**（bf16 LUT 的 49.8% 错误率不可接受；所有优化必须过 fingerprint / 四段文本 / 逐位验证）。
+
+**（附加，最决定性）gate 卫生**：改 gate 默认值时，`FileReplace` **必须按函数名/上下文锚定、改完读回确认**；
+裸变量声明（如 `int v = 2`）作锚点会静默改错同名对象——这一个错误造成了连续三轮误诊与 499 行无谓清理。
+
+### nsys v16 分解（会话终态基线 6.26ms，2026-09-12 12:30）
+
+| kernel | med µs | 实例 | % | 备注 |
+|---|---|---|---|---|
+| gemm_fp8_gemv | **10.98** | 23592 | 22.8% | swapAB 的目标（→1.1-1.5µs）|
+| interleave_gateup_fp4 | 2.21 | 125952 | 22.2% | 加载期一次性（非每步）|
+| hc_dots_late | 14.94 | 7680 | 9.2% | 侧流 |
+| expert_gateup<1,1> | 24.07 | 3840 | 7.4% | PDEPTH=1（P4 行为）|
+| expert_down_reduce | 17.44 | 3840 | 5.3% | |
+| hc_mixes_tail | 7.78 | 7680 | 4.8% | |
+| ar_reduce + ar_store | 7.49 + 5.70 | 7872×2 | 8.1% | |
+
+**确认**：gemm 10.98µs × 246/步 = 2.70ms 是最大项——swapAB 后 →0.3-0.4ms（省 2.3ms）→ 步 ~4.0ms ≈ **250 tok/s**。
