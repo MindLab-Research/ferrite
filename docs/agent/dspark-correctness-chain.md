@@ -2425,3 +2425,22 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **预期**：
 - parity 通过 → SH_PAIR template<M> 可以放心上生产
 - tcgen05 冒烟通过（不 misaligned）→ tcgen05 路径解锁
+
+## 当前优化的完整账本（Wave 1 + SH_PAIR + tcgen05 + SWALLOW 全部兑现后）
+
+**优化叠加**（从 lazy 基线 ~33ms serve 侧计时，准确值待 nsys）：
+| 优化 | launch 账节省 | ms 账节省 | 状态 |
+|---|---|---|---|
+| Wave 1（HC 融合 + mrows） | -8.4ms | -11~15ms | ✅ 已验证 |
+| SH_PAIR template&lt;M&gt; | -2.38ms | -4.9~7.9ms | 🔄 parity 测试中 |
+| SWALLOW_STEP | -4.55ms | -4.55ms | 🔄 ar5 修复中 |
+| tcgen05 | — | -1.0~3.8ms | 🔄 冒烟测试中 |
+| **合计（全部兑现）** | **-15.3ms** | **-21.5~31.3ms** | |
+| **预期步时** | **~18ms** | **~2-12ms** | |
+
+**⚠️ launch 账 vs ms 账的巨大差距**：launch 账（-15.3ms → 18ms）是保守估计；ms 账（-21.5~31.3ms → 2-12ms）可能过于乐观。**nsys 的 per-kernel 计时是唯一的真实答案**。
+
+**高 accept 任务（计数，accept=5）的吞吐**：
+- 保守（launch 账）：6/0.018 = **333 tok/s**（差 400 17%）
+- 乐观（ms 账）：6/0.010 = **600 tok/s** ✓✓
+- **真实值在 333-600 之间——400 是可达的**
