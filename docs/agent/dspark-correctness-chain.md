@@ -5529,3 +5529,23 @@ epoch 1328 → 54（第一次 swallowed 步的均匀降级）
 1. **AR 优化**（-3~4ms）——ar-optimization-l45-design 分析中
 2. **tcgen05**（-2ms）——TMA bulk 对齐需要修
 3. **投影优化**（-1ms）——R2 已做大部分
+
+## epoch 54 的 RESET 断言谜题（为什么没触发？）
+
+**第 11 次测试的数据**：
+- v5-ledger-pre pos=16: epoch=1328（所有 rank）
+- v5-ledger pos=24: epoch=54（swallowed，delta=0）
+- **CANARY=0**（无越界写 ✓）
+- **RESET=0**（**没有检测到降级！**——但 epoch 从 1328/1497 → 54！）
+
+**为什么 RESET 没触发？**（可能性）：
+1. **v5_ledger_seen 的序列没包含降级**——pre/note 的存储值可能在某处被重置
+2. **pre 和 note 用不同的比较逻辑**——pre 不检查（只有 note 检查？）
+3. **降级发生在 pre 之前**（上一步的 note 到这一步的 pre 之间）——序列是 [54, 54] 不是 [1497, 54]
+4. **11.0 的 RESET 逻辑有 bug**——需要读实现确认
+
+**关键线索**：delta=0 意味着 note 的当前 epoch == 存储的上一 epoch（都是 54）。如果 pre 在 pos=22 读的是 1497，note 在 pos=22 读的是 54，那 delta 应该是非零（或者 RESET 应该触发）。**delta=0 + RESET=0 = pre 和 note 读到相同的值（54）**——意味着 pre 在 pos=22 也读到了 54！
+
+**修正假设**：epoch 的降级发生在 pos=16 到 pos=22 之间（不是 pos=22 的步中！）——pre 在 pos=22 读到的已经是 54！
+
+**这改变了调查方向**：降级发生在早期（prefill 或第一个 spec 步），不是第一次 swallowed 步！
