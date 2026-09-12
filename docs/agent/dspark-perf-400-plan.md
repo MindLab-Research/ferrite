@@ -120,3 +120,34 @@
 | **步时** | **49.8** | **~14.2** |
 
 **accept 4.5 × (1000/14.2) ≈ 317 tok/s**；再压 verify（confidence 门控 / 进一步融合）或 accept 到 5.0 → **~350-380**；**400 需要 verify ≤11ms 且 draft ≤2.5ms 且 accept ≥4.8**——**三项都在本设计的能力范围内**（吞主链步是最大的单项 −6ms）。
+
+---
+
+## 八、诚实的 400 账本（2026-09-12 更新，含多行化落地后的重估）
+
+**当前实测**：步时 = 主链 6.15 + draft 4.9 + verify 38.5 + commit 0.2 ≈ **49.8ms** @ **accept 0.58** → **11.6 tok/s**。
+
+**已落地的削减**（投影/MoE 的多行化 + q_norm 批量化）：verify 的 launch 从 6232 → **~3000**（−52%）；图化（`DSV41_VERIFY_GRAPH=1`）再把 per-node submit 从 2.9µs 降到 0.4µs。
+
+**优化后的乐观账**:
+| 项 | 现在 | 优化后 | 手段 |
+|---|---|---|---|
+| verify（5 行） | 38.5 | **~11** | 多行化（−3000 launch）+ 图化（submit→0.4µs）|
+| draft | 4.9 | 4.9 | （已接近极限：head 多行 ✓、wo_a 融合 ✓、device pos ✓）|
+| 主链步 | 6.15 | **0**（6 行 verify 内化，+1.6ms）| 吞主链步 |
+| commit | 0.2 | 0.2 | — |
+| **步时** | **49.8** | **~16** | |
+
+**⇒ tok/s = accept × (1000/16) = accept × 62.5**：
+- accept 0.58（现状）→ **36 tok/s**
+- accept 2.5 → 156
+- accept 4.5 → **281**
+- accept 6.4（**全接受 block-5 的 5 个 draft + bonus**）→ **400** ✓
+
+**结论（诚实）**：**400 tok/s 的瓶颈是 accept，不是 kernel 时间**。即使 verify 压到 11ms、主链吞掉，**accept 必须 ≥6.4**（即 **5 个 draft 全部猜中**）才够——**当前 accept 0.58 ⇒ `drafts[0]==next` 只有 33%**。**SGLang 的 DSpark 在同一 checkpoint 上做到接近全中**，所以这是**我们的 draft 链的数值/语义问题**，不是模型能力问题。
+
+**⇒ 优先级重排（本会话的最终判定）**：
+1. **draft 质量**（accept 0.58 → 4+）——`draft-quality-research` 在查（tap 的层/形状、main_proj 的顺序、markov 的采样、窗口语义、dtype 路径）
+2. **verify 的多行化 + 图化**（38.5 → 11）——已落地一半，图化待 A/B
+3. **吞主链步**（−4.5ms）——`swallow-step-impl` 在实施
+4. **parity 修复**（verify 的 head 与 eager 同 kernel）——`DSV41_VERIFY_HEAD_FOLD=0` 待 A/B；根治在 `folded-head-korder`
