@@ -2356,3 +2356,32 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 2. 其他 A 类项已全部启用（Wave 1）
 
 **结论**：LAZY_VERIFY 的优化天花板是 Wave 1 + SH_PAIR。要到 400 必须切到 BATCHED/SWALLOW（那里有 head mrows + rope mrows + gate mrows 的全部收益）——但 SWALLOW 被 ar5-hang 阻塞。
+
+## 400 路径的最终总结（所有当前工作落地后的完整预期）
+
+**优化叠加表**（从 lazy 基线 ~33ms）：
+| 优化 | 节省（launch 账） | 状态 |
+|---|---|---|
+| Wave 1（HC 融合 + mrows） | -8.4ms | ✅ 已启用（GPU 验证成功） |
+| SH_PAIR template&lt;M&gt; | -2.38ms（launch）/-4.9~7.9ms（ms） | 🔄 parity 修复中 |
+| SWALLOW_STEP | -4.55ms | ❌ ar5-hang（gap 3） |
+| tcgen05 | -1.0~3.8ms | ❌ misaligned |
+| **合计（全部落地）** | **-16.3~23.7ms** | |
+| **预期步时** | **~9-17ms** | |
+
+**吞吐预期**（不同任务类型）：
+| 任务 | accept | tok/step | @ 16ms | @ 12ms | @ 9ms |
+|---|---|---|---|---|---|
+| 数字（计数） | ~5 | 6 | 375 | 500 | 667 |
+| 中等（用户校准） | ~3 | 4 | 250 | 333 | 444 |
+| 出师表 | ~1.2 | 2.2 | 137 | 183 | 244 |
+
+**判定**：
+- **400 在高 accept 任务上可达**（需要步时 ≤15ms = SWALLOW + SH_PAIR + tcgen05 全部兑现）
+- **在中等 accept（用户校准 2-3）上**：需要步时 ≤10ms（L4 级优化）
+- **在出师表上**：需要步时 ≤5.5ms（低于 L5 地板——物理不可达）
+
+**当前的三个阻塞**：
+1. SH_PAIR parity（编译修复中——subagent）
+2. SWALLOW ar5-hang（架构修复中——subagent）
+3. tcgen05 misaligned（深度调查中——subagent）
