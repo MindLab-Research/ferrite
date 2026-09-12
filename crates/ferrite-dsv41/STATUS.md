@@ -7521,3 +7521,22 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **验证**：`cargo check` 全 workspace **0 errors**；`dsv41_kernels.cu` 的 sparse/rope 区（925-1250、1750-1795）与 `d546139` **逐字节相同**；`chain_dev.rs` 的 kv/ring 段（`let kv_stream` → `// selection: the window ring`）与 np1 **逐字节相同**；`device.rs` 对应区域相同。⚠️ 远端 `nvcc -c` 编译与上机 p50 未跑（本地无 nvcc）——恢复区与 np1 同源，编译风险低，但仍建议上机前先跑一次 `nvcc -c`。
 
 **方法论铁律（第 7 条）**：**给热点 kernel 加运行时参数/分支 = 编译产物变重 = 性能回归风险**。gate OFF 只是不执行，不等于不编译。未来热点 kernel 的优化必须：(a) 模板参数编译期消除，或 (b) 独立 kernel（不改原签名）。
+
+### 🎉 v16 定案：gate 修复生效，基线恢复 6.26ms（2026-09-12 12:00）
+
+| 臂 | p50 | tok/s | 配置 |
+|---|---|---|---|
+| v15（错误默认） | 6.59ms | 151.7 | ksplit=1（误关）+ pipeline=2（误开）|
+| **v16（gate 修复）** | **6.26ms** | **159.7** | ksplit=2（恢复）+ pipeline=1（修复）|
+
+**恢复 0.33ms** ✓（K-split 的验证收益）。四段全对，faults=0。
+
+**会话谜团的完整解答**（v13/v14/v15 的 6.6ms）：
+1. v12 的 +0.39ms = quant-fold（gate 缺陷：=0 仍传非空 xq4）+ swiglu-fold
+2. v13/v14/v15 的 +0.37ms = **006bd0c 的 FileReplace 匹配错函数**——把 ksplit（-0.33ms 收益）误关、pipeline（+0.04ms 回归）误开
+3. "热点 kernel 代码存在性"理论是误诊——真正的根因是 gate 错配
+4. hot-kernel-restore（499 删除）是错诊下的过度清理——但清理本身无害（sparse-merge 确实中性、ringwin 未验证）
+
+**会话终态：13.28 → 6.23-6.26ms（+113%，160-161 tok/s）**
+
+**通往 200+ 的路径确认**：swapAB（gemv 2.33ms→0.3ms → 步 4.2ms ≈ **238 tok/s**）——swapab-impl 实施中。
