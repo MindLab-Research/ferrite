@@ -617,3 +617,27 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 ## W4 compressor 族现状——compress_proj_rows 已存在（mrows 版）
 
 `compress_proj_rows`（chain_dev.rs:9188）是 compressor 投影的 m 行版本（per-row `comp_wkv`/`comp_wgate` 投影的批版）。80 launch/步已部分批化。`compressor_fused` 有 NOTE："NOT used"（:9263）——有 kernel 但未启用，原因需查（可能是数值域或形状约束）。剩余优化空间：0.55ms → 0.25-0.35ms（fused 启用 + f32 mrows）。
+
+## 全栈测试计划（段错误修复后的 gate 矩阵）
+
+**第一轮（正确性——用户红线）**：
+- `DSV41_BF16_TRUNCATE=1 DSV41_TAP_BF16=1`（双截断）
+- 判据：零拉丁字符 + accept 提升（k_acc 直方图的 0-模态占比下降）
+
+**第二轮（性能 gate 逐个开启）**：
+| gate | 预期收益 | 风险 |
+|---|---|---|
+| DSV41_SH_EXP_MROWS=1 + MROWS_SMALL_N | -1~8ms（staging 修复后）| 低（位等价）|
+| DSV41_SH_EXP_FUSED=1 | 额外 -2~5ms | 中（grid barrier）|
+| DSV41_GATE_MROWS=1 | -2ms | 低（v2 位等价已断言）|
+| DSV41_VERIFY_HEAD_MROWS=1 | -0.7ms | 低（v1 序逐位）|
+| DSV41_INDEXER_MROWS=1 | -1ms | 低（front 融合）|
+| DSV41_NORM_MROWS=1 | -0.1ms | 低 |
+| DSV41_VERIFY_GRAPH=1 | -1.5ms | 低（已验证）|
+| DSV41_LAZY_VERIFY=1 | 步时 2×（vs batched）| 与 mrows 收益重叠 |
+
+**第三轮（组合判定）**：
+- lazy vs batched 在全 mrows 下的对比（mrows 让 batched 的边际行成本降低，可能反转 lazy 的优势）
+- 目标：步时 ≤16ms → accept 3+ 时 187+ tok/s；accept 5 时 312+
+
+**AR v5 的 1.40ms 是协议地板**（TP8 3-kernel × 40 层 × 2 = 240 launch × 17.3μs）——不可再压。
