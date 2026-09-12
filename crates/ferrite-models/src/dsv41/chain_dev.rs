@@ -9628,22 +9628,60 @@ impl<'a> DevChain<'a> {
                 self.world()
             );
         }
-        // (b) canary before epoch: a write landing between the two reads still
-        // shows on the (canary, epoch) pair rather than hiding behind the epoch
-        // read itself.
-        let canary = match self.dev.download_u32(c.canary_dev() as *const c_void) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[v5-ledger] pos={pos} rank={rank} arm={arm} canary read failed: {e}");
-                return None;
+        // (b) the epoch's guard and canaries BEFORE the epoch: a write landing
+        // between the two reads still shows on the (guard/canary, epoch) pair
+        // rather than hiding behind the epoch read itself.
+        //
+        // The GUARD words come first because they are what a `reduced`-array
+        // overrun hits BEFORE it can reach the epoch: `ctr_at` used to start on
+        // the byte right after `reduced[world-1]`, so a 1–2 word overrun was
+        // indistinguishable from a legitimate (but wrong) epoch — the epoch-54
+        // shape, with the tail canary intact. See
+        // `Collective::V5_LEDGER_GUARD_BYTES` and `docs/agent/epoch54-final-fix-path.md`
+        // §2.3 / §5-A2′.
+        let guard_base = c.guard_dev() as *const u8;
+        for w in 0..Collective::V5_LEDGER_GUARD_WORDS {
+            let word = guard_base.wrapping_add(w * 4) as *const c_void;
+            match self.dev.download_u32(word) {
+                Ok(v) => {
+                    if v != Collective::V5_LEDGER_GUARD {
+                        eprintln!(
+                            "[v5-ledger-GUARD] pos={pos} rank={rank} arm={arm} word={w} \
+                             value={v:#010x} expected={:#010x} — the `reduced` array was \
+                             overrun into ctr_at's guard (tp.rs layout)",
+                            Collective::V5_LEDGER_GUARD
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[v5-ledger] pos={pos} rank={rank} arm={arm} guard read failed: {e}");
+                    return None;
+                }
             }
-        };
-        if canary != Collective::V5_LEDGER_CANARY {
-            eprintln!(
-                "[v5-ledger-CANARY] pos={pos} rank={rank} arm={arm} canary={canary:#010x} \
-                 expected={:#010x}",
-                Collective::V5_LEDGER_CANARY
-            );
+        }
+        // The canaries are the wider net BEHIND the epoch: one word at `ctr_at+8`
+        // can be stepped over by a clobber that reaches the epoch in 16-byte
+        // steps, so all four are read and the slot that changed is named.
+        let mut canary = Collective::V5_LEDGER_CANARY;
+        for slot in 0..Collective::V5_LEDGER_CANARY_OFFS.len() {
+            let v = match self.dev.download_u32(c.canary_slot_dev(slot) as *const c_void) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[v5-ledger] pos={pos} rank={rank} arm={arm} canary read failed: {e}");
+                    return None;
+                }
+            };
+            if slot == 0 {
+                canary = v;
+            }
+            if v != Collective::V5_LEDGER_CANARY {
+                eprintln!(
+                    "[v5-ledger-CANARY] pos={pos} rank={rank} arm={arm} slot={slot} \
+                     off={} canary={v:#010x} expected={:#010x}",
+                    Collective::V5_LEDGER_CANARY_OFFS[slot],
+                    Collective::V5_LEDGER_CANARY
+                );
+            }
         }
         // `epoch` is the device-side authority on rounds issued (`tp.rs`): the AR
         // pubred and the argmax exchange advance this one word, so it counts BOTH

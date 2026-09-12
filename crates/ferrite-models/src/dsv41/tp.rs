@@ -370,7 +370,7 @@ impl Collective {
     ) -> Result<Self> {
         let depth = bytes * std::mem::size_of::<f32>() / 4;
         // Layout per rank: [parity 0: world*bytes][parity 1: world*bytes]
-        //                 [stored: world u32][reduced: world u32]
+        //                 [stored: world u32][reduced: world u32][guard: 8 B]
         // Double buffering by round parity is what lets the host barrier go: a
         // writer targets the half last used by round-2, and the store kernel
         // waits on the peers' `reduced` stamps before touching it.
@@ -663,6 +663,7 @@ impl Collective {
     ) -> Result<bool> {
         // Same shape gate as `dsv41_hc_post_inplace`: h % 4 == 0 (float4 path)
         // and 1 <= n <= 8 (the register-staging bound).
+        self.check_payload(len);
         if !ar_v5()
             || hc_n <= 0
             || hc_n > 8
@@ -761,6 +762,7 @@ impl Collective {
         hc_n: i32,
         hc_h: i32,
     ) -> Result<bool> {
+        self.check_payload(len);
         if !ar_v5()
             || hc_n <= 0
             || hc_n > 8
@@ -829,6 +831,7 @@ impl Collective {
         // float4 path, and what keeps a payload float4 inside one row) and
         // `1 <= n <= 8` (the register-staging bound); plus `n == rows * hc_h`
         // (the payload is exactly the block's rows).
+        self.check_payload(len);
         if !ar_v5()
             || rows <= 0
             || hc_n <= 0
@@ -953,6 +956,7 @@ impl Collective {
         // shared float*/u32* pointer tables (both are 8-byte device addresses),
         // so no buffer change and no kernel parameterization were needed.
         if ar_v5() {
+            self.check_payload(len);
             let n = (len / 4) as c_int;
             let stride = (self.bytes / 4) as c_int;
             let base8 = self.staging.ptr as *const u8;
