@@ -218,3 +218,16 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 `model.py:27-28`：`fp8_block_size = 32`（激活）/ `fp4_block_size = 32`（权重 K 维）。
 ⇒ **官方的 routed expert 语义 = e4m3 激活（block 32 的 f32 scale）× e2m1 权重（block 32 的 scale）**。
 ⇒ ferrite 的对齐目标：`quant_fp8(xn → e4m3, block=32, f32 scale)` + expert kernel 吃 e4m3 激活（不是 e2m1 packed）。
+
+## e2m1 vs e4m3 的隔离测量（expert-act-fp8-ab，方向 B）
+
+| 臂 | 点态 rel-L2 | expert 输出 rel-L2 | 44 层系统性累积 |
+|---|---|---|---|
+| e2m1（ferrite 现状） | 0.115 | **1.215e-1** | **≈5.3**（首 token 翻转的正确量级） |
+| e4m3（官方） | 0.027 | 2.715e-2 | ≈1.2 |
+| **e2m1×2 双趟**（q_hi + q_lo 分解，同一 fp4 权重两次 pass） | 0.014 | **1.447e-2** | ≈0.64（**优于官方 e4m3**） |
+
+**关键发现**：
+1. **Stage 2 可行**：e2m1×2 双趟在现有 fp4 kernel 上达到 e4m3 级精度（0.53×），**无需 fp8 expert 路径**——绕开 2026-09-10 用户禁令（fp8 expert 计算被删过 cadd000）。
+2. **down 路径反而更好**：ferrite 的 down 吃 f32（精确），官方对 swiglu 输出也量化——分歧集中在 gate/up。
+3. 分期：Stage 2（e2m1×2，Rust-only，gate `DSV41_EXPERT_ACT_E4M3`）一轮可给出 GPU 判决；Stage 3（真 mxf8f6f4）需用户仲裁（触碰 fp8 禁令 + unpacked 权重 ×2）。

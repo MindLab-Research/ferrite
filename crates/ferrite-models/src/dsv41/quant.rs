@@ -500,6 +500,226 @@ mod tests {
         assert!(dst.iter().all(|&v| v == 4.0));
     }
 
+    // ------------------------------------------------ activation-format A/B probe
+    //
+    // ROOT-CAUSE MEASUREMENT (2026-09-12). The official `linear()` quantises the
+    // activation of a **fp4** weight to fp8 e4m3 (`model.py:181-195`: "both fp4
+    // and fp8 weights take an fp8 one; for fp4 the kernel handles the mixed
+    // precision"), i.e. 3 mantissa bits. Ferrite feeds the same activation
+    // through `act_quant_fp4` (e2m1 = 1 mantissa bit), because the routed-expert
+    // ABI is e2m1 x e2m1 (`tcgen05.mma kind::mxf4`) and deliberately has no fp8
+    // expert entry point (`kernels.rs`, user directive 2026-09-10). The gap is a
+    // *format* gap, not a tuning gap, and it is systematic: every routed-expert
+    // output of every one of the 44 layers carries it.
+    //
+    // The two tests below turn that argument into numbers:
+    //   * pointwise -- the reconstruction error of e2m1 vs e4m3 at the SAME
+    //     block-32 power-of-two scale, plus a third arm;
+    //   * at the expert output -- the arms pushed through a realistic
+    //     `[inter, dim] x [dim]` expert projection with the 44-layer bound.
+    //
+    // The third arm is a **two-term e2m1 expansion** (`q(a) = q_hi(a) +
+    // q_lo(a - q_hi(a))`, two fp4 GEMM passes against the SAME fp4 weights). It
+    // matters for the fix's cost: two e2m1 grids four powers of two apart cover
+    // ~3 effective mantissa bits, so if this arm lands near e4m3 the official
+    // precision is reachable on the *existing* fp4 tensor-core kernels, with no
+    // new CUDA and no fp8 expert path.
+    //
+    // No GPU and no new dependency: the CPU-golden quantisers the parity tests
+    // already use are the model, and the RNG is seeded so the numbers repeat.
+
+    /// Deterministic xorshift64* (the crate takes no RNG dependency).
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed | 1)
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        /// Uniform in (0, 1].
+        fn unit(&mut self) -> f32 {
+            (((self.next_u64() >> 40) as u32) as f32 + 1.0) / (1u32 << 24) as f32
+        }
+        /// Standard normal (Box-Muller) -- the shape of a post-rmsnorm row.
+        fn normal(&mut self) -> f32 {
+            let (u1, u2) = (self.unit(), self.unit());
+            (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+        }
+    }
+
+    /// Arm A (ferrite today): e2m1, block 32, power-of-two scale.
+    fn deq_fp4_blocks(x: &[f32]) -> Vec<f32> {
+        let (packed, scales) = act_quant_fp4(x, 32, true);
+        let mut out = vec![0f32; x.len()];
+        fp4_decode_packed(&packed, &mut out);
+        for c in 0..out.len() {
+            out[c] *= scales[c / 32];
+        }
+        out
+    }
+
+    /// Arm B (official `linear()` for fp4 weights): e4m3, block 32, ue8m0 scale.
+    fn deq_fp8_blocks(x: &[f32]) -> Vec<f32> {
+        let (y, scales) = act_quant_fp8(x, 32, true);
+        (0..x.len())
+            .map(|c| e4m3_decode(y[c]) * scales[c / 32])
+            .collect()
+    }
+
+    /// Arm C: two-term e2m1 expansion (e4m3-equivalent precision, fp4 kernels).
+    fn deq_fp4x2_blocks(x: &[f32]) -> Vec<f32> {
+        let hi = deq_fp4_blocks(x);
+        let res: Vec<f32> = x.iter().zip(&hi).map(|(a, b)| a - b).collect();
+        let lo = deq_fp4_blocks(&res);
+        hi.iter().zip(&lo).map(|(h, l)| h + l).collect()
+    }
+
+    /// Accumulated squared error / squared signal of one row (sqrt of the ratio
+    /// is the relative L2 norm of the whole row).
+    fn row_err(row: &[f32], arm: fn(&[f32]) -> Vec<f32>) -> (f64, f64) {
+        let q = arm(row);
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for (a, b) in q.iter().zip(row) {
+            let d = *a as f64 - *b as f64;
+            num += d * d;
+            den += (*b as f64) * (*b as f64);
+        }
+        (num, den)
+    }
+
+    fn rel_l2(got: &[f64], want: &[f64]) -> f64 {
+        let mut num = 0f64;
+        let mut den = 0f64;
+        for (a, b) in got.iter().zip(want) {
+            let d = a - b;
+            num += d * d;
+            den += b * b;
+        }
+        (num / den.max(f64::MIN_POSITIVE)).sqrt()
+    }
+
+    #[test]
+    fn activation_format_gap_pointwise() {
+        const DIM: usize = 5120; // the experts' K (== the model dim)
+        const ROWS: usize = 32;
+        let mut rng = Rng::new(0x4453_5634_3141_4354); // "DSV41ACT"
+        // Two activation shapes: a post-rmsnorm row, and a heavy-tailed one (a
+        // per-block power-of-two scale is worst at the latter, because one large
+        // entry sets the step for the whole block).
+        let mut gauss = Vec::with_capacity(ROWS * DIM);
+        let mut heavy = Vec::with_capacity(ROWS * DIM);
+        for _ in 0..ROWS * DIM {
+            gauss.push(rng.normal());
+            let n = rng.normal();
+            heavy.push(n * n - 1.0);
+        }
+        for (name, buf) in [("post-rmsnorm N(0,1)", &gauss), ("heavy-tail chi2-1", &heavy)] {
+            let mut acc = [(0f64, 0f64); 3];
+            for r in 0..ROWS {
+                let row = &buf[r * DIM..(r + 1) * DIM];
+                for (i, arm) in [deq_fp4_blocks, deq_fp8_blocks, deq_fp4x2_blocks]
+                    .iter()
+                    .enumerate()
+                {
+                    let (num, den) = row_err(row, *arm);
+                    acc[i].0 += num;
+                    acc[i].1 += den;
+                }
+            }
+            let e: Vec<f64> = acc.iter().map(|(n, d)| (n / d).sqrt()).collect();
+            println!(
+                "[act-format] {name:20} rel-L2  e2m1 {:.5}  e4m3 {:.5}  e2m1x2 {:.5}   \
+                 e2m1/e4m3 = {:.2}x  e2m1x2/e4m3 = {:.2}x",
+                e[0],
+                e[1],
+                e[2],
+                e[0] / e[1],
+                e[2] / e[1]
+            );
+            // The point of the probe: one mantissa bit (e2m1) is a different
+            // error class from three (e4m3) at the same block/scale scheme.
+            assert!(
+                e[0] > 2.0 * e[1],
+                "expected e2m1 to be a distinct error class from e4m3: {:.5} vs {:.5}",
+                e[0],
+                e[1]
+            );
+            // ... and the two-term expansion must actually buy precision.
+            assert!(
+                e[2] < e[0],
+                "e2m1x2 ({:.5}) must beat plain e2m1 ({:.5})",
+                e[2],
+                e[0]
+            );
+        }
+    }
+
+    #[test]
+    fn activation_format_gap_expert_output() {
+        // ONE routed expert, ONE token row, the gate/up direction:
+        //   y[n] = sum_k w[n, k] * a[k],  k over the model dim.
+        const DIM: usize = 5120;
+        const INTER: usize = 128; // statistical stand-in for the full 2*inter rows
+        let mut rng = Rng::new(0x4D4F_455F_4755_5000); // "MOE_GUP"
+        // Weights in the checkpoint's own format -- fp4 e2m1 with a power-of-two
+        // scale per (row, 32-col block). The dequantised f32 matrix is the SHARED
+        // truth of all three arms, so what is measured is the activation's error.
+        let mut w = Vec::with_capacity(INTER * DIM);
+        for _ in 0..INTER {
+            let row: Vec<f32> = (0..DIM).map(|_| 0.02 * rng.normal()).collect();
+            w.extend(deq_fp4_blocks(&row));
+        }
+        let x: Vec<f32> = (0..DIM).map(|_| rng.normal()).collect();
+        let gemm = |a: &[f32]| -> Vec<f64> {
+            (0..INTER)
+                .map(|n| {
+                    w[n * DIM..(n + 1) * DIM]
+                        .iter()
+                        .zip(a)
+                        .map(|(wv, av)| *wv as f64 * *av as f64)
+                        .sum::<f64>()
+                })
+                .collect()
+        };
+        let y_true = gemm(&x);
+        let mut rel = [0f64; 3];
+        for (i, (name, a)) in [
+            ("e2m1 (ferrite)", deq_fp4_blocks(&x)),
+            ("e4m3 (official)", deq_fp8_blocks(&x)),
+            ("e2m1x2", deq_fp4x2_blocks(&x)),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rel[i] = rel_l2(&gemm(&a), &y_true);
+            println!(
+                "[expert-out] {name:16} rel-L2 {:.3e}  ->  44 layers: independent {:.3e}, \
+                 fully systematic {:.3e}",
+                rel[i],
+                rel[i] * 44f64.sqrt(),
+                rel[i] * 44.0
+            );
+        }
+        // NOTE the activation error is ONE shared delta vector across all n, so
+        // it does not average out over the output rows -- which is why this
+        // per-layer number is the right scale for the accumulation argument.
+        assert!(
+            rel[0] > rel[1],
+            "the e2m1 activation must not beat e4m3 at the expert output: {:.3e} vs {:.3e}",
+            rel[0],
+            rel[1]
+        );
+        assert!(rel[2] < rel[0], "e2m1x2 ({:.3e}) must beat e2m1 ({:.3e})", rel[2], rel[0]);
+    }
+
     #[test]
     fn cast_fp4_to_e4m3_is_lossless_per_tile() {
         // 32x32 tile, one segment; per-row segment scales differ by powers of two
