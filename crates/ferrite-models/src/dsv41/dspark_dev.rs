@@ -785,10 +785,17 @@ impl<'a> DsparkDev<'a> {
         )?;
 
         // ---- the ring's window rows, then the draft block, contiguous ----
-        // `sparse_attn` indexes one `[n, d]` block, so the two sources have to
-        // live in one buffer; `window` is passed as `min(win, pos + 1)` and the
-        // "compressed" block (index_topk = bs) is the draft tokens at [win, ..).
-        let wbytes = (win * hd * 4) as usize;
+        // COMPACT layout: only the n_win LIVE window rows are copied, so the
+        // block's rows sit at [n_win, n_win+bs) and the kernel's derived
+        // geometry is self-consistent on BOTH formulas: n = window + *clen =
+        // n_win + bs (the true row stride) and topk = window + min(*clen,
+        // index_topk) = n_win + bs (the true candidate count). The historical
+        // copy took ALL win rows (stride win+bs) while the kernel derived
+        // n_win+bs from the parameters — every kv read past row n_win landed
+        // `win - n_win` rows off once pos < win-1, which is exactly the
+        // "draft outputs unrelated garbage" signature.
+        let n_win = win.min(pos + 1);
+        let wbytes = (n_win * hd * 4) as usize;
         self.dev
             .memcpy_d2d(self.all_kv.ptr, self.window[s].ptr, wbytes)?;
         self.dev.memcpy_d2d(
@@ -797,7 +804,6 @@ impl<'a> DsparkDev<'a> {
             (bs * hd * 4) as usize,
         )?;
 
-        let n_win = win.min(pos + 1);
         self.dev.sparse_attn(
             self.q.as_f32(),
             self.all_kv.ptr as *const f32,
@@ -1407,9 +1413,13 @@ impl<'a> DsparkDev<'a> {
         if self.n_win_cached == n_win {
             return Ok(());
         }
+        // COMPACT layout: the block's rows sit at [n_win, n_win+bs) of
+        // `all_kv` (only the live window rows are copied), NOT at [win, ..) —
+        // the historical `win + i` indexed the full-width layout while the
+        // buffer was compact, reading past every window row once pos < win-1.
         let mut row: Vec<i32> = Vec::with_capacity(n_win + bs);
         row.extend((0..n_win).map(|i| i as i32));
-        row.extend((0..bs).map(|i| (win + i) as i32));
+        row.extend((0..bs).map(|i| (n_win + i) as i32));
         let row_bytes: Vec<u8> = row.iter().flat_map(|v| v.to_le_bytes()).collect();
         let mut flat = Vec::with_capacity(row_bytes.len() * bs);
         for _ in 0..bs {
