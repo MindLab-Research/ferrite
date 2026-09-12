@@ -21,12 +21,12 @@
 | 7 | down 回归修复 + dots-LATE merge | 6.48 | +51.4% | `96f169b`、`1b265a8` | serve A/B |
 | 8 | AR store 并行化（grid.y=world） | 6.47 | +51.5% | `f911abd` | serve A/B |
 | 9 | P4 act-cpasync（默认 ON） | **6.24** | **+112.8%** | `fdd70d4` | serve A/B，160.3 tok/s |
-| 10 | sparse-merge 选举折叠 | ~6.15 | +115.9% | `f6d2dde` | **v14 验证中** |
+| 10 | sparse-merge 选举折叠 | ~6.15 | +115.9% | `f6d2dde` | ❌ **已回退**（v14 判中性 + 代码存在性 +0.34ms）|
 | 11 | COMPRESS_FUSE 3→1 | ~6.15 | +115.9% | `595437d` | **v14 验证中** |
 | 12 | fold 代码物理清理（847 删除 / 14 文件） | ~6.15 | +115.9% | `175462d` | `cargo check` 0 error；**v14 验证中** |
 
 > 第 10–12 项合并成 v14 一次验证（都是默认 ON 的小改动，预期 −0.08ms）。
-> ⚠️ 工作树另有未提交的 **RW_FOLD**（ring_win 全折叠，`-0.02~0.05ms`）——若一并上机需单独标注。
+> ⚠️ 工作树另有未提交的 **RW_FOLD**（ring_win 全折叠，`-0.02~0.05ms`）——❌ **2026-09-12 已回退删除**（未验证的优化给热点 `rmsnorm_rope_kernel` 加 6 尾参+早退守卫，同机制风险）。
 
 ---
 
@@ -45,7 +45,7 @@
 | 9 | **down 回归修复 + dots-LATE merge** | 去掉 `__launch_bounds__(256,4)`（4→6 blk/SM）+ 恢复 ILV；dots 与 LATE 合一个 launch | `96f169b` / `1b265a8` |
 | 10 | **AR store 并行化** | `grid.y=world`（5→40 blocks，3%→25% SM），每 block 只写一个 peer | `f911abd` |
 | 11 | **P4 act-cpasync（默认 ON）** | 激活 staging 用 cp.async，消除 a32 物化的串行 LDG | `fdd70d4` |
-| 12 | **sparse-merge 选举折叠** | split 的 winner block 就地跑 merge body，40 launch → 0 | `f6d2dde` |
+| 12 | **sparse-merge 选举折叠** | split 的 winner block 就地跑 merge body，40 launch → 0 —— ❌ **2026-09-12 已回退**（v14 判中性；符号/选举代码给热点 split kernel +0.34ms）| `f6d2dde` |
 | 13 | **COMPRESS_FUSE 3→1** | decode compressor 的 state+pool+commit 合一 launch，逐字节不变 | `595437d` |
 
 **旁证**：`175462d` 的 fold 物理清理本身也是"落地"——它修复了 quant-fold 的**缺陷 gate** 并消除 ABI 风险
@@ -142,4 +142,4 @@
 - [ ] 优化链表中 step 10–12 的实测 p50
 - [ ] §1 的"最终值"（预期 ~6.15ms）
 - [ ] nsys 对照表（见 `docs/agent/dsv41-nsys-v14-plan.md` §4.2）
-- [ ] RW_FOLD 是否并入本次（未提交）
+- [x] RW_FOLD 是否并入本次（未提交）→ **不并入；2026-09-12 已回退删除**

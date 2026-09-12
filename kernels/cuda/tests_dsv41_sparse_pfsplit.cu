@@ -25,13 +25,12 @@
 //   DSV41_ATTN_PF_SPLIT=1 ./t_sparse_pfsplit c1   50   # must be bit-identical to pf
 //   DSV41_ATTN_PF_SPLIT=8 ./t_sparse_pfsplit c8   50   # tolerance vs pf
 //
-// MERGE FOLD A/B (sparse-attn-v9, DSV41_SPARSE_MERGE_FOLD, default ON): one
-// process per arm again, but now the REFERENCE label is selectable through
-// REF=<label> so fold-ON can be compared BIT-EXACTLY against fold-OFF at the
-// same C (they run the same `sparse_attn_merge_body`, so the acceptance test is
-// nbits == 0):
-//   DSV41_SPARSE_MERGE_FOLD=0 ./t_sparse_pfsplit c4nf 50            # writes out_c4nf.bin
-//   DSV41_SPARSE_MERGE_FOLD=1 REF=c4nf ./t_sparse_pfsplit c4f 50    # must be BIT-IDENTICAL
+// MERGE FOLD A/B: REMOVED. `DSV41_SPARSE_MERGE_FOLD` / the election in
+// `sparse_attn_split_kernel` and `sparse_attn_merge_body` were deleted by
+// hot-kernel-restore (2026-09-12): v14 measured the fold as truly neutral
+// (=0 and =1 both 6.61ms) yet its code presence in the hot split kernel cost
+// +0.34ms even gate-OFF. `dsv41_sparse_attn` always runs the two launches now,
+// which is what the `pf`/`c1`/`c8` arms above already exercise.
 //
 // ⚠️ The DEFAULT chunk count comes from `DSV41_SPARSE_SPLIT`
 // (kSparseSplitDefault = 4, sparse-attn-v8); `DSV41_ATTN_PF_SPLIT` still wins

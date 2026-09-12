@@ -284,6 +284,12 @@ __global__ void sparse_attn_orope_kernel(const float* q, const float* kv, const 
 的 `split_c>0` 分支不再 decline，直接跑 split + merge 两 launch 且保留两个融合；gate `DSV41_SPARSE_SPLIT`
 默认 C=4（`kSparseSplitDefault`，`dsv41_resolve_sparse_split_c()` 统一解析，plain 与 orope 共用以免选择不一致）。
 隔离台架 per-slot 成本降 ~7x（`dsv41_kernels.cu:845-857`）。
+> ❌ **2026-09-12 hot-kernel-restore：①b merge 选举折叠已整体回退**。`DSV41_SPARSE_MERGE_FOLD`、
+> `g_attn_ticket`、`sparse_attn_merge_body`、split kernel 的 `fold`/14 个运行时尾参、选举块全部删除。
+> v14 实测该折叠「真中性」（=0/=1 均 6.61ms），但其**代码存在性**给 40-launch/step 的热点 split kernel
+> 带来 **+0.34ms**（gate OFF 无法编译期消除）⇒ 无保留价值。`sparse_attn_merge_kernel` 恢复独立 launch
+> （每层 2 launch）。以下为历史记录。
+
 **①b merge 选举折叠（2026-09-11，sparse-attn-v9）：`DSV41_SPARSE_MERGE_FOLD` 默认 ON**——merge 的
 (b·m,h)=8 blocks 只占 148 SM 的 ~5%，5.1µs 大半是固定开销；`sparse_attn_split_kernel`（`:1085`）在每组
 (b·m,h) 的 C 个 chunk 之上用 **per-group ticket** `g_attn_ticket[row][hh]`（`:943`）选举最后完成者

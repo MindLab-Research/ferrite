@@ -650,7 +650,14 @@ if (e != cudaSuccess) {
 `cudaFuncSetAttribute`、`cudaMalloc` …）在返回错误码前都必须先 `(void)cudaGetLastError()` 清 sticky，
 否则错误会泄漏给下一个 launcher 造成归因错位。
 
-## ring_win_fuse 全折叠设计（ringwin-fold-impl 产出，2026-09-12，✅ 已实施）
+## ring_win_fuse 全折叠设计（ringwin-fold-impl 产出，2026-09-12，❌ 已回退）
+
+> ⚠️ **2026-09-12 hot-kernel-restore**：本节描述的 `DSV41_RW_FOLD` 全折叠**已整体回退**。
+> 原因是 residue-hunt 定案：给热点 kernel `rmsnorm_rope_kernel` 加 6 个运行时尾参 + 早退守卫，
+> gate OFF 也留在编译产物里（同 sparse-merge 给 split kernel 加代码的机制，后者实测 +0.34ms）。
+> 该优化从未上机验证（中性未知）⇒ 无保留价值，直接恢复 np1（d546139）形态。
+> `dsv41_rmsnorm_rope_ring` launcher、`device.rs::rmsnorm_rope_ring_on`、`chain_dev.rs::rw_fold()`
+> 均已删除；ring_win 三半回到独立 `dsv41_ring_win_fuse_ph` launch。以下内容保留为历史记录。
 
 **目标**：把 ring_win_fuse_ph（1.3µs × 40/步，三合一：placeholder + ring append + window idxs）整个折进 kv 生产者 rmsnorm_rope_kernel（1 block × 1024 线程），省 40 launch。
 

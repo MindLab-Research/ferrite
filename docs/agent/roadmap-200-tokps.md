@@ -13,7 +13,7 @@
 | shared expert TP 切分（`DSV41_SHARED_TP`）| chain_dev.rs:2210 `moe`；−1.43ms |
 | lm_head 词表切分 + 跨 rank argmax（`DSV41_HEAD_SLICE`）| −0.35ms |
 | sparse 3 深预取（`DSV41_ATTN_PF`）| sparse_attn_pf_kernel dsv41_kernels.cu:484；−1.09ms |
-| **sparse 3 深预取 × key-split（`DSV41_SPARSE_SPLIT`，默认 C=4）** | 同一 kernel 加了 key 分块：grid=(C,b·m,h) + merge kernel；C=1 与 pf **位级一致**，微基准 per-slot 78→10.7ns。**2026-09-11 sparse-attn-v8**：`sparse_attn_orope` 的 split 分支不再 decline（rope+fp8 epilogue 已折进 `sparse_attn_merge_kernel`），故 split 与两个融合可共存；`DSV41_ATTN_PF_SPLIT` 显式设置时仍优先。**2026-09-11 sparse-attn-v9**：merge 选举折叠（`DSV41_SPARSE_MERGE_FOLD`，默认 ON）——split 每组 (b·m,h) 的 C 个 block 用 per-group ticket 选最后完成者跑 merge，每层 2 launch → 1，位级一致（台架 fold ON/OFF 直接对拍）；=0 回退两 kernel |
+**2026-09-12 hot-kernel-restore：merge 选举折叠（sparse-attn-v9）已整体回退**——v14 实测「真中性」（=0/=1 均 6.61ms），但其代码存在性（split kernel +14 运行时参数 + `g_attn_ticket` 选举块）给 40-launch/step 的热点 kernel 带来 **+0.34ms**；无保留价值，`sparse_attn_split_kernel` 恢复 `(... int scale, int C)`，merge 回到独立 `sparse_attn_merge_kernel` launch（每层 2 launch）。
 | P1 route_topk hist 死码 + P2 zero 冗余 | −0.27ms |
 | MoE 批化 / NR / SH_EXP_MX2 / MIX_GATE / FUSE_C / FUSE_B1 | 均为默认 ON（勿再误关）|
 

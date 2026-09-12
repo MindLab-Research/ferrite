@@ -7505,6 +7505,19 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 
 **ringwin 同款风险**：rmsnorm_rope_kernel 的 6 尾参 + 早退守卫（ffabd0d，默认 OFF）——未验证的优化给热点 kernel 加代码。
 
-**处置**：hot-kernel-restore 正在恢复两个 kernel 到 np1（d546139）形态。sparse-merge（v14a=v14b=中性）和 ringwin（未验证）都无保留价值。
+**处置**：hot-kernel-restore **已完成**，两个 kernel 恢复 np1（d546139）形态。sparse-merge（v14a=v14b=中性）和 ringwin（未验证）都无保留价值。
+
+### hot-kernel-restore 完成（2026-09-12）
+
+**已删除**（全部恢复为 d546139 形态）：
+- `sparse_attn_split_kernel`：签名回到 `(... int scale, int C)`——去掉 `fold + sink/out/cos/sin/base/rope_rd/half/mul/off/step/inverse/xq/xsc` 共 14 个运行时尾参；删掉 `__shared__ int sh_winner` + atomicAdd 选举块与 `g_attn_ticket`。
+- `sparse_attn_merge_body`（共享 helper）→ merge body 搬回 `sparse_attn_merge_kernel` 内联（np1 形态）；`dsv41_resolve_sparse_merge_fold()` 删除。
+- `rmsnorm_rope_kernel`：签名回到 `(... int inverse, float eps)`——去掉 `pos_ctr/ring/window/idxs/clen/index_topk` 6 尾参、早退守卫 `if (ring == nullptr && idxs == nullptr) return;` 与整个 fold 体。
+- launcher：`dsv41_sparse_attn` / `dsv41_sparse_attn_orope` 的 split 分支恢复两次 launch；`dsv41_rmsnorm_rope_ring` 整个删除。
+- Rust：`device.rs` 的 `rmsnorm_rope_ring` 字段 / `ko!` 绑定 / `supports_rmsnorm_rope_ring` / `rmsnorm_rope_ring_on` 删除；`chain_dev.rs` 的 `rw_fold()` + kv 链里的 ring 地址提前计算 + `rw_folded` 分支删除，恢复 np1 的 `nr_fused = nr_fuse() && rmsnorm_rope_on(...)` 直调与 B2/B3 原位 `ph_ok`。
+
+**保留**：`compressor_fused_kernel`（COMPRESS_FUSE，惰性死码，不在热点路径）。
+
+**验证**：`cargo check` 全 workspace **0 errors**；`dsv41_kernels.cu` 的 sparse/rope 区（925-1250、1750-1795）与 `d546139` **逐字节相同**；`chain_dev.rs` 的 kv/ring 段（`let kv_stream` → `// selection: the window ring`）与 np1 **逐字节相同**；`device.rs` 对应区域相同。⚠️ 远端 `nvcc -c` 编译与上机 p50 未跑（本地无 nvcc）——恢复区与 np1 同源，编译风险低，但仍建议上机前先跑一次 `nvcc -c`。
 
 **方法论铁律（第 7 条）**：**给热点 kernel 加运行时参数/分支 = 编译产物变重 = 性能回归风险**。gate OFF 只是不执行，不等于不编译。未来热点 kernel 的优化必须：(a) 模板参数编译期消除，或 (b) 独立 kernel（不改原签名）。

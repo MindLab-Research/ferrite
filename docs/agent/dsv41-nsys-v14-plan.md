@@ -1,6 +1,11 @@
 # DSV4.1 v14 最终 nsys 分解方案（会话终态）
 
 **一句话**：v14 = HEAD（`175462d` fold 代码清理）+ `f6d2dde`（sparse-merge 选举折叠，默认 ON）+ `595437d`
+
+> ❌ **2026-09-12 hot-kernel-restore 生效后本计划部分作废**：`f6d2dde`（sparse-merge 选举折叠）已整体回退删除——
+> v14 实测它「真中性」（=0/=1 均 6.61ms），但其代码存在性（split kernel +14 运行时参数 + 选举块）给 40-launch/step
+> 的热点 kernel 带来 +0.34ms。因此 `sparse_attn_merge_kernel` 的 launch（40 次）**仍存在**，本文件里
+> 「merge 行从 CSV 消失」的成功判据不再适用；下采 v14 应以 **无 fold 的两 launch 形态**为基线。
 （COMPRESS_FUSE 3→1，默认 ON）。预期步时 **~6.15ms ≈ 162 tok/s**。本文给出**采集命令、口径、v9 基线、
 预期 vs 实测对照表模板**，供上机后逐行回填。
 
