@@ -2304,6 +2304,60 @@ fn lazy_verify() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_LAZY_VERIFY").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_LAZY_SDR=1`: the lazy arm's PER-ROW SYNC COALESCING — the implementable
+/// part of the "L2 per-row sync" item in
+/// `docs/agent/lazy-verify-optimization-path.md` §L2. Default OFF, so the lazy
+/// path keeps its current every-row sync sequence bit for bit.
+///
+/// # What it removes
+///
+/// A lazy row pays ~4 host↔device round trips; this gate takes two of them out
+/// without changing a single byte of the block's maths:
+///
+/// * **the tap carry.** [`DevChain::lazy_tap_commit`]'s `DSPARK_TAP_SLOTS`
+///   device-to-device copies become ONE strided copy (`memcpy_d2d_2d`): the
+///   staging buffer's slots are `dim` floats apart and so are the block's rows,
+///   so the `slots × dim` block is one `cudaMemcpy2DAsync` instead of three
+///   launches.
+/// * **the position counter.** The per-row `set_pos_ctr(pos + i)` — a 4-byte
+///   BLOCKING H2D — is dropped; the counter is parked once per round at the
+///   block's row-0 position instead.
+///
+/// # Why dropping the per-row counter write is sound
+///
+/// Nothing in the m-ROW path reads `s.pos_ctr`:
+///
+/// * every kernel `step_rows_inner` reaches takes its position from
+///   `s.pos_rows[r]` (`attention_rows`' RoPE/`sparse_attn`/`indexer`,
+///   `compress_row`'s pool/commit, `engram_hash_step`'s per-row twin);
+/// * the block's argmax is passed a NULL counter explicitly, because the accept
+///   logic moves the counter once, for the committed prefix;
+/// * `step_rows` itself does not read it back — the lazy arm passes
+///   `pos_base_hint`, and [`DevChain::lazy_run_row`]'s whole point is that the
+///   caller already knows the value.
+///
+/// The only reads of `s.pos_ctr` in this file belong to the SINGLE-ROW arms
+/// (`norm_fuse`/`orope_q`'s fused RoPE, the single-row `engram_hash_step`, the
+/// single-row `argmax`) and to the utilities that bracket a step
+/// ([`DevChain::set_pos_ctr`]'s callers, the snapshot/shadow-step save pairs).
+/// The round's final value is written by [`DevChain::dspark_commit_lazy`] (and
+/// `pos` again on the error path), so the counter the NEXT round reads is the
+/// same either way.
+///
+/// # What it deliberately does NOT do: pair two rows
+///
+/// The design document's headline — a speculative TWO-ROW batch, one D2H for
+/// both argmaxes (its "SDR") — is REJECTED here; the reasoning is recorded on
+/// [`DevChain::dspark_spec_lazy`]'s cost-shape note. In short: the drafts make
+/// the pair's INPUTS available, but the second row is speculative, ~45% of
+/// drafts miss, and a row costs ~6 ms of wall clock while the batched D2H saves
+/// ~0.5 ms — the trade is a large net loss, and the discarded row has no exact
+/// rollback on an arm that deliberately runs with `spec_capture` clear.
+fn lazy_sdr() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_LAZY_SDR").map(|v| v != "0").unwrap_or(false))
+}
+
 /// `DSV41_LAZY_THRESHOLD`: the mean-k threshold of the lazy ⇄ batched route.
 /// `auto` (or unset) derives it from the two calibrated step costs
 /// ([`lazy_tau`]); an explicit float overrides it (`0` ⇒ always batched, a
@@ -8061,6 +8115,25 @@ impl<'a> DevChain<'a> {
     fn lazy_tap_commit(&self, i: usize) -> Result<()> {
         debug_assert!(i < VERIFY_ROWS, "lazy_tap_commit: row {i} past the tap block");
         let row_bytes = self.cfg.dim * std::mem::size_of::<f32>();
+        // DSV41_LAZY_SDR: ONE strided copy instead of `DSPARK_TAP_SLOTS` of them.
+        // The staging slots are `row_bytes` apart (contiguous `[slots, dim]`) and
+        // so are the block's slots, but each block SLOT's rows are
+        // `VERIFY_ROWS * row_bytes` apart — which is exactly the pitch
+        // `cudaMemcpy2DAsync` carries. Byte-identical to the loop below: same
+        // slots, same rows, same `row_bytes` each.
+        if lazy_sdr() {
+            let src = self.s.dspark_tap.ptr as *const u8;
+            let dst = (self.s.dspark_tap_r.ptr as *mut u8)
+                .wrapping_add(i * row_bytes) as *mut c_void;
+            return self.dev.memcpy_d2d_2d(
+                dst,
+                VERIFY_ROWS * row_bytes,
+                src as *const c_void,
+                row_bytes,
+                row_bytes,
+                DSPARK_TAP_SLOTS,
+            );
+        }
         for slot in 0..DSPARK_TAP_SLOTS {
             let src = (self.s.dspark_tap.ptr as *const u8).wrapping_add(slot * row_bytes);
             let dst = (self.s.dspark_tap_r.ptr as *mut u8)
@@ -8101,14 +8174,23 @@ impl<'a> DevChain<'a> {
     /// ([`Self::step_rows_sync`]). Suppressing it here is what removes the
     /// ~2.85 ms/row of host rendezvous the per-row `step_rows(m = 1)` used to pay.
     fn lazy_run_row(&mut self, rows_in: &[u32], i: usize, pos: usize) -> Result<u32> {
-        self.set_pos_ctr(pos + i)?;
+        // DSV41_LAZY_SDR: one BLOCKING H2D fewer per row. The counter parks at the
+        // block's row-0 position (written once by [`Self::dspark_spec_lazy`]) and
+        // nothing in the m-row path reads it — `step_rows` is handed this row's
+        // position through `pos_base_hint` below, which is the only consumer the
+        // per-row write ever had. See [`lazy_sdr`] for the full argument.
+        if !lazy_sdr() {
+            self.set_pos_ctr(pos + i)?;
+        }
         self.spec_capture = false;
         self.spec_tap_deferred = true;
         // `Some(pos + i)` is the value `step_rows` would read straight back off the
-        // device counter: `set_pos_ctr` above has just written it with a BLOCKING
-        // H2D and the device is quiescent (the previous row ended in a blocking
-        // D2H), so the hint IS the counter. That removes the per-row read-back,
-        // which — like the argmax D2H — is a full device sync.
+        // device counter: the device is quiescent (the previous row ended in a
+        // blocking D2H), so the hint IS the counter. (With the per-row
+        // `set_pos_ctr` above, that is by construction; under
+        // `DSV41_LAZY_SDR` it is by the argument that the counter is not read at
+        // all inside the block.) That removes the per-row read-back, which — like
+        // the argmax D2H — is a full device sync.
         let res = self.step_rows_sync(&rows_in[i..=i], true, Some(pos as i32 + i as i32));
         // Cleared BEFORE the `?`, so a failed row does not leave the hook in
         // deferred mode for whatever runs next.
@@ -8160,6 +8242,53 @@ impl<'a> DevChain<'a> {
     /// right) is six, i.e. the batched arm's block. The arm therefore cannot be
     /// slower than what it replaces, and on a low-accept workload it is far
     /// cheaper.
+    ///
+    /// # The two-row batch (SDR): analysed, and NOT taken
+    ///
+    /// `docs/agent/lazy-verify-optimization-path.md` §L2 proposes running rows
+    /// `i`, `i+1` back to back on one stream and reading BOTH argmaxes with one
+    /// D2H. The dataflow premise HOLDS — the drafts are produced before the loop
+    /// ([`DsparkDev::draft_forward`] + [`DsparkDev::drafts`]), so row `i + 1`'s
+    /// input token is known before row `i` has been run and the two forwards are
+    /// independent. What fails is everything else:
+    ///
+    /// * **the second row is SPECULATIVE, and half the time it is wasted.** The
+    ///   loop's early exit is the whole point of the arm: row `i + 1` runs only
+    ///   when `drafts[i] == rows[i]`. At this workload's accept rate (mean
+    ///   `k_emit` 2.214 ⇒ ~45% of drafts miss) fixed pairs `(0,1) (2,3) (4,5)`
+    ///   run `2·⌈k_emit/2⌉` rows, i.e. 4.0 rows/step against today's 2.214 —
+    ///   **+1.79 rows/step**. At the ~6 ms a row costs (`c_row` 6.15 eager / 8.18
+    ///   lazy, and 6 rows = 34–37 ms for the batched block) that is **+10 ms**,
+    ///   against the ~0.5 ms the halved D2H count saves. Pairing only the tail
+    ///   (rows 4–5) does not rescue it either: the D2H gain is then ~0.05 ms and
+    ///   the waste ~0.24 ms.
+    /// * **the discarded row has no exact rollback here.** This arm runs with
+    ///   `spec_capture` CLEAR on purpose ([`Self::lazy_run_row`]), so the
+    ///   compressor's per-row `kvp`/`scp` inputs are never saved and
+    ///   [`Self::compress_replay`] — the only exact way to land the compressor on
+    ///   "the state after `keep` rows" — cannot run. `dspark_rollback_keep`
+    ///   restores the compressor WHOLE, so a rollback without the replay would
+    ///   leave the rejected row's committed latent in `clen`/`index_k` and hand
+    ///   the indexer a KV row for a token that was never emitted (the corruption
+    ///   class `lazy-batched-gate.md` §0-4 records).
+    /// * **the per-row scratch is single-row by construction.** The deferred tap
+    ///   hook stages ONE row into a fixed `[DSPARK_TAP_SLOTS, dim]` address, and
+    ///   the block's tap/`kvp`/`scp` snapshots index rows relative to the block's
+    ///   row 0 — so only the pair at `i = 0` lines up with `dspark_rollback_keep`'s
+    ///   ring-slot rule, and a pair at `i >= 2` would relocate the tap and
+    ///   re-index both snapshots per pair, inside the captured shape. The `m = 2`
+    ///   block would also have to stay on the DIRECT arm: the `kvp`/`scp` save is
+    ///   HOST code in the layer hook, and a replayed graph runs no host code, so a
+    ///   captured `m = 2` shape would silently leave the rollback without its
+    ///   input (and the direct arm gives back the graph's ~1.5 ms). Threading a row
+    ///   offset through the hook and the snapshot is a redesign of `layer_rows` +
+    ///   `dspark_snapshot` + `compress_replay`, not the "~50 行" the note assumes.
+    ///
+    /// What IS taken from §L2 is the sync coalescing that does not speculate:
+    /// [`lazy_sdr`] folds the tap carry into one strided copy and drops the
+    /// per-row counter H2D. The batched argmax D2H stays per row — it is the
+    /// dependency the early exit is built on, and buying it with a speculative row
+    /// costs an order of magnitude more than it saves.
     ///
     /// # Report
     ///
@@ -8224,6 +8353,16 @@ impl<'a> DevChain<'a> {
         // TP8), so single-rank runs are unaffected.
         if let Some(c) = self.comm.as_ref() {
             c.host_barrier();
+        }
+
+        // DSV41_LAZY_SDR: the round's ONE counter write, where the loop otherwise
+        // writes it once per row. The counter ends the round at `pos + k_emit`
+        // regardless (`dspark_commit_lazy`), and nothing inside the block reads it
+        // — see [`lazy_sdr`] for the argument. Parking it on the block's row-0
+        // position keeps "the counter is where the block starts" true for anything
+        // that only ever LOOKS at it between rounds.
+        if lazy_sdr() {
+            self.set_pos_ctr(pos)?;
         }
 
         let t = std::time::Instant::now();

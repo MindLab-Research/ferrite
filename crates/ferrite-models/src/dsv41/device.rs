@@ -1543,6 +1543,20 @@ impl Device {
         self.rt.memcpy_d2d(dst, src, bytes)
     }
 
+    /// Strided D2D copy — `height` rows of `width` bytes, `dpitch`/`spitch` apart.
+    /// See [`ferrite_kernel::devrt::DevRuntime::memcpy_d2d_2d`].
+    pub fn memcpy_d2d_2d(
+        &self,
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<()> {
+        self.rt.memcpy_d2d_2d(dst, dpitch, src, spitch, width, height)
+    }
+
     pub fn download_u32(&self, ptr: *const c_void) -> Result<u32> {
         self.rt.download_u32(ptr)
     }

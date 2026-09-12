@@ -1262,6 +1262,42 @@ impl DevRuntime {
         check_cudart(st, &self.cudart, "cudaMemcpy D2D")
     }
 
+    /// Strided DEVICE-to-device copy: `height` rows of `width` bytes, `spitch`
+    /// apart in the source and `dpitch` apart in the destination.
+    ///
+    /// The D2D twin of [`Self::upload_from_2d`]. Its use is the case where a
+    /// CONTIGUOUS per-row buffer has to land in ONE ROW of a `[slots][rows][w]`
+    /// block: the rows are `w` apart on the destination and `w` apart in the
+    /// source, so the copy is `slots` rows of `w` bytes at the two different
+    /// pitches — one launch instead of `slots`.
+    ///
+    /// Stream-ordered on OUR stream for the reason [`Self::memcpy_d2d`] gives: the
+    /// synchronous `cudaMemcpy2D` runs on the legacy stream, which a capturing
+    /// stream must not depend on.
+    pub fn memcpy_d2d_2d(
+        &self,
+        dst: *mut c_void,
+        dpitch: usize,
+        src: *const c_void,
+        spitch: usize,
+        width: usize,
+        height: usize,
+    ) -> Result<()> {
+        let st = unsafe {
+            (self.cudart.memcpy_2d_async)(
+                dst,
+                dpitch,
+                src,
+                spitch,
+                width,
+                height,
+                CUDA_MEMCPY_D2D,
+                self.stream,
+            )
+        };
+        check_cudart(st, &self.cudart, "cudaMemcpy2DAsync D2D")
+    }
+
     /// The single 4-byte host read per decode step (EOS check + printing).
     pub fn download_u32(&self, ptr: *const c_void) -> Result<u32> {
         let mut b = [0u8; 4];
