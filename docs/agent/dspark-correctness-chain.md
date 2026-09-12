@@ -243,6 +243,16 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 
 ## Stage 2 实施（e2m1×2，2026-09-12）
 
+> ⚠️ **本节的 e2m1×2 双趟已被取代（2026-09-12，同日）**：双趟实测代价是每层 +1 趟 expert
+> GEMM（serve 口径 **+5ms/步**，仅换 +2% accept），因此改成 **直接 e4m3 单趟** —— 即官方
+> `fp4_gemm` 的激活口径本身（`act_quant(e4m3, block=32)` → 一次 GEMM），gatem 名仍是
+> `DSV41_EXPERT_ACT_E4M3`，命中条件从"有 `dsv41_sub_dequant_fp4`"改为"有
+> `dsv41_expert_act_e4m3_cap`"。下面的双趟实现（`sub_dequant_fp4` / 残差 / 第二趟 /
+> `add_inplace_raw` / `xq4_lo` 等 scratch）**已全部删除**（-485/+303）。实现见
+> `chain_dev.rs:moe()/moe_rows()/dspark_dev` 的 `if e4m3 { quant_fp8 } else { quant_fp4 }`
+> 与 `kernels/cuda/dsv41_experts_mxf4.cu` 的 `act_e4m3` 暂存分支。本节以下内容保留为
+> **历史记录**（双趟的量化数学、审计结论与 degen-hunt 判词仍然有效，只是那条路线不再采用）。
+
 **gate**：`DSV41_EXPERT_ACT_E4M3`（默认 OFF，`!= "0"` 开）。名字说的是"达到 e4m3 精度"。
 
 **改动点**（`crates/ferrite-models/src/dsv41/` + `kernels/cuda/dsv41_kernels.cu`）：
@@ -388,3 +398,20 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 
 **结论**：E4M3 双趟的**计算成本**（2× GEMM）大于精度收益带来的 accept 提升（0.840→0.860 仅 +2%）。
 **正确方向**：**直接用 fp8 e4m3 激活**（官方语义：一次 act_quant(e4m3) + 一次 fp4_gemm）而非 e2m1×2 双趟模拟。这砍掉一半的 expert GEMM 发射。
+
+## 直接 e4m3 单趟 GPU 验证（32d45b83，2026-09-12）——正确性完美 ✓
+
+**配置**：SPEC + E4M3(直接单趟) + SH_EXP + GRAPH + P3A + WRITEBACK，ILV 默认 ON
+
+| 指标 | 双趟（旧） | **直接单趟（新）** | EAGER |
+|---|---|---|---|
+| 文本 | LEN 132/opa False/双字 4 | **LEN 142 / opa: False / 双字: 0** | LEN 146/双字 3 |
+| verify | 42.01ms | **38.34ms**（−3.7ms） | — |
+| draft | 4.56ms | 4.27ms | — |
+| k_acc | {0:32,1:15,2:6,3:1,4:4} | {0:50,1:14,2:10,3:3} | — |
+| 图化 | captured m5@20 | captured m5@16 ✓ | — |
+
+**关键突破**：**双字 = 0**（此前从未达到过——双趟 4、EAGER 3）——直接 e4m3 的精度正确性**超过 EAGER**（因为 EAGER 仍走 e2m1 单趟）。
+**文本质量**：出师表背诵到 "引喻失义，以塞忠谏之路也" + 后续正常——**最长的正确背诵**。
+**性能**：verify 38.34ms（比双趟 −3.7ms，与无 e4m3 的基线 36.10 差 +2.2ms——e4m3 的量化开销（quant_fp8 的 block-32 计算）+ kernel 内 e4m3 staging 的解码开销）。
+**accept**：k_acc 均值从 0.86 降到 0.66——可能因 ILV=ON 与 e4m3 的 pair body 交互变化。
