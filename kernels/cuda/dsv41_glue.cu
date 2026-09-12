@@ -1515,6 +1515,206 @@ extern "C" int dsv41_dspark_markov_head(float* logits, const float* h, const flo
 }
 
 // ---------------------------------------------------------------------------
+// VOCABULARY-SLICED twin of the Markov step (DSV41_MARKOV_SLICED).
+//
+// WHY. `markov_head` is [vocab, mr] f32 = 126 MiB and `dspark_markov_head_kernel`
+// walks ALL of it, once per step, `bs = 5` times per draft block: 631 MiB of
+// weight traffic per block, none of it reusable across steps (`er` changes with
+// the sampled token). That working set cannot live anywhere on-chip — 126 MiB
+// against 148 SM x 227 KB = 33.6 MB of registers+smem, and against a 60 MB L2 —
+// so the 5 scans are 5 compulsory HBM passes. Cutting the vocabulary into
+// `world` contiguous segments makes one rank's share `vocab/world` = 16160 rows
+// = 15.8 MiB, which DOES fit L2 (and nearly the whole device's on-chip memory),
+// i.e. the slice is the physical enabler for "four of the five scans hit L2",
+// not a byte-count trick (docs/agent/draft-1ms-design.md 1.2).
+//
+// WHAT CHANGES. This kernel is the SAME program restricted to this rank's
+// `[idx_off, idx_off + n)` rows of the head: `n` is the slice width and
+// `markov_head` already points at the slice's first row (the caller offsets a
+// REPLICATED tensor — see the C entry). Three consequences:
+//
+//  1. `lrow` is the slice-wide row (`logits + step * n`, pitch `n`) — the head
+//     GEMV that filled it wrote the same `n` rows at the same pitch, so host and
+//     kernel agree on ONE geometry. Slicing the head and slicing the Markov bias
+//     with DIFFERENT partitions would silently bias logits row `v` with weight
+//     row `v + k`: the pitch is not in the type (the same class of silent error
+//     `chain_dev.rs` warns about for `logits_r`).
+//  2. The packed key carries the GLOBAL index (`idx_off + v`), so the winner and
+//     its lowest-index tie rule after the cross-rank fold are exactly the
+//     full-vocabulary argmax's — 129280 near-ties are decided by value first and
+//     by index only on exact equality, and a local index would break that in the
+//     rank-dependent way (design doc risk 2).
+//  3. The kernel can no longer DECIDE the step's token: one rank holds 1/world of
+//     the vocabulary. It therefore publishes its slice's packed winner into
+//     `local_key[0]` and leaves `ids[step + 1]` to the caller's cross-rank
+//     exchange (`dsv41_argmax_key_pub`, one v5 epoch round). It deliberately does
+//     NOT write a provisional local id into `ids[step + 1]`: a failed exchange
+//     would then leave a plausible-looking LOCAL token behind, which is
+//     indistinguishable from a correct answer from the outside (the `44f4956`
+//     "silently emits a stale/plausible token" failure mode).
+//
+// `markov_embed` stays REPLICATED: `er = markov_embed + tok * mr` needs the row
+// of the GLOBAL token, which after step 0 lives on an arbitrary rank — a sliced
+// embed would need its own gather + exchange to serve a 1 KB row. It is also
+// free on the bandwidth ledger: ONE row (256 f32) per step, not 126 MiB
+// (design doc 1.1).
+//
+// EPOCH FOOTPRINT. `partial`/`ctr` keep the full kernel's self-resetting
+// last-block election contract, so the sliced loop costs ZERO extra epochs
+// compared with the unsliced one — the ONLY added epochs are the caller's five
+// `dsv41_argmax_key_pub` rounds per block. That is safe because the draft runs on
+// EVERY rank with the same launch sequence (replicated weights, its MoE AR per
+// block), so the footprint stays SYMMETRIC: 3 blocks x 5 steps = 15 extra rounds
+// on every rank, none on any single rank alone. Asymmetry is what deadlocks v5
+// (`SEED_ALIGN`), and a sliced Markov that ran on one rank only would add exactly
+// such an asymmetry.
+__global__ void dspark_markov_head_sliced_kernel(
+    float* __restrict__ logits,                 // [bs, n], row `step` biased in place
+    const float* __restrict__ h,                // [bs, dim] collapsed (PRE-norm) hidden
+    const float* __restrict__ markov_embed,     // [vocab, mr] — REPLICATED (global tok)
+    const float* __restrict__ markov_head,      // THIS rank's [n, mr] row slice
+    const float* __restrict__ confidence_proj,  // [dim + mr] or null
+    int* __restrict__ ids,                      // [bs + 1]; ids[step] in (GLOBAL id)
+    float* __restrict__ confidence,             // [bs] or null
+    int dim, int n, int mr, int step, int idx_off,
+    unsigned long long* __restrict__ local_key, // [1] out: my slice's packed winner
+    unsigned long long* __restrict__ partial,   // [gridDim.x] scratch
+    unsigned* __restrict__ ctr) {               // 1 u32, starts at 0, self-resets
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (int)blockDim.x >> 5;
+    const int tok = ids[step];
+    const float* __restrict__ er = markov_embed + (size_t)tok * (size_t)mr;
+    float* __restrict__ lrow = logits + (size_t)step * (size_t)n;
+
+    // Identical walk to the full kernel with `vocab -> n`; `v` is the LOCAL row
+    // in this rank's slice, `idx_off + v` its GLOBAL index (see note 2 above).
+    unsigned long long best = 0ull;
+    for (int v = blockIdx.x * nwarp + wid; v < n; v += gridDim.x * nwarp) {
+        const float* __restrict__ wr = markov_head + (size_t)v * (size_t)mr;
+        float acc = 0.f;
+        if ((mr & 3) == 0) {
+            const float4* w4 = reinterpret_cast<const float4*>(wr);
+            const float4* e4 = reinterpret_cast<const float4*>(er);
+            const int n4 = mr >> 2;
+            for (int c = lane; c < n4; c += 32) {
+                const float4 wv = w4[c], ev = e4[c];
+                acc = __fmaf_rn(wv.x, ev.x, acc);
+                acc = __fmaf_rn(wv.y, ev.y, acc);
+                acc = __fmaf_rn(wv.z, ev.z, acc);
+                acc = __fmaf_rn(wv.w, ev.w, acc);
+            }
+        } else {
+            for (int c = lane; c < mr; c += 32) acc = __fmaf_rn(wr[c], er[c], acc);
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) {
+            const float l = lrow[v] + acc;
+            lrow[v] = l;   // the bias is applied ONCE per row (row `step` only)
+            const unsigned long long k =
+                ((unsigned long long)dspark_markov_f2key(l) << 32) |
+                (unsigned long long)(0xFFFFFFFFu - (unsigned)(idx_off + v));
+            if (k > best) best = k;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+        if (o > best) best = o;
+    }
+
+    // ---- block reduction (unchanged) ----
+    __shared__ unsigned long long sb[32];
+    if (lane == 0) sb[wid] = best;
+    __syncthreads();
+    if (wid == 0) {
+        unsigned long long b2 = (lane < nwarp) ? sb[lane] : 0ull;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, b2, off);
+            if (o > b2) b2 = o;
+        }
+        if (lane == 0) partial[blockIdx.x] = b2;
+    }
+    __syncthreads();
+
+    // ---- confidence (independent of the argmax; block 0's first warp) ----
+    if (confidence != nullptr && confidence_proj != nullptr && blockIdx.x == 0 && wid == 0) {
+        float acc = 0.f;
+        const float* __restrict__ hr = h + (size_t)step * (size_t)dim;
+        for (int c = lane; c < dim; c += 32) acc = __fmaf_rn(confidence_proj[c], hr[c], acc);
+        for (int c = lane; c < mr; c += 32)
+            acc = __fmaf_rn(confidence_proj[dim + c], er[c], acc);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) confidence[step] = acc;
+    }
+
+    // ---- last-block election: publish my slice's winner as a packed key ----
+    // The WHOLE vocabulary is only compared after the caller's exchange, so this
+    // kernel's answer is a partial key, never a token (note 3 above).
+    __threadfence();
+    __shared__ unsigned is_last;
+    if (threadIdx.x == 0) {
+        const unsigned old = atomicAdd(ctr, 1u);
+        is_last = (old == gridDim.x - 1) ? 1u : 0u;
+    }
+    __syncthreads();
+    if (is_last) {
+        __threadfence();
+        unsigned long long g = 0ull;
+        for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
+            const unsigned long long k = partial[i];
+            if (k > g) g = k;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, g, off);
+            if (o > g) g = o;
+        }
+        if (lane == 0) sb[wid] = g;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            g = 0ull;
+            for (int w = 0; w < nwarp; w++) {
+                if (sb[w] > g) g = sb[w];
+            }
+            local_key[0] = g;   // NOT `ids[step + 1]` — the exchange owns that
+            // Self-reset: the NEXT step's launch (same stream) must start at zero.
+            // Every block has already taken its ticket, so nothing can race this.
+            *ctr = 0u;
+        }
+    }
+}
+
+// `markov_head` is passed ALREADY OFFSET to this rank's first slice row (a
+// REPLICATED tensor, exactly the way the verify's sliced head offsets its own:
+// chain_dev.rs's `head_ptr = head.ptr() + rank * seg * dim * 2`). Slicing the
+// SHARD instead would break the unsliced arm on the very same loaded weights —
+// the gate defaults OFF, so both arms must be able to run, and the recorded
+// history of this tensor is exactly the "markov_head indexed vocab of a 16160-row
+// slice" 8x out-of-bounds read (weights.rs). `n` is the slice width.
+//
+// `markov_embed` is NOT offset: it stays full [vocab, mr] on every rank (er is
+// the GLOBAL token's row), see the kernel header.
+extern "C" int dsv41_dspark_markov_head_sliced(
+    float* logits, const float* h, const float* markov_embed, const float* markov_head,
+    const float* confidence_proj, int* ids, float* confidence, int dim, int n, int mr, int step,
+    int idx_off, unsigned long long* local_key, unsigned long long* partial, unsigned* ctr,
+    cudaStream_t s) {
+    if (n <= 0 || mr <= 0 || dim <= 0 || step < 0 || idx_off < 0) return (int)cudaErrorInvalidValue;
+    if (partial == nullptr || ctr == nullptr || local_key == nullptr)
+        return (int)cudaErrorInvalidValue;
+    int blocks = (n + DSPARK_MARKOV_WARPS * DSPARK_MARKOV_ROWS_PER_WARP - 1) /
+                 (DSPARK_MARKOV_WARPS * DSPARK_MARKOV_ROWS_PER_WARP);
+    if (blocks < 1) blocks = 1;
+    if (blocks > DSPARK_MARKOV_MAX_BLOCKS) blocks = DSPARK_MARKOV_MAX_BLOCKS;
+    dspark_markov_head_sliced_kernel<<<blocks, DSPARK_MARKOV_WARPS * 32, 0, s>>>(
+        logits, h, markov_embed, markov_head, confidence_proj, ids, confidence, dim, n, mr, step,
+        idx_off, local_key, partial, ctr);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
 // DSpark verify: the m-row block append + per-row CAUSAL window indices, in
 // one launch (the verify twin of `ring_win_fused_kernel`).
 //

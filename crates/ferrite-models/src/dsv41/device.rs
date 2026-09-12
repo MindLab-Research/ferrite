@@ -709,6 +709,31 @@ struct Kernels {
             c_int, c_int, c_int, c_int, *mut u64, *mut c_uint, CuStream,
         ) -> c_int,
     >,
+    /// Vocabulary-sliced twin of `dspark_markov_head` (DSV41_MARKOV_SLICED): one
+    /// rank walks its own `n`-wide row slice of `markov_head` (the caller passes
+    /// the slice base into the REPLICATED tensor) and publishes the slice's
+    /// packed winner into `local_key[0]` instead of writing `ids[step + 1]`. The
+    /// caller then folds the ranks with `argmax_key_pub`. A SEPARATE symbol on
+    /// purpose: the old entry keeps its arity, so a stale .so cannot be called
+    /// through a mismatched signature. Optional — `None` keeps the
+    /// full-vocabulary Markov loop (see `DsparkDev::markov_head_geom`).
+    dspark_markov_head_sliced: Option<
+        unsafe extern "C" fn(
+            *mut f32, *const f32, *const f32, *const f32, *const f32, *mut i32, *mut f32,
+            c_int, c_int, c_int, c_int, c_int, *mut u64, *mut u64, *mut c_uint, CuStream,
+        ) -> c_int,
+    >,
+    /// Cross-rank fold of an ALREADY-PACKED argmax key: one v5 epoch round,
+    /// nothing else (the local reduce belongs to the producer's kernel). The
+    /// draft's sliced Markov loop needs it because its five steps are strictly
+    /// sequential and cannot be batched into one multi-row round. Optional — see
+    /// `Self::supports_argmax_key_pub`.
+    argmax_key_pub: Option<
+        unsafe extern "C" fn(
+            *const u64, *mut c_int, *const *mut u64, *const *mut u32, *mut c_uint, *mut u64,
+            *const c_uint, c_int, c_int, c_long, CuStream,
+        ) -> c_int,
+    >,
     window_append: Option<unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int>,
@@ -1020,6 +1045,8 @@ impl Device {
             gather_rows: ko!(rt, "dsv41_gather_rows"),
             scatter_add_rows: ko!(rt, "dsv41_scatter_add_rows"),
             dspark_markov_head: ko!(rt, "dsv41_dspark_markov_head"),
+            dspark_markov_head_sliced: ko!(rt, "dsv41_dspark_markov_head_sliced"),
+            argmax_key_pub: ko!(rt, "dsv41_argmax_key_pub"),
             window_append: ko!(rt, "dsv41_window_append"),
             rmsnorm: km!(rt, "ferrite_rmsnorm"),
             hc_pre: km!(rt, "ferrite_hc_pre"),
@@ -2950,6 +2977,104 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_dspark_markov_head")
+    }
+
+    /// Vocabulary-sliced Markov step (DSV41_MARKOV_SLICED): the same program as
+    /// [`Self::dspark_markov_head`] restricted to this rank's `[idx_off,
+    /// idx_off + n)` rows of the replicated `markov_head` (the caller passes that
+    /// slice's base pointer). It biases `logits`' `step` row (pitch `n`) and
+    /// publishes the slice's packed winner — key = (value key | ~(idx_off + v)),
+    /// i.e. carrying the GLOBAL index so the fold's winner and tie rule are the
+    /// full-vocabulary argmax's — into `local_key[0]`. It does NOT write
+    /// `ids[step + 1]`: that is [`Self::argmax_key_pub`]'s job, and leaving a
+    /// local answer behind would be a plausible-looking wrong token.
+    ///
+    /// `markov_embed` is the FULL [vocab, mr] tensor (the step's token is global);
+    /// only `markov_head` is sliced.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_markov_head_sliced(
+        &self,
+        logits: *mut f32,
+        h: *const f32,
+        markov_embed: *const f32,
+        markov_head: *const f32,
+        confidence_proj: *const f32,
+        ids: *mut i32,
+        confidence: *mut f32,
+        dim: i32,
+        n: i32,
+        markov_rank: i32,
+        step: i32,
+        idx_off: i32,
+        local_key: *mut u64,
+        partial: *mut u64,
+        ctr: *mut u32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.dspark_markov_head_sliced else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                logits, h, markov_embed, markov_head, confidence_proj, ids, confidence, dim, n,
+                markov_rank, step, idx_off, local_key, partial, ctr, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_dspark_markov_head_sliced")?;
+        Ok(true)
+    }
+
+    /// Fold the ranks' already-packed argmax keys into `out` (one global index)
+    /// as ONE v5 epoch round. `Ok(false)` when the loaded .so predates the symbol
+    /// or the key cannot fit the v5 slot (the kernel's DECLINE sentinel) — the
+    /// caller gates the geometry on [`Self::supports_argmax_key_pub`] and on the
+    /// slot size, so a decline here must be treated as an inconsistency, not
+    /// swallowed into a fallback that has already written a sliced layout.
+    ///
+    /// `pos_ctr` is deliberately not exposed: the draft owns no device position
+    /// counter, and a Markov step must never advance one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn argmax_key_pub(
+        &self,
+        packed: *const u64,
+        out: *mut c_int,
+        peer_staging: *const *mut u64,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *mut u64,
+        ready_local: *const c_uint,
+        world: i32,
+        rank: i32,
+        stride_bytes: i64,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.argmax_key_pub else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                packed, out, peer_staging, ready_tbl, epoch, staging_local, ready_local, world,
+                rank, stride_bytes, self.stream,
+            )
+        };
+        if rc == 1 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_argmax_key_pub")?;
+        Ok(true)
+    }
+
+    /// Is the vocabulary-sliced Markov step in this .so? The draft gates the
+    /// slice geometry on it BEFORE the head GEMV takes an offset, so a stale .so
+    /// keeps the full-vocabulary `logits` pitch instead of leaving a half-sliced
+    /// buffer for the fallback to misread.
+    pub fn supports_dspark_markov_head_sliced(&self) -> bool {
+        self.kernels.dspark_markov_head_sliced.is_some()
+    }
+
+    /// Is the packed-key cross-rank fold in this .so? Both halves of the sliced
+    /// Markov path must be present; the kernel alone would leave `ids[step + 1]`
+    /// as this rank's LOCAL winner, which is a wrong token that looks plausible.
+    pub fn supports_argmax_key_pub(&self) -> bool {
+        self.kernels.argmax_key_pub.is_some()
     }
 
     pub fn swiglu_limit(&self, gate_up: *mut f32, rows: i32, inter: i32, limit: f32) -> Result<()> {

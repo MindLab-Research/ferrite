@@ -126,6 +126,45 @@ fn draft_moe_mrows() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_DRAFT_MOE_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_MARKOV_SLICED=1` (DEFAULT OFF — the house rule: a new path ships as an
+/// A/B arm) cuts the draft's Markov head across the ranks the same way
+/// `DSV41_VERIFY_HEAD_SLICED` cuts the verify's head: rank `r` walks only its
+/// `[r*seg, (r+1)*seg)` rows of the REPLICATED `markov_head` and the ranks fold
+/// their packed keys once per step.
+///
+/// **Why it is the one physical enabler of the 5-step reuse.**
+/// `dspark_markov_head_kernel` streams the whole `[vocab, mr]` f32 head (126 MiB)
+/// once per step, 5 steps per draft block, and nothing carries over: the input
+/// embedding row changes with the sampled token. 126 MiB cannot be held
+/// anywhere on-chip (148 SM x 227 KB = 33.6 MB of registers + smem, 60 MB L2),
+/// so all five scans are compulsory HBM passes. One rank's `vocab/world` = 16160
+/// rows = 15.8 MiB DOES fit L2, which is what turns four of the five scans into
+/// L2 hits (docs/agent/draft-1ms-design.md 1.2) — the slice is not a byte-count
+/// trick, it is the only way the traffic is physically avoidable.
+///
+/// **Epoch footprint.** The Markov loop is strictly sequential, so the five steps
+/// cannot be batched into one multi-row round; each step pays one
+/// `dsv41_argmax_key_pub` round. That is 3 blocks x 5 = 15 extra v5 rounds per
+/// `draft_forward`, and it is deadlock-free for a structural reason: the draft
+/// runs on EVERY rank with the SAME launch sequence (replicated draft weights and
+/// attention tensors, an MoE all-reduce per block), so every rank issues the same
+/// 15 rounds plus the same 3 AR rounds. The footprint is SYMMETRIC — no rank ever
+/// issues a round its peers do not (the `SEED_ALIGN` asymmetry failure). This is
+/// the same property the verify's per-row argmax exchange relies on; it holds
+/// here for the same reason. A sliced Markov that ran on a SUBSET of the ranks
+/// would break exactly this invariant, so the gate must stay an all-ranks gate.
+///
+/// Fallbacks (each one keeps the full-vocabulary loop): `world == 1`,
+/// `vocab % world != 0`, a non-BF16 head (the sliced head GEMV is bf16-only),
+/// a stale `.so` missing either new symbol, a collective that is not on the v5
+/// protocol, and a v5 slot too small for one key. [`Self::markov_head_geom`] is
+/// the ONE place that decides. Read once and cached (the house rule for
+/// hot-path gates).
+fn markov_sliced() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_MARKOV_SLICED").map(|v| v != "0").unwrap_or(false))
+}
+
 /// The device draft. Holds the window rings (one per MTP block), every scratch
 /// buffer the forward needs, and references to the shared weights/config.
 pub struct DsparkDev<'a> {
@@ -225,6 +264,10 @@ pub struct DsparkDev<'a> {
     confidence: DevBuf,
     mk_partial: DevBuf,
     mk_ctr: DevBuf,
+    /// `[1]` u64: the sliced Markov step's packed slice winner (key | ~global
+    /// index), the input to the step's cross-rank fold (`argmax_key_pub`). Only
+    /// touched by `DSV41_MARKOV_SLICED`; dormant on the full-vocabulary path.
+    mk_key: DevBuf,
 
     // ---- MoE ----
     scores: DevBuf,
@@ -395,6 +438,7 @@ impl<'a> DsparkDev<'a> {
             confidence: dev.alloc(fb(bs).max(4))?,
             mk_partial: dev.alloc(MARKOV_MAX_BLOCKS * 8)?,
             mk_ctr: dev.alloc(4)?,
+            mk_key: dev.alloc(8)?,
             // Sized by the DRAFT layers' routing geometry — see `mo_n_routed` /
             // `mo_topk` above (defect 4, audit-moe-seg). `draft_moe` reads them
             // with `cfg.moe_config(layer)` for `layer >= n_layers`.
@@ -1717,6 +1761,55 @@ impl<'a> DsparkDev<'a> {
         Ok(())
     }
 
+    /// The vocabulary slice the Markov head walks, or `None` for the
+    /// full-vocabulary path: `Some((seg, base))` with `seg = vocab / world` and
+    /// `base = rank * seg`.
+    ///
+    /// This is [`markov_sliced`]'s ONLY consumer and the one place the geometry is
+    /// decided, so the head GEMV, the Markov bias and the packed key's global
+    /// index base can never disagree (the pitch is not in the type — see the
+    /// head site's warning, and the verify's twin `verify_head_geom`).
+    ///
+    /// Gated on the whole set of fallbacks BEFORE any layout choice:
+    /// * `DSV41_MARKOV_SLICED` on (default OFF — the A/B arm),
+    /// * `world > 1` (a single rank has nothing to slice against),
+    /// * `vocab % world == 0` (16160 x 8 = 129280 divides),
+    /// * a BF16 head — the sliced head GEMV is the bf16 multi-row kernel,
+    /// * BOTH new symbols present, tested HERE so a stale .so keeps the
+    ///   full-vocabulary pitch instead of leaving a half-sliced `logits` buffer
+    ///   for the fallback to misread,
+    /// * a v5 collective, because the per-step fold IS one round of that epoch
+    ///   sequence,
+    /// * room for one 8-byte key in the v5 slot — the fold entry's own decline
+    ///   arm, checked here so a decline can never happen after the head has
+    ///   already written a sliced pitch.
+    fn markov_head_geom(&self) -> Option<(usize, usize)> {
+        let world = self.world;
+        let vocab = self.vocab;
+        if world <= 1 || vocab % world != 0 {
+            return None;
+        }
+        let head_bf16 = self
+            .w
+            .head
+            .as_ref()
+            .map(|h| h.dtype == "BF16")
+            .unwrap_or(false);
+        let sliced = markov_sliced()
+            && head_bf16
+            && self.dev.supports_dspark_markov_head_sliced()
+            && self.dev.supports_argmax_key_pub()
+            && self
+                .comm
+                .as_ref()
+                .map(|c| c.uses_v5() && 8 <= c.bytes)
+                .unwrap_or(false);
+        if !sliced {
+            return None;
+        }
+        Some((vocab / world, self.rank * (vocab / world)))
+    }
+
     /// `forward_head`: the first block's collapse, the head, then the
     /// sequential Markov loop (`dsv41_dspark_markov_head`, one launch per step).
     fn draft_head(&mut self) -> Result<()> {
@@ -1788,14 +1881,41 @@ impl<'a> DsparkDev<'a> {
         // `DSV41_DRAFT_HEAD_FOLD=0` forces the per-row loop even when the folded
         // launch is available: the A/B for "does the folded kernel's K-order
         // difference cost the draft its top-1" (see `draft_head_fold`).
+        //
+        // DSV41_MARKOV_SLICED geometry. `geom = Some((seg, base))` means this rank
+        // head-projects only ITS `seg = vocab / world` rows of `head.weight` and
+        // biases only the matching rows of `markov_head`, so the slope of `logits`
+        // becomes `seg`. Both halves MUST take the same `(seg, base)` — a head
+        // sliced at one pitch with a Markov bias at another would bias logits row
+        // `v` with weight row `v + k` and still produce a plausible token (the
+        // pitch is not in the type). `markov_head_geom` is the one place that
+        // decides, and it is read ONCE here, before the head writes its pitch.
+        //
+        // The slice is taken by OFFSETTING the replicated tensor (the same thing
+        // the verify's sliced head does: `head.ptr() + rank * seg * dim * 2`), not
+        // by re-sharding `weights.rs`. The gate defaults OFF, so the unsliced arm
+        // must keep working on the SAME loaded weights — a Rows-sharded
+        // `markov_head` is exactly the "indexed vocab of a 16160-row slice" 8x
+        // out-of-bounds read weights.rs records. The bandwidth win does not need
+        // the shard: the kernel only ever touches its own 15.8 MiB of rows.
+        //
+        // `logits` stays allocated at `bs * vocab` and only its PITCH changes, so
+        // the layout never depends on `set_comm` (which runs after `new`) and a
+        // captured/replayed buffer keeps a stable address.
+        let geom = self.markov_head_geom();
+        let lg_pitch = geom.map(|(seg, _)| seg).unwrap_or(vocab);
+        let lg_base = geom.map(|(_, base)| base).unwrap_or(0);
+        // Element offset of this rank's first head row (bf16 = 2 bytes).
+        let head_off = lg_base * dim * 2;
+        let head_ptr = (head.ptr() as *const u8).wrapping_add(head_off) as *const c_void;
         let head_rows = draft_head_fold()
             && if head.dtype.as_str() == "BF16" {
                 self.dev.head_gemv_bf16_mrows(
-                    head.ptr(),
+                    head_ptr,
                     self.normed.ptr as *const f32,
                     self.logits.ptr as *mut f32,
                     bs as i32,
-                    vocab as i32,
+                    lg_pitch as i32,
                     dim as i32,
                 )?
             } else {
@@ -1805,17 +1925,19 @@ impl<'a> DsparkDev<'a> {
             for r in 0..bs {
                 match head.dtype.as_str() {
                     "BF16" => self.dev.gemv_bf16(
-                        head.ptr(),
+                        head_ptr,
                         (self.normed.ptr as *const f32).wrapping_add(r * dim),
-                        (self.logits.ptr as *mut f32).wrapping_add(r * vocab),
-                        vocab as i32,
+                        (self.logits.ptr as *mut f32).wrapping_add(r * lg_pitch),
+                        lg_pitch as i32,
                         dim as i32,
                     )?,
+                    // Unreachable with `geom == Some`: the geometry requires a
+                    // bf16 head. The full-vocabulary f32 path is unchanged.
                     _ => self.dev.gemv_f32(
                         head.as_f32(),
                         (self.normed.ptr as *const f32).wrapping_add(r * dim),
-                        (self.logits.ptr as *mut f32).wrapping_add(r * vocab),
-                        vocab as i32,
+                        (self.logits.ptr as *mut f32).wrapping_add(r * lg_pitch),
+                        lg_pitch as i32,
                         dim as i32,
                     )?,
                 }
@@ -1827,24 +1949,86 @@ impl<'a> DsparkDev<'a> {
         //
         // The unit dump takes `logits_row0` BEFORE this loop: the Markov head
         // biases the rows in place, so after the loop `logits[0]` is the biased
-        // row, not the head's raw output the reference records.
-        self.dump_unit("logits_row0", self.logits.ptr as *const f32, &[vocab]);
+        // row, not the head's raw output the reference records. Under the slice
+        // the recorded row is this rank's `seg`-wide slice (the same shape change
+        // `DSV41_VERIFY_HEAD_SLICED` makes to the verify's `logits_r`), so the
+        // dump's second dim follows the pitch rather than the vocabulary.
+        self.dump_unit("logits_row0", self.logits.ptr as *const f32, &[lg_pitch]);
         for step in 0..bs {
-            self.dev.dspark_markov_head(
-                self.logits.ptr as *mut f32,
-                self.collapse.ptr as *const f32,
-                markov_embed.as_f32(),
-                markov_head.as_f32(),
-                confidence_proj.as_f32(),
-                self.ids.ptr as *mut i32,
-                self.confidence.ptr as *mut f32,
-                dim as i32,
-                vocab as i32,
-                mr as i32,
-                step as i32,
-                self.mk_partial.ptr as *mut u64,
-                self.mk_ctr.ptr as *mut u32,
-            )?;
+            if let Some((seg, base)) = geom {
+                // This rank's Markov head rows start `base * mr` f32 into the
+                // replicated [vocab, mr] tensor — the SAME partition the head GEMV
+                // just used.
+                let mk_head =
+                    (markov_head.as_f32() as *const u8).wrapping_add(base * mr * 4) as *const f32;
+                self.dev.dspark_markov_head_sliced(
+                    (self.logits.ptr as *mut f32).wrapping_add(step * seg),
+                    self.collapse.ptr as *const f32,
+                    // `markov_embed` NOT offset: `er` is the GLOBAL token's row.
+                    markov_embed.as_f32(),
+                    mk_head,
+                    confidence_proj.as_f32(),
+                    self.ids.ptr as *mut i32,
+                    self.confidence.ptr as *mut f32,
+                    dim as i32,
+                    seg as i32,
+                    mr as i32,
+                    step as i32,
+                    base as i32,
+                    self.mk_key.ptr as *mut u64,
+                    self.mk_partial.ptr as *mut u64,
+                    self.mk_ctr.ptr as *mut u32,
+                )?;
+                // ONE v5 epoch round per step (the steps are strictly sequential:
+                // step s+1's input token IS step s's winner). Symmetric across the
+                // ranks because every rank runs this same loop — see
+                // `markov_sliced`'s epoch-footprint note.
+                let c = self.comm.as_ref().ok_or_else(|| {
+                    FerriteError::Config(
+                        "dspark: markov_head_geom accepted the slice with no collective attached"
+                            .into(),
+                    )
+                })?;
+                let ok = self.dev.argmax_key_pub(
+                    self.mk_key.ptr as *const u64,
+                    (self.ids.ptr as *mut i32).wrapping_add(step + 1),
+                    c.peer_slots_u64(),
+                    c.peer_stamps_u32(),
+                    c.epoch_dev(),
+                    c.staging_dev() as *mut u64,
+                    c.ready_local_dev(),
+                    self.world as i32,
+                    self.rank as i32,
+                    c.bytes as i64,
+                )?;
+                if !ok {
+                    // Unreachable by construction: `markov_head_geom` gated on the
+                    // symbol AND on `8 <= c.bytes`, the entry's two decline arms. A
+                    // decline would mean the two sides disagree about the slot, and
+                    // the sliced kernel has ALREADY biased this rank's row — a
+                    // silent fallback would then read a slice as if it were the
+                    // whole vocabulary and emit a plausible wrong token.
+                    return Err(FerriteError::Config(
+                        "dsv41_argmax_key_pub declined a shape the host gated as legal".into(),
+                    ));
+                }
+            } else {
+                self.dev.dspark_markov_head(
+                    self.logits.ptr as *mut f32,
+                    self.collapse.ptr as *const f32,
+                    markov_embed.as_f32(),
+                    markov_head.as_f32(),
+                    confidence_proj.as_f32(),
+                    self.ids.ptr as *mut i32,
+                    self.confidence.ptr as *mut f32,
+                    dim as i32,
+                    vocab as i32,
+                    mr as i32,
+                    step as i32,
+                    self.mk_partial.ptr as *mut u64,
+                    self.mk_ctr.ptr as *mut u32,
+                )?;
+            }
         }
         // the drafted block the sampler produced: `[t0, d1..d_bs]`, the
         // reference's `output_ids`.

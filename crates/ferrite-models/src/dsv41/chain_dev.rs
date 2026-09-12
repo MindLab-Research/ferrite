@@ -83,6 +83,14 @@ struct LayerCache {
 /// (a short block at the end of a request) simply uses a prefix of them.
 pub const VERIFY_ROWS: usize = 6;
 
+/// How many row SHAPES the verify graph pool holds (see
+/// [`DevChain::verify_graphs`]): the two a production request actually produces
+/// — the shadow step's `DSPARK_DRAFTS` rows and the swallowed anchor's `+1`
+/// (`SEED_ALIGN`/`SWALLOW`). A third shape (the parity self-test varies `m`)
+/// takes the direct launches. Each slot is an independent graph (its own
+/// DRY→capture schedule, its own failure latch).
+const VERIFY_GRAPH_SLOTS: usize = 2;
+
 /// What one shadow-mode DSpark step observed. See
 /// [`DevChain::dspark_shadow_step`] for the orchestration: the step runs the
 /// draft and a real verify block, then puts the main chain back exactly where
@@ -1211,6 +1219,16 @@ fn verify_graph_want() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_VERIFY_GRAPH").map(|v| v != "0").unwrap_or(false))
 }
 
+/// The shape-tagged name of a verify graph: `verify_graph_m{m}`.
+///
+/// The pool holds up to [`VERIFY_GRAPH_SLOTS`] coexisting graphs (one per row
+/// count), so the `[verify_graph]` diagnostics tag each capture line with the
+/// shape it belongs to — an A/B log then shows WHICH shape engaged instead of a
+/// single anonymous "captured".
+fn verify_graph_name(m: usize) -> String {
+    format!("verify_graph_m{m}")
+}
+
 /// DSV41_AR_STORE_FUSE=1 re-enables the wo_b all-reduce store epilogue.
 fn ar_store_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -1797,21 +1815,41 @@ pub struct DevChain<'a> {
     // different times (the step graph on the first decode step, this one on the
     // second verify) and cover different kernel sets. The precedent for two
     // coexisting execs is `moe_graph` above.
-    verify_graph: Option<*mut std::ffi::c_void>,
-    /// The row count the stored graph was captured at. The capture bakes the
-    /// launch geometry, so a verify block of a DIFFERENT length must not replay
-    /// it (`DSPARK_DRAFTS` = 5 for the shadow step, 6 for the spec step, and the
-    /// parity self-test varies it) — those calls fall back to the direct path.
-    verify_graph_m: usize,
-    /// Set when a capture attempt FAILED. The graph is an optimisation, so a
-    /// refusal from the driver must not take the verify down with it: the
-    /// request finishes on the direct launches, and this flag stops the same
-    /// doomed capture from being re-attempted on every step. Cleared by `reset`.
-    verify_graph_failed: bool,
-    /// False until the first `step_rows` call has executed for real: that call
-    /// is the DRY run (it warms every kernel, builds the lazy engram state and
-    /// sizes the cuBLAS workspaces), and only the SECOND one captures.
-    verify_dry_done: bool,
+    //
+    // The execs live in the SHAPE POOL `verify_graphs` below: ONE SLOT PER ROW
+    // COUNT. With `SEED_ALIGN`/`SWALLOW` on a single request emits `m = 5` on
+    // its first verify and `m = 6` on every later one, and a single slot could
+    // only ever latch the first of those — see `verify_shapes`.
+    verify_graphs: [Option<*mut std::ffi::c_void>; VERIFY_GRAPH_SLOTS],
+    /// The row count (`m`) each graph slot was captured at, `0` = EMPTY slot.
+    ///
+    /// The capture bakes the launch geometry, so a verify block of a DIFFERENT
+    /// length must not replay a slot's graph. ONE shared `m` field was not
+    /// enough: with `SEED_ALIGN`/`SWALLOW` on, one request emits `m = 5` on its
+    /// first verify and `m = 6` on every later one (`DSPARK_DRAFTS` = 5 for the
+    /// shadow step, +1 for the swallowed anchor). The single field had the first
+    /// DRY write `5`, so every later `m = 6` call failed the shape latch and the
+    /// request quietly finished on the direct launches — the graph engaged for
+    /// exactly one step and never paid for a capture at all. The pool holds the
+    /// (at most) TWO shapes a production request can produce; a THIRD shape (the
+    /// parity self-test varies `m`) still takes the direct path, as does a
+    /// request in which the pool is full.
+    verify_shapes: [usize; VERIFY_GRAPH_SLOTS],
+    /// Set when a capture attempt FAILED, PER SLOT. The graph is an
+    /// optimisation, so a refusal from the driver must not take the verify down
+    /// with it: the request finishes on the direct launches, and this latch stops
+    /// the same doomed capture from being re-attempted on every step. The slots
+    /// latch INDEPENDENTLY — a refusal while capturing one shape does not disable
+    /// the other (each shape has its own capture, so each gets its own verdict).
+    /// Cleared by `reset`.
+    verify_graph_failed: [bool; VERIFY_GRAPH_SLOTS],
+    /// False until that SLOT's first `step_rows` call has executed for real: that
+    /// call is the DRY run (it warms every kernel, builds the lazy engram state
+    /// and sizes the cuBLAS workspaces), and only the SECOND one captures. Per
+    /// slot, because each shape's geometry has to be warmed before its own
+    /// capture — the second shape DRYs while the first shape's graph already
+    /// exists.
+    verify_dry_done: [bool; VERIFY_GRAPH_SLOTS],
     /// Diagnostics: captures and replays since the last `reset`.
     verify_captures: u32,
     verify_replays: u32,
@@ -2158,10 +2196,10 @@ impl<'a> DevChain<'a> {
             moe_add_in: vec![None; cfg.n_layers],
             spec_capture: false,
             spec_primed: false,
-            verify_graph: None,
-            verify_graph_m: 0,
-            verify_graph_failed: false,
-            verify_dry_done: false,
+            verify_graphs: [None; VERIFY_GRAPH_SLOTS],
+            verify_shapes: [0; VERIFY_GRAPH_SLOTS],
+            verify_graph_failed: [false; VERIFY_GRAPH_SLOTS],
+            verify_dry_done: [false; VERIFY_GRAPH_SLOTS],
             verify_captures: 0,
             verify_replays: 0,
         })
@@ -2619,27 +2657,45 @@ impl<'a> DevChain<'a> {
         // capture time, and a verify at a position past `window` takes a
         // different `pos_rows` residue. A stale exec would therefore replay
         // against addresses that may now belong to something else at positions it
-        // was not recorded for. Drop it; the next request re-DRYs and re-captures.
-        if let Some(e) = self.verify_graph.take() {
-            self.dev.graph_free(std::ptr::null_mut(), e)?;
+        // was not recorded for. Drop EVERY pool slot; the next request re-DRYs and
+        // re-captures each shape it uses.
+        for slot in self.verify_graphs.iter_mut() {
+            if let Some(e) = slot.take() {
+                self.dev.graph_free(std::ptr::null_mut(), e)?;
+            }
         }
-        self.verify_graph_m = 0;
-        self.verify_graph_failed = false;
-        self.verify_dry_done = false;
+        self.verify_shapes = [0; VERIFY_GRAPH_SLOTS];
+        self.verify_graph_failed = [false; VERIFY_GRAPH_SLOTS];
+        self.verify_dry_done = [false; VERIFY_GRAPH_SLOTS];
         // The next request's first spec step bootstraps again (its standalone
         // `step_dev` is what supplies the very first tap).
         self.spec_primed = false;
         // `reset` runs at the START of a request, so this reports the PREVIOUS
         // one: the only place the capture/replay counts of a finished request can
         // be read (the alternative diagnostic is the per-request capture line in
-        // `step_rows`). Silent while the switch is off or nothing engaged.
+        // `step_rows`). Silent while the switch is off or nothing engaged. With
+        // the shape pool in play a request can hold TWO graphs, so `failed` is the
+        // any-slot verdict and the shapes that engaged are listed alongside.
         if verify_graph_want()
             && self.rank() == 0
-            && (self.verify_captures > 0 || self.verify_replays > 0 || self.verify_graph_failed)
+            && (self.verify_captures > 0
+                || self.verify_replays > 0
+                || self.verify_graph_failed.iter().any(|&f| f))
         {
+            let shapes = self
+                .verify_shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, &m)| m != 0)
+                .map(|(_, &m)| format!("m={m}"))
+                .collect::<Vec<_>>()
+                .join(",");
             eprintln!(
-                "[verify_graph] previous request: captures={} replays={} failed={}",
-                self.verify_captures, self.verify_replays, self.verify_graph_failed
+                "[verify_graph] previous request: captures={} replays={} failed={} shapes=[{}]",
+                self.verify_captures,
+                self.verify_replays,
+                self.verify_graph_failed.iter().any(|&f| f),
+                shapes
             );
         }
         self.verify_captures = 0;
@@ -3918,15 +3974,18 @@ impl<'a> DevChain<'a> {
         self.ul_i32(self.s.ids_r.ptr, &ids)?;
         self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
 
-        if self.verify_graph_gate(m, pos_base) {
-            if !self.verify_dry_done {
+        if let Some(idx) = self.verify_graph_gate(m, pos_base) {
+            if !self.verify_dry_done[idx] {
                 // DRY: a REAL execution, so every lazy first-use cost happens
                 // outside the capture. Its device effects are the caller's to
-                // keep or roll back, exactly like any other verify.
+                // keep or roll back, exactly like any other verify. Run once PER
+                // SHAPE: the second shape's DRY happens while the first shape's
+                // graph already sits in its slot (harmless — `step_rows_inner`
+                // never touches the pool).
                 self.step_rows_inner(toks, m, pos_base)?;
-                self.verify_dry_done = true;
-                self.verify_graph_m = m;
-            } else if let Some(e) = self.verify_graph {
+                self.verify_dry_done[idx] = true;
+                self.verify_shapes[idx] = m;
+            } else if let Some(e) = self.verify_graphs[idx] {
                 // Rendezvous before the replay: a capture only RECORDS the AR
                 // kernels while a peer may already be EXECUTING its own — the same
                 // pair `step_impl` keeps around its capture.
@@ -3947,8 +4006,9 @@ impl<'a> DevChain<'a> {
                 // verify down with it. A driver refusal (an op the static audit
                 // approved that the driver still rejects, an unsupported
                 // primitive on a stale `.so`, an instantiate failure) leaves this
-                // request on the DIRECT launches, and `verify_graph_failed` stops
-                // the doomed capture from being retried on every step.
+                // request on the DIRECT launches, and this SLOT's
+                // `verify_graph_failed` latch stops the doomed capture from being
+                // retried on every step (the other shape's slot is unaffected).
                 let (g, cap_err) = self.capture_verify(toks, m, pos_base);
                 // ... but the HOST code inside the recording ran for real either
                 // way: `compress_rows` advances its `compress_len` mirror by the
@@ -3973,10 +4033,11 @@ impl<'a> DevChain<'a> {
                         .map(|e| format!("{e}"))
                         .unwrap_or_else(|| "capture_end returned a null graph".into());
                     eprintln!(
-                        "[verify_graph] capture FAILED (m={m} pos={pos_base}): {why} — this \
-                         request finishes on the direct launches (gate re-closed)"
+                        "[verify_graph] {} capture FAILED (m={m} pos={pos_base}): {why} — this \
+                         request finishes on the direct launches (slot latched)",
+                        verify_graph_name(m)
                     );
-                    self.verify_graph_failed = true;
+                    self.verify_graph_failed[idx] = true;
                     if !g.is_null() {
                         let _ = self.dev.graph_free(g, std::ptr::null_mut());
                     }
@@ -3985,15 +4046,18 @@ impl<'a> DevChain<'a> {
                     let e = self.dev.graph_instantiate(g)?;
                     self.dev.graph_free(g, std::ptr::null_mut())?;
                     self.dev.graph_launch(e)?; // the capture did not execute
-                    self.verify_graph = Some(e);
+                    self.verify_graphs[idx] = Some(e);
                     self.verify_captures += 1;
                     // The A/B's proof that `DSV41_VERIFY_GRAPH=1` took effect: one
                     // line per request (rank 0 only — the ranks are threads of one
-                    // process and would otherwise print it `world` times).
+                    // process and would otherwise print it `world` times). The name
+                    // carries the shape, so with the pool holding two graphs the
+                    // log shows WHICH one engaged.
                     if self.rank() == 0 {
                         eprintln!(
-                            "[verify_graph] captured m={m} at pos={pos_base} — every later \
-                             verify of this request replays (DSV41_VERIFY_GRAPH=1)"
+                            "[verify_graph] captured {} at pos={pos_base} — every later \
+                             verify of this shape replays (DSV41_VERIFY_GRAPH=1)",
+                            verify_graph_name(m)
                         );
                     }
                     self.advance_compress_lens(pos_base, m);
@@ -4023,7 +4087,9 @@ impl<'a> DevChain<'a> {
 
     /// Can THIS verify of THIS shape go through the graph right now?
     ///
-    /// Every condition is either a concrete capture hazard or a shape mismatch:
+    /// Returns the SHAPE POOL SLOT this call is cleared into, or `None` when it
+    /// must take the direct launches. Every condition is either a concrete
+    /// capture hazard or a shape mismatch:
     ///
     /// * `DSV41_VERIFY_GRAPH` on (default OFF — the A/B);
     /// * `pos_base >= 1`: the compressor's launcher picks its mode and grid from
@@ -4036,8 +4102,13 @@ impl<'a> DevChain<'a> {
     ///   decision (`out_rows_val`) is NOT affected: the kernel already derives it
     ///   from the DEVICE counter pointer it is given (`pos_rows[r]`, dereferenced
     ///   in-kernel at dsv41_kernels.cu:3029).
-    /// * `m` equal to the row count the DRY pass warmed / the stored graph was
-    ///   recorded at — the capture bakes the per-row launch geometry.
+    /// * a pool SLOT for `m` (see [`Self::verify_slot`]): a slot already holding
+    ///   that shape, or a free one. The capture bakes the per-row launch geometry,
+    ///   so a shape with no slot (a THIRD shape — the parity self-test varies `m`
+    ///   — or a pool already full) takes the direct path. This replaces the old
+    ///   single-`m` latch, which let the request's FIRST shape (`m = 5`) block
+    ///   every later one (`m = 6`) and silently cost the whole feature.
+    /// * this SLOT has not already latched a capture failure (`verify_graph_failed`).
     /// * `!eng_host()`: the `DSV41_ENG_HOST` fallback hashes on the HOST and
     ///   uploads per row (`upload_bytes_at` = blocking H2D).
     /// * `ar_v5()` whenever there are peers: a host barrier is not a CUDA call, so
@@ -4060,31 +4131,47 @@ impl<'a> DevChain<'a> {
     ///   the recorded region (`step_impl` excludes them for the same reason).
     /// * the host `comp_len > 0` branch must already be in its steady state — see
     ///   [`Self::compress_branch_steady`], which is the guard for the audit's S7.
-    fn verify_graph_gate(&self, m: usize, pos_base: i32) -> bool {
+    /// The shape pool's slot for a verify block of `m` rows: the slot ALREADY
+    /// holding that shape, else the first EMPTY one, else `None` (the pool is
+    /// full of other shapes). Pure — the gate and `step_rows` resolve the same
+    /// slot from the same state, so the slot the gate approves is the slot the
+    /// call uses.
+    fn verify_slot(&self, m: usize) -> Option<usize> {
+        if let Some(i) = self.verify_shapes.iter().position(|&s| s == m) {
+            return Some(i);
+        }
+        // `0` is the EMPTY marker; `step_rows` rejects `m == 0` before the gate,
+        // so a zero-row block can never claim a slot here.
+        self.verify_shapes.iter().position(|&s| s == 0)
+    }
+
+    fn verify_graph_gate(&self, m: usize, pos_base: i32) -> Option<usize> {
         if !verify_graph_want() || pos_base < 1 {
-            return false;
+            return None;
         }
-        if self.verify_graph_failed {
-            // A capture already failed this request. Re-attempting it every step
-            // would burn the failure on the hot path for nothing.
-            return false;
+        // The shape pool first: without a slot there is nothing to check.
+        let idx = self.verify_slot(m)?;
+        if self.verify_graph_failed[idx] {
+            // A capture already failed for THIS shape this request. Re-attempting
+            // it every step would burn the failure on the hot path for nothing.
+            // The other slot is independent and still usable.
+            return None;
         }
-        if self.verify_graph_m != 0 && m != self.verify_graph_m {
-            return false;
+        if self.verify_graphs[idx].is_some() || self.verify_dry_done[idx] {
+            // The stored graph (or the pending capture) is already committed to
+            // this slot's shape and its environment was checked when it was
+            // armed; the shape matches by construction, so only the hazards
+            // below could still disqualify the call.
+            return Some(idx);
         }
-        if self.verify_graph.is_some() || self.verify_dry_done {
-            // The stored graph (or the pending capture) is already committed to a
-            // shape and its environment was checked when it was armed; only the
-            // row count can still disqualify this call.
-            return true;
-        }
-        !eng_host()
+        let armed = !eng_host()
             && !stats_dbg()
             && !phase_dbg()
             && self.compress_branch_steady()
             && self.dev.supports_dspark_snapshot()
             && self.dev.supports_memset_async()
-            && (self.comm.is_none() || crate::dsv41::tp::ar_v5())
+            && (self.comm.is_none() || crate::dsv41::tp::ar_v5());
+        armed.then_some(idx)
     }
 
     /// Record one [`Self::step_rows_inner`] into a fresh graph.

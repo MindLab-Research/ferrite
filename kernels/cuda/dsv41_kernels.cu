@@ -6992,6 +6992,38 @@ extern "C" int dsv41_argmax_sliced(
     return (int)cudaGetLastError();
 }
 
+// Cross-rank fold of an ALREADY-PACKED key: `dsv41_argmax_sliced` minus its
+// local `argmax_kernel`. For the DSpark draft's vocabulary-sliced Markov head
+// (DSV41_MARKOV_SLICED), whose own kernel produces the slice's packed key
+// (`idx_off + v` in the low half, so the key already carries the GLOBAL index)
+// while walking — re-reducing the biased row here would be a second pass over
+// the same 16160 floats for an answer the markov kernel already has in a
+// register.
+//
+// ONE round of the v5 epoch sequence, exactly like the single-row
+// `dsv41_argmax_sliced`: the Markov loop is strictly sequential (step s+1's
+// input token IS step s's winner), so the five steps CANNOT be batched into one
+// multi-row round the way the verify's `argmax_sliced_rows` batches its six
+// independent rows. The five rounds per block are safe because EVERY rank runs
+// the same launch sequence (replicated draft weights, same MoE ARs), so the
+// footprint is symmetric — see the sliced markov kernel's header.
+//
+// `pos_ctr` is always NULL for this entry (the draft has no device position
+// counter; its `dspark_dev.rs` host shadow is the owner) — the parameter is not
+// even exposed. Returns 1 (the DECLINE sentinel `dsv41_argmax_sliced` uses) when
+// the key cannot fit the v5 slot, so a caller that gated on the symbol alone
+// still falls back instead of corrupting the AR's staging.
+extern "C" int dsv41_argmax_key_pub(
+    const unsigned long long* packed, int* out, unsigned long long* const* staging_tbl,
+    unsigned* const* ready_tbl, unsigned* epoch, unsigned long long* staging_local,
+    const unsigned* ready_local, int world, int rank, long stride_bytes, cudaStream_t s) {
+    if (world <= 0 || packed == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
+    if (stride_bytes < 8) return 1;  // the single key must fit the v5 slot
+    argmax_xchg_v5_kernel<<<1, 1, 0, s>>>(packed, staging_tbl, ready_tbl, epoch, staging_local,
+                                          ready_local, out, nullptr, world, rank, stride_bytes);
+    return (int)cudaGetLastError();
+}
+
 // Multi-row vocabulary-sliced argmax (DSV41_VERIFY_HEAD_SLICED): the m-row form
 // of `dsv41_argmax_sliced`, for the DSpark verify's head. Row i is reduced over
 // its OWN `n`-wide slice (`v + i*row_stride`, the logits buffer's row pitch),
