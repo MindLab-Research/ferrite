@@ -8145,9 +8145,20 @@ impl<'a> DevChain<'a> {
     /// intermediate is not needed by the fused form, but the pair's fallback
     /// still writes it, so the buffer stays live).
     ///
-    /// `DSV41_BF16_TRUNCATE` rides along: the fused kernel is the only form that
-    /// carries it (as in `layer()`), so with the gate ON the verify chain now
-    /// honours it where the raw pair silently ignored it.
+    /// `DSV41_BF16_TRUNCATE` deliberately does NOT ride along (2026-09-12, the
+    /// baseline-breakage fix): the fused call passes `truncate = false`, so the
+    /// verify chain keeps the raw pair's historical f32 behaviour no matter what
+    /// the decode-side gate does. `hc_collapse_norm` was the ONLY form that
+    /// carried the gate (as in `layer()`), and arming it here made the verify the
+    /// first place inside a step where BF16_TRUNCATE applied; combined with the
+    /// P0-series commits that broke the zero-Latin baseline (bisect: 050c7fd, the
+    /// commit that first routed the verify's collapse through `hc_collapse_norm`;
+    /// the GPU A/B confirmed `HC_VERIFY_FUSE=0` restores zero Latin). With the
+    /// truncate removed the fused form is a statement-for-statement superset of
+    /// the raw pair's f32 path, so arming `HC_VERIFY_FUSE=1` buys the launches
+    /// back without touching the verify's numerics. `layer()`'s own
+    /// `hc_collapse_norm` still honours the gate — the decode path was always the
+    /// one the gate was validated on.
     ///
     /// The control flow is `layer()`'s, on purpose. `fused_done` says the fused
     /// front end already collapsed this block (its EARLY half IS
@@ -8175,6 +8186,10 @@ impl<'a> DevChain<'a> {
                 return Ok(());
             }
             if Self::hc_verify_fuse() {
+                // `truncate = false` on purpose: the verify chain must keep the
+                // raw pair's historical f32 behaviour (see the doc comment above
+                // and `hc_verify_fuse`). Reading the gate here is what first put
+                // BF16_TRUNCATE on the verify and broke the zero-Latin baseline.
                 self.dev.hc_collapse_norm(
                     self.s.h_r.ptr as *mut f32,
                     pre,
@@ -8184,7 +8199,7 @@ impl<'a> DevChain<'a> {
                     hc as i32,
                     dim as i32,
                     cfg.norm_eps,
-                    bf16_truncate(),
+                    false,
                 )?;
                 return Ok(());
             }
@@ -11544,8 +11559,9 @@ fn fuse_b1() -> bool {
 ///
 ///  * A1-a: the collapse + norm pair becomes `hc_collapse_norm(rows = m)` — an
 ///    existing kernel with a native `rows` grid, bit-exact for the same reason
-///    `FUSE_B1` is (`layer()`'s A/B), and the only path that applies
-///    `DSV41_BF16_TRUNCATE` on the verify chain.
+///    `FUSE_B1` is (`layer()`'s A/B). **It passes `truncate = false`** (the
+///    2026-09-12 fix — see `collapse_norm_rows`): the verify chain must not take
+///    `DSV41_BF16_TRUNCATE`, which is what first broke the zero-Latin baseline.
 ///  * A1-b: `hc_post` + the `h2_r` copy become `hc_post_inplace_rows(rows = m)`
 ///    — the m-row entry of the segment-C kernel. Also *additionally* gated on
 ///    the symbol being present, so a `.so` built before this change silently
