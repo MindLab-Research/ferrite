@@ -4949,3 +4949,18 @@ DSV41_V5_LEDGER=1             # D1 观测（每步打印 epoch 增量）
 **预期**（如果 epoch pad 成功）：
 - batched 路径解锁 → 理论 ~480（accept 5）/ ~320（accept 3）
 - **400 的唯一路径打开！**
+
+## tcgen05 重启测试失败（68a0a913）——misaligned address 依旧
+
+**结果**：
+- LEN=0（空输出）+ **"sync: misaligned address"（rank 7）**
+- 208ms 快速失败——engine fault → config error
+
+**判定**：
+1. **对齐守卫（ld_uint2_a8）没有修复 grouped 路径的对齐问题**——守卫保护的 pair body 不是 grouped 路径跑的 split body（tcgen05-proper-retest 的早期分析确认）
+2. **tcgen05 仍然被阻塞**——需要修复 split body 的对齐（或找到正确的守卫位置）
+3. **干净栈保持 90.8**（无 tcgen05 的 +3-5%）
+
+**400 的路径更新**：
+- lazy 路径：90.8（当前）→ 无 tcgen05 → 上限更低
+- **batched（SWALLOW epoch pad）是更关键的路径**——实施运行中
