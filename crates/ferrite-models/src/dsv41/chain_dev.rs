@@ -2839,11 +2839,14 @@ impl<'a> DevChain<'a> {
     ///
     /// For every layer that OWNS its window ring ([`Self::ring_owners`]):
     ///
-    /// 1. the `m` ring slots the block lands in, `(pos + 1 + j) % window`. One
-    ///    D2D per slot: the slots are `head_dim` floats each and the sequence
-    ///    wraps at the ring's end, so a single contiguous copy is not available.
-    ///    (The first cut is deliberately naive — ~15 launches for the production
-    ///    geometry; a slot-permutation kernel is the M2 optimisation.)
+    /// 1. the `m` ring slots the block lands in, `(pos + 1 + j) % window`. ONE
+    ///    launch per owner (`dsv41_dspark_ring_save`) covers all `m` slots: the
+    ///    slots are `head_dim` floats each and the sequence wraps at the ring's
+    ///    end, so a single contiguous copy is not available, but the kernel
+    ///    computes each slot on the device. Historically this was one D2D per
+    ///    slot, which made the pair the post-launch bottleneck of a verify step
+    ///    (40 owners x m slots x 2 directions x ~5us) and pinned it ineligible
+    ///    for a CUDA graph (a host-computed slot is a capture-time constant).
     ///
     /// For every COMPRESS SOURCE ([`Self::compress_sources`]):
     ///
@@ -2899,26 +2902,63 @@ impl<'a> DevChain<'a> {
         let win = cfg.window_size;
         let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
         debug_assert!(m <= VERIFY_ROWS, "the snapshot is sized for a {VERIFY_ROWS}-row block");
+        // P0: ONE launch per layer replaces the per-slot `cudaMemcpyAsync` loop
+        // (40 owners x m slots per direction). The kernel's slot is
+        // `(pos_base + j) % win`, and `pos_base` is `(pos + 1) % win`: that is
+        // the SAME residue as `(pos + 1 + j) % win` for every `j < win`
+        // (`m <= VERIFY_ROWS` << `win`), and the reduction keeps the argument
+        // inside `c_int` for positions past 2^31. The bytes are identical
+        // either way; `fused == false` (a stale .so without the kernels) keeps
+        // the original per-slot path.
+        let fused = self.dev.supports_dspark_snapshot();
+        let pos_base = ((pos + 1) % win) as i32;
 
         for &l in &self.ring_owners() {
             let ring = self.layers[l].ring.ptr as *const f32;
             let snap = (self.s.dspark_snap_ring.ptr as *mut f32)
                 .wrapping_add(l * VERIFY_ROWS * hd);
-            for j in 0..m {
-                let slot = (pos + 1 + j) % win;
-                self.dev.memcpy_d2d(
-                    snap.wrapping_add(j * hd) as *mut c_void,
-                    ring.wrapping_add(slot * hd) as *const c_void,
-                    hd * std::mem::size_of::<f32>(),
-                )?;
+            if fused {
+                self.dev
+                    .dspark_ring_save(snap, ring, pos_base, win as i32, hd as i32, m as i32)?;
+            } else {
+                for j in 0..m {
+                    let slot = (pos + 1 + j) % win;
+                    self.dev.memcpy_d2d(
+                        snap.wrapping_add(j * hd) as *mut c_void,
+                        ring.wrapping_add(slot * hd) as *const c_void,
+                        hd * std::mem::size_of::<f32>(),
+                    )?;
+                }
             }
         }
 
         let mut host = Vec::new();
         for &l in &self.compress_sources() {
             let ratio = cfg.compress_ratio(l).max(1);
-            let bytes = ratio * hd * std::mem::size_of::<f32>();
             let cache = &self.layers[l];
+            if fused {
+                // One launch covers state_kv + state_score + latent + the two
+                // 4-byte counters; the segments sit at the same bases the
+                // memcpy path below used.
+                self.dev.dspark_comp_save(
+                    cache.state_kv.ptr as *const f32,
+                    cache.state_score.ptr as *const f32,
+                    cache.latent.ptr as *const f32,
+                    (self.s.clen.ptr as *const i32).wrapping_add(l),
+                    cache.out_rows.ptr as *const i32,
+                    (self.s.dspark_snap_state.ptr as *mut f32)
+                        .wrapping_add(l * 2 * max_ratio * hd),
+                    (self.s.dspark_snap_latent.ptr as *mut f32).wrapping_add(l * hd),
+                    (self.s.dspark_snap_clen.ptr as *mut i32).wrapping_add(l),
+                    (self.s.dspark_snap_out_rows.ptr as *mut i32).wrapping_add(l),
+                    ratio as i32,
+                    max_ratio as i32,
+                    hd as i32,
+                )?;
+                host.push((l, cache.compress_len));
+                continue;
+            }
+            let bytes = ratio * hd * std::mem::size_of::<f32>();
             let base = (self.s.dspark_snap_state.ptr as *mut f32)
                 .wrapping_add(l * 2 * max_ratio * hd);
             self.dev
@@ -2997,29 +3037,67 @@ impl<'a> DevChain<'a> {
         let hd = cfg.head_dim;
         let win = cfg.window_size;
         let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+        // P0: mirror of `dspark_snapshot` -- one launch per layer per side.
+        // `pos_base` follows the same `(pos + 1) % win` reduction.
+        let fused = self.dev.supports_dspark_snapshot();
+        let pos_base = ((pos + 1) % win) as i32;
 
         for &l in &self.ring_owners() {
             let ring = self.layers[l].ring.ptr as *mut f32;
             let snap = (self.s.dspark_snap_ring.ptr as *const f32)
                 .wrapping_add(l * VERIFY_ROWS * hd);
             // Only the rows BEYOND the kept prefix go back: rows `0..keep` are
-            // the accepted prefix's KV and must survive this call.
-            for j in keep..m {
-                let slot = (pos + 1 + j) % win;
-                self.dev.memcpy_d2d(
-                    ring.wrapping_add(slot * hd) as *mut c_void,
-                    snap.wrapping_add(j * hd) as *const c_void,
-                    hd * std::mem::size_of::<f32>(),
+            // the accepted prefix's KV and must survive this call. `keep >= m`
+            // restores nothing, which the kernel reports as a successful no-op.
+            if fused {
+                self.dev.dspark_ring_restore(
+                    ring,
+                    snap,
+                    pos_base,
+                    win as i32,
+                    hd as i32,
+                    m as i32,
+                    keep as i32,
                 )?;
+            } else {
+                for j in keep..m {
+                    let slot = (pos + 1 + j) % win;
+                    self.dev.memcpy_d2d(
+                        ring.wrapping_add(slot * hd) as *mut c_void,
+                        snap.wrapping_add(j * hd) as *const c_void,
+                        hd * std::mem::size_of::<f32>(),
+                    )?;
+                }
             }
         }
 
         for &l in &self.compress_sources() {
             let ratio = cfg.compress_ratio(l).max(1);
+            let cache = &self.layers[l];
+            if fused {
+                // The whole carry is restored regardless of `keep` (see the doc
+                // comment above): one launch covers all three segments and both
+                // counters.
+                self.dev.dspark_comp_restore(
+                    cache.state_kv.ptr as *mut f32,
+                    cache.state_score.ptr as *mut f32,
+                    cache.latent.ptr as *mut f32,
+                    (self.s.clen.ptr as *mut i32).wrapping_add(l),
+                    cache.out_rows.ptr as *mut i32,
+                    (self.s.dspark_snap_state.ptr as *const f32)
+                        .wrapping_add(l * 2 * max_ratio * hd),
+                    (self.s.dspark_snap_latent.ptr as *const f32).wrapping_add(l * hd),
+                    (self.s.dspark_snap_clen.ptr as *const i32).wrapping_add(l),
+                    (self.s.dspark_snap_out_rows.ptr as *const i32).wrapping_add(l),
+                    ratio as i32,
+                    max_ratio as i32,
+                    hd as i32,
+                )?;
+                continue;
+            }
             let bytes = ratio * hd * std::mem::size_of::<f32>();
             let base = (self.s.dspark_snap_state.ptr as *const f32)
                 .wrapping_add(l * 2 * max_ratio * hd);
-            let cache = &self.layers[l];
             self.dev
                 .memcpy_d2d(cache.state_kv.ptr, base as *const c_void, bytes)?;
             self.dev.memcpy_d2d(
