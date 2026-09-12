@@ -3383,3 +3383,31 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 | MARKOV_SLICED 修复 | DSV41_MARKOV_SLICED | 🔄 全栈测试中 |
 | LAZY_SDR 修复 | DSV41_LAZY_SDR | 🔄 全栈测试中 |
 | ring+window 直调 | DSV41_RING_WIN_FUSE | 🔄 subagent 实施中 |
+
+## 🎉 全栈 lazy 组合测试成功（c65e9269）——84.0 tok/s 新纪录 + 两个 bug 修复验证！
+
+**配置**：lazy + R2 + R2b + A4 + VERIFY_FORK + 修复后的 MARKOV_SLICED + 修复后的 LAZY_SDR + Wave 1 全套
+
+**结果**：
+- **零拉丁 ✓**（LEN=186，拉丁=[]）
+- **k_acc: 5 5 5 5 3 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5**——**不退化！两个 bug 修复验证成功！**
+- **吞吐 84.0 tok/s**（130 tokens / 1548ms）——**新纪录！**
+- 0 ar5-hang ✓
+
+**lazy 路径的完整进展**：
+| 配置 | 吞吐 | 增量 |
+|---|---|---|
+| Wave 1 基线 | 78.8 | — |
+| + SH_PAIR_M=1 | 78.1 | ~0 |
+| + R2 ATTN_LIN_FUSE | 82.9 | +5.2% |
+| + R2b + A4 | 82.6 | ~0 |
+| **+ FORK + 修复的 MARKOV + 修复的 LAZY_SDR** | **84.0** | **+1.7%** |
+| **总提升** | | **+6.6%** |
+
+**关键验证**：
+1. **MARKOV_SLICED 修复验证 ✓**——k_acc 从修复前的 1.4 恢复到 ~5.0！
+2. **LAZY_SDR 修复验证 ✓**——k_acc 从修复前的 2.4 恢复到 ~5.0！
+3. **VERIFY_FORK 安全 ✓**——与 SH_PAIR_M 的互斥正确处理（MoE dual 被禁用但 attention dual + compressor 侧流工作）
+4. **全栈共存 ✓**——所有优化安全叠加
+
+**下一步**：+ ring+window（刚提交的 DSV41_RING_WIN_FUSE）→ 预期 84.5-85？
