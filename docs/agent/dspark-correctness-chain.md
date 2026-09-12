@@ -3709,3 +3709,24 @@ self.dev.gemm_fp8_mx_rope_norm(
 4. **parity 测试先行**——K1/K2 必须先过逐字节 diff 再上 e2e
 
 **预期最终干净栈**：78.8 × 1.10-1.15 ≈ **87-91 tok/s**
+
+## 🎯🎯🎯 BISECT4 决定性结果（df448384）——lin2 干净，lin_rope_norm 是罪魁！
+
+**ARM2 (ATTN_LIN_FUSE=2, lin2 only)**：
+- LEN=120，**拉丁=[] 零拉丁！** completion=93
+- 内容正确（"先帝创业未半而中道崩殂...欲报之于陛下也。"）
+- **✓ lin2 (gemm_fp8_mx2) 安全！**
+
+**ARM3 (ATTN_LIN_FUSE=3, rope_norm only)**：
+- LEN=218，**拉丁=['opa','eba','denominaci','Poundshenyasc']——损坏！**
+- **✗ lin_rope_norm (gemm_fp8_mx_rope_norm) 是 R2 损坏的唯一来源！**
+
+**判决**：
+1. **lin2（wq_a+wkv 融合）可以立即启用**（ATTN_LIN_FUSE=2）
+2. **lin_rope_norm 必须禁用**——K2（mrows_rope_norm 同程序替代）是修复路径
+3. K1（mrows2）变成冗余（lin2 已安全）——但保留作为更安全的选项
+
+**下一步**：
+1. ATTN_LIN_FUSE=2 + 计数任务（验证数字顺序 + 测吞吐）
+2. K2 实施完成后替代 lin_rope_norm
+3. 全栈 = base + lin2 + K2 + 其他验证过的优化
