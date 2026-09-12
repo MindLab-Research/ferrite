@@ -1711,3 +1711,10 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 | verify head mrows | OFF | dsv41_gemv_bf16_v1_mrows | **v1-order** multi-row（与 v1 同序）|
 
 **修复**：DSV41_DRAFT_HEAD_FOLD=0 → draft 走 v1 per-row（与 verify 默认一致）
+
+## SWALLOW_STEP 的 AR v5 hang（8e78e3d6 卡死根因）
+
+**现象**：argmax_rows 死锁——rank 2/4/7 等 peer 1/5/6 的 stamp 54-55 但只有 53（rows=6）
+**根因**：SWALLOW_STEP 的 m=6 形状与 VERIFY_HEAD_MROWS 的 sliced argmax 交换死锁（m=6 的 stamp 序列不匹配）
+**workaround**：SWALLOW_STEP + VERIFY_HEAD_MROWS 不同时开；或先修 argmax_rows 的 m=6 支持
+**用户指示**：timeout 应 5 分钟内
