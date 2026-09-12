@@ -239,7 +239,12 @@ __global__ void route_group_kernel(const int32_t* __restrict__ ids, int32_t* __r
                                    int32_t* __restrict__ gather_src, int32_t* __restrict__ active,
                                    int32_t* __restrict__ n_active, int m, int topk, int n_experts,
                                    int m_cap) {
-    extern __shared__ int sh[];
+    // Named dynamic-smem alias (route_group): the anonymous `extern __shared__
+    // float sh[]` at the top of this TU (route_topk's) cannot be re-declared
+    // with a different element type in the same TU — nvcc rejects the
+    // incompatible redeclaration. Alias through a byte-typed extern instead.
+    extern __shared__ unsigned char route_sm[];
+    int* sh = reinterpret_cast<int*>(route_sm);
     int* s_counts = sh;              // [n_experts]
     int* s_cursor = sh + n_experts;  // [n_experts] running destination cursor
     const int n_assign = m * topk;

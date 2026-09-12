@@ -5710,6 +5710,384 @@ extern "C" int dsv41_expert_gemm_e4m3_ext(
     return (int)rc;
 }
 
+// =============================================================================
+// GROUP-INDEXED MASKED GEMM — the `m_grouped_gemm_nt_masked` form
+// =============================================================================
+// WHY THIS EXISTS. `e4m3_gemm_kernel` above is EXPERT-CENTRIC: its whole B side
+// is derived from ONE `ids[slot]`, so one launch covers ONE expert over a DENSE
+// row block, while `moe_rows`' routing is per-(row, slot) (`route_idx_r[m][topk]`).
+// Handing that table to the dense arm would apply slot s's expert to rows that
+// route to a DIFFERENT expert — a SILENT WRONG ANSWER, which is exactly why the
+// dense arm declines today (`e4x_tile = false` in chain_dev.rs::moe_rows).
+//
+// The missing form is DeepGEMM's `m_grouped_gemm_nt_masked`: the routed rows are
+// re-ordered so that every expert's rows are CONTIGUOUS (the grouped layout of
+// `dsv41_route_group`), a CTA owns ONE kMTile=128 row MMA tile OF ONE EXPERT, and
+// the rows past that expert's real row count are MASKED — the A operand is
+// zero-filled there and the epilogue writes nothing. At this engine's shapes
+// (m <= VERIFY_ROWS = 6, topk = 6) an expert owns O(1) rows, so the masking is
+// what makes the tensor-core arm viable at all: a per-expert DENSE launch would
+// have to pad 1-3 real rows out to 128 (85x the work of the whole step), while
+// this kernel still runs the 128-row MMA but only ~1/128 of its columns carry a
+// non-zero A.
+//
+// GRID (blockIdx.y is the intra-expert m-tile, blockIdx.z the group-table
+// cursor, blockIdx.x the N tile — the SAME (n, m) plane as the dense arm, with
+// the group axis appended rather than a second m-tile sum):
+//   x : n_total / kNTile                 — N tiles of ONE expert's weight planes
+//   y : ceil(m_cap / kMTile)             — m-tiles INSIDE one expert's block
+//   z : the ACTIVE-list cursor (n_assign entries; the caller passes `m*topk`,
+//       the number of grouped positions the layout can ever hold)
+// Per CTA, from the group table (all four reads are uniform across the CTA, so
+// each is ONE L2 broadcast per warp):
+//   e        = active[z]                 — exit when z >= *n_active
+//   row_base = starts[e] + y*kMTile      — the A row base, from the GROUP TABLE
+//   m_valid  = min(kMTile, counts[e] - y*kMTile)   — real rows of this tile
+//   m_valid <= 0                          — exit (empty expert, or past its block)
+//
+// ⚠️ WHY `starts[e]` AND NOT `z * kMTile`: the grouped buffer is COMPACT
+// (`dsv41_route_gather_rows` writes the `n_assign` gathered rows back to back,
+// with no per-expert padding), so expert e's first row sits at `starts[e]`, and
+// the tile's rows are `[starts[e] + y*kMTile, +m_valid)`. `active`/`n_active` is
+// why the grid does not have to be n_routed deep: only the ~topk*m live experts
+// are listed, and the caller already knows `n_assign = m*topk >= n_active`
+// (every live expert owns at least one assignment), so the z bound is static
+// (CUDA-graph friendly — no D2H, no host-side scan of `counts`).
+//
+// ⚠️ EARLY EXIT IS BEFORE tc_alloc: an out-of-range CTA does one uniform load
+// (`*n_active`) plus one branch, and touches no tensor memory. That matters
+// because the plan's naive `grid.z = n_routed` would launch ~10x more CTAs than
+// there are live experts at decode shapes (n_routed = 384 vs n_assign <= 36).
+//
+// NUMERIC DOMAIN (identical to the dense arm, element for element): the K loop
+// is the SAME atom-ascending walk with the SAME two-kind::f8f6f4 MMAs per atom
+// and the SAME `C_accum += C_local * sa * sb` fold at the SAME point, so an
+// output element's f32 chain is the one the dense arm would produce for that
+// (activation row, expert, column) triple. The row index only selects WHICH
+// contiguous A row is read (the gather is byte-verbatim, see
+// dsv41_route.cu's NUMERIC DOMAIN note) and WHICH out cell is written (the
+// scatter is a pure copy). Masked rows contribute nothing: their A chunks and
+// their per-32-block scales are ZERO-filled in smem, and their accumulator is
+// never written back, so no masked lane can reach a live output cell.
+//
+// The epilogue keeps mode 0 (plain store) and mode 1 (gate/up clamp) only. Mode
+// 2 (multiply by `row_weight[row]`) and mode 3 (accumulate into `out`) are
+// per-(row, slot) concepts — `row_weight` is indexed by the MODEL row and every
+// slot accumulates into the same `out` cell, while a grouped row's output cell
+// belongs to ONE (row, slot) pair whose weight lives in the ungrouped table.
+// Rather than index the WRONG row (a silent wrong answer) the launcher REFUSES
+// them and the grouped pipeline applies the weight after the scatter.
+__global__ void __launch_bounds__(kThreads) e4m3_gemm_grouped_kernel(
+    const uint8_t* __restrict__ a,        // [n_assign, k] e4m3, GROUPED row order
+    const float* __restrict__ a_scale,    // [n_assign, k/32] f32 powers of two
+    float* __restrict__ out,              // [n_assign, n_total], grouped row order
+    const int* __restrict__ active,       // [..] live expert ids, ascending
+    const int* __restrict__ n_active,     // [1] live length of `active`
+    const int* __restrict__ counts,       // [n_experts] rows per expert
+    const int* __restrict__ starts,       // [n_experts + 1] exclusive prefix sum
+    int n_experts, int n_total, int k, int b_split, int epi_mode, float limit,
+    // The four B planes, derived per CTA from `base + e * stride` exactly as the
+    // dense arm derives them from `base + ids[slot] * stride`. There is no
+    // direct-pointer path here: the expert ALWAYS comes from the group table.
+    const uint8_t* __restrict__ b_base, long b_stride,
+    const uint8_t* __restrict__ bs_base, long bs_stride,
+    const uint8_t* __restrict__ bh_base, long bh_stride,
+    const uint8_t* __restrict__ bhs_base, long bhs_stride) {
+    // ---- 0. group-table lookup + mask (the whole point of this arm) -------
+    if ((int)blockIdx.z >= *n_active) return;  // compact list exhausted
+    const int e = active[blockIdx.z];
+    if (e < 0 || e >= n_experts) return;  // belt-and-braces (the table is ours)
+    const int m_off = (int)blockIdx.y * kMTile;
+    const int m_valid = min(kMTile, counts[e] - m_off);
+    if (m_valid <= 0) return;  // empty expert, or a tile past its row block
+    const int row_base = starts[e] + m_off;  // first grouped row of this tile
+
+    const uint8_t* b_use = b_base + e * (size_t)b_stride;
+    const uint8_t* bsc_use = bs_base + e * (size_t)bs_stride;
+    const uint8_t* bhi_use = bh_base + e * (size_t)bh_stride;
+    const uint8_t* bhs_use = bhs_base + e * (size_t)bhs_stride;
+
+    const int n_base = (int)blockIdx.x * kNTile;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int kbytes = k >> 1;  // PACKED fp4 weight bytes per row
+    const int nk_blk = k >> 5;  // 32-element blocks == scale columns
+
+    __shared__ Smem s;
+
+    // ---------------------------------------------------------- tmem alloc
+    if (warp == 0) {
+        tc_alloc(&s.tmem_base, kTmemCols);
+        tc_relinquish();
+    }
+    if (tid == 0) mbar_init(&s.mbar, 1);
+    __syncthreads();
+
+    const uint32_t tmem_base = s.tmem_base;
+    const uint32_t d0_col = tmem_base;           // C_local, sub-block 0 (64 cols)
+    const uint32_t d1_col = tmem_base + kDCols;  // C_local, sub-block 1 (64 cols)
+
+    // --------------------------------------------------- register accumulator
+    // One f32 chain per (m, n) of the tile, ascending K; `m` is the row WITHIN
+    // the tile, so a masked row's chain starts and stays at 0.
+    float acc[kNTile];
+#pragma unroll
+    for (int c = 0; c < kNTile; ++c) acc[c] = 0.f;
+
+    // ------------------------------------------------------------- K loop
+    uint32_t phase = 0;
+    for (int k0 = 0; k0 < k; k0 += kStageAtoms * kAtomK) {
+        const int natoms = min(kStageAtoms, (k - k0 + kAtomK - 1) / kAtomK);
+
+        // ---- 1. stage the A operand (e4m3), MASKED -------------------------
+        // Identical to the dense arm's chunk-per-(atom, row, sub, kb) walk, with
+        // the row guarded twice: `m < m_valid` keeps the masked lanes away from
+        // memory (their smem chunk stays the zero it was initialised to), and
+        // `kk + 16 <= k` is the dense arm's own K tail guard.
+        for (int c = tid; c < kStageAtoms * kMTile * 2 * kSubs; c += kThreads) {
+            const int atom = c / (kMTile * 2 * kSubs);
+            if (atom >= natoms) continue;
+            const int r = c % (kMTile * 2 * kSubs);
+            const int m = r >> 2;  // row within this CTA's M tile
+            const int q = r & 3;   // chunk within the atom: 2 subs x 2 kb
+            const int sub = q >> 1, kb = q & 1;
+            const size_t kk = (size_t)k0 + (size_t)atom * kAtomK + sub * kSubK + kb * 16;
+            uint4 val = make_uint4(0, 0, 0, 0);
+            if (m < m_valid && kk + 16 <= (size_t)k)
+                val = *reinterpret_cast<const uint4*>(a + (size_t)(row_base + m) * k + kk);
+            *reinterpret_cast<uint4*>(s.a + (atom * kSubs + sub) * kASubBytes +
+                                      e4x_off(m, kb)) = val;
+        }
+
+        // ---- 2. stage + expand the B operand (packed fp4 -> unpacked) ------
+        // Unchanged from the dense arm: the B side is ONE expert's weight from
+        // `b_use`/`bhi_use`, selected by `b_split` (gate|up).
+        for (int c = tid; c < kStageAtoms * kNTile * kSubs; c += kThreads) {
+            const int atom = c / (kNTile * kSubs);
+            if (atom >= natoms) continue;
+            const int r = c % (kNTile * kSubs);
+            const int n = r >> 1, sub = r & 1;
+            const int n_glob = n_base + n;
+            const size_t ko = (size_t)(k0 + atom * kAtomK + sub * kSubK) >> 1;
+            uint4 o0 = make_uint4(0, 0, 0, 0), o1 = make_uint4(0, 0, 0, 0);
+            if (n_glob < n_total && ko + 16 <= (size_t)kbytes) {
+                const uint8_t* src_base = b_use;
+                int row = n_glob;
+                if (b_split >= 0 && n_glob >= b_split) {
+                    src_base = bhi_use;
+                    row = n_glob - b_split;
+                }
+                if (row >= 0) {
+                    const uint4 p = *reinterpret_cast<const uint4*>(src_base +
+                                                                    (size_t)row * kbytes + ko);
+                    uint32_t ev[4], od[4];
+                    e4x_expand(p.x, ev[0], od[0]);
+                    e4x_expand(p.y, ev[1], od[1]);
+                    e4x_expand(p.z, ev[2], od[2]);
+                    e4x_expand(p.w, ev[3], od[3]);
+                    o0.x = e4x_ilv_lo(ev[0], od[0]);
+                    o0.y = e4x_ilv_hi(ev[0], od[0]);
+                    o0.z = e4x_ilv_lo(ev[1], od[1]);
+                    o0.w = e4x_ilv_hi(ev[1], od[1]);
+                    o1.x = e4x_ilv_lo(ev[2], od[2]);
+                    o1.y = e4x_ilv_hi(ev[2], od[2]);
+                    o1.z = e4x_ilv_lo(ev[3], od[3]);
+                    o1.w = e4x_ilv_hi(ev[3], od[3]);
+                }
+            }
+            uint8_t* dst = s.b + (atom * kSubs + sub) * kBSubBytes;
+            *reinterpret_cast<uint4*>(dst + e4x_off(n, 0)) = o0;
+            *reinterpret_cast<uint4*>(dst + e4x_off(n, 1)) = o1;
+        }
+
+        // ---- 3. stage this stage's scales (once, coalesced), MASKED --------
+        // A scales: masked rows read 0.f (so a masked row's fold is 0 * partial =
+        // 0 and can never leak a real value into a live accumulator). B scales
+        // are the expert's own rows, unchanged.
+        for (int c = tid; c < kSubsPerStage * kMTile; c += kThreads) {
+            const int sub = c / kMTile;
+            const int m = c % kMTile;
+            const int bb = (k0 >> 5) + sub;  // global 32-block of this sub
+            float v = 0.f;
+            if (m < m_valid && bb < nk_blk)
+                v = a_scale[(size_t)(row_base + m) * nk_blk + bb];
+            s.sa[sub][m] = v;
+        }
+        for (int c = tid; c < kSubsPerStage * kNTile; c += kThreads) {
+            const int sub = c / kNTile;
+            const int n = c % kNTile;
+            const int n_glob = n_base + n;
+            const int bb = (k0 >> 5) + sub;
+            float v = 0.f;
+            if (n_glob < n_total && bb < nk_blk) {
+                const uint8_t* sc = bsc_use;
+                int row = n_glob;
+                if (b_split >= 0 && n_glob >= b_split) {
+                    sc = bhs_use;
+                    row = n_glob - b_split;
+                }
+                if (row >= 0) v = ue8m0_to_f(sc[(size_t)row * nk_blk + bb]);
+            }
+            s.sb[sub][n] = v;
+        }
+
+        // publish every smem write to the async proxy (the MMA reads it there)
+        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+        __syncthreads();
+
+        // ---- 4. per atom: 2 MMAs (one per 32-block) + ONE commit/wait + fold
+        for (int atom = 0; atom < natoms; ++atom) {
+            if (tid == 0) {
+                const uint32_t id = e4x_make_idesc();
+                const uint64_t da0 =
+                    e4x_make_desc(smem_addr(s.a + (atom * kSubs + 0) * kASubBytes));
+                const uint64_t db0 =
+                    e4x_make_desc(smem_addr(s.b + (atom * kSubs + 0) * kBSubBytes));
+                const uint64_t da1 =
+                    e4x_make_desc(smem_addr(s.a + (atom * kSubs + 1) * kASubBytes));
+                const uint64_t db1 =
+                    e4x_make_desc(smem_addr(s.b + (atom * kSubs + 1) * kBSubBytes));
+                e4x_mma(d0_col, da0, db0, id, 0u);
+                e4x_mma(d1_col, da1, db1, id, 0u);
+                tc_commit(&s.mbar);  // ONE arrival covers BOTH MMAs of the atom
+            }
+            mbar_wait(&s.mbar, phase);
+            phase ^= 1u;
+
+            const int mrow = warp * 32 + lane;  // this thread's row in the M tile
+#pragma unroll
+            for (int sub = 0; sub < kSubs; ++sub) {
+                const int ssub = atom * kSubs + sub;  // stage-local sub index
+                const uint32_t dcol = (sub == 0) ? d0_col : d1_col;
+                const float sa = s.sa[ssub][mrow];  // [row, 32-block] activation
+#pragma unroll
+                for (int c0 = 0; c0 < kNTile; c0 += 16) {
+                    uint32_t v[16];
+                    tc_ld_x16((((uint32_t)(warp * 32)) << 16) | (dcol + c0), v);
+                    tc_wait_ld();
+#pragma unroll
+                    for (int i = 0; i < 16; ++i) {
+                        acc[c0 + i] += __uint_as_float(v[i]) * (sa * s.sb[ssub][c0 + i]);
+                    }
+                }
+            }
+
+            tc_fence_before_thread_sync();
+            __syncthreads();
+            tc_fence_after_thread_sync();
+        }
+    }
+
+    // ------------------------------------------------------------ epilogue
+    // Masked rows are SKIPPED: a grouped position that no assignment reached is
+    // never a `perm_map` target, so the scatter cannot read it, and the cells
+    // past `starts[e] + counts[e]` belong to another expert's tile (or to the
+    // tail of the grouped buffer) — writing them would race that expert's CTA.
+#pragma unroll
+    for (int c = 0; c < kNTile; ++c) {
+        const int m = warp * 32 + lane;
+        if (m >= m_valid) continue;
+        const int row = row_base + m;  // GROUPED row of this output element
+        const int col = n_base + c;
+        if (col >= n_total) continue;
+        float x = acc[c];
+        if (epi_mode == 1) {  // gate/up clamps (training convention)
+            if (limit > 0.f) {
+                if (col < b_split) x = fminf(x, limit);           // gate
+                else x = fminf(fmaxf(x, -limit), limit);          // up
+            }
+        }
+        out[(size_t)row * n_total + col] = x;
+    }
+
+    __syncthreads();
+    if (warp == 0) tc_dealloc(tmem_base, kTmemCols);
+}
+
+// Launcher for the grouped arm. Contract (checked here, not in the kernel):
+//   k % kAtomK == 0            a stage never carries a half atom
+//   n_total % kNTile == 0      the MMA's N is the CTA's N
+//   epi_mode in {0, 1}         see the kernel's note on modes 2/3
+//   a / a_scale / every B base 16-byte aligned, B strides multiples of 16
+// There is DELIBERATELY no `rows % kMTile == 0` term here: that requirement is
+// exactly what this arm removes. The tile's real row count is `m_valid`, which
+// is derived IN-KERNEL from `counts[e]`.
+//
+// `m_cap` is the per-expert row capacity the `active` list was built against
+// (`grp_m_cap` on the Rust side); the launcher turns it into grid.y, so the
+// tile-per-expert formula lives in ONE place. `n_assign` (= m*topk) is the z
+// bound: it is >= `n_active` by construction, so no live expert can be missed,
+// and a z past the live list reads `*n_active` and exits.
+inline cudaError_t e4x_launch_gemm_grouped(
+    const uint8_t* a, const float* a_scale, float* out, const int* active, const int* n_active,
+    const int* counts, const int* starts, int n_experts, int n_assign, int m_cap, int n_total,
+    int k, int b_split, int epi_mode, float limit, const uint8_t* b_base, long b_stride,
+    const uint8_t* bs_base, long bs_stride, const uint8_t* bh_base, long bh_stride,
+    const uint8_t* bhs_base, long bhs_stride, cudaStream_t stream) {
+    if (a == nullptr || a_scale == nullptr || out == nullptr || active == nullptr ||
+        n_active == nullptr || counts == nullptr || starts == nullptr || b_base == nullptr ||
+        bs_base == nullptr)
+        return cudaErrorInvalidValue;
+    if (n_total <= 0 || k <= 0 || n_experts <= 0 || n_assign <= 0 || m_cap <= 0)
+        return cudaErrorInvalidValue;
+    if (k % kAtomK != 0 || n_total % kNTile != 0) return cudaErrorInvalidValue;
+    if (epi_mode != 0 && epi_mode != 1) return cudaErrorInvalidValue;  // see the kernel note
+    // `b_split >= 0` is the two-pool (gate|up) form: the SECOND pool is then a
+    // hard requirement, not an option.
+    if (b_split >= 0 && (bh_base == nullptr || bhs_base == nullptr))
+        return cudaErrorInvalidValue;
+    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
+    if (!al16(a) || !al16(a_scale) || !al16(b_base) || !al16(bs_base)) return cudaErrorInvalidValue;
+    // The B plane's expert stride is `inter * k/2` bytes; a stride that is not a
+    // 16-byte multiple would silently misplace the uint4 rows.
+    if ((b_stride % 16) != 0 || (bs_stride % 16) != 0) return cudaErrorInvalidValue;
+    const int m_tiles = (m_cap + kMTile - 1) / kMTile;
+    const dim3 grid((unsigned)(n_total / kNTile), (unsigned)m_tiles, (unsigned)n_assign);
+    e4m3_gemm_grouped_kernel<<<grid, kThreads, 0, stream>>>(
+        a, a_scale, out, active, n_active, counts, starts, n_experts, n_total, k, b_split,
+        epi_mode, limit, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride, bhs_base,
+        bhs_stride);
+    return cudaGetLastError();
+}
+
+// "e4m3 activation x fp4 weight, GROUP-INDEXED MASKED M=128 tile GEMM" — the
+// form `moe_rows`' per-(row, slot) routing needs (see the block comment above).
+// Returns 0 (and does nothing) while EITHER runtime gate is OFF, so a caller can
+// invoke it unconditionally and keep its proven per-(row, slot) path — the same
+// contract as every other arm in this file.
+//
+// Runtime gates (both read ONCE per process, strict first-char '1', default OFF
+// — a per-call getenv is a CUDA-graph capture hazard, exactly as in `e4x`):
+//   DSV41_EXPERT_TCGEN05_E4M3 — the e4m3-activation tcgen05 family (this arm
+//                               shares it with the two arms above: which of them
+//                               a step runs is a LAUNCH-SHAPE decision, not a
+//                               numeric-format one);
+//   DSV41_EXPERT_GROUPED      — the grouped (permuted) routed layout.
+// The AND is deliberate: this kernel CONSUMES `counts`/`starts`/`active`/
+// `n_active`, so without the grouped layout it would index tables the step never
+// built. Both gates must be armed before a single CTA runs.
+extern "C" int dsv41_expert_gemm_e4m3_grouped(
+    const uint8_t* a, const float* a_scale, float* out, const int* active, const int* n_active,
+    const int* counts, const int* starts, int n_experts, int n_assign, int m_cap, int n_total,
+    int k, int b_split, int epi_mode, float limit, const uint8_t* b_base, long b_stride,
+    const uint8_t* bs_base, long bs_stride, const uint8_t* bh_base, long bh_stride,
+    const uint8_t* bhs_base, long bhs_stride, cudaStream_t stream) {
+    static const int enabled = [] {
+        const char* g = getenv("DSV41_EXPERT_TCGEN05_E4M3");
+        const char* h = getenv("DSV41_EXPERT_GROUPED");
+        return (g != nullptr && g[0] == '1' && h != nullptr && h[0] == '1') ? 1 : 0;
+    }();
+    if (!enabled) return 0;
+    const cudaError_t rc = e4x_launch_gemm_grouped(a, a_scale, out, active, n_active, counts,
+                                                   starts, n_experts, n_assign, m_cap, n_total, k,
+                                                   b_split, epi_mode, limit, b_base, b_stride,
+                                                   bs_base, bs_stride, bh_base, bh_stride,
+                                                   bhs_base, bhs_stride, stream);
+    (void)cudaGetLastError();  // never fail the step: the fallback path is correctness
+    return (int)rc;
+}
+
 }  // namespace e4x
 }  // namespace tc5
 

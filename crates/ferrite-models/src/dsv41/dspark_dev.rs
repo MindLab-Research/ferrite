@@ -1678,14 +1678,22 @@ impl<'a> DsparkDev<'a> {
         let attn_sink = need(&ld.attn_sink, "mtp.*.attn.attn_sink")?;
 
         // ---- the main stream's KV row goes into the ring ----
-        // `pos` here is the ANCHOR's position; the main_x it projects is the
-        // hidden of the anchor's PREDECESSOR (the just-consumed token — the
-        // official source is hidden[anchor_pos - 1]), so both the ring slot
-        // and the RoPE position are pos - 1. The historical call used pos
-        // directly, which under the old (anchor == t0) timing happened to be
-        // the same position; under the official timing it must shift back one.
+        // P0-1 FIX (draft-numerical-audit, 2026-09-12): the official seeds at
+        // `start_pos` — the ANCHOR's position — for content, RoPE, and ring
+        // slot alike (model.py:1039-1042 freqs_cis[start_pos], :1065
+        // window_kv_cache[start_pos % win]). The historical `pos - 1` phased
+        // every window row one position early relative to its content, a
+        // first-order perturbation of the attention output and the #1 suspect
+        // for the 1.02 accept rate (all main-chain KV relative distances
+        // systematically off by one). The old comment claimed the content is
+        // "hidden[anchor_pos - 1]" — the audit's read of model.py:1261-1267
+        // shows the tap is captured BEFORE the target layer, i.e. at
+        // start_pos, not start_pos - 1.
+        // NOTE: if DSV41_SEED_ALIGN changes the calling convention to
+        // draft_forward(next, pos+1), do NOT also apply this fix (the audit
+        // warns the two would overshoot by one).
         debug_assert!(pos > 0, "draft_forward: the anchor is never at pos 0");
-        self.seed_window(s, pos - 1, slot_dev)?;
+        self.seed_window(s, pos, slot_dev)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — the historical call

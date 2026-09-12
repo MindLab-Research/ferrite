@@ -718,6 +718,26 @@ struct Kernels {
             *const u8, i64, *const u8, i64, *const c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// GROUP-INDEXED MASKED sibling of `expert_gemm_e4m3_ext` — DeepGEMM's
+    /// `m_grouped_gemm_nt_masked`. Same MMA/format/K-fold as the dense-tile arm,
+    /// but the expert of a CTA comes from the GROUPED routing layout
+    /// (`active[blockIdx.z]` + `counts`/`starts`), the A rows are the grouped
+    /// activation rows (`starts[e] + m_off`), and the rows past `counts[e]` are
+    /// MASKED (zero-fill in, no store out). That removes the dense arm's
+    /// `rows % 128 == 0` requirement, which is what makes the tcgen05 e4m3 arm
+    /// reachable at decode shapes (`m <= 6`, `topk = 6`, O(1) rows per expert).
+    ///
+    /// This ONE entry point needs BOTH runtime gates (`DSV41_EXPERT_TCGEN05_E4M3`
+    /// and `DSV41_EXPERT_GROUPED`, read once inside the `.so`); rc == 0 means
+    /// "nothing ran", the caller's fallback contract. A nonzero rc is a REJECTED
+    /// contract (see [`Self::expert_gemm_e4m3_grouped`]), not a missing feature.
+    expert_gemm_e4m3_grouped: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *mut f32, *const c_int, *const c_int, *const c_int,
+            *const c_int, c_int, c_int, c_int, c_int, c_int, c_int, c_int, f32, *const u8, i64,
+            *const u8, i64, *const u8, i64, *const u8, i64, CuStream,
+        ) -> c_int,
+    >,
     /// Load-time gate/up interleave (DSV41_EXPERT_ILV): rewrites an expert's
     /// w1/w3 blocks into one 8-byte-granule-interleaved region so the fused
     /// gate/up GEMV fetches both with one LDG.128. Optional: an .so without it
@@ -1168,6 +1188,7 @@ impl Device {
             expert_tcgen05_gate_up_mxf4: ko!(rt, "dsv41_expert_tcgen05_gate_up_mxf4"),
             expert_tcgen05_gate_up_e4m3: ko!(rt, "dsv41_expert_tcgen05_gate_up_e4m3"),
             expert_gemm_e4m3_ext: ko!(rt, "dsv41_expert_gemm_e4m3_ext"),
+            expert_gemm_e4m3_grouped: ko!(rt, "dsv41_expert_gemm_e4m3_grouped"),
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
@@ -4823,6 +4844,95 @@ impl Device {
     /// changes no behaviour on its own.
     pub fn supports_expert_gemm_e4m3_ext(&self) -> bool {
         self.kernels.expert_gemm_e4m3_ext.is_some()
+    }
+
+    /// tcgen05 **e4m3-activation GROUP-INDEXED MASKED** expert GEMM — the
+    /// `m_grouped_gemm_nt_masked` form the grouped routed path needs. Same MMAs,
+    /// same K-fold and same formats as [`Self::expert_gemm_e4m3_ext`]; what
+    /// changes is WHERE a CTA's operands come from:
+    ///
+    ///   `a`/`a_scale` : the GROUPED activation `[n_assign, k]` (e4m3, one byte
+    ///                   per value) + `[n_assign, k/32]` f32 scales — the gathered
+    ///                   rows of `dsv41_route_gather_rows`;
+    ///   `out`         : `[n_assign, n_total]`, GROUPED row order (the scatter
+    ///                   `dsv41_route_scatter_rows` moves it to the
+    ///                   `[m*topk][n]` per-(row, slot) layout);
+    ///   `active`/`n_active`, `counts`, `starts` : the group table of
+    ///                   `dsv41_route_group`. CTA (x = N tile, y = m-tile inside
+    ///                   one expert, z = cursor) reads `e = active[z]`,
+    ///                   `row_base = starts[e] + y*128`, and masks the rows past
+    ///                   `counts[e]`;
+    ///   `m_cap`       : the caller's per-expert row capacity (`grp_m_cap`), the
+    ///                   bound the grid's m-tile count is derived from;
+    ///   `n_assign`    : `m * topk`, the grid's z bound (>= `n_active` always);
+    ///   `b*`          : the four weight planes with their expert strides
+    ///                   (identical to the dense arm's indirect form).
+    ///
+    /// `epi_mode` is 0 (plain store) or **1** (gate/up clamp) only: modes 2/3 are
+    /// per-(row, slot) concepts and the launcher REFUSES them rather than index
+    /// the wrong row — the grouped pipeline applies `route_w_r` after the
+    /// scatter.
+    ///
+    /// Returns `Ok(false)` when the `.so` gates are OFF (rc == 0, nothing ran),
+    /// so the caller keeps the proven per-(row, slot) launches. ⚠️ A REJECTED
+    /// shape returns a nonzero code and IS an error: the caller must pre-check
+    /// the contract (`k % 64 == 0`, `n_total % 64 == 0`, 16-byte aligned
+    /// operand bases and B strides).
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_gemm_e4m3_grouped(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        out: *mut f32,
+        active: *const i32,
+        n_active: *const i32,
+        counts: *const i32,
+        starts: *const i32,
+        n_experts: i32,
+        n_assign: i32,
+        m_cap: i32,
+        n_total: i32,
+        k: i32,
+        b_split: i32,
+        epi_mode: i32,
+        limit: f32,
+        b_base: *const u8,
+        b_stride: i64,
+        bs_base: *const u8,
+        bs_stride: i64,
+        bh_base: *const u8,
+        bh_stride: i64,
+        bhs_base: *const u8,
+        bhs_stride: i64,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.expert_gemm_e4m3_grouped,
+            "dsv41_expert_gemm_e4m3_grouped",
+        )?;
+        let rc = unsafe {
+            f(
+                a, a_scale, out, active, n_active, counts, starts, n_experts, n_assign, m_cap,
+                n_total, k, b_split, epi_mode, limit, b_base, b_stride, bs_base, bs_stride,
+                bh_base, bh_stride, bhs_base, bhs_stride, self.stream,
+            )
+        };
+        if rc == 0 {
+            return Ok(false); // either gate OFF: nothing ran, the caller falls back
+        }
+        self.kerr(rc, "dsv41_expert_gemm_e4m3_grouped")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the group-indexed masked e4m3 GEMM
+    /// (`dsv41_expert_gemm_e4m3_grouped`) — a separate symbol from the dense
+    /// arm's on purpose (same staged-bring-up rule as
+    /// [`Self::supports_expert_gemm_e4m3_ext`]): a `.so` built before this arm
+    /// existed must leave the grouped path on its fallback instead of failing the
+    /// step. Its runtime gates (`DSV41_EXPERT_TCGEN05_E4M3` **and**
+    /// `DSV41_EXPERT_GROUPED`) are both default OFF, so a present symbol changes
+    /// no behaviour on its own.
+    pub fn supports_expert_gemm_e4m3_grouped(&self) -> bool {
+        self.kernels.expert_gemm_e4m3_grouped.is_some()
     }
 
     /// True when the loaded `.so` carries the tcgen05 MXFP4 gate/up entry point

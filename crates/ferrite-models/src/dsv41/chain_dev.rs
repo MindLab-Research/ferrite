@@ -503,6 +503,14 @@ struct Scratch {
     grp_xq: DevBuf,
     /// `[VERIFY_ROWS * topk * dim/32 + 8]` f32 — their per-32-block scales.
     grp_xsc: DevBuf,
+    /// `[VERIFY_ROWS * topk * 2 * inter]` f32 — the GROUPED gate/up output of
+    /// `dsv41_expert_gemm_e4m3_grouped`, one row per ASSIGNMENT in grouped order
+    /// (same shape as `ex_act_r`, hence the same capacity formula). It exists so
+    /// the masked GEMM can write a CONTIGUOUS per-expert row block; the
+    /// `dsv41_route_scatter_rows` call that follows moves it into `ex_act_r`, so
+    /// everything downstream (swiglu, the down GEMV, the reduce) is untouched by
+    /// the grouped path.
+    grp_out: DevBuf,
     xq4_r: DevBuf,       // [m, dim] fp4 nibbles (dim/2 bytes/row) or e4m3 (dim)
     xsc4_r: DevBuf,      // [m, dim/32 + 8] f32 scales (either format)
     /// [m, topk, 2*inter] routed gate|up output. The batched expert launchers
@@ -871,13 +879,14 @@ pub(crate) fn act_e4m3_skipped_note() {
 /// DEFAULT OFF, and read ONCE per process like every other gate here (a
 /// per-call getenv is a CUDA-graph capture hazard).
 ///
-/// STATUS: the layout and the two movers are implemented and wired (see
-/// `moe_route_grouped`); the per-expert GEMM call itself is NOT yet issued —
-/// see the one-shot notice and docs/agent/grouped-routing-design.md. Until that
-/// lands, this gate changes NO numerics: it builds and gathers the layout and
-/// then leaves the proven per-(row, slot) launches in force. The notice says so
-/// out loud, because an "ON" arm that measures the OLD path is this project's
-/// #1 measurement-bias trap.
+/// STATUS: complete. The layout and the two movers are wired (`moe_route_grouped`)
+/// and the consuming GEMM is issued (`moe_experts_grouped_gate_up` →
+/// `dsv41_expert_gemm_e4m3_grouped`, the group-indexed MASKED M=128 tile). The
+/// arm is still a numeric no-op ON ITS OWN, because that consumer also requires
+/// `DSV41_EXPERT_TCGEN05_E4M3` (the `.so` reads both gates) — with only this one
+/// armed the layout is built, nothing consumes it, and the proven per-(row, slot)
+/// launches answer the step. That state is announced once, because an "ON" arm
+/// that measures the OLD path is this project's #1 measurement-bias trap.
 pub(crate) fn expert_grouped() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -2858,6 +2867,9 @@ impl<'a> DevChain<'a> {
             // slots normally go to topk different experts.
             grp_xq: dev.alloc((VERIFY_ROWS * grp_topk_max(cfg) * dim).max(8))?, // e4m3 bytes
             grp_xsc: dev.alloc(fb(VERIFY_ROWS * grp_topk_max(cfg) * dim / 32 + 8))?,
+            // Same capacity as `ex_act_r` below (one row per assignment, `2*inter`
+            // wide): the grouped gate/up output is the pre-scatter twin of it.
+            grp_out: dev.alloc(fb(VERIFY_ROWS * grp_topk_max(cfg) * 2 * inter.max(dim)))?,
             // `dim` bytes per row covers both activation formats: the packed fp4
             // arm uses `dim/2`, the DSV41_EXPERT_ACT_E4M3 arm exactly `dim`.
             xq4_r: dev.alloc((VERIFY_ROWS * dim).max(8))?,
@@ -9917,15 +9929,189 @@ impl<'a> DevChain<'a> {
             );
             return Ok(false);
         }
-        // The layout is live. The per-expert GEMM that consumes it is the next
-        // step (see the ⚠️ note above): say so once rather than let an operator
-        // believe the grouped GEMM is running.
-        expert_grouped_skipped_note(
-            "the grouped layout is built but the per-expert dense GEMM is not issued yet \
-             (rows % 128 == 0 in e4x_launch_gemm vs O(1) rows per expert at m <= 6; the \
-             group-indexed masked kernel is the missing piece)",
-            true,
+        // The layout is live. Whether the GEMM that consumes it runs is
+        // `moe_experts_grouped_gate_up`'s decision (it is the only consumer, and
+        // it emits its own one-shot notice when an armed gate declines), so all
+        // this step says is that the tables are ready.
+        Ok(true)
+    }
+
+    /// The GROUPED routed gate/up: `dsv41_expert_gemm_e4m3_grouped` (`tc5::e4x`,
+    /// DeepGEMM's `m_grouped_gemm_nt_masked`) followed by the scatter back to the
+    /// per-(row, slot) `ex_act_r` layout.
+    ///
+    /// This is what makes the tcgen05 e4m3 arm reachable at decode shapes. The
+    /// dense arm needs `rows % 128 == 0`, but `moe_rows`' routing is
+    /// per-(row, slot) with O(1) rows per expert (`m <= VERIFY_ROWS = 6`,
+    /// `topk = 6`, so at most 36 assignments), and handing the per-(row, slot)
+    /// table to a dense launch would apply slot s's expert to rows that route
+    /// elsewhere — a SILENT WRONG ANSWER (`e4x_tile = false` above). The grouped
+    /// layout plus a masked M=128 tile removes the padding without changing a
+    /// single rounding step (see the kernel's NUMERIC DOMAIN note).
+    ///
+    /// PRECONDITIONS, all checked here; every decline is LOUD ONCE, because this
+    /// is only called with BOTH gates armed (`DSV41_EXPERT_GROUPED` **and**
+    /// `DSV41_EXPERT_TCGEN05_E4M3`) and an armed pair that silently measured the
+    /// proven per-(row, slot) launches is this project's #1 measurement-bias trap:
+    ///   * `e4m3` — the kernel's A operand is `kind::f8f6f4`, i.e. the e4m3 bytes
+    ///     `quant_fp8` wrote and `route_gather_rows` gathered;
+    ///   * NOT `gateup_fused` — the e4x epilogue only CLAMPS, it never fuses the
+    ///     swiglu, so the fused-swiglu shape is a different kernel's job;
+    ///   * the launcher's shape contract: `dim % 64 == 0` and
+    ///     `(2*inter_local) % 64 == 0`;
+    ///   * the plain (non-interleaved) w1/w3 planes, as the dense e4x arm
+    ///     requires;
+    ///   * the `.so` carries the symbol (a staged-bring-up arm, like every other).
+    ///
+    /// On success `ex_act_r` holds the gate|up block exactly where the batched
+    /// per-(row, slot) launch would have left it, so the swiglu / down / reduce
+    /// chain below is untouched by this arm. `Ok(false)` means "nothing ran, run
+    /// the proven launch" — the same fallback contract as every other arm here.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_experts_grouped_gate_up(
+        &mut self,
+        m: usize,
+        topk: usize,
+        n_routed: usize,
+        dim: usize,
+        inter_local: usize,
+        e4m3: bool,
+        gateup_fused: bool,
+        ld: &LayerDev,
+    ) -> Result<bool> {
+        // The caller guarantees `DSV41_EXPERT_GROUPED` (it only calls this with
+        // the layout live). The tcgen05 e4m3 gate is this method's own business:
+        // without it the `.so` would return 0 (nothing ran) and the operator would
+        // never hear why the grouped arm they armed did nothing.
+        if !expert_tcgen05_e4m3() {
+            expert_grouped_skipped_note(
+                "DSV41_EXPERT_GROUPED is on but DSV41_EXPERT_TCGEN05_E4M3 — the gate of its \
+                 only GEMM consumer — is off, so the grouped tcgen05 tile arm stays \
+                 compiled-in-but-inert and the proven per-(row, slot) launches answer the step",
+                true,
+            );
+            return Ok(false);
+        }
+        if !e4m3 {
+            expert_grouped_skipped_note(
+                "the grouped tcgen05 tile arm eats e4m3 ACTIVATION bytes (kind::f8f6f4), but \
+                 DSV41_EXPERT_ACT_E4M3 is off so the gathered rows are fp4 nibbles",
+                true,
+            );
+            return Ok(false);
+        }
+        if gateup_fused {
+            expert_grouped_skipped_note(
+                "gate/up is on the FUSED swiglu shape (DSV41_GATEUP_FUSE + fp4 mode 2 + \
+                 dim % 512 == 0); the tcgen05 e4x epilogue only clamps, it never fuses",
+                true,
+            );
+            return Ok(false);
+        }
+        let n_total = 2 * inter_local;
+        if dim % 64 != 0 || n_total % 64 != 0 {
+            expert_grouped_skipped_note(
+                "the grouped tcgen05 e4m3 gate/up needs the dense-tile shape contract \
+                 (dim % 64 == 0 and 2*inter_local % 64 == 0)",
+                true,
+            );
+            return Ok(false);
+        }
+        if ld.experts_ilv {
+            expert_grouped_skipped_note(
+                "the routed gate/up weights are interleaved (DSV41_EXPERT_ILV); the \
+                 group-indexed e4m3 tile arm reads the plain w1/w3 planes only",
+                true,
+            );
+            return Ok(false);
+        }
+        if !self.dev.supports_expert_gemm_e4m3_grouped() {
+            expert_grouped_skipped_note(
+                "the loaded .so has no `dsv41_expert_gemm_e4m3_grouped` \
+                 (rebuild kernels/cuda: bash build.sh 103a)",
+                false,
+            );
+            return Ok(false);
+        }
+        if ld.experts.len() < 2 {
+            expert_grouped_skipped_note(
+                "the layer has fewer than two expert tensors, so the per-expert weight \
+                 strides cannot be derived",
+                true,
+            );
+            return Ok(false);
+        }
+        // The expert tensors are views into one per-layer pool with a uniform
+        // stride, so every plane is `base + ids[e] * stride`. Same derivation as
+        // the batched call site below, repeated so this arm is self-contained.
+        let (a, b) = (&ld.experts[0], &ld.experts[1]);
+        let d = |x: *mut std::ffi::c_void, y: *mut std::ffi::c_void| (y as i64) - (x as i64);
+        let (w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride) = (
+            a.w1.ptr() as *const u8,
+            d(a.w1.ptr(), b.w1.ptr()),
+            a.w1_scale.ptr() as *const u8,
+            d(a.w1_scale.ptr(), b.w1_scale.ptr()),
+            a.w3.ptr() as *const u8,
+            d(a.w3.ptr(), b.w3.ptr()),
+            a.w3_scale.ptr() as *const u8,
+            d(a.w3_scale.ptr(), b.w3_scale.ptr()),
         );
+        let n_assign = m * topk;
+        // gate | up in ONE launch: `b = w1`, `b_hi = w3`, `b_split = inter_local`
+        // (the dense arm's own convention for this pair), epi_mode 1 = the
+        // gate/up clamp. `n_assign` bounds the grid's group-table cursor
+        // (>= n_active by construction) and `grp_m_cap` bounds the per-expert
+        // m-tiles of the masked kernel.
+        let ran = self.dev.expert_gemm_e4m3_grouped(
+            self.s.grp_xq.as_u8(),
+            self.s.grp_xsc.as_f32(),
+            self.s.grp_out.ptr as *mut f32,
+            self.s.grp_active.ptr as *const i32,
+            self.s.grp_nactive.ptr as *const i32,
+            self.s.grp_counts.ptr as *const i32,
+            self.s.grp_starts.ptr as *const i32,
+            n_routed as i32,
+            n_assign as i32,
+            grp_m_cap(self.cfg) as i32,
+            n_total as i32,
+            dim as i32,
+            inter_local as i32,
+            1, // epi_mode: gate/up clamp (2/3 are per-(row, slot); the launcher refuses them)
+            self.cfg.swiglu_limit,
+            w1_base,
+            w1_stride,
+            w1s_base,
+            w1s_stride,
+            w3_base,
+            w3_stride,
+            w3s_base,
+            w3s_stride,
+        )?;
+        if !ran {
+            return Ok(false); // a gate was OFF after all: nothing ran, no notice owed
+        }
+        // Grouped `[n_assign, 2*inter_local]` -> per-(row, slot) `ex_act_r`. This
+        // is the ONLY thing that has to happen for the rest of the route to be
+        // unaware of the grouped arm: every (row, slot) block lands exactly where
+        // the batched launch would have written it (`i = r*topk + t` is the
+        // destination row and the row pitch is `topk * n_total`), and a
+        // `perm_map[i] < 0` (an out-of-range expert id) is written as zeros, which
+        // is what the per-(row, slot) path produces too.
+        let scattered = self.dev.route_scatter_rows(
+            self.s.grp_out.ptr as *const f32,
+            self.s.ex_act_r.ptr as *mut f32,
+            self.s.grp_perm.ptr as *const i32,
+            n_assign as i32,
+            n_total as i32,
+        )?;
+        if !scattered {
+            expert_grouped_skipped_note(
+                "the grouped gate/up ran but `dsv41_route_scatter_rows` is missing from the \
+                 .so, so the grouped output could not be moved into `ex_act_r`",
+                false,
+            );
+            return Ok(false); // the batched launch below re-writes `ex_act_r` in full
+        }
         Ok(true)
     }
 
@@ -10115,10 +10301,28 @@ impl<'a> DevChain<'a> {
             // copies, never computes, and it declines (`Ok(false)`) into a no-op
             // when the gate is OFF or the `.so` lacks the `dsv41_route_*` set —
             // the `if` below therefore reads like every other optional arm here.
-            // It does NOT replace the launches below: the per-expert dense GEMM is
-            // the next step (see `moe_route_grouped`'s ⚠️ note).
+            // It does NOT itself replace the launches below: its consumer does.
             let row_bytes = if e4m3 { dim } else { dim / 2 };
             let _grouped = self.moe_route_grouped(m, topk, n_routed, row_bytes)?;
+            // ---- GROUPED routed gate/up: the GROUP-INDEXED MASKED tcgen05 tile ---
+            // `dsv41_expert_gemm_e4m3_grouped` (`tc5::e4x`,
+            // `m_grouped_gemm_nt_masked`) IS the consumer: one masked M=128 tile
+            // per expert, the expert coming from the group table (`active` /
+            // `counts` / `starts`) and the rows past `counts[e]` masked out. It
+            // needs BOTH gates armed (`DSV41_EXPERT_GROUPED` **and**
+            // `DSV41_EXPERT_TCGEN05_E4M3`), the e4m3 activation, the plain
+            // (non-interleaved) w1/w3 planes, the launcher's shape contract and
+            // the symbol in the `.so` — otherwise it returns `false` and the
+            // batched SIMT launch below runs, with a one-shot notice for every
+            // decline (an armed pair must never silently measure the OLD path).
+            //
+            // It writes `ex_act_r` through the scatter, i.e. the very buffer the
+            // batched launch writes, at the very same offsets: everything below
+            // (the swiglu, the down GEMV, the reduce) is unaware of this arm.
+            let grp_gu = _grouped
+                && self.moe_experts_grouped_gate_up(
+                    m, topk, n_routed, dim, inter_local, e4m3, gateup_fused, ld,
+                )?;
             // ---- tcgen05 e4m3 DENSE-TILE gate/up (tc5::e4x) ----------------------
             // `dsv41_expert_gemm_e4m3_ext` is the e4m3 twin of the masked M=128
             // tile GEMM (`mxf4_gemm_kernel`): the M = ACTIVATION ROWS form, i.e.
@@ -10133,12 +10337,12 @@ impl<'a> DevChain<'a> {
             // runs is a LAUNCH-SHAPE decision (dense M=128 activation tile vs the
             // single-token swapAB form), not a numeric-format one.
             //
-            // ⚠️ TWO LAYOUT PRECONDITIONS THIS CALL SITE DOES NOT MEET, which is
-            // why the arm declines and the batched SIMT launch below stays in
-            // force. Both are shape/layout, not numerics, so neither can be
-            // tolerated silently — an armed gate must never mean "the OLD path
-            // measured as the new one" (this repo's #1 measurement-bias trap),
-            // hence the one-shot notice:
+            // ⚠️ THIS DENSE ARM NEVER QUALIFIES AT `moe_rows`' SHAPES, and that is
+            // correct — it is the GROUPED masked arm above (not this one) that
+            // serves the routed gate/up. Both of this arm's preconditions are
+            // shape/layout, not numerics, so neither may be tolerated silently
+            // (an armed gate must never mean "the OLD path measured as the new
+            // one" — this repo's #1 measurement-bias trap):
             //  1. EXPERT HOMOGENEITY. The kernel derives its whole B side from
             //     `base + ids[slot] * stride`, so ONE expert covers every row of
             //     the launch, while `moe_rows`' routing is per-(row, slot)
@@ -10146,17 +10350,16 @@ impl<'a> DevChain<'a> {
             //     slot s's expert to rows that route to a different one, i.e. a
             //     SILENT WRONG ANSWER. A uniform tile needs the GROUPED (permuted)
             //     routed form — the permutation plus per-expert row blocks — which
-            //     this engine does not build yet, and checking `route_idx_r` on the
-            //     host would be a D2H read (a CUDA-graph capture hazard).
+            //     is now built (`moe_route_grouped`) and consumed by
+            //     `moe_experts_grouped_gate_up`; checking `route_idx_r` on the host
+            //     would be a D2H read (a CUDA-graph capture hazard).
             //  2. DENSE OUTPUT PITCH. The kernel writes `out[row * n_total + col]`
             //     (row pitch `n_total`), while the routed gate/up output here is
             //     `ex_act_r[row][slot][act_slot]` (row pitch `topk * act_slot`).
             //     The two pitches coincide only for `topk == 1`.
-            // When the grouped tile lands, the call belongs HERE: one launch per
-            // slot, `b = w1_base` / `b_hi = w3_base` with `b_split = inter_local`,
-            // `c = route_idx_r` with `slot = s`, `epi_mode = 1` with
-            // `limit = cfg.swiglu_limit`, and the separate `swiglu_limit_batched`
-            // below kept ON (the e4x epilogue only clamps — it never fuses).
+            // So this arm's own `e4x_tile` stays false: when `grp_gu` is true the
+            // grouped masked launch already answered this stage, and when it is
+            // false the note below says why the tcgen05 family did not.
             let e4x_armed = e4m3
                 && expert_tcgen05_e4m3()
                 && self.dev.supports_expert_gemm_e4m3_ext()
@@ -10166,19 +10369,22 @@ impl<'a> DevChain<'a> {
             // which the loader guarantees for the weight planes and the
             // quantiser's row-major buffers.
             let e4x_shape = (m % 128) == 0 && (dim % 64) == 0 && ((2 * inter_local) % 64) == 0;
-            // Precondition (1)/(2) above: the tile must be one expert's dense row
-            // block. No grouped routed path exists, so this is false for every
-            // call this function currently makes.
+            // Precondition (1)/(2) above: a dense launch would need one expert's
+            // dense row block plus a `n_total`-pitched output. The GROUPED masked
+            // arm covers exactly that case, so this one stays OFF by design.
             let e4x_tile = false;
-            if e4x_armed && !(e4x_tile && e4x_shape) {
+            if e4x_armed && !grp_gu && !(e4x_tile && e4x_shape) {
                 tcgen05_e4m3_ext_skipped_note(
                     if !e4x_shape {
                         "the routed tile is not the dense shape the launcher accepts \
-                         (m % 128 == 0, dim % 64 == 0 and 2*inter % 64 == 0 are all required)"
+                         (m % 128 == 0, dim % 64 == 0 and 2*inter % 64 == 0 are all required), \
+                         and the GROUPED masked arm did not take the stage either (see its own \
+                         notice above)"
                     } else {
-                        "the routed tile is per-(row, slot): the kernel carries ONE ids[slot] \
-                         expert per launch and writes a dense [rows, n_total] out, so it needs \
-                         the grouped (permuted) routed form, which is not built"
+                        "the routed tile is per-(row, slot) and the GROUPED masked arm did not \
+                         take the stage (see its own notice above); the dense arm carries ONE \
+                         ids[slot] expert per launch and a dense [rows, n_total] out, so it \
+                         cannot serve a per-(row, slot) routing"
                     },
                     true,
                 );
@@ -10214,29 +10420,37 @@ impl<'a> DevChain<'a> {
             // holding one e4m3 byte per value and the kernel's `act_e4m3` flag
             // selecting the decoder. `act_slot` follows the fusion decision above,
             // exactly as it does on the e2m1 path.
-            let (qa, qs) = (self.s.xq4_r.as_u8(), self.s.xsc4_r.as_f32());
-            self.dev.expert_gate_up_fp4_batched(
-                qa,
-                qs,
-                self.s.ex_act_r.ptr as *mut f32,
-                act_slot as i64,
-                m as i32,
-                dim as i32,
-                inter_local as i32,
-                cfg.swiglu_limit,
-                topk as i32,
-                w1_base,
-                w1_stride,
-                w1s_base,
-                w1s_stride,
-                w3_base,
-                w3_stride,
-                w3s_base,
-                w3s_stride,
-                ids_base,
-                ld.experts_ilv as i32,
-                e4m3 as i32,
-            )?;
+            // `grp_gu` means the grouped masked tcgen05 launch above already
+            // filled every (row, slot) block of `ex_act_r`, so this proven launch
+            // must NOT run: it would overwrite the grouped result with the SIMT
+            // path's — that is precisely the "armed gate measured as the OLD path"
+            // failure this dispatch exists to avoid. `grp_gu == false` is the
+            // fallback: this launch answers the step, unchanged.
+            if !grp_gu {
+                let (qa, qs) = (self.s.xq4_r.as_u8(), self.s.xsc4_r.as_f32());
+                self.dev.expert_gate_up_fp4_batched(
+                    qa,
+                    qs,
+                    self.s.ex_act_r.ptr as *mut f32,
+                    act_slot as i64,
+                    m as i32,
+                    dim as i32,
+                    inter_local as i32,
+                    cfg.swiglu_limit,
+                    topk as i32,
+                    w1_base,
+                    w1_stride,
+                    w1s_base,
+                    w1s_stride,
+                    w3_base,
+                    w3_stride,
+                    w3s_base,
+                    w3s_stride,
+                    ids_base,
+                    ld.experts_ilv as i32,
+                    e4m3 as i32,
+                )?;
+            }
             // The separate swiglu pass is element-wise and row-local, and its
             // kernel walks the SAME [rows][slot][slot_stride] layout
             // (`base + (blockIdx.z*gridDim.y + blockIdx.y)*slot_stride`), so the
