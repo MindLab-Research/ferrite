@@ -1188,3 +1188,17 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 1. batched verify + 全 mrows + tcgen05 + draft P3c → 步时 ≤10ms
 2. accept 测试（P0-3+P1-5 with 修复后基线）
 3. 组合：4 tok/step / 0.010 = 400 tok/s
+
+## Batched 400 测试的风险预判（e6fc5ad7 跑中）
+
+**首次 GPU 测试的 gate**：
+- DSV41_DRAFT_GRAPH=1（draft P3c 图化）——**首次测试**！风险：D3/D4 的 pos >= win 约束（前 ~130 步不上图）+ ring_append 的 slot_dev 路径
+- DSV41_COMPRESSOR_MROWS=1（compressor 多行）——首次测试
+- DSV41_GATE_MROWS/VERIFY_HEAD_MROWS/INDEXER_MROWS/NORM_MROWS——首次组合
+
+**可能的结果**：
+- 如果 DRAFT_GRAPH 的 capture 失败 → latch 回退直发（安全）
+- 如果 COMPRESSOR_MROWS 的多行 fused 有 bug → clen 错位 → 文本退化
+- 如果某个 mrows gate 的符号缺失 → 静默回退（安全但无收益）
+
+**判定**：零拉丁必须保持（BF16_TRUNCATE=1）——任何拉丁出现 = 某个 gate 破坏了基线。
