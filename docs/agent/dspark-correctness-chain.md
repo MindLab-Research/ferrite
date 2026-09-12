@@ -5410,3 +5410,14 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 
 **11.0 + 11-B 的联合测试**（实施完成后）：
 - SWALLOW + 动态 pad + 加固观测 → 看 canary 是否触发 + epoch 是否正常推进
+
+## L4-9 快速 A/B 结果（efc9c663）——CNORM_SPLIT 中性
+
+**结果**：
+- 臂A（control）：**91.4 tok/s**，前 61 行正确 ✓，零拉丁 ✓
+- 臂B（CNORM_SPLIT=1）：**90.8 tok/s**，前 61 行正确 ✓，零拉丁 ✓
+- 差异：-0.6 tok/s（噪声内）
+
+**判定**：CNORM_SPLIT **中性**（不带来收益）——保持 OFF。L4-9 的 +0.5-1% 预期没有兑现。
+
+**干净栈确认**：91.1-91.4 tok/s（control 的 91.4 与之前的 91.1 一致——基线稳定！）
