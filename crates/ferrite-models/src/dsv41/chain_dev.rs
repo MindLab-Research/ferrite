@@ -2284,6 +2284,33 @@ fn ring_win_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// R3 (DSV41_RING_WIN_FUSE, **DEFAULT OFF on the verify path** — A/B first): the
+/// verify's per-row interleave calls EAGER's [`Self::ring_win_fuse`] with
+/// `pos_rows + r`, i.e. the `m == 1` form of the very launch `attention()` issues
+/// once per step, so the `ring_append` + `window_idxs` pair (2 launches/row, 12
+/// per layer at `m = 6`) becomes ONE launch per row (6 per layer).
+///
+/// WHY THIS IS EXACT, not an approximation: the fused kernel's ring half is
+/// `ring_append_kernel` term for term (`slot = *pos_ctr % window`, one thread per
+/// `hd` element) and its indices half is `window_idxs_kernel` term for term,
+/// including the `start_pos == 0` special case. The two halves write disjoint
+/// buffers (`ring` vs `idxs[0, window)`) and read nothing but `*pos_ctr`, so with
+/// `pos_ctr = pos_rows + r` the launch is byte-identical to the pair it replaces
+/// AT THAT ROW. What made the earlier BLOCK-wide fusion (`verify_ring_win`) wrong
+/// was appending the whole block up front (audit defect #2, a slot-vs-position
+/// mixup); one row at a time keeps the ring invariant per row, which is exactly
+/// why this variant is safe and that one was reverted.
+///
+/// The env var is the EAGER-side gate's, but this path reads it as an explicit
+/// opt-in so the wiring can be A/B'd: unset keeps the pair here (EAGER still
+/// fuses), `=1` turns it on here, `=0` turns both off. A `.so` predating
+/// `dsv41_ring_win_fuse` declines inside [`Self::ring_win_fuse`] (it returns
+/// `Ok(false)`) and the pair runs, so the fallback needs no symbol check here.
+fn verify_ring_win_fuse() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v == "1").unwrap_or(false))
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
@@ -9966,19 +9993,40 @@ impl<'a> DevChain<'a> {
             // future rows while losing the oldest m-1-r history. The single-row
             // kernels keep the ring invariant row by row, so the window is
             // byte-identical to a single-row decode at each row's position.
+            //
+            // R3 (DSV41_RING_WIN_FUSE=1, default OFF here — see
+            // [`verify_ring_win_fuse`]): the two single-row kernels below are the
+            // EAGER step's `ring_append` + `window_idxs` pair, which EAGER issues
+            // as ONE `dsv41_ring_win_fuse`. Calling that same kernel with
+            // `pos_rows + r` is this row's `m == 1` form — same arithmetic, same
+            // buffers, byte-identical — and halves the per-row ring+window cost
+            // (12 -> 6 launches per layer at `m = 6`). The rollback is the pair,
+            // unchanged, so a decline (gate OFF, or a `.so` without the symbol)
+            // reproduces today's path launch for launch.
             if owns_kv {
-                self.dev.ring_append(
-                    ring_ptr as *mut f32,
-                    (self.s.kv_r.ptr as *const f32).wrapping_add(r * hd),
-                    (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
-                    win as i32,
-                    hd as i32,
-                )?;
-                self.dev.window_idxs(
-                    (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist),
-                    (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
-                    win as i32,
-                )?;
+                let rw_fused = verify_ring_win_fuse()
+                    && self.dev.ring_win_fuse(
+                        ring_ptr as *mut f32,
+                        (self.s.kv_r.ptr as *const f32).wrapping_add(r * hd),
+                        (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                        win as i32,
+                        hd as i32,
+                        (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist),
+                    )?;
+                if !rw_fused {
+                    self.dev.ring_append(
+                        ring_ptr as *mut f32,
+                        (self.s.kv_r.ptr as *const f32).wrapping_add(r * hd),
+                        (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                        win as i32,
+                        hd as i32,
+                    )?;
+                    self.dev.window_idxs(
+                        (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist),
+                        (self.s.pos_rows.ptr as *const std::os::raw::c_int).wrapping_add(r),
+                        win as i32,
+                    )?;
+                }
             }
             // A consumer layer's window block is the owner's (the indices depend
             // only on the positions and the ring geometry, and the owner filled
