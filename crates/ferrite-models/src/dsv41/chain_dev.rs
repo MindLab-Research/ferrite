@@ -4151,20 +4151,15 @@ impl<'a> DevChain<'a> {
             verify_out.copy_from_slice(&rows);
         }
 
-        // 8. the accept arithmetic (host, no device traffic). The first check
-        //    is FREE: drafts[0] predicts pos+1's token, which the single-row
-        //    step already sampled as `next`; then drafts[j] (j>=1) against
-        //    verify_out[j-1] (row d_j's argmax = the prediction for pos+1+j).
+        // 8. the accept arithmetic (host, no device traffic). Same index-for-index
+        //    chain as the spec path: block row j sits at pos+1+j so `drafts[j]`
+        //    predicts pos+2+j, and verify row j's argmax is at the same pos+2+j —
+        //    compared as `drafts[j] == verify_out[j]`. The old `drafts[0] == next`
+        //    compared across positions (a pos+2 prediction vs the pos+1 token).
+        //    `next` itself is certain and always emitted ahead of the rows.
         let mut acc = 0usize;
-        if drafts[0] == next {
-            acc = 1;
-            for j in 1..DSPARK_DRAFTS {
-                if drafts[j] == verify_out[j - 1] {
-                    acc += 1;
-                } else {
-                    break;
-                }
-            }
+        while acc < DSPARK_DRAFTS && drafts[acc] == verify_out[acc] {
+            acc += 1;
         }
 
         // 9. the golden-comparison dump (no-op unless `DSV41_DSPARK_DUMP=1`).
@@ -4300,17 +4295,21 @@ impl<'a> DevChain<'a> {
         let mut verify_out = [0u32; DSPARK_DRAFTS];
         verify_out.copy_from_slice(&rows);
 
-        // ---- 5. the accept arithmetic (host, no device traffic). Row j sits at
-        // pos + 1 + j and was fed `drafts[j]`, so `verify_out[j]` is the target's
-        // prediction for pos + 2 + j. The first check is FREE: drafts[0] predicts
-        // pos+1's token, which the single-row step already sampled as `next`;
-        // then drafts[j] (j>=1) is checked against verify_out[j-1].
+        // ---- 5. the accept arithmetic (host, no device traffic). Fix #10 moved
+        // the draft block to the NEXT-position viewpoint: block row j sits at
+        // pos+1+j, so `drafts[j]` predicts pos+2+j — and verify row j (fed
+        // `drafts[j]` at pos+1+j, per step_rows' pos_base+row positions) has its
+        // argmax at the SAME pos+2+j. The two are therefore compared
+        // index-for-index: `drafts[j] == verify_out[j]`, j = 0.. — the accept
+        // chain fix #10 left half-done (the old `drafts[0] == next` compared a
+        // pos+2 prediction against the pos+1 token, which is why the measured
+        // match rate was ~33% — the adjacent-position correlation level).
+        //
+        // `next` (the single-row step's argmax, the pos+1 token) is a CERTAIN
+        // value and is always emitted, ahead of the verify's rows.
         let mut k_acc = 0usize;
-        if drafts[0] == next {
-            k_acc = 1;
-            while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc - 1] {
-                k_acc += 1;
-            }
+        while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc] {
+            k_acc += 1;
         }
 
         // ---- 6. the commit: roll back everything past the accepted prefix,

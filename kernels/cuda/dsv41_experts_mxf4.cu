@@ -1168,15 +1168,15 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // epilogue), so row r of a rows=m call is BIT-IDENTICAL to a rows==1 call on
     // the same row. See kernels/cuda/tests_dsv41_experts_mrows.cu.
     const int arow = (int)blockIdx.z;
-    const size_t srow = (size_t)arow * (size_t)gridDim.y;   // this row's slot-0 index
+    const size_t slot0 = (size_t)arow * (size_t)gridDim.y;   // this row's slot-0 index
     const float* act = (a_f32 != nullptr)
-                           ? (a_f32 + (srow + (size_t)slot) * (size_t)act_stride)
+                           ? (a_f32 + (slot0 + (size_t)slot) * (size_t)act_stride)
                            : nullptr;
     const float* rw = (row_weight != nullptr)
-                          ? (row_weight + (srow + (size_t)slot) * (size_t)rw_stride)
+                          ? (row_weight + (slot0 + (size_t)slot) * (size_t)rw_stride)
                           : nullptr;
-    out += (srow + (size_t)slot) * (size_t)out_slot_stride;
-    const size_t e = (size_t)ids[srow + (size_t)slot];
+    out += (slot0 + (size_t)slot) * (size_t)out_slot_stride;
+    const size_t e = (size_t)ids[slot0 + (size_t)slot];
     const uint8_t* b_use = b_base + e * (size_t)b_stride;
     const uint8_t* bsc_use = bs_base + e * (size_t)bs_stride;
     const uint8_t* bhi_use = bh_base + e * (size_t)bh_stride;
@@ -1953,8 +1953,8 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
     // the base pointers move. Row r of a rows=m call is therefore BIT-IDENTICAL
     // to a rows==1 call on the same row (tests_dsv41_experts_mrows.cu).
     const int arow = (int)blockIdx.z;
-    const size_t srow = (size_t)arow * (size_t)slots;             // this row's slot-0 index
-    const float* act_row = act_base + srow * (size_t)act_stride;  // this row's slot-0 slice
+    const size_t slot0 = (size_t)arow * (size_t)slots;            // this row's slot-0 index
+    const float* act_row = act_base + slot0 * (size_t)act_stride;  // this row's slot-0 slice
     float* out_row = out + (size_t)arow * (size_t)n_total;
     if (STAGED) {
         // ONE cooperative pass stages every slot's activation. `act_stride` is
@@ -1986,9 +1986,9 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
             // blockIdx.y, every warp owns its whole row. MULTI-ROW: the router's
             // per-slot scalars move with the activation row (row pitch = slots).
             const float rwv =
-                (row_weight != nullptr) ? row_weight[(srow + (size_t)slot) * (size_t)rw_stride]
+                (row_weight != nullptr) ? row_weight[(slot0 + (size_t)slot) * (size_t)rw_stride]
                                         : 1.f;
-            const size_t e = (size_t)ids[srow + (size_t)slot];
+            const size_t e = (size_t)ids[slot0 + (size_t)slot];
             const uint8_t* brow = w2_base + e * (size_t)w2_stride + (size_t)row * kbytes;
             const uint8_t* srow = w2s_base + e * (size_t)w2s_stride + (size_t)row * ksc;
 
@@ -2386,10 +2386,13 @@ extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
 // to the sequential per-slot loop.
 // ============================================================================
 
-// gate/up, batched over the top-k slots: grid = (row_blocks, slots) and
-// blockIdx.y = slot. `out` holds `slots` consecutive [2*inter] blocks, one per
-// slot, `out_slot_stride` floats apart; nothing accumulates across slots. The
-// activation is the ONE shared quantised row `a`/`a_scale`.
+// gate/up, batched over the top-k slots: grid = (row_blocks, slots, rows) with
+// blockIdx.y = slot and blockIdx.z = the ACTIVATION ROW (`rows` used to be
+// validation-only; the kernel's row mapping and the [rows][slot][...] layout are
+// documented at the top of expert_gemv_fp4_batched_kernel). `out` holds `slots`
+// consecutive [2*inter] blocks, one per slot, `out_slot_stride` floats apart;
+// nothing accumulates across slots. The activation is the ONE shared quantised row
+// `a`/`a_scale` (per activation row).
 // `ilv` (trailing, new in ABI 2): the w1/w3 pools are INTERLEAVED (DSV41_EXPERT_ILV
 // on the Rust side). It selects the kernel's ILV instantiation and REQUIRES the
 // fused read: gate and up of a row then come from one region, so the unfused
