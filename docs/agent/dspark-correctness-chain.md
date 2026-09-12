@@ -429,3 +429,9 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 **关键发现（3a）**：e2m1（双趟或单趟）的 draft 和 verify 共享量化路径 → 误差相关 → 近 tie 时同步偏移 → "假接受"。e4m3 的 verify 精度更高 → 草稿的 e2m1 误差暴露 → 正确拒绝。**本质：quantization noise correlation 在投机解码中虚增 accept**。
 
 **修法方向**：draft 也切 e4m3（已落地——draft_moe 的直接 e4m3 接线已提交）→ 两侧数值域对齐 → accept 应恢复但更真实。
+
+## 用户发现的残余乱码（"acs"）——判定为同一族缺陷
+
+用户指出 `引喻失义，以塞忠谏之路也acs。` 中的 "acs" 是乱码。**判定**：与 "opa"/"anao" 同族（词表里的合法拉丁碎片 token 出现在中文续写中）——都是 **e2m1 激活量化噪声** 在长上下文尾部累积到 argmax 翻转的表现。e4m3 直接路径已把双字降到 0，但 "acs" 出现在 ~第 130 token 处——**说明 e4m3 单趟还不够精确**（或 draft/verify 的 e4m3 尚未完全对齐）。
+**根因方向**：EAGER（纯 decode）也出 opa/acs → backbone 的 routed expert 数值残留——**需确认 draft 侧的 e4m3 是否真正生效**（draft_moe 的接线是否正确 dispatch 到 act_e4m3=1 的 kernel）。
+**下一步**：跑一次 EAGER + e4m3 的对照（不含 spec）——如果 EAGER+e4m3 干净（无 acs/opa），则残留来自 spec 路径的 draft e4m3 未生效；如果 EAGER+e4m3 也有 acs，则 backbone 的 e4m3 还需进一步排查。
