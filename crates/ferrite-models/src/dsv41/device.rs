@@ -1807,6 +1807,47 @@ impl Device {
         self.kerr(rc, "ferrite_add")
     }
 
+    /// [`Self::add_inplace`] whose epilogue ALSO copies `dst` into every peer's
+    /// staging slot (A1a, `ferrite_add_store`) — i.e. the launch carries the
+    /// following all-reduce's store, so the caller must then run the
+    /// publish+reduce half instead of the full all-reduce.
+    ///
+    /// `Ok(false)` when the loaded .so has no `ferrite_add_store` (stale build):
+    /// NOTHING was launched and the caller must fall back to `add_inplace` + the
+    /// ordinary all-reduce, so the store can never be dropped silently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_inplace_ar(
+        &self,
+        dst: &DevBuf,
+        src: &DevBuf,
+        n: i64,
+        staging_tbl: *const *mut f32,
+        epoch: *const c_uint,
+        world: i32,
+        my_rank: i32,
+        stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.add_inplace_ar else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                dst.ptr as *const f32,
+                src.ptr as *const f32,
+                dst.ptr as *mut f32,
+                n as c_int,
+                staging_tbl,
+                epoch,
+                world,
+                my_rank,
+                stride,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "ferrite_add_store")?;
+        Ok(true)
+    }
+
     /// Device-wide synchronisation (used by the all-reduce, which must know
     /// that its peer copies have landed before summing them).
     pub fn add_inplace_raw(&self, dst: *mut c_void, src: *const c_void, n: i64) -> Result<()> {
@@ -1897,6 +1938,23 @@ impl Device {
     /// (`ferrite_p2p_ar_v5_hcpost_add`) — the one the default MoE AR uses.
     pub fn supports_ar_hcpost_add(&self) -> bool {
         self.kernels.p2p_ar_v5_hcpost_add.is_some()
+    }
+
+    /// True when the loaded .so carries BOTH MoE store carriers of A1a
+    /// (`dsv41_moe_down_reduce_st` / `ferrite_add_store`). Without them
+    /// `DSV41_AR_STORE_FUSE` stays inert for the MoE site and every AR keeps its
+    /// own `p2p_ar_store_v5_kernel` launch.
+    pub fn supports_ar_store_carriers(&self) -> bool {
+        self.kernels.moe_down_reduce_ar.is_some() && self.kernels.add_inplace_ar.is_some()
+    }
+
+    /// True when the loaded .so carries the MoE publish+reduce halves of A1a
+    /// (`ferrite_p2p_ar_pubred_v5_moe` for the plain AR,
+    /// `ferrite_p2p_ar_pubred_v5_hcpost` for the folded one). A stale .so
+    /// reports false and the MoE site stays on the full all-reduce.
+    pub fn supports_ar_pubred_moe(&self) -> bool {
+        self.kernels.p2p_ar_pubred_v5_moe.is_some()
+            && self.kernels.p2p_ar_pubred_v5_hcpost.is_some()
     }
 
     /// True when the loaded `.so` carries the MULTI-ROW hc-post fold
@@ -4675,6 +4733,31 @@ impl Device {
         self.kerr(rc, "ferrite_p2p_ar_pubred_v5")
     }
 
+    /// [`Self::p2p_ar_pubred_v5`] with the A0 probe's site label set to the MoE
+    /// site (`ferrite_p2p_ar_pubred_v5_moe`, A1a). Identical work, so the MoE
+    /// half of the 80 rounds/step stays distinguishable from the attention half
+    /// in the `[ar-probe]` lines.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_pubred_v5_moe(
+        &self,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.p2p_ar_pubred_v5_moe, "ferrite_p2p_ar_pubred_v5_moe")?;
+        let rc = unsafe {
+            f(ready_tbl, epoch, staging_local, ready_local, out, n, world, my_rank, stride,
+              self.stream)
+        };
+        self.kerr(rc, "ferrite_p2p_ar_pubred_v5_moe")
+    }
+
     /// AR v5 with the segment-C `hc_post_inplace` folded into the pubred
     /// epilogue (`ferrite_p2p_ar_v5_hcpost`). Same shapes as [`Self::p2p_ar_v5`]
     /// plus the residual stream `hc_res` (`[hc_n][hc_h]`, row stride `hc_h`) and
@@ -4796,6 +4879,45 @@ impl Device {
             return Ok(false);
         }
         self.kerr(rc, "ferrite_p2p_ar_v5_hcpost_add")?;
+        Ok(true)
+    }
+
+    /// `ferrite_p2p_ar_pubred_v5_hcpost` (A1a): the publish+reduce AND the
+    /// hc-post fold, with NO store — the payload was already carried by a
+    /// producer's epilogue (see [`Self::moe_down_reduce_ar`] /
+    /// [`Self::add_inplace_ar`]). Covers the ADD_EPI path too: the folded
+    /// residual changes only what is PUBLISHED, so it is the carrier's business.
+    ///
+    /// `Ok(false)` on a stale .so or a declared shape mismatch (the launcher
+    /// returns `cudaErrorInvalidValue`), so the caller falls back to the full
+    /// `all_reduce_inplace_hcpost*` and the producer's store is simply redone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_ar_pubred_v5_hcpost(
+        &self,
+        ready_tbl: *const *mut u32,
+        epoch: *mut c_uint,
+        staging_local: *const f32,
+        ready_local: *const c_uint,
+        out: *mut f32,
+        n: c_int,
+        world: c_int,
+        my_rank: c_int,
+        stride: c_int,
+        hc_res: *mut f32,
+        hc_post: *const f32,
+        hc_comb: *const f32,
+        hc_n: c_int,
+        hc_h: c_int,
+    ) -> Result<bool> {
+        let f = match self.kernels.p2p_ar_pubred_v5_hcpost {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(ready_tbl, epoch, staging_local, ready_local, out, n, world, my_rank, stride,
+              hc_res, hc_post, hc_comb, hc_n, hc_h, self.stream)
+        };
+        self.kerr(rc, "ferrite_p2p_ar_pubred_v5_hcpost")?;
         Ok(true)
     }
 
@@ -5717,6 +5839,40 @@ impl Device {
         let f = self.need(self.kernels.moe_down_reduce, "dsv41_moe_down_reduce")?;
         let rc = unsafe { f(part, out, n, slots, self.stream) };
         self.kerr(rc, "dsv41_moe_down_reduce")
+    }
+
+    /// [`Self::moe_down_reduce`] whose epilogue ALSO copies `out` into every
+    /// peer's staging slot (A1a, `dsv41_moe_down_reduce_st`) — valid only where
+    /// this sum is `s.o`'s LAST writer (the rank does NOT run the shared expert).
+    /// The caller must then run the AR's publish+reduce half, not the full
+    /// all-reduce.
+    ///
+    /// `Ok(false)` when the loaded .so has no `dsv41_moe_down_reduce_st` (stale
+    /// build): NOTHING was launched and the caller must fall back, so the store
+    /// can never be dropped silently.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_reduce_ar(
+        &self,
+        part: *const f32,
+        out: *mut f32,
+        n: i32,
+        slots: i32,
+        staging_tbl: *const *mut f32,
+        epoch: *const c_uint,
+        world: i32,
+        my_rank: i32,
+        stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.moe_down_reduce_ar else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                part, out, n, slots, staging_tbl, epoch, world, my_rank, stride, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_moe_down_reduce_st")?;
+        Ok(true)
     }
 
     /// Fused down + reduce (DSV41_DOWN_FUSE, default ON): ONE launch computes

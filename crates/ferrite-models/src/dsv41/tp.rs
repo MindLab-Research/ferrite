@@ -637,6 +637,95 @@ impl Collective {
         )
     }
 
+    /// [`Self::all_reduce_inplace_pubred_only`] for the MoE site: identical work,
+    /// but the A0 probe labels the round as the MoE half
+    /// (`ferrite_p2p_ar_pubred_v5_moe`) instead of the attention half, so the two
+    /// 40-round halves of a decode step stay distinguishable in `[ar-probe]`.
+    /// The producer that carried the store is the MoE payload's last writer
+    /// (`Device::moe_down_reduce_ar` / `Device::add_inplace_ar`).
+    pub fn all_reduce_inplace_pubred_only_moe(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+    ) -> Result<()> {
+        debug_assert!(
+            ar_v5(),
+            "fused-store AR requires AR v5 (the producer kernel read *epoch)"
+        );
+        self.check_payload(len);
+        let n = (len / 4) as c_int;
+        let stride = self.slot_stride_elems();
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        self.dev.p2p_ar_pubred_v5_moe(
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+        )
+    }
+
+    /// [`Self::all_reduce_inplace_hcpost`] with the store carried by the
+    /// producer: publish + reduce + the segment-C fold, no store. Returns
+    /// `Ok(false)` when the `.so` lacks the entry or the shape is not the folded
+    /// one, so the caller falls back to the full `all_reduce_inplace_hcpost*`
+    /// (whose own store then re-publishes the same bytes — correct, just the
+    /// extra launch A1a removes).
+    ///
+    /// Covers the ADD_EPI variant as well: the folded residual only changes what
+    /// gets PUBLISHED, which is the carrier's job once the store is carried.
+    #[allow(clippy::too_many_arguments)]
+    pub fn all_reduce_inplace_hcpost_pubred_only(
+        &self,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+        res: *mut f32,
+        post: *const f32,
+        comb: *const f32,
+        hc_n: i32,
+        hc_h: i32,
+    ) -> Result<bool> {
+        self.check_payload(len);
+        if !ar_v5()
+            || hc_n <= 0
+            || hc_n > 8
+            || hc_h <= 0
+            || (hc_h & 3) != 0
+            || (len / 4) as i32 != hc_h
+        {
+            return Ok(false);
+        }
+        let n = (len / 4) as c_int;
+        let stride = self.slot_stride_elems();
+        let base8 = self.staging.ptr as *const u8;
+        let staging_local = self.staging.ptr as *const f32;
+        let ready_local = base8.wrapping_add(self.stamps_at) as *const c_uint;
+        let epoch = (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut c_uint;
+        self.dev.p2p_ar_pubred_v5_hcpost(
+            self.peer_stamps.ptr as *const *mut u32,
+            epoch,
+            staging_local,
+            ready_local,
+            buf as *mut f32,
+            n,
+            self.world as c_int,
+            self.rank as c_int,
+            stride,
+            res,
+            post,
+            comb,
+            hc_n,
+            hc_h,
+        )
+    }
+
     /// AR v5 with the segment-C `hc_post_inplace` fused into the pubred
     /// epilogue (see `ferrite_p2p_ar_v5_hcpost`). Returns `Ok(true)` when the
     /// fused path ran — the caller MUST then skip the standalone

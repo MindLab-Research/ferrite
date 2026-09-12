@@ -2205,6 +2205,35 @@ fn ar_store_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_AR_STORE_FUSE").map(|v| v != "0").unwrap_or(false))
 }
 
+/// The MoE half of the same gate (A1a): can this rank's `s.o` carry the MoE
+/// all-reduce's store? `false` (the default, and any stale `.so`) leaves the
+/// `p2p_ar_store_v5_kernel` launch exactly where it is.
+///
+/// The store's carrier must be the payload's LAST writer — the store only
+/// copies, so publishing an intermediate value would put bytes into the peers'
+/// slots that nothing can retract (see the note above `p2p_ar_v5_slot_base` in
+/// `ferrite_kernels.cu`). Two launches can be that writer:
+///
+///  * the routed batched down-reduce (`dsv41_moe_down_reduce_st`) on a rank that
+///    does NOT run the shared expert, and
+///  * the standalone shared-expert merge (`ferrite_add_store`) on a rank that
+///    does, when nothing folded that merge away.
+///
+/// The second half is why this stays conservative: with ADD_EPI the merge lives
+/// inside the AR's own store, and with A5 (`moe_epi_add`) it lives inside the w2
+/// GEMV's epilogue. In both the merged bytes exist only inside the AR, so there
+/// is no producer to carry the copy and the rank keeps today's two-launch AR.
+/// The carriers are only ever used when `Device::supports_ar_store_carriers`
+/// reports the symbols, and the Rust wrappers themselves return `Ok(false)` on a
+/// stale `.so` (the caller then falls back to the plain launch + `add_inplace`),
+/// so the store can never be dropped silently.
+fn ar_store_fuse_moe(dev: &Device, comm: &Option<std::sync::Arc<Collective>>) -> bool {
+    ar_store_fuse()
+        && dev.supports_ar_store_carriers()
+        && dev.supports_ar_pubred_moe()
+        && comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false)
+}
+
 /// DSV41_GATEUP_FUSE (default ON): gate/up fusion in the batched MoE path.
 pub(crate) fn gateup_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5291,6 +5320,45 @@ impl<'a> DevChain<'a> {
         )
     }
 
+    /// [`Self::ar_hc_post_fold`] for an all-reduce whose store was CARRIED by the
+    /// payload's last writer (A1a): the payload is already in every peer's
+    /// staging slot, so only publish + reduce + the hc-post fold are left. Same
+    /// gates, same shapes and the same bit-pinned epilogue as the full entry —
+    /// the only difference is the missing `p2p_ar_store_v5_kernel` launch.
+    ///
+    /// Returns `Ok(false)` when the fold declines (gate off, or a `.so` without
+    /// `ferrite_p2p_ar_pubred_v5_hcpost`): the caller then runs the plain
+    /// publish+reduce, which still consumes the carried payload.
+    fn ar_hc_post_fold_after_store(
+        &self,
+        c: &std::sync::Arc<Collective>,
+        buf: *mut std::ffi::c_void,
+        len: usize,
+    ) -> Result<bool> {
+        if !Self::hcpost_epi() || !Self::fuse_c() {
+            // Same reason as `ar_hc_post_fold`: folding under the h2-staging
+            // branch would apply the mix twice.
+            return Ok(false);
+        }
+        // The tail-split join sits HERE, not after the AR, for the same reason as
+        // in `ar_hc_post_fold`: the fused epilogue is the first consumer of the
+        // LATE half's `comb`/`post` (and its `hc_res` write clobbers memory the
+        // LATE half is still reading), so the side stream's `join_ev` must be
+        // waited on the main stream BEFORE this launch. No-op when no split is
+        // armed.
+        self.dev.hc_tail_join()?;
+        let (dim, hc) = (self.cfg.dim, self.cfg.hc_mult);
+        c.all_reduce_inplace_hcpost_pubred_only(
+            buf,
+            len,
+            self.s.h.ptr as *mut f32,
+            self.s.post.as_f32(),
+            self.s.comb.as_f32(),
+            hc as i32,
+            dim as i32,
+        )
+    }
+
     /// [`Self::ar_hc_post_fold`] for the VERIFY (m-row) chain: fold this block's
     /// `hc_post_inplace_rows` into the AR that just produced its `x`.
     ///
@@ -5366,7 +5434,7 @@ impl<'a> DevChain<'a> {
     /// cannot contain the host barrier that this path still uses, so the segment
     /// boundary sits exactly here. Returns whether the segment-C hc-post was
     /// folded into the reduce (see [`Self::ar_hc_post_fold`]).
-    fn moe_reduce(&mut self, layer: usize) -> Result<bool> {
+    fn moe_reduce(&mut self, layer: usize, carried: bool) -> Result<bool> {
         let dim = self.cfg.dim;
         // ADD_EPI: the merge `moe(layer, ..)` deferred (see `add_epi()`). READ,
         // never consumed: the step-body graph is captured after the first decode
@@ -5375,6 +5443,30 @@ impl<'a> DevChain<'a> {
         let add_in = self.moe_add_in[layer];
         // routed experts are expert-parallel, so each rank holds a partial sum
         if let Some(c) = self.comm.clone() {
+            // A1a: `carried` says `s.o`'s LAST writer already copied the payload
+            // into every peer's staging slot (see `ar_store_fuse_moe`), so only
+            // the publish+reduce half is left. It is never set together with a
+            // deferred merge: the carrier IS the standalone `add_inplace`, and
+            // with ADD_EPI that launch does not happen at all.
+            debug_assert!(
+                !carried || add_in.is_none(),
+                "an AR-store carrier never coexists with the deferred ADD_EPI merge"
+            );
+            if carried {
+                let folded = self.ar_hc_post_fold_after_store(
+                    &c,
+                    self.s.o.ptr as *mut std::ffi::c_void,
+                    fb(dim),
+                )?;
+                if !folded {
+                    c.all_reduce_inplace_pubred_only_moe(
+                        self.s.o.ptr as *mut std::ffi::c_void,
+                        fb(dim),
+                    )?;
+                }
+                c.end_round();
+                return Ok(folded);
+            }
             let folded =
                 self.ar_hc_post_fold(&c, self.s.o.ptr as *mut std::ffi::c_void, fb(dim), add_in)?;
             if !folded {
@@ -14378,7 +14470,14 @@ fn tap_input() -> bool {
         // DSV41_GRAPH_MOE=1 captures the host-free part of the MoE (everything up
         // to the all-reduce) into one per-layer graph. The first step warms every
         // kernel; the capture happens on the next one, then it replays.
-        if self.moe_graph_armed {
+        //
+        // A1a: `ar_store_fuse_moe` is a process-constant decision (env + the
+        // loaded symbols), so it answers for the captured segment's replays too —
+        // the carrier launch is INSIDE the segment, the publish+reduce stays
+        // outside it. The store therefore keeps the stream order it always had:
+        // segment replay, then the AR.
+        let ar_carry = ar_store_fuse_moe(&self.dev, &self.comm);
+        let moe_carried = if self.moe_graph_armed {
             if let Some(e) = self.moe_graph.get(layer).and_then(|x| *x) {
                 self.moe_graph_replays = self.moe_graph_replays.wrapping_add(1);
                 if self.moe_graph_replays == 1 {
@@ -14386,9 +14485,10 @@ fn tap_input() -> bool {
                         self.moe_graph_captures);
                 }
                 self.dev.graph_launch(e)?;
+                ar_carry
             } else {
                 self.dev.capture_begin()?;
-                self.moe(layer, ld)?;
+                let carried = self.moe(layer, ld)?;
                 let g = self.dev.capture_end()?;
                 let e = self.dev.graph_instantiate(g)?;
                 self.dev.graph_free(g, std::ptr::null_mut())?;
@@ -14397,11 +14497,12 @@ fn tap_input() -> bool {
                 if self.moe_graph_captures == 1 {
                     eprintln!("[gmo] MoE segment graph armed: first capture at L{layer}");
                 }
+                carried
             }
         } else {
-            self.moe(layer, ld)?;
-        }
-        let moe_hc_folded = self.moe_reduce(layer)?;
+            self.moe(layer, ld)?
+        };
+        let moe_hc_folded = self.moe_reduce(layer, moe_carried)?;
         if phase_dbg() {
             eprintln!("[phs] L{layer} moe={:?}", _t_moeonly.elapsed());
         }
@@ -15789,11 +15890,24 @@ fn tap_input() -> bool {
     }
 
     /// MoE: bf16 gate GEMM, `noaux_tc` routing, MXFP4 experts, fp8 shared expert.
-    fn moe(&mut self, layer: usize, ld: &LayerDev) -> Result<()> {
+    ///
+    /// Returns `Ok(true)` when this rank's LAST writer of `s.o` took the MoE
+    /// all-reduce's store into its own epilogue (A1a, see `ar_store_fuse_moe`):
+    /// the caller then calls [`Self::moe_reduce`] with `carried = true`, so the AR
+    /// runs as publish+reduce only and one launch/graph node disappears. `false`
+    /// — the gate off (the default), a rank whose merge was folded into the AR or
+    /// into the w2 GEMV, the sequential expert path (its last writer is the last
+    /// slot's `expert_down_fp4_indirect`, not a single carrier), or a `.so`
+    /// without the carrier symbols — leaves the ordinary two-launch all-reduce.
+    fn moe(&mut self, layer: usize, ld: &LayerDev) -> Result<bool> {
         let cfg = self.cfg;
         // ADD_EPI: cleared here and set only by the deferral below (see
-        // `add_epi()`); `moe_reduce(layer)` reads it right after this segment.
+        // `add_epi()`); `moe_reduce(layer, ..)` reads it right after this segment.
         self.moe_add_in[layer] = None;
+        // A1a: whether this rank may carry the all-reduce's store at all (gate +
+        // symbols + AR v5). Cached per process, so the decision is constant and a
+        // captured segment stays valid across replays.
+        let ar_carry = ar_store_fuse_moe(&self.dev, &self.comm);
         let dim = cfg.dim;
         let inter = cfg.moe_inter_dim;
         // MoE is TP-split, NOT expert-parallel: every rank holds every expert,
@@ -15844,6 +15958,16 @@ fn tap_input() -> bool {
         // they exist decides if that half runs at all, so MOE_DUAL must know it
         // before it forks.
         let sh_w2_ok = ld.shared_w2.is_some() && ld.shared_w2_scale.is_some();
+        // A1a: does the shared expert actually merge into `s.o` on this rank? Its
+        // merge is a LATER writer of `s.o` than the routed down-reduce, so it
+        // decides which launch may carry the all-reduce's store
+        // (`ar_store_fuse_moe`): the merge when it runs standalone, the
+        // down-reduce otherwise. `sh_w.is_some()` is exactly the guard of the
+        // shared-expert block below (`!skip_shared_expert && shared_rank` and all
+        // four w1/w3 tensors), and that block additionally needs w2.
+        let shared_here = sh_w.is_some() && sh_w2_ok;
+        // Set by whichever carrier took the store; returned to `moe_reduce`.
+        let mut ar_carried = false;
         // MOE_DUAL (DSV41_MOE_DUAL, default ON): fork the SHARED expert half onto
         // the second side stream HERE, before the gate/routed chain is issued.
         // The fork event is recorded on the main stream at a point where `xn`
@@ -16394,12 +16518,37 @@ fn tap_input() -> bool {
                     // Fixed-order sum, slot 0 first: the SAME order the sequential
                     // `o[row] += x` accumulation used (from the zeroed `o`), so the
                     // result is bit-identical (fp addition is not associative).
-                    self.dev.moe_down_reduce(
-                        self.s.ex_down_b.ptr as *const f32,
-                        self.s.o.ptr as *mut f32,
-                        dim as i32,
-                        topk as i32,
-                    )?;
+                    //
+                    // A1a: on a rank where the shared expert does NOT add into
+                    // `s.o` afterwards, this sum is `s.o`'s LAST writer and is
+                    // therefore the only launch that may carry the following
+                    // all-reduce's store. The epilogue copies `acc` into every
+                    // peer's slot AFTER it is final, so the summation bits (the
+                    // contract above) are untouched; the AR then runs as
+                    // publish+reduce only.`Ok(false)` (stale .so) falls straight
+                    // back to the plain launch.
+                    if ar_carry && !shared_here {
+                        let c = self.comm.clone().expect("ar_carry implies a collective");
+                        ar_carried = self.dev.moe_down_reduce_ar(
+                            self.s.ex_down_b.ptr as *const f32,
+                            self.s.o.ptr as *mut f32,
+                            dim as i32,
+                            topk as i32,
+                            c.peer_slots_f32(),
+                            c.epoch_u32(),
+                            c.world as i32,
+                            c.rank as i32,
+                            c.slot_stride_elems(),
+                        )?;
+                    }
+                    if !ar_carried {
+                        self.dev.moe_down_reduce(
+                            self.s.ex_down_b.ptr as *const f32,
+                            self.s.o.ptr as *mut f32,
+                            dim as i32,
+                            topk as i32,
+                        )?;
+                    }
                 }
             } else {
                 for slot in 0..topk {
@@ -16596,8 +16745,31 @@ fn tap_input() -> bool {
                         // ADD_EPI: defer the merge into the MoE all-reduce's
                         // store epilogue when the .so carries the biased entry
                         // (see `add_epi()`); otherwise the standalone add.
+                        //
+                        // A1a: with no deferral this merge IS `s.o`'s last writer,
+                        // so it is the launch that carries the following
+                        // all-reduce's store (see `ar_store_fuse_moe`) — publishing
+                        // the merged value is exactly what the deferred ADD_EPI
+                        // would have published, only from here. With ADD_EPI the
+                        // merged bytes exist only inside the AR, so no carrier is
+                        // taken and the AR keeps its own store.
                         if self.add_epi_ready() {
                             self.moe_add_in[layer] = Some(self.s.ex_out.ptr as *const f32);
+                        } else if ar_carry {
+                            let c = self.comm.clone().expect("ar_carry implies a collective");
+                            ar_carried = self.dev.add_inplace_ar(
+                                &self.s.o,
+                                &self.s.ex_out,
+                                dim as i64,
+                                c.peer_slots_f32(),
+                                c.epoch_u32(),
+                                c.world as i32,
+                                c.rank as i32,
+                                c.slot_stride_elems(),
+                            )?;
+                            if !ar_carried {
+                                self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                            }
                         } else {
                             self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
                         }
@@ -16614,14 +16786,35 @@ fn tap_input() -> bool {
             self.dev.dual_chain_join()?;
             // ADD_EPI: the join just made `s.ex_out` final on the main stream, so
             // the following AR's store can publish `s.o + s.ex_out` itself.
+            //
+            // A1a: the join made this merge `s.o`'s last writer, so with no
+            // deferral it carries the all-reduce's store (same reasoning as the
+            // `!dual` site above).
             if self.add_epi_ready() {
                 self.moe_add_in[layer] = Some(self.s.ex_out.ptr as *const f32);
+            } else if ar_carry {
+                let c = self.comm.clone().expect("ar_carry implies a collective");
+                ar_carried = self.dev.add_inplace_ar(
+                    &self.s.o,
+                    &self.s.ex_out,
+                    dim as i64,
+                    c.peer_slots_f32(),
+                    c.epoch_u32(),
+                    c.world as i32,
+                    c.rank as i32,
+                    c.slot_stride_elems(),
+                )?;
+                if !ar_carried {
+                    self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
+                }
             } else {
                 self.dev.add_inplace(&self.s.o, &self.s.ex_out, dim as i64)?;
             }
         }
         // the block output is the attention-branch accumulator `o`
-        Ok(())
+        // `ar_carried` tells `moe_reduce` that the all-reduce's store is already
+        // in the peers' staging slots for this round.
+        Ok(ar_carried)
     }
 }
 
