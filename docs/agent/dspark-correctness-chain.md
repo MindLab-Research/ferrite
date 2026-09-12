@@ -507,3 +507,24 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 1. 首 token 就有分歧（官方 `《出师表》是三国` vs ferrite `《前出师表》原文：`——**prompt 对齐后**首步 top-10 logits 对照）
 2. 逐层 norm 对照二分到第一个偏离层
 3. 已知候选：fp4 权重解包的 nibble 顺序、e8m0 scale 的读取/应用、hc 数学、DSA indexer 的 tie 规则
+
+## e8m0 scale 对照核实（代码级，ferrite vs 官方）——一致 ✓
+
+**官方** `kernel.py:25-38`：
+```python
+fast_log2_ceil(x): exp = (bits >> 23) & 0xFF; man = bits & 0x7FFFFF; return exp - 127 + (man != 0 ? 1 : 0)
+fast_pow2(x): bits = (x + 127) << 23; return reinterpret<float32>(bits)
+fast_round_scale(amax, max_inv) = fast_pow2(fast_log2_ceil(amax * max_inv))
+```
+
+**ferrite** `dsv41_kernels.cu:113-121`：
+```cuda
+fast_round_scale(amax, max_inv):
+    bits = __float_as_uint(amax * max_inv)
+    exp = (bits >> 23) & 0xFF
+    man = bits & 0x7FFFFF
+    e = exp - 127 + (man != 0 ? 1 : 0)
+    return __int_as_float((e + 127) << 23)
+```
+
+**逐位一致** ✓——相同的 IEEE 754 位操作、相同的 ceil 语义、相同的 2^e 重建。**e8m0 scale 排除**。
