@@ -1241,10 +1241,7 @@ fn vrow0_write(rec: &Vrow0Rec<'_>) -> Result<()> {
                 "],\"eager_n\":{},\"eager_base\":{},\"eager_sliced\":{}",
                 e.n, e.base, e.sliced
             );
-            (
-                Some(rec.verify_argmax == e.argmax),
-                vrow0_gap(&e.top),
-            )
+            (Some(rec.verify_argmax == e.argmax), vrow0_gap(&e.top))
         }
         None => {
             line.push_str(",\"eager_argmax\":null,\"eager_top\":null");
@@ -4621,7 +4618,8 @@ impl<'a> DevChain<'a> {
         //     propagated: a probe must not answer an error for a step whose
         //     numbers are already fixed.
         if vrow0_probe() {
-            if let Err(e) = self.vrow0_step("shadow", pos, token, next, drafts[0], verify_out[0], true)
+            if let Err(e) =
+                self.vrow0_step("shadow", pos, token, next, drafts[0], verify_out[0], true)
             {
                 eprintln!("[dsv41] vrow0 probe (shadow, pos {pos}) failed: {e}");
             }
@@ -4765,7 +4763,8 @@ impl<'a> DevChain<'a> {
         // is off. Logged, never propagated — a probe must not answer an error
         // for a step whose block is already committed.
         if vrow0_probe() {
-            if let Err(e) = self.vrow0_step("spec", pos, token, next, drafts[0], verify_out[0], false)
+            if let Err(e) =
+                self.vrow0_step("spec", pos, token, next, drafts[0], verify_out[0], false)
             {
                 eprintln!("[dsv41] vrow0 probe (spec, pos {pos}) failed: {e}");
             }
