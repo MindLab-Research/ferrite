@@ -7,9 +7,9 @@
 
 | 项 | 状态 |
 |---|---|
-| 验证干净的最佳配置 | **base + R2 + MARKOV = 89.6 tok/s**（base 78.8，+13.7%）|
+| 验证干净的最佳配置 | **base + R2 + MARKOV + LAZY_SDR + FORK + RING_WIN = 91.1 tok/s**（base 78.8，**+15.6%**）|
 | 待重验 | LAZY_SDR（修复后）、VERIFY_FORK、K1+K2、RING_WIN_FUSE、wo_a |
-| 全部干净后的预期 | **~92-95 tok/s** |
+| 全部干净后的当前值 | **91.1 tok/s**（tcgen05 被阻塞）|
 | 到 400 tok/s | lazy 上限 **~145**；400 需 batched（SWALLOW 修复）或 L4/L5 kernel |
 | 最重要的教训 | **验证必须用 EAGER 对照**；**计数判据只对前 61 行有效** |
 
