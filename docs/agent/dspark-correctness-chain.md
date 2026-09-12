@@ -155,3 +155,21 @@
 **用户（权威）**："之前 162 tok/s，也就是打 git tag 那个版本（`dsv41-6.15ms-162toks`，HEAD=8a5a952）没有乱码。"
 
 ⇒ **正确性的判据锚定**：`dsv41-6.15ms-162toks` 的 EAGER 路径是干净的（无 opa/无乱码）。opa 是**这个 tag 之后引入的回归**——二分范围：8a5a952..HEAD 之间的 backbone 改动（不在 spec 路径——EAGER 也中招 ⇒ backbone 共性）。下一步：`git log 8a5a952..HEAD --oneline -- crates/ferrite-models/src/dsv41/chain_dev.rs kernels/cuda/dsv41_kernels.cu kernels/cuda/dsv41_glue.cu` 列出候选提交，按"触及 backbone 数值路径（量化/fp4/AR/head/attention kernel）"过滤，在远端逐个 checkout A/B 出师表（EAGER 模式）。
+
+## opa 回归二分的两份判词（backbone-regress-bisect + first-token-divergence）
+
+**backbone-regress-bisect 的关键杠杆**：EAGER 是 m=1 逐 token 的 step_dev 循环（无 `fn prefill`——prefill 也是 step_dev）⇒ **~80% 的 m>1 优化候选全部惰性排除**。剩余 4 个候选：
+| # | 提交 | 内容 | EAGER 生效 | 合理性 |
+|---|---|---|---|---|
+| **C0** | b5dee8d+a3b913e+97d0b46 | chat frame/serve 入口统一 | ✓ | **最高**——prompt 字节差一步解释首 token + 尾部 |
+| **C1** | 47a9bb9 | mxf4 ILV/scale 分片（**已知 test failure 72!=96 是它的指纹**） | ✓（load-time 布局） | **高**——每层 MoE 系统性小偏差 |
+| C2 | 71b9d66 | AR staging 尺寸（hc_dim*4 → max(hc_dim, VERIFY_ROWS*dim)） | ✓（共享） | 中 |
+| C3 | 3d318bf | indexer 慢路径（decode 恒 fast path） | 大概率惰性 | 低 |
+
+**first-token-divergence 的头号根因**：**MoE routed expert 的激活量化格式——ferrite e2m1 vs 官方 e4m3**（官方 fp4 权重的 `linear()` 用 fp8 激活：`model.py:181-195`"both fp4 and fp8 weights take an fp8 one"）。e2m1 只有 1 位尾数——**backbone 里量级最大的已知数值分歧**。
+**⚠️ 判据前提红旗**：官方输出 `《出师表》开头如下` vs ferrite `出师表》全文如下`——**两侧 prompt 不同**（"开头" vs "全文"）——**首 token 分歧可能是 prompt 差，不是数值差**。先对齐 prompt 再判定。
+
+**二分计划（判词给的顺序，比 checkout 快）**：
+1. **先仲裁 prompt**（两侧 ids 逐位 diff）
+2. **ablation 阶梯**（env 开关，每条一次 EAGER 出师表）：`DSV41_EXPERT_ILV=0`（C1 一击）→ `DSV41_SKIP_EXPERTS=1`（定位 MoE）→ 融合族逐个 `=0`（EAGER 侧从未 A/B 过的 10 个默认 ON）→ `DSV41_GRAPH_STEP=0 DSV41_AR_V5=0`（C2）
+3. checkout 二分（仅当 2 全落空）：先 `47a9bb9`（C1 直收）
