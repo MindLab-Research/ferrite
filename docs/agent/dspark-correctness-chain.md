@@ -318,3 +318,8 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 **修复（已提交）**：kernel 的 `fuse` 绑到调用者的 `out_slot_stride`（**单一真值**：`== inter` = fused、`== 2*inter` = unfused）——两侧结构上不可能再分歧。Rust mirror 补了 `dim%512==0` 条件。ILV+E4M3 冲突现在硬失败。
 
 **量化数学无罪**（判词确认）：sub_dequant_fp4 与 quant_fp4 严格互逆 ✓、scale 索引一致 ✓、ex_act/ex_act_lo 的 pitch 相同 ✓——**唯一坏的是布局协商**。这也解释了 opa 为什么真的消失了（激活假设成立）。
+
+## sub_dequant_fp4 kernel 审计（spec-step-hardening2）——**本体无罪，五项全过**
+
+nibble 解包（偶列=LOW）✓ / e2m1 dequant 表（同一张，含负零的恒等）✓ / scale 索引（r*nb+b 一致）✓ / round_scale 语义（读同一份 f32，结构上保证 residual = x − pass0 真正喂进点积的项）✓ / grid 覆盖 ✓。
+**唯一一般缺陷**：moe_rows 的 ILV 守卫漏了 `!two`——armed + ILV 组合会 fail-loud（不是静默）但应在 Rust 侧提前拒绝。已顺手修（fuse 绑 pitch 的同一提交）。
