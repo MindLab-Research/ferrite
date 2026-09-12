@@ -446,14 +446,14 @@ struct Kernels {
     /// tcgen05 MXFP4 gate/up, Phase-1 skeleton (`DSV41_EXPERT_TCGEN05_MXF4`,
     /// default OFF). OPTIONAL on purpose: `build.sh` defines no
     /// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`, so a stock `.so` has no such
-    /// symbol and the probe below keeps the proven GEMV path. The ABI note in
-    /// kernels.rs lists the three shape asymmetries (contiguous gate|up pool,
-    /// e8m0 activation scales, no per-slot expert id) that the Phase-2
-    /// indirect launcher has to close before `moe()` can dispatch to it.
+    /// symbol and the probe below keeps the proven GEMV path. The ABI (18
+    /// params) takes the loader's four weight planes as base/stride pairs plus
+    /// a device-side `ids[slot]`, so `moe()` can dispatch to it directly; see
+    /// the ABI note in kernels.rs.
     expert_tcgen05_gate_up_mxf4: Option<
         unsafe extern "C" fn(
-            *const u8, *const u8, *const u8, *const u8, *mut f32, i64, c_int, c_int, f32, c_int,
-            CuStream,
+            *const u8, *const f32, *mut f32, i64, c_int, c_int, f32, c_int, *const u8, i64,
+            *const u8, i64, *const u8, i64, *const u8, i64, *const c_int, CuStream,
         ) -> c_int,
     >,
     /// Load-time gate/up interleave (DSV41_EXPERT_ILV): rewrites an expert's
@@ -3382,35 +3382,41 @@ impl Device {
     /// tcgen05 MXFP4 gate/up — the Phase-1 `kind::mxf4` swapAB kernel
     /// (`DSV41_TCGEN05_GATEUP_MXF4`, default OFF, read once inside the `.so`).
     ///
-    /// `w`/`w_scale` are ONE expert's contiguous `[2*inter, dim/2]` gate|up pool
-    /// and its `[2*inter, dim/32]` e8m0 scales (rows `[0, inter)` = gate, then
-    /// up); `act`/`act_scale` are the shared quantised row (packed e2m1 and
-    /// `[dim/32]` e8m0 BYTES — see the kernels.rs ABI note); `out` holds `slots`
-    /// `[2*inter]` blocks, `out_slot_stride` floats apart, with the `limit`
-    /// clamp applied in the epilogue (`split == inter`).
+    /// The four `*_base`/`*_stride` pairs are the loader's actual weight planes
+    /// (`w1` gate / `w3` up and their e8m0 scale planes, `load.rs:644`) and
+    /// `ids[slot]` selects one expert per `grid.y` slot on the device — pass
+    /// `nullptr` to make the bases BE the direct pointers (one expert).
+    /// `act`/`act_scale` are the shared quantised row: packed e2m1 and its
+    /// `[dim/32]` **f32 power-of-two** scales (the quantiser's native output;
+    /// the kernel converts to e8m0 — see the kernels.rs ABI note). `out` holds
+    /// `slots` `[2*inter]` blocks, `out_slot_stride` floats apart, with the
+    /// `limit` clamp applied in the epilogue (`split = inter`).
     ///
-    /// Returns `Ok(false)` when the entry did not run — the `.so` gate is OFF,
-    /// or the launcher rejected the shape and swallowed the error — so a caller
-    /// can keep the proven GEMV path. Anything else is an error.
-    ///
-    /// ⚠️ The routed MoE cannot use this yet: it feeds four separate pools
-    /// (w1/w3 + scales) selected by device-side ids and f32 activation scales,
-    /// while this launcher takes one direct contiguous pool and e8m0 bytes.
-    /// Until the Phase-2 indirect launcher lands, this entry serves the parity
-    /// harness / microbench only (see `supports_expert_tcgen05_mxf4`).
+    /// Returns `Ok(false)` when the `.so` gate is OFF (rc == 0, nothing ran) so
+    /// a caller can keep the proven GEMV path. ⚠️ A REJECTED shape/alignment
+    /// returns a nonzero code and IS an error: the caller must pre-check the
+    /// contract (`dim % 128 == 0`, `2*inter % 128 == 0`, 16-byte aligned bases
+    /// and strides) or it will fail the step instead of falling back.
     #[allow(clippy::too_many_arguments)]
     pub fn expert_tcgen05_gate_up_mxf4(
         &self,
-        w: *const u8,
-        w_scale: *const u8,
         act: *const u8,
-        act_scale: *const u8,
+        act_scale: *const f32,
         out: *mut f32,
         out_slot_stride: i64,
         inter: i32,
         dim: i32,
         limit: f32,
         slots: i32,
+        w1_base: *const u8,
+        w1_stride: i64,
+        w1s_base: *const u8,
+        w1s_stride: i64,
+        w3_base: *const u8,
+        w3_stride: i64,
+        w3s_base: *const u8,
+        w3s_stride: i64,
+        ids: *const i32,
     ) -> Result<bool> {
         let f = self.need(
             self.kernels.expert_tcgen05_gate_up_mxf4,
@@ -3418,12 +3424,12 @@ impl Device {
         )?;
         let rc = unsafe {
             f(
-                w, w_scale, act, act_scale, out, out_slot_stride, inter, dim, limit, slots,
-                self.stream,
+                act, act_scale, out, out_slot_stride, inter, dim, limit, slots, w1_base, w1_stride,
+                w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids, self.stream,
             )
         };
         if rc == 0 {
-            return Ok(false); // gate OFF, or the launcher declined the shape
+            return Ok(false); // gate OFF: nothing ran, the caller falls back
         }
         self.kerr(rc, "dsv41_expert_tcgen05_gate_up_mxf4")?;
         Ok(true)

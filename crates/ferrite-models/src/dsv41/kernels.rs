@@ -149,36 +149,49 @@ extern "C" {
     /// symbol — `Device::supports_expert_tcgen05_mxf4()` is the probe and the
     /// proven GEMV/GEMM path stays in force.
     ///
-    /// ⚠️ **Three shape asymmetries vs `dsv41_expert_gate_up_fp4_batched`**
-    /// (why this cannot be dropped into `moe()` yet — see the wrapper doc in
-    /// device.rs and docs/agent/expert-tcgen05-plan.md §7):
-    ///   1. the weight side is ONE contiguous `[2*inter, dim/2]` pool with
-    ///      `[2*inter, dim/32]` e8m0 scales, rows `[0, inter)` = gate then up
-    ///      (`split == inter` in the epilogue); the production loader keeps w1
-    ///      and w3 in SEPARATE regions;
-    ///   2. `act_scale` is `[dim/32]` e8m0 BYTES read straight into the SF
-    ///      word, while `dsv41_quant_fp4` emits f32 power-of-two scales;
-    ///   3. no expert indirection: the kernel accepts
-    ///      `w_base/w_stride/ws_base/ws_stride/ids[slot]`, but this launcher
-    ///      passes null, so every `grid.y` slot reads the SAME weights.
+    /// **ABI (18 params, 2026-09-12 gap resolution; was 11).** The three shape
+    /// asymmetries vs `dsv41_expert_gate_up_fp4_batched` are CLOSED:
+    ///   1. weight layout — the kernel takes the loader's TWO separate pools
+    ///      (`w1` gate, `w3` up) as `*_base`/`*_stride` pairs and applies the
+    ///      row split `r < inter ? w1[r] : w3[r - inter]` per weight row
+    ///      (mirrors `mxf4_gemm_kernel`'s `b`/`b_hi` + `b_split`);
+    ///   2. activation scale — `act_scale` is the quantiser's natural
+    ///      `[dim/32]` **f32 power-of-two** array; the kernel converts it with
+    ///      its own `f_pow2_to_ue8m0` (lossless for `round_scale=true`), so
+    ///      `dsv41_quant_fp4`'s ABI and the whole SIMT path stay untouched;
+    ///   3. expert indirection — `ids[slot]` selects the expert per `grid.y`
+    ///      slot ON THE DEVICE, so the routing never reaches the host and the
+    ///      launch arguments stay static (CUDA-graph safe).
+    /// There is deliberately no separate direct-pointer parameter pair: with
+    /// `ids == nullptr` the four bases ARE the direct pointers, so one form
+    /// serves both the parity harness and the serve dispatch.
     ///
     /// Returns 0 when the gate is OFF (read once inside the `.so`, process
-    /// level) and swallows `cudaGetLastError`, so a rejected shape is a no-op
-    /// rather than a failed step — the caller falls back either way.
-    /// Launcher contract: `dim % 128 == 0`, `dim % 64 == 0`, `dim <= 5120`,
-    /// `rows = 2*inter`, `rows % 128 == 0` (⇒ `inter % 64 == 0`).
+    /// level). A REJECTED shape/strides returns a nonzero CUDA error code
+    /// (so a misaligned pool fails loudly instead of silently misplacing
+    /// bytes); the launcher checks `dim % 128 == 0`, `dim % 64 == 0`,
+    /// `dim <= 5120`, `rows = 2*inter`, `rows % 128 == 0` (⇒ `inter % 64 == 0`,
+    /// `split = inter % 32 == 0`) and the 16-byte alignment of all four bases
+    /// and all four strides.
     #[allow(clippy::too_many_arguments)]
     pub fn dsv41_expert_tcgen05_gate_up_mxf4(
-        w: *const u8,
-        w_scale: *const u8,
         act: *const u8,
-        act_scale: *const u8,
+        act_scale: *const f32,
         out: *mut f32,
         out_slot_stride: i64,
         inter: i32,
         dim: i32,
         limit: f32,
         slots: i32,
+        w1_base: *const u8,
+        w1_stride: i64,
+        w1s_base: *const u8,
+        w1s_stride: i64,
+        w3_base: *const u8,
+        w3_stride: i64,
+        w3s_base: *const u8,
+        w3s_stride: i64,
+        ids: *const i32,
         stream: CuStream,
     ) -> i32;
 

@@ -59,6 +59,26 @@
 #include <cstring>
 #include <vector>
 
+// ⚠️ THE ENTRY POINT LIVES INSIDE `namespace tc5::mxf4`. The mxf4 block opens
+// `namespace tc5 { namespace mxf4 {` at :3516-3517 and the `extern "C"` entry is
+// declared at :4007 — *inside* that namespace. `extern "C"` fixes the LINKAGE
+// (the .so exports the unmangled name `dsv41_expert_tcgen05_gate_up_mxf4`, which
+// is what the Rust `kernel_sym_opt` probe finds), but it does NOT put the name
+// into the global namespace: an unqualified call from this file does not
+// compile. This wrapper is the qualified call — same symbol, and one place to
+// touch if the launcher ever moves out of the namespace.
+static inline int m4_gateup_entry(const uint8_t* act, const float* act_scale, float* out,
+                                  long out_slot_stride, int inter, int dim, float limit,
+                                  int slots, const uint8_t* w1_base, long w1_stride,
+                                  const uint8_t* w1s_base, long w1s_stride,
+                                  const uint8_t* w3_base, long w3_stride,
+                                  const uint8_t* w3s_base, long w3s_stride, const int* ids,
+                                  cudaStream_t stream) {
+    return tc5::mxf4::dsv41_expert_tcgen05_gate_up_mxf4(
+        act, act_scale, out, out_slot_stride, inter, dim, limit, slots, w1_base, w1_stride,
+        w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids, stream);
+}
+
 namespace {
 
 // ---------------------------------------------------------------- quant.rs ---
@@ -204,7 +224,10 @@ struct Diff {
 // Row-L2-relative error is the PASS basis: a per-element relative error blows
 // up on the near-zero elements a random-sign dot product produces, while the
 // row norm is stable and is what a model actually consumes downstream.
-Diff cmp(const std::vector<float>& got, const std::vector<double>& ref) {
+// Templated on the reference type so a float reference (the SIMT arm) and a
+// double one (the CPU golden) are both accepted.
+template <typename T>
+Diff cmp(const std::vector<float>& got, const std::vector<T>& ref) {
     Diff d;
     double num = 0.0, den = 0.0;
     for (size_t i = 0; i < got.size(); ++i) {
@@ -250,6 +273,16 @@ struct Cfg { const char* name; int dim; int inter; int slots; float limit; };
 const Cfg kCases[] = {
     {"min-shape    dim=128  inter=64   slots=1 limit=0",    128,   64, 1,  0.f},
     {"slots8+clamp dim=128  inter=64   slots=8 limit=10",   128,   64, 8, 10.f},
+    // Ring-wrap bisect. ngrp = (dim/64)/kNStep = dim/64 iterations, and the ring
+    // is kRing = 8 deep, so:
+    //   dim 128 -> ngrp 2   prologue covers all of K, the REFILL path never runs
+    //   dim 256 -> ngrp 4   still no wrap (the last pre-fix suspect)
+    //   dim 576 -> ngrp 9   one iteration PAST kRing: the refill path runs once
+    // Measured 2026-09-12 on B300: 128 PASS (bit-exact), 256 PASS, 576 FAULT
+    // (misaligned address) -> the fault lives in the ring REFILL, not in the SF
+    // prologue / MMA / epilogue (which are byte-identical code in all of them).
+    {"no-wrap      dim=256  inter=64   slots=1 limit=0",    256,   64, 1,  0.f},
+    {"ring-wrap    dim=576  inter=64   slots=1 limit=0",    576,   64, 1,  0.f},
     {"odd-ring     dim=640  inter=128  slots=1 limit=10",   640,  128, 1, 10.f},
     {"prod-dim     dim=5120 inter=256  slots=8 limit=10",  5120,  256, 8, 10.f},
     {"prod-shape   dim=5120 inter=2048 slots=8 limit=10",  5120, 2048, 8, 10.f},
@@ -277,14 +310,14 @@ int run_case(const Cfg& cfg, int graph_mode) {
     int* dids = nullptr;
     const size_t wb = c.w.size(), wsb = c.ws.size();
     cudaMalloc(&dw, wb); cudaMalloc(&dws, wsb);
-    cudaMalloc(&da, c.act.size()); cudaMalloc(&das, c.acts.size());
+    cudaMalloc(&da, c.act.size()); cudaMalloc(&das, c.actf.size() * sizeof(float));
     cudaMalloc(&dout_tc, (size_t)cfg.slots * rows * 4);
     cudaMalloc(&dout_gv, (size_t)cfg.slots * rows * 4);
     cudaMalloc(&dids, sizeof(int));
     cudaMemcpy(dw, c.w.data(), wb, cudaMemcpyHostToDevice);
     cudaMemcpy(dws, c.ws.data(), wsb, cudaMemcpyHostToDevice);
     cudaMemcpy(da, c.act.data(), c.act.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(das, c.acts.data(), c.acts.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(das, c.actf.data(), c.actf.size() * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemset(dids, 0, sizeof(int));
 
     std::vector<float> vpoison((size_t)cfg.slots * rows, kPoison);
@@ -292,32 +325,55 @@ int run_case(const Cfg& cfg, int graph_mode) {
     cudaMemcpy(dout_tc, vpoison.data(), vpoison.size() * 4, cudaMemcpyHostToDevice);
     cudaMemcpy(dout_gv, vpoison.data(), vpoison.size() * 4, cudaMemcpyHostToDevice);
 
-    // ---- ARM 1: the tcgen05 kernel, through the EXACT entry serve would call.
-    // rc == 0 means either "ran" or "gate off / shape rejected" — the sentinel
-    // check below is what separates them.
-    const int rc_tc = dsv41_expert_tcgen05_gate_up_mxf4(
-        dw, dws, da, das, dout_tc, (long)(2 * cfg.inter), cfg.inter, cfg.dim, cfg.limit,
-        cfg.slots, 0);
-    cudaError_t e_tc = cudaDeviceSynchronize();
+    // A device-side fault (misaligned address / illegal instruction) POISONS the
+    // CUDA context: every later launch returns the sticky error. That is how a
+    // single kernel bug used to look like "all remaining cases failed in BOTH
+    // arms" — so (a) the reference arm runs FIRST, and (b) a faulting case frees
+    // its allocations and calls cudaDeviceReset() so the NEXT case starts on a
+    // clean context. One fault, one attributed FAIL, no cascade.
+    auto fail_arm = [&](const char* arm, int rc, cudaError_t e) -> int {
+        printf("  [%s] FAIL: %s arm rc=%d err=%s%s\n", cfg.name, arm, rc, cudaGetErrorString(e),
+               (strcmp(arm, "reference") == 0)
+                   ? " (reference arm — the harness's own call; check the shape/pointers)"
+                   : " (the reference arm ran CLEAN on this context, so this fault is the "
+                     "tcgen05 kernel's)");
+        (void)cudaGetLastError();
+        cudaFree(dw); cudaFree(dws); cudaFree(da); cudaFree(das);
+        cudaFree(dout_tc); cudaFree(dout_gv); cudaFree(dids);
+        cudaDeviceReset();   // see the note above: this does NOT always revive the
+                             // device — the caller marks the context dead and the
+                             // driver/script re-runs the remaining cases with --case N
+        return 2;            // 2 = DEVICE FAULT (not a numerics failure)
+    };
 
-    // ---- ARM 2: the proven SIMT GEMV, same nibbles, same e8m0 weight scales,
-    // w1 = pool rows [0, inter), w3 = pool rows [inter, 2*inter).
-    const int zero_id = 0;
-    (void)zero_id;
+    // ---- ARM 1: the proven SIMT GEMV. Same packed nibbles, same e8m0 weight
+    // scales, w1 = pool rows [0, inter), w3 = pool rows [inter, 2*inter).
+    // It runs FIRST on purpose: if the tcgen05 arm faults, the reference must
+    // already have its clean result on record.
     const int rc_gv = dsv41_expert_gate_up_fp4_batched(
         da, c.actf.data(), dout_gv, (long)(2 * cfg.inter), 1, cfg.dim, cfg.inter, cfg.limit,
         cfg.slots, dw, 0, dws, 0, dw + (size_t)cfg.inter * (cfg.dim / 2), 0,
         dws + (size_t)cfg.inter * (cfg.dim / 32), 0, dids, /*ilv=*/0, 0);
-    cudaError_t e_gv = cudaDeviceSynchronize();
+    const cudaError_t e_gv = cudaDeviceSynchronize();
+    if (rc_gv != 0 || e_gv != cudaSuccess) return fail_arm("reference", rc_gv, e_gv);
+
+    // ---- ARM 2: the tcgen05 kernel, through the EXACT entry serve would call.
+    // rc == 0 means either "ran" or "gate off / shape rejected" — the sentinel
+    // check below is what separates those two.
+    const int rc_tc = m4_gateup_entry(
+        da, reinterpret_cast<const float*>(das), dout_tc, (long)(2 * cfg.inter), cfg.inter,
+        cfg.dim, cfg.limit, cfg.slots,
+        // ABI 2026-09-12: four pool bases (+ per-expert strides), ids == nullptr
+        // means "the bases ARE the direct pointers". gate pool = rows [0, inter),
+        // up pool = rows [inter, 2*inter) of the one [2*inter, dim/2] buffer.
+        dw, 0, dws, 0, dw + (size_t)cfg.inter * (cfg.dim / 2), 0,
+        dws + (size_t)cfg.inter * (cfg.dim / 32), 0, nullptr, 0);
+    const cudaError_t e_tc = cudaDeviceSynchronize();
+    if (rc_tc != 0 || e_tc != cudaSuccess) return fail_arm("tcgen05", rc_tc, e_tc);
 
     cudaMemcpy(tc.data(), dout_tc, tc.size() * 4, cudaMemcpyDeviceToHost);
     cudaMemcpy(gv.data(), dout_gv, gv.size() * 4, cudaMemcpyDeviceToHost);
 
-    int fails = 0;
-    if (rc_tc != 0 || e_tc != cudaSuccess) {
-        printf("  [%s] FAIL: tcgen05 rc=%d err=%s\n", cfg.name, rc_tc, cudaGetErrorString(e_tc));
-        ++fails;
-    }
     // Gate actually fired? (the launcher's silent no-op path)
     size_t poison_left = 0;
     for (size_t i = 0; i < tc.size(); ++i) if (same_bits(tc[i], kPoison)) ++poison_left;
@@ -325,11 +381,9 @@ int run_case(const Cfg& cfg, int graph_mode) {
         printf("  [%s] FAIL: tcgen05 did not write %zu/%zu outputs — the env gate is OFF or the "
                "launcher rejected the shape (set DSV41_EXPERT_TCGEN05_MXF4=1 / check the "
                "dim %% 128 contract)\n", cfg.name, poison_left, tc.size());
-        ++fails;
-    }
-    if (rc_gv != 0 || e_gv != cudaSuccess) {
-        printf("  [%s] FAIL: gemv ref rc=%d err=%s\n", cfg.name, rc_gv, cudaGetErrorString(e_gv));
-        ++fails;
+        cudaFree(dw); cudaFree(dws); cudaFree(da); cudaFree(das);
+        cudaFree(dout_tc); cudaFree(dout_gv); cudaFree(dids);
+        return 1;
     }
 
     // slot uniformity: direct pool (no ids) => every grid.y slot bit-identical.
@@ -343,24 +397,30 @@ int run_case(const Cfg& cfg, int graph_mode) {
     std::vector<float> tc0(tc.begin(), tc.begin() + rows);
     std::vector<float> gv0(gv.begin(), gv.begin() + rows);
     const Diff d_q = cmp(tc0, gq0);       // vs quantised golden   (bar 1e-4)
-    const Diff d_f = cmp(tc0, gr0);       // vs unquantised golden (bar 5e-2)
+    const Diff d_f = cmp(tc0, gr0);       // vs unquantised golden (relative bar)
     const Diff d_g = cmp(tc0, gv0);       // vs the SIMT path      (bar 1e-3)
-    // and the same three for the reference arm, so a failure can be localised.
+    // and the same for the reference arm, so a failure localises.
     const Diff r_q = cmp(gv0, gq0);
     const Diff r_f = cmp(gv0, gr0);
+    const Diff bit = cmp_exact(tc0, gv0);
+    // The GOLDEN_F32 comparison measures a DIFFERENT thing: how far the fp4
+    // activation quantisation moves the answer. Under the sign-cancellation of a
+    // random dot product that is data-dependent (1e-2 ... 1e-1 here) and is NOT
+    // the kernel's error, so the bar is RELATIVE: the tcgen05 arm must be as
+    // close to the unquantised golden as the proven arm is (with a 5e-2 floor
+    // for the lucky case where the proven arm happens to land on zero noise).
+    const double f32_bar = std::max(2.0 * r_f.rel_l2, 5e-2);
 
-    const bool ok = d_q.rel_l2 < 1e-4 && d_g.rel_l2 < 1e-3 && d_f.rel_l2 < 5e-2 &&
-                    poison_left == 0 && rc_tc == 0 && rc_gv == 0 && slot_bad == 0;
+    int fails = 0;
+    const bool ok = d_q.rel_l2 < 1e-4 && d_g.rel_l2 < 1e-3 && d_f.rel_l2 <= f32_bar &&
+                    poison_left == 0 && slot_bad == 0;
     printf("  [%s]\n", cfg.name);
-    printf("      rc=%d/%d err=%s   tc-vs-GOLDEN_Q relL2=%.2e (bar 1e-4)   "
-           "tc-vs-GEMV relL2=%.2e (bar 1e-3)   tc-vs-GOLDEN_F32 relL2=%.2e (bar 5e-2)\n",
-           rc_tc, rc_gv, cudaGetErrorString(e_tc), d_q.rel_l2, d_g.rel_l2, d_f.rel_l2);
-    printf("      maxrel: q=%.2e gemv=%.2e f32=%.2e   maxabs f32=%.3e   "
-           "gemv-vs-GOLDEN_Q relL2=%.2e  slot-mismatch=%d  %s\n",
-           d_q.max_rel, d_g.max_rel, d_f.max_rel, d_f.max_abs, r_q.rel_l2, slot_bad,
-           ok ? "PASS" : "FAIL");
-    if (r_f.rel_l2 > 1.0) printf("      (reference arm deviates from GOLDEN_F32 by %.2e — that is "
-                                 "the fp4 quantisation floor, not a bug)\n", r_f.rel_l2);
+    printf("      tc-vs-GOLDEN_Q relL2=%.2e (<=1e-4)   tc-vs-GEMV relL2=%.2e (<=1e-3, bitdiff=%zu/%d)"
+           "   tc-vs-GOLDEN_F32 relL2=%.2e (<=%.2e)\n",
+           d_q.rel_l2, d_g.rel_l2, bit.nbit, rows, d_f.rel_l2, f32_bar);
+    printf("      reference arm: GEMV-vs-GOLDEN_Q relL2=%.2e  GEMV-vs-GOLDEN_F32 relL2=%.2e "
+           "(the fp4 quantisation floor)   maxabs(tc vs GOLDEN_F32)=%.3e   slot-mismatch=%d   %s\n",
+           r_q.rel_l2, r_f.rel_l2, d_f.max_abs, slot_bad, ok ? "PASS" : "FAIL");
     if (!ok) ++fails;
 
     if (graph_mode == 1 && fails == 0) {
@@ -371,9 +431,11 @@ int run_case(const Cfg& cfg, int graph_mode) {
         std::vector<float> vp2 = vpoison;
         cudaMemcpy(dout_tc, vp2.data(), vp2.size() * 4, cudaMemcpyHostToDevice);
         cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal);
-        const int rc_cap = dsv41_expert_tcgen05_gate_up_mxf4(
-            dw, dws, da, das, dout_tc, (long)(2 * cfg.inter), cfg.inter, cfg.dim, cfg.limit,
-            cfg.slots, s);
+        const int rc_cap = m4_gateup_entry(
+            da, reinterpret_cast<const float*>(das), dout_tc, (long)(2 * cfg.inter), cfg.inter,
+            cfg.dim, cfg.limit, cfg.slots, dw, 0, dws, 0,
+            dw + (size_t)cfg.inter * (cfg.dim / 2), 0,
+            dws + (size_t)cfg.inter * (cfg.dim / 32), 0, nullptr, s);
         cudaGraph_t graph = nullptr;
         const cudaError_t e_end = cudaStreamEndCapture(s, &graph);
         cudaGraphExec_t inst = nullptr;
@@ -407,16 +469,18 @@ int run_gate_off() {
     uint8_t *dw = nullptr, *dws = nullptr, *da = nullptr, *das = nullptr;
     float* dout = nullptr;
     cudaMalloc(&dw, c.w.size()); cudaMalloc(&dws, c.ws.size());
-    cudaMalloc(&da, c.act.size()); cudaMalloc(&das, c.acts.size());
+    cudaMalloc(&da, c.act.size()); cudaMalloc(&das, c.actf.size() * sizeof(float));
     cudaMalloc(&dout, (size_t)rows * 4);
     cudaMemcpy(dw, c.w.data(), c.w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dws, c.ws.data(), c.ws.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(da, c.act.data(), c.act.size(), cudaMemcpyHostToDevice);
-    cudaMemcpy(das, c.acts.data(), c.acts.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(das, c.actf.data(), c.actf.size() * sizeof(float), cudaMemcpyHostToDevice);
     std::vector<float> vp((size_t)rows, kPoison), got((size_t)rows);
     cudaMemcpy(dout, vp.data(), vp.size() * 4, cudaMemcpyHostToDevice);
-    const int rc = dsv41_expert_tcgen05_gate_up_mxf4(dw, dws, da, das, dout, rows, inter, dim,
-                                                    0.f, 1, 0);
+    const int rc = m4_gateup_entry(da, reinterpret_cast<const float*>(das), dout, rows, inter,
+                                   dim, 0.f, 1, dw, 0, dws, 0,
+                                   dw + (size_t)inter * (dim / 2), 0,
+                                   dws + (size_t)inter * (dim / 32), 0, nullptr, 0);
     const cudaError_t e = cudaDeviceSynchronize();
     cudaMemcpy(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost);
     size_t intact = 0;
@@ -432,13 +496,27 @@ int run_gate_off() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    int graph_mode = 0;
+    int graph_mode = 0, only_case = -1;
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (strcmp(a, "--gate-off") == 0) return run_gate_off();  // MUST NOT set the gate below
         if (strcmp(a, "--graph") == 0) graph_mode = 1;
+        else if (strcmp(a, "--case") == 0 || strncmp(a, "--case=", 7) == 0) {
+            // Isolate one case in a FRESH context: the way to tell a real fault
+            // from a cascade when a kernel bug poisons the context mid-suite.
+            only_case = (a[6] == '=') ? atoi(a + 7) : (i + 1 < argc ? atoi(argv[++i]) : -1);
+            if (only_case < 0 || only_case >= (int)(sizeof(kCases) / sizeof(kCases[0]))) {
+                printf("--case wants 0..%zu\n", sizeof(kCases) / sizeof(kCases[0]) - 1);
+                return 2;
+            }
+        }
         else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
-            printf("usage: %s [--graph] | --gate-off\n", argv[0]);
+            // `cases=N` is machine-readable: the driver parses it to drive the
+            // per-case isolation pass. Keep the token stable.
+            printf("usage: %s [--graph] [--case N] | --gate-off\ncases=%zu\n",
+                   argv[0], sizeof(kCases) / sizeof(kCases[0]));
+            for (size_t i = 0; i < sizeof(kCases) / sizeof(kCases[0]); ++i)
+                printf("   --case %zu  %s\n", i, kCases[i].name);
             return 0;
         }
         else { printf("unknown arg: %s (try --help)\n", a); return 2; }
@@ -462,7 +540,27 @@ int main(int argc, char** argv) {
     printf("   gate: DSV41_EXPERT_TCGEN05_MXF4=1  reference: DSV41_GATEUP_FUSE=0 (unfused)\n");
 
     int fails = 0;
-    for (const Cfg& cfg : kCases) fails += run_case(cfg, graph_mode);
+    bool ctx_dead = false;
+    const size_t ncases = sizeof(kCases) / sizeof(kCases[0]);
+    const size_t begin = (only_case >= 0) ? (size_t)only_case : 0;
+    const size_t end = (only_case >= 0) ? (size_t)only_case + 1 : ncases;
+    for (size_t i = begin; i < end; ++i) {
+        // A device-side fault leaves the CUDA context unusable for THIS process
+        // (cudaDeviceReset does not always revive it — measured as rc=46
+        // cudaErrorDevicesUnavailable on the very next cudaMalloc). Reporting the
+        // remaining cases from a dead context would invent failures, so they are
+        // SKIPPED by name and the driver re-runs them with --case N (one process
+        // per case = the only reliable attribution).
+        if (ctx_dead) {
+            printf("  [%s] SKIPPED — the CUDA context died with an earlier fault; "
+                   "run: --case %zu\n", kCases[i].name, i);
+            ++fails;
+            continue;
+        }
+        const int r = run_case(kCases[i], graph_mode);
+        if (r == 2) ctx_dead = true;
+        if (r != 0) ++fails;
+    }
 
     printf(fails ? "RESULT: %d case(s) FAILED\n" : "RESULT: all cases PASS\n", fails);
     return fails ? 1 : 0;

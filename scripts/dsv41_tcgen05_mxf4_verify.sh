@@ -115,6 +115,14 @@ if [ -z "$NODE" ] && [ "$have_local_nvcc" = "0" ]; then
 fi
 sync_src || { echo "FATAL: could not push the sources to $NODE"; exit 1; }
 
+build_harness() {
+    local o rc
+    o="$(run "nvcc -gencode arch=compute_${ARCH},code=sm_${ARCH} -O2 -std=c++17 \
+-DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1 -o /tmp/t_mxf4_gateup $HARNESS" 2>&1)"; rc=$?
+    [ "$rc" = 0 ] || printf '%s\n' "$o" | grep -m8 'error' | sed 's/^/    /'
+    return $rc
+}
+
 want() { [ -z "$STEP" ] || [ "$STEP" = "$1" ]; }
 
 # =============================================================================
@@ -142,11 +150,30 @@ spills="$(printf '%s\n' "$kstats" | grep -A2 'gateup_mxf4_kernel' | grep -oE '[0
 # The whole point of the arm is the MMA spelling: if ptxas accepted a different
 # kind/scale_vec, the numbers would still be checked by step 3 but the DESIGN
 # (2X SF pairing, 128-K pairing contract) would not be the one documented.
-sass_cnt="$(run "cuobjdump -sass /tmp/mxf4.o 2>/dev/null | grep -c 'tcgen05.mma'" 2>/dev/null)"
-mxf4_cnt="$(run "cuobjdump -sass /tmp/mxf4.o 2>/dev/null | grep -c 'tcgen05.mma.*block_scale'" 2>/dev/null)"
-echo "    sass: tcgen05.mma x$sass_cnt (block_scale x$mxf4_cnt)"
-[ "${sass_cnt:-0}" -gt 0 ] && ok "tcgen05.mma is present in SASS" \
-                           || warn "no tcgen05.mma in SASS — check cuobjdump/arch mismatch"
+# cuobjdump is NOT on PATH on the B300 node even though nvcc is (found the hard
+# way) — derive it from nvcc's own directory.
+CUDUMP="$(dirname "$(command -v nvcc)")/cuobjdump"
+[ -x "$CUDUMP" ] || CUDUMP="$(command -v cuobjdump || true)"
+if [ -n "$CUDUMP" ] && [ -x "$CUDUMP" ]; then
+    sass_json="$(run "$CUDUMP -sass /tmp/mxf4.o 2>&1")"
+    sass_cnt="$(printf '%s\n' "$sass_json" | grep -c 'tcgen05.mma')"
+    mxf4_cnt="$(printf '%s\n' "$sass_json" | grep -c 'tcgen05.mma[^ ]*mxf4')"
+    echo "    sass ($CUDUMP): tcgen05.mma x$sass_cnt, kind::mxf4 x$mxf4_cnt"
+    [ "${sass_cnt:-0}" -gt 0 ] && ok "tcgen05.mma present in SASS" \
+                               || warn "no tcgen05.mma in SASS — cuobjdump found nothing to read"
+else
+    warn "cuobjdump not found on the target — SASS spelling not checked"
+fi
+
+# The SYMBOL NAME is what the Rust probe looks for (device.rs:3438 -> dlsym of
+# the unmangled name). The mxf4 entry is declared INSIDE `namespace tc5::mxf4`
+# (dsv41_experts_mxf4.cu:4007): extern "C" fixes the linkage, so the symbol MUST
+# still be the unmangled one. Checked here, in the .o, before any .so exists.
+if run "nm /tmp/mxf4.o 2>/dev/null | grep -q ' T dsv41_expert_tcgen05_gate_up_mxf4'"; then
+    ok "extern \"C\" symbol exported unmangled from the tc5::mxf4 block"
+else
+    bad "symbol dsv41_expert_tcgen05_gate_up_mxf4 not found in the object — check its linkage"
+fi
 
 # Regression guard: the SAME TU without the macro must still compile (the stock
 # .so is the fallback every A/B arm compares against).
@@ -157,10 +184,11 @@ out2="$(run "nvcc -gencode arch=compute_${ARCH},code=sm_${ARCH} -O3 --use_fast_m
 
 # Step 3's artifact is compiled here (still no GPU needed): a compile failure of
 # the harness must be visible in step 1, not 20 minutes into step 3.
-out3="$(run "nvcc -gencode arch=compute_${ARCH},code=sm_${ARCH} -O2 -std=c++17 \
--DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1 -o /tmp/t_mxf4_gateup $HARNESS" 2>&1)"; rc3=$?
-[ "$rc3" = 0 ] && ok "GPU parity harness compiles (/tmp/t_mxf4_gateup)" \
-               || { bad "harness does not compile (rc=$rc3)"; printf '%s\n' "$out3" | grep -m8 'error' | sed 's/^/    /'; }
+if build_harness; then
+    ok "GPU parity harness compiles (/tmp/t_mxf4_gateup)"
+else
+    bad "harness does not compile"
+fi
 fi
 
 # =============================================================================
@@ -224,11 +252,37 @@ else
     echo "  GPU ${GPU} (memory.used=${used:-?} MiB)"
     [ "${used:-0}" -gt 2048 ] && warn "GPU $GPU is not idle (${used} MiB used) — another tenant is on it"
 
+    # freshness guard: this step RUNS /tmp/t_mxf4_gateup, so it must also BUILD
+    # it — a stale binary here would report the previous revision's numbers
+    # (that mistake cost one debugging round already).
+    if ! build_harness; then
+        bad "harness does not compile — NOT running a stale binary"
+    else
     out="$(run "CUDA_VISIBLE_DEVICES=$GPU /tmp/t_mxf4_gateup" 2>&1)"; rc=$?
     printf '%s\n' "$out" | sed 's/^/    /'
     printf '%s\n' "$out" | grep -q 'RESULT: all cases PASS' \
-        && ok "parity suite: all 5 cases PASS (bars: GOLDEN_Q 1e-4 / GEMV 1e-3 / GOLDEN_F32 5e-2, relL2)" \
+        && ok "parity suite: all 5 cases PASS (bars: GOLDEN_Q 1e-4 / GEMV 1e-3 / GOLDEN_F32 relative, relL2)" \
         || bad "parity suite FAILED (rc=$rc) — see the per-case lines above"
+
+    # Isolation pass: a device-side fault (misaligned address etc.) poisons the
+    # CUDA context for the WHOLE process, so every later case in the same run
+    # reports a bogus rc=46. One process per case is the only reliable
+    # attribution — and it is the pass that tells the next session WHICH shapes
+    # are broken. Always run it (a few seconds), only when the suite did not pass.
+    if ! printf '%s\n' "$out" | grep -q 'RESULT: all cases PASS'; then
+        ncases="$(run "/tmp/t_mxf4_gateup --help" 2>/dev/null | grep -oE 'cases=[0-9]+' | cut -d= -f2)"
+        echo "  per-case isolation (fresh process each; a fault in one case cannot mask another):"
+        for ((i = 0; i < ncases; i++)); do
+            o="$(run "CUDA_VISIBLE_DEVICES=$GPU /tmp/t_mxf4_gateup --case $i" 2>&1)"
+            fl="$(printf '%s\n' "$o" | grep -m1 'FAIL:')"
+            nm="$(printf '%s\n' "$o" | tail -n +2 | sed -n '1p' | sed 's/^ *//')"
+            if [ -n "$fl" ]; then
+                printf '    --case %d  %s\n' "$i" "$(printf '%s' "$fl" | sed 's/^ *//')"
+            else
+                printf '    --case %d  PASS  (%s)\n' "$i" "$(printf '%s' "$nm" | cut -c1-60)"
+            fi
+        done
+    fi
 
     out="$(run "CUDA_VISIBLE_DEVICES=$GPU /tmp/t_mxf4_gateup --gate-off" 2>&1)"
     printf '%s\n' "$out" | sed 's/^/    /'
@@ -241,6 +295,7 @@ else
     printf '%s\n' "$out" | grep -q 'REPLAY-EXACT' \
         && ok "CUDA-graph capture + replay is bit-identical (serve captures the step)" \
         || warn "graph replay not bit-identical / not capturable — check before any serve A/B"
+fi
 fi
 fi
 

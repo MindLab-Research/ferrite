@@ -3707,20 +3707,38 @@ __device__ __forceinline__ void m4_mbar_expect_tx(uint64_t* bar, unsigned bytes)
 //   dim % kPackK == 0    (the ring never stages a partial K atom)
 //   dim % 128 == 0       (2X pairing: a 32-bit SF word never straddles a row end)
 //   dim <= kMaxDim       (sizes the SF staging chunk)
-//   dim % 2 == 0 and act/act_scale 16-byte aligned (16-byte bulk-copy contract)
+//   dim % 2 == 0 and act 16-byte aligned (16-byte bulk-copy contract)
+//   rows == 2 * split and split % 32 == 0  (see GAP 1 below)
 //   (2*inter) % kMTile == 0    -> 30 tiles at the production shape
-//   w / w_scale rows are per-(row, k/32); act_scale is per-(k/32) e8m0.
+//   w1/w3 (+ their scales) rows are per-(row, k/32); act_scale is per-(k/32)
+//   f32 (GAP 2: the quantiser emits f32 2^n, the kernel converts to e8m0).
 // -----------------------------------------------------------------------------
 __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
-    const uint8_t* __restrict__ w,          // [2*inter, dim/2] fp4 e2m1, 2/byte
-    const uint8_t* __restrict__ w_scale,    // [2*inter, dim/32] e8m0
     const uint8_t* __restrict__ act,        // [dim/2] fp4 e2m1, the ONE token
-    const uint8_t* __restrict__ act_scale,  // [dim/32] e8m0
+    const float* __restrict__ act_scale,    // [dim/32] f32 power-of-two scales
     float* __restrict__ out,                // [slots][2*inter] (out_slot_stride apart)
     long out_slot_stride,
     int dim, int epi_mode, float limit, int split,
-    const uint8_t* __restrict__ w_base, long w_stride,
-    const uint8_t* __restrict__ ws_base, long ws_stride,
+    // ---- GAP 1: TWO weight pools, not one ------------------------------------
+    // The loader keeps w1 (gate) and w3 (up) in SEPARATE contiguous planes
+    // (`load.rs:644`: [w1][w1.scale][w3][w3.scale][w2][w2.scale]). `split` is
+    // the row boundary between them, NOT the row count of either pool: output
+    // row `r < split` is gate pool row `r`, output row `r >= split` is up pool
+    // row `r - split`. This is exactly `mxf4_gemm_kernel:626-632` (`b`/`b_hi` +
+    // `b_split`), the production-verified form of the same split. Feeding the
+    // single-pool form `w1_base` alone reads `w1.scale` as gate weights for
+    // every row >= split: silent wrong values, never a fault.
+    // Scales are [rows, dim/32] e8m0 and follow the same row split.
+    const uint8_t* __restrict__ w1_base, long w1_stride,
+    const uint8_t* __restrict__ w1s_base, long w1s_stride,
+    const uint8_t* __restrict__ w3_base, long w3_stride,
+    const uint8_t* __restrict__ w3s_base, long w3s_stride,
+    // ---- GAP 3: per-slot expert indirection ----------------------------------
+    // ids != nullptr: each grid.y slot derives its OWN four pool pointers from
+    // `base + ids[slot] * stride`, so the routing never reaches the host and
+    // the launch arguments stay independent of the routing (CUDA-graph safe).
+    // ids == nullptr: the four bases ARE the direct pointers (one expert, every
+    // slot the same answer) -- the parity-harness form.
     const int* __restrict__ ids) {
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -3728,12 +3746,16 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
     const int slot = (int)blockIdx.y;
 
     // ---- expert / row-block resolution (pure argument arithmetic) -------------
-    const uint8_t* wp = w;
-    const uint8_t* wsp = w_scale;
+    const uint8_t* w1p = w1_base;
+    const uint8_t* w1sp = w1s_base;
+    const uint8_t* w3p = w3_base;
+    const uint8_t* w3sp = w3s_base;
     if (ids != nullptr) {
         const size_t e = (size_t)ids[slot];
-        wp = w_base + e * (size_t)w_stride;
-        wsp = ws_base + e * (size_t)ws_stride;
+        w1p = w1_base + e * (size_t)w1_stride;
+        w1sp = w1s_base + e * (size_t)w1s_stride;
+        w3p = w3_base + e * (size_t)w3_stride;
+        w3sp = w3s_base + e * (size_t)w3s_stride;
     }
     const int m0 = (int)blockIdx.x * kMTile;  // first weight row of this CTA
     const int kbytes = dim >> 1;              // packed weight bytes per row
@@ -3779,7 +3801,16 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
         const int sslot = g % kRing;
         const size_t kb0 = (size_t)g * (kKStep / 2);  // packed byte offset of the atom
         if (tid < kMTile) {
-            const uint8_t* src = wp + (size_t)(m0 + tid) * kbytes + kb0;
+            // GAP 1: per ROW, not per CTA. `rows % 128 == 0` only pins the split
+            // to a multiple of 64, so a 128-row tile may straddle the two pools
+            // (the production shape does not, but the kernel must not depend on
+            // that). Row `r < split` is gate pool row `r`; `r >= split` is up
+            // pool row `r - split`.
+            const int row = m0 + tid;
+            const uint8_t* wrow = (row < split)
+                                      ? (w1p + (size_t)row * kbytes)
+                                      : (w3p + (size_t)(row - split) * kbytes);
+            const uint8_t* src = wrow + kb0;
 #pragma unroll
             for (int st = 0; st < kNStep; ++st) {
                 uint8_t* dst = s.a_op[sslot][st];
@@ -3832,7 +3863,13 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
     // into sf_stage, and the 4-blocks-per-word assembly happens out of smem.
     // =========================================================================
     for (int j = 0; j < 4; ++j) {
-        const uint8_t* src = wsp + (size_t)(m0 + 32 * j) * nsf;
+        // GAP 1: the scales follow the same row split as the weights. A 32-row
+        // group never straddles the pools: `split` is a multiple of 32 (it is
+        // `rows/2` with `rows % 128 == 0`) and m0 is a multiple of 128.
+        const int r0 = m0 + 32 * j;
+        const bool hi = (r0 >= split);
+        const int rr = hi ? (r0 - split) : r0;
+        const uint8_t* src = (hi ? w3sp : w1sp) + (size_t)rr * nsf;
         for (int i = tid; i < 2 * nsf; i += kThreads)  // nsf % 4 == 0 by contract
             reinterpret_cast<uint4*>(s.sf_stage)[i] = reinterpret_cast<const uint4*>(src)[i];
         __syncthreads();  // the chunk is read by every warp below
@@ -3853,7 +3890,20 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
     // exactly 0. Never write 0xFF (NaN): NaN * 0 is NaN and would poison the
     // whole D column.
     for (int w = 0; w < nwords; ++w) {
-        const uint32_t word = (lane == 0) ? *reinterpret_cast<const uint32_t*>(act_scale + 4 * w) : 0u;
+        // GAP 2: `dsv41_quant_fp4` emits f32 powers of two; the SF word wants
+        // e8m0 BYTES. Converting here (instead of demanding an e8m0 activation
+        // scale producer) leaves the quantiser's ABI and the whole old SIMT path
+        // untouched. Lossless by construction: a fast_round_scale output IS 2^n,
+        // so `f_pow2_to_ue8m0` (:132) is an exact exponent copy, and the four
+        // bytes are packed exactly as the weight path packs its checkpoint bytes
+        // ([b0, b1, b2, b3] of the atom pair's four 32-K blocks).
+        uint32_t word = 0u;
+        if (lane == 0) {
+            const float* s4 = act_scale + 4 * w;
+            word = (uint32_t)f_pow2_to_ue8m0(s4[0]) | ((uint32_t)f_pow2_to_ue8m0(s4[1]) << 8) |
+                   ((uint32_t)f_pow2_to_ue8m0(s4[2]) << 16) |
+                   ((uint32_t)f_pow2_to_ue8m0(s4[3]) << 24);
+        }
         m4_st_x1(((uint32_t)(warp * 32) << 16) | (sfb_col + w), word);
     }
     tc_wait_st();
@@ -3970,10 +4020,11 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
 // =============================================================================
 // LAUNCHER
 // =============================================================================
-// [Phase 2 territory] Phase 1 shape: direct pointers, one launch, default OFF
-// behind an env gate read ONCE per process (a per-call getenv() is a capture
-// hazard, plan §5 -- the value must not change between capture and replay, and
-// the Rust side flips it with a process-level env var anyway).
+// [Phase 2 territory] Phase 1 shape: the four pool bases (+ per-expert strides)
+// and the per-slot `ids`, one launch, default OFF behind an env gate read ONCE
+// per process (a per-call getenv() is a capture hazard, plan §5 -- the value
+// must not change between capture and replay, and the Rust side flips it with a
+// process-level env var anyway).
 //
 // [K-SPLIT TODO] The OCCUPANCY note in the mxf8f6f4 block applies verbatim:
 // grid = (30, slots) at slots=8 with <= 2 CTAs/SM still has to put enough bytes
@@ -3983,41 +4034,70 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_mxf4_kernel(
 // associative; the order IS the contract). The kernel needs no ring change --
 // only the atom range and the partial write.
 // =============================================================================
-inline cudaError_t m4_launch_gateup(const uint8_t* w, const uint8_t* w_scale,
-                                    const uint8_t* act, const uint8_t* act_scale, float* out,
+inline cudaError_t m4_launch_gateup(const uint8_t* act, const float* act_scale, float* out,
                                     long out_slot_stride, int rows, int dim, int slots,
-                                    float limit, int epi_mode, int split, cudaStream_t stream) {
+                                    float limit, int epi_mode, int split,
+                                    const uint8_t* w1_base, long w1_stride,
+                                    const uint8_t* w1s_base, long w1s_stride,
+                                    const uint8_t* w3_base, long w3_stride,
+                                    const uint8_t* w3s_base, long w3s_stride,
+                                    const int* ids, cudaStream_t stream) {
     if (dim <= 0 || rows <= 0 || slots <= 0) return cudaErrorInvalidValue;
     // dim % 128 == 0 IS the 2X pairing contract (a 32-bit SF word spans 4 blocks
     // = 128 K elements); dim % kPackK == 0 keeps the ring on atom boundaries.
     if (dim % kPackK != 0 || dim % 128 != 0 || dim > kMaxDim) return cudaErrorInvalidValue;
     if (rows % kMTile != 0) return cudaErrorInvalidValue;
+    // GAP 1 contract: `split` is the row count of EACH pool, so `rows == 2*split`
+    // is what makes the epilogue's clamp boundary and the weight row indexing
+    // agree. `split % 32 == 0` is what keeps one 32-row SF group inside a single
+    // pool (the SF prologue stages 32 rows at a time).
+    if (split <= 0 || 2 * split != rows || split % 32 != 0) return cudaErrorInvalidValue;
+    // 16-BYTE ALIGNMENT IS A HARD CONTRACT on both sides of every bulk copy: a
+    // misaligned copy does not fault, it silently misplaces bytes. Every base
+    // and every per-expert stride must be a multiple of 16 -- including w3,
+    // which the dual-pointer split now feeds through the same TMA. Reject here
+    // instead of producing silently wrong weights.
+    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
+    const auto str16 = [](long s) { return s == 0 || (s & 0xF) == 0; };
+    if (!al16(w1_base) || !al16(w1s_base) || !al16(w3_base) || !al16(w3s_base) ||
+        !str16(w1_stride) || !str16(w1s_stride) || !str16(w3_stride) || !str16(w3s_stride))
+        return cudaErrorInvalidValue;
     const dim3 grid((unsigned)(rows / kMTile), (unsigned)slots, 1u);
     return dsv41_experts_pdl_or_plain(expert_tcgen05_gateup_mxf4_kernel, grid, dim3(kThreads), 0,
-                                      stream, w, w_scale, act, act_scale, out, out_slot_stride,
-                                      dim, epi_mode, limit, split, (const uint8_t*)nullptr, 0L,
-                                      (const uint8_t*)nullptr, 0L, (const int*)nullptr);
+                                      stream, act, act_scale, out, out_slot_stride, dim, epi_mode,
+                                      limit, split, w1_base, w1_stride, w1s_base, w1s_stride,
+                                      w3_base, w3_stride, w3s_base, w3s_stride, ids);
 }
 
 // gate/up, one dispatch per (layer, top-k slot) batch: `act` is the ONE shared
-// quantised activation row (packed e2m1, [dim/2]), `out` holds `slots`
-// consecutive [2*inter] blocks. Returns 0 (and does nothing) while disabled, so
-// the caller can call it unconditionally and keep the proven GEMV path as the
-// fallback.
-extern "C" int dsv41_expert_tcgen05_gate_up_mxf4(const uint8_t* w, const uint8_t* w_scale,
-                                                 const uint8_t* act, const uint8_t* act_scale,
-                                                 float* out, long out_slot_stride, int inter,
-                                                 int dim, float limit, int slots,
-                                                 cudaStream_t stream) {
+// quantised activation row (packed e2m1, [dim/2]), `act_scale` its [dim/32] f32
+// power-of-two scales, `out` holds `slots` consecutive [2*inter] blocks.
+// Returns 0 (and does nothing) while disabled, so the caller can call it
+// unconditionally and keep the proven GEMV path as the fallback.
+//
+// ABI (18 params, 2026-09-12 ABI-gap revision; was 11):
+//   `*_base` + `*_stride` describe the four weight planes the loader actually
+//   uses (`load.rs:644`), and `ids[slot]` selects the expert per grid.y slot.
+//   There is deliberately NO separate "direct pointer" pair any more: ids
+//   == nullptr makes the four bases BE the direct pointers (one expert, every
+//   slot the same answer), which is exactly the parity-harness call, so one
+//   form covers both. `rows` is derived (`2 * inter`) and `epi_mode`/`split`
+//   are fixed (`1`, `inter`), so they are not ABI surface.
+extern "C" int dsv41_expert_tcgen05_gate_up_mxf4(
+    const uint8_t* act, const float* act_scale, float* out, long out_slot_stride, int inter,
+    int dim, float limit, int slots, const uint8_t* w1_base, long w1_stride,
+    const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
+    const uint8_t* w3s_base, long w3s_stride, const int* ids, cudaStream_t stream) {
     static const int enabled = [] {
         const char* e = getenv("DSV41_EXPERT_TCGEN05_MXF4");
         return (e != nullptr && e[0] == '1') ? 1 : 0;  // default OFF until serve A/B
     }();
     if (!enabled) return 0;
     if (inter <= 0 || dim <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
-    const cudaError_t e = m4_launch_gateup(w, w_scale, act, act_scale, out, out_slot_stride,
-                                           2 * inter, dim, slots, limit, /*epi_mode=*/1,
-                                           /*split=*/inter, stream);
+    const cudaError_t e = m4_launch_gateup(act, act_scale, out, out_slot_stride, 2 * inter, dim,
+                                           slots, limit, /*epi_mode=*/1, /*split=*/inter, w1_base,
+                                           w1_stride, w1s_base, w1s_stride, w3_base, w3_stride,
+                                           w3s_base, w3s_stride, ids, stream);
     (void)cudaGetLastError();  // never fail the step: the fallback GEMV is correctness
     return (int)e;
 }

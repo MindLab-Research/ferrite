@@ -227,7 +227,7 @@ DSV4.1 的每层三段（A: hc→attn；**AR#1**；B: hc→moe；**AR#2**；C: h
 
 **中期（persistent / mega-kernel）**：5ms 需**跨层流水 + 激活常驻 smem**——一个 persistent kernel 吃下连续多层，层间激活不落 global；AR#1/#2 作为段边界仍在（跨 rank 无法进核内），用 **PDL 重叠（§4.2）** 或 **侧流（§4.1）** 重叠下一段。段核 = 「phase machine」，40 层 × 3 段 = 120 节点（vs ~700）；hc 族沿 hc_dim 分 tile（T=64 → 320 blocks）。⚠️ P1d 的回归（+3.3ms）已证「多块相位机 + 选举式自同步」在图的约束下会退化——正解是**无同步的角色分解或 PDL**，不是 `cudaLaunchCooperativeKernel`（与图捕获不兼容）。架构级改动，须先有图 + 描述化（Phase 3）打底。
 
-**长期（M>1 batching + prefix cache）**：通往**多并发 1600 tok/s**。延迟受限已证（8→16 seq 只 +7%），故 batching 有 2x 余量。`ferrite-kernel::dcp` 的 `split_pages_round_robin`/`sparse_attn_partial` + kv-page-design（P=128 token/page、链式哈希、DSA latent+index_k 页化、TP8 全复制无协商）是共享 prefix cache 的页基座；`ferrite-batch/scheduler/dispatch` 供调度与 radix 前缀树。叠加：单并发 5ms ≈ 200 tok/s，16 并发共享前缀 → 1600 tok/s。
+**长期（M>1 batching + prefix cache）**：通往**多并发 1600 tok/s**。延迟受限已证（8→16 seq 只 +7%），故 batching 有 2x 余量。`ferrite-kernel::dcp` 的 `split_pages_round_robin`/`sparse_attn_partial` + kv-page-design（P=128 token/page、链式哈希、DSA latent+index_k 页化、TP8 全复制无协商）是共享 prefix cache 的页基座；真正的调度基座是 **`ferrite-dispatch`**（arena/batch/bucket/exec/graph/mtp/radix/state，被 `ferrite-http` 的 driver/engine/host_engine/single_flight 全量依赖）；`ferrite-batch` + `ferrite-scheduler` 目前**只被 `ferrite-exec` 的 CPU `Engine` 使用**（`ferrite-exec/src/lib.rs:16/19`），是 CPU 时代的遗留，统一时应并入 dispatch 或标 legacy。叠加：单并发 5ms ≈ 200 tok/s，16 并发共享前缀 → 1600 tok/s。
 
 ## 7. 里程碑判据
 

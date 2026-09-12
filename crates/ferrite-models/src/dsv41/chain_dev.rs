@@ -311,21 +311,20 @@ pub(crate) fn expert_tcgen05_mxf4() -> bool {
     })
 }
 
-/// One-shot notice for the not-yet-wired mxf4 dispatch. The `.so` reads the gate
-/// itself, so an operator who exports `DSV41_EXPERT_TCGEN05_MXF4=1` believes the
-/// step now runs the tcgen05 gate/up — while `moe()` still issues the proven GEMV
-/// (see the call site). A silent no-op there is the project's #1 measurement-bias
-/// trap (an "ON" arm that measures the OLD path), so it is said out loud once.
-fn tcgen05_mxf4_unwired_note(so_has_symbol: bool) {
+/// One-shot notice for an ARMED-but-undispatchable mxf4 gate. The `.so` reads the
+/// same env var itself, so an operator who exports `DSV41_EXPERT_TCGEN05_MXF4=1`
+/// believes the step now runs the tcgen05 gate/up — while `moe()` keeps issuing
+/// the proven GEMV (see the call site: no symbol in the .so, the interleaved
+/// weight layout, or no batched path). A silent no-op there is the project's #1
+/// measurement-bias trap (an "ON" arm that measures the OLD path), so it is said
+/// out loud once.
+fn tcgen05_mxf4_skipped_note(reason: &str, so_has_symbol: bool) {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
         eprintln!(
             "warning: DSV41_EXPERT_TCGEN05_MXF4 is set, but the routed MoE still dispatches the \
-             gate/up to the proven GEMV/GEMM: the Phase-1 tcgen05 launcher takes ONE contiguous \
-             [2*inter, dim/2] gate|up pool + [dim/32] e8m0 ACTIVATION scales + direct pointers, \
-             while the chain has four pools (w1/w3 + scales) selected by device-side `ids` and \
-             f32 activation scales. Any A/B run with this gate ON measures the OLD path. \
-             (symbol present in .so: {so_has_symbol})"
+             gate/up to the proven GEMV/GEMM: {reason}. Any A/B run with this gate ON measures \
+             the OLD path. (symbol present in .so: {so_has_symbol})"
         );
     });
 }
@@ -4246,21 +4245,37 @@ fn hc_tail_split() -> bool {
             );
         }
         if !self.opts.skip_experts {
-            // DSV41_EXPERT_TCGEN05_MXF4 is deliberately NOT dispatched here yet.
-            // The committed Phase-1 launcher (`dsv41_experts_mxf4.cu:4007`) takes
-            // ONE contiguous [2*inter, dim/2] gate|up pool with [2*inter, dim/32]
-            // e8m0 scales, [dim/32] e8m0 ACTIVATION bytes and direct pointers;
-            // this site has four pools (w1/w3 + their scales) selected by
-            // device-side `ids` and f32 activation scales from
-            // `dsv41_quant_fp4`. Handing `w1_base` to it would have the kernel
-            // read the w1 SCALE block as gate weights once row >= inter —
-            // silent corruption, the same failure class as the down-GEMV
-            // all-zeros incident. The dispatch lands with the Phase-2 indirect
-            // launcher (see `Device::expert_tcgen05_gate_up_mxf4`); until then
-            // the gate can only drive the parity harness, and arming it for a
-            // serve run is reported rather than silently ignored.
+            // DSV41_EXPERT_TCGEN05_MXF4=1 dispatches the routed gate/up to the
+            // tcgen05 `kind::mxf4` swapAB kernel (`dsv41_experts_mxf4.cu`). The
+            // 2026-09-12 ABI-gap resolution closed all three blockers, so the
+            // launcher now takes exactly what this site has: the loader's four
+            // weight planes (w1/w3 + their scales) as base/stride pairs, the
+            // quantiser's f32 activation scales (the kernel converts them to
+            // e8m0), and a device-side `ids[slot]`. Two refusals remain, both
+            // reported once below rather than silently falling back to the arm
+            // the operator thinks they disabled: a `.so` without the symbol
+            // (stock build) and the DSV41_EXPERT_ILV layout, which only the
+            // fused GEMV body can read.
             if expert_tcgen05_mxf4() {
-                tcgen05_mxf4_unwired_note(self.dev.supports_expert_tcgen05_mxf4());
+                if !self.dev.supports_expert_tcgen05_mxf4() {
+                    tcgen05_mxf4_skipped_note(
+                        "the loaded .so has no such symbol (a stock build does not define \
+                         DSV41_TCGEN05_GATEUP_MXF4_SKELETON)",
+                        false,
+                    );
+                } else if ilv {
+                    tcgen05_mxf4_skipped_note(
+                        "the routed gate/up pools are interleaved (DSV41_EXPERT_ILV) and only \
+                         the fused GEMV body can read that layout",
+                        true,
+                    );
+                } else if !batched {
+                    tcgen05_mxf4_skipped_note(
+                        "the batched MoE path is unavailable (DSV41_MOE_BATCH / the batched \
+                         kernel set)",
+                        true,
+                    );
+                }
             }
             // The input row is identical for every expert, so quantise it ONCE
             // here instead of inside the loop: the fp4 path was re-quantising and
@@ -4295,17 +4310,50 @@ fn hc_tail_split() -> bool {
                 // 2*inter_local (unfused: gate|up) or inter_local (fused: the
                 // swiglu'd result written by the kernel's epilogue).
                 // `ex_down_b` [topk][dim]; both disjoint.
-                let gateup_fused = gateup_fuse()
-                    && self.dev.supports_gateup_fuse()
-                    && expert_fp4_mode() == 2;
+                let ids = self.s.route_idx.ptr as *const i32;
+                // ---- tcgen05 mxf4 gate/up (DSV41_EXPERT_TCGEN05_MXF4) ---------
+                // Default OFF. Its epilogue only clamps (no swiglu fusion), so it
+                // writes the UNFUSED [2*inter] gate|up layout — the separate
+                // swiglu launch below must stay enabled whenever it runs.
+                // `Ok(false)` means the `.so` gate was OFF: nothing ran, so fall
+                // through to the GEMV with the layout THAT call would have used,
+                // i.e. byte-for-byte the pre-tcgen05 behaviour. ILV was already
+                // reported as a refusal once, above.
+                let tcgen05 =
+                    expert_tcgen05_mxf4() && self.dev.supports_expert_tcgen05_mxf4() && !ilv;
+                let mut ran_tc = false;
+                if tcgen05 {
+                    ran_tc = self.dev.expert_tcgen05_gate_up_mxf4(
+                        self.s.xq4.as_u8(),
+                        self.s.xsc4.as_f32(),
+                        self.s.ex_act_b.ptr as *mut f32,
+                        (2 * inter_local) as i64,  // unfused slot pitch
+                        inter_local as i32,
+                        dim as i32,
+                        cfg.swiglu_limit,
+                        topk as i32,
+                        w1_base,
+                        w1_stride,
+                        w1s_base,
+                        w1s_stride,
+                        w3_base,
+                        w3_stride,
+                        w3s_base,
+                        w3s_stride,
+                        ids,
+                    )?;
+                }
+                let gateup_fused =
+                    !ran_tc && gateup_fuse() && self.dev.supports_gateup_fuse()
+                        && expert_fp4_mode() == 2;
                 let act_slot = if gateup_fused {
                     inter_local as i64
                 } else {
                     (2 * inter_local) as i64
                 };
                 let down_slot = dim as i64;
-                let ids = self.s.route_idx.ptr as *const i32;
-                self.dev.expert_gate_up_fp4_batched(
+                if !ran_tc {
+                    self.dev.expert_gate_up_fp4_batched(
                     self.s.xq4.as_u8(),
                     self.s.xsc4.as_f32(),
                     self.s.ex_act_b.ptr as *mut f32,
@@ -4331,6 +4379,7 @@ fn hc_tail_split() -> bool {
                     // view alias w1's), they are simply not read.
                     ilv as i32,
                 )?;
+                }
                 // W2 L2 PREWARM (DSV41_W2_PREWARM, default OFF; `=1` enables).
                 //
                 // The down GEMV that follows streams w2 from HBM (286-385 GB/s
@@ -4376,8 +4425,10 @@ fn hc_tail_split() -> bool {
                 // both must agree. The simplest correct wiring: try the fused
                 // path (the kernel sets it when mode==2 && dim%512==0), and skip
                 // swiglu when it did. We can't read the kernel's decision from
-                // here, so we mirror the same condition.
-                let gateup_fused = gateup_fuse()
+                // here, so we mirror the same condition. `ran_tc` forces it OFF:
+                // the tcgen05 epilogue never fuses, so its [2*inter] output needs
+                // the separate swiglu launch.
+                let gateup_fused = !ran_tc && gateup_fuse()
                     && self.dev.supports_gateup_fuse()
                     && expert_fp4_mode() == 2;
                 if !gateup_fused {

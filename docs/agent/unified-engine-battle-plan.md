@@ -1,0 +1,107 @@
+# Ferrite 统一引擎战役计划 — 全方面超越 SGLang
+
+**制定日期**: 2026-09-12（用户指令：统一架构 → MTP 400 tok/s → KV/radix → 1M prefill → 多并发）
+**基线**: DSV41 单并发 6.15ms/步 = 162.6 tok/s（tag `dsv41-6.15ms-162toks`）；GLM B=16 13.4ms
+**对标**: sglang DSpark 383.7 tok/s @ B=1 B300 TP8（V4-Pro, accept~5, LMSYS 2026-07-06 博客）
+
+## 0. 用户目标 → 工程指标
+
+| 用户要求 | 工程指标 | 依赖 |
+|---|---|---|
+| 统一 GLM/DeepSeek，零重复 | 单一二进制 `ferrite-serve --model {glm53,dsv41}`；五层重复（服务/TP/图/kernel/加载）逐层收敛 | dup-audit 报告 |
+| MTP 单并发峰值 ≥400 | dspark block-5：draft(1 图) + verify(n=6) + commit ≤ ~12ms，accept ≥4 | MTP 调研报告 |
+| KV 管理 + 前缀命中 | radix tree（dispatch 已有 SGLang parity）+ hicache 三层接上 GPU 引擎 | kv 调研报告 |
+| 1M 上下文 prefill | chunked prefill + indexer O(n²)→O(n) + KV 口径统一（8.9x 差） | prefill 调研报告 |
+| 多并发不掉单流 | DSV41 batched（megab_b{size} 图池）+ ragged verify | 架构统一 + MTP |
+| 超越 sglang | 以上全部 + 生产级稳定性 | — |
+
+## 1. 五份侦察的核心事实（浓缩）
+
+### 1.1 重复度（dup-audit，480 行报告 /tmp/dup_audit_report.md）
+- 唯一共享层 = ferrite-http。五层各写一份：服务(60%) / TP-AR(70%) / 图捕获(75%) / kernel(30-35%) / 权重加载(65%)
+- AR v5 kernel 已共享；devrt 是图原语超集（侧流/事件/节点优先级）；quant.rs 是量化基座
+- `ferrite-exec/src/dist.rs` 是死文件（未被 lib.rs 声明）；ferrite-batch/scheduler 仅 CPU Engine 用
+- **ferrite-dispatch 是活的调度基座**：radix.rs（SGLang parity 611 行）+ state.rs（三层 hicache）+ mtp.rs（MTP×batch 协议）+ batch.rs（SchedConfig）
+- hc（hyper-connection）两套是同一数学（GLM mhc.rs ↔ DSV41 hc_*），重复最严重
+
+### 1.2 DSpark/MTP（mtp-research，509 行报告 /tmp/mtp_research_report.md）
+- **DSV41 checkpoint 自带完整 dspark 权重**（mtp.{0,1,2}，128-expert MoE topk3 + Markov rank256 + confidence），加载器已读，引擎从不执行
+- sglang 机制：gamma=5（draft tokens），verify 宽度 = gamma+1 = 6 行，线性链（非树），num_steps 强制 1
+- **verify 行数在延迟绑定下几乎免费**（GLM 经验：n=3 verify 16.6ms ≈ n=1 decode 17ms）→ block-6 verify 预计 ≈ 1.2-1.8× 单步
+- 400 预算表：accept 4 → T≤10ms；accept 5 → T≤12.5ms。步时估算 8-13ms → **385-750 tok/s，可行性由实测 accept 决定**
+- GLM MTP 的 N-unified 机制（mega_v N 行图 + graph_run_ids + ferrite_mtp_commit 单核）直接复用
+- **旧"严禁mtp/投机"禁令已被用户 2026-09-12 指令明确解除**（本战役目标即 MTP 400）
+- 最大 POC 风险：DSV41 sparse attn 的 n=6 多行支持（未验证）；small_n_rows 数值域对 accept 的影响
+
+### 1.3 KV/radix（kv-research，报告待出）
+- ferrite-dispatch 已有 radix（页对齐/lock_ref/LRU/三层）+ state（GDN snapshot + DSA page lease）
+- GPU 路径（GpuEngine/TpRankPool）未接 dispatch —— prefix_hit 恒 0（死字段）
+- GLM DSA KV 两套口径差 8.9×（latent 512 vs kernel 展开 41088）—— 1M 显存讨论的前提
+
+### 1.4 Prefill/1M（prefill-research，427 行报告 /tmp/prefill_research_report.md）
+- GLM：引擎 chunk-ready（prefill_chunk 存在）但 serve 整段传；MAX_CTX=8100 vs 模型声明 1M
+- DSV41：无 prefill 分支（逐 token 走 decode 链）；indexer O(n²) 是最大瓶颈
+- **多行链（m>1）是 dspark verify(n=6) 与 prefill(chunk) 的共享基础设施** ← 关键架构洞察
+- CP 基础设施全有（axes.rs/shard.rs/dist.rs）但未接生产
+- P0 清单：抬上限锁步 / KV 口径统一 / GLM chunked 接 serve / indexer 分块 / GDN 对齐 / 显存预算表 / DSV41 chunked
+
+## 2. 战役分波（依赖序 + 价值序）
+
+### Wave 1 — 快速架构统一（低风险高价值，先做）
+1. 删 `ferrite-exec/src/dist.rs` 死文件（747 行，无引用）
+2. GLM `run_serve` 改用 `ferrite_http::serve::launch`（删 80 行复制）
+3. `Dsv41Frame` 上移 ferrite-models（与 GlmFrame 对称）
+4. CLI 统一（合并两套 arg 解析）
+5. 单一二进制 `ferrite-serve --model {glm53,dsv41}`（dsv41-run 变 alias）
+6. 文档：更新 roadmap-200-tokps.md / perf-roadmap.md 的 MTP 禁令记录（用户 2026-09-12 解除）
+
+**验收**: 两个模型各自 serve 文本不变（四段文本）；单一二进制跑通两个模型。
+
+### Wave 2 — dspark MTP（最高价值目标，400 tok/s）
+按 mtp-research 的 M0-M4：
+- M0: 远端核对 checkpoint mtp.* key（ssh 读 index）
+- M1: device dspark draft 前向（3 block + Markov + gumbel；对照 host 参考对齐 argmax）
+- M2: verify 图 n=6 + **DSV41 多行链 POC**（sparse attn n=6、compressor n=6、GEMV/GEMM 数值域）
+- M3: accept（贪心最长前缀）+ commit（复用 ferrite_mtp_commit, mtp_n=6）+ 文本校验
+- M4: 性能调优 ≥400 tok/s（accept 实测 → 步时分解 → 优化）
+
+**关键设计**: spec 框架写成模型无关（DraftHead trait：propose(graph) / VerifyEngine: verify(n rows) / Commit），DSV41 dspark 是第一个实现。这同时服务后续 GLM MTP batched 和多并发 ragged verify。
+
+### Wave 3 — KV/radix 接线（前缀命中）
+1. GpuEngine 接 ferrite-dispatch 调度（SchedConfig 页预算 + Admission.prefix_hit 活化）
+2. radix + hicache 三层接 DSV41 ring/index_k（快照 = state 恢复）
+3. DSA indexer topk 表 + GDN state 的前缀恢复路径
+
+### Wave 4 — 1M prefill
+P0 清单执行（见 prefill-research §D）：多行链（与 Wave 2 共享）→ indexer 分块 → 口径统一 → 显存预算表
+
+### Wave 5 — 多并发 batched
+1. DSV41 batched 图池（megab_b{1,2,4,8,16,32} 键控 + STABLE 设备地址表）——复用 GLM 已验证机制
+2. MTP × batched（ragged verify 总量键控分层，sglang 方案）
+3. pad 策略（dummy state 共享 + membership 变化刷新）
+
+### 深度统一（与 Wave 3-5 并行推进，有 400 基线保护后做）
+- 设备层收敛：cuda.rs → devrt（GLM 获得侧流/节点优先级）
+- kernel 库合并：dsv41_glue/route 并入 ferrite_kernels.cu；PDL 公共头
+- hc 数学合并（GLM mhc ↔ DSV41 hc_*，需数值 parity）
+- 描述化：LayerDesc schema，两个 chain*.rs 层循环变数据
+- TP host 协议收敛：TpCluster → Collective
+
+## 3. 关键技术决策（已定）
+
+1. **多行链先行**: DSV41 的 layer 函数支持 rows>1 是 Wave 2/4/5 的共同基础。verify(6) 和 prefill chunk 走同一套。
+2. **spec 框架模型无关**: DraftHead/Verify/Commit trait 在引擎层，dspark 是实现。
+3. **图策略**: draft 1 张图（block 一次出 5 token，无 h 链 relay）+ verify 1 张图（n=6, graph_run_ids 喂 24B ids）+ commit 单核。DRY→rollback→CAPTURE 纪律 + 图间 sync 护栏（GLM 教训）。
+4. **贪心 accept 先行**: 采样拒绝路径（sglang AcceptSampling）后补。
+5. **数值域铁律**: draft 与 verify 同数值域（small_n_rows 的 n=6 取舍必须实测 accept 后定）。
+6. **不 git revert**: 旧禁令文档更新为"已解除"，不删历史记录。
+
+## 4. 风险清单
+
+| 风险 | 影响 | 缓解 |
+|---|---|---|
+| DSV41 sparse attn 不支持 n=6 | verify 无法一次 6 行 | Wave 2 最先 POC；退路 = 逐行 verify（慢但可跑，先验证 accept 再优化） |
+| accept < 4 | 400 不可达 | M1 后立即离线测 accept 分布（host 参考在真实文本上）；confidence 头给出预期 |
+| 多行链重构破坏 6.15ms 基线 | 回归 | env gate（DSV41_SPEC=1 才走新路径）；单行路径逐位不变 |
+| 架构统一破坏两模型 | 回归 | 每步单一文本验收；tag 保护（dsv41-6.15ms-162toks） |
+| 图捕获池 miss（TP=4 教训） | 崩溃 | DRY 预热纪律 + FERRITE_POOL_MISS 诊断 |
