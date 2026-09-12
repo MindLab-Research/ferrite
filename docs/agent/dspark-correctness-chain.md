@@ -6114,3 +6114,24 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 3. **DYNAMIC_PAD 的 A/B**：OOB 修复后 DYNAMIC_PAD 可能不必要（contingency 计划的 P0.5）
 
 **干净的 SWALLOW 是正确路径**！
+
+## SWALLOW 对 host 侧同步点敏感（观测干扰的深层分析）
+
+**观测干扰的机制**：
+- V5_LEDGER 的每步 10 个 D2H（canary 4 槽 + epoch + guard）→ **10 个隐式全设备同步点/步**
+- batched 模式（m=6）对时序敏感——AR 的 epoch 管理在同步点间被打断
+- **任何 host 侧 D2H 观测都会破坏 SWALLOW 的 batched 执行**
+
+**对生产和调试的影响**：
+1. **生产 SWALLOW 必须零 D2H/步**（clean 配置已经是——56.7 tok/s 正确输出 ✓）
+2. **调试 SWALLOW 需要非同步观测**（device-side logging 而不是 D2H）
+3. **DYNAMIC_PAD 的 host 同步可能也有干扰**——OOB 修复后 DYNAMIC_PAD 可能不必要
+
+**SWALLOW 的最终判据（clean 配置）**：
+- ✅ 计数：61/72 正确（前 61 行 ✓）零拉丁
+- ✅ accept5：32/32 正确 零拉丁
+- 🔄 出师表：1000 token 测试中（2a0850fd）
+- ✅ 无 panic 无 hang
+- 吞吐 54-57 tok/s（vs lazy 91.1——SWALLOW 更慢但 batched 路径可用）
+
+**400 的路径**：SWALLOW 的 accept 修复（~0.6 → ~5）是唯一关键——修好后 28ms 步时给 214 tok/s，优化到 15ms 给 400 ✓
