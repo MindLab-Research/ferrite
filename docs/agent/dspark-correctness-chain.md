@@ -328,3 +328,11 @@ nibble 解包（偶列=LOW）✓ / e2m1 dequant 表（同一张，含负零的�
 
 out_slot_stride ✓ / add_inplace 长度（m*topk*act_slot）✓ / ex_act_r_lo 同尺寸 ✓ / armed 时一次 swiglu ✓ / down 的行距 ✓。**双趟在 moe_rows 的接线没有被 moe() 的修复漏掉。**
 **一般缺陷（已由 fuse 绑 pitch 的提交覆盖）**：ILV + E4M3 组合会 fail-loud（cudaErrorInvalidValue）——在默认 ILV 布局下 armed 特性不可用，需 Rust 侧提前拒绝（已修）。
+
+## verify 图化 × e4m3 × SH_EXP 的 capture/replay 分支漂移审计（verify-graph-capture-test）
+
+**结论：三个 gate 同时开启不会造成 kernel 序列漂移。** 所有分支由 OnceLock(env) + .so 符号存在性 + shape 三层确定。
+
+**关键前提修正**：`ran_tc` **不在捕获区**——`moe()`（含 tcgen05）只有 eager 路径的调用点，verify 走 `moe_rows`（无 ran_tc 项）。
+
+**⚠️ 真正发现的一处 capture 冻结分支**（不在三个 gate 内）：`publish_key = committed`（值是 `pos_base mod ratio` 的函数，决定 `publish_index_key` 的 3 个 launch 是否被录制）——**layer 2/8/14（ratio=2 的 index-owning 层）随 pos_base 奇偶翻转** → 图捕获时如果 pos_base 是偶数，`publish` 被 skip，replay 到奇数位置时缺 launch（反之亦然）。**修法**：capture 前强制跑一次奇数位置（或 publish 无条件化后用 clen 门控）。
