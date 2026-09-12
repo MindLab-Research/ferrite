@@ -2385,3 +2385,18 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 1. SH_PAIR parity（编译修复中——subagent）
 2. SWALLOW ar5-hang（架构修复中——subagent）
 3. tcgen05 misaligned（深度调查中——subagent）
+
+## SH_PAIR_M=1 template<M> 冒烟结果（4135ec3e）
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）——template<M> kernel 不破坏正确性！
+- **k_acc 序列完全相同**：4 0 0 0 3 0 1 1 0 0 0 1 2 0 0 5 0 0 0 1——数值等价 ✓
+- sh_pair_m arm 无日志输出（可能 declined 静默或正确使用——需要 parity 测试确认）
+
+**判定**：
+1. template<M> kernel **不 crash** ✓
+2. 零拉丁保持 ✓（正确性红线）
+3. k_acc 不变 ✓（数值等价）
+4. **需要 parity 测试**（编译修复中——subagent）确认 template<M> 真的被使用（vs 静默 declined）
+
+**下一步**：parity 编译修复（sh-pair-parity-fix subagent）→ parity 硬门 → 四臂 A/B（性能验证）
