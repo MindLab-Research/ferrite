@@ -7492,3 +7492,19 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **验证**：`cargo check -p ferrite-models` ✓；远端 `nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -Xptxas -v -c dsv41_kernels.cu` **EXIT=0** 且 `rmsnorm_rope_kernel` 改动前后同为 **26 registers / 1 barrier / 128 B smem**（对照 HEAD 编译）——没有触发 v13 那种"代码存在性/寄存器"回归面。**尚未上机**：判据是 `DSV41_RW_FOLD=1` vs `=0` 背靠背四段文本逐字节相同 + `faults=0`，再看 p50。
 
 **回退**：`DSV41_RW_FOLD=0` → `DSV41_NR_FUSE=0` → 老 `.so` 符号探测，三条都是逐位等价的旧路径。
+
+### residue-hunt 定案：+0.34ms 回归 = 热点 kernel 的代码存在性（2026-09-12 11:00）
+
+**排查结论**：
+| 文件 | d546139→175462d | 判定 |
+|---|---|---|
+| ferrite_kernels.cu | **0 差异**（10162 行 byte-identical） | 清理完美 |
+| dsv41_kernels.cu | +338/−83 | 全部可归因，无第三类残留 |
+
+**真凶**：`sparse_attn_split_kernel` 的 **+12 参数 + 选举代码**（`__shared__ int sh_winner` + atomicAdd 分支）——`fold` 是**运行时 kernel 参数**，gate OFF 时无法编译期消除。40 launch/step 的热点 kernel 带着这些代码 → +0.34ms。与 v13 的 quant-fold 同机制（那次是 gate 缺陷使代码执行；这次是编译产物变重）。
+
+**ringwin 同款风险**：rmsnorm_rope_kernel 的 6 尾参 + 早退守卫（ffabd0d，默认 OFF）——未验证的优化给热点 kernel 加代码。
+
+**处置**：hot-kernel-restore 正在恢复两个 kernel 到 np1（d546139）形态。sparse-merge（v14a=v14b=中性）和 ringwin（未验证）都无保留价值。
+
+**方法论铁律（第 7 条）**：**给热点 kernel 加运行时参数/分支 = 编译产物变重 = 性能回归风险**。gate OFF 只是不执行，不等于不编译。未来热点 kernel 的优化必须：(a) 模板参数编译期消除，或 (b) 独立 kernel（不改原签名）。
