@@ -83,22 +83,17 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-12，详见 docs/agent/）
+## 当前状态与下一步（2026-09-12 深夜更新，详见 docs/agent/）
 
 **正确性（用户红线：不能重复不能乱码）**：
-- 8 个根因全部修复并验证（详见 `docs/agent/dspark-correctness-chain.md`）
-- 最后一个根因：**routed expert 激活量化 e2m1 vs 官方 e4m3**（4×噪声差、44 层累积=opa 的来源）——**直接 e4m3 单趟**（`DSV41_EXPERT_ACT_E4M3=1`：`quant_fp8(block=32)` → 一次 expert GEMM，kernel 侧 `act_e4m3` 暂存分支解码 e4m3，权重路径零改动）消除 opa ✓；布局契约 bug（fuse 绑 pitch）已修；ILV 与 e4m3 不冲突（单趟可保留 gate_up+swiglu 融合）。⚠️ 早先的 e2m1×2 双趟已被取代（+5ms/步仅 +2% accept）；命中条件改为 `.so` 的 `dsv41_expert_act_e4m3_cap` 符号，需重编 .so。
-- spec 步跨步不变量断言层（`DSV41_INV_CHECK=1`，8 条优先项）。
-- diff probe（`DSV41_DIFF_EAGER=1`）：mismatch 从首轮即错→18→1（o-rope 对齐后）。
+- 8 个历史根因全部修复 + **R2 损坏发现与替代**：R2（ATTN_LIN_FUSE 复用 EAGER 的 lin2/lin_rope_norm）两个半边都损坏输出（计数 62-72 错、出师表 ~100 字后乱码）——**教训：EAGER 复用必须"同程序或 bust"**；K1（gemm_fp8_mrows2）+ K2（gemm_fp8_mrows_rope_norm）为同程序替代（已实施，验证中）
+- **验证纪律**：拉丁检查不够（必须验证计数数字顺序）；出师表自然停止 < 损坏点是假阴性风险（计数任务更可靠）；构造性等价论证不够（必须真实形状逐字节 diff）
+- **SH_PAIR template<M> parity 虚报解决**：kernel 无 bug（哨兵 0x5A 是可产出值 + double-count）
 
-**性能（400 tok/s 口径：accept 3 ⇒ 步时 ≤7.5ms）**：
-- 基线 48ms/步（verify 37.31 + draft 4.37 + 主链 6.15 + commit 0.33）@ accept 0.83
-- **accept 是真正的乘数**（0.83→3 = 3.6× 缺口 vs 性能 1.6× 缺口）
-- 已实现的 gate（全部默认 OFF，等 A/B）：SH_EXP_MROWS(−8.3ms)、VERIFY_GRAPH(−15ms submit)、DRAFT_P3A(−37 launch)、MARKOV_SLICED(−1ms draft)、VERIFY_ROPE_MROWS(−0.6ms)、SWALLOW_STEP(−6.15ms 主链)、tcgen05 mxf4(−6.8ms routed experts)、**GATE_MROWS**(−2.75ms gate 行折叠；`DSV41_GATE_MROWS` 与 `DSV41_ROW_FOLD_GATE` 同程序双名，入口 `ferrite_gemv_bf16_v2_mrows` → 复用 `gemv_bf16_nt_kernel<NT,8>` 单一定义；逐位见证 `tests_gate_mrows.cu` 三臂对比)
-- **最终判定**（`docs/agent/final-400-config.md`）：全部落地后步时 ~12ms，accept 3 → 250 tok/s；**7.5ms 触架构地板**（weight-stationary 下限 7.4-9.2ms）——400 需要 accept ≥4 或 verify ≤5.5ms（需 tcgen05 + 融合全部兑现）
-- verify 的 ms 分解（`docs/agent/verify-ms-breakdown.md`）：50% launch submit + 49% in-kernel 残差 + 5% 带宽——先 A（合并/mrows）后 B（图化）
-- routed experts 残差分析（`docs/agent/routed-expert-residual.md`）：377GB/s 的成因 = 每 fp4 值 2.5 条 L1TEX 解码指令 → tcgen05 是唯一根治路径（−6.8ms）
-
-**测试纪律**：单一 GPU 测试驱动 = 主 agent（subagent 禁止 e2e）；禁止轮询远端状态（等通知）；禁止跑已知结果的测试。
-
-**性能与知识文档**：`docs/agent/dspark-perf-400-plan.md`（400 的账本与融合清单）、`docs/agent/unified-engine-battle-plan.md`（战役计划）、`docs/agent/wave4-prefill-plan.md`（1M）、`docs/agent/wave5-multiseq-plan.md`（多并发）、`docs/agent/mtp-unification-analysis.md`（MTP 统一）、`docs/agent/dspark-swallow-step-diff.md`（吞主链步）。会话级的详细记录归 `/tmp/AGENTS_session_archive.md`（本地）与 git 历史。
+**性能（诚实基线）**：
+- **干净基线 78.8 tok/s**（lazy + SH_PAIR_M=1 + Wave 1，零拉丁 + 计数正确）
+- R2 的 +6% 无效（损坏）；K1+K2 验证中（预期恢复到 ~83-85）
+- **lazy 数学上限 ~145 tok/s**（k_emit×c_row 乘积）；400 需要 batched（SWALLOW）或 L4/L5 kernel 重写
+- **SWALLOW ar5-hang：8 次修复全失败（shelved）**——多根因（臂足迹 + argmax 轮次）
+- **kernel 物理特性**：instruction-bound（0.7-4.9% 峰值带宽）；warp-per-row 使 batched 权重共享不生效；SH_PAIR 是唯一"M 进 grid"折法
+- **口径纪律**：步时用 [dspark] steps 行或 nsys；吞吐 end-to-end；accept-N 的步时不能配 accept-M 的 tok/step
