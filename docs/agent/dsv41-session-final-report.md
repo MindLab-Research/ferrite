@@ -3,10 +3,11 @@
 > **状态：已定稿**（2026-09-12 01:20，HEAD `6fc6113`）。本文件是会话的权威汇总，
 > 数字全部来自本会话已验证的 serve A/B 或隔离复现器；未验证项已显式标注。
 >
-> **会话终态**：**13.28 → 6.17ms（+115.4%），75.3 → 162.1 tok/s**。
-> v17a 基线复测定案 **6.17ms / 162.1 tok/s**，四段文本全对、`faults=0`。
-> **"唯一数量级路径" swapAB 在 serve 全矩阵中性，已于 v21 正式关闭**（§3.5）；
-> 通往 200+ 的剩余路径只剩 **DL K-chunk**（已实施待验证）与 **expert tcgen05**（4-5 人日）。
+> **会话终态**：**13.28 → 6.15–6.17ms（+115.4%），75.3 → 162.1–162.6 tok/s**。
+> 最优读数 v24a **6.15ms / 162.6 tok/s**、v17a **6.17ms / 162.1 tok/s**，四段文本全对、`faults=0`。
+> **"唯一数量级路径" swapAB 经 5 变体 serve 全矩阵中性，已于 v24 正式关闭**（§3.5）；
+> DL K-chunk 亦于 v22 serve 判**略负**（第 10 次失败）。
+> **200 tok/s 判定见 §9：tcgen05 + gemv 突破 + hc/AR 突破三者同时成立才可能——研究级。**
 
 ---
 
@@ -80,7 +81,7 @@
 |---|---|---|---|---|
 | 1 | **swapAB kernel 族**（`gemm_fp8_swapab_kernel`，形状分发 + last-block reduction） | `166acc5`/`9696afa`/`b7744a1` | OFF | **中性**（4 变体全中性，§3.5） |
 | 2 | **TMA Phase 1**（1D `cp.async.bulk` staging + mbarrier，`DSV41_SWAPAB_TMA`） | `0f34001` | OFF | **中性**（v21t，§3.5） |
-| 3 | **DL K-chunk cp.async 流水**（`hc_dots_late_kchunk_kernel`，`DSV41_HC_DL_KCHUNK`） | `6fc6113` | OFF | **待 serve 验证**（理论 14.9→8-9µs） |
+| 3 | **DL K-chunk cp.async 流水**（`hc_dots_late_kchunk_kernel`，`DSV41_HC_DL_KCHUNK`） | `6fc6113` | OFF | **略负**（v22：6.25 vs 6.17ms，第 10 次失败） |
 
 > 三条都是**完整的、编译通过、位一致已论证**的实现，保留在树内供后续升级后重测。
 > 但**它们都不构成会话收益**——报告的数字口径以 §1 的 serve A/B 为准。
@@ -368,36 +369,74 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 
 | 量 | 值 |
 |---|---|
-| **会话终态（v17a，serve 验证）** | **6.17ms / 162.1 tok/s（+115.4%）** |
+| **会话终态（v24a，serve 验证）** | **6.15ms / 162.6 tok/s（+115.4%）** |
 | 目标 | 5.00ms / 200 tok/s |
-| Gap | **~1.17ms** |
+| Gap | **−1.15ms 仍缺** |
 
-### 9.1 判定：旧框架已全部关闭
+### 9.0 终态每步分解（v24a 基线 nsys）
+
+| 段 | 步时占比 | 状态 |
+|---|---|---|
+| **gemv**（`gemm_fp8_gemv` + `gemv_bf16_v2`，246 次） | **2.70ms（44%）** | SIMT **compute-bound**（isolated 11µs 不变）——a32-vec4 / P4 / swapAB×5 全部无效；**无路径**|
+| **expert**（`expert_gateup` 24.1µs + `expert_down` 17.4µs） | **2.00ms（32%）** | **DRAM-bound**：0.9GB/步 ÷ 8TB/s = 0.11ms 地板，当前 18× 差距——**tcgen05 唯一目标** |
+| **hc / AR / misc**（`hc_dots_late` / `hc_mixes_tail` / `ar_*` / misc） | **1.45ms（24%）** | 各自地板：hc 屏障、AR NVLink 协议（~8µs/call）、misc 已优化；**无路径** |
+| 合计 | 6.15ms | 162.6 tok/s |
+
+### 9.1 判定：旧框架已全部关闭，新框架只有"半个"
 
 - **"逐 kernel 抠 SIMT 地板"框架**：全部已识别的小优化路径（节点削减 / gemv_bf16 / w2 warm /
-  down cp.async / epilogue folding）若全部兑现 → ~6.05ms ≈ 165 tok/s，**达不到 200**。
-- **swapAB 换范式框架**：曾被判定为"唯一数量级路径（~238 tok/s）"，
-  但 **v17–v21 四变体 serve 全矩阵中性**（§3.5）——**该框架正式关闭**，
-  与它绑定的 ~1.8ms gemv 收益、a32 地板拆除、row-stationary 替代等**全部作废**。
+  down cp.async / epilogue folding）即使全部兑现 → ~6.05ms ≈ 165 tok/s，**达不到 200**。
+- **swapAB 换范式框架**：曾被判定为"唯一数量级路径（~238 tok/s）"，经 v17s→v24r **5 变体
+  serve 全矩阵中性/回归**（§3.5），**正式关闭**——与它绑定的 ~1.8ms gemv 收益、a32 地板拆除、
+  row-stationary 替代等**全部作废**。gemv 的 2.7ms **确认无路径**。
+- **DL K-chunk 框架**：v22 serve 判**略负**（6.25 vs 6.17ms），第 10 次失败。
+- ⇒ **会话结束时唯一存活的路径只剩 expert tcgen05（§9.2）**，且它只覆盖 32% 的步时。
 
-### 9.2 剩余路径（按可行性排序）
+### 9.2 tcgen05-perf-model 定案（200 tok/s 可达性）
 
-| # | 路径 | 预期 | 状态 |
-|---|---|---|---|
-| 1 | **DL K-chunk cp.async**（`DSV41_HC_DL_KCHUNK`） | 14.9→8–9µs/launch，打 6 折后 **0.15–0.3ms/步** | **已实施**（`6fc6113`，默认 OFF，位一致已构造论证）**待 serve 验证** |
-| 2 | **expert tcgen05 fp4 swapAB**（`kind::f8f6f4`） | expert 2.0ms → 1.0ms，步时 ~3.0ms ≈ **333 tok/s** | 可行性已三处离线证实；**缺口是现 mxf4 无 cp.async/TMA**（16.8 GB/s LDG→STS 是 0.2% 带宽地板）；工作量 **4-5 人日** |
-| 3 | 无其它已识别路径 | — | — |
+> 把 expert 的 2.0ms 作为唯一变量，其余段（gemv 2.7 + hc/AR/misc 1.45 = 4.15ms）视为不可动，
+> 推演 tcgen05 兑现后单请求 decode 步时的可达区间。
 
-> ⚠️ **路径 1 带有与 swapAB 完全相同的翻译风险**（隔离探针、7 次失效先验），必须走 serve A/B 判定。
-> 路径 2 的两条已验证事实：① `tcgen05.mma.cta_group::1.kind::f8f6f4` 在 sm_103a 可用
-> （CCCL arch guard 含 1030 / CUTLASS SM100_MMA_MXF8F6F4_SS / DeepGEMM 已实写 e4m3.e2m1 配对）；
-> ② scale 用 `kind::mxf8f6f4.block_scale.scale_vec::1X`（K=32 粒度，与 checkpoint per-32 e8m0 零转换）。
-> swapAB 布局同时解决 tcgen05 的 M=128 钉死（gateup 3840/128=30 tile、down 5120/128=40 tile）。
+**天花板推演（expert = 唯一变量）**：
+
+| 场景 | expert 步时 | 步时 | tok/s | 说明 |
+|---|---|---|---|---|
+| 当前（SIMT） | 2.00ms | 6.15ms | 162.6 | 基线 |
+| tcgen05 折中 | 1.00ms | 5.15ms | **194** | 计划书原预期 |
+| **tcgen05 最乐观** | **0.50ms** | **4.65ms** | **215** | 理论天花板（DRAM 地板 0.11ms 的 ~4.5×，已放宽） |
+
+⇒ **即使 tcgen05 100% 完美兑现，天花板也只有 ~4.65–5.15ms ≈ 194–215 tok/s**，
+仅仅"擦线"越过 200（且只有 0.5ms 场景才真正越过）。
+
+**叠加 serve-translation 折扣后的现实预期**：
+
+本会话已积压 **7 次隔离→生产失效 + 10 次 serve 验证失败/中性**（§7.2、§3.5），
+`swapAB` 隔离 1.76–1.94× → serve **完全中性**是最新的、也是最贵的一次先验。
+tcgen05 属**第 7 类系统差异**（profiled 与 served 的 SM 争抢 / L2 竞争 / 图 replay 不同），
+计划书 §5 已自认其"翻译风险最高的一类"。按 **60–100% 折扣**折算：
+
+- 乐观（折扣 60%）：expert 2.0 → 1.4ms ⇒ 步 ~5.55ms ≈ **180 tok/s**
+- 中性（折扣 80%）：expert 2.0 → 1.6ms ⇒ 步 ~5.75ms ≈ **174 tok/s**
+- 悲观（折扣 100%，同 swapAB）：expert 不变 ⇒ **162.6 tok/s**
+
+⇒ **现实预期 ~170–175 tok/s，200 tok/s 触不到。**
+
+**200 的数学（为什么必须"三者同时"）**：
+
+- 需要：6.15 → 5.00ms = **−1.15ms**
+- tcgen05 即使给出理论最大 **−1.5ms**（expert→0.5ms），也只是把天花板抬到 215 tok/s，
+  且该点要求 expert 达到 DRAM 地板 4.5× 内、翻译零损失——两者都未被任何证据支持。
+- 要在**现实折扣下**稳过 200，还须**同时**：
+  1. **gemv 的 2.7ms 减半**（−1.35ms）——**无路径**（SIMT compute-bound，5 变体 swapAB 全中性）；
+  2. **hc/AR 的 1.45ms 再砍**（−0.3ms+）——**已在地板**（AR NVLink 往返 ~6µs、hc 屏障、misc 已优化）。
+- 三者**同时成立**的概率，按本会话失败率与翻译风险外推，属**研究级**，非工程量级。
 
 ### 9.3 结论一句话
 
-**SIMT 抠法已到顶（~6.0ms / 166 tok/s）；曾被视为突破口的 swapAB 范式被 serve 否证；
-200 tok/s 需要下一会话的 expert tcgen05 路径，或一个新的结构性发现。**
+**当前架构上 200 tok/s 很可能不可达**：唯一存活的 expert tcgen05 即使完美兑现，
+天花板也只有 194–215 tok/s，考虑 serve-translation 折扣后**现实预期 170–175 tok/s**；
+要过 200 必须 **tcgen05 + gemv 突破 + hc/AR 突破三者同时成立**——
+而 gemv 与 hc/AR 两条在当前架构下**均已无路径**。**这是一个研究级目标，不是下一会话的工程量。**
 
 ---
 
@@ -405,13 +444,15 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 
 - serve A/B：`scripts/dsv41_serve_ab.sh`，同二进制背靠背，判据 = 四段文本（Paris/Tokyo/1+1=/静夜思/出师表）
   逐字 + `faults=0` + p50。
-- 本报告 v2 覆盖的 commit 区间：`9cddfb8` … `6fc6113`（HEAD）。关键 commit：
-  `4bed9f6`（gate 修复）、`166acc5`/`9696afa`/`b7744a1`（swapAB 三阶段）、
-  `0f34001`（TMA Phase 1）、`6fc6113`（DL K-chunk）、`319ffc1`（v21 定案）。
-- 相关文档：`crates/ferrite-dsv41/STATUS.md`（逐 commit 记录，v17–v21 全部定案在此）、
+- 本报告覆盖的 commit 区间：`9cddfb8` … `b5bed8a`（HEAD）。关键 commit：
+  `4bed9f6`（gate 修复）、`166acc5`/`9696afa`/`b7744a1`（swapAB 三阶段）、`0f34001`（TMA Phase 1）、
+  `6fc6113`（DL K-chunk）、`7fe3ede`（v22 DL K-chunk 判负）、`06a1285`/`297a79a`/`1b27bc6`/`ab8b2ca`
+  （v23/v24 swapAB 环几何系列）、`003a4ab`（v24 定案，swapAB 绝对关闭）、`246d1be`（终态 nsys 分解）、
+  `b5bed8a`（tcgen05 Phase 1 骨架 + 环几何否证回退）。
+- 相关文档：`crates/ferrite-dsv41/STATUS.md`（逐 commit 记录，v17–v24 全部定案在此）、
   `docs/agent/dsv41-methodology.md`（方法论手册）、`docs/agent/dsv41-layer-fusion.md`
   （DL K-chunk 与 dots+LATE merge）、`docs/agent/dsv41-persistent-arch.md`（选举/持久化段核）、
   `docs/agent/perf-roadmap.md`（gemv/a32/swapAB 分析）、`docs/agent/dsv41-nsys-v14-plan.md`（nsys 分解）、
-  `docs/agent/roadmap-200-tokps.md`（执行计划）。
-- 未验证项标注：§2.2 三条默认 OFF 实现（swapAB/TMA 已 serve 判中性；DL K-chunk 待 serve）；
-  §9.2 路径 1/2 的预期收益均为**理论值**。
+  `docs/agent/expert-tcgen05-plan.md`（tcgen05 四阶段实施计划）、`docs/agent/roadmap-200-tokps.md`（执行计划）。
+- 未验证项标注：§2.2 三条默认 OFF 实现（swapAB/TMA 已 serve 判**中性**；DL K-chunk 已于 v22 判**略负**）；
+  §9.2 tcgen05 的 194–215 tok/s 为**理论天花板**，170–175 tok/s 为**含翻译折扣的现实预期**，两者均未上机。

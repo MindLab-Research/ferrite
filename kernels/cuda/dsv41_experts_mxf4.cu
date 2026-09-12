@@ -3143,7 +3143,53 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_kernel(
     // 8 + 160 + 40 = 208 <= kTmemCols = 256.
 
     // =========================================================================
-    // 1. SF PROLOGUE — the WHOLE scale block into TMEM, once, before the MMAs.
+    // 1. STAGING PROLOGUE — arm + issue the first kRing-1 ring slots.
+    // =========================================================================
+    // FIRST, deliberately: the ring TMA is then in flight for the whole of the SF
+    // prologue below, so the ~20 KB of scale traffic does not sit in front of the
+    // first MMA with an idle memory system behind it.
+    //
+    // Issue one ring stage. All kThreads take part: 128 A rows (threads 0..127
+    // each copy kPackK/2 = 32 B = exactly one 32-byte DRAM sector, so a per-row
+    // copy wastes nothing) + 1 activation row (threads 0..7 carry one B row each;
+    // row 0 is the token and is the only one transferred).
+    //
+    // NOTE the B row choice: rows 1..7 of b_raw are zeroed ONCE (below) and are
+    // never re-written by a TMA, because the operand's B rows 1..7 are
+    // mathematically dead (their D columns are 0 by construction). This removes
+    // the need for an [8, dim] padded activation buffer upstream and saves 7/8 of
+    // the activation traffic. If that ever stops holding (e.g. a second token),
+    // rows 1..7 must be TMA'd like row 0.
+    auto issue = [&](int g) {
+        const int sslot = g % kRing;
+        const size_t k0 = (size_t)g * kPackK;
+        if (tid < kMTile)
+            tc5_bulk_g2s(s.a_raw[sslot] + (size_t)tid * (kPackK / 2),
+                         wp + (size_t)(m0 + tid) * kbytes + (k0 >> 1), kPackK / 2,
+                         &s.tma_bar[sslot]);
+        if (tid < kNTile)
+            tc5_bulk_g2s(s.b_raw[sslot] + (size_t)tid * kPackK, act + k0, kPackK,
+                         &s.tma_bar[sslot]);
+    };
+    // Zero B rows 1..7, once: they are never TMA'd again.
+    for (int i = tid; i < (kNTile - 1) * kPackK / 16; i += kThreads) {
+        const int n = 1 + i / (kPackK / 16), off = (i % (kPackK / 16)) * 16;
+        for (int r = 0; r < kRing; ++r)
+            *reinterpret_cast<uint4*>(s.b_raw[r] + (size_t)n * kPackK + off) =
+                make_uint4(0u, 0u, 0u, 0u);
+    }
+    __syncthreads();  // the tx count must be armed, and the zeroed B rows in smem,
+                      // before any copy is issued / any raw slot is permuted
+    if (tid == 0) {
+        for (int g = 0; g < kRing - 1; ++g)
+            if (g < ngrp) tc5_mbar_expect_tx(&s.tma_bar[g], kStageTxBytes);
+    }
+    __syncthreads();  // arm-before-issue
+    for (int g = 0; g < kRing - 1; ++g)
+        if (g < ngrp) issue(g);
+
+    // =========================================================================
+    // 2. SF PROLOGUE — the WHOLE scale block into TMEM, once, before the MMAs.
     // =========================================================================
     // Every MMA of the K loop reads all four row-group columns of its quad, so
     // the full 160 SFA columns must exist before the first MMA: the scales cannot
@@ -3157,9 +3203,6 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_kernel(
     // 128 * 160 = 20480 contiguous bytes, so it is copied one 32-row group at a
     // time (coalesced uint4s) into sf_stage, and the four-blocks-per-word
     // assembly happens out of smem.
-    //
-    // ORDERING: the ring prologue's TMA (step 2) is issued first so this
-    // 20 KB of scale traffic overlaps it instead of sitting in front of it.
     // =========================================================================
     for (int j = 0; j < 4; ++j) {
         const uint8_t* src = wsp + (size_t)(m0 + 32 * j) * nsf;
@@ -3192,49 +3235,6 @@ __global__ void __launch_bounds__(kThreads) expert_tcgen05_gateup_kernel(
     tc_fence_before_thread_sync();
     __syncthreads();
     tc_fence_after_thread_sync();
-
-    // =========================================================================
-    // 2. STAGING PROLOGUE — arm + issue the first kRing-1 ring slots.
-    // =========================================================================
-    if (tid == 0) {
-        for (int g = 0; g < kRing - 1; ++g)
-            if (g < ngrp) tc5_mbar_expect_tx(&s.tma_bar[g], kStageTxBytes);
-    }
-    __syncthreads();  // the tx count must be armed BEFORE any copy is issued
-
-    // Issue one ring stage. All kThreads take part: 128 A rows (threads 0..127
-    // each copy kPackK/2 = 32 B = exactly one 32-byte DRAM sector, so a per-row
-    // copy wastes nothing) + 1 activation row (threads 0..7 carry one B row each;
-    // row 0 is the token and is the only one transferred).
-    //
-    // NOTE the B row choice: rows 1..7 of b_raw are zeroed ONCE (below, before
-    // the loop) and are never re-written by a TMA, because the operand's B rows
-    // 1..7 are mathematically dead (their D columns are 0 by construction). This
-    // removes the need for an [8, dim] padded activation buffer upstream, and
-    // saves 7/8 of the activation traffic. If that assumption is ever broken
-    // (e.g. a second token), rows 1..7 must be TMA'd like row 0.
-    auto issue = [&](int g) {
-        const int sslot = g % kRing;
-        const size_t k0 = (size_t)g * kPackK;
-        if (tid < kMTile)
-            tc5_bulk_g2s(s.a_raw[sslot] + (size_t)tid * (kPackK / 2),
-                         wp + (size_t)(m0 + tid) * kbytes + (k0 >> 1), kPackK / 2,
-                         &s.tma_bar[sslot]);
-        if (tid < kNTile)
-            tc5_bulk_g2s(s.b_raw[sslot] + (size_t)tid * kPackK, act + k0, kPackK,
-                         &s.tma_bar[sslot]);
-    };
-    // Zero B rows 1..7, once: they are never TMA'd again.
-    for (int i = tid; i < (kNTile - 1) * kPackK / 16; i += kThreads) {
-        const int n = 1 + i / (kPackK / 16), off = (i % (kPackK / 16)) * 16;
-        for (int r = 0; r < kRing; ++r)
-            *reinterpret_cast<uint4*>(s.b_raw[r] + (size_t)n * kPackK + off) =
-                make_uint4(0u, 0u, 0u, 0u);
-    }
-    __syncthreads();  // the zeroed B rows must be in smem before any permute
-
-    for (int g = 0; g < kRing - 1; ++g)
-        if (g < ngrp) issue(g);
 
     // =========================================================================
     // 3. THE RING

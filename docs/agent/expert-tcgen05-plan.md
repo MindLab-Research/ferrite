@@ -78,9 +78,45 @@ M 侧 3840/5120 整除 128（满 tile），N 侧 decode=1 token → 补到 **N=8
   3. `PERBLK` 需 4 TMEM 列/块 ⇒ 真实 K（160 块 = 640 列 > 512）装不下，只能用于消歧，不能上生产；
   4. N=8 的 8 行都填独立随机激活（比"1 token + 7 行零"覆盖更强；行间独立，真实零填充同代码路径）。
 
+## 1c. Phase 1 骨架已落地（2026-09-12 代码已写；GPU parity 待跑）
+
+落点：`kernels/cuda/dsv41_experts_mxf4.cu` **文件尾部**，`namespace tc5`，整块由
+`#ifdef DSV41_TCGEN05_GATEUP_SKELETON` 包住 —— `build.sh` 不定义该宏，所以**不进 .so**；
+单独编译验证：`nvcc -gencode arch=compute_103a,code=sm_103a -DDSV41_TCGEN05_GATEUP_SKELETON=1 -c`。
+
+- 入口：`tc5::expert_tcgen05_gateup_kernel`（M=128 tile / N=8 / K_STEP=32 / kPackK=64 / kRing=3 /
+  128 线程），launcher `tc5::tc5_launch_gateup` + `extern "C" dsv41_expert_tcgen05_gate_up`
+  （env `DSV41_EXPERT_TCGEN05` 门禁，函数内 `static const` 读一次，默认 OFF）。
+- **本地已闭环（无 GPU）**：sm_103a 编译过；ptxas `-v` = **101 regs / 0 spill / 46080 B static smem**；
+  PTX 内含 `tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X`、
+  `cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes`、
+  `mbarrier.arrive.expect_tx`、`tcgen05.st.sync.aligned.32x32b.x1.b32`（x1 拼写 ptxas 接受）。
+  默认构建（不定义宏）不受影响，仍 0 error。
+- **骨架里 4 个新结论（超出 §2 原设计，实施时必须知道）**：
+  1. **PACKED SF 在真实 K 下是被迫的、不是选择**：PERBLK 需 4 列/块 ⇒ 160 块 = 640 列 > 512 TMEM 列，
+     装不下。所以 §1b 里 PACKED 假设的 GPU 判定从"两种布局哪个对"升级为**唯一可上线路径**，
+     PACKED 挂 = 整个 Phase 1 布局假设挂（这是 §1c 最重要的一条）。
+  2. **mxf8f6f4 的 fp4 操作数必须 UNPACKED（1 元素/字节）**，而 checkpoint 是 2 元素/字节 ⇒
+     每个 ring slot 需要两块 buffer（TMA 落的 raw 打包区 + MMA 读的 unpack 操作数），
+     并在中间做一次 1:2 展开。这就是本 kernel 最大的 smem 开销，也是"TMA 直接写操作数"不可能的原因。
+     **Alternative B（已记为备选，未实现）**：改 `kind::mxf4`（两侧都打包）⇒ 无 unpack 段、操作数 smem 减半、
+     MMA 是 `tests_tcgen05_mxf4.cu` 已数值验证的那条；代价是激活格式 e4m3→e2m1（放弃 Phase 0 买的精度余量），
+     且 2X 粒度需把 checkpoint 的 per-32 scale 配对（现 kernel 已在做）。切换约 30 行。
+  3. **静态 smem 装得下**（kPackK=64/kRing=3 时 45 KiB）⇒ 不需要 `cudaFuncSetAttribute`，
+     **图捕获安全**；更深的 ring（更多 in-flight 字节）才需要动态 smem + init 期一次性的 attribute 设置。
+  4. **occupancy 是硬约束**：grid=(30, slots) 且每 CTA 256/512 TMEM 列 ⇒ ≤2 CTA/SM；
+     slots=1 时只有 30 CTA（≈15 SM）——**隔离微基准必须跑 slots=8（240 CTA）**，否则测的是延迟不是带宽。
+     若 slots=8 仍离地板远，下一步是 **K-split**（同一份权重换更多 CTA 数），需配一个
+     确定性升序 reduce（与 §3 down 的 ascending-slot 契约同款）。kernel 的 ring 不用改。
+- **仍待填（骨架里已标 TODO-1..5 + K-SPLIT）**：真实 K 的 GPU parity（复用 Phase 0 harness + 真实
+  checkpoint 字节）、`kPackK`/`kRing` 调优基准、2D tensor TMA（每 stage 1 条指令替代 129 条）、
+  K-split reduce、Phase 2 的 pool/ids 间接寻址 + Rust FFI。
+
 ## 2. Phase 1（1-2 天）gateup kernel
 
-落点：`kernels/cuda/dsv41_experts_mxf4.cu` 新增 `mxf8f6f4_swapab_gemm_kernel`（保留旧 kernel）。
+落点：`kernels/cuda/dsv41_experts_mxf4.cu` 新增 swapAB gateup kernel（保留旧 kernel）。
+**实际命名见 §1c**：`tc5::expert_tcgen05_gateup_kernel`（原计划名 `mxf8f6f4_swapab_gemm_kernel` 未采用，
+骨架已按最终签名写好）。
 - **A 侧（权重）**：fp4 smem descriptor。**必须补多级异步 staging**（TMA bulk / cp.async）——
   现 `mxf4_gemm_kernel:348-421` 全程 LDG→STS、无 cp.async/TMA（STATUS:5038 的 16.8GB/s 0.2%
   带宽地板根因）。swapAB 只解决 M 钉死，**不补 staging 仍是 0.2% 地板**。
