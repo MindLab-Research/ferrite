@@ -4805,3 +4805,28 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 |---|---|---|
 | lazy 完成 + L4/L5 | 145 / 97 | 不够 400！ |
 | batched（SWALLOW 修复）| 480 / 320 理论 | **唯一路径**——第 9 次修复设计中 |
+
+## tcgen05 重启测试的准备（K1/K2 后的下一个大优化）
+
+**tcgen05 的 gate 链**：
+```bash
+DSV41_EXPERT_TCGEN05_E4M3=1   # tcgen05 e4m3 臂
+DSV41_EXPERT_GROUPED=1         # grouped MoE
+DSV41_GATEUP_FUSE=0            # 关 gateup 融合（tcgen05 的前提）
+DSV41_EXPERT_ILV=0             # 非交错权重（checkpoint 原生）
+DSV41_MOE_BATCH=1              # MoE batch（tcgen05 的前提）
+```
+
+**验证要点**（tcgen05-restart-analysis 的建议）：
+1. **nsys 确认 kernel 执行**：e4m3_gemm_grouped_kernel 实例 > 0（正证据）
+2. **计数前 61 行**（修正判据）
+3. **吞吐对比**：预期 +3-5%（MoE 三件套 38.1% 的 tensor core 化）
+
+**风险**：
+- ILV=0 的权重加载（非交错）——之前确认"完全可用"
+- 与 SH_PAIR_M 的互斥——tcgen05 和 SH_PAIR 可能不能共存（需要确认）
+- 对齐守卫——已修复（ld_uint2_a8）但守卫保护的是 pair body 不是 split body
+
+**预期**：
+- 当前干净栈（90.8）+ tcgen05 = **~94-95**
+- 如果 tcgen05 干净且有效，这是 lazy 路径到 145 的关键一步
