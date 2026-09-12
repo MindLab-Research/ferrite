@@ -550,3 +550,29 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 **代价**：每个 K-atom 需要 1 次 tmem 读 + 2 次乘 + 1 次加（vs 单次大 MMA 的 1 次终读）。K=2304/rank → 36 atoms → 36 次 tmem 往返。
 **收益模型**：SIMT 377GB/s（每 fp4 值 2.5 条 L1TEX 解码指令）→ tensor core 路径的解码消失。tcgen05 mxf4 骨架已按 masked M=128 tile 写好（kMTile=128/kNTile=64/kAtomK=64），tile 机制可直接复用。
 **关键风险**：36 次 tmem 往返的延迟 vs SIMT 的 377GB/s——需要微基准定夺（预期 tensor core + tmem 往返仍快 3-5×）。
+
+## 超越 400 的完整数学（用户目标：明显超过 400）
+
+**当前基线**（lazy verify + m=1 图 + e4m3）：
+- 步时 22.56ms，tok/step 2.08（accept 1.08），实际吞吐 ~92 tok/s
+- k_acc 直方图 {0:55, 1:13, 2:10, 3:4, 4:3, 5:1}——**64% 的步 k_acc=0**（首个 draft 就被拒）
+
+**400 需要**：吞吐 4.3× → accept 4.6 @ 22.56ms 或 accept 1.08 @ 5.2ms 或组合
+**500+ 需要**：吞吐 5.4× → accept 5.8 @ 22.56ms 或 accept 5.4 @ 4.2ms 或组合
+
+**工程侧（步时压缩，可确定）**：
+| 项 | 现在 | 落地后 |
+|---|---|---|
+| verify | 37.31 | ~15（全融合 + tcgen05）|
+| draft | 4.29 | ~1（P3c 图化）|
+| commit | 0.20 | 0.20 |
+| **步时** | **~24-42** | **~16** |
+
+**accept 侧（乘数，关键未知数）**：
+- sglang DSpark B=1 达 accept ~5 → 383.7 tok/s @ 步时 13ms
+- ferrite 当前 accept 1.08——**draft 首token 拒绝率 64% 是瓶颈**
+- bf16 截断可能提升 accept（backbone 对齐官方 → draft 更准）——等 GPU 验证
+- **如果 bf16 截断把 accept 拉到 3+**：16ms × accept 3 = 187 tok/s；accept 5 = 312 tok/s
+- **如果 accept 保持 1**：再怎么压步时也到不了 400（需要 2.5ms 步时——不可能）
+
+**结论**：400 的成败在 **accept 率**，不在步时。bf16 截断（backbone 对齐）+ draft 数值路径对齐是关键。sglang 的 accept 5 说明 MTP head 有这个能力——ferrite 的 draft 实现有数值偏差压低了它。
