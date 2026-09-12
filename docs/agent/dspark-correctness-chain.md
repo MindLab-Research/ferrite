@@ -6037,3 +6037,25 @@ A. **步时更高**（batched forward 的 kernel 效率低）→ 优化 kernel
 B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 
 **下一步**：SWALLOW + V5_LEDGER 的 k_emit 序列分析（确认 accept 是不是真的 ~1.2）
+
+## SWALLOW accept 质量对 400 的影响分析
+
+**SWALLOW 的 accept 问题**：
+| 场景 | accept | 步时 15ms 的吞吐 | 400 可达 |
+|---|---|---|---|
+| 如果 accept 可修复到 ~5 | 5.0 | 6/0.015 = **400** ✓ | ✅ |
+| 如果 accept 只能到 ~3 | 3.0 | 4/0.015 = **267** | ❌ |
+| 如果 accept 固定在 ~1.2 | 1.2 | 2.2/0.015 = **147** | ❌ |
+
+**结论**：**SWALLOW 的 accept 质量是 400 的关键前提**——如果 accept 不能接近 lazy 的 ~5，batched 路径到不了 400。
+
+**accept 低的可能根因**（等 subagent 判决 + k_emit 序列数据）：
+1. **draft 的预测质量**：SWALLOW 的 draft 路径与 lazy 不同？
+2. **verify 的 argmax 差异**：batched m=6 的 argmax 与 m=1 不同？
+3. **tap/commit 差异**：batched 的 tap staging 有偏差？
+
+**与 lazy 的对照**：lazy 在同一任务 accept ~5（前 61 行几乎全接受）——**同模型同 prompt**。差异在 SWALLOW 的管线。
+
+**如果 accept 不可修复**：
+- lazy 91.1（当前最佳）→ L4/L5 优化 → ~145 上限
+- 400 需要 accept≥4 且步时≤15ms——batched 的 accept 问题必须解决
