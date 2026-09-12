@@ -17,7 +17,7 @@
 //! The reduction sums the slots in **rank order**, identically on every rank, so
 //! the result is bit-identical across ranks and reproducible run to run.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Spin barrier. `std::sync::Barrier` parks and unparks threads through the
@@ -29,6 +29,13 @@ pub struct SpinBarrier {
     n: usize,
     count: AtomicUsize,
     gen: AtomicUsize,
+    /// The arm vote — an INDEPENDENT generation, deliberately kept out of
+    /// `count`/`gen` above. `wait` counts ARRIVALS per generation, so folding a
+    /// payload-carrying rendezvous into the same counter would let a vote change
+    /// the epoch sequence the callers of `wait` see (exactly the coupling that
+    /// makes the arms' rendezvous counts load-bearing in `chain_dev`). See
+    /// [`RankVote`] for the protocol.
+    vote: RankVote,
 }
 
 impl SpinBarrier {
@@ -37,6 +44,7 @@ impl SpinBarrier {
             n,
             count: AtomicUsize::new(0),
             gen: AtomicUsize::new(0),
+            vote: RankVote::new(n),
         }
     }
 
@@ -60,6 +68,96 @@ impl SpinBarrier {
                 }
             }
         }
+    }
+
+    /// This rank's `value`, returned as the UNANIMOUS value iff every rank voted
+    /// the same, `None` otherwise. ONE rendezvous, and it does NOT touch `wait`'s
+    /// generation. See [`RankVote::unanimous_i32`].
+    pub fn unanimous_i32(&self, rank: usize, value: i32) -> Option<i32> {
+        self.vote.unanimous_i32(rank, value)
+    }
+}
+
+/// A one-`i32`-per-rank **unanimity vote**: every rank publishes one code and
+/// learns whether the ranks agreed, in a single rendezvous.
+///
+/// # Why a vote rather than a barrier
+///
+/// The verify-graph gate in `chain_dev` is per-RANK (a capture-failure latch, a
+/// shape pool, a `compress_len` host mirror), while the arms it chooses between
+/// take DIFFERENT numbers of `host_barrier` arrivals per block. `SpinBarrier`
+/// counts arrivals, so two ranks in different arms misphase every later barrier
+/// (`ar5-hang`). The fix is to make the ranks agree on the arm before any of
+/// them walks it — and, when they cannot agree, to fall back to the one arm that
+/// exists in every state (the direct launches). A plain barrier cannot carry
+/// that decision, hence the payload.
+///
+/// # Protocol (and why it is lap-safe)
+///
+/// Round `n` uses the buffer selected by `n & 1`, so a rank that has already
+/// started round `n + 1` writes into the OTHER half and cannot be observed by a
+/// slow peer still reading round `n`. Only one round of lapping is possible
+/// (round `n + 1` needs every rank to arrive, and the slow rank has not), which
+/// is exactly what the parity covers. The arrival counter is reset by the last
+/// arriver BEFORE it bumps the generation, so a lap cannot be miscounted.
+///
+/// The result is deliberately all-or-nothing: a single dissenting rank sends the
+/// whole world to the fallback. That is the conservative direction — the
+/// alternative (majority) would leave a minority walking an arm whose rendezvous
+/// count the majority does not share.
+pub struct RankVote {
+    world: usize,
+    /// Arrivals in the CURRENT round.
+    arrived: AtomicUsize,
+    /// Completed rounds; also the buffer parity for the current round.
+    gen: AtomicUsize,
+    /// `2 * world` slots: round `n` uses `votes[(n & 1) * world .. + world]`.
+    votes: Vec<AtomicI32>,
+}
+
+impl RankVote {
+    pub fn new(world: usize) -> Self {
+        let world = world.max(1);
+        Self {
+            world,
+            arrived: AtomicUsize::new(0),
+            gen: AtomicUsize::new(0),
+            votes: (0..2 * world).map(|_| AtomicI32::new(0)).collect(),
+        }
+    }
+
+    /// Publish `value` for `rank` and return `Some(v)` iff every rank published
+    /// `v` this round, `None` on any disagreement. A world of one is unanimity by
+    /// construction and skips the rendezvous entirely.
+    pub fn unanimous_i32(&self, rank: usize, value: i32) -> Option<i32> {
+        if self.world <= 1 {
+            return Some(value);
+        }
+        let g = self.gen.load(Ordering::Acquire);
+        let base = (g & 1) * self.world;
+        self.votes[base + rank].store(value, Ordering::Release);
+        if self.arrived.fetch_add(1, Ordering::AcqRel) + 1 == self.world {
+            // Last in: clear the counter for the next round FIRST (a rank that
+            // laps cannot pass the generation bump below until this store is
+            // visible), then release the others with the bump.
+            self.arrived.store(0, Ordering::Release);
+            self.gen.store(g + 1, Ordering::Release);
+        } else {
+            let mut spins = 0u32;
+            while self.gen.load(Ordering::Acquire) == g {
+                spins += 1;
+                if spins < 4096 {
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+        }
+        let first = self.votes[base].load(Ordering::Acquire);
+        let all = self.votes[base..base + self.world]
+            .iter()
+            .all(|v| v.load(Ordering::Acquire) == first);
+        all.then_some(first)
     }
 }
 
@@ -727,6 +825,18 @@ impl Collective {
     /// memory access on a rank that varied between runs - the signature of a race.
     pub fn host_barrier(&self) {
         self.barrier.wait();
+    }
+
+    /// Publish this rank's arm code and return the UNANIMOUS code, or `None` when
+    /// the ranks disagree. The caller then falls back to the direct launches.
+    ///
+    /// This is the ONLY cross-rank decision primitive here that carries a
+    /// payload; it rides the shared [`SpinBarrier`] (every rank already holds the
+    /// same `Arc`, so no new plumbing) but on an INDEPENDENT generation, so a
+    /// vote never perturbs the arrival epochs `host_barrier` hands out. See
+    /// [`RankVote`] for why that separation is load-bearing.
+    pub fn unanimous_i32(&self, value: i32) -> Option<i32> {
+        self.barrier.unanimous_i32(self.rank, value)
     }
 
     /// Release a round (pairs with `publish`, to keep the next round from

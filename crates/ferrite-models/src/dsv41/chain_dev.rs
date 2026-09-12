@@ -1928,6 +1928,37 @@ fn verify_graph_name(m: usize) -> String {
     format!("verify_graph_m{m}")
 }
 
+/// The four arms of [`DevChain::step_rows_sync`] a verify block can run in, as the
+/// RANK-VISIBLE code the arms vote on (Plan B, "unanimity-or-direct").
+///
+/// The code exists because the arms do not cost the same number of `host_barrier`
+/// arrivals per block, and `SpinBarrier` counts arrivals per epoch: two ranks in
+/// different arms close epochs their peers never entered, and every later barrier
+/// in the request is one generation out — the stall `ar5-hang` traced. Making the
+/// ranks AGREE on the arm is what keeps the counts equal; when they cannot agree,
+/// the world takes [`VerifyArm::Direct`], the one arm that exists in every state
+/// (the graph is an optimisation over those launches, never a different program).
+///
+/// Voting on the ARM rather than on "graph or not" is the point: `Dry`, `Capture`
+/// and `Replay` all return a slot index, so a `Some`/`None` vote would let a rank
+/// that is DRY-ing a fresh shape and a peer that is REPLAYING one "agree" while
+/// walking arms with different rendezvous counts (`Capture` alone takes two — it
+/// brackets its recording). The three are therefore distinct codes, and only
+/// `Dry`/`Replay` — the pair with equal counts — are adjacent in meaning.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VerifyArm {
+    /// No graph: the caller's direct launches. One rendezvous whenever the graph
+    /// is configured on (`DSV41_VERIFY_GRAPH`), zero when it is off.
+    Direct = 0,
+    /// The shape's first-use DRY execution (a REAL run, to move every lazy
+    /// first-use cost outside the capture). One rendezvous.
+    Dry = 1,
+    /// Record the shape's graph. TWO rendezvous: the recording is bracketed.
+    Capture = 2,
+    /// Launch the stored graph. One rendezvous.
+    Replay = 3,
+}
+
 /// DSV41_AR_STORE_FUSE=1 re-enables the wo_b all-reduce store epilogue.
 fn ar_store_fuse() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5523,9 +5554,14 @@ impl<'a> DevChain<'a> {
         self.verify_shapes.iter().position(|&s| s == 0)
     }
 
-    fn verify_graph_gate(&self, m: usize, pos_base: i32) -> Option<usize> {
+    /// THIS RANK's arm for a verify block of `m` rows at `pos_base` — the
+    /// decision [`Self::verify_graph_gate`] used to make inline, as a value the
+    /// ranks can vote on (see [`VerifyArm`]). Pure: the gate, the vote and the
+    /// dispatch in [`Self::step_rows_sync`] all read the same state, so the arm
+    /// that is voted on is the arm that runs.
+    fn verify_arm_local(&self, m: usize, pos_base: i32) -> (VerifyArm, Option<usize>) {
         if !verify_graph_want() || pos_base < 1 {
-            return None;
+            return (VerifyArm::Direct, None);
         }
         // (ar5-hang method C) `DSV41_SWALLOW_STEP`'s warm-up window. The swallow
         // arm's first rounds are the ONLY place a request runs TWO verify shapes
