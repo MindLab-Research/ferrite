@@ -2062,17 +2062,47 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     }
 }
 
+// AR v5 store helpers (A1a). The .cu files are separate translation units, so
+// each carrier keeps its own copy; the arithmetic MUST stay IDENTICAL to
+// ferrite_kernels.cu's `p2p_ar_v5_slot_base` / `p2p_ar_v5_store_elem` (which in
+// turn mirror `p2p_ar_store_v5_kernel`'s addressing) — that is what makes the
+// staging layout agree. See the long note above `p2p_ar_v5_slot_base` in
+// ferrite_kernels.cu for the last-writer / coverage / no-PDL contract.
+__device__ __forceinline__ size_t dsv41_ar5_slot_base(
+    const unsigned* __restrict__ epoch, int world, int my_rank, int stride) {
+    const unsigned e = *epoch;
+    return (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride;
+}
+__device__ __forceinline__ void dsv41_ar5_store_elem(
+    float* const* __restrict__ staging_tbl, size_t base, int world, size_t i, float v) {
+    #pragma unroll 4
+    for (int rr = 0; rr < world; rr++) staging_tbl[rr][base + i] = v;
+}
+
 // Fixed-order reduction of the batched down scratch:
 //   out[i] = ((0 + part[0][i]) + part[1][i]) + ... + part[slots-1][i]
 // i.e. the SAME ascending-slot order the sequential loop's `out[i] += x` used,
 // starting from 0.0f. fp addition is not associative, so this order is part of
 // the numerical contract - do NOT parallelise the slot loop.
+//
+// `ar_stg` (A1a, optional): non-null means this launch ALSO copies its output
+// into every peer's staging slot, i.e. it carries the following all-reduce's
+// store. The epilogue only ADDS a copy AFTER `acc` is final, so the summation
+// bits (the contract above) are identical in both modes; `dsv41_moe_down_reduce`
+// leaves the defaults, so both modes run the SAME compiled kernel.
 __global__ void moe_down_reduce_kernel(const float* __restrict__ part, float* __restrict__ out,
-                                       int n, int slots) {
+                                       int n, int slots,
+                                       float* const* __restrict__ ar_stg = nullptr,
+                                       const unsigned* __restrict__ ar_epoch = nullptr,
+                                       int ar_world = 0, int ar_rank = 0, int ar_stride = 0) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
         float acc = 0.f;
         for (int s = 0; s < slots; ++s) acc += part[(size_t)s * n + i];
         out[i] = acc;
+        if (ar_stg != nullptr)
+            dsv41_ar5_store_elem(ar_stg,
+                                 dsv41_ar5_slot_base(ar_epoch, ar_world, ar_rank, ar_stride),
+                                 ar_world, (size_t)i, acc);
     }
 }
 
@@ -2865,6 +2895,30 @@ extern "C" int dsv41_moe_down_reduce(const float* part, float* out, int n, int s
     if (n <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const unsigned blocks = (unsigned)((n + 255) / 256);
     moe_down_reduce_kernel<<<blocks, 256, 0, stream>>>(part, out, n, slots);
+    return (int)cudaGetLastError();
+}
+
+// The same sum, carrying the all-reduce's store (A1a). On a rank WITHOUT the
+// shared expert this `out` (= `s.o`) is `s.o`'s LAST writer, so it is also the
+// value the following all-reduce must publish: the epilogue copies it into every
+// peer's staging slot and the AR then runs as publish+reduce only
+// (`ferrite_p2p_ar_pubred_v5_moe` / `ferrite_p2p_ar_pubred_v5_hcpost`). On the
+// rank that DOES compute the shared expert the add is a later writer, so this
+// entry must not be used there (see chain_dev.rs's `moe()`).
+//
+// Return contract (device.rs::moe_down_reduce_ar depends on it):
+//   0  = the store WAS carried: the caller must then use the publish+reduce
+//        entry, NOT the full all-reduce;
+//   <0 = cuda error (the caller falls back to `dsv41_moe_down_reduce` + the
+//        ordinary all-reduce, so the store can never be dropped silently).
+extern "C" int dsv41_moe_down_reduce_st(const float* part, float* out, int n, int slots,
+                                        float* const* staging_tbl, const unsigned* epoch,
+                                        int world, int my_rank, int stride, cudaStream_t stream) {
+    if (n <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
+    if (staging_tbl == nullptr || epoch == nullptr || world <= 0) return (int)cudaErrorInvalidValue;
+    const unsigned blocks = (unsigned)((n + 255) / 256);
+    moe_down_reduce_kernel<<<blocks, 256, 0, stream>>>(
+        part, out, n, slots, staging_tbl, epoch, world, my_rank, stride);
     return (int)cudaGetLastError();
 }
 

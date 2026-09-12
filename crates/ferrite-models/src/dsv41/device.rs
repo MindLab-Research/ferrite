@@ -405,6 +405,24 @@ struct Kernels {
         c_int, c_int, c_int, c_int, f32, c_int, f32, c_int, CuStream,
     ) -> c_int,
     add_inplace: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, CuStream) -> c_int>,
+    /// `ferrite_add_store` (A1a): the same elementwise add, whose epilogue ALSO
+    /// copies `z` into every peer's staging slot — i.e. the launch carries the
+    /// following all-reduce's store. Used only where the standalone add is the
+    /// payload's LAST writer (see `Device::add_inplace_ar`).
+    add_inplace_ar: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *const f32,
+            *mut f32,
+            c_int,
+            *const *mut f32,
+            *const c_uint,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     hc_collapse: Option<unsafe extern "C" fn(*const f32, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int>,
     ar_stamp: Option<unsafe extern "C" fn(*const u64, c_int, c_int, c_uint, CuStream) -> c_int>,
     ar_store: Option<
@@ -879,6 +897,23 @@ struct Kernels {
         ) -> c_int,
     >,
     moe_down_reduce: Option<unsafe extern "C" fn(*const f32, *mut f32, c_int, c_int, CuStream) -> c_int>,
+    /// `dsv41_moe_down_reduce_st` (A1a): the same fixed-order sum, whose epilogue
+    /// also copies `out` into every peer's staging slot (carries the following
+    /// all-reduce's store). Valid only where this sum is `s.o`'s LAST writer.
+    moe_down_reduce_ar: Option<
+        unsafe extern "C" fn(
+            *const f32,
+            *mut f32,
+            c_int,
+            c_int,
+            *const *mut f32,
+            *const c_uint,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// w2 L2 prewarm (DSV41_W2_PREWARM): `cp.async.bulk.prefetch.L2.global` over
     /// every slot's w2 + scale rows, launched between the gate/up and the down
     /// launch. Writes nothing; returns 0 always (best effort).
@@ -1175,6 +1210,23 @@ struct Kernels {
             CuStream,
         ) -> c_int,
     >,
+    /// `ferrite_p2p_ar_pubred_v5_moe` (A1a): byte-for-byte `p2p_ar_pubred_v5`
+    /// with the A0 probe's site label set to the MoE site — the MoE AR runs the
+    /// same publish+reduce once a producer carried the store.
+    p2p_ar_pubred_v5_moe: Option<
+        unsafe extern "C" fn(
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// AR v5 with the segment-C `hc_post_inplace` folded into the pubred
     /// epilogue (`ferrite_p2p_ar_v5_hcpost`): same shapes as `p2p_ar_v5` plus the
     /// residual stream `hc_res` (`[hc_n][hc_h]`) and the hyper-connection
@@ -1229,6 +1281,30 @@ struct Kernels {
             *const f32,
             *const f32,
             *const *mut f32,
+            *const *mut u32,
+            *mut c_uint,
+            *const f32,
+            *const c_uint,
+            *mut f32,
+            c_int,
+            c_int,
+            c_int,
+            c_int,
+            *mut f32,
+            *const f32,
+            *const f32,
+            c_int,
+            c_int,
+            CuStream,
+        ) -> c_int,
+    >,
+    /// `ferrite_p2p_ar_pubred_v5_hcpost` (A1a): the publish+reduce AND the
+    /// hc-post fold with NO store — the payload was already carried by a
+    /// producer's epilogue. Covers the ADD_EPI (`_hcpost_add`) path too, because
+    /// the folded residual only changes what is PUBLISHED (now the carrier's
+    /// business); the hc-post half consumes `out`.
+    p2p_ar_pubred_v5_hcpost: Option<
+        unsafe extern "C" fn(
             *const *mut u32,
             *mut c_uint,
             *const f32,
@@ -1337,6 +1413,7 @@ impl Device {
             hc_mixes: km!(rt, "dsv41_hc_mixes"),
             moe_route: km!(rt, "dsv41_moe_route"),
             add_inplace: ko!(rt, "ferrite_add"),
+            add_inplace_ar: ko!(rt, "ferrite_add_store"),
             hc_collapse: ko!(rt, "dsv41_hc_collapse"),
             ar_stamp: ko!(rt, "dsv41_ar_stamp"),
             ar_store: ko!(rt, "dsv41_ar_store"),
@@ -1383,6 +1460,7 @@ impl Device {
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
+            moe_down_reduce_ar: ko!(rt, "dsv41_moe_down_reduce_st"),
             expert_down_reduce_fp4_batched: ko!(rt, "dsv41_expert_down_reduce_fp4_batched"),
             w2_l2_prewarm: ko!(rt, "dsv41_w2_l2_prewarm"),
             swiglu_limit_batched: ko!(rt, "dsv41_swiglu_limit_batched"),
@@ -1419,9 +1497,11 @@ impl Device {
             bf16_to_f32: km!(rt, "ferrite_bf16_to_f32"),
             p2p_ar_v5: ko!(rt, "ferrite_p2p_ar_v5"),
             p2p_ar_pubred_v5: ko!(rt, "ferrite_p2p_ar_pubred_v5"),
+            p2p_ar_pubred_v5_moe: ko!(rt, "ferrite_p2p_ar_pubred_v5_moe"),
             p2p_ar_v5_hcpost: ko!(rt, "ferrite_p2p_ar_v5_hcpost"),
             p2p_ar_v5_add: ko!(rt, "ferrite_p2p_ar_v5_add"),
             p2p_ar_v5_hcpost_add: ko!(rt, "ferrite_p2p_ar_v5_hcpost_add"),
+            p2p_ar_pubred_v5_hcpost: ko!(rt, "ferrite_p2p_ar_pubred_v5_hcpost"),
             p2p_ar_v5_hcpost_rows: ko!(rt, "ferrite_p2p_ar_v5_hcpost_rows"),
         };
         Ok(Device { rt, kernels, stream, hc_split_armed: std::cell::Cell::new(false) })

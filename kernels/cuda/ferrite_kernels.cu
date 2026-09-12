@@ -9416,6 +9416,28 @@ extern "C" cudaError_t ferrite_p2p_ar_pubred_v5(
     return cudaGetLastError();
 }
 
+// The SAME publish+reduce for the MoE site (A1a): byte-for-byte the body above,
+// with the A0 probe's site label set to `AR5_SITE_MOE` so the MoE half of the
+// 80 rounds/step stays distinguishable from the attention half. A second symbol
+// (not a `site` parameter) because the probe label is the only difference and
+// adding an argument to `ferrite_p2p_ar_pubred_v5` would change the ABI that
+// `device.rs` binds by name.
+extern "C" cudaError_t ferrite_p2p_ar_pubred_v5_moe(
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride, cudaStream_t s) {
+    // Grid on n4 — see the launcher note in `ferrite_p2p_ar_v5`.
+    const int threads = ferrite_ar_v5_block_threads(world);
+    int blocks = ferrite_ar_v5_grid_blocks(n, threads);
+    const int single_poll = ferrite_ar_single_poll();
+    const int probe = ferrite_ar_probe();
+    const int trap = ferrite_ar_timeout_trap();
+    p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
+        single_poll, probe, AR5_SITE_MOE, trap);
+    return cudaGetLastError();
+}
+
 // ---------------------------------------------------------------------------
 // AR v5 pubred WITH the segment-C `hc_post_inplace` folded into its epilogue.
 //
@@ -9611,6 +9633,33 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_add(
         partial, staging_tbl, epoch, world, my_rank, n, stride, bias);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return err;
+    p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
+        ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
+        hc_res, hc_post, hc_comb, hc_n, hc_h,
+        ferrite_ar_single_poll(), ferrite_ar_probe(), AR5_SITE_MOE,
+        ferrite_ar_timeout_trap());
+    return cudaGetLastError();
+}
+
+// The publish+reduce AND the hc-post fold, with NO store (A1a): the payload was
+// already published by the producer's epilogue (see the note above
+// `p2p_ar_v5_slot_base`), so only the second launch of
+// `ferrite_p2p_ar_v5_hcpost` remains. It covers the ADD_EPI (`_hcpost_add`) path
+// as well: the folded residual changes only WHAT is published to the peers, which
+// is now the carrier's business — the hc-post half consumes `out` (the reduced
+// sum), never `bias`. `hc_res`/`hc_post`/`hc_comb` keep the shapes and the
+// bit-pinned arithmetic of `ferrite_p2p_ar_v5_hcpost`.
+extern "C" cudaError_t ferrite_p2p_ar_pubred_v5_hcpost(
+    unsigned* const* ready_tbl, unsigned* epoch,
+    const float* staging_local, const unsigned* ready_local,
+    float* out, int n, int world, int my_rank, int stride,
+    float* hc_res, const float* hc_post, const float* hc_comb,
+    int hc_n, int hc_h, cudaStream_t s) {
+    if (hc_res == nullptr || hc_post == nullptr || hc_comb == nullptr ||
+        hc_n <= 0 || hc_n > 8 || (hc_h & 3) != 0 || n != hc_h)
+        return cudaErrorInvalidValue;
+    const int threads = ferrite_ar_v5_block_threads(world);
+    int blocks = ferrite_ar_v5_grid_blocks(n, threads);
     p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
         hc_res, hc_post, hc_comb, hc_n, hc_h,
@@ -9997,16 +10046,104 @@ extern "C" cudaError_t ferrite_gdn_step_v2p(
                         q, k, v, b_raw, fb, dt_bias, a_log, lb, state, out, 1, h, dk, dv);
 }
 
+// ============================================================
+// AR v5 store, CARRIED BY A PRODUCER'S EPILOGUE (A1a).
+//
+// `p2p_ar_store_v5_kernel` above is a PURE element-wise copy of the payload into
+// every peer's staging slot, issued independently by each block. So any kernel
+// which (a) runs on the same stream before the publish+reduce and (b) writes
+// every payload element exactly once, with the value the AR must reduce, can
+// carry that copy in its own epilogue — and the AR then costs one launch (the
+// publish+reduce) instead of two. This is the MoE half of that change (the
+// attention half lives in `dsv41_kernels.cu`'s `gemm_fp8_gemv_kernel`, launched
+// through `dsv41_gemm_fp8_mx`'s staging args); the two halves are the same
+// protocol, so `ferrite_p2p_ar_pubred_v5*` serves both.
+//
+// A carrier must satisfy all of:
+//   1. LAST WRITER. It produces the FINAL payload value. The store only copies,
+//      so publishing an INTERMEDIATE would put bytes into the peers' slots that
+//      no later step can retract (pubred orders, it does not correct).
+//   2. FULL COVERAGE, ONCE, IN BOUNDS. Every element of [0, n) is written by
+//      exactly one thread at slot offset ((e & 1) * world + my_rank) * stride + i
+//      — the same expression `p2p_ar_store_v5_kernel` uses. Elements at or
+//      beyond n must NOT be touched: slot + stride is the NEXT slot, i.e.
+//      another rank's payload.
+//   3. SAME STREAM, BEFORE THE PUBLISH, NO PDL. The carriers are launched with a
+//      plain <<<>>> (no cudaGridDependencySynchronize), so their prologue cannot
+//      overlap a predecessor. If a PDL attribute is ever added to a carrier, the
+//      store has to move behind the grid-dependency sync.
+//
+// Nothing else about the protocol changes. In particular the memory-order
+// argument does NOT change: what makes the staging writes peer-visible is the
+// KERNEL BOUNDARY between the writer and the publish, and a carrier's completion
+// is exactly that boundary. The parity argument is unchanged too — the copy only
+// moves EARLIER (out of its own launch into the producer), so it is still after
+// this rank's previous publish, which is what keeps a peer from overwriting a
+// slot before every rank has reduced it. The epoch is read at KERNEL RUN TIME
+// (it has to be: that is what makes a captured graph replay), exactly as
+// `p2p_ar_store_v5_kernel` reads it; a carrier sits strictly inside the window
+// between the previous round's publish and this round's, i.e. where the
+// standalone store sat.
+// ============================================================
+__device__ __forceinline__ size_t p2p_ar_v5_slot_base(
+    const unsigned* __restrict__ epoch, int world, int my_rank, int stride) {
+    const unsigned e = *epoch;
+    return (size_t)((e & 1u) * (unsigned)world + (unsigned)my_rank) * (unsigned)stride;
+}
+
+// One payload element to every peer's slot; `base` = `p2p_ar_v5_slot_base`.
+__device__ __forceinline__ void p2p_ar_v5_store_elem(
+    float* const* __restrict__ staging_tbl, size_t base, int world, size_t i, float v) {
+    #pragma unroll 4
+    for (int rr = 0; rr < world; rr++) staging_tbl[rr][base + i] = v;
+}
+
 // elementwise add (residual): z = x + y — MTP layer's standard (non-MHC)
 // residual connections.
+//
+// `ar_stg` (A1a, optional): non-null means this launch ALSO copies `z` into
+// every peer's staging slot, i.e. it carries the following all-reduce's store
+// (see the note above `p2p_ar_v5_slot_base`). `ferrite_add` leaves the defaults
+// so BOTH modes run the SAME compiled kernel and the `x + y` bits cannot differ
+// between them; only `ferrite_add_store` passes the store arguments.
 __global__ void add_kernel(const float* __restrict__ x, const float* __restrict__ y,
-                           float* __restrict__ z, int n) {
+                           float* __restrict__ z, int n,
+                           float* const* __restrict__ ar_stg = nullptr,
+                           const unsigned* __restrict__ ar_epoch = nullptr,
+                           int ar_world = 0, int ar_rank = 0, int ar_stride = 0) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) z[i] = x[i] + y[i];
+    if (i < n) {
+        const float v = x[i] + y[i];
+        z[i] = v;
+        if (ar_stg != nullptr) {
+            const size_t base = p2p_ar_v5_slot_base(ar_epoch, ar_world, ar_rank, ar_stride);
+            p2p_ar_v5_store_elem(ar_stg, base, ar_world, (size_t)i, v);
+        }
+    }
 }
 extern "C" cudaError_t ferrite_add(const float* x, const float* y, float* z,
                                    int n, cudaStream_t s) {
     add_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, y, z, n);
+    return cudaGetLastError();
+}
+
+// `add_kernel` + the AR v5 store epilogue. This is the carrier for the rank(s)
+// that compute the MoE shared expert and do NOT fold the merge elsewhere: the
+// standalone `add_inplace(&s.o, &s.ex_out)` in `moe()` is then `s.o`'s LAST
+// writer, so it is the only launch that may publish the payload. The ranks
+// without the shared expert carry the store in `dsv41_moe_down_reduce_st`
+// instead (`dsv41_experts_mxf4.cu`).
+//
+// Returns a cuda error code; the caller falls back to the plain `ferrite_add` +
+// the ordinary all-reduce on any non-success, so a missing/mis-shapen call can
+// never drop the store silently.
+extern "C" cudaError_t ferrite_add_store(const float* x, const float* y, float* z, int n,
+                                         float* const* staging_tbl, const unsigned* epoch,
+                                         int world, int my_rank, int stride, cudaStream_t s) {
+    if (n <= 0 || world <= 0 || staging_tbl == nullptr || epoch == nullptr)
+        return cudaErrorInvalidValue;
+    add_kernel<<<(n + 255) / 256, 256, 0, s>>>(
+        x, y, z, n, staging_tbl, epoch, world, my_rank, stride);
     return cudaGetLastError();
 }
 
