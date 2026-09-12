@@ -443,3 +443,14 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 1. e4m3 单趟的精度仍不足以在该位置翻转 argmax（近 tie）
 2. 模型在该位置本身就有歧义（官方参考可能也有类似碎片）
 **下一步**：跑官方 ref_inference 同 prompt 1000 tok 判定"acs"是 ferrite 残留还是模型固有。
+
+## 1000 tok 全文出师表（0960e86e）——两个拉丁碎片（acs、ibu）
+
+```
+《前出师表》原文：
+先帝创业未半而中道崩殂，今天下三分，益州疲弊，此诚危急存亡之秋也。然侍卫之臣不懈于内，忠志之士忘身于外者，盖追先帝之殊遇，欲报之于陛下也。诚宜开张圣听，以光先帝遗德，恢弘志士之气，不宜妄自菲薄，引喻失义，以塞忠谏之路也acs。
+宫中府中，俱为一体，陟（ibu）
+```
+**LEN 142、双字 0、拉丁碎片 [acs, ibu]**——文本在 `以塞忠谏之路也` 后出现 "acs"，再后面 `陟（ibu）`——**"陟"后面应该是"罚臧否"**——模型在上下文累积后退化。
+**EAGER+e4m3 也有 acs（同位置）** → **backbone 残留**（不是 spec 路径回归）。
+**下一步**：官方 ref_inference 判别（acs-model-inherent subagent 在跑）——如果官方干净则继续排查 ferrite 的 backbone 数值。
