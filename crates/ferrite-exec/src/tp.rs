@@ -1287,6 +1287,142 @@ impl<B: KernelBackend> TpCluster<B> {
         Ok(out)
     }
 
+    /// WAVE 5 STEP B — ONE MTP step for B live seqs: the batched-MTP landing.
+    ///
+    /// Replaces the per-seq `mtp_step` round-robin with a single B-seq pass.
+    /// The drafts and the verify block of ALL live seqs run back to back over
+    /// ONE set of per-seq state pointers (`MtpStateB` slots), with the verify
+    /// rows laid out seq-major as `[B][n_v]` — the shape the batched decode's
+    /// per-seq pointer tables (`gdn_state_tables`/`dsa_ptr_tables`) and the
+    /// row-mapped DSA append already address.
+    ///
+    /// The host-side half is `ferrite_exec::mtp_batch` — the five Step-B
+    /// pieces, wired here for the first time:
+    ///   1. per-seq position bases → `SeqRowMap::for_verify` (the B×n_v block's
+    ///      row layout — the ONE place padded and ragged differ, verdict 5);
+    ///   2. the same map's `AppendPlan` — the `dsa_append_batched_mapped`
+    ///      launch the verify's cache append needs (`ntok = n_v`, or the
+    ///      `(seq, tok)` table for the ragged layout) + each seq's advance step
+    ///      (the whole block, not the hard-coded `+1` of verdict 4);
+    ///   3. `verify_graph_name` — the `(padded seqs, n_v)` graph key: a
+    ///      rows-only key aliases `(4, 6)` with `(8, 3)` (both 24 rows, different
+    ///      table widths and divisors), verdict 1;
+    ///   4. `CommitBatchLayout` — the `[B][n_gdn][6]` plan + `k[B]` layout of
+    ///      the single-launch commit (verdict 3b);
+    ///   5. `draft_graphs` — the draft chain's per-seq graph names (verdict 2:
+    ///      Step B keeps the draft chain per seq, its graphs embed per-seq state
+    ///      pointers as immediate kernel args).
+    ///
+    /// While `mtp_batch::MTP_BATCH_READY` is false the plan is built and
+    /// checked, then the PER-SEQ FALLBACK runs (one `decode_step` per seq — the
+    /// legacy round-robin, so this wiring is A/B-able against the pre-wiring
+    /// path before the three kernel pieces land). The plan is the interface
+    /// those pieces consume, so flipping `MTP_BATCH_READY` needs no call-site
+    /// change.
+    ///
+    /// `seqs` are the live cluster seq ids in admission order; `mtp_step_batched`
+    /// pushes each seq's sampled token into its own `seq_runtime` (the same
+    /// contract as `decode_step_batched`).
+    #[cfg(feature = "cuda")]
+    pub fn mtp_step_batched(&mut self, seqs: &[u64]) -> Result<Vec<u32>> {
+        if seqs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n_v = mtp_verify_n();
+        // FERRITE_MTP_N=1 is plain decode ("non-MTP is n=1", literally): no
+        // drafts, so the batched MTP step IS the batched decode.
+        if n_v <= 1 {
+            return self.decode_step_batched(seqs);
+        }
+        let hidden = self.full_cfg.hidden_size;
+        let plans = build_layer_plans(&self.full_cfg);
+        let n_gdn = plans.iter().filter(|p| matches!(p.attn, AttnKind::Linear)).count();
+        let num_dsa = plans.iter().filter(|p| matches!(p.attn, AttnKind::Dsa)).count();
+        // The row bases: each seq's own pinned DSA slot (the family-0 cache's
+        // `t_count` BEFORE this step's append). GLM's DSA carries position
+        // IMPLICITLY through this pinned `t0` (the mega chain has no RoPE), so
+        // the per-row position is exactly `base[seq] + tok` —
+        // `SeqRowMap::pos_of_row` is the whole position story, no per-row table.
+        let bases: Vec<i32> = {
+            let cuda = self.shards[0]
+                .backend
+                .as_cuda()
+                .ok_or_else(|| FerriteError::Config("batched MTP needs cuda".into()))?;
+            let mut b = Vec::with_capacity(seqs.len());
+            for &seq_r in seqs {
+                let t0 = if num_dsa > 0 {
+                    cuda.mtp_family_cache(seq_r, 0).map(|(_, t_count)| t_count).unwrap_or(0)
+                } else {
+                    // No DSA family (a pure-GDN config): the position base is
+                    // the seq's own token count, which the row map does not
+                    // need to know — 0 keeps the plan well-formed.
+                    0
+                };
+                b.push(t0 as i32);
+            }
+            b
+        };
+        // THE PLAN (Wave 5): the verify block's rows/graph key/append launch +
+        // the batched commit's strides.
+        let plan = crate::mtp_batch::MtpBatchPlan::build(
+            seqs.len(),
+            &bases,
+            n_v,
+            hidden,
+            n_gdn,
+            None, // padded (plan §3.3 "A 起步"); ragged is the non-graph follow-up
+        )
+        .ok_or_else(|| {
+            FerriteError::InvalidArg(
+                "mtp_step_batched: the batch plan is underspecified (pos_base does not cover the seq set)"
+                    .into(),
+            )
+        })?;
+        // Observability: the plan once at first use (so the wiring is visible
+        // in a run that never sets the timing flag), then per step under
+        // FERRITE_MTP_BATCH_TIMING.
+        {
+            static ONCE: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            let timing = std::env::var_os("FERRITE_MTP_BATCH_TIMING").is_some();
+            if timing || !ONCE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                eprintln!(
+                    "[mtp-batch] {} ready={} fallback={}",
+                    plan.summary(),
+                    crate::mtp_batch::MTP_BATCH_READY,
+                    !crate::mtp_batch::MTP_BATCH_READY
+                );
+            }
+        }
+        if !crate::mtp_batch::MTP_BATCH_READY {
+            // FALLBACK — the wiring's stopgap: per-seq, i.e. exactly the legacy
+            // round-robin. `mtp_step_batched` is reachable ahead of the kernel
+            // work so the composition, the plan and the interfaces can be
+            // validated and A/B'd first.
+            let mut out = Vec::with_capacity(seqs.len());
+            for &seq_r in seqs {
+                out.push(self.decode_step(seq_r)?);
+            }
+            return Ok(out);
+        }
+        // THE REAL B-ROW PASS (verdicts 1/3/5) — the plan is the only input:
+        //   1. drafts: `crate::mtp_batch::draft_graphs(seqs, n_v)` replayed per
+        //      seq (per-seq graphs, verdict 2), each preceded by its seq's
+        //      `dsa_host_advance(seq, f, 1)`;
+        //   2. verify: ONE replay of `plan.verify_graph` with the B×n_v block
+        //      staged (`plan.verify_rows()` rows), preceded by
+        //      `dsa_append_batched_mapped(.., plan.append.rows, plan.append.seqs,
+        //      plan.append.ntok, plan.append.row_map, plan.append.block_len, ..)`
+        //      and the per-seq advance `plan.advance_steps()`;
+        //   3. accept + commit: `plan.commit`'s `[B][n_gdn][6]` plan with the
+        //      `k[B]` array the accept kernel fills (`commit_plan_row` is the
+        //      row→seq divisor).
+        Err(FerriteError::InvalidArg(
+            "mtp_step_batched: MTP_BATCH_READY=1 but the kernel-side landing is not implemented"
+                .into(),
+        ))
+    }
+
     /// Decode one token. Returns the sampled token id.
     pub fn decode_step(&mut self, seq: u64) -> Result<u32> {
         // CUDA graph fast path: FERRITE_GRAPH=1 → first decode_step captures

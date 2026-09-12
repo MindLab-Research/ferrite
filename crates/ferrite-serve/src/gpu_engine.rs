@@ -16,12 +16,17 @@
 //! (~GBs per seq — without it the serve OOMs after a handful of
 //! requests).
 //!
-//! MTP constraint: the MTP step is still the SINGLE-SEQ round-robin — the
-//! verify graph is one seq's block (`mega_v{seq}`, n = FERRITE_MTP_N rows)
-//! and the draft chain / accept / commit are per seq — so with FERRITE_MTP=1
-//! the engine forces max_seqs=1. The scratch is already per seq
-//! (`ferrite_kernel::cuda::MtpStateB`); what is still missing is the B-row
-//! verify graph (Wave 5 Step B), and the gate lifts with it.
+//! MTP constraint (Wave 5): the legacy MTP step is the single-seq
+//! round-robin — the verify graph is one seq's block (`mega_v{seq}`,
+//! n = FERRITE_MTP_N rows) and the draft chain / accept / commit are per seq
+//! — so with FERRITE_MTP=1 the engine forces max_seqs=1 by default. The
+//! scratch is per seq (`ferrite_kernel::cuda::MtpStateB`) and the B-seq step
+//! is wired behind `FERRITE_MTP_BATCHED=1` (`TpCluster::mtp_step_batched`,
+//! plan from `ferrite_exec::mtp_batch`); the forcing-1 default lifts once
+//! `mtp_batch::MTP_BATCH_READY` — the three kernel-side pieces (the
+//! `ntok = n_v` mapped append call site, the single-launch batched commit, the
+//! `(seqs, n_v)`-keyed B-row verify capture) — is true, see
+//! `mtp_batch::MTP_BATCH_READY`'s doc for the checklist.
 
 #![cfg(feature = "cuda")]
 
@@ -31,6 +36,7 @@ use ferrite_dispatch::arena::{NodeId, SeqId, SeqTag, TypedArena};
 use ferrite_dispatch::batch::{Admission, CacheStats, TickPlan};
 use ferrite_dispatch::radix::RadixCache;
 use ferrite_dispatch::state::StateId;
+use ferrite_exec::mtp_batch;
 use ferrite_exec::tp::TpCluster;
 use ferrite_http::engine::ServeEngine;
 use ferrite_kernel::CudaBackend;
@@ -630,15 +636,29 @@ pub struct GpuEngine {
 
 impl GpuEngine {
     pub fn new(cluster: TpCluster<CudaBackend>, stops: Vec<u32>, mut max_seqs: usize) -> Self {
-        // MTP: the step is the single-seq round-robin — the verify graph is
-        // one seq's block (mega_v{seq}) and the draft chain / commit are per
-        // seq. MtpState itself is per-seq now (MtpStateB); the gate lifts with
-        // the B-row verify graph (Wave 5 Step B).
-        if std::env::var_os("FERRITE_MTP").is_some() && max_seqs > 1 {
+        // Wave 5: the MTP step is the single-seq round-robin by default — the
+        // verify graph is one seq's block (`mega_v{seq}`) and the draft chain /
+        // accept / commit are per seq — so FERRITE_MTP forces max_seqs=1
+        // unless the batched sub-branch is explicitly opted into. MtpState is
+        // per seq (`MtpStateB`) and the B-seq step exists
+        // (`TpCluster::mtp_step_batched`, FERRITE_MTP_BATCHED=1); while
+        // `mtp_batch::MTP_BATCH_READY` is false that step runs the per-seq
+        // fallback, so opting in with max_seqs > 1 today is a
+        // WIRING-VALIDATION mode (correct — the legacy round-robin — but it
+        // pays the per-seq graph captures), NOT a performance path.
+        let batched_mtp = mtp_batch::batched_enabled();
+        if std::env::var_os("FERRITE_MTP").is_some() && max_seqs > 1 && !batched_mtp {
             eprintln!(
-                "[serve] FERRITE_MTP=1 with max_seqs={max_seqs}: forcing 1 (the MTP step is still the single-seq round-robin; the batched verify graph is Step B)"
+                "[serve] FERRITE_MTP=1 with max_seqs={max_seqs}: forcing 1 (the MTP step is still the single-seq round-robin; FERRITE_MTP_BATCHED=1 opts into the batched B-seq step, ready={})",
+                mtp_batch::MTP_BATCH_READY
             );
             max_seqs = 1;
+        }
+        if batched_mtp && std::env::var_os("FERRITE_MTP").is_some() {
+            eprintln!(
+                "[serve] FERRITE_MTP_BATCHED=1: batched MTP sub-branch ON (max_seqs={max_seqs}, kernels ready={})",
+                mtp_batch::MTP_BATCH_READY
+            );
         }
         eprintln!(
             "[serve] GpuEngine: max_seqs={max_seqs} stops={stops:?} (per-seq state ~GBs; free at retire)"
@@ -936,23 +956,56 @@ impl ServeEngine for GpuEngine {
         //    as B × n=1 in-graph launches with each row's own state
         //    pointers. Composition change (admission/retirement) re-captures
         //    (~1-2s, amortized over 1000-token streams).
-        //    MTP: the per-seq round-robin (MtpState is per-seq, but the
-        //    batched MTP — a B-row verify graph — is Step B; FERRITE_MTP
-        //    already forces max_seqs=1, so this branch degenerates to a single
-        //    live seq).
+        //    MTP: the per-seq round-robin by default, and (Wave 5) the batched
+        //    B-seq step behind FERRITE_MTP_BATCHED=1 — `mtp_step_batched`
+        //    batches the drafts + the B×n_v verify block of ALL live seqs into
+        //    one pass. FERRITE_MTP still forces max_seqs=1 unless that flag is
+        //    set, so this branch degenerates to a single live seq by default.
         let mtp_mode = std::env::var_os("FERRITE_MTP").is_some();
+        let batched_mtp = mtp_batch::batched_enabled();
         let mut retired: Vec<SeqId> = Vec::new();
         if !self.live.is_empty() {
             if mtp_mode {
-                // per-seq round-robin (the legacy single-seq path — MTP's
-                // single-seq constraint; decode_step handles mega/MTP)
+                // the live cluster seqs in admission order — the batched MTP
+                // composition (and the per-seq loop's iteration order).
+                let live_seqs: Vec<u64> = self
+                    .live
+                    .iter()
+                    .filter_map(|seq| self.arena.get(*seq).map(|g| g.cluster_seq))
+                    .collect();
+                if batched_mtp && live_seqs.len() > 1 {
+                    // WAVE 5 STEP B: ONE B-seq MTP step — drafts, the B×n_v
+                    // verify block, accept and commit for all live seqs in one
+                    // pass, with each seq's state reached through the pointer
+                    // tables (the same shape the batched decode uses). The plan
+                    // (`ferrite_exec::mtp_batch`) is built inside; while
+                    // MTP_BATCH_READY is false the per-seq fallback runs, so
+                    // this is safe-but-unaccelerated until the kernel work
+                    // lands. The seq_runtime token push is part of the step.
+                    self.cluster.mtp_step_batched(&live_seqs)?;
+                } else {
+                    // per-seq round-robin (the legacy single-seq path —
+                    // decode_step handles mega/MTP). Also the B=1 case: the
+                    // batched B-row graph is 1.9x SLOWER at B=1 (measured
+                    // [megab] 17.95ms vs [mega] 9.55ms), and the batched MTP
+                    // step has nothing to batch — keep the per-seq path there.
+                    for i in 0..self.live.len() {
+                        let seq = self.live[i];
+                        let cluster_seq = match self.arena.get(seq) {
+                            Some(g) => g.cluster_seq,
+                            None => continue,
+                        };
+                        self.cluster.decode_step(cluster_seq)?;
+                    }
+                }
+                // Retirement checks — shared by both sub-branches (the decode
+                // call above is the only difference).
                 for i in 0..self.live.len() {
                     let seq = self.live[i];
                     let (cluster_seq, prompt_len, max_new, prev_len) = match self.arena.get(seq) {
                         Some(g) => (g.cluster_seq, g.prompt_len, g.max_new, g.prev_len),
                         None => continue,
                     };
-                    self.cluster.decode_step(cluster_seq)?;
                     let rt_len = self
                         .cluster
                         .shards

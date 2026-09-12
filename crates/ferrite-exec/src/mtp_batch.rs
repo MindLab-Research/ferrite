@@ -517,6 +517,185 @@ impl CommitBatchLayout {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The per-step plan — the ONE struct the exec layer builds a batched MTP tick
+// from (`TpCluster::mtp_step_batched`, the Wave 5 wiring)
+// ---------------------------------------------------------------------------
+
+/// `FERRITE_MTP_BATCHED`: the serve-layer gate for the batched-MTP sub-branch
+/// (default OFF). Read once and cached — the house rule for hot-path gates.
+/// Kept here (not in `gpu_engine`) so the serve layer and the exec layer read
+/// the SAME switch: the gate decides whether `gpu_engine`'s `max_seqs` forcing
+/// is lifted AND which step the cluster runs.
+pub fn batched_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("FERRITE_MTP_BATCHED")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// Whether the batched-MTP **kernel half** is in place. `false` today: the
+/// plan below is built and validated, but three device-side pieces are still
+/// designs (the module docs' verdicts), so `mtp_step_batched` runs the per-seq
+/// fallback AFTER building the plan:
+///
+/// 1. the `dsa_append_batched_mapped` CALL SITE at `ntok = n_v` — the kernel
+///    and its Rust wrapper exist, but the MTP verify path does not call them
+///    yet (`cuda.rs::dsa_append_batched` still pins `ntok = 1`, verdicts 4/5);
+/// 2. the single-launch batched commit (verdict 3b) — `cuda.rs` exposes the
+///    per-seq `mtp_commit(seq, k)` / `mtp_commit_dev(seq, k_dev)` only;
+/// 3. the `(seqs, n_v)`-keyed B-row verify capture (verdict 1) — the per-seq
+///    `mega_v{seq}` capture is what `mtp_step` uses today.
+///
+/// Flipping this const is the whole switch: `MtpBatchPlan` is the interface
+/// those three consume, so no call site changes with it.
+pub const MTP_BATCH_READY: bool = false;
+
+/// The per-step plan a batched MTP tick is built from: the verify block's row
+/// layout ([`SeqRowMap`] + [`AppendPlan`]), the graph keys and the commit
+/// layout of ONE B-seq draft+verify pass. Every field is derived from the live
+/// seq count and the per-seq position bases — nothing here touches the GPU, so
+/// the plan is unit-testable (the tests below are the contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MtpBatchPlan {
+    /// Verify width (`FERRITE_MTP_N`; drafts = `n_v - 1`).
+    pub n_v: usize,
+    /// Live seqs this tick.
+    pub live: usize,
+    /// The ladder rung the layout is padded to ([`SEQ_LADDER`]).
+    pub padded: usize,
+    /// The B×n_v verify block's row map.
+    pub rows: SeqRowMap,
+    /// The cache-append launch the verify's rows imply.
+    pub append: AppendPlan,
+    /// The batched commit's strides (`[B][n_gdn][6]`, `k[B]`).
+    pub commit: CommitBatchLayout,
+    /// The verify graph key — `mega_v_b{padded}_n{n_v}`, NOT the row count
+    /// (verdict 1: the per-size pointer tables and the `n_v` divisor are baked
+    /// into the capture).
+    pub verify_graph: String,
+}
+
+impl MtpBatchPlan {
+    /// Build the plan for `live` seqs whose own position bases are
+    /// `live_bases` (one per live seq — GLM's DSA `t0`, the slot the verify's
+    /// anchor row is appended at). `padded` = the ladder rung, `n_v` = the
+    /// verify width, `hidden`/`n_plans` = the commit layout's dimensions
+    /// (`n_plans` = the GDN layer count of `MtpState.commit`).
+    ///
+    /// `ragged_lens = Some(_)` selects the ragged layout (plan §3.2 — a
+    /// non-graph path); `None` is the padded default (plan §3.3 "A 起步").
+    ///
+    /// `None` when `live_bases` does not cover the live set exactly: a short
+    /// table would silently pair a seq's base with its neighbour's rows, which
+    /// is the mistake worth catching BEFORE the H2D ([`SeqRowMap::pos_table`],
+    /// hoisted so callers see it once). Pad slots of the padded layout carry
+    /// base `0` — their rows land on the shared dummy table state and their
+    /// outputs are discarded.
+    pub fn build(
+        live: usize,
+        live_bases: &[i32],
+        n_v: usize,
+        hidden: usize,
+        n_plans: usize,
+        ragged_lens: Option<&[usize]>,
+    ) -> Option<Self> {
+        if live == 0 || live_bases.len() != live {
+            return None;
+        }
+        let n_v = n_v.max(1);
+        let rows = SeqRowMap::for_verify(live, n_v, ragged_lens);
+        if rows.seqs() == 0 || rows.rows() == 0 {
+            return None;
+        }
+        // Position bases are per SEQ SLOT, so the padded layout needs one
+        // entry per rung slot (the pad slots included).
+        let bases: Vec<i32> = match rows.layout() {
+            RowLayout::Padded => {
+                let mut b = vec![0i32; rows.seqs()];
+                b[..live].copy_from_slice(live_bases);
+                b
+            }
+            RowLayout::Ragged => live_bases.to_vec(),
+        };
+        let append = rows.append_plan(&bases)?;
+        let commit = commit_batch_layout(rows.seqs(), n_plans, n_v, hidden);
+        Some(Self {
+            n_v,
+            live,
+            padded: padded_seqs(live),
+            rows,
+            append,
+            commit,
+            verify_graph: verify_graph_name(padded_seqs(live), n_v),
+        })
+    }
+
+    /// The per-seq DSA advance steps the verify's rows imply: one entry per
+    /// seq slot, `n_v` for the padded layout (the whole block appended in one
+    /// pass) and each seq's own block length for the ragged layout. The seqs
+    /// the kernel keeps counting (grid = `seqs`) advance by ONE while the
+    /// per-row kernels see `rows` — the distinction [`AppendPlan::seqs`] vs
+    /// [`AppendPlan::rows`] exists for.
+    pub fn advance_steps(&self) -> Vec<usize> {
+        (0..self.rows.seqs())
+            .map(|s| self.append.dev_adv_step(s).unwrap_or(1))
+            .collect()
+    }
+
+    /// The number of rows the verify graph must be asked for
+    /// (`padded_seqs(live) * n_v` for the padded layout): the `small_n_rows`
+    /// GEMV path is only valid at `n <= 16` (B=16, n_v=3 → 48 rows is the
+    /// tiled-GEMM domain, module docs verdict 1).
+    pub fn verify_rows(&self) -> usize {
+        self.rows.rows()
+    }
+
+    /// One-line report (the wiring's observability; `FERRITE_MTP_BATCH_TIMING`).
+    pub fn summary(&self) -> String {
+        format!(
+            "live={} padded={} n_v={} layout={:?} rows={} ntok={} seqs={} verify={} \
+             commit=[{}x{}x{} k[{}] hf_v={} hprev={}]",
+            self.live,
+            self.padded,
+            self.n_v,
+            self.rows.layout(),
+            self.append.rows,
+            self.append.ntok,
+            self.append.seqs,
+            self.verify_graph,
+            self.commit.seqs,
+            self.commit.n_plans,
+            self.commit.plan_row_elems,
+            self.commit.k_len,
+            self.commit.hf_v_elems(),
+            self.commit.hprev_elems(),
+        )
+    }
+}
+
+/// The draft chain's graph names for this tick, seq-major: `n_v - 1` names per
+/// seq, `mega_d{seq}_{i}` while [`DRAFT_CHAIN_SHARED`] is false (verdict 2 —
+/// the Step-B decision), `mega_d_b{padded}_{i}` once the B-row + pointer-table
+/// conversion lands. `n_v = 1` (no drafts) yields an empty vector.
+pub fn draft_graphs(seqs: &[u64], n_v: usize) -> Vec<String> {
+    let nd = n_v.saturating_sub(1);
+    let padded = padded_seqs(seqs.len());
+    let mut out = Vec::with_capacity(seqs.len() * nd);
+    for &seq in seqs {
+        for i in 0..nd {
+            out.push(if DRAFT_CHAIN_SHARED {
+                draft_graph_name(padded, i)
+            } else {
+                format!("mega_d{seq}_{i}")
+            });
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,5 +944,91 @@ mod tests {
         assert!(m.pos_table(&[0, 1, 2]).is_none(), "one base per seq, not per row");
         assert!(m.append_plan(&[0, 1, 2]).is_none());
         assert_eq!(m.dev_adv_step(9), None, "no such seq");
+    }
+
+    // ---- the per-step plan (`TpCluster::mtp_step_batched`'s input) ---------
+
+    #[test]
+    fn plan_pads_the_bases_to_the_rung_and_keys_the_graph() {
+        // 3 live seqs, n_v=3 -> the 4-seq rung, 12 verify rows, ntok=n_v.
+        let p = MtpBatchPlan::build(3, &[10, 20, 30], 3, 5120, 38, None).expect("plan");
+        assert_eq!((p.live, p.padded, p.n_v), (3, 4, 3));
+        assert_eq!(p.verify_rows(), 12);
+        assert_eq!(p.verify_graph, "mega_v_b4_n3");
+        assert_eq!(p.rows.seqs(), 4, "the pad slot is a real table column");
+        assert_eq!((p.append.rows, p.append.seqs, p.append.ntok), (12, 4, 3));
+        // the real seqs keep their bases; the pad slot is 0 (its rows land on
+        // the shared dummy state) and is NOT a shift of its neighbour's base.
+        assert_eq!(p.append.pos_base, vec![10, 20, 30, 0]);
+        assert!(p.append.row_map.is_none(), "padded: the ntok divisor carries it");
+        assert_eq!(p.rows.at(3), Some((1, 0)), "seq 1's anchor row");
+        assert_eq!(p.rows.pos_of_row(5, &p.append.pos_base), Some(22), "seq 1, tok 2");
+        assert_eq!(p.advance_steps(), vec![3, 3, 3, 3], "the whole block, not +1");
+    }
+
+    #[test]
+    fn plan_commit_layout_is_sized_off_the_rung() {
+        let p = MtpBatchPlan::build(2, &[0, 100], 3, 4096, 38, None).expect("plan");
+        assert_eq!(p.commit.seqs, 2, "n=2 pads to 2");
+        assert_eq!(p.commit.plan_elems(), 2 * 38 * 12);
+        assert_eq!(p.commit.hf_v_elems(), 2 * 3 * 4096);
+        assert_eq!(p.commit.hprev_elems(), 2 * 4096);
+        assert_eq!(p.commit.k_len, 2, "one k per seq — pad rows must carry 1");
+        // 3 live seqs pad to 4: the commit array is widened with the rung too,
+        // so the pad slots' writes land on their own dummy states.
+        let q = MtpBatchPlan::build(3, &[0, 1, 2], 3, 4096, 38, None).expect("plan");
+        assert_eq!((q.commit.seqs, q.live), (4, 3));
+    }
+
+    #[test]
+    fn plan_rejects_a_base_table_that_misses_the_live_set() {
+        assert!(MtpBatchPlan::build(3, &[10, 20], 3, 5120, 38, None).is_none(), "short");
+        assert!(MtpBatchPlan::build(3, &[10, 20, 30, 40], 3, 5120, 38, None).is_none(), "long");
+        assert!(MtpBatchPlan::build(0, &[], 3, 5120, 38, None).is_none(), "empty tick");
+    }
+
+    #[test]
+    fn plan_ragged_carries_the_block_lengths_and_skips_the_rung() {
+        // A ragged round: seq0's whole block was consumed (1 row), seq1 kept 3.
+        let p = MtpBatchPlan::build(2, &[10, 20], 3, 5120, 38, Some(&[1, 3])).expect("plan");
+        assert_eq!(p.rows.layout(), RowLayout::Ragged);
+        assert_eq!((p.append.rows, p.append.seqs, p.append.ntok), (4, 2, 0));
+        assert_eq!(p.append.row_map.as_deref(), Some(&[0, 0, 1, 0, 1, 1, 1, 2][..]));
+        assert_eq!(p.append.block_len.as_deref(), Some(&[1, 3][..]));
+        assert_eq!(p.advance_steps(), vec![1, 3], "each seq advances by its own block");
+        // The graph key is still the (padded, n_v) pair — a ragged pass is a
+        // non-graph path, but the naming must not collide with the padded one.
+        assert_eq!(p.verify_graph, "mega_v_b2_n3");
+    }
+
+    #[test]
+    fn plan_n_v_one_is_the_undrafted_decode_shape() {
+        // n_v=1 (FERRITE_MTP_N=1): one row per seq, ntok=1 — the shape the
+        // decode-batched append already launches.
+        let p = MtpBatchPlan::build(4, &[0, 1, 2, 3], 1, 5120, 38, None).expect("plan");
+        assert_eq!((p.verify_rows(), p.append.ntok), (4, 1));
+        assert_eq!(p.append.seqs, 4);
+        assert!(draft_graphs(&[7, 8, 9, 10], 1).is_empty(), "no drafts");
+    }
+
+    #[test]
+    fn draft_graph_names_are_per_seq_and_seq_major() {
+        assert!(!DRAFT_CHAIN_SHARED, "Step B keeps the per-seq draft chain");
+        assert_eq!(
+            draft_graphs(&[7, 9], 3),
+            vec!["mega_d7_0", "mega_d7_1", "mega_d9_0", "mega_d9_1"]
+        );
+        assert_eq!(draft_graphs(&[], 3), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_batched_gate_keeps_the_plan_consistent_with_the_kernel_switch() {
+        // The wiring's invariant: while the kernel half is missing, the plan
+        // is still built (so the data flow is exercised) and the per-seq
+        // fallback runs. Flipping MTP_BATCH_READY must not change the plan.
+        assert!(!MTP_BATCH_READY, "the three device-side pieces are still designs");
+        let p = MtpBatchPlan::build(2, &[5, 6], 3, 5120, 38, None).expect("plan");
+        assert!(p.summary().contains("verify=mega_v_b2_n3"), "{}", p.summary());
+        assert!(p.summary().contains("rows=6"));
     }
 }
