@@ -3963,24 +3963,42 @@ static bool mrows_act_cpasync_host() {
 //
 // A/B arm, DEFAULT OFF. Unset / `0` = today's behaviour (`fold_r = m`, byte-for-
 // byte the previous launcher); a positive value N is clamped to [1, m]; `auto`
-// (or a negative value) applies the shape rule below.
+// (or a negative value) also resolves to `m` -- see the rule below.
 static const int g_mrows_fold_r = [] {
     const char* e = getenv("DSV41_MROWS_FOLD_R");
     if (e == nullptr) return 0;
     if (e[0] == 'a' || e[0] == 'A') return -1;  // "auto" -> shape rule
     return atoi(e);
 }();
-// Shape rule for `DSV41_MROWS_FOLD_R=auto` (design §3.4). The applicability test
-// is "does the n-driven block count already cover the 148-SM chip, and is smem
-// not the thing capping warps/SM": wq_b/wo_b (n >= 4096) are 346%/432% and must
-// keep `fold_r = m` (re-reading their weights buys no parallelism); wkv (512) /
-// wq_a (1280) are the fold_r targets. `n <= 1024 -> 1`, else `m`.
+// Shape rule for `DSV41_MROWS_FOLD_R=auto` (design §3.4). REVISED 2026-09-12:
+// `auto` NO LONGER FOLDS. It resolves to `m` (ng = 1), i.e. exactly the gate-OFF
+// program.
+//
+// WHY (the 6x regression, docs/agent/swallow-400-final-roadmap.md §gate table +
+// docs/agent/mrows-phaseb-bisect-analysis-framework.md §0): the first version of
+// this rule was `n <= 1024 -> 1`, i.e. it folded EVERY small-n projection to
+// `fold_r = 1` -- wkv (n = 512) AND the shared expert's w1/w3 (n = 288). At the
+// batched verify shape (M = 6) that is ng = ceil(m/1) = 6, so the grid becomes
+// `nt * 6` and each of the 6 activation-row groups re-stages the SAME weight row:
+// a 6x weight re-read per projection. The measured result was 63.8 -> 10.3 tok/s
+// (6x) -- the weight re-staging cost dwarfed the smem/occupancy win the fold was
+// supposed to buy (design §3.3 explicitly flagged the sign as "must be settled by
+// A/B"; the A/B settled it negative). wo_b's call site passes n = 5120, so it was
+// never the fold target the analysis first suspected; the folded shapes are wkv /
+// w1 / w3.
+//
+// The knobs stay usable as single-variable A/B arms -- a positive
+// `DSV41_MROWS_FOLD_R` (2 / 3 / ... / 1 / m) still reaches the kernel, so the
+// fold can be re-measured without a recompile -- but nothing selects it
+// implicitly any more. A future shape rule must be justified by a measured win at
+// the shape it enables, not by the occupancy algebra alone.
 static inline int dsv41_mrows_fold_r_for(int n, int m) {
+    (void)n;  // n kept in the signature for a future (measured) shape rule
     int fold_r = g_mrows_fold_r;
-    if (fold_r == 0) return m;                      // OFF: today's program
-    if (fold_r < 0) fold_r = (n <= 1024) ? 1 : m;   // auto: shape rule
+    if (fold_r == 0) return m;  // OFF: today's program
+    if (fold_r < 0) return m;   // auto: conservative = today's program (ng = 1)
     if (fold_r > m) fold_r = m;
-    if (fold_r < 1) fold_r = 1;                     // never 1-as-decline
+    if (fold_r < 1) fold_r = 1;  // never 1-as-decline
     return fold_r;
 }
 
