@@ -2341,3 +2341,18 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **预期总节省**（launch 账）：Wave 1 (-8.4ms) + rope (-0.53) + head (-0.01) + SH_PAIR (-2.38 launch 账) ≈ **-11.3ms**
 **预期步时**：~33ms - 11.3 = **~22ms**（如果全部兑现）
 **@ accept 5（数字任务）**：6/0.022 = **273 tok/s**
+
+## 纠正：VERIFY_ROPE_MROWS 和 VERIFY_HEAD_MROWS 在 LAZY 下无节省
+
+**之前的错误**：我以为这两个 gate 可以在 LAZY_VERIFY 下节省——但仔细分析后：
+- **LAZY_VERIFY 的每行是 m=1**：head 和 rope 每行调用一次（已经是单发）
+- **mrows 的节省只在 m>1 时生效**（5 发→1 发需要 m=5）
+- LAZY 的多行是**串行调用**（每步_rows(m=1) 多次），不是单次 m=5
+
+**正确的适用场景**：这两个 gate 只在 **BATCHED/SWALLOW**（m=5/6 单次调用）下有节省。
+
+**LAZY_VERIFY 下剩余的优化**：
+1. **SH_PAIR template<M>**（M=1 版在 lazy 下也工作——每层的 shared expert 从 25 发→7 发）✓ parity 测试中
+2. 其他 A 类项已全部启用（Wave 1）
+
+**结论**：LAZY_VERIFY 的优化天花板是 Wave 1 + SH_PAIR。要到 400 必须切到 BATCHED/SWALLOW（那里有 head mrows + rope mrows + gate mrows 的全部收益）——但 SWALLOW 被 ar5-hang 阻塞。
