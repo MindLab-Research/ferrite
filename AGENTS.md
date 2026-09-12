@@ -2012,3 +2012,16 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **spec 首测（根因修复后）**：mean-k=0.120、tok/step=1.12、62ms/步（draft 5.85 + verify 38.68 + commit 0.19 + 主链 ~17）。**新 bug：双字**（"床床前"——**verify 缺 next 行的 KV**：d1 行的 causal window 里 pos+1 槽是空的（主链只 forward t0@pos，next@pos+1 的 KV 不存在）——sglang 的 6 行 verify [anchor(next), d1..d5] 里 anchor 行提供这个 KV。修复中。
 
 **方法论定论（用户"单元测试比较每个单元"的完全正确性）**：11 个"终局定位"里只有单元对照+手算+权重三角验证是真定位。审计推理（猜嫌疑）浪费了其中 9 次。教训：**数值问题用数值对照定位，一行手算胜过十轮审计**。
+
+## 2026-09-12 Wave 2：MoE 段 138% 的判词与修复（audit-moe-seg）+ 一个误判纠正
+
+**MoE 段对照的完整梯队**（窗口注入后）：embed ✓ 0.0 / main_x ✓ 4.4e-3 / o(attn) ✓ 5.6% / **ffn_in ✓ 4.4% / route_w ✓ 3.5% / shared ✓ / moe_out ✗ 139% / h_block0 ✗ 138%**——**输入与路由都对，expert 计算段全错**。
+
+**判词的两个阻塞级缺陷**（两条分支各一个——"无论 ILV 开关怎么设，draft 的 MoE 都错"）：
+1. **ILV 选择 bug（默认路径）**：`dspark_dev.rs:1274` 的 `if !ld.experts_ilv && supports_moe_batch()` ——`DSV41_EXPERT_ILV` **默认 ON** → 条件恒假 → 走**顺序 indirect 分支**，该分支用**非交错 reader** 读**交错专家池**（load.rs:650-656/716-724：w1/w3 view 同一指针交错）→ gate/up 读到打乱字节。**主链在 chain_dev.rs:7606 有红线 guard，draft 没有**。修复：判定去掉 `!ld.experts_ilv`（batched kernel 支持 ilv），尾参 `ilv` 从写死 0 改为 `ld.experts_ilv as i32`。
+2. **fuse 判定不一致（ILV=0 时）**：draft 写死非融合（act_slot=2*inter + 二次 swiglu），kernel 默认 fuse=1（`mxf4.cu:2366`：g_fuse && mode==2 && dim%512==0；dim=5120 ✓）→ 融合尾只写 inter 宽 → up 半区是未初始化显存 → 垃圾。修复：镜像 `moe_rows:5378-5386` 的 gateup_fused 判定 + 条件 swiglu。
+3. 另修：顺序分支的 per-row rows=1（原 rows=bs + 单权重指针 → 行间权重错配）+ ilv guard；buffer 尺寸从骨干几何（384/6）改为 draft 几何（128/3）。
+
+**误判纠正（重要）**：早前调查曾判定 "`ferrite_rmsnorm` 的 n>1 产生 1e27 垃圾"并把 attn_norm 改成逐行 n=1 绕过。**读 kernel（ferrite_kernels.cu:280-330）确认它是正确的**（grid(n) 每 block 一行、行偏移 row*dim、blockDim-sized 归约）。1e27 的真因是**当时 attn_norm 的权重指针是垃圾**（load.rs:925 placeholder bug）。**教训：数值异常要先确认输入/权重，再怀疑 kernel**（"绕过"是无必要的性能损失——已回退为多行）。
+
+**真实 serve 的长 prompt 基线**（出师表 250 tok，MoE 修复前）：文本内容**正确**（"先帝创业未半而中道崩殂，今天下三分，益州疲弊，此诚危急存亡之秋也"逐字对）+ **双字**（臣臣/盖盖）+ accept=0.020。文本正确 = next（主链 argmax）正确 + 大部分步 k_acc=0（纯主链输出）；accept 低 = drafts[0]==next 的比率极低 → draft 质量差（MoE ILV 是候选，修复后待测）。
