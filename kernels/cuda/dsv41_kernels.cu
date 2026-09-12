@@ -9297,29 +9297,45 @@ __global__ void dsv41_hc_collapse_norm_split_kernel(const float* __restrict__ x,
     __shared__ float red[32];
     const float part = nsplit_ss_fold<DSV41_NORM_SPLIT_BLOCK>(ss, red);
 
-    // One arrival per block. Order is: this block's `o_r` stores -> the fold's
-    // closing `__syncthreads()` -> t0's `__threadfence()` (device-scope release)
-    // -> the atomicAdd. The last arrival therefore observes every earlier
-    // block's published partial (its own `__threadfence()` after the atomic is
-    // the acquire), and every earlier block has already EXITED phase 1.
+    // One arrival per block, by thread 0. The chain is: this block's `o_r`
+    // stores -> the fold's closing `__syncthreads()` -> t0's `__threadfence()`
+    // (device-scope release) -> the atomicAdd. The last arrival therefore
+    // observes every earlier block's published partial (its `__threadfence()`
+    // after the atomic is the acquire), and every earlier block has already
+    // EXITED phase 1 — which is why the "winner" can safely be the last one and
+    // no block ever has to wait.
+    //
+    // The winner is a WHOLE BLOCK, not thread 0 (`s_win`/`s_inv` broadcast the
+    // election through shared memory): phase 2 walks all `dim` elements, so
+    // leaving it on one lane would serialise the tail that this kernel exists to
+    // spread out.
+    __shared__ int s_cn_win;
+    __shared__ float s_cn_inv;
     if (threadIdx.x == 0) {
         g_nsplit_cn_ss[row][ck] = part;
         __threadfence();
+        s_cn_win = 0;
         const unsigned arrived = atomicAdd(&g_nsplit_cn_ticket[row], 1u);
         if (arrived == (unsigned)(nchunks - 1)) {
             __threadfence();   // acquire: the other chunks' partials
             float tot = 0.f;
             for (int q = 0; q < nchunks; ++q) tot += g_nsplit_cn_ss[row][q];   // fixed order
-            const float inv = rsqrtf(tot / (float)dim + eps);
-            // Phase 2 for the WHOLE row: the collapsed row is only complete now,
-            // and `inv` is a row scalar. The reads of the chunks this block did
-            // not write are ordered by the fence chain above.
-            for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * inv * w[c];
-            // Self-reset so the next launch / graph replay starts at zero. Safe:
-            // all `nchunks` arrivals of this row already happened (the ticket
-            // proved it) and no other block touches the slot before the grid ends.
+            // Self-reset so the next launch / graph replay starts at zero. Safe
+            // HERE and not later: all `nchunks` arrivals of this row already
+            // happened (the ticket proved it), the partials have just been read,
+            // and no later statement of this kernel reads the slot. The next
+            // grid is stream-ordered behind this one in any case.
             g_nsplit_cn_ticket[row] = 0u;
+            s_cn_inv = rsqrtf(tot / (float)dim + eps);
+            s_cn_win = 1;
         }
+    }
+    __syncthreads();
+    if (s_cn_win) {
+        // Phase 2 for the WHOLE row: the collapsed row is only complete now, and
+        // `inv` is a row scalar. The reads of the chunks this block did not write
+        // are ordered by the fence chain above.
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = o_r[c] * s_cn_inv * w[c];
     }
 }
 
@@ -9362,18 +9378,27 @@ __global__ void dsv41_rmsnorm_rows_split_kernel(const float* __restrict__ x,
     __shared__ float red[32];
     const float part = nsplit_ss_fold<DSV41_NORM_SPLIT_BLOCK>(ss, red);
 
+    // Same arrival / election / whole-block-tail shape as the collapse split
+    // above; only phase 2 differs (`x * inv * w`, and `out` may alias `x`).
+    __shared__ int s_rn_win;
+    __shared__ float s_rn_inv;
     if (threadIdx.x == 0) {
         g_nsplit_rn_ss[row][ck] = part;
         __threadfence();
+        s_rn_win = 0;
         const unsigned arrived = atomicAdd(&g_nsplit_rn_ticket[row], 1u);
         if (arrived == (unsigned)(nchunks - 1)) {
             __threadfence();
             float tot = 0.f;
             for (int q = 0; q < nchunks; ++q) tot += g_nsplit_rn_ss[row][q];
-            const float inv = rsqrtf(tot / (float)dim + eps);
-            for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = x_r[c] * inv * w[c];
-            g_nsplit_rn_ticket[row] = 0u;
+            g_nsplit_rn_ticket[row] = 0u;   // self-reset, as in the collapse split
+            s_rn_inv = rsqrtf(tot / (float)dim + eps);
+            s_rn_win = 1;
         }
+    }
+    __syncthreads();
+    if (s_rn_win) {
+        for (int c = threadIdx.x; c < dim; c += blockDim.x) o_r[c] = x_r[c] * s_rn_inv * w[c];
     }
 }
 

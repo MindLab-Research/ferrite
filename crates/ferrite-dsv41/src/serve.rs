@@ -24,7 +24,7 @@
 //! that the all-reduce's peer stores require. The prologue below is the one-shot
 //! path's (verified) verbatim.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ferrite_http::single_flight::{SingleFlight, StepEngine};
@@ -165,6 +165,12 @@ impl TpRankPool {
         let rxs = Arc::new(rxs);
         let prefix_hit = Arc::new(AtomicUsize::new(0));
         let prefix_hit_for_ranks = prefix_hit.clone();
+        // ---- the request-level POISON (see `poisoned_request`) ----
+        // ONE flag, shared by every rank: the day a rank's spec step fails, the
+        // whole request dies together instead of that rank leaving the lockstep
+        // while its peers keep walking rounds against a frozen peer epoch.
+        let poisoned = Arc::new(AtomicBool::new(false));
+        let poisoned_for_ranks = poisoned.clone();
         let dir = dir.to_string();
         let so = so.to_string();
         let cfg = cfg.clone();
@@ -179,7 +185,7 @@ impl TpRankPool {
                 tp::run_ranks(world, move |rank| {
                     rank_loop(
                         rank, world, &stops_for_ranks, &cfg, &dir, &so, &rxs, &res_tx, &ready_tx, &barrier,
-                        &staging, &prefix_hit_for_ranks,
+                        &staging, &prefix_hit_for_ranks, &poisoned_for_ranks,
                     )
                 })
             })
@@ -335,9 +341,11 @@ fn rank_loop(
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
     prefix_hit: &Arc<AtomicUsize>,
+    poisoned: &Arc<AtomicBool>,
 ) -> Result<()> {
     let r = pool_rank_body(
         rank, world, stops, cfg, dir, so, rxs, res_tx, ready_tx, barrier, staging, prefix_hit,
+        poisoned,
     );
     if let Err(e) = &r {
         let _ = ready_tx.send(Err(ferrite_types::FerriteError::Config(e.to_string())));
@@ -359,6 +367,7 @@ fn pool_rank_body(
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
     prefix_hit: &Arc<AtomicUsize>,
+    poisoned: &Arc<AtomicBool>,
 ) -> Result<()> {
     // ---- bring-up: the one-shot path's prologue (rank_body) verbatim ----
     Device::bind_to(rank as i32)?;

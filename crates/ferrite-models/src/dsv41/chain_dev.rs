@@ -5936,6 +5936,64 @@ impl<'a> DevChain<'a> {
         }
     }
 
+    /// ★★ THE ROUND'S ARM IS A **UNANIMOUS** DECISION, AND EVERY RANK VOTES
+    /// (the `ar5-hang` root cause, 2026-09-12).
+    ///
+    /// # The lesion this closes
+    ///
+    /// `spec_primed` is a **per-rank** chain flag, but the arm it selects has a
+    /// **process-wide** cost: the legacy and aligned arms each call `step_dev`
+    /// (the whole single-row chain — 40 layers × 2 AR ≈ 80 v5 all-reduce rounds
+    /// per step) and the swallowed and lazy arms do NOT (their verify block's
+    /// row 0 IS the anchor's forward). AR v5 has no host-side rendezvous, so a
+    /// rank with a LARGER round footprint waits on a peer stamp its peer will
+    /// never publish — forever. One rank that loses its priming (the swallowed
+    /// arm's failure contract deliberately leaves the flag alone, see
+    /// [`Self::dspark_spec_swallowed`]'s "Failure") therefore rifts the epochs
+    /// for the REST of the request: it falls back to the legacy arm (+~80
+    /// rounds per step) while its peers keep swallowing, and the rank that
+    /// issues MORE rounds is the one that spins on `ar5_wait_round` — the
+    /// `ar5-hang` signature.
+    ///
+    /// # The decision
+    ///
+    /// Every rank publishes its OWN `spec_primed` bit, and the round is a
+    /// swallow round only when the ranks agree that ALL of them are primed. On
+    /// any disagreement the whole world walks the legacy path for this round,
+    /// and that path's tail re-primes **every** rank unconditionally
+    /// (`spec_primed = true` at the exit of [`Self::dspark_spec_step`]) — so the
+    /// next round is unanimous again: the degradation is one round wide, and it
+    /// heals itself. The vote is taken BEFORE any arm's device work, because an
+    /// arm must be agreed before any rank walks it.
+    ///
+    /// # The invariant the callers must keep
+    ///
+    /// **The vote must be taken by EVERY rank on EVERY round** while
+    /// [`swallow_step`] is on — whether or not that rank is primed. The
+    /// rendezvous is symmetric ([`crate::dsv41::tp::RankVote::unanimous_i32`]
+    /// waits for `world` votes), so a rank that short-circuited the call on its
+    /// own `spec_primed` would leave its primed peers spinning in the vote
+    /// forever — the fix would have swapped one hang for another. That is also
+    /// why this helper publishes the LOCAL bit instead of a constant `1`: a
+    /// non-primed rank that voted `1` would drag its primed peers into the
+    /// swallowed arm — exactly the rift this closes.
+    ///
+    /// # Cost and scope
+    ///
+    /// One rendezvous per round: `world` releases + `world` acquires on ONE
+    /// shared cache line, orders of magnitude below the ~6 ms round it guards.
+    /// With the gate off the caller short-circuits before this call, so the
+    /// default path stays bit-for-bit what it was. Without peers (`comm` is
+    /// `None` off TP>1, and a world of one is unanimity by construction) the
+    /// function answers `true` with no rendezvous at all — the single-rank path
+    /// is unchanged, and the caller's own `spec_primed` still decides.
+    fn spec_primed_unanimous(&self) -> bool {
+        let Some(c) = self.comm.as_ref() else {
+            return true;
+        };
+        c.unanimous_i32(i32::from(self.spec_primed)) == Some(1)
+    }
+
     /// ★ PRINT, DO NOT SILENTLY DEGRADE.
     ///
     /// A failed vote falls back to the direct launches and the request still runs,
@@ -7559,7 +7617,26 @@ impl<'a> DevChain<'a> {
         // primed by the round that ran the legacy path (its `step_dev` is what
         // writes the very first tap) and every later round swallows the
         // main-chain step into the verify's anchor row.
-        if swallow_step() && self.spec_primed {
+        //
+        // ★ THE ARM IS A UNANIMOUS DECISION, NOT A PER-RANK ONE (`ar5-hang`'s
+        // root cause — see [`Self::spec_primed_unanimous`]): `spec_primed` is a
+        // per-rank flag but the arm's AR ROUND FOOTPRINT is process-wide, so one
+        // rank that lost its priming must send the WHOLE world back to the
+        // legacy path for this round. Otherwise that rank issues ~80 more v5
+        // rounds per step than its peers and spins on their stamps forever (the
+        // permanent epoch rift), while the peers — who issued FEWER — silently
+        // read its previous epoch's values. The legacy path re-primes every rank
+        // at its tail, so the very next round is unanimous again.
+        //
+        // The vote comes FIRST and is taken unconditionally: it is a symmetric
+        // rendezvous, so evaluating the cheap `self.spec_primed` before it would
+        // leave the primed ranks spinning alone in the vote (one hang for
+        // another). With the gate off both terms short-circuit on
+        // `swallow_step()` and nothing is issued — the default path is
+        // bit-for-bit what it was. The trailing `self.spec_primed` is what keeps
+        // the NO-PEER case identical to the old expression: without a `comm` the
+        // helper answers `true` and the local flag alone decides.
+        if swallow_step() && self.spec_primed_unanimous() && self.spec_primed {
             let rep = self.dspark_spec_swallowed(dspark, token, pos)?;
             lazy_b_ms_note(rep.verify_ms);
             return Ok(rep);

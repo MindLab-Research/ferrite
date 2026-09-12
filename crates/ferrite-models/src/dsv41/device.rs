@@ -354,6 +354,15 @@ struct Kernels {
     rmsnorm_rows: Option<unsafe extern "C" fn(
         *const f32, *const f32, *mut f32, c_int, c_int, f32, CuStream,
     ) -> c_int>,
+    /// L4-9: the dim-split twin of [`Self::rmsnorm_rows`]
+    /// (`dsv41_rmsnorm_rows_split_kernel`), `DSV41_NORM_SPLIT` (default OFF).
+    /// `grid = (nchunks, rows)` — the `dim` axis is cut into `nchunks`
+    /// contiguous segments so a `rows = 1` call spreads over `nchunks` SMs
+    /// instead of one. Optional: an `.so` without the symbol, or a gate that is
+    /// off, keeps the original `dsv41_rmsnorm_rows` launch unchanged.
+    rmsnorm_rows_split: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *mut f32, c_int, c_int, f32, c_int, CuStream,
+    ) -> c_int>,
     // bf16 gate + fp8 shared expert in ONE launch (same activation). Optional:
     // falls back to the separate launches.
     gemm_bf16_fp8x2: Option<unsafe extern "C" fn(
@@ -978,6 +987,16 @@ struct Kernels {
         *mut f32, *const f32, *const f32, *mut f32,
         c_int, c_int, c_int, f32, c_int, CuStream,
     ) -> c_int,
+    /// L4-9: the dim-split twin of [`Self::hc_collapse_norm`]
+    /// (`dsv41_hc_collapse_norm_split_kernel`), `DSV41_CNORM_SPLIT` (default
+    /// OFF). Same arguments plus a trailing `nchunks` before the stream, and
+    /// `grid = (nchunks, rows)` instead of `grid = rows` — the fix for the
+    /// m = 1 one-CTA case. Optional: an `.so` without the symbol, or a gate
+    /// that is off, keeps the fused single-launch version unchanged.
+    hc_collapse_norm_split: Option<unsafe extern "C" fn(
+        *mut f32, *const f32, *const f32, *mut f32,
+        c_int, c_int, c_int, f32, c_int, c_int, CuStream,
+    ) -> c_int>,
     /// hc_mixes spread over one block per projection row with cp.async staging,
     /// plus the sum-of-squares/sigmoid/sinkhorn tail in one trailing kernel.
     /// Returns an error when DSV41_HC_FRONT is off, so the caller keeps hc_mixes.
@@ -1238,6 +1257,7 @@ impl Device {
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
             rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
             rmsnorm_rows: ko!(rt, "dsv41_rmsnorm_rows"),
+            rmsnorm_rows_split: ko!(rt, "dsv41_rmsnorm_rows_split"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
             argmax_sliced_rows: ko!(rt, "dsv41_argmax_sliced_rows"),
@@ -1314,6 +1334,7 @@ impl Device {
             hc_post_inplace: km!(rt, "dsv41_hc_post_inplace"),
             hc_post_inplace_rows: ko!(rt, "dsv41_hc_post_inplace_rows"),
             hc_collapse_norm: km!(rt, "dsv41_hc_collapse_norm"),
+            hc_collapse_norm_split: ko!(rt, "dsv41_hc_collapse_norm_split"),
             hc_front: km!(rt, "dsv41_hc_front"),
             hc_front_persist: ko!(rt, "dsv41_hc_front_persist"),
             hc_front_persist_mb: ko!(rt, "dsv41_hc_front_persist_mb"),
@@ -5555,6 +5576,22 @@ impl Device {
         dim: i32,
         eps: f32,
     ) -> Result<bool> {
+        // L4-9 (DSV41_NORM_SPLIT, default OFF): the dim-split twin. Only a shape
+        // the C launcher accepts is issued, and a decline falls through to the
+        // original launch below — so OFF (or a stale `.so`, or a decline) is the
+        // pre-existing call, bit for bit.
+        if norm_split_wanted() {
+            if let Some(fs) = self.kernels.rmsnorm_rows_split {
+                let nc = norm_split_chunks(dim);
+                if norm_split_fits(rows, dim, nc) {
+                    let rc = unsafe { fs(x, w, out, rows, dim, eps, nc, self.stream) };
+                    if rc != NORM_SPLIT_DECLINE {
+                        self.kerr(rc, "dsv41_rmsnorm_rows_split")?;
+                        return Ok(true);
+                    }
+                }
+            }
+        }
         let f = match self.kernels.rmsnorm_rows {
             Some(f) => f,
             None => return Ok(false),
@@ -5703,6 +5740,24 @@ impl Device {
         eps: f32,
         truncate: bool,
     ) -> Result<()> {
+        // L4-9 (DSV41_CNORM_SPLIT, default OFF): the dim-split twin — the fix
+        // for the m = 1 one-CTA case. Issued only for a shape the C launcher
+        // accepts; a decline falls through to the original launch below, so OFF
+        // (or a stale `.so`, or a decline) is the pre-existing call, bit for bit.
+        if cnorm_split_wanted() {
+            if let Some(fs) = self.kernels.hc_collapse_norm_split {
+                let nc = norm_split_chunks(dim);
+                if norm_split_fits(rows, dim, nc) {
+                    let rc = unsafe {
+                        fs(x, pre, w, out, rows, hc, dim, eps, truncate as c_int, nc, self.stream)
+                    };
+                    if rc != NORM_SPLIT_DECLINE {
+                        self.kerr(rc, "dsv41_hc_collapse_norm_split")?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         let rc = unsafe {
             (self.kernels.hc_collapse_norm)(
                 x, pre, w, out, rows, hc, dim, eps, truncate as c_int, self.stream,
@@ -6139,4 +6194,72 @@ fn gemv_f32_v2_wanted(n: i32) -> bool {
     n > 0
         && n < GEMV_F32_V2_MAX_N
         && *F.get_or_init(|| std::env::var("DSV41_GEMV_F32_V2").map(|v| v != "0").unwrap_or(true))
+}
+
+// ---------------------------------------------------------------- L4-9 split
+//
+// `dsv41_hc_collapse_norm` / `dsv41_rmsnorm_rows` launch `grid = rows`, so at
+// m = 1 they run as ONE block on ONE SM. The split entries cut the `dim` axis
+// into `nchunks` contiguous segments (`grid = (nchunks, rows)`) and do the row
+// reduction in two stages (per-chunk partial -> elected-last-block fold), which
+// is the fix for that worst case. Both gates are default OFF: the OFF arm issues
+// the original launch with the original arguments, i.e. bit-for-bit today's
+// path, and a stale `.so` without the new symbols reports `None` and falls back
+// the same way.
+
+/// Caps of the split kernels (`DSV41_NORM_SPLIT_MAXR` / `_MAXC` in
+/// `dsv41_kernels.cu`). The C launcher declines above them via
+/// `DSV41_NORM_SPLIT_DECLINE`, and this side declines FIRST so a shape the split
+/// cannot take never reaches the entry (a decline is the same fall-back as a
+/// missing symbol). Keep the two in step.
+const NORM_SPLIT_MAXR: i32 = 256;
+const NORM_SPLIT_MAXC: i32 = 16;
+
+/// The split launchers' decline sentinel (`DSV41_NORM_SPLIT_DECLINE` in
+/// `dsv41_kernels.cu`). Deliberately NOT `1`: that is `cudaErrorInvalidValue`,
+/// which the legacy `dsv41_rmsnorm_q` uses as its decline and which the caller
+/// therefore cannot distinguish from a real failure. Only this exact code means
+/// "keep the original launch"; every other non-zero code is an error.
+const NORM_SPLIT_DECLINE: c_int = 0x7FFF;
+
+/// `DSV41_CNORM_SPLIT=1` routes [`Device::hc_collapse_norm`] through the
+/// dim-split entry when the shape fits. Default OFF (numerically equivalent, not
+/// bit-identical — see the kernel header).
+fn cnorm_split_wanted() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_CNORM_SPLIT").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_NORM_SPLIT=1` routes [`Device::rmsnorm_rows`] through the dim-split
+/// entry when the shape fits. Default OFF, same contract as
+/// [`cnorm_split_wanted`]. [`Device::rmsnorm_rows_on`] (the verify attention
+/// fork's side-stream kv norm) is deliberately NOT routed: its `[row]` slots
+/// would be shared with a concurrent main-stream split launch. See the kernel
+/// header's PRECONDITION note.
+fn norm_split_wanted() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_NORM_SPLIT").map(|v| v != "0").unwrap_or(false))
+}
+
+/// The `dim` cut for the split entries: one chunk per 1024 elements (the
+/// blockDim both originals already use, so each chunk is one full-width pass of
+/// the same tree), clamped to `[1, NORM_SPLIT_MAXC]`. `DSV41_NORM_SPLIT_NC`
+/// overrides it so the chunk count can be swept without a rebuild; a value the
+/// kernel cannot take declines there and the caller keeps the original launch.
+fn norm_split_chunks(dim: i32) -> i32 {
+    static NC: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+    let want = *NC.get_or_init(|| {
+        std::env::var("DSV41_NORM_SPLIT_NC")
+            .ok()
+            .and_then(|v| v.parse::<i32>().ok())
+    });
+    let nc = want.unwrap_or_else(|| (dim + 1023) / 1024);
+    nc.clamp(1, NORM_SPLIT_MAXC)
+}
+
+/// `true` when the split entry should be issued for this `(rows, dim)`: the gate
+/// is on, the `.so` exports the symbol, and the shape is one the C side accepts
+/// (`rows <= NORM_SPLIT_MAXR`, at least two chunks, every chunk non-empty).
+fn norm_split_fits(rows: i32, dim: i32, nc: i32) -> bool {
+    rows > 0 && rows <= NORM_SPLIT_MAXR && nc >= 2 && nc <= NORM_SPLIT_MAXC && dim >= nc
 }
