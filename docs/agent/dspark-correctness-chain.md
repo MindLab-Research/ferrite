@@ -5121,3 +5121,31 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 1. lazy 逼近 145（L4/L5 kernel 工作）——不够 400
 2. **batched 的 kernel 重写**（"M 进 grid" 化）——L4/L5 的 25-35 人日
 3. SWALLOW 修复（如果第 10 次成功）——但 SWALLOW 的 hang 修复后 batched 还是要 kernel 重写才能超 145
+
+## L4/L5 "M 进 grid" 的第一步实施计划（400 的根本路径）
+
+**SH_PAIR 的验证机制**：phase-1 用 M×9=54 blocks（M 进 grid 维度）——每个 block 加载一份权重，为 M 行激活做计算。**权重读 1 次，M 行复用**——唯一已验证的真权重共享。
+
+**推广的第一步：gemm_fp8_mrows 的 M-into-grid 化**（投影族，19.4% kernel 时间）
+```
+当前（warp-per-row）：
+  grid = (n/32) blocks，每 block 8 warps，每 warp 一行权重
+  M 行激活：每 warp 串行处理 M 次 dot product
+  
+推广后（M-into-grid）：
+  grid = (n/32) × M blocks，每 block 处理一行权重 × 全部 M 行激活
+  权重读 1 次/block，M 行激活在 smem
+  效果：权重读从 M 次降到 1 次（如果 kernel 是带宽受限）
+  但：kernel 是 instruction-bound——省字节收益小；真正的收益是 launch 数减少
+```
+
+**诚实评估**："M 进 grid" 的收益在 instruction-bound kernel 下主要是 launch 减少（不是字节节省）。L4 的占用优化（SM 利用率）可能比 "M 进 grid" 更直接。
+
+**第一步的具体工作**（如果下一 session 继续）：
+1. gemm_fp8_mrows 的 grid 扩展（M 维度）——设计 + 实施 + parity
+2. hc_dots 的 grid 扩展（mix × rows）——L4-7 已设计
+3. collapse_norm 的 grid 扩展——L4-9 已实施（待 A/B）
+
+**预期收益**：~5-8ms（从 91.1 的 ~33ms 步时降到 ~25-28ms）→ ~110-120 tok/s
+**到 145**：还需要 tcgen05 + 更多 L4 项
+**到 400**：batched + L5 流水（25-35 人日的完整路径）
