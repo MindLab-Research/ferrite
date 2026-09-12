@@ -2700,3 +2700,16 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 6. + L4 占用优化 → -5ms → **400 tok/s** ✓
 
 **每一步都是必要的**——缺任何一步都到不了 400。当前最大阻塞：Plan B（图）> SH_PAIR parity > tcgen05。
+
+## SWALLOW + 计数任务测试结果（92bceb69）——部分成功（高 accept 路径仍 hang）
+
+**结果**：LEN=60（短输出），completion=46，**937 ar5-hang**（计数任务比出师表更严重）
+**k_acc**：5 1 3 3 1 5 0 2 1 1 5 0 2 1 1（重复模式——数值问题？）
+**对比**：出师表 SWALLOW 不用图 = 0 ar5-hang ✓，计数任务 = 937 hang ✗
+
+**判定**：
+1. SWALLOW 不用图在低 accept（出师表）下工作，但在高 accept（计数）下仍 hang
+2. **高 accept 触发更多 note_ctx_rows 处理**（更多 committed rows）——可能触发不同的 AR 模式
+3. **LAZY_VERIFY 是可靠的路径**（已蕴含 SWALLOW——lazy 的 row 0 = 被吞的主链步）
+
+**结论**：放弃 batched SWALLOW_STEP（ar5-hang 顽固），专注 LAZY_VERIFY 优化。
