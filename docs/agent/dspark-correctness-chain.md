@@ -1379,3 +1379,17 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0
 ```
 （GATEUP_FUSE=0 解锁被默认 ON 阻塞的 grouped 路径）
+
+## Batched 400 v2 的结果行动计划（等 1fa9a430）
+
+**k_acc 语义**：swallowed 臂的 k_acc 保持 legacy 含义（k_emit - 1 = 接受的 draft 数）——与 lazy 臂直接可比。
+
+**结果→行动**：
+| 步时 | 判定 | 下一步 |
+|---|---|---|
+| ≤10ms | 400 路径确认 ✓ | 加 P0-3+P1-5 accept 杠杆的组合测试 |
+| 10-20ms | 部分优化未兑现 | 分析 decline 日志（head-mrows 修复加了可观测性） |
+| >20ms | SWALLOW 或图化问题 | 检查 verify_graph_m6 capture + SWALLOW 的 spec_primed |
+| 拉丁出现 | gate 破坏基线 | 逐个隔离（用 decline 日志） |
+
+**tcgen05 路径**（下一轮）：需要 GATEUP_FUSE=0 + 三件套 =1（解锁被默认 ON 阻塞的路径）
