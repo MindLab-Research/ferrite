@@ -1830,3 +1830,17 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **Stage 2**：脚本 bug（`tag: unbound variable`——set -u 捕获未设置变量），手动跑替代（f15ecd37）
 
 **意义**：tcgen05 kernel 已编译进 .so，5-gate 链的前置条件全部满足。首次 GPU 冒烟即将验证正确性。
+
+## AR v5 Hang 的完整根因与修复（ar5-hang-rootcause 的判词）
+
+**根因 1（SEVERE）**：argmax_sliced_rows 与 MoE AR 共享 epoch 计数器，但 capturing 规则不一致：
+- MoE AR（cuda.rs:6815）：`if !is_capturing() { return Ok(false); }` —— 非 capturing 时走 NCCL，不推进 epoch
+- argmax_sliced_rows（device.rs:2957-2971）：**无此守卫**——无条件发射，kernel 的 `*epoch = e + 1` 无条件推进
+
+**根因 2（SEVERE）**：DRY 分支（chain_dev.rs:5158-5168）无 host barrier，而 replay（:5176）和 capture（:5185）都有。DRY 是真实执行（推进 epoch）但时序无约束。
+
+**死锁机制**：DRY 轮 → MoE AR 走 NCCL（epoch+0）+ argmax 照发（epoch+1）→ 下轮 replay 的 epoch 预期错位 → 部分 rank 自旋等待不存在的 stamp → ar5-hang（need-cur=1..2，rows=6 的形态）
+
+**修复**（ar5-hang-fix subagent 实施中）：
+1. argmax_sliced_rows 加 capturing 守卫（与 MoE AR 同规则）
+2. DRY 分支加 host barrier（与 replay/capture 一致）
