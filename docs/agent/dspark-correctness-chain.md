@@ -1359,3 +1359,16 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 - 当前 accept 1.214 → 2.214 tok/step → 步时 ≤5.5ms 才达 400（不可能）
 
 **结论**：400 需要 accept 接近上限（~3）且步时 ≤10ms。两个都是必要条件。
+
+## tcgen05 的 5-gate 链 + 2 个隐藏坑（tcgen05-test-analysis）
+
+**显式 3 gate**：EXPERT_ACT_E4M3（≠"0" 宽松）→ EXPERT_TCGEN05_E4M3（严格"1"前缀）→ EXPERT_GROUPED（严格"1"前缀）
+
+**隐藏坑 1**：`DSV41_GATEUP_FUSE` **默认 ON** 且生产形状（dim=5120%512==0）满足 → **decline 条件 #3 触发**——tcgen05 grouped 路径被一个默认 ON 的 gate 阻塞！**修复：DSV41_GATEUP_FUSE=0**
+
+**隐藏坑 2**：gate 读取不一致（ACT_E4M3 用 !="0"，TCGEN05 用 starts_with("1")）——测试脚本必须三个都用 =1
+
+**正确的 tcgen05 测试组合**：
+```
+DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0
+```
