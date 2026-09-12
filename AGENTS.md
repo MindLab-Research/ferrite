@@ -1884,3 +1884,24 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 8 passed ✓。**待办**：`.cu` 未改（无需重编 .so），但需在 b300 上跑真实权重 A/B
 （`FERRITE_GEMM3=0` 对照）确认 tok/s 与四段文本——bf16-MMA vs cuBLAS 的 1e-3 重结合
 是已知的 leading-token flip 类，且 out_f>65536 的路径仍带 cast。
+
+## 2026-09-12 统一引擎战役（用户指令：架构零重复 + dspark MTP ≥400 + KV/radix + 1M prefill + 多并发，全超 sglang）
+
+**基线 tag**: `dsv41-6.15ms-162toks`（DSV41 单并发 6.15ms = 162.6 tok/s）。**对标**: sglang DSpark 383.7 tok/s @ B=1 B300 TP8（V4-Pro, accept~5, LMSYS 博客）——用户目标 400 = 超越它。
+
+**战役计划**: `docs/agent/unified-engine-battle-plan.md`（4 份调研综合：dup-audit / mtp-research / kv-research / prefill-research，报告在 /tmp/*_report.md）。五波：①快速统一 ②dspark MTP ③KV/radix ④1M prefill ⑤多并发 + 深度统一（cuda.rs→devrt、kernel 合并、LayerDesc 描述化）。
+
+### Wave 1 完成（2026-09-12，4 commits）
+- 单一二进制 `ferrite-serve --model {glm53,dsv41}`（T3）；GLM run_serve 改走共享 `serve::launch`（T2，删 80 行复制）；Dsv41Frame 上移 ferrite-models（T1）；死代码 dist.rs 删除（747 行未挂载文件）
+- ferrite-dispatch 确认为调度基座（radix 611 行 + state 三层 hicache 1037 行 + mtp 协议 267 行，SGLang parity）——Wave 3 接 GpuEngine 的对象
+- 旧"MTP/投机禁令"已解除（用户 2026-09-12 指令明确要求 dspark block-5 单并发 ≥400）
+
+### Wave 2 dspark MTP（进行中）的关键定案
+1. **dspark 语义**（host 参考 dspark.rs + sglang 仲裁）：3 个 mtp block 一次 forward 出 5-token block（block_size=5）；MQA 单 kv head；**块内非因果**（所有行共享窗口+块候选集）；行 r 位置 = start_pos+bs+r；Markov head 顺序 5 步 gumbel（u≡1 时退化为 argmax——与 sglang 语义一致）；权重 2401 key 全在（M0 核对）。
+2. **时序**（host 语义定案，与 sglang 的 gamma+1=6 不同但更优）：主链**单行** forward(anchor) → argmax + hidden(t) → draft(hidden, t) 出 d1..d5 → **verify 5 行 [d1..d5]**（anchor 行走单行路径 = 数值域天然与非 spec 一致，k=1 时输出与非 spec 完全相同）→ accept k = 1 + 最长匹配（d1 vs argmax 免费第一个匹配）。
+3. **数值域铁律**：verify 的 argmax 必须与逐 token 单行 decode 一致——行独立算子多行调用（rmsnorm/hc/rope/sparse_attn/MoE route），**投影与 head 逐行循环**（同 kernel 路径）；M2 优化做多行 GEMV kernel（per-row 独立累加）。
+4. **RoPE 仲裁**：host 参考两处转录 bug 已修（q 的覆盖错乱 + o 的 per-head pos）——以 sglang 生产实现为准（per-token pos，token r 的所有 head 共享 start_pos+bs+r）。
+5. **verify 因果窗口**：verify_ring_win kernel——行 r 的窗口 = 截至 pos+r 的因果槽位（块内因果由 ring 几何天然给出：行 r 看到块内 0..r）；GPU 测试 7/7 过（含窗口边界）。markov_head kernel GPU 测试 5/5 过（含 full 129280×256）。
+6. **发现**：三个 batched expert launcher 的 rows 参数**只做校验不进 grid**（每次调用只算 1 个 activation 行）——draft_moe 曾传 rows=bs 静默只算行 0，已修（逐行调用模式 = moe_rows 的写法）。
+7. **影子模式**（shadow_step，subagent 实现中）：draft+verify 的副作用全回退（ring 槽快照 + compressor 状态 + clen），主链输出与非 spec 逐位一致——先验证 accept 分布（预期 4-5）再上真 commit。
+8. **遗留**：compressor 多行组形成（6 行跨多组未建模）、indexer 块内候选排除（TODO）、verify ~800 launch/步（M2 收）、多行 sliced argmax。
