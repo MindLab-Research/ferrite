@@ -165,3 +165,204 @@ fp4 = 0.5B/元素 + scale(o·k/32)，bf16 = 2B，f32 = 4B。
 ---
 
 *户部 · 只读分析，未执行任何 GPU 命令、未改动任何代码（本文件为唯一产出）。*
+
+---
+
+# 更新（第二轮）— head 切分 / o-rope 融合 / a32 回退落地后
+
+> 户部 · 2026-09-12 · HEAD `53bae56`（a32 gate `28515b6` 10:08 · orope `8f18105` 10:18 · head slice `109f87c` 10:24）
+> 方法同第一轮：只读代码 + shape 精确推导 + 仓库内实测单价折算。**本机无 GPU，未跑 nsys。**
+> 本轮第三项（a32）是**唯一一个让账本变差**的变化，所以先给判定。
+
+## 0. 一句话结论
+
+**新预期基线 ≈ 40 ~ 45ms（m=6），不是 37ms 以下。**
+head 的 −1.3~−1.5ms **被 a32 回退吃掉了**——而且不止：回退同时把 `proj_mrows` 的
+**weight-stationary 收益**（`AGENTS.md:94` 自己记的「多行化的真实收益 = 权重读一次（~3ms）」）还了回去。
+关键判定（§3）：**即使 verify 图化，a32 回退仍净亏 ~3.9ms > head 的 −1.3ms**。
+到 5.5ms 的最新缺口：**~34.7 ~ 39.1ms（6.3~8.1×）**。
+
+---
+
+## 1. 三个已落地变化：代码级核对（先用代码钉住口径）
+
+| 变化 | 落点 | 代码事实 | 口径修正 |
+|---|---|---|---|
+| **head 词表切分** | `chain_dev.rs::verify_head_geom` + `DSV41_VERIFY_HEAD_SLICED`（**默认 ON**，`verify_head_sliced()→unwrap_or(true)`）｜`device.rs:2622 argmax_sliced_rows` | 每 rank 只投 `seg = vocab/world = 129280/8 = 16160` 行 → **165.5MB/rank/行**；每行仍是**同一个 v1 核**（`gemv_bf16`，n=seg=16160 仍 >2048 所以不走 v2）⇒ 与 eager 逐位同源；argmax 是 `dsv41_argmax_sliced_rows` **一次 v5 round 批 m 行**（不是 m 次 `argmax_sliced`） | ⚠️ **上一版 6619MB 是 m=5（5×1323.8），本轮 992MB 是 m=6（6×165.5）——两者不可直接相减。** 同 m=6 归一：**7943 → 993MB（−6.95GB，−87.5%）** |
+| **o-rope 融合（P1v）** | `8f18105`｜`DSV41_VERIFY_OROPE`（默认 ON）｜`sparse_attn_orope` 调用点在**行循环内**（`chain_dev.rs:6820`） | 每行每层：`sparse_attn` + `apply_rope` + `quant_fp8` 三个 launch → **1 个**（融合核的 phase 2 旋转 + phase 3 发射 fp8）⇒ **−2 launch/行/层** | 任务口径的「−80 launch/步」是 **eager（m=1）** 的数；verify 是 **−2×m×40 = −480/步（m=6）**。ms 上很小（~0.2ms），**但它是正确性对齐**（两臂同核），不是优化项 |
+| **a32 gate** | `28515b6`：`dsv41_kernels.cu:4985 if (g_gemv_a32) return 2;`（`g_gemv_a32` 默认 **true**）｜`chain_dev.rs::proj_mrows` 把 `Ok(false)` 当「未执行」 | **decline 在 C 端，Rust 侧 `mrows` 变量看不到它**——见 §2 | 见下 |
+
+---
+
+## 2. Q3 的精确核算：decline 之后走的是什么循环
+
+### 2.1 调用侧（这是判定成立的关键）
+
+```rust
+// chain_dev.rs:6497  —— 只看 .so 符号 / swapab / 行数，**不看 a32**
+let mrows = self.dev.supports_gemm_fp8_mrows() && !Self::swapab() && m <= VERIFY_ROWS;
+let took_akv = if mrows {
+    self.quant_rows(xn_r, m, dim)?;           // ① 先发射 staging
+    let ok_a  = self.proj_mrows(wq_a, ...)?;  // ② C 端 return 2 ⇒ Ok(false)
+    let ok_kv = self.proj_mrows(wkv,  ...)?;
+    ok_a && ok_kv                             // ③ false
+} else { false };
+if !took_akv { for r in 0..m { self.lin(wq_a); self.lin(wkv); } }  // ④ 落到逐行
+```
+
+`lin()` = **`quant1` + `gemm_fp8_mx(m=1)`**（`chain_dev.rs:2625`）——即 **M=1 SIMT GEMV**，也就是 EAGER 跑的那个程序。
+**要点：① 是纯粹浪费——staging launch 已经发射，decline 后又把同样的量化按行重做一遍。**
+`quant1` 的 T1/T2 省略在这里**不生效**（它们按指针门控 `s.xn.ptr` / `s.qr.ptr`，而 verify 的源是 `xn_r + r*dim`，不是同一个 buffer）。
+
+### 2.2 launch 账（每层 / m=6）
+
+| 站点 | mrows 路径 | a32 decline 后 | Δ |
+|---|---|---|---|
+| `wq_a`+`wkv` | `quant_rows`×1 + gemm×2 = **3** | `quant_rows`×1(废) + 6×(`quant1`+gemm)×2 = **25** | **+22** |
+| `wq_b` | `quant_rows`×1 + gemm×1 = **2** | `quant_rows`×1(废) + 6×(`quant1`+gemm) = **13** | **+11** |
+| `wo_a`（grouped） | 1（`wo_a_grouped_fp8` **自读 a32 门**，不受影响） | 1 | **0** |
+| `wo_b` | pack×6 + gemm×1 = **7** | pack×6(废) + 6×(`quant1`+gemm) = **18** | **+11** |
+| **合计** | **13** | **57** | **+44/层 = +1760/步** |
+
+拆开看这 +1760：
+- **gemm：+20/层 = +800/步** ← 这一项正好等于 commit 说的「+800 launches/step」——**原话只算了 gemm**；
+- **`quant1`：+16/层 = +640/步**（每个 `lin` 自带一次量化）；
+- **纯废 launch：+8/层 = +320/步**（wq_a/wkv、wq_b 的 `quant_rows` + wo_b 的 pack 循环，decline 后仍先发射）。
+
+m=5 口径（上一版账本的行数）：**+36/层 = +1440/步**，其中 gemm +640。
+
+⇒ **任务里「800 × 3µs = 2.4ms」低估了 ~2.2×**（真实增量 ~1760 launch），但——**3µs 本身也不是正确的单价**，见下。
+
+### 2.3 「每 launch 小」是不是真的？——不是，代价有两层
+
+**(a) launch 层**（仓库实测地板，来源 `graph_bench` / verify 审计）：
+
+| 口径 | 单价 | 1760 launch | 只算 gemm 800 |
+|---|---|---|---|
+| 图内 dispatch（`DSV41_VERIFY_GRAPH=1`） | 0.411µs/node | **0.72ms** | 0.33ms |
+| 流式 host submit（**今天的默认，verify 未图化**） | 2.904µs/launch | **5.11ms** | 2.32ms |
+| + 小核最小执行（verify 自己的口径 3.3µs） | 6.2µs | 10.9ms | 4.96ms |
+
+**(b) 权重重读层（主项，且任务描述里没提）**：
+`gemm_fp8_mrows` 是 **weight-stationary**——每个 warp 把**一行权重 stage 进 smem**（`row_s[warp*k] ← w[row*k]`），
+然后对 **M 行激活**复用（`for r in 0..M: acc[r] += av*wv`，`dsv41_kernels.cu:4936`）。
+逐行 `gemm_fp8_mx(m=1)` 则是**每行把整块权重重读一遍** ⇒ 4 个受影响的投影权重被读 **m 次**：
+
+```
+每层受影响权重 = wq_a 6.554 + wkv 2.621 + wq_b 5.243 + wo_b 5.243 = 19.661 MB
+× 40 层 × (m−1) = m=6: +3.93 GB/步   (m=5: +3.14 GB/步)
+```
+
+**旁证（同一仓库自证）**：`AGENTS.md:94` 写「verify 37ms：**多行化的真实收益 = 权重读一次（~3ms）**」——
+3.14GB @ ~1TB/s ≈ 3.1ms，与 3.9GB @ 1TB/s ≈ 3.9ms 同量级。**这就是 a32 回退还给回去的东西。**
+
+---
+
+## 3. 关键判定：会不会吃掉 head 的 −1.3ms？
+
+**会，而且不够。** 按最保守（对 a32 最有利）的假设——verify **已经图化**：
+
+| 分项 | 值 |
+|---|---|
+| a32 回退 · launch（图化 0.411µs × 1760） | **+0.72 ms** |
+| a32 回退 · 权重重读（+3.93GB @ ~1TB/s） | **+3.9 ms** |
+| **回退合计** | **+4.6 ms** |
+| head 切分收益（m=6：6×298µs → 6×48µs） | **−1.50 ms** |
+| o-rope 融合（同核对齐的副产品） | **−0.20 ms** |
+| **三变化净效应** | **+2.9 ms** |
+
+⇒ 非图化（今天的默认）时把 launch 换成 5.11ms：**回退合计 +9.0ms，净效应 +7.3ms。**
+
+**结论**：`−1.3ms` 的 head 收益在**两种情形下都被吃光**（最乐观情形下也净亏 ~2.9ms）。
+`+800 launch` 之所以看起来"小"，是因为只数了 gemm 一项、且用了 3µs 这个纯发射单价——
+**漏掉了 (i) 640 个 `quant1` + 320 个纯废 launch，(ii) weight-stationary 回退带来的 3.9GB 重读。**
+
+### 3.1 一个必须先钉死的前置不确定项（否则上面的判定会翻转）
+
+**37.31ms 那次测量（09:5x）时，mrows 到底有没有生效？**
+
+| 证据方向 | 内容 |
+|---|---|
+| **支持「生效」**（⇒ 回退 = 新增 +4.6~9ms） | `AGENTS.md:94` 明写「verify 37ms：多行化的真实收益 = 权重读一次（~3ms）」⇒ 37ms 已含 mrows；根因 #6（`quant_rows` 行距 bug）的指纹（行 0 恒对、r≥1 全错）**只能在 mrows 分支出现** |
+| **支持「未生效」**（⇒ 回退 = 0，head 的 −1.3ms 保住） | verify 审计（`86b1608`, 09:30）把 verify **38.5ms** 记成 **6232 launch**（其中投影 2000 = **逐行口径**），并把 mrows 列为"产出的削减 2000→~400" |
+
+**一次 A/B 就能定**（正是 a32 提交自己点名的 verification posture）：
+
+```
+同一 serve 跑 DSV41_GEMV_A32=1 vs =0，比 [dspark] 的 verify_ms
+  A32=0 ⇒ mrows 生效（多行）；A32=1 ⇒ 逐行
+判据：Δverify_ms ≥ 1.3ms ⇒ head 收益被吃；≈0 ⇒ 37.31ms 本就是逐行，a32 gate 零变化
+```
+
+---
+
+## 4. 更新后的账本
+
+### 4.1 变化项（m=6，每卡/每步）
+
+| 项 | 上一版 | 本轮 | 字节变化 | ms 变化 |
+|---|---|---|---|---|
+| **head**（词表切分） | 7943MB / 1.79ms（未切） | **993MB / 0.29ms** | **−6.95 GB** | **−1.50 ms** |
+| **o-rope**（P1v 融合） | per-row rope+quant（2×m×40 launch） | 1 launch/行/层 | ~0 | **−0.20 ms**（+ −480 launch/步） |
+| **投影族**（a32 回退） | 955MB / 3.70ms（mrows） | **4886MB / 8.3~12.7ms** | **+3.93 GB** | **+4.6 ~ +9.0 ms** |
+| 三项净 | | | **−3.02 GB** | **+2.9 ~ +7.3 ms** |
+| **共享专家（flag OFF）** | 885MB / 10.40ms（m=5） | 1062MB / **12.48ms**（m=6） | — | 仍在桌上，**最大项** |
+
+### 4.2 新的预期基线（锚定测量值，不重算全表）
+
+```
+37.31ms（实测，m≈5，mrows ON，未切 head，无 verify-orope）
+ −1.50    head 词表切分（m=6 归一：6×298µs → 6×48µs）
+ −0.20    o-rope 融合（同核对齐）
+ +4.6~9.0 a32 回退（图化 0.72 + 权重 3.9 ／ 非图 5.11 + 权重 3.9）
+ ─────────
+ = 40.2 ~ 44.6 ms   ← 新的预期基线（m=6；若 §3.1 判为"未生效"则 35.6ms）
+```
+
+**流量侧的现状（m=6）**：16.1GB（上一版 m=6 归一）− 6.95（head）+ 3.93（a32）= **≈13.1 GB/步**
+⇒ 达成带宽 ≈ 13.1GB / 40ms ≈ **327 GB/s**（比第一轮的 381 更低）。
+**注意方向：head 切分省的是"已经跑到 4.44TB/s 的字节"，a32 回退加的是"每层只跑到 ~1TB/s 的权重重读流量"——
+所以字节净减 3GB，时间反而净增 ~3ms。**
+
+---
+
+## 5. 到 5.5ms 的最新路径（按 把握 × 收益 排序）
+
+| # | 方向 | 落点 | 预期 | 把握 | 加权 |
+|---|---|---|---|---|---|
+| **1** | **共享专家 mrows**（`DSV41_SH_EXP_MROWS=1`，代码已就位 93c4439，**默认 OFF**）<br>`shared_expert_mrows`：`quant_rows` + `gemm_fp8_mrows`×2(w1/w3) + `swiglu_limit_q(rows=m)` + `gemm_fp8_mrows`(w2) + `add_inplace` | `chain_dev.rs:8018/8026/8038/8068` | **12.48 → 2.52ms（−9.96ms）**；字节 1062→212MB | **高**（只差默认值 + 一次 A/B） | **9.0** |
+| **2** | **verify 图化**（`DSV41_VERIFY_GRAPH=1`，A/B 脚本现成 `scripts/verify_graph_ab.sh`） | `verify_graph_gate` | launch submit 2.904→**0.411µs/node** ⇒（3000~4600 launch）**−3~5ms**；**并把 a32 回退的 launch 代价从 5.11 压到 0.72ms** | 中高（图捕获条件已就位；`eng_host/stats_dbg/phase_dbg` 会拒绝） | **3.0** |
+| **3** | **MoE gate 行折叠**（`DSV41_ROW_FOLD_GATE=1`）+ **indexer 多行**<br>复用现成 `gemv_bf16_mrows` / `proj_mrows` | `chain_dev.rs:7188` / `:6826` | **4.13 → 0.83ms（−3.3）** + indexer **3.00 → 2.30（−0.7）** | 高（gate flag 已存在）/ 中 | **2.6** |
+| **4** | **a32 Direction B**：给 mrows 核补 a32（物化 `s_af`）变体，让两个臂再次同表达式 | `dsv41_kernels.cu:4985`（删掉 decline） | **投影 8.3~12.7 → 3.7ms（拿回 4.6~9.0ms）** | **中**（是 §3 的止损项，非新增收益） | **2.3** |
+| 5 | 路由专家**核效率**（`dsv41_experts_mxf4.cu`：cp.async/TMA/tcgen05；现状 80% issue 停等在 LUT smem gather） | 同 | **9.96 → 2~3ms（−7~8ms）** | **低-中**（历史 5 次失败；M=128 mxf4 实测 16.8GB/s） | 2.0 |
+| 6 | hc 链融合 + compressor 多行 + engram | `dsv41_glue.cu` | 3.55 → 1.5（−2.0）+ 0.66→0.4 | 中 | 1.2 |
+| 7 | head **折叠**（K 序 parity 后再谈，`VERIFY_HEAD_FOLD` 保持 OFF） | `head_gemv_bf16_mrows` | 0.29 → 0.05（−0.24） | 低 | 0.3 |
+
+**1~4 全做完**：40.2~44.6 → **~18~20ms**。**仍然差 3.5×**——这与第一轮的结论一致：
+**字节/launch 都不是门槛，门槛是「小 N GEMV 族的达成带宽」**（第一轮 T1/T2/T3 不变）：
+
+| 层 | 定义 | 数值 | 与 5.5ms |
+|---|---|---|---|
+| T1 | 折叠后字节 ÷ 7TB/s | 5.66GB ÷ 7TB/s = **0.81 ms** | 目标的 15%（**a32 回退不改变折叠目标，只抬高现状流量**） |
+| T2 | 折叠后字节 ÷ 今天达成的 327~381 GB/s | **14.9 ~ 17.3 ms** | 目标的 **2.7~3.1×** |
+| T3 | 5.66GB ÷ 5.5ms | 需 **≥1029 GB/s**（今天的 2.7~3.1×） | 专家 3.76GB 单独就要 **684 GB/s** |
+
+⇒ **a32 回退把 T2 又推远了 ~0.4ms，并且把"多行化"这条已经到手的路退回去了一半。**
+最新路径的两条硬腿没变：**(a) 折叠到权重每层读一次；(b) 有效带宽 ≥1029 GB/s（专家核 ≥684 GB/s）。**
+
+---
+
+## 6. 待验证（第二轮新增；前三项任一落定都能把上面的区间收窄一半）
+
+| # | 断言 | 为什么必须验证 | 建议实验 |
+|---|---|---|---|
+| **V7** | 37.31ms 基线**已含 mrows** | 决定 a32 回退是 **+4.6~9ms** 还是 **0**（§3.1 两张证据冲突） | 同 serve `DSV41_GEMV_A32=1` vs `=0`，比 `verify_ms` |
+| **V8** | 逐行 `gemm_fp8_mx` 的权重重读**未被 L2 吸收**（⇒ ~1TB/s 有效带宽） | 若被 L2 吸收，权重项 <<3.9ms，§3 的判定会**翻转成"没有吃掉"** | nsys 看 `gemm_fp8_gemv` 的 dram__bytes 是否 ~m× 权重；或 A32=0/1 的 Δ |
+| **V9** | 「launch 单价」用哪个：0.411 / 2.904 / 6.2µs | 同一 1760 launch 的估价在 **0.72 ~ 10.9ms** 之间（15×） | 图化 A/B：`verify_ms(graph)` 与裸流的差 |
+| **V10** | `argmax_sliced_rows` 真的把 cross-rank argmax 压成 **1 次 v5 round** | 若退化成 m 次，head 的 −1.5ms 会被协议地板吃掉 | 数 `[dspark]` 段内的 v5 round 次数（或 nsys 看 stamp/poll 核） |
+| V1–V6 | 同第一轮（mrows 核固定项未实测；路由专家 ±6ms；attention 每行单价；共享专家 17.3µs 的适用性；激活字节；`padded(288)=320`） | **V2（专家 ±6ms）仍是全表最大不确定项** | 一条 nsys 按 kernel 名聚合 verify 段 |
+
+---
+
+*户部 · 只读分析，未执行任何 GPU 命令、未改动任何代码（本文件为唯一产出）。*
+*本轮对代码的唯一动作：读 `chain_dev.rs` / `device.rs` / `dsv41_kernels.cu` + `git log -S` 追时间线。*
