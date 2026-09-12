@@ -2231,3 +2231,11 @@ DSV41_BF16_TRUNCATE=1
 **Wave 1 的"25.17ms"需要重新验证**——用 [dspark] steps 行的 verify_ms + draft_ms + commit_ms 而不是 [dsv41] step 行。
 
 **所有历史步时报告需要用准确指标重写**。
+
+## Wave 1 + tcgen05 测试结果（0f464ac4）——tcgen05 仍 misaligned
+
+**结果**：SURVIVED 但 **LEN=0（空输出）**——rank 5 报 "sync: misaligned address"（与修复前相同）
+
+**判定**：ld_uint4_a16 对齐修复**没有解决** misaligned 问题——根因不在 uint4 加载的对齐检查（gathered buffer 本来就对齐，subagent 的修正正确）。**真正的根因在别处**——可能是 B 侧间接寻址（base + e*stride）或 swapAB 路径的 uint4 读。
+
+**Wave 1 的成功不受影响**——tcgen05 关掉后 Wave 1 仍然工作（25.17ms，零拉丁 ✓）。
