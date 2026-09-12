@@ -59,4 +59,31 @@ dim=5120, inter=2304, nh=64, hd=512, ql=1280, ol=1024, groups=8, hpg=8, n_routed
 1. **第 0 步（观测修复，进行中 — ministry-works/tcgen05-observation-fix）**：serve.rs 全量 Err 收集；`DSV41_ALIGN_STRICT=1`（默认 warn）+ check_bulk_geometry 补 w2 SF 行 pitch；devrt alloc 契约响应亮化；launcher 门补齐；`DSV41_ALIGN_AUDIT=1` 装载期审计。
 2. **若 8 rank 全错（路径 A）**：修布局不变量——`padded_inter(inter/world)/32 % 16 == 0`（即 inter/world 需被 512 整除）。**唯一根修，数值不变只改地址**。
 3. **若 1-2 rank 错（路径 B）**：查 engram.embed div_ceil 短尾视图边界 + collective staging `reduced[world-1]` guard。
-4. `FERRITE_ALIGN_STRICT=1` 进 CI，让新破环在 CI 炸而不是 191ms 处。
+## 9. 第 5 轮判定实验可执行序列（观测修复 = 3cd7258 + A0 site 分流 = 95d7083 之后）
+
+**远端前置**：`git fetch && git reset --hard origin/main && cd kernels/cuda && bash build.sh 103a && cd ~/ferrite && cargo build --release`（动了 .cu ⇒ 双产物必做）。
+
+**tcgen05 臂 gate 前提链**（权威出处 `tcgen05-retest-after-guardfix.md §4.1`；两个 `starts_with('1')` 门不能写 `=true`/`=on`；`DSV41_NO_GEMV_FP4` 必须不存在）：
+```
+DSV41_SPEC=1 DSV41_DSPARK=1 DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1
+DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0 DSV41_EXPERT_ILV=0 DSV41_MOE_BATCH=1
+CUDA_VISIBLE_DEVICES=0..7, LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda, --tp 8 --port 8712
+```
+
+**步骤 0（装载审计，秒级）**：上 gate 链 + `DSV41_ALIGN_AUDIT=1` 启动，grep `^\[align\]`：
+- 预期（若路径 A 成立）：每层 `w2.scale … pitch=10 pitch%16=10 row1&15=10` 且 **8 rank 完全一致**（rank 对称 ⇒ 解释"8 rank 全错"）
+- `worst_base&15 != 0` ⇒ 专家位移破环；只有某 rank 不同 ⇒ 真 rank-local
+
+**步骤 1（复现归因，单轮制）**：上 gate 链 + `CUDA_LAUNCH_BLOCKING=1 DSV41_VERIFY_GRAPH=0 DSV41_GRAPH_MOE=0`（不用 nsys；判据是日志行），/health 后发"你好" max_tokens=20，读 stderr：
+- `[tp] step failed on 8/8 ranks` + 8 行 Err 文本逐字相同（misaligned/716）⇒ **路径 A**：w2 SF 行 pitch 布局根修（`padded_inter(inter/world)/32 % 16 == 0`，即 inter/world 被 512 整除；数值不变只改地址）
+- `1/8 ranks` 单行 Err ⇒ **路径 B**：查 engram.embed div_ceil 短尾视图边界 + collective staging `reduced[world-1]` guard + DevBuf::view bare wrapping_add
+- `N/8` + `cuda error 1 (invalid argument)` + `dsv41_expert_tcgen05_gate_up_*` ⇒ **路径 C**：门触发（对照 .cu 门覆盖矩阵，看哪个参数被拒）
+- `[align] … base misaligned by N B` 行出现 ⇒ 门已抓到布局事故（这行就是证据）
+- **关键**：改后同一故障稳定打 8 行——8 行里每行的 rank 号只是 ack 到达顺序，**判断 rank-specific 唯一标准是"是否只有一行"**
+
+**步骤 2（A0 探针，顺带同会话）**：SWALLOW 全 gate 集（`swallow-full-gate-config.md §4` 逐字手写，禁裸跑 batched_400_v2.sh；V5_LEDGER=0）+ `DSV41_AR_PROBE=1 DSV41_AR_TIMEOUT_TRAP=1`，计数任务 max_tokens≥120（探针每 512 轮/site 才打印，84 轮/步 ⇒ ≥7 步才出第一行）。读 `[ar-probe] rank= site= n= avg_spin=`（单位 SM 周期，1µs≈1800cyc）：
+- ATTN/MOE 各 40 轮/步稳态（新分流的 verify AR）；site=1 与 site=0 各 ≥1 行 × 8 rank、n≥512 才可判
+- `avg_spin≈31k cyc(17.3µs)` ⇒ 账本成立，靶子 A2c rank 负载均衡（先看 per-rank 是否"一超多零"）
+- `≫31k` ⇒ nsys 自旋放大为主，AR 方向预算重估；`≪31k(≈9k)` ⇒ AR 无肉，转 MoE(17.4%)/投影(15.1%)/hc_dots
+- 辅助：`avg_stamp`~0.2-0.5µs（大 ⇒ store 路径贵=A1a 靶）；`avg_epi` lazy 4-6µs / SWALLOW 设计 8-15µs（>15 ⇒ T3 fold/reduce 向量化）
+- 收尾一律 `POST /shutdown`
