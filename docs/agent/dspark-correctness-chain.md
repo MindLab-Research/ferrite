@@ -6234,3 +6234,24 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 5. AR Step 2 的 3 项 GPU 验证中的第 2 项（gate ON vs OFF 一致）**未通过**
 
 **下一步**：AR Step 2 需要 root cause 分析（batched 路径的 store fold 为什么破坏性能和正确性）
+
+## AR Step 2 退化后的优化优先级重估
+
+**AR Step 2 (A1a) 的退化**（7.1 tok/s vs 58.3——8× 退化）改变了优化优先级：
+
+**更新后的优化栈**（从 SWALLOW 58.3 出发）：
+| 优先级 | 优化 | 预期节省 | 依赖 | 状态 |
+|---|---|---|---|---|
+| 1 | **mrows 族 (S2)** | **-4.5ms** | 无（设计完成）| **最优先！** |
+| 2 | hc/B6 (S3) | -3.8ms | 无 | 设计完成 |
+| 3 | tcgen05 (S4) | -2.0ms | TMA 对齐修复 | 待修 |
+| 4 | AR 修复 | -3~5ms（如果修好）| root cause 分析 | 🔬 调查中 |
+| 5 | L4/L5 | -3~5ms | 前面全部 | 长期 |
+
+**关键判定**：
+- **AR 优化暂缓**（A1a 方案失败——需要不同的方法）
+- **mrows 族成为最优先**（最大确定性收益 -4.5ms）
+- **SWALLOW 优化路径**：mrows → hc/B6 → tcgen05 → AR（重设计）→ L4/L5
+- **58.3 + mrows + hc/B6 + tcgen05 = ~19.7ms** → @accept 5: ~304 tok/s
+
+**AR 退化的教训**：store fold 的优化需要极其谨慎——在 batched 模式下 kernel 的执行模式可能与 lazy 完全不同。
