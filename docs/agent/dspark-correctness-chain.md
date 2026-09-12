@@ -310,3 +310,11 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 **判定**：① **激活量化假设确认**——opa 被 e2m1×2 双趟消除（opa: False），存量架构级偏差（e2m1 vs e4m3）是 opa 的根因 ✓。② **双趟实现有 bug**——输出退化为 "6.6.6.6" 计数循环（不是乱码而是模型行为完全偏移——首 token 就错了），双字 64。③ 性能代价 +1.37ms（两趟 GEMM）。
 
 **下一步**（twopass-degen-hunt vanguard 在查）：按可能性排序——① act_slot/pitch 不一致（ex_act vs ex_act_lo）② down 的输入缓冲混淆 ③ sub_dequant 的 nibble/scale 索引不互逆 ④ 第二趟的 a_scale 传错 ⑤ 单行 moe() 路径的接线。
+
+## 双趟 "6.6.6.6" 退化根因定案（twopass-degen-hunt 判词 + 已修）
+
+**严重·确定性**：kernel 的 `fuse` 与 Rust 的 `two` 各自独立推导——Rust 侧 `two` 强制 unfused（`act_slot=2*inter`），kernel 侧 `dim=7168%512==0` 仍满足 fuse 条件（它不知道 `two` 的存在）→ 两趟都写 swiglu 后的 `[inter]`（高半 `[inter,2*inter)` 是 cudaMalloc 垃圾）→ `add_inplace` 混垃圾 → 再 swiglu 一次（对垃圾做非线性）→ 44 层全废、首 token 即崩、退化到 "6.6.6.6" 计数循环。
+
+**修复（已提交）**：kernel 的 `fuse` 绑到调用者的 `out_slot_stride`（**单一真值**：`== inter` = fused、`== 2*inter` = unfused）——两侧结构上不可能再分歧。Rust mirror 补了 `dim%512==0` 条件。ILV+E4M3 冲突现在硬失败。
+
+**量化数学无罪**（判词确认）：sub_dequant_fp4 与 quant_fp4 严格互逆 ✓、scale 索引一致 ✓、ex_act/ex_act_lo 的 pitch 相同 ✓——**唯一坏的是布局协商**。这也解释了 opa 为什么真的消失了（激活假设成立）。
