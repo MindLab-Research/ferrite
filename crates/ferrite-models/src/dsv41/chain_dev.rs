@@ -5067,6 +5067,19 @@ impl<'a> DevChain<'a> {
         let mut emitted = Vec::with_capacity(k_acc + 1);
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
+        // ★ THE s.ids WRITE-BACK (verify-row0-systematic's root cause).
+        // step_body's embedding reads `s.ids` (the `token` arg is only the
+        // engram fallback), and NOTHING in the spec path updates it: the main
+        // argmax wrote `next` (pos+1's token), but commit advanced the counter
+        // by 1+k_acc — so after ANY k_acc>=1 round the next round would embed a
+        // token k_acc positions STALE, silently corrupting the context. On the
+        // digit task that self-locks into emitting every number twice (the
+        // first polluted round makes the model treat repetition as the pattern
+        // to continue — which is why the first ~10 chars were right and then it
+        // collapsed, while emitted itself stayed item-by-item correct).
+        if let Some(&last) = emitted.last() {
+            self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+        }
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
 
@@ -5265,6 +5278,13 @@ impl<'a> DevChain<'a> {
         let mut emitted = Vec::with_capacity(k_acc + 1);
         emitted.push(next);
         emitted.extend_from_slice(&verify_out[..k_acc]);
+        // ★ THE s.ids WRITE-BACK — same root cause as the legacy arm above:
+        // step_body embeds `s.ids`, and without this the next round would embed
+        // a token k_acc positions stale (the digit task's self-locking
+        // repetition). 4 bytes per round.
+        if let Some(&last) = emitted.last() {
+            self.ul_i32(self.s.ids.ptr, &[last as i32])?;
+        }
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
 
