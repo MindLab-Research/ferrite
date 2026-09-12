@@ -723,6 +723,13 @@ impl<'a> DsparkDev<'a> {
             )?;
             // collapse with the INCOMING premix, then the attn norm
             let attn_norm = need(&ld.attn_norm, "mtp.*.attn_norm.weight")?;
+        // THE decisive dump: the first 10 weights of this rank's attn_norm.
+        // The checkpoint's mtp.0.attn_norm starts [-0.0491, -0.0457, -0.0481,
+        // ...] (BF16, read straight from the safetensors). If this dump shows
+        // anything else, the weight POINTER is wrong (loading/shard), which
+        // would explain rmsnorm exploding while hand-computation with the
+        // checkpoint's values stays normal.
+        self.dump_unit_idx("attn_norm_w", s, attn_norm.as_f32(), &[16]);
             self.dev.hc_collapse(
                 self.h.ptr as *const f32,
                 self.pre_in.ptr as *const f32,
