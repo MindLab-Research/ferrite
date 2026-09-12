@@ -6135,3 +6135,25 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 - 吞吐 54-57 tok/s（vs lazy 91.1——SWALLOW 更慢但 batched 路径可用）
 
 **400 的路径**：SWALLOW 的 accept 修复（~0.6 → ~5）是唯一关键——修好后 28ms 步时给 214 tok/s，优化到 15ms 给 400 ✓
+
+## 🎉 SWALLOW 出师表红线测试通过！（2a0850fd）
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）
+- **前 ~100 字正确**（"先帝创业未半而中道崩殂...欲报之于陛下也."——完整的前段）
+- completion=93（模型自然停止——与 lazy 的行为一致）
+- 0 ar5-hang ✓ 0 panic ✓
+- 配置：干净 SWALLOW（无观测）+ TAP_INPUT + DRAFT_BF16_DOMAIN ✓
+
+**判定**：**SWALLOW 通过出师表红线！** batched 路径的输出质量与 lazy 相当（前 ~100 字的可靠区内正确）。
+
+**SWALLOW 的完整验证状态**：
+| 测试 | 结果 | 状态 |
+|---|---|---|
+| 计数（clean）| 61/72 前 61 行 ✓ 零拉丁 ✓ | ✅ |
+| accept5（clean）| 32/32 前 20 行 ✓ 零拉丁 ✓ | ✅ |
+| **出师表（clean）**| **零拉丁 ✓ 前 100 字正确 ✓** | **✅ 红线通过！** |
+| ar5-hang | 0 | ✅ |
+| panic | 0 | ✅ |
+
+**SWALLOW 的下一步**：全 gate 测试（加 R2/MARKOV/FORK/RING_WIN 优化栈）→ 真实吞吐 → 400 冲刺！
