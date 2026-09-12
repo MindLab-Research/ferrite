@@ -3425,3 +3425,21 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 - ring+window 融合版可能在这个位置处理错误
 
 **立即行动**：二分验证——不带 RING_WIN_FUSE 重跑出师表（确认之前的栈仍然干净）
+
+## RING_WIN_FUSE 的调查计划（如果二分确认为罪魁）
+
+**损坏模式**（3d86b1c5）：前 ~100 字正确 → "opa" 出现 → 后续退化
+**位置依赖**：损坏在特定 token 位置——与 ring/window 的 `slot = pos % window` 逻辑一致
+
+**嫌疑点**（按可能性排序）：
+1. **pos_rows 的读取时序**：融合版从设备读 `pos_rows + r`——如果该行的 pos_rows 还没被更新（时序问题），位置错误
+2. **ring 的 wrap-around**：如果 window 在某个位置 wrap（如 window=128），融合版的 wrap 处理可能与分离版不同
+3. **start_pos == 0 的特例**：融合版可能对这个特例处理不同
+4. **idxs 的写入范围**：`idxs_r + r*ist` 的 ist 计算（win + index_topk）——如果与分离版不同
+
+**验证方法**：
+1. 单 GPU 测试（隔离 TP8 的复杂性）
+2. DSV41_DIFF_EAGER=1 对照（逐位比较融合 vs 分离的输出）
+3. 在损坏位置（~token 100）附近检查 KV ring 的状态
+
+**临时缓解**：RING_WIN_FUSE 默认 OFF（已经是）——不开启即可
