@@ -34,7 +34,7 @@
 **Phase 1 骨架的 4 个新发现（实施前必读，超出原设计）**：
 1. **PACKED SF 是被迫的，不是选择**：PERBLK 需 4 列/块 ⇒ 160 块 = 640 列 > 512 TMEM 列，装不下。⇒ PACKED 挂 = 整个 Phase 1 布局假设挂。SF 寻址：`SFA col = sfa_col + 4*(b>>2), a_sf_id = b&3`；`SFB col = sfb_col + (b>>2), b_sf_id = b&3`（契约 `dim % 128 == 0`）。
 2. **mxf8f6f4 的 fp4 操作数必须 UNPACKED（1 元素/字节）**，checkpoint 是 2 元素/字节 ⇒ 每个 ring slot 需**两块 buffer**（TMA 落的 raw 打包区 + MMA 读的 unpack 区）+ 一次 1:2 展开。**这是本 kernel 最大 smem 开销，也是"TMA 直写操作数"不可能的原因。**
-   - **Alternative B**：改用 `kind::mxf4`（两侧打包）⇒ 无 unpack、操作数 smem 减半、用已验证的 `tests_tcgen05_mxf4.cu` 那条 MMA；代价是激活 e4m3→e2m1（放弃 Phase 0 买的精度余量），且 2X 粒度需配对 checkpoint 的 per-32 scale（现有 kernel 已在做）。**切换约 30 行。**
+   - **Alternative B**：改用 `kind::mxf4`（两侧打包）⇒ 去掉**展开**段（permute 段仍在，见注）、操作数 smem **per-slot 13312→4352 B（3.06x）**、用**唯一已在 GPU 验证过**的 `tests_tcgen05_mxf4.cu` 那条 MMA；代价是激活 e4m3→e2m1（放弃 Phase 0 买的精度余量——但**现生产就是 e2m1**，见 `expert-tcgen05-plan.md` §1d），且 2X 粒度需配对 checkpoint 的 per-32 scale（现有 kernel 已在做）。**切换约 30 行。** ⚠️ smem 减半**不会**翻 occupancy（TMEM 256 列/CTA 才是绑定点）；真收益是 kRing 3→7-8。
 3. **静态 smem 装得下**（kPackK=64/kRing=3 时 45 KiB）⇒ 无需 `cudaFuncSetAttribute`，**图捕获安全**。更深 ring 才需动态 smem + **init 期一次性** attribute（**捕获内禁用**）。
 4. **occupancy 是硬约束**：grid=(30, slots)，每 CTA 256/512 TMEM 列 ⇒ ≤2 CTA/SM。**slots=1 只有 30 CTA（≈15 SM）⇒ 隔离微基准必须跑 slots=8（240 CTA）**，否则测的是延迟不是带宽。若 slots=8 仍离地板远 ⇒ **K-split**（更多 CTA 覆盖同权重，需确定性升序 reduce）。
 

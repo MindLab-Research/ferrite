@@ -112,6 +112,46 @@ M 侧 3840/5120 整除 128（满 tile），N 侧 decode=1 token → 补到 **N=8
   checkpoint 字节）、`kPackK`/`kRing` 调优基准、2D tensor TMA（每 stage 1 条指令替代 129 条）、
   K-split reduce、Phase 2 的 pool/ids 间接寻址 + Rust FFI。
 
+## 1d. Alternative B（`kind::mxf4`）量化分析（2026-09-12，纯代码分析，无 GPU）
+
+**数值判定（激活格式检查）**
+- **参考实现的 expert 激活是 e4m3**，不是 fp4：`ref_inference/model.py:186-198` 的 `linear()`
+  对 fp4 权重走 `act_quant(x, fp8_block_size=32)`，`kernel.py:537-540` 再把 fp4 权重 upcast 成
+  FP8 做 fp8 MMA。⇒ Phase 0 选 e4m3 是**对齐参考**，不是自创。
+- **但现生产 ferrite 是 e2m1 激活**：`chain_dev.rs:4217` `quant_fp4`（e2m1, block 32）→
+  `expert_gate_up_fp4_batched`（`kind::mxf4`，E2M1×E2M1，`kernels.rs:110-127` /
+  `dsv41_experts_mxf4.cu:13-18,256-273`）。⇒ **Alternative B 的激活格式与今天 162.6 tok/s 的
+  serve 基线逐位同源（同一个 `dsv41_quant_fp4`、同一 block-32 e8m0）⇒ 零格式增量风险**；
+  相对参考是"沿用既有偏差"（现状只被四段**短**提示验证过，长文残余风险非零）。
+- e2m1 码表是 **8 个幅值** `{0,±0.5,±1,±1.5,±2,±3,±4,±6}`（`quant.rs::FP4_TABLE`、
+  `tests_tcgen05_mxf4.cu:26`），不是 4 个。最坏相对误差 **20%**（4/6 中点），不是 25-50%；
+  e8m0 幂次 block 缩放后块内绝对误差 ≤ amax/6；§1b 实测合成数据 l1/l2 rel ≈ 0.11-0.16。
+- e2m1×e2m1 积 + 2^e scale 在 fp32 **精确** ⇒ `tests_tcgen05_mxf4.cu` GPU 上
+  `maxdiff=0.000e+00`（7 shapes，`crates/ferrite-dsv41/README.md:94-101`）。**Alt B 用的 MMA 是
+  唯一已在 GPU 数值验证过的形式**；1X 的 PACKED SF 布局（§1c #1）至今没有 GPU parity。
+
+**性能账（kPackK=64/kRing=3）**
+- 每 slot 操作数：Alt A `a_raw 4096 + a_op 8192 + b_raw 512 + b_op 512 = 13312 B`
+  → Alt B `4096 + 256 = 4352 B`（**3.06x**，不是 2x）。静态 smem 46.4 KiB → ~19.5 KiB
+  （`sf_stage` 6400 B 不变）。
+- ⚠️ **"smem 减半 ⇒ occupancy 翻倍"不成立**：绑定点是 **TMEM 256 列/CTA**
+  （`dsv41_experts_mxf4.cu:2834,3141-3143`）⇒ 仍 2 CTA/SM。要翻 occupancy 必须把 SF 改成
+  **per-slot staging**（照生产 kernel `:437-514` 按 K stage 复用；1X/2X 的 SFA 列密度相同：
+  每 K=128 用 4 列，两个 atom 共享一个 32-bit 字，`SFA_ID=0/2`）。
+- 真收益是 **ring 深度**：同一个 48 KiB 窗口 kRing 3 → 7-8 ⇒ in-flight 8 KiB → 28-32 KiB/CTA
+  ⇒ 240 CTA 从 1.9 MB 到 **6.7 MB**，逼近 8 TB/s × ~700 ns ≈ 5.6 MB 的带宽-延迟积
+  （骨架 DEPTH NOTE）。这才是打 0.2% 地板的杠杆。
+- ⚠️ 更正"无 unpack 段"：**permute 段落删不掉**。canonical UMMA 布局
+  `unit16(m,kb)=(m%8)+8kb+16(m/8)`（`:249-254`）与 raw packed 行主序（chunk=2m+kb）不兼容，
+  描述符的 (m%8) stride 固定为 1（CUTLASS `((8,n),(2,1)):((1,SBO),LBO)`）。Alt B 只把
+  `16B in→32B out + byte_perm` 减成 `16B in→16B out`。⇒ "TMA 直写操作数"对 **1D bulk 仍不成立**
+  （TODO-3 的 2D tensormap 只解决 issue storm，不解决布局）。
+
+**推荐路径**：B 是"首个绿灯风险最低"的臂（唯一 GPU 验证过的 MMA + 与现状格式同源），A 的 1X PACKED
+SF 布局未验证且 §1c #1 明确"PACKED 挂 = Phase 1 全挂"。做法：同一 skeleton 用编译期宏切两臂
+（idesc 格式 / LBO-SBO / ring 尺寸 / 去掉 `tc5_unpack_a`，~30 行），共享 ring+TMA+occupancy 机制；
+Phase 0 harness 把激活量化换成 e2m1（1 行）即可出 B 的 parity；**终门仍是 serve 四段文本**。
+
 ## 2. Phase 1（1-2 天）gateup kernel
 
 落点：`kernels/cuda/dsv41_experts_mxf4.cu` 新增 swapAB gateup kernel（保留旧 kernel）。
