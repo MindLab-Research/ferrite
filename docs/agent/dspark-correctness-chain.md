@@ -1240,3 +1240,22 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 2. **HC_VERIFY_FUSE=1 重测**（truncate=false 安全版——−1.3ms）
 3. **accept 杠杆测试**（P0-3+P1-5 在修复后基线上）
 4. **batched verify 400 组合**（全 mrows + tcgen05 + draft graph → 步时 ≤10ms）
+
+## Mrows 回退调查的最终判词（mrows-decline-investigation）
+
+**结构性发现**：5/6 mrows gate 共用**零观测性**回退路径（device.rs 无任何 decline 日志）——无法区分"没生效"和"生效了但零收益"。
+
+**逐 gate 判定**：
+| gate | 状态 | 原因 |
+|---|---|---|
+| SH_EXP_MROWS | 生效但零收益 | kernel 是 instruction-bound（0.7% 带宽）——"读一次权重"帮不了指令瓶颈。项目已量过两次（-8.3ms 预期 vs ~1ms 实测） |
+| GATE_MROWS | **应生效** | 5 条件全过（n=384<2048, 符号在, m=5∈1..8, k=5120%8=0）；预期 −2.75ms |
+| VERIFY_HEAD_MROWS | **结构性死门** | 调用点在 verify_head_geom 的分支内，7 个条件任一不满足则 mrows 连条件都不求值 |
+| INDEXER/NORM/COMPRESSOR | 待查（报告后半） | |
+
+**400 路径的根本约束**：mrows（权重共享）对 instruction-bound kernel 无效——**tcgen05（换核）才是 verify 优化的真路径**。
+
+**修复优先级**：
+1. GATE_MROWS 的 −2.75ms 验证（应生效——需确认）
+2. VERIFY_HEAD_MROWS 死门修复（head-mrows-deadgate-fix subagent 正在做）
+3. tcgen05 grouped 路径的真 A/B（三件套 gate 链）
