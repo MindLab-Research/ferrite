@@ -3814,3 +3814,25 @@ self.dev.gemm_fp8_mx_rope_norm(
 - **.so 一致性**：每次测试确认 build-id 匹配
 
 **预期最终干净栈**：78.8 × 1.09-1.11 ≈ **86-88 tok/s**
+
+## K1+K2 验证测试的两个分支准备（0dd2c9fb）
+
+**分支 A（K1+K2 干净——数字 1-200 全对）**：
+1. 立即跑出师表验证（1000 token + 零拉丁 + 完整内容）
+2. 然后干净栈重建（wo_a → RING_WIN → FORK → MARKOV → LAZY_SDR 逐项）
+3. 预期最终 ~86-88 tok/s
+
+**分支 B（K1+K2 损坏——数字错误）**：
+1. 读 k1k2-prereview 的审查发现
+2. 读 ropenorm-corruption-mechanism 的分析（如果是 K2 的问题）
+3. 逐字节 diff 定位（kernel-parity-byte-diff 的测试）
+4. **教训**：同程序原则可能还不够——需要更深的等价验证
+
+**分支 C（K1+K2 崩溃）**：
+1. 检查 .so 的符号导出（nm -D）
+2. 检查 decline 路径（gate ON 但 kernel decline → 回退到 4 发）
+
+**当前测试配置**：
+- base + DSV41_ATTN_MROWS2=1 + DSV41_ATTN_MROWS_ROPE_NORM=1
+- 计数任务（1-200）+ 数字顺序验证 + 吞吐
+- .so 包含：K1 + K2 + wo_a cp.async16 + A4 single-poll（18303492 的重编 + 本次重编）
