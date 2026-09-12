@@ -1101,3 +1101,7 @@ draft-numerical-audit 找到 5 个严重缺陷（当前 accept 1.02 vs sglang ~5
 - **P0-1 seed 修复的 accept 提升**（GPU 测试 079ffbaf 跑中——决定性测试）
 - P0-3 tap 修复（subagent）
 - tcgen05 grouped 路径的端到端
+
+## Oracle 修复完成（P3-9）——host 的 rope 相位对齐官方
+
+dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转从 `start_pos+bs+r` 改为 `start_pos+seqlen+r` = `start_pos+1+r`），显式引入 `seqlen=1` 变量对齐官方公式。10 个 CPU 测试通过（含 chain_smoke 的真实 host decode 路径）。**parity 测试不受影响**（dspark_parity 用 device 自身做 draft，不用 host oracle）。修正暴露的是 device/host 的真实分歧（此前 host 把相位整体后移 bs-1 个位置）。
