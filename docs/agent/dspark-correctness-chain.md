@@ -5651,3 +5651,27 @@ let delta = prev.map(|p| epoch.wrapping_sub(p)).unwrap_or(0);
 **实际**：pos=16 pre 无 RESET！→ **某处更新了 seen 表**（note 的 probe？或其他路径？）
 
 **P1 witness（实施中）将绕过 host 侧的所有歧义**——kernel 自己记录读/写的值！
+
+## 决定性测试的准备（RESET 修复 + witness 完成后）
+
+**测试配置**（三件套齐上！）：
+```bash
+# SWALLOW + 动态 pad + 加固观测 + witness
+DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1
+DSV41_SWALLOW_DYNAMIC_PAD=1       # 第 11 次修复（0 hang！）
+DSV41_V5_LEDGER=1                  # 加固观测（canary + stream + rank=）
+DSV41_V5_WITNESS=1                 # P1 设备侧证词（kernel 自己记录！）
+# RESET 修复（代码级——note 也更新 seen 表）
+# + base 栈
+```
+
+**预期输出**：
+1. **[v5-ledger-RESET]** 行——pos=15 note 的 54 vs pre 的 999（修复后的 RESET 应该触发！）
+2. **[v5-witness]** 行——每个 epoch 写点的 e_read/e_wrote（kernel 的真实行为！）
+3. **ar5-hang = 0**（动态 pad 的效果）
+4. epoch 的 witness 数据——**kernel 到底写了什么到 epoch 位置**
+
+**判定**：
+- witness 的 e_wrote 如果显示某个写点写了 54——**找到根因**（哪个 kernel 写的！）
+- witness 的所有 e_wrote 都 > 999——**host 读错位置**（观测错位确认！）
+- RESET 触发——降级检测工作（为下一轮调查提供准确数据）
