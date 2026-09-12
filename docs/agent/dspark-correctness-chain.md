@@ -1202,3 +1202,21 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 - 如果某个 mrows gate 的符号缺失 → 静默回退（安全但无收益）
 
 **判定**：零拉丁必须保持（BF16_TRUNCATE=1）——任何拉丁出现 = 某个 gate 破坏了基线。
+
+## Batched 400 性能测试结果（e6fc5ad7）
+
+**零拉丁 ✓**（LEN=148，拉丁=[]）——所有 gate 组合下保持！
+
+**性能**：
+- verify=37.80ms（batched，vs 37.31 基线——**mrows gates 无收益**！）
+- draft=4.29ms（**DRAFT_GRAPH 无收益**——图在 pos=130 才捕获，出师表只有 ~130 步）
+- 步时 45-52ms，tok/step 1.740，mean-k=0.566（accept 更低了）
+- **图化成功**：verify_graph_m5 @ pos=20 ✓，draft_graph @ pos=130 ✓
+
+**判定**：
+1. **mrows gates 全部回退**（SH_EXP/GATE/HEAD/INDEXER/NORM/COMPRESSOR_MROWS）——符号可能缺失或形状不匹配
+2. **DRAFT_GRAPH 的 pos>=win 约束**（win=128）使其在短文本上无效
+3. **accept 下降**（0.566 vs 基线 1.022）——batched 的 5 行 verify 比 lazy 更严？
+4. **verify 37.80ms ≈ 基线 37.31ms**——所有性能优化都没有兑现！
+
+**下一步**：查为什么 mrows gates 全部回退（符号缺失？形状不匹配？gate 冲突？）
