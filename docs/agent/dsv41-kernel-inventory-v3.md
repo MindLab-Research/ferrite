@@ -109,7 +109,7 @@ wq_a→wq_b / w1w3→w2 同构但需 grid 级同步，不可行），② 异激�
 
 **dual-chain 重构后的复核（2026-09-11，结论：旧结论仍成立，但理由变了）**：`DSV41_DUAL_CHAIN`
 在 `lin2(wq_a,wkv)`（:2331）**之后**才 fork（:2365-2368），因为 `lin2` 已把 wkv 与 wq_a 一起算完
-（`kv_early`），所以 **kv 侧链上根本没有 gemv** —— 只有 `rmsnorm_rope`（:2585）一个非 gemv 的小核。
+（`kv_early`），所以 **kv 侧链上根本没有 gemv** —— 只有 `rmsnorm_rope`（chain_dev.rs:2974，DSV41_RW_FOLD 后同时承载 ring_win 三半）一个非 gemv 的小核。
 ⇒ "wq_b ∥ kvb 异激活合并"的候选**前提不成立**（kvb 早已并入 fork 前的 mx2）。MoE 侧同理：
 routed 链上是 fp4 expert 核（`expert_gemv_fp4_*`），shared 链上是 w1/w3 mx2 + w2，
 **没有任何一条跨流 gemv 对**可供合并；两条链各自的 gemv 都是"链内依赖"（w1w3→swiglu→w2）。

@@ -34,6 +34,27 @@
 唯一为真的子命题：e4m3→bf16 **确实无损**（256 码全枚举，含 kernel 把 0x7F/0xFF 映射到 ±480.0，
 bf16 的 7-bit 尾数可精确表示）；但它不改变上面三条。**结论：不实施。**
 
+## a32 的 `cvt` 解码路线 — 分析否证（2026-09-12，未落地，纯调研）
+
+提案：丢掉 `s_lut`，用硬件转换指令 `cvt.rn.f16x2.e4m3x2`（一条 2 元素）替代 smem gather。
+**吞吐上不成立，且保不住逐位一致。**（证据来自本地 PTX ISA 文本 + CUDA C Programming Guide
+Table 4 "Throughput of Native Arithmetic Instructions"，12.9 版；非实测。）
+
+1. **转换管吞吐只有 LDS 管的一半**。Table 4 的 `All other type conversions`（fp8/f16 转换都归这
+   一行）= **16 results/clk/SM**，8.0/8.6/8.9/9.0/10.0/12.0 同值；而 shared memory = 128B/clk/SM
+   ⇒ LDS.32 = **32 值/clk/SM**。a32 现在每元素 2 次 LDS（`LDS.8` 取码 + `LDS.32` 查表）就是
+   16 元素/clk/SM 的管限；换 cvt 则是每元素 ≥1.5 条转换（0.5 条 e4m3x2 + 1 条 `cvt.f32.f16`
+   把 half 展回 f32，因为 scale 是 f32）⇒ **≤10.7 元素/clk/SM，严格更慢**。
+2. **保不住位一致**。`s_af[j] = s_lut[a[j]] * s_as[j>>5]` 的逐元素 f32 乘无法折叠进
+   `fma.rn.f32.f16`（PTX 9.7.5 mixed precision，确实存在），除非把 per-32-block 的 scale 提出来
+   重结合求和 —— 那就改了舍入次序。
+3. 指令本身可用性没问题：`cvt.rn.f16x2.e4m3x2` = sm_90+（PTX 7.8；sm_89 自 8.1），B300 支持。
+
+**顺带记录的结构性事实**：a32 是**每 block 重算**的（416 blocks × k=5120 = 2.13M 次解码，
+而该 token 只有 5120 个唯一值 ⇒ **416x 冗余**），这才是 1.55µs 的真身；想省它只能"不解码"
+（tensor-core W8A8，见 SGLang 的 M<32 swapAB 路径）或把解码改成 row-stationary 复用寄存器。
+**结论：不实施 cvt 路线。**
+
 ## gemm_fp8_gemv 微基准（2026-09-11 最后一轮，隔离探针 /tmp/gp6/gprobe6..10.cu）
 
 > 底座复刻 = `kernels/cuda/dsv41_kernels.cu` 的 `gemm_fp8_gemv_kernel`（mode 4 / warps=4 / LUT /

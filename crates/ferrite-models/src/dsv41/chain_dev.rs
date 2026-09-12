@@ -698,6 +698,22 @@ fn ring_win_fuse() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_RING_WIN_FUSE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// DSV41_RW_FOLD (default ON): fold the WHOLE `ring_win_fuse_ph` trio (ring
+/// append + window idxs + comp placeholder) into the kv chain's rmsnorm+rope
+/// launch, which removes that launch and its graph node (40/step). All three or
+/// none: the append alone would leave the indices launch behind, so folding it
+/// would save nothing. Requires `DSV41_NR_FUSE` (the plain two-launch path has no
+/// launch to fold into) and an `.so` carrying `dsv41_rmsnorm_rope_ring`; a shape
+/// the one 1024-lane block cannot cover declines and falls back on its own. "0"
+/// reverts to the standalone `ring_win_fuse_ph` launch (bit-identical either way).
+fn rw_fold() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // default OFF: compile+register verified but NOT yet serve-verified; the session's
+    // pattern (sparse-merge/compress-fuse/quant-fold all failed or neutral in serve)
+    // demands serve A/B before any default-ON flip.
+    *F.get_or_init(|| std::env::var("DSV41_RW_FOLD").map(|v| v == "1").unwrap_or(false))
+}
+
 /// B3 (DSV41_COMP_PLACEHOLDER_FUSE, default ON): the recency-placeholder launch
 /// (30/step, ~1.0us each) writes `idxs[win, win+take)` into the SAME buffer the
 /// `ring_win_fuse` epilogue already writes `idxs[0, win)` into, and `sparse_attn`
@@ -2909,12 +2925,56 @@ fn hc_tail_split() -> bool {
         // on every other path, so the serial behaviour is byte-for-byte the old
         // one (same launch order, same stream).
         let kv_stream = if dual { self.dev.side_stream2() } else { self.dev.stream() };
+        // ---- DSV41_RW_FOLD: the ring_win trio's addresses, computed early ----
+        // These are exactly the values the B2/B3 launches further down use. They
+        // are pure host-side pointer arithmetic (no launch, and no borrow held
+        // past the expression), so hoisting them above the kv launch is free -
+        // and it is what lets that launch carry the whole `ring_win_fuse_ph`
+        // trio. The full argument for why the three halves may fuse sits with
+        // the B2/B3 comment below; `ph_ok` is the same gate (it also excludes a
+        // compress SOURCE, whose `*clen` this step's compressor is advancing).
+        let win = cfg.window_size;
+        let owner = if ring_owner_shared() { self.kv_owner(layer) } else { layer };
+        let ring_ptr = self.layers[owner].ring.ptr;
+        let idxs_ptr = if cfg.is_index_source(layer) {
+            self.layers[layer].idxs.ptr
+        } else {
+            self.layers[owner].idxs.ptr
+        };
+        let owns_kv = owner == layer;
+        let ph_ok = comp_ph_fuse()
+            && owns_kv
+            && !cfg.is_index_source(layer)
+            && !cfg.is_kv_source(layer)
+            && cfg.compress_ratio(layer) > 0;
+        // `ring == null` is how a consumer layer skips the append half;
+        // `clen == null` (with topk 0) is how it skips the placeholder half.
+        let ring_half = if owns_kv { ring_ptr as *mut f32 } else { std::ptr::null_mut() };
+        let ph_clen = if ph_ok {
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner)
+        } else {
+            std::ptr::null::<std::os::raw::c_int>()
+        };
+        let ph_topk = if ph_ok { cfg.index_topk as i32 } else { 0 };
         // The kv norm and its rope are an adjacent pair on the same row: one
         // fused launch, bit-identical to the two (same reduction tree at
         // blockDim 1024, elementwise rope). DSV41_NR_FUSE=0 reverts, and so
         // does an .so without the symbol.
-        let nr_fused = nr_fuse()
-            && self.dev.rmsnorm_rope_on(
+        //
+        // DSV41_RW_FOLD (default ON) additionally folds the ENTIRE ring_win trio
+        // into that same launch: the append publishes the row it just roped, the
+        // indices read nothing but the counters, and the placeholder writes a
+        // disjoint block of the same `idxs` buffer - so the standalone
+        // `dsv41_ring_win_fuse_ph` launch and its graph node disappear for every
+        // layer (40/step). All three, not one: folding only the append would
+        // leave the indices launch behind and save nothing. A shape decline or an
+        // .so without `dsv41_rmsnorm_rope_ring` falls through to the plain pair
+        // (and then to the standalone B2/B3 launches) - bit-identical either way.
+        let mut ph_fused = false;
+        let mut rw_folded = false;
+        let mut nr_fused = false;
+        if rw_fold() && nr_fuse() {
+            nr_fused = self.dev.rmsnorm_rope_ring_on(
                 self.s.kv.ptr as *const f32,
                 ld.kv_norm.as_ref().unwrap().as_f32(),
                 self.s.kv.ptr as *mut f32,
@@ -2928,8 +2988,38 @@ fn hc_tail_split() -> bool {
                 1,
                 false,
                 cfg.norm_eps,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                ring_half,
+                win as i32,
+                idxs_ptr as *mut i32,
+                ph_clen,
+                ph_topk,
                 kv_stream,
             )?;
+            if nr_fused {
+                rw_folded = true;
+                ph_fused = ph_ok;
+            }
+        }
+        if !nr_fused {
+            nr_fused = nr_fuse()
+                && self.dev.rmsnorm_rope_on(
+                    self.s.kv.ptr as *const f32,
+                    ld.kv_norm.as_ref().unwrap().as_f32(),
+                    self.s.kv.ptr as *mut f32,
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    1,
+                    hd as i32,
+                    cfg.rope_head_dim as i32,
+                    (cfg.rope_head_dim / 2) as i32,
+                    self.s.pos_ctr.ptr as *const std::os::raw::c_int, 1, 0,
+                    1,
+                    false,
+                    cfg.norm_eps,
+                    kv_stream,
+                )?;
+        }
         if !nr_fused {
         self.dev.rmsnorm_on(
             self.s.kv.ptr as *const f32,
@@ -2984,21 +3074,9 @@ fn hc_tail_split() -> bool {
         // exactly why layer 2 (the owner) matched the official while layer 3, the
         // first consumer, dropped ~15%. DSV41_RING_OWNER=1 restores the old
         // shared-ring behaviour for A/B.
-        let owner = if ring_owner_shared() {
-            self.kv_owner(layer)
-        } else {
-            layer
-        };
-        let ring_ptr = self.layers[owner].ring.ptr;
-        // index-source layers compute their OWN selection into their OWN buffer;
-        // non-index layers read the owner's (shared) selection
-        let idxs_ptr = if cfg.is_index_source(layer) {
-            self.layers[layer].idxs.ptr
-        } else {
-            self.layers[owner].idxs.ptr
-        };
+        // (owner / ring_ptr / idxs_ptr / owns_kv / win are already computed above,
+        // just before the kv launch: the DSV41_RW_FOLD path there needs them.)
         let cache = &self.layers[owner];
-        let owns_kv = owner == layer;
         // B2 (DSV41_RING_WIN_FUSE, default ON): the ring append and the window
         // indices are two adjacent, mutually independent one-block kernels (the
         // append writes the ring at pos % win; the indices read nothing but
@@ -3027,52 +3105,37 @@ fn hc_tail_split() -> bool {
         // `kv_source` (2/8/14/20) is also an `index_source`, so those layers are
         // already excluded. A config where a compress source is NOT an index
         // source keeps the standalone launch below, unchanged.
-        let ph_ok = comp_ph_fuse()
-            && owns_kv
-            && !cfg.is_index_source(layer)
-            && !cfg.is_kv_source(layer)
-            && cfg.compress_ratio(layer) > 0;
-        let mut ph_fused = false;
-        let rw_fused = ring_win_fuse() && {
-            let ring = if owns_kv {
-                cache.ring.ptr as *mut f32
-            } else {
-                std::ptr::null_mut()
-            };
-            // clen == null is the switch that turns the placeholder half off, so
-            // an excluded layer reproduces `ring_win_fuse` byte for byte.
-            let (clen_p, topk) = if ph_ok {
-                (
-                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
-                    cfg.index_topk as i32,
-                )
-            } else {
-                (std::ptr::null(), 0)
-            };
-            if self.dev.ring_win_fuse_ph(
-                ring,
-                self.s.kv.ptr as *const f32,
-                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
-                win as i32,
-                hd as i32,
-                idxs_ptr as *mut i32,
-                clen_p,
-                topk,
-            )? {
-                ph_fused = ph_ok;
-                true
-            } else {
-                // .so predates `dsv41_ring_win_fuse_ph`
-                self.dev.ring_win_fuse(
-                    ring,
+        // (`ph_ok` / `ring_half` / `ph_clen` / `ph_topk` / `ph_fused` are computed
+        // above, together with the DSV41_RW_FOLD decision - see the kv launch.)
+        //
+        // DSV41_RW_FOLD: when that kv launch took the fold, the trio already ran
+        // and `ph_fused` is already set - nothing to issue here.
+        let rw_fused = rw_folded
+            || (ring_win_fuse() && {
+                if self.dev.ring_win_fuse_ph(
+                    ring_half,
                     self.s.kv.ptr as *const f32,
                     self.s.pos_ctr.ptr as *const std::os::raw::c_int,
                     win as i32,
                     hd as i32,
                     idxs_ptr as *mut i32,
-                )?
-            }
-        };
+                    ph_clen,
+                    ph_topk,
+                )? {
+                    ph_fused = ph_ok;
+                    true
+                } else {
+                    // .so predates `dsv41_ring_win_fuse_ph`
+                    self.dev.ring_win_fuse(
+                        ring_half,
+                        self.s.kv.ptr as *const f32,
+                        self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                        win as i32,
+                        hd as i32,
+                        idxs_ptr as *mut i32,
+                    )?
+                }
+            });
         if !rw_fused && owns_kv {
             // DEVICE-side slot: a host-computed destination address would be frozen
             // by the graph capture (slot = pos % win at capture time), so every

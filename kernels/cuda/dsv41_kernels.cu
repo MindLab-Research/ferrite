@@ -1843,11 +1843,21 @@ __global__ void sparse_attn_orope_kernel(
 // The reduction tree is rmsnorm_kernel's verbatim at the same blockDim, and the
 // rope half is elementwise - both are bit-identical to the two-launch sequence,
 // which is the only reason this is allowed to exist.
+//
+// DSV41_RW_FOLD: the five trailing arguments host `dsv41_ring_win_fuse_ph`'s
+// three disjoint halves (ring append / window idxs / comp placeholder) in this
+// block. All five null-or-zero reproduces the two-launch form's kernel byte for
+// byte (the fold body is behind an early return), which is what `dsv41_rmsnorm_
+// rope` passes. See the launcher below for the coverage argument.
 __global__ void rmsnorm_rope_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                     float* __restrict__ out, const float* __restrict__ cos,
                                     const float* __restrict__ sin, int n, int dim,
                                     int rope_len, int half, const int* __restrict__ base, int mul,
-                                    int off, int step, int inverse, float eps) {
+                                    int off, int step, int inverse, float eps,
+                                    const int* __restrict__ pos_ctr,
+                                    float* __restrict__ ring, int window,
+                                    int32_t* __restrict__ idxs, const int* __restrict__ clen,
+                                    int index_topk) {
     const int row_i = blockIdx.x;
     if (row_i >= n) return;
     const float* xr = x + (size_t)row_i * dim;
@@ -1879,6 +1889,55 @@ __global__ void rmsnorm_rope_kernel(const float* __restrict__ x, const float* __
         rr[2 * i] = x0 * c - x1 * s;
         rr[2 * i + 1] = x0 * s + x1 * c;
     }
+    // ---- DSV41_RW_FOLD: the `dsv41_ring_win_fuse_ph` trio, folded in --------
+    // The three halves are pure functions of the counters (`pos_ctr`, `clen`)
+    // and the lane index, they write disjoint memory, and no half consumes
+    // another's output - so the block that just produced the row can run them
+    // with the very expressions the standalone kernel uses:
+    //   append      ring[(*pos_ctr % window) * dim + i] = row[i]   (the ROPED row)
+    //   window idxs idxs[c] = (c == 0) ? 0 : -1                    (start_pos == 0)
+    //               idxs[c] = oldest + c, or c - (window - oldest) (the ring
+    //               rotation of ops::window_topk_idxs' decode branch, with
+    //               oldest = (*pos_ctr % window) + 1, and -1 for idx > start_pos)
+    //   placeholder idxs[window + j] = window + *clen - take + j, j < take,
+    //               take = min(*clen, index_topk)   (device-derived bound: a
+    //               captured graph freezes launch arguments, so `clen` must stay
+    //               a pointer, never a host value)
+    // `dim` here IS the ring row stride: the only caller (the kv chain) passes
+    // dim == hd == head_dim, which is what `dsv41_ring_append`/`_fuse_ph` use.
+    //
+    // The barrier below is LOAD-BEARING, not hygiene: the append publishes the
+    // row the rope pass just rotated, and the rope handles pairs on lanes
+    // 0..half-1, so the trailing lanes that get appended are written by OTHER
+    // threads than the ones that append them. Without it the ring receives a mix
+    // of pre- and post-rope values.
+    if (ring == nullptr && idxs == nullptr) return;   // plain call: nothing to fold
+    __syncthreads();
+    const int gid = (int)threadIdx.x;   // one block (grid == n rows) of 1024 lanes
+    if (idxs != nullptr && clen != nullptr && gid < index_topk) {
+        const int c = *clen;
+        const int take = (c < index_topk) ? c : index_topk;
+        if (gid < take) idxs[window + gid] = window + c - take + gid;
+    }
+    if (window <= 0) return;   // the two window halves are no-ops at window <= 0
+    const int start_pos = *pos_ctr;
+    if (ring != nullptr) {
+        const int slot = start_pos % window;
+        float* dst = ring + (size_t)slot * (size_t)dim;
+        for (int i = gid; i < dim; i += blockDim.x) dst[i] = or_[i];
+    }
+    if (idxs == nullptr || gid >= window) return;
+    const int c = gid;
+    if (start_pos == 0) {
+        idxs[c] = (c == 0) ? 0 : -1;
+        return;
+    }
+    const int oldest = (start_pos % window) + 1;
+    long long idx = ((long long)c < (long long)window - oldest)
+                        ? (long long)oldest + c
+                        : (long long)c - ((long long)window - oldest);
+    if (idx > (long long)start_pos) idx = -1;
+    idxs[c] = (int)idx;
 }
 
 // ------------------------------------------------------------------ hc / moe
@@ -6372,7 +6431,50 @@ extern "C" int dsv41_rmsnorm_rope(const float* x, const float* w, float* out, co
                                   float eps, cudaStream_t s) {
     if (n <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
     rmsnorm_rope_kernel<<<n, 1024, 0, s>>>(x, w, out, cos, sin, n, dim, rope_len, half, base, mul,
-                                          off, step, inverse, eps);
+                                          off, step, inverse, eps, nullptr, nullptr, 0, nullptr,
+                                          nullptr, 0);
+    return (int)cudaGetLastError();
+}
+
+// DSV41_RW_FOLD: the same launch, whose tail ALSO runs the whole
+// `dsv41_ring_win_fuse_ph` trio (ring append + window idxs + comp placeholder)
+// on the row it just normed and roped. That removes the standalone
+// `dsv41_ring_win_fuse_ph` launch - and its graph node - for EVERY layer
+// (40/step), which is the only reason to fold: it is the same one-block kernel
+// doing three extra O(win + dim) writes, not a new launch.
+//
+// COVERAGE (why one 1024-lane block suffices): the append loop strides by
+// blockDim (any `dim`), and the two `idxs` halves are lane-per-entry, so the
+// launcher declines when `window` or (with the placeholder armed) `index_topk`
+// exceeds 1024. The production shapes are window=128, dim=hd=512,
+// index_topk=512.
+//
+// BIT-IDENTITY: every half carries the standalone kernel's expressions verbatim
+// (see `rmsnorm_rope_kernel`), the three write disjoint regions, and the row the
+// append publishes is read after a barrier that orders the rope pass (whose
+// pairs live on lanes 0..half-1) against the appending lanes. `dim` must be the
+// ring row stride - the caller passes hd.
+//
+// DECLINE == 2, never 1: 1 is `cudaErrorInvalidValue` and the trailing
+// `cudaGetLastError()` can return it too, so a 1 sentinel would be
+// indistinguishable from a real failure (the legacy trap documented on
+// `dsv41_apply_rope_q` / `dsv41_rmsnorm_q` is deliberately NOT repeated here).
+// A decline means "run `dsv41_rmsnorm_rope` + the standalone ring_win launch",
+// which is bit-identical by construction.
+extern "C" int dsv41_rmsnorm_rope_ring(const float* x, const float* w, float* out,
+                                       const float* cos, const float* sin, int n, int dim,
+                                       int rope_len, int half, const int* base, int mul, int off,
+                                       int step, int inverse, float eps, const int* pos_ctr,
+                                       float* ring, int window, int32_t* idxs, const int* clen,
+                                       int index_topk, cudaStream_t s) {
+    if (n <= 0 || dim <= 0) return 2;
+    if (idxs != nullptr) {
+        if (window > 1024) return 2;                          // lane-per-entry half
+        if (clen != nullptr && index_topk > 1024) return 2;   // ditto for the placeholder
+    }
+    rmsnorm_rope_kernel<<<n, 1024, 0, s>>>(x, w, out, cos, sin, n, dim, rope_len, half, base, mul,
+                                           off, step, inverse, eps, pos_ctr, ring, window, idxs,
+                                           clen, index_topk);
     return (int)cudaGetLastError();
 }
 

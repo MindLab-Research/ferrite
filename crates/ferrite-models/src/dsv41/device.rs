@@ -255,6 +255,19 @@ struct Kernels {
         *const f32, *const f32, *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int,
         *const c_int, c_int, c_int, c_int, c_int, f32, CuStream,
     ) -> c_int>,
+    // DSV41_RW_FOLD: the same launch whose tail ALSO runs the whole
+    // `dsv41_ring_win_fuse_ph` trio (ring append + window idxs + comp
+    // placeholder) on the row it just normed and roped - one launch and one
+    // graph node fewer per layer (40/step). The five tail arguments null-or-zero
+    // reproduce `dsv41_rmsnorm_rope` byte for byte. Returns 0 on success, 2 when
+    // a half does not fit the single 1024-lane block (the caller then runs the
+    // plain pair plus the standalone ring_win launch). Optional: an older .so
+    // without the symbol falls back on its own.
+    rmsnorm_rope_ring: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *mut f32, *const f32, *const f32, c_int, c_int, c_int, c_int,
+        *const c_int, c_int, c_int, c_int, c_int, f32, *const c_int, *mut f32, c_int, *mut i32,
+        *const c_int, c_int, CuStream,
+    ) -> c_int>,
     // T2: rmsnorm that ALSO emits the fp8 (byte + per-32-block scale) of its own
     // normalised output, so the next fp8 activation consumer of that row (the
     // qr -> wq_b projection) skips its quant launch. Optional: an older .so
@@ -744,6 +757,7 @@ impl Device {
             rope_precompute: km!(rt, "dsv41_rope_precompute"),
             apply_rope: km!(rt, "dsv41_apply_rope"),
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
+            rmsnorm_rope_ring: ko!(rt, "dsv41_rmsnorm_rope_ring"),
             rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
@@ -2181,6 +2195,71 @@ impl Device {
               eps, s)
         };
         self.kerr(rc, "dsv41_rmsnorm_rope")?;
+        Ok(true)
+    }
+
+    /// Does the loaded `.so` carry [`Self::rmsnorm_rope_ring_on`]
+    /// (`DSV41_RW_FOLD`)? An older `.so` keeps the plain `rmsnorm_rope` pair.
+    pub fn supports_rmsnorm_rope_ring(&self) -> bool {
+        self.kernels.rmsnorm_rope_ring.is_some()
+    }
+
+    /// [`Self::rmsnorm_rope_on`] whose tail ALSO folds the whole
+    /// `ring_win_fuse_ph` trio into the same launch: the ring append
+    /// (`ring[pos % window * dim + i] = roped_row[i]`), the window indices
+    /// (`idxs[0, window)`), and - when `clen` is non-null - the compressed-row
+    /// recency placeholder (`idxs[window, window + take)`).
+    ///
+    /// One launch and one graph node fewer per layer (40/step). `Ok(true)` means
+    /// the fused launch ran, i.e. all armed halves are done. `Ok(false)` means
+    /// "run the fallback": an `.so` without `dsv41_rmsnorm_rope_ring`, or a shape
+    /// decline - `window`/`index_topk` beyond the single 1024-lane block. The
+    /// decline sentinel is 2, so it can never be read as `cudaErrorInvalidValue`
+    /// (1) - the trap the older fused launchers carry.
+    ///
+    /// Bit-identity: the three halves carry `dsv41_ring_win_fuse_ph`'s
+    /// expressions verbatim, they write disjoint regions, and the append reads
+    /// the ROPED row after a barrier (the rope pairs live on lanes `0..half-1`,
+    /// so the appending lane is generally a different thread). `dim` must be the
+    /// ring row stride (`hd`), as on the standalone path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_rope_ring_on(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        cos: *const f32,
+        sin: *const f32,
+        n: i32,
+        dim: i32,
+        rope_len: i32,
+        half: i32,
+        base: *const c_int,
+        mul: i32,
+        off: i32,
+        step: i32,
+        inverse: bool,
+        eps: f32,
+        pos_ctr: *const c_int,
+        ring: *mut f32,
+        window: i32,
+        idxs: *mut i32,
+        clen: *const c_int,
+        index_topk: i32,
+        s: CuStream,
+    ) -> Result<bool> {
+        let f = match self.kernels.rmsnorm_rope_ring {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe {
+            f(x, w, out, cos, sin, n, dim, rope_len, half, base, mul, off, step, inverse as i32,
+              eps, pos_ctr, ring, window, idxs, clen, index_topk, s)
+        };
+        if rc == 2 {
+            return Ok(false);   // shape decline: the caller runs the plain pair
+        }
+        self.kerr(rc, "dsv41_rmsnorm_rope_ring")?;
         Ok(true)
     }
 

@@ -650,17 +650,39 @@ if (e != cudaSuccess) {
 `cudaFuncSetAttribute`、`cudaMalloc` …）在返回错误码前都必须先 `(void)cudaGetLastError()` 清 sticky，
 否则错误会泄漏给下一个 launcher 造成归因错位。
 
-## ring_win_fuse 全折叠设计（ringwin-fold-impl 产出，2026-09-12，待实施）
+## ring_win_fuse 全折叠设计（ringwin-fold-impl 产出，2026-09-12，✅ 已实施）
 
 **目标**：把 ring_win_fuse_ph（1.3µs × 40/步，三合一：placeholder + ring append + window idxs）整个折进 kv 生产者 rmsnorm_rope_kernel（1 block × 1024 线程），省 40 launch。
 
 **可行性**：
-- kv 定稿生产者是 rmsnorm_rope_kernel（NR_FUSE 路径，非 lin_rope_norm——那是 q 侧）
+- kv 定稿生产者是 rmsnorm_rope_kernel（NR_FUSE 路径）——不是 lin_rope_norm（那是 q 侧）
 - win=128 / hd=512 / index_topk=512 全部 ≤1024——三半都能塞进同一 1024 线程 block
 - 只折 append 半省不到 launch（idxs 仍需 launch）——必须全折
-- 位一致：append 公式原样（ring[pos%win*hd+gid]=kv[gid]）；idxs/placeholder 表达式原样搬；norm 归约树在 blockDim=1024 时逐位对齐（kernel 注释明写 load-bearing）
+- 位一致：append 公式原样（ring[pos%win*hd+gid]=kv[gid]）；idxs/placeholder 表达式原样搬；norm 归约树在 blockDim=1024 时逐位对齐（load-bearing）
 
-**改动**：
-1. rmsnorm_rope_kernel 加可选尾参（ring/window/idxs/clen/index_topk，全 null = 旧行为）
-2. device.rs: supports_rmsnorm_rope_ring() + rmsnorm_rope_ring_on()
-3. chain_dev.rs: nr_fuse 命中时走新入口；!nr_fused 回退老路径
+**实施落点（2026-09-12，`DSV41_RW_FOLD` 默认 ON）**：
+| 层 | 位置 | 内容 |
+|---|---|---|
+| kernel | `dsv41_kernels.cu:1852`（fold 体 `:1892`）| 尾参 `pos_ctr, ring, window, idxs, clen, index_topk`；`ring==nullptr && idxs==nullptr` 时在 fold 体前**提前 return**（旧行为逐位不变）。`dsv41_rmsnorm_rope`（:6428）传全 null |
+| launcher | `dsv41_kernels.cu:6464` `dsv41_rmsnorm_rope_ring` | decline **== 2**（不重蹈 1 == `cudaErrorInvalidValue` 的老坑）；`window>1024` 或（`clen!=null` 且 `index_topk>1024`）时 decline |
+| Rust | `device.rs:2203` `supports_rmsnorm_rope_ring()` / `:2226` `rmsnorm_rope_ring_on()`（`rc==2 → Ok(false)`）| 字段声明 `device.rs:266`，`ko!` 装载 `:760` |
+| 调用点 | `chain_dev.rs:2974` | `rw_fold() && nr_fuse()` 时走新入口，`Ok(false)` → 回退 `rmsnorm_rope_on`（:3003）；`rw_folded` 置位后 `ring_win_fuse_ph` 分支整体跳过（`rw_fused = rw_folded \|\| …`），`ph_fused = ph_ok` |
+| gate | `chain_dev.rs:709` `rw_fold()` | `DSV41_RW_FOLD`，默认 ON，`=0` 回退旧路径 |
+
+**相对设计稿的两处修正（实施时发现）**：
+1. **kernel 必须显式收 `pos_ctr`**——rmsnorm_rope_kernel 原签名里没有 pos 计数器（只有 `base`+`mul/off/step` 的 rope 位置语义）。借用 `*base` 会依赖"base 恰好是 pos_ctr 且 mul/off/step==1/0/1"的隐式契约，故加第 16 个尾参 `pos_ctr`（`dsv41_rmsnorm_rope` 传 nullptr）。首次远端编译即因此报 `identifier "pos_ctr" is undefined`。
+2. **rope 之后必须补一道 `__syncthreads()`**（只在 fold 体里，旧路径不执行）——append 发布的是 rope **之后**的行，而 rope 的 pair 由 lane `0..half-1` 写、被 append 的尾段 lane 是**别的线程**读。少这道 barrier 会把 rope 前后的值混进 ring。
+
+**覆盖域**：append 用 `for (i = gid; i < dim; i += blockDim.x)`（任意 dim 都成立）；两个 idxs 半是 lane-per-entry，故 launcher 以 1024 为界 decline。生产形状 win=128 / dim=hd=512 / index_topk=512。
+
+**语义边界（实施后复核）**：三半写入互不相交的地址——append 写 ring 的 `pos%win` 行，placeholder 写 `idxs[win, win+take)`，idxs 半写 `idxs[0, win)`；唯一写 `idxs[win,..)` 的 indexer 与唯一写 ring 压缩行 `[win, win+clen)` 的 compressor 都与本 fold 的数据**不重叠**，`ph_ok` 继续排除 index-source 与 compress-source（后者的 `*clen` 正被本步 compressor 推进）。fold 后三半提前到 kv 侧链（DUAL_CHAIN 下 `side_stream2`）执行，由 `dual_chain_join`（`chain_dev.rs:2962` 起）与主流的 `sparse_attn` 定序——**join 之前没有任何主/侧流读者读 idxs/ring**。
+
+**验证（已完成）**：
+- `cargo check -p ferrite-models` ✓（仅既有 warning）
+- 远端 `nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -Xptxas -v -c dsv41_kernels.cu` → **EXIT=0**（remote `ubuntu@43.202.208.136`，无 GPU 动作）
+- **寄存器/占用逐项对齐**：`rmsnorm_rope_kernel` 改动前后同为 **26 registers / 1 barrier / 128 B smem**（HEAD 版本对照编译）——避开了 v13 那次"代码存在性"回归的敏感点（签名变长 + 死代码分支都没有推高寄存器）
+- **尚未上机**：位一致目前是构造性论证 + 编译期证据；上机判据 = `DSV41_RW_FOLD=1` vs `=0` 背靠背四段文本逐字节相同 + `faults=0`，再看 p50
+
+**回退**：`DSV41_RW_FOLD=0`（优先）、`DSV41_NR_FUSE=0`（无 fold 载体）、或老 `.so`（`ko!` 符号探测自动回退）。三条回退都是逐位等价的旧路径。
+
+*（原设计稿末尾的"改动 1/2/3"清单已被上表取代。）*

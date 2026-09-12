@@ -7476,3 +7476,19 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 **跨切面风险**：quant-fold 和 ar-stamp-fold 改动了既有符号的 ABI（中间插参数）——旧 .so + 新 Rust = 709（与 gate 无关）。建议 ABI 版本符号。
 
 **处置**：hc-fold-cleanup（进行中）将彻底删除 fold 代码——修复 gate 缺陷 + 消除 ABI 风险。
+
+### ring_win 全折叠落地（DSV41_RW_FOLD，默认 ON，2026-09-12）
+
+**做了什么**：把 `dsv41_ring_win_fuse_ph`（placeholder + ring append + window idxs 三合一，~1.3µs × 40/步）整个折进 kv 链的 `rmsnorm_rope_kernel`（1 block × 1024 线程）：追加 6 个尾参（`pos_ctr/ring/window/idxs/clen/index_topk`），rope 之后在同一 block 内跑三半；新 launcher `dsv41_rmsnorm_rope_ring`，**decline == 2**（避开 1 == `cudaErrorInvalidValue` 的老坑）。省 40 launch + 40 图节点（预期 −0.02~0.05ms）。
+
+**为什么必须全折**：只折 append 半的话 idxs 仍要单独 launch ⇒ 省 0。L2/L1 层面无收益，唯一收益是 launch 数。
+
+**实施时修正设计稿两处**：
+1. kernel 原签名没有 pos 计数器（`base` 是 rope 位置语义）⇒ 显式加尾参 `pos_ctr`，**不**借用 `*base`（否则依赖 `mul/off/step==1/0/1` 的隐式契约）。首次远端编译立即暴露（`pos_ctr is undefined`）。
+2. rope 后必须补 `__syncthreads()`（只在 fold 体内）：append 发布 rope **之后**的行，而 rope 的 pair 由 lane `0..half-1` 写、被 append 的尾段 lane 由**别的线程**读。
+
+**位一致依据**：三半的表达式与独立 kernel 逐字相同；写入区域互不相交（ring 的 `pos%win` 行 / `idxs[0,win)` / `idxs[win,win+take)`）；`ph_ok` 与 B3 同一 gate（排除 index-source 与 compress-source）；fold 后三半移到 kv 侧链，由 `dual_chain_join` 与主流 `sparse_attn` 定序，join 前无任何 idxs/ring 读者。norm 归约树仍是 blockDim=1024 的那棵。
+
+**验证**：`cargo check -p ferrite-models` ✓；远端 `nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -Xptxas -v -c dsv41_kernels.cu` **EXIT=0** 且 `rmsnorm_rope_kernel` 改动前后同为 **26 registers / 1 barrier / 128 B smem**（对照 HEAD 编译）——没有触发 v13 那种"代码存在性/寄存器"回归面。**尚未上机**：判据是 `DSV41_RW_FOLD=1` vs `=0` 背靠背四段文本逐字节相同 + `faults=0`，再看 p50。
+
+**回退**：`DSV41_RW_FOLD=0` → `DSV41_NR_FUSE=0` → 老 `.so` 符号探测，三条都是逐位等价的旧路径。
