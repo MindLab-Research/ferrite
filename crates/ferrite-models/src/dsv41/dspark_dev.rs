@@ -772,14 +772,15 @@ impl<'a> DsparkDev<'a> {
             hd as i32,
             cfg.norm_eps,
         )?;
-        // The draft rows sit at pos + bs + r, i.e. one row per step (the host's
-        // `apply_rope(kv, bs, hd, rd, freqs, start_pos + bs, 1, false)`).
+        // The draft rows sit at pos + 1 + r, one row per step — the SAME
+        // per-row positions as the queries (the sglang arbitration; the host
+        // comment's `seqlen` is the sequence length, not the block size).
         self.rope_at(
             self.kv.ptr as *mut f32,
             bs as i32,
             hd as i32,
             1,
-            pos as i32 + bs as i32,
+            pos as i32 + 1,
             1,
             false,
         )?;
@@ -1315,16 +1316,14 @@ impl<'a> DsparkDev<'a> {
     }
 
     /// Forward RoPE for the `bs` draft queries: query `r` sits at
-    /// `pos + bs + r`, and every head of a query shares that position (the main
-    /// chain's `step = 0` convention).
-    ///
-    /// ⚠️ The host reference's literal calls cannot both be right — it ropes `q`
-    /// with `rows = bs, row_len = hd` (which only reaches the first `bs * hd` of
-    /// the `bs * nh * hd` buffer) and `o` with `rows = bs * nh, step = 1` (which
-    /// gives every HEAD its own position). Both are inconsistent with the
-    /// backbone's own attention, where one token's heads all share `pos_ctr`.
-    /// This implementation takes the backbone-isomorphic reading; the host
-    /// reference should be arbitrated by the design owner.
+    /// `pos + 1 + r` — the NEXT position after the anchor, one row per step
+    /// (sglang arbitration: `positions_2d = prefix_lens + arange(...)` with
+    /// prefix_lens already counting the anchor, i.e. row r = anchor_pos + 1 + r.
+    /// The historical `pos + bs + r` misread the host comment's `seqlen` as the
+    /// block size — it is the SEQUENCE length; the two differ by bs-1 = 4
+    /// positions, enough to scramble the whole attention).
+    /// Every head of a query shares that position (the main chain's `step = 0`
+    /// convention).
     fn rope_queries(&mut self, x: *mut f32, pos: usize) -> Result<()> {
         let (bs, nh) = (self.bs, self.nh);
         for r in 0..bs {
@@ -1333,7 +1332,7 @@ impl<'a> DsparkDev<'a> {
                 nh as i32,
                 self.hd as i32,
                 0,
-                pos as i32 + self.bs as i32 + r as i32,
+                pos as i32 + 1 + r as i32,
                 1,
                 false,
             )?;
@@ -1351,7 +1350,7 @@ impl<'a> DsparkDev<'a> {
                 nh as i32,
                 self.hd as i32,
                 0,
-                pos as i32 + self.bs as i32 + r as i32,
+                pos as i32 + 1 + r as i32,
                 1,
                 true,
             )?;
