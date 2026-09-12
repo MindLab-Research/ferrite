@@ -5024,3 +5024,26 @@ DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1
 DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1
 DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3A=1
 ```
+
+## SWALLOW epoch pad 测试的四种结果应对（4c1cc40a 跑中）
+
+**测试配置**：SWALLOW_STEP + VERIFY_GRAPH + EPOCH_PAD + V5_LEDGER + 干净栈
+
+### 结果 A：0 ar5-hang + 输出干净（epoch pad 成功！）
+1. **THE BATCHED PATH IS UNLOCKED**——400 的唯一路径打开！
+2. 立即跑 batched 优化叠加：SH_PAIR_M=6（-4.9~7.9ms）→ mrows 族 → tcgen05
+3. 吞吐目标：batched 基线 → +SH_PAIR → +mrows → +tcgen05 → **400 冲刺**
+
+### 结果 B：0 ar5-hang 但输出损坏
+1. epoch pad 修复了 hang 但 SWALLOW 有其他问题
+2. 检查 v5-ledger 的轮次增量（应该 165/步）
+3. 可能需要 SWALLOW 的其他修复
+
+### 结果 C：仍 hang（第 9 次也失败）
+1. epoch pad 没有修复——需要分析 v5-ledger 的实际增量
+2. 第 10 次修复的方向（基于 ledger 的实测数据）
+3. 400 的路径需要重新评估
+
+### 结果 D：crash
+1. epoch pad 实施有 bug
+2. 检查 pad kernel 的调用和参数
