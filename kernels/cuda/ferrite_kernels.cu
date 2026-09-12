@@ -32,7 +32,14 @@
 // ABI 3 (2026-09-12): dsv41_hc_collapse_norm gained a trailing `int truncate`
 // (DSV41_BF16_TRUNCATE — round the hc_pre collapse back to bf16 before the norm).
 // Same reason: a stale .so must be refused, not read the new int as its stream.
-#define FERRITE_KERNEL_ABI_VERSION 3u
+// ABI 4 (2026-09-12): the bf16 truncation reaches the FUSED hc front end, which
+// is what the 44-layer main chain actually runs (DSV41_HC_FRONT is default ON).
+// dsv41_hc_front / dsv41_hc_front_split / dsv41_hc_front_persist /
+// dsv41_hc_front_persist_mb each gained a trailing `int truncate` (before their
+// first stream), carried into hc_mixes_tail_kernel (the split's EARLY half),
+// hc_front_kernel, hc_pre_persist_kernel and hc_pre_persist_mb_kernel. Without
+// the trailing int a stale .so would read it as the stream pointer.
+#define FERRITE_KERNEL_ABI_VERSION 4u
 extern "C" const char* ferrite_kernel_build_id(void) { return FERRITE_KERNEL_BUILD_ID; }
 extern "C" unsigned ferrite_kernel_abi_version(void) { return FERRITE_KERNEL_ABI_VERSION; }
 

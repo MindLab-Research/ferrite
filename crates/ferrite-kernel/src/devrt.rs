@@ -267,7 +267,10 @@ fn dlopen_or_err(path: &str) -> Result<*mut c_void> {
 /// dlopen design). So the linked-image belt-and-braces is skipped here and the
 /// stamp + ABI + same-source comparisons do the work.
 unsafe fn verify_kernel_build(handle: *mut c_void, so_path: &str) -> Result<()> {
-    const EXPECTED_ABI: u32 = 3;
+    // ABI 4: the bf16 truncation gate reached the fused hc front end (a trailing
+    // `int truncate` on the four `dsv41_hc_front*` entries). Keep in lockstep with
+    // FERRITE_KERNEL_ABI_VERSION in kernels/cuda/ferrite_kernels.cu.
+    const EXPECTED_ABI: u32 = 4;
     let get_id = sym(handle, "ferrite_kernel_build_id").ok();
     let get_abi = sym(handle, "ferrite_kernel_abi_version").ok();
     let (get_id, get_abi) = match (get_id, get_abi) {

@@ -721,15 +721,28 @@ def hc_pre(self, x, pre_mix):
 
 **ferrite** `dsv41_hc_collapse_norm_kernel`（`dsv41_kernels.cu:8011+`）：
 - 输入 x 是 f32、pre 是 f32、输出 out 是 **f32**（`float* out`）
-- **没有 bf16 截断**——hc_pre 的结果全程 f32
+- 默认 f32；`DSV41_BF16_TRUNCATE=1` 时在 collapse 后、平方和之前做 bf16 round-trip（见下）
 
 **差异**：ferrite 在 hc_pre 后保持 f32 精度，官方截断回 bf16。这意味着 ferrite 的下游（attn_norm、attention）吃的是 f32（更高精度），而官方吃 bf16。**这是一个数值域分歧**——ferrite 更精确，但与官方的参考实现不同。在对齐实验中会表现为逐层 norm 的微小偏差。
 
 **是否需要修**：取决于对齐实验的结果——如果 acs/ibu 的根因不在 hc_pre 的截断（偏差小于量化噪声），可以不修（ferrite 的做法更精确）。如果对齐数据显示从 hc_pre 截断处开始 norm 偏差显著，则需要加截断。
 
-**已实施（2026-09-12）**：加了 `DSV41_BF16_TRUNCATE` gate（默认 OFF）——`dsv41_hc_collapse_norm_kernel` 在 collapse 之后、**平方和累积与 phase-2 scale 之前**对 `acc` 做 bf16 round-trip（`__float2bfloat16(_rn)` → `__bfloat162float`，后者无损），对应官方 `hc_pre` 的 `y.to(x.dtype)`；round-trip 放在方差之前，因为官方 `attn_norm` 读的正是那个 bf16 行（`x.float()` 精确升位后算 var）。OFF 时逐位不变。gate 由 `chain_dev::bf16_truncate()` 下发到 `Device::hc_collapse_norm`（launcher 新增尾参 `int truncate`，ABI 2→3）。
+**已实施（2026-09-12）**：加了 `DSV41_BF16_TRUNCATE` gate（默认 OFF）——`dsv41_hc_collapse_norm_kernel` 在 collapse 之后、**平方和累积与 phase-2 scale 之前**对 `acc` 做 bf16 round-trip（`__float2bfloat16(_rn)` → `__bfloat162float`，后者无损），对应官方 `hc_pre` 的 `y.to(x.dtype)`；round-trip 放在方差之前，因为官方 `attn_norm` 读的正是那个 bf16 行（`x.float()` 精确升位后算 var）。OFF 时逐位不变。gate 由 `chain_dev::bf16_truncate()`（OnceLock 缓存，只读一次）下发。ABI 2→3（独立路径新增尾参 `int truncate`）。
 
-⚠️ **默认配置可达性**：默认 `DSV41_HC_FRONT=1` / `DSV41_HC_TAIL_SPLIT=1` 时 backbone 的 collapse 由**融合前段**（`hc_front` / `hc_front_split` 的 EARLY half，内联了同一段 collapse+rmsnorm）完成，独立的 `hc_collapse_norm` 只在 `DSV41_HC_FRONT=0`（且 persist 系列 OFF）时才执行——所以本 gate 在默认配置下对 44 层主链**不生效**（只覆盖 head-collapse 与 DSpark draft）。要作用于主链，需把 `truncate` 一并透进融合核，或 A/B 时设 `DSV41_HC_FRONT=0`（融合路径与两段式 bit-identical，只少一次 launch）。
+**gate 覆盖面（2026-09-12 补齐 —— 融合段）**：截断现在覆盖全部 **5 个 collapse 站点**，不再是「只有独立调用」生效：
+
+| 路径 | collapse 所在 kernel | launcher |
+|---|---|---|
+| 独立路径（`DSV41_HC_FRONT=0`） | `dsv41_hc_collapse_norm_kernel` | `dsv41_hc_collapse_norm` |
+| **主链默认**（`HC_TAIL_SPLIT=1` 的 EARLY half） | `hc_mixes_tail_kernel` | `dsv41_hc_front_split` |
+| 主链（`HC_TAIL_SPLIT=0` 两段式 tail，HC_TAIL_FULL） | `hc_mixes_tail_kernel` | `dsv41_hc_front` |
+| hc-merge（`DSV41_HC_MERGE=1`，默认 OFF） | `hc_front_kernel` | `dsv41_hc_front` |
+| persist（`DSV41_HC_PERSIST=1`） | `hc_pre_persist_kernel` | `dsv41_hc_front_persist` |
+| persist-mb（`DSV41_HC_PERSIST_MB=1`） | `hc_pre_persist_mb_kernel` | `dsv41_hc_front_persist_mb` |
+
+`hc_dots_late_kernel` / `hc_dots_late_kchunk_kernel`（dots+LATE 合并节点）**不含 collapse**，无需改动（已用 `acc * acc` 全树扫描确认）。融合段各 launcher 加尾参 `int truncate`（位于首个 stream 之前），ABI 再 bump **3→4**；OFF 时 `truncate == 0` 直接跳过 round-trip，逐位不变。
+
+❌ → ✅ **默认配置可达性**：默认 `DSV41_HC_FRONT=1` / `DSV41_HC_TAIL_SPLIT=1` 时 backbone 的 collapse 由**融合前段**（`hc_front_split` 的 EARLY half，内联了同一段 collapse+rmsnorm）完成，该内联实现现在**同样**吃 `truncate`，因此本 gate 在默认配置下对 44 层主链**已生效**。旧版此处的「gate 对主链不生效」警告作废。
 
 ## rmsnorm eps 对照——一致 ✓（1e-20）
 

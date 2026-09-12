@@ -300,6 +300,14 @@ struct Kernels {
     rmsnorm_q: Option<unsafe extern "C" fn(
         *const f32, *const f32, *mut f32, c_int, c_int, f32, *mut u8, *mut f32, CuStream,
     ) -> c_int>,
+    /// The dsv41-side multi-row rmsnorm (`rows` norm rows of `dim`, row stride
+    /// `dim`, the shared weight row `w[dim]`), the `DSV41_NORM_MROWS` arm's
+    /// kernel. Bit-identical to `rmsnorm`'s per-row program at the same blockDim
+    /// (see `dsv41_rmsnorm_rows_kernel`). Optional: an `.so` without the symbol
+    /// (or with the gate off) keeps the pre-existing `rmsnorm` call.
+    rmsnorm_rows: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *mut f32, c_int, c_int, f32, CuStream,
+    ) -> c_int>,
     // bf16 gate + fp8 shared expert in ONE launch (same activation). Optional:
     // falls back to the separate launches.
     gemm_bf16_fp8x2: Option<unsafe extern "C" fn(
@@ -792,7 +800,7 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const f32,
         *const f32, *const f32,
         *mut f32, *mut f32, *mut f32, *mut f32,
-        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
+        c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, c_int, CuStream,
     ) -> c_int,
     /// Stage-C persistent prototype: the whole hc front end in ONE block as a
     /// `__syncthreads` phase machine (no ticket, no spin). Same ABI as
@@ -803,7 +811,7 @@ struct Kernels {
             *const f32, *const f32, *const f32, *const f32,
             *const f32, *const f32,
             *mut f32, *mut f32, *mut f32, *mut f32,
-            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
+            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, c_int, CuStream,
         ) -> c_int,
     >,
     /// Stage-C persistent MULTI-BLOCK form: the same front end as
@@ -818,7 +826,7 @@ struct Kernels {
             *const f32, *const f32, *const f32, *const f32,
             *const f32, *const f32,
             *mut f32, *mut f32, *mut f32, *mut f32,
-            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, CuStream,
+            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, c_int, CuStream,
         ) -> c_int,
     >,
     /// hc TAIL SPLIT (`DSV41_HC_TAIL_SPLIT`, default ON): same front end as
@@ -842,7 +850,7 @@ struct Kernels {
             *const f32, *const f32, *const f32, *const f32,
             *const f32, *const f32,
             *mut f32, *mut f32, *mut f32, *mut f32,
-            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32,
+            c_int, c_int, c_int, c_int, f32, f32, *mut u8, *mut f32, c_int,
             CuStream, CuStream, *mut c_void, *mut c_void, *mut c_void, *mut c_void,
             CuStream,
         ) -> c_int,
@@ -1014,6 +1022,7 @@ impl Device {
             apply_rope_mrows: ko!(rt, "dsv41_apply_rope_mrows"),
             rmsnorm_rope: ko!(rt, "dsv41_rmsnorm_rope"),
             rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
+            rmsnorm_rows: ko!(rt, "dsv41_rmsnorm_rows"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
             argmax_sliced_rows: ko!(rt, "dsv41_argmax_sliced_rows"),
@@ -4702,6 +4711,34 @@ impl Device {
         Ok(true)
     }
 
+    /// Multi-row rmsnorm for the verify block (`DSV41_NORM_MROWS`): `rows` norm
+    /// rows of `dim`, row stride `dim`, the shared weight row `w[dim]`, in place
+    /// when `out == x`.
+    ///
+    /// This is the dsv41-side twin of [`Self::rmsnorm`]'s per-row program at the
+    /// same blockDim (see `dsv41_rmsnorm_rows_kernel`), so a `rows = m` call
+    /// replaces the block's norm launch and each row lands bit just as it would
+    /// have through the per-row entry. `Ok(false)` when the loaded `.so` predates
+    /// the symbol (or when the caller's gate is off), and the caller then keeps
+    /// the launch it already made - strictly additive, no new failure mode.
+    pub fn rmsnorm_rows(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+    ) -> Result<bool> {
+        let f = match self.kernels.rmsnorm_rows {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe { f(x, w, out, rows, dim, eps, self.stream) };
+        self.kerr(rc, "dsv41_rmsnorm_rows")?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn hc_pre(
         &self,
@@ -4815,6 +4852,7 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        truncate: bool,
     ) -> Result<bool> {
         let rc = unsafe {
             (self.kernels.hc_front)(
@@ -4836,6 +4874,7 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
+                truncate as c_int,
                 self.stream,
             )
         };
@@ -4914,6 +4953,7 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        truncate: bool,
     ) -> Result<bool> {
         let f = self.need(self.kernels.hc_front_split, "dsv41_hc_front_split")?;
         let rc = unsafe {
@@ -4936,6 +4976,7 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
+                truncate as c_int,
                 self.stream,
                 self.rt.side_stream(),
                 // Dead ABI slots (EARLY-on-main): the launcher neither validates
@@ -5012,6 +5053,7 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        truncate: bool,
     ) -> Result<bool> {
         let f = self.need(self.kernels.hc_front_persist, "dsv41_hc_front_persist")?;
         let rc = unsafe {
@@ -5034,6 +5076,7 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
+                truncate as c_int,
                 self.stream,
             )
         };
@@ -5082,6 +5125,7 @@ impl Device {
         eps_norm: f32,
         xq: *mut u8,
         xsc: *mut f32,
+        truncate: bool,
     ) -> Result<bool> {
         let f = self.need(self.kernels.hc_front_persist_mb, "dsv41_hc_front_persist_mb")?;
         let rc = unsafe {
@@ -5104,6 +5148,7 @@ impl Device {
                 eps_norm,
                 xq,
                 xsc,
+                truncate as c_int,
                 self.stream,
             )
         };

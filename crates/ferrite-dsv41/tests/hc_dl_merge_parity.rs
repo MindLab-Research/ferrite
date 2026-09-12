@@ -29,6 +29,14 @@ fn env(n: &str) -> Option<String> {
     std::env::var(n).ok().filter(|v| !v.is_empty())
 }
 
+/// The runtime's `chain_dev::bf16_truncate()` gate, mirrored so the parity test
+/// exercises whichever arm the model is configured for: both sides of the
+/// comparison below must pass the SAME value, otherwise the test would compare
+/// two different kernels. See `DSV41_BF16_TRUNCATE` (default OFF).
+fn truncate() -> bool {
+    std::env::var("DSV41_BF16_TRUNCATE").map(|v| v != "0").unwrap_or(false)
+}
+
 struct FrontOut {
     pre: Vec<f32>,
     post: Vec<f32>,
@@ -123,6 +131,7 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
                     cfg.norm_eps,
                     xq.ptr as *mut u8,
                     xsc.ptr as *mut f32,
+                    truncate(),
                 )
                 .unwrap();
             // The caller's contract: wait `join_ev` before the hc_post that
@@ -149,6 +158,7 @@ fn dl_merge_split_matches_two_launch_bit_for_bit() {
                 cfg.norm_eps,
                 xq.ptr as *mut u8,
                 xsc.ptr as *mut f32,
+                truncate(),
             )
             .unwrap()
         };

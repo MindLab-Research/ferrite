@@ -7829,6 +7829,82 @@ extern "C" int dsv41_rmsnorm_q(const float* x, const float* w, float* out, int n
     return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Multi-row rmsnorm for the verify block (`dsv41_rmsnorm_rows`, Rust gate
+// DSV41_NORM_MROWS, default OFF).
+//
+// The verify path normalises WHOLE BLOCKS of rows: `layer_rows` takes the
+// block's attn_norm/ffn_norm rows and `attention_rows` the block's q/kv rows,
+// every one of them a `[rows, dim]` contiguous block with the shared weight row
+// `w[dim]`. Those calls are the only reason this translation unit still reaches
+// into `ferrite_kernels.cu` for a norm, and the `rows` spelling is the one the
+// rest of the dsv41 rows family uses (`dsv41_hc_collapse_norm`,
+// `dsv41_apply_rope_mrows`, `dsv41_quant_rows`).
+//
+// BIT-IDENTITY TO THE SINGLE-ROW PROGRAM. The body below is `rmsnorm_kernel`'s
+// (ferrite_kernels.cu:288-319) statement for statement: the same `row >= rows`
+// guard, the same `x + row*dim` / `out + row*dim` row addressing, the same
+// stride-`blockDim.x` sum-of-squares walk (`ss += xr[i] * xr[i]`, one `add.f32`
+// per element, in ascending index order), the same `shfl_down` tree
+// 16,8,4,2,1 over the warp, the same `__shared__ float red[32]` cross-warp fold
+// (lane 0 of each warp writes `red[tid>>5]`, thread 0 sums `red[0..blockDim/32)`
+// in ascending warp order), the same `rsqrtf(t / dim + eps)`, and the same
+// phase-2 `out[i] = x[i] * inv * w[i]`.
+//
+// Rows are independent BY CONSTRUCTION: a block reads and writes only its own
+// row and every shared/register value is per block, so an `rows = r` call is the
+// concatenation of `r` single-row calls and the ORDER inside a row is untouched
+// by how many rows the launch carries. What the two launchers must agree on is
+// blockDim: `red[32]` is a blockDim-sized tree, so 1024 threads on both sides is
+// what makes the cross-warp fold the same sum in the same order. The row stride
+// is `dim` for all three operands - `x_r`/`xn_r`/`qr_r`/`kv_r` are `[rows, dim]`
+// blocks in the verify path, which is exactly the layout a single-row call sees
+// at rows == 1.
+//
+// `out` may alias `x`: the q and kv norms normalise in place, and each element
+// is read once (into `ss` or into the phase-2 product) before it is written.
+__global__ void dsv41_rmsnorm_rows_kernel(const float* __restrict__ x,
+                                          const float* __restrict__ w,
+                                          float* __restrict__ out, int rows, int dim, float eps) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* xr = x + (size_t)row * dim;
+    float* or_ = out + (size_t)row * dim;
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        ss += xr[i] * xr[i];
+    }
+    // warp reduce - the single-row kernel's tree, verbatim
+    float lane = ss;
+    for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffffu, lane, off);
+    // Cross-warp reduce sized by blockDim (32 slots cover up to 1024 threads),
+    // as in rmsnorm_kernel: blockDim/32 partial sums, summed in warp order by
+    // thread 0.
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = lane;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+        red[0] = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        or_[i] = xr[i] * inv * w[i];
+    }
+}
+
+// One block per row, 1024 threads - the geometry `ferrite_rmsnorm` uses, so the
+// two entries are interchangeable row for row.
+extern "C" int dsv41_rmsnorm_rows(const float* x, const float* w, float* out, int rows, int dim,
+                                  float eps, cudaStream_t s) {
+    if (x == nullptr || w == nullptr || out == nullptr) return (int)cudaErrorInvalidValue;
+    if (rows <= 0 || dim <= 0) return (int)cudaErrorInvalidValue;
+    dsv41_rmsnorm_rows_kernel<<<(unsigned)rows, 1024, 0, s>>>(x, w, out, rows, dim, eps);
+    return (int)cudaGetLastError();
+}
+
 static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
 
 // ---------------------------------------------------------------------------
@@ -8300,7 +8376,8 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
                                      const float* __restrict__ w_norm,
                                      const float* __restrict__ pre_collapse,
                                      float* __restrict__ out, float eps_norm, int ss_in,
-                                     uint8_t* __restrict__ xq, float* __restrict__ xsc, int mode) {
+                                     uint8_t* __restrict__ xq, float* __restrict__ xsc, int mode,
+                                     int truncate) {
     const int r = blockIdx.x;
     const int mix = hc * (2 + hc);
     const int hc_dim = hc * dim;
@@ -8401,6 +8478,16 @@ __global__ void hc_mixes_tail_kernel(const float* __restrict__ x,
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
                 acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
+            // DSV41_BF16_TRUNCATE (`truncate`, default OFF): the same round trip
+            // dsv41_hc_collapse_norm_kernel applies — see the header above it. The
+            // official `hc_pre` returns `y.to(x.dtype)`, so the norm's sum of
+            // squares just below is taken on the ROUNDED values exactly as it is
+            // there. `truncate == 0` skips the pair entirely, so OFF is
+            // bit-for-bit the f32 path this kernel has always run.
+            // This is the 44-layer main chain's site: with DSV41_HC_FRONT on (the
+            // default) the split's EARLY half collapses here, not in the
+            // standalone kernel, so the gate must be carried into this kernel.
+            if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
             o_r[c] = acc;
             s2 += acc * acc;
         }
@@ -8474,7 +8561,8 @@ __global__ void hc_front_kernel(const float* __restrict__ x, const float* __rest
                                 const float* __restrict__ w_norm,
                                 const float* __restrict__ pre_collapse, float* __restrict__ out,
                                 float eps_norm, int ss_in, uint8_t* __restrict__ xq,
-                                float* __restrict__ xsc, int rows, int hc_dim, int mix) {
+                                float* __restrict__ xsc, int rows, int hc_dim, int mix,
+                                int truncate) {
     const int r = blockIdx.y;
     const int m = blockIdx.x;
     extern __shared__ float hc_sm[];
@@ -8546,6 +8634,8 @@ __global__ void hc_front_kernel(const float* __restrict__ x, const float* __rest
                 float acc = 0.f;
                 for (int i = 0; i < hc; ++i)
                     acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
+                // same round trip as dsv41_hc_collapse_norm_kernel (DSV41_BF16_TRUNCATE)
+                if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
                 o_r[c] = acc;
                 s2 += acc * acc;
             }

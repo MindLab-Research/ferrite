@@ -1020,6 +1020,33 @@ fn indexer_mrows() -> bool {
     })
 }
 
+/// NORM-MROWS (`DSV41_NORM_MROWS=1`, DEFAULT OFF): the verify path's block norms
+/// (attn_norm, ffn_norm, the q/kv norms of `attention_rows`, the final head
+/// norm) run through the dsv41-side multi-row entry `dsv41_rmsnorm_rows` instead
+/// of the GLM-reuse `ferrite_rmsnorm`.
+///
+/// **What it changes.** Both entries take a whole `[rows, dim]` block and give
+/// every row its own block with its own `blockDim`-sized reduction tree, so the
+/// launch count is the same either way and each row's arithmetic is the
+/// single-row program's, statement for statement
+/// (`dsv41_rmsnorm_rows_kernel`). What moves is OWNERSHIP: the verify's norms are
+/// the only thing this chain still reaches into `ferrite_kernels.cu` for, and
+/// the dsv41 entry spells the row count `rows`, like every other member of the
+/// family (`dsv41_hc_collapse_norm`, `dsv41_apply_rope_mrows`,
+/// `dsv41_quant_rows`). The arm exists so the A/B can prove the two kernels
+/// agree row for row before any caller is moved permanently; it is additive, and
+/// an `.so` without the symbol leaves every call exactly where it was.
+///
+/// Read ONCE and cached — this branch runs 4x/layer inside graph capture.
+fn norm_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_NORM_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, or the plan-named alias DSV41_GATE_MROWS=1;
 /// both DEFAULT OFF): `moe_rows` runs the bf16 gate `gemv_bf16` once per
 /// activation row. `gemv_bf16` dispatches to `ferrite_gemv_bf16_v2(...,
@@ -3276,6 +3303,32 @@ impl<'a> DevChain<'a> {
         )
     }
 
+    /// The verify path's BLOCK norm: `rows` rows of `dim`, row stride `dim`, one
+    /// shared weight row `w[dim]`, each row normalised independently.
+    ///
+    /// `DSV41_NORM_MROWS=1` (and an `.so` exporting `dsv41_rmsnorm_rows`) routes
+    /// the call through the dsv41-side multi-row entry — the same per-row
+    /// program, owned by this chain's own kernel file. With the gate off, or on a
+    /// stale `.so`, the pre-existing `ferrite_rmsnorm` call is issued unchanged,
+    /// so OFF is bit-for-bit today's verify.
+    ///
+    /// Only the `m`-row sites come through here; the decode path's single-row
+    /// `layer()` norms stay on `rmsnorm` (folding one row saves nothing).
+    fn norm_rows(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+    ) -> Result<()> {
+        if norm_mrows() && self.dev.rmsnorm_rows(x, w, out, rows as i32, dim as i32, eps)? {
+            return Ok(());
+        }
+        self.dev.rmsnorm(x, w, out, rows as i32, dim as i32, eps)
+    }
+
     /// Quantise `rows` FP32 rows of `cols` values each into the block scratch
     /// `s.xq_r` / `s.xsc_r` — the multi-row form of [`Self::quant1`].
     ///
@@ -5055,12 +5108,12 @@ impl<'a> DevChain<'a> {
             hc as i32,
             dim as i32,
         )?;
-        self.dev.rmsnorm(
+        self.norm_rows(
             self.s.x_r.ptr as *const f32,
             self.w.norm.as_ref().unwrap().as_f32(),
             self.s.xn_r.ptr as *mut f32,
-            m as i32,
-            dim as i32,
+            m,
+            dim,
             cfg.norm_eps,
         )?;
 
@@ -7722,12 +7775,12 @@ impl<'a> DevChain<'a> {
             hc as i32,
             dim as i32,
         )?;
-        self.dev.rmsnorm(
+        self.norm_rows(
             self.s.x_r.ptr as *const f32,
             ld.attn_norm.as_ref().unwrap().as_f32(),
             self.s.xn_r.ptr as *mut f32,
-            m as i32,
-            dim as i32,
+            m,
+            dim,
             cfg.norm_eps,
         )?;
         self.attention_rows(layer, m, pos_base)?;
@@ -7768,12 +7821,12 @@ impl<'a> DevChain<'a> {
             hc as i32,
             dim as i32,
         )?;
-        self.dev.rmsnorm(
+        self.norm_rows(
             self.s.x_r.ptr as *const f32,
             ld.ffn_norm.as_ref().unwrap().as_f32(),
             self.s.xn_r.ptr as *mut f32,
-            m as i32,
-            dim as i32,
+            m,
+            dim,
             cfg.norm_eps,
         )?;
         self.moe_rows(layer, ld, m)?;
@@ -7955,12 +8008,12 @@ impl<'a> DevChain<'a> {
         }
         // q norm, in place: ALL m rows in ONE launch (the T2 epilogue's own
         // fallback pair — a plain rmsnorm into `qr`). Was m launches.
-        self.dev.rmsnorm(
+        self.norm_rows(
             self.s.qr_r.ptr as *const f32,
             ld.q_norm.as_ref().unwrap().as_f32(),
             self.s.qr_r.ptr as *mut f32,
-            m as i32,
-            ql as i32,
+            m,
+            ql,
             cfg.norm_eps,
         )?;
         // wq_b: ONE launch for the whole block (see `proj_mrows`). The activation
@@ -8040,12 +8093,12 @@ impl<'a> DevChain<'a> {
                 )?;
             }
         }
-        self.dev.rmsnorm(
+        self.norm_rows(
             self.s.kv_r.ptr as *const f32,
             ld.kv_norm.as_ref().unwrap().as_f32(),
             self.s.kv_r.ptr as *mut f32,
-            m as i32,
-            hd as i32,
+            m,
+            hd,
             cfg.norm_eps,
         )?;
         self.dev.apply_rope(
@@ -9895,6 +9948,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
+                bf16_truncate(),
             )?
         } else if Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
             self.dev.hc_front_persist_mb(
@@ -9916,6 +9970,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
+                bf16_truncate(),
             )?
         } else if Self::hc_persist() && self.dev.supports_hc_persist() {
             // Stage-C persistent prototype (DSV41_HC_PERSIST=1, default OFF): the
@@ -9940,6 +9995,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
+                bf16_truncate(),
             )?
         } else {
             self.dev.hc_front(
@@ -9961,6 +10017,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
+                bf16_truncate(),
             )?
         };
         if fused {
