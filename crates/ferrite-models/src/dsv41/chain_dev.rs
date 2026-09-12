@@ -4117,7 +4117,17 @@ impl<'a> DevChain<'a> {
         let drafts = if bisect >= 2 {
             [token; DSPARK_DRAFTS]
         } else {
-            dspark.draft_forward(token, pos + 1)?;
+            // The block sits at the anchor's OWN position (row r = pos+r): the
+            // accepted layout is the 5-row verify block [d1..d5] @ pos+1..pos+5
+            // — row j fed drafts[j] lands at pos+1+j, so its argmax is the
+            // pos+2+j prediction and drafts[j+1] (proposed for pos+2+j) is its
+            // judge. This matches the shadow path, the parity oracle
+            // (dspark_parity.rs:380) and the free-first-check `drafts[0]==next`.
+            // The `pos + 1` form (a half-applied viewpoint experiment) fed row j
+            // a token belonging to pos+2+j → a one-token GAP at pos+1 in every
+            // row's context → the model's natural "fill the gap" output == next
+            // → verify_out[0]==next echo + the per-1-2-char repetitions.
+            dspark.draft_forward(token, pos)?;
             dspark.drafts()?
         };
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
@@ -4270,7 +4280,11 @@ impl<'a> DevChain<'a> {
         // Official model.py semantics: the block is [embed(t0), noise×4] at the
         // NEXT position's viewpoint (RoPE pos+1+r; the seed window row goes to
         // slot pos%win).
-        dspark.draft_forward(token, pos + 1)?;
+        // The block sits at the anchor's OWN position — the accepted 5-row
+        // layout (see the shadow path's comment): drafts[j] is the proposal for
+        // pos+1+j, verify row j (fed it at pos+1+j) judges it, so the accept
+        // chain is drafts[0] vs `next` then drafts[j] vs verify_out[j-1].
+        dspark.draft_forward(token, pos)?;
         let drafts = dspark.drafts()?;
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
 
