@@ -5785,3 +5785,28 @@ canary 从 0xdeadbeef → **0x00000000**——不是随机数据而是**写零**
 - **生成问题独立于 OOB**——SWALLOW 的 commit/emission 可能还有 bug
 
 **下一步**：调查 SWALLOW 只生成 1 token 的原因（OOB 修复后的新问题——可能与 finish_reason=length 有关）
+
+## 🎯🎯🎯 OOB 的精确来源——check_payload 抓到了！（147456 > 122880）
+
+**Panic 消息**（所有 rank）：
+```
+collective payload 147456 > slot 122880
+(a v5 AR payload must fit the staging slot)
+```
+
+**数值分析**：
+- 载荷：147,456 B = 36,864 f32
+- 槽：122,880 B = 30,720 f32 = max(hc_dim=20480, 6×dim=30720) × 4
+- **越界：24,576 B = 6,144 f32**
+
+**36,864 f32 的来源**（什么操作需要这么多？）：
+- 6 × dim = 30,720（VERIFY_ROWS × dim）— 不是
+- 7 × dim = 35,840 — 不是
+- 36,864 / 5120 = 7.2 — 非整数倍！
+- 36,864 = 576 × 64 = 2^15 + 2^13
+- **可能是 MoE 或 hc 相关的张量**（非标准的 m × dim 模式）
+
+**判定**：
+1. **OOB 修复的 check_payload 工作正常**——它抓住了真正的越界！
+2. **这就是之前静默损坏 staging 的载荷**——epoch 54 的直接来源！
+3. **下一步**：找到传递 147,456 的调用点（哪个 v5 AR 入口）并修复
