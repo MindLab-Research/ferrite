@@ -6197,7 +6197,14 @@ impl<'a> DevChain<'a> {
         // arms). Set LAST, so a round that failed above leaves this flag alone
         // and the next round re-runs the legacy path (whose `step_dev`
         // re-supplies a valid tap).
-        if seed_align() || swallow_step() {
+        // (lazy-route-debug's verdict: `lazy_verify()` was MISSING from this
+        // disjunction — with only LAZY_VERIFY set (SWALLOW/SEED_ALIGN both off),
+        // spec_primed stayed false FOREVER, so dspark_spec_lazy was never entered
+        // and every round ran the legacy 5-row path (verify 37.95 ≈ batched 38.34,
+        // text identical because it WAS the same code path). The lazy arm needs the
+        // same bootstrap: its row 0 is the swallowed main-chain step, so the FIRST
+        // round's step_dev is what supplies the very first tap.)
+        if seed_align() || swallow_step() || lazy_verify() {
             self.spec_primed = true;
         }
 
