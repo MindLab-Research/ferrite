@@ -4254,3 +4254,19 @@ self.dev.gemm_fp8_mx_rope_norm(
 **legacy 臂的 line-6 双字**（独立问题）：
 - 如果是模型行为 → 无法通过修复消除（测试判据要调整）
 - 如果是 legacy 臂的 bug → legacy-doubling-bughunt 的判决会指出
+
+## 🎯🎯🎯 lazy-verify-position-bughunt 的完整判决——D1+D2 完整机制链！
+
+**per-row 位置链逐环验证干净**（9 环全过：位置写入/位置表/ring 槽位/window 索引/rope/compressor/host 泄漏/accept/commit）——"某行 pos 设错→后行全读错"在代码层面**证伪**！
+
+**D1【严重·确定性】DIRECT 臂双计**（确认 S1 + lazy 放大）：
+- lazy 臂的 verify_blocks **按行自增**（每行一次 step_rows_sync）→ 前 ~3 行必走 DIRECT
+- **如果 m=1 拿不到池槽（D2）→ 整个请求每一行都走 DIRECT → 镜像以 2× 速率跑飞！**
+- 镜像分叉的三个后果：(1) indexer_topk 的 n_pos 错 → cl 被 min() 夹小 → 只看旧 group；(2) n_pos 超限 → cudaErrorInvalidValue → 整请求毒化；(3) inv_compress_len 默认关 → 无告警
+
+**D2【严重·静默】形状池饥饿**：
+- 池 VERIFY_GRAPH_SLOTS=2；首轮 legacy 是 m=5，batched 是 m=6，lazy 是 m=1
+- **路由在 lazy 前先访问过 batched → m=1 形状拿不到池槽 → 整个请求全程 DIRECT！**
+- 与 D1 联合：全程 DIRECT + 每块双计 = 镜像彻底跑飞 → "重置到 12"！
+
+**完整机制链**：D2（池饥饿→全程 DIRECT）→ D1（双计→镜像 2× 跑飞）→ indexer_topk 读旧 group → attention 读旧上下文 → "重置到 12" ✓
