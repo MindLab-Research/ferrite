@@ -5346,3 +5346,26 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 3. **D1 观测的干扰**：download_u32 的 D2H 与 AR 并发？（但 pos=16/22 的观测正常）
 
 **待 epoch-decrease-rootcause 的完整判决**
+
+## 🚨 第 10 次修复（真正的 epoch pad）也失败——epoch 冻结在 54！
+
+**结果**（4a20fa90 中间观察）：
+- **33,472 ar5-hang**——epoch pad 没有修复 hang！
+- v5-ledger：`pos=33 rank=7 epoch=54 arm=pre` / `pos=32 rank=4 epoch=54 delta=0`
+- **epoch 冻结在 54**——从 pos=22 到 pos=33 都是 54——**不推进！**
+
+**分析**：
+1. **epoch 不是"降级"而是"冻结"**——1497→54 是最后一次成功推进，之后 epoch 卡死
+2. **AR 无法完成轮次**——等待 peers 但 peers 也在等待——死锁
+3. **epoch pad 的 +81 轮没有生效**——或者 pad 本身也卡在同一个死锁
+
+**SWALLOW 修复的完整历史（10 次全失败）**：
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1-8 | （各种）| ❌ |
+| 9 | epoch pad（幻影——从未实施）| ❌（=第 8 次）|
+| **10** | **真正的 epoch pad（kernel+接线+gate）** | **❌ 33,472 hang——epoch 冻结在 54** |
+
+**根本问题**：不是轮次差（pad 补偿无效）——是 **epoch 推进机制本身在 SWALLOW 臂下卡死**！
+
+**下一步**：epoch-decrease-rootcause 的判决（为什么 epoch 冻结？）
