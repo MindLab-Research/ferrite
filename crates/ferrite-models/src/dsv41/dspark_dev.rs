@@ -652,7 +652,11 @@ impl<'a> DsparkDev<'a> {
         self.seed_window(s, pos)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
-        self.quant1(self.xn.ptr as *const f32, dim)?;
+        // D1 fix (audit-ffi-args): quantise ALL bs rows — the historical call
+        // passed `dim` (ONE row) while the gemm below reads `bs × dim` bytes
+        // and `bs·dim/32` scales, so rows 1..bs-1 consumed stale xq bytes and
+        // the draft q/kv were silently garbage.
+        self.quant1(self.xn.ptr as *const f32, bs * dim)?;
         self.dev.gemm_fp8_mx(
             self.xq.as_u8(),
             self.xsc.as_f32(),
@@ -688,7 +692,9 @@ impl<'a> DsparkDev<'a> {
         self.rope_queries(self.q.ptr as *mut f32, pos)?;
 
         // ---- kv = wkv(x), normed and roped like the backbone's window KV ----
-        self.quant1(self.xn.ptr as *const f32, dim)?;
+        // D1 fix (audit-ffi-args): quantise ALL bs rows — one row left rows 1..bs-1
+        // reading stale xq bytes into the gemm below.
+        self.quant1(self.xn.ptr as *const f32, bs * dim)?;
         self.dev.gemm_fp8_mx(
             self.xq.as_u8(),
             self.xsc.as_f32(),

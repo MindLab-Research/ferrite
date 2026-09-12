@@ -308,21 +308,27 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         // redundant work). Sharding them properly needs the reference's
         // per-group split, whose rows are strided rather than a contiguous
         // range, so it is a separate change.
-        // ColumnParallel over the attention heads: each rank keeps a contiguous
-        // block of heads, which at tp=8 is exactly one o_groups block — that is
-        // what keeps the head block and wo_a's row block aligned.
-        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Heads);
-        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Heads);
+        // DSpark draft: the draft runs on EVERY rank with the GLOBAL geometry
+        // (dspark_dev.rs addresses heads/groups/vocab globally and performs no
+        // collectives — every rank must produce the identical draft block), so
+        // these tensors are REPLICATED even though the backbone twins are
+        // sharded. The sharded twins caused 8x out-of-bounds reads (the
+        // gemm_fp8_mx cuda-700 in the first draft step: wq_b read 32768 rows
+        // of a 4096-row local slice, wo_a walked the local buffer with GLOBAL
+        // group numbers, wo_b read k=8192 of a 1024-col slice, markov_head
+        // indexed vocab=129280 of a 16160-row slice). The replication cost is
+        // ~540 MB/rank across the 3 draft blocks — negligible on B300, and the
+        // draft's projection FLOPs are a rounding error next to the backbone.
+        push(&mut out, format!("{p}.attn.wq_b.weight"), vec![nh * hd, ql], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wq_b.scale"), vec![nh * hd / 32, ql / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.weight"), vec![hd, dim], Shard::Replicated);
         push(&mut out, format!("{p}.attn.wkv.scale"), vec![hd / 32, dim / 32], Shard::Replicated);
         push(&mut out, format!("{p}.attn.kv_norm.weight"), vec![hd], Shard::Replicated);
-        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Heads);
-        push(&mut out, format!("{p}.attn.wo_a.weight"), vec![groups * ol, hpg * hd], Shard::Groups);
-        push(&mut out, format!("{p}.attn.wo_a.scale"), vec![groups * ol / 32, hpg * hd / 32], Shard::Groups);
-        // RowParallel: the input (groups*o_lora) is split, so each rank holds a
-        // partial sum and the chain all-reduces after it.
-        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Cols);
-        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Cols);
+        push(&mut out, format!("{p}.attn.attn_sink"), vec![nh], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_a.weight"), vec![groups * ol, hpg * hd], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_a.scale"), vec![groups * ol / 32, hpg * hd / 32], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_b.weight"), vec![dim, groups * ol], Shard::Replicated);
+        push(&mut out, format!("{p}.attn.wo_b.scale"), vec![dim / 32, groups * ol / 32], Shard::Replicated);
         let (n_routed, _) = cfg.moe_config(mtp_layer);
         push(&mut out, format!("{p}.ffn.gate.weight"), vec![n_routed, dim], Shard::Replicated);
         push(&mut out, format!("{p}.ffn.gate.bias"), vec![n_routed], Shard::Replicated);
@@ -368,8 +374,12 @@ pub fn tensor_specs(cfg: &Dsv41Config, world: usize) -> Vec<TensorSpec> {
         if s + 1 == cfg.n_mtp_layers {
             push(&mut out, format!("{p}.norm.weight"), vec![dim], Shard::Replicated);
             let mr = cfg.dspark_markov_rank;
-            push(&mut out, format!("{p}.markov_head.embed.weight"), vec![cfg.vocab_size, mr], Shard::Rows);
-            push(&mut out, format!("{p}.markov_head.head.weight"), vec![cfg.vocab_size, mr], Shard::Rows);
+            // Replicated (was Rows): the markov head indexes the GLOBAL token id
+            // against the full vocab (the draft's kernel walks v < vocab); a
+            // vocab-sliced copy read 8x past its end. mr is tiny (256), the
+            // replication is ~264 MB/rank for the pair — nothing on B300.
+            push(&mut out, format!("{p}.markov_head.embed.weight"), vec![cfg.vocab_size, mr], Shard::Replicated);
+            push(&mut out, format!("{p}.markov_head.head.weight"), vec![cfg.vocab_size, mr], Shard::Replicated);
             push(
                 &mut out,
                 format!("{p}.confidence_head.proj.weight"),
