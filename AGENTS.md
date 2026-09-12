@@ -2048,3 +2048,24 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **修复**（spec + shadow 两条路径同步）：`if drafts[0]==next { … drafts[j]==verify_out[j-1] }` → `while drafts[k] == verify_out[k] { k += 1 }`。
 
 **教训（bug 模式）**：**语义重构（"块从 t0@pos 视角改成 @pos+1 视角"）必须把整条消费者链一起改**——生产者（draft 块）、验证者（verify 行位置）、判定者（accept 比较）、提交者（commit 的行基址）四者的"位置约定"必须同一次改完并在注释里写成一个不变量。第十修只动了生产者与验证者。
+
+## 2026-09-12 Wave 2 终局：draft 块的"token/position 左移一位"（audit B1）——重复与 accept 停滞的真根因
+
+**判词**（row0-residual-audit 的代码级分析）：`dspark_spec_step` 把**两套互斥的行语义混在一次调用**：
+| 环节 | 代码 | 属于 |
+|---|---|---|
+| draft 位置实参 | `draft_forward(token, pos + 1)` | **A**（行 r = pos+1+r）|
+| verify 块 | `step_rows(&drafts)`，行 j = drafts[j] @ pos+1+j | **B**（5 行块）|
+| accept / emit / commit | 5 行块的链（drafts[0]==next + drafts[j]==verify_out[j-1]）| **B** |
+| shadow / parity oracle | `draft_forward(t, pos)` + 5 行块 | **B** |
+
+**机制**：draft 的第 r 行位置 = `pos_arg + r`（`rope_queries`→`rope_at`）。传 `pos+1` 时 `drafts[j]` 是 **pos+2+j 的提案**，而 step_rows 把它放在 **pos+1+j** 喂进去——**每行的 (token, position) 配对整个左移一位，pos+1 处留下缺口（真 token 是 `next`）**。自回归模型面对"跳掉一个 token"的序列，**输出倾向就是补上缺口位置的 token = next** → `verify_out[0]==next` ✓。accept 只在 j=0 恰好通过（`next==drafts[0]` 正是 draft 首 token 与 target 一致的时刻）→ **每步最多 2 个 token 且首两个相同 = 每 1-2 字符一个重复** ✓。
+
+**三个数字同时对上的解释**（本会话最漂亮的一次闭环）：
+- `drafts[0]==next` **60%**——**不是** draft 的 pos+1 预测精度，而是**模型重复模式的副产品**（重复发生时 pos+1 与 pos+2 的 token 相同，于是"pos+2 的提案"自然等于 next）
+- `accept 0.52` = P(drafts[0]==next)（只有 j=0 通过）
+- 文本"先帝帝创业/中道道崩"= emit 的 `[next] ++ verify_out[..k_acc]` 在 k_acc=1 时把 next 写了两遍
+
+**修复**：`draft_forward(token, pos)`（spec + shadow 两处）——**draft/verify/accept/emit/commit/oracle 六者同一布局**。
+
+**方法论教训（重要）**：我基于 `drafts[0]==next 60%` 的**实测**做了"旧链正确"的回退推理（并回退了 accept 链实验）——**方向对（旧链确实正确）但理由错**（60% 的真实成因是重复attern 而不是 draft 的位置）。**真正的定位来自 audit 的代码级语义分析**（把六个环节的"位置约定"列成表）——**"实测数据 + 代码级语义表"缺一不可**：单看数据会把 60% 误读为质量证据，单看代码会漏掉"60% 与 16% 同源"的量化闭环。**同时**：`quant1`（rows=1）与 `dsv41_rmsnorm_q`（n=m）的对比也证明——**"行偏移缺失"只在多行内核里可能出现**（rows=1 结构上不可能犯）。
