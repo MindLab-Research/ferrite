@@ -713,6 +713,12 @@ print("   P7 %s: %s" % (arm, "  ".join(lines[:-1]) + "  -> " + lines[-1]))
 PY
     done
     echo "-- P7 artifacts: $LOGDIR/<arm>.{kern.csv,p7}"
+    echo
+    echo "NOTE: --nsys is a SEPARATE pass (it pollutes the step wall). It ran no A/B arm,"
+    echo "      so the Δ judge is NOT run here — run the plain (no --nsys) pass for P0..P6/P8,"
+    echo "      and this pass for P7. Both write into $LOGDIR, which is why --judge-only"
+    echo "      can fold the two together afterwards."
+    exit 0
 fi
 
 # ===========================================================================
@@ -936,14 +942,14 @@ sigma = None
 if sa and sa2:
     sigma = abs(sa - sa2) / sa * 100.0
 print()
-print("  噪声地板: steady(T1-A)=%s ms  steady(T1-A2)=%s ms  sigma=%.3f%%%s" % (
-    M["T1-A"].get("di_steady_mean"), M["T1-A2"].get("di_steady_mean"),
-    -1 if sigma is None else sigma,
+sig_s = "NA" if sigma is None else "%.3f%%" % sigma
+print("  噪声地板: steady(T1-A)=%s ms  steady(T1-A2)=%s ms  sigma=%s%s" % (
+    M["T1-A"].get("di_steady_mean"), M["T1-A2"].get("di_steady_mean"), sig_s,
     "  (>= %.2f%% -> 噪声地板过高, skip everything)" % SIGMA_FLOOR if sigma is not None and sigma >= SIGMA_FLOOR else ""))
 
 # ---- DECISION (§5.3) --------------------------------------------------------
 print()
-print("  决策 (§5.3): Δ% = (steady_ctrl - steady_arm)/steady_ctrl * 100;  Δ% > max(1σ, %.1f%%) -> 入栈" % MIN_GAIN_PCT)
+print("  决策 (§5.3): Δ%% = (steady_ctrl - steady_arm)/steady_ctrl * 100;  Δ%% > max(1σ, %.1f%%) -> 入栈" % MIN_GAIN_PCT)
 if sigma is None:
     print("    sigma unmeasured (T1-A or T1-A2 missing) — cannot decide.")
     rc = max(rc, 2)
@@ -968,7 +974,7 @@ else:
         else:
             verdict = "入栈 (gate 保持 ON)"
         redline = "redline-FAIL" if (a in p1_fail or a in p2_fail or a in p3_fail or a in p6_fail) else "redline-ok"
-        print("    %-6s vs %-6s: %s -> %s ms  Δ%+ = %+.3f%%  (%s)  [%s]" % (
+        print("    %-6s vs %-6s: %s -> %s ms  Δ%%+ = %+.3f%%  (%s)  [%s]" % (
             a, ctrl, "%.2f" % sc, "%.2f" % sm, delta, verdict, redline))
     # C0 is its own (entry) reading vs A, shown for the §5.4 note.
     if rows["T1-C0"]["steady"] and rows["T1-A"]["steady"]:

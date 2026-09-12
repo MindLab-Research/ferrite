@@ -9092,6 +9092,56 @@ __global__ void p2p_ar_pubred_v5_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// D2 EPOCH PAD (`DSV41_SWALLOW_EPOCH_PAD=1`) — the SWALLOW arm's round ledger.
+//
+// The swallowed arm drops `step_dev`, so its per-step v5 footprint is 84 rounds
+// against the legacy/aligned arm's 165: the missing 81 are `step_dev`'s 40
+// layers x (attention + MoE all-reduce) plus the head's argmax exchange (one
+// round for the whole verify block). AR v5 has NO host-side rendezvous, so a
+// rank that lands on the other arm issues a different NUMBER of rounds than its
+// peers in the same step and the peers' polls then wait for a stamp 81 rounds
+// away -- the permanent epoch rift (`[ar5-hang]`, the SWALLOW ar5-hang series).
+//
+// Every earlier fix tried to make the ranks AGREE on one arm. This kernel makes
+// every arm COST THE SAME instead: it advances the epoch by `pad` EMPTY rounds
+// and stamps THIS rank's slot in every peer's ready row with the final value
+// `e + pad`, so the pad is indistinguishable from `pad` real rounds to every
+// waiter -- a rank that picks the other arm can no longer open a rift, because
+// the divergence is not prevented, it is made invisible on the epoch.
+//
+// Why ONE jump and not `pad` replays: v5's wait is an ABSOLUTE, MONOTONE stamp
+// compare -- `(int)(cur - (e + 1)) >= 0` in `ar5_wait_round` -- so a peer
+// waiting on any round `e_p + 1 <= e + pad` is satisfied by the jump.
+//
+// Why nothing else is touched:
+//   * no staging write: a padded round has NO payload and NO reader (every real
+//     round writes its own column before the reduce reads it), so the ring's
+//     parity slots are left exactly as the next real store expects them;
+//   * `pad` is ODD at every production geometry (`2 * n_layers + 1`), so the
+//     parity the next real round uses is the parity it would have used anyway;
+//   * the A4 broadcast word at `epoch + 1` (which `ar5_wait_round`'s single-poll
+//     arm polls instead of the peer stamps) advances with the SAME value, or
+//     that arm would wait forever for a value that never comes.
+//
+// Block 0 only, `blockDim.x >= world` (thread r stamps peer r's row) -- the same
+// shape requirement the pubred stamp arm has (`ferrite_ar_v5_block_threads`).
+__global__ void dsv41_v5_epoch_pad_kernel(
+    unsigned* const* __restrict__ ready_tbl,  // [world] peers' ready rows
+    unsigned* __restrict__ epoch,             // this rank's epoch + A4 word
+    int world, int my_rank, unsigned pad) {
+    if (blockIdx.x != 0) return;
+    const unsigned e = *epoch;
+    if (threadIdx.x < (unsigned)world)
+        atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + pad);
+    __threadfence_system();   // stamps visible BEFORE the epoch advances
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        *(volatile unsigned*)(epoch + 1) = e + pad;   // A4 broadcast word
+        *epoch = e + pad;                             // only here, after the stamps
+    }
+}
+
 // Block shape for every v5 AR store/pubred launch. The reduce is LATENCY-bound
 // (one float4 x `world` ranks per thread, no cross-thread reduction), so many
 // small blocks beat few fat ones: 64 x ceil(n4/64) = 64 x 20 at n=5120 covers
@@ -9166,6 +9216,23 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out,
         world, my_rank, n, stride, single_poll, probe);
+    return cudaGetLastError();
+}
+
+// D2 epoch pad (see `dsv41_v5_epoch_pad_kernel` above). ONE launch per swallowed
+// step, moving the epoch to where the legacy/aligned arm's 81 extra rounds would
+// have left it, so both arms pay the same round count. No payload, no staging
+// write, no poll (the pad IS the stamp its peers were waiting for). The Rust
+// side treats an ABSENT symbol as "no pad" (an .so predating this kernel).
+extern "C" cudaError_t dsv41_v5_epoch_pad(
+    unsigned* const* ready_tbl, unsigned* epoch,
+    int world, int my_rank, unsigned pad, cudaStream_t s) {
+    if (ready_tbl == nullptr || epoch == nullptr || world <= 0 || my_rank < 0 ||
+        my_rank >= world || pad == 0u)
+        return cudaErrorInvalidValue;
+    // `blockDim.x >= world` so `threadIdx.x < world` covers every peer row.
+    dsv41_v5_epoch_pad_kernel<<<1, ferrite_ar_v5_block_threads(world), 0, s>>>(
+        ready_tbl, epoch, world, my_rank, pad);
     return cudaGetLastError();
 }
 
