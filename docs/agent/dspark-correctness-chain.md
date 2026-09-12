@@ -5879,3 +5879,37 @@ pos=322: arm=swallowed k_emit=1 delta=86 canary=0xdeadbeef
 1. 无观测开销的吞吐测量（关 V5_LEDGER）
 2. SH_PAIR M=6 验证（-4.9~7.9ms）
 3. 400 冲刺！
+
+## SWALLOW 解锁后的 400 冲刺路径（最终版）
+
+**SWALLOW 已解锁！** 纯净基线测试中（6648a81b）。下一步：
+
+### 400 冲刺的优化序列
+| 步骤 | 优化 | 预期步时 | 预期 tok/s @ accept 5 | 状态 |
+|---|---|---|---|---|
+| S0 | SWALLOW 基线（纯净） | ~30ms | ~200 | 🔄 测试中 |
+| S1 | + SH_PAIR M=6 | ~24.6ms | ~244 | arm 已验证 |
+| S2 | + mrows 族 | ~19.5ms | ~308 | kernel 已有 |
+| S3 | + hc / B6 | ~16.9ms | ~355 | 设计完成 |
+| S4 | + tcgen05 | ~14.5ms | **414** | TMA 对齐待修 |
+
+### SH_PAIR M=6 在 SWALLOW 下的测试命令（基线完成后）
+```bash
+# 与 SWALLOW 基线相同 + SH_PAIR_M=1（template<M=6> 自动路由）
+DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1 DSV41_SH_PAIR_M=1
+# + 其他 base gates（无 V5_LEDGER——纯净吞吐！）
+```
+
+### 判定框架
+- **SWALLOW 基线 vs lazy 91.1**：batched 更好 ⟺ mean_k > B/c - 1
+- **SH_PAIR M=6 的增量**：预期 -5~8ms（batched 最大单项）
+- **400 可达性**：需要全部优化 ~97% 兑现（414 tok/s）——现实 60% → ~278
+
+### 与 lazy 的战略对比
+| 场景 | lazy | SWALLOW (batched) |
+|---|---|---|
+| 计数（accept 5）| 91.1 | ~200（基线）→ 414（全优化）|
+| 出师表（accept 1.2）| 91.1 | 可能更慢（阈值 3.55 > 1.2）|
+| 对话（accept 0.96）| 91.1 | 更慢 |
+
+**混合路由**：lazy（低 accept）+ SWALLOW（高 accept）——最优策略？
