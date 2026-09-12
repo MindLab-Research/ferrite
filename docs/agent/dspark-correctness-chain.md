@@ -3553,3 +3553,30 @@ self.lin_rope_norm(
 - **"重置"更像是 KV cache 或 hidden state 在特定点被破坏**——模型"从早期状态继续"
 
 **待 r2-rope-position-analysis 的判决**：lin_rope_norm 的位置源到底是什么？
+
+## R2 的 lin_rope_norm 位置源分析（亲自验证）
+
+**发现**（chain_dev.rs:4567-4586）：
+```rust
+self.dev.gemm_fp8_mx_rope_norm(
+    ..., 
+    self.cos.as_f32(), self.sin.as_f32(),   // rope 表
+    self.s.pos_ctr.ptr as *const c_int,      // ← rope_base = pos_ctr！
+    1,   // rope_mul
+    0,   // rope_off = 0！
+    0,   // rope_step
+    false, rope_rd, rope_hd,
+)
+```
+
+**kernel 位置计算**：`t = *pos_ctr * 1 + 0 + 0 = *pos_ctr`——从 pos_ctr 设备读取。
+
+**lazy 路径的时序**：set_pos_ctr(pos+i) → attention_rows(m=1) → lin_rope_norm 读 *pos_ctr = pos+i ✓ 应该正确！
+
+**但损坏确实发生**——可能的残余嫌疑：
+1. **VERIFY_GRAPH 的交互**：图捕获/回放与 pos_ctr 读取的时序？
+2. **lin2（另一个融合 kernel）**：wq_a+wkv 融合——输出布局差异？
+3. **损坏位置模式**：计数在 ~61，出师表在 ~60-70（两者都在位置 60-70 附近！可能是指定位置的表边界或缓冲区边界）
+4. **cos/sin 表的索引**：lin_rope_norm 的表索引方式与 apply_rope_mrows 不同？
+
+**待 subagent 判决**（r2-rope-position-analysis + r2-corruption-rootcause 分析中）
