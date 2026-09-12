@@ -21,7 +21,8 @@
 | 阶段 | 交付 | 位置 | 状态 |
 |---|---|---|---|
 | **Phase 0** | 真实量化 parity 探针 | `kernels/cuda/tests_tcgen05_mxf8f6f4_1x.cu`（**1565** 行） | **host 侧数值闭环 ✓；GPU parity 待跑** |
-| **Phase 1** | gateup swapAB kernel **骨架** | `kernels/cuda/dsv41_experts_mxf4.cu` 尾部（第 2686 行起，**713** 行） | 编译验证 ✓（101 regs / 0 spill / 46080B static smem），**GPU parity 待跑** |
+| **Phase 1** | gateup swapAB kernel **骨架（A 臂 mxf8f6f4）** | `kernels/cuda/dsv41_experts_mxf4.cu` 尾部（第 2686 行起，**713** 行） | 编译验证 ✓（101 regs / 0 spill / 46080B static smem），**GPU parity 待跑** |
+| **Phase 1（默认臂）** | gateup swapAB kernel **骨架（B 臂 mxf4）** | 同文件尾部、`namespace tc5::mxf4`（第 3400 行起，**~640** 行） | 编译验证 ✓（**92 regs / 0 spill / 40960B static smem**，kRing=8），**GPU parity 待跑** |
 | **Phase 1 默认 MMA** | 🔴 **`kind::mxf4`**（两侧 packed，E2M1×E2M1，`scale_vec::2X`） | 计划书 §1e；骨架注释内（~30 行可切） | **B 臂 GPU 已验 EXACT**；A 臂 `mxf8f6f4`/e4m3 降为备选 |
 
 > 🔴 **2026-09-12 修订**：Phase 1 默认 = `kind::mxf4`（§1e 定案）。理由：**唯一已在 GPU 数值验证过**的
@@ -42,6 +43,7 @@
 1. **PACKED SF 是被迫的，不是选择**：PERBLK 需 4 列/块 ⇒ 160 块 = 640 列 > 512 TMEM 列，装不下。⇒ PACKED 挂 = 整个 Phase 1 布局假设挂。SF 寻址：`SFA col = sfa_col + 4*(b>>2), a_sf_id = b&3`；`SFB col = sfb_col + (b>>2), b_sf_id = b&3`（契约 `dim % 128 == 0`）。
 2. **mxf8f6f4 的 fp4 操作数必须 UNPACKED（1 元素/字节）**，checkpoint 是 2 元素/字节 ⇒ 每个 ring slot 需**两块 buffer**（TMA 落的 raw 打包区 + MMA 读的 unpack 区）+ 一次 1:2 展开。**这是本 kernel 最大 smem 开销，也是"TMA 直写操作数"不可能的原因。** ⚠️ 这是 **A 臂（备选）的固有成本** —— §1e 已把默认切到 B 臂，B 臂**无此开销**。
    - **🔴 默认演化（§1e）**：`kind::mxf4`（两侧打包）⇒ 去掉**展开**段（permute 段仍在，见注）、操作数 smem **per-slot 13312→4352 B（3.06x）**、用**唯一已在 GPU 验证过**的 `tests_tcgen05_mxf4.cu` 那条 MMA。⚠️ 精度上它是**相对参考**的 e4m3→e2m1 降级（**不是"零损失"**；零增量风险只相对**现生产** e2m1 基线，见 §1e.1/§1e.3）；2X 粒度需配对 checkpoint 的 per-32 scale（现有 kernel 已在做）。**切换约 30 行。** ⚠️ smem 减半**不会**翻 occupancy（TMEM 256 列/CTA 才是绑定点）；真收益是 kRing 3→7-8。
+   - **✅ 已落地（§1f）**：B 臂骨架已写进同一 TU（`namespace tc5::mxf4`，gated `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`），kRing=8 / 92 regs / 0 spill / 40960 B static smem。它比原估的"30 行"大，因为**没有 raw buffer 后 permute 从"smem→smem 展开"变成"16 B chunk 直落 canonical unit 的 TMA 目的地址"**（每 stage 258 条 bulk copy），这一处是结构差异而非常量替换。
 3. **静态 smem 装得下**（kPackK=64/kRing=3 时 45 KiB）⇒ 无需 `cudaFuncSetAttribute`，**图捕获安全**。更深 ring 才需动态 smem + **init 期一次性** attribute（**捕获内禁用**）。
 4. **occupancy 是硬约束**：grid=(30, slots)，每 CTA 256/512 TMEM 列 ⇒ ≤2 CTA/SM。**slots=1 只有 30 CTA（≈15 SM）⇒ 隔离微基准必须跑 slots=8（240 CTA）**，否则测的是延迟不是带宽。若 slots=8 仍离地板远 ⇒ **K-split**（更多 CTA 覆盖同权重，需确定性升序 reduce）。
 
@@ -49,11 +51,20 @@
 
 **骨架编译验证命令（无需 GPU）**：
 ```bash
+# A 臂（备选，mxf8f6f4 / 1X / e4m3）
 nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
      -DDSV41_TCGEN05_GATEUP_SKELETON=1 -c kernels/cuda/dsv41_experts_mxf4.cu -o /tmp/t5.o
 # ptxas -v 必须：0 spill + tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X
+
+# B 臂（默认，mxf4 / 2X / e2m1）
+nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
+     -DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1 -c kernels/cuda/dsv41_experts_mxf4.cu -o /tmp/t5m4.o -Xptxas -v
+# 已验：92 regs / 0 spill / 40960 B static smem + tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X
+# 4 种宏组合（无宏 / A / B / A+B）全 0 error，两种臂可同时 -D（tc5::mxf4 是嵌套命名空间）。
 ```
-入口 `tc5::expert_tcgen05_gateup_kernel` / launcher `tc5::tc5_launch_gateup` / FFI `dsv41_expert_tcgen05_gate_up`（env `DSV41_EXPERT_TCGEN05` 门禁，**函数内 static const 只读一次**，默认 OFF）。`build.sh` **不定义该宏** ⇒ 不进 `.so`。
+A 臂入口 `tc5::expert_tcgen05_gateup_kernel` / launcher `tc5::tc5_launch_gateup` / FFI `dsv41_expert_tcgen05_gate_up`（env `DSV41_EXPERT_TCGEN05`）。
+B 臂入口 `tc5::mxf4::expert_tcgen05_gateup_mxf4_kernel` / launcher `tc5::mxf4::m4_launch_gateup` / FFI `dsv41_expert_tcgen05_gate_up_mxf4`（env `DSV41_EXPERT_TCGEN05_MXF4`）。
+两者门禁均为**函数内 static const 只读一次**，默认 OFF。`build.sh` **不定义这两个宏** ⇒ 都不进 `.so`。
 
 ### 1.3 期望管理（**必须提前对齐，否则会重演 swapAB 的浪费**）
 来自 `dsv41-session-final-report.md` §9.2 的 perf-model 定案：

@@ -215,6 +215,45 @@ Phase 0 harness 把激活量化换成 e2m1（1 行）即可出 B 的 parity；**
 ⇒ Phase 0 的**第一件事**从"A 臂 GPU parity"改判为"**确认 B 臂的 `tests_tcgen05_mxf4.cu` 在当前
 checkpoint 尺度规则下仍全绿**"（工作量更小，且是唯一已有 GPU 证据的路径）。
 
+## 1f. mxf4 臂骨架已落地（2026-09-12；GPU parity 待跑）
+
+落点：**同一文件同一 TU**，`kernels/cuda/dsv41_experts_mxf4.cu` 尾部（mxf8f6f4 块之后），
+`namespace tc5::mxf4`，整块由 `#ifdef DSV41_TCGEN05_GATEUP_MXF4_SKELETON` 包住 —— `build.sh` 不定义该宏，
+**不进 .so**。为 `namespace tc5::mxf4` 嵌套而非另起命名空间：两臂常量同名，嵌套保证 `-D` 两个宏同时开
+也能编译（已验，0 error）。
+
+- 入口：`tc5::mxf4::expert_tcgen05_gateup_mxf4_kernel`（M=128 / N=8 / **kKStep=64** / kPackK=64 /
+  **kRing=8** / kNStep=1 / 128 线程）；launcher `tc5::mxf4::m4_launch_gateup` +
+  `extern "C" dsv41_expert_tcgen05_gate_up_mxf4`（env `DSV41_EXPERT_TCGEN05_MXF4` 门禁，
+  函数内 `static const` 读一次，默认 OFF）。
+- **本地已闭环（无 GPU）**：sm_103a 编译过；ptxas `-v` = **92 regs / 0 spill / 40960 B static smem**；
+  PTX 含 `tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X`、`cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes`、
+  `mbarrier.arrive.expect_tx`、`tcgen05.st.sync.aligned.32x32b.x1.b32`。
+  4 种宏组合（无宏 / A / B / A+B）全 0 error；默认构建不受影响。
+- 编译验证命令：`nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 \
+  -DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1 -c kernels/cuda/dsv41_experts_mxf4.cu -o /tmp/t5m4.o -Xptxas -v`
+- **两臂的差异被压缩到 4 处**（其余结构逐行同形，serve A/B 因此只隔离"staging 深度"一个变量）：
+  1. 操作数格式与 smem：PACKED 2/byte、**无 raw buffer**、无 1:2 展开；slot 13312 → **4352 B**
+     （a_op 4096 + b_op 256）；kRing 3 → 8（40 KiB / 48 KiB 窗口）。
+  2. MMA + idesc：`kind::mxf4...scale_vec::2X`，`a_format = b_format = 1`（MXF4Format::E2M1）。
+     N=8/sf_id=0 的 idesc = **0x08820480**（A 臂的对偶断言是 0x08820280，只差两个 format 字段）。
+  3. K 原子 32 → 64；2X 下 32-bit SF 字由**两个 atom 共享**（bytes[0,1]=偶 atom, bytes[2,3]=奇 atom），
+     idesc 的 SFA_ID/SFB_ID 从 `b & 3` 变为 `2 * (a & 1)`。
+  4. 激活指针语义：`[dim]` e4m3 → `[dim/2]` packed e2m1。
+- **不变的（重点）**：SF 列密度与 TMEM 预算完全一致（SFA 每 K=128 用 4 列、SFB 每 pair 1 列 ⇒
+  8+160+40 = 208 ≤ 256），所以 **occupancy 不变（仍 ≤2 CTA/SM）**；ring/mbarrier/epilogue/launcher
+  契约同形。⇒ 3.06x 的收益**只**兑现在 ring 深度（in-flight 8 KiB → 28 KiB/CTA，240 CTA 达 6.7 MB）。
+- **permute 段的真实形态（订正本文档早前的措辞）**：mxf4 臂**没有** raw staging buffer，
+  "permute" 由 `m4_off(row, kb) = 16*((row & 7) + 8*kb + 16*(row >> 3))` 把每个 **16 字节**
+  raw chunk 直接 TMA 到它的 canonical unit —— 因为 packed fp4 的 raw chunk 与 canonical unit 都是
+  16 B，**两者同尺寸**，所以布局变换退化成"换目的地址"，这是 4352 B/slot 的来源。
+  代价：每 stage 的 TMA issue 数从 129（A 臂，32 B/行）涨到 **258（16 B/块）**；`[TODO-3]` 的 2D
+  tensor 形式（8 行 × 16 B 的 box → 一条指令填一个 canonical core matrix，32 条/stage）是解药。
+  ⚠️ 16 B 对齐因此成为**硬契约**：`wp + row*(dim/2) + k0/2 + 16*kb` 与 `act + k0/2 + 16*kb`
+  都必须 16 B 对齐（`dim % 128 == 0` ⇒ `dim/2 % 64 == 0`）。
+- **2X 配对是正确性契约**：一个 32-bit SF 字跨 4 个 block = 128 K 元素 ⇒ launcher 硬拒 `dim % 128 != 0`。
+- 骨架内仍留 `TODO-3`（2D tensor TMA）与 `K-SPLIT`（occupancy 是绑定点，见 §1c #4）。
+
 ## 2. Phase 1（1-2 天）gateup kernel
 
 落点：`kernels/cuda/dsv41_experts_mxf4.cu` 新增 swapAB gateup kernel（保留旧 kernel）。

@@ -79,3 +79,4 @@ persistent 单独到不了 5ms——**真实工作地板 ≈ 5.3ms**（expert_ge
 - **Stage B**：不做字面跨层搬运（会读错 s.h）；~~不给 sparse_attn 加 `DSV41_ATTN_SPLIT`（实测更差）~~ → **2026-09-11 修正**：当年更差是**丢了 3 深预取**，不是 key-split 无效——split 版已补上预取并成为默认（`DSV41_SPARSE_SPLIT`，默认 C=4；`DSV41_ATTN_PF_SPLIT` 显式值仍优先，见 §1）；不共用 `s.o` 的双重生命周期。
 - **Stage C**：不做整模型单核；不把跨 rank 同步塞进单核；不拆 split=8（改部分和顺序）；不捕获含 `cudaMalloc`/host 交互的核。
 - **Stage D**：不做 MTP（用户明令禁止）；不重试 k-split/uint4/T=4（均阴性）；不"变快=少算"（必逐位/text 验证）。
+- **禁令边界（待用户裁定，勿自行启用）**：用户原文是「严禁mtp…严禁投机」。① MTP = 模型自带 draft 头（DSV4.1 的 DSpark，`mtp.*` 命名空间，config `n_mtp_layers=3` / `dspark_block_size=5`）—— 明确禁止。② 可验证投机（n-gram / prompt-lookup）候选来自 prompt/历史拷贝、用同一次 forward 的 argmax 验证，输出与逐 token greedy **逐位一致**、不引入 draft 头、不改变数值域；但文献术语里它就是「投机解码」。故：字面禁令 → 一并禁止；禁令实指 MTP（目标行文为"无mtp"）→ 行为不变，可议。**默认按字面执行，启用前须用户确认。**
