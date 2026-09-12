@@ -3890,6 +3890,44 @@ static inline int dsv41_mrows_warps_for(int n) {
     return dsv41_gemv_warps_for(n);
 }
 
+// MROWS-ACT-CPASYNC (DSV41_MROWS_ACT_CPASYNC, 2026-09-12): stage the
+// `gemm_fp8_mrows_kernel<M>` activation rows with `dsv41_cp_async16` instead of
+// the scalar byte loop. Design: docs/agent/l4-mgrid-first-step-design.md §4
+// (design step "1b"). A/B arm, DEFAULT OFF -- unset is byte-identical to today.
+//
+// THE ASYMMETRY IT CLOSES. The mrows kernel staged its two kinds of row by two
+// different rules. The WEIGHT row has gone through `dsv41_cp_async16` since the
+// verify-family-fusion finding -- 16 B per lane per issue. The M ACTIVATION rows
+// kept the scalar loop: one BYTE per lane per issue, i.e. 32 B per warp-issue
+// against the weight side's 512 B. That is the very "SIXTEEN times the
+// instructions" the kernel's own weight-side comment records (:5260-5265), never
+// closed on the activation side -- `DSV41_GEMV_ACT_CPASYNC` (P4) wired the m=1
+// gemv only. Both staging loops sit in the SAME kernel.
+//
+// INSTRUCTION ACCOUNT (production shape wkv: 128 threads, k = 5120, M = 6):
+//   scalar    : 6*5120/128 = 240 issues/thread x 2 instr = 480 warp-instr (exposed)
+//   cp.async16: 6*5120/16/128 = 15 issues/thread        =  15 warp-instr
+//
+// NUMERICS -- staging does not touch a value. Same bytes, same slot
+// (`s_a[r*k + i]`), same global address as the loop it replaces (that loop was a
+// pure copy: `s_a[...] = ar[i]`, no arithmetic); the consume path
+// (`s_lut[s_a[r*k+j]] * s_as[r*nb_k + (j>>5)]`), the K walk and the `shfl_xor`
+// tree are untouched => bit-identical output.
+//
+// ALIGNMENT. `dsv41_cp_async16` needs a 16B-aligned global+smem pair. The
+// launcher rejects `k & 31`, so `a + r*k` is 16B-aligned given a 16B-aligned `a`
+// (the same assumption the weight side and the gemv P4 path already make); `s_a`
+// sits `nwarps*k + 1024 + M*(k/8)` bytes off the dynamic-smem base, all three
+// terms 16B multiples at production shapes (k = 5120 -> nb_k*4 = 640). The pair
+// is checked at RUNTIME (`dsv41_f4_ok`) rather than assumed, so an exotic shape
+// (e.g. k = 96, where M*(k/8) is not a 16B multiple) keeps the scalar loop
+// instead of trapping err 716.
+static const bool g_mrows_act_cpasync = [] {
+    const char* e = getenv("DSV41_MROWS_ACT_CPASYNC");
+    if (e == nullptr) return false;
+    return atoi(e) != 0;
+}();
+
 // P1 staged gate (DSV41_GEMV_A32_STAGED), default OFF = the P1 direct form.
 //
 // P1 (a32 dead-slot elimination) merges the two mode-4 activation passes into
@@ -5241,13 +5279,44 @@ gemm_fp8_mrows_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a
     // they are staged once per block instead of re-read by each of the `nwarps`
     // warps (the mode-3-vs-4 argument the gemv carries). Row r's bytes and scale
     // row land exactly where the m=1 kernel would have staged its single row.
+    // 1b (DSV41_MROWS_ACT_CPASYNC): the activation rows are staged by the SAME
+    // rule the weight row below already uses -- `dsv41_cp_async16`, 16 B per lane
+    // per issue. The scalar loop it replaces moved 32 B per warp-issue where the
+    // weight side moves 512 B, i.e. "SIXTEEN times the instructions" for
+    // identically the same bytes. Same slot (`s_a[r*k + i]`), same source bytes,
+    // pure copy -> bit-identical (the consume path is untouched). See
+    // `g_mrows_act_cpasync` above for the instruction account and the err-716
+    // alignment guard.
+    //
+    // SYNC. The activation stage is BLOCK-wide and is read by every active warp's
+    // consume loop (lane j reads `s_a[r*k + j]`, bytes staged by other warps), so
+    // the group is retired by `wait_all` BELOW -- before the `__syncthreads()`
+    // that publishes `s_a`. A wait placed after that barrier (where the
+    // warp-private WEIGHT row waits) would be a data race on this slot. The
+    // weight group is issued after this wait, so it still stays in flight across
+    // the barrier for the active warps' own wait.
+    const bool a16 = g_mrows_act_cpasync && dsv41_f4_ok(a) && dsv41_f4_ok(s_a);
     #pragma unroll
     for (int r = 0; r < M; ++r) {
         const uint8_t* __restrict__ ar = a + (size_t)r * (size_t)k;
         const float* __restrict__ asr = a_scale + (size_t)r * (size_t)nb_k;
         for (int i = threadIdx.x; i < nb_k; i += blockDim.x) s_as[(size_t)r * nb_k + i] = asr[i];
-        for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[(size_t)r * (size_t)k + i] = ar[i];
+        if (a16) {
+            uint8_t* __restrict__ sar = s_a + (size_t)r * (size_t)k;
+            const int n16a = k >> 4;
+            for (int i = threadIdx.x; i < n16a; i += blockDim.x)
+                dsv41_cp_async16(sar + (i << 4), ar + (i << 4));
+            // k % 16 tail: unreachable for every launcher (all reject `k & 31`),
+            // kept so the row is staged by exactly the rule the weight row uses.
+            for (int i = (n16a << 4) + threadIdx.x; i < k; i += blockDim.x) sar[i] = ar[i];
+        } else {
+            for (int i = threadIdx.x; i < k; i += blockDim.x) s_a[(size_t)r * (size_t)k + i] = ar[i];
+        }
     }
+    // Retire the activation group here (see SYNC above). `a16` is uniform across
+    // the block (gate + pointer alignment), so no thread carries a pending group
+    // into the weight staging or past its own exit.
+    if (a16) dsv41_cp_wait_all();
     // This warp's output row. `row` is UNIFORM within a warp, so the whole warp
     // takes the same side of every `active` branch and both barriers below are
     // reached by every thread of the block (the strided-walk shape the m=1
