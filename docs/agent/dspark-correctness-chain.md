@@ -5388,3 +5388,25 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 | **2** | **4 个新读点（含主嫌疑 :5009）** | **191ms 快速失败——仍 1 misaligned** |
 
 **下一步**：compute-sanitizer（唯一能枚举未知写者的手段）——`compute-sanitizer --tool memcheck --launch-timeout 120` + `CUDA_LAUNCH_BLOCKING=1`
+
+## 11-B 动态 pad 能否解冻 epoch 54 的分析
+
+**epoch 冻结的机制**（第 10 次测试）：
+- pos=22 步后：epoch 从 1497 → 54（某些 rank 被重置或读到不同位置）
+- 后续步：epoch 停在 54——AR 无法完成（等待 peers 的 stamp）
+
+**11-B 动态 pad 的机制**：
+- 每步开始（host 侧）：读所有 rank 的 epoch → 计算 max → 落后者 pad 到 max
+- **关键**：host 侧同步（D2H 读 + host 计算 + kernel launch）——**绕过 AR 的设备侧 spin**！
+
+**能否解冻**：
+| 情景 | epoch 状态 | 动态 pad 的效果 |
+|---|---|---|
+| A：某些 rank 54 某些 1497 | 分歧 | pad 到 1497 → **统一！AR 可以前进！** ✓ |
+| B：所有 rank 都 54 | 统一但低位 | pad 无差额 → epoch 54 继续 → AR 应该能工作（都在 54）|
+| C：epoch 位置被覆盖（canary 触发）| 数据损坏 | pad 也无法恢复——需要修覆盖源 |
+
+**预测**：如果情景 A（分歧），动态 pad 能解冻！如果情景 C（损坏），需要先修覆盖源（11.0 的 canary 会检测到）。
+
+**11.0 + 11-B 的联合测试**（实施完成后）：
+- SWALLOW + 动态 pad + 加固观测 → 看 canary 是否触发 + epoch 是否正常推进
