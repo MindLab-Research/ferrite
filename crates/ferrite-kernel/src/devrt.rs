@@ -499,6 +499,16 @@ pub struct DevRuntime {
     /// the kernel `.so` — model crates resolve their own symbols in it
     kernel_handle: *mut c_void,
     debug_sync: bool,
+    /// True while THIS handle's stream is inside a stream capture
+    /// (`capture_begin` .. `capture_end`). Read by the model layer through
+    /// [`DevRuntime::capturing`] to keep the device-side v5 epoch/flag protocol
+    /// inside RECORDED graph nodes only: the epoch counter is shared with the
+    /// MoE all-reduce, so an advance from a non-capturing host path desynchronises
+    /// the ranks' epochs and every later poll waits for a stamp that is never
+    /// published (the ar5 hang). Set only by `capture_begin`/`capture_end`, so a
+    /// plain (direct-launch) execution reads false — which is exactly the DRY
+    /// pass's state.
+    capturing: std::cell::Cell<bool>,
     _cudart_handle: *mut c_void,
     _libs: (*mut c_void, *mut c_void, *mut c_void),
 }
@@ -776,6 +786,7 @@ impl DevRuntime {
                 join3_ev,
                 handle,
                 kernel_handle: h_k,
+                capturing: std::cell::Cell::new(false),
                 debug_sync: std::env::var("FERRITE_DEBUG_SYNC")
                     .or_else(|_| std::env::var("DSV41_DEBUG_SYNC"))
                     .map(|v| v != "0")
@@ -1398,11 +1409,21 @@ impl DevRuntime {
             .stream_begin_capture
             .ok_or_else(|| FerriteError::Config("cudaStreamBeginCapture missing".into()))?;
         let rc = unsafe { f(self.stream, 2 /* cudaStreamCaptureModeRelaxed */) };
-        self.kerr(rc, "cudaStreamBeginCapture")
+        self.kerr(rc, "cudaStreamBeginCapture")?;
+        // Only a SUCCESSFUL begin leaves the stream capturing; the `?` above
+        // returns before this line when it failed, so the flag never lies.
+        self.capturing.set(true);
+        Ok(())
     }
 
     /// End the capture and return the graph handle.
     pub fn capture_end(&self) -> Result<*mut c_void> {
+        // Clear the flag FIRST. `cudaStreamEndCapture` ends the capture whether or
+        // not it reports success (an invalidated recording still comes back to the
+        // caller), and a flag left set by an error would make every later host path
+        // believe it is inside a recording — which is precisely the state that must
+        // never be misreported (see the field's doc).
+        self.capturing.set(false);
         let f = self
             .cudart
             .stream_end_capture
@@ -1411,6 +1432,14 @@ impl DevRuntime {
         let rc = unsafe { f(self.stream, &mut g) };
         self.kerr(rc, "cudaStreamEndCapture")?;
         Ok(g)
+    }
+
+    /// True while THIS handle's stream is inside a stream capture started by
+    /// [`Self::capture_begin`]. The v5 epoch/stamp protocol (the MoE all-reduce
+    /// and the batched vocabulary-sliced argmax) may only be RECORDED, never
+    /// executed from a host path, so both read this before their first launch.
+    pub fn capturing(&self) -> bool {
+        self.capturing.get()
     }
 
     /// Instantiate a captured graph into an executable.

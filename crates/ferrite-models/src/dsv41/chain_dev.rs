@@ -2782,6 +2782,19 @@ pub struct DevChain<'a> {
     /// Diagnostics: captures and replays since the last `reset`.
     verify_captures: u32,
     verify_replays: u32,
+    /// The verify head's geometry as the LAST [`Self::step_rows_inner`] resolved
+    /// it (`None` = the full-vocabulary rows), for the vrow0 probe.
+    ///
+    /// The probe ([`Self::vrow0_verify`]) must read `logits_r` at the SAME pitch
+    /// the head wrote, and it cannot re-derive it: `verify_head_geom` now also
+    /// depends on whether the verify is being RECORDED (the v5 epoch rule — the
+    /// batched argmax exchange may only run inside a capture), so a
+    /// re-derivation at probe time, i.e. AFTER `capture_end`, would answer `None`
+    /// for a graph that ran the SLICED head and the probe would read a
+    /// `seg`-pitch row as a full-vocabulary one. Recorded per `step_rows_inner`
+    /// call, which is also the call the probe follows; the replay path leaves it
+    /// at the capture's value, which is what the replayed graph wrote.
+    verify_geom: std::cell::Cell<Option<(usize, usize)>>,
 }
 
 fn fb(n: usize) -> usize {
@@ -3193,6 +3206,7 @@ impl<'a> DevChain<'a> {
             verify_dry_done: [false; VERIFY_GRAPH_SLOTS],
             verify_captures: 0,
             verify_replays: 0,
+            verify_geom: std::cell::Cell::new(None),
         })
     }
 
@@ -3277,16 +3291,19 @@ impl<'a> DevChain<'a> {
     /// that buffer — the rollback restores the ring and the compressors, not the
     /// m-row scratch), reduced to `(kernel argmax, host argmax, top-k)`.
     ///
-    /// The row's width and index base come from the SAME [`Self::verify_head_geom`]
-    /// the head GEMV and the argmax used, so the probe reads exactly what they
-    /// wrote: under `DSV41_VERIFY_HEAD_SLICED` row 0 is this rank's `seg`-wide
-    /// slice (the rows packed `seg` apart in `logits_r`) and the top-k's indices
-    /// are offset by the rank's slice base — the mirror of the probe's eager half
-    /// below, which does the same for the single-row `s.logits`. Getting this
-    /// wrong is a silent misread (the pitch is not in the type), which is why the
-    /// decision lives in ONE function.
+    /// The row's width and index base come from the geometry the SAME
+    /// `step_rows_inner` call resolved for the head GEMV and the argmax — read
+    /// back from [`Self::verify_geom`] rather than re-derived, because
+    /// `verify_head_geom` is capture-dependent now (the v5 epoch rule) and this
+    /// probe runs outside the capture: under `DSV41_VERIFY_HEAD_SLICED` +
+    /// `DSV41_VERIFY_GRAPH=1` row 0 is this rank's `seg`-wide slice (the rows
+    /// packed `seg` apart in `logits_r`) and the top-k's indices are offset by
+    /// the rank's slice base — the mirror of the probe's eager half below, which
+    /// does the same for the single-row `s.logits`. Getting this wrong is a
+    /// silent misread (the pitch is not in the type), which is why the decision
+    /// lives in ONE function and its RESULT is recorded here.
     fn vrow0_verify(&self, argmax: u32) -> Result<(u32, u32, Vec<(u32, f32)>)> {
-        let (n, base) = match self.verify_head_geom() {
+        let (n, base) = match self.verify_geom.get() {
             Some((seg, base)) => (seg, base as u32),
             None => (self.cfg.vocab_size, 0),
         };
@@ -5163,6 +5180,18 @@ impl<'a> DevChain<'a> {
                 // SHAPE: the second shape's DRY happens while the first shape's
                 // graph already sits in its slot (harmless — `step_rows_inner`
                 // never touches the pool).
+                //
+                // Rendezvous before it, exactly like the replay and capture arms
+                // below: the DRY is an execution whose device-side protocol runs
+                // while a peer may still be busy with its own previous step, and
+                // this arm was the one bracket of the three without a barrier — so
+                // its timing against the peers was unconstrained. The two peers'
+                // arms already prove the shape of the fix (a barrier BEFORE the
+                // work, and a second one after a capture so no rank starts
+                // publishing while a peer is still recording).
+                if let Some(c) = self.comm.as_ref() {
+                    c.host_barrier();
+                }
                 self.step_rows_inner(toks, m, pos_base)?;
                 self.verify_dry_done[idx] = true;
                 self.verify_shapes[idx] = m;
@@ -5518,6 +5547,26 @@ impl<'a> DevChain<'a> {
     /// [`verify_head_mrows_note`], which says out loud which arm ran.
     fn verify_head_geom(&self) -> Option<(usize, usize)> {
         let cfg = self.cfg;
+        // THE v5 EPOCH RULE — the reason this arm is capture-only.
+        //
+        // The batched argmax exchange this geometry arms (`dsv41_argmax_sliced_rows`)
+        // is ONE round of the v5 epoch sequence, and that counter is SHARED with
+        // the MoE all-reduce (`c.epoch_dev()`). Such a round may only be RECORDED
+        // (see [`Device::argmax_sliced_rows`], which refuses outside a capture for
+        // exactly this reason), so a verify that is NOT being recorded — the DRY
+        // warm-up run of a graph slot, or the plain eager path with
+        // `DSV41_VERIFY_GRAPH=0` — must not take the sliced arm at all: it takes
+        // the full-vocabulary head at the vocab pitch and the ordinary per-row
+        // `argmax`, which never touches the epoch. That is the caller's
+        // "full-vocabulary per-row fallback", reached through the ONE geometry
+        // decision (so the head, the argmax and the probe below cannot disagree).
+        //
+        // Deliberately NOT part of [`VerifyHeadGeom`]/`note_once`: nothing is
+        // misconfigured here — the arm simply does not exist outside a recording —
+        // and a note naming it would fire once per process for a transient state.
+        if !self.dev.capturing() {
+            return None;
+        }
         let comm = self.comm.as_ref();
         let geom = VerifyHeadGeom {
             env: verify_head_sliced(),
@@ -5680,6 +5729,10 @@ impl<'a> DevChain<'a> {
         // head, the argmax below and the probe all index `logits_r` through it.
         let head = self.w.head.as_ref().unwrap();
         let geom = self.verify_head_geom();
+        // Record the arm for the vrow0 probe: it runs OUTSIDE the capture, where
+        // `verify_head_geom` would answer `None` even for the sliced head this
+        // call is about to write, and the probe outlives `capture_end`.
+        self.verify_geom.set(geom);
         let lg_stride = geom.map(|(stride, _)| stride).unwrap_or(cfg.vocab_size);
         // The fold is the UNSLICED arm's alternative only: it changes the K order
         // (a numerical change), so it is never combined with the slice.
