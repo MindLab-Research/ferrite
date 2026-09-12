@@ -121,9 +121,12 @@ n=1664 k=1280 → 6.05µs（0.99x 打平）。
    （148 SM 上 0.7/SM），每 warp 串行搬 80KB；`nobody` 变体说明 7.4µs 全花在 staging 上
    （≈1.15 TB/s，离 HBM 地板 6x）。
 3. **唯一可加的自由并行维是 K**（MMA 的 M=16 钉死，N 只有 1 列有效）。k_split 把 warp 数
-   提到 n/16 × ks，原子归约合并（launcher 先 `cudaMemsetAsync(out,0)`，分区 0 附带 bias，
-   保证 bias 只加一次）。k=5120 的合法 ks：{2,4,5,8,10,16}（5120=2^10·5，需 k%(32·ks)==0，
-   launcher 从宏值按 2 折半降到可整除为止）。
+   提到 n/16 × ks，跨分片归约合并（初版：launcher `cudaMemsetAsync(out,0)` + `atomicAdd`，
+   **非确定性**；当前：各分片写独立 `partial[kp*n+r]` slot，每 16-row tile 一个 `ctr` ticket，
+   最后一个到达的分片按 **kp 升序**求和 + 加 bias + 写 `out`，无 memset、无 graph 节点、
+   逐位可复现 —— 见 `gemm_fp8_swapab_kernel` 的 LAST-BLOCK REDUCTION 注释，scratch
+   （partial/ctr）由 caller 提供）。k=5120 的合法 ks：{2,4,5,8,10,16}（5120=2^10·5，
+   需 k%(32·ks)==0，launcher 从宏值按 2 折半降到可整除为止）。
 4. **`stage()` 里每个 16B chunk 一次 `c / nchunk` 整数除法**在白耗（该 kernel 的环流已完全
    主导）：改成 full-stage 用移位+掩码（chunk/row 是编译期 2 的幂），尾部残 stage 保留除法。
    单此一项 9.4 → 6.4。
@@ -133,16 +136,19 @@ kernel 3.35µs + memset 0.5µs ≈ 3.85µs/call → gemv 246×3.85µs = 0.95ms�
 → 步 ~4.5ms ≈ **222 tok/s**。但**隔离口径含 3.0µs 的 `cudaMemsetAsync` 独立 launch 开销**
 （已实测），小形状（n≤576）因固定开销反而慢于 SIMT，故默认仍 OFF，须上机做 serve A/B。
 **下一步的确定性杠杆**（按性价比）：
-- **消掉 memset 节点**：改「最后块归约」——各块写独立 partial slot，`atomicAdd` 计数，
-  最后到达的块（old == gridDim-1）读全部 slot 求和写出（先例：sparse-merge 选举、hc_dots_late）。
-  省一个 graph 节点（−0.5µs/call ≈ −0.12ms/步）。**需要 caller 提供 scratch**（ABI 改动）。
+- ~~**消掉 memset 节点**：改「最后块归约」~~ **已实施**（各分片写独立 partial slot，tile ticket
+  选举最后到达者按 kp 升序求和写出；launcher 不再 memset，scratch 由 caller 提供，
+  ABI 已改）。省一个 graph 节点（−0.5µs/call ≈ −0.12ms/步）。
 - **TMA / `cp.async.bulk` 替 cp.async**：per-SM 的 outstanding 深度是当前 1.3 TB/s 的硬墙，
   TMA 队列深得多，是逼近内存地板的唯一路径。代价：tensormap 的 host 侧 plumbing。
 - **N 维填真 token**（batched decode / MTP）：现在 7/8 的 N 是浪费，填满即再省 ~1 倍。
 
-**验收**：`kernels/cuda/tests_dsv41_gemm_fp8.cu` 新增 `run_swapab_case`（4 形状，含
-n%32==16 的部分 scale 块、k=544 的部分 ring stage）——4/4 通过；ks=1 与参考**逐位一致**，
-ks>1 因 atomicAdd 次序 rel ~5e-8（容差内）。
+**验收**：`kernels/cuda/tests_dsv41_gemm_fp8.cu` 的 `run_swapab_case` —— 5 形状：4 个小形状
+（含 n%32==16 的部分 scale 块、k=544 的部分 ring stage）+ **生产形状 n=1664 k=5120（ks=8，
+唯一真正走「最后块归约」的用例）**。因 launcher 的 n≥1664 形状分派，小形状现为 rc=2
+（declined，打印为 skip 而非 fail）。生产形状 rc=0、rel 2.35e-07，且**同 buffer 连跑两次
+逐位一致（bit_diff=0/1664）** —— 一次覆盖归约正确性、`ctr` 自重置（=graph replay 安全）
+与确定性。ks=1 仍与参考逐位一致。
 
 ### swapAB parity 判据（落点：单测 + serve A/B）— 2026-09-12
 

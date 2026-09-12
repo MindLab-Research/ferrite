@@ -223,6 +223,30 @@ struct Scratch {
     /// hazard `wo_q`/`wo_qsc` document for the wo pair).
     sh_q: DevBuf,   // [inter] fp8 bytes
     sh_qsc: DevBuf, // [inter/32 + 8] f32
+    // ---- swapAB K-split last-block reduction scratch ----
+    /// `[kSwapabKSplit][n]` f32 partial slots for `dsv41_gemm_fp8_swapab`'s ks > 1
+    /// path: partition `kp` writes its 16-row tile's sums at `partial[kp*n + r]`
+    /// and the LAST partition of the tile (per-tile ticket, `swapab_ctr`) reduces
+    /// them into `out`. This is what replaced the launcher's `cudaMemsetAsync(out)`
+    /// + `atomicAdd(&out[r])` pair — one fewer graph node per call and a FIXED
+    /// reduction order (bit-deterministic) instead of an atomic race.
+    ///
+    /// Sized by the largest `n` ANY swapAB call site can pass (`swapab_n`), times
+    /// the compile-time max K split (8 = `DSV41_SWAPAB_KSPLIT` in
+    /// dsv41_kernels.cu). One buffer serves every call site: the calls are
+    /// serialised on the main stream, and PDL's `cudaGridDependencySynchronize()`
+    /// keeps a successor grid's slot writes behind this grid's end.
+    swapab_part: DevBuf,
+    /// One u32 arrival ticket per 16-row tile (`n/16` entries) for the same
+    /// reduction. Must be ZERO before the first swapAB call; the kernel resets
+    /// each entry after the elected block consumes it, so it is never re-zeroed
+    /// per step (doing so would race the kernel's own reset — the `wo_bar`
+    /// discipline).
+    swapab_ctr: DevBuf,
+    /// The `n` bound `swapab_part`/`swapab_ctr` were sized for. A call with a
+    /// larger `n` is not routed to swapAB (the guard in `gemm_fp8_mx_or_swap`),
+    /// so the scratch can never be overrun by a config the allocation missed.
+    swapab_n: usize,
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -852,6 +876,20 @@ impl<'a> DevChain<'a> {
         let ehd = cfg.engram_head_dim.max(1);
         let bf16_cap = dim.max(ql).max(nh * hd).max(cfg.vocab_size);
         let bf16 = dev.alloc(bf16_cap * 2)?;
+        // swapAB last-block-reduction scratch bound: the largest `n` ANY
+        // `gemm_fp8_mx_or_swap` call site can pass. That is exactly the set `xq`
+        // is sized from (attention out = nh*hd, the wo_a output, `dim`, `inter`),
+        // plus the engram kv row `(hc+1)*dim` and the indexer's q. The partial
+        // buffer is `8 * swapab_n` floats (8 = the compile-time max
+        // `DSV41_SWAPAB_KSPLIT`), the ticket array one u32 per 16-row tile.
+        let swapab_n = (hc + 1)
+            .saturating_mul(dim)
+            .max(nh * hd)
+            .max(cfg.index_n_heads.max(1) * cfg.index_head_dim.max(1))
+            .max(cfg.n_groups_o_lora())
+            .max(inter)
+            .max(dim)
+            .max(16);
 
         // The model's max_position_embeddings (1M) sizes NOTHING at runtime:
         // index_k alone would be 256-512 MiB per layer (~16.5 GiB over 43
@@ -965,6 +1003,15 @@ impl<'a> DevChain<'a> {
             // phase 1 writes it before phase 2 ever reads it, so no zero-fill.
             sh_q: dev.alloc(inter.max(8))?,
             sh_qsc: dev.alloc(fb(inter.max(8) / 32 + 8))?,
+            // swapAB K-split scratch: sized by the largest `n` any swapAB call
+            // site passes (the same list `xq` is sized from, plus the engram kv
+            // row and the indexer's q), times the max K split 8. The ticket array
+            // needs one u32 per 16-row tile. A call whose `n` exceeds `swapab_n`
+            // is not routed here (see `gemm_fp8_mx_or_swap`), so the bound is
+            // enforced rather than assumed.
+            swapab_n,
+            swapab_part: dev.alloc(fb(8 * swapab_n))?,
+            swapab_ctr: dev.alloc(4 * (swapab_n / 16 + 1))?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does
@@ -975,6 +1022,11 @@ impl<'a> DevChain<'a> {
         // is the ONLY initialisation it ever needs -- do not re-zero it per step
         // (that would race the kernel's own reset).
         dev.zero(&s.wo_bar)?;
+        // swapAB last-block reduction: the per-tile tickets must start at zero
+        // (the kernel resets each entry after the elected block consumes it, so a
+        // captured graph replays clean). Like `wo_bar`, this is a ONE-TIME
+        // initialisation -- re-zeroing per step would race the kernel's reset.
+        dev.zero(&s.swapab_ctr)?;
 
         // RoPE tables covering the whole context.
         let table = max_pos;
@@ -1162,6 +1214,11 @@ impl<'a> DevChain<'a> {
     /// (n % 16 == 0, k % 32 == 0), the tensor-core form runs; otherwise the SIMT
     /// `gemm_fp8_mx` runs exactly as before. The decline is per-call and free, so
     /// no shape bookkeeping is needed on this side.
+    ///
+    /// The `n <= swapab_n` guard is NOT part of the kernel's own shape test: it is
+    /// this side's promise that `swapab_part`/`swapab_ctr` are big enough for the
+    /// K-split reduction. A larger `n` (a config the allocation did not size for)
+    /// takes the SIMT path instead of overrunning the scratch.
     #[allow(clippy::too_many_arguments)]
     fn gemm_fp8_mx_or_swap(
         &self,
@@ -1174,10 +1231,19 @@ impl<'a> DevChain<'a> {
         n: i32,
         k: i32,
     ) -> Result<()> {
-        if Self::swapab() {
-            let ok = self
-                .dev
-                .gemm_fp8_swapab(a, a_scale, w, w_scale, bias, out, n, k)?;
+        if Self::swapab() && n > 0 && n as usize <= self.s.swapab_n {
+            let ok = self.dev.gemm_fp8_swapab(
+                a,
+                a_scale,
+                w,
+                w_scale,
+                bias,
+                out,
+                n,
+                k,
+                self.s.swapab_part.ptr as *mut f32,
+                self.s.swapab_ctr.ptr as *mut u32,
+            )?;
             if ok {
                 return Ok(());
             }

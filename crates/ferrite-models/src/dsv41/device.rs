@@ -145,6 +145,15 @@ struct Kernels {
     /// `(a*sa)*(w*sb)` and reduces by shuffles). Same scheme as the m>1 dense MMA
     /// path; parity is judged by text/fingerprint, not bit equality.
     ///
+    /// `partial` / `ctr` are the LAST-BLOCK REDUCTION scratch for the ks > 1
+    /// (K-split) path: `partial` is `ks * n` f32 slots (one per (K partition,
+    /// output row)) and `ctr` is one u32 arrival ticket per 16-row tile
+    /// (`n / 16`). The kernel writes `out` itself through the elected block, so it
+    /// no longer memsets `out` and no longer needs `out` pre-zeroed; the caller
+    /// only has to ensure `ctr` is ZERO before the first call (the kernel
+    /// self-resets it, so a captured graph replays clean). Both may be null when
+    /// the shape reduces to ks == 1 (that path is a plain store).
+    ///
     /// Optional: a stale `.so` has no entry and the caller keeps the SIMT gemv.
     /// Returns 2 when the shape cannot take it (n % 16 != 0 or k % 32 != 0; never
     /// 1 -- cudaErrorInvalidValue, the round-42 collision).
@@ -152,7 +161,7 @@ struct Kernels {
     gemm_fp8_swapab: Option<
         unsafe extern "C" fn(
             *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32, c_int, c_int,
-            CuStream,
+            *mut f32, *mut c_uint, CuStream,
         ) -> c_int,
     >,
     /// chain-pair-grid-sync: the wo_a -> wo_b pair as ONE grid-sync launch
@@ -1766,6 +1775,10 @@ impl Device {
     /// `Ok(true)` = it ran; `Ok(false)` = the shape declined (n % 16 != 0 or
     /// k % 32 != 0) or the .so has no `dsv41_gemm_fp8_swapab`, in which case the
     /// caller keeps `gemm_fp8_mx`. NOT bit-identical to the SIMT gemv.
+    ///
+    /// `partial` / `ctr` are the K-split last-block-reduction scratch (see the
+    /// kernel table above): `ks * n` f32 + one u32 per 16-row tile, `ctr` zeroed
+    /// once by the caller. Only touched when the shape actually splits K.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_fp8_swapab(
         &self,
@@ -1777,11 +1790,15 @@ impl Device {
         out: *mut f32,
         n: i32,
         k: i32,
+        partial: *mut f32,
+        ctr: *mut c_uint,
     ) -> Result<bool> {
         let Some(f) = self.kernels.gemm_fp8_swapab else {
             return Ok(false);
         };
-        let rc = unsafe { f(a, a_scale, w, w_scale, bias, out, n, k, self.stream) };
+        let rc = unsafe {
+            f(a, a_scale, w, w_scale, bias, out, n, k, partial, ctr, self.stream)
+        };
         // 2 is the graceful shape decline (1 collides with cudaErrorInvalidValue).
         if rc == 2 {
             return Ok(false);

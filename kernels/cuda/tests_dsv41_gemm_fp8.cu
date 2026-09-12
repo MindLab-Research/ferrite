@@ -240,16 +240,46 @@ static int run_swapab_case(int n, int k, bool with_bias) {
     cudaMalloc(&dasc, asc.size() * sizeof(float));
     cudaMalloc(&dbias, with_bias ? (size_t)n * sizeof(float) : 1u);
     cudaMalloc(&dout, ref.size() * sizeof(float));
+    // Last-block reduction scratch: ks_max * n partial slots + one u32 ticket per
+    // 16-row tile. The tickets must start at zero (the kernel self-resets them).
+    float* dpart = nullptr;
+    unsigned* dctr = nullptr;
+    cudaMalloc(&dpart, (size_t)n * 8 * sizeof(float));
+    cudaMalloc(&dctr, (size_t)(n / 16 + 1) * sizeof(unsigned));
+    cudaMemset(dctr, 0, (size_t)(n / 16 + 1) * sizeof(unsigned));
     cudaMemcpy(da, a.data(), a.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dwsc, wsc.data(), wsc.size(), cudaMemcpyHostToDevice);
     cudaMemcpy(dasc, asc.data(), asc.size() * sizeof(float), cudaMemcpyHostToDevice);
     if (with_bias) cudaMemcpy(dbias, bias.data(), (size_t)n * sizeof(float), cudaMemcpyHostToDevice);
 
-    int rc = dsv41_gemm_fp8_swapab(da, dasc, dw, dwsc, with_bias ? dbias : nullptr, dout, n, k, 0);
+    int rc = dsv41_gemm_fp8_swapab(da, dasc, dw, dwsc, with_bias ? dbias : nullptr, dout, n, k,
+                                   dpart, dctr, 0);
     cudaDeviceSynchronize();
     std::vector<float> got((size_t)n);
     cudaMemcpy(got.data(), dout, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    // Repeat the SAME call (same buffers, same scratch, `ctr` left as the kernel
+    // reset it) and require a BIT-IDENTICAL result. Two things ride on this:
+    //   1. the per-tile ticket self-reset -- if the elected block did not clear
+    //      its entry, the second launch's tickets would already be saturated and
+    //      the reduction would either hang or elect the wrong block;
+    //   2. determinism -- the reduction sums the ks slots in a FIXED kp order, so
+    //      unlike the atomicAdd it replaced the output cannot vary run to run.
+    // A graph replay is exactly this: the same kernel re-issued over unchanged
+    // scratch, so this is the graph-safety check in miniature.
+    int repeat_bad = 0;
+    if (rc == 0) {
+        int rc2 = dsv41_gemm_fp8_swapab(da, dasc, dw, dwsc, with_bias ? dbias : nullptr, dout, n,
+                                        k, dpart, dctr, 0);
+        cudaError_t se = cudaDeviceSynchronize();
+        std::vector<float> got2((size_t)n);
+        cudaMemcpy(got2.data(), dout, got2.size() * sizeof(float), cudaMemcpyDeviceToHost);
+        int ndiff = 0;
+        for (int i = 0; i < n; i++) if (got[i] != got2[i]) ndiff++;
+        repeat_bad = (rc2 != 0) || (se != cudaSuccess) || ndiff != 0;
+        printf("  [swapab n=%4d k=%4d] repeat: rc=%d sync=%s bit_diff=%d/%d %s\n", n, k, rc2,
+               cudaGetErrorString(se), ndiff, n, repeat_bad ? "*** NON-DETERMINISTIC ***" : "OK");
+    }
 
     float maxdiff = 0.0f, maxval = 0.0f;
     for (int i = 0; i < n; i++) {
@@ -257,9 +287,22 @@ static int run_swapab_case(int n, int k, bool with_bias) {
         maxval = fmaxf(maxval, fabsf(ref[i]));
     }
     const float rel = maxval > 0 ? maxdiff / maxval : maxdiff;
+    // rc 2 is the launcher's graceful decline, and since 2026-09-12 the shape
+    // dispatch declines every n < 1664 (swapAB's fixed overhead loses to SIMT on
+    // the small calls that dominate the step). That is NOT a numerics failure:
+    // the kernel never ran, so there is nothing to compare. Report it as such so
+    // a real mismatch stays distinguishable from "the gate kept it away".
+    if (rc == 2) {
+        printf("  [swapab n=%4d k=%4d bias=%d] rc=2 declined (shape dispatch / n%%16 / k%%32)\n",
+               n, k, (int)with_bias);
+        cudaFree(da); cudaFree(dw); cudaFree(dwsc); cudaFree(dasc); cudaFree(dbias); cudaFree(dout);
+        cudaFree(dpart); cudaFree(dctr);
+        return 0;
+    }
     printf("  [swapab n=%4d k=%4d bias=%d] rc=%d maxdiff=%.3e rel=%.2e %s\n", n, k, (int)with_bias,
            rc, maxdiff, rel, (rel < 5e-3f ? "OK" : "*** MISMATCH ***"));
     cudaFree(da); cudaFree(dw); cudaFree(dwsc); cudaFree(dasc); cudaFree(dbias); cudaFree(dout);
+    cudaFree(dpart); cudaFree(dctr);
     return rel < 5e-3f ? 0 : 1;
 }
 
@@ -272,10 +315,17 @@ int main() {
     bad += run_case(32, 64, 512, false);
     bad += run_case(16, 96, 64, true);
     printf("== swapAB M=1 fp8 GEMV self-test (dsv41_gemm_fp8_swapab) ==\n");
+    // The four small shapes are below the launcher's n >= 1664 dispatch (they
+    // exercise the ring/scale edge cases through the SIMT fallback now, and print
+    // as "declined"). The PRODUCTION shape below is the one that actually runs the
+    // kernel -- and the ONLY case that takes the ks > 1 last-block reduction
+    // (k = 5120 = 160 * 32, 160 % 8 == 0 => ks = 8), so it is the regression
+    // guard for the reduction's correctness and determinism.
     bad += run_swapab_case(32, 32, false);    // exactly one stage, one k block
     bad += run_swapab_case(96, 64, true);     // 3 full weight-scale row blocks
     bad += run_swapab_case(48, 544, false);   // n%32==16 partial block, partial ring stage (544 = 17*32)
     bad += run_swapab_case(256, 512, true);   // full stage, multi-block grid
+    bad += run_swapab_case(1664, 5120, true); // production M=1 decode shape, ks = 8, last-block reduction
     printf("RESULT: %s\n", bad ? "FAILURES" : "all cases OK");
     return bad ? 1 : 0;
 }

@@ -4598,8 +4598,9 @@ extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, con
     // publish -- a warp that dropped out of the grid would leave its tile's
     // ticket short of ks and hang the grid on the elected block's arrival. The
     // grid is exact at kSwapabWarps == 1 (total blocks); this guards a future
-    // WARPS > 1 where total % WARPS != 0.
-    if ((n >> 4) * ks % kSwapabWarps) return 2;
+    // WARPS > 1 where total % WARPS != 0. (Explicit parens: `%` binds tighter
+    // than `*`, so the unparenthesised form would compute (n>>4) * (ks % WARPS).)
+    if (((n >> 4) * ks) % kSwapabWarps) return 2;
     // The reduction needs the caller's scratch. Absent it, decline so the caller
     // runs the SIMT gemv rather than faulting on a null slot store.
     if (ks > 1 && (partial == nullptr || ctr == nullptr)) return 2;

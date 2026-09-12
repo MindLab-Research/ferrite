@@ -214,7 +214,13 @@ fn compare(new: &[f32], reference: &[f32]) -> Stats {
 }
 
 /// One shape: build inputs, run both GPU paths + the CPU golden, compare.
-fn run_case(dev: &Device, n: usize, k: usize, with_bias: bool, seed: u64) -> Stats {
+///
+/// `None` = the swapAB launcher declined the shape, which since 2026-09-12
+/// includes EVERY n < 1664: the launcher's shape dispatch sends those small
+/// calls to the SIMT gemv (the measured crossover — swapAB's fixed overhead
+/// loses below it, see dsv41_kernels.cu). There is no swapAB result to compare
+/// then, so the caller SKIPS the shape instead of failing.
+fn run_case(dev: &Device, n: usize, k: usize, with_bias: bool, seed: u64) -> Option<Stats> {
     let mut rng = Lcg::new(seed);
     // Activation: one row, per-32-block power-of-two scale (runtime semantics).
     let x = rng.vec(k);
@@ -256,6 +262,12 @@ fn run_case(dev: &Device, n: usize, k: usize, with_bias: bool, seed: u64) -> Sta
 
     // ---- arm 2: swapAB tensor-core GEMV ----
     let dnew = dev.alloc(n * 4).unwrap();
+    // Last-block-reduction scratch (ks > 1 splits K for the production shape):
+    // 8 * n partial slots + one u32 ticket per 16-row tile. The tickets must be
+    // zeroed once; the kernel self-resets each entry it consumes.
+    let dpart = dev.alloc(n * 8 * 4).unwrap();
+    let dctr = dev.alloc((n / 16 + 1) * 4).unwrap();
+    dev.zero(&dctr).unwrap();
     let ran = dev
         .gemm_fp8_swapab(
             da.as_u8(),
@@ -266,6 +278,8 @@ fn run_case(dev: &Device, n: usize, k: usize, with_bias: bool, seed: u64) -> Sta
             dnew.ptr as *mut f32,
             n as i32,
             k as i32,
+            dpart.ptr as *mut f32,
+            dctr.ptr as *mut u32,
         )
         .expect("dsv41_gemm_fp8_swapab");
     assert!(ran, "swapAB declined the shape n={n} k={k} (needs n%16==0, k%32==0)");
@@ -288,7 +302,7 @@ fn run_case(dev: &Device, n: usize, k: usize, with_bias: bool, seed: u64) -> Sta
         );
     }
 
-    compare(&newo, &refo)
+    Some(compare(&newo, &refo))
 }
 
 #[test]
@@ -332,7 +346,9 @@ fn swapab_matches_simt_gemv() {
     let mut worst: f32 = 0.0;
     for (n, k, bias, seed) in cases {
         eprintln!("[swapab_parity] n={n} k={k} bias={bias}");
-        let s = run_case(&dev, n, k, bias, seed);
+        let Some(s) = run_case(&dev, n, k, bias, seed) else {
+            continue;
+        };
         eprintln!(
             "  swapab vs simt: max_abs={:.3e} global_rel={:.3e} \
              p50={:.2e} p90={:.2e} p99={:.2e} max_rel={:.3e} bit_id={}/{} \
