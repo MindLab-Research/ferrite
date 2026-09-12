@@ -126,6 +126,103 @@ impl DevTensor {
     }
 }
 
+/// `DSV41_ALIGN_AUDIT=1`: the load-time 16B audit switch (default OFF). Read ONCE
+/// (house rule for a non-hot-path gate). See
+/// docs/agent/tcgen05-tma-bulk-align-design.md §6 V2.
+pub fn align_audit() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ALIGN_AUDIT").map(|v| v == "1").unwrap_or(false))
+}
+
+/// The six expert planes in the loader's own order — the names a misalignment
+/// report has to use to be actionable at the call site.
+const ALIGN_PLANES: [&str; 6] = ["w1", "w1.scale", "w3", "w3.scale", "w2", "w2.scale"];
+
+/// `DSV41_ALIGN_AUDIT=1` (`load_expert_pool`): print the 16B-grid position of
+/// every operand a tcgen05 / `cp.async.bulk` arm will derive from this layer's
+/// pool, and report every violation it finds.
+///
+/// One line per plane at expert 0 (the layout is per-expert uniform, so e0 IS the
+/// layout), each carrying the four quantities that can move a pointer off the
+/// grid:
+///   * `base&15`     — `pool + poff[k]`
+///   * `worst_base&15` — the WORST expert (`pool + e*block + poff[k]`); a `block`
+///                     that is not a 16B multiple slides every later expert
+///   * `stride%16`   — `block`
+///   * `pitch%16`    — the plane's row pitch, plus `row1&15` = `base + pitch`,
+///                     i.e. where row 1 of the plane actually starts. A pitch
+///                     that is not a 16B multiple (w2's e8m0 plane is 10 B/row at
+///                     the production shape) leaves row 0 aligned and EVERY
+///                     following row misaligned — the one failure the base and
+///                     stride checks alone cannot see.
+///
+/// This runs at LOAD time, so a violation costs a second instead of an
+/// unexplained `err 716` 191 ms into the first prefill, detached at the next
+/// sync. It is arm-agnostic: it does not depend on any single arm's launcher
+/// gate, which is the whole point (§6 V2 is described as the highest-value
+/// change of the design).
+fn audit_expert_pool(
+    layer: usize,
+    rank: usize,
+    n_routed: usize,
+    block: usize,
+    poff: &[usize; 6],
+    plans: &[TensorPlan],
+    base: *mut u8,
+    ilv: bool,
+) {
+    if plans.len() < 6 {
+        return; // nothing to audit; a malformed plan list fails elsewhere
+    }
+    let base_usize = base as usize;
+    let mut bad: Vec<String> = Vec::new();
+    for (k, name) in ALIGN_PLANES.iter().enumerate() {
+        let p = &plans[k]; // expert 0's plan for this plane
+        let esz = p.esz();
+        let pitch = p.local.get(1..).map(|d| d.iter().product::<usize>()).unwrap_or(1) * esz;
+        // interleaved: w3 shares w1's doubled region, so the kernel reads it at
+        // offset 0 — report what the kernel will use, not the plan's own slot
+        let off = if ilv && k == 2 { 0 } else { poff[k] };
+        let a = (base_usize + off) & 0xF;
+        // scan every expert: a `block` that is not a 16B multiple slides all the
+        // experts after e0, so e0 alone would miss it
+        let worst =
+            (0..n_routed).map(|e| (base_usize + e * block + off) & 0xF).max().unwrap_or(0);
+        let pitch_rem = pitch % 16;
+        let row1 = (base_usize + off + pitch) & 0xF;
+        eprintln!(
+            "[align] L{layer} r{rank} e0 {name:<9} base&15={a} worst_base&15={worst} \
+             stride%16={} pitch={pitch} pitch%16={pitch_rem} row1&15={row1}",
+            block % 16
+        );
+        if a != 0 || worst != 0 {
+            bad.push(format!(
+                "L{layer} {name}: base off the 16B grid (e0={a} B, worst={worst} B; \
+                 pool base&15={}, poff[{k}]={off}, block%16={})",
+                base_usize & 0xF,
+                block % 16
+            ));
+        }
+        if pitch_rem != 0 {
+            bad.push(format!(
+                "L{layer} {name}: row pitch {pitch} B is not a multiple of 16 (row 1 starts \
+                 {row1} B off the grid) — every row past the first of this plane is \
+                 unaddressable by the bulk/uint4 paths"
+            ));
+        }
+    }
+    if bad.is_empty() {
+        eprintln!("[align] L{layer} r{rank}: pool geometry OK (block={block}, 6 planes, 16B)");
+    } else {
+        eprintln!(
+            "[align] L{layer} r{rank}: {} 16B violation(s) in the expert pool — the tcgen05/bulk \
+             operands CANNOT be addressed: {}",
+            bad.len(),
+            bad.join(" | ")
+        );
+    }
+}
+
 /// One expert's on-device weights. The tensors are VIEWS into a single pooled
 /// allocation per layer — one cudaMalloc per layer instead of six per expert
 /// (40 layers x 384 experts x 6 = ~92k individual allocations was exhausting the
@@ -614,7 +711,7 @@ impl<'a> Loader<'a> {
         &mut self,
         prefix: &str,
         n_routed: usize,
-        _layer: usize,
+        layer: usize,
         world: usize,
         rank: usize,
         ilv: bool,
@@ -757,6 +854,19 @@ impl<'a> Loader<'a> {
         }
         if let Some(t) = tmp {
             self.dev.free(&t);
+        }
+        // ---- DSV41_ALIGN_AUDIT=1: the load-time 16B audit --------------------
+        // Every operand a tcgen05/bulk arm consumes is
+        //     pool + e*block + poff[k] + row*pitch [+ j*16]
+        // so the ONLY things that can move it off the 16B grid are the pool base,
+        // `block`, `poff[k]` and `pitch`. Audit all four HERE, per layer, at load
+        // time (seconds) — instead of 191 ms into the first prefill, where the
+        // err 716 surfaces detached at the next sync and names no buffer.
+        // Default OFF; this is the §6 V2 hook of
+        // docs/agent/tcgen05-tma-bulk-align-design.md, and it is arm-agnostic
+        // (it does not depend on any single arm's launcher gate).
+        if align_audit() {
+            audit_expert_pool(layer, rank, n_routed, block, &poff, &plans, base, ilv);
         }
         let mut experts = Vec::with_capacity(n_routed);
         for e in 0..n_routed {

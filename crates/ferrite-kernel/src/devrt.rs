@@ -1115,6 +1115,34 @@ impl DevRuntime {
             "cudaMalloc must return 16-byte aligned pointers: the tcgen05 expert \
              operands are addressed in uint4s"
         );
+        // ★ ENFORCED, not debug-only. The check above disappears in a release
+        // build, and that is exactly where it matters: a non-16B base is err 716
+        // ("misaligned address") for the entire CUDA context, and — this is the
+        // reason it must never be silent — the report is DETACHED, surfacing at
+        // the next `Device::sync()` (devrt.rs:1073) with no hint of which buffer
+        // caused it. cudaMalloc documents 256-byte alignment, so this fires only
+        // if the driver allocator ever breaks that contract; the cost is one AND
+        // per allocation (a few hundred per model load), the payoff is naming the
+        // pointer, its misalignment and its size instead of a rank-local
+        // "sync: misaligned address". See
+        // docs/agent/tcgen05-tma-bulk-align-design.md (layer 1).
+        let misalign = p as usize & 0xF;
+        if misalign != 0 {
+            // release the bad block before unwinding: leaving it allocated would
+            // turn a diagnostic into a leak on the error path
+            unsafe {
+                (self.cudart.free)(p);
+            }
+            return Err(FerriteError::Config(format!(
+                "cudaMalloc returned a NON-16B pointer {:#x} (misaligned by {misalign} B) for a \
+                 {bytes}-byte request on device {}: the tcgen05/bulk operands are addressed in \
+                 uint4s, so every use of this buffer would be err 716 (misaligned address) at the \
+                 next sync instead of here. See \
+                 docs/agent/tcgen05-tma-bulk-align-design.md",
+                p as usize,
+                self.device_id()
+            )));
+        }
         self.allocated.set(self.allocated.get() + bytes);
         Ok(DevBuf { ptr: p, bytes, owned: true })
     }

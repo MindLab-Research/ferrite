@@ -5781,8 +5781,19 @@ impl Device {
                 w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids, self.stream,
             )
         };
+        // ★ `rc == 0` means EXACTLY ONE thing: the `.so`'s own gate was OFF
+        // (nothing was launched), and the caller keeps the proven GEMV path.
+        // Every other outcome is a real error and goes through `kerr`, including
+        // a REJECTED ARGUMENT LIST — `m4_launch_gateup` returns
+        // `cudaErrorInvalidValue` for a shape OR a 16B-alignment violation, and
+        // prints an `[align] tc5::mxf4: …` line to stderr before it does. The two
+        // used to be indistinguishable downstream (both surfaced as
+        // `!ran_tc` → fallback), which is the project's #1 measurement trap: a
+        // layout accident read as "the arm never engaged" instead of "the arm
+        // refused". If a round shows the arm not running, check stderr for an
+        // `[align]` line BEFORE concluding the gate is off.
         if rc == 0 {
-            return Ok(false); // gate OFF: nothing ran, the caller falls back
+            return Ok(false); // .so gate OFF: nothing ran, the caller falls back
         }
         self.kerr(rc, "dsv41_expert_tcgen05_gate_up_mxf4")?;
         Ok(true)

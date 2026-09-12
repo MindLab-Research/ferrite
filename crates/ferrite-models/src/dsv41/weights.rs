@@ -493,11 +493,58 @@ pub fn check_bulk_geometry(cfg: &Dsv41Config, world: usize) -> Result<()> {
             ));
         }
     }
+    // ---- w2's SF plane row pitch: the ONE pitch this gate used to miss ------
+    // w2's e8m0 plane is `[dim, padded_inter(inter/world)/32]` — 10 bytes per row
+    // at the production shape (9 real + 1 pad), and `10 % 16 = 10 != 0`. The
+    // FIRST row is still 16B-aligned (the plane base is), but every row r > 0
+    // starts at `base + r*10`, i.e. OFF the 16B grid — exactly the class of
+    // pointer the bulk/`uint4` operand paths cannot address. It is the only
+    // non-16B row pitch the earlier checks did not cover.
+    //
+    // It is also RANK-SYMMETRIC: `padded_inter(inter/world)` is the same on every
+    // rank, so this cannot produce a rank-specific fault (it is the first
+    // suspect for the "all 8 ranks fault together" shape, which the per-rank ack
+    // reporting in `serve.rs::broadcast` now distinguishes from a rank-local
+    // one). Rank-specific faults are impossible from uniform sharding anyway
+    // (`base_r = r*per`, and an aligned `per` gives aligned `base_r` for every
+    // r) — see the alignment audit in `load.rs` (`DSV41_ALIGN_AUDIT=1`).
+    let sf_row = padded_inter(inter_local) / 32;
+    if sf_row % BULK_ALIGN != 0 {
+        let msg = format!(
+            "w2 SF row pitch padded_inter(inter/world)/32={sf_row} is not 16B \
+             (needs padded_inter(inter/world) % 512 == 0, i.e. the K_ATOM=64-padded \
+             inter/world must ALSO be a multiple of 512); rows past the first of w2's \
+             e8m0 plane start off the 16B grid"
+        );
+        if align_strict() {
+            bad.push(msg);
+        } else {
+            // env-gate: WARN by default so the shipped shape still loads;
+            // DSV41_ALIGN_STRICT=1 turns it into a load-time error. The project
+            // rule is that a new gate defaults OFF (the code stays, the behaviour
+            // does not change until it is asked for).
+            eprintln!(
+                "[align] bulk-geometry WARN: {msg} \
+                 (set DSV41_ALIGN_STRICT=1 to make this a load-time error)"
+            );
+        }
+    }
     if bad.is_empty() {
         Ok(())
     } else {
         Err(FerriteError::Config(format!("bulk-geometry: {}", bad.join("; "))))
     }
+}
+
+/// `DSV41_ALIGN_STRICT=1` promotes the alignment WARNINGS of
+/// [`check_bulk_geometry`] to load-time errors. Read ONCE (house rule for every
+/// non-hot-path gate) and OFF by default so a shipped shape keeps loading; the
+/// CI / parity jobs set it to catch a layout break for seconds instead of
+/// seconds-of-prefill-plus-a-detached-err-716. See
+/// docs/agent/tcgen05-tma-bulk-align-design.md §6 V5.
+pub fn align_strict() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_ALIGN_STRICT").map(|v| v == "1").unwrap_or(false))
 }
 
 /// The local shape a rank holds for `spec`.
@@ -868,9 +915,20 @@ mod tests {
                         spec.name
                     ),
                     Shard::ExpertCols => {
-                        // columns are packed 2 fp4 values per byte
+                        // columns are packed 2 fp4 values per byte, but the
+                        // ue8m0 scale packs one byte per 32 values — both pad
+                        // to the SAME logical K (mirror of local_shape's
+                        // ExpertCols branch; the old fp4-only formula here
+                        // expected 96 where the scale row is 72 @ world 1)
+                        let is_scale = spec.name.ends_with(".scale");
                         let packed = spec.shape[1] / f;
-                        assert_eq!(ls[1], padded_inter(packed * 2) / 2, "{}", spec.name)
+                        let logical = if is_scale { packed * 32 } else { packed * 2 };
+                        let padded = if is_scale {
+                            padded_inter(logical) / 32
+                        } else {
+                            padded_inter(logical) / 2
+                        };
+                        assert_eq!(ls[1], padded.max(packed), "{}", spec.name)
                     }
                     Shard::Rows if spec.name.contains("engram.embed") => {
                         // engram rows use ceil-division
@@ -956,5 +1014,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `check_bulk_geometry` must pass on the shipped shape (the new w2-SF row
+    /// pitch is a WARN there, not an error) and must still reject a config whose
+    /// `nsf` row pitch is off the 16B grid. The SF check is the one that used to
+    /// be missing: w2's e8m0 plane is `padded_inter(inter/world)/32 = 10` bytes
+    /// per row at the production shape, so every row past the first is off the
+    /// 16B grid — a fact the gate now names at load time.
+    #[test]
+    fn bulk_geometry_covers_w2_sf_row_pitch() {
+        let cfg = Dsv41Config::production();
+        // production: dim/32 = 160 (%16 == 0) and padded_inter(288) = 320 (%16 == 0),
+        // so only the NEW w2-SF pitch (320/32 = 10) is off the grid — and that one
+        // is a WARN unless DSV41_ALIGN_STRICT=1 (a OnceLock env read, so the strict
+        // arm cannot be exercised in-process).
+        assert!(check_bulk_geometry(&cfg, 8).is_ok(), "production shape must load");
+        if !align_strict() {
+            let inter_local = cfg.moe_inter_dim / 8;
+            let sf_row = padded_inter(inter_local) / 32;
+            assert_eq!(sf_row, 10, "w2 SF row pitch at the production shape");
+            assert_ne!(sf_row % BULK_ALIGN, 0, "…and it IS off the 16B grid");
+        }
+
+        // a config whose dim/32 is not a 16B multiple still fails hard, with or
+        // without DSV41_ALIGN_STRICT
+        let mut bad = Dsv41Config::production();
+        bad.dim = 6016; // nsf = 188, 188 % 16 = 12
+        let e = check_bulk_geometry(&bad, 8).unwrap_err().to_string();
+        assert!(e.contains("nsf=dim/32=188"), "{e}");
     }
 }

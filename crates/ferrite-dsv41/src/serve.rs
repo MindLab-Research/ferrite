@@ -121,8 +121,11 @@ pub struct TpRankPool {
     world: usize,
     /// One command channel per rank (the broadcast fan-out).
     cmd: Vec<std::sync::mpsc::Sender<RankCmd>>,
-    /// Rank replies: (rank, token-or-error).
-    res: std::sync::mpsc::Receiver<(usize, Result<Vec<u32>>)>,
+    /// Rank replies: (rank, device id, token-or-error). The device id is carried
+    /// explicitly (instead of assuming `device == rank`) so an error line names
+    /// the GPU that actually faulted even under a `CUDA_VISIBLE_DEVICES`
+    /// remap — see [`Self::broadcast`].
+    res: std::sync::mpsc::Receiver<(usize, i32, Result<Vec<u32>>)>,
     /// One-shot load reports — a failed load arrives as `Err` from its rank.
     ready: std::sync::mpsc::Receiver<Result<usize>>,
     /// Tokens already computed by the last `DecodeRun`, handed out one per
@@ -232,6 +235,20 @@ impl TpRankPool {
     /// Broadcast one command, then collect EVERY rank's reply. Rank 0's token is
     /// the answer; any rank's error fails the step (a broken rank means a broken
     /// lockstep engine — the adapter poisons the pool on Err).
+    ///
+    /// ★ EVERY rank's error is reported, not just the first one. The pool used to
+    /// keep only the first `Err` it saw (`if fault.is_none()`), which turned the
+    /// RANK NUMBER in the error into a property of the ack ORDER rather than of
+    /// the fault: a poisoned CUDA context (a misaligned access reports at the
+    /// NEXT `Device::sync()`, devrt.rs) is broadcast to every rank of the
+    /// lockstep group within microseconds, so whichever rank's ack the pool
+    /// happened to pop first "was" the faulty one. That is the entire origin of
+    /// the "only rank 7 ever fails" folklore — the same fault has been printed
+    /// as rank 5, 6 AND 7 across sessions (a race signature, not a rank
+    /// property). The RETURN semantics are unchanged (the first fault still
+    /// decides, so downstream behaviour is bit-identical); what changes is that
+    /// the shape of the failure — `1/8` ranks vs `8/8` ranks — is now VISIBLE.
+    /// See docs/agent/tcgen05-tma-bulk-align-design.md and the round-5 runbook.
     fn broadcast(&mut self, cmd: RankCmd) -> Result<Vec<u32>> {
         for (r, tx) in self.cmd.iter().enumerate() {
             tx.send(cmd.clone()).map_err(|_| {
@@ -240,16 +257,24 @@ impl TpRankPool {
         }
         let mut tokens: Option<Vec<u32>> = None;
         let mut fault: Option<ferrite_types::FerriteError> = None;
+        let mut faults = 0usize;
         for _ in 0..self.world {
             match self.res.recv_timeout(STEP_TIMEOUT) {
-                Ok((rank, Ok(t))) => {
+                Ok((rank, _dev, Ok(t))) => {
                     if rank == 0 {
                         tokens = Some(t);
                     }
                 }
-                Ok((rank, Err(e))) => {
+                Ok((rank, dev, Err(e))) => {
+                    // one line per failing rank: rank + device + the error VERBATIM
+                    // (a misaligned-address report is the *same* string on every
+                    // rank — 8 identical lines mean the fault is symmetric, a
+                    // single line means it really is rank-local)
+                    eprintln!("[tp] rank {rank} (device {dev}) err: {e}");
+                    faults += 1;
                     if fault.is_none() {
-                        fault = Some(ferrite_types::FerriteError::Config(format!("rank {rank}: {e}")));
+                        fault =
+                            Some(ferrite_types::FerriteError::Config(format!("rank {rank}: {e}")));
                     }
                 }
                 Err(_) => {
@@ -260,6 +285,9 @@ impl TpRankPool {
             }
         }
         if let Some(e) = fault {
+            // The count is the round-5 discriminator: `n/8` says how many ranks
+            // reported an error THIS step (the per-rank lines above carry the text).
+            eprintln!("[tp] step failed on {faults}/{} ranks", self.world);
             return Err(e);
         }
         tokens.ok_or_else(|| {
@@ -336,7 +364,7 @@ fn rank_loop(
     dir: &str,
     so: &str,
     rxs: &Arc<Vec<Mutex<std::sync::mpsc::Receiver<RankCmd>>>>,
-    res_tx: &std::sync::mpsc::Sender<(usize, Result<Vec<u32>>)>,
+    res_tx: &std::sync::mpsc::Sender<(usize, i32, Result<Vec<u32>>)>,
     ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
@@ -362,7 +390,7 @@ fn pool_rank_body(
     dir: &str,
     so: &str,
     rxs: &Arc<Vec<Mutex<std::sync::mpsc::Receiver<RankCmd>>>>,
-    res_tx: &std::sync::mpsc::Sender<(usize, Result<Vec<u32>>)>,
+    res_tx: &std::sync::mpsc::Sender<(usize, i32, Result<Vec<u32>>)>,
     ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
@@ -372,6 +400,9 @@ fn pool_rank_body(
     // ---- bring-up: the one-shot path's prologue (rank_body) verbatim ----
     Device::bind_to(rank as i32)?;
     let dev = Arc::new(Device::open(so)?);
+    // The GPU this rank really runs on (not assumed to be `rank`): carried on
+    // every ack so an error line can name the device that faulted.
+    let dev_id = dev.device_id();
     let mut loader = Loader::new(std::path::Path::new(dir), &dev)?;
     if std::env::var("DSV41_SKIP_ENGRAM_WEIGHTS")
         .map(|v| v != "0")
@@ -545,7 +576,7 @@ fn pool_rank_body(
                     prefix_hit.store(*hit, Ordering::SeqCst);
                 }
                 let r = r.map(|(t, _)| vec![t]);
-                if res_tx.send((rank, r)).is_err() {
+                if res_tx.send((rank, dev_id, r)).is_err() {
                     return Ok(()); // the pool is gone
                 }
             }
@@ -555,7 +586,7 @@ fn pool_rank_body(
                 if r.is_ok() {
                     step_time(pos, st.elapsed());
                 }
-                if res_tx.send((rank, r)).is_err() {
+                if res_tx.send((rank, dev_id, r)).is_err() {
                     return Ok(());
                 }
             }
@@ -700,7 +731,7 @@ fn pool_rank_body(
                                     eprintln!(
                                         "[dsv41] rank {rank} shadow step err at pos {p}: {e}"
                                     );
-                                    let _ = res_tx.send((rank, Err(e)));
+                                    let _ = res_tx.send((rank, dev_id, Err(e)));
                                     return Ok(());
                                 }
                             };
@@ -739,7 +770,7 @@ fn pool_rank_body(
                             Ok(tok) => tok,
                             Err(e) => {
                                 eprintln!("[dsv41] rank {rank} step err at pos {p}: {e}");
-                                let _ = res_tx.send((rank, Err(e)));
+                                let _ = res_tx.send((rank, dev_id, Err(e)));
                                 return Ok(());
                             }
                         };
@@ -767,7 +798,7 @@ fn pool_rank_body(
                         break;
                     }
                 }
-                if res_tx.send((rank, r.map(|_| out))).is_err() {
+                if res_tx.send((rank, dev_id, r.map(|_| out))).is_err() {
                     return Ok(());
                 }
             }
