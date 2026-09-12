@@ -5186,3 +5186,24 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 1. **真正实施 epoch pad**（kernel + 接线 + 脚本 gate——三件都要！）
 2. **真正激活 v5_ledger**（步前打印已修复但 gate 要进脚本）
 3. **验证 gate 生效**：`/proc/PID/environ` 检查（1 秒成本）
+
+## D1 观测测试的分析框架（f063279f 跑中）
+
+**测试**：SWALLOW + V5_LEDGER=1（无 pad——纯观测）+ 短 prompt（1-50，200 max tokens）
+
+**预期数据**：`[v5-ledger-pre] pos=N rank=R epoch=E arm=pre` 行——每步每 rank 的步前 epoch
+
+**分析方法**：
+1. **同 rank 的步间 delta**：rank R 在 step N 和 N+1 的 epoch 差 = 该步的轮次足迹
+2. **同 step 的跨 rank 差**：step N 时 rank A 和 rank B 的 epoch 差 = 轮次分歧
+3. **分歧的起始点**：哪一步开始出现跨 rank 差？差多少？
+
+**可能的发现**：
+| 发现 | 含义 | 第 10 次修复的方向 |
+|---|---|---|
+| delta 均匀但跨 rank 差逐歩累积 | 每步某 rank 多/少几轮 | 找到多/少的轮次源，pad 或消除 |
+| delta 不均匀（某步突跳）| 某个操作偶发多轮 | 该操作的触发条件 |
+| 前几步就分歧 | 启动时的轮次差 | 启动序列的对齐 |
+| 观测本身改变了行为 | D1 的 D2H 影响时序 | 用更轻的观测 |
+
+**gap=27 的预测**：如果每步 ±1 的漂移，27 步后差 27——第 27 步左右 hang。观测会显示。
