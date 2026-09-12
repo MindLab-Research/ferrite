@@ -705,9 +705,15 @@ impl<'a> DsparkDev<'a> {
         let kv_norm = need(&ld.kv_norm, "mtp.*.attn.kv_norm.weight")?;
         let attn_sink = need(&ld.attn_sink, "mtp.*.attn.attn_sink")?;
 
-        // ---- the main stream's KV row goes into the ring at pos % win ----
-        // The reference ropes it at `start_pos` (one row, step irrelevant).
-        self.seed_window(s, pos)?;
+        // ---- the main stream's KV row goes into the ring ----
+        // `pos` here is the ANCHOR's position; the main_x it projects is the
+        // hidden of the anchor's PREDECESSOR (the just-consumed token — the
+        // official source is hidden[anchor_pos - 1]), so both the ring slot
+        // and the RoPE position are pos - 1. The historical call used pos
+        // directly, which under the old (anchor == t0) timing happened to be
+        // the same position; under the official timing it must shift back one.
+        debug_assert!(pos > 0, "draft_forward: the anchor is never at pos 0");
+        self.seed_window(s, pos - 1)?;
 
         // ---- q = wq_b(q_norm(wq_a(x))) with RoPE at the draft positions ----
         // D1 fix (audit-ffi-args): quantise ALL bs rows — the historical call

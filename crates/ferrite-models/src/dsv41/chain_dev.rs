@@ -96,7 +96,7 @@ pub struct DsparkShadowReport {
     pub drafts: [u32; DSPARK_DRAFTS],
     /// The verify block's per-row argmax: row `j` (position `pos + 1 + j`, fed
     /// `drafts[j]`) predicted `verify_out[j]` for `pos + 2 + j`.
-    pub verify_out: [u32; DSPARK_DRAFTS],
+    pub verify_out: [u32; DSPARK_DRAFTS + 1],
     /// `k` (1..=DSPARK_DRAFTS + 1): the number of tokens the speculative path
     /// WOULD have emitted from this step — the accepted draft prefix plus one
     /// bonus token. `1` means no draft survived, i.e. `next` alone.
@@ -2955,7 +2955,10 @@ impl<'a> DevChain<'a> {
         pos: usize,
     ) -> Result<DsparkShadowReport> {
         let cfg = self.cfg;
-        let m = DSPARK_DRAFTS;
+        // The verify block is [anchor(next), d1..d5] — 6 rows (the official
+        // DSpark structure: the anchor's forward happens IN the verify, its KV
+        // is what rows 1.. attend).
+        let m = DSPARK_DRAFTS + 1;
         // The tap hook only exists in the step graph when the gate was armed at
         // capture time. `dspark_armed()` caches the env in a OnceLock, so this is
         // the SAME decision `layer()` made — a process that armed the gate after
@@ -3013,22 +3016,33 @@ impl<'a> DevChain<'a> {
         // the same one the host reference's `forward_spec(.., start_pos)` uses.
         let t = std::time::Instant::now();
         dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
+        // The anchor is the JUST-SAMPLED token (`next` — the official DSpark
+        // convention: draft_input_ids[:, 0] = the bonus token, which has NOT
+        // been forwarded yet). The block [next, noise×4] therefore starts at
+        // pos+1 and every one of the γ predictions covers an UNKNOWN token;
+        // the historical call fed the just-CONSUMED t0, wasting the first
+        // draft slot on re-predicting a token the backbone already emitted and
+        // leaving every prediction one position behind. The tap (t0's hidden)
+        // is exactly the official main_x source: hidden[anchor_pos - 1].
         let drafts = if bisect >= 2 {
-            [token; DSPARK_DRAFTS]
+            [next; DSPARK_DRAFTS]
         } else {
-            dspark.draft_forward(token, pos)?;
+            dspark.draft_forward(next, pos + 1)?;
             dspark.drafts()?
         };
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
 
-        // 6. the verify block: one m-row forward, per-row argmax. It appends the
-        //    block to the ring at `pos + 1 + j` and runs the block's compressor —
-        //    all of which step 8 undoes.
+        // 6. the verify block: one m-row forward, per-row argmax. The block is
+        //    [anchor(next), d1..d5] at pos+1..pos+6 — the anchor's row is what
+        //    provides its KV (it was never forwarded; the single-row step only
+        //    appended t0). Everything it appends, step 8 undoes.
         let t = std::time::Instant::now();
+        let mut six = [next; DSPARK_DRAFTS + 1];
+        six[1..].copy_from_slice(&drafts);
         let rows = if bisect == 1 || bisect == 3 {
             Vec::new()
         } else {
-            self.step_rows(&drafts)?
+            self.step_rows(&six)?
         };
         let verify_ms = t.elapsed().as_secs_f32() * 1e3;
 
@@ -3037,28 +3051,31 @@ impl<'a> DevChain<'a> {
         //    error path.
         self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
 
-        let mut verify_out = [0u32; DSPARK_DRAFTS];
-        if bisect == 0 && rows.len() != DSPARK_DRAFTS {
+        let mut verify_out = [0u32; DSPARK_DRAFTS + 1];
+        if bisect == 0 && rows.len() != DSPARK_DRAFTS + 1 {
             return Err(FerriteError::Config(format!(
-                "dspark_shadow_step: step_rows returned {} rows for a {DSPARK_DRAFTS}-row \
+                "dspark_shadow_step: step_rows returned {} rows for a {}-row \
                  verify block",
-                rows.len()
+                rows.len(),
+                DSPARK_DRAFTS + 1
             )));
         }
-        if rows.len() == DSPARK_DRAFTS {
+        if rows.len() == DSPARK_DRAFTS + 1 {
             verify_out.copy_from_slice(&rows);
         }
 
-        // 8. the accept arithmetic (host, no device traffic).
+        // 8. the accept arithmetic (host, no device traffic). The anchor row
+        //    (verify_out[0], the forward of `next`) predicts the token after
+        //    it — that is what d1 is checked against; d_{j+1} against
+        //    verify_out[j]. k = 1 (the anchor `next` is always emitted) +
+        //    matches; a full 6 means every draft matched plus the final
+        //    verify_out bonus.
         let mut acc = 0usize;
-        if drafts[0] == next {
-            acc = 1;
-            for j in 1..DSPARK_DRAFTS {
-                if drafts[j] == verify_out[j - 1] {
-                    acc += 1;
-                } else {
-                    break;
-                }
+        for j in 0..DSPARK_DRAFTS {
+            if drafts[j] == verify_out[j] {
+                acc += 1;
+            } else {
+                break;
             }
         }
 
