@@ -5207,3 +5207,22 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 | 观测本身改变了行为 | D1 的 D2H 影响时序 | 用更轻的观测 |
 
 **gap=27 的预测**：如果每步 ±1 的漂移，27 步后差 27——第 27 步左右 hang。观测会显示。
+
+## 第 10 次修复（真正的 epoch pad）的进展确认
+
+**实施进度**（工作树验证）：
+- ✅ `kernels/cuda/ferrite_kernels.cu: 4 个 v5_epoch_pad 匹配`（kernel 正在添加！）
+- ✅ `chain_dev.rs: 7 个匹配`（调用点！）
+- ✅ `device.rs` 修改（FFI wrapper！）
+- ✅ `batched_400_v2.sh` 修改（gate！）
+
+**三件完整**——与第 9 次的幻影（零调用点/kernel/gate）形成鲜明对比！
+
+**第 10 次修复后的测试计划**（swallow-10th-verification-design 的三重验证）：
+1. **验证 1（提交前）**：代码存在性——grep kernel/调用点/gate
+2. **验证 2（启动后）**：/proc/PID/environ 检查——DSV41_SWALLOW_EPOCH_PAD=1 确实导出
+3. **验证 3（测试中）**：v5-ledger 的 delta 变化——swallowed 臂从 84 → 165 轮/步
+
+**如果第 10 次成功**（0 hang + delta 165）：
+- batched 路径解锁！
+- SH_PAIR M=6（-4.9~7.9ms）→ mrows 族 → tcgen05 → **400 冲刺！**
