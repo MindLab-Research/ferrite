@@ -547,7 +547,6 @@ impl Collective {
             .wrapping_add(self.reduced_at + self.world * 4)
             as *const std::ffi::c_uint
     }
-    }
 
     /// This rank's own ready row (`staging + stamps_at`).
     pub fn ready_local_dev(&self) -> *const std::ffi::c_uint {
