@@ -2025,3 +2025,14 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **误判纠正（重要）**：早前调查曾判定 "`ferrite_rmsnorm` 的 n>1 产生 1e27 垃圾"并把 attn_norm 改成逐行 n=1 绕过。**读 kernel（ferrite_kernels.cu:280-330）确认它是正确的**（grid(n) 每 block 一行、行偏移 row*dim、blockDim-sized 归约）。1e27 的真因是**当时 attn_norm 的权重指针是垃圾**（load.rs:925 placeholder bug）。**教训：数值异常要先确认输入/权重，再怀疑 kernel**（"绕过"是无必要的性能损失——已回退为多行）。
 
 **真实 serve 的长 prompt 基线**（出师表 250 tok，MoE 修复前）：文本内容**正确**（"先帝创业未半而中道崩殂，今天下三分，益州疲弊，此诚危急存亡之秋也"逐字对）+ **双字**（臣臣/盖盖）+ accept=0.020。文本正确 = next（主链 argmax）正确 + 大部分步 k_acc=0（纯主链输出）；accept 低 = drafts[0]==next 的比率极低 → draft 质量差（MoE ILV 是候选，修复后待测）。
+
+## 2026-09-12 Wave 2：MoE ILV 修复的实测效果（26x accept 提升）
+
+**修复前**（长 prompt 出师表 250 tok）：accept mean-k=**0.020**、tok/step 1.020、文本内容正确但双字（臣臣/盖盖）。
+**修复后**（draft_moe 的 ILV/fuse/顺序分支/buffer 四项）：accept mean-k=**0.520**、tok/step 1.520、draft 5.85→**4.99ms**。
+
+**判定**：audit-moe-seg 的判词完全正确——**ILV 选择 bug（默认路径走非交错 reader 读交错池）是 draft MoE 输出 138% 偏差的根因**，修复后 draft 的预测质量提升 26 倍。**draft 的数值链（tap→main_x→block→MoE→head→markov）现在基本健康**。
+
+**剩余**：文本**重复加剧**（"全文全文"、"先帝创业帝创业"）——这是 **verify 的 interleave 缺陷**的直接后果（verify-parity-audit 判词：`sparse_attn`/`indexer_rows` 在全部 append 之后统一跑，读"块末 clen"→ 行 0 的候选含本块未来 latent → argmax 退化为重复刚看到的 token）。interleave-rows-fix 正在把 attention 的读侧逐行化（sparse_attn 改 b=1,m=1 单行调用——与 eager 同形状 = parity 保障）。
+
+**性能状态**：verify 38.85ms（5 行 = 7.77ms/行 > 单行图化 6.15ms/行——batch 收益未兑现）。400 路径的完整账本在 `docs/agent/dspark-perf-400-plan.md`（3 阶段：多行化+图化 → ≤8ms；吞主链步 −4.5ms；confidence-gated verify）。
