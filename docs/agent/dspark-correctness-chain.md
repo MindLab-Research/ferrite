@@ -2444,3 +2444,25 @@ DSV41_BF16_TRUNCATE=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 - 保守（launch 账）：6/0.018 = **333 tok/s**（差 400 17%）
 - 乐观（ms 账）：6/0.010 = **600 tok/s** ✓✓
 - **真实值在 333-600 之间——400 是可达的**
+
+## SWALLOW_STEP + ar5 修复测试的准备（当前测试完成后跑）
+
+**ar5 修复内容**（方案 A+C）：
+- 方案 A：四臂 barrier 对称化（DRY=1, replay=1, direct=1, capture=2）
+- 方案 C：SWALLOW 前 3 个 verify block 走 direct（避开图转换窗口）
+
+**测试配置**（SWALLOW + Wave 1 + SH_PAIR）：
+```bash
+DSV41_SWALLOW_STEP=1              # 主链折进 verify（-4.55ms）——ar5 修复后
+DSV41_SH_PAIR_M=1                 # SH_PAIR template<M>
+DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1  # Wave 1
+DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1   # mrows
+DSV41_VERIFY_GRAPH=1 DSV41_BF16_TRUNCATE=1
+# NOT: DSV41_LAZY_VERIFY（SWALLOW 是 batched）
+```
+
+**判定标准**：
+1. 零拉丁（红线）
+2. **0 ar5-hang**（ar5 修复验证——之前 gap 3）
+3. k_acc 与 lazy 可比
+4. 步时（准确值——nsys 或 [dspark] steps）
