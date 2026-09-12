@@ -445,6 +445,13 @@ struct Scratch {
     ex_down_r: DevBuf,
     /// [m, 2*inter] the shared expert's gate|up row (one row at a time).
     sh_act_r: DevBuf,
+    /// [m, dim] the shared expert's w2 output for the whole block —
+    /// [`DevChain::shared_expert_mrows`]'s write-then-add scratch. The per-row
+    /// path writes w2 straight into `moe_out_r + r*dim` (A5) or into the
+    /// single-row `ex_out` and adds; the multi-row form writes the block to a
+    /// `[m, dim]` scratch and folds it in with ONE element-wise add, because
+    /// `gemm_fp8_mrows` (unlike `gemm_fp8_mx_add`) has no accumulate epilogue.
+    sh_out_r: DevBuf,
     // ---- engram, m rows ----
     eng_ids_r: DevBuf,  // [m, n_engram_layers * n_cols] i64
     eng_rows_r: DevBuf, // [m, n_cols * engram_head_dim] f32
@@ -779,6 +786,31 @@ fn row_fold_gate() -> bool {
 fn sh_exp_mx2() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MX2").map(|v| v != "0").unwrap_or(true))
+}
+
+/// SHARED-EXPERT ROW-FOLD (`DSV41_SH_EXP_MROWS=1`, DEFAULT OFF): the shared
+/// expert's (w1/w3 -> swiglu -> w2) chain runs as ONE multi-row pass over the
+/// verify block ([`DevChain::shared_expert_mrows`]) instead of the per-row loop.
+///
+/// **What it removes.** The shared expert is a SINGLE expert applied to every
+/// row, so its weights are identical across the block — but `moe_rows` still
+/// reads them once per row (4.42 MB x m per layer, 4-5 launches x m per layer).
+/// At the production shape (m = 5, `sh_il` = 288, dim = 5120) that is 26.5 MB
+/// and ~25 launches per layer = **~0.89 GB/step and ~960 launches/step** of pure
+/// repeat traffic, the same class of redundancy the routed experts' `rows`
+/// dimension and the projections' `mrows` already removed. Unlike the routed
+/// half — whose rows select DIFFERENT experts, so its byte count is irreducible
+/// and only its launch count can shrink — this one's bytes really do divide by m.
+///
+/// **Why it is not flipped on.** Every step is documented as bit-identical to
+/// the call it replaces (see the method), but this project's rule is that a new
+/// multi-row path ships as an explicit A/B arm first: the acceptance criterion
+/// is `verify_ms` (plan §3.3/§4) plus the row-level `dspark_parity` check.
+/// Read ONCE and cached — this branch runs 40x/step inside the layer loop, so a
+/// per-call getenv would be exactly the hot-path slip the other gates avoid.
+fn sh_exp_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SH_EXP_MROWS").map(|v| v != "0").unwrap_or(false))
 }
 
 /// A5: DSV41_MOE_EPI_ADD=0 reverts the shared expert's w2 to the
@@ -6524,7 +6556,26 @@ impl<'a> DevChain<'a> {
             // fallback), quantised with the row pitch `nlh*hd` -- the per-row
             // `quant1` wrote these same bytes into `s.xq` one row at a time,
             // shared by all of the row's group blocks.
-            self.quant_rows(self.s.o_r.ptr as *const f32, m, (nlh * hd) as i32)?;
+            // ⚠️ ROW STRIDE FIX (verify-value-hunt's deterministic root cause):
+            // `quant_rows`'s kernel derives the SOURCE row stride from `cols`
+            // (`src = x + r*cols`), but `o_r`'s real row pitch is `nh*hd`
+            // (8x `nlh*hd` under TP8's head split) — so with a single block call
+            // every row r>=1 quantised bytes from inside ROW 0's unwritten tail
+            // (garbage scratch), which is exactly the "row 0 always right,
+            // r>=1 always wrong" signature the diff probe measured. Pack row by
+            // row: source at its true pitch, destination compact (the downstream
+            // wo_a_grouped_fp8 / proj_mrows layouts are unchanged).
+            for r in 0..m {
+                self.dev.quant_fp8(
+                    (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                    (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
+                    (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (nlh * hd / 32)),
+                    1,
+                    (nlh * hd) as i32,
+                    32,
+                    true,
+                )?;
+            }
             self.dev.wo_a_grouped_fp8(
                 self.s.xq_r.ptr as *const u8,
                 self.s.xsc_r.ptr as *const f32,
@@ -6582,7 +6633,21 @@ impl<'a> DevChain<'a> {
         // slice of each `wo_r` row. It reads `wo_r`, which the wo_a phase above
         // fully wrote — both forms of that phase finish before this launches.
         let took_wob = if mrows {
-            self.quant_rows(self.s.wo_r.ptr as *const f32, m, ol_local as i32)?;
+            // ⚠️ ROW STRIDE FIX (same class as the o_r quant above):
+            // `quant_rows` derives the SOURCE row stride from `cols`, but `wo_r`'s
+            // real pitch is `ol_total` (8x `ol_local` under TP8) — a block call
+            // quantised garbage from row 0's tail for every r>=1. Pack row by row.
+            for r in 0..m {
+                self.dev.quant_fp8(
+                    (self.s.wo_r.ptr as *const f32).wrapping_add(r * ol_total),
+                    (self.s.xq_r.ptr as *mut u8).wrapping_add(r * ol_local),
+                    (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (ol_local / 32)),
+                    1,
+                    ol_local as i32,
+                    32,
+                    true,
+                )?;
+            }
             self.proj_mrows(
                 ld.wo_b.as_ref().unwrap().as_u8(),
                 ld.wo_b_scale.as_ref().unwrap().as_u8(),
