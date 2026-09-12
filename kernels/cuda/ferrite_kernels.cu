@@ -9074,8 +9074,30 @@ __global__ void p2p_ar_store_v5_kernel(
 // Timing/contract. The launch still returns only after every peer's store for
 // this round is observable from this rank (block 0 waits directly, the others
 // wait for the flag block 0 sets after that wait) and `*epoch` is still advanced
-// at the same point, so the kernel boundary every downstream consumer depends on
-// does not move.
+// exactly once per round -- now AFTER the wait, see the R1 note below -- so the
+// kernel boundary every downstream consumer depends on does not move.
+//
+// R1 (2026-09-12, `ar-step2-a1a-fix-design.md` §5) closed the two defects this
+// arm shipped with:
+//   bug 1 -- a timed-out poll used to `break`, and block 0 then STILL wrote the
+//            broadcast word `epoch[1] = e+1`, publishing an INCOMPLETE round as
+//            complete; the other blocks fell through to a reduce over peer
+//            staging that never arrived. Closed by A2b: a timed-out waiter calls
+//            `ar5_timeout` (always armed, see its note), which never returns --
+//            it prints `[ar5-hang]`/`[ar5-hang-bcast]` and then parks (default)
+//            or traps, so it NEVER broadcasts, never advances the epoch and
+//            never reaches the reduce.
+//   bug 2 -- the epoch read/write race. Fixed in all three pubred kernels: the
+//            `*epoch = e + 1u` advance moved from BEFORE the wait to just after
+//            it. Every block reads `const unsigned e = *epoch` at its entry and
+//            block 0 is the only writer, so an advance that preceded the wait
+//            could be read by a block that had not entered yet: it took `e + 1`
+//            as its own round, waited for `e + 2` (the ON arm on the broadcast
+//            word, the OFF arm on the peer stamps -- a value no peer publishes
+//            this round), and would have reduced the WRONG parity half. After
+//            the wait every block of this grid has long since read its `e`, and
+//            the advance still precedes the next round's store -- a separate
+//            launch the stream orders after this kernel.
 //
 // A0/A1 (`DSV41_AR_PROBE`, default OFF): the instrument that decides where the AR
 // budget goes. The SAME v5 round costs ~5us of work, 17.3us by the ledger and
@@ -9701,11 +9723,15 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
         __threadfence_system();
     }
     __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-        *epoch = e + 1u;
     ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, site,
                    trap, s_probe, t_entry);
     __syncthreads();
+    // R1 (A4) bug 2 fix — see the note in `p2p_ar_pubred_v5_kernel`: the epoch
+    // advance belongs AFTER the wait. Writing it before let a block whose entry
+    // read of `*epoch` landed after the write take `e + 1` as its round, wait for
+    // a stamp no peer sends (`e + 2`), and reduce the wrong parity half.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *epoch = e + 1u;
     unsigned long long t_wait_done = 0ull;   // A0: block 0 / thread 0 only
     if (probe && blockIdx.x == 0 && threadIdx.x == 0)
         t_wait_done = clock64();
@@ -9873,11 +9899,14 @@ __global__ void p2p_ar_pubred_v5_hcpost_rows_kernel(
         __threadfence_system();
     }
     __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0)
-        *epoch = e + 1u;
     ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, site,
                    trap, s_probe, t_entry);
     __syncthreads();
+    // R1 (A4) bug 2 fix — see the note in `p2p_ar_pubred_v5_kernel`: the epoch
+    // advance belongs AFTER the wait, so no block of this grid can read the
+    // advanced value as its own round and then wait for an unstamped round.
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+        *epoch = e + 1u;
     unsigned long long t_wait_done = 0ull;   // A0: block 0 / thread 0 only
     if (probe && blockIdx.x == 0 && threadIdx.x == 0)
         t_wait_done = clock64();
