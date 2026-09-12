@@ -1341,6 +1341,20 @@ impl<'a> DevChain<'a> {
         (self.cos.as_f32(), self.sin.as_f32())
     }
 
+    /// The DSpark target-hidden tap, `[DSPARK_TAP_SLOTS, dim]` f32, as the raw
+    /// pointer [`DsparkDev::import_tap`] consumes. `layer()` rewrites it on every
+    /// step the gate is armed for, so it always holds the LAST real step's
+    /// recording — which is exactly what the draft that follows that step needs.
+    ///
+    /// `pub(crate)` for the single-rank parity self-test
+    /// ([`crate::dsv41::dspark_parity`]): that tool drives the draft and the
+    /// verify block itself instead of through [`Self::dspark_shadow_step`],
+    /// because shadow_step feeds the draft's own proposals to the verify by
+    /// construction, while the parity check has to feed the TRUE continuation.
+    pub(crate) fn dspark_tap_ptr(&self) -> *const f32 {
+        self.s.dspark_tap.ptr as *const f32
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         // the incoming premix is the CONSTANT [1,0,0,0] every step; upload it once
         // here so the per-step refresh is a device-to-device copy (no H2D)
@@ -2751,7 +2765,12 @@ impl<'a> DevChain<'a> {
     /// * `pos_ctr`: never advanced by the verify — `step_rows` passes a NULL
     ///   counter to its per-row argmax.
     /// * everything in `s.*_r`: the m-row scratch is the verify's own.
-    fn dspark_snapshot(&self, pos: usize, m: usize) -> Result<Vec<(usize, usize)>> {
+    ///
+    /// `pub(crate)` for the parity self-test ([`crate::dsv41::dspark_parity`]),
+    /// which needs the same save/restore pair around its own `step_rows` call;
+    /// it passes the position the real step ran at (the counter's value BEFORE
+    /// the step, which is what the slot arithmetic below keys off).
+    pub(crate) fn dspark_snapshot(&self, pos: usize, m: usize) -> Result<Vec<(usize, usize)>> {
         let cfg = self.cfg;
         let hd = cfg.head_dim;
         let win = cfg.window_size;
@@ -2810,7 +2829,15 @@ impl<'a> DevChain<'a> {
 
     /// Undo the verify block: copy the [`Self::dspark_snapshot`] save back over
     /// every buffer it recorded, and restore the host counters it returned.
-    fn dspark_rollback(&mut self, pos: usize, m: usize, host: &[(usize, usize)]) -> Result<()> {
+    ///
+    /// `pub(crate)` for the parity self-test, which pairs it with
+    /// [`Self::dspark_snapshot`] around its own `step_rows` call.
+    pub(crate) fn dspark_rollback(
+        &mut self,
+        pos: usize,
+        m: usize,
+        host: &[(usize, usize)],
+    ) -> Result<()> {
         // An empty mirror list means the caller skipped the snapshot (the
         // bisect modes that never run the verify): there is NOTHING to roll
         // back, and the snapshot buffers below were never written — restoring

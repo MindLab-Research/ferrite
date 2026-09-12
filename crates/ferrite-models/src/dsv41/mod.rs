@@ -22,6 +22,7 @@ pub mod config;
 pub mod device;
 pub mod dspark;
 pub mod dspark_dev;
+pub mod dspark_parity;
 pub mod engram;
 pub mod frame;
 pub mod kernels;
