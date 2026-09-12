@@ -865,3 +865,7 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 - 需要 P3c（draft 链的 CUDA 图化 + 块级 mrows——5 块的 forward 共享权重读）
 - 或 draft 链的深度削减（3 层 MTP 是固定的，不能减）
 - draft 图化：5 块 × ~40 kernel/块 = 200 launch → 图化后 1 launch——预期 -2ms
+
+## Draft 链结构确认（P3c 图化的可行性）
+
+`draft_forward`（dspark_dev.rs:860）的块循环：`for s in 0..cfg.n_mtp_layers`（3 块 MTP），每块 = hc_mixes + attn（sparse/window）+ hc_post + MoE（draft_moe）+ hc_mixes(ffn) + P3a 折叠。块间串行依赖（premix ping-pong a3 已把 D2D 消除）。**结构上可图化**：固定 kernel 序列 + 设备端输入输出（ids/pos 都在 device）+ 无宿主侧分支（除 unit_dump 的调试臂）。P3c = 捕获 3 块序列为一张图，launch 从 ~120 → 1。
