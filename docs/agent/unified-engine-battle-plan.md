@@ -164,3 +164,27 @@ P0 清单执行（见 prefill-research §D）：多行链（与 Wave 2 共享）
 - dsv41_verify_ring_win：7/7 case 过（因果窗口索引 + 块 append，含窗口边界）
 - 主 .so 远端编译通过（build_id fe3243ca）
 
+
+## Wave 2 状态快照（2026-09-12 06:20 UTC，第 8 修后）
+
+**已落地 8 个修复**（全部同会话验证）：
+| # | 修复 | 效果 |
+|---|---|---|
+| 1-2 | RC0 错误显形 + RC1 snapshot 时机 | rank 错误不再吞；rollback 恢复正确基线 |
+| 3 | mtp 权重 shard 越界（attn Replicated + MoE TP 几何 + AR） | cuda-700 消除 |
+| 4 | all_kv 紧凑布局 + rope 位置 pos+r | drafts 从随机样 → 有信号 |
+| 5 | verify 因果窗口逐行化 + compressor 逐行化 | verify 链 parity 达成 |
+| 6 | tap 口径（层输出非输入） | verify[0]==next 频率 1/12→5/12 |
+| 7 | draft head collapse 对齐 attn_pre + 撤销 mk 恢复官方块语义 | — |
+| 8 | **时序对齐（anchor=bonus 官方结构）** | **结构里程碑：verify anchor 行正确预测下一 token**（verify[0]=1767==pos12 next 等）；draft 块 [next,noise×4]@pos+1、verify 6 行、accept drafts[j] vs verify_out[j] |
+
+**性能实测**（影子模式，出师表 150 步）：主链 6.15ms + draft 7.4ms + verify 45.3ms（6 行朴素版）+ snapshot/rollback ~2.7ms ≈ 55ms/步。
+
+**剩余瓶颈**：draft 匹配率 ~6%（0.3 匹配/步 vs 正常 60-80%）——draft 数值还有系统性偏差（结构已全部对齐官方：时序/窗口/块语义/rope/ctx/层序 ✓ 全部核对）。模式分析：无错位（shift1≈0）、d_in_v≈m（对/错二值分布）、部分位置匹配。
+
+**进行中**（3 subagent）：
+- audit-draft-residual：draft 剩余数值风险的系统性清单（noise id/premix/q_norm/MoE 路由等 10 项对照）
+- commit-impl：真 commit（DSV41_SPEC=1，方案 A 快照+重放）
+- verify-perf-design：verify 39→5ms 的优化路线（多行 GEMV + 图化）
+
+**下一步**：audit-draft-residual 的清单 → 修 draft 的最后数值 bug → accept 跃升验证 → 真 commit → 性能优化至 ≥400。
