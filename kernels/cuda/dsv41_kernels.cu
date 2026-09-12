@@ -389,11 +389,14 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 
 // Ring geometry for gemm_fp8_swapab_kernel.
 //   kSwapabKStep: k width of one stage. A multiple of 32 (one scale block == the
-//                 MMA's K) and of 16 (the cp.async granule). 64 (with
-//                 kSwapabNStage 16) is the v20 ring fix -- see the KSTEP/NSTAGE
-//                 note at the macros.
-//   kSwapabNStage: ring depth. Must exceed ceil(kc / kSwapabKStep), else the
-//                 ring cannot hold the slice and the cold-read latency shows.
+//                 MMA's K) and of 16 (the cp.async granule). 128 is the measured
+//                 best of {32, 64, 128} at the k=5120 shapes -- see the measured
+//                 A/B at the macros below, which also records why a finer stage
+//                 (64) is NOT the win the ring-depth story predicted.
+//   kSwapabNStage: ring depth. Only needs to be >= 2 for the wait_group(NSTAGE-2)
+//                 discipline; a depth that "fills exactly" (NSTAGE-1 == nk) is
+//                 measurably SLOWER than a shallow ring -- the bytes in flight
+//                 per warp, not the stage count, is what covers DRAM latency.
 //   kSwapabRow: bytes per staged row. PADDED by 16: with an unpadded stride every
 //                 one of the 8 gid rows of the A fragment lands on banks 0..3
 //                 (stride/4 % 32 == 0) and each LDS.32 is an 8-way conflict; +16B
@@ -439,31 +442,51 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 // 0 by the elected block after its last slot read, so a captured graph replays
 // clean -- the discipline g_hc_ticket / g_hc_mb_done use (see dsv41_glue.cu).
 // It must simply START at zero (cudaMalloc does not zero).
-// ⚠ KSTEP/NSTAGE ARE A PAIR, NOT TWO KNOBS. The ring only hides a cold-read
-// latency when it can hold the WHOLE partition slice: the prologue prefetches
-// NSTAGE-1 stages up front, so the invariant that makes the ring "full" is
+// ⚠ Ring geometry is EMPIRICAL, not derived. A 2026-09-12 A/B (B300, n=1664
+// k=5120, ks=8, CUDA events, the same weight buffer re-read each call =>
+// L2-hot; "cold" = 512MB memset flush with the memset time measured separately
+// and subtracted; interleaved reps, min of 5) measured:
 //
-//     nk = ceil(kc / KSTEP) >= NSTAGE - 1,   kc = k / ks
+//   KStep NStage  ks   hot us/call   cold us/call   note
+//    128     8     8     7.31-7.37       9.98       <-- this default
+//     64    16     8     8.66-8.72      10.64       the "ring-full" hypothesis
+//     64    11     8     8.43             -         nk=10 == NSTAGE-1 (exactly full)
+//     64     8    16     6.29            8.55       nk=5 for the K=64 ring
+//    128     8    10     5.72            8.36       <-- best measured
 //
-// v19 (ks=8 => kc=640, KStep=128) gave nk = 5 < NSTAGE-1 = 7: the prologue
-// prefetched 7 stages of which only 5 were real, every warp carried the cold
-// miss across 1/8 of the data (8 partitions x 5 stages), the epilogue fired 8x
-// per tile, and swapAB measured NEUTRAL vs SIMT (~0.99x) instead of the 1.8x
-// the isolated sweep had shown (the sweep kept the weights L2-hot; serve does
-// not). KStep=64 halves the stage, so the same kc=640 yields nk = 10: all 10
-// real stages are in flight before the first consume. The ring is then deeper
-// than any slice needs (NSTAGE-1 = 15 > 10), which is harmless -- the excess
-// stages are the empty-cadence stages the wait discipline already requires
-// (see stage()) -- and is the point: depth >= nk + 1 covers the whole slice.
-// Do NOT "tidy" KStep back to 128 or NSTAGE down to 8 without redoing this
-// arithmetic for the (k, ks) the launcher actually picks (k=5120, ks=8).
-// smem for WARPS=1: 1*16*16*(64+16) = 20480B ring + 128B barriers + kc 640 + the
-// (4+1)B scale staging = 21348B, under the 48KB default ceiling (no opt-in).
+// The hypothesis "v19/ks=8 was neutral because kc=640 => nk=5 < NSTAGE-1=7, so
+// the ring cannot hold the slice and a finer stage would turn 8x warps into 8x
+// in-flight" is FALSIFIED: the exactly-full variant (64/11) is SLOWER than this
+// not-full default (8.43 vs 7.31), and 64/16 is slower still. The reason:
+// what covers a DRAM round trip is the in-flight BYTES per warp,
+// NSTAGE * KStep * 16, and that product is nearly CONSERVED (8*128 ~ 16*64) --
+// and MLP actually comes from the ~11 concurrently resident one-warp blocks per
+// SM (smem-bound), not from per-warp ring depth. A finer stage halves the bytes
+// per stage and doubles the per-stage wait/commit/__syncwarp and empty-cadence
+// overhead, plus the 16B row pad is a bigger fraction of an 80B row (20%) than
+// of a 144B one (11%).
+//
+// The knob that DID move the number is `ks` (warp count x kc), non-monotonically
+// at k=5120 (160 k-blocks): ks=4 8.79, ks=5 8.06, ks=8 7.34, ks=10 5.72 (best),
+// ks=16 8.32, ks=20 8.07 us/call (hot). ks=10 is legal only because 160 % 10 == 0
+// and it is UNREACHABLE from this macro by the launcher's halving (10 needs the
+// macro to be 10; 8 only ever halves to 4/2/1) -- changing it must go through the
+// launcher's ks policy and a serve A/B, one shape at a time (a naive ks=10 breaks
+// k=2048, where 64 % 10 != 0 falls back to ks=2). See docs/agent/perf-roadmap.md.
+//
+// Consequences of the above that ARE structural and should keep holding:
+//   * kSwapabRow = KStep + 16 must stay 16B aligned and NOT a multiple of 128B
+//     (bank-conflict knob, see the kSwapabRow note);
+//   * NSTAGE-1 prologue groups + 1 group per iteration keep the wait_group(NSTAGE-2)
+//     depth discipline valid even when nk < NSTAGE-1 (the empty stages are the
+//     cadence, not dead weight -- correctness does not depend on the ring filling).
+// smem for WARPS=1 at 128/8: 1*8*16*(128+16) = 18432B ring + 128B barriers + kc
+// 640 + (4+1)B scale staging = 19236B, under the 48KB default ceiling (no opt-in).
 #ifndef DSV41_SWAPAB_KSTEP
-#define DSV41_SWAPAB_KSTEP 64
+#define DSV41_SWAPAB_KSTEP 128
 #endif
 #ifndef DSV41_SWAPAB_NSTAGE
-#define DSV41_SWAPAB_NSTAGE 16
+#define DSV41_SWAPAB_NSTAGE 8
 #endif
 #ifndef DSV41_SWAPAB_WARPS
 #define DSV41_SWAPAB_WARPS 1
