@@ -2064,3 +2064,24 @@ DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 - 除非：MTP head 换更好的训练/更大的头 → 不在本 session 范围
 - **重点转向步时**：lazy 33ms + SWALLOW（-4.55ms）+ tcgen05（-2ms）+ 融合 → 目标 20-25ms
 - **实际可达**：1.214 × (1000/22) ≈ **55 tok/s**（不是 400）
+
+## 400 目标的诚实评估（accept 天花板确认后）
+
+**用户的 400 目标在当前 MTP head 下不可达**——这是数学事实：
+- accept 1.214（MTP head 能力天花板，所有对齐杠杆测完）
+- 400 需要：1.214 × (1/step) ≥ 0.4 → step ≤ 5.54ms
+- L5 架构地板 8-9ms（verify 的理论最低）→ **5.54ms < 地板 → 物理不可达**
+
+**可能的突破路径（本 session 范围外）**：
+1. **MTP head 换代**：更大的 draft head（更多层、更好的训练）→ accept 3-5
+2. **draft 配置变化**：block size 从 5 改到 3（更短的 draft 更准，但 tok/step 也降）
+3. **多 draft head**：多个 head 投票（类似 beam search）
+
+**本 session 的实际可达成**（accept 1.214）：
+- 当前 lazy + 截断：~33ms → **67 tok/s**
+- + SWALLOW_STEP（ar5-hang 回退后）：~28ms → **79 tok/s**
+- + tcgen05 + 融合：~20ms → **111 tok/s**
+- + 族级融合（L3）：~15ms → **148 tok/s**
+- **实际上限：~150-200 tok/s**（需要 L3/L4 级 kernel 工作）
+
+**与 sglang 383.7 的差距**：sglang 的 accept 必须在 3+（383.7 × 13ms = 5.0 tok/step）——他们的 MTP head 或 draft 实现有我们没达到的东西。这不是步时差距——是 accept 差距。
