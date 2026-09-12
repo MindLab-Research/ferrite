@@ -1268,6 +1268,52 @@ fn stats_every() -> usize {
     })
 }
 
+/// `DSV41_TOPK_DUMP=1` arms the first-token logits probe: the head's row is read
+/// back and its top `DSV41_TOPK_N` entries printed as one `[topk]` line per step
+/// (see [`DevChain::dump_topk`]).
+///
+/// This is the ferrite half of the backbone first-token alignment experiment:
+/// the official reference's top-10 on the same prompt's token sequence against
+/// this line's, the first rank that disagrees being the deviation signal. The
+/// step is dumped AFTER the head projection and BEFORE the argmax dispatch, so
+/// the row is exactly the one the argmax consumes.
+///
+/// DEFAULT OFF, and — like `DSV41_STATS` — it must also disable the whole-step
+/// CUDA graph: the dump is a device→host read, which is illegal inside a
+/// capture. The gate is cached in a `OnceLock` (read once per process), so the
+/// steady-state path pays a single predictable branch.
+fn topk_dump() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_TOPK_DUMP").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_TOPK_N` (default 10): how many ranks `DSV41_TOPK_DUMP` prints.
+fn topk_dump_n() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DSV41_TOPK_N")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(10)
+            .max(1)
+    })
+}
+
+/// `DSV41_LAYER_DUMP=1` arms the per-layer residual probe: one `[layer]` line
+/// per layer carrying the L2 norm of the residual stream the block just finished
+/// writing (see [`DevChain::dump_layer_norm`]).
+///
+/// It is the bisection half of the alignment experiment: comparing the per-layer
+/// norms against the reference's localises the FIRST layer whose backbone
+/// departs, which the first-token logits alone cannot name.
+///
+/// DEFAULT OFF; like `DSV41_TOPK_DUMP` it disables the whole-step CUDA graph,
+/// because the norm read is a device→host transfer.
+fn layer_dump() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_LAYER_DUMP").map(|v| v != "0").unwrap_or(false))
+}
+
 /// DSV41_MOEDBG=1 dumps the router's selection per layer.
 fn moe_dbg() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3800,6 +3846,13 @@ impl<'a> DevChain<'a> {
             // ar_v5() therefore also turns on with the graph (see tp.rs).
             let host_hash = std::env::var("DSV41_ENG_HOST").map(|v| v != "0").unwrap_or(false);
             let probes = std::env::var("DSV41_STATS").map(|v| v != "0").unwrap_or(false);
+            // The two backbone-alignment dumps read the device from INSIDE the
+            // region a capture would record (`dump_topk` in step_body before the
+            // argmax, `dump_layer_norm` at each layer's end), and a device->host
+            // copy is illegal inside a capture - so, exactly like `probes`, arming
+            // either one forces the per-kernel path. Same cached-gate discipline:
+            // this closure runs once (the OnceLock holds the answer).
+            let dumps = topk_dump() || layer_dump();
             // VERIFIED: a SINGLE request with the graph on is bit-identical to the
             // per-kernel path (DSV41_TOKTRACE compared step by step, no divergence),
             // so the captured operator set is right. With SEVERAL sequential
@@ -3818,6 +3871,7 @@ impl<'a> DevChain<'a> {
             // then verified with 12/12 answers and zero faults. DSV41_GRAPH_STEP=0 opts out.
             !host_hash
                 && !probes
+                && !dumps
                 && std::env::var("DSV41_GRAPH_STEP").map(|v| v != "0").unwrap_or(true)
         });
         // ONLY on the decode path: capturing during prefill froze the prefill
@@ -4079,6 +4133,18 @@ impl<'a> DevChain<'a> {
             self.stats("final logits (slice)", &self.s.logits, seg)?;
         } else {
             self.stats("final logits", &self.s.logits, cfg.vocab_size)?;
+        }
+        // DSV41_TOPK_DUMP: the head's row, read back HERE — after the projection
+        // and before the argmax dispatch — so the probe sees exactly the logits
+        // the argmax consumes. The row's geometry follows `sliced` above (the
+        // full vocabulary on the plain path, one rank's slice under
+        // DSV41_HEAD_SLICE with world > 1).
+        if topk_dump() {
+            if sliced {
+                self.dump_topk(pos, (rank * seg) as u32, seg)?;
+            } else {
+                self.dump_topk(pos, 0, cfg.vocab_size)?;
+            }
         }
         // Device-side argmax (the GLM HEAD_DEV pattern): the next token lands
         // straight in s.ids, which the next step's embedding reads — no 517 KB
@@ -9769,6 +9835,13 @@ fn hc_tail_split() -> bool {
                 )?;
             }
         }
+        // DSV41_LAYER_DUMP: the residual stream this block just finished writing
+        // (`s.h`, the same tensor the dspark tap above collapses). LAST in the
+        // layer on purpose — the norm then describes the block's COMPLETED output,
+        // the quantity the bisection compares layer by layer.
+        if layer_dump() {
+            self.dump_layer_norm(layer)?;
+        }
         Ok(2) // slot 2 holds this layer's ffn_pre = the next layer's premix
     }
 
@@ -9800,6 +9873,54 @@ fn hc_tail_split() -> bool {
                 mx
             );
         }
+        Ok(())
+    }
+
+    /// The `DSV41_TOPK_DUMP` probe: read back `n` floats of the head's logits row
+    /// and print its top [`topk_dump_n`] entries as ONE `[topk]` line
+    ///
+    /// ```text
+    /// [topk] pos=0 #1 id=12345 val=12.34 #2 id=67890 val=11.98 ...
+    /// ```
+    ///
+    /// `base` is the row's first entry's index in the FULL vocabulary and `n` its
+    /// width. With `DSV41_HEAD_SLICE` on and `world > 1` the row is this rank's
+    /// slice, so the printed ids are global while the SET is slice-local (a true
+    /// global top-N needs `world == 1` or `DSV41_HEAD_SLICE=0` — the alignment
+    /// experiment's single-GPU eager step is the full-vocabulary case).
+    /// The ranking is [`vrow0_topk`]'s: `f32::total_cmp` descending, ties to the
+    /// LOWER index — the same rule both argmax kernels implement.
+    fn dump_topk(&self, pos: usize, base: u32, n: usize) -> Result<()> {
+        let mut lg = vec![0f32; n];
+        let b = Device::view(self.s.logits.ptr, n * std::mem::size_of::<f32>());
+        self.dev.download_f32(&b, &mut lg)?;
+        let mut line = format!("[topk] pos={pos}");
+        for (i, (id, v)) in vrow0_topk(&lg, base, topk_dump_n()).iter().enumerate() {
+            line.push_str(&format!(" #{} id={} val={}", i + 1, id, v));
+        }
+        eprintln!("{line}");
+        Ok(())
+    }
+
+    /// The `DSV41_LAYER_DUMP` probe: ONE `[layer]` line carrying the L2 norm of
+    /// the residual stream the block just finished writing
+    ///
+    /// ```text
+    /// [layer] l=0 norm=123.45
+    /// ```
+    ///
+    /// The buffer is `s.h`, the whole `hc*dim` hyper-connection stream (the same
+    /// tensor `layer()`'s dspark tap collapses over), NOT its `hc`-mean — a
+    /// collapse would add a kernel to a diagnostic path and blur which of the two
+    /// moved. `pos` is not printed: the caller knows which step it drove.
+    fn dump_layer_norm(&self, layer: usize) -> Result<()> {
+        let n = self.cfg.hc_mult * self.cfg.dim;
+        let h = self.dl(self.s.h.as_f32(), n)?;
+        let mut ss = 0f64;
+        for &v in &h {
+            ss += (v as f64) * (v as f64);
+        }
+        eprintln!("[layer] l={layer} norm={:.6}", ss.sqrt());
         Ok(())
     }
 
