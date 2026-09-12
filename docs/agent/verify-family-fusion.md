@@ -613,3 +613,7 @@ for each K-atom (64 fp4 元素 = 2 个 32-块):
 - **如果 accept 保持 1**：再怎么压步时也到不了 400（需要 2.5ms 步时——不可能）
 
 **结论**：400 的成败在 **accept 率**，不在步时。bf16 截断（backbone 对齐）+ draft 数值路径对齐是关键。sglang 的 accept 5 说明 MTP head 有这个能力——ferrite 的 draft 实现有数值偏差压低了它。
+
+## W4 compressor 族现状——compress_proj_rows 已存在（mrows 版）
+
+`compress_proj_rows`（chain_dev.rs:9188）是 compressor 投影的 m 行版本（per-row `comp_wkv`/`comp_wgate` 投影的批版）。80 launch/步已部分批化。`compressor_fused` 有 NOTE："NOT used"（:9263）——有 kernel 但未启用，原因需查（可能是数值域或形状约束）。剩余优化空间：0.55ms → 0.25-0.35ms（fused 启用 + f32 mrows）。
