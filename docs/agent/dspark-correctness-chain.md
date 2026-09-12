@@ -5851,3 +5851,31 @@ m-1 个 round）。因此**修复方向 = 增大 slot**，与 `serve.rs` 既有�
 `engram_apply_rows` 自身一致（无 `.max(1)`，engram 关闭时为 0 不影响 max）。
 
 **验证**：`cargo check --workspace` EXIT=0。
+
+## 🎉🎉🎉 SWALLOW 完全解锁！（c900216e——engram 修复后的决定性测试）
+
+**结果**：
+- **PANIC = 0** ✓✓✓（engram 修复生效——check_payload 不再触发！）
+- **CANARY/GUARD/RESET = 0** ✓✓✓（OOB 修复的效果保持！）
+- **ar5-hang = 0** ✓✓✓
+- **LEN=387, completion=300** ✓✓✓（正常生成——达到 max_tokens=300！）
+- **finish_reason=length**（合法——真的到 max_tokens！不是 fault！）
+- **拉丁=[]** ✓
+- **吞吐 = 56.6 tok/s**（含 V5_LEDGER 观测开销——D2H 每步）
+
+**Ledger 证明 SWALLOW 臂正常**：
+```
+pos=319: arm=swallowed k_emit=1 delta=86 canary=0xdeadbeef
+pos=320: arm=swallowed k_emit=2 delta=86 canary=0xdeadbeef
+pos=322: arm=swallowed k_emit=1 delta=86 canary=0xdeadbeef
+```
+- **arm=swallowed 的 note 正常出现**（穿过旧墙——结构性证明！）
+- **epoch 递增**（12953→13039→13125，每步 delta=86）
+- **canary 全程清洁**（0xdeadbeef）
+
+**11 次修复的最终结果**：SWALLOW 完全解锁！batched 路径可用！
+
+**下一步**：
+1. 无观测开销的吞吐测量（关 V5_LEDGER）
+2. SH_PAIR M=6 验证（-4.9~7.9ms）
+3. 400 冲刺！
