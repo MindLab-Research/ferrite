@@ -76,6 +76,9 @@
 #   bash scripts/batched_400_v2.sh --no-sync       # measure the node tree as-is
 #   MAXTOK=1000 PORT=8691 bash scripts/batched_400_v2.sh
 #   NODE=ubuntu@1.2.3.4 bash scripts/batched_400_v2.sh
+#   B400_MROWS_A=b2 bash scripts/batched_400_v2.sh   # mrows S2 Phase A arm (b1|b2|b3;
+#                                                    # ONE gate per serve — see the
+#                                                    # ARM block below)
 #
 # OUTPUT: $LOGDIR/<tag>.{log,dspark,metrics,txt,env,resp.json,build_*.log}
 #   Exit: 0 = usable AND both red lines hold; 1 = a red line broke (拉丁 / 双字 /
@@ -207,6 +210,60 @@ if [ "$TCGEN05_E4M3_GROUPED" = 1 ]; then
     TC5_GATES="DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41_GATEUP_FUSE=0 DSV41_EXPERT_ILV=0"
     GATES_ONELINE="$GATES_ONELINE $TC5_GATES"
 fi
+
+# ---------------------------------------------------------------------------
+# OPT-IN ARM: the mrows S2 **Phase A** A/B — B2 / B3 / B1, ONE gate per serve.
+#
+# WHY THIS ARM HAS TO EXIST. The three gates are already read by
+# `attention_rows` (the BATCHED verify path — `chain_dev.rs:10790` K2,
+# `:10595` K1, `:10908` B1) and the kernels they call are already in
+# `dsv41_kernels.cu`, so there is no code left to write in the engine. What did
+# NOT exist is a way to SET them on the node: the serve is spawned through
+# `rssh`, i.e. `ssh NODE "<quoted command>"`, and its environment is built from
+# `$GATES_ONELINE` alone (`rssh() { ssh … "$1"; }`). A local
+# `export DSV41_ATTN_MROWS_ROPE_NORM=1` can never reach that command, and the
+# resulting failure mode is this project's #1 trap: "the gate is ON and nothing
+# changed" — the serve never saw the variable, and the decline is silent
+# (`Ok(false)`; no warning, no counter). Arm it here and the gate rides the same
+# `env` list as the matrix, so the `-- gates:` banner, the on-node
+# `/proc/<pid>/environ` dump (`$LOGDIR/run.env`) and the FORBIDDEN check below
+# all see it — the effective-env proof (V1) needs no extra step.
+#
+# ONE GATE PER SERVE, BY CONSTRUCTION. Each gate is `OnceLock`-cached, one read
+# per process, so a second gate in the same serve would make the first
+# unattributable. And for B1 that is not just discipline: **K2 takes
+# `q_norm_fused`, which short-circuits B1's whole call site**
+# (`chain_dev.rs:10908`, design §0-2), so B1's delta measured under B2 is 0 by
+# construction. b1 and b2 must be two separate serves.
+#
+# THE THREE ARMS (each is one A/B against the unset run):
+#   B400_MROWS_A=b2  -> DSV41_ATTN_MROWS_ROPE_NORM=1   (K2, zero-code)
+#       norm + fp8-quant + wq_b + q-rope in ONE launch where the mrows branch
+#       runs norm_rows(1) + quant_rows(1) + proj_mrows(1) + m per-row ropes(6)
+#       => −7 launches/layer = −280/step; launch account −0.92ms @3.3µs.
+#       ⚠️ If this arm measures SLOWER, check `mrows_rope_norm`'s `qr_norm_out`
+#       is still `null` (`chain_dev.rs:4729`) — passing `Some` is the
+#       documented 9.2 tok/s in-place-write-back cliff.
+#   B400_MROWS_A=b3  -> DSV41_ATTN_MROWS2=1            (K1, zero-code)
+#       wq_a + wkv as ONE two-family `gemm_fp8_mrows2` where the mrows branch
+#       pays two `proj_mrows` => −1 launch/layer = −40/step; −0.13ms @3.3µs.
+#   B400_MROWS_A=b1  -> DSV41_VERIFY_ROPE_MROWS=1      (B1, zero-code)
+#       q rope row fold: m per-row `apply_rope` -> ONE `apply_rope_mrows`
+#       => −5 launches/layer = −200/step; −0.66ms @3.3µs **while B2 is OFF**.
+#
+# USAGE:  B400_MROWS_A=b2 bash scripts/batched_400_v2.sh
+# ⚠️ The `.so` must carry the symbols. `build.sh` compiles them from this
+# same-source .cu unconditionally (no `#ifdef`, unlike the tcgen05 arms), so
+# the rebuild this script already performs is sufficient; a stale .so would make
+# the arm inert while the gate still looks set (the trap above).
+MROWS_A="${B400_MROWS_A:-}"
+case "$MROWS_A" in
+    "") ;;
+    b2|B2) GATES_ONELINE="$GATES_ONELINE DSV41_ATTN_MROWS_ROPE_NORM=1" ;;
+    b3|B3) GATES_ONELINE="$GATES_ONELINE DSV41_ATTN_MROWS2=1" ;;
+    b1|B1) GATES_ONELINE="$GATES_ONELINE DSV41_VERIFY_ROPE_MROWS=1" ;;
+    *) echo "FATAL: B400_MROWS_A='$MROWS_A' is not a Phase A arm (b1|b2|b3); refusing to guess."; exit 2 ;;
+esac
 
 echo "== BATCHED-400 v2 (rebuilt) comprehensive run =="
 echo "-- node $NODE   arch $ARCH   port $PORT   tp $TP"

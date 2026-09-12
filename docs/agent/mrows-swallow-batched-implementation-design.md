@@ -292,6 +292,29 @@ let mrows = self.dev.supports_gemm_fp8_mrows() && !Self::swapab() && m <= VERIFY
 
 ---
 
+## 7. 工部实施记录（2026-09-12 · Phase A 第一批）
+
+**结论：Phase A 的 3 个「零代码接线」在 HEAD 已全部落树、已连在 batched 路径上 ⇒ 引擎侧无需新增代码。**
+勘察逐点核对设计 §3 的接线点（行号见下），`cargo check --workspace` EXIT=0。
+
+| 项 | gate（默认 OFF） | 接线点（均在 `attention_rows` = batched 路径） | kernel / launcher | 落树 |
+|---|---|---|---|---|
+| B2 | `DSV41_ATTN_MROWS_ROPE_NORM` | `chain_dev.rs:10790-10809`（`k2_took`）→ `Self::mrows_rope_norm`@4696 | `dsv41_gemm_fp8_mrows_rope_norm`@`dsv41_kernels.cu:6006` | `97ce72e` |
+| B3 | `DSV41_ATTN_MROWS2` | `chain_dev.rs:10595-10648`（`mrows2`/`m2_ok`）→ `Self::proj_mrows2`@4769 | `dsv41_gemm_fp8_mrows2`@`:5650` | `196a7d6` + `a04ab3f` |
+| B1 | `DSV41_VERIFY_ROPE_MROWS` | `chain_dev.rs:10908-10922`（`q_roped`） | `dsv41_apply_rope_mrows`@`:9182` | `626251e` / `75c1c15` |
+
+两点与设计一致的**代码事实复核**（不是文档转述）：
+* K2 的 `qr_norm_out` 确为 `null`（`chain_dev.rs:4729`），且后续 `norm_rows` 在 `k2_took` 时仍会跑（`qr_raw_r = q_norm_fused && !k2_took && …`，`:10836`）——即 §3 的陷阱已被 FIX 覆盖；
+* 三个 gate 的读点全部落在 `step_rows`→`layer_rows`→`attention_rows`（`:6042`/`:10261`/`:10388`/`:10558`）内，满足 §1.1 的 M 判据。
+
+**真正缺失的是「把 gate 送到节点上」这一段接线**：serve 经 `rssh`（`ssh NODE "<quoted>"`）拉起，其 env 只由 `$GATES_ONELINE` 构成 ⇒ 本机 `export` 到不了节点，而 decline 是静默的（`Ok(false)`），正是 Y1/V1 说的「设了没生效」。
+⇒ 已在 `scripts/batched_400_v2.sh` 加 opt-in arm（默认 unset ⇒ GATES 逐字不变）：
+`B400_MROWS_A=b2|b3|b1`，一次只允许一个 gate（B1 与 B2 必须分 serve 跑，§0-2）。arm 的 gate 进入 `$GATES_ONELINE`，因此 `-- gates:` banner、`$LOGDIR/run.env` 的 `/proc/<pid>/environ` 实读、FORBIDDEN 校验都自动覆盖它。
+
+*工部 · 本段为实施记录；phase A 无 GPU 命令执行，验收只到 `cargo check` + `bash -n`。*
+
+---
+
 *工部 · 只读勘察 + 本文件（唯一产出）；未执行 GPU 命令、未改动任何源码。*
 *所有 ms 标来源（实测 / launch 账 / 设计 / 代数）；行号以 HEAD `ba88df1` 为准；*
 *与任务前提冲突处已显式给出依据与 file:line。*
