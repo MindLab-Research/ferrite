@@ -3520,3 +3520,36 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 - **干净最佳：78.8 tok/s**（base：lazy + SH_PAIR + Wave 1）——不是 84.0！
 - R2 的 +6% 无效（损坏输出）
 - 待 r2-corruption-rootcause 找到具体 bug 后修复再启用
+
+## R2 损坏的亲自分析——lin_rope_norm 没有位置参数！
+
+**观察**（chain_dev.rs:9743-9755）：
+```rust
+self.lin_rope_norm(
+    qr_r,           // input (raw)
+    q_norm,         // norm weights
+    eps,
+    ql,             // quant layout
+    wq_b,           // weight
+    wq_b_scale,
+    nlh*hd,         // output size
+    q_r,            // output
+    rd,             // rope dim?? 或 rope data??
+    hd,             // head dim
+)
+```
+
+**关键**：**没有位置参数！** lin_rope_norm 必须从内部读取位置——最可能是 `pos_ctr`（EAGER 的语义：当前 token 的位置）。
+
+**verify 路径的问题**：
+1. EAGER：pos_ctr = 当前位置（每步设置一次）✓
+2. verify lazy：set_pos_ctr(pos + i) 每行设置 ✓（时序对的话）
+3. **但是**：如果 lin_rope_norm 内部不是读 pos_ctr 而是别的位置源（或 rd 参数是预计算的 rope 表而表的索引方式不同）——位置会错！
+
+**"序列重置"模式的解释**：
+- 计数 1-61 对 → 62-65 变 12-15（重置到 12）
+- 出师表 ~100 字对 → "opa" → 重复开头
+- 如果 rope 位置偶尔错，attention 的分数会错——但不会"重置"
+- **"重置"更像是 KV cache 或 hidden state 在特定点被破坏**——模型"从早期状态继续"
+
+**待 r2-rope-position-analysis 的判决**：lin_rope_norm 的位置源到底是什么？
