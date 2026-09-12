@@ -7,6 +7,18 @@
 > 目标：expert 2.0ms/步 → ~1.0ms/步 ⇒ 步时 ~3.0ms ≈ 300+ tok/s（**唯一路径**，4-5 人日）。
 > 代码基线：`kernels/cuda/dsv41_experts_mxf4.cu`（现有 `mxf4_gemm_kernel` / `expert_gemv_fp4*`）。
 
+> 🔴 **2026-09-12 修订（本文件当前口径，覆盖以下各节原本的 mxf8f6f4 假设）**
+> **Phase 1 默认 = `kind::mxf4`**（A/B 两侧 packed，E2M1×E2M1，ue8m0，`scale_vec::2X`）；
+> **`mxf8f6f4`（`scale_vec::1X`，e4m3 激活）降为备选臂**。依据与代价见新增 **§1e**。
+>
+> ⚠️ 本轮流传的"定案"里有两处**与代码不符**，本文件按代码订正（逐条 `file:line` 见 §1e）：
+> ① 参考实现的 fp4-weight `linear()` 激活是 **FP8 e4m3，不是 fp4 e2m1**
+>    （`ref_inference/model.py:187` 调的 `act_quant` 产出 `float8_e4m3fn`；`kernel.py:111,490,511`）。
+>    "激活本来就是 e2m1"说的是**现生产 ferrite**，不是参考。
+> ② 因此 mxf4 相对参考**不是零损失**，而是"沿用既有 e2m1 偏差"；"零"只成立于
+>    **相对现生产 162.6 tok/s 基线**（同一套 `dsv41_quant_fp4`）。另："smem 减半 ⇒ 更多 CTA/SM"
+>    不成立——occupancy 由 TMEM 256 列/CTA 钉死，真收益是 **ring 深度**（§1d/§1e）。
+
 ## 0. 为什么 expert 与 gemv 的 swapAB 不同（避免重蹈 serve 中性）
 
 | | gemv swapAB（已关闭） | expert tcgen05（本项目） |
@@ -99,9 +111,11 @@ M 侧 3840/5120 整除 128（满 tile），N 侧 decode=1 token → 补到 **N=8
   2. **mxf8f6f4 的 fp4 操作数必须 UNPACKED（1 元素/字节）**，而 checkpoint 是 2 元素/字节 ⇒
      每个 ring slot 需要两块 buffer（TMA 落的 raw 打包区 + MMA 读的 unpack 操作数），
      并在中间做一次 1:2 展开。这就是本 kernel 最大的 smem 开销，也是"TMA 直接写操作数"不可能的原因。
-     **Alternative B（已记为备选，未实现）**：改 `kind::mxf4`（两侧都打包）⇒ 无 unpack 段、操作数 smem 减半、
+     **Alternative B**：改 `kind::mxf4`（两侧都打包）⇒ 无 unpack 段、操作数 smem 减半、
      MMA 是 `tests_tcgen05_mxf4.cu` 已数值验证的那条；代价是激活格式 e4m3→e2m1（放弃 Phase 0 买的精度余量），
      且 2X 粒度需把 checkpoint 的 per-32 scale 配对（现 kernel 已在做）。切换约 30 行。
+     🔴 **§1e 已把 Alternative B 升为 Phase 1 默认路径**：本条描述的 UNPACKED 双 buffer 开销
+     是 **mxf8f6f4 臂（现为备选）的固有成本**，不再是默认路径的成本。
   3. **静态 smem 装得下**（kPackK=64/kRing=3 时 45 KiB）⇒ 不需要 `cudaFuncSetAttribute`，
      **图捕获安全**；更深的 ring（更多 in-flight 字节）才需要动态 smem + init 期一次性的 attribute 设置。
   4. **occupancy 是硬约束**：grid=(30, slots) 且每 CTA 256/512 TMEM 列 ⇒ ≤2 CTA/SM；
@@ -152,19 +166,72 @@ SF 布局未验证且 §1c #1 明确"PACKED 挂 = Phase 1 全挂"。做法：同
 （idesc 格式 / LBO-SBO / ring 尺寸 / 去掉 `tc5_unpack_a`，~30 行），共享 ring+TMA+occupancy 机制；
 Phase 0 harness 把激活量化换成 e2m1（1 行）即可出 B 的 parity；**终门仍是 serve 四段文本**。
 
+## 1e. 定案（2026-09-12 修订）：Phase 1 默认 = `kind::mxf4`
+
+**结论**：Phase 1 的 gateup/down swapAB kernel **默认用 `kind::mxf4`**（A/B 两侧 packed fp4 e2m1，
+`scale_vec::2X`，ue8m0）；**`mxf8f6f4`（`scale_vec::1X`，e4m3 激活）为备选臂**。两臂用编译期宏切换
+（idesc 格式 / LBO-SBO / ring 尺寸 / 去掉 unpack），共享 ring+TMA+occupancy 机制（§1d 末段）。
+
+### 1e.1 订正：流传"定案"中与代码不符的表述
+
+| 流传说法 | 代码事实 | 出处 |
+|---|---|---|
+| 参考实现的 linear 激活就是 fp4 e2m1 | **是 FP8 e4m3**。fp4 权重分支走 `act_quant(x, fp8_block_size=32)`，`act_quant` 分配的输出是 `torch.float8_e4m3fn`；`fp4_gemm` 的 A 形参即 FP8，docstring 写明 "FP8 act x FP4 weight" | `ref_inference/model.py:186-195`；`ref_inference/kernel.py:111, 490-493, 511` |
+| mxf4「零数值损失」 | 相对**参考**是有损（e4m3→e2m1，即放弃 Phase 0 买的精度余量）；"零"仅成立于**相对现生产 162.6 tok/s 基线**——生产本来就是 e2m1/block-32/ue8m0，且是同一个 `dsv41_quant_fp4` | `kernels.rs:110-127`；`chain_dev.rs:4217`；`dsv41_experts_mxf4.cu:14` |
+| smem 减半 ⇒ 更多 CTA/SM | **不成立**。绑定点是 **TMEM 256 列/CTA** ⇒ 仍 ≤2 CTA/SM；真收益是 **ring 深度 kRing 3→7-8** | §1d；`dsv41_experts_mxf4.cu:2834,3141-3143` |
+| 无 unpack 段 | **部分成立**：1:2 **展开**段可去掉，但 **permute 段删不掉**（canonical UMMA 布局 `unit16(m,kb)=(m%8)+8kb+16(m/8)` 与 raw packed 行主序不兼容，描述符 (m%8) stride 固定为 1） | `dsv41_experts_mxf4.cu:249-254`；§1d |
+
+> 注：参考实现里确实存在 fp4 激活，但在 **attention 路径**（`model.py:546,552` 的 `fp4_act_quant` 用于
+> q/k），**不是 expert/linear 路径**。expert 的 `linear()` 走的是 e4m3（上表第 1 行）。
+
+### 1e.2 mxf4 成为默认的（可验证的）理由 —— 不是"零损失"
+
+1. **唯一已在 GPU 上数值验证过的 fp4 tcgen05 形式**：`tests_tcgen05_mxf4.cu` 报
+   `maxdiff = 0.000e+00`（EXACT，7 shapes，含两个 ABI 入口 gate/up 与 down），
+   `crates/ferrite-dsv41/README.md:94-101`。而 A 臂（mxf8f6f4）依赖的 **1X PACKED SF 布局
+   （§1c #1）至今没有 GPU parity**。
+2. **与现生产 serve 基线逐位同源**：激活 = `dsv41_quant_fp4` 的 e2m1/block-32/ue8m0，
+   ⇒ serve A/B 的变量被干净地隔离成**单一变量"staging（kRing TMA）"**，而不是"格式 + staging"两个。
+3. **操作数 smem 3.06x**（每 slot 13312 → 4352 B，§1d）⇒ 静态 46.4 → ~19.5 KiB，同一 48 KiB 窗口
+   kRing 3 → 7-8 ⇒ 240 CTA 的 in-flight 1.9 MB → **6.7 MB**，逼近 8 TB/s × ~700 ns 的带宽-延迟积。
+   **这才是打 0.2% 地板的杠杆**（第 2 条把这条杠杆的读数变干净）。
+4. **少一段代码、少一类失败模式**：无 1:2 展开 ⇒ 无 raw/operand 双 buffer（§1c #2 的固有成本只属 A 臂）。
+
+### 1e.3 代价（诚实列出）
+
+- 相对**参考**是精度降级（e4m3 → e2m1），属"沿用既有偏差"而非新增；生产仅被**四段短文本**验过，
+  **长文残余风险非零** ⇒ 终门仍是 §4 的四段文本 + `faults=0`。
+- mxf4 atom 是 **K=64 / `scale_vec::2X`**（scale 粒度 64），checkpoint 的 per-32 scale 需**两两配对**；
+  现 `mxf4_gemm_kernel` 已在做（`dsv41_experts_mxf4.cu:430`），但**这是必须保住的契约**。
+- A 臂仍是"对齐参考"的那条：若 B 臂在 serve 四段文本上翻车（长文数值），**回退 A 臂并补跑其 Phase 0 GPU parity**。
+
+### 1e.4 两臂与 Phase 0 harness 的对应
+
+| 臂 | Phase 0 harness | 激活 | MMA | 状态 |
+|---|---|---|---|---|
+| **B（默认）** | `tests_tcgen05_mxf4.cu` | e2m1 | `kind::mxf4.block_scale.scale_vec::2X` | **GPU 已验 EXACT** |
+| A（备选） | `tests_tcgen05_mxf8f6f4_1x.cu` | e4m3 | `kind::mxf8f6f4.block_scale.scale_vec::1X` | 本会话 host 闭环；**GPU parity 待跑** |
+
+⇒ Phase 0 的**第一件事**从"A 臂 GPU parity"改判为"**确认 B 臂的 `tests_tcgen05_mxf4.cu` 在当前
+checkpoint 尺度规则下仍全绿**"（工作量更小，且是唯一已有 GPU 证据的路径）。
+
 ## 2. Phase 1（1-2 天）gateup kernel
 
 落点：`kernels/cuda/dsv41_experts_mxf4.cu` 新增 swapAB gateup kernel（保留旧 kernel）。
 **实际命名见 §1c**：`tc5::expert_tcgen05_gateup_kernel`（原计划名 `mxf8f6f4_swapab_gemm_kernel` 未采用，
 骨架已按最终签名写好）。
-- **A 侧（权重）**：fp4 smem descriptor。**必须补多级异步 staging**（TMA bulk / cp.async）——
+- **A/B 两侧都 packed**（🔴 §1e 定案：默认 `kind::mxf4`）；
+  **必须补多级异步 staging**（TMA bulk / cp.async）——
   现 `mxf4_gemm_kernel:348-421` 全程 LDG→STS、无 cp.async/TMA（STATUS:5038 的 16.8GB/s 0.2%
   带宽地板根因）。swapAB 只解决 M 钉死，**不补 staging 仍是 0.2% 地板**。
-- **B 侧（激活）**：e4m3 8×K staged；N=8（col0=token，其余 0）。
+- **B 侧（激活）**：fp4 e2m1 8×K staged（与现生产 `dsv41_quant_fp4` 同源）；N=8（col0=token，其余 0；
+  `kind::mxf4` 的 N 合法域为 [8,256] step 8，见 `dsv41_experts_mxf4.cu:14-18`）。
 - **D**：TMEM 累加器；epilogue 用 `tcgen05.ld` 取回，套用现有 epi_mode（gate/up clamp `limit`，
   down 的 row_weight，`epi_mode==3` 累加）。
 - **scale**：SFA（权重 per-row per-32 e8m0）、SFB（激活 per-32）经 `tcgen05.st` 写 TMEM；
-  idesc 用 `make_idesc_mxf8f6f4(a_fmt=E2M1=5, b_fmt=E4M3=0, sf_id...)`。
+  idesc 用 `make_idesc_mxf4(n_dim, a_sf_id, b_sf_id)`（两侧 `E2M1`，`scale_format=UE8M0`，
+  见 `dsv41_experts_mxf4.cu:256-273`）。mxf4 为 **`scale_vec::2X`（粒度 64）** ⇒ 每 K=64 atom
+  吃两个 per-32 scale 字（`dsv41_experts_mxf4.cu:430` 已是此契约）。
 - 形状契约沿用：launcher 只校验 `k % 32 == 0`；`n % 128 == 0` 需新增（M 侧 tile）。
 - **验收**：隔离微基准 + Phase 0 同款 parity（真实权重）。
 
@@ -214,15 +281,16 @@ STATUS:7713 定案的 6 条，隔离评估必须全部满足，否则数据无�
 
 | 里程碑 | 交付 | 工时 | 通过判据 |
 |---|---|---|---|
-| M0 | 探针扩展 | 0.5d | GPU parity 全绿 |
-| M1 | gateup tcgen05 kernel | 1-2d | 隔离微基准 + parity |
+| M0 | 探针：**先确认 B 臂 `tests_tcgen05_mxf4.cu` 全绿**；再扩 A 臂探针 | 0.5d | GPU parity 全绿 |
+| M1 | gateup tcgen05 kernel（**默认 `kind::mxf4`**） | 1-2d | 隔离微基准 + parity |
 | M2 | down + launcher + FFI | 0.5-1d | cargo check + 符号探测 |
 | M3 | serve A/B | 0.5d | 四段文本 + faults=0 + p50 |
 | **Gate** | 去留决策 | — | serve 中性 ⇒ 关闭默认 OFF；否则转默认 ON |
 
 ## 7. 建议改动点（按顺序）
 
-1. `kernels/cuda/tests_tcgen05_mxf8f6f4_1x.cu` —— Phase 0 扩展（真实权重 + parity）。
+1. `kernels/cuda/tests_tcgen05_mxf4.cu` —— **B 臂（默认）探针**，先确认在当前 checkpoint 尺度规则下全绿。
+   备选臂保留 `kernels/cuda/tests_tcgen05_mxf8f6f4_1x.cu` —— Phase 0 扩展（真实权重 + parity）。
 2. `kernels/cuda/dsv41_experts_mxf4.cu` —— 新增 swapAB gateup/down kernel + launcher 门禁。
 3. `kernels/cuda/build.sh` —— 无需改（新 kernel 同 TU，自动进 `.so` + build_id 哈希）。
 4. `crates/ferrite-models/src/dsv41/kernels.rs` / `device.rs` —— FFI + 版本探测。
