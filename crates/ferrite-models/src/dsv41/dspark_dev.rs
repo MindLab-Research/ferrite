@@ -807,54 +807,67 @@ impl<'a> DsparkDev<'a> {
             );
             let ids = self.route_idx.ptr as *const i32;
             if !ld.experts_ilv && self.dev.supports_moe_batch() {
-                // One launch per direction, grid.y = slot. The slot pitch covers
-                // this call's `bs` rows.
-                let act_slot = (bs * 2 * inter_local) as i64;
-                self.dev.expert_gate_up_fp4_batched(
-                    self.xq4.as_u8(),
-                    self.xsc4.as_f32(),
-                    self.ex_act_b.ptr as *mut f32,
-                    act_slot,
-                    bs as i32,
-                    dim as i32,
-                    inter_local as i32,
-                    cfg.swiglu_limit,
-                    topk as i32,
-                    strides.0,
-                    strides.1,
-                    strides.2,
-                    strides.3,
-                    strides.4,
-                    strides.5,
-                    strides.6,
-                    strides.7,
-                    ids,
-                    0,
-                )?;
-                self.dev.swiglu_limit_batched(
-                    self.ex_act_b.ptr as *mut f32,
-                    bs as i32,
-                    inter_local as i32,
-                    cfg.swiglu_limit,
-                    act_slot,
-                    topk as i32,
-                )?;
-                self.dev.expert_down_reduce_fp4_batched(
-                    self.ex_act_b.ptr as *const f32,
-                    act_slot,
-                    self.moe_out.ptr as *mut f32,
-                    bs as i32,
-                    dim as i32,
-                    inter_local as i32,
-                    self.route_w.ptr as *const f32,
-                    1,
-                    topk as i32,
-                    strides.8,
-                    strides.9,
-                    strides.10,
-                    strides.11,
-                    ids,
-                )?;
+                // The batched expert launchers' `rows` argument is validation
+                // only - the grid is output-width based, so each call computes
+                // ONE activation row (the finding recorded in
+                // `DevChain::moe_rows`'s doc). Issue per row, with that row's
+                // packed fp4 bytes, its `ids`/`route_w` slice and its own
+                // `[row][slot][act_slot]` block - the same shape `moe_rows`
+                // uses. (The historical call passed rows = bs and silently
+                // computed row 0 only.)
+                let act_slot = (2 * inter_local) as i64;
+                let row_pitch = (topk * 2 * inter_local) as usize;
+                for r in 0..bs {
+                    self.dev.expert_gate_up_fp4_batched(
+                        self.xq4.as_u8().wrapping_add(r * (dim / 2)),
+                        self.xsc4.as_f32().wrapping_add(r * (dim / 32)),
+                        (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch),
+                        act_slot,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                        topk as i32,
+                        strides.0,
+                        strides.1,
+                        strides.2,
+                        strides.3,
+                        strides.4,
+                        strides.5,
+                        strides.6,
+                        strides.7,
+                        ids.wrapping_add(r * topk),
+                        0,
+                    )?;
+                }
+                for r in 0..bs {
+                    self.dev.swiglu_limit_batched(
+                        (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch),
+                        1,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                        act_slot,
+                        topk as i32,
+                    )?;
+                }
+                for r in 0..bs {
+                    self.dev.expert_down_reduce_fp4_batched(
+                        (self.ex_act_b.ptr as *const f32).wrapping_add(r * row_pitch),
+                        act_slot,
+                        (self.moe_out.ptr as *mut f32).wrapping_add(r * dim),
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        (self.route_w.ptr as *const f32).wrapping_add(r * topk),
+                        1,
+                        topk as i32,
+                        strides.8,
+                        strides.9,
+                        strides.10,
+                        strides.11,
+                        ids.wrapping_add(r * topk),
+                    )?;
+                }
             } else {
                 self.dev.zero(&self.moe_out)?;
                 for slot in 0..topk {
