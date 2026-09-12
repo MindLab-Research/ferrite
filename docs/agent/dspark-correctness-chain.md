@@ -730,3 +730,7 @@ def hc_pre(self, x, pre_mix):
 ## rmsnorm eps 对照——一致 ✓（1e-20）
 
 ferrite config.rs:210 `norm_eps: f(t, "norm_eps").or(f(t, "rms_norm_eps")).unwrap_or(1e-20)` — checkpoint 的 `rms_norm_eps: 1e-20` → ferrite 读到 1e-20 ✓，与官方一致。
+
+## sinkhorn iters/eps 对照——一致 ✓（20 / 1e-6）
+
+ferrite config.rs:278 `hc_sinkhorn_iters: 20`（默认）= checkpoint 的 `hc_sinkhorn_iters: 20` ✓。`hc_eps: 1e-6`（需确认 ferrite 的默认——:279 的 unwrap_or）。
