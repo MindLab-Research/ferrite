@@ -2824,6 +2824,29 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 
 **判定**：sh-pair-parity-fix-3 的修复（幻影行越界 + 测试 bug）解决了 34/36 项。剩余 2 项在 **prod/m=6/nolimit**（batched verify 的生产形状）——lazy verify 用 m=1 不受影响！
 
+### ✅ 已定位并修复（2026-09-12，kernel 本身无 bug——两处都是测试口径）
+
+**根因 1：phase-1 哨兵 `0x5A` 是"可产出"的 e4m3 值（=20.0）。** 覆盖度判据是
+`aqm[i] == 0x5A && aqr[i] == 0x5A` → "两个缓冲都还是哨兵 = 没写"，但一个**真被写入**
+的字节完全可以等于 0x5A，两者无法区分。
+- **GPU-free 证据**：把本套件的 RNG 流（`g_rng = 20260912`，LCG 1664525/1013904223，按 `sh_case()`
+  的填充顺序）+ phase-1 全套数学（consume → shfl 树 → swiglu → amax 树 → `fast_round_scale`
+  → e4m3 encode）在 host 上复刻一遍，**完全不涉及显存/哨兵**：
+  `prod/m=6/nolimit` 的数据恰好有 **8 个元素量化成 0x5A**（邻域直方图 `0x58=6 0x59=10 0x5A=8 0x5B=9 0x5C=4`，
+  哨兵正落在产出分布正中间）；其余 7 个 `limit=3.0` 用例都是 **0 个** → 只有 nolimit 翻车。
+  与套件报的"8"逐个吻合。**kernel 每个字节都写了**，且与 M=1 参考逐位相同（`aq_same` 一直通过）。
+- **修复**：哨兵 `0x5A → 0x7F`（e4m3 NaN 码）。emit 是 `fminf(fmaxf(v/sc,-448),448)` + saturating
+  cvt，`0x7F/0xFF` **不可产出**：已用 host 穷举证明（全部 256 个 e4m3 码值 ±1ulp + clamp 域密集扫描
+  + 边界 ulp 逐格走 + 200 万随机/饱和/下溢探针 → 0 次命中）。从此"仍是 0x7F"⇔"从未写入"。
+- 顺带给两处覆盖度 FAIL 加了**首个洞的位置**（`r=%zu c=%d` + 两侧字节），真洞一眼可辨。
+
+**根因 2：那"2 个失败"里有 1 个是 double-count，不是第二个 FAIL 行。**
+`SH_CHECK` 内部 `++g_fails`，而 `sh_case` 失败时又 `return 1`，`main` 再 `g_fails += sh_case(...)`
+→ **单行 FAIL 被记成 2**。所以 "RESULT: 2 check(s) FAILED" 只对应 1 行 FAIL 输出。
+（`tests_dsv41_gemm_mrows.cu` 的 `mr_case` 是同一写法，属同源口径；仅影响计数标签，不影响退出码。
+修掉哨兵后 `g_fails` 归零，标签自然消失。）
+
+
 ## Plan B SWALLOW 测试结果——0 ar5-hang ✓
 
 **结果**：PLANB-CRASH（curl 超时——可能是 serve 启动慢），但 **0 ar5-hang + 0 DISAGREED** ✓

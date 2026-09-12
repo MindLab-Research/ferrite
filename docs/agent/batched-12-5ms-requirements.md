@@ -129,7 +129,7 @@ for (int kb = 0; kb < nb_k; ++kb) {
 |---|---|---|---|---|
 | B0 | batched 现状（SWALLOW 无图） | — | **~40ms（serve）/ verify ~37-39** | 实测 |
 | B1 | + Plan B（图化） | −3~4 | ✅ **实测只 −1.5ms**（非 −15） | 已实施未测 |
-| B2 | + SH_PAIR `template<M=6>` | −4.9~7.9 | ⚠️ **parity 2 failed**（prod/m=6/nolimit） | 待修 parity |
+| B2 | + SH_PAIR `template<M=6>` | −4.9~7.9 | ✅ **parity 根因已修**（哨兵 `0x5A→0x7F`，kernel 无 bug；见 `dspark-correctness-chain.md` §SH_PAIR Parity） | 待上 GPU 复跑 parity |
 | B3 | + mrows 族（GATE/INDEXER/ROPE/HEAD/NORM/COMPRESSOR） | −4.5~5.8 | ❌ **实测 ≈0**（两次零收益） | gate 已就位 |
 | B4 | + tcgen05 e4m3 grouped | −2 | ⚠️ **修正 −1.0~3.8**（down 无核） | 从未上 GPU |
 | — | 小计（B1-B4） | −15 ~ −20 | 60% 兑现 ⇒ **−9 ~ −12** | |
@@ -166,8 +166,10 @@ for (int kb = 0; kb < nb_k; ++kb) {
 
 ### A. 零/低成本（已就位 gate，只差 A/B 或默认值）
 
-1. `SH_PAIR_M=1 (+ SH_PAIR_M_FOLD=1)` —— **前置：parity 100%**（当前 prod/m=6/nolimit 剩 2 失败，
-   `dspark-correctness-chain.md:2813-2825`）；`template<M=6>` 是 batched production 形状。
+1. `SH_PAIR_M=1 (+ SH_PAIR_M_FOLD=1)` —— **前置：parity 100%**（prod/m=6/nolimit 的两项已定名为
+   **测试口径问题、kernel 无 bug**：phase-1 哨兵 `0x5A` 可产出 → 已改 `0x7F`；另一"失败"是
+   `SH_CHECK ++g_fails` 与 `main += sh_case()` 的 double-count。**待上 GPU 复跑确认**；
+   `dspark-correctness-chain.md` §SH_PAIR Parity）；`template<M=6>` 是 batched production 形状。
 2. `GATE_MROWS` / `INDEXER_MROWS`(front) / `VERIFY_ROPE_MROWS` / `VERIFY_HEAD_MROWS`（**最后单独上**，
    历史 ar5-hang 组合）/ `NORM_MROWS` / `COMPRESSOR_MROWS`。
 3. `HC_VERIFY_FUSE=1` + `HC_FRONT_ROWS=1`（**前置**：`chain_dev.rs::hc_mixes_auto` 的 verify 调用点
