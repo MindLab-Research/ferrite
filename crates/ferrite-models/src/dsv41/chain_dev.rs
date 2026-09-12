@@ -4898,6 +4898,28 @@ impl<'a> DevChain<'a> {
         })
     }
 
+    /// B6 (DSV41_VERIFY_WOB_MROWS_F32, default OFF): the verify's wo_b as ONE
+    /// m-rows launch reading the RAW f32 activation (`dsv41_gemm_fp8_mrows_f32`),
+    /// instead of `m x quant_fp8 + 1 x proj_mrows`.
+    ///
+    /// It is the m-rows form of [`Self::wob_f32`]'s lever: row r of the launch is
+    /// bit-identical to the M=1 `dsv41_gemm_fp8_mx_f32` decode of row r (EAGER's
+    /// wo_b program), and NOT bit-identical to the fp8 round trip it replaces —
+    /// skipping the quantise -> dequantise step is strictly more accurate, which
+    /// is why the acceptance is the red line and not a byte comparison.
+    ///
+    /// Default OFF because it is a new kernel: "=1" is the bring-up arm, and the
+    /// A/B (`scripts/batched_400_v2.sh`) is what flips it. A stale `.so` (no
+    /// symbol) falls back the same way the gate being unset does. The activation
+    /// row pitch is passed explicitly (`ol_total`, NOT `k = ol_local`) — see
+    /// [`Self::gemm_fp8_mrows_f32`] / the kernel's `a_stride` contract.
+    fn wob_mrows_f32() -> bool {
+        static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *F.get_or_init(|| {
+            std::env::var("DSV41_VERIFY_WOB_MROWS_F32").map(|v| v == "1").unwrap_or(false)
+        })
+    }
+
     /// chain-pair-grid-sync (DSV41_WO_PAIR, default OFF): the wo_a -> wo_b pair as
     /// ONE grid-sync launch (`dsv41_gemm_fp8_wo_pair`) instead of two, with a
     /// sense-reversing device-wide barrier between the phases. Each row is still
@@ -11585,9 +11607,12 @@ impl<'a> DevChain<'a> {
                 for g in 0..nlg {
                     // The weight tensor is ALREADY this rank's local slice, so every
                     // offset is local (see `attention`'s comment on the tp=8 bug).
-                    let a = self.s.xq.as_u8().wrapping_add(g * k);
+                    // `a` (activation) and `wp` (weight) both feed
+                    // `gemm_fp8_mx_or_swap`'s `cp.async.bulk`/`LDG.128` sources, so
+                    // both views stay on the 16B grid (DevBuf::u8_aligned_at).
+                    let a = self.s.xq.u8_aligned_at(g * k);
                     let asc = self.s.xsc.as_f32().wrapping_add((g * k / 32) as usize);
-                    let wp = ld.wo_a.as_ref().unwrap().as_u8().wrapping_add(g * olg * k);
+                    let wp = ld.wo_a.as_ref().unwrap().u8_aligned_at(g * olg * k);
                     let wsp = ld
                         .wo_a_scale
                         .as_ref()
@@ -11613,7 +11638,39 @@ impl<'a> DevChain<'a> {
         // block (`proj_mrows`); the activation is this rank's `ol_local`-wide
         // slice of each `wo_r` row. It reads `wo_r`, which the wo_a phase above
         // fully wrote — both forms of that phase finish before this launches.
-        let took_wob = if mrows {
+        let mut took_wob = false;
+        // B6 (DSV41_VERIFY_WOB_MROWS_F32, default OFF): the wo_b step as ONE
+        // m-rows launch over the RAW f32 `wo_r` rows, instead of
+        // `m x quant_fp8 + 1 x proj_mrows`. Row r of the launch is bit-identical
+        // to the M=1 f32 GEMV decode of row r (EAGER's `wob_f32` program); it is
+        // NOT bit-identical to the fp8 pair below — skipping the round trip is
+        // strictly more accurate (same lever as `DSV41_WOB_F32`), which is why
+        // the acceptance is the red line rather than a byte comparison.
+        //
+        // `a_stride = ol_total` is the whole point of the ABI: `wo_r`'s real row
+        // pitch is `ol_total` while the contraction is only `ol_local` wide, so
+        // the pitch CANNOT be derived from `k`. Passing it explicitly removes the
+        // per-row packing loop below along with the `quant_fp8` launches.
+        // ⚠️ STALE-READER CHECK: this arm does NOT write `xq_r`/`xsc_r` (the fp8
+        // arm below quantises the rows into them). Verified at HEAD: within
+        // `attention_rows` their last use IS that quant, and the next reader
+        // (`indexer_front_rows`) runs its own `quant_rows` first — so skipping is
+        // safe. Re-check with `grep -n xq_r` before changing this ordering.
+        if Self::wob_mrows_f32() && mrows && self.dev.supports_gemm_fp8_mrows_f32() {
+            took_wob = self.dev.gemm_fp8_mrows_f32(
+                self.s.wo_r.ptr as *const f32,
+                ld.wo_b.as_ref().unwrap().as_u8(),
+                ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                self.s.wo_out_r.ptr as *mut f32,
+                m as i32,
+                dim as i32,
+                ol_local as i32,
+                ol_total as i32, // a_stride: the TRUE row pitch of `wo_r`
+                dim as i32,      // out_stride
+            )?;
+        }
+        if !took_wob && mrows {
             // ⚠️ ROW STRIDE FIX (same class as the o_r quant above):
             // `quant_rows` derives the SOURCE row stride from `cols`, but `wo_r`'s
             // real pitch is `ol_total` (8x `ol_local` under TP8) — a block call
@@ -11629,7 +11686,7 @@ impl<'a> DevChain<'a> {
                     true,
                 )?;
             }
-            self.proj_mrows(
+            took_wob = self.proj_mrows(
                 ld.wo_b.as_ref().unwrap().as_u8(),
                 ld.wo_b_scale.as_ref().unwrap().as_u8(),
                 self.s.wo_out_r.ptr as *mut f32,
@@ -11637,10 +11694,8 @@ impl<'a> DevChain<'a> {
                 dim as i32,
                 ol_local as i32,
                 dim as i32,
-            )?
-        } else {
-            false
-        };
+            )?;
+        }
         if !took_wob {
             for r in 0..m {
                 self.quant1(
@@ -16319,7 +16374,7 @@ fn tap_input() -> bool {
                     // branch above), which is exactly the row this kernel wants;
                     // `xsc4` is the same [dim/32] f32 vector either way.
                     ran_tc = self.dev.expert_tcgen05_gate_up_e4m3(
-                        self.s.xq4.as_u8(),
+                        self.s.xq4.u8_aligned_at(0),
                         self.s.xsc4.as_f32(),
                         self.s.ex_act_b.ptr as *mut f32,
                         (2 * inter_local) as i64,  // unfused slot pitch
@@ -16339,7 +16394,7 @@ fn tap_input() -> bool {
                     )?;
                 } else if tc_mxf4 {
                     ran_tc = self.dev.expert_tcgen05_gate_up_mxf4(
-                        self.s.xq4.as_u8(),
+                        self.s.xq4.u8_aligned_at(0),
                         self.s.xsc4.as_f32(),
                         self.s.ex_act_b.ptr as *mut f32,
                         (2 * inter_local) as i64,  // unfused slot pitch

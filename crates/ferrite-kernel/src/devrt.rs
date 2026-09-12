@@ -325,6 +325,14 @@ unsafe fn verify_kernel_build(handle: *mut c_void, so_path: &str) -> Result<()> 
     Ok(())
 }
 
+/// 16 B: the alignment `cp.async.bulk*` requires on the global source (and on the
+/// smem destination of the `.shared::cluster.global` form) and that every
+/// `LDG.128` / `cp.async`16 operand requires too. Mirrors
+/// `ferrite_models::dsv41::weights::BULK_ALIGN`; kept local so this crate stays
+/// free of a models dependency. See
+/// docs/agent/tcgen05-tma-bulk-align-design.md.
+pub const BULK_ALIGN: usize = 16;
+
 /// A plain device allocation. No pooling: the load-and-run path is
 /// latency-tolerant, and skipping the pool keeps this layer free of any
 /// interaction with the capture-sensitive activation allocator.
@@ -363,6 +371,19 @@ impl DevBuf {
     /// Byte view at an offset, e.g. to alias a slice of a packed weight.
     #[inline]
     pub fn as_u8_at(&self, off: usize) -> *const u8 {
+        (self.ptr as *const u8).wrapping_add(off)
+    }
+    /// A 16-byte-aligned view at `off` bytes into this buffer. `cp.async.bulk*`
+    /// and `cp.async`16/`LDG.128` operands all require it, and this is the ONE
+    /// place a view into a pooled allocation can be built: a bare
+    /// `ptr.wrapping_add(off)` at a call site is how a 4-byte slip reaches a
+    /// TMA source (`dsv41_experts_mxf4.cu` documents the class; see
+    /// docs/agent/tcgen05-tma-bulk-align-design.md §4.1c). `debug_assert` only:
+    /// release has no overhead, and the point is to blow up in CI/parity runs
+    /// instead of silently misplacing bytes in production.
+    #[inline]
+    pub fn u8_aligned_at(&self, off: usize) -> *const u8 {
+        debug_assert_eq!(off & (BULK_ALIGN - 1), 0, "bulk/16B view must stay aligned");
         (self.ptr as *const u8).wrapping_add(off)
     }
     #[inline]

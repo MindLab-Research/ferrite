@@ -5480,6 +5480,240 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
 }
 
 // ===========================================================================
+// B6 (`dsv41_gemm_fp8_mrows_f32`): the MULTI-ROW form of the f32-activation
+// GEMV (`dsv41_gemm_fp8_mx_f32`) -- fp8 e4m3 weights x RAW f32 activations.
+// The verify's wo_b, folded from `m x quant_fp8 + 1 x proj_mrows` into ONE
+// launch per layer. Design: docs/agent/b6-mrows-f32-design.md.
+// ===========================================================================
+// WHY THIS EXISTS. `attention_rows` quantises EVERY row of `wo_r` into
+// `xq_r`/`xsc_r` (m launches) and then runs the fp8 multi-row GEMV over them
+// (one launch), i.e. `m + 1` launches per layer for one input -- even though
+// the activation on this site is a plain f32 row (`wo_r`) and the fp8
+// round-trip is a pure loss. The M=1 decode on the same site (EAGER,
+// `DSV41_WOB_F32` default ON) already reads the raw f32 activation via
+// `dsv41_gemm_fp8_mx_f32`; this kernel is that program with the row batch
+// folded in, so the two paths become ONE program (row r of this launch == row
+// r of the M=1 call, bit for bit).
+//
+// NUMERICS -- for every (output row `row`, activation row `r`), BIT-IDENTICAL
+// to the M=1 `dsv41_gemm_fp8_mx_f32` call of the same (row, r). That kernel's
+// consume loop is
+//     acc += a_f32[j] * (s_lut[row_s[j]] * sb),   sb = ue8m0_to_f(wsr[kb]), j = kb*32+lane
+// and this kernel emits the SAME expression with the M activation operands
+// hoisted into registers:
+//     const float wv = s_lut[s_w[warp*k + j]] * sb;
+//     av[r] = a_f32[r*a_stride + j];  acc[r] += av[r] * wv;
+// C1 (same K walk): `kb` ascends 0..nb_k-1 and `j = kb*32 + lane` -- the
+//     order-preserving staged form. The launcher declines `g_gemv_fp8_mode < 3`.
+// C2 (same operands, same bytes): `s_w` holds the weight row's own fp8 bytes
+//     (staged by the same cp.async16 rule the fp8 sibling uses); `wsr` is the
+//     weight's ue8m0 scale row; the activation operand is the raw f32 word at
+//     `a_f32[r*a_stride + j]` -- the very word the M=1 kernel reads (its
+//     `a32=1` slot `s_af` IS that value: `s_af[i] = a_f32[i]`, a pure copy, see
+//     the gemv header). `e4m3_to_f` / `ue8m0_to_f` are the gemv's own helpers.
+//     NOT bit-identical to the OLD verify path (`m x quant_fp8 + proj_mrows`):
+//     this kernel SKIPS the quantise -> dequantise round trip, so the activation
+//     carries its full f32 mantissa and the row partial sums are slightly MORE
+//     accurate. That is intentional (same lever as `DSV41_WOB_F32` / E8), which
+//     is why the acceptance is the red line, not a memcmp against the old path.
+// C3 (same reduction tree): the `shfl_xor` tree off = 16,8,4,2,1 is emitted
+//     verbatim and run ONCE PER (warp, r).
+// C4 (no cross-row recombination): `acc[r]` is an independent chain; nothing is
+//     ever added across r. `wv` is hoisted out of the r loop because it is a
+//     per-(row, kb) value -- the identical decode on the identical value,
+//     reused. (Sharing ONE weight decode across the M rows is exactly what
+//     removes the m-fold weight traffic; it does not touch the association.)
+// C5: no K-split and no smem fold exists here, so nothing can reorder.
+// C6 (codegen pin): the accumulate stays a SINGLE serial `acc[r] +=` chain with
+//     the M=1 loop's `#pragma unroll 32` source form. Unrolling cannot
+//     reassociate a serial chain; split accumulators WOULD -- do not "optimise"
+//     this into per-r partials or a multi-way unrolled body with plain
+//     operators (build.sh records a ~1 ULP/layer fast-math drift from that).
+//
+// WHY THERE IS NO ACTIVATION STAGING (unlike the fp8 sibling). The fp8 kernel
+// must stage `s_a` (k BYTES x m) because it has to decode LUT + scale; this
+// domain's "materialisation" is the identity, so the only thing a slot could do
+// is copy m*k*4 bytes (24 KB at m=6, k=1024) that are already L2-resident -- at
+// the price of an smem write, a barrier and (for the draft shape, k = 8192) a
+// 160 KB slot that would not even fit. Direct global reads are both simpler and
+// cheaper, and the M reads per (warp, kb) are one coalesced 128 B line each.
+//
+// THE THREE PLUGGABLE PHASES (this kernel is the skeleton the rest of the B
+// class is written against, per the design's §4.3):
+//   ① PROLOGUE -- producing this block's activation operand. HERE: identity
+//      (`av[r] = a_f32[r*a_stride + j]`). The fp8 sibling's prologue is the
+//      LUT+scale decode; a future consumer's (e.g. B2's rmsnorm) would be its
+//      own -- the slot is this loop.
+//   ② CONSUME  -- the M independent serial chains, unchanged from the fp8
+//      sibling (C1/C4/C6).
+//   ③ EPILOGUE -- the per-row lane-0 write-back. HERE: `acc + bias`. A future
+//      consumer inserts its own tail here (e.g. the rope phase of the EAGER
+//      `gemm_fp8_mx_rope` epilogue: `s_rows[warp] = v` then the paired-warp
+//      rotation). Keep it a SEPARATE statement after the shfl tree -- never
+//      fold it into the accumulate chain, which would break C6's codegen pin.
+//
+// ABI: (a_f32, w, w_scale, bias, out, m, n, k, a_stride, out_stride, stream)
+//      -> 0 launched, 2 DECLINED (never 1).
+//   a_f32      [m, a_stride]  f32 activation, row r at +r*a_stride ELEMENTS
+//   w          [n, k]         fp8 e4m3 weights (k % 32 == 0)
+//   w_scale    [n/32, k/32]   ue8m0 (block 32x32)
+//   bias       [n] or null    (both call sites pass null)
+//   out        f32, row r's element `row` at +r*out_stride + row
+//   a_stride   the activation ROW PITCH, in f32 elements -- an EXPLICIT
+//              contract, not the caller's implicit promise. verify's `wo_r` is
+//              [m, ol_total] while k = ol_local (TP8: 8x), so the pitch cannot
+//              be derived from `k`; that mismatch was the verify-value-hunt
+//              root cause F1/F2 ("row 0 always right, r>=1 always wrong").
+//              Declining `a_stride < k` refuses a silently-wrong read instead
+//              of guessing. draft's `wo` is compact, so it passes `a_stride = k`.
+//   out_stride >= n           (the verify site writes `dim` of an `nh*hd` row)
+// "2" and not cudaErrorInvalidValue: 1 would be indistinguishable from a real
+// launch failure, and every decline here is a shape / mode property the caller
+// can fall back on -- the caller keeps its per-row loop (and then its
+// `quant_fp8 + proj_mrows` block), whose numerics are the reference.
+template <int M>
+__global__ void __launch_bounds__(256)
+gemm_fp8_mrows_f32_kernel(const float* __restrict__ a_f32, const uint8_t* __restrict__ w,
+                          const uint8_t* __restrict__ w_scale, const float* __restrict__ bias,
+                          float* __restrict__ out, int n, int k, int a_stride, int out_stride) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int nwarps = (blockDim.x + 31) >> 5;
+    const int nb_k = k >> 5;
+    // smem layout: this block's weight rows | the 256-entry e4m3 table.
+    // NO activation slot -- see the header. The fp8 sibling's `s_as` / `s_a`
+    // (m*(k/32) f32 + m*k bytes) have no counterpart in this domain.
+    extern __shared__ uint8_t smem[];
+    uint8_t* s_w = smem;
+    float* s_lut = reinterpret_cast<float*>(s_w + (size_t)nwarps * (size_t)k);
+    for (int i = threadIdx.x; i < 256; i += blockDim.x) s_lut[i] = e4m3_to_f((uint8_t)i);
+    // This warp's output row, uniform within the warp, so every thread takes the
+    // same side of `active` and both barriers below are reached block-wide.
+    const int row = blockIdx.x * nwarps + warp;
+    const bool active = row < n;
+    // cp.async16 weight staging, the same rule the fp8 sibling and the M=1
+    // prologue use (staging is a pure copy: the consumed bytes are identical,
+    // so it is invisible to the parity argument). The launcher rejects `k & 31`,
+    // so `row * k` and `s_w + warp * k` are 16B-aligned.
+    if (active) {
+        const uint8_t* __restrict__ wr = w + (size_t)row * (size_t)k;
+        uint8_t* __restrict__ row_s = s_w + (size_t)warp * (size_t)k;
+        const int n16 = k >> 4;
+        for (int i = lane; i < n16; i += 32) dsv41_cp_async16(row_s + (i << 4), wr + (i << 4));
+        for (int i = (n16 << 4) + lane; i < k; i += 32) row_s[i] = wr[i];
+        dsv41_cp_commit();
+    }
+    __syncthreads();
+    if (active) {
+        dsv41_cp_wait_all();
+        __syncwarp();
+        const uint8_t* __restrict__ wsr = w_scale + (size_t)(row >> 5) * (size_t)nb_k;
+        float acc[M];
+        #pragma unroll
+        for (int r = 0; r < M; ++r) acc[r] = 0.f;
+        #pragma unroll 32
+        for (int kb = 0; kb < nb_k; ++kb) {
+            const float sb = ue8m0_to_f(wsr[kb]);
+            const int j = kb * 32 + lane;
+            // ONE decode for all M rows (C4): the identical per-(row, kb) value
+            // the M=1 loop would recompute, reused.
+            const float wv = s_lut[s_w[(size_t)warp * (size_t)k + j]] * sb;
+            // ① PROLOGUE -- the f32 domain's materialisation is the identity, so
+            // the M operands of this kb are hoisted straight out of global memory
+            // into registers, exactly the word the M=1 kernel's `s_af` slot holds
+            // (`s_af[i] = a_f32[i]`, a pure copy). Worked as ONE FMUL per operand
+            // either way, so the two programs are the same expression.
+            float av[M];
+            #pragma unroll
+            for (int r = 0; r < M; ++r) av[r] = a_f32[(size_t)r * (size_t)a_stride + j];
+            #pragma unroll
+            for (int r = 0; r < M; ++r) acc[r] += av[r] * wv;
+        }
+        #pragma unroll
+        for (int r = 0; r < M; ++r) {
+            float a_r = acc[r];
+            for (int off = 16; off > 0; off >>= 1) a_r += __shfl_xor_sync(0xFFFFFFFFu, a_r, off);
+            // ③ EPILOGUE -- `acc + bias`, the same expression as the M=1 kernel's
+            // `:4922-4929`. A future consumer (B1's rope tail) appends here.
+            if (lane == 0) {
+                const float v = a_r + (bias != nullptr ? bias[row] : 0.f);
+                out[(size_t)r * (size_t)out_stride + row] = v;
+            }
+        }
+    }
+}
+
+// See the kernel header above for the layout and the C1-C6 argument.
+// Returns 0 (launched) or 2 (declined: the caller keeps `quant_fp8 + proj_mrows`
+// and then its per-row loop, whose numerics are the reference by construction).
+extern "C" int dsv41_gemm_fp8_mrows_f32(const float* a_f32, const uint8_t* w,
+                                        const uint8_t* w_scale, const float* bias, float* out,
+                                        int m, int n, int k, int a_stride, int out_stride,
+                                        cudaStream_t s) {
+    if (m <= 0 || m > 8) return 2;
+    if (n <= 0 || k <= 0 || (k & 31)) return 2;
+    // The activation row pitch is an explicit contract: a pitch below the
+    // contraction width would read row 0's tail for every r >= 1 (the silent
+    // corruption this parameter exists to make impossible). Refuse, do not guess.
+    if (a_stride < k) return 2;
+    if (out_stride < n) return 2;
+    if (a_f32 == nullptr || w == nullptr || w_scale == nullptr || out == nullptr) return 2;
+    // Same two mode gates as the fp8 sibling: mode 0/1 reorder a lane's elements
+    // (not the C1 walk), and with the M=1 GEMV disabled the reference program
+    // becomes the M-tile MMA, a different expression entirely.
+    if (g_gemv_fp8_mode < 3) return 2;
+    static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
+    if (no_gemv) return 2;
+    // NOTE: no `g_gemv_a32` / `DSV41_GEMV_A32_STAGED` decline here, unlike the
+    // fp8 sibling's history. On the f32 domain the a32=1 (`s_af[j] = a_f32[j]`,
+    // a pure copy) and a32=0 (`a_f32[j]`) forms read the SAME word, so both are
+    // this kernel's expression and no arm has to be refused.
+    const int nwarps = dsv41_mrows_warps_for(n);
+    const int blocks = (n + nwarps - 1) / nwarps;
+    // weight rows + the e4m3 table. 9216 B at the verify shape (k = 1024); the
+    // draft shape (k = 8192) is 66560 B and takes the ceiling staircase below.
+    const size_t smem = (size_t)nwarps * (size_t)k + (size_t)256 * sizeof(float);
+    if (smem > 48 * 1024) {
+        // Per-kernel ceiling, not this call's need: a sticky attribute set to a
+        // smaller value would silently cap later launches. ⚠️ EVERY M
+        // specialisation needs its own attribute (the fp8 sibling's m=5
+        // cudaErrorInvalidValue accident: setting only <1> left the rest at the
+        // 48KB default).
+        cudaError_t e = cudaSuccess;
+#define FERRITE_SET_MROWS_F32_SMEM(k)                                                  \
+    do {                                                                               \
+        cudaError_t r = cudaFuncSetAttribute(                                          \
+            gemm_fp8_mrows_f32_kernel<k>, cudaFuncAttributeMaxDynamicSharedMemorySize, \
+            dsv41_smem_ceiling(gemm_fp8_mrows_f32_kernel<k>));                         \
+        if (r != cudaSuccess && e == cudaSuccess) e = r;                               \
+    } while (0)
+        FERRITE_SET_MROWS_F32_SMEM(1);
+        FERRITE_SET_MROWS_F32_SMEM(2);
+        FERRITE_SET_MROWS_F32_SMEM(3);
+        FERRITE_SET_MROWS_F32_SMEM(4);
+        FERRITE_SET_MROWS_F32_SMEM(5);
+        FERRITE_SET_MROWS_F32_SMEM(6);
+        FERRITE_SET_MROWS_F32_SMEM(7);
+        FERRITE_SET_MROWS_F32_SMEM(8);
+#undef FERRITE_SET_MROWS_F32_SMEM
+        if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
+    }
+    const dim3 grid(blocks);
+    switch (m) {
+        case 1: gemm_fp8_mrows_f32_kernel<1><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 2: gemm_fp8_mrows_f32_kernel<2><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 3: gemm_fp8_mrows_f32_kernel<3><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 4: gemm_fp8_mrows_f32_kernel<4><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 5: gemm_fp8_mrows_f32_kernel<5><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 6: gemm_fp8_mrows_f32_kernel<6><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 7: gemm_fp8_mrows_f32_kernel<7><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        case 8: gemm_fp8_mrows_f32_kernel<8><<<grid, nwarps * 32, smem, s>>>(a_f32, w, w_scale, bias, out, n, k, a_stride, out_stride); break;
+        default: return 2;
+    }
+    return (int)cudaGetLastError();
+}
+
+// ===========================================================================
 // K1 (`dsv41_gemm_fp8_mrows2`): TWO projection families in ONE launch.
 // The verify block's wq_a + wkv pair -- SAME activation, SAME k, two different
 // weight matrices and two different output widths.
@@ -6365,6 +6599,24 @@ extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, con
     // The 246 calls/step mix both; serving the small ones with SIMT is the fix.
     if (n < 1664) return 2;
     if (n <= 0 || k <= 0 || (n & 15) || (k & 31)) return 2;
+    // 16-BYTE ALIGNMENT: `a` is read as uint4 / `cp.async`16 (the activation
+    // staging) and `w` is the `cp.async.bulk` (or `cp.async.cg`16) source, so
+    // both bases must be on the 16B grid. A misaligned base is err 716 at best
+    // and silently misplaced bytes at worst -- NOT a shape decline, so it is
+    // reported rather than swallowed. See
+    // docs/agent/tcgen05-tma-bulk-align-design.md §2.2 (site B2).
+    {
+        const auto a16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
+        if (!a16(a) || !a16(w)) {
+            static int reported = 0;
+            if (reported++ < 4)
+                fprintf(stderr,
+                        "[align] dsv41_gemm_fp8_swapab: activation/weight base is not 16B "
+                        "-- the bulk/LDG.128 contract cannot be met (see "
+                        "docs/agent/tcgen05-tma-bulk-align-design.md)\n");
+            return 2;
+        }
+    }
 
     // K split: the largest {kSwapabKSplit, .../2, 1} that divides K into slices
     // that are still whole 32-wide scale blocks. K = 5120 gives 4; a K the

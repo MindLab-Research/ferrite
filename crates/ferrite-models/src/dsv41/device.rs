@@ -620,6 +620,40 @@ struct Kernels {
             c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    // B6 (`dsv41_gemm_fp8_mrows_f32`, from dsv41_kernels.cu): the MULTI-ROW form
+    // of the f32-activation GEMV (`dsv41_gemm_fp8_mx_f32`) — fp8 e4m3 weights x
+    // RAW f32 activations. It folds the verify's wo_b from `m x quant_fp8 +
+    // 1 x proj_mrows` into ONE launch per layer, and it is the same program as
+    // the M=1 decode of the same (row, r): row r of this launch is BIT-IDENTICAL
+    // to the M=1 `dsv41_gemm_fp8_mx_f32` call of row r (EAGER's `DSV41_WOB_F32`
+    // path), since the f32 domain's "materialisation" is the identity
+    // (`s_af[i] = a_f32[i]`, a pure copy).
+    //
+    // NOT bit-identical to the OLD verify path (the `quant_fp8 + proj_mrows`
+    // pair): it skips the quantise -> dequantise round trip, so the activation
+    // keeps its full f32 mantissa and the row partials are slightly MORE
+    // accurate. That is the `DSV41_WOB_F32` / E8 lever, and it is why the
+    // acceptance is the red line (counting order + zero Latin) rather than a
+    // memcmp against the old bytes.
+    //
+    // `a_stride` — the activation row PITCH in f32 elements — is an explicit
+    // parameter, not a caller promise: verify's `wo_r` is [m, ol_total] while
+    // k = ol_local (8x apart under TP8), so the pitch can NOT be derived from
+    // `k`. The C entry declines `a_stride < k` instead of reading row 0's tail
+    // (the verify-value-hunt root cause F1/F2).
+    //
+    // Optional: a stale .so without the symbol keeps the
+    // `quant_fp8 + proj_mrows` pair, and the C entry returns 2 (declined, never
+    // cudaErrorInvalidValue) for `m` outside 1..=8, `k` not a multiple of 32,
+    // `a_stride < k`, `out_stride < n`, a null pointer, or a run configured for
+    // the reordering `DSV41_GEMV_FP8_MODE` 0/1 arms / `DSV41_NO_GEMV_FP8`.
+    // ABI: (a_f32, w, w_scale, bias, out, m, n, k, a_stride, out_stride, s).
+    gemm_fp8_mrows_f32: Option<
+        unsafe extern "C" fn(
+            *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
@@ -1434,6 +1468,7 @@ impl Device {
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
             gemm_fp8_mrows_rope_norm: ko!(rt, "dsv41_gemm_fp8_mrows_rope_norm"),
             gemm_fp8_mrows2: ko!(rt, "dsv41_gemm_fp8_mrows2"),
+            gemm_fp8_mrows_f32: ko!(rt, "dsv41_gemm_fp8_mrows_f32"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -4582,6 +4617,83 @@ impl Device {
     /// the bit-exact reference K1 is verified against.
     pub fn supports_gemm_fp8_mrows2(&self) -> bool {
         self.kernels.gemm_fp8_mrows2.is_some()
+    }
+
+    /// B6: the MULTI-ROW form of the f32-activation GEMV — fp8 e4m3 weights x
+    /// RAW f32 activations, so the verify's wo_b no longer needs the `m x
+    /// quant_fp8` round trip in front of its `proj_mrows`.
+    ///
+    /// Row r of this launch is BIT-IDENTICAL to the M=1
+    /// [`Self::gemm_fp8_mx_f32`] call of row r — the f32 domain's
+    /// "materialisation" is the identity (`s_af[i] = a_f32[i]`, a pure copy),
+    /// and this kernel emits the same `acc += a_f32[j] * (s_lut[w[j]] * sb)`
+    /// serial chain, the same `kb`-ascending `j = kb*32 + lane` walk and the
+    /// same `shfl_xor` tree. It is NOT bit-identical to the OLD verify path it
+    /// replaces (`m x quant_fp8 + proj_mrows`): skipping the fp8 round trip is
+    /// strictly more accurate (`DSV41_WOB_F32`'s lever), so the acceptance is
+    /// the red line, not a memcmp.
+    ///
+    /// `a_stride` is the activation row PITCH in f32 elements — an explicit
+    /// contract, because the verify's `wo_r` is [m, ol_total] while k =
+    /// ol_local (8x apart under TP8) and the pitch therefore cannot be derived
+    /// from `k`. The C entry declines `a_stride < k` rather than reading row 0's
+    /// tail (verify-value-hunt root cause F1/F2).
+    ///
+    /// `Ok(false)` means NOT performed — the caller keeps its
+    /// `quant_fp8 + proj_mrows` block and then its per-row loop: either the
+    /// loaded .so predates the symbol, or the C entry declined (it returns 2,
+    /// never cudaErrorInvalidValue, so a decline can never read as a launch
+    /// failure). `rows` outside 1..=8 is refused here as well, the bound the
+    /// template dispatch covers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_fp8_mrows_f32(
+        &self,
+        a_f32: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        a_stride: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemm_fp8_mrows_f32 else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                a_f32,
+                w,
+                w_scale,
+                bias,
+                out,
+                rows,
+                n,
+                k,
+                a_stride,
+                out_stride,
+                self.stream,
+            )
+        };
+        // 2 = the kernel's "declined" (shape/mode), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_gemm_fp8_mrows_f32")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries B6 (`dsv41_gemm_fp8_mrows_f32`). A stale
+    /// .so leaves `DSV41_VERIFY_WOB_MROWS_F32` inert and the verify's wo_b on the
+    /// `quant_fp8 + proj_mrows` pair, which is the reference B6 was written
+    /// against.
+    pub fn supports_gemm_fp8_mrows_f32(&self) -> bool {
+        self.kernels.gemm_fp8_mrows_f32.is_some()
     }
 
     /// Fused M=1 gate GEMV + MoE route: ONE launch where `gemv_bf16_command` +

@@ -159,6 +159,30 @@ fn attn_proj_align() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_ATTN_PROJ_ALIGN").map(|v| v != "0").unwrap_or(false))
 }
 
+/// B6 on the DRAFT side (`DSV41_VERIFY_WOB_MROWS_F32=1`, **DEFAULT OFF** — the
+/// A/B arm). The verify's wo_b has TWO f32-activation m-rows call sites and the
+/// design deliberately drives them from ONE gate
+/// (`docs/agent/b6-mrows-f32-design.md` §5.1): leaving one side on the old
+/// program while the other moves is exactly the "half-aligned attention chain"
+/// `attn_proj_align`'s own comment warns about, so the two flip together and the
+/// accept comparison never measures a mixed pair.
+///
+/// It puts `draft_attn_out`'s wo_b on `dsv41_gemm_fp8_mrows_f32` — the SAME
+/// program `devrt`'s verify site now runs — and it does so BEFORE the
+/// `quant1(wo)` launch, so the draft saves that launch too. The `wo` row pitch
+/// is `ol_total` and the contraction is also `ol_total` here (the draft's wo_b is
+/// `Shard::Replicated`, unlike the verify's TP-split `ol_local`), so the draft
+/// passes `a_stride = k`, the compact case.
+///
+/// Read once and cached (the house rule for hot-path gates): this branch runs
+/// `bs` x n_mtp x 2 times per step.
+fn wob_mrows_f32() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_WOB_MROWS_F32").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 /// `DSV41_DRAFT_GRAPH=1` (**DEFAULT OFF** — the A/B arm) — the draft's
 /// **device-level** CUDA graph: the whole kernel sequence from the `main_x`
 /// projection through the sampled block is RECORDED once and rePLAYed as ONE
@@ -2167,26 +2191,15 @@ impl<'a> DsparkDev<'a> {
             let n = (bs * ol_total) as i64;
             self.dev.bf16_roundtrip(self.wo.ptr as *mut f32, n)?;
         }
-        self.quant1(self.wo.ptr as *const f32, bs * ol_total)?;
-        // `DSV41_ATTN_PROJ_ALIGN` (see `draft_attention`'s `wq_a`): the verify's
-        // `wo` projection runs `proj_mrows`, so the draft joins it — OFF keeps the
-        // `gemm_fp8_mx` TILE launch at `m = bs` bit for bit. All four attention
-        // projections move as one arm so the draft's attention chain is never
-        // half-aligned.
-        if !(attn_proj_align()
-            && self.proj_attn_mrows(
-                wo_b.as_u8(),
-                wo_b_s.as_u8(),
-                self.o.ptr as *mut f32,
-                bs,
-                dim as i32,
-                ol_total as i32,
-                dim as i32,
-            )?)
-        {
-            self.dev.gemm_fp8_mx(
-                self.xq.as_u8(),
-                self.xsc.as_f32(),
+        // B6 (DSV41_VERIFY_WOB_MROWS_F32, default OFF): the draft's wo_b on the
+        // SAME m-rows f32 program the verify site now runs, inserted BEFORE the
+        // `quant1` so that launch disappears too. `wo` is compact [bs, ol_total]
+        // here (`Shard::Replicated`), so `a_stride == k == ol_total`.
+        // On a decline (`Ok(false)`) or a stale .so the chain below runs exactly
+        // as before, including the `quant1`.
+        let took_mrows_f32 = if wob_mrows_f32() && self.dev.supports_gemm_fp8_mrows_f32() {
+            self.dev.gemm_fp8_mrows_f32(
+                self.wo.ptr as *const f32,
                 wo_b.as_u8(),
                 wo_b_s.as_u8(),
                 std::ptr::null(),
@@ -2194,7 +2207,42 @@ impl<'a> DsparkDev<'a> {
                 bs as i32,
                 dim as i32,
                 ol_total as i32,
-            )?;
+                ol_total as i32, // a_stride: the draft's compact `wo` row pitch
+                dim as i32,
+            )?
+        } else {
+            false
+        };
+        if !took_mrows_f32 {
+            self.quant1(self.wo.ptr as *const f32, bs * ol_total)?;
+            // `DSV41_ATTN_PROJ_ALIGN` (see `draft_attention`'s `wq_a`): the verify's
+            // `wo` projection runs `proj_mrows`, so the draft joins it — OFF keeps the
+            // `gemm_fp8_mx` TILE launch at `m = bs` bit for bit. All four attention
+            // projections move as one arm so the draft's attention chain is never
+            // half-aligned.
+            if !(attn_proj_align()
+                && self.proj_attn_mrows(
+                    wo_b.as_u8(),
+                    wo_b_s.as_u8(),
+                    self.o.ptr as *mut f32,
+                    bs,
+                    dim as i32,
+                    ol_total as i32,
+                    dim as i32,
+                )?)
+            {
+                self.dev.gemm_fp8_mx(
+                    self.xq.as_u8(),
+                    self.xsc.as_f32(),
+                    wo_b.as_u8(),
+                    wo_b_s.as_u8(),
+                    std::ptr::null(),
+                    self.o.ptr as *mut f32,
+                    bs as i32,
+                    dim as i32,
+                    ol_total as i32,
+                )?;
+            }
         }
         // DRAFT ATTN BF16 ROUND-TRIP (DSV41_DRAFT_ATTN_BF16, default OFF): the
         // official DSparkBlock's attention output (after wo_b) carries the model

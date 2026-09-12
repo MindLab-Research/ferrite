@@ -92,6 +92,8 @@
 #include <cstdint>
 // fprintf/stderr for the host-side gate warnings (the PDEPTH pin, below).
 #include <cstdio>
+// getenv/abort for the bulk/16B alignment contract below (FERRITE_ALIGN_STRICT).
+#include <cstdlib>
 // P4 (DSV41_GATEUP_CPASYNC): __pipeline_memcpy_async / __pipeline_commit /
 // __pipeline_wait_prior for the weight-first prologue of the batched expert
 // gate/up kernel. 16-byte copies lower to cp.async.cg (the same instruction
@@ -3265,6 +3267,68 @@ extern "C" int dsv41_w2_l2_prewarm(const uint8_t* w2_base, long w2_stride,
 // bulk/expect_tx pair, the fp4 nibble expansion, the x1 TMEM store.
 // =============================================================================
 
+// =============================================================================
+// THE BULK/16B ALIGNMENT CONTRACT, IN ONE PLACE
+// =============================================================================
+// `cp.async.bulk*` demands 16 B on the global source (and on the smem
+// destination for the `.shared::cluster.global` form); the lengths must be
+// multiples of 16. A violation is SILENT on the bulk form (the bytes land
+// elsewhere, no fault) and err 716 on the LDG.128 / `cp.async`16 form. Every
+// launcher that can reach a bulk copy checks its own argument list through
+// `bulk_align_ok`, so a new arm cannot be born with half the check: the e4 arm
+// had all of it, the mxf4 arm was missing `act`, the grouped arm the whole
+// `bh*` set, the swapAB entry point nothing.
+//
+// The alignment itself is NOT enforced here -- it is a property of the LAYOUT
+// (docs/agent/tcgen05-tma-bulk-align-design.md layer 1: the loader pads
+// `block`/`poff` to 128 B and the pitches are asserted 16B). This gate is the
+// ALARM that fires when something upstream breaks it: a bare
+// `cudaErrorInvalidValue` is swallowed as "the arm declined" on the Rust side
+// (`Ok(false)` -> the SIMT GEMV fallback), i.e. a layout accident presents as
+// "the arm never ran".
+//
+// FERRITE_ALIGN_STRICT=1 turns the refusal into a HARD STOP -- the mode for CI
+// and for the harness, where a silent decline is exactly the failure we keep
+// paying for.
+namespace tc5 {
+
+struct BulkAlign {
+    const char* name;
+    const void* p;
+    long stride;  // 0 = no per-expert stride to check
+};
+
+inline bool bulk_align_ok(const char* who, const BulkAlign* v, int n) {
+    static const int strict = [] {
+        const char* e = getenv("FERRITE_ALIGN_STRICT");
+        return (e != nullptr && e[0] == '1') ? 1 : 0;
+    }();
+    bool ok = true;
+    // Report ONCE per process, not per call: the condition is a property of the
+    // LAYOUT, and this runs in the hot path (the routed gate/up fires per slot,
+    // per layer).
+    static int reported = 0;
+    for (int i = 0; i < n; ++i) {
+        const unsigned a = (unsigned)((uintptr_t)v[i].p & 0xF);
+        const long s = v[i].stride;
+        if (a == 0 && ((s & 0xF) == 0)) continue;
+        ok = false;
+        if (reported++ < 8)
+            fprintf(stderr,
+                    "[align] %s: %s base misaligned by %u B, stride misaligned by %ld B "
+                    "-- the bulk/16B contract cannot be met (see "
+                    "docs/agent/tcgen05-tma-bulk-align-design.md)\n",
+                    who, v[i].name, a, s & 0xF);
+    }
+    if (!ok && strict) {
+        fflush(stderr);
+        abort();
+    }
+    return ok;
+}
+
+}  // namespace tc5
+
 #ifdef DSV41_TCGEN05_GATEUP_SKELETON
 
 #include <cstdlib>  // getenv (launcher gate)
@@ -4048,6 +4112,19 @@ static_assert(sizeof(Smem) <= 48 * 1024, "tc5::mxf4 ring does not fit static sme
 // TMEM budget: the accumulator D plus the full SFA and SFB range must fit the
 // single power-of-two alloc (8 + 160 + 40 = 208 <= 256).
 static_assert(kNTile + kSfaCols + kSfbCols <= kTmemCols, "tc5::mxf4 TMEM budget overflow");
+// ---- the smem side of the same contract, PROVEN not eyeballed --------------
+// The bulk destination needs 16 B and every per-slot stride must preserve it.
+// `alignas` on the members plus 16B-multiple stage sizes is the whole argument;
+// these asserts exist so a tuning change (kRing, kPackK, a kNTile tweak) cannot
+// silently re-open the hole. See docs/agent/tcgen05-tma-bulk-align-design.md §4.
+static_assert(kAbBytes % 16 == 0, "tc5::mxf4 A operand: TMA dst + descriptor units");
+static_assert(kBbBytes % 16 == 0, "tc5::mxf4 B operand: TMA dst + descriptor units");
+static_assert(kAtomBytes % 16 == 0, "tc5::mxf4 per-atom row bytes are a k*16 offset");
+static_assert(kLboBytes % 16 == 0 && kSboBytes % 16 == 0, "tc5::mxf4 descriptor strides");
+static_assert(kPackK % 16 == 0 && kKStep % 16 == 0, "tc5::mxf4 per-copy offsets are k*16");
+static_assert(__builtin_offsetof(Smem, a_op) % 16 == 0, "tc5::mxf4 TMA dst base (A)");
+static_assert(__builtin_offsetof(Smem, b_op) % 16 == 0, "tc5::mxf4 TMA dst base (B)");
+static_assert(__builtin_offsetof(Smem, sf_stage) % 16 == 0, "tc5::mxf4 SF staging base");
 // sizeof at the shipped constants: a_op 32768 + b_op 2048 + sf_stage 5120 +
 // barriers 128 + tmem_base ~= 40068 B -> 40 KiB of the 48 KiB window, leaving
 // kRing 9-10 as headroom if a future kPackK stays at one atom.
@@ -4067,7 +4144,11 @@ static_assert(kNTile + kSfaCols + kSfbCols <= kTmemCols, "tc5::mxf4 TMEM budget 
 // B has a single 8-row group so the (row >> 3) term is identically 0 (which is
 // also why the hardware ignores SBO at N=8 -- Phase 0 says so and relies on it).
 __device__ __forceinline__ int m4_off(int row, int kb) {
-    return 16 * ((row & 7) + 8 * kb + 16 * (row >> 3));
+    // Written as `16 * unit` so the 16B property is visible at the expression
+    // level: the canonical unit IS 16 bytes, and a future edit that adds a +8
+    // would be obvious here (see the smem static_asserts above).
+    const int unit = (row & 7) + 8 * kb + 16 * (row >> 3);
+    return 16 * unit;
 }
 
 // --- SMEM operand descriptor, SWIZZLE_NONE K-major, 16-byte units ------------
@@ -4520,13 +4601,18 @@ inline cudaError_t m4_launch_gateup(const uint8_t* act, const float* act_scale, 
     // 16-BYTE ALIGNMENT IS A HARD CONTRACT on both sides of every bulk copy: a
     // misaligned copy does not fault, it silently misplaces bytes. Every base
     // and every per-expert stride must be a multiple of 16 -- including w3,
-    // which the dual-pointer split now feeds through the same TMA. Reject here
-    // instead of producing silently wrong weights.
-    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
-    const auto str16 = [](long s) { return s == 0 || (s & 0xF) == 0; };
-    if (!al16(w1_base) || !al16(w1s_base) || !al16(w3_base) || !al16(w3s_base) ||
-        !str16(w1_stride) || !str16(w1s_stride) || !str16(w3_stride) || !str16(w3s_stride))
-        return cudaErrorInvalidValue;
+    // which the dual-pointer split now feeds through the same TMA, AND `act`,
+    // whose 16-byte chunks `tc5_bulk_g2s` addresses directly (this arm's B side;
+    // it was the one argument the pre-fix gate did not cover).
+    // Reject here instead of producing silently wrong weights.
+    const BulkAlign chk[] = {
+        {"act", act, 0},
+        {"w1", w1_base, w1_stride},
+        {"w1s", w1s_base, w1s_stride},
+        {"w3", w3_base, w3_stride},
+        {"w3s", w3s_base, w3s_stride},
+    };
+    if (!bulk_align_ok("tc5::mxf4", chk, 5)) return cudaErrorInvalidValue;
     const dim3 grid((unsigned)(rows / kMTile), (unsigned)slots, 1u);
     return dsv41_experts_pdl_or_plain(expert_tcgen05_gateup_mxf4_kernel, grid, dim3(kThreads), 0,
                                       stream, act, act_scale, out, out_slot_stride, dim, epi_mode,
@@ -4764,6 +4850,21 @@ static_assert(kNTile + kSfaCols + kSfbCols <= kTmemCols, "tc5::e4 TMEM budget ov
 // e4_expand_a maps one (row, K_STEP) item to one thread; keep the identity
 // explicit so a kThreads change cannot silently leave rows unexpanded.
 static_assert(kMTile == kThreads, "tc5::e4 expansion assumes one A row per thread");
+// ---- the smem side of the bulk/16B contract, PROVEN not eyeballed -----------
+// The TMA destination needs 16 B and every per-slot stride must preserve it;
+// `tid*(kPackK/2)` and `e4_off(r,kb)` land on the same grid. A tuning change
+// (kRing, kPackK, a kNTile tweak) must fail the BUILD, not the first prefill.
+// See docs/agent/tcgen05-tma-bulk-align-design.md §4 (layer 3).
+static_assert(kARawBytes % 16 == 0, "tc5::e4 packed A staging: TMA dst stride");
+static_assert(kAbBytes % 16 == 0, "tc5::e4 A operand: MMA descriptor 16B units");
+static_assert(kBbBytes % 16 == 0, "tc5::e4 B operand: TMA dst + descriptor units");
+static_assert(kAtomBytes % 16 == 0, "tc5::e4 per-atom row bytes are a k*16 offset");
+static_assert(kLboBytes % 16 == 0 && kSboBytes % 16 == 0, "tc5::e4 descriptor strides");
+static_assert(kPackK % 16 == 0 && kKStep % 16 == 0, "tc5::e4 per-copy offsets are k*16");
+static_assert(__builtin_offsetof(Smem, a_raw) % 16 == 0, "tc5::e4 TMA dst base (packed A)");
+static_assert(__builtin_offsetof(Smem, a_op) % 16 == 0, "tc5::e4 MMA operand base (A)");
+static_assert(__builtin_offsetof(Smem, b_op) % 16 == 0, "tc5::e4 TMA dst base (B)");
+static_assert(__builtin_offsetof(Smem, sf_stage) % 16 == 0, "tc5::e4 SF staging base");
 // sizeof at the shipped constants: a_raw 12288 + a_op 24576 + b_op 1536 +
 // sf_stage 5120 + barriers 96 + tmem_base ~= 43620 B of the 48 KiB window.
 
@@ -4774,7 +4875,10 @@ static_assert(kMTile == kThreads, "tc5::e4 expansion assumes one A row per threa
 // has a single 8-row group so its (row >> 3) term is identically 0 -- which is
 // also why the hardware ignores SBO at N=8).
 __device__ __forceinline__ int e4_off(int row, int kb) {
-    return 16 * ((row & 7) + 8 * kb + 16 * (row >> 3));
+    // `16 * unit`: the canonical unit IS 16 bytes, so every e4_off is a multiple
+    // of 16 by construction (see the smem static_asserts above).
+    const int unit = (row & 7) + 8 * kb + 16 * (row >> 3);
+    return 16 * unit;
 }
 
 // --- SMEM operand descriptor, SWIZZLE_NONE K-major, 16-byte units ------------
@@ -5269,11 +5373,14 @@ inline cudaError_t e4_launch_gateup(const uint8_t* act, const float* act_scale, 
     // 16-byte chunks are addressed directly (the activation row here is twice as
     // long as the e2m1 one, so a 16-byte-aligned base is not implied by anything
     // else).
-    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
-    const auto str16 = [](long s) { return s == 0 || (s & 0xF) == 0; };
-    if (!al16(act) || !al16(w1_base) || !al16(w1s_base) || !al16(w3_base) || !al16(w3s_base) ||
-        !str16(w1_stride) || !str16(w1s_stride) || !str16(w3_stride) || !str16(w3s_stride))
-        return cudaErrorInvalidValue;
+    const BulkAlign chk[] = {
+        {"act", act, 0},
+        {"w1", w1_base, w1_stride},
+        {"w1s", w1s_base, w1s_stride},
+        {"w3", w3_base, w3_stride},
+        {"w3s", w3s_base, w3s_stride},
+    };
+    if (!bulk_align_ok("tc5::e4", chk, 5)) return cudaErrorInvalidValue;
     const dim3 grid((unsigned)(rows / kMTile), (unsigned)slots, 1u);
     return dsv41_experts_pdl_or_plain(expert_tcgen05_gateup_e4_kernel, grid, dim3(kThreads), 0,
                                       stream, act, act_scale, out, out_slot_stride, dim, epi_mode,
@@ -5492,12 +5599,26 @@ struct Smem {
 // The 48 KiB static window, same rule as every other arm in this file: a tuning
 // change that trips this fails the BUILD instead of failing at launch.
 static_assert(sizeof(Smem) <= 48 * 1024, "tc5::e4x stage does not fit static smem");
+// ---- the smem side of the bulk/16B contract, PROVEN not eyeballed -----------
+// Every operand break is a whole number of 16-byte canonical units and the
+// staging bases are aligned; a tuning change (kSubsPerStage, kNTile) must fail
+// the BUILD, not the first prefill. See
+// docs/agent/tcgen05-tma-bulk-align-design.md §4 (layer 3).
+static_assert(kASubBytes % 16 == 0, "tc5::e4x A sub-block: MMA descriptor 16B units");
+static_assert(kBSubBytes % 16 == 0, "tc5::e4x B sub-block: MMA descriptor 16B units");
+static_assert(kABytes % 16 == 0, "tc5::e4x A operand base stride");
+static_assert(kBBytes % 16 == 0, "tc5::e4x B operand base stride");
+static_assert(kLboBytes % 16 == 0 && kSboBytes % 16 == 0, "tc5::e4x descriptor strides");
+static_assert(__builtin_offsetof(Smem, a) % 16 == 0, "tc5::e4x operand base (A)");
+static_assert(__builtin_offsetof(Smem, b) % 16 == 0, "tc5::e4x operand base (B)");
 // 16384 + 8192 + 2048 + 1024 + 12 ~= 27.7 KiB.
 
 // ------------------------------------------------------------------- helpers
 // Byte offset of the canonical 16-byte unit holding (row, kb) of a K=32 atom.
 __device__ __forceinline__ int e4x_off(int row, int kb) {
-    return 16 * ((row & 7) + 8 * kb + 16 * (row >> 3));
+    // `16 * unit`: the canonical unit IS 16 bytes (see the e4x static_asserts).
+    const int unit = (row & 7) + 8 * kb + 16 * (row >> 3);
+    return 16 * unit;
 }
 // SMEM operand descriptor. Kept local (not the file-scope make_desc) so this
 // arm's constants cannot drift through a macro switch; the VALUES are identical.
@@ -5843,11 +5964,22 @@ inline cudaError_t e4x_launch_gemm(const uint8_t* a, const float* a_scale, const
     // here rather than tolerated.
     if (k % kAtomK != 0 || rows % kMTile != 0 || n_total % kNTile != 0)
         return cudaErrorInvalidValue;
-    // 16-byte alignment is a hard contract on the operand bases: the K=32 e4m3
-    // row is addressed in 16-byte chunks and the packed fp4 source in uint4s. A
-    // misaligned access does not fault, it silently misplaces bytes.
-    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
-    if (!al16(a) || !al16(b) || !al16(b_hi)) return cudaErrorInvalidValue;
+    // 16-byte alignment is a hard contract on the operand bases AND on every
+    // per-expert stride: the K=32 e4m3 row is addressed in 16-byte chunks and the
+    // packed fp4 source in uint4s. A misaligned access does not fault, it
+    // silently misplaces bytes. The stride half was entirely missing here (this
+    // arm is not dispatched yet -- `e4x_tile=false` -- so it had no execution
+    // evidence either way; see design §7.5).
+    const BulkAlign chk[] = {
+        {"a", a, 0},
+        {"b", b, 0},
+        {"b_hi", b_hi, 0},
+        {"b_base", b_base, b_stride},
+        {"bs_base", bs_base, bs_stride},
+        {"bh_base", bh_base, bh_stride},
+        {"bhs_base", bhs_base, bhs_stride},
+    };
+    if (!bulk_align_ok("tc5::e4x", chk, 7)) return cudaErrorInvalidValue;
     const dim3 grid((unsigned)(n_total / kNTile), (unsigned)(rows / kMTile));
     e4m3_gemm_kernel<<<grid, kThreads, 0, stream>>>(
         a, a_scale, b, b_scale, b_hi, b_hi_scale, out, rows, n_total, k, b_split, epi_mode, limit,
@@ -6214,11 +6346,20 @@ inline cudaError_t e4x_launch_gemm_grouped(
     // hard requirement, not an option.
     if (b_split >= 0 && (bh_base == nullptr || bhs_base == nullptr))
         return cudaErrorInvalidValue;
-    const auto al16 = [](const void* p) { return ((uintptr_t)p & 0xF) == 0; };
-    if (!al16(a) || !al16(a_scale) || !al16(b_base) || !al16(bs_base)) return cudaErrorInvalidValue;
-    // The B plane's expert stride is `inter * k/2` bytes; a stride that is not a
-    // 16-byte multiple would silently misplace the uint4 rows.
-    if ((b_stride % 16) != 0 || (bs_stride % 16) != 0) return cudaErrorInvalidValue;
+    // The activation, all FOUR weight planes AND their per-expert strides are on
+    // the 16B grid: the B plane's expert stride is `inter * k/2` bytes, and a
+    // stride that is not a 16-byte multiple would silently misplace the uint4
+    // rows. The whole `bh*` set was the missing half of this gate (it was named
+    // in the code comment at :5025-5032 as the class that err 716 comes from).
+    const BulkAlign chk[] = {
+        {"a", a, 0},
+        {"a_scale", a_scale, 0},
+        {"b_base", b_base, b_stride},
+        {"bs_base", bs_base, bs_stride},
+        {"bh_base", bh_base, bh_stride},
+        {"bhs_base", bhs_base, bhs_stride},
+    };
+    if (!bulk_align_ok("tc5::e4x.grouped", chk, 6)) return cudaErrorInvalidValue;
     const int m_tiles = (m_cap + kMTile - 1) / kMTile;
     const dim3 grid((unsigned)(n_total / kNTile), (unsigned)m_tiles, (unsigned)n_assign);
     e4m3_gemm_grouped_kernel<<<grid, kThreads, 0, stream>>>(

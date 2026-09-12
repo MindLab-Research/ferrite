@@ -453,6 +453,53 @@ pub fn padded_inter(n: usize) -> usize {
     n.div_ceil(K_ATOM) * K_ATOM
 }
 
+/// 16 B: the alignment `cp.async.bulk*` requires on the global source (and on the
+/// smem destination of the `.shared::cluster.global` form), and the granule every
+/// weight-plane PITCH must be a multiple of. A violation is SILENT on the bulk
+/// form (the bytes land in the wrong place, no fault) and `err 716` on the
+/// `LDG.128` / `cp.async`16 form. See
+/// docs/agent/tcgen05-tma-bulk-align-design.md.
+pub const BULK_ALIGN: usize = 16;
+
+/// The pool geometry the bulk paths depend on, checked ONCE per model at LOAD
+/// time. A config that cannot be bulk-addressed must fail here (seconds) rather
+/// than at the first prefill (191 ms in, with a detached err 716 and no kernel
+/// name). The byte paddings themselves are applied in
+/// [`crate::dsv41::load`]'s expert pool; this is the *pitch* half of layer 1 of
+/// docs/agent/tcgen05-tma-bulk-align-design.md.
+pub fn check_bulk_geometry(cfg: &Dsv41Config, world: usize) -> Result<()> {
+    let dim = cfg.dim;
+    let mut bad: Vec<String> = Vec::new();
+    if dim == 0 || dim % (2 * BULK_ALIGN) != 0 {
+        bad.push(format!(
+            "dim={dim}: the fp4 row pitch dim/2 is not 16B (needs dim % 32 == 0)"
+        ));
+    }
+    if dim >= 32 && (dim / 32) % BULK_ALIGN != 0 {
+        bad.push(format!(
+            "nsf=dim/32={}: the e8m0 scale row pitch is not 16B (needs dim % 512 == 0); \
+             the SF prologue's `rr * nsf` and the grouped arm's bhs rows both address it directly",
+            dim / 32
+        ));
+    }
+    let inter_local = if world == 0 { cfg.moe_inter_dim } else { cfg.moe_inter_dim / world };
+    for (what, v) in [
+        ("inter/world", inter_local),
+        ("padded_inter", padded_inter(inter_local)),
+    ] {
+        if v % BULK_ALIGN != 0 {
+            bad.push(format!(
+                "{what}={v} is not 16B (w2's ExpertCols row pitch inter_local/2)"
+            ));
+        }
+    }
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        Err(FerriteError::Config(format!("bulk-geometry: {}", bad.join("; "))))
+    }
+}
+
 /// The local shape a rank holds for `spec`.
 /// Shared-expert tensor-parallelism, DEFAULT ON.
 ///

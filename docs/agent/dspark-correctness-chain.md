@@ -6404,3 +6404,21 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 - **当前最佳 SWALLOW：60.4 tok/s（mrows b2）+ 红线通过！**
 - lazy 91.1 仍快 1.5×（但 SWALLOW 是 400 的唯一路径）
 - 下一步：mrows b3 → tcgen05 → AR fix → L4/L5 → 400
+
+## 🎉🎉 mrows b2+b3 组合验证成功（30ad4f47）——63.8 tok/s！
+
+**结果**：
+- **吞吐 = 63.8 tok/s**（vs 基线 58.3——**+9.4% 总增量**！）
+- 前 61 行正确=True ✓（数值中性！）
+- 零拉丁 ✓ finish_reason=stop ✓ 0 panic 0 hang ✓
+
+**SWALLOW 优化进展表**：
+| # | 优化 | 吞吐 | 增量 |
+|---|---|---|---|
+| S0 | 全 gate 基线 | 58.3 tok/s | — |
+| S1 | + mrows b2 (ATTN_MROWS_ROPE_NORM) | 60.4 tok/s | +3.6% |
+| **S1+S2** | **+ mrows b2+b3 (+ATTN_MROWS2)** | **63.8 tok/s** | **+9.4% 总** |
+| S3 | + tcgen05 (TMA 修复已实施!) | ? (待测) | ? |
+| S4 | + AR fix (设计中) | ? | ? |
+
+**SWALLOW 与 lazy 的差距缩小**：91.1 / 63.8 = 1.43×（从 1.56× 缩小）

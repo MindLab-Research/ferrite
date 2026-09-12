@@ -83,6 +83,8 @@
 #   B400_MROWS_A=b2 bash scripts/batched_400_v2.sh   # mrows S2 Phase A arm (b1|b2|b3;
 #                                                    # ONE gate per serve — see the
 #                                                    # ARM block below)
+#   B400_B6=1 bash scripts/batched_400_v2.sh         # B6 arm: the verify wo_b as ONE
+#                                                    # m-rows f32 launch (see below)
 #
 # OUTPUT: $LOGDIR/<tag>.{log,dspark,metrics,txt,env,resp.json,build_*.log}
 #   Exit: 0 = usable AND both red lines hold; 1 = a red line broke (拉丁 / 双字 /
@@ -318,6 +320,39 @@ HC_ARM="${B400_HC:-0}"
 if [ "$HC_ARM" = 1 ]; then
     HC_GATES="DSV41_HC_VERIFY_FUSE=1 DSV41_FUSE_B1=1 DSV41_FUSE_C=1 DSV41_HC_FRONT_ROWS=1"
     GATES_ONELINE="$GATES_ONELINE $HC_GATES"
+fi
+
+# ---------------------------------------------------------------------------
+# OPT-IN ARM: B6 — the verify's wo_b as ONE m-rows f32 launch (default OFF).
+#
+# WHAT IT IS. `dsv41_gemm_fp8_mrows_f32`: the verify's wo_b folded from
+# `m x quant_fp8 + 1 x proj_mrows` into a single launch reading the RAW f32
+# `wo_r` rows (the `DSV41_WOB_F32` lever with the row batch added). Row r of the
+# launch is bit-identical to the M=1 `dsv41_gemm_fp8_mx_f32` decode of row r;
+# it is NOT bit-identical to the fp8 pair it replaces — skipping the round trip
+# is strictly MORE accurate. ⇒ **the red lines judge this arm, not a byte
+# comparison** (zero Latin / 0 double-char / 先帝创业未半, plus the counting
+# prompt's digit order and the `k_acc` histogram mode).
+# Design: docs/agent/b6-mrows-f32-design.md.
+#
+# WHY AN OPT-IN ARM AND NOT IN THE MATRIX ABOVE. It is a NEW kernel (the
+# matrix's default must stay the shipped configuration), and the design's §5.1
+# drives BOTH wo_b call sites from this ONE gate on purpose: the verify site
+# (`attention_rows`) and the draft site (`draft_attn_out`). Flipping only one
+# would leave a "half-aligned" attention chain, which is exactly what a mixed
+# A/B would then measure instead of the kernel change.
+#
+# USAGE:  B400_B6=1 bash scripts/batched_400_v2.sh
+# ⚠️ The `.so` must be REBUILT (`build.sh 103a`) and carry
+# `dsv41_gemm_fp8_mrows_f32`; `nm -D libferrite_kernels.so | grep -c
+# dsv41_gemm_fp8_mrows_f32` = 0 makes the arm SILENTLY inert (`Ok(false)` — the
+# chain falls back to `quant_fp8 + proj_mrows`) and the A/B reads "no effect".
+# That is the phantom-gate trap this arm's symbol check exists to catch; the
+# run's own `$LOGDIR/run.env` `/proc/<pid>/environ` read-back covers the env half.
+B6_ARM="${B400_B6:-0}"
+if [ "$B6_ARM" = 1 ]; then
+    B6_GATES="DSV41_VERIFY_WOB_MROWS_F32=1"
+    GATES_ONELINE="$GATES_ONELINE $B6_GATES"
 fi
 
 echo "== BATCHED-400 v2 (rebuilt) comprehensive run =="

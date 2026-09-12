@@ -20,7 +20,9 @@ use ferrite_types::{FerriteError, Result};
 
 use crate::dsv41::config::Dsv41Config;
 use crate::dsv41::device::{DevBuf, Device};
-use crate::dsv41::weights::{gateup_ilv, local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec};
+use crate::dsv41::weights::{
+    check_bulk_geometry, gateup_ilv, local_shape, tensor_specs, SafetensorsIndex, Shard, TensorSpec,
+};
 
 /// Tensors whose consumer is a bf16 tensor-core GEMM: they stay bf16 verbatim.
 /// Everything else that arrives as bf16 is widened to f32 on the way in —
@@ -104,6 +106,14 @@ impl DevTensor {
     }
     pub fn as_u8(&self) -> *const u8 {
         self.buf.ptr as *const u8
+    }
+    /// A 16-byte-aligned byte view at `off` (see [`DevBuf::u8_aligned_at`]).
+    /// Used at every site whose pointer feeds a `cp.async.bulk*` /
+    /// `LDG.128` source, so a 4-byte slip into a pooled weight plane trips a
+    /// `debug_assert` in CI instead of silently misplacing bytes.
+    #[inline]
+    pub fn u8_aligned_at(&self, off: usize) -> *const u8 {
+        self.buf.u8_aligned_at(off)
     }
     pub fn as_f32(&self) -> *const f32 {
         self.buf.ptr as *const f32
@@ -647,26 +657,42 @@ impl<'a> Loader<'a> {
         // region holds both, and the kernel derives the up bytes from the gate
         // pointer. Rust's per-expert STRIDES are pointer differences between
         // experts, which stay uniform in both layouts.)
+        // ---- 16B pool geometry: the bulk-copy contract --------------------
+        // Every pointer an expert kernel derives is
+        //     pool + e*block + poff[k] + row*pitch [+ j*16]
+        // and `cp.async.bulk{.prefetch}` demands 16 B on BOTH usable sides
+        // (src, and dst for the G2S form). cudaMalloc supplies `pool`; `block`,
+        // `poff` and `pitch` are OURS, so they are padded here instead of
+        // being "accidentally right" for the shipped shape (the current
+        // 2,611,200 B block is a multiple of 128 only by arithmetic luck, and
+        // nothing asserts it).
+        // See docs/agent/tcgen05-tma-bulk-align-design.md §4.
+        const ALIGN: usize = 128; // >= 16 (PTX); 128 also keeps a full L2 sector
+        let up = |x: usize| (x + ALIGN - 1) & !(ALIGN - 1);
         let (block, poff) = if ilv {
             let mut o = [0usize; 6];
-            o[1] = 2 * w1b;
-            o[3] = o[1] + plans[1].bytes;
-            o[4] = o[3] + plans[3].bytes;
-            o[5] = o[4] + plans[4].bytes;
-            (o[5] + plans[5].bytes, o)
+            // o[2] stays 0: w3 reuses w1's doubled region (0 is trivially aligned).
+            o[1] = up(2 * w1b);
+            o[3] = up(o[1] + plans[1].bytes);
+            o[4] = up(o[3] + plans[3].bytes);
+            o[5] = up(o[4] + plans[4].bytes);
+            (up(o[5] + plans[5].bytes), o)
         } else {
             let mut o = [0usize; 6];
             let mut acc = 0usize;
             for (k, slot) in o.iter_mut().enumerate() {
-                *slot = acc;
-                acc += plans[k].bytes;
+                *slot = up(acc);
+                acc = *slot + plans[k].bytes;
             }
-            (acc, o)
+            (up(acc), o)
         };
-        debug_assert!(block * n_routed <= total.max(1));
-        // one allocation; the K padding is already zero
-        let pool = self.dev.alloc(total.max(1))?;
-        self.dev.zero_at(pool.ptr, total.max(1))?;
+        debug_assert_eq!(block % ALIGN, 0);
+        debug_assert!(poff.iter().all(|o| o % ALIGN == 0));
+        debug_assert!(block * n_routed >= total);
+        // one allocation; BOTH the K padding and the alignment padding are zero
+        let pool_bytes = (block * n_routed).max(1);
+        let pool = self.dev.alloc(pool_bytes)?;
+        self.dev.zero_at(pool.ptr, pool_bytes)?;
         let base = pool.ptr as *mut u8;
         let mut views: Vec<DevTensor> = Vec::with_capacity(plans.len());
         // Interleaved: the gate/up pair is staged in a scratch (the permute
@@ -783,6 +809,10 @@ impl<'a> Loader<'a> {
 
     /// Load everything the rank needs. `specs` come from `tensor_specs`.
     pub fn load(&mut self, cfg: &Dsv41Config, world: usize, rank: usize) -> Result<Dsv41DevWeights> {
+        // The bulk/16B geometry is a LOAD-TIME property of the config: fail here
+        // (seconds) instead of at the first prefill (191 ms in, with a detached
+        // err 716). See docs/agent/tcgen05-tma-bulk-align-design.md §4.1b.
+        check_bulk_geometry(cfg, world)?;
         let specs = tensor_specs(cfg, world);
         // expert ownership: the rank keeps n_routed/world consecutive experts
         let _expert_lo = |n: usize| (rank * (n / world), n / world);
