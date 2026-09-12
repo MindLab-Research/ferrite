@@ -939,6 +939,7 @@ impl<'a> DsparkDev<'a> {
             cfg.norm_eps,
         )?;
         self.quant1(self.qr.ptr as *const f32, bs * ql)?;
+        self.dump_unit_idx("qr", s, self.qr.ptr as *const f32, &[bs, ql]);
         // wq_b is [nh * hd, ql]; one fp8 GEMM covers all bs draft rows.
         self.dev.gemm_fp8_mx(
             self.xq.as_u8(),
@@ -951,6 +952,9 @@ impl<'a> DsparkDev<'a> {
             (nh * hd) as i32,
             ql as i32,
         )?;
+        // the pre-RoPE projection — the unit-diff isolator between the
+        // projection chain (wq_a/q_norm/wq_b) and the RoPE.
+        self.dump_unit_idx("q_pre_rope", s, self.q.ptr as *const f32, &[bs, nh, hd]);
         self.rope_queries(self.q.ptr as *mut f32, pos)?;
 
         // ---- kv = wkv(x), normed and roped like the backbone's window KV ----

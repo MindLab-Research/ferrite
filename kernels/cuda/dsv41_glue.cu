@@ -453,6 +453,13 @@ __global__ void gemv_f32_kernel(const float* __restrict__ w, const float* __rest
 //     REPRODUCED, and identical source under the same flags is the strongest
 //     guarantee of that. Pinning it would only be able to diverge.
 //
+// ⚠️ DOMAIN OF C1-C5 (perf-review finding 4): the reference is v1's
+// `gemv_bf16_kernel`, and `dsv41_gemv_bf16` only selects v1 for
+// `n >= GEMV_V2_MAX_N` (gemv_bf16_v2 takes the small-n shapes and K-splits,
+// which reorders the f32 sum). Below that threshold a single-row `gemv_bf16` is
+// NOT bit-identical to this kernel's rows -- the parity holds only in the v1
+// domain, so a small-n reuse has to re-derive it rather than inherit it.
+//
 // `x` is [m, k] f32 (the verify's `xn_r`), `out` is [m, n] f32 (`logits_r`).
 // M is a template parameter so each row owns a register chain; the launcher
 // dispatches m = 1..8 and the caller keeps its per-row loop above 8. Grid and
@@ -1636,6 +1643,22 @@ extern "C" int dsv41_dspark_ring_save(float* snap, const float* ring, int pos_ba
                                       int m, cudaStream_t s) {
     if (snap == nullptr || ring == nullptr || win <= 0 || hd <= 0 || m <= 0)
         return (int)cudaErrorInvalidValue;
+    // perf-review finding 1: `slot = (pos_base + j) % win` is injective only for
+    // `m <= win`. Past that two rows of the SAME layer map to ONE slot, so the
+    // grid's blocks race on that destination and the snapshot stops being the
+    // deterministic element move the header above promises. Decline (2) -- never
+    // 1, which is cudaErrorInvalidValue and must stay a real device failure --
+    // so the caller falls back to the per-slot host loop, which serialises the
+    // colliding slots in j order.
+    if (m > win) return 2;
+    // perf-review finding 3: the Rust bound on `m` is `dspark_snapshot`'s bare
+    // `debug_assert!(m <= VERIFY_ROWS)`, which release builds compile away.
+    // `snap` here is ONE layer's `VERIFY_ROWS`-row slice (chain_dev.rs sizes
+    // `dspark_snap_ring` as `n_layers * VERIFY_ROWS * head_dim`), so a longer
+    // block would run past the last layer's slice. Enforce the same capacity at
+    // the single entry every call goes through. VERIFY_ROWS is 6 today; this
+    // constant has to follow it.
+    if (m > 6) return 2;
     const unsigned blocks = (unsigned)((m * hd + 255) / 256);
     dspark_ring_save_kernel<<<blocks, 256, 0, s>>>(snap, ring, pos_base, win, hd, m);
     return (int)cudaGetLastError();
@@ -1645,6 +1668,15 @@ extern "C" int dsv41_dspark_ring_restore(float* ring, const float* snap, int pos
                                          int hd, int m, int keep, cudaStream_t s) {
     if (ring == nullptr || snap == nullptr || win <= 0 || hd <= 0 || m <= 0)
         return (int)cudaErrorInvalidValue;
+    // perf-review finding 1: same slot-map aliasing as `dsv41_dspark_ring_save`
+    // above -- for `m > win` several rows resolve to one `(pos_base + j) % win`
+    // slot and the restore's reads/writes race. Decline (2) so the caller keeps
+    // its per-slot host loop.
+    if (m > win) return 2;
+    // perf-review finding 3: `m <= VERIFY_ROWS` is only debug-asserted on the
+    // Rust side; `snap` is one layer's `VERIFY_ROWS`-row slice, so cap it here
+    // too (see `dsv41_dspark_ring_save`).
+    if (m > 6) return 2;
     if (keep < 0) keep = 0;
     const int rows = m - keep;
     // `keep == m` (the whole block was accepted) restores nothing. Returning
@@ -1665,8 +1697,16 @@ extern "C" int dsv41_dspark_comp_save(const float* state_kv, const float* state_
         out_rows == nullptr || snap_state == nullptr || snap_latent == nullptr ||
         snap_clen == nullptr || snap_out_rows == nullptr)
         return (int)cudaErrorInvalidValue;
-    if (hd <= 0 || ratio <= 0 || max_ratio <= 0 || ratio > max_ratio)
+    if (hd <= 0 || ratio <= 0 || max_ratio <= 0)
         return (int)cudaErrorInvalidValue;
+    // perf-review finding 2: `ratio > max_ratio` is a SHAPE this kernel cannot
+    // serve -- `snap_state` is only `2 * max_ratio * hd` wide and the
+    // `state_score` segment is written at `+max_ratio * hd`, so the copy would
+    // land past the layer's slice. That is a decline, not a device failure:
+    // returning cudaErrorInvalidValue (1) made it indistinguishable from a real
+    // launch error. 2 is the file's fallback code, the same one the fused
+    // kernels use for a shape they decline.
+    if (ratio > max_ratio) return 2;
     const unsigned blocks = (unsigned)((2 * ratio * hd + hd + 255) / 256);
     dspark_comp_save_kernel<<<blocks, 256, 0, s>>>(state_kv, state_score, latent, clen, out_rows,
                                                    snap_state, snap_latent, snap_clen, snap_out_rows,
@@ -1683,8 +1723,11 @@ extern "C" int dsv41_dspark_comp_restore(float* state_kv, float* state_score, fl
         out_rows == nullptr || snap_state == nullptr || snap_latent == nullptr ||
         snap_clen == nullptr || snap_out_rows == nullptr)
         return (int)cudaErrorInvalidValue;
-    if (hd <= 0 || ratio <= 0 || max_ratio <= 0 || ratio > max_ratio)
+    if (hd <= 0 || ratio <= 0 || max_ratio <= 0)
         return (int)cudaErrorInvalidValue;
+    // perf-review finding 2: the `ratio > max_ratio` shape decline, mirroring
+    // `dsv41_dspark_comp_save` above -- 2 (fallback), not 1 (a real failure).
+    if (ratio > max_ratio) return 2;
     const unsigned blocks = (unsigned)((2 * ratio * hd + hd + 255) / 256);
     dspark_comp_restore_kernel<<<blocks, 256, 0, s>>>(state_kv, state_score, latent, clen, out_rows,
                                                       snap_state, snap_latent, snap_clen,

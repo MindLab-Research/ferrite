@@ -2917,6 +2917,17 @@ impl Device {
     /// header carries the C1-C5 argument, and its accumulate is pinned to
     /// `__fmaf_rn` so `--use_fast_math` cannot reassociate an m-way chain.
     ///
+    /// ⚠️ DOMAIN OF THAT PARITY (perf-review finding 4): the kernel it is
+    /// bit-identical to is v1's `gemv_bf16_kernel`, and [`Self::gemv_bf16`] only
+    /// dispatches to v1 for `n >= GEMV_V2_MAX_N` — BELOW that it takes
+    /// `gemv_bf16_v2`, whose K-split changes the f32 summation order (~1e-6, see
+    /// its note). This launcher has no such split, so it matches the single-row
+    /// path only inside the v1 domain; for a small `n` the two differ in the
+    /// last bits and the parity claim does NOT transfer. The verify's head
+    /// (`n = 129280`) is deep inside the v1 domain, which is why the claim holds
+    /// where it is used — do not reuse this kernel for a small matrix and expect
+    /// a bit-exact A/B against the `gemv_bf16` it would then be replacing.
+    ///
     /// `Ok(false)` means NOT performed — keep the per-row loop: either the
     /// loaded .so predates the symbol, or `rows` is outside the kernel's 1..=8
     /// dispatch set (the same bound the C entry enforces).
