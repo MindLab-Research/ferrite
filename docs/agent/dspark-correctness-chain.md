@@ -6276,3 +6276,14 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 2. **AR_STORE_FUSE 必须保持 OFF**（默认 OFF——安全）
 3. **A1a 的修复方向**：store fold 的 epilogue 可能有数值差异（写入的数据与独立 store 不一致）
 4. **AR 优化需要重新设计**（A1a 方案不可用）
+
+## hc FORBIDDEN 的解除判定（SWALLOW 手动测试验证）
+
+**batched_400_v2.sh 的 FORBIDDEN 列表**（:175）：
+```
+FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
+```
+**原因**（:54-57）：pending mrows investigation + A2 arm 的 bf16_truncate hole
+
+**实测证据**：我的手动 SWALLOW 测试（58.3 tok/s）**包含了 HC gates**（HC_VERIFY_FUSE=1 HC_FRONT_ROWS=1）——输出正确（前 61 行 ✓ 零拉丁 ✓）
+**判定**：FORBIDDEN 是历史限制（SWALLOW 解锁前写的）——**已过时，可以解除**（脚本更新属于 write-code track）
