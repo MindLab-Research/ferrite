@@ -55,3 +55,9 @@
 
 **性能**（同测）：`mean-k=0.833 tok/step=1.833 draft=4.23ms verify=37.31ms commit=0.33ms`。
 **下一步**：① 剩余 18 个 mismatch 的行分布（判断 B1 consumer-clen 还是 B2-B6 融合族）→ verify-moe-ilv-audit 的判定树；② 双字 43 的位置（是否集中在长上下文段）；③ 性能：verify 37.31ms → 图化 A/B + 计算下限账本（verify-calc-audit2 / draft-perf-audit 跑中）。
+
+## 剩余 mismatch 的行分布（9fcecb70 的 diff probe）
+
+**18 个 mismatch 的 index 分布：{1: 16, 3: 1, 4: 1}**——即 16/18 是 verify 行 0（verify_out[0]）与 eager 分歧、各 1 个是行 2/行 3。**不是** quant_rows 那种"行 0 恒对 r≥1 全错"的指纹——行 0 现在也错了（16 次）。
+- pos=14 的 mismatch=4（行 3）：spec 第 5 个 token 37500 vs eager 28638——**前 4 个全对**（654/1767/1146/1338 完全一致），说明 k_acc=4 的深度接受已工作，只是第 5 行（被拒的那行之后的 bonus）偶有分歧——这属于正常的近 tie 或残余路径差。
+- 16 个 index=1（行 0）：需要对照 verify-moe-ilv-audit 的 B2-B6 判定树（compressor fused / route fuse / hc tail / 融合投影族）——这是"多行 vs 单行的 kernel 路径差"的最后一层。
