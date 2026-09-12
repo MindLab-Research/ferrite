@@ -5564,6 +5564,32 @@ impl Device {
         Ok(true)
     }
 
+    /// [`Self::rmsnorm_rows`] issued on `s` instead of the main stream. Only the
+    /// verify block's attention dual chain (`DSV41_VERIFY_FORK`) uses it: its kv
+    /// half (norm + rope) rides the second side stream under the q chain, and the
+    /// split is bit-identical exactly because the SAME `dsv41_rmsnorm_rows`
+    /// launch is issued, only on another stream. Same `Ok(false)` contract (a
+    /// stale `.so`/a declined shape) as [`Self::rmsnorm_rows`], so the caller
+    /// falls back to the stream-parameterised plain rmsnorm either way.
+    pub fn rmsnorm_rows_on(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<bool> {
+        let f = match self.kernels.rmsnorm_rows {
+            Some(f) => f,
+            None => return Ok(false),
+        };
+        let rc = unsafe { f(x, w, out, rows, dim, eps, s) };
+        self.kerr(rc, "dsv41_rmsnorm_rows")?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn hc_pre(
         &self,

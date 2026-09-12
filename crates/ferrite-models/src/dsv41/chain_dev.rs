@@ -4079,6 +4079,27 @@ impl<'a> DevChain<'a> {
         self.dev.rmsnorm(x, w, out, rows as i32, dim as i32, eps)
     }
 
+    /// [`Self::norm_rows`] with an explicit stream. Only the verify block's
+    /// attention dual chain (`DSV41_VERIFY_FORK`) calls it: its kv norm rides the
+    /// second side stream under the q chain. Same gate, same two kernels, same
+    /// fallback order — only the stream changes, which is precisely what makes
+    /// the split bit-identical to the serial block.
+    fn norm_rows_on(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: usize,
+        dim: usize,
+        eps: f32,
+        s: CuStream,
+    ) -> Result<()> {
+        if norm_mrows() && self.dev.rmsnorm_rows_on(x, w, out, rows as i32, dim as i32, eps, s)? {
+            return Ok(());
+        }
+        self.dev.rmsnorm_on(x, w, out, rows as i32, dim as i32, eps, s)
+    }
+
     /// Quantise `rows` FP32 rows of `cols` values each into the block scratch
     /// `s.xq_r` / `s.xsc_r` — the multi-row form of [`Self::quant1`].
     ///
@@ -8258,12 +8279,17 @@ impl<'a> DevChain<'a> {
     fn lazy_run_row(&mut self, rows_in: &[u32], i: usize, pos: usize) -> Result<u32> {
         // DSV41_LAZY_SDR: one BLOCKING H2D fewer per row. The counter parks at the
         // block's row-0 position (written once by [`Self::dspark_spec_lazy`]) and
-        // nothing in the m-row path reads it — `step_rows` is handed this row's
-        // position through `pos_base_hint` below, which is the only consumer the
-        // per-row write ever had. See [`lazy_sdr`] for the full argument.
-        if !lazy_sdr() {
-            self.set_pos_ctr(pos + i)?;
-        }
+        // FIX (accept-degradation-rootcause): the claim "nothing in the m-row
+        // path reads it" is WRONG — the per-row rope fallbacks read it:
+        // `apply_rope` at :9543 (q rope), :10047 (inverse o-rope), :10589
+        // (indexer q rope, NO mrows alternative in this config) all compute
+        // `t = *pos_ctr + off`, so the 4-byte H2D IS load-bearing: it puts
+        // row `i` at `pos + i` for the rope rotations. Skipping it made row
+        // i's q/o⁻¹/idx-q rotate at `pos` instead of `pos + i` — corrupting
+        // the verify argmax (k_acc 5.0→2.4). LAZY_SDR keeps only its safe
+        // part (the tap-staging D2D merge at :8206); the per-row set_pos_ctr
+        // H2D is restored unconditionally.
+        self.set_pos_ctr(pos + i)?;
         self.spec_capture = false;
         self.spec_tap_deferred = true;
         // `Some(pos + i)` is the value `step_rows` would read straight back off the

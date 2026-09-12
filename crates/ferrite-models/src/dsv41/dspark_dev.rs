@@ -3185,7 +3185,13 @@ impl<'a> DsparkDev<'a> {
                 let mk_head =
                     (markov_head.as_f32() as *const u8).wrapping_add(base * mr * 4) as *const f32;
                 self.dev.dspark_markov_head_sliced(
-                    (self.logits.ptr as *mut f32).wrapping_add(step * seg),
+                    // FIX (accept-degradation-rootcause): the kernel's contract is
+                    // `logits // [bs, n], row step biased in place` (dsv41_glue.cu:1706
+                    // does `lrow = logits + step*n` INTERNALLY). The previous
+                    // `wrapping_add(step * seg)` here biased the row TWICE, so step s
+                    // read row 2s — steps 3-4 read stale out-of-range rows and the
+                    // draft tokens were semantically misaligned (k_acc 5.0→1.4).
+                    self.logits.ptr as *mut f32,
                     self.collapse.ptr as *const f32,
                     // `markov_embed` NOT offset: `er` is the GLOBAL token's row.
                     markov_embed.as_f32(),
