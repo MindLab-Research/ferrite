@@ -3624,6 +3624,74 @@ static inline int dsv41_gemv_warps_for(int n) {
     return g_gemv_warps;
 }
 
+// MROWS-SMALLN (DSV41_MROWS_SMALL_N_ADAPTIVE, 2026-09-12): rows/block for the
+// MULTI-ROW launcher ONLY (`dsv41_gemm_fp8_mrows`), with its own small-n arm.
+//
+// WHY ITS OWN ARM. The mrows launcher's parallelism is `ceil(n / nwarps)`
+// BLOCKS -- n, not m, and the block count is what decides how much of the chip
+// the launch touches. At the shared expert's w1/w3 shape (n = sh_il = 144, the
+// verify ledger's single biggest item at 10.4ms) the P2 default nwarps = 4
+// gives exactly 36 blocks; on a 148-SM B300 the other 112 SMs carry no block at
+// all for the whole launch, so the kernel is issued onto a machine that is
+// mostly idle.
+//
+// The M=1 arm's crossover (kGemvWarpsBigN = 2048, P2 above) does not answer
+// this: that arm trades prologue amortisation against warps in flight for LARGE
+// n, where the block count is already in the hundreds. Here n is 144 -- nearly
+// two orders below the crossover -- so the constraint is inverted: fewer rows
+// per block is what buys blocks.
+//
+//   n < 256 -> 1 row/block : grid = n     (144) -> 144/148 SMs hold a block
+//   n < 512 -> 2 rows/block: grid = n/2    (72) ->  72/148
+//   else       -> dsv41_gemv_warps_for(n)  (the P2 / P2b arms, untouched)
+//
+// SMEM gets CHEAPER, never tighter: the mrows block's gsmem is
+//     nwarps*k + 256*4 + m*(k/32)*4 + m*k
+// i.e. monotonically increasing in nwarps for every fixed (m, k), so a smaller
+// nwarps cannot cross the opt-in ceiling its predecessor did not. At the
+// shared-expert shape (k = 7168, m = 5): nwarps = 4 asks 70016B (opt-in path),
+// nwarps = 1 asks 48512B -- under the 48KB default, so the cheaper arm also
+// skips the cudaFuncSetAttribute block entirely.
+//
+// NUMERICS -- bit-identical by construction. `nwarps` reaches the kernel as
+// EXACTLY two things: (a) the row a warp owns, `blockIdx.x * nwarps + warp`,
+// and (b) the staging/adressing stride `blockDim.x`. Everything that decides a
+// result is per-warp and unchanged by how many rows share a block: the K walk
+// (`kb` ascending 0..nb_k-1, `j = kb*32 + lane`, the order-preserving form --
+// C1 in the kernel header), the ONE serial `acc[r] += av * wv` chain per
+// (output row, activation row) with its `#pragma unroll 32` source form (C6),
+// the `shfl_xor` tree emitted verbatim once per (warp, r) (C3), and the absence
+// of both a K-split and any cross-row recombination (C4/C5 -- `acc[r]` is an
+// independent chain and nothing is ever combined across r). C4 is precisely the
+// invariant that makes the row partition free; C5 says there is no partial sum
+// anywhere that a different grid could reduce differently.
+// The block-level prologue (LUT build + the M staged activation rows) is
+// replicated once per block, and each replica copies the SAME bytes of the SAME
+// activation rows into its own smem -- a different partition changes neither the
+// bytes copied nor the order they are consumed in, only how many SMs hold a
+// copy. (The kernel's own header already records the geometry as non-observable:
+// "the block geometry does not enter the parity argument -- rows are
+// independent -- it only decides how many rows share one block's staging".)
+//
+// DEFAULT OFF: unset env is byte-identical to the previous behaviour, so serve
+// can A/B DSV41_MROWS_SMALL_N_ADAPTIVE=0 vs 1 in one session.
+// Read once (static): the launcher runs a few hundred times per step.
+static const bool g_mrows_small_n_adaptive = [] {
+    const char* e = getenv("DSV41_MROWS_SMALL_N_ADAPTIVE");
+    if (e == nullptr) return false;
+    return atoi(e) != 0;
+}();
+// Named so the two crossovers are auditable (and tweakable) in one place.
+static const int kMrowsSmallN1 = 256;  // n below which ONE row/block
+static const int kMrowsSmallN2 = 512;  // n below which TWO rows/block
+static inline int dsv41_mrows_warps_for(int n) {
+    if (g_mrows_small_n_adaptive) {
+        if (n < kMrowsSmallN1) return 1;
+        if (n < kMrowsSmallN2) return 2;
+    }
+    return dsv41_gemv_warps_for(n);
+}
+
 // P1 staged gate (DSV41_GEMV_A32_STAGED), default OFF = the P1 direct form.
 //
 // P1 (a32 dead-slot elimination) merges the two mode-4 activation passes into
@@ -5117,10 +5185,16 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     // different expression entirely.
     static const bool no_gemv = getenv("DSV41_NO_GEMV_FP8") != nullptr;
     if (no_gemv) return 2;
-    // One warp per output row, the same adaptive block the m=1 launcher picks for
-    // this `n` (the block geometry does not enter the parity argument -- rows are
-    // independent -- it only decides how many rows share one block's staging).
-    const int nwarps = dsv41_gemv_warps_for(n);
+    // One warp per output row. The MULTI-ROW family reads its OWN rows/block
+    // helper (DSV41_MROWS_SMALL_N_ADAPTIVE): its block count is ceil(n/nwarps),
+    // so the shared expert's n = 144 wants FEWER rows per block -- the M=1 arm's
+    // large-n value (8 for n >= 2048) is the wrong direction here entirely. See
+    // `dsv41_mrows_warps_for` above for the SM-count arithmetic and the
+    // bit-identity argument; with the gate unset it returns exactly
+    // dsv41_gemv_warps_for(n), i.e. this line's previous expression. The block
+    // geometry still does not enter the parity argument -- rows are independent,
+    // it only decides how many rows share one block's staging.
+    const int nwarps = dsv41_mrows_warps_for(n);
     const int blocks = (n + nwarps - 1) / nwarps;
     const int nb_k = k >> 5;
     // weight rows (nwarps*k) + the e4m3 table + the M activation scale rows + the
