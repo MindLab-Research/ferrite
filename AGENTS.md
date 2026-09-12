@@ -1950,3 +1950,25 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **实测验证**：时序结构生效——verify 的 anchor 行（verify_out[0]）正确预测下一 token（pos=11 的 verify[0]=1767==pos12 的 next=1767 ✓、pos=20 的 verify[0]=26433==pos21 的 next ✓ 多处）。**verify 链 + 时序已正确**。
 
 **剩余瓶颈**：drafts 部分匹配（pos=20 的 drafts[4]==verify[4]=25653、pos=22 的 drafts[1]==verify[1]=1572——部分位置匹配暗示中等数值 bug 而非结构崩坏）。mean-accept 仍 1.02。audit-draft-residual 在查。
+
+## 2026-09-12 Wave 2 修复 #10 与单元对照方法论（用户定调）
+
+**单元对照基础设施**（用户方法论："跑一次 demo 抓 mtp 的 latent 对比"+"单元测试比较每个单元"——不再审计推理）：
+- **官方 golden**（/tmp/unit_golden.py，920 行）：官方 model.py 的 DSparkBlock TP1 单卡加载（原始 checkpoint 的 mtp.* 逐 tensor + convert.py 的语义复刻），合成输入（seed 128 行 + decode 1 行），monkeypatch 逐单元 dump（forward_embed/main_x/h/premix/attn 全链/rope/quant/sparse/ffn/head/markov）→ /tmp/unit_golden.pt
+- **device 侧**（unit_dump.rs）：DSV41_DSPARK_UNIT_DUMP=1 dump 第一次 draft_forward 的同款单元 → JSON
+- **注入**（DSV41_DSPARK_UNIT_INJECT）：golden 的 inputs（main_hidden/token/pos）注入 device forward——两侧同输入对照
+- **远程环境**：CUDA torch 2.14.0+cu130（pip --break-system-packages --force-reinstall --index-url .../whl/cu130 "torch==2.14.0+cu130"）+ tilelang 0.1.14
+- **TP8 demo checkpoint**：convert.py 转换完成（/opt/dlami/nvme/models/V41-demo-TP8，34 分钟）——官方 generate.py 的端到端用
+
+**修复 #10**（官方 model.py 语义，单元对照定位）：块 = [embed(t0), noise×4]@**下一位置视角**（RoPE start_pos+1+r；窗口 seed 行 @ start_pos%win）——#8 的 anchor=bonus（sglang/DeepSpec 约定）被单元对照证伪（q 100% 发散）；#8 修对了位置（pos+1）但 token 错（应 t0）。verify 回 5 行 [d1..d5]，accept 链 drafts[0]==next（免费首检）+ drafts[j]==verify_out[j-1]。
+
+**注入 pos 的 off-by-one 教训**：注入的 pos 替换 draft_forward 的 pos 参数（=块行 0 的 rope 位置）——golden 的 start_pos 是 t0 位置——注入要 +1（129 不是 128）。第一次对照（pos=128）q 完全没变（max|d|=54 三次相同）就是这个 off-by-one。
+
+**对照的单元 diff 表**（pos=129 修正后待跑）：
+| 单元 | 修复前（pos=128 注入） |
+|---|---|
+| embed | rel=0.0 ✓ |
+| main_x | rel=4.4e-3 ✓（量化噪声） |
+| q（rope 后） | rel=1.0 ✗（token/位置语义 + 注入 off-by-one） |
+| o/attn out | rel=1.0 ✗（下游） |
+| moe/h | rel=1.6-1.8 ✗（下游） |
