@@ -144,24 +144,41 @@ fi
 # ---------------------------------------------------------------------------
 SO_REL="kernels/cuda/libferrite_kernels.so"
 BIN_REL="target/release/ferrite-serve"
-if [ "$BUILD" = 1 ]; then
+if [ "$BUILD" = 1 ] && [ "$DRY" != 1 ]; then
     echo "-- build: kernels/cuda/build.sh $ARCH ..."
-    rssh "cd ~/$RROOT/kernels/cuda && bash build.sh $ARCH" >"$LOGDIR/build_so.log" 2>&1 \
-        || { echo "FATAL: build.sh $ARCH failed (log $LOGDIR/build_so.log)"; tail -5 "$LOGDIR/build_so.log"; exit 2; }
+    # ⚠️ build.sh's LAST statement is `[ ${#SKELETON_FLAGS[@]} -gt 0 ] && echo …`,
+    # so with no skeleton flags exported the script exits 1 under its own `set -e`
+    # EVEN THOUGH IT BUILT THE .so (measured 2026-09-12). The exit code is NOT the
+    # success criterion here — the "built …" line is.
+    rssh "cd ~/$RROOT/kernels/cuda && bash build.sh $ARCH" >"$LOGDIR/build_so.log" 2>&1
+    so_rc=$?
+    if ! grep -q "built .*libferrite_kernels.so for sm_${ARCH}" "$LOGDIR/build_so.log"; then
+        echo "FATAL: build.sh $ARCH did not report a successful build (rc=$so_rc, log $LOGDIR/build_so.log)"
+        tail -5 "$LOGDIR/build_so.log" | sed 's/^/    | /'
+        exit 2
+    fi
+    [ "$so_rc" != 0 ] && echo "   (build.sh exited $so_rc but reported a successful build — trailing '[ ] && echo' under set -e; the .so IS fresh)"
     echo "-- build: cargo build --release (touch build.rs first, the stamp is baked in by it) ..."
     # The node's non-interactive PATH has no cargo: go through a login shell.
     rssh "cd ~/$RROOT && touch crates/ferrite-kernel/build.rs && bash -lc 'cd ~/$RROOT && cargo build --release'" \
         >"$LOGDIR/build_bin.log" 2>&1 \
         || { echo "FATAL: cargo build --release failed (log $LOGDIR/build_bin.log)"; tail -5 "$LOGDIR/build_bin.log"; exit 2; }
+elif [ "$DRY" = 1 ]; then
+    echo "-- build: skipped (--dry-run is read-only; it never rewrites .build_id or the pair)"
 fi
 
-# Same-source proof (post-build, never an assumption). `grep -cF` and NOT `grep -qF`:
-# under `set -o pipefail` a `strings BIN | grep -q id` makes grep exit at its first
-# match, `strings` takes SIGPIPE (141) and the PIPELINE reports failure even though
-# the id WAS found — the gate would then misfire on a perfectly good pair.
+# Same-source proof (post-build, never an assumption). The .so and its .build_id
+# both live on the NODE — the source box has no nvcc, so it never holds one, and
+# comparing against a local file would always "fail" a perfectly good pair.
+#
+# `grep -cF` and NOT `grep -qF`: under `set -o pipefail` a `strings BIN | grep -q id`
+# makes grep exit at its first match, `strings` then takes SIGPIPE (141) and the
+# PIPELINE reports failure even though the id WAS found — the gate would misfire
+# on a good pair.
+NODE_BUILD_ID="$(rssh "cat ~/$RROOT/kernels/cuda/.build_id 2>/dev/null")"
 embeds_id() {
-    [ -f "$K/.build_id" ] || return 1
-    rssh "strings ~/$RROOT/$BIN_REL | grep -cF -- '$(cat "$K/.build_id")'" >/dev/null 2>&1
+    [ -n "$NODE_BUILD_ID" ] || return 1
+    rssh "strings ~/$RROOT/$BIN_REL | grep -cF -- '$NODE_BUILD_ID'" >/dev/null 2>&1
 }
 HAS_SO="$(rssh "[ -f ~/$RROOT/$SO_REL ] && echo yes || echo no")"
 HAS_BIN="$(rssh "[ -f ~/$RROOT/$BIN_REL ] && echo yes || echo no")"
@@ -169,13 +186,17 @@ if [ "$HAS_SO" != yes ] || [ "$HAS_BIN" != yes ]; then
     echo "FATAL: the node is missing ~/$RROOT/{$SO_REL,$BIN_REL} (so=$HAS_SO bin=$HAS_BIN) — run without --no-build"
     exit 2
 fi
+PAIR_OK=1
 if ! embeds_id; then
-    echo "FATAL: the node's binary does NOT embed the .so's build id — the pair is not same-source."
-    echo "       (.so id: $(cat "$K/.build_id" 2>/dev/null || echo '<missing locally>'))"
-    echo "       rerun without --no-build so the pair is rebuilt in the one working order."
-    exit 2
+    PAIR_OK=0
+    if [ "$DRY" != 1 ]; then
+        echo "FATAL: the node's binary does NOT embed the .so's build id — the pair is not same-source."
+        echo "       (.so id on the node: ${NODE_BUILD_ID:-<missing>})"
+        echo "       rerun without --no-build so the pair is rebuilt in the one working order."
+        exit 2
+    fi
 fi
-echo "-- pair: same-source OK (build id $(cat "$K/.build_id"))"
+[ "$PAIR_OK" = 1 ] && echo "-- pair: same-source OK (build id $NODE_BUILD_ID)"
 
 # ---------------------------------------------------------------------------
 # 2. Which gate, if any, turns the multi-row MoE on. No gate => it IS the default
@@ -196,9 +217,12 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Dry run stops here: nothing was built beyond the pair check, no serve ran.
+# 3. Dry run stops here: nothing was built and no serve ran. What it answers is
+#    "is this box ready to be measured on" — node, revision, pair, gate, GPU.
 # ---------------------------------------------------------------------------
 if [ "$DRY" = 1 ]; then
+    [ "$PAIR_OK" = 1 ] && echo "-- dry run: pair same-source YES" \
+                       || echo "-- dry run: pair same-source NO (binary does not embed ${NODE_BUILD_ID:-<?>}) — a real run would rebuild it"
     free="$(rssh "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | awk '{s+=\$1} END {print s+0}'")"
     echo "-- dry run: GPU memory in use = ${free} MiB (a serve needs the box to itself)"
     echo "-- dry run: ports $PORT_BASE..$(( PORT_BASE + 2 )) would be used; nothing was launched."
@@ -212,6 +236,7 @@ BODY="$(printf '{"model":"%s","messages":[{"role":"user","content":"%s"}],"max_t
         "$MODEL_NAME" "$PROMPT" "$MAXTOK")"
 
 declare -a A_TAG A_VERIFY A_DRAFT A_MEANK A_TOKSTEP A_STEPS A_TEXT A_NOTE
+unmeasured=0    # set when an arm produced no cumulative dspark line at all
 
 # Teardown by EXACT process name: `pkill -f ferrite-serve` would match this very
 # command line (it contains the string) and kill the ssh session. Then prove no
@@ -314,10 +339,14 @@ faults = sum(1 for l in open(log, errors='ignore')
              or re.search(r'\bfault\b', l))
 if faults: fails.append('%d fault line(s) in the log' % faults)
 
-print('%.2f %.2f %.3f %.3f %d %s %s' % (
-    v if v is not None else -1, d if d is not None else -1,
-    k if k is not None else -1, t if t is not None else -1,
-    int(s) if s is not None else 0,
+def num(x, spec):
+    # 'NA', never -1: a missing field must not look like a (negative) measurement
+    # — the shell keys its "no dspark line, this arm is unusable" branch on it.
+    return 'NA' if x is None else (spec % x)
+
+print('%s %s %s %s %s %s %s' % (
+    num(v, '%.2f'), num(d, '%.2f'), num(k, '%.3f'), num(t, '%.3f'),
+    'NA' if s is None else '%d' % int(s),
     'OK' if not fails else 'FAIL',
     '; '.join(fails) if fails else ''))
 PY
@@ -326,7 +355,12 @@ PY
 
     A_TAG+=("$tag"); A_VERIFY+=("$avv"); A_DRAFT+=("$ad2"); A_MEANK+=("$akk")
     A_TOKSTEP+=("$att"); A_STEPS+=("$ass"); A_TEXT+=("$atxt"); A_NOTE+=("${anote:-$note}")
-    [ "$avv" = -1 ] && { echo "   no dspark line parsed — was DSV41_TIMING=1 effective? (log $LOGDIR/${tag}.log)"; }
+    if [ "$avv" = NA ]; then
+        # No cumulative dspark line => no number for this arm. NOT a slow arm: an
+        # unusable one, and the table must not read as a result.
+        echo "   UNMEASURED: no '[dspark] steps=…' line — was DSV41_TIMING=1 effective? (log $LOGDIR/${tag}.log)"
+        unmeasured=1
+    fi
     [ "$atxt" = FAIL ] && echo "   TEXT: $anote"
 }
 
@@ -353,7 +387,7 @@ python3 - "${A_TAG[@]}" -- "${A_VERIFY[@]}" -- "${A_DRAFT[@]}" -- "${A_MEANK[@]}
     | tee "$LOGDIR/table.txt"
 import sys
 argv = sys.argv[1:]
-groups = []
+groups = [[]]          # the tag list comes BEFORE the first '--'
 for a in argv:
     if a == '--': groups.append([])
     else: groups[-1].append(a)
@@ -382,6 +416,10 @@ PY
 
 text_fail=0
 for t in "${A_TEXT[@]}"; do [ "$t" = FAIL ] && text_fail=1; done
+if [ "$unmeasured" = 1 ]; then
+    echo "verify_spec_bench: at least one arm produced NO number — the table is not evidence about the kernels."
+    exit 2
+fi
 if [ "$text_fail" = 1 ]; then
     echo "verify_spec_bench: a TEXT check FAILED — the speed numbers are not usable for a verdict."
     exit 1
