@@ -5722,3 +5722,22 @@ canary 从 0xdeadbeef → **0x00000000**——不是随机数据而是**写零**
 1. **chain.reset()**（chain_dev.rs:4305）——是否碰 staging？
 2. **dspark_rollback/dspark_snapshot**——是否碰 staging？
 3. **某个 kernel 的 memset/zero 越界**
+
+## pubred kernel 的亲自审查——没有 counter reset！
+
+**p2p_ar_pubred_v5_kernel**（:9132-9191）：
+- 写 stamps：`atomicExch_system(&ready_tbl[threadIdx.x][my_rank], e+1)` (:9163)
+- 写 epoch：`*epoch = e + 1u` (:9169)
+- 等待：`ar5_wait_round` (:9172)
+- **没有 counter reset 逻辑！**
+
+**p2p_ar_store_v5_kernel**（:8854-8894）：
+- 只写数据到 parity 缓冲区
+- **没有 counter 逻辑！**
+
+**"two last-block counters" 的来源**（tp.rs:349 注释）：
+- 可能指 **v2 路径**的 store kernel（不是 v5！）
+- v2 的 counter 位置：待查（可能在 ctr_at+8 = canary 的位置！）
+- 如果 v2 的 counter 在 canary 位置且被 reset——**canary 被清零！**
+
+**待 oob-source-investigation 的完整判决**（subagent 正在调查）
