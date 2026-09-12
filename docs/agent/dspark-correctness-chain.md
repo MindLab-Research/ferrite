@@ -498,3 +498,12 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 2. B 只在 `lazy_b_ms_note(rep.verify_ms)` 时更新（swallowed 臂跑完后），但**首轮 legacy（未 primed）不会调 note**——B 停留在 0 → lazy 永远不被选中。
 
 **修法**：B 的初始值不应为 0——应设为合理默认（37ms）或首轮后强制 update。
+
+## 用户红线升级（2026-09-12）："必须和官方完全一样，必须修复拉丁碎片问题"
+
+**官方参考实现 100% 干净**（897/769 字完整背诵、零拉丁碎片、fp8 同格式）——ferrite 的 acs/ibu 是 **backbone 数值路径的确定性偏差**（不是精度格式、不是模型固有）。
+
+**定位路径**（backbone-first-token-alignment 的设计已就绪）：
+1. 首 token 就有分歧（官方 `《出师表》是三国` vs ferrite `《前出师表》原文：`——**prompt 对齐后**首步 top-10 logits 对照）
+2. 逐层 norm 对照二分到第一个偏离层
+3. 已知候选：fp4 权重解包的 nibble 顺序、e8m0 scale 的读取/应用、hc 数学、DSA indexer 的 tie 规则
