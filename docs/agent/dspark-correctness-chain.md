@@ -4853,3 +4853,48 @@ DSV41_VERIFY_FORK=1             # FORK
 ```
 
 **干净栈重建完成**：78.8 → **90.8**（+15.2%）！
+
+## 📋 Session 最终成就总结（极长 session 的收官）
+
+### 一、最核心的发现（范式转移）
+**"引擎损坏"的判定标准是错的——损坏是模型自然行为！**
+- Base 模型（非 chat 微调）在 ~50-60 token 后必然退化
+- 计数：line 62 "重置到 12"（EAGER+e4m3 对照确认 61/77）
+- 出师表：~100 字后重复 + 拉丁（EAGER 对照 'acs' 确认）
+- **验证标准修正**：计数只对前 61 行有效；出师表退化与 EAGER 一致 = 干净
+
+### 二、干净栈重建（+15.2%）
+| 步骤 | 配置 | 吞吐 | 增量 |
+|---|---|---|---|
+| 1 | base | 78.8 | — |
+| 2 | + R2（ATTN_LIN_FUSE）| 86.8 | +10.2% |
+| 3 | + MARKOV_SLICED（修复）| 89.6 | +3.2% |
+| 4 | + LAZY_SDR（修复）| 89.3 | ~0 |
+| 5 | **+ VERIFY_FORK** | **90.8** | **+1.5%（总 +15.2%）** |
+| 6 | K1/K2（R2 替代）| 88.7 | 干净但 R2 更快 |
+
+### 三、代码修复（真 bug——虽不是损坏根因）
+1. MARKOV_SLICED 双重偏移（step s 读 row 2s）
+2. LAZY_SDR 承重 H2D（set_pos_ctr）
+3. S1/D1 DIRECT 臂双计（compress_len 镜像 2×）
+4. D2 形状池饥饿（m=1 拿不到池槽）
+5. S3 路由锁定（lazy⇄batched 换臂）
+6. A4 单块轮询（超时当成功广播 + epoch 竞态）
+7. indexer_topk 烧入 n_pos（*lens==0 时扫陈旧槽）
+8. K2 竞态（qr_norm_out 写回与读取竞态 + 128× 带宽）
+9. K1 decline 路径（回退到逐行 lin 而非两次 proj_mrows）
+
+### 四、400 的路径（诚实评估）
+| 路径 | accept 5 | accept 3（用户校准）| 400 可达 |
+|---|---|---|---|
+| lazy 完成（当前 90.8 → ~95-98）| ✓ | ~65 | ❌ |
+| lazy 极限（L4/L5 全面化）| ~145 | ~97 | ❌ |
+| **batched（SWALLOW 修复）** | **~480 理论** | **~320** | **✓ 唯一路径** |
+
+### 五、Session 的知识产出
+- 交接文档（session-final-handover.md）
+- 验证协议 v2（EAGER 对照 + 前 61 行 + 退化模式一致）
+- 8 大架构发现（instruction-bound、warp-per-row、SH_PAIR M-into-grid 等）
+- SWALLOW 系统性轮次建模 + 第 9 次修复设计
+- tcgen05 重启分析（+3-5% 预期）
+- 400 最终战略（lazy 逼近 + batched 解锁）
