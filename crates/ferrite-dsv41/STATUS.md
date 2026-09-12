@@ -7600,7 +7600,7 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 
 ### E. 方法论铁律（7 条 + gate 卫生）
 
-1. **隔离探针只用于淘汰，正向收益必须 serve A/B**（隔离无法模拟 SM 争抢 / L2 竞争 / 占用率敏感；已 5 次确认隔离→生产失效）。
+1. **隔离探针只用于淘汰，正向收益必须 serve A/B**（隔离无法模拟 SM 争抢 / L2 竞争 / 占用率敏感；本会话最终 **7 次**确认隔离→生产失效：a32-vec4 / AR grid / PDEPTH / w2-warm / quant+swiglu-fold / stamp-fold / swapAB）。
 2. **fork_ev 是 kernel 级，不是 block 级** —— 给 gating kernel 加工作 = 加到关键路径；小 kernel 合并的收益必须 > gate 语义的代价。
 3. **失败实验的代码立即物理删除**（不留 gated-off）；gate 必须验证"OFF 时真的回退"。
 4. **FFI 边界（.cu ↔ Rust）是原子性单位，必须同一 commit**；docs 提交用 `git add <specific-files>`（禁 `-A`）。
@@ -7698,3 +7698,22 @@ wo-pair-diagnosis subagent 分析中。临时处置：**WO_PAIR 保持默认 OFF
 - mx2 swapAB 变体（+0.28ms 理论）——同失效风险
 - expert tcgen05（4-5 人日 → 300 tok/s 路径）
 **当前验证最优：6.17ms = 162.1 tok/s（+115.4%）**
+
+### 隔离→生产失效的系统性根因定案（7 次失效的分类，2026-09-12 17:00）
+
+**三类失效（非均匀分布）**：
+| 类型 | 次数 | 案例 | 机制 |
+|---|---|---|---|
+| 测量有偏 | 3 | a32-vec4 / AR grid / quant+swiglu fold | 旧构型分母（P4 已吸收）/ 理论高估 / launch 计数漏 fork_ev 关键路径 |
+| serve 条件改变 | 3 | PDEPTH / stamp fold / w2 warm | 占用率暴露 / 图 replay 机制崩 / PDL 窗口 SM 争抢 |
+| 系统差异 | 1 | swapAB | L2 争用使 staging 更慢 + 混合形状净亏 |
+
+**系统性差异权重**：SM 争抢（最高）> L2 竞争 > graph replay 模式 > 构型漂移。
+
+**"serve-faithful" 隔离协议（6 条）**：
+1. 生产构型（含已 ON 的前置优化）
+2. 图模式 capture+replay（禁 direct-launch 计时）
+3. 侧流干扰注入（复现 SM 争抢）
+4. L2 污染（每轮换缓冲，禁驻留红利）
+5. 关键路径计费（gate/fork kernel 按 fork_ev 语义）
+6. 判据分层（隔离只做淘汰；正向收益一律 serve A/B + 四段文本 + faults=0）
