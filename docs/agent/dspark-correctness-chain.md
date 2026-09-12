@@ -2201,3 +2201,13 @@ DSV41_BF16_TRUNCATE=1
 **EAGER 融合迁移方案的第一波兑现**！launch 账的 -8.4ms 预测准确 ✓
 
 **下一步**：加 SWALLOW_STEP（ar5-hang 修复后）+ tcgen05（对齐修复验证后）→ 步时目标 ~15-20ms
+
+## ⚠️ 用户的 step 计时纠正（2026-09-12）
+
+**规则**：step 计时必须用日志的准确值（`[dsv41] step pos=X: Y ms` 行），**不能倒推**。
+
+**原因**：开 MTP 后，倒推（总 token / 总时间）受 accept rate 影响——accept 高时每步生成更多 token，倒推的"步时"会偏小；accept 低时偏大。**日志的 per-step 计时是唯一的准确口径**。
+
+**Wave 1 的准确数据**（日志值）：
+- `[dsv41] step pos=105: 25.17ms` ← 这是准确的步时
+- 之前报告的 "87 tok/s" 是从步时+accept 估算的——需要用日志的实际生成时间来验证
