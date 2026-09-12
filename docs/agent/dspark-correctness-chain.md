@@ -1931,3 +1931,21 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1
 DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 ```
 （零拉丁 ✓ + accept 1.214 + 步时 33ms）
+
+## 🔍🔍🔍 draft-verify program 审计的完整判词（4 个新不匹配！）
+
+**已知（head v2/v1）**：ulp 级——测试证明中性（不是 accept 根因）
+
+**新发现的 4 个不匹配**（按严重度）：
+| # | 组件 | draft | verify | 严重度 |
+|---|---|---|---|---|
+| 2 | **attention 投影族** wq_a/wq_b/wkv/wo_b | `gemm_fp8_mx`（m=bs=5 → **16-row TILE**）| `proj_mrows` → `gemm_fp8_mrows`（**m=1 GEMV**）| **🔴 同 head 级** |
+| 3 | **attention o 路** | `sparse_attn`（plain）+ `rope_queries_inv` + `quant1` | `sparse_attn_orope`（**融合** inverse-rope + fp8）| 🟡 |
+| 6 | **shared expert** | 2× `gemm_fp8_mx`（w1/w3 分发）| `gemm_fp8_mx2`（单发两族）| 🟢 低风险 |
+| 9 | **hc_collapse FFN** | 无条件 `hc_collapse_norm`（融合）| pair（collapse_norm_rows 默认 OFF）| 🟡 |
+
+**#2 的机制**：draft 的 bs=5 行走 TILE 程序（多行共享 K-walk），verify 的 m 行走 GEMV 程序（每行独立 K-walk）——**求和序完全不同**，不是 ulp 级而是**结构性差异**！这可能是 accept 卡在 1.214 的真正根因。
+
+**修复方向**：draft 的 attention 投影改用与 verify 相同的程序（gemm_fp8_mrows 的 m=bs 形态），或 verify 改用 draft 的（gemm_fp8_mx）。关键是**两侧走同一个程序**。
+
+**一致的组件**（✓）：MoE gate、routed experts、hc_mixes、hc_post、norm、quant
