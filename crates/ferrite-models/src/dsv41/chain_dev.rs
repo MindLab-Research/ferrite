@@ -2593,6 +2593,44 @@ fn lazy_verify() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_LAZY_VERIFY").map(|v| v != "0").unwrap_or(false))
 }
 
+/// `DSV41_LAZY_ROUTE_LOCK` (DEFAULT ON): the lazy ⇄ batched route binds the
+/// request to the arm its FIRST decision picked and never switches again — the S3
+/// fix.
+///
+/// # Why the switch has to go, not be tuned
+///
+/// The two arms do not own the same compressor state. The LAZY arm forwards one
+/// row at a time and leaves no snapshot of the compressor behind (`spec_capture`
+/// is deliberately clear on it — see [`DevChain::dspark_commit_lazy`]), while the
+/// BATCHED arm's commit ROLLS the block's rejected tail back and replays the kept
+/// rows through the compressor ([`DevChain::dspark_commit`]). A mid-request switch
+/// therefore hands the new arm a state the other arm does not own, and the batched
+/// arm's rollback restores garbage.
+///
+/// It is not a rare edge either. The Schmitt band is `τ ± LAZY_HYST`, i.e. about
+/// `[4.77, 5.27]` with the frozen `B = 37 ms` / `c = 6.15 ms`; a counting-style
+/// task's `k_acc` sits at ≈5 — IN the band — so its mean-k crosses the boundary by
+/// construction. The observed corruption is exactly that switch (round 10-11, 61
+/// tokens). Locking at the first decision removes it: the arm can never move, so
+/// the arm that runs the round is the arm that ran every earlier round.
+///
+/// # Which arm the lock binds to
+///
+/// The first decision is taken with an EMPTY window (`mean_k() == 0.0` — the
+/// window resets with `spec_primed`), so under the default `auto` threshold
+/// (`τ ≈ 5.0`) a locked request starts and stays on the LAZY arm. That is the
+/// intended A/B: `DSV41_LAZY_ROUTE_LOCK=0` is the switchy route as it stood, `=1`
+/// is the corruption's precondition removed. `DSV41_LAZY_THRESHOLD` still decides
+/// which arm the lock binds to (an explicit `0` binds to batched).
+fn lazy_route_lock() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_LAZY_ROUTE_LOCK")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
 /// `DSV41_LAZY_SDR=1`: the lazy arm's PER-ROW SYNC COALESCING — the implementable
 /// part of the "L2 per-row sync" item in
 /// `docs/agent/lazy-verify-optimization-path.md` §L2. Default OFF, so the lazy
@@ -5859,7 +5897,7 @@ impl<'a> DevChain<'a> {
                         c.host_barrier();
                     }
                 }
-                self.step_rows_inner(toks, m, pos_base)?;
+                let _ = self.step_rows_inner(toks, m, pos_base)?;
                 self.verify_dry_done[idx] = true;
                 self.verify_shapes[idx] = m;
             } else if let Some(e) = self.verify_graphs[idx] {
@@ -5962,16 +6000,38 @@ impl<'a> DevChain<'a> {
                     c.host_barrier();
                 }
             }
-            self.step_rows_inner(toks, m, pos_base)?;
-            // (lazy verify's bare-chain path was missing this: `advance_compress_lens`
-            // is called after the graph_launch but NOT after the bare chain, so the
-            // host mirror of compress_len drifted from the device counter on every
-            // m=1 bare-chain call — lazy's per-row step_rows(m=1) hits exactly this
-            // path when no m=1 verify graph exists, and each row's committed groups
-            // were invisible to the host mirror, corrupting the NEXT row's indexer
-            // candidates. This is the direct source of lazy's Bristol/burdens/oqua
-            // and the repetition — the KV/compute misalignment the user called out.)
-            self.advance_compress_lens(pos_base, m);
+            let mirror_advanced = self.step_rows_inner(toks, m, pos_base)?;
+            // ★ S1 FIX. `step_rows_inner` runs the compressor's HOST half for
+            // real, and that half ALREADY advanced `layers[l].compress_len` by this
+            // block's commits — the per-row `compress_row` (`compress_len += 1` per
+            // committed group, under the same `(pos + r + 1) % ratio == 0` rule the
+            // commit kernel applies) or, on the `DSV41_COMPRESSOR_MROWS` arm,
+            // `compress_rows_fused` for the whole block. This arm is the one that
+            // EXECUTES, so the mirror is already right and `advance_compress_lens`
+            // here would count every group a SECOND time.
+            //
+            // What that double count did: the mirror ran ahead of the device
+            // counter by the block's commits, and `compress_len` is what
+            // `attention_rows` bounds the indexer's selection by — so every later
+            // block selected against pool slots the device had never committed,
+            // i.e. stale/zero compressed positions entering the attention. That is
+            // the S1 root cause of the "reset to 12" base corruption.
+            //
+            // The call still belongs to the arms that run the device WITHOUT this
+            // host code: the REPLAY (`graph_launch` above) and the successful
+            // capture (`graph_instantiate` + `graph_launch`), where no
+            // `compress_row` ever runs. The DRY arm and the capture-failure
+            // fallback both call `step_rows_inner` and, like this arm, advance the
+            // mirror through it — they do not call `advance_compress_lens` either,
+            // which is why they were already correct.
+            //
+            // (History: the call was added by 53dfb3b0 as a "missing mirror
+            // advance" fix for the bare chain, on the belief that `step_rows_inner`
+            // did not advance the mirror. It does — `compress_row` already did when
+            // that commit landed — so the "fix" was itself the double count.)
+            if !mirror_advanced {
+                self.advance_compress_lens(pos_base, m);
+            }
         }
 
         // D2H of the m argmaxes, always OUTSIDE the graph (a device read is illegal
@@ -6305,7 +6365,10 @@ impl<'a> DevChain<'a> {
         // fallback launch below — which re-runs `step_rows_inner` on the direct
         // path — is unaffected and eager stays bit-identical.
         self.verify_recording = true;
-        let inner = self.step_rows_inner(toks, m, pos_base);
+        // The S1 mirror flag is discarded here: this arm only cares whether the
+        // recording succeeded. The caller's rollback (`restore_compress_lens`)
+        // owns the mirror on this path either way.
+        let inner = self.step_rows_inner(toks, m, pos_base).map(|_| ());
         self.verify_recording = false;
         let end = self.dev.capture_end();
         match (inner, end) {
@@ -6474,10 +6537,23 @@ impl<'a> DevChain<'a> {
     /// `argmax_r` D2H is the caller's). `pos_base` is the host value the block's
     /// ROW 0 sits at — it is only read where the compressor's launcher needs a
     /// scalar, and it IS frozen by a capture (see [`Self::verify_graph_gate`]).
-    fn step_rows_inner(&mut self, toks: &[u32], m: usize, pos_base: i32) -> Result<()> {
+    /// Returns whether THIS call already advanced the host mirrors of the device
+    /// committed-row counters — the S1 signal `step_rows_sync`'s DIRECT arm needs.
+    ///
+    /// `true` whenever any compress source ran its compressor's HOST half (the
+    /// per-row [`Self::compress_row`] or the hoisted [`Self::compress_rows_fused`]),
+    /// because that half advances `layers[l].compress_len` by the block's commits
+    /// under the same deterministic rule the device commit kernel applies. The
+    /// DIRECT arm must then NOT call [`Self::advance_compress_lens`] (that call is
+    /// the REPLAY/graph-launch arms' — they run the device with no host code); the
+    /// pre-S1 code called it unconditionally and counted every DIRECT block's
+    /// groups twice.
+    fn step_rows_inner(&mut self, toks: &[u32], m: usize, pos_base: i32) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
+        // OR-ed over the layer stack below; see the return note above.
+        let mut mirror_advanced = false;
 
         // embedding + hyper-connection expansion, all m rows in one launch
         self.dev.embed_expand_dev(
@@ -6559,7 +6635,9 @@ impl<'a> DevChain<'a> {
             if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
                 self.engram_apply_rows(layer, li, m)?;
             }
-            pa = self.layer_rows(layer, m, pos_base, pa)?;
+            let (pa_next, layer_mirror) = self.layer_rows(layer, m, pos_base, pa)?;
+            pa = pa_next;
+            mirror_advanced |= layer_mirror;
         }
         debug_assert_eq!(pa, 2, "layer_rows must report the ffn_pre slot");
 
@@ -6779,7 +6857,7 @@ impl<'a> DevChain<'a> {
         // The `argmax_r` D2H is deliberately NOT here: it is a device read, which a
         // capture forbids, so the caller ([`Self::step_rows`]) issues it after the
         // replay for every arm of the graph decision.
-        Ok(())
+        Ok(mirror_advanced)
     }
 
     /// The layers whose window ring the verify block appends to: the `owns_kv`
@@ -8577,7 +8655,23 @@ impl<'a> DevChain<'a> {
     /// (`lazy-batched-gate.md` §4.3). The two arms claim one verify-graph slot
     /// each (`m = 1` / `m = 6`), so switching costs no re-capture once both have
     /// been visited.
+    ///
+    /// ★ S3: with `DSV41_LAZY_ROUTE_LOCK` (DEFAULT ON — see [`lazy_route_lock`]
+    /// for the corruption this removes) the arm is decided ONCE per request and
+    /// then frozen. The hysteresis below still runs on that first call (it is the
+    /// lock-OFF A/B's route, and the lock's first decision is the `None` arm of the
+    /// same expression), so the two configurations share one decision rule.
     fn lazy_route_decide(&mut self) -> bool {
+        // The S3 LOCK: an arm already chosen is FINAL for this request. The two
+        // arms leave DIFFERENT compressor state behind, so a mid-flight switch
+        // hands the new arm a state the other one does not own (the batched
+        // commit's rollback then restores garbage), and the band the switch would
+        // happen in is exactly where a counting task's mean-k sits.
+        if lazy_route_lock() {
+            if let Some(arm) = self.lazy_mode {
+                return arm == Arm::Lazy;
+            }
+        }
         let tau = lazy_tau();
         let mk = self.lazy_hist.mean_k();
         // Two thresholds, one arm: a window sitting on `τ` must not flip the arm
@@ -9541,7 +9635,11 @@ impl<'a> DevChain<'a> {
     /// at `rows = m`, then `collapse_norm_rows` / `hc_post_rows`. The three fusions
     /// (`FUSE_B1`'s `hc_collapse_norm`, `FUSE_C`'s in-place post, the tail split)
     /// are the ones decode has been running, called with `rows = m`.
-    fn layer_rows(&mut self, layer: usize, m: usize, pos_base: i32, pa: usize) -> Result<usize> {
+    /// Returns `(pa, mirror_advanced)` — `pa` is the premix slot the next layer
+    /// starts from (always 2, see `step_rows_inner`), `mirror_advanced` is
+    /// [`Self::attention_rows`]'s S1 answer for THIS layer (whether its
+    /// compressor's host half already advanced `compress_len`).
+    fn layer_rows(&mut self, layer: usize, m: usize, pos_base: i32, pa: usize) -> Result<(usize, bool)> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hc = cfg.hc_mult;
@@ -9668,7 +9766,7 @@ impl<'a> DevChain<'a> {
             m,
             hc_done,
         )?;
-        let attn_folded = self.attention_rows(layer, m, pos_base)?;
+        let (attn_folded, mirror_advanced) = self.attention_rows(layer, m, pos_base)?;
         // `DSV41_VERIFY_AR_FOLD` off (default): the plain AR left `wo_out_r`
         // holding the summed rows and this is the post that consumes it.
         // On: the AR's pubred epilogue already wrote `h_r`, so the standalone
@@ -9814,7 +9912,7 @@ impl<'a> DevChain<'a> {
                 )?;
             }
         }
-        Ok(2)
+        Ok((2, mirror_advanced))
     }
 
     /// Multi-row attention: the m-row twin of [`Self::attention`].
@@ -9826,10 +9924,19 @@ impl<'a> DevChain<'a> {
     /// the window ring and emits the per-row causal window) and the wo all-reduce,
     /// whose payload is simply m rows.
     ///
-    /// Returns whether the wo AR took the `DSV41_VERIFY_AR_FOLD` fold, i.e. its
-    /// pubred epilogue already wrote this block's `hc_post` onto `h_r` — in which
-    /// case `layer_rows` must NOT run the standalone `hc_post_rows`.
-    fn attention_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<bool> {
+    /// Returns `(wo_ar_folded, mirror_advanced)`.
+    ///
+    /// * `wo_ar_folded`: whether the wo AR took the `DSV41_VERIFY_AR_FOLD` fold,
+    ///   i.e. its pubred epilogue already wrote this block's `hc_post` onto `h_r`
+    ///   — in which case `layer_rows` must NOT run the standalone `hc_post_rows`.
+    /// * `mirror_advanced`: whether THIS layer's compressor ran its HOST half for
+    ///   the block (`is_comp_src && comp_proj`), i.e. whether the per-row
+    ///   [`Self::compress_row`] or the hoisted [`Self::compress_rows_fused`] has
+    ///   already advanced `layers[l].compress_len` by this block's commits. The
+    ///   flag exists for `step_rows_sync`'s S1 fix: its DIRECT arm runs this
+    ///   function's host code for real and must therefore NOT advance the mirror a
+    ///   second time (see [`Self::step_rows_inner`]).
+    fn attention_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<(bool, bool)> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hd = cfg.head_dim;
@@ -10330,6 +10437,26 @@ impl<'a> DevChain<'a> {
         } else {
             false
         };
+        // ★ S1: THE HOST MIRROR'S OWNER, reported back to `step_rows_sync`.
+        // This function runs the compressor's HOST half for real, and that half
+        // advances `layers[l].compress_len` by this block's commits — the per-row
+        // `compress_row` (`compress_len += 1` per committed group) or, on the
+        // hoisted arm, `compress_rows_fused` (the whole block up front). Both apply
+        // the SAME deterministic rule the device commit kernel applies, so once
+        // `is_comp_src && comp_proj` holds the mirror ALREADY AGREES with the
+        // device counter. `step_rows_sync`'s DIRECT arm must therefore NOT also
+        // call `advance_compress_lens` — that call belongs to the arms that run the
+        // device WITHOUT this host code (the replay and the graph launch). Doing
+        // both counted every group twice for every DIRECT block, leaving the mirror
+        // ahead of the device counter and the indexer selecting against pool slots
+        // that were never committed (the S1 diagnosis).
+        //
+        // The predicate is exact rather than an approximation of the loop: when
+        // `comp_proj` is false the layer's compressor wrote nothing on EITHER side
+        // (the device kernel is not launched either), so the mirror needs no
+        // advance and `advance_compress_lens` would skip the layer anyway
+        // (`advance_compress_lens`'s own `comp_wkv`/`comp_norm` guard).
+        let mirror_advanced = is_comp_src && comp_proj;
         // The owner's block, for a layer that reads its counters (a consumer, or a
         // source whose own hoist declined while its owner's took).
         let mrows_own_owner = if is_comp_src {
@@ -10939,7 +11066,10 @@ impl<'a> DevChain<'a> {
             }
             c.end_round();
         }
-        Ok(folded)
+        // The second element is THIS layer's answer to `step_rows_sync`'s S1
+        // question ("did the compressor's host half already advance the mirror?"),
+        // computed above where the compressor arm is decided.
+        Ok((folded, mirror_advanced))
     }
 
     /// Publish ONE index key: the roped `wk` projection of `layer`'s pooled
