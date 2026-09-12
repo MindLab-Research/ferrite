@@ -1393,3 +1393,7 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 | 拉丁出现 | gate 破坏基线 | 逐个隔离（用 decline 日志） |
 
 **tcgen05 路径**（下一轮）：需要 GATEUP_FUSE=0 + 三件套 =1（解锁被默认 ON 阻塞的路径）
+
+## AR v5 kernel 数确认（代码级验证）
+
+`ferrite_p2p_ar_v5` = `p2p_ar_store_v5` + `p2p_ar_pubred_v5` 两发（ferrite_kernels.cu :8853/:8895）——**已是 2-kernel**（step-time-remaining 的修正确认）。文档的"3 核/240 发"是旧口径。实际 80 次 × 2 = **160 发/步**。
