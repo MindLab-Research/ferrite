@@ -260,6 +260,19 @@ impl<'a> DsparkDev<'a> {
             .max(bs * dim)
             .max(bs * inter);
 
+        // Defect 4 (audit-moe-seg): the MoE scratches below (`scores`, `route_w`,
+        // `route_idx`, `ex_act_b`) are indexed by the DRAFT layers' routing
+        // geometry — `cfg.moe_config(n_layers + s)`, i.e. the dspark 128/3 — not
+        // the backbone's 384/6. Sizing them from `cfg.n_routed_experts` /
+        // `cfg.n_activated_experts` happened to be the LARGER pair so nothing
+        // overflowed in the shipped config, but a checkpoint whose draft routes
+        // wider than its backbone would walk past the end. All `mtp` blocks share
+        // one geometry; take the max over them anyway so a future per-block
+        // difference cannot silently under-allocate.
+        let (mo_n_routed, mo_topk) = (0..cfg.n_mtp_layers)
+            .map(|s| cfg.moe_config(cfg.n_layers + s))
+            .fold((1usize, 1usize), |(nr, tk), (n, k)| (nr.max(n), tk.max(k)));
+
         let mut window = Vec::with_capacity(cfg.n_mtp_layers);
         for _ in 0..cfg.n_mtp_layers {
             let b = dev.alloc(fb(win * hd))?;
@@ -326,15 +339,18 @@ impl<'a> DsparkDev<'a> {
             confidence: dev.alloc(fb(bs).max(4))?,
             mk_partial: dev.alloc(MARKOV_MAX_BLOCKS * 8)?,
             mk_ctr: dev.alloc(4)?,
-            scores: dev.alloc(fb(bs * cfg.n_routed_experts.max(1)))?,
-            route_w: dev.alloc(fb(bs * cfg.n_activated_experts.max(1)).max(4))?,
-            route_idx: dev.alloc(fb(bs * cfg.n_activated_experts.max(1)).max(4))?,
+            // Sized by the DRAFT layers' routing geometry — see `mo_n_routed` /
+            // `mo_topk` above (defect 4, audit-moe-seg). `draft_moe` reads them
+            // with `cfg.moe_config(layer)` for `layer >= n_layers`.
+            scores: dev.alloc(fb(bs * mo_n_routed))?,
+            route_w: dev.alloc(fb(bs * mo_topk).max(4))?,
+            route_idx: dev.alloc(fb(bs * mo_topk).max(4))?,
             // Shared by the routed SEQUENTIAL fallback ([bs][2*inter_local]) and
             // the shared expert ([2*sh_il]); under the replicated shared layout
             // (DSV41_SHARED_TP=0) `sh_il == inter` is the LARGER of the two, so
             // the size has to clear both.
             ex_act: dev.alloc(fb(bs * 2 * inter_local.max(sh_il)))?,
-            ex_act_b: dev.alloc(fb(cfg.n_activated_experts.max(1) * bs * 2 * inter_local))?,
+            ex_act_b: dev.alloc(fb(mo_topk * bs * 2 * inter_local))?,
             moe_out: dev.alloc(fb(bs * dim))?,
             shared_out: dev.alloc(fb(bs * dim))?,
             pre_mean: dev.alloc(fb(hc))?,
@@ -1284,7 +1300,44 @@ impl<'a> DsparkDev<'a> {
                 d(a.w2_scale.ptr(), b.w2_scale.ptr()),
             );
             let ids = self.route_idx.ptr as *const i32;
-            if !ld.experts_ilv && self.dev.supports_moe_batch() {
+            // Defect 2 (audit-moe-seg): the batched launcher's own `fuse` test
+            // (`dsv41_experts_mxf4.cu`: `g_fuse && g_expert_fp4_mode == 2 &&
+            // dim % 512 == 0`) decides whether the epilogue writes the swiglu'd
+            // inter-width slice or the full 2*inter gate|up block. A host that
+            // guesses wrong walks `act_slot` off by `inter` and runs (or skips)
+            // the separate swiglu against a half that was never written — silent
+            // garbage. Mirror the SAME expression the backbone's `moe_rows` uses
+            // (`chain_dev.rs:5378-5386`), including the `dim % 512` term the
+            // single-row call site omits.
+            let gateup_fused = crate::dsv41::chain_dev::gateup_fuse()
+                && self.dev.supports_gateup_fuse()
+                && crate::dsv41::chain_dev::expert_fp4_mode() == 2
+                && (dim % 512) == 0;
+            // Defect 1 (audit-moe-seg): the interleaved pool is addressable ONLY
+            // by the batched gate/up reader's trailing `ilv` argument. The old
+            // condition (`!ld.experts_ilv && ...`) was therefore always FALSE in
+            // the default configuration (DSV41_EXPERT_ILV defaults ON and the
+            // loader makes ONE layout decision shared by every layer and by the
+            // `mtp` blocks), so the draft fell through to the SEQUENTIAL indirect
+            // reader over interleaved bytes -> shuffled gate/up, i.e. the
+            // MoE-segment 138% deviation. `experts_ilv` must not veto the batched
+            // path; it is handed to the kernel instead.
+            if self.dev.supports_moe_batch() {
+                // The interleaved layout is readable only by the FUSED body (the
+                // unfused arm walks the w3 pool separately), and the kernel
+                // rejects `ilv && !fuse` with cudaErrorInvalidValue. Refuse here,
+                // loudly, instead of launching a call that must fail — the same
+                // contract `moe_rows` enforces (`chain_dev.rs:5341-5351`).
+                if ld.experts_ilv && !gateup_fused {
+                    return Err(FerriteError::Config(
+                        "draft_moe: routed expert gate/up weights are interleaved \
+                         (DSV41_EXPERT_ILV) but the fused batched gate/up path is \
+                         unavailable — run with DSV41_EXPERT_ILV=0, or restore \
+                         DSV41_GATEUP_FUSE / DSV41_EXPERT_FP4_MODE=2 so the fused batched \
+                         call is used"
+                            .into(),
+                    ));
+                }
                 // The batched expert launchers' `rows` argument is validation
                 // only - the grid is output-width based, so each call computes
                 // ONE activation row (the finding recorded in
@@ -1293,8 +1346,16 @@ impl<'a> DsparkDev<'a> {
                 // `[row][slot][act_slot]` block - the same shape `moe_rows`
                 // uses. (The historical call passed rows = bs and silently
                 // computed row 0 only.)
-                let act_slot = (2 * inter_local) as i64;
-                let row_pitch = (topk * 2 * inter_local) as usize;
+                //
+                // Defect 2: the fused epilogue writes only `inter` floats per
+                // slot (the swiglu'd half), so `act_slot` shrinks from `2*inter`
+                // to `inter` exactly when it ran.
+                let act_slot = if gateup_fused {
+                    inter_local as i64
+                } else {
+                    (2 * inter_local) as i64
+                };
+                let row_pitch = (topk as usize) * (act_slot as usize);
                 for r in 0..bs {
                     self.dev.expert_gate_up_fp4_batched(
                         self.xq4.as_u8().wrapping_add(r * (dim / 2)),
@@ -1315,18 +1376,25 @@ impl<'a> DsparkDev<'a> {
                         strides.6,
                         strides.7,
                         ids.wrapping_add(r * topk),
-                        0,
+                        // Defect 1: the pool layout (was a hard-wired 0, which
+                        // only ever matched a non-interleaved pool).
+                        ld.experts_ilv as i32,
                     )?;
                 }
-                for r in 0..bs {
-                    self.dev.swiglu_limit_batched(
-                        (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch),
-                        1,
-                        inter_local as i32,
-                        cfg.swiglu_limit,
-                        act_slot,
-                        topk as i32,
-                    )?;
+                // Defect 2: the fused epilogue already applied swiglu in place,
+                // so the separate pass must be skipped exactly when it ran — it
+                // would otherwise read the never-written up half of every slot.
+                if !gateup_fused {
+                    for r in 0..bs {
+                        self.dev.swiglu_limit_batched(
+                            (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch),
+                            1,
+                            inter_local as i32,
+                            cfg.swiglu_limit,
+                            act_slot,
+                            topk as i32,
+                        )?;
+                    }
                 }
                 for r in 0..bs {
                     self.dev.expert_down_reduce_fp4_batched(
@@ -1347,48 +1415,63 @@ impl<'a> DsparkDev<'a> {
                     )?;
                 }
             } else {
+                // Defect 3 (audit-moe-seg): the sequential `*_indirect` readers
+                // walk the plain [w1][w3] pools; against an interleaved pool they
+                // read shuffled bytes. Refuse instead of emitting garbage.
+                if ld.experts_ilv {
+                    return Err(FerriteError::Config(
+                        "draft_moe: the interleaved pool needs the batched path".into(),
+                    ));
+                }
                 self.dev.zero(&self.moe_out)?;
-                for slot in 0..topk {
-                    let w = (self.route_w.ptr as *const f32).wrapping_add(slot);
-                    self.dev.expert_gate_up_fp4_indirect(
-                        self.xq4.as_u8(),
-                        self.xsc4.as_f32(),
-                        self.ex_act.ptr as *mut f32,
-                        bs as i32,
-                        dim as i32,
-                        inter_local as i32,
-                        cfg.swiglu_limit,
-                        strides.0,
-                        strides.1,
-                        strides.2,
-                        strides.3,
-                        strides.4,
-                        strides.5,
-                        strides.6,
-                        strides.7,
-                        ids,
-                        slot as i32,
-                    )?;
-                    self.dev.swiglu_limit(
-                        self.ex_act.ptr as *mut f32,
-                        bs as i32,
-                        inter_local as i32,
-                        cfg.swiglu_limit,
-                    )?;
-                    self.dev.expert_down_fp4_indirect(
-                        self.ex_act.ptr as *const f32,
-                        self.moe_out.ptr as *mut f32,
-                        bs as i32,
-                        dim as i32,
-                        inter_local as i32,
-                        w,
-                        strides.8,
-                        strides.9,
-                        strides.10,
-                        strides.11,
-                        ids,
-                        slot as i32,
-                    )?;
+                // Defect 3: `expert_gate_up_fp4_indirect` with `rows > 1` takes
+                // the gemm body, while its `row_weight` handling belongs to the
+                // M=1 body (which reads `row_weight[0]`). Issuing `rows = bs` with
+                // the single `route_w + slot` pointer therefore routes every row
+                // through row 0's weight. Issue one row per launch instead
+                // (rows = 1), each with that row's packed fp4 bytes, its
+                // `ids`/`route_w` slice and its own `[2*inter_local]` block.
+                for r in 0..bs {
+                    let act = (self.ex_act.ptr as *mut f32).wrapping_add(r * 2 * inter_local);
+                    let out = (self.moe_out.ptr as *mut f32).wrapping_add(r * dim);
+                    let ids_r = ids.wrapping_add(r * topk);
+                    for slot in 0..topk {
+                        let w = (self.route_w.ptr as *const f32).wrapping_add(r * topk + slot);
+                        self.dev.expert_gate_up_fp4_indirect(
+                            self.xq4.as_u8().wrapping_add(r * (dim / 2)),
+                            self.xsc4.as_f32().wrapping_add(r * (dim / 32)),
+                            act,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            cfg.swiglu_limit,
+                            strides.0,
+                            strides.1,
+                            strides.2,
+                            strides.3,
+                            strides.4,
+                            strides.5,
+                            strides.6,
+                            strides.7,
+                            ids_r,
+                            slot as i32,
+                        )?;
+                        self.dev.swiglu_limit(act, 1, inter_local as i32, cfg.swiglu_limit)?;
+                        self.dev.expert_down_fp4_indirect(
+                            act as *const f32,
+                            out,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            w,
+                            strides.8,
+                            strides.9,
+                            strides.10,
+                            strides.11,
+                            ids_r,
+                            slot as i32,
+                        )?;
+                    }
                 }
             }
         } else {
