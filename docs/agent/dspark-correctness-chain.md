@@ -1700,3 +1700,14 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **这就是 program 不匹配**：draft 用 v2（WPR==1，8 元素分组，shfl_down），verify 用 v1（标量，1 元素/lane，shfl_xor）。两个 program 的舍入不同 → argmax 近 tie 翻转 → 链式失败。
 
 **修复**：`DSV41_DRAFT_HEAD_FOLD=0`（draft head 回 v1，与 verify 一致）
+
+## Program 一致性总结（draft-verify head 的完整图景）
+
+| head 路径 | 默认 | kernel | program |
+|---|---|---|---|
+| draft head fold | **ON** | head_gemv_bf16_mrows | **v2 WPR==1**（uint4 + 8 元素 + shfl_down）|
+| draft head fallback | ON 时不用 | gemv_bf16 | v1 per-row（标量 + shfl_xor）|
+| verify head | 默认 | gemv_bf16 per-row | **v1 per-row**（标量 + shfl_xor）|
+| verify head mrows | OFF | dsv41_gemv_bf16_v1_mrows | **v1-order** multi-row（与 v1 同序）|
+
+**修复**：DSV41_DRAFT_HEAD_FOLD=0 → draft 走 v1 per-row（与 verify 默认一致）
