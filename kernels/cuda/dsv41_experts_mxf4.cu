@@ -126,6 +126,23 @@ __device__ __forceinline__ uint32_t smem_addr(const void* p) {
     return __uint_as_float(((uint32_t)b) << 23);
 }
 
+// e4m3 -> f32, the OFFICIAL expert-activation format (fp8 e4m3, block 32). The
+// mapping is EXACT (fp8 -> f32 is lossless), so the fp8 activation staging below
+// reproduces the reference kernel's operand bit for bit. Copied verbatim from
+// dsv41_kernels.cu's anonymous namespace (the two TUs cannot share it) - keep the
+// two copies in sync.
+__device__ __forceinline__ float dsv41_e4m3_to_f(uint8_t b) {
+    // sign(1) exp(4) mantissa(3), bias 7; subnormals (exp 0) are m * 2^-9.
+    const uint32_t s = ((uint32_t)b & 0x80u) << 24;
+    const uint32_t e = ((uint32_t)b >> 3) & 0x0Fu;
+    const uint32_t m = (uint32_t)b & 0x07u;
+    if (e == 0u) {
+        const float v = (float)m * (1.0f / 512.0f);
+        return (b & 0x80u) ? -v : v;
+    }
+    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
+}
+
 // f32 power-of-two -> e8m0 byte (the caller's scales are fast_round_scale
 // outputs, i.e. powers of two; a non-power-of-two is truncated to its exponent).
 // ue8m0(b) = 2^(b-127), so the byte is the BIASED exponent: e + 127.
@@ -571,6 +588,22 @@ __device__ __forceinline__ float dsv41_e2m1_to_f(uint8_t n) {
     return (n & 8u) ? -m : m;
 }
 
+// e4m3 byte -> f32: sign(1) / exponent(4, bias 7) / mantissa(3); e == 0 is the
+// subnormal arm m * 2^-9. EXACT (every e4m3 value is representable in f32),
+// which is what lets the e4m3 activation path feed the SAME float dot the e2m1
+// one does - the official `fp4_gemm` is "FP8 act x FP4 weight" with the FP4
+// weight cast up to FP8, and an fp4/fp8 -> f32 decode composes with that cast.
+// The expert activation quantiser (`quant.rs::e4m3_encode` via `dsv41_quant_fp8`)
+// saturates into +-448 and never emits 0x7F/0xFF, so no Inf/NaN arm is needed.
+__device__ __forceinline__ float dsv41_e4m3_to_f(uint8_t b) {
+    const uint32_t e = (b >> 3) & 0x0Fu;
+    const uint32_t m = b & 0x07u;
+    // e == 0: m * 2^-9        e > 0: (8 + m) * 2^(e - 10)
+    const float v = (e == 0) ? ((float)m * (1.0f / 512.0f))
+                             : (float)(8u + m) * __uint_as_float((e + 117u) << 23);
+    return (b & 0x80u) ? -v : v;
+}
+
 __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                                        const uint8_t* __restrict__ a,
                                        const float* __restrict__ a_scale,
@@ -584,7 +617,7 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
                                        const uint8_t* __restrict__ bs_base, long bs_stride,
                                        const uint8_t* __restrict__ bh_base, long bh_stride,
                                        const uint8_t* __restrict__ bhs_base, long bhs_stride,
-                                       const int* __restrict__ ids, int slot) {
+                                       const int* __restrict__ ids, int slot, int act_e4m3) {
     const uint8_t* b_use = b;
     const uint8_t* bsc_use = b_scale;
     const uint8_t* bhi_use = b_hi;
@@ -602,10 +635,17 @@ __global__ void expert_gemv_fp4_kernel(const float* __restrict__ a_f32,
     // weights, which is what pinned this kernel at 38 GB/s (0.5 percent).
     extern __shared__ float s_act[];   // k floats (20 KB at k=5120)
     const int kbytes = k >> 1;   // packed bytes per row
-    const int ksc = k >> 5;      // e8m0 scales per row
+    const int ksc = k >> 5;      // scales per row (f32 for the activation)
+    // DSV41_EXPERT_ACT_E4M3 (direct e4m3, official semantics): `a` holds ONE
+    // e4m3 byte per value (no packing), so the row is `k` bytes; `a_scale` is
+    // the quantiser's own f32 per 32 (`dsv41_quant_fp8(block=32)`). Same float
+    // staging as the e2m1 arm - only the decode and the row pitch differ - so
+    // the dot, the shuffle tree and the epilogue are untouched.
     for (int j = threadIdx.x; j < k; j += blockDim.x) {
         if (a_f32 != nullptr) {
             s_act[j] = a_f32[j];
+        } else if (act_e4m3) {
+            s_act[j] = dsv41_e4m3_to_f(a[j]) * a_scale[j >> 5];
         } else {
             const uint8_t ab = a[j >> 1];
             const float asc = a_scale[j >> 5];
@@ -1162,7 +1202,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bs_stride, const uint8_t* __restrict__ bh_base,
                                                long bh_stride, const uint8_t* __restrict__ bhs_base,
                                                long bhs_stride, const int* __restrict__ ids,
-                                               int vec, int fuse_swiglu, int ksplit, int pf) {
+                                               int vec, int fuse_swiglu, int ksplit, int pf,
+                                               int act_e4m3) {
     const int slot = (int)blockIdx.y;
     // ---- ACTIVATION ROW (grid.z): the MULTI-ROW dimension ------------------
     // `rows` is now the launcher's THIRD grid dimension (it used to be
@@ -1378,9 +1419,35 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // packing (kbytes bytes / ksc scales per row) - see the layout contract at
     // the top of this kernel. `arow == 0` folds every offset below to exactly the
     // pre-multi-row address arithmetic.
-    const uint8_t* a_row = (a != nullptr) ? (a + (size_t)arow * (size_t)kbytes) : a;
+    //
+    // DSV41_EXPERT_ACT_E4M3 (direct e4m3, official semantics): `a` holds ONE
+    // e4m3 byte per value instead of two packed nibbles, so the row PITCH
+    // doubles (`abytes = k`) while the weights stay fp4-packed (`kbytes`). This
+    // is the official `fp4_gemm` activation - `act_quant(e4m3, block=32)` -
+    // consumed in one pass instead of the retired e2m1x2 two-pass simulation.
+    const int abytes = act_e4m3 ? k : kbytes;
+    const uint8_t* a_row = (a != nullptr) ? (a + (size_t)arow * (size_t)abytes) : a;
     const float* asc_row = (a != nullptr) ? (a_scale + (size_t)arow * (size_t)ksc) : a_scale;
-    if ((k & 31) == 0 && a_row != nullptr && act == nullptr &&
+    if (act_e4m3 && a_row != nullptr && act == nullptr) {
+        // 16 bytes = 16 values, all inside ONE 32-value scale block (a 16-value
+        // group starts at a multiple of 16 and `g >> 1` is its block), so one
+        // LDG.128 + one LDS.32 scale covers the group.
+        if ((k & 15) == 0 && (((uintptr_t)a_row & 15) == 0)) {
+            const int n16 = k >> 4;
+            for (int g = threadIdx.x; g < n16; g += blockDim.x) {
+                const uint4 packed =
+                    *reinterpret_cast<const uint4*>(a_row + (size_t)g * 16);
+                const float asc = asc_row[g >> 1];
+                const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
+                float* dst = s_act + (size_t)g * 16;
+#pragma unroll
+                for (int q = 0; q < 16; ++q) dst[q] = dsv41_e4m3_to_f(pb[q]) * asc;
+            }
+        } else {
+            for (int j = threadIdx.x; j < k; j += blockDim.x)
+                s_act[j] = dsv41_e4m3_to_f(a_row[j]) * asc_row[j >> 5];
+        }
+    } else if ((k & 31) == 0 && a_row != nullptr && act == nullptr &&
         (((uintptr_t)a_row & 15) == 0)) {
         const int nb32 = k >> 5;
         for (int b32 = threadIdx.x; b32 < nb32; b32 += blockDim.x) {
@@ -2291,7 +2358,8 @@ inline cudaError_t launch_mxf4(const uint8_t* a, const float* a_scale, const flo
         const int blocks = (n_total + warps - 1) / warps;
         expert_gemv_fp4_kernel<<<blocks, cta, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, b, b_scale, b_hi, b_hi_scale, out, n_total, k, b_split, epi_mode,
-            limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0);
+            limit, row_weight, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0, nullptr, 0,
+            /*act_e4m3=*/0);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
@@ -2394,9 +2462,15 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
                                         const uint8_t* bs_base, long bs_stride,
                                         const uint8_t* bh_base, long bh_stride,
                                         const uint8_t* bhs_base, long bhs_stride,
-                                        const int* ids, int slot, cudaStream_t s) {
+                                        const int* ids, int slot, int act_e4m3, cudaStream_t s) {
     if (rows <= 0 || n_total <= 0 || k <= 0) return cudaSuccess;
     if (k % kAtomK != 0) return cudaErrorInvalidValue;
+    // The e4m3 activation form exists only in the GEMV (the tcgen05 `kind::mxf4`
+    // MMA is e2m1 x e2m1). Every routed-expert caller here is rows == 1 at
+    // decode, but a rows > 1 call would silently take the wrong arm, so it is
+    // refused rather than mis-decoded.
+    if (act_e4m3 != 0 && !(rows == 1 && getenv("DSV41_NO_GEMV_FP4") == nullptr))
+        return cudaErrorInvalidValue;
     // M=1 (decode): the tcgen05 tile is M=128 by hardware, so the tensor-core path
     // is 128x redundant and its grid collapses to a handful of blocks. The GEMV is
     // bandwidth-bound with one warp per output row. (Same dispatch as launch_mxf4.)
@@ -2410,7 +2484,7 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
         expert_gemv_fp4_kernel<<<blocks, warps * 32, (size_t)k * sizeof(float), s>>>(
             a_f32, a, a_scale, nullptr, nullptr, nullptr, nullptr, out, n_total, k, b_split,
             epi_mode, limit, row_weight, b_base, b_stride, bs_base, bs_stride, bh_base, bh_stride,
-            bhs_base, bhs_stride, ids, slot);
+            bhs_base, bhs_stride, ids, slot, act_e4m3);
         return cudaGetLastError();
     }
     const dim3 grid((unsigned)((n_total + kNTile - 1) / kNTile),
@@ -2429,14 +2503,17 @@ inline cudaError_t launch_mxf4_indirect(const uint8_t* a, const float* a_scale, 
 }
 
 // gate_up, indirect: derives w1/w3 (+scales) from the pools and ids[slot].
+// `act_e4m3` (trailing, new): the activation `a` is e4m3 bytes (1/value) with
+// `a_scale` f32 per 32 instead of e2m1 packed nibbles (DSV41_EXPERT_ACT_E4M3).
 extern "C" int dsv41_expert_gate_up_fp4_indirect(
     const uint8_t* a, const float* a_scale, float* out, int rows, int dim, int inter, float limit,
     const uint8_t* w1_base, long w1_stride, const uint8_t* w1s_base, long w1s_stride,
     const uint8_t* w3_base, long w3_stride, const uint8_t* w3s_base, long w3s_stride,
-    const int* ids, int slot, cudaStream_t stream) {
+    const int* ids, int slot, int act_e4m3, cudaStream_t stream) {
     return (int)launch_mxf4_indirect(a, a_scale, nullptr, out, rows, 2 * inter, dim, inter, 1, limit,
                                      nullptr, false, w1_base, w1_stride, w1s_base, w1s_stride,
-                                     w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, stream);
+                                     w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, act_e4m3,
+                                     stream);
 }
 
 // down, indirect, accumulating into `out` (epi_mode 3).
@@ -2446,7 +2523,8 @@ extern "C" int dsv41_expert_down_fp4_indirect(
     const int* ids, int slot, cudaStream_t stream) {
     return (int)launch_mxf4_indirect(nullptr, nullptr, act, out, rows, dim, inter, -1, 3, 0.f,
                                      row_weight, true, w2_base, w2_stride, w2s_base, w2s_stride,
-                                     w2_base, w2_stride, w2s_base, w2s_stride, ids, slot, stream);
+                                     w2_base, w2_stride, w2s_base, w2s_stride, ids, slot,
+                                     /*act_e4m3=*/0, stream);
 }
 
 extern "C" int dsv41_expert_down_fp4(const float* act, const uint8_t* w2,
