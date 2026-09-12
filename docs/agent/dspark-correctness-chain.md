@@ -2809,3 +2809,22 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 @ accept 5：6/0.0178 = **337 tok/s**（不是 400！）
 
 **结论**：lazy verify 的优化天花板是 ~337 tok/s（不是 400）。**400 需要 batched（SWALLOW）在 accept ≥3.55 时才可达**——Plan B 是关键！
+
+## SH_PAIR Parity 重测结果（780d83af）——36 → 2 failures（重大进展！）
+
+**通过的测试**（绝大多数）：
+- [fold/range] OK m=8 fold_r=3~8
+- [n2%32/m=5] OK m=5 fold_r=3
+- [tiny/m=2] OK
+- [prod/m=3/act] OK m=3 fold_r=1 n1=288 k1=5120 n2=5120 epi_add=0 act=buf
+
+**剩余 2 failures**：
+1. **[prod/m=6/nolimit] 8 phase-1 byte(s) left unwritten**——生产形状（m=6）的 nolimit 路径有 8 字节未写
+2. （需要看第二个失败——可能是同类）
+
+**判定**：sh-pair-parity-fix-3 的修复（幻影行越界 + 测试 bug）解决了 34/36 项。剩余 2 项在 **prod/m=6/nolimit**（batched verify 的生产形状）——lazy verify 用 m=1 不受影响！
+
+## Plan B SWALLOW 测试结果——0 ar5-hang ✓
+
+**结果**：PLANB-CRASH（curl 超时——可能是 serve 启动慢），但 **0 ar5-hang + 0 DISAGREED** ✓
+**判定**：Plan B（unanimity-or-direct）可能工作——需要重测确认（serve 可能启动晚了）
