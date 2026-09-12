@@ -29,7 +29,7 @@
 
 use std::ffi::c_void;
 
-use ferrite_types::{FerriteError, Result};
+use ferrite_types::{FerriteError, Result, SpecStep};
 
 use std::sync::Arc;
 
@@ -861,6 +861,29 @@ fn idx_fuse() -> bool {
 fn head_slice() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| std::env::var("DSV41_HEAD_SLICE").map(|v| v != "0").unwrap_or(true))
+}
+
+/// `DSV41_VERIFY_HEAD_FOLD=0` makes the verify's head run the SAME per-row
+/// `gemv_bf16` the single-row path uses instead of the folded multi-row
+/// `head_gemv_bf16_mrows`.
+///
+/// The folded kernel's header argues bit-identity with "the single-row launch it
+/// replaces" (C1-C5), but the production single-row path is NOT that program:
+/// `gemv_bf16` dispatches to `ferrite_gemv_bf16_v2` (`gemv_bf16_nt_kernel`:
+/// lane-strided uint4 loads, 8-wide FMA groups, WPR split-K), while the folded
+/// kernel walks `for (c = lane; c < k; c += 32)` scalar `__fmaf_rn` pairs. Two
+/// different accumulation orders means a ~1e-3 rounding gap — enough to flip
+/// near-tie argmaxes, measured as `verify_out[0] == next` (the "echo") on 33% of
+/// verify rows, which IS the text repetition (`emitted = [next] + verify_out[..]`
+/// then writes `next` twice). Default ON (the fast path) until the folded kernel
+/// adopts v2's K order. Read once and cached — the house rule for hot-path gates.
+fn verify_head_fold() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_HEAD_FOLD")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -3677,18 +3700,19 @@ impl<'a> DevChain<'a> {
         // --use_fast_math cannot reassociate). A stale .so without the symbol —
         // or m outside the kernel's 1..=8 set — falls back to the per-row loop.
         let head = self.w.head.as_ref().unwrap();
-        let folded = if head.dtype == "BF16" {
-            self.dev.head_gemv_bf16_mrows(
-                head.ptr(),
-                self.s.xn_r.ptr as *const f32,
-                self.s.logits_r.ptr as *mut f32,
-                m as i32,
-                cfg.vocab_size as i32,
-                dim as i32,
-            )?
-        } else {
-            false
-        };
+        let folded = verify_head_fold()
+            && if head.dtype == "BF16" {
+                self.dev.head_gemv_bf16_mrows(
+                    head.ptr(),
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.logits_r.ptr as *mut f32,
+                    m as i32,
+                    cfg.vocab_size as i32,
+                    dim as i32,
+                )?
+            } else {
+                false
+            };
         if !folded {
             for r in 0..m {
                 let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
@@ -4868,13 +4892,16 @@ impl<'a> DevChain<'a> {
         // verify_out[j-1]. This is the historical chain; an "index-for-index
         // drafts[j]==verify_out[j]" variant was tried and measured 0.000 —
         // cross-position — confirming the draft block is at pos, not pos+1.
-        let mut k_acc = 0usize;
-        if drafts[0] == next {
-            k_acc = 1;
-            while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc - 1] {
-                k_acc += 1;
-            }
-        }
+        //
+        // The chain itself is the SHARED one ([`ferrite_types::spec_accept`],
+        // bound here through `SpecStep::ANCHOR_IS_IN_BLOCK = false`): because
+        // this block does NOT contain the anchor row, the anchor's judge `next`
+        // has to lead the judge array and the block rows shift by one — the
+        // block's LAST row's argmax is the bonus token, so it judges no draft.
+        let mut judges = [0u32; DSPARK_DRAFTS];
+        judges[0] = next;
+        judges[1..].copy_from_slice(&verify_out[..DSPARK_DRAFTS - 1]);
+        let k_acc = Self::accept(&drafts, &judges);
 
         // ---- 6. the commit: roll back everything past the accepted prefix,
         // replay the kept rows through the compressors, advance the counter.
@@ -9042,5 +9069,41 @@ fn hc_tail_split() -> bool {
         }
         // the block output is the attention-branch accumulator `o`
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The SpecStep seam — the four-phase skeleton shared with GLM's MTP chain
+// ---------------------------------------------------------------------------
+
+/// The DSV41 DSpark chain as one [`SpecStep`], the same four phases GLM's
+/// `TpCluster::mtp_step` exposes (`ferrite-exec/src/tp.rs`):
+/// draft → verify → accept → commit.
+///
+/// `ANCHOR_IS_IN_BLOCK = false` is the layout fact the shared accept chain
+/// needs: this verify block is `[d1..DSPARK_DRAFTS]` and does NOT contain the
+/// anchor row — the plain single-row step forwards it — so `SpecStep::accept`
+/// takes the judge array with the anchor's argmax (`next`) leading it and the
+/// block rows shifted by one (`drafts[j]` vs `verify_out[j - 1]`), and the
+/// accepted count is the draft prefix itself (0..=DSPARK_DRAFTS).
+///
+/// The phases stay fused in one call on purpose: the snapshot/rollback pair
+/// brackets the verify (see `DevChain::dspark_spec_step`), so the trait exposes
+/// the step, not its parts.
+impl<'c> SpecStep for DevChain<'c> {
+    // Two lifetimes, both needed: the OUTER one borrows the draft device for
+    // this step, the INNER one is `DsparkDev`'s own (it borrows the device,
+    // config and weights for the whole serving scope). They cannot be collapsed
+    // — `&mut T` is invariant in `T`.
+    type Step<'a, 'b>
+        = (&'a mut DsparkDev<'b>, u32, usize)
+    where
+        'b: 'a;
+    type Report = DsparkSpecReport;
+    const ANCHOR_IS_IN_BLOCK: bool = false;
+
+    fn spec_step(&mut self, step: Self::Step<'_, '_>) -> Result<Self::Report> {
+        let (dspark, token, pos) = step;
+        self.dspark_spec_step(dspark, token, pos)
     }
 }
