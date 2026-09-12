@@ -415,3 +415,9 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 **文本质量**：出师表背诵到 "引喻失义，以塞忠谏之路也" + 后续正常——**最长的正确背诵**。
 **性能**：verify 38.34ms（比双趟 −3.7ms，与无 e4m3 的基线 36.10 差 +2.2ms——e4m3 的量化开销（quant_fp8 的 block-32 计算）+ kernel 内 e4m3 staging 的解码开销）。
 **accept**：k_acc 均值从 0.86 降到 0.66——可能因 ILV=ON 与 e4m3 的 pair body 交互变化。
+
+## tcgen05 × e4m3 互斥判词（tcgen05-route-mxf4）
+
+**硬互斥**：`kind::mxf4` 的 `b_format` 只认 E2M1——e4m3 属于另一个格式枚举。tcgen05 的 MMA 硬件路径（`tcgen05.mma::kind::mxf4`）不适用于 e4m3 激活。**不能同时开启**。
+且当前 dispatch 层的拒绝是**静默的**（`!ran_tc` 只是跳过，不报错）——测量陷阱。
+**修法**：Rust 侧在 e4m3 + tcgen05 同时开时打印一次警告（或 fail-loud）。
