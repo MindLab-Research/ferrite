@@ -97,3 +97,14 @@
 **修复路径**：
 - **判定**（最便宜）：用官方 `ref_inference/generate.py` 跑同一 prompt——若官方也在同位置出 opa ⇒ 模型固有（无需修）；若官方干净 ⇒ ferrite 的 backbone 数值有共性偏差（继续二分：fp4 解包/量化）。
 - **缓解**（无论如何可做）：模型可能本来就需要"背诵完出师表后收尾"的 chat template 引导——检查 Dsv41Frame 的模板是否让模型有明确的"答完即停"信号。
+
+## 剩余 mismatch 的 A/B 结果（1f2ce355）
+
+| 配置 | 出师表 | mismatch 数 |
+|---|---|---|
+| 基线（前一轮 final1） | LEN 140 双字 3 | 18 |
+| `DSV41_GEMV_A32=0` | PARSE-FAIL（serve 被 kill——与 sh-exp-ab-runner 的并发冲突，作废） | — |
+| **`DSV41_SPARSE_OROPE=0`** | **LEN 140 双字 3（与基线逐字一致）** | **1** |
+
+**决定性**：`DSV41_SPARSE_OROPE=0` 把 mismatch 从 18 降到 **1**——**o-rope 融合（sparse_attn_orope）是剩余 row-0 mismatch 的根因**（EAGER 走融合、verify 走三连——"verbatim" 声称不成立，与 FOLD 同类）。文本不变（LEN 140 双字 3）说明那 1 个残余 mismatch 不影响本 prompt 的输出。
+**修法**：把 verify 也走 `sparse_attn_orope`（对齐 EAGER），或 EAGER 关融合（性能损失小——但 o-rope 融合本身是优化）。**下一步**：重跑 GEMV_A32=0 臂（这轮被并发测试 kill 了），确认 a32 是否解释最后 1 个 mismatch。
