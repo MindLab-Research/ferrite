@@ -1503,3 +1503,7 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 
 **预期**：accept 1.214 → **1.4-1.8**（S1 修复的效果）
 **判定**：如果 accept 显著提升且零拉丁保持 → S1 修复成功，P0-1 可以安全启用
+
+## 重要校准：sglang 的 accept ~5 和 13ms 步时是循环推导（用户挑战）
+
+**硬数据只有 383.7 tok/s**。accept 5 和 13ms 互相推导（循环论证）。实际可能是低步时+低 accept 的组合。对我们的策略影响：如果 sglang 是低步时（~8ms）+低 accept（~3），那步时优化比 accept 更重要——与 arch-floor-insights 的"accept 优先"判决可能矛盾。需要实测 sglang 或找到公开的分解数据。
