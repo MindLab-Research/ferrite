@@ -3922,3 +3922,28 @@ self.dev.gemm_fp8_mx_rope_norm(
 **测试后的分支**：
 - 干净 → 出师表验证 → 干净栈重建（wo_a → RING_WIN → FORK → MARKOV → LAZY_SDR）
 - 损坏 → parity 测试（GPU 7 单卡）→ 逐字节定位
+
+## K1+K2 全修复测试的立即行动方案（结果驱动）
+
+**结果 A（数字全对 + 吞吐 ≥75）**：
+1. 立即跑出师表验证（1000 token + 零拉丁 + 完整内容人工检查）
+2. 出师表过 → K1+K2 验证完成 → 干净栈重建开始
+3. 提交最终配置到知识文档
+
+**结果 B（数字仍错）**：
+1. 跑 parity 逐字节 diff（GPU 7 单卡）：
+   ```bash
+   nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 \
+     -I/usr/local/cuda/include -L/usr/local/cuda/lib64 \
+     -o /tmp/t_r2parity kernels/cuda/tests_dsv41_r2_parity.cu && \
+   CUDA_VISIBLE_DEVICES=7 timeout 120 /tmp/t_r2parity
+   ```
+2. parity 的 VERDICT 行会指出哪个组件不等价
+3. 根据定位修复
+
+**结果 C（数字对但吞吐 < 50）**：
+1. 读 perf-pathology 的分析
+2. 可能是 K2 的 32-warp 强制块效率——考虑 K2 的 launch 配置优化
+3. 或者 K1/K2 的其他性能问题
+
+**注意**：本次测试的 .so 不含 K1 decline 路径修复（刚提交）——但 decline 只影响回退路径（正常路径不变），测试结果仍有效。
