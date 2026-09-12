@@ -5047,3 +5047,33 @@ DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3
 ### 结果 D：crash
 1. epoch pad 实施有 bug
 2. 检查 pad kernel 的调用和参数
+
+## 🚨 SWALLOW epoch pad 测试失败（4c1cc40a）——第 9 次也失败！
+
+**中间观察**：
+- **21,843 ar5-hang**——仍 hang！
+- hang 消息：`argmax_rows rank=2 peer=3 need=81 cur=54 rows=6`——gap=27
+- **v5-ledger 没有输出（0 行）**——D1 观测没有生效！（或 ledger 的打印条件没触发）
+
+**SWALLOW 修复的完整历史（9 次全失败）**：
+| # | 尝试 | 结果 |
+|---|---|---|
+| 1 | argmax 守卫 | gap 22 ❌ |
+| 2 | 回退 | gap 3 ❌ |
+| 3 | Plan A+C（对称化）| gap 23 ❌ |
+| 4 | 无图（出师表）| 0 ✓ |
+| 5 | 无图（计数）| 937 ❌ |
+| 6 | Plan B（臂投票）| 10,099 ❌ |
+| 7 | Plan B+primed_unanimous+serve 毒化 | 105,469 ❌ |
+| 8 | （隐含）| ❌ |
+| 9 | **epoch pad（81 轮补偿）** | **21,843 ❌** |
+
+**判定**：
+1. **epoch pad 没有修复 hang**——可能 pad 的 81 轮补偿不足以/不正确
+2. **v5-ledger 观测没生效**——无法看到实际轮次增量（需要检查 ledger 的实现/触发条件）
+3. **gap=27**（不是 81）——轮次差不是 swallowed 的 step_dev 缺失（81）而是别的来源
+
+**下一步**：
+1. 检查 v5-ledger 为什么没输出（D1 观测的 bug？）
+2. 分析 gap=27 的来源（不是 81——不是 step_dev 的缺失）
+3. 可能需要第 10 次修复——基于 ledger 的实测数据（先修 D1）
