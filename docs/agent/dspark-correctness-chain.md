@@ -810,3 +810,19 @@ Layer 20 的 norm 偏差 +14.46% 是最大异常点。config: `compress_ratios[2
 
 **优化方向**：批量化 barrier/D2H（每步一次而非每行一次）或混合模式（前 2 行 batched + 后续 lazy）。
 **文本**：与之前完全相同（backbone 偏差不变，acs/Bristol/burdens/oqua）。
+
+## 架构判定：lazy verify 无法达到 400 tok/s——batched + kernel 优化是正道
+
+**数学**：
+- Lazy at accept 3：4 行 × 6.5ms/行 = 26ms verify + 1ms draft = 27ms → 111 tok/s
+- Batched (weight-stationary)：5 行共享权重 → ~6.5ms verify + 1ms draft = 7.5ms → **400 tok/s** ✓
+
+**根本问题**：lazy 的每行是独立的 EAGER forward（权重重新读），batched 的 5 行共享一次权重读。用户"模仿 EAGER + 5 行几乎免费"的洞察指的是**batched weight-stationary**，不是 lazy（逐行重复读）。
+
+**SH_EXP_MROWS 为什么只省 1.2ms（预期 8.3ms）**：共享专家的 kernel 带宽利用率只有 **0.7%**（377GB/s / 7.6TB/s）——它不是带宽受限，是指令/占用率受限。mrows "读一次权重"帮不了指令瓶颈的 kernel。真正的修复是 kernel 融合（减少 kernel 数）和 tcgen05（换核）。
+
+**400 的真正路径**（verify-family-fusion subagent 在设计）：
+1. **kernel 融合**：每层的 75 个 kernel → 5-10 个大 kernel（段融合）
+2. **tcgen05**：routed experts 从 SIMT 到 tensor core（-6.8ms）
+3. **共享专家的 kernel 优化**：不是 mrows，是更好的 tiling/占用率
+4. **图化**：只提供 launch 消除（已确认 ~1.5ms 收益）
