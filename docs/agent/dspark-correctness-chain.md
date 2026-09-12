@@ -1662,3 +1662,15 @@ let head_rows = draft_head_fold()  // 默认 ON！
 **杠杆**：`DSV41_DRAFT_HEAD_FOLD=0`（draft head 回 v1 per-row）——draft 预测可能更准 → accept 提升。
 
 **待测**：S2 矩阵加一臂（DRAFT_HEAD_FOLD=0）或单独 A/B。
+
+## 🔍🔍 重大发现：draft head v2 fold vs verify head v1 的 program 不匹配（accept 链式失败的直接嫌疑）
+
+**draft-head-v2-analysis 的判词（严重级别）**：
+- **draft head**（dspark_dev.rs:3022，默认 ON）= `head_gemv_bf16_mrows`（**v2 WPR==1 program**——uint4 + 8 元素分组）
+- **verify head**（chain_dev.rs:5736，默认 v1 per-row）= `gemv_bf16`（**v1 scalar program**——1 元素/lane/步）
+- **两个 program 数学同值但舍入不同**（k-walk 步长 256 vs 32、归约树 shfl_down vs shfl_xor）→ ulp 级/logit 差异
+- **argmax 在近 tie 位置翻转** → draft 的 drafts[0] 与 verify 的 argmax 不一致 → **链式失败**
+
+**修复**：`DSV41_DRAFT_HEAD_FOLD=0`（draft head 回 v1 per-row，与 verify 一致）
+
+**预期**：accept 显著提升（消除 draft↔verify 的 program 级不一致——这正是 accept-first-strategy 说的"consistency"原则的又一例证）
