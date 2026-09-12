@@ -4509,6 +4509,15 @@ impl<'a> DevChain<'a> {
             }
         } else {
             self.step_rows_inner(toks, m, pos_base)?;
+            // (lazy verify's bare-chain path was missing this: `advance_compress_lens`
+            // is called after the graph_launch but NOT after the bare chain, so the
+            // host mirror of compress_len drifted from the device counter on every
+            // m=1 bare-chain call — lazy's per-row step_rows(m=1) hits exactly this
+            // path when no m=1 verify graph exists, and each row's committed groups
+            // were invisible to the host mirror, corrupting the NEXT row's indexer
+            // candidates. This is the direct source of lazy's Bristol/burdens/oqua
+            // and the repetition — the KV/compute misalignment the user called out.)
+            self.advance_compress_lens(pos_base, m);
         }
 
         // D2H of the m argmaxes, always OUTSIDE the graph (a device read is illegal
