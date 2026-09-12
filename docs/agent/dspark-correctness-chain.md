@@ -41,3 +41,17 @@
 
 1. **单一 GPU 测试驱动**：同一台远端上**同时只能有一个测试驱动**（主 agent 或一个 subagent，不可两者并发）——2026-09-12 的 build-id mismatch 事故（.so HEAD 7da4bef7 vs 二进制 HEAD cee7cffd）就是两个驱动并发 `git reset + build.sh + cargo build` 交错产出的不同源组合（门禁正确拒绝，但浪费了整轮测试）。**subagent 一律只做代码/分析，GPU 测试由主 agent 串行执行**。
 2. **不轮询远端状态**：后台任务的输出会自动注入；反复跑同一条 `stat/grep` 查询既浪费轮次又违反"持续工作"的要求。启动测试后做本地实事（代码/审计/提交），等通知。
+
+## 决定性验证（9fcecb70，2026-09-12 09:5x）——正确性基本达标
+
+**配置**：quant_rows 行距修复 + tap_r 行距修复 + DSV41_SIDS_WRITEBACK=1 全开 + diff probe。
+
+| 任务 | 修复前（乱码崩） | 修复后 | EAGER 基线 |
+|---|---|---|---|
+| 出师表 | LEN 12"出师nofollow" | **LEN 140 双字 3**（先帝创业…引喻失义opa——与 EAGER 同水平，连尾巴都一样） | LEN 146 双字 3 |
+| 数字任务 | 全崩每数两次 | **LEN 426，干净数 1..63+**（双字 43 待查——后期退化） | LEN 216（anao/跳50） |
+| k_acc | {0:13,1:6,2:3} | **{0:124, 1:84, 2:5, 3:15, 4:2, 5:2}**——k_acc=5（全接受）首次出现 | — |
+| diff probe | 首轮即 mismatch | **18/232**（7.8%） | 0 |
+
+**性能**（同测）：`mean-k=0.833 tok/step=1.833 draft=4.23ms verify=37.31ms commit=0.33ms`。
+**下一步**：① 剩余 18 个 mismatch 的行分布（判断 B1 consumer-clen 还是 B2-B6 融合族）→ verify-moe-ilv-audit 的判定树；② 双字 43 的位置（是否集中在长上下文段）；③ 性能：verify 37.31ms → 图化 A/B + 计算下限账本（verify-calc-audit2 / draft-perf-audit 跑中）。
