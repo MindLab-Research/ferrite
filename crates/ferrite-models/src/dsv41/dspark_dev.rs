@@ -238,18 +238,46 @@ struct DraftP3a {
 ///
 /// Read once and cached (the house rule for hot-path gates): this branch runs
 /// `bs x n_mtp` times per draft step.
-/// SEED POSITION FIX gate (`DSV41_SEED_POS`, DEFAULT OFF): seeds the draft's
-/// ring at `pos` (the audit's official semantics) instead of `pos-1`. The
-/// GPU A/B (079ffbaf) showed this arm DEGRADES text (Latin fragments return)
-/// when applied WITHOUT the win_rows/ensure_idxs co-fix — the window must
-/// include the seed slot and the block rows must not double-cover position
-/// pos. Gated OFF pending that co-fix.
+/// SEED POSITION FIX gate (`DSV41_SEED_POS`, DEFAULT OFF): the P0-1 fix in its
+/// COMPLETE form (draft-numerical-audit + the 079ffbaf GPU A/B). It owns THREE
+/// coupled sites, and never one alone — the seed AT `pos` only reproduces the
+/// official semantics once the window contains the seed's own slot and no OTHER
+/// row claims position `pos`:
+///
+/// 1. [`DsparkDev::draft_attention`] seeds the ring at `pos` — the anchor's own
+///    position — for content (`main_x` is the tap AT `pos`), RoPE and ring slot
+///    alike: the official `freqs_cis[start_pos]` / `window_kv_cache[start_pos %
+///    win]` (model.py:1039-1042, :1065). The historical `pos - 1` phased every
+///    window row one position early relative to its content.
+/// 2. [`DsparkDev::win_rows`] returns the official candidate window
+///    `arange(min(win, start_pos + 1))` (model.py:1025): `min(win, pos + 1)`
+///    rows INCLUDING the seed's slot `pos % win`, and `win` rows — not `win - 1`
+///    — once the ring has turned over. [`DsparkDev::ensure_idxs`] follows it
+///    (`[0, n_win) ++ [n_win, n_win + bs)`, the same order `all_kv` is copied in).
+/// 3. the draft block's KV rows start at `pos + 1` — the official
+///    `start_pos + seqlen` (model.py:1055) — so they do NOT hand position `pos`
+///    a SECOND KV. The seed already owns that position, and the official mask
+///    allows exactly one KV per position.
+///
+/// 079ffbaf ran (1) ALONE and DEGRADED the text (Latin fragments returned, 15
+/// double-chars): the seed moved into slot `pos % win` while the window still
+/// excluded it and the block's row 0 still claimed `pos` — a position with two
+/// candidate KVs and, in the warmup, a missing newest row. Hence the gate: OFF
+/// until the coupled arm is A/B'd as a whole.
+///
+/// MUTUALLY EXCLUSIVE with `DSV41_SEED_ALIGN` (`chain_dev::seed_align`): that
+/// arm shifts the whole calling convention to `draft_forward(next, pos + 1)`,
+/// where `seed_window(pos - 1)` is ALREADY the tap's position and the ring's
+/// slot `pos % win` is the block's own anchor row, so this fix must NOT also
+/// apply (the two together would overshoot by one — the audit's note). Setting
+/// both therefore resolves to the SEED_ALIGN arm, bit for bit.
 fn seed_pos_fix() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("DSV41_SEED_POS")
-            .map(|v| v != "0")
-            .unwrap_or(false)
+        !crate::dsv41::chain_dev::seed_align()
+            && std::env::var("DSV41_SEED_POS")
+                .map(|v| v != "0")
+                .unwrap_or(false)
     })
 }
 
@@ -1537,8 +1565,16 @@ impl<'a> DsparkDev<'a> {
         // `DSV41_SEED_ALIGN` rotates the ring's start slot (`s0`) every step,
         // turning that copy into two variable-length pieces at a host-computed
         // split — which no capture can represent. The aligned arm therefore
-        // keeps the direct launches.
-        if self.win < 1 || pos < self.win || crate::dsv41::chain_dev::seed_align() {
+        // keeps the direct launches, and so does `DSV41_SEED_POS`: its window
+        // ends at the seed's own slot, so `win_rows` returns
+        // `(min(win, pos+1), (pos + 1 - n) % win)` — never a constant `(win, 0)`
+        // — and BOTH the copy's split and `ensure_idxs`'s row set move every
+        // step (the same reason, one arm over).
+        if self.win < 1
+            || pos < self.win
+            || crate::dsv41::chain_dev::seed_align()
+            || seed_pos_fix()
+        {
             return false;
         }
         // The golden per-unit capture probes the device from the HOST inside the
@@ -1724,19 +1760,22 @@ impl<'a> DsparkDev<'a> {
         // "hidden[anchor_pos - 1]" — the audit's read of model.py:1261-1267
         // shows the tap is captured BEFORE the target layer, i.e. at
         // start_pos, not start_pos - 1.
-        // NOTE: if DSV41_SEED_ALIGN changes the calling convention to
-        // draft_forward(next, pos+1), do NOT also apply this fix (the audit
-        // warns the two would overshoot by one).
+        // NOTE: `DSV41_SEED_ALIGN` (chain_dev.rs) changes the calling
+        // convention to `draft_forward(next, pos+1)`, under which `pos - 1` IS
+        // the tap's position — so `seed_pos_fix()` resolves to false on that arm
+        // and the two never compose (see its doc).
         debug_assert!(pos > 0, "draft_forward: the anchor is never at pos 0");
-        // P0-1 REVERT (GPU-verified 079ffbaf): the seed at `pos` (the audit's
-        // official semantics) DEGRADED the text — Latin fragments returned
-        // (ellantdot/estrganoasc/henyasc, 15 double-chars) because the fix
-        // changed the ring layout WITHOUT the win_rows/ensure_idxs co-fix
-        // (the window must be [pos-win+1, pos] INCLUDING the seed slot, and
-        // the block's own rows must not double-cover position pos). The seed
-        // at pos-1 with the default window is the last VERIFIED-CORRECT
-        // combination (zero Latin, BF16_TRUNCATE). Gate the experimental
-        // arm for the follow-up investigation (win_rows co-fix).
+        // P0-1 CO-FIX ARMED (`DSV41_SEED_POS`): the seed at `pos` is only the
+        // official semantics TOGETHER with its two companions — `win_rows` now
+        // returns the window `[pos - n + 1, pos]` INCLUDING this seed's slot
+        // (`pos % win`, `min(win, pos+1)` rows), and the block's KV rows now
+        // start at `pos + 1`, so position `pos` is claimed exactly once (by this
+        // seed). 079ffbaf ran the seed move ALONE and the text degraded (Latin
+        // fragments, 15 double-chars): the seed had moved into slot `pos % win`
+        // while the window still excluded it (warmup) and the block still
+        // claimed `pos`. `seed_pos_fix()` gates ALL THREE sites as one arm; with
+        // it OFF nothing here changes (the last VERIFIED-CORRECT combination is
+        // the seed at `pos - 1` with the default window).
         let seed_pos = if seed_pos_fix() { pos } else { pos - 1 };
         self.seed_window(s, seed_pos, slot_dev)?;
 
@@ -1808,13 +1847,24 @@ impl<'a> DsparkDev<'a> {
         )?;
         // The draft rows sit at pos + 1 + r, one row per step — the SAME
         // per-row positions as the queries (the sglang arbitration; the host
-        // comment's `seqlen` is the sequence length, not the block size).
+        // comment's `seqlen` is the sequence length, not the block size). The
+        // historical `pos + bs + r` misread `seqlen` as the block size.
+        //
+        // P0-1 CO-FIX (`DSV41_SEED_POS`, with `win_rows`): the official block's
+        // rows start at `start_pos + seqlen` (model.py:1055
+        // `freqs_cis[start_pos + seqlen : ...]`), i.e. one PAST the anchor — and
+        // under the co-fix the anchor's own position `pos` belongs to the SEED
+        // row (the window's newest, `seed_window(s, pos)`), so a block row at
+        // `pos` would hand position `pos` a SECOND KV, which the official mask
+        // forbids (exactly one KV per position). Off the gate the historical
+        // `pos + r` base is untouched, bit for bit.
+        let kv_pos = if seed_pos_fix() { pos + 1 } else { pos };
         self.rope_at(
             self.kv.ptr as *mut f32,
             bs as i32,
             hd as i32,
             1,
-            pos as i32,
+            kv_pos as i32,
             false,
         )?;
 
@@ -1829,13 +1879,16 @@ impl<'a> DsparkDev<'a> {
         // `win - n_win` rows off once pos < win-1, which is exactly the
         // "draft outputs unrelated garbage" signature.
         //
-        // `win_rows` also fixes the RING WRAP (`DSV41_SEED_ALIGN`): once the
-        // ring has turned over, the window has to be copied in POSITION order
-        // (`(pos - n_win + j) % win`), because the slot `pos % win` belongs to
-        // the block's anchor row and must not appear as a window candidate —
-        // the official mask allows exactly one KV per position, and the
+        // `win_rows` also fixes the RING WRAP (`DSV41_SEED_ALIGN`, and the
+        // position-ordered `DSV41_SEED_POS` window): once the ring has turned
+        // over, the window has to be copied in POSITION order
+        // (`(pos - n_win + 1 + j) % win`), because the slot `pos % win` no
+        // longer starts the set — under SEED_ALIGN it belongs to the block's
+        // anchor row (and must not ALSO appear as a window candidate: the
+        // official mask allows exactly one KV per position, and the
         // slot-index-order copy handed the anchor a SECOND one while evicting
-        // the oldest live row.
+        // the oldest live row), while under SEED_POS it is the window's NEWEST
+        // row (the seed) and the oldest live slot is `(pos + 1 - n_win) % win`.
         let (n_win, s0) = self.win_rows(pos);
         let wbytes = (n_win * hd * 4) as usize;
         if s0 == 0 {
@@ -1864,15 +1917,23 @@ impl<'a> DsparkDev<'a> {
             self.kv.ptr,
             (bs * hd * 4) as usize,
         )?;
-        // The anchor-KV seat: the window EXCLUDES the block's own row-0 slot
-        // (n_win = min(win - 1, pos) — the ring's copy of that position either
-        // does not exist yet or stays written for the NEXT round), so the
-        // anchor (t0) at pos has exactly ONE kv in the candidates: the block's
-        // row 0, its EMBED-derived projection — exactly the official block
-        // structure (DeepSpec's draft blocks project their own inputs; the seat
-        // arbitration in the earlier fix went one step further and swapped row
-        // 0's bytes for the target-hidden projection mk, which is NOT what the
-        // official blocks do — reverted).
+        // The anchor-KV seat — who owns position `pos`, and why it is never
+        // covered twice (the official mask allows exactly ONE KV per position):
+        //
+        // * default / SEED_ALIGN arms: the window sits one BEHIND the anchor
+        //   (`n_win = min(win, pos)`, or `min(win - 1, pos)` on SEED_ALIGN), so
+        //   the anchor's position `pos` has exactly ONE candidate KV: this
+        //   block's row 0, its EMBED-derived projection (`t0`) — the official
+        //   block structure (DeepSpec's draft blocks project their own inputs;
+        //   the seat arbitration in the earlier fix went one step further and
+        //   swapped row 0's bytes for the target-hidden projection `mk`, which
+        //   is NOT what the official blocks do — reverted).
+        // * SEED_POS arm: the anchor's position `pos` belongs to the RING's seed
+        //   row instead (`seed_window(s, pos)`, the target-hidden projection
+        //   `mk` at its true RoPE phase), the window `[pos - n_win + 1, pos]`
+        //   includes it, and the block's rows start at `pos + 1` (`kv_pos` above)
+        //   — so `pos` is STILL covered exactly once, and no block row repeats a
+        //   window position.
 
         self.dev.sparse_attn(
             self.q.as_f32(),
@@ -3362,13 +3423,18 @@ impl<'a> DsparkDev<'a> {
 
     /// The draft block's window geometry for a block whose row 0 sits at `pos`:
     /// how many ring rows are LIVE, and the ring slot the OLDEST of them lives
-    /// in. The rows are the positions `[pos - n, pos - 1]`, slot `q % win`.
+    /// in. Slot `q % win` holds position `q`, so the rows are the positions
+    /// `[pos - n + 1, pos]` on the `DSV41_SEED_POS` arm and `[pos - n, pos - 1]`
+    /// on every other arm.
     ///
-    /// Off (`DSV41_SEED_ALIGN` unset) this is the historical `min(win, pos)` rows
-    /// from slot 0, which is the same set as long as the ring has not turned
-    /// over — see the wrap discussion below.
+    /// Off both gates (`DSV41_SEED_ALIGN` unset) this is the historical
+    /// `min(win, pos)` rows from slot 0 — the positions `[pos - n, pos - 1]`, the
+    /// set the seed at `pos - 1` writes into. It is the same set as the
+    /// position-ordered copy as long as the ring has not turned over — see the
+    /// wrap discussion below.
     ///
-    /// # Why the count is `min(win - 1, pos)` and never `win`
+    /// # Why the count is `min(win - 1, pos)` on the SEED_ALIGN arm and never
+    /// `win`
     ///
     /// The ring has `win` slots and the block's own row 0 owns the slot
     /// `pos % win`. Once `pos >= win` every slot is live, so a window that
@@ -3380,11 +3446,31 @@ impl<'a> DsparkDev<'a> {
     /// slot is `(pos % win) + 1`) in exchange for the stale `pos - win` row in
     /// the anchor's slot. Copying in POSITION order (the `s0` return) is what
     /// makes the set exact; the count alone is not enough.
+    ///
+    /// # The SEED_POS arm (the P0-1 co-fix)
+    ///
+    /// The official candidate window is `arange(min(win, start_pos + 1))`
+    /// (model.py:1025) — `min(win, start_pos + 1)` SLOTS whose NEWEST is the
+    /// seed's own slot `start_pos % win` (model.py:1065), i.e. `min(win, pos + 1)`
+    /// rows here, and `win` (NOT `win - 1`) once the ring has turned over. The
+    /// off-by-one on this count is half of why 079ffbaf degraded: the seed moved
+    /// into slot `pos % win` while `min(win, pos)` rows still excluded it
+    /// whenever `pos < win`. The rows are copied in POSITION order from the
+    /// oldest slot `(pos + 1 - n) % win` (0 while `pos + 1 < win`), so `all_kv`
+    /// holds the window in ascending position order and `ensure_idxs`'s
+    /// `[0, n_win)` enumerates exactly those positions — the block's rows (which
+    /// start at `pos + 1`) hold the rest, and no position is covered twice.
     fn win_rows(&self, pos: usize) -> (usize, usize) {
         let win = self.win;
         if crate::dsv41::chain_dev::seed_align() {
             let n = pos.min(win.max(1) - 1);
             (n, (pos - n) % win.max(1))
+        } else if seed_pos_fix() {
+            // P0-1 co-fix: the official `arange(min(win, start_pos + 1))` set.
+            // The seed's slot `pos % win` IS a candidate here, so the oldest
+            // live slot is `(pos + 1 - n) % win`.
+            let n = (pos + 1).min(win.max(1));
+            (n, (pos + 1 - n) % win.max(1))
         } else {
             (win.min(pos), 0)
         }
@@ -3392,16 +3478,25 @@ impl<'a> DsparkDev<'a> {
 
     /// Rebuild `idxs` when the valid window length changes.
     ///
-    /// `dspark_topk_idxs` (dspark.rs) is `[0, n_win) ++ [win, win + bs)` repeated
-    /// over the batch and over every draft query; with `bs == 1` batch that is
-    /// `bs` identical rows, so the whole matrix is built on the host and cached
-    /// until `n_win` moves (it settles at `win` after the first `win` positions,
-    /// so the steady-state decode path is H2D-free).
+    /// `dspark_topk_idxs` (dspark.rs, model.py:1020-1029) is
+    /// `[arange(min(win, start_pos + 1))] ++ [win + arange(bs)]` in the
+    /// official's FULL-width layout — i.e. the live window rows followed by the
+    /// draft block's own rows, repeated over the batch and over every draft
+    /// query. ferrite's `all_kv` is COMPACT (only `n_win` window rows are
+    /// copied, see `draft_attention`), so the block segment's base moves with
+    /// the window: `[0, n_win) ++ [n_win, n_win + bs)`. The segment BASE is the
+    /// only difference — the candidate SET (which positions a draft query may
+    /// attend to) is the official's, provided `n_win` comes from `win_rows`.
+    /// With `bs == 1` batch that is `bs` identical rows, so the whole matrix is
+    /// built on the host and cached until `n_win` moves (it settles at `win`
+    /// once `pos >= win - 1`, so the steady-state decode path is H2D-free).
     fn ensure_idxs(&mut self, pos: usize) -> Result<()> {
         let bs = self.bs;
         // The SAME window geometry `draft_attention` copies with (see
         // `win_rows`): the candidate rows are [0, n_win) plus the block at
-        // [n_win, n_win + bs), in exactly the order `all_kv` holds them.
+        // [n_win, n_win + bs), in exactly the order `all_kv` holds them. Under
+        // `DSV41_SEED_POS` `n_win = min(win, pos + 1)` counts the seed's own
+        // slot (`pos % win`) in, matching `arange(min(win, start_pos + 1))`.
         let (n_win, _s0) = self.win_rows(pos);
         if self.n_win_cached == n_win {
             return Ok(());
