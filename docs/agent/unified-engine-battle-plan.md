@@ -142,3 +142,25 @@ P0 清单执行（见 prefill-research §D）：多行链（与 Wave 2 共享）
 | M2 | spec_step 端到端（贪心 accept + 回退）+ 图捕获 | 四段文本逐字 + accept 打印 |
 | M3 | 性能：accept 实测 → 步时分解 → 调优 | ≥400 tok/s |
 
+### 5.4 spec 编排设计（2026-09-12 定案）
+
+**`dspark_spec_step`（DevChain 方法，chain_dev.rs）**：
+```
+输入：t0（上一步 argmax 输出，pos_ctr = pos_base）
+1. draft：DsparkDev::draft_forward(t0, pos_base) → draft_ids[5]（device，Markov 循环）
+2. verify：step_rows([t0, d1..d5]) → argmax_r[6]（verify 的 argmax 循环传 null pos_ctr 不递增）
+3. D2H：24B（argmax_r + draft_ids）
+4. accept（host）：k = 1 + 最长前缀（d_i == argmax[i-1]，i=1..5）；输出 tokens = argmax[0..k-1]（k 个新 token）
+5. commit（device）：
+   - k == 6：全部接受（快路径，仅 pos_ctr += 6——下一步 argmax 自然递增）
+   - k < 6：恢复状态——compressor state（state_kv/state_score 快照 D2D 恢复）+ clen 回退 + ring 窗口无需回退（覆盖写）+ pos_ctr 设 pos_base+k（H2D 4B）+ 重放前 k 行 compressor（用 x_r 前 k 行，从快照状态续算 clen/index_k 一致性）
+6. 返回 k 个 token；下一步 t0 = argmax[k-1]
+```
+
+**状态快照**（verify 前，每 kv-source 层）：state_kv/state_score D2D 拷到快照缓冲（~10MB 总量）+ clen host 侧记录。第一版用逐层 memcpy（~40 次 launch），M2 融合为单 kernel。
+
+**GPU 验证进度（2026-09-12）**：
+- dsv41_dspark_markov_head：5/5 case 过（含 full 129280×256，与 CPU 参考逐位一致）
+- dsv41_verify_ring_win：7/7 case 过（因果窗口索引 + 块 append，含窗口边界）
+- 主 .so 远端编译通过（build_id fe3243ca）
+

@@ -75,6 +75,12 @@ struct LayerCache {
     index_k: DevBuf,
 }
 
+/// The DSpark verify block's row count: `step_rows` accepts up to this many
+/// tokens and every `_r` buffer below is sized for it. The production block is
+/// `dspark_block_size` (6); the buffers are sized once here so a smaller `m`
+/// (a short block at the end of a request) simply uses a prefix of them.
+pub const VERIFY_ROWS: usize = 6;
+
 struct Scratch {
     h: DevBuf,     // [hc*dim]
     h2: DevBuf,    // [hc*dim] (hc_post lands here, then copies back)
@@ -247,6 +253,86 @@ struct Scratch {
     /// larger `n` is not routed to swapAB (the guard in `gemm_fp8_mx_or_swap`),
     /// so the scratch can never be overrun by a config the allocation missed.
     swapab_n: usize,
+    // ==================== DSpark verify: the m-row buffers ====================
+    //
+    // `step_rows` runs a whole verify block (`m <= VERIFY_ROWS` rows) through the
+    // same layer stack `step_body` runs one row of, so every per-row buffer above
+    // needs an m-row twin here. They are deliberately SEPARATE from the single-row
+    // ones: `step_rows` must not perturb the state a decode step leaves behind
+    // (the whole point is that both paths keep working), and several of the
+    // single-row buffers (`s.q`, `s.o`, `s.kv`, `s.logits`, ...) are far too small
+    // for m rows anyway.
+    //
+    // Layout convention: row-major with the row stride taken from the GEOMETRIC
+    // width each buffer was sized for (e.g. `nh*hd` for q/o, `dim` for x/xn).
+    // Only the places that hand a WHOLE multi-row region to one launch (the AR
+    // payloads, the hc kernels, `embed_expand_dev`, the head/gate loops written
+    // per row) rely on contiguity, and each such call site says so.
+    h_r: DevBuf,       // [m, hc*dim] residual stream (embed + hc expansion)
+    h2_r: DevBuf,      // [m, hc*dim] hc_post staging (hc_post is not in-place for rows > 1)
+    x_r: DevBuf,       // [m, dim] collapse output
+    xn_r: DevBuf,      // [m, dim] normalised block input
+    q_r: DevBuf,       // [m, nh*hd] wq_b output, row base at `r*nh*hd`
+    kv_r: DevBuf,      // [m, hd] window KV
+    qr_r: DevBuf,      // [m, q_lora] wq_a output / its normalisation
+    o_r: DevBuf,       // [m, nh*hd] sparse attention output (after the inverse o-rope)
+    wo_r: DevBuf,      // [m, n_groups*o_lora] wo_a output
+    wo_out_r: DevBuf,  // [m, dim] attention block output (wo_b + the wo AR)
+    moe_out_r: DevBuf, // [m, dim] MoE block output (routed + shared expert)
+    ids_r: DevBuf,     // [m] i32 token ids
+    argmax_r: DevBuf,  // [m] i32 per-row argmax (the head's output)
+    logits_r: DevBuf,  // [m, vocab]
+    /// [m, hc] the CONSTANT incoming premix, `[1,0,0,0]` per row (uploaded once per
+    /// `step_rows`, the m-row twin of `premix_const`).
+    premix_r: DevBuf,
+    /// [m, hc] slot 1: this layer's attn_pre — the FFN collapse's premix, and after
+    /// the last layer the final collapse's premix (the single-row `pre_b`).
+    pre_r: DevBuf,
+    /// [m, hc] slot 2: this layer's ffn_pre — the NEXT layer's incoming premix (the
+    /// single-row `pre_c`).
+    pre2_r: DevBuf,
+    post_r: DevBuf,    // [m, hc] hc_post gate
+    comb_r: DevBuf,    // [m, hc*hc] hc_post mix
+    /// [m] i32 the row positions `pos_base + r`. The verify forward never advances
+    /// the device counter, so every kernel that takes a position POINTER (the
+    /// engram hash, `ring_append`, `window_idxs`) is pointed at this table instead
+    /// of at `pos_ctr`.
+    pos_rows: DevBuf,
+    /// [m, window + index_topk] i32 the per-layer selection `sparse_attn` reads,
+    /// row stride `window + index_topk` (the indexer's picks follow each row's
+    /// window block at `+window`).
+    idxs_r: DevBuf,
+    /// [m, window] i32 the RAW `verify_ring_win` output. The kernel writes its
+    /// index half with a row stride of `window` (it only ever wrote one row
+    /// before), so it cannot fill `idxs_r`'s wider rows directly; each row's
+    /// window block is copied from here into `idxs_r` (see `attention_rows`).
+    idxs_win_r: DevBuf,
+    idx_q_r: DevBuf,   // [m, index_n_heads*index_head_dim]
+    idx_w_r: DevBuf,   // [m, index_n_heads]
+    // ---- compressor, m rows ----
+    kvp_r: DevBuf,     // [m, hd] the compressor's kv projection
+    scp_r: DevBuf,     // [m, hd] the compressor's gate/score projection
+    // ---- MoE, m rows ----
+    scores_r: DevBuf,   // [m, n_experts] the bf16 gate's output
+    route_idx_r: DevBuf, // [m, topk] i32
+    route_w_r: DevBuf,   // [m, topk] f32
+    xq4_r: DevBuf,       // [m, dim] fp4 nibbles (dim/2 bytes per row)
+    xsc4_r: DevBuf,      // [m, dim/32 + 8] f32 scales
+    /// [m, topk, 2*inter] routed gate|up output. The batched expert launchers
+    /// process ONE activation row per call (their `rows` argument is validated but
+    /// never enters the grid — see `moe_rows`), so this is a per-row slot block:
+    /// row `r`'s slot `t` starts at `r*(topk*act_slot) + t*act_slot`.
+    ex_act_r: DevBuf,
+    /// [m, topk, dim] the DOWN_FUSE=0 fallback's per-slot scratch.
+    ex_down_r: DevBuf,
+    /// [m, 2*inter] the shared expert's gate|up row (one row at a time).
+    sh_act_r: DevBuf,
+    // ---- engram, m rows ----
+    eng_ids_r: DevBuf,  // [m, n_engram_layers * n_cols] i64
+    eng_rows_r: DevBuf, // [m, n_cols * engram_head_dim] f32
+    eng_kv_r: DevBuf,   // [m, (hc+1)*dim] f32
+    eng_xq_r: DevBuf,   // [m, n_cols*ehd] fp8 bytes
+    eng_xsc_r: DevBuf,  // [m, n_cols*ehd/32 + 8] f32
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -1048,6 +1134,52 @@ impl<'a> DevChain<'a> {
             swapab_n,
             swapab_part: dev.alloc(fb(8 * swapab_n))?,
             swapab_ctr: dev.alloc(4 * (swapab_n / 16 + 1))?,
+            // ---- DSpark verify (`step_rows`): the m-row twins. Allocated
+            // unconditionally — the whole set is a few MB (the only large member is
+            // `logits_r`, one per-row head row) and a static allocation graph is
+            // worth more than the bytes.
+            h_r: dev.alloc(fb(VERIFY_ROWS * hc * dim))?,
+            h2_r: dev.alloc(fb(VERIFY_ROWS * hc * dim))?,
+            x_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
+            xn_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
+            q_r: dev.alloc(fb(VERIFY_ROWS * nh * hd))?,
+            kv_r: dev.alloc(fb(VERIFY_ROWS * hd))?,
+            qr_r: dev.alloc(fb(VERIFY_ROWS * ql))?,
+            o_r: dev.alloc(fb(VERIFY_ROWS * nh * hd))?,
+            wo_r: dev.alloc(fb(VERIFY_ROWS * cfg.n_groups_o_lora()))?,
+            wo_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
+            moe_out_r: dev.alloc(fb(VERIFY_ROWS * dim))?,
+            ids_r: dev.alloc(VERIFY_ROWS * 4)?,
+            argmax_r: dev.alloc(VERIFY_ROWS * 4)?,
+            logits_r: dev.alloc(fb(VERIFY_ROWS * cfg.vocab_size))?,
+            premix_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
+            pre_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
+            pre2_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
+            post_r: dev.alloc(fb(VERIFY_ROWS * hc).max(8))?,
+            comb_r: dev.alloc(fb(VERIFY_ROWS * hc * hc).max(8))?,
+            pos_rows: dev.alloc(VERIFY_ROWS * 4)?,
+            idxs_r: dev.alloc(4 * VERIFY_ROWS * (cfg.window_size + cfg.index_topk + 8).max(4))?,
+            idxs_win_r: dev.alloc(4 * VERIFY_ROWS * cfg.window_size.max(4))?,
+            idx_q_r: dev
+                .alloc(fb(VERIFY_ROWS * cfg.index_n_heads.max(1) * cfg.index_head_dim.max(1)))?,
+            idx_w_r: dev.alloc(fb(VERIFY_ROWS * cfg.index_n_heads.max(1)))?,
+            kvp_r: dev.alloc(fb(VERIFY_ROWS * hd))?,
+            scp_r: dev.alloc(fb(VERIFY_ROWS * hd))?,
+            scores_r: dev.alloc(fb(VERIFY_ROWS * n_exp))?,
+            route_idx_r: dev.alloc(4 * VERIFY_ROWS * topk)?,
+            route_w_r: dev.alloc(fb(VERIFY_ROWS * topk))?,
+            xq4_r: dev.alloc((VERIFY_ROWS * dim / 2).max(8))?,
+            xsc4_r: dev.alloc(fb(VERIFY_ROWS * dim / 32 + 8))?,
+            // `2 * inter` per slot: `inter` (the full, unsharded width) is >= every
+            // rank's padded local slice, so one allocation covers tp=1 and tp=N.
+            ex_act_r: dev.alloc(fb(VERIFY_ROWS * topk * 2 * inter.max(dim)))?,
+            ex_down_r: dev.alloc(fb(VERIFY_ROWS * topk * dim))?,
+            sh_act_r: dev.alloc(fb(VERIFY_ROWS * 2 * inter.max(dim)))?,
+            eng_ids_r: dev.alloc(fb(eng_cols * n_eng_layers * VERIFY_ROWS).max(8) * 2)?, // i64
+            eng_rows_r: dev.alloc(fb(VERIFY_ROWS * eng_cols * ehd).max(8))?,
+            eng_kv_r: dev.alloc(fb(VERIFY_ROWS * (hc + 1) * dim))?,
+            eng_xq_r: dev.alloc((VERIFY_ROWS * eng_cols * ehd).max(8))?, // fp8 bytes
+            eng_xsc_r: dev.alloc(fb((VERIFY_ROWS * eng_cols * ehd).max(8) / 32 + 8))?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does
@@ -2189,6 +2321,1336 @@ impl<'a> DevChain<'a> {
                 cfg.vocab_size as i32,
                 self.s.pos_ctr.ptr as *mut std::ffi::c_int,
             )?;
+        }
+        Ok(())
+    }
+
+    // ========================================================================
+    // DSpark verify: the m-row forward (`step_rows` and its per-block helpers)
+    // ========================================================================
+    //
+    // # What this is
+    //
+    // `step_body` runs ONE token. The speculative-decoding target verify needs m
+    // rows of the SAME stack in one pass: the block `[t0, d1..dm-1]`, where `t0` is
+    // the anchor the previous step committed and `d*` are the draft model's
+    // proposals, all placed at consecutive positions `pos_base + r`. The output is
+    // one argmax per row; the host then accepts the longest matching prefix.
+    //
+    // # The numerical-domain rule (why this is written the way it is)
+    //
+    // Greedy speculative decoding is only correct if, for EVERY row, the verify
+    // argmax is the token a per-token decode at that position would have produced.
+    // So this path deliberately reuses the single-row kernels instead of
+    // generalising the fused ones:
+    //
+    //   * row-INDEPENDENT ops that already have a real `rows` dimension are called
+    //     ONCE with `rows = m` (`rmsnorm`, `hc_mixes`/`hc_collapse`/`hc_post`,
+    //     `embed_expand_dev`, `route_topk`, `quant_fp8`/`quant_fp4`,
+    //     `engram_apply`, `swiglu_limit`, the grouped `gemm_fp8_mx`, the AR);
+    //   * per-row (M=1) ops are called ONCE PER ROW with the row's own pointers and
+    //     position (`lin`/`lin_f32`/`lin_bf16`, `gemv_bf16`, `sparse_attn`,
+    //     `indexer_topk`, `apply_rope`, the routed-expert kernels);
+    //   * the single-row FUSIONS (`lin2`, `lin_rope*`, `sparse_attn_orope`,
+    //     FUSE_B1/B2/C, DUEL_CHAIN, COMPRESS_SIDE, MOE_DUAL, HCPOST_EPI, ADD_EPI,
+    //     the wo pair, the sliced head) are NOT taken: each is documented as
+    //     bit-identical to the pair it replaces, so the naive pair IS the parity
+    //     target rather than a different program.
+    //
+    // # The position counter
+    //
+    // `pos_ctr` is READ-ONLY here. The single-row step advances it from the
+    // argmax kernel (the step's last kernel); a verify pass must not, because the
+    // accept logic owns that decision and every kernel in the pass has to see the
+    // same `pos_base`. Row r's position therefore lives in `pos_rows[r]`, and the
+    // kernels that take a position POINTER (`engram_hash_step`, `ring_append`,
+    // `window_idxs`) are pointed at that table; the head's argmax is called with a
+    // NULL `pos_ctr` so it cannot advance either.
+    //
+    // # TODO (known modelling gaps — reported, not hidden)
+    //
+    // 1. COMPRESSOR: `compressor_fused` rejects `seqlen != 1` outright
+    //    (dsv41_kernels.cu) and the state/pool kernels' decode branches carry ONE
+    //    row, so `compress_rows` runs the pool+commit pair with `seqlen = m` and
+    //    only the group the single-row arithmetic knows about is formed. A block
+    //    that completes several groups (ratio 2, m = 6: up to 3) is not modelled
+    //    yet.
+    // 2. INDEXER: the candidate count is the live device counter, which includes
+    //    the group this block may have just committed — whose index key is
+    //    published AFTER the selection (the single-row path has the same order, it
+    //    just has one row). Newly created groups are not excluded from the
+    //    candidate set yet.
+    // 3. HEAD: the full vocabulary is used on every rank (no `HEAD_SLICE`):
+    //    `argmax_sliced` advances `pos_ctr` and consumes one v5 epoch round per
+    //    call, which a 6-row block cannot afford. The head is replicated, so the
+    //    unsliced argmax selects the same token; a multi-row sliced argmax is the
+    //    TODO.
+    // 4. The tcgen05 MXFP4 gate/up arm (`DSV41_EXPERT_TCGEN05_MXF4`, default OFF)
+    //    is not wired into `moe_rows`: the rows path pins the proven GEMV arm.
+
+    /// DSpark verify forward: run an m-row block through the layer stack in ONE
+    /// pass and return each row's argmax.
+    ///
+    /// `toks[0]` is the anchor token, `toks[1..]` the draft proposals; row `r`
+    /// sits at position `pos_base + r` where `pos_base` is the device position
+    /// counter's current value (read once, never written). The returned `Vec<u32>`
+    /// has one entry per row: `out[r]` is the token row `r` predicts, i.e. what
+    /// the draft's `toks[r+1]` is matched against.
+    ///
+    /// The window ring is appended with the whole block (each row's window is
+    /// causal: row r sees `[pos_base+r-window+1, pos_base+r]`, which includes the
+    /// block's own rows 0..r through the ring geometry), and the KV the rest of
+    /// the run will read is exactly what this pass wrote — so a verify pass leaves
+    /// the caches consistent with the accepted prefix for whatever the caller
+    /// decides to keep.
+    ///
+    /// See the section comment above for the numerical-domain rule, the position
+    /// discipline and the known modelling gaps.
+    pub fn step_rows(&mut self, toks: &[u32]) -> Result<Vec<u32>> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        let m = toks.len();
+        if m == 0 {
+            return Ok(Vec::new());
+        }
+        if m > VERIFY_ROWS {
+            return Err(FerriteError::Config(format!(
+                "step_rows: {m} rows exceed the allocated verify block ({VERIFY_ROWS})"
+            )));
+        }
+        // The row positions. One D2H: the counter is device-resident (the argmax
+        // advances it), and EVERY row's position has to be materialised somewhere
+        // because the kernels that take a position take a POINTER. This runs
+        // between steps, so the read cannot stall anything that matters; the value
+        // itself never crosses back to the device afterwards (pos_rows is an H2D of
+        // m ints and is then read on-device).
+        let pos_base = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as i32;
+        let pos_rows: Vec<i32> = (0..m).map(|r| pos_base + r as i32).collect();
+
+        let ids: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
+        self.ul_i32(self.s.ids_r.ptr, &ids)?;
+        self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
+        // every row's incoming premix is the one-hot [1,0,0,0] (the m-row twin of
+        // the `premix_const` copy `step_body` does before its loop)
+        let mut pm = vec![0f32; m * hc];
+        for r in 0..m {
+            pm[r * hc] = 1.0;
+        }
+        self.ul_f32(self.s.premix_r.ptr, &pm)?;
+
+        // embedding + hyper-connection expansion, all m rows in one launch
+        self.dev.embed_expand_dev(
+            self.w.embed.as_ref().unwrap().ptr(),
+            self.s.ids_r.as_i32(),
+            self.s.h_r.ptr as *mut f32,
+            m as i32,
+            dim as i32,
+            hc as i32,
+            cfg.vocab_size as i32,
+        )?;
+
+        // engram hashes for the block. `engram_hash_step` is a SINGLE-token kernel
+        // (it reads `*pos_ctr` and one token id), so it is called once per row with
+        // the row's own position; each row's hashes land at
+        // `eng_ids_r[r*n_eng*n_cols]`, the same per-token layout `step_body` fills.
+        let mut eng_layer_of: Vec<(usize, usize)> = Vec::new();
+        if let (Some(ng), Some(lay), Some(map)) =
+            (self.ngram.as_mut(), self.eng_layout.as_ref(), self.eng_map.as_ref())
+        {
+            let n_cols = lay.n_hash_cols();
+            let n_eng = lay.layers.len();
+            if eng_host() {
+                // A/B fallback (DSV41_ENG_HOST=1): the host hash + an upload. The
+                // state's token cache spans prefill + decode, so the rows are hashed
+                // in ascending position order.
+                let mut bytes: Vec<u8> = Vec::with_capacity(m * n_eng * n_cols * 8);
+                for r in 0..m {
+                    let hs = ng.forward_row(
+                        lay,
+                        map,
+                        0,
+                        &[toks[r]],
+                        (pos_base + r as i32) as usize,
+                        None,
+                    );
+                    for v in hs.iter().take(n_eng * n_cols) {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                self.dev.upload_bytes_at(&self.s.eng_ids_r, &bytes)?;
+            } else {
+                if self.eng_dev.is_none() {
+                    let e = build_eng_dev(&self.dev, lay, map, ng.max_seq)?;
+                    self.eng_dev = Some(e);
+                }
+                let e = self.eng_dev.as_ref().unwrap();
+                for r in 0..m {
+                    self.dev.engram_hash_step(
+                        e.map.ptr as *const i64,
+                        e.cache.ptr as *mut i64,
+                        e.mults.ptr as *const i64,
+                        e.lms.ptr as *const u64,
+                        e.offs.ptr as *const u64,
+                        (self.s.eng_ids_r.ptr as *mut i64).wrapping_add(r * n_eng * n_cols),
+                        (self.s.ids_r.as_i32()).wrapping_add(r),
+                        (self.s.pos_rows.ptr as *const i32).wrapping_add(r),
+                        map.map.len() as i64,
+                        n_eng as i32,
+                        lay.max_ngram_size as i32,
+                        lay.n_heads as i32,
+                        ng.pad_id,
+                    )?;
+                }
+            }
+            for l in 0..cfg.n_layers {
+                if let Some(li) = lay.engram_index(l) {
+                    eng_layer_of.push((l, li));
+                }
+            }
+        }
+
+        // ---- the layer stack ----
+        // `pa` follows `layer()`'s convention (see `premix_row_slot`): 0 = the
+        // constant incoming block, 2 = the previous layer's ffn_pre. Every layer
+        // reports 2, so only the first layer's call starts at 0.
+        let mut pa = 0usize;
+        for layer in 0..cfg.n_layers {
+            if let Some(&(_, li)) = eng_layer_of.iter().find(|(l, _)| *l == layer) {
+                self.engram_apply_rows(layer, li, m)?;
+            }
+            pa = self.layer_rows(layer, m, pos_base, pa)?;
+        }
+        debug_assert_eq!(pa, 2, "layer_rows must report the ffn_pre slot");
+
+        // final collapse + norm with the LAST layer's attn_pre (slot 1), exactly as
+        // `step_body` does after its loop
+        self.dev.hc_collapse(
+            self.s.h_r.ptr as *const f32,
+            self.s.pre_r.as_f32(),
+            self.s.x_r.ptr as *mut f32,
+            m as i32,
+            hc as i32,
+            dim as i32,
+        )?;
+        self.dev.rmsnorm(
+            self.s.x_r.ptr as *const f32,
+            self.w.norm.as_ref().unwrap().as_f32(),
+            self.s.xn_r.ptr as *mut f32,
+            m as i32,
+            dim as i32,
+            cfg.norm_eps,
+        )?;
+
+        // ---- head + per-row argmax ----
+        // Same call `step_body` makes for its single token (f32 activation, bf16
+        // weight read in-kernel), once per row into that row's logits slot.
+        let head = self.w.head.as_ref().unwrap();
+        for r in 0..m {
+            let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+            let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * cfg.vocab_size);
+            if head.dtype == "BF16" {
+                self.dev
+                    .gemv_bf16(head.ptr(), xnr, lg, cfg.vocab_size as i32, dim as i32)?;
+            } else {
+                self.lin_f32(xnr, dim as i32, head, cfg.vocab_size as i32, lg)?;
+            }
+            // NULL pos_ctr: this argmax must NOT advance the counter (the kernel
+            // null-checks it) — the accept logic advances it once, for the accepted
+            // prefix.
+            self.dev.argmax(
+                lg as *const f32,
+                (self.s.argmax_r.ptr as *mut std::os::raw::c_int).wrapping_add(r),
+                cfg.vocab_size as i32,
+                std::ptr::null_mut(),
+            )?;
+        }
+        // D2H of the m argmaxes. `download_u8` keeps this a plain byte copy, so no
+        // f32 reinterpretation is involved.
+        let mut bytes = vec![0u8; m * 4];
+        let b = Device::view(self.s.argmax_r.ptr, m * 4);
+        self.dev.download_u8(&b, &mut bytes)?;
+        Ok((0..m)
+            .map(|r| {
+                u32::from_le_bytes([
+                    bytes[4 * r],
+                    bytes[4 * r + 1],
+                    bytes[4 * r + 2],
+                    bytes[4 * r + 3],
+                ])
+            })
+            .collect())
+    }
+
+    /// The m-row premix slots, mirroring [`Self::premix_slot`]'s convention: 0 is
+    /// the incoming block (the constant `[1,0,0,0]` for a verify pass), 1 is this
+    /// layer's attn_pre (written by the attention mixes, read by the FFN collapse)
+    /// and 2 receives this layer's ffn_pre, i.e. the next layer's incoming premix.
+    fn premix_row_slot(&self, i: usize) -> &DevBuf {
+        match i % 3 {
+            0 => &self.s.premix_r,
+            2 => &self.s.pre2_r,
+            _ => &self.s.pre_r,
+        }
+    }
+
+    /// One multi-row block: the m-row twin of [`Self::layer`].
+    ///
+    /// The premix threading is `layer()`'s, one step up in width: `pa` indexes the
+    /// m-row premix the attention collapse reads, the attention mixes land in
+    /// `pre_r` (slot 1) which the FFN collapse then consumes, and the FFN mixes
+    /// land in `pre2_r` (slot 2) — the next layer's incoming premix. Returns 2.
+    ///
+    /// `hc_post` is used in its staging form (`hc_post` + a copy back) rather than
+    /// the single-row `FUSE_C` in-place form: the in-place variant is a one-row
+    /// specialisation, and the staging form is the pair it was verified against.
+    fn layer_rows(&mut self, layer: usize, m: usize, pos_base: i32, pa: usize) -> Result<usize> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hc = cfg.hc_mult;
+        let ld = &self.w.layers[layer];
+        let hbytes = m * hc * dim * std::mem::size_of::<f32>();
+
+        // ---------------- attention block ----------------
+        // hc_mixes has a native `rows` dimension (`rows = m`, `hc_dim = hc*dim`),
+        // with pre/post/comb row-major per row — the same shape the single-row call
+        // uses with rows = 1.
+        self.dev.hc_mixes(
+            self.s.h_r.ptr as *const f32,
+            ld.hc_attn_fn.as_ref().unwrap().as_f32(),
+            ld.hc_attn_scale.as_ref().unwrap().as_f32(),
+            ld.hc_attn_base.as_ref().unwrap().as_f32(),
+            self.s.pre_r.ptr as *mut f32,  // slot 1: this layer's attn_pre
+            self.s.post_r.ptr as *mut f32,
+            self.s.comb_r.ptr as *mut f32,
+            m as i32,
+            (hc * dim) as i32,
+            hc as i32,
+            cfg.hc_sinkhorn_iters as i32,
+            cfg.hc_eps,
+        )?;
+        self.dev.hc_collapse(
+            self.s.h_r.ptr as *const f32,
+            self.premix_row_slot(pa).as_f32(),
+            self.s.x_r.ptr as *mut f32,
+            m as i32,
+            hc as i32,
+            dim as i32,
+        )?;
+        self.dev.rmsnorm(
+            self.s.x_r.ptr as *const f32,
+            ld.attn_norm.as_ref().unwrap().as_f32(),
+            self.s.xn_r.ptr as *mut f32,
+            m as i32,
+            dim as i32,
+            cfg.norm_eps,
+        )?;
+        self.attention_rows(layer, m, pos_base)?;
+        self.dev.hc_post(
+            self.s.wo_out_r.ptr as *const f32,
+            self.s.h_r.ptr as *const f32,
+            self.s.post_r.as_f32(),
+            self.s.comb_r.as_f32(),
+            self.s.h2_r.ptr as *mut f32,
+            m as i32,
+            hc as i32,
+            dim as i32,
+        )?;
+        self.dev
+            .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
+
+        // ---------------- FFN block ----------------
+        self.dev.hc_mixes(
+            self.s.h_r.ptr as *const f32,
+            ld.hc_ffn_fn.as_ref().unwrap().as_f32(),
+            ld.hc_ffn_scale.as_ref().unwrap().as_f32(),
+            ld.hc_ffn_base.as_ref().unwrap().as_f32(),
+            self.s.pre2_r.ptr as *mut f32, // slot 2: this layer's ffn_pre -> next layer
+            self.s.post_r.ptr as *mut f32,
+            self.s.comb_r.ptr as *mut f32,
+            m as i32,
+            (hc * dim) as i32,
+            hc as i32,
+            cfg.hc_sinkhorn_iters as i32,
+            cfg.hc_eps,
+        )?;
+        // the FFN collapses with THIS layer's attn_pre (slot 1), exactly as `layer()`
+        self.dev.hc_collapse(
+            self.s.h_r.ptr as *const f32,
+            self.s.pre_r.as_f32(),
+            self.s.x_r.ptr as *mut f32,
+            m as i32,
+            hc as i32,
+            dim as i32,
+        )?;
+        self.dev.rmsnorm(
+            self.s.x_r.ptr as *const f32,
+            ld.ffn_norm.as_ref().unwrap().as_f32(),
+            self.s.xn_r.ptr as *mut f32,
+            m as i32,
+            dim as i32,
+            cfg.norm_eps,
+        )?;
+        self.moe_rows(layer, ld, m)?;
+        self.dev.hc_post(
+            self.s.moe_out_r.ptr as *const f32,
+            self.s.h_r.ptr as *const f32,
+            self.s.post_r.as_f32(),
+            self.s.comb_r.as_f32(),
+            self.s.h2_r.ptr as *mut f32,
+            m as i32,
+            hc as i32,
+            dim as i32,
+        )?;
+        self.dev
+            .memcpy_d2d(self.s.h_r.ptr, self.s.h2_r.ptr as *const c_void, hbytes)?;
+        Ok(2)
+    }
+
+    /// Multi-row attention: the m-row twin of [`Self::attention`].
+    ///
+    /// Every row goes through the pair-call form (`lin`, `gemm_fp8_mx_or_swap`,
+    /// `apply_rope`, `sparse_attn`, `indexer_topk`) that the single-row fusions are
+    /// verified against — see the section comment above for why. The two genuinely
+    /// multi-row steps are `verify_ring_win` (one launch appends the whole block to
+    /// the window ring and emits the per-row causal window) and the wo all-reduce,
+    /// whose payload is simply m rows.
+    fn attention_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<()> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hd = cfg.head_dim;
+        let nh = cfg.n_heads;
+        let ql = cfg.q_lora_rank;
+        let rd = cfg.rope_head_dim;
+        let half = (cfg.rope_head_dim / 2) as i32;
+        let win = cfg.window_size;
+        let world = self.world();
+        let nlh = nh / world;
+        let ld = &self.w.layers[layer];
+        let pos_ctr = self.s.pos_ctr.ptr as *const std::os::raw::c_int;
+
+        // ---- q / kv projections, one row per call ----
+        // `lin()` is the (quant1, gemm_fp8_mx_or_swap) pair: the plain shape the
+        // fused `lin2`/`lin_rope*` launches are bit-identical to.
+        for r in 0..m {
+            let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+            let qrr = (self.s.qr_r.ptr as *mut f32).wrapping_add(r * ql);
+            let kvr = (self.s.kv_r.ptr as *mut f32).wrapping_add(r * hd);
+            self.lin(
+                xr,
+                dim as i32,
+                ld.wq_a.as_ref().unwrap(),
+                ld.wq_a_scale.as_ref().unwrap(),
+                ql as i32,
+                qrr,
+            )?;
+            self.lin(
+                xr,
+                dim as i32,
+                ld.wkv.as_ref().unwrap(),
+                ld.wkv_scale.as_ref().unwrap(),
+                hd as i32,
+                kvr,
+            )?;
+            // q norm, in place (the T2 epilogue's own fallback pair: plain rmsnorm
+            // into `qr`)
+            self.dev.rmsnorm(
+                qrr as *const f32,
+                ld.q_norm.as_ref().unwrap().as_f32(),
+                qrr,
+                1,
+                ql as i32,
+                cfg.norm_eps,
+            )?;
+            // wq_b: this rank's `nlh` heads, written at the row's base
+            self.lin(
+                qrr as *const f32,
+                ql as i32,
+                ld.wq_b.as_ref().unwrap(),
+                ld.wq_b_scale.as_ref().unwrap(),
+                (nlh * hd) as i32,
+                (self.s.q_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+            )?;
+        }
+        // ---- RoPE ----
+        // The kernel computes `pos = *base * mul + off + row * step` for row `row`.
+        // All `nlh` heads of one verify row share that row's position, so the q
+        // rope rides the position in `off` with `step = 0` (exactly how the
+        // single-row call keeps its heads at one position); the KV rope has one row
+        // per position, so the block form works directly with `step = 1`.
+        for r in 0..m {
+            self.dev.apply_rope(
+                (self.s.q_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                nlh as i32,
+                hd as i32,
+                rd as i32,
+                half,
+                pos_ctr,
+                1,
+                r as i32,
+                0,
+                false,
+            )?;
+        }
+        self.dev.rmsnorm(
+            self.s.kv_r.ptr as *const f32,
+            ld.kv_norm.as_ref().unwrap().as_f32(),
+            self.s.kv_r.ptr as *mut f32,
+            m as i32,
+            hd as i32,
+            cfg.norm_eps,
+        )?;
+        self.dev.apply_rope(
+            self.s.kv_r.ptr as *mut f32,
+            self.cos.as_f32(),
+            self.sin.as_f32(),
+            m as i32,
+            hd as i32,
+            rd as i32,
+            half,
+            pos_ctr,
+            1,
+            0,
+            1,
+            false,
+        )?;
+
+        // ---- window ring + the per-row causal window ----
+        // The release shares one KV store across a group of layers; a consumer then
+        // reads its owner's ring and must not append to it again (the same rule the
+        // single-row `ring_append` follows).
+        let owner = if ring_owner_shared() { self.kv_owner(layer) } else { layer };
+        let owns_kv = owner == layer;
+        let ring_ptr = self.layers[owner].ring.ptr;
+        if owns_kv {
+            self.dev.verify_ring_win(
+                ring_ptr as *mut f32,
+                self.s.kv_r.ptr as *const f32,
+                pos_ctr,
+                win as i32,
+                hd as i32,
+                m as i32,
+                self.s.idxs_win_r.ptr as *mut i32,
+            )?;
+        }
+        // The kernel's index half writes `[m, window]` with a `window` row stride
+        // (it never had to fill a wider row), while `sparse_attn` reads
+        // `[m, window + index_topk]` so the indexer's picks can follow each row's
+        // window block. Copy each row's block into place. The window itself is a
+        // function of the positions and the ring only, so a consumer layer's block
+        // is the owner's, unchanged — no second `verify_ring_win` (which would
+        // append the consumer's kv rows a second time).
+        let ist = win + cfg.index_topk;
+        for r in 0..m {
+            self.dev.memcpy_d2d(
+                (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist) as *mut c_void,
+                (self.s.idxs_win_r.ptr as *const i32).wrapping_add(r * win) as *const c_void,
+                win * 4,
+            )?;
+        }
+
+        // ---- compressor + the compressed-half selection ----
+        let comp_len = if cfg.compress_ratio(layer) > 0 && cfg.is_kv_source(layer) {
+            self.compress_rows(layer, m, pos_base)?
+        } else if cfg.compress_ratio(layer) > 0 {
+            // a consumer inherits the count published by its source layer
+            self.source_compress_len(layer)
+        } else {
+            0
+        };
+        if comp_len > 0 && cfg.is_index_source(layer) {
+            self.indexer_rows(layer, m, win, comp_len)?;
+        } else if !owns_kv && comp_len > 0 {
+            // a non-index consumer reads the owner's selection, which the owner (an
+            // index source, running earlier in the stack) already wrote into this
+            // step's `idxs_r` compressed block
+        } else if comp_len > 0 {
+            // the owner has no indexer: the recency placeholder, per row
+            for r in 0..m {
+                self.dev.comp_placeholder(
+                    (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * ist + win),
+                    (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                    win as i32,
+                    cfg.index_topk as i32,
+                )?;
+            }
+        }
+
+        // ---- sparse attention + the inverse o-rope, one row per call ----
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        for r in 0..m {
+            self.dev.sparse_attn(
+                (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                ring_ptr as *const f32,
+                ld.attn_sink.as_ref().unwrap().as_f32(),
+                (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
+                (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                1,
+                1,
+                nlh as i32,
+                hd as i32,
+                (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(owner),
+                win as i32,
+                cfg.index_topk as i32,
+                scale,
+            )?;
+        }
+        for r in 0..m {
+            self.dev.apply_rope(
+                (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                nlh as i32,
+                hd as i32,
+                rd as i32,
+                half,
+                pos_ctr,
+                1,
+                r as i32,
+                0,
+                true,
+            )?;
+        }
+
+        // ---- grouped output projection + wo_b, one row per call ----
+        let groups = cfg.o_groups;
+        let hpg = nh / groups;
+        let olg = cfg.o_lora_rank;
+        let nlg = groups / world;
+        let k = hpg * hd;
+        let ol_total = groups * cfg.o_lora_rank;
+        let ol_local = ol_total / world;
+        for r in 0..m {
+            // the fp8 of this row's attention output (the OROPE_Q epilogue's own
+            // fallback), shared by all of the row's group blocks
+            self.quant1(
+                (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                (nlh * hd) as i32,
+            )?;
+            for g in 0..nlg {
+                // The weight tensor is ALREADY this rank's local slice, so every
+                // offset is local (see `attention`'s comment on the tp=8 bug).
+                let a = self.s.xq.as_u8().wrapping_add(g * k);
+                let asc = self.s.xsc.as_f32().wrapping_add((g * k / 32) as usize);
+                let wp = ld.wo_a.as_ref().unwrap().as_u8().wrapping_add(g * olg * k);
+                let wsp = ld
+                    .wo_a_scale
+                    .as_ref()
+                    .unwrap()
+                    .as_u8()
+                    .wrapping_add((g * olg / 32) * (k / 32));
+                let out = (self.s.wo_r.ptr as *mut f32).wrapping_add(r * ol_total + g * olg);
+                self.gemm_fp8_mx_or_swap(
+                    a,
+                    asc,
+                    wp,
+                    wsp,
+                    std::ptr::null(),
+                    out,
+                    olg as i32,
+                    k as i32,
+                )?;
+            }
+            // wo_b is RowParallel: the input is split over the ranks, so this rank
+            // writes its own partial and the AR below sums them.
+            self.quant1(
+                (self.s.wo_r.ptr as *const f32).wrapping_add(r * ol_total),
+                ol_local as i32,
+            )?;
+            self.gemm_fp8_mx_or_swap(
+                self.s.xq.as_u8(),
+                self.s.xsc.as_f32(),
+                ld.wo_b.as_ref().unwrap().as_u8(),
+                ld.wo_b_scale.as_ref().unwrap().as_u8(),
+                std::ptr::null(),
+                (self.s.wo_out_r.ptr as *mut f32).wrapping_add(r * dim),
+                dim as i32,
+                ol_local as i32,
+            )?;
+        }
+        // ---- the attention all-reduce ----
+        // The payload is the m rows of `wo_out_r` instead of one: the AR is a
+        // byte-wise operation that sums the ranks in ascending order, so each row's
+        // per-element sum is the same values in the same order as the single-row AR
+        // of that row would have been. The hc-post fold (`HCPOST_EPI`) is a
+        // single-row epilogue and is not taken; the standalone `hc_post` in
+        // `layer_rows` is the pair it was verified against.
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.wo_out_r.ptr as *mut std::ffi::c_void, fb(m * dim))?;
+            c.end_round();
+        }
+        Ok(())
+    }
+
+    /// Multi-row indexer: the m-row twin of [`Self::indexer`].
+    ///
+    /// The key PUBLISHING stays once per layer (it is a function of the compressor's
+    /// latent, of which the multi-row compressor produces one row — see the
+    /// compressor TODO); the queries, per-head weights and the top-k launch run per
+    /// row, with each row's picks landing in that row's `idxs_r` block at
+    /// `+offset`.
+    ///
+    /// `indexer_topk`'s output stride is `cols = min(topk, n_pos)` — a RUNTIME value
+    /// derived from the live compressed count — so the kernel cannot be handed the
+    /// `window + index_topk` row stride `idxs_r` uses. It is therefore called once
+    /// per row with `m = 1`, where the stride never matters.
+    fn indexer_rows(
+        &mut self,
+        layer: usize,
+        m: usize,
+        offset: usize,
+        comp_len: usize,
+    ) -> Result<bool> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let ql = cfg.q_lora_rank;
+        let idx_nh = cfg.index_n_heads.max(1);
+        let idx_hd = cfg.index_head_dim.max(1);
+        let rd = cfg.rope_head_dim;
+        let half = (cfg.rope_head_dim / 2) as i32;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ld = &self.w.layers[layer];
+        let (Some(idx_wq_b), Some(idx_wq_b_s), Some(wk), Some(kn), Some(wp)) = (
+            ld.idx_wq_b.as_ref(),
+            ld.idx_wq_b_scale.as_ref(),
+            ld.idx_wk.as_ref(),
+            ld.idx_k_norm.as_ref(),
+            ld.idx_weights.as_ref(),
+        ) else {
+            return Ok(false);
+        };
+        // ---- key publishing (kv sources only, once per layer) ----
+        // `indexer_owns_k` decides whether this layer publishes the index key for
+        // the group the compressor produced; the roped key lands in the owner's
+        // `index_k` at the slot its DEVICE counter names.
+        if cfg.indexer_owns_k(layer) {
+            let clen_layer = (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(layer);
+            self.lin_bf16(
+                self.layers[layer].latent.ptr as *const f32,
+                cfg.head_dim as i32,
+                wk,
+                idx_hd as i32,
+                self.s.idx_k.ptr as *mut f32,
+            )?;
+            self.dev.rmsnorm(
+                self.s.idx_k.ptr as *const f32,
+                kn.as_f32(),
+                self.s.idx_k.ptr as *mut f32,
+                1,
+                idx_hd as i32,
+                cfg.norm_eps,
+            )?;
+            self.dev.apply_rope(
+                self.s.idx_k.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                1,
+                idx_hd as i32,
+                rd as i32,
+                (rd / 2) as i32,
+                clen_layer,
+                ratio as i32,
+                -(ratio as i32),
+                1,
+                false,
+            )?;
+            self.dev.index_k_publish(
+                self.layers[layer].index_k.ptr as *mut f32,
+                self.s.idx_k.ptr as *const f32,
+                clen_layer,
+                idx_hd as i32,
+            )?;
+        }
+        // ---- per-row queries, weights and selection ----
+        // The q_lora stream is already normed (attention_rows ran the plain
+        // rmsnorm), so `idx_wq_b` uses the plain `lin`/`lin_bf16` pair.
+        for r in 0..m {
+            let idxq = (self.s.idx_q_r.ptr as *mut f32).wrapping_add(r * idx_nh * idx_hd);
+            self.lin(
+                (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+                ql as i32,
+                idx_wq_b,
+                idx_wq_b_s,
+                (idx_nh * idx_hd) as i32,
+                idxq,
+            )?;
+            self.dev.apply_rope(
+                idxq,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                idx_nh as i32,
+                idx_hd as i32,
+                rd as i32,
+                half,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                1,
+                r as i32,
+                0,
+                false,
+            )?;
+            self.lin_bf16(
+                (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
+                dim as i32,
+                wp,
+                idx_nh as i32,
+                (self.s.idx_w_r.ptr as *mut f32).wrapping_add(r * idx_nh),
+            )?;
+        }
+        let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
+        let key_owner = self.kv_owner(layer);
+        let idx_lens =
+            (self.s.clen.ptr as *const std::os::raw::c_int).wrapping_add(key_owner);
+        let idx_k_ptr = self.layers[key_owner].index_k.ptr as *const f32;
+        for r in 0..m {
+            self.dev.indexer_topk(
+                (self.s.idx_q_r.ptr as *const f32).wrapping_add(r * idx_nh * idx_hd),
+                idx_k_ptr,
+                (self.s.idx_w_r.ptr as *const f32).wrapping_add(r * idx_nh),
+                std::ptr::null(),
+                idx_lens,
+                (self.s.idxs_r.ptr as *mut i32).wrapping_add(r * (offset + cfg.index_topk) + offset),
+                1,
+                1,
+                idx_nh as i32,
+                idx_hd as i32,
+                comp_len as i32,
+                cfg.index_topk as i32,
+                offset as i32,
+                scale,
+                1.0,
+                false,
+            )?;
+        }
+        Ok(true)
+    }
+
+    /// Multi-row compressor: the m-row twin of [`Self::compress_on`].
+    ///
+    /// The projections are per row (the same `lin_f32` call, repeated), and the
+    /// state/pool/commit trio is called with `seqlen = m`. `compressor_fused` is
+    /// NOT used: its launcher rejects `b != 1 || seqlen != 1` outright. The
+    /// pool+commit pair is the path the fused launch is bit-identical to, so this
+    /// is a parity target and not a different program.
+    ///
+    /// ⚠️ KNOWN GAP (documented in `step_rows`): the state kernel's decode branch
+    /// and the mode-2 pool carry ONE row each, so this models a single completed
+    /// group per block. The host mirror is advanced by the same rule the commit
+    /// kernel applies on the device, which keeps the two consistent for that one
+    /// group.
+    fn compress_rows(&mut self, layer: usize, m: usize, pos_base: i32) -> Result<usize> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let hd = cfg.head_dim;
+        let ratio = cfg.compress_ratio(layer).max(1);
+        let ld = &self.w.layers[layer];
+        let (Some(wkv), Some(norm)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
+            return Ok(self.layers[layer].compress_len);
+        };
+        let st = self.dev.stream();
+        for r in 0..m {
+            let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+            self.lin_f32_on(
+                xr,
+                dim as i32,
+                wkv,
+                hd as i32,
+                (self.s.kvp_r.ptr as *mut f32).wrapping_add(r * hd),
+                st,
+            )?;
+            if let Some(wg) = ld.comp_wgate.as_ref() {
+                self.lin_f32_on(
+                    xr,
+                    dim as i32,
+                    wg,
+                    hd as i32,
+                    (self.s.scp_r.ptr as *mut f32).wrapping_add(r * hd),
+                    st,
+                )?;
+            }
+        }
+        if ld.comp_wgate.is_none() {
+            // ratio == 1: no gate, so the pooled value IS the projection. The
+            // single-row path zeroes `scp` here; in that mode every row is pooled
+            // independently, so all m rows are zeroed.
+            self.dev.zero_on(&self.s.scp_r, st)?;
+        }
+        self.dev.compressor_pool_on(
+            self.s.kvp_r.as_f32(),
+            self.s.scp_r.as_f32(),
+            norm.as_f32(),
+            self.layers[layer].state_kv.ptr as *mut f32,
+            self.layers[layer].state_score.ptr as *mut f32,
+            self.layers[layer].latent.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *mut i32,
+            1,
+            m as i32,
+            hd as i32,
+            ratio as i32,
+            pos_base,
+            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+            cfg.norm_eps,
+            st,
+        )?;
+        self.dev.compress_commit_on(
+            self.layers[layer].latent.as_f32(),
+            self.cos_comp.as_f32(),
+            self.sin_comp.as_f32(),
+            self.layers[layer].ring.ptr as *mut f32,
+            self.layers[layer].out_rows.ptr as *const std::os::raw::c_int,
+            (self.s.clen.ptr as *mut std::os::raw::c_int).wrapping_add(layer),
+            hd as i32,
+            cfg.rope_head_dim as i32,
+            (cfg.rope_head_dim / 2) as i32,
+            cfg.window_size as i32,
+            ratio as i32,
+            st,
+        )?;
+        // The host MIRROR of the device counter, by the SAME deterministic rule the
+        // commit kernel applies ((*pos_ctr + 1) % ratio == 0 commits one latent).
+        if (pos_base + 1) % (ratio as i32) == 0 {
+            self.layers[layer].compress_len += 1;
+        }
+        Ok(self.layers[layer].compress_len)
+    }
+
+    /// Multi-row engram write-back: the m-row twin of [`Self::engram_apply`].
+    ///
+    /// The gather runs once per row (the hash ids are per token); the collective is
+    /// one m-row call (byte-wise, ascending rank order, so each row's part is
+    /// identical to the single-row AR of that row); the projection and the gated
+    /// write-back use their native `rows` dimension.
+    fn engram_apply_rows(&mut self, layer: usize, li: usize, m: usize) -> Result<()> {
+        let cfg = self.cfg;
+        let rank = self.rank();
+        let (dim, hc, ehd) = (cfg.dim, cfg.hc_mult, cfg.engram_head_dim);
+        let n_cols = cfg.engram_max_ngram_size.saturating_sub(1) * cfg.engram_n_heads;
+        let (table, tsc, wkv, wsc, qw, kw) = {
+            let ld = &self.w.layers[layer];
+            (
+                ld.engram_embed.as_ref(),
+                ld.engram_embed_scale.as_ref(),
+                ld.engram_wkv.as_ref(),
+                ld.engram_wkv_scale.as_ref(),
+                ld.engram_q_weight.as_ref(),
+                ld.engram_k_weight.as_ref(),
+            )
+        };
+        let (Some(table), Some(tsc), Some(wkv), Some(wsc), Some(qw), Some(kw)) =
+            (table, tsc, wkv, wsc, qw, kw)
+        else {
+            return Ok(());
+        };
+        // This rank's slice of the row-parallel table: convert.py shards
+        // `ceil(rows / world)` rows and zero-pads the tail.
+        let world = self.world().max(1);
+        let global_rows = cfg.engram_num_embeddings.get(li).copied().unwrap_or(0) as usize;
+        let per = global_rows.div_ceil(world);
+        // `eng_ids_r` is [row][engram layer][column], the same per-token layer count
+        // the hash wrote above.
+        let n_eng = self
+            .eng_layout
+            .as_ref()
+            .map(|l| l.layers.len())
+            .unwrap_or(1)
+            .max(1);
+        for r in 0..m {
+            let ids = (self.s.eng_ids_r.ptr as *const i64).wrapping_add((r * n_eng + li) * n_cols);
+            self.dev.engram_gather(
+                table.ptr() as *const u8,
+                tsc.ptr() as *const u8,
+                ids,
+                (self.s.eng_rows_r.ptr as *mut f32).wrapping_add(r * n_cols * ehd),
+                1,
+                n_cols as i32,
+                ehd as i32,
+                (rank * per) as i64,
+                per as i64,
+            )?;
+        }
+        // rows another rank owns arrived as 0, so the sum yields the real row
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(
+                self.s.eng_rows_r.ptr as *mut std::ffi::c_void,
+                fb(m * n_cols * ehd),
+            )?;
+        }
+        // kv = wkv(gathered): [(hc + 1) * dim] per row. The f32-direct-read and
+        // swapAB variants are single-row optimisations of this (quantise, GEMM)
+        // pair, which is the numerically canonical one.
+        self.dev.quant_fp8(
+            self.s.eng_rows_r.ptr as *const f32,
+            self.s.eng_xq_r.ptr as *mut u8,
+            self.s.eng_xsc_r.ptr as *mut f32,
+            m as i32,
+            (n_cols * ehd) as i32,
+            32,
+            true,
+        )?;
+        self.dev.gemm_fp8_mx(
+            self.s.eng_xq_r.as_u8(),
+            self.s.eng_xsc_r.as_f32(),
+            wkv.ptr() as *const u8,
+            wsc.ptr() as *const u8,
+            std::ptr::null(),
+            self.s.eng_kv_r.ptr as *mut f32,
+            m as i32,
+            ((hc + 1) * dim) as i32,
+            (n_cols * ehd) as i32,
+        )?;
+        // gated write-back into the residual stream (in place), all m rows
+        self.dev.engram_apply(
+            self.s.h_r.ptr as *mut f32,
+            self.s.eng_kv_r.ptr as *const f32,
+            qw.ptr() as *const f32,
+            kw.ptr() as *const f32,
+            std::ptr::null(),
+            m as i32,
+            hc as i32,
+            dim as i32,
+            cfg.norm_eps,
+        )?;
+        Ok(())
+    }
+
+    /// Multi-row MoE: the m-row twin of [`Self::moe`].
+    ///
+    /// # The batched-expert launchers are SINGLE-ROW
+    ///
+    /// `dsv41_expert_gate_up_fp4_batched` / `dsv41_expert_down_fp4_batched` /
+    /// `dsv41_expert_down_reduce_fp4_batched` take a `rows` argument, but it never
+    /// reaches the grid: the grid is `((n_total + warps - 1)/warps, slots)` where
+    /// `n_total` is the OUTPUT width (`inter` / `2*inter` / `dim`) and the slot loop
+    /// is `grid.y` — i.e. each call computes ONE activation row against `slots`
+    /// experts. (`dspark_dev.rs` hands them `rows = bs`, which for `bs > 1` silently
+    /// computes row 0 only.) The routed half is therefore issued PER ROW, with that
+    /// row's fp4-packed activation, its `ids`/`route_w` slice and its own output
+    /// slot block; the gate/up output is laid out `[row][slot][act_slot]`.
+    ///
+    /// The routing itself IS multi-row: the gate is the same M=1 bf16 GEMV `moe()`
+    /// runs (once per row), and `route_topk` has a native `rows` dimension.
+    fn moe_rows(&mut self, layer: usize, ld: &LayerDev, m: usize) -> Result<()> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let inter = cfg.moe_inter_dim;
+        let inter_local = crate::dsv41::weights::padded_inter(inter / self.world());
+        let (n_routed, topk) = cfg.moe_config(layer);
+        let topk = topk.max(1);
+        let n_routed = n_routed.max(1);
+        let stp = crate::dsv41::weights::shared_expert_tp();
+        let sh_il = if stp { inter / self.world() } else { inter };
+        let shared_rank = if stp {
+            true
+        } else {
+            self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true)
+        };
+        let mdim = m * dim;
+
+        // ---- gate + route ----
+        // The gate runs on EVERY path (exactly as `moe()` does: `skip_experts` only
+        // skips the expert launches); the routing is genuinely multi-row through
+        // `route_topk`'s `rows` dimension.
+        let gate_bias = ld
+            .gate_bias
+            .as_ref()
+            .map(|b| b.as_f32())
+            .unwrap_or(std::ptr::null());
+        for r in 0..m {
+            self.dev.gemv_bf16(
+                ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
+                (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
+                (self.s.scores_r.ptr as *mut f32).wrapping_add(r * n_routed),
+                n_routed as i32,
+                dim as i32,
+            )?;
+        }
+        self.dev.route_topk(
+            self.s.scores_r.as_f32(),
+            gate_bias,
+            self.s.route_w_r.ptr as *mut f32,
+            self.s.route_idx_r.ptr as *mut i32,
+            std::ptr::null_mut(),
+            m as i32,
+            n_routed as i32,
+            topk as i32,
+            cfg.norm_topk_prob,
+            cfg.route_scale,
+            2, // sqrtsoftplus, per the checkpoint's routing
+        )?;
+
+        // The MoE accumulator: the routed half OVERWRITES it (the fused down+reduce
+        // writes `out[i] = acc`, exactly like `moe_reduce`), so with no routed half
+        // it has to start at zero.
+        if self.opts.skip_experts {
+            self.dev.zero(&self.s.moe_out_r)?;
+        }
+
+        // ---- routed experts, one activation row per launch ----
+        if !self.opts.skip_experts {
+            let ne = ld.experts.len();
+            if ne < 2 {
+                return Err(FerriteError::Config(format!(
+                    "moe_rows: layer {layer} has {ne} expert tensors; the indirect \
+                     per-slot weight scheme needs at least 2"
+                )));
+            }
+            // The interleaved layout is only addressable by the FUSED batched
+            // gate/up body, so refuse loudly instead of reading the wrong bytes
+            // (the same contract `moe()` enforces).
+            if ld.experts_ilv
+                && !(gateup_fuse() && self.dev.supports_gateup_fuse() && expert_fp4_mode() == 2)
+            {
+                return Err(FerriteError::Config(
+                    "routed expert gate/up weights are interleaved (DSV41_EXPERT_ILV) but the \
+                     fused batched gate/up path is unavailable — run with DSV41_EXPERT_ILV=0, \
+                     or restore DSV41_GATEUP_FUSE / DSV41_EXPERT_FP4_MODE=2 so the fused \
+                     batched call is used"
+                        .into(),
+                ));
+            }
+            // The expert tensors are views into one per-layer pool with a uniform
+            // stride, so the kernels derive every pointer from a base plus
+            // `ids[slot] * stride` (the same derivation `moe()` uses).
+            let (a, b) = (&ld.experts[0], &ld.experts[1]);
+            let d = |x: *mut std::ffi::c_void, y: *mut std::ffi::c_void| (y as i64) - (x as i64);
+            let (w1_base, w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride) = (
+                a.w1.ptr() as *const u8,
+                d(a.w1.ptr(), b.w1.ptr()),
+                a.w1_scale.ptr() as *const u8,
+                d(a.w1_scale.ptr(), b.w1_scale.ptr()),
+                a.w3.ptr() as *const u8,
+                d(a.w3.ptr(), b.w3.ptr()),
+                a.w3_scale.ptr() as *const u8,
+                d(a.w3_scale.ptr(), b.w3_scale.ptr()),
+            );
+            let (w2_base, w2_stride, w2s_base, w2s_stride) = (
+                a.w2.ptr() as *const u8,
+                d(a.w2.ptr(), b.w2.ptr()),
+                a.w2_scale.ptr() as *const u8,
+                d(a.w2_scale.ptr(), b.w2_scale.ptr()),
+            );
+            // The gate/up fusion decision mirrors the launcher's own `fuse` test
+            // (and therefore `moe()`'s expression, plus the `dim % 512 == 0` term
+            // the launcher applies but the single-row call site omits). It changes
+            // the slot pitch: the fused epilogue writes the swiglu'd inter-width
+            // slice, so `act_slot` shrinks from `2*inter` to `inter`.
+            let gateup_fused = gateup_fuse()
+                && self.dev.supports_gateup_fuse()
+                && expert_fp4_mode() == 2
+                && (dim % 512) == 0;
+            let act_slot = if gateup_fused {
+                inter_local
+            } else {
+                2 * inter_local
+            };
+            let row_pitch = topk * act_slot; // usize: per-row pitch in ex_act_r
+            // One fp4 packing covers all m rows (rows = m is native to the
+            // quantiser); each gate/up call then reads its own row's packed bytes.
+            self.dev.quant_fp4(
+                self.s.xn_r.ptr as *const f32,
+                self.s.xq4_r.ptr as *mut u8,
+                self.s.xsc4_r.ptr as *mut f32,
+                m as i32,
+                dim as i32,
+                32,
+                true,
+            )?;
+            let ids_base = self.s.route_idx_r.ptr as *const i32;
+            let rw_base = self.s.route_w_r.ptr as *const f32;
+            for r in 0..m {
+                self.dev.expert_gate_up_fp4_batched(
+                    self.s.xq4_r.as_u8().wrapping_add(r * (dim / 2)),
+                    self.s.xsc4_r.as_f32().wrapping_add(r * (dim / 32)),
+                    (self.s.ex_act_r.ptr as *mut f32).wrapping_add(r * row_pitch),
+                    act_slot as i64,
+                    1,
+                    dim as i32,
+                    inter_local as i32,
+                    cfg.swiglu_limit,
+                    topk as i32,
+                    w1_base,
+                    w1_stride,
+                    w1s_base,
+                    w1s_stride,
+                    w3_base,
+                    w3_stride,
+                    w3s_base,
+                    w3s_stride,
+                    ids_base.wrapping_add(r * topk),
+                    ld.experts_ilv as i32,
+                )?;
+            }
+            // The separate swiglu pass keeps the single-row call shape (one row per
+            // launch) so its accumulation order is the verified one.
+            if !gateup_fused {
+                for r in 0..m {
+                    self.dev.swiglu_limit(
+                        (self.s.ex_act_r.ptr as *mut f32).wrapping_add(r * row_pitch),
+                        1,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                    )?;
+                }
+            }
+            for r in 0..m {
+                let act = (self.s.ex_act_r.ptr as *const f32).wrapping_add(r * row_pitch);
+                let ids = ids_base.wrapping_add(r * topk);
+                let rw = rw_base.wrapping_add(r * topk);
+                let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
+                if down_fuse() && self.dev.supports_down_fuse() {
+                    // ONE launch: the slot loop and the fixed-order sum, verbatim.
+                    self.dev.expert_down_reduce_fp4_batched(
+                        act,
+                        act_slot as i64,
+                        out,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        rw,
+                        1,
+                        topk as i32,
+                        w2_base,
+                        w2_stride,
+                        w2s_base,
+                        w2s_stride,
+                        ids,
+                    )?;
+                } else {
+                    let scratch =
+                        (self.s.ex_down_r.ptr as *mut f32).wrapping_add(r * topk * dim);
+                    self.dev.expert_down_fp4_batched(
+                        act,
+                        act_slot as i64,
+                        scratch,
+                        dim as i64,
+                        1,
+                        dim as i32,
+                        inter_local as i32,
+                        rw,
+                        1,
+                        topk as i32,
+                        w2_base,
+                        w2_stride,
+                        w2s_base,
+                        w2s_stride,
+                        ids,
+                    )?;
+                    self.dev
+                        .moe_down_reduce(scratch as *const f32, out, dim as i32, topk as i32)?;
+                }
+            }
+        }
+
+        // ---- shared expert, one row per launch ----
+        // Only the rank(s) that actually contribute it: all of them under
+        // SHARED_TP, rank 0 alone under the replicated layout (otherwise the AR
+        // would sum it `world` times).
+        if !self.opts.skip_shared_expert && shared_rank {
+            if let (Some(w1), Some(w1s), Some(w3), Some(w3s), Some(w2), Some(w2s)) = (
+                ld.shared_w1.as_ref(),
+                ld.shared_w1_scale.as_ref(),
+                ld.shared_w3.as_ref(),
+                ld.shared_w3_scale.as_ref(),
+                ld.shared_w2.as_ref(),
+                ld.shared_w2_scale.as_ref(),
+            ) {
+                for r in 0..m {
+                    // The T1/T2 fast paths are single-row gates around this very
+                    // pair, so the rows path runs the (quant1, gemm) pair.
+                    self.quant1((self.s.xn_r.ptr as *const f32).wrapping_add(r * dim), dim as i32)?;
+                    let sh_fused = sh_exp_mx2()
+                        && self.dev.gemm_fp8_mx2(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w1.as_u8(),
+                            w1s.as_u8(),
+                            std::ptr::null(),
+                            self.s.sh_act_r.ptr as *mut f32,
+                            sh_il as i32,
+                            w3.as_u8(),
+                            w3s.as_u8(),
+                            std::ptr::null(),
+                            (self.s.sh_act_r.ptr as *mut f32).wrapping_add(sh_il),
+                            sh_il as i32,
+                            dim as i32,
+                        )?;
+                    if !sh_fused {
+                        self.dev.gemm_fp8_mx(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w1.as_u8(),
+                            w1s.as_u8(),
+                            std::ptr::null(),
+                            self.s.sh_act_r.ptr as *mut f32,
+                            1,
+                            sh_il as i32,
+                            dim as i32,
+                        )?;
+                        self.dev.gemm_fp8_mx(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w3.as_u8(),
+                            w3s.as_u8(),
+                            std::ptr::null(),
+                            (self.s.sh_act_r.ptr as *mut f32).wrapping_add(sh_il),
+                            1,
+                            sh_il as i32,
+                            dim as i32,
+                        )?;
+                    }
+                    self.dev.swiglu_limit(
+                        self.s.sh_act_r.ptr as *mut f32,
+                        1,
+                        sh_il as i32,
+                        cfg.swiglu_limit,
+                    )?;
+                    self.quant1(self.s.sh_act_r.ptr as *const f32, sh_il as i32)?;
+                    // w2 folds straight into this row's accumulator (the A5
+                    // epilogue); a decline falls back to a scratch + the standalone
+                    // add, which is the same pair with the same association.
+                    let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
+                    let added = moe_epi_add()
+                        && self.dev.supports_gemm_fp8_add()
+                        && self.dev.gemm_fp8_mx_add(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w2.as_u8(),
+                            w2s.as_u8(),
+                            std::ptr::null(),
+                            out,
+                            1,
+                            dim as i32,
+                            sh_il as i32,
+                        )?;
+                    if !added {
+                        self.dev.gemm_fp8_mx(
+                            self.s.xq.as_u8(),
+                            self.s.xsc.as_f32(),
+                            w2.as_u8(),
+                            w2s.as_u8(),
+                            std::ptr::null(),
+                            self.s.ex_out.ptr as *mut f32,
+                            1,
+                            dim as i32,
+                            sh_il as i32,
+                        )?;
+                        self.dev.add_inplace_raw(
+                            out as *mut std::ffi::c_void,
+                            self.s.ex_out.ptr as *const c_void,
+                            dim as i64,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        // ---- the MoE all-reduce ----
+        // Payload = the m rows of `moe_out_r`. Byte-wise and ascending-rank, so
+        // each row's sum is the single-row AR's sum for that row.
+        if let Some(c) = self.comm.clone() {
+            c.all_reduce_inplace(self.s.moe_out_r.ptr as *mut std::ffi::c_void, fb(mdim))?;
+            c.end_round();
         }
         Ok(())
     }
