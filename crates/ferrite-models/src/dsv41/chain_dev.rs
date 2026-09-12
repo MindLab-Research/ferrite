@@ -8029,6 +8029,13 @@ impl<'a> DevChain<'a> {
         // above, so it adds no device traffic (see `inv_pos_ctr`).
         self.inv_pos_ctr(pos, pos_ctr)?;
 
+        // The v5 round ledger's PRE line: emitted BEFORE the arm is dispatched, so
+        // a step that hangs in its collectives still shows the epoch it started
+        // from (the post-line at the arm's COMMON exit is unreachable then — see
+        // [`Self::v5_ledger_pre`]). Gate off: one branch, no device traffic. The
+        // read reuses none of the D2H above (that one is `pos_ctr`, not `epoch`).
+        self.v5_ledger_pre(pos);
+
         // A chain that has not yet bootstrapped, or a process without the gate,
         // takes the legacy 5-row block below. With the gate on, the chain is
         // primed by the round that ran the legacy path (its `step_dev` is what
@@ -9433,6 +9440,43 @@ impl<'a> DevChain<'a> {
     /// on (the same discipline [`Self::vrow0_step`] follows). Gated on
     /// [`v5_ledger`], which is a cached `OnceLock` read — with the gate off this
     /// is one predictable branch and no device traffic.
+    /// The v5 round LEDGER's PRE-step line (`DSV41_V5_LEDGER=1`) — the same 4-byte
+    /// read as [`Self::v5_ledger_note`], taken BEFORE any arm is dispatched.
+    ///
+    /// [`Self::v5_ledger_note`] runs at an arm's COMMON exit, so a step that HANGS
+    /// inside its collectives never reaches it — the step that opened the epoch
+    /// rift is exactly the step the ledger cannot see (`ar5-hang`: the ninth fix's
+    /// run hung and the ledger printed 0 lines). Emitting the step's STARTING epoch
+    /// here makes every round the step is about to issue attributable even when the
+    /// step never completes; the (pre, post) pair then brackets each round.
+    ///
+    /// `arm=pre` tags the line. This must NOT feed [`Self::v5_ledger_epoch`]: the
+    /// post-line's `delta` differences two consecutive POST epochs, so a pre-line
+    /// overwrite would make that delta straddle a step.
+    ///
+    /// This is an OBSERVATION and never answers an error: a failed D2H is logged
+    /// and the step proceeds (the discipline [`Self::v5_ledger_note`] follows).
+    /// Gated on [`v5_ledger`], which is a cached `OnceLock` read — with the gate off
+    /// this is one predictable branch and no device traffic.
+    fn v5_ledger_pre(&self, pos: usize) {
+        if !v5_ledger() {
+            return;
+        }
+        let Some(c) = self.comm.as_ref() else {
+            return;
+        };
+        match self.dev.download_u32(c.epoch_dev() as *const c_void) {
+            Ok(epoch) => eprintln!(
+                "[v5-ledger-pre] pos={pos} rank={} epoch={epoch} arm=pre",
+                self.rank()
+            ),
+            Err(e) => eprintln!(
+                "[v5-ledger-pre] pos={pos} rank={} epoch read failed: {e}",
+                self.rank()
+            ),
+        }
+    }
+
     fn v5_ledger_note(&self, pos: usize, arm: &str, k_emit: usize) {
         if !v5_ledger() {
             return;
