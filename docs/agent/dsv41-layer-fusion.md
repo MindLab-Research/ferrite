@@ -421,7 +421,7 @@ TP8 ⇒ `nlh = 8`、`inter_local = padded(2304/8)`、`ol_local = 128`、`nlg = 1
       side 链上 dots(4.9µs) 与 LATE(10.7µs) 本是一个依赖对（LATE 读 dots 写的
       `g_hc_part`），却占**两个图节点**（审计 1355 节点 ≈ 2.0ms，~1.5µs/节点 ⇒ 每 front
       省 1 节点 = 2/层 × 61 层）。合并核 `hc_dots_late_kernel`
-      （`dsv41_kernels.cu:6632`），grid=`(mix, rows)`、block=`DSV41_HC_DOTS_T`(128)：
+      （`dsv41_kernels.cu:7867`），grid=`(mix, rows)`、block=`DSV41_HC_DOTS_T`(128)：
       **每个 dot 块 publish 后 `__threadfence()` + `atomicAdd(&g_hc_dl_done[r],1)`，
       看到最后一个计数的块跑 LATE 半**——`hc_pre_persist_mb_kernel` 的机制，
       **无 ticket、无自旋**（这正是 `hc_front_kernel` 的 tail 自旋 +3.2ms 的反例）。

@@ -396,6 +396,17 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 //                 (stride/4 % 32 == 0) and each LDS.32 is an 8-way conflict; +16B
 //                 staggers row r by 4 banks, making the four fragment loads
 //                 conflict-free.
+//                 ⚠ THE PADDING IS A BANK-CONFLICT KNOB, NOT AN ALIGNMENT ONE.
+//                 A "nice" 128-multiple stride (128+128 = 256) puts stride/4 %
+//                 32 back to 0, i.e. all 8 gid rows on one bank -> every A-shape
+//                 LDS.32 becomes 8-way conflicted (4 loads x 4 k blocks x up to
+//                 80 stages). The TMA path does NOT need it: measured
+//                 2026-09-12 on B300 (probe in the launcher's notes) a 128B
+//                 1D bulk into smem offsets 0/16/32/64/112 off a 128B boundary
+//                 is bit-correct -- `cp.async.bulk` (non-tensor) wants 16B
+//                 alignment, not the 128B the TENSOR form wants. Only 4/12/20/28
+//                 (mod 32) stride-words are both 16B-aligned and conflict-free;
+//                 9 (=144 bytes) is the smallest. DSV41_SWAPAB_ROWPAD overrides.
 //   kSwapabWarps: warps per block.
 //   kSwapabKSplit: K partitions per 16-row tile. THIS IS THE PARALLELISM KNOB.
 //                 MEASURED 2026-09-12: with ks=1 the kernel ran 28.4 us/call at
@@ -437,11 +448,22 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 #ifndef DSV41_SWAPAB_KSPLIT
 #define DSV41_SWAPAB_KSPLIT 8
 #endif
+#ifndef DSV41_SWAPAB_ROWPAD
+#define DSV41_SWAPAB_ROWPAD 16
+#endif
 constexpr int kSwapabKStep = DSV41_SWAPAB_KSTEP;
 constexpr int kSwapabNStage = DSV41_SWAPAB_NSTAGE;
-constexpr int kSwapabRow = kSwapabKStep + 16;
+constexpr int kSwapabRow = kSwapabKStep + DSV41_SWAPAB_ROWPAD;
+static_assert(kSwapabRow % 16 == 0, "the TMA row destination must be 16B aligned");
+static_assert((kSwapabRow >> 2) % 32 != 0,
+              "row stride must NOT be a multiple of 128B: every A-fragment LDS.32 would be "
+              "8-way bank conflicted (see the kSwapabRow note)");
 constexpr int kSwapabWarps = DSV41_SWAPAB_WARPS;
 constexpr int kSwapabKSplit = DSV41_SWAPAB_KSPLIT;
+// TMA completion barriers: one per (warp, stage), 8B each, placed FIRST in the
+// dynamic smem so the ring that follows stays 16B aligned (16B is all the bulk
+// destination needs -- see above).
+constexpr int kSwapabMbarBytes = ((kSwapabWarps * kSwapabNStage * 8 + 15) / 16) * 16;
 
 __device__ __forceinline__ void swapab_cp_async16(void* smem_dst, const void* gmem_src) {
     const unsigned s = (unsigned)__cvta_generic_to_shared(smem_dst);
@@ -453,11 +475,90 @@ __device__ __forceinline__ void swapab_cp_wait() {
     asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
+// ---- TMA staging (1D `cp.async.bulk`) ---------------------------------------
+// DSV41_SWAPAB_TMA=1 routes the weight ring through these instead of the
+// cp.async grid above: ONE instruction per row (16 per stage) replaces the
+// 16B-chunk fan-out, and the outstanding-depth limit moves from the per-thread/
+// per-SM cp.async queue (== the measured 1.3 TB/s wall) to the TMA queue.
+//
+// 1D, NOT the tensor form: `cp.async.bulk.shared::cluster.global` takes
+// [dstMem],[srcMem],size,[mbar] directly, so there is NO tensormap, no
+// cuTensorMapEncode* plumbing, no host-side descriptor -- and no
+// `cp.async.bulk.commit_group`/wait either: completion is counted by the
+// mbarrier's tx-count. Both `.shared::cluster` (used here) and `.shared::cta`
+// spellings assemble on sm_103a; the cluster form with a plain CTA-relative
+// address and no ctaMask targets the issuing CTA's own shared memory (verified
+// by the probe described at kSwapabRow).
+//
+// Alignment: 16B on both sides and size % 16 == 0 (PTX). The row stride is a
+// multiple of 16 and the global side is (m0+r)*k + k0 with k % 32 == 0 and
+// k0 % 128 == 0, so every operand is over-aligned.
+//
+// The mbarrier completes one phase per ring revolution; the consumer rotates
+// the parity it passes to swapab_mbar_wait (see the main loop).
+__device__ __forceinline__ void swapab_mbar_init(uint64_t* bar, unsigned cnt) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(
+                     (unsigned)__cvta_generic_to_shared(bar)),
+                 "r"(cnt)
+                 : "memory");
+#else
+    (void)bar; (void)cnt;
+#endif
+}
+// Required between `mbarrier.init` and the FIRST async-proxy use of the barrier
+// (the bulk copy is async-proxy; the consumer's try_wait is generic-proxy).
+__device__ __forceinline__ void swapab_mbar_init_fence() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+#endif
+}
+// arrive (1 count, matching the barrier's init count) + set the byte count the
+// bulk copies will retire. `expect_tx(0)` is how an EMPTY stage keeps the phase
+// cadence: one arrival and zero bytes completes the phase immediately (the
+// cp.async path's empty commit_group plays the same role for wait_group).
+__device__ __forceinline__ void swapab_mbar_expect_tx(uint64_t* bar, unsigned bytes) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;" ::"r"(
+                     (unsigned)__cvta_generic_to_shared(bar)),
+                 "r"(bytes)
+                 : "memory");
+#else
+    (void)bar; (void)bytes;
+#endif
+}
+__device__ __forceinline__ void swapab_mbar_wait(uint64_t* bar, unsigned phase) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile(
+        "{\n\t.reg .pred p;\n"
+        "SWAIT_%=:\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n\t"
+        "@!p bra SWAIT_%=;\n\t}" ::"r"((unsigned)__cvta_generic_to_shared(bar)),
+        "r"(phase)
+        : "memory");
+#else
+    (void)bar; (void)phase;
+#endif
+}
+__device__ __forceinline__ void swapab_bulk_g2s(void* smem_dst, const void* gmem_src,
+                                                unsigned bytes, uint64_t* bar) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+    asm volatile(
+        "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
+        " [%0], [%1], %2, [%3];" ::"r"((unsigned)__cvta_generic_to_shared(smem_dst)),
+        "l"(gmem_src), "r"(bytes), "r"((unsigned)__cvta_generic_to_shared(bar))
+        : "memory");
+#else
+    (void)smem_dst; (void)gmem_src; (void)bytes; (void)bar;
+#endif
+}
+
 __global__ void __launch_bounds__(kSwapabWarps * 32)
 gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ a_scale,
                        const uint8_t* __restrict__ w, const uint8_t* __restrict__ w_scale,
                        const float* __restrict__ bias, float* __restrict__ out, int n, int k,
-                       int ks, float* __restrict__ partial, unsigned* __restrict__ ctr) {
+                       int ks, float* __restrict__ partial, unsigned* __restrict__ ctr,
+                       int tma) {
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have started this
     // grid during the producer's tail, so gate the activation reads on the
@@ -486,15 +587,20 @@ gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ 
     // symbol, so a second declaration of the same name with a different type is
     // a compile error (the file already has `extern __shared__ float smem[]`).
     extern __shared__ uint8_t sab_smem[];
-    uint8_t* sw = sab_smem + (size_t)warp * kSwapabNStage * 16 * kSwapabRow;
+    // TMA completion barriers come first (8B each, one per (warp, stage)), so
+    // the ring behind them keeps its 16B alignment.
+    uint64_t* s_mb = (uint64_t*)sab_smem;
+    uint8_t* sw = sab_smem + kSwapabMbarBytes + (size_t)warp * kSwapabNStage * 16 * kSwapabRow;
 
     // ---- per-warp A/B staging (this warp's K slice only) -------------------
     // Staged only for THIS warp's slice, so the ks partitions do not each re-read
     // the whole activation. Vectorised 16B: a byte-wise copy of k bytes cost a
     // fixed ~3.3 us/call on its own.
     const size_t wbytes = (size_t)kSwapabWarps * kSwapabNStage * 16 * kSwapabRow;
-    uint8_t* s_a = sab_smem + wbytes + (size_t)warp * kc;                 // [kc] fp8
-    float* s_as = (float*)(sab_smem + wbytes + (size_t)kSwapabWarps * kc) + (size_t)warp * nb;
+    uint8_t* s_a = sab_smem + kSwapabMbarBytes + wbytes + (size_t)warp * kc;  // [kc] fp8
+    float* s_as =
+        (float*)(sab_smem + kSwapabMbarBytes + wbytes + (size_t)kSwapabWarps * kc) +
+        (size_t)warp * nb;
     uint8_t* s_ws = (uint8_t*)(s_as + (size_t)kSwapabWarps * nb) + (size_t)warp * nb;
     {
         const uint4* src4 = (const uint4*)(a + k0p);
@@ -509,20 +615,64 @@ gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ 
     }
     __syncwarp();
 
+    // ---- TMA completion barriers ------------------------------------------
+    // Initialised ONCE, here, per (warp, stage): count 1 == exactly one
+    // `arrive.expect_tx` per stage use. Within a launch the barriers are only
+    // ever rotated (parity), NEVER re-initialised -- a re-init mid-flight would
+    // clear the pending tx count and desynchronise the consumer. Across launches
+    // the dynamic smem is fresh, so init-at-entry is also what keeps a captured
+    // graph replay clean. The fence is the documented bridge between the init
+    // (generic proxy) and the bulk copy's async-proxy use of the barrier.
+    if (tma) {
+        if (lane == 0) {
+#pragma unroll
+            for (int i = 0; i < kSwapabNStage; i++)
+                swapab_mbar_init(&s_mb[warp * kSwapabNStage + i], 1u);
+        }
+        swapab_mbar_init_fence();
+        __syncwarp();
+    }
+
     const int nk = (kc + kSwapabKStep - 1) / kSwapabKStep;  // stages in the slice
 
-    // Stage `st`: 16 rows x [k0, k0+KSTEP) of THIS warp's slice, one cp.async
-    // group of 16B chunks. An out-of-range `st` STILL commits (an empty group):
-    // the depth invariant wait_group relies on is "NSTAGE-1 groups outstanding
-    // before the wait", and near the end of K the real issues run out. Without
-    // the empty groups the count drops to NSTAGE-2, wait_group(NSTAGE-2) returns
-    // immediately and the LAST TWO stages get read before their cp.asyncs land.
+    // Stage `st`: 16 rows x [k0, k0+KSTEP) of THIS warp's slice.
+    //   * cp.async path: one group of 16B chunks. An out-of-range `st` STILL
+    //     commits (an empty group): the depth invariant wait_group relies on is
+    //     "NSTAGE-1 groups outstanding before the wait", and near the end of K
+    //     the real issues run out. Without the empty groups the count drops to
+    //     NSTAGE-2, wait_group(NSTAGE-2) returns immediately and the LAST TWO
+    //     stages get read before their cp.asyncs land.
+    //   * TMA path: 16 `cp.async.bulk`s (one per row, `rb` bytes each) issued by
+    //     lane 0 and retired into this stage's mbarrier. An out-of-range `st`
+    //     still ARRIVES with expect_tx(0) -- the same "keep the cadence" role,
+    //     but now it is the phase parity the wait depends on rather than a
+    //     group count.
+    // Both paths write the SAME ring layout, so the consumer below is identical.
     auto stage = [&](int st) {
+        const int slot = st % kSwapabNStage;
+        if (tma) {
+            const int rb = (st < nk) ? min(kSwapabKStep, kc - st * kSwapabKStep) : 0;
+            if (lane == 0) {
+                uint64_t* bar = &s_mb[warp * kSwapabNStage + slot];
+                // 16 rows x rb bytes of transactions; the producer's own arrival
+                // (count 1) is folded into expect_tx.
+                swapab_mbar_expect_tx(bar, (unsigned)(16 * rb));
+                if (rb > 0) {
+                    uint8_t* dst = sw + (size_t)slot * 16 * kSwapabRow;
+                    const int k0 = k0p + st * kSwapabKStep;
+#pragma unroll
+                    for (int r = 0; r < 16; r++)
+                        swapab_bulk_g2s(dst + (size_t)r * kSwapabRow,
+                                        w + (size_t)(m0 + r) * k + k0, (unsigned)rb, bar);
+                }
+            }
+            return;
+        }
         if (st < nk) {
             const int k0 = k0p + st * kSwapabKStep;
             const int rb = min(kSwapabKStep, kc - st * kSwapabKStep);  // % 16 == 0
             const int nchunk = rb >> 4;                                // 16B chunks/row
-            uint8_t* dst = sw + (size_t)(st % kSwapabNStage) * 16 * kSwapabRow;
+            uint8_t* dst = sw + (size_t)slot * 16 * kSwapabRow;
             if (nchunk == (kSwapabKStep >> 4)) {
                 // Full stage: 16B chunks per row is the compile-time power of two
                 // P, so the chunk->(row, offset) map is a shift and a mask. The
@@ -561,7 +711,19 @@ gemm_fp8_swapab_kernel(const uint8_t* __restrict__ a, const float* __restrict__ 
         // Exactly ONE group per iteration keeps NSTAGE-1 outstanding, so
         // wait_group(NSTAGE-2) always retires the oldest one (== stage st).
         stage(st + kSwapabNStage - 1);
-        swapab_cp_wait<kSwapabNStage - 2>();
+        if (tma) {
+            // Same depth, different accounting: slot `st % NSTAGE` has been
+            // filled (st / NSTAGE + 1) times, and each fill flips its barrier's
+            // phase once, so the parity to wait on is the ring revolution count
+            // mod 2. All lanes wait (try_wait is a read, not a consume): the
+            // phase flip is what publishes the bulk-written bytes to this
+            // generic-proxy LDS (no extra fence needed -- TMA writes land
+            // visible once the mbarrier's tx count retires).
+            swapab_mbar_wait(&s_mb[warp * kSwapabNStage + (st % kSwapabNStage)],
+                             (unsigned)((st / kSwapabNStage) & 1));
+        } else {
+            swapab_cp_wait<kSwapabNStage - 2>();
+        }
         __syncwarp();  // every lane's own group is retired -> the tile is complete
 
         const uint8_t* s = sw + (size_t)(st % kSwapabNStage) * 16 * kSwapabRow;
@@ -4580,6 +4742,14 @@ extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, con
     // times per step, so a per-call getenv would be the hot-path slip).
     static const bool no_swapab = getenv("DSV41_NO_SWAPAB") != nullptr;
     if (no_swapab) return 2;
+    // TMA staging gate (DSV41_SWAPAB_TMA, default OFF, `=1` enables): the weight
+    // ring is filled by 1D `cp.async.bulk` + mbarrier instead of the cp.async.cg
+    // grid. Same `= "1"` convention as the Rust-side gates (DSV41_SWAPAB).
+    // Read once, like the others; a per-call getenv is the hot-path slip.
+    static const int tma_stage = [] {
+        const char* v = getenv("DSV41_SWAPAB_TMA");
+        return (v != nullptr && v[0] == '1') ? 1 : 0;
+    }();
     if (a == nullptr || a_scale == nullptr || w == nullptr || w_scale == nullptr || out == nullptr)
         return 2;
     // Shape-based dispatch: the isolated sweep showed swapAB wins at n>=1664
@@ -4610,7 +4780,7 @@ extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, con
     // weight ring + the per-warp activation / scale staging (see the kernel's
     // staging note). The staging is sized for the SLICE (kc, nb), not full k.
     const int kc = k / ks, nb = kc >> 5;
-    const size_t smem = (size_t)kSwapabWarps * kSwapabNStage * 16 * kSwapabRow +
+    const size_t smem = kSwapabMbarBytes + (size_t)kSwapabWarps * kSwapabNStage * 16 * kSwapabRow +
                         (size_t)kSwapabWarps * kc + (size_t)kSwapabWarps * nb * (sizeof(float) + 1);
     if (smem > 48 * 1024) {
         // Per-kernel ceiling, not this call's need: a sticky attribute set to a
@@ -4630,7 +4800,7 @@ extern "C" int dsv41_gemm_fp8_swapab(const uint8_t* a, const float* a_scale, con
     // after cudaGridDependencySynchronize() returns, i.e. after this grid ended.
     cudaError_t le = dsv41_pdl_or_plain(gemm_fp8_swapab_kernel, dim3(blocks), dim3(kSwapabWarps * 32),
                                         smem, s, a, a_scale, w, w_scale, bias, out, n, k, ks,
-                                        partial, ctr);
+                                        partial, ctr, tma_stage);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }

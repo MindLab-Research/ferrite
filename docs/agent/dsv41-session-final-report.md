@@ -240,7 +240,8 @@ hc_mixes_tail 在 decode 只有 1 个 block——占用率不是变量。
 
 1. **隔离探针只用于淘汰，正向收益必须 serve A/B。**
    隔离探针无法模拟 serve 的三个条件：**SM 争抢（侧流并行）、L2 竞争、占用率敏感**。
-   已确认 5 次隔离→生产失效：a32-vec4 → AR grid → PDEPTH pipeline → w2 warm → 隔离版 cp.async。
+   本会话最终确认 **7 次**隔离→生产失效：a32-vec4 → AR grid → PDEPTH pipeline → w2 warm →
+   quant+swiglu fold → stamp fold → swapAB。（早期清单只数到 5 次，漏了 3 条 fold 与 swapAB。）
 2. **fork_ev 是 kernel 级事件，不是 block 级。**
    `fork_ev` 在 EARLY kernel **完成时**记录，所以给 gating kernel 加任何工作 = 加到 main 的关键路径。
    小 kernel 合并的收益必须 **> gate 语义的代价**（省 launch 的收益 < 加到 gate kernel 的代价时是净负）。
