@@ -5603,3 +5603,31 @@ pos=20/22: epoch=54（持续冻结）
 - **观测错位**：D2H 读到的不是 AR 写的那个字
 - 检查：AR 的调用者传的 epoch 指针是否与 `c.epoch_dev()` 一致？
 - 如果 AR 写 A 位置而 ledger 读 B 位置——"降级"是读错位置
+
+## P0 日志重检的最终数据（亲自验证——决定性！）
+
+**完整 rank=0 序列**：
+```
+pos=10 pre: epoch=830（正常）
+pos=15 pre: epoch=999（正常——所有 8 rank 一致！）
+pos=15 note: epoch=54（所有 8 rank 均匀降到 54！）
+pos=16+ 全部 54（冻结）
+```
+
+**所有 8 rank 的 pos=15**：
+- pre: 全部 epoch=999（完全同步！）
+- note: 全部 epoch=54（**均匀降级**——同一代码路径所有 rank 一致！）
+
+**RESET=0 确认**（尽管 999→54）——**断言有 bug 或逻辑不同**！
+**CANARY=0 确认**——盲区是结构性的（swallow-final-fix-path 的分析正确）。
+
+**epoch 54 的完整画像**：
+1. ✅ 均匀降级（所有 rank 一起 999→54）
+2. ✅ 发生在 pos=15 的第一次 swallowed 步内
+3. ❌ 不是写入（所有写者都是 e+k）
+4. ❌ 不是流错位（全部 self.stream）
+5. ❌ 不是 canary 检测的越界（盲区）
+6. ❌ RESET 断言没触发（有 bug）
+7. **剩余**：观测错位（D2H 读错位置）或 reduced 的向上溢出（ctr_at-4 踩 epoch 而 canary 完好）
+
+**P1 witness（实施中）将一锤定音**——kernel 自己记录它读/写的值！
