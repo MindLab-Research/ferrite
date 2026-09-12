@@ -315,6 +315,62 @@ let mrows = self.dev.supports_gemm_fp8_mrows() && !Self::swapab() && m <= VERIFY
 
 ---
 
+## 8. 工部实施记录（2026-09-12 · Phase B 第二批：B5 + B4）
+
+**结论：本设计 §3 的 B5 / B4 两个「新核」已按 B6 的实施模式全部落树 —— kernel + launcher + device.rs FFI/probe + `chain_dev.rs` gate/接线 + parity suite + 脚本 opt-in arm；两个 gate 默认 OFF，`cargo check --workspace` EXIT=0。**
+
+实施模式完全照 B6（§0-1 / `b6-mrows-f32-design.md`）：**不换程序、只搬代码** —— 新核的每一段决定结果的表达式都逐字复制自它在用的现有 kernel，逐位等价由构造保证（parity suite 在 GPU 上钉死）。
+
+### B5 —— `ferrite_gemv_bf16_v2_mrows_route`（gate GEMV + route 单发）
+
+| 项 | 内容 |
+|---|---|
+| **gate** | `DSV41_GATE_MROWS_ROUTE=1`（严格 `== "1"`，默认 OFF）**且** `row_fold_gate()`（`DSV41_GATE_MROWS`/`DSV41_ROW_FOLD_GATE`）——融合就是多行程序本身，没有逐行形态可折 |
+| **kernel** | `ferrite_kernels.cu`：把 `Gv2RouteEpi` 加 `nrows` 字段、把 `gv2_route_epilogue` 的「rows == 1」硬编码改成 `for (rr < epi.nrows)` 行循环（**同一份 `route_topk` body，v2 入口传 `nrows = 1` ⇒ 行为逐字不变**），给 `gemv_bf16_nt_kernel<NT, WPR>` 加 `rte` 形参（null ctr ⇒ 无 barrier/atomic/smem，逐字不变），新增 C 入口 `ferrite_gemv_bf16_v2_mrows_route`（`nrows == 1` 转发到 M=1 的 `ferrite_gemv_bf16_v2_route`） |
+| **程序复用（关键）** | B5 实例化的是**同一个** `gemv_bf16_nt_kernel<NT, WPR>`（`NT×WPR` 双重 dispatch 与 `ferrite_gemv_bf16_nt` 逐字相同，只有 epilogue 不同）⇒ 满足该入口自己的「**NO SECOND TRANSCRIPTION**」铁律，不产生第二份 K 序定义 |
+| **接线点** | `moe_rows` @`chain_dev.rs`（`gate_folded` 块）：`row_fold_gate() && gate_mrows_route()` → 融合入口；返回 `Ok(false)`（stale `.so`/shape/smem）⇒ **回落到 `gemv_bf16_v2_mrows` + `route_topk` 两发**（即参考） |
+| **新计数器** | `Scratch::route_ctr_r`（4B，**与 EAGER 的 `route_ctr` 分开**：两个 gate 可同开，一个 counter 服务两个 election 会双双损坏），build 时 zero **一次**，kernel 自己复位（graph replay 干净） |
+| **替换掉什么** | **2 发/层 → 1 发/层** ⇒ **−1 发/层 = −40 发/步**（设计 §0-5：`GATE_MROWS` 已吃掉 m×gemv） |
+| **位等价** | ✅ by construction（GEMV 半 = 同一程序 + epilogue 在其 block 的 `y[]` store 之后；route 半 = `route_topk_kernel` 的 body 逐行，MAX 选择 + 确定性 tie-break ⇒ reduce 树形状不影响结果） |
+| **parity** | `kernels/cuda/tests_mrows_route.cu`：融合 vs `gemv_bf16_v2_mrows` + `dsv41_route_topk`，**scores / weights / indices 三个缓冲区整块 raw-bit 比对** + qNaN sentinel 覆盖；m=2/5/6、score_func=2/0、topk=6/8、WPR=4/8、k 非 `32*8*WPR` 倍数 |
+
+### B4 —— `dsv41_rmsnorm_rope_mrows`（kv norm + rope 单发）
+
+| 项 | 内容 |
+|---|---|
+| **gate** | `DSV41_RMSNORM_ROPE_MROWS=1`（严格 `== "1"`，默认 OFF） |
+| **kernel** | `dsv41_kernels.cu`（紧接 `dsv41_rmsnorm_rows`）：`dsv41_rmsnorm_rope_mrows_kernel` = **phase 1 `dsv41_rmsnorm_rows_kernel` 的 body 逐字**（含 1024 线程的 `red[32]` 跨 warp 折叠 —— blockDim 是逐位等价的必要条据）+ **phase 2 `apply_rope_kernel` 的 trailing `2*half` 旋转逐字**（`t = pos_rows[row]`）；ABI 带 **stream** |
+| **接线点** | `attention_rows` @`chain_dev.rs`（kv 半链，`norm_rows_on` + `apply_rope_on` 处）：`rmsnorm_rope_mrows()` → 融合入口，`Ok(false)` ⇒ 原两发（`norm_rows_on` + `apply_rope_on`）逐字运行 |
+| **⚠️ stream 红线** | 两发都是 `*_on`（`VERIFY_FORK` 的 `kv_stream` 侧链）；融合入口把 stream 作为**参数**（Rust `Device::rmsnorm_rope_mrows(..., s)`），硬件码里写死主流会把 kv 半链悄悄拖回主流、抵消 FORK 收益。**A/B 必须与 `DSV41_VERIFY_FORK` 同臂**（设计 §3 的陷阱已被 ABI 覆盖） |
+| **替换掉什么** | **2 发/层 → 1 发/层** ⇒ **−1 发/层 = −40 发/步**（设计 §0-5：`NORM_MROWS` 已吃掉 m×norm；kv rope 本来就是 m 行单发） |
+| **位等价** | ✅ by construction：phase 1 行独立 + blockDim 相同；phase 2 无归约、每元素恰好写一次（线程映射不影响结果）；**唯一新增是一条相位间 `__syncthreads()`** —— 只定内存序，不动数值 |
+| **parity** | `kernels/cuda/tests_rmsnorm_rope_mrows.cu`：融合 vs `dsv41_rmsnorm_rows` + `dsv41_apply_rope`，整块 raw-bit + qNaN sentinel；非 0 `pos_base`（钉死「用 `pos_rows[row]` 而不是 `row`」）、`rope_off = dim − 2*half`（钉死「旋转尾段而不是头段」）、`inverse=1`（生产不走的那个 arm）、三种 head 宽度 |
+
+### 脚本 opt-in arm（把 gate 送到节点上）
+
+与 §7 同因（serve 经 `rssh`，env 只由 `$GATES_ONELINE` 构成）：`scripts/batched_400_v2.sh` 加两个 arm，**默认 unset ⇒ `GATES_ONELINE` 逐字不变**：
+
+* `B400_B5=1` → `DSV41_GATE_MROWS=1 DSV41_GATE_MROWS_ROUTE=1`
+* `B400_B4=1` → `DSV41_RMSNORM_ROPE_MROWS=1`
+
+### 本次验收（无 GPU / 无 nvcc ⇒ 只到源码级）
+
+| 判据 | 结果 |
+|---|---|
+| `cargo check --workspace` | ✅ **EXIT=0** |
+| `bash -n scripts/batched_400_v2.sh` | ✅ OK |
+| gate OFF 默认行为不变 | ✅ B5：`row_fold_gate()` false ⇒ `route_fused=false` ∧ `gate_folded=false` ⇒ **逐行 gemv + route_topk 原样**；B4：`kv_fused=false` ⇒ **`norm_rows_on` + `apply_rope_on` 原样**（两处 fallback 就是参考实现本身） |
+| 符号/接线完整性 | ✅ `nm -D` 待 GPU 节点重建后核（V2）；两条新符号已进 `kernels` 表与 `ko!` |
+
+**留给 GPU 会话的三件事**（设计 §5 的判据，本次无 GPU 不能做）：
+1. 重建 `.so`（`bash build.sh 103a`）后 `nm -D` 核两条新符号 —— **decline 是静默的**，没有符号就等于 arm 空转；
+2. nsys sum 表出现 `ferrite_gemv_bf16_v2_mrows_route` / `dsv41_rmsnorm_rope_mrows` 的 **kernel 名**（这是唯一「真上场」的硬证），且 `route_topk` / kv 侧 `apply_rope_kernel` 的 Instances/步 各从 40 掉到 0；
+3. `k_acc` 逐位 + 计数数字顺序 + 出师表零拉丁（两项都声称位等价，所以走 V6 而不是红线）；B4 必须与 `DSV41_VERIFY_FORK` 同臂。
+
+*工部 · 本段为实施记录；本批无 GPU 命令执行，验收只到 `cargo check` + `bash -n`。*
+
+---
+
 *工部 · 只读勘察 + 本文件（唯一产出）；未执行 GPU 命令、未改动任何源码。*
 *所有 ms 标来源（实测 / launch 账 / 设计 / 代数）；行号以 HEAD `ba88df1` 为准；*
 *与任务前提冲突处已显式给出依据与 file:line。*
