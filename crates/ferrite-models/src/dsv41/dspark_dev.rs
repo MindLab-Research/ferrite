@@ -1345,82 +1345,91 @@ impl<'a> DsparkDev<'a> {
                             .into(),
                     ));
                 }
-                // The batched expert launchers' `rows` argument is validation
-                // only - the grid is output-width based, so each call computes
-                // ONE activation row (the finding recorded in
-                // `DevChain::moe_rows`'s doc). Issue per row, with that row's
-                // packed fp4 bytes, its `ids`/`route_w` slice and its own
-                // `[row][slot][act_slot]` block - the same shape `moe_rows`
-                // uses. (The historical call passed rows = bs and silently
-                // computed row 0 only.)
+                // The batched expert launchers are MULTI-ROW as of the
+                // `moe-mrows-impl` kernel change: `rows` is the grid's third
+                // dimension (`blockIdx.z` = the activation row) and each row's
+                // pointers are derived INSIDE the kernel from the arguments plus
+                // `gridDim.y` (= slots = topk): a/a_scale at arow*(dim/2) /
+                // arow*(dim/32) (the quantiser's own packed layout), ids at
+                // [arow*topk + slot], out at (arow*topk + slot)*out_slot_stride,
+                // act/rw at (arow*topk + slot)*act_stride. So ONE call now covers
+                // all bs rows, with the host passing the row-0 BASE of each
+                // [row][slot][...] buffer - exactly the offsets the old per-row
+                // loop computed by hand (r*(dim/2), r*(dim/32), r*row_pitch with
+                // row_pitch = topk*act_slot, ids + r*topk, out + r*dim).
+                //
+                // BIT-EXACTNESS: an activation row shares no output element, no
+                // accumulator and no smem staging with any other row (`arow` only
+                // shifts base pointers - see the kernel's ROW INDEPENDENCE block),
+                // so row r of this call runs the identical instruction sequence the
+                // rows=1 call ran for row r. rows == bs > 1 no longer means "row 0
+                // only"; rows == 1 is the previous launch bit for bit.
                 //
                 // Defect 2: the fused epilogue writes only `inter` floats per
                 // slot (the swiglu'd half), so `act_slot` shrinks from `2*inter`
-                // to `inter` exactly when it ran.
+                // to `inter` exactly when it ran. `act_slot` is also the kernel's
+                // per-slot act/out stride, so ex_act_b (= [row][slot][act_slot])
+                // and moe_out (= [row][dim]) keep their layout unchanged.
                 let act_slot = if gateup_fused {
                     inter_local as i64
                 } else {
                     (2 * inter_local) as i64
                 };
-                let row_pitch = (topk as usize) * (act_slot as usize);
-                for r in 0..bs {
-                    self.dev.expert_gate_up_fp4_batched(
-                        self.xq4.as_u8().wrapping_add(r * (dim / 2)),
-                        self.xsc4.as_f32().wrapping_add(r * (dim / 32)),
-                        (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch),
-                        act_slot,
-                        1,
-                        dim as i32,
-                        inter_local as i32,
-                        cfg.swiglu_limit,
-                        topk as i32,
-                        strides.0,
-                        strides.1,
-                        strides.2,
-                        strides.3,
-                        strides.4,
-                        strides.5,
-                        strides.6,
-                        strides.7,
-                        ids.wrapping_add(r * topk),
-                        // Defect 1: the pool layout (was a hard-wired 0, which
-                        // only ever matched a non-interleaved pool).
-                        ld.experts_ilv as i32,
-                    )?;
-                }
+                self.dev.expert_gate_up_fp4_batched(
+                    self.xq4.as_u8(),
+                    self.xsc4.as_f32(),
+                    self.ex_act_b.ptr as *mut f32,
+                    act_slot,
+                    bs as i32,
+                    dim as i32,
+                    inter_local as i32,
+                    cfg.swiglu_limit,
+                    topk as i32,
+                    strides.0,
+                    strides.1,
+                    strides.2,
+                    strides.3,
+                    strides.4,
+                    strides.5,
+                    strides.6,
+                    strides.7,
+                    ids,
+                    // Defect 1: the pool layout (was a hard-wired 0, which
+                    // only ever matched a non-interleaved pool).
+                    ld.experts_ilv as i32,
+                )?;
                 // Defect 2: the fused epilogue already applied swiglu in place,
                 // so the separate pass must be skipped exactly when it ran — it
                 // would otherwise read the never-written up half of every slot.
+                // The pass is element-wise and row-local and its kernel walks the
+                // same [rows][slot][slot_stride] layout, so one rows=bs launch
+                // replaces the per-row loop with no order to preserve.
                 if !gateup_fused {
-                    for r in 0..bs {
-                        self.dev.swiglu_limit_batched(
-                            (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch),
-                            1,
-                            inter_local as i32,
-                            cfg.swiglu_limit,
-                            act_slot,
-                            topk as i32,
-                        )?;
-                    }
-                }
-                for r in 0..bs {
-                    self.dev.expert_down_reduce_fp4_batched(
-                        (self.ex_act_b.ptr as *const f32).wrapping_add(r * row_pitch),
-                        act_slot,
-                        (self.moe_out.ptr as *mut f32).wrapping_add(r * dim),
-                        1,
-                        dim as i32,
+                    self.dev.swiglu_limit_batched(
+                        self.ex_act_b.ptr as *mut f32,
+                        bs as i32,
                         inter_local as i32,
-                        (self.route_w.ptr as *const f32).wrapping_add(r * topk),
-                        1,
+                        cfg.swiglu_limit,
+                        act_slot,
                         topk as i32,
-                        strides.8,
-                        strides.9,
-                        strides.10,
-                        strides.11,
-                        ids.wrapping_add(r * topk),
                     )?;
                 }
+                self.dev.expert_down_reduce_fp4_batched(
+                    self.ex_act_b.ptr as *const f32,
+                    act_slot,
+                    self.moe_out.ptr as *mut f32,
+                    bs as i32,
+                    dim as i32,
+                    inter_local as i32,
+                    self.route_w.ptr as *const f32,
+                    1,
+                    topk as i32,
+                    strides.8,
+                    strides.9,
+                    strides.10,
+                    strides.11,
+                    ids,
+                )?;
             } else {
                 // Defect 3 (audit-moe-seg): the sequential `*_indirect` readers
                 // walk the plain [w1][w3] pools; against an interleaved pool they

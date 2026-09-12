@@ -4151,15 +4151,21 @@ impl<'a> DevChain<'a> {
             verify_out.copy_from_slice(&rows);
         }
 
-        // 8. the accept arithmetic (host, no device traffic). Same index-for-index
-        //    chain as the spec path: block row j sits at pos+1+j so `drafts[j]`
-        //    predicts pos+2+j, and verify row j's argmax is at the same pos+2+j —
-        //    compared as `drafts[j] == verify_out[j]`. The old `drafts[0] == next`
-        //    compared across positions (a pos+2 prediction vs the pos+1 token).
-        //    `next` itself is certain and always emitted ahead of the rows.
+        // 8. the accept arithmetic (host, no device traffic). MEASURED layout:
+        //    the draft block is at the anchor's own position, so drafts[j]
+        //    predicts pos+1+j; verify row j-1's argmax is at the same pos+1+j.
+        //    The chain: drafts[0] vs `next` (the single-row step's argmax), then
+        //    drafts[j] vs verify_out[j-1].
         let mut acc = 0usize;
-        while acc < DSPARK_DRAFTS && drafts[acc] == verify_out[acc] {
-            acc += 1;
+        if drafts[0] == next {
+            acc = 1;
+            for j in 1..DSPARK_DRAFTS {
+                if drafts[j] == verify_out[j - 1] {
+                    acc += 1;
+                } else {
+                    break;
+                }
+            }
         }
 
         // 9. the golden-comparison dump (no-op unless `DSV41_DSPARK_DUMP=1`).
@@ -4295,21 +4301,21 @@ impl<'a> DevChain<'a> {
         let mut verify_out = [0u32; DSPARK_DRAFTS];
         verify_out.copy_from_slice(&rows);
 
-        // ---- 5. the accept arithmetic (host, no device traffic). Fix #10 moved
-        // the draft block to the NEXT-position viewpoint: block row j sits at
-        // pos+1+j, so `drafts[j]` predicts pos+2+j — and verify row j (fed
-        // `drafts[j]` at pos+1+j, per step_rows' pos_base+row positions) has its
-        // argmax at the SAME pos+2+j. The two are therefore compared
-        // index-for-index: `drafts[j] == verify_out[j]`, j = 0.. — the accept
-        // chain fix #10 left half-done (the old `drafts[0] == next` compared a
-        // pos+2 prediction against the pos+1 token, which is why the measured
-        // match rate was ~33% — the adjacent-position correlation level).
-        //
-        // `next` (the single-row step's argmax, the pos+1 token) is a CERTAIN
-        // value and is always emitted, ahead of the verify's rows.
+        // ---- 5. the accept arithmetic (host, no device traffic). MEASURED
+        // layout (154-step trace): drafts[0] == next 60% — the draft block sits
+        // at the anchor's OWN position, so drafts[j] predicts pos+1+j and
+        // verify row j-1 (fed drafts[j-1] at pos+1+j-1) has its argmax at the
+        // SAME pos+1+j. The chain is therefore drafts[0] against `next` (the
+        // single-row step's argmax, the pos+1 token) and then drafts[j] against
+        // verify_out[j-1]. This is the historical chain; an "index-for-index
+        // drafts[j]==verify_out[j]" variant was tried and measured 0.000 —
+        // cross-position — confirming the draft block is at pos, not pos+1.
         let mut k_acc = 0usize;
-        while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc] {
-            k_acc += 1;
+        if drafts[0] == next {
+            k_acc = 1;
+            while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc - 1] {
+                k_acc += 1;
+            }
         }
 
         // ---- 6. the commit: roll back everything past the accepted prefix,
@@ -5429,17 +5435,30 @@ impl<'a> DevChain<'a> {
 
     /// Multi-row MoE: the m-row twin of [`Self::moe`].
     ///
-    /// # The batched-expert launchers are SINGLE-ROW
+    /// # The batched-expert launchers are MULTI-ROW
     ///
     /// `dsv41_expert_gate_up_fp4_batched` / `dsv41_expert_down_fp4_batched` /
-    /// `dsv41_expert_down_reduce_fp4_batched` take a `rows` argument, but it never
-    /// reaches the grid: the grid is `((n_total + warps - 1)/warps, slots)` where
-    /// `n_total` is the OUTPUT width (`inter` / `2*inter` / `dim`) and the slot loop
-    /// is `grid.y` — i.e. each call computes ONE activation row against `slots`
-    /// experts. (`dspark_dev.rs` hands them `rows = bs`, which for `bs > 1` silently
-    /// computes row 0 only.) The routed half is therefore issued PER ROW, with that
-    /// row's fp4-packed activation, its `ids`/`route_w` slice and its own output
-    /// slot block; the gate/up output is laid out `[row][slot][act_slot]`.
+    /// `dsv41_expert_down_reduce_fp4_batched` / `dsv41_swiglu_limit_batched` now
+    /// put `rows` into the grid's THIRD dimension (`blockIdx.z` = the activation
+    /// row): the grid is `((n_total + warps - 1)/warps, slots, rows)` where
+    /// `n_total` is the OUTPUT width (`inter` / `2*inter` / `dim`) and `grid.y` is
+    /// the slot. Each call therefore computes ALL m activation rows against their
+    /// `slots` experts, deriving every per-row pointer itself from the arguments
+    /// plus `gridDim.y` (see the layout contract on the kernels). `rows == 1`
+    /// leaves `blockIdx.z == 0`, i.e. the pre-existing single-row launch bit for
+    /// bit — so a caller that still passes rows = 1 is unchanged.
+    ///
+    /// The routed half is consequently ONE call per stage instead of m, with the
+    /// host passing the row-0 BASE of each `[row][slot][...]` buffer:
+    ///   fp4 activation `xq4_r`/`xsc4_r` : [row][dim/2] / [row][dim/32] (the
+    ///                                     quantiser's own packed layout)
+    ///   `route_idx_r` / `route_w_r`     : [row][topk]      (row pitch = slots)
+    ///   `ex_act_r`                      : [row][slot][act_slot]
+    ///   `moe_out_r`                     : [row][dim]
+    /// The per-row pointers are NOT passed any more — that is the whole point of
+    /// the rewrite (m·4 launches → 4, the MoE launch count the verify audit
+    /// flagged). Byte-for-byte identical to the per-row loop it replaces: see the
+    /// bit-exactness note at the launch site.
     ///
     /// The routing itself IS multi-row: the gate is the same M=1 bf16 GEMV `moe()`
     /// runs (once per row), and `route_topk` has a native `rows` dimension.
@@ -5557,9 +5576,14 @@ impl<'a> DevChain<'a> {
             } else {
                 2 * inter_local
             };
-            let row_pitch = topk * act_slot; // usize: per-row pitch in ex_act_r
+            // ex_act_r is [row][slot][act_slot], i.e. row pitch = topk*act_slot.
+            // That pitch is no longer computed here - the multi-row kernels
+            // derive it from `slots * out_slot_stride` - but it is the pitch the
+            // kernel's per-row walk assumes, and the two agree by construction
+            // (slots == topk, out_slot_stride == act_slot).
             // One fp4 packing covers all m rows (rows = m is native to the
-            // quantiser); each gate/up call then reads its own row's packed bytes.
+            // quantiser); the single gate/up call then reads each row's packed
+            // bytes at arow*(dim/2) / arow*(dim/32) inside the kernel.
             self.dev.quant_fp4(
                 self.s.xn_r.ptr as *const f32,
                 self.s.xq4_r.ptr as *mut u8,
@@ -5571,86 +5595,122 @@ impl<'a> DevChain<'a> {
             )?;
             let ids_base = self.s.route_idx_r.ptr as *const i32;
             let rw_base = self.s.route_w_r.ptr as *const f32;
-            for r in 0..m {
-                self.dev.expert_gate_up_fp4_batched(
-                    self.s.xq4_r.as_u8().wrapping_add(r * (dim / 2)),
-                    self.s.xsc4_r.as_f32().wrapping_add(r * (dim / 32)),
-                    (self.s.ex_act_r.ptr as *mut f32).wrapping_add(r * row_pitch),
-                    act_slot as i64,
-                    1,
-                    dim as i32,
+            // ---- ONE rows = m launch per stage, for all m activation rows --------
+            // The kernels' `rows` argument is now the THIRD grid dimension
+            // (`expert_gemv_fp4_batched_kernel`: `blockIdx.z`, see its layout
+            // contract), so the launcher's grid is (n_total/warps, slots, rows)
+            // and every per-row pointer is derived INSIDE the kernel from the
+            // arguments below plus `gridDim.y` (= slots = topk):
+            //   a / a_scale : a + arow*(k/2) / a_scale + arow*(k/32)   (quantiser's
+            //                 own row-major packed layout -> no extra stride arg)
+            //   ids         : ids[arow*gridDim.y + slot]      == route_idx_r[m][topk]
+            //   out         : out + (arow*gridDim.y + slot)*out_slot_stride
+            //   act / rw    : act + (arow*gridDim.y + slot)*act_stride, same for rw
+            // Each of those IS the offset the per-row loop applied on the host
+            // (r*(dim/2), r*(dim/32), ids_base + r*topk, r*row_pitch +
+            // slot*act_slot with row_pitch = topk*act_slot), so the host now
+            // passes the row-0 BASE of each buffer and the kernel re-derives the
+            // rest. `row_pitch == slots*out_slot_stride` is the whole alignment
+            // requirement, and it holds by construction (row_pitch =
+            // topk*act_slot = slots*out_slot_stride).
+            //
+            // BIT-EXACTNESS: rows share no output element, no accumulator and no
+            // shared-memory staging - `arow` only shifts base pointers (the
+            // kernel's ROW INDEPENDENCE block) - so row r of this call executes
+            // the identical group order / fma chain / shuffle tree / epilogue the
+            // rows=1 call executed for row r. rows == 1 degenerates to the
+            // previous launch exactly (grid.z == 1, every offset 0).
+            self.dev.expert_gate_up_fp4_batched(
+                self.s.xq4_r.as_u8(),
+                self.s.xsc4_r.as_f32(),
+                self.s.ex_act_r.ptr as *mut f32,
+                act_slot as i64,
+                m as i32,
+                dim as i32,
+                inter_local as i32,
+                cfg.swiglu_limit,
+                topk as i32,
+                w1_base,
+                w1_stride,
+                w1s_base,
+                w1s_stride,
+                w3_base,
+                w3_stride,
+                w3s_base,
+                w3s_stride,
+                ids_base,
+                ld.experts_ilv as i32,
+            )?;
+            // The separate swiglu pass is element-wise and row-local, and its
+            // kernel walks the SAME [rows][slot][slot_stride] layout
+            // (`base + (blockIdx.z*gridDim.y + blockIdx.y)*slot_stride`), so the
+            // m-row loop collapses into one rows=m launch with no order
+            // dependency to preserve: element i of (row, slot) is read and
+            // written once, and the expf/limit chain is the rows=1 one.
+            if !gateup_fused {
+                self.dev.swiglu_limit_batched(
+                    self.s.ex_act_r.ptr as *mut f32,
+                    m as i32,
                     inter_local as i32,
                     cfg.swiglu_limit,
+                    act_slot as i64,
                     topk as i32,
-                    w1_base,
-                    w1_stride,
-                    w1s_base,
-                    w1s_stride,
-                    w3_base,
-                    w3_stride,
-                    w3s_base,
-                    w3s_stride,
-                    ids_base.wrapping_add(r * topk),
-                    ld.experts_ilv as i32,
                 )?;
             }
-            // The separate swiglu pass keeps the single-row call shape (one row per
-            // launch) so its accumulation order is the verified one.
-            if !gateup_fused {
+            if down_fuse() && self.dev.supports_down_fuse() {
+                // ONE rows = m launch: the fused down+reduce kernel's grid is
+                // (dim/warps, 1, rows) and it derives act_row =
+                // act_base + arow*slots*act_stride, out_row = out + arow*n_total
+                // and ids/rw [arow*slots + slot] itself - again exactly the host
+                // offsets of the old loop. Its ascending-slot sum is SERIAL PER
+                // ROW, same order, same rounded product/add pair, so row r is
+                // bit-identical to the rows=1 call for row r.
+                self.dev.expert_down_reduce_fp4_batched(
+                    self.s.ex_act_r.ptr as *const f32,
+                    act_slot as i64,
+                    self.s.moe_out_r.ptr as *mut f32,
+                    m as i32,
+                    dim as i32,
+                    inter_local as i32,
+                    rw_base,
+                    1,
+                    topk as i32,
+                    w2_base,
+                    w2_stride,
+                    w2s_base,
+                    w2s_stride,
+                    ids_base,
+                )?;
+            } else {
+                // The down WRITE is one rows = m launch too (out row pitch =
+                // slots*out_slot_stride = topk*dim, which IS the scratch's row
+                // pitch). The fixed-order sum stays PER ROW: `dsv41_moe_down_reduce`
+                // has no `rows` dimension, and the ascending-slot summation order
+                // is the numerical contract - so it keeps the exact per-row shape
+                // (scratch row r, out row r) it had before.
+                self.dev.expert_down_fp4_batched(
+                    self.s.ex_act_r.ptr as *const f32,
+                    act_slot as i64,
+                    self.s.ex_down_r.ptr as *mut f32,
+                    dim as i64,
+                    m as i32,
+                    dim as i32,
+                    inter_local as i32,
+                    rw_base,
+                    1,
+                    topk as i32,
+                    w2_base,
+                    w2_stride,
+                    w2s_base,
+                    w2s_stride,
+                    ids_base,
+                )?;
                 for r in 0..m {
-                    self.dev.swiglu_limit(
-                        (self.s.ex_act_r.ptr as *mut f32).wrapping_add(r * row_pitch),
-                        1,
-                        inter_local as i32,
-                        cfg.swiglu_limit,
-                    )?;
-                }
-            }
-            for r in 0..m {
-                let act = (self.s.ex_act_r.ptr as *const f32).wrapping_add(r * row_pitch);
-                let ids = ids_base.wrapping_add(r * topk);
-                let rw = rw_base.wrapping_add(r * topk);
-                let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
-                if down_fuse() && self.dev.supports_down_fuse() {
-                    // ONE launch: the slot loop and the fixed-order sum, verbatim.
-                    self.dev.expert_down_reduce_fp4_batched(
-                        act,
-                        act_slot as i64,
-                        out,
-                        1,
-                        dim as i32,
-                        inter_local as i32,
-                        rw,
-                        1,
-                        topk as i32,
-                        w2_base,
-                        w2_stride,
-                        w2s_base,
-                        w2s_stride,
-                        ids,
-                    )?;
-                } else {
                     let scratch =
-                        (self.s.ex_down_r.ptr as *mut f32).wrapping_add(r * topk * dim);
-                    self.dev.expert_down_fp4_batched(
-                        act,
-                        act_slot as i64,
-                        scratch,
-                        dim as i64,
-                        1,
-                        dim as i32,
-                        inter_local as i32,
-                        rw,
-                        1,
-                        topk as i32,
-                        w2_base,
-                        w2_stride,
-                        w2s_base,
-                        w2s_stride,
-                        ids,
-                    )?;
+                        (self.s.ex_down_r.ptr as *const f32).wrapping_add(r * topk * dim);
+                    let out = (self.s.moe_out_r.ptr as *mut f32).wrapping_add(r * dim);
                     self.dev
-                        .moe_down_reduce(scratch as *const f32, out, dim as i32, topk as i32)?;
+                        .moe_down_reduce(scratch, out, dim as i32, topk as i32)?;
                 }
             }
         }
