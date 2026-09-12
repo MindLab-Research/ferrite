@@ -5328,3 +5328,21 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 - 如果仍有 misaligned：还有其他读点（compute-sanitizer 定位）
 
 **注意**：需要双产物重编（.cu 变了）
+
+## epoch 写入点分析（亲自验证——降级不是直接写入）
+
+**所有 epoch 写入点**（ferrite_kernels.cu）：
+- `:8623 *epoch = e + 1u;`（AR advance——递增）
+- `:8723 *epoch = e + 1u;`（另一个 advance——递增）
+- `:8991 *(volatile unsigned*)(epoch + 1) = e + 1u;`（A4 广播字——epoch+1 的位置不是 epoch）
+
+**所有写入都是 e+1（递增）——没有写小绝对值的地方！**
+
+**epoch 1497→54 的可能机制（排除直接写入后）**：
+1. **Memory corruption**：越界写命中 `staging + ctr_at`（epoch 的位置）
+   - staging 缓冲区包含：AR 结果 + ready stamps + epoch（ctr_at）+ A4 广播字
+   - 某个操作的越界写破坏了 epoch！
+2. **SWALLOW 臂的某个 kernel 越界**：第一次 swallowed 步就降级——SWALLOW 特有的 kernel？
+3. **D1 观测的干扰**：download_u32 的 D2H 与 AR 并发？（但 pos=16/22 的观测正常）
+
+**待 epoch-decrease-rootcause 的完整判决**
