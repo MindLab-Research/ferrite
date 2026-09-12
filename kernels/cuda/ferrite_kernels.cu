@@ -8933,76 +8933,173 @@ __global__ void p2p_ar_store_v5_kernel(
 // at the same point, so the kernel boundary every downstream consumer depends on
 // does not move.
 //
-// A1 (`DSV41_AR_PROBE`, default OFF): wraps the poll in `clock64()` and folds the
-// spin of the SLOWEST of block 0's pollers into the `g_ar5_probe_*` device
-// globals, printing one `[ar-probe]` line every 512 ARs. Device `printf` (stdout,
-// not stderr): the counters are never copied to the host, which would be an
-// illegal op inside a capture. Units are SM clock cycles (~1.8GHz on B300, so
-// 1us ~= 1800 cycles). Only block 0 is measured -- the same site in both arms, so
-// the two are comparable.
+// A0/A1 (`DSV41_AR_PROBE`, default OFF): the instrument that decides where the AR
+// budget goes. The SAME v5 round costs ~5us of work, 17.3us by the ledger and
+// 53.4us under nsys, and only an unsampled device-side reading can say which of
+// the three is real. Three questions, three fields in every `[ar-probe]` line:
+//
+//   site  -- WHICH half of the 80 rounds/step waits. The label is the COMPILE-TIME
+//            entry that launched the round (see `ar5_probe_site` below), because
+//            the launcher identity is what the .so's ABI already carries: adding a
+//            per-call `site` argument would change six `extern "C"` signatures,
+//            and a stale .so would then receive the site as its stream handle.
+//   rank  -- is ONE rank systematically the last to arrive (the load-balance arm,
+//            `A2c`), or do all ranks spin equally (the synchronization itself)?
+//            Counters are per-DEVICE, so each rank prints its own line.
+//   seg   -- how much of the round is WORK, split the three ways the design's
+//            §2 needs: `stamp` (entry -> the wait begins: this rank's 8 remote
+//            `atomicExch_system` + the joining barrier + the epoch write),
+//            `spin` (the wait for the slowest peer) and `epi` (the wait's end ->
+//            this block's reduce + hc-post fold has retired, i.e. the work floor).
+//
+// Device `printf` (stdout, not stderr): the counters are never copied to the host,
+// which would be an illegal op inside a capture. Units are SM clock cycles
+// (~1.8GHz on B300, so 1us ~= 1800 cycles; the ledger's 17.3us/round == ~31k
+// cycles is the number to compare `avg_spin` against). Only block 0 is measured --
+// the same site in every arm, so the arms stay comparable.
 //
 // Both gates are read ONCE per process (below): they select a kernel arm and must
 // not change between the capture and the replays of the same graph node.
 // ===========================================================================
-__device__ unsigned long long g_ar5_probe_n = 0ull;    // AR rounds observed
-__device__ unsigned long long g_ar5_probe_spin = 0ull; // summed spin cycles (max-of-block per round)
-__device__ unsigned long long g_ar5_probe_max = 0ull;  // worst single-round spin
 
-__device__ __forceinline__ void ar5_probe_report(unsigned long long spin) {
-    const unsigned long long n = atomicAdd(&g_ar5_probe_n, 1ull) + 1ull;
-    atomicAdd(&g_ar5_probe_spin, spin);
-    atomicMax(&g_ar5_probe_max, spin);
+// ---- A0 probe SITES -------------------------------------------------------
+// Each of these mirrors one `extern "C"` entry point, i.e. one Rust call path
+// (`tp.rs`), and the counters are one slot per site so a run can be split without
+// a second experiment:
+//   MOE    <- `ferrite_p2p_ar_v5_hcpost_add` / `_add`: the MoE all-reduce of
+//             `moe_reduce`, which runs OUTSIDE the captured segment (40 rounds/step)
+//   ATTN   <- `ferrite_p2p_ar_v5_hcpost` / `ferrite_p2p_ar_pubred_v5`: the
+//             attention all-reduce of `layer()`, INSIDE the graph (40 rounds/step)
+//   VERIFY <- `ferrite_p2p_ar_v5_hcpost_rows`: the m-row verify AR (lazy: per row)
+//   OTHER  <- `ferrite_p2p_ar_v5`, plus every site the split cannot tell apart.
+//             KNOWN LIMIT: `_hcpost` serves BOTH the attention fold and the MoE
+//             fold (the latter only when the loaded .so lacks `_hcpost_add`), so
+//             under that fallback ATTN's count doubles per layer -- the site line
+//             then shows it and the run needs the biased entry to be read apart.
+#define AR5_SITE_MOE 0
+#define AR5_SITE_ATTN 1
+#define AR5_SITE_VERIFY 2
+#define AR5_SITE_OTHER 3
+#define AR5_SITE_N 4
+
+__device__ unsigned long long g_ar5_probe_n[AR5_SITE_N] = {0ull, 0ull, 0ull, 0ull};
+__device__ unsigned long long g_ar5_probe_spin[AR5_SITE_N] = {0ull, 0ull, 0ull, 0ull};
+__device__ unsigned long long g_ar5_probe_max[AR5_SITE_N] = {0ull, 0ull, 0ull, 0ull};
+__device__ unsigned long long g_ar5_probe_stamp[AR5_SITE_N] = {0ull, 0ull, 0ull, 0ull};
+__device__ unsigned long long g_ar5_probe_epi[AR5_SITE_N] = {0ull, 0ull, 0ull, 0ull};
+__device__ unsigned long long g_ar5_probe_epi_max[AR5_SITE_N] = {0ull, 0ull, 0ull, 0ull};
+
+__device__ __forceinline__ void ar5_probe_report(
+    unsigned long long spin, unsigned long long stamp, unsigned long long epi,
+    int site, int my_rank) {
+    if (site < 0 || site >= AR5_SITE_N) site = AR5_SITE_OTHER;
+    const unsigned long long n = atomicAdd(&g_ar5_probe_n[site], 1ull) + 1ull;
+    atomicAdd(&g_ar5_probe_spin[site], spin);
+    atomicMax(&g_ar5_probe_max[site], spin);
+    atomicAdd(&g_ar5_probe_stamp[site], stamp);
+    atomicAdd(&g_ar5_probe_epi[site], epi);
+    atomicMax(&g_ar5_probe_epi_max[site], epi);
     if ((n & 511ull) == 0ull)
-        printf("[ar-probe] n=%llu avg_spin=%.0f cyc max=%llu cyc\n", n,
-               (double)g_ar5_probe_spin / (double)n, g_ar5_probe_max);
+        printf("[ar-probe] rank=%d site=%d n=%llu avg_spin=%.0f cyc max=%llu cyc"
+               " avg_stamp=%.0f cyc avg_epi=%.0f cyc max_epi=%llu cyc\n",
+               my_rank, site, n, (double)g_ar5_probe_spin[site] / (double)n,
+               g_ar5_probe_max[site], (double)g_ar5_probe_stamp[site] / (double)n,
+               (double)g_ar5_probe_epi[site] / (double)n, g_ar5_probe_epi_max[site]);
+}
+
+// ---- A2b: what a TIMED-OUT round does (safety, always armed) ---------------
+// Code fact this replaces: on `spins > 5,000,000` (~0.5s) both arms used to
+// `break` out of the poll and then carry on as if the round had completed --
+// the OFF arm fell through to the `__syncthreads()` + the reduce (reading peer
+// staging that peer never published) and the A4 arm's block 0 still wrote the
+// broadcast word `epoch[1] = e+1` (publishing the timeout as a success to the
+// other blocks). A round whose stamps never arrived is INCOMPLETE, so that path
+// is not a stall: it is silently wrong numbers entering the residual stream --
+// the same chain as the SWALLOW arm's "6 tokens then EOS" (`epoch 54`: the AR
+// result is corrupted -> attention wrong -> logits wrong -> EOS). See
+// docs/agent/ar-l4l5-optimization-design.md §4-A2b.
+//
+// So a timed-out waiter now NEVER publishes, NEVER advances the epoch and NEVER
+// reaches the reduce. It reports and then does one of:
+//   PARK (default, `DSV41_AR_TIMEOUT_TRAP` unset/0) -- spin forever. The kernel
+//     never completes, so the stream never advances and the rank cannot emit a
+//     token built on the bad round. The wedge is LOUD twice: the `[ar5-hang]`
+//     line names rank/site/peer/need/cur, and the pool's own watchdog
+//     (`serve.rs STEP_TIMEOUT`) reports "a rank did not answer".
+//   TRAP (`DSV41_AR_TIMEOUT_TRAP=1`) -- `trap`, i.e. a hard CUDA error on the
+//     next API call. Faster than the 1800s pool watchdog and it cannot be
+//     mistaken for slowness; opt in for A/B runs, where a wedge costs a whole
+//     measurement cycle.
+// A genuine rift therefore cannot produce a token any more -- which is the
+// precondition for believing ANY AR A/B. Cost on the normal path: zero (the
+// branch already existed; only its body changed).
+#define AR5_TIMEOUT_SPINS 5000000
+__device__ unsigned long long g_ar5_timeout_n = 0ull;   // timed-out waiters (all sites)
+
+__device__ __forceinline__ void ar5_timeout(
+    int bcast, int site, int my_rank, int peer, unsigned need, unsigned cur, int trap) {
+    const unsigned long long nth = atomicAdd(&g_ar5_timeout_n, 1ull) + 1ull;
+    // A handful of lines is a diagnosis; 160 (20 blocks x 8 pollers) is a flood.
+    if (nth <= 8ull) {
+        if (bcast)
+            printf("[ar5-hang-bcast] rank=%d site=%d need=%u cur=%u spins>%d TIMEOUT -> %s\n",
+                   my_rank, site, need, cur, AR5_TIMEOUT_SPINS, trap ? "TRAP" : "PARK");
+        else
+            printf("[ar5-hang] rank=%d site=%d peer=%d need=%u cur=%u spins>%d TIMEOUT -> %s\n",
+                   my_rank, site, peer, need, cur, AR5_TIMEOUT_SPINS,
+                   trap ? "TRAP" : "PARK");
+    }
+    if (trap) asm volatile("trap;");   // a hard CUDA error, never a silent round
+    for (;;) __nanosleep(1000000u);
 }
 
 // The wait for one v5 round, shared verbatim by the three pubred variants
-// (`_v5`, `_v5_hcpost`, `_v5_hcpost_rows`). `s_spin` is the caller's shared
-// scratch for the A1 probe (initialised to 0 by the caller before its first
-// barrier). See the A4/A1 note above for the protocol and its justification.
+// (`_v5`, `_v5_hcpost`, `_v5_hcpost_rows`). `s_probe` is the caller's shared
+// scratch for the A0 probe, `[0]` = spin (written here) and `[1]` = the stamp
+// segment (written here), initialised to 0 by the caller; `t_entry` is the
+// caller's kernel-entry `clock64()` (block 0, thread 0) -- the anchor of that
+// stamp segment. `site` labels the counters and `trap` picks A2b's failure mode
+// (see both above). See the A4/A1 note for the protocol and its justification.
 __device__ __forceinline__ void ar5_wait_round(
     const unsigned* __restrict__ ready_local, unsigned* __restrict__ epoch,
-    unsigned e, int world, int my_rank, int single_poll, int probe,
-    unsigned long long* __restrict__ s_spin) {
+    unsigned e, int world, int my_rank, int single_poll, int probe, int site,
+    int trap, unsigned long long* __restrict__ s_probe,
+    unsigned long long t_entry) {
+    const unsigned need = e + 1u;
     if (single_poll) {
         if (blockIdx.x == 0) {
             const unsigned long long t0 = probe ? clock64() : 0ull;
+            if (probe && threadIdx.x == 0) s_probe[1] = t0 - t_entry;
             if (threadIdx.x < (unsigned)world) {
                 const int tr = (int)threadIdx.x;
                 unsigned cur = *(volatile unsigned*)&ready_local[tr];
                 long spins = 0;
                 unsigned ns = 32;   // first probe 32ns, then the proven 100ns cadence
-                while ((int)(cur - (e + 1u)) < 0) {
+                while ((int)(cur - need) < 0) {
                     __nanosleep(ns);
                     ns = 100;
                     cur = *(volatile unsigned*)&ready_local[tr];
-                    if (++spins > 5000000) {
-                        printf("[ar5-hang] rank=%d peer=%d need=%u cur=%u\n",
-                               my_rank, tr, e + 1u, cur);
-                        break;
-                    }
+                    if (++spins > AR5_TIMEOUT_SPINS)
+                        ar5_timeout(0, site, my_rank, tr, need, cur, trap);
                 }
             }
-            if (probe && threadIdx.x < (unsigned)world) atomicMax(s_spin, clock64() - t0);
+            if (probe && threadIdx.x < (unsigned)world) atomicMax(&s_probe[0], clock64() - t0);
             __syncthreads();   // THIS block has now observed every peer
             if (threadIdx.x == 0) {
                 __threadfence();   // the observation before the publish
-                *(volatile unsigned*)(epoch + 1) = e + 1u;
+                *(volatile unsigned*)(epoch + 1) = need;
             }
         } else {
             // Every other block waits on the ONE local flag, not on 8 stamps.
             if (threadIdx.x == 0) {
                 long spins = 0;
                 unsigned ns = 32;
-                while ((int)(*(volatile unsigned*)(epoch + 1) - (e + 1u)) < 0) {
+                while ((int)(*(volatile unsigned*)(epoch + 1) - need) < 0) {
                     __nanosleep(ns);
                     ns = 100;
-                    if (++spins > 5000000) {
-                        printf("[ar5-hang-bcast] rank=%d block=%u need=%u\n",
-                               my_rank, blockIdx.x, e + 1u);
-                        break;
-                    }
+                    if (++spins > AR5_TIMEOUT_SPINS)
+                        ar5_timeout(1, site, my_rank, -1, need,
+                                    *(volatile unsigned*)(epoch + 1), trap);
                 }
                 __threadfence();   // the publish observed before this block reduces
             }
@@ -9012,25 +9109,23 @@ __device__ __forceinline__ void ar5_wait_round(
         // OFF arm: byte-for-byte the poll every v5 pubred has run since the
         // publish/reduce merge (thread r polls peer r in EVERY block).
         const unsigned long long t0 = probe ? clock64() : 0ull;
+        if (probe && blockIdx.x == 0 && threadIdx.x == 0) s_probe[1] = t0 - t_entry;
         if (threadIdx.x < (unsigned)world) {
             const int tr = (int)threadIdx.x;
             unsigned cur = *(volatile unsigned*)&ready_local[tr];
             long spins = 0;
             unsigned ns = 32;
-            while ((int)(cur - (e + 1u)) < 0) {
+            while ((int)(cur - need) < 0) {
                 __nanosleep(ns);
                 ns = 100;
                 cur = *(volatile unsigned*)&ready_local[tr];
-                if (++spins > 5000000) {
-                    printf("[ar5-hang] rank=%d peer=%d need=%u cur=%u\n",
-                           my_rank, tr, e + 1u, cur);
-                    break;
-                }
+                if (++spins > AR5_TIMEOUT_SPINS)
+                    ar5_timeout(0, site, my_rank, tr, need, cur, trap);
             }
         }
         // Probe only block 0: the site must be the same one the ON arm measures.
         if (probe && blockIdx.x == 0 && threadIdx.x < (unsigned)world)
-            atomicMax(s_spin, clock64() - t0);
+            atomicMax(&s_probe[0], clock64() - t0);
     }
 }
 
@@ -9040,7 +9135,8 @@ __global__ void p2p_ar_pubred_v5_kernel(
     const float* __restrict__ staging_local,  // my [2][world][stride]
     const unsigned* __restrict__ ready_local, // my [world] flag row
     float* __restrict__ out,
-    int world, int my_rank, int n, int stride, int single_poll, int probe) {
+    int world, int my_rank, int n, int stride, int single_poll, int probe,
+    int site, int trap) {
     // publish + reduce fused (2026-09-10): the publish used to be its own
     // 1-block kernel and the reduce another launch — 3 kernels per AR. v5's
     // ABSOLUTE-epoch stamps make multi-block polling safe (no per-block
@@ -9048,10 +9144,15 @@ __global__ void p2p_ar_pubred_v5_kernel(
     // multi-block kernel can stamp (block 0), poll (all blocks, all peers)
     // and reduce its slice. Saves one graph node + launch per AR (90/step).
     // `single_poll` (A4) narrows the poll to block 0 + a broadcast flag; see
-    // `ar5_wait_round`. `probe` (A1) records the spin of both arms.
+    // `ar5_wait_round`. `probe`/`site`/`trap` are A0/A2b (see their notes):
+    // `site` is the compile-time label of THIS entry, `trap` A2b's failure mode.
     const unsigned e = *epoch;
-    __shared__ unsigned long long s_spin;   // A1 scratch, read after the barrier below
-    if (threadIdx.x == 0) s_spin = 0ull;
+    __shared__ unsigned long long s_probe[2];   // A0: [0] spin, [1] stamp segment
+    unsigned long long t_entry = 0ull;          // A0: block 0 / thread 0 only
+    if (probe) {
+        if (threadIdx.x == 0) { s_probe[0] = 0ull; s_probe[1] = 0ull; }
+        if (blockIdx.x == 0 && threadIdx.x == 0) t_entry = clock64();
+    }
     // Stamp the peers in parallel: thread r publishes round e+1 into peer r's
     // ready row. Thread 0 used to loop over `world` slots serially (8
     // atomicExch_system = 0.4-0.8us, the bulk of the stamp stage). The slots
@@ -9067,10 +9168,13 @@ __global__ void p2p_ar_pubred_v5_kernel(
     if (blockIdx.x == 0 && threadIdx.x == 0)
         *epoch = e + 1u;
     // The round's wait. OFF arm = every block polls all peers (today's path);
-    // ON arm = block 0 polls + a broadcast flag. A4/A1, see `ar5_wait_round`.
-    ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, &s_spin);
+    // ON arm = block 0 polls + a broadcast flag. A4/A0/A2b, see `ar5_wait_round`.
+    ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, site,
+                   trap, s_probe, t_entry);
     __syncthreads();
-    if (probe && blockIdx.x == 0 && threadIdx.x == 0) ar5_probe_report(s_spin);
+    unsigned long long t_wait_done = 0ull;   // A0: block 0 / thread 0 only
+    if (probe && blockIdx.x == 0 && threadIdx.x == 0)
+        t_wait_done = clock64();
     // reduce this block's slice of staging[e & 1] (ascending rank order —
     // the same order the standalone reduce used: bit-identical)
     const int step = gridDim.x * blockDim.x;
@@ -9089,6 +9193,16 @@ __global__ void p2p_ar_pubred_v5_kernel(
         for (int r = 0; r < world; r++)
             acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
         out[ii] = acc;
+    }
+    // A0's `epi` segment: from the wait's end to the LAST thread of this block
+    // having finished the reduce -- the round's work floor, measured in situ
+    // (the design's §2 needs it to tell work from waiting; the gate is uniform
+    // across the block, so the barrier is legal).
+    if (probe) {
+        __syncthreads();
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            ar5_probe_report(s_probe[0], s_probe[1], clock64() - t_wait_done, site,
+                             my_rank);
     }
 }
 
@@ -9213,9 +9327,10 @@ extern "C" cudaError_t ferrite_p2p_ar_v5(
     // writes before this kernel's polls/reduce reads.
     const int single_poll = ferrite_ar_single_poll();
     const int probe = ferrite_ar_probe();
+    const int trap = ferrite_ar_timeout_trap();
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out,
-        world, my_rank, n, stride, single_poll, probe);
+        world, my_rank, n, stride, single_poll, probe, AR5_SITE_OTHER, trap);
     return cudaGetLastError();
 }
 
@@ -9257,9 +9372,10 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_add(
     if (err != cudaSuccess) return err;
     const int single_poll = ferrite_ar_single_poll();
     const int probe = ferrite_ar_probe();
+    const int trap = ferrite_ar_timeout_trap();
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out,
-        world, my_rank, n, stride, single_poll, probe);
+        world, my_rank, n, stride, single_poll, probe, AR5_SITE_MOE, trap);
     return cudaGetLastError();
 }
 
@@ -9281,9 +9397,10 @@ extern "C" cudaError_t ferrite_p2p_ar_pubred_v5(
     int blocks = ferrite_ar_v5_grid_blocks(n, threads);
     const int single_poll = ferrite_ar_single_poll();
     const int probe = ferrite_ar_probe();
+    const int trap = ferrite_ar_timeout_trap();
     p2p_ar_pubred_v5_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
-        single_poll, probe);
+        single_poll, probe, AR5_SITE_ATTN, trap);
     return cudaGetLastError();
 }
 
@@ -9379,10 +9496,14 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
     int world, int my_rank, int n, int stride,
     float* __restrict__ hc_res, const float* __restrict__ hc_post,
     const float* __restrict__ hc_comb, int hc_n, int hc_h,
-    int single_poll, int probe) {
+    int single_poll, int probe, int site, int trap) {
     const unsigned e = *epoch;
-    __shared__ unsigned long long s_spin;   // A1 scratch
-    if (threadIdx.x == 0) s_spin = 0ull;
+    __shared__ unsigned long long s_probe[2];   // A0: [0] spin, [1] stamp segment
+    unsigned long long t_entry = 0ull;          // A0: block 0 / thread 0 only
+    if (probe) {
+        if (threadIdx.x == 0) { s_probe[0] = 0ull; s_probe[1] = 0ull; }
+        if (blockIdx.x == 0 && threadIdx.x == 0) t_entry = clock64();
+    }
     // Parallel stamp — same protocol/transformation as
     // `p2p_ar_pubred_v5_kernel` (thread r stamps peer r; the barrier joins the
     // stamps before e+1 is published to the next round's store).
@@ -9393,9 +9514,12 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
     __syncthreads();
     if (blockIdx.x == 0 && threadIdx.x == 0)
         *epoch = e + 1u;
-    ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, &s_spin);
+    ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, site,
+                   trap, s_probe, t_entry);
     __syncthreads();
-    if (probe && blockIdx.x == 0 && threadIdx.x == 0) ar5_probe_report(s_spin);
+    unsigned long long t_wait_done = 0ull;   // A0: block 0 / thread 0 only
+    if (probe && blockIdx.x == 0 && threadIdx.x == 0)
+        t_wait_done = clock64();
     const int step = gridDim.x * blockDim.x;
     const int n4 = n >> 2;
     for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
@@ -9414,6 +9538,14 @@ __global__ void p2p_ar_pubred_v5_hcpost_kernel(
             acc += staging_local[(size_t)((e & 1u) * world + r) * stride + ii];
         out[ii] = acc;
         ar5_hc_post_col1(hc_res, hc_post, hc_comb, hc_n, hc_h, ii, acc);
+    }
+    // A0's `epi` segment (reduce + fold, this block's slowest thread) — see the
+    // note in `p2p_ar_pubred_v5_kernel`.
+    if (probe) {
+        __syncthreads();
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            ar5_probe_report(s_probe[0], s_probe[1], clock64() - t_wait_done, site,
+                             my_rank);
     }
 }
 
@@ -9442,7 +9574,8 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost(
     p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
         hc_res, hc_post, hc_comb, hc_n, hc_h,
-        ferrite_ar_single_poll(), ferrite_ar_probe());
+        ferrite_ar_single_poll(), ferrite_ar_probe(), AR5_SITE_ATTN,
+        ferrite_ar_timeout_trap());
     return cudaGetLastError();
 }
 
@@ -9469,7 +9602,8 @@ extern "C" cudaError_t ferrite_p2p_ar_v5_hcpost_add(
     p2p_ar_pubred_v5_hcpost_kernel<<<blocks, threads, 0, s>>>(
         ready_tbl, epoch, staging_local, ready_local, out, world, my_rank, n, stride,
         hc_res, hc_post, hc_comb, hc_n, hc_h,
-        ferrite_ar_single_poll(), ferrite_ar_probe());
+        ferrite_ar_single_poll(), ferrite_ar_probe(), AR5_SITE_MOE,
+        ferrite_ar_timeout_trap());
     return cudaGetLastError();
 }
 
@@ -9509,10 +9643,14 @@ __global__ void p2p_ar_pubred_v5_hcpost_rows_kernel(
     int world, int my_rank, int n, int stride,
     float* __restrict__ hc_res, const float* __restrict__ hc_post,
     const float* __restrict__ hc_comb, int hc_n, int hc_h,
-    int single_poll, int probe) {
+    int single_poll, int probe, int site, int trap) {
     const unsigned e = *epoch;
-    __shared__ unsigned long long s_spin;   // A1 scratch
-    if (threadIdx.x == 0) s_spin = 0ull;
+    __shared__ unsigned long long s_probe[2];   // A0: [0] spin, [1] stamp segment
+    unsigned long long t_entry = 0ull;          // A0: block 0 / thread 0 only
+    if (probe) {
+        if (threadIdx.x == 0) { s_probe[0] = 0ull; s_probe[1] = 0ull; }
+        if (blockIdx.x == 0 && threadIdx.x == 0) t_entry = clock64();
+    }
     // Parallel stamp — identical protocol to `p2p_ar_pubred_v5_hcpost_kernel`.
     if (blockIdx.x == 0 && threadIdx.x < (unsigned)world) {
         atomicExch_system((unsigned int*)&ready_tbl[threadIdx.x][my_rank], e + 1u);
@@ -9521,9 +9659,12 @@ __global__ void p2p_ar_pubred_v5_hcpost_rows_kernel(
     __syncthreads();
     if (blockIdx.x == 0 && threadIdx.x == 0)
         *epoch = e + 1u;
-    ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, &s_spin);
+    ar5_wait_round(ready_local, epoch, e, world, my_rank, single_poll, probe, site,
+                   trap, s_probe, t_entry);
     __syncthreads();
-    if (probe && blockIdx.x == 0 && threadIdx.x == 0) ar5_probe_report(s_spin);
+    unsigned long long t_wait_done = 0ull;   // A0: block 0 / thread 0 only
+    if (probe && blockIdx.x == 0 && threadIdx.x == 0)
+        t_wait_done = clock64();
     const int step = gridDim.x * blockDim.x;
     const int n4 = n >> 2;
     for (int i4 = blockIdx.x * blockDim.x + threadIdx.x; i4 < n4; i4 += step) {
@@ -9557,6 +9698,14 @@ __global__ void p2p_ar_pubred_v5_hcpost_rows_kernel(
                          hc_post + (size_t)row * hc_n,
                          hc_comb + (size_t)row * hc_n * hc_n,
                          hc_n, hc_h, j, acc);
+    }
+    // A0's `epi` segment (reduce + fold, this block's slowest thread) — see the
+    // note in `p2p_ar_pubred_v5_kernel`.
+    if (probe) {
+        __syncthreads();
+        if (blockIdx.x == 0 && threadIdx.x == 0)
+            ar5_probe_report(s_probe[0], s_probe[1], clock64() - t_wait_done, site,
+                             my_rank);
     }
 }
 

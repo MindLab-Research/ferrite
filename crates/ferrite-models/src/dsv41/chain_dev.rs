@@ -9681,6 +9681,15 @@ impl<'a> DevChain<'a> {
     }
 
     fn v5_ledger_note(&self, pos: usize, arm: &str, k_emit: usize) {
+        // Do NOT "fix" this into a second tracking mechanism: the probe below
+        // feeds `v5_ledger_seen` for BOTH `pre` and `note`, so a pre→note epoch
+        // DROP (e.g. pos=15 pre=999 → note=54) already fires `[v5-ledger-RESET]`
+        // from INSIDE the probe. `note` does not need its own seen-table insert
+        // — adding one is dead code, because the drop has already been reported
+        // (and the entry already overwritten) by the time this call returns. The
+        // `Cell` below is the note-to-note `delta` ONLY; keeping it out of the
+        // seen table is deliberate and mirrors `v5_ledger_pre`'s rule that a pre
+        // line must not feed the Cell either.
         let Some((epoch, canary)) = self.v5_ledger_probe(pos, arm) else {
             return;
         };
