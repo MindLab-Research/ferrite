@@ -2181,3 +2181,21 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **seed-tap-align-impl 的交付**（gate `DSV41_SEED_ALIGN`，默认 OFF）：路线 A（`draft_forward(next, pos+1)`——seed 落 pos 与 tap 同位）+ ring 回绕按位置序展开 + **顺带发现的独立 bug：`note_ctx_rows` 的行 stride**（`dspark_dev.rs:534` 用 `slot*m+j` 而生产者 `chain_dev.rs:5823` 写 `slot*VERIFY_ROWS+r`——**slot≥1 的 target 层读错行**；6 行 arm 传 m=6 自愈，旧 5 行 arm 带病）。
 
 **已知待核**（`spec-state-pollution` 的清单）：verify 写了槽 `pos+1..pos+5` + compressor 的 pool/commit + clen + `s.ids_r` + `xq` 量化缓存 + indexer 候选——**rollback 恢复了哪些**？`dspark_commit` 的 `compress_replay` 与下一步 `step_dev` 的 append 是否双写？`s.ids` 与 `s.ids_r` 是否共享？
+
+## 2026-09-12 【根因定案】s.ids 无人回写——spec 的 commit 只推计数器、不写 token
+
+**verify-row0-systematic 的判词（代码级证据链，无猜测）**：
+| 环节 | 位置 | 事实 |
+|---|---|---|
+| 前向读哪个 token | `chain_dev.rs:3064-3072` | `step_body` 的 embedding 读 **`s.ids`**——形参 `token` 只用于 engram 的 host 回退 |
+| 谁写 `s.ids` | `:3303-3308`（sliced 同） | **只有主链 argmax**（`out` 就是 `s.ids`）⇒ `step_dev` 结束后 `s.ids = next`（pos+1 的 token） |
+| verify 写哪 | `:3846-3851` | `argmax_r + r`、`pos_ctr = NULL` ⇒ **verify 不更新 `s.ids`** |
+| commit 做什么 | `:5557-5578`、`:5670-5672` | 只 `rollback_keep + compress_replay + set_pos_ctr(pos_base+keep)`——**没有 token 的 H2D** |
+
+⇒ **任何 `k_acc ≥ 1` 的轮**：计数器推到 `pos+1+k_acc`，但 `s.ids` 仍是 `next`（pos+1 的 token）⇒ **下一轮在位置 `pos+1+k_acc` 嵌入的是落后 `k_acc` 个位置的旧 token** ⇒ 上下文被污染 ⇒ 模型把「同一 token 出现两次」当作模式自我延续（数字任务 100% 每个数两次、且能一路数到 400——**不是每步都错，是首次污染后自锁**）。
+
+**这解释了全部观测**：前 ~10 字符对（k_acc=0 的轮 `s.ids` 恰好正确）；emitted 逐项正确（verify 的 argmax 没错——**错的是下一轮的输入**）；EAGER 干净（每步 argmax 更新 `s.ids` ✓）；DBG 的 emitted 解码正确而文本崩（上下文 ≠ 文本）。
+
+**修复（已提交）**：`emitted` 构造后把**最后一个 token** 回写 `s.ids`（4 字节 H2D/轮，两臂 legacy/aligned 都加）。**结构性教训**：`s.ids`（自喂 token）、`pos_ctr`、`pos_rows`、`compress_len` 四个跨步不变量由不同机制分别推动——单行路径自洽，**spec 把推进从 1 变成 1+k_acc 时只照顾了计数器没照顾 token**。建议后续加 `debug_assert_eq!(download(s.ids), token)`（这个检查在第一步就会爆掉）。
+
+**判词的另两项**：verify 的 engram hash 写共享 cache 但 rollback 不覆盖（当前无害——被拒位置 ≥ 提交后的计数器且每步重写——但与缺陷同源，建议进 snapshot）；`pos_base` 的 host 算术与 device 读取的两条推导依赖 stream 次序（建议断言）。
