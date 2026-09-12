@@ -43,16 +43,31 @@ FAST_MATH_FLAG="--use_fast_math"
 if [ -n "${FERRITE_NO_FAST_MATH:-}" ]; then FAST_MATH_FLAG=""; fi
 
 # ---------------------------------------------------------------------------
-# OPT-IN in-tree kernel blocks (2026-09-12). Both tcgen05 gate/up arms live in
+# GATED in-tree kernel blocks (2026-09-12). Both tcgen05 gate/up arms live in
 # dsv41_experts_mxf4.cu behind a COMPILE-TIME #ifdef, so the .so either carries
 # their extern "C" entry point or it does not — the Rust side probes the SYMBOL
-# (`Device::supports_expert_tcgen05_mxf4`, device.rs:3438), never a version
-# string. Default OFF: the stock .so has neither symbol and the proven GEMV/GEMM
-# path stays in force.
-#   DSV41_BUILD_TCGEN05_MXF4=1      -> -DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1
-#   DSV41_BUILD_TCGEN05_MXF8F6F4=1  -> -DDSV41_TCGEN05_GATEUP_SKELETON=1
+# (`Device::supports_expert_tcgen05_mxf4`, device.rs:4289), never a version
+# string.
+#   mxf4 arm      DEFAULT ON — -DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1
+#                 -> symbol dsv41_expert_tcgen05_gate_up_mxf4
+#                 opt OUT with DSV41_BUILD_TCGEN05_MXF4=0|no|false|off|<empty>
+#   mxf8f6f4 arm  opt-in    — DSV41_BUILD_TCGEN05_MXF8F6F4=<nonempty>
+#                 -> -DDSV41_TCGEN05_GATEUP_SKELETON=1
 # The two macros are independent by design (dsv41_experts_mxf4.cu:3427 — nested
-# namespaces), so enabling one can never change the other block.
+# namespaces `tc5` vs `tc5::mxf4`), so enabling one can never change the other.
+#
+# WHY THE mxf4 ARM IS ON BY DEFAULT (2026-09-12, the fix for "dispatch 不可达").
+# The Rust dispatch test is a TWO-PART gate: this BUILD-TIME symbol probe AND the
+# process-static RUNTIME gate `DSV41_EXPERT_TCGEN05[_MXF4]` (default OFF, so the
+# proven GEMV/GEMM path stays in force). While the macro was opt-in, a stock .so
+# had no symbol at all, so `supports_expert_tcgen05_mxf4()` was false and every
+# `DSV41_EXPERT_TCGEN05=1` A/B silently measured the OLD path (one-shot warning
+# only). Compiling the block in unconditionally makes the symbol always present
+# and leaves the RUNTIME default OFF — exactly the "compiled in, still gated"
+# contract already documented at the end of this script. The symbol being
+# present is NOT sufficient to change any behaviour.
+# ⚠️ The mxf8f6f4 arm stays opt-in: it is the older 1X form (kRing=3) and is NOT
+# the routed-expert-residual (b) path.
 #
 # ⚠️ The flag set is folded into BUILD_ID below. Without that, a flag-less
 # rebuild of the same source would rewrite .build_id with the SAME string while
@@ -61,14 +76,20 @@ if [ -n "${FERRITE_NO_FAST_MATH:-}" ]; then FAST_MATH_FLAG=""; fi
 # both arms (the project's #1 measurement-bias trap). Consequence: ANY build
 # after this change gets a new id, so rebuild BOTH products (see
 # scripts/dsv41_serve_ab.sh for the one working order).
-# ⚠️ scripts/dsv41_serve_ab.sh SELF-HEALS a stale pair by re-running this script,
-# so an A/B that needs the skeleton must EXPORT DSV41_BUILD_TCGEN05_MXF4=1 —
-# the env is inherited by that rebuild and the symbol survives it.
+# ⚠️ scripts/dsv41_serve_ab.sh SELF-HEALS a stale pair by re-running this script.
+# That is now SAFE BY DEFAULT: the mxf4 symbol is in the flag set unless
+# explicitly opted out, so an UNEXPORTED rebuild keeps it (before this change it
+# dropped it — failure mode (a) in scripts/dsv41_tcgen05_mxf4_verify.sh). `=0`
+# is the only way to lose it, and then the Rust side sees no symbol and falls
+# back loudly.
 # ---------------------------------------------------------------------------
 SKELETON_FLAGS=()
-if [ -n "${DSV41_BUILD_TCGEN05_MXF4:-}" ]; then
-    SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1)
-fi
+# mxf4 (the (b) path): DEFAULT ON; an explicit 0/no/false/off — or an EMPTY
+# value, which used to mean OFF — opts out. Every other value keeps it ON.
+case "${DSV41_BUILD_TCGEN05_MXF4-1}" in
+    0|no|false|off|"") ;;
+    *) SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1) ;;
+esac
 if [ -n "${DSV41_BUILD_TCGEN05_MXF8F6F4:-}" ]; then
     SKELETON_FLAGS+=(-DDSV41_TCGEN05_GATEUP_SKELETON=1)
 fi
@@ -94,5 +115,10 @@ echo "$BUILD_ID" > "$(dirname "$0")/.build_id"
     -o "$OUT" "${SRCS[@]}"
 
 echo "built ${OUT} for sm_${ARCH} from ${SRCS[*]} (build_id ${BUILD_ID})"
+# NOTE: the `|| true` is load-bearing under `set -e`. With the mxf4 flag now
+# opt-out-able, SKELETON_FLAGS can be empty again, and a FALSE `A && B` as the
+# LAST statement of the script would make an otherwise successful build exit 1
+# (scripts/verify_graph_ab.sh:151-161 already had to work around exactly that).
 [ ${#SKELETON_FLAGS[@]} -gt 0 ] && \
-    echo "  skeleton flags: ${SKELETON_FLAGS[*]} (gated blocks are COMPILED IN; each still needs its runtime env gate)"
+    echo "  skeleton flags: ${SKELETON_FLAGS[*]} (gated blocks are COMPILED IN; each still needs its runtime env gate: DSV41_EXPERT_TCGEN05[_MXF4], plus DSV41_MOE_BATCH on and DSV41_EXPERT_ILV=0 for the routed mxf4 arm)" \
+    || true

@@ -726,9 +726,19 @@ static const int g_expert_fp4_mode = [] {
 // It is NOT fed to the gate/up launch: that path needs vec==2 for its fused
 // swiglu body (`fuse` requires g_expert_fp4_mode == 2). Set DSV41_DOWN_VEC4=0
 // to fall back to DSV41_EXPERT_FP4_MODE for the down launches (bisection).
+//
+// `DSV41_DOWN_4VAL` (the spec-side name, same polarity: an explicit "0" turns
+// the 4-value drain off, anything else keeps it) is an ALIAS of the same switch,
+// so an A/B can be driven by either name - the canonical, historical one stays
+// DSV41_DOWN_VEC4. Same precedent as the DSV41_VERIFY_ROPE_MROWS alias for
+// DSV41_ROW_FOLD_ROPE. An explicit "0" from EITHER name wins (conservative: the
+// rollback must never lose to the historical default).
 static const int g_down_fp4_mode = [] {
-    const char* e = getenv("DSV41_DOWN_VEC4");
-    if (e != nullptr && atoi(e) == 0) return g_expert_fp4_mode;
+    const char* names[2] = {"DSV41_DOWN_VEC4", "DSV41_DOWN_4VAL"};
+    for (int i = 0; i < 2; ++i) {
+        const char* e = getenv(names[i]);
+        if (e != nullptr && atoi(e) == 0) return g_expert_fp4_mode;
+    }
     return g_expert_fp4_mode == 2 ? 3 : g_expert_fp4_mode;
 }();
 
@@ -1749,6 +1759,49 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
             }
             acc = (a0 + a1) + (a2 + a3);
             for (int j = (nv2 << 9) + lane * 2; j < k; j += 64) {
+                const uint8_t byte = brow[j >> 1];
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                const float2 t = s_lut2[byte];
+                acc += s_act[j] * (t.x * sc);
+                acc += s_act[j + 1] * (t.y * sc);
+            }
+        } else if (vec == 3) {
+            // 4 values per lane for k < 512, where the vec==2 main loop above
+            // cannot run at all (nv2 = k >> 9 = 0 at the production k = 320).
+            // This is the VERBATIM mirror of expert_gemv_fp4_down_reduce_kernel's
+            // vec==3 body (same lane map, same group order, same
+            // one-scale-multiply-per-group shape): the down direction has TWO
+            // entries (the fused `_down_reduce` kernel and this batched one, which
+            // is its DSV41_DOWN_FUSE=0 fallback) and BOTH read `g_down_fp4_mode`,
+            // so the two branches are one unit - changing either one without the
+            // other silently drops the bit-parity contract between the fused and
+            // unfused arms (mode 3's lane map differs from mode 2's).
+            //
+            // One LDG.U16 = 2 packed bytes = 4 nibbles, one LDS.128 = the 4
+            // activations, two LDS.64 = the LUT pairs: 5 L1TEX ops per 4 values
+            // against 10 in the 2-value tail. The four values of a group sit
+            // inside ONE 32-value scale block (j = lane*4, block = j >> 5 =
+            // lane >> 3), so `sc` multiplies the accumulator once per group
+            // instead of once per element: 6 FP ops per 4 values.
+            const int nv4 = k >> 7;
+            float a0 = 0.f, a1 = 0.f;
+            for (int g = 0; g < nv4; ++g) {
+                const int j = (g << 7) + (lane << 2);
+                const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
+                const uint16_t w =
+                    *reinterpret_cast<const uint16_t*>(brow + (g << 6) + (lane << 1));
+                const float4 av = *reinterpret_cast<const float4*>(s_act + j);
+                const float2 t0 = s_lut2[w & 0xFFu];
+                const float2 t1 = s_lut2[(w >> 8) & 0xFFu];
+                float p0 = av.x * t0.x;
+                p0 = fmaf(av.y, t0.y, p0);
+                float p1 = av.z * t1.x;
+                p1 = fmaf(av.w, t1.y, p1);
+                a0 = fmaf(sc, p0, a0);
+                a1 = fmaf(sc, p1, a1);
+            }
+            acc = a0 + a1;
+            for (int j = (nv4 << 7) + lane * 2; j < k; j += 64) {
                 const uint8_t byte = brow[j >> 1];
                 const float sc = __uint_as_float(((uint32_t)srow[j >> 5]) << 23);
                 const float2 t = s_lut2[byte];
@@ -4177,9 +4230,23 @@ extern "C" int dsv41_expert_tcgen05_gate_up_mxf4(
     int dim, float limit, int slots, const uint8_t* w1_base, long w1_stride,
     const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
     const uint8_t* w3s_base, long w3s_stride, const int* ids, cudaStream_t stream) {
+    // Runtime gate, read ONCE per process (a per-call getenv is a capture
+    // hazard, plan §5). TWO NAMES arm the arm, both with the strict
+    // "first char == '1'" rule so `=0` and the unset default are both OFF:
+    //   DSV41_EXPERT_TCGEN05_MXF4  the long name (the historical one)
+    //   DSV41_EXPERT_TCGEN05       the short alias the (b) task passes
+    // ⚠️ MUST stay byte-for-byte equivalent to the Rust mirror
+    // `chain_dev.rs::expert_tcgen05_mxf4()`. If the two disagree, the Rust side
+    // believes the step runs the tcgen05 arm while the .so keeps the paired
+    // GEMV, i.e. BOTH A/B arms measure the OLD path (the project's #1
+    // measurement-bias trap).
     static const int enabled = [] {
-        const char* e = getenv("DSV41_EXPERT_TCGEN05_MXF4");
-        return (e != nullptr && e[0] == '1') ? 1 : 0;  // default OFF until serve A/B
+        const char* names[2] = {"DSV41_EXPERT_TCGEN05_MXF4", "DSV41_EXPERT_TCGEN05"};
+        for (const char* n : names) {
+            const char* e = getenv(n);
+            if (e != nullptr && e[0] == '1') return 1;
+        }
+        return 0;  // default OFF until the serve A/B
     }();
     if (!enabled) return 0;
     if (inter <= 0 || dim <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;

@@ -626,21 +626,34 @@ pub(crate) fn no_gemv_fp4() -> bool {
     *F.get_or_init(|| std::env::var_os("DSV41_NO_GEMV_FP4").is_some())
 }
 
-/// DSV41_EXPERT_TCGEN05_MXF4=1 arms the tcgen05 MXFP4 swapAB gate/up
-/// (`tc5::mxf4::expert_tcgen05_gateup_mxf4_kernel`, `dsv41_experts_mxf4.cu:4007`).
-/// Mirror of the launcher's own gate test (`e[0] == '1'`, a strict "1..." prefix,
-/// NOT the usual `!= "0"`: the default is OFF and stays OFF if the value is
-/// anything else). Read ONCE and cached: the `.so` reads the same variable once
-/// per process, so a per-call getenv here could only ever add a hot-path slip and
-/// a capture hazard (plan §5), never a different decision.
+/// `DSV41_EXPERT_TCGEN05_MXF4=1` (or its short alias `DSV41_EXPERT_TCGEN05=1`)
+/// arms the tcgen05 MXFP4 swapAB gate/up
+/// (`tc5::mxf4::expert_tcgen05_gateup_mxf4_kernel`, `dsv41_experts_mxf4.cu:3805`).
 ///
-/// ⚠️ The gate is armed by the `.so`, which loads with a
-/// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON` build only — the stock build has no such
-/// symbol and `Device::supports_expert_tcgen05_mxf4()` is false.
+/// Mirror of the launcher's own gate test: either name, first char `'1'` — a
+/// strict "1..." prefix, NOT the usual `!= "0"`, so the default is OFF and
+/// `=0` / anything else stays OFF. Read ONCE and cached: the `.so` reads the same
+/// variables once per process, so a per-call getenv here could only ever add a
+/// hot-path slip and a capture hazard (plan §5), never a different decision.
+///
+/// ⚠️ TWO-NAME ORDER AND STRICTNESS ARE THE CONTRACT. The `.so` tests
+/// `DSV41_EXPERT_TCGEN05_MXF4` then `DSV41_EXPERT_TCGEN05`
+/// (`dsv41_experts_mxf4.cu`, the launcher's `enabled` lambda). If this list and
+/// that one ever disagree, the Rust side believes the step runs the tcgen05 arm
+/// while the `.so` keeps the paired GEMV — both A/B arms then measure the OLD
+/// path (the project's #1 measurement-bias trap). Keep the two tests identical.
+///
+/// ⚠️ The gate can only arm a `.so` that CARRIES the symbol. Since 2026-09-12
+/// `build.sh` compiles `DSV41_TCGEN05_GATEUP_MXF4_SKELETON` in BY DEFAULT (opt
+/// out with `DSV41_BUILD_TCGEN05_MXF4=0`), so a stock build of that revision now
+/// satisfies `Device::supports_expert_tcgen05_mxf4()`. This gate itself is still
+/// default OFF, so no behaviour changes unless an operator sets it.
 pub(crate) fn expert_tcgen05_mxf4() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
-        std::env::var("DSV41_EXPERT_TCGEN05_MXF4").map(|v| v.starts_with('1')).unwrap_or(false)
+        ["DSV41_EXPERT_TCGEN05_MXF4", "DSV41_EXPERT_TCGEN05"]
+            .iter()
+            .any(|n| std::env::var(n).map(|v| v.starts_with('1')).unwrap_or(false))
     })
 }
 
