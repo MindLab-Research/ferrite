@@ -312,10 +312,51 @@ impl Collective {
     /// world A/A3), taken for free on a read the ledger already pays.
     pub const V5_LEDGER_CANARY: u32 = 0xDEAD_BEEF;
 
-    /// Byte offset of the canary from `ctr_at`. The epoch is at `ctr_at` and
-    /// `A4`'s broadcast flag (`DSV41_AR_SINGLE_POLL`) at `ctr_at + 4`, so the
-    /// canary starts the still-`0`-and-unused tail at `ctr_at + 8`.
+    /// Byte offset of the FIRST canary word from `ctr_at`. The epoch is at
+    /// `ctr_at` and `A4`'s broadcast flag (`DSV41_AR_SINGLE_POLL`) at
+    /// `ctr_at + 4`, so the canaries start the still-`0`-and-unused tail at
+    /// `ctr_at + 8`.
     pub const V5_LEDGER_CANARY_OFF: usize = 8;
+
+    /// Byte offsets (from `ctr_at`) of the canary WORDS, all inside `ctr_at`'s
+    /// 64-byte tail and none of them colliding with the epoch (`+0`) or A4's
+    /// broadcast flag (`+4`).
+    ///
+    /// ONE word was not enough. The epoch is reached in 8-byte-wide steps (a
+    /// `float4` store, the v5 store's own granularity) from two directions, so a
+    /// single word at `+8` can be stepped over: a clobber that lands on
+    /// `+0..+8` (epoch + flag) leaves it intact and the ledger reads a
+    /// CORRUPTED epoch as a clean one. Four words at `+8/+16/+32/+48` make any
+    /// write wide enough to reach the epoch (or the tail's head) hit at least
+    /// one of them, and `[v5-ledger-CANARY]` names WHICH one. See
+    /// `docs/agent/epoch54-final-fix-path.md` §5-A2′ item 2.
+    pub const V5_LEDGER_CANARY_OFFS: [usize; 4] =
+        [Self::V5_LEDGER_CANARY_OFF, 16, 32, 48];
+
+    /// 8 bytes of slack between the LAST `reduced` slot and `ctr_at`, filled
+    /// with [`Self::V5_LEDGER_GUARD`] and written by **no kernel in the tree**.
+    ///
+    /// Why the epoch needed its own margin. The `reduced` array (`world` u32
+    /// slots, ending exactly 4 bytes below `ctr_at` before this) has a writer in
+    /// the v2 device path (`ar_mark` / `ar_reduce`, `dsv41_glue.cu`) and is the
+    /// natural landing zone of any 1–2 word upward overrun from it — landing on
+    /// `ctr_at + 0` (the epoch) and `ctr_at + 4` (A4's flag) while leaving the
+    /// canary at `+8` untouched. The epoch was therefore structurally exposed
+    /// with no guard: the 54-epoch signature (a zeroed epoch re-counting) is
+    /// exactly this shape, read as "clean" because the single canary survived.
+    /// Moving `ctr_at` up by this margin both ABSORBS such an overrun (the
+    /// epoch can no longer be the first thing hit) and DETECTS it (the guard
+    /// words change). See `docs/agent/epoch54-final-fix-path.md` §2.3 / §5-A2′
+    /// item 1.
+    pub const V5_LEDGER_GUARD_BYTES: usize = 8;
+
+    /// The guard's magic. Shares [`Self::V5_LEDGER_CANARY`]'s value on purpose —
+    /// one expected constant covers both regions, and the offset the ledger
+    /// reports (guard vs canary slot) already says which one was hit.
+    pub const V5_LEDGER_GUARD: u32 = Self::V5_LEDGER_CANARY;
+
+    /// Number of guard words between `reduced` and `ctr_at`.
+    pub const V5_LEDGER_GUARD_WORDS: usize = Self::V5_LEDGER_GUARD_BYTES / 4;
 
     /// `staging` is `world * bytes`. The peer addresses are not known until
     /// every rank has allocated theirs, so this starts empty and `set_peers`
@@ -335,7 +376,12 @@ impl Collective {
         // waits on the peers' `reduced` stamps before touching it.
         let stamps_at = 2 * world * bytes;
         let reduced_at = stamps_at + world * 4;
-        let ctr_at = reduced_at + world * 4;
+        // The `reduced` array's guard sits between its last slot and the epoch:
+        // `ctr_at` used to start on the very byte after `reduced[world-1]`, so a
+        // 1–2 word upward overrun of `reduced` landed DIRECTLY on the epoch (and
+        // A4's flag) with no guard and no canary in between — see
+        // [`Self::V5_LEDGER_GUARD_BYTES`].
+        let ctr_at = reduced_at + world * 4 + Self::V5_LEDGER_GUARD_BYTES;
         // `ctr_at + 4` (the word right after the v5 epoch) is the A4 broadcast
         // flag: `DSV41_AR_SINGLE_POLL` makes the pubred kernels' block 0 wait on
         // the peers' stamps and then publish `e + 1` there, so the other blocks
@@ -352,19 +398,36 @@ impl Collective {
         // garbage counter means the stamp is never published and the reduce
         // spins forever — exactly the dev-path hang the micro-benchmark found.
         dev.zero_at(staging.ptr, ctr_at + 64)?;
-        // The v5 ledger's canary: a magic word in the epoch's 64-byte tail that NO
+        // The `reduced` array's guard: it sits between the last `reduced` slot and
+        // the epoch, so an upward overrun of `reduced` changes THESE words instead
+        // of `ctr_at` — and the ledger names the region. See
+        // [`Self::V5_LEDGER_GUARD_BYTES`] and [`Self::guard_dev`].
+        let guard = Self::V5_LEDGER_GUARD.to_le_bytes();
+        for w in 0..Self::V5_LEDGER_GUARD_WORDS {
+            dev.upload_from(
+                (staging.ptr as *mut u8)
+                    .wrapping_add(reduced_at + world * 4 + w * guard.len())
+                    as *mut std::ffi::c_void,
+                guard.as_ptr() as *const std::ffi::c_void,
+                guard.len(),
+            )?;
+        }
+        // The v5 ledger's canaries: magic words in the epoch's 64-byte tail that NO
         // kernel writes, so the ledger can tell "read the epoch" from "read a word
         // some out-of-bounds payload write clobbered" — the world A/A3 evidence the
-        // fix-11 design's D1 is built to take. See [`Self::V5_LEDGER_CANARY`] and
-        // [`Self::canary_dev`]. Written once, synchronously (cudaMemcpy), so the
+        // fix-11 design's D1 is built to take. FOUR of them, because a clobber that
+        // reaches the epoch can step over a single word (see
+        // [`Self::V5_LEDGER_CANARY_OFFS`]). See [`Self::V5_LEDGER_CANARY`] and
+        // [`Self::canary_slot_dev`]. Written once, synchronously (cudaMemcpy), so the
         // stack buffer's lifetime is not an issue.
         let canary = Self::V5_LEDGER_CANARY.to_le_bytes();
-        dev.upload_from(
-            (staging.ptr as *mut u8).wrapping_add(ctr_at + Self::V5_LEDGER_CANARY_OFF)
-                as *mut std::ffi::c_void,
-            canary.as_ptr() as *const std::ffi::c_void,
-            canary.len(),
-        )?;
+        for &off in Self::V5_LEDGER_CANARY_OFFS.iter() {
+            dev.upload_from(
+                (staging.ptr as *mut u8).wrapping_add(ctr_at + off) as *mut std::ffi::c_void,
+                canary.as_ptr() as *const std::ffi::c_void,
+                canary.len(),
+            )?;
+        }
         let peer_stamps = dev.alloc(world * 8)?;
         let peer_slots = dev.alloc(world * 8)?;
         let peer_reduced = dev.alloc(world * 8)?;
@@ -456,14 +519,34 @@ impl Collective {
         (self.staging.ptr as *mut u8).wrapping_add(self.ctr_at) as *mut std::ffi::c_uint
     }
 
-    /// The v5 round LEDGER's canary word (`staging + ctr_at + 8`) — see
-    /// [`Self::V5_LEDGER_CANARY`]. Read-only by design: no kernel writes it, so a
-    /// read that does not match the magic is proof that something outside the
-    /// epoch path wrote into its 64-byte tail.
+    /// The v5 round LEDGER's FIRST canary word (`staging + ctr_at + 8`) — see
+    /// [`Self::V5_LEDGER_CANARY`] and [`Self::canary_slot_dev`]. Read-only by
+    /// design: no kernel writes it, so a read that does not match the magic is
+    /// proof that something outside the epoch path wrote into its 64-byte tail.
     pub fn canary_dev(&self) -> *const std::ffi::c_uint {
+        self.canary_slot_dev(0)
+    }
+
+    /// Canary word `slot` of [`Self::V5_LEDGER_CANARY_OFFS`] (`staging + ctr_at
+    /// + the slot's offset`). Read-only by design, exactly like
+    /// [`Self::canary_dev`]; `slot` must be `< ` [`Self::V5_LEDGER_CANARY_OFFS`]
+    /// `.len()` (the ledger loops that length).
+    pub fn canary_slot_dev(&self, slot: usize) -> *const std::ffi::c_uint {
         (self.staging.ptr as *const u8)
-            .wrapping_add(self.ctr_at + Self::V5_LEDGER_CANARY_OFF)
+            .wrapping_add(self.ctr_at + Self::V5_LEDGER_CANARY_OFFS[slot])
             as *const std::ffi::c_uint
+    }
+
+    /// The `reduced` array's guard words (`staging + reduced_at + world * 4`) —
+    /// see [`Self::V5_LEDGER_GUARD_BYTES`]. Read-only by design: no kernel
+    /// writes them, so a changed guard word is proof that the `reduced` array
+    /// was overrun by 1–2 words — the shape that used to land on `ctr_at`
+    /// (the epoch) itself.
+    pub fn guard_dev(&self) -> *const std::ffi::c_uint {
+        (self.staging.ptr as *const u8)
+            .wrapping_add(self.reduced_at + self.world * 4)
+            as *const std::ffi::c_uint
+    }
     }
 
     /// This rank's own ready row (`staging + stamps_at`).
@@ -499,6 +582,27 @@ impl Collective {
         (self.bytes / 4) as i32
     }
 
+    /// The v5 AR entries' length gate.
+    ///
+    /// `publish` (the v2 path) has always asserted `len <= self.bytes`, and the
+    /// zcopy reason is the same here: every v5 kernel walks the slot with
+    /// `stride = bytes/4` and stops at `n = len/4`, so a payload larger than the
+    /// slot writes PAST it — into the next rank's slot, the ready row, the
+    /// `reduced` array's tail and finally `ctr_at` (the epoch) and its canary
+    /// tail. That overrun is the shape behind the epoch-54 signature (an epoch
+    /// seen zeroed and re-counted with a canary that only a wide clobber
+    /// reaches), and the fused/`_rows`/`_add` entries — unlike `publish` — had
+    /// no gate at all. Failing LOUDLY here beats silently corrupting the v5
+    /// round state of every rank in the world.
+    fn check_payload(&self, len: usize) {
+        assert!(
+            len <= self.bytes,
+            "collective payload {len} > slot {} (a v5 AR payload must fit the staging slot \
+             — see docs/agent/epoch54-final-fix-path.md §5-A2′)",
+            self.bytes
+        );
+    }
+
     /// AR v5 publish + reduce ONLY: the store half already ran inside the producer
     /// kernel's epilogue (see `Device::gemm_fp8_mx_ar`), so this skips
     /// `p2p_ar_store_v5_kernel` and goes straight to the pubred kernel. `len` must
@@ -514,6 +618,7 @@ impl Collective {
             ar_v5(),
             "fused-store AR requires AR v5 (the producer kernel read *epoch)"
         );
+        self.check_payload(len);
         let n = (len / 4) as c_int;
         let stride = self.slot_stride_elems();
         let base8 = self.staging.ptr as *const u8;
@@ -616,6 +721,7 @@ impl Collective {
         if !ar_v5() {
             return Ok(false);
         }
+        self.check_payload(len);
         let n = (len / 4) as c_int;
         let stride = self.slot_stride_elems();
         let base8 = self.staging.ptr as *const u8;
