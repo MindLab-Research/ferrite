@@ -44,8 +44,6 @@ static void case_causal(int window, int m, int base) {
     // indices: row r's causal window ends at base + r
     std::vector<int32_t> got((size_t)m * window), exp((size_t)m * window);
     cudaMemcpy(got.data(), idxs, got.size() * sizeof(int32_t), cudaMemcpyDeviceToHost);
-    for (int r = 0; r < m; ++r) ref_row(std::vector<int32_t>(exp.begin() + (size_t)r * window, exp.begin() + (size_t)((size_t)r + 1) * window), base + r, window), 0;
-    // (the above comma trick does not work; redo plainly)
     for (int r = 0; r < m; ++r) {
         std::vector<int32_t> row((size_t)window);
         ref_row(row, base + r, window);
