@@ -1131,3 +1131,258 @@ extern "C" int dsv41_ar_mark(const unsigned long long* peer_reduced, int world, 
     ar_mark_kernel<<<1, 32, 0, s>>>(peer_reduced, world, rank, round);
     return (int)cudaGetLastError();
 }
+
+// ===========================================================================
+// DSpark Markov head  (dspark.rs::forward_head, the sequential sampling loop)
+// ===========================================================================
+//
+// The draft head's last stage. For draft row `step` (0-based), exactly as the
+// host reference does it:
+//
+//   1. read the ALREADY SAMPLED token `ids[step]` and its Markov embedding row
+//      `er = markov_embed[ids[step]]`                                    [mr]
+//   2. bias that row's logits IN PLACE, one GEMV over the vocabulary:
+//        logits[step][v] += <markov_head[v], er>                         [vocab]
+//   3. sample the next token `ids[step+1]` from the biased row
+//   4. score the row's confidence from the collapsed hidden and `er`
+//
+// One launch covers ONE step; `draft_forward` issues `bs` of them in order,
+// because `er` depends on the previous step's sample and nothing on the device
+// can break that chain (a grid-wide sync needs a cooperative launch the
+// runtime does not expose, and a "one block, loop over the vocabulary" form
+// would read the 128 MiB Markov head at one SM's bandwidth: measured single-SM
+// streaming is ~50 GB/s, i.e. ~2.6 ms per step against a ~1 ms whole-draft
+// budget). The many-block form below reads the head ONCE per step at full HBM
+// bandwidth (~35 us for 132 MiB at 3.8 TB/s effective) and is therefore the
+// only form that fits the budget.
+//
+// ---- sampling numerics (the discipline the caller must preserve) ----
+// `ops::gumbel_argmax` is `argmax(logits)` when `temperature == 0`, and
+// otherwise `argmax(softmax(logits/t) / max(u, 1e-30))`. The chain calls it
+// with `u == 1.0` for EVERY entry (chain.rs uploads `vec![1.0; bs * vocab]`),
+// for which the ratio is `softmax(...)` = `exp((l-mx)/t) / den`. `den` is the
+// SAME positive constant for every `v`, `expf` and division by a positive
+// constant are both monotone in IEEE-754, so the winner is exactly
+// `argmax(logits)` with ties going to the LOWEST index (the host's ascending
+// strict-`>` scan). The kernel therefore reduces to one stable argmax of the
+// biased row, which is bit-identical to the host at every temperature and
+// needs a single pass. A future NON-constant `u` (per-entry Gumbel noise) would
+// need `den` and hence a second pass - it is deliberately not implemented here.
+//
+// Tie rule: the packed key is (monotone(value) << 32) | (0xFFFFFFFF - v), the
+// same construction `argmax_kernel` (dsv41_kernels.cu) uses, so a plain
+// unsigned max over the keys picks the largest value and, among equals, the
+// lowest index.
+__device__ __forceinline__ unsigned dspark_markov_f2key(float f) {
+    const unsigned b = __float_as_uint(f);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// Warps per block (the block reduction holds up to 32).
+#define DSPARK_MARKOV_WARPS 8
+// Vocab rows each warp covers before the grid strides: 129280 rows / (8*8)
+// = 2020 blocks, i.e. one partial per block with a cheap last-block fold.
+#define DSPARK_MARKOV_ROWS_PER_WARP 8
+// Hard cap on the grid == the size of the caller's `partial` scratch.
+#define DSPARK_MARKOV_MAX_BLOCKS 2048
+
+__global__ void dspark_markov_head_kernel(
+    float* __restrict__ logits,                 // [bs, vocab], row `step` biased in place
+    const float* __restrict__ h,                // [bs, dim] collapsed (PRE-norm) hidden
+    const float* __restrict__ markov_embed,     // [vocab, mr]
+    const float* __restrict__ markov_head,      // [vocab, mr]
+    const float* __restrict__ confidence_proj,  // [dim + mr] or null
+    int* __restrict__ ids,                      // [bs + 1]; ids[step] in, ids[step+1] out
+    float* __restrict__ confidence,             // [bs] or null
+    int dim, int vocab, int mr, int step,
+    unsigned long long* __restrict__ partial,   // [gridDim.x] scratch
+    unsigned* __restrict__ ctr) {               // 1 u32, starts at 0, self-resets
+    const int lane = threadIdx.x & 31;
+    const int wid = threadIdx.x >> 5;
+    const int nwarp = (int)blockDim.x >> 5;
+    const int tok = ids[step];
+    const float* __restrict__ er = markov_embed + (size_t)tok * (size_t)mr;
+    float* __restrict__ lrow = logits + (size_t)step * (size_t)vocab;
+
+    // ---- per-warp: one vocab row per iteration, all 32 lanes on its [mr] dot ----
+    // A whole warp per row keeps the markov_head read fully coalesced (lanes 0..31
+    // walk consecutive 4-float groups of one row); a thread-per-row layout would
+    // stride by `mr` and waste 7/8 of every 128 B line.
+    unsigned long long best = 0ull;
+    // EVERY lane of the warp walks the same `v` sequence (the bounds do not
+    // depend on the lane), so the shuffle reductions below are always executed
+    // with a fully converged warp - the mask is 0xFFFFFFFF throughout.
+    for (int v = blockIdx.x * nwarp + wid; v < vocab; v += gridDim.x * nwarp) {
+        const float* __restrict__ wr = markov_head + (size_t)v * (size_t)mr;
+        float acc = 0.f;
+        if ((mr & 3) == 0) {
+            // Rows are 16 B aligned whenever mr % 4 == 0 (the tensor base is a
+            // cudaMalloc pointer), so the float4 form is safe.
+            const float4* w4 = reinterpret_cast<const float4*>(wr);
+            const float4* e4 = reinterpret_cast<const float4*>(er);
+            const int n4 = mr >> 2;
+            for (int c = lane; c < n4; c += 32) {
+                const float4 wv = w4[c], ev = e4[c];
+                acc = __fmaf_rn(wv.x, ev.x, acc);
+                acc = __fmaf_rn(wv.y, ev.y, acc);
+                acc = __fmaf_rn(wv.z, ev.z, acc);
+                acc = __fmaf_rn(wv.w, ev.w, acc);
+            }
+        } else {
+            for (int c = lane; c < mr; c += 32) acc = __fmaf_rn(wr[c], er[c], acc);
+        }
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) {
+            const float l = lrow[v] + acc;
+            lrow[v] = l;   // the bias is applied ONCE per row (row `step` only)
+            const unsigned long long k =
+                ((unsigned long long)dspark_markov_f2key(l) << 32) |
+                (unsigned long long)(0xFFFFFFFFu - (unsigned)v);
+            if (k > best) best = k;
+        }
+    }
+    #pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, best, off);
+        if (o > best) best = o;
+    }
+
+    // ---- block reduction ----
+    __shared__ unsigned long long sb[32];
+    if (lane == 0) sb[wid] = best;
+    __syncthreads();
+    if (wid == 0) {
+        unsigned long long b2 = (lane < nwarp) ? sb[lane] : 0ull;
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, b2, off);
+            if (o > b2) b2 = o;
+        }
+        if (lane == 0) partial[blockIdx.x] = b2;
+    }
+    // The `sb` slots are reused by the last-block fold below; this barrier is
+    // what stops a late warp from clobbering them before warp 0 has read them.
+    __syncthreads();
+
+    // ---- confidence (independent of the argmax; block 0's first warp) ----
+    if (confidence != nullptr && confidence_proj != nullptr && blockIdx.x == 0 && wid == 0) {
+        float acc = 0.f;
+        const float* __restrict__ hr = h + (size_t)step * (size_t)dim;
+        for (int c = lane; c < dim; c += 32) acc = __fmaf_rn(confidence_proj[c], hr[c], acc);
+        for (int c = lane; c < mr; c += 32)
+            acc = __fmaf_rn(confidence_proj[dim + c], er[c], acc);
+        for (int off = 16; off > 0; off >>= 1) acc += __shfl_xor_sync(0xFFFFFFFFu, acc, off);
+        if (lane == 0) confidence[step] = acc;
+    }
+
+    // ---- last-block election: fold the per-block winners and publish the id ----
+    // Standard counting barrier: every block publishes its partial, fences, then
+    // takes a ticket; the block that takes the LAST ticket sees every partial.
+    __threadfence();
+    __shared__ unsigned is_last;
+    if (threadIdx.x == 0) {
+        const unsigned old = atomicAdd(ctr, 1u);
+        is_last = (old == gridDim.x - 1) ? 1u : 0u;
+    }
+    __syncthreads();
+    if (is_last) {
+        __threadfence();
+        unsigned long long g = 0ull;
+        for (int i = threadIdx.x; i < gridDim.x; i += blockDim.x) {
+            const unsigned long long k = partial[i];
+            if (k > g) g = k;
+        }
+        #pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+            const unsigned long long o = __shfl_xor_sync(0xFFFFFFFFu, g, off);
+            if (o > g) g = o;
+        }
+        if (lane == 0) sb[wid] = g;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            g = 0ull;
+            for (int w = 0; w < nwarp; w++) {
+                if (sb[w] > g) g = sb[w];
+            }
+            ids[step + 1] = (int)(0xFFFFFFFFu - (unsigned)(g & 0xFFFFFFFFu));
+            // Self-reset: the NEXT step's launch (same stream) must start at zero.
+            // Every block has already taken its ticket, so nothing can race this.
+            *ctr = 0u;
+        }
+    }
+}
+
+extern "C" int dsv41_dspark_markov_head(float* logits, const float* h, const float* markov_embed,
+                                        const float* markov_head, const float* confidence_proj,
+                                        int* ids, float* confidence, int dim, int vocab, int mr,
+                                        int step, unsigned long long* partial, unsigned* ctr,
+                                        cudaStream_t s) {
+    if (vocab <= 0 || mr <= 0 || dim <= 0 || step < 0) return (int)cudaErrorInvalidValue;
+    if (partial == nullptr || ctr == nullptr) return (int)cudaErrorInvalidValue;
+    int blocks = (vocab + DSPARK_MARKOV_WARPS * DSPARK_MARKOV_ROWS_PER_WARP - 1) /
+                 (DSPARK_MARKOV_WARPS * DSPARK_MARKOV_ROWS_PER_WARP);
+    if (blocks < 1) blocks = 1;
+    if (blocks > DSPARK_MARKOV_MAX_BLOCKS) blocks = DSPARK_MARKOV_MAX_BLOCKS;
+    dspark_markov_head_kernel<<<blocks, DSPARK_MARKOV_WARPS * 32, 0, s>>>(
+        logits, h, markov_embed, markov_head, confidence_proj, ids, confidence, dim, vocab, mr,
+        step, partial, ctr);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// DSpark verify: the m-row block append + per-row CAUSAL window indices, in
+// one launch (the verify twin of `ring_win_fused_kernel`).
+//
+// The verify block's rows sit at positions base..base+m-1 where base =
+// *pos_ctr (the anchor's position - the counter is advanced by the argmax at
+// the END of a step, so during the verify forward it still holds the anchor).
+// Row r's query must attend everything up to and including position base+r;
+// its window enumerates positions [base+r-window+1 .. base+r], whose slots are
+// exactly the block's own rows 0..r plus the surviving history - the ring
+// geometry gives the intra-block causal order for free (window > m always).
+//
+// The append half writes all m kv rows into their slots ((base+j) % window,
+// mutually distinct because m <= window). The indices half fills
+// idxs[r * window + c] with the same arithmetic as `window_idxs_kernel`'s
+// decode branch, with start_pos = base + r per row.
+__global__ void verify_ring_win_kernel(float* __restrict__ ring, const float* __restrict__ kv,
+                                       const int* __restrict__ pos_ctr, int window, int hd, int m,
+                                       int32_t* __restrict__ idxs) {
+    const int base = *pos_ctr;
+    // ---- append half: m*hd elements, strided grid-stride loop ----
+    const int total = m * hd;
+    for (int e = threadIdx.x + (int)blockIdx.x * blockDim.x; e < total;
+         e += gridDim.x * blockDim.x) {
+        const int j = e / hd, i = e % hd;
+        const int slot = (base + j) % window;
+        ring[(size_t)slot * (size_t)hd + (size_t)i] = kv[(size_t)e];
+    }
+    // ---- indices half: m*window entries, first block only (it is tiny) ----
+    if (blockIdx.x != 0) return;
+    for (int e = threadIdx.x; e < m * window; e += blockDim.x) {
+        const int r = e / window, c = e % window;
+        const int start_pos = base + r;
+        int idx;
+        if (start_pos == 0) {
+            idx = (c == 0) ? 0 : -1;
+        } else {
+            const int oldest = (start_pos % window) + 1;
+            long long v = ((long long)c < (long long)window - oldest)
+                              ? (long long)oldest + c
+                              : (long long)c - ((long long)window - oldest);
+            if (v > (long long)start_pos) v = -1;
+            idx = (int)v;
+        }
+        idxs[(size_t)e] = idx;
+    }
+}
+
+extern "C" int dsv41_verify_ring_win(float* ring, const float* kv, const int* pos_ctr,
+                                     int window, int hd, int m, int32_t* idxs,
+                                     cudaStream_t s) {
+    if (window <= 0 || m <= 0) return (int)cudaSuccess;
+    const int n = (m * hd > m * window) ? m * hd : m * window;
+    const unsigned blocks = (unsigned)((n + 127) / 128);
+    verify_ring_win_kernel<<<blocks, 128, 0, s>>>(ring, kv, pos_ctr, window, hd, m, idxs);
+    return (int)cudaGetLastError();
+}

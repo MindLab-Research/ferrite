@@ -686,6 +686,34 @@ extern "C" {
         dim: i32,
         stream: CuStream,
     ) -> i32;
+
+    /// DSpark draft head, ONE sequential step of `dspark.rs::forward_head`:
+    /// bias `logits[step, :]` in place with `<markov_head[v], markov_embed[ids[step]]>`,
+    /// sample `ids[step + 1]` from the biased row (a stable argmax - see the
+    /// kernel comment for why this is bit-identical to `ops::gumbel_argmax` at
+    /// the reference's constant `u == 1`), and score `confidence[step]`.
+    ///
+    /// `partial` is `[gridDim.x]` u64 scratch (size it to `MAX_BLOCKS` = 2048)
+    /// and `ctr` is ONE u32 that must be zero at allocation: the kernel's last
+    /// elected block resets it before returning, which is what makes the next
+    /// step's launch (and a captured graph's replay) start clean.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_dspark_markov_head(
+        logits: *mut f32,
+        h: *const f32,
+        markov_embed: *const f32,
+        markov_head: *const f32,
+        confidence_proj: *const f32,
+        ids: *mut i32,
+        confidence: *mut f32,
+        dim: i32,
+        vocab: i32,
+        markov_rank: i32,
+        step: i32,
+        partial: *mut u64,
+        ctr: *mut u32,
+        stream: CuStream,
+    ) -> i32;
 }
 
 /// Convenience: the reference's `score_func` selector.

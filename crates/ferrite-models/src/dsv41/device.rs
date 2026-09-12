@@ -384,6 +384,20 @@ struct Kernels {
     ring_win_fuse_ph: Option<unsafe extern "C" fn(
         *mut f32, *const f32, *const c_int, c_int, c_int, *mut i32, *const c_int, c_int, CuStream,
     ) -> c_int>,
+    // DSpark verify: the m-row block append + per-row CAUSAL window indices in
+    // one launch (the multi-row twin of `ring_win_fuse`). Row r's window ends
+    // at *pos_ctr + r, so the intra-block causal order falls out of the ring
+    // geometry. `idxs` is `[m, window]`.
+    verify_ring_win: Option<unsafe extern "C" fn(
+        *mut f32,
+        *const f32,
+        *const c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut i32,
+        CuStream,
+    ) -> c_int>,
     index_k_publish:
         Option<unsafe extern "C" fn(*mut f32, *const f32, *const c_int, c_int, CuStream) -> c_int>,
     compress_commit: Option<
@@ -540,6 +554,13 @@ struct Kernels {
     gather_rows: Option<unsafe extern "C" fn(*const f32, *const i32, *mut f32, c_int, c_int, CuStream) -> c_int>,
     scatter_add_rows: Option<
         unsafe extern "C" fn(*const f32, *const i32, *const f32, *mut f32, c_int, c_int, CuStream) -> c_int,
+    >,
+    /// DSpark draft head: one sequential step of the block sampler (`glue.cu`).
+    dspark_markov_head: Option<
+        unsafe extern "C" fn(
+            *mut f32, *const f32, *const f32, *const f32, *const f32, *mut i32, *mut f32,
+            c_int, c_int, c_int, c_int, *mut u64, *mut c_uint, CuStream,
+        ) -> c_int,
     >,
     window_append: Option<unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
@@ -819,6 +840,7 @@ impl Device {
             apply_rope_q: ko!(rt, "dsv41_apply_rope_q"),
             ring_win_fuse: ko!(rt, "dsv41_ring_win_fuse"),
             ring_win_fuse_ph: ko!(rt, "dsv41_ring_win_fuse_ph"),
+            verify_ring_win: ko!(rt, "dsv41_verify_ring_win"),
             index_k_publish: ko!(rt, "dsv41_index_k_publish"),
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
@@ -839,6 +861,7 @@ impl Device {
             swiglu_limit_q: ko!(rt, "dsv41_swiglu_limit_q"),
             gather_rows: ko!(rt, "dsv41_gather_rows"),
             scatter_add_rows: ko!(rt, "dsv41_scatter_add_rows"),
+            dspark_markov_head: ko!(rt, "dsv41_dspark_markov_head"),
             window_append: ko!(rt, "dsv41_window_append"),
             rmsnorm: km!(rt, "ferrite_rmsnorm"),
             hc_pre: km!(rt, "ferrite_hc_pre"),
@@ -2582,6 +2605,39 @@ impl Device {
         self.kerr(rc, "dsv41_scatter_add_rows")
     }
 
+    /// DSpark draft head: ONE step of the sequential block sampler
+    /// (`dspark.rs::forward_head`'s Markov loop). See the kernel comment in
+    /// `dsv41_glue.cu` for the sampling numerics (at the reference's constant
+    /// `u == 1` the Gumbel-max is exactly the stable argmax of the biased row,
+    /// so a single vocab pass is enough) and for the `partial`/`ctr` contract.
+    /// The caller issues this once per draft row, in order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn dspark_markov_head(
+        &self,
+        logits: *mut f32,
+        h: *const f32,
+        markov_embed: *const f32,
+        markov_head: *const f32,
+        confidence_proj: *const f32,
+        ids: *mut i32,
+        confidence: *mut f32,
+        dim: i32,
+        vocab: i32,
+        markov_rank: i32,
+        step: i32,
+        partial: *mut u64,
+        ctr: *mut u32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.dspark_markov_head, "dsv41_dspark_markov_head")?;
+        let rc = unsafe {
+            f(
+                logits, h, markov_embed, markov_head, confidence_proj, ids, confidence, dim, vocab,
+                markov_rank, step, partial, ctr, self.stream,
+            )
+        };
+        self.kerr(rc, "dsv41_dspark_markov_head")
+    }
+
     pub fn swiglu_limit(&self, gate_up: *mut f32, rows: i32, inter: i32, limit: f32) -> Result<()> {
         self.swiglu_limit_on(gate_up, rows, inter, limit, self.stream)
     }
@@ -3036,6 +3092,26 @@ impl Device {
         let f = self.need(self.kernels.window_idxs, "dsv41_window_idxs")?;
         let rc = unsafe { f(idxs, pos_ctr, window, self.stream) };
         self.kerr(rc, "dsv41_window_idxs")
+    }
+
+    /// DSpark verify: append the m-row block's kv rows into their ring slots
+    /// and emit the per-row CAUSAL window indices `[m, window]` (row r's window
+    /// ends at `*pos_ctr + r`, which makes the intra-block causal order a
+    /// consequence of the ring geometry). One launch for both halves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_ring_win(
+        &self,
+        ring: *mut f32,
+        kv: *const f32,
+        pos_ctr: *const c_int,
+        window: i32,
+        hd: i32,
+        m: i32,
+        idxs: *mut i32,
+    ) -> Result<()> {
+        let f = self.need(self.kernels.verify_ring_win, "dsv41_verify_ring_win")?;
+        let rc = unsafe { f(ring, kv, pos_ctr, window, hd, m, idxs, self.stream) };
+        self.kerr(rc, "dsv41_verify_ring_win")
     }
 
     /// Publish the roped index key into the owner's group slot, with the slot

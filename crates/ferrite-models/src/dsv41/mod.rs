@@ -21,6 +21,7 @@ pub mod chain_dev;
 pub mod config;
 pub mod device;
 pub mod dspark;
+pub mod dspark_dev;
 pub mod engram;
 pub mod frame;
 pub mod kernels;
