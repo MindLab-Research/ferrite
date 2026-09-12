@@ -8589,6 +8589,13 @@ impl<'a> DevChain<'a> {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 m,
+                // A2 verify arm: `false` on purpose, exactly as A1-a's
+                // `collapse_norm_rows` — the m-row chain must keep the raw pair's
+                // historical f32 behaviour. Reading `bf16_truncate()` here is the
+                // same trap that routed `BF16_TRUNCATE` onto the verify for the
+                // first time and broke the zero-Latin baseline; only `layer()`
+                // reads the gate.
+                false,
             )?
         } else {
             self.dev.hc_mixes(
@@ -8659,6 +8666,9 @@ impl<'a> DevChain<'a> {
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 m,
+                // Same A2 verify arm as the attention block above: no
+                // `BF16_TRUNCATE` on the m-row chain.
+                false,
             )?
         } else {
             self.dev.hc_mixes(
@@ -11552,6 +11562,16 @@ impl<'a> DevChain<'a> {
     /// SINGLE-ROW layout (`xq[c]`, no row base), so a multi-row caller passes
     /// null and quantises its own rows with `quant_rows` instead (`layer_rows`
     /// into `s.xq_r`/`s.xsc_r`).
+    ///
+    /// `truncate` is the fused front end's `DSV41_BF16_TRUNCATE` arm, and it is
+    /// a PARAMETER rather than a direct `bf16_truncate()` read on purpose: the
+    /// two callers want opposite things. `layer()` (single row) passes
+    /// `bf16_truncate()` — the decode path is the one the gate was validated on.
+    /// `layer_rows()` (m rows) passes `false`: letting the gate reach the verify
+    /// chain put `BF16_TRUNCATE` on the verify for the first time and broke the
+    /// zero-Latin baseline (the same interaction A1-a fixed by hard-coding
+    /// `false` in [`Self::collapse_norm_rows`], 2026-09-12). The A2 arm must
+    /// therefore keep the raw chain's historical f32 behaviour.
     #[allow(clippy::too_many_arguments)]
     fn hc_mixes_auto(
         &mut self,
@@ -11573,6 +11593,7 @@ impl<'a> DevChain<'a> {
         xq: *mut u8,
         xsc: *mut f32,
         rows: usize,
+        truncate: bool,
     ) -> Result<bool> {
         // Stage-C persistent forms, both default OFF and both selected only when
         // the .so carries the symbol. `_MB` (multi-block) is tried first: same
@@ -11622,7 +11643,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
-                bf16_truncate(),
+                truncate,
             )?
         } else if rows == 1 && Self::hc_persist_mb() && self.dev.supports_hc_persist_mb() {
             self.dev.hc_front_persist_mb(
@@ -11644,7 +11665,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
-                bf16_truncate(),
+                truncate,
             )?
         } else if rows == 1 && Self::hc_persist() && self.dev.supports_hc_persist() {
             // Stage-C persistent prototype (DSV41_HC_PERSIST=1, default OFF): the
@@ -11669,7 +11690,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
-                bf16_truncate(),
+                truncate,
             )?
         } else {
             self.dev.hc_front(
@@ -11691,7 +11712,7 @@ impl<'a> DevChain<'a> {
                 eps_norm,
                 xq,
                 xsc,
-                bf16_truncate(),
+                truncate,
             )?
         };
         if fused {
@@ -11986,6 +12007,10 @@ fn tap_input() -> bool {
             self.s.xq.ptr as *mut u8,
             self.s.xsc.ptr as *mut f32,
             1,
+            // Single-row decode form: this is the path `DSV41_BF16_TRUNCATE` was
+            // validated on, so `layer()` keeps reading the gate. Only the m-row
+            // verify arm passes `false` (see `hc_mixes_auto`).
+            bf16_truncate(),
         )?;
         // T1: when the fused front ran the collapse, it also emitted the fp8
         // quantisation of `xn` (s.xq/s.xsc), so the next quant1(xn) - lin2's, in
@@ -12102,6 +12127,9 @@ fn tap_input() -> bool {
             self.s.xq.ptr as *mut u8,
             self.s.xsc.ptr as *mut f32,
             1,
+            // Same as the attention block above: the single-row decode form keeps
+            // the `DSV41_BF16_TRUNCATE` gate.
+            bf16_truncate(),
         )?;
         // T1 (ffn side): the tail emitted the fp8 of the ffn-norm output, so the
         // MoE's quant1(xn) - its first xq consumer - is redundant and skips.
