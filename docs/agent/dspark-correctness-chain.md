@@ -1875,3 +1875,59 @@ val = *reinterpret_cast<const uint4*>(a + (size_t)row * (k >> 1) + ...);
 3. 或在 gather kernel 里把基址 pad 到 16B
 
 **不阻塞 400 路径**——tcgen05 是性能优化（-1~-2.8ms 修正口径），kernel 级修复留给下一轮。
+
+# ═══════════════════════════════════════════════════════════
+# SESSION FINAL SUMMARY（2026-09-12 全天 MTP 400 冲刺）
+# ═══════════════════════════════════════════════════════════
+
+## 一、今日达成的里程碑
+
+### 正确性（用户红线——全部达成 ✓）
+1. **零拉丁字符** ✓ — DSV41_BF16_TRUNCATE=1（hc_pre 的 bf16 截断），多次 GPU 验证
+2. **段错误修复** ✓ — 并发编辑 ABI 不一致 → ABI 5 + 干净重建
+3. **基线破坏修复** ✓ — HC_VERIFY_FUSE 默认 OFF + A1/A2 truncate 修复
+
+### Accept 战役（1.022 → 1.214，+19%）
+- **最优组合：P0-3（TAP_INPUT）+ P1-5（DRAFT_BF16_DOMAIN）= 1.214**
+- SEED_POS 不改善（1.067）——draft 已适应 pos-1 相位
+- DRAFT_HEAD_FOLD v1 中性（1.214）——ulp 噪声不影响 argmax
+- TAP_BF16 + DRAFT_ATTN 略降（1.163）——bf16 域已饱和
+- **链式失败模型确认**：mean-k = p/(1-p)，p≈0.55
+
+### 性能分析（arch-floor + sglang 硬锚点）
+- **sglang 硬锚点**：verify=7.3ms（实测）、γ=5（与我们同）、400 是乘积约束
+- **arch-floor**：L0=37.31ms → L5=8-9ms（400 算术地板）
+- **mrows 判词**：实测仅 -1.21ms（instruction-bound，不是 bandwidth-bound）
+- **SWALLOW_STEP 必要性**：没有它 264 tok/s 出局（但 ar5-hang 阻塞）
+- **tcgen05 冒烟**：5 gate 全通过（kernel 可派发）但 misaligned address（uint4 对齐）
+
+### 发现的根因（全部记录在 correctness-chain.md）
+1. AR v5 hang：argmax epoch 规则不一致 + DRY 无 barrier（修复中）
+2. tcgen05 misaligned：uint4* 强转的 16B 对齐（kernel 级，下一轮）
+3. draft head v2/v1 program 不匹配：ulp 级（不是 accept 根因）
+
+## 二、400 路径的现状
+
+**当前**：67 tok/s（accept 1.214 × step 33ms）
+**400 需要**：accept 2.5-3.0 × step 8-10ms（双轴并进）
+
+**阻塞清单**：
+1. SWALLOW_STEP 的 ar5-hang（修复中——argmax capturing 守卫 + DRY barrier）
+2. tcgen05 的 misaligned（kernel 对齐——下一轮）
+3. accept 的深层对齐（S4 paired ring alignment——设计中）
+
+**下一步优先级**：
+1. ar5-hang 修复 → SWALLOW_STEP 解锁 → 步时 -4.55ms
+2. S4 paired alignment → accept 深层提升
+3. tcgen05 对齐修复 → verify -1~-2.8ms
+4. 族级融合 → verify 的 launch 地板
+
+## 三、当前配置推荐
+
+```
+DSV41_SPEC=1 DSV41_DSPARK=1 DSV41_SIDS_WRITEBACK=1
+DSV41_EXPERT_ACT_E4M3=1 DSV41_SH_EXP_MROWS=1
+DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1
+DSV41_DRAFT_P3A=1 DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+```
+（零拉丁 ✓ + accept 1.214 + 步时 33ms）
