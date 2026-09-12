@@ -435,3 +435,11 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 用户指出 `引喻失义，以塞忠谏之路也acs。` 中的 "acs" 是乱码。**判定**：与 "opa"/"anao" 同族（词表里的合法拉丁碎片 token 出现在中文续写中）——都是 **e2m1 激活量化噪声** 在长上下文尾部累积到 argmax 翻转的表现。e4m3 直接路径已把双字降到 0，但 "acs" 出现在 ~第 130 token 处——**说明 e4m3 单趟还不够精确**（或 draft/verify 的 e4m3 尚未完全对齐）。
 **根因方向**：EAGER（纯 decode）也出 opa/acs → backbone 的 routed expert 数值残留——**需确认 draft 侧的 e4m3 是否真正生效**（draft_moe 的接线是否正确 dispatch 到 act_e4m3=1 的 kernel）。
 **下一步**：跑一次 EAGER + e4m3 的对照（不含 spec）——如果 EAGER+e4m3 干净（无 acs/opa），则残留来自 spec 路径的 draft e4m3 未生效；如果 EAGER+e4m3 也有 acs，则 backbone 的 e4m3 还需进一步排查。
+
+## EAGER+e4m3 判别结果（41699339）——"acs" 是 backbone 残留
+
+**EAGER + DSV41_EXPERT_ACT_E4M3=1（无 spec）也出 "acs"**：`...以塞忠谏之路也acs：臣亮言：...` — **与 spec 完全相同的位置**。
+⇒ "acs" 不是 spec 路径引入的回归，是 **backbone 的 e4m3 路径在该上下文长度（~第 130 token）的 argmax 不确定性**。可能原因：
+1. e4m3 单趟的精度仍不足以在该位置翻转 argmax（近 tie）
+2. 模型在该位置本身就有歧义（官方参考可能也有类似碎片）
+**下一步**：跑官方 ref_inference 同 prompt 1000 tok 判定"acs"是 ferrite 残留还是模型固有。
