@@ -4381,6 +4381,44 @@ impl<'a> DevChain<'a> {
     /// twin): the snapshot is taken before the replay and the rollback/commit after
     /// the D2H, so nothing about the accept logic changes.
     pub fn step_rows(&mut self, toks: &[u32]) -> Result<Vec<u32>> {
+        // Every EXTERNAL caller keeps the historic rendezvous: the barrier in front
+        // of a replay is what pairs with the CAPTURE arm of this same function (and
+        // with `step_impl`'s), so a peer that is still recording cannot lose a stamp
+        // an executing rank is polling for. Only the lazy row loop — where every rank
+        // is provably executing the SAME replay — passes `true`; see
+        // [`Self::step_rows_sync`].
+        self.step_rows_sync(toks, false, None)
+    }
+
+    /// [`Self::step_rows`] with the per-replay rendezvous switchable and the
+    /// `pos_ctr` read-back skippable.
+    ///
+    /// `skip_barrier` suppresses ONLY the single `host_barrier` that sits in front
+    /// of a stored-graph REPLAY (the `verify_graphs[idx].is_some()` arm). It never
+    /// touches the two barriers that bracket a CAPTURE (`capture_begin` .. `capture_end`)
+    /// nor the DRY arm, because those are exactly the rendezvous that keep a
+    /// recording rank from being lapped by an executing peer. The replay barrier
+    /// itself is redundant once no rank can be recording: under `ar_v5()` (which the
+    /// graph gate requires whenever there are peers) the device-side protocol is
+    /// self-synchronising — `p2p_ar_pubred_v5_kernel` publishes this rank's round
+    /// stamp to every peer and then POLLS all peers' stamps for the same round
+    /// before it reduces (ferrite_kernels.cu:8898-8928), and `end_round` already
+    /// relies on exactly that ("v5 needs no host barrier", tp.rs:665-670).
+    ///
+    /// `pos_base_hint` is the blocking D2H of `pos_ctr` this call would otherwise
+    /// make, for a caller that has JUST written it and therefore already knows the
+    /// value. `None` (every external caller) reads it back, so nothing changes off
+    /// the lazy path. The hint is only sound under the invariant that the caller's
+    /// H2D has landed and NOTHING device-side has run since: `lazy_run_row` does
+    /// exactly that (`set_pos_ctr(pos + i)` — a blocking `cudaMemcpy` H2D — with the
+    /// device quiescent because the previous row ended in a blocking D2H), so the
+    /// device counter equals the hint by construction.
+    fn step_rows_sync(
+        &mut self,
+        toks: &[u32],
+        skip_barrier: bool,
+        pos_base_hint: Option<i32>,
+    ) -> Result<Vec<u32>> {
         let m = toks.len();
         if m == 0 {
             return Ok(Vec::new());
@@ -4404,7 +4442,15 @@ impl<'a> DevChain<'a> {
         // because the kernels that take a position take a POINTER. This runs
         // between steps, so the read cannot stall anything that matters; the values
         // are then written to `pos_rows`, which the graph only ever READS.
-        let pos_base = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as i32;
+        //
+        // The read-back is skipped when the caller supplies `pos_base_hint` (the
+        // lazy row loop, which has JUST written that value — see
+        // [`Self::step_rows_sync`]). It is a full device sync, and paying it once
+        // per row is the per-row overhead this parameter exists to remove.
+        let pos_base = match pos_base_hint {
+            Some(p) => p,
+            None => self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as i32,
+        };
         let pos_rows: Vec<i32> = (0..m).map(|r| pos_base + r as i32).collect();
 
         // The graph's per-verify inputs, refreshed before every replay: both land
@@ -4432,9 +4478,14 @@ impl<'a> DevChain<'a> {
             } else if let Some(e) = self.verify_graphs[idx] {
                 // Rendezvous before the replay: a capture only RECORDS the AR
                 // kernels while a peer may already be EXECUTING its own — the same
-                // pair `step_impl` keeps around its capture.
-                if let Some(c) = self.comm.as_ref() {
-                    c.host_barrier();
+                // pair `step_impl` keeps around its capture. The lazy row loop
+                // passes `skip_barrier`, because it has already rendezvoused once
+                // before its loop and every rank is then executing the same replay
+                // back-to-back on one stream (see [`Self::step_rows_sync`]).
+                if !skip_barrier {
+                    if let Some(c) = self.comm.as_ref() {
+                        c.host_barrier();
+                    }
                 }
                 self.dev.graph_launch(e)?;
                 self.verify_replays += 1;
@@ -6903,11 +6954,24 @@ impl<'a> DevChain<'a> {
     /// `spec_capture` stays CLEAR, deliberately: this arm never replays the
     /// compressor (so the `kvp`/`scp` snapshot would be pure waste) and its tap
     /// write is handled by the deferred path above.
+    ///
+    /// The per-row `step_rows` runs with the replay rendezvous SUPPRESSED: the
+    /// caller already rendezvoused once before its loop ([`Self::dspark_spec_lazy`])
+    /// and, from there to the loop's end, every rank is executing the SAME replay
+    /// sequence on one stream, so the device-side AR stamps are the only
+    /// cross-rank ordering that remains — and v5 carries them in-kernel
+    /// ([`Self::step_rows_sync`]). Suppressing it here is what removes the
+    /// ~2.85 ms/row of host rendezvous the per-row `step_rows(m = 1)` used to pay.
     fn lazy_run_row(&mut self, rows_in: &[u32], i: usize, pos: usize) -> Result<u32> {
         self.set_pos_ctr(pos + i)?;
         self.spec_capture = false;
         self.spec_tap_deferred = true;
-        let res = self.step_rows(&rows_in[i..=i]);
+        // `Some(pos + i)` is the value `step_rows` would read straight back off the
+        // device counter: `set_pos_ctr` above has just written it with a BLOCKING
+        // H2D and the device is quiescent (the previous row ended in a blocking
+        // D2H), so the hint IS the counter. That removes the per-row read-back,
+        // which — like the argmax D2H — is a full device sync.
+        let res = self.step_rows_sync(&rows_in[i..=i], true, Some(pos as i32 + i as i32));
         // Cleared BEFORE the `?`, so a failed row does not leave the hook in
         // deferred mode for whatever runs next.
         self.spec_tap_deferred = false;
@@ -7006,6 +7070,23 @@ impl<'a> DevChain<'a> {
         let mut rows_in: Vec<u32> = Vec::with_capacity(m);
         rows_in.push(token);
         rows_in.extend_from_slice(&drafts);
+
+        // ★ THE LOOP'S ONE RENDEZVOUS. Each row below suppresses the per-replay
+        // barrier `step_rows` normally keeps in front of `graph_launch` (see
+        // [`Self::step_rows_sync`]): with the ranks aligned HERE, and with the
+        // `m = 1` graph's own CAPTURE still bracketed by the two barriers inside
+        // `step_rows_sync`, no rank can be recording while a peer executes the
+        // replay. From this point to the end of the loop every rank runs the same
+        // replay sequence back-to-back on one stream, and the only cross-rank
+        // ordering left is the v5 AR's in-kernel publish/poll — which is
+        // drift-tolerant by construction (absolute epoch stamps + a read-before-
+        // overwrite publish chain; see the `p2p_ar_pubred_v5_kernel` note in
+        // kernels/cuda/ferrite_kernels.cu). Placed AFTER the draft forward so it
+        // also covers the draft's kernels. No-op without peers (comm is None off
+        // TP8), so single-rank runs are unaffected.
+        if let Some(c) = self.comm.as_ref() {
+            c.host_barrier();
+        }
 
         let t = std::time::Instant::now();
         let mut rows: Vec<u32> = Vec::with_capacity(m);
