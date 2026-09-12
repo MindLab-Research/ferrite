@@ -231,3 +231,12 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 1. **Stage 2 可行**：e2m1×2 双趟在现有 fp4 kernel 上达到 e4m3 级精度（0.53×），**无需 fp8 expert 路径**——绕开 2026-09-10 用户禁令（fp8 expert 计算被删过 cadd000）。
 2. **down 路径反而更好**：ferrite 的 down 吃 f32（精确），官方对 swiglu 输出也量化——分歧集中在 gate/up。
 3. 分期：Stage 2（e2m1×2，Rust-only，gate `DSV41_EXPERT_ACT_E4M3`）一轮可给出 GPU 判决；Stage 3（真 mxf8f6f4）需用户仲裁（触碰 fp8 禁令 + unpacked 权重 ×2）。
+
+## 锚点复测结果（anchor-dsv41run-retest，8a5a952 用旧入口 dsv41-run）
+
+**锚点版 8a5a952 也有 opa**（`…引喻失义opa**`——与 HEAD 同一位点，3 次重复 100% 稳定复现，temperature=0 确定性）。输出后半段还有更明显的退化（`以下为《**》之秋，`——错接 + 占位符）。
+
+**结论**：
+1. **opa 不是 8a5a952..HEAD 的回归**——用户对"162tok/s 版没乱码"的记忆不成立（或那个版本的乱码不在 opa 位点）。ablation 阶梯（EXPERT_ILV=0 等）**不再适用**（没有差异可二分）。
+2. **opa 是存量偏差**——8a5a952 时点就存在，且与 e2m1-vs-e4m3 的架构级分歧（head 号根因）的时间线吻合（它早于锚点，从 fp4 expert 路径的第一天就存在）。
+3. **修复路径不变**：e2m1×2 双趟（Stage 2 在实施）就是正解——它不是"回归修复"而是"存量架构级数值偏差的修复"。
