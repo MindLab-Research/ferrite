@@ -1163,6 +1163,29 @@ fn sparse_orope() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_SPARSE_OROPE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// P1v (DSV41_VERIFY_OROPE, default ON): the m-row verify path takes the SAME
+/// fused sparse-attention launch the EAGER path takes ([`Self::sparse_attn_orope`]:
+/// the o-rope and the fp8 emission of the roped row folded into the
+/// sparse-attention kernel) instead of `sparse_attn` + `apply_rope` + `quant`.
+///
+/// WHY THIS IS A CORRECTNESS FIX, NOT AN OPTIMISATION: the two forms are NOT
+/// bit-identical, contrary to the fusion's "verbatim" claim — the `DSV41_DIFF_EAGER`
+/// probe mismatches at 18 positions with the EAGER-side fusion on and at ONE with
+/// `DSV41_SPARSE_OROPE=0`. So the fused launch IS the numerical divergence between
+/// the spec path and the plain one, and taking the same kernel on both sides is
+/// the alignment. It is also the cheap direction: the fusion stays on the EAGER
+/// side, and the verify path LOSES its per-row `apply_rope` + `quant_fp8` pair.
+///
+/// "0" reverts the verify path to `sparse_attn` + `apply_rope` + `quant_fp8`
+/// (the A/B arm). A decline (an .so without `dsv41_sparse_attn_orope`, or a
+/// shape/env the launcher cannot mirror) falls back per row on its own — the same
+/// decline the EAGER path would take under the same env, so the two paths stay
+/// aligned either way.
+fn verify_orope() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_VERIFY_OROPE").map(|v| v != "0").unwrap_or(true))
+}
+
 /// B2 (DSV41_RING_WIN_FUSE, default ON): one launch does the window ring append
 /// and the window indices (two adjacent, mutually independent one-block
 /// kernels), saving 40 launches/step. "0" reverts; an .so without
@@ -6475,6 +6498,18 @@ impl<'a> DevChain<'a> {
         } else {
             0
         };
+        // P1v (DSV41_VERIFY_OROPE, default ON): take the EAGER path's fused
+        // sparse-attention launch per row instead of the `sparse_attn` +
+        // `apply_rope` + `quant_fp8` triple. See [`verify_orope`] for why this is
+        // the correctness alignment (the fusion is NOT bit-identical to the
+        // triple) and why the fusion is the direction that must win.
+        //
+        // `orope_rows[r]` records whether row r's fused launch took; the two
+        // consumers are the standalone o-rope below (a row the fused launch
+        // already rotated must be SKIPPED, not rotated twice) and the o-quant
+        // (`sparse_attn_orope` already emitted that row's fp8).
+        let vo = verify_orope() && m <= VERIFY_ROWS;
+        let mut orope_rows = [false; VERIFY_ROWS];
         for r in 0..m {
             // ---- 1) ring append + THIS row's causal window ----
             // (audit defect #2: the window half.) `window_idxs(r)` must run after
@@ -6552,45 +6587,117 @@ impl<'a> DevChain<'a> {
             // The `b = 1, m = 1` shape is exactly the single-row `attention`'s, so
             // each row is verified against the plain engine row by row — the
             // strongest parity guarantee available.
-            self.dev.sparse_attn(
-                (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
-                ring_ptr as *const f32,
-                ld.attn_sink.as_ref().unwrap().as_f32(),
-                (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
-                (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
-                1,
-                1,
-                nlh as i32,
-                hd as i32,
-                clen_owner,
-                win as i32,
-                cfg.index_topk as i32,
-                scale,
-            )?;
+            //
+            // P1v (DSV41_VERIFY_OROPE): the EAGER path runs the FUSED launch
+            // (`sparse_attn_orope`: the inverse o-rope and the fp8 emission of the
+            // roped row folded into the sparse-attention kernel) while this path
+            // ran the triple — and the two are NOT bit-identical (the +18
+            // `DSV41_DIFF_EAGER` mismatches vs ONE with the EAGER-side fusion
+            // off). Same kernel on both sides is the alignment.
+            //
+            // ABI (checked against `sparse_attn_orope_kernel` phase 3): the call is
+            // per row (`b = m = 1`, `h = nlh`, `d = hd`), and with the row's own
+            // base pointers it writes the roped row to `out + hh*hd`, the fp8 to
+            // `xq + hh*hd` and the scale to `xsc + hh*(hd/32)` — `[h, d]` fp8 +
+            // `[h, d/32]` f32 relative to the pointers handed in. Passing
+            // `xq_r + r*nlh*hd` / `xsc_r + r*(nlh*hd/32)` therefore lands EXACTLY
+            // on the per-row compact packing the `quant_fp8` loop below used to
+            // write (same bytes, same offsets), so the downstream
+            // `wo_a_grouped_fp8` sees an unchanged layout.
+            let oroped = vo
+                && self.dev.sparse_attn_orope(
+                    (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                    ring_ptr as *const f32,
+                    ld.attn_sink.as_ref().unwrap().as_f32(),
+                    (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
+                    (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                    1,
+                    1,
+                    nlh as i32,
+                    hd as i32,
+                    clen_owner,
+                    win as i32,
+                    cfg.index_topk as i32,
+                    scale,
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    // row `r` sits at `pos_ctr + r`, i.e. `mul = 1, off = r,
+                    // step = 0` — the same `tt` the per-row `apply_rope` fallback
+                    // below computes off the same counter (`hd`-independent here:
+                    // the fused kernel's `hh*step` term is the rope's per-head
+                    // step, which is 0 on both sides).
+                    pos_ctr,
+                    rd as i32,
+                    half,
+                    1,
+                    r as i32,
+                    0,
+                    true,
+                    (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
+                    (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (nlh * hd / 32)),
+                )?;
+            if !oroped {
+                self.dev.sparse_attn(
+                    (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                    ring_ptr as *const f32,
+                    ld.attn_sink.as_ref().unwrap().as_f32(),
+                    (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
+                    (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                    1,
+                    1,
+                    nlh as i32,
+                    hd as i32,
+                    clen_owner,
+                    win as i32,
+                    cfg.index_topk as i32,
+                    scale,
+                )?;
+            }
+            if vo {
+                orope_rows[r] = oroped;
+            }
         }
 
         // ---- the inverse o-rope, one row per call (the attention loop above
         //      interleaves this row's selection with the block's commits, so the
         //      rope stays outside it) ----
+        //
+        // P1v (DSV41_VERIFY_OROPE): a row whose FUSED launch took already carries
+        // the ROTATED value — `sparse_attn_orope_kernel`'s phase 2 rotates the row
+        // in shared memory before storing it — so this block must not touch it
+        // again (a second inverse rotation is NOT idempotent). With the default
+        // gate EVERY row is fused and the whole block is skipped; the ROW_FOLD
+        // fold below stays available for the all-fallback case, and a partial
+        // fallback (never observed: every decline in `dsv41_sparse_attn_orope` is
+        // a property of the call SHAPE and the env, not of the row) degrades to the
+        // per-row form, which is what keeps a mixed block correct instead of
+        // double-roping it.
+        let o_oroped_any = vo && orope_rows[..m].iter().any(|&b| b);
+        let o_oroped_all = vo && orope_rows[..m].iter().all(|&b| b);
         // ROW-FOLD (DSV41_ROW_FOLD_ROPE=1): same launch fold as the q rope above,
         // with `inverse = true`. Identical shape (`x = s.o_r`,
         // `row_stride = nh*hd`, `rows = nlh`) and the same per-row position array.
-        let o_roped = row_fold_rope()
-            && self.dev.apply_rope_mrows(
-                self.s.o_r.ptr as *mut f32,
-                self.cos.as_f32(),
-                self.sin.as_f32(),
-                m as i32,
-                nlh as i32,
-                (nh * hd) as i32,
-                hd as i32,
-                rd as i32,
-                half,
-                self.s.pos_rows.ptr as *const std::os::raw::c_int,
-                true,
-            )?;
+        let o_roped = o_oroped_all
+            || (!o_oroped_any
+                && row_fold_rope()
+                && self.dev.apply_rope_mrows(
+                    self.s.o_r.ptr as *mut f32,
+                    self.cos.as_f32(),
+                    self.sin.as_f32(),
+                    m as i32,
+                    nlh as i32,
+                    (nh * hd) as i32,
+                    hd as i32,
+                    rd as i32,
+                    half,
+                    self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                    true,
+                )?);
         if !o_roped {
             for r in 0..m {
+                if vo && orope_rows[r] {
+                    continue; // the fused launch already roped this row
+                }
                 self.dev.apply_rope(
                     (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
                     self.cos.as_f32(),
@@ -6639,7 +6746,16 @@ impl<'a> DevChain<'a> {
             // r>=1 always wrong" signature the diff probe measured. Pack row by
             // row: source at its true pitch, destination compact (the downstream
             // wo_a_grouped_fp8 / proj_mrows layouts are unchanged).
+            //
+            // P1v: a row whose FUSED launch took was emitted by that launch itself
+            // — `sparse_attn_orope_kernel`'s phase 3 quantises the ROTATED row
+            // with the same per-32-block arithmetic into the same offsets — so it
+            // needs no second pass here. The gate's default fuses every row and
+            // this loop is skipped entirely.
             for r in 0..m {
+                if vo && orope_rows[r] {
+                    continue;
+                }
                 self.dev.quant_fp8(
                     (self.s.o_r.ptr as *const f32).wrapping_add(r * nh * hd),
                     (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
