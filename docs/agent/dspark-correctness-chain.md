@@ -6347,3 +6347,24 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 **AR 优化的风险控制**：
 - **gate ON vs OFF 逐字节一致**是前提（A1a 的教训）
 - **正确性红线**（前 61 行 + 零拉丁）必须在每个优化后验证
+
+## 🎉 mrows Phase A b2 (ATTN_MROWS_ROPE_NORM=1) SWALLOW 验证成功！
+
+**结果**（ac2d50df）：
+- **吞吐 = 60.4 tok/s**（vs 基线 58.3——**+3.6%**！）
+- **前 61 行正确=True** ✓（数值中性！）
+- **零拉丁** ✓ finish_reason=stop ✓
+- **0 panic 0 ar5-hang** ✓
+
+**判定**：
+1. **mrows Phase A b2 干净生效**（+3.6%，数值中性，无 panic！）
+2. **与 A1a 的对比**：A1a 破坏数值——mrows b2 数值中性！mrows 的实施方法（零代码接线）比 A1a 的方法（store fold）**安全得多**！
+3. **400 ladder 更新**：58.3 → 60.4（mrows b2）→ 下一步 hc/B6 → tcgen05
+
+**SWALLOW 优化进展**：
+| 优化 | 吞吐 | 增量 | 数值中性 |
+|---|---|---|---|
+| 全 gate 基线 | 58.3 | — | ✓ |
+| **+ mrows Phase A b2** | **60.4** | **+3.6%** | **✓** |
+| + hc/B6 S3（待测） | ? | ? | ? |
+| + tcgen05 S4（待测） | ? | ? | ? |
