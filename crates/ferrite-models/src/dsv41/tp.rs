@@ -1185,3 +1185,68 @@ mod vote_tests {
         }
     }
 }
+
+/// [`RankMax`] is the 11-B consensus's primitive and is host-side concurrency
+/// code, so it gets the same treatment as the vote above: pinned here rather
+/// than only through an engine that needs a GPU.
+#[cfg(test)]
+mod max_tests {
+    use super::RankMax;
+    use std::sync::Arc;
+
+    /// `rounds` of `world` threads, each publishing `f(rank, round)`; returns
+    /// every rank's per-round answer.
+    fn run(
+        world: usize,
+        rounds: usize,
+        f: impl Fn(usize, usize) -> i32 + Send + Sync + 'static,
+    ) -> Vec<Vec<i32>> {
+        let m = Arc::new(RankMax::new(world));
+        let f = Arc::new(f);
+        let hs: Vec<_> = (0..world)
+            .map(|r| {
+                let m = m.clone();
+                let f = f.clone();
+                std::thread::spawn(move || {
+                    (0..rounds).map(|i| m.max_i32(r, f(r, i))).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    }
+
+    /// EVERY rank must learn the same maximum — the property 11-B's pad rests on
+    /// (a rank that read a smaller max would under-pad and keep the rift).
+    #[test]
+    fn every_rank_learns_the_world_max() {
+        let all = run(8, 512, |r, _| r as i32 * 7 - 3);
+        for rank in &all {
+            assert!(rank.iter().all(|v| *v == 7 * 7 - 3));
+        }
+    }
+
+    /// The answer is per-ROUND: a rank whose value alternates must not bleed into
+    /// a neighbour's round (the parity buffer is what guarantees this).
+    #[test]
+    fn rounds_do_not_bleed_into_each_other() {
+        // rank 0 publishes a high value only on odd rounds; the max is then 9 on
+        // odd rounds and 1 on even ones, on EVERY rank.
+        let all = run(4, 512, |r, i| if r == 0 && i % 2 == 1 { 9 } else { 1 });
+        for (i, want) in (0..512).map(|i| if i % 2 == 1 { 9 } else { 1 }).enumerate() {
+            for (r, rank) in all.iter().enumerate() {
+                assert_eq!(rank[i], want, "round {i}, rank {r}");
+            }
+        }
+    }
+
+    /// A laggard's own answer must be the max (it is the one that pads up), and a
+    /// leader's too (it pads nothing, but the number it sees must not be lower
+    /// than its own — otherwise it would "pad" backwards).
+    #[test]
+    fn a_one_rank_world_is_its_own_max() {
+        let m = RankMax::new(1);
+        for i in [-5i32, 0, 3, 1497] {
+            assert_eq!(m.max_i32(0, i), i);
+        }
+    }
+}
