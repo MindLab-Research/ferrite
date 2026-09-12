@@ -53,15 +53,23 @@ pub fn dspark_spec_step(&mut self, dspark: &mut DsparkDev, token: u32, pos: usiz
     let rows = self.step_rows(&rows_in)?;   // 行 j @ pos+j（pos_base = pos_ctr = pos）
     self.spec_capture = false;
 
-    // 4. accept（6 行布局的链）：verify 行 0 的 argmax == pos+1 的 token（= 旧 next）；
-    //    drafts[j]（对 pos+1+j 的提案）与 verify 行 j+1 的 argmax（pos+2+j）比对
+    // 4. accept（6 行块的链 = 索引对齐，与 GLM 的 MTP 同构——见 tp.rs:1993 的
+    //    `while drafts[k-1] == out[k-1]`）：verify 行 i 的输入是 [t0, d1..d5][i]、
+    //    位置 pos+i，所以行 i 的 argmax = pos+1+i 的预测；而 drafts[i] 是"对 pos+1+i
+    //    的提案"（draft 块 @ pos，行 i @ pos+i）——**两者同索引对齐**：
+    //      drafts[0]（pos+1 的提案） vs verify_out[0]（行 0 = t0 @ pos 的 argmax = pos+1）
+    //      drafts[1]（pos+2 的提案） vs verify_out[1]（行 1 = d1 @ pos+1 的 argmax = pos+2）
+    //      ...
+    //    （对照：5 行块不含 anchor，行 j 的 argmax 是 pos+2+j，所以那条链是
+    //      drafts[0]==next + drafts[j]==verify_out[j-1]——**不同布局、各自自洽**。）
     let verify_out = rows;                   // len = 6
     let mut k_acc = 0usize;                  // = 接受的 draft 数（0..=5）
-    while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc + 1] {
+    while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc] {
         k_acc += 1;
     }
-    // emitted = [verify_out[0], verify_out[1], .. verify_out[k_acc]]
-    //   = [pos+1 的 token（确定）, d1..d_{k_acc} 的验证结果] —— 共 k_acc+1 个
+    // emitted = [verify_out[0], .., verify_out[k_acc]]
+    //   = [pos+1 的 token（= 旧路径的 next，确定值）, pos+2 .. pos+1+k_acc]
+    //   —— 共 k_acc+1 个（k_acc=0 时仅 verify_out[0]，与旧路径的 emitted=[next] 相同）
     let mut emitted = Vec::with_capacity(k_acc + 1);
     emitted.extend_from_slice(&verify_out[..=k_acc]);
 
