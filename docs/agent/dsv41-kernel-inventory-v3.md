@@ -102,10 +102,33 @@ tie-break、同一 renorm）。真正省下的只有 launch/节点开销（route
 **镜像差指向 4 次调用的符号归属，而非 4 个隐藏调用**——需一次逐符号 CSV 交叉核对定案，勿直接改动本表的 246。
 
 **融合空间（同一审计）**：attention 侧"同激活 + 同 k"的对已被 A1(mx2)/A2(idx mx2)/M1(mx2) 用完 ⇒
-**无任何可 mx2 合并的对**。剩余只有两类：① 链式两段核（wo_a→wo_b，k 4096→1024，跨 stage 同步；
+**fp8 族内无任何可 mx2 合并的对**。剩余只有两类：① 链式两段核（wo_a→wo_b，k 4096→1024，跨 stage 同步；
 wq_a→wq_b / w1w3→w2 同构但需 grid 级同步，不可行），② 异激活融合需先加第二 fp8 激活缓冲
 （`s.xq/xsc` 是**单缓冲**，T1/T2 一次性旗标建立在"只存最近一次量化"之上），且 mx2 只有单一 k。
 ⇒ 单层 6 次 → 1 次只能走 Stage C persistent 段核。
+
+> **2026-09-12 全调用点复核（补遗 + 两处订正）**：
+> 1. 「无任何可 mx2 合并的对」只对 **fp8 族**成立。跨出 fp8 族仍有两个**同激活 + 同 k + 同 dtype**
+>    的对，审计时被漏掉：
+>    - **`comp_wkv` + `comp_wgate`**（`chain_dev.rs:3841/3843`，`lin_f32_on`）：都是 `s.xn`、k=5120、
+>      **n=hd=512 各一**、同一条流、输出互不相交、**字面相邻两次 launch**。4 个 kv-source 层
+>      ⇒ 合并省 **4 次 launch/步**。需要的是 f32 两族 launcher（`gemv_f32` 目前单族），现成 mx2 不适用。
+>    - **`gate` + `idx_weights`**（`:4084` / `:3758`，都是 `gemv_bf16`）：都是 `s.xn`、k=5120、bf16，
+>      n=384(=`n_routed`) + 32(=`index_n_heads`)，8 个 index-source 层 ⇒ 省 **8 次 launch/步**。
+>      障碍是跨函数（gate 在 `moe()`，idx_w 在 `indexer()`，indexer 在 attention 内）需重排调用点，
+>      且现成两族 launcher 只有 `gemm_bf16_fp8x2`（bf16+fp8 混合）没有 bf16 两族；收益 ≈3µs，不划算。
+> 2. 订正 §89-100：`wq_b` 一条按「8 个 index-source 层用 IDX_FUSE mx2 带上 idx_wq_b」记账，但
+>    `idx_fuse()` 的**实际默认是 OFF**（`chain_dev.rs:566`，`.unwrap_or(false)`）⇒ 这 8 层实际是
+>    **两次** fp8 gemv（attention 的 `lin_rope_norm(wq_b)` + indexer 的 `lin_rope(idx_wq_b)`）。
+>    按默认 gate 的代码推导应为 32×6 + 8×7 + 2(engram L1/L14) = **250**，不是 242；剖析值 246
+>    落在 242(IDX_FUSE=1) 与 250(IDX_FUSE=0) 之间，仍待逐符号核对。
+> 3. 订正 §96：`sh_il = cfg.moe_inter_dim / world = 2304 / 8 = 288`（`chain_dev.rs:3963/3984`，
+>    config `moe_intermediate_size=2304`）⇒ `w1/w3` mx2 的 **n=2×288=576**（文档记 512/256 是旧
+>    config 遗留；routed 侧的 `padded_inter(288)=320` 与 §260 的「320 行/slot」自洽）。
+> 4. 收益口径：把上表所有**未合并且可合**的对全部合掉（含 default-OFF 的 WO_PAIR 40 次、
+>    SH_PAIR 80 次、上面 12 次），总计 ≈132 次 launch ⇒ 0.4µs×132 ≈ **53µs/步 ≈ 0.55%**
+>    加上跨核 drain 气泡，量级 <1%。**配对不是 gemv 2.70ms 的杠杆**（compute-bound，总计算量不变），
+>    唯一实质路径仍是 Stage C persistent 段核。
 
 **dual-chain 重构后的复核（2026-09-11，结论：旧结论仍成立，但理由变了）**：`DSV41_DUAL_CHAIN`
 在 `lin2(wq_a,wkv)`（:2331）**之后**才 fork（:2365-2368），因为 `lin2` 已把 wkv 与 wq_a 一起算完
