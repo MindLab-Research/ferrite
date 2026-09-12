@@ -3214,3 +3214,34 @@ DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 
 | **lazy 平台** | **~83** | |
 
 **结论**：lazy 路径已到平台。**400 的唯一路径是 Plan B（SWALLOW batched）**——理论 ~12.5ms → 480 tok/s。
+
+## Plan B SWALLOW 测试的决策树（0dfe5bf9——400 的决定性测试）
+
+### 如果 Plan B 成功（0 ar5-hang + SURVIVED）
+1. **batched 路径解锁**！400 的数学路径打开
+2. 测量吞吐——如果显著超过 lazy 的 83 tok/s → 在 400 的路上
+3. **下一步**：batched kernel 优化
+   - SH_PAIR template<M=6> parity 修复（-4.9~7.9ms——batched 下的大头）
+   - mrows 族 B1-B6（batched 下有效——lazy m=1 无效）
+   - tcgen05（-2ms）
+   - 理论组合：40ms - 4.9 - 4.5 - 2 = ~28.6ms → 210 tok/s（还需更多优化到 15ms）
+
+### 如果 Plan B 失败（ar5-hang）
+1. 臂分歧不是根因（或不是唯一原因）
+2. **无图模式的 hang 根因**（计数任务 937 hang）——这不是臂分歧（无图全 direct）
+3. 可能的根因：
+   - SWALLOW 的主链步被吞后某个 epoch 对齐被破坏
+   - note_ctx_rows 的处理在高 accept 下触发竞态
+   - 或者：Plan B 的投票引入新的时序问题
+4. **下一步**：分析 hang 的精确位置（rank/epoch/gap）
+
+### 如果 k_acc 退化或输出损坏
+1. Plan B 的投票改变了时序 → 数值影响
+2. **下一步**：DSV41_DIFF_EAGER=1 对照
+
+### lazy vs batched 的性能对比框架
+| 路径 | 步时 | @accept 5 | 优化潜力 | 400 可达 |
+|---|---|---|---|---|
+| lazy（已平台）| ~71ms | ~83 tok/s | ~0（launch 常数已到底）| ❌ 数学不可能 |
+| batched（Plan B 后）| ~40ms? | ~? | -12~15ms（SH_PAIR+mrows+tcgen05）| ✅ 如果 Plan B 解锁 |
+| batched 理论 | ~12.5ms | 480 tok/s | weight-stationary | ✅ |
