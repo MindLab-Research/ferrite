@@ -1527,3 +1527,28 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 与官方 model.py:1055-1068 的单一 freqs_cis 基址完全对齐。默认臂 rope_pos == pos（逐位不变），SEED_POS 臂 rope_pos == pos+1（与 kv 对齐，修复 off-by-one）。
 
 s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-identical ✓（"同整数"级别等价）、SEED_POS 臂对齐 ✓、位置认领无重叠 ✓。**0 严重 / 3 一般 / 2 建议**。
+
+## 🎯 sglang DSpark 的硬锚点（sglang-benchmark-research）
+
+**一手实测**（LMSYS 博客）：**verify = 7.3 ms**（非循环推导！）
+
+**非循环推导链**：
+- verify 在关键路径上 → step ≥ 7.3ms（硬下界）
+- step = 5/383.7 = 13.03ms（推导，被 verify 实测佐证）
+- 非 verify ≈ 5.7ms（反推，合理量级）
+
+**关键修正**：
+1. **sglang γ=5（block 5），不是 7**——与 ferrite 完全相同的块长！
+2. sglang p≈0.93 vs ferrite p≈0.56（1.66×差，被截断非线性放大到 3.3×）
+3. **非 MTP 基线（GH200）**：92.9 tok/s（ferrite 纯 decode 162.6——我们比 GH200 快 1.75×！）
+
+**400 的乘积约束**（τ/step ≥ 0.4 tok/ms）：
+| mean-k | 400 允许步时 |
+|---|---|
+| 1.214（现状）| **5.54ms**（不可达——低于 L5 地板）|
+| 2.0 | 7.50ms（= sglang verify 水平）|
+| 3.0 | 10.0ms |
+| 4.0 | 12.5ms |
+
+**单轴都不够**：只提 accept（22.56ms）= 266 ❌；只降步时（2.214 tok）= 303 ❌
+**必须双轴**：accept ~2-3 + 步时 ~8-12ms → 400 ✓
