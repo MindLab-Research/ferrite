@@ -1099,6 +1099,72 @@ fn moe_dual() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_MOE_DUAL").map(|v| v != "0").unwrap_or(true))
 }
 
+/// VERIFY_FORK (DSV41_VERIFY_FORK, DEFAULT OFF): the verify block (`layer_rows`
+/// → `attention_rows` / `moe_rows`) takes the SAME three side-stream splits
+/// `layer()` runs, so the whole verify pass (`verify_ms`) gets the decode path's
+/// overlap instead of issuing every launch on one stream.
+///
+/// The three seams, each a faithful port of its EAGER twin (same kernels, same
+/// operands, only the stream changes ⇒ the split is bit-identical by
+/// construction, exactly like `DSV41_DUAL_CHAIN` / `DSV41_COMPRESS_SIDE` /
+/// `DSV41_MOE_DUAL`):
+///
+///  1. **attention q chain vs kv chain** (`dual_chain_fork/join`,
+///     `side_stream2`). The block-wide `wq_a`/`wkv` projections fill `qr_r` and
+///     `kv_r`, and NOTHING after them reads both: the q chain
+///     (`lin_rope_norm`/`norm_rows(qr_r)` + `proj_mrows(wq_b)` + the q rope)
+///     touches only `qr_r`/`q_r`/`xq_r`/`xsc_r`, while the kv half
+///     (`norm_rows(kv_r)` + the kv rope) touches only `kv_r` in place. The two
+///     are therefore independent once the projections have landed — the
+///     projections are the chains' last shared node — and the join sits before
+///     the per-row interleave, whose `ring_append` is `kv_r`'s first consumer.
+///
+///  2. **compressor projections** (`compress_side_fork/join`, `side_stream3`).
+///     Only `compress_proj_rows` is hoistable in the verify: it is a pure
+///     function of `s.xn_r` and writes layer-private `kvp_r`/`scp_r`, so it is
+///     issued on the third side stream at the SAME point as the dual chain's fork
+///     and overlaps the whole attention chain. The join sits before
+///     `compress_rows_fused` / the per-row `compress_row`, the first readers of
+///     `kvp_r`/`scp_r`. ⚠️ NOT the pool/commit half: the verify's per-row
+///     interleave (audit defects #1/#2) requires each row's commit to be issued
+///     before that row's readers, so the state/pool/commit stays on the main
+///     stream inside the loop.
+///
+///  3. **MoE routed vs shared expert** (`dual_chain_fork/join`, `side_stream2`).
+///     The two halves read `xn_r` through DISJOINT quantisations (routed:
+///     `xq4_r`/`xsc4_r`; shared: `xq`/`xsc`) and write disjoint scratch
+///     (`ex_act_r`/`ex_down_r` vs `sh_act_r`). The one shared resource is the
+///     accumulator: the routed down-reduce OVERWRITES `moe_out_r`, so the shared
+///     half always writes its `w2` block to the DISJOINT `sh_out_r` scratch
+///     (never `moe_out_r + r*dim`) and the join runs the same element-wise
+///     `moe_out_r += sh_out_r` the serial path ran per row — same operands, same
+///     order, one launch over `m*dim`.
+///
+/// Gated OFF (serial, byte-for-byte today's verify) on anything that would make
+/// a seam a real race or a different program: `Device::supports_dual_chain()` /
+/// `supports_compress_side()` (missing side stream or events), `swapAB`,
+/// `cublas_m1` (one handle bound to the main stream), a compressor snapshot
+/// (`spec_capture`, whose D2D copies run on the main stream), `skip_experts` /
+/// `skip_shared_expert` / no shared expert on this rank, and the shared expert's
+/// fused multi-row arms (`sh_exp_mrows` / `sh_pair_m` / `sh_exp_fused`), which
+/// are main-stream programs this arm does not re-issue.
+///
+/// GRAPH SAFETY: legal inside a capture. The fork is `record(main)` +
+/// `wait(side)` and the join is `record(side)` + `wait(main)` — both adjacent
+/// pairs on `cudaEventDisableTiming` events (see `devrt.rs`), which is exactly
+/// the pattern the whole-step graph (`DSV41_GRAPH_STEP`, ON by default) already
+/// records for `layer()`'s three forks under the same
+/// `cudaStreamCaptureModeRelaxed` capture, and the same one `DSV41_VERIFY_GRAPH`
+/// would record here. Both sides of every pair are inside the capture, so the
+/// two ops become graph edges; a capture that refuses them fails at
+/// `capture_end` and the existing DRY→CAPTURE failure latch drops the request to
+/// the direct launches, where the same calls are plain stream ops.
+/// "0"/unset is the A/B arm (serial).
+fn verify_fork() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_VERIFY_FORK").map(|v| v != "0").unwrap_or(false))
+}
+
 /// DSV41_ROPE_FUSE=0 reverts the q rope (and, under IDX_FUSE, the idx_q rope) to
 /// the standalone `apply_rope` launch. DEFAULT ON. The fused epilogue performs
 /// `apply_rope_kernel`'s rotation expression verbatim on the same `v = acc + bias`
@@ -9512,6 +9578,49 @@ impl<'a> DevChain<'a> {
                 )?;
             }
         }
+        // ---- VERIFY_FORK (DSV41_VERIFY_FORK): the attention dual chain ----
+        // The m-row twin of `layer()`'s DUAL_CHAIN fork. `qr_r` and `kv_r` are
+        // complete at this point (the block-wide `lin2`/`proj_mrows` pair, or the
+        // per-row loop above) and are the two chains' LAST SHARED NODE: from here
+        // the q chain below reads/writes only `qr_r`/`q_r`/`xq_r`/`xsc_r`, and
+        // the kv half reads/writes only `kv_r` in place. The fork is therefore the
+        // point at which the two are independent, and it is recorded on the MAIN
+        // stream so the side stream cannot start before the projections land.
+        // `kv_stream` is the main stream on every other path, so the serial
+        // behaviour is byte-for-byte the old one (same launches, same order, same
+        // stream). See [`verify_fork`] for the whole gate + the capture argument.
+        let dual = verify_fork() && self.dev.supports_dual_chain();
+        let kv_stream = if dual { self.dev.side_stream2() } else { self.dev.stream() };
+        if dual {
+            self.dev.dual_chain_fork()?;
+        }
+        // ---- VERIFY_FORK: the compressor's projections on the THIRD stream ----
+        // Only `compress_proj_rows` is hoisted here — it is a pure function of
+        // `s.xn_r` (final since the pre-attention norm) and writes this layer's
+        // private `kvp_r`/`scp_r`, so it shares nothing with either chain and can
+        // be issued at the SAME fork point as the dual chain, overlapping the
+        // whole q/kv window. The pool+commit half deliberately stays inside the
+        // per-row interleave below: the verify's read side must see row r's OWN
+        // `*clen`, which the per-row commit publishes on the main stream (audit
+        // defects #1/#2). The join below sits before `compress_rows_fused` / the
+        // per-row `compress_row` — the first readers of `kvp_r`/`scp_r`.
+        //
+        // `spec_capture` excludes the arm because `compress_proj_rows`' snapshot
+        // (`s.spec_snap_kvp`/`scp`) is a `memcpy_d2d` on the MAIN stream: on the
+        // side stream it would race the very projections it saves.
+        let comp_side = verify_fork()
+            && cfg.compress_ratio(layer) > 0
+            && cfg.is_kv_source(layer)
+            && !self.spec_capture
+            && !cublas_m1()
+            && ld.comp_wkv.is_some()
+            && ld.comp_norm.is_some()
+            && self.dev.supports_compress_side();
+        let mut comp_proj_side = false;
+        if comp_side {
+            self.dev.compress_side_fork()?;
+            comp_proj_side = self.compress_proj_rows(layer, m, self.dev.side_stream3())?;
+        }
         // R2 (DSV41_ATTN_LIN_FUSE): at `m == 1` the wq_b projection IS the EAGER
         // path's fused launch — the rmsnorm of the raw `qr_r` and the rope of
         // its own output folded into the GEMV's prologue/epilogue (NORM_FUSE,
@@ -9644,15 +9753,20 @@ impl<'a> DevChain<'a> {
                 )?;
             }
         }
-        self.norm_rows(
+        // VERIFY_FORK: the kv half of the dual chain. `kv_stream` is the side
+        // stream when the fork above took (so the norm + rope run UNDER the q
+        // chain instead of after it) and the main stream otherwise — same two
+        // launches, same operands, same order, byte-for-byte the old serial pair.
+        self.norm_rows_on(
             self.s.kv_r.ptr as *const f32,
             ld.kv_norm.as_ref().unwrap().as_f32(),
             self.s.kv_r.ptr as *mut f32,
             m,
             hd,
             cfg.norm_eps,
+            kv_stream,
         )?;
-        self.dev.apply_rope(
+        self.dev.apply_rope_on(
             self.s.kv_r.ptr as *mut f32,
             self.cos.as_f32(),
             self.sin.as_f32(),
@@ -9665,7 +9779,15 @@ impl<'a> DevChain<'a> {
             0,
             1,
             false,
+            kv_stream,
         )?;
+        // VERIFY_FORK join: the kv half is fully issued — nothing below writes
+        // `kv_r` until the per-row `ring_append`, its first consumer. Joining here
+        // makes the finished `kv_r` visible to the main stream before the
+        // interleave starts. A no-op when the fork did not take.
+        if dual {
+            self.dev.dual_chain_join()?;
+        }
 
         // ---- the per-row interleave: append → window → compress → select →
         //      sparse attention, ONE ROW AT A TIME ----
@@ -9708,8 +9830,17 @@ impl<'a> DevChain<'a> {
         // zeroing and the DSV41_SPEC scratch snapshot) are a pure function of
         // `s.xn_r`, which no later step of this layer writes, so they stay
         // block-wide; only the state/pool/commit half is interleaved below.
-        let comp_proj = if is_comp_src {
-            self.compress_proj_rows(layer, m)?
+        //
+        // VERIFY_FORK: when the side arm took, the projections were ALREADY
+        // issued on `side_stream3` back at the dual chain's fork point; this is
+        // their join — the point where the main stream needs `kvp_r`/`scp_r`
+        // (`compress_rows_fused` below, and the per-row `compress_row` in the
+        // interleave). The serial arm is the untouched call, byte for byte.
+        let comp_proj = if comp_side {
+            self.dev.compress_side_join()?;
+            comp_proj_side
+        } else if is_comp_src {
+            self.compress_proj_rows(layer, m, self.dev.stream())?
         } else {
             false
         };
@@ -10822,7 +10953,12 @@ impl<'a> DevChain<'a> {
     /// Returns `false` when the layer carries no compressor (`comp_wkv`/`comp_norm`
     /// absent): no row runs at all then and the host mirror is left untouched, which
     /// is the early return `compress_rows` used to take.
-    fn compress_proj_rows(&self, layer: usize, m: usize) -> Result<bool> {
+    fn compress_proj_rows(
+        &self,
+        layer: usize,
+        m: usize,
+        st: ferrite_kernel::devrt::CuStream,
+    ) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
         let hd = cfg.head_dim;
@@ -10830,7 +10966,6 @@ impl<'a> DevChain<'a> {
         let (Some(wkv), Some(_)) = (ld.comp_wkv.as_ref(), ld.comp_norm.as_ref()) else {
             return Ok(false);
         };
-        let st = self.dev.stream();
         for r in 0..m {
             let xr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
             self.lin_f32_on(
@@ -11537,6 +11672,45 @@ impl<'a> DevChain<'a> {
             self.comm.as_ref().map(|c| c.rank == 0).unwrap_or(true)
         };
         let mdim = m * dim;
+
+        // ---- VERIFY_FORK: the MoE dual chain (routed vs shared expert) ----
+        // The m-row twin of `moe()`'s MOE_DUAL. The fork is recorded on the MAIN
+        // stream BEFORE the gate, i.e. at a point where `xn_r` (and the T1 fp8
+        // staging the hc tail may have emitted) is already complete — so the
+        // shared half reads exactly what the serial code reads, it just no longer
+        // WAITS for the gate + the routed experts in between. The two halves read
+        // `xn_r` through DISJOINT quantisations (routed: `xq4_r`/`xsc4_r`, shared:
+        // `xq`/`xsc`) and use disjoint scratch (`ex_act_r`/`ex_down_r` vs
+        // `sh_act_r`). See [`verify_fork`] for the gate and the capture argument.
+        //
+        // The shared half may NOT fold into `moe_out_r`: the routed down-reduce
+        // OVERWRITES that buffer at the same time. It therefore always writes its
+        // `w2` block to the DISJOINT `sh_out_r` scratch (the same buffer
+        // `shared_expert_mrows` uses for exactly this reason) and the join below
+        // runs the element-wise merge the serial path ran per row.
+        //
+        // Excluded: the shared expert's fused multi-row arms, which are
+        // main-stream programs this arm does not re-issue, and the two skip
+        // switches (nothing to overlap / nothing to merge).
+        let sh_w6 = ld.shared_w1.is_some()
+            && ld.shared_w1_scale.is_some()
+            && ld.shared_w3.is_some()
+            && ld.shared_w3_scale.is_some()
+            && ld.shared_w2.is_some()
+            && ld.shared_w2_scale.is_some();
+        let dual = verify_fork()
+            && !self.opts.skip_experts
+            && !self.opts.skip_shared_expert
+            && shared_rank
+            && sh_w6
+            && !sh_exp_mrows()
+            && !sh_pair_m()
+            && !sh_exp_fused()
+            && self.dev.supports_dual_chain();
+        let sh_st = if dual { self.dev.side_stream2() } else { self.dev.stream() };
+        if dual {
+            self.dev.dual_chain_fork()?;
+        }
 
         // ---- gate + route ----
         // The gate runs on EVERY path (exactly as `moe()` does: `skip_experts` only
