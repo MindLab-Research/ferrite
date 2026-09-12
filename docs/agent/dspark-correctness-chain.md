@@ -2296,3 +2296,19 @@ DSV41_BF16_TRUNCATE=1
 **400 的路径更新**（k_acc=5 发现后）：
 - 高 accept 任务（计数）：6 tok/step × (1000/15ms) = **400 tok/s** ✓（如果步时 ≤15ms）
 - SH_PAIR template&lt;M&gt;（-5ms）+ Wave 1（-8ms）+ SWALLOW（-4.5ms，待修复）= 步时 33-17.5 = **~15.5ms** → 接近 400 ✓
+
+## 400 路径的量化分析（k_acc=5 发现 + Wave 1 成功 + SH_PAIR 实施后）
+
+**数字任务（计数 1-200）的 accept=5 → 6 tok/step**：
+
+| 优化阶段 | 步时（估算） | 吞吐（6 tok/step） | 400 达标 |
+|---|---|---|---|
+| Wave 1（当前）| ~25ms | 240 tok/s | ✗（差 67%）|
+| + SH_PAIR template&lt;M&gt;（-5ms）| ~20ms | 300 tok/s | ✗（差 33%）|
+| + SWALLOW_STEP（-4.5ms，待修复）| ~15.5ms | **387 tok/s** | **≈400**（差 3%）|
+| + tcgen05（-2ms，待修复）| ~13.5ms | **444 tok/s** | **✓** |
+
+**出师表（accept ~1.2）→ 2.2 tok/step**：
+- 所有优化后 ~13.5ms → 163 tok/s（不是 400——但出师表不是唯一测试任务）
+
+**结论**：400 在高 accept 任务（计数、代码生成）上可达——需要 SH_PAIR + SWALLOW + tcgen05 三个阻塞全部解除。当前最关键的下一步是 SH_PAIR 的 parity 测试（正在跑）。
