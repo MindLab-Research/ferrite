@@ -3141,3 +3141,20 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 | **R2 ATTN_LIN_FUSE** | **~5.0 不变** | **82.9（+6%）** | **✓✓ 真正的优化！** |
 
 **R2 的贡献**：verify m=1 从 7 发降到 ~4 发（lin2 替代 proj_mrows×2，lin_rope_norm 替代 norm+quant+proj+rope 的 4 发）——**EAGER 复用策略有效**！
+
+## 🎯 两个 accept 退化的根因修复（accept-degradation-rootcause 的发现 + 我的应用）
+
+### BUG 1: MARKOV_SLICED 的 logits 行偏移双重计算
+**根因**：host 侧 `wrapping_add(step * seg)`（dspark_dev.rs:3188）+ kernel 内部 `lrow = logits + step*n`（dsv41_glue.cu:1706）→ **step s 读 row 2s**！step 3-4 读越界的陈旧数据（超出写入范围 [0, 5*16160)）
+**指纹**：k_acc 序列 "3 1 3 3 3..." = 第 0 步对（首 draft 被接受）后续全错
+**修复**：删 host 侧偏移（kernel 契约是 [bs,n] 基址）
+**预期**：修复后 MARKOV_SLICED 应该 k_acc 恢复 ~5.0 且 draft -0.7~0.8ms
+
+### BUG 2: LAZY_SDR 的 set_pos_ctr 是承重构件不是 readback
+**根因**：lazy_sdr() 文档声称 "nothing in the m-row path reads pos_ctr"——**错**！apply_rope 的 per-row 回退（:9543 q rope、:10047 逆 o-rope、:10589 indexer q rope）都读 `t = *pos_ctr + off` 算绝对位置。删掉 H2D 后 row i 的 rope 在 pos 而不是 pos+i → verify argmax 被污染
+**指纹**：k_acc "5 3 1 1 1..." = row 0 对后续错（row i 的位置错误）
+**修复**：恢复 set_pos_ctr(pos+i) 的无条件调用（LAZY_SDR 只保留安全部分：tap-staging D2D 合并）
+**预期**：修复后 LAZY_SDR 的节省缩水（只剩 D2D 合并 ~-0.2ms）但不再退化
+
+### 重要教训
+**"数值中性"的优化可能不是数值中性的**——必须验证 accept 前后一致才能认为优化有效。两个 bug 都是"看似无害的时序/指针优化"实际破坏了承重不变量。
