@@ -2109,3 +2109,19 @@ Step 40-41: 3 1                     (mean 2.0)
 - **draft head 的能力不是瓶颈——位置难度才是**！
 
 **对 400 的意义**：如果 accept 的 0.9→2.0 差异主要是位置难度（不是 draft 能力），那**长上下文的平均 accept 可能更高**（好区和差区平均）。出师表 120 字太短——统计不足。
+
+## 下一波测试计划（SWALLOW 重测后）
+
+**第一波（零成本 A/B）**：全 mrows gates + nsys 按 kernel 名聚合——验证设计口径 vs 实测：
+- DSV41_GATE_MROWS=1（-2.75ms 设计口径——最高 ROI）
+- DSV41_INDEXER_MROWS=1（-1.0~1.5ms）
+- DSV41_VERIFY_HEAD_MROWS=1（-0.7~0.9ms，但与 SWALLOW m=6 冲突！）
+- DSV41_NORM_MROWS=1（结构性零收益——不期望节省）
+- DSV41_COMPRESSOR_MROWS=1（-0.2~0.3ms）
+- DSV41_SH_EXP_MROWS=1（零收益已两次实测——作对照）
+
+**关键**：用 nsys（nccl 模式）做 per-kernel timing，把设计口径钉死成实测数字。
+
+**第二波（hc A1+A2）**：HC_VERIFY_FUSE=1（truncate=false 修复后）+ HC_FRONT_ROWS=1
+**第三波（SH_PAIR）**：M=1 版 A/B → template<M>（subagent 设计中）
+**第四波（tcgen05）**：对齐修复后的 smoke → parity
