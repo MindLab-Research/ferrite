@@ -2199,3 +2199,13 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **修复（已提交）**：`emitted` 构造后把**最后一个 token** 回写 `s.ids`（4 字节 H2D/轮，两臂 legacy/aligned 都加）。**结构性教训**：`s.ids`（自喂 token）、`pos_ctr`、`pos_rows`、`compress_len` 四个跨步不变量由不同机制分别推动——单行路径自洽，**spec 把推进从 1 变成 1+k_acc 时只照顾了计数器没照顾 token**。建议后续加 `debug_assert_eq!(download(s.ids), token)`（这个检查在第一步就会爆掉）。
 
 **判词的另两项**：verify 的 engram hash 写共享 cache 但 rollback 不覆盖（当前无害——被拒位置 ≥ 提交后的计数器且每步重写——但与缺陷同源，建议进 snapshot）；`pos_base` 的 host 算术与 device 读取的两条推导依赖 stream 次序（建议断言）。
+
+## 2026-09-12 修复前的基线档案（s.ids 回写修复的 A/B 对照用）
+
+| 任务 | SPEC 修复前（sa_0） | EAGER 对照 | SPEC 修复后（c7ad988b，待出） |
+|---|---|---|---|
+| 数字任务（数到 100） | LEN 56、**双字 10**、文本崩（"我会按 1 . 到？…11\n2a3\n4i"）、k_acc={0:15,1:9,2:3}（27 步） | **LEN 216、完美数数 1..100**（仅 "anao"、跳 50 等小瑕疵） | **期望：像 EAGER 一样数对** |
+| 出师表 | LEN 54、双字 4（"蜀蜀汉/丞相丞相/篇篇/以下是以下"） | LEN 146、双字 3（基本正确） | 期望：无双字 |
+| 步时 | 47.7ms（20.9 tok/s） | ~6.2ms（162 tok/s，无 spec 开销） | — |
+
+**注**：SEED_ALIGN=1 的 arm 在 AR v5 上死锁（`[ar5-hang] rank=1 peer=5/6/7 need=56 cur=53`）——路线 A 的新代码与 v5 的交互待查（不阻塞主线：s.ids 修复独立于 SEED_ALIGN）。
