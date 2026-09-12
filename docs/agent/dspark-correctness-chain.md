@@ -4270,3 +4270,24 @@ self.dev.gemm_fp8_mx_rope_norm(
 - 与 D1 联合：全程 DIRECT + 每块双计 = 镜像彻底跑飞 → "重置到 12"！
 
 **完整机制链**：D2（池饥饿→全程 DIRECT）→ D1（双计→镜像 2× 跑飞）→ indexer_topk 读旧 group → attention 读旧上下文 → "重置到 12" ✓
+
+## 🎯 base 无图测试结果（be1bd6bb）——D1 确认为根因！
+
+**结果**：数字正确=61/72——**与有图完全相同的损坏**（line 62 起：12,13,14,15,28,...,44）！
+
+**判定**：
+1. **去掉 VERIFY_GRAPH 没有修复损坏**——图不是（唯一）根因
+2. **D1（DIRECT 臂双计）在无图模式下影响每个块**：
+   - 无图 → 所有块走 DIRECT 臂
+   - DIRECT 臂：compress_row 推进 mirror + advance_compress_lens 再推进 = **每块双计！**
+   - mirror 以 2× 速率跑飞 → indexer 读错位置 → "重置到 12"
+3. **S1 修复（删除 DIRECT 臂的双重推进）将解决这个损坏**！
+
+**完整图景**：
+| 配置 | 损坏 | 根因 |
+|---|---|---|
+| base（lazy+graph）| line 62 重置 | D1（DIRECT 双计）+ D2（池饥饿→全程 DIRECT）|
+| base 无图（lazy 无 graph）| **line 62 重置（相同！）** | **D1（全 DIRECT 双计）——纯 D1 就够！** |
+| spec 最小（legacy）| line 6 双字 | 不同的 bug（legacy 臂特有）|
+
+**S1 修复的验证**：修复后跑 base 无图 → 应该干净（line 62 重置消失）
