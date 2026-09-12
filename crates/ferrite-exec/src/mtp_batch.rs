@@ -112,6 +112,27 @@
 //! `t0`/`total` (`dsa_host_advance`, zero-copy reads; there is no RoPE in the
 //! mega chain) — so the batched verify needs NO per-row position table, unlike
 //! the DSV41 path (plan §4.2). The row→seq mapping is the whole story here.
+//!
+//! # Verdict 5 — the row→seq map is the ONE place the two layouts differ
+//!
+//! `dsa_append_batched`'s kernel grid is `(B, ntok, h)` and it addresses
+//! `kvb + (seq*ntok + tok)*row` — i.e. it ALREADY implements the padded
+//! seq-major map, with `ntok = n_v`. The `cuda.rs` call site pins `ntok = 1`
+//! because the DECODE-batched layout is `[B][1][row]` there (verdict 4). The
+//! MTP verify's rows are `[B][n_v]` by construction ([`verify_rows`]), so the
+//! same kernel wants `ntok = n_v` plus two fixes: the idx/gate tail must read
+//! the ROW's `ki[row*idm + c]` (today: `ki[seq*idm + c]`), and the device
+//! advance must move `t0` by the seq's whole block, not by 1.
+//!
+//! The ragged layout (plan §3.2) cannot be expressed by a divisor at all —
+//! `Σ len_r` rows have no constant pitch — so it passes a `[rows][2]`
+//! `(seq, tok)` device table ([`SeqRowMap::row_table`]) plus the per-seq block
+//! lengths (the advance step). [`AppendPlan`] describes both shapes in one
+//! struct: `row_map = None, block_len = None, ntok = n_v` for padded,
+//! `row_map = Some(_), block_len = Some(_), ntok = 0` for ragged. With
+//! `ntok = 1` and no tables it degenerates to exactly today's launch — the
+//! backward-compatibility invariant the mapped kernel is written against
+//! (`ferrite_dsa_append_batched_mapped`, `kernels/cuda/ferrite_kernels.cu`).
 
 /// The seq-count ladder the batched paths pad to (mirrors the `[1,2,4,8,16,32]`
 /// search in `tp.rs::decode_step_batched` and `gpu_engine`'s scheduler). The
@@ -157,6 +178,249 @@ pub fn seq_of_row(row: usize, n_v: usize) -> usize {
 /// `[t_last, d1..d_{n_v-1}]` and the `ntok` axis of `dsa_append_batched`.
 pub fn tok_of_row(row: usize, n_v: usize) -> usize {
     row % n_v.max(1)
+}
+
+/// Which block layout a batched verify pass uses (plan §3.1 A vs §3.2 B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowLayout {
+    /// `padded_seqs(live) * n_v` rows: every seq owns exactly `n_v` rows,
+    /// seq-major. FIXED shape, so it can live inside the `(seqs, n_v)`-keyed
+    /// graph; a short block's missing drafts are `PAD_TOKEN` rows that map
+    /// onto the shared dummy table slots (their outputs are discarded).
+    Padded,
+    /// `Σ_r len_r` rows: each seq owns its own block length (`len_r = 1 + k_r`
+    /// — the anchor row plus its accepted-draft block). VARIABLE shape, so it
+    /// is a non-graph path only (plan §3.2): `(seq, tok)` comes from a device
+    /// table, not from a divisor.
+    Ragged,
+}
+
+/// `(row) -> (seq_slot, tok_in_block)` for a batched pass, plus the per-seq
+/// bases the rows' positions are offset from.
+///
+/// This is the ONE piece of arithmetic that differs between the padded and the
+/// ragged verify layout (verdict 5): every other consumer — the per-seq
+/// pointer tables (`gdn_state_tables`/`dsa_ptr_tables`), the commit plan, the
+/// position tables — is indexed by the `seq_slot` this returns.
+///
+/// Both layouts are SEQ-MAJOR: seq `s` owns the contiguous row range
+/// `[prefix[s], prefix[s+1])`, so the rows of one seq stay in ascending token
+/// order (which is what the per-row attention interleave depends on, plan
+/// §3.1's "排序坑").
+///
+/// Positions: a row's position/slot is `pos_base[seq] + tok`, i.e. each seq
+/// carries its OWN base. For GLM's DSA that base is the seq's pinned `t0` (the
+/// cache slot the row is appended at) rather than a RoPE position — the mega
+/// chain has no RoPE (the module's closing NOTE).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqRowMap {
+    layout: RowLayout,
+    /// Rows per seq (padded: `seqs` copies of `n_v`).
+    block_len: Vec<usize>,
+    /// `[seqs + 1]` row offsets; `prefix[seqs] == rows()`. The seq-major
+    /// partition — a ragged map's whole content.
+    prefix: Vec<usize>,
+}
+
+impl SeqRowMap {
+    /// The padded map: `seqs` seqs of `n_v` rows each. `seqs` is the PADDED
+    /// seq count (callers use [`padded_seqs`]); `n_v` is the verify width.
+    pub fn padded(seqs: usize, n_v: usize) -> Self {
+        let n_v = n_v.max(1);
+        let seqs = seqs.max(1);
+        Self::from_blocks(RowLayout::Padded, &vec![n_v; seqs])
+    }
+
+    /// The padded map for `live` seqs: sizes the block off the ladder rung
+    /// (the same padding the batched decode uses, so the graph is reused
+    /// across membership changes inside a rung).
+    pub fn padded_for_live(live: usize, n_v: usize) -> Self {
+        Self::padded(padded_seqs(live), n_v)
+    }
+
+    /// The ragged map: one entry per live seq, its own block length. A seq with
+    /// a block of 0 (its whole draft block was consumed/rejected) owns no row —
+    /// the mapping simply skips it.
+    pub fn ragged(block_lens: &[usize]) -> Self {
+        Self::from_blocks(RowLayout::Ragged, block_lens)
+    }
+
+    /// The map a verify pass uses: `ragged_lens = None` → the padded default
+    /// (Step-B: plan §3.3 "A 起步"), `Some(lens)` → the ragged layout.
+    pub fn for_verify(live: usize, n_v: usize, ragged_lens: Option<&[usize]>) -> Self {
+        match ragged_lens {
+            None => Self::padded(padded_seqs(live), n_v),
+            Some(lens) => Self::ragged(lens),
+        }
+    }
+
+    fn from_blocks(layout: RowLayout, block_lens: &[usize]) -> Self {
+        let mut prefix = Vec::with_capacity(block_lens.len() + 1);
+        prefix.push(0usize);
+        let mut acc = 0usize;
+        for &b in block_lens {
+            acc += b;
+            prefix.push(acc);
+        }
+        Self { layout, block_len: block_lens.to_vec(), prefix }
+    }
+
+    pub fn layout(&self) -> RowLayout {
+        self.layout
+    }
+
+    /// The number of seq slots (B — the width of every per-seq table).
+    pub fn seqs(&self) -> usize {
+        self.block_len.len()
+    }
+
+    /// The number of rows (the kvb/ki/gate row dimension, grid.x).
+    pub fn rows(&self) -> usize {
+        self.prefix[self.prefix.len() - 1]
+    }
+
+    /// The uniform block length, when the map has one (padded always does).
+    pub fn n_v(&self) -> Option<usize> {
+        match self.block_len.first() {
+            Some(&first) if self.block_len.iter().all(|&b| b == first) => Some(first),
+            _ => None,
+        }
+    }
+
+    /// Rows owned by `seq`.
+    pub fn block_len(&self, seq: usize) -> Option<usize> {
+        self.block_len.get(seq).copied()
+    }
+
+    /// Whether the mapping needs a DEVICE table (ragged) or is carried by the
+    /// kernel's `ntok` divisor (padded — no table, so the padded launch is
+    /// bit-identical to today's `dsa_append_batched`).
+    pub fn needs_row_table(&self) -> bool {
+        self.layout == RowLayout::Ragged
+    }
+
+    /// The seq slot `row` belongs to. `None` past the last row.
+    pub fn seq_of_row(&self, row: usize) -> Option<usize> {
+        if row >= self.rows() {
+            return None;
+        }
+        // the last prefix <= row; `prefix[0] == 0 <= row` keeps this >= 1
+        let s = self.prefix.partition_point(|p| *p <= row) - 1;
+        Some(s)
+    }
+
+    /// The slot inside its seq `row` occupies: the index into the seq's draft
+    /// block (`[t_last, d1..]`) and the `ntok` axis of the cache append.
+    pub fn tok_of_row(&self, row: usize) -> Option<usize> {
+        let seq = self.seq_of_row(row)?;
+        Some(row - self.prefix[seq])
+    }
+
+    /// `(seq_slot, tok_in_block)` for `row`.
+    pub fn at(&self, row: usize) -> Option<(usize, usize)> {
+        let seq = self.seq_of_row(row)?;
+        Some((seq, row - self.prefix[seq]))
+    }
+
+    /// The position/slot of `row`: its seq's own base plus the row's token
+    /// offset. `None` when `row` is out of range or `pos_base` is short.
+    pub fn pos_of_row(&self, row: usize, pos_base: &[i32]) -> Option<i32> {
+        let (seq, tok) = self.at(row)?;
+        pos_base.get(seq)?.checked_add(i32::try_from(tok).ok()?)
+    }
+
+    /// The `[seqs]` per-seq base table to hand the device (`pos_base` itself —
+    /// this validates the length, which is the mistake worth catching before
+    /// the H2D: a short table silently reads a neighbour's base).
+    pub fn pos_table(&self, pos_base: &[i32]) -> Option<Vec<i32>> {
+        if pos_base.len() != self.seqs() {
+            return None;
+        }
+        Some(pos_base.to_vec())
+    }
+
+    /// Rows `seq` contributes — the DEVICE advance step for its pinned
+    /// `t0`/`total` (`t0 += dev_adv_step(seq)`), not a hard-coded `+1`.
+    pub fn dev_adv_step(&self, seq: usize) -> Option<usize> {
+        self.block_len(seq)
+    }
+
+    /// The `[rows][2]` interleaved `(seq, tok)` table the ragged kernel maps
+    /// through. Also correct for padded (it is the same mapping), but padded
+    /// passes `None` so the divisor path — and therefore the graph — is used.
+    pub fn row_table(&self) -> Vec<i32> {
+        let mut t = Vec::with_capacity(self.rows() * 2);
+        for seq in 0..self.seqs() {
+            for tok in 0..self.block_len[seq] {
+                t.push(seq as i32);
+                t.push(tok as i32);
+            }
+        }
+        t
+    }
+
+    /// The launch arguments this map implies (verdict 5). `None` when
+    /// `pos_base` does not carry exactly one base per seq.
+    pub fn append_plan(&self, pos_base: &[i32]) -> Option<AppendPlan> {
+        let (ntok, row_map) = if self.needs_row_table() {
+            (0usize, Some(self.row_table()))
+        } else {
+            (self.n_v().unwrap_or(1), None)
+        };
+        let block_len = self
+            .needs_row_table()
+            .then(|| self.block_len.iter().map(|&b| b as i32).collect::<Vec<i32>>());
+        Some(AppendPlan {
+            rows: self.rows(),
+            seqs: self.seqs(),
+            ntok,
+            row_map,
+            block_len,
+            pos_base: self.pos_table(pos_base)?,
+        })
+    }
+}
+
+/// The `ferrite_dsa_append_batched_mapped` launch arguments a [`SeqRowMap`]
+/// derives. Both tables are OPTIONAL on purpose:
+///
+/// - **padded** (`ntok = n_v`, no tables) — the kernel derives
+///   `seq = row / ntok, tok = row % ntok` and advances `t0` by `ntok`. This is
+///   also exactly what today's `ferrite_dsa_append_batched` does at
+///   `ntok = 1` (`rows == seqs`), i.e. the decode-batched launch is unchanged.
+/// - **ragged** (`ntok = 0`) — the kernel reads `row_map[2*row]` /
+///   `row_map[2*row+1]` and advances `t0` by `block_len[seq]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendPlan {
+    /// Grid rows, and the kvb/ki/gate row dimension.
+    pub rows: usize,
+    /// The per-seq tables' width (the SEQ count, NOT the row count). Every
+    /// per-seq kernel (kpool/indexer/expand) and pointer table keeps receiving
+    /// this.
+    pub seqs: usize,
+    /// `> 0` → divisor mapping + advance step; `0` → the tables below.
+    pub ntok: usize,
+    /// `[rows][2]` interleaved `(seq, tok)` — ragged only.
+    pub row_map: Option<Vec<i32>>,
+    /// `[seqs]` rows per seq — ragged only (the advance step).
+    pub block_len: Option<Vec<i32>>,
+    /// `[seqs]` per-seq base the row's `tok` is offset from.
+    pub pos_base: Vec<i32>,
+}
+
+impl AppendPlan {
+    /// Elements in the device `(seq, tok)` table: `2 * rows`.
+    pub fn row_map_elems(&self) -> usize {
+        self.rows * 2
+    }
+
+    /// The device advance step for `seq` under this plan.
+    pub fn dev_adv_step(&self, seq: usize) -> Option<usize> {
+        match &self.block_len {
+            Some(b) => b.get(seq).map(|&v| v as usize),
+            None => Some(self.ntok),
+        }
+    }
 }
 
 /// Whether the draft chain's graphs (`mega_d{seq}_{i}`) are shared across seqs.
@@ -346,5 +610,160 @@ mod tests {
         assert_eq!(l.hprev_offset(3), 3 * 5120);
         // k=0 (a pad row that forgot to set 1) must not go negative.
         assert_eq!(l.hf_v_offset(1, 0), 1 * 3 * 5120);
+    }
+
+    /// The identity `(seq, tok)` table a `rows == seqs, ntok == 1` launch has
+    /// — i.e. today's decode-batched mapping.
+    fn identity_table(seqs: usize) -> Vec<i32> {
+        (0..seqs).flat_map(|s| [s as i32, 0]).collect()
+    }
+
+    #[test]
+    fn padded_map_is_the_row_divide() {
+        // B=4 padded seqs of n_v=3 rows: row r -> (r/3, r%3), the Step-B form.
+        let m = SeqRowMap::padded(4, 3);
+        assert_eq!(m.layout(), RowLayout::Padded);
+        assert_eq!((m.seqs(), m.rows()), (4, 12));
+        assert_eq!(m.n_v(), Some(3));
+        assert_eq!(m.at(0), Some((0, 0)), "the anchor row of seq 0");
+        assert_eq!(m.at(2), Some((0, 2)));
+        assert_eq!(m.at(3), Some((1, 0)), "seq 1's anchor");
+        assert_eq!(m.at(5), Some((1, 2)));
+        assert_eq!(m.at(11), Some((3, 2)));
+        assert_eq!(m.at(12), None, "past the block");
+        assert_eq!(m.block_len(3), Some(3));
+        assert_eq!(m.block_len(4), None);
+        assert!(!m.needs_row_table(), "the divisor carries the padded map");
+        // agrees with the standalone arithmetic the graph key is sized from
+        for r in 0..m.rows() {
+            assert_eq!(m.seq_of_row(r), Some(seq_of_row(r, 3)));
+            assert_eq!(m.tok_of_row(r), Some(tok_of_row(r, 3)));
+        }
+    }
+
+    #[test]
+    fn padded_map_follows_the_ladder_rungs() {
+        // (live, n_v) -> (padded seqs, rows) exactly as the graphs are sized.
+        for (live, n_v) in [(0usize, 3usize), (1, 3), (2, 3), (3, 3), (16, 3), (16, 5), (33, 5)] {
+            let m = SeqRowMap::padded_for_live(live, n_v);
+            assert_eq!(m.seqs(), padded_seqs(live));
+            assert_eq!(m.rows(), verify_rows(live, n_v));
+            assert_eq!(m.n_v(), Some(n_v));
+            // every (seq, tok) slot is covered exactly once
+            let rows = m.rows();
+            let mut seen = vec![0usize; m.seqs() * n_v];
+            for r in 0..rows {
+                let (s, t) = m.at(r).expect("row in range");
+                seen[s * n_v + t] += 1;
+            }
+            assert!(seen.iter().all(|&c| c == 1), "live={live} n_v={n_v}");
+            // the device table (if it were used) is the same mapping
+            assert_eq!(m.row_table().len(), rows * 2);
+        }
+    }
+
+    #[test]
+    fn ragged_map_is_the_block_prefix_sum() {
+        // the tail round of B=3: seq0 3 rows, seq1 1 row, seq2 5 rows.
+        let m = SeqRowMap::ragged(&[3, 1, 5]);
+        assert_eq!(m.layout(), RowLayout::Ragged);
+        assert_eq!((m.seqs(), m.rows()), (3, 9));
+        assert_eq!(m.n_v(), None, "no uniform block length");
+        assert_eq!(m.block_len(1), Some(1));
+        assert_eq!(m.at(0), Some((0, 0)));
+        assert_eq!(m.at(2), Some((0, 2)));
+        assert_eq!(m.at(3), Some((1, 0)), "seq 1 owns exactly one row");
+        assert_eq!(m.at(4), Some((2, 0)), "seq 2 starts right after seq 1");
+        assert_eq!(m.at(8), Some((2, 4)));
+        assert_eq!(m.at(9), None);
+        assert!(m.needs_row_table());
+        assert_eq!(
+            m.row_table(),
+            vec![0, 0, 0, 1, 0, 2, 1, 0, 2, 0, 2, 1, 2, 2, 2, 3, 2, 4]
+        );
+    }
+
+    #[test]
+    fn ragged_map_skips_a_seq_with_no_rows() {
+        // A block that was entirely consumed owns no row: the partition must
+        // skip it, not hand its neighbour's rows to a phantom seq.
+        let m = SeqRowMap::ragged(&[2, 0, 1]);
+        assert_eq!(m.rows(), 3);
+        assert_eq!(m.at(1), Some((0, 1)));
+        assert_eq!(m.at(2), Some((2, 0)), "seq 1 is skipped, seq 2 answers");
+        assert_eq!(m.row_table(), vec![0, 0, 0, 1, 2, 0]);
+        assert_eq!(SeqRowMap::ragged(&[]).rows(), 0, "nothing to append");
+    }
+
+    /// The alias the `(seqs, n_v)` graph key exists to prevent (verdict 1):
+    /// 24 rows both ways, different seqs for the same row.
+    #[test]
+    fn ragged_rows_are_not_the_padded_divisor() {
+        let padded = SeqRowMap::padded(8, 3); // 24 rows under 8 seqs
+        let ragged = SeqRowMap::ragged(&[6, 6, 6, 6]); // 24 rows under 4 seqs
+        assert_eq!(padded.rows(), ragged.rows());
+        assert_ne!(padded.seqs(), ragged.seqs());
+        assert_ne!(padded.seq_of_row(6), ragged.seq_of_row(6));
+        assert_eq!(padded.seq_of_row(6), Some(2));
+        assert_eq!(ragged.seq_of_row(6), Some(1));
+        assert_ne!(padded.row_table(), ragged.row_table());
+    }
+
+    #[test]
+    fn append_plan_padded_needs_no_device_table() {
+        let m = SeqRowMap::padded(4, 3);
+        let pos = [100, 200, 300, 400];
+        let p = m.append_plan(&pos).expect("one base per seq");
+        assert_eq!((p.rows, p.seqs, p.ntok), (12, 4, 3));
+        assert!(p.row_map.is_none(), "padded: the ntok divisor carries it");
+        assert!(p.block_len.is_none());
+        assert_eq!(p.pos_base, vec![100, 200, 300, 400]);
+        assert_eq!(p.dev_adv_step(1), Some(3), "advance the whole block, not +1");
+        assert_eq!(m.pos_of_row(5, &pos), Some(202), "row 5 = seq 1, tok 2");
+        assert_eq!(m.dev_adv_step(1), Some(3));
+    }
+
+    /// BACKWARD COMPAT — the launch the code does TODAY (decode-batched:
+    /// `rows == seqs`, `ntok = 1`, no tables) must come out of the map
+    /// unchanged: that is the invariant the mapped kernel is written against.
+    #[test]
+    fn append_plan_reproduces_todays_decode_batched_launch() {
+        let live = 16;
+        let m = SeqRowMap::for_verify(live, 1, None);
+        let pos: Vec<i32> = (0..m.seqs() as i32).collect();
+        let p = m.append_plan(&pos).expect("plan");
+        assert_eq!(p.rows, live, "n == ni when ntok == 1");
+        assert_eq!(p.seqs, live);
+        assert_eq!(p.ntok, 1);
+        assert!(p.row_map.is_none() && p.block_len.is_none());
+        assert_eq!(p.pos_base, pos);
+        assert_eq!(p.row_map_elems(), 2 * live);
+        assert_eq!(m.row_table(), identity_table(live));
+        assert_eq!(m.dev_adv_step(7), Some(1), "tok == ntok-1 == 0 advances");
+    }
+
+    #[test]
+    fn append_plan_ragged_carries_both_tables() {
+        let m = SeqRowMap::ragged(&[3, 2]);
+        let p = m.append_plan(&[10, 20]).expect("plan");
+        assert_eq!((p.rows, p.seqs, p.ntok), (5, 2, 0), "ntok 0 = table mode");
+        assert_eq!(
+            p.row_map.as_deref(),
+            Some(&[0, 0, 0, 1, 0, 2, 1, 0, 1, 1][..])
+        );
+        assert_eq!(p.block_len.as_deref(), Some(&[3, 2][..]));
+        assert_eq!(p.dev_adv_step(0), Some(3));
+        assert_eq!(p.dev_adv_step(1), Some(2), "each seq advances by its own block");
+        assert_eq!(p.row_map_elems(), 10, "2 i32 per row");
+        assert_eq!(m.pos_of_row(4, &[10, 20]), Some(21), "row 4 = seq 1, tok 1");
+    }
+
+    #[test]
+    fn append_plan_rejects_a_short_base_table() {
+        let m = SeqRowMap::padded(4, 3);
+        assert!(m.pos_table(&[0, 1, 2, 3]).is_some());
+        assert!(m.pos_table(&[0, 1, 2]).is_none(), "one base per seq, not per row");
+        assert!(m.append_plan(&[0, 1, 2]).is_none());
+        assert_eq!(m.dev_adv_step(9), None, "no such seq");
     }
 }
