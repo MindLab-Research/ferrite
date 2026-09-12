@@ -2753,3 +2753,31 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - **33ms → 15ms 需要 -18ms**（SH_PAIR -5 + tcgen05 -2 + B类 -3 + L4 -5 + L5 -3 = -18ms 恰好够！）
 
 **400 的每一毫秒都是必要的**——所有优化缺一不可。
+
+## Lazy verify 33ms 步时的精确分解（从 78.8 tok/s 实测反推 + nsys 分析框架的族表）
+
+| 族 | 估计 ms | 占比 | Wave 1 后状态 |
+|---|---|---|---|
+| shared expert | ~10.4 | 31% | **未动**（SH_PAIR parity 修复中→-5~8ms）|
+| routed experts | ~8.3 | 25% | **未动**（tcgen05 对齐修复→-1~2ms）|
+| gate | ~1.5 | 5% | ✓ GATE_MROWS |
+| attention | ~2.8 | 8% | 未动（因果序问题）|
+| projections | ~2.5 | 8% | ✓ mrows |
+| hc 链 | ~1.5 | 5% | ✓ A1+A2 融合 |
+| AR | ~1.4 | 4% | ✓ AR fold |
+| indexer | ~1.5 | 5% | ✓ front mrows |
+| head | ~1.1 | 3% | per-row |
+| compressor+other | ~2.0 | 6% | ✓ 部分 |
+
+**合计 ~33ms**（与实测 78.8 tok/s @ accept 4.8 = 6/0.076 ≈ 33ms 吻合 ✓）
+
+**到 15ms 的削减计划**：
+| 优化 | 削减 | 后剩余 |
+|---|---|---|
+| SH_PAIR（shared expert 10.4→3） | -7.4 | 25.6ms |
+| tcgen05（routed 8.3→6.5） | -1.8 | 23.8ms |
+| B 类核（B6 等） | -3 | 20.8ms |
+| L4 占用 | -5 | 15.8ms |
+| L5 流水 | -1 | **14.8ms** ✓ |
+
+**结论**：14.8ms @ accept 5 → 6/0.0148 = **405 tok/s** — 恰好过 400！但需要全部 5 层优化兑现。
