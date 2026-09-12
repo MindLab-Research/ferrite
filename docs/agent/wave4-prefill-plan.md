@@ -505,3 +505,20 @@ pub fn prefill_chunk(&mut self, seq: u64, chunk_tokens: &[u32]) -> Result<()> {
 3. **conv1d（k=4）的边界**：chunk 首个 token 需要的 3 个前驱在 seq 的 conv state 里——**同样跨 chunk 连续**。
 
 **⇒ 设计上 chunked prefill 的 GDN 语义正确**（无需 kernel 改动）。**P0-E 的剩余工作 = 数值验证**：同一 prompt 整段 prefill vs `FERRITE_PREFILL_BUDGET=512` 分块——**逐 token 的输出必须逐位一致**（若有差 → 定位 chunk 边界的 state 提交时序）。
+
+---
+
+## 5. P0-A — 1M 上限的界清单（读码建表，2026-09-12）
+
+**必须同时抬的界**（漏一个 = 静默截断或 OOM）：
+
+| # | 位置 | 当前值 | 1M 需要 | 备注 |
+|---|---|---|---|---|
+| 1 | `ferrite-serve/src/gpu_engine.rs:37` `MAX_CTX` | **8100** | 1_048_576 | 提交时的拒绝界（`prompt + max_new > MAX_CTX` → InvalidArg）。**必须与 #2 的 pool 同步**（否则放进来了但 pool 装不下）|
+| 2 | `ferrite-kernel` 的 DSA cache 池 `max_tokens` per family | 由 pool 布局定（MAX_CTX 的注释自认是它的界）| 1M | **真正的物理界**；`ferrite-kernel/src/cuda.rs` 的 pool 尺寸 + `PoolMiss` 的类 |
+| 3 | DSV41 `DSV41_MAX_POS` | **65536**（`chain_dev.rs:1230` 的 `unwrap_or`）| 1_048_576 | KV buffer 的分配界（`max_comp = max_pos/ratio`——见 P0-F 的 14GB/卡）|
+| 4 | DSV41 `cfg.max_seq_len`（config.rs:39）| checkpoint 值 | ≥1M | `min(max_seq_len, DSV41_MAX_POS)` |
+| 5 | **索引/位置的 dtype** | `i32`（pos_ctr/pos_rows/idxs）| 1M < 2^31 ✓ | **2^31 是硬界**（4M token 时 i32 溢出——1M 安全）|
+| 6 | **锁步的位置一致性** | 各 rank 的 pos_ctr 独立推进（device 侧）| 同 | **P0-A 的隐藏风险**：1M 下任何一处"按 host 的 pos 分支"（如 indexer 的 host 镜像）在 chunk 边界漏一拍 = **静默截断**——**chunked prefill（P0-B）必须与 pos 的推进严格同流** |
+
+**验证顺序**（P0-A 的准入）: P0-F（内存表 ✓）→ P0-C（KV 口径统一）→ **P0-A**（抬 #1+#2+#3+#4 后跑 32k/128k/512k/1M 的逐步长验证 + `DSV41_PREFILL_BUDGET=512` 的整段-vs-分块 parity）。
