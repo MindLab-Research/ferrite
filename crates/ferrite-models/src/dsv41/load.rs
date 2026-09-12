@@ -922,7 +922,13 @@ impl<'a> Loader<'a> {
             ld.expert_pool = Some(pool);
             ld.experts_ilv = experts_ilv;
             if s == 0 {
-                take!(p, ld, "main_proj.weight", attn_norm); // placeholder
+                // THE ROOT CAUSE of the 100% q divergence (unit-diff verdict):
+                // this block once "parked" main_proj's spec in the attn_norm
+                // FIELD as a placeholder — a later take!-free load then left
+                // the field pointing at main_proj's fp8 bytes, which rmsnorm
+                // read as f32 weights → 1e27 explosions. main_proj has its own
+                // dedicated fields (w.main_proj*) loaded below; the placeholder
+                // overwrite of attn_norm is deleted.
                 if let Some(sp) = want(&format!("{p}.main_proj.weight")) {
                     w.main_proj = Some(self.load_tensor(&sp, world, rank)?);
                 }
