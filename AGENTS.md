@@ -2101,3 +2101,24 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **处置**：`verify_head_fold()` 默认 **OFF**（代价：head 的 1262MB 权重被流 m 次而非 1 次 ≈ **+0.7ms/步**——**正确性优先**）。根治（folded 与 v1 逐位一致）留给后续；`folded-head-korder` 已把 folded 对齐到 v2 序（**≠ v1**，故仍 gate OFF）。
 
 **剩余**：echo 9% + `accept 0.55`（`k_acc={0:13,1:6,2:3}`）⇒ **draft 质量仍是主要瓶颈**（`draft-quality-research` 在查 tap/main_proj/markov/窗口）。
+
+## 2026-09-12 会话：dspark MTP 的正确性修复链（accept 0.02 → 0.58）与 400 的路径
+
+**修复链（每一项都有代码级或实测证据）**:
+| # | 修复 | 效果/证据 |
+|---|---|---|
+| 1 | `load.rs:925` 的 placeholder hack（main_proj 的 spec 覆盖 attn_norm 字段） | attn_norm 的权重从 fp8 垃圾（1e27 输出）恢复正常 |
+| 2 | **draft 的 MoE ILV**（`!ld.experts_ilv` 让 batched 分支不可达 → draft 走顺序 reader 读交错池） | **accept 0.02 → 0.52**（26x） |
+| 3 | **verify 的 per-row interleave**（attention 的读侧：compress/indexer/sparse_attn 与 append 同行序） | 消掉"块末 clen"的未来 latent 污染 + 环绕回时的窗口覆盖 |
+| 4 | **`draft_forward(token, pos)`（B1）** | draft 块回到 anchor 自己的位置（60% 的 `drafts[0]==next` 是重复模式的副产品，修正后 33% 是干净读数） |
+| 5 | accept 链——**实测证明旧链正确**（`drafts[0]==next` + `drafts[j]==verify_out[j-1]`），索引对齐的变体测出 0.000（跨位置） | 不改为准 |
+| 6 | **投影 + MoE 的多行化**（`dsv41_gemm_fp8_mrows`、`rows=m` 进 grid） | verify 的 launch 6232 → ~3000（−52%） |
+| 7 | **`DSV41_VERIFY_HEAD_FOLD=0`（已改默认）** | **echo（`verify_out[0]==next`）33% → 9%**；文本相邻重复 6 → 4 |
+
+**关键机制（#7）**：`gemv_bf16_v2_wanted(n)` 需要 `n<2048`，head 的 `n=129280` ⇒ eager 的 head 走 **v1**（`gemv_bf16_kernel`，标量）；folded 的 `head_gemv_bf16_mrows` 与 v1 的 fma/解码配对不同 ⇒ ~1e-3 ⇒ 近 tie 翻转 ⇒ echo ⇒ `emitted=[next]+verify_out[..]` 写两遍 next = 重复。代价 ~+0.7ms/步（head 权重流 m 次）。
+
+**400 的口径（用户 2026-09-12 权威）**：**accept 3（5 中 3）是正常水平（官方亦然）⇒ 步时 ≤ 7.5ms**。
+**当前**：49.8ms（主链 6.15 + draft 4.9 + verify 38.5 + commit 0.2）@ accept 0.58。
+**剩余路径**：①**逐行融合**（rope/ring/attn 的 m 次 launch → kernel 内 m 行循环，保持逐行语义）②**吞主链步**（−6.15ms）③**draft 质量**（accept 0.58 → 3，draft-quality-research 在查 tap/main_proj/markov/窗口）。
+
+**提交纪律的教训（本会话犯了 3 次）**：共享工作树里**永远不要** `git add <file>` 而不跑一次**退出码被真正检查**的 `cargo check`——连带提交同伴的半成品会把 main 弄坏（本次 3 次：specstep 的 import、swallow 的两个未实现符号 + 一个 cast）。
