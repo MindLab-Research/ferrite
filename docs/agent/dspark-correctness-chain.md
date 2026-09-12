@@ -1475,3 +1475,15 @@ DSV41_EXPERT_ACT_E4M3=1 DSV41_EXPERT_TCGEN05_E4M3=1 DSV41_EXPERT_GROUPED=1 DSV41
 **lazy 比 batched 快**（22.56 vs ~39ms）——instruction-bound 下 batched 的激活×6 反而更贵。
 
 **行动**：accept-first-strategy subagent 正在分析 accept 1.214 → 2-3 的路径。
+
+## DSV41_DIFF_EAGER 探针的 accept 应用计划
+
+探针机制（chain_dev.rs:3420）：re-decode spec 步刚 emitted 的位置（一次一行，同前缀 KV），报首个两路径分歧的位置。
+
+**accept 分析的应用**：
+1. 对 accept 1.214 的最佳组合（P0-3+P1-5）跑 DIFF_EAGER
+2. 分歧位置 = draft 预测与 backbone 的分叉点
+3. 分叉点的层（用 DSV41_LAYER_DUMP）= 数值偏移的来源
+4. 这比盲改 gate 更精确——直接定位哪一层的哪个值偏了
+
+**与 accept-first-strategy 的关系**：subagent 正在分析 accept 1.214 → 2-3 的路径。DIFF_EAGER 是精确诊断的首选工具。
