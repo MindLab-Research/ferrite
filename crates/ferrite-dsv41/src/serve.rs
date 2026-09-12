@@ -864,6 +864,10 @@ fn prefill_or_resume(
             let first = e.first_token;
             let hit = e.snap.tokens;
             chain.kv_restore(&e.snap)?;
+            // The snapshot does NOT cover `s.ids` (step_dev is zero-H2D by
+            // design): without this the first decode step would feed whatever
+            // token the PREVIOUS request last produced. Restore it here.
+            chain.prime_input(first)?;
             kv_log(rank, ids.len(), Some(hit), cache.stats(), t0.elapsed());
             return Ok((first, hit));
         }

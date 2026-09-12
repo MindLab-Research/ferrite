@@ -1036,6 +1036,266 @@ fn cublas_m1() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_CUBLAS_M1").map(|v| v != "0").unwrap_or(false))
 }
 
+// ==================== verify-row-0 / eager parity probe =======================
+//
+// `DSV41_VROW0_PROBE=1`. The measured symptom it exists for: over a 154-step
+// trace `drafts[0] == next` held 60% of the time (the draft is good) while
+// `verify_out[0] == next` held only 16% — i.e. the verify block's row 0, the
+// forward that consumes `drafts[0]` at `pos + 1`, returns an argmax that repeats
+// its own input token far more often than the eager single-row path does at the
+// same position. A row that re-emits its input is what the repetition rate of
+// the emitted text looks like from the inside.
+//
+// The verify's row 0 is a RE-SCHEDULING of a plain single-row step (one m-row
+// forward instead of m one-row forwards), so `verify_out[0]` must equal the
+// eager argmax at `pos + 1` fed the same token. This probe puts those two
+// numbers, and the two logits rows they came from, side by side, one JSONL line
+// per step:
+//
+// ```text
+//   {"seq":..,"mode":"shadow","pos":..,"token":..,"next":..,"d0":..,
+//    "verify_argmax":..,"verify_host_argmax":..,"verify_top":[[idx,val]..],
+//    "eager_argmax":..,"eager_host_argmax":..,"eager_top":[[idx,val]..],
+//    "same":true|false,"verify_gap":val,"eager_gap":val,...}
+// ```
+//
+// `verify_argmax == next` in that record IS the 16% metric (the verify's row 0
+// emitting the token the anchor already emitted — a repetition, token for token),
+// and `eager_argmax == next` is the same quantity for the plain path, so the two
+// are directly comparable inside one line.
+//
+// Reading it: when `same` is false, the top-2 spread of BOTH rows says which kind
+// of disagreement it is. `verify_gap` (top1 - top2 of the verify row) below the
+// bf16/quantisation resolution means the two paths merely landed on different
+// sides of a near-tie — a boundary flip that a confidence gate can absorb. A
+// LARGE gap with different winners is a structural break (a kernel/geometry
+// difference between the m-row and the single-row scheduling), never noise.
+//
+// Two hooks, because the two paths can afford different things:
+//
+// * [`DevChain::dspark_shadow_step`] — the FULL probe. Its rollback leaves the
+//   chain exactly where the real step did (`pos_ctr == pos + 1`, the ring holding
+//   only `token`'s row), which is the one state a plain `step_dev(drafts[0],
+//   pos + 1)` can be compared FROM. That extra forward is a real step, so the
+//   probe brackets it with its own snapshot/rollback pair — plus `pos_ctr` and
+//   `s.ids`, which the verify's snapshot does not cover and the next step's
+//   embedding reads.
+// * [`DevChain::dspark_spec_step`] — the VERIFY side only (`"eager":null`): the
+//   spec path has committed its block by the time a record could be written, so
+//   there is no state left to run an eager forward against, and a commit is not
+//   something a probe may undo. The record still carries the verify row's
+//   logits/argmax, which is what makes the two modes diffable against each other.
+//
+// ⚠️ Arm it on EVERY rank: the eager forward runs the `DSV41_HEAD_SLICE` argmax
+// collective, so a probe armed on one rank only would leave the others waiting.
+// The gate is read once per process ([`vrow0_probe`]), so "every rank" means the
+// env var, not a per-step decision.
+//
+// Cost, paid only while the gate is on: two vocabulary-row D2Hs per probed step
+// (517 KB each at `vocab = 129280`) plus one extra single-row forward.
+
+/// `DSV41_VROW0_PROBE=1` arms the probe; `0` or unset leaves it off. Cached in a
+/// `OnceLock` for the reason every other gate here is: it is read on every
+/// speculative step, and a bare `getenv` on that path is the slip this project
+/// has been bitten by before.
+fn vrow0_probe() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_VROW0_PROBE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// How many logits each row reports: `DSV41_VROW0_TOPK`, default 5.
+fn vrow0_topk_n() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("DSV41_VROW0_TOPK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5)
+            .max(1)
+    })
+}
+
+/// Where the records go: `DSV41_VROW0_PATH`, else `/tmp/vrow0.jsonl`.
+fn vrow0_path() -> &'static str {
+    static P: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("DSV41_VROW0_PATH").unwrap_or_else(|_| "/tmp/vrow0.jsonl".to_string())
+    })
+}
+
+/// The top `k` entries of one logits row as `(global index, value)`, descending,
+/// ties broken by the LOWER index — the rule both argmax kernels implement
+/// (the sliced one packs `(value, -index)`).
+///
+/// `base` is the row's first entry's index in the FULL vocabulary: the verify's
+/// `logits_r` row is always the whole vocabulary, while the eager step's row is
+/// one rank's slice under `DSV41_HEAD_SLICE` (see [`DevChain::vrow0_eager`]).
+///
+/// `f32::total_cmp` rather than `partial_cmp`: a NaN is then ORDERED instead of
+/// silently dropping out of every comparison, and it sorts to the top — a `NaN`
+/// in a record is itself a finding, not a lost comparison.
+fn vrow0_topk(lg: &[f32], base: u32, k: usize) -> Vec<(u32, f32)> {
+    let k = k.min(lg.len());
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut idx: Vec<u32> = (0..lg.len() as u32).collect();
+    let cmp = |a: &u32, b: &u32| lg[*b as usize].total_cmp(&lg[*a as usize]).then(a.cmp(b));
+    // O(n) partial select, then sort just the k winners: a full sort of 129280
+    // entries per row per step would be the probe's dominant cost.
+    idx.select_nth_unstable_by(k - 1, cmp);
+    idx.truncate(k);
+    idx.sort_by(cmp);
+    idx.into_iter().map(|i| (base + i, lg[i as usize])).collect()
+}
+
+/// One probe record. Built by [`DevChain::vrow0_step`] and written by
+/// [`vrow0_write`].
+struct Vrow0Rec<'a> {
+    /// `"shadow"` or `"spec"` — which orchestration produced the record.
+    mode: &'a str,
+    /// The anchor token's position (the verify's row 0 sits at `pos + 1`).
+    pos: usize,
+    /// The anchor token the real step consumed.
+    token: u32,
+    /// The real (single-row) step's argmax — the token at `pos + 1`, i.e. what
+    /// `drafts[0]` was predicting. `verify_argmax == next` is the repetition
+    /// fingerprint this probe was built for (measured 16% against the eager
+    /// path's baseline), so it is carried in the record rather than reconstructed.
+    next: u32,
+    /// `drafts[0]` — the token the verify's row 0 consumed.
+    d0: u32,
+    /// `step_rows`' argmax for the block's row 0 (the kernel's answer).
+    verify_argmax: u32,
+    /// The argmax recomputed on the HOST from the same row's logits (D2H'd
+    /// below). A `verify_host_argmax != verify_argmax` is an argmax-kernel
+    /// disagreement, not a logits difference — the split the probe exists to
+    /// make.
+    verify_host_argmax: u32,
+    verify_top: &'a [(u32, f32)],
+    /// `(argmax, host argmax, top, row width, index base)` from the eager
+    /// single-row forward at `pos + 1`. `None` on the spec path (no eager forward
+    /// is legal there — see the module-level note).
+    eager: Option<&'a Vrow0Eager>,
+    rank: usize,
+    world: usize,
+}
+
+/// The probe's eager half: what one plain single-row step produced at `pos + 1`.
+struct Vrow0Eager {
+    argmax: u32,
+    host_argmax: u32,
+    top: Vec<(u32, f32)>,
+    /// The row width read: the full vocabulary, or one rank's slice.
+    n: usize,
+    /// The row's first entry's index in the FULL vocabulary.
+    base: u32,
+    /// Which of the two the row was (`step_body`'s own condition, repeated).
+    sliced: bool,
+}
+
+/// Append one record. The caller LOGS a failure rather than propagating it — a
+/// full disk must not answer an error for a step whose block is committed.
+///
+/// Floats go through Rust's shortest-roundtrip `Display`, not `serde_json`:
+/// `NaN`/`inf` must stay visible rather than becoming `null`, which is the one
+/// thing a numeric near-tie diff is looking for.
+fn vrow0_write(rec: &Vrow0Rec<'_>) -> Result<()> {
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let mut line = String::with_capacity(512);
+    let _ = write!(
+        line,
+        "{{\"seq\":{},\"pid\":{},\"ts_ms\":{},\"mode\":\"{}\",\"pos\":{},\"token\":{},\"next\":{},\
+         \"d0\":{},\
+         \"verify_argmax\":{},\"verify_host_argmax\":{},\"verify_top\":[",
+        VROW0_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        std::process::id(),
+        ts_ms,
+        rec.mode,
+        rec.pos,
+        rec.token,
+        rec.next,
+        rec.d0,
+        rec.verify_argmax,
+        rec.verify_host_argmax,
+    );
+    vrow0_push_top(&mut line, rec.verify_top);
+    line.push(']');
+
+    let (same, e_gap) = match rec.eager {
+        Some(e) => {
+            let _ = write!(
+                line,
+                ",\"eager_argmax\":{},\"eager_host_argmax\":{},\"eager_top\":[",
+                e.argmax, e.host_argmax
+            );
+            vrow0_push_top(&mut line, &e.top);
+            let _ = write!(
+                line,
+                "],\"eager_n\":{},\"eager_base\":{},\"eager_sliced\":{}",
+                e.n, e.base, e.sliced
+            );
+            (
+                Some(rec.verify_argmax == e.argmax),
+                vrow0_gap(&e.top),
+            )
+        }
+        None => {
+            line.push_str(",\"eager_argmax\":null,\"eager_top\":null");
+            (None, f32::NAN)
+        }
+    };
+    let v_gap = vrow0_gap(rec.verify_top);
+    let _ = write!(
+        line,
+        ",\"verify_gap\":{v_gap},\"eager_gap\":{e_gap},\"rank\":{},\"world\":{}",
+        rec.rank, rec.world
+    );
+    match same {
+        Some(s) => line.push_str(if s { ",\"same\":true}" } else { ",\"same\":false}" }),
+        None => line.push_str(",\"same\":null}"),
+    }
+    line.push('\n');
+
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(vrow0_path())
+        .map_err(|e| FerriteError::Config(format!("vrow0 probe: open {}: {e}", vrow0_path())))?;
+    f.write_all(line.as_bytes())
+        .map_err(|e| FerriteError::Config(format!("vrow0 probe: write {}: {e}", vrow0_path())))?;
+    Ok(())
+}
+
+/// Per-process record counter, for the reason [`dump_dev`] keeps one: the file
+/// is append-only and survives runs, so `pos` alone cannot separate two runs.
+static VROW0_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn vrow0_push_top(line: &mut String, top: &[(u32, f32)]) {
+    use std::fmt::Write as _;
+    for (i, (idx, v)) in top.iter().enumerate() {
+        if i > 0 {
+            line.push(',');
+        }
+        let _ = write!(line, "[{idx},{v}]");
+    }
+}
+
+/// `top1 - top2`, or `NaN` when a row has fewer than two entries — the number the
+/// analysis script buckets a mismatch by.
+fn vrow0_gap(top: &[(u32, f32)]) -> f32 {
+    match (top.first(), top.get(1)) {
+        (Some(a), Some(b)) => a.1 - b.1,
+        _ => f32::NAN,
+    }
+}
+
 fn build_eng_dev(
     dev: &Device,
     lay: &crate::dsv41::engram::EngramLayout,
@@ -1566,6 +1826,154 @@ impl<'a> DevChain<'a> {
         if let Err(e) = dump_dev::write_step(self.dev, &rec) {
             eprintln!("[dsv41] dspark dump (pos {pos}) failed: {e}");
         }
+    }
+
+    /// D2H one logits row (`n` f32) from a device pointer. A view, not an
+    /// allocation: the row belongs to whichever path computed it, so the probe
+    /// only ever reads it.
+    fn vrow0_row(&self, ptr: *const f32, n: usize) -> Result<Vec<f32>> {
+        let mut lg = vec![0f32; n];
+        let b = Device::view(ptr as *mut c_void, n * 4);
+        self.dev.download_f32(&b, &mut lg)?;
+        Ok(lg)
+    }
+
+    /// The probe's verify half: the row 0 logits the verify's own head pass left
+    /// in `logits_r` (`step_rows_inner` writes it and NOTHING else ever touches
+    /// that buffer — the rollback restores the ring and the compressors, not the
+    /// m-row scratch), reduced to `(kernel argmax, host argmax, top-k)`.
+    ///
+    /// `logits_r` is a FULL-vocabulary row even under `DSV41_HEAD_SLICE`: the
+    /// verify's head is not sliced (the multi-row cross-rank argmax is still
+    /// open), which is the first thing to check when the eager row below looks
+    /// short.
+    fn vrow0_verify(&self, argmax: u32) -> Result<(u32, u32, Vec<(u32, f32)>)> {
+        let lg = self.vrow0_row(self.s.logits_r.ptr as *const f32, self.cfg.vocab_size)?;
+        let top = vrow0_topk(&lg, 0, vrow0_topk_n());
+        let host = top.first().map(|t| t.0).unwrap_or(0);
+        Ok((argmax, host, top))
+    }
+
+    /// The probe's eager half: ONE plain single-row step at `pos + 1` fed
+    /// `token` — the exact forward the verify's row 0 re-schedules — with every
+    /// write it makes undone before returning.
+    ///
+    /// The caller's chain must be at the state the REAL step left it, which is
+    /// what [`Self::dspark_shadow_step`]'s rollback guarantees: `pos_ctr ==
+    /// pos + 1` and the ring holding `token`'s row at slot `pos % win`.
+    ///
+    /// What gets undone, and why each entry has to be:
+    ///
+    /// * the ring row and the compressor carry/counters — one row at `pos + 1`,
+    ///   the slot `dspark_snapshot(pos, 1)` covers and `dspark_rollback(pos, 1)`
+    ///   puts back (`(pos + 1 + j) % win`, j = 0, is the slot the step writes);
+    /// * `pos_ctr` — the step's argmax advanced it to `pos + 2`;
+    /// * `s.ids` — the NEXT step's embedding reads it (that is what makes
+    ///   `step_dev` a zero-H2D path), and the eager step's argmax overwrote the
+    ///   real step's answer. Restoring it is not optional: without it the next
+    ///   real step emits the wrong token, which is a BEHAVIOUR change, not a
+    ///   measurement.
+    fn vrow0_eager(&mut self, token: u32, pos: usize) -> Result<Vrow0Eager> {
+        let cfg = self.cfg;
+        let host = self.dspark_snapshot(pos, 1)?;
+        let ids_saved = self.dev.download_u32(self.s.ids.ptr as *const c_void)?;
+
+        let argmax = self.step_dev(token, pos + 1)?;
+
+        // The eager row: the single-row `s.logits`, the whole vocabulary unless
+        // `step_body` took its `DSV41_HEAD_SLICE` arm — the SAME condition,
+        // repeated here because a slice-local row must be reduced with its own
+        // width and index base (the sliced argmax packs the GLOBAL index, so the
+        // two sides stay comparable). `s.logits` is allocated at `vocab_size`
+        // whatever the arm, so the read is always in bounds; only `n` changes.
+        //
+        // The one arm this repeats imperfectly: `step_body` WIDENS the row back
+        // to the full vocabulary when the .so has no `dsv41_argmax_sliced`
+        // (`!ok`). That fallback is invisible from here, so on it the top-k below
+        // would be taken over the first `1/world` of a full row — for a probe run
+        // on such an .so, set `DSV41_HEAD_SLICE=0`, which makes both sides agree.
+        let world = self.world();
+        let rank = self.rank();
+        let seg = if world > 1 { cfg.vocab_size / world } else { 0 };
+        let head_bf16 = self
+            .w
+            .head
+            .as_ref()
+            .map(|h| h.dtype == "BF16")
+            .unwrap_or(false);
+        let sliced = head_slice()
+            && head_bf16
+            && world > 1
+            && cfg.vocab_size % world == 0
+            && self.comm.as_ref().map(|c| c.uses_v5()).unwrap_or(false);
+        let (n, base) = if sliced {
+            (seg, (rank * seg) as u32)
+        } else {
+            (cfg.vocab_size, 0)
+        };
+        let lg = self.vrow0_row(self.s.logits.ptr as *const f32, n)?;
+        let top = vrow0_topk(&lg, base, vrow0_topk_n());
+        let host_argmax = top.first().map(|t| t.0).unwrap_or(0);
+
+        // Undo, in the reverse order of the writes: the ring + the compressor
+        // carry, then the counter, then `s.ids`.
+        self.dspark_rollback(pos, 1, &host)?;
+        self.set_pos_ctr(pos + 1)?;
+        self.ul_i32(self.s.ids.ptr, &[ids_saved as i32])?;
+
+        Ok(Vrow0Eager {
+            argmax,
+            host_argmax,
+            top,
+            n,
+            base,
+            sliced,
+        })
+    }
+
+    /// One probe record: the verify's row 0 against the eager single-row step at
+    /// `pos + 1`.
+    ///
+    /// EVERY rank runs this body — the eager forward's argmax is a collective
+    /// under `DSV41_HEAD_SLICE`, so a rank that skipped it would leave its peers
+    /// polling — and only rank 0 appends the line (each TP rank is a separate
+    /// process writing the same path, exactly as [`Self::dspark_dump_step`] does).
+    ///
+    /// `with_eager` is `false` on the spec path, where the block is already
+    /// committed and there is no state left to compare against.
+    fn vrow0_step(
+        &mut self,
+        mode: &str,
+        pos: usize,
+        token: u32,
+        next: u32,
+        d0: u32,
+        verify_argmax: u32,
+        with_eager: bool,
+    ) -> Result<()> {
+        let (verify_argmax, verify_host, verify_top) = self.vrow0_verify(verify_argmax)?;
+        let eager = if with_eager {
+            Some(self.vrow0_eager(d0, pos)?)
+        } else {
+            None
+        };
+        if self.rank() != 0 {
+            return Ok(());
+        }
+        let rec = Vrow0Rec {
+            mode,
+            pos,
+            token,
+            next,
+            d0,
+            verify_argmax,
+            verify_host_argmax: verify_host,
+            verify_top: &verify_top,
+            eager: eager.as_ref(),
+            rank: self.rank(),
+            world: self.world(),
+        };
+        vrow0_write(&rec)
     }
 
     pub fn reset(&mut self) -> Result<()> {
@@ -2307,6 +2715,21 @@ impl<'a> DevChain<'a> {
     pub fn step_dev(&mut self, token: u32, pos: usize) -> Result<u32> {
         self.decode_steps = self.decode_steps.wrapping_add(1);
         self.step_impl(token, pos)
+    }
+
+    /// Put the continuation's first input token back on the device.
+    ///
+    /// `step_dev` deliberately performs NO H2D for the token: it reads `s.ids`,
+    /// which the PREVIOUS step's argmax wrote (chain_dev.rs's argmax epilogue), so
+    /// the steady-state decode loop is self-feeding. That contract is broken by a
+    /// snapshot RESUME: `kv_restore` restores every cross-step state EXCEPT
+    /// `s.ids`, which would still hold whatever token the PREVIOUS request's last
+    /// step produced — so the first decode step after a prefix-cache HIT would
+    /// condition on the wrong token AND write that token's KV into the restored
+    /// prefix (silent, total corruption of the continuation). Callers resuming
+    /// from a snapshot must call this with the continuation's first token.
+    pub fn prime_input(&mut self, token: u32) -> Result<()> {
+        self.ul_i32(self.s.ids.ptr, &[token as i32])
     }
 
     /// The whole decode step as ONE CUDA graph (DSV41_GRAPH_STEP=1, the default):
@@ -4186,6 +4609,24 @@ impl<'a> DevChain<'a> {
         //    spec path's `k_acc` is the same quantity, so the two diff cleanly.
         self.dspark_dump_step("shadow", pos, token, next, acc, &drafts, &verify_out);
 
+        // 10. the verify-row-0 vs eager parity probe (DSV41_VROW0_PROBE=1). LAST,
+        //     for the same reason the dump is: the eager forward below re-runs the
+        //     step's TAP HOOK, so anything that reads `dspark_tap` (step 9) must
+        //     have run first. The chain is back where the real step left it (step
+        //     7), which is the one state an eager single-row forward at pos+1 can
+        //     be compared from; everything that forward writes — the ring row, the
+        //     compressor carry, `pos_ctr`, `s.ids` — is restored by the probe
+        //     itself before it returns, so the shadow step's contract (leave the
+        //     chain where the REAL step left it) still holds. Logged, never
+        //     propagated: a probe must not answer an error for a step whose
+        //     numbers are already fixed.
+        if vrow0_probe() {
+            if let Err(e) = self.vrow0_step("shadow", pos, token, next, drafts[0], verify_out[0], true)
+            {
+                eprintln!("[dsv41] vrow0 probe (shadow, pos {pos}) failed: {e}");
+            }
+        }
+
         Ok(DsparkShadowReport {
             next,
             drafts,
@@ -4314,6 +4755,21 @@ impl<'a> DevChain<'a> {
         }
         let mut verify_out = [0u32; DSPARK_DRAFTS];
         verify_out.copy_from_slice(&rows);
+
+        // ---- 4b. the verify-row-0 parity probe (DSV41_VROW0_PROBE=1). VERIFY
+        // SIDE ONLY: the block below is about to be COMMITTED, and a probe may
+        // not undo a commit to go and run an eager forward — so the spec path
+        // reports the row 0 logits/argmax and no eager half (`"eager":null`),
+        // while the shadow path reports both. Read-only (the `logits_r` row is
+        // this verify's own scratch) and gated: nothing here runs when the gate
+        // is off. Logged, never propagated — a probe must not answer an error
+        // for a step whose block is already committed.
+        if vrow0_probe() {
+            if let Err(e) = self.vrow0_step("spec", pos, token, next, drafts[0], verify_out[0], false)
+            {
+                eprintln!("[dsv41] vrow0 probe (spec, pos {pos}) failed: {e}");
+            }
+        }
 
         // ---- 5. the accept arithmetic (host, no device traffic). MEASURED
         // layout (154-step trace): drafts[0] == next 60% — the draft block sits
