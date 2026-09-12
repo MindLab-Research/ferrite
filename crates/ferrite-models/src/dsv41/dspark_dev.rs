@@ -155,8 +155,12 @@ pub struct DsparkDev<'a> {
     ids: DevBuf,
     /// the compressor-length stand-in `sparse_attn` reads: constant `bs`
     clen: DevBuf,
-    /// one i32 the RoPE base is uploaded into
+    /// one i32 the RoPE base is uploaded into (see [`Self::ensure_pos_dev`])
     pos_base: DevBuf,
+    /// Host shadow of what `pos_base` currently holds on the device, i.e. the
+    /// base every `rope_at` call's `off` is measured from. `None` = unknown
+    /// (nothing uploaded yet), which forces the next upload.
+    pos_dev: Option<i32>,
 
     // ---- head ----
     collapse: DevBuf,
@@ -315,6 +319,7 @@ impl<'a> DsparkDev<'a> {
             ids: dev.alloc(fb(bs + 1).max(4))?,
             clen: dev.alloc(4)?,
             pos_base: dev.alloc(4)?,
+            pos_dev: None,
             collapse: dev.alloc(fb(bs * dim))?,
             normed: dev.alloc(fb(bs * dim))?,
             logits: dev.alloc(fb(bs * vocab))?,
@@ -469,6 +474,11 @@ impl<'a> DsparkDev<'a> {
         let dim = self.dim;
         let n_target = self.n_target;
         let row_bytes = dim * std::mem::size_of::<f32>();
+        // One RoPE base for the whole batch: row `j`'s position is `pos_base + j`
+        // and `rope_at` carries that difference as the kernel's `off`, so the
+        // `keep` blocking H2Ds this loop used to issue (one per `seed_window`)
+        // become one.
+        self.ensure_pos_dev(pos_base as i32)?;
         for j in 0..keep {
             // Row j's `forward_embed` input is the CONCATENATION of the target
             // layers' hidden[j]; the tap interleaves the layers (`m` rows apart),
@@ -639,6 +649,20 @@ impl<'a> DsparkDev<'a> {
                 }
             }
         }
+
+        // ---- the draft's RoPE base, on the DEVICE ----------------------------
+        // One 4B upload per draft step, shared by every rope site below
+        // (`seed_window`'s row, the `bs` query rows, the `bs` inverse-query rows
+        // and the `bs` KV rows — 36 blocking H2Ds per forward before this). Each
+        // site keeps its ABSOLUTE position and `rope_at` passes the delta as the
+        // kernel's `off`, so the upload is a pure emission change: the position
+        // arithmetic is integer and the result is bit-identical (see
+        // [`Self::ensure_pos_dev`] / [`Self::rope_at`]).
+        //
+        // It goes AFTER the injection override above (which may rewrite `pos`)
+        // and BEFORE the `pos == 0` early return below (which seeds the window
+        // rings at position 0 and ropes them).
+        self.ensure_pos_dev(pos as i32)?;
 
         // ---- ids: the backbone's token first, the noise token for the rest ----
         // (dspark.rs::forward_embed; the noise row IS embed[noise_token_id])
@@ -961,7 +985,6 @@ impl<'a> DsparkDev<'a> {
             hd as i32,
             1,
             pos as i32,
-            1,
             false,
         )?;
 
@@ -1016,43 +1039,74 @@ impl<'a> DsparkDev<'a> {
         // The reference's `grp` reshape is the IDENTITY (o is already
         // [bs, groups, hpg*hd] row-major), so no permute is needed. wo_a is
         // [groups * olg, hpg * hd] and each row of a group uses THAT group's
-        // weight block, so this is one small GEMV per (group, row) — the
-        // activation stride between two rows of a group is nh*hd, which no
-        // existing GEMM launcher can express. A fused grouped-output kernel (or
-        // a group-major repack) is the obvious optimisation; see the module
-        // header. The fp8 quantisation is shared by all of them because the
-        // group blocks are whole 32-element quant blocks of the same row.
+        // weight block: a BLOCK-DIAGONAL matmul, not one GEMM. The activation
+        // stride between two rows of a group is nh*hd and one group's output
+        // columns are strided by ol_total — both outside every GEMM launcher's
+        // ABI, which is why this used to be one m=1 GEMV per (group, row): 8 x bs
+        // = 40 launches per MTP block, each re-reading the group's whole weight
+        // block (~500 MB/forward for a 33 MB weight set; the plan's §4 "wo_a
+        // 分组投影", ~1.0ms). A "one gemm_fp8_mx over the whole wo_a" call cannot
+        // express it for the same reason (see the kernel header).
+        //
+        // `wo_a_grouped_fp8` (dsv41_kernels.cu) is the weight-stationary form of
+        // exactly the same GEMV: one launch for ALL groups (grid.y = group) in
+        // which every block stages its group's weight rows ONCE and folds all
+        // `bs` activation rows against them. Per (group, row) the arithmetic is
+        // the m=1 gemv's order-preserving consume expression verbatim — same
+        // ascending kb walk, same staged bytes, same serial `acc` chain and
+        // shfl_xor tree, no cross-row recombination — so every output row is
+        // BIT-IDENTICAL to the launch it replaces; the kernel header carries the
+        // C1-C6 argument.
+        //
+        // Ok(false) = stale .so or a declined shape/mode: the per-(group, row)
+        // loop below produces the same numbers by construction.
         self.quant1(self.o.ptr as *const f32, bs * nh * hd)?;
         let wo_a = need(&ld.wo_a, "mtp.*.attn.wo_a.weight")?;
         let wo_a_s = need(&ld.wo_a_scale, "mtp.*.attn.wo_a.scale")?;
         let k_grp = hpg * hd;
-        for g in 0..groups {
-            let wp = wo_a.as_u8().wrapping_add(g * olg * k_grp);
-            let wsp = wo_a_s
-                .as_u8()
-                .wrapping_add((g * olg / 32) * (k_grp / 32));
-            for r in 0..bs {
-                let a = self
-                    .xq
+        let fused = self.dev.wo_a_grouped_fp8(
+            self.xq.as_u8(),
+            self.xsc.as_f32(),
+            wo_a.as_u8(),
+            wo_a_s.as_u8(),
+            std::ptr::null(),
+            self.wo.ptr as *mut f32,
+            groups as i32,
+            bs as i32,
+            olg as i32,
+            k_grp as i32,
+            (nh * hd) as i32,   // activation row stride: one whole draft row
+            ol_total as i32,    // output row stride: [bs, ol_total]
+        )?;
+        if !fused {
+            for g in 0..groups {
+                let wp = wo_a.as_u8().wrapping_add(g * olg * k_grp);
+                let wsp = wo_a_s
                     .as_u8()
-                    .wrapping_add((r * nh + g * hpg) * hd);
-                let asc = self
-                    .xsc
-                    .as_f32()
-                    .wrapping_add(((r * nh + g * hpg) * hd / 32) as usize);
-                let out = (self.wo.ptr as *mut f32)
-                    .wrapping_add(r * ol_total + g * olg);
-                self.dev.gemm_fp8_mx(
-                    a,
-                    asc,
-                    wp,
-                    wsp,
-                    std::ptr::null(),
-                    out,
-                    1,
-                    olg as i32,
-                    k_grp as i32,
-                )?;
+                    .wrapping_add((g * olg / 32) * (k_grp / 32));
+                for r in 0..bs {
+                    let a = self
+                        .xq
+                        .as_u8()
+                        .wrapping_add((r * nh + g * hpg) * hd);
+                    let asc = self
+                        .xsc
+                        .as_f32()
+                        .wrapping_add(((r * nh + g * hpg) * hd / 32) as usize);
+                    let out = (self.wo.ptr as *mut f32)
+                        .wrapping_add(r * ol_total + g * olg);
+                    self.dev.gemm_fp8_mx(
+                        a,
+                        asc,
+                        wp,
+                        wsp,
+                        std::ptr::null(),
+                        out,
+                        1,
+                        olg as i32,
+                        k_grp as i32,
+                    )?;
+                }
             }
         }
         let wo_b = need(&ld.wo_b, "mtp.*.attn.wo_b.weight")?;
@@ -1419,31 +1473,64 @@ impl<'a> DsparkDev<'a> {
         )?;
         self.dump_unit("normed", self.normed.ptr as *const f32, &[bs, dim]);
 
-        // logits = head @ normed, one row at a time.
+        // logits = head @ normed — all `bs` rows in ONE multi-row launch.
         //
-        // ⚠️ COST: the checkpoint's head is bf16 [vocab, dim] = 1.29 GiB, and
-        // the chain keeps the ACTIVATION in f32 (casting it to bf16 costs ~3
+        // ⚠️ COST (before): the checkpoint's head is bf16 [vocab, dim] = 1.29 GiB,
+        // and the chain keeps the ACTIVATION in f32 (casting it to bf16 costs ~3
         // bits on a 129280-way near-tie argmax — see chain_dev's head site), so
-        // each row is a separate f32-activation GEMV and the head is read `bs`
-        // times: ~5 x 350 us. That single term is most of the draft budget. A
-        // multi-row head kernel (m = bs, f32 activation, W reused across rows)
-        // would remove the 5x; it does not exist yet.
-        for r in 0..bs {
-            match head.dtype.as_str() {
-                "BF16" => self.dev.gemv_bf16(
-                    head.ptr(),
-                    (self.normed.ptr as *const f32).wrapping_add(r * dim),
-                    (self.logits.ptr as *mut f32).wrapping_add(r * vocab),
-                    vocab as i32,
-                    dim as i32,
-                )?,
-                _ => self.dev.gemv_f32(
-                    head.as_f32(),
-                    (self.normed.ptr as *const f32).wrapping_add(r * dim),
-                    (self.logits.ptr as *mut f32).wrapping_add(r * vocab),
-                    vocab as i32,
-                    dim as i32,
-                )?,
+        // each row used to be a separate f32-activation GEMV and the head was
+        // read `bs` times: ~5 x 350 us. That single term was most of the draft
+        // budget (docs/agent/dspark-verify-perf-plan.md §4).
+        //
+        // `head_gemv_bf16_mrows` (dsv41_glue.cu, the P1 kernel the verify's
+        // `step_rows` already uses) is the WEIGHT-STATIONARY form of the same
+        // GEMV: one block decodes its weight tile ONCE and folds all `bs` rows
+        // against it, so the head is read once instead of `bs` times (and the
+        // row loop's `bs` launches become one).
+        //
+        // NUMERICS — row r of the multi-row launch is BIT-IDENTICAL to the
+        // per-row `gemv_bf16` launch of row r: same ascending lane->c chain (C1),
+        // same decode in the same expression position (C2), the same shuffle
+        // reduction tree run once per row (C3), per-row independent accumulators
+        // with no cross-row recombination (C4), no K-split/fold to reorder (C5),
+        // `__fmaf_rn` pinned against fast-math reassociation (C6). The kernel
+        // header carries the full argument; the layouts already match what it
+        // wants — `normed` is [bs, dim] row-major (x, [m, k]) and `logits` is
+        // [bs, vocab] row-major (out, [m, n]).
+        //
+        // Ok(false) = stale .so (no symbol) or `bs` outside the kernel's 1..=8
+        // dispatch: keep the per-row loop, which computes the same values by the
+        // same argument. The f32-activation dtype keeps it too (the multi-row
+        // kernel is bf16-only).
+        let mut head_rows = false;
+        if head.dtype.as_str() == "BF16" {
+            head_rows = self.dev.head_gemv_bf16_mrows(
+                head.ptr(),
+                self.normed.ptr as *const f32,
+                self.logits.ptr as *mut f32,
+                bs as i32,
+                vocab as i32,
+                dim as i32,
+            )?;
+        }
+        if !head_rows {
+            for r in 0..bs {
+                match head.dtype.as_str() {
+                    "BF16" => self.dev.gemv_bf16(
+                        head.ptr(),
+                        (self.normed.ptr as *const f32).wrapping_add(r * dim),
+                        (self.logits.ptr as *mut f32).wrapping_add(r * vocab),
+                        vocab as i32,
+                        dim as i32,
+                    )?,
+                    _ => self.dev.gemv_f32(
+                        head.as_f32(),
+                        (self.normed.ptr as *const f32).wrapping_add(r * dim),
+                        (self.logits.ptr as *mut f32).wrapping_add(r * vocab),
+                        vocab as i32,
+                        dim as i32,
+                    )?,
+                }
             }
         }
 
@@ -1508,7 +1595,7 @@ impl<'a> DsparkDev<'a> {
             hd as i32,
             cfg.norm_eps,
         )?;
-        self.rope_at(self.mk.ptr as *mut f32, 1, hd as i32, 1, pos as i32, 1, false)?;
+        self.rope_at(self.mk.ptr as *mut f32, 1, hd as i32, 1, pos as i32, false)?;
 
         // ⚠️ The destination is a HOST-computed address (pos % win). That is
         // fine for a plain launch but frozen by a CUDA-graph capture; the
@@ -1539,7 +1626,6 @@ impl<'a> DsparkDev<'a> {
                 self.hd as i32,
                 0,
                 pos as i32 + r as i32,
-                1,
                 false,
             )?;
         }
@@ -1557,20 +1643,64 @@ impl<'a> DsparkDev<'a> {
                 self.hd as i32,
                 0,
                 pos as i32 + r as i32,
-                1,
                 true,
             )?;
         }
         Ok(())
     }
 
-    /// `apply_rope` with the position uploaded into `pos_base`.
+    /// Upload the RoPE base into the device counter `pos_base` — at most ONCE
+    /// per draft step, instead of once per `rope_at` call.
     ///
-    /// The kernel derives each row's position from a DEVICE counter
-    /// (`*base * mul + off + row * step`), which is what makes the backbone's
-    /// rope graph-capturable; `pos_base` is the draft's own little counter.
-    /// ⚠️ The upload is a blocking H2D per call; a device-side draft position
-    /// counter would remove both it and the capture hazard.
+    /// `pos_base` is the draft's own little counter: `apply_rope` derives every
+    /// row's position from `*base * mul + off + row * step`, so the whole draft
+    /// step can share ONE uploaded value as long as each call expresses its own
+    /// position as an `off` relative to it (see [`Self::rope_at`]).
+    ///
+    /// ⚠️ The upload is a blocking H2D (`upload_bytes_at` is a `cudaMemcpy`), so
+    /// it drains the stream. That is the expensive part, and it is why the count
+    /// matters: the draft's rope sites used to upload once per CALL (36 blocking
+    /// H2Ds per `draft_forward`, one per seed / query row / inverse-query row /
+    /// KV row — docs/agent/dspark-verify-perf-plan.md §4 ranks it
+    /// "0.25 + ... 每次强制流水线排空"), and they now share one.
+    ///
+    /// The host keeps the shadow `pos_dev` so a value that is already on the
+    /// device is not re-uploaded: the pattern is seed(pos-1) -> queries(pos) ->
+    /// inverse(pos) -> KV(pos), which is two uploads per draft step, and one per
+    /// `note_ctx_rows` batch (whose rows step by one), not one per rope call.
+    ///
+    /// Capture note: `off` still rides in the launch parameters, so this removes
+    /// the per-call H2Ds but does NOT by itself make the draft graph-capturable —
+    /// that needs the base to advance on the DEVICE (a device pos counter feeding
+    /// `*base` with `off == 0`). This change is the sizeable half of it (the
+    /// drains), and it is what makes the remaining one a single 4B upload.
+    fn ensure_pos_dev(&mut self, pos: i32) -> Result<()> {
+        if self.pos_dev == Some(pos) {
+            return Ok(());
+        }
+        // The kernel reads `*base` as an `int`; upload the INTEGER's four bytes.
+        self.dev
+            .upload_bytes_at(&self.pos_base, &pos.to_le_bytes())?;
+        self.pos_dev = Some(pos);
+        Ok(())
+    }
+
+    /// `apply_rope` for the draft: `pos` is the ABSOLUTE position of row 0 (the
+    /// rows then step by `step`), and the device counter only supplies the
+    /// subtraction-free part of it.
+    ///
+    /// The kernel computes `row r -> (*base) * 1 + off + r * step`, and
+    /// `ensure_pos_dev(base)` has already put `pos_dev` into `*base`, so passing
+    /// `off = pos - pos_dev` yields `pos_dev + (pos - pos_dev) + r * step =
+    /// pos + r * step` — the exact integer position this call always asked for.
+    /// The arithmetic is INTEGER (and `off` is a tiny signed delta), so no
+    /// position value can move a bit: every rope call site keeps its absolute
+    /// position semantics (`rope_at(x, rows, hd, step, pos, inverse)`), and the
+    /// `mul` factor the old form carried is fixed at 1 exactly as every caller
+    /// passed it.
+    ///
+    /// `base` in the doc above is the value passed to the KERNEL (`pos_base`),
+    /// which is why the caller's absolute position is an `off` here.
     #[allow(clippy::too_many_arguments)]
     fn rope_at(
         &mut self,
@@ -1578,15 +1708,16 @@ impl<'a> DsparkDev<'a> {
         rows: i32,
         row_len: i32,
         step: i32,
-        base: i32,
-        mul: i32,
+        pos: i32,
         inverse: bool,
     ) -> Result<()> {
         let cfg = self.cfg;
         let rd = cfg.rope_head_dim;
-        // The kernel reads `*base` as an `int`; upload the INTEGER's four bytes.
-        self.dev
-            .upload_bytes_at(&self.pos_base, &base.to_le_bytes())?;
+        let pos_dev = self.pos_dev.ok_or_else(|| {
+            FerriteError::Config(
+                "dspark: rope_at before ensure_pos_dev (no RoPE base on the device)".into(),
+            )
+        })?;
         let cos = self.cos.unwrap();
         let sin = self.sin.unwrap();
         self.dev.apply_rope(
@@ -1598,8 +1729,8 @@ impl<'a> DsparkDev<'a> {
             rd as i32,
             (rd / 2) as i32,
             self.pos_base.ptr as *const std::os::raw::c_int,
-            mul,
-            0,
+            1,
+            pos - pos_dev,
             step,
             inverse,
         )

@@ -24,13 +24,14 @@
 //! that the all-reduce's peer stores require. The prologue below is the one-shot
 //! path's (verified) verbatim.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use ferrite_http::single_flight::{SingleFlight, StepEngine};
 use ferrite_http::tokenizer::{ChatTokenizer, StopSpec};
 use ferrite_types::Result;
 
-use crate::chain_dev::{DevChain, RunOpts};
+use crate::chain_dev::{DevChain, KvSnapshot, RunOpts};
 use crate::config::Dsv41Config;
 use crate::device::Device;
 use crate::load::Loader;
@@ -64,6 +65,32 @@ enum RankCmd {
 /// this many steps; the cost of over-running is bounded by it (the pool discards
 /// the tail when the driver stops, and the next request resets the chain).
 const LOOKAHEAD: usize = 16;
+
+/// `DSV41_KV_CACHE=1` turns on the in-process KV prefix cache (P0: host memory,
+/// exact full-prompt match). Read ONCE and cached — the house rule for every
+/// hot-path gate; `"0"` means OFF even though it is "set".
+///
+/// Off by default because the snapshot has a price of its own: every prefill
+/// freezes the sequence's prefix state to the host (~15-35 MB and a dozen D2H
+/// syncs), which only pays off when requests actually share a prompt.
+fn kv_cache_on() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_KV_CACHE").map(|v| v != "0").unwrap_or(false))
+}
+
+/// How many frozen prefixes to hold (`DSV41_KV_CACHE_SLOTS`, default 8). The
+/// snapshot is linear in the prompt (see `LayerKvSnapshot`), so this is the
+/// cache's memory bound: 8 x ~35 MB at a 4k prompt.
+fn kv_cache_cap() -> usize {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_KV_CACHE_SLOTS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(8)
+    })
+}
 
 /// The model is ~80 s of mmap + upload; the first request waits for it.
 const LOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1800);
@@ -102,6 +129,12 @@ pub struct TpRankPool {
     /// The checkpoint's stop set (the engine retires on these ids; the wire
     /// layer strips the same ones).
     stops: Vec<u32>,
+    /// The prefix-hit length the ranks reported for the most recent admission
+    /// (`StepEngine::resume_hit`). Read after `broadcast` returns, i.e. after
+    /// every rank has already stored its own value.
+    resume_hit: usize,
+    /// Written by the ranks on every prefill — the prefix cache's hit length.
+    prefix_hit: Arc<AtomicUsize>,
 }
 
 impl TpRankPool {
@@ -120,6 +153,8 @@ impl TpRankPool {
         let barrier = Arc::new(tp::SpinBarrier::new(world));
         let staging = Arc::new(Mutex::new(vec![0u64; world]));
         let rxs = Arc::new(rxs);
+        let prefix_hit = Arc::new(AtomicUsize::new(0));
+        let prefix_hit_for_ranks = prefix_hit.clone();
         let dir = dir.to_string();
         let so = so.to_string();
         let cfg = cfg.clone();
@@ -134,7 +169,7 @@ impl TpRankPool {
                 tp::run_ranks(world, move |rank| {
                     rank_loop(
                         rank, world, &stops_for_ranks, &cfg, &dir, &so, &rxs, &res_tx, &ready_tx, &barrier,
-                        &staging,
+                        &staging, &prefix_hit_for_ranks,
                     )
                 })
             })
@@ -149,6 +184,8 @@ impl TpRankPool {
             loaded: false,
             max_ctx,
             stops,
+            resume_hit: 0,
+            prefix_hit,
         })
     }
 
@@ -220,7 +257,9 @@ impl StepEngine for TpRankPool {
         self.ensure_loaded()?;
         // a new request resets the chain, so any un-consumed look-ahead is stale
         self.lookahead.clear();
+        self.resume_hit = 0;
         let mut v = self.broadcast(RankCmd::Prefill(prompt.to_vec()))?;
+        self.resume_hit = self.prefix_hit.load(Ordering::SeqCst);
         Ok(if v.is_empty() { 0 } else { v.remove(0) })
     }
 
@@ -256,6 +295,14 @@ impl StepEngine for TpRankPool {
     fn max_ctx(&self) -> usize {
         self.max_ctx
     }
+
+    /// The tokens the last admission served from the frozen prefix cache (0 when
+    /// the cache is off, missed, or nothing is cached). `SingleFlight` puts this
+    /// into `Admission::prefix_hit`, which the driver reports as
+    /// `usage.prompt_tokens_details.cached_tokens`.
+    fn resume_hit(&self) -> usize {
+        self.resume_hit
+    }
 }
 
 /// One rank's life: load its shard, join the peer handshake, then execute
@@ -277,8 +324,11 @@ fn rank_loop(
     ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
+    prefix_hit: &Arc<AtomicUsize>,
 ) -> Result<()> {
-    let r = pool_rank_body(rank, world, stops, cfg, dir, so, rxs, res_tx, ready_tx, barrier, staging);
+    let r = pool_rank_body(
+        rank, world, stops, cfg, dir, so, rxs, res_tx, ready_tx, barrier, staging, prefix_hit,
+    );
     if let Err(e) = &r {
         let _ = ready_tx.send(Err(ferrite_types::FerriteError::Config(e.to_string())));
     }
@@ -298,6 +348,7 @@ fn pool_rank_body(
     ready_tx: &std::sync::mpsc::Sender<Result<usize>>,
     barrier: &Arc<tp::SpinBarrier>,
     staging: &Arc<Mutex<Vec<u64>>>,
+    prefix_hit: &Arc<AtomicUsize>,
 ) -> Result<()> {
     // ---- bring-up: the one-shot path's prologue (rank_body) verbatim ----
     Device::bind_to(rank as i32)?;
@@ -403,11 +454,34 @@ fn pool_rank_body(
             );
         }
     };
+    // ---- the KV prefix cache (DSV41_KV_CACHE=1) ----
+    // Per RANK: the KV is TP-sharded, so each rank freezes and restores its own
+    // share. The DECISION is nonetheless uniform — every rank sees the same
+    // requests in the same order and runs the same LRU over the same prompts — so
+    // a hit/miss here is one engine-wide fact, not a per-rank guess. (It has to
+    // be: a rank that skipped a forward the others ran would land in the next
+    // collective out of step. A divergence is therefore a loud wedge, never a
+    // silent KV desync.)
+    let kv_enabled = kv_cache_on() && !cfg.dspark_armed();
+    let mut kv_cache = KvCache::new(kv_cache_cap());
+    let mut kv_warned = false;
+    if rank == 0 && kv_cache_on() && !kv_enabled {
+        eprintln!(
+            "[kv-cache] DSV41_KV_CACHE is set but DSpark is armed: the draft's window rings \
+             are not part of the snapshot yet, so the cache stays off"
+        );
+    }
     let rx = rxs[rank].lock().unwrap();
     loop {
         match rx.recv() {
             Ok(RankCmd::Prefill(ids)) => {
-                let r = prefill_chain(&mut chain, &ids).map(|t| vec![t]);
+                let r = prefill_or_resume(&mut chain, &ids, &mut kv_cache, kv_enabled, &mut kv_warned);
+                if let Ok((_, hit)) = &r {
+                    // every rank stores the same value; the pool reads it once the
+                    // broadcast has collected all of them.
+                    prefix_hit.store(*hit, Ordering::SeqCst);
+                }
+                let r = r.map(|(t, _)| vec![t]);
                 if res_tx.send((rank, r)).is_err() {
                     return Ok(()); // the pool is gone
                 }
@@ -598,6 +672,262 @@ fn prefill_chain(chain: &mut DevChain<'_>, ids: &[u32]) -> Result<u32> {
         next = chain.step(t, i)?;
     }
     Ok(next)
+}
+
+// ---- the P0 prefix cache ---------------------------------------------------
+
+/// One frozen prefix: the exact prompt it was taken from, the token the cold
+/// prefill returned, and the chain state at the end of that prefill.
+struct KvCacheEntry {
+    /// The prompt, verbatim — the KEY. Matching is a full sequence equality
+    /// test, not a prefix one: P0 deliberately caches exactly what was asked.
+    tokens: Vec<u32>,
+    /// What `prefill_chain` returned for this prompt. A hit replays it instead of
+    /// recomputing it, which is the whole point: the state the snapshot holds is
+    /// the state AFTER the last prompt token was fed, and the first generated
+    /// token is that step's argmax — one value, not worth a device round trip,
+    /// and not reproducible without replaying a step against the state it already
+    /// consumed.
+    first_token: u32,
+    /// The chain state at prefill completion. Immutable once taken: the decode
+    /// that follows MOVES the live KV, never this copy, which is why a later hit
+    /// resumes exactly at the prefill boundary.
+    snap: KvSnapshot,
+    last_used: u64,
+}
+
+/// The P0 prefix cache: exact full-prompt match, LRU eviction, host memory only.
+///
+/// A `HashMap` keyed by a stable hash of the prompt, with each entry keeping the
+/// prompt itself so a hash collision is a MISS rather than a wrong hit — the
+/// failure mode of a hash-only cache here would be resuming from another
+/// request's KV, which is silent and total (unlike a cache miss, which just
+/// costs the prefill).
+///
+/// ⚠️ One cache per RANK, and its contents must stay identical across ranks: the
+/// hit decision is taken independently by each rank (nothing is broadcast, and
+/// nothing of the snapshot travels through the command/ack channels — a snapshot
+/// is MBs, which does not belong on that path), so all ranks rely on seeing the
+/// same request sequence. They do, because the pool is batch-1 and every rank
+/// executes the same command stream.
+struct KvCache {
+    slots: std::collections::HashMap<u64, KvCacheEntry>,
+    cap: usize,
+    /// A monotonic tick stamped on every access — the LRU's clock.
+    clock: u64,
+    hits: u64,
+    misses: u64,
+}
+
+impl KvCache {
+    fn new(cap: usize) -> Self {
+        KvCache {
+            slots: std::collections::HashMap::new(),
+            cap: cap.max(1),
+            clock: 0,
+            hits: 0,
+            misses: 0,
+        }
+    }
+
+    /// FNV-1a over the token ids (little-endian). Inlined rather than pulling in
+    /// a hasher: the key is only ever compared against the stored prompt, so it
+    /// needs to be stable, not cryptographic.
+    fn hash(tokens: &[u32]) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &t in tokens {
+            for b in t.to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        h
+    }
+
+    /// The entry for exactly this prompt, touching it for the LRU.
+    fn get(&mut self, tokens: &[u32]) -> Option<&KvCacheEntry> {
+        let k = Self::hash(tokens);
+        self.clock += 1;
+        let clock = self.clock;
+        // a collision (different tokens, same key) is a miss, never a hit
+        if self.slots.get(&k).is_some_and(|e| e.tokens == tokens) {
+            self.hits += 1;
+            let e = self.slots.get_mut(&k).unwrap();
+            e.last_used = clock;
+            Some(e)
+        } else {
+            self.misses += 1;
+            None
+        }
+    }
+
+    /// Replace-or-insert, evicting the least recently used entry when full.
+    fn insert(&mut self, tokens: &[u32], first: u32, snap: KvSnapshot) {
+        let k = Self::hash(tokens);
+        self.clock += 1;
+        let clock = self.clock;
+        if let Some(e) = self.slots.get_mut(&k) {
+            if e.tokens == tokens {
+                e.first_token = first;
+                e.snap = snap;
+                e.last_used = clock;
+                return;
+            }
+        }
+        while self.slots.len() >= self.cap {
+            let victim = self
+                .slots
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| *k);
+            match victim {
+                Some(k) => {
+                    self.slots.remove(&k);
+                }
+                None => break,
+            }
+        }
+        self.slots.insert(
+            k,
+            KvCacheEntry { tokens: tokens.to_vec(), first_token: first, snap, last_used: clock },
+        );
+    }
+
+    fn stats(&self) -> (u64, u64) {
+        (self.hits, self.misses)
+    }
+}
+
+/// `StepEngine::prefill`'s body with the prefix cache in front of it. Returns
+/// `(first_token, prefix_hit)`.
+///
+/// A HIT skips the prompt's forwards entirely: `kv_restore` drops the frozen
+/// state back in and the token the cold prefill produced is replayed, so the
+/// engine is standing exactly where the first request was after its prefill and
+/// the driver's next `decode(token, prompt_len)` is the same step it would have
+/// run. A MISS runs the unchanged [`prefill_chain`] and then freezes what it
+/// produced.
+///
+/// The snapshot is taken at PREFILL COMPLETION, once, and never updated during
+/// decode: a prefix hit only ever needs the state a prompt leaves behind, and
+/// re-snapshotting per decode step would multiply the copy cost for a state no
+/// hit could use.
+fn prefill_or_resume(
+    chain: &mut DevChain<'_>,
+    ids: &[u32],
+    cache: &mut KvCache,
+    enabled: bool,
+    warned: &mut bool,
+) -> Result<(u32, usize)> {
+    if enabled {
+        if let Some(e) = cache.get(ids) {
+            let first = e.first_token;
+            let hit = e.snap.tokens;
+            chain.kv_restore(&e.snap)?;
+            if kv_trace() {
+                eprintln!("[kv-cache] HIT {} tokens (restored, prefill skipped)", hit);
+            }
+            return Ok((first, hit));
+        }
+    }
+    let first = prefill_chain(chain, ids)?;
+    if enabled {
+        // Refuse to cache anything the snapshot cannot represent exactly: the
+        // contract a hit relies on is "byte-identical to a from-scratch run", so a
+        // configuration the snapshot does not cover must degrade to a plain
+        // prefill, not to a wrong answer.
+        match chain.kv_snapshot() {
+            Ok(snap) if snap.tokens == ids.len() => {
+                if kv_trace() {
+                    let (h, m) = cache.stats();
+                    eprintln!(
+                        "[kv-cache] MISS {}/{} tokens frozen (hits={h} misses={m})",
+                        ids.len(),
+                        snap.tokens
+                    );
+                }
+                cache.insert(ids, first, snap);
+            }
+            Ok(snap) => {
+                if !*warned {
+                    *warned = true;
+                    eprintln!(
+                        "[kv-cache] not caching: the chain's position counter reads {} after a \
+                         {}-token prefill, so the snapshot would not sit where a hit resumes",
+                        snap.tokens,
+                        ids.len()
+                    );
+                }
+            }
+            Err(e) => {
+                if !*warned {
+                    *warned = true;
+                    eprintln!("[kv-cache] not caching: {e}");
+                }
+            }
+        }
+    }
+    Ok((first, 0))
+}
+
+/// `DSV41_KV_TRACE=1` logs each hit/miss (off by default: the per-request line
+/// would otherwise interleave with the per-step timing lines).
+fn kv_trace() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_KV_TRACE").map(|v| v != "0").unwrap_or(false))
+}
+
+#[cfg(test)]
+mod kv_cache_tests {
+    use super::*;
+
+    /// A stand-in snapshot: the cache never looks inside one, so an empty
+    /// payload is enough to exercise the keying and the LRU.
+    fn snap(tokens: usize) -> KvSnapshot {
+        KvSnapshot {
+            pos_ctr: tokens as i32,
+            tokens,
+            layers: Vec::new(),
+            clen_dev: Vec::new(),
+            eng_cache: None,
+        }
+    }
+
+    /// The P0 contract: matching is a full-sequence EQUALITY, so a prompt that
+    /// merely shares a prefix must miss (P0 caches exactly what was asked).
+    #[test]
+    fn exact_match_only() {
+        let mut c = KvCache::new(4);
+        c.insert(&[1, 2, 3], 7, snap(3));
+        assert_eq!(c.get(&[1, 2, 3]).map(|e| e.first_token), Some(7));
+        assert_eq!(c.get(&[1, 2]).map(|e| e.first_token), None);
+        assert_eq!(c.get(&[1, 2, 3, 4]).map(|e| e.first_token), None);
+        assert_eq!(c.stats(), (1, 2));
+    }
+
+    /// Eviction is by least-recent use, and a LOOKUP counts as a use.
+    #[test]
+    fn lru_eviction() {
+        let mut c = KvCache::new(2);
+        c.insert(&[1], 10, snap(1));
+        c.insert(&[2], 20, snap(1));
+        assert_eq!(c.get(&[1]).map(|e| e.first_token), Some(10));
+        c.insert(&[3], 30, snap(1)); // [2] is now the oldest
+        assert_eq!(c.get(&[2]).map(|e| e.first_token), None);
+        assert_eq!(c.get(&[1]).map(|e| e.first_token), Some(10));
+        assert_eq!(c.get(&[3]).map(|e| e.first_token), Some(30));
+    }
+
+    /// Re-freezing the same prompt replaces its state instead of growing the map
+    /// (a re-prefill of a cached prompt must not leak a second snapshot).
+    #[test]
+    fn reinsert_replaces() {
+        let mut c = KvCache::new(4);
+        c.insert(&[9, 9], 1, snap(2));
+        c.insert(&[9, 9], 2, snap(2));
+        assert_eq!(c.slots.len(), 1);
+        assert_eq!(c.get(&[9, 9]).map(|e| e.first_token), Some(2));
+    }
 }
 
 /// The engram's token map (a pure function of the tokenizer, precomputed into

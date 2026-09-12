@@ -70,6 +70,17 @@ pub trait StepEngine: Send {
     fn max_ctx(&self) -> usize {
         usize::MAX
     }
+
+    /// How many prompt tokens the MOST RECENT `prefill` served from a cached
+    /// prefix instead of computing them (0 when there is no cache, it missed,
+    /// or the backend has none — the honest default).
+    ///
+    /// Read once per admission, so the adapter can report it as
+    /// `Admission::prefix_hit` → `usage.prompt_tokens_details.cached_tokens`
+    /// without the engine having to know how that travels.
+    fn resume_hit(&self) -> usize {
+        0
+    }
 }
 
 /// One request's state while it lives on the engine.
@@ -230,7 +241,14 @@ impl<E: StepEngine + 'static> ServeEngine for SingleFlight<E> {
         if self.live.is_none() {
             if let Some(seq) = self.queue.pop_front() {
                 match self.admit(seq) {
-                    Ok(()) => plan.admissions.push(Admission { seq, row: 0, prefix_hit: 0 }),
+                    Ok(()) => plan.admissions.push(Admission {
+                        seq,
+                        row: 0,
+                        // what the admission just served from a prefix cache (0 for
+                        // a backend without one) — this is the number the wire
+                        // reports as `cached_tokens`.
+                        prefix_hit: self.engine.resume_hit(),
+                    }),
                     Err(e) => self.fail(Some(seq), e),
                 }
             }

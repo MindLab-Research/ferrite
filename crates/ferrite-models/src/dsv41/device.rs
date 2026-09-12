@@ -363,6 +363,23 @@ struct Kernels {
     head_gemv_bf16_mrows: Option<
         unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
     >,
+    // Grouped low-rank output projection, from dsv41_kernels.cu
+    // (`dsv41_wo_a_grouped_fp8`). The draft's block-diagonal `wo_a` in ONE
+    // launch per (group tile x MTP block) instead of one m=1 gemv per
+    // (group, row): the weight rows are staged once and every activation row
+    // folds against them. Optional — a stale .so without the symbol keeps the
+    // per-(group, row) loop, and the C entry returns 2 (declined, never
+    // cudaErrorInvalidValue) for a shape/mode it cannot take.
+    // Row of the multi-row launch is bit-identical to the m=1 launch of the
+    // same (group, row); the kernel header carries the argument.
+    // ABI: (a, a_scale, w, w_scale, bias, out, groups, rows, n, k, a_stride,
+    //       out_stride, s).
+    wo_a_grouped_fp8: Option<
+        unsafe extern "C" fn(
+            *const u8, *const f32, *const u8, *const u8, *const f32, *mut f32,
+            c_int, c_int, c_int, c_int, c_int, c_int, CuStream,
+        ) -> c_int,
+    >,
     // v2 (vectorized float4 + K-split) f32 M=1 GEMV, from dsv41_glue.cu.
     // Optional: an older .so without the symbol keeps the v1 kernel above.
     // Same ABI as v1: (w, x, out, n=out_f, k=in_f, s).
@@ -898,6 +915,7 @@ impl Device {
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
+            wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             argmax: ko!(rt, "dsv41_argmax"),
             engram_hash_step: ko!(rt, "dsv41_engram_hash_step"),
             window_idxs: ko!(rt, "dsv41_window_idxs"),
@@ -2919,6 +2937,59 @@ impl Device {
         }
         let rc = unsafe { f(w, x, out, rows, n, k, self.stream) };
         self.kerr(rc, "dsv41_head_gemv_bf16_mrows")?;
+        Ok(true)
+    }
+
+    /// The draft's block-diagonal `wo_a` as ONE weight-stationary launch.
+    ///
+    /// `a` is the quantised attention output `[rows][a_stride/4 f32]` (fp8 bytes,
+    /// group `g`'s k-element segment at `+g*k`), `w` the [n, k] fp8 weight whose
+    /// group `g` row block starts at `+g*n*k`, `out` the f32 `[rows][out_stride]`
+    /// result whose group `g` columns start at `+g*n`. The C entry lays the group
+    /// out along `grid.y`, so all `groups` groups ride in one launch.
+    ///
+    /// Every (row, r) of this launch is BIT-IDENTICAL to the m=1 `gemm_fp8_mx`
+    /// of the same (group, r) the caller would otherwise issue: same ascending
+    /// kb / lane->c walk, same staged bytes, same serial `acc` chain with the same
+    /// `shfl_xor` tree, no cross-row recombination (the kernel header carries the
+    /// C1-C6 argument). What changes is the traffic: the group's weight block is
+    /// read ONCE for all `rows` rows instead of once per row, and `groups * rows`
+    /// launches collapse into one.
+    ///
+    /// `Ok(false)` means NOT performed — keep the per-(group, row) loop: either
+    /// the loaded .so predates the symbol or the C entry declined the shape/mode
+    /// (it returns 2, not cudaErrorInvalidValue, so a decline can never be read as
+    /// a launch failure).
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_a_grouped_fp8(
+        &self,
+        a: *const u8,
+        a_scale: *const f32,
+        w: *const u8,
+        w_scale: *const u8,
+        bias: *const f32,
+        out: *mut f32,
+        groups: i32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        a_stride: i32,
+        out_stride: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.wo_a_grouped_fp8 else {
+            return Ok(false);
+        };
+        let rc = unsafe {
+            f(
+                a, a_scale, w, w_scale, bias, out, groups, rows, n, k, a_stride, out_stride,
+                self.stream,
+            )
+        };
+        // 2 = the kernel's "declined" (shape/mode), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_wo_a_grouped_fp8")?;
         Ok(true)
     }
 

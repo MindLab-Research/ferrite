@@ -97,8 +97,8 @@ pub struct DsparkShadowReport {
     pub drafts: [u32; DSPARK_DRAFTS],
     /// The verify block's per-row argmax: row `j` (position `pos + 1 + j`, fed
     /// `drafts[j]`) predicted `verify_out[j]` for `pos + 2 + j`.
-    pub verify_out: [u32; DSPARK_DRAFTS + 1],
-    /// `k` (1..=DSPARK_DRAFTS + 1): the number of tokens the speculative path
+    pub verify_out: [u32; DSPARK_DRAFTS],
+    /// `k` (1..=DSPARK_DRAFTS): the number of tokens the speculative path
     /// WOULD have emitted from this step — the accepted draft prefix plus one
     /// bonus token. `1` means no draft survived, i.e. `next` alone.
     pub accepted: usize,
@@ -123,7 +123,7 @@ pub struct DsparkSpecReport {
     pub drafts: [u32; DSPARK_DRAFTS],
     /// The verify block's per-row argmax — row `j` sits at `pos + 1 + j` (row 0
     /// is the anchor) and predicts `pos + 2 + j`.
-    pub verify_out: [u32; DSPARK_DRAFTS + 1],
+    pub verify_out: [u32; DSPARK_DRAFTS],
     /// The accepted draft-prefix length (0..=DSPARK_DRAFTS): `drafts[0..k_acc]`
     /// all matched the verify row that predicts them.
     pub k_acc: usize,
@@ -460,6 +460,30 @@ struct Scratch {
     spec_snap_kvp: DevBuf,
     /// `[n_layers][VERIFY_ROWS][head_dim]` f32 — the verify's `scp` rows.
     spec_snap_scp: DevBuf,
+    // ==================== the KV prefix snapshot (serve-side prefix cache) ====
+    //
+    // `DevChain::kv_snapshot` freezes the WHOLE sequence's prefix state into the
+    // host, and `kv_restore` puts it back. The layout deliberately mirrors the
+    // shadow save's above — indexed BY LAYER, carry stored as `state_kv` then
+    // `state_score` at a `max_ratio * head_dim` stride — but at the FULL window
+    // width instead of a `VERIFY_ROWS` block, and as persistent scratch rather
+    // than a within-a-step save.
+    //
+    // ⚠️ Not the `dspark_snap_*` buffers themselves: those are `VERIFY_ROWS` rows
+    // wide and must be free for a verify block to save into at any step. A prefix
+    // snapshot is taken BETWEEN requests, so the two never overlap in time — but
+    // sharing a buffer would make that an argument about call order instead of a
+    // property of the code.
+    /// `[n_layers][window][head_dim]` f32 — the staging area every ring owner's
+    /// window is D2D'd into, so the window half costs ONE D2H instead of one per
+    /// layer (a D2H is a full device sync; a 40-layer chain would pay 40).
+    kv_snap_ring: DevBuf,
+    /// `[n_layers][2][max_ratio * head_dim]` f32 — the compressor carry, same
+    /// segmentation as `dspark_snap_state`.
+    kv_snap_state: DevBuf,
+    /// `[n_layers][head_dim]` f32 — the pooled latent rows, `dspark_snap_latent`'s
+    /// layout.
+    kv_snap_latent: DevBuf,
 }
 
 /// Device-resident state for the engram n-gram hash: the compressed-token map,
@@ -1333,6 +1357,18 @@ impl<'a> DevChain<'a> {
             dspark_snap_out_rows: dev.alloc((cfg.n_layers * 4).max(4))?,
             spec_snap_kvp: dev.alloc(fb(cfg.n_layers * VERIFY_ROWS * hd).max(8))?,
             spec_snap_scp: dev.alloc(fb(cfg.n_layers * VERIFY_ROWS * hd).max(8))?,
+            // ---- the KV prefix snapshot's staging area. Allocated unconditionally
+            // (10.5 MB) so the allocation graph stays static, exactly like the
+            // shadow save's set above; only touched when a snapshot/restore runs.
+            kv_snap_ring: dev.alloc(fb(cfg.n_layers * cfg.window_size * hd).max(8))?,
+            kv_snap_state: dev.alloc(
+                fb(cfg.n_layers
+                    * 2
+                    * cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1)
+                    * hd)
+                .max(8),
+            )?,
+            kv_snap_latent: dev.alloc(fb(cfg.n_layers * hd).max(8))?,
         };
 
         // The fused route's election counter must start at 0 (cudaMalloc does
@@ -3161,6 +3197,466 @@ impl<'a> DevChain<'a> {
         Ok(())
     }
 
+    // ======================= the KV prefix snapshot (serve side) =============
+    //
+    // `dspark_snapshot`/`dspark_rollback` above undo a 6-ROW block inside one
+    // step. These two freeze the WHOLE sequence's prefix state and put it back
+    // at a later request: the mechanism is the same one (copy the KV out, copy it
+    // back, restore the counters) at the sequence scale, which is what a prefix
+    // cache needs. What is saved is the union of the shadow save's inventory and
+    // two entries the shadow save deliberately omits:
+    //
+    //   * `index_k[0 .. clen * index_head_dim)` — the shadow save can skip it
+    //     because it restores `clen` in the same breath and the next real commit
+    //     overwrites the row at `clen - 1`, which is the only row the verify
+    //     touched. A prefix snapshot is restored from an ARBITRARY later request,
+    //     so those rows are the live read source of the continuing step
+    //     (`indexer_topk` scans them) and must come back.
+    //   * the engram n-gram table (`EngDev::cache`) — per-sequence device state
+    //     that `reset` zeroes, feeding the layer 1/14 residual write-back, so a
+    //     missing table makes a resumed run diverge from a from-scratch one on a
+    //     long prompt.
+    //
+    // The snapshot is EXACT and self-contained: restoring it and stepping on
+    // reproduces a from-scratch run bit for bit. It is therefore also taken
+    // literally — `pos_ctr` is read back from the device rather than assumed, and
+    // a caller that finds the recorded position disagreeing with its own
+    // bookkeeping must not use the result.
+}
+
+/// One layer's share of a [`KvSnapshot`]. A field is empty when the layer does
+/// not play that role, so a window-only layer costs its window and nothing more.
+///
+/// All the float payloads are raw bytes (not `Vec<f32>`) for the reason the
+/// release will need: the ring is stored fp8 on the way there, and a byte copy
+/// neither reinterprets nor converts — the same block can be handed to
+/// `upload_bytes_at` whatever element type the device side grows.
+#[derive(Debug, Clone, Default)]
+pub struct LayerKvSnapshot {
+    /// The window ring, `window * head_dim` f32 as raw bytes. Empty for a layer
+    /// that is not a ring owner (a shared-ring consumer has no state of its own:
+    /// `sparse_attn` reads its owner's buffer).
+    pub ring: Vec<u8>,
+    /// The committed compressed rows, `clen * head_dim` f32 as raw bytes — the
+    /// device's `ring[window, window + clen)`, contiguous right after the window.
+    /// Empty for a layer that runs no compressor.
+    pub compress: Vec<u8>,
+    /// The published pre-RoPE index keys, `clen * index_head_dim` f32 as raw
+    /// bytes. Empty for a layer that publishes none.
+    pub index_k: Vec<u8>,
+    /// The compressor carry, `ratio * head_dim` f32 as raw bytes.
+    pub state_kv: Vec<u8>,
+    /// The compressor's score carry, same shape. Never zero-seeded: the device
+    /// seeds empty slots with `-inf` (`reset`), so this block must round-trip
+    /// whole or an empty slot starts looking like a real 0-weight entry.
+    pub state_score: Vec<u8>,
+    /// The compressor's pooled latent row, `head_dim` f32 as raw bytes. Not a
+    /// scratch: a later step reads it to publish its index key when the group
+    /// completes (`indexer`), so a wrong latent lands in `index_k[clen - 1]`.
+    pub latent: Vec<u8>,
+    /// The committed-row count — the HOST mirror `LayerCache::compress_len`,
+    /// which the host branches on. Restored alongside the device counter.
+    pub clen: usize,
+}
+
+/// A whole chain's prefix state at one position, held on the HOST (the P0 cache
+/// tier). Taken by [`DevChain::kv_snapshot`], put back by [`DevChain::kv_restore`].
+#[derive(Debug, Clone)]
+pub struct KvSnapshot {
+    /// The device position counter as read at snapshot time: the absolute
+    /// position the state sits at, i.e. the number of tokens consumed.
+    pub pos_ctr: i32,
+    /// [`Self::pos_ctr`] as a length — what the caller resumes from. Recorded
+    /// separately so a caller can see the two disagree instead of inferring it.
+    pub tokens: usize,
+    /// Per layer, indexed by layer id (length `n_layers`). MTP layers are not
+    /// part of this: they are not ring owners (see [`DevChain::ring_owners`]).
+    pub layers: Vec<LayerKvSnapshot>,
+    /// The DEVICE committed-row counters, `n_layers` i32, written back as one
+    /// block (`commit`/`sparse_attn`/`indexer_topk` all read them).
+    pub clen_dev: Vec<i32>,
+    /// The engram n-gram table, `max_seq` i64; `None` when the engram is off.
+    pub eng_cache: Option<Vec<i64>>,
+}
+
+/// `gcd`, for [`DevChain::kv_page_align`].
+fn gcd(a: usize, b: usize) -> usize {
+    let (mut a, mut b) = (a, b);
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
+}
+
+impl<'a> DevChain<'a> {
+    /// How many compressed rows this layer's ring can hold. The allocation is
+    /// `window + max_comp` rows (`DevChain::new`), so the ceiling is derivable
+    /// from the buffer rather than stored a second time.
+    fn layer_max_comp(&self, layer: usize) -> usize {
+        let row = self.cfg.head_dim * std::mem::size_of::<f32>();
+        (self.layers[layer].ring.bytes / row).saturating_sub(self.cfg.window_size)
+    }
+
+    /// The largest position `<= tokens` that is a boundary for EVERY compress
+    /// source, i.e. a multiple of the lcm of their ratios. `tokens` itself when
+    /// all ratios are 1.
+    ///
+    /// Why it exists: the compressor commits a group when `(pos + 1) % ratio == 0`
+    /// and only then publishes the row, so a position off the boundary carries a
+    /// HALF-accumulated group. That is still exact for the same prefix — the carry
+    /// round-trips whole, which is why the serving cache (an exact full-prompt
+    /// match, restored at the same position) does not need this. It becomes
+    /// mandatory for the P1 radix tree, where a node's state is handed to a
+    /// DIFFERENT continuation and a mid-group node could not keep
+    /// `(pos + 1) % ratio` aligned with the position it is resumed at.
+    ///
+    /// A caller combining this with a block/page granularity must also make that
+    /// granularity a multiple of the returned step (`page_size % ratio == 0` for
+    /// every compress source), or the two alignments cannot both hold.
+    pub fn kv_page_align(&self, tokens: usize) -> usize {
+        let mut step = 1usize;
+        for &l in &self.compress_sources() {
+            let r = self.cfg.compress_ratio(l).max(1);
+            step = step / gcd(step, r) * r;
+        }
+        tokens - tokens % step
+    }
+
+    /// Freeze the chain's prefix state into the host. Call BETWEEN steps: the
+    /// snapshot describes the state after the last completed one, and a D2H is a
+    /// device sync, so an in-flight step would be captured half-applied.
+    ///
+    /// Cost is linear in the position (see the module's `LayerKvSnapshot`), the
+    /// window being the only constant part. The reads are batched: every ring
+    /// owner's window goes through one staging buffer and one D2H, the carry
+    /// through two more, and only the position-sized pieces (compressed rows,
+    /// index keys) are copied per source layer.
+    pub fn kv_snapshot(&self) -> Result<KvSnapshot> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let win = cfg.window_size;
+        let ihd = cfg.index_head_dim.max(1);
+        let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+        let n_layers = cfg.n_layers;
+        // The host n-gram path (`DSV41_ENG_HOST=1`) keeps its rolling hash on the
+        // HOST side and this increment snapshots only the device table, so a
+        // resume would start from a host hash that no longer matches the prefix.
+        // Refuse rather than hand back a state that cannot be restored exactly —
+        // the caller's contract is "byte-identical to a from-scratch run".
+        if eng_host() && self.ngram.is_some() {
+            return Err(FerriteError::Config(
+                "kv_snapshot: DSV41_ENG_HOST=1 keeps the n-gram hash on the host, which this \
+                 snapshot does not cover (device-hash mode is the supported one)"
+                    .into(),
+            ));
+        }
+        // Drain in-flight work: everything below reads completed state.
+        self.dev.sync()?;
+        let pos = self.dev.download_u32(self.s.pos_ctr.ptr as *const c_void)? as i32;
+
+        // 1. The window ring of every owner: one D2D per layer into the staging
+        //    buffer, then ONE D2H for all of them.
+        let owners = self.ring_owners();
+        let astep = win * hd * std::mem::size_of::<f32>();
+        for &l in &owners {
+            self.dev.memcpy_d2d(
+                (self.s.kv_snap_ring.ptr as *mut f32).wrapping_add(l * win * hd) as *mut c_void,
+                self.layers[l].ring.ptr as *const c_void,
+                astep,
+            )?;
+        }
+        let mut window = vec![0u8; n_layers * astep];
+        self.dev.download_u8(&self.s.kv_snap_ring, &mut window)?;
+
+        let mut layers = vec![LayerKvSnapshot::default(); n_layers];
+        for &l in &owners {
+            layers[l].ring = window[l * astep..(l + 1) * astep].to_vec();
+        }
+
+        // 2. The compressor carry of every source: staged and downloaded like the
+        //    window (state_kv then state_score at a max-ratio stride).
+        let sources = self.compress_sources();
+        let cstep = max_ratio * hd * std::mem::size_of::<f32>();
+        for &l in &sources {
+            let cache = &self.layers[l];
+            let bytes = cfg.compress_ratio(l).max(1) * hd * std::mem::size_of::<f32>();
+            let base = (self.s.kv_snap_state.ptr as *mut f32).wrapping_add(l * 2 * max_ratio * hd);
+            self.dev
+                .memcpy_d2d(base as *mut c_void, cache.state_kv.ptr as *const c_void, bytes)?;
+            self.dev.memcpy_d2d(
+                base.wrapping_add(max_ratio * hd) as *mut c_void,
+                cache.state_score.ptr as *const c_void,
+                bytes,
+            )?;
+            self.dev.memcpy_d2d(
+                (self.s.kv_snap_latent.ptr as *mut f32).wrapping_add(l * hd) as *mut c_void,
+                cache.latent.ptr as *const c_void,
+                hd * std::mem::size_of::<f32>(),
+            )?;
+        }
+        let mut carry = vec![0u8; n_layers * 2 * cstep];
+        self.dev.download_u8(&self.s.kv_snap_state, &mut carry)?;
+        let mut latents = vec![0u8; n_layers * hd * std::mem::size_of::<f32>()];
+        self.dev.download_u8(&self.s.kv_snap_latent, &mut latents)?;
+
+        // 3. The DEVICE committed-row counters FIRST (one small read): they are
+        //    the authority for how much of the ring's compressed region is live,
+        //    so the position-sized copies below are sized from them and not from
+        //    the host mirror (which is a mirror: it tracks the same rule, but the
+        //    buffer's content is what a reader actually sees).
+        let mut clen_b = vec![0u8; n_layers * 4];
+        self.dev
+            .download_u8(&Device::view(self.s.clen.ptr, n_layers * 4), &mut clen_b)?;
+        let clen_dev: Vec<i32> = clen_b
+            .chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+
+        // 4. The position-sized pieces, one D2H each (a handful of layers).
+        for &l in &sources {
+            let cache = &self.layers[l];
+            let ratio = cfg.compress_ratio(l).max(1);
+            let clen = (clen_dev[l].max(0) as usize).min(self.layer_max_comp(l)).min(
+                // a `clen` past what the host mirror claims cannot be indexed:
+                // `indexer` publishes at `*clen - 1`, so the two must agree for a
+                // key to exist. Clipping to the smaller keeps the snapshot
+                // self-consistent rather than half-stale.
+                cache.compress_len,
+            );
+            let cb = ratio * hd * std::mem::size_of::<f32>();
+            let base = l * 2 * cstep;
+            // The HOST mirror, snapshotted as-is (it is restored as-is): the two
+            // counters are separate facts and neither is derived on the way back.
+            layers[l].clen = cache.compress_len;
+            layers[l].state_kv = carry[base..base + cb].to_vec();
+            layers[l].state_score = carry[base + cstep..base + cstep + cb].to_vec();
+            layers[l].latent = latents[l * hd * 4..(l + 1) * hd * 4].to_vec();
+            if clen == 0 {
+                continue;
+            }
+            let rows = clen * hd * std::mem::size_of::<f32>();
+            let view = Device::view(
+                (cache.ring.ptr as *mut f32).wrapping_add(win * hd) as *mut c_void,
+                rows,
+            );
+            let mut b = vec![0u8; rows];
+            self.dev.download_u8(&view, &mut b)?;
+            layers[l].compress = b;
+            // Only a publishing layer has keys to save (`indexer_owns_k` =
+            // `is_kv_source`; a consumer's own `index_k` is never written).
+            if cfg.is_index_source(l) {
+                let kb = clen * ihd * std::mem::size_of::<f32>();
+                let view = Device::view(cache.index_k.ptr, kb);
+                let mut b = vec![0u8; kb];
+                self.dev.download_u8(&view, &mut b)?;
+                layers[l].index_k = b;
+            }
+        }
+
+        // 5. The engram's n-gram table.
+        let eng_cache = match self.eng_dev.as_ref() {
+            Some(e) => {
+                let mut b = vec![0u8; e.max_seq * 8];
+                self.dev.download_u8(&e.cache, &mut b)?;
+                Some(
+                    b.chunks_exact(8)
+                        .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                        .collect(),
+                )
+            }
+            None => None,
+        };
+
+        Ok(KvSnapshot {
+            pos_ctr: pos,
+            tokens: pos.max(0) as usize,
+            layers,
+            clen_dev,
+            eng_cache,
+        })
+    }
+
+    /// Put a [`DevChain::kv_snapshot`] back. The caller then continues with
+    /// `step()` from `snap.tokens` (the tail of the prompt, if any) — the same
+    /// position discipline a from-scratch run has.
+    ///
+    /// Two side effects the caller must not undo: the captured step graph is
+    /// DROPPED and `decode_steps` reset to 0, for `reset`'s two reasons (the graph
+    /// baked the previous request's device addresses and its host branch choices);
+    /// and the device position counter is moved LAST, once everything it points
+    /// at is in place.
+    pub fn kv_restore(&mut self, snap: &KvSnapshot) -> Result<()> {
+        let cfg = self.cfg;
+        let hd = cfg.head_dim;
+        let win = cfg.window_size;
+        let ihd = cfg.index_head_dim.max(1);
+        let max_ratio = cfg.compress_ratios.iter().copied().max().unwrap_or(1).max(1);
+        let n_layers = cfg.n_layers;
+        let bad = |m: String| FerriteError::InvalidArg(format!("kv_restore: {m}"));
+        if snap.layers.len() < n_layers || snap.clen_dev.len() < n_layers {
+            return Err(bad(format!(
+                "snapshot covers {} layers / {} counters, the chain has {n_layers}",
+                snap.layers.len(),
+                snap.clen_dev.len()
+            )));
+        }
+
+        // 1. Drop the graph first: it would otherwise be replayed against state
+        //    (and addresses) it was not recorded from.
+        if let Some(e) = self.step_graph.take() {
+            self.dev.graph_free(std::ptr::null_mut(), e)?;
+        }
+        self.decode_steps = 0;
+
+        // 2. The window ring: one H2D into the staging buffer, one D2D per owner.
+        let owners = self.ring_owners();
+        let astep = win * hd * std::mem::size_of::<f32>();
+        let mut window = vec![0u8; n_layers * astep];
+        for &l in &owners {
+            let r = &snap.layers[l].ring;
+            if r.len() != astep {
+                return Err(bad(format!(
+                    "layer {l} window is {} bytes, expected {astep}",
+                    r.len()
+                )));
+            }
+            window[l * astep..(l + 1) * astep].copy_from_slice(r);
+        }
+        self.dev.upload_bytes_at(&self.s.kv_snap_ring, &window)?;
+        for &l in &owners {
+            self.dev.memcpy_d2d(
+                self.layers[l].ring.ptr,
+                (self.s.kv_snap_ring.ptr as *const f32).wrapping_add(l * win * hd) as *const c_void,
+                astep,
+            )?;
+        }
+
+        // 3. The compressor carry, staged the same way, then the position-sized
+        //    pieces per source (compressed rows, index keys) and the host mirror.
+        let sources = self.compress_sources();
+        let cstep = max_ratio * hd * std::mem::size_of::<f32>();
+        let mut carry = vec![0u8; n_layers * 2 * cstep];
+        let mut latents = vec![0u8; n_layers * hd * 4];
+        for &l in &sources {
+            let ratio = cfg.compress_ratio(l).max(1);
+            let cb = ratio * hd * std::mem::size_of::<f32>();
+            let li = &snap.layers[l];
+            if li.state_kv.len() != cb || li.state_score.len() != cb || li.latent.len() != hd * 4 {
+                return Err(bad(format!("layer {l} carry is not {cb}/{cb}/{} bytes", hd * 4)));
+            }
+            let base = l * 2 * cstep;
+            carry[base..base + cb].copy_from_slice(&li.state_kv);
+            carry[base + cstep..base + cstep + cb].copy_from_slice(&li.state_score);
+            latents[l * hd * 4..(l + 1) * hd * 4].copy_from_slice(&li.latent);
+        }
+        self.dev.upload_bytes_at(&self.s.kv_snap_state, &carry)?;
+        self.dev.upload_bytes_at(&self.s.kv_snap_latent, &latents)?;
+
+        for &l in &sources {
+            let ratio = cfg.compress_ratio(l).max(1);
+            let cb = ratio * hd * std::mem::size_of::<f32>();
+            let max_comp = self.layer_max_comp(l);
+            let li = &snap.layers[l];
+            // The row count comes from the DEVICE counter — the same authority the
+            // snapshot used, and the one a reader honours. The host mirror goes
+            // back unchanged but sizes nothing.
+            let clen = (snap.clen_dev[l].max(0) as usize).min(max_comp);
+            {
+                let cache = &self.layers[l];
+                let base = (self.s.kv_snap_state.ptr as *const f32)
+                    .wrapping_add(l * 2 * max_ratio * hd);
+                self.dev
+                    .memcpy_d2d(cache.state_kv.ptr, base as *const c_void, cb)?;
+                self.dev.memcpy_d2d(
+                    cache.state_score.ptr,
+                    base.wrapping_add(max_ratio * hd) as *const c_void,
+                    cb,
+                )?;
+                self.dev.memcpy_d2d(
+                    cache.latent.ptr,
+                    (self.s.kv_snap_latent.ptr as *const f32).wrapping_add(l * hd) as *const c_void,
+                    hd * 4,
+                )?;
+                if clen > 0 {
+                    if li.compress.len() != clen * hd * 4 {
+                        return Err(bad(format!(
+                            "layer {l} has {} compressed-row bytes, expected {}",
+                            li.compress.len(),
+                            clen * hd * 4
+                        )));
+                    }
+                    let view = Device::view(
+                        (cache.ring.ptr as *mut f32).wrapping_add(win * hd) as *mut c_void,
+                        clen * hd * 4,
+                    );
+                    self.dev.upload_bytes_at(&view, &li.compress)?;
+                    if cfg.is_index_source(l) && !li.index_k.is_empty() {
+                        if li.index_k.len() != clen * ihd * 4 {
+                            return Err(bad(format!(
+                                "layer {l} has {} index-key bytes, expected {}",
+                                li.index_k.len(),
+                                clen * ihd * 4
+                            )));
+                        }
+                        let view = Device::view(cache.index_k.ptr, clen * ihd * 4);
+                        self.dev.upload_bytes_at(&view, &li.index_k)?;
+                    }
+                }
+            }
+            // The host mirror last, so `clen`-gated host branches read the value
+            // that goes with the buffers just written.
+            self.layers[l].compress_len = li.clen;
+        }
+
+        // 4. The device counters as one block. A non-source layer cannot have
+        //    committed rows — the commit kernel runs from the compressor, which only
+        //    a source executes — so a non-zero counter there would mean the snapshot
+        //    describes a configuration this restore does not put back. Refuse
+        //    instead of leaving rows a reader would trust.
+        for l in 0..n_layers {
+            if snap.clen_dev[l] != 0 && !sources.contains(&l) {
+                return Err(bad(format!(
+                    "layer {l} reports {} committed rows but is not a compress source",
+                    snap.clen_dev[l]
+                )));
+            }
+        }
+        let mut clen_b = Vec::with_capacity(n_layers * 4);
+        for v in &snap.clen_dev[..n_layers] {
+            clen_b.extend_from_slice(&v.to_le_bytes());
+        }
+        self.dev
+            .upload_bytes_at(&Device::view(self.s.clen.ptr, n_layers * 4), &clen_b)?;
+
+        // 5. The engram table. A snapshot without one means the table must be
+        //    ZEROED, exactly as `reset` leaves it — a stale table would make the
+        //    resumed run differ from a from-scratch one.
+        match (self.eng_dev.as_ref(), snap.eng_cache.as_ref()) {
+            (Some(e), Some(v)) => {
+                if v.len() != e.max_seq {
+                    return Err(bad(format!(
+                        "engram table is {} entries, expected {}",
+                        v.len(),
+                        e.max_seq
+                    )));
+                }
+                let mut b = Vec::with_capacity(v.len() * 8);
+                for x in v {
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                self.dev.upload_bytes_at(&e.cache, &b)?;
+            }
+            (Some(e), None) => self.dev.zero_at(e.cache.ptr, e.max_seq * 8)?,
+            (None, _) => {}
+        }
+
+        // 6. The position LAST (see the doc comment).
+        self.set_pos_ctr(snap.tokens)?;
+        Ok(())
+    }
+
     /// Shadow-mode DSpark step: run the draft and a real verify block for this
     /// step, then put the main chain back exactly where the single-row path would
     /// have left it, and report what the speculative path would have emitted.
@@ -3193,7 +3689,7 @@ impl<'a> DevChain<'a> {
     /// * `drafts[j]`, `j >= 1`, is accepted iff it equals `verify_out[j - 1]`: the
     ///   row fed `drafts[j - 1]` predicted it, so the checks are only meaningful
     ///   under the accepted prefix (hence the early `break`).
-    /// * `accepted = 1 + <accepted draft prefix length>` (1..=DSPARK_DRAFTS + 1):
+    /// * `accepted = 1 + <accepted draft prefix length>` (1..=DSPARK_DRAFTS):
     ///   the accepted drafts plus the single bonus token the last surviving row
     ///   contributes — with nothing accepted, the emitted token is `next` alone.
     ///
@@ -3215,10 +3711,9 @@ impl<'a> DevChain<'a> {
         pos: usize,
     ) -> Result<DsparkShadowReport> {
         let cfg = self.cfg;
-        // The verify block is [anchor(next), d1..d5] — 6 rows (the official
-        // DSpark structure: the anchor's forward happens IN the verify, its KV
-        // is what rows 1.. attend).
-        let m = DSPARK_DRAFTS + 1;
+        // The verify block is [d1..d5] — 5 rows (t0's forward already happened
+        // in the single-row step).
+        let m = DSPARK_DRAFTS;
         // The tap hook only exists in the step graph when the gate was armed at
         // capture time. `dspark_armed()` caches the env in a OnceLock, so this is
         // the SAME decision `layer()` made — a process that armed the gate after
@@ -3276,33 +3771,29 @@ impl<'a> DevChain<'a> {
         // the same one the host reference's `forward_spec(.., start_pos)` uses.
         let t = std::time::Instant::now();
         dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
-        // The anchor is the JUST-SAMPLED token (`next` — the official DSpark
-        // convention: draft_input_ids[:, 0] = the bonus token, which has NOT
-        // been forwarded yet). The block [next, noise×4] therefore starts at
-        // pos+1 and every one of the γ predictions covers an UNKNOWN token;
-        // the historical call fed the just-CONSUMED t0, wasting the first
-        // draft slot on re-predicting a token the backbone already emitted and
-        // leaving every prediction one position behind. The tap (t0's hidden)
-        // is exactly the official main_x source: hidden[anchor_pos - 1].
+        // The official model.py semantics (settled by the unit diff): the block
+        // is [embed(t0), noise×4] — the JUST-CONSUMED token's embedding, placed
+        // at the NEXT position's viewpoint (RoPE at start_pos + seqlen + r with
+        // seqlen = 1, i.e. pos+1+r; the seed window row goes to slot
+        // start_pos % win = pos). The intermediate anchor=bonus reading was the
+        // sglang/DeepSpec convention, which does NOT match this checkpoint's
+        // reference — the unit harness caught it as a 100% q divergence.
         let drafts = if bisect >= 2 {
-            [next; DSPARK_DRAFTS]
+            [token; DSPARK_DRAFTS]
         } else {
-            dspark.draft_forward(next, pos + 1)?;
+            dspark.draft_forward(token, pos + 1)?;
             dspark.drafts()?
         };
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
 
         // 6. the verify block: one m-row forward, per-row argmax. The block is
-        //    [anchor(next), d1..d5] at pos+1..pos+6 — the anchor's row is what
-        //    provides its KV (it was never forwarded; the single-row step only
-        //    appended t0). Everything it appends, step 8 undoes.
+        //    [d1..d5] at pos+1..pos+5 (t0 was already forwarded by the single-row
+        //    step). Everything it appends, step 8 undoes.
         let t = std::time::Instant::now();
-        let mut six = [next; DSPARK_DRAFTS + 1];
-        six[1..].copy_from_slice(&drafts);
         let rows = if bisect == 1 || bisect == 3 {
             Vec::new()
         } else {
-            self.step_rows(&six)?
+            self.step_rows(&drafts)?
         };
         let verify_ms = t.elapsed().as_secs_f32() * 1e3;
 
@@ -3311,31 +3802,32 @@ impl<'a> DevChain<'a> {
         //    error path.
         self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
 
-        let mut verify_out = [0u32; DSPARK_DRAFTS + 1];
-        if bisect == 0 && rows.len() != DSPARK_DRAFTS + 1 {
+        let mut verify_out = [0u32; DSPARK_DRAFTS];
+        if bisect == 0 && rows.len() != DSPARK_DRAFTS {
             return Err(FerriteError::Config(format!(
                 "dspark_shadow_step: step_rows returned {} rows for a {}-row \
                  verify block",
                 rows.len(),
-                DSPARK_DRAFTS + 1
+                DSPARK_DRAFTS
             )));
         }
-        if rows.len() == DSPARK_DRAFTS + 1 {
+        if rows.len() == DSPARK_DRAFTS {
             verify_out.copy_from_slice(&rows);
         }
 
-        // 8. the accept arithmetic (host, no device traffic). The anchor row
-        //    (verify_out[0], the forward of `next`) predicts the token after
-        //    it — that is what d1 is checked against; d_{j+1} against
-        //    verify_out[j]. k = 1 (the anchor `next` is always emitted) +
-        //    matches; a full 6 means every draft matched plus the final
-        //    verify_out bonus.
+        // 8. the accept arithmetic (host, no device traffic). The first check
+        //    is FREE: drafts[0] predicts pos+1's token, which the single-row
+        //    step already sampled as `next`; then drafts[j] (j>=1) against
+        //    verify_out[j-1] (row d_j's argmax = the prediction for pos+1+j).
         let mut acc = 0usize;
-        for j in 0..DSPARK_DRAFTS {
-            if drafts[j] == verify_out[j] {
-                acc += 1;
-            } else {
-                break;
+        if drafts[0] == next {
+            acc = 1;
+            for j in 1..DSPARK_DRAFTS {
+                if drafts[j] == verify_out[j - 1] {
+                    acc += 1;
+                } else {
+                    break;
+                }
             }
         }
 
@@ -3442,19 +3934,21 @@ impl<'a> DevChain<'a> {
         // is `next` — the JUST-SAMPLED token, not yet forwarded — at pos + 1.
         let t = std::time::Instant::now();
         dspark.import_tap(self.s.dspark_tap.ptr as *const f32)?;
-        dspark.draft_forward(next, pos + 1)?;
+        // Official model.py semantics: the block is [embed(t0), noise×4] at the
+        // NEXT position's viewpoint (RoPE pos+1+r; the seed window row goes to
+        // slot pos%win). See dspark_shadow_step for the full arbitration note.
+        dspark.draft_forward(token, pos + 1)?;
         let drafts = dspark.drafts()?;
         let draft_ms = t.elapsed().as_secs_f32() * 1e3;
 
-        // ---- 4. the verify: [anchor, d1..d5] at pos+1..pos+6, per-row argmax.
+        // ---- 4. the verify: [d1..d5] at pos+1..pos+5, per-row argmax (t0 was
+        // already forwarded by the single-row step).
         let t = std::time::Instant::now();
-        let mut six = [next; DSPARK_DRAFTS + 1];
-        six[1..].copy_from_slice(&drafts);
         // Arm the per-layer kvp/scp capture the commit's replay needs. It is
         // cleared BEFORE the `?` so a failed verify cannot leave every later step
         // paying for copies nobody reads.
         self.spec_capture = true;
-        let rows_res = self.step_rows(&six);
+        let rows_res = self.step_rows(&drafts);
         self.spec_capture = false;
         let rows = match rows_res {
             Ok(r) => r,
@@ -3466,24 +3960,28 @@ impl<'a> DevChain<'a> {
             }
         };
         let verify_ms = t.elapsed().as_secs_f32() * 1e3;
-        if rows.len() != DSPARK_DRAFTS + 1 {
+        if rows.len() != DSPARK_DRAFTS {
             self.dspark_rollback(pos_ctr, m, &host_mirrors)?;
             return Err(FerriteError::Config(format!(
                 "dspark_spec_step: step_rows returned {} rows for a {}-row verify block",
                 rows.len(),
-                DSPARK_DRAFTS + 1
+                DSPARK_DRAFTS
             )));
         }
-        let mut verify_out = [0u32; DSPARK_DRAFTS + 1];
+        let mut verify_out = [0u32; DSPARK_DRAFTS];
         verify_out.copy_from_slice(&rows);
 
         // ---- 5. the accept arithmetic (host, no device traffic). Row j sits at
-        // pos + 1 + j and was fed `six[j]` (the anchor for j == 0, d_j after), so
-        // `verify_out[j]` is the target's prediction for pos + 2 + j — the exact
-        // position `drafts[j]` guesses.
+        // pos + 1 + j and was fed `drafts[j]` (d_{j+1}), so `verify_out[j]` is the
+        // target's prediction for pos + 2 + j. The first check is FREE: drafts[0]
+        // predicts pos+1's token, which the single-row step already sampled as
+        // `next`; then drafts[j] (j>=1) is checked against verify_out[j-1].
         let mut k_acc = 0usize;
-        while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc] {
-            k_acc += 1;
+        if drafts[0] == next {
+            k_acc = 1;
+            while k_acc < DSPARK_DRAFTS && drafts[k_acc] == verify_out[k_acc - 1] {
+                k_acc += 1;
+            }
         }
 
         // ---- 6. the commit.
