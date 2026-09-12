@@ -1852,6 +1852,80 @@ fn sids_writeback() -> bool {
     })
 }
 
+/// `DSV41_V5_LEDGER=1` arms the per-step v5 round LEDGER: one `[v5-ledger]`
+/// line per spec step carrying this rank's device epoch before/after the step.
+///
+/// # Why this exists (the 9th SWALLOW fix's D1)
+///
+/// Eight fixes failed on the `ar5-hang` epoch rift, and every one of them had to
+/// INFER the per-rank round footprint from a watchdog line. The two watchdogs do
+/// not fire at the same distance from the defect: the AR v5 pubred spins
+/// 5,000,000 times (~0.5 s, `ferrite_kernels.cu`'s `ar5_wait_round`) while the
+/// argmax exchange spins 25,000,000 (~5 s, `dsv41_kernels.cu`). A real rift
+/// therefore reports FIRST on the AR (no `rows=`) and only later on
+/// `argmax_rows` — and the historical logs quote the `rows=` line, which is the
+/// symptom, not the first witness.
+///
+/// This gate turns the inference into a READ: `epoch` is the one device-side
+/// authority on "how many v5 rounds has this rank issued" (`tp.rs`'s
+/// `epoch_dev`, advanced by every pubred and by the argmax exchange alike), so
+/// the increment between two consecutive lines is this rank's exact round count
+/// for the step. One run then decides the round-ledger ambiguity the design
+/// document was written around: whether a rank's footprint is short by 1/step
+/// (a head-geometry branch), by 81 in one step (an arm boundary), or is
+/// identical (the rift is a round-ORDER defect, not a round-count one).
+///
+/// DEFAULT OFF: the read is a 4-byte D2H per step (the same order as
+/// `inv_ids`/`inv_compress_len`), which is measurable at 400 tok/s — so
+/// throughput runs are taken with the gate off and only the ledger run pays it.
+/// Read once and cached (`OnceLock`), the house rule for every gate here.
+fn v5_ledger() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_V5_LEDGER").map(|v| v != "0").unwrap_or(false))
+}
+
+/// `DSV41_SWALLOW_EPOCH_PAD=1` arms the D2 epoch pad: the swallowed arm's round
+/// sequence is padded with `SWALLOW_MISSING_ROUNDS` empty v5 rounds so its
+/// per-step footprint equals the legacy/aligned arm's.
+///
+/// # Why the fix is a PAD and not another arm-vote
+///
+/// The round ledger (see [`v5_ledger`]) puts `legacy == aligned == 165` and
+/// `swallowed == 84` rounds/step: the swallowed arm drops `step_dev`, whose 40
+/// layers of attention + MoE all-reduce (40 x 2) and the head's argmax exchange
+/// are exactly the missing 81. Every arm-selection guard tried before this one
+/// tried to make all ranks AGREE on one arm; the pad instead makes every arm
+/// COST THE SAME, so a rank that picks the other arm cannot open a rift —
+/// the divergence is not prevented, it is made unobservable on the epoch.
+///
+/// DEFAULT OFF (the A/B): with the gate off the swallowed arm issues exactly
+/// the rounds it always did, so `DSV41_SWALLOW_EPOCH_PAD=1` vs unset is the
+/// pair. The pad is a launch, not a payload — the real all-reduces' bytes are
+/// untouched, so the swallowed arm's speed-up is not given back.
+///
+/// # The one arm this must NOT be applied to
+///
+/// The lazy arm's footprint is `3 + 81 * k_emit` — it is `k_emit`-dependent, so
+/// a constant pad cannot equalise it. `DSV41_LAZY_VERIFY` with
+/// `DSV41_SWALLOW_STEP` stays forbidden (`scripts/batched_400_v2.sh`), and if
+/// that pairing is ever allowed the lazy arm needs its own per-row pad. The
+/// pad below is reachable only from the batched swallowed arm.
+fn swallow_epoch_pad() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_SWALLOW_EPOCH_PAD").map(|v| v != "0").unwrap_or(false))
+}
+
+/// The rounds the swallowed arm is short per step: `step_dev`'s per-layer
+/// attention + MoE all-reduces (`2 * n_layers`) plus the head's argmax exchange
+/// (`1`). At the production geometry (40 layers) that is 81.
+///
+/// Keyed off the CONFIG's `n_layers`, not a literal 40: the ledger's whole point
+/// is that the two arms' round counts are a function of the geometry, and a pad
+/// that hard-codes 40 would silently under-pad any other config.
+fn swallow_missing_rounds(n_layers: usize) -> u32 {
+    (2 * n_layers + 1) as u32
+}
+
 /// `DSV41_INV_CHECK=1` arms the spec path's cross-step INVARIANT ASSERTIONS.
 ///
 /// Default OFF, so the steady-state hot path pays nothing: every check below is
@@ -3300,6 +3374,12 @@ pub struct DevChain<'a> {
     /// the call the probe follows; the replay path leaves it at the capture's
     /// value, which is what the replayed graph wrote.
     verify_geom: std::cell::Cell<Option<(usize, usize)>>,
+    /// `DSV41_V5_LEDGER=1` only: the device epoch the previous `[v5-ledger]`
+    /// line reported, so the next line can carry the per-step increment. `None`
+    /// until the first line of the process (its `delta` is 0). A `Cell` because
+    /// [`Self::v5_ledger_note`] is an observation that must not need `&mut self`
+    /// at the arms' exits, and lives only while the gate is on.
+    v5_ledger_epoch: std::cell::Cell<Option<u32>>,
 }
 
 fn fb(n: usize) -> usize {
@@ -3714,6 +3794,7 @@ impl<'a> DevChain<'a> {
             verify_captures: 0,
             verify_replays: 0,
             verify_geom: std::cell::Cell::new(None),
+            v5_ledger_epoch: std::cell::Cell::new(None),
         })
     }
 
@@ -7975,6 +8056,7 @@ impl<'a> DevChain<'a> {
         if swallow_step() && self.spec_primed_unanimous() && self.spec_primed {
             let rep = self.dspark_spec_swallowed(dspark, token, pos)?;
             lazy_b_ms_note(rep.verify_ms);
+            self.v5_ledger_note(pos, "swallowed", rep.emitted.len());
             return Ok(rep);
         }
         // ---- `DSV41_LAZY_VERIFY`: the same block, one ROW at a time ----
@@ -7996,6 +8078,14 @@ impl<'a> DevChain<'a> {
                 rep
             };
             self.lazy_hist.push(rep.k_acc);
+            // The ledger's arm tag distinguishes the two sub-arms of this block:
+            // `lazy`'s footprint is `k_emit`-dependent (see [`swallow_epoch_pad`]),
+            // while the batched sub-arm is the one D2 pads.
+            self.v5_ledger_note(
+                pos,
+                if use_lazy { "lazy" } else { "swallowed" },
+                rep.emitted.len(),
+            );
             return Ok(rep);
         }
         // The seed↔tap alignment (`DSV41_SEED_ALIGN`) moves this arm's draft
@@ -9329,6 +9419,44 @@ impl<'a> DevChain<'a> {
     // static (compile-time / `debug_assert`) shape check, or a single 4-byte
     // device→host spot read.
     // =========================================================================
+
+    /// The v5 round LEDGER's one read (`DSV41_V5_LEDGER=1`) — see [`v5_ledger`].
+    ///
+    /// Called at every arm's COMMON exit in [`Self::dspark_spec_step`], so the
+    /// line's `epoch` is this rank's device round counter AFTER the step's
+    /// collectives were issued, and `delta` is the increment since the previous
+    /// line's `epoch` (this rank's exact round footprint for the step; `0` on the
+    /// first line, when there is no previous epoch to difference against).
+    ///
+    /// This is an OBSERVATION and must never answer an error for a step whose
+    /// block is already committed: a failed D2H is logged and the round carries
+    /// on (the same discipline [`Self::vrow0_step`] follows). Gated on
+    /// [`v5_ledger`], which is a cached `OnceLock` read — with the gate off this
+    /// is one predictable branch and no device traffic.
+    fn v5_ledger_note(&self, pos: usize, arm: &str, k_emit: usize) {
+        if !v5_ledger() {
+            return;
+        }
+        let Some(c) = self.comm.as_ref() else {
+            return;
+        };
+        // `epoch` is the device-side authority on rounds issued (`tp.rs`): the AR
+        // pubred and the argmax exchange advance this one word, so it counts BOTH
+        // of them — which is exactly what the round ledger needs.
+        let epoch = match self.dev.download_u32(c.epoch_dev() as *const c_void) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[v5-ledger] pos={pos} rank={} epoch read failed: {e}", self.rank());
+                return;
+            }
+        };
+        let prev = self.v5_ledger_epoch.replace(Some(epoch));
+        let delta = prev.map(|p| epoch.wrapping_sub(p)).unwrap_or(0);
+        eprintln!(
+            "[v5-ledger] pos={pos} rank={} epoch={epoch} arm={arm} k_emit={k_emit} delta={delta}",
+            self.rank()
+        );
+    }
 
     /// The common failure report: one line naming the invariant, the position and
     /// the values, and an `Err` that carries the same text.
