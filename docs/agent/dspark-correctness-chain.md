@@ -240,3 +240,10 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 1. **opa 不是 8a5a952..HEAD 的回归**——用户对"162tok/s 版没乱码"的记忆不成立（或那个版本的乱码不在 opa 位点）。ablation 阶梯（EXPERT_ILV=0 等）**不再适用**（没有差异可二分）。
 2. **opa 是存量偏差**——8a5a952 时点就存在，且与 e2m1-vs-e4m3 的架构级分歧（head 号根因）的时间线吻合（它早于锚点，从 fp4 expert 路径的第一天就存在）。
 3. **修复路径不变**：e2m1×2 双趟（Stage 2 在实施）就是正解——它不是"回归修复"而是"存量架构级数值偏差的修复"。
+
+## verify 图化与最新 verify 路径的兼容性预审（代码级，等待 verify-graph-capture2 的完整判词）
+
+代码级已确认的兼容性要点：
+1. **`verify_graph_m` 的形状锁**（:3988 `m != self.verify_graph_m` → gate false）——legacy（m=5）与 aligned/swallow（m=6）**混用时图永远不命中**（第一次捕获锁定 m，另一种 m 静默回裸链——性能损失但无错）。**修法**：`verify_graph_m` 改成 `Option<(usize, graph)>` 的形状池（或按 m 分桶存图）——性能项，不阻塞正确性。
+2. **`compress_branch_steady`**（:4050）要求每个 compress source 的 `compress_len > 0`——prefill 后第一个 verify 时可能不满足（组形成需要 ratio 个 token）——**首 1-2 轮走裸链后自动 steady** ✓。
+3. **`spec_capture` 标志**（:1701）在 `step_rows_inner` 内有 host 分支（图捕获时 host 代码照跑、kernel 只记录）——**compress_len 的 host mirror 推进（advance_compress_lens）在 capture 时也执行**，回滚靠 `restore_compress_lens`（:4063）——已闭合 ✓。
