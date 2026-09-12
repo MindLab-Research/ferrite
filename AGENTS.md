@@ -83,18 +83,17 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 - serve 卡住/日志 mtime 停滞 = 挂了（查 `stat -c %y` + pgrep，别等）。
 - 加载错防线（三道 runtime + 三道编译期 + git hooks）见 `docs/agent/` 的加载防线文档。
 
-## 当前状态与下一步（2026-09-12 session 收官——SWALLOW 完全解锁！）
+## 当前状态与下一步（2026-09-12 session 深夜收官——SWALLOW 解锁 + A1a 教训）
 
-**Session 成果（769+ commits，102 知识文件）**：
-- **范式转移**：所有"损坏"判定是模型行为（base 模型 ~50-60 token 后自然退化——EAGER 对照确认）。验证协议 v2：计数只对前 61 行有效；出师表退化与 EAGER 一致 = 干净；红线 = 不引入 EXTRA 损坏。
-- **lazy 干净栈：91.1 tok/s（+15.6%）**：base + R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)——全部修正判据下验证
-- **🎉 SWALLOW 完全解锁！**（11 次修复：第 9 幻影 → 第 10 epoch 冻结 54 → OOB 根因（staging 被越界清零！）→ OOB 修复（guard band + bounds check）→ engram slot 修复（147456 ≥ payload）→ **300 token 正常生成 + canary 清洁 + 无 panic！**）
-- **SWALLOW 含观测吞吐 56.6 tok/s**（纯净基线测量中——去掉 V5_LEDGER + DYNAMIC_PAD 开销）
-- **nsys 最终数据**：AR 27.1% #1（从 13.2% 翻倍！）、MoE interleave 19%、gemv 18.5%
-- **tcgen05 仍被阻塞**（2 轮修复失败——TMA bulk 16B 硬对齐）
+**Session 成果（783+ commits，107 知识文件）**：
+- **范式转移**：所有"损坏"判定是模型行为（EAGER 对照确认）。验证协议 v2：计数只对前 61 行有效；退化与 EAGER 一致 = 干净。
+- **lazy 干净栈：91.1 tok/s（+15.6%）**：R2(+10.2%) + MARKOV(+3.2%) + VERIFY_FORK(+1.5%) + RING_WIN(+0.3%)
+- **🎉 SWALLOW 完全解锁！**（11 次修复：OOB 根因（staging 被越界清零→canary 抓到！）→ OOB 修复（guard band + bounds check）→ engram slot 修复（147456 ≥ payload）→ **300 token 正常生成 + 出师表红线通过（零拉丁 ✓）+ 全 gate 58.3 tok/s**）
+- **AR Step 2 (A1a) 教训**：+665 行 store fold 在两条路径破坏数值（lazy 90.9/输出退化 + SWALLOW 7.1/8× 退化）——**AR_STORE_FUSE 永久 OFF**
+- **修正后的 400 路线**（SWALLOW 优化执行计划）：AR 每步 6.58ms（不是 10.1ms！）；mrows -3.0ms；400 ladder: 28→21.6→18.6→17.1→14.7ms = **441 tok/s @ accept 5**；三轨道并行（GPU/写码/诊断）
 
-**400 的诚实判定**：lazy 上限 ~145（accept 5）/ ~97（accept 3）——不够 400；batched（SWALLOW 解锁！）+ 全优化（SH_PAIR M=6 + mrows + tcgen05）→ 理论 414（需 ~97% 兑现）；60% 兑现 → ~278。
+**400 的诚实判定**：lazy 上限 ~145；SWALLOW 需要全部优化兑现（mrows + hc/B6 + tcgen05 + AR 重设计 + L4/L5）；60% 兑现 → ~300 tok/s；**先钉死 S0 步时（28ms）是 G2 的全部意义**。
 
-**修复链的核心武器**（知识固化）：P1 witness + canary（设备侧证词）+ check_payload（静默损坏→响亮失败）+ guard band（reduced 溢出拦截）
+**验证纪律（v2）**：EAGER 对照必须；前 61 行判据；三探针（数字+拉丁+k_acc）缺一不可；**gate ON vs OFF 逐字节一致**（A1a 的教训）。
 
-**验证纪律（v2 协议）**：EAGER 对照必须；前 61 行判据；退化模式一致 = 干净；三探针（数字+拉丁+k_acc）缺一不可。
+**下一 session 前 30 分钟**：读 handover 的 SWALLOW 部分 → mrows Phase A 状态检查 → 起一臂测试 → 5 个决策（A1a 修或弃 / hc arm / 路由 / tcgen05 / 400 口径）。
