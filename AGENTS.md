@@ -87,7 +87,7 @@ LD_LIBRARY_PATH=$HOME/ferrite/kernels/cuda ./target/release/ferrite-serve --back
 
 **正确性（用户红线：不能重复不能乱码）**：
 - 8 个根因全部修复并验证（详见 `docs/agent/dspark-correctness-chain.md`）
-- 最后一个根因：**routed expert 激活量化 e2m1 vs 官方 e4m3**（4×噪声差、44 层累积=opa 的来源）——e2m1×2 双趟修复（`DSV41_EXPERT_ACT_E4M3=1`）消除 opa ✓；布局契约 bug（fuse 绑 pitch）已修；ILV+E4M3 冲突有 Rust 守卫。
+- 最后一个根因：**routed expert 激活量化 e2m1 vs 官方 e4m3**（4×噪声差、44 层累积=opa 的来源）——**直接 e4m3 单趟**（`DSV41_EXPERT_ACT_E4M3=1`：`quant_fp8(block=32)` → 一次 expert GEMM，kernel 侧 `act_e4m3` 暂存分支解码 e4m3，权重路径零改动）消除 opa ✓；布局契约 bug（fuse 绑 pitch）已修；ILV 与 e4m3 不冲突（单趟可保留 gate_up+swiglu 融合）。⚠️ 早先的 e2m1×2 双趟已被取代（+5ms/步仅 +2% accept）；命中条件改为 `.so` 的 `dsv41_expert_act_e4m3_cap` 符号，需重编 .so。
 - spec 步跨步不变量断言层（`DSV41_INV_CHECK=1`，8 条优先项）。
 - diff probe（`DSV41_DIFF_EAGER=1`）：mismatch 从首轮即错→18→1（o-rope 对齐后）。
 

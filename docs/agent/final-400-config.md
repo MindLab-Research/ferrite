@@ -61,7 +61,7 @@
 | draft P3a 折叠 | `dspark_dev.rs:178` `DRAFT_P3A`（a1/a2/a4） | OFF | −0.30ms（draft） | 4 个 fold |
 | markov 词表切分 | `dspark_dev.rs:228` `MARKOV_SLICED` | OFF | −1.00ms（draft） | draft 侧 |
 | 吞主链步 | `chain_dev.rs:1530` `SWALLOW_STEP`（`spec_primed` :1896） | OFF | **净 −4.55ms**（主链 −6.15，verify +1.6） | 见 `dspark-swallow-step-diff.md` |
-| e4m3 双趟 | `chain_dev.rs:713` `EXPERT_ACT_E4M3` | OFF | **正确性**（opa 消除），**非 perf** | 见 §2.4 口径校正 |
+| e4m3 直接单趟 | `chain_dev.rs` `EXPERT_ACT_E4M3` | OFF | **正确性**（opa 消除）+ 与双趟相比省一整趟 expert GEMM（**−5ms**） | 见 §2.4 口径校正；取代 e2m1×2 双趟 |
 | tcgen05 mxf4 | `kernels/cuda/build.sh:89`（`-DDSV41_TCGEN05_GATEUP_MXF4_SKELETON=1`，**WORKING TREE 未提交**） | build 进 .so，**函数体未填** | **−6.80ms** | subagent 跑中 |
 | down 4-value | `dsv41_experts_mxf4.cu:715-724`（mode 3 @40reg = 0.90×） | OFF | −0.35ms | **被 tcgen05 吞掉**（见 §3 注②） |
 
@@ -93,10 +93,13 @@
    **本文件采用"逐项独立收益相加"（用户给的 gate 表口径），并把此重叠列为 §6-R0 的头号风险**——
    真实落点应在 **8~12ms 之间**，必须用一次 nsys + 一次 A/B 钉死（§7-T2）。
 2. **e4m3 的收益性质校正**：任务表把 `EXPERT_ACT_E4M3` 标为"正确性（opa 消除）"——
-   与代码一致（`chain_dev.rs:210` "the SECOND pass"、:716 "ARMED-but-undispatchable" 警告）。
-   但 `routed-expert-residual.md` §3(c) 的 **−2.0~3.3ms** 是**另一件事**（把 `s_act` 从 f32 改 fp8、
+   与当时代码一致（那一版是 e2m1×2 双趟 + `ARMED-but-undispatchable` 警告）。
+   **现已改为直接 e4m3 单趟**（同日，见 `dspark-correctness-chain.md` 的取代注）：正确性口径不变，
+   但不再是"非 perf"——它把双趟的第二趟 expert GEMM 整个删掉（serve 实测双趟 +5ms/步 → 单趟回到
+   e2m1 的 launch 数，只换量化格式），所以是"正确性 + 省一趟 GEMM"。
+   但 `routed-expert-residual.md` §3(c) 的 **−2.0~3.3ms** 仍是**另一件事**（把 `s_act` 从 f32 改 fp8、
    占用 2→6 CTA/SM、down 的 LDS 指令 ÷4）。**两者不可混算**：
-   - 已落地的 e4m3 双趟 = **纯正确性**（本文件不计 perf）；
+   - 已落地的 e4m3 单趟 = **纯正确性**（本文件不计 perf，省下的那趟 GEMM 是与双趟对比的净值）；
    - **fp8 激活占用优化** = 可选 perf 项，**−2.0~3.3ms**（§5-P2）。
 3. **投影族 V7 口径冲突**：`verify-calc-floor.md` 第二轮开头判定——**a32 回退吃掉 head 的 −1.5ms，
    且还回 `proj_mrows` 的 weight-stationary 收益（net 亏 ~3.9ms）**。
