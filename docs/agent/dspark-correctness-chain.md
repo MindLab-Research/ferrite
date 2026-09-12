@@ -4204,3 +4204,30 @@ self.dev.gemm_fp8_mx_rope_norm(
 1. S1 的双重计数 → mirror 超前 → compress_branch_steady 提前触发 → 图提前 engage
 2. indexer_topk 的烧入 n_pos → *lens == 0 时扫陈旧槽 → attention 读旧上下文
 3. **两个机制联合 = "重置到早期位置"的完整解释！**
+
+## spec 最小 + e4m3 计数测试结果（6f686493）——legacy 臂也有损坏（不同模式！）
+
+**结果**：
+- **数字正确=5/6**——line 6 就错！输出 "5好的，用户我注意到您要求的要求中有一个数字4..." 
+- **双字模式**："从从1数数到100100"（从从、数数、100100 都是双字！）
+- completion=52（生成了 52 token 后停止）
+
+**与 base 损坏的对比**：
+| 配置 | 损坏点 | 模式 | 根因 |
+|---|---|---|---|
+| spec 最小（legacy 臂）| **line 6** | **双字 + meta-commentary** | 模型自然行为？或 legacy 臂的 bug |
+| base（lazy+graph+...）| **line 62** | **"重置到 12"** | S1/S2/S3（lazy/graph 特有）|
+
+**分析**：
+1. **两种损坏是不同的 bug**——legacy 的早期双字 vs lazy 的后期重置
+2. legacy 的双字（从从、数数）可能是：
+   a. **模型自然行为**（base 模型的重复倾向——之前 EAGER 对照 77% 重复率）
+   b. 或 legacy 臂的 spec-decode bug（verify/commit 的 token 重复）
+3. **base 的"重置到 12"**是 S1/S2/S3（已确认的 lazy/graph 特有 bug）
+
+**bisect 的修正**：
+- legacy 臂的 line-6 损坏可能无法通过 gate bisect 消除（如果是模型行为）
+- **lazy+graph 的 line-62 损坏（S1/S2/S3）可以通过修复消除**
+- 修复后的测试应该看 line-62 的"重置"是否消失（line-6 的双字可能是模型固有）
+
+**下一步**：等 S1/S3 修复完成 → base + 修复 → 验证 line-62 的重置是否消失
