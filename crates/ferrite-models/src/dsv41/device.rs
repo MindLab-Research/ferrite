@@ -443,6 +443,19 @@ struct Kernels {
             *const c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// tcgen05 MXFP4 gate/up, Phase-1 skeleton (`DSV41_EXPERT_TCGEN05_MXF4`,
+    /// default OFF). OPTIONAL on purpose: `build.sh` defines no
+    /// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`, so a stock `.so` has no such
+    /// symbol and the probe below keeps the proven GEMV path. The ABI note in
+    /// kernels.rs lists the three shape asymmetries (contiguous gate|up pool,
+    /// e8m0 activation scales, no per-slot expert id) that the Phase-2
+    /// indirect launcher has to close before `moe()` can dispatch to it.
+    expert_tcgen05_gate_up_mxf4: Option<
+        unsafe extern "C" fn(
+            *const u8, *const u8, *const u8, *const u8, *mut f32, i64, c_int, c_int, f32, c_int,
+            CuStream,
+        ) -> c_int,
+    >,
     /// Load-time gate/up interleave (DSV41_EXPERT_ILV): rewrites an expert's
     /// w1/w3 blocks into one 8-byte-granule-interleaved region so the fused
     /// gate/up GEMV fetches both with one LDG.128. Optional: an .so without it
@@ -810,6 +823,7 @@ impl Device {
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
             expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
+            expert_tcgen05_gate_up_mxf4: ko!(rt, "dsv41_expert_tcgen05_gate_up_mxf4"),
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
             moe_down_reduce: ko!(rt, "dsv41_moe_down_reduce"),
@@ -3363,6 +3377,65 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_expert_gate_up_fp4_batched")
+    }
+
+    /// tcgen05 MXFP4 gate/up — the Phase-1 `kind::mxf4` swapAB kernel
+    /// (`DSV41_TCGEN05_GATEUP_MXF4`, default OFF, read once inside the `.so`).
+    ///
+    /// `w`/`w_scale` are ONE expert's contiguous `[2*inter, dim/2]` gate|up pool
+    /// and its `[2*inter, dim/32]` e8m0 scales (rows `[0, inter)` = gate, then
+    /// up); `act`/`act_scale` are the shared quantised row (packed e2m1 and
+    /// `[dim/32]` e8m0 BYTES — see the kernels.rs ABI note); `out` holds `slots`
+    /// `[2*inter]` blocks, `out_slot_stride` floats apart, with the `limit`
+    /// clamp applied in the epilogue (`split == inter`).
+    ///
+    /// Returns `Ok(false)` when the entry did not run — the `.so` gate is OFF,
+    /// or the launcher rejected the shape and swallowed the error — so a caller
+    /// can keep the proven GEMV path. Anything else is an error.
+    ///
+    /// ⚠️ The routed MoE cannot use this yet: it feeds four separate pools
+    /// (w1/w3 + scales) selected by device-side ids and f32 activation scales,
+    /// while this launcher takes one direct contiguous pool and e8m0 bytes.
+    /// Until the Phase-2 indirect launcher lands, this entry serves the parity
+    /// harness / microbench only (see `supports_expert_tcgen05_mxf4`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn expert_tcgen05_gate_up_mxf4(
+        &self,
+        w: *const u8,
+        w_scale: *const u8,
+        act: *const u8,
+        act_scale: *const u8,
+        out: *mut f32,
+        out_slot_stride: i64,
+        inter: i32,
+        dim: i32,
+        limit: f32,
+        slots: i32,
+    ) -> Result<bool> {
+        let f = self.need(
+            self.kernels.expert_tcgen05_gate_up_mxf4,
+            "dsv41_expert_tcgen05_gate_up_mxf4",
+        )?;
+        let rc = unsafe {
+            f(
+                w, w_scale, act, act_scale, out, out_slot_stride, inter, dim, limit, slots,
+                self.stream,
+            )
+        };
+        if rc == 0 {
+            return Ok(false); // gate OFF, or the launcher declined the shape
+        }
+        self.kerr(rc, "dsv41_expert_tcgen05_gate_up_mxf4")?;
+        Ok(true)
+    }
+
+    /// True when the loaded `.so` carries the tcgen05 MXFP4 gate/up entry point
+    /// (`dsv41_expert_tcgen05_gate_up_mxf4`). The stock `build.sh` defines no
+    /// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`, so this is false there and the
+    /// proven GEMV/GEMM path stays in force — the same staged-bring-up contract
+    /// as `supports_moe_batch` / `supports_down_fuse`.
+    pub fn supports_expert_tcgen05_mxf4(&self) -> bool {
+        self.kernels.expert_tcgen05_gate_up_mxf4.is_some()
     }
 
     /// Interleave one expert's gate/up fp4 blocks on the device (DSV41_EXPERT_ILV,

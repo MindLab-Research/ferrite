@@ -139,6 +139,49 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
+    /// tcgen05 MXFP4 gate/up (Phase-1 skeleton, `DSV41_TCGEN05_GATEUP_MXF4`):
+    /// swapAB `kind::mxf4.block_scale.scale_vec::2X`, BOTH operands packed
+    /// e2m1, TMA ring `kRing=8`, `M=128` tile (= `dsv41_experts_mxf4.cu`'s
+    /// `tc5::mxf4::expert_tcgen05_gateup_mxf4_kernel`).
+    ///
+    /// ⚠️ **Not in the stock build**: `build.sh` defines no
+    /// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`, so a normal `.so` has no such
+    /// symbol — `Device::supports_expert_tcgen05_mxf4()` is the probe and the
+    /// proven GEMV/GEMM path stays in force.
+    ///
+    /// ⚠️ **Three shape asymmetries vs `dsv41_expert_gate_up_fp4_batched`**
+    /// (why this cannot be dropped into `moe()` yet — see the wrapper doc in
+    /// device.rs and docs/agent/expert-tcgen05-plan.md §7):
+    ///   1. the weight side is ONE contiguous `[2*inter, dim/2]` pool with
+    ///      `[2*inter, dim/32]` e8m0 scales, rows `[0, inter)` = gate then up
+    ///      (`split == inter` in the epilogue); the production loader keeps w1
+    ///      and w3 in SEPARATE regions;
+    ///   2. `act_scale` is `[dim/32]` e8m0 BYTES read straight into the SF
+    ///      word, while `dsv41_quant_fp4` emits f32 power-of-two scales;
+    ///   3. no expert indirection: the kernel accepts
+    ///      `w_base/w_stride/ws_base/ws_stride/ids[slot]`, but this launcher
+    ///      passes null, so every `grid.y` slot reads the SAME weights.
+    ///
+    /// Returns 0 when the gate is OFF (read once inside the `.so`, process
+    /// level) and swallows `cudaGetLastError`, so a rejected shape is a no-op
+    /// rather than a failed step — the caller falls back either way.
+    /// Launcher contract: `dim % 128 == 0`, `dim % 64 == 0`, `dim <= 5120`,
+    /// `rows = 2*inter`, `rows % 128 == 0` (⇒ `inter % 64 == 0`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn dsv41_expert_tcgen05_gate_up_mxf4(
+        w: *const u8,
+        w_scale: *const u8,
+        act: *const u8,
+        act_scale: *const u8,
+        out: *mut f32,
+        out_slot_stride: i64,
+        inter: i32,
+        dim: i32,
+        limit: f32,
+        slots: i32,
+        stream: CuStream,
+    ) -> i32;
+
     /// Down projection of the experts: `[rows, inter] x W2[dim, inter] -> [rows, dim]`,
     /// accumulating the per-row routing weight.
     pub fn dsv41_expert_down_fp4(

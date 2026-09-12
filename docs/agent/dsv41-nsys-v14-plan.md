@@ -170,6 +170,18 @@ PY
 6. **空 CSV 会静默打印 0.0ms**：脚本对 `rows < 5` 硬失败（`dsv41_profile.sh:80-85`），
    但若 CSV 非空却全是 0 行，先看 `*.log` 里 binary 是否真的跑了。
 7. **名字含空格/逗号** → 一律 `--format csv` + python，禁用 table+awk。
+8. **`gemv_bf16_v2_kernel` ≠ `gemv_bf16_fp8x2_kernel`**（2026-09-12 澄清，防误读）：
+   `ferrite_kernels.cu:2880` 的 `gemv_bf16_v2_kernel` 是**纯 bf16** 的 gate GEMV v2，
+   含 route 融合 epilogue（`gv2_route_epilogue`，`ferrite_kernels.cu:2788`），
+   入口 `ferrite_gemv_bf16_v2`（:2955）/ `ferrite_gemv_bf16_v2_route`（:2990）。
+   它**不含任何 fp8**。`gemv_bf16_fp8x2_kernel`（`dsv41_kernels.cu:5954`，入口
+   `dsv41_gemm_bf16_fp8x2`）才是 bf16 gate + fp8 共享专家 w1/w3 的混合核，由
+   `DSV41_MIX_GATE` 门控——**默认 OFF**（`chain_dev.rs:540-543`，round-25 定案 9.38 vs 9.71ms），
+   在 HEAD 上**调用 0 次**。
+   §3 表 #9 的 48 次 = **40 次 MoE router gate（n=384, k=5120, WPR=8, 384 blocks,
+   route 融合） + 8 次 idx_weights（`chain_dev.rs:3758` `lin_bf16` → `dev.gemv_bf16`
+   → `gemv_bf16_v2_wanted(32)` 命中，n=32, k=5120）**。两者同符号却不同 grid 形状 ⇒
+   这一行的 Med 是**混合 population**（同 §5.3 的 `hc_mixes_tail` 陷阱）。
 
 ---
 

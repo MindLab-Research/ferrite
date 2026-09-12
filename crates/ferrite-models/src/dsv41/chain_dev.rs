@@ -293,6 +293,43 @@ pub(crate) fn no_gemv_fp4() -> bool {
     *F.get_or_init(|| std::env::var_os("DSV41_NO_GEMV_FP4").is_some())
 }
 
+/// DSV41_EXPERT_TCGEN05_MXF4=1 arms the tcgen05 MXFP4 swapAB gate/up
+/// (`tc5::mxf4::expert_tcgen05_gateup_mxf4_kernel`, `dsv41_experts_mxf4.cu:4007`).
+/// Mirror of the launcher's own gate test (`e[0] == '1'`, a strict "1..." prefix,
+/// NOT the usual `!= "0"`: the default is OFF and stays OFF if the value is
+/// anything else). Read ONCE and cached: the `.so` reads the same variable once
+/// per process, so a per-call getenv here could only ever add a hot-path slip and
+/// a capture hazard (plan §5), never a different decision.
+///
+/// ⚠️ The gate is armed by the `.so`, which loads with a
+/// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON` build only — the stock build has no such
+/// symbol and `Device::supports_expert_tcgen05_mxf4()` is false.
+pub(crate) fn expert_tcgen05_mxf4() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_EXPERT_TCGEN05_MXF4").map(|v| v.starts_with('1')).unwrap_or(false)
+    })
+}
+
+/// One-shot notice for the not-yet-wired mxf4 dispatch. The `.so` reads the gate
+/// itself, so an operator who exports `DSV41_EXPERT_TCGEN05_MXF4=1` believes the
+/// step now runs the tcgen05 gate/up — while `moe()` still issues the proven GEMV
+/// (see the call site). A silent no-op there is the project's #1 measurement-bias
+/// trap (an "ON" arm that measures the OLD path), so it is said out loud once.
+fn tcgen05_mxf4_unwired_note(so_has_symbol: bool) {
+    static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        eprintln!(
+            "warning: DSV41_EXPERT_TCGEN05_MXF4 is set, but the routed MoE still dispatches the \
+             gate/up to the proven GEMV/GEMM: the Phase-1 tcgen05 launcher takes ONE contiguous \
+             [2*inter, dim/2] gate|up pool + [dim/32] e8m0 ACTIVATION scales + direct pointers, \
+             while the chain has four pools (w1/w3 + scales) selected by device-side `ids` and \
+             f32 activation scales. Any A/B run with this gate ON measures the OLD path. \
+             (symbol present in .so: {so_has_symbol})"
+        );
+    });
+}
+
 /// DSV41_DOWN_FUSE=0 reverts the batched down direction to the two-launch
 /// (expert_down_fp4_batched + moe_down_reduce) pair. DEFAULT ON
 /// (`.unwrap_or(true)`: f3b1be1 had flipped it OFF after the round-18 corruption,
@@ -4209,6 +4246,22 @@ fn hc_tail_split() -> bool {
             );
         }
         if !self.opts.skip_experts {
+            // DSV41_EXPERT_TCGEN05_MXF4 is deliberately NOT dispatched here yet.
+            // The committed Phase-1 launcher (`dsv41_experts_mxf4.cu:4007`) takes
+            // ONE contiguous [2*inter, dim/2] gate|up pool with [2*inter, dim/32]
+            // e8m0 scales, [dim/32] e8m0 ACTIVATION bytes and direct pointers;
+            // this site has four pools (w1/w3 + their scales) selected by
+            // device-side `ids` and f32 activation scales from
+            // `dsv41_quant_fp4`. Handing `w1_base` to it would have the kernel
+            // read the w1 SCALE block as gate weights once row >= inter —
+            // silent corruption, the same failure class as the down-GEMV
+            // all-zeros incident. The dispatch lands with the Phase-2 indirect
+            // launcher (see `Device::expert_tcgen05_gate_up_mxf4`); until then
+            // the gate can only drive the parity harness, and arming it for a
+            // serve run is reported rather than silently ignored.
+            if expert_tcgen05_mxf4() {
+                tcgen05_mxf4_unwired_note(self.dev.supports_expert_tcgen05_mxf4());
+            }
             // The input row is identical for every expert, so quantise it ONCE
             // here instead of inside the loop: the fp4 path was re-quantising and
             // re-packing the same 5120-element row for each of the ~6 selected

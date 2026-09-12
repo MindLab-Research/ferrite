@@ -274,6 +274,37 @@ checkpoint 尺度规则下仍全绿**"（工作量更小，且是唯一已有 GP
 - 形状契约沿用：launcher 只校验 `k % 32 == 0`；`n % 128 == 0` 需新增（M 侧 tile）。
 - **验收**：隔离微基准 + Phase 0 同款 parity（真实权重）。
 
+### 2b. Phase 1.5（2026-09-12 补齐）CPU 侧已绑定；**派发被 3 个 ABI 缺口挡住**
+
+已落地（`cargo check -p ferrite-models` 通过）：
+- `kernels.rs:171` `dsv41_expert_tcgen05_gate_up_mxf4`（按 `:4007` 的实际签名，11 参数）；
+- `device.rs` `Kernels.expert_tcgen05_gate_up_mxf4`（**`ko!` 可选符号**：`build.sh` 不定义
+  `DSV41_TCGEN05_GATEUP_MXF4_SKELETON` ⇒ 现成 `.so` 无此符号，用 `km!` 会让 `Device::open`
+  对所有用户失败）+ 包装 `Device::expert_tcgen05_gate_up_mxf4`（`rc==0` ⇒ `Ok(false)`）
+  + 探测 `supports_expert_tcgen05_mxf4()`；
+- `chain_dev.rs:296` `expert_tcgen05_mxf4()` OnceLock 门禁（镜像 `.cu` 的 `e[0]=='1'`，
+  默认 OFF），并在 `moe()` 的 routed 分支放**一次性告警**（`tcgen05_mxf4_unwired_note`）——
+  避免"门禁 ON 但实际跑旧路径"的测量偏差（本仓 #1 失效模式）。
+
+🔴 **为什么 `moe()` 还不能派发**（`:4007` launcher vs `expert_gate_up_fp4_batched` 的形状差）：
+1. **权重布局**：新 launcher 要**一个连续** `w=[2*inter, dim/2]` + `w_scale=[2*inter, dim/32]`
+   （行 `[0,inter)`=gate、其后 up，epilogue `split=inter`）；生产 loader 把 w1/w3 放在
+   **两块独立区域**（`load.rs:644` 的 `[w1][w1.scale][w3][w3.scale][w2][w2.scale]`）。
+   直接传 `w1_base` ⇒ 行 `>=inter` 时把 **w1.scale 当权重读**，静默错值。
+2. **激活 scale 格式**：新 kernel 的 `act_scale` 是 `[dim/32]` **e8m0 字节**（直接读进 SF 字，
+   `:3856`），而 `dsv41_quant_fp4` 产出 **f32 2 的幂**（旧路径在 kernel 内
+   `f_pow2_to_ue8m0` 转换，`:452`）。⇒ 需要一个 e8m0 字节化的激活 scale 生产者。
+3. **无 expert 间接寻址**：kernel **已支持** `w_base/w_stride/ws_base/ws_stride/ids[slot]`
+   （`:3736-3741`），但 launcher 传 `nullptr` ⇒ 每个 `grid.y` slot 读**同一份**权重。
+   Phase-1 只能是"单 expert + `slots` 份输出"。
+
+⇒ 最小 CUDA 侧补法（Phase 2，二选一）：(a) 恢复旧 kernel 的 `b`/`b_hi`/`b_split`
+双矩阵形式（旧 `mxf4_gemm_kernel` 已有该模式，~15 行），launcher 加
+`w1/w3/w1s/w3s + ids` 参数；或 (b) 加载期把 gate|up 打成连续池（**不推荐**：256 个 expert
+的 fp4 权重会翻倍，~630 MB）。另需一个 e8m0 激活 scale 打包 kernel（~10 行）。
+在补齐前，`DSV41_EXPERT_TCGEN05_MXF4=1` 只对 parity/微基准有意义（走
+`Device::expert_tcgen05_gate_up_mxf4`），serve 侧会打印告警并继续走旧路径。
+
 ## 3. Phase 2（0.5-1 天）down kernel + launcher + Rust FFI
 
 - down：同 kernel 模板，K=1920、M=5120，套 `expert_gemv_fp4_down_reduce_kernel` 的
