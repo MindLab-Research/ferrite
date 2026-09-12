@@ -6287,3 +6287,38 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 
 **实测证据**：我的手动 SWALLOW 测试（58.3 tok/s）**包含了 HC gates**（HC_VERIFY_FUSE=1 HC_FRONT_ROWS=1）——输出正确（前 61 行 ✓ 零拉丁 ✓）
 **判定**：FORBIDDEN 是历史限制（SWALLOW 解锁前写的）——**已过时，可以解除**（脚本更新属于 write-code track）
+
+## 📋 Session 最终性能汇总（789+ commits，110 知识文件）
+
+### 一、性能成绩单
+| 路径 | 吞吐 | 状态 | 验证 |
+|---|---|---|---|
+| **lazy 干净栈** | **91.1 tok/s (+15.6%)** | ✅ 当前最佳 | 前 61 行 ✓ 零拉丁 ✓ |
+| **SWALLOW 全 gate** | **58.3 tok/s** | ✅ batched 可用 | 前 61 行 ✓ 零拉丁 ✓ 出师表红线 ✓ |
+| lazy + AR_FUSE | 90.9 (中性但输出退化 ✗) | ❌ A1a bug | — |
+| SWALLOW + AR_FUSE | 7.1 (8× 退化 ✗) | ❌ A1a bug | — |
+
+### 二、SWALLOW 解锁的完整旅程
+```
+10 次失败 → 第 9 幻影 → 第 10 epoch 冻结 54 → D1 观测（999→54 均匀）
+→ P1 witness（CANARY 触发！）→ OOB 根因（staging 被越界清零！）
+→ OOB 修复（guard + bounds check）→ 验证成功（CANARY=0！）
+→ check_payload 抓到 engram 147456 越界 → slot 增大修复
+→ SWALLOW 完全解锁（300 token + canary 清洁 + 无 panic！）
+→ 出师表红线通过（零拉丁 ✓）
+→ 全 gate 58.3 tok/s
+```
+
+### 三、400 的最终路线（修正后）
+**400 ladder**（SWALLOW 优化执行计划——三轨道并行！）：
+```
+28.0ms（当前）→ +SH_PAIR_M=1（已含）21.6ms → +mrows S2（-3.0ms）18.6ms
+→ +hc/B6 S3（-3.8ms）17.1ms → +tcgen05 S4（-2.0ms）14.7ms = **441 tok/s @ accept 5**
+```
+
+### 四、Session 的关键技术产出
+1. **验证协议 v2**（EAGER 对照 + 前 61 行 + 退化一致）
+2. **OOB 修复工具链**（P1 witness + canary + guard band + check_payload）
+3. **11 个真 bug 修复** + AR A2b/A0 + epoch pad + dynamic pad
+4. **110 知识文件**（完整的调试旅程和优化路线）
+5. **修正后的 400 数学**（AR=6.58ms 不是 10.1ms；mrows=-3.0ms 不是 -4.5ms）
