@@ -4425,3 +4425,28 @@ base + S1/S3 fix + DSV41_ATTN_LIN_FUSE=1
 - **400 的差距**：95 → 400 = 4.2×
 - **lazy 上限**：~145（数学）
 - **400 需要**：batched（SWALLOW 修复）或 L4/L5 kernel 工作
+
+## MARKOV_SLICED 重验的准备（R2 出师表后的下一个测试）
+
+**测试命令**（出师表完成后立即跑）：
+```bash
+# base + R2 + MARKOV_SLICED（修复后）
+DSV41_SPEC=1 DSV41_TIMING=1 DSV41_EXPERT_ACT_E4M3=1 \
+DSV41_SH_EXP_MROWS=1 DSV41_SH_PAIR_M=1 \
+DSV41_ATTN_LIN_FUSE=1 \
+DSV41_MARKOV_SLICED=1 \  # 重验对象
+DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1 \
+DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1 \
+DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3A=1 \
+DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
+```
+
+**判据**（修正后）：
+1. 计数前 61 行正确（模型行为区之外）
+2. k_acc 序列与 base+R2 一致（~5.0 区域）——**如果不退化，MARKOV 修复成功！**
+3. 出师表零拉丁
+4. 吞吐 ≥ 86.8（R2 的基线）
+
+**之前的判定**："退化 accept 5.0→1.4"——但这是在损坏 base 上测的（当时以为 base 干净）。MARKOV 的 bug（双重偏移）已修复——重验看修复是否生效。
+
+**k_acc 的有效性**：k_acc 测的是 draft-verify 一致性（不依赖输出正确性）——之前的 k_acc=1.4 可能是 MARKOV bug 的真实表现（不是模型行为）。修复后应该恢复 ~5.0。
