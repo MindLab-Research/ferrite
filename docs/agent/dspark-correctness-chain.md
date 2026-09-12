@@ -6255,3 +6255,24 @@ B. **accept 更低**（draft 质量差）→ 调查 draft 的预测质量
 - **58.3 + mrows + hc/B6 + tcgen05 = ~19.7ms** → @accept 5: ~304 tok/s
 
 **AR 退化的教训**：store fold 的优化需要极其谨慎——在 batched 模式下 kernel 的执行模式可能与 lazy 完全不同。
+
+## LAZY + AR_STORE_FUSE 对照结果（6a4d9774）——A1a 根本性 bug 确认！
+
+**结果**：
+- **吞吐 = 90.9 tok/s**（vs 91.1 无 AR_FUSE——性能中性）
+- **数字正确=53/65 前61行=False**（**输出退化！之前是 True！**）
+- 零拉丁 ✓ finish_reason=stop 0 panic ✓
+
+**AR Step 2 (A1a MoE store fold) 的完整判定**：
+| 路径 | 吞吐 | 前 61 行 | 判定 |
+|---|---|---|---|
+| lazy + AR_FUSE=0 | 91.1 | True ✓ | 基线 |
+| **lazy + AR_FUSE=1** | **90.9** | **False ✗** | **性能中性但正确性退化！** |
+| SWALLOW + AR_FUSE=0 | 58.3 | True ✓ | 基线 |
+| SWALLOW + AR_FUSE=1 | **7.1** | **False ✗** | **8× 性能 + 正确性双退化！** |
+
+**结论**：
+1. **A1a 有根本性数值 bug**——在两条路径都破坏正确性！
+2. **AR_STORE_FUSE 必须保持 OFF**（默认 OFF——安全）
+3. **A1a 的修复方向**：store fold 的 epilogue 可能有数值差异（写入的数据与独立 store 不一致）
+4. **AR 优化需要重新设计**（A1a 方案不可用）
