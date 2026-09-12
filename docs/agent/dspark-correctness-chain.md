@@ -1271,3 +1271,21 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 **Mrows 总收益的现实评估**：~3-4ms（GATE −2.75 + INDEXER −1 + COMPRESSOR −0.3），不是原projection的 10+ ms。
 
 **400 的剩余路径**：mrows 3-4ms + tcgen05 6.8ms + draft P3c 3.3ms + SWALLOW_STEP 6.15ms + HC_VERIFY_FUSE 1.3ms ≈ 21ms 总节省 → verify ~16ms + draft 1ms = 17ms 步时。@ accept 3 → 235 tok/s。**仍差 40%**——需要 tcgen05 真正兑现 + accept 达 3+。
+
+## SWALLOW_STEP 的 400 必要性分析（swallow-step-analysis）
+
+**判决**：swallow 不是可选的 perf gate——是 400 预算的**必要条件**。
+
+**没有 swallow**：主链 6.15ms 独立 + verify(m=5) ~8ms + draft 0.8 + commit 0.2 = 15.15ms → **264 tok/s**（差 1.5×）
+**有 swallow**：主链被吞进 verify 的 anchor 行（m=5→6），节省 **−4.55ms/步**
+
+**关键事实**：
+- m=6 恰好是 VERIFY_ROWS 分配上限——无越界
+- 形状池已支持 m=5/m=6（per-shape 槽，VERIFY_GRAPH_SLOTS=3）——不用改代码
+- swallow × SEED_ALIGN 布局互斥（一轮只开一个）
+- swallow × LAZY 抢第三槽——**400 路径必须 batched（不开 LAZY）**
+- 首轮必须走 legacy（spec_primed）修 AR v5 自旋
+
+**400 的完整预算**（swallow + 全优化）：
+- verify(m=6, 权重共享) ~9ms + draft 0.8 + commit 0.2 = **10ms**
+- @ accept 3 → 4 tok/step → **400 tok/s ✓**
