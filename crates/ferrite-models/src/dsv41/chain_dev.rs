@@ -490,6 +490,16 @@ struct Scratch {
     scores_r: DevBuf,   // [m, n_experts] the bf16 gate's output
     route_idx_r: DevBuf, // [m, topk] i32
     route_w_r: DevBuf,   // [m, topk] f32
+    /// [1] u32 — the m-row gate GEMV's last-block election counter
+    /// (`ferrite_gemv_bf16_v2_mrows_route`, DSV41_GATE_MROWS_ROUTE). Its own
+    /// buffer, separate from `route_ctr` (the EAGER/`DSV41_ROUTE_FUSE` one):
+    /// both gates can be armed in the same process, and one counter shared
+    /// between two live elections would corrupt both. Zeroed ONCE at build —
+    /// the elected block resets it in place before its grid ends, so a captured
+    /// graph replays without a host memset. A run that dies mid-grid leaves it
+    /// non-zero, which would silently disable the election —
+    /// `DSV41_GATE_MROWS_ROUTE=0` is the recovery.
+    route_ctr_r: DevBuf,
     // ---- grouped (permuted) routing, DSV41_EXPERT_GROUPED (default OFF) ----
     //
     // The expert-centric routed GEMMs (`dsv41_expert_gemm_e4m3_ext`) take ONE
@@ -1279,6 +1289,32 @@ fn norm_mrows() -> bool {
     })
 }
 
+/// B4 (`DSV41_RMSNORM_ROPE_MROWS=1`, DEFAULT OFF): the verify block's kv half —
+/// `norm_rows(kv_r)` + `apply_rope(kv_r)` — as ONE launch
+/// (`Device::rmsnorm_rope_mrows`), where `attention_rows` issued two.
+///
+/// It is a pure launch fusion of two rows the block already owns end to end:
+/// phase 1 is `dsv41_rmsnorm_rows_kernel`'s program (the one `DSV41_NORM_MROWS`
+/// already runs) and phase 2 is `apply_rope_kernel`'s rotation of the same row's
+/// trailing `rope_head_dim` columns, at `pos_rows[r] == pos_base + r`. Both are
+/// row-independent and phase 2 has no reduction, so the fused launch is
+/// bit-identical to the pair; the only addition is a barrier between the phases.
+/// Removes 40 launches/step (one per layer, the design's §3 B4 −0.13ms @3.3us).
+///
+/// **Default OFF because it is a new kernel**: "=1" is the bring-up arm and the
+/// batched A/B (`scripts/batched_400_v2.sh`) is what flips it. A stale `.so`
+/// (no symbol) falls back the same way the gate being unset does. It does NOT
+/// depend on `norm_mrows()`: the fused kernel carries its own copy of the
+/// norm's program, so it works with NORM_MROWS either way — but the A/B must
+/// run with `DSV41_VERIFY_FORK` in the SAME arm (§3 B4), since the two launches
+/// it replaces are the fork's side-stream (`*_on`) entries.
+fn rmsnorm_rope_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_RMSNORM_ROPE_MROWS").map(|v| v == "1").unwrap_or(false)
+    })
+}
+
 /// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, or the plan-named alias DSV41_GATE_MROWS=1;
 /// both DEFAULT OFF): `moe_rows` runs the bf16 gate `gemv_bf16` once per
 /// activation row. `gemv_bf16` dispatches to `ferrite_gemv_bf16_v2(...,
@@ -1303,6 +1339,30 @@ fn row_fold_gate() -> bool {
     *F.get_or_init(|| {
         std::env::var("DSV41_ROW_FOLD_GATE").map(|v| v != "0").unwrap_or(false)
             || std::env::var("DSV41_GATE_MROWS").map(|v| v != "0").unwrap_or(false)
+    })
+}
+
+/// B5 (`DSV41_GATE_MROWS_ROUTE=1`, DEFAULT OFF): [`row_fold_gate`]'s multi-row
+/// gate GEMV **with the MoE route folded into it** — ONE launch where the gate
+/// + `route_topk` were two (`Device::gemv_bf16_v2_mrows_route`).
+///
+/// It is the m-rows twin of the EAGER path's `DSV41_ROUTE_FUSE` (default ON
+/// there, `Device::gemv_bf16_route`): the gate's last block runs
+/// `dsv41_route_topk`'s body over the finished score block. The GEMV half is the
+/// SAME `gemv_bf16_nt_kernel<NT, WPR>` program `DSV41_GATE_MROWS` already runs,
+/// so it is bit-identical to the two-launch pair — the whole change is where the
+/// election lands. Removes 40 launches/step (one per layer); the design's §3 B5
+/// puts it at −0.13ms @3.3us.
+///
+/// **Default OFF because it is a new kernel**: "=1" is the bring-up arm and the
+/// batched A/B (`scripts/batched_400_v2.sh`) is what flips it. A stale `.so`
+/// (no symbol) falls back the same way the gate being unset does. It implies
+/// `row_fold_gate()` (the fold is the multi-row program — there is no per-row
+/// form), so the call site requires both.
+fn gate_mrows_route() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_GATE_MROWS_ROUTE").map(|v| v == "1").unwrap_or(false)
     })
 }
 
@@ -3767,6 +3827,7 @@ impl<'a> DevChain<'a> {
             scores_r: dev.alloc(fb(VERIFY_ROWS * n_exp))?,
             route_idx_r: dev.alloc(4 * VERIFY_ROWS * topk)?,
             route_w_r: dev.alloc(fb(VERIFY_ROWS * topk))?,
+            route_ctr_r: dev.alloc(4)?,
             // ---- grouped (permuted) routing scratch (DSV41_EXPERT_GROUPED) ----
             // `grp_cap` is the per-expert row capacity of the `grp_rows`/
             // `grp_slots` lists. The router consumes each expert it picks
@@ -3843,6 +3904,10 @@ impl<'a> DevChain<'a> {
         // The fused route's election counter must start at 0 (cudaMalloc does
         // not zero). From here on the kernel self-resets it every call.
         dev.zero(&s.route_ctr)?;
+        // B5's m-row route election counter: same ONE-TIME initialisation, its
+        // own buffer (see the `route_ctr_r` field comment — the two gates can
+        // be armed together, and one counter cannot serve both).
+        dev.zero(&s.route_ctr_r)?;
         // chain-pair-grid-sync: the wo_a -> wo_b barrier pair must also start at
         // zero (arrive == 0, sense == 0). It is self-resetting after that, so this
         // is the ONLY initialisation it ever needs -- do not re-zero it per step
@@ -10964,30 +11029,61 @@ impl<'a> DevChain<'a> {
         // stream when the fork above took (so the norm + rope run UNDER the q
         // chain instead of after it) and the main stream otherwise — same two
         // launches, same operands, same order, byte-for-byte the old serial pair.
-        self.norm_rows_on(
-            self.s.kv_r.ptr as *const f32,
-            ld.kv_norm.as_ref().unwrap().as_f32(),
-            self.s.kv_r.ptr as *mut f32,
-            m,
-            hd,
-            cfg.norm_eps,
-            kv_stream,
-        )?;
-        self.dev.apply_rope_on(
-            self.s.kv_r.ptr as *mut f32,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
-            m as i32,
-            hd as i32,
-            rd as i32,
-            half,
-            pos_ctr,
-            1,
-            0,
-            1,
-            false,
-            kv_stream,
-        )?;
+        // B4 (DSV41_RMSNORM_ROPE_MROWS=1, default OFF): the SAME two programs in
+        // ONE launch (`Device::rmsnorm_rope_mrows`): phase 1 is `norm_rows`'
+        // kernel body, phase 2 is `apply_rope`'s trailing-`rd` rotation at
+        // `pos_rows[r]` (== `pos_base + r`, the integer the `off = 0, step = 1`
+        // form below computes). Both are row-independent and the rotation has no
+        // reduction, so the fused launch is bit-identical to the pair.
+        // ⚠️ STREAM: it must ride `kv_stream` (the VERIFY_FORK side stream), the
+        // same stream the two `*_on` calls below use — a fusion that dropped the
+        // stream would silently drag the kv half back onto the main stream.
+        // A decline (stale `.so` / shape) returns Ok(false) and the exact
+        // two-launch pair below runs, which is the reference.
+        let mut kv_fused = false;
+        if rmsnorm_rope_mrows() {
+            kv_fused = self.dev.rmsnorm_rope_mrows(
+                self.s.kv_r.ptr as *const f32,
+                ld.kv_norm.as_ref().unwrap().as_f32(),
+                self.s.kv_r.ptr as *mut f32,
+                m as i32,
+                hd as i32,
+                cfg.norm_eps,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                (hd - rd) as i32, // rope_off: the trailing region's offset
+                half,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                false,
+                kv_stream,
+            )?;
+        }
+        if !kv_fused {
+            self.norm_rows_on(
+                self.s.kv_r.ptr as *const f32,
+                ld.kv_norm.as_ref().unwrap().as_f32(),
+                self.s.kv_r.ptr as *mut f32,
+                m,
+                hd,
+                cfg.norm_eps,
+                kv_stream,
+            )?;
+            self.dev.apply_rope_on(
+                self.s.kv_r.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                m as i32,
+                hd as i32,
+                rd as i32,
+                half,
+                pos_ctr,
+                1,
+                0,
+                1,
+                false,
+                kv_stream,
+            )?;
+        }
         // VERIFY_FORK join: the kv half is fully issued — nothing below writes
         // `kv_r` until the per-row `ring_append`, its first consumer. Joining here
         // makes the finished `kv_r` visible to the main stream before the
@@ -13015,15 +13111,48 @@ impl<'a> DevChain<'a> {
         // the per-row path would take v2; the wrapper enforces that
         // (`gemv_bf16_v2_wanted(n_routed)` + the symbol) and returns Ok(false)
         // otherwise, keeping the loop.
-        let gate_folded = row_fold_gate()
-            && self.dev.gemv_bf16_v2_mrows(
-                ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
-                self.s.xn_r.ptr as *const f32,
-                self.s.scores_r.ptr as *mut f32,
-                m as i32,
-                n_routed as i32,
-                dim as i32,
-            )?;
+        //
+        // B5 (DSV41_GATE_MROWS_ROUTE=1, DEFAULT OFF): the SAME multi-row GEMV
+        // program WITH the route election folded into its last block — ONE launch
+        // where the gate + `route_topk` below were two. It implies the fold (the
+        // fusion IS the multi-row program: the election routes the whole
+        // [m, n_routed] score block, so there is no per-row form to fold into),
+        // hence the `row_fold_gate()` conjunct. A decline (stale `.so`, shape,
+        // smem) returns Ok(false) and BOTH the fold below and `route_topk` run,
+        // which is exactly the two-launch reference.
+        let mut route_fused = false;
+        let mut gate_folded = false;
+        if row_fold_gate() {
+            if gate_mrows_route() {
+                route_fused = self.dev.gemv_bf16_v2_mrows_route(
+                    ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.scores_r.ptr as *mut f32,
+                    m as i32,
+                    n_routed as i32,
+                    dim as i32,
+                    self.s.route_w_r.ptr as *mut f32,
+                    self.s.route_idx_r.ptr as *mut i32,
+                    gate_bias,
+                    topk as i32,
+                    cfg.norm_topk_prob,
+                    cfg.route_scale,
+                    2, // sqrtsoftplus, per the checkpoint's routing
+                    self.s.route_ctr_r.ptr as *mut std::ffi::c_uint,
+                )?;
+                gate_folded = route_fused;
+            }
+            if !gate_folded {
+                gate_folded = self.dev.gemv_bf16_v2_mrows(
+                    ld.gate_w.as_ref().unwrap().ptr() as *const c_void,
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.scores_r.ptr as *mut f32,
+                    m as i32,
+                    n_routed as i32,
+                    dim as i32,
+                )?;
+            }
+        }
         if !gate_folded {
             for r in 0..m {
                 self.dev.gemv_bf16(
@@ -13035,19 +13164,21 @@ impl<'a> DevChain<'a> {
                 )?;
             }
         }
-        self.dev.route_topk(
-            self.s.scores_r.as_f32(),
-            gate_bias,
-            self.s.route_w_r.ptr as *mut f32,
-            self.s.route_idx_r.ptr as *mut i32,
-            std::ptr::null_mut(),
-            m as i32,
-            n_routed as i32,
-            topk as i32,
-            cfg.norm_topk_prob,
-            cfg.route_scale,
-            2, // sqrtsoftplus, per the checkpoint's routing
-        )?;
+        if !route_fused {
+            self.dev.route_topk(
+                self.s.scores_r.as_f32(),
+                gate_bias,
+                self.s.route_w_r.ptr as *mut f32,
+                self.s.route_idx_r.ptr as *mut i32,
+                std::ptr::null_mut(),
+                m as i32,
+                n_routed as i32,
+                topk as i32,
+                cfg.norm_topk_prob,
+                cfg.route_scale,
+                2, // sqrtsoftplus, per the checkpoint's routing
+            )?;
+        }
 
         // The MoE accumulator: the routed half OVERWRITES it (the fused down+reduce
         // writes `out[i] = acc`, exactly like `moe_reduce`), so with no routed half

@@ -3098,18 +3098,26 @@ extern "C" cudaError_t ferrite_gemv_bf16(const float* x, const void* w,
 // counter stays non-zero, the election never fires again and route_w/idx go
 // stale — the DSV41_ROUTE_FUSE=0 escape hatch is the recovery.
 // ------------------------------------------------------------
+// `nrows` is the number of SCORE ROWS the elected block routes. The v2 entry
+// (`ferrite_gemv_bf16_v2_route`) sets it to 1 — the rows == 1 body that entry
+// has always run; B5 (`ferrite_gemv_bf16_v2_mrows_route`) sets it to the GEMV's
+// row count, so ONE election routes the whole m-row score block. The body below
+// runs `dsv41_route.cu`'s `route_topk_kernel` for row `rr` at score base
+// `y + rr*n_experts` with the outputs at `+rr*topk` — the identical per-row
+// expression that kernel emits at `blockIdx.x == rr`.
 struct Gv2RouteEpi {
-    float* weights;      // [topk] out
-    int32_t* indices;    // [topk] out
+    float* weights;      // [nrows][topk] out (row pitch = topk)
+    int32_t* indices;    // [nrows][topk] out (row pitch = topk)
     const float* bias;   // [n_experts] or null
     float route_scale;
     int topk, n_experts, norm_topk_prob, score_func;
     unsigned* ctr;       // [1] device counter (null => epilogue disabled)
+    int nrows;           // score rows to route (1 = the v2 entry, m = B5)
 };
 
 // The null epilogue handed to the plain ferrite_gemv_bf16_v2 launches: the
 // aggregate-init leaves ctr == nullptr, which is the "disabled" test below.
-static const Gv2RouteEpi GV2_ROUTE_NONE = {nullptr, nullptr, nullptr, 0.f, 0, 0, 0, 0, nullptr};
+static const Gv2RouteEpi GV2_ROUTE_NONE = {nullptr, nullptr, nullptr, 0.f, 0, 0, 0, 0, nullptr, 0};
 
 // Mirrors dsv41_act() in dsv41_route.cu (that one lives in an anonymous
 // namespace and cannot be shared). KEEP THE TWO IN SYNC — the fused route is
@@ -3137,7 +3145,12 @@ __device__ void gv2_route_epilogue(const Gv2RouteEpi epi, const float* __restric
     if (s_last == 0) return;   // no barrier follows on this path — safe
     __threadfence();           // acquire: every other block's y[] store
 
-    // ---- route_topk_kernel's body, rows == 1 (scores = y) ----
+    // ---- route_topk_kernel's body, once per score row (scores = y) ----
+    // `epi.nrows == 1` is the single-row form the v2 entry has always run. Each
+    // iteration is the standalone kernel's body for `r == rr`, statement for
+    // statement; the shared-memory scratch is reused, and the consume barrier at
+    // the end of an iteration is what makes the next iteration's score load
+    // race-free (all readers have passed it).
     const int n = epi.n_experts;
     const int topk = epi.topk;
     extern __shared__ float sh[];
@@ -3145,73 +3158,77 @@ __device__ void gv2_route_epilogue(const Gv2RouteEpi epi, const float* __restric
     float* s_sel = s_act + n;
     int* s_pick = (int*)(s_sel + n);
 
-    const float* sr = y;
-    for (int e = threadIdx.x; e < n; e += blockDim.x) {
-        const float a = gv2_route_act(sr[e], epi.score_func);
-        s_act[e] = a;
-        s_sel[e] = a + (epi.bias ? epi.bias[e] : 0.f);
-    }
-    __syncthreads();
-
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
-    for (int it = 0; it < topk; ++it) {
-        float bv = -INFINITY;
-        int bi = n;
+    for (int rr = 0; rr < epi.nrows; ++rr) {
+        const float* sr = y + (size_t)rr * n;
         for (int e = threadIdx.x; e < n; e += blockDim.x) {
-            const float v = s_sel[e];
-            if (v > bv || (v == bv && e < bi)) {
-                bv = v;
-                bi = e;
-            }
-        }
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
-            if (ov > bv || (ov == bv && oi < bi)) {
-                bv = ov;
-                bi = oi;
-            }
-        }
-        if (lane == 0) {
-            s_bv[warp] = bv;
-            s_bi[warp] = bi;
+            const float a = gv2_route_act(sr[e], epi.score_func);
+            s_act[e] = a;
+            s_sel[e] = a + (epi.bias ? epi.bias[e] : 0.f);
         }
         __syncthreads();
-        if (warp == 0) {
-            float v = (lane < nw) ? s_bv[lane] : -INFINITY;
-            int i = (lane < nw) ? s_bi[lane] : n;
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_xor_sync(0xffffffffu, v, off);
-                const int oi = __shfl_xor_sync(0xffffffffu, i, off);
-                if (ov > v || (ov == v && oi < i)) {
-                    v = ov;
-                    i = oi;
+
+        for (int it = 0; it < topk; ++it) {
+            float bv = -INFINITY;
+            int bi = n;
+            for (int e = threadIdx.x; e < n; e += blockDim.x) {
+                const float v = s_sel[e];
+                if (v > bv || (v == bv && e < bi)) {
+                    bv = v;
+                    bi = e;
                 }
             }
-            if (lane == 0) s_pick[it] = i;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, off);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            if (lane == 0) {
+                s_bv[warp] = bv;
+                s_bi[warp] = bi;
+            }
+            __syncthreads();
+            if (warp == 0) {
+                float v = (lane < nw) ? s_bv[lane] : -INFINITY;
+                int i = (lane < nw) ? s_bi[lane] : n;
+                for (int off = 16; off > 0; off >>= 1) {
+                    const float ov = __shfl_xor_sync(0xffffffffu, v, off);
+                    const int oi = __shfl_xor_sync(0xffffffffu, i, off);
+                    if (ov > v || (ov == v && oi < i)) {
+                        v = ov;
+                        i = oi;
+                    }
+                }
+                if (lane == 0) s_pick[it] = i;
+            }
+            __syncthreads();
+            if (threadIdx.x == 0 && s_pick[it] < n) s_sel[s_pick[it]] = -INFINITY;  // consume
+            __syncthreads();
         }
-        __syncthreads();
-        if (threadIdx.x == 0 && s_pick[it] < n) s_sel[s_pick[it]] = -INFINITY;  // consume
-        __syncthreads();
+
+        if (threadIdx.x == 0) {
+            float sum = 0.f;
+            for (int t = 0; t < topk; ++t) {
+                const int e = s_pick[t];
+                sum += (e < n) ? s_act[e] : 0.f;
+            }
+            for (int t = 0; t < topk; ++t) {
+                const int e = s_pick[t];
+                const float base = (e < n) ? s_act[e] : 0.f;
+                const float w = (epi.norm_topk_prob && sum > 0.f) ? base / sum : base;
+                epi.indices[(size_t)rr * topk + t] = e;
+                epi.weights[(size_t)rr * topk + t] = w * epi.route_scale;
+            }
+        }
+        __syncthreads();   // the scratch is reused by the next row
     }
 
-    if (threadIdx.x == 0) {
-        float sum = 0.f;
-        for (int t = 0; t < topk; ++t) {
-            const int e = s_pick[t];
-            sum += (e < n) ? s_act[e] : 0.f;
-        }
-        for (int t = 0; t < topk; ++t) {
-            const int e = s_pick[t];
-            const float base = (e < n) ? s_act[e] : 0.f;
-            const float w = (epi.norm_topk_prob && sum > 0.f) ? base / sum : base;
-            epi.indices[t] = e;
-            epi.weights[t] = w * epi.route_scale;
-        }
-        *epi.ctr = 0u;   // reset for the next launch / graph replay
-    }
+    if (threadIdx.x == 0) *epi.ctr = 0u;   // reset for the next launch / graph replay
 }
 
 template <int WPR>
@@ -3399,7 +3416,7 @@ extern "C" cudaError_t ferrite_gemv_bf16_v2_route(
     const size_t smem = (size_t)out_f * 2 * sizeof(float) + (size_t)topk * sizeof(int);
     if (smem > 48 * 1024) return (cudaError_t)cudaErrorInvalidValue;
     const Gv2RouteEpi epi = {weights, indices, route_bias, route_scale,
-                             topk, out_f, norm_topk_prob, score_func, ctr};
+                             topk, out_f, norm_topk_prob, score_func, ctr, /*nrows=*/1};
     int wpr = gv2_wpr(out_f);                 // MUST match the plain entry
     int rpb = 8 / wpr;
     dim3 grid((out_f + rpb - 1) / rpb);       // nrows == 1 => out_f rows total
@@ -3439,7 +3456,7 @@ __global__ void gemv_bf16_nt_kernel(const float* __restrict__ x,
                                     const __nv_bfloat16* __restrict__ w,
                                     const float* __restrict__ bias,
                                     float* __restrict__ y,
-                                    int in_f, int out_f) {
+                                    int in_f, int out_f, const Gv2RouteEpi rte) {
     const int warps = blockDim.x >> 5;
     const int rpb = warps / WPR;               // rows per block (as v2)
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -3508,6 +3525,14 @@ __global__ void gemv_bf16_nt_kernel(const float* __restrict__ x,
             }
         }
     }
+    // Fused route epilogue (B5): a null counter is the plain multi-row GEMV,
+    // bit for bit as before (no barrier, no atomic, no extra smem touched).
+    // The nt kernel computes `rpb` rows x NT tokens per block, so the union of
+    // the grid's writes IS the whole [nrows, out_f] score block, and the last
+    // block's election can route every row at `rte.nrows`. Same discipline as
+    // `gemv_bf16_v2_kernel`'s epilogue; the leading `__syncthreads()` inside
+    // `gv2_route_epilogue` also orders this block's `y[]` stores.
+    if (rte.ctr != nullptr) gv2_route_epilogue(rte, y);
 }
 
 // ============================================================
@@ -3607,7 +3632,7 @@ extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
     // double dispatch (NT × WPR — the v2 heuristic's per-out_f K-split):
     // macro-instantiated switch (9 NT values × 4 WPR lanes = 36 kernels,
     // same code path per instantiation — no register bloat beyond NT).
-#define NT_CASE(NTV, WPRV) gemv_bf16_nt_kernel<NTV, WPRV><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f)
+#define NT_CASE(NTV, WPRV) gemv_bf16_nt_kernel<NTV, WPRV><<<grid, 256, 0, s>>>(x, wb, bias, out, in_f, out_f, GV2_ROUTE_NONE)
 #define NT_SWITCH_W(NTV) \
     switch (wpr) { \
         case 1:  NT_CASE(NTV, 1);  break; \
@@ -3627,6 +3652,125 @@ extern "C" cudaError_t ferrite_gemv_bf16_nt(const float* x, const void* w,
         case 16: NT_SWITCH_W(16); break;
         default: return cudaErrorNotSupported; // host falls back to v2 batched
     }
+    return cudaGetLastError();
+}
+
+// ============================================================
+// B5 (`ferrite_gemv_bf16_v2_mrows_route`): the MoE gate's m-row GEMV with the
+// route election folded in — ONE launch where `ferrite_gemv_bf16_v2_mrows`
+// (DSV41_GATE_MROWS) + `dsv41_route_topk` used to be two.
+// Design: docs/agent/mrows-swallow-batched-implementation-design.md §3 (B5).
+// ============================================================
+// WHAT THIS IS. `moe_rows` (chain_dev.rs) computes the routing with TWO
+// launches: the gate GEMV over the block's activation rows, then
+// `dsv41_route_topk` over the finished score block. This entry is the m-row
+// twin of the M=1 `ferrite_gemv_bf16_v2_route` (DSV41_ROUTE_FUSE, default ON in
+// the EAGER path): the SAME GEMV program (`gemv_bf16_nt_kernel<NT, WPR>` — the
+// one `ferrite_gemv_bf16_v2_mrows` names, see that entry's "NO SECOND
+// TRANSCRIPTION" rule) runs the multiplication, and its LAST BLOCK — the
+// "last block" election on `ctr`, cf. `gv2_route_epilogue` — runs
+// `dsv41_route.cu`'s `route_topk_kernel` body over the whole
+// [nrows, out_f] score block.
+//
+// WHY THE FOLD IS BIT-EXACT. Two independent claims:
+//   * the GEMV half is the identical program: this entry instantiates the same
+//     `gemv_bf16_nt_kernel<NT, WPR>` with the same `gv2_wpr` heuristic, the same
+//     grid/K-slice/decode bodies and the same per-row accumulators — the
+//     epilogue is the ONLY addition, and it runs strictly after every `y[]`
+//     store of the block (its leading `__syncthreads()`;
+//     `gemv_bf16_nt_kernel`'s own header carries the parity argument, asserted
+//     by `tests_gate_mrows.cu`);
+//   * the route half is `route_topk_kernel`'s body, row for row: the elected
+//     block loops `rr` over the score rows and emits the same
+//     `dsv41_act` / selection / tie-break (`v > bv || (v == bv && e < bi)`,
+//     a MAX, so the reduce tree's shape cannot move the result) / renorm /
+//     `-INFINITY` consume statements, reading `y + rr*n_experts` and writing
+//     `indices/weights + rr*topk` — exactly what the standalone kernel does at
+//     `blockIdx.x == rr`. `gv2_route_act` mirrors `dsv41_act` (KEEP THE TWO IN
+//     SYNC — the fused route is only bit-exact while they agree).
+//
+// COUNTER DISCIPLINE (graph-safe). `ctr` is 4 B of device memory zeroed ONCE at
+// allocation; the elected block resets it in place before its grid ends, so a
+// captured graph replays without a per-call host memset. A run that dies
+// mid-grid leaves it non-zero and the election stops firing — the escape hatch
+// is the gate OFF (the two-launch pair below is always available).
+//
+// ABI: (x, w, bias, out, in_f, out_f, nrows, route outs/bias/params, ctr, s)
+//      -> cudaSuccess launched, cudaErrorNotSupported DECLINED.
+//   x          [nrows, in_f]  f32 activations (row pitch in_f)
+//   w          [out_f, in_f]  bf16 gate weight
+//   out        [nrows, out_f] f32 gate scores (row pitch out_f)
+//   weights    [nrows, topk]  f32 route weights (row pitch topk)
+//   indices    [nrows, topk]  i32 route indices (row pitch topk)
+//   nrows      2..=8 (1 is forwarded to `ferrite_gemv_bf16_v2_route`)
+// Declines (never a wrong answer): `nrows` outside 1..=8, `in_f % 8 != 0` (v2
+// would take the v1 kernel, a DIFFERENT accumulation order — the FOLD trap),
+// `topk` outside [1, out_f], a null route output/counter, or route smem above
+// 48 KB. The Rust wrapper checks the same set and keeps the two-launch pair.
+extern "C" cudaError_t ferrite_gemv_bf16_v2_mrows_route(
+    const float* x, const void* w, const float* bias, float* out,
+    int in_f, int out_f, int nrows,
+    float* weights, int32_t* indices, const float* route_bias,
+    int topk, int norm_topk_prob, float route_scale, int score_func,
+    unsigned* ctr, cudaStream_t s) {
+    // The v2/nt entries' "nothing to do" conventions, verbatim.
+    if (out_f <= 0 || nrows <= 0) return cudaSuccess;
+    if (in_f <= 0) return cudaSuccess;
+    // One row IS the M=1 route entry (identical by definition — no fold to
+    // prove): the same shape/EAGER discipline `ferrite_gemv_bf16_v2_mrows`
+    // applies when it forwards `nrows == 1` to `ferrite_gemv_bf16_v2`.
+    if (nrows == 1) {
+        return ferrite_gemv_bf16_v2_route(x, w, bias, out, in_f, out_f, 1,
+                                          weights, indices, route_bias, topk,
+                                          norm_topk_prob, route_scale, score_func,
+                                          ctr, s);
+    }
+    if (nrows > 8) return cudaErrorNotSupported;
+    // in_f % 8 != 0: v2 itself falls back to the scalar v1 kernel, whose
+    // accumulation order is a DIFFERENT program — decline instead of pretending
+    // parity (the same rule `ferrite_gemv_bf16_v2_mrows` follows).
+    if (in_f & 7) return cudaErrorNotSupported;
+    if (topk <= 0 || topk > out_f || weights == nullptr || indices == nullptr
+        || ctr == nullptr) {
+        return cudaErrorNotSupported;
+    }
+    const size_t smem = (size_t)out_f * 2 * sizeof(float) + (size_t)topk * sizeof(int);
+    if (smem > 48 * 1024) return cudaErrorNotSupported;
+    // DIAGNOSTIC ONLY (FERRITE_GEMV_SKIP=1): timing-only ablation, as in the
+    // plain entries — the whole launch (gate + route) is skipped.
+    static const bool gemv_skip_ = getenv("FERRITE_GEMV_SKIP") != nullptr;
+    if (gemv_skip_) return cudaSuccess;
+    const Gv2RouteEpi epi = {weights, indices, route_bias, route_scale,
+                             topk, out_f, norm_topk_prob, score_func, ctr,
+                             /*nrows=*/nrows};
+    int wpr = gv2_wpr(out_f);                 // MUST match `ferrite_gemv_bf16_v2_mrows`
+    int rpb = 8 / wpr;
+    dim3 grid((out_f + rpb - 1) / rpb);       // NO x nrows — as the nt entry
+    dim3 block(256);
+    const __nv_bfloat16* wb = (const __nv_bfloat16*)w;
+    // The same double dispatch (NT x WPR) as `ferrite_gemv_bf16_nt`, only the
+    // epilogue differs — so the GEMV program is shared, not retyped.
+#define NT_ROUTE_CASE(NTV, WPRV) \
+    gemv_bf16_nt_kernel<NTV, WPRV><<<grid, 256, smem, s>>>(x, wb, bias, out, in_f, out_f, epi)
+#define NT_ROUTE_SWITCH_W(NTV) \
+    switch (wpr) { \
+        case 1:  NT_ROUTE_CASE(NTV, 1);  break; \
+        case 2:  NT_ROUTE_CASE(NTV, 2);  break; \
+        case 4:  NT_ROUTE_CASE(NTV, 4);  break; \
+        default: NT_ROUTE_CASE(NTV, 8);  break; \
+    }
+    switch (nrows) {
+        case 2:  NT_ROUTE_SWITCH_W(2); break;
+        case 3:  NT_ROUTE_SWITCH_W(3); break;
+        case 4:  NT_ROUTE_SWITCH_W(4); break;
+        case 5:  NT_ROUTE_SWITCH_W(5); break;
+        case 6:  NT_ROUTE_SWITCH_W(6); break;
+        case 7:  NT_ROUTE_SWITCH_W(7); break;
+        case 8:  NT_ROUTE_SWITCH_W(8); break;
+        default: return cudaErrorNotSupported;
+    }
+#undef NT_ROUTE_SWITCH_W
+#undef NT_ROUTE_CASE
     return cudaGetLastError();
 }
 

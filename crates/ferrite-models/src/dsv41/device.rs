@@ -363,6 +363,28 @@ struct Kernels {
     rmsnorm_rows_split: Option<unsafe extern "C" fn(
         *const f32, *const f32, *mut f32, c_int, c_int, f32, c_int, CuStream,
     ) -> c_int>,
+    // B4 (`DSV41_RMSNORM_ROPE_MROWS`, default OFF, from dsv41_kernels.cu): the
+    // verify block's kv half — `norm_rows(kv_r)` + `apply_rope(kv_r)` — in ONE
+    // launch. Phase 1 is `dsv41_rmsnorm_rows_kernel`'s body verbatim (same 1024
+    // threads per row, so the cross-warp fold is the same sum in the same
+    // order); phase 2 is `apply_rope_kernel`'s trailing-`2*half` rotation at
+    // `pos_rows[r]` (== `pos_base + r`, the position the `off = 0, step = 1`
+    // form computed). The only addition is a barrier between the phases, which
+    // orders memory and moves no value ⇒ bit-identical to the two launches it
+    // replaces. It takes the STREAM explicitly: the kv half is the
+    // `DSV41_VERIFY_FORK` side chain, and hard-coding the main stream would drag
+    // it back off the side stream.
+    //
+    // Optional: a stale .so without the symbol keeps `norm_rows + apply_rope`,
+    // whose numerics are the reference. The C entry returns 2 (declined) for a
+    // shape outside its domain (rope region past the row, non-positive sizes);
+    // this wrapper pre-checks the same set and returns Ok(false).
+    // ABI: (x, w, out, rows, dim, eps, cos, sin, rope_off, half, pos_rows,
+    //       inverse, s).
+    rmsnorm_rope_mrows: Option<unsafe extern "C" fn(
+        *const f32, *const f32, *mut f32, c_int, c_int, f32, *const f32, *const f32, c_int, c_int,
+        *const c_int, c_int, CuStream,
+    ) -> c_int>,
     // bf16 gate + fp8 shared expert in ONE launch (same activation). Optional:
     // falls back to the separate launches.
     gemm_bf16_fp8x2: Option<unsafe extern "C" fn(
@@ -476,6 +498,29 @@ struct Kernels {
     // in place, so a captured graph replays correctly). Optional: an older .so
     // without the symbol keeps the two-launch gate + route_topk pair.
     gemv_bf16_v2_route: Option<
+        unsafe extern "C" fn(
+            *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, *mut f32,
+            *mut c_int, *const f32, c_int, c_int, f32, c_int, *mut c_uint, CuStream,
+        ) -> c_int,
+    >,
+    // B5 (`DSV41_GATE_MROWS_ROUTE`, default OFF, from ferrite_kernels.cu): the
+    // multi-row MoE gate GEMV (`ferrite_gemv_bf16_v2_mrows`) with the route
+    // election folded in — ONE launch where the gate + `route_topk` used to be
+    // two. It instantiates the SAME `gemv_bf16_nt_kernel<NT, WPR>` program, so
+    // the GEMV half is bit-identical to `gemv_bf16_v2_mrows`; the elected block
+    // then runs `dsv41_route_topk`'s body over the whole [rows, n_experts] score
+    // block, row for row. `nrows == 1` forwards to `gemv_bf16_v2_route` (the
+    // M=1/ROUTE_FUSE program), so the two entries agree at the boundary.
+    //
+    // Optional: a stale .so without the symbol keeps the two-launch pair (the
+    // gate GEMV + `route_topk`), whose numerics are the reference. The C entry
+    // declines (cudaErrorNotSupported) for `rows` outside 1..=8, `k % 8 != 0`
+    // (v1 is a different accumulation order), `topk` outside [1, n], a null
+    // route output, or route smem above 48 KB; this wrapper pre-checks the same
+    // set and returns Ok(false) so the caller falls back.
+    // ABI: (x, w, bias, out, in_f, out_f, nrows, weights, indices, route_bias,
+    //       topk, norm_topk_prob, route_scale, score_func, ctr, s).
+    gemv_bf16_v2_mrows_route: Option<
         unsafe extern "C" fn(
             *const f32, *const c_void, *const f32, *mut f32, c_int, c_int, c_int, *mut f32,
             *mut c_int, *const f32, c_int, c_int, f32, c_int, *mut c_uint, CuStream,
@@ -1440,6 +1485,7 @@ impl Device {
             rmsnorm_q: ko!(rt, "dsv41_rmsnorm_q"),
             rmsnorm_rows: ko!(rt, "dsv41_rmsnorm_rows"),
             rmsnorm_rows_split: ko!(rt, "dsv41_rmsnorm_rows_split"),
+            rmsnorm_rope_mrows: ko!(rt, "dsv41_rmsnorm_rope_mrows"),
             gemm_bf16_fp8x2: ko!(rt, "dsv41_gemm_bf16_fp8x2"),
             argmax_sliced: ko!(rt, "dsv41_argmax_sliced"),
             argmax_sliced_rows: ko!(rt, "dsv41_argmax_sliced_rows"),
@@ -1459,6 +1505,7 @@ impl Device {
             gemv_bf16_nt: ko!(rt, "ferrite_gemv_bf16_nt"),
             gemv_bf16_v2_mrows: ko!(rt, "ferrite_gemv_bf16_v2_mrows"),
             gemv_bf16_v2_route: ko!(rt, "ferrite_gemv_bf16_v2_route"),
+            gemv_bf16_v2_mrows_route: ko!(rt, "ferrite_gemv_bf16_v2_mrows_route"),
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
@@ -4760,6 +4807,106 @@ impl Device {
         Ok(true)
     }
 
+    /// B5 (DSV41_GATE_MROWS_ROUTE, default OFF): [`Self::gemv_bf16_v2_mrows`]
+    /// with the MoE route folded into the GEMV's last block — ONE launch where
+    /// the gate GEMV + `route_topk` used to be two (`ferrite_gemv_bf16_v2_mrows_route`).
+    ///
+    /// The GEMV half is the SAME `gemv_bf16_nt_kernel<NT, WPR>` program
+    /// `gemv_bf16_v2_mrows` names (the .so holds one definition — see that
+    /// entry's "NO SECOND TRANSCRIPTION" rule), so every gate score is
+    /// bit-identical to the two-launch path; the elected block then runs
+    /// `dsv41_route_topk`'s body row for row over the [rows, n] score block, so
+    /// `weights`/`indices` are bit-identical too.
+    ///
+    /// `Ok(false)` = NOT performed, keep `gemv_bf16_v2_mrows` + `route_topk`:
+    /// the .so predates the symbol, the per-row path would not take v2
+    /// (`gemv_bf16_v2_wanted(n)`, `k % 8 != 0` — v1 is a DIFFERENT accumulation
+    /// order, so there is no parity to claim), `rows` is outside 1..=8, `topk`
+    /// is outside [1, n], or the route scratch would exceed 48 KB. The checks
+    /// mirror the C entry's decline set exactly, so an armed gate never silently
+    /// measures the old path with this returning `Ok(true)`.
+    ///
+    /// `ctr` is `s.route_ctr` (4B, zeroed ONCE at allocation): the kernel
+    /// resets it in place before its grid ends, which is what makes a captured
+    /// graph replay correct without a per-call memset.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_v2_mrows_route(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+        weights: *mut f32,
+        indices: *mut i32,
+        route_bias: *const f32,
+        topk: i32,
+        norm_topk_prob: bool,
+        route_scale: f32,
+        score_func: i32,
+        ctr: *mut c_uint,
+    ) -> Result<bool> {
+        // The same preconditions `gemv_bf16_v2_mrows` folds on, plus the route's
+        // own shape/smem bounds — all of them also declined by the C entry, so
+        // this never has to classify a cudaError_t.
+        if !gemv_bf16_v2_wanted(n) || self.kernels.gemv_bf16_v2.is_none() {
+            return Ok(false);
+        }
+        if !(1..=GEMV_V2_MROWS_MAX).contains(&rows) || (k & 7) != 0 {
+            return Ok(false);
+        }
+        if n <= 0 || topk <= 0 || topk > n || ctr.is_null() {
+            return Ok(false);
+        }
+        // Route scratch: [n] act + [n] selection scores + [topk] picks.
+        if (n as usize) * 2 * std::mem::size_of::<f32>() + (topk as usize) * std::mem::size_of::<i32>()
+            > 48 * 1024
+        {
+            return Ok(false);
+        }
+        // `FERRITE_GEMV_SKIP` is a timing-only ablation INSIDE the entry:
+        // treating it as "do not fold" keeps the ablation honest.
+        if gemv_bf16_nt_skip() {
+            return Ok(false);
+        }
+        let Some(f) = self.kernels.gemv_bf16_v2_mrows_route else {
+            return Ok(false); // older .so: keep the two-launch pair
+        };
+        // ABI: (x, w, bias, out, in_f=k, out_f=n, nrows=rows, route out/bias/params, ctr, s).
+        let rc = unsafe {
+            f(
+                x,
+                w,
+                std::ptr::null(),
+                out,
+                k,
+                n,
+                rows,
+                weights,
+                indices,
+                route_bias,
+                topk,
+                norm_topk_prob as i32,
+                route_scale,
+                score_func,
+                ctr,
+                self.stream,
+            )
+        };
+        self.kerr(rc, "ferrite_gemv_bf16_v2_mrows_route")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries B5
+    /// (`ferrite_gemv_bf16_v2_mrows_route`). A stale .so leaves
+    /// `DSV41_GATE_MROWS_ROUTE` inert and the verify's routing on the
+    /// `gemv_bf16_v2_mrows` + `route_topk` pair, which is the reference B5 was
+    /// written against.
+    pub fn supports_gemv_bf16_v2_mrows_route(&self) -> bool {
+        self.kernels.gemv_bf16_v2_mrows_route.is_some()
+    }
+
     /// Same, f32 weights.
     /// The decode-step n-gram hash on the device (removes the last per-step H2D
     /// and makes the step graph-capturable). Single thread, bit-identical to the
@@ -6256,6 +6403,83 @@ impl Device {
         let rc = unsafe { f(x, w, out, rows, dim, eps, s) };
         self.kerr(rc, "dsv41_rmsnorm_rows")?;
         Ok(true)
+    }
+
+    /// B4 (DSV41_RMSNORM_ROPE_MROWS, default OFF): [`Self::rmsnorm_rows_on`]'s
+    /// norm AND the trailing-`2*half` RoPE of the same rows in ONE launch
+    /// (`dsv41_rmsnorm_rope_mrows`) — where the kv half issued two.
+    ///
+    /// Phase 1 is `dsv41_rmsnorm_rows_kernel`'s body verbatim at the same
+    /// blockDim (1024), so the normalized rows are bit-identical; phase 2 is
+    /// `apply_rope_kernel`'s rotation of the columns `[rope_off, rope_off+2*half)`
+    /// at `pos_rows[row]` — the identical integer the two-launch form computed
+    /// as `pos_base + row` — with no reduction, so it cannot move a value. The
+    /// only addition is a barrier between the phases (memory order, not math).
+    ///
+    /// The stream is a PARAMETER, not `self.stream`: the kv half is the
+    /// `DSV41_VERIFY_FORK` side chain, and the two launches this replaces are the
+    /// `*_on` entries. Hard-coding the main stream would drag the kv chain back
+    /// off the side stream and eat the fork's gain.
+    ///
+    /// `Ok(false)` = NOT performed, keep `rmsnorm_rows_on` + `apply_rope_on`:
+    /// the .so predates the symbol, or the shape is outside the fusion's domain
+    /// (`rows <= 0`, `dim <= 0`, `half <= 0`, `rope_off < 0`,
+    /// `rope_off + 2*half > dim`). The C entry declines the same set with 2, so
+    /// an armed gate never silently measures the old path while returning
+    /// `Ok(true)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rmsnorm_rope_mrows(
+        &self,
+        x: *const f32,
+        w: *const f32,
+        out: *mut f32,
+        rows: i32,
+        dim: i32,
+        eps: f32,
+        cos: *const f32,
+        sin: *const f32,
+        rope_off: i32,
+        half: i32,
+        pos_rows: *const c_int,
+        inverse: bool,
+        s: CuStream,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.rmsnorm_rope_mrows else {
+            return Ok(false); // older .so: keep the two-launch kv pair
+        };
+        if rows <= 0 || dim <= 0 || half <= 0 || rope_off < 0 || rope_off + 2 * half > dim {
+            return Ok(false);
+        }
+        let rc = unsafe {
+            f(
+                x,
+                w,
+                out,
+                rows,
+                dim,
+                eps,
+                cos,
+                sin,
+                rope_off,
+                half,
+                pos_rows,
+                inverse as i32,
+                s,
+            )
+        };
+        // 2 = the kernel's "declined" (shape), the caller falls back.
+        if rc == 2 {
+            return Ok(false);
+        }
+        self.kerr(rc, "dsv41_rmsnorm_rope_mrows")?;
+        Ok(true)
+    }
+
+    /// True when the loaded .so carries B4 (`dsv41_rmsnorm_rope_mrows`). A stale
+    /// .so leaves `DSV41_RMSNORM_ROPE_MROWS` inert and the verify's kv half on
+    /// `norm_rows + apply_rope`, which is the reference B4 was written against.
+    pub fn supports_rmsnorm_rope_mrows(&self) -> bool {
+        self.kernels.rmsnorm_rope_mrows.is_some()
     }
 
     #[allow(clippy::too_many_arguments)]

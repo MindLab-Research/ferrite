@@ -355,6 +355,45 @@ if [ "$B6_ARM" = 1 ]; then
     GATES_ONELINE="$GATES_ONELINE $B6_GATES"
 fi
 
+# ---------------------------------------------------------------------------
+# B5 / B4 (mrows Phase B, docs/agent/mrows-swallow-batched-implementation-design.md
+# §3). Opt-in arms, DEFAULT unset ⇒ `$GATES_ONELINE` is byte-identical to the
+# shipped configuration (the matrix above). Both are NEW kernels, both are pure
+# launch fusions (bit-identical by construction to the pair they replace), so
+# their A/B verdict is the `k_acc` sequence + the counting digits + 出师表, and
+# the ONLY hard evidence of "it ran" is the kernel NAME in the nsys sum table —
+# a stale `.so` makes both arms SILENTLY inert (`Ok(false)`, the chain falls back
+# to the two-launch pair), which is the phantom-gate trap the symbol check below
+# exists to catch. The run's own `$LOGDIR/run.env` `/proc/<pid>/environ` read-back
+# covers the env half.
+#
+#   B400_B5=1  -> DSV41_GATE_MROWS_ROUTE=1
+#     ONE launch where the gate GEMV + `route_topk` were two (40/step): the
+#     `DSV41_GATE_MROWS` multi-row gate program with the route election folded
+#     into its last block. Needs the fold gate armed too — B5 implies it at the
+#     call site, but the A/B reads cleanest with BOTH in the arm.
+#     nm -D $SO | grep -c ferrite_gemv_bf16_v2_mrows_route
+#     design §3 B5: -0.13ms @3.3us (small item; GATE_MROWS already ate m×gemv)
+#
+#   B400_B4=1  -> DSV41_RMSNORM_ROPE_MROWS=1
+#     ONE launch where the kv half's `norm_rows(kv_r)` + `apply_rope(kv_r)` were
+#     two (40/step). ⚠️ A/B MUST run with `DSV41_VERIFY_FORK` in the SAME arm:
+#     both launches it replaces are the fork's side-stream (`*_on`) entries, and
+#     only a FORK=1 run exercises the stream the new kernel must ride.
+#     nm -D $SO | grep -c dsv41_rmsnorm_rope_mrows
+#     design §3 B4: -0.13ms @3.3us (small item; NORM_MROWS already ate m×norm)
+#
+# USAGE:  B400_B5=1 bash scripts/batched_400_v2.sh
+#         B400_B4=1 bash scripts/batched_400_v2.sh
+B5_ARM="${B400_B5:-0}"
+if [ "$B5_ARM" = 1 ]; then
+    GATES_ONELINE="$GATES_ONELINE DSV41_GATE_MROWS=1 DSV41_GATE_MROWS_ROUTE=1"
+fi
+B4_ARM="${B400_B4:-0}"
+if [ "$B4_ARM" = 1 ]; then
+    GATES_ONELINE="$GATES_ONELINE DSV41_RMSNORM_ROPE_MROWS=1"
+fi
+
 echo "== BATCHED-400 v2 (rebuilt) comprehensive run =="
 echo "-- node $NODE   arch $ARCH   port $PORT   tp $TP"
 echo "-- prompt: 出师表 max_tokens=$MAXTOK   steady-skip=$STEADY_SKIP"

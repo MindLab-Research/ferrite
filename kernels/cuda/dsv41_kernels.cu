@@ -9630,6 +9630,123 @@ extern "C" int dsv41_rmsnorm_rows(const float* x, const float* w, float* out, in
     return (int)cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// B4 (`dsv41_rmsnorm_rope_mrows`, Rust gate DSV41_RMSNORM_ROPE_MROWS, default
+// OFF): the verify block's kv half -- `norm_rows(kv_r)` + `apply_rope(kv_r)` --
+// in ONE launch per layer.
+// Design: docs/agent/mrows-swallow-batched-implementation-design.md §3 (B4).
+// ---------------------------------------------------------------------------
+// WHY THIS IS A PURE LAUNCH FUSION. The two launches it replaces already own the
+// SAME row and the SAME pitch:
+//     norm_rows_on(kv_r, kv_norm, kv_r, m, hd, eps)   -> dsv41_rmsnorm_rows_kernel
+//     apply_rope_on(kv_r, cos, sin, m, hd, rd, half, pos_ctr, 1, 0, 1, false)
+//                                                     -> apply_rope_kernel
+// both one block per row of the `[m, hd]` kv block with row pitch `hd`. (The
+// norm's target here is the whole head (`dim = hd`); the rope rotates the
+// TRAILING `2*half` columns of that row, `apply_rope_kernel`'s
+// `x + r*row_len + (row_len - dim)` with `row_len = hd`, `dim = rd` -- i.e. the
+// offset `rope_off = hd - rd` this kernel takes as a parameter.)
+//
+// BIT-IDENTITY. Phase 1 is `dsv41_rmsnorm_rows_kernel`'s body VERBATIM, and that
+// kernel's own header carries the argument: rows are independent, every
+// reduction value is per block, and `blockDim == 1024` on both sides is what
+// makes `red[32]`'s cross-warp fold the same sum in the same order -- so this
+// launcher uses 1024 too. Phase 2 is `apply_rope_kernel`'s rotation verbatim:
+//     t = (*base)*mul + off + row*step = pos_base + row = pos_rows[row]
+// (the call site's `mul = 1, off = 0, step = 1`, and `step_rows` uploaded
+// `pos_rows[r] = pos_base + r` -- the same table the q/o rope, `ring_append` and
+// the compressor read), the same `cos[t*half+i]` / `sin[...] * (inverse ? -1 : 1)`
+// and the same `x0*c - x1*s` / `x0*s + x1*c` pair, on the trailing `2*half`
+// columns of the row. There is NO reduction in phase 2 and every element is
+// written exactly once, so its thread mapping cannot move a value (only phase
+// 1's fold is geometry-bound).
+// The ONE addition is the `__syncthreads()` between the phases: phase 2 reads
+// columns phase 1 wrote, which the two-launch sequence got from the launch
+// boundary. It orders memory; it does not move a value.
+//
+// STREAM (must not be dropped). The kv half is the `VERIFY_FORK` side chain, so
+// both launches it replaces are the `*_on` entries. This kernel takes the stream
+// as a parameter for the same reason -- hard-coding the main stream would
+// silently drag the kv half back off the side stream and eat FORK's gain.
+//
+// ABI: (x, w, out, rows, dim, eps, cos, sin, rope_off, half, pos_rows, inverse, s)
+//      -> 0 launched, 2 DECLINED (the caller keeps the two-launch pair; never a
+//         wrong answer).
+//   x         [rows, dim] f32   (row pitch dim)
+//   w         [dim]      f32    the shared norm weight row
+//   out       [rows, dim] f32   may alias x -- the kv norm is in place, and
+//                               phase 1 reads each element before it writes it
+//   rope_off  `row_len - rope_dim` = dim - 2*half: phase 2 rotates the columns
+//             [rope_off, rope_off + 2*half)
+//   pos_rows  [rows] i32        `pos_rows[r] == pos_base + r`
+// Declines: rows <= 0, dim <= 0, half <= 0, rope_off < 0,
+// rope_off + 2*half > dim, or a null pointer. A null/invalid argument is a
+// programming error (cudaErrorInvalidValue); a shape that is not this fusion's
+// domain is 2, so the caller falls back to `norm_rows + apply_rope`.
+__global__ void __launch_bounds__(1024)
+dsv41_rmsnorm_rope_mrows_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                float* __restrict__ out, int rows, int dim, float eps,
+                                const float* __restrict__ cos, const float* __restrict__ sin,
+                                int rope_off, int half, const int* __restrict__ pos_rows,
+                                int inverse) {
+    const int row = blockIdx.x;
+    if (row >= rows) return;
+    const float* xr = x + (size_t)row * dim;
+    float* or_ = out + (size_t)row * dim;
+    // ---- phase 1: `dsv41_rmsnorm_rows_kernel`'s body, verbatim ----
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        ss += xr[i] * xr[i];
+    }
+    // warp reduce - the single-row kernel's tree, verbatim
+    float lane = ss;
+    for (int off = 16; off > 0; off >>= 1) lane += __shfl_down_sync(0xffffffffu, lane, off);
+    __shared__ float red[32];
+    if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = lane;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.f;
+        for (int i = 0; i < (int)(blockDim.x >> 5); i++) t += red[i];
+        red[0] = rsqrtf(t / dim + eps);
+    }
+    __syncthreads();
+    const float inv = red[0];
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        or_[i] = xr[i] * inv * w[i];
+    }
+    // ---- phase 2: `apply_rope_kernel`'s body on this row, at pos_rows[row] ----
+    // The barrier is the only addition to the pair: phase 2 reads columns that
+    // phase 1 may have written from another thread.
+    __syncthreads();
+    const int t = pos_rows[row];
+    float* rr = or_ + rope_off;
+    for (int i = threadIdx.x; i < half; i += blockDim.x) {
+        const float c = cos[(size_t)t * half + i];
+        const float s = sin[(size_t)t * half + i] * (inverse ? -1.f : 1.f);
+        const float x0 = rr[2 * i], x1 = rr[2 * i + 1];
+        rr[2 * i] = x0 * c - x1 * s;
+        rr[2 * i + 1] = x0 * s + x1 * c;
+    }
+}
+
+extern "C" int dsv41_rmsnorm_rope_mrows(const float* x, const float* w, float* out, int rows,
+                                        int dim, float eps, const float* cos, const float* sin,
+                                        int rope_off, int half, const int* pos_rows, int inverse,
+                                        cudaStream_t s) {
+    if (x == nullptr || w == nullptr || out == nullptr || cos == nullptr || sin == nullptr
+        || pos_rows == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    if (rows <= 0 || dim <= 0 || half <= 0 || rope_off < 0 || rope_off + 2 * half > dim) {
+        return 2; // declined: the caller keeps `norm_rows + apply_rope`
+    }
+    // 1024 threads, one block per row -- `dsv41_rmsnorm_rows`' geometry, which is
+    // what makes phase 1's cross-warp fold the same sum in the same order.
+    dsv41_rmsnorm_rope_mrows_kernel<<<(unsigned)rows, 1024, 0, s>>>(
+        x, w, out, rows, dim, eps, cos, sin, rope_off, half, pos_rows, inverse);
+    return (int)cudaGetLastError();
+}
+
 static const bool g_hc_acc4 = getenv("DSV41_HC_MIXES_ACC4") != nullptr;
 
 // ---------------------------------------------------------------------------
