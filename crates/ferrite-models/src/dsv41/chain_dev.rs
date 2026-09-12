@@ -83,6 +83,21 @@ struct LayerCache {
 /// (a short block at the end of a request) simply uses a prefix of them.
 pub const VERIFY_ROWS: usize = 6;
 
+/// Compile-time proof that the per-row tap's PRODUCER and CONSUMERS agree on its
+/// row stride. The `layer_rows` hook writes slot `s`'s row `r` at
+/// `(s * VERIFY_ROWS + r) * dim` and both consumers spell the same stride with
+/// this ONE constant: [`DsparkDev::note_ctx_rows`] (`(slot * VERIFY_ROWS + j) *
+/// row_bytes`, dspark_dev.rs) and [`DevChain::carry_kept_tap`] (`slot *
+/// VERIFY_ROWS * row_bytes`). A block is the anchor row plus `DSPARK_DRAFTS`
+/// drafts, so `VERIFY_ROWS` must be exactly one more than `DSPARK_DRAFTS` — if a
+/// future edit changes either number without the other, this fails the BUILD
+/// instead of silently reading one row past the block (a stride mismatch is not
+/// expressible in the buffer's type, so nothing else would catch it).
+const _: () = assert!(
+    VERIFY_ROWS == DSPARK_DRAFTS + 1,
+    "VERIFY_ROWS must be the anchor row plus the DSPARK_DRAFTS draft rows"
+);
+
 /// How many row SHAPES the verify graph pool holds (see
 /// [`DevChain::verify_graphs`]): the two a production request actually produces
 /// — the shadow step's `DSPARK_DRAFTS` rows and the swallowed anchor's `+1`
@@ -1150,6 +1165,35 @@ fn sids_writeback() -> bool {
             .map(|v| v != "0")
             .unwrap_or(false)
     })
+}
+
+/// `DSV41_INV_CHECK=1` arms the spec path's cross-step INVARIANT ASSERTIONS.
+///
+/// Default OFF, so the steady-state hot path pays nothing: every check below is
+/// gated on this one cached flag, and with it off each call site is a single
+/// predictable branch on a `OnceLock` value (the same discipline the other gates
+/// here follow — no `getenv` on a per-step path).
+///
+/// Each check is one of two kinds, and the kind fixes its cost:
+///
+/// * **static / constructive** — a `debug_assert!` or a compile-time `const`
+///   assertion. Zero runtime cost in a release build, and it cannot be "passed"
+///   by a wrong value: it asserts a SHAPE (a length, a row pitch, a constant
+///   relationship). These catch the class of defect that a buffer's Rust type
+///   cannot express — `logits_r`'s row pitch, `dspark_tap_r`'s stride, the fp8
+///   staging's row geometry.
+/// * **D2H spot check** — one 4-byte device→host read of the single scalar whose
+///   producer/consumer relationship the check names (a position, a length, an
+///   argmax). The read is the cost; the comparison is free.
+///
+/// The invariant behind each check and the exact site it runs at are recorded on
+/// the check itself (`inv_*` in the `impl DevChain` block). A failure prints one
+/// `[inv-fail]` line naming the invariant, the expected and the seen value, and
+/// returns `Err` — so the first step that breaks an invariant is the step that
+/// reports it, not the later step whose output merely looks wrong.
+fn inv_check() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var("DSV41_INV_CHECK").map(|v| v != "0").unwrap_or(false))
 }
 
 // ---------------------------------------------------------------------------
@@ -2793,6 +2837,22 @@ impl<'a> DevChain<'a> {
     /// multi-row pass feeds `s.xn_r` / `s.qr_r`), so the elision never fired for
     /// this path and the flags' state is unchanged by using this instead.
     fn quant_rows(&self, src: *const f32, rows: usize, cols: i32) -> Result<()> {
+        // (#5) The fp8 staging's ROW PITCH is `cols` bytes on `s.xq_r` and
+        // `cols/32` f32 on `s.xsc_r`, and both are sized for `VERIFY_ROWS` rows of
+        // the WIDEST activation the verify quantises (`dim.max(nh*hd)`, see the
+        // `xq_r` field comment). A call past either bound writes past the buffer —
+        // and the projection that consumes it (`proj_mrows`) reads the SAME pitch,
+        // so a wrong `cols` is a silent misread, not a type error. Static: no
+        // device traffic, compiled out of a release build.
+        debug_assert!(
+            rows <= VERIFY_ROWS,
+            "quant_rows: {rows} rows exceed the {VERIFY_ROWS}-row fp8 staging"
+        );
+        let pitch = self.cfg.dim.max(self.cfg.n_heads * self.cfg.head_dim);
+        debug_assert!(
+            cols as usize <= pitch,
+            "quant_rows: cols {cols} exceeds the staging row pitch ({pitch} bytes)"
+        );
         self.dev.quant_fp8(
             src,
             self.s.xq_r.ptr as *mut u8,
@@ -3966,6 +4026,15 @@ impl<'a> DevChain<'a> {
                 "step_rows: {m} rows exceed the allocated verify block ({VERIFY_ROWS})"
             )));
         }
+        // (#6) The closing D2H below reads `m` i32s out of `argmax_r`; the buffer
+        // is `VERIFY_ROWS` of them. Constructive: the block SIZE is the contract
+        // between `m` and the buffer, and `m > VERIFY_ROWS` is already rejected
+        // above — this pins the byte count the D2H will touch. Static.
+        debug_assert!(
+            m * 4 <= self.s.argmax_r.bytes,
+            "step_rows: {m} argmax rows exceed the {}-byte argmax_r buffer",
+            self.s.argmax_r.bytes
+        );
         // The row positions. One D2H: the counter is device-resident (the argmax
         // advances it), and EVERY row's position has to be materialised somewhere
         // because the kernels that take a position take a POINTER. This runs
@@ -3980,6 +4049,10 @@ impl<'a> DevChain<'a> {
         let ids: Vec<i32> = toks.iter().map(|&t| t as i32).collect();
         self.ul_i32(self.s.ids_r.ptr, &ids)?;
         self.ul_i32(self.s.pos_rows.ptr, &pos_rows)?;
+        // (3) the row-position table's first entry is the block's row-0 position.
+        // Spot-checked right after the H2D, before anything reads it, so a table
+        // the kernels read as `pos_base + r` is confirmed at its head. ONE D2H 4 B.
+        self.inv_pos_rows_first(pos_base)?;
 
         if let Some(idx) = self.verify_graph_gate(m, pos_base) {
             if !self.verify_dry_done[idx] {
@@ -4080,7 +4153,7 @@ impl<'a> DevChain<'a> {
         let mut bytes = vec![0u8; m * 4];
         let b = Device::view(self.s.argmax_r.ptr, m * 4);
         self.dev.download_u8(&b, &mut bytes)?;
-        Ok((0..m)
+        let rows: Vec<u32> = (0..m)
             .map(|r| {
                 u32::from_le_bytes([
                     bytes[4 * r],
@@ -4089,7 +4162,13 @@ impl<'a> DevChain<'a> {
                     bytes[4 * r + 3],
                 ])
             })
-            .collect())
+            .collect();
+        // (8) every verify row's argmax is a real vocabulary index. Free: the m
+        // rows are already here (the closing D2H above), so this inspects exactly
+        // what the caller hands to the accept chain. A failure means the head
+        // wrote at the wrong pitch / the argmax read past its row.
+        self.inv_argmax_rows(&rows, pos_base)?;
+        Ok(rows)
     }
 
     /// Can THIS verify of THIS shape go through the graph right now?
@@ -5649,8 +5728,11 @@ impl<'a> DevChain<'a> {
             pos_ctr, pos,
             "dspark_spec_step: `pos` must be the device position counter's current value"
         );
+        // (2) the common entry of all three arms: the device counter the driver is
+        // about to step from must be the `p` it believes it is at. Reuses the D2H
+        // above, so it adds no device traffic (see `inv_pos_ctr`).
+        self.inv_pos_ctr(pos, pos_ctr)?;
 
-        // ---- 0. which block layout this round runs (`DSV41_SWALLOW_STEP`) ----
         // A chain that has not yet bootstrapped, or a process without the gate,
         // takes the legacy 5-row block below. With the gate on, the chain is
         // primed by the round that ran the legacy path (its `step_dev` is what
@@ -5823,6 +5905,11 @@ impl<'a> DevChain<'a> {
         }
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
+        // (1) the arms' common EXIT invariant: the round left `s.ids` holding the
+        // token the NEXT round embeds. Runs after the write-back + dump, and
+        // before `spec_primed` is touched, so a failure unwinds with the flag
+        // alone (the caller rolls the block back).
+        self.inv_ids(pos, &emitted)?;
 
         // The chain is now bootstrapped: with the swallowed arm's gate on, the
         // next round's 6-row block carries the anchor's forward; with the aligned
@@ -6042,6 +6129,9 @@ impl<'a> DevChain<'a> {
         }
 
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
+        // (1) the arms' common EXIT invariant: see the legacy arm. Idempotent
+        // write-back means this check is the same statement for both arms.
+        self.inv_ids(pos, &emitted)?;
 
         // The chain is now bootstrapped: with the swallow gate on, the next
         // round's 6-row block carries the anchor's forward. Set LAST, so a round
@@ -6264,6 +6354,11 @@ impl<'a> DevChain<'a> {
         // would report a layout difference as a numerical one. The anchor row's
         // parity is what `dspark_parity`'s row-level diff measures.
         self.dspark_dump_step("spec", pos, token, next, k_acc, &drafts, &verify_out);
+        // (1) the arms' common EXIT invariant: the round left `s.ids` holding the
+        // token the NEXT round embeds. THIS arm never READS `s.ids`, but the
+        // round after it may be the legacy bootstrap one — and that `step_dev`
+        // embeds it — so the check belongs here too.
+        self.inv_ids(pos, &emitted)?;
 
         Ok(DsparkSpecReport {
             next,
@@ -6378,6 +6473,11 @@ impl<'a> DevChain<'a> {
             self.compress_replay(pos_base as i32, keep)?;
         }
         self.set_pos_ctr(pos_base + keep)?;
+        // (4) at the END of the commit the host mirror and the device *clen must
+        // describe the SAME committed prefix: the rollback restored both from the
+        // same snapshot and the replay advanced both by the same rule. A drift is
+        // the split brain the `comp_len > 0` host branch would act on. ONE D2H 4 B.
+        self.inv_compress_len()?;
         Ok(())
     }
 
@@ -6474,6 +6574,154 @@ impl<'a> DevChain<'a> {
     fn set_pos_ctr(&self, pos: usize) -> Result<()> {
         self.ul_i32(self.s.pos_ctr.ptr, &[pos as i32])
     }
+
+    // =========================================================================
+    // Cross-step INVARIANT ASSERTIONS (`DSV41_INV_CHECK=1`, default OFF)
+    //
+    // Every method here is a no-op unless [`inv_check`] is on: with the gate off
+    // each is one branch, so the steady-state path pays nothing. With it on, a
+    // broken invariant prints ONE `[inv-fail]` line (invariant, expected, seen)
+    // and returns `Err` — the caller rolls its block back, so the step that
+    // BROKE the invariant is the step that reports it, not a later step whose
+    // output merely looks wrong.
+    //
+    // The checks are the eight root causes of the spec-chain hardening session,
+    // each pinned to the exact place its producer and consumer could disagree.
+    // Their costs are deliberately of two kinds only (see [`inv_check`]): a
+    // static (compile-time / `debug_assert`) shape check, or a single 4-byte
+    // device→host spot read.
+    // =========================================================================
+
+    /// The common failure report: one line naming the invariant, the position and
+    /// the values, and an `Err` that carries the same text.
+    fn inv_fail(&self, invariant: &str, pos: usize, detail: &str) -> FerriteError {
+        eprintln!("[inv-fail] pos {pos}: {invariant} — {detail}");
+        FerriteError::Config(format!(
+            "invariant violated at pos {pos}: {invariant} — {detail}"
+        ))
+    }
+
+    /// **(1)** `s.ids == emitted.last()` — the token the NEXT round's `step_body`
+    /// embeds is the last token this round emitted. `step_body` reads `s.ids`
+    /// (the `token` argument is only the engram fallback), and a round advances
+    /// `pos_ctr` by `emitted.len()`, so a missing/stale write-back makes the next
+    /// round embed a token `k_acc` positions behind (the digit task's
+    /// self-locking repetition). **Cost: one D2H, 4 B.**
+    ///
+    /// Runs at the END of all three arms, past the `sids_writeback()` write. NOTE
+    /// the write-back itself is a separate A/B gate; with it OFF the invariant is
+    /// deliberately not upheld, so `DSV41_INV_CHECK=1` must be paired with
+    /// `DSV41_SIDS_WRITEBACK=1` for this check to pass on a `k_acc >= 1` round —
+    /// and the report below says so, which is exactly the signal wanted.
+    fn inv_ids(&self, pos: usize, emitted: &[u32]) -> Result<()> {
+        if !inv_check() {
+            return Ok(());
+        }
+        let Some(&last) = emitted.last() else {
+            return Ok(());
+        };
+        let seen = self.dev.download_u32(self.s.ids.ptr as *const c_void)?;
+        if seen != last {
+            return Err(self.inv_fail(
+                "s.ids == emitted.last()",
+                pos,
+                &format!("s.ids = {seen}, emitted.last() = {last} (write-back missing or stale?)"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// **(2)** `pos_ctr == p` — the DEVICE position counter equals the `p` the
+    /// driver is stepping at. The driver strides by `emitted.len()`, so any drift
+    /// between the two makes every later step write the wrong ring slot. The
+    /// value is passed in because the caller already paid its D2H for the entry
+    /// `debug_assert`; this check therefore adds **no** device traffic.
+    fn inv_pos_ctr(&self, pos: usize, seen: usize) -> Result<()> {
+        if !inv_check() {
+            return Ok(());
+        }
+        if seen != pos {
+            return Err(self.inv_fail(
+                "pos_ctr == p (driver position)",
+                pos,
+                &format!("device pos_ctr = {seen}, driver p = {pos}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// **(3)** `pos_rows[r] == pos_base + r` — `step_rows` just uploaded the row
+    /// positions; row 0 must be `pos_base`. A mismatch means the verify's kernels
+    /// read a position table that does not describe the block. **Cost: one D2H,
+    /// 4 B** (row 0 only — the table is filled by one host-side
+    /// `(0..m).map(|r| pos_base + r)`, so a wrong row-0 value is the only failure
+    /// the construction can produce).
+    fn inv_pos_rows_first(&self, pos_base: i32) -> Result<()> {
+        if !inv_check() {
+            return Ok(());
+        }
+        let seen = self.dev.download_u32(self.s.pos_rows.ptr as *const c_void)? as i32;
+        if seen != pos_base {
+            return Err(self.inv_fail(
+                "pos_rows[0] == pos_base",
+                pos_base.max(0) as usize,
+                &format!("pos_rows[0] = {seen}, pos_base = {pos_base}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// **(4)** `compress_len[l] == *clen[l]` — the HOST mirror of the committed-
+    /// row count agrees with the DEVICE counter for the first compressor that
+    /// owns one. The mirror drives `attention_rows`' `comp_len > 0` branch and the
+    /// graph-capture steady-state guard, so a drift makes the next verify take a
+    /// path the device counter does not agree with. **Cost: one D2H, 4 B.**
+    ///
+    /// Runs at the END of [`Self::dspark_commit`]: after the rollback + replay
+    /// both counters must describe the same committed prefix.
+    fn inv_compress_len(&self) -> Result<()> {
+        if !inv_check() {
+            return Ok(());
+        }
+        let Some(&l) = self.compress_sources().first() else {
+            return Ok(());
+        };
+        let seen = self.dev.download_u32(
+            (self.s.clen.ptr as *const u8).wrapping_add(l * 4) as *const c_void,
+        )? as i32;
+        let want = self.layers[l].compress_len as i32;
+        if seen != want {
+            return Err(self.inv_fail(
+                "compress_len[l] == *clen[l]",
+                want.max(0) as usize,
+                &format!("layer {l}: host mirror = {want}, device *clen = {seen}"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// **(8)** every verify row's argmax is a REAL vocabulary index
+    /// (`idx < vocab`). A value outside the vocabulary means the head wrote a row
+    /// at the wrong pitch (the sliced/full arm disagreeing with the argmax) or the
+    /// argmax read past its row — and the accept chain would then judge drafts
+    /// against garbage. The `m` argmaxes are ALREADY on the host (`step_rows`'
+    /// closing D2H), so this is **free**: it inspects the rows the caller is about
+    /// to hand to the accept chain.
+    fn inv_argmax_rows(&self, rows: &[u32], pos_base: i32) -> Result<()> {
+        if !inv_check() {
+            return Ok(());
+        }
+        let vocab = self.cfg.vocab_size as u32;
+        if let Some((r, &a)) = rows.iter().enumerate().find(|(_, &a)| a >= vocab) {
+            return Err(self.inv_fail(
+                "argmax_r[r] < vocab_size",
+                pos_base.max(0) as usize,
+                &format!("verify row {r}: argmax = {a} >= vocab {vocab}"),
+            ));
+        }
+        Ok(())
+    }
+
 
     /// The m-row premix slots, mirroring [`Self::premix_slot`]'s convention: 0 is
     /// the incoming block (the constant `[1,0,0,0]` for a verify pass), 1 is this
@@ -6621,6 +6869,16 @@ impl<'a> DevChain<'a> {
         // so its rows are never committed and the extra launches would buy nothing.
         if self.spec_capture {
             if let Some(slot) = cfg.dspark_target_slot(layer) {
+                // (#7) The tap's row stride. The compile-time `assert!` at
+                // `VERIFY_ROWS` pins `VERIFY_ROWS == DSPARK_DRAFTS + 1`; this is
+                // the WRITE side of the same contract. The consumers
+                // (`DsparkDev::note_ctx_rows`, `Self::carry_kept_tap`) index row
+                // `r` at `slot * VERIFY_ROWS + r`; a block with more rows than
+                // that slot holds would spill into the NEXT slot. Static.
+                debug_assert!(
+                    m <= VERIFY_ROWS,
+                    "dspark tap_r: {m}-row block overruns the {VERIFY_ROWS}-row tap slot"
+                );
                 self.dev.hc_collapse(
                     self.s.h_r.ptr as *const f32,
                     self.s.dspark_pre_mean.as_f32(),
