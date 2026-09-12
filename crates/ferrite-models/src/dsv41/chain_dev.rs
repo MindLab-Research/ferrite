@@ -982,6 +982,44 @@ fn verify_rope_mrows() -> bool {
     })
 }
 
+/// INDEXER-MROWS (`DSV41_INDEXER_MROWS=1`, DEFAULT OFF): `attention_rows` pays
+/// the indexer's block-wide FRONT once for the whole block instead of once per
+/// row — `idx_wq_b`'s fp8 projection + rope and `idx_weights`' bf16 GEMV, four
+/// launches for `m` rows where the per-row form takes `4*m` (16 of the family's
+/// 20 front launches per layer).
+///
+/// WHY ONLY THE FRONT (this is the boundary the verify-family-fusion plan draws
+/// too optimistically — see the note on [`Self::indexer_rows_m`]): the SELECT
+/// half (publish + `indexer_topk`) is per-row BY CONSTRUCTION inside this loop.
+/// Row r's `*clen` must be row r's own (audit defect #1) and row r's window must
+/// be appended immediately before row r's `sparse_attn` (audit defect #2 — the
+/// window ring is exactly `window` slots wide, so row r+1's append destroys row
+/// r's oldest entry). A select that consumed the block's per-row `clen` snapshot
+/// would have to be issued after ALL of the block's commits, which drags it (and
+/// every reader of `idxs_r`) past those appends. The front has no such coupling:
+/// it is a pure function of `s.qr_r`, `s.xn_r` and `pos_rows`, all of which are
+/// final before the interleave starts.
+///
+/// Bit-identity: every fused launch is the documented m-row twin of the per-row
+/// program it replaces — `quant_rows`' row-indexed `(r, block)` map (exactly the
+/// pair `attention_rows` already uses for wq_b/wo_b), `gemm_fp8_mrows_kernel`'s
+/// per-row independent accumulator chain (the `C1-C6` argument on `proj_mrows`),
+/// `apply_rope_kernel`'s body with the same per-row position from `pos_rows`
+/// (the `DSV41_ROW_FOLD_ROPE` contract), and `gemv_bf16_nt_kernel<NT,WPR>`'s
+/// per-row independent accumulator (the `DSV41_GATE_MROWS` contract). Every
+/// decline (`swapab`, `cublas_m1`, an .so without a symbol, a shape outside the
+/// kernel's bound) falls back to the per-row front verbatim, so the arm is
+/// strictly additive. Read ONCE and cached — this branch runs 40x/step, inside
+/// graph capture.
+fn indexer_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_INDEXER_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// ROW-FOLD (DSV41_ROW_FOLD_GATE=1, or the plan-named alias DSV41_GATE_MROWS=1;
 /// both DEFAULT OFF): `moe_rows` runs the bf16 gate `gemv_bf16` once per
 /// activation row. `gemv_bf16` dispatches to `ferrite_gemv_bf16_v2(...,
@@ -8091,6 +8129,22 @@ impl<'a> DevChain<'a> {
         // (`sparse_attn_orope` already emitted that row's fp8).
         let vo = verify_orope() && m <= VERIFY_ROWS;
         let mut orope_rows = [false; VERIFY_ROWS];
+        // INDEXER-MROWS (`DSV41_INDEXER_MROWS=1`, DEFAULT OFF): the indexer's
+        // block-wide front — `idx_wq_b` + its rope and `idx_weights` — paid ONCE
+        // for the block instead of once per row. It is a pure function of
+        // `s.qr_r` / `s.xn_r` / `s.pos_rows`, all of which are final here, so
+        // hoisting it out of the interleave changes no reader's inputs: the only
+        // consumer of `idx_q_r` / `idx_w_r` is this row's select, which still runs
+        // at row r's own `*clen`, between row r's commit/publish and row r's
+        // window append + `sparse_attn`. `(false, false)` (gate off, a layer the
+        // front declines, an .so without the symbols) leaves BOTH halves of the
+        // per-row front in place, so the default path is unchanged by
+        // construction.
+        let idx_front = if indexer_mrows() && is_idx_src {
+            self.indexer_rows_m(layer, m)?
+        } else {
+            (false, false)
+        };
         for r in 0..m {
             // ---- 1) ring append + THIS row's causal window ----
             // (audit defect #2: the window half.) `window_idxs(r)` must run after
@@ -8148,7 +8202,7 @@ impl<'a> DevChain<'a> {
                 // order). Publishing per row instead of once per block is what
                 // keeps every group of the block addressable: the key of a group is
                 // written while `latent` still holds that group's pooled row.
-                self.indexer_rows_one(layer, r, win, comp_len, committed)?;
+                self.indexer_rows_one(layer, r, win, comp_len, committed, idx_front)?;
             } else if !owns_kv && comp_len > 0 {
                 // a non-index consumer reads the owner's selection, which the owner
                 // (an index source, running earlier in the stack) already wrote into
@@ -8528,6 +8582,135 @@ impl<'a> DevChain<'a> {
         Ok(true)
     }
 
+    /// The m-row entry of the indexer family (`DSV41_INDEXER_MROWS=1`, default
+    /// OFF): pays [`Self::indexer_front_rows`] ONCE for the block and hands the
+    /// two `*_done` flags to the per-row select ([`Self::indexer_rows_one`]) that
+    /// follows, so a fused half is never recomputed.
+    ///
+    /// WHY THE SELECT HALF IS NOT FUSED HERE. `dsv41_indexer_topk` really does
+    /// carry the m-row shape (`dim3 grid(m, b)`, `cl = lens[mm]` per row,
+    /// `dsv41_kernels.cu:2869/2874`), so the plan's "pure wiring" reading of the
+    /// grid is correct as far as it goes — but an m-row CALL from this loop site
+    /// is not expressible with the current launcher/ABI, for three reasons that
+    /// only show up once you leave `b = m = 1`:
+    ///
+    ///   1. **the scan bound.** The kernel takes `n_pos` and then OVERRIDES it
+    ///      with `*lens` (`:2854`), i.e. row 0's count. A per-row `lens[m]` with
+    ///      differing counts (verify's index-source layers commit one group per
+    ///      row, so `clen` ascends with `r`) therefore needs `n_pos` to be the
+    ///      MAXIMUM of the rows — otherwise rows 1..m-1 are silently clamped to
+    ///      row 0's count and lose their newest groups.
+    ///   2. **the output row stride.** The kernel writes `out[row * cols + i]`
+    ///      with `cols = min(topk, n_pos)` — a RUNTIME value — while `idxs_r`'s
+    ///      row pitch is the fixed `win + index_topk`. That mismatch is exactly
+    ///      why `indexer_rows_one` is called `b = m = 1` today (see its own note);
+    ///      a single m-row call needs the stride as an explicit argument.
+    ///   3. **causal order.** The per-row counts only exist after EVERY row of the
+    ///      block has committed, so a single call can only be issued after the
+    ///      block's appends — and this loop's appends are what destroy the window
+    ///      row `r`'s `sparse_attn` is about to read (audit defect #2: the window
+    ///      ring is exactly `window` slots). Fusing the select therefore moves
+    ///      `sparse_attn` too, which is the ATTENTION family's restructure (a
+    ///      device-written per-row `clen` snapshot + an explicit `idx_stride` +
+    ///      the `b*m` sparse-attn arm), not a wiring change in this one.
+    ///
+    /// So this entry fuses what is genuinely uncoupled — the front — and leaves
+    /// the select where its `*clen` is row `r`'s own.
+    fn indexer_rows_m(&mut self, layer: usize, m: usize) -> Result<(bool, bool)> {
+        self.indexer_front_rows(layer, m)
+    }
+
+    /// The indexer FRONT for a whole block: the m-row twin of the first three
+    /// launches of [`Self::indexer_rows_one`] — `idx_wq_b`'s fp8 projection
+    /// (`s.qr_r` → `s.idx_q_r`) plus its rope at `pos_rows[r]`, and `idx_weights`'
+    /// bf16 GEMV (`s.xn_r` → `s.idx_w_r`) — in four launches instead of `4*m`
+    /// (16 of the family's 20 front launches per layer).
+    ///
+    /// Returns `(q_done, w_done)`: `q_done` means `idx_q_r` rows `0..m` are
+    /// projected AND roped, `w_done` means `idx_w_r` rows `0..m` are filled. A
+    /// `false` half is NOT a failure — the caller passes the flags to
+    /// [`Self::indexer_rows_one`], which redoes exactly that half per row. Every
+    /// decline (a layer without the weights, `swapab`, `cublas_m1`, an .so
+    /// without a symbol, a shape outside a kernel's bound) degrades to the
+    /// per-row front verbatim, so the arm is strictly additive.
+    ///
+    /// The two halves are INDEPENDENT, so one may fuse while the other does not:
+    /// `gemv_bf16_v2_mrows` declines on its own when the per-row `lin_bf16` would
+    /// take v1 or cuBLAS (different accumulation orders, no parity to claim).
+    fn indexer_front_rows(&self, layer: usize, m: usize) -> Result<(bool, bool)> {
+        let cfg = self.cfg;
+        let dim = cfg.dim;
+        let ql = cfg.q_lora_rank;
+        let idx_nh = cfg.index_n_heads.max(1);
+        let idx_hd = cfg.index_head_dim.max(1);
+        let rd = cfg.rope_head_dim;
+        let half = (cfg.rope_head_dim / 2) as i32;
+        let ld = &self.w.layers[layer];
+        // The same presence gate `indexer_rows_one` applies: an indexer without
+        // `idx_wq_b` / `idx_weights` runs no row at all, so there is nothing to
+        // fuse and the per-row entry declines identically.
+        let (Some(idx_wq_b), Some(idx_wq_b_s), Some(wp)) = (
+            ld.idx_wq_b.as_ref(),
+            ld.idx_wq_b_scale.as_ref(),
+            ld.idx_weights.as_ref(),
+        ) else {
+            return Ok((false, false));
+        };
+        if m == 0 || m > VERIFY_ROWS {
+            return Ok((false, false));
+        }
+        // ---- q half: ONE `quant_rows` + `proj_mrows`, then ONE rope ----
+        // `quant_rows` writes `s.xq_r`/`s.xsc_r` at the `cols = ql` pitch that
+        // `proj_mrows` reads back — the pair `attention_rows` already uses for
+        // wq_b/wo_b, so each row's fp8 bytes are `quant1`'s and the GEMM is the
+        // mrows kernel's per-row identical chain. The rope is the same kernel
+        // `DSV41_ROW_FOLD_ROPE` uses, with the indexer's geometry (`rows =
+        // index_n_heads` head rows of `index_head_dim`, row pitch `idx_nh*idx_hd`,
+        // row r at `pos_rows[r]` — the `mul=1, off=r, step=0` the per-row call
+        // evaluates off the counter).
+        let mut q_done = false;
+        self.quant_rows(self.s.qr_r.ptr as *const f32, m, ql as i32)?;
+        if self.proj_mrows(
+            idx_wq_b.as_u8(),
+            idx_wq_b_s.as_u8(),
+            self.s.idx_q_r.ptr as *mut f32,
+            m,
+            (idx_nh * idx_hd) as i32,
+            ql as i32,
+            (idx_nh * idx_hd) as i32,
+        )? {
+            q_done = self.dev.apply_rope_mrows(
+                self.s.idx_q_r.ptr as *mut f32,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                m as i32,
+                idx_nh as i32,
+                (idx_nh * idx_hd) as i32,
+                idx_hd as i32,
+                rd as i32,
+                half,
+                self.s.pos_rows.ptr as *const std::os::raw::c_int,
+                false,
+            )?;
+        }
+        // ---- w half: ONE bf16 GEMV for all m rows ----
+        // `lin_bf16` takes `gemv_bf16_v2` for this shape (`index_n_heads` is far
+        // under `GEMV_V2_MAX_N`) and `gemv_bf16_v2_mrows` IS that program's m-row
+        // form (per-row independent accumulator, `tests_gate_mrows.cu`). The entry
+        // declines by itself when v2 is not what the per-row path would run;
+        // `cublas_m1` is the one branch it cannot see, so it is checked here.
+        let w_done = !cublas_m1()
+            && self.dev.gemv_bf16_v2_mrows(
+                wp.ptr() as *const c_void,
+                self.s.xn_r.ptr as *const f32,
+                self.s.idx_w_r.ptr as *mut f32,
+                m as i32,
+                idx_nh as i32,
+                dim as i32,
+            )?;
+        Ok((q_done, w_done))
+    }
+
     /// ONE ROW of the multi-row indexer: the per-row query/weights/top-k triple of
     /// [`Self::indexer`], plus — when `publish_key` — the index key of the group
     /// this row's compressor just committed.
@@ -8545,6 +8728,12 @@ impl<'a> DevChain<'a> {
     /// `window + index_topk` row stride `idxs_r` uses. It is therefore called with
     /// `m = 1` (`b = 1`), where the stride never matters; every offset is the row's
     /// base plus the caller's `offset`.
+    ///
+    /// `front = (q_done, w_done)` is [`Self::indexer_front_rows`]'s result for
+    /// this block (`DSV41_INDEXER_MROWS`): a half that the block-wide front
+    /// already produced is skipped here, because rows `0..m` of `idx_q_r` /
+    /// `idx_w_r` hold byte-for-byte what the per-row launches below would write.
+    /// `(false, false)` is the historical per-row behaviour verbatim.
     fn indexer_rows_one(
         &mut self,
         layer: usize,
@@ -8552,6 +8741,7 @@ impl<'a> DevChain<'a> {
         offset: usize,
         comp_len: usize,
         publish_key: bool,
+        front: (bool, bool),
     ) -> Result<bool> {
         let cfg = self.cfg;
         let dim = cfg.dim;
@@ -8606,36 +8796,47 @@ impl<'a> DevChain<'a> {
         // ---- this row's query, per-head weights and selection ----
         // The q_lora stream is already normed (attention_rows ran the plain
         // rmsnorm), so `idx_wq_b` uses the plain `lin`/`lin_bf16` pair.
-        let idxq = (self.s.idx_q_r.ptr as *mut f32).wrapping_add(r * idx_nh * idx_hd);
-        self.lin(
-            (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
-            ql as i32,
-            idx_wq_b,
-            idx_wq_b_s,
-            (idx_nh * idx_hd) as i32,
-            idxq,
-        )?;
-        self.dev.apply_rope(
-            idxq,
-            self.cos.as_f32(),
-            self.sin.as_f32(),
-            idx_nh as i32,
-            idx_hd as i32,
-            rd as i32,
-            half,
-            self.s.pos_ctr.ptr as *const std::os::raw::c_int,
-            1,
-            r as i32,
-            0,
-            false,
-        )?;
-        self.lin_bf16(
-            (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
-            dim as i32,
-            wp,
-            idx_nh as i32,
-            (self.s.idx_w_r.ptr as *mut f32).wrapping_add(r * idx_nh),
-        )?;
+        //
+        // INDEXER-MROWS: a half the block-wide front already produced is skipped
+        // — `indexer_front_rows` wrote rows `0..m` of `idx_q_r` (projected AND
+        // roped) and/or `idx_w_r`, and row `r` of those is exactly what the
+        // per-row launches below would write. The SELECT below (publish + topk) is
+        // deliberately NOT skipped: it must read row `r`'s own `*clen`.
+        let (q_done, w_done) = front;
+        if !q_done {
+            let idxq = (self.s.idx_q_r.ptr as *mut f32).wrapping_add(r * idx_nh * idx_hd);
+            self.lin(
+                (self.s.qr_r.ptr as *const f32).wrapping_add(r * ql),
+                ql as i32,
+                idx_wq_b,
+                idx_wq_b_s,
+                (idx_nh * idx_hd) as i32,
+                idxq,
+            )?;
+            self.dev.apply_rope(
+                idxq,
+                self.cos.as_f32(),
+                self.sin.as_f32(),
+                idx_nh as i32,
+                idx_hd as i32,
+                rd as i32,
+                half,
+                self.s.pos_ctr.ptr as *const std::os::raw::c_int,
+                1,
+                r as i32,
+                0,
+                false,
+            )?;
+        }
+        if !w_done {
+            self.lin_bf16(
+                (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim),
+                dim as i32,
+                wp,
+                idx_nh as i32,
+                (self.s.idx_w_r.ptr as *mut f32).wrapping_add(r * idx_nh),
+            )?;
+        }
         let scale = 1.0f32 / (idx_hd as f32).sqrt() / (idx_nh as f32).sqrt();
         let key_owner = self.kv_owner(layer);
         let idx_lens =

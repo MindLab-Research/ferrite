@@ -8711,7 +8711,7 @@ __global__ void hc_pre_persist_kernel(const float* __restrict__ x, const float* 
                                       const float* __restrict__ pre_collapse,
                                       float* __restrict__ out, float eps_norm, int ss_in,
                                       uint8_t* __restrict__ xq, float* __restrict__ xsc,
-                                      int hc_dim, int mix) {
+                                      int hc_dim, int mix, int truncate) {
     const int r = blockIdx.x;
     extern __shared__ float hc_sm[];
     float* s_x = hc_sm;                 // hc_dim floats: the staged activation row
@@ -8846,6 +8846,8 @@ __global__ void hc_pre_persist_kernel(const float* __restrict__ x, const float* 
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
                 acc = fmaf(pre_collapse[(size_t)r * hc + i], xr[(size_t)i * dim + c], acc);
+            // same round trip as dsv41_hc_collapse_norm_kernel (DSV41_BF16_TRUNCATE)
+            if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
             o_r[c] = acc;
             s2 += acc * acc;
         }
@@ -9359,7 +9361,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
                               const float* hc_base, const float* w_norm, const float* pre_collapse,
                               float* pre, float* post, float* comb, float* out, int rows, int hc,
                               int dim, int sinkhorn_iters, float eps, float eps_norm,
-                              uint8_t* xq, float* xsc, cudaStream_t s) {
+                              uint8_t* xq, float* xsc, int truncate, cudaStream_t s) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
@@ -9404,7 +9406,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
         hc_front_kernel<<<dim3((unsigned)(mix + 1), (unsigned)rows), 1024u, smem, s>>>(
             x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps,
             mix * 32, w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, rows, hc_dim,
-            mix);
+            mix, truncate);
         return (int)cudaGetLastError();
     }
     // ---- the two-launch path (kept for A/B) ----
@@ -9431,7 +9433,7 @@ extern "C" int dsv41_hc_front(const float* x, const float* hc_fn, const float* h
     if (e != cudaSuccess) return (int)e;
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), s>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, w_norm,
-        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_FULL);
+        pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_FULL, truncate);
     return (int)cudaGetLastError();
 }
 
@@ -9514,7 +9516,8 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
                                     const float* pre_collapse, float* pre, float* post,
                                     float* comb, float* out, int rows, int hc, int dim,
                                     int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
-                                    float* xsc, cudaStream_t s, cudaStream_t side,
+                                    float* xsc, int truncate,
+                                    cudaStream_t s, cudaStream_t side,
                                     cudaEvent_t in_ev, cudaEvent_t fork_ev,
                                     cudaEvent_t early_ev, cudaEvent_t join_ev,
                                     cudaStream_t side_dl) {
@@ -9593,7 +9596,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     // 1024-thread block as dsv41_hc_front's EARLY ⇒ bit-identical bytes.
     hc_mixes_tail_kernel<<<(unsigned)rows, 1024, (64 + 64) * sizeof(float), side>>>(
         x, hc_scale, hc_base, nullptr, nullptr, nullptr, hc, dim, sinkhorn_iters, eps, mix * 32,
-        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY);
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, HC_TAIL_EARLY, truncate);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     // (2) EARLY-done edge, side -> main: record `fork_ev` on `side` right after
@@ -9690,7 +9693,7 @@ extern "C" int dsv41_hc_front_split(const float* x, const float* hc_fn, const fl
     const unsigned late_t = (g_hc_ss ? (unsigned)g_hc_late_t : 1024u);
     hc_mixes_tail_kernel<<<(unsigned)rows, late_t, (64 + 64) * sizeof(float), dl>>>(
         x, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32, nullptr,
-        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE);
+        nullptr, nullptr, eps_norm, g_hc_ss ? 1 : 0, nullptr, nullptr, HC_TAIL_LATE, truncate);
     e = cudaGetLastError();
     if (e != cudaSuccess) return (int)e;
     }   // end of the `if (!dl_merged)` two-launch fallback / A/B arm
@@ -9728,7 +9731,7 @@ extern "C" int dsv41_hc_front_persist(const float* x, const float* hc_fn, const 
                                       const float* pre_collapse, float* pre, float* post,
                                       float* comb, float* out, int rows, int hc, int dim,
                                       int sinkhorn_iters, float eps, float eps_norm, uint8_t* xq,
-                                      float* xsc, cudaStream_t s) {
+                                      float* xsc, int truncate, cudaStream_t s) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
@@ -9752,7 +9755,7 @@ extern "C" int dsv41_hc_front_persist(const float* x, const float* hc_fn, const 
     }
     hc_pre_persist_kernel<<<(unsigned)rows, 1024u, smem, s>>>(
         x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, mix * 32,
-        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, hc_dim, mix);
+        w_norm, pre_collapse, out, eps_norm, g_hc_ss ? 1 : 0, xq, xsc, hc_dim, mix, truncate);
     return (int)cudaGetLastError();
 }
 
@@ -9817,7 +9820,7 @@ __global__ void hc_pre_persist_mb_kernel(const float* __restrict__ x,
                                          const float* __restrict__ pre_collapse,
                                          float* __restrict__ out, float eps_norm,
                                          uint8_t* __restrict__ xq, float* __restrict__ xsc,
-                                         int hc_dim, int mix, int split) {
+                                         int hc_dim, int mix, int split, int truncate) {
     const int r = blockIdx.y;
     const int bid = blockIdx.x;
     const int ndot = mix * split;
@@ -9895,6 +9898,8 @@ __global__ void hc_pre_persist_mb_kernel(const float* __restrict__ x,
             float acc = 0.f;
             for (int i = 0; i < hc; ++i)
                 acc = fmaf(pre_collapse[(size_t)r * hc + i], xrow[(size_t)i * dim + c], acc);
+            // same round trip as dsv41_hc_collapse_norm_kernel (DSV41_BF16_TRUNCATE)
+            if (truncate) acc = __bfloat162float(__float2bfloat16(acc));
             o_r[c] = acc;
             s2 += acc * acc;
         }
@@ -10010,7 +10015,7 @@ extern "C" int dsv41_hc_front_persist_mb(const float* x, const float* hc_fn,
                                          float* pre, float* post, float* comb, float* out,
                                          int rows, int hc, int dim, int sinkhorn_iters,
                                          float eps, float eps_norm, uint8_t* xq, float* xsc,
-                                         cudaStream_t s) {
+                                         int truncate, cudaStream_t s) {
     if (x == nullptr || hc_fn == nullptr || hc_scale == nullptr || hc_base == nullptr ||
         pre == nullptr || post == nullptr || comb == nullptr)
         return (int)cudaErrorInvalidValue;
@@ -10045,6 +10050,6 @@ extern "C" int dsv41_hc_front_persist_mb(const float* x, const float* hc_fn,
     dim3 grid((unsigned)(mix * split + 1), (unsigned)rows);
     hc_pre_persist_mb_kernel<<<grid, 1024u, smem, s>>>(
         x, hc_fn, hc_scale, hc_base, pre, post, comb, hc, dim, sinkhorn_iters, eps, w_norm,
-        pre_collapse, out, eps_norm, xq, xsc, hc_dim, mix, split);
+        pre_collapse, out, eps_norm, xq, xsc, hc_dim, mix, split, truncate);
     return (int)cudaGetLastError();
 }
