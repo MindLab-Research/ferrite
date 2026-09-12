@@ -774,3 +774,15 @@ ferrite 是**顺序加**（k=0..n-1 逐个加），PyTorch 的 sum 可能是 tre
 **norm 本身很大（l=39 ≈ 2M）**——**偏差可能来自数值精度（f32 vs bf16）的合法差异**，而非 bug。
 
 **关键判定**：backbone 的数值路径**基本对齐**（首 token argmax 一致、逐层 norm 在 3% 以内）。acs/ibu 可能是**累积精度差**（44 层 × 130 token 的 2-3% 漂移在近 tie argmax 处翻转）——**不是 kernel bug**，是 f32 全程 vs 官方 bf16 的系统性精度差。
+
+## 关键洞察修正：lazy 没有额外 bug——它只是比 batched 走得更远
+
+**对比分析**：
+| 配置 | max_tokens | LEN | 停止原因 | 拉丁碎片位置 |
+|---|---|---|---|---|
+| batched 1000tok (0960e86e) | 1000 | **142** | EOS（提前停） | acs@~130, ibu@~142 |
+| lazy 1000tok (6f11e5b8) | 1000 | **201** | max_tokens | acs@~130, Bristol@~150, burdens@~155, oqua@~180 |
+
+**Bristol/burdens/oqua 全部出现在位置 >142**——batched 在 142 就停了（EOS），**永远到不了这些位置**。lazy 接受更多 token（k_acc 直方图更宽）→ 走得更远 → **暴露了更多 backbone 偏差**。
+
+**结论**：lazy verify 没有"额外退化"——它和 batched 共享同一个 backbone 偏差（acs/ibu 族），只是 lazy 的更高 accept 率让它生成到更远的位置，暴露了更多偏差。**修复目标是 backbone 对齐（bf16 截断），不是 lazy 特有的 bug**。
