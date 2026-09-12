@@ -1348,3 +1348,14 @@ dspark.rs 的 `dspark_attention()` 修正 3 处 RoPE 相位（query/kv/逆旋转
 - accept 会是基线 ~1.022（不含 P0-3+P1-5 的提升）
 
 **最终 400 组合测试**（性能 + accept）需要加：DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1（最佳 accept 1.214）。
+
+## 用户校准更新（accept 2-3，上限 ~3）
+
+用户明确："acc rate 应该 2-3 左右（如果生成五个 token）（上限估计差不多这么多）"
+
+**400 的最终数学**（用户校准后）：
+- accept 2 → 3 tok/step → 步时 ≤7.5ms 才达 400（很难）
+- accept 3（上限）→ 4 tok/step → 步时 ≤10ms 达 400 ✓
+- 当前 accept 1.214 → 2.214 tok/step → 步时 ≤5.5ms 才达 400（不可能）
+
+**结论**：400 需要 accept 接近上限（~3）且步时 ≤10ms。两个都是必要条件。
