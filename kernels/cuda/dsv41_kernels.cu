@@ -4950,9 +4950,35 @@ extern "C" int dsv41_gemm_fp8_mrows(const uint8_t* a, const float* a_scale,
     if (smem > 48 * 1024) {
         // Per-kernel ceiling, not this call's need: a sticky attribute set to a
         // smaller value would silently cap later launches (round-43 revert).
-        cudaError_t e = cudaFuncSetAttribute(gemm_fp8_mrows_kernel<1>,
-                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                             dsv41_smem_ceiling(gemm_fp8_mrows_kernel<1>));
+        // ⚠️ EVERY M specialisation needs its own attribute: the launch below
+        // picks `gemm_fp8_mrows_kernel<m>`, and setting only <1> left <m> at the
+        // 48KB default → cudaErrorInvalidValue at m=5 (the verify block's exact
+        // case, observed on serve as "dsv41_gemm_fp8_mrows: cuda error 1").
+        cudaError_t e = cudaSuccess;
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<1>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<2>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<3>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<4>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<5>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<6>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<7>));
+        e |= cudaFuncSetAttribute(
+            gemm_fp8_mrows_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            dsv41_smem_ceiling(gemm_fp8_mrows_kernel<8>));
         if (e != cudaSuccess) { (void)cudaGetLastError(); return (int)e; }
     }
     const dim3 grid(blocks);
