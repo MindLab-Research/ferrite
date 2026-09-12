@@ -976,3 +976,18 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 1. draft 的 attention bf16 截断（sparse_attn 的 q/k/v 输出截断）——工作量中等
 2. draft 的 rope 输出截断——工作量小
 3. 或者反向：**比较 ferrite draft 的预测与官方 MTP head 的预测**（用 DSV41_DIFF_EAGER 式探针）——精确定位 draft 的哪一层开始偏
+
+## Lazy + 双截断组合测试（a54bd0cc）
+
+**结果**：
+- **零拉丁字符 ✓**（lazy verify 下也保持）
+- **k_acc {0:20, 1:17, 2:2, 3:3, 4:3, 5:1}——43% k_acc=0**（vs batched+截断的 73%，vs lazy 无截断的 64%）——**accept 显著改善**！
+- 步时 33.10ms（30.2 tok/s）——**比无截断 lazy 的 22.56ms 慢 10.5ms**（需分析：截断计算开销 or 路径变化）
+- LEN=120，双字=4
+
+**k_acc 改善的机制**：lazy 的逐步检查让 draft 更早获得正确反馈（拒绝后下一步从正确位置重新开始）。tap 截断 + backbone 截断的对齐效应在 lazy 下更显著。
+
+**步时退化嫌疑**：
+1. bf16 截断的计算开销（round-trip 指令 × 40 层 × 2 侧）——应该很小（2 条指令）
+2. verify 图与截断的交互（图捕获可能失败，回退裸链）
+3. SH_EXP_MROWS + 截断的路径冲突
