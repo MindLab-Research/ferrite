@@ -4231,3 +4231,26 @@ self.dev.gemm_fp8_mx_rope_norm(
 - 修复后的测试应该看 line-62 的"重置"是否消失（line-6 的双字可能是模型固有）
 
 **下一步**：等 S1/S3 修复完成 → base + 修复 → 验证 line-62 的重置是否消失
+
+## 修复后的验证计划（S1/S3 修复完成后的测试序列）
+
+**修复内容**（s1s2s3-fix-implementation 实施中）：
+- S1：DIRECT 臂的 compress_len 双重计数修复（与 DRY 臂对齐——只推一次）
+- S3：lazy⇄batched 换臂锁定（gate：DSV41_LAZY_ROUTE_LOCK——首臂锁定后不切换）
+
+**验证序列**（每步计数数字 + 出师表零拉丁）：
+| # | 测试 | 目的 | 预期 |
+|---|---|---|---|
+| 1 | base + 修复（lazy+graph+SH_PAIR+Wave1+S1/S3 fix）| line-62 "重置"是否消失 | **干净**（如果 S1/S3 是根因）|
+| 2 | 如果 1 干净：K1+K2 + 修复 | R2 替代的正确性 | 干净 + 性能提升 |
+| 3 | 如果 2 干净：+ wo_a/FORK/MARKOV/LAZY_SDR | 干净栈重建 | 逐步验证 |
+| 4 | 出师表 1000 tok 完整验证 | 红线 | 零拉丁 |
+
+**如果 1 仍损坏（line-62 重置）**：
+- S3 的修复不够（换臂锁定可能没生效或有其他切换路径）
+- 或 S2（verify_recording 的强发 publish）也在贡献——需要 S2 修复
+- 或 indexer_topk 的烧入 n_pos（verify-graph-replay-position 的发现）——需要修复
+
+**legacy 臂的 line-6 双字**（独立问题）：
+- 如果是模型行为 → 无法通过修复消除（测试判据要调整）
+- 如果是 legacy 臂的 bug → legacy-doubling-bughunt 的判决会指出
