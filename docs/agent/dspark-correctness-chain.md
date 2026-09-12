@@ -1648,3 +1648,17 @@ s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-iden
 **修正模型**：如果链式（第一个不对就全崩），mean-k = p/(1-p) × (1-p⁶)。p=0.56 → mean-k = 1.27（接近实测 1.067-1.214！）✓
 
 **结论**：我们的 accept 是**链式失败模式**（第一个 draft 错 → 后面全错）。提升 p 到 0.7+ 才能脱离链式陷阱。P0-3+P1-5 的 1.214 ≈ p=0.55 的链式模型。
+
+## 🔍 新发现：draft_head_fold 默认 ON 用 v2 kernel（accept 的隐藏杠杆）
+
+**代码**（dspark_dev.rs:3022）：
+```rust
+let head_rows = draft_head_fold()  // 默认 ON！
+    && self.dev.head_gemv_bf16_mrows(...)  // v2 fold kernel
+```
+
+**问题**：verify head 的 v2 fold 被禁（"NUMERICAL change"——gemv_bf16_v2_wanted 需 n<2048，head 的 n 是词表）。**draft head 的 v2 fold 是同一个机制**——draft 的 token 预测可能因 v2 的 K-split 而偏离官方的 v1 逐行计算。
+
+**杠杆**：`DSV41_DRAFT_HEAD_FOLD=0`（draft head 回 v1 per-row）——draft 预测可能更准 → accept 提升。
+
+**待测**：S2 矩阵加一臂（DRAFT_HEAD_FOLD=0）或单独 A/B。
