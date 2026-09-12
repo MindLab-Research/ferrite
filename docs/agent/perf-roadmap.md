@@ -194,6 +194,9 @@ ptxas 实测闭环，数值自测仍待 GPU）：
   与裸 `.block_scale` 两种拼写都过。**踩坑**：该 nvcc 的 `--list-gpu-arch` 没有 sm_103a 条目，
   `-arch=sm_103a` 会被静默降成 `sm_103`（tcgen05 全线报 "not supported on .target 'sm_103'"），
   必须写 `-gencode arch=compute_103a,code=sm_103a`。
+  **数值自测（2026-09-12 更新）**：该文件已扩展为真实量化 parity 套件（Phase 0），
+  4 种构建全过、codec 暴力最近码自检全过、host-only 模式可本地复现全部数值预测；
+  GPU 闭环待跑，逐项见 `docs/agent/expert-tcgen05-plan.md` §1b。
 - **要带 scale 就必须用 `mxf8f6f4`，不是裸 `f8f6f4`**：裸 `kind::f8f6f4` 的操作数是
   `{%4,%5,%6,%7}`（disable_output_lane 掩码），**没有 block-scale 描述符**；per-32 e8m0
   scale 只能走 `kind::mxf8f6f4.block_scale.scale_vec::1X`（`mxf8f6f4` **只有 1X**，没有 2X/4X）。

@@ -557,6 +557,68 @@ inline CaseCore build_case(const CaseCfg& cfg) {
     return c;
 }
 
+// ------------------------------------------------------------- codec selfcheck
+// The whole suite is only as good as these two encoders, and an encoder bug is
+// invisible from the GPU side (the golden decodes the same bytes the hardware
+// gets). So they are checked by brute force against the nearest representable
+// code every run. This is not paranoia: the first version of e4m3_encode clamped
+// the exponent field at `efield >= 15`, which mapped the entire [256,448] decade
+// onto 448 (max excess 192) and silently inflated the quantization loss 2x.
+inline int codec_selfcheck(bool verbose) {
+    int bad = 0;
+    // e2m1: nearest of the 16 codes
+    {
+        double worst = 0;
+        Rng r(4242u);
+        for (int i = 0; i < 200000; ++i) {
+            const float x = r.normal() * (float)std::ldexp(1.0, (int)(r.next() % 8) - 3);
+            const uint8_t mine = e2m1_encode(x);
+            const double dmine = std::fabs((double)kE2M1[mine] - (double)x);
+            double best = 1e300;
+            for (int c = 0; c < 16; ++c) best = std::fmin(best, std::fabs((double)kE2M1[c] - (double)x));
+            worst = std::fmax(worst, dmine - best);
+        }
+        if (verbose) printf("   codec e2m1_encode: max excess over the nearest code = %.3e\n", worst);
+        if (!(worst < 1e-6)) { printf("   [FAIL] e2m1_encode is not nearest\n"); ++bad; }
+    }
+    // e4m3: nearest of the 254 finite codes, log-uniform over the representable
+    // range [2^-9, 448] plus the saturation region above it.
+    {
+        double worst = 0, worst_abs = 0;
+        Rng r(7u);
+        for (int i = 0; i < 200000; ++i) {
+            const double mag = std::ldexp(1.0, (int)(r.next() % 19) - 9) * (0.5 + (double)r.uniform());
+            const float x = (float)((r.next() & 1) ? mag : -mag);
+            const uint8_t mine = e4m3_encode(x);
+            const double dmine = std::fabs(e4m3_to_d(mine) - (double)x);
+            double best = 1e300;
+            for (int c = 0; c < 256; ++c) {
+                if (c == 0x7F || c == 0xFF) continue;  // NaN
+                best = std::fmin(best, std::fabs(e4m3_to_d((uint8_t)c) - (double)x));
+            }
+            worst = std::fmax(worst, dmine - best);
+            worst_abs = std::fmax(worst_abs, dmine);
+        }
+        if (verbose)
+            printf("   codec e4m3_encode: max excess over the nearest code = %.3e (max |err| %.3g)\n",
+                   worst, worst_abs);
+        if (!(worst < 1e-9)) { printf("   [FAIL] e4m3_encode is not nearest\n"); ++bad; }
+    }
+    // e8m0 round trip: the byte the hardware reads must decode to the exact float
+    // scale the codes were produced with (the entire parity argument rests on it).
+    {
+        int e_bad = 0;
+        for (int e = -126; e <= 127; ++e) {
+            const float s = std::ldexp(1.f, e);
+            if (scale_to_ue8m0(s) != (uint8_t)(e + 127) || ue8m0_to_scale((uint8_t)(e + 127)) != (double)s)
+                ++e_bad;
+        }
+        if (verbose) printf("   codec e8m0 round trip over [-126,127]: %s\n", e_bad ? "BROKEN" : "OK");
+        if (e_bad) { printf("   [FAIL] e8m0 round trip\n"); ++bad; }
+    }
+    return bad;
+}
+
 // --------------------------------------------------------------- host analysis
 // The local half of Phase 0: no GPU, no CUDA. It reports (1) the quantization
 // loss (a) vs (b) — the number that decides whether e2m1 weights + e4m3
@@ -838,7 +900,14 @@ int main() {
 // the Phase 0 numerical analysis with the same codecs/data/goldens the GPU
 // suite uses, including the real K=5120 shape the GPU kernel cannot stage.
 // ---------------------------------------------------------------------------
-int main() { return ph0::host_analysis(); }
+int main() {
+    printf("== PHASE 0 codec selfcheck (host build, no CUDA) ==\n");
+    if (ph0::codec_selfcheck(true)) {
+        printf("[FAIL] codec selfcheck — fix the codecs before trusting any number below\n");
+        return 1;
+    }
+    return ph0::host_analysis();
+}
 #else  // !PH0_HOST_ONLY  (the CUDA build: probe + Phase 0 parity)
 // =============================================================================
 namespace {
@@ -1483,6 +1552,8 @@ int main() {
     printf("   quantization (per-32 e8m0), B = e4m3 activations (per-32 e8m0)\n");
     printf("   criterion: max rel err < 5e-2 vs the dequantized CPU golden + argmax equal\n");
     int fails = 0;
+    printf("\n== codec selfcheck (the suite's own foundation) ==\n");
+    fails += ph0::codec_selfcheck(true);
     fails += ph0_raw_probe_main();  // case 0: random-code layout probe (exact arithmetic)
     fails += ph0_parity_suite();
     printf("\n[PHASE 0] %s\n", fails ? "FAILED — do NOT start Phase 1" : "ALL GREEN");

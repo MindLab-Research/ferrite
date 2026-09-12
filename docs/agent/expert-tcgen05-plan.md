@@ -37,6 +37,47 @@ M 侧 3840/5120 整除 128（满 tile），N 侧 decode=1 token → 补到 **N=8
 4. **验收**：GPU 上 `nvcc -gencode arch=compute_103a,code=sm_103a && ./t` 全绿。
    **若 parity 不过，不进入 Phase 1**（布局/scale 映射的 bug 必须在此拦下）。
 
+## 1b. Phase 0 实施状态（2026-09-12 代码已落地；GPU 待跑）
+
+`kernels/cuda/tests_tcgen05_mxf8f6f4_1x.cu` 已由"随机码布局探针"扩展为**真实量化 parity 套件**
+（1565 行，原探针完整保留，可 `-DPROBE_RAW_LAYOUT=1` 单独跑）：
+
+- **默认 `main`** = codec 自检 → 随机码布局探针（case 0，精确算术）→ 4 个真实量化 case
+  （K=32/128/256/256；N(0,1)/outlier/lognormal 组合）。每个 case 跑**两种 SF 布局假设**：
+  `PACKED`（4 块/字 `[SF(b0..b3)]`、sf_id=b%4、字列按 32 行组步进 —— 即 `dsv41_experts_mxf4.cu`
+  已数值验证的 2X 字布局搬到 1X）与 `PERBLK`（1 块/字、byte 0、sf_id=0，逐块等价于已验证的单块探针）。
+  nblk=1 时两者按构造逐位相同（套件只跑一次并说明）。⇒ **自带判决**：PACKED 挂而 PERBLK 过
+  ⇒ SF 字节选择模型错，不是 MMA / smem descriptor / TMEM 映射错。
+- **四方参照**：(a) 反量化 CPU golden（double）＝判据对象；(b) 未量化 f32 ＝量化损失（信息项）；
+  (c) GPU f32 SIMT 反量化 GEMV ＝现 expert 路径的算术形状（`expert_gemv_fp4` 读打包 fp4 激活，
+  不能直接调用，故镜像其算术）；(d) f32 `fmaf` 逐块累加 ＝预测 tcgen05-vs-golden 的量级。
+- **判据**：max rel err < 5e-2（含 p50/p90/p99）、norm 口径（max/max、l2、l1）、
+  argmax（M 向 / N 向）、min top1-top2 margin 与 diff/margin 比。
+- **本地已闭环（无 GPU）**：4 种构建全过（`-gencode arch=compute_103a,code=sm_103a` /
+  `-DPROBE_ASM_ONLY=1` / `-DPROBE_RAW_LAYOUT=1` / `g++ -DPH0_HOST_ONLY`）；`ptxas -v`：
+  `ph0_parity_kernel` 77 regs / 34828 B smem / **0 spill**，PTX 内 5 条
+  `tcgen05.mma.cta_group::1.kind::mxf8f6f4.block_scale.scale_vec::1X`。host-only 模式可本地复现全部数值：
+  - **codec 自检（暴力最近码，每次运行都跑）**：e2m1 超出 0、e4m3 超出 0、e8m0 往返 OK。
+    **已抓到并修掉一个真 bug**：e4m3 编码器原先把 `efield >= 15` 当溢出钳位 ⇒ 整个 [256,448]
+    十倍程被压到 448（超出最近码 192），量化损失被虚高约 2 倍。**这类 bug 从 GPU 侧不可见**
+    （golden 用的是同一份字节），所以自检必须留在套件里。
+  - **(d) 预测**：K≤256 时 f32 累加与 double golden **逐位相同**（e2m1×e4m3 积有限位精确，
+    32 项部分和 < 24 bit）；K=5120 时 max rel 2.5e-05 / l2 3.2e-08 ⇒ GPU 上
+    "tcgen05 vs golden" 应报 ~1e-6..1e-5，判据 5e-2 有两个量级余量。
+  - **(a) 量化损失（信息项，不是判据）**：合成 N(0,1) 权重按 checkpoint 口径
+    （per-32 amax → `2^ceil(log2(amax/6))`，与生产 `fast_round_scale6` 同源）量化后
+    **l1 rel ≈ 0.11-0.16、l2 ≈ 0.11-0.15**；逐元素 p50≈0.12、max 极大 —— 后者是随机点积
+    近零输出的除零效应，**判据必须只看 norm 列**，否则会误判。格式本身会翻掉 1-2/8 的
+    列 argmax（128 行的 top1-top2 margin 相对行范数只有 1e-3 量级）——真实模型不比这更宽松，
+    这也是 §5 止损线要盯 argmax margin 的原因。
+- **残留（不影响下一会话首次 GPU 验收）**：
+  1. 输入仍是合成 f32（按 checkpoint 尺度规则量化），**未接真实 checkpoint 字节**；
+     接法：把 `ph0::build_case` 的 W/A 换成读盘字节（fp4 + e8m0 布局）即可，其余全复用；
+  2. smem 单级 staging 上限 `PH0_MAXBLK=8`（K=256）；真实 K=5120/1920 需 chunked staging 或
+     动态 smem + `cudaFuncSetAttribute`（**图捕获内禁用**），属 Phase 1；
+  3. `PERBLK` 需 4 TMEM 列/块 ⇒ 真实 K（160 块 = 640 列 > 512）装不下，只能用于消歧，不能上生产；
+  4. N=8 的 8 行都填独立随机激活（比"1 token + 7 行零"覆盖更强；行间独立，真实零填充同代码路径）。
+
 ## 2. Phase 1（1-2 天）gateup kernel
 
 落点：`kernels/cuda/dsv41_experts_mxf4.cu` 新增 `mxf8f6f4_swapab_gemm_kernel`（保留旧 kernel）。

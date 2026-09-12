@@ -389,8 +389,11 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 
 // Ring geometry for gemm_fp8_swapab_kernel.
 //   kSwapabKStep: k width of one stage. A multiple of 32 (one scale block == the
-//                 MMA's K) and of 16 (the cp.async granule).
-//   kSwapabNStage: ring depth.
+//                 MMA's K) and of 16 (the cp.async granule). 64 (with
+//                 kSwapabNStage 16) is the v20 ring fix -- see the KSTEP/NSTAGE
+//                 note at the macros.
+//   kSwapabNStage: ring depth. Must exceed ceil(kc / kSwapabKStep), else the
+//                 ring cannot hold the slice and the cold-read latency shows.
 //   kSwapabRow: bytes per staged row. PADDED by 16: with an unpadded stride every
 //                 one of the 8 gid rows of the A fragment lands on banks 0..3
 //                 (stride/4 % 32 == 0) and each LDS.32 is an 8-way conflict; +16B
@@ -436,11 +439,31 @@ __global__ void gemm_fp8_kernel(const uint8_t* __restrict__ a, const float* __re
 // 0 by the elected block after its last slot read, so a captured graph replays
 // clean -- the discipline g_hc_ticket / g_hc_mb_done use (see dsv41_glue.cu).
 // It must simply START at zero (cudaMalloc does not zero).
+// ⚠ KSTEP/NSTAGE ARE A PAIR, NOT TWO KNOBS. The ring only hides a cold-read
+// latency when it can hold the WHOLE partition slice: the prologue prefetches
+// NSTAGE-1 stages up front, so the invariant that makes the ring "full" is
+//
+//     nk = ceil(kc / KSTEP) >= NSTAGE - 1,   kc = k / ks
+//
+// v19 (ks=8 => kc=640, KStep=128) gave nk = 5 < NSTAGE-1 = 7: the prologue
+// prefetched 7 stages of which only 5 were real, every warp carried the cold
+// miss across 1/8 of the data (8 partitions x 5 stages), the epilogue fired 8x
+// per tile, and swapAB measured NEUTRAL vs SIMT (~0.99x) instead of the 1.8x
+// the isolated sweep had shown (the sweep kept the weights L2-hot; serve does
+// not). KStep=64 halves the stage, so the same kc=640 yields nk = 10: all 10
+// real stages are in flight before the first consume. The ring is then deeper
+// than any slice needs (NSTAGE-1 = 15 > 10), which is harmless -- the excess
+// stages are the empty-cadence stages the wait discipline already requires
+// (see stage()) -- and is the point: depth >= nk + 1 covers the whole slice.
+// Do NOT "tidy" KStep back to 128 or NSTAGE down to 8 without redoing this
+// arithmetic for the (k, ks) the launcher actually picks (k=5120, ks=8).
+// smem for WARPS=1: 1*16*16*(64+16) = 20480B ring + 128B barriers + kc + scales
+// = 21308B, under the 48KB default ceiling.
 #ifndef DSV41_SWAPAB_KSTEP
-#define DSV41_SWAPAB_KSTEP 128
+#define DSV41_SWAPAB_KSTEP 64
 #endif
 #ifndef DSV41_SWAPAB_NSTAGE
-#define DSV41_SWAPAB_NSTAGE 8
+#define DSV41_SWAPAB_NSTAGE 16
 #endif
 #ifndef DSV41_SWAPAB_WARPS
 #define DSV41_SWAPAB_WARPS 1
