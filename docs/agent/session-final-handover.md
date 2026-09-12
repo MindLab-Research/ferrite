@@ -204,3 +204,35 @@ lazy 数学上限 ~145（k_emit × c_row）。400 需要：
 2. 检查 mrows Phase A 的实施状态（本轮 mrows-batched-impl-p1 正在实施）
 3. 起一臂 SWALLOW + mrows 测试 → mrows 的增量
 4. 5 个决策点：A1a 修或弃（建议硬止损）· hc 破 FORBIDDEN · SWALLOW 常开 vs 路由 · tcgen05 go/no-go · 400 口径锁定 counting
+
+---
+
+## Session 末尾的 mrows 验证成功 + tcgen05 持续阻塞（最终数据）
+
+### SWALLOW 优化的实测进展（全部验证！）
+| # | 优化 | 吞吐 | 增量 | 红线 |
+|---|---|---|---|---|
+| S0 | 全 gate 基线 | 58.3 tok/s | — | ✓ |
+| S1 | + mrows b2 (ATTN_MROWS_ROPE_NORM) | 60.4 tok/s | +3.6% | ✓ |
+| **S1+S2** | **+ mrows b2+b3 (+ATTN_MROWS2)** | **63.8 tok/s** | **+9.4%** | **🔄 出师表测试中** |
+
+### tcgen05 的 4 轮修复历史（全部失败！）
+| 轮 | 修复 | 结果 |
+|---|---|---|
+| 1 | 6 个 split body 读点 byte-fallback | 18.8s LEN=0 |
+| 2 | 4 个新读点（含 :5009）| 191ms 快崩 |
+| 3 | TMA 修复（+775/-69）| rank 7 misaligned 仍在 |
+| 4 | + mrows b2+b3 组合 | rank 7 misaligned 仍在 |
+
+**tcgen05 的根因**：rank 7 的分片边界可能天然不 16B 对齐（TP-sharded DevBuf::view 的固有属性）——byte-fallback 和 TMA guard 都救不了
+
+### 最终性能对照
+| 路径 | 吞吐 | 状态 |
+|---|---|---|
+| **lazy 干净栈** | **91.1 tok/s (+15.6%)** | ✅ 当前最佳 |
+| **SWALLOW + mrows b2+b3** | **63.8 tok/s (+9.4% from SWALLOW 基线)** | ✅ batched 最佳 |
+
+### 400 的最终判定
+- SWALLOW 路径：63.8 → +B5/B4 → +AR fix → +L4/L5 → ~200-300 tok/s（optimistic）
+- lazy 路径：91.1 → +L4/L5 → ~145 tok/s（ceiling）
+- **400 需要：AR fix（-3~5ms）+ L4/L5 全部兑现 + tcgen05 解锁**——超出本 session 范围
