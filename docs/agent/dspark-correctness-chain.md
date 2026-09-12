@@ -1586,3 +1586,17 @@ s1-verify-implementation 的判词：官方语义核对 ✓、默认臂 bit-iden
 - **最后 10-25% 需要**：L4/L5 级优化（占用/流水）或 accept 上限突破
 
 **现实预期**：250-350 tok/s 是当前战役的可达范围；400 需要下一步战役（L4/L5 kernel 优化）。
+
+## S1 修复验证的结果处理框架（等 677f3efe）
+
+**测试配置**：最新代码（54f7dc2）+ BF16_TRUNCATE + TAP_INPUT + DRAFT_BF16_DOMAIN + **SEED_POS=1**（S1 修复！）
+
+**结果→行动**：
+| accept | 判定 | 下一步 |
+|---|---|---|
+| 1.4-1.8 | **S1 修复成功** ✓ | S2（TAP_BF16/DRAFT_ATTN 单变量 A/B）+ 性能组合 |
+| ~1.2（不变）| q/o 基址不是瓶颈 | 回到 accept 差距分析的其他路径（draft MoE/attention 数值域）|
+| <1.0（退化）| S1 引入新问题 | 回退 SEED_POS，调查 winrows 配套 |
+| 拉丁出现 | SEED_POS 破坏基线 | 回退 SEED_POS，winrows 还有问题 |
+
+**零拉丁红线**：任何拉丁出现 = 立即处理（不是可接受的 trade-off）。
