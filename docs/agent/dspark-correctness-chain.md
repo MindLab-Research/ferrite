@@ -6384,3 +6384,23 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 **当前最佳：60.4 tok/s（SWALLOW + mrows b2）**
 **当前 lazy：91.1 tok/s（仍快 1.5×）**
 **400 目标：步时 ≤15ms → 需要 tcgen05 + AR 修复 + L4/L5**
+
+## 🎉 mrows b2 SWALLOW 出师表红线——通过！（b3405c04）
+
+**结果**：
+- **零拉丁 ✓**（LEN=120，拉丁=[]）
+- **前 ~100 字正确**（"先帝创业未半而中道崩殂...欲报之于陛下也."）
+- completion=93（模型自然停止）
+- 0 ar5-hang ✓ 0 panic ✓
+
+**SWALLOW + mrows b2 的完整验证**：
+| 测试 | 结果 | 状态 |
+|---|---|---|
+| 计数 1-200 | **60.4 tok/s** 前 61 行 ✓ | ✅ |
+| **出师表 1000 tok** | **零拉丁 ✓ 前 100 字正确 ✓** | **✅ 红线通过！** |
+| panic/hang | 0/0 | ✅ |
+
+**SWALLOW 优化的最新状态**：
+- **当前最佳 SWALLOW：60.4 tok/s（mrows b2）+ 红线通过！**
+- lazy 91.1 仍快 1.5×（但 SWALLOW 是 400 的唯一路径）
+- 下一步：mrows b3 → tcgen05 → AR fix → L4/L5 → 400
