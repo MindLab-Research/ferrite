@@ -36,6 +36,20 @@ use ferrite_types::{FerriteError, Result};
 /// prompt + generation must stay under it.
 const MAX_CTX: usize = 8100;
 
+/// Wave-4 P0-B: the chunked-prefill budget (prompt tokens per
+/// `prefill_chunk` call). `0` (or unset) keeps the historical whole-segment
+/// call, so the two granularities can be A/B'd on the same binary. Read once
+/// and cached — the house rule for every hot-path gate.
+fn prefill_token_budget() -> usize {
+    static F: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("FERRITE_PREFILL_BUDGET")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// One live/queued request on the engine side.
 struct GpuSeq {
     /// The cluster-side sequence id (u64 counter, never reused).
@@ -224,15 +238,30 @@ impl ServeEngine for GpuEngine {
             if let Some(g) = self.arena.get(seq) {
                 let (cluster_seq, prompt) = (g.cluster_seq, g.prompt.clone());
                 let t0 = std::time::Instant::now();
-                self.cluster.prefill_chunk(cluster_seq, &prompt)?;
+                // P0-B (Wave 4): feed the prompt in chunks instead of one whole
+                // segment. The engine is n-variable already — `prefill_chunk`
+                // accumulates the KV across successive calls on the same seq, so
+                // the ONLY thing that changes is the caller's granularity. The
+                // chunked path is the prerequisite for every 1M-context item
+                // (bounded per-call workspace, indexer chunking, CP). `0` keeps
+                // the historical whole-segment call so the two can be A/B'd.
+                let budget = prefill_token_budget();
+                if budget == 0 || prompt.len() <= budget {
+                    self.cluster.prefill_chunk(cluster_seq, &prompt)?;
+                } else {
+                    for chunk in prompt.chunks(budget) {
+                        self.cluster.prefill_chunk(cluster_seq, chunk)?;
+                    }
+                }
                 if let Some(g) = self.arena.get_mut(seq) {
                     g.prev_len = g.prompt_len; // rt.tokens = prompt after prefill
                 }
                 self.live.push(seq);
                 eprintln!(
-                    "[serve] admitted seq {seq:?} cluster={cluster_seq} prompt={} prefill={:.2}s (live={} queued={})",
+                    "[serve] admitted seq {seq:?} cluster={cluster_seq} prompt={} prefill={:.2}s budget={} (live={} queued={})",
                     prompt.len(),
                     t0.elapsed().as_secs_f32(),
+                    if budget == 0 { 0 } else { budget },
                     self.live.len(),
                     self.queue.len()
                 );

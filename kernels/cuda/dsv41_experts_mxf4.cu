@@ -1141,11 +1141,42 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
                                                long bhs_stride, const int* __restrict__ ids,
                                                int vec, int fuse_swiglu, int ksplit, int pf) {
     const int slot = (int)blockIdx.y;
-    const float* act = (a_f32 != nullptr) ? (a_f32 + (size_t)slot * (size_t)act_stride) : nullptr;
-    const float* rw = (row_weight != nullptr) ? (row_weight + (size_t)slot * (size_t)rw_stride)
-                                              : nullptr;
-    out += (size_t)slot * (size_t)out_slot_stride;
-    const size_t e = (size_t)ids[slot];
+    // ---- ACTIVATION ROW (grid.z): the MULTI-ROW dimension ------------------
+    // `rows` is now the launcher's THIRD grid dimension (it used to be
+    // validation-only, so every call computed ONE activation row). rows == 1
+    // leaves blockIdx.z == 0, every offset below is 0 and this kernel is the
+    // pre-existing single-row one BIT FOR BIT.
+    //
+    // LAYOUT CONTRACT (rows > 1) - the caller's buffers are [rows][slot][...],
+    // each row laid out EXACTLY as the rows == 1 call laid out its single row:
+    //   ids         : [rows][slots]                  row pitch = slots
+    //   row_weight  : [rows][slots][rw_stride]       row pitch = slots*rw_stride
+    //   out         : [rows][slots][out_slot_stride] row pitch = slots*out_slot_stride
+    //   act (f32)   : [rows][slots][act_stride]      row pitch = slots*act_stride
+    //   a / a_scale : [rows][k/2] bytes / [rows][k/32] floats - the quantiser's
+    //                 own row-major packed layout (`dsv41_quant_fp4`), so the fp4
+    //                 activation needs NO extra stride argument.
+    // Every pitch is derived from an argument the caller ALREADY passes plus
+    // gridDim.y (the slot count), which is what keeps this ABI-2 entry point
+    // unchanged (the Rust side needs no new parameter). A caller that wants a
+    // different row pitch needs a NEW entry point - do not reinterpret these.
+    //
+    // ROW INDEPENDENCE (why the acceptance test can compare row-by-row): rows
+    // share no output, no accumulator and no shared-memory staging - the only
+    // thing that changes with `arow` is a base pointer. Row r's K loop is the
+    // rows==1 K loop (same group order, same fma chains, same shuffle tree, same
+    // epilogue), so row r of a rows=m call is BIT-IDENTICAL to a rows==1 call on
+    // the same row. See kernels/cuda/tests_dsv41_experts_mrows.cu.
+    const int arow = (int)blockIdx.z;
+    const size_t srow = (size_t)arow * (size_t)gridDim.y;   // this row's slot-0 index
+    const float* act = (a_f32 != nullptr)
+                           ? (a_f32 + (srow + (size_t)slot) * (size_t)act_stride)
+                           : nullptr;
+    const float* rw = (row_weight != nullptr)
+                          ? (row_weight + (srow + (size_t)slot) * (size_t)rw_stride)
+                          : nullptr;
+    out += (srow + (size_t)slot) * (size_t)out_slot_stride;
+    const size_t e = (size_t)ids[srow + (size_t)slot];
     const uint8_t* b_use = b_base + e * (size_t)b_stride;
     const uint8_t* bsc_use = bs_base + e * (size_t)bs_stride;
     const uint8_t* bhi_use = bh_base + e * (size_t)bh_stride;
@@ -1304,13 +1335,20 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
     // even j, high -> odd j), the e2m1 decode and the per-32 scale multiply are
     // identical to the byte loop below; only the number of load instructions
     // changes. The f32 path gets the same treatment via float4.
-    if ((k & 31) == 0 && a != nullptr && act == nullptr &&
-        (((uintptr_t)a & 15) == 0)) {
+    //
+    // MULTI-ROW: the fp4 activation's row pitch is the quantiser's own row-major
+    // packing (kbytes bytes / ksc scales per row) - see the layout contract at
+    // the top of this kernel. `arow == 0` folds every offset below to exactly the
+    // pre-multi-row address arithmetic.
+    const uint8_t* a_row = (a != nullptr) ? (a + (size_t)arow * (size_t)kbytes) : a;
+    const float* asc_row = (a != nullptr) ? (a_scale + (size_t)arow * (size_t)ksc) : a_scale;
+    if ((k & 31) == 0 && a_row != nullptr && act == nullptr &&
+        (((uintptr_t)a_row & 15) == 0)) {
         const int nb32 = k >> 5;
         for (int b32 = threadIdx.x; b32 < nb32; b32 += blockDim.x) {
             const uint4 packed =
-                *reinterpret_cast<const uint4*>(a + (size_t)b32 * 16);
-            const float asc = a_scale[b32];
+                *reinterpret_cast<const uint4*>(a_row + (size_t)b32 * 16);
+            const float asc = asc_row[b32];
             float* dst = s_act + (size_t)b32 * 32;
             const uint8_t* pb = reinterpret_cast<const uint8_t*>(&packed);
 #pragma unroll
@@ -1331,8 +1369,8 @@ __global__ void expert_gemv_fp4_batched_kernel(const float* __restrict__ a_f32, 
         if (act != nullptr) {
             s_act[j] = act[j];
         } else {
-            const uint8_t ab = a[j >> 1];
-            const float asc = a_scale[j >> 5];
+            const uint8_t ab = a_row[j >> 1];
+            const float asc = asc_row[j >> 5];
             s_act[j] = dsv41_e2m1_to_f((j & 1) ? (uint8_t)(ab >> 4) : (uint8_t)(ab & 0xFu)) * asc;
         }
     }
@@ -1897,14 +1935,38 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
 #if __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();
 #endif
+    // ---- ACTIVATION ROW (grid.z): the MULTI-ROW dimension ------------------
+    // Same contract as expert_gemv_fp4_batched_kernel (see the layout block
+    // there): the caller's buffers are [rows][slot][...] with each row laid out
+    // exactly as the rows == 1 call laid out its single row -
+    //   ids        : [rows][slots]              row pitch = slots
+    //   row_weight : [rows][slots][rw_stride]   row pitch = slots*rw_stride
+    //   act        : [rows][slots][act_stride]  row pitch = slots*act_stride
+    //   out        : [rows][n_total]            row pitch = n_total (this fused
+    //                kernel overwrites ONE [n_total] row per activation row, so
+    //                its output pitch is n_total, not slots*something)
+    // rows == 1 leaves blockIdx.z == 0 and every offset below is 0, i.e. the
+    // pre-existing single-row kernel bit for bit.
+    //
+    // ROW INDEPENDENCE: each row's serial ascending slot loop, its K loop, its
+    // shuffle tree and its rounded product/add pair are the rows==1 ones; only
+    // the base pointers move. Row r of a rows=m call is therefore BIT-IDENTICAL
+    // to a rows==1 call on the same row (tests_dsv41_experts_mrows.cu).
+    const int arow = (int)blockIdx.z;
+    const size_t srow = (size_t)arow * (size_t)slots;             // this row's slot-0 index
+    const float* act_row = act_base + srow * (size_t)act_stride;  // this row's slot-0 slice
+    float* out_row = out + (size_t)arow * (size_t)n_total;
     if (STAGED) {
         // ONE cooperative pass stages every slot's activation. `act_stride` is
         // the caller's slice pitch and only the first `k` floats of each slice
         // are read - today the pitch is 2*inter (the swiglu half of the gate/up
         // output); once gate_up+swiglu fusion shrinks that slice to inter, the
         // caller passes the smaller pitch and this loop is unchanged.
+        // MULTI-ROW: `act_row` shifts the whole [slots] slice block by this
+        // row's pitch; the smem budget is per ROW, so it does not grow with
+        // `rows` (each grid.z CTA stages its own row).
         for (int s = 0; s < slots; ++s) {
-            const float* src = act_base + (size_t)s * (size_t)act_stride;
+            const float* src = act_row + (size_t)s * (size_t)act_stride;
             float* dst = s_smem + (size_t)s * (size_t)k;
             for (int j = threadIdx.x; j < k; j += blockDim.x) dst[j] = src[j];
         }
@@ -1918,13 +1980,15 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
         // Ascending slot loop, never parallel: see the contract above.
         for (int slot = 0; slot < slots; ++slot) {
             const float* s_act = STAGED ? (s_smem + (size_t)slot * (size_t)k)
-                                        : (act_base + (size_t)slot * (size_t)act_stride);
+                                        : (act_row + (size_t)slot * (size_t)act_stride);
             // Per-slot derivation identical to expert_gemv_fp4_batched_kernel,
             // except that the weight row is selected here: this kernel has no
-            // blockIdx.y, every warp owns its whole row.
+            // blockIdx.y, every warp owns its whole row. MULTI-ROW: the router's
+            // per-slot scalars move with the activation row (row pitch = slots).
             const float rwv =
-                (row_weight != nullptr) ? row_weight[(size_t)slot * (size_t)rw_stride] : 1.f;
-            const size_t e = (size_t)ids[slot];
+                (row_weight != nullptr) ? row_weight[(srow + (size_t)slot) * (size_t)rw_stride]
+                                        : 1.f;
+            const size_t e = (size_t)ids[srow + (size_t)slot];
             const uint8_t* brow = w2_base + e * (size_t)w2_stride + (size_t)row * kbytes;
             const uint8_t* srow = w2s_base + e * (size_t)w2s_stride + (size_t)row * ksc;
 
@@ -2095,7 +2159,7 @@ __global__ void expert_gemv_fp4_down_reduce_kernel(
             // and rounds after the add), then the ascending add.
             tot = __fadd_rn(tot, __fmul_rn(acc, rwv));
         }
-        if (lane == 0) out[(size_t)row] = tot;
+        if (lane == 0) out_row[(size_t)row] = tot;
     }
 }
 
@@ -2408,7 +2472,13 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
         ((ksplit > 1) ? (size_t)nwarps * sizeof(float2) : (size_t)0);
     const size_t smem_pf_stride = (size_t)nwarps * kGateUpPfBytes;
     const size_t smem = smem_fixed + (pf ? smem_pf_stride : (size_t)0);
-    dim3 grid((unsigned)ctas_x, (unsigned)slots);
+    // grid = (output-row blocks, slots, rows): blockIdx.y = slot (unchanged),
+    // blockIdx.z = the ACTIVATION ROW (new - `rows` used to be validation-only,
+    // so every call computed one activation row). rows == 1 gives grid.z == 1 and
+    // the pre-existing grid, so every rows == 1 caller is bit-for-bit unchanged.
+    // The per-row buffer pitches are derived INSIDE the kernel from the existing
+    // arguments + gridDim.y - see the layout contract on the kernel.
+    dim3 grid((unsigned)ctas_x, (unsigned)slots, (unsigned)rows);
     const unsigned block_threads = (unsigned)(nwarps * 32);
     // PDL (see dsv41_experts_pdl_or_plain): the consumer's grid may start during
     // quant_fp4's tail; the kernel's entry cudaGridDependencySynchronize() gates
@@ -2448,7 +2518,10 @@ extern "C" int dsv41_expert_down_fp4_batched(
     long w2_stride, const uint8_t* w2s_base, long w2s_stride, const int* ids, cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     const int warps = 8;
-    dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots);
+    // blockIdx.z = the activation row (the multi-row dim, same contract as the
+    // gate/up launcher: `act`/`row_weight`/`ids`/`out` are [rows][slot][...]).
+    // rows == 1 reproduces the previous grid exactly.
+    dim3 grid((unsigned)((dim + warps - 1) / warps), (unsigned)slots, (unsigned)rows);
     // PDL (see dsv41_experts_pdl_or_plain): same consumer contract as the
     // gate/up call above -- the producer is the gate/up launch that wrote the
     // swiglu'd `act_base`, and the kernel's entry sync gates the staging.
@@ -2513,7 +2586,11 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
     }
     const size_t staged_bytes = (size_t)slots * (size_t)inter * sizeof(float) + lut_bytes;
     const size_t cap = (dev >= 0 && dev < 64) ? (size_t)dev_optin[dev] : (size_t)0;
-    const dim3 grid((unsigned)((dim + warps - 1) / warps));
+    // blockIdx.z = the activation row (the multi-row dim). The stage buffer is
+    // per ROW (each grid.z CTA stages only its own row's [slots][k] slices), so
+    // `staged_bytes` - and therefore the STAGED/fallback decision - does not
+    // change with `rows`. rows == 1 reproduces the previous grid exactly.
+    const dim3 grid((unsigned)((dim + warps - 1) / warps), 1u, (unsigned)rows);
     // PDL (see dsv41_experts_pdl_or_plain): consumer of the gate/up launch; the
     // kernel's entry sync gates the activation staging (STAGED) and the per-slot
     // reads of the non-staged fallback.

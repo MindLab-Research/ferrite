@@ -990,15 +990,30 @@ extern "C" int dsv41_swiglu_limit_q(float* gate_up, int rows, int inter, float l
 // the sequential loop's. The batched gate/up writes each slot's [2*inter] block
 // at a disjoint offset `slot * slot_stride`, and this kernel then rewrites the
 // first `inter` floats of every block in place.
+//
+// MULTI-ROW (grid.z = the activation row): `rows` is now the ACTIVATION-ROW
+// dimension, matching the expert gate/up and down launchers - the buffer is
+// [rows][slot][2*inter], each row laid out exactly as the rows == 1 call laid
+// out its single row, so this kernel's `gate_up` pointer and `slot_stride` mean
+// the same thing for every row and only the row base moves:
+//     base = gate_up + arow*gridDim.y*slot_stride + slot*slot_stride
+// It therefore rewrites exactly the (row, slot) blocks that the rows=m gate/up
+// launch wrote (its `out` row pitch is slots*out_slot_stride for the same
+// reason). rows == 1 leaves blockIdx.z == 0, i.e. the pre-existing arithmetic.
+//
+// ⚠️ The former IN-SLOT row loop (`rows` rows inside one slot, pitch 2*inter)
+// is GONE: it made `rows` mean two different things at once. It was only ever
+// called with rows == 1 (chain_dev.rs:8030 and dspark_dev.rs:1396), where the
+// two interpretations coincide, so every existing call is bit-identical.
 __global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int rows, int inter,
                                             float limit, long slot_stride) {
-    float* base = gate_up + (size_t)blockIdx.y * (size_t)slot_stride;
-    const size_t total = (size_t)rows * inter;
+    float* base = gate_up + (size_t)blockIdx.z * (size_t)gridDim.y * (size_t)slot_stride +
+                  (size_t)blockIdx.y * (size_t)slot_stride;
+    const size_t total = (size_t)inter;
     for (size_t t = (size_t)blockIdx.x * blockDim.x + threadIdx.x; t < total;
          t += (size_t)gridDim.x * blockDim.x) {
-        const int r = (int)(t / (size_t)inter);
-        const int i = (int)(t % (size_t)inter);
-        float* row = base + (size_t)r * 2 * inter;
+        const int i = (int)t;
+        float* row = base;
         float g = row[i];
         float u = row[inter + i];
         if (limit > 0.f) {
@@ -1012,8 +1027,8 @@ __global__ void swiglu_limit_batched_kernel(float* __restrict__ gate_up, int row
 extern "C" int dsv41_swiglu_limit_batched(float* gate_up, int rows, int inter, float limit,
                                           long slot_stride, int slots, cudaStream_t s) {
     if (rows <= 0 || inter <= 0 || slots <= 0) return (int)cudaSuccess;
-    const size_t total = (size_t)rows * inter;
-    dim3 grid((unsigned)((total + 255) / 256), (unsigned)slots);
+    const size_t total = (size_t)inter;
+    dim3 grid((unsigned)((total + 255) / 256), (unsigned)slots, (unsigned)rows);
     swiglu_limit_batched_kernel<<<grid, 256, 0, s>>>(gate_up, rows, inter, limit, slot_stride);
     return (int)cudaGetLastError();
 }
