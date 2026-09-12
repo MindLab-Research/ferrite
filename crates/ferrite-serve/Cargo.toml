@@ -27,5 +27,9 @@ pprof = { version = "0.13", features = ["flamegraph"] }
 # GpuEngine behind them.
 ferrite-http = { path = "../ferrite-http" }
 ferrite-dispatch = { path = "../ferrite-dispatch" }
+# The DeepSeek-V4.1-Flash serve assembly (`--model dsv41`): config + the TP
+# rank pool + the shared ferrite-http stack. Re-exported through this crate's
+# `serve` module so the unified binary and `dsv41-run` build one stack.
+ferrite-dsv41 = { path = "../ferrite-dsv41" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "net", "time"] }
 axum = "0.7"

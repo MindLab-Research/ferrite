@@ -457,6 +457,7 @@ dependencies = [
 name = "ferrite-models"
 version = "0.1.0"
 dependencies = [
+ "ferrite-http",
  "ferrite-kernel",
  "ferrite-types",
  "libc",
@@ -480,6 +481,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "ferrite-dispatch",
+ "ferrite-dsv41",
  "ferrite-exec",
  "ferrite-http",
  "ferrite-kernel",

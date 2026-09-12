@@ -4,10 +4,15 @@
 //!   ferrite-serve --model-dir /path/to/GLM-5.3-Flash [--max-tokens N]
 //!                 [--backend cpu|cuda] [--tp N] [--lib /path/libferrite_kernels.so]
 //!                 [--prompt "..."]
+//!   ferrite-serve --model {glm53|dsv41} --model-dir DIR --serve [--port N] ...
 //!
 //! CPU: single-process Engine (f32, needs ~700 GB RAM).
 //! CUDA: TP=N cluster — one CudaBackend per GPU (device = rank), weights
 //! sharded by shard_weights_tp, per-layer all-reduce via the TpCluster.
+//!
+//! `--model dsv41` selects the DeepSeek-V4.1-Flash path — a different engine
+//! assembly (see `run_dsv41_serve`) behind the SAME shared ferrite-http
+//! launcher GLM serves through.
 
 use std::path::PathBuf;
 
@@ -44,6 +49,10 @@ fn main() {
         }
         default.to_string()
     };
+    // Which checkpoint this binary serves: glm53 (default — the historical CLI)
+    // or dsv41 (the DeepSeek-V4.1-Flash path). One serve front door, two engine
+    // assemblies behind the shared ferrite-http launcher.
+    let model = get_arg("--model", "glm53");
     let model_dir = PathBuf::from(get_arg("--model-dir", "."));
     let max_tokens: usize = get_arg("--max-tokens", "32").parse().unwrap_or(32);
     let backend = get_arg("--backend", "cpu");
@@ -53,7 +62,29 @@ fn main() {
     // --serve mode flags (the OpenAI HTTP/SSE API — see run_serve).
     let port: u16 = get_arg("--port", "8080").parse().unwrap_or(8080);
     let max_seqs: usize = get_arg("--max-seqs", "4").parse().unwrap_or(4);
-    let model_name = get_arg("--model-name", "glm-5.3-flash");
+    let model_name = get_arg(
+        "--model-name",
+        if model == "dsv41" { "deepseek-v4.1-flash" } else { "glm-5.3-flash" },
+    );
+
+    // ---- --model dsv41: the DeepSeek-V4.1-Flash path ----
+    // A separate engine assembly (its own config + the TP rank pool) behind the
+    // SAME shared ferrite-http launcher. Branch here — nothing below (the GLM
+    // config/weights load) applies to this checkpoint.
+    if model == "dsv41" {
+        let kernels = {
+            let k = get_arg("--kernels", "");
+            if k.is_empty() { lib.clone() } else { k }
+        };
+        let dir = if model_dir.as_path() == std::path::Path::new(".") {
+            std::env::var("DSV41_MODEL_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| model_dir.clone())
+        } else {
+            model_dir.clone()
+        };
+        return run_dsv41_serve(&dir, &kernels, tp, port, model_name);
+    }
 
     // ---- built-in CPU profiler (Go-pprof style): FERRITE_PPROF=1 starts a
     // 1000 Hz SIGPROF sampler; on exit the flamegraph lands in
@@ -606,6 +637,47 @@ fn run_serve(
     let opts = ServeOptions::new(addr, model_name)
         .on_shutdown(|| ferrite_kernel::cuda::profiler_stop());
     launch(engine, tok, Arc::new(GlmFrame), opts)
+}
+
+/// `--model dsv41`: the DeepSeek-V4.1-Flash serve path. A different engine
+/// assembly — the checkpoint's own config, the TP rank pool and its tokenizer —
+/// behind the SAME shared launcher GLM serves through. The builder lives in
+/// `ferrite-dsv41::serve` so the `dsv41-run` binary constructs the identical
+/// stack; the listener binds immediately and the ranks load behind the first
+/// request.
+fn run_dsv41_serve(
+    model_dir: &std::path::Path,
+    kernels: &str,
+    tp: usize,
+    port: u16,
+    model_name: String,
+) -> ! {
+    if tp < 2 {
+        panic!("--model dsv41 needs --tp >= 2 (the ranks each hold a shard)");
+    }
+    let cfg_path = model_dir.join("config.json");
+    let cfg_str = std::fs::read_to_string(&cfg_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", cfg_path.display()));
+    let cfg = ferrite_dsv41::Dsv41Config::from_json_str(&cfg_str)
+        .unwrap_or_else(|e| panic!("parse config.json: {e}"));
+    println!(
+        "[serve] dsv41 config ok: {} layers, dim {}, experts {}/topk {}",
+        cfg.n_layers, cfg.dim, cfg.n_routed_experts, cfg.n_activated_experts,
+    );
+    let dir = model_dir.to_string_lossy().to_string();
+    let eos = ferrite_dsv41::serve::resolve_eos(&dir);
+    let (tok, engine) = ferrite_dsv41::serve::build_serve_engine(&dir, kernels, &cfg, tp, eos)
+        .unwrap_or_else(|e| panic!("dsv41 serve bring-up: {e}"));
+    let addr: std::net::SocketAddr = format!("0.0.0.0:{port}")
+        .parse()
+        .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], port)));
+    eprintln!("[serve] serving TP{tp} {model_name} on http://{addr}/v1/chat/completions (ranks loading)");
+    ferrite_http::serve::launch(
+        engine,
+        tok,
+        std::sync::Arc::new(ferrite_dsv41::Dsv41Frame),
+        ferrite_http::ServeOptions::new(addr, model_name),
+    )
 }
 
 fn rss_gb() -> f64 {

@@ -25,3 +25,7 @@ pub use ferrite_models::dsv41::{
 };
 pub use ferrite_models::dsv41::frame::Dsv41Frame;
 pub use ferrite_models::dsv41::{Dsv41Config, KvMode};
+
+/// The serve assembly (TP rank pool + engine builder), shared by the
+/// `dsv41-run` runner and the unified `ferrite-serve --model dsv41` binary.
+pub mod serve;
