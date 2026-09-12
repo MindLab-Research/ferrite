@@ -153,3 +153,17 @@ launch 单价按任务口径 **3µs**（仓库实测 2.904µs 提交；审计口
 
 *户部 · 只读分析，未执行任何 GPU 命令、未改动任何代码。*
 *本文件为唯一产出；字节/launch 数/单价均标注了来源，未实测项已在 §4 列明。*
+
+## 修正（2026-09-12 perf-only 实测）：launch submit 假设被推翻
+
+**实测**：SH_EXP + GRAPH + ROPE + P3A 全开（ILV=ON，无 e4m3）→ verify = **36.10ms**（vs 基线 37.31ms，仅 −1.21ms）。
+
+图化在 pos=20 捕获成功，50 步平均含 30 步 replay。反推 replay 步时 ≈ 35.5ms vs 裸链 37ms——**图化收益仅 ~1.5ms**。
+
+**结论**：CUDA async launch 已让 CPU submit 与 GPU 执行重叠——**"50% submit + 50% 执行"的分解是错的**（submit 的 2.9µs/launch 只有在 CPU 是瓶颈时才成立）。**verify 的 37ms 几乎全部是 GPU kernel 执行时间**。
+
+**修正后的优化路径**（只有减少 GPU 执行时间才能压 verify）：
+1. tcgen05 mxf4（routed experts −6.8ms）——最大单项
+2. kernel 融合（减少 kernel 数量降低尾延迟/依赖链）
+3. SH_EXP_MROWS 需排查（−8.3ms 预期未兑现——可能 mrows kernel 本身不够快或未正确 dispatch）
+4. 图化降级为"正确性工具"（保证 launch 顺序一致）而非性能工具
