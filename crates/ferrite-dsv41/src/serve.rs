@@ -398,7 +398,19 @@ fn pool_rank_body(
     // (hc_mult*dim = 20480); an undersized slot makes the AR store overrun the
     // next peer's parity half and the protocol desyncs into a wedge (the
     // GLM-side P2P_AR_MAX_N lesson, same failure shape).
-    let ar_bytes = (hc_dim.max(crate::chain_dev::VERIFY_ROWS * cfg.dim)) * 4;
+    //
+    // The WIDEST payload is the multi-row engram write-back
+    // (`engram_apply_rows`): ONE collective carries all m rows' gathered table
+    // slices, `m * n_cols * engram_head_dim` floats (6 * 24 * 256 = 36864 →
+    // 147456 B). Omitting it re-opened exactly the overrun the note above
+    // warns about — the `check_payload` gate caught it as
+    // `payload 147456 > slot 122880` (see
+    // docs/agent/dspark-correctness-chain.md, "engram 多行 gather 的载荷修复").
+    // `n_cols` mirrors `engram_apply_rows`'s own derivation.
+    let eng_cols = cfg.engram_max_ngram_size.saturating_sub(1) * cfg.engram_n_heads;
+    let eng_rows = crate::chain_dev::VERIFY_ROWS * eng_cols * cfg.engram_head_dim;
+    let ar_bytes =
+        (hc_dim.max(crate::chain_dev::VERIFY_ROWS * cfg.dim).max(eng_rows)) * 4;
     let mut comm = Collective::new(dev.clone(), world, rank, ar_bytes, barrier.clone())?;
     {
         staging.lock().unwrap()[rank] = comm.staging_base();

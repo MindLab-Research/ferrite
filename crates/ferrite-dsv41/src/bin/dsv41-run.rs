@@ -355,8 +355,16 @@ fn rank_body(
     let vocab = cfg.vocab_size;
     // the staging slot must cover the verify chain's m*dim AR payload too
     // (step_rows), not just the single-row hc payload — see serve.rs for the
-    // overrun/desync failure mode
-    let ar_bytes = (hc_dim.max(ferrite_dsv41::chain_dev::VERIFY_ROWS * cfg.dim)) * 4;
+    // overrun/desync failure mode. It must also cover the WIDER multi-row engram
+    // write-back (`engram_apply_rows`, `m * n_cols * engram_head_dim` floats:
+    // 6 * 24 * 256 = 36864 → 147456 B), which the `check_payload` gate caught as
+    // `payload 147456 > slot 122880` (see docs/agent/dspark-correctness-chain.md).
+    let eng_cols = cfg.engram_max_ngram_size.saturating_sub(1) * cfg.engram_n_heads;
+    let eng_rows = ferrite_dsv41::chain_dev::VERIFY_ROWS * eng_cols * cfg.engram_head_dim;
+    let ar_bytes = (hc_dim
+        .max(ferrite_dsv41::chain_dev::VERIFY_ROWS * cfg.dim)
+        .max(eng_rows))
+        * 4;
     let mut c_small = Collective::new(dev.clone(), world, rank, ar_bytes, barrier.clone())?;
     let mut c_big = Collective::new(dev.clone(), world, rank, vocab * 4, barrier.clone())?;
     {
