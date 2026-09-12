@@ -5762,3 +5762,26 @@ canary 从 0xdeadbeef → **0x00000000**——不是随机数据而是**写零**
 - canary 0x00000000 = 一个越界写同时踩 epoch+A4+canary（它们相邻！）
 
 **修复的意义**：如果 OOB 修复生效 → SWALLOW 正常生成 → batched 解锁 → 400 冲刺！
+
+## 🎉🎉🎉 OOB 修复验证成功（257434f6）——epoch 54 之谜解决！
+
+**结果**：
+- **CANARY = 0** ✓✓✓（canary 保持 0xdeadbeef——不再被清零！OOB 修复生效！）
+- **GUARD = 0** ✓（guard 没被踩！）
+- **RESET = 0** ✓（epoch 不再降级！）
+- **ar5-hang = 0** ✓（没有 hang！）
+- ledger: pos=10 epoch=830 canary=0xdeadbeef ✓ / pos=15 epoch=999 canary=0xdeadbeef ✓
+
+**OOB 修复的 4 项全过**：
+| 判据 | 预期 | 实际 | 状态 |
+|---|---|---|---|
+| CANARY 行数 | 0 | **0** | ✓✓✓ |
+| GUARD 行数 | 0 | **0** | ✓ |
+| RESET 行数 | 0 | **0** | ✓ |
+| ar5-hang | 0 | **0** | ✓ |
+
+**但**：LEN=1, completion=1, finish_reason=length——只生成 1 token！
+- ledger 只到 pos=15 的 pre（epoch=999）——**SWALLOW 臂的 note 没出现**（第一次 swallowed 步可能没完成或没被记录）
+- **生成问题独立于 OOB**——SWALLOW 的 commit/emission 可能还有 bug
+
+**下一步**：调查 SWALLOW 只生成 1 token 的原因（OOB 修复后的新问题——可能与 finish_reason=length 有关）
