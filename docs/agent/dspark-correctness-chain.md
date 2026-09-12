@@ -2675,3 +2675,28 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 - 或者：**放弃 SWALLOW**，专注 LAZY_VERIFY 的优化路径
 
 **下一步**：先试 SWALLOW 不用图（最简单的验证——如果不用图就不 hang，说明图的臂分歧是根因）
+
+## SWALLOW 突破后的 400 路径最终计算
+
+**事实基础**：
+- SWALLOW 不用图工作（0 ar5-hang，零拉丁 ✓）
+- SWALLOW 真实价值 -9~10.4ms（不是 -4.55ms）
+- 步时（SWALLOW 不用图）~40ms（serve 侧，不准确但可比较）
+- 步时（lazy + 图）~25ms（serve 侧）
+
+**SWALLOW 不用图的性能预测**（高 accept 任务）：
+| accept | tok/step | @ 40ms | @ 30ms (Plan B) | @ 25ms (+SH_PAIR) | @ 20ms (+B类) | @ 15ms (+L4) |
+|---|---|---|---|---|---|---|
+| 5（数字）| 6 | 150 | 200 | 240 | 300 | **400** ✓ |
+| 3（中等）| 4 | 100 | 133 | 160 | 200 | 267 |
+| 1.2（出师表）| 2.2 | 55 | 73 | 88 | 110 | 147 |
+
+**400 的路径**（高 accept 任务 = 数字/模板）：
+1. SWALLOW 不用图（✅ 已工作）→ 150 tok/s
+2. + Plan B（SWALLOW + 图）→ -10ms → 200 tok/s
+3. + SH_PAIR parity 修复 → -5ms → 240 tok/s
+4. + tcgen05 重测 → -2ms → 270 tok/s
+5. + B 类核（B6 等）→ -5ms → 300 tok/s
+6. + L4 占用优化 → -5ms → **400 tok/s** ✓
+
+**每一步都是必要的**——缺任何一步都到不了 400。当前最大阻塞：Plan B（图）> SH_PAIR parity > tcgen05。
