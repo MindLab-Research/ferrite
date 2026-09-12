@@ -1682,6 +1682,74 @@ fn verify_orope() -> bool {
     *F.get_or_init(|| std::env::var("DSV41_VERIFY_OROPE").map(|v| v != "0").unwrap_or(true))
 }
 
+/// How many rows an m-row sparse-attention launch may carry — the Rust mirror of
+/// `kAttnMaxBM` (`kernels/cuda/dsv41_kernels.cu`), which sizes the split arm's
+/// `g_attn_part[kAttnMaxBM][...]` scratch (the launcher re-checks it).
+const ATT_MROWS_MAX_BM: usize = 8;
+
+/// W2-MROWS (`DSV41_ATTN_MROWS=1`, **DEFAULT OFF**): `attention_rows` folds the
+/// block's `m` sparse-attention calls into ONE m-row launch (`b = 1, m = m`,
+/// grid `(b*m, h)`) carrying a **per-row compressor-length snapshot**
+/// (`clen_rows[m]`) and the `idxs_r` row pitch (`ist`, not `topk`).
+///
+/// **Why the snapshot is the prerequisite.** The sparse-attention kernels bound
+/// themselves by the LIVE device counter `*clen` and derive `n`/`topk` from it
+/// (dsv41_kernels.cu:947-949). In the verify interleave that counter ADVANCES
+/// with every row's commit, so a block-wide launch would hand every row the
+/// block-final value — row 0's compressed half would include the latents rows
+/// 1..m-1 committed AFTER it (its own future) while losing the oldest group it
+/// should still have seen. That is exactly audit defect #1 (see the comment at
+/// the head of the row loop), which is what `clen_rows[r]` removes: row `r`
+/// binds to its own count, the value its per-row launch read.
+///
+/// **Two hard preconditions, both checked at the call site** (this gate alone is
+/// not enough, and getting them wrong is silent corruption):
+///
+/// 1. **Causal ring view.** The block's own KV rows are appended to the ring
+///    BEFORE the block-wide launch, which is only harmless while the ring has
+///    not turned over: for `pos + r < window` the slot index IS the position, the
+///    `idx > start_pos` filter in `window_idxs_kernel` still nulls the not-yet-
+///    written slots (the block's own FUTURE rows), and every slot a row reads
+///    holds the single position it was written with. Once `pos + r >= window`
+///    that filter never fires, so rows `0..m-2` would read the block's future
+///    rows as history while losing the oldest `m-1-r` entries — audit defect #2
+///    ("running the read side BLOCK-WIDE"), the exact failure the
+///    `verify_ring_win` fusion had to be reverted for. The `b*m` launch is
+///    therefore taken only while `pos + m - 1 < window`; the long-context case
+///    needs the ring/window halves fused into the row-ascending kernel first
+///    (design §3.4(b)), which is NOT part of W2.
+/// 2. **Row pitch = `h*d`.** The kernels index the query/output rows as
+///    `(row*h + hh)*d`. The verify call's rows live in the full `[m, nh*hd]`
+///    buffers, i.e. at pitch `nh*hd`, which equals `h*d` only at `world == 1`
+///    (`h = nlh = nh/world`). Batching at `world > 1` therefore needs a
+///    `row_pitch` tail parameter on the five attention kernels AND the merge
+///    kernel (the split arm is the default) — a follow-up ABI addition, not a
+///    silent assumption. Until it exists the arm is taken at `world == 1` only,
+///    which is where the parity harness runs it.
+///
+/// With the gate OFF (or either precondition unmet) nothing changes: the per-row
+/// loop runs exactly as before, and the per-row call passes `nullptr/0` for the
+/// new parameters, so the emitted bytes are the pre-W2 ones byte-for-byte.
+fn attn_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_ATTN_MROWS")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
+/// One-time note when [`attn_mrows`] is ON but a precondition declines the arm —
+/// the bring-up failure mode this project keeps re-hitting is "the gate is ON and
+/// nothing changed", so the reason is stated once per process instead of being
+/// left to inference. `OnceLock` keeps it off the hot path.
+fn attn_mrows_decline(reason: &'static str) {
+    static F: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        eprintln!("[dsv41] DSV41_ATTN_MROWS=1 declined: {reason}; per-row sparse attention")
+    });
+}
+
 /// B2 (DSV41_RING_WIN_FUSE, default ON): one launch does the window ring append
 /// and the window indices (two adjacent, mutually independent one-block
 /// kernels), saving 40 launches/step. "0" reverts; an .so without
@@ -8254,6 +8322,41 @@ impl<'a> DevChain<'a> {
         } else {
             (false, false)
         };
+        // W2-MROWS (`DSV41_ATTN_MROWS=1`, DEFAULT OFF): ONE m-row sparse-attention
+        // launch for the whole block instead of one per row. [`attn_mrows`]'s header
+        // carries the full argument; this is where its two PRECONDITIONS become
+        // concrete host tests, because a wrong one is silent corruption and not a
+        // slow path:
+        //   * `world == 1` — the kernels index the q/out rows as `(row*h + hh)*d`
+        //     while this call's rows live at pitch `nh*hd` (`h = nlh = nh/world`),
+        //     so a `world > 1` batch needs a `row_pitch` argument the ABI does not
+        //     have yet;
+        //   * `pos_base + m - 1 < win` — the block must not have turned the ring
+        //     over, or rows `0..m-2` read the block's own FUTURE rows as history
+        //     while losing the oldest `m-1-r` entries (audit defect #2: the
+        //     `verify_ring_win` fusion was reverted for exactly this).
+        // ON-but-declined announces itself once (the bring-up failure mode this
+        // project keeps re-hitting is a gate that is ON and changes nothing).
+        let mrows_attn = if attn_mrows() && m > 1 && m <= ATT_MROWS_MAX_BM {
+            if world != 1 {
+                attn_mrows_decline("world != 1: the row pitch is nh*hd, the kernels index h*d");
+                false
+            } else if (pos_base as i64) + (m as i64) - 1 >= win as i64 {
+                attn_mrows_decline(
+                    "pos + m - 1 >= window: the ring has turned over, the block's own \
+                     future rows would be read as history",
+                );
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        // Row `r`'s bound for that launch — filled by the loop below with the SAME
+        // per-row value the per-row call read (`comp_len`, the host mirror the
+        // selection is already bounded by), never the block-final counter.
+        let mut clen_rows = [0i32; VERIFY_ROWS];
         for r in 0..m {
             // ---- 1) ring append + THIS row's causal window ----
             // (audit defect #2: the window half.) `window_idxs(r)` must run after
@@ -8327,36 +8430,127 @@ impl<'a> DevChain<'a> {
                     cfg.index_topk as i32,
                 )?;
             }
-            // ---- 4) sparse attention for THIS row ----
+            // ---- 4) sparse attention: THIS row, or (W2-MROWS) the whole block ----
             // The `b = 1, m = 1` shape is exactly the single-row `attention`'s, so
             // each row is verified against the plain engine row by row — the
             // strongest parity guarantee available.
             //
-            // P1v (DSV41_VERIFY_OROPE): the EAGER path runs the FUSED launch
-            // (`sparse_attn_orope`: the inverse o-rope and the fp8 emission of the
-            // roped row folded into the sparse-attention kernel) while this path
-            // ran the triple — and the two are NOT bit-identical (the +18
-            // `DSV41_DIFF_EAGER` mismatches vs ONE with the EAGER-side fusion
-            // off). Same kernel on both sides is the alignment.
-            //
-            // ABI (checked against `sparse_attn_orope_kernel` phase 3): the call is
-            // per row (`b = m = 1`, `h = nlh`, `d = hd`), and with the row's own
-            // base pointers it writes the roped row to `out + hh*hd`, the fp8 to
-            // `xq + hh*hd` and the scale to `xsc + hh*(hd/32)` — `[h, d]` fp8 +
-            // `[h, d/32]` f32 relative to the pointers handed in. Passing
-            // `xq_r + r*nlh*hd` / `xsc_r + r*(nlh*hd/32)` therefore lands EXACTLY
-            // on the per-row compact packing the `quant_fp8` loop below used to
-            // write (same bytes, same offsets), so the downstream
-            // `wo_a_grouped_fp8` sees an unchanged layout.
+            // W2-MROWS: when the block-wide arm is on, this row's launch is
+            // DEFERRED to the single m-row call after the loop and all this row
+            // contributes is its bound. Everything before it (append → commit →
+            // select) still runs per row in ascending order, so the interleave that
+            // fixes defects #1/#2 is untouched: what made the old block-wide read
+            // side wrong was the BLOCK-FINAL `*clen` and the BLOCK-FIRST appends,
+            // and both are answered (the snapshot here, the non-wrapped-ring
+            // precondition at the gate).
+            if mrows_attn {
+                clen_rows[r] = comp_len as i32;
+            } else {
+                //
+                // P1v (DSV41_VERIFY_OROPE): the EAGER path runs the FUSED launch
+                // (`sparse_attn_orope`: the inverse o-rope and the fp8 emission of the
+                // roped row folded into the sparse-attention kernel) while this path
+                // ran the triple — and the two are NOT bit-identical (the +18
+                // `DSV41_DIFF_EAGER` mismatches vs ONE with the EAGER-side fusion
+                // off). Same kernel on both sides is the alignment.
+                //
+                // ABI (checked against `sparse_attn_orope_kernel` phase 3): the call is
+                // per row (`b = m = 1`, `h = nlh`, `d = hd`), and with the row's own
+                // base pointers it writes the roped row to `out + hh*hd`, the fp8 to
+                // `xq + hh*hd` and the scale to `xsc + hh*(hd/32)` — `[h, d]` fp8 +
+                // `[h, d/32]` f32 relative to the pointers handed in. Passing
+                // `xq_r + r*nlh*hd` / `xsc_r + r*(nlh*hd/32)` therefore lands EXACTLY
+                // on the per-row compact packing the `quant_fp8` loop below used to
+                // write (same bytes, same offsets), so the downstream
+                // `wo_a_grouped_fp8` sees an unchanged layout.
+                let oroped = vo
+                    && self.dev.sparse_attn_orope(
+                        (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                        ring_ptr as *const f32,
+                        ld.attn_sink.as_ref().unwrap().as_f32(),
+                        (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
+                        (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                        1,
+                        1,
+                        nlh as i32,
+                        hd as i32,
+                        clen_owner,
+                        win as i32,
+                        cfg.index_topk as i32,
+                        scale,
+                        self.cos.as_f32(),
+                        self.sin.as_f32(),
+                        // row `r` sits at `pos_ctr + r`, i.e. `mul = 1, off = r,
+                        // step = 0` — the same `tt` the per-row `apply_rope` fallback
+                        // below computes off the same counter (`hd`-independent here:
+                        // the fused kernel's `hh*step` term is the rope's per-head
+                        // step, which is 0 on both sides).
+                        pos_ctr,
+                        rd as i32,
+                        half,
+                        1,
+                        r as i32,
+                        0,
+                        true,
+                        (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
+                        (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (nlh * hd / 32)),
+                        // W2-MROWS inputs: inert at `b = m = 1` (the row is the whole
+                        // launch, `idxs` is that row's own base, `row_step = 0` keeps
+                        // the `off = r` formula).
+                        std::ptr::null(),
+                        0,
+                        0,
+                    )?;
+                if !oroped {
+                    self.dev.sparse_attn(
+                        (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                        ring_ptr as *const f32,
+                        ld.attn_sink.as_ref().unwrap().as_f32(),
+                        (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
+                        (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                        1,
+                        1,
+                        nlh as i32,
+                        hd as i32,
+                        clen_owner,
+                        win as i32,
+                        cfg.index_topk as i32,
+                        scale,
+                        std::ptr::null(),
+                        0,
+                    )?;
+                }
+                if vo {
+                    orope_rows[r] = oroped;
+                }
+            }
+        }
+
+        // ---- W2-MROWS: the block's ONE sparse-attention launch ----
+        // Only reached when BOTH preconditions held (see the gate above), i.e. the
+        // block's appends cannot have clobbered any slot a row's window reads, so
+        // each row sees the ring image its per-row call saw, and the row pitch is
+        // `h*d`, so `q_r`/`o_r`/`xq_r`/`xsc_r` are indexed exactly as the per-row
+        // calls indexed them (row `mm` of the block is `q_r + mm*nh*hd`, the same
+        // address the loop above passed). `clen_rows[mm]` gives row `mm` its own
+        // `topk`, and `idx_stride = ist` is the `idxs_r` row pitch — NOT `topk`,
+        // which is per-row now that `clen` is (`ist = win + index_topk` is the
+        // block's fixed pitch; a row with `clen < index_topk` has the smaller
+        // `topk`, so the historical `(bb*m+mm)*topk` base would alias the next
+        // row's block).
+        if mrows_attn {
+            // The fused form when the row loop would have taken it. A decline is
+            // all-or-nothing (it is a property of the call SHAPE and the env, not
+            // of a row), which is what lets `orope_rows` be filled uniformly below.
             let oroped = vo
                 && self.dev.sparse_attn_orope(
-                    (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                    self.s.q_r.ptr as *const f32,
                     ring_ptr as *const f32,
                     ld.attn_sink.as_ref().unwrap().as_f32(),
-                    (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
-                    (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                    self.s.idxs_r.ptr as *const i32,
+                    self.s.o_r.ptr as *mut f32,
                     1,
-                    1,
+                    m as i32,
                     nlh as i32,
                     hd as i32,
                     clen_owner,
@@ -8365,40 +8559,45 @@ impl<'a> DevChain<'a> {
                     scale,
                     self.cos.as_f32(),
                     self.sin.as_f32(),
-                    // row `r` sits at `pos_ctr + r`, i.e. `mul = 1, off = r,
-                    // step = 0` — the same `tt` the per-row `apply_rope` fallback
-                    // below computes off the same counter (`hd`-independent here:
-                    // the fused kernel's `hh*step` term is the rope's per-head
-                    // step, which is 0 on both sides).
                     pos_ctr,
                     rd as i32,
                     half,
                     1,
-                    r as i32,
+                    0,
                     0,
                     true,
-                    (self.s.xq_r.ptr as *mut u8).wrapping_add(r * nlh * hd),
-                    (self.s.xsc_r.ptr as *mut f32).wrapping_add(r * (nlh * hd / 32)),
+                    self.s.xq_r.ptr as *mut u8,
+                    self.s.xsc_r.ptr as *mut f32,
+                    clen_rows.as_ptr(),
+                    ist as i32,
+                    // `row_step = 1`: `tt = pos_ctr + mm`, the per-row call's
+                    // `off = r` — each row ropes at its own position.
+                    1,
                 )?;
             if !oroped {
                 self.dev.sparse_attn(
-                    (self.s.q_r.ptr as *const f32).wrapping_add(r * nh * hd),
+                    self.s.q_r.ptr as *const f32,
                     ring_ptr as *const f32,
                     ld.attn_sink.as_ref().unwrap().as_f32(),
-                    (self.s.idxs_r.ptr as *const i32).wrapping_add(r * ist),
-                    (self.s.o_r.ptr as *mut f32).wrapping_add(r * nh * hd),
+                    self.s.idxs_r.ptr as *const i32,
+                    self.s.o_r.ptr as *mut f32,
                     1,
-                    1,
+                    m as i32,
                     nlh as i32,
                     hd as i32,
                     clen_owner,
                     win as i32,
                     cfg.index_topk as i32,
                     scale,
+                    clen_rows.as_ptr(),
+                    ist as i32,
                 )?;
             }
             if vo {
-                orope_rows[r] = oroped;
+                // No row was found; the block's answer is uniform.
+                for slot in orope_rows[..m].iter_mut() {
+                    *slot = oroped;
+                }
             }
         }
 
@@ -11148,6 +11347,11 @@ fn hc_tail_split() -> bool {
                 true,
                 self.s.xq.ptr as *mut u8,
                 self.s.xsc.ptr as *mut f32,
+                // W2-MROWS: the eager row is b = m = 1 — scalar counter, `topk`
+                // pitch and the old rope formula, bit-identical.
+                std::ptr::null(),
+                0,
+                0,
             )?;
         if !s_orope {
             self.dev.sparse_attn(
@@ -11164,6 +11368,9 @@ fn hc_tail_split() -> bool {
                 win as i32,
                 cfg.index_topk as i32,
                 1.0 / (hd as f32).sqrt(),
+                // W2-MROWS: b = m = 1, so both new inputs are inert.
+                std::ptr::null(),
+                0,
             )?;
         }
         // B2 (DSV41_OROPE_Q, default ON): the inverse rope's epilogue emits the

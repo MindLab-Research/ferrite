@@ -39,7 +39,14 @@
 // first stream), carried into hc_mixes_tail_kernel (the split's EARLY half),
 // hc_front_kernel, hc_pre_persist_kernel and hc_pre_persist_mb_kernel. Without
 // the trailing int a stale .so would read it as the stream pointer.
-#define FERRITE_KERNEL_ABI_VERSION 4u
+// ABI 5 (2026-09-12): W2-MROWS (DSV41_ATTN_MROWS) — the m-row sparse-attention
+// call. dsv41_sparse_attn gained `const int* clen_rows, int idx_stride` and
+// dsv41_sparse_attn_orope gained `const int* clen_rows, int idx_stride,
+// int row_step` (all three before their stream), carried into
+// sparse_attn_kernel / sparse_attn_warp_kernel / sparse_attn_pf_kernel /
+// sparse_attn_split_kernel / sparse_attn_orope_kernel. Without the bump a stale
+// .so would read `clen_rows` as the stream pointer.
+#define FERRITE_KERNEL_ABI_VERSION 5u
 extern "C" const char* ferrite_kernel_build_id(void) { return FERRITE_KERNEL_BUILD_ID; }
 extern "C" unsigned ferrite_kernel_abi_version(void) { return FERRITE_KERNEL_ABI_VERSION; }
 

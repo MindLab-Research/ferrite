@@ -243,7 +243,13 @@ struct Kernels {
     ) -> c_int,
     sparse_attn: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const i32, *mut f32,
-        c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32, CuStream,
+        c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
+        // W2-MROWS (DSV41_ATTN_MROWS, ABI 5): the m-row call's inputs. `clen_rows`
+        // is the per-row compressor-length snapshot (`nullptr` = read the single
+        // scalar counter, which is what every pre-W2 caller wants and what keeps
+        // the per-row result byte-identical); `idx_stride` is the `idxs` row pitch
+        // (0 = the historical `topk` pitch). See `dsv41_sparse_attn`.
+        *const c_int, c_int, CuStream,
     ) -> c_int,
     // P1 (DSV41_SPARSE_OROPE): sparse attention + inverse o-rope + fp8 emission
     // in ONE launch, replacing the `sparse_attn` + `apply_rope_q` (+ `quant1`)
@@ -257,7 +263,12 @@ struct Kernels {
         *const f32, *const f32, *const f32, *const i32, *mut f32,
         c_int, c_int, c_int, c_int, *const c_int, c_int, c_int, f32,
         *const f32, *const f32, *const c_int, c_int, c_int, c_int, c_int, c_int, c_int,
-        *mut u8, *mut f32, CuStream,
+        *mut u8, *mut f32,
+        // W2-MROWS (DSV41_ATTN_MROWS, ABI 5): `clen_rows`/`idx_stride` as in
+        // `sparse_attn`; `row_step` makes the rope position affine in the row
+        // (`tt = base*mul + off + hh*step + mm*row_step`, 0 = the old formula), so
+        // an m-row launch ropes row `mm` at `pos_base + mm`.
+        *const c_int, c_int, c_int, CuStream,
     ) -> c_int>,
     indexer_topk: unsafe extern "C" fn(
         *const f32, *const f32, *const f32, *const u8, *const i32, *mut i32,
@@ -425,6 +436,11 @@ struct Kernels {
     gemv_bf16_v1_mrows: Option<
         unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
     >,
+    /// Tap bf16 round-trip (DSV41_TAP_BF16): in-place elementwise
+    /// `x[i] = bf16_to_f32(f32_to_bf16(x[i]))` for the dspark draft's main_h
+    /// buffer, aligning the MTP head's input with the official model's bf16
+    /// hidden states. Optional so a stale `.so` simply declines.
+    bf16_roundtrip: Option<unsafe extern "C" fn(*mut f32, i64, CuStream) -> c_int>,
     // Grouped low-rank output projection, from dsv41_kernels.cu
     // (`dsv41_wo_a_grouped_fp8`). The draft's block-diagonal `wo_a` in ONE
     // launch per (group tile x MTP block) instead of one m=1 gemv per
@@ -1060,6 +1076,7 @@ impl Device {
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
             gemv_bf16_v1_mrows: ko!(rt, "dsv41_gemv_bf16_v1_mrows"),
+            bf16_roundtrip: ko!(rt, "dsv41_bf16_roundtrip"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
             argmax: ko!(rt, "dsv41_argmax"),
@@ -1129,6 +1146,18 @@ impl Device {
 
     pub fn stream(&self) -> CuStream {
         self.stream
+    }
+
+    /// Tap bf16 round-trip (DSV41_TAP_BF16): in-place elementwise
+    /// `x[i] = bf16_to_f32(f32_to_bf16(x[i]))`. Returns Ok(false) when the
+    /// symbol is absent (stale .so) so the caller can treat it as a no-op.
+    pub fn bf16_roundtrip(&self, x: *mut f32, n: i64) -> Result<bool> {
+        let Some(f) = self.kernels.bf16_roundtrip else {
+            return Ok(false);
+        };
+        let rc = unsafe { f(x, n, self.stream) };
+        self.kerr(rc, "dsv41_bf16_roundtrip")?;
+        Ok(true)
     }
 
     /// True when the runtime owns the SECOND side stream and its fork/join
@@ -2283,10 +2312,17 @@ impl Device {
         window: i32,
         index_topk: i32,
         scale: f32,
+        // W2-MROWS (DSV41_ATTN_MROWS): `b*m > 1` needs BOTH the per-row counter
+        // snapshot and the `idxs` row pitch. `(null, 0)` is the per-row/shape-P0
+        // call: every row reads the single scalar counter and the `topk` pitch,
+        // byte-for-byte identical to the pre-W2 launcher.
+        clen_rows: *const c_int,
+        idx_stride: i32,
     ) -> Result<()> {
         let rc = unsafe {
             (self.kernels.sparse_attn)(
-                q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, self.stream,
+                q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, clen_rows,
+                idx_stride, self.stream,
             )
         };
         self.kerr(rc, "dsv41_sparse_attn")
@@ -2328,6 +2364,12 @@ impl Device {
         inverse: bool,
         xq: *mut u8,
         xsc: *mut f32,
+        // W2-MROWS (DSV41_ATTN_MROWS): `clen_rows`/`idx_stride` as in
+        // [`Self::sparse_attn`]; `row_step` adds `mm * row_step` to the rope
+        // position (`0` = the per-row call's `off = r`, `step = 0` spelling).
+        clen_rows: *const c_int,
+        idx_stride: i32,
+        row_step: i32,
     ) -> Result<bool> {
         let f = match self.kernels.sparse_attn_orope {
             Some(f) => f,
@@ -2335,7 +2377,8 @@ impl Device {
         };
         let rc = unsafe {
             f(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
-              rope_rd, half, mul, off, step, inverse as i32, xq, xsc, self.stream)
+              rope_rd, half, mul, off, step, inverse as i32, xq, xsc, clen_rows, idx_stride,
+              row_step, self.stream)
         };
         // 1/2/3 are the decline sentinels (see the C launcher); anything else is
         // a real launch error.

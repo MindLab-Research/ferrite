@@ -172,6 +172,19 @@ struct DraftP3a {
 ///
 /// Read once and cached (the house rule for hot-path gates): this branch runs
 /// `bs x n_mtp` times per draft step.
+/// TAP BF16 ROUND-TRIP gate (`DSV41_TAP_BF16`, DEFAULT OFF): rounds the dspark
+/// draft's `main_h` input (the concatenated target-layer hidden states) back to
+/// bf16 precision, matching the official model's dtype for the tensors the MTP
+/// head was trained on. Read once and cached.
+fn tap_bf16() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_TAP_BF16")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    })
+}
+
 fn draft_p3a() -> DraftP3a {
     static F: std::sync::OnceLock<DraftP3a> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -685,7 +698,18 @@ impl<'a> DsparkDev<'a> {
             self.main_h.ptr,
             src as *const c_void,
             self.n_target * self.dim * std::mem::size_of::<f32>(),
-        )
+        )?;
+        // TAP BF16 ROUND-TRIP (DSV41_TAP_BF16, default OFF): the official
+        // model's hidden states carry the model dtype (bf16) — the MTP head was
+        // trained on bf16 taps. ferrite's chain keeps f32, so the draft's input
+        // is systematically ~1e-3 off what the head expects, which suppresses
+        // the first-token acceptance (the 64% k_acc=0 mode). The round-trip is
+        // exact (RN narrowing, lossless widening) and OFF keeps every bit.
+        if tap_bf16() {
+            let n = (self.n_target * self.dim) as i64;
+            self.dev.bf16_roundtrip(self.main_h.ptr as *mut f32, n)?;
+        }
+        Ok(())
     }
 
     /// Append a COMMITTED verify block's target hiddens to the window rings:
@@ -1499,6 +1523,13 @@ impl<'a> DsparkDev<'a> {
             n_win as i32,
             bs as i32,
             (hd as f32).powf(-0.5),
+            // W2-MROWS: the draft block's counter is one value for the whole
+            // block (it is passed in as `self.clen`, not advanced per draft row),
+            // so the scalar read stays - and `self.idxs` is the draft's own
+            // [bs, ...] pitch (`topk` = n_win + bs here, so `idx_stride = 0`
+            // reproduces the historical `topk` pitch).
+            std::ptr::null(),
+            0,
         )?;
         // inverse RoPE, same per-query positions
         self.rope_queries_inv(self.o.ptr as *mut f32, pos)?;

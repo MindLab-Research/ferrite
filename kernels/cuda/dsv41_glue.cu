@@ -2114,3 +2114,24 @@ extern "C" int dsv41_dspark_comp_restore(float* state_kv, float* state_score, fl
                                                       snap_out_rows, ratio, max_ratio, hd);
     return (int)cudaGetLastError();
 }
+
+// TAP BF16 ROUND-TRIP (DSV41_TAP_BF16, 2026-09-12): the dspark draft's input
+// (main_h, the concatenated target-layer hidden states) is f32 in ferrite but
+// bf16 in the official reference — every tensor the MTP head was trained on
+// carried the model dtype. This kernel rounds the buffer in place, elementwise:
+//   out[i] = __bfloat162float(__float2bfloat16(in[i]))
+// The round-trip is exact (RN narrowing, lossless widening), and OFF (the
+// caller's gate) keeps every bit. The gate lives chain-side (OnceLock), same
+// pattern as DSV41_BF16_TRUNCATE.
+__global__ void dsv41_bf16_roundtrip_kernel(float* __restrict__ x, long n) {
+    const long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = __bfloat162float(__float2bfloat16(x[i]));
+}
+
+extern "C" int dsv41_bf16_roundtrip(float* x, long n, cudaStream_t s) {
+    if (x == nullptr || n <= 0) return (int)cudaErrorInvalidValue;
+    const long blocks = (n + 255) / 256;
+    if (blocks > 2147483647L) return (int)cudaErrorInvalidValue;
+    dsv41_bf16_roundtrip_kernel<<<(unsigned)blocks, 256, 0, s>>>(x, n);
+    return (int)cudaGetLastError();
+}

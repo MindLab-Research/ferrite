@@ -941,15 +941,27 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
                                    const float* __restrict__ sink, const int32_t* __restrict__ idxs,
                                    float* __restrict__ out, int b, int m, int h, int d,
                                    const int* __restrict__ clen, int window, int index_topk,
-                                   float scale) {
-    // n and topk used to be host arguments derived from this layer's compress_len;
-    // they change per step, so a captured graph would freeze them. The counter now
-    // lives on the device (the compressor's commit kernel advances it).
-    const int n = window + *clen;
-    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+                                   float scale, const int* __restrict__ clen_rows, int idx_stride) {
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // n and topk used to be host arguments derived from this layer's compress_len;
+    // they change per step, so a captured graph would freeze them. The counter now
+    // lives on the device (the compressor's commit kernel advances it).
+    //
+    // W2-MROWS (DSV41_ATTN_MROWS): in an m-row launch ONE counter value is not
+    // enough - row `mm`'s bound is its OWN count (row mm's compressor commit
+    // precedes row mm's attention and follows row mm-1's), so the caller hands
+    // the per-row snapshot in `clen_rows`. `clen_rows == nullptr` (every caller
+    // before W2) keeps the scalar read, byte-for-byte.
+    const int cl = clen_rows ? clen_rows[mm] : *clen;
+    const int n = window + cl;
+    const int topk = window + ((cl < index_topk) ? cl : index_topk);
+    // `idxs` is strided by the CALLER's row pitch: a per-row call passes
+    // `idxs_r + r * (window + index_topk)` (its window and compressed halves are
+    // contiguous), which is NOT `topk` once `cl` < index_topk. `idx_stride == 0`
+    // keeps the historical `topk` pitch.
+    const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
         const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
         // acc is a COMPILE-TIME-sized array (d <= 512 and blockDim is 128 here, so
@@ -965,7 +977,7 @@ __global__ void sparse_attn_kernel(const float* __restrict__ q, const float* __r
         for (int i = 0; i < kMaxPer; ++i) acc[i] = 0.f;
         float smax = -1e30f, se = 0.f;
         for (int t = 0; t < topk; t++) {
-            const int idx = idxs[(size_t)(bb * m + mm) * topk + t];
+            const int idx = irow[t];
             if (idx < 0) continue;
             const float* kr = kv + ((size_t)bb * n + idx) * d;
             float dot = 0.f;
@@ -1033,12 +1045,16 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
                                         const int32_t* __restrict__ idxs, float* __restrict__ out,
                                         int b, int m, int h, int d,
                                         const int* __restrict__ clen, int window, int index_topk,
-                                        float scale) {
-    const int n = window + *clen;
-    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+                                        float scale, const int* __restrict__ clen_rows,
+                                        int idx_stride) {
     const int row = blockIdx.x;  // flattened (b, m)
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
+    // W2-MROWS (DSV41_ATTN_MROWS): per-row bound, see `sparse_attn_kernel`.
+    const int cl = clen_rows ? clen_rows[mm] : *clen;
+    const int n = window + cl;
+    const int topk = window + ((cl < index_topk) ? cl : index_topk);
+    const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
         const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
         const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
@@ -1048,7 +1064,7 @@ __global__ void sparse_attn_warp_kernel(const float* __restrict__ q, const float
         for (int i = 0; i < kMaxPerW; ++i) my_acc[i] = 0.f;
         float my_smax = -1e30f, my_se = 0.f;
         for (int t = wid; t < topk; t += nwarp) {
-            const int idx = idxs[(size_t)(bb * m + mm) * topk + t];
+            const int idx = irow[t];
             if (idx < 0) continue;
             const float* kr = kv + ((size_t)bb * n + idx) * d;
             float dot = 0.f;
@@ -1118,7 +1134,8 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
                                       const int32_t* __restrict__ idxs, float* __restrict__ out,
                                       int b, int m, int h, int d,
                                       const int* __restrict__ clen, int window, int index_topk,
-                                      float scale) {
+                                      float scale, const int* __restrict__ clen_rows,
+                                      int idx_stride) {
 #if __CUDA_ARCH__ >= 900
     // PDL (DSV41_PDL, see dsv41_pdl_or_plain): the launcher may have launched
     // this grid with programmatic stream serialization, so the grid is already
@@ -1131,12 +1148,14 @@ __global__ void sparse_attn_pf_kernel(const float* __restrict__ q, const float* 
     // there is nothing worth hoisting above the sync.
     cudaGridDependencySynchronize();
 #endif
-    const int n = window + *clen;
-    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
-    const int32_t* irow = idxs + (size_t)(bb * m + mm) * topk;
+    // W2-MROWS (DSV41_ATTN_MROWS): per-row bound, see `sparse_attn_kernel`.
+    const int cl = clen_rows ? clen_rows[mm] : *clen;
+    const int n = window + cl;
+    const int topk = window + ((cl < index_topk) ? cl : index_topk);
+    const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     for (int hh = blockIdx.y; hh < h; hh += gridDim.y) {
         const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
         const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
@@ -1487,21 +1506,26 @@ __global__ void sparse_attn_split_kernel(const float* __restrict__ q,
                                          const float* __restrict__ kv,
                                          const int32_t* __restrict__ idxs, int b, int m, int h,
                                          int d, const int* __restrict__ clen, int window,
-                                         int index_topk, float scale, int C) {
-    const int n = window + *clen;
-    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+                                         int index_topk, float scale, int C,
+                                         const int* __restrict__ clen_rows, int idx_stride) {
     const int ck = blockIdx.x;
     const int row = blockIdx.y;
     if (row >= b * m || ck >= C) return;
     const int hh = blockIdx.z;
     if (hh >= h) return;
     const int bb = row / m, mm = row % m;
+    // W2-MROWS (DSV41_ATTN_MROWS): per-row bound (`clen_rows == nullptr` keeps the
+    // scalar read, byte-for-byte); `idx_stride` is the caller's row pitch, see
+    // `sparse_attn_kernel`.
+    const int cl = clen_rows ? clen_rows[mm] : *clen;
+    const int n = window + cl;
+    const int topk = window + ((cl < index_topk) ? cl : index_topk);
     const float* qr = q + ((size_t)(bb * m + mm) * h + hh) * d;
     const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
     const int nwarp = (int)blockDim.x >> 5;
     const int lo = (int)((long long)topk * ck / C);
     const int hi = (int)((long long)topk * (ck + 1) / C);
-    const int32_t* row_idx = idxs + (size_t)(bb * m + mm) * topk;
+    const int32_t* row_idx = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     // Stage the q row once: kills the per-slot re-read of qr (16 floats/lane).
     float qv[kMaxPerW];
 #pragma unroll
@@ -2036,13 +2060,17 @@ __global__ void sparse_attn_orope_kernel(
     const int* __restrict__ clen, int window, int index_topk, float scale,
     const float* __restrict__ cos, const float* __restrict__ sin,
     const int* __restrict__ base, int rope_rd, int half, int mul, int off, int step,
-    int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc) {
-    const int n = window + *clen;
-    const int topk = window + ((*clen < index_topk) ? *clen : index_topk);
+    int inverse, uint8_t* __restrict__ xq, float* __restrict__ xsc,
+    const int* __restrict__ clen_rows, int idx_stride, int row_step) {
     const int row = blockIdx.x;
     if (row >= b * m) return;
     const int bb = row / m, mm = row % m;
-    const int32_t* irow = idxs + (size_t)(bb * m + mm) * topk;
+    // W2-MROWS (DSV41_ATTN_MROWS): per-row bound and per-row pitch, see
+    // `sparse_attn_kernel`.
+    const int cl = clen_rows ? clen_rows[mm] : *clen;
+    const int n = window + cl;
+    const int topk = window + ((cl < index_topk) ? cl : index_topk);
+    const int32_t* irow = idxs + (size_t)(bb * m + mm) * (idx_stride ? idx_stride : topk);
     // ---- the one addition to the phase-1 footprint: the o row, in smem ----
     // d <= 512 (kMaxPerW * 32) is guaranteed by the launcher.
     __shared__ float sh_row[512];
@@ -2273,7 +2301,11 @@ __global__ void sparse_attn_orope_kernel(
         // row - `apply_rope_kernel:1218-1224` verbatim, with `row` = the head
         // row's rope base inside sh_row and `t` the per-call position.
         {
-            const int tt = (*base) * mul + off + hh * step;
+            // W2-MROWS: the position is affine in (row, head) —
+            // `base*mul + off + hh*step` is the per-ROW call's spelling (`off = r`,
+            // `step = 0`), and an m-row launch adds `mm*row_step` so row `mm` ropes
+            // at `pos_base + mm`. `row_step == 0` is the old formula, bit-exact.
+            const int tt = (*base) * mul + off + hh * step + mm * row_step;
             float* rrow = sh_row + (d - rope_rd);
             for (int i = threadIdx.x; i < half; i += blockDim.x) {
                 const float cc = cos[(size_t)tt * half + i];
@@ -7242,7 +7274,7 @@ extern "C" int dsv41_argmax_sliced_rows(
 extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* sink,
                                  const int32_t* idxs, float* out, int b, int m, int h, int d,
                                  const int* clen, int window, int index_topk, float scale,
-                                 cudaStream_t s) {
+                                 const int* clen_rows, int idx_stride, cudaStream_t s) {
     if (d > 512) return (int)cudaErrorInvalidValue;  // the accumulator is d-wide per thread group
     // Flash-decode split by default; DSV41_ATTN_SEQ=1 restores the sequential
     // version for A/B. Cached in a static: this runs per attention call, and a
@@ -7270,7 +7302,8 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             // arm. It is tested BEFORE the split on purpose: the split now defaults
             // ON, so the old order would leave this arm unreachable.
             sparse_attn_warp_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen,
-                                                         window, index_topk, scale);
+                                                         window, index_topk, scale, clen_rows,
+                                                         idx_stride);
         } else if (split_c > 0 && split_c <= kAttnMaxC && b * m <= kAttnMaxBM &&
                    h <= kAttnMaxH) {
             // One block per (chunk, row, head); the split writes the partials,
@@ -7280,7 +7313,8 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             // partials visible to the merge with no fence and no sync.
             sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                             (unsigned)h), 128, 0, s>>>(
-                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+                q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
+                idx_stride);
             cudaError_t e2 = cudaGetLastError();
             if (e2 != cudaSuccess) return (int)e2;
             sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
@@ -7295,11 +7329,12 @@ extern "C" int dsv41_sparse_attn(const float* q, const float* kv, const float* s
             // reads. The split/merge and warp A/B arms deliberately stay plain.
             cudaError_t le = dsv41_pdl_or_plain(sparse_attn_pf_kernel, grid, dim3(128), 0, s, q,
                                                kv, sink, idxs, out, b, m, h, d, clen, window,
-                                               index_topk, scale);
+                                               index_topk, scale, clen_rows, idx_stride);
             if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
         }
     } else {
-        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale);
+        sparse_attn_kernel<<<grid, 128, 0, s>>>(q, kv, sink, idxs, out, b, m, h, d, clen, window,
+                                                index_topk, scale, clen_rows, idx_stride);
     }
     return (int)cudaGetLastError();
 }
@@ -7337,7 +7372,8 @@ extern "C" int dsv41_sparse_attn_orope(
     const float* q, const float* kv, const float* sink, const int32_t* idxs, float* out, int b,
     int m, int h, int d, const int* clen, int window, int index_topk, float scale,
     const float* cos, const float* sin, const int* base, int rope_rd, int half, int mul, int off,
-    int step, int inverse, uint8_t* xq, float* xsc, cudaStream_t s) {
+    int step, int inverse, uint8_t* xq, float* xsc, const int* clen_rows, int idx_stride,
+    int row_step, cudaStream_t s) {
     if (b <= 0 || m <= 0 || h <= 0 || d <= 0) return 1;
     if (d > 512) return 1;              // accumulator is d-wide per thread group
     if ((d & 31) != 0) return 1;        // fp8 per-32-block index must stay head-local
@@ -7368,7 +7404,8 @@ extern "C" int dsv41_sparse_attn_orope(
         // program order makes the partials visible to the merge with no fence.
         sparse_attn_split_kernel<<<dim3((unsigned)split_c, (unsigned)(b * m),
                                         (unsigned)h), 128, 0, s>>>(
-            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c);
+            q, kv, idxs, b, m, h, d, clen, window, index_topk, scale, split_c, clen_rows,
+            idx_stride);
         cudaError_t e2 = cudaGetLastError();
         if (e2 != cudaSuccess) return (int)e2;
         sparse_attn_merge_kernel<<<dim3((unsigned)(b * m), (unsigned)h), 128, 0, s>>>(
@@ -7379,7 +7416,7 @@ extern "C" int dsv41_sparse_attn_orope(
     if (pf_off) return 2;
     sparse_attn_orope_kernel<<<dim3(b * m, h), 128, 0, s>>>(
         q, kv, sink, idxs, out, b, m, h, d, clen, window, index_topk, scale, cos, sin, base,
-        rope_rd, half, mul, off, step, inverse, xq, xsc);
+        rope_rd, half, mul, off, step, inverse, xq, xsc, clen_rows, idx_stride, row_step);
     return (int)cudaGetLastError();
 }
 
