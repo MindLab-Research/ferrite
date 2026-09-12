@@ -2122,3 +2122,19 @@ nvjet splitK + splitKreduce。门控 `FERRITE_GEMM3`（默认 ON，`=0` 完全�
 **剩余路径**：①**逐行融合**（rope/ring/attn 的 m 次 launch → kernel 内 m 行循环，保持逐行语义）②**吞主链步**（−6.15ms）③**draft 质量**（accept 0.58 → 3，draft-quality-research 在查 tap/main_proj/markov/窗口）。
 
 **提交纪律的教训（本会话犯了 3 次）**：共享工作树里**永远不要** `git add <file>` 而不跑一次**退出码被真正检查**的 `cargo check`——连带提交同伴的半成品会把 main 弄坏（本次 3 次：specstep 的 import、swallow 的两个未实现符号 + 一个 cast）。
+
+## 2026-09-12 Wave 2：draft 质量的判词（`drafts[0]==next` 33% 的根因 = seed↔tap 差一位）
+
+**判词（draft-quality-research 的三条独立证据 + 我的独立核实）**:
+1. `note_ctx_rows` 的 doc（`chain_dev.rs:467-469`）："Row `keep` (position `pos+keep+1` = the new `pos_ctr`) is deliberately NOT written … that position's KV comes from the next step's `step_dev` and is **seeded by the next `draft_forward`**"——**下一 step 的 `draft_forward` 的第一个实参就是新 `pos_ctr` 的 token** ⇒ **seed 必须写在实参的位置**。
+2. **`seed_window` 的调用自相矛盾**（我 grep 核实）：`:770`（`pos == 0` 分支）用 **`seed_window(s, pos)`** ✓ vs **`:1028`（稳态分支）用 `seed_window(s, pos - 1)`** ✗——同一个函数、同一个物理量、两个分支差一位。
+3. **tap 的真实位置是 `pos`**：`step_dev(token, pos)` 在槽 `pos % win` 写入该 token 的行，tap hook 取的是**这个 token 在该层的 hidden**，`import_tap` 之后才拷走。
+
+⇒ 现状写进 ring 的行是 **`{内容: h(token@pos)，RoPE: pos-1}`** 的错配；**`pos` 那一格永远没人写**（全流程写的位置集合 = `{p_i−1} ∪ [p_i+1, p_i+k_acc]`，**每个 step 的 `p_i` 都漏**）。
+⇒ **窗口内容相对 RoPE 相位系统性前移一个 token**（最有用的"紧邻前驱（距离 1）"以"距离 2"出现，而"距离 1"那一行是锚点自己，与 block row 0 重复）；叠加 **24/36 步 `k_acc=0` 时 `note_ctx_rows` early-return（一行新内容都不写）** ⇒ ring 里 `pos` 格的旧行长期留用；draft 的候选集**只有窗口** ⇒ `drafts[0]==next` 被压到 33%。**MoE ILV 修复能把 accept 从 0.02 拉到 0.52，正说明这条数值链极度敏感。**
+
+**修复（路线 A，判词推荐，最干净）**：锚点用**刚采样的 bonus**——`draft_forward(next, pos + 1)`（**seed 落点 = `(pos+1)−1 = pos`** ✓ 与 tap 的真实位置一致，`seed_window(s, pos-1)` **一行都不用改**）+ verify 6 行 `[next, d1..d5] @ pos+1..pos+6` + accept 索引对齐（`ferrite-types::spec_step::spec_accept(.., true)`）。
+
+**另两个候选（并行在查）**：
+- **§2 tap 采集口径**：我们在 `layer()` **末尾**取 `self.s.h`（= **该层输出**），而仓库自带的官方参考 `ref_inference/model.py:1264-1266` 在 `layer(h,…)` **之前**取（= **该层 attention 输入**）——**三份文档互相矛盾**（`config.rs`/`dspark.rs` 说 "input"；`dump_dev.rs` 说 "output"）——`tap-layer-arbitration` 在仲裁（**权重形状可唯一判定**）。
+- **§3 窗口回绕**（`pos ≥ win` 后锚点槽不再被排除——修 §1 时必须一起修）。
