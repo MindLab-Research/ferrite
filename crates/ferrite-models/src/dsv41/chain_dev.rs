@@ -8159,9 +8159,17 @@ impl<'a> DevChain<'a> {
             }
             // The interleaved layout is only addressable by the FUSED batched
             // gate/up body, so refuse loudly instead of reading the wrong bytes
-            // (the same contract `moe()` enforces).
+            // (the same contract `moe()` enforces). The two-pass e4m3 arm forces
+            // the UNFUSED [2*inter] layout (act_slot), which the fused body
+            // cannot write — so ILV + E4M3 is a hard conflict (the kernel's
+            // `ilv && !fuse` guard fires as cudaErrorInvalidValue, but catching
+            // it here gives a actionable message instead).
+            let two_pass_armed = expert_act_e4m3() && self.dev.supports_sub_dequant_fp4();
             if ld.experts_ilv
-                && !(gateup_fuse() && self.dev.supports_gateup_fuse() && expert_fp4_mode() == 2)
+                && (two_pass_armed
+                    || !(gateup_fuse()
+                        && self.dev.supports_gateup_fuse()
+                        && expert_fp4_mode() == 2))
             {
                 return Err(FerriteError::Config(
                     "routed expert gate/up weights are interleaved (DSV41_EXPERT_ILV) but the \
