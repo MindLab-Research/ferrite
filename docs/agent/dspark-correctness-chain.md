@@ -372,3 +372,19 @@ if cfg.indexer_owns_k(layer) && (publish_key || self.verify_recording) { self.pu
 - 图捕获步的摊销：capture at pos=20 → 前 20 步走裸链 → 50 步平均被拉高
 
 **修复方向**：让 E4M3 双趟与 ILV 兼容 → **已落地（2026-09-12，ministry-works）**：kernel 的 gate/up **PAIR body**（一 warp 一 inter 行、一次 LDG.128 取两半）原有两个 epilogue 由 `fuse_swiglu` 选：swiglu 后 `[inter]`，或**原始 gate|up 对**（`out[row]`/`out[b_split+row]`，即 `[2*inter]`）。launcher 去掉 `ilv && !fuse` 硬失败，只保留 PAIR body 的 K 契约 `dim%512==0`；`n_total`/`ksplit`/`pf` 改由同一个 `pair_body` 谓词决定（ILV+raw 因此拿到与 fused 完全相同的发射几何：ksplit=2、cp.async 预取）。Rust 侧 `moe_rows`/`draft_moe` 的 ILV 守卫同步放宽为"batched + dim%512==0"。
+
+## 最终性能验证（51ceb04e，全修复落地后）——verify 42.01ms 未降
+
+**全 gate ON（E4M3 + SH_EXP + GRAPH + P3A + WRITEBACK，ILV 默认 ON）**：
+- **文本正确 ✓**：LEN 132、opa: False、双字 4（EAGER 级质量保持）
+- **k_acc 改善**：{0:32, 1:15, 2:6, 3:1, 4:4}——mean-k 0.860，k_acc=4 出现 4 次
+- **verify = 42.01ms**——比基线 37.31 **慢 4.7ms**
+
+**性能分析**：
+- a32 mrows 物化已落地（Direction B），SH_EXP_MROWS 应能 dispatch
+- 但 verify 反而比无 e4m3 的 36.10ms 慢 6ms
+- **可能原因**：E4M3 双趟本身 +5ms（每层 2× expert GEMM + sub_dequant + add_inplace）
+- ILV 解耦后 e4m3 可用 ILV=ON（不再 +6.5ms），但双趟的额外发射仍在
+
+**结论**：E4M3 双趟的**计算成本**（2× GEMM）大于精度收益带来的 accept 提升（0.840→0.860 仅 +2%）。
+**正确方向**：**直接用 fp8 e4m3 激活**（官方语义：一次 act_quant(e4m3) + 一次 fp4_gemm）而非 e2m1×2 双趟模拟。这砍掉一半的 expert GEMM 发射。
