@@ -2125,3 +2125,7 @@ Step 40-41: 3 1                     (mean 2.0)
 **第二波（hc A1+A2）**：HC_VERIFY_FUSE=1（truncate=false 修复后）+ HC_FRONT_ROWS=1
 **第三波（SH_PAIR）**：M=1 版 A/B → template<M>（subagent 设计中）
 **第四波（tcgen05）**：对齐修复后的 smoke → parity
+
+## sparse_attn_orope 的 verify 路径现状（代码级确认）
+
+`DSV41_VERIFY_OROPE`（默认 **ON**）——verify 的 m 行路径**已经**走与 EAGER 相同的融合 sparse_attn_orope launch（chain_dev.rs:1966-1967 "the m-row verify path takes the SAME fused sparse-attention launch the EAGER path takes"）。✓ 已对齐——不需要额外迁移。
