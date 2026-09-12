@@ -409,6 +409,22 @@ struct Kernels {
     head_gemv_bf16_mrows: Option<
         unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
     >,
+    // V1-ORDER multi-row GEMV, from dsv41_glue.cu (`dsv41_gemv_bf16_v1_mrows`):
+    // the SAME v1 program `dsv41_gemv_bf16` runs, with `m` activation rows
+    // folded into one weight pass. This is the fold the verify's SLICED head
+    // actually needs — `head_gemv_bf16_mrows` above is the v2 (`gemv_bf16_nt`,
+    // WPR == 1) program, a NUMERICAL change against the v1 head that measured as
+    // one (`verify_head_fold`). Row r here is bit-identical to the per-row
+    // `gemv_bf16` launch of row r, because the head's shape stays on v1
+    // (`gemv_bf16_v2_wanted(n)` needs `n < 2048`; the head's `n` is the
+    // vocabulary / its slice). `x` is [m, k] f32, `out` is [m, n] f32. Optional:
+    // a stale .so without the symbol keeps the per-row loop, and m outside 1..=8
+    // is refused. NOTE v1's body is scalar, so — unlike `head_gemv_bf16_mrows` —
+    // there is no `k % 8 == 0` bound.
+    // ABI: `head_gemv_bf16_mrows`'s verbatim — (w, x, out, m=rows, n, k, s).
+    gemv_bf16_v1_mrows: Option<
+        unsafe extern "C" fn(*const c_void, *const f32, *mut f32, c_int, c_int, c_int, CuStream) -> c_int,
+    >,
     // Grouped low-rank output projection, from dsv41_kernels.cu
     // (`dsv41_wo_a_grouped_fp8`). The draft's block-diagonal `wo_a` in ONE
     // launch per (group tile x MTP block) instead of one m=1 gemv per
@@ -1043,6 +1059,7 @@ impl Device {
             gemv_f32: ko!(rt, "dsv41_gemv_f32"),
             gemv_f32_v2: ko!(rt, "dsv41_gemv_f32_v2"),
             head_gemv_bf16_mrows: ko!(rt, "dsv41_head_gemv_bf16_mrows"),
+            gemv_bf16_v1_mrows: ko!(rt, "dsv41_gemv_bf16_v1_mrows"),
             wo_a_grouped_fp8: ko!(rt, "dsv41_wo_a_grouped_fp8"),
             gemm_fp8_mrows: ko!(rt, "dsv41_gemm_fp8_mrows"),
             argmax: ko!(rt, "dsv41_argmax"),
@@ -3425,6 +3442,53 @@ impl Device {
         }
         let rc = unsafe { f(w, x, out, rows, n, k, self.stream) };
         self.kerr(rc, "dsv41_head_gemv_bf16_mrows")?;
+        Ok(true)
+    }
+
+    /// V1-ORDER multi-row twin of [`Self::gemv_bf16`] for the DSpark verify's
+    /// SLICED head: ONE launch streams the `[n, k]` bf16 weight ONCE and folds
+    /// all `rows` activation rows into it, where the per-row loop paid `m`
+    /// passes over the slice (`seg * k * 2` = 158 MB at world = 8; the head is
+    /// 1262 MB REPLICATED, `dspark-verify-perf-plan.md` §1.2). `x` is [rows, k]
+    /// f32 (`xn_r`), `out` is [rows, n] f32 (`logits_r`, the slice pitch).
+    ///
+    /// Row r is BIT-IDENTICAL to the single-row `gemv_bf16` launch of row r,
+    /// which for the head's shape is v1: `gemv_bf16_v2_wanted(n)` diverts only
+    /// `n < 2048`, and the head's `n` is the vocabulary (or its per-rank slice,
+    /// 16160 at world = 8), so the per-row program is `dsv41_gemv_bf16` /
+    /// `gemv_bf16_kernel`. The kernel header (dsv41_glue.cu) carries the
+    /// transcription argument: same `c = lane; c += 32` scan, one independent
+    /// accumulator per row, same `__shfl_xor_sync` tree, no K-split.
+    ///
+    /// ⚠️ WHY THIS EXISTS NEXT TO [`Self::head_gemv_bf16_mrows`]. That entry is
+    /// the v2 (`gemv_bf16_nt`, WPR == 1) program, so folding the v1 head with it
+    /// is a NUMERICAL change, and it measured as one (`verify_head_fold`: 33%
+    /// echo). It is the fold to use only when the per-row program IS v2 — i.e.
+    /// for `n < 2048`. The two entries have IDENTICAL ABIs, so a caller must
+    /// know which program it is claiming parity with; the verify's head needs
+    /// this one (v1).
+    ///
+    /// `Ok(false)` means NOT performed — keep the per-row loop: either the
+    /// loaded .so predates the symbol or `rows` is outside the kernel's 1..=8
+    /// dispatch set (the C entry refuses `m > 8` rather than reading garbage).
+    /// No `k` bound: v1's body is scalar, so any `k` is in its domain.
+    pub fn head_gemv_bf16_v1_mrows(
+        &self,
+        w: *const c_void,
+        x: *const f32,
+        out: *mut f32,
+        rows: i32,
+        n: i32,
+        k: i32,
+    ) -> Result<bool> {
+        let Some(f) = self.kernels.gemv_bf16_v1_mrows else {
+            return Ok(false);
+        };
+        if !(1..=8).contains(&rows) {
+            return Ok(false);
+        }
+        let rc = unsafe { f(w, x, out, rows, n, k, self.stream) };
+        self.kerr(rc, "dsv41_gemv_bf16_v1_mrows")?;
         Ok(true)
     }
 

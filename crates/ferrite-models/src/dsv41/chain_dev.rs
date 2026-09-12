@@ -1305,6 +1305,42 @@ fn verify_head_fold() -> bool {
     })
 }
 
+/// `DSV41_VERIFY_HEAD_MROWS=1` (DEFAULT OFF) folds the DSpark verify's SLICED
+/// head into ONE **v1-order** multi-row launch (`dsv41_gemv_bf16_v1_mrows`)
+/// instead of `m` per-row `gemv_bf16` calls.
+///
+/// **Why v1 order, and why this is NOT [`verify_head_fold`].** The per-row
+/// program the sliced verify head runs IS v1: `gemv_bf16_v2_wanted(n)` diverts
+/// only `n < 2048`, and the head's per-rank `n` is `seg = vocab / world` (16160
+/// at world = 8), so the per-row call lands on `dsv41_gemv_bf16` /
+/// `gemv_bf16_kernel`. The existing folded entry (`head_gemv_bf16_mrows`, the
+/// thing `verify_head_fold` re-enables) is the **v2** (`gemv_bf16_nt`, WPR == 1)
+/// program — a NUMERICAL change against the v1 head, and it measured as one
+/// (33% echo). This gate takes the **v1 fold** instead, whose row r is
+/// bit-identical to the per-row launch it replaces: the same `c = lane; c += 32`
+/// scan, one independent accumulator per row, v1's `__shfl_xor_sync` tree, no
+/// K-split (the kernel header in dsv41_glue.cu carries the transcription
+/// argument). So it changes the head's TRAFFIC (`m` passes over the slice →
+/// one) and its LAUNCH COUNT (`m` → 1) and **not its values** — the design's
+/// 1.12ms → 0.25-0.4ms arm (`docs/agent/verify-family-fusion.md`).
+///
+/// Both folds are mutually exclusive and neither is reachable from the other:
+/// `verify_head_fold` only fires on the UNSLICED arm (`geom.is_none()`), this
+/// one only on the SLICED arm.
+///
+/// Default OFF: the arm is new and needs an `.so` carrying
+/// `dsv41_gemv_bf16_v1_mrows`; a stale one falls back to the per-row loop (the
+/// method returns `Ok(false)`), as does `m > 8`. Read once and cached — this
+/// branch runs at the verify's head, inside graph capture.
+fn verify_head_mrows() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("DSV41_VERIFY_HEAD_MROWS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// `DSV41_VERIFY_HEAD_SLICED` (DEFAULT ON) gives the DSpark verify's head the
 /// same per-rank VOCABULARY SLICE the eager step takes under `DSV41_HEAD_SLICE`:
 /// each rank projects its own `seg = vocab / world` rows of `head.weight`, and
@@ -5164,16 +5200,36 @@ impl<'a> DevChain<'a> {
             // (2 bytes each) into it — the same offset arithmetic `step_body`
             // uses for the eager sliced head.
             let head_ptr = (head.ptr() as *const u8).wrapping_add(self.rank() * seg * dim * 2);
-            for r in 0..m {
-                let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
-                let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
-                self.dev.gemv_bf16(
+            // `DSV41_VERIFY_HEAD_MROWS=1` folds the block's rows into ONE
+            // V1-ORDER launch (`dsv41_gemv_bf16_v1_mrows`), which streams this
+            // rank's slice once instead of `m` times. Row r of the fold is
+            // BIT-IDENTICAL to the per-row `gemv_bf16` below (v1's `c = lane;
+            // c += 32` chain, one accumulator per row, v1's `__shfl_xor_sync`
+            // tree, no K-split — the kernel header carries the argument), so this
+            // is a traffic + launch change and not a numerical one. Default OFF:
+            // a stale .so (no symbol) or `m > 8` makes the method return
+            // `Ok(false)` and the per-row loop below still runs.
+            let mrows = verify_head_mrows()
+                && self.dev.head_gemv_bf16_v1_mrows(
                     head_ptr as *const c_void,
-                    xnr,
-                    lg,
+                    self.s.xn_r.ptr as *const f32,
+                    self.s.logits_r.ptr as *mut f32,
+                    m as i32,
                     seg as i32,
                     dim as i32,
                 )?;
+            if !mrows {
+                for r in 0..m {
+                    let xnr = (self.s.xn_r.ptr as *const f32).wrapping_add(r * dim);
+                    let lg = (self.s.logits_r.ptr as *mut f32).wrapping_add(r * lg_stride);
+                    self.dev.gemv_bf16(
+                        head_ptr as *const c_void,
+                        xnr,
+                        lg,
+                        seg as i32,
+                        dim as i32,
+                    )?;
+                }
             }
         } else if !folded {
             for r in 0..m {
