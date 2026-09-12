@@ -5311,3 +5311,20 @@ pub fn epoch_dev(&self) -> *mut std::ffi::c_uint {
 3. **"1497→54 的降级"可能是读到了 staging 的不同位置或重置后的值！**
 
 **待 epoch-decrease-rootcause 的完整分析**（ctr_at 是否 arm-dependent？staging 何时重置？）
+
+## tcgen05 第 2 轮重测的准备（第 10 次测试后立即跑）
+
+**修复内容**（round 2, +35/-12）：4 个新读点的 byte-fallback：
+- **:5009 expert_tcgen05_gateup_e4_kernel SF prologue（主嫌疑！）**——与失败臂同一 gate（DSV41_EXPERT_TCGEN05_E4M3）+ **prefill 必经**——解释 LEN=0（prefill 就挂→一个 token 都出不来）！
+- :2484 interleave_gateup_fp4 的 g/u（W3 平面）
+- :3616/:4278 两个 tcgen05 gateup 的 SF prologue
+
+**测试配置**（同第 1 轮重测）：
+- 干净栈 + tcgen05 gate 链（TCGEN05_E4M3=1 + GROUPED=1 + GATEUP_FUSE=0 + ILV=0 + MOE_BATCH=1）
+- 计数前 61 行 + 吞吐 + misaligned 检查
+
+**预期**：
+- 如果 :5009 是根因：无 misaligned + 输出正常 + 吞吐提升（MoE tensor cores 生效！）
+- 如果仍有 misaligned：还有其他读点（compute-sanitizer 定位）
+
+**注意**：需要双产物重编（.cu 变了）
