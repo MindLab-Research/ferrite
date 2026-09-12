@@ -1691,3 +1691,12 @@ DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1
 **判定**：
 - accept 显著提升 + 零拉丁 → v2/v1 不匹配是链式失败的主要根因
 - accept 不变 → v2/v1 的 ulp 差异不是主要因素
+
+## verify_head_fold vs draft_head_fold 的默认值确认
+
+- `verify_head_fold()`（chain_dev.rs:1455）：`unwrap_or(false)` — **默认 OFF**（verify head 走 v1 per-row）
+- `draft_head_fold()`（dspark_dev.rs:94）：`unwrap_or(true)` — **默认 ON**（draft head 走 v2 fold）
+
+**这就是 program 不匹配**：draft 用 v2（WPR==1，8 元素分组，shfl_down），verify 用 v1（标量，1 元素/lane，shfl_xor）。两个 program 的舍入不同 → argmax 近 tie 翻转 → 链式失败。
+
+**修复**：`DSV41_DRAFT_HEAD_FOLD=0`（draft head 回 v1，与 verify 一致）
