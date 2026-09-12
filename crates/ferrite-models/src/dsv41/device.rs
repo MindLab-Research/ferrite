@@ -2937,31 +2937,28 @@ impl Device {
     /// either way. `pos_ctr` may be NULL: the verify must not advance it, and
     /// only the epoch advance is unconditional.
     ///
-    /// `Ok(false)` when the loaded .so predates the symbol, when the kernel
-    /// DECLINED (the block's keys do not fit the v5 slot), or when the stream is
-    /// NOT capturing. The caller gates the layout on
-    /// [`Self::supports_argmax_sliced_rows`] and on the slot bound, so a decline
-    /// here is an inconsistency it must not swallow — see
+    /// `Ok(false)` when the loaded .so predates the symbol, or the kernel
+    /// DECLINED (the block's keys do not fit the v5 slot). The caller gates the
+    /// layout on [`Self::supports_argmax_sliced_rows`] and on the slot bound, so
+    /// a decline here is an inconsistency it must not swallow — see
     /// `verify_head_geom`.
     ///
-    /// # The v5 epoch rule
+    /// # The epoch advance is UNCONDITIONAL
     ///
     /// This entry is ONE round of the shared v5 epoch sequence: the kernel lands
     /// the block's keys in every peer's CURRENT parity slot, stamps, advances
-    /// `*epoch` (`*epoch = e + 1`, UNCONDITIONAL — note `pos_ctr` is the only
-    /// null-able argument, never the round), then polls every peer for the same
-    /// round. `epoch` is the SAME device counter the MoE all-reduce advances
-    /// (`c.epoch_dev()`), so the two must move together: the AR keeps the rule
-    /// `if !is_capturing() { return Ok(false) }` (`cuda.rs::p2p_ar_v2`, the v5
-    /// arm), i.e. the counter is advanced EXCLUSIVELY by replayed graph nodes.
-    /// Without the same guard here the DRY pass — a real execution OUTSIDE any
-    /// capture, where the AR falls back to NCCL and advances nothing — would
-    /// still fire this exchange and add one phantom epoch round to a counter the
-    /// capture/replay sequence owns, permanently skewing the ranks' epochs (every
-    /// later poll then waits for a stamp the peers publish at a different round:
-    /// the ar5 hang). Returning `false` instead hands the caller its
-    /// full-vocabulary per-row fallback — exactly what the AR's `false` hands
-    /// its caller (NCCL).
+    /// `*epoch` (`*epoch = e + 1`), then polls every peer for the same round.
+    /// `epoch` is the SAME device counter the MoE all-reduce advances
+    /// (`c.epoch_dev()`), so the two MUST advance together per step. The AR keeps
+    /// no capturing guard on this code path either: DSV41's MoE all-reduce goes
+    /// through `all_reduce_inplace` → `p2p_ar_v5` (`tp.rs`), which advances one
+    /// round wherever it runs, capture or not. (`p2p_ar_v2`'s
+    /// `if !is_capturing() { return Ok(false) }` is a different arm, one DSV41
+    /// does not take.) A guard here would drop this side's round while the AR
+    /// kept its own — one round of permanent drift per step, after which every
+    /// poll waits for a stamp the peers publish at a different round (the ar5
+    /// disaster, gap 22). Hence: no guard, and `Ok(false)` only for the two arms
+    /// above.
     #[allow(clippy::too_many_arguments)]
     pub fn argmax_sliced_rows(
         &self,
@@ -2982,12 +2979,6 @@ impl Device {
         rows: i32,
         stride_bytes: i64,
     ) -> Result<bool> {
-        // Not a capture: no epoch round may run from a host path (see above).
-        // This also covers every `.so`-less / non-v5 caller, which is why it sits
-        // ahead of the symbol probe.
-        if !self.capturing() {
-            return Ok(false);
-        }
         let f = match self.kernels.argmax_sliced_rows {
             Some(f) => f,
             None => return Ok(false),
