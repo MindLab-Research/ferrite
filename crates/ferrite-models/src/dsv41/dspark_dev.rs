@@ -72,25 +72,30 @@ fn trace() -> bool {
 
 /// `DSV41_DRAFT_HEAD_FOLD=0` swaps the draft's head GEMV to the PER-ROW
 /// `gemv_bf16` (the v1 program) instead of the folded multi-row
-/// `head_gemv_bf16_mrows`. **Default ON (the folded path): this gate exists as
-/// an A/B, not as a fallback.**
+/// `head_gemv_bf16_v1_mrows` (**the v1-order fold**). **Default ON (the folded
+/// path): this gate exists as an A/B, not as a fallback.**
 ///
-/// The folded kernel's header claims bit-identity with the single-row launch it
-/// replaces (C1-C6); the verify's head measured it as false — see
-/// [`crate::dsv41::chain_dev::verify_head_fold`]'s doc, where folded gives
-/// `verify_out[0] == next` on 33% of rows vs 9% for the per-row `gemv_bf16`.
-/// The production single-row head is `gemv_bf16_kernel` in `dsv41_glue.cu:368`
-/// (the scalar `c += 32` chain) because `gemv_bf16_v2_wanted(n)` needs
-/// `n < 2048` and the head's `n = vocab_size = 129280` (device.rs). So folding
-/// the head is a NUMERICAL change, not a free scheduling one: the folded kernel
-/// pairs the fma/decode differently ⇒ ~1e-3 on the logits ⇒ a near-tie argmax
-/// can flip.
+/// **Why the fold is now v1-order** (`head_gemv_bf16_v1_mrows`). The draft's
+/// per-row arm is the SAME v1 program the verify's head runs: the production
+/// single-row head is `gemv_bf16_kernel` in `dsv41_glue.cu` (the scalar
+/// `c += 32` chain) because `gemv_bf16_v2_wanted(n)` needs `n < 2048` and the
+/// head's `n = vocab_size = 129280` (device.rs). The fold therefore has to be
+/// v1's order to stay the same program — the earlier v2 fold
+/// (`head_gemv_bf16_mrows`, the `gemv_bf16_nt` WPR == 1 body) was a NUMERICAL
+/// change: its header claims bit-identity, but the verify's head measured it as
+/// false (`verify_head_fold`: folded gives `verify_out[0] == next` on 33% of
+/// rows vs 9% for the per-row `gemv_bf16`), because it pairs the fma/decode
+/// differently ⇒ ~1e-3 on the logits ⇒ a near-tie argmax can flip. With the
+/// v2 fold the draft head and the verify head were TWO DIFFERENT PROGRAMS, so
+/// the accept comparison was measuring that mismatch, not the model.
 ///
-/// That matters here because the draft's top-1 IS `drafts[0]` (`ids[1]` in the
-/// Markov loop below): if the fold lowers it, the accept chain loses its first
-/// link. The A/B tests exactly that — same step, `drafts[0] == next` rate and
-/// the `k_acc` histogram, folded vs per-row. Read once and cached (the house
-/// rule for hot-path gates).
+/// The v1 fold keeps the multi-row TRAFFIC win (one pass over the head instead
+/// of `bs`) and is bit-identical to the per-row launch it replaces, so the draft
+/// head is now the verify's program. That matters here because the draft's top-1
+/// IS `drafts[0]` (`ids[1]` in the Markov loop below): if the fold lowers it, the
+/// accept chain loses its first link. The A/B tests exactly that — same step,
+/// `drafts[0] == next` rate and the `k_acc` histogram, folded vs per-row. Read
+/// once and cached (the house rule for hot-path gates).
 fn draft_head_fold() -> bool {
     static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *F.get_or_init(|| {
@@ -390,7 +395,8 @@ struct DraftP3b {
 ///   multi-row: every draft call passes `rows = bs` (the kernel's native row
 ///   dimension, the same one `chain_dev`'s verify side drives with `rows = m`).
 /// * **rope** and the **head** are P3a a4 (`apply_rope_mrows`) and
-///   `head_gemv_bf16_mrows` respectively — both already in place.
+///   `head_gemv_bf16_v1_mrows` (the v1-order fold) respectively — both already
+///   in place.
 /// * **b4 does not pair with b1**: `dsv41_gemm_fp8_mrows` has no additive
 ///   epilogue, and folding the add into the shared `w2` would leave the
 ///   `shared_out` unit dump unwritten, breaking the golden comparison chain
@@ -2968,21 +2974,33 @@ impl<'a> DsparkDev<'a> {
         // read `bs` times: ~5 x 350 us. That single term was most of the draft
         // budget (docs/agent/dspark-verify-perf-plan.md §4).
         //
-        // `head_gemv_bf16_mrows` (dsv41_glue.cu, the P1 kernel the verify's
-        // `step_rows` already uses) is the WEIGHT-STATIONARY form of the same
-        // GEMV: one block decodes its weight tile ONCE and folds all `bs` rows
-        // against it, so the head is read once instead of `bs` times (and the
+        // `head_gemv_bf16_v1_mrows` (dsv41_glue.cu, `dsv41_gemv_bf16_v1_mrows`)
+        // is the WEIGHT-STATIONARY form of the **v1** GEMV the draft's per-row arm
+        // actually runs: one block decodes its weight tile ONCE and folds all `bs`
+        // rows against it, so the head is read once instead of `bs` times (and the
         // row loop's `bs` launches become one).
         //
-        // NUMERICS — row r of the multi-row launch is BIT-IDENTICAL to the
-        // per-row `gemv_bf16` launch of row r: same ascending lane->c chain (C1),
-        // same decode in the same expression position (C2), the same shuffle
-        // reduction tree run once per row (C3), per-row independent accumulators
-        // with no cross-row recombination (C4), no K-split/fold to reorder (C5),
-        // `__fmaf_rn` pinned against fast-math reassociation (C6). The kernel
-        // header carries the full argument; the layouts already match what it
-        // wants — `normed` is [bs, dim] row-major (x, [m, k]) and `logits` is
-        // [bs, vocab] row-major (out, [m, n]).
+        // NUMERICS — row r of this launch is BIT-IDENTICAL to the per-row
+        // `gemv_bf16` launch of row r (v1: `gemv_bf16_kernel`, the scalar `c =
+        // lane; c += 32` chain — `gemv_bf16_v2_wanted(n)` needs `n < 2048` and the
+        // head's `n = lg_pitch` is far above it), because the kernel is a
+        // TRANSCRIPTION of v1's body and not a re-derivation: same lane->k scan,
+        // one independent accumulator per row, v1's `__shfl_xor_sync` tree per
+        // row, no K-split (the kernel header carries the C1-C6 argument).
+        //
+        // ⚠️ WHY `head_gemv_bf16_v1_mrows` AND NOT `head_gemv_bf16_mrows`. The
+        // latter is the **v2** (`gemv_bf16_nt`, WPR == 1) program — a different
+        // contraction from v1's, and it measured as a numerical change
+        // (`verify_head_fold`: 33% echo). Folding the draft's v1 head with it made
+        // the draft head a DIFFERENT program from the verify's v1 per-row head, so
+        // the accept comparison saw an argmax flipped at near-tie positions. The
+        // v1 fold keeps the multi-row traffic win while staying bit-identical to
+        // the verify's program. The two entries have IDENTICAL ABIs.
+        //
+        // The layouts already match what the kernel wants — `normed` is [bs, dim]
+        // row-major (x, [m, k]) and `logits` is [bs, lg_pitch] row-major, i.e.
+        // `out[r * n + row]` with `n = lg_pitch` (the same [m, n] layout the v2
+        // mrows kernel writes), so the logits consumer (argmax/topk) is unchanged.
         //
         // Ok(false) = stale .so (no symbol) or `bs` outside the kernel's 1..=8
         // dispatch: keep the per-row loop, which computes the same values by the
