@@ -960,3 +960,19 @@ Draft 的 MoE 用 `expert_gate_up_fp4_batched` / `expert_down_reduce_fp4_batched
 3. **性能**：verify 33.96ms 是 batched——lazy verify 会 ~20ms
 
 **下一步**：lazy verify + 双截断的组合测试（性能 + 正确性）。
+
+## Accept 率下降的根因分析（截断后 0.820 vs 截断前 1.080）
+
+**现象**：backbone 的 bf16 截断让 verify 更严——argmax 变了（更准，对齐官方），但 draft 的预测没跟上。k_acc=0 从 64%→73%。
+
+**机制**：
+1. backbone 44 层的 hc_pre 截断 → 累积效应大 → argmax 显著变化（更接近官方）
+2. draft 3 层 MTP 的截断（tap + hc + MoE）→ 累积效应小 → 预测变化较小
+3. **draft 的 attention 仍是 f32**（未截断）→ MTP head 的预测与官方的 bf16 MTP head 有差
+
+**官方的 DSpark accept ~5 的前提**：官方的 backbone 和 MTP head **都是 bf16**——两者天然对齐。ferrite 的 backbone 现在对齐了（bf16 截断），但 draft 只有部分对齐。
+
+**修复方向**（按 ROI）：
+1. draft 的 attention bf16 截断（sparse_attn 的 q/k/v 输出截断）——工作量中等
+2. draft 的 rope 输出截断——工作量小
+3. 或者反向：**比较 ferrite draft 的预测与官方 MTP head 的预测**（用 DSV41_DIFF_EAGER 式探针）——精确定位 draft 的哪一层开始偏
