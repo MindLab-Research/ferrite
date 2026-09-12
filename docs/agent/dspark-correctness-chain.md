@@ -3158,3 +3158,36 @@ DSV41_EXPERT_ACT_E4M3=1           # e4m3
 
 ### 重要教训
 **"数值中性"的优化可能不是数值中性的**——必须验证 accept 前后一致才能认为优化有效。两个 bug 都是"看似无害的时序/指针优化"实际破坏了承重不变量。
+
+## 全栈组合测试的配置（R2b+A4 测试完成后跑）
+
+**目标**：所有已验证优化 + 两个 bug 修复的 gate 一起开——lazy 路径的最大吞吐
+
+```bash
+# 已验证 ✓ 的 gates
+DSV41_LAZY_VERIFY=1 DSV41_VERIFY_GRAPH=1          # lazy + 图
+DSV41_SH_PAIR_M=1                                  # SH_PAIR（k_acc 不变）
+DSV41_ATTN_LIN_FUSE=1                              # R2+R2b（82.9 tok/s 验证）
+DSV41_AR_SINGLE_POLL=1                             # A4（新，本测试验证）
+# bug 修复后的 gates（本测试验证修复）
+DSV41_MARKOV_SLICED=1                              # 修复后应该不退化（k_acc ~5.0）
+DSV41_LAZY_SDR=1                                   # 修复后应该不退化（节省缩水但不破坏）
+# Wave 1 全套
+DSV41_HC_VERIFY_FUSE=1 DSV41_HC_FRONT_ROWS=1 DSV41_VERIFY_AR_FOLD=1
+DSV41_GATE_MROWS=1 DSV41_INDEXER_MROWS=1 DSV41_COMPRESSOR_MROWS=1
+# 正确性 + accept
+DSV41_BF16_TRUNCATE=1 DSV41_TAP_INPUT=1 DSV41_DRAFT_BF16_DOMAIN=1 DSV41_DRAFT_P3A=1
+# 标准
+DSV41_EXPERT_ACT_E4M3=1 DSV41_SH_EXP_MROWS=1 DSV41_SIDS_WRITEBACK=1
+```
+
+**预期**：
+- R2 的 82.9 tok/s 基础上 + R2b (-1.4ms?) + A4 (-0.5ms?) + MARKOV (-0.7ms?) + LAZY_SDR (-0.2ms?)
+- 预期 ~90-95 tok/s（lazy 路径的上限）
+- k_acc 应该保持 ~5.0（所有 bug 已修）
+
+**之后的 Plan B SWALLOW 测试**（batched 是 400 的唯一数学路径）：
+```bash
+DSV41_SWALLOW_STEP=1 DSV41_VERIFY_GRAPH=1  # Plan B（unanimity-or-direct）的 ar5-hang 修复
+# + 上述所有 lazy 优化（batched 下部分适用）
+```
