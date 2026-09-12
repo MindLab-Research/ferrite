@@ -299,3 +299,14 @@ if weight.dtype == torch.float4_e2m1fn_x2:
 - 每步的 kernel：读 `markov_embed[tok]`（一行 mr 元素）+ 遍历 vocab 的每行 `markov_head[v]`（mr 元素点积）→ **bias 到 logits[step]**
 - **⇒ markov 的权重读 = vocab × mr（不是 vocab × dim！）**——如果 mr 小（比如 512 或 1024），markov 每步只读 vocab×mr×4B ≈ 129280×512×4 ≈ 264MB？——**比 head 的 vocab×dim×2B=1.26GB 小**——**需要从 checkpoint 确认 mr 的真实值**（`mtp.last.markov_head.head.weight` 的形状）。
 - **head 本身（collapse→norm→head）只在循环外做一次**（:1721 的 forward_head）——**draft 的 head 权重读是 1 次（1.26GB）+ markov 的 5 次（vocab×mr）**。
+
+## e4m3 双趟 A/B 定案（2026-09-12 ca04effe + a8058d63）
+
+| 臂 | LEN | opa | 双字 | 稳态 | 文本 |
+|---|---|---|---|---|---|
+| EAGER 基线 | 146 | **True** | 3 | ~6.15ms (162 tok/s) | 出师表正常 + opa 尾部 |
+| EAGER + EXPERT_ACT_E4M3 | 230 | **False** ✓ | 64 | 7.52ms (133 tok/s) | **"6.6.6.6" 完全退化** |
+
+**判定**：① **激活量化假设确认**——opa 被 e2m1×2 双趟消除（opa: False），存量架构级偏差（e2m1 vs e4m3）是 opa 的根因 ✓。② **双趟实现有 bug**——输出退化为 "6.6.6.6" 计数循环（不是乱码而是模型行为完全偏移——首 token 就错了），双字 64。③ 性能代价 +1.37ms（两趟 GEMM）。
+
+**下一步**（twopass-degen-hunt vanguard 在查）：按可能性排序——① act_slot/pitch 不一致（ex_act vs ex_act_lo）② down 的输入缓冲混淆 ③ sub_dequant 的 nibble/scale 索引不互逆 ④ 第二趟的 a_scale 传错 ⑤ 单行 moe() 路径的接线。
