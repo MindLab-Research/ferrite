@@ -225,14 +225,6 @@ struct Kernels {
     quant_fp4: unsafe extern "C" fn(
         *const f32, *mut u8, *mut f32, c_int, c_int, c_int, c_int, CuStream,
     ) -> c_int,
-    /// `out = x - dequant_fp4(q, scale)` — the residual half of the e2m1x2
-    /// two-pass activation decomposition (`DSV41_EXPERT_ACT_E4M3`, default OFF).
-    /// OPTIONAL: a stock .so has no such symbol, and the armed gate must then
-    /// stay OFF (reported once) rather than fail the load.
-    sub_dequant_fp4: Option<
-        unsafe extern "C" fn(*const f32, *const u8, *const f32, *mut f32, c_int, c_int, c_int, CuStream)
-            -> c_int,
-    >,
     expert_gate_up_fp4: unsafe extern "C" fn(
         *const u8, *const f32, *const u8, *const u8, *const u8, *const u8, *mut f32,
         c_int, c_int, c_int, f32, CuStream,
@@ -595,7 +587,7 @@ struct Kernels {
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, c_int, c_int, c_int, f32,
             *const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64,
-            *const c_int, c_int, CuStream,
+            *const c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
     expert_down_fp4_indirect: Option<
@@ -611,9 +603,15 @@ struct Kernels {
         unsafe extern "C" fn(
             *const u8, *const f32, *mut f32, i64, c_int, c_int, c_int, f32, c_int,
             *const u8, i64, *const u8, i64, *const u8, i64, *const u8, i64,
-            *const c_int, c_int, CuStream,
+            *const c_int, c_int, c_int, CuStream,
         ) -> c_int,
     >,
+    /// Capability marker for the DIRECT e4m3 activation path
+    /// (`DSV41_EXPERT_ACT_E4M3`). `act_e4m3` is a trailing argument of the
+    /// launchers, and a stale .so would ignore it and decode e4m3 bytes as fp4
+    /// nibbles — a silent wrong answer. OPTIONAL: only the direct-e4m3 build
+    /// exports this, so a stale .so keeps the gate OFF (reported once).
+    expert_act_e4m3_cap: Option<unsafe extern "C" fn() -> c_int>,
     /// tcgen05 MXFP4 gate/up, Phase-1 skeleton (`DSV41_EXPERT_TCGEN05_MXF4`,
     /// default OFF). OPTIONAL on purpose: `build.sh` defines no
     /// `DSV41_TCGEN05_GATEUP_MXF4_SKELETON`, so a stock `.so` has no such
@@ -984,7 +982,6 @@ impl Device {
             gemm_fp8_sh_pair: ko!(rt, "dsv41_gemm_fp8_sh_pair"),
             quant_fp8: km!(rt, "dsv41_quant_fp8"),
             quant_fp4: km!(rt, "dsv41_quant_fp4"),
-            sub_dequant_fp4: ko!(rt, "dsv41_sub_dequant_fp4"),
             expert_gate_up_fp4: km!(rt, "dsv41_expert_gate_up_fp4"),
             expert_down_fp4: km!(rt, "dsv41_expert_down_fp4"),
             engram_hash: km!(rt, "dsv41_engram_hash"),
@@ -1039,6 +1036,7 @@ impl Device {
             expert_gate_up_fp4_indirect: ko!(rt, "dsv41_expert_gate_up_fp4_indirect"),
             expert_down_fp4_indirect: ko!(rt, "dsv41_expert_down_fp4_indirect"),
             expert_gate_up_fp4_batched: ko!(rt, "dsv41_expert_gate_up_fp4_batched"),
+            expert_act_e4m3_cap: ko!(rt, "dsv41_expert_act_e4m3_cap"),
             expert_tcgen05_gate_up_mxf4: ko!(rt, "dsv41_expert_tcgen05_gate_up_mxf4"),
             interleave_gateup_fp4: ko!(rt, "dsv41_interleave_gateup_fp4"),
             expert_down_fp4_batched: ko!(rt, "dsv41_expert_down_fp4_batched"),
@@ -2129,32 +2127,6 @@ impl Device {
             )
         };
         self.kerr(rc, "dsv41_quant_fp4")
-    }
-
-    /// True when the loaded .so carries `dsv41_sub_dequant_fp4` (the residual
-    /// primitive of the `DSV41_EXPERT_ACT_E4M3` two-pass decomposition). A stock
-    /// .so leaves the gate OFF with a one-shot notice rather than a load failure.
-    pub fn supports_sub_dequant_fp4(&self) -> bool {
-        self.kernels.sub_dequant_fp4.is_some()
-    }
-
-    /// `out[i] = x[i] - dequant_fp4(q, scale)[i]` — the f32 RESIDUAL of the first
-    /// e2m1 pass, i.e. the input of the second one. Same layout contract as
-    /// [`Self::quant_fp4`]'s output: `q` packs 2 nibbles/byte (LOW = even column)
-    /// and `scale` holds one f32 per (row, `block`-column) block.
-    pub fn sub_dequant_fp4(
-        &self,
-        x: *const f32,
-        q: *const u8,
-        scale: *const f32,
-        out: *mut f32,
-        rows: i32,
-        cols: i32,
-        block: i32,
-    ) -> Result<()> {
-        let f = self.need(self.kernels.sub_dequant_fp4, "dsv41_sub_dequant_fp4")?;
-        let rc = unsafe { f(x, q, scale, out, rows, cols, block, self.stream) };
-        self.kerr(rc, "dsv41_sub_dequant_fp4")
     }
 
     /// Native fp4 experts (tcgen05 MXFP4): gate and up in one pass.
@@ -4199,6 +4171,8 @@ impl Device {
 
     /// Indirect expert gate/up: the weights come from the per-layer pools plus the
     /// device-side expert id, so the launch arguments do not depend on the routing.
+    /// `act_e4m3` (trailing): `a` holds e4m3 bytes (1/value) + `a_scale` f32 per 32
+    /// instead of the packed e2m1 nibbles (`DSV41_EXPERT_ACT_E4M3`).
     #[allow(clippy::too_many_arguments)]
     pub fn expert_gate_up_fp4_indirect(
         &self,
@@ -4219,6 +4193,7 @@ impl Device {
         w3s_stride: i64,
         ids: *const i32,
         slot: i32,
+        act_e4m3: i32,
     ) -> Result<()> {
         let f = self.need(
             self.kernels.expert_gate_up_fp4_indirect,
@@ -4227,7 +4202,7 @@ impl Device {
         let rc = unsafe {
             f(
                 a, a_scale, out, rows, dim, inter, limit, w1_base, w1_stride, w1s_base, w1s_stride,
-                w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, self.stream,
+                w3_base, w3_stride, w3s_base, w3s_stride, ids, slot, act_e4m3, self.stream,
             )
         };
         self.kerr(rc, "dsv41_expert_gate_up_fp4_indirect")
@@ -4267,6 +4242,8 @@ impl Device {
     /// slots (grid.y = slot). `out` holds `slots` consecutive [2*inter] blocks,
     /// `out_slot_stride` floats apart; the slots never share a written element.
     /// DSV41_MOE_BATCH only — see `moe_batch()` in chain_dev.rs.
+    /// `act_e4m3` (trailing): `a` holds e4m3 bytes (1/value, row pitch `dim`)
+    /// + `a_scale` f32 per 32, instead of packed e2m1 (`DSV41_EXPERT_ACT_E4M3`).
     #[allow(clippy::too_many_arguments)]
     pub fn expert_gate_up_fp4_batched(
         &self,
@@ -4289,6 +4266,7 @@ impl Device {
         w3s_stride: i64,
         ids: *const i32,
         ilv: i32,
+        act_e4m3: i32,
     ) -> Result<()> {
         let f = self.need(
             self.kernels.expert_gate_up_fp4_batched,
@@ -4298,10 +4276,19 @@ impl Device {
             f(
                 a, a_scale, out, out_slot_stride, rows, dim, inter, limit, slots, w1_base,
                 w1_stride, w1s_base, w1s_stride, w3_base, w3_stride, w3s_base, w3s_stride, ids, ilv,
-                self.stream,
+                act_e4m3, self.stream,
             )
         };
         self.kerr(rc, "dsv41_expert_gate_up_fp4_batched")
+    }
+
+    /// True when the loaded .so carries the DIRECT e4m3 activation path
+    /// (`dsv41_expert_act_e4m3_cap`). A stale .so has no such symbol, and
+    /// `DSV41_EXPERT_ACT_E4M3` must then stay OFF (reported once) instead of
+    /// feeding e4m3 bytes to a kernel that decodes them as fp4 nibbles — a
+    /// silent wrong answer, not a failure.
+    pub fn supports_expert_act_e4m3(&self) -> bool {
+        self.kernels.expert_act_e4m3_cap.is_some()
     }
 
     /// tcgen05 MXFP4 gate/up — the Phase-1 `kind::mxf4` swapAB kernel

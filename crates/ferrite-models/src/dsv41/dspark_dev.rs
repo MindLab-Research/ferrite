@@ -301,17 +301,6 @@ pub struct DsparkDev<'a> {
     xsc: DevBuf,
     xq4: DevBuf,
     xsc4: DevBuf,
-    /// e2m1x2 (`DSV41_EXPERT_ACT_E4M3`, default OFF): the SECOND pass of the
-    /// activation decomposition, mirroring the backbone's `Scratch` fields of
-    /// the same name. `xq4`/`xsc4` hold the first term q_hi (the existing
-    /// single-pass quantisation, unchanged); these hold
-    /// q_lo = quant_fp4(xn - dequant(q_hi)), and `xres` is the f32 residual
-    /// between them. All three are read ONLY while the gate is armed, but they
-    /// are allocated unconditionally (a few KB each: capture-legal, and sizing
-    /// needs no gate).
-    xq4_lo: DevBuf,
-    xsc4_lo: DevBuf,
-    xres: DevBuf,
     pre_in: DevBuf,
     pre_attn: DevBuf,
     pre_ffn: DevBuf,
@@ -355,11 +344,6 @@ pub struct DsparkDev<'a> {
     route_idx: DevBuf,
     ex_act: DevBuf,
     ex_act_b: DevBuf,
-    /// e2m1x2 only: the second pass's gate/up outputs, accumulated into
-    /// `ex_act_b` by `add_inplace_raw` BEFORE swiglu (swiglu is non-linear, so
-    /// the two passes must be summed in the GEMM domain). Same `[bs][topk]`
-    /// row/slot layout and pitch as `ex_act_b`.
-    ex_act_lo: DevBuf,
     moe_out: DevBuf,
     shared_out: DevBuf,
 
@@ -505,14 +489,10 @@ impl<'a> DsparkDev<'a> {
             wo: dev.alloc(fb(bs * ol_total))?,
             xq: dev.alloc(max_act.max(8))?,
             xsc: dev.alloc(fb(max_act / 32 + 8))?,
-            xq4: dev.alloc((bs * dim / 2).max(8))?,
+            // `bs` activation rows: `dim/2` packed fp4 bytes or `dim` e4m3 bytes
+            // per row — `bs*dim` covers both quantiser layouts.
+            xq4: dev.alloc((bs * dim).max(8))?,
             xsc4: dev.alloc(fb(bs * dim / 32 + 8))?,
-            // e2m1x2 scratch (DSV41_EXPERT_ACT_E4M3, default OFF): the second
-            // pass's packing/scales/residual — sized like `xq4`/`xsc4` (the
-            // quantiser's own `[bs][dim]` layout) and the f32 residual.
-            xq4_lo: dev.alloc((bs * dim / 2).max(8))?,
-            xsc4_lo: dev.alloc(fb(bs * dim / 32 + 8))?,
-            xres: dev.alloc(fb(bs * dim))?,
             pre_in: dev.alloc(fb(bs * hc))?,
             pre_attn: dev.alloc(fb(bs * hc))?,
             pre_ffn: dev.alloc(fb(bs * hc))?,
@@ -543,11 +523,6 @@ impl<'a> DsparkDev<'a> {
             // the size has to clear both.
             ex_act: dev.alloc(fb(bs * 2 * inter_local.max(sh_il)))?,
             ex_act_b: dev.alloc(fb(mo_topk * bs * 2 * inter_local))?,
-            // e2m1x2 only: the second gate/up pass's output, the same
-            // `[bs][topk][2*inter_local]` shape/pitch as `ex_act_b` it is summed
-            // into (before swiglu). Allocated unconditionally, like the
-            // backbone's `Scratch::ex_act_lo`.
-            ex_act_lo: dev.alloc(fb(mo_topk * bs * 2 * inter_local))?,
             moe_out: dev.alloc(fb(bs * dim))?,
             shared_out: dev.alloc(fb(bs * dim))?,
             pre_mean: dev.alloc(fb(hc))?,
@@ -1627,25 +1602,33 @@ impl<'a> DsparkDev<'a> {
         // gate is deliberately SHARED with the verify chain so both domains stay
         // in lockstep. Guarded on the .so symbol so a stock build keeps the
         // single-pass path with a one-shot notice instead of failing here.
-        let two = crate::dsv41::chain_dev::expert_act_e4m3()
-            && self.dev.supports_sub_dequant_fp4();
-        if crate::dsv41::chain_dev::expert_act_e4m3() && !two {
+        // e4m3 DIRECT (`DSV41_EXPERT_ACT_E4M3`, default OFF): the SAME path the
+        // backbone's `moe()` runs (chain_dev.rs, the `if e4m3` quantisation).
+        // The activation takes the OFFICIAL `act_quant(e4m3, block=32)` form and
+        // is consumed by ONE gate/up pass, so the draft's routed experts and the
+        // verify chain stay in lockstep on the one shared gate without the
+        // retired e2m1x2 second pass + add. Guarded on the .so symbol so a stock
+        // build keeps the e2m1 path with a one-shot notice instead of failing.
+        let e4m3 = crate::dsv41::chain_dev::expert_act_e4m3()
+            && self.dev.supports_expert_act_e4m3();
+        if crate::dsv41::chain_dev::expert_act_e4m3() && !e4m3 {
             crate::dsv41::chain_dev::act_e4m3_skipped_note();
         }
-        if two {
-            self.dev.sub_dequant_fp4(
+        if e4m3 {
+            self.dev.quant_fp8(
                 self.xn.ptr as *const f32,
-                self.xq4.ptr as *const u8,
-                self.xsc4.ptr as *const f32,
-                self.xres.ptr as *mut f32,
+                self.xq4.ptr as *mut u8,
+                self.xsc4.ptr as *mut f32,
                 bs as i32,
                 dim as i32,
                 32,
+                true,
             )?;
+        } else {
             self.dev.quant_fp4(
-                self.xres.ptr as *const f32,
-                self.xq4_lo.ptr as *mut u8,
-                self.xsc4_lo.ptr as *mut f32,
+                self.xn.ptr as *const f32,
+                self.xq4.ptr as *mut u8,
+                self.xsc4.ptr as *mut f32,
                 bs as i32,
                 dim as i32,
                 32,
@@ -1681,8 +1664,7 @@ impl<'a> DsparkDev<'a> {
             // garbage. Mirror the SAME expression the backbone's `moe_rows` uses
             // (`chain_dev.rs:5378-5386`), including the `dim % 512` term the
             // single-row call site omits.
-            let gateup_fused = !two
-                && crate::dsv41::chain_dev::gateup_fuse()
+            let gateup_fused = crate::dsv41::chain_dev::gateup_fuse()
                 && self.dev.supports_gateup_fuse()
                 && crate::dsv41::chain_dev::expert_fp4_mode() == 2
                 && (dim % 512) == 0;
@@ -1765,66 +1747,44 @@ impl<'a> DsparkDev<'a> {
                 let rows = if mrows { bs as i32 } else { 1 };
                 let n_launches = if mrows { 1 } else { bs };
                 for r in 0..n_launches {
-                    let xq4_r = self.xq4.as_u8().wrapping_add(r * (dim / 2));
+                    // e4m3 packs ONE byte per value, so the per-row pitch of the
+                    // activation is `dim` (not `dim/2`) whenever the gate is armed.
+                    let abytes = if e4m3 { dim } else { dim / 2 };
+                    let xq4_r = self.xq4.as_u8().wrapping_add(r * abytes);
                     let xsc4_r = self.xsc4.as_f32().wrapping_add(r * (dim / 32));
                     let act_r = (self.ex_act_b.ptr as *mut f32).wrapping_add(r * row_pitch);
-                    // e2m1x2 (`two`): the second pass's output block, the SAME
-                    // per-row/per-slot pitch as `act_r`.
-                    let act_lo_r = (self.ex_act_lo.ptr as *mut f32).wrapping_add(r * row_pitch);
                     let ids_r = ids.wrapping_add(r * topk);
                     let out_r = (self.moe_out.ptr as *mut f32).wrapping_add(r * dim);
                     let rw_r = (self.route_w.ptr as *const f32).wrapping_add(r * topk);
-                    // e2m1x2 (`two`): pass 0 is q_hi (`xq4`/`xsc4`, exactly the
-                    // pre-gate launch) into `ex_act_b`; pass 1 is q_lo into
-                    // `ex_act_lo`. The two are summed below, BEFORE swiglu —
-                    // swiglu is non-linear, so q_hi and q_lo must be added in the
-                    // gate/up domain. gate OFF keeps n_pass == 1, i.e. the old
-                    // launch, byte for byte. `act_slot` is the unfused [2*inter]
-                    // pitch whenever `two` (fusion is forced off above), and both
-                    // passes use the SAME fp4 weight bytes (the weights are
-                    // untouched: no duplication, no fp8 expert path).
-                    let n_pass = if two { 2 } else { 1 };
-                    for pass in 0..n_pass {
-                        let (qa, qs) = if pass == 0 {
-                            (xq4_r, xsc4_r)
-                        } else {
-                            (
-                                self.xq4_lo.as_u8().wrapping_add(r * (dim / 2)),
-                                self.xsc4_lo.as_f32().wrapping_add(r * (dim / 32)),
-                            )
-                        };
-                        let gout = if pass == 0 { act_r } else { act_lo_r };
-                        self.dev.expert_gate_up_fp4_batched(
-                            qa,
-                            qs,
-                            gout,
-                            act_slot,
-                            rows,
-                            dim as i32,
-                            inter_local as i32,
-                            cfg.swiglu_limit,
-                            topk as i32,
-                            strides.0,
-                            strides.1,
-                            strides.2,
-                            strides.3,
-                            strides.4,
-                            strides.5,
-                            strides.6,
-                            strides.7,
-                            ids_r,
-                            // Defect 1: the pool layout (was a hard-wired 0, which
-                            // only ever matched a non-interleaved pool).
-                            ld.experts_ilv as i32,
-                        )?;
-                    }
-                    if two {
-                        self.dev.add_inplace_raw(
-                            act_r as *mut c_void,
-                            act_lo_r as *const c_void,
-                            topk as i64 * act_slot,
-                        )?;
-                    }
+                    // ONE pass: `xq4`/`xsc4` hold the activation in whichever form
+                    // the quantisation above produced (e4m3 bytes when `e4m3` is
+                    // set, packed e2m1 otherwise) and `act_e4m3` selects the
+                    // decoder. `act_slot` follows the fusion decision above on both
+                    // arms; the fp4 weight bytes are untouched either way.
+                    self.dev.expert_gate_up_fp4_batched(
+                        xq4_r,
+                        xsc4_r,
+                        act_r,
+                        act_slot,
+                        rows,
+                        dim as i32,
+                        inter_local as i32,
+                        cfg.swiglu_limit,
+                        topk as i32,
+                        strides.0,
+                        strides.1,
+                        strides.2,
+                        strides.3,
+                        strides.4,
+                        strides.5,
+                        strides.6,
+                        strides.7,
+                        ids_r,
+                        // Defect 1: the pool layout (was a hard-wired 0, which
+                        // only ever matched a non-interleaved pool).
+                        ld.experts_ilv as i32,
+                        e4m3 as i32,
+                    )?;
                     // Defect 2: the fused epilogue already applied swiglu in
                     // place, so the separate pass must be skipped exactly when
                     // it ran — it would otherwise read the never-written up half
@@ -1880,61 +1840,39 @@ impl<'a> DsparkDev<'a> {
                 // `ids`/`route_w` slice and its own `[2*inter_local]` block.
                 for r in 0..bs {
                     let act = (self.ex_act.ptr as *mut f32).wrapping_add(r * 2 * inter_local);
-                    // e2m1x2 (`two`): the second pass's block for this row, the
-                    // same [2*inter_local] shape as `act` but a disjoint buffer
-                    // (`expert_gate_up_fp4_indirect` is epi_mode 1 = clamp+WRITE,
-                    // so the second pass cannot accumulate into `act`).
-                    let act_lo = (self.ex_act_lo.ptr as *mut f32).wrapping_add(r * 2 * inter_local);
                     let out = (self.moe_out.ptr as *mut f32).wrapping_add(r * dim);
                     let ids_r = ids.wrapping_add(r * topk);
+                    // e4m3 packs ONE byte per value, so this row's activation
+                    // starts at `r * dim` (not `r * dim/2`) when the gate is armed.
+                    let abytes = if e4m3 { dim } else { dim / 2 };
+                    let xq4_r = self.xq4.as_u8().wrapping_add(r * abytes);
+                    let xsc4_r = self.xsc4.as_f32().wrapping_add(r * (dim / 32));
                     for slot in 0..topk {
                         let w = (self.route_w.ptr as *const f32).wrapping_add(r * topk + slot);
-                        // e2m1x2 (`two`): the SAME two-pass contract the batched
-                        // arm above and the backbone's `moe()` use — pass 0 = q_hi
-                        // into `act`, pass 1 = q_lo into `act_lo`, summed before
-                        // swiglu (non-linear). gate OFF keeps one pass, byte for
-                        // byte the old launch.
-                        let n_pass = if two { 2 } else { 1 };
-                        for pass in 0..n_pass {
-                            let (qa, qs) = if pass == 0 {
-                                (
-                                    self.xq4.as_u8().wrapping_add(r * (dim / 2)),
-                                    self.xsc4.as_f32().wrapping_add(r * (dim / 32)),
-                                )
-                            } else {
-                                (
-                                    self.xq4_lo.as_u8().wrapping_add(r * (dim / 2)),
-                                    self.xsc4_lo.as_f32().wrapping_add(r * (dim / 32)),
-                                )
-                            };
-                            let gout = if pass == 0 { act } else { act_lo };
-                            self.dev.expert_gate_up_fp4_indirect(
-                                qa,
-                                qs,
-                                gout,
-                                1,
-                                dim as i32,
-                                inter_local as i32,
-                                cfg.swiglu_limit,
-                                strides.0,
-                                strides.1,
-                                strides.2,
-                                strides.3,
-                                strides.4,
-                                strides.5,
-                                strides.6,
-                                strides.7,
-                                ids_r,
-                                slot as i32,
-                            )?;
-                        }
-                        if two {
-                            self.dev.add_inplace_raw(
-                                act as *mut c_void,
-                                act_lo as *const c_void,
-                                (2 * inter_local) as i64,
-                            )?;
-                        }
+                        // ONE pass: the activation form is selected by `e4m3`
+                        // and `expert_gate_up_fp4_indirect` is epi_mode 1
+                        // (clamp + WRITE), so the row's [2*inter_local] block is
+                        // produced by a single launch.
+                        self.dev.expert_gate_up_fp4_indirect(
+                            xq4_r,
+                            xsc4_r,
+                            act,
+                            1,
+                            dim as i32,
+                            inter_local as i32,
+                            cfg.swiglu_limit,
+                            strides.0,
+                            strides.1,
+                            strides.2,
+                            strides.3,
+                            strides.4,
+                            strides.5,
+                            strides.6,
+                            strides.7,
+                            ids_r,
+                            slot as i32,
+                            e4m3 as i32,
+                        )?;
                         self.dev.swiglu_limit(act, 1, inter_local as i32, cfg.swiglu_limit)?;
                         self.dev.expert_down_fp4_indirect(
                             act as *const f32,

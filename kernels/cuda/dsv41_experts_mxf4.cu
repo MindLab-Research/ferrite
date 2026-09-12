@@ -126,23 +126,6 @@ __device__ __forceinline__ uint32_t smem_addr(const void* p) {
     return __uint_as_float(((uint32_t)b) << 23);
 }
 
-// e4m3 -> f32, the OFFICIAL expert-activation format (fp8 e4m3, block 32). The
-// mapping is EXACT (fp8 -> f32 is lossless), so the fp8 activation staging below
-// reproduces the reference kernel's operand bit for bit. Copied verbatim from
-// dsv41_kernels.cu's anonymous namespace (the two TUs cannot share it) - keep the
-// two copies in sync.
-__device__ __forceinline__ float dsv41_e4m3_to_f(uint8_t b) {
-    // sign(1) exp(4) mantissa(3), bias 7; subnormals (exp 0) are m * 2^-9.
-    const uint32_t s = ((uint32_t)b & 0x80u) << 24;
-    const uint32_t e = ((uint32_t)b >> 3) & 0x0Fu;
-    const uint32_t m = (uint32_t)b & 0x07u;
-    if (e == 0u) {
-        const float v = (float)m * (1.0f / 512.0f);
-        return (b & 0x80u) ? -v : v;
-    }
-    return __uint_as_float(s | ((e + 120u) << 23) | (m << 20));
-}
-
 // f32 power-of-two -> e8m0 byte (the caller's scales are fast_round_scale
 // outputs, i.e. powers of two; a non-power-of-two is truncated to its exponent).
 // ue8m0(b) = 2^(b-127), so the byte is the BIASED exponent: e + 127.
@@ -2590,7 +2573,8 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     const uint8_t* a, const float* a_scale, float* out, long out_slot_stride, int rows, int dim,
     int inter, float limit, int slots, const uint8_t* w1_base, long w1_stride,
     const uint8_t* w1s_base, long w1s_stride, const uint8_t* w3_base, long w3_stride,
-    const uint8_t* w3s_base, long w3s_stride, const int* ids, int ilv, cudaStream_t stream) {
+    const uint8_t* w3s_base, long w3s_stride, const int* ids, int ilv, int act_e4m3,
+    cudaStream_t stream) {
     if (rows <= 0 || dim <= 0 || inter <= 0 || slots <= 0) return (int)cudaErrorInvalidValue;
     // rows per CTA == warps per CTA (one warp owns one row). 8 = today's shape;
     // DSV41_GATEUP_ROWS=4/2/1 re-packs the SAME warps into more, smaller CTAs -
@@ -2714,7 +2698,7 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
                                           a, a_scale, out, out_slot_stride, n_total, dim, inter, 1,
                                           limit, nullptr, 0, w1_base, w1_stride, w1s_base, w1s_stride,
                                           w3_base, w3_stride, w3s_base, w3s_stride, ids,
-                                          g_expert_fp4_mode, fuse, ksplit, pf);
+                                          g_expert_fp4_mode, fuse, ksplit, pf, act_e4m3);
     };
     cudaError_t le;
     // ONE depth (1) x 2 ILV instantiations. The former 5-way depth cascade
@@ -2730,7 +2714,14 @@ extern "C" int dsv41_expert_gate_up_fp4_batched(
     return (int)cudaGetLastError();
 }
 
-// down, batched: writes a [slots][dim] scratch (epi_mode 2 = write, scaled by
+// Capability marker for the Rust-side `DSV41_EXPERT_ACT_E4M3` gate. The gate
+// changes what the CALLER writes into `a` (e4m3 bytes instead of packed e2m1),
+// and `act_e4m3` is a trailing argument of the launchers above - a stale .so
+// would ignore it and decode e4m3 bytes as fp4 nibbles, i.e. a silent wrong
+// answer, not a failure. Exporting a symbol only the direct-e4m3 build has is
+// the established probe pattern (`Device::supports_*`), so a stale .so leaves
+// the gate OFF with a one-shot notice instead.
+extern "C" int dsv41_expert_act_e4m3_cap(void) { return 1; }
 // the PER-SLOT routing weight; NOT accumulating). act_base holds `slots`
 // consecutive [2*inter] slices `act_stride` floats apart - the swiglu half is
 // the first `inter` floats of each slice, exactly the buffer the sequential call
@@ -2754,7 +2745,7 @@ extern "C" int dsv41_expert_down_fp4_batched(
         (size_t)inter * sizeof(float) + 256 * sizeof(float2), stream, act_base, act_stride, nullptr,
         nullptr, out, out_slot_stride, dim, inter, -1, 2, 0.f, row_weight, rw_stride, w2_base,
         w2_stride, w2s_base, w2s_stride, w2_base, w2_stride, w2s_base, w2s_stride, ids,
-        g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1, /*pf=*/0);
+        g_down_fp4_mode, /*fuse_swiglu=*/0, /*ksplit=*/1, /*pf=*/0, /*act_e4m3=*/0);
     if (le != cudaSuccess) { (void)cudaGetLastError(); return (int)le; }
     return (int)cudaGetLastError();
 }
