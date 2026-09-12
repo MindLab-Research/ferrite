@@ -93,9 +93,19 @@
 // Build (single TU, NO GPU needed to compile):
 //   nvcc -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 \
 //        -o /tmp/t_r2parity kernels/cuda/tests_dsv41_r2_parity.cu
-// Run (ONE free GPU; peak allocation is ~40 MB):
+// On a node whose CUDA toolkit comes from the pip `nvidia-cu13` wheel (this
+// workspace's case: nvcc at /tmp/nvccx/nvidia/cu13/bin/nvcc, headers/libs under
+// ~/.local/lib/python3.10/site-packages/nvidia/cu13), add the -I/-L:
+//   CU=~/.local/lib/python3.10/site-packages/nvidia/cu13
+//   /tmp/nvccx/nvidia/cu13/bin/nvcc -I$CU/include -L$CU/lib \
+//        -gencode arch=compute_103a,code=sm_103a -O3 --use_fast_math -std=c++17 \
+//        -o /tmp/t_r2parity kernels/cuda/tests_dsv41_r2_parity.cu
+// Run (ONE free GPU; peak allocation is ~16 MB):
 //   CUDA_VISIBLE_DEVICES=7 /tmp/t_r2parity              # full suite
 //   CUDA_VISIBLE_DEVICES=7 /tmp/t_r2parity --quick      # 2 seeds x 3 patterns
+//   CUDA_VISIBLE_DEVICES=7 /tmp/t_r2parity --verbose    # also print every EQUAL
+// Exit status: 0 = every measured comparison was bit-identical, 1 = at least
+// one differed (or a harness failure).
 //
 // OPTIONAL EXTRA (one more TU on the command line):
 //   nvcc ... -DPARITY_FERRITE_RMSNORM tests_dsv41_r2_parity.cu ferrite_kernels.cu
@@ -724,7 +734,7 @@ int main(int argc, char** argv) {
             }
 
             // =============================================================
-            // T4/T5: the wq_b half (norm + GEMV + rope)
+            // T2/T3/T3b/T4: the wq_b half (norm + GEMV + rope), 3-way + controls
             // =============================================================
             fill_activation(hqr, pat);
             for (int e = 0; e < n_eps; ++e) {
@@ -742,11 +752,11 @@ int main(int argc, char** argv) {
 
                     // ---- C: rmsnorm_q + gemm_fp8_mx_rope (the stage reference)
                     const bool ran_rq = ok_rc(
-                        "T5.rope-norm-3way", "rmsnorm_q",
+                        "T3.fused-vs-rmsnorm_q+mxrope", "rmsnorm_q",
                         dsv41_rmsnorm_q(d.qrRawA, d.qnorm, d.normOut, 1, kQl, eps, d.xqQ, d.xscQ,
                                         nullptr));
                     const bool ran_mxrope = ok_rc(
-                        "T5.rope-norm-3way", "gemm_fp8_mx_rope",
+                        "T3b.mxrope-vs-mrows", "gemm_fp8_mx_rope",
                         dsv41_gemm_fp8_mx_rope(d.xqQ, d.xscQ, d.wqb, d.wsqb, nullptr, d.qC, kNQ, kQl,
                                                d.cos, d.sin, d.pos_ctr, 1, 0, 0, 0, kRd, kHd,
                                                nullptr));
@@ -836,7 +846,7 @@ int main(int argc, char** argv) {
             }       // eps
 
             // =============================================================
-            // T6: the REAL end-to-end chain (the headline number)
+            // T5: the REAL end-to-end chain (the headline number)
             //     A: lin2 -> lin_rope_norm(qr_r raw)
             //     B: quant -> mrows x2 -> rmsnorm_rows -> quant -> mrows ->
             //        apply_rope_mrows
@@ -850,34 +860,38 @@ int main(int argc, char** argv) {
                     h2d(d.pos_rows, pr.data(), kNlh * 4, "pos_rows");
                 }
                 // Keep the raw qr_r from BOTH arms (T1 wrote qrA from the fused
-                // launch and qrB from mrows).
-                h2d(d.qrRawA, read_f32(d.qrA, kQl).data(), kQl * 4, "qrRawA<-qrA");
-                h2d(d.qrRawB, read_f32(d.qrB, kQl).data(), kQl * 4, "qrRawB<-qrB");
-                const bool f1 = ok_rc("T6.end-to-end", "fused lin_rope_norm(qr_r_A)",
+                // launch and qrB from mrows), so each chain is fed its OWN
+                // projection's bytes -- exactly the wiring R2 vs the verify
+                // block differs in.
+                const std::vector<float> hqr_a = read_f32(d.qrA, kQl);
+                const std::vector<float> hqr_b = read_f32(d.qrB, kQl);
+                h2d(d.qrRawA, hqr_a.data(), kQl * 4, "qrRawA<-qrA");
+                h2d(d.qrRawB, hqr_b.data(), kQl * 4, "qrRawB<-qrB");
+                const bool f1 = ok_rc("T5.end-to-end", "fused lin_rope_norm(qr_r_A)",
                                       dsv41_gemm_fp8_mx_rope_norm(
                                           d.qrRawA, d.qnorm, eps, d.wqb, d.wsqb, nullptr, d.qD,
                                           kNQ, kQl, d.cos, d.sin, d.pos_ctr, 1, 0, 0, 0, kRd, kHd,
                                           nullptr));
-                const bool n1 = ok_rc("T6.end-to-end", "verify norm_rows(qr_r_B)",
+                const bool n1 = ok_rc("T5.end-to-end", "verify norm_rows(qr_r_B)",
                                       dsv41_rmsnorm_rows(d.qrRawB, d.qnorm, d.qrRawB, 1, kQl, eps,
                                                          nullptr));
-                const bool q1 = ok_rc("T6.end-to-end", "verify quant_rows(qr_r_B)",
+                const bool q1 = ok_rc("T5.end-to-end", "verify quant_rows(qr_r_B)",
                                       dsv41_quant_fp8(d.qrRawB, d.xqR, d.xscR, 1, kQl, 32, 1,
                                                       nullptr));
-                const bool m1 = ok_rc("T6.end-to-end", "verify proj_mrows(wq_b)",
+                const bool m1 = ok_rc("T5.end-to-end", "verify proj_mrows(wq_b)",
                                       dsv41_gemm_fp8_mrows(d.xqR, d.xscR, d.wqb, d.wsqb, nullptr,
                                                            d.qB, 1, kNQ, kQl, kOs, nullptr));
-                const bool r1 = ok_rc("T6.end-to-end", "verify apply_rope_mrows",
+                const bool r1 = ok_rc("T5.end-to-end", "verify apply_rope_mrows",
                                       dsv41_apply_rope_mrows(d.qB, d.cos, d.sin, 1, kNlh, kOs, kHd,
                                                              kRd, kHalf, d.pos_rows, 0, nullptr));
                 if (f1 && n1 && q1 && m1 && r1) {
                     printf("  wseed=%d pattern=%s: THE END-TO-END CHAIN (fused vs verify)\n", ws,
                            pattern_name(pat));
-                    compare("T6.end-to-end", "q_r (lin2+lin_rope_norm vs the verify chain)",
+                    compare("T5.end-to-end", "q_r (lin2+lin_rope_norm vs the verify chain)",
                             read_f32(d.qD, kNQ), read_f32(d.qB, kNQ), kNQ, R_ALL, true);
-                    compare("T6.end-to-end.pre-rope", "q_r pre-rope lanes",
+                    compare("T5.end-to-end.pre-rope", "q_r pre-rope lanes",
                             read_f32(d.qD, kNQ), read_f32(d.qB, kNQ), kNQ, R_PREROPE, true);
-                    compare("T6.end-to-end.rope-lane", "q_r rope lanes",
+                    compare("T5.end-to-end.rope-lane", "q_r rope lanes",
                             read_f32(d.qD, kNQ), read_f32(d.qB, kNQ), kNQ, R_ROPE, true);
                 }
                 // coverage: neither arm may have written past n (the mrows form
@@ -887,10 +901,10 @@ int main(int argc, char** argv) {
                     fill_sentinel(sent);
                     h2d(d.qB, sent.data(), sent.size() * 4, "qB sentinel");
                     h2d(d.qD, sent.data(), sent.size() * 4, "qD sentinel");
-                    ok_rc("T6.coverage", "verify proj_mrows(wq_b) re-run",
+                    ok_rc("T5.coverage", "verify proj_mrows(wq_b) re-run",
                           dsv41_gemm_fp8_mrows(d.xqR, d.xscR, d.wqb, d.wsqb, nullptr, d.qB, 1, kNQ,
                                                kQl, kOs, nullptr));
-                    ok_rc("T6.coverage", "fused lin_rope_norm re-run",
+                    ok_rc("T5.coverage", "fused lin_rope_norm re-run",
                           dsv41_gemm_fp8_mx_rope_norm(d.qrRawA, d.qnorm, eps_list[0], d.wqb, d.wsqb,
                                                       nullptr, d.qD, kNQ, kQl, d.cos, d.sin,
                                                       d.pos_ctr, 1, 0, 0, 0, kRd, kHd, nullptr));
@@ -899,13 +913,13 @@ int main(int argc, char** argv) {
                     const size_t ub = still_sentinel(hb, kNQ, kOs);
                     const size_t ud = still_sentinel(hd, kNQ, kOs);
                     P_CHECK(ub == (size_t)(kOs - kNQ),
-                            "T6.coverage: mrows left %zu of the %d tail lanes unwritten", ub,
+                            "T5.coverage: mrows left %zu of the %d tail lanes unwritten", ub,
                             kOs - kNQ);
                     P_CHECK(ud == (size_t)(kOs - kNQ),
-                            "T6.coverage: fused left %zu of the %d tail lanes unwritten", ud,
+                            "T5.coverage: fused left %zu of the %d tail lanes unwritten", ud,
                             kOs - kNQ);
                     if (ub == (size_t)(kOs - kNQ) && ud == (size_t)(kOs - kNQ))
-                        printf("  [T6.coverage] OK: both arms wrote exactly [0,%d) and left the "
+                        printf("  [T5.coverage] OK: both arms wrote exactly [0,%d) and left the "
                                "%d-lane tail untouched\n",
                                kNQ, kOs - kNQ);
                 }
@@ -953,7 +967,7 @@ int main(int argc, char** argv) {
     verdict("T3.fused-vs-rmsnorm_q+mxrope", "fused == rmsnorm_q+mx_rope (prologue/epilogue)");
     verdict("T3b.mxrope-vs-mrows", "mx_rope == mrows+apply_rope_mrows");
     verdict("T2.fused-vs-sep", "R2 FUSED wq_b == verify separate chain");
-    verdict("T6.end-to-end", "R2 FULL CHAIN == verify FULL CHAIN");
+    verdict("T5.end-to-end", "R2 FULL CHAIN == verify FULL CHAIN");
 
     if (g_skips) printf("\n%u SKIP event(s) -- see the per-tag 'skips' column.\n", (unsigned)g_skips);
     if (g_fails) printf("\n%d HARNESS FAILURE(S).\n", g_fails);
