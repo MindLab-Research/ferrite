@@ -6468,3 +6468,24 @@ FORBIDDEN="DSV41_LAZY_VERIFY DSV41_HC_VERIFY_FUSE DSV41_HC_FRONT_ROWS"
 | **lazy 干净栈** | **91.1 tok/s** | +15.6% from base 78.8 | ✓ |
 | **SWALLOW + mrows b2+b3** | **63.8 tok/s** | +9.4% from SWALLOW 58.3 | **✓** |
 | base | 78.8 tok/s | — | ✓ |
+
+## ⚠️⚠️ 全 mrows 栈 v2 测试——严重性能退化！（1275d690）
+
+**结果**：
+- **吞吐 = 10.3 tok/s**（vs mrows b2+b3 基线 63.8——**6× 退化！**）
+- ELAPSED=13961ms（vs 2254ms——6× 慢！）
+- 前 61 行=True ✓ 零拉丁 ✓ 0 panic 0 hang ✓
+- **符号检查 = 2**（B5/B4 kernel 已编译进 .so ✓——compile fix 生效！）
+
+**判定**：
+1. **输出正确**——kernel 数值正确（零拉丁 + 前 61 行 ✓）
+2. **性能灾难**——10.3 vs 63.8（-84%）！
+3. **退化源**：B5/B4/1b/fold_r 中的某个（或组合）导致 6× 慢
+
+**嫌疑分析**（6× 的量级指向结构性问题）：
+1. **fold_r=auto**（嫌疑最大！）：auto → n<=1024 时 fold_r=1 → ng=M/1=6 → grid = nt*6。**权重行被每个 ng block 重新 staging**（6× 权重读！）→ 6× 慢完美匹配！
+2. **B5 (GATE_MROWS_ROUTE)**：gate GEMV + route 融合——如果 route 的计算变得极慢
+3. **B4 (RMSNORM_ROPE_MROWS)**：需要 VERIFY_FORK——FORK 在 SWALLOW 下从未单独验证
+4. **1b (MROWS_ACT_CPASYNC)**：激活 cp.async16——不太可能（只是装载方式变化）
+
+**下一步**：bisect（单独测 fold_r、B5、B4、1b 各自的增量——找到 6× 慢的来源）
