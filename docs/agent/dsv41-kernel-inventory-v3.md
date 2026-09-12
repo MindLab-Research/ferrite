@@ -335,10 +335,10 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 **执行顺序**：(1) `DSV41_GATEUP_ROWS=4/2` A/B（证伪 CTA 数假说；逐位一致，唯一变量是 CTA 形状）；
 (2) 同轮抓 regs/thread；(3) 按结论选 K-split（加 warp）还是 MLP/寄存器路线。
 
-**K-split 设计（✅ 2026-09-11 已实施，env 门 `DSV41_GATEUP_KSPLIT`，默认 1 = OFF）**：
+**K-split 设计（✅ 2026-09-11 已实施，env 门 `DSV41_GATEUP_KSPLIT`，默认 2 = ON——A/B 通过后翻转）**：
 
 > **落地状态（2026-09-11）**：`kernels/cuda/dsv41_experts_mxf4.cu` 的 fused gate/up 分支已实现
-> K-split。env `DSV41_GATEUP_KSPLIT`（默认 **1**，范围 1..8，`dsv41_gateup_ksplit()` 缓存读取）；
+> K-split。env `DSV41_GATEUP_KSPLIT`（默认 **2**，范围 1..8，`dsv41_gateup_ksplit()` 缓存读取）；
 > launcher `dsv41_expert_gate_up_fp4_batched` 里 `int ksplit = fuse ? dsv41_gateup_ksplit() : 1;`
 > （**非 fused 分支强制 1**——只有 fused 体实现了跨 half 合并，否则两个 half 会各自算整行并 race 同一个
 > `out[row]`），并在 `warps*ksplit > 32` 时递减（blockDim ≤ 1024）。grid.x **仍按 rows 算**
@@ -354,7 +354,7 @@ CSE 把每 lane 每组的 `LDS.32` 从 32 降到 16（源码 + SASS 双确认）
 > ksplit>1 时退化为**单趟**（`row_stop = row_base+1`），且越界 warp 用 `active` 守卫（**不能**用
 > loop 边界守卫——barrier 必须被 CTA 内所有 warp 到达，否则死锁；越界 warp 的 load 重定向到 row 0）。
 > 验证：远端 `nvcc 13.2 -gencode arch=compute_103a,code=sm_103a --use_fast_math` **编译干净**；
-> `cargo check -p ferrite-models` 通过。**parity A/B（文本）与 nsys 微基准尚未跑**——翻转前必须先做。
+> `cargo check -p ferrite-models` 通过。**parity A/B（文本）已完成并通过（6.90 → 6.57ms，-0.33ms），故默认已翻转为 2 = ON**；nsys 微基准未跑。
 
 - 结构：`grid=(ceil(n_total/4), slots)` + `blockDim=8 warps`，warp `w` 与 `w+4` 认领**同一行**，
   各做 g2 ∈ [0,5) / [5,10)（k=5120 → k>>9 = 10 组，切在 32-值 scale block 边界上），各自做 warp 内

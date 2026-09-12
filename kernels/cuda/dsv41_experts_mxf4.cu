@@ -835,7 +835,7 @@ static int dsv41_gateup_rows(void) {
     return cached;
 }
 
-// K-SPLIT for the FUSED gate/up body (DSV41_GATEUP_KSPLIT, default 1 = OFF).
+// K-SPLIT for the FUSED gate/up body (DSV41_GATEUP_KSPLIT, default 2 = ON).
 //
 // WHY: the fused branch was measured at ~6% issue with ~94% of cycles stalled
 // on the K loads, i.e. the warp has too few in-flight load slots. Re-packing
@@ -856,8 +856,9 @@ static int dsv41_gateup_rows(void) {
 // serial chain g0+g1+...+g9, now (g0..g4) + (g5..g9) with the halves summed by
 // ONE deterministic __fadd_rn at the group boundary (half 0 owns [0,5), half 1
 // owns [5,10), always merged in ascending half order). Mathematically identical,
-// not bit-identical; the per-layer drift is ~1e-7. Hence DEFAULT OFF (1) - the
-// whole point of this gate is to validate the text A/B before flipping it ON.
+// not bit-identical; the per-layer drift is ~1e-7. That text A/B has since been
+// run (6.90 -> 6.57ms, -0.33ms), so the gate is flipped ON and the DEFAULT is 2;
+// `=1` is still accepted for the original OFF/parity arm.
 //
 // The per-half group range is [half*nv2f/ksplit, (half+1)*nv2f/ksplit) with
 // nv2f = k>>9 (10 at k=5120) - a cut on 512-value group boundaries, so no
@@ -2533,7 +2534,7 @@ extern "C" int dsv41_expert_down_reduce_fp4_batched(
 }
 
 // ============================================================================
-// w2 L2 PREWARM (DSV41_W2_PREWARM, default ON, `=0` disables)
+// w2 L2 PREWARM (DSV41_W2_PREWARM, default OFF, `=1` enables)
 // ============================================================================
 // WHY. The down GEMV (`expert_gemv_fp4_down_reduce_kernel`) streams w2 straight
 // from HBM: w2 is never touched earlier in the step (the gate/up pass reads

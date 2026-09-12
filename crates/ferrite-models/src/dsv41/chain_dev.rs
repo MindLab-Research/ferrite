@@ -4278,7 +4278,7 @@ fn hc_tail_split() -> bool {
                     // view alias w1's), they are simply not read.
                     ilv as i32,
                 )?;
-                // W2 L2 PREWARM (DSV41_W2_PREWARM, default ON; `=0` disables).
+                // W2 L2 PREWARM (DSV41_W2_PREWARM, default OFF; `=1` enables).
                 //
                 // The down GEMV that follows streams w2 from HBM (286-385 GB/s
                 // against a ~7 TB/s part => LATENCY-bound, not bandwidth-bound)

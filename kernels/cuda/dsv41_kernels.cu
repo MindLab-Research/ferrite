@@ -3567,8 +3567,8 @@ static const bool g_gemv_cpasync = [] {
     return atoi(e) != 0;
 }();
 
-// P4 (gemm-act-cpasync, 2026-09-12): cp.async ACTIVATION staging, default OFF
-// (A/B arm; "=1" enables, an unset variable keeps today's synchronous staging).
+// P4 (gemm-act-cpasync, 2026-09-12): cp.async ACTIVATION staging, default ON
+// ("=0" restores today's synchronous staging; A/B verified, see the gate below).
 //
 // WHAT IT DOES. The mode-4 block-wide fp8 activation row is currently staged
 // into `s_a` by a SYNCHRONOUS wide copy, and -- only while P1's fused
@@ -3587,9 +3587,10 @@ static const bool g_gemv_cpasync = [] {
 // condition). IT IS THEREFORE NOT A FREE WIN AT warps=4: the small-n arm loses a
 // block/SM (5 -> 4), while the warps=8 arm (n >= 2048) and the forced-32-warp
 // rope launchers keep their residency (3 and 1 blocks/SM either way). That
-// trade-off is exactly why the gate defaults OFF -- the measured P1 A/B called
-// staged-vs-direct NEUTRAL, so "staged + async copy" has to prove itself before
-// it becomes the default, not the other way round.
+// trade-off is exactly why this gate had to be A/B'd before becoming the default:
+// the measured P1 A/B called staged-vs-direct NEUTRAL, so "staged + async copy"
+// had to prove itself first -- it did (6.44 -> 6.24ms, -0.20ms), hence default ON
+// while "=0" keeps the old synchronous staging available as the rollback arm.
 //
 // LAYOUT COUPLING -- read by BOTH sides or the two disagree:
 //   * the kernel reads `gc.act_cpasync` (a GemvCore field) into `act_async`,
@@ -4276,7 +4277,8 @@ gemm_fp8_gemv_kernel(__grid_constant__ const GemvCore gc, __grid_constant__ cons
         // re-try without first reading the dbg-err700 findings.
         //
         // [2026-09-12] P4 re-opens that cp.async attempt behind
-        // DSV41_GEMV_ACT_CPASYNC (default OFF, A/B arm). Two things changed since
+        // DSV41_GEMV_ACT_CPASYNC (now default ON, A/B verified -0.20ms since
+        // 2026-09-12; `=0` keeps it as the rollback arm). Two things changed since
         // the note above was written, and BOTH matter before trusting the arm:
         //   1. the err-700 round that produced this note was later traced to a
         //      DIFFERENT kernel's out-of-bounds dynamic smem (gemv_bf16 staging

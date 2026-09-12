@@ -577,7 +577,7 @@ extern "C" {
         stream: CuStream,
     ) -> i32;
 
-    /// w2 L2 PREWARM (DSV41_W2_PREWARM, default ON): pull every slot's w2 rows
+    /// w2 L2 PREWARM (DSV41_W2_PREWARM, default OFF, `=1` enables): pull every slot's w2 rows
     /// (`dim * (inter/2)` bytes) plus their e8m0 scale rows (`dim * (inter/32)`)
     /// into L2 with `cp.async.bulk.prefetch.L2.global`, so the down GEMV that
     /// follows answers from L2 instead of HBM. FIRE-AND-FORGET: writes nothing,

@@ -3465,7 +3465,7 @@ impl Device {
         self.kerr(rc, "dsv41_expert_down_reduce_fp4_batched")
     }
 
-    /// w2 L2 PREWARM (DSV41_W2_PREWARM, default ON): warm every slot's w2 rows
+    /// w2 L2 PREWARM (DSV41_W2_PREWARM, default OFF, `=1` enables): warm every slot's w2 rows
     /// (`sel_bytes` = dim * (inter/2)) plus their e8m0 scale rows
     /// (`sc_bytes` = dim * (inter/32)) into L2 so the down GEMV that follows is
     /// an L2 hit instead of a ~600 ns HBM round trip. The kernel is
