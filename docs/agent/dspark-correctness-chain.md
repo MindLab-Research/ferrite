@@ -3902,3 +3902,23 @@ self.dev.gemm_fp8_mx_rope_norm(
 2. **kernel parity 测试是金标准**——所有新融合 kernel 必须先过 parity 再上 e2e
 3. **SWALLOW 的 ar5-hang 需要系统性轮次分析**（不是逐个修——8 次失败的教训）
 4. **400 的真正路径是 L4/L5 kernel 工作**（"M 进 grid" 化 + tcgen05 + 流水）
+
+## K1+K2 全修复测试的预期分析（70f51f6d）
+
+**修复内容**（本次测试包含）：
+1. **FMA 确定性修复**（.cu）：K2 prologue 的 `ss += xr[i]*xr[i]` → `ss = __fmaf_rn(xr[i], xr[i], ss)`——消除跨上下文 FMA 收缩差异（1 ULP 根因）
+2. **竞态修复**（.rs）：qr_norm_out = null（消除 128 blocks 的 RAW/WAR 竞态）+ norm_rows 保留（每元素恰好一次写）
+
+**预期结果**：
+| 指标 | 上次（无修复）| 预期（有修复）|
+|---|---|---|
+| 数字正确 | 61/107 ❌ | 200/200 ✓（如果修复完全）|
+| 吞吐 | 9.2 tok/s ❌ | ~78-85（竞态的带宽浪费消除）|
+| 拉丁 | []（计数无拉丁）| [] |
+
+**如果仍损坏**：FMA/竞态不是全部根因 → 跑 parity 逐字节 diff 测试定位
+**如果干净但慢**：K2 的 32-warp 强制块的效率问题 → perf-pathology 分析
+
+**测试后的分支**：
+- 干净 → 出师表验证 → 干净栈重建（wo_a → RING_WIN → FORK → MARKOV → LAZY_SDR）
+- 损坏 → parity 测试（GPU 7 单卡）→ 逐字节定位
