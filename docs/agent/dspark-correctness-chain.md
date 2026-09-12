@@ -4159,3 +4159,26 @@ self.dev.gemm_fp8_mx_rope_norm(
 - **如果某行的 commit 失败或时序错位**——clen 停留在早期值——后续行读到早期池
 
 **待 lazy-verify-position-bughunt 的判决**（分析中）
+
+## 🎯🎯🎯 BASE 数字损坏的三个根因（base-numbers-corruption-suspects 的判决）
+
+**三根桩**（排除法）：
+- 桩A：accept 链干净（逐支重演验证）——"输出 token 来自 accept 错位"封死
+- 桩B：输出 token 只可能来自 verify argmax——损坏必然在 verify 的上下文里
+- 桩C：m=1 图"一次捕获服务全程"——recorded region 的 host 分支被冻结在第 1 行的值
+
+**S1 ★★★ [严重·确定性] DIRECT 臂的 compress_len 双重计数**：
+- `step_rows_sync` 的 DIRECT 臂在 `step_rows_inner` 后又调 `advance_compress_lens`——但 `compress_row`（内部调用）自己也推进 mirror！
+- **每个 DIRECT 块 mirror 推进两次，device clen 只一次** → 3 个 warmup 块后 mirror 领先
+- indexer 的 index_k 行数超过真实已提交组 → 选中陈旧压缩位置 → **"重置到 12"**！
+- 验证：`DSV41_INV_CHECK=1` 的 `inv_compress_len` 直接判死活
+
+**S2 ★★★ [严重·每奇数行] verify_recording 强发 publish 覆盖已提交组的 key**：
+- 捕获期无条件强发 index-key publish（为 parity 修复）
+- m=1 逐行路径上：非提交行的 `latent` 是半组 → 覆盖上一已提交组的 key
+- ratio=2 的层（18/40）每两行一次 → Direct 与 Replay 从捕获起就分叉
+
+**S3 ★★★ [严重·概率性] lazy⇄batched 中途换臂**：
+- 滞回带 [4.766, 5.266]（τ≈5.016, hyst=0.25）——**数数任务 k_acc≈5 恰好在带心！**
+- mean-k 在早期轮跳动 → **必然在某轮跨过边界** → 第 10-11 轮 = 61 token = **损坏点！**
+- 换臂改变 tap 去向/compressor 快照/commit 语义——batched 对 lazy 留下的无快照状态做 rollback → 垃圾
